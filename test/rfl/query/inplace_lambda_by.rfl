@@ -1,0 +1,45 @@
+;; A lambda written in place as a plain output under by: (#1289).  It used
+;; to evaluate once over the whole column and store that one lazy result in
+;; every group's cell: the first group read the whole column, and every
+;; other group raised "lazy handle already materialized".  Each spelling
+;; must give the named helper's answer: per group for a whole-column verb,
+;; the whole-table column split by group for a running call (#1249).
+(set T (table [k i] (list [0 1 0 1 0 1] [1 2 4 8 16 32])))
+(.sys.exec "rm -rf /tmp/rfl_inplace_lambda_by")
+(.db.splayed.set "/tmp/rfl_inplace_lambda_by/1/t/" (take T 3))
+(.db.splayed.set "/tmp/rfl_inplace_lambda_by/2/t/" (take T -3))
+(set P (.db.parted.get "/tmp/rfl_inplace_lambda_by/" 't))
+(set hr1 (fn [x] (reverse x)))
+(set hs1 (fn [x] (sums x)))
+(set hp1 (fn [x] (+ x 1)))
+(set Z (fn [r] (at (xasc r 'k) 'z)))
+
+;; the issue's cases, against the named helper and literal answers
+(Z (select {from: T by: k z: ((fn [x] (reverse x)) i)})) -- (list [16 4 1] [32 8 2])
+(Z (select {from: T by: k z: (hr1 i)})) -- (list [16 4 1] [32 8 2])
+(Z (select {from: T by: k z: ((fn [x] (sums x)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: (hs1 i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: ((fn [x] (+ x 1)) i)})) -- (list [2 5 17] [3 9 33])
+(Z (select {from: T by: k z: (hp1 i)})) -- (list [2 5 17] [3 9 33])
+
+;; every cell is readable, not only the first
+(set R (Z (select {from: T by: k z: ((fn [x] (reverse x)) i)})))
+(at R 1) -- [32 8 2]
+(set R (Z (select {from: T by: k z: ((fn [x] (sums x)) i)})))
+(at R 1) -- [3 15 63]
+
+;; under where:, and wrapped in last / sum
+(Z (select {from: T by: k where: (> i 2) z: ((fn [x] (reverse x)) i)})) -- (Z (select {from: T by: k where: (> i 2) z: (hr1 i)}))
+(Z (select {from: T by: k z: (last ((fn [x] (reverse x)) i))})) -- (Z (select {from: T by: k z: (last (hr1 i))}))
+(Z (select {from: T by: k z: (sum ((fn [x] (sums x)) i))})) -- (Z (select {from: T by: k z: (sum (hs1 i))}))
+
+;; a parted table gives the flat answers
+(Z (select {from: P by: k z: ((fn [x] (reverse x)) i)})) -- (list [16 4 1] [32 8 2])
+(Z (select {from: P by: k z: ((fn [x] (sums x)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: P by: k z: ((fn [x] (+ x 1)) i)})) -- (list [2 5 17] [3 9 33])
+
+;; groups large enough for the parallel paths
+(set B (table [k i] (list (% (til 300000) 3) (til 300000))))
+(Z (select {from: B by: k z: ((fn [x] (reverse x)) i)})) -- (Z (select {from: B by: k z: (hr1 i)}))
+(Z (select {from: B by: k z: ((fn [x] (sums x)) i)})) -- (Z (select {from: B by: k z: (hs1 i)}))
+(.sys.exec "rm -rf /tmp/rfl_inplace_lambda_by")
