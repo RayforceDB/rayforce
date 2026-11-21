@@ -588,7 +588,8 @@ static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_
  * true; a symbol, string or GUID is true unless null.  The AND/OR kernels
  * read BOOL bytes, so a non-boolean column is lowered to a mask first:
  * `(and (not (nil? x)) (!= x 0))` for a number or temporal (`(!= x 0)` for
- * U8, which has no null), `(not (nil? x))` for text and GUID.  Both stay
+ * U8, which has no null, and for an integer or temporal column whose
+ * metadata says it holds none), `(not (nil? x))` for text and GUID.  Both stay
  * on the fused kernels over a nullable column, where `(not (not x))`
  * fell back to the element-wise path twice (2x slower under a where:,
  * 30x as a projection).  Reading the raw cells instead is what kept rows a where: on `x`
@@ -597,6 +598,19 @@ static bool dag_cmp_operands_ok(ray_graph_t* g, const char* fname, size_t fname_
  * partition key's wrapper goes to the evaluator (NULL, no error); any
  * other type sets compile_err.  Returns the operand to combine, or NULL. */
 static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x);
+
+/* A scan of a column of the query's table whose metadata says it holds no
+ * null (the flag a float column's computed NaN may lack, so callers ask
+ * only for sentinel-null types). */
+static bool dag_scan_null_free(ray_graph_t* g, ray_op_t* x) {
+    if (x->opcode != OP_SCAN || !g->table) return false;
+    ray_op_ext_t* ext = find_ext(g, x->id);
+    if (!ext) return false;
+    uint16_t table_id = 0;
+    memcpy(&table_id, ext->base.pad, sizeof(uint16_t));
+    return table_id == 0 && ray_table_has_col(g->table, ext->sym) &&
+           !ray_table_col_has_nulls(g->table, ext->sym);
+}
 
 static ray_op_t* dag_bool_operand(ray_graph_t* g, ray_op_t* a, bool is_and) {
     int8_t t = dag_operand_type(g, a);
@@ -623,6 +637,8 @@ static ray_op_t* dag_bool_operand(ray_graph_t* g, ray_op_t* a, bool is_and) {
         if (!z) return NULL;
         ray_op_t* ne = ray_ne(g, &g->nodes[a_id], z);
         if (!ne || bt == RAY_U8) return ne;        /* U8 has no null */
+        if (bt != RAY_F32 && bt != RAY_F64 && dag_scan_null_free(g, &g->nodes[a_id]))
+            return ne;                             /* a sentinel null cannot occur */
         uint32_t ne_id = ne->id;
         ray_op_t* nn = ray_isnull(g, &g->nodes[a_id]);
         if (!nn) return NULL;
