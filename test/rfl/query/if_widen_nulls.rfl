@@ -27,6 +27,22 @@
 (Q (select {from: T q: (if (> x 5.0) i x) where: (> x 0.0)})) -- [1.0 0Nf 30.0 2.0]
 (at (update {q: (if (> x 5.0) i x) from: T}) 'q) -- [1.0 0Nf 30.0 2.0]
 
+;; computed branches take the selected-arm route
+(Q (select {from: T q: (if (> x 5.0) (+ i 1) (* x 2.0))})) -- [2.0 0Nf 31.0 4.0]
+
+;; widening between integer widths gives the output type's null, not the
+;; narrower sentinel's value, on the fill and the selected-arm routes
+(set W (table [x i j h] (list [1.0 6.0 7.0 2.0] [10 0Nl 30 40] [1i 0Ni 3i 4i] [1h 0Nh 3h 4h])))
+(set WQ (fn [r] (at r 'q)))
+(WQ (select {from: W q: (if (< x 5.0) i j)})) -- [10 0Nl 3 40]
+(nil? (WQ (select {from: W q: (if (< x 5.0) i j)}))) -- [false true false false]
+(WQ (select {from: W q: (if (< x 5.0) i h)})) -- [10 0Nl 3 40]
+(WQ (select {from: W q: (if (< x 5.0) j h)})) -- [1i 0Ni 3i 4i]
+(WQ (select {from: W q: (if (< x 5.0) (+ i 1) (+ j 1i))})) -- [11 0Nl 4 41]
+;; a null atom beside a wider column broadcasts that column's null
+(WQ (select {from: W q: (if (< x 5.0) i 0Ni)})) -- [10 0Nl 0Nl 40]
+(WQ (select {from: W q: (if (< x 5.0) j 0Nh)})) -- [1i 0Ni 0Ni 4i]
+
 ;; a sliced column (where: keeps a slice of the source) keeps its nulls
 (Q (select {from: T q: (if (> x 5.0) i x) where: (> x 3.0)})) -- [0Nf 30.0]
 

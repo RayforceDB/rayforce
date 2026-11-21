@@ -345,11 +345,26 @@ static double if_vec_f64(ray_t* v, int64_t idx) {
     return (double)if_vec_i64(v, idx);
 }
 
-/* May this vector hold a null cell?  A slice carries its parent's mark. */
-static inline bool if_vec_may_null(ray_t* v) {
-    while (v->attrs & RAY_ATTR_SLICE) v = v->slice_parent;
-    return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
+/* The null of an integer-celled output type, or 0 when it has none. */
+static inline int64_t if_int_null(int8_t out_type) {
+    switch (out_type) {
+    case RAY_I64: case RAY_TIMESTAMP: return NULL_I64;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
+    case RAY_I16: return NULL_I16;
+    default: return 0;
+    }
 }
+
+/* One cell widened or narrowed to an integer output: a null cell becomes the
+ * output type's null.  Reading the stored sentinel instead keeps its own
+ * width's value, so an I32 null in an I64 output was -2147483648 (#1279). */
+static inline int64_t if_vec_int_as(ray_t* v, int64_t idx, int8_t out_type) {
+    if (v->type != RAY_F64 && v->type != RAY_F32 &&
+        ray_vec_may_have_nulls(v) && ray_vec_is_null(v, idx))
+        return if_int_null(out_type);
+    return if_vec_i64(v, idx);
+}
+
 
 static int64_t if_scalar_i64(ray_t* v) {
     return ray_is_atom(v) ? if_atom_i64(v) : if_vec_i64(v, 0);
@@ -357,6 +372,15 @@ static int64_t if_scalar_i64(ray_t* v) {
 
 static double if_scalar_f64(ray_t* v) {
     return ray_is_atom(v) ? if_atom_f64(v) : if_vec_f64(v, 0);
+}
+
+/* if_scalar_i64 for an integer output: a null atom (or one-cell null
+ * vector) broadcasts the output type's null. */
+static int64_t if_scalar_int_as(ray_t* v, int8_t out_type) {
+    bool null = ray_is_atom(v) ? RAY_ATOM_IS_NULL(v)
+              : (v->type != RAY_F64 && v->type != RAY_F32 &&
+                 ray_vec_may_have_nulls(v) && ray_vec_is_null(v, 0));
+    return null ? if_int_null(out_type) : if_scalar_i64(v);
 }
 
 static int8_t if_value_type(ray_t* v) {
@@ -464,13 +488,16 @@ static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
                      : if_vec_f64(value, src);
             ((double*)ray_data(result))[dst] = x;
         } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int64_t*)ray_data(result))[dst] = x;
         } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int32_t*)ray_data(result))[dst] = (int32_t)x;
         } else if (out_type == RAY_I16) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int16_t*)ray_data(result))[dst] = (int16_t)x;
         } else {
             int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
@@ -1151,14 +1178,11 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             break;
         }
         /* An I64-cell side beside an F64 or scalar one: (double) of the raw
-         * cell.  A side that may hold nulls takes the per-cell loop below,
-         * whose if_vec_f64 widens a null to the F64 null (#1279). */
+         * cell, except that the I64 null (shared by TIMESTAMP and TIMESPAN)
+         * widens to the F64 null, as `as 'F64` does (#1279). */
         bool t_i = !c->then_scalar && if_side_i64_cells(c->then_v, false);
         bool e_i = !c->else_scalar && if_side_i64_cells(c->else_v, false);
-        bool may_null = (t_i && if_vec_may_null(c->then_v)) ||
-                        (e_i && if_vec_may_null(c->else_v));
-        if (!may_null &&
-            (t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
+        if ((t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
             (e_i || c->else_scalar || c->else_v->type == RAY_F64)) {
             double* dst = (double*)c->dst;
             const void* tp = c->then_scalar ? NULL : ray_data(c->then_v);
@@ -1168,14 +1192,16 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             const double* tf = (const double*)tp;
             const double* ef = (const double*)ep;
             double ts = c->t_f64, es = c->e_f64;
+#define IF_W(x) ((x) == NULL_I64 ? (double)NAN : (double)(x))
 #define IF_FILL_LOOP(TX, EX) \
             for (int64_t i = i0; i < i1; i++) dst[i] = cond_p[i] ? (TX) : (EX)
-            if (t_i && e_i)          IF_FILL_LOOP((double)ti[i], (double)ei[i]);
-            else if (t_i && ep)      IF_FILL_LOOP((double)ti[i], ef[i]);
-            else if (t_i)            IF_FILL_LOOP((double)ti[i], es);
-            else if (tp)             IF_FILL_LOOP(tf[i], (double)ei[i]);
-            else                     IF_FILL_LOOP(ts, (double)ei[i]);
+            if (t_i && e_i)          IF_FILL_LOOP(IF_W(ti[i]), IF_W(ei[i]));
+            else if (t_i && ep)      IF_FILL_LOOP(IF_W(ti[i]), ef[i]);
+            else if (t_i)            IF_FILL_LOOP(IF_W(ti[i]), es);
+            else if (tp)             IF_FILL_LOOP(tf[i], IF_W(ei[i]));
+            else                     IF_FILL_LOOP(ts, IF_W(ei[i]));
 #undef IF_FILL_LOOP
+#undef IF_W
             break;
         }
         double* dst = (double*)c->dst;
@@ -1193,8 +1219,8 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         }
         int64_t* dst = (int64_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int64_t tv = c->then_scalar ? c->t_i64 : if_vec_i64(c->then_v, i);
-            int64_t ev = c->else_scalar ? c->e_i64 : if_vec_i64(c->else_v, i);
+            int64_t tv = c->then_scalar ? c->t_i64 : if_vec_int_as(c->then_v, i, c->out_type);
+            int64_t ev = c->else_scalar ? c->e_i64 : if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
@@ -1217,16 +1243,16 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         }
         int32_t* dst = (int32_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_i64(c->then_v, i);
-            int32_t ev = c->else_scalar ? (int32_t)c->e_i64 : (int32_t)if_vec_i64(c->else_v, i);
+            int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_int_as(c->then_v, i, c->out_type);
+            int32_t ev = c->else_scalar ? (int32_t)c->e_i64 : (int32_t)if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
     case RAY_I16: {
         int16_t* dst = (int16_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int16_t tv = c->then_scalar ? (int16_t)c->t_i64 : (int16_t)if_vec_i64(c->then_v, i);
-            int16_t ev = c->else_scalar ? (int16_t)c->e_i64 : (int16_t)if_vec_i64(c->else_v, i);
+            int16_t tv = c->then_scalar ? (int16_t)c->t_i64 : (int16_t)if_vec_int_as(c->then_v, i, c->out_type);
+            int16_t ev = c->else_scalar ? (int16_t)c->e_i64 : (int16_t)if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
@@ -1801,8 +1827,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
                     ? ray_sym_intern(ray_str_ptr(else_v), ray_str_len(else_v))
                     : sym_scalar_runtime_id(else_v);
         } else {
-            if (then_scalar) { fc.t_f64 = if_scalar_f64(then_v); fc.t_i64 = if_scalar_i64(then_v); }
-            if (else_scalar) { fc.e_f64 = if_scalar_f64(else_v); fc.e_i64 = if_scalar_i64(else_v); }
+            if (then_scalar) { fc.t_f64 = if_scalar_f64(then_v); fc.t_i64 = if_scalar_int_as(then_v, out_type); }
+            if (else_scalar) { fc.e_f64 = if_scalar_f64(else_v); fc.e_i64 = if_scalar_int_as(else_v, out_type); }
         }
 
         ray_pool_t* pool = ray_pool_get();
