@@ -11074,6 +11074,21 @@ static ray_t* empty_unary_group_result(ray_unary_fn fn, ray_t* source) {
     return out ? out : ray_error("oom", NULL);
 }
 
+/* The planner's aggregand admission (agg_type_admitted), applied once to the
+ * evaluated source of a per-group aggregate.  An argument the DAG cannot
+ * compile, such as (if c d (+ d 1)) over a DATE d, reaches the per-group
+ * builtins unchecked, so `sum` of it must fail here with the same error as
+ * `(sum d)` (#1284).  NULL when admitted. */
+static ray_t* group_agg_src_rejected(ray_t* fn_name, ray_t* src) {
+    int8_t t = src->type;
+    uint16_t op;
+    if (t <= 0 || !(op = resolve_agg_opcode(fn_name->i64)) || agg_type_admitted(op, t))
+        return NULL;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return ray_error("type", "select by: aggregation does not admit input type %s",
+                     ray_type_name(t));
+}
+
 static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                                        const int64_t* idx_buf,
                                        const int64_t* offsets,
@@ -11116,6 +11131,9 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
         }
     }
 
+    ray_t* rej = group_agg_src_rejected(fn_name, src);
+    if (rej) { ray_release(src); return rej; }
+
     if (n_groups == 0) {
         ray_t* out = empty_unary_group_result(uf, src);
         ray_release(src); return out;
@@ -11141,12 +11159,17 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                    (size_t)grp_cnt[gi] * sizeof(int64_t));
         }
         ray_t* subset = ray_at_fn(src, idx_vec);
-        if (!subset || RAY_IS_ERR(subset)) continue;
-        ray_t* agg_val = uf(subset);
-        ray_release(subset);
+        ray_t* agg_val = subset && !RAY_IS_ERR(subset) ? uf(subset) : subset;
+        if (subset && !RAY_IS_ERR(subset)) ray_release(subset);
         if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
             agg_val = ray_lazy_materialize(agg_val);
-        if (!agg_val || RAY_IS_ERR(agg_val)) continue;
+        /* A group's error is the query's: skipping it left that slot (every
+         * slot, when all groups failed) unwritten in the result (#1284). */
+        if (!agg_val || RAY_IS_ERR(agg_val)) {
+            ray_release(idx_vec); ray_release(src);
+            if (agg_vec) ray_release(agg_vec);
+            return agg_val ? agg_val : ray_error("oom", NULL);
+        }
 
         if (!agg_vec) {
             agg_atom_t = agg_val->type;
@@ -22473,6 +22496,7 @@ by_dict_done:
                         }
 
                         ray_t* agg_vec = NULL;
+                        ray_t* agg_err = group_agg_src_rejected(agg_fn_name, src_col_val);
                         ray_t** grp_items = (ray_t**)ray_data(groups);
 
                         /* Median fast path: flatten `groups` LIST<(key,
@@ -22486,7 +22510,7 @@ by_dict_done:
                          * to the generic per-group ray_at_fn + ray_med_fn
                          * loop below.  Uses out_groups so a preapplied
                          * take limits the work to the kept prefix. */
-                        if (is_med_call(val_expr_item)) {
+                        if (!agg_err && is_med_call(val_expr_item)) {
                             ray_t* ix_hdr = NULL;
                             ray_t* off_hdr = NULL;
                             ray_t* cnt_hdr = NULL;
@@ -22518,30 +22542,51 @@ by_dict_done:
                             if (off_hdr) scratch_free(off_hdr);
                             if (cnt_hdr) scratch_free(cnt_hdr);
                         }
-                        if (!agg_vec) {
+                        if (!agg_err && !agg_vec) {
                             for (int64_t gi = 0; gi < out_groups; gi++) {
                                 ray_t* idx_list = grp_items[gi * 2 + 1];
                                 ray_t* subset = ray_at_fn(src_col_val, idx_list);
-                                if (!subset || RAY_IS_ERR(subset)) continue;
-                                ray_t* agg_val = NULL;
-                                ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
-                                if (fn_obj && fn_obj->type == RAY_UNARY) {
-                                    ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-                                    agg_val = uf(subset);
+                                ray_t* agg_val = subset;
+                                if (subset && !RAY_IS_ERR(subset)) {
+                                    agg_val = NULL;
+                                    ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
+                                    if (fn_obj && fn_obj->type == RAY_UNARY) {
+                                        ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+                                        agg_val = uf(subset);
+                                    }
+                                    ray_release(subset);
                                 }
-                                ray_release(subset);
                                 if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
                                     agg_val = ray_lazy_materialize(agg_val);
-                                if (!agg_val || RAY_IS_ERR(agg_val)) continue;
+                                /* A group's error is the query's: skipping it
+                                 * left the slot unwritten, or the column out
+                                 * when every group failed (#1284). */
+                                if (!agg_val || RAY_IS_ERR(agg_val)) {
+                                    agg_err = agg_val ? agg_val : ray_error("domain", "select by: aggregation failed");
+                                    break;
+                                }
                                 if (!agg_vec) {
                                     int8_t vt = -(agg_val->type);
                                     agg_vec = ray_vec_new(vt, out_groups);
-                                    if (!agg_vec || RAY_IS_ERR(agg_vec)) { ray_release(agg_val); break; }
+                                    if (!agg_vec || RAY_IS_ERR(agg_vec)) {
+                                        ray_release(agg_val);
+                                        agg_err = agg_vec ? agg_vec : ray_error("oom", NULL);
+                                        agg_vec = NULL;
+                                        break;
+                                    }
                                     agg_vec->len = out_groups;
                                 }
                                 store_typed_elem(agg_vec, gi, agg_val);
                                 ray_release(agg_val);
                             }
+                        }
+                        if (agg_err) {
+                            if (agg_vec) ray_release(agg_vec);
+                            ray_release(src_col_val);
+                            for (int ai = 0; ai < n_agg_out; ai++) if (agg_results[ai]) ray_release(agg_results[ai]);
+                            scratch_free(aggnames_hdr); scratch_free(aggres_hdr); scratch_free(keycols_hdr);
+                            ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return agg_err;
                         }
                         if (!agg_vec && out_groups == 0) agg_vec = empty_agg_column(agg_fn_name, src_col_val);
                         ray_release(src_col_val);
