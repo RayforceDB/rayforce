@@ -1,0 +1,51 @@
+;; semi_mask.rfl — (semi-mask [keys] left right) / (anti-mask [keys] left right)
+;; (#596): a BOOL vector over left's rows, true where the row has a match
+;; in right on every key (anti: where it has none).  The rows inner-join /
+;; anti-join emit, as a selection that where: and delete take directly.
+
+(set levels (table [venue instrument px] (list [V0 V1 V0 V1 V2 V0] [A B C B A A] [1 2 3 4 5 6])))
+(set resets (table [venue instrument] (list [V0 V1 V9] [A B Q])))
+
+;; compound key: the (venue, instrument) pair, not each column alone
+(semi-mask [venue instrument] levels resets) -- [true true false true false true]
+(anti-mask [venue instrument] levels resets) -- [false false true false true false]
+;; keys last, as the joins also accept
+(semi-mask levels resets [venue instrument]) -- [true true false true false true]
+;; single key
+(semi-mask [instrument] levels resets) -- [true true false true true true]
+
+;; the semi mask selects what inner-join emits, the anti mask what anti-join keeps
+(set M (semi-mask [venue instrument] levels resets))
+(at (select {from: levels where: M}) 'px) -- [1 2 4 6]
+(at (select {from: levels where: (anti-mask [venue instrument] levels resets)}) 'px) -- (at (anti-join [venue instrument] levels resets) 'px)
+(count (delete {from: levels where: M})) -- 2
+
+;; nulls match nulls, as in every join
+(set ln (table [k] (list (as 'SYM ["a" "" "b"]))))
+(set rn (table [k] (list (as 'SYM ["" "b"]))))
+(semi-mask [k] ln rn) -- [false true true]
+(set li (table [k] (list [1 0Nl 2])))
+(set ri (table [k] (list [2 3])))
+(semi-mask [k] li ri) -- [false false true]
+(semi-mask [k] li li) -- [true true true]
+
+;; empty sides
+(semi-mask [k] li (select {from: ri where: (> k 10)})) -- [false false false]
+(anti-mask [k] li (select {from: ri where: (> k 10)})) -- [true true true]
+(count (semi-mask [k] (select {from: li where: (> k 10)}) ri)) -- 0
+
+;; parted sides are flattened, same answer as the in-RAM tables
+(.sys.exec "rm -rf /tmp/rfl_semi_mask_p")
+(.db.splayed.set "/tmp/rfl_semi_mask_p/2024.01.01/t/" (table [Sym V] (list [a b] [1 2])))
+(.db.splayed.set "/tmp/rfl_semi_mask_p/2024.01.02/t/" (table [Sym V] (list [b c] [3 4])))
+(set P (.db.parted.get "/tmp/rfl_semi_mask_p/" 't))
+(set S (table [Sym] (list [b d])))
+(semi-mask [Sym] P S) -- [false true true false]
+(anti-mask [Sym] S P) -- [false true]
+(semi-mask [Sym V] P (table [Sym V] (list [c b] [4 2]))) -- [false true false true]
+(.sys.exec "rm -rf /tmp/rfl_semi_mask_p")
+
+;; errors
+(semi-mask [k] li) !- arity
+(semi-mask [q] li ri) !- domain
+(anti-mask [k] li 1) !- type

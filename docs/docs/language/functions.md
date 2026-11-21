@@ -358,6 +358,8 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `inner-join` | variadic | Inner join — only matching rows. |
 | `full-join` | variadic | Full outer join. All left and right rows are preserved; unmatched columns are null. |
 | `anti-join` | variadic | Anti-semi-join. Keep left rows with no right match. |
+| `semi-mask` | variadic | Boolean vector over the left rows: true where the row has a right match. |
+| `anti-mask` | variadic | Boolean vector over the left rows: true where the row has no right match. |
 | `window-join` | variadic, special | Join with time window constraint. Match rows within a time range. |
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
