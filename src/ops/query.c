@@ -18333,8 +18333,10 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     }
     /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
      * value per row, never a necessary partition constraint (the mask reads
-     * no comparison below it). Interpreted whole, as a fallback may, its
-     * vector condition is truthy on any source, the pruned one included. */
+     * no comparison below it). The route (compiled per row or interpreted)
+     * is chosen from the AST and the schema; interpreted whole, any non-null
+     * vector condition is truthy (is_truthy), so ray_cond_fn takes THEN on
+     * the pruned source as on the full one. */
     if (mode == 2 && n == 4 && fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
         (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn && prune_head_named(el[0], "if")) {
         int budget = PRUNE_IF_MAX_VISITS;
@@ -18346,7 +18348,7 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
                 prune_bound_const(el[2], tbl, true));        /* a set: a typed vector, written or bound */
     if (prune_logic_head(el[0], fn)) {
-        sub = mode;
+        sub = mode ? 1 : 0;              /* a logic operand is a condition, not an IF */
     } else {
         if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
             !(fn->attrs & RAY_FN_ATOMIC) || (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
@@ -18420,7 +18422,7 @@ static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) 
         (ray_vary_fn)(uintptr_t)fn->i64 != ray_cond_fn || !prune_head_named(el[0], "if")) return 0;
     if (!prune_if_cond(el[1], tbl, budget, depth + 1)) return 0;
     int8_t a = prune_if_projection(el[2], tbl, budget, depth + 1);
-    return a && a == prune_if_projection(el[3], tbl, budget, depth + 1) ? a : 0;
+    return (a && a == prune_if_projection(el[3], tbl, budget, depth + 1)) ? a : 0;
 }
 
 /* An output reads only the rows the where keeps: elementwise, or an
@@ -18736,20 +18738,31 @@ static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
         if (!k) return false;
         n_clauses += prune_clause_key(k);
     }
+    bool if_checked = false;
     for (int64_t i = 0; i < keys->len; i++) {
         if (prune_clause_key(ray_sym_vec_cell(keys, i)) ||
             prune_output_ok(((ray_t**)ray_data(vals))[i], tbl, grouped)) continue;
-        /* An ungrouped IF beside other outputs as well: they are row-local
-         * (admitted above), and the projection either compiles every output
-         * (rowwise IF) or filters first and scatters each output per row
-         * (select's eval fallback), a choice made from the AST and the
-         * schema, which the pruned source keeps. */
+        /* An ungrouped IF beside other outputs as well: they are admitted
+         * above, and the projection either compiles every output (rowwise
+         * IF) or filters first and scatters each output per row (select's
+         * eval fallback), a choice made from the AST and the schema, which
+         * the pruned source keeps. */
         int budget = PRUNE_IF_MAX_VISITS;
         if (by || n_clauses != 2 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
         /* Clause keys can have a compact width or a non-runtime domain. */
         int64_t output_id = sym_cell_runtime_id(keys, i);
         if (output_id < 0 || ray_table_slot(tbl, output_id) ||
             !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
+        /* The proof types the IF's names from the source; an earlier output
+         * may rebind one for later outputs (`a: (avg a)`). Only a column
+         * passed through under its own name keeps its type. */
+        for (int64_t j = 0; !if_checked && j < keys->len; j++) {
+            int64_t id = sym_cell_runtime_id(keys, j);
+            ray_t* v = ((ray_t**)ray_data(vals))[j];
+            if (id < 0 || prune_clause_key(ray_sym_vec_cell(keys, j)) || !ray_table_slot(tbl, id)) continue;
+            if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || v->i64 != id) return false;
+        }
+        if_checked = true;
     }
     return true;
 }

@@ -4779,21 +4779,30 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
  * agree, nulls (an F64 NaN is null) and symbols outside the root's domain
  * included; mixed I64/F64 branches keep the full source. */
 static test_result_t test_select_parted_prunes_if_f64_sym(void) {
-    static const struct { const char* output; bool pruned; const char* pred; } cases[] = {
-        { "q: (if (>= px 1.0) qty 0)", true, NULL },
-        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true, NULL },
-        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true, NULL },
-        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true, NULL },
-        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true, NULL },
-        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true, NULL },
-        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true, NULL },
-        { "q: (if (> qty 2) px qty)", false, NULL },
-        { "by: g n: (sum (if (> qty 2) px qty))", false, NULL },
+    /* rows: of the answer over 2024.01.02 */
+    static const struct { const char* output; bool pruned; const char* pred; int64_t rows; } cases[] = {
+        { "q: (if (>= px 1.0) qty 0)", true, NULL, 8 },
+        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true, NULL, 8 },
+        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true, NULL, 8 },
+        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true, NULL, 8 },
+        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true, NULL, 8 },
+        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true, NULL, 2 },
+        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true, NULL, 2 },
+        { "q: (if (> qty 2) px qty)", false, NULL, 8 },
+        { "by: g n: (sum (if (> qty 2) px qty))", false, NULL, 2 },
+        /* an output rebinding a column the IF reads */
+        { "px: (* px 2.0) q: (if (> px 1.0) px 0.0)", false, NULL, 8 },
+        { "qty: (avg qty) q: (if (> px 1.0) qty 0)", false, NULL, 8 },
         /* an IF operand in where: */
-        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) 'A 'B) 'B))" },
-        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) act side) 'New))" },
-        { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))" },
-        { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))" },
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) 'A 'B) 'B))", 4 },
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) act side) 'New))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))", 5 },
+        { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
+        /* not an operand: a bare conjunct, under a logic head, in by: */
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
+        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
     };
     for (int gen = 0; gen < 2; gen++) {
         char root[256], sym_path[512];
@@ -4838,8 +4847,10 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
             structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
 #endif
             bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
-                          (cases[i].pred || ray_table_nrows(r) == (strstr(cases[i].output, "by:") ? 2 : 8)) &&
-                          sp_same(r, u);
+                          (cases[i].rows < 0 || ray_table_nrows(r) == cases[i].rows) && sp_same(r, u);
+            /* rows -1: the answer may be an error; both sources must agree on it */
+            if (cases[i].rows < 0 && r && u && RAY_IS_ERR(r) && RAY_IS_ERR(u))
+                values = strcmp(ray_err_code(r), ray_err_code(u)) == 0;
             drop_out(r); drop_out(u);
             if (!values || !structure) {
                 sp_bind(NULL); ray_release(t);
