@@ -2058,8 +2058,11 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
     }
     part_off[P] = total;
     if (total != len) {
+        /* a cancel leaves its skipped tasks' counts zero (hist is zeroed):
+         * the histogram is short */
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
-        return ray_error("nyi", "distinct: histogram mismatch");
+        return pool_cancelled(pool) ? ray_error("cancel", NULL)
+                                    : ray_error("nyi", "distinct: histogram mismatch");
     }
 
     /* Pass 2: scatter (value, row id) pairs. */
@@ -2101,6 +2104,15 @@ ray_t* distinct_radix_first_ids(ray_t* input) {
         .part_count = part_count, .first = first,
     };
     ray_pool_dispatch_n(pool, dv_part_dedup_fn, &dctx, (uint32_t)P);
+    /* A cancel skips the tasks it lands before, and the flag stays set, so
+     * the passes after it run none: a cancel in the scatter or the dedup
+     * leaves the dedup's counts and marks unwritten, read only here. */
+    if (pool_cancelled(pool)) {
+        scratch_free(pcnt_hdr); scratch_free(first_hdr);
+        scratch_free(rid_hdr); scratch_free(buf_hdr); scratch_free(cur_hdr);
+        scratch_free(off_hdr); scratch_free(hist_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     int64_t total_distinct = 0;
     for (uint64_t p = 0; p < P; p++) {
