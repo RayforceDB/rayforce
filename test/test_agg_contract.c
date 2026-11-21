@@ -5699,7 +5699,8 @@ static test_result_t test_cd_route(void) {
  * for column and row for row (ray_query_test_cd_route forces each): with no
  * key projection, under a where:, with a single key's projection, and with
  * a composite key's projections ({a: a b: b ... by: [a b]}), which the
- * select folds into the key (#1235): [a b u] on both routes, the answer of
+ * select folds into the key (#1235, and #1237 for a single key, written
+ * before or after the count): the keys first on both routes, the answer of
  * the select without them.  At 3,000 rows over 1,000 groups and at 300,000
  * rows over 100,000. */
 static test_result_t test_cd_route_key_proj(void) {
@@ -5715,7 +5716,10 @@ static test_result_t test_cd_route_key_proj(void) {
           "(select {u: (count (distinct h)) from: Tq by: [a b]})" },
         { "(select {u: (count (distinct h)) from: Tq by: [a b]})", NULL },
         { "(select {u: (count (distinct h)) from: Tq where: (>= h 0) by: [a b]})", NULL },
-        { "(select {a: a u: (count (distinct h)) from: Tq where: (>= h 0) by: a})", NULL },
+        { "(select {a: a u: (count (distinct h)) from: Tq where: (>= h 0) by: a})",
+          "(select {u: (count (distinct h)) from: Tq where: (>= h 0) by: a})" },
+        { "(select {u: (count (distinct h)) a: a from: Tq where: (>= h 0) by: a})",
+          "(select {u: (count (distinct h)) from: Tq where: (>= h 0) by: a})" },
     };
     static const char* const mk[] = {
         "(set qi (til 3000)) (set q0 (% (* qi 7919) 1000))",
