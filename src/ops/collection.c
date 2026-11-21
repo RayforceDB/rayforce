@@ -1327,6 +1327,42 @@ static ray_t* prior_typed_cmp(ray_t* fn, ray_t* vec) {
     return out;
 }
 
+/* (prior f v) for f one of + - * over a numeric vector: f over v and v
+ * shifted down one row (its first row repeated), which is what the
+ * cell-by-cell call gives, nulls and overflow included, as one vector op
+ * instead of a boxed cell per row; so its type does not depend on whether
+ * the vector holds a null.  NULL for any other shape. */
+static ray_t* prior_typed_arith(ray_t* fn, ray_t* vec) {
+    if (fn->type != RAY_BINARY || !vec || !ray_is_vec(vec) || vec->len <= 0 ||
+        (vec->attrs & RAY_ATTR_SLICE))
+        return NULL;
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    if (bf != ray_add_fn && bf != ray_sub_fn && bf != ray_mul_fn) return NULL;
+    int8_t t = vec->type;
+    if (t != RAY_I16 && t != RAY_I32 && t != RAY_I64 && t != RAY_F64) return NULL;
+    int64_t n = vec->len;
+    size_t esz = (size_t)ray_elem_size(t);
+    ray_t* sh = ray_vec_new(t, n);
+    if (!sh || RAY_IS_ERR(sh)) return sh ? sh : ray_error("oom", NULL);
+    sh->len = n;
+    const char* d = (const char*)ray_data(vec);
+    char* o = (char*)ray_data(sh);
+    memcpy(o, d, esz);
+    memcpy(o + esz, d, (size_t)(n - 1) * esz);
+    /* the shifted copy holds the same null cells, one row down */
+    if (ray_vec_may_have_nulls(vec)) sh->attrs |= RAY_ATTR_HAS_NULLS;
+    /* The evaluator's own vector dispatch for an atomic builtin (eval.c):
+     * call_fn2 would map it cell by cell. */
+    ray_t* r = (fn->attrs & RAY_FN_RESTRICTED) ? NULL
+             : atomic_map_binary_op(bf, RAY_FN_OPCODE(fn), vec, sh);
+    ray_release(sh);
+    if (!r) return NULL;
+    if (!RAY_IS_ERR(r) && ray_is_lazy(r)) r = ray_lazy_materialize(r);
+    if (!r || RAY_IS_ERR(r)) return r ? r : ray_error("oom", NULL);
+    if (!ray_is_vec(r) || r->type == RAY_LIST || r->len != n) { ray_release(r); return NULL; }
+    return r;
+}
+
 ray_t* ray_prior_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "prior: requires fn and vec args, got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
@@ -1334,6 +1370,8 @@ ray_t* ray_prior_fn(ray_t** args, int64_t n) {
     ray_t* fn = args[0];
     {
         ray_t* fast = prior_typed_cmp(fn, args[1]);
+        if (fast) return fast;
+        fast = prior_typed_arith(fn, args[1]);
         if (fast) return fast;
     }
     ray_t* _bx = NULL;
