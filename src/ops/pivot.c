@@ -336,10 +336,19 @@ static int64_t if_vec_i64(ray_t* v, int64_t idx) {
     return read_col_i64(ray_data(v), idx, v->type, v->attrs);
 }
 
+/* An integer null widens to the F64 null, as `as 'F64` widens it: converting
+ * the stored sentinel instead gives an ordinary huge number (#1279). */
 static double if_vec_f64(ray_t* v, int64_t idx) {
     if (v->type == RAY_F64) return ((double*)ray_data(v))[idx];
     if (v->type == RAY_F32) return (double)((float*)ray_data(v))[idx];
+    if (ray_vec_is_null(v, idx)) return (double)NAN;
     return (double)if_vec_i64(v, idx);
+}
+
+/* May this vector hold a null cell?  A slice carries its parent's mark. */
+static inline bool if_vec_may_null(ray_t* v) {
+    while (v->attrs & RAY_ATTR_SLICE) v = v->slice_parent;
+    return (v->attrs & RAY_ATTR_HAS_NULLS) != 0;
 }
 
 static int64_t if_scalar_i64(ray_t* v) {
@@ -1141,11 +1150,15 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             IF_FILL_SAME(double, c->t_f64, c->e_f64);
             break;
         }
-        /* An I64-cell side beside an F64 or scalar one: converted as
-         * if_vec_f64 converts it, (double) of the raw cell. */
+        /* An I64-cell side beside an F64 or scalar one: (double) of the raw
+         * cell.  A side that may hold nulls takes the per-cell loop below,
+         * whose if_vec_f64 widens a null to the F64 null (#1279). */
         bool t_i = !c->then_scalar && if_side_i64_cells(c->then_v, false);
         bool e_i = !c->else_scalar && if_side_i64_cells(c->else_v, false);
-        if ((t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
+        bool may_null = (t_i && if_vec_may_null(c->then_v)) ||
+                        (e_i && if_vec_may_null(c->else_v));
+        if (!may_null &&
+            (t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
             (e_i || c->else_scalar || c->else_v->type == RAY_F64)) {
             double* dst = (double*)c->dst;
             const void* tp = c->then_scalar ? NULL : ray_data(c->then_v);

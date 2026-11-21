@@ -1,0 +1,36 @@
+;; #1279: a query `if` that widens an integer branch to F64 carries that
+;; branch's nulls as the F64 null, as `as 'F64` does, instead of converting
+;; the stored sentinel into an ordinary huge number.
+(set T (table [x i] (list [1.0 6.0 7.0 2.0] [10 0Nl 30 40])))
+(set Q (fn [r] (at r 'q)))
+
+;; the issue's case, and the branches the other way round
+(Q (select {from: T q: (if (> x 5.0) i x)})) -- [1.0 0Nf 30.0 2.0]
+(Q (select {from: T q: (if (< x 5.0) x i)})) -- [1.0 0Nf 30.0 2.0]
+(nil? (Q (select {from: T q: (if (> x 5.0) i x)}))) -- [false true false false]
+
+;; beside an F64 atom, and with the null in the branch not taken
+(Q (select {from: T q: (if (> x 5.0) i 0.5)})) -- [0.5 0Nf 30.0 0.5]
+(Q (select {from: T q: (if (> x 6.5) i x)})) -- [1.0 6.0 30.0 2.0]
+
+;; I32 and I16 branches widen the same way
+(set U (table [x i h] (list [1.0 6.0 7.0 2.0] [10i 0Ni 30i 40i] [10h 0Nh 30h 40h])))
+(at (select {from: U q: (if (> x 5.0) i x)}) 'q) -- [1.0 0Nf 30.0 2.0]
+(at (select {from: U q: (if (> x 5.0) h x)}) 'q) -- [1.0 0Nf 30.0 2.0]
+
+;; an F64 null in the other branch stays null
+(set V (table [x i] (list [1.0 6.0 0Nf 2.0] [10 0Nl 30 40])))
+(Q (select {from: V q: (if (> x 5.0) i x)})) -- [1.0 0Nf 0Nf 2.0]
+
+;; under an aggregate, where:, and in update
+(Q (select {from: T q: (sum (if (> x 5.0) i x))})) -- [33.0]
+(Q (select {from: T q: (if (> x 5.0) i x) where: (> x 0.0)})) -- [1.0 0Nf 30.0 2.0]
+(at (update {q: (if (> x 5.0) i x) from: T}) 'q) -- [1.0 0Nf 30.0 2.0]
+
+;; a sliced column (where: keeps a slice of the source) keeps its nulls
+(Q (select {from: T q: (if (> x 5.0) i x) where: (> x 3.0)})) -- [0Nf 30.0]
+
+;; 200k rows: the parallel fill gives the same cells
+(set n 200000)
+(set B (table [x i] (list (as 'F64 (% (til n) 10)) (at [1 0Nl 3] (% (til n) 3)))))
+(sum (nil? (at (select {from: B q: (if (> x 4.0) i x)}) 'q))) -- (sum (and (> (% (til n) 10) 4) (== 1 (% (til n) 3))))
