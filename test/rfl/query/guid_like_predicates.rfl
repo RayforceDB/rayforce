@@ -21,8 +21,9 @@
 ;; guid predicate composes with aggregation
 (at (get (select {from: t where: (== g g1) s: (sum v)}) 's) 0) -- 20
 
-;; ordering on guid operands is undefined — loud, not silent
-(select {from: t where: (< g g1)}) !- type
+;; guid operands order by their bytes, as the builtin orders them (#974)
+(get (select {from: t where: (< g g1)}) 'v) -- (at [10 20 30] (where (< gs g1)))
+(get (select {from: t where: (>= g g1)}) 'v) -- (at [10 20 30] (where (>= gs g1)))
 
 ;; GUID membership: the typed `in` kernel read guid cells at the wrong width
 ;; (every cell decoded to 0), so `in`/`not-in` silently matched everything.
@@ -74,8 +75,9 @@
 ;; col-vs-const finds its row across partitions
 (get (select {from: PT where: (== g pg1)}) 'v) -- [20]
 (count (get (select {from: PT where: (!= g pg1)}) 'v)) -- 4
-;; ordering stays loud on parted guids too
-(select {from: PT where: (< g pg1)}) !- type
+;; parted guids order by their bytes too
+(get (select {from: PT where: (< g pg1)}) 'v) -- (at [10 20 30 40 50] (where (< (concat PG1 PG2) pg1)))
+(get (select {from: PT where: (> g h)}) 'v) -- (at [10 20 30 40 50] (where (> (concat PG1 PG2) (concat (at PT1 'h) PG2))))
 
 ;; partitioned guid columns take the same in/not-in fallback
 (get (select {from: PT where: (in g (at PG1 [0 1]))}) 'v) -- [10 20]

@@ -44,8 +44,10 @@
 (at (select {c: (== ts (first ts)) from: T}) 'c) -- [true false false false]
 (at (select {c: (!= ts 2024.01.01D00:00:00.000000010) from: T}) 'c) -- [true false true true]
 (count (select {from: T where: (> ts 2024.01.01D00:00:00.000000015)})) -- 2
-;; integer scalars keep the exact int64 kernel
-(at (select {c: (> ts 757382400000000015) from: T}) 'c) -- [false false true true]
+;; an integer against a TIMESTAMP is the builtin's type error, not a compare
+;; of the stored nanoseconds (#974)
+(select {c: (> ts 757382400000000015) from: T}) !- type
+(> (at T 'ts) 757382400000000015) !- type
 (at (select {c: (> i (avg i)) from: T}) 'c) -- [false false true true]
 
 ;; Different temporal types compare on one nanosecond scale, as the eval path
