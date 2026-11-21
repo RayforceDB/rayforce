@@ -2726,34 +2726,52 @@ typedef struct {
     uint8_t*           out;
 } join_mask_ctx_t;
 
+RAY_INLINE uint8_t join_mask_probe(const join_mask_ctx_t* c, int64_t l, uint64_t h) {
+    for (uint32_t r = c->ht_heads[(uint32_t)(h & c->ht_mask)]; r != JHT_EMPTY; r = c->ht_next[r])
+        if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree))
+            return c->hit;
+    return (uint8_t)!c->hit;
+}
+
 RAY_INLINE void join_mask_rows(void* raw, int64_t start, int64_t end,
                                bool prefetch_heads, bool single64) {
     join_mask_ctx_t* c = (join_mask_ctx_t*)raw;
+    if (prefetch_heads) {
+        /* Row l+8's hash is computed once: prefetched, then kept in an
+         * 8-slot ring for its own probe.  The caller takes this path only
+         * without a prefilter, so no row is rejected. */
+        uint8_t* restrict out = c->out;
+        uint64_t ring[8];
+        int64_t pre = end - start < 8 ? end : start + 8;
+        for (int64_t l = start; l < pre; l++) {
+            uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+            ring[l & 7] = h;
+            __builtin_prefetch(&c->ht_heads[(uint32_t)(h & c->ht_mask)], 0, 1);
+        }
+        for (int64_t l = start; l < end; l++) {
+            uint64_t h = ring[l & 7];
+            if (l + 8 < end) {
+                uint64_t nh = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
+                ring[l & 7] = nh;
+                __builtin_prefetch(&c->ht_heads[(uint32_t)(nh & c->ht_mask)], 0, 1);
+            }
+            out[l] = join_mask_probe(c, l, h);
+        }
+        return;
+    }
     const join_pf_col_t* pf = c->pf;
     uint32_t n_pf = c->n_pf;
     const int64_t*  d64    = single64 ? (const int64_t*)pf[0].data : NULL;
     const uint64_t* bits64 = single64 ? pf[0].bits : NULL;
     uint64_t base64 = single64 ? (uint64_t)pf[0].base : 0;
     uint64_t span64 = single64 ? pf[0].span : 0;
-    uint8_t hit = c->hit, miss = (uint8_t)!hit;
+    uint8_t miss = (uint8_t)!c->hit;
     uint8_t* restrict out = c->out;
-    uint32_t ht_mask = c->ht_mask;
 
     int64_t skipped = 0;
     for (int64_t l = start; l < end; l++) {
         if (JOIN_PF_REJECT(l)) { out[l] = miss; skipped++; continue; }
-        if (prefetch_heads && l + 8 < end) {
-            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
-            __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
-        }
-        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
-        uint8_t v = miss;
-        for (uint32_t r = c->ht_heads[(uint32_t)(h & ht_mask)]; r != JHT_EMPTY; r = c->ht_next[r])
-            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree)) {
-                v = hit;
-                break;
-            }
-        out[l] = v;
+        out[l] = join_mask_probe(c, l, hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree));
     }
     if (skipped)
         atomic_fetch_add_explicit(&ray_join_prefilter_skips, (uint64_t)skipped,
