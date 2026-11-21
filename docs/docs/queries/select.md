@@ -218,6 +218,40 @@ The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
 `desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
 surviving rows only.
 
+The same holds under `by:`. A running function in a grouped select runs over
+the whole table, not over each group, and the groups then take their rows of
+what it gave: an aggregate over it aggregates them, and a running output on
+its own is that whole-table column split by group. A helper is no different,
+whether the planner inlines it or not, named or written in place: a helper
+with several statements, or one that passes a builtin as a value, is called
+once over the whole columns. A helper runs once per group instead when
+
+- an argument holds an aggregate (`(f i (avg i))`): that aggregate is the
+  group's, as it is written inline;
+- it has an effect (it prints, sets a global), so it runs as often as before;
+- its last statement is an aggregate (`(fn [x] (let y x) (avg y))`), so it
+  gives no value per row;
+- or its call over the whole table fails or gives anything but one typed
+  value per row (a scalar, a LIST). That call is a probe: its cost is paid
+  once over the whole table before the helper runs per group.
+
+A running call in the arguments of a helper that runs per group still runs
+over the whole table. Over the table `r` above:
+
+```lisp
+(select {s: (sums score) from: r by: room})                         ; A: [60 125], B: [80 160]
+(select {s: (last (sums score)) from: r by: room})                  ; s: [125 160]
+(select {s: (sum (sums score)) from: r by: room where: (> score 30)}) ; s: [185 160]
+```
+
+The running sum over all four rows is `60 80 125 160`; room A keeps rows 1
+and 3, room B rows 2 and 4. For a running column per group, use `update`
+with `by:`, which runs the function over each group's rows:
+
+```lisp
+(update {s: (sums score) from: r by: room})   ; s: [60 20 105 55]
+```
+
 ### Group-by Aggregation
 
 The `by:` clause groups rows by one or more key columns. Aggregation functions are specified as additional key-value pairs in the query dict:
@@ -334,8 +368,11 @@ stands for a column:
 A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, an
 expression of constants, a call of a single-expression helper included — is
 evaluated once for the whole query, not once per row or per group, so a side
-effect in it runs once. A helper with several statements is not inlined and
-runs once per group. A collection it
+effect in it runs once. A helper with several statements is not inlined.
+Given no argument that reads the rows, it runs once per group; given one, it
+is called once over the whole table unless one of the exceptions in
+[Running functions under `where:`](#running-functions-under-where) sends it
+per group. A collection it
 returns is aggregated as it stands, as outside a select, and gives the same
 value in every group; a scalar stands for every row, as `1` does in
 `(sum 1)`, which counts the rows:

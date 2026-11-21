@@ -1,0 +1,1207 @@
+;; Running functions under by: (#1249).  A running, moving or shift
+;; function sees the whole table, the rows the where: drops included, in a
+;; grouped select as in a keyless one (docs/queries/select.md "Running
+;; functions under where:"), whatever its spelling: a builtin, a helper the
+;; planner inlines, one it cannot inline (a builtin passed as a value, several
+;; statements).  An aggregate over it aggregates each group's rows of the
+;; whole-table column; a plain output is that column split by group.  The
+;; answer is the same on flat, parted and splayed tables, with take:.
+(set T (table [k i] (list [0 1 0 1 0 1] [1 2 4 8 16 32])))
+(.sys.exec "rm -rf /tmp/rfl_grouped_running /tmp/rfl_grouped_running_s /tmp/rfl_grouped_running_d /tmp/rfl_grouped_running_ds")
+(.db.splayed.set "/tmp/rfl_grouped_running/1/t/" (take T 3))
+(.db.splayed.set "/tmp/rfl_grouped_running/2/t/" (take T -3))
+(.db.splayed.set "/tmp/rfl_grouped_running_s/t/" T)
+(set P (.db.parted.get "/tmp/rfl_grouped_running/" 't))
+(set S (.db.splayed.get "/tmp/rfl_grouped_running_s/t/"))
+(set hs (fn [x] (sums x)))
+(set hd (fn [x] (deltas x)))
+(set hm (fn [x] (msum 2 x)))
+(set hl (fn [x] (lag x)))
+(set lp (fn [x] (prior - x)))
+(set hs2 (fn [x] (let y x) (sums y)))
+(set hd2 (fn [x] (let y x) (deltas y)))
+(set Z (fn [r] (at (xasc r 'k) 'z)))
+
+;; The issue: (prior - x) in a helper the planner cannot inline ran per group.
+(Z (select {from: T by: k z: (sum (prior - i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (lp i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (hs2 i))})) -- [39 81]
+;; A plain running output is the whole-table column split by group.
+(Z (select {from: T by: k z: (sums i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k where: (> i 2) z: (sums i)})) -- (list [7 31] [15 63])
+
+;; Every spelling (a helper by name or written in place), with and without
+;; where:, flat, parted and splayed.
+(Z (select {from: T by: k z: (sums i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: (hs i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: ((fn [x] (sums x)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: (hs2 i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: T by: k z: (deltas i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: (hd i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: (hd2 i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: (prior - i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: T by: k z: (lp i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: T by: k z: ((fn [x] (prior - x)) i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: T by: k z: (msum 2 i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: T by: k z: (hm i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: T by: k z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: T by: k z: (lag i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: (hl i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: T by: k z: (sum (sums i))})) -- [39 81]
+(Z (select {from: T by: k z: (sum (hs i))})) -- [39 81]
+(Z (select {from: T by: k z: (sum ((fn [x] (sums x)) i))})) -- [39 81]
+(Z (select {from: T by: k z: (sum (hs2 i))})) -- [39 81]
+(Z (select {from: T by: k z: (sum (deltas i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (hd i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (hd2 i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (prior - i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (lp i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum ((fn [x] (prior - x)) i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (msum 2 i))})) -- [31 63]
+(Z (select {from: T by: k z: (sum (hm i))})) -- [31 63]
+(Z (select {from: T by: k z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [31 63]
+(Z (select {from: T by: k z: (sum (lag i))})) -- [10 21]
+(Z (select {from: T by: k z: (sum (hl i))})) -- [10 21]
+(Z (select {from: T by: k z: (last (sums i))})) -- [31 63]
+(Z (select {from: T by: k z: (last (hs i))})) -- [31 63]
+(Z (select {from: T by: k z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: T by: k z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: T by: k z: (last (deltas i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (hd i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: T by: k z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (prior - i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (lp i))})) -- [8 16]
+(Z (select {from: T by: k z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: T by: k z: (last (hm i))})) -- [24 48]
+(Z (select {from: T by: k z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: T by: k z: (last (lag i))})) -- [8 16]
+(Z (select {from: T by: k z: (last (hl i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (sums i)})) -- (list [7 31] [15 63])
+(Z (select {from: T by: k where: (> i 2) z: (hs i)})) -- (list [7 31] [15 63])
+(Z (select {from: T by: k where: (> i 2) z: ((fn [x] (sums x)) i)})) -- (list [7 31] [15 63])
+(Z (select {from: T by: k where: (> i 2) z: (hs2 i)})) -- (list [7 31] [15 63])
+(Z (select {from: T by: k where: (> i 2) z: (deltas i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (hd i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (hd2 i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (prior - i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (lp i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: ((fn [x] (prior - x)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (msum 2 i)})) -- (list [6 24] [12 48])
+(Z (select {from: T by: k where: (> i 2) z: (hm i)})) -- (list [6 24] [12 48])
+(Z (select {from: T by: k where: (> i 2) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [6 24] [12 48])
+(Z (select {from: T by: k where: (> i 2) z: (lag i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (hl i)})) -- (list [2 8] [4 16])
+(Z (select {from: T by: k where: (> i 2) z: (sum (sums i))})) -- [38 78]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hs i))})) -- [38 78]
+(Z (select {from: T by: k where: (> i 2) z: (sum ((fn [x] (sums x)) i))})) -- [38 78]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hs2 i))})) -- [38 78]
+(Z (select {from: T by: k where: (> i 2) z: (sum (deltas i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hd i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hd2 i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (prior - i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (lp i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum ((fn [x] (prior - x)) i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (msum 2 i))})) -- [30 60]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hm i))})) -- [30 60]
+(Z (select {from: T by: k where: (> i 2) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [30 60]
+(Z (select {from: T by: k where: (> i 2) z: (sum (lag i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (sum (hl i))})) -- [10 20]
+(Z (select {from: T by: k where: (> i 2) z: (last (sums i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (last (hs i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: T by: k where: (> i 2) z: (last (deltas i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (hd i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (prior - i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (lp i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: T by: k where: (> i 2) z: (last (hm i))})) -- [24 48]
+(Z (select {from: T by: k where: (> i 2) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: T by: k where: (> i 2) z: (last (lag i))})) -- [8 16]
+(Z (select {from: T by: k where: (> i 2) z: (last (hl i))})) -- [8 16]
+(Z (select {from: T by: k where: (== k 1) z: (sums i)})) -- (list [3 15 63])
+(Z (select {from: T by: k where: (== k 1) z: (hs i)})) -- (list [3 15 63])
+(Z (select {from: T by: k where: (== k 1) z: ((fn [x] (sums x)) i)})) -- (list [3 15 63])
+(Z (select {from: T by: k where: (== k 1) z: (hs2 i)})) -- (list [3 15 63])
+(Z (select {from: T by: k where: (== k 1) z: (deltas i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (hd i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (hd2 i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (prior - i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (lp i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: ((fn [x] (prior - x)) i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (msum 2 i)})) -- (list [3 12 48])
+(Z (select {from: T by: k where: (== k 1) z: (hm i)})) -- (list [3 12 48])
+(Z (select {from: T by: k where: (== k 1) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [3 12 48])
+(Z (select {from: T by: k where: (== k 1) z: (lag i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (hl i)})) -- (list [1 4 16])
+(Z (select {from: T by: k where: (== k 1) z: (sum (sums i))})) -- [81]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hs i))})) -- [81]
+(Z (select {from: T by: k where: (== k 1) z: (sum ((fn [x] (sums x)) i))})) -- [81]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hs2 i))})) -- [81]
+(Z (select {from: T by: k where: (== k 1) z: (sum (deltas i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hd i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hd2 i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (prior - i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (lp i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum ((fn [x] (prior - x)) i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (msum 2 i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hm i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (sum (lag i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (sum (hl i))})) -- [21]
+(Z (select {from: T by: k where: (== k 1) z: (last (sums i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (last (hs i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (last ((fn [x] (sums x)) i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (last (hs2 i))})) -- [63]
+(Z (select {from: T by: k where: (== k 1) z: (last (deltas i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (hd i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (hd2 i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (prior - i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (lp i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last ((fn [x] (prior - x)) i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (msum 2 i))})) -- [48]
+(Z (select {from: T by: k where: (== k 1) z: (last (hm i))})) -- [48]
+(Z (select {from: T by: k where: (== k 1) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [48]
+(Z (select {from: T by: k where: (== k 1) z: (last (lag i))})) -- [16]
+(Z (select {from: T by: k where: (== k 1) z: (last (hl i))})) -- [16]
+(Z (select {from: P by: k z: (sums i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: P by: k z: (hs i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: P by: k z: ((fn [x] (sums x)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: P by: k z: (hs2 i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: P by: k z: (deltas i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: (hd i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: (hd2 i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: (prior - i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: P by: k z: (lp i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: P by: k z: ((fn [x] (prior - x)) i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: P by: k z: (msum 2 i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: P by: k z: (hm i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: P by: k z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: P by: k z: (lag i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: (hl i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: P by: k z: (sum (sums i))})) -- [39 81]
+(Z (select {from: P by: k z: (sum (hs i))})) -- [39 81]
+(Z (select {from: P by: k z: (sum ((fn [x] (sums x)) i))})) -- [39 81]
+(Z (select {from: P by: k z: (sum (hs2 i))})) -- [39 81]
+(Z (select {from: P by: k z: (sum (deltas i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (hd i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (hd2 i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (prior - i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (lp i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum ((fn [x] (prior - x)) i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (msum 2 i))})) -- [31 63]
+(Z (select {from: P by: k z: (sum (hm i))})) -- [31 63]
+(Z (select {from: P by: k z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [31 63]
+(Z (select {from: P by: k z: (sum (lag i))})) -- [10 21]
+(Z (select {from: P by: k z: (sum (hl i))})) -- [10 21]
+(Z (select {from: P by: k z: (last (sums i))})) -- [31 63]
+(Z (select {from: P by: k z: (last (hs i))})) -- [31 63]
+(Z (select {from: P by: k z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: P by: k z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: P by: k z: (last (deltas i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (hd i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: P by: k z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (prior - i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (lp i))})) -- [8 16]
+(Z (select {from: P by: k z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: P by: k z: (last (hm i))})) -- [24 48]
+(Z (select {from: P by: k z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: P by: k z: (last (lag i))})) -- [8 16]
+(Z (select {from: P by: k z: (last (hl i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (sums i)})) -- (list [7 31] [15 63])
+(Z (select {from: P by: k where: (> i 2) z: (hs i)})) -- (list [7 31] [15 63])
+(Z (select {from: P by: k where: (> i 2) z: ((fn [x] (sums x)) i)})) -- (list [7 31] [15 63])
+(Z (select {from: P by: k where: (> i 2) z: (hs2 i)})) -- (list [7 31] [15 63])
+(Z (select {from: P by: k where: (> i 2) z: (deltas i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (hd i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (hd2 i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (prior - i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (lp i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: ((fn [x] (prior - x)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (msum 2 i)})) -- (list [6 24] [12 48])
+(Z (select {from: P by: k where: (> i 2) z: (hm i)})) -- (list [6 24] [12 48])
+(Z (select {from: P by: k where: (> i 2) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [6 24] [12 48])
+(Z (select {from: P by: k where: (> i 2) z: (lag i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (hl i)})) -- (list [2 8] [4 16])
+(Z (select {from: P by: k where: (> i 2) z: (sum (sums i))})) -- [38 78]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hs i))})) -- [38 78]
+(Z (select {from: P by: k where: (> i 2) z: (sum ((fn [x] (sums x)) i))})) -- [38 78]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hs2 i))})) -- [38 78]
+(Z (select {from: P by: k where: (> i 2) z: (sum (deltas i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hd i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hd2 i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (prior - i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (lp i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum ((fn [x] (prior - x)) i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (msum 2 i))})) -- [30 60]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hm i))})) -- [30 60]
+(Z (select {from: P by: k where: (> i 2) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [30 60]
+(Z (select {from: P by: k where: (> i 2) z: (sum (lag i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hl i))})) -- [10 20]
+(Z (select {from: P by: k where: (> i 2) z: (last (sums i))})) -- [31 63]
+(Z (select {from: P by: k where: (> i 2) z: (last (hs i))})) -- [31 63]
+(Z (select {from: P by: k where: (> i 2) z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: P by: k where: (> i 2) z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: P by: k where: (> i 2) z: (last (deltas i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (hd i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (prior - i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (lp i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: P by: k where: (> i 2) z: (last (hm i))})) -- [24 48]
+(Z (select {from: P by: k where: (> i 2) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: P by: k where: (> i 2) z: (last (lag i))})) -- [8 16]
+(Z (select {from: P by: k where: (> i 2) z: (last (hl i))})) -- [8 16]
+(Z (select {from: P by: k where: (== k 1) z: (sums i)})) -- (list [3 15 63])
+(Z (select {from: P by: k where: (== k 1) z: (hs i)})) -- (list [3 15 63])
+(Z (select {from: P by: k where: (== k 1) z: ((fn [x] (sums x)) i)})) -- (list [3 15 63])
+(Z (select {from: P by: k where: (== k 1) z: (hs2 i)})) -- (list [3 15 63])
+(Z (select {from: P by: k where: (== k 1) z: (deltas i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (hd i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (hd2 i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (prior - i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (lp i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: ((fn [x] (prior - x)) i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (msum 2 i)})) -- (list [3 12 48])
+(Z (select {from: P by: k where: (== k 1) z: (hm i)})) -- (list [3 12 48])
+(Z (select {from: P by: k where: (== k 1) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [3 12 48])
+(Z (select {from: P by: k where: (== k 1) z: (lag i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (hl i)})) -- (list [1 4 16])
+(Z (select {from: P by: k where: (== k 1) z: (sum (sums i))})) -- [81]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hs i))})) -- [81]
+(Z (select {from: P by: k where: (== k 1) z: (sum ((fn [x] (sums x)) i))})) -- [81]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hs2 i))})) -- [81]
+(Z (select {from: P by: k where: (== k 1) z: (sum (deltas i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hd i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hd2 i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (prior - i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (lp i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum ((fn [x] (prior - x)) i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (msum 2 i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hm i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (sum (lag i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (sum (hl i))})) -- [21]
+(Z (select {from: P by: k where: (== k 1) z: (last (sums i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (last (hs i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (last ((fn [x] (sums x)) i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (last (hs2 i))})) -- [63]
+(Z (select {from: P by: k where: (== k 1) z: (last (deltas i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (hd i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (hd2 i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (prior - i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (lp i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last ((fn [x] (prior - x)) i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (msum 2 i))})) -- [48]
+(Z (select {from: P by: k where: (== k 1) z: (last (hm i))})) -- [48]
+(Z (select {from: P by: k where: (== k 1) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [48]
+(Z (select {from: P by: k where: (== k 1) z: (last (lag i))})) -- [16]
+(Z (select {from: P by: k where: (== k 1) z: (last (hl i))})) -- [16]
+(Z (select {from: S by: k z: (sums i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: S by: k z: (hs i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: S by: k z: ((fn [x] (sums x)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: S by: k z: (hs2 i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: S by: k z: (deltas i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: (hd i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: (hd2 i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: (prior - i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: S by: k z: (lp i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: S by: k z: ((fn [x] (prior - x)) i)})) -- (list [0 2 8] [1 4 16])
+(Z (select {from: S by: k z: (msum 2 i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: S by: k z: (hm i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: S by: k z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [1 6 24] [3 12 48])
+(Z (select {from: S by: k z: (lag i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: (hl i)})) -- (list [0Nl 2 8] [1 4 16])
+(Z (select {from: S by: k z: (sum (sums i))})) -- [39 81]
+(Z (select {from: S by: k z: (sum (hs i))})) -- [39 81]
+(Z (select {from: S by: k z: (sum ((fn [x] (sums x)) i))})) -- [39 81]
+(Z (select {from: S by: k z: (sum (hs2 i))})) -- [39 81]
+(Z (select {from: S by: k z: (sum (deltas i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (hd i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (hd2 i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (prior - i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (lp i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum ((fn [x] (prior - x)) i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (msum 2 i))})) -- [31 63]
+(Z (select {from: S by: k z: (sum (hm i))})) -- [31 63]
+(Z (select {from: S by: k z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [31 63]
+(Z (select {from: S by: k z: (sum (lag i))})) -- [10 21]
+(Z (select {from: S by: k z: (sum (hl i))})) -- [10 21]
+(Z (select {from: S by: k z: (last (sums i))})) -- [31 63]
+(Z (select {from: S by: k z: (last (hs i))})) -- [31 63]
+(Z (select {from: S by: k z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: S by: k z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: S by: k z: (last (deltas i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (hd i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: S by: k z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (prior - i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (lp i))})) -- [8 16]
+(Z (select {from: S by: k z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: S by: k z: (last (hm i))})) -- [24 48]
+(Z (select {from: S by: k z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: S by: k z: (last (lag i))})) -- [8 16]
+(Z (select {from: S by: k z: (last (hl i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (sums i)})) -- (list [7 31] [15 63])
+(Z (select {from: S by: k where: (> i 2) z: (hs i)})) -- (list [7 31] [15 63])
+(Z (select {from: S by: k where: (> i 2) z: ((fn [x] (sums x)) i)})) -- (list [7 31] [15 63])
+(Z (select {from: S by: k where: (> i 2) z: (hs2 i)})) -- (list [7 31] [15 63])
+(Z (select {from: S by: k where: (> i 2) z: (deltas i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (hd i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (hd2 i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (prior - i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (lp i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: ((fn [x] (prior - x)) i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (msum 2 i)})) -- (list [6 24] [12 48])
+(Z (select {from: S by: k where: (> i 2) z: (hm i)})) -- (list [6 24] [12 48])
+(Z (select {from: S by: k where: (> i 2) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [6 24] [12 48])
+(Z (select {from: S by: k where: (> i 2) z: (lag i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (hl i)})) -- (list [2 8] [4 16])
+(Z (select {from: S by: k where: (> i 2) z: (sum (sums i))})) -- [38 78]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hs i))})) -- [38 78]
+(Z (select {from: S by: k where: (> i 2) z: (sum ((fn [x] (sums x)) i))})) -- [38 78]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hs2 i))})) -- [38 78]
+(Z (select {from: S by: k where: (> i 2) z: (sum (deltas i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hd i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hd2 i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (prior - i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (lp i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum ((fn [x] (prior - x)) i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (msum 2 i))})) -- [30 60]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hm i))})) -- [30 60]
+(Z (select {from: S by: k where: (> i 2) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [30 60]
+(Z (select {from: S by: k where: (> i 2) z: (sum (lag i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (sum (hl i))})) -- [10 20]
+(Z (select {from: S by: k where: (> i 2) z: (last (sums i))})) -- [31 63]
+(Z (select {from: S by: k where: (> i 2) z: (last (hs i))})) -- [31 63]
+(Z (select {from: S by: k where: (> i 2) z: (last ((fn [x] (sums x)) i))})) -- [31 63]
+(Z (select {from: S by: k where: (> i 2) z: (last (hs2 i))})) -- [31 63]
+(Z (select {from: S by: k where: (> i 2) z: (last (deltas i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (hd i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (hd2 i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (prior - i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (lp i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last ((fn [x] (prior - x)) i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (msum 2 i))})) -- [24 48]
+(Z (select {from: S by: k where: (> i 2) z: (last (hm i))})) -- [24 48]
+(Z (select {from: S by: k where: (> i 2) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [24 48]
+(Z (select {from: S by: k where: (> i 2) z: (last (lag i))})) -- [8 16]
+(Z (select {from: S by: k where: (> i 2) z: (last (hl i))})) -- [8 16]
+(Z (select {from: S by: k where: (== k 1) z: (sums i)})) -- (list [3 15 63])
+(Z (select {from: S by: k where: (== k 1) z: (hs i)})) -- (list [3 15 63])
+(Z (select {from: S by: k where: (== k 1) z: ((fn [x] (sums x)) i)})) -- (list [3 15 63])
+(Z (select {from: S by: k where: (== k 1) z: (hs2 i)})) -- (list [3 15 63])
+(Z (select {from: S by: k where: (== k 1) z: (deltas i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (hd i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (hd2 i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: ((fn [x] (let y x) (deltas y)) i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (prior - i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (lp i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: ((fn [x] (prior - x)) i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (msum 2 i)})) -- (list [3 12 48])
+(Z (select {from: S by: k where: (== k 1) z: (hm i)})) -- (list [3 12 48])
+(Z (select {from: S by: k where: (== k 1) z: ((fn [x] (let y x) (msum 2 y)) i)})) -- (list [3 12 48])
+(Z (select {from: S by: k where: (== k 1) z: (lag i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (hl i)})) -- (list [1 4 16])
+(Z (select {from: S by: k where: (== k 1) z: (sum (sums i))})) -- [81]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hs i))})) -- [81]
+(Z (select {from: S by: k where: (== k 1) z: (sum ((fn [x] (sums x)) i))})) -- [81]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hs2 i))})) -- [81]
+(Z (select {from: S by: k where: (== k 1) z: (sum (deltas i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hd i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hd2 i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum ((fn [x] (let y x) (deltas y)) i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (prior - i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (lp i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum ((fn [x] (prior - x)) i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (msum 2 i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hm i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (sum ((fn [x] (let y x) (msum 2 y)) i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (sum (lag i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (sum (hl i))})) -- [21]
+(Z (select {from: S by: k where: (== k 1) z: (last (sums i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (last (hs i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (last ((fn [x] (sums x)) i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (last (hs2 i))})) -- [63]
+(Z (select {from: S by: k where: (== k 1) z: (last (deltas i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (hd i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (hd2 i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last ((fn [x] (let y x) (deltas y)) i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (prior - i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (lp i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last ((fn [x] (prior - x)) i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (msum 2 i))})) -- [48]
+(Z (select {from: S by: k where: (== k 1) z: (last (hm i))})) -- [48]
+(Z (select {from: S by: k where: (== k 1) z: (last ((fn [x] (let y x) (msum 2 y)) i))})) -- [48]
+(Z (select {from: S by: k where: (== k 1) z: (last (lag i))})) -- [16]
+(Z (select {from: S by: k where: (== k 1) z: (last (hl i))})) -- [16]
+
+;; take: keeps groups, not the rows a running call sees.
+(Z (select {from: T by: k z: (sum (lp i)) take: 1})) -- [10]
+(Z (select {from: P by: k where: (> i 2) z: (sum (hs2 i)) take: 1})) -- [38]
+(Z (select {from: S by: k where: (> i 2) z: (lp i) take: 1})) -- (list [2 8])
+;; last of a plain output is the (last ...) of the same call.
+(map last (Z (select {from: T by: k z: (prior - i)}))) -- (Z (select {from: T by: k z: (last (prior - i))}))
+(map last (Z (select {from: T by: k z: (hs2 i)}))) -- (Z (select {from: T by: k z: (last (hs2 i))}))
+(map last (Z (select {from: P by: k where: (> i 2) z: (sums i)}))) -- (Z (select {from: P by: k where: (> i 2) z: (last (sums i))}))
+;; An aggregate under a running call sees the whole table too.
+(Z (select {from: T by: k z: (last (sums (- i (avg i))))})) -- [-21.5 0.0]
+(Z (select {from: T by: k z: (- (last (sums i)) (first (prior - i)))})) -- [31 62]
+;; A helper with an aggregate inside is called once over the whole table
+;; when it gives one value per row ...
+(set hz2 (fn [x] (let y x) (- y (avg y))))
+(Z (select {from: T by: k z: (last (hz2 i))})) -- [5.5 21.5]
+(Z (select {from: T by: k z: (hz2 i)})) -- (list [-9.5 -6.5 5.5] [-8.5 -2.5 21.5])
+;; ... and per group when it does not, or when it fails over the whole table.
+(set ha (fn [x] (let y x) (avg y)))
+(Z (select {from: T by: k z: (sum (ha i))})) -- [7.0 14.0]
+(set he (fn [x] (let y x) (if (> (count y) 3) (raise "big") (sums y))))
+(Z (select {from: T by: k z: (sum (he i))})) -- [27 54]
+;; An aggregate passed to a helper is the group's, as it is inline: the
+;; helper call stays per group, and a running call in its arguments is
+;; still taken over the whole table.
+(set hz (fn [x y] (let q x) (- q y)))
+(Z (select {from: T by: k z: (hz i (first i))})) -- (list [0 3 15] [0 6 30])
+(Z (select {from: T by: k z: (hz i (avg i))})) -- (list [-6.0 -3.0 9.0] [-12.0 -6.0 18.0])
+(Z (select {from: T by: k where: (> i 2) z: (hz i (first i))})) -- (list [0 12] [0 24])
+(select {from: T by: k z: (sum (hz i (count i)))}) !- domain
+(Z (select {from: T by: k z: (hz (sums i) (sum i))})) -- (list [-20 -14 10] [-39 -27 21])
+;; A call that runs per group still takes the running calls in its
+;; arguments over the whole table.
+(set h3 (fn [x] (let n (count x)) (take x 2)))
+(Z (select {from: T by: k z: (h3 (sums i))})) -- (list [1 7] [3 15])
+(Z (select {from: P by: k where: (> i 2) z: (h3 (sums i))})) -- (list [7 31] [15 63])
+;; So does a helper with an effect, which runs per group, once each.
+(set NC 0)
+(set hfx (fn [x] (set NC (+ NC 1)) x))
+(Z (select {from: T by: k z: (sum (hfx (sums i)))})) -- [39 81]
+NC -- 2
+(Z (select {from: T by: k where: (> i 2) z: (last (hfx (prior - i)))})) -- [8 16]
+;; A lambda written in place is a helper like any other.
+(Z (select {from: T by: k z: (sum ((fn [x] (let y x) (sums y)) i))})) -- [39 81]
+(Z (select {from: T by: k z: ((fn [x] (let y x) (sums y)) i)})) -- (list [1 7 31] [3 15 63])
+(Z (select {from: S by: k where: (> i 2) z: (sum ((fn [x] (prior - x)) i))})) -- [10 20]
+;; A helper whose result is a reduction runs per group only: it is not
+;; tried over the whole table first.
+(set NR 0)
+(set hred (fn [x] (set NR (+ NR 1)) (let y x) (med y)))
+(Z (select {from: T by: k z: (sum (hred i))})) -- [4.0 8.0]
+NR -- 2
+;; A helper that gives a LIST (not one typed value per row) runs per group.
+(set hlst (fn [x] (let y x) (map (fn [a] (list a a)) (sums y))))
+(Z (select {from: T by: k z: (last (hlst i))})) -- (list [21 21] [42 42])
+;; The same call twice is one column; each output reads it.
+(set Q2 (select {from: T by: k z: (sum (hs2 i)) y: (last (hs2 i))}))
+(Z Q2) -- [39 81]
+(at (xasc Q2 'k) 'y) -- [31 63]
+;; An output that rebinds a column keeps out only the calls that read it:
+;; under an aggregate a source column name is the source column.
+(Z (select {from: T by: k i: (* 10 i) z: (last (prior - i))})) -- [8 16]
+(Z (select {from: T by: k i: (* 10 i) z: (sum (sums i))})) -- [39 81]
+(Z (select {from: T by: k i: (* 10 i) z: (prior - i)})) -- (list [0 20 80] [10 40 160])
+(at (xasc (select {from: T by: k i: (* 10 i) y: (last (lp i)) z: (sums i)}) 'k) 'y) -- [8 16]
+;; A running call over a per-group alias runs across the groups, as before.
+(Z (select {from: T by: k n: (sum i) z: (deltas n)})) -- [0Nl 21]
+;; A running call in the where: or the by: is not an output: it is unchanged.
+(Z (select {from: T by: k where: (> (sums i) 5) z: (sum i)})) -- [20 40]
+;; update by: stays per group.
+(at (update {from: T z: (sums i) by: k}) 'z) -- [1 2 5 10 21 42]
+(at (update {from: T z: (hs2 i) by: k}) 'z) -- [1 2 5 10 21 42]
+(at (update {from: T z: (lp i) by: k}) 'z) -- [0 0 3 6 12 24]
+
+;; Against the whole-table oracle: the call over the whole table by update,
+;; then grouped, on a larger table, several key shapes and outputs beside
+;; (in key order: the order of the groups is not the point here).
+(set N 3000)
+(set x (til N))
+(set D (table [k s i f t u] (list (% (* x 7919) 13) (at ['a 'b 'c 'd] (% (* x 31) 4)) (% (* x 104729) 1000) (* 0.5 (+ 1 (% (* x 13) 97))) (at ["x" "yy" "z"] (% x 3)) (at (concat (as 'GUID "11111111-1111-1111-1111-111111111111") (concat (as 'GUID "22222222-2222-2222-2222-222222222222") (as 'GUID "33333333-3333-3333-3333-333333333333"))) (% x 3)))))
+(.db.splayed.set "/tmp/rfl_grouped_running_d/1/t/" (take D 1000))
+(.db.splayed.set "/tmp/rfl_grouped_running_d/2/t/" (take (take D 2000) -1000))
+(.db.splayed.set "/tmp/rfl_grouped_running_d/3/t/" (take D -1000))
+(.db.splayed.set "/tmp/rfl_grouped_running_ds/t/" D)
+(set DP (.db.parted.get "/tmp/rfl_grouped_running_d/" 't))
+(set DS (.db.splayed.get "/tmp/rfl_grouped_running_ds/t/"))
+(set g_sums (fn [v] (let y v) (sums y)))
+(set g_prior (fn [v] (prior - v)))
+(set g_dev (fn [v] (let y v) (- y (avg y))))
+(set g_two (fn [a b] (let y (+ a b)) (deltas y)))
+(set CNT 0)
+(set g_eff (fn [v] (set CNT (+ CNT 1)) v))
+(xasc (select {from: D by: k r: (sums i)}) 'k) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: k r: zz}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (sums i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (sums i)}) 't) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: D by: u r: (sum (sums i))}) 'u) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (sum (sums i))}) 'g) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (sum (sums i)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (last (sums i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (last (sums i)) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (last (sums i)) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (max (sums i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (max (sums i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (max (sums i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (sums i)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (deltas i) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (deltas i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (deltas i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (sum (deltas i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (sum (deltas i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (sum (deltas i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (last (deltas i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (last (deltas i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (last (deltas i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (max (deltas i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (max (deltas i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (max (deltas i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (deltas i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (prior - i) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (prior - i) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (prior - i) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (sum (prior - i)) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (sum (prior - i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (sum (prior - i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (last (prior - i))}) 'k) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (last (prior - i))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (last (prior - i))}) 't) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: D by: u r: (max (prior - i))}) 'u) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (max (prior - i))}) 'g) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (max (prior - i)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (prior - i)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (msum 3 i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (msum 3 i) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (msum 3 i) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (sum (msum 3 i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (sum (msum 3 i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (sum (msum 3 i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (last (msum 3 i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (last (msum 3 i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (last (msum 3 i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (max (msum 3 i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (max (msum 3 i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (max (msum 3 i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (msum 3 i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (mavg 3 f) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (mavg 3 f) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (mavg 3 f) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (sum (mavg 3 f)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (sum (mavg 3 f)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (sum (mavg 3 f)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (last (mavg 3 f)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (last (mavg 3 f)) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (last (mavg 3 f)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (max (mavg 3 f)) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (max (mavg 3 f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (max (mavg 3 f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (mavg 3 f)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (lag i)}) 'k) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: k r: zz}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (lag i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (lag i)}) 't) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: D by: u r: (sum (lag i))}) 'u) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (sum (lag i))}) 'g) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (sum (lag i)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (last (lag i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (last (lag i)) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (last (lag i)) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (max (lag i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (max (lag i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (max (lag i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (lag i)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (lead i) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (lead i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (lead i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (sum (lead i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (sum (lead i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (sum (lead i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (last (lead i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (last (lead i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (last (lead i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (max (lead i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (max (lead i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (max (lead i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (lead i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (ratios f) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (ratios f) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (ratios f) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (sum (ratios f)) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (sum (ratios f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (sum (ratios f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (last (ratios f))}) 'k) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (last (ratios f))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (last (ratios f))}) 't) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: D by: u r: (max (ratios f))}) 'u) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (max (ratios f))}) 'g) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (max (ratios f)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (ratios f)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (maxs i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (maxs i) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (maxs i) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (sum (maxs i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (sum (maxs i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (sum (maxs i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (last (maxs i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (last (maxs i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (last (maxs i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (max (maxs i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (max (maxs i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (max (maxs i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (maxs i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (differ s) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (differ s) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (differ s) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (sum (differ s)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (sum (differ s)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (sum (differ s)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (last (differ s)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (last (differ s)) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (last (differ s)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (max (differ s)) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (max (differ s)) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (max (differ s)) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (differ s)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (g_sums i)}) 'k) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: k r: zz}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (g_sums i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (g_sums i)}) 't) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: D by: u r: (sum (g_sums i))}) 'u) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (sum (g_sums i))}) 'g) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (sum (g_sums i)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (last (g_sums i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (last (g_sums i)) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (last (g_sums i)) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (max (g_sums i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (max (g_sums i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (max (g_sums i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_sums i)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (g_prior i) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (g_prior i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (g_prior i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (sum (g_prior i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (sum (g_prior i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (sum (g_prior i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (last (g_prior i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (last (g_prior i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (last (g_prior i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (max (g_prior i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (max (g_prior i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (max (g_prior i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (g_prior i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (g_dev f) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (g_dev f) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (g_dev f) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (sum (g_dev f)) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (sum (g_dev f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (sum (g_dev f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (last (g_dev f))}) 'k) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (last (g_dev f))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (last (g_dev f))}) 't) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: D by: u r: (max (g_dev f))}) 'u) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (max (g_dev f))}) 'g) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (max (g_dev f)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (g_dev f)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (g_two i f) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (g_two i f) p: i}) 't) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (g_two i f) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (sum (g_two i f)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (sum (g_two i f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (sum (g_two i f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: (last (g_two i f)) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (last (g_two i f)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (last (g_two i f)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (max (g_two i f)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (max (g_two i f)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (max (g_two i f)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: (g_two i f)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (sums (- f (avg f))) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (sums (- f (avg f))) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (sums (- f (avg f))) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (sum (sums (- f (avg f)))) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (sum (sums (- f (avg f)))) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (sum (sums (- f (avg f)))) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (last (sums (- f (avg f)))) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (last (sums (- f (avg f)))) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (last (sums (- f (avg f)))) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (max (sums (- f (avg f)))) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (max (sums (- f (avg f)))) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (max (sums (- f (avg f)))) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (sums (- f (avg f)))}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: ((fn [v] (let y v) (sums y)) i)}) 'k) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: k r: zz}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: ((fn [v] (let y v) (sums y)) i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: ((fn [v] (let y v) (sums y)) i)}) 't) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: D by: u r: (sum ((fn [v] (let y v) (sums y)) i))}) 'u) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (sum ((fn [v] (let y v) (sums y)) i))}) 'g) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (sum ((fn [v] (let y v) (sums y)) i)) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: D by: [k s] r: (last ((fn [v] (let y v) (sums y)) i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (last ((fn [v] (let y v) (sums y)) i)) p: i}) 't) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (last ((fn [v] (let y v) (sums y)) i)) p: i}) 'u) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (max ((fn [v] (let y v) (sums y)) i)) p: i}) 'g) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (max ((fn [v] (let y v) (sums y)) i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (max ((fn [v] (let y v) (sums y)) i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: D by: t r: ((fn [v] (prior - v)) f) c: (count i)}) 't) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: ((fn [v] (prior - v)) f) c: (count i)}) 'u) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: ((fn [v] (prior - v)) f) c: (count i)}) 'g) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: D by: k r: (sum ((fn [v] (prior - v)) f)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (sum ((fn [v] (prior - v)) f)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (sum ((fn [v] (prior - v)) f)) m: (first f)}) 't) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: D by: u r: (last ((fn [v] (prior - v)) f)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (last ((fn [v] (prior - v)) f)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (last ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: D by: [k s] r: (max ((fn [v] (prior - v)) f)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: D by: t where: (> i 500) r: (max ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: D by: u where: (== k 3) r: (max ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: D zz: ((fn [v] (prior - v)) f)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} r: (g_eff (deltas i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: D by: k where: (> i 500) r: (g_eff (deltas i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: D by: [k s] where: (== k 3) r: (g_eff (deltas i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: D by: t r: (sum (g_eff (deltas i))) u1: 1}) 't) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: D by: u where: (> i 500) r: (sum (g_eff (deltas i))) u1: 1}) 'u) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (== k 3) r: (sum (g_eff (deltas i))) u1: 1}) 'g) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: D by: k r: (last (g_eff (deltas i)))}) 'k) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: k r: (last zz)}) 'k)
+(xasc (select {from: D by: [k s] where: (> i 500) r: (last (g_eff (deltas i)))}) ['k 's]) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: D by: t where: (== k 3) r: (last (g_eff (deltas i)))}) 't) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: D by: u r: (max (g_eff (deltas i)))}) 'u) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: u r: (max zz)}) 'u)
+(xasc (select {from: D by: {g: (% i 7)} where: (> i 500) r: (max (g_eff (deltas i)))}) 'g) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: D by: k where: (== k 3) r: (max (g_eff (deltas i))) p: i}) 'k) -- (xasc (select {from: (update {from: D zz: (g_eff (deltas i))}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (sums i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (sums i) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (sums i) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (sum (sums i)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (sum (sums i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (sum (sums i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (last (sums i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (last (sums i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (last (sums i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (max (sums i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (max (sums i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (max (sums i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (sums i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (deltas i) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (deltas i) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (deltas i) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (sum (deltas i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (sum (deltas i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (sum (deltas i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (last (deltas i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (last (deltas i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (last (deltas i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (max (deltas i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (max (deltas i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (max (deltas i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (deltas i)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (prior - i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: k r: zz}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (prior - i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (prior - i)}) 't) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DP by: u r: (sum (prior - i))}) 'u) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (sum (prior - i))}) 'g) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (sum (prior - i)) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (last (prior - i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (last (prior - i)) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (last (prior - i)) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (max (prior - i)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (max (prior - i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (max (prior - i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (prior - i)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (msum 3 i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (msum 3 i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (msum 3 i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (sum (msum 3 i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (sum (msum 3 i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (sum (msum 3 i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (last (msum 3 i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (last (msum 3 i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (last (msum 3 i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (max (msum 3 i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (max (msum 3 i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (max (msum 3 i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (msum 3 i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (mavg 3 f) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (mavg 3 f) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (mavg 3 f) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (sum (mavg 3 f)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (sum (mavg 3 f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (sum (mavg 3 f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (last (mavg 3 f))}) 'k) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (last (mavg 3 f))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (last (mavg 3 f))}) 't) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DP by: u r: (max (mavg 3 f))}) 'u) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (max (mavg 3 f))}) 'g) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (max (mavg 3 f)) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (mavg 3 f)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (lag i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (lag i) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (lag i) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (sum (lag i)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (sum (lag i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (sum (lag i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (last (lag i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (last (lag i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (last (lag i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (max (lag i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (max (lag i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (max (lag i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (lag i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (lead i) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (lead i) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (lead i) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (sum (lead i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (sum (lead i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (sum (lead i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (last (lead i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (last (lead i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (last (lead i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (max (lead i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (max (lead i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (max (lead i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (lead i)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (ratios f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: k r: zz}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (ratios f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (ratios f)}) 't) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DP by: u r: (sum (ratios f))}) 'u) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (sum (ratios f))}) 'g) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (sum (ratios f)) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (last (ratios f)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (last (ratios f)) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (last (ratios f)) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (max (ratios f)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (max (ratios f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (max (ratios f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (ratios f)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (maxs i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (maxs i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (maxs i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (sum (maxs i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (sum (maxs i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (sum (maxs i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (last (maxs i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (last (maxs i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (last (maxs i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (max (maxs i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (max (maxs i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (max (maxs i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (maxs i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (differ s) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (differ s) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (differ s) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (sum (differ s)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (sum (differ s)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (sum (differ s)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (last (differ s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (last (differ s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (last (differ s))}) 't) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DP by: u r: (max (differ s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (max (differ s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (max (differ s)) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (differ s)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (g_sums i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (g_sums i) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (g_sums i) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (sum (g_sums i)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (sum (g_sums i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (sum (g_sums i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (last (g_sums i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (last (g_sums i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (last (g_sums i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (max (g_sums i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (max (g_sums i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (max (g_sums i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (g_sums i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (g_prior i) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (g_prior i) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (g_prior i) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (sum (g_prior i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (sum (g_prior i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (sum (g_prior i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (last (g_prior i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (last (g_prior i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (last (g_prior i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (max (g_prior i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (max (g_prior i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (max (g_prior i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_prior i)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (g_dev f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: k r: zz}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (g_dev f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (g_dev f)}) 't) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DP by: u r: (sum (g_dev f))}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (sum (g_dev f))}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (sum (g_dev f)) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (last (g_dev f)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (last (g_dev f)) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (last (g_dev f)) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (max (g_dev f)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (max (g_dev f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (max (g_dev f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_dev f)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (g_two i f) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (g_two i f) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (g_two i f) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (sum (g_two i f)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (sum (g_two i f)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (sum (g_two i f)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: (last (g_two i f)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (last (g_two i f)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (last (g_two i f)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (max (g_two i f)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (max (g_two i f)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (max (g_two i f)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_two i f)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (sums (- f (avg f))) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (sums (- f (avg f))) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (sums (- f (avg f))) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (sum (sums (- f (avg f)))) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (sum (sums (- f (avg f)))) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (sum (sums (- f (avg f)))) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (last (sums (- f (avg f))))}) 'k) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (last (sums (- f (avg f))))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (last (sums (- f (avg f))))}) 't) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DP by: u r: (max (sums (- f (avg f))))}) 'u) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (max (sums (- f (avg f))))}) 'g) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (max (sums (- f (avg f)))) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (sums (- f (avg f)))}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: ((fn [v] (let y v) (sums y)) i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: ((fn [v] (let y v) (sums y)) i) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: ((fn [v] (let y v) (sums y)) i) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (sum ((fn [v] (let y v) (sums y)) i)) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (sum ((fn [v] (let y v) (sums y)) i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (sum ((fn [v] (let y v) (sums y)) i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DP by: t r: (last ((fn [v] (let y v) (sums y)) i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (last ((fn [v] (let y v) (sums y)) i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (last ((fn [v] (let y v) (sums y)) i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DP by: k r: (max ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (max ((fn [v] (let y v) (sums y)) i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (max ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DP by: u r: ((fn [v] (prior - v)) f) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: ((fn [v] (prior - v)) f) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: ((fn [v] (prior - v)) f) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DP by: [k s] r: (sum ((fn [v] (prior - v)) f)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (sum ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (sum ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (last ((fn [v] (prior - v)) f)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (last ((fn [v] (prior - v)) f)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (last ((fn [v] (prior - v)) f)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DP by: t r: (max ((fn [v] (prior - v)) f)) u1: 1}) 't) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DP by: u where: (> i 500) r: (max ((fn [v] (prior - v)) f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (== k 3) r: (max ((fn [v] (prior - v)) f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DP zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DP by: k r: (g_eff (deltas i))}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: k r: zz}) 'k)
+(xasc (select {from: DP by: [k s] where: (> i 500) r: (g_eff (deltas i))}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DP by: t where: (== k 3) r: (g_eff (deltas i))}) 't) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DP by: u r: (sum (g_eff (deltas i)))}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} where: (> i 500) r: (sum (g_eff (deltas i)))}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DP by: k where: (== k 3) r: (sum (g_eff (deltas i))) p: i}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DP by: [k s] r: (last (g_eff (deltas i))) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DP by: t where: (> i 500) r: (last (g_eff (deltas i))) p: i}) 't) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DP by: u where: (== k 3) r: (last (g_eff (deltas i))) p: i}) 'u) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DP by: {g: (% i 7)} r: (max (g_eff (deltas i))) p: i}) 'g) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DP by: k where: (> i 500) r: (max (g_eff (deltas i))) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DP by: [k s] where: (== k 3) r: (max (g_eff (deltas i))) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DP zz: (g_eff (deltas i))}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (sums i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (sums i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (sums i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (sum (sums i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (sum (sums i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (sum (sums i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (last (sums i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (last (sums i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (last (sums i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (max (sums i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (max (sums i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (max (sums i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (sums i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (deltas i) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (deltas i) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (deltas i) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (sum (deltas i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (sum (deltas i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (sum (deltas i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (last (deltas i))}) 'k) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (last (deltas i))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (last (deltas i))}) 't) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DS by: u r: (max (deltas i))}) 'u) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (max (deltas i))}) 'g) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (max (deltas i)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (deltas i)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (prior - i) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (prior - i) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (prior - i) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (sum (prior - i)) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (sum (prior - i)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (sum (prior - i)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (last (prior - i)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (last (prior - i)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (last (prior - i)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (max (prior - i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (max (prior - i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (max (prior - i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (prior - i)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (msum 3 i) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (msum 3 i) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (msum 3 i) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (sum (msum 3 i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (sum (msum 3 i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (sum (msum 3 i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (last (msum 3 i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (last (msum 3 i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (last (msum 3 i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (max (msum 3 i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (max (msum 3 i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (max (msum 3 i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (msum 3 i)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (mavg 3 f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: k r: zz}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (mavg 3 f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (mavg 3 f)}) 't) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DS by: u r: (sum (mavg 3 f))}) 'u) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (sum (mavg 3 f))}) 'g) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (sum (mavg 3 f)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (last (mavg 3 f)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (last (mavg 3 f)) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (last (mavg 3 f)) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (max (mavg 3 f)) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (max (mavg 3 f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (max (mavg 3 f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (mavg 3 f)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (lag i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (lag i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (lag i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (sum (lag i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (sum (lag i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (sum (lag i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (last (lag i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (last (lag i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (last (lag i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (max (lag i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (max (lag i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (max (lag i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (lag i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (lead i) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (lead i) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (lead i) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (sum (lead i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (sum (lead i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (sum (lead i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (last (lead i))}) 'k) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (last (lead i))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (last (lead i))}) 't) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DS by: u r: (max (lead i))}) 'u) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (max (lead i))}) 'g) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (max (lead i)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (lead i)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (ratios f) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (ratios f) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (ratios f) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (sum (ratios f)) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (sum (ratios f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (sum (ratios f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (last (ratios f)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (last (ratios f)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (last (ratios f)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (max (ratios f)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (max (ratios f)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (max (ratios f)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (ratios f)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (maxs i) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (maxs i) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (maxs i) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (sum (maxs i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (sum (maxs i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (sum (maxs i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (last (maxs i)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (last (maxs i)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (last (maxs i)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (max (maxs i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (max (maxs i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (max (maxs i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (maxs i)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (differ s)}) 'k) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: k r: zz}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (differ s)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (differ s)}) 't) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DS by: u r: (sum (differ s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (sum (differ s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (sum (differ s)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (last (differ s)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (last (differ s)) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (last (differ s)) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (max (differ s)) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (max (differ s)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (max (differ s)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (differ s)}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (g_sums i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (g_sums i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (g_sums i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (sum (g_sums i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (sum (g_sums i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (sum (g_sums i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (last (g_sums i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (last (g_sums i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (last (g_sums i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (max (g_sums i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (max (g_sums i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (max (g_sums i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_sums i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (g_prior i) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (g_prior i) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (g_prior i) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (sum (g_prior i)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (sum (g_prior i)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (sum (g_prior i)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (last (g_prior i))}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (last (g_prior i))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (last (g_prior i))}) 't) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DS by: u r: (max (g_prior i))}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (max (g_prior i))}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (max (g_prior i)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_prior i)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (g_dev f) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (g_dev f) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (g_dev f) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (sum (g_dev f)) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (sum (g_dev f)) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (sum (g_dev f)) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (last (g_dev f)) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (last (g_dev f)) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (last (g_dev f)) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (max (g_dev f)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (max (g_dev f)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (max (g_dev f)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_dev f)}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (g_two i f) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: u r: zz m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (g_two i f) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: {g: (% i 7)} where: (> i 500) r: zz m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (g_two i f) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: k where: (== k 3) r: zz d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (sum (g_two i f)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: [k s] r: (sum zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (sum (g_two i f)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: t where: (> i 500) r: (sum zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (sum (g_two i f)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: u where: (== k 3) r: (sum zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (last (g_two i f)) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: {g: (% i 7)} r: (last zz) d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (last (g_two i f)) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: k where: (> i 500) r: (last zz) u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (last (g_two i f)) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: [k s] where: (== k 3) r: (last zz) u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (max (g_two i f)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: t r: (max zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (max (g_two i f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: u where: (> i 500) r: (max zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (max (g_two i f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_two i f)}) by: {g: (% i 7)} where: (== k 3) r: (max zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (sums (- f (avg f)))}) 'k) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: k r: zz}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (sums (- f (avg f)))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: [k s] where: (> i 500) r: zz}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (sums (- f (avg f)))}) 't) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: t where: (== k 3) r: zz}) 't)
+(xasc (select {from: DS by: u r: (sum (sums (- f (avg f))))}) 'u) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: u r: (sum zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (sum (sums (- f (avg f))))}) 'g) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: {g: (% i 7)} where: (> i 500) r: (sum zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (sum (sums (- f (avg f)))) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: k where: (== k 3) r: (sum zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (last (sums (- f (avg f)))) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: [k s] r: (last zz) p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (last (sums (- f (avg f)))) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: t where: (> i 500) r: (last zz) p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (last (sums (- f (avg f)))) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: u where: (== k 3) r: (last zz) p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (max (sums (- f (avg f)))) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: {g: (% i 7)} r: (max zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (max (sums (- f (avg f)))) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: k where: (> i 500) r: (max zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (max (sums (- f (avg f)))) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (sums (- f (avg f)))}) by: [k s] where: (== k 3) r: (max zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: ((fn [v] (let y v) (sums y)) i) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: t r: zz c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: ((fn [v] (let y v) (sums y)) i) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: u where: (> i 500) r: zz c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: ((fn [v] (let y v) (sums y)) i) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} where: (== k 3) r: zz c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (sum ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: k r: (sum zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (sum ((fn [v] (let y v) (sums y)) i)) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] where: (> i 500) r: (sum zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (sum ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (== k 3) r: (sum zz) m: (first f)}) 't)
+(xasc (select {from: DS by: u r: (last ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 'u) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: u r: (last zz) m: (first f)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (last ((fn [v] (let y v) (sums y)) i)) m: (first f)}) 'g) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: {g: (% i 7)} where: (> i 500) r: (last zz) m: (first f)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (last ((fn [v] (let y v) (sums y)) i)) d: (count (distinct s))}) 'k) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: k where: (== k 3) r: (last zz) d: (count (distinct s))}) 'k)
+(xasc (select {from: DS by: [k s] r: (max ((fn [v] (let y v) (sums y)) i)) d: (count (distinct s))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: [k s] r: (max zz) d: (count (distinct s))}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (max ((fn [v] (let y v) (sums y)) i)) d: (count (distinct s))}) 't) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: t where: (> i 500) r: (max zz) d: (count (distinct s))}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (max ((fn [v] (let y v) (sums y)) i)) d: (count (distinct s))}) 'u) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (let y v) (sums y)) i)}) by: u where: (== k 3) r: (max zz) d: (count (distinct s))}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: ((fn [v] (prior - v)) f) d: (count (distinct s))}) 'g) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} r: zz d: (count (distinct s))}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: ((fn [v] (prior - v)) f) u1: 1}) 'k) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: k where: (> i 500) r: zz u1: 1}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: ((fn [v] (prior - v)) f) u1: 1}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: [k s] where: (== k 3) r: zz u1: 1}) ['k 's])
+(xasc (select {from: DS by: t r: (sum ((fn [v] (prior - v)) f)) u1: 1}) 't) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: t r: (sum zz) u1: 1}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (sum ((fn [v] (prior - v)) f)) u1: 1}) 'u) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: u where: (> i 500) r: (sum zz) u1: 1}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (sum ((fn [v] (prior - v)) f)) u1: 1}) 'g) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (== k 3) r: (sum zz) u1: 1}) 'g)
+(xasc (select {from: DS by: k r: (last ((fn [v] (prior - v)) f))}) 'k) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: k r: (last zz)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (last ((fn [v] (prior - v)) f))}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: [k s] where: (> i 500) r: (last zz)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (last ((fn [v] (prior - v)) f))}) 't) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: t where: (== k 3) r: (last zz)}) 't)
+(xasc (select {from: DS by: u r: (max ((fn [v] (prior - v)) f))}) 'u) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: u r: (max zz)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (> i 500) r: (max ((fn [v] (prior - v)) f))}) 'g) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: {g: (% i 7)} where: (> i 500) r: (max zz)}) 'g)
+(xasc (select {from: DS by: k where: (== k 3) r: (max ((fn [v] (prior - v)) f)) p: i}) 'k) -- (xasc (select {from: (update {from: DS zz: ((fn [v] (prior - v)) f)}) by: k where: (== k 3) r: (max zz) p: i}) 'k)
+(xasc (select {from: DS by: [k s] r: (g_eff (deltas i)) p: i}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: [k s] r: zz p: i}) ['k 's])
+(xasc (select {from: DS by: t where: (> i 500) r: (g_eff (deltas i)) p: i}) 't) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: t where: (> i 500) r: zz p: i}) 't)
+(xasc (select {from: DS by: u where: (== k 3) r: (g_eff (deltas i)) p: i}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: u where: (== k 3) r: zz p: i}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} r: (sum (g_eff (deltas i))) p: i}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: {g: (% i 7)} r: (sum zz) p: i}) 'g)
+(xasc (select {from: DS by: k where: (> i 500) r: (sum (g_eff (deltas i))) c: (count i)}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: k where: (> i 500) r: (sum zz) c: (count i)}) 'k)
+(xasc (select {from: DS by: [k s] where: (== k 3) r: (sum (g_eff (deltas i))) c: (count i)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: [k s] where: (== k 3) r: (sum zz) c: (count i)}) ['k 's])
+(xasc (select {from: DS by: t r: (last (g_eff (deltas i))) c: (count i)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: t r: (last zz) c: (count i)}) 't)
+(xasc (select {from: DS by: u where: (> i 500) r: (last (g_eff (deltas i))) c: (count i)}) 'u) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: u where: (> i 500) r: (last zz) c: (count i)}) 'u)
+(xasc (select {from: DS by: {g: (% i 7)} where: (== k 3) r: (last (g_eff (deltas i))) c: (count i)}) 'g) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: {g: (% i 7)} where: (== k 3) r: (last zz) c: (count i)}) 'g)
+(xasc (select {from: DS by: k r: (max (g_eff (deltas i))) m: (first f)}) 'k) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: k r: (max zz) m: (first f)}) 'k)
+(xasc (select {from: DS by: [k s] where: (> i 500) r: (max (g_eff (deltas i))) m: (first f)}) ['k 's]) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: [k s] where: (> i 500) r: (max zz) m: (first f)}) ['k 's])
+(xasc (select {from: DS by: t where: (== k 3) r: (max (g_eff (deltas i))) m: (first f)}) 't) -- (xasc (select {from: (update {from: DS zz: (g_eff (deltas i))}) by: t where: (== k 3) r: (max zz) m: (first f)}) 't)
+(.sys.exec "rm -rf /tmp/rfl_grouped_running /tmp/rfl_grouped_running_s /tmp/rfl_grouped_running_d /tmp/rfl_grouped_running_ds")
