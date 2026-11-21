@@ -1,0 +1,130 @@
+;; (.sys.profile) — the call profiler: calls, self/total wall time and pool
+;; busy time per Rayfall call site.  Times vary run to run; the assertions
+;; are on call counts, sites and names, which do not.  The functions live in
+;; test/data/profile/calls.rfl so their sites have a file and lines.
+
+(load "test/data/profile/calls.rfl")
+
+;; Shape: seven columns, empty before anything is profiled.
+(type (.sys.profile)) -- 'TABLE
+(key (.sys.profile)) -- [file line fn calls self-ms total-ms busy-ms]
+(count (.sys.profile)) -- 0
+
+;; Off: calls leave nothing behind.
+(prof-loop 10) -- 55
+(prof-map [1 2 3]) -- 12
+(count (.sys.profile)) -- 0
+
+;; The toggle, as .sys.querylog.enable: explicit 0/1, no argument flips.
+(.sys.profile.enable 1) -- 1
+(.sys.profile.enable 0) -- 0
+(.sys.profile.enable) -- 1
+(.sys.profile.enable) -- 0
+(.sys.profile.enable 2 3) !- domain
+(.sys.profile.enable 'on) !- type
+(.sys.profile 1) !- arity
+(.sys.profile.reset 1) !- arity
+(.sys.profile.reset)
+(count (.sys.profile)) -- 0
+
+;; Profile a known workload.  prof-loop 10 runs `<` 11 times and each `+`
+;; 10 times; prof-inc's `+` runs once per call: 10 from the loop and 3 from
+;; the top-level map.  prof-map's anonymous lambda multiplies 4 times.
+(.sys.profile.enable 1) -- 1
+(prof-loop 10) -- 55
+(map prof-inc [1 2 3]) -- [2 3 4]
+(prof-map [1 2 3 4]) -- 20
+(prof.ns.inner 5) -- -5
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(set Calls (fn [name ln] (sum (at (select {from: P where: (and (== fn name) (== line ln))}) 'calls))))
+
+(Calls 'prof-inc 4) -- 13
+(Calls 'prof-loop 8) -- 11
+(Calls 'prof-loop 9) -- 10
+(Calls 'prof-loop 10) -- 10
+(Calls 'prof-map 13) -- 2
+(Calls '<lambda@14> 14) -- 4
+(Calls 'prof.ns.inner 20) -- 1
+;; Every site of the fixture names it as its file.
+(count (select {from: P where: (== fn 'prof-inc)})) -- 1
+(at (select {from: P where: (== fn 'prof-inc)}) 'file) -- ['test/data/profile/calls.rfl]
+;; Top-level calls are `<top>` sites named by their callee: the four above
+;; and the call that switched profiling off (the one that switched it on ran
+;; before it was).
+(sum (at (select {from: P where: (like fn "<top>*")}) 'calls)) -- 5
+(set TopCalls (fn [name] (sum (at (select {from: P where: (== fn name)}) 'calls))))
+(TopCalls '<top>prof-loop) -- 1
+(TopCalls '<top>map) -- 1
+(TopCalls '<top>.sys.profile.enable) -- 1
+;; A nested call's time is inside its caller's: map over a lambda.
+(set MapRow (first (select {from: P where: (and (== fn 'prof-map) (== line 13))})))
+(>= (at MapRow 'total-ms) (at MapRow 'self-ms)) -- true
+(all (>= (at P 'total-ms) 0.0)) -- true
+(all (>= (at P 'self-ms) 0.0)) -- true
+(all (>= (at P 'busy-ms) 0.0)) -- true
+
+;; Off again: the rows stay put while more code runs.
+(prof-loop 10) -- 55
+(count (.sys.profile)) -- (count P)
+(Calls 'prof-loop 8) -- 11
+
+;; Rows accumulate across runs until reset.
+(.sys.profile.enable 1) -- 1
+(prof-loop 10) -- 55
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(Calls 'prof-loop 8) -- 22
+(Calls 'prof-inc 4) -- 23
+(.sys.profile.reset)
+(count (.sys.profile)) -- 0
+
+;; An error inside a profiled call is still counted, at its site, and the
+;; calls after it are timed as before: the error caught inside compiled
+;; code, then uncaught at top level.
+(.sys.profile.enable 1) -- 1
+(prof-catch 1) -- -1
+(prof-catch 2) -- -1
+(prof-bad 3) !- type
+(prof-loop 10) -- 55
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(Calls 'prof-bad 16) -- 3
+(Calls 'prof-loop 8) -- 11
+(Calls 'prof-inc 4) -- 10
+
+;; Reset while profiling: later calls count from zero.
+(.sys.profile.enable 1) -- 1
+(prof-loop 3) -- 6
+(.sys.profile.reset)
+(prof-loop 2) -- 3
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(Calls 'prof-loop 8) -- 3
+(.sys.profile.reset)
+
+;; Builtins reached through compiled code's other call paths: one passed
+;; as an argument (called through OP_CALLF) and a select inside a lambda
+;; (a dynamic form, OP_CALLD).
+(set T (table [a] (list [1 2 3])))
+(.sys.profile.enable 1) -- 1
+(prof-apply neg 4) -- -4
+(prof-apply neg 5) -- -5
+(prof-apply prof-inc 1) -- 2
+(count (prof-sel T)) -- 2
+(count (prof-sel T)) -- 2
+(count (prof-sel T)) -- 2
+(.sys.profile.enable 0) -- 0
+(set P (.sys.profile))
+(Calls 'prof-apply 22) -- 2
+(Calls 'prof-inc 4) -- 1
+(Calls 'prof-sel 24) -- 3
+(.sys.profile.reset)
+
+;; A row is a site that ran: the calls still open when the table is read
+;; (the count around it, the read itself) are not rows yet.
+(.sys.profile.enable 1) -- 1
+(.sys.profile.reset)
+(count (.sys.profile)) -- 0
+(.sys.profile.enable 0) -- 0
+(.sys.profile.reset)

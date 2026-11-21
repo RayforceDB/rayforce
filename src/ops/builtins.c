@@ -2974,6 +2974,12 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
     }
 }
 
+/* as pool_cancelled (ops/internal.h, which builtins.c cannot include) */
+static inline bool where_cancelled(ray_pool_t* pool) {
+    return RAY_UNLIKELY(ray_interrupted()) ||
+           RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed));
+}
+
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a B8 vector, got %s%s",
@@ -2998,6 +3004,9 @@ ray_t* ray_where_fn(ray_t* x) {
             where_ctx_t wc = { .data = data, .n = n, .chunk_rows = chunk_rows,
                                .chunk_counts = chunk_counts, .out = NULL };
             ray_pool_dispatch_n(pool, where_count_fn, &wc, (uint32_t)n_chunks);
+            /* the chunks a cancel skips leave their counts, then their
+             * rows, unwritten (a count would size the result) */
+            if (where_cancelled(pool)) { ray_release(cc_hdr); return ray_error("cancel", NULL); }
             int64_t cum = 0;
             for (int64_t ch = 0; ch < n_chunks; ch++) {
                 int64_t v = chunk_counts[ch];
@@ -3008,8 +3017,9 @@ ray_t* ray_where_fn(ray_t* x) {
             if (RAY_IS_ERR(result)) { ray_release(cc_hdr); return result; }
             wc.out = (int64_t*)ray_data(result);
             ray_pool_dispatch_n(pool, where_emit_fn, &wc, (uint32_t)n_chunks);
-            result->len = cum;
             ray_release(cc_hdr);
+            if (where_cancelled(pool)) { ray_release(result); return ray_error("cancel", NULL); }
+            result->len = cum;
             return result;
         }
         /* scratch OOM → sequential fallback below */
@@ -3155,6 +3165,7 @@ uint64_t ray_atom_hash(ray_t* a) {
         case -RAY_SYM:       return ray_hash_i64(a->i64);
         case -RAY_DATE:
         case -RAY_TIME:      return ray_hash_i64((int64_t)a->i32);
+        case -RAY_TIMESPAN:
         case -RAY_TIMESTAMP: return ray_hash_i64(a->i64);
         case -RAY_GUID: {
             const uint8_t* g = a->obj

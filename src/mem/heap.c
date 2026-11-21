@@ -2953,6 +2953,8 @@ void ray_heap_init(void) {
     ray_registry_unlock();
     if (reuse) {
         reuse->idle_next = NULL;
+        /* Environment belongs to the adopting thread, not the old owner. */
+        heap_swap_dir(reuse->swap_path, sizeof(reuse->swap_path));
         ray_tl_heap = reuse;
         return;
     }
@@ -3696,9 +3698,56 @@ static void heap_spill_pools_age(ray_heap_t* h, uint32_t now) {
  * ever cut from.  A statement that freed its pool temporaries and goes on to
  * large blocks would otherwise spill those while the pools sit empty and
  * counted, and no rule at the boundary can tell that the next statement
- * wants large blocks rather than its pools back.  Only the caller's heap:
- * any other, a worker's included, may be allocating right now.  Returns
- * whether `bytes` still crosses the watermark. */
+ * wants large blocks rather than its pools back.
+ *
+ * Then, if that was not enough, the parked pool workers' empty anonymous
+ * pools, one worker after another until the block fits — but only from the
+ * dispatcher's thread with no dispatch in flight (heap_make_room_workers_ok).
+ * A heavy query run again keeps its workers' pools from the run before,
+ * empty and counted, and without this its large blocks spill against them
+ * (#750): the boundary that could have given them back declines to, since
+ * a heap that spilled wants its pools for the next run.  Any other heap
+ * may be allocating right now: an embedding's own thread, a server's poll
+ * thread, a helper thread of an import.  Returns whether `bytes` still
+ * crosses the watermark. */
+typedef struct { size_t bytes; int64_t got; } make_room_t;
+
+static void heap_make_room_worker(ray_heap_t* h, void* ctx) {
+    make_room_t* m = ctx;
+    if (!heap_anon_would_exceed(m->bytes)) return;   /* fits: the rest keep theirs */
+    heap_drain_foreign(h);
+    heap_flush_slabs(h);
+    m->got += heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
+}
+
+/* Whether the workers' heaps are this thread's to work on: it is bound to
+ * the runtime's main VM, and ray_parallel_flag is clear.
+ *
+ * Evaluation is single-threaded: the pool has one producer (see
+ * ray_pool_par_dispatch_ok), the thread that runs queries, which is the main
+ * VM's — so no dispatch opens while this thread is in here.  (A query run
+ * on another thread at the same time — an IPC hook on an embedder's thread
+ * under a temporary VM — is outside that rule, as for the pool itself.)
+ * The flag is clear on this thread outside pool_run_window: it raises
+ * it before it publishes a window and clears it only after an acquire of
+ * pending == 0, which every worker's last pending-- (acq_rel, after its last
+ * allocation and free of the window) is ordered before.  From there until
+ * the next window a worker claims nothing — one woken by a surplus token
+ * finds the window drained and waits again — so it allocates and frees
+ * nothing; the same ground pool_reclaim_worker_heaps, the relief and the
+ * decay stand on.  Inside a dispatch — this thread as worker 0, or any
+ * worker — the flag is up, and a pool worker's thread, a VM-less thread or
+ * an IPC hook's temporary VM (id -1) never qualifies.  What others may still
+ * do to a worker heap meanwhile is push onto its foreign list, which the
+ * drain takes in one exchange; a block on its way there is live in its pool
+ * until it is on a freelist, so the pool is not found empty under it.  No
+ * registry lock is needed: nothing here reads another heap's lists or the
+ * registry. */
+static bool heap_make_room_workers_ok(void) {
+    return __VM && __VM->id == 0
+        && atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) == 0;
+}
+
 static bool heap_make_room(size_t bytes) {
     direct_cache_drain();
     if (!heap_anon_would_exceed(bytes)) return false;
@@ -3707,8 +3756,10 @@ static bool heap_make_room(size_t bytes) {
     if (!h) return true;
     heap_drain_foreign(h);
     heap_flush_slabs(h);
-    int64_t got = heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON);
-    return got == 0 || heap_anon_would_exceed(bytes);
+    make_room_t m = { bytes, heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON) };
+    if (heap_anon_would_exceed(bytes) && heap_make_room_workers_ok())
+        ray_pool_each_worker_heap(heap_make_room_worker, &m);
+    return m.got == 0 || heap_anon_would_exceed(bytes);
 #else
     return true;   /* past the watermark the block comes from RAM all the same */
 #endif

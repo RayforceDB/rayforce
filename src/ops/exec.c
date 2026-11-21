@@ -2645,7 +2645,24 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
     case -RAY_F64:       key_f = cv->f64;    is_float = 1; break;
     case -RAY_F32:       key_f = cv->f64;    is_float = 1; break; /* F32 atoms use f64 slot */
     case -RAY_SYM:       key_i = cv->i64;               break; /* global intern id; domain-resolved at consult */
+    case -RAY_TIMESPAN:  key_i = cv->i64;               break;
     default: return 0;  /* str / guid — not eligible */
+    }
+
+    /* The probe is the literal's raw value, so it must be in the column's
+     * own unit, as the comparison reads it (#974): a DATE / TIME /
+     * TIMESTAMP column takes a literal of its own type (a cross-temporal
+     * one is rewritten to it at plan time, cmp_temporal_rewrite; anything
+     * else is not that compare); a TIMESPAN literal only a TIMESPAN column
+     * (an integer meets a TIMESPAN as nanoseconds, as the builtin does);
+     * a symbol only a SYM column.  Any other pair takes the scan. */
+    {
+        int8_t ct = m.type, lt = (int8_t)-cv->type;
+        bool ctemp = ct == RAY_DATE || ct == RAY_TIME || ct == RAY_TIMESTAMP;
+        bool ltemp = lt == RAY_DATE || lt == RAY_TIME || lt == RAY_TIMESTAMP;
+        if ((ctemp || ltemp) && ct != lt) return 0;
+        if (lt == RAY_TIMESPAN && ct != RAY_TIMESPAN) return 0;
+        if ((ct == RAY_SYM) != (lt == RAY_SYM)) return 0;
     }
 
     /* Reconcile the literal's family with the COLUMN's family.  Index
@@ -2723,12 +2740,6 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want
     }
     *out_set_lit = rext->literal;
     return 1;
-}
-
-/* True when a GROUP node groups by at least one key. */
-static inline bool group_has_keys(ray_graph_t* g, ray_op_t* group_op) {
-    ray_op_ext_t* gx = find_ext(g, group_op->id);
-    return gx && gx->n_keys > 0;
 }
 
 /* True when every leaf of the op tree under `id` is a constant or, with
@@ -2930,63 +2941,6 @@ static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* k
     return 1;
 }
 
-/* Does a GROUP read a constant of several values as rows: a vector
- * literal under its key or aggregate inputs, as one or as an operand of an
- * element-wise node?  Such a vector stands for a column of the table it was
- * written against, so compacting the table under a where: would leave it
- * longer than the survivors.  An operand of any other node (the set of an
- * `in`, say) is no row input and does not count. */
-static bool group_reads_vector_const(ray_graph_t* g, ray_op_ext_t* gx) {
-    if (!gx) return false;
-    uint32_t nc = g->node_count;
-    if (nc > 4096) return true;
-    bool visited[4096];
-    memset(visited, 0, nc * sizeof(bool));
-    uint32_t stack[64];
-    bool rows[64];
-    int sp = 0;
-    for (uint8_t k = 0; k < gx->n_keys; k++) {
-        if (sp >= 64) return true;
-        stack[sp] = gx->keys[k]; rows[sp++] = true;
-    }
-    for (uint8_t a = 0; a < gx->n_aggs; a++) {
-        uint32_t ins[2] = { gx->agg_ins ? gx->agg_ins[a] : RAY_OP_NONE,
-                            gx->agg_ins2 ? gx->agg_ins2[a] : RAY_OP_NONE };
-        for (int i = 0; i < 2; i++) {
-            if (ins[i] == RAY_OP_NONE) continue;
-            if (sp >= 64) return true;
-            stack[sp] = ins[i]; rows[sp++] = true;
-        }
-    }
-    while (sp > 0) {
-        sp--;
-        uint32_t nid = stack[sp];
-        bool as_rows = rows[sp];
-        if (nid >= nc) return true;
-        ray_op_t* node = &g->nodes[nid];
-        if (node->flags & OP_FLAG_DEAD) continue;
-        if (node->opcode == OP_CONST) {
-            ray_op_ext_t* cx = find_ext(g, nid);
-            ray_t* lit = cx ? cx->literal : NULL;
-            if (as_rows && lit && !ray_is_atom(lit) && ray_len(lit) != 1) return true;
-            continue;
-        }
-        if (visited[nid]) continue;
-        visited[nid] = true;
-        bool child_rows = op_is_elementwise(node->opcode);
-        ray_op_ext_t* nx = find_ext(g, nid);
-        uint32_t kids[3] = { node->arity > 0 ? node->in_id[0] : RAY_OP_NONE,
-                             node->arity > 1 ? node->in_id[1] : RAY_OP_NONE,
-                             nx && nx->third_in != 0 ? nx->third_in : RAY_OP_NONE };
-        for (int i = 0; i < 3; i++) {
-            if (kids[i] == RAY_OP_NONE) continue;
-            if (sp >= 64) return true;
-            stack[sp] = kids[i]; rows[sp++] = child_rows;
-        }
-    }
-    return false;
-}
-
 /* collect_scan_syms over a GROUP's key + agg-input subtrees. */
 static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
                                  int64_t* syms, int max, bool* has_expr) {
@@ -3001,6 +2955,77 @@ static int group_input_scan_syms(ray_graph_t* g, ray_op_ext_t* gx,
             roots[nroots++] = gx->agg_ins2[a];
     }
     return collect_scan_syms(g, roots, nroots, syms, max, has_expr);
+}
+
+/* Sparse-selection pre-compaction of a GROUP's input, for OP_GROUP and the
+ * HEAD(GROUP) arm alike: when the WHERE selection admits far fewer rows
+ * than the table AND some group input is a computed expression, exec_group
+ * would still materialize the expression over ALL rows (expr_eval_full)
+ * and only then skip non-selected entries.  Gather the referenced columns
+ * once (sel_compact keep-set) and group the dense survivors with no
+ * selection instead.  Every other group stays on the lazy path and reads
+ * the selection in place; gathering every column of a wide table first
+ * costs more than the group itself (#736).  The lazy path is also the
+ * language's row domain for an input that reads other rows (`sums`,
+ * `deltas`, `mavg` and the rest): it runs over the whole table and the
+ * group keeps the selected rows of it (#916, docs: running functions under
+ * where:), so such an input must not be compacted first.  collect_scan_syms
+ * declines it, as it declines a vector constant of more than one element
+ * (sliced per group over the table's rows); a one-element vector spreads
+ * like an atom and is admitted.
+ * On success *tbl and *owned_tbl name the compacted table and the selection
+ * is dropped; any decline or failure leaves both and the selection as
+ * they were. */
+static void group_sel_precompact(ray_graph_t* g, ray_op_t* op,
+                                 ray_t** tbl, ray_t** owned_tbl) {
+    if (!g->selection || !*tbl || (*tbl)->type != RAY_TABLE) return;
+    ray_op_ext_t* gx = find_ext(g, op->id);
+    ray_rowsel_t* meta = ray_rowsel_meta(g->selection);
+    int64_t nrows = ray_table_nrows(*tbl);
+    /* Contiguity-aware admission: when most surviving rows sit in
+     * ALL-flagged rowsel segments (contiguous runs — the parted-layout
+     * shape), sel_compact's gather is nearly sequential memcpy, so
+     * compaction pays off at much higher densities than the
+     * scattered-row case. */
+    int64_t all_rows = 0;
+    if (meta) {
+        const uint8_t* fl = ray_rowsel_flags(g->selection);
+        for (uint32_t sg = 0; sg < meta->n_segs; sg++)
+            if (fl[sg] == RAY_SEL_ALL) all_rows += RAY_MORSEL_ELEMS;
+    }
+    bool contig = meta && meta->total_pass > 0 &&
+                  all_rows * 4 >= meta->total_pass * 3;
+    /* Admission: compaction only ever fires when an expression agg input
+     * exists (has_expr below) — the alternative is materializing that
+     * expression over ALL rows — so the scattered gate matches the
+     * projection-side compaction factor (4x), not the plain-gather
+     * tradeoff (16x).  A keyless group (an all-aggregate select) is one
+     * row and its aggregates read the selection themselves; compacted, a
+     * no-match where: handed exec_group an empty table and it came back
+     * with no row (#679).  A vector constant of more than one element
+     * under the inputs stands for a column of the whole table:
+     * collect_scan_syms declines it, so such a group keeps the lazy path.
+     * A one-element vector spreads over the rows like an atom and compacts
+     * with them. */
+    if (!gx || gx->n_keys == 0 || !meta || nrows <= 0 ||
+        meta->total_pass * (contig ? 2 : 4) > nrows)
+        return;
+    int64_t keep[32];
+    bool has_expr = false;
+    int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
+    if (nkeep <= 0 || !has_expr) return;
+    ray_t* compacted = sel_compact(g, *tbl, g->selection, keep, nkeep);
+    if (compacted && !RAY_IS_ERR(compacted) && compacted != *tbl) {
+        if (*owned_tbl) { ray_graph_unbind_table(g, *owned_tbl); ray_release(*owned_tbl); }
+        *owned_tbl = compacted;
+        *tbl = compacted;
+        ray_release(g->selection);
+        g->selection = NULL;
+    } else if (compacted) {
+        /* all-pass / alloc-fallback returned tbl retained, or an error —
+         * drop it and keep the lazy path. */
+        ray_release(compacted);
+    }
 }
 
 /* Lowercase display label for profiler spans.  ray_opcode_name returns the
@@ -4828,63 +4853,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 }
             }
 
-            /* Sparse-selection pre-compaction: when the WHERE selection
-             * admits far fewer rows than the table AND some group input is
-             * a computed expression, exec_group would still materialize the
-             * expression over ALL rows (expr_eval_full) and only then skip
-             * non-selected entries.  Gather the referenced columns once
-             * (sel_compact keep-set) and group the dense survivors with no
-             * selection instead.  Plain-scan-only groups stay on the lazy
-             * path — their selection-aware loops are already optimal. */
-            if (g->selection && tbl && tbl->type == RAY_TABLE) {
-                ray_op_ext_t* gx = find_ext(g, op->id);
-                ray_rowsel_t* meta = ray_rowsel_meta(g->selection);
-                int64_t nrows = ray_table_nrows(tbl);
-                /* Contiguity-aware admission: when most surviving rows sit
-                 * in ALL-flagged rowsel segments (contiguous runs — the
-                 * parted-layout shape), sel_compact's gather is nearly
-                 * sequential memcpy, so compaction pays off at much higher
-                 * densities than the scattered-row case. */
-                int64_t all_rows = 0;
-                if (meta) {
-                    const uint8_t* fl = ray_rowsel_flags(g->selection);
-                    for (uint32_t sg = 0; sg < meta->n_segs; sg++)
-                        if (fl[sg] == RAY_SEL_ALL) all_rows += RAY_MORSEL_ELEMS;
-                }
-                bool contig = meta && meta->total_pass > 0 &&
-                              all_rows * 4 >= meta->total_pass * 3;
-                /* Admission: compaction only ever fires when an expression
-                 * agg input exists (has_expr below) — the alternative is
-                 * materializing that expression over ALL rows — so the
-                 * scattered gate matches the projection-side compaction
-                 * factor (4x), not the plain-gather tradeoff (16x). */
-                /* A keyless group (an all-aggregate select) is one row and
-                 * its aggregates read the selection themselves; compacted,
-                 * a no-match where: handed exec_group an empty table and it
-                 * came back with no row (#679, the HEAD arm likewise). */
-                if (gx && gx->n_keys > 0 && meta && nrows > 0 &&
-                    meta->total_pass * (contig ? 2 : 4) <= nrows) {
-                    int64_t keep[32];
-                    bool has_expr = false;
-                    int nkeep = group_input_scan_syms(g, gx, keep, 32, &has_expr);
-                    if (nkeep > 0 && has_expr) {
-                        ray_t* compacted = sel_compact(g, tbl, g->selection,
-                                                       keep, nkeep);
-                        if (compacted && !RAY_IS_ERR(compacted) &&
-                            compacted != tbl) {
-                            if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }
-                            owned_tbl = compacted;
-                            tbl = compacted;
-                            ray_release(g->selection);
-                            g->selection = NULL;
-                        } else if (compacted) {
-                            /* all-pass / alloc-fallback returned tbl retained,
-                             * or an error — drop it and keep the lazy path. */
-                            ray_release(compacted);
-                        }
-                    }
-                }
-            }
+            group_sel_precompact(g, op, &tbl, &owned_tbl);
 
             /* Lazy selection is consumed by exec_group itself — all
              * paths (sequential, DA, radix-parallel) honour the
@@ -5065,31 +5034,11 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (res && RAY_IS_ERR(res)) return res;
                     if (res) { owned_tbl = res; tbl = res; }
                     /* NULL → lazy path; g->selection installed, tbl unchanged */
-                } else if (g->selection && tbl->type == RAY_TABLE &&
-                           group_has_keys(g, child_op) &&
-                           !group_reads_vector_const(g, find_ext(g, child_op->id))) {
-                    /* A keyless group (an all-aggregate select) is one row
-                     * whatever the limit, and its aggregates read the
-                     * selection themselves: compacting a no-match where:
-                     * handed exec_group an empty table, which has no rows to
-                     * reduce and came back with no row at all (#679). */
-                    int needs = 0;
-                    int64_t nc = ray_table_ncols(tbl);
-                    for (int64_t c = 0; c < nc; c++) {
-                        ray_col_meta_t cm;
-                        if (ray_table_col_meta_idx(tbl, c, &cm) && !RAY_IS_PARTED(cm.type)
-                            && cm.type != RAY_MAPCOMMON) {
-                            needs = 1; break;
-                        }
-                    }
-                    if (needs) {
-                        ray_t* compacted = sel_compact(g, tbl, g->selection, NULL, 0);
-                        if (!compacted || RAY_IS_ERR(compacted)) return compacted;
-                        ray_release(g->selection);
-                        g->selection = NULL;
-                        owned_tbl = compacted;
-                        tbl = compacted;
-                    }
+                } else {
+                    /* As OP_GROUP: the group reads the selection in place;
+                     * only a sparse where: under an expression input gathers
+                     * the columns the group reads. */
+                    group_sel_precompact(g, child_op, &tbl, &owned_tbl);
                 }
                 input = exec_group(g, child_op, tbl, n);
                 if (owned_tbl) { ray_graph_unbind_table(g, owned_tbl); ray_release(owned_tbl); }

@@ -59,6 +59,7 @@ All comparison operators are **atomic** and return boolean results.
 | `<` | binary | Less than | `(< 3 5)` → `true` |
 | `>=` | binary | Greater than or equal | `(>= 5 5)` → `true` |
 | `<=` | binary | Less than or equal | `(<= 3 5)` → `true` |
+| `identical` | binary | Same type, shape and contents | `(identical 1 1i)` → `false` |
 | `==` | binary | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | Check which vector elements fall within a range | `(within [1 5 10] [3 7])` → `[false true false]` |
@@ -67,8 +68,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
-| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (zero, null and NaN are false), in a query too (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists, each element by its truthiness, in a query too (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
@@ -440,8 +441,8 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `date` | unary | Current date or extract date from timestamp | `(date 0)` → today's date |
-| `time` | unary | Current wall-clock time (millisecond resolution) or extract time from timestamp | `(time 0)` → current time |
+| `date` | unary | Current date; of a timestamp, its day. Answers a DATE | `(date 0)` → today's date |
+| `time` | unary | Current wall-clock time (millisecond resolution); of a timestamp, its time of day. Answers a TIME | `(time 0)` → current time |
 | `timestamp` | unary | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
 
 ### Calendar/Clock Field Extraction
@@ -459,7 +460,34 @@ Unary functions that pull a single calendar or clock field out of a DATE / TIME 
 | `dow` | 1..7 (Mon=1) | `(dow 2024.03.15)` → `5` |
 | `doy` | 1..366 | `(doy 2024.03.15)` → `75` |
 
-`mm` is unambiguously MONTH; the minute spelling stays long-form because a two-letter token can't serve both meanings in a uniform dotted walk. Two dotted-only truncations exist: `.date` drops the time-of-day component (keeps the day), and `.time` drops the date component (keeps the microseconds within the day).
+`mm` is unambiguously MONTH; the minute spelling stays long-form because a two-letter token can't serve both meanings in a uniform dotted walk. `.date` and `.time` answer the whole DATE and the whole TIME of a timestamp.
+
+### Calendar/Clock Truncation
+
+`(trunc 'unit x)` floors a DATE, TIME or TIMESTAMP (atom or vector) to the start of the calendar or clock unit that holds it. The result has the **type of `x`**: a DATE floored to its month is a DATE, a TIMESTAMP stays a TIMESTAMP. Null rows stay null.
+
+| Unit | Start of the... | Takes | Example |
+|---|---|---|---|
+| `'year` | year | DATE, TIMESTAMP | `(trunc 'year 2024.05.17)` → `2024.01.01` |
+| `'quarter` | quarter (Jan, Apr, Jul, Oct) | DATE, TIMESTAMP | `(trunc 'quarter 2024.05.17)` → `2024.04.01` |
+| `'month` | month | DATE, TIMESTAMP | `(trunc 'month 2024.05.17)` → `2024.05.01` |
+| `'week` | week, **Monday-based** as `dow` counts | DATE, TIMESTAMP | `(trunc 'week 2024.05.17)` → `2024.05.13` |
+| `'day` | day | DATE, TIMESTAMP | `(trunc 'day 2024.05.17D13:45:00.000000000)` → `2024.05.17D00:00:00.000000000` |
+| `'hour` | hour | TIME, TIMESTAMP | `(trunc 'hour 13:45:12.123)` → `13:00:00.000` |
+| `'minute` | minute | TIME, TIMESTAMP | `(trunc 'minute 13:45:12.123)` → `13:45:00.000` |
+| `'second` | second | TIME, TIMESTAMP | `(trunc 'second 13:45:12.123)` → `13:45:12.000` |
+
+A calendar unit on a TIME and a clock unit on a DATE are `type` errors (neither carries what the unit needs); an unknown unit is a `domain` error. A TIMESTAMP whose period starts before the TIMESTAMP range (1707.09.23 onward) truncates to null, as does a DATE whose period starts below the DATE range. All calendar arithmetic is UTC.
+
+It works as a `by:` key and in projections, which is how calendar bucketing is written (`xbar` takes a fixed width, so it cannot do months or years):
+
+```lisp
+(select {from: Bars
+         by:   {m: (trunc 'month ts)}
+         open: (first px)  high: (max px)  low: (min px)  close: (last px)})
+```
+
+Inside queries the same truncations are available as dotted segments: `ts.year`, `ts.quarter`, `ts.month`, `ts.week`, `ts.day`, `ts.hour`, `ts.second` (`ts.minute` is the extract, `(trunc 'minute ts)` the truncation). Outside a query, use `trunc`.
 
 Cross-temporal comparisons are supported: dates, times, and timestamps are all converted to nanoseconds internally for comparison operations.
 
@@ -576,7 +604,7 @@ spills exactly as it did before.
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
-| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

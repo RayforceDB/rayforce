@@ -147,6 +147,7 @@ extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
 extern const test_entry_t join_buildside_entries[];
+extern const test_entry_t join_prefilter_entries[];
 extern const test_entry_t journal_entries[];
 extern const test_entry_t lang_entries[];
 extern const test_entry_t link_entries[];
@@ -226,6 +227,7 @@ static const test_entry_t* const compiled_groups[] = {
     idx_route_entries,
     index_entries,    ipc_entries,
     join_buildside_entries,
+    join_prefilter_entries,
     journal_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,
@@ -959,6 +961,9 @@ void ray_test_hooks_off(void) {
     ray_idx_lazy_test_fail_build(NULL);
     ray_expr_test_parted_all_segments(false);
     ray_group_test_route(0);
+    ray_query_test_cd_route(0);
+    ray_query_test_cancel_net_off(false);
+    ray_query_test_cd_firstn_set_max(-1);
     ray_group_test_fail_scalar_alloc(0);
     ray_group_test_scalar_grain(0);
     ray_in_guid_test_fail_alloc(0);

@@ -1515,7 +1515,7 @@ static test_result_t test_count_fast_path(void) {
     SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
     SR_SAME("(count (select {from: T where: (> k 150000)}))", 0);   /* I64 */
     SR_SAME("(count (select {from: T where: (!= u 7)}))", 0);        /* U8 */
-    SR_SAME("(count (select {from: T where: (< d 100)}))", 0);       /* DATE, integer literal */
+    SR_SAME("(count (select {from: T where: (< d 2000.04.10)}))", 0); /* DATE */
     SR_SAME("(count (select {from: T where: (== s 'c)}))", 0);       /* file-domain SYM */
     SR_SAME("(count (select {from: T where: (== s 'zz)}))", 0);      /* absent symbol */
     TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 12);          /* 6 shapes x 2 generations */
@@ -2047,7 +2047,7 @@ static test_result_t test_zone_dir_nulls(void) {
     if ((r = sr_sel_same(pred_v_gt)).status != TEST_PASS) return r;
     SR_SAME("(count (select {from: T where: (> v 1000000)}))", 0);   /* every chunk all-fail */
     SR_SAME("(count (select {from: T where: (< v 1000000)}))", 0);   /* nulls pass < : mixed */
-    SR_SAME("(count (select {from: T where: (>= d 899)}))", 0);
+    SR_SAME("(count (select {from: T where: (>= d 2002.06.18)}))", 0);
     PASS();
 }
 
@@ -5213,7 +5213,7 @@ static test_result_t test_v2_parted_segment(void) {
  * gate (Task 12) moved them here, at zero. */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
-#define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
+#define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) " \
                "(== b false) (!= u 0)) by: s desc: p take: 1010}) -10)"
 #define SR_COMPACT_GROUP "(select {c: (count k) from: T where: (< k 1000) by: g})"
 #define SR_AND_COUNT "(count (select {from: T where: (and (== g 3) (!= u 0))}))"
@@ -5248,7 +5248,7 @@ static const char* const sr_clickbench_scan[] = {
     /* q41: TraficSourceID IN (-1, 6) later in a chain of == conjuncts: on a
      * parted table the `in` conjunct reads each segment by range and is
      * intersected with the selection (exec_in_parted_selection, P3 Task 12) */
-    "(select {h: h d: d c: (count h) from: T where: (and (== g 3) (>= d 100) (<= d 400) (== b false) "
+    "(select {h: h d: d c: (count h) from: T where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) (== b false) "
     "(in u [1 6]) (!= h 0)) by: {h: h d: d} desc: c take: 10})",                         /* q41 */
     NULL,
 };
@@ -5572,7 +5572,7 @@ static test_result_t test_count_and(void) {
     static const char* const splayed[] = {
         "(and (== g 3) (!= u 0))",
         "(and (> v 100) (< f 150000.0))",                    /* nullable I32 and F64 */
-        "(and (== g 3) (>= d 100) (<= d 400))",
+        "(and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04))",
         "(and (== g 3) (== g 4))",                           /* all false */
         "(and (> k 199990) (== b true) (!= v 0))",
         NULL,

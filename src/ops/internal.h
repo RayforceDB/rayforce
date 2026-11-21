@@ -923,9 +923,12 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr);
 /* The rows a `where:` keeps, sampled for the distinct-count route gate
  * (query.c; exposed for the contract tests): the table rows surviving the
  * predicate among CD_GATE_WHERE_SAMPLE sampled ones in *rows, *nrows of
- * them, *population the rows the whole predicate would keep.  NULL (the
- * outputs then describe the whole table) when the predicate names no
- * column the gather covers or keeps every sampled row. */
+ * them, *population the rows the whole predicate would keep.  The sample is
+ * drawn from the P rows of the chunks the zone gate lets through; when it
+ * keeps every sampled row, those sampled rows with *population = P, or NULL
+ * with *population the table's rows when no chunk was ruled out.  NULL with
+ * *population 0 (the outputs describe the whole table) when the predicate
+ * names no column the gather covers. */
 ray_t* query_cd_gate_where_rows(ray_t* tbl, ray_t* where_expr, int64_t n_table,
                                 const int64_t** rows, int64_t* nrows, int64_t* population);
 
@@ -1094,6 +1097,16 @@ extern uint64_t ray_join_dup_fallbacks;
 extern uint64_t ray_join_null_fallbacks;
 extern bool     ray_join_force_null_checks;
 extern uint64_t ray_join_nullfree_keys;
+/* #595: right-side key bitmap prefilter on the chained probe */
+extern bool     ray_join_no_prefilter;
+extern uint64_t ray_join_prefilter_builds;
+extern _Atomic(uint64_t) ray_join_prefilter_skips;
+/* #599: settable dispatch floor of the chained probe (.sys.join.par.min).
+ * The default is one join morsel plus one row: the split rule before #599. */
+#define RAY_JOIN_PAR_MIN_DEFAULT 8193
+int64_t  ray_join_par_min(void);
+void     ray_join_set_par_min(int64_t rows);
+extern _Atomic(uint64_t) ray_join_par_probes; /* count + fill dispatches */
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1479,6 +1492,8 @@ void ray_exec_test_zone_prune(uint64_t* calls, uint64_t* pruned_segs);
 #ifdef DEBUG
 /* Completed synchronous sorted-find kernels; no release instrumentation. */
 uint64_t ray_find_test_sorted_runs(bool reset);
+/* Unboxed same-type atom scans: unsorted, or sorted and at most 64 rows. */
+uint64_t ray_find_test_typed_scans(bool reset);
 /* Successful query-level narrowed-source constructions, not physical reads. */
 uint64_t ray_query_test_parted_pruned_sources(bool reset);
 #endif
@@ -1488,6 +1503,23 @@ uint64_t ray_exec_test_in_single_within(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
+/* query.c test hook: the grouped distinct counts the route gate
+ * (ray_cd_two_pass_preferred) sent to the two-pass rewrite, and those it
+ * sent to the slices, since process start. */
+void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
+/* query.c test hook: the route a grouped distinct count takes past the gate,
+ * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
+ * Disarmed by ray_test_hooks_off. */
+void ray_query_test_cd_route(int route);
+/* query.c test hook: true turns off ray_select_impl's net (a select that
+ * answers while the pool's dispatches were cancelled answers `cancel`), so a
+ * test pins each stage's own check.  Disarmed by ray_test_hooks_off. */
+void ray_query_test_cancel_net_off(bool off);
+/* query.c test hook: the largest unordered take the rewrite's first-N pick
+ * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
+ * first row is found.  Negative restores the default; disarmed by
+ * ray_test_hooks_off. */
+void ray_query_test_cd_firstn_set_max(int64_t cap);
 /* query.c test hook: selects whose parted source was pruned before fetch,
  * and the partitions they dropped, since process start. */
 void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
@@ -1633,6 +1665,17 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit);
  * the shape is not the top-k shortcut's (compact the table and sort). */
 ray_t* exec_sort_head_sel(ray_graph_t* g, ray_op_t* op, ray_t* tbl, ray_t* sel, int64_t limit);
 uint64_t ray_sort_test_late_heads(void);   /* test hook: HEAD(SORT)s it answered */
+#ifdef DEBUG
+/* Single-key top-k selections run on the pool (topk_sel_run). */
+uint64_t ray_sort_test_topk_chunked(void);
+/* Buffer pairs (ranges x room) the last single-key top-k selection reserved
+ * (0 when it ran in place). */
+int64_t ray_sort_test_topk_pairs(void);
+/* Single-key top-k selections made in place (topk_place_fn), no buffers. */
+uint64_t ray_sort_test_topk_inplace(void);
+/* Parted columns sel_compact gathered on the pool (sel_parted_gather). */
+uint64_t ray_filter_test_parted_runs(void);
+#endif
 
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);
@@ -1834,6 +1877,15 @@ bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
  * and materializations only?  Defined in opt.c; the correspondence
  * ray_expr_subset_invariant leaves to its caller. */
 bool filter_input_default_domain(ray_graph_t* g, uint32_t id);
+
+/* Does every node under `root_id` read only its own row or run over the
+ * whole table (a running, moving or shift function, #916)?  Defined in
+ * group.c; an aggregate, an order or distinct op, or anything else whose
+ * value depends on which rows a where: keeps answers false. */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id);
+/* Does every node under `root_id` read only its own row?  Defined in
+ * group.c (group_expr_src_syms). */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id);
 
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.

@@ -100,7 +100,7 @@
 (count Rdt) -- 100
 (fold + 0 (map count (at Rdt 'v))) -- 200000
 ;; Order-independent per-group check via key-masked SOURCE (k==7).
-(set Gdt (select {n: (count v) s: (sum v) by: k from: Tdt where: (== k 7)}))
+(set Gdt (select {n: (count v) s: (sum v) by: k from: Tdt where: (== k 2000.01.08)}))
 (count Gdt) -- 1
 (as 'I64 (at (at Gdt 'k) 0)) -- 7
 (at (at Gdt 'n) 0) -- 2000
@@ -113,7 +113,7 @@
 (count Rts) -- 100
 (fold + 0 (map count (at Rts 'v))) -- 200000
 ;; Order-independent per-group check via key-masked SOURCE (k==7).
-(set Gts (select {n: (count v) s: (sum v) by: k from: Tts where: (== k 7)}))
+(set Gts (select {n: (count v) s: (sum v) by: k from: Tts where: (== k 2000.01.01D00:00:00.000000007)}))
 (count Gts) -- 1
 (as 'I64 (at (at Gts 'k) 0)) -- 7
 (at (at Gts 'n) 0) -- 2000

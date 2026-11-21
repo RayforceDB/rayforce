@@ -21,6 +21,7 @@
 #include "core/profile.h"   /* ray_profile_now_ns: pq_pool's bounded wait */
 #include "core/crc32.h"     /* ray_crc32: page checksums of the made files */
 #include <dirent.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -274,11 +275,100 @@ static test_result_t test_pq_decimal(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(t));
     TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 7189.43);
     ray_release(t);
-    const char* bad[] = {FIX "decimal-binary.parquet",FIX "decimal-bad-scale.parquet"};
-    for (int i = 0; i < 2; i++) {
-        ray_t* e = ray_parquet_read(bad[i],NULL);
-        TEST_ASSERT_TRUE(RAY_IS_ERR(e)); ray_error_free(e);
+    /* A scale above the precision refuses, naming the column. */
+    ray_t* e = ray_parquet_read(FIX "decimal-bad-scale.parquet",NULL);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e)); TEST_ASSERT_TRUE(strstr(ray_error_msg(),"column d: DECIMAL scale") != NULL);
+    ray_error_free(e);
+    /* A DECIMAL(10,2) on a BYTE_ARRAY holding the one-byte integers 1 and 2. */
+    t = ray_parquet_read(FIX "decimal-binary.parquet",NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[0] == 0.01);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,0)))[1] == 0.02);
+    ray_release(t);
+    PASS();
+}
+/* DECIMAL on FIXED_LEN_BYTE_ARRAY (16, 9 and 4 bytes, one nullable) and on a
+ * BYTE_ARRAY of varying length: big-endian two's complement, plain and
+ * dictionary pages, v1 and v2 pages, any batch size. */
+static test_result_t test_pq_decimal_wide(void) {
+    const char* wide[] = {"0","0.5","-2","123.45","-1000000000000000000","9999999999999999999","1e-19","7189.43"};
+    const int64_t mid[] = {12345678,0,-1,INT64_C(1000000000000000000),0,0,-12345678,7};
+    const int64_t narrow[] = {12345,-1,0,99999999,-99999999,1,100,-100};
+    const char* var[] = {"0.001","-0.001","0.255","-0.256","1e17","-1e17","0","12345678901234567890.123"};
+    for (int dict = 0; dict < 2; dict++) for (int v2 = 0; v2 < 2; v2++) {
+        char path[128]; snprintf(path,sizeof(path),FIX "decimal-wide-%d-%d.parquet",dict,v2);
+        for (int batch = 1; batch <= 3; batch++) {
+            ray_parquet_t* r = NULL;
+            TEST_ASSERT_NULL(ray_parquet_open(path,NULL,batch*3,&r));
+            int64_t total = 0;
+            for (ray_t* t; (t = ray_parquet_next(r)); ) {
+                TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),5);
+                for (int c = 1; c < 5; c++) TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,c)->type,RAY_F64);
+                for (int64_t row = 0; row < ray_table_nrows(t); row++, total++) {
+                    const double* w = ray_data(ray_table_get_col_idx(t,1));
+                    const double* m = ray_data(ray_table_get_col_idx(t,2));
+                    const double* n = ray_data(ray_table_get_col_idx(t,3));
+                    const double* x = ray_data(ray_table_get_col_idx(t,4));
+                    double ew = strtod(wide[total],NULL), ex = strtod(var[total],NULL);
+                    /* the unscaled integer is rounded to a double, then divided: within an ulp or two */
+                    TEST_ASSERT_TRUE(fabs(w[row]-ew) <= 4e-16*fabs(ew));
+                    TEST_ASSERT_TRUE(fabs(x[row]-ex) <= 4e-16*fabs(ex));
+                    TEST_ASSERT_TRUE(n[row] == (double)narrow[total]/1e2);
+                    if (total == 1 || total == 5) TEST_ASSERT_TRUE(ray_vec_is_null(ray_table_get_col_idx(t,2),row));
+                    else TEST_ASSERT_TRUE(m[row] == (double)mid[total]/1e4);
+                }
+                ray_release(t);
+            }
+            TEST_ASSERT_EQ_I(total,8);
+            ray_parquet_close(r);
+        }
     }
+    PASS();
+}
+/* The unscaled integer becomes the nearest double, ties to even; the expected
+ * values are computed outside Rayforce. */
+static test_result_t test_pq_decimal_rounding(void) {
+    const double expect[] = {0x1.0000000000000p+53,0x1.0000000000002p+53,-0x1.0000000000000p+53,
+        0x1.0000000000000p+100,0x1.0000000000001p+100,-0x1.0000000000001p+100,
+        0x1.2ced32a16a1b1p+126,-0x1.2ced32a16a1b1p+126};
+    ray_t* t = ray_parquet_read(FIX "decimal-round.parquet",NULL);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    const double* d = ray_data(ray_table_get_col_idx(t,0));
+    for (int i = 0; i < 8; i++) TEST_ASSERT_TRUE(d[i] == expect[i]);
+    ray_release(t);
+    PASS();
+}
+/* One column the reader cannot read: an INT96, a FIXED_LEN_BYTE_ARRAY with no
+ * DECIMAL annotation, beside readable ones. A projection reads the others, the
+ * metadata describes all of them with the reason, and asking for the column
+ * itself is the error. */
+static test_result_t test_pq_unsupported_columns(void) {
+    const char* file = FIX "unsupported-columns.parquet";
+    int64_t names[] = {ray_sym_intern("id",2),ray_sym_intern("amount",6)};
+    ray_t* cols = ray_vec_from_raw(RAY_SYM,names,2);
+    ray_t* t = ray_parquet_read(file,cols);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_ncols(t),2); TEST_ASSERT_EQ_I(ray_table_nrows(t),3);
+    TEST_ASSERT_TRUE(((double*)ray_data(ray_table_get_col_idx(t,1)))[1] == -0.25);
+    ray_release(t); ray_release(cols);
+    int64_t bad[] = {ray_sym_intern("id",2),ray_sym_intern("i96",3)};
+    cols = ray_vec_from_raw(RAY_SYM,bad,2);
+    t = ray_parquet_read(file,cols);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); TEST_ASSERT_TRUE(strstr(ray_error_msg(),"column i96: INT96") != NULL);
+    ray_error_free(t); ray_release(cols);
+    t = ray_parquet_read(file,NULL);   /* every column: the first it cannot read is named */
+    TEST_ASSERT_TRUE(RAY_IS_ERR(t)); TEST_ASSERT_TRUE(strstr(ray_error_msg(),"column fixed:") != NULL);
+    ray_error_free(t);
+    t = ray_parquet_metadata(file);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),5);
+    ray_t* reason = ray_table_get_col_idx(t,11);
+    const int64_t* rs = ray_data(reason);
+    for (int i = 0; i < 5; i++) {
+        bool unsupported = i >= 3;
+        TEST_ASSERT_TRUE(ray_vec_is_null(reason,i) == !unsupported);
+        if (unsupported) TEST_ASSERT_TRUE(strlen(ray_str_ptr(ray_sym_str(rs[i]))) > 0);
+    }
+    TEST_ASSERT_TRUE(strstr(ray_str_ptr(ray_sym_str(rs[4])),"INT96") != NULL);
+    ray_release(t);
     PASS();
 }
 /* Several files import into one partitioned table, in order: partitions
@@ -390,6 +480,54 @@ static test_result_t test_pq_lz4_multichunk(void) {
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
     ray_error_free(n); ray_release(types);
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
+    PASS();
+}
+/* A staged tree is flushed with one call where the host has one (Linux syncfs on
+ * a local filesystem), opened before the writes. Where it has none, or the
+ * filesystem is not one syncfs is known to work on (a container's overlay, a
+ * network mount), begin answers NONE and the caller syncs each file: so every
+ * answer is accepted here, and each must be consistent. */
+static test_result_t test_pq_sync_tree(void) {
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-sync-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(mkdir(dir,0755),0);
+    int h = ray_file_sync_tree_begin(dir);
+    TEST_ASSERT_TRUE(h >= 0 || h == RAY_SYNC_TREE_NONE || h == RAY_SYNC_TREE_SKIP);
+    if (h >= 0) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else if (h == RAY_SYNC_TREE_SKIP) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else { TEST_ASSERT_FALSE(ray_file_sync_tree_end(h)); }
+    /* A handle that is aborted is only closed. */
+    h = ray_file_sync_tree_begin(dir);
+    ray_file_sync_tree_abort(h);
+    /* Nothing to open: the caller syncs each file. */
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin("/nonexistent-rayforce-dir/x"),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(NULL),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_FALSE(ray_file_sync_tree_end(RAY_SYNC_TREE_NONE));
+    /* The knob that forces the fallback. */
+    ray_file_sync_tree_force_fallback(true);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(dir),RAY_SYNC_TREE_NONE);
+    ray_file_sync_tree_force_fallback(false);
+    rmdir(dir);
+    PASS();
+}
+/* The per-file fallback of a native import (the only path on other hosts, before
+ * Linux 5.8 and on filesystems syncfs is not trusted on) still produces the table:
+ * the Linux suite would otherwise only run the single flush. */
+static test_result_t test_pq_sync_fallback(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    const char* two[] = {FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet"};
+    char root[160];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-fallback-%d",(int)getpid());
+    ray_file_sync_tree_force_fallback(true);
+    ray_t* n = ray_parquet_parted_files(two,2,root,"hits",types);
+    ray_file_sync_tree_force_fallback(false);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,36); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),36);
+    ray_release(t);
+    pq_rm_rf(root);
+    ray_release(types);
     PASS();
 }
 static test_result_t test_pq_matrix(void) {
@@ -7349,8 +7487,13 @@ const test_entry_t parquet_entries[] = {
     {"parquet/lz4",test_pq_lz4,pq_setup,pq_teardown},
     {"parquet/uint64",test_pq_uint64,pq_setup,pq_teardown},
     {"parquet/decimal",test_pq_decimal,pq_setup,pq_teardown},
+    {"parquet/decimal-wide",test_pq_decimal_wide,pq_setup,pq_teardown},
+    {"parquet/decimal-rounding",test_pq_decimal_rounding,pq_setup,pq_teardown},
+    {"parquet/unsupported-columns",test_pq_unsupported_columns,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
+    {"parquet/sync_tree",test_pq_sync_tree,pq_setup,pq_teardown},
+    {"parquet/sync_fallback",test_pq_sync_fallback,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

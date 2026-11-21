@@ -2309,10 +2309,8 @@ static test_result_t test_exec_date_trunc(void) {
 
 /* ---- DATE_TRUNC: SECOND / MINUTE / HOUR / YEAR / default field codes ----
  * The existing test only exercises RAY_EXTRACT_MONTH.  This test covers the
- * remaining switch arms in DATE_TRUNC_INNER that are unreachable from RFL
- * (ray_temporal_trunc_from_sym only maps "date"→DAY and "time"→SECOND).
- * All four macro instantiations (HAS_NULLS × IN32) share the same switch,
- * so exercising one instantiation is sufficient to cover each case label.
+ * remaining units, built straight on the op (the dotted path cannot spell
+ * `minute`).
  *
  * Timestamp used: 2024-06-15 12:30:45.000000000 UTC (771769845000000000 ns).
  * µs = 771769845000000:
@@ -2320,7 +2318,7 @@ static test_result_t test_exec_date_trunc(void) {
  *   MINUTE: r = 45e6 µs → out_ns = 771769800000000000  (2024-06-15 12:30:00)
  *   HOUR:   r = 1845e6 µs → out_ns = 771768000000000000  (2024-06-15 12:00:00)
  *   YEAR:   → 2024-01-01  = 8766 days = 757382400000000000 ns
- *   default (RAY_EXTRACT_DOW): out_us = us → out_ns = 771769845000000000 */
+ *   WEEK:   Saturday → Monday 2024-06-10; QUARTER: 2024-04-01 */
 static test_result_t test_exec_date_trunc_fields(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -2377,14 +2375,29 @@ static test_result_t test_exec_date_trunc_fields(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* default case: RAY_EXTRACT_DOW (=6) falls through to default → out_us = us */
+    /* not a truncation unit: RAY_EXTRACT_DOW is a field, so no op is built */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "ts");
-    op = ray_date_trunc(g, col, RAY_EXTRACT_DOW);
+    TEST_ASSERT_TRUE(ray_date_trunc(g, col, RAY_EXTRACT_DOW) == NULL);
+    ray_graph_free(g);
+
+    /* week and quarter: 2024-06-15 is a Saturday, in Q2 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "ts");
+    op = ray_date_trunc(g, col, RAY_TRUNC_WEEK);
     result = ray_execute(g, op);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
     TEST_ASSERT_EQ_I(result->type, RAY_TIMESTAMP);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 771769845000000000LL);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 771292800000000000LL); /* 2024-06-10 */
+    ray_release(result);
+    ray_graph_free(g);
+
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "ts");
+    op = ray_date_trunc(g, col, RAY_TRUNC_QUARTER);
+    result = ray_execute(g, op);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 765244800000000000LL); /* 2024-04-01 */
     ray_release(result);
     ray_graph_free(g);
 
@@ -2394,14 +2407,10 @@ static test_result_t test_exec_date_trunc_fields(void) {
     PASS();
 }
 
-/* ---- DATE_TRUNC with HAS_NULLS=1, IN32=1 (DATE column) ----
- * DATE column (int32 days) with a null slot — forces DATE_TRUNC_INNER(HAS_NULLS=1,
- * IN32=1).  Use MINUTE and HOUR (not yet covered via RFL) to exercise those
- * switch arms in the HAS_NULLS=1 / IN32=1 instantiation.
- * Days: 8932 = 2024-06-15 (midnight → MINUTE/HOUR trunc leaves value unchanged).
- *       null at slot 1.
- *       8766 = 2024-01-01
- * day 8932 at midnight: 8932 * 86400e9 = 771724800000000000 ns */
+/* ---- DATE_TRUNC over a DATE column with a null slot ----
+ * A DATE truncates to a DATE (int32 days), nulls stay null, and a clock unit
+ * is no truncation of a DATE (a type error).
+ * Days: 8932 = 2024-06-15, null at slot 1, 8766 = 2024-01-01. */
 static test_result_t test_exec_date_trunc_in32_nulls(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -2418,42 +2427,26 @@ static test_result_t test_exec_date_trunc_in32_nulls(void) {
     tbl = ray_table_add_col(tbl, nd, dv);
     ray_release(dv);
 
-    /* MINUTE: days are midnight-aligned → r=0 → same as input in µs → ns */
-    /* day 8932 midnight: 8932 * 86400 * 1e9 = 771724800000000000 ns */
+    /* a clock unit does not fit a DATE: the type error comes at execution */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* col = ray_scan(g, "d");
-    ray_op_t* op = ray_date_trunc(g, col, RAY_EXTRACT_MINUTE);
+    ray_op_t* bad = ray_date_trunc(g, col, RAY_EXTRACT_HOUR);
+    TEST_ASSERT_TRUE(bad != NULL);
+    ray_t* bad_r = ray_execute(g, bad);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(bad_r));
+    ray_error_free(bad_r);
+    ray_graph_free(g);
+
+    /* YEAR: DATE 8932 (2024-06-15) floors to 2024-01-01 = day 8766 */
+    g = ray_graph_new(tbl);
+    col = ray_scan(g, "d");
+    ray_op_t* op = ray_date_trunc(g, col, RAY_EXTRACT_YEAR);
     ray_t* result = ray_execute(g, op);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_TIMESTAMP);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 771724800000000000LL);
+    TEST_ASSERT_EQ_I(result->type, RAY_DATE);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(result))[0], 8766);
     TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
-    ray_release(result);
-    ray_graph_free(g);
-
-    /* HOUR: same logic for midnight dates */
-    g = ray_graph_new(tbl);
-    col = ray_scan(g, "d");
-    op = ray_date_trunc(g, col, RAY_EXTRACT_HOUR);
-    result = ray_execute(g, op);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_TIMESTAMP);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 771724800000000000LL);
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
-    ray_release(result);
-    ray_graph_free(g);
-
-    /* YEAR: trunc DATE 8932 (2024-06-15) to 2024-01-01 = 8766 days
-     * = 8766*86400000000000 = 757382400000000000 ns */
-    g = ray_graph_new(tbl);
-    col = ray_scan(g, "d");
-    op = ray_date_trunc(g, col, RAY_EXTRACT_YEAR);
-    result = ray_execute(g, op);
-    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->type, RAY_TIMESTAMP);
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[0], 757382400000000000LL);
-    TEST_ASSERT_TRUE(ray_vec_is_null(result, 1));
-    TEST_ASSERT_EQ_I(((int64_t*)ray_data(result))[2], 757382400000000000LL);
+    TEST_ASSERT_EQ_I(((int32_t*)ray_data(result))[2], 8766);
     ray_release(result);
     ray_graph_free(g);
 

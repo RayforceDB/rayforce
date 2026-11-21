@@ -29,7 +29,8 @@ checks, pruning, and memory limits are described in the
 
 Read footer metadata without decoding data pages. The returned table has one
 row per column chunk, including its row group, type, codec, compressed and
-uncompressed sizes, and the presence of statistics or optional indexes.
+uncompressed sizes, and the presence of statistics or optional indexes. A column the reader
+cannot read has one row per row group too, with its reason in `unsupported`.
 
 ```lisp
 (.parquet.meta "events.parquet")
@@ -52,9 +53,18 @@ The whole result remains in memory. Typed `SYM` text uses a private dictionary
 that remains valid for as long as returned vectors retain it.
 
 Column types: `UINT64` reads as `I64`, and a value above `INT64_MAX`
-(including 2^63) fails the read. `DECIMAL` on an `INT32` or `INT64` column
-reads as `F64`, the stored integer divided by 10^scale; a decimal on a byte
-array is refused.
+(including 2^63) fails the read. `DECIMAL` reads as `F64`, the stored integer
+divided by 10^scale, on `INT32`, `INT64`, `FIXED_LEN_BYTE_ARRAY` (up to 16
+bytes) and `BYTE_ARRAY` columns (up to 38 digits). On a byte array the
+big-endian integer is first rounded to the nearest `F64` (ties to even), so the
+result is exact only while the unscaled integer is below 2^53.
+
+A column the reader cannot read (nested `LIST`, `MAP` or `STRUCT`, `INT96`, a
+`FIXED_LEN_BYTE_ARRAY` that is not a `DECIMAL`) does not make the file
+unreadable: a projection, or a query that never names the column, reads the
+others, and `.parquet.meta` lists every column, giving the reason in its
+`unsupported` column (null for a readable one). Naming such a column, or
+reading all columns, fails with `column <name>: <reason>`.
 
 ## `.parquet.scan` { #parquet-scan }
 
@@ -131,7 +141,7 @@ errors; argument, I/O, allocation, and cancellation errors also propagate.
 The options dict also takes `compress`: `true` writes generation-2
 (compressed) column files where the column is eligible, `false` (or no
 option, since the destination is always new) generation 0. A non-bool
-`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, because the import writes through the same splayed-table writer as `.db.splayed.set`.
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, unless a string column's dictionary would make the file larger than the generation-0 one (mostly distinct strings; see `.db.splayed.set` in [Storage](../storage/index.md)): the import writes through the same splayed-table writer as `.db.splayed.set`.
 For example:
 
 ```lisp

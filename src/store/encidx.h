@@ -218,6 +218,11 @@ typedef struct {               /* a region's children: pointers into it */
  * by construction. */
 ray_t* ray_enc_dict_write(FILE* f, const ray_enc_dict_src_t* s, uint64_t* bytes);
 
+/* The *bytes ray_enc_dict_write gives a source of len rows, n_distinct
+ * entries and bytes_len entry bytes (the same layout); UINT64_MAX when the
+ * layout is too large. */
+uint64_t ray_enc_dict_region_bytes(int64_t len, int64_t n_distinct, uint64_t bytes_len);
+
 /* The DICT region at `region` (32-aligned) that rayforce wrote: its root
  * fields and its children's places, read as written. */
 void   ray_enc_dict_parse(const uint8_t* region, ray_enc_dict_view_t* out);

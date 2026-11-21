@@ -970,6 +970,76 @@ static void sym_gather_set_nulls(ray_t* dst, int64_t n, ray_pool_t* pool) {
     if (atomic_load_explicit(&c.zero, memory_order_relaxed)) dst->attrs |= RAY_ATTR_HAS_NULLS;
 }
 
+/* A fixed-width parted column under the selection, on the pool (#1122):
+ * each task finds the segment of its first row and copies runs of
+ * consecutive rows within a segment with one parted_copy_cells.  Only when
+ * every segment is present and none may hold nulls: the tasks then write
+ * their own output cells and nothing else (no null bits, no fill). */
+typedef struct {
+    ray_t* const*  segs;
+    const int64_t* seg_ends;     /* [n_segs] cumulative rows */
+    const int64_t* idx;          /* source rows, ascending */
+    char*          dst;
+    int64_t        n_segs;
+    int8_t         base;
+    uint8_t        out_attrs;
+} parted_runs_ctx_t;
+
+static void parted_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const parted_runs_ctx_t* c = raw;
+    int64_t lo = 0, hi = c->n_segs - 1;                  /* the first row's segment */
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (c->idx[start] < c->seg_ends[mid]) hi = mid; else lo = mid + 1;
+    }
+    int64_t seg = lo;
+    for (int64_t i = start; i < end; ) {
+        int64_t row = c->idx[i];
+        while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;
+        int64_t seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0, j = i + 1;
+        while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < c->seg_ends[seg]) j++;
+        parted_copy_cells(c->dst, c->base, c->out_attrs, i, c->segs[seg], row - seg_start, j - i);
+        i = j;
+    }
+}
+
+#ifdef DEBUG
+static _Atomic(uint64_t) g_parted_runs;   /* test hook: parted columns gathered on the pool by runs */
+uint64_t ray_filter_test_parted_runs(void) { return atomic_load_explicit(&g_parted_runs, memory_order_relaxed); }
+#endif
+
+/* parted_gather_col, by runs on the pool when the column allows it. */
+static void sel_parted_gather(ray_pool_t* pool, ray_t* col, const int64_t* idx, int64_t count,
+                              ray_t* dst, const int64_t* cnt, int64_t ncnt) {
+    int64_t n_segs = col->len;
+    ray_t** segs = (ray_t**)ray_data(col);
+    bool runs = n_segs > 0;
+    for (int64_t s = 0; s < n_segs && runs; s++)
+        runs = segs[s] && !RAY_IS_ERR(segs[s]) && !ray_vec_may_have_nulls(segs[s]);
+    ray_t* ends_hdr = NULL;
+    int64_t* ends = runs ? (int64_t*)scratch_alloc(&ends_hdr, (size_t)n_segs * sizeof(int64_t)) : NULL;
+    if (!ends) { parted_gather_col(col, idx, count, dst, cnt, ncnt); return; }
+    int64_t cum = 0;
+    for (int64_t s = 0; s < n_segs; s++) ends[s] = cum += segs[s]->len;
+    int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
+    parted_runs_ctx_t c = {
+        .segs = segs, .seg_ends = ends, .idx = idx, .dst = (char*)ray_data(dst),
+        .n_segs = n_segs, .base = base, .out_attrs = base == RAY_SYM ? dst->attrs : 0,
+    };
+    if (ray_pool_par_dispatch_ok(pool, count, RAY_PARALLEL_THRESHOLD)) {
+        ray_pool_dispatch(pool, parted_runs_fn, &c, count);
+        if (pool_cancelled(pool))                        /* skipped tasks: no garbage cells */
+            memset(c.dst, 0, (size_t)count * ray_sym_elem_size(base, c.out_attrs));
+#ifdef DEBUG
+        atomic_fetch_add_explicit(&g_parted_runs, 1, memory_order_relaxed);
+#endif
+    } else {
+        parted_runs_fn(&c, 0, 0, count);
+    }
+    scratch_free(ends_hdr);
+}
+
 /* keep-set membership: is column name-sym `nm` present in keep_syms? */
 static inline bool sel_compact_keep(int64_t nm, const int64_t* keep_syms, int keep_n) {
     for (int j = 0; j < keep_n; j++)
@@ -1108,6 +1178,12 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             };
             ray_pool_dispatch_n(sc_pool, scidx_fill_fn, &sc, sc_chunks);
             scratch_free(soff_hdr);
+            /* a cancelled dispatch skips its tasks: match_idx is unfilled
+             * and every gather below would read its garbage as rows */
+            if (pool_cancelled(sc_pool)) {
+                scratch_free(idx_hdr);
+                return ray_error("cancel", NULL);
+            }
         } else {
             int64_t j = 0;
             for (uint32_t seg = 0; seg < n_segs; seg++) {
@@ -1270,7 +1346,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                                                            match_idx, pass_count,
                                                            cnt, ncnt);
                 } else {
-                    parted_gather_col(col, match_idx, pass_count, new_cols[c],
+                    sel_parted_gather(pool, col, match_idx, pass_count, new_cols[c],
                                       cnt, ncnt);
                 }
             } else {

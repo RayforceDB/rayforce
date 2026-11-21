@@ -546,6 +546,9 @@ bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
  * ray_index_inline_map: patch an mmap'd region's child offsets → absolute ptrs
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
+/* ray_index_inline_size of a RAY_IDX_DICT over `len` rows and `n_distinct`
+ * strings (I32 codes and first-occurrence rows), without building it. */
+int64_t ray_index_dict_inline_size(int64_t len, int64_t n_distinct);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
 /* The same bytes as ray_index_inline_write, streamed to `f` block by block
  * straight from the child vecs: no region-sized staging buffer (a 100 M-row

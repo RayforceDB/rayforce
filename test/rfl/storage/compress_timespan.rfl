@@ -1,0 +1,13 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; A TIMESPAN column of a chunk or more saved with compress: true.  The
+;; automatic chunk zone is not an index a TIMESPAN column admits, so the save
+;; writes the column without one instead of refusing it (nyi), as a column
+;; of fewer rows and a parted TIMESPAN column always were.
+(.sys.exec "rm -rf /tmp/rf_compress_timespan") -- 0
+(set T (table [d] (list (* 1000 (as 'TIMESPAN (til 70000))))))
+(.db.splayed.set "/tmp/rf_compress_timespan/t" T {compress: true})
+(set R (.db.splayed.get "/tmp/rf_compress_timespan/t"))
+(at (.idx.info R 'd) 'gen) -- 2
+(count R) -- 70000
+(get R 'd) -- (get T 'd)
+(.sys.exec "rm -rf /tmp/rf_compress_timespan") -- 0

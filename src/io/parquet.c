@@ -442,10 +442,12 @@ static const char* pq_levels_present(pq_rle* defs, int64_t n, bool* all) {
 typedef struct {
     int64_t name;
     int physical, optional, converted, type;
+    int tlen;       /* FIXED_LEN_BYTE_ARRAY: bytes per value */
+    int leaves;     /* leaf column chunks per row group (1 unless nested) */
     int64_t scale; /* TIMESTAMP multiplier to ns */
     double dec_div; /* DECIMAL: 10^scale, the divisor of the stored integer */
     bool native_symbol, strict;
-    const char* refusal; /* why pq_schema_type refused a DECIMAL, else NULL */
+    const char* refusal; /* why the column cannot be read, else NULL */
     ray_sym_domain_t* import_domain; /* borrowed from import or scan owner */
 } pq_schema;
 typedef struct { const uint8_t* p; uint32_t n; } pq_string;
@@ -763,7 +765,7 @@ struct ray_parquet {
     ray_sym_domain_t* scan_domain;
     ray_t* text_pattern;
     int64_t text_pos;
-    int64_t ncols, ngroups, nselected, noutput, rows, group, group_left, batch_rows;
+    int64_t ncols, nleaves, ngroups, nselected, noutput, rows, group, group_left, batch_rows;
     int64_t group_batch;  /* batch_rows, capped for this group's STR columns */
     int64_t filter_pos, filter_lo, filter_hi, skipped;
     pq_interval* excluded;
@@ -797,10 +799,42 @@ static bool pq_utf8(const uint8_t* p, size_t n) {
     }
     return true;
 }
+/* Bytes of one PLAIN value of a fixed-width column (and of a dictionary entry). */
+/* A column read as strings (a byte-array DECIMAL is read as numbers). */
+#define PQ_STRCOL(s) ((s)->physical == 6 && (s)->type == RAY_STR)
+static size_t pq_width(const pq_schema* s) {
+    return s->physical == 7 ? (size_t)s->tlen : s->physical == 1 || s->physical == 4 ? 4 : 8;
+}
+/* A DECIMAL stored on a byte array (FIXED_LEN_BYTE_ARRAY or BYTE_ARRAY). */
+static bool pq_byte_decimal(const pq_schema* s) { return s->converted == 5 && (s->physical == 6 || s->physical == 7); }
+/* The unscaled integer of a big-endian two's complement byte string of at most
+ * 16 bytes, as the double nearest to it (ties to even), then divided by 10^scale.
+ * The conversion is exact up to 2^53; the division is correctly rounded as well
+ * when 10^scale is exact, which holds up to scale 22. */
+static double pq_decimal_bytes(const uint8_t* p, size_t n, double div) {
+    unsigned __int128 u = n && (p[0]&0x80) ? ~(unsigned __int128)0 : 0;
+    for (size_t i = 0; i < n; i++) u = u<<8 | p[i];     /* sign-extended to 128 bits */
+    bool neg = n && (p[0]&0x80);
+    if (neg) u = ~u+1;                                   /* the magnitude, 2^127 included */
+    double m;
+    if (u>>64 == 0) m = (double)(uint64_t)u;
+    else {
+        int bits = 128-(int)(u>>64 ? __builtin_clzll((uint64_t)(u>>64)) : 64+__builtin_clzll((uint64_t)u));
+        int sh = bits-53;                                /* keep 53 bits, round to nearest even */
+        uint64_t mant = (uint64_t)(u>>sh);
+        bool half = (u>>(sh-1))&1, sticky = (u & (((unsigned __int128)1<<(sh-1))-1)) != 0;
+        if (half && (sticky || (mant&1))) mant++;
+        m = ldexp((double)mant, sh);                     /* mant <= 2^53: exact */
+    }
+    return (neg ? -m : m) / div;
+}
 static bool pq_schema_type(pq_schema* s, pq_span* f) {
     int64_t phys, rep;
-    if (!pq_num(f[1], &phys) || !pq_num(f[3], &rep) || rep < 0 || rep > 1 || f[5].type) return false;
-    s->physical = (int)phys; s->optional = (int)rep;
+    if (!pq_num(f[1], &phys) || !pq_num(f[3], &rep) || f[5].type) return false;
+    s->physical = (int)phys; s->optional = rep == 1; s->leaves = 1;
+    s->tlen = (int)pq_get(f[2], -1);
+    if (rep < 0 || rep > 2) return false;
+    if (rep == 2) { s->refusal = "repeated column"; return false; }
     s->converted = (int)pq_get(f[6], -1); s->scale = 1; s->dec_div = 1;
     int64_t dscale = pq_get(f[7], -1), dprec = pq_get(f[8], -1); /* DECIMAL annotation */
     switch (phys) {
@@ -810,7 +844,9 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
     case 4: s->type = RAY_F32; break;
     case 5: s->type = RAY_F64; break;
     case 6: s->type = RAY_STR; break;
-    default: return false;
+    case 3: s->refusal = "INT96 is not supported"; return false;
+    case 7: s->type = RAY_STR; break;   /* read as a DECIMAL only, below */
+    default: s->refusal = "unsupported physical type"; return false;
     }
     int conv = s->converted;
     if (f[10].type) {
@@ -841,16 +877,22 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
             conv = 5;
         } else return false;
     }
+    if (phys == 7 && conv != 5) { s->refusal = "FIXED_LEN_BYTE_ARRAY is read as a DECIMAL only"; return false; }
     if (conv == 0) { if (phys != 6) return false; }
     else if (conv == 6) { if (phys != 1) return false; s->type = RAY_DATE; }
     else if (conv == 5) {
-        /* DECIMAL on INT32/INT64 reads as F64: stored / 10^scale, one correctly
-         * rounded division of an exactly converted integer, so exact up to 2^53. */
-        if (phys != 1 && phys != 2) { s->refusal = "DECIMAL is read on INT32 and INT64 columns only"; return false; }
+        /* DECIMAL reads as F64: the stored integer divided by 10^scale. On INT32
+         * and INT64 that is one correctly rounded division of an exactly converted
+         * integer, so exact up to 2^53; on a byte array the integer is first
+         * rounded to the nearest double (pq_decimal_bytes). */
+        bool bytes = phys == 6 || phys == 7;
+        if (phys != 1 && phys != 2 && !bytes) { s->refusal = "DECIMAL is read on INT32, INT64, BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY columns only"; return false; }
         if (dscale < 0 || dscale > dprec) { s->refusal = "DECIMAL scale must be between 0 and its precision"; return false; }
-        if (dprec < 1 || dprec > (phys == 1 ? 9 : 18) || dscale > 18) { s->refusal = "DECIMAL precision is beyond its physical type (9 digits on INT32, 18 on INT64)"; return false; }
-        s->type = RAY_F64; s->dec_div = 1;
-        for (int64_t i = 0; i < dscale; i++) s->dec_div *= 10;
+        if (dprec < 1 || dprec > (phys == 1 ? 9 : phys == 2 ? 18 : 38)) { s->refusal = "DECIMAL precision is beyond its physical type (9 digits on INT32, 18 on INT64, 38 on a byte array)"; return false; }
+        if (phys == 7 && (s->tlen < 1 || s->tlen > 16)) { s->refusal = "DECIMAL on a FIXED_LEN_BYTE_ARRAY is read up to 16 bytes"; return false; }
+        s->type = RAY_F64;
+        char text[16]; snprintf(text, sizeof text, "1e%d", (int)dscale);
+        s->dec_div = strtod(text, NULL);                /* the nearest double to 10^scale */
     } else if (conv == 9 || conv == 10) {
         if (phys != 2) return false;
         s->type = RAY_TIMESTAMP; s->scale = conv == 9 ? 1000000 : 1000;
@@ -882,7 +924,33 @@ void ray_parquet_close(ray_parquet_t* r) {
     }
     ray_free_raw(r);
 }
+/* The error for selecting a column the reader cannot read, or NULL. */
+static ray_t* pq_check_selected(const ray_parquet_t* r) {
+    for (int64_t i = 0; i < r->nselected; i++) {
+        const pq_schema* s = &r->schema[r->selected[i]];
+        if (!s->refusal) continue;
+        ray_t* name = ray_sym_str(s->name);
+        return ray_error("parquet","column %s: %s",name ? ray_str_ptr(name) : "?",s->refusal);
+    }
+    return NULL;
+}
+/* Skip the schema elements below a group, counting its leaf columns. */
+static bool pq_subtree(pq_cur* sc, unsigned depth, int64_t* leaves) {
+    pq_span se, sf[11]; int64_t kids;
+    if (depth > 32 || !pq_element(sc,12,&se) || !pq_fields(se,sf,11)) return false;
+    if (!sf[5].type) { (*leaves)++; return true; }
+    if (!pq_num(sf[5],&kids) || kids < 0 || kids > PQ_MAX_COLS) return false;
+    for (int64_t k = 0; k < kids; k++) if (!pq_subtree(sc,depth+1,leaves)) return false;
+    return true;
+}
+static ray_t* pq_open_impl(const char* path, ray_t* columns, int64_t batch_rows, ray_parquet_t** out, bool lenient);
 ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ray_parquet_t** out) {
+    return pq_open_impl(path,columns,batch_rows,out,false);
+}
+/* `lenient`: columns the reader cannot read stay in the schema, marked with
+ * their refusal, and selecting one is not an error here (the caller decides
+ * which columns it reads, then calls pq_check_selected). */
+static ray_t* pq_open_impl(const char* path, ray_t* columns, int64_t batch_rows, ray_parquet_t** out, bool lenient) {
     *out = NULL;
     if (batch_rows < 1 || batch_rows > PQ_BATCH) return pq_error("batch size must be 1..65536");
     if (columns && (columns->type != RAY_SYM || !columns->len)) return pq_error("columns must be a nonempty symbol vector");
@@ -907,24 +975,32 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
                          !memcmp(created,"DuckDB",6); }
     pq_cur sc = {f[2].p,f[2].end,false}; uint8_t st;
     uint64_t ns = pq_list(&sc, &st);
-    if (sc.bad || st != 12 || ns < 2 || ns > PQ_MAX_COLS+1) goto fail;
-    r->ncols = (int64_t)ns-1;
+    if (sc.bad || st != 12 || ns < 2 || ns > 8*PQ_MAX_COLS) goto fail;
+    pq_span root, sf[11];
+    if (!pq_element(&sc, 12, &root) || !pq_fields(root,sf,11) || sf[1].type ||
+        !pq_num(sf[5],&r->ncols) || r->ncols < 1 || r->ncols > PQ_MAX_COLS) goto fail;
     r->schema = ray_calloc_raw((size_t)r->ncols*sizeof(*r->schema));
     if (!r->schema) { err = "schema allocation failed"; goto fail; }
-    pq_span root, sf[11]; char why[200];
-    if (!pq_element(&sc, 12, &root) || !pq_fields(root,sf,11) || pq_get(sf[5],-1) != r->ncols || sf[1].type) goto fail;
-    err = "unsupported or malformed schema (only flat primitive columns are supported)";
+    err = "malformed schema";
     for (int64_t i = 0; i < r->ncols; i++) {
         pq_span se; const uint8_t* name; size_t len;
         if (!pq_element(&sc,12,&se) || !pq_fields(se,sf,11) || !pq_binary(sf[4],&name,&len) ||
             !len || len > 1024 || memchr(name,0,len)) goto fail;
-        if (!pq_schema_type(&r->schema[i],sf)) {
-            if (r->schema[i].refusal) {
-                snprintf(why,sizeof why,"column %.*s: %s",(int)(len < 100 ? len : 100),(const char*)name,r->schema[i].refusal);
-                err = why;
-            }
-            goto fail;
+        pq_schema* col = &r->schema[i];
+        if (sf[5].type) {            /* a group: list, map or struct; its leaves are skipped */
+            int64_t kids, leaves = 0;
+            if (!pq_num(sf[5],&kids) || kids < 1 || kids > PQ_MAX_COLS) goto fail;
+            for (int64_t k = 0; k < kids; k++) if (!pq_subtree(&sc,1,&leaves)) goto fail;
+            col->physical = -1; col->leaves = (int)leaves;
+            int64_t conv = pq_get(sf[6],-1);
+            col->refusal = conv == 3 ? "nested type LIST is not supported" :
+                           conv == 1 || conv == 2 ? "nested type MAP is not supported" :
+                           "nested type STRUCT is not supported";
+        } else if (!pq_schema_type(col,sf)) {
+            if (!col->refusal) col->refusal = "unsupported column type";
+            col->leaves = 1;
         }
+        r->nleaves += col->leaves;
         r->schema[i].name = ray_sym_intern((const char*)name,len);
         if (r->schema[i].name < 0) goto fail;
         for (int64_t j = 0; j < i; j++) if (r->schema[j].name == r->schema[i].name) goto fail;
@@ -943,7 +1019,7 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
         if (!pq_element(&gc,12,&r->groups[i]) || !pq_fields(r->groups[i],gf,8) ||
             !pq_num(gf[3],&nr) || nr < 0 || nr > r->rows-total || gf[1].type != 9) goto fail;
         pq_cur chunks = {gf[1].p,gf[1].end,false}; uint8_t chunk_type;
-        if (pq_list(&chunks,&chunk_type) != (uint64_t)r->ncols || chunks.bad || chunk_type != 12) goto fail;
+        if (pq_list(&chunks,&chunk_type) != (uint64_t)r->nleaves || chunks.bad || chunk_type != 12) goto fail;
         total += nr;
     }
     if (gc.p != gc.end || total != r->rows) goto fail;
@@ -964,6 +1040,10 @@ ray_t* ray_parquet_open(const char* path, ray_t* columns, int64_t batch_rows, ra
         for (int64_t k = 0; k < i; k++) if (r->selected[k] == j) goto fail;
         r->selected[i] = (int32_t)j;
     }
+    if (!lenient) {
+        ray_t* refused = pq_check_selected(r);
+        if (refused) { ray_parquet_close(r); return refused; }
+    }
     *out = r; return NULL;
 fail:
     ray_parquet_close(r); return pq_error(err);
@@ -976,6 +1056,7 @@ ray_t* ray_parquet_range(ray_parquet_t* r, int64_t column, int64_t lo, int64_t h
     while (c < r->ncols && r->schema[c].name != column) c++;
     if (c == r->ncols) return pq_error("unknown range column");
     pq_schema* s = &r->schema[c];
+    if (s->refusal) return ray_error("parquet","column %s: %s",ray_str_ptr(ray_sym_str(s->name)),s->refusal);
     if ((s->type != RAY_I16 && s->type != RAY_I32 && s->type != RAY_I64) ||
         (s->converted != -1 && (s->converted < 15 || s->converted > 18)))
         return pq_error("range requires a signed integer column");
@@ -1118,9 +1199,14 @@ static bool pq_group_columns(ray_parquet_t* r, int64_t g, pq_span* cols, int64_t
     pq_span gf[8];
     if (!pq_fields(r->groups[g],gf,8) || !pq_num(gf[3],rows) || gf[1].type != 9) return false;
     pq_cur c = {gf[1].p,gf[1].end,false}; uint8_t type;
-    if (pq_list(&c,&type) != (uint64_t)r->ncols || c.bad || type != 12) return false;
+    if (pq_list(&c,&type) != (uint64_t)r->nleaves || c.bad || type != 12) return false;
     for (int64_t i = 0; i < r->ncols; i++) {
         pq_span ch, cf[10], mf[17];
+        if (r->schema[i].refusal) {      /* not read: its chunks are only stepped over */
+            for (int k = 0; k < r->schema[i].leaves; k++) if (!pq_element(&c,12,&ch)) return false;
+            cols[i] = (pq_span){0};
+            continue;
+        }
         if (!pq_element(&c,12,&ch) || !pq_fields(ch,cf,10) || cf[1].type || cf[8].type || cf[9].type ||
             !pq_fields(cf[3],mf,17) || pq_get(mf[1],-1) != r->schema[i].physical ||
             pq_get(mf[5],-1) != *rows || mf[3].type != 9) return false;
@@ -1316,8 +1402,7 @@ static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, si
         }
         return true;
     }
-    size_t width = s->physical == 1 || s->physical == 4 ? 4 : 8;
-    return s->physical != 0 && (uint64_t)count*width == n;
+    return s->physical != 0 && (uint64_t)count*pq_width(s) == n;
 }
 /* The steps of reading a page that the decoder (pq_page) and the seeding
  * of a grouped import's direct columns (pq_seed_dicts) share, so that the
@@ -1514,7 +1599,14 @@ static const char* pq_put_value(ray_t** vp, int64_t row, pq_schema* s, const uin
     }
     case 4: { uint32_t u = pq_u32(p); memcpy((float*)ray_data(v)+row,&u,4); break; }
     case 5: { uint64_t u = pq_u64(p); memcpy((double*)ray_data(v)+row,&u,8); break; }
-    case 6: {
+    case 6: case 7: {
+        if (pq_byte_decimal(s)) {
+            size_t n = s->physical == 7 ? (size_t)s->tlen : len;
+            if (n < 1 || n > 16) return "DECIMAL value is empty or wider than 16 bytes";
+            ((double*)ray_data(v))[row] = pq_decimal_bytes(p,n,s->dec_div);
+            break;
+        }
+        if (s->physical == 7) return PQ_PUT_FAIL;
         if (s->strict && s->converted == 0 && !pq_utf8(p,len)) return PQ_PUT_FAIL;
         ray_t* next = ray_str_vec_set(v,row,(const char*)p,len);
         if (!next || RAY_IS_ERR(next)) { if (next) ray_release(next); return PQ_PUT_FAIL; }
@@ -1763,9 +1855,9 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
             if ((uint64_t)n > c->ids.left) n = (int64_t)c->ids.left;
             if (n > 4096) n = 4096;
             const uint8_t* p = s->physical == 6 ? c->strings[id].p :
-                c->dict+(size_t)id*((s->physical == 1 || s->physical == 4) ? 4 : 8);
+                c->dict+(size_t)id*pq_width(s);
             uint32_t len = s->physical == 6 ? c->strings[id].n : 0;
-            if (len > PQ_MAX_PAGE || (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX)) return PQ_PUT_FAIL;
+            if (len > PQ_MAX_PAGE || (PQ_STRCOL(s) && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX)) return PQ_PUT_FAIL;
             const char* perr = pq_put_value(&v,i,s,p,len);
             if (perr) return perr;
             *out = v;
@@ -1817,7 +1909,7 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                     uint32_t id;
                     if (!pq_rle_next(&c->ids,&id) || id >= c->dict_count) return "dictionary index out of range";
                     if (s->physical == 6) { p = c->strings[id].p; len = c->strings[id].n; }
-                    else p = c->dict+(size_t)id*((s->physical == 1 || s->physical == 4) ? 4 : 8);
+                    else p = c->dict+(size_t)id*pq_width(s);
                 } else if (c->bool_rle) {
                     uint32_t bit;
                     if (!pq_rle_next(&c->ids,&bit)) return "truncated RLE boolean data";
@@ -1830,10 +1922,10 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
                     if (!pq_take(&c->values,4,&lp)) return "truncated string length";
                     len = pq_u32(lp);
                     if (!pq_take(&c->values,len,&p)) return "truncated string data";
-                } else if (!pq_take(&c->values,(s->physical == 1 || s->physical == 4) ? 4 : 8,&p)) return "truncated numeric data";
-                if (s->physical == 6 && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
+                } else if (!pq_take(&c->values,pq_width(s),&p)) return "truncated numeric data";
+                if (PQ_STRCOL(s) && v->str_pool && (uint64_t)v->str_pool->len+len > PQ_POOL_MAX) return "batch string pool exceeds 4 GiB";
                 if (len > PQ_MAX_PAGE) return PQ_PUT_FAIL;
-                if (s->physical == 6 && !c->encoding) {
+                if (PQ_STRCOL(s) && !c->encoding) {
                     /* PLAIN bytes land in the batch directly; definition
                      * traversal, null/empty and strict rules are unchanged. */
                     if (s->strict && s->converted == 0 && !pq_utf8(p,len)) return PQ_PUT_FAIL;
@@ -2111,7 +2203,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     ray_parquet_t* r = ray_calloc_raw(sizeof(*r));
     if (!r) return NULL;
     r->borrowed = true; r->map = parent->map; r->size = parent->size; r->data_end = parent->data_end;
-    r->schema = parent->schema; r->groups = parent->groups; r->ncols = parent->ncols;
+    r->schema = parent->schema; r->groups = parent->groups; r->ncols = parent->ncols; r->nleaves = parent->nleaves;
     r->ngroups = group+1; r->group = group-1; r->batch_rows = parent->batch_rows;
     r->nselected = nselected; r->noutput = parent->noutput;
     r->filter_pos = parent->filter_pos; r->filter_lo = parent->filter_lo; r->filter_hi = parent->filter_hi;
@@ -2259,17 +2351,17 @@ ray_t* ray_parquet_read(const char* path, ray_t* columns) {
 }
 
 ray_t* ray_parquet_metadata(const char* path) {
-    ray_parquet_t* r = NULL; ray_t* err = ray_parquet_open(path,NULL,PQ_BATCH,&r);
+    ray_parquet_t* r = NULL; ray_t* err = pq_open_impl(path,NULL,PQ_BATCH,&r,true);
     if (err) return err;
-    const char* names[] = {"row_group","column","physical_type","ray_type","codec","rows","compressed_bytes","uncompressed_bytes","statistics","page_index","bloom_filter"};
-    enum { N = 11 };
+    const char* names[] = {"row_group","column","physical_type","ray_type","codec","rows","compressed_bytes","uncompressed_bytes","statistics","page_index","bloom_filter","unsupported"};
+    enum { N = 12 };
     ray_t* v[N] = {0}; pq_span* cols = NULL;
     int64_t count = r->ngroups*r->ncols;
     if ((uint64_t)count > PQ_MAX_FOOTER/(N*sizeof(int64_t))) {
         ray_parquet_close(r); return pq_error("metadata result exceeds 64 MiB");
     }
     for (int i = 0; i < N; i++) {
-        v[i] = i == 1 || i == 3 ? ray_sym_vec_new(RAY_SYM_W64,count) : ray_vec_new(RAY_I64,count);
+        v[i] = i == 1 || i == 3 || i == 11 ? ray_sym_vec_new(RAY_SYM_W64,count) : ray_vec_new(RAY_I64,count);
         if (!v[i] || RAY_IS_ERR(v[i])) { err = v[i]; v[i] = NULL; goto done; }
         v[i]->len = count;
     }
@@ -2283,14 +2375,25 @@ ray_t* ray_parquet_metadata(const char* path) {
         pq_cur cc = {gf[1].p,gf[1].end,false}; uint8_t ct; pq_list(&cc,&ct);
         for (int64_t c = 0; c < r->ncols; c++) {
             int64_t row = g*r->ncols+c; pq_span mf[17], ch, cf[10];
+            const pq_schema* sc = &r->schema[c];
+            if (sc->refusal) {      /* described, not read: only the reason and the row count are known */
+                int64_t cells[N] = {g,sc->name,sc->physical,0,0,nr,0,0,0,0,0,ray_sym_intern(sc->refusal,strlen(sc->refusal))};
+                const char* tn = "unsupported"; cells[3] = ray_sym_intern(tn,strlen(tn));
+                for (int i = 0; i < N; i++) ((int64_t*)ray_data(v[i]))[row] = cells[i];
+                for (int k = 0; k < sc->leaves; k++) if (!pq_element(&cc,12,&ch)) { err = pq_error("invalid column metadata"); goto done; }
+                if (sc->physical < 0 && ray_vec_set_null_checked(v[2],row,true) != RAY_OK) { err = pq_error("unrepresentable null"); goto done; }
+                for (int i = 4; i < 8; i++) if (i != 5 && ray_vec_set_null_checked(v[i],row,true) != RAY_OK) { err = pq_error("unrepresentable null"); goto done; }
+                continue;
+            }
             if (!pq_fields(cols[c],mf,17) || !pq_element(&cc,12,&ch) || !pq_fields(ch,cf,10)) {
                 err = pq_error("invalid column metadata"); goto done;
             }
             const char* tn = ray_type_name((int8_t)r->schema[c].type);
             int64_t cells[N] = {g,r->schema[c].name,r->schema[c].physical,ray_sym_intern(tn,strlen(tn)),
                 pq_get(mf[4],-1),nr,pq_get(mf[7],-1),pq_get(mf[6],-1),!!mf[12].type,
-                !!cf[4].type && !!cf[6].type,!!mf[14].type};
+                !!cf[4].type && !!cf[6].type,!!mf[14].type,0};
             for (int i = 0; i < N; i++) ((int64_t*)ray_data(v[i]))[row] = cells[i];
+            if (ray_vec_set_null_checked(v[11],row,true) != RAY_OK) { err = pq_error("unrepresentable null"); goto done; }
         }
     }
     err = ray_table_new(N);
@@ -2356,6 +2459,7 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         ray_t* atom = ray_sym_vec_cell(types,c); const char* name = atom ? ray_str_ptr(atom) : NULL;
         pq_schema* s = &r->schema[c];
         if (!name) return pq_error("invalid import type");
+        if (s->refusal) continue;      /* not readable: its type is moot */
         if (!strcmp(name,"SYM") && s->type == RAY_STR) { s->native_symbol = true; continue; }
         if (!strcmp(name,ray_type_name((int8_t)s->type))) continue;
         bool integer = (s->type == RAY_I16 || s->type == RAY_I32 || s->type == RAY_I64);
@@ -2540,7 +2644,19 @@ static ray_t* pq_publish(const char* staging, const char* root, int64_t rows) {
     if (ray_file_sync_dir(root) != RAY_OK) return pq_error("native destination published but directory sync failed");
     return ray_i64(rows);
 }
-static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char* table, int64_t parts) {
+/* Make the staged tree durable before it is published. `tree` is the handle
+ * ray_file_sync_tree_begin gave when staging began, before any write: one flush of
+ * the staged tree where the host has one (a table of many small files otherwise
+ * spends its time in thousands of sequential fsyncs: 14,900 for 16 million rows in
+ * 1,145 files, about 55 s), else, or if that flush fails, every file and directory
+ * synced in turn, which finds a failed write itself. The flush is not a check that
+ * every column file exists, nor is it interruptible: the writers report their own
+ * errors and cancellation. Publication still syncs the staging root and renames it
+ * into place. The handle is consumed. */
+static ray_t* pq_sync_partitions(ray_parquet_t* r, const char* root, const char* table, int64_t parts, int* tree) {
+    int handle = *tree;
+    *tree = RAY_SYNC_TREE_NONE;
+    if (ray_file_sync_tree_end(handle)) return NULL;
     char path[1600], leaf[1400];
     for (int64_t part = 0; part < parts; part++) {
         if (ray_interrupted()) return ray_error("cancel","parquet conversion interrupted");
@@ -2599,6 +2715,7 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
     root = dest;
     ray_parquet_t* first = NULL; ray_t* err = NULL;
     char staging[1100] = "", sym[1200] = ""; int64_t parts = 0, rows = 0;
+    int tree = RAY_SYNC_TREE_NONE;   /* the flush of the staged tree, opened before its first write */
     ray_sym_domain_t* domain = NULL;
     for (size_t i = 0; i < npaths && !err; i++) {
         ray_parquet_t* r = NULL;
@@ -2608,7 +2725,10 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
         if (!err && i) err = pq_same_ncols(first,r);
         if (!err) err = pq_import_types(r,types);
         if (!err && r->symcol) err = ray_error("domain","parquet: symfile 'column is supported by .parquet.splayed only");
-        if (!err && !i) err = pq_stage(r,root,staging,sizeof(staging),true);
+        if (!err && !i) {
+            err = pq_stage(r,root,staging,sizeof(staging),true);
+            if (!err) tree = ray_file_sync_tree_begin(staging);
+        }
         if (!err && i) err = pq_same_schema(first,r);
         if (!err) {
             /* Global runtime interning is not worker-safe. Decode symbols
@@ -2646,7 +2766,8 @@ ray_t* ray_parquet_parted_files(const char* const* paths, size_t npaths, const c
         ray_err_t e = ray_sym_domain_flush(domain,true);
         if (e != RAY_OK) err = ray_error(ray_err_code_str(e),"parquet: cannot flush symbol file");
     }
-    if (!err) err = pq_sync_partitions(first,staging,table,parts);
+    if (!err) err = pq_sync_partitions(first,staging,table,parts,&tree);
+    ray_file_sync_tree_abort(tree);   /* still open: an error before the flush */
     if (!err) err = pq_publish(staging,root,rows);
     if (domain) ray_sym_domain_release(domain);
     if (first) ray_parquet_close(first);
@@ -5374,7 +5495,7 @@ ray_t* ray_parquet_select_source(ray_t* source, ray_t* query, bool* complete) {
     const char* p = pq_path_arg(path);
     if (!p) { ray_release(path); return pq_error("invalid lazy source path"); }
     ray_parquet_t* r = NULL;
-    ray_t* err = ray_parquet_open(p,NULL,PQ_BATCH,&r); ray_release(path);
+    ray_t* err = pq_open_impl(p,NULL,PQ_BATCH,&r,true); ray_release(path);
     if (err) return err;
     ray_t* options = pq_option(source,".parquet.options");
     if (options) {
@@ -5401,10 +5522,17 @@ ray_t* ray_parquet_select_source(ray_t* source, ray_t* query, bool* complete) {
         int64_t n = 0;
         for (int64_t c = 0; c < r->ncols; c++) if (keep[c]) r->selected[n++] = (int32_t)c;
         /* Keep a column for row cardinality when outputs contain only constants. */
-        if (!n) { r->selected[0] = 0; n = 1; }
+        if (!n) {
+            int64_t first = 0;
+            while (first < r->ncols && r->schema[first].refusal) first++;
+            if (first == r->ncols) first = 0;      /* none readable: reported below */
+            r->selected[0] = (int32_t)first; n = 1;
+        }
         r->nselected = r->noutput = n;
     }
     ray_free_raw(keep);
+    err = pq_check_selected(r);
+    if (err) { ray_parquet_close(r); return err; }
     ray_t* where = pq_option(query,"where");
     int64_t col = -1, lo = INT64_MIN, hi = INT64_MAX;
     if (pq_query_range(r,where,&col,&lo,&hi,0) && col >= 0 && lo <= hi) {
