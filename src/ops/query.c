@@ -28627,7 +28627,8 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * so the groups after the first skip the graph and go to the evaluator
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
-static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined) {
+static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
+                                  ray_t* rows) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
@@ -28636,7 +28637,9 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
             op = ray_optimize(g, op);
+            g->xbar_rows = rows;          /* borrowed; the rows where: updates */
             out = ray_execute(g, op);
+            g->xbar_rows = NULL;
         } else {
             cerr = graph_take_compile_err(g);
             if (dag_declined) *dag_declined = true;
@@ -28696,7 +28699,18 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
 }
 
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
-    return update_eval_on_impl(sub, expr, true, NULL);
+    return update_eval_on_impl(sub, expr, true, NULL, NULL);
+}
+
+/* update_eval_on under where: (mask, one BOOL per row): the value is read
+ * on the matched rows only, so an xbar buckets those alone; a dropped row
+ * keeps its old value and never raises, as in a select (#1355). */
+static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    ray_t* rows = mask && mask->type == RAY_BOOL && mask->len == ray_table_nrows(tbl)
+                ? ray_rowsel_from_pred(mask) : NULL;
+    ray_t* v = update_eval_on_impl(tbl, expr, true, NULL, rows);
+    if (rows) ray_rowsel_release(rows);
+    return v;
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -29198,7 +29212,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     dependencies.table = sub_tbl;
                     g_query_dependencies = &dependencies;
                 }
-                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined);
+                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined, NULL);
                 g_query_dependencies = prev_dependencies;
                 ray_release(sub_tbl);
 
@@ -29428,7 +29442,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
-                ray_t* expr_vec = update_eval_on(tbl, update_expr);
+                ray_t* expr_vec = update_eval_where(tbl, update_expr, mask_vec);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
                 if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
                     int64_t got = ray_len(expr_vec);
@@ -29677,7 +29691,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_eval_on(tbl, dict_elems[d + 1]);
+            ray_t* v = update_eval_where(tbl, dict_elems[d + 1], mask_vec);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {

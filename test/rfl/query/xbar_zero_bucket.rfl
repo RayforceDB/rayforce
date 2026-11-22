@@ -741,7 +741,11 @@
 (at (select {from: E r: (xbar v 0Nl)}) 'r) -- (xbar (at E 'v) 0Nl)
 (at (select {from: E r: (xbar v 0x00)}) 'r) -- (xbar (at E 'v) 0x00)
 (at (select {from: E r: (xbar v w)}) 'r) -- (xbar (at E 'v) (at E 'w))
-(at (select {from: E r: (xbar (as 'F64 v) 0.0)}) 'r) -- (xbar (as 'F64 (at E 'v)) 0.0)
+;; (the builtin's empty F64-by-0.0 result is I64-typed; the query keeps F64,
+;; as it does for a nonzero bucket and the builtin does then)
+(type (at (select {from: E r: (xbar (as 'F64 v) 0.0)}) 'r)) -- 'F64
+(type (at (select {from: E r: (xbar (as 'F64 v) 0.0)}) 'r)) -- (type (xbar (as 'F64 (at E 'v)) 2.0))
+(count (at (select {from: E r: (xbar (as 'F64 v) 0.0)}) 'r)) -- 0
 (at (select {from: T r: (xbar v x)}) 'r) -- (xbar (at T 'v) (at T 'x))
 (at (select {from: T r: (+ 1 (xbar v x))}) 'r) -- (+ 1 (xbar (at T 'v) (at T 'x)))
 (at (select {from: T by: k s: (sum (xbar v x))}) 's) -- [-3 12]
@@ -758,9 +762,19 @@
 (at (select {from: T where: (> w 0) r: (xbar v w)}) 'r) -- [9 12]
 (select {from: T where: (!= w 0) r: (xbar v w)}) !- domain
 (count (select {from: T where: (and (> x 0) (> (xbar v w) 0))})) -- 2
-;; (update buckets every row, the per-row route included)
+;; an update buckets the rows its where: keeps; the others keep their value
+;; (the interpreter's per-row route, which buckets every row, still raises)
+(at (update {from: T where: (> x 0) v: (xbar v w)}) 'v) -- [9 -11 12 13]
+(at (update {from: T where: (> x 0) r: (xbar v w)}) 'r) -- [9 0Nl 12 0Nl]
+(at (update {from: T where: (> x 0) r: (+ 1 (xbar v w))}) 'r) -- [10 0Nl 13 0Nl]
+(at (update {from: T where: (> x 0) g: (xbar f g)}) 'g) -- [1.5 0.0 3.0 0Nf]
+(update {from: T where: (> x -5) v: (xbar v w)}) !- domain
+(update {from: T where: (> x -5) r: (xbar v w)}) !- domain
+(update {from: T r: (xbar v w)}) !- domain
 (update {from: T where: (> x 0) v: (xbar (min v v) w)}) !- domain
-(update {from: T where: (> x 0) v: (xbar v w)}) !- domain
+(set U (table [v w] (list [10 11 12 13] [3 0 5 7])))
+(at (update {from: U where: (> w 0) r: (xbar v w)}) 'r) -- [9 0Nl 10 7]
+(at (update {from: U where: (> w 0) v: (xbar v w)}) 'v) -- [9 11 10 7]
 ;; ... while a kept row's zero bucket still raises
 (select {from: T where: (> v 0) r: (xbar v w)}) !- domain
 (select {from: T where: (> v 0) by: {k: (xbar v w)} n: (count v)}) !- domain
@@ -793,6 +807,21 @@
 (select {from: T where: (and (== (xbar v w) 12) (> w 0)) by: c n: (count v)}) !- domain
 (select {from: T where: (and (> v 0) (== (xbar v w) 12))}) !- domain
 (select {from: T where: (and true (> v 0) (> (xbar v w) 5))}) !- domain
+;; a conjunct with the xbar inside an if or an in, under a computed key
+(set U (table [v w] (list [10 11 12 13] [3 0 5 7])))
+(at (select {from: U where: (and (> w 0) (> (if (> v 0) (xbar v w) v) 5)) n: (count v) by: {b: (% v 2)}}) 'n) -- [2 1]
+(at (select {from: U where: (and (> w 0) (in (xbar v w) [9 10 7])) n: (count v) by: {b: (% v 2)}}) 'n) -- [2 1]
+(at (select {from: U where: (and (> w 0) (not-in (xbar v w) [99])) n: (count v) by: {b: (% v 2)}}) 'n) -- [2 1]
+(at (select {from: U where: (and (> w 0) (> (if (> v 0) (xbar v w) v) 5))}) 'v) -- [10 12 13]
+(select {from: U where: (and (> v 0) (> (if (> v 0) (xbar v w) v) 5)) n: (count v) by: {b: (% v 2)}}) !- domain
+(select {from: U where: (and (> v 0) (in (xbar v w) [9 10 7])) n: (count v) by: {b: (% v 2)}}) !- domain
+;; F64 lanes and a bare boolean column as the guard, under a computed key
+(set U (table [v w f g ok] (list [10 11 12 13] [3 0 5 7] [1.5 2.5 3.5 4.5] [0.5 0.0 1.0 2.0] [true false true true])))
+(at (select {from: U where: (and (> g 0.0) (> (xbar f g) 1.0)) n: (count v) by: {b: (% v 2)}}) 'n) -- [2 1]
+(select {from: U where: (and (> f 0.0) (> (xbar f g) 1.0)) n: (count v) by: {b: (% v 2)}}) !- domain
+(at (select {from: U where: (and ok (> (xbar v w) 5)) n: (count v) by: {b: (% v 2)}}) 'n) -- [2 1]
+(select {from: U where: (and (> v 0) ok (> (xbar v w) 5)) n: (count v) by: {b: (% v 2)}}) -- (table [b n] (list [0 1] [2 1]))
+(select {from: U where: (and (not ok) (> (xbar v w) 5)) n: (count v) by: {b: (% v 2)}}) !- domain
 ;; a one-cell condition (a reduction) takes one arm for every row
 (at (select {from: T r: (if (> (sum v) 0) v (xbar v w))}) 'r) -- [10 11 12 13 14]
 (if (> (sum [1 2]) 0) 7 (xbar [10 11] [3 0])) -- 7

@@ -1148,7 +1148,11 @@ typedef struct {
     uint8_t null_aware; /* 1 = use sentinel-checking kernel variant */
     uint8_t u8_mod_zero; /* U8 divisor: modulo by zero yields 0 */
     uint8_t xbar;       /* OP_MOD of an xbar: a zero or null divisor raises */
+    uint8_t xbar_guard; /* xbar under a where: AND: conjuncts (conj_reg[0..n))
+                         * written before it, whose false rows it never sees */
 } expr_ins_t;
+
+#define EXPR_MAX_CONJ 16
 
 enum { REG_SCAN = 0, REG_CONST = 1, REG_SCRATCH = 2 };
 
@@ -1165,6 +1169,7 @@ typedef struct {
      * morsel's row (segment-relative in a parted run) to the selection's. */
     ray_t*  sel;
     int64_t sel_off;
+    uint8_t conj_reg[EXPR_MAX_CONJ];   /* a root AND's conjuncts, in order (xbar_guard) */
     struct {
         uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
         int8_t      type;       /* computational type: RAY_F64 / RAY_I64 / RAY_BOOL */

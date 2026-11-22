@@ -3488,15 +3488,29 @@ static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext) {
     return g->table;
 }
 
-/* Over node n's subtree: 1 when it is row-wise only (elementwise nodes
- * over scans and constants), with *xbar set when it holds an xbar
- * (OP_FLAG_XBAR); 0 otherwise. */
+/* Over node n's subtree: 1 when it is row-wise only (elementwise nodes,
+ * `if`, `in` against a constant set, over scans and constants), with *xbar
+ * set when it holds an xbar (OP_FLAG_XBAR); 0 otherwise. */
 static int filter_rowwise_tree(ray_graph_t* g, ray_op_t* n, bool* xbar, int depth) {
     if (!n || depth > 64) return 0;
     if (n->opcode == OP_SCAN || n->opcode == OP_CONST) return 1;
     /* an AND with a true arm folds to an alias of the other */
     if (n->opcode == OP_ALIAS && n->arity == 1)
         return filter_rowwise_tree(g, op_node(g, n->in_id[0]), xbar, depth + 1);
+    /* `if` buckets each arm over the rows that take it; `in` / `not-in`
+     * test one value per row against a constant set */
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        return e && e->third_in != RAY_OP_NONE &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_child(g, n, 1), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_node(g, e->third_in), xbar, depth + 1);
+    }
+    if (n->opcode == OP_IN || n->opcode == OP_NOT_IN) {
+        ray_op_t* set = op_child(g, n, 1);
+        return n->arity == 2 && set && set->opcode == OP_CONST &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1);
+    }
     if (!op_is_elementwise(n->opcode) || n->arity > 2) return 0;
     if (n->flags & OP_FLAG_XBAR) *xbar = true;
     for (int k = 0; k < n->arity; k++)

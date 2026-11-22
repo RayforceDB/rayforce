@@ -567,6 +567,9 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    ray_t*          xbar_rows;   /* borrowed rowsel: the rows an xbar buckets when no
+                                  * selection is installed (an update's where:);
+                                  * NULL = every row (#1355) */
     struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
