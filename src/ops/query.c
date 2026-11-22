@@ -10666,6 +10666,47 @@ static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
     return out;
 }
 
+/* `(first c)` / `(last c)` of the hidden column `c` (nonagg_hoist_if),
+ * per group, by the rule a grouped first/last of a plain column follows
+ * (docs: all-functions, first): a typed vector's nulls are skipped, and an
+ * all-null group gives its null.  One gather of the chosen rows.  NULL when
+ * `e` is no such call, or a group is empty: evaluated per group as before. */
+static ray_t* nonagg_first_last_hidden(ray_t* e, ray_t* tbl, idx_feeder_fn feeder,
+                                       void* fstate, int64_t n_groups) {
+    if (!e || e->type != RAY_LIST || e->len != 2 || (e->attrs & ATTR_QUOTED)) return NULL;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    ray_t* a = es[1];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || ray_env_has_lexical_local(h->i64) ||
+        tbl_has_col(tbl, h->i64) || !a || a->type != -RAY_SYM || (a->attrs & ATTR_QUOTED) ||
+        !tbl_has_col(tbl, a->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type != RAY_UNARY) return NULL;
+    void* fp = (void*)(uintptr_t)fn->i64;
+    bool last = fp == (void*)ray_last_fn;
+    if (!last && fp != (void*)ray_first_fn) return NULL;
+    ray_t* col = ray_table_col(tbl, a->i64);
+    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col) || col->type == RAY_LIST) return NULL;
+    ray_t* pick = ray_vec_new(RAY_I64, n_groups > 0 ? n_groups : 1);
+    if (!pick || RAY_IS_ERR(pick)) return pick ? pick : ray_error("oom", NULL);
+    int64_t* pk = (int64_t*)ray_data(pick);
+    for (int64_t gi = 0; gi < n_groups; gi++) {
+        ray_t* idx = feeder(gi, fstate);
+        int64_t cnt = idx ? ray_len(idx) : 0;
+        if (cnt == 0) { ray_release(pick); return NULL; }
+        const int64_t* ix = (const int64_t*)ray_data(idx);
+        int64_t r = last ? ix[cnt - 1] : ix[0];       /* all null: that null */
+        for (int64_t j = 0; j < cnt; j++) {
+            int64_t row = last ? ix[cnt - 1 - j] : ix[j];
+            if (!ray_vec_is_null(col, row)) { r = row; break; }
+        }
+        pk[gi] = r;
+    }
+    ray_t* out = gather_by_idx(col, pk, n_groups);
+    ray_release(pick);
+    return out ? out : ray_error("oom", NULL);
+}
+
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -10680,7 +10721,11 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
             if (hs.out) ray_release(hs.out);
             return hoisted ? hoisted : ray_error("oom", NULL);
         }
-        if (hs.out) { expr = hoisted; tbl = hs.out; }
+        if (hs.out) {
+            ray_t* fl = nonagg_first_last_hidden(hoisted, hs.out, feeder, fstate, n_groups);
+            if (fl) { ray_release(hoisted); ray_release(hs.out); return fl; }
+            expr = hoisted; tbl = hs.out;
+        }
     }
     query_dependency_cache_t cache = { .table = tbl };
     query_dependency_cache_t* prev = g_query_dependencies;
@@ -11377,8 +11422,15 @@ static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, i
     }
     ray_t* out;
     if (!sel_t) {
-        ray_release(cv);
-        out = rw_chain(e, next, t, c, depth);
+        /* the rest alone; an atom or another shape takes the rows through
+         * the blend, as the then arm alone does below */
+        ray_t* ev = rw_chain(e, next, t, c, depth);
+        if (RAY_IS_ERR(ev) || (ray_is_vec(ev) && ev->len == nr)) { ray_release(cv); out = ev; }
+        else {
+            ray_t* fe = next == n - 1 ? es[n - 1] : NULL;
+            ray_retain(ev);
+            out = rw_blend(cv, ev, ev, fe ? fe : be, fe, c);
+        }
     } else {
         ray_t* tv = rw_value(be, c, depth + 1);
         if (RAY_IS_ERR(tv)) { ray_release(cv); out = tv; }

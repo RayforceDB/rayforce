@@ -37,7 +37,7 @@
 ;; O adds the arms the DAG declines as columns (d1 = (+ d 1), ...), so the
 ;; same `if` spelled over them compiles: m1..m8 are the materialized values.
 (set mkF (fn [n] (let r (til n)) (let X (table ['g 'k 's 'h 'c 'd 't 'p 'i 'j 'b 'u] (list (take ['a 'b 'c] n) (% r 4) (take ["x" "y"] n) (% r 2) (% r 10) (+ 2024.01.01 (% r 50)) (+ 10:00:00.000 (% r 50)) (+ 2024.01.01D10:00:00.000000000 (% r 50)) r (as 'I32 r) (as 'I16 (% r 30)) r))) (update {from: X i: (if (== 0 (% i 7)) 0N i) j: (if (== 0 (% j 5)) 0Ni j)})))
-(set mkO (fn [F] (let A (update {from: F d1: (+ d 1) d5: (+ d 5) t1: (+ t 1) p1: (+ p 1)})) (update {from: A m1: (if (> c 4) d d1) m2: (if (> c 4) t t1) m3: (if (> c 4) p p1) m4: (if (> c 4) d1 0N) m5: (if (> c 6) d1 (> c 2) d d5) m6: (if (> c 2) (if (> c 6) d1 d) d5) m7: (if (> c 4) j i) m8: (if (> c 4) b j) m9: (if i d d1) m10: (if (< c 4) d d1)})))
+(set mkO (fn [F] (let A (update {from: F d1: (+ d 1) d5: (+ d 5) t1: (+ t 1) p1: (+ p 1)})) (update {from: A m1: (if (> c 4) d d1) m2: (if (> c 4) t t1) m3: (if (> c 4) p p1) m4: (if (> c 4) d1 0N) m5: (if (> c 6) d1 (> c 2) d d5) m6: (if (> c 2) (if (> c 6) d1 d) d5) m7: (if (> c 4) j i) m8: (if (> c 4) b j) m9: (if i d d1) m10: (if (< c 4) d d1) m11: (if (> c 4) d1 0Nd) m12: (if (< c 4) d1 0Nd)})))
 (set F (mkO (mkF 3000)))
 ;; the oracle columns hold the per-row choice, typed as the keyless `if`
 (at (select {from: F s: (if (> c 4) d (+ d 1))}) 's) -- (at F 'm1)
@@ -71,6 +71,28 @@
 (at (select {from: T by: g q: (last (if (< c 4) d (+ d 1)))}) 'q) -- [2024.01.03 2024.01.05]
 (at (select {from: T by: g q: (at (if (> c 4) d (+ d 1)) 0)}) 'q) -- [2024.01.02 2024.01.04]
 (at (select {from: T by: g q: (distinct (if (> c 4) d (+ d 1)))}) 'q) -- (list [2024.01.02] [2024.01.04])
+
+;; a null arm: grouped first / last skip a typed vector's nulls, as over the
+;; materialized column (docs: all-functions, first); each group's first row
+;; (c = 0) and last row (c = 7) take the null
+(Q (select {from: F by: g q: (first (if (> c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F by: g q: (first m11)}) 'g)
+(Q (select {from: F by: g q: (last (if (< c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F by: g q: (last m12)}) 'g)
+(Q (select {from: F by: s q: (first (if (> c 4) (+ d 1) 0Nd))}) 's) -- (Q (select {from: F by: s q: (first m11)}) 's)
+(Q (select {from: F by: [g h] q: (last (if (< c 4) (+ d 1) 0Nd))}) ['g 'h]) -- (Q (select {from: F by: [g h] q: (last m12)}) ['g 'h])
+(Q (select {from: F by: {kk: (% c 3)} q: (first (if (> c 4) (+ d 1) 0Nd))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (first m11)}) 'kk)
+(Q (select {from: F where: (> c 1) by: g q: (first (if (> c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: (first m11)}) 'g)
+(Q (select {from: F by: g q: (at (if (> c 4) (+ d 1) 0Nd) 0)}) 'g) -- (Q (select {from: F by: g q: (at m11 0)}) 'g)
+(Q (select {from: F by: g q: (distinct (if (> c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F by: g q: (distinct m11)}) 'g)
+;; an all-null group gives its null
+(at (select {from: F by: g q: (first (if (> c 100) (+ d 1) 0Nd))}) 'q) -- [0Nd 0Nd 0Nd]
+;; round 2's case
+(set T (table ['g 'c 'd] (list ['a 'a 'a 'b 'b 'b] [1 9 2 9 1 9] (+ 2024.01.01 (til 6)))))
+(at (select {from: T by: g q: (first (if (> c 4) (+ d 1) 0Nd))}) 'q) -- [2024.01.03 2024.01.05]
+(at (select {from: T by: g q: (last (if (< c 4) (+ d 1) 0Nd))}) 'q) -- [2024.01.04 2024.01.06]
+;; a condition no row takes leaves the other arm, one value per row
+(at (select {from: T by: g q: (if (> c 100) (+ d 1) d)}) 'q) -- (list [2024.01.01 2024.01.02 2024.01.03] [2024.01.04 2024.01.05 2024.01.06])
+(at (select {from: T by: g q: (if (> c 100) (+ d 1) 0Nd)}) 'q) -- (list [0Nd 0Nd 0Nd] [0Nd 0Nd 0Nd])
+(set T (table ['g 'c 'd] (list ['a 'a 'b 'b] [0 9 0 9] (+ 2024.01.01 (til 4)))))
 
 ;; ── an arm no row selects is not evaluated, as keyless ─────────────────────
 (at (select {from: T s: (avg (if (> c -1) (+ d 1) (+ d "x")))}) 's) -- [8768.5]
@@ -229,6 +251,8 @@ n -- 4
 (Q (select {from: S by: g q: (if (> c 4) d (+ d 1))}) 'g) -- (Q (select {from: F by: g q: m1}) 'g)
 (Q (select {from: S by: g q: (first (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (first m1)}) 'g)
 (Q (select {from: S by: g q: (last (if (< c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (last m10)}) 'g)
+(Q (select {from: S by: g q: (first (if (> c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F by: g q: (first m11)}) 'g)
+(Q (select {from: S by: g q: (last (if (< c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: F by: g q: (last m12)}) 'g)
 (Q (select {from: S where: (> c 1) by: s q: (sum (if (> c 4) t (+ t 1)))}) 's) -- (Q (select {from: F where: (> c 1) by: s q: (sum m2)}) 's)
 (Q (select {from: S by: {kk: (% c 3)} q: (avg (if (> c 4) d (+ d 1)))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (avg m1)}) 'kk)
 
@@ -248,6 +272,9 @@ n -- 4
 ;; but in another order, so it is no row-aligned column to split
 (Q (select {from: P where: (> c 1) by: g q: (distinct (if (> c 4) u (+ u 0)))}) 'g) -- (Q (select {from: P where: (> c 1) by: g q: (distinct u)}) 'g)
 (Q (select {from: P by: g q: (last (if (< c 4) d (+ d 1)))}) 'g) -- (Q (select {from: P by: g q: (last m10)}) 'g)
+(Q (select {from: P by: g q: (first (if (> c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: P by: g q: (first m11)}) 'g)
+(Q (select {from: P by: g q: (last (if (< c 4) (+ d 1) 0Nd))}) 'g) -- (Q (select {from: P by: g q: (last m12)}) 'g)
+(Q (select {from: P by: s q: (first (if (> c 4) (+ d 1) 0Nd))}) 's) -- (Q (select {from: P by: s q: (first m11)}) 's)
 (Q (select {from: P where: (> c 1) by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: P where: (> c 1) by: g q: (avg m1)}) 'g)
 (Q (select {from: P by: s q: (if (> c 4) j i)}) 's) -- (Q (select {from: P by: s q: m7}) 's)
 (Q (select {from: P by: g q: (avg (if (> c 4) date (+ date 1)))}) 'g) -- (Q (select {from: (update {from: P dd: (if (> c 4) date (+ date 1))}) by: g q: (avg dd)}) 'g)
