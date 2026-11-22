@@ -256,7 +256,8 @@ bool    ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, ui
 /* An FSST body against table t: clen[] (compressed lengths), xlen[]
  * (expanded lengths) and *bytes (the compressed area). */
 /* An FSST body's compressed lengths into clen[], and its compressed area
- * (no expanded lengths: for a reader of one slice). */
+ * (no expanded lengths: for a reader of one slice).  The body is read as
+ * written, as ray_enc_fsst_parse reads it: nothing is checked. */
 const uint8_t* ray_enc_fsst_lengths(const uint8_t* p, size_t avail, int n, uint64_t* clen);
 void    ray_enc_fsst_parse(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
                            uint64_t* clen, uint64_t* xlen, const uint8_t** bytes);

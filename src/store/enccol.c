@@ -2048,11 +2048,14 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
     return ray_enccol_desc_pool_bytes(e, c, j, &ray_enccol_descs(e, c)[j], out);
 }
 
-/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  Only that
- * cell is read: an FSST vector's lengths are parsed and the one slice
- * decoded (its decoded length compared first), a STR_DICT vector's codes
- * read and the one entry compared, a RAW vector's cell (and the pooled
- * lengths before it) read in place.  The vector is never decoded whole. */
+/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  The cell
+ * is read where the file says it is, under the same trust as dec_str (files
+ * this engine wrote are trusted): an FSST vector's compressed lengths and
+ * the one slice (its decoded length compared first), a STR_DICT vector's
+ * codes and the one entry, a RAW vector's cell (and the pooled lengths
+ * before it), a CONST vector's value.  The vector is never decoded whole.
+ * The one check is the row against the column's length (a `range` error);
+ * the file's offsets and lengths are not checked against the mapping. */
 ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq) {
     *eq = false;
     if (e->type != RAY_STR || row < 0 || row >= e->len)
