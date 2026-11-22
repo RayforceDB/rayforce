@@ -29,7 +29,12 @@
 (_fboth (.idx.hash _fstamp) _fspan) -- true
 (_fscalar (.idx.hash (as 'TIMESPAN [5 1000000 1000000])) (as 'TIME 1)) -- true
 (_fscalar (.idx.hash (as 'TIME [5 1 1])) (as 'TIMESPAN 1000000)) -- true
-(_fscalar (.idx.hash (as 'TIMESTAMP [1000000 86400001000000 -1])) (as 'TIMESPAN 1000000)) -- true
+;; row 0 matches by time of day only (raw 86400001000000), so a raw-count
+;; probe misses it: the first match is 0, and a payload compare would say 2
+(_fscalar (.idx.hash (as 'TIMESTAMP [86400001000000 7 1000000])) (as 'TIMESPAN 1000000)) -- true
+(find (.idx.hash (as 'TIMESTAMP [86400001000000 7 1000000])) (as 'TIMESPAN 1000000)) -- 0
+(find (as 'TIMESTAMP [86400001000000 7 1000000]) (as 'TIMESPAN 1000000)) -- 0
+(find (.idx.hash (as 'TIME [7i 5i 1i])) (as 'TIMESPAN 1000000)) -- 2
 ;; Existing count/floating/DATE comparison families are unchanged.
 (_fboth _fspan [1000000 5 0Nl -1]) -- true
 (_fboth _fspan (as 'I32 [5 0N -1])) -- true
