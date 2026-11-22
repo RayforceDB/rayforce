@@ -14382,10 +14382,9 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
  * where the evaluator maps over the cells.  Only then: run through the
  * planner, `(first (+ d 1))` over 10M DATE rows took four times as long.
  * A scalar it gives stands for every row, as `1` does in `(sum 1)`, so over
- * no rows `(first (count d))` is the null the compiled route gives.  NULL
- * leaves the argument to the per-row pass. */
-static bool expr_holds_vector_const(ray_t* expr, ray_t* tbl);
-
+ * no rows `(first (count d))` is the null the compiled route gives.  Over
+ * rows text stays one value, as first takes its first character: `(first
+ * (format "%" c))` is "[".  NULL leaves the argument to the per-row pass. */
 static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
     bool elementwise = scalar_edge_src_vectorizes(e, tbl, 0);
     if (!elementwise && !(scalar_edge_src_builtin(e, tbl, 0) && query_expr_effect_free(e)))
@@ -14412,8 +14411,38 @@ static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
         ray_release(src);
         return NULL;
     }
-    if (ray_is_atom(src)) src = scalar_atom_rows(src, nrows);
+    if (ray_is_atom(src) && (src->type != -RAY_STR || nrows == 0)) src = scalar_atom_rows(src, nrows);
     return src;
+}
+
+static bool expr_holds_vector_const(ray_t* expr, ray_t* tbl);
+
+/* Is every vector written as a value in `e` (expr_holds_vector_const) read
+ * row by row: an operand of elementwise calls (atomic builtins, an `if`)
+ * all the way up, as `GI` in `(+ c GI)`?  Such a vector stands for a column
+ * of the table before a where:.  One that is an argument of another call,
+ * such as the index list of `(at d [0 1])`, is a value: it reads the rows
+ * the where: keeps.  `rows` says whether the calls above `e` are all
+ * elementwise. */
+static bool expr_vconst_on_rows(ray_t* e, ray_t* tbl, bool rows, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0)
+        return rows || !expr_holds_vector_const(e, tbl);
+    ray_t** es = (ray_t**)ray_data(e);
+    if (e->len == 2 && es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
+        es[0]->i64 == ray_sym_intern("quote", 5)) return true;
+    bool ew = rw_if_kind(e, tbl);
+    if (!ew) {
+        ray_t* h = es[0];
+        ray_t* fn = h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) &&
+                    !tbl_has_col(tbl, h->i64) && !ray_env_has_lexical_local(h->i64)
+                  ? ray_env_get(h->i64) : NULL;
+        ew = fn && !RAY_IS_ERR(fn) && fn->type >= RAY_UNARY && fn->type <= RAY_VARY &&
+             (fn->attrs & RAY_FN_ATOMIC);
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!expr_vconst_on_rows(es[i], tbl, rows && ew, depth + 1)) return false;
+    return true;
 }
 
 /* `src`, the argument evaluated over the rows before a where:, at the rows
@@ -14541,13 +14570,15 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             /* first/last of a builtin-call source: its column in one
              * vectorized pass (an `if` blended per row), not one eval per
              * row (scalar_edge_src_whole).  Anything else runs per row.
-             * A vector written as a value stands for a column of the table
-             * it was written against, as by: and the compiled route read
-             * it: `(+ c GI)` is evaluated over the rows before the where:,
-             * which then keeps its rows.  Over a parted table it runs per
-             * row, as before. */
-            bool vconst = edge && expr_holds_vector_const(agg_src_expr, tbl);
-            if (edge && vconst && sel) {
+             * A vector written as a value that elementwise calls read row
+             * by row stands for a column of the table it was written
+             * against, as by: and the compiled route read it: `(+ c GI)`
+             * is evaluated over the rows before the where:, which then
+             * keeps its rows (expr_vconst_on_rows).  Over a parted table it
+             * runs per row, as before. */
+            bool vconst = edge && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
+                          expr_vconst_on_rows(agg_src_expr, tbl, true, 0);
+            if (vconst) {
                 if (src_tbl) {
                     int64_t sn = ray_table_nrows(src_tbl);
                     src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn);

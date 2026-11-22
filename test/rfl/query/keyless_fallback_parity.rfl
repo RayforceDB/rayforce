@@ -111,3 +111,42 @@
 (S (select {from: T s: (first (nil? m)) z: (first (+ w 0))})) !- type
 (S (select {from: T s: (first (nil? m))})) !- type
 (S (select {from: T by: k s: (first (nil? m))})) !- type
+
+;; ── a vector that is an argument, such as an index list, is a value ───────
+;; it reads the rows the where: keeps, never a dropped row
+(S (select {from: T where: (> c 100) s: (first (at d [0 1])) z: (first (+ w 0))}))     -- [0Nd]
+(S (select {from: T where: (> c 100) s: (first (at d [0 1]))}))                        -- [0Nd]
+(S (select {from: T where: (> c 100) s: (last (at d [3 2 1 0])) z: (first (+ w 0))}))  -- [0Nd]
+(S (select {from: T where: (> c 100) s: (last (at d [3 2 1 0]))}))                     -- [0Nd]
+(S (select {from: T where: (> c 100) s: (first (at c [0 1])) z: (first (+ w 0))}))     -- [0Nl]
+(S (select {from: T where: (> c 1) s: (first (at c [0 1])) z: (first (+ w 0))}))       -- [5]
+(S (select {from: T where: (> c 1) s: (first (at c [0 1]))}))                          -- [5]
+(S (select {from: T where: (> c 1) by: k s: (first (at c [0 1]))}))                    -- [5]
+(S (select {from: T where: (> c 1) s: (last (at c [0 1])) z: (first (+ w 0))}))        -- [6]
+(S (select {from: T where: (> c 1) by: k s: (last (at c [0 1]))}))                     -- [6]
+(S (select {from: T where: (> c 1) s: (first (at c [3 2 1 0])) z: (first (+ w 0))}))   -- [2]
+(S (select {from: T where: (> c 1) s: (first (at c [3 2 1 0]))}))                      -- [2]
+(S (select {from: T where: (> c 1) by: k s: (first (at c [3 2 1 0]))}))                -- [2]
+(S (select {from: T where: (> c 1) s: (last (at c [3 2 1 0])) z: (first (+ w 0))}))    -- [5]
+(S (select {from: T where: (> c 1) by: k s: (last (at c [3 2 1 0]))}))                 -- [5]
+(set GX [0 1])
+(S (select {from: T where: (> c 1) s: (last (at s GX)) z: (first (+ w 0))}))           -- [cc]
+(S (select {from: T where: (> c 1) s: (last (at s GX))}))                              -- [cc]
+(S (select {from: T where: (> c 1) by: k s: (last (at s GX))}))                        -- [cc]
+(S (select {from: T where: (> c 100) s: (last (at s GX)) z: (first (+ w 0))}))         -- (S (select {from: T where: (> c 100) s: (last (at s GX))}))
+
+;; ── text is one value: first and last take a character of it ──────────────
+(set V (table [c v k w] (list [1 5 6 2] (list "bb" "cc" "dd" "ee") [0 0 0 0] [2024.02.01 2024.02.02 2024.02.03 2024.02.04])))
+(S (select {from: T s: (first (format "%" c)) z: (first (+ w 0))}))       -- ["["]
+(S (select {from: T s: (first (format "%" c))}))                          -- ["["]
+(S (select {from: T by: k s: (first (format "%" c))}))                    -- ["["]
+(S (select {from: T where: (> c 1) s: (last (format "%" c)) z: (first (+ w 0))}))  -- ["]"]
+(S (select {from: T where: (> c 1) by: k s: (last (format "%" c))}))               -- ["]"]
+(S (select {from: V s: (first (at v 0)) z: (first (+ w 0))}))           -- ["b"]
+(S (select {from: V s: (first (at v 0))}))                                -- ["b"]
+(S (select {from: V by: k s: (first (at v 0))}))                          -- ["b"]
+(S (select {from: V where: (> c 1) s: (last (at v 0)) z: (first (+ w 0))})) -- ["c"]
+(S (select {from: V where: (> c 1) by: k s: (last (at v 0))}))                 -- ["c"]
+;; over no rows it is the null of its type
+(S (select {from: T where: (> c 100) s: (first (format "%" c)) z: (first (+ w 0))}))  -- [""]
+(S (select {from: V where: (> c 100) s: (first (at v 0)) z: (first (+ w 0))}))      -- [""]
