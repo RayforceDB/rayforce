@@ -1,0 +1,46 @@
+;; A comparison whose two operands are themselves predicates (== != < <= > >= over two
+;; B8 results) wrote nothing in the fused kernel: its output stayed all false, so
+;; (== p p) was false for every row and (!= p q) never true.  Every shape is
+;; checked against the same expression evaluated over the plain vectors.
+
+(set a [1 2 3 4 5 6])
+(set b [1.0 0Nf 3.0 0Nf 5.0 6.0])
+(set T (table [a b] (list a b)))
+(at (select {x: (== (> a 2) (< a 5)) from: T}) 'x) -- (== (> a 2) (< a 5))
+(at (select {x: (== (> a 2) (> a 2)) from: T}) 'x) -- (== (> a 2) (> a 2))
+(at (select {x: (== (nil? b) (> a 3)) from: T}) 'x) -- (== (nil? b) (> a 3))
+(at (select {x: (== (nil? b) (nil? b)) from: T}) 'x) -- (== (nil? b) (nil? b))
+(at (select {x: (== (< a 0) (nil? b)) from: T}) 'x) -- (== (< a 0) (nil? b))
+(at (select {x: (!= (> a 2) (< a 5)) from: T}) 'x) -- (!= (> a 2) (< a 5))
+(at (select {x: (!= (> a 2) (> a 2)) from: T}) 'x) -- (!= (> a 2) (> a 2))
+(at (select {x: (!= (nil? b) (> a 3)) from: T}) 'x) -- (!= (nil? b) (> a 3))
+(at (select {x: (!= (nil? b) (nil? b)) from: T}) 'x) -- (!= (nil? b) (nil? b))
+(at (select {x: (!= (< a 0) (nil? b)) from: T}) 'x) -- (!= (< a 0) (nil? b))
+(at (select {x: (< (> a 2) (< a 5)) from: T}) 'x) -- (< (> a 2) (< a 5))
+(at (select {x: (< (> a 2) (> a 2)) from: T}) 'x) -- (< (> a 2) (> a 2))
+(at (select {x: (< (nil? b) (> a 3)) from: T}) 'x) -- (< (nil? b) (> a 3))
+(at (select {x: (< (nil? b) (nil? b)) from: T}) 'x) -- (< (nil? b) (nil? b))
+(at (select {x: (< (< a 0) (nil? b)) from: T}) 'x) -- (< (< a 0) (nil? b))
+(at (select {x: (<= (> a 2) (< a 5)) from: T}) 'x) -- (<= (> a 2) (< a 5))
+(at (select {x: (<= (> a 2) (> a 2)) from: T}) 'x) -- (<= (> a 2) (> a 2))
+(at (select {x: (<= (nil? b) (> a 3)) from: T}) 'x) -- (<= (nil? b) (> a 3))
+(at (select {x: (<= (nil? b) (nil? b)) from: T}) 'x) -- (<= (nil? b) (nil? b))
+(at (select {x: (<= (< a 0) (nil? b)) from: T}) 'x) -- (<= (< a 0) (nil? b))
+(at (select {x: (> (> a 2) (< a 5)) from: T}) 'x) -- (> (> a 2) (< a 5))
+(at (select {x: (> (> a 2) (> a 2)) from: T}) 'x) -- (> (> a 2) (> a 2))
+(at (select {x: (> (nil? b) (> a 3)) from: T}) 'x) -- (> (nil? b) (> a 3))
+(at (select {x: (> (nil? b) (nil? b)) from: T}) 'x) -- (> (nil? b) (nil? b))
+(at (select {x: (> (< a 0) (nil? b)) from: T}) 'x) -- (> (< a 0) (nil? b))
+(at (select {x: (>= (> a 2) (< a 5)) from: T}) 'x) -- (>= (> a 2) (< a 5))
+(at (select {x: (>= (> a 2) (> a 2)) from: T}) 'x) -- (>= (> a 2) (> a 2))
+(at (select {x: (>= (nil? b) (> a 3)) from: T}) 'x) -- (>= (nil? b) (> a 3))
+(at (select {x: (>= (nil? b) (nil? b)) from: T}) 'x) -- (>= (nil? b) (nil? b))
+(at (select {x: (>= (< a 0) (nil? b)) from: T}) 'x) -- (>= (< a 0) (nil? b))
+
+;; spelled out, so the oracle itself is pinned
+(at (select {x: (== (> a 2) (> a 2)) from: T}) 'x) -- [true true true true true true]
+(at (select {x: (!= (> a 2) (< a 5)) from: T}) 'x) -- [true true false false true true]
+(at (select {x: (< (> a 2) (< a 5)) from: T}) 'x) -- [true true false false false false]
+(at (select {x: (>= (> a 2) (< a 5)) from: T}) 'x) -- [false false true true true true]
+(at (select {x: (!= (nil? b) (> a 3)) from: T}) 'x) -- [false true false false true true]
+(at (select {x: (== (nil? b) (nil? b)) from: T}) 'x) -- [true true true true true true]
