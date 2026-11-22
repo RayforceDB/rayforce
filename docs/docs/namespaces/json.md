@@ -74,7 +74,7 @@ A byte order mark before the value is not JSON whitespace, and is a `parse` erro
 | `input` | bytes of one document |
 | `depth` | nesting depth; the default is 128, and it never exceeds 1024 |
 | `nodes` | values, containers included |
-| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector (an array of 780,000 integers, 8 MB), and a block freed while reading (the atoms of an array that turns out mixed) still counts |
+| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector (an array of 780,000 integers, 8 MB), and the atoms an array turns into when it turns out mixed are charged while the typed run still is, then the run's charge is returned, so the real peak stays close to the cap (about 1.1 times it, measured, in the worst case of 40-byte strings followed by an integer) |
 
 The other two names, `grammar` and `symbol-bytes`, are accepted but have no effect on JSON. A cap is checked before the value it counts is built (a container's own growth is settled when it closes), so a hostile document stops at the cap and never exhausts the stack or the heap: 100,000 empty objects hold about 25 MB, and `{alloc: 8000000}` refuses them. For a vector, the caps apply to each element. A long document can be interrupted: the reader polls for cancellation every 1,024 members of a container.
 
@@ -103,7 +103,7 @@ Returns the value at `path` in the document `s`, or in each document of a string
 
 There is no boolean type: `B8` has no null, and reading a missing field as `false` would make it pass a `where:` that tests for `false`. `'B8` is a `domain` error; use the untyped form and compare the field with `true`. Another name is a `domain` error naming the accepted ones.
 
-A null (empty) document gives the type's null, like a missing field. A document that is not JSON is still an error naming the element and the byte, never a silent null: a stored line that does not parse is a fault to see, not a field to skip.
+A null (empty) document gives the type's null, like a missing field. `-0` is a number written as an integer, so `'I64` reads it as `0` and `'F64` as `0.0`. A document that is not JSON is still an error naming the element and the byte, never a silent null: a stored line that does not parse is a fault to see, not a field to skip.
 
 ```lisp
 (set t (table [line] (list ["{\"kind\":\"note\",\"n\":2}" "{\"kind\":5}" "{}" ""])))
@@ -161,11 +161,11 @@ Signature: `(.json.format v)`. Returns a string of JSON text.
 | Value | JSON |
 |---|---|
 | dict with symbol or string keys | object |
-| dict with other scalar keys (a keyed table made by `xkey` on one column) | object whose member names are the keys as `.json.format` writes them, as strings: a number its JSON text (`1` is `"1"`, the F64 `1.0` is `"1.0"`), a date, time, timestamp, timespan or guid its printed form (`"2024.01.01"`), a null key `""`. Two keys written alike (two null keys, or `1` and `1.0` in a list of keys) give two members of one name, which most readers resolve to the last. A multi-column key is a `type` error |
+| dict with other scalar keys (a keyed table made by `xkey` on one column) | object whose member names are the keys as `.json.format` writes them, as strings: a number its JSON text (`1` is `"1"`, the F64 `1.0` is `"1.0"`), a date, time, timestamp, timespan or guid its printed form (`"2024.01.01"`), a null key `""`. Two keys written alike give two members of one name, which most readers resolve to the last: `(.json.format (dict ["" ""] (list 1 2)))` writes `{"":1,"":2}`, and two null keys of a keyed table both write `""`. A multi-column key is a `type` error |
 | table, in memory, splayed, compressed or parted | array of objects, one per row (a parted table's partition key is a column) |
 | list, vector | array |
 | `i16` `i32` `i64` `u8` | number |
-| `f32` `f64` | the fewest significant digits that read back to the same float, written as the shorter of the positional and the exponent form (the positional on a tie), always with a `.` or an exponent: `1.0`, `0.1`, `120.0`, `1e2`, `99999999999999984.0`, `1e300`, `5e-324`; the same text whatever the host's `LC_NUMERIC` is |
+| `f32` `f64` | the shortest text that reads back to the same float: the fewest significant digits that do, written as the shorter of the positional and the exponent form (the positional on a tie, so a value from 1e17 to 1e21 can be written with more digits, `73950701333918976.0`, when that is shorter), always with a `.` or an exponent: `1.0`, `0.1`, `120.0`, `1e2`, `99999999999999984.0`, `1e300`, `5e-324`; the same text whatever the host's `LC_NUMERIC` is |
 | `b8` | `true` / `false` |
 | string, symbol | string; the null string and the null symbol are `""` |
 | date, time, timestamp, timespan, guid | the string it prints as (`"2024.01.01"`) |
