@@ -132,6 +132,7 @@ watermark, a few diagnostic counters and the symbol-table size, all `i64`:
 | `lock-failed` | Times the kernel refused a lock, or a page release could not lock its range again, since start. |
 | `lock-skipped` | Bytes, summed since start, that the heap mapped under the watermark but left unlocked: past the bound, past `RLIMIT_MEMLOCK`, or refused. The heap works on, unlocked. |
 | `group-perpart-runs` | Diagnostic: results served by the streaming parted `by:` (GROUP) kernel — one per query, not per partition; a run that falls back to the flatten path is not counted. |
+| `group-boxed-i64-runs` | Diagnostic: serial `group` invocations that used exact hashing for a homogeneous list of boxed I64 atoms — one per invocation, not per key. |
 | `asof-perpart-runs` | Diagnostic: days processed by the streaming parted asof join — one per day in the union of both sides' partitions. |
 | `sort-perpart-runs` | Diagnostic: partitions processed by the streaming parted `asc:` / `desc:` paths (ordered concat of pre-sorted partitions, or per-partition top-k). |
 | `window-perpart-runs` | Diagnostic: segments processed by the streaming parted window path (the window's partition key includes the table's partition key). |
@@ -161,7 +162,8 @@ symbol table where it found it.
 ;;     peak-bytes: 28672, slab-hits: 354, sys-current: 34836480,
 ;;     sys-mapped: 0, sys-mapped-peak: 0, anon-committed: 34795520,
 ;;     anon-peak: 34799616, anon-watermark: 50178081792,
-;;     group-perpart-runs: 0, asof-perpart-runs: 0, sort-perpart-runs: 0,
+;;     group-perpart-runs: 0, group-boxed-i64-runs: 0, asof-perpart-runs: 0,
+;;     sort-perpart-runs: 0,
 ;;     window-perpart-runs: 0, join-perpart-runs: 0,
 ;;     sym-count: 424, sym-bytes: 30336}
 ```

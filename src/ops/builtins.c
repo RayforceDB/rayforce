@@ -3242,9 +3242,18 @@ static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
 
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
  * unique group (one slot per gi), hashed the same way on insert and grow. */
-typedef struct { ray_t** gkeys; int spans; bool exact_i64; } ght_list_ctx_t;
-static uint64_t ght_list_hash(ray_t* key, const ght_list_ctx_t* c) {
-    return c->exact_i64 ? ray_hash_i64(key->i64) : ray_key_hash(key, c->spans);
+static _Atomic(int64_t) group_boxed_i64_runs = 0;
+
+typedef struct { ray_t** gkeys; int spans; bool exact_i64; bool counted; } ght_list_ctx_t;
+static uint64_t ght_list_hash(ray_t* key, ght_list_ctx_t* c) {
+    if (!c->exact_i64) return ray_key_hash(key, c->spans);
+    uint64_t h = ray_hash_i64(key->i64);
+    /* Count actual exact-hash use once per invocation, not per key. */
+    if (!c->counted) {
+        atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
+        c->counted = true;
+    }
+    return h;
 }
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
@@ -3306,9 +3315,6 @@ static bool group_grow_listkeys(ray_t** val_block, ray_t** ivblock, ray_t** kblo
     return true;
 }
 
-/* Count serial exact-I64 groups once per invocation, not per key. */
-static _Atomic(int64_t) group_boxed_i64_runs = 0;
-
 int64_t ray_group_boxed_i64_runs(void) {
     return atomic_load_explicit(&group_boxed_i64_runs, memory_order_relaxed);
 }
@@ -3365,8 +3371,6 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         for (int64_t i = 0; i < n; i++) {
             if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
         }
-        if (exact_i64)
-            atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
         ght_list_ctx_t lctx = { .gkeys = gkeys,
             .spans = exact_i64 ? 0 : ray_key_spans(x), .exact_i64 = exact_i64 };
 

@@ -3,7 +3,7 @@
 (set wide (as 'LIST (+ 4611686018427387904 offsets)))
 (type wide) -- 'LIST
 (type (at wide 0)) -- 'i64
-;; Keep inputs below the parallel dispatch threshold; pin the route, not time.
+;; Keep inputs below the parallel dispatch threshold; pin actual use of the exact hash, not time.
 (set runs_before (at (.sys.mem) 'group-boxed-i64-runs))
 (set groups (value (group wide)))
 (- (at (.sys.mem) 'group-boxed-i64-runs) runs_before) -- 1
