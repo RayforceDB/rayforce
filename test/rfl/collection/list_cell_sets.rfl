@@ -353,9 +353,11 @@
 (take (distinct VK) 3) -- (list [0] [1] [2])
 (count (distinct AK)) -- 1500
 (count (distinct MK)) -- 3000
-(take (distinct MK) 2) -- (list 0 1)
-(at (distinct MK) 1500) -- [500]
-(at (distinct MK) 2499) -- [499]
+;; first-occurrence order: VK's 1000, AK's 1500, then the I32 cells (#1361)
+(take (distinct MK) 2) -- (list [0] [1])
+(at (distinct MK) 1000) -- 0
+(at (distinct MK) 2499) -- 1499
+(at (distinct MK) 2500) -- (as 'I32 [0])
 (count (except VK (take VK 500))) -- 10000
 (take (except VK (take VK 500)) 2) -- (list [500] [501])
 (count (except MK (take VK 700))) -- 26500

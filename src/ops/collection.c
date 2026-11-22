@@ -2509,17 +2509,6 @@ ray_t* ray_distinct_fn(ray_t* x) {
         }
     }
     result->len = count;
-    /* Atoms before vectors, the order the pairwise swap this replaces gave
-     * (each non-atom slot, left to right, swapped with the first atom after
-     * it): in one pass, as the next such atom is never left of the last. */
-    for (int64_t i = 0, p = 1; i < count; i++) {
-        if (ray_is_atom(out[i])) continue;
-        if (p <= i) p = i + 1;
-        while (p < count && !ray_is_atom(out[p])) p++;
-        if (p >= count) break;
-        ray_t* tmp = out[i]; out[i] = out[p]; out[p] = tmp;
-        p++;
-    }
     if (_bx) ray_release(_bx);
     return result;
 }

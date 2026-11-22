@@ -694,9 +694,9 @@
 ;; Boxed list with duplicates (lines 852-860)
 (count (distinct (list 1 2 1 3))) -- 3
 
-;; Boxed list sorting: atoms before vectors (lines 864-872)
+;; Boxed list: first-occurrence order, vectors and atoms alike (#1361)
 (count (distinct (list [1 2] 3 [1 2] 4))) -- 3
-(at (distinct (list [1 2] 3 4)) 0) -- 3
+(at (distinct (list [1 2] 3 4)) 0) -- [1 2]
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; Section 26: list_to_typed_vec — SYM/STR empty conversion (lines 1042-1062)
