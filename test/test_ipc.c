@@ -107,6 +107,10 @@ extern ray_runtime_t* __RUNTIME;
  * poll first (fires close hooks while the env is still alive), then the
  * runtime. */
 static void ipc_setup(void) {
+    /* Start from no request being evaluated: an earlier test in this
+     * process that ran a client and a server on two threads can leave the
+     * cancel state naming its socket (#1265). */
+    ray_ipc_cancel_state_reset_for_test();
     ray_runtime_create(0, NULL);
     ray_poll_t* p = ray_poll_create();
     if (p) ray_runtime_set_poll(p);
