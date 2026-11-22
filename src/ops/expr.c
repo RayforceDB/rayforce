@@ -324,18 +324,471 @@ static bool linear_expr_add_scaled(linear_expr_i64_t* dst, const linear_expr_i64
     return true;
 }
 
-/* Parse an expression tree into integer linear form:
- *   sum(coeff[i] * scan(sym[i])) + bias
- * Supports +, -, unary -, and multiplication by integer constants. */
 /* A node planned in a narrow integer width (I16 + I16 is I16, #972) wraps
- * there per row; a sum of its terms' sums does not, so neither the linear
- * nor the affine plan may take it apart. */
-static inline bool op_narrow_int(const ray_op_t* op) {
+ * there per row; a sum of its terms' sums does not, so the linear and the
+ * affine plan take such a tree apart only under the no-wrap proof below. */
+static inline int8_t op_base_type(const ray_op_t* op) {
     int8_t t = op->out_type;
-    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    return RAY_IS_PARTED(t) ? (int8_t)RAY_PARTED_BASETYPE(t) : t;
+}
+static inline bool op_narrow_int(const ray_op_t* op) {
+    int8_t t = op_base_type(op);
     return t == RAY_U8 || t == RAY_I16 || t == RAY_I32;
 }
 
+/* ---- The no-wrap proof of a narrow linear / affine sum (#1287) ----
+ *
+ * The linear and affine plans sum an expression's terms in I64.  Over a
+ * node planned in U8 / I16 / I32 the per-row answer wraps in that width,
+ * and a value landing on the I16 / I32 minimum is that type's null; the
+ * plans agree with it exactly when no row of any narrow node leaves
+ * [min + 1, max] of its type ([0, 255] for U8): then nothing wraps and
+ * nothing reads as null.  np_prog_t is the tree as a postfix program of
+ * interval steps over its column terms.  A term's bounds come from its type,
+ * from what the column carries (SORTED ends, a fresh ZONE / CHUNK_ZONE,
+ * a generation-2 directory's chunk statistics), or, for a plain vector
+ * carrying none, from a min/max pass (np_scan_fn) in 64K-row slices, after
+ * four sample blocks: each slice proves its own rows from their own bounds,
+ * and the pass stops at the first slice that cannot.  The pass sums the terms
+ * on the way (agg_linear_t.pre_sum); for a lone unfiltered SUM / AVG, which
+ * takes that total and nothing else, a slice that cannot be proved is summed
+ * row by row right there, wrapped per narrow node as the per-row path does
+ * (np_wrap_slice), so one wrapping row costs one slice, not a second pass.
+ * Nothing keeps the bounds between executions. */
+_Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
+static inline void np_count(narrow_sum_route_t k) {
+    atomic_fetch_add_explicit(&ray_narrow_sum_routes[k], 1, memory_order_relaxed);
+}
+
+#define NP_MAX_NODES 32
+#define NP_MAX_DEPTH 8                    /* np_wrap_slice's value stack */
+#define NP_SLICE ((int64_t)8 * RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)   /* 64K rows */
+#define NP_BLK   256
+enum { NP_TERM = 0xFE, NP_CONST = 0xFF };
+
+typedef struct {
+    uint8_t op;          /* NP_TERM, NP_CONST, OP_ADD, OP_SUB, OP_MUL, OP_NEG */
+    uint8_t term;        /* NP_TERM: term slot */
+    int8_t  type;        /* planned type of the node */
+    int64_t c;           /* NP_CONST */
+} np_node_t;
+
+typedef struct {
+    np_node_t n[NP_MAX_NODES];
+    uint8_t   n_nodes;
+    uint8_t   n_terms;
+    uint8_t   depth, max_depth;           /* the program's value stack */
+    bool      narrow;                     /* some node needs the proof */
+    int64_t   syms[AGG_LINEAR_MAX_TERMS];
+    int8_t    types[AGG_LINEAR_MAX_TERMS];
+} np_prog_t;
+
+typedef struct { __int128 lo, hi; } np_iv_t;
+
+/* |v| <= 2^63 stands for "no bound": clamping a wider interval there keeps
+ * every narrow check that it fails failing, and keeps products in range. */
+#define NP_BIG ((__int128)1 << 63)
+static inline __int128 np_clamp(__int128 v) { return v > NP_BIG ? NP_BIG : v < -NP_BIG ? -NP_BIG : v; }
+
+/* The values a node of type t may hold without wrapping or reading as null;
+ * false for a type that is not narrow. */
+static bool np_safe_range(int8_t t, int64_t* lo, int64_t* hi) {
+    switch (t) {
+    case RAY_U8:  *lo = 0;              *hi = UINT8_MAX; return true;
+    case RAY_I16: *lo = INT16_MIN + 1;  *hi = INT16_MAX; return true;
+    case RAY_I32: *lo = INT32_MIN + 1;  *hi = INT32_MAX; return true;
+    default:      return false;
+    }
+}
+
+/* Every value a column of type t can hold. */
+static np_iv_t np_type_iv(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: return (np_iv_t){ 0, 1 };
+    case RAY_U8:   return (np_iv_t){ 0, UINT8_MAX };
+    case RAY_I16:  return (np_iv_t){ INT16_MIN, INT16_MAX };
+    case RAY_I32:  return (np_iv_t){ INT32_MIN, INT32_MAX };
+    default:       return (np_iv_t){ -NP_BIG, NP_BIG };
+    }
+}
+
+static bool np_has_narrow(ray_graph_t* g, ray_op_t* op, int depth) {
+    if (!op || depth > 64) return true;
+    if (op->opcode != OP_SCAN && op->opcode != OP_CONST && op_narrow_int(op)) return true;
+    for (int i = 0; i < op->arity; i++)
+        if (np_has_narrow(g, op_child(g, op, i), depth + 1)) return true;
+    return false;
+}
+
+static bool np_push(np_prog_t* p, np_node_t n) {
+    if (p->n_nodes >= NP_MAX_NODES) return false;
+    p->n[p->n_nodes++] = n;
+    if (n.op == NP_TERM || n.op == NP_CONST) {
+        if (++p->depth > p->max_depth) p->max_depth = p->depth;
+    } else if (n.op != OP_NEG) {
+        p->depth--;
+    }
+    return true;
+}
+
+static bool np_build(ray_graph_t* g, ray_op_t* op, np_prog_t* p, int depth) {
+    if (!op || depth > 64) return false;
+    int8_t t = op_base_type(op);
+    if (op->opcode == OP_SCAN) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->base.opcode != OP_SCAN) return false;
+        uint8_t k = 0;
+        while (k < p->n_terms && p->syms[k] != ext->sym) k++;
+        if (k == p->n_terms) {
+            if (k >= AGG_LINEAR_MAX_TERMS) return false;
+            p->syms[k] = ext->sym;
+            p->types[k] = t;
+            p->n_terms++;
+        }
+        return np_push(p, (np_node_t){ .op = NP_TERM, .term = k, .type = t });
+    }
+    bool arith = (op->opcode == OP_ADD || op->opcode == OP_SUB || op->opcode == OP_MUL) &&
+                 op->arity == 2;
+    if (arith || (op->opcode == OP_NEG && op->arity == 1)) {
+        for (int i = 0; i < op->arity; i++)
+            if (!np_build(g, op_child(g, op, i), p, depth + 1)) return false;
+        if (op_narrow_int(op)) p->narrow = true;
+        return np_push(p, (np_node_t){ .op = (uint8_t)op->opcode, .type = t });
+    }
+    /* any other constant: folded in I64 (eval_const_numeric_expr), exact
+     * only while nothing in it is narrow */
+    if (op->opcode != OP_CONST && np_has_narrow(g, op, depth)) return false;
+    double cf; int64_t ci; bool is_f64;
+    if (!eval_const_numeric_expr(g, op, &cf, &ci, &is_f64) || is_f64) return false;
+    return np_push(p, (np_node_t){ .op = NP_CONST, .type = t, .c = ci });
+}
+
+/* Run the program over the terms' bounds: true when no narrow node can
+ * leave its safe range.  *root: the root's interval. */
+static bool np_eval(const np_prog_t* p, const np_iv_t* terms, np_iv_t* root) {
+    np_iv_t st[NP_MAX_NODES];
+    int sp = 0;
+    for (uint8_t i = 0; i < p->n_nodes; i++) {
+        const np_node_t* n = &p->n[i];
+        switch (n->op) {
+        case NP_TERM:  st[sp++] = terms[n->term]; break;
+        case NP_CONST: st[sp].lo = st[sp].hi = n->c; sp++; break;
+        case OP_NEG: { np_iv_t a = st[sp - 1]; st[sp - 1] = (np_iv_t){ -a.hi, -a.lo }; break; }
+        default: {
+            np_iv_t b = st[--sp], a = st[sp - 1], r;
+            if (n->op == OP_ADD)      r = (np_iv_t){ a.lo + b.lo, a.hi + b.hi };
+            else if (n->op == OP_SUB) r = (np_iv_t){ a.lo - b.hi, a.hi - b.lo };
+            else {
+                __int128 c1 = a.lo * b.lo, c2 = a.lo * b.hi, c3 = a.hi * b.lo, c4 = a.hi * b.hi;
+                r.lo = c1 < c2 ? c1 : c2; if (c3 < r.lo) r.lo = c3; if (c4 < r.lo) r.lo = c4;
+                r.hi = c1 > c2 ? c1 : c2; if (c3 > r.hi) r.hi = c3; if (c4 > r.hi) r.hi = c4;
+            }
+            st[sp - 1] = r;
+            break;
+        }
+        }
+        np_iv_t* top = &st[sp - 1];
+        top->lo = np_clamp(top->lo); top->hi = np_clamp(top->hi);
+        int64_t lo, hi;
+        if (n->op != NP_TERM && n->op != NP_CONST && np_safe_range(n->type, &lo, &hi) &&
+            (top->lo < lo || top->hi > hi))
+            return false;
+    }
+    if (root) *root = st[0];
+    return true;
+}
+
+/* A term column's bounds from what it carries, never scanning. */
+static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
+    ray_t* col = ray_col_src_ready(src);
+    if (col && ray_is_vec(col) && !(col->attrs & RAY_ATTR_SLICE) && col->len > 0) {
+        int64_t lo, hi;
+        if (ray_idx_int_bounds(col, &lo, &hi)) { *out = (np_iv_t){ lo, hi }; return true; }
+        if ((col->attrs & RAY_ATTR_SORTED) && !src->may_null) {
+            const void* d = ray_data(col);
+            switch (col->type) {
+            case RAY_U8:  *out = (np_iv_t){ ((const uint8_t*)d)[0], ((const uint8_t*)d)[col->len - 1] }; return true;
+            case RAY_I16: *out = (np_iv_t){ ((const int16_t*)d)[0], ((const int16_t*)d)[col->len - 1] }; return true;
+            case RAY_I32: *out = (np_iv_t){ ((const int32_t*)d)[0], ((const int32_t*)d)[col->len - 1] }; return true;
+            default: break;
+            }
+        }
+        return false;
+    }
+    /* a generation-2 column: its chunks' directory statistics */
+    ray_enc_chunk_stat_t st;
+    __int128 lo = NP_BIG, hi = -NP_BIG;
+    int64_t c = 0;
+    for (; ray_col_src_chunk_stat(src, c, &st); c++) {
+        if (st.has_minmax) {
+            if (st.min < lo) lo = st.min;
+            if (st.max > hi) hi = st.max;
+        } else if (st.null_count < st.rows) {
+            return false;
+        }
+    }
+    if (c == 0 || lo > hi) return false;
+    *out = (np_iv_t){ lo, hi };
+    return true;
+}
+
+typedef struct {
+    const np_prog_t*  prog;
+    np_iv_t           glob[AGG_LINEAR_MAX_TERMS];   /* the bounds of a term not scanned */
+    const void*       data[AGG_LINEAR_MAX_TERMS];   /* a scanned term's rows (NULL: not scanned) */
+    bool              nulls[AGG_LINEAR_MAX_TERMS];  /* skip the type's null sentinel */
+    bool              wrap;                         /* sum a slice that fails row by row */
+    _Atomic(bool)     fail;
+    _Atomic(int64_t)  rows;                         /* rows proved or summed row by row */
+    _Atomic(int64_t)  pass_rows;                    /* rows proved */
+    _Atomic(uint64_t) sum[AGG_LINEAR_MAX_TERMS];    /* a term's total over the proved rows */
+    _Atomic(uint64_t) wsum;                         /* the per-row total of the other rows */
+    _Atomic(int64_t)  wslices;                      /* slices summed row by row */
+} np_scan_ctx_t;
+
+/* Rows [start, end) summed as the per-row path computes them: the program
+ * over int64 lanes, each narrow node wrapped to its width (I16 * I16 wraps
+ * in 16 bits whatever its consumer).  The terms are null-free, the root is
+ * narrow, and so is every arithmetic node under it.  False when a narrow
+ * node lands on its type's null (the per-row paths read that value
+ * differently by route): the caller gives up the plan. */
+static bool np_wrap_slice(const np_scan_ctx_t* x, int64_t start, int64_t end, int64_t* out) {
+    const np_prog_t* p = x->prog;
+    int64_t buf[NP_MAX_DEPTH][NP_BLK];
+    int64_t total = 0;
+    for (int64_t b = start; b < end; b += NP_BLK) {
+        int64_t m = end - b < NP_BLK ? end - b : NP_BLK;
+        int sp = 0;
+        for (uint8_t i = 0; i < p->n_nodes; i++) {
+            const np_node_t* n = &p->n[i];
+            if (n->op == NP_TERM) {
+                int64_t* d = buf[sp++];
+                const void* src = x->data[n->term];
+                switch (p->types[n->term]) {
+                case RAY_I16: for (int64_t r = 0; r < m; r++) d[r] = ((const int16_t*)src)[b + r]; break;
+                case RAY_I32: for (int64_t r = 0; r < m; r++) d[r] = ((const int32_t*)src)[b + r]; break;
+                default:      for (int64_t r = 0; r < m; r++) d[r] = ((const uint8_t*)src)[b + r]; break;
+                }
+                continue;
+            }
+            if (n->op == NP_CONST) {
+                int64_t* d = buf[sp++];
+                for (int64_t r = 0; r < m; r++) d[r] = n->c;
+                continue;
+            }
+            uint64_t* a = (uint64_t*)buf[n->op == OP_NEG ? sp - 1 : sp - 2];
+            if (n->op == OP_NEG) {
+                for (int64_t r = 0; r < m; r++) a[r] = 0 - a[r];
+            } else {
+                const uint64_t* c = (const uint64_t*)buf[--sp];
+                if (n->op == OP_ADD)      for (int64_t r = 0; r < m; r++) a[r] += c[r];
+                else if (n->op == OP_SUB) for (int64_t r = 0; r < m; r++) a[r] -= c[r];
+                else                      for (int64_t r = 0; r < m; r++) a[r] *= c[r];
+            }
+            int64_t* v = (int64_t*)a;
+            bool hit = false;
+            switch (n->type) {
+            case RAY_U8:
+                for (int64_t r = 0; r < m; r++) v[r] = (uint8_t)a[r];
+                break;
+            case RAY_I16:
+                for (int64_t r = 0; r < m; r++) { v[r] = (int16_t)(uint16_t)a[r]; hit |= v[r] == NULL_I16; }
+                break;
+            case RAY_I32:
+                for (int64_t r = 0; r < m; r++) { v[r] = (int32_t)(uint32_t)a[r]; hit |= v[r] == NULL_I32; }
+                break;
+            default:
+                return false;   /* not narrow: no wrap model here */
+            }
+            if (hit) return false;
+        }
+        for (int64_t r = 0; r < m; r++) total += buf[0][r];
+    }
+    *out = total;
+    return true;
+}
+
+/* ACC: a block's sum type (8192 rows of a U8 / I16 stay inside int32). */
+#define NP_SCAN(T, NUL, ACC) do {                                              \
+    const T* d = (const T*)x->data[t] + start;                                 \
+    T mn = d[0], mx = d[0]; int64_t s = 0;                                     \
+    if (x->nulls[t]) {                                                         \
+        bool any = false;                                                      \
+        for (int64_t r = 0; r < n; r++) {                                      \
+            T v = d[r];                                                        \
+            if (v == (NUL)) continue;                                          \
+            if (!any || v < mn) mn = v;                                        \
+            if (!any || v > mx) mx = v;                                        \
+            any = true;                                                        \
+        }                                                                      \
+        if (!any) mn = mx = 0;   /* every row null: no row uses the term */    \
+    } else {                                                                   \
+        for (int64_t b = 0; b < n; b += 8192) {                                \
+            int64_t e = n - b > 8192 ? b + 8192 : n;                           \
+            ACC bs = 0;                                                        \
+            for (int64_t r = b; r < e; r++) {                                  \
+                T v = d[r];                                                    \
+                mn = v < mn ? v : mn; mx = v > mx ? v : mx; bs += v;           \
+            }                                                                  \
+            s += bs;                                                           \
+        }                                                                      \
+    }                                                                          \
+    iv[t] = (np_iv_t){ mn, mx }; sums[t] = s;                                  \
+} while (0)
+
+static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    np_scan_ctx_t* x = (np_scan_ctx_t*)ctx;
+    if (atomic_load_explicit(&x->fail, memory_order_relaxed)) return;
+    int64_t n = end - start;
+    if (n <= 0) return;
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS];
+    int64_t sums[AGG_LINEAR_MAX_TERMS];
+    for (uint8_t t = 0; t < x->prog->n_terms; t++) {
+        if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
+        switch (x->prog->types[t]) {
+        case RAY_I16: NP_SCAN(int16_t, NULL_I16, int32_t); break;
+        case RAY_I32: NP_SCAN(int32_t, NULL_I32, int64_t); break;
+        default:      NP_SCAN(uint8_t, (uint8_t)0, int32_t); break;   /* U8: never nulls[] */
+        }
+    }
+    if (!np_eval(x->prog, iv, NULL)) {
+        int64_t w;
+        if (x->wrap && np_wrap_slice(x, start, end, &w)) {   /* the rows are cache-hot */
+            atomic_fetch_add_explicit(&x->wsum, (uint64_t)w, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->wslices, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
+            return;
+        }
+        atomic_store_explicit(&x->fail, true, memory_order_relaxed);
+        return;
+    }
+    for (uint8_t t = 0; t < x->prog->n_terms; t++)
+        if (x->data[t])
+            atomic_fetch_add_explicit(&x->sum[t], (uint64_t)sums[t], memory_order_relaxed);
+    atomic_fetch_add_explicit(&x->pass_rows, n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
+}
+#undef NP_SCAN
+
+/* The pass's totals (np_prove): sums[t] keyed by p->syms over pass_rows
+ * proved rows, wsum the per-row total of the rest. */
+typedef struct {
+    bool    summed;       /* every term was read: the totals below hold */
+    bool    partial;      /* some rows were summed per row: only the total holds */
+    int64_t sums[AGG_LINEAR_MAX_TERMS];
+    int64_t pass_rows;
+    int64_t wsum;
+} np_total_t;
+
+typedef enum { NP_NO, NP_PROVED, NP_NEED_SCAN } np_res_t;
+
+/* Prove that no row of the narrow nodes of `root` wraps or reads as null
+ * (NP_PROVED at once when the tree has none).  nrows: the rows the plan
+ * sums.  scan: a min/max pass may run (else NP_NEED_SCAN where one would,
+ * counted nowhere).  tot (optional): the pass's totals, which need
+ * null-free terms; with tot->partial preset, a slice that cannot be proved
+ * is summed per row instead of failing the pass (the caller then takes the
+ * total and nothing else).  A failed bind: NP_NO with *err. */
+static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nrows, bool scan,
+                         np_prog_t* p, np_total_t* tot, ray_t** err) {
+    bool want_partial = tot && tot->partial;
+    if (tot) memset(tot, 0, sizeof(*tot));
+    memset(p, 0, sizeof(*p));
+    if (!np_has_narrow(g, root, 0)) return NP_PROVED;
+    if (!np_build(g, root, p, 0) || !p->narrow) {
+        np_count(NARROW_SUM_REFUSED);
+        return NP_NO;
+    }
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS];
+    for (uint8_t t = 0; t < p->n_terms; t++) iv[t] = np_type_iv(p->types[t]);
+    if (np_eval(p, iv, NULL)) { np_count(NARROW_SUM_TYPE); return NP_PROVED; }
+
+    ray_col_src_t* srcs[AGG_LINEAR_MAX_TERMS];
+    bool tight = false;
+    for (uint8_t t = 0; t < p->n_terms; t++) {
+        if (ray_col_bind_declines(tbl, p->syms[t])) goto refuse;
+        srcs[t] = ray_graph_bind_col(g, tbl, p->syms[t], err);
+        if (!srcs[t]) return NP_NO;
+        if (srcs[t]->parted) goto refuse;
+        np_iv_t m;
+        if (np_meta_bounds(srcs[t], &m)) { iv[t] = m; tight = true; }
+    }
+    if (tight && np_eval(p, iv, NULL)) { np_count(NARROW_SUM_META); return NP_PROVED; }
+
+    /* the pass: over the narrow terms of plain columns (a column without
+     * metadata and not plain cannot be proved here) */
+    np_scan_ctx_t x;
+    memset(&x, 0, sizeof x);
+    x.prog = p;
+    bool all = true;
+    for (uint8_t t = 0; t < p->n_terms; t++) {
+        x.glob[t] = iv[t];
+        int8_t ty = p->types[t];
+        bool narrow_col = ty == RAY_U8 || ty == RAY_I16 || ty == RAY_I32;
+        const void* base = narrow_col ? ray_col_src_base(srcs[t]) : NULL;
+        if (!base || srcs[t]->type != ty || srcs[t]->len != nrows) { all = false; continue; }
+        x.data[t] = base;
+        x.nulls[t] = srcs[t]->may_null && ty != RAY_U8;
+        if (x.nulls[t]) all = false;
+    }
+    bool any = false;
+    for (uint8_t t = 0; t < p->n_terms; t++) any |= x.data[t] != NULL;
+    if (!any || nrows <= 0) goto refuse;
+    if (!scan) return NP_NEED_SCAN;
+    if (nrows >= RAY_PARALLEL_THRESHOLD) {
+        /* Four sample blocks first: rows that can wrap usually show in any
+         * block, and then no pass is made. */
+        np_scan_ctx_t smp;
+        memset(&smp, 0, sizeof smp);
+        smp.prog = p;
+        memcpy(smp.glob, x.glob, sizeof x.glob);
+        memcpy(smp.data, x.data, sizeof x.data);
+        memcpy(smp.nulls, x.nulls, sizeof x.nulls);
+        for (int64_t k = 0; k < 4; k++) {
+            int64_t s0 = nrows / 4 * k;
+            np_scan_fn(&smp, 0, s0, s0 + RAY_MORSEL_ELEMS);   /* nrows >= 64 morsels */
+        }
+        if (atomic_load_explicit(&smp.fail, memory_order_relaxed)) {
+            np_count(NARROW_SUM_SAMPLE);
+            return NP_NO;
+        }
+    }
+    /* the root narrow and every row's value in its width: below 2^32 rows
+     * the total cannot leave int64 */
+    x.wrap = want_partial && all && op_narrow_int(root) && p->max_depth <= NP_MAX_DEPTH &&
+             nrows <= ((int64_t)1 << 32);
+    /* slices of 64K rows: the per-slice proof and its atomics stay off the
+     * per-row cost, and a slice that fails ends the pass */
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch_grain(pool, np_scan_fn, &x, nrows, NP_SLICE);
+    else
+        for (int64_t s0 = 0; s0 < nrows && !atomic_load_explicit(&x.fail, memory_order_relaxed); s0 += NP_SLICE)
+            np_scan_fn(&x, 0, s0, nrows - s0 > NP_SLICE ? s0 + NP_SLICE : nrows);
+    if (atomic_load_explicit(&x.fail, memory_order_relaxed) ||
+        atomic_load_explicit(&x.rows, memory_order_relaxed) != nrows)
+        goto refuse;   /* a slice that could not be proved, or a cancel */
+    bool partial = atomic_load_explicit(&x.wslices, memory_order_relaxed) > 0;
+    np_count(partial ? NARROW_SUM_PARTIAL : NARROW_SUM_SCAN);
+    if (all && tot) {
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            tot->sums[t] = (int64_t)atomic_load_explicit(&x.sum[t], memory_order_relaxed);
+        tot->pass_rows = atomic_load_explicit(&x.pass_rows, memory_order_relaxed);
+        tot->wsum = (int64_t)atomic_load_explicit(&x.wsum, memory_order_relaxed);
+        tot->summed = true;
+        tot->partial = partial;
+    }
+    return NP_PROVED;
+refuse:
+    np_count(NARROW_SUM_REFUSED);
+    return NP_NO;
+}
+
+/* Parse an expression tree into integer linear form:
+ *   sum(coeff[i] * scan(sym[i])) + bias
+ * Supports +, -, unary -, and multiplication by integer constants.  A
+ * narrow node parses as any other: the caller holds the no-wrap proof. */
 static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_t* out) {
     if (!g || !op || !out) return false;
     memset(out, 0, sizeof(*out));
@@ -354,8 +807,6 @@ static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_
         out->coeff_i64[0] = 1;
         return true;
     }
-
-    if (op_narrow_int(op)) return false;
 
     if (op->opcode == OP_NEG && op->arity == 1 && op_child(g, op, 0)) {
         linear_expr_i64_t inner;
@@ -397,7 +848,7 @@ static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_
 
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
                                         agg_linear_t* out_plan, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_plan) return false;
@@ -425,6 +876,14 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
          * scalar route evaluates the expression by range reads instead */
         if (!ray_col_src_base(srcs[i])) return false;
     }
+    /* a narrow tree: the plan only under the no-wrap proof, whose pass
+     * also leaves the terms' totals when it read every one; a lone
+     * aggregate, which takes the total alone, lets the pass sum a slice it
+     * cannot prove row by row */
+    int64_t nrows = ray_table_nrows(tbl);
+    np_prog_t np;
+    np_total_t tot = { .partial = lone };
+    if (np_prove(g, tbl, input_op, nrows, true, &np, &tot, err) != NP_PROVED) return false;
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
         *err = ray_col_src_plain(srcs[i], &col);   /* ready-only */
@@ -433,6 +892,23 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         out_plan->term_types[i] = srcs[i]->type;
         out_plan->coeff_i64[i] = lin.coeff_i64[i];
     }
+    /* The pass's totals give the answer: every row's value is exact in
+     * the root's narrow type, so below 2^32 rows the total cannot leave
+     * int64 and the wraparound sum below is the exact one (AVG's 128-bit
+     * total too).  Same arithmetic as scalar_sum_linear_i64_fn over the
+     * proved rows, plus the per-row total of the others. */
+    if (tot.summed && op_narrow_int(input_op) && nrows > 0 && nrows <= ((int64_t)1 << 32)) {
+        int64_t s = wrap_add_i64(wrap_mul_i64(lin.bias_i64, tot.pass_rows), tot.wsum);
+        bool ok = true;
+        for (uint8_t i = 0; i < lin.n_terms && ok; i++) {
+            uint8_t k = 0;
+            while (k < np.n_terms && np.syms[k] != lin.syms[i]) k++;
+            if (k == np.n_terms) { ok = false; break; }
+            s = wrap_add_i64(s, wrap_mul_i64(lin.coeff_i64[i], tot.sums[k]));
+        }
+        if (ok) { out_plan->pre = true; out_plan->pre_sum = s; out_plan->pre_only = tot.partial; }
+    }
+    if (tot.partial && !out_plan->pre_only) return false;   /* the rows' plan does not hold */
     out_plan->enabled = true;
     return true;
 }
@@ -519,13 +995,12 @@ static bool affine_int_f64_bias_exact(int8_t bt, double bias, int64_t nrows,
  * (sum,count) directly.  f64_bias_ok: the caller emits a FLOAT bias over an
  * integer column as F64 (agg_affine_t.f64). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                    bool f64_bias_ok,
+                                    bool f64_bias_ok, bool defer_scan,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
     if (input_op->opcode != OP_ADD && input_op->opcode != OP_SUB) return false;
     if (input_op->arity != 2 || !op_child(g, input_op, 0) || !op_child(g, input_op, 1)) return false;
-    if (op_narrow_int(input_op)) return false;
 
     ray_op_t* lhs = op_child(g, input_op, 0);
     ray_op_t* rhs = op_child(g, input_op, 1);
@@ -572,6 +1047,16 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     ray_col_src_t* base_src = ray_graph_bind_col(g, tbl, base_ext->sym, err);
     if (!base_src) return false;
     if (base_src->parted) return false;     /* a parted wrapper matches no arm below */
+    /* (scan +/- c) with a narrow node: sum(scan) + n*c is the per-row sum
+     * only under the no-wrap proof (both skip the base's null rows).  When
+     * proving needs a pass over a null-free plain base, defer_scan leaves
+     * the shape to the linear plan, whose pass sums as it goes. */
+    {
+        np_prog_t np;
+        bool defer = defer_scan && !base_src->may_null && ray_col_src_base(base_src);
+        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, err);
+        if (pr != NP_PROVED) return false;
+    }
 
     int8_t bt = base_src->type;
     ray_t* base_vec = NULL;

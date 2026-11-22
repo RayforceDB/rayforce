@@ -6776,37 +6776,37 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
 
     /* I64 values may round on conversion before the addition. */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_FALSE(aff.enabled);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_FALSE(aff.enabled);
     /* Small whole-number biases on a narrow type have exact row and sum
      * arithmetic; a fractional or very large bias does not. */
-    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, &vec, &aff, &err));
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_TRUE(aff.enabled && aff.f64 && aff.bias_f64 == 5.0);
     TEST_ASSERT_TRUE(vec && vec->type == RAY_I16);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     /* (ts + 5.0) is no F64 sum at all: declined either way */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     /* control: (a + 5) is an integer bias on every route */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, &vec, &aff, &err));
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, false, &vec, &aff, &err));
     TEST_ASSERT_TRUE(aff.enabled && !aff.f64 && aff.bias_i64 == 5);
     /* linear: (a * 2.0) declines, (a * 2) is planned (control) */
-    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, &lin, &err));
+    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, false, &lin, &err));
     TEST_ASSERT_NULL(err);
-    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, &lin, &err));
+    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, false, &lin, &err));
     TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 1 && lin.coeff_i64[0] == 2);
     ray_graph_free(g);
 

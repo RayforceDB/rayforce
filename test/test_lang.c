@@ -163,6 +163,229 @@ static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
 }
 
+/* ---- #1287: the narrow linear / affine sum plans, by proof route ---- */
+
+#define NSR(k) (1u << (k))
+/* Run `q` (a boolean: the query against its eager per-row answer) and
+ * report the no-wrap proof routes it took: the bit of each counter of
+ * ray_narrow_sum_routes it moved. */
+static unsigned narrow_sum_routes_of(const char* q, bool* same) {
+    uint64_t before[NARROW_SUM__N];
+    for (int k = 0; k < NARROW_SUM__N; k++)
+        before[k] = atomic_load_explicit(&ray_narrow_sum_routes[k], memory_order_relaxed);
+    ray_t* r = ray_eval_str(q);
+    *same = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    unsigned moved = 0;
+    for (int k = 0; k < NARROW_SUM__N; k++)
+        if (atomic_load_explicit(&ray_narrow_sum_routes[k], memory_order_relaxed) != before[k])
+            moved |= NSR(k);
+    return moved;
+}
+
+static bool narrow_sum_eval_ok(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return ok;
+}
+
+typedef struct { const char* q; unsigned routes; } narrow_sum_case_t;
+
+static test_result_t narrow_sum_run_cases(const narrow_sum_case_t* cases) {
+    for (int c = 0; cases[c].q; c++) {
+        bool same = false;
+        unsigned got = narrow_sum_routes_of(cases[c].q, &same);
+        TEST_ASSERT_FMT(same, "case %d: answer differs from the eager one: %s", c, cases[c].q);
+        TEST_ASSERT_FMT(got == cases[c].routes, "case %d: routes 0x%x, want 0x%x: %s",
+                        c, got, cases[c].routes, cases[c].q);
+    }
+    PASS();
+}
+
+#define NS_Q(sel, eager) "(all (== (at " sel " 's) (enlist " eager ")))"
+
+static test_result_t test_narrow_sum_bound_routes(void) {
+    static const char* const setup[] = {
+        "(set _nI (til 200000))",
+        "(set h (as 'I16 (- (% _nI 2001) 1000)))",
+        "(set k (as 'I16 (- (% (* _nI 7) 1999) 999)))",
+        "(set u (as 'U8 (% _nI 100)))",
+        "(set v (as 'U8 (% (* _nI 3) 101)))",
+        "(set i (as 'I32 (- (% _nI 200001) 100000)))",
+        "(set j (as 'I32 (% (* _nI 7) 99991)))",
+        "(set _nT (table [h k u v i j] (list h k u v i j)))",
+        /* one row outside the sample blocks wraps: 30000h + 30000h,
+         * 3 * 30000h, 0xc8 + 0x64, 2e9i + 2e9i */
+        "(set _nW (fn [x a] (concat (take x 170001) (concat (enlist a) (drop x 170002)))))",
+        "(set hw (_nW h 30000h)) (set kw (_nW k 30000h)) (set uw (_nW u 0xc8)) (set vw (_nW v 0x64))",
+        "(set iw (_nW i 2000000000i)) (set jw (_nW j 2000000000i))",
+        "(set _nTW (table [h k u v i j] (list hw kw uw vw iw jw)))",
+        /* a row landing on the I16 null, without a wrap and with one */
+        "(set hs (_nW h -16384h)) (set ks (_nW k -16384h))",
+        "(set _nTS (table [h k] (list hs ks)))",
+        "(set hx (_nW h 32767h)) (set kx (_nW k 1h)) (set _nTX (table [h k] (list hx kx)))",
+        /* wraps in every block: the samples refuse */
+        "(set hf (as 'I16 (- (% (* _nI 13) 65536) 32768)))",
+        "(set _nTF (table [h k] (list hf hf)))",
+        /* wraps in the first sample block only */
+        "(set hb (concat (enlist 30000h) (drop h 1))) (set _nTB (table [h k] (list hb hb)))",
+        "(set hn (_nW h 0Nh)) (set _nTN (table [h k] (list hn k)))",
+        "(set _nTZ (table [h k] (list (.idx.zone h) (.idx.zone k))))",
+        "(set _nso (.attr.set 'sorted (asc h))) (set _nTO (table [h k] (list _nso _nso)))",
+        /* small tables: the serial pass, no samples; the safe range's edges */
+        "(set _nts (table [h k] (list (take h 3000) (take k 3000))))",
+        "(set hsw (concat (take h 2999) (enlist 30000h))) (set _ntw (table [h k] (list hsw hsw)))",
+        "(set he [32767h -32767h 5h]) (set ke [0h 0h 0h]) (set _nte (table [h k] (list he ke)))",
+        "(set hm [-32767h 5h]) (set km [-1h 1h]) (set _ntm (table [h k] (list hm km)))",
+        "(set ue (as 'U8 [255 0 3])) (set ve (as 'U8 [0 0 0])) (set _ntu (table [u v] (list ue ve)))",
+        "(set uo (as 'U8 [255 0 3])) (set vo (as 'U8 [1 0 4])) (set _ntv (table [u v] (list uo vo)))",
+        "(set ie [2147483647i -2147483647i]) (set je [0i 0i]) (set _nti (table [i j] (list ie je)))",
+        NULL,
+    };
+    for (int q = 0; setup[q]; q++)
+        TEST_ASSERT_FMT(narrow_sum_eval_ok(setup[q]), "setup %d", q);
+    char dir[256];
+    int dn = snprintf(dir, sizeof dir, "/tmp/rayforce_lang_narrow_sum_%ld", (long)getpid());
+    TEST_ASSERT_TRUE(dn > 0 && (size_t)dn < sizeof dir);
+    char cmd[900];
+    snprintf(cmd, sizeof cmd, "(do (.db.splayed.set \"%s/s0/\" _nT {compress: false})"
+                              " (.db.splayed.set \"%s/w0/\" _nTW {compress: false})"
+                              " (.db.splayed.set \"%s/s2/\" _nT {compress: true})"
+                              " (set _nS0 (.db.splayed.get \"%s/s0/\"))"
+                              " (set _nW0 (.db.splayed.get \"%s/w0/\"))"
+                              " (set _nS2 (.db.splayed.get \"%s/s2/\")) 0)", dir, dir, dir, dir, dir, dir);
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok(cmd));
+
+    const unsigned SCAN = NSR(NARROW_SUM_SCAN), PRE = NSR(NARROW_SUM_PRE), TYPE = NSR(NARROW_SUM_TYPE),
+                   META = NSR(NARROW_SUM_META), PART = NSR(NARROW_SUM_PARTIAL),
+                   SAMPLE = NSR(NARROW_SUM_SAMPLE), REF = NSR(NARROW_SUM_REFUSED);
+    const narrow_sum_case_t cases[] = {
+        /* nothing can wrap: proved by the pass, a lone SUM / AVG takes its total */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nT})",   "(sum (+ h k))"),   SCAN | PRE },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nT})",  "(sum (* h 3h))"),  SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nT})",   "(sum (+ u v))"),   SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nT})",   "(sum (+ i j))"),   SCAN | PRE },
+        { NS_Q("(select {s: (avg (+ i j)) from: _nT})",   "(avg (+ i j))"),   SCAN | PRE },
+        /* the affine shape goes to the linear plan for its pass */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nT})",  "(sum (+ h 1h))"),  SCAN | PRE },
+        /* filtered, or beside another aggregate: proved, summed per term */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nT where: (> i 0)})",
+               "(sum (+ (at h (where (> i 0))) (at k (where (> i 0)))))"),     SCAN },
+        { NS_Q("(select {s: (sum (+ h k)) c: (count h) from: _nT})", "(sum (+ h k))"), SCAN },
+        /* from the types: an I32 node over an I16 column */
+        { NS_Q("(select {s: (sum (+ h 5i)) from: _nT})",  "(sum (+ h 5i))"),  TYPE },
+        /* from the column metadata */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTZ})",  "(sum (+ h k))"),   META },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTO})",  "(sum (+ _nso _nso))"), META },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nS0})",  "(sum (+ h k))"),   META },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nS0})", "(sum (* h 3h))"),  META },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nS0})",  "(sum (+ u v))"),   META },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nS0})",  "(sum (+ i j))"),   META },
+        /* compressed: the chunk directory (the affine plan reads it staged) */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nS2})", "(sum (+ h 1h))"),  META },
+        /* one row can wrap: the pass sums its slice per row, the rest from the terms */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTW})",  "(sum (+ hw kw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nTW})", "(sum (* hw 3h))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nTW})",  "(sum (+ uw vw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nTW})",  "(sum (+ iw jw))"), PART | PRE },
+        { NS_Q("(select {s: (avg (+ i j)) from: _nTW})",  "(avg (+ iw jw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ h 30000h)) from: _nTW})", "(sum (+ hw 30000h))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ h 2000h)) from: _nTW})", "(sum (+ hw 2000h))"), SCAN | PRE },
+        /* the filtered rows (a compacted table here) are summed the same way */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTW where: (> i -1000000)})", "(sum (+ hw kw))"), PART | PRE },
+        /* ... but where the per-term plan would run: refused, per row */
+        { NS_Q("(select {s: (sum (+ h k)) c: (count h) from: _nTW})", "(sum (+ hw kw))"), REF },
+        /* metadata that does not prove it: the pass */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nW0})",  "(sum (+ hw kw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nW0})",  "(sum (+ iw jw))"), PART | PRE },
+        /* refused by the samples, before any pass */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTF})",  "(sum (+ hf hf))"), SAMPLE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTB})",  "(sum (+ hb hb))"), SAMPLE },
+        /* a row on the null sentinel, with or without a wrap: refused */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTS})",  "(sum (+ hs ks))"), REF },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTX})",  "(sum (+ hx kx))"), REF },
+        /* serial (below the parallel threshold, no samples) */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nts})",  "(sum (+ (take h 3000) (take k 3000)))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _ntw})",  "(sum (+ hsw hsw))"), PART | PRE },
+        /* the safe range's edges: 32767 and -32767 in, -32768 out; U8 255 in, 256 wraps */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nte})",  "(sum (+ he ke))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _ntm})",  "(sum (+ hm km))"), REF },
+        { NS_Q("(select {s: (sum (+ u v)) from: _ntu})",  "(sum (+ ue ve))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _ntv})",  "(sum (+ uo vo))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nti})",  "(sum (+ ie je))"), SCAN | PRE },
+        /* a nullable base: the affine plan proves the non-null rows; the
+         * linear plan never takes a nullable term (no proof is tried) */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nTN})", "(sum (+ hn 1h))"), SCAN },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTN})",  "(sum (+ hn k))"),  0 },
+        /* I64: no narrow node, no proof */
+        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), 0 },
+        { NULL, 0 },
+    };
+    test_result_t r = narrow_sum_run_cases(cases);
+    snprintf(cmd, sizeof cmd, "(.sys.exec \"rm -rf %s\")", dir);
+    narrow_sum_eval_ok(cmd);
+    return r;
+}
+
+/* A cancel at any dispatch of the proof pass or the scalar kernel: the
+ * query is cancelled or answers exactly, never a partial total. */
+static test_result_t test_narrow_sum_bound_cancel(void) {
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const char* const setup[] = {
+        "(set _cI (til 600000))",
+        "(set h (as 'I16 (- (% _cI 2001) 1000)))",
+        "(set k (as 'I16 (- (% (* _cI 7) 1999) 999)))",
+        "(set i (as 'I32 (- (% _cI 200001) 100000)))",
+        "(set j (as 'I32 (% (* _cI 7) 99991)))",
+        "(set hw (concat (take h 500001) (concat (enlist 30000h) (drop h 500002))))",
+        "(set _cT (table [h k i j hw] (list h k i j hw)))",
+        NULL,
+    };
+    int bad = 0;
+    for (int q = 0; setup[q]; q++) if (!narrow_sum_eval_ok(setup[q])) bad++;
+    static const char* const qs[] = {
+        "(select {s: (sum (+ h k)) from: _cT})",
+        "(select {s: (avg (+ i j)) from: _cT})",
+        "(select {s: (sum (+ h 1h)) from: _cT})",
+        "(select {s: (sum (+ hw hw)) from: _cT})",
+        NULL,
+    };
+    static const char* const ex[] = {
+        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))",
+    };
+    int cancelled = 0, answered = 0;
+    for (int qi = 0; qs[qi] && !bad; qi++)
+        for (int mode = 0; mode < 2; mode++)
+            for (uint32_t nth = 1; nth <= 12; nth++) {
+                ray_pool_test_cancel_at(nth, mode == 1);
+                ray_t* got = ray_eval_str(qs[qi]);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                if (!got) { bad++; continue; }
+                if (RAY_IS_ERR(got)) {
+                    if (strcmp(ray_err_code(got), "cancel") == 0) cancelled++; else bad++;
+                    ray_error_free(got);
+                    continue;
+                }
+                ray_env_set(ray_sym_intern("_cQ", 3), got);
+                ray_release(got);
+                char chk[256];
+                snprintf(chk, sizeof chk, "(all (== (at _cQ 's) %s))", ex[qi]);
+                ray_t* v = ray_eval_str(chk);
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                if (ok) answered++; else bad++;
+            }
+    ray_pool_destroy();
+    ray_pool_init_total(cores);
+    TEST_ASSERT_FMT(bad == 0, "%d bad outcomes (%d cancelled, %d answered)", bad, cancelled, answered);
+    TEST_ASSERT_TRUE(cancelled > 0 && answered > 0);
+    PASS();
+}
+
 /* ---- Group classifier owned-error versus unsupported fallback ---- */
 static void group_probe_test_dispose(ray_t* value) {
     if (value && RAY_IS_ERR(value)) ray_error_free(value);
@@ -13321,6 +13544,8 @@ const test_entry_t lang_entries[] = {
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
+    { "lang/query/narrow_sum_bound_routes", test_narrow_sum_bound_routes, lang_setup, lang_teardown },
+    { "lang/query/narrow_sum_bound_cancel", test_narrow_sum_bound_cancel, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
