@@ -849,7 +849,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             if (result && RAY_IS_ERR(result) &&
                 hdr->msgtype == RAY_IPC_MSG_ASYNC) {
                 fprintf(stderr, "ipc: .ipc.on.async hook raised an error\n");
-                ray_release(result);
+                ray_error_free(result);   /* an error object is not reference counted */
                 result = NULL;
             }
         } else if (msg->type == -RAY_STR) {
@@ -869,6 +869,11 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             result = ray_eval(msg);
             ray_release(msg);
         }
+    } else if (msg) {
+        /* A payload that does not decode comes back as an error object, which is
+         * not reference counted: it is freed, not released.  Left alone it was a
+         * block per bad frame, at the will of whoever could reach the port. */
+        ray_error_free(msg);
     }
     ray_ipc_set_auto_journal_eval(prev_auto_journal_eval);
     /* A lazy result is an internal deferred-DAG representation that cannot
@@ -1598,7 +1603,13 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
                               ack);
             }
     }
-    if (result != RAY_NULL_OBJ) ray_release(result);
+    /* An error object is not reference counted: ray_release leaves it alone, so
+     * every request that failed (an error in the evaluation, a message that is
+     * no expression) left a block behind in the server. */
+    if (result != RAY_NULL_OBJ) {
+        if (RAY_IS_ERR(result)) ray_error_free(result);
+        else ray_release(result);
+    }
     /* The request is served: this is the end of the server's unit of work,
      * and stamping here is what lets the poll loop tell an idle server from
      * one between two requests.  Stamping on frame arrival instead would
