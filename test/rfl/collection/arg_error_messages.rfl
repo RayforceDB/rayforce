@@ -1,0 +1,47 @@
+;; take, drop, rotate and filter: a wrong argument is reported with the
+;; expected call shape and the argument that is wrong (#1189).
+
+;; count given before the collection
+(at (try (take 3 [1 2 3]) (fn [e] e)) 'msg) -- "take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)"
+(at (try (drop 3 [1 2 3]) (fn [e] e)) 'msg) -- "drop: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (drop <collection> <count>)"
+(at (try (rotate 1 [1 2 3]) (fn [e] e)) 'msg) -- "rotate: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (rotate <collection> <count>)"
+
+;; a count of the wrong type
+(at (try (drop [1 2 3] "a") (fn [e] e)) 'msg) -- "drop: expected (drop collection count) where count is an integer atom; got count str"
+(at (try (take [1 2 3] 1.5) (fn [e] e)) 'msg) -- "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got count f64"
+
+;; a mask that is a single value
+(at (try (filter [1 2 3] true) (fn [e] e)) 'msg) -- "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got mask b8 (a single value, not a vector)"
+
+;; the calls that work still work
+(take [1 2 3] 2) -- [1 2]
+(drop [1 2 3] 1) -- [2 3]
+(filter [1 2 3] [true false true]) -- [1 3]
+
+;; ── every builtin names its usage: argument names, types and order ──
+;; (a builtin that fails on a bad call ends its message with "; usage: ...")
+
+;; the argument count
+(at (try (top [1 2 3]) (fn [e] e)) 'msg) -- "top: takes 2 arguments, got 1; usage: (top <x: vector> <n: int>)"
+(at (try (xrank [1 2]) (fn [e] e)) 'msg) -- "xrank: takes 2 arguments, got 1; usage: (xrank <buckets: int> <x: numeric vector>)"
+(at (try (strlen) (fn [e] e)) 'msg) -- "strlen: takes 1 argument, got 0; usage: (strlen <x: str or sym>)"
+(at (try (+ 1) (fn [e] e)) 'msg) -- "+: takes 2 arguments, got 1; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(at (try (and) (fn [e] e)) 'msg) -- "and: expected at least 1 arg, got 0; usage: (and <a: bool or num> <b: bool or num> ...)"
+
+;; an argument of the wrong type, the order being the one that counts
+(at (try (bin 1 [1 2]) (fn [e] e)) 'msg) -- "bin: sorted arg must be an i64 vector, got i64; usage: (bin <sorted: I64 vector> <value: i64 atom or I64 vector>)"
+(at (try (mavg [1 2] 3) (fn [e] e)) 'msg) -- "mavg window must be an integer atom; usage: (mavg <window: int> <x: numeric vector>)"
+(at (try (wavg 1 2) (fn [e] e)) 'msg) -- "wavg expects two numeric vectors, got i64 and i64; usage: (wavg <weights: numeric vector> <values: numeric vector>)"
+(at (try (fold + 1) (fn [e] e)) 'msg) -- "fold: vec arg must be a list, got i64; usage: (fold <fn: fn> <init: any> <x: vector or list>) or (fold <fn: fn> <x: vector or list>)"
+(at (try (.db.parted.get 1 2) (fn [e] e)) 'msg) -- ".db.parted.get expects a string db root path, got i64; usage: (.db.parted.get <root: str> <table: sym>)"
+
+;; an applied non-function is reported with the usage of the caller
+(at (try (map 1 [1 2]) (fn [e] e)) 'msg) -- "call: expected a callable function, got i64; usage: (map <fn: fn> <x: vector or list>) or (map <fn: fn> <val: any> <x: vector or list>)"
+
+;; an error that comes from code a builtin runs is not that builtin's: it
+;; keeps the usage of the builtin that failed, and gets no second one
+(at (try (map (fn [x] (+ x 'a)) [1]) (fn [e] e)) 'msg) -- "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(at (try (eval (list '+ 1 'a)) (fn [e] e)) 'msg) -- "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+
+;; an error that is not about the call is left as it is
+(at (try (quantile [1 2 3] 5.0) (fn [e] e)) 'msg) -- "quantile: probability out of range"

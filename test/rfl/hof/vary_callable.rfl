@@ -41,10 +41,10 @@
 (fold if 0 [1 2]) !- type
 (map do [1 2]) !- type
 (map + [1 2]) !- arity
-(at (try (fold if 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'if' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
-(at (try (map do [1 2]) (fn [e] e)) 'msg) -- "call: 'do' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
-(at (try (fold select 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'select' is a special form: it takes its arguments unevaluated, so it cannot be applied to values"
-(at (try (map + [1 2]) (fn [e] e)) 'msg) -- "call: '+' expects 2 arguments, got 1"
+(at (try (fold if 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'if' is a special form: it takes its arguments unevaluated, so it cannot be applied to values; usage: (fold <fn: fn> <init: any> <x: vector or list>) or (fold <fn: fn> <x: vector or list>)"
+(at (try (map do [1 2]) (fn [e] e)) 'msg) -- "call: 'do' is a special form: it takes its arguments unevaluated, so it cannot be applied to values; usage: (map <fn: fn> <x: vector or list>) or (map <fn: fn> <val: any> <x: vector or list>)"
+(at (try (fold select 0 [1 2]) (fn [e] e)) 'msg) -- "call: 'select' is a special form: it takes its arguments unevaluated, so it cannot be applied to values; usage: (fold <fn: fn> <init: any> <x: vector or list>) or (fold <fn: fn> <x: vector or list>)"
+(at (try (map + [1 2]) (fn [e] e)) 'msg) -- "+: takes 2 arguments, got 1; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
 (map abs [-1 2]) -- [1 2]
 
 ;; ── the type name of every function kind ──

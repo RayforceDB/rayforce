@@ -98,7 +98,7 @@ Occur when an operation receives the wrong argument type:
 
 ```text
 (+ 1 "hello")
-; error: type
+; error: type: cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)
 ```
 
 Arithmetic, comparison, and most builtins check argument types and produce type errors for mismatches.
@@ -109,8 +109,35 @@ Occur when a function receives the wrong number of arguments:
 
 ```text
 (+ 1)
-; error: arity — + expects 2 arguments
+; error: arity: +: takes 2 arguments, got 1; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)
 ```
+
+### Usage Lines
+
+A builtin called with the wrong arguments ends its message with `usage:`, the call shape with each
+argument's name and type in the order the builtin takes them, so a caller (a person or a program)
+sees what to change without looking the function up:
+
+```text
+(top [5 1 9 3])
+; error: arity: top: takes 2 arguments, got 1; usage: (top <x: vector> <n: int>)
+
+(mavg [1 2 3] 2)
+; error: type: mavg window must be an integer atom; usage: (mavg <window: int> <x: numeric vector>)
+```
+
+The order differs between builtins (`mavg` takes its window first, `top` its vector first), which is
+what the usage line is for. Where a builtin gets its arguments in the wrong order the message says so:
+
+```text
+(take 3 [1 2 3])
+; error: type: take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)
+```
+
+Only errors about the call get a usage line (`type`, `length`, `rank`, `arity`, and a `domain` error
+about the argument list). An error from a bad value, such as an index out of range, does not. An error
+raised by code a builtin runs (a function given to `map`, an expression given to `eval`) keeps the usage
+of the builtin that failed, not that of the one that ran it.
 
 ### Domain Errors
 

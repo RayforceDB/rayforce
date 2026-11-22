@@ -15,7 +15,9 @@
 (set T (table [cb8 cu8 ci16 ci32 ci64 cf32 cf64 cdate ctime cts cspan cguid csym cstr] (list [true false true] (as 'U8 [1 0 2]) [1h 0h 0Nh] [1i 0i 0Ni] [1 0 0Nl] (as 'F32 [1.0 0.0 0Nf]) [1.0 0.0 0Nf] (as 'DATE [1 0 0Nl]) (as 'TIME [1 0 0Nl]) (as 'TIMESTAMP [1 0 0Nl]) (as 'TIMESPAN [1 0 0Nl]) (concat (guid 2) [0Ng]) (as 'SYM ["a" "" "b"]) ["a" "" "b"])))
 (set TK (update {k: (til 3) from: T}))
 (set C (key T))
-(set msg (fn [e] (concat "ERR:" (at e 'msg))))
+;; a builtin called by name ends its message with its usage line; the query
+;; planner's own error does not, so the messages are compared without it
+(set msg (fn [e] (concat "ERR:" (first (split (at e 'msg) "; usage:")))))
 ;; column against column: vector builtin, select projection, where: rows
 (set out (fn [op a b] (try (eval (list op (at T a) (at T b))) msg)))
 (set inq (fn [op a b] (try (at (eval (list 'select (dict ['r 'from] (list (list op a b) T)))) 'r) msg)))

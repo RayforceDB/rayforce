@@ -244,6 +244,15 @@ const char* ray_error_msg(void) {
     return ray_last_err_msg;
 }
 
+void ray_error_msg_set(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(ray_last_err_msg, sizeof(ray_last_err_msg), fmt, ap);
+    va_end(ap);
+    if (__VM)
+        memcpy(__VM->err.msg, ray_last_err_msg, sizeof(__VM->err.msg));
+}
+
 void ray_error_clear(void) {
     ray_last_err_msg[0] = '\0';
     if (__VM) __VM->err.msg[0] = '\0';

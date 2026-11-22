@@ -568,7 +568,7 @@ static ray_t* eval_and_short(ray_t* arg) {
 }
 
 ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("arity", "expected at least 1 arg, got %lld", (long long)n);
+    if (n < 1) return ray_error("arity", "and: expected at least 1 arg, got %lld", (long long)n);
     ray_t* acc = eval_and_short(args[0]);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity: (and X) == X, (or X) == X — monoid identity
@@ -598,7 +598,7 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
 }
 
 ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
-    if (n < 1) return ray_error("arity", "expected at least 1 arg, got %lld", (long long)n);
+    if (n < 1) return ray_error("arity", "or: expected at least 1 arg, got %lld", (long long)n);
     ray_t* acc = eval_and_short(args[0]);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity — see ray_and_vary_fn for rationale. */

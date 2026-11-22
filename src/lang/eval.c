@@ -26,6 +26,7 @@
 #include "lang/internal.h"
 #include "app/repl.h"
 #include "lang/env.h"
+#include "lang/sig.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
 #include "core/types.h"
@@ -2396,7 +2397,7 @@ static ray_t* call_vary_values(ray_t* fn, ray_t* const* args, int64_t n) {
     }
     ray_t* r = ((ray_vary_fn)(uintptr_t)fn->i64)(own, n);
     for (int64_t i = 0; i < n; i++) ray_release(own[i]);
-    return r;
+    return ray_sig_note(ray_fn_name(fn), r);
 }
 
 /* Helper: call a function object with 1 arg, returning result.
@@ -2419,14 +2420,14 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         else
             r = f(a);
         if (owned) ray_release(a);
-        return r;
+        return ray_sig_note(ray_fn_name(fn), r);
     }
     if (fn->type == RAY_LAMBDA) {
         ray_t* args[1] = { arg };
         return call_lambda(fn, args, 1);
     }
     if (fn->type == RAY_BINARY)
-        return ray_error("arity", "call: '%s' expects 2 arguments, got 1", ray_fn_name(fn));
+        return ray_sig_arity(ray_fn_name(fn), "2", 1);
     if (fn->type == RAY_VARY) {
         if (fn_is_vary(fn, ray_and_vary_fn) || fn_is_vary(fn, ray_or_vary_fn)) {
             /* (and x) is (or x) is x */
@@ -2475,7 +2476,7 @@ ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b) {
             r = bin(la, lb);
         if (owned_a) ray_release(la);
         if (owned_b) ray_release(lb);
-        return r;
+        return ray_sig_note(ray_fn_name(fn), r);
     }
     if (fn->type == RAY_LAMBDA) {
         ray_t* args[2] = { a, b };
@@ -3816,7 +3817,7 @@ static bool vm_text_value(const ray_t* v) {
 }
 
 /* A unary builtin applied by compiled code to `arg` (borrowed). */
-static inline ray_t* vm_apply_unary(ray_t* fn_obj, ray_t* arg) {
+static inline ray_t* vm_apply_unary_raw(ray_t* fn_obj, ray_t* arg) {
     ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
     if (RAY_UNLIKELY(RAY_IS_NULL(arg)))
         return (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
@@ -3826,11 +3827,15 @@ static inline ray_t* vm_apply_unary(ray_t* fn_obj, ray_t* arg) {
     return fn(arg);
 }
 
+static inline ray_t* vm_apply_unary(ray_t* fn_obj, ray_t* arg) {
+    return ray_sig_note(ray_fn_name(fn_obj), vm_apply_unary_raw(fn_obj, arg));
+}
+
 /* A binary builtin applied by compiled code.  Consumes `left` and `right`;
  * `left_rows`/`right_rows` are their row-provenance flags and `*out_rows`
  * receives the result's.  Returns an owned result or error. */
-static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
-                             uint8_t left_rows, uint8_t right_rows, uint8_t* out_rows) {
+static ray_t* vm_call_binary_raw(ray_t* fn_obj, ray_t* left, ray_t* right,
+                                 uint8_t left_rows, uint8_t right_rows, uint8_t* out_rows) {
     ray_binary_fn fn = (ray_binary_fn)(uintptr_t)fn_obj->i64;
     ray_t *result;
     *out_rows = 0;
@@ -3875,6 +3880,12 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     ray_release(left);
     ray_release(right);
     return result;
+}
+
+static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
+                             uint8_t left_rows, uint8_t right_rows, uint8_t* out_rows) {
+    return ray_sig_note(ray_fn_name(fn_obj),
+                        vm_call_binary_raw(fn_obj, left, right, left_rows, right_rows, out_rows));
 }
 
 /* The calls above, timed by the call profiler under the running lambda
@@ -4267,7 +4278,7 @@ op_jmpf: {
         ray_t* err = materialize_owned_args(fn_args, n);                    \
         if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }  \
     }                                                                       \
-    ray_t *result = APPLY;                                                  \
+    ray_t *result = ray_sig_note(ray_fn_name(fn_obj), APPLY);               \
     uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0; \
     for (int32_t i = 0; i < n; i++)                                         \
         ray_release(fn_args[i]);                                            \
@@ -4440,7 +4451,7 @@ op_callf: {
                 ray_release(fn_args[1]);
                 goto unary_done;
             }
-            if (n != 1) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("arity", "expected 1 arg, got %d", n); break; }
+            if (n != 1) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_sig_arity(ray_fn_name(fn_obj), "1", n); break; }
             /* fn_args[0] is an owned ref (POPped from VM stack); materialise
              * consumes it — no extra ray_release after the call. */
             if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && fn_args[0] && ray_is_lazy(fn_args[0])) {
@@ -4462,7 +4473,7 @@ unary_done:
             }
         case RAY_BINARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
-            if (n != 2) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("arity", "expected 2 args, got %d", n); break; }
+            if (n != 2) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_sig_arity(ray_fn_name(fn_obj), "2", n); break; }
             /* fn_args[0/1] are owned refs (POPped from VM stack); materialise
              * consumes them — no extra ray_release after each call. */
             if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
@@ -6001,14 +6012,19 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 ray_release(right);
                 goto out;
             }
-            if (n != 2) { ray_release(head); ret = ray_error("arity", "expected 1 arg, got %d", (int)(n-1)); goto out; }
+            if (n != 2) {
+                ray_t* arity_err = ray_sig_arity(ray_fn_name(head), "1", (int)(n-1));
+                ray_release(head); ret = arity_err; goto out;
+            }
+            char nm[16];
+            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
             uint8_t fn_attrs = head->attrs;
             if (fn == (ray_unary_fn)ray_count_fn) {
                 int handled = 0;
                 ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
                 if (handled) {
                     ray_release(head);
-                    ret = fast ? fast : ray_error("type", NULL);
+                    ret = ray_sig_note(nm, fast ? fast : ray_error("type", NULL));
                     rows = 0; goto out;
                 }
             }
@@ -6046,18 +6062,24 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 result = atomic_map_unary(fn, arg);
             else
                 result = fn(arg);
+            result = ray_sig_note(nm, result);
             if (arg) ray_release(arg);
             ret = result; goto out;
         }
         case RAY_BINARY: {
-            if (n != 3) { ray_release(head); ret = ray_error("arity", "expected 2 args, got %d", (int)(n-1)); goto out; }
+            if (n != 3) {
+                ray_t* arity_err = ray_sig_arity(ray_fn_name(head), "2", (int)(n-1));
+                ray_release(head); ret = arity_err; goto out;
+            }
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
+            char nm[16];
+            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
             ray_binary_fn fn = (ray_binary_fn)(uintptr_t)head->i64;
             uint8_t fn_attrs = head->attrs;
             if (fn_attrs & RAY_FN_SPECIAL_FORM) {
                 bool inherits = form_inherits_rows(head);
                 ray_release(head);
-                ret = fn(elems[1], elems[2]);
+                ret = ray_sig_note(nm, fn(elems[1], elems[2]));
                 rows = inherits ? g_eval_rows : 0;
                 goto out;
             }
@@ -6174,6 +6196,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             }
             else
                 result = fn(left, right);
+            result = ray_sig_note(nm, result);
             ray_release(left);
             ray_release(right);
             ret = result; goto out;
@@ -6181,6 +6204,8 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
         case RAY_VARY: {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
+            char nm[16];
+            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
             /* insert or alter reached through any head but the literal name
              * or a global alias: an ordinary call, its operands evaluated
              * first, and its quoted target is no binding of this function. */
@@ -6192,7 +6217,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                  * form (a query, a table op) builds a new value. */
                 bool inherits = form_inherits_rows(head);
                 ray_release(head);
-                ret = fn(elems + 1, n - 1);
+                ret = ray_sig_note(nm, fn(elems + 1, n - 1));
                 rows = inherits ? g_eval_rows : 0;
                 goto out;
             }
@@ -6236,7 +6261,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             }
             ray_release(head);
             if (callee_mutator) ray_env_mutator_callee_arm();
-            ray_t* result = fn(args, argc);
+            ray_t* result = ray_sig_note(nm, fn(args, argc));
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             if (args != stack_args) ray_free_raw(args);
             ret = result; goto out;

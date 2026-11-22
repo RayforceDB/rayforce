@@ -29,6 +29,7 @@
 #include "io/parquet.h"
 #include "lang/eval.h"
 #include "lang/env.h"
+#include "lang/sig.h"
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/colbind.h"      /* ray_col_bind_declines — the count fast path binds */
@@ -12393,7 +12394,7 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                    (size_t)grp_cnt[gi] * sizeof(int64_t));
         }
         ray_t* subset = ray_at_fn(src, idx_vec);
-        ray_t* agg_val = subset && !RAY_IS_ERR(subset) ? uf(subset) : subset;
+        ray_t* agg_val = subset && !RAY_IS_ERR(subset) ? ray_sig_note(ray_fn_name(fn_obj), uf(subset)) : subset;
         if (subset && !RAY_IS_ERR(subset)) ray_release(subset);
         if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
             agg_val = ray_lazy_materialize(agg_val);
@@ -15064,7 +15065,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         }
 
         ray_t* agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
-        if (!agg_value) agg_value = uf(src);
+        if (!agg_value) agg_value = ray_sig_note(ray_fn_name(fn_obj), uf(src));
         ray_release(src);
         if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
             agg_value = ray_lazy_materialize(agg_value);
@@ -19817,7 +19818,7 @@ static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
             if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, lit);
             if (lit && !RAY_IS_ERR(lit)) ray_release(lit);
         } else {
-            ray_t* agg = ((ray_unary_fn)(uintptr_t)fn_obj->i64)(val);
+            ray_t* agg = ray_sig_note(ray_fn_name(fn_obj), ((ray_unary_fn)(uintptr_t)fn_obj->i64)(val));
             if (agg && !RAY_IS_ERR(agg) && ray_is_lazy(agg)) agg = ray_lazy_materialize(agg);
             if (agg && !RAY_IS_ERR(agg) && !ray_is_atom(agg)) {
                 /* An aggregate with a collection result is no one value
@@ -24374,7 +24375,7 @@ by_dict_done:
                                     ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
                                     if (fn_obj && fn_obj->type == RAY_UNARY) {
                                         ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-                                        agg_val = uf(subset);
+                                        agg_val = ray_sig_note(ray_fn_name(fn_obj), uf(subset));
                                     }
                                     ray_release(subset);
                                 }
@@ -25057,7 +25058,7 @@ by_dict_done:
                         ray_t* fn_obj = ray_env_get(agg_fn_name->i64);
                         if (fn_obj && fn_obj->type == RAY_UNARY) {
                             ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-                            agg_val = uf(subset);
+                            agg_val = ray_sig_note(ray_fn_name(fn_obj), uf(subset));
                         }
                         ray_release(subset);
                         if (agg_val && !RAY_IS_ERR(agg_val) && ray_is_lazy(agg_val))
@@ -26803,7 +26804,7 @@ by_dict_done:
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sagg_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
-                        return ray_error("type", "%s expects two numeric vectors, got %s and %s", nm, ray_type_name(xt), ray_type_name(yt));
+                        return ray_sig_note(nm, ray_error("type", "%s expects two numeric vectors, got %s and %s", nm, ray_type_name(xt), ray_type_name(yt)));
                     }
                     s_use_eval_fallback = 1;
                     break;
