@@ -2007,11 +2007,13 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         return h;
     }
     case RAY_TABLE: {
-        if (seen && !spans && ray_key_spans(x)) *seen = true;
+        /* RAY_KEY_EXACT_INT is not a span bit: only the span bits matter here */
+        int sb = spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
+        if (seen && !sb && ray_key_spans(x)) *seen = true;
         if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
         /* With spans, a column can equal a vector of a different type.
          * Keep the conservative hash for every table in that key set. */
-        if (spans) return 0;
+        if (sb) return 0;
         int64_t nc = ray_table_ncols(x);
         uint64_t h = ray_hash_i64(nc);
         for (int64_t c = 0; c < nc; c++) {
@@ -2022,10 +2024,12 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         }
         return h;
     }
-    case RAY_DICT:
-        if (seen && !spans && ray_key_spans(x)) *seen = true;
+    case RAY_DICT: {
+        int sb = spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
+        if (seen && !sb && ray_key_spans(x)) *seen = true;
         if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
-        return spans ? 0 : ray_atom_hash(x);
+        return sb ? 0 : ray_atom_hash(x);
+    }
     }
     if (seen && ray_has_timespan(x)) *seen = true;
     if (spans & RAY_KEY_SPAN_VEC) {
