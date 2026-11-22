@@ -10538,6 +10538,15 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl);
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth);
 static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl);
+static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget);
+
+/* Does `e` read only its own row: no aggregate and no whole-column verb
+ * (`distinct`, `reverse`, ...) here or in a helper it calls?  Then its
+ * value over the rows, split by group, is its value per group. */
+static bool expr_reads_own_row(ray_t* e, ray_t* tbl) {
+    int budget = 4096;
+    return !query_code_needs_group(e, tbl, false, 0, &budget);
+}
 
 /* A plain grouped output whose `if` chooses per row: evaluated once over
  * the rows (query_eval_rowwise_if) and split by group, as the scatter route
@@ -10546,8 +10555,7 @@ static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl);
 static ray_t* nonagg_rowwise_if_split(ray_t* expr, ray_t* tbl,
                                       idx_feeder_fn feeder, void* fstate,
                                       int64_t n_groups) {
-    if (!rw_has_if(expr, tbl, 0) || expr_contains_agg(expr) ||
-        query_expr_calls_group_helper(expr, tbl)) return NULL;
+    if (!rw_has_if(expr, tbl, 0) || !expr_reads_own_row(expr, tbl)) return NULL;
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* bind_err = NULL;
     ray_t* aqt = bind_referenced_query(tbl, &expr, 1, &bind_err);
@@ -10575,17 +10583,113 @@ static ray_t* nonagg_rowwise_if_split(ray_t* expr, ray_t* tbl,
     return out ? out : ray_error("oom", NULL);
 }
 
+static int rw_if_kind(ray_t* e, ray_t* tbl);
+static bool rw_pure(ray_t* e, ray_t* tbl, int depth);
+
+typedef struct {
+    ray_t*  tbl;        /* the groups' table */
+    ray_t*  out;        /* it with the hidden columns, once one is added */
+    int64_t next;
+} if_hoist_t;
+
+/* `e` with each outermost `if` that reads only its own row (no aggregate,
+ * no helper that reads the group, no effect) replaced by a hidden column
+ * holding its value over the rows (query_eval_rowwise_if), added to h->out.
+ * Evaluated per group, an aggregate around it, `(first (if c d (+ d 1)))`,
+ * then reads the group's rows of that column instead of an `if` that tests
+ * the group's condition vector whole.  The walk enters builtin calls only.
+ * Owned; an error is the query's. */
+static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32) {
+        ray_retain(e); return e;
+    }
+    ray_t** es = (ray_t**)ray_data(e);
+    if (rw_if_kind(e, h->tbl)) {
+        if (!expr_reads_own_row(e, h->tbl) || !expr_refs_row_column(e, h->tbl) ||
+            !rw_pure(e, h->tbl, 0)) { ray_retain(e); return e; }
+        if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
+        ray_t* bind_err = NULL;
+        ray_t* aqt = bind_referenced_query(h->tbl, &e, 1, &bind_err);
+        ray_t* v = bind_err ? bind_err : query_eval_rowwise_if(e, h->tbl);
+        g_active_query_table = aqt;
+        ray_env_pop_scope();
+        if (v && RAY_IS_ERR(v)) return v;
+        if (!v || !(ray_is_vec(v) || v->type == RAY_LIST) || v->len != ray_table_nrows(h->tbl)) {
+            if (v) ray_release(v);
+            ray_retain(e); return e;
+        }
+        int64_t sym = -1;
+        while (sym < 0) {
+            char nm[32];
+            int ln = snprintf(nm, sizeof nm, "#ifcol%lld", (long long)h->next++);
+            int64_t cand = ray_sym_intern(nm, (size_t)ln);
+            if (!tbl_has_col(h->tbl, cand)) sym = cand;
+        }
+        if (!h->out) { ray_retain(h->tbl); h->out = h->tbl; }
+        h->out = ray_table_add_col(h->out, sym, v);
+        ray_release(v);
+        if (!h->out || RAY_IS_ERR(h->out)) {
+            ray_t* err = h->out ? h->out : ray_error("oom", NULL);
+            h->out = NULL;
+            return err;
+        }
+        return ray_sym(sym);
+    }
+    ray_t* hd = es[0];
+    if (!hd || hd->type != -RAY_SYM || (hd->attrs & ATTR_QUOTED) ||
+        tbl_has_col(h->tbl, hd->i64) || ray_env_has_lexical_local(hd->i64)) { ray_retain(e); return e; }
+    ray_t* fn = ray_env_get(hd->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM)) {
+        ray_retain(e); return e;
+    }
+    ray_t* out = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* a = nonagg_hoist_if(es[i], h, depth + 1);
+        if (!a || RAY_IS_ERR(a)) { if (out) ray_release(out); return a ? a : ray_error("oom", NULL); }
+        if (a == es[i] && !out) { ray_release(a); continue; }
+        if (!out) {
+            out = ray_list_new((int32_t)e->len);
+            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) {
+                ray_t* nx = ray_list_append(out, es[j]);
+                if (!nx || RAY_IS_ERR(nx)) { ray_release(out); out = nx ? nx : ray_error("oom", NULL); }
+                else out = nx;
+            }
+            if (!out || RAY_IS_ERR(out)) { ray_release(a); return out ? out : ray_error("oom", NULL); }
+        }
+        ray_t* nx = ray_list_append(out, a);
+        ray_release(a);
+        if (!nx || RAY_IS_ERR(nx)) { ray_release(out); return nx ? nx : ray_error("oom", NULL); }
+        out = nx;
+    }
+    if (!out) { ray_retain(e); return e; }
+    out->attrs = e->attrs;
+    return out;
+}
+
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
     ray_t* split = nonagg_rowwise_if_split(expr, tbl, feeder, fstate, n_groups);
     if (split) return split;
+    /* an `if` beside or under an aggregate: its column over the rows */
+    if_hoist_t hs = { .tbl = tbl };
+    ray_t* hoisted = NULL;
+    if (rw_has_if(expr, tbl, 0)) {
+        hoisted = nonagg_hoist_if(expr, &hs, 0);
+        if (!hoisted || RAY_IS_ERR(hoisted)) {
+            if (hs.out) ray_release(hs.out);
+            return hoisted ? hoisted : ray_error("oom", NULL);
+        }
+        if (hs.out) { expr = hoisted; tbl = hs.out; }
+    }
     query_dependency_cache_t cache = { .table = tbl };
     query_dependency_cache_t* prev = g_query_dependencies;
     g_query_dependencies = &cache;
     ray_t* expanded = query_inline_helpers(expr, tbl);
     ray_t* result = nonagg_eval_per_group_impl(expanded, tbl, feeder, fstate, n_groups);
     ray_release(expanded);
+    if (hoisted) ray_release(hoisted);
+    if (hs.out) ray_release(hs.out);
     for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
     g_query_dependencies = prev;
     return result;
@@ -11041,11 +11145,11 @@ static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
  * is OP_IF's refusal of an `if` that compiles whole (as keyless); a pair
  * of pieces OP_IF has no type for, or refuses, is boxed per row, as the
  * keyless per-row pass gives an `if` it cannot compile.  A condition that
- * is one value chooses its arm, as the control-flow `if` does.  An `if`
- * chain, an `if` or `cond` in an arm or condition, and one in a builtin
- * call's argument nest.  A `cond` under an aggregate does not reach here:
- * the planner sends it to the per-group evaluator, which has no `cond`
- * builtin (`'cond' undefined`, as keyless).  An expression with an effect
+ * is one value chooses its arm, as the control-flow `if` does, and an arm
+ * no row selects is not evaluated, as the keyless per-row pass never
+ * reaches it.  An `if` chain, an `if` in an arm or condition, and one in a
+ * builtin call's argument nest.  `cond` is left to the evaluator, which has
+ * no `cond` builtin: `'cond' undefined`, as keyless.  An expression with an effect
  * anywhere in it, and an `if` inside a helper the planner does not open,
  * keep the evaluator's answer: the caller evaluates them as before. */
 
@@ -11054,26 +11158,19 @@ static bool rw_head_is(ray_t* h, const char* nm, size_t nl) {
     return s && ray_str_len(s) == nl && memcmp(ray_str_ptr(s), nm, nl) == 0;
 }
 
-/* 1: `(if c1 r1 ... else)` with a fallback, 2: `(cond (p e) ... (else e))`,
- * 0: neither, or a head a column, a local or a rebinding shadows. */
+/* 1 for `(if c1 r1 ... else)` with a fallback; 0 for anything else, a
+ * head a column, a local or a rebinding shadows included.  `cond` is not
+ * one: it has no evaluator builtin, and the keyless select raises `'cond'
+ * undefined` for one the DAG does not compile, so a grouped one raises the
+ * same. */
 static int rw_if_kind(ray_t* e, ray_t* tbl) {
-    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2) return 0;
-    ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return 0;
-    int kind = rw_head_is(h, "if", 2) ? 1 : rw_head_is(h, "cond", 4) ? 2 : 0;
-    if (!kind || tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return 0;
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 4 || (e->len & 1)) return 0;
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || !rw_head_is(h, "if", 2) ||
+        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return 0;
     ray_t* fn = ray_env_get(h->i64);
-    if (kind == 1) {
-        if (e->len < 4 || (e->len & 1)) return 0;
-        return fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
-               (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn ? 1 : 0;
-    }
-    if (fn) return 0;
-    for (int64_t i = 1; i < e->len; i++)
-        if (!es[i] || es[i]->type != RAY_LIST || es[i]->len != 2) return 0;
-    ray_t* last = ((ray_t**)ray_data(es[e->len - 1]))[0];
-    return last && last->type == -RAY_SYM && rw_head_is(last, "else", 4) ? 2 : 0;
+    return fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn ? 1 : 0;
 }
 
 /* Does `e` hold such an `if` where the walk reaches: itself, or an argument
@@ -11202,20 +11299,52 @@ done:
     return out;
 }
 
-/* The `if` chain `e` (kind as rw_if_kind) from its pair `i` on: a
- * condition that is one value (an atom, or one cell over several rows)
- * chooses its arm and the other is not evaluated, as the control-flow `if`
- * does; a condition per row blends.  Right to left, as OP_IF chains: (if c1
- * r1 c2 r2 e) is OP_IF(c1, r1, OP_IF(c2, r2, e)). */
-static ray_t* rw_chain(ray_t* e, int kind, int64_t i, rw_ctx_t* c, int depth) {
+/* Each row's truth of the condition value `cv` into `t` (is_truthy's
+ * rule, as OP_IF's fills read it; a null is false). */
+static void rw_truth(ray_t* cv, int64_t n, uint8_t* t) {
+    const void* d = ray_data(cv);
+    switch (cv->type) {
+    case RAY_BOOL: case RAY_U8:
+        for (int64_t r = 0; r < n; r++) t[r] = ((const uint8_t*)d)[r] != 0;
+        return;
+    case RAY_I16:
+        for (int64_t r = 0; r < n; r++) t[r] = ((const int16_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
+        return;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        for (int64_t r = 0; r < n; r++) t[r] = ((const int32_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
+        return;
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+        for (int64_t r = 0; r < n; r++) t[r] = ((const int64_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
+        return;
+    case RAY_F64:
+        for (int64_t r = 0; r < n; r++) { double v = ((const double*)d)[r]; t[r] = v != 0.0 && v == v; }
+        return;
+    default:
+        for (int64_t r = 0; r < n; r++) {
+            int ca = 0;
+            ray_t* cc = collection_elem(cv, r, &ca);
+            t[r] = cc && !RAY_IS_ERR(cc) && is_truthy(cc);
+            if (ca) ray_release(cc);
+        }
+    }
+}
+
+/* The `if` chain `e` from its pair `i` on, over the rows `reach` marks (the
+ * rows no earlier condition took; NULL for all).  A condition that is one
+ * value (an atom, or one cell over several rows) chooses its arm, as the
+ * control-flow `if` does.  A condition per row blends, but an arm none of
+ * the reaching rows selects is not evaluated, as the keyless select's
+ * per-row pass never reaches it: `(if (> c -1) d (+ d "x"))` is `d`.  Over
+ * no rows both arms are evaluated, so the empty column keeps the blended
+ * type.  Right to left, as OP_IF chains: (if c1 r1 c2 r2 e) is OP_IF(c1, r1,
+ * OP_IF(c2, r2, e)). */
+static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, int depth) {
     ray_t** es = (ray_t**)ray_data(e);
     int64_t n = e->len;
-    /* the fallback: `if`'s last argument, `cond`'s else clause */
-    ray_t* fb = kind == 1 ? es[n - 1] : ((ray_t**)ray_data(es[n - 1]))[1];   /* not-a-table */
-    if (i == n - 1) return rw_value(fb, c, depth + 1);
-    ray_t* pe = kind == 1 ? es[i] : ((ray_t**)ray_data(es[i]))[0];
-    ray_t* be = kind == 1 ? es[i + 1] : ((ray_t**)ray_data(es[i]))[1];   /* not-a-table */
-    int64_t next = kind == 1 ? i + 2 : i + 1;
+    if (i == n - 1) return rw_value(es[n - 1], c, depth + 1);
+    ray_t* pe = es[i];
+    ray_t* be = es[i + 1];
+    int64_t next = i + 2;
     ray_t* cv = rw_value(pe, c, depth + 1);
     if (RAY_IS_ERR(cv)) return cv;
     bool one = ray_is_atom(cv) || ((ray_is_vec(cv) || cv->type == RAY_LIST) && cv->len == 1 && c->nrows != 1);
@@ -11231,15 +11360,43 @@ static ray_t* rw_chain(ray_t* e, int kind, int64_t i, rw_ctx_t* c, int depth) {
         bool t = cc && !RAY_IS_ERR(cc) && is_truthy(cc);
         if (ca) ray_release(cc);
         ray_release(cv);
-        return t ? rw_value(be, c, depth + 1) : rw_chain(e, kind, next, c, depth);
+        return t ? rw_value(be, c, depth + 1) : rw_chain(e, next, reach, c, depth);
     }
-    ray_t* tv = rw_value(be, c, depth + 1);
-    if (RAY_IS_ERR(tv)) { ray_release(cv); return tv; }
-    ray_t* ev = rw_chain(e, kind, next, c, depth);
-    if (RAY_IS_ERR(ev)) { ray_release(cv); ray_release(tv); return ev; }
-    /* the else side is the rest of the chain, already blended, or the
-     * fallback itself, whose shape is checked */
-    return rw_blend(cv, tv, ev, be, next == n - 1 ? fb : NULL, c);
+    /* which arms the reaching rows select, and the rows the rest reaches */
+    int64_t nr = c->nrows;
+    ray_t* thdr = NULL;
+    uint8_t* t = (uint8_t*)scratch_alloc(&thdr, (size_t)(nr > 0 ? nr : 1));
+    if (!t) { ray_release(cv); return ray_error("oom", NULL); }
+    rw_truth(cv, nr, t);
+    bool sel_t = nr == 0, sel_f = nr == 0;
+    for (int64_t r = 0; r < nr; r++) {
+        bool in = !reach || reach[r];
+        sel_t |= in && t[r];
+        sel_f |= in && !t[r];
+        t[r] = in && !t[r];                     /* now: the rows the rest reaches */
+    }
+    ray_t* out;
+    if (!sel_t) {
+        ray_release(cv);
+        out = rw_chain(e, next, t, c, depth);
+    } else {
+        ray_t* tv = rw_value(be, c, depth + 1);
+        if (RAY_IS_ERR(tv)) { ray_release(cv); out = tv; }
+        else if (!sel_f) {
+            /* the then arm alone; an atom or an arm of another shape takes
+             * the rows through the blend */
+            if (ray_is_vec(tv) && tv->len == nr) { ray_release(cv); out = tv; }
+            else { ray_retain(tv); out = rw_blend(cv, tv, tv, be, be, c); }
+        } else {
+            ray_t* ev = rw_chain(e, next, t, c, depth);
+            if (RAY_IS_ERR(ev)) { ray_release(cv); ray_release(tv); out = ev; }
+            /* the else side is the rest of the chain, already blended, or
+             * the fallback itself, whose shape is checked */
+            else out = rw_blend(cv, tv, ev, be, next == n - 1 ? es[n - 1] : NULL, c);
+        }
+    }
+    scratch_free(thdr);
+    return out;
 }
 
 /* `e`, a builtin call with such an `if` in an argument: the argument is
@@ -11298,14 +11455,13 @@ static ray_t* rw_value(ray_t* e, rw_ctx_t* c, int depth) {
     }
     ray_graph_free(g);
     if (out) return out;
-    int kind = depth > 32 ? 0 : rw_if_kind(e, c->tbl);
-    if (kind) return rw_chain(e, kind, 1, c, depth);
+    if (depth <= 32 && rw_if_kind(e, c->tbl)) return rw_chain(e, 1, NULL, c, depth);
     if (depth <= 32 && rw_has_if(e, c->tbl, depth)) return rw_eval_call(e, c, depth);
     return rw_force(ray_eval(e));
 }
 
-/* Is `e` free of effects?  An `if` or a `cond` is when its parts are:
- * `cond` has no evaluator builtin, so the purity walk cannot read it. */
+/* Is `e` free of effects?  An `if` is when its parts are; a builtin call
+ * with one in an argument when the call and that argument are. */
 static bool rw_pure(ray_t* e, ray_t* tbl, int depth) {
     int kind = depth > 32 ? 0 : rw_if_kind(e, tbl);
     if (!kind && depth <= 32 && rw_has_if(e, tbl, depth)) {
@@ -11330,15 +11486,8 @@ static bool rw_pure(ray_t* e, ray_t* tbl, int depth) {
     }
     if (!kind) return query_expr_effect_free(e);
     ray_t** es = (ray_t**)ray_data(e);
-    for (int64_t i = 1; i < e->len; i++) {
-        if (kind == 1 && !rw_pure(es[i], tbl, depth + 1)) return false;
-        if (kind == 2) {
-            ray_t** ce = (ray_t**)ray_data(es[i]);
-            bool is_else = i == e->len - 1;
-            if ((!is_else && !rw_pure(ce[0], tbl, depth + 1)) || !rw_pure(ce[1], tbl, depth + 1))
-                return false;
-        }
-    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!rw_pure(es[i], tbl, depth + 1)) return false;
     return true;
 }
 
@@ -17846,9 +17995,13 @@ static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl) {
  * (several statements, a closure), which may run over other rows than its
  * own, and it sees the whole table as a running builtin does (#1249).  One
  * given an aggregate (`(f i (avg i))`) is not: that aggregate is the
- * group's, as it is inline. */
+ * group's, as it is inline.  Grouped, an `if` is a call whose arguments are
+ * evaluated where it stands: it chooses per row over its arms' whole
+ * columns (query_eval_rowwise_if), so a running call in an arm sees the
+ * whole table as one written alone does. */
 static int query_running_call_kind(ray_t* e, ray_t* tbl, bool grouped) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2) return -1;
+    if (grouped && rw_if_kind(e, tbl)) return 0;
     ray_t* h = ((ray_t**)ray_data(e))[0];
     if (h && h->type == RAY_LIST)                   /* `((fn [x] ...) i)` */
         return grouped && key_literal_is_fn(h) && query_helper_call_hoists(e, tbl, h)
@@ -17905,7 +18058,7 @@ static int64_t query_count_running_all(ray_t* e, ray_t* tbl, bool grouped, int d
 /* Could `e` hold a running call, before its helpers are inlined?  A call of
  * a helper may hide one in its body. */
 static bool query_may_run(ray_t* e, ray_t* tbl, int depth) {
-    int k = depth > 32 ? -1 : query_running_call_kind(e, tbl, false);
+    int k = depth > 32 ? -1 : rw_if_kind(e, tbl) ? 0 : query_running_call_kind(e, tbl, false);
     if (k > 0) return true;
     if (k < 0) return false;
     ray_t** es = (ray_t**)ray_data(e);
@@ -23655,9 +23808,12 @@ by_dict_done:
                     n_agg_out++;
                 } else {
                     /* an aggregate, or a helper call whose code reads the
-                     * group (query_expr_calls_group_helper): per group */
+                     * group (query_expr_calls_group_helper), or an `if` under
+                     * a whole-column verb (`(distinct (if ...))`, which the
+                     * per-group pass reads off the if's column): per group */
                     if (is_agg_expr(val_expr_item) ||
-                        query_expr_calls_group_helper(val_expr_item, eval_tbl)) {
+                        query_expr_calls_group_helper(val_expr_item, eval_tbl) ||
+                        (rw_has_if(val_expr_item, eval_tbl, 0) && !expr_reads_own_row(val_expr_item, eval_tbl))) {
                         ray_t* per_group = nonagg_eval_per_group(
                             val_expr_item, eval_tbl, groups, n_groups);
                         if (RAY_IS_ERR(per_group)) {
@@ -27209,7 +27365,8 @@ by_dict_done:
                      * scalar across all groups. */
                     if (is_agg_expr(nonagg_exprs[ni]) ||
                         expr_contains_agg(nonagg_exprs[ni]) ||
-                        query_expr_calls_group_helper(nonagg_exprs[ni], tbl)) {
+                        query_expr_calls_group_helper(nonagg_exprs[ni], tbl) ||
+                        (rw_has_if(nonagg_exprs[ni], tbl, 0) && !expr_reads_own_row(nonagg_exprs[ni], tbl))) {
                         ray_t* per_group = nonagg_eval_per_group_buf(
                             nonagg_exprs[ni], tbl, idx_buf, offsets, grp_cnt, n_groups);
                         if (RAY_IS_ERR(per_group)) {
