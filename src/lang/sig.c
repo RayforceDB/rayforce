@@ -35,9 +35,9 @@
  *
  * A builtin that runs other code (eval, try, load, the binding forms) is in
  * own_sigs below, not here: an error from the code it runs is not its own. */
-typedef struct { const char* name; const char* usage; } sig_t;
+typedef struct { const char* name; const char* usage; } ray_sig_entry_t;
 
-static const sig_t sigs[] = {
+static const ray_sig_entry_t sigs[] = {
     /* arithmetic and comparison */
     {"+", "(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"},
     {"-", "(- <left: num, date, time, timestamp or timespan> <right: the same kinds>)"},
@@ -231,7 +231,7 @@ static const sig_t sigs[] = {
  * variable argument list.  An error that passes through them from the code
  * they run is not theirs, so their usage line is added only to a message
  * that starts with their own name (see own_message). */
-static const sig_t own_sigs[] = {
+static const ray_sig_entry_t own_sigs[] = {
     {"map", "(map <fn: fn> <x: vector or list>) or (map <fn: fn> <val: any> <x: vector or list>)"},
     {"pmap", "(pmap <fn: fn> <x: vector or list>) or (pmap <fn: fn> <val: any> <x: vector or list>)"},
     {"map-left", "(map-left <fn: fn> <left: any> <right: any>)"},
@@ -339,8 +339,8 @@ static bool name_matches(const char* entry, const char* name) {
 
 /* The entry of `name`, in either table; NULL when there is none or the name is
  * ambiguous.  `*own` tells which table it came from. */
-static const sig_t* find_entry(const char* name, bool* own) {
-    const sig_t* hit = NULL;
+static const ray_sig_entry_t* find_entry(const char* name, bool* own) {
+    const ray_sig_entry_t* hit = NULL;
     int found = 0;
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
         if (name_matches(sigs[i].name, name)) {
@@ -357,7 +357,7 @@ static const sig_t* find_entry(const char* name, bool* own) {
 
 const char* ray_sig_usage(const char* name) {
     bool own;
-    const sig_t* e = name ? find_entry(name, &own) : NULL;
+    const ray_sig_entry_t* e = name ? find_entry(name, &own) : NULL;
     return e ? e->usage : NULL;
 }
 
@@ -411,7 +411,7 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
         strcmp(code, "rank") && strcmp(code, "arity") && !domain)
         return result;
     bool own;
-    const sig_t* e = find_entry(name, &own);
+    const ray_sig_entry_t* e = find_entry(name, &own);
     if (!e) return result;
     const char* old = ray_error_msg();
     /* Only the own-message table needs the guard. */
@@ -435,7 +435,7 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
 
 ray_t* ray_sig_arity(const char* name, const char* want, int got) {
     bool own;
-    const sig_t* e = find_entry(name, &own);
+    const ray_sig_entry_t* e = find_entry(name, &own);
     const char* shown = e ? e->name : name;
     return ray_error("arity", "%s: takes %s argument%s, got %d%s%s", shown, want,
                      strcmp(want, "1") ? "s" : "", got,
