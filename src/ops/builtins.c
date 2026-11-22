@@ -3241,11 +3241,14 @@ static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
 }
 
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
- * unique group (one slot per gi), recomputed on grow via ray_key_hash. */
-typedef struct { ray_t** gkeys; int spans; } ght_list_ctx_t;
+ * unique group (one slot per gi), hashed the same way on insert and grow. */
+typedef struct { ray_t** gkeys; int spans; bool exact_i64; } ght_list_ctx_t;
+static uint64_t ght_list_hash(ray_t* key, const ght_list_ctx_t* c) {
+    return c->exact_i64 ? ray_hash_i64(key->i64) : ray_key_hash(key, c->spans);
+}
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return ray_key_hash(c->gkeys[gi], c->spans);
+    return ght_list_hash(c->gkeys[gi], c);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -3349,11 +3352,18 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         }
         /* atom_eq groups, so ray_key_hash: ray_atom_hash put every vector
          * cell of one type and length in one bucket. */
-        ght_list_ctx_t lctx = { .gkeys = gkeys, .spans = ray_key_spans(x) };
+        /* Only a homogeneous atom list permits exact I64 hashing: mixed
+         * numeric keys must retain their shared equality-compatible hash. */
+        bool exact_i64 = true;
+        for (int64_t i = 0; i < n; i++) {
+            if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
+        }
+        ght_list_ctx_t lctx = { .gkeys = gkeys,
+            .spans = exact_i64 ? 0 : ray_key_spans(x), .exact_i64 = exact_i64 };
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = ray_key_hash(elem, lctx.spans);
+            uint64_t h = ght_list_hash(elem, &lctx);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {
