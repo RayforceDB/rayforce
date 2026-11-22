@@ -250,8 +250,9 @@ ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool
 ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out);
 /* Whether row `row` of the STR column `e` holds s[0..l), reading that cell
  * where the file says it is (no vector decode; the file is trusted, as by
- * dec_str; only `row` is checked, against the column's length).  NULL with
- * *eq set, or an owned error. */
+ * dec_str; `row` is checked against the column's and its vector's length,
+ * and a dictionary or FSST table that fails to load is an error).  NULL
+ * with *eq set, or an owned error. */
 ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq);
 uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width */
 
