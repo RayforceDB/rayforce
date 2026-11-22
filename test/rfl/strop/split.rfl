@@ -96,3 +96,12 @@
 (de (ser seg)) -- ["b" "cccccccccccccccccccccc"]
 (de (ser (first (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc"]) [0 1])))) -- ["aaaaaaaaaaaaaaaaaaaaaaaa"]
 (de (ser (at (split [1 0Nl 3 4] [0 2]) 0))) -- [1 0Nl]
+
+;; saving a table whose LIST column holds string segments: the writer read the slice's
+;; offset as the pool pointer, and wrote its SLICE bit into the file
+(set src ["aaaaaaaaaaaaaaaaaaaaaa" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "cccccccccccccccccccccc"])
+(set T (table [k v] (list [1 2] (split src [0 1]))))
+(.db.splayed.set "/tmp/rfl_split_save/t/" T)
+(set U (.db.splayed.get "/tmp/rfl_split_save/t/"))
+(at U 'v) -- (list ["aaaaaaaaaaaaaaaaaaaaaa"] ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "cccccccccccccccccccccc"])
+(.sys.exec "rm -rf /tmp/rfl_split_save") -- 0
