@@ -1081,7 +1081,9 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
         out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
-        out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
+        /* An F64 base reads bias_f64; the int copy must not be a raw cast
+         * of an out-of-range or non-finite bias (#1343). */
+        out_affine->bias_i64 = ray_cast_f64_to_i64_null(out_affine->bias_f64);
         *out_vec = base_vec;
         return true;
     }

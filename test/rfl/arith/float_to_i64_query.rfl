@@ -12,7 +12,8 @@
 (at (select {from: U r: (as 'I64 y)}) 'r) -- (as 'I64 Y)
 (at (select {from: T r: (signum x)}) 'r) -- (signum X)
 (at (select {from: U r: (signum y)}) 'r) -- (signum Y)
-;; every integer width: the narrow casts pass through the I64 conversion
+;; every integer width (the narrow casts take their own null-aware arms:
+;; regression coverage beside the I64 case)
 (set N32 (as 'F32 [7.5 0Nf 1024.0 0.0 -2.5]))
 (set N64 [7.5 0Nf 1024.0 0.0 -2.5])
 (set T32 (table [a] (list N32)))
@@ -27,3 +28,14 @@
 (at (select {r: (as 'I16 a) from: T64}) 'r) -- (as 'I16 N64)
 (at (select {r: (as 'I32 a) from: T64}) 'r) -- (as 'I32 N64)
 (at (update {r: (as 'I16 a) from: T32}) 'r) -- (as 'I16 N32)
+;; the other float -> int64 conversions a query makes: the affine sum/avg
+;; fold's bias, a constant fold of an out-of-range float literal, and the
+;; fused sum/avg of a product that overflows to inf
+(set FN [7.9 -7.9 1.5 1e300 -1e300 0.0 2.5])
+(set TN (table [f] (list FN)))
+(at (select {from: TN r: (sum (+ f 1e300))}) 'r) -- (enlist (sum (+ FN 1e300)))
+(at (select {from: TN r: (avg (- f 1e300))}) 'r) -- (enlist (avg (- FN 1e300)))
+(at (select {from: TN r: (+ f (* 1e300 2.0))}) 'r) -- (+ FN (* 1e300 2.0))
+(at (select {from: TN r: (+ f (neg 1e300))}) 'r) -- (+ FN (neg 1e300))
+(count (select {from: TN r: (sum (* f f))})) -- 1
+(count (select {from: (table [a b] (list [1e200 2.0] [1e200 3.0])) r: (sum (* a b))})) -- 1

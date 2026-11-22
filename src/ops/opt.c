@@ -31,6 +31,7 @@
 #include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
 #include "mem/heap.h"
+#include "core/types.h"   /* ray_cast_f64_to_i64_null */
 #include <float.h>
 #include <math.h>
 #include <string.h>
@@ -301,12 +302,12 @@ static bool atom_to_numeric(ray_t* v, double* out_f, int64_t* out_i, bool* is_f6
     switch (v->type) {
         case -RAY_F64:
             *out_f = v->f64;
-            *out_i = (int64_t)v->f64;
+            *out_i = ray_cast_f64_to_i64_null(v->f64);   /* not a raw cast (#1343) */
             *is_f64 = true;
             return true;
         case -RAY_F32:
             *out_f = (double)(float)v->f64;
-            *out_i = (int64_t)(float)v->f64;
+            *out_i = ray_cast_f64_to_i64_null((double)(float)v->f64);
             *is_f64 = true;
             return true;
         case -RAY_I64:
