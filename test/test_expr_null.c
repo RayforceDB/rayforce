@@ -183,7 +183,7 @@ static test_result_t test_expr_bail_counter_nulls(void) {
     PASS();
 }
 
-static test_result_t test_nullfree_stream_unchanged(void) {
+static test_result_t test_nullfree_i64_producer(void) {
     ray_heap_init(); (void)ray_sym_init();
     int64_t vals[] = {1, 2, 3, 4, 5, 6, 7, 8};
     ray_t* col = ray_vec_from_raw(RAY_I64, vals, 8);
@@ -197,10 +197,11 @@ static test_result_t test_nullfree_stream_unchanged(void) {
                           ray_const_i64(g, 2));
     ray_expr_t ex;
     TEST_ASSERT(expr_compile(g, tbl, e, &ex, &(ray_t*){NULL}), "null-free compiles");
-    for (uint8_t i = 0; i < ex.n_ins; i++)
-        TEST_ASSERT(ex.ins[i].null_aware == 0, "no null_aware on null-free");
-    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
-        TEST_ASSERT(!ex.regs[r2].nullable, "no nullable regs on null-free");
+    TEST_ASSERT(ex.n_ins == 2, "ADD then MUL");
+    TEST_ASSERT(!ex.ins[0].null_aware, "ADD has null-free inputs");
+    TEST_ASSERT(ex.regs[ex.ins[0].dst].nullable, "ADD can generate the sentinel");
+    TEST_ASSERT(ex.ins[1].null_aware, "MUL must propagate a generated null");
+    TEST_ASSERT(!ex.regs[ex.ins[1].dst].null_src, "no nullable source column");
 
     ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
@@ -1944,7 +1945,7 @@ const test_entry_t expr_null_entries[] = {
     { "expr_null/sym_ordered_partitions", test_sym_ordered_partitions, NULL, NULL },
     { "expr_null/sym_ordered_domains_widths", test_sym_ordered_domains_widths, NULL, NULL },
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
-    { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
+    { "expr_null/nullfree_i64_producer",     test_nullfree_i64_producer,        NULL, NULL },
     { "expr_null/diff_i64_add",            test_diff_i64_add_nullable_prelanding, NULL, NULL },
     { "expr_null/diff_f64_chain",          test_diff_f64_chain_nullable,          NULL, NULL },
     { "expr_null/diff_i64_promoted",       test_diff_i64_promoted_nullable,       NULL, NULL },

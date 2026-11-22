@@ -5686,6 +5686,8 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
     }
     scratch_free(summary_hdr);
     scratch_free(carry_hdr);
+    /* A running sum can produce a null sentinel even from null-free input. */
+    if (opcode == OP_SUMS && out_type == RAY_I64) par_finalize_nulls(out);
     /* the running mean of durations is a duration */
     if (opcode == OP_AVGS && x->type == RAY_TIMESPAN) return ray_timespan_of_f64_vec(out);
     return out;

@@ -38,3 +38,17 @@
 (+ 100h 200h) -- 300h
 (+ 5i 6i) -- 11i
 (+ 2.5 3.5) -- 6.0
+
+;; A generated I64 null has to be visible to whole-vector consumers, not
+;; just to indexing the sentinel. Exercise both broadcasts and vec/vec.
+(sum (nil? (+ [0 9223372036854775807] 1))) -- 1
+(sum (nil? (+ 1 [0 9223372036854775807]))) -- 1
+(sum (nil? (+ [1 9223372036854775807] [3 1]))) -- 1
+(sum (nil? (- [1 -9223372036854775807] 1))) -- 1
+(sum (nil? (- -1 [0 9223372036854775807]))) -- 1
+(sum (nil? (- [1 -9223372036854775807] [2 1]))) -- 1
+(sum (nil? (* [1 4611686018427387904] 2))) -- 1
+(sum (nil? (* 2 [1 4611686018427387904]))) -- 1
+(sum (nil? (* [1 4611686018427387904] [3 2]))) -- 1
+;; Other overflows still wrap to ordinary values.
+(* [1 9223372036854775807] 2) -- [2 -2]
