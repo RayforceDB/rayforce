@@ -4733,10 +4733,12 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             for (int64_t j = 0; j < vlen; j++) {
                 int alloc = 0;
                 ray_t* ve = collection_elem(val, j, &alloc);
-                if (ve && !ray_is_atom(ve)) {
+                if (ve && !ray_is_atom(ve) && (vec->type == RAY_LIST || ray_is_vec(vec))) {
                     /* A vector or list cell is one value to look up, not a
                      * set of needles: the first haystack cell atom_eq calls
-                     * equal, which only a LIST haystack can hold (#1374). */
+                     * equal, which only a LIST haystack can hold (#1374).  Any
+                     * other haystack (table, dict, atom) takes the per-cell
+                     * find below, which raises its type error. */
                     int64_t pos = NULL_I64;
                     if (vec->type == RAY_LIST) {
                         ray_t** cells = (ray_t**)ray_data(vec);
