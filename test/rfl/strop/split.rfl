@@ -89,3 +89,10 @@
 (map nil? (first (split [1 0Nl 3 4] [0 2]))) -- [false true]
 (split [1.5 0Nf 3.5] [0 1]) -- (list [1.5] [0Nf 3.5])
 (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc" "d"]) [0 2]) -- (list ["aaaaaaaaaaaaaaaaaaaaaaaa" "b"] ["cccccccccccccccccccccc" "d"])
+
+;; a segment is a slice, which has no pool of its own: serialising one (every IPC reply
+;; does) read the slice offset as the pool pointer and crashed
+(set seg (at (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc"]) [0 1]) 1))
+(de (ser seg)) -- ["b" "cccccccccccccccccccccc"]
+(de (ser (first (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc"]) [0 1])))) -- ["aaaaaaaaaaaaaaaaaaaaaaaa"]
+(de (ser (at (split [1 0Nl 3 4] [0 2]) 0))) -- [1 0Nl]
