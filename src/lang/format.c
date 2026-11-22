@@ -265,7 +265,10 @@ void ray_fmt_set_width(int cols) {
 const char* ray_type_name(int8_t type) {
     /* A parted column wraps a vector type (a column of a table read with
      * .db.parted.get); its partition key is a virtual MAPCOMMON column.  The
-     * names rotate through a few buffers so that one message can hold several. */
+     * names rotate through four buffers so that one message can hold several: a
+     * message names at most two types, and the buffer is read before the next
+     * ray_type_name of the same thread comes four calls later.  A caller that keeps
+     * the pointer past its own printf has to copy it. */
     if (type >= RAY_PARTED_BASE && type < RAY_MAPCOMMON) {
         static _Thread_local char ring[4][24];
         static _Thread_local unsigned next;

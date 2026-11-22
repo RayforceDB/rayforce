@@ -14,7 +14,11 @@
 
 (count PT) -- 6
 (at (try (union-all PT PT) (fn [e] e)) 'code) -- 'type
-(first (split (at (try (union-all PT PT) (fn [e] e)) 'msg) "; usage:")) -- "concat: MAPCOMMON is a parted column and cannot be concatenated; read the table into memory first"
+(first (split (at (try (union-all PT PT) (fn [e] e)) 'msg) "; usage:")) -- "union-all: a parted table cannot be concatenated as it is; read it into memory first, (table (key t) (map (fn [c] (at t c)) (key t)))"
+
+;; the recipe the message gives works, and the copy can be concatenated
+(set MT (table (key PT) (map (fn [c] (at PT c)) (key PT))))
+(count (union-all MT MT)) -- 12
 
 ;; the same operations on the table read into memory still work
 (count (union-all Tp Tp)) -- 6

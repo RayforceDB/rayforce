@@ -2150,11 +2150,26 @@ ray_t* ray_row_fn(ray_t* tbl, ray_t* idx) {
  * ══════════════════════════════════════════ */
 
 /* (union-all t1 t2) — concatenate two tables row-wise (same schema) */
+/* A table read with .db.parted.get keeps one segment per partition in each column and
+ * has a virtual partition column: none of them can be concatenated as vectors. */
+static bool table_is_parted(ray_t* t) {
+    int64_t n = ray_table_ncols(t);
+    for (int64_t c = 0; c < n; c++) {
+        ray_t* col = ray_table_col_idx(t, c);
+        if (col && !RAY_IS_ERR(col) && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
     if (t1->type != RAY_TABLE)
         return ray_error("type", "union-all: first arg must be a table, got %s", ray_type_name(t1->type));
     if (t2->type != RAY_TABLE)
         return ray_error("type", "union-all: second arg must be a table, got %s", ray_type_name(t2->type));
+    if (table_is_parted(t1) || table_is_parted(t2))
+        return ray_error("type", "union-all: a parted table cannot be concatenated as it is; read it into memory first, "
+                                 "(table (key t) (map (fn [c] (at t c)) (key t)))");
 
     int64_t ncols = ray_table_ncols(t1);
     if (ncols != ray_table_ncols(t2))
