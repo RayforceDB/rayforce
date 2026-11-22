@@ -594,7 +594,14 @@ ray_t* ray_exit_fn(ray_t* arg) {
     return ray_error("restricted", "exit disabled under fuzzing");
 #else
     int code = 0;
-    if (arg && is_numeric(arg)) code = (int)as_i64(arg);
+    if (arg && (!ray_is_atom(arg) ||
+                (arg->type != -RAY_I64 && arg->type != -RAY_I32 &&
+                 arg->type != -RAY_I16 && arg->type != -RAY_U8)))
+        /* as_i64 of a float is its bit pattern: the status of the process was whatever
+         * the low bits of the double happened to be */
+        return ray_error("type", "exit: the status must be an integer atom, got %s",
+                         ray_type_name(arg->type));
+    if (arg) code = (int)as_i64(arg);
     exit(code);
     return NULL; /* unreachable */
 #endif
