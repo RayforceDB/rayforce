@@ -24,8 +24,9 @@
 (== (% (as 'TIMESPAN -10) 3.0) 2.0) -- true
 (== (% (as 'TIMESPAN 10) -3.0) -2.0) -- true
 (== (% (as 'TIMESPAN -10) -3.0) -1.0) -- true
-;; F32 divisor
-(== (% (as 'TIMESPAN 10) 3.0e) 1.0) -- true
+;; a non-whole F64 divisor
+(== (% (as 'TIMESPAN 10) 3.5) 3.0) -- true
+(== (% (as 'TIMESPAN -10) 3.5) 0.5) -- true
 ;; zero divisor and nulls stay null
 (nil? (% (as 'TIMESPAN 5) 0.0)) -- true
 (nil? (% (as 'TIMESPAN 0Nl) 7.0)) -- true
