@@ -26,6 +26,16 @@
 ;; outside a query the call is positional, as documented
 (first [0Nd 2024.01.03])                                         -- 0Nd
 (last [2024.01.03 0Nd])                                          -- 0Nd
+;; a literal or global vector argument of the table's length beside a
+;; declined output skips nulls too, as under by: (it is not column-free)
+(at (select {from: N s: (first [0Nd 2024.01.01 0Nd 2024.01.02]) z: (first (+ e 0))}) 's)  -- [2024.01.01]
+(at (select {from: N s: (last [0Nd 2024.01.01 2024.01.02 0Nd]) z: (first (+ e 0))}) 's)   -- [2024.01.02]
+;; a computed argument that reads no column stays positional, on every route
+(set X [0Nd 2024.01.07 2024.01.08 0Nd 2024.01.09])
+(at (select {from: N s: (first (take X 4)) z: (first (+ e 0))}) 's)   -- [0Nd]
+(at (select {from: N s: (last (take X 4)) z: (first (+ e 0))}) 's)    -- [0Nd]
+(at (select {from: N s: (first (take X 4))}) 's)                      -- [0Nd]
+(at (select {from: N by: k s: (first (take X 4))}) 's)                -- [0Nd]
 
 ;; ── every typed vector, beside a declined output ────────────────────────────
 ;; z declines, so the whole select goes to the evaluator: each plain column
