@@ -391,22 +391,20 @@
 (at (at Pmk2 'q) 3) -- 80
 
 ;; ══════════════════════════════════════════════════════════════════
-;; Section 20: pivot — "col%ld" fallback column naming (L498-500)
-;;             When pivot column values have a type that doesn't match
-;;             SYM/I64/F64/BOOL, the fallback formats "col%ld".
-;;             U8 pivot values in the generic fallback (lambda agg).
+;; Section 20: pivot — U8 pivot values on the generic route (lambda agg)
+;;             are named as (format "%" v) gives them: 0x01 0x02 (#1397;
+;;             they were "col1" / "col2").
 ;; ══════════════════════════════════════════════════════════════════
 
 (set Tu8fb (table [k c v] (list ['A 'A 'B 'B] [0x01 0x02 0x01 0x02] [10 20 30 40])))
 (set Pu8fb (pivot Tu8fb 'k 'c 'v (fn [xs] (sum xs))))
 (count Pu8fb) -- 2
 (count (key Pu8fb)) -- 3
-;; U8 pivot values hit the "col%ld" fallback → column names "col1" / "col2".
 ;; Value-check the scattered cells to prove the scatter, not just shape.
-(at (at Pu8fb 'col1) 0) -- 10
-(at (at Pu8fb 'col2) 0) -- 20
-(at (at Pu8fb 'col1) 1) -- 30
-(at (at Pu8fb 'col2) 1) -- 40
+(at (at Pu8fb '0x01) 0) -- 10
+(at (at Pu8fb '0x02) 0) -- 20
+(at (at Pu8fb '0x01) 1) -- 30
+(at (at Pu8fb '0x02) 1) -- 40
 
 ;; ══════════════════════════════════════════════════════════════════
 ;; Section 21: modify — fn that returns error (call_fn1 RAY_IS_ERR)

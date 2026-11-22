@@ -82,6 +82,9 @@ static ray_t* pivot_normalize_f64_key(ray_t* tbl, int64_t pcol_name) {
     norm->len = nr;
     double* dst = (double*)ray_data(norm);
     for (int64_t i = 0; i < nr; i++) dst[i] = clear_neg_zero(src[i]);
+    /* keep the null flag: without it the group took each NaN null for a
+     * value of its own (#1397) */
+    if (ray_vec_may_have_nulls(pcol)) norm->attrs |= RAY_ATTR_HAS_NULLS;
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* wt = ray_table_new(ncols);
     if (!wt || RAY_IS_ERR(wt)) { ray_release(norm); return wt ? wt : ray_error("oom", NULL); }
@@ -200,6 +203,251 @@ static uint64_t fb_wide_hash(ray_t* c, int64_t r, int spans) {
     size_t n = 0;
     const char* s = ray_str_vec_get(c, r, &n);
     return n ? ray_hash_bytes(s, n) : 0;
+}
+
+/* A pivot value's first source row, for the generic route's column order. */
+typedef struct { int64_t row, p; } pv_order_t;
+static int pv_order_cmp(const void* a, const void* b) {
+    int64_t x = ((const pv_order_t*)a)->row, y = ((const pv_order_t*)b)->row;
+    return (x > y) - (x < y);
+}
+
+/* Open-addressed set of name ids for pivot_col_names (a zero flag is an
+ * empty slot): PCN_BASE marks a value column's own text, PCN_TWICE one two
+ * values share, PCN_TAKEN a name some column already holds. */
+#define PCN_BASE  1
+#define PCN_TAKEN 2
+#define PCN_TWICE 4
+static uint8_t* pcn_slot(int64_t* keys, uint8_t* fl, uint64_t mask, int64_t id) {
+    uint64_t h = ray_hash_i64(id) & mask;
+    while (fl[h] && keys[h] != id) h = (h + 1) & mask;
+    keys[h] = id;
+    return &fl[h];
+}
+
+/* The names of pivot's value columns, the same code on both routes.
+ * Column j holds the pivot value at source row rows[j] of `pcol`; `tbl` is
+ * the result so far (its index columns).  An I64 vector of name ids, or an
+ * error.
+ *  - A value is named what (format "%" v) gives (ray_fmt_pct): dates and
+ *    times as such, every integer width in decimal, U8 as 0x.., BOOL as
+ *    true/false, F64 as %g, F32 with its e, a null as its literal (0Nl,
+ *    0Nd, ...), the null symbol as '.
+ *  - F64/F32 values whose texts coincide (%g keeps 6 digits) take their
+ *    shortest round-trip text, as repr writes it.
+ *  - A name an index column or an earlier value column already holds takes
+ *    the smallest suffix _1, _2, ... that no column's name has. */
+ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl) {
+    ray_t* vals = gather_by_idx(pcol, rows, n);
+    if (!vals || RAY_IS_ERR(vals)) return vals ? vals : ray_error("oom", NULL);
+    int64_t ni = ray_table_ncols(tbl);
+    ray_t* out = ray_vec_new(RAY_I64, n);
+    if (!out || RAY_IS_ERR(out)) { ray_release(vals); return out ? out : ray_error("oom", NULL); }
+    out->len = n;
+    int64_t* ids = (int64_t*)ray_data(out);
+    uint64_t cap = 16;
+    while (cap < 4 * (uint64_t)(n + ni)) cap <<= 1;
+    ray_t* set_hdr = NULL;
+    int64_t* keys = (int64_t*)scratch_alloc(&set_hdr, (size_t)cap * (sizeof(int64_t) + 1));
+    if (!keys) { ray_release(vals); ray_release(out); return ray_error("oom", NULL); }
+    uint8_t* fl = (uint8_t*)(keys + cap);
+    uint64_t mask = cap - 1;
+    ray_t* err = NULL;
+    bool fp = vals->type == RAY_F64 || vals->type == RAY_F32;
+
+    for (int64_t j = 0; j < n && !err; j++) {
+        int al = 0;
+        ray_t* a = collection_elem(vals, j, &al);
+        char buf[64];
+        const char* t; size_t tl = 0;
+        ray_t* own = ray_fmt_pct(a, buf, sizeof buf, &t, &tl);
+        if (own && RAY_IS_ERR(own)) err = own;
+        else {
+            ids[j] = ray_sym_intern(t, tl);
+            if (ids[j] < 0) err = ray_error("oom", NULL);
+            if (own) ray_release(own);
+        }
+        if (al) ray_release(a);
+    }
+
+    /* floats that read alike: their round-trip digits tell them apart */
+    if (fp && !err) {
+        memset(fl, 0, (size_t)cap);
+        for (int64_t j = 0; j < n; j++) {
+            uint8_t* f = pcn_slot(keys, fl, mask, ids[j]);
+            *f |= (*f & PCN_BASE) ? PCN_TWICE : PCN_BASE;
+        }
+        for (int64_t j = 0; j < n && !err; j++) {
+            if (!(*pcn_slot(keys, fl, mask, ids[j]) & PCN_TWICE) || ray_vec_is_null(vals, j)) continue;
+            int al = 0;
+            ray_t* a = collection_elem(vals, j, &al);
+            ray_t* s = ray_fmt(a, RAY_FMT_ROUNDTRIP);
+            if (al) ray_release(a);
+            if (s && !RAY_IS_ERR(s)) {
+                int64_t id = ray_sym_intern(ray_str_ptr(s), ray_str_len(s));
+                if (id >= 0) ids[j] = id; else err = ray_error("oom", NULL);
+            }
+            if (s) ray_release(s);              /* non-finite: keep its text */
+        }
+    }
+
+    /* unique: index names and earlier columns keep theirs */
+    if (!err) {
+        memset(fl, 0, (size_t)cap);
+        for (int64_t j = 0; j < n; j++) *pcn_slot(keys, fl, mask, ids[j]) |= PCN_BASE;
+        for (int64_t c = 0; c < ni; c++) *pcn_slot(keys, fl, mask, ray_table_col_name(tbl, c)) |= PCN_TAKEN;
+        for (int64_t j = 0; j < n && !err; j++) {
+            uint8_t* f = pcn_slot(keys, fl, mask, ids[j]);
+            if (!(*f & PCN_TAKEN)) { *f |= PCN_TAKEN; continue; }
+            ray_t* bs = ray_sym_str(ids[j]);
+            if (!bs) { err = ray_error("oom", NULL); break; }
+            size_t bl = ray_str_len(bs);
+            ray_t* nb_hdr = NULL;
+            char* nb = (char*)scratch_alloc(&nb_hdr, bl + 24);
+            if (!nb) { ray_release(bs); err = ray_error("oom", NULL); break; }
+            memcpy(nb, ray_str_ptr(bs), bl);
+            ray_release(bs);
+            for (int64_t k = 1;; k++) {
+                int sl = snprintf(nb + bl, 24, "_%" PRId64, k);
+                int64_t id = ray_sym_intern(nb, bl + (size_t)sl);
+                if (id < 0) { err = ray_error("oom", NULL); break; }
+                uint8_t* g = pcn_slot(keys, fl, mask, id);
+                if (*g) continue;
+                *g = PCN_TAKEN;
+                ids[j] = id;
+                break;
+            }
+            scratch_free(nb_hdr);
+        }
+    }
+    scratch_free(set_hdr);
+    ray_release(vals);
+    if (err) { ray_release(out); return err; }
+    return out;
+}
+
+/* The generic route's pivot value number per group of `g_pcol` (the
+ * grouped table's pivot column), in group order: an I64 vector of n_grps,
+ * *n_pv the count.  Equal cells share a number as atom_eq compares them,
+ * hashed as FB_CELL_HASH does (every null alike).  NULL on oom. */
+static __attribute__((noinline)) ray_t* pivot_fb_number_values(ray_t* g_pcol, int64_t n_grps, int64_t* n_pv) {
+    ray_t* out = ray_vec_new(RAY_I64, n_grps);
+    if (!out || RAY_IS_ERR(out)) return out;
+    out->len = n_grps;
+    int64_t* num = (int64_t*)ray_data(out);
+    uint64_t cap = 16;
+    while (cap < 2 * (uint64_t)n_grps) cap <<= 1;
+    ray_t* ht_hdr = NULL;
+    int64_t* ht = (int64_t*)scratch_alloc(&ht_hdr, (size_t)cap * sizeof(int64_t));
+    if (!ht) { ray_release(out); return NULL; }
+    memset(ht, 0xFF, (size_t)cap * sizeof(int64_t));
+    uint64_t mask = cap - 1;
+    bool nullable = (g_pcol->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0;
+    int64_t n = 0;
+    for (int64_t gi = 0; gi < n_grps; gi++) {
+        uint64_t h;
+        if (g_pcol->type == RAY_STR || g_pcol->type == RAY_GUID)
+            h = fb_wide_hash(g_pcol, gi, 0);
+        else if (nullable && ray_vec_is_null(g_pcol, gi))
+            h = 0x9E3779B97F4A7C15ULL;
+        else if (g_pcol->type == RAY_F64) {
+            double d = ((const double*)ray_data(g_pcol))[gi];
+            h = d != d ? 0x9E3779B97F4A7C15ULL : ray_hash_f64(d);   /* NaN is the F64 null */
+        } else
+            h = ray_hash_i64(read_col_i64(ray_data(g_pcol), gi, g_pcol->type, g_pcol->attrs));
+        uint64_t slot = h & mask;
+        int a1 = 0;
+        ray_t* v = collection_elem(g_pcol, gi, &a1);
+        num[gi] = -1;
+        while (ht[slot] >= 0) {
+            int a2 = 0;
+            ray_t* w = collection_elem(g_pcol, ht[slot], &a2);
+            bool eq = atom_eq(v, w);
+            if (a2) ray_release(w);
+            if (eq) { num[gi] = num[ht[slot]]; break; }
+            slot = (slot + 1) & mask;
+        }
+        if (a1) ray_release(v);
+        if (num[gi] < 0) { ht[slot] = gi; num[gi] = n++; }
+    }
+    scratch_free(ht_hdr);
+    *n_pv = n;
+    return out;
+}
+
+/* The generic route's index rows in the order of their first source row:
+ * ix_row[r] (a source row of index row r) becomes its first one, the
+ * least gm_row (each group's first source row) of its groups, and the
+ * rows and gm_ix (group -> index row) are renumbered in that order.
+ * Out of line, so the per-row loops of pivot_fn_impl keep their code.
+ * false: out of memory. */
+static __attribute__((noinline)) bool pivot_fb_order_rows(int64_t* ix_row, int64_t n_ix, int64_t* gm_ix,
+                                                          const int64_t* gm_row, int64_t n_grps) {
+    for (int64_t gi = 0; gi < n_grps; gi++)
+        if (gm_row[gi] >= 0 && gm_row[gi] < ix_row[gm_ix[gi]]) ix_row[gm_ix[gi]] = gm_row[gi];
+    ray_t* ord_hdr = NULL;
+    pv_order_t* ord = (pv_order_t*)scratch_alloc(&ord_hdr,
+        (size_t)n_ix * (sizeof(pv_order_t) + sizeof(int64_t)) + 1);
+    if (!ord) return false;
+    int64_t* rank = (int64_t*)(ord + n_ix);
+    for (int64_t r = 0; r < n_ix; r++) { ord[r].row = ix_row[r]; ord[r].p = r; }
+    qsort(ord, (size_t)n_ix, sizeof(pv_order_t), pv_order_cmp);
+    for (int64_t r = 0; r < n_ix; r++) { ix_row[r] = ord[r].row; rank[ord[r].p] = r; }
+    for (int64_t gi = 0; gi < n_grps; gi++) gm_ix[gi] = rank[gm_ix[gi]];
+    scratch_free(ord_hdr);
+    return true;
+}
+
+/* The generic route's value columns, added to `result` (consumed; the
+ * result or an error comes back): one per pivot value p (gm_pv), in the
+ * order of its first source row (gm_row per group), as OP_PIVOT orders
+ * them (distinct would sort numbers), named by pivot_col_names from
+ * that row; cell (r, p) is the result ar[gi] of the group gi at index row
+ * gm_ix[gi].  Out of line, as pivot_fb_order_rows. */
+static __attribute__((noinline)) ray_t* pivot_fb_value_cols(ray_t* result, ray_t* pcol, int64_t n_ix, int64_t n_pv,
+                                  int64_t n_grps, const int64_t* gm_ix, const int64_t* gm_pv,
+                                  const int64_t* gm_row, ray_t** ar) {
+    ray_t* cells_hdr = NULL;
+    ray_t** cells = (ray_t**)scratch_alloc(&cells_hdr,
+        (size_t)n_ix * sizeof(ray_t*) + (size_t)n_pv * 3 * sizeof(int64_t) + 1);
+    if (!cells) { ray_release(result); return ray_error("oom", NULL); }
+    pv_order_t* pord = (pv_order_t*)(cells + n_ix);
+    for (int64_t p = 0; p < n_pv; p++) { pord[p].row = INT64_MAX; pord[p].p = p; }
+    for (int64_t gi = 0; gi < n_grps; gi++) {
+        int64_t p = gm_pv[gi];
+        if (p >= 0 && gm_row[gi] >= 0 && gm_row[gi] < pord[p].row) pord[p].row = gm_row[gi];
+    }
+    qsort(pord, (size_t)n_pv, sizeof(pv_order_t), pv_order_cmp);
+    int64_t* prow = (int64_t*)(pord + n_pv);
+    for (int64_t q = 0; q < n_pv; q++) {
+        if (pord[q].row == INT64_MAX) {
+            scratch_free(cells_hdr); ray_release(result);
+            return ray_error("domain", "pivot: pivot value without a source row");
+        }
+        prow[q] = pord[q].row;
+    }
+    ray_t* names = pivot_col_names(pcol, prow, n_pv, result);
+    if (!names || RAY_IS_ERR(names)) {
+        scratch_free(cells_hdr); ray_release(result);
+        return names ? names : ray_error("oom", NULL);
+    }
+    for (int64_t q = 0; q < n_pv; q++) {
+        int64_t p = pord[q].p;
+        memset(cells, 0, (size_t)n_ix * sizeof(ray_t*));
+        for (int64_t gi = 0; gi < n_grps; gi++)
+            if (gm_pv[gi] == p) cells[gm_ix[gi]] = ar[gi];
+        ray_t* agg_vec = pivot_cells_col(cells, n_ix);
+        if (!agg_vec || RAY_IS_ERR(agg_vec)) {
+            ray_release(result); result = agg_vec ? agg_vec : ray_error("oom", NULL);
+            break;
+        }
+        result = ray_table_add_col(result, ((const int64_t*)ray_data(names))[q], agg_vec);
+        ray_release(agg_vec);
+        if (RAY_IS_ERR(result)) break;
+    }
+    ray_release(names);
+    scratch_free(cells_hdr);
+    return result;
 }
 
 /* (pivot table index_col pivot_col value_col agg_fn) — pivot table */
@@ -444,21 +692,15 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         return g_pcol;
     }
 
-    /* Collect distinct pivot values and index keys from grouped table.
-     * ray_distinct_fn returns a lazy for concrete vecs; materialise here
-     * since pivot C-code needs a concrete result to iterate over. */
-    ray_retain(g_pcol);
-    ray_t* dvals = ray_distinct_fn(g_pcol);
-    ray_release(g_pcol);
-    if (RAY_IS_ERR(dvals)) { scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr); return dvals; }
-    if (ray_is_lazy(dvals)) {
-        dvals = ray_lazy_materialize(dvals);
-        if (!dvals || RAY_IS_ERR(dvals)) {
-            scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
-            return dvals ? dvals : ray_error("oom", NULL);
-        }
+    /* Number the pivot values from the groups themselves: dvals[gi] is
+     * group gi's pivot value number (distinct over g_pcol could disagree
+     * with the groups, as when it counted two NaN nulls apart). */
+    int64_t n_pv = 0;
+    ray_t* dvals = pivot_fb_number_values(g_pcol, n_grps, &n_pv);
+    if (!dvals || RAY_IS_ERR(dvals)) {
+        scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
+        return dvals ? dvals : ray_error("oom", NULL);
     }
-    int64_t n_pv = ray_len(dvals);
 
     /* Re-scan original table to assign a grouped-row index to each
      * input row.  Previously this was an O(nrows * n_grps) nested loop
@@ -670,18 +912,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_t* ix_list = ray_list_new(16);
 
     for (int64_t gi = 0; gi < n_grps; gi++) {
-        /* Find pivot index */
-        int a1 = 0;
-        ray_t* pv = collection_elem(g_pcol, gi, &a1);
-        gm_pv[gi] = -1;
-        for (int64_t p = 0; p < n_pv; p++) {
-            int a2 = 0;
-            ray_t* dv = collection_elem(dvals, p, &a2);
-            bool eq = atom_eq(pv, dv);
-            if (a2) ray_release(dv);
-            if (eq) { gm_pv[gi] = p; break; }
-        }
-        if (a1) ray_release(pv);
+        gm_pv[gi] = ((const int64_t*)ray_data(dvals))[gi];
 
         /* Find or insert index key */
         gm_ix[gi] = -1;
@@ -726,6 +957,11 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * index came back boxed or as a type error). */
     for (int64_t r = 0; r < n_ix; r++)
         if (ix_row[r] < 0) { ray_release(result); result = ray_error("domain", "pivot: index row without a source row"); goto fb_cleanup; }
+    /* Index rows in the order of their first source row, as OP_PIVOT gives
+     * them (the group's own order sorts small integer keys). */
+    if (!pivot_fb_order_rows(ix_row, n_ix, gm_ix, gm_row, n_grps)) {
+        ray_release(result); result = ray_error("oom", NULL); goto fb_cleanup;
+    }
     for (int64_t ci = 0; ci < n_idx; ci++) {
         ray_t* col_vec = gather_by_idx(icols[ci], ix_row, n_ix);
         if (!col_vec || RAY_IS_ERR(col_vec)) { ray_release(result); result = col_vec ? col_vec : ray_error("oom", NULL); goto fb_cleanup; }
@@ -744,60 +980,9 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         if (RAY_IS_ERR(result)) goto fb_cleanup;
     }
 
-    /* Value columns */
-    ray_t* cells_hdr = NULL;
-    ray_t** cells = (ray_t**)scratch_alloc(&cells_hdr, (size_t)n_ix * sizeof(ray_t*));
-    if (!cells) { ray_release(result); result = ray_error("oom", NULL); goto fb_cleanup; }
-    for (int64_t p = 0; p < n_pv; p++) {
-        memset(cells, 0, (size_t)n_ix * sizeof(ray_t*));
-        for (int64_t gi = 0; gi < n_grps; gi++)
-            if (gm_pv[gi] == p) cells[gm_ix[gi]] = ar[gi];
-        ray_t* agg_vec = pivot_cells_col(cells, n_ix);
-        if (!agg_vec || RAY_IS_ERR(agg_vec)) {
-            scratch_free(cells_hdr);
-            ray_release(result); result = agg_vec ? agg_vec : ray_error("oom", NULL);
-            goto fb_cleanup;
-        }
-
-        /* Column name */
-        int a1 = 0;
-        ray_t* pval = collection_elem(dvals, p, &a1);
-        int64_t col_sym;
-        if (pval->type == -RAY_SYM) {
-            col_sym = pval->i64;
-        } else if (pval->type == -RAY_I64) {
-            char buf[64]; int len = snprintf(buf, sizeof(buf), "%" PRId64, pval->i64);
-            col_sym = ray_sym_intern(buf, (size_t)len);
-        } else if (pval->type == -RAY_F64 || pval->type == -RAY_F32) {
-            /* an F32 atom holds its value as a double (ray_f32) */
-            double fv = clear_neg_zero(pval->f64);
-            char buf[64]; int len = snprintf(buf, sizeof(buf), "%g", fv);
-            col_sym = ray_sym_intern(buf, (size_t)len);
-        } else if (pval->type == -RAY_GUID) {
-            /* its text, as the DAG route names it, not the payload pointer (#1375) */
-            ray_t* s = ray_fmt(pval, RAY_FMT_COMPACT);
-            if (!s || RAY_IS_ERR(s)) {
-                if (a1) ray_release(pval);
-                scratch_free(cells_hdr);
-                ray_release(agg_vec); ray_release(result);
-                result = s ? s : ray_error("oom", NULL);
-                goto fb_cleanup;
-            }
-            col_sym = ray_sym_intern(ray_str_ptr(s), ray_str_len(s));
-            ray_release(s);
-        } else if (pval->type == -RAY_BOOL) {
-            col_sym = ray_sym_intern(pval->b8 ? "true" : "false", pval->b8 ? 4 : 5);
-        } else {
-            char buf[64]; int len = snprintf(buf, sizeof(buf), "col%" PRId64, pval->i64);
-            col_sym = ray_sym_intern(buf, (size_t)len);
-        }
-        if (a1) ray_release(pval);
-
-        result = ray_table_add_col(result, col_sym, agg_vec);
-        ray_release(agg_vec);
-        if (RAY_IS_ERR(result)) break;
-    }
-    scratch_free(cells_hdr);
+    /* Value columns, in the order of each pivot value's first source row,
+     * as OP_PIVOT orders them, named by pivot_col_names. */
+    result = pivot_fb_value_cols(result, pcol, n_ix, n_pv, n_grps, gm_ix, gm_pv, gm_row, ar);
 
 fb_cleanup:
     ray_free(gmap);

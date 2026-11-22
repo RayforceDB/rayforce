@@ -187,6 +187,8 @@
 ;; a missing cell is the F32 null
 (set Tm (table [g h x] (list [0 0 1] ['a 'b 'a] (as 'F32 [2.5 1.5 -3.5]))))
 (nil? (at (at (pivot Tm 'g 'h 'x max) 'b) 1)) -- true
-;; an F32 pivot column names its columns by value, as an F64 one does
+;; an F32 pivot column names its columns by value, as (format "%" v) writes
+;; an F32: with its e (#1397; an F64 column gives 0.5 1.5)
 (set Tk (table [g h x] (list [0 0 1] (as 'F32 [0.5 1.5 0.5]) [1 2 3])))
-(key (pivot Tk 'g 'h 'x sum)) -- (key (pivot (table [g h x] (list [0 0 1] [0.5 1.5 0.5] [1 2 3])) 'g 'h 'x sum))
+(key (pivot Tk 'g 'h 'x sum)) -- (as 'SYM (list "g" "0.5e" "1.5e"))
+(key (pivot (table [g h x] (list [0 0 1] [0.5 1.5 0.5] [1 2 3])) 'g 'h 'x sum)) -- (as 'SYM (list "g" "0.5" "1.5"))
