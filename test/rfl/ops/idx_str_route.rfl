@@ -55,6 +55,18 @@
 (set HD (table [s i] (list (.idx.hash (take ["k"] 500)) (til 500))))
 (count (at (select {from: HD where: (== s "k") i: i}) 'i)) -- 500
 (count (at (select {from: HD where: (in s ["k" "q"]) i: i}) 'i)) -- 500
+;; a key on more than an eighth of the rows (and 64) is the scan's; a rare
+;; key of the same column is the index's
+(set HR (table [s i] (list (.idx.hash (concat (take ["k"] 500) ["r"])) (til 501))))
+(do (.idx.uses HR) null)
+(count (at (select {from: HR where: (== s "k") i: i}) 'i)) -- 500
+(.idx.uses HR) -- {}
+(count (at (select {from: HR where: (in s ["k"]) i: i}) 'i)) -- 500
+(.idx.uses HR) -- {}
+(at (select {from: HR where: (== s "r") i: i}) 'i) -- [500]
+(at (.idx.uses HR) 's) -- 1
+(at (select {from: HR where: (in s ["r"]) i: i}) 'i) -- [500]
+(at (.idx.uses HR) 's) -- 1
 
 ;; A first-row-only index (a concat repeated a key) is not read for rows:
 ;; the scan finds the repeat
@@ -92,6 +104,40 @@
 (set S2 (.db.splayed.get "/tmp/rfl_idx_str_route/sc/"))
 (at (select {from: S2 where: (== id "e77-x") seq: seq}) 'seq) -- (at (select {from: BT where: (== id "e77-x") seq: seq}) 'seq)
 (at (select {from: S2 where: (in id ["e77-x" "e5-x"]) seq: seq}) 'seq) -- (at (select {from: BT where: (in id ["e77-x" "e5-x"]) seq: seq}) 'seq)
+;; generation 2: the recorded hash is probed where it is mapped, each word
+;; hit confirmed by reading that one cell; the column is never materialized
+(set S3 (.db.splayed.get "/tmp/rfl_idx_str_route/sc/"))
+(do (.idx.uses S3) null)
+(set m0 (at (.sys.mem) 'bytes-allocated))
+(at (select {from: S3 where: (== id "e77-x") seq: seq}) 'seq) -- (at (select {from: BT where: (== id "e77-x") seq: seq}) 'seq)
+(at (.idx.uses S3) 'id) -- 1
+(at (select {from: S3 where: (in id ["e77-x" "e5-x" "nope" "e77-x"]) seq: seq}) 'seq) -- (at (select {from: BT where: (in id ["e77-x" "e5-x"]) seq: seq}) 'seq)
+(at (.idx.uses S3) 'id) -- 1
+(count (at (select {from: S3 where: (== id "nope") seq: seq}) 'seq)) -- 0
+(at (.idx.uses S3) 'id) -- 1
+(< (- (at (.sys.mem) 'bytes-allocated) m0) 1000000) -- true
+;; "" (the null rows the hash leaves out) is the scan's
+(count (at (select {from: S3 where: (== id "") seq: seq}) 'seq)) -- 0
+(.idx.uses S3) -- {}
+;; the other string encodings of a vector: a dictionary of few values, long
+;; strings, nulls among them
+(set lo (as 'STR (map (fn [j] (if (== 0 (% j 97)) "" (format "w%" (% j 1000)))) (til 20000))))
+(set ln (as 'STR (map (fn [j] (format "%-%" j (str-join (take ["abcdefgh"] 40) ""))) (til 3000))))
+(.db.splayed.set "/tmp/rfl_idx_str_route/lo/" (table [id seq] (list (.idx.hash lo) (til 20000))) {compress: true})
+(.db.splayed.set "/tmp/rfl_idx_str_route/ln/" (table [id seq] (list (.idx.hash ln) (til 3000))) {compress: true})
+(set LO (.db.splayed.get "/tmp/rfl_idx_str_route/lo/"))
+(set LN (.db.splayed.get "/tmp/rfl_idx_str_route/ln/"))
+(do (.idx.uses LO) (.idx.uses LN) null)
+(at (select {from: LO where: (== id "w7") seq: seq}) 'seq) -- (where (== lo "w7"))
+(at (.idx.uses LO) 'id) -- 1
+(at (select {from: LO where: (in id ["w7" "w999"]) seq: seq}) 'seq) -- (where (in lo ["w7" "w999"]))
+(at (.idx.uses LO) 'id) -- 1
+(set K (at ln 2999))
+(at (select {from: LN where: (== id K) seq: seq}) 'seq) -- [2999]
+(at (.idx.uses LN) 'id) -- 1
+(set KX (concat K "x"))
+(count (at (select {from: LN where: (== id KX) seq: seq}) 'seq)) -- 0
+(at (.idx.uses LN) 'id) -- 1
 (.db.splayed.set "/tmp/rfl_idx_str_route/p/1/t/" (take BH 1000))
 (.db.splayed.set "/tmp/rfl_idx_str_route/p/2/t/" (take BH -1000))
 (set P (.db.parted.get "/tmp/rfl_idx_str_route/p/" 't))
