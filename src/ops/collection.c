@@ -1863,8 +1863,9 @@ static bool span_vec_hash(ray_t* x, uint64_t* out) {
 }
 
 /* `seen`, when given, is set when x holds a TIMESPAN (ray_key_spans != 0)
- * found as the hash walks it, so a caller hashing with spans 0 learns
- * that it should not have, without a second pass. */
+ * or an I64 atom past 2^53, found as the hash walks it, so a caller hashing
+ * with spans 0, or in parallel, learns that it should not have, without a
+ * second pass. */
 static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
     if (!x) return 0;
@@ -1872,7 +1873,16 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         if (seen && x->type == -RAY_TIMESPAN) *seen = true;
         return 0;
     }
-    if (is_numeric(x)) return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
+    if (is_numeric(x)) {
+        /* Past 2^53 an I64 and an F64 compare through double, so atom_eq is
+         * not transitive there (2^53+1 = 2^53.0 = 2^53, but 2^53+1 != 2^53):
+         * only the row-order scan gives `group`'s answer, so report it
+         * through `seen` as a TIMESPAN is (#1330). */
+        if (seen && x->type == -RAY_I64 &&
+            (x->i64 > (INT64_C(1) << 53) || x->i64 < -(INT64_C(1) << 53)))
+            *seen = true;
+        return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
+    }
     switch (x->type) {
     case -RAY_SYM: return ray_hash_i64(x->i64);
     case -RAY_TIMESTAMP:

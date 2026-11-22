@@ -1,0 +1,22 @@
+;; #1330: past 2^53 an I64 and an F64 compare through double, so atom_eq is
+;; not transitive (2^53+1 = 2^53.0 = 2^53, but 2^53+1 != 2^53).  `group`
+;; and `by:` over such LIST cells give the row-order answer on any number
+;; of workers: the parallel directory used to vary from run to run.
+(set C (concat (list [7 7]) (at (list 9007199254740993 9007199254740992.0 9007199254740992) (% (til 89999) 3))))
+(set T (table [c r] (list C (til 90000))))
+
+;; the row-order answer: 2^53+1 starts a group, 2^53.0 joins it, 2^53
+;; (which does not equal 2^53+1) starts the next
+(map count (value (group C))) -- [1 60000 29999]
+(at (select {from: T by: c n: (count r)}) 'n) -- [1 60000 29999]
+(count (distinct C)) -- 3
+
+;; repeated, so a run-to-run difference shows within one test
+(set reps (map (fn [i] (map count (value (group C)))) (til 8)))
+(count (distinct reps)) -- 1
+(set reps (map (fn [i] (at (select {from: T by: c n: (count r)}) 'n)) (til 8)))
+(count (distinct reps)) -- 1
+
+;; no value past 2^53: the same answers, by the parallel directory
+(set D (concat (list [7 7]) (at (list 5 5.0 6) (% (til 89999) 3))))
+(map count (value (group D))) -- [1 60000 29999]
