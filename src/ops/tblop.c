@@ -734,6 +734,10 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         if (col_vec->type == RAY_F64) {
             double* d = (double*)ray_data(col_vec);
             for (int64_t r = 0; r < n_ix; r++) d[r] = clear_neg_zero(d[r]);
+        } else if (col_vec->type == RAY_F32) {
+            /* by bits, as clear_neg_zero: -fno-signed-zeros may fold x == 0 */
+            uint32_t* d = (uint32_t*)ray_data(col_vec);
+            for (int64_t r = 0; r < n_ix; r++) if (d[r] == UINT32_C(0x80000000)) d[r] = 0;
         }
         result = ray_table_add_col(result, idx_syms[ci], col_vec);
         ray_release(col_vec);
