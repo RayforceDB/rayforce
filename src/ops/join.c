@@ -218,6 +218,11 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
             kh = ray_hash_bytes((const uint8_t*)ray_data(col) + row * 16, 16);
         } else if (col->type == RAY_F64) {
             kh = ray_hash_f64(((double*)ray_data(col))[row]);
+        } else if (col->type == RAY_LIST) {
+            /* A LIST key cell hashes as group and distinct hash it, with
+             * every span bit, so the hash agrees with atom_eq whatever the
+             * other side's cells hold (#1373). */
+            kh = ray_key_hash(((ray_t**)ray_data(col))[row], RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
         } else {
             int64_t kv = read_col_i64(ray_data(col), row, col->type, col->attrs);
             /* sym-domain Phase 2: a SYM cell id is a position in the
@@ -700,6 +705,13 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
              * equal only to their own kind. */
             if ((lc->type == RAY_STR)  != (rc->type == RAY_STR))  return false;
             if ((lc->type == RAY_GUID) != (rc->type == RAY_GUID)) return false;
+            continue;
+        }
+        if (lc->type == RAY_LIST || rc->type == RAY_LIST) {
+            /* LIST key cells compare by value (atom_eq), not by pointer;
+             * a LIST key meets only a LIST key, as STR meets only STR. */
+            if (lc->type != RAY_LIST || rc->type != RAY_LIST) return false;
+            if (!atom_eq(((ray_t**)ray_data(lc))[l], ((ray_t**)ray_data(rc))[r])) return false;
             continue;
         }
         if (lc->type == RAY_STR || rc->type == RAY_STR) {
