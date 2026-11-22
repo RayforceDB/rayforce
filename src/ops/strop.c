@@ -882,7 +882,6 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         }
         /* Vector split by indices */
         int64_t total = str->len;
-        int esz = ray_elem_size(str->type);
         ray_t* result = ray_list_new(nidx + 1);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < nidx; i++) {
@@ -890,10 +889,11 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             int64_t end = (i + 1 < nidx) ? idx_buf[i + 1] : total;
             int64_t seglen = end - start;
             if (seglen < 0) seglen = 0;
-            ray_t* seg = ray_vec_new(str->type, seglen);
+            /* a slice keeps the null flags and the string pool of the source; a raw
+             * copy of the cells dropped both (a null came out as its sentinel value,
+             * a string that is not inline as an empty one) */
+            ray_t* seg = ray_vec_slice(str, start, seglen);
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
-            seg->len = seglen;
-            if (seglen > 0) memcpy(ray_data(seg), (char*)ray_data(str) + start * esz, seglen * esz);
             result = ray_list_append(result, seg);
             ray_release(seg);
             if (RAY_IS_ERR(result)) return result;

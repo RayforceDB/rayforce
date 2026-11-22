@@ -81,3 +81,11 @@
 (split [1 2 3 4 5] [0 9]) -- (list [1 2 3 4 5] [])
 (split (list 1 2 3) [1 9]) -- (list [2 3] ())
 (split "hello" [0 9]) -- (list "hello" "")
+
+;; a segment keeps the null flags and the string pool of its source: a raw copy of the
+;; cells gave the null's sentinel value (nil? all false) and an empty string for one
+;; that is not stored inline
+(split [1 0Nl 3 4] [0 2]) -- (list [1 0Nl] [3 4])
+(map nil? (first (split [1 0Nl 3 4] [0 2]))) -- [false true]
+(split [1.5 0Nf 3.5] [0 1]) -- (list [1.5] [0Nf 3.5])
+(split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc" "d"]) [0 2]) -- (list ["aaaaaaaaaaaaaaaaaaaaaaaa" "b"] ["cccccccccccccccccccccc" "d"])
