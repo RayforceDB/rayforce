@@ -335,11 +335,11 @@
 (map count (value (group (list (as 'TIMESPAN [1 0]) [true false] (as 'U8 [1 0]) [false true] (as 'U8 [0 1]))))) -- [3 1 1]
 (map count (value (group (list (as 'U8 [0 1]) [false true] (as 'U8 [1 0]) [true false] (as 'TIMESPAN [1 0]))))) -- [1 1 2 1]
 (map count (value (group (Z (list (as 'TIMESPAN [1 0]) [true false] (as 'U8 [1 0]) [false true] (as 'U8 [0 1])))))) -- [67 1 1]
-;; signed zero and fractions
+;; signed zero and fractions (#1361: [-0.0 1.0] and [0.0 1.0] are one cell)
 (distinct (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0])) -- (list [0D00:00:00.000000000 0D00:00:00.000000001] [0.4 1.0] [-0.4 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [1.5 1.0])
 (distinct (Z (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]))) -- (list [0D00:00:00.000000000 0D00:00:00.000000001] [0.4 1.0] [-0.4 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [1.5 1.0])
-(distinct (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1]))) -- (list [1.5 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0])
-(distinct (Z (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1])))) -- (list [1.5 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0])
+(distinct (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1]))) -- (list [1.5 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [-0.4 1.0] [0.4 1.0] [0.0 1.0])
+(distinct (Z (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1])))) -- (list [1.5 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [-0.4 1.0] [0.4 1.0] [0.0 1.0])
 (in (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]) (list [-0.0 1.0] [0.0 1.0])) -- (list [false false] [false false] [false false] [false false] [false false] [false false] [false false])
 (in (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]) (Z (list [-0.0 1.0] [0.0 1.0]))) -- (list [false false] [false false] [false false] [false false] [false false] [false false] [false false])
 (except (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]) (list [-0.0 1.0] [0.0 1.0])) -- (list [0.4 1.0] [-0.4 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [1.5 1.0])
@@ -365,7 +365,7 @@
 (union (list [-0.0 1.0] [0.0 1.0]) (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0])) -- (list [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [1.5 1.0])
 (union (list [-0.0 1.0] [0.0 1.0]) (Z (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]))) -- (list [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] [0D00:00:00.000000002 0D00:00:00.000000001] [1.5 1.0])
 (map count (value (group (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0])))) -- [3 1 1 1 1]
-(map count (value (group (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1]))))) -- [1 1 1 1 2 1]
+(map count (value (group (list [1.5 1.0] (as 'TIMESPAN [2 1]) [-0.4 1.0] [0.4 1.0] [0.0 1.0] [-0.0 1.0] (as 'TIMESPAN [0 1]))))) -- [1 1 1 1 3]
 (map count (value (group (Z (list (as 'TIMESPAN [0 1]) [-0.0 1.0] [0.0 1.0] [0.4 1.0] [-0.4 1.0] (as 'TIMESPAN [2 1]) [1.5 1.0]))))) -- [67 1 1 1 1]
 ;; past 2^53
 (distinct (list (as 'TIMESPAN [9007199254740993]) [9007199254740993] [9007199254740992.0] [9007199254740992] (as 'TIMESPAN [9007199254740992]))) -- (list [104D05:59:59.254740993] [9007199254740992])
