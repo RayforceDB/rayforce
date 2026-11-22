@@ -1074,10 +1074,40 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
         }
     }
 
+    /* Each row finds its group through a hash table, as xkey's duplicate
+     * check does: ray_key_hash agrees with atom_eq, and its TIMESPAN bits
+     * come from the key columns before the first row is hashed.  A linear
+     * scan over the groups so far was quadratic, even for atom keys
+     * (#1315).  Groups keep first-seen order. */
+    int spans = 0;
+    for (int64_t k = 0; k < nkeys; k++) {
+        ray_t* col = key_cols[k];
+        if (col->type == RAY_LIST) spans |= ray_key_spans(col);
+        else if (ray_has_timespan(col)) spans |= RAY_KEY_SPAN_ATOM;
+        else if (col->type <= RAY_LIST || col->type > RAY_STR) spans |= RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
+    }
+    size_t ht_cap = 16;
+    while (nrows > 0 && ht_cap < (size_t)nrows * 2) {
+        if (ht_cap > SIZE_MAX / 2) {
+            ray_release(keys); ray_free_raw(gids); ray_free_raw(counts);
+            ray_free_raw(key_cols); ray_free_raw(key_syms);
+            return ray_error("limit", "xgroup: table is too large");
+        }
+        ht_cap *= 2;
+    }
+    int64_t* ht = (int64_t*)ray_alloc_raw(ht_cap * sizeof(int64_t));
+    if (!ht) {
+        ray_release(keys); ray_free_raw(gids); ray_free_raw(counts);
+        ray_free_raw(key_cols); ray_free_raw(key_syms);
+        return ray_error("oom", NULL);
+    }
+    for (size_t i = 0; i < ht_cap; i++) ht[i] = -1;
+
     int64_t ngroups = 0;
     for (int64_t r = 0; r < nrows; r++) {
         ray_t* k = table_row_key(key_cols, nkeys, r);
         if (!k || RAY_IS_ERR(k)) {
+            ray_free_raw(ht);
             ray_release(keys);
             ray_free_raw(gids);
             ray_free_raw(counts);
@@ -1088,8 +1118,10 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
 
         int64_t gi = -1;
         ray_t** key_items = (ray_t**)ray_data(keys);
-        for (int64_t i = 0; i < ngroups; i++) {
-            if (atom_eq(key_items[i], k)) { gi = i; break; }
+        size_t slot = (size_t)ray_key_hash(k, spans) & (ht_cap - 1);
+        while (ht[slot] >= 0) {
+            if (atom_eq(key_items[ht[slot]], k)) { gi = ht[slot]; break; }
+            slot = (slot + 1) & (ht_cap - 1);
         }
 
         if (gi < 0) {
@@ -1097,6 +1129,7 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
             ray_t* nkeys_obj = ray_list_append(keys, k);
             if (!nkeys_obj || RAY_IS_ERR(nkeys_obj)) {
                 ray_release(k);
+                ray_free_raw(ht);
                 ray_release(keys);
                 ray_free_raw(gids);
                 ray_free_raw(counts);
@@ -1105,6 +1138,7 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
                 return nkeys_obj ? nkeys_obj : ray_error("oom", NULL);
             }
             keys = nkeys_obj;
+            ht[slot] = gi;
             counts[gi] = 0;
         }
 
@@ -1112,6 +1146,8 @@ ray_t* ray_xgroup_fn(ray_t* tbl, ray_t* keys_arg) {
         counts[gi]++;
         ray_release(k);
     }
+
+    ray_free_raw(ht);
 
     ray_t* vals = ray_list_new(ngroups);
     if (!vals || RAY_IS_ERR(vals)) {
