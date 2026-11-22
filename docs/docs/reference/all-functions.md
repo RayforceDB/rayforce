@@ -557,6 +557,8 @@ Rayforce supports seven join types, including time-series-aware as-of and window
 |---|---|---|---|---|
 | `pivot` | variadic | — | Pivot table — reshape long to wide. Args: table, index col, pivot col, value col, agg fn | `(pivot sales 'region 'product 'revenue sum)` |
 
+Each value column is named `(format "%" v)` of its pivot value (`2024.01.01`, `1.5`, `0x01`, `true`), in first-seen order. Rows with a null pivot value are kept in one column named by the type's null (`0Nl`, `0Nd`, `'` for the null symbol). Floats that `%g` writes alike take their round-trip digits, and a name an index column or an earlier column already has takes the smallest free suffix `_1`, `_2`, ... The rule is the same for every aggregation; see [Column names](../queries/pivot.md#column-names).
+
 ```lisp
 ; Pivot sales data: rows=region, cols=product, values=revenue, aggregated with sum
 (set sales (table [region product revenue]
@@ -572,7 +574,7 @@ String functions are available as direct builtins. The transform functions are l
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `split` | binary | — | Split string by delimiter into a list of strings | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `split` | binary | — | Split string by delimiter into a list of strings; a string or symbol vector, or a list of string or symbol atoms, splits each element into its own list | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `str-find` | binary | parallel vector | First byte index of a literal substring (no wildcards; see `like`); `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | — | Join string/symbol atoms, vectors, or lists with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | — | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |

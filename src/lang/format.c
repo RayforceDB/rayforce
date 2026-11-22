@@ -585,6 +585,57 @@ const char* ray_fmt_null_literal(int8_t type) {
     }
 }
 
+/* The text `format` puts at a `%` for `a`: a null as its literal (0Nl,
+ * 0Nd, ...), I64 in decimal, F64 as %g, BOOL as true/false, STR as its
+ * characters, SYM as its name (the empty symbol as '), anything else as
+ * ray_fmt compact text.  fmt_interpolate and pivot's column names
+ * (pivot_col_names) both read it, so a pivot column is named what
+ * (format "%" v) gives.  The text is *txt, *len bytes: in `buf` (cap >= 64)
+ * or borrowed from `a`, and NULL is returned; or inside the returned owned
+ * STR, which the caller releases; or an error is returned. */
+ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len) {
+    int n = 0;
+    *txt = buf;
+    if (!a || RAY_IS_ERR(a)) {
+        n = snprintf(buf, cap, "error");
+    } else if (a->type != -RAY_STR && a->type != -RAY_SYM && RAY_ATOM_IS_NULL(a)) {
+        n = snprintf(buf, cap, "%s", ray_fmt_null_literal(-a->type));
+    } else if (a->type == -RAY_I64) {
+        n = snprintf(buf, cap, "%" PRId64, a->i64);
+    } else if (a->type == -RAY_F64) {
+        n = snprintf(buf, cap, "%g", clear_neg_zero(a->f64));
+    } else if (a->type == -RAY_BOOL) {
+        n = snprintf(buf, cap, "%s", a->b8 ? "true" : "false");
+    } else if (a->type == -RAY_STR) {
+        *txt = ray_str_ptr(a);
+        *len = ray_str_len(a);
+        return NULL;
+    } else if (a->type == -RAY_SYM) {
+        ray_t* ss = ray_sym_str(a->i64);
+        if (!ss) {
+            n = snprintf(buf, cap, "'?");
+        } else if (ray_str_len(ss) == 0) {      /* sym 0: the empty symbol */
+            ray_release(ss);
+            n = snprintf(buf, cap, "'");
+        } else {
+            *txt = ray_str_ptr(ss);
+            *len = ray_str_len(ss);
+            return ss;
+        }
+    } else {
+        ray_t* s = ray_fmt(a, RAY_FMT_COMPACT);
+        if (s && !RAY_IS_ERR(s)) {
+            *txt = ray_str_ptr(s);
+            *len = ray_str_len(s);
+            return s;
+        }
+        if (s) return s;
+        n = snprintf(buf, cap, "<type:%d>", a->type);
+    }
+    *len = n > 0 ? (size_t)n : 0;
+    return NULL;
+}
+
 /* ===== Vector element formatter ===== */
 
 static void fmt_raw_elem(fmt_buf_t* b, ray_t* vec, int64_t idx, int mode) {
