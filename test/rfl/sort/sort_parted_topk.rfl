@@ -181,12 +181,12 @@
 
 ;; ══════════════════════════════════════════════════════════════════════════
 ;; DECLINE — a non-bare (aggregate/expression) output is not row-preserving, so
-;; the top-k stream declines (delta 0).  The flat fallback cannot lazily
-;; aggregate-and-sort a parted table, so it surfaces a loud error (contract:
-;; loud error ≫ silent wrong answer) — never a per-partition-collapsed result.
+;; the top-k stream declines (delta 0).  An all-aggregate select is one row
+;; over every partition, so sorting it by its own output leaves it as it is
+;; (#1338; it raised `nyi` before) — never a per-partition-collapsed result.
 ;; ══════════════════════════════════════════════════════════════════════════
 (set BG (at (.sys.mem) 'sort-perpart-runs))
-(select {s: (sum v) from: Pq asc: s take: 1}) !- nyi
+(select {s: (sum v) from: Pq asc: s take: 1}) -- (table [s] (list [180]))
 (set AG (at (.sys.mem) 'sort-perpart-runs))
 (- AG BG) -- 0
 
