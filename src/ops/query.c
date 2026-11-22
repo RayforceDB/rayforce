@@ -911,6 +911,61 @@ static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     }
 }
 
+/* A literal xbar bucket that is zero or null, where ray_xbar_fn raises
+ * whatever the column holds: its vector-by-integer fast path (an I16 / I32 /
+ * I64 bucket on an integer or temporal column, empty too, message
+ * "non-zero"), and an atom value.  Sets that domain error and returns true.
+ * Any other zero or null literal is left to the modulo kernels, which raise
+ * per row as the builtin's per-element path does (an empty column gives an
+ * empty result in both). */
+static bool xbar_literal_bucket_bad(ray_graph_t* g, ray_op_t* b, ray_op_t* col,
+                                    int8_t col_t) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v)) return false;
+    bool zero, ib = false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: zero = as_i64(v) == 0; ib = true; break;
+        case -RAY_F64: case -RAY_F32: zero = as_f64(v) == 0.0; break;
+        case -RAY_U8: case -RAY_BOOL: zero = v->u8 == 0; break;
+        case -RAY_DATE: case -RAY_TIME: zero = v->i32 == 0; break;
+        case -RAY_TIMESTAMP: zero = v->i64 == 0; break;
+        default: return false;
+    }
+    bool null = RAY_ATOM_IS_NULL(v);
+    if (!null && !zero) return false;
+    bool int_col = col_t == RAY_I64 || col_t == RAY_I32 || col_t == RAY_I16 ||
+                   col_t == RAY_TIMESTAMP || col_t == RAY_DATE || col_t == RAY_TIME;
+    bool atom = dag_const_is_atom(g, col);
+    bool fast = int_col && !atom && ib && !null;
+    if (!fast && !(atom && (int_col || col_t == RAY_U8 || col_t == RAY_BOOL ||
+                            col_t == RAY_F64 || col_t == RAY_F32)))
+        return false;
+    if (!g->compile_err)
+        g->compile_err = ray_error("domain", fast ? "xbar: bucket size must be non-zero"
+                                                  : RAY_XBAR_BUCKET_ERR);
+    return true;
+}
+
+/* A literal bucket that is neither zero nor null: no row can raise, so the
+ * xbar is a plain modulo and the plan carries no OP_FLAG_XBAR (an update
+ * under where: then builds no row selection for it). */
+static bool xbar_literal_bucket_ok(ray_graph_t* g, ray_op_t* b) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v) || RAY_ATOM_IS_NULL(v)) return false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: return as_i64(v) != 0;
+        case -RAY_F64: case -RAY_F32: { double d = as_f64(v); return d == d && d != 0.0; }
+        case -RAY_U8: case -RAY_BOOL: return v->u8 != 0;
+        case -RAY_DATE: case -RAY_TIME: return v->i32 != 0;
+        case -RAY_TIMESTAMP: return v->i64 != 0;
+        default: return false;
+    }
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -2336,7 +2391,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             uint32_t col_id = col->id;
             ray_op_t* bucket = compile_expr_dag(g, elems[2]);
             if (!bucket) return NULL;
-            uint32_t bucket_id = bucket->id;
+            uint32_t bucket_id = bucket->id, lit_id = bucket->id;
             col = &g->nodes[col_id];
             /* xbar(x, b) = x - (x % b)  (stays in integer domain).
              *
@@ -2369,8 +2424,19 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                     col = &g->nodes[col_id];
                 }
             }
+            /* A zero or null bucket is ray_xbar_fn's domain error (#1355).
+             * A literal one the builtin rejects outright is decided here,
+             * once; every other one by the modulo kernels (OP_FLAG_XBAR),
+             * whose zero-divisor branch raises instead of writing a null.
+             * In an arm of an `if` / `cond` only the rows that take the arm
+             * bucket, so the kernels decide there too. */
+            if (g->if_arm_depth == 0 &&
+                xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
+                return NULL;
+            bool lit_ok = xbar_literal_bucket_ok(g, &g->nodes[lit_id]);
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;
+            if (!lit_ok) m->flags |= OP_FLAG_XBAR;
             col = &g->nodes[col_id];
             ray_op_t* r = ray_sub(g, col, m);
             if (!r || !temporal) return r;
@@ -28750,7 +28816,8 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * so the groups after the first skip the graph and go to the evaluator
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
-static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined) {
+static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
+                                  ray_t* mask) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
@@ -28759,7 +28826,17 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
             op = ray_optimize(g, op);
+            /* Under where: (mask, one BOOL per row) an xbar buckets the
+             * matched rows only.  Their selection is built only when the
+             * plan holds an xbar, so any other update pays nothing. */
+            ray_t* rows = NULL;
+            if (mask)
+                for (uint32_t i = 0; i < g->node_count; i++)
+                    if (g->nodes[i].flags & OP_FLAG_XBAR) { rows = ray_rowsel_from_pred(mask); break; }
+            g->xbar_rows = rows;          /* the rows where: updates */
             out = ray_execute(g, op);
+            g->xbar_rows = NULL;
+            if (rows) ray_rowsel_release(rows);
         } else {
             cerr = graph_take_compile_err(g);
             if (dag_declined) *dag_declined = true;
@@ -28819,7 +28896,15 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
 }
 
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
-    return update_eval_on_impl(sub, expr, true, NULL);
+    return update_eval_on_impl(sub, expr, true, NULL, NULL);
+}
+
+/* update_eval_on under where: (mask, one BOOL per row): the value is read
+ * on the matched rows only, so an xbar buckets those alone; a dropped row
+ * keeps its old value and never raises, as in a select (#1355). */
+static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    bool ok = mask && mask->type == RAY_BOOL && mask->len == ray_table_nrows(tbl);
+    return update_eval_on_impl(tbl, expr, true, NULL, ok ? mask : NULL);
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -29321,7 +29406,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     dependencies.table = sub_tbl;
                     g_query_dependencies = &dependencies;
                 }
-                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined);
+                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined, NULL);
                 g_query_dependencies = prev_dependencies;
                 ray_release(sub_tbl);
 
@@ -29551,7 +29636,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
-                ray_t* expr_vec = update_eval_on(tbl, update_expr);
+                ray_t* expr_vec = update_eval_where(tbl, update_expr, mask_vec);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
                 if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
                     int64_t got = ray_len(expr_vec);
@@ -29800,7 +29885,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_eval_on(tbl, dict_elems[d + 1]);
+            ray_t* v = update_eval_where(tbl, dict_elems[d + 1], mask_vec);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {

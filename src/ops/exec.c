@@ -3488,6 +3488,108 @@ static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext) {
     return g->table;
 }
 
+/* Over node n's subtree: 1 when it is row-wise only (elementwise nodes,
+ * `if`, `in` against a constant set, over scans and constants), with *xbar
+ * set when it holds an xbar (OP_FLAG_XBAR); 0 otherwise. */
+static int filter_rowwise_tree(ray_graph_t* g, ray_op_t* n, bool* xbar, int depth) {
+    if (!n || depth > 64) return 0;
+    if (n->opcode == OP_SCAN || n->opcode == OP_CONST) return 1;
+    /* an AND with a true arm folds to an alias of the other */
+    if (n->opcode == OP_ALIAS && n->arity == 1)
+        return filter_rowwise_tree(g, op_node(g, n->in_id[0]), xbar, depth + 1);
+    /* `if` buckets each arm over the rows that take it; `in` / `not-in`
+     * test one value per row against a constant set */
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        return e && e->third_in != RAY_OP_NONE &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_child(g, n, 1), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_node(g, e->third_in), xbar, depth + 1);
+    }
+    if (n->opcode == OP_IN || n->opcode == OP_NOT_IN) {
+        ray_op_t* set = op_child(g, n, 1);
+        return n->arity == 2 && set && set->opcode == OP_CONST &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1);
+    }
+    if (!op_is_elementwise(n->opcode) || n->arity > 2) return 0;
+    if (n->flags & OP_FLAG_XBAR) *xbar = true;
+    for (int k = 0; k < n->arity; k++)
+        if (!filter_rowwise_tree(g, op_node(g, n->in_id[k]), xbar, depth + 1)) return 0;
+    return 1;
+}
+
+/* `where: (and a b ...)` kept as one predicate (a filter pushed below a
+ * group is not split) with an xbar in a conjunct after the first.  The one
+ * fused pass runs first, as for any predicate; only when it raises the xbar's
+ * domain error (or cannot run) do the conjuncts run left to right as the
+ * split chain does, each over the rows the earlier ones keep (the selection
+ * is an xbar's row domain), so a zero bucket on a row an earlier conjunct
+ * rejects is no error, with by: or without (#1355).  input with the
+ * selection installed, an owned error (input released), or NULL: not such
+ * a predicate. */
+static __attribute__((noinline)) ray_t* exec_filter_xbar_chain(ray_graph_t* g, ray_op_t* op, ray_t* input) {
+    ray_op_t* pred = op_child(g, op, 1);
+    while (pred && pred->opcode == OP_ALIAS && pred->arity == 1) pred = op_child(g, pred, 0);
+    if (!pred || pred->opcode != OP_AND || g->selection || !g->table ||
+        ray_table_nrows(input) != ray_table_nrows(g->table)) return NULL;
+    /* the conjuncts in order: an in-order walk of the AND tree */
+    uint32_t conj[64], stk[64];
+    int nc = 0, sp = 0;
+    ray_op_t* cur = pred;
+    while (cur || sp) {
+        while (cur && cur->opcode == OP_ALIAS && cur->arity == 1) cur = op_child(g, cur, 0);
+        while (cur && cur->opcode == OP_AND && cur->arity == 2 && sp < 64) {
+            stk[sp++] = cur->id;
+            cur = op_child(g, cur, 0);
+        }
+        if (cur) { if (nc == 64) return NULL; conj[nc++] = cur->id; }
+        if (!sp) break;
+        cur = op_child(g, op_node(g, stk[--sp]), 1);
+    }
+    /* every conjunct row-wise, so a selection changes none of their rows */
+    bool later = false;
+    for (int k = 0; k < nc; k++) {
+        bool xb = false;
+        if (!filter_rowwise_tree(g, op_node(g, conj[k]), &xb, 0)) return NULL;
+        later |= k > 0 && xb;
+    }
+    if (!later) return NULL;
+    int64_t nrows = ray_table_nrows(input);
+    /* the fused pass over every row: when it raises nothing, its answer is
+     * the chain's (the conjuncts are row-wise) at dev's cost */
+    bool all_pass = false;
+    ray_t* fsel = exec_pred_to_selection(g, pred, nrows, &all_pass);
+    if (fsel && RAY_IS_ERR(fsel)) {
+        if (strcmp(ray_err_code(fsel), "domain") != 0) { ray_release(input); return fsel; }
+        ray_error_free(fsel);
+    } else if (fsel || all_pass) {
+        g->selection = fsel;                 /* NULL when all rows pass */
+        return input;
+    }
+    ray_t* sel = NULL;                       /* NULL: every row */
+    for (int k = 0; k < nc; k++) {
+        g->selection = sel;
+        ray_t* pv = exec_node(g, op_node(g, conj[k]));
+        g->selection = NULL;
+        pv = ray_where_mask_coerce(pv, nrows, "where");
+        if (pv && !RAY_IS_ERR(pv) && (pv->type != RAY_BOOL || pv->len != nrows)) {
+            ray_release(pv);
+            pv = ray_error("type", "where: predicate must be boolean");
+        }
+        if (!pv || RAY_IS_ERR(pv)) {
+            if (sel) ray_rowsel_release(sel);
+            ray_release(input);
+            return pv ? pv : ray_error("oom", NULL);
+        }
+        ray_t* ns = sel ? ray_rowsel_refine(sel, pv) : ray_rowsel_from_pred(pv);
+        ray_release(pv);
+        if (sel) ray_rowsel_release(sel);
+        sel = ns;                            /* NULL: every row passes so far */
+    }
+    g->selection = sel;
+    return input;
+}
+
 /* A chained filter's refinement over a generation-2 predicate column: the
  * predicate is evaluated on the segments the selection keeps, through the
  * fused path's encoded leaves (views and vector statistics), and ANDed with
@@ -4088,6 +4190,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     }
                 }
+            }
+            if (input->type == RAY_TABLE && !g->selection) {
+                ray_t* xr = exec_filter_xbar_chain(g, op, input);
+                if (xr) return xr;           /* input (filtered), or an owned error */
             }
             /* Hash-index point-lookup fast path: when the predicate is
              * `col == K` on a column with RAY_IDX_HASH attached and
