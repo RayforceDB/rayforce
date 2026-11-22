@@ -1452,28 +1452,37 @@ void ray_repl_run(ray_repl_t* repl) {
     g_active_term = NULL;
 }
 
-/* Everything `f` yields up to EOF, in a block of its own.  For a stream whose
- * size is not known beforehand: a pipe, a FIFO, process substitution, stdin
- * from a pipe, and the /proc files that report a size of 0.  The block grows
- * by doubling; NULL (nothing is printed) when memory runs out. */
-static ray_t* repl_slurp(FILE* f, size_t* out_len) {
+/* The longest script that is run: the same for a regular file and for a stream. */
+#define REPL_SCRIPT_MAX ((size_t)256 << 20)
+
+/* Everything `f` yields from where it stands up to EOF, in a block of its own.
+ * For a stream whose size is not known beforehand: a pipe, a FIFO, process
+ * substitution, stdin, and the /proc files that report a size of 0.  The block
+ * doubles from 64 KiB, the old one released as soon as its content is copied, and
+ * is the script itself: there is no second buffer to copy out of.  NULL when
+ * memory runs out; *too_big when the stream is longer than REPL_SCRIPT_MAX. */
+static ray_t* repl_slurp(FILE* f, size_t* out_len, bool* too_big) {
     size_t cap = 64 * 1024, len = 0;
-    char* buf = (char*)ray_alloc_raw(cap);
-    if (!buf) return NULL;
+    ray_t* block = ray_alloc((int64_t)cap + 1);
+    if (!block) return NULL;
     for (;;) {
-        size_t n = fread(buf + len, 1, cap - len, f);
+        size_t n = fread((char*)ray_data(block) + len, 1, cap - len, f);
         len += n;
         if (len < cap) break;                         /* short read: EOF or an error */
-        if (cap > SIZE_MAX / 2) { ray_free_raw(buf); return NULL; }
-        char* bigger = (char*)ray_alloc_raw(cap * 2);
-        if (!bigger) { ray_free_raw(buf); return NULL; }
-        memcpy(bigger, buf, len);
-        ray_free_raw(buf);
-        buf = bigger; cap *= 2;
+        if (cap >= REPL_SCRIPT_MAX) {
+            int c = fgetc(f);                         /* exactly the limit is still a script */
+            if (c == EOF) break;
+            *too_big = true;
+            ray_release(block);
+            return NULL;
+        }
+        size_t newcap = cap * 2 > REPL_SCRIPT_MAX ? REPL_SCRIPT_MAX : cap * 2;
+        ray_t* bigger = ray_alloc((int64_t)newcap + 1);
+        if (!bigger) { ray_release(block); return NULL; }
+        memcpy(ray_data(bigger), ray_data(block), len);
+        ray_release(block);
+        block = bigger; cap = newcap;
     }
-    ray_t* block = ray_alloc((int64_t)len + 1);
-    if (block) memcpy(ray_data(block), buf, len);
-    ray_free_raw(buf);
     *out_len = len;
     return block;
 }
@@ -1490,24 +1499,30 @@ int ray_repl_run_file(const char* path) {
 
     /* A regular file is sized and read in one go.  Anything that cannot be sized
      * (a pipe, a FIFO, process substitution) or reports 0 (a /proc file) is read
-     * to EOF instead of being refused. */
+     * to EOF instead of being refused.  Stdin is always read from where it stands,
+     * as `cat -` reads it: input the parent already consumed is not run again,
+     * whether stdin is a pipe or a seekable file. */
     long flen = -1;
-    if (fseek(f, 0, SEEK_END) == 0) {
+    if (!from_stdin && fseek(f, 0, SEEK_END) == 0) {
         flen = ftell(f);
         if (fseek(f, 0, SEEK_SET) != 0) flen = -1;
     }
 
-    ray_t* block;
+    ray_t* block = NULL;
     size_t nread = 0;
-    if (flen > 0) {
+    bool too_big = false;
+    if (flen > 0 && (size_t)flen <= REPL_SCRIPT_MAX) {
         block = ray_alloc((int64_t)flen + 1);
         if (block) nread = fread((char*)ray_data(block), 1, (size_t)flen, f);
+    } else if (flen > 0) {
+        too_big = true;
     } else {
-        block = repl_slurp(f, &nread);
+        block = repl_slurp(f, &nread, &too_big);
     }
     if (!from_stdin) fclose(f);
     if (!block) {
-        fprintf(stderr, "error: out of memory\n");
+        if (too_big) fprintf(stderr, "error: script '%s' is larger than %zu MiB\n", path, REPL_SCRIPT_MAX >> 20);
+        else fprintf(stderr, "error: out of memory\n");
         return 1;
     }
     char* buf = (char*)ray_data(block);

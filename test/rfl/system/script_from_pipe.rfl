@@ -33,6 +33,17 @@
 (.sys.exec "./rayforce - < /dev/null > /tmp/rfl_script_pipe/e.out 2>&1") -- 0
 (read "/tmp/rfl_script_pipe/e.out") -- ""
 (.sys.exec "printf ';; nothing\\n' | ./rayforce - > /tmp/rfl_script_pipe/f.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/f.out") -- ""
+
+;; stdin is read from where it stands, as cat - reads it: the first line is consumed
+;; by the parent, and a seekable stdin must not run it again
+(.sys.exec "printf '(println 9)\\n(println 2)\\n' > /tmp/rfl_script_pipe/k.rfl; (read -r l; ./rayforce -) < /tmp/rfl_script_pipe/k.rfl > /tmp/rfl_script_pipe/k.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/k.out") -- "2\n"
+
+;; a stream that never ends stops at the size limit (the same for a file) instead of
+;; reading until memory is gone
+(.sys.exec "./rayforce /dev/zero > /tmp/rfl_script_pipe/z.out 2>&1") -- 1
+(read "/tmp/rfl_script_pipe/z.out") -- "error: script '/dev/zero' is larger than 256 MiB\n"
 
 ;; a script that fails reports it and fails the process
 (.sys.exec "printf '(println 1)\\n(+ 1 (quote a))\\n' | ./rayforce - > /tmp/rfl_script_pipe/g.out 2>&1") -- 1
