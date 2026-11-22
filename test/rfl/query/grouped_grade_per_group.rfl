@@ -13,9 +13,11 @@
 (at (select {from: t by: g r: (iasc v)}) 'r) -- (list [1 2 0] [0 1])
 (at (select {from: t by: g r: (idesc v)}) 'r) -- (list [0 2 1] [1 0])
 (at (select {from: t by: g r: (sum (rank v))}) 'r) -- [3 1]
+;; a sum of ranks alone is n(n-1)/2 for any order: weight them
+(at (select {from: t by: g r: (sum (* v (rank v)))}) 'r) -- [80 7]
 (set T (table [a g] (list [3 0N 1 2 5] [1 2 1 2 1])))
 (at (select {from: T by: g r: (rank a)}) 'r) -- (list [1 0 2] [0 1])
-(at (select {from: T by: g r: (sum (rank a))}) 'r) -- [3 1]
+(at (select {from: T by: g r: (sum (* a (rank a)))}) 'r) -- [13 2]
 
 ;; The other row-length verbs of the family
 (at (select {from: t by: g r: (xrank 2 v)}) 'r) -- (list [1 0 0] [0 1])
@@ -33,14 +35,14 @@
 (at (select {from: t by: g r: (first (asc v))}) 'r) -- [10 5]
 (at (select {from: t by: g r: (count (asc v))}) 'r) -- [3 2]
 (set hr (fn [x] (rank x)))
-(at (select {from: t by: g r: (sum (hr v))}) 'r) -- [3 1]
+(at (select {from: t by: g r: (sum (* v (hr v)))}) 'r) -- [80 7]
 (at (select {from: t by: g r: (hr v)}) 'r) -- (list [2 0 1] [0 1])
 
 ;; Every grouping route: a STR key and a computed key go through the
 ;; evaluator's grouping, not the planner's
 (R (select {from: t by: s r: (rank v)})) -- (list [2 0 1] [0 1])
 (R (select {from: t by: s r: (iasc v)})) -- (list [1 2 0] [0 1])
-(R (select {from: t by: s r: (sum (rank v))})) -- [3 1]
+(R (select {from: t by: s r: (sum (* v (rank v)))})) -- [80 7]
 (R (select {from: t by: {k: (> v 8)} r: (rank v)})) -- (list [0 1] [2 0 1])
 (R (select {from: t by: {k: (> v 8)} r: (max (idesc v))})) -- [1 2]
 ;; an aggregate in a plain output on the evaluator's grouping is the group's
@@ -51,7 +53,7 @@
 ;; where: keeps its rows first; each group ranks its kept rows
 (at (select {from: t where: (> v 6) by: g r: (rank v)}) 'r) -- (list [2 0 1] [0])
 (R (select {from: t where: (> v 6) by: s r: (rank v)})) -- (list [2 0 1] [0])
-(at (select {from: t where: (> v 6) by: g r: (sum (rank v))}) 'r) -- [3 0]
+(at (select {from: t where: (> v 6) by: g r: (sum (* v (rank v)))}) 'r) -- [80 0]
 
 ;; Nulls: a group ranks its nulls as `rank` does outside a select
 (set N (table [g v] (list [0 0 0 0 1 1] [3 0N 1 5 2 0N])))
@@ -68,16 +70,66 @@
 ;; A single group is the keyless answer
 (at (select {from: (update {from: t g: 'a}) by: g r: (rank v)}) 'r) -- (list [4 2 3 0 1])
 
+;; A verb in a running function's argument runs with that function, over
+;; the whole table (the running-function rule, docs/queries/select.md): this
+;; PR leaves it so
+(at (select {from: t by: g r: (sums (rank v))}) 'r) -- (list [4 6 9] [9 10])
+(at (select {from: t by: g r: (sum (sums (rank v)))}) 'r) -- [19 19]
+
+;; What the evaluator's grouping (STR, GUID, computed keys) now gives per
+;; group, as the planner's grouping already did
+(R (select {from: t by: s r: (+ v (count v))})) -- (list [33 13 23] [7 9])
+(R (select {from: t by: s r: (== v (max v))})) -- (list [true false false] [false true])
+(R (select {from: t by: s r: (+ v (sum v))})) -- (list [90 70 80] [17 19])
+(set gu (guid 2))
+(asc (at (select {from: (table [k v] (list (at gu [0 0 0 1 1]) [30 10 20 5 7])) by: k r: (sum (* v (rank v)))}) 'r)) -- [7 80]
+;; null keys group like any key
+(set tn (table [ks kt ki v] (list ['a ' 'a ' 'b] ["x" "" "x" "" "y"] [1 0Nl 1 0Nl 2] [30 10 20 5 7])))
+(at (xasc (select {from: tn by: ks r: (rank v)}) 'ks) 'r) -- (list [1 0] [1 0] [0])
+(at (xasc (select {from: tn by: kt r: (rank v)}) 'kt) 'r) -- (list [1 0] [1 0] [0])
+(at (xasc (select {from: tn by: ki r: (rank v)}) 'ki) 'r) -- (list [1 0] [1 0] [0])
+;; a where: that empties a group drops it; a key of several columns
+(at (select {from: t where: (> v 8) by: g r: (rank v)}) 'r) -- (list [2 0 1])
+(at (select {from: t where: (> v 8) by: g r: (rank v)}) 'g) -- ['a]
+(set tm (table [g h v] (list ['a 'a 'a 'b 'b] [1 2 1 1 1] [30 10 20 5 7])))
+(at (xasc (select {from: tm by: [g h] r: (rank v)}) [g h]) 'r) -- (list [1 0] [0] [0 1])
+
+;; Routes, compared within the run (500,000 rows, 100,000 groups)
+(set n5 500000)
+(set K5 (table [k v w] (list (at (as 'SYM (map (fn [i] (format "k%" i)) (til 100000))) (% (* (til n5) 7919) 100000)) (% (* (til n5) 104729) 1000003) (as 'I64 (map (fn [i] (if (== 0 (% i 9)) 0N i)) (til n5))))))
+;; a row-local output nested past the code walk's depth is not sent per group
+(set D16 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))})))
+(set D20 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))))))})))
+(at (D20) 'r) -- (+ 4 (at (D16) 'r))
+(< (timeit (D20) 3) (+ 50.0 (* 4.0 (timeit (D16) 3)))) -- true
+;; (first (asc v)) is planned as (min v), (count (iasc w)) as (count w)
+(count (select {from: K5 by: k r: (count w)})) -- 100000
+(at (select {from: K5 by: k r: (first (asc v))}) 'r) -- (at (select {from: K5 by: k r: (min v)}) 'r)
+(< (timeit (select {from: K5 by: k r: (first (asc v))}) 3) (+ 50.0 (* 4.0 (timeit (select {from: K5 by: k r: (min v)}) 3)))) -- true
+(at (select {from: K5 by: k r: (count (iasc w))}) 'r) -- (at (select {from: K5 by: k r: (count w)}) 'r)
+(< (timeit (select {from: K5 by: k r: (count (iasc w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
+(< (timeit (select {from: K5 by: k r: (count (rank w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
+(at (select {from: t by: g r: (count (xrank 2 v))}) 'r) -- [3 2]
+(at (select {from: t by: g r: (count (rotate v 1))}) 'r) -- [3 2]
+(at (select {from: t by: g r: (count (idesc v))}) 'r) -- [3 2]
+
 ;; Parted: a group spans partitions; its ranks are its rows' across them
 (.sys.exec "rm -rf /tmp/rfl_grouped_grade")
 (.db.splayed.set "/tmp/rfl_grouped_grade/1/t/" (table [g v] (list [0 1 0] [30 5 10])))
 (.db.splayed.set "/tmp/rfl_grouped_grade/2/t/" (table [g v] (list [1 0] [7 20])))
 (set P (.db.parted.get "/tmp/rfl_grouped_grade/" 't))
 (R (select {from: P by: g r: (rank v)})) -- (list [2 0 1] [0 1])
-(R (select {from: P by: g r: (sum (rank v))})) -- [3 1]
+(R (select {from: P by: g r: (sum (* v (rank v)))})) -- [80 7]
 (R (select {from: P by: g r: (iasc v)})) -- (list [1 2 0] [0 1])
 (R (select {from: P where: (> v 6) by: g r: (rank v)})) -- (list [2 0 1] [0])
-(.sys.exec "rm -rf /tmp/rfl_grouped_grade")
+;; a STR key over the parted table: the evaluator's grouping
+(.sys.exec "rm -rf /tmp/rfl_grouped_grade_s")
+(.db.splayed.set "/tmp/rfl_grouped_grade_s/1/t/" (table [s v] (list ["x" "y" "x"] [30 5 10])))
+(.db.splayed.set "/tmp/rfl_grouped_grade_s/2/t/" (table [s v] (list ["y" "x"] [7 20])))
+(set PS (.db.parted.get "/tmp/rfl_grouped_grade_s/" 't))
+(R (select {from: PS by: s r: (rank v)})) -- (list [2 0 1] [0 1])
+(R (select {from: PS by: s r: (+ v (count v))})) -- (list [33 13 23] [7 9])
+(.sys.exec "rm -rf /tmp/rfl_grouped_grade /tmp/rfl_grouped_grade_s")
 
 ;; Many rows and groups (the pool's parallel grouping): every group's ranks
 ;; are `rank` of its rows
