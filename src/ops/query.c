@@ -3901,6 +3901,18 @@ static ray_t* eval_query_expr(ray_t* expr, ray_t* tbl) {
 /* The rows of the group being evaluated by the per-group fallback, while
  * its expression runs: a helper's free source column is sliced by it. */
 static _Thread_local ray_t*  g_active_query_group_idx = NULL;
+/* The table the group's row indices index, and the scope depth just above
+ * the per-group frame: the indices apply to a column of that table only,
+ * and only while no nested query has opened its own scope above it (the
+ * row path's g_active_query_row_tbl / _row_depth rule). */
+static _Thread_local ray_t*  g_active_query_group_tbl = NULL;
+static _Thread_local int32_t g_active_query_group_depth = 0;
+
+/* Does the per-group row index apply to a column of `tbl` here? */
+static bool query_group_idx_applies(const ray_t* tbl) {
+    return g_active_query_group_idx && tbl && tbl == g_active_query_group_tbl &&
+           !ray_env_query_scope_above(g_active_query_group_depth);
+}
 static _Thread_local int64_t g_active_query_row       = -1;
 static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
 static _Thread_local int32_t g_active_query_row_depth = 0;
@@ -3913,13 +3925,16 @@ ray_t* ray_query_helper_table(void) {
 void ray_query_suspend(ray_query_state_t* saved) {
     *saved = (ray_query_state_t){
         .table = g_active_query_table, .source = g_query_source_table,
-        .group_idx = g_active_query_group_idx, .row = g_active_query_row,
+        .group_idx = g_active_query_group_idx, .group_tbl = g_active_query_group_tbl,
+        .group_depth = g_active_query_group_depth, .row = g_active_query_row,
         .row_tbl = g_active_query_row_tbl, .row_depth = g_active_query_row_depth,
         .dependencies = g_query_dependencies,
     };
     g_active_query_table = NULL;
     g_query_source_table = NULL;
     g_active_query_group_idx = NULL;
+    g_active_query_group_tbl = NULL;
+    g_active_query_group_depth = 0;
     g_active_query_row = -1;
     g_active_query_row_tbl = NULL;
     g_active_query_row_depth = 0;
@@ -3930,6 +3945,8 @@ void ray_query_resume(const ray_query_state_t* saved) {
     g_active_query_table = saved->table;
     g_query_source_table = saved->source;
     g_active_query_group_idx = saved->group_idx;
+    g_active_query_group_tbl = saved->group_tbl;
+    g_active_query_group_depth = saved->group_depth;
     g_active_query_row = saved->row;
     g_active_query_row_tbl = saved->row_tbl;
     g_active_query_row_depth = saved->row_depth;
@@ -10931,9 +10948,15 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
             }
             if (bound) {
                 ray_t* prev_group_idx = g_active_query_group_idx;
+                ray_t* prev_group_tbl = g_active_query_group_tbl;
+                int32_t prev_group_depth = g_active_query_group_depth;
                 g_active_query_group_idx = empty_idx;
+                g_active_query_group_tbl = tbl;
+                g_active_query_group_depth = ray_env_scope_depth();   /* just above our own frame */
                 ray_t* cell = ray_eval(expr);
                 g_active_query_group_idx = prev_group_idx;
+                g_active_query_group_tbl = prev_group_tbl;
+                g_active_query_group_depth = prev_group_depth;
                 if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
                 if (cell && !RAY_IS_ERR(cell)) {
                     int8_t t = cell->type;
@@ -10971,9 +10994,15 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
             }
         }
         ray_t* prev_group_idx = g_active_query_group_idx;
+        ray_t* prev_group_tbl = g_active_query_group_tbl;
+        int32_t prev_group_depth = g_active_query_group_depth;
         g_active_query_group_idx = idx_list;
+        g_active_query_group_tbl = tbl;
+        g_active_query_group_depth = ray_env_scope_depth();   /* just above our own frame */
         ray_t* cell = ray_eval(expr);
         g_active_query_group_idx = prev_group_idx;
+        g_active_query_group_tbl = prev_group_tbl;
+        g_active_query_group_depth = prev_group_depth;
         if (!cell || RAY_IS_ERR(cell)) {
             g_active_query_table = _aqt;
             ray_env_pop_scope();
@@ -11488,7 +11517,7 @@ ray_t* ray_query_helper_value(int64_t sym) {
     if (!col || RAY_IS_ERR(col)) return col;
     /* Per-group evaluation: the group's rows of the column, as the
      * expression's own column references are bound. */
-    if (g_active_query_group_idx && src == g_active_query_table)
+    if (query_group_idx_applies(src))
         return slice_col_by_idx(col, g_active_query_group_idx);
     if (g_active_query_row < 0 || g_active_query_table != g_active_query_row_tbl ||
         g_active_query_row >= ray_len(col) ||
@@ -11509,7 +11538,7 @@ ray_t* ray_active_query_literal(int64_t sym) {
     if (!col || RAY_IS_ERR(col)) return col;
     /* Per-group evaluation: the group's rows, as a bare name of the
      * column is bound (ray_query_helper_value) */
-    if (g_active_query_group_idx) return slice_col_by_idx(col, g_active_query_group_idx);
+    if (query_group_idx_applies(qt)) return slice_col_by_idx(col, g_active_query_group_idx);
     if (g_active_query_row < 0 || qt != g_active_query_row_tbl ||
         g_active_query_row >= ray_len(col) ||
         ray_env_query_scope_above(g_active_query_row_depth)) {
