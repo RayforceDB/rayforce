@@ -457,7 +457,11 @@ A sort key names a column of the result. A key that names an output sorts by
 that output's values, computed or renamed, even when a source column has the
 same name; the answer is the one `xasc`/`xdesc` gives on the unsorted select. A
 source column is used only when no output has the key's name, and it is not
-added to the result:
+added to the result. That fallback applies to a plain select only: in a select
+with `by:`, or one whose outputs are all aggregates, the result rows are groups
+(or one row), so a sort key must name an output. A key that names only a
+source column there is not supported, e.g. `(select {r: (sum a) from: t by: k
+asc: c})`:
 
 ```lisp
 (set t (table [a b] (list [3 1 2] [0 2 1])))
