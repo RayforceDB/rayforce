@@ -4547,17 +4547,19 @@ static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
                    (ray_unary_fn)(uintptr_t)fn->i64 == native);
 }
 
-/* A JSON read's argument that is one value for every row: a dict, a
- * string or a quoted symbol written in place, or a name that is not a
- * column holding a string, a symbol or a dict. */
-static bool json_const_arg(ray_t* a, ray_t* tbl) {
+/* A JSON read's argument that is the same for every row: a dict, a string
+ * or a quoted symbol written in place, or a name that is not a column
+ * holding a string, a symbol or a dict, or (`path`: the path position) a
+ * string or symbol vector, one path per row as a column of paths is. */
+static bool json_const_arg(ray_t* a, ray_t* tbl, bool path) {
     if (!a) return false;
     if (a->type == RAY_DICT || a->type == -RAY_STR) return true;
     if (a->type != -RAY_SYM) return false;
     if (a->attrs & ATTR_QUOTED) return true;
     if (expr_refs_row_column(a, tbl)) return false;
     ray_t* v = ray_env_get(a->i64);
-    return v && !RAY_IS_ERR(v) && (v->type == -RAY_STR || v->type == -RAY_SYM || v->type == RAY_DICT);
+    return v && !RAY_IS_ERR(v) && (v->type == -RAY_STR || v->type == -RAY_SYM || v->type == RAY_DICT ||
+                                   (path && (v->type == RAY_STR || v->type == RAY_SYM)));
 }
 
 /* The JSON readers take a whole string column and type the result from
@@ -4595,7 +4597,7 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
         /* a JSON read's path and limits: a column, a literal, or a name
          * holding a string, a symbol or a dict (a global, a parameter, a
          * let), which is one value for every row */
-        if (json && i >= 2 && json_const_arg(el[i], tbl)) continue;
+        if (json && i >= 2 && json_const_arg(el[i], tbl, i == 2)) continue;
         int k = json_rowwise(el[i], tbl);
         if (k < 0) return -1;
         if (k > r) r = k;

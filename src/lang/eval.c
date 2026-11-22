@@ -6205,7 +6205,16 @@ ray_t* ray_eval(ray_t* obj) {
             }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
-                args[i] = ray_eval(elems[i + 1]);
+                /* .json.get's type, a quoted symbol after the path, names a
+                 * type, never a column a query would read it as */
+                ray_t* ai = elems[i + 1];
+                if (i == 2 && fn == ray_json_get_fn && ai && ai->type == -RAY_SYM &&
+                    (ai->attrs & ATTR_QUOTED)) {
+                    ray_retain(ai);
+                    args[i] = ai;
+                    continue;
+                }
+                args[i] = ray_eval(ai);
                 any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
