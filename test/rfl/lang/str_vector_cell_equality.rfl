@@ -21,6 +21,13 @@
 ;; grouping by such cells
 (count (xgroup (table [k v] (list (list c1 c2 ["x"]) [1 2 3])) [k])) -- 2
 
+;; cells of different lengths, as cells and as dict keys (an early length
+;; check, not a recursion back through atom_eq_cell_col)
+(count (distinct (list (as 'STR ["ab" "cd"]) (as 'STR ["ab"])))) -- 2
+(count (distinct (list c1 (drop c1 1)))) -- 2
+(count (distinct (list (dict (as 'STR ["a" "b"]) [1 2]) (dict (as 'STR ["a"]) [1])))) -- 2
+(count (distinct (list (dict X [1 2]) (dict (as 'STR ["LONG_A_twentyfour_chars_" "LONG_B_twentyfour_chars_"]) [1 2])))) -- 1
+
 ;; still unequal when the text differs, and short and empty strings as before
 (count (distinct (list c1 (enlist "LONG_A_twentyfour_chars_")))) -- 2
 (count (distinct (list c1 (enlist "LONG_B_twentyfour_chars")))) -- 2

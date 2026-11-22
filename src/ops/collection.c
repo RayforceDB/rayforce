@@ -1648,6 +1648,35 @@ static int sym_vec_eq(ray_t* a, ray_t* b) {
     return atom_eq_cell_col(a, b);
 }
 
+/* Two STR vectors are equal when every cell holds the same text: a pooled
+ * cell's descriptor holds its pool offset, so equal text in two pools
+ * differs by bytes (#1318).  A slice reads its parent's descriptors and
+ * pool.  Reads only, so it is safe in a pool worker. */
+static int str_vec_eq(ray_t* a, ray_t* b) {
+    if (a->len != b->len) return 0;
+    ray_t* oa = a; int64_t fa = 0;
+    ray_t* ob = b; int64_t fb = 0;
+    if (a->attrs & RAY_ATTR_SLICE) { oa = a->slice_parent; fa = a->slice_offset; }
+    if (b->attrs & RAY_ATTR_SLICE) { ob = b->slice_parent; fb = b->slice_offset; }
+    const ray_str_t* da = (const ray_str_t*)oa->data + fa;
+    const ray_str_t* db = (const ray_str_t*)ob->data + fb;
+    const char* pa = NULL; const char* pb = NULL;   /* resolved on a pooled cell */
+    for (int64_t i = 0; i < a->len; i++) {
+        const ray_str_t* x = &da[i];
+        const ray_str_t* y = &db[i];
+        if (x->len != y->len) return 0;
+        if (ray_str_is_inline(x)) {
+            if (x->len && memcmp(x->data, y->data, x->len) != 0) return 0;
+            continue;
+        }
+        if (!pa) pa = oa->str_pool ? (const char*)ray_data(oa->str_pool) : NULL;
+        if (!pb) pb = ob->str_pool ? (const char*)ray_data(ob->str_pool) : NULL;
+        if (!pa || !pb) return 0;                       /* no pool to read */
+        if (!ray_str_t_eq(x, pa, y, pb)) return 0;
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
@@ -1757,7 +1786,7 @@ int atom_eq(ray_t* a, ray_t* b) {
     case RAY_STR:
         /* By text: a descriptor holds a pool offset, so the same string
          * stored in two pools compared unequal by bytes (#1318). */
-        return b->type == RAY_STR && atom_eq_cell_col(a, b);
+        return b->type == RAY_STR && str_vec_eq(a, b);
     default:
         /* Vector equality: same type and length, element-wise comparison */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
