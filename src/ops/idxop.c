@@ -5076,6 +5076,16 @@ int64_t ray_index_find_atom(ray_t* col, ray_t* a) {
         return hx_get(ix->u.hash.rows, hx_get(ix->u.hash.offs, gid));
     }
     default: {
+        /* As ray_index_find_vec: a DATE, TIME or TIMESTAMP meets only its own
+         * type by payload (atom_eq never matches a DATE to a TIMESPAN or an
+         * int, and meets a TIME or a TIMESTAMP with a TIMESPAN as a
+         * duration), and a float column keeps the scan's promotion (#1350). */
+        int8_t at = (int8_t)-a->type;
+        if (col->type == RAY_F32 || col->type == RAY_F64) return -2;
+        if (col->type != at &&
+            (col->type == RAY_DATE || col->type == RAY_TIME || col->type == RAY_TIMESTAMP ||
+             at == RAY_DATE || at == RAY_TIME || at == RAY_TIMESTAMP))
+            return -2;
         int64_t k = 0;
         if (!int_atom_key(a, &k)) return -2;
         return ray_index_find_row(col, k);

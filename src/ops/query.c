@@ -14300,6 +14300,44 @@ static ray_t* scalar_result_col(ray_t* value) {
     return value;
 }
 
+/* Does `e`, evaluated once over the columns, give the vector the per-row
+ * pass builds: an elementwise expression (update_expr_elementwise), each
+ * `if` in it at any depth chosen per row by the blend (query_eval_bound). */
+static bool scalar_edge_src_vectorizes(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) < 2)
+        return update_expr_elementwise(e, tbl, true);
+    if (depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (!rw_if_kind(e, tbl)) {
+        ray_t* h = es[0];
+        if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+            tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+        ray_t* fn = ray_env_get(h->i64);
+        if (!fn || RAY_IS_ERR(fn) || fn->type < RAY_UNARY || fn->type > RAY_VARY ||
+            !(fn->attrs & RAY_FN_ATOMIC)) return false;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!scalar_edge_src_vectorizes(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* `(first v)` / `(last v)` in a select skip a typed vector's nulls, as the
+ * compiled route's reduction does (exec_reduction): the first (last)
+ * non-null cell.  NULL leaves `v` to the builtin: no null in it, every
+ * cell null or none (its positional cell is that type's null), a LIST or
+ * an atom. */
+static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
+    if (!ray_is_vec(v) || v->type == RAY_LIST || !ray_vec_may_have_nulls(v)) return NULL;
+    int64_t n = v->len, r = -1;
+    if (last) { for (int64_t i = n - 1; i >= 0; i--) if (!ray_vec_is_null(v, i)) { r = i; break; } }
+    else      { for (int64_t i = 0; i < n; i++)      if (!ray_vec_is_null(v, i)) { r = i; break; } }
+    if (r < 0) return NULL;
+    int alloc = 0;
+    ray_t* x = collection_elem(v, r, &alloc);
+    if (x && !RAY_IS_ERR(x) && !alloc) ray_retain(x);
+    return x ? x : ray_error("oom", NULL);
+}
+
 static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
                                       ray_t* tbl,
                                       int64_t from_id, int64_t where_id,
@@ -14346,6 +14384,8 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         ray_t* agg_src_expr = query_inline_helpers(agg_elems[1], tbl);
         ray_t* src = NULL;
         bool column_free = false;
+        ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+        bool edge = uf == ray_first_fn || uf == ray_last_fn;
         if (is_whole_column_projection(agg_src_expr, tbl) ||
             expr_is_constant_collection(agg_src_expr, tbl, NULL))
             src = eval_expr_whole_column_impl(agg_src_expr, tbl);
@@ -14370,15 +14410,28 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
                 src = cells ? cells : ray_error("oom", NULL);
             }
         }
-        else src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+        else {
+            /* first/last of an elementwise source: its column in one
+             * vectorized pass (an `if` blended per row), not one eval per
+             * row.  Anything else, or a pass that fails or is not one
+             * value per row, runs per row as before. */
+            if (edge && scalar_edge_src_vectorizes(agg_src_expr, tbl, 0)) {
+                src = eval_expr_whole_column_impl(agg_src_expr, tbl);
+                if (src && RAY_IS_ERR(src)) { rw_swallow(src); src = NULL; }
+                else if (src && ((!ray_is_vec(src) && src->type != RAY_LIST) || src->len != nrows)) {
+                    ray_release(src); src = NULL;
+                }
+            }
+            if (!src) src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+        }
         ray_release(agg_src_expr);
         if (!src || RAY_IS_ERR(src)) {
             ray_release(result);
             return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
         }
 
-        ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-        ray_t* agg_value = uf(src);
+        ray_t* agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
+        if (!agg_value) agg_value = uf(src);
         ray_release(src);
         if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
             agg_value = ray_lazy_materialize(agg_value);

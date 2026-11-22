@@ -6577,8 +6577,9 @@ static test_result_t test_eval_insert_parted_inplace_text_nulls_impl(const char*
 
     ASSERT_EQ("(count (select {from: pn where: (nil? acct)}))", "1");
     ASSERT_EQ("(count (select {from: pn where: (nil? note)}))", "1");
-    ASSERT_EQ("(nil? (at (at (select {m: (first (asc acct)) from: pn}) 'm) 0))", "true");
-    ASSERT_EQ("(at (select {n: (first (asc note)) from: pn}) 'n)", "[\"\"]");
+    /* the sorted column leads with the nulls (a select's first skips them) */
+    ASSERT_EQ("(nil? (first (at (select {m: (asc acct) from: pn}) 'm)))", "true");
+    ASSERT_EQ("(first (at (select {n: (asc note) from: pn}) 'n))", "\"\"");
     PASS();
 }
 
