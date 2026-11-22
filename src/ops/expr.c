@@ -2323,10 +2323,11 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
  * the mark_i64_overflow_as_null post-pass (INT64_MIN result → null). */
 static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void* dp,
                              int8_t t1, const void* ap, int64_t n) {
-    if (opcode == OP_CAST) {
-        dt = expr_cast_lane_type(dt);
-        t1 = expr_cast_lane_type(t1);
-    }
+    /* A CAST to DATE / TIME / TIMESTAMP (xbar, temporal %) leaves a
+     * register typed by its temporal result; every reader of it (ISNULL,
+     * NOT, a chained CAST) dispatches on the lane it sits in (#1339). */
+    t1 = expr_cast_lane_type(t1);
+    if (opcode == OP_CAST) dt = expr_cast_lane_type(dt);
     if (dt == RAY_F64) {
         double* d = (double*)dp;
         if (t1 == RAY_F64) {
