@@ -491,7 +491,12 @@ int    atom_eq(ray_t* a, ray_t* b);
  * Pass spans = ray_key_spans() over every cell the set will compare. */
 #define RAY_KEY_SPAN_ATOM 1
 #define RAY_KEY_SPAN_VEC  2
+/* Not a span bit: the key set holds no float atom and no TIMESPAN
+ * (ray_key_float_free), so atom_eq meets integer atoms exactly and they
+ * hash by their integer value, not their double (#1333). */
+#define RAY_KEY_EXACT_INT 4
 uint64_t ray_key_hash(ray_t* x, int spans);
+bool ray_key_float_free(ray_t* x);
 int      ray_key_spans(ray_t* x);
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 

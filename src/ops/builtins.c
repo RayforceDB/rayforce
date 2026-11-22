@@ -3313,7 +3313,14 @@ static _Atomic(int64_t) group_boxed_i64_runs = 0;
 
 typedef struct { ray_t** gkeys; int spans; bool exact_i64; bool counted; } ght_list_ctx_t;
 static uint64_t ght_list_hash(ray_t* key, ght_list_ctx_t* c) {
-    if (!c->exact_i64) return ray_key_hash(key, c->spans);
+    if (!c->exact_i64) {
+        /* the float-free exact-integer hash counts as the same route */
+        if ((c->spans & RAY_KEY_EXACT_INT) && !c->counted) {
+            atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
+            c->counted = true;
+        }
+        return ray_key_hash(key, c->spans);
+    }
     uint64_t h = ray_hash_i64(key->i64);
     /* Count actual exact-hash use once per invocation, not per key. */
     if (!c->counted) {
@@ -3438,8 +3445,26 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         for (int64_t i = 0; i < n; i++) {
             if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
         }
-        ght_list_ctx_t lctx = { .gkeys = gkeys,
-            .spans = exact_i64 ? 0 : ray_key_spans(x), .exact_i64 = exact_i64 };
+        /* One walk gathers the cells' span bits (as ray_key_spans) and
+         * whether any float atom is present.  A set with neither hashes
+         * integer atoms at any depth by their integer value (#1333). */
+        int lspans = 0;
+        bool float_free = true;
+        if (!exact_i64) {
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* c = elems[i];
+                if (!c) continue;
+                if (c->type < 0) {
+                    if (c->type == -RAY_TIMESPAN) lspans |= RAY_KEY_SPAN_ATOM;
+                    else if (c->type == -RAY_F64 || c->type == -RAY_F32) float_free = false;
+                } else {
+                    if (lspans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) lspans |= ray_key_spans(c);
+                    if (float_free && !ray_key_float_free(c)) float_free = false;
+                }
+            }
+            if (lspans == 0 && float_free) lspans = RAY_KEY_EXACT_INT;
+        }
+        ght_list_ctx_t lctx = { .gkeys = gkeys, .spans = lspans, .exact_i64 = exact_i64 };
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
