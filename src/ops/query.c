@@ -4562,6 +4562,47 @@ static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
  * semantics and is left to the per-row path. */
+/* The JSON readers take a whole string column and type the result from
+ * every row's value (a missing field is that type's null); one cell at a
+ * time each row would come back untyped, and an element-wise call around
+ * it would meet an untyped null.  Their value at a row is the row's alone,
+ * so a tree of element-wise builtins (RAY_FN_ATOMIC) over columns, literals
+ * and JSON reads of a column has, over the whole column, its per-row
+ * answer.  1: such a tree with a JSON read of a column in it; 0: an
+ * element-wise tree without one; -1: anything else (a free name, a lambda,
+ * an order-dependent or aggregate call, a JSON read of constants, which
+ * keeps its per-row, broadcast answer).  A dotted name cannot be rebound. */
+static int json_rowwise(ray_t* e, ray_t* tbl) {
+    if (!e || RAY_IS_ERR(e)) return -1;
+    if (e->type == -RAY_SYM)
+        return (e->attrs & ATTR_QUOTED) || expr_refs_row_column(e, tbl) ? 0 : -1;
+    if (e->type < 0) return 0;
+    if (e->type != RAY_LIST || ray_len(e) < 2) return -1;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* head = el[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return -1;
+    ray_t* hs = ray_sym_str(head->i64);
+    size_t hl = hs ? ray_str_len(hs) : 0;
+    const char* hp = hs ? ray_str_ptr(hs) : "";
+    bool json = (hl == 9 && memcmp(hp, ".json.get", 9) == 0) ||
+                (hl == 11 && memcmp(hp, ".json.parse", 11) == 0);
+    if (json && !expr_refs_row_column(el[1], tbl)) return -1;
+    if (!json) {
+        ray_t* fn = ray_env_get(head->i64);
+        if (!fn || RAY_IS_ERR(fn) || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
+            !(fn->attrs & RAY_FN_ATOMIC)) return -1;
+    }
+    int r = json ? 1 : 0;
+    for (int64_t i = 1; i < ray_len(e); i++) {
+        /* a limits dict passed to a JSON read is a constant */
+        if (json && i == 3 && el[i]->type == RAY_DICT) continue;
+        int k = json_rowwise(el[i], tbl);
+        if (k < 0) return -1;
+        if (k > r) r = k;
+    }
+    return r;
+}
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -4581,14 +4622,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!s) return 0;
     size_t l = ray_str_len(s);
     const char* p = ray_str_ptr(s);
-    /* The JSON readers take a whole string column and type the result from
-     * every row's value (a missing field is that type's null); one cell at
-     * a time each row would come back untyped.  Their value at a row is the
-     * row's alone, so one call over the column is the per-row answer.  A
-     * dotted name cannot be rebound. */
-    if ((l == 9 && memcmp(p, ".json.get", 9) == 0) ||
-        (l == 11 && memcmp(p, ".json.parse", 11) == 0))
-        return 1;
+    if (json_rowwise(expr, tbl) == 1) return 1;
     if (l == 6 && memcmp(p, "concat", 6) == 0) {
         /* Preserve row-wise text concatenation when another projection
          * forces fallback, but evaluate collection concat once. Compilation
