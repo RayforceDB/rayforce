@@ -1,0 +1,905 @@
+;; pivot_value_types.rfl — pivot keeps the aggregate's result type (#1398).
+;; @requires: posix
+;;
+;; pivot has two routes: OP_PIVOT for sum avg min max count first last
+;; (pivot.c exec_pivot) and a generic one for med and lambdas (tblop.c),
+;; which calls the aggregate per cell.  Every value column must be what the
+;; aggregate gives over a plain vector, or its own error: the generic route
+;; built I64 unless the result was F64 (SYM ids, STR and GUID pointers,
+;; F32 1.5 -> 1, DATE/TIME/TIMESTAMP lost their type), and OP_PIVOT summed
+;; SYM/GUID/LIST/DATE/TIMESTAMP words, gave zero GUIDs for first/min, raised
+;; oom for LIST first/min, typed TIME/TIMESPAN sums and TIMESPAN avg as
+;; I64/F64, and filled a missing TIMESPAN cell with 0 instead of null.
+;; Missing cells are typed nulls (BOOL and U8 vectors hold none: 0).
+;;
+;; Index columns of every type group on both routes, flat and parted: a
+;; LIST index raised oom (OP_PIVOT) or `vec_new ... got LIST` (generic), a
+;; parted STR index collapsed to one row keyed "", SYM/STR index columns
+;; came back boxed, and the generic route failed on any parted table.
+;;
+;; Each value type is pinned per route, and the routes are checked against
+;; each other: (pivot T .. agg) == (pivot T .. (fn [x] (agg x))).
+;; One table holds every column: k/p/n, a value column v<TYPE> and an index
+;; column k<TYPE> per type.  k a a b b c c, p x y x y x x: cell c/y has no row.
+(set W (table [k p n vI64 vI32 vI16 vU8 vBOOL vF64 vF32 vDATE vTIME vTIMESTAMP vTIMESPAN vSYM vSTR vGUID vLIST kI64 kI32 kI16 kU8 kBOOL kF64 kF32 kDATE kTIME kTIMESTAMP kTIMESPAN kSYM kSTR kGUID kLIST fI16 lI16 fI32 lI32 fDATE lDATE fTIME lTIME fTIMESTAMP lTIMESTAMP fTIMESPAN lTIMESPAN fI64 lI64 fF64 lF64 fF32 lF32 fSYM lSYM z zf] (list [a a b b c c] [x y x y x x] [1 2 3 4 5 6] (as 'I64 [1 2 3 4 5 6]) (as 'I32 [1 2 3 4 5 6]) (as 'I16 [1 2 3 4 5 6]) (as 'U8 [1 2 3 4 5 6]) (as 'BOOL [1 0 1 1 0 1]) (as 'F64 [1.5 2.5 3.5 4.5 5.5 6.5]) (as 'F32 [1.5 2.5 3.5 4.5 5.5 6.5]) (as 'DATE [1 2 3 4 5 6]) (as 'TIME [1 2 3 4 5 6]) (as 'TIMESTAMP [1 2 3 4 5 6]) (as 'TIMESPAN [1 2 3 4 5 6]) ['s1 's2 's3 's4 's5 's6] (list "aa" "bb" "cc" "dd" "ee" "ff") (concat (as 'GUID "00000001-1111-1111-1111-111111111111") (concat (as 'GUID "00000002-1111-1111-1111-111111111111") (concat (as 'GUID "00000003-1111-1111-1111-111111111111") (concat (as 'GUID "00000004-1111-1111-1111-111111111111") (concat (as 'GUID "00000005-1111-1111-1111-111111111111") (as 'GUID "00000006-1111-1111-1111-111111111111")))))) (list [1 2] [3] [4 5] [6] [7 8] [9]) (as 'I64 [7 7 3 3 5 5]) (as 'I32 [7 7 3 3 5 5]) (as 'I16 [7 7 3 3 5 5]) (as 'U8 [7 7 3 3 5 5]) (as 'BOOL [1 1 0 0 1 0]) (as 'F64 [7.5 7.5 3.5 3.5 5.5 5.5]) (as 'F32 [7.5 7.5 3.5 3.5 5.5 5.5]) (as 'DATE [7 7 3 3 5 5]) (as 'TIME [7 7 3 3 5 5]) (as 'TIMESTAMP [7 7 3 3 5 5]) (as 'TIMESPAN [7 7 3 3 5 5]) ['k7 'k7 'k3 'k3 'k5 'k5] (list "k7" "k7" "k3" "k3" "k5" "k5") (concat (as 'GUID "00000007-1111-1111-1111-111111111111") (concat (as 'GUID "00000007-1111-1111-1111-111111111111") (concat (as 'GUID "00000003-1111-1111-1111-111111111111") (concat (as 'GUID "00000003-1111-1111-1111-111111111111") (concat (as 'GUID "00000005-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111")))))) (list [7 1] [7 1] [3] [3] [5 5] [5 5]) (as 'I16 [1 2 3 4 0Nl 6]) (as 'I16 [1 2 3 4 5 0Nl]) (as 'I32 [1 2 3 4 0Nl 6]) (as 'I32 [1 2 3 4 5 0Nl]) (as 'DATE [1 2 3 4 0Nl 6]) (as 'DATE [1 2 3 4 5 0Nl]) (as 'TIME [1 2 3 4 0Nl 6]) (as 'TIME [1 2 3 4 5 0Nl]) (as 'TIMESTAMP [1 2 3 4 0Nl 6]) (as 'TIMESTAMP [1 2 3 4 5 0Nl]) (as 'TIMESPAN [1 2 3 4 0Nl 6]) (as 'TIMESPAN [1 2 3 4 5 0Nl]) (as 'I64 [1 2 3 4 0Nl 6]) (as 'I64 [1 2 3 4 5 0Nl]) (as 'F64 [1 2 3 4 0Nf 6]) (as 'F64 [1 2 3 4 5 0Nf]) (as 'F32 [1 2 3 4 0Nf 6]) (as 'F32 [1 2 3 4 5 0Nf]) (as 'SYM ["s1" "s2" "s3" "s4" "" "s6"]) (as 'SYM ["s1" "s2" "s3" "s4" "s5" ""]) (* [-1.0 1.0 1.0 1.0 1.0 1.0] [0.0 0.0 0.0 0.0 0.0 0.0]) (as 'F32 (* [-1.0 1.0 1.0 1.0 1.0 1.0] [0.0 0.0 0.0 0.0 0.0 0.0])))))
+(.sys.exec "rm -rf /tmp/rfl_pivot_value_types")
+(.db.splayed.set "/tmp/rfl_pivot_value_types/2024.01.01/t/" (take W 3) "/tmp/rfl_pivot_value_types/.sym")
+(.db.splayed.set "/tmp/rfl_pivot_value_types/2024.01.02/t/" (drop W 3) "/tmp/rfl_pivot_value_types/.sym")
+(set P (.db.parted.get "/tmp/rfl_pivot_value_types" 't))
+(count P) -- 6
+;; ---- value types, flat table
+;; I64 values
+(set R (pivot W 'k 'p 'vI64 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI64 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI64 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vI64 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical (try (pivot W 'k 'p 'vI64 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI64 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI64 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; I32 values
+(set R (pivot W 'k 'p 'vI32 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 5i] [2i 4i 0Ni]))) -- true
+(set R (pivot W 'k 'p 'vI32 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI32 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vI32 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 5i] [2i 4i 0Ni]))) -- true
+(identical (try (pivot W 'k 'p 'vI32 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI32 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI32 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; I16 values
+(set R (pivot W 'k 'p 'vI16 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI16 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 5h] [2h 4h 0Nh]))) -- true
+(set R (pivot W 'k 'p 'vI16 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vI16 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vI16 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 5h] [2h 4h 0Nh]))) -- true
+(identical (try (pivot W 'k 'p 'vI16 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vI16 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vI16 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; U8 values
+(set R (pivot W 'k 'p 'vU8 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vU8 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0x01 0x03 0x05] [0x02 0x04 0x00]))) -- true
+(set R (pivot W 'k 'p 'vU8 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vU8 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vU8 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0x01 0x03 0x05] [0x02 0x04 0x00]))) -- true
+(identical (try (pivot W 'k 'p 'vU8 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vU8 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vU8 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; BOOL values
+(set R (pivot W 'k 'p 'vBOOL sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 1] [0 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vBOOL first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [true true false] [false true false]))) -- true
+(set R (pivot W 'k 'p 'vBOOL count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vBOOL med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 1.0 0.5] [0.0 1.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vBOOL (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [true true false] [false true false]))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vBOOL max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vBOOL (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; F64 values
+(set R (pivot W 'k 'p 'vF64 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 12.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vF64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 5.5] [2.5 4.5 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vF64 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vF64 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 6.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vF64 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 5.5] [2.5 4.5 0Nf]))) -- true
+(identical (try (pivot W 'k 'p 'vF64 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF64 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF64 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; F32 values
+(set R (pivot W 'k 'p 'vF32 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 12.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vF32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5e 3.5e 5.5e] [2.5e 4.5e 0Ne]))) -- true
+(set R (pivot W 'k 'p 'vF32 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vF32 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 6.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vF32 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5e 3.5e 5.5e] [2.5e 4.5e 0Ne]))) -- true
+(identical (try (pivot W 'k 'p 'vF32 sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vF32 max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vF32 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; DATE values
+(pivot W 'k 'p 'vDATE sum) !- type
+(set R (pivot W 'k 'p 'vDATE first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 2000.01.06] [2000.01.03 2000.01.05 0Nd]))) -- true
+(set R (pivot W 'k 'p 'vDATE count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vDATE med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vDATE (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 2000.01.06] [2000.01.03 2000.01.05 0Nd]))) -- true
+(identical (try (pivot W 'k 'p 'vDATE sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vDATE max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vDATE (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIME values
+(set R (pivot W 'k 'p 'vTIME sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.011] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot W 'k 'p 'vTIME first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.005] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot W 'k 'p 'vTIME count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vTIME med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vTIME (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.005] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(identical (try (pivot W 'k 'p 'vTIME sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIME max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIME (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIMESTAMP values
+(pivot W 'k 'p 'vTIMESTAMP sum) !- type
+(set R (pivot W 'k 'p 'vTIMESTAMP first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(set R (pivot W 'k 'p 'vTIMESTAMP count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vTIMESTAMP med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'vTIMESTAMP (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESTAMP max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESTAMP (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIMESPAN values
+(set R (pivot W 'k 'p 'vTIMESPAN sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000011] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot W 'k 'p 'vTIMESPAN first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000005] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot W 'k 'p 'vTIMESPAN count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot W 'k 'p 'vTIMESPAN med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000006] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot W 'k 'p 'vTIMESPAN (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000005] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vTIMESPAN max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vTIMESPAN (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; SYM values
+(pivot W 'k 'p 'vSYM sum) !- type
+(set R (pivot W 'k 'p 'vSYM first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "s5")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(set R (pivot W 'k 'p 'vSYM count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot W 'k 'p 'vSYM med) !- type
+(set R (pivot W 'k 'p 'vSYM (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "s5")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(identical (try (pivot W 'k 'p 'vSYM sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSYM max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSYM (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; STR values
+(pivot W 'k 'p 'vSTR sum) !- type
+(set R (pivot W 'k 'p 'vSTR first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) ["aa" "cc" "ee"] ["bb" "dd" ""]))) -- true
+(set R (pivot W 'k 'p 'vSTR count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot W 'k 'p 'vSTR med) !- type
+(set R (pivot W 'k 'p 'vSTR (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) ["aa" "cc" "ee"] ["bb" "dd" ""]))) -- true
+(identical (try (pivot W 'k 'p 'vSTR sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vSTR max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vSTR (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; GUID values
+(pivot W 'k 'p 'vGUID sum) !- type
+(set R (pivot W 'k 'p 'vGUID first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'GUID (list (as 'GUID "00000001-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) (as 'GUID (list (as 'GUID "00000002-1111-1111-1111-111111111111") (as 'GUID "00000004-1111-1111-1111-111111111111") 0Ng))))) -- true
+(set R (pivot W 'k 'p 'vGUID count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot W 'k 'p 'vGUID med) !- type
+(set R (pivot W 'k 'p 'vGUID (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'GUID (list (as 'GUID "00000001-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) (as 'GUID (list (as 'GUID "00000002-1111-1111-1111-111111111111") (as 'GUID "00000004-1111-1111-1111-111111111111") 0Ng))))) -- true
+(identical (try (pivot W 'k 'p 'vGUID sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vGUID max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vGUID (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; LIST values
+(pivot W 'k 'p 'vLIST sum) !- type
+(set R (pivot W 'k 'p 'vLIST first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (list [1 2] [4 5] [7 8]) (list [3] [6] null)))) -- true
+(set R (pivot W 'k 'p 'vLIST count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot W 'k 'p 'vLIST med) !- type
+(set R (pivot W 'k 'p 'vLIST (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (list [1 2] [4 5] [7 8]) (list [3] [6] null)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST sum) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST first) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST last) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST count) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST avg) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST min) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot W 'k 'p 'vLIST max) (fn [e] (at e 'code))) (try (pivot W 'k 'p 'vLIST (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; ---- first/last over a column with a null (row 4 opens cell c/x, row 5
+;; closes it): OP_PIVOT skips nulls, the builtin only for I64/F64/F32,
+;; so these columns take the generic route; flat table
+(set R (pivot W 'k 'p 'fI16 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 0Nh] [2h 4h 0Nh]))) -- true
+(set R (pivot W 'k 'p 'lI16 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 0Nh] [2h 4h 0Nh]))) -- true
+(identical (pivot W 'k 'p 'fI16 first) (pivot W 'k 'p 'fI16 (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lI16 last) (pivot W 'k 'p 'lI16 (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fI32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 0Ni] [2i 4i 0Ni]))) -- true
+(set R (pivot W 'k 'p 'lI32 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 0Ni] [2i 4i 0Ni]))) -- true
+(identical (pivot W 'k 'p 'fI32 first) (pivot W 'k 'p 'fI32 (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lI32 last) (pivot W 'k 'p 'lI32 (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fDATE first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 0Nd] [2000.01.03 2000.01.05 0Nd]))) -- true
+(set R (pivot W 'k 'p 'lDATE last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 0Nd] [2000.01.03 2000.01.05 0Nd]))) -- true
+(identical (pivot W 'k 'p 'fDATE first) (pivot W 'k 'p 'fDATE (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lDATE last) (pivot W 'k 'p 'lDATE (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fTIME first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 0Nt] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot W 'k 'p 'lTIME last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 0Nt] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(identical (pivot W 'k 'p 'fTIME first) (pivot W 'k 'p 'fTIME (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lTIME last) (pivot W 'k 'p 'lTIME (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fTIMESTAMP first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 0Np] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(set R (pivot W 'k 'p 'lTIMESTAMP last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 0Np] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(identical (pivot W 'k 'p 'fTIMESTAMP first) (pivot W 'k 'p 'fTIMESTAMP (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lTIMESTAMP last) (pivot W 'k 'p 'lTIMESTAMP (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fTIMESPAN first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0Nn] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot W 'k 'p 'lTIMESPAN last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0Nn] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(identical (pivot W 'k 'p 'fTIMESPAN first) (pivot W 'k 'p 'fTIMESPAN (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lTIMESPAN last) (pivot W 'k 'p 'lTIMESPAN (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fI64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 6] [2 4 0Nl]))) -- true
+(set R (pivot W 'k 'p 'lI64 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical (pivot W 'k 'p 'fI64 first) (pivot W 'k 'p 'fI64 (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lI64 last) (pivot W 'k 'p 'lI64 (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fF64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 6.0] [2.0 4.0 0Nf]))) -- true
+(set R (pivot W 'k 'p 'lF64 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.0] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'k 'p 'fF64 first) (pivot W 'k 'p 'fF64 (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lF64 last) (pivot W 'k 'p 'lF64 (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fF32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 6e] [2e 4e 0Ne]))) -- true
+(set R (pivot W 'k 'p 'lF32 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 5e] [2e 4e 0Ne]))) -- true
+(identical (pivot W 'k 'p 'fF32 first) (pivot W 'k 'p 'fF32 (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lF32 last) (pivot W 'k 'p 'lF32 (fn [x] (last x)))) -- true
+(set R (pivot W 'k 'p 'fSYM first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(set R (pivot W 'k 'p 'lSYM last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(identical (pivot W 'k 'p 'fSYM first) (pivot W 'k 'p 'fSYM (fn [x] (first x)))) -- true
+(identical (pivot W 'k 'p 'lSYM last) (pivot W 'k 'p 'lSYM (fn [x] (last x)))) -- true
+;; ---- an F64 index key whose first row holds -0.0 reads 0.0 on both routes
+(set R (pivot W 'z 'p 'n med))
+(identical R (table (as 'SYM (list "z" "x" "y")) (list [-0.0] [4.0] [3.0]))) -- true
+;; identical does not tell -0.0 from 0.0; the printed key does
+(repr (at R 'z)) -- "[0.0]"
+(set R (pivot W 'z 'p 'n sum))
+(identical R (table (as 'SYM (list "z" "x" "y")) (list [0.0] [15] [6]))) -- true
+(repr (at R 'z)) -- "[0.0]"
+;; the same for an F32 index key: it reads 0e, as on OP_PIVOT
+(set R (pivot W 'zf 'p 'n med))
+(repr (at R 'zf)) -- "[0e]"
+(set R (pivot W 'zf 'p 'n sum))
+(repr (at R 'zf)) -- "[0e]"
+;; ---- index types, flat table
+;; I64 index
+(set R (pivot W 'kI64 'p 'n sum))
+(identical R (table (as 'SYM (list "kI64" "x" "y")) (list [7 3 5] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kI64 'p 'n med))
+(identical R (table (as 'SYM (list "kI64" "x" "y")) (list [7 3 5] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kI64 'p 'n sum) (pivot W 'kI64 'p 'n (fn [x] (sum x)))) -- true
+;; I32 index
+(set R (pivot W 'kI32 'p 'n sum))
+(identical R (table (as 'SYM (list "kI32" "x" "y")) (list [7i 3i 5i] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kI32 'p 'n med))
+(identical R (table (as 'SYM (list "kI32" "x" "y")) (list [7i 3i 5i] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kI32 'p 'n sum) (pivot W 'kI32 'p 'n (fn [x] (sum x)))) -- true
+;; I16 index
+(set R (pivot W 'kI16 'p 'n sum))
+(identical R (table (as 'SYM (list "kI16" "x" "y")) (list [7h 3h 5h] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kI16 'p 'n med))
+(identical R (table (as 'SYM (list "kI16" "x" "y")) (list [7h 3h 5h] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kI16 'p 'n sum) (pivot W 'kI16 'p 'n (fn [x] (sum x)))) -- true
+;; U8 index
+(set R (pivot W 'kU8 'p 'n sum))
+(identical R (table (as 'SYM (list "kU8" "x" "y")) (list [0x07 0x03 0x05] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kU8 'p 'n med))
+(identical R (table (as 'SYM (list "kU8" "x" "y")) (list [0x07 0x03 0x05] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kU8 'p 'n sum) (pivot W 'kU8 'p 'n (fn [x] (sum x)))) -- true
+;; BOOL index
+(set R (pivot W 'kBOOL 'p 'n sum))
+(identical R (table (as 'SYM (list "kBOOL" "x" "y")) (list [true false] [6 9] [2 4]))) -- true
+(set R (pivot W 'kBOOL 'p 'n med))
+(identical R (table (as 'SYM (list "kBOOL" "x" "y")) (list [true false] [3.0 4.5] [2.0 4.0]))) -- true
+(identical (pivot W 'kBOOL 'p 'n sum) (pivot W 'kBOOL 'p 'n (fn [x] (sum x)))) -- true
+;; F64 index
+(set R (pivot W 'kF64 'p 'n sum))
+(identical R (table (as 'SYM (list "kF64" "x" "y")) (list [7.5 3.5 5.5] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kF64 'p 'n med))
+(identical R (table (as 'SYM (list "kF64" "x" "y")) (list [7.5 3.5 5.5] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kF64 'p 'n sum) (pivot W 'kF64 'p 'n (fn [x] (sum x)))) -- true
+;; F32 index
+(set R (pivot W 'kF32 'p 'n sum))
+(identical R (table (as 'SYM (list "kF32" "x" "y")) (list [7.5e 3.5e 5.5e] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kF32 'p 'n med))
+(identical R (table (as 'SYM (list "kF32" "x" "y")) (list [7.5e 3.5e 5.5e] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kF32 'p 'n sum) (pivot W 'kF32 'p 'n (fn [x] (sum x)))) -- true
+;; DATE index
+(set R (pivot W 'kDATE 'p 'n sum))
+(identical R (table (as 'SYM (list "kDATE" "x" "y")) (list [2000.01.08 2000.01.04 2000.01.06] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kDATE 'p 'n med))
+(identical R (table (as 'SYM (list "kDATE" "x" "y")) (list [2000.01.08 2000.01.04 2000.01.06] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kDATE 'p 'n sum) (pivot W 'kDATE 'p 'n (fn [x] (sum x)))) -- true
+;; TIME index
+(set R (pivot W 'kTIME 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIME" "x" "y")) (list [00:00:00.007 00:00:00.003 00:00:00.005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kTIME 'p 'n med))
+(identical R (table (as 'SYM (list "kTIME" "x" "y")) (list [00:00:00.007 00:00:00.003 00:00:00.005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kTIME 'p 'n sum) (pivot W 'kTIME 'p 'n (fn [x] (sum x)))) -- true
+;; TIMESTAMP index
+(set R (pivot W 'kTIMESTAMP 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIMESTAMP" "x" "y")) (list [2000.01.01D00:00:00.000000007 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kTIMESTAMP 'p 'n med))
+(identical R (table (as 'SYM (list "kTIMESTAMP" "x" "y")) (list [2000.01.01D00:00:00.000000007 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kTIMESTAMP 'p 'n sum) (pivot W 'kTIMESTAMP 'p 'n (fn [x] (sum x)))) -- true
+;; TIMESPAN index
+(set R (pivot W 'kTIMESPAN 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIMESPAN" "x" "y")) (list [0D00:00:00.000000007 0D00:00:00.000000003 0D00:00:00.000000005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kTIMESPAN 'p 'n med))
+(identical R (table (as 'SYM (list "kTIMESPAN" "x" "y")) (list [0D00:00:00.000000007 0D00:00:00.000000003 0D00:00:00.000000005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kTIMESPAN 'p 'n sum) (pivot W 'kTIMESPAN 'p 'n (fn [x] (sum x)))) -- true
+;; SYM index
+(set R (pivot W 'kSYM 'p 'n sum))
+(identical R (table (as 'SYM (list "kSYM" "x" "y")) (list (as 'SYM (list "k7" "k3" "k5")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kSYM 'p 'n med))
+(identical R (table (as 'SYM (list "kSYM" "x" "y")) (list (as 'SYM (list "k7" "k3" "k5")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kSYM 'p 'n sum) (pivot W 'kSYM 'p 'n (fn [x] (sum x)))) -- true
+;; STR index
+(set R (pivot W 'kSTR 'p 'n sum))
+(identical R (table (as 'SYM (list "kSTR" "x" "y")) (list ["k7" "k3" "k5"] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kSTR 'p 'n med))
+(identical R (table (as 'SYM (list "kSTR" "x" "y")) (list ["k7" "k3" "k5"] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kSTR 'p 'n sum) (pivot W 'kSTR 'p 'n (fn [x] (sum x)))) -- true
+;; GUID index
+(set R (pivot W 'kGUID 'p 'n sum))
+(identical R (table (as 'SYM (list "kGUID" "x" "y")) (list (as 'GUID (list (as 'GUID "00000007-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kGUID 'p 'n med))
+(identical R (table (as 'SYM (list "kGUID" "x" "y")) (list (as 'GUID (list (as 'GUID "00000007-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kGUID 'p 'n sum) (pivot W 'kGUID 'p 'n (fn [x] (sum x)))) -- true
+;; LIST index
+(set R (pivot W 'kLIST 'p 'n sum))
+(identical R (table (as 'SYM (list "kLIST" "x" "y")) (list (list [7 1] [3] [5 5]) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot W 'kLIST 'p 'n med))
+(identical R (table (as 'SYM (list "kLIST" "x" "y")) (list (list [7 1] [3] [5 5]) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot W 'kLIST 'p 'n sum) (pivot W 'kLIST 'p 'n (fn [x] (sum x)))) -- true
+;; ---- value types, parted table
+;; I64 values
+(set R (pivot P 'k 'p 'vI64 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI64 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI64 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vI64 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical (try (pivot P 'k 'p 'vI64 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI64 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI64 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; I32 values
+(set R (pivot P 'k 'p 'vI32 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 5i] [2i 4i 0Ni]))) -- true
+(set R (pivot P 'k 'p 'vI32 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI32 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vI32 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 5i] [2i 4i 0Ni]))) -- true
+(identical (try (pivot P 'k 'p 'vI32 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI32 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI32 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; I16 values
+(set R (pivot P 'k 'p 'vI16 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI16 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 5h] [2h 4h 0Nh]))) -- true
+(set R (pivot P 'k 'p 'vI16 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vI16 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vI16 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 5h] [2h 4h 0Nh]))) -- true
+(identical (try (pivot P 'k 'p 'vI16 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vI16 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vI16 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; U8 values
+(set R (pivot P 'k 'p 'vU8 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vU8 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0x01 0x03 0x05] [0x02 0x04 0x00]))) -- true
+(set R (pivot P 'k 'p 'vU8 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vU8 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vU8 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0x01 0x03 0x05] [0x02 0x04 0x00]))) -- true
+(identical (try (pivot P 'k 'p 'vU8 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vU8 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vU8 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; BOOL values
+(set R (pivot P 'k 'p 'vBOOL sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 1] [0 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vBOOL first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [true true false] [false true false]))) -- true
+(set R (pivot P 'k 'p 'vBOOL count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vBOOL med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 1.0 0.5] [0.0 1.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vBOOL (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [true true false] [false true false]))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vBOOL max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vBOOL (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; F64 values
+(set R (pivot P 'k 'p 'vF64 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 12.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vF64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 5.5] [2.5 4.5 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vF64 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vF64 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 6.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vF64 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 5.5] [2.5 4.5 0Nf]))) -- true
+(identical (try (pivot P 'k 'p 'vF64 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF64 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF64 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; F32 values
+(set R (pivot P 'k 'p 'vF32 sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 12.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vF32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5e 3.5e 5.5e] [2.5e 4.5e 0Ne]))) -- true
+(set R (pivot P 'k 'p 'vF32 count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vF32 med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5 3.5 6.0] [2.5 4.5 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vF32 (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.5e 3.5e 5.5e] [2.5e 4.5e 0Ne]))) -- true
+(identical (try (pivot P 'k 'p 'vF32 sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vF32 max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vF32 (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; DATE values
+(pivot P 'k 'p 'vDATE sum) !- type
+(set R (pivot P 'k 'p 'vDATE first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 2000.01.06] [2000.01.03 2000.01.05 0Nd]))) -- true
+(set R (pivot P 'k 'p 'vDATE count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vDATE med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vDATE (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 2000.01.06] [2000.01.03 2000.01.05 0Nd]))) -- true
+(identical (try (pivot P 'k 'p 'vDATE sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vDATE max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vDATE (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIME values
+(set R (pivot P 'k 'p 'vTIME sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.011] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot P 'k 'p 'vTIME first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.005] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot P 'k 'p 'vTIME count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vTIME med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vTIME (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 00:00:00.005] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(identical (try (pivot P 'k 'p 'vTIME sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIME max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIME (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIMESTAMP values
+(pivot P 'k 'p 'vTIMESTAMP sum) !- type
+(set R (pivot P 'k 'p 'vTIMESTAMP first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(set R (pivot P 'k 'p 'vTIMESTAMP count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vTIMESTAMP med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'vTIMESTAMP (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESTAMP max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESTAMP (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; TIMESPAN values
+(set R (pivot P 'k 'p 'vTIMESPAN sum))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000011] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot P 'k 'p 'vTIMESPAN first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000005] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot P 'k 'p 'vTIMESPAN count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(set R (pivot P 'k 'p 'vTIMESPAN med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000006] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot P 'k 'p 'vTIMESPAN (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0D00:00:00.000000005] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vTIMESPAN max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vTIMESPAN (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; SYM values
+(pivot P 'k 'p 'vSYM sum) !- type
+(set R (pivot P 'k 'p 'vSYM first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "s5")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(set R (pivot P 'k 'p 'vSYM count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot P 'k 'p 'vSYM med) !- type
+(set R (pivot P 'k 'p 'vSYM (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "s5")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(identical (try (pivot P 'k 'p 'vSYM sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSYM max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSYM (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; STR values
+(pivot P 'k 'p 'vSTR sum) !- type
+(set R (pivot P 'k 'p 'vSTR first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) ["aa" "cc" "ee"] ["bb" "dd" ""]))) -- true
+(set R (pivot P 'k 'p 'vSTR count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot P 'k 'p 'vSTR med) !- type
+(set R (pivot P 'k 'p 'vSTR (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) ["aa" "cc" "ee"] ["bb" "dd" ""]))) -- true
+(identical (try (pivot P 'k 'p 'vSTR sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vSTR max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vSTR (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; GUID values
+(pivot P 'k 'p 'vGUID sum) !- type
+(set R (pivot P 'k 'p 'vGUID first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'GUID (list (as 'GUID "00000001-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) (as 'GUID (list (as 'GUID "00000002-1111-1111-1111-111111111111") (as 'GUID "00000004-1111-1111-1111-111111111111") 0Ng))))) -- true
+(set R (pivot P 'k 'p 'vGUID count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot P 'k 'p 'vGUID med) !- type
+(set R (pivot P 'k 'p 'vGUID (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'GUID (list (as 'GUID "00000001-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) (as 'GUID (list (as 'GUID "00000002-1111-1111-1111-111111111111") (as 'GUID "00000004-1111-1111-1111-111111111111") 0Ng))))) -- true
+(identical (try (pivot P 'k 'p 'vGUID sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vGUID max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vGUID (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; LIST values
+(pivot P 'k 'p 'vLIST sum) !- type
+(set R (pivot P 'k 'p 'vLIST first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (list [1 2] [4 5] [7 8]) (list [3] [6] null)))) -- true
+(set R (pivot P 'k 'p 'vLIST count))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 1 2] [1 1 0Nl]))) -- true
+(pivot P 'k 'p 'vLIST med) !- type
+(set R (pivot P 'k 'p 'vLIST (fn [x] (first x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (list [1 2] [4 5] [7 8]) (list [3] [6] null)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST sum) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (sum x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST first) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (first x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST last) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (last x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST count) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (count x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST avg) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (avg x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST min) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (min x))) (fn [e] (at e 'code)))) -- true
+(identical (try (pivot P 'k 'p 'vLIST max) (fn [e] (at e 'code))) (try (pivot P 'k 'p 'vLIST (fn [x] (max x))) (fn [e] (at e 'code)))) -- true
+;; ---- first/last over a column with a null (row 4 opens cell c/x, row 5
+;; closes it): OP_PIVOT skips nulls, the builtin only for I64/F64/F32,
+;; so these columns take the generic route; parted table
+(set R (pivot P 'k 'p 'fI16 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 0Nh] [2h 4h 0Nh]))) -- true
+(set R (pivot P 'k 'p 'lI16 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1h 3h 0Nh] [2h 4h 0Nh]))) -- true
+(identical (pivot P 'k 'p 'fI16 first) (pivot P 'k 'p 'fI16 (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lI16 last) (pivot P 'k 'p 'lI16 (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fI32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 0Ni] [2i 4i 0Ni]))) -- true
+(set R (pivot P 'k 'p 'lI32 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1i 3i 0Ni] [2i 4i 0Ni]))) -- true
+(identical (pivot P 'k 'p 'fI32 first) (pivot P 'k 'p 'fI32 (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lI32 last) (pivot P 'k 'p 'lI32 (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fDATE first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 0Nd] [2000.01.03 2000.01.05 0Nd]))) -- true
+(set R (pivot P 'k 'p 'lDATE last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.02 2000.01.04 0Nd] [2000.01.03 2000.01.05 0Nd]))) -- true
+(identical (pivot P 'k 'p 'fDATE first) (pivot P 'k 'p 'fDATE (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lDATE last) (pivot P 'k 'p 'lDATE (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fTIME first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 0Nt] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(set R (pivot P 'k 'p 'lTIME last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [00:00:00.001 00:00:00.003 0Nt] [00:00:00.002 00:00:00.004 0Nt]))) -- true
+(identical (pivot P 'k 'p 'fTIME first) (pivot P 'k 'p 'fTIME (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lTIME last) (pivot P 'k 'p 'lTIME (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fTIMESTAMP first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 0Np] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(set R (pivot P 'k 'p 'lTIMESTAMP last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [2000.01.01D00:00:00.000000001 2000.01.01D00:00:00.000000003 0Np] [2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000004 0Np]))) -- true
+(identical (pivot P 'k 'p 'fTIMESTAMP first) (pivot P 'k 'p 'fTIMESTAMP (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lTIMESTAMP last) (pivot P 'k 'p 'lTIMESTAMP (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fTIMESPAN first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0Nn] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(set R (pivot P 'k 'p 'lTIMESPAN last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [0D00:00:00.000000001 0D00:00:00.000000003 0Nn] [0D00:00:00.000000002 0D00:00:00.000000004 0Nn]))) -- true
+(identical (pivot P 'k 'p 'fTIMESPAN first) (pivot P 'k 'p 'fTIMESPAN (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lTIMESPAN last) (pivot P 'k 'p 'lTIMESPAN (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fI64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 6] [2 4 0Nl]))) -- true
+(set R (pivot P 'k 'p 'lI64 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical (pivot P 'k 'p 'fI64 first) (pivot P 'k 'p 'fI64 (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lI64 last) (pivot P 'k 'p 'lI64 (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fF64 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 6.0] [2.0 4.0 0Nf]))) -- true
+(set R (pivot P 'k 'p 'lF64 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.0] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'k 'p 'fF64 first) (pivot P 'k 'p 'fF64 (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lF64 last) (pivot P 'k 'p 'lF64 (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fF32 first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 6e] [2e 4e 0Ne]))) -- true
+(set R (pivot P 'k 'p 'lF32 last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 5e] [2e 4e 0Ne]))) -- true
+(identical (pivot P 'k 'p 'fF32 first) (pivot P 'k 'p 'fF32 (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lF32 last) (pivot P 'k 'p 'lF32 (fn [x] (last x)))) -- true
+(set R (pivot P 'k 'p 'fSYM first))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(set R (pivot P 'k 'p 'lSYM last))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "s1" "s3" "")) (as 'SYM (list "s2" "s4" ""))))) -- true
+(identical (pivot P 'k 'p 'fSYM first) (pivot P 'k 'p 'fSYM (fn [x] (first x)))) -- true
+(identical (pivot P 'k 'p 'lSYM last) (pivot P 'k 'p 'lSYM (fn [x] (last x)))) -- true
+;; ---- an F64 index key whose first row holds -0.0 reads 0.0 on both routes
+(set R (pivot P 'z 'p 'n med))
+(identical R (table (as 'SYM (list "z" "x" "y")) (list [-0.0] [4.0] [3.0]))) -- true
+;; identical does not tell -0.0 from 0.0; the printed key does
+(repr (at R 'z)) -- "[0.0]"
+(set R (pivot P 'z 'p 'n sum))
+(identical R (table (as 'SYM (list "z" "x" "y")) (list [0.0] [15] [6]))) -- true
+(repr (at R 'z)) -- "[0.0]"
+;; the same for an F32 index key: it reads 0e, as on OP_PIVOT
+(set R (pivot P 'zf 'p 'n med))
+(repr (at R 'zf)) -- "[0e]"
+(set R (pivot P 'zf 'p 'n sum))
+(repr (at R 'zf)) -- "[0e]"
+;; ---- index types, parted table
+;; I64 index
+(set R (pivot P 'kI64 'p 'n sum))
+(identical R (table (as 'SYM (list "kI64" "x" "y")) (list [7 3 5] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kI64 'p 'n med))
+(identical R (table (as 'SYM (list "kI64" "x" "y")) (list [7 3 5] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kI64 'p 'n sum) (pivot P 'kI64 'p 'n (fn [x] (sum x)))) -- true
+;; I32 index
+(set R (pivot P 'kI32 'p 'n sum))
+(identical R (table (as 'SYM (list "kI32" "x" "y")) (list [7i 3i 5i] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kI32 'p 'n med))
+(identical R (table (as 'SYM (list "kI32" "x" "y")) (list [7i 3i 5i] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kI32 'p 'n sum) (pivot P 'kI32 'p 'n (fn [x] (sum x)))) -- true
+;; I16 index
+(set R (pivot P 'kI16 'p 'n sum))
+(identical R (table (as 'SYM (list "kI16" "x" "y")) (list [7h 3h 5h] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kI16 'p 'n med))
+(identical R (table (as 'SYM (list "kI16" "x" "y")) (list [7h 3h 5h] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kI16 'p 'n sum) (pivot P 'kI16 'p 'n (fn [x] (sum x)))) -- true
+;; U8 index
+(set R (pivot P 'kU8 'p 'n sum))
+(identical R (table (as 'SYM (list "kU8" "x" "y")) (list [0x07 0x03 0x05] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kU8 'p 'n med))
+(identical R (table (as 'SYM (list "kU8" "x" "y")) (list [0x07 0x03 0x05] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kU8 'p 'n sum) (pivot P 'kU8 'p 'n (fn [x] (sum x)))) -- true
+;; BOOL index
+(set R (pivot P 'kBOOL 'p 'n sum))
+(identical R (table (as 'SYM (list "kBOOL" "x" "y")) (list [true false] [6 9] [2 4]))) -- true
+(set R (pivot P 'kBOOL 'p 'n med))
+(identical R (table (as 'SYM (list "kBOOL" "x" "y")) (list [true false] [3.0 4.5] [2.0 4.0]))) -- true
+(identical (pivot P 'kBOOL 'p 'n sum) (pivot P 'kBOOL 'p 'n (fn [x] (sum x)))) -- true
+;; F64 index
+(set R (pivot P 'kF64 'p 'n sum))
+(identical R (table (as 'SYM (list "kF64" "x" "y")) (list [7.5 3.5 5.5] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kF64 'p 'n med))
+(identical R (table (as 'SYM (list "kF64" "x" "y")) (list [7.5 3.5 5.5] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kF64 'p 'n sum) (pivot P 'kF64 'p 'n (fn [x] (sum x)))) -- true
+;; F32 index
+(set R (pivot P 'kF32 'p 'n sum))
+(identical R (table (as 'SYM (list "kF32" "x" "y")) (list [7.5e 3.5e 5.5e] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kF32 'p 'n med))
+(identical R (table (as 'SYM (list "kF32" "x" "y")) (list [7.5e 3.5e 5.5e] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kF32 'p 'n sum) (pivot P 'kF32 'p 'n (fn [x] (sum x)))) -- true
+;; DATE index
+(set R (pivot P 'kDATE 'p 'n sum))
+(identical R (table (as 'SYM (list "kDATE" "x" "y")) (list [2000.01.08 2000.01.04 2000.01.06] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kDATE 'p 'n med))
+(identical R (table (as 'SYM (list "kDATE" "x" "y")) (list [2000.01.08 2000.01.04 2000.01.06] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kDATE 'p 'n sum) (pivot P 'kDATE 'p 'n (fn [x] (sum x)))) -- true
+;; TIME index
+(set R (pivot P 'kTIME 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIME" "x" "y")) (list [00:00:00.007 00:00:00.003 00:00:00.005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kTIME 'p 'n med))
+(identical R (table (as 'SYM (list "kTIME" "x" "y")) (list [00:00:00.007 00:00:00.003 00:00:00.005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kTIME 'p 'n sum) (pivot P 'kTIME 'p 'n (fn [x] (sum x)))) -- true
+;; TIMESTAMP index
+(set R (pivot P 'kTIMESTAMP 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIMESTAMP" "x" "y")) (list [2000.01.01D00:00:00.000000007 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kTIMESTAMP 'p 'n med))
+(identical R (table (as 'SYM (list "kTIMESTAMP" "x" "y")) (list [2000.01.01D00:00:00.000000007 2000.01.01D00:00:00.000000003 2000.01.01D00:00:00.000000005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kTIMESTAMP 'p 'n sum) (pivot P 'kTIMESTAMP 'p 'n (fn [x] (sum x)))) -- true
+;; TIMESPAN index
+(set R (pivot P 'kTIMESPAN 'p 'n sum))
+(identical R (table (as 'SYM (list "kTIMESPAN" "x" "y")) (list [0D00:00:00.000000007 0D00:00:00.000000003 0D00:00:00.000000005] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kTIMESPAN 'p 'n med))
+(identical R (table (as 'SYM (list "kTIMESPAN" "x" "y")) (list [0D00:00:00.000000007 0D00:00:00.000000003 0D00:00:00.000000005] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kTIMESPAN 'p 'n sum) (pivot P 'kTIMESPAN 'p 'n (fn [x] (sum x)))) -- true
+;; SYM index
+(set R (pivot P 'kSYM 'p 'n sum))
+(identical R (table (as 'SYM (list "kSYM" "x" "y")) (list (as 'SYM (list "k7" "k3" "k5")) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kSYM 'p 'n med))
+(identical R (table (as 'SYM (list "kSYM" "x" "y")) (list (as 'SYM (list "k7" "k3" "k5")) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kSYM 'p 'n sum) (pivot P 'kSYM 'p 'n (fn [x] (sum x)))) -- true
+;; STR index
+(set R (pivot P 'kSTR 'p 'n sum))
+(identical R (table (as 'SYM (list "kSTR" "x" "y")) (list ["k7" "k3" "k5"] [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kSTR 'p 'n med))
+(identical R (table (as 'SYM (list "kSTR" "x" "y")) (list ["k7" "k3" "k5"] [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kSTR 'p 'n sum) (pivot P 'kSTR 'p 'n (fn [x] (sum x)))) -- true
+;; GUID index
+(set R (pivot P 'kGUID 'p 'n sum))
+(identical R (table (as 'SYM (list "kGUID" "x" "y")) (list (as 'GUID (list (as 'GUID "00000007-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kGUID 'p 'n med))
+(identical R (table (as 'SYM (list "kGUID" "x" "y")) (list (as 'GUID (list (as 'GUID "00000007-1111-1111-1111-111111111111") (as 'GUID "00000003-1111-1111-1111-111111111111") (as 'GUID "00000005-1111-1111-1111-111111111111"))) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kGUID 'p 'n sum) (pivot P 'kGUID 'p 'n (fn [x] (sum x)))) -- true
+;; LIST index
+(set R (pivot P 'kLIST 'p 'n sum))
+(identical R (table (as 'SYM (list "kLIST" "x" "y")) (list (list [7 1] [3] [5 5]) [1 3 11] [2 4 0Nl]))) -- true
+(set R (pivot P 'kLIST 'p 'n med))
+(identical R (table (as 'SYM (list "kLIST" "x" "y")) (list (list [7 1] [3] [5 5]) [1.0 3.0 5.5] [2.0 4.0 0Nf]))) -- true
+(identical (pivot P 'kLIST 'p 'n sum) (pivot P 'kLIST 'p 'n (fn [x] (sum x)))) -- true
+;; ---- generic route: rows with a null index key all reach their group
+(set T (table [k p v] (list [0Nl 0Nl 0Nl 1 0Nl] [x x x x y] [1 2 3 4 5])))
+(set R (pivot T 'k 'p 'v med))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list [0Nl 1] [2.0 4.0] [5.0 0Nf]))) -- true
+(set R (pivot T 'k 'p 'v (fn [x] (sum x))))
+(identical R (table (as 'SYM (list "k" "x" "y")) (list [0Nl 1] [6 4] [5 0Nl]))) -- true
+;; ---- generic route: results of mixed types, or vectors, box like select by:
+(set T (table [k p v] (list [a a b b] [x x x y] [1 2 3 4])))
+(set R (pivot T 'k 'p 'v (fn [x] (if (> (count x) 1) 1.5 2))))
+;; (list 1.5 2) would build an F64 vector: pin the boxed cells one by one
+(type (at R 'x)) -- 'LIST
+(identical (at (at R 'x) 0) 1.5) -- true
+(identical (at (at R 'x) 1) 2) -- true
+(identical (at R 'y) [0Nl 2]) -- true
+(set R (pivot T 'k 'p 'v (fn [x] x)))
+(identical (at R 'x) (list [1 2] [3])) -- true
+(type (at R 'y)) -- 'LIST
+(identical (at (at R 'y) 0) null) -- true
+(identical (at (at R 'y) 1) [4]) -- true
+(.sys.exec "rm -rf /tmp/rfl_pivot_value_types")

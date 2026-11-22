@@ -2394,6 +2394,7 @@ typedef struct {
 void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
 void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+ray_t* pivot_flatten_parted(ray_t* tbl);
 
 /* ── embedding_exec.c ── */
 ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
