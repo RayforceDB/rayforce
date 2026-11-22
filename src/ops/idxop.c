@@ -3527,6 +3527,11 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         if (set_is_float) return NULL;
         /* Check set type is integer-family (numeric_elem_size covers all int types) */
         if (numeric_elem_size(st) == 0) return NULL;
+        /* A DATE, TIME or TIMESTAMP against another type compares by duration
+         * (atom_eq), not by payload: leave it to the general route. */
+        bool col_point = col->type == RAY_DATE || col->type == RAY_TIME || col->type == RAY_TIMESTAMP;
+        bool set_point = st == RAY_DATE || st == RAY_TIME || st == RAY_TIMESTAMP;
+        if (col->type != st && (col_point || set_point)) return NULL;
     }
 
     int64_t set_len = set_vec->len;

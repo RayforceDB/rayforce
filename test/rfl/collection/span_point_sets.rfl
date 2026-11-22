@@ -273,3 +273,15 @@
 (Q S0 DP) -- true
 (QA BLN (at DP 1)) -- true
 (QA PLN (at S0 0)) -- true
+;; The index on the column side inside a select (ray_index_in_rowsel): a
+;; DATE, TIME or TIMESTAMP column or set of another type compares by duration.
+(set IXQ (fn [A B] (at (select {from: (table [a] (list (.idx.hash A))) where: (in a B)}) 'a)))
+(set IXN (fn [A B] (count (select {from: (table [a] (list (.idx.hash A))) where: (in a B)}))))
+(IXQ (as 'TIME [3600000 5]) (as 'TIMESPAN [3600000000000])) -- (as 'TIME [3600000])
+(IXQ (as 'TIMESPAN [7 5]) (as 'TIME [7])) -- (as 'TIMESPAN [])
+(IXQ (as 'TIMESPAN [3600000000000 5]) (as 'TIMESTAMP [90000000000000])) -- (as 'TIMESPAN [3600000000000])
+(IXN (as 'TIMESPAN [3600000000000 5]) (as 'TIMESTAMP [90000000000000])) -- 1
+(IXN (as 'TIMESTAMP [90000000000000 5]) (as 'TIMESPAN [3600000000000])) -- 1
+(IXN (as 'DATE [1 2]) (as 'TIMESPAN [1 86400000000000])) -- 0
+(IXQ (as 'TIMESPAN [7 5]) [7]) -- (as 'TIMESPAN [7])
+(IXQ (as 'TIME [7 5]) (as 'TIME [7])) -- (as 'TIME [7])
