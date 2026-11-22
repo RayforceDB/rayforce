@@ -3752,7 +3752,11 @@ static test_result_t test_csr_parallel_fk_matches_serial(void) {
     ray_heap_init();
     (void)ray_sym_init();
     enum { N_TARGET = 2500, M = 30000 };
-    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) {
+        ray_sym_destroy();
+        ray_heap_destroy();
+        SKIP("no pool worker");
+    }
     int64_t* f = ray_alloc_raw((size_t)M * sizeof(int64_t));
     TEST_ASSERT(f, "scratch");
     for (int64_t i = 0; i < M; i++) f[i] = (i * 7919) % N_TARGET;
@@ -3788,6 +3792,11 @@ static test_result_t test_csr_parallel_fk_matches_serial(void) {
                            (size_t)x->n_edges * sizeof(int64_t)) == 0, "rowmap identical");
     }
     ray_rel_free(a); ray_rel_free(b);
+    /* Its symbol table and heap go with it, as the other csr tests': left
+     * behind, the next test in the process inherited "fk" (sym/many counted
+     * 1002 symbols, domain/sort_upper_resolve's fixture diverged). */
+    ray_sym_destroy();
+    ray_heap_destroy();
     PASS();
 }
 
