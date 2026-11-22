@@ -1,0 +1,32 @@
+;; #1315: xgroup finds each row's group through a hash table (ray_key_hash
+;; with atom_eq, as xkey), so atom, composite and vector keys are linear.
+;; Groups keep first-seen order and their rows keep table order.
+(set s (table [a b v] (list [x y x y x] [1 1 1 2 1] [10 20 30 40 50])))
+(key (xgroup s [a b])) -- (list (list 'x 1) (list 'y 1) (list 'y 2))
+(at (at (xgroup s [a b]) (list 'x 1)) 'v) -- [10 30 50]
+(at (at (xgroup s [a b]) (list 'y 2)) 'v) -- [40]
+(key (xgroup s [a])) -- (list 'x 'y)
+(at (at (xgroup s [a]) 'y) 'v) -- [20 40]
+
+;; vector and nested key cells, by content
+(set vt (table [k v] (list (list [1 2] [3] [1 2] [] [3] (list 'a [1])) [1 2 3 4 5 6])))
+(key (xgroup vt [k])) -- (list [1 2] [3] [] (list 'a [1]))
+(at (at (value (xgroup vt [k])) 0) 'v) -- [1 3]
+(at (at (value (xgroup vt [k])) 1) 'v) -- [2 5]
+
+;; nulls and floats group as atom_eq says
+(set nt (table [k v] (list [1.0 0Nf -0.0 0Nf 1.0] [1 2 3 4 5])))
+(count (xgroup nt [k])) -- (count (distinct [1.0 0Nf -0.0]))
+(at (at (xgroup nt [k]) 1.0) 'v) -- [1 5]
+
+;; a TIMESPAN vector cell and an equal I64 one are one group, as atom_eq has it
+(count (xgroup (table [k v] (list (list (as 'TIMESPAN [1 2]) [1 2] [3 4]) [1 2 3])) [k])) -- 2
+
+;; many groups, and every row in exactly one
+(set m 20000)
+(set big (table [k v] (list (% (til m) 997) (til m))))
+(set g (xgroup big [k]))
+(count g) -- 997
+(sum (map count (value g))) -- m
+(key g) -- (til 997)
+(at (at g 5) 'v) -- (+ 5 (* 997 (til 21)))
