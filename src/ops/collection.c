@@ -1976,7 +1976,8 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
          * their integer value, so hash it: past 2^53 a double would put
          * hundreds of neighbours in one hash (#1333). */
         if ((spans & RAY_KEY_EXACT_INT) && x->type != -RAY_F64 && x->type != -RAY_F32)
-            return ray_hash_i64(as_i64(x));
+            /* BOOL by its byte, as atom_eq (as_f64) reads it */
+            return ray_hash_i64(x->type == -RAY_BOOL ? (int64_t)x->b8 : as_i64(x));
         return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
     }
     switch (x->type) {
