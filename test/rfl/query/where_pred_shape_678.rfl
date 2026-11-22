@@ -112,11 +112,11 @@
 (at (select {from: T where: (or b (> y 4))}) 'y) -- [0 2 4 5]
 ;; the eval fallback (a projection the DAG declines) takes the same rule
 (set TF (table [x y ts] (list [0 256 0N 1 0 0] (til 6) (+ 2024.01.01D00:00:00.000000000 (* 10 (til 6))))))
-(select {k: (+ ts 1) from: TF where: x}) !- type
-(select {k: (+ ts 1) from: TF where: 'abc}) !- type
-(at (select {k: (+ ts 1) y: y from: TF where: (first [0 2])}) 'y) -- []
-(at (select {k: (+ ts 1) y: y from: TF where: (first [1 2])}) 'y) -- [0 1 2 3 4 5]
-(at (select {k: (+ ts 1) y: y from: TF where: (> y 3)}) 'y) -- [4 5]
+(select {k: (- ts ts) from: TF where: x}) !- type
+(select {k: (- ts ts) from: TF where: 'abc}) !- type
+(at (select {k: (- ts ts) y: y from: TF where: (first [0 2])}) 'y) -- []
+(at (select {k: (- ts ts) y: y from: TF where: (first [1 2])}) 'y) -- [0 1 2 3 4 5]
+(at (select {k: (- ts ts) y: y from: TF where: (> y 3)}) 'y) -- [4 5]
 ;; the count-only path
 (count (select {from: TF where: (first [0 2])})) -- 0
 (count (select {from: TF where: x})) !- type

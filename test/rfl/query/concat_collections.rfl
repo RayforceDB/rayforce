@@ -23,7 +23,7 @@
 (set S (table [s ts] (list ['a 'b] [2024.01.01D00:00:00.000000000 2024.01.01D00:00:00.000000001])))
 (at (select {v: (concat s "!") from: S}) 'v) -- ['a! 'b!]
 (at (select {v: (concat "[" s "]") from: S}) 'v) -- (as 'SYM (list "[a]" "[b]"))
-(at (select {v: (concat [2] [1]) other: (+ ts 1) from: S}) 'v) -- [2 1]
+(at (select {v: (concat [2] [1]) other: (- ts ts) from: S}) 'v) -- [2 1]
 (set SS (table [s ts] (list (as 'STR (list "a" "b")) (at S 'ts))))
-(at (select {v: (concat s "!") other: (+ ts 1) from: SS}) 'v) -- ["a!" "b!"]
-(at (select {v: (concat "a" "b") other: (+ ts 1) from: SS}) 'v) -- ["ab" "ab"]
+(at (select {v: (concat s "!") other: (- ts ts) from: SS}) 'v) -- ["a!" "b!"]
+(at (select {v: (concat "a" "b") other: (- ts ts) from: SS}) 'v) -- ["ab" "ab"]

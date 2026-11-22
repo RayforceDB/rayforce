@@ -1,0 +1,30 @@
+;; #1344: `in` with an empty set prunes every partition, whether a partition
+;; carries statistics (a compressed save) or not (a plain save), for a
+;; literal and for a name bound to the set.  The answers stay empty; the
+;; partitions read are the same on both saves, so the equivalence pass
+;; (every save compressed) agrees with the plain run.
+(.sys.exec "rm -rf /tmp/rfl_pp_empty")
+(.db.splayed.set "/tmp/rfl_pp_empty/a/2024.01.01/t/" (table [x y] (list [1 2 3] [10 15 20])) {compress: false})
+(.db.splayed.set "/tmp/rfl_pp_empty/a/2024.01.02/t/" (table [x y] (list [4 5 6] [30 35 40])) {compress: false})
+(.db.splayed.set "/tmp/rfl_pp_empty/b/2024.01.01/t/" (table [x y] (list [1 2 3] [10 15 20])) {compress: true})
+(.db.splayed.set "/tmp/rfl_pp_empty/b/2024.01.02/t/" (table [x y] (list [4 5 6] [30 35 40])) {compress: true})
+(set A (.db.parted.get "/tmp/rfl_pp_empty/a/" 't))
+(set B (.db.parted.get "/tmp/rfl_pp_empty/b/" 't))
+(set f (fn [tbl m] (select {x: x y: y from: tbl where: (in x m) asc: x})))
+(set runs (fn [g] (do (set b0 (at (.sys.mem) 'sort-perpart-runs)) (g) (- (at (.sys.mem) 'sort-perpart-runs) b0))))
+(count (f A [])) -- 0
+(count (f B [])) -- 0
+(runs (fn [] (f A []))) -- (runs (fn [] (f B [])))
+(runs (fn [] (select {x: x from: A where: (in x []) asc: x}))) -- (runs (fn [] (select {x: x from: B where: (in x []) asc: x})))
+(set E (as 'I64 []))
+;; the answers, schema and types included, equal the unpruned table's
+(set MA (select {from: A}))
+(select {x: x y: y from: A where: (in x []) asc: x}) -- (select {x: x y: y from: MA where: (in x []) asc: x})
+(select {x: x y: y from: B where: (in x E) asc: x}) -- (select {x: x y: y from: MA where: (in x E) asc: x})
+(select {n: (count y) s: (sum y) from: A where: (in x [])}) -- (select {n: (count y) s: (sum y) from: MA where: (in x [])})
+(runs (fn [] (select {x: x from: A where: (in x E) asc: x}))) -- (runs (fn [] (select {x: x from: B where: (in x E) asc: x})))
+;; a non-empty set is unchanged: both partitions hold a member
+(f A [1 4 5]) -- (f B [1 4 5])
+(runs (fn [] (f A [1 4 5]))) -- 2
+(runs (fn [] (f B [1 4 5]))) -- 2
+(.sys.exec "rm -rf /tmp/rfl_pp_empty")

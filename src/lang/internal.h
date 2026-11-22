@@ -421,6 +421,9 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
  * ══════════════════════════════════════════ */
 
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right);
+/* Vectors the typed temporal +/- integer pass answered (eval.c, #1302):
+ * a test counter, as ray_narrow_sum_routes. */
+extern _Atomic(uint64_t) ray_tempint_routes;
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg);
 ray_t* to_boxed_list(ray_t* x);
 ray_t* unbox_vec_arg(ray_t* x, ray_t** _bx);

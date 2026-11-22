@@ -435,8 +435,9 @@ static int8_t dag_operand_type(ray_graph_t* g, ray_op_t* x) {
  * `(% date 2)` came back as I64 where the builtin keeps DATE.  Every verb
  * the DAG lowers declines a temporal operand, so the projection is left to
  * the builtin through the evaluator: select's fallback applies it row by
- * row, an ordinary update to the whole bound columns.  The one exception
- * is the modulo dag_temporal_mod admits. */
+ * row, an ordinary update to the whole bound columns.  The exceptions
+ * are the modulo dag_temporal_mod admits and the temporal +/- integer
+ * dag_temporal_int_arith admits. */
 static bool dag_temporal_arith_needs_eval(const char* name, size_t len,
                                           int8_t left_type, int8_t right_type) {
     if (!dag_type_is_temporal(left_type) && !dag_type_is_temporal(right_type))
@@ -478,6 +479,130 @@ static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
     ray_op_t* m = ray_mod(g, left, right);
     if (!m) return NULL;
     return ray_cast(g, m, lt);
+}
+
+/* `(+ temporal int)`, `(+ int temporal)`, `(- temporal int)` and
+ * `(- int time)` (#1302).  The builtins add the raw day / millisecond /
+ * nanosecond count and the integer, wrapped to the temporal lane (a DATE
+ * or TIME keeps the low 32 bits, a TIMESTAMP wraps in 64), with a null on
+ * either side null.  The integer kernels compute the same thing on the raw
+ * counts, so the node is the integer + or - with its result cast back to
+ * the temporal type, as dag_temporal_mod does:
+ *   - TIMESTAMP is an I64 lane: any integer operand, the I64 kernel's wrap.
+ *   - DATE / TIME are I32 lanes: + and - of an I32 or narrower operand are
+ *     planned in I32 and wrap there (#973).  An I64 operand would be planned
+ *     in I64, where a sum landing on NULL_I64 reads as null before the
+ *     narrowing; an I64 literal is reduced to its low 32 bits first (the
+ *     sum's low 32 bits are the same), and an I64 column stays with the
+ *     builtin.
+ * The temporal side is a column or a lowered pair (not a literal, not a
+ * partition key's MAPCOMMON wrapper); the integer side a column or a
+ * non-null integer literal. */
+static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t len,
+                                        ray_op_t* left, ray_op_t* right,
+                                        int8_t left_type, int8_t right_type) {
+    if (len != 1 || (name[0] != '+' && name[0] != '-')) return NULL;
+    bool add = name[0] == '+';
+    bool lt_temp = dag_type_is_temporal(left_type), rt_temp = dag_type_is_temporal(right_type);
+    if (lt_temp == rt_temp) return NULL;
+    ray_op_t* tv = lt_temp ? left : right;
+    ray_op_t* xv = lt_temp ? right : left;
+    int8_t tt = lt_temp ? left_type : right_type;
+    int8_t xt = lt_temp ? right_type : left_type;
+    if (RAY_IS_PARTED(tt) || RAY_IS_PARTED(xt)) return NULL;
+    if (!add && !lt_temp && tt != RAY_TIME) return NULL;   /* int - DATE: an error */
+    if (tv->out_type != tt || xv->out_type != xt) return NULL;
+    /* The builtin reads a sentinel in either operand as null; the DAG reads
+     * it as null only where its source says so.  So the temporal side is a
+     * column or a lowered pair (whose wrap is flagged), and the integer side
+     * a column or a literal: an integer expression that wraps onto its own
+     * sentinel (`(+ i 1i)` at I32 max) would be added as a number. */
+    if (tv->opcode != OP_SCAN && !(tv->flags & OP_FLAG_TEMPORAL_INT)) return NULL;
+    if (xv->opcode != OP_SCAN && xv->opcode != OP_CONST) return NULL;
+    if (xt != RAY_BOOL && xt != RAY_U8 && xt != RAY_I16 && xt != RAY_I32 && xt != RAY_I64)
+        return NULL;
+    if (xv->opcode == OP_CONST) {
+        int64_t c = 0;
+        if (!const_op_i64(g, xv, &c)) return NULL;
+        if (tt != RAY_TIMESTAMP && xt == RAY_I64) {
+            int32_t w = (int32_t)(uint32_t)(uint64_t)c;
+            if (w == NULL_I32) return NULL;   /* its I32 constant would read as null */
+            ray_t* a = ray_i32(w);
+            if (!a || RAY_IS_ERR(a)) return NULL;
+            uint32_t tid = tv->id;
+            xv = ray_const_atom(g, a);
+            ray_release(a);
+            if (!xv) return NULL;
+            tv = &g->nodes[tid];
+        }
+    } else if (tt != RAY_TIMESTAMP && xt == RAY_I64) {
+        return NULL;
+    }
+    uint32_t tid = tv->id, xid = xv->id;
+    ray_op_t* l = lt_temp ? &g->nodes[tid] : &g->nodes[xid];
+    ray_op_t* r = lt_temp ? &g->nodes[xid] : &g->nodes[tid];
+    ray_op_t* m = add ? ray_add(g, l, r) : ray_sub(g, l, r);
+    if (!m) return NULL;
+    m->flags |= OP_FLAG_TEMPORAL_INT;
+    ray_op_t* c = ray_cast(g, m, tt);
+    if (!c) return NULL;
+    c->flags |= OP_FLAG_TEMPORAL_INT;
+    g->temporal_int_nodes++;
+    return c;
+}
+
+/* Where a lowered temporal +/- integer may be read (#1302).  Before it was
+ * lowered, the pair failed to compile, and so did every expression around
+ * it: the builtins answered the whole of it.  Several DAG consumers of a
+ * temporal value do not answer as the builtins do (a DATE scratch register
+ * under nil? or a comparison in the fused program, an `if` over arms of
+ * different types, a grouped aggregate's null rule), so the lowered node
+ * keeps that contract: it is the root of what compiles (a projection, an
+ * aggregate's argument the planner hands to the temporal materializer, an
+ * `if` arm the row-wise blend runs on its own), an operand of another such
+ * pair, or an arm of an `if` whose arms are all of its type and none a
+ * literal, which then stands for it.  Any other node that reads it fails
+ * the compile, as the builtin pair did: through an input, the third input
+ * of a 3-ary node (substr's length, replace's text), or a later
+ * projection's alias of it.  Only the nodes made since `base` are walked,
+ * and only in a graph that holds a lowered pair. */
+static bool dag_temporal_int_readers_ok(ray_graph_t* g, uint32_t base) {
+    /* the third input of a 3-ary node other than `if` (below) */
+    for (uint32_t e = 0; e < g->ext_count; e++) {
+        ray_op_ext_t* x = g->ext_nodes[e];
+        if (!x || x->base.id < base || x->base.opcode == OP_IF) continue;
+        uint32_t t = x->third_in;
+        if (t != RAY_OP_NONE && t != 0 && t < g->node_count &&
+            (g->nodes[t].flags & OP_FLAG_TEMPORAL_INT))
+            return false;
+    }
+    for (uint32_t id = base; id < g->node_count; id++) {
+        ray_op_t* n = &g->nodes[id];
+        if (n->flags & (OP_FLAG_DEAD | OP_FLAG_TEMPORAL_INT)) continue;
+        uint32_t in[3] = { RAY_OP_NONE, RAY_OP_NONE, RAY_OP_NONE };
+        for (int i = 0; i < n->arity && i < 2; i++) in[i] = n->in_id[i];
+        if (n->opcode == OP_IF) {
+            ray_op_ext_t* x = find_ext(g, id);
+            if (x) in[2] = x->third_in;
+        }
+        bool reads = false;
+        for (int i = 0; i < 3; i++)
+            reads |= in[i] != RAY_OP_NONE && in[i] < g->node_count &&
+                     (g->nodes[in[i]].flags & OP_FLAG_TEMPORAL_INT);
+        if (!reads) continue;
+        if (n->opcode == OP_IF && in[1] != RAY_OP_NONE && in[2] != RAY_OP_NONE &&
+            !(g->nodes[in[0]].flags & OP_FLAG_TEMPORAL_INT) &&
+            dag_type_is_temporal(n->out_type) &&
+            g->nodes[in[1]].out_type == n->out_type &&
+            g->nodes[in[2]].out_type == n->out_type &&
+            /* a literal arm may be one ray_if retyped (`0Nd` beside a TIME) */
+            g->nodes[in[1]].opcode != OP_CONST && g->nodes[in[2]].opcode != OP_CONST) {
+            n->flags |= OP_FLAG_TEMPORAL_INT;
+            continue;
+        }
+        return false;
+    }
+    return true;
 }
 
 /* The kind of a comparison operand, for the type rule the builtins apply
@@ -1838,7 +1963,27 @@ static ray_op_t* compile_if_chain_dag(ray_graph_t* g, ray_t** a, int64_t nargs) 
     return ray_if(g, c, t, e);
 }
 
+static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr);
+
+/* An aggregate's argument for the planner's DAG aggregate: a lowered
+ * temporal +/- integer at its root declines, as it did before #1302, and
+ * the aggregate keeps the builtin's answer (its type error, its float
+ * order, its nulls). */
+static ray_op_t* compile_agg_arg_dag(ray_graph_t* g, ray_t* expr) {
+    ray_op_t* r = compile_expr_dag(g, expr);
+    return r && (r->flags & OP_FLAG_TEMPORAL_INT) ? NULL : r;
+}
+
+/* compile_expr_dag_node, with the readers of a lowered temporal +/- integer
+ * held to dag_temporal_int_readers_ok at each level. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
+    uint32_t base = g->node_count;
+    ray_op_t* r = compile_expr_dag_node(g, expr);
+    if (!r || !g->temporal_int_nodes) return r;
+    return dag_temporal_int_readers_ok(g, base) ? &g->nodes[r->id] : NULL;
+}
+
+static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
     /* Atom literal → const node.  Handle non-null scalar literals
@@ -2553,7 +2698,9 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     g->if_arm_depth++;
                     ray_op_t* c = compile_expr_dag(g, cpair[1]);
                     g->if_arm_depth--;
-                    if (!c) return NULL;
+                    /* a lowered temporal +/- integer failed to compile
+                     * here before #1302, and the evaluator has no `cond` */
+                    if (!c || (c->flags & OP_FLAG_TEMPORAL_INT)) return NULL;
                     chain_id = c->id;
                 } else {
                     if (chain_id == UINT32_MAX) return NULL;
@@ -2563,7 +2710,7 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                     g->if_arm_depth++;
                     ray_op_t* body = compile_expr_dag(g, cpair[1]);
                     g->if_arm_depth--;
-                    if (!body) return NULL;
+                    if (!body || (body->flags & OP_FLAG_TEMPORAL_INT)) return NULL;
                     pred = &g->nodes[pred_id];
                     ray_op_t* chain = &g->nodes[chain_id];
                     ray_op_t* r = ray_if(g, pred, body, chain);
@@ -2694,8 +2841,14 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 }
                 int8_t lvt = dag_operand_type(g, left);
                 int8_t rvt = dag_operand_type(g, right);
-                if (dag_temporal_arith_needs_eval(fname, fname_len, lvt, rvt))
-                    return dag_temporal_mod(g, fname, fname_len, left, right, lvt);
+                if (dag_temporal_arith_needs_eval(fname, fname_len, lvt, rvt)) {
+                    uint32_t lid = left->id, rid = right->id;
+                    ray_op_t* ti = dag_temporal_int_arith(g, fname, fname_len,
+                                                          left, right, lvt, rvt);
+                    if (ti) return ti;
+                    return dag_temporal_mod(g, fname, fname_len,
+                                            &g->nodes[lid], &g->nodes[rid], lvt);
+                }
                 if (g->if_arm_depth == 0 &&
                     dag_arith_rejects_sym(fname, fname_len, lvt, rvt)) {
                     if (!g->compile_err)
@@ -18510,6 +18663,9 @@ static ray_t* select_running_fallback(ray_t* dict, ray_t* tbl, unsigned plan, bo
  * on the DAG (#916). */
 static bool select_agg_arg_group_local(ray_t* a, ray_t* tbl, bool running) {
     if (!a || a->type != RAY_LIST || (a->attrs & ATTR_QUOTED)) return true;
+    /* the temporal materializer, not the DAG, aggregates such an argument
+     * (is_group_dag_agg_expr_dag_safe), and evaluates it over the kept rows */
+    if (expr_contains_temporal_arith(a, tbl)) return false;
     ray_graph_t* pg = ray_graph_new(tbl);
     if (!pg) return false;
     ray_op_t* op = compile_expr_dag(pg, a);
@@ -18914,7 +19070,8 @@ static bool part_stats_lit_ok(int8_t ct, int8_t lt) {
  * is dropped only when its statistics (ray_part_seg_stats) decide the
  * comparison false for every row, by the rule row-level zone skipping uses
  * (zone_cmp_core: nulls rank below every value), and a partition without
- * statistics is kept.  False when nothing can be dropped: a type the
+ * statistics is kept, except under an empty `in` set, which no row passes, so
+ * every partition drops (#1344).  False when nothing can be dropped: a type the
  * statistics do not order, an unsupported literal, `not in`, or no
  * partition decided. */
 bool ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped, ray_t* lit, uint64_t* mask) {
@@ -18958,6 +19115,10 @@ bool ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped, ray_t*
         cval = read_col_i64(ray_data(lit), 0, lit->type, lit->attrs);
     } else return false;
 
+    /* An empty set holds no row, a null row included, so every partition
+     * prunes whether or not it carries statistics: a plain and a compressed
+     * save then read the same partitions (#1344). */
+    if (cmp_op == OP_IN && nset == 0) return wrapper->len > 0;
     bool pruned = false;
     for (int64_t p = 0; p < wrapper->len; p++) {
         ray_t* seg = col->type == RAY_ENCCOL ? ray_enccol_seg(col, p) : ((ray_t**)ray_data(wrapper))[p];
@@ -24615,7 +24776,7 @@ by_dict_done:
                 }
                 agg_ops[n_aggs] = op;
                 /* Compile the aggregation input (the column reference) */
-                agg_ins[n_aggs] = compile_expr_dag(g, agg_arg);
+                agg_ins[n_aggs] = compile_agg_arg_dag(g, agg_arg);
                 agg_in_ids[n_aggs] = agg_ins[n_aggs] ? agg_ins[n_aggs]->id : RAY_OP_NONE;
                 if (!agg_ins[n_aggs]) {
                     for (int ci = 0; ci < n_compound; ci++)
@@ -24638,7 +24799,7 @@ by_dict_done:
                 agg_k[n_aggs] = 0;
                 if (agg_is_binary_agg(op)) {
                     if (ray_len(val_expr) < 3) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select by: binary aggregation requires two column arguments"); }
-                    agg_ins2[n_aggs] = compile_expr_dag(g, agg_elems[2]);
+                    agg_ins2[n_aggs] = compile_agg_arg_dag(g, agg_elems[2]);
                     agg_in2_ids[n_aggs] = agg_ins2[n_aggs] ? agg_ins2[n_aggs]->id : RAY_OP_NONE;
                     if (!agg_ins2[n_aggs]) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select by: failed to compile binary aggregation second argument"); }
                     if (dag_operand_type(g, agg_ins2[n_aggs]) > 0 &&
@@ -24698,7 +24859,7 @@ by_dict_done:
             ray_t** he = (ray_t**)ray_data(hidden_agg_exprs[hi]);
             uint16_t hop = resolve_agg_opcode(he[0]->i64);
             agg_ops[n_aggs] = hop;
-            agg_ins[n_aggs] = compile_expr_dag(g, he[1]);
+            agg_ins[n_aggs] = compile_agg_arg_dag(g, he[1]);
             agg_in_ids[n_aggs] = agg_ins[n_aggs] ? agg_ins[n_aggs]->id : RAY_OP_NONE;
             if (!agg_ins[n_aggs]) {
                 for (int ci = 0; ci < n_compound; ci++)
@@ -25589,7 +25750,7 @@ by_dict_done:
                     }
                 }
                 s_agg_ops[s_n_aggs] = op;
-                s_agg_ins[s_n_aggs] = compile_expr_dag(g, agg_elems[1]);
+                s_agg_ins[s_n_aggs] = compile_agg_arg_dag(g, agg_elems[1]);
                 s_agg_ins2[s_n_aggs] = NULL;
                 if (!s_agg_ins[s_n_aggs]) {
                     s_use_eval_fallback = 1;
@@ -25646,7 +25807,7 @@ by_dict_done:
                         scratch_free(sagg_hdr);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("arity", "select: binary aggregation requires two column arguments");
                     }
-                    s_agg_ins2[s_n_aggs] = compile_expr_dag(g, agg_elems[2]);
+                    s_agg_ins2[s_n_aggs] = compile_agg_arg_dag(g, agg_elems[2]);
                     if (!s_agg_ins2[s_n_aggs]) {
                         s_use_eval_fallback = 1;
                         break;
@@ -25784,7 +25945,11 @@ by_dict_done:
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
                 col_ops[nc] = compile_expr_dag(g, dict_elems[i + 1]);
-                if (!col_ops[nc]) {
+                /* A sort key that names an output, not a source column, is
+                 * sorted by the evaluator alone: a lowered temporal +/-
+                 * integer (#1302) keeps the evaluator, as before it lowered. */
+                if (!col_ops[nc] ||
+                    (has_sort && (col_ops[nc]->flags & OP_FLAG_TEMPORAL_INT))) {
                     use_eval_fallback = 1;
                     break;
                 }
@@ -27722,8 +27887,9 @@ static void xbar_par_fn(void* vctx, uint32_t worker_id,
                 int64_t a = in[i];
                 int64_t q = a / b;
                 if ((a ^ b) < 0 && q * b != a) q--;
-                /* Unsigned wrap: only the null sentinel (INT64_MIN) rounds
-                 * below INT64_MIN, and the caller rewrites it as null. */
+                /* Unsigned wrap: a value within |b| of INT64_MIN (b > 0) or
+                 * INT64_MAX (b < 0) rounds past the range and wraps; the
+                 * atom path wraps the same (#1348). */
                 o[i] = (int64_t)((uint64_t)q * (uint64_t)b);
             }
         }
@@ -27870,7 +28036,9 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(rt);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
-        return make_typed_int(rt, q * b);
+        /* Unsigned wrap, as the vector kernel: q * b of a value within |b|
+         * of INT64_MIN / INT64_MAX lies past the range (#1348). */
+        return make_typed_int(rt, (int64_t)((uint64_t)q * (uint64_t)b));
     }
     /* Float path: either operand is f64 */
     if (is_numeric(col) && is_numeric(bucket)) {
@@ -27900,7 +28068,10 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(col->type);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
-        int64_t result = q * b;
+        /* Unsigned wrap, as the vector kernel and the query lowering: a
+         * TIMESTAMP within |b| of INT64_MIN / INT64_MAX buckets past the
+         * range (#1348). */
+        int64_t result = (int64_t)((uint64_t)q * (uint64_t)b);
         if (col->type == -RAY_TIME) return ray_time(result);
         if (col->type == -RAY_DATE) return ray_date(result);
         return ray_timestamp(result);

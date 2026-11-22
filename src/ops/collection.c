@@ -2001,7 +2001,22 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
             h = ray_hash_i64((int64_t)(h ^ key_hash(cells[i], spans, view, seen, inexact)));
         return h;
     }
-    case RAY_TABLE:
+    case RAY_TABLE: {
+        if (seen && !spans && ray_key_spans(x)) *seen = true;
+        if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
+        /* With spans, a column can equal a vector of a different type.
+         * Keep the conservative hash for every table in that key set. */
+        if (spans) return 0;
+        int64_t nc = ray_table_ncols(x);
+        uint64_t h = ray_hash_i64(nc);
+        for (int64_t c = 0; c < nc; c++) {
+            h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(x, c)));
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
+            h = ray_hash_combine(h, key_hash(col, 0, view, NULL, NULL));
+        }
+        return h;
+    }
     case RAY_DICT:
         if (seen && !spans && ray_key_spans(x)) *seen = true;
         if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
