@@ -5227,14 +5227,16 @@ static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
  * blanket rejection cannot satisfy the decline assertions. */
 static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
     /* These concrete lexical calls intentionally retain their evaluator
-     * semantics. Local IF/NOT prevents rowwise IF lowering; the nonempty
-     * condition vector is truthy, selecting whole a/b columns. A local SUM
-     * still aggregates the rowwise-lowered inner IF in this query shape. */
+     * semantics. A local IF is no `if`: the nonempty condition vector is
+     * truthy, selecting whole a/b columns. A local NOT only stops the DAG
+     * lowering; the `if` still chooses per row over the evaluated condition
+     * (#1300). A local SUM still aggregates the rowwise-lowered inner IF in
+     * this query shape. */
     static const struct { const char* local; bool pruned; int64_t expected[4]; } heads[] = {
         { NULL,  true,  { 370, 13, 300, 13 } },
         { "if",  false, {  70,  6, 600, 20 } },
         { "sum", false, { 370, 13, 300, 13 } },
-        { "not", false, {  70,  6, 600, 20 } },
+        { "not", false, { 370, 13, 300, 13 } },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];

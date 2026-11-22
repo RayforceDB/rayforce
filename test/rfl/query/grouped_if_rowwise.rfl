@@ -1,0 +1,207 @@
+;; @also-unfused
+;; @requires: posix  (parted and splayed fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; An `if` under by: chooses per row, as a plain output and inside an
+;; aggregate (issues #1297 and #1300).
+;;
+;; Inside a query `if` is evaluated row by row (docs: control flow), as the
+;; keyless select does.  Under by:, an `if` the DAG declines (an arm such as
+;; `(+ d 1)` over a DATE column, which is left to the builtin), and a plain
+;; `if` output, were evaluated as the control-flow `if`: the condition vector
+;; is not empty, so it counted as true and every row took the `then` arm.
+;; The condition and the arms are now evaluated once over the column and
+;; blended by the condition mask (OP_IF), so the answer is the one computed
+;; from the materialized column: the same `if` over columns holding the
+;; arms' values, which the DAG compiles.
+
+;; ── #1297: a plain `if` output under by: ──────────────────────────────────
+(set T (table [k x i] (list [0 0 1 1] [1.0 6.0 7.0 2.0] [10 20 30 40])))
+(at (xasc (select {from: T by: k q: (if (> x 5.0) i x)}) 'k) 'q)        -- (list [1.0 20.0] [30.0 2.0])
+(at (xasc (select {from: T by: k q: (if (> x 5.0) i 0)}) 'k) 'q)        -- (list [0 20] [30 0])
+(at (xasc (select {from: T by: k q: (last (if (> x 5.0) i x))}) 'k) 'q) -- [20.0 2.0]
+(at (select {from: T q: (if (> x 5.0) i x)}) 'q)                         -- [1.0 20.0 30.0 2.0]
+(type (first (at (select {from: T by: k q: (if (> x 5.0) i x)}) 'q)))   -- 'F64
+
+;; ── #1300: an `if` inside an aggregate's argument ──────────────────────────
+(set T (table ['g 'c 'd] (list (take ['a 'b] 20) (% (til 20) 10) (+ 2024.01.01 (til 20)))))
+(at (select {from: T by: g s: (avg (if (> c 4) d (+ d 1)))}) 's)        -- [8775.6 8776.4]
+(at (select {from: T by: g s: (avg (+ d (as 'I64 (<= c 4))))}) 's)      -- [8775.6 8776.4]
+(at (select {from: T s: (avg (if (> c 4) d (+ d 1)))}) 's)              -- [8776.0]
+(at (select {from: T by: g s: (med (if (> c 4) d (+ d 1)))}) 's)        -- [8775.5 8776.5]
+(set U (table ['g 'c 'd] (list (take ['a 'b] 20) (% (til 20) 10) (take 2024.01.01 20))))
+(at (select {from: U by: g s: (count (distinct (if (> c 4) d (+ d 1))))}) 's)   -- [2 2]
+;; #1297's comment on #1284's shape
+(set T (table [g c d] (list [a a b b] [1 0 1 0] [2024.01.01 2024.01.02 2024.01.03 2024.01.04])))
+(at (select {from: T by: g s: (avg (if (> c 0) d (+ d 1)))}) 's)   -- [8767.0 8769.0]
+
+;; ── the fixture: temporal columns, integers of three widths with nulls ─────
+;; O adds the arms the DAG declines as columns (d1 = (+ d 1), ...), so the
+;; same `if` spelled over them compiles: m1..m8 are the materialized values.
+(set mkF (fn [n] (let r (til n)) (let X (table ['g 'k 's 'h 'c 'd 't 'p 'i 'j 'b] (list (take ['a 'b 'c] n) (% r 4) (take ["x" "y"] n) (% r 2) (% r 10) (+ 2024.01.01 (% r 50)) (+ 10:00:00.000 (% r 50)) (+ 2024.01.01D10:00:00.000000000 (% r 50)) r (as 'I32 r) (as 'I16 (% r 30))))) (update {from: X i: (if (== 0 (% i 7)) 0N i) j: (if (== 0 (% j 5)) 0Ni j)})))
+(set mkO (fn [F] (let A (update {from: F d1: (+ d 1) d5: (+ d 5) t1: (+ t 1) p1: (+ p 1)})) (update {from: A m1: (if (> c 4) d d1) m2: (if (> c 4) t t1) m3: (if (> c 4) p p1) m4: (if (> c 4) d1 0N) m5: (if (> c 6) d1 (> c 2) d d5) m6: (if (> c 2) (if (> c 6) d1 d) d5) m7: (if (> c 4) j i) m8: (if (> c 4) b j) m9: (if i d d1)})))
+(set F (mkO (mkF 3000)))
+;; the oracle columns hold the per-row choice, typed as the keyless `if`
+(at (select {from: F s: (if (> c 4) d (+ d 1))}) 's) -- (at F 'm1)
+(at (select {from: F s: (if (> c 4) p (+ p 1))}) 's) -- (at F 'm3)
+(type (at F 'm4)) -- 'DATE
+(type (at F 'm7)) -- 'I64
+
+;; ordered by the key, whatever route gave the groups
+(set Q (fn [t ks] (at (xasc t ks) 'q)))
+
+;; ── flat: each aggregate, each temporal type, by a SYM key ────────────────
+(Q (select {from: F by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m1)}) 'g)
+(Q (select {from: F by: g q: (med (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (med m1)}) 'g)
+(Q (select {from: F by: g q: (min (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (min m1)}) 'g)
+(Q (select {from: F by: g q: (max (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (max m1)}) 'g)
+(Q (select {from: F by: g q: (last (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (last m1)}) 'g)
+(Q (select {from: F by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'g) -- (Q (select {from: F by: g q: (count (distinct m1))}) 'g)
+(Q (select {from: F by: g q: (if (> c 4) d (+ d 1))}) 'g) -- (Q (select {from: F by: g q: m1}) 'g)
+(Q (select {from: F by: g q: (sum (if (> c 4) t (+ t 1)))}) 'g) -- (Q (select {from: F by: g q: (sum m2)}) 'g)
+(Q (select {from: F by: g q: (avg (if (> c 4) t (+ t 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m2)}) 'g)
+(Q (select {from: F by: g q: (max (if (> c 4) t (+ t 1)))}) 'g) -- (Q (select {from: F by: g q: (max m2)}) 'g)
+(Q (select {from: F by: g q: (if (> c 4) t (+ t 1))}) 'g) -- (Q (select {from: F by: g q: m2}) 'g)
+(Q (select {from: F by: g q: (avg (if (> c 4) p (+ p 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m3)}) 'g)
+(Q (select {from: F by: g q: (min (if (> c 4) p (+ p 1)))}) 'g) -- (Q (select {from: F by: g q: (min m3)}) 'g)
+(Q (select {from: F by: g q: (count (distinct (if (> c 4) p (+ p 1))))}) 'g) -- (Q (select {from: F by: g q: (count (distinct m3))}) 'g)
+(Q (select {from: F by: g q: (if (> c 4) p (+ p 1))}) 'g) -- (Q (select {from: F by: g q: m3}) 'g)
+;; a null literal beside a temporal arm: the arm's type, its null
+(Q (select {from: F by: g q: (if (> c 4) (+ d 1) 0N)}) 'g) -- (Q (select {from: F by: g q: m4}) 'g)
+(Q (select {from: F by: g q: (min (if (> c 4) (+ d 1) 0N))}) 'g) -- (Q (select {from: F by: g q: (min m4)}) 'g)
+(Q (select {from: F by: g q: (count (distinct (if (> c 4) (+ d 1) 0N)))}) 'g) -- (Q (select {from: F by: g q: (count (distinct m4))}) 'g)
+;; nested: a chain, and an `if` in an arm
+(Q (select {from: F by: g q: (avg (if (> c 6) (+ d 1) (> c 2) d (+ d 5)))}) 'g) -- (Q (select {from: F by: g q: (avg m5)}) 'g)
+(Q (select {from: F by: g q: (if (> c 6) (+ d 1) (> c 2) d (+ d 5))}) 'g) -- (Q (select {from: F by: g q: m5}) 'g)
+(Q (select {from: F by: g q: (med (if (> c 2) (if (> c 6) (+ d 1) d) (+ d 5)))}) 'g) -- (Q (select {from: F by: g q: (med m6)}) 'g)
+(Q (select {from: F by: g q: (if (> c 2) (if (> c 6) (+ d 1) d) (+ d 5))}) 'g) -- (Q (select {from: F by: g q: m6}) 'g)
+;; an `if` inside a builtin call, and a computed condition
+(Q (select {from: F by: g q: (avg (- (if (> c 4) d (+ d 1)) 2024.01.01))}) 'g) -- (Q (select {from: F by: g q: (avg (- m1 2024.01.01))}) 'g)
+(Q (select {from: F by: g q: (- (if (> c 4) d (+ d 1)) 2024.01.01)}) 'g) -- (Q (select {from: F by: g q: (- m1 2024.01.01)}) 'g)
+(Q (select {from: F by: g q: (avg (if (> (+ c 1) 5) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m1)}) 'g)
+;; numeric arms of mixed widths with nulls: widened, a null stays null
+(Q (select {from: F by: g q: (if (> c 4) j i)}) 'g) -- (Q (select {from: F by: g q: m7}) 'g)
+(Q (select {from: F by: g q: (sum (if (> c 4) j i))}) 'g) -- (Q (select {from: F by: g q: (sum m7)}) 'g)
+(Q (select {from: F by: g q: (if (> c 4) b j)}) 'g) -- (Q (select {from: F by: g q: m8}) 'g)
+(Q (select {from: F by: g q: (avg (if (> c 4) b j))}) 'g) -- (Q (select {from: F by: g q: (avg m8)}) 'g)
+(type (first (at (select {from: F by: g q: (if (> c 4) j i)}) 'q))) -- 'I64
+
+;; a null condition cell takes the else arm, as the keyless `if`
+(Q (select {from: F by: g q: (if i d (+ d 1))}) 'g) -- (Q (select {from: F by: g q: m9}) 'g)
+(Q (select {from: F by: g q: (avg (if i d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m9)}) 'g)
+(Q (select {from: F by: s q: (if i d (+ d 1))}) 's) -- (Q (select {from: F by: s q: m9}) 's)
+;; a condition that is one value chooses its arm, as the control-flow `if`:
+;; the arm keeps its type, the other arm is not blended in
+(Q (select {from: F by: g q: (if 1 d (+ p 1))}) 'g) -- (Q (select {from: F by: g q: d}) 'g)
+(Q (select {from: F by: g q: (avg (if 0 (+ p 1) (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (avg d1)}) 'g)
+;; arms OP_IF has no column type for are boxed per row, as keyless
+(Q (select {from: F by: g q: (count (if (> c 4) (list 1 2) 5))}) 'g) -- [1000 1000 1000]
+;; text beside a temporal arm the DAG declines: keyless boxes it per row
+(Q (select {from: F by: g q: (count (if (> c 4) s (+ t 1)))}) 'g) -- [1000 1000 1000]
+(type (at (select {from: F s: (if (> c 4) s (+ t 1))}) 's)) -- 'LIST
+
+;; ── errors are the query's, as the keyless select reports them ─────────────
+;; an arm that errors, and text beside a number (OP_IF refuses), on the
+;; aggregate, scatter and per-group routes
+(select {from: F by: g q: (avg (if (> c 4) d (+ d "x")))}) !- type
+(select {from: F by: g q: (if (> c 4) d (+ d "x"))}) !- type
+(select {from: F by: s q: (if (> c 4) d (+ d "x"))}) !- type
+(select {from: F by: g q: (med (if (> c 4) d (+ d "x")))}) !- type
+(select {from: F by: g q: (if (> c 4) i 'z)}) !- type
+(select {from: F by: g q: (max (if (> c 4) i 'z))}) !- type
+(select {from: F by: s q: (if (> c 4) i 'z)}) !- type
+(select {from: F by: g q: (count (distinct (if (> c 4) g 5)))}) !- type
+(select {from: F by: {kk: (% c 3)} q: (avg (if (> c 4) d (+ d "x")))}) !- type
+(select {from: F s: (if (> c 4) i 'z)}) !- type
+
+;; ── a per-group plain output: a condition without an aggregate is read
+;; over the rows once, as on the scatter route and keyless; one with an
+;; aggregate still reduces each group ──────────────────────────────────────
+(Q (select {from: F by: [g h] q: (if (in 3 c) i j)}) ['g 'h]) -- (Q (select {from: F by: [g h] q: i}) ['g 'h])
+(Q (select {from: F by: [g h] q: (if (> (count c) 400) i j)}) ['g 'h]) -- (Q (select {from: F by: [g h] q: i}) ['g 'h])
+(Q (select {from: F by: [g h] q: (if (> (count c) 600) i j)}) ['g 'h]) -- (Q (select {from: F by: [g h] q: j}) ['g 'h])
+
+;; ── with where: ────────────────────────────────────────────────────────────
+(Q (select {from: F where: (> c 1) by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: (avg m1)}) 'g)
+(Q (select {from: F where: (> c 1) by: g q: (med (if (> c 4) t (+ t 1)))}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: (med m2)}) 'g)
+(Q (select {from: F where: (> c 1) by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: (count (distinct m1))}) 'g)
+(Q (select {from: F where: (> c 1) by: g q: (if (> c 4) d (+ d 1))}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: m1}) 'g)
+(Q (select {from: F where: (> c 1) by: g q: (if (> c 4) j i)}) 'g) -- (Q (select {from: F where: (> c 1) by: g q: m7}) 'g)
+
+;; ── other keys: an integer, a STR, two columns, and a dict (eval-level) ────
+(Q (select {from: F by: k q: (avg (if (> c 4) d (+ d 1)))}) 'k) -- (Q (select {from: F by: k q: (avg m1)}) 'k)
+(Q (select {from: F by: k q: (if (> c 4) d (+ d 1))}) 'k) -- (Q (select {from: F by: k q: m1}) 'k)
+(Q (select {from: F by: s q: (avg (if (> c 4) d (+ d 1)))}) 's) -- (Q (select {from: F by: s q: (avg m1)}) 's)
+(Q (select {from: F by: s q: (med (if (> c 4) p (+ p 1)))}) 's) -- (Q (select {from: F by: s q: (med m3)}) 's)
+(Q (select {from: F by: s q: (count (distinct (if (> c 4) d (+ d 1))))}) 's) -- (Q (select {from: F by: s q: (count (distinct m1))}) 's)
+(Q (select {from: F by: s q: (if (> c 4) d (+ d 1))}) 's) -- (Q (select {from: F by: s q: m1}) 's)
+(Q (select {from: F by: s q: (if (> c 4) j i)}) 's) -- (Q (select {from: F by: s q: m7}) 's)
+(Q (select {from: F by: [g h] q: (avg (if (> c 4) d (+ d 1)))}) ['g 'h]) -- (Q (select {from: F by: [g h] q: (avg m1)}) ['g 'h])
+(Q (select {from: F by: [g h] q: (if (> c 4) d (+ d 1))}) ['g 'h]) -- (Q (select {from: F by: [g h] q: m1}) ['g 'h])
+(Q (select {from: F by: [g h] q: (min (if (> c 4) t (+ t 1))) x: (+ c 1)}) ['g 'h]) -- (Q (select {from: F by: [g h] q: (min m2) x: (+ c 1)}) ['g 'h])
+(Q (select {from: F by: {kk: (% c 3)} q: (avg (if (> c 4) d (+ d 1)))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (avg m1)}) 'kk)
+(Q (select {from: F by: {kk: (% c 3)} q: (med (if (> c 4) d (+ d 1)))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (med m1)}) 'kk)
+(Q (select {from: F by: {kk: (% c 3)} q: (count (distinct (if (> c 4) d (+ d 1))))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (count (distinct m1))}) 'kk)
+(Q (select {from: F by: {kk: (% c 3)} q: (if (> c 4) d (+ d 1))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: m1}) 'kk)
+(Q (select {from: F by: {kk: (% c 3)} where: (> c 1) q: (avg (if (> c 4) d (+ d 1)))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} where: (> c 1) q: (avg m1)}) 'kk)
+;; a computed key is row by row too
+(Q (select {from: F by: {kk: (if (> c 4) d (+ d 1))} q: (count c)}) 'kk) -- (Q (select {from: F by: {kk: m1} q: (count c)}) 'kk)
+
+;; ── the numeric `if` the DAG compiles is unchanged ──────────────────────────
+(Q (select {from: F by: g q: (sum (if (> c 4) c (+ c 1)))}) 'g) -- (Q (select {from: (update {from: F z: (+ c (as 'I64 (<= c 4)))}) by: g q: (sum z)}) 'g)
+
+;; ── no rows: the aggregates keep their column types ─────────────────────────
+(set Z (select {from: F where: (> c 100)}))
+(type (at (select {from: Z by: g q: (avg (if (> c 4) d (+ d 1)))}) 'q)) -- 'F64
+(type (at (select {from: Z by: g q: (min (if (> c 4) d (+ d 1)))}) 'q)) -- 'DATE
+(type (at (select {from: Z by: g q: (max (if (> c 4) p (+ p 1)))}) 'q)) -- 'TIMESTAMP
+(type (at (select {from: Z by: g q: (med (if (> c 4) d (+ d 1)))}) 'q)) -- 'F64
+(type (at (select {from: Z by: g q: (sum (if (> c 4) t (+ t 1)))}) 'q)) -- 'TIME
+(type (at (select {from: Z by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'q)) -- 'I64
+(count (select {from: Z by: g q: (if (> c 4) d (+ d 1))})) -- 0
+;; a plain `if` output keeps the blend's type
+(type (at (select {from: Z by: g q: (if (> c 4) d (+ d 1))}) 'q)) -- 'DATE
+(type (at (select {from: Z by: g q: (if (> c 4) j i)}) 'q)) -- 'I64
+(type (at (select {from: Z by: {kk: (% c 3)} q: (if (> c 4) d (+ d 1))}) 'q)) -- 'DATE
+(count (select {from: Z by: {kk: (% c 3)} q: (avg (if (> c 4) d (+ d 1)))})) -- 0
+
+;; ── an effect keeps the evaluator's route ───────────────────────────────────
+;; The blend evaluates both arms over the column.  An expression with an
+;; effect is evaluated as before and no part of it twice: under an aggregate
+;; once per group (3 groups), as a plain output once over the rows, and an
+;; arm the control-flow `if` does not take is not run.
+(set n 0)
+(set fx (fn [v] (set n (+ n 1)) v))
+(count (select {from: F by: g q: (avg (if (fx (> c 4)) d (+ d 1)))})) -- 3
+n -- 3
+(count (select {from: F by: g q: (if (fx (> c 4)) d (+ d 1))})) -- 3
+n -- 4
+(count (select {from: F by: g q: (avg (if (> c 4) d (fx (+ d 1))))})) -- 3
+n -- 4
+
+;; ── splayed ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_grouped_if_rowwise/") -- 0
+(.db.splayed.set "/tmp/rfl_grouped_if_rowwise/s/t/" F)
+(set S (.db.splayed.get "/tmp/rfl_grouped_if_rowwise/s/t/"))
+(Q (select {from: S by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: F by: g q: (avg m1)}) 'g)
+(Q (select {from: S by: g q: (med (if (> c 4) p (+ p 1)))}) 'g) -- (Q (select {from: F by: g q: (med m3)}) 'g)
+(Q (select {from: S by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'g) -- (Q (select {from: F by: g q: (count (distinct m1))}) 'g)
+(Q (select {from: S by: g q: (if (> c 4) d (+ d 1))}) 'g) -- (Q (select {from: F by: g q: m1}) 'g)
+(Q (select {from: S where: (> c 1) by: s q: (sum (if (> c 4) t (+ t 1)))}) 's) -- (Q (select {from: F where: (> c 1) by: s q: (sum m2)}) 's)
+(Q (select {from: S by: {kk: (% c 3)} q: (avg (if (> c 4) d (+ d 1)))}) 'kk) -- (Q (select {from: F by: {kk: (% c 3)} q: (avg m1)}) 'kk)
+
+;; ── parted: a data column and the partition key ─────────────────────────────
+(set mkP (fn [o] (select {from: F where: (== (% (til (count F)) 2) o)})))
+(.db.splayed.set "/tmp/rfl_grouped_if_rowwise/p/2024.01.01/t/" (mkP 0) "/tmp/rfl_grouped_if_rowwise/p/.sym")
+(.db.splayed.set "/tmp/rfl_grouped_if_rowwise/p/2024.01.02/t/" (mkP 1) "/tmp/rfl_grouped_if_rowwise/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_grouped_if_rowwise/p/" 't))
+(Q (select {from: P by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: P by: g q: (avg m1)}) 'g)
+(Q (select {from: P by: g q: (med (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: P by: g q: (med m1)}) 'g)
+(Q (select {from: P by: g q: (min (if (> c 4) t (+ t 1)))}) 'g) -- (Q (select {from: P by: g q: (min m2)}) 'g)
+(Q (select {from: P by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'g) -- (Q (select {from: P by: g q: (count (distinct m1))}) 'g)
+(Q (select {from: P by: g q: (if (> c 4) d (+ d 1))}) 'g) -- (Q (select {from: P by: g q: m1}) 'g)
+(Q (select {from: P where: (> c 1) by: g q: (avg (if (> c 4) d (+ d 1)))}) 'g) -- (Q (select {from: P where: (> c 1) by: g q: (avg m1)}) 'g)
+(Q (select {from: P by: s q: (if (> c 4) j i)}) 's) -- (Q (select {from: P by: s q: m7}) 's)
+(Q (select {from: P by: g q: (avg (if (> c 4) date (+ date 1)))}) 'g) -- (Q (select {from: (update {from: P dd: (if (> c 4) date (+ date 1))}) by: g q: (avg dd)}) 'g)
+;; the mapped tables go first, so the unfused pass can write the fixture again
+(set P 0)
+(set S 0)
+(.sys.exec "rm -rf /tmp/rfl_grouped_if_rowwise/") -- 0
