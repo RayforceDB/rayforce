@@ -1407,6 +1407,166 @@ static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
     return out;
 }
 
+/* ---- Temporal +/- integer (#1302) ----
+ *
+ * DATE / TIME / TIMESTAMP plus or minus a B8 / U8 / I16 / I32 / I64 operand,
+ * either order for +, and int - TIME (the builtin's one int-minus-temporal
+ * pair).  ray_add_fn / ray_sub_fn answer each cell as the temporal count
+ * plus the integer, wrapped to the temporal lane (ray_date / ray_time keep
+ * the low 32 bits, TIMESTAMP wraps in 64), and a null on either side is the
+ * temporal null; a result that wraps onto the sentinel reads as null too.
+ * The DAG below cannot carry that (promote() types DATE + I64 as I64 and
+ * the narrow lane is lost), so the pair ran the boxed per-element loop at
+ * ~27 ns a cell.  Here it is one typed pass over the raw counts: the same
+ * wrap, the same nulls, the temporal type.  (A query lowers the same pairs
+ * to the DAG itself: dag_temporal_int_arith, src/ops/query.c.) */
+enum { TI_ADD, TI_SUB, TI_RSUB };          /* t + x, t - x, x - t */
+enum { TI_VV, TI_VA, TI_AV };              /* t vec x vec, t vec x atom, t atom x vec */
+
+typedef struct {
+    const void* t;  const void* x;  void* out;
+    int64_t tc, xc;                        /* the atom side's value */
+    int8_t  tw, xt;                        /* temporal lane bytes, int type */
+    uint8_t op, shape;
+    _Atomic(uint8_t) has_null;             /* some cell is the sentinel */
+} tempint_ctx_t;
+
+static inline __attribute__((always_inline))
+void tempint_span(tempint_ctx_t* c, int64_t lo, int64_t hi,
+                  const int tw, const int8_t xt, const int op, const int shape) {
+    const int32_t* t32 = (const int32_t*)c->t;
+    const int64_t* t64 = (const int64_t*)c->t;
+    bool any = false;
+    for (int64_t j = lo; j < hi; j++) {
+        int64_t tv = shape == TI_AV ? c->tc : tw == 4 ? (int64_t)t32[j] : t64[j];
+        int64_t xv;
+        bool xn = false;
+        if (shape == TI_VA) xv = c->xc;
+        else switch (xt) {
+        case RAY_BOOL: case RAY_U8: xv = ((const uint8_t*)c->x)[j]; break;
+        case RAY_I16: xv = ((const int16_t*)c->x)[j]; xn = xv == NULL_I16; break;
+        case RAY_I32: xv = ((const int32_t*)c->x)[j]; xn = xv == NULL_I32; break;
+        default:      xv = ((const int64_t*)c->x)[j]; xn = xv == NULL_I64; break;
+        }
+        if (tw == 4) {
+            bool tn = shape != TI_AV && tv == NULL_I32;
+            uint32_t a = (uint32_t)tv, b = (uint32_t)xv;
+            uint32_t r = op == TI_ADD ? a + b : op == TI_SUB ? a - b : b - a;
+            int32_t o = (tn || xn) ? NULL_I32 : (int32_t)r;
+            ((int32_t*)c->out)[j] = o;
+            any |= o == NULL_I32;
+        } else {
+            bool tn = shape != TI_AV && tv == NULL_I64;
+            uint64_t a = (uint64_t)tv, b = (uint64_t)xv;
+            uint64_t r = op == TI_ADD ? a + b : op == TI_SUB ? a - b : b - a;
+            int64_t o = (tn || xn) ? NULL_I64 : (int64_t)r;
+            ((int64_t*)c->out)[j] = o;
+            any |= o == NULL_I64;
+        }
+    }
+    /* a wrap onto the sentinel is a null too, as the boxed store reads it */
+    if (any) atomic_store_explicit(&c->has_null, 1, memory_order_relaxed);
+}
+
+#define TEMPINT_SHAPES(TW, XT, OP)                                             \
+    switch (c->shape) {                                                        \
+    case TI_VV: tempint_span(c, lo, hi, TW, XT, OP, TI_VV); break;             \
+    case TI_VA: tempint_span(c, lo, hi, TW, XT, OP, TI_VA); break;             \
+    default:    tempint_span(c, lo, hi, TW, XT, OP, TI_AV); break;             \
+    }
+#define TEMPINT_OPS(TW, XT)                                                    \
+    switch (c->op) {                                                           \
+    case TI_ADD: TEMPINT_SHAPES(TW, XT, TI_ADD) break;                         \
+    case TI_SUB: TEMPINT_SHAPES(TW, XT, TI_SUB) break;                         \
+    default:     TEMPINT_SHAPES(TW, XT, TI_RSUB) break;                        \
+    }
+/* an atom offset is read once (xc): one instantiation serves every type */
+#define TEMPINT_XTYPES(TW)                                                     \
+    switch (c->shape == TI_VA ? RAY_I64 : c->xt) {                             \
+    case RAY_BOOL: case RAY_U8: TEMPINT_OPS(TW, RAY_U8) break;                 \
+    case RAY_I16: TEMPINT_OPS(TW, RAY_I16) break;                              \
+    case RAY_I32: TEMPINT_OPS(TW, RAY_I32) break;                              \
+    default:      TEMPINT_OPS(TW, RAY_I64) break;                              \
+    }
+
+static void tempint_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    tempint_ctx_t* c = (tempint_ctx_t*)vctx;
+    if (c->tw == 4) { TEMPINT_XTYPES(4) }
+    else            { TEMPINT_XTYPES(8) }
+}
+#undef TEMPINT_XTYPES
+#undef TEMPINT_OPS
+#undef TEMPINT_SHAPES
+
+_Atomic(uint64_t) ray_tempint_routes;
+
+static bool tempint_is_int(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64;
+}
+
+/* NULL when the operands are not a temporal-vs-integer +/- pair the typed
+ * pass answers (the caller then takes its usual route); otherwise the
+ * result vector of type `out_type` (the probe's), or an error.  Plain
+ * vectors and atoms only: parted, LIST and the rest keep their paths. */
+static ray_t* tempint_arith(uint16_t dag_opcode, ray_t* left, ray_t* right,
+                            int8_t out_type, int64_t len) {
+    if (dag_opcode != OP_ADD && dag_opcode != OP_SUB) return NULL;
+    if (out_type != RAY_DATE && out_type != RAY_TIME && out_type != RAY_TIMESTAMP)
+        return NULL;
+    bool lvec = ray_is_vec(left), rvec = ray_is_vec(right);
+    if (!lvec && !ray_is_atom(left)) return NULL;
+    if (!rvec && !ray_is_atom(right)) return NULL;
+    if (!lvec && !rvec) return NULL;
+    int8_t lt = lvec ? left->type : (int8_t)-left->type;
+    int8_t rt = rvec ? right->type : (int8_t)-right->type;
+    ray_t *tv, *xv;
+    uint8_t op;
+    if (lt == out_type && tempint_is_int(rt)) {
+        tv = left; xv = right; op = dag_opcode == OP_ADD ? TI_ADD : TI_SUB;
+    } else if (rt == out_type && tempint_is_int(lt) &&
+               (dag_opcode == OP_ADD || out_type == RAY_TIME)) {
+        tv = right; xv = left; op = dag_opcode == OP_ADD ? TI_ADD : TI_RSUB;
+    } else {
+        return NULL;
+    }
+    bool tvec = tv == left ? lvec : rvec;
+    bool xvec = xv == left ? lvec : rvec;
+    ray_t* out = ray_vec_new(out_type, len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = len;
+    atomic_fetch_add_explicit(&ray_tempint_routes, 1, memory_order_relaxed);
+    int tw = out_type == RAY_TIMESTAMP ? 8 : 4;
+    /* A null atom is a null for every cell, as the builtin answers it. */
+    if ((!tvec && RAY_ATOM_IS_NULL(tv)) || (!xvec && RAY_ATOM_IS_NULL(xv))) {
+        if (tw == 4) { int32_t* d = (int32_t*)ray_data(out); for (int64_t j = 0; j < len; j++) d[j] = NULL_I32; }
+        else         { int64_t* d = (int64_t*)ray_data(out); for (int64_t j = 0; j < len; j++) d[j] = NULL_I64; }
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+    tempint_ctx_t c = {
+        .t = tvec ? ray_data(tv) : NULL, .x = xvec ? ray_data(xv) : NULL,
+        .out = ray_data(out),
+        .tc = tvec ? 0 : tv->i64, .xc = xvec ? 0 : as_i64(xv),
+        .tw = (int8_t)tw, .xt = xvec ? xv->type : (int8_t)-xv->type,
+        .op = op, .shape = tvec && xvec ? TI_VV : tvec ? TI_VA : TI_AV,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && len >= RAY_PARALLEL_THRESHOLD) {
+        ray_pool_dispatch(pool, tempint_fn, &c, len);
+        if (ray_interrupted() ||
+            atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+            ray_release(out);
+            return ray_error("cancel", "interrupted");
+        }
+    } else {
+        tempint_fn(&c, 0, 0, len);
+    }
+    if (atomic_load_explicit(&c.has_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
         (left->type == RAY_DICT || right->type == RAY_DICT ||
@@ -1512,6 +1672,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if (out_type == RAY_I32 && left_coll && ray_is_vec(left) &&
         !ray_num_type(left->type, left->type) && !RAY_ATOM_IS_NULL(e0))
         out_type = RAY_I64;
+
+    if (!force_boxed) {
+        ray_t* r = tempint_arith(dag_opcode, left, right, out_type, len);
+        if (r) { ray_release(e0); return r; }
+    }
 
     /* DAG executor — for F64 and comparisons */
     if (!force_boxed && dag_opcode > 0) {

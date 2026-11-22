@@ -305,7 +305,8 @@ same order. The keys come first, in `by:` order, wherever the projections
 are written, with one key or with several: `{total: (sum qty) sym: sym}
 by: sym` gives the columns `sym total`, and `{n: (count qty) k: k}
 by: {k: sym}` gives `k n`. A select whose only outputs are key projections
-is the select with no outputs. A computed projection of a key is an
+is the select with no outputs. A key projected under another name (`x: sym`)
+is an ordinary output containing each group's key values. A computed projection of a key is an
 ordinary output.
 
 ```lisp

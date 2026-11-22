@@ -168,15 +168,11 @@
 (nil? (- (as 'TIMESTAMP 5000) 0Ni)) -- true
 (type (- (as 'TIMESTAMP 5000) 0Ni)) -- 'timestamp
 
-;; ── L105-107: numeric(a) - temporal(b) null → null typed on b ──
+;; ── numeric(a) - TIME(b) null → null TIME ──
 
-;; int - null DATE → null DATE
-(nil? (- 5 0Nd))                    -- true
-(type (- 5 0Nd))                    -- 'date
-
-;; int - null TIMESTAMP → null TIMESTAMP
-(nil? (- 5 0Np))                    -- true
-(type (- 5 0Np))                    -- 'timestamp
+;; int - null DATE / TIMESTAMP is the type error int - DATE / TIMESTAMP is (#1336)
+(- 5 0Nd)                           !- type
+(- 5 0Np)                           !- type
 
 ;; null int - TIME → null TIME
 (nil? (- 0Ni (as 'TIME 500)))       -- true
