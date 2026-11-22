@@ -4369,7 +4369,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             if (opc == OP_SIGNUM)
                 for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0f) - (src[i] < 0.0f);
             else
-                for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i];
+                /* A float null, ±inf or an out-of-range value has no int64_t:
+                 * a raw cast is undefined (#1343). */
+                for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null((double)src[i]);
             out_off += n;
         }
     } else if (in_type == RAY_F64 && out_type == RAY_F64) {
@@ -4408,15 +4410,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             double* src = (double*)m.morsel_ptr;
             int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
             switch (opc) {
-                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)(-src[i]); break;
-                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)fabs(src[i]); break;
-                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)sqrt(src[i]); break;
-                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)log(src[i]); break;
-                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)exp(src[i]); break;
+                /* Through ray_cast_f64_to_i64_null: a raw cast of a null,
+                 * ±inf or out-of-range result is undefined (#1343). */
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(-src[i]); break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(fabs(src[i])); break;
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(sqrt(src[i])); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(log(src[i])); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(exp(src[i])); break;
                 case OP_SIGNUM:for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0) - (src[i] < 0.0); break;
-                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
-                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
-                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(ceil(src[i])); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(floor(src[i])); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(round(src[i])); break;
                 default:       for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(src[i]); break;
             }
             out_off += n;

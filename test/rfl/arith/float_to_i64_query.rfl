@@ -1,0 +1,29 @@
+;; @also-unfused  (the raw cast sat on the unfused elementwise route)
+;; #1343: a query's elementwise float -> I64 conversion goes through the
+;; null-aware cast: a null gives the I64 null, and ±inf or an out-of-range
+;; value saturates as the eager cast does.  A raw (int64_t) cast was
+;; undefined there (UBSan in test-full).
+(set X (as 'F32 [7.9 -7.9 0Nf 3e38 -3e38 0.0]))
+(set Y (concat [7.9 -7.9 0Nf 1e300 -1e300 0.0] (list (/ 1.0 0.0) (/ -1.0 0.0))))
+(set T (table [x] (list X)))
+(set U (table [y] (list Y)))
+(at (select {from: T r: (as 'I64 x)}) 'r) -- (as 'I64 X)
+(at (select {from: T r: (as 'I64 x)}) 'r) -- [7 -7 0Nl 9223372036854775807 -9223372036854775807 0]
+(at (select {from: U r: (as 'I64 y)}) 'r) -- (as 'I64 Y)
+(at (select {from: T r: (signum x)}) 'r) -- (signum X)
+(at (select {from: U r: (signum y)}) 'r) -- (signum Y)
+;; every integer width: the narrow casts pass through the I64 conversion
+(set N32 (as 'F32 [7.5 0Nf 1024.0 0.0 -2.5]))
+(set N64 [7.5 0Nf 1024.0 0.0 -2.5])
+(set T32 (table [a] (list N32)))
+(set T64 (table [a] (list N64)))
+(at (select {r: (as 'B8 a) from: T32}) 'r) -- (as 'B8 N32)
+(at (select {r: (as 'U8 a) from: T32}) 'r) -- (as 'U8 N32)
+(at (select {r: (as 'I16 a) from: T32}) 'r) -- (as 'I16 N32)
+(at (select {r: (as 'I32 a) from: T32}) 'r) -- (as 'I32 N32)
+(at (select {r: (as 'I64 a) from: T32}) 'r) -- (as 'I64 N32)
+(at (select {r: (as 'B8 a) from: T64}) 'r) -- (as 'B8 N64)
+(at (select {r: (as 'U8 a) from: T64}) 'r) -- (as 'U8 N64)
+(at (select {r: (as 'I16 a) from: T64}) 'r) -- (as 'I16 N64)
+(at (select {r: (as 'I32 a) from: T64}) 'r) -- (as 'I32 N64)
+(at (update {r: (as 'I16 a) from: T32}) 'r) -- (as 'I16 N32)
