@@ -2183,6 +2183,30 @@ static test_result_t test_eval_temporal_int_slice(void) {
     PASS();
 }
 
+/* The typed temporal +/- integer pass (#1302) answers the vector forms, and
+ * nothing else: ray_tempint_routes moves once per vector it answers. */
+static test_result_t test_eval_temporal_int_route(void) {
+    static const struct { const char* src; uint64_t moves; } cases[] = {
+        { "(+ (as 'DATE (til 100)) 1)", 1 },          { "(- (as 'TIME (til 100)) 1i)", 1 },
+        { "(+ 2h (as 'TIMESTAMP (til 100)))", 1 },    { "(- (til 100) (as 'TIME (til 100)))", 1 },
+        { "(+ 2024.01.01 (til 100))", 1 },            { "(+ (as 'DATE (til 100)) 0Nl)", 1 },
+        { "(+ (til 100) 1)", 0 },                     { "(- (as 'DATE (til 100)) (as 'DATE (til 100)))", 0 },
+        { "(+ (as 'TIME (til 100)) (- 00:00:01.000 00:00:00.000))", 0 },{ "(+ 2024.01.01 1)", 0 },
+        { "(try (- (til 100) (as 'DATE (til 100))) 0)", 0 },
+        { "(try (+ (as 'DATE (til 100)) 1.5) 0)", 0 },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        uint64_t before = atomic_load_explicit(&ray_tempint_routes, memory_order_relaxed);
+        ray_t* r = ray_eval_str(cases[k].src);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: failed", cases[k].src);
+        ray_release(r);
+        uint64_t moved = atomic_load_explicit(&ray_tempint_routes, memory_order_relaxed) - before;
+        TEST_ASSERT_FMT(moved == cases[k].moves, "%s: the pass ran %llu times, want %llu",
+                        cases[k].src, (unsigned long long)moved, (unsigned long long)cases[k].moves);
+    }
+    PASS();
+}
+
 /* ---- Test: except ---- */
 static test_result_t test_eval_except(void) {
     ray_t* result = ray_eval_str("(except [1 2 3] [2])");
@@ -2819,6 +2843,7 @@ static test_result_t test_eval_select_temporal_int_dag_admission(void) {
     static const char* const declines[] = {
         "(+ d l)", "(- t l)", "(+ l t)", "(+ d 2147483648)", "(+ d 0N)", "(+ d 2.5)",
         "(- 5 d)", "(- i ts)", "(+ 2024.01.01 i)", "(+ d d)", "(* d 2)",
+        "(+ d (+ i 1i))", "(- (+ i 1i) t)", "(+ ts (+ l 1))", "(+ d (as 'I32 l))", "(+ (xbar d 7) 1)",
         "(nil? (+ d 1))", "(== (+ d 1) d)", "(as 'I64 (+ ts 1))", "(sum (+ t 1))",
         "(if (> i 2) d (+ t 1))", "(if (> i 2) (+ d 1) ts)", "(if (> i 2) (+ d 1) 0Nd)",
         "(cond ((> i 2) (+ d 1)) (else d))", "(xbar (+ d 1) 7)", "(nil? (if (> i 2) d (+ d 1)))",
@@ -13789,6 +13814,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/temporal_int_slice", test_eval_temporal_int_slice, lang_setup, lang_teardown },
+    { "lang/eval/temporal_int_route", test_eval_temporal_int_route, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },

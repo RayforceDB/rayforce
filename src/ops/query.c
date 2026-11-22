@@ -495,9 +495,9 @@ static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
  *     narrowing; an I64 literal is reduced to its low 32 bits first (the
  *     sum's low 32 bits are the same), and an I64 column stays with the
  *     builtin.
- * The temporal side is a column or a lowered expression (not a literal, not
- * a partition key's MAPCOMMON wrapper); the integer side a column or
- * expression of its type, or a non-null integer literal. */
+ * The temporal side is a column or a lowered pair (not a literal, not a
+ * partition key's MAPCOMMON wrapper); the integer side a column or a
+ * non-null integer literal. */
 static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t len,
                                         ray_op_t* left, ray_op_t* right,
                                         int8_t left_type, int8_t right_type) {
@@ -511,7 +511,14 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
     int8_t xt = lt_temp ? right_type : left_type;
     if (RAY_IS_PARTED(tt) || RAY_IS_PARTED(xt)) return NULL;
     if (!add && !lt_temp && tt != RAY_TIME) return NULL;   /* int - DATE: an error */
-    if (tv->opcode == OP_CONST || tv->out_type != tt || xv->out_type != xt) return NULL;
+    if (tv->out_type != tt || xv->out_type != xt) return NULL;
+    /* The builtin reads a sentinel in either operand as null; the DAG reads
+     * it as null only where its source says so.  So the temporal side is a
+     * column or a lowered pair (whose wrap is flagged), and the integer side
+     * a column or a literal: an integer expression that wraps onto its own
+     * sentinel (`(+ i 1i)` at I32 max) would be added as a number. */
+    if (tv->opcode != OP_SCAN && !(tv->flags & OP_FLAG_TEMPORAL_INT)) return NULL;
+    if (xv->opcode != OP_SCAN && xv->opcode != OP_CONST) return NULL;
     if (xt != RAY_BOOL && xt != RAY_U8 && xt != RAY_I16 && xt != RAY_I32 && xt != RAY_I64)
         return NULL;
     if (xv->opcode == OP_CONST) {

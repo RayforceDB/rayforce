@@ -238,6 +238,19 @@
 (try (at (select {r: (sums (+ t 1)) from: A}) 'r) (fn [e] (at e 'msg))) -- "sums expects a vector input, got time"
 (try (at (select {r: (substr s 1 (+ d 1)) from: A}) 'r) (fn [e] (at e 'msg))) -- "substr: length must be an integer atom or I64/I32 vector"
 (try (at (select {r: (replace s "a" (+ d 1)) from: A}) 'r) (fn [e] (at e 'msg))) -- "replace: to must be string or symbol atom"
+
+;; a computed integer operand that wraps onto its own sentinel is a null for
+;; the builtin: the pair keeps the builtin (only a column or a literal lowers),
+;; and an I64 column beside a DATE stays with it too
+(set IW (table [d i t s h l] (list (as 'DATE [5i 5i]) [2147483647i 1i] (as 'TIME [5i 6i]) (as 'TIMESTAMP [5 6]) [32767h 1h] [9223372036854775807 1])))
+(at (select {r: (+ d (+ i 1i)) from: IW}) 'r) -- [0Nd 2000.01.08]
+(+ (at IW 'd) (+ (at IW 'i) 1i)) -- [0Nd 2000.01.08]
+(at (select {r: (+ s (+ l 1)) from: IW}) 'r) -- [0Np 2000.01.01D00:00:00.000000008]
+(at (select {r: (+ d (+ h 1h)) from: IW}) 'r) -- [0Nd 2000.01.08]
+(at (select {r: (- (+ i 1i) t) from: IW}) 'r) -- [0Nt -00:00:00.004]
+(at (update {r: (+ d (+ i 1i)) from: IW}) 'r) -- [0Nd 2000.01.08]
+(at (update {r: (- s (+ l 1)) from: IW}) 'r) -- [0Np 2000.01.01D00:00:00.000000004]
+(at (select {r: (+ d l) from: (table [d l] (list (as 'DATE [-1i 5i 0Ni]) [-9223372036854775807 1 0Nl]))}) 'r) -- [2000.01.01 2000.01.07 0Nd]
 (set BQ (table [d s x y g c] (list BD BS BI32 BI64 (% (til n) 7) (% (til n) 10))))
 (identical (at (select {r: (+ d x) from: BQ}) 'r) (+ BD BI32)) -- true
 (identical (at (select {r: (- s y) from: BQ}) 'r) (- BS BI64)) -- true

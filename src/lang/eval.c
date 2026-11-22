@@ -1499,6 +1499,8 @@ static void tempint_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
 #undef TEMPINT_OPS
 #undef TEMPINT_SHAPES
 
+_Atomic(uint64_t) ray_tempint_routes;
+
 static bool tempint_is_int(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64;
 }
@@ -1533,6 +1535,7 @@ static ray_t* tempint_arith(uint16_t dag_opcode, ray_t* left, ray_t* right,
     ray_t* out = ray_vec_new(out_type, len);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = len;
+    atomic_fetch_add_explicit(&ray_tempint_routes, 1, memory_order_relaxed);
     int tw = out_type == RAY_TIMESTAMP ? 8 : 4;
     /* A null atom is a null for every cell, as the builtin answers it. */
     if ((!tvec && RAY_ATOM_IS_NULL(tv)) || (!xvec && RAY_ATOM_IS_NULL(xv))) {
