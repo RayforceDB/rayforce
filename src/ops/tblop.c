@@ -23,6 +23,7 @@
 
 /*  Table builtins — extracted from eval.c  */
 
+#include "lang/format.h"
 #include "lang/internal.h"
 #include "lang/env.h"
 #include "ops/ops.h"
@@ -182,10 +183,12 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * specific to the pivot column, whose values name the unstacked columns.) */
     /* A LIST pivot column's cells are not scalars either: naming columns from
      * them read pointers as numbers (#1375). */
-    if (pcol->type == RAY_STR || pcol->type == RAY_LIST) {
+    /* A parted column carries its base type offset (RAY_PARTED_BASE + t). */
+    int8_t pct = RAY_IS_PARTED(pcol->type) ? (int8_t)RAY_PARTED_BASETYPE(pcol->type) : pcol->type;
+    if (pct == RAY_STR || pct == RAY_LIST) {
         scratch_free(ic_hdr);
         return ray_error("nyi", "pivot: %s pivot column not supported as column names",
-                         pcol->type == RAY_STR ? "STR" : "LIST");
+                         pct == RAY_STR ? "STR" : "LIST");
     }
 
     /* Get index columns (icols carved together with idx_syms above) */
@@ -649,10 +652,22 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         } else if (pval->type == -RAY_I64) {
             char buf[64]; int len = snprintf(buf, sizeof(buf), "%" PRId64, pval->i64);
             col_sym = ray_sym_intern(buf, (size_t)len);
-        } else if (pval->type == -RAY_F64) {
+        } else if (pval->type == -RAY_F64 || pval->type == -RAY_F32) {
+            /* an F32 atom holds its value as a double (ray_f32) */
             double fv = clear_neg_zero(pval->f64);
             char buf[64]; int len = snprintf(buf, sizeof(buf), "%g", fv);
             col_sym = ray_sym_intern(buf, (size_t)len);
+        } else if (pval->type == -RAY_GUID) {
+            /* its text, as the DAG route names it, not the payload pointer (#1375) */
+            ray_t* s = ray_fmt(pval, RAY_FMT_COMPACT);
+            if (!s || RAY_IS_ERR(s)) {
+                if (a1) ray_release(pval);
+                ray_release(agg_vec); ray_release(result);
+                result = s ? s : ray_error("oom", NULL);
+                goto fb_cleanup;
+            }
+            col_sym = ray_sym_intern(ray_str_ptr(s), ray_str_len(s));
+            ray_release(s);
         } else if (pval->type == -RAY_BOOL) {
             col_sym = ray_sym_intern(pval->b8 ? "true" : "false", pval->b8 ? 4 : 5);
         } else {
