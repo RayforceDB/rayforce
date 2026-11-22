@@ -546,6 +546,14 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     } else {
         return NULL;
     }
+    /* sum(v) + n*c is the per-row sum only for a non-null c that no row can
+     * overflow with (#1349): v + null is null per row and sums to 0, and
+     * below 2^970 no finite v + c can pass DBL_MAX (as expr.c's affine
+     * plan).  Decided before v is evaluated, so a decline evaluates once. */
+    if (RAY_ATOM_IS_NULL(c_expr) ||
+        ((c_expr->type == -RAY_F64 || c_expr->type == -RAY_F32) &&
+         !(fabs(as_f64(c_expr)) < 0x1p970)))
+        return NULL;
 
     ray_t* vec = ray_eval(vec_expr);
     if (!vec || RAY_IS_ERR(vec))

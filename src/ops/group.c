@@ -8903,8 +8903,10 @@ typedef struct {
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
     ray_t* _h_touched;
-    /* A fused product overflowed in this worker while no nn_count is kept
-     * (#1349): an AVG over it reruns on ht_path.  Per worker, plain store. */
+    /* A fused product overflowed while no nn_count is kept (#1349): an AVG
+     * over it reruns on ht_path.  The partitioned DA path's drain tasks
+     * share accums[0], so it is set with a relaxed atomic store (always
+     * true) and read after the join. */
     bool   prod_overflow;
 } da_accum_t;
 
@@ -11066,7 +11068,7 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
                 /* Fused product: an overflowed one is 0Nf, skipped. */
                 double v = prod_val_f64(&c->agg_prod[a], r);
                 if (RAY_LIKELY(__builtin_fabs(v) <= DBL_MAX)) { acc->sum[idx].f += v; if (nn) nn[idx]++; }
-                else if (!nn) acc->prod_overflow = true;
+                else if (!nn) __atomic_store_n(&acc->prod_overflow, true, __ATOMIC_RELAXED);
                 continue;
             }
             if (!c->agg_ptrs[a]) continue;
@@ -11126,7 +11128,7 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = ray_f64_fin(prod_val_f64(&c->agg_prod[a], r));
             if (RAY_UNLIKELY(fv != fv) && !nn)
-                acc->prod_overflow = true;
+                __atomic_store_n(&acc->prod_overflow, true, __ATOMIC_RELAXED);
             iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_strlen && c->agg_strlen[a]) {
             /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
