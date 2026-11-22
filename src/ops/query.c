@@ -11145,7 +11145,10 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
  * whole column instead of one scalar cell.  The returned vector (caller owns)
  * defines its output column's length, which may differ from the table's row
  * count — the caller enforces cross-column length agreement.  Mirrors
- * eval_expr_per_row's scope save/restore, including on every error exit. */
+ * eval_expr_per_row's scope save/restore, including on every error exit.
+ * An `if` in `expr` chooses per row (query_eval_bound), as in a projection:
+ * `(count (distinct (if c d (+ d 1))))` counts the values the rows take,
+ * not the `then` column's (#1305). */
 static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl) {
     if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
     ray_t* bind_err_ = NULL;
@@ -11154,7 +11157,7 @@ static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl) {
      * is in progress (a nested select inside one of its outputs). */
     int64_t _aqr = g_active_query_row;
     g_active_query_row = -1;
-    ray_t* result = bind_err_ ? bind_err_ : ray_eval(expr);
+    ray_t* result = bind_err_ ? bind_err_ : query_eval_bound(expr, tbl);
     /* distinct/asc/desc/reverse return a lazy DAG chain (RAY_LAZY) — force it
      * to a concrete vector while the source columns it captured are still
      * bound in this scope. */
