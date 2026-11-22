@@ -1,0 +1,28 @@
+;; #1349: eager (sum (+ v c)) with a literal c takes the sum(v) + n*c
+;; shortcut (try_sum_affine_expr).  It must give the per-row answer, as the
+;; lambda form (compiled, no shortcut) and the query do: a null c makes every
+;; row null, summing to 0, and a c that overflows a row makes that row null.
+(set x [1.7e308 1.0])
+(set i [1 2 3])
+(set F (fn [] (sum (+ x 1e308))))
+(set G (fn [] (sum (+ 1e308 x))))
+;; overflowing literal bias, both orders
+(== (sum (+ x 1e308)) 1e308) -- true
+(== (sum (+ 1e308 x)) 1e308) -- true
+(== (sum (+ x 1e308)) (F)) -- true
+(== (sum (+ 1e308 x)) (G)) -- true
+(== (sum (+ x -1e308)) (+ (- 1.7e308 1e308) (- 1.0 1e308))) -- true
+(== (sum (+ x 1e308)) (first (at (select {r: (sum (+ x 1e308)) from: (table [x] (list x))}) 'r))) -- true
+;; null literal bias of every width, both orders
+(== (sum (+ x 0Nf)) 0.0) -- true
+(== (sum (+ 0Nf x)) 0.0) -- true
+(== (sum (+ i 0Nf)) 0.0) -- true
+(sum (+ i 0Nl)) -- 0
+(sum (+ 0Nl i)) -- 0
+(sum (+ i 0Ni)) -- 0
+(== (sum (+ x 0Nl)) 0.0) -- true
+(== (sum (+ x 0Ni)) 0.0) -- true
+;; the shortcut still answers ordinary literals
+(sum (+ i 10)) -- 36
+(== (sum (+ x 1.0)) (+ 1.7e308 3.0)) -- true
+(== (sum (+ [1.0 2.0] 1e300)) (+ 3.0 2e300)) -- true

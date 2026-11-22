@@ -354,16 +354,16 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
         return ray_typed_null(rt);
 
-    /* Float modulo: result = a - b * floor(a/b) */
+    /* Float modulo: a - b * floor(a/b), rounded once (ray_fmod_floor), as
+     * the vector kernels give it.  An F32 result is taken in F32 (#1349:
+     * the product b * floor(a/b) of the old formula lost the remainder
+     * past 2^53, and the residual snap moved results near 0 and b). */
     if (is_float_op(a, b)) {
         double av = as_f64(a), bv = as_f64(b);
         if (bv == 0.0)
             return ray_typed_null(rt);
-        double result = av - bv * floor(av / bv);
-        /* Snap tiny residual to 0 */
-        if (fabs(result) < 1e-12 || fabs(result - fabs(bv)) < 1e-12) result = bv > 0 ? 0.0 : -0.0;
-        if (rt == -RAY_F32) return ray_f32(ray_f64_to_f32_fin(result));
-        return make_f64(result);
+        if (rt == -RAY_F32) return ray_f32(ray_fmod_floor_f32((float)av, (float)bv));
+        return make_f64(ray_fmod_floor(av, bv));
     }
 
     /* Integer modulo: result = a - b * floor(a/b), sign follows b (divisor).

@@ -84,6 +84,42 @@ static inline float ray_f64_to_f32_fin(double v) {
     return (v <= (double)FLT_MAX && v >= -(double)FLT_MAX) ? (float)v : NULL_F32;
 }
 
+/* Float `%`: the floor modulo a - b*floor(a/b) of finite a and b != 0,
+ * rounded once, so it lies in [0,b) for b > 0 and in (b,0] for b < 0 (a
+ * remainder that would round to b itself is 0).  One rule for the atom
+ * builtin, the vector kernels and the constant folds (#1349).  While the
+ * quotient is below 2^52 (2^23 for F32) the fused a - b*floor(q) is the
+ * remainder exactly: floor(q) is the true floor or, when q rounded up to
+ * an integer, one more, whose remainder is the exact IEEE one, and adding b
+ * back rounds once.  Past that, fmod (exact, but a loop over the exponent
+ * gap: ~9 ns at a quotient of 100, ~80 ns at 1e11) and the sign fix. */
+double ray_fmod_floor_wide(double a, double b);
+float  ray_fmod_floor_wide_f32(float a, float b);
+
+static inline double ray_fmod_floor(double a, double b) {
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+    double q = a / b;
+    if (__builtin_expect(__builtin_fabs(q) < 0x1p52, 1)) {
+        double r = __builtin_fma(-b, __builtin_floor(q), a);
+        if (b > 0 ? r < 0 : r > 0) r += b;
+        return r == b ? 0.0 : r;
+    }
+#endif
+    return ray_fmod_floor_wide(a, b);
+}
+
+static inline float ray_fmod_floor_f32(float a, float b) {
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+    float q = a / b;
+    if (__builtin_expect(__builtin_fabsf(q) < 0x1p23f, 1)) {
+        float r = __builtin_fmaf(-b, __builtin_floorf(q), a);
+        if (b > 0 ? r < 0 : r > 0) r += b;
+        return r == b ? 0.0f : r;
+    }
+#endif
+    return ray_fmod_floor_wide_f32(a, b);
+}
+
 static inline uint8_t ray_cast_f64_to_u8_null(double v) {
     if (v != v || v <= 0.0) return 0;
     if (v >= (double)UINT8_MAX) return UINT8_MAX;

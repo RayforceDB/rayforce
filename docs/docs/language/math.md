@@ -66,7 +66,11 @@ integer (floor) division.
 
 ### `(% a b)` — atomic
 
-Modulo: `a - b * floor(a / b)`, so the result takes the sign of `b`. The
+Modulo: `a - b * floor(a / b)`, so the result takes the sign of `b`. A
+float result is that value rounded once, so it lies in `[0, b)` for a
+positive `b` and in `(b, 0]` for a negative one at any magnitude:
+`(% 1e300 7.0)` is `1.0`, and a remainder that would round to `b` itself
+is `0` (`(% -1e-20 7.0)` is `0.0`). The
 result type comes from the [table above](#result-types). A zero divisor
 gives null, with one exception kept from u8 byte modulo: an integer result
 with a u8 divisor (or a u8 result) gives `0`. A float result of a zero
