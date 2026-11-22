@@ -1972,6 +1972,11 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
             if (x->type == -RAY_I64) { if (i64_inexact(x->i64)) *inexact |= RAY_KEY_BIG_I64; }
             else if (x->type == -RAY_F64 || x->type == -RAY_F32) *inexact |= RAY_KEY_FLOAT;
         }
+        /* With no float anywhere in the key set, integer atoms meet only by
+         * their integer value, so hash it: past 2^53 a double would put
+         * hundreds of neighbours in one hash (#1333). */
+        if ((spans & RAY_KEY_EXACT_INT) && x->type != -RAY_F64 && x->type != -RAY_F32)
+            return ray_hash_i64(as_i64(x));
         return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
     }
     switch (x->type) {
@@ -2063,6 +2068,29 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
 }
 
 uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NULL, NULL); }
+
+/* No F64 or F32 atom anywhere in x (a key set, or one cell), nested lists,
+ * dict and table cells included: with ray_key_spans(x) == 0 too, integer
+ * atoms may hash exactly (RAY_KEY_EXACT_INT).  Typed vector cells compare
+ * by type and bytes, so a float vector never meets an integer one. */
+bool ray_key_float_free(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return true;
+    if (x->type == -RAY_F64 || x->type == -RAY_F32) return false;
+    if (x->type == RAY_LIST) {
+        ray_t** cells = ray_data(x);
+        for (int64_t i = 0; i < x->len; i++) if (!ray_key_float_free(cells[i])) return false;
+        return true;
+    }
+    if (x->type == RAY_DICT) return ray_key_float_free(ray_dict_keys(x)) && ray_key_float_free(ray_dict_vals(x));
+    if (x->type == RAY_TABLE) {
+        for (int64_t c = 0; c < ray_table_ncols(x); c++) {
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
+            if (!ray_key_float_free(col)) return false;
+        }
+    }
+    return true;
+}
 
 /* ray_key_hash for a pool worker: runtime-domain symbols read from the
  * borrowed `view`, not through ray_sym_str's lock.  Same text, same hash.
