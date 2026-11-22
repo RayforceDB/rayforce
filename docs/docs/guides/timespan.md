@@ -50,7 +50,7 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | `span div integer`, `span div span` | TIMESPAN |
 | `span / span`, `span / integer` | F64 |
 | `span % integer` | TIMESPAN |
-| `span % F64`, `F64 % span` | F64: the float `%` of the nanosecond count, the floor modulo rounded once (in [0,b) for b > 0, (b,0] for b < 0); a zero divisor gives null |
+| `span % F64`, `F64 % span`, and the same with F32 | F64: the float `%` of the nanosecond count, the floor modulo rounded once (in [0,b) for b > 0, (b,0] for b < 0); a zero divisor gives null |
 | `span % span`, `span * span` | Type error |
 | Comparisons with another span or an integer count | BOOL |
 | `sum spans` | TIMESPAN; skips nulls |
@@ -73,9 +73,9 @@ Inside a query the same functions give the same answers, nulls included.
 On empty or all-null duration vectors, `min` returns `0Wn` and `max`
 returns `-0Wn`.
 
-F64 operands promote ordinary duration addition and multiplication to F64
-nanosecond arithmetic. F32 operands are rounded to an integer count for
-these duration operations. Integer division preserves the left operand's
+F64 and F32 operands promote duration addition, subtraction,
+multiplication and `%` to F64 nanosecond arithmetic: `(+ 0D00:00:00.000000010 2.5e)` is
+`12.5`, as with `2.5`. Integer division preserves the left operand's
 type: a span divided by a span is a duration containing the quotient count,
 not a dimensionless integer. Division floors toward negative infinity.
 For example, `(div -0D00:00:00.000000001 2)` is minus one nanosecond, and
