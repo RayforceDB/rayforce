@@ -80,20 +80,21 @@ ray_t* ray_add_fn(ray_t* a, ray_t* b) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(a->type);
 
-        int64_t v = as_i64(b);
-        if (a->type == -RAY_DATE)      return ray_date(a->i64 + v);
-        if (a->type == -RAY_TIME)      return ray_time(a->i64 + v);
-        if (a->type == -RAY_TIMESTAMP) return ray_timestamp(a->i64 + v);
+        /* uint64 wrap (defined), as the typed vector pass computes it */
+        int64_t v = (int64_t)((uint64_t)a->i64 + (uint64_t)as_i64(b));
+        if (a->type == -RAY_DATE)      return ray_date(v);
+        if (a->type == -RAY_TIME)      return ray_time(v);
+        if (a->type == -RAY_TIMESTAMP) return ray_timestamp(v);
     }
     if (is_numeric(a) && a->type != -RAY_F64 &&
         a->type != -RAY_F32 && is_temporal(b)) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(b->type);
 
-        int64_t v = as_i64(a);
-        if (b->type == -RAY_DATE)      return ray_date(b->i64 + v);
-        if (b->type == -RAY_TIME)      return ray_time(b->i64 + v);
-        if (b->type == -RAY_TIMESTAMP) return ray_timestamp(b->i64 + v);
+        int64_t v = (int64_t)((uint64_t)b->i64 + (uint64_t)as_i64(a));
+        if (b->type == -RAY_DATE)      return ray_date(v);
+        if (b->type == -RAY_TIME)      return ray_time(v);
+        if (b->type == -RAY_TIMESTAMP) return ray_timestamp(v);
     }
     /* Reject float + temporal */
     if (((a->type == -RAY_F64 || a->type == -RAY_F32) && is_temporal(b)) ||
@@ -162,13 +163,15 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(a->type);
     }
-    if (is_numeric(a) && is_temporal(b)) {
+    /* int - TIME is the one int-minus-temporal pair; int - DATE / TIMESTAMP
+     * falls to the type error below, a null on either side included (#1336). */
+    if (is_numeric(a) && b->type == -RAY_TIME) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(b->type);
     }
     /* DATE - int → DATE */
     if (a->type == -RAY_DATE && is_numeric(b)) {
-        return ray_date(a->i64 - as_i64(b));
+        return ray_date((int64_t)((uint64_t)a->i64 - (uint64_t)as_i64(b)));
     }
     /* DATE - DATE → i32 (days difference) */
     if (a->type == -RAY_DATE && b->type == -RAY_DATE) {
@@ -182,15 +185,15 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
     }
     /* TIME - int → TIME */
     if (a->type == -RAY_TIME && is_numeric(b)) {
-        return ray_time(a->i64 - as_i64(b));
+        return ray_time((int64_t)((uint64_t)a->i64 - (uint64_t)as_i64(b)));
     }
     /* int - TIME → TIME (negative) */
     if (is_numeric(a) && b->type == -RAY_TIME) {
-        return ray_time(as_i64(a) - b->i64);
+        return ray_time((int64_t)((uint64_t)as_i64(a) - (uint64_t)b->i64));
     }
     /* TIMESTAMP - int → TIMESTAMP */
     if (a->type == -RAY_TIMESTAMP && is_numeric(b)) {
-        return ray_timestamp(a->i64 - as_i64(b));
+        return ray_timestamp((int64_t)((uint64_t)a->i64 - (uint64_t)as_i64(b)));
     }
     /* TIMESTAMP - TIME → TIMESTAMP */
     if (a->type == -RAY_TIMESTAMP && b->type == -RAY_TIME) {
@@ -351,16 +354,16 @@ ray_t* ray_mod_fn(ray_t* a, ray_t* b) {
     if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
         return ray_typed_null(rt);
 
-    /* Float modulo: result = a - b * floor(a/b) */
+    /* Float modulo: a - b * floor(a/b), rounded once (ray_fmod_floor), as
+     * the vector kernels give it.  An F32 result is taken in F32 (#1349:
+     * the product b * floor(a/b) of the old formula lost the remainder
+     * past 2^53, and the residual snap moved results near 0 and b). */
     if (is_float_op(a, b)) {
         double av = as_f64(a), bv = as_f64(b);
         if (bv == 0.0)
             return ray_typed_null(rt);
-        double result = av - bv * floor(av / bv);
-        /* Snap tiny residual to 0 */
-        if (fabs(result) < 1e-12 || fabs(result - fabs(bv)) < 1e-12) result = bv > 0 ? 0.0 : -0.0;
-        if (rt == -RAY_F32) return ray_f32(ray_f64_to_f32_fin(result));
-        return make_f64(result);
+        if (rt == -RAY_F32) return ray_f32(ray_fmod_floor_f32((float)av, (float)bv));
+        return make_f64(ray_fmod_floor(av, bv));
     }
 
     /* Integer modulo: result = a - b * floor(a/b), sign follows b (divisor).

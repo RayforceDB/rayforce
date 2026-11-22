@@ -31,6 +31,7 @@
 #include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
 #include "mem/heap.h"
+#include "core/types.h"   /* ray_cast_f64_to_i64_null, ray_fmod_floor */
 #include <float.h>
 #include <math.h>
 #include <string.h>
@@ -299,14 +300,16 @@ static bool atom_to_numeric(ray_t* v, double* out_f, int64_t* out_i, bool* is_f6
     if (!v || !ray_is_atom(v)) return false;
     if (RAY_ATOM_IS_NULL(v)) return false;
     switch (v->type) {
+        /* *out_i of a float is read by no fold (is_f64 says so); keep it
+         * defined past the int64 range ((% 1e300 7) reaches here). */
         case -RAY_F64:
             *out_f = v->f64;
-            *out_i = (int64_t)v->f64;
+            *out_i = ray_cast_f64_to_i64_null(v->f64);   /* not a raw cast (#1343) */
             *is_f64 = true;
             return true;
         case -RAY_F32:
             *out_f = (double)(float)v->f64;
-            *out_i = (int64_t)(float)v->f64;
+            *out_i = ray_cast_f64_to_i64_null((double)(float)v->f64);
             *is_f64 = true;
             return true;
         case -RAY_I64:
@@ -497,8 +500,7 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MUL: r = lv * rv; break;
                 case OP_MOD:
                     if (rv == 0.0f) return false;   /* 0Nf at run time */
-                    r = fmodf(lv, rv);
-                    if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
+                    r = ray_fmod_floor_f32(lv, rv);
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -518,8 +520,8 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MUL: r = lv * rv; break;
                 case OP_DIV: r = lv / rv; break;
                 case OP_MOD:
-                    r = fmod(lv, rv);
-                    if (r != 0.0 && ((r > 0.0) != (rv > 0.0))) r += rv;
+                    if (rv == 0.0) return false;    /* 0Nf at run time */
+                    r = ray_fmod_floor(lv, rv);
                     break;
                 case OP_POW:
                     if (!pow_atom_type_admitted(le->literal) ||

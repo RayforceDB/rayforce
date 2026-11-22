@@ -1,0 +1,117 @@
+;; @also-unfused
+;; Float `%` is the floor modulo a - b*floor(a/b), rounded once: in [0,b)
+;; for b > 0, in (b,0] for b < 0, null for a zero divisor or a null operand
+;; (math.md).  The atom builtin, the eager vector, the fused query, the
+;; per-node executor (the unfused pass) and the constant folds all give the
+;; same value (#1349).  The atom builtin used to multiply b by floor(a/b),
+;; which loses the remainder once a/b passes 2^53 ((% 1e300 7) was
+;; 3.72e+283, (% 3e38e 3e) -1.89e+22e), and snapped a result within 1e-12
+;; of 0 or of b to 0.  A remainder that rounds to b itself (-1e-20 mod 7 is
+;; 7 - 1e-20) is 0, never b.  Pins compare exactly with ==; an expected
+;; value is the exact floor modulo rounded once.
+
+(set Same (fn [x y] (and (== (type x) (type y)) (== (count x) (count y)) (all (or (and (nil? x) (nil? y)) (== x y))))))
+;; every non-null r of (% a b) lies in [0,b) or (b,0]
+(set InRange (fn [r b] (all (or (nil? r) (and (>= (* r (signum b)) 0) (< (abs r) (abs b)))))))
+(set Q (fn [T] (at (select {r: (% a b) from: T}) 'r)))
+
+;; ─── F64 atoms ──────────────────────────────────────────────────────
+(== (% 1e300 7.0) 1.0) -- true
+(== (% -1e300 7.0) 6.0) -- true
+(== (% 1e300 -7.0) -6.0) -- true
+(== (% -1e300 -7.0) -1.0) -- true
+(== (% 1e300 7) 1.0) -- true
+(== (% 1e17 3.0) 1.0) -- true
+(== (% -1e17 3.0) 2.0) -- true
+(== (% 1e15 7.0) 6.0) -- true
+(== (% -1e15 7.0) 1.0) -- true
+(== (% 4503599627370497.0 2.0) 1.0) -- true
+(== (% 9007199254740991.0 10.0) 1.0) -- true
+(== (% -1e308 3.0) 1.0) -- true
+(== (% 1.7976931348623157e308 -3.0) -1.0) -- true
+(== (% 5.0 1e-300) 4.8159326401985574e-301) -- true
+(== (% -5.0 1e-300) 5.184067359801443e-301) -- true
+(== (% 0.3 0.1) 0.09999999999999998) -- true
+(== (% 0.7 0.1) 0.09999999999999992) -- true
+(== (% -0.3 0.1) 2.7755575615628914e-17) -- true
+(== (% 1e-13 1.0) 1e-13) -- true
+(== (% -1e-20 7.0) 0.0) -- true
+(== (% 1e-20 -7.0) 0.0) -- true
+(== (% -7.5 2.0) 0.5) -- true
+(== (% 7.5 -2.0) -0.5) -- true
+(== (% -7.5 -2.0) -1.5) -- true
+(nil? (% 5.5 0.0)) -- true
+(nil? (% 5.5 0)) -- true
+(nil? (% 0Nf 7.0)) -- true
+(nil? (% 7.0 0Nf)) -- true
+(type (% 1e300 7.0)) -- 'f64
+
+;; ─── F32 atoms: taken in F32 ────────────────────────────────────────
+(== (% 3e38e 3e) 2.0e) -- true
+(== (% -3e38e 3e) 1.0e) -- true
+(== (% 3e38e -3e) -1.0e) -- true
+(== (% -3e38e -3e) -2.0e) -- true
+(== (% 1.5e 0.1e) 0.09999998e) -- true
+(== (% -1.5e 0.1e) 2.2351742e-08e) -- true
+(== (% 3.4e38e 0.7e) 0.16714478e) -- true
+(== (% -2.5e20e 3e) 1.0e) -- true
+(== (% 16777216e 10e) 6.0e) -- true
+(== (% -1e-30e 7e) 0.0e) -- true
+(== (% 1e-30e -7e) 0.0e) -- true
+(== (% -7.5e 2e) 0.5e) -- true
+(nil? (% 5e 0e)) -- true
+(nil? (% 0Ne 3e)) -- true
+(type (% 3e38e 3e)) -- 'f32
+
+;; ─── the same pins over vectors: eager, then fused / unfused query ──
+(set a [1e300 -1e300 1e300 -1e300 1e17 -1e17 1e15 4503599627370497.0 -1e308 5.0 -5.0 0.3 0.7 -0.3 1e-13 -1e-20 1e-20 -7.5 7.5 -7.5 5.5 0Nf 7.0])
+(set b [7.0 7.0 -7.0 -7.0 3.0 3.0 7.0 2.0 3.0 1e-300 1e-300 0.1 0.1 0.1 1.0 7.0 -7.0 2.0 -2.0 -2.0 0.0 7.0 0Nf])
+(set W [1.0 6.0 -6.0 -1.0 1.0 2.0 6.0 1.0 1.0 4.8159326401985574e-301 5.184067359801443e-301 0.09999999999999998 0.09999999999999992 2.7755575615628914e-17 1e-13 0.0 0.0 0.5 -0.5 -1.5 0Nf 0Nf 0Nf])
+(Same (% a b) W) -- true
+(set T (table [a b] (list a b)))
+(Same (Q T) W) -- true
+(Same (at (select {r: (+ 0.0 (% a b)) from: T}) 'r) W) -- true
+;; a vector by an atom divisor
+(Same (% [1e300 -1e300 1e15 -1e-20] 7.0) [1.0 6.0 6.0 0.0]) -- true
+(Same (at (select {r: (% a 7.0) from: (table [a] (list [1e300 -1e300 1e15 -1e-20]))}) 'r) [1.0 6.0 6.0 0.0]) -- true
+
+(set a [3e38e -3e38e 3e38e -3e38e 1.5e -1.5e 3.4e38e -2.5e20e 16777216e -1e-30e 1e-30e -7.5e 5e 0Ne])
+(set b [3e 3e -3e -3e 0.1e 0.1e 0.7e 3e 10e 7e -7e 2e 0e 3e])
+(set W [2.0e 1.0e -1.0e -2.0e 0.09999998e 2.2351742e-08e 0.16714478e 1.0e 6.0e 0.0e 0.0e 0.5e 0Ne 0Ne])
+(Same (% a b) W) -- true
+(set T (table [a b] (list a b)))
+(Same (Q T) W) -- true
+(Same (at (select {r: (% a 3e) from: T}) 'r) (% a 3e)) -- true
+
+;; ─── constant folds: the query folds (% 1e300 7) before the kernels ──
+(set i [3 -9223372036854775807 0 0N])
+(set TI (table [i] (list i)))
+(Same (at (select {r: (+ i (% 1e300 7)) from: TI}) 'r) (+ i (% 1e300 7))) -- true
+(Same (+ i (% 1e300 7)) [4.0 -9.223372036854776e18 1.0 0Nf]) -- true
+(Same (at (select {r: (+ i (% -1e-20 7.0)) from: TI}) 'r) [3.0 -9.223372036854776e18 0.0 0Nf]) -- true
+(Same (at (select {r: (+ i (% 3e38e 3e)) from: TI}) 'r) (+ i (% 3e38e 3e))) -- true
+;; the affine plan reads its bias through the constant evaluator
+(set x [1.0 2.0 3.0])
+(at (select {r: (sum (+ x (% 1e300 7))) from: (table [x] (list x))}) 'r) -- [9.0]
+(== (sum (+ x (% 1e300 7))) 9.0) -- true
+(at (select {r: (sum (+ x (% -1e-20 7.0))) from: (table [x] (list x))}) 'r) -- [6.0]
+(== (sum (+ x (% -1e-20 7.0))) 6.0) -- true
+
+;; ─── range: huge magnitudes, both signs, every divisor sign ─────────
+(set n 4000)
+(set I (til n))
+(set a (* (as 'F64 (- (% (* I 7919) 2001) 1000)) (at [1.0 1e-20 1e10 1e100 1e297 3.3e15] (% I 6))))
+(set b (at [7.0 -7.0 0.1 -0.1 3e-5 -1e10 1e300 2.5] (% (* I 13) 8)))
+(set T (table [a b] (list a b)))
+(set R (% a b))
+(InRange R b) -- true
+(InRange (Q T) b) -- true
+(Same (Q T) R) -- true
+(set a32 (as 'F32 (* (as 'F64 (- (% (* I 7919) 2001) 1000)) (at [1.0 1e-20 1e10 1e30 3e35] (% I 5)))))
+(set b32 (as 'F32 (at [7.0 -7.0 0.1 -0.1 3e-5 -1e10 1e30 2.5] (% (* I 13) 8))))
+(set T (table [a b] (list a32 b32)))
+(set R (% a32 b32))
+(type R) -- 'F32
+(InRange R b32) -- true
+(InRange (Q T) b32) -- true
+(Same (Q T) R) -- true

@@ -223,7 +223,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
             case OP_MUL: r = lv * rv; break;
             case OP_DIV: r = rv != 0.0 ? lv / rv : NAN; break;
             case OP_IDIV: r = rv != 0.0 ? floor(lv / rv) : NAN; break;
-            case OP_MOD: { if (rv != 0.0) { r = fmod(lv, rv); if (r && ((r > 0) != (rv > 0))) r += rv; } else { r = NAN; } } break;
+            case OP_MOD: r = rv != 0.0 ? ray_fmod_floor(lv, rv) : NAN; break;
             case OP_POW: r = (lv != lv || rv != rv) ? NAN : pow(lv, rv); break;
             case OP_MIN2: r = lv < rv ? lv : rv; break;
             case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -1078,10 +1078,16 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     int8_t bt = base_src->type;
     ray_t* base_vec = NULL;
     if (bt == RAY_F64) {
+        /* sum(x) + n*c is the per-row sum only while no x + c overflows:
+         * an overflowing row is 0Nf per row and skipped (#1349).  Below
+         * 2^970, half an ulp of DBL_MAX, no finite x can carry x + c past
+         * it; a null c (x + 0Nf is all null) fails the test too. */
+        double bias = (double)sign * (c_is_f64 ? c_f : (double)c_i);
+        if (!(fabs(bias) < 0x1p970)) return false;
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
-        out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
-        out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
+        out_affine->bias_f64 = bias;
+        out_affine->bias_i64 = ray_cast_f64_to_i64_null(bias);
         *out_vec = base_vec;
         return true;
     }
@@ -1221,6 +1227,18 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
         return (op == OP_NEG || op == OP_ABS) && t1 == RAY_I64;
     }
     return false;
+}
+
+/* `(+ temporal int)` and friends lower to the integer + / - with a CAST
+ * back to the temporal type, flagged OP_FLAG_TEMPORAL_INT
+ * (dag_temporal_int_arith, query.c).  The builtin reads a result that
+ * wraps onto the lane's sentinel as a null, so that CAST is a null
+ * producer: its register is nullable and the output is scanned for the
+ * sentinel (expr_flag_output_nulls), where the integer kernels keep the
+ * wrapped value as a number.  (The xbar CAST is not flagged.) */
+static bool expr_temporal_arith_cast(ray_graph_t* g, ray_op_t* node) {
+    (void)g;
+    return node->opcode == OP_CAST && (node->flags & OP_FLAG_TEMPORAL_INT);
 }
 
 /* A CAST may target a temporal type (the DAG retags a bucketed temporal
@@ -1776,7 +1794,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 bool in_src  = out->regs[s1].null_src ||
                                (s2 != 0xFF && out->regs[s2].null_src);
                 bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
-                                                       s2 != 0xFF);
+                                                       s2 != 0xFF) ||
+                                expr_temporal_arith_cast(g, node);
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
                 if (in_null) {
@@ -2089,12 +2108,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] * b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
             case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
-            case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                if (b[j] == 0.0) { d[j] = NULL_F64; continue; }
-                double m = fmod(a[j], b[j]);
-                m = (m && ((m > 0) != (b[j] > 0))) ? m + b[j] : m;
-                d[j] = ray_f64_fin(m);
-            } break;
+            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64; break;
             case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
@@ -2323,10 +2337,11 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
  * the mark_i64_overflow_as_null post-pass (INT64_MIN result → null). */
 static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void* dp,
                              int8_t t1, const void* ap, int64_t n) {
-    if (opcode == OP_CAST) {
-        dt = expr_cast_lane_type(dt);
-        t1 = expr_cast_lane_type(t1);
-    }
+    /* A CAST to DATE / TIME / TIMESTAMP (xbar, temporal %) leaves a
+     * register typed by its temporal result; every reader of it (ISNULL,
+     * NOT, a chained CAST) dispatches on the lane it sits in (#1339). */
+    t1 = expr_cast_lane_type(t1);
+    if (opcode == OP_CAST) dt = expr_cast_lane_type(dt);
     if (dt == RAY_F64) {
         double* d = (double*)dp;
         if (t1 == RAY_F64) {
@@ -3410,14 +3425,16 @@ static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t n
     uint8_t o = expr->out_reg;
     if (!expr->regs[o].nullable) return;
     if (expr->regs[o].null_src) { out->attrs |= RAY_ATTR_HAS_NULLS; return; }
-    if (expr->out_type == RAY_I64)      mark_i64_overflow_as_null(out, 0, nrows);
+    if (expr->out_type == RAY_I64 || expr->out_type == RAY_TIMESTAMP)
+        mark_i64_overflow_as_null(out, 0, nrows);
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
-    else if (expr->out_type == RAY_I32 || expr->out_type == RAY_I16) {
+    else if (expr->out_type == RAY_I32 || expr->out_type == RAY_I16 ||
+             expr->out_type == RAY_DATE || expr->out_type == RAY_TIME) {
         /* a narrowed result (#973): the null-aware CAST wrote the narrow
          * sentinel where the I64 lane held a produced null */
         const void* d = ray_data(out);
         bool any = false;
-        if (expr->out_type == RAY_I32)
+        if (expr->out_type != RAY_I16)
             for (int64_t i = 0; i < nrows && !any; i++) any = ((const int32_t*)d)[i] == NULL_I32;
         else
             for (int64_t i = 0; i < nrows && !any; i++) any = ((const int16_t*)d)[i] == NULL_I16;
@@ -4368,7 +4385,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             if (opc == OP_SIGNUM)
                 for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0f) - (src[i] < 0.0f);
             else
-                for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i];
+                /* A float null, ±inf or an out-of-range value has no int64_t:
+                 * a raw cast is undefined (#1343). */
+                for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null((double)src[i]);
             out_off += n;
         }
     } else if (in_type == RAY_F64 && out_type == RAY_F64) {
@@ -4407,15 +4426,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             double* src = (double*)m.morsel_ptr;
             int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
             switch (opc) {
-                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)(-src[i]); break;
-                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)fabs(src[i]); break;
-                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)sqrt(src[i]); break;
-                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)log(src[i]); break;
-                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)exp(src[i]); break;
+                /* Through ray_cast_f64_to_i64_null: a raw cast of a null,
+                 * ±inf or out-of-range result is undefined (#1343). */
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(-src[i]); break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(fabs(src[i])); break;
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(sqrt(src[i])); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(log(src[i])); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(exp(src[i])); break;
                 case OP_SIGNUM:for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0) - (src[i] < 0.0); break;
-                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
-                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
-                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(ceil(src[i])); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(floor(src[i])); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(round(src[i])); break;
                 default:       for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(src[i]); break;
             }
             out_off += n;
@@ -4772,6 +4793,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
      * add/sub/mul/div perf-gate kernels, so the single pass is acceptable. */
     if (out_type == RAY_F64 && expr_is_f64_unary_math(op->opcode))
         mark_f64_nonfinite_as_null(result, 0, len);
+
+    /* A temporal +/- integer wrapped onto the sentinel is a null, as the
+     * builtin and the fused CAST read it (expr_temporal_arith_cast). */
+    if (g && expr_temporal_arith_cast(g, op)) {
+        if (out_type == RAY_TIMESTAMP) mark_i64_overflow_as_null(result, 0, len);
+        else {
+            const int32_t* d = (const int32_t*)ray_data(result);
+            for (int64_t i = 0; i < len; i++)
+                if (d[i] == NULL_I32) { result->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        }
+    }
 
     return result;
 }
@@ -5342,7 +5374,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=ray_f64_fin(lv*rv); } break;
             case OP_DIV:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(lv/rv):NULL_F64; } break;
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(floor(lv/rv)):NULL_F64; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); double r; if(rv!=0.0){r=fmod(lv,rv);if(r&&((r>0)!=(rv>0)))r+=rv; r=ray_f64_fin(r);}else r=NULL_F64; odst[i]=r; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(ray_fmod_floor(lv,rv)):NULL_F64; } break;
             case OP_POW:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=(lv!=lv||rv!=rv)?NULL_F64:ray_f64_fin(pow(lv,rv)); } break;
             case OP_MIN2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
             case OP_MAX2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
@@ -5369,7 +5401,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_ADD:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)+RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_SUB:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)-RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_MUL:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)*RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=fmodf(lv,rv);if(v&&((v>0)!=(rv>0)))v+=rv;v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=ray_fmod_floor_f32(lv,rv);v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
             /* div over two F32 operands keeps F32 (#972): the floor of the
              * double quotient, rounded once, as the atom builtin does. */
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_to_f32_fin(floor(lv/rv)):NULL_F32; } break;

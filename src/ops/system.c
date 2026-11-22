@@ -1384,6 +1384,7 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "lock-failed",     11, ray_heap_lock_failures()      },
         { "lock-skipped",    12, ray_heap_lock_skipped()       },
         { "group-perpart-runs", 18, ray_group_perpart_runs()   },
+        { "group-boxed-i64-runs", sizeof("group-boxed-i64-runs") - 1, ray_group_boxed_i64_runs() },
         { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },
         { "window-perpart-runs", 19, ray_window_perpart_runs() },
