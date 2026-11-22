@@ -510,7 +510,8 @@ static void jarr_free(jarr_t* a) {
 /* Turn the run into a LIST of the atoms its cells hold, each as it was
  * written (an integer of an F64 run its integer, a null cell an untyped
  * null).  The list is charged while the run still is, so the cap holds
- * over the copy; the run's charge is returned once it is freed. */
+ * over the copy, each atom by what it holds (a string with its bytes);
+ * the run's charge is returned once it is freed. */
 static bool jarr_to_list(jp_t* jp, jarr_t* a) {
     int64_t n = a->mode == 1 ? a->out->len : a->n_null;
     size_t run_pre = a->mode == 1 ? a->pre : 0;
@@ -551,6 +552,12 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
             }
         }
         if (!v || RAY_IS_ERR(v)) { ray_release(list); jp->err = v ? v : ray_error("oom", NULL); return false; }
+        /* an atom is charged what it holds: a string's bytes beyond the
+         * estimate charged for it above */
+        size_t own = RAY_IS_NULL(v) ? 0 : ray_shallow_bytes(v);
+        if (own > JP_ATOM_BYTES && !jp_bytes(jp, own - JP_ATOM_BYTES)) {
+            ray_release(v); ray_release(list); return false;
+        }
         list = ray_list_append(list, v);
         ray_release(v);
     }
