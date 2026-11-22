@@ -4622,10 +4622,46 @@ static __attribute__((noinline, cold)) ray_t* find_in_f64_hay(ray_t* vec, ray_t*
     return r;
 }
 
+/* A TIME/TIMESTAMP meets a TIMESPAN by nanosecond duration, not raw
+ * payload. Recast only that point side, keeping haystack row numbers and
+ * letting the existing span routes find the first duplicate. An atom
+ * needle must stay an atom even though span_keys returns a vector. */
+static __attribute__((noinline, cold)) ray_t* find_span_pair(ray_t* vec, ray_t* val) {
+    ray_t* hay = vec;
+    ray_t* needle = val;
+    ray_t* keys = span_pair_keys(&hay, &needle);
+    if (!keys || RAY_IS_ERR(keys)) return keys ? keys : ray_error("oom", NULL);
+    ray_t* atom = NULL;
+    if (ray_is_atom(val) && needle != val) {
+        atom = ray_timespan(((const int64_t*)ray_data(keys))[0]);
+        if (!atom || RAY_IS_ERR(atom)) {
+            ray_release(keys);
+            return atom ? atom : ray_error("oom", NULL);
+        }
+        needle = atom;
+    }
+    ray_t* result = ray_find_fn(hay, needle);
+    if (atom) ray_release(atom);
+    ray_release(keys);
+    return result;
+}
+
 /* (find vec val) — index of first occurrence, or -1 */
 ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
+    /* A TIMESPAN meets a TIME/TIMESTAMP by duration.  Recast the point side
+     * (find_span_pair) for a vector needle, or for a TIMESPAN haystack, where
+     * only the atom needle is recast.  An atom needle against a TIME or
+     * TIMESTAMP haystack skips the recast, which would copy the whole
+     * haystack per call, and the index route below, which keys by payload:
+     * the scan's atom_eq answers it and stops at the first hit (#1325). */
+    bool span_atom_scan = false;
+    if (RAY_UNLIKELY(ray_is_vec(vec) && span_point_pair(vec->type, val->type))) {
+        if (!(ray_is_atom(val) && (vec->type == RAY_TIME || vec->type == RAY_TIMESTAMP)))
+            return find_span_pair(vec, val);
+        span_atom_scan = true;
+    }
     /* String find: (find "hello" 'l') → index of char in string */
     if (ray_is_atom(vec) && (-vec->type) == RAY_STR && ray_is_atom(val) && val->type == -RAY_STR && ray_str_len(val) == 1) {
         const char* s = ray_str_ptr(vec);
@@ -4720,7 +4756,7 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
          * needles fall through to the scan (the scan owns promotion
          * semantics; we do not replicate them here).  A guid index keys
          * every row by its bytes, so the column's nulls do not matter. */
-        if (!val_null && ray_is_atom(val) && ray_index_has(vec) &&
+        if (!val_null && !span_atom_scan && ray_is_atom(val) && ray_index_has(vec) &&
             (!has_nulls || vec->type == RAY_SYM || vec->type == RAY_GUID)) {
             ray_idx_consults[IDX_SITE_FIND]++;
             int64_t row = ray_index_find_atom(vec, val);
