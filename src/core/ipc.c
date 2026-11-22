@@ -349,6 +349,21 @@ static void hook_vm_unbind(hook_vm_t* hv) {
     hv->owned = NULL;
 }
 
+/* Drop a result that may be an error.  An error object is not reference counted:
+ * ray_release leaves it alone, so each one that was released was a block left behind
+ * in the server.  A reply sent with the verbose flag holds its error as a cell of the
+ * [captured, result] list, which ray_release does not look into either. */
+static void ipc_drop(ray_t* r) {
+    if (!r || r == RAY_NULL_OBJ) return;
+    if (RAY_IS_ERR(r)) { ray_error_free(r); return; }
+    if (r->type == RAY_LIST && r->rc == 1) {
+        ray_t** cells = (ray_t**)ray_data(r);
+        for (int64_t i = 0; i < r->len; i++)
+            if (cells[i] && RAY_IS_ERR(cells[i])) { ray_error_free(cells[i]); cells[i] = NULL; }
+    }
+    ray_release(r);
+}
+
 /* Call a single-arg hook for lifecycle events (on.open / on.close).
  * Errors are logged and swallowed — a buggy logging hook must never
  * wedge connection teardown.  `poll` is the poll the connection lives
@@ -376,7 +391,7 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
                 name, (long long)handle);
     }
     ray_release(arg);
-    if (r && r != RAY_NULL_OBJ) ray_release(r);
+    ipc_drop(r);
     hook_vm_unbind(&hv);
 }
 
@@ -429,7 +444,7 @@ static int hook_call_auth(ray_poll_t* poll, int64_t handle,
     } else {
         ok = is_truthy(r) ? 1 : 0;
     }
-    if (r && r != RAY_NULL_OBJ) ray_release(r);
+    ipc_drop(r);
     return ok;
 }
 
@@ -1517,7 +1532,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         } else {
             fprintf(stderr, "ipc: dropping unexpected response frame "
                             "(handle=%lld)\n", (long long)id);
-            if (obj && obj != RAY_NULL_OBJ) ray_release(obj);
+            ipc_drop(obj);   /* an undecodable or an error frame comes back as an error object */
         }
         return NULL;
     }
@@ -1603,13 +1618,9 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
                               ack);
             }
     }
-    /* An error object is not reference counted: ray_release leaves it alone, so
-     * every request that failed (an error in the evaluation, a message that is
-     * no expression) left a block behind in the server. */
-    if (result != RAY_NULL_OBJ) {
-        if (RAY_IS_ERR(result)) ray_error_free(result);
-        else ray_release(result);
-    }
+    /* every request that failed (an error in the evaluation, a message that is no
+     * expression, a verbose reply whose result is an error) left a block behind */
+    ipc_drop(result);
     /* The request is served: this is the end of the server's unit of work,
      * and stamping here is what lets the poll loop tell an idle server from
      * one between two requests.  Stamping on frame arrival instead would

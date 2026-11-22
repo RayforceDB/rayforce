@@ -1,14 +1,15 @@
-;; @requires: posix  (the server is spawned and stopped through a POSIX shell)
-;; The server answered a failed request and then released the error object, which
-;; does nothing: errors are not reference counted, so every failed request left
-;; a 64-byte block behind (300 failing requests: 19200 bytes).  A server that
-;; outlives its clients grows with every bad message it is sent.
+;; @requires: posix  (the server is spawned and stopped through bash: /dev/tcp, $RANDOM)
+;; An error object is not reference counted, so ray_release leaves it alone and every
+;; place that released a decoded or evaluated result which turned out to be an error
+;; left a 64-byte block in the server (300 failing requests: 19200 bytes).  A server
+;; that outlives its clients grows with every bad message it is sent.  The server
+;; picks a free port and is stopped by its own pid only.
 
-(.sys.exec "pkill -TERM -f 'rayforce -p 19981' 2>/dev/null; true")
-(.sys.exec "./rayforce -p 19981 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19981) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "bash -c 'D=/tmp/rfl_ipc_leak; rm -rf $D; mkdir -p $D; while :; do P=$((30000 + RANDOM % 20000)); (echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null || break; done; echo $P > $D/port; ./rayforce -p $P </dev/null >/dev/null 2>&1 & echo $! > $D/pid'") -- 0
+(.sys.exec "bash -c 'for i in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$(cat /tmp/rfl_ipc_leak/port)) 2>/dev/null && exit 0; sleep 0.1; done; exit 1'") -- 0
 
-(set h (.ipc.open "127.0.0.1:19981"))
+(set port (trim (read "/tmp/rfl_ipc_leak/port")))
+(set h (.ipc.open (format "127.0.0.1:%" port)))
 (set smem (fn [] (at (.ipc.send h "(.sys.mem)") 'bytes-allocated)))
 
 ;; the same on success, as the control
@@ -37,14 +38,29 @@
 (.ipc.send h "(+ 1 2)")
 (< (- (smem) s4) 2000) -- true
 
-;; a frame whose body does not decode: the decoder answers an error object, which
-;; the request handler never freed (a block per frame, for anyone who can reach the
-;; port).  Sent raw: the 2-byte handshake, then a header (prefix, version 4, flags,
-;; endianness, message type 1 = sync, an 8-byte size of 4) and 4 bytes of nothing.
+;; Raw frames, sent behind the 2-byte handshake: a header (prefix, version 4, flags,
+;; endianness, message type, an 8-byte size) and a body.  A frame is the 16 bytes of
+;; header and a body of 4 bytes of nothing; the type and flags vary.
+;; a body that does not decode (a sync request)
 (set s5 (smem))
-(.sys.exec "bash -c 'for i in $(seq 120); do exec 3<>/dev/tcp/127.0.0.1/19981; printf \"\\004\\000\" >&3; sleep 0.01; printf \"\\372\\336\\372\\316\\004\\000\\000\\001\\004\\000\\000\\000\\000\\000\\000\\000\\005\\001\\002\\003\" >&3; sleep 0.01; exec 3>&-; done'")
+(.sys.exec "bash -c 'for i in $(seq 120); do exec 3<>/dev/tcp/127.0.0.1/$(cat /tmp/rfl_ipc_leak/port); printf \"\\004\\000\" >&3; sleep 0.01; printf \"\\372\\336\\372\\316\\004\\000\\000\\001\\004\\000\\000\\000\\000\\000\\000\\000\\005\\001\\002\\003\" >&3; sleep 0.01; exec 3>&-; done'")
 (.ipc.send h "(+ 1 2)")
 (< (- (smem) s5) 3000) -- true
 
+;; a RESP frame (type 2) nobody waits for, with a body that does not decode
+(set s6 (smem))
+(.sys.exec "bash -c 'for i in $(seq 120); do exec 3<>/dev/tcp/127.0.0.1/$(cat /tmp/rfl_ipc_leak/port); printf \"\\004\\000\" >&3; sleep 0.01; printf \"\\372\\336\\372\\316\\004\\000\\000\\002\\004\\000\\000\\000\\000\\000\\000\\000\\005\\001\\002\\003\" >&3; sleep 0.01; exec 3>&-; done'")
+(.ipc.send h "(+ 1 2)")
+(< (- (smem) s6) 3000) -- true
+
+;; a sync request sent with the verbose flag (4) whose evaluation fails: the reply holds
+;; the error as a cell of a [captured, result] list, which ray_release does not look into
+(write-bytes "/tmp/rfl_ipc_leak/verbose.bin" (ser "(+ 1 (quote a))"))
+(.sys.exec "bash -c 'printf \"\\001\" | dd of=/tmp/rfl_ipc_leak/verbose.bin bs=1 seek=7 conv=notrunc 2>/dev/null; printf \"\\004\" | dd of=/tmp/rfl_ipc_leak/verbose.bin bs=1 seek=5 conv=notrunc 2>/dev/null'") -- 0
+(set s7 (smem))
+(.sys.exec "bash -c 'for i in $(seq 120); do exec 3<>/dev/tcp/127.0.0.1/$(cat /tmp/rfl_ipc_leak/port); printf \"\\004\\000\" >&3; sleep 0.01; cat /tmp/rfl_ipc_leak/verbose.bin >&3; sleep 0.02; exec 3>&-; done'")
+(.ipc.send h "(+ 1 2)")
+(< (- (smem) s7) 3000) -- true
+
 (try (.ipc.send h "(exit 0)") 0)
-(.sys.exec "pkill -TERM -f 'rayforce -p 19981' 2>/dev/null; true")
+(.sys.exec "bash -c 'kill $(cat /tmp/rfl_ipc_leak/pid) 2>/dev/null; rm -rf /tmp/rfl_ipc_leak; exit 0'") -- 0
