@@ -10418,7 +10418,7 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = prod_val_f64(&c->agg_prod[a], r);
-            iv = (int64_t)fv;
+            iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_linear && c->agg_linear[a].enabled) {
             const agg_linear_t* lin = &c->agg_linear[a];
             iv = lin->bias_i64;
@@ -11098,7 +11098,7 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = prod_val_f64(&c->agg_prod[a], r);
-            iv = (int64_t)fv;
+            iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_strlen && c->agg_strlen[a]) {
             /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
             int64_t len = da_strlen_at(c, a, r, rr, staged);
