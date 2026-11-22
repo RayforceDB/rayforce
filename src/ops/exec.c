@@ -2711,6 +2711,31 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
     return 1;
 }
 
+/* Decode (== s "lit"): an equality of a plain (generation-0) STR column of
+ * the default table carrying a hash index against a STR atom.  *out_col is
+ * the column, *out_lit the literal (borrowed from the ext).  1 on a match. */
+static int idx_filter_str_eq_decode(ray_graph_t* g, ray_op_t* pred_op,
+                                    ray_t** out_col, ray_t** out_lit) {
+    if (!pred_op || pred_op->arity != 2 || pred_op->opcode != OP_EQ) return 0;
+    ray_op_t* lhs = op_child(g, pred_op, 0);
+    ray_op_t* rhs = op_child(g, pred_op, 1);
+    if (!lhs || !rhs || lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
+    ray_op_ext_t* lext = find_ext(g, lhs->id);
+    ray_op_ext_t* rext = find_ext(g, rhs->id);
+    if (!lext || !rext || !rext->literal || rext->literal->type != -RAY_STR) return 0;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, lext->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0 || !g->table) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(g->table, lext->sym, &m)) return 0;
+    if (m.type != RAY_STR || m.enc || m.index_kind != RAY_IDX_HASH) return 0;
+    ray_t* col = idx_decode_col(g->table, lext->sym);
+    if (!col || col->type != RAY_STR) return 0;
+    *out_col = col;
+    *out_lit = rext->literal;
+    return 1;
+}
+
 /* Decode a FILTER predicate of the shape OP_IN(SCAN(col), CONST(set_vec)).
  *
  * Same column eligibility as idx_filter_decode: default table, not parted,
@@ -4594,6 +4619,26 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         /* hit < 0 (stale/ineligible index): fall through */
                     }
                     if (eq_lazy) ray_release(eq_lazy);
+                }
+
+                /* 3b. Hash EQ on a STR column: its index is keyed on a
+                 * hash of each row's bytes, so the probe is the literal's
+                 * bytes, which idx_filter_decode (integer keys) does not
+                 * give.  A generation-2 column keeps its own STR route. */
+                {
+                    ray_t* scol = NULL;
+                    ray_t* slit = NULL;
+                    if (idx_filter_str_eq_decode(g, op_child(g, op, 1), &scol, &slit)) {
+                        ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                        ray_t* sel = ray_index_hash_eq_str_rowsel(scol, ray_str_ptr(slit),
+                                                                  ray_str_len(slit));
+                        if (sel) {
+                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                            ray_idx_note_use(scol);
+                            g->selection = sel;
+                            return input;
+                        }
+                    }
                 }
 
                 /* 5. Hash/part-index IN probe:
