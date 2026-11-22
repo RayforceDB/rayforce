@@ -4761,6 +4761,56 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 }
                 hashset_destroy(&hs);
             }
+        } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen > 0 &&
+                   vec->len > 0 && vec->len >= 1 + (LIST_SET_MIN_PAIRS - 1) / vlen) {
+            ray_t** cells = ray_data(vec);
+            ray_t** needles = ray_data(val);
+            /* The full pair count says nothing about where matches are.
+             * Give each needle a short, bounded chance to hit before hashing. */
+            int64_t prefix = (LIST_SET_MIN_PAIRS - 1) / vlen + 1;
+            if (prefix < 4) prefix = 4;
+            if (prefix > vec->len) prefix = vec->len;
+            int64_t unresolved = 0;
+            for (int64_t j = 0; j < vlen; j++) {
+                int64_t i = 0;
+                while (i < prefix && !atom_eq(cells[i], needles[j])) i++;
+                out[j] = i < prefix ? i : NULL_I64;
+                unresolved += i == prefix;
+            }
+            int64_t suffix = vec->len - prefix;
+            if (unresolved && suffix >= 1 + (LIST_SET_MIN_PAIRS - 1) / unresolved) {
+                list_set_t set;
+                int spans = ray_key_spans(vec) | ray_key_spans(val);
+                if (!list_set_init(&set, cells + prefix, suffix, spans)) {
+                    ray_release(result);
+                    return ray_error("oom", NULL);
+                }
+                /* Prepend every cell in reverse to probe in haystack order. */
+                for (int64_t i = suffix; i-- > 0;)
+                    list_set_add(&set, i, ray_key_hash(set.cells[i], spans));
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    ray_t* needle = needles[j];
+                    uint64_t h = ray_key_hash(needle, spans);
+                    for (uint64_t at = h & set.mask; set.head[at] >= 0; at = (at + 1) & set.mask) {
+                        if (set.hash[at] != h) continue;
+                        for (int64_t i = set.head[at]; i >= 0; i = set.next[i]) {
+                            if (atom_eq(set.cells[i], needle)) { out[j] = prefix + i; break; }
+                        }
+                        break;
+                    }
+                    if (out[j] == NULL_I64) any_null = true;
+                }
+                list_set_destroy(&set);
+            } else if (unresolved) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < vec->len && !atom_eq(cells[i], needles[j])) i++;
+                    if (i < vec->len) out[j] = i;
+                    else any_null = true;
+                }
+            }
         } else {
             /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
             for (int64_t j = 0; j < vlen; j++) {
