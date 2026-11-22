@@ -13,19 +13,19 @@
 (type (at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ i 1)}) 'n)) -- 'SYM
 (type (at (select {from: t n: 'name x: (+ i 1)}) 'n)) -- 'SYM
 
-;; ─── the fallback (temporal arithmetic beside it) ───────────────────────────
-(type (at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ ts 1)}) 'n)) -- 'SYM
-(at (select {from: t n: (if (> i 1) 'hi 'lo) x: (+ ts 1)}) 'n) -- [lo hi hi]
-(type (at (select {from: t n: 'name x: (+ ts 1)}) 'n)) -- 'SYM
-(at (select {from: t n: 'name x: (+ ts 1)}) 'n) -- [Alice Bob Carol]
+;; ─── the fallback (a point difference beside it) ───────────────────────────
+(type (at (select {from: t n: (if (> i 1) 'hi 'lo) x: (- ts ts)}) 'n)) -- 'SYM
+(at (select {from: t n: (if (> i 1) 'hi 'lo) x: (- ts ts)}) 'n) -- [lo hi hi]
+(type (at (select {from: t n: 'name x: (- ts ts)}) 'n)) -- 'SYM
+(at (select {from: t n: 'name x: (- ts ts)}) 'n) -- [Alice Bob Carol]
 
 ;; a mixed-type projection still demotes to LIST rather than mis-typing
-(type (at (select {from: t n: (if (> i 1) 'hi 0) x: (+ ts 1)}) 'n)) -- 'LIST
+(type (at (select {from: t n: (if (> i 1) 'hi 0) x: (- ts ts)}) 'n)) -- 'LIST
 
 ;; ─── per-group fallback: a sym-valued non-aggregate output ──────────────────
 (set g (table [k name ts] (list [a a b] [Alice Bob Carol] [2001.01.01D01:01:01.000000000 2002.02.02D02:02:02.000000000 2003.03.03D03:03:03.000000000])))
-(type (at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n)) -- 'SYM
-(at (select {from: g by: k n: (first name) x: (first (+ ts 1))}) 'n) -- [Alice Carol]
+(type (at (select {from: g by: k n: (first name) x: (first (- ts ts))}) 'n)) -- 'SYM
+(at (select {from: g by: k n: (first name) x: (first (- ts ts))}) 'n) -- [Alice Carol]
 
 ;; ─── a plain grouped select whose output is a sym cell ──────────────────────
 ;; `(at name 0)` is no aggregate, so it takes the per-group collector too; it

@@ -1,7 +1,7 @@
 ;; eval_fallback_sym_passthrough.rfl — a SYM column projected beside a
-;; projection the DAG declines (temporal + - *) keeps its SYM type.
+;; projection the DAG declines (a point difference) keeps its SYM type.
 ;;
-;; Temporal arithmetic makes compile_expr_dag return NULL, so the whole select
+;; A point difference makes compile_expr_dag return NULL, so the whole select
 ;; lands in the eval-level projection fallback.  That path used to evaluate a
 ;; bare column name per row and collect the cells, and its cell collector never
 ;; collapses SYM / STR / GUID atoms into a typed vector — so `name: name` came
@@ -13,32 +13,32 @@
 ;; ─── control: an I64 computed column compiles, SYM survives ─────────────────
 (type (at (select {from: t name: name x: (+ i 1)}) 'name)) -- 'SYM
 
-;; ─── temporal arithmetic beside a SYM passthrough ───────────────────────────
-(type (at (select {from: t name: name x: (+ ts 1)}) 'name)) -- 'SYM
-(type (at (select {from: t name: name x: (+ d 1)}) 'name)) -- 'SYM
-(type (at (select {from: t name: name x: (+ tm 1)}) 'name)) -- 'SYM
+;; ─── a point difference beside a SYM passthrough ────────────────────────────
 (type (at (select {from: t name: name x: (- ts ts)}) 'name)) -- 'SYM
-(at (select {from: t name: name x: (+ ts 1)}) 'name) -- [Alice Bob Carol]
+(type (at (select {from: t name: name x: (- d d)}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (- tm tm)}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (- ts ts)}) 'name)) -- 'SYM
+(at (select {from: t name: name x: (- ts ts)}) 'name) -- [Alice Bob Carol]
 
 ;; the computed column itself is unaffected
 (at (select {from: t name: name x: (- ts ts)}) 'x) -- (- (at t 'ts) (at t 'ts))
 
 ;; aliasing, projection order and a where: clause make no difference
-(type (at (select {from: t n: name x: (+ ts 1)}) 'n)) -- 'SYM
-(type (at (select {from: t x: (+ ts 1) name: name}) 'name)) -- 'SYM
-(type (at (select {from: t name: name x: (+ ts 1) where: (> i 1)}) 'name)) -- 'SYM
-(at (select {from: t name: name x: (+ ts 1) where: (> i 1)}) 'name) -- [Bob Carol]
+(type (at (select {from: t n: name x: (- ts ts)}) 'n)) -- 'SYM
+(type (at (select {from: t x: (- ts ts) name: name}) 'name)) -- 'SYM
+(type (at (select {from: t name: name x: (- ts ts) where: (> i 1)}) 'name)) -- 'SYM
+(at (select {from: t name: name x: (- ts ts) where: (> i 1)}) 'name) -- [Bob Carol]
 
 ;; other passthrough column kinds keep their type too
-(type (at (select {from: t s: s x: (+ ts 1)}) 's)) -- 'STR
-(at (select {from: t s: s x: (+ ts 1)}) 's) -- (list "a" "b" "c")
-(type (at (select {from: t i: i x: (+ ts 1)}) 'i)) -- 'I64
-(type (at (select {from: t ts: ts x: (+ ts 1)}) 'ts)) -- 'TIMESTAMP
+(type (at (select {from: t s: s x: (- ts ts)}) 's)) -- 'STR
+(at (select {from: t s: s x: (- ts ts)}) 's) -- (list "a" "b" "c")
+(type (at (select {from: t i: i x: (- ts ts)}) 'i)) -- 'I64
+(type (at (select {from: t ts: ts x: (- ts ts)}) 'ts)) -- 'TIMESTAMP
 
 ;; ─── the downstream symptom: a join on the projected column ─────────────────
 (set t2 (table [name last] (list [Alice Bob Carol] [Cooper Belcher Bells])))
-(at (inner-join [name] (select {from: t name: name x: (+ ts 1)}) t2) 'last) -- [Cooper Belcher Bells]
+(at (inner-join [name] (select {from: t name: name x: (- ts ts)}) t2) 'last) -- [Cooper Belcher Bells]
 
 ;; ─── a lexical local shadows a column of the same name, as on the DAG ───────
-((fn [name] (at (select {from: t w: name x: (+ ts 1)}) 'w)) 'shadow) -- [shadow shadow shadow]
+((fn [name] (at (select {from: t w: name x: (- ts ts)}) 'w)) 'shadow) -- [shadow shadow shadow]
 ((fn [name] (at (select {from: t w: name}) 'w)) 'shadow) -- [shadow shadow shadow]
