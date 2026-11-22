@@ -310,6 +310,7 @@ static test_result_t test_lftj_build_plan_too_many_vars(void) {
     bool ok = lftj_build_plan(&ctx, NULL, 0, LFTJ_MAX_VARS + 1, sv, dv);
     TEST_ASSERT_FALSE(ok);
 
+    ray_sym_destroy();
     ray_heap_destroy();
     PASS();
 }

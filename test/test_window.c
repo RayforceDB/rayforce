@@ -2794,6 +2794,8 @@ static test_result_t test_window_f64_value_lag(void) {
      * FIRST_VALUE similarly.  So win_read_i64 RAY_F64 may not be reachable
      * directly from the public API (output type mirrors input type).
      * Skip this specific sub-arm; focus on confirmed reachable ones. */
+    ray_sym_destroy();
+    ray_heap_destroy();
     PASS();
 }
 

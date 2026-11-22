@@ -3026,7 +3026,14 @@ static void relieve_env_begin(relieve_env_t* e) {
     relieve_spill_elsewhere(e);
     ray_heap_relieve();
     ray_heap_direct_cache_drain();
+    /* One boundary under the unbounded watermark: the relief's history is
+     * process-wide (heap.c, ray_heap_relieve), and a watermark equal to the
+     * last relief's — an earlier test's, at the same footprint — would
+     * carry its state into this test, so a spill here read as that relief
+     * proving futile and nothing was relieved (#1293).  The new watermark
+     * resets the state and the boundary syncs the spill and map counters. */
     ray_heap_set_anon_watermark(INT64_C(1) << 40);
+    ray_heap_relieve();
 }
 
 #if defined(__linux__)
