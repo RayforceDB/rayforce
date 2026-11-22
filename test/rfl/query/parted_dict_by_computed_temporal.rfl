@@ -1,0 +1,31 @@
+;; #1306: a dict by: on a parted table with an aggregate whose argument the
+;; DAG leaves to the builtin (temporal arithmetic) gives the flat answer.  The
+;; deferred parted dict by: renames its keys after the group, so an output the
+;; DAG does not lower used to look up the key by its alias and fail with
+;; "group key column not found".
+(set T (table [g c d i t s] (list (take [a b] 20) (% (til 20) 10) (+ 2024.01.01 (til 20)) (til 20) (+ 09:00:00.000 (* 1000 (til 20))) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 (til 20))))))
+(.sys.exec "rm -rf /tmp/rfl_parted_dict_by_ct") -- 0
+(.db.splayed.set "/tmp/rfl_parted_dict_by_ct/1/t/" (take T 10))
+(.db.splayed.set "/tmp/rfl_parted_dict_by_ct/2/t/" (take T -10))
+(set P (.db.parted.get "/tmp/rfl_parted_dict_by_ct/" 't))
+(set Z (fn [r] (at (xasc r 'gg) 's)))
+
+;; the issue's case, against the flat table and literal answers
+(Z (select {from: P by: {gg: g} s: (avg (+ d 1))})) -- [8776.0 8777.0]
+(Z (select {from: P by: {gg: g} s: (avg (+ d 1))})) -- (Z (select {from: T by: {gg: g} s: (avg (+ d 1))}))
+
+;; TIME and TIMESTAMP arguments, other aggregates
+(Z (select {from: P by: {gg: g} s: (max (+ t 1000))})) -- (Z (select {from: T by: {gg: g} s: (max (+ t 1000))}))
+(Z (select {from: P by: {gg: g} s: (min (+ s 5))})) -- (Z (select {from: T by: {gg: g} s: (min (+ s 5))}))
+(Z (select {from: P by: {gg: g} s: (count (+ d 1))})) -- [10 10]
+
+;; with where:, and beside an aggregate the DAG lowers
+(Z (select {from: P by: {gg: g} where: (> i 3) s: (avg (+ d 1))})) -- (Z (select {from: T by: {gg: g} where: (> i 3) s: (avg (+ d 1))}))
+(Z (select {from: P by: {gg: g} s: (avg (+ d 1)) n: (sum i)})) -- (Z (select {from: T by: {gg: g} s: (avg (+ d 1)) n: (sum i)}))
+(at (xasc (select {from: P by: {gg: g} s: (avg (+ d 1)) n: (sum i)}) 'gg) 'n) -- [90 100]
+
+;; the shapes that already streamed keep their answers
+(Z (select {from: P by: {gg: g} s: (sum (+ i 1))})) -- [100 110]
+(Z (select {from: P by: {gg: g} s: (avg d)})) -- (Z (select {from: T by: {gg: g} s: (avg d)}))
+
+(.sys.exec "rm -rf /tmp/rfl_parted_dict_by_ct") -- 0
