@@ -1,0 +1,28 @@
+;; #1318: two STR vectors holding the same strings are equal cells whatever
+;; pool their text sits in.  atom_eq compared the raw 16-byte descriptors,
+;; so a pooled string (longer than the inline limit) compared by offset.
+(set X (as 'STR ["LONG_A_twentyfour_chars_" "LONG_B_twentyfour_chars_"]))
+(set c1 (drop X 1))
+(set c2 (enlist "LONG_B_twentyfour_chars_"))
+(identical c1 c2) -- true
+
+;; distinct, except, union and sect over list cells
+(count (distinct (list c1 c2))) -- 1
+(except (list c1 1) (list c2)) -- (list 1)
+(count (union (list c1) (list c2))) -- 1
+(count (sect (list c1) (list c2))) -- 1
+
+;; keyed tables: a duplicate under xkey, and == over such keys
+(try (xkey (table [k v] (list (list c1 c2) [1 2])) [k]) (fn [e] (format "%" e))) -- "{code:domain msg:\"xkey: duplicate key at row 1\"}"
+(set K1 (xkey (table [k v] (list (list c1 ["x"]) [1 2])) [k]))
+(set K2 (xkey (table [k v] (list (list ["x"] c2) [2 1])) [k]))
+(== K1 K2) -- (== K1 K1)
+
+;; grouping by such cells
+(count (xgroup (table [k v] (list (list c1 c2 ["x"]) [1 2 3])) [k])) -- 2
+
+;; still unequal when the text differs, and short and empty strings as before
+(count (distinct (list c1 (enlist "LONG_A_twentyfour_chars_")))) -- 2
+(count (distinct (list c1 (enlist "LONG_B_twentyfour_chars")))) -- 2
+(count (distinct (list ["ab"] (enlist "ab")))) -- 1
+(count (distinct (list (as 'STR [""]) (enlist "")))) -- 1
