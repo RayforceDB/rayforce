@@ -202,6 +202,13 @@
 (.json.parse "[1,2,3]" {input: 7}) -- [1 2 3]
 (.json.parse "[1,2,3]" {input: 6}) !- limit
 (.json.parse "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"" {alloc: 40}) !- limit
+;; a string run broken by an integer becomes a list of string atoms, each
+;; charged its bytes: 11 runs of 480 4000-byte strings hold 21 MB
+(set s4k (concat "\"" (concat (str-join (take ["x"] 4000) "") "\"")))
+(set run480 (concat "[" (concat (str-join (take (enlist s4k) 480) ",") ",1]")))
+(set runs11 (concat "[" (concat (str-join (take (enlist run480) 11) ",") "]")))
+(.json.parse runs11 {alloc: 4194304 input: 1000000000}) !- limit
+(count (.json.parse runs11 {input: 1000000000})) -- 11
 (.json.parse "[1]" {bogus: 1}) !- domain
 (.json.parse "[1]" 5) !- type
 (.json.get (deep 129) "0") !- limit
@@ -324,6 +331,15 @@
 (update {from: T4 v: (== (.json.get line PV2 'STR) "a")}) !- length
 (select {from: T4 where: (== (.json.get line PV2 'STR) "a")}) !- length
 ((fn [q] (select {from: T4 v: (.json.get line q 'STR)})) PV2) !- length
+;; a group key reads the column whole too, by name and by parameter
+(set T3 (table [line g] (list ["{\"a\":1,\"b\":\"x\"}" "{\"a\":2,\"b\":\"y\"}" "{\"a\":3,\"b\":\"z\"}"] ['p 'q 'p])))
+(set PV3 ["a" "b" "a"])
+(set PV3b ["a" "b"])
+(select {from: T3 by: (.json.get line PV3 'STR) n: (count g)}) -- (table [PV3 n] (list ["" "y"] [2 1]))
+(select {from: T3 by: (.json.get line PV3 'STR) x: g}) -- (table [PV3 x] (list ["" "y"] (list ['p 'p] ['q])))
+((fn [q] (select {from: T3 by: (.json.get line q 'STR) n: (count g)})) PV3) -- (table [q n] (list ["" "y"] [2 1]))
+(M (fn [] (select {from: T3 by: (.json.get line PV3b 'STR) n: (count g)}))) -- ".json.get: 2 paths for 3 documents"
+(M (fn [] ((fn [q] (select {from: T3 by: (.json.get line q 'STR) n: (count g)})) PV3b))) -- ".json.get: 2 paths for 3 documents"
 ;; a quoted type names a type, also when the table has a column of its name
 (set T5 (table [line STR I64 F64] (list ["{\"k\":\"a\",\"n\":1}" "{\"n\":2.5}"] [7 8] [1 2] [0.5 0.5])))
 (at (select {from: T5 v: (.json.get line "k" 'STR)}) 'v) -- ["a" ""]
