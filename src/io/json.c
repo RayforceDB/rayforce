@@ -69,6 +69,8 @@ typedef struct {
     const uint8_t *s, *p, *end;   /* the document, the cursor                 */
     const char* who;              /* ".json.parse" / ".json.get"              */
     int64_t row;                  /* element of a vector input, -1 for an atom */
+    const char* unit;             /* what `row` counts: "element", or "path"
+                                   * for one document read by a vector of paths */
     size_t depth, max_depth;
     size_t nodes, max_nodes;
     size_t bytes, max_alloc;      /* bytes of the values built so far        */
@@ -86,7 +88,8 @@ static void* jp_fail(jp_t* jp, const char* code, const char* fmt, ...) {
     va_end(ap);
     size_t at = (size_t)(jp->p - jp->s);
     if (jp->row >= 0)
-        jp->err = ray_error(code, "%s: %s at byte %zu of element %lld", jp->who, what, at, (long long)jp->row);
+        jp->err = ray_error(code, "%s: %s at byte %zu of %s %lld", jp->who, what, at,
+                            jp->unit ? jp->unit : "element", (long long)jp->row);
     else
         jp->err = ray_error(code, "%s: %s at byte %zu", jp->who, what, at);
     return NULL;
@@ -491,20 +494,38 @@ typedef struct {
     int64_t n_null;      /* nulls so far (mode 0: all of them) */
     ray_t*  out;         /* the typed vector, or the LIST */
     ray_t*  str_nulls;   /* STR run: the positions that were null (I64) */
+    ray_t*  ints;        /* F64 run holding integers: each cell's integer as
+                          * written (NULL_I64 for a float or a null cell), so
+                          * a run that breaks into a LIST keeps them exact */
     size_t  pre;         /* bytes charged for `out` before it is settled */
 } jarr_t;
 
 static void jarr_free(jarr_t* a) {
     if (a->out && !RAY_IS_ERR(a->out)) ray_release(a->out);
     if (a->str_nulls && !RAY_IS_ERR(a->str_nulls)) ray_release(a->str_nulls);
-    a->out = a->str_nulls = NULL;
+    if (a->ints && !RAY_IS_ERR(a->ints)) ray_release(a->ints);
+    a->out = a->str_nulls = a->ints = NULL;
 }
 
-/* Turn the run into a LIST of the atoms its cells hold (a null cell an
- * untyped null, as the element was), each charged as an atom. */
+/* Turn the run into a LIST of the atoms its cells hold, each as it was
+ * written (an integer of an F64 run its integer, a null cell an untyped
+ * null).  The list is charged while the run still is, so the cap holds
+ * over the copy; the run's charge is returned once it is freed. */
 static bool jarr_to_list(jp_t* jp, jarr_t* a) {
     int64_t n = a->mode == 1 ? a->out->len : a->n_null;
-    if (!jp_bytes(jp, (size_t)n * (JP_ATOM_BYTES + JP_SLOT_BYTES))) return false;
+    size_t run_pre = a->mode == 1 ? a->pre : 0;
+    /* a slot per cell, an atom per cell that is not null */
+    int64_t n_atoms = a->mode == 1 ? n : 0;
+    if (a->mode == 1 && a->kind == JK_STR && a->str_nulls) n_atoms -= a->str_nulls->len;
+    else if (a->mode == 1 && (a->kind == JK_INT || a->kind == JK_FLOAT)) {
+        for (int64_t i = 0; i < n; i++) {
+            bool nul = a->kind == JK_INT ? ((const int64_t*)ray_data(a->out))[i] == NULL_I64
+                                         : ((const double*)ray_data(a->out))[i] != ((const double*)ray_data(a->out))[i];
+            n_atoms -= nul;
+        }
+    }
+    if (!jp_bytes(jp, (size_t)n * JP_SLOT_BYTES + (size_t)n_atoms * JP_ATOM_BYTES)) return false;
+    const int64_t* iv = a->ints ? (const int64_t*)ray_data(a->ints) : NULL;
     ray_t* list = ray_list_new(n > 4 ? n : 4);
     if (!list || RAY_IS_ERR(list)) { jp_fail(jp, "oom", "out of memory"); return false; }
     const int64_t* sn = a->str_nulls ? (const int64_t*)ray_data(a->str_nulls) : NULL;
@@ -514,7 +535,12 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
         if (a->mode == 1) {
             switch (a->kind) {
             case JK_INT: { int64_t x = ((const int64_t*)ray_data(a->out))[i]; v = x == NULL_I64 ? RAY_NULL_OBJ : ray_i64(x); break; }
-            case JK_FLOAT: { double x = ((const double*)ray_data(a->out))[i]; v = x != x ? RAY_NULL_OBJ : ray_f64(x); break; }
+            case JK_FLOAT: {
+                if (iv && iv[i] != NULL_I64) { v = ray_i64(iv[i]); break; }
+                double x = ((const double*)ray_data(a->out))[i];
+                v = x != x ? RAY_NULL_OBJ : ray_f64(x);
+                break;
+            }
             case JK_BOOL: v = ray_bool(((const uint8_t*)ray_data(a->out))[i] != 0); break;
             default: {
                 if (sni < nsn && sn[sni] == i) { sni++; break; }
@@ -530,6 +556,7 @@ static bool jarr_to_list(jp_t* jp, jarr_t* a) {
     }
     if (RAY_IS_ERR(list)) { jp->err = list; return false; }
     jarr_free(a);
+    jp->bytes -= run_pre < jp->bytes ? run_pre : jp->bytes;
     a->out = list;
     a->mode = 2;
     a->pre = (size_t)n * JP_SLOT_BYTES;
@@ -573,7 +600,10 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
         bool fits = k == a->kind || (k == JK_NULL && a->kind != JK_BOOL) ||
                     (a->kind == JK_FLOAT && k == JK_INT) || (a->kind == JK_INT && k == JK_FLOAT);
         if (fits && a->kind == JK_INT && k == JK_FLOAT) {
-            /* integers then a float: the run becomes F64 */
+            /* integers then a float: the run becomes F64, its integers
+             * kept as written in `ints` */
+            if (!jp_bytes(jp, (size_t)a->out->len * 2 * sizeof(double))) { ray_release(v); return false; }
+            a->pre += (size_t)a->out->len * 2 * sizeof(double);
             ray_t* f = ray_vec_new(RAY_F64, a->out->len + 8);
             if (!f || RAY_IS_ERR(f)) { ray_release(v); jp_fail(jp, "oom", "out of memory"); return false; }
             const int64_t* d = (const int64_t*)ray_data(a->out);
@@ -582,9 +612,20 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
                 f = ray_vec_append(f, &x);
             }
             if (RAY_IS_ERR(f)) { ray_release(v); jp->err = f; return false; }
-            ray_release(a->out);
+            a->ints = a->out;
             a->out = f;
             a->kind = JK_FLOAT;
+        } else if (fits && a->kind == JK_FLOAT && k == JK_INT && !a->ints) {
+            /* floats then an integer: start keeping the integers */
+            if (!jp_bytes(jp, (size_t)a->out->len * 2 * sizeof(int64_t))) { ray_release(v); return false; }
+            a->pre += (size_t)a->out->len * 2 * sizeof(int64_t);
+            ray_t* iv = ray_vec_new(RAY_I64, a->out->len + 8);
+            for (int64_t i = 0; iv && !RAY_IS_ERR(iv) && i < a->out->len; i++) {
+                int64_t x = NULL_I64;
+                iv = ray_vec_append(iv, &x);
+            }
+            if (!iv || RAY_IS_ERR(iv)) { ray_release(v); jp->err = iv ? iv : ray_error("oom", NULL); return false; }
+            a->ints = iv;
         }
         if (!fits && !jarr_to_list(jp, a)) { ray_release(v); return false; }
     }
@@ -598,13 +639,24 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
     }
     /* a typed run: the atom's charge back, the cell's (with its growth) in */
     jp->bytes -= built < jp->bytes ? built : jp->bytes;
-    size_t cell = a->kind == JK_STR ? 2 * 16 + (k == JK_STR ? ray_str_len(v) : 0) : 2 * 8;
+    /* the cell and its pooled bytes, each doubled for the growth that
+     * copies them; an F64 run keeping integers, that cell too */
+    size_t cell = a->kind == JK_STR ? 2 * 16 + (k == JK_STR ? 2 * ray_str_len(v) : 0)
+                                    : 2 * 8 * (a->ints ? 2 : 1);
     a->pre += cell;
     if (!jp_bytes(jp, cell)) { ray_release(v); return false; }
     ray_t* o = a->out;
     if (k == JK_NULL) {
         if (a->kind == JK_INT) { int64_t x = NULL_I64; o = ray_vec_append(o, &x); }
-        else if (a->kind == JK_FLOAT) { double x = NULL_F64; o = ray_vec_append(o, &x); }
+        else if (a->kind == JK_FLOAT) {
+            double x = NULL_F64;
+            o = ray_vec_append(o, &x);
+            if (a->ints) {
+                int64_t xi = NULL_I64;
+                a->ints = ray_vec_append(a->ints, &xi);
+                if (RAY_IS_ERR(a->ints)) { jp->err = a->ints; a->ints = NULL; }
+            }
+        }
         else {
             int64_t at = o->len;
             o = ray_str_vec_append(o, "", 0);
@@ -613,7 +665,15 @@ static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
             if (!a->str_nulls || RAY_IS_ERR(a->str_nulls)) { a->str_nulls = NULL; jp->err = ray_error("oom", NULL); }
         }
     } else if (a->kind == JK_INT) { o = ray_vec_append(o, &v->i64); }
-    else if (a->kind == JK_FLOAT) { double x = k == JK_INT ? (double)v->i64 : v->f64; o = ray_vec_append(o, &x); }
+    else if (a->kind == JK_FLOAT) {
+        double x = k == JK_INT ? (double)v->i64 : v->f64;
+        o = ray_vec_append(o, &x);
+        if (a->ints) {
+            int64_t xi = k == JK_INT ? v->i64 : NULL_I64;
+            a->ints = ray_vec_append(a->ints, &xi);
+            if (RAY_IS_ERR(a->ints)) { jp->err = a->ints; a->ints = NULL; }
+        }
+    }
     else if (a->kind == JK_BOOL) { uint8_t x = v->b8 ? 1 : 0; o = ray_vec_append(o, &x); }
     else o = ray_str_vec_append(o, ray_str_ptr(v), ray_str_len(v));
     ray_release(v);
@@ -637,12 +697,13 @@ static ray_t* jarr_finish(jp_t* jp, jarr_t* a) {
     }
     if (a->mode == 1 && a->kind == JK_STR && a->str_nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
     if (a->str_nulls) { ray_release(a->str_nulls); a->str_nulls = NULL; }
+    if (a->ints) { ray_release(a->ints); a->ints = NULL; }
     return jp_settle(jp, out, a->pre);
 }
 
 static ray_t* jp_array(jp_t* jp, bool build) {
     jp->p++;                                   /* '[' */
-    jarr_t a = { 0, 0, 0, NULL, NULL, 0 };
+    jarr_t a = { 0, 0, 0, NULL, NULL, NULL, 0 };
     jp_ws(jp);
     if (jp->p < jp->end && *jp->p == ']') {
         jp->p++;
@@ -875,7 +936,8 @@ static bool jp_doc(jp_t* jp, const char* s, size_t len, int64_t row, const ray_r
     if (len > lim->max_input) {
         if (!jp->err)
             jp->err = row >= 0
-                ? ray_error("limit", "%s: input limit of %zu bytes exceeded by element %lld (%zu bytes)", jp->who, lim->max_input, (long long)row, len)
+                ? ray_error("limit", "%s: input limit of %zu bytes exceeded by %s %lld (%zu bytes)", jp->who, lim->max_input,
+                            jp->unit ? jp->unit : "element", (long long)row, len)
                 : ray_error("limit", "%s: input limit of %zu bytes exceeded (%zu bytes)", jp->who, lim->max_input, len);
         return false;
     }
@@ -1000,9 +1062,12 @@ typedef struct { const char* p; size_t l; int64_t idx; } jseg_t;   /* idx -1: no
 
 /* Split the path p[0..l) at its dots.  A segment of digits (no leading
  * zero) is also an array index. */
-static ray_t* json_path_bytes(const char* p, size_t l, jseg_t* segs, int* nseg, int64_t row) {
+static ray_t* json_path_bytes(const char* p, size_t l, jseg_t* segs, int* nseg, int64_t row, const char* unit) {
     char of[48] = "";
-    if (row >= 0) snprintf(of, sizeof of, " of element %lld", (long long)row);
+    /* "path of element 3" for one path per document, "path 3" for one
+     * document read by a vector of paths */
+    if (row >= 0 && unit) snprintf(of, sizeof of, " %lld", (long long)row);
+    else if (row >= 0) snprintf(of, sizeof of, " of element %lld", (long long)row);
     if (l == 0) return ray_error("domain", ".json.get: path%s is empty", of);
     int k = 0;
     size_t st = 0;
@@ -1028,10 +1093,10 @@ static ray_t* json_path_bytes(const char* p, size_t l, jseg_t* segs, int* nseg, 
 
 /* The path argument as one path: a string or a symbol. */
 static ray_t* json_path(ray_t* path, jseg_t* segs, int* nseg) {
-    if (path && path->type == -RAY_STR) return json_path_bytes(ray_str_ptr(path), ray_str_len(path), segs, nseg, -1);
+    if (path && path->type == -RAY_STR) return json_path_bytes(ray_str_ptr(path), ray_str_len(path), segs, nseg, -1, NULL);
     if (path && path->type == -RAY_SYM) {
         ray_t* s = ray_sym_str(path->i64);
-        return json_path_bytes(s ? ray_str_ptr(s) : "", s ? ray_str_len(s) : 0, segs, nseg, -1);
+        return json_path_bytes(s ? ray_str_ptr(s) : "", s ? ray_str_len(s) : 0, segs, nseg, -1, NULL);
     }
     return ray_error("type", ".json.get: path must be a string or a string vector, got %s",
                      path ? ray_type_name(path->type) : "null");
@@ -1119,7 +1184,7 @@ static ray_t* jp_get_doc(jp_t* jp, const char* s, size_t l, int64_t row, jp_get_
             pp = ray_str_vec_get(c->paths, row, &pl);
         }
         if (!pp || pl == 0) return RAY_NULL_OBJ;   /* a null path: no field */
-        ray_t* perr = json_path_bytes(pp, pl, rsegs, &nseg, row);
+        ray_t* perr = json_path_bytes(pp, pl, rsegs, &nseg, row, jp->unit);
         if (perr) { jp->err = perr; return NULL; }
         segs = rsegs;
     }
@@ -1237,6 +1302,7 @@ ray_t* ray_json_get_fn(ray_t** args, int64_t n) {
     if (x->type == -RAY_STR) {
         /* one document, a vector of paths: one value per path */
         c.paths = paths;
+        jp.unit = "path";
         c.out = ray_list_new(paths->len > 0 ? paths->len : 1);
         if (!c.out || RAY_IS_ERR(c.out)) return c.out ? c.out : ray_error("oom", NULL);
         for (int64_t r = 0; r < paths->len; r++) {
