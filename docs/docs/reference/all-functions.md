@@ -736,7 +736,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
 | `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | — | JSON text to a value (object to dict with string keys, array to a vector or list); element-wise over a string vector; strict, the limits of `read-value`. See [`.json.*`](../namespaces/json.md) | `(.json.parse "{\"a\":[1,2]}")` → `(dict ["a"] (list [1 2]))` |
-| `.json.get` | variadic | — | One field of each JSON document by a dotted path (or one path per row), without building the rest; optional limits; a missing path is null | `(.json.get line "data.ids.0")` |
+| `.json.get` | variadic | — | One field of each JSON document by a dotted path (or one path per row), without building the rest; an optional type (`'STR`, `'I64`, `'F64`) makes it always that type, null where the field is absent or another kind; optional limits | `(.json.get line "kind" 'STR)` |
 | `.json.format` | unary | — | A value as JSON text (a table as an array of objects) | `(.json.format [1 0Nl 3])` → `"[1,null,3]"` |
 
 ```lisp

@@ -1976,29 +1976,39 @@ static test_result_t test_fmt_table_parted_ragged(void) {
 
 
 /* .json.format writes '.' whatever decimal point the host's LC_NUMERIC
- * uses: under a comma locale snprintf writes "1,5", which is not JSON. */
+ * uses (under a comma locale snprintf writes "1,5", which is not JSON),
+ * and the text it picks reads back to the same double: the hard values
+ * (subnormals, 17 significant digits, large exponents) give, under a comma
+ * locale, the text they give in the C locale. */
 static test_result_t test_json_format_locale(void) {
+    double xs[12] = { 1.5, 0.1, 1e300, -2.25,
+                      (1.0 + 14.0 * 7919.0) / 104729.0 * 1e-309,   /* subnormal */
+                      5e-324, 1.7976931348623157e308, 2.2250738585072014e-308,
+                      1.0 / 3.0, 2.0 / 3.0, 1e200 / 3.0, 0.1234567890123456789 };
+    ray_t* v = ray_vec_from_raw(RAY_F64, xs, 12);
+    ray_t* in_c = ray_json_format_fn(v);                  /* the C locale's text */
     static const char* const comma[] = { "de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8", "de_AT.utf8" };
     const char* got_locale = NULL;
     for (size_t i = 0; i < sizeof comma / sizeof *comma && !got_locale; i++)
         got_locale = setlocale(LC_NUMERIC, comma[i]);
     if (!got_locale || strcmp(localeconv()->decimal_point, ".") == 0) {
         setlocale(LC_NUMERIC, "C");
+        if (in_c) ray_release(in_c);
+        ray_release(v);
         SKIP("no locale with a comma decimal point");
     }
-    double xs[3] = { 1.5, 0.1, 1e300 };
-    ray_t* v = ray_vec_from_raw(RAY_F64, xs, 3);
-    ray_t* a = ray_f64(-2.25);
-    ray_t* sv = ray_json_format_fn(v);
-    ray_t* sa = ray_json_format_fn(a);
+    ray_t* in_comma = ray_json_format_fn(v);
     setlocale(LC_NUMERIC, "C");
-    bool ok = sv && !RAY_IS_ERR(sv) && sa && !RAY_IS_ERR(sa) &&
-              ray_str_len(sv) == 16 && memcmp(ray_str_ptr(sv), "[1.5,0.1,1e+300]", 16) == 0 &&
-              ray_str_len(sa) == 5 && memcmp(ray_str_ptr(sa), "-2.25", 5) == 0;
-    if (sv) ray_release(sv);
-    if (sa) ray_release(sa);
+    static const char want[] = "[1.5,0.1,1e300,-2.25,1.058608408368267e-309,5e-324,"
+                               "1.7976931348623157e308,2.2250738585072014e-308,"
+                               "0.3333333333333333,0.6666666666666666,3.3333333333333334e199,"
+                               "0.12345678901234568]";
+    bool ok = in_c && !RAY_IS_ERR(in_c) && in_comma && !RAY_IS_ERR(in_comma) &&
+              ray_str_len(in_c) == sizeof want - 1 && memcmp(ray_str_ptr(in_c), want, sizeof want - 1) == 0 &&
+              ray_str_len(in_comma) == sizeof want - 1 && memcmp(ray_str_ptr(in_comma), want, sizeof want - 1) == 0;
+    if (in_c) ray_release(in_c);
+    if (in_comma) ray_release(in_comma);
     ray_release(v);
-    ray_release(a);
     TEST_ASSERT_TRUE(ok);
     PASS();
 }

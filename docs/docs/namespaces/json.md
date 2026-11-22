@@ -74,7 +74,7 @@ A byte order mark before the value is not JSON whitespace, and is a `parse` erro
 | `input` | bytes of one document |
 | `depth` | nesting depth; the default is 128, and it never exceeds 1024 |
 | `nodes` | values, containers included |
-| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the vector an array collapses to; a block freed while reading still counts |
+| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector (an array of 780,000 integers, 8 MB), and a block freed while reading (the atoms of an array that turns out mixed) still counts |
 
 The other two names, `grammar` and `symbol-bytes`, are accepted but have no effect on JSON. A cap is checked before the value it counts is built (a container's own growth is settled when it closes), so a hostile document stops at the cap and never exhausts the stack or the heap: 100,000 empty objects hold about 25 MB, and `{alloc: 8000000}` refuses them. For a vector, the caps apply to each element. A long document can be interrupted: the reader polls for cancellation every 1,024 members of a container.
 
@@ -87,13 +87,37 @@ Object keys are checked for repeats by sorting them, so the cost of an object is
 
 ## `.json.get` { #json-get }
 
-Signature: `(.json.get s path)` or `(.json.get s path limits)`.
+Signature: `(.json.get s path type)`, `(.json.get s path type limits)`, or untyped `(.json.get s path)`, `(.json.get s path limits)`.
 
 Returns the value at `path` in the document `s`, or in each document of a string vector. Only that value is built. The rest of the document is still checked, so a malformed document is an error here too.
 
+### With a type: the form to use in queries
+
+`type` is `'STR`, `'I64` or `'F64`. The result is a vector of that type with one cell per document (for one document, an atom of that type), whatever the documents hold, so a query over it cannot fail because one row is odd. A field that is missing, is JSON `null`, or holds a value of another kind gives that type's null (`""`, `0Nl`, `0Nf`):
+
+| `type` | takes | gives null for |
+|---|---|---|
+| `'STR` | JSON strings | numbers (a number is not turned into text), booleans, objects, arrays, `null`, a missing field |
+| `'I64` | numbers written as integers within the `I64` range | fractions and exponents, numbers past the range, everything else |
+| `'F64` | every JSON number (an integer converted, losing precision past 2^53) | everything else |
+
+There is no boolean type: `B8` has no null, and reading a missing field as `false` would make it pass a `where:` that tests for `false`. `'B8` is a `domain` error; use the untyped form and compare the field with `true`. Another name is a `domain` error naming the accepted ones.
+
+A null (empty) document gives the type's null, like a missing field. A document that is not JSON is still an error naming the element and the byte, never a silent null: a stored line that does not parse is a fault to see, not a field to skip.
+
+```lisp
+(set t (table [line] (list ["{\"kind\":\"note\",\"n\":2}" "{\"kind\":5}" "{}" ""])))
+(select {from: t where: (== (.json.get line "kind" 'STR) "note")})   ; the first row
+(at (select {from: t n: (+ 1 (.json.get line "n" 'I64))}) 'n)        ; [3 0Nl 0Nl 0Nl]
+```
+
+The type, the path and the limits may each be held by a name; in a `select` the typed call takes the same one-call-over-the-column route as the untyped one, in every position.
+
+### Untyped
+
 `path` is a string (or a symbol) of keys separated by dots. A key made of digits, `"0"` or `"12"` but not `"01"`, also indexes an array: `"data.ids.0"` is the first element of the `ids` array of the `data` object. A missing path gives `null`, not an error. That covers a missing key, an index past the end, a key into a scalar, and a null (empty) document. An empty path, or one with an empty segment (`"a..b"`), is a `domain` error. A key that contains a dot cannot be addressed this way; use `.json.parse` for it. If a key is repeated, the last one is used, as `.json.parse` keeps it.
 
-Over a string vector, `path` may also be a string vector of the same length, one path per element; a different length is a `length` error.
+Over a string vector, `path` may also be a string or symbol vector of the same length, one path per element; a different length is a `length` error, and a null path (`""`) gives `null` for its element. One document with a vector of paths gives one value per path, typed as a column is.
 
 `limits` is the dict `.json.parse` takes. Only the value at the path is charged against `nodes` and `alloc`; the rest of the document is charged its `input` and `depth` only, so a document of a million values can still give one field.
 
@@ -105,7 +129,7 @@ Over a string vector, `path` may also be a string vector of the same length, one
 (.json.get doc "missing")      ; null
 ```
 
-Over a string vector, the result has one value per element. It is typed from every element's value, with a missing path counting as null:
+Over a string vector, the untyped result has one value per element. It is typed from every element's value, with a missing path counting as null:
 
 | The values found | Result |
 |---|---|
@@ -116,7 +140,11 @@ Over a string vector, the result has one value per element. It is typed from eve
 | none: the path is missing everywhere, or there are no elements | `STR` of `""` (an empty `STR` for no elements) |
 | anything else | `LIST`, with a missing path as `null` |
 
-A string field therefore gives a `STR` column, and `==` against a string is false on the rows that lack it:
+A string field therefore gives a `STR` column, and `==` against a string is false on the rows that lack it. Two consequences of typing by the values found:
+
+- A field absent from every row the call sees gives a `STR` of nulls, whatever the field holds elsewhere: under a `where:` that keeps only rows without `n`, `(+ 1 (.json.get line "n"))` meets a string and is a `type` error.
+- One row whose field is another kind makes the whole column a `LIST`: with one row `{"kind":1}` among strings, `(== (.json.get line "kind") "note")` is a `type` error for the whole query, not `false` for that row.
+
 
 ```lisp
 (set t (table [line] (list ["{\"kind\":\"note\",\"n\":1}" "{\"kind\":\"ping\",\"n\":2.5}" "{\"n\":3}"])))
@@ -124,7 +152,7 @@ A string field therefore gives a `STR` column, and `==` against a string is fals
 (at (select {from: t n: (.json.get line "n")}) 'n)              ; [1.0 2.5 3.0]
 ```
 
-In a `select`, a `.json.get` or `.json.parse` of a column is called once over the column, also when it stands inside element-wise builtins such as `(+ 1 (.json.get line "n"))` or `(== (.json.get line "k") "x")`. A projection, a `where:`, a `by:` and an `update` therefore type the result in the same way. Integers of a field that also holds non-integers become `F64` and, past 2^53, lose precision, as in an array. A call whose text is a constant is one value, like any constant: `(select {from: t x: (.json.get "{\"a\":1}" "a")})` gives `1` on every row. Inside a lambda the call runs per row, as every builtin does there, and a missing field is then an untyped `null`. They work on any string column: in memory, splayed, compressed (generation 2) and parted.
+In a `select`, a `.json.get` or `.json.parse` of a column is called once over the column, also when it stands inside element-wise builtins such as `(+ 1 (.json.get line "n"))` or `(== (.json.get line "k") "x")`. A projection, a `where:`, a `by:` and an `update` therefore type the result in the same way. Integers of a field that also holds non-integers become `F64` and, past 2^53, lose precision, as in an array. A path or a limits dict may be written in place or held by a name (a global, a lambda's parameter, a `let`): `(.json.get line P)` with `(set P "n")` is still one call over the column. A call whose text is a constant is one value, like any constant: `(select {from: t x: (.json.get "{\"a\":1}" "a")})` gives `1` on every row. Inside a lambda the call runs per row, as every builtin does there, and a missing field is then an untyped `null`. They work on any string column: in memory, splayed, compressed (generation 2) and parted.
 
 ## `.json.format` { #json-format }
 
@@ -133,11 +161,11 @@ Signature: `(.json.format v)`. Returns a string of JSON text.
 | Value | JSON |
 |---|---|
 | dict with symbol or string keys | object |
-| dict with other scalar keys (a keyed table made by `xkey` on one column) | object whose member names are the keys' JSON text (`{"1":...}`, `{"2024.01.01":...}`); a multi-column key is a `type` error |
+| dict with other scalar keys (a keyed table made by `xkey` on one column) | object whose member names are the keys as `.json.format` writes them, as strings: a number its JSON text (`1` is `"1"`, the F64 `1.0` is `"1.0"`), a date, time, timestamp, timespan or guid its printed form (`"2024.01.01"`), a null key `""`. Two keys written alike (two null keys, or `1` and `1.0` in a list of keys) give two members of one name, which most readers resolve to the last. A multi-column key is a `type` error |
 | table, in memory, splayed, compressed or parted | array of objects, one per row (a parted table's partition key is a column) |
 | list, vector | array |
 | `i16` `i32` `i64` `u8` | number |
-| `f32` `f64` | the shortest number that reads back to the same float, always with a `.` or an exponent (`1.0`, `0.1`, `100.0`, `1e+300`, `5e-324`); written with `.` whatever the host's `LC_NUMERIC` is |
+| `f32` `f64` | the fewest significant digits that read back to the same float, written as the shorter of the positional and the exponent form (the positional on a tie), always with a `.` or an exponent: `1.0`, `0.1`, `120.0`, `1e2`, `99999999999999984.0`, `1e300`, `5e-324`; the same text whatever the host's `LC_NUMERIC` is |
 | `b8` | `true` / `false` |
 | string, symbol | string; the null string and the null symbol are `""` |
 | date, time, timestamp, timespan, guid | the string it prints as (`"2024.01.01"`) |

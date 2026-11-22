@@ -43,6 +43,9 @@
  * (.json.get s path) walks the same grammar, building only the value at the
  * path and validating the rest of the document without building it.
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L     /* newlocale / uselocale */
+#endif
 #include "io/json.h"
 #include "lang/internal.h"
 #include "lang/readval.h"      /* ray_read_limits_t, ray_read_limits_apply */
@@ -50,6 +53,7 @@
 #include "ops/internal.h"      /* pool_cancelled, RAY_IS_PARTED */
 #include "ops/hash.h"          /* ray_hash_bytes */
 #include "core/numparse.h"     /* ray_parse_f64 */
+#include "core/platform.h"     /* RAY_OS_WINDOWS */
 #include "table/sym.h"
 #include <locale.h>
 #include <math.h>
@@ -164,10 +168,14 @@ static int64_t jp_hex4(jp_t* jp) {
     return v;
 }
 
+static bool jp_bytes(jp_t* jp, size_t nbytes);
+
+/* The decoded-string buffer grown to n bytes, its growth charged. */
 static bool jp_buf_need(jp_t* jp, size_t n) {
     if (n <= jp->buf_cap) return true;
     size_t cap = jp->buf_cap ? jp->buf_cap : 64;
     while (cap < n) cap *= 2;
+    if (!jp_bytes(jp, cap - jp->buf_cap)) return false;
     char* nb = (char*)ray_realloc_raw(jp->buf, cap);
     if (!nb) { jp_fail(jp, "oom", "out of memory"); return false; }
     jp->buf = nb;
@@ -472,44 +480,187 @@ static bool jp_poll(jp_t* jp, int64_t i) {
  * again for the doubling that grows it. */
 #define JP_SLOT_BYTES (2 * sizeof(ray_t*))
 
+/* An array being built: while its elements are one kind of scalar (and
+ * nulls) they go straight into the typed vector they collapse to
+ * (json_collapse's rule), so an array of a million numbers costs its
+ * vector, not a million atoms; the first element that breaks the kind
+ * turns the run into a LIST of atoms, and the build goes on in it. */
+typedef struct {
+    int     mode;        /* 0 nothing but nulls yet, 1 a typed run, 2 a LIST */
+    int     kind;        /* JK_INT / JK_FLOAT / JK_BOOL / JK_STR of the run */
+    int64_t n_null;      /* nulls so far (mode 0: all of them) */
+    ray_t*  out;         /* the typed vector, or the LIST */
+    ray_t*  str_nulls;   /* STR run: the positions that were null (I64) */
+    size_t  pre;         /* bytes charged for `out` before it is settled */
+} jarr_t;
+
+static void jarr_free(jarr_t* a) {
+    if (a->out && !RAY_IS_ERR(a->out)) ray_release(a->out);
+    if (a->str_nulls && !RAY_IS_ERR(a->str_nulls)) ray_release(a->str_nulls);
+    a->out = a->str_nulls = NULL;
+}
+
+/* Turn the run into a LIST of the atoms its cells hold (a null cell an
+ * untyped null, as the element was), each charged as an atom. */
+static bool jarr_to_list(jp_t* jp, jarr_t* a) {
+    int64_t n = a->mode == 1 ? a->out->len : a->n_null;
+    if (!jp_bytes(jp, (size_t)n * (JP_ATOM_BYTES + JP_SLOT_BYTES))) return false;
+    ray_t* list = ray_list_new(n > 4 ? n : 4);
+    if (!list || RAY_IS_ERR(list)) { jp_fail(jp, "oom", "out of memory"); return false; }
+    const int64_t* sn = a->str_nulls ? (const int64_t*)ray_data(a->str_nulls) : NULL;
+    int64_t sni = 0, nsn = a->str_nulls ? a->str_nulls->len : 0;
+    for (int64_t i = 0; i < n && !RAY_IS_ERR(list); i++) {
+        ray_t* v = RAY_NULL_OBJ;
+        if (a->mode == 1) {
+            switch (a->kind) {
+            case JK_INT: { int64_t x = ((const int64_t*)ray_data(a->out))[i]; v = x == NULL_I64 ? RAY_NULL_OBJ : ray_i64(x); break; }
+            case JK_FLOAT: { double x = ((const double*)ray_data(a->out))[i]; v = x != x ? RAY_NULL_OBJ : ray_f64(x); break; }
+            case JK_BOOL: v = ray_bool(((const uint8_t*)ray_data(a->out))[i] != 0); break;
+            default: {
+                if (sni < nsn && sn[sni] == i) { sni++; break; }
+                size_t l = 0;
+                const char* p = ray_str_vec_get(a->out, i, &l);
+                v = ray_str(p ? p : "", p ? l : 0);
+            }
+            }
+        }
+        if (!v || RAY_IS_ERR(v)) { ray_release(list); jp->err = v ? v : ray_error("oom", NULL); return false; }
+        list = ray_list_append(list, v);
+        ray_release(v);
+    }
+    if (RAY_IS_ERR(list)) { jp->err = list; return false; }
+    jarr_free(a);
+    a->out = list;
+    a->mode = 2;
+    a->pre = (size_t)n * JP_SLOT_BYTES;
+    return true;
+}
+
+/* Start a typed run of `kind` holding the nulls seen so far. */
+static bool jarr_start(jp_t* jp, jarr_t* a, int kind) {
+    int8_t t = kind == JK_INT ? RAY_I64 : kind == JK_FLOAT ? RAY_F64 : kind == JK_BOOL ? RAY_BOOL : RAY_STR;
+    ray_t* v = ray_vec_new(t, a->n_null + 8);
+    if (!v || RAY_IS_ERR(v)) { jp_fail(jp, "oom", "out of memory"); return false; }
+    a->out = v;
+    a->kind = kind;
+    a->mode = 1;
+    for (int64_t i = 0; i < a->n_null; i++) {
+        if (kind == JK_INT)   { int64_t x = NULL_I64; v = ray_vec_append(v, &x); }
+        else if (kind == JK_FLOAT) { double x = NULL_F64; v = ray_vec_append(v, &x); }
+        else {
+            v = ray_str_vec_append(v, "", 0);
+            if (!RAY_IS_ERR(v)) {
+                if (!a->str_nulls) a->str_nulls = ray_vec_new(RAY_I64, 8);
+                a->str_nulls = ray_vec_append(a->str_nulls, &i);
+            }
+        }
+        if (RAY_IS_ERR(v) || RAY_IS_ERR(a->str_nulls)) { a->out = NULL; jp->err = ray_error("oom", NULL); return false; }
+        a->out = v;
+    }
+    return true;
+}
+
+/* Add one built element `v` (consumed).  `built` is what building it was
+ * charged: in a typed run that charge is returned and the cell's charged
+ * instead. */
+static bool jarr_add(jp_t* jp, jarr_t* a, ray_t* v, size_t built) {
+    int k = json_kind(v);
+    if (a->mode == 0) {
+        if (k == JK_NULL) { a->n_null++; return true; }
+        bool scalar = k == JK_INT || k == JK_FLOAT || k == JK_STR || (k == JK_BOOL && a->n_null == 0);
+        if (scalar ? !jarr_start(jp, a, k) : !jarr_to_list(jp, a)) { ray_release(v); return false; }
+    } else if (a->mode == 1) {
+        bool fits = k == a->kind || (k == JK_NULL && a->kind != JK_BOOL) ||
+                    (a->kind == JK_FLOAT && k == JK_INT) || (a->kind == JK_INT && k == JK_FLOAT);
+        if (fits && a->kind == JK_INT && k == JK_FLOAT) {
+            /* integers then a float: the run becomes F64 */
+            ray_t* f = ray_vec_new(RAY_F64, a->out->len + 8);
+            if (!f || RAY_IS_ERR(f)) { ray_release(v); jp_fail(jp, "oom", "out of memory"); return false; }
+            const int64_t* d = (const int64_t*)ray_data(a->out);
+            for (int64_t i = 0; i < a->out->len && !RAY_IS_ERR(f); i++) {
+                double x = d[i] == NULL_I64 ? NULL_F64 : (double)d[i];
+                f = ray_vec_append(f, &x);
+            }
+            if (RAY_IS_ERR(f)) { ray_release(v); jp->err = f; return false; }
+            ray_release(a->out);
+            a->out = f;
+            a->kind = JK_FLOAT;
+        }
+        if (!fits && !jarr_to_list(jp, a)) { ray_release(v); return false; }
+    }
+    if (a->mode == 2) {
+        a->pre += JP_SLOT_BYTES;
+        if (!jp_bytes(jp, JP_SLOT_BYTES)) { ray_release(v); return false; }
+        a->out = ray_list_append(a->out, v);
+        ray_release(v);
+        if (RAY_IS_ERR(a->out)) { jp->err = a->out; a->out = NULL; return false; }
+        return true;
+    }
+    /* a typed run: the atom's charge back, the cell's (with its growth) in */
+    jp->bytes -= built < jp->bytes ? built : jp->bytes;
+    size_t cell = a->kind == JK_STR ? 2 * 16 + (k == JK_STR ? ray_str_len(v) : 0) : 2 * 8;
+    a->pre += cell;
+    if (!jp_bytes(jp, cell)) { ray_release(v); return false; }
+    ray_t* o = a->out;
+    if (k == JK_NULL) {
+        if (a->kind == JK_INT) { int64_t x = NULL_I64; o = ray_vec_append(o, &x); }
+        else if (a->kind == JK_FLOAT) { double x = NULL_F64; o = ray_vec_append(o, &x); }
+        else {
+            int64_t at = o->len;
+            o = ray_str_vec_append(o, "", 0);
+            if (!a->str_nulls) a->str_nulls = ray_vec_new(RAY_I64, 8);
+            if (a->str_nulls && !RAY_IS_ERR(a->str_nulls)) a->str_nulls = ray_vec_append(a->str_nulls, &at);
+            if (!a->str_nulls || RAY_IS_ERR(a->str_nulls)) { a->str_nulls = NULL; jp->err = ray_error("oom", NULL); }
+        }
+    } else if (a->kind == JK_INT) { o = ray_vec_append(o, &v->i64); }
+    else if (a->kind == JK_FLOAT) { double x = k == JK_INT ? (double)v->i64 : v->f64; o = ray_vec_append(o, &x); }
+    else if (a->kind == JK_BOOL) { uint8_t x = v->b8 ? 1 : 0; o = ray_vec_append(o, &x); }
+    else o = ray_str_vec_append(o, ray_str_ptr(v), ray_str_len(v));
+    ray_release(v);
+    if (RAY_IS_ERR(o)) { a->out = NULL; jp->err = o; return false; }
+    a->out = o;
+    return !jp->err;
+}
+
+/* The finished array: the typed run (its nulls flagged), the LIST, or a
+ * LIST of the nulls when nothing else came. */
+static ray_t* jarr_finish(jp_t* jp, jarr_t* a) {
+    if (a->mode == 0 && !jarr_to_list(jp, a)) { jarr_free(a); return NULL; }
+    ray_t* out = a->out;
+    a->out = NULL;
+    if (a->mode == 1 && (a->kind == JK_INT || a->kind == JK_FLOAT)) {
+        for (int64_t i = 0; i < out->len; i++) {
+            bool nul = a->kind == JK_INT ? ((const int64_t*)ray_data(out))[i] == NULL_I64
+                                         : ((const double*)ray_data(out))[i] != ((const double*)ray_data(out))[i];
+            if (nul) { out->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        }
+    }
+    if (a->mode == 1 && a->kind == JK_STR && a->str_nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
+    if (a->str_nulls) { ray_release(a->str_nulls); a->str_nulls = NULL; }
+    return jp_settle(jp, out, a->pre);
+}
+
 static ray_t* jp_array(jp_t* jp, bool build) {
     jp->p++;                                   /* '[' */
-    ray_t* list = NULL;
-    size_t pre = 0;
-    if (build) {
-        list = ray_list_new(4);
-        if (!list || RAY_IS_ERR(list)) return jp_fail(jp, "oom", "out of memory");
-    }
+    jarr_t a = { 0, 0, 0, NULL, NULL, 0 };
     jp_ws(jp);
     if (jp->p < jp->end && *jp->p == ']') {
         jp->p++;
-        return build ? jp_settle(jp, list, 0) : RAY_NULL_OBJ;
+        return build ? jarr_finish(jp, &a) : RAY_NULL_OBJ;
     }
     for (int64_t i = 0;; i++) {
-        if (!jp_poll(jp, i)) { if (list) ray_release(list); return NULL; }
-        if (build && !jp_bytes(jp, JP_SLOT_BYTES)) { ray_release(list); return NULL; }
-        pre += build ? JP_SLOT_BYTES : 0;
+        if (!jp_poll(jp, i)) { jarr_free(&a); return NULL; }
+        size_t before = jp->bytes;
         ray_t* v = jp_value(jp, build);
-        if (!v) { if (list) ray_release(list); return NULL; }
-        if (build) {
-            list = ray_list_append(list, v);
-            ray_release(v);
-            if (RAY_IS_ERR(list)) { jp->err = list; return NULL; }
-        }
+        if (!v) { jarr_free(&a); return NULL; }
+        if (build && !jarr_add(jp, &a, v, jp->bytes - before)) { jarr_free(&a); return NULL; }
         jp_ws(jp);
         if (jp->p < jp->end && *jp->p == ',') { jp->p++; jp_ws(jp); continue; }
         if (jp->p < jp->end && *jp->p == ']') { jp->p++; break; }
-        if (list) ray_release(list);
+        jarr_free(&a);
         return jp_unexpected(jp, "',' or ']'");
     }
-    if (!build) return RAY_NULL_OBJ;
-    list = jp_settle(jp, list, pre);
-    if (!list) return NULL;
-    /* the collapsed vector is a copy, built while the list still lives */
-    ray_t* out = json_collapse(list, false);
-    if (RAY_IS_ERR(out)) { jp->err = out; return NULL; }
-    if (out->type != RAY_LIST) out = jp_settle(jp, out, 0);
-    return out;
+    return build ? jarr_finish(jp, &a) : RAY_NULL_OBJ;
 }
 
 /* One key of the duplicate pass: its bytes, and its first 8 bytes as a
@@ -719,7 +870,8 @@ static bool jp_doc(jp_t* jp, const char* s, size_t len, int64_t row, const ray_r
     jp->s = jp->p = (const uint8_t*)s;
     jp->end = jp->s + len;
     jp->row = row;
-    jp->depth = jp->nodes = jp->bytes = 0;
+    jp->depth = jp->nodes = 0;
+    jp->bytes = jp->buf_cap;                   /* the decoded-string buffer it keeps */
     if (len > lim->max_input) {
         if (!jp->err)
             jp->err = row >= 0
@@ -959,8 +1111,15 @@ static ray_t* jp_get_doc(jp_t* jp, const char* s, size_t l, int64_t row, jp_get_
     int nseg = c->nseg;
     if (c->paths) {
         size_t pl = 0;
-        const char* pp = ray_str_vec_get(c->paths, row, &pl);
-        ray_t* perr = json_path_bytes(pp ? pp : "", pp ? pl : 0, rsegs, &nseg, row);
+        const char* pp = NULL;
+        if (c->paths->type == RAY_SYM) {
+            ray_t* ps = ray_sym_vec_cell(c->paths, row);
+            if (ps) { pp = ray_str_ptr(ps); pl = ray_str_len(ps); }
+        } else {
+            pp = ray_str_vec_get(c->paths, row, &pl);
+        }
+        if (!pp || pl == 0) return RAY_NULL_OBJ;   /* a null path: no field */
+        ray_t* perr = json_path_bytes(pp, pl, rsegs, &nseg, row);
         if (perr) { jp->err = perr; return NULL; }
         segs = rsegs;
     }
@@ -983,19 +1142,85 @@ static ray_t* jp_get_each(jp_t* jp, const char* s, size_t l, int64_t row, void* 
     return c->out;
 }
 
+/* The type a typed .json.get asks for: RAY_STR, RAY_I64 or RAY_F64, or an
+ * owned error.  B8 is refused: it has no null, and a missing field read
+ * as false would pass `(not ...)` in a where: as a real false. */
+static ray_t* json_get_type(ray_t* t, int8_t* out) {
+    ray_t* nm = ray_sym_str(t->i64);
+    const char* p = nm ? ray_str_ptr(nm) : "";
+    size_t l = nm ? ray_str_len(nm) : 0;
+    if (l == 3 && memcmp(p, "STR", 3) == 0) { *out = RAY_STR; return NULL; }
+    if (l == 3 && memcmp(p, "I64", 3) == 0) { *out = RAY_I64; return NULL; }
+    if (l == 3 && memcmp(p, "F64", 3) == 0) { *out = RAY_F64; return NULL; }
+    if ((l == 2 && memcmp(p, "B8", 2) == 0) || (l == 4 && memcmp(p, "BOOL", 4) == 0))
+        return ray_error("domain", ".json.get: 'B8 has no null to give a missing or other field; "
+                         "use the untyped form and compare the field with true");
+    return ray_error("domain", ".json.get: type must be 'STR, 'I64 or 'F64, got '%.*s", (int)l, p);
+}
+
+/* A found value as the asked type: the value when it is that kind (an
+ * integer as an F64 for 'F64), else the type's null.  Consumes v. */
+static ray_t* json_typed_atom(ray_t* v, int8_t t) {
+    int k = json_kind(v);
+    ray_t* out;
+    if (t == RAY_STR) out = k == JK_STR ? (ray_retain(v), v) : ray_str("", 0);
+    else if (t == RAY_I64) out = k == JK_INT ? ray_i64(v->i64) : ray_typed_null(-RAY_I64);
+    else out = k == JK_FLOAT ? ray_f64(v->f64) : k == JK_INT ? ray_f64((double)v->i64) : ray_typed_null(-RAY_F64);
+    if (v && !RAY_IS_NULL(v)) ray_release(v);
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* A LIST of found values (consumed) as a vector of the asked type, one
+ * cell per value, the type's null where the value is another kind. */
+static ray_t* json_typed_vec(ray_t* list, int8_t t) {
+    int64_t n = list->len;
+    ray_t** it = (ray_t**)ray_data(list);
+    ray_t* out = ray_vec_new(t, n > 0 ? n : 1);
+    bool any_null = false;
+    for (int64_t i = 0; out && !RAY_IS_ERR(out) && i < n; i++) {
+        int k = json_kind(it[i]);
+        if (t == RAY_STR) {
+            out = k == JK_STR ? ray_str_vec_append(out, ray_str_ptr(it[i]), ray_str_len(it[i]))
+                              : ray_str_vec_append(out, "", 0);
+        } else if (t == RAY_I64) {
+            int64_t x = k == JK_INT ? it[i]->i64 : NULL_I64;
+            any_null |= x == NULL_I64;
+            out = ray_vec_append(out, &x);
+        } else {
+            double x = k == JK_FLOAT ? it[i]->f64 : k == JK_INT ? (double)it[i]->i64 : NULL_F64;
+            any_null |= x != x;
+            out = ray_vec_append(out, &x);
+        }
+    }
+    ray_release(list);
+    if (!out) return ray_error("oom", NULL);
+    if (!RAY_IS_ERR(out) && any_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* ray_json_get_fn(ray_t** args, int64_t n) {
-    if (n < 2 || n > 3)
-        return ray_error("arity", ".json.get: expects text, a path and optional limits, got %lld arguments", (long long)n);
+    if (n < 2 || n > 4)
+        return ray_error("arity", ".json.get: expects text, a path, an optional type and optional limits, got %lld arguments", (long long)n);
     ray_read_limits_t lim = ray_read_limits_default();
-    if (n == 3) {
-        ray_t* err = ray_read_limits_apply(".json.get", args[2], &lim);
+    int8_t typed = 0;
+    int64_t at = 2;
+    if (n > at && args[at] && args[at]->type == -RAY_SYM) {
+        ray_t* terr = json_get_type(args[at], &typed);
+        if (terr) return terr;
+        at++;
+    }
+    if (n > at + 1)
+        return ray_error("arity", ".json.get: after the path come an optional type symbol and an optional limits dict");
+    if (n > at) {
+        ray_t* err = ray_read_limits_apply(".json.get", args[at], &lim);
         if (err) return err;
     }
     ray_t* path = jp_input(args[1]);
     if (!path || RAY_IS_ERR(path)) return path;
     jseg_t segs[JSON_PATH_MAX];
     int nseg = 0;
-    ray_t* paths = path->type == RAY_STR ? path : NULL;
+    /* one path per row: a STR or SYM vector */
+    ray_t* paths = path->type == RAY_STR || path->type == RAY_SYM ? path : NULL;
     if (!paths) {
         ray_t* perr = json_path(path, segs, &nseg);
         if (perr) return perr;
@@ -1005,8 +1230,25 @@ ray_t* ray_json_get_fn(ray_t** args, int64_t n) {
     jp_t jp;
     jp_init(&jp, ".json.get", &lim);
     jp_get_ctx_t c = { NULL, &lim, segs, nseg, NULL };
-    if (x->type == -RAY_STR && !paths)
-        return jp_finish(&jp, jp_get_doc(&jp, ray_str_ptr(x), ray_str_len(x), -1, &c));
+    if (x->type == -RAY_STR && !paths) {
+        ray_t* v = jp_finish(&jp, jp_get_doc(&jp, ray_str_ptr(x), ray_str_len(x), -1, &c));
+        return typed && !RAY_IS_ERR(v) ? json_typed_atom(v, typed) : v;
+    }
+    if (x->type == -RAY_STR) {
+        /* one document, a vector of paths: one value per path */
+        c.paths = paths;
+        c.out = ray_list_new(paths->len > 0 ? paths->len : 1);
+        if (!c.out || RAY_IS_ERR(c.out)) return c.out ? c.out : ray_error("oom", NULL);
+        for (int64_t r = 0; r < paths->len; r++) {
+            if (!jp_get_each(&jp, ray_str_ptr(x), ray_str_len(x), r, &c)) {
+                if (jp.buf) ray_free_raw(jp.buf);
+                if (c.out) ray_release(c.out);
+                return jp.err ? jp.err : ray_error("oom", NULL);
+            }
+        }
+        if (jp.buf) ray_free_raw(jp.buf);
+        return typed ? json_typed_vec(c.out, typed) : json_collapse(c.out, true);
+    }
     if (!jp_is_docs(x))
         return ray_error("type", ".json.get: expected a string or a string vector, got %s", ray_type_name(x->type));
     int64_t rows = RAY_IS_PARTED(x->type) ? ray_parted_nrows(x) : x->len;
@@ -1023,6 +1265,7 @@ ray_t* ray_json_get_fn(ray_t** args, int64_t n) {
         if (c.out) ray_release(c.out);
         return err;
     }
+    if (typed) return json_typed_vec(c.out, typed);
     /* no rows: what rows that all lack the field give, an empty STR */
     return json_collapse(c.out, true);
 }
@@ -1105,36 +1348,98 @@ static bool jw_i64(jw_t* w, int64_t v) {
     return jw_put(w, b, (size_t)k);
 }
 
-/* `d` printed with `fmt` ("%.*g" or "%.*f") at `prec` into b[0..cap):
- * the length written, b NUL-terminated on every path (an encoding error
- * leaves it empty, a long result is cut at cap - 1).  snprintf writes the
- * locale's decimal point; JSON's is '.', so it is rewritten in place,
- * whatever the host set LC_NUMERIC to. */
+/* strtod in the C locale, whatever the host set LC_NUMERIC to: the
+ * read-back test of a candidate must parse the '.' the writer wrote. */
+#if defined(RAY_OS_WINDOWS)
+static double jw_strtod_c(const char* s, char** end) {
+    static _locale_t cl;
+    _locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
+    if (!l) {
+        _locale_t n = _create_locale(LC_NUMERIC, "C");
+        _locale_t exp = NULL;
+        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            _free_locale(n);
+            n = exp;
+        }
+        l = n;
+    }
+    return l ? _strtod_l(s, end, l) : strtod(s, end);
+}
+#else
+static double jw_strtod_c(const char* s, char** end) {
+    static locale_t cl;
+    locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
+    if (!l) {
+        locale_t n = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+        locale_t exp = (locale_t)0;
+        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            freelocale(n);
+            n = exp;
+        }
+        l = n;
+    }
+    if (!l) return strtod(s, end);
+    locale_t old = uselocale(l);
+    double v = strtod(s, end);
+    uselocale(old);
+    return v;
+}
+#endif
+
+/* `d` printed with `fmt` ("%.*g" or "%.*f") at `prec` into b[0..cap),
+ * NUL-terminated: its length, or -1 when snprintf fails or the result does
+ * not fit.  snprintf writes the locale's decimal point; JSON's is '.', so
+ * it is rewritten in place, and an exponent is written short ("1e+05" as
+ * "1e5"). */
 static int jw_fmt_c(char* b, size_t cap, const char* fmt, int prec, double d) {
     int k = snprintf(b, cap, fmt, prec, d);
-    if (k < 0) k = 0;
-    if ((size_t)k >= cap) k = (int)cap - 1;
-    b[k] = '\0';
+    if (k < 0 || (size_t)k >= cap) { b[0] = '\0'; return -1; }
     const struct lconv* lc = localeconv();
     const char* dp = lc && lc->decimal_point ? lc->decimal_point : ".";
     size_t dl = strlen(dp);
-    if (dl == 0 || (dl == 1 && dp[0] == '.')) return k;
-    char* at = strstr(b, dp);
-    if (!at) return k;
-    *at = '.';
-    memmove(at + 1, at + dl, (size_t)(b + k - (at + dl)) + 1);
-    return k - (int)(dl - 1);
+    if (dl > 0 && !(dl == 1 && dp[0] == '.')) {
+        char* at = strstr(b, dp);
+        if (at) {
+            *at = '.';
+            memmove(at + 1, at + dl, (size_t)(b + k - (at + dl)) + 1);
+            k -= (int)(dl - 1);
+        }
+    }
+    char* e = strchr(b, 'e');
+    if (e) {
+        char* q = e + 1;
+        char* r = q;
+        if (*r == '+') r++;
+        else if (*r == '-') { q++; r++; }
+        while (*r == '0' && r[1] != '\0') r++;
+        memmove(q, r, strlen(r) + 1);
+        k = (int)strlen(b);
+    }
+    return k;
 }
 
 /* Does b[0..k) read back as `d` (as an F32 when `f32`)? */
 static bool jw_reads_back(const char* b, int k, double d, bool f32) {
-    double back = 0.0;
-    return k > 0 && ray_parse_f64(b, (size_t)k, &back) == (size_t)k &&
-           (f32 ? (float)back == (float)d : back == d);
+    if (k <= 0) return false;
+    char* end = NULL;
+    double back = jw_strtod_c(b, &end);
+    return end == b + k && (f32 ? (float)back == (float)d : back == d);
 }
 
-/* The shortest decimal that reads back as `d` (as an F32 when `f32`),
- * with a '.' or an exponent so that it reads back as a float. */
+/* A candidate as JSON writes a float: with a '.' or an exponent, so that it
+ * reads back as a float. */
+static int jw_mark_float(char* b, int k, size_t cap) {
+    for (int i = 0; i < k; i++) if (b[i] == '.' || b[i] == 'e') return k;
+    if ((size_t)k + 3 > cap) return -1;
+    b[k++] = '.'; b[k++] = '0'; b[k] = '\0';
+    return k;
+}
+
+/* The shortest text that reads back as `d` (as an F32 when `f32`): the
+ * fewest significant digits that read back, written as the shorter of the
+ * %g form (an exponent once the digits run out) and the positional form,
+ * the positional one on a tie.  A '.' or an exponent always, so that it
+ * reads back as a float. */
 static bool jw_float(jw_t* w, double d, bool f32) {
     if (d != d) return JW_LIT(w, "null");
     if (!isfinite(d)) { w->err = ray_error("domain", ".json.format: a float is not finite"); return false; }
@@ -1144,19 +1449,20 @@ static bool jw_float(jw_t* w, double d, bool f32) {
     int k = jw_fmt_c(b, sizeof b, "%.*g", prec, d);
     while (prec < max_prec && !jw_reads_back(b, k, d, f32))
         k = jw_fmt_c(b, sizeof b, "%.*g", ++prec, d);
-    /* %g writes 100 as 1e+02 once the digits run out: an integral or
-     * moderate value is written positionally, as long as it reads back */
+    if (k > 0) k = jw_mark_float(b, k, sizeof b);
+    if (k <= 0) { w->err = ray_error("domain", ".json.format: cannot write the float %g", d); return false; }
+    /* the positional form with the same significant digits */
     double ad = d < 0 ? -d : d;
-    if (strchr(b, 'e') && ad >= 1.0 && ad < 1e17) {
+    if (strchr(b, 'e') && ad >= 1e-6 && ad < 1e21) {
         int e10 = (int)floor(log10(ad));
         int dec = prec - 1 - e10 > 0 ? prec - 1 - e10 : 0;
         char c[48];
         int kc = jw_fmt_c(c, sizeof c, "%.*f", dec, d);
-        if (jw_reads_back(c, kc, d, f32)) { memcpy(b, c, (size_t)kc + 1); k = kc; }
+        if (jw_reads_back(c, kc, d, f32)) {
+            kc = jw_mark_float(c, kc, sizeof c);
+            if (kc > 0 && kc <= k) { memcpy(b, c, (size_t)kc + 1); k = kc; }
+        }
     }
-    bool marked = false;
-    for (int i = 0; i < k; i++) if (b[i] == '.' || b[i] == 'e' || b[i] == 'E') marked = true;
-    if (!marked && k + 2 < (int)sizeof b) { b[k++] = '.'; b[k++] = '0'; }
     return jw_put(w, b, (size_t)k);
 }
 
