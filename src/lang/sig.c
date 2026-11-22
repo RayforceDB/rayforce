@@ -225,6 +225,30 @@ static const ray_sig_entry_t sigs[] = {
     {".attr.set", "(.attr.set <attribute: sym, one of sorted unique grouped parted> <x: vector>)"},
     {".col.link", "(.col.link <target: sym naming a table> <v: integer vector>)"},
     {".parquet.meta", "(.parquet.meta <path: nonempty str>)"},
+    {".attr.get", "(.attr.get <x: vector>)"},
+    {".attr.drop", "(.attr.drop <x: vector>)"},
+    {".col.link?", "(.col.link? <x: vector>)"},
+    {".col.target", "(.col.target <x: vector>)"},
+    {".col.unlink", "(.col.unlink <x: vector>)"},
+    {".idx.bloom", "(.idx.bloom <x: vector>)"},
+    {".idx.drop", "(.idx.drop <x: vector>)"},
+    {".idx.has?", "(.idx.has? <x: vector>)"},
+    {".idx.hash", "(.idx.hash <x: vector>)"},
+    {".idx.sort", "(.idx.sort <x: vector>)"},
+    {".idx.zone", "(.idx.zone <x: vector>)"},
+    {".fs.list", "(.fs.list <path: str>)"},
+    {".fs.size", "(.fs.size <path: str>)"},
+    {".os.getenv", "(.os.getenv <name: str>)"},
+    {"flip", "(flip <x: numeric vector or non-empty list of numeric rows>)"},
+    {"gram", "(gram <x: numeric vector or non-empty list of numeric rows>)"},
+    {"inv", "(inv <x: numeric vector or non-empty list of numeric rows>)"},
+    {"norm", "(norm <x: numeric vector (f32, f64, i32 or i64), or a list of them>)"},
+    {"lower", "(lower <x: str or sym, atom or vector>)"},
+    {"upper", "(upper <x: str or sym, atom or vector>)"},
+    {"trim", "(trim <x: str or sym, atom or vector>)"},
+    {"hnsw-free", "(hnsw-free <index: hnsw index handle>)"},
+    {"hnsw-info", "(hnsw-info <index: hnsw index handle>)"},
+    {"hnsw-load", "(hnsw-load <path: str>)"},
 };
 
 /* Builtins that run other code (callbacks, expressions, queries) or take a
@@ -310,6 +334,42 @@ static const ray_sig_entry_t own_sigs[] = {
     {".sys.prof", "(.sys.prof)"},
     {".sys.profile", "(.sys.profile)"},
     {".sys.querylog", "(.sys.querylog)"},
+    {".graph.build", "(.graph.build <edges: table> <src: sym> <dst: sym> [<weight: sym>])"},
+    {".graph.pagerank", "(.graph.pagerank <graph: graph handle> [<iterations: int>] [<damping: f64>])"},
+    {".graph.connected", "(.graph.connected <graph: graph handle>)"},
+    {".graph.degree", "(.graph.degree <graph: graph handle>)"},
+    {".graph.topsort", "(.graph.topsort <graph: graph handle>)"},
+    {".graph.cluster", "(.graph.cluster <graph: graph handle>)"},
+    {".graph.mst", "(.graph.mst <graph: graph handle>)"},
+    {".graph.louvain", "(.graph.louvain <graph: graph handle> [<max-iter: int>])"},
+    {".graph.dijkstra", "(.graph.dijkstra <graph: graph handle> <src: int> [<dst: int>] [<max-depth: int>])"},
+    {".graph.dfs", "(.graph.dfs <graph: graph handle> <src: int> [<max-depth: int>])"},
+    {".graph.betweenness", "(.graph.betweenness <graph: graph handle> [<sample: int>])"},
+    {".graph.closeness", "(.graph.closeness <graph: graph handle> [<sample: int>])"},
+    {".graph.random-walk", "(.graph.random-walk <graph: graph handle> <src: int> [<walk-len: int>])"},
+    {".graph.k-shortest", "(.graph.k-shortest <graph: graph handle> <src: int> <dst: int> <k: int>)"},
+    {".graph.shortest-path", "(.graph.shortest-path <graph: graph handle> <src: int> <dst: int> [<max-depth: int>])"},
+    {".graph.expand", "(.graph.expand <graph: graph handle> <src: int> [<direction: sym>])"},
+    {".graph.var-expand", "(.graph.var-expand <graph: graph handle> <src: int> <min-depth: int> <max-depth: int> [<direction: sym>] [<track-path: bool>])"},
+    {".idx.info", "(.idx.info <col: vector>) or (.idx.info <t: table> <column: sym>)"},
+    {"hnsw-build", "(hnsw-build <col: list of numeric vectors> [<metric>] [<M: int>] [<ef_c: int>])"},
+    {"knn", "(knn <col: list of numeric vectors> <query: numeric vector> <k: int> [<metric>])"},
+    {"ann", "(ann <index: hnsw index handle> <query: numeric vector> <k: int> [<ef_s: int>])"},
+    {"replace", "(replace <text: str or sym> <from: str or sym> <to: str or sym>)"},
+    {"substr", "(substr <text: str or sym> <start: int, or I64/I32 vector> <length: int, or I64/I32 vector>)"},
+    {".mem.ts", "(.mem.ts <expr>)"},
+    {".sys.args", "(.sys.args)"},
+    {".sys.build", "(.sys.build)"},
+    {".sys.info", "(.sys.info)"},
+    {".sys.mem", "(.sys.mem)"},
+    {".sys.env", "(.sys.env [<name: str>])"},
+    {".sys.gc", "(.sys.gc [<mode: i64, 0 or 1>])"},
+    {".sys.join.par.min", "(.sys.join.par.min [<rows: i64>])"},
+    {".sys.timeit", "(.sys.timeit [<on: i64, 0 or 1>])"},
+    {".sys.profile.enable", "(.sys.profile.enable [<on: i64, 0 or 1>])"},
+    {".sys.profile.reset", "(.sys.profile.reset)"},
+    {".sys.querylog.enable", "(.sys.querylog.enable [<on: i64, 0 or 1>])"},
+    {".time.now", "(.time.now)"},
     {"datoms", "(datoms)"},
     {"assert-fact", "(assert-fact <db: datoms table> <entity> <attr: sym> <value>)"},
     {"retract-fact", "(retract-fact <db: datoms table> <entity> <attr: sym> <value>)"},
@@ -339,25 +399,40 @@ static bool name_matches(const char* entry, const char* name) {
 
 /* The entry of `name`, in either table; NULL when there is none or the name is
  * ambiguous.  `*own` tells which table it came from. */
-static const ray_sig_entry_t* find_entry(const char* name, bool* own) {
+static bool own_message(const char* name, const char* msg);
+
+static const ray_sig_entry_t* find_entry(const char* name, bool* own, const char* msg) {
     const ray_sig_entry_t* hit = NULL;
     int found = 0;
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
         if (name_matches(sigs[i].name, name)) {
-            if (strcmp(sigs[i].name, name) == 0) { *own = false; return &sigs[i]; }
+            if (strlen(name) < FN_NAME_MAX && strcmp(sigs[i].name, name) == 0) { *own = false; return &sigs[i]; }
             hit = &sigs[i]; *own = false; found++;
         }
     for (size_t i = 0; i < sizeof own_sigs / sizeof *own_sigs; i++)
         if (name_matches(own_sigs[i].name, name)) {
-            if (strcmp(own_sigs[i].name, name) == 0) { *own = true; return &own_sigs[i]; }
+            if (strlen(name) < FN_NAME_MAX && strcmp(own_sigs[i].name, name) == 0) { *own = true; return &own_sigs[i]; }
             hit = &own_sigs[i]; *own = true; found++;
         }
-    return found == 1 ? hit : NULL;
+    if (found == 1) return hit;
+    /* A cut-off name that fits several entries (.sys.querylog and
+     * .sys.querylog.enable, .sys.profile.enable and .sys.profile.reset): the
+     * message begins with the full name of the builtin that wrote it. */
+    if (found > 1 && msg && *msg) {
+        const ray_sig_entry_t* pick = NULL;
+        int picks = 0;
+        for (size_t i = 0; i < sizeof own_sigs / sizeof *own_sigs; i++)
+            if (name_matches(own_sigs[i].name, name) && own_message(own_sigs[i].name, msg)) {
+                pick = &own_sigs[i]; picks++;
+            }
+        if (picks == 1) { *own = true; return pick; }
+    }
+    return NULL;
 }
 
 const char* ray_sig_usage(const char* name) {
     bool own;
-    const ray_sig_entry_t* e = name ? find_entry(name, &own) : NULL;
+    const ray_sig_entry_t* e = name ? find_entry(name, &own, NULL) : NULL;
     return e ? e->usage : NULL;
 }
 
@@ -368,7 +443,8 @@ static bool starts_with_word(const char* msg, const char* cand, size_t n) {
     if (msg[n] == ':') return true;
     if (msg[n] != ' ') return false;
     const char* w = msg + n + 1;
-    return !strncmp(w, "expects", 7) || !strncmp(w, "takes", 5) || !strncmp(w, "requires", 8);
+    return !strncmp(w, "expects", 7) || !strncmp(w, "takes", 5) || !strncmp(w, "requires", 8) ||
+           !strncmp(w, "accepts", 7);
 }
 
 /* A message is the builtin's own when it begins with its name, written as the
@@ -411,9 +487,9 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
         strcmp(code, "rank") && strcmp(code, "arity") && !domain)
         return result;
     bool own;
-    const ray_sig_entry_t* e = find_entry(name, &own);
-    if (!e) return result;
     const char* old = ray_error_msg();
+    const ray_sig_entry_t* e = find_entry(name, &own, old);
+    if (!e) return result;
     /* Only the own-message table needs the guard. */
     if (own && (!old || !*old || !own_message(e->name, old))) return result;
     /* A domain error is a bad value, not a bad call, unless it is about the
@@ -435,7 +511,7 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
 
 ray_t* ray_sig_arity(const char* name, const char* want, int got) {
     bool own;
-    const ray_sig_entry_t* e = find_entry(name, &own);
+    const ray_sig_entry_t* e = find_entry(name, &own, NULL);
     const char* shown = e ? e->name : name;
     return ray_error("arity", "%s: takes %s argument%s, got %d%s%s", shown, want,
                      strcmp(want, "1") ? "s" : "", got,

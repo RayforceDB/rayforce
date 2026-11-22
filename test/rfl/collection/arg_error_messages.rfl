@@ -58,5 +58,22 @@
 (at (try (til 3h) (fn [e] e)) 'msg) -- "til: argument must be an i64 atom, got i16; usage: (til <n: i64 atom>)"
 
 ;; a registered name is cut at 13 characters: two builtins that share the cut
-;; name get no usage line rather than the wrong one
-(at (try (.sys.profile.enable 1 2 3) (fn [e] e)) 'msg) -- ".sys.profile.enable takes 0 or 1 arguments"
+;; name are told apart by their message (see below)
+(at (try (.sys.profile.enable 1 2 3) (fn [e] e)) 'msg) -- ".sys.profile.enable takes 0 or 1 arguments; usage: (.sys.profile.enable [<on: i64, 0 or 1>])"
+
+;; the builtins that register with a space before the parenthesis (graph, index,
+;; attribute, link, string, vector-search and system ones) have usage lines too
+(at (try (.graph.pagerank 1) (fn [e] e)) 'msg) -- "graph.pagerank: expects a graph handle, got i64; usage: (.graph.pagerank <graph: graph handle> [<iterations: int>] [<damping: f64>])"
+(at (try (.graph.dijkstra) (fn [e] e)) 'code) -- 'rank
+(at (try (lower 5) (fn [e] e)) 'msg) -- "string transform: expected string or symbol, got i64; usage: (lower <x: str or sym, atom or vector>)"
+(at (try (substr "abc" 'a 1) (fn [e] e)) 'msg) -- "substr: start must be an integer atom or I64/I32 vector; usage: (substr <text: str or sym> <start: int, or I64/I32 vector> <length: int, or I64/I32 vector>)"
+(at (try (flip 'a) (fn [e] e)) 'msg) -- "flip: expects a numeric vector or a non-empty list of numeric rows; usage: (flip <x: numeric vector or non-empty list of numeric rows>)"
+(at (try (.attr.get) (fn [e] e)) 'msg) -- ".attr.get: takes 1 argument, got 0; usage: (.attr.get <x: vector>)"
+(at (try (knn 1 2) (fn [e] e)) 'code) -- 'rank
+
+;; two builtins whose names share the first 13 characters are told apart by the
+;; message, each of which begins with its own name
+(at (try (.sys.querylog.enable 1 2) (fn [e] e)) 'msg) -- ".sys.querylog.enable takes 0 or 1 arguments; usage: (.sys.querylog.enable [<on: i64, 0 or 1>])"
+(at (try (.sys.querylog 1) (fn [e] e)) 'msg) -- ".sys.querylog takes no arguments; usage: (.sys.querylog)"
+(at (try (.sys.profile.enable 'a) (fn [e] e)) 'msg) -- ".sys.profile.enable: flag must be i64, got sym; usage: (.sys.profile.enable [<on: i64, 0 or 1>])"
+(at (try (.sys.profile.reset 1) (fn [e] e)) 'msg) -- ".sys.profile.reset takes no arguments; usage: (.sys.profile.reset)"
