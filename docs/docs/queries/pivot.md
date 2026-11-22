@@ -14,7 +14,7 @@ Pivot a table to wide format.
 
 - **table** — source table
 - **index** — row index column (symbol or vector of symbols for multi-index)
-- **pivot_col** — column whose distinct values become new column headers
+- **pivot_col** — column whose distinct values become new column headers. Its values must be scalars that can name a column (a symbol, number or temporal value); a STR or LIST pivot column raises `nyi`
 - **value_col** — column to aggregate
 - **agg_fn** — aggregation function (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`, `med`, or a custom lambda)
 

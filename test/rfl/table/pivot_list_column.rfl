@@ -1,0 +1,9 @@
+;; #1375: a LIST pivot column's cells cannot name output columns; pivot raises
+;; nyi, as for a STR pivot column, instead of naming columns from pointers.
+(set mk (fn [p] (table [k p v] (list [1 1 2] p [10 20 30]))))
+(pivot (mk (list [1 2] [3] [1 2])) 'k 'p 'v sum) !- nyi
+(pivot (mk (list [1] 'a [1])) 'k 'p 'v sum) !- nyi
+(pivot (mk ["a" "b" "a"]) 'k 'p 'v sum) !- nyi
+;; scalar pivot columns still name their columns
+(cols (pivot (mk ['a 'b 'a]) 'k 'p 'v sum)) -- ['k 'a 'b]
+(count (cols (pivot (mk [5 6 5]) 'k 'p 'v sum))) -- 3

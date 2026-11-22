@@ -180,9 +180,12 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
      * a STR pivot column cannot supply names.  (STR *index* columns ARE now
      * supported — they group via the wide-key path; this restriction is
      * specific to the pivot column, whose values name the unstacked columns.) */
-    if (pcol->type == RAY_STR) {
+    /* A LIST pivot column's cells are not scalars either: naming columns from
+     * them read pointers as numbers (#1375). */
+    if (pcol->type == RAY_STR || pcol->type == RAY_LIST) {
         scratch_free(ic_hdr);
-        return ray_error("nyi", "pivot: STR pivot column not supported as column names");
+        return ray_error("nyi", "pivot: %s pivot column not supported as column names",
+                         pcol->type == RAY_STR ? "STR" : "LIST");
     }
 
     /* Get index columns (icols carved together with idx_syms above) */
