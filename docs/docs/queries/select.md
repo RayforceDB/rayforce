@@ -155,15 +155,19 @@ The positions `where` returns count those rows, not the table's:
 ```
 
 Under `by:` the verb sees each group's surviving rows, as an aggregate does:
-the grades and ranks count within the group, never across groups. The same
-holds for `rotate` and `xrank`, for a verb under an element-wise call
-(`(+ 1 (rank v))`), and for one inside an aggregate's argument
-(`(sum (rank v))`, `(sum (asc v))`):
+its grades and ranks count within the group. The same holds for `rotate`
+and `xrank`, for a verb under an element-wise call (`(+ 1 (rank v))`), and
+for one inside an aggregate's argument (`(sum (rank v))`, `(sum (asc v))`):
 
 ```lisp
 (at (select {r: (rank v) from: g by: k}) 'r)        ; [[0 1] [1 0 2]]
 (at (select {r: (sum (rank v)) from: g by: k}) 'r)  ; [1 3]
 ```
+
+A verb inside a running function's argument runs with that function, over
+the whole table (see [running functions](#running-functions-under-where)):
+`(sums (rank v))` by `k` takes each group's rows of the running sum of the
+whole table's ranks, not the running sum of each group's ranks.
 
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
