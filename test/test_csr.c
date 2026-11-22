@@ -3808,7 +3808,11 @@ static test_result_t test_csr_parallel_cancel(void) {
     ray_heap_init();
     (void)ray_sym_init();
     enum { N_NODES = 3000, M = 20000 };
-    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) SKIP("no pool worker");
+    if (!ray_pool_par_dispatch_ok(ray_pool_get(), M, 0)) {
+        ray_sym_destroy();
+        ray_heap_destroy();
+        SKIP("no pool worker");
+    }
     int64_t* s = ray_alloc_raw((size_t)M * sizeof(int64_t));
     int64_t* d = ray_alloc_raw((size_t)M * sizeof(int64_t));
     TEST_ASSERT(s && d, "scratch");
@@ -3841,8 +3845,10 @@ static test_result_t test_csr_parallel_matches_serial(void) {
     ray_heap_init();
     (void)ray_sym_init();
     test_result_t r = csr_par_vs_serial(false);
-    if (r.status != TEST_PASS) return r;
-    return csr_par_vs_serial(true);
+    if (r.status == TEST_PASS) r = csr_par_vs_serial(true);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    return r;
 }
 
 /* A hub whose list is long enough to leave the insertion sort behind must
