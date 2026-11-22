@@ -1204,12 +1204,12 @@ static uint8_t expr_ensure_type(ray_expr_t* out, uint8_t src, int8_t target) {
 /* Can this instruction write a null sentinel into its destination even
  * when every source lane is a real value?  F64: any op that ray_f64_fin /
  * a zero-divisor test canonicalizes to NULL_F64 (overflow, x/0, sqrt(<0),
- * log(<=0), ...).  I64: zero-divisor IDIV/MOD and the INT64_MIN overflow of
- * NEG/ABS.  Such a destination is nullable for every downstream instruction
- * (so CAST F64->I64, I64 arithmetic and MIN2/MAX2 pick their null-aware
+ * log(<=0), ...).  I64: ADD/SUB/MUL wrapping to the sentinel, zero-divisor
+ * IDIV/MOD and the INT64_MIN overflow of NEG/ABS.  Such a destination is
+ * nullable downstream (so CAST, I64 arithmetic and MIN2/MAX2 pick their null-aware
  * kernels) and, when nothing upstream is a nullable column, the output flag
  * comes from a precise sentinel scan rather than the conservative attr. */
-static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binary) {
+static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binary, int8_t planned) {
     if (ot == RAY_F64) {
         switch (op) {
             case OP_ADD: case OP_SUB: case OP_MUL:
@@ -1223,7 +1223,14 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
         }
     }
     if (ot == RAY_I64) {
-        if (binary) return op == OP_DIV || op == OP_IDIV || op == OP_MOD;
+        if (binary) {
+            if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
+                /* Narrow nodes also use I64 scratch lanes, but wrap in their own width. */
+                if (RAY_IS_PARTED(planned)) planned = (int8_t)RAY_PARTED_BASETYPE(planned);
+                return planned == RAY_I64;
+            }
+            return op == OP_DIV || op == OP_IDIV || op == OP_MOD;
+        }
         return (op == OP_NEG || op == OP_ABS) && t1 == RAY_I64;
     }
     return false;
@@ -1844,7 +1851,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 bool in_src  = out->regs[s1].null_src ||
                                (s2 != 0xFF && out->regs[s2].null_src);
                 bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
-                                                       s2 != 0xFF) ||
+                                                       s2 != 0xFF, node->out_type) ||
                                 expr_temporal_arith_cast(g, node);
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
@@ -3474,6 +3481,7 @@ static int expr_leaf_emit(const ray_expr_t* expr, const expr_enc_plan_t* p, ray_
 typedef struct {
     const ray_expr_t* expr;
     void*  out_data;
+    atomic_bool* i64_null;             /* shared only for generated-only I64 results */
     int8_t out_type;
     rowsel_builder_t* sel_builders;    /* NULL = normal bool/vec output */
     uint32_t          n_sel_builders;  /* slot count (fused mode only)  */
@@ -3518,6 +3526,7 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
 
     /* Chunk-zone skip is only possible for a BOOL predicate over a zone-
      * indexed column; compute the gate once, not per morsel. */
+    bool found_null = false;
     bool zone = expr_zone_eligible(expr);
     int64_t skips = 0;
     /* encoded leaves: one vector view on this task's stack (never the heap) */
@@ -3583,11 +3592,21 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (!result) { memset(scratch[0], 0, (size_t)(me - ms)); result = scratch[0]; }
             rowsel_emit_segment(sb, lseg, (const uint8_t*)result, me - ms);
         } else if (result) {
-            memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
+            /* Combine copy and detection while the final register is hot. */
+            if (c->i64_null && !found_null) {
+                const int64_t* src = result;
+                int64_t* dst = (int64_t*)c->out_data + ms;
+                for (int64_t j = 0; j < me - ms; j++) {
+                    dst[j] = src[j];
+                    found_null |= src[j] == NULL_I64;
+                }
+            } else
+                memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
         }
     }
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(scratch_hdr);
+    if (found_null) atomic_store_explicit(c->i64_null, true, memory_order_relaxed);
     if (skips) atomic_fetch_add_explicit(&g_expr_zone_skips, skips, memory_order_relaxed);
 }
 
@@ -3621,6 +3640,11 @@ static void mark_i64_overflow_as_null(ray_t* result, int64_t off, int64_t len) {
     }
 }
 
+static bool expr_track_i64_null(const ray_expr_t* expr) {
+    uint8_t o = expr->out_reg;
+    return expr->out_type == RAY_I64 && expr->regs[o].nullable && !expr->regs[o].null_src;
+}
+
 /* HAS_NULLS on a fused output.  A register whose nullability traces to a
  * nullable column gets the conservative attr — REQUIRED, not cosmetic:
  * group.c feeds this vec to aggregates whose check-free fast path is gated
@@ -3631,16 +3655,17 @@ static void mark_i64_overflow_as_null(ray_t* result, int64_t off, int64_t len) {
  * critical because this output is often an input to the NEXT op /
  * aggregate, and a spurious HAS_NULLS would force that consumer onto the
  * slow null-aware path (measured: conservative flagging regressed chained
- * float kernels catastrophically by poisoning inputs).  The scan looks at
- * the whole program's generators, not just the last instruction: the
- * sentinel survives every downstream null-aware kernel (abs, +, cast, ...).
- * Produced once (post-join of all morsels), so the pass is not the per-op
- * hot loop.  Mirrors the fallback's shape-based flagging (VM == fallback). */
-static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t nrows) {
+ * float kernels catastrophically by poisoning inputs). I64 workers check the
+ * final register during the output copy; the coordinator sets the attribute
+ * once after join. Other generated types keep their post-join scan. */
+static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t nrows,
+                                   const atomic_bool* i64_null) {
     uint8_t o = expr->out_reg;
     if (!expr->regs[o].nullable) return;
     if (expr->regs[o].null_src) { out->attrs |= RAY_ATTR_HAS_NULLS; return; }
-    if (expr->out_type == RAY_I64 || expr->out_type == RAY_TIMESTAMP)
+    if (expr->out_type == RAY_I64) {
+        if (atomic_load_explicit(i64_null, memory_order_relaxed)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    } else if (expr->out_type == RAY_TIMESTAMP)
         mark_i64_overflow_as_null(out, 0, nrows);
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
     else if (expr->out_type == RAY_I32 || expr->out_type == RAY_I16 ||
@@ -3702,6 +3727,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
 
     int64_t n_segs = expr_nsegs(ref_parted);
     uint8_t esz = ray_elem_size(expr->out_type);
+    atomic_bool i64_null = false;   /* sticky across all segments */
     ray_pool_t* pool = ray_pool_get();
     int64_t global_off = 0;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
@@ -3766,6 +3792,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             expr_enc_plan_t plan;
             expr_full_ctx_t ctx = {
                 .expr = &seg_expr,
+                .i64_null = expr_track_i64_null(expr) ? &i64_null : NULL,
                 .out_data = (char*)ray_data(out) + global_off * esz,
                 .out_type = expr->out_type,
                 .fail = &fail,
@@ -3791,7 +3818,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     }
     ray_t* ferr = ray_scan_fail_finish(&fail, dispatched ? pool : NULL);
     if (ferr) { ray_release(out); return ferr; }
-    expr_flag_output_nulls(expr, out, nrows);
+    expr_flag_output_nulls(expr, out, nrows, &i64_null);
     return out;
 }
 
@@ -3805,9 +3832,11 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     if (!out || RAY_IS_ERR(out)) return out;
     out->len = nrows;
 
+    atomic_bool i64_null = false;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_enc_plan_t plan;
     expr_full_ctx_t ctx = {
+        .i64_null = expr_track_i64_null(expr) ? &i64_null : NULL,
         .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type, .fail = &fail,
         .plan = expr_enc_plan_build(expr, &plan),
     };
@@ -3824,7 +3853,7 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
 
     ray_t* ferr = ray_scan_fail_finish(&fail, par ? pool : NULL);
     if (ferr) { ray_release(out); return ferr; }
-    expr_flag_output_nulls(expr, out, nrows);
+    expr_flag_output_nulls(expr, out, nrows, &i64_null);
     return out;
 }
 
@@ -5386,6 +5415,20 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         return;
     }
 
+    /* Even non-null operands can wrap to the I64 null payload. Reduce while
+     * storing, without a second column pass or a per-row metadata update. */
+#define BR_WRAP(T, L, OP, R) do {                                           \
+        int any = 0;                                                        \
+        for (int64_t i = 0; i < n; i++) {                                   \
+            uint64_t bits = (uint64_t)(L) OP (uint64_t)(R);                      \
+            odst[i] = (T)bits;                                                    \
+            if (sizeof(T) == 8 && out_type == RAY_I64)                      \
+                any |= (bits == (uint64_t)NULL_I64);                            \
+        }                                                                   \
+        if (any) __atomic_fetch_or(&result->attrs, RAY_ATTR_HAS_NULLS,      \
+                                   __ATOMIC_RELAXED);                       \
+    } while (0)
+
     /* Fast path: integer-vec vs integer-scalar arithmetic with
      * matching output type (e.g. (- ClientIP 1) → I32 from I32 col).
      * Same motivation as the BOOL fast path: the LV_READ macro chain
@@ -5415,9 +5458,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             T* odst = (T*)dst;                                              \
             T cvt = (T)cv;                                                  \
             switch (opc) {                                                  \
-            case OP_ADD:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] + (uint64_t)cvt); break; \
-            case OP_SUB:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] - (uint64_t)cvt); break; \
-            case OP_MUL:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] * (uint64_t)cvt); break; \
+            case OP_ADD:  BR_WRAP(T, d[i], +, cvt); break; \
+            case OP_SUB:  BR_WRAP(T, d[i], -, cvt); break; \
+            case OP_MUL:  BR_WRAP(T, d[i], *, cvt); break; \
             case OP_MIN2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] < cvt ? d[i] : cvt; break; \
             case OP_MAX2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] > cvt ? d[i] : cvt; break; \
             }                                                               \
@@ -5636,10 +5679,25 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         }
     } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
         int64_t* odst = (int64_t*)dst;
+        /* The right broadcast already has a typed loop. Keep the remaining
+         * common I64 shapes out of per-element reader dispatch as well. */
+        if (out_type == RAY_I64 && rhs->type == RAY_I64 && !r_scalar &&
+            (lhs->type == RAY_I64 || lhs->type == -RAY_I64)) {
+#define BR_I64(OP) do {                                                     \
+                if (l_scalar) BR_WRAP(int64_t, l_i64, OP, rp_i64[i]);       \
+                else BR_WRAP(int64_t, lp_i64[i], OP, rp_i64[i]);            \
+            } while (0)
+            switch (op->opcode) {
+                case OP_ADD: BR_I64(+); return;
+                case OP_SUB: BR_I64(-); return;
+                case OP_MUL: BR_I64(*); return;
+            }
+#undef BR_I64
+        }
         switch (op->opcode) {
-            case OP_ADD: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li+(uint64_t)ri);}break;
-            case OP_SUB: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li-(uint64_t)ri);}break;
-            case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
+            case OP_ADD: BR_WRAP(int64_t, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int64_t, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int64_t, LV_INT(i), *, RV_INT(i)); break;
             case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}break;
             case OP_IDIV:
                 if (rp_i16) {
@@ -5806,6 +5864,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #undef RV_READ
 #undef LV_READ_I64
 #undef RV_READ_I64
+#undef BR_WRAP
 #undef LV_INT
 #undef RV_INT
 done:

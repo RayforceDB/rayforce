@@ -183,7 +183,7 @@ static test_result_t test_expr_bail_counter_nulls(void) {
     PASS();
 }
 
-static test_result_t test_nullfree_stream_unchanged(void) {
+static test_result_t test_nullfree_i64_producer(void) {
     ray_heap_init(); (void)ray_sym_init();
     int64_t vals[] = {1, 2, 3, 4, 5, 6, 7, 8};
     ray_t* col = ray_vec_from_raw(RAY_I64, vals, 8);
@@ -197,10 +197,11 @@ static test_result_t test_nullfree_stream_unchanged(void) {
                           ray_const_i64(g, 2));
     ray_expr_t ex;
     TEST_ASSERT(expr_compile(g, tbl, e, &ex, &(ray_t*){NULL}), "null-free compiles");
-    for (uint8_t i = 0; i < ex.n_ins; i++)
-        TEST_ASSERT(ex.ins[i].null_aware == 0, "no null_aware on null-free");
-    for (uint8_t r2 = 0; r2 < ex.n_regs; r2++)
-        TEST_ASSERT(!ex.regs[r2].nullable, "no nullable regs on null-free");
+    TEST_ASSERT(ex.n_ins == 2, "ADD then MUL");
+    TEST_ASSERT(!ex.ins[0].null_aware, "ADD has null-free inputs");
+    TEST_ASSERT(ex.regs[ex.ins[0].dst].nullable, "ADD can generate the sentinel");
+    TEST_ASSERT(ex.ins[1].null_aware, "MUL must propagate a generated null");
+    TEST_ASSERT(!ex.regs[ex.ins[1].dst].null_src, "no nullable source column");
 
     ray_graph_free(g); ray_release(tbl);
     ray_sym_destroy(); ray_heap_destroy();
@@ -1939,12 +1940,49 @@ static test_result_t test_zero_divisor_nullfree(void) {
     return r;
 }
 
+/* A partial final morsel and a null produced only in the last task
+ * exercise the tail bounds and the post-dispatch reduction. */
+static test_result_t test_generated_i64_output(void) {
+    ray_heap_init(); (void)ray_sym_init();
+    const int n = RAY_PARALLEL_THRESHOLD + 3;
+    for (int shape = 0; shape < 4; shape++) {
+        ray_t* col = ray_vec_new(RAY_I64, n);
+        col->len = n;
+        int64_t* p = ray_data(col);
+        for (int i = 0; i < n; i++) {
+            bool hit = shape == 1 ? (i & 1) : shape == 2 || (shape == 3 && i == n - 1);
+            p[i] = hit ? INT64_MAX : INT64_MAX - 1;
+        }
+        ray_t* tbl = ray_table_new(1);
+        tbl = ray_table_add_col(tbl, ray_sym_intern("x", 1), col);
+        ray_graph_t* g = ray_graph_new(tbl);
+        /* Second ADD must propagate a generated null, but wrap the other
+         * rows normally (MAX + 2 == MIN + 1, not null). */
+        ray_op_t* a = ray_add(g, ray_scan(g, "x"), ray_const_i64(g, 1));
+        ray_op_t* e = ray_add(g, a, ray_const_i64(g, 2));
+        ray_expr_t ex;
+        TEST_ASSERT(expr_compile(g, tbl, e, &ex, &(ray_t*){NULL}), "fused ADD chain");
+        ray_t* out = expr_eval_full(&ex, n);
+        TEST_ASSERT(out && !RAY_IS_ERR(out) && out->len == n, "fused output");
+        TEST_ASSERT_EQ_I(!!(out->attrs & RAY_ATTR_HAS_NULLS), shape != 0);
+        for (int i = 0; i < n; i++) {
+            bool hit = p[i] == INT64_MAX;
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(out))[i], hit ? NULL_I64 : INT64_MIN + 1);
+        }
+        ray_release(out); ray_graph_free(g); ray_release(tbl);
+        ray_release(col);
+    }
+    ray_sym_destroy(); ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t expr_null_entries[] = {
+    { "expr_null/generated_i64_output", test_generated_i64_output, NULL, NULL },
     { "expr_null/sym_ordered_sparse_no_intern", test_sym_ordered_sparse_no_intern, NULL, NULL },
     { "expr_null/sym_ordered_partitions", test_sym_ordered_partitions, NULL, NULL },
     { "expr_null/sym_ordered_domains_widths", test_sym_ordered_domains_widths, NULL, NULL },
     { "expr_null/bail_counter",            test_expr_bail_counter_nulls,          NULL, NULL },
-    { "expr_null/nullfree_invariance",     test_nullfree_stream_unchanged,        NULL, NULL },
+    { "expr_null/nullfree_i64_producer",     test_nullfree_i64_producer,        NULL, NULL },
     { "expr_null/diff_i64_add",            test_diff_i64_add_nullable_prelanding, NULL, NULL },
     { "expr_null/diff_f64_chain",          test_diff_f64_chain_nullable,          NULL, NULL },
     { "expr_null/diff_i64_promoted",       test_diff_i64_promoted_nullable,       NULL, NULL },

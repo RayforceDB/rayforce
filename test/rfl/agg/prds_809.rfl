@@ -1,0 +1,7 @@
+;; A skipped input repeats the previous product, even at the sentinel.
+(set p (prds [4611686018427387904 0Nl 2 0Nl 2]))
+(nil? p) -- [false false true true false]
+(at p 1) -- 4611686018427387904
+(at p 4) -- 0
+;; Ordinary wrap stays numeric.
+(prds [9223372036854775807 2]) -- [9223372036854775807 -2]
