@@ -18913,7 +18913,8 @@ static bool part_stats_lit_ok(int8_t ct, int8_t lt) {
  * is dropped only when its statistics (ray_part_seg_stats) decide the
  * comparison false for every row, by the rule row-level zone skipping uses
  * (zone_cmp_core: nulls rank below every value), and a partition without
- * statistics is kept.  False when nothing can be dropped: a type the
+ * statistics is kept, except under an empty `in` set, which no row passes, so
+ * every partition drops (#1344).  False when nothing can be dropped: a type the
  * statistics do not order, an unsupported literal, `not in`, or no
  * partition decided. */
 bool ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped, ray_t* lit, uint64_t* mask) {

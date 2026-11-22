@@ -840,6 +840,9 @@
 ;; an empty set holds no row, so every partition prunes, with or without
 ;; statistics: a plain and a compressed save run the same sorts (#1344)
 (count (lcio Qlc [])) -- 0
+(lcio Qlc []) -- (lcio Ulc [])
+(set Bso (at (.sys.mem) 'sort-perpart-runs))
+(count (lcio Qlc [])) -- 0
 (- (at (.sys.mem) 'sort-perpart-runs) Bso) -- 1
 (set Bso (at (.sys.mem) 'sort-perpart-runs))
 (at (select {x: x from: Qlc where: (within x [2 5]) desc: x take: 3}) 'x) -- [5 4 3]

@@ -17,6 +17,11 @@
 (runs (fn [] (f A []))) -- (runs (fn [] (f B [])))
 (runs (fn [] (select {x: x from: A where: (in x []) asc: x}))) -- (runs (fn [] (select {x: x from: B where: (in x []) asc: x})))
 (set E (as 'I64 []))
+;; the answers, schema and types included, equal the unpruned table's
+(set MA (select {from: A}))
+(select {x: x y: y from: A where: (in x []) asc: x}) -- (select {x: x y: y from: MA where: (in x []) asc: x})
+(select {x: x y: y from: B where: (in x E) asc: x}) -- (select {x: x y: y from: MA where: (in x E) asc: x})
+(select {n: (count y) s: (sum y) from: A where: (in x [])}) -- (select {n: (count y) s: (sum y) from: MA where: (in x [])})
 (runs (fn [] (select {x: x from: A where: (in x E) asc: x}))) -- (runs (fn [] (select {x: x from: B where: (in x E) asc: x})))
 ;; a non-empty set is unchanged: both partitions hold a member
 (f A [1 4 5]) -- (f B [1 4 5])
