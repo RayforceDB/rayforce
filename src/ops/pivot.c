@@ -2015,30 +2015,40 @@ static bool pivot_table_has_parted_col(ray_t* tbl) {
     return false;
 }
 
+/* A parted table as one in-RAM table: every segment concatenated in order.
+ * NULL when `tbl` has no parted column (the caller keeps `tbl`), else a new
+ * reference or an error.  pivot (tblop.c) flattens before it picks a route,
+ * so both routes and their column-type gates see the base types. */
+ray_t* pivot_flatten_parted(ray_t* tbl) {
+    if (!pivot_table_has_parted_col(tbl)) return NULL;
+    int64_t nseg = pivot_parted_seg_count(tbl);
+    ray_t* flat = NULL;
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg = build_segment_table(tbl, (int32_t)s);
+        if (!seg || RAY_IS_ERR(seg)) { if (flat) ray_release(flat); return seg ? seg : ray_error("oom", NULL); }
+        if (!flat) flat = seg;
+        else {
+            ray_t* m = ray_result_merge(flat, seg);
+            ray_release(flat); ray_release(seg);
+            if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+            flat = m;
+        }
+    }
+    return flat ? flat : ray_table_new(0);
+}
+
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     /* Parted-input guard: exec_pivot fetches columns via ray_table_col and
      * indexes them by row up to ray_table_nrows.  A raw RAY_PARTED/MAPCOMMON
      * column (whose data is a tiny segs array, not nrows elements) would be
-     * indexed out of bounds → OOB read / SIGSEGV.  Flatten (concat all
-     * segments) and recompute on the flat table, mirroring exec_window /
-     * join_with_parted_guard.  A flat table has no parted column, so the
+     * indexed out of bounds.  pivot flattens first; this keeps the op safe
+     * on any other input.  A flat table has no parted column, so the
      * recursive call falls straight through this guard (one level). */
-    if (pivot_table_has_parted_col(tbl)) {
-        int64_t nseg = pivot_parted_seg_count(tbl);
-        ray_t* flat = NULL;
-        for (int64_t s = 0; s < nseg; s++) {
-            ray_t* seg = build_segment_table(tbl, (int32_t)s);
-            if (!seg || RAY_IS_ERR(seg)) { if (flat) ray_release(flat); return seg ? seg : ray_error("oom", NULL); }
-            if (!flat) flat = seg;
-            else {
-                ray_t* m = ray_result_merge(flat, seg);
-                ray_release(flat); ray_release(seg);
-                if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
-                flat = m;
-            }
-        }
+    ray_t* flat = pivot_flatten_parted(tbl);
+    if (flat) {
+        if (RAY_IS_ERR(flat)) return flat;
         ray_t* r = exec_pivot(g, op, flat);
         ray_release(flat);
         return r;
@@ -2535,7 +2545,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     switch (agg_op) {
         case OP_AVG:   out_agg_type = RAY_F64; break;
         case OP_COUNT: out_agg_type = RAY_I64; break;
-        case OP_SUM:   out_agg_type = val_is_f64 ? RAY_F64 : RAY_I64; break;
+        /* a sum of durations is a duration, as (sum v) is */
+        case OP_SUM:   out_agg_type = val_is_f64 ? RAY_F64
+                                    : (vcol->type == RAY_TIME || vcol->type == RAY_TIMESPAN)
+                                    ? vcol->type : RAY_I64; break;
         default:       out_agg_type = vcol->type; break;
     }
 
@@ -2617,9 +2630,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * overwritten in the scatter loop below; whatever remains is null.
          * par_finalize_nulls (after scatter) flips HAS_NULLS if any
          * sentinel survives.  Types without a dedicated initialization arm
-         * (SYM/STR/BOOL/U8/GUID) fall back to zero-fill.  For SYM/STR/BOOL/U8
-         * that is an ordinary zero/empty value and cannot represent "no
-         * data"; GUID is also zero-filled on this path. */
+         * (SYM/BOOL/U8) fall back to zero-fill: the empty symbol is SYM's
+         * null, and BOOL/U8 vectors hold no null.  pivot sends GUID, LIST
+         * and STR values to its other route. */
         switch (new_col->type) {
             case RAY_F64: {
                 double* d = (double*)ray_data(new_col);
@@ -2631,7 +2644,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_F32;
                 break;
             }
-            case RAY_I64: case RAY_TIMESTAMP: {
+            case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: {
                 int64_t* d = (int64_t*)ray_data(new_col);
                 for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_I64;
                 break;
