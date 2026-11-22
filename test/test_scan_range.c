@@ -3112,7 +3112,17 @@ static test_result_t test_scalar_route_shapes(void) {
     PASS();
 }
 
-/* The tight F64 kernel sums by explicit lanes (row mod 8, combined in one
+/* The lane reference: lanes 2k and 2k + 1 added, then those sums the same
+ * way down to one (group.c, sc_f64_lanes_total), each sum stored. */
+static double sr_lanes_ref(const volatile double* lane) {
+    volatile double t[32];
+    for (int k = 0; k < 32; k++) t[k] = lane[k];
+    for (int w = 16; w >= 1; w /= 2)
+        for (int k = 0; k < w; k++) t[k] = t[2 * k] + t[2 * k + 1];
+    return t[0];
+}
+
+/* The tight F64 kernel sums by explicit lanes (row mod 32, combined in one
  * fixed order) on both generations: a serial run (fewer rows than the
  * parallel threshold: one task, a deterministic order) over non-integral
  * values (whose sum depends on the order: a plain row-order sum differs)
@@ -3126,12 +3136,9 @@ static test_result_t test_scalar_route_f64_bits(void) {
     sr_eval_ok("(set R (table [x] (list (* (as 'F64 (% (* i 7919) 1000003)) 0.37))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf0/\" R {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf2/\" R {compress: true})");
-    volatile double lane[8] = { 0 };
-    for (int64_t r = 0; r < n; r++) lane[r & 7] += (double)((r * 7919) % 1000003) * 0.37;
-    volatile double ab = (lane[0] + lane[1]), cd = (lane[2] + lane[3]);
-    volatile double ef = (lane[4] + lane[5]), gh = (lane[6] + lane[7]);
-    volatile double lo = ab + cd, hi = ef + gh;
-    double ref = lo + hi;
+    volatile double lane[32] = { 0 };
+    for (int64_t r = 0; r < n; r++) lane[r & 31] += (double)((r * 7919) % 1000003) * 0.37;
+    double ref = sr_lanes_ref(lane);
     static const char* const q[] = { "(select {s: (sum x) from: T})",
                                      "(select {s: (sum (+ x 0.5)) from: T})",
                                      "(select {a: (avg (+ x 0.25)) from: T})", NULL };
@@ -3157,7 +3164,8 @@ static test_result_t test_scalar_route_f64_bits(void) {
 
 /* Fix round 2: the lanes' combine order is the fixed tree, never a fold:
  * x[0] = 2^53 and x[1..7] = 1.0 (every other row 0) sum to exactly
- * 2^53 + 6 (lane 0's 2^53 + 1 rounds to 2^53, the other pairs are exact);
+ * 2^53 + 6 (lanes 0 and 1: 2^53 + 1 rounds to 2^53, the other pairs are
+ * exact);
  * a left fold gives 2^53.  Both generations, serially. */
 static test_result_t test_scalar_route_f64_combine(void) {
     const int64_t n = 60000;
@@ -3178,28 +3186,26 @@ static test_result_t test_scalar_route_f64_combine(void) {
     PASS();
 }
 
-/* Fix round 2: a piece starting at a row not a multiple of 8 realigns
+/* Fix round 2: a piece starting at a row not a multiple of 32 realigns
  * through the head loop; the cut sum equals the whole block's and the lane
  * reference, on lane-weighted data where any lane mix-up changes the bits.
  * (The engine's tasks and pieces start 1024-aligned: the hook drives the
  * staged piece function directly.) */
 static test_result_t test_scalar_route_f64_unaligned(void) {
     const int64_t n = 5000;
-    static const double m[8] = { -11, 11, -1, 1, 11, 1, -13, 1 };
+    static const double m[32] = { -11, 11, -1, 1, 11, 1, -13, 1, 7, -7, 3, -3, 13, -1, 5, -5,
+                                  -3, 3, -7, 7, 1, -11, 11, -13, 5, -5, 13, -1, -1, 1, 3, -3 };
     static double d[5000];
     static const int64_t row0s[] = { 0, 3, 1021 };
     static const int64_t cuts[] = { 5, 13, 1000, 1027, 2049, 4099 };
     for (size_t k = 0; k < sizeof row0s / sizeof row0s[0]; k++) {
         int64_t row0 = row0s[k];
-        volatile double lane[8] = { 0 };
+        volatile double lane[32] = { 0 };
         for (int64_t r = 0; r < n; r++) {
-            d[r] = 0.37 * (double)(((r + row0) * 7919) % 1000003) * m[(r + row0) & 7];
-            lane[(r + row0) & 7] += d[r];
+            d[r] = 0.37 * (double)(((r + row0) * 7919) % 1000003) * m[(r + row0) & 31];
+            lane[(r + row0) & 31] += d[r];
         }
-        volatile double ab = lane[0] + lane[1], cd = lane[2] + lane[3];
-        volatile double ef = lane[4] + lane[5], gh = lane[6] + lane[7];
-        volatile double lo = ab + cd, hi = ef + gh;
-        double ref = lo + hi, whole, cut;
+        double ref = sr_lanes_ref(lane), whole, cut;
         ray_group_test_f64_lanes(d, row0, n, cuts, (int)(sizeof cuts / sizeof cuts[0]), &whole, &cut);
         TEST_ASSERT_FMT(memcmp(&whole, &ref, sizeof ref) == 0, "row0 %lld: whole %.17g vs ref %.17g",
                         (long long)row0, whole, ref);

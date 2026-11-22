@@ -200,6 +200,93 @@ int64_t ray_group_test_minmax_staged_rows(void) {
     return atomic_load_explicit(&ray_group_minmax_staged_rows_ctr, memory_order_relaxed);
 }
 
+/* Float sums by explicit lanes: row r adds into lane r mod SC_F64_LANES,
+ * each lane in row order, and a partial is the lanes combined in one fixed
+ * order.  The answer therefore depends only on the rows a partial covers,
+ * never on how they are cut into calls: a walk over zero-copy or decoded
+ * pieces, its lanes carried across them, gives the bits of one call over
+ * the plain column.  The scalar route's tasks and the keyless reduction's
+ * chunks (reduce_lanes_add) both add this way.
+ *
+ * The release build reassociates float math (-fassociative-math), so every
+ * intermediate the order depends on is pinned with SC_F64_PIN: an empty asm
+ * that claims to read and write the value, which no compiler may move an
+ * addition across.  GCC-compatible compilers (gcc, clang, emscripten) pin
+ * on every target: in a vector register on x86 and aarch64, through memory
+ * elsewhere.  Other compilers get no pin: the guarantee there rests on the
+ * compiler not reassociating (MSVC's default /fp:precise does not).
+ *
+ * Thirty-two lanes: eight AVX vectors (sixteen SSE2 ones) of independent
+ * chains keep the adds off the add latency, so a pinned sum runs as fast as
+ * the loop the compiler vectorizes itself (1024 rows in L1: 32 ns, the same
+ * as that loop; 41 ns with sixteen lanes, 55 ns with eight). */
+#define SC_F64_LANES 32
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#define SC_F64_PIN(v) __asm__("" : "+x"(v))
+#elif defined(__GNUC__) && defined(__aarch64__)
+#define SC_F64_PIN(v) __asm__("" : "+w"(v))
+#elif defined(__GNUC__)
+#define SC_F64_PIN(v) __asm__("" : "+m"(v))
+#else
+#define SC_F64_PIN(v) ((void)0)
+#endif
+typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
+
+/* Rows [row0, row0 + n) at d into the lanes. */
+static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict d, int64_t row0, int64_t n) {
+    int64_t i = 0;
+    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++) {
+        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
+        SC_F64_PIN(v);
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
+    }
+#if defined(__GNUC__)
+    /* SC_F64_LANES / SC_V lanes per vector, lanes {0..SC_V-1} in vector 0
+     * and so on: each lane still one row-order chain (a vector add is
+     * lane-wise), so the 4-lane (AVX), 2-lane and scalar forms give the same
+     * bits.  The vectors are independent chains: their count, not the add
+     * latency, bounds the throughput. */
+#if defined(__AVX__)
+#define SC_V 4
+#else
+#define SC_V 2
+#endif
+    typedef double sc_vd __attribute__((vector_size(SC_V * 8)));
+    sc_vd v[SC_F64_LANES / SC_V];
+    for (int k = 0; k < SC_F64_LANES / SC_V; k++) {
+        memcpy(&v[k], &s->l[k * SC_V], sizeof v[k]);
+        SC_F64_PIN(v[k]);           /* the head's last adds stay folded in */
+    }
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
+        for (int k = 0; k < SC_F64_LANES / SC_V; k++) {
+            sc_vd x;
+            memcpy(&x, d + i + k * SC_V, sizeof x);
+            v[k] += x;
+            SC_F64_PIN(v[k]);
+        }
+    for (int k = 0; k < SC_F64_LANES / SC_V; k++) memcpy(&s->l[k * SC_V], &v[k], sizeof v[k]);
+#undef SC_V
+#else
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
+        for (int l = 0; l < SC_F64_LANES; l++) { double v = s->l[l] + d[i + l]; SC_F64_PIN(v); s->l[l] = v; }
+#endif
+    for (; i < n; i++) {
+        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
+        SC_F64_PIN(v);
+        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
+    }
+}
+
+/* The lanes combined pairwise: lanes 2k and 2k + 1, then those sums the
+ * same way, down to one. */
+static double sc_f64_lanes_total(const sc_f64_lanes_t* s) {
+    double t[SC_F64_LANES];
+    for (int k = 0; k < SC_F64_LANES; k++) t[k] = s->l[k];
+    for (int w = SC_F64_LANES / 2; w >= 1; w /= 2)
+        for (int k = 0; k < w; k++) { double v = t[2 * k] + t[2 * k + 1]; SC_F64_PIN(v); t[k] = v; }
+    return t[0];
+}
+
 /* ============================================================================
  * Reduction execution
  * ============================================================================ */
@@ -237,6 +324,9 @@ typedef struct {
     int64_t cnt;
     int64_t zero_count;
     bool has_first;
+    /* Float SUM / AVG: the chunk's lanes (reduce_lanes_add), combined into
+     * sum_f once the chunk is read (reduce_lanes_fold). */
+    sc_f64_lanes_t sum_l;
 } reduce_acc_t;
 
 static void reduce_acc_init(reduce_acc_t* acc) {
@@ -247,6 +337,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_hi = 0;
     acc->sum_c = 0; acc->sum_sq_c = 0; acc->shift_i = 0; acc->shift_set = false;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
+    memset(&acc->sum_l, 0, sizeof acc->sum_l);
 }
 
 /* Lexicographic SYM compare — resolves both sym_ids to strings and
@@ -682,6 +773,54 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             REDUCE_SYM_EXTREME(input, base, start, end, acc, idx, dom, 1, 1, WANT_MIN); \
     } while (0)
 
+/* Float SUM / AVG of rows [start, end) of base (of positions idx[start, end)
+ * when idx) into acc's lanes, row i at lane (key0 + i - start) mod
+ * SC_F64_LANES: key0 is the range's first row in the reduced rows, whose
+ * chunks start at multiples of RED_BLOCK, so a chunk's lanes see one
+ * sequence however the caller cuts it into calls.  The plain column
+ * (RED_BLOCK rows a call) and a walk over its generation-2 pieces (a view a
+ * call) then add the same rows in the same order under any FP flags
+ * (#1363); an accumulating loop leaves the association to the compiler,
+ * which with -fassociative-math vectorizes it per call, so the cut showed
+ * in the low bits.  A null-free F64 range adds in place; F32 widens, and a
+ * null (NaN) row becomes -0.0, the exact additive identity, in a stack
+ * block first.  cnt counts the non-null rows, AVG's divisor. */
+#define RED_LANES_BLK 256
+#define RED_LANES_FILL(T, HAS_IDX, HAS_NULLS) \
+    for (int64_t i = 0; i < n; i++) { \
+        double v_ = (double)((const T*)base)[(HAS_IDX) ? idx[b + i] : b + i]; \
+        if (HAS_NULLS) { bool ok_ = v_ == v_; tmp[i] = ok_ ? v_ : -0.0; nn += ok_; } \
+        else tmp[i] = v_; \
+    }
+static void reduce_lanes_add(reduce_acc_t* acc, int8_t type, const void* base, int64_t start, int64_t end,
+                             int64_t key0, bool has_nulls, const int64_t* idx) {
+    if (type == RAY_F64 && !has_nulls && !idx) {
+        sc_f64_lanes_add(&acc->sum_l, (const double*)base + start, key0, end - start);
+        acc->cnt += end - start;
+        return;
+    }
+    double tmp[RED_LANES_BLK];
+    for (int64_t b = start; b < end; b += RED_LANES_BLK) {
+        int64_t n = end - b < RED_LANES_BLK ? end - b : RED_LANES_BLK, nn = 0;
+        if (type == RAY_F64) {
+            if (idx) { if (has_nulls) RED_LANES_FILL(double, 1, 1) else RED_LANES_FILL(double, 1, 0) }
+            else if (has_nulls) RED_LANES_FILL(double, 0, 1)
+        } else {
+            if (idx) { if (has_nulls) RED_LANES_FILL(float, 1, 1) else RED_LANES_FILL(float, 1, 0) }
+            else { if (has_nulls) RED_LANES_FILL(float, 0, 1) else RED_LANES_FILL(float, 0, 0) }
+        }
+        sc_f64_lanes_add(&acc->sum_l, tmp, key0 + (b - start), n);
+        acc->cnt += has_nulls ? nn : n;
+    }
+}
+#undef RED_LANES_FILL
+
+/* A chunk's float SUM / AVG lanes into sum_f, after its last row. */
+static inline void reduce_lanes_fold(reduce_acc_t* acc, int8_t type, uint16_t opcode) {
+    if ((type == RAY_F64 || type == RAY_F32) && (opcode == OP_SUM || opcode == OP_AVG))
+        acc->sum_f = sc_f64_lanes_total(&acc->sum_l);
+}
+
 /* The reduction kernel over raw elements: `base` is row 0 of a column of
  * `type`.  `input` is read only by the SYM arm (cell width, domain) and by
  * the BOOL / U8 bitmap null test, which never runs: those types are
@@ -689,7 +828,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
  * a SYM column. */
 static void reduce_range_raw(int8_t type, uint8_t attrs, const void* cbase,
                              struct ray_sym_domain_s* dom, ray_t* input,
-                             int64_t start, int64_t end, reduce_acc_t* acc,
+                             int64_t start, int64_t end, int64_t key0, reduce_acc_t* acc,
                              bool has_nulls, const int64_t* idx, uint16_t opcode) {
     (void)attrs;
     void* base = (void*)cbase;      /* the loops only read */
@@ -707,8 +846,10 @@ static void reduce_range_raw(int8_t type, uint8_t attrs, const void* cbase,
         DISPATCH_I_OPCODE(int64_t, NULL_I64, base, start, end, acc,
                           has_nulls, idx, opcode); break;
     case RAY_F32:
+        if (opcode == OP_SUM || opcode == OP_AVG) { reduce_lanes_add(acc, type, base, start, end, key0, has_nulls, idx); break; }
         DISPATCH_F_OPCODE(float, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_F64:
+        if (opcode == OP_SUM || opcode == OP_AVG) { reduce_lanes_add(acc, type, base, start, end, key0, has_nulls, idx); break; }
         DISPATCH_F_OPCODE(double, base, start, end, acc, has_nulls, idx, opcode); break;
     case RAY_SYM: {
         /* Adaptive-width SYM columns — read_col_i64 produces the i64
@@ -734,7 +875,7 @@ static void reduce_range(ray_t* input, int64_t start, int64_t end,
                          const int64_t* idx, uint16_t opcode) {
     reduce_range_raw(input->type, input->attrs, ray_data(input),
                      input->type == RAY_SYM ? ray_sym_vec_domain(input) : NULL, input,
-                     start, end, acc, has_nulls, idx, opcode);
+                     start, end, start, acc, has_nulls, idx, opcode);
 }
 
 /* Keyless reductions over a pooled input run in chunks whose shape depends
@@ -782,6 +923,7 @@ static void red_chunk_run(const red_chunk_ctx_t* c, int64_t k, reduce_acc_t* out
         if (!c->idx) ray_pool_scan_at(c->n, b, hi);
         reduce_range(c->input, b, e, &acc, c->has_nulls, c->idx, c->opcode);
     }
+    reduce_lanes_fold(&acc, c->input->type, c->opcode);
     *out = acc;
 }
 
@@ -4910,6 +5052,7 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (scan_n < RAY_PARALLEL_THRESHOLD) {
         reduce_acc_init(&acc);
         reduce_range(input, 0, scan_n, &acc, has_nulls, sel_idx, op->opcode);
+        reduce_lanes_fold(&acc, in_type, op->opcode);
     } else {
         /* Fixed chunks folded in chunk order, pooled or not: the same
          * result at any worker count (see red_chunk_rows). */
@@ -4957,11 +5100,12 @@ ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input) {
  * by range: the rows fall into the chunks exec_reduction folds
  * (red_chunk_rows: their shape depends on the row count only), each chunk
  * walked piece by piece (R-WALK) into its own partial, and the partials
- * folded in chunk order.  REDUCE_LOOP_I / _F accumulate every row straight
- * into the accumulator's fields (no per-call partial), so the pieces of a
- * chunk add in the same order as one call over the chunk: float sums,
- * squares and products are the same bits as the plain loop's, at any
- * worker count (#744). */
+ * folded in chunk order.  Integer loops are exact in any order; a float
+ * SUM / AVG adds by lanes keyed on the row (reduce_lanes_add), so the pieces
+ * of a chunk add in the same order as the plain loop's blocks: the same
+ * bits under any FP flags, at any worker count (#744, #1363).  Float
+ * squares and products still accumulate in REDUCE_LOOP_F, whose
+ * association the release flags leave to the compiler per call. */
 
 typedef struct {
     ray_col_src_t*  src;
@@ -4980,7 +5124,7 @@ typedef struct { const par_reduce_src_ctx_t* c; reduce_acc_t* acc; } reduce_piec
 static void reduce_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
     reduce_piece_ctx_t* x = (reduce_piece_ctx_t*)ctx;
-    reduce_range_raw(x->c->src->type, p[0].attrs, p[0].data, NULL, NULL, 0, e - b,
+    reduce_range_raw(x->c->src->type, p[0].attrs, p[0].data, NULL, NULL, 0, e - b, b - x->c->lo,
                      x->acc, x->c->has_nulls, NULL, x->c->opcode);
 }
 
@@ -4996,6 +5140,7 @@ static void red_src_chunk_run(par_reduce_src_ctx_t* c, uint32_t wid, int64_t k) 
     reduce_piece_ctx_t x = { c, acc };
     ray_t* err = ray_col_walk(srcs, plain, 1, c->lo + start, c->lo + end, false, &x, wid, reduce_piece);
     if (err) ray_scan_fail_note(&c->fail, start, err);
+    reduce_lanes_fold(acc, c->src->type, c->opcode);
 }
 
 static void par_reduce_src_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
@@ -10122,98 +10267,10 @@ SCALAR_SUM_NARROW(scalar_sum_i16, int16_t)
 SCALAR_SUM_NARROW(scalar_sum_u8,  uint8_t)
 #undef SCALAR_SUM_NARROW
 
-/* Tight loop for single SUM/AVG on f64 (no mask), by explicit lanes: row r
- * adds into lane r mod SC_F64_LANES, each lane in row order, and the task's
- * partial is the lanes combined in one fixed order.  The answer therefore
- * depends only on the rows each task covers, never on how a task's rows are
- * cut into pieces: a staged task reads zero-copy pieces with its lanes
- * carried across them and gives generation 0's bits for the same task.
- *
- * The release build reassociates float math (-fassociative-math), so every
- * intermediate the order depends on is pinned with SC_F64_PIN: an empty asm
- * that claims to read and write the value, which no compiler may move an
- * addition across.  GCC-compatible compilers (gcc, clang, emscripten) pin
- * on every target: in a vector register on x86 and aarch64, through memory
- * elsewhere.  Other compilers get no pin: the guarantee there rests on the
- * compiler not reassociating (MSVC's default /fp:precise does not). */
-#define SC_F64_LANES 8
-#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
-#define SC_F64_PIN(v) __asm__("" : "+x"(v))
-#elif defined(__GNUC__) && defined(__aarch64__)
-#define SC_F64_PIN(v) __asm__("" : "+w"(v))
-#elif defined(__GNUC__)
-#define SC_F64_PIN(v) __asm__("" : "+m"(v))
-#else
-#define SC_F64_PIN(v) ((void)0)
-#endif
-typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
-
-/* Rows [row0, row0 + n) at d into the lanes. */
-static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict d, int64_t row0, int64_t n) {
-    int64_t i = 0;
-    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++) {
-        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
-        SC_F64_PIN(v);
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
-    }
-#if defined(__GNUC__) && defined(__AVX__)
-    /* two 4-lane vectors: lanes {0..3} {4..7}, each lane still one
-     * row-order chain (a vector add is lane-wise): the same bits as the
-     * 2-lane and scalar forms below */
-    typedef double sc_v4d __attribute__((vector_size(32)));
-    sc_v4d v0, v1;
-    memcpy(&v0, &s->l[0], 32); memcpy(&v1, &s->l[4], 32);
-    SC_F64_PIN(v0); SC_F64_PIN(v1);   /* the head's last adds stay folded in */
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
-        sc_v4d x0, x1;
-        memcpy(&x0, d + i, 32); memcpy(&x1, d + i + 4, 32);
-        v0 += x0; v1 += x1;
-        SC_F64_PIN(v0); SC_F64_PIN(v1);
-    }
-    memcpy(&s->l[0], &v0, 32); memcpy(&s->l[4], &v1, 32);
-#elif defined(__GNUC__)
-    /* four 2-lane vectors: lanes {0,1} {2,3} {4,5} {6,7}, each lane still
-     * one row-order chain (a vector add is lane-wise) */
-    typedef double sc_v2d __attribute__((vector_size(16)));
-    sc_v2d v0, v1, v2, v3;
-    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-    memcpy(&v0, &s->l[0], 16); memcpy(&v1, &s->l[2], 16);
-    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-    memcpy(&v2, &s->l[4], 16); memcpy(&v3, &s->l[6], 16);
-    SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) {
-        sc_v2d x0, x1, x2, x3;
-        // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-        memcpy(&x0, d + i, 16);     memcpy(&x1, d + i + 2, 16);
-        // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-        memcpy(&x2, d + i + 4, 16); memcpy(&x3, d + i + 6, 16);
-        v0 += x0; v1 += x1; v2 += x2; v3 += x3;
-        SC_F64_PIN(v0); SC_F64_PIN(v1); SC_F64_PIN(v2); SC_F64_PIN(v3);
-    }
-    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-    memcpy(&s->l[0], &v0, 16); memcpy(&s->l[2], &v1, 16);
-    // cppcheck-suppress bufferAccessOutOfBounds // the vector_size(16) typedef is read as a scalar double; the copy is 16 bytes into a 16-byte vector
-    memcpy(&s->l[4], &v2, 16); memcpy(&s->l[6], &v3, 16);
-#else
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
-        for (int l = 0; l < SC_F64_LANES; l++) { double v = s->l[l] + d[i + l]; SC_F64_PIN(v); s->l[l] = v; }
-#endif
-    for (; i < n; i++) {
-        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
-        SC_F64_PIN(v);
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
-    }
-}
-
-static double sc_f64_lanes_total(const sc_f64_lanes_t* s) {
-    double a = s->l[0] + s->l[1]; SC_F64_PIN(a);
-    double b = s->l[2] + s->l[3]; SC_F64_PIN(b);
-    double c = s->l[4] + s->l[5]; SC_F64_PIN(c);
-    double d = s->l[6] + s->l[7]; SC_F64_PIN(d);
-    double ab = a + b; SC_F64_PIN(ab);
-    double cd = c + d; SC_F64_PIN(cd);
-    return ab + cd;
-}
+/* The scalar route's single SUM / AVG of f64 (no mask) adds by the explicit
+ * lanes above (sc_f64_lanes_add): its task's partial is the lanes combined in
+ * one fixed order, so a staged task reading zero-copy pieces, its lanes
+ * carried across them, gives generation 0's bits for the same task. */
 
 static void scalar_f64_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
