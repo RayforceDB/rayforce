@@ -1,0 +1,21 @@
+;; @requires: posix
+;; union-all concatenated the columns of two parted tables.  A parted column has
+;; one segment per partition and no elements of its own, so the "column" it built
+;; had no segments and the process crashed when the table was freed.  The error
+;; names the column's type too: ray_type_name had no name for a parted column
+;; or for the virtual partition key, and printed "?" (concat of a parted table
+;; with itself said "cannot concatenate ? and ?").
+
+(.sys.exec "rm -rf /tmp/rfl_parted_concat")
+(set Tp (table [a b] (list [1 2 3] [1.0 2.0 3.0])))
+(.db.splayed.set "/tmp/rfl_parted_concat/2024.01.01/t/" Tp)
+(.db.splayed.set "/tmp/rfl_parted_concat/2024.01.02/t/" Tp)
+(set PT (.db.parted.get "/tmp/rfl_parted_concat/" 't))
+
+(count PT) -- 6
+(at (try (union-all PT PT) (fn [e] e)) 'code) -- 'type
+(first (split (at (try (union-all PT PT) (fn [e] e)) 'msg) "; usage:")) -- "concat: MAPCOMMON is a parted column and cannot be concatenated; read the table into memory first"
+
+;; the same operations on the table read into memory still work
+(count (union-all Tp Tp)) -- 6
+(.sys.exec "rm -rf /tmp/rfl_parted_concat")

@@ -31,6 +31,7 @@
 #include "vec/embedding.h"
 #include "vec/str.h"
 #include "ops/idxop.h"
+#include "ops/ops.h"   /* RAY_IS_PARTED */
 #include "lang/format.h"  /* ray_type_name */
 #include <string.h>
 #include <stdlib.h>
@@ -533,6 +534,12 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
     if (!b || RAY_IS_ERR(b)) return b;
     if (a->type != b->type)
         return ray_error("type", "concat: operands must have matching type, got %s and %s", ray_type_name(a->type), ray_type_name(b->type));
+    /* A parted column holds one segment per partition, not elements: it has no
+     * element storage to copy.  Concatenating two of them built a column of that
+     * type with no segments, which crashed when the table was freed. */
+    if (RAY_IS_PARTED(a->type) || a->type == RAY_MAPCOMMON)
+        return ray_error("type", "concat: %s is a parted column and cannot be concatenated; read the table into memory first",
+                         ray_type_name(a->type));
 
     if (a->type == RAY_STR) {
         int64_t total_len = a->len + b->len;
