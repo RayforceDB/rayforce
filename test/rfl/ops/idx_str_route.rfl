@@ -149,8 +149,8 @@
 (set K (at ln 2999))
 (at (select {from: LN where: (== id K) seq: seq}) 'seq) -- [2999]
 (at (.idx.uses LN) 'id) -- 1
-(set KX (concat K "x"))
-(count (at (select {from: LN where: (== id KX) seq: seq}) 'seq)) -- 0
+(set KMISS (concat K "x"))
+(count (at (select {from: LN where: (== id KMISS) seq: seq}) 'seq)) -- 0
 (at (.idx.uses LN) 'id) -- 1
 (.db.splayed.set "/tmp/rfl_idx_str_route/p/1/t/" (take BH 1000))
 (.db.splayed.set "/tmp/rfl_idx_str_route/p/2/t/" (take BH -1000))
