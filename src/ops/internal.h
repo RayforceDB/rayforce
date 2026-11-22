@@ -80,7 +80,11 @@ static inline ray_t* ray_group_sym_read(const ray_group_sym_view_t* view, struct
 }
 /* ray_key_hash (collection.c) reading runtime symbols from `view`; sets
  * *seen (when given) if x holds a TIMESPAN. */
-uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen);
+/* ray_key_hash_view's `inexact` bits: an I64 atom past ±2^53, a float atom.
+ * Both among the keys make atom_eq non-transitive (#1330). */
+#define RAY_KEY_BIG_I64 1
+#define RAY_KEY_FLOAT   2
+uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact);
 
 
 #include <stdio.h>

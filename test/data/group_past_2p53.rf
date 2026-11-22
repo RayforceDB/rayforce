@@ -1,0 +1,38 @@
+;; Child of rfl/group/list_cells_past_2p53.rfl, run with -c 8 so the parallel
+;; directory is reachable.  Prints one line: "ok", or the first failure.
+(set want [1 60000 29999])
+(set bad (list))
+(set chk (fn [name got exp] (if (== (format "%" got) (format "%" exp)) 0 (set bad (concat bad (list name))))))
+(set same8 (fn [name f exp] (do (set j 0) (while (< j 8) (do (chk name (f) exp) (set j (+ j 1)))))))
+(set cyc (fn [vals] (at vals (% (til 89999) 3))))
+;; a LIST of atoms: 2^53+1 starts a group, 2^53.0 joins it, 2^53 starts the next
+(set C (concat (list [7 7]) (cyc (list 9007199254740993 9007199254740992.0 9007199254740992))))
+(set T (table [c r] (list C (til 90000))))
+(same8 "group" (fn [] (map count (value (group C)))) want)
+(same8 "by:c" (fn [] (at (select {from: T by: c n: (count r)}) 'n)) want)
+;; the negative side
+(set N (concat (list [7 7]) (cyc (list -9007199254740993 -9007199254740992.0 -9007199254740992))))
+(same8 "negative" (fn [] (map count (value (group N)))) want)
+;; nested in a list, and inside dict and table cells
+(set L (concat (list [7 7]) (map (fn [x] (list x)) (cyc (list 9007199254740993 9007199254740992.0 9007199254740992)))))
+(same8 "nested" (fn [] (map count (value (group L)))) want)
+(set D (concat (list [7 7]) (map (fn [x] (dict [a b] (list x 'x))) (cyc (list 9007199254740993 9007199254740992.0 9007199254740992)))))
+(same8 "dict" (fn [] (map count (value (group D)))) want)
+(set B (concat (list [7 7]) (map (fn [x] (table [a] (list (list (list x 'x))))) (cyc (list 9007199254740993 9007199254740992.0 9007199254740992)))))
+(same8 "table" (fn [] (map count (value (group B)))) want)
+;; ±2^53 itself converts exactly: 2^53 = 2^53.0, a single group
+(set E (concat (list [7 7]) (cyc (list 9007199254740992 9007199254740992.0 9007199254740992))))
+(same8 "boundary" (fn [] (map count (value (group E)))) [1 89999])
+;; large integers with no float compare exactly: grouped as values, and
+;; they keep the parallel route (the time bound catches a serial fall back
+;; only loosely; the answer is the point)
+(set G (concat (list [7 7]) (cyc (list 9007199254740993 9007199254740992 9007199254740993))))
+(same8 "no float" (fn [] (map count (value (group G)))) [1 59999 30000])
+;; one large integer among distinct floats stays linear (the declined route
+;; must not hash every float alike): 40k rows well under a second
+(set F (concat (list [7 7] 9007199254740993) (as 'LIST (/ (til 40000) 40000.0))))
+(set U (table [g c r] (list (% (til 40002) 2) F (til 40002))))
+(chk "by:c count" (count (select {from: U by: c n: (count r)})) 40002)
+(chk "by:c time" (< (timeit (select {from: U by: c n: (count r)})) 1000.0) true)
+(chk "count distinct time" (< (timeit (select {from: U by: g n: (count (distinct c))})) 1000.0) true)
+(println (if (== (count bad) 0) "ok" (first bad)))
