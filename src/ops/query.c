@@ -4547,7 +4547,7 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_e
     return 1;
 }
 
-static int is_single_group_key_projection(ray_t* by_expr, ray_t* val_expr) {
+static int is_single_group_key_projection(ray_t* by_expr, int64_t output_id, ray_t* val_expr) {
     int64_t key_id = -1;
     if (by_expr && by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED)) {
         key_id = by_expr->i64;
@@ -4555,7 +4555,7 @@ static int is_single_group_key_projection(ray_t* by_expr, ray_t* val_expr) {
         key_id = ((int64_t*)ray_data(by_expr))[0];
     }
 
-    return key_id >= 0 &&
+    return key_id >= 0 && output_id == key_id &&
            val_expr &&
            val_expr->type == -RAY_SYM &&
            !(val_expr->attrs & ATTR_QUOTED) &&
@@ -17847,7 +17847,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         if (kid == kname) kname = ray_sym_intern("key", 3);
         ray_t* v = ((ray_t**)ray_data(vals))[i];
         /* the routing's own test for an output the DAG group cannot serve */
-        if (is_single_group_key_projection(by_expr, v)) continue;
+        if (is_single_group_key_projection(by_expr, kid, v)) continue;
         if (is_group_dag_agg_expr(v, tbl)) continue;
         if (is_decomposable_agg_compound(v, tbl)) continue;
         needs_eval = true;
@@ -18546,7 +18546,8 @@ static bool select_grouped_running_needed(ray_t* dict, ray_t* tbl, ray_t* by_exp
     bool all_dag = by_expr && !(by_expr->attrs & ATTR_QUOTED) &&
                    (by_expr->type == -RAY_SYM || by_expr->type == RAY_SYM);
     for (int64_t i = 0; i < nd; i++) {
-        if (select_clause_key(rid, sym_cell_runtime_id(keys, i)) || !vs[i]) continue;
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (select_clause_key(rid, kid) || !vs[i]) continue;
         ray_t* v = vs[i];
         if (v->type == RAY_LIST && query_may_run(v, tbl, 0)) {
             ray_t* x = query_inline_helpers(v, tbl);
@@ -18563,7 +18564,7 @@ static bool select_grouped_running_needed(ray_t* dict, ray_t* tbl, ray_t* by_exp
             if (!dag) return true;
             if (run) { any_run = true; continue; }
         }
-        if (all_dag && !is_single_group_key_projection(by_expr, v) &&
+        if (all_dag && !is_single_group_key_projection(by_expr, kid, v) &&
             !is_group_dag_agg_expr(v, tbl) && !is_decomposable_agg_compound(v, tbl) &&
             !can_atom_broadcast(v) && !match_count_distinct(v))
             all_dag = false;
@@ -21822,7 +21823,7 @@ by_dict_done:
         if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
             kid == asc_id || kid == desc_id || kid == nearest_id) continue;
         ray_t* ov = dict_elems[i + 1];
-        by_key_carry = !is_single_group_key_projection(by_expr, ov) &&
+        by_key_carry = !is_single_group_key_projection(by_expr, kid, ov) &&
                         !is_group_dag_agg_expr(ov, tbl) && !is_decomposable_agg_compound(ov, tbl);
     }
     /* A where: comparing the name of a column the key's local hides reads
@@ -22448,7 +22449,7 @@ by_dict_done:
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id) continue;
-                if (is_single_group_key_projection(by_expr, dict_elems[i + 1]))
+                if (is_single_group_key_projection(by_expr, kid, dict_elems[i + 1]))
                     continue;
                 if (is_group_dag_agg_expr(dict_elems[i + 1], tbl)) continue;
                 /* Arithmetic over aggregates is served by hidden agg slots
@@ -24224,7 +24225,7 @@ by_dict_done:
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id) continue;
                 ray_t* expr = dict_elems[i + 1];
-                if (is_single_group_key_projection(by_expr, expr))
+                if (is_single_group_key_projection(by_expr, kid, expr))
                     continue;
                 if (grouped_output_nested_agg(expr, false)) {
                     ray_t* nm = ray_sym_str(kid);
@@ -24672,7 +24673,7 @@ by_dict_done:
                 }
                 n_aggs++;
             } else {
-                if (is_single_group_key_projection(by_expr, val_expr))
+                if (is_single_group_key_projection(by_expr, kid, val_expr))
                     continue;
                 /* Arith-of-aggs: decomposed by the classification pass
                  * above (hidden DAG agg slots + one post-group wrapper
