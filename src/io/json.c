@@ -1105,9 +1105,16 @@ static bool jw_i64(jw_t* w, int64_t v) {
     return jw_put(w, b, (size_t)k);
 }
 
-/* snprintf writes the locale's decimal point; JSON's is '.'.  Rewrite it
- * in place (k bytes in b), whatever the host set LC_NUMERIC to. */
-static int jw_c_locale(char* b, int k) {
+/* `d` printed with `fmt` ("%.*g" or "%.*f") at `prec` into b[0..cap):
+ * the length written, b NUL-terminated on every path (an encoding error
+ * leaves it empty, a long result is cut at cap - 1).  snprintf writes the
+ * locale's decimal point; JSON's is '.', so it is rewritten in place,
+ * whatever the host set LC_NUMERIC to. */
+static int jw_fmt_c(char* b, size_t cap, const char* fmt, int prec, double d) {
+    int k = snprintf(b, cap, fmt, prec, d);
+    if (k < 0) k = 0;
+    if ((size_t)k >= cap) k = (int)cap - 1;
+    b[k] = '\0';
     const struct lconv* lc = localeconv();
     const char* dp = lc && lc->decimal_point ? lc->decimal_point : ".";
     size_t dl = strlen(dp);
@@ -1119,20 +1126,24 @@ static int jw_c_locale(char* b, int k) {
     return k - (int)(dl - 1);
 }
 
+/* Does b[0..k) read back as `d` (as an F32 when `f32`)? */
+static bool jw_reads_back(const char* b, int k, double d, bool f32) {
+    double back = 0.0;
+    return k > 0 && ray_parse_f64(b, (size_t)k, &back) == (size_t)k &&
+           (f32 ? (float)back == (float)d : back == d);
+}
+
 /* The shortest decimal that reads back as `d` (as an F32 when `f32`),
  * with a '.' or an exponent so that it reads back as a float. */
 static bool jw_float(jw_t* w, double d, bool f32) {
     if (d != d) return JW_LIT(w, "null");
     if (!isfinite(d)) { w->err = ray_error("domain", ".json.format: a float is not finite"); return false; }
+    const int max_prec = f32 ? 9 : 17;
     char b[48];
-    int k = 0;
     int prec = 1;
-    for (; prec <= (f32 ? 9 : 17); prec++) {
-        k = jw_c_locale(b, snprintf(b, sizeof b, "%.*g", prec, d));
-        double back = 0.0;
-        if (ray_parse_f64(b, (size_t)k, &back) == (size_t)k &&
-            (f32 ? (float)back == (float)d : back == d)) break;
-    }
+    int k = jw_fmt_c(b, sizeof b, "%.*g", prec, d);
+    while (prec < max_prec && !jw_reads_back(b, k, d, f32))
+        k = jw_fmt_c(b, sizeof b, "%.*g", ++prec, d);
     /* %g writes 100 as 1e+02 once the digits run out: an integral or
      * moderate value is written positionally, as long as it reads back */
     double ad = d < 0 ? -d : d;
@@ -1140,10 +1151,8 @@ static bool jw_float(jw_t* w, double d, bool f32) {
         int e10 = (int)floor(log10(ad));
         int dec = prec - 1 - e10 > 0 ? prec - 1 - e10 : 0;
         char c[48];
-        int kc = jw_c_locale(c, snprintf(c, sizeof c, "%.*f", dec, d));
-        double back = 0.0;
-        if (kc > 0 && kc < (int)sizeof c && ray_parse_f64(c, (size_t)kc, &back) == (size_t)kc &&
-            (f32 ? (float)back == (float)d : back == d)) { memcpy(b, c, (size_t)kc + 1); k = kc; }
+        int kc = jw_fmt_c(c, sizeof c, "%.*f", dec, d);
+        if (jw_reads_back(c, kc, d, f32)) { memcpy(b, c, (size_t)kc + 1); k = kc; }
     }
     bool marked = false;
     for (int i = 0; i < k; i++) if (b[i] == '.' || b[i] == 'e' || b[i] == 'E') marked = true;
