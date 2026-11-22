@@ -229,9 +229,17 @@ static ray_t* equality_column(ray_t* table, int64_t c) {
     return ray_table_col_value(table, ray_table_col_name(table, c));
 }
 
+/* eq_key_spans bits: a TIMESPAN atom anywhere switches atoms to duration
+ * normalization.  Any TIMESPAN, atom or vector, sends atom_eq's pairs with
+ * a vector cell through ray_timespan_binary instead of a byte compare, so
+ * then every vector cell keeps one bucket. */
+#define EQ_SPAN_ATOM 1
+#define EQ_SPAN_VEC  2
+
 /* LIST keys include xkey's composite rows. Hash recursively with the same
  * numeric coercion as atom_eq; uncommon container keys share a safe bucket. */
-static uint64_t eq_key_hash(ray_t* x, bool durations) {
+static uint64_t eq_key_hash(ray_t* x, int spans) {
+    bool durations = spans & EQ_SPAN_ATOM;
     if (RAY_ATOM_IS_NULL(x)) return 0;
     if (is_numeric(x)) return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
     if (x->type == -RAY_SYM) return ray_hash_i64(x->i64);
@@ -247,27 +255,38 @@ static uint64_t eq_key_hash(ray_t* x, bool durations) {
         uint64_t h = ray_hash_i64(x->len);
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len; i++)
-            h = ray_hash_i64((int64_t)(h ^ eq_key_hash(cells[i], durations)));
+            h = ray_hash_i64((int64_t)(h ^ eq_key_hash(cells[i], spans)));
         return h;
+    }
+    /* atom_eq's vector arm: same type and length, then memcmp of
+     * len * ray_elem_size bytes, so type tags, null sentinels, NaN bits,
+     * raw SYM ids and STR descriptors all compare raw.  Hash those bytes;
+     * a narrow SYM vector hashes the width it stores. */
+    if (x->type > RAY_LIST && x->type <= RAY_STR && !spans) {
+        size_t esz = x->type == RAY_SYM ? RAY_SYM_ELEM(x->attrs) : ray_elem_size(x->type);
+        return ray_hash_combine(ray_hash_i64(((int64_t)x->type << 32) ^ x->len),
+                                ray_hash_bytes(ray_data(x), (size_t)x->len * esz));
     }
     return 0;
 }
 
 /* Duration equality rounds numeric operands and converts TIME to ns.
  * Detect it before hashing so both key sets use that normalization. */
-static bool eq_key_has_span(ray_t* x) {
-    if (x->type == -RAY_TIMESPAN) return true;
+static int eq_key_spans(ray_t* x) {
+    if (x->type == -RAY_TIMESPAN) return EQ_SPAN_ATOM;
+    if (x->type > 0 && ray_has_timespan(x)) return EQ_SPAN_VEC;
+    int spans = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len; i++)
-            if (eq_key_has_span(cells[i])) return true;
+        for (int64_t i = 0; i < x->len && spans != (EQ_SPAN_ATOM | EQ_SPAN_VEC); i++)
+            spans |= eq_key_spans(cells[i]);
     }
-    return false;
+    return spans;
 }
 
 static ray_t* eq_key_find(ray_t* keys, ray_t* probes) {
     if (keys->type != RAY_LIST) return ray_find_fn(keys, probes);
-    bool durations = eq_key_has_span(keys) || eq_key_has_span(probes);
+    int spans = eq_key_spans(keys) | eq_key_spans(probes);
     int64_t cap = 8;
     while (cap / 2 < keys->len) {
         if (cap > INT64_MAX / 2) return ray_error("oom", NULL);
@@ -279,7 +298,7 @@ static ray_t* eq_key_find(ray_t* keys, ray_t* probes) {
     for (int64_t i = 0; i < cap; i++) index[i] = -1;
     ray_t** data = ray_data(keys);
     for (int64_t i = 0; i < keys->len; i++) {
-        uint64_t at = eq_key_hash(data[i], durations) & (cap - 1);
+        uint64_t at = eq_key_hash(data[i], spans) & (cap - 1);
         while (index[at] >= 0 && !atom_eq(data[index[at]], data[i]))
             at = (at + 1) & (cap - 1);
         if (index[at] < 0) index[at] = i;
@@ -290,7 +309,7 @@ static ray_t* eq_key_find(ray_t* keys, ray_t* probes) {
     int64_t* result = ray_data(out);
     ray_t** needle = ray_data(probes);
     for (int64_t i = 0; i < probes->len; i++) {
-        uint64_t at = eq_key_hash(needle[i], durations) & (cap - 1);
+        uint64_t at = eq_key_hash(needle[i], spans) & (cap - 1);
         while (index[at] >= 0 && !atom_eq(data[index[at]], needle[i]))
             at = (at + 1) & (cap - 1);
         result[i] = index[at] < 0 ? NULL_I64 : index[at];
