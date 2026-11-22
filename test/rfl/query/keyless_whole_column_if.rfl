@@ -1,0 +1,87 @@
+;; @also-unfused
+;; @requires: posix  (parted and splayed fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; An `if` under a whole-column verb in a keyless select chooses per row
+;; (issue #1305).
+;;
+;; Inside a query `if` is evaluated row by row (docs: control flow).  The
+;; keyless `(count (distinct (if ...)))`, and `distinct` / `asc` of an `if`,
+;; evaluated their argument over the whole column with the evaluator's `if`,
+;; which tests the condition vector whole: it is not empty, so every row took
+;; the `then` arm.  The argument now chooses per row through the same blend
+;; the grouped paths use (#1297, #1300), so the answer is the one computed
+;; from the materialized column: the `if` written to a column with `update`,
+;; then the same select over that column.
+
+;; ── the issue's case ────────────────────────────────────────────────────────
+(set T (table ['g 'c 'd 'i] (list (take ['a 'b] 20) (% (til 20) 10) (+ 2024.01.01 (til 20)) (til 20))))
+(set E (update {from: T e1: (if (> c 4) d (+ d 1)) e2: (if (> c 4) i 0)}))
+(at (select {from: T s: (count (distinct (if (> c 4) d (+ d 1))))}) 's)   -- [18]
+(at (select {from: E s: (count (distinct e1))}) 's)                       -- [18]
+(at (select {from: T s: (count (distinct (if (> c 4) i 0)))}) 's)         -- [11]
+(at (select {from: E s: (count (distinct e2))}) 's)                       -- [11]
+
+;; ── the fixture: temporal arms, integers of three widths with nulls ─────────
+(set mkF (fn [n] (let r (til n)) (let X (table ['g 'c 'd 't 'p 'i 'j 'b 'x] (list (take ['a 'b 'c] n) (% (* 7 r) 10) (+ 2024.01.01 (% r 50)) (+ 10:00:00.000 (% r 50)) (+ 2024.01.01D10:00:00.000000000 (% r 50)) r (as 'I32 r) (as 'I16 (% r 30)) (* 1.5 r)))) (update {from: X i: (if (== 0 (% i 7)) 0N i) j: (if (== 0 (% j 5)) 0Ni j)})))
+(set F (mkF 3000))
+;; the materialized columns: the same `if`, written by `update`
+(set mkO (fn [F] (update {from: F m1: (if (> c 4) d (+ d 1)) m2: (if (> c 4) t (+ t 1)) m3: (if (> c 4) p (+ p 1)) m4: (if (> c 4) j i) m5: (if (> c 4) b j) m6: (if i d (+ d 1)) m7: (if (> c 6) (+ d 1) (> c 2) d (+ d 5)) m8: (if (> c 4) (+ d 1) 0Nd) m9: (if (> c 4) i 0) m10: (if (> i 50) x (* x 2.0))})))
+(set O (mkO F))
+(set K (fn [t] (at t 'q)))
+
+;; ── count (distinct ...): DATE, TIME, TIMESTAMP, mixed widths, nulls ────────
+(K (select {from: F q: (count (distinct (if (> c 4) d (+ d 1))))})) -- (K (select {from: O q: (count (distinct m1))}))
+(K (select {from: F q: (count (distinct (if (> c 4) t (+ t 1))))})) -- (K (select {from: O q: (count (distinct m2))}))
+(K (select {from: F q: (count (distinct (if (> c 4) p (+ p 1))))})) -- (K (select {from: O q: (count (distinct m3))}))
+(K (select {from: F q: (count (distinct (if (> c 4) j i)))})) -- (K (select {from: O q: (count (distinct m4))}))
+(K (select {from: F q: (count (distinct (if (> c 4) b j)))})) -- (K (select {from: O q: (count (distinct m5))}))
+(K (select {from: F q: (count (distinct (if i d (+ d 1))))})) -- (K (select {from: O q: (count (distinct m6))}))
+(K (select {from: F q: (count (distinct (if (> c 6) (+ d 1) (> c 2) d (+ d 5))))})) -- (K (select {from: O q: (count (distinct m7))}))
+(K (select {from: F q: (count (distinct (if (> c 4) (+ d 1) 0Nd)))})) -- (K (select {from: O q: (count (distinct m8))}))
+(K (select {from: F q: (count (distinct (if (> c 4) i 0)))})) -- (K (select {from: O q: (count (distinct m9))}))
+(K (select {from: F q: (count (distinct (if (> i 50) x (* x 2.0))))})) -- (K (select {from: O q: (count (distinct m10))}))
+;; with where:
+(K (select {from: F where: (> c 1) q: (count (distinct (if (> c 4) d (+ d 1))))})) -- (K (select {from: O where: (> c 1) q: (count (distinct m1))}))
+(K (select {from: F where: (> c 1) q: (count (distinct (if (> c 4) j i)))})) -- (K (select {from: O where: (> c 1) q: (count (distinct m4))}))
+(K (select {from: F where: (> c 1) q: (count (distinct (if (> c 4) i 0)))})) -- (K (select {from: O where: (> c 1) q: (count (distinct m9))}))
+;; beside another output
+(K (select {from: F q: (count (distinct (if (> c 4) d (+ d 1)))) n: (count c)})) -- (K (select {from: O q: (count (distinct m1)) n: (count c)}))
+
+;; ── distinct / asc of an `if`: whole-column verbs over its per-row value ────
+(K (select {from: F q: (distinct (if (> c 4) d (+ d 1)))})) -- (K (select {from: O q: (distinct m1)}))
+(K (select {from: F q: (asc (if (> c 4) d (+ d 1)))})) -- (K (select {from: O q: (asc m1)}))
+(K (select {from: F q: (desc (if (> c 4) j i))})) -- (K (select {from: O q: (desc m4)}))
+(K (select {from: F where: (> c 1) q: (distinct (if (> c 4) t (+ t 1)))})) -- (K (select {from: O where: (> c 1) q: (distinct m2)}))
+
+;; ── an arm no row selects is not evaluated ─────────────────────────────────
+(K (select {from: F q: (count (distinct (if (> c -1) d (+ d "x"))))})) -- (K (select {from: F q: (count (distinct d))}))
+(K (select {from: F q: (count (distinct (if (> c 100) (+ d "x") (+ d 1))))})) -- (K (select {from: O q: (count (distinct (+ d 1)))}))
+;; an arm some row selects still raises
+(select {from: F q: (count (distinct (if (> c 4) d (+ d "x"))))}) !- type
+
+;; ── the DAG shapes and the plain column are unchanged ──────────────────────
+(K (select {from: F q: (count (distinct d))})) -- [50]
+(K (select {from: F q: (count (distinct (+ c 1)))})) -- [10]
+
+;; ── splayed ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_keyless_wc_if/") -- 0
+(.db.splayed.set "/tmp/rfl_keyless_wc_if/s/t/" O)
+(set S (.db.splayed.get "/tmp/rfl_keyless_wc_if/s/t/"))
+(K (select {from: S q: (count (distinct (if (> c 4) d (+ d 1))))})) -- (K (select {from: O q: (count (distinct m1))}))
+(K (select {from: S q: (count (distinct (if (> c 4) j i)))})) -- (K (select {from: O q: (count (distinct m4))}))
+(K (select {from: S where: (> c 1) q: (count (distinct (if (> c 4) p (+ p 1))))})) -- (K (select {from: O where: (> c 1) q: (count (distinct m3))}))
+(K (select {from: S q: (distinct (if (> c 4) d (+ d 1)))})) -- (K (select {from: O q: (distinct m1)}))
+
+;; ── parted: a data column and the partition key ─────────────────────────────
+(set mkP (fn [o] (select {from: O where: (== (% (til (count O)) 2) o)})))
+(.db.splayed.set "/tmp/rfl_keyless_wc_if/p/2024.01.01/t/" (mkP 0) "/tmp/rfl_keyless_wc_if/p/.sym")
+(.db.splayed.set "/tmp/rfl_keyless_wc_if/p/2024.01.02/t/" (mkP 1) "/tmp/rfl_keyless_wc_if/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_keyless_wc_if/p/" 't))
+(K (select {from: P q: (count (distinct (if (> c 4) d (+ d 1))))})) -- (K (select {from: P q: (count (distinct m1))}))
+(K (select {from: P q: (count (distinct (if (> c 4) j i)))})) -- (K (select {from: P q: (count (distinct m4))}))
+(K (select {from: P where: (> c 1) q: (count (distinct (if (> c 4) d (+ d 1))))})) -- (K (select {from: P where: (> c 1) q: (count (distinct m1))}))
+(K (select {from: P q: (count (distinct (if (> c 4) (+ d 1) 0Nd)))})) -- (K (select {from: P q: (count (distinct m8))}))
+(K (select {from: P q: (count (distinct (if (> c 4) date (+ date 1))))})) -- (K (select {from: (update {from: P dd: (if (> c 4) date (+ date 1))}) q: (count (distinct dd))}))
+;; the mapped tables go first, so the unfused pass can write the fixture again
+(set P 0)
+(set S 0)
+(.sys.exec "rm -rf /tmp/rfl_keyless_wc_if/") -- 0
