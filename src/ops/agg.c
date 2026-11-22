@@ -307,8 +307,7 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
             }
         }
     }
-    if (!found) return base == RAY_TIMESPAN
-        ? ray_timespan(want_max ? -INT64_MAX : INT64_MAX) : ray_typed_null(-base);
+    if (!found) return ray_typed_null(-base);
     if (base == RAY_F64) return make_f64(best_f);
     if (base == RAY_F32) return ray_f32((float)best_f);
     return agg_atom_i64_for_type(base, best_i);
@@ -673,7 +672,7 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
         }
         int64_t m = mx ? z.max_i : z.min_i;
         if (t == RAY_TIMESPAN)
-            return ray_timespan(z.nonnull ? m : (mx ? -INT64_MAX : INT64_MAX));
+            return z.nonnull ? ray_timespan(m) : ray_typed_null(-RAY_TIMESPAN);
         /* all-null by the non-null counts when the directory has sums */
         if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
         switch (t) {
@@ -1062,9 +1061,10 @@ ray_t* ray_min_fn(ray_t* x) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = INT64_MAX;
+            bool found = false;
             for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && d[i] < best) best = d[i];
-            return ray_timespan(best);
+                if (d[i] != NULL_I64 && (!found || d[i] < best)) { best = d[i]; found = true; }
+            return found ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
         }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
          * Only valid when the index was built for the column's current len
@@ -1136,9 +1136,10 @@ ray_t* ray_max_fn(ray_t* x) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
             int64_t best = -INT64_MAX;
+            bool found = false;
             for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && d[i] > best) best = d[i];
-            return ray_timespan(best);
+                if (d[i] != NULL_I64 && (!found || d[i] > best)) { best = d[i]; found = true; }
+            return found ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
         }
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);

@@ -34,6 +34,6 @@
 (set X (.db.splayed.get "/tmp/rfl_timespan_extrema"))
 (min (at X 's)) -- 0Wn
 (max (at X 's)) -- 0Wn
-(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'lo) -- [0Wn 0Wn]
-(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'hi) -- [0Wn -0Wn]
+(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'lo) -- [0Wn 0Nn]
+(at (select {from:X by:k lo:(min s) hi:(max s) asc:k}) 'hi) -- [0Wn 0Nn]
 (.sys.exec "rm -rf /tmp/rfl_timespan_extrema") -- 0
