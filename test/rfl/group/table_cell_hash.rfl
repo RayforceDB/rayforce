@@ -1,0 +1,27 @@
+;; #1334: typed columns of equal shape used to hash alike regardless of value.
+(set cells (map (fn [x] (table [a] (list (enlist x)))) (til 2000)))
+(set keys (at cells (% (til 60000) 2000)))
+;; Generous bound for a linear scan of 60k cells, including debug builds.
+(< (timeit (group keys)) 1000.0) -- true
+(count (distinct keys)) -- 2000
+(count (value (group keys))) -- 2000
+(all (== (map count (value (group keys))) 30)) -- true
+
+;; Independently built cells with equal columns still group together;
+;; names and column order distinguish cells, and LIST columns recurse.
+(set a (table [a b] (list [1 2] (list (list 1) (list 2)))))
+(set b (table [a b] (list [1 2] (list (list 1.0) (list 2.0)))))
+(set c (table [b a] (list (list (list 1) (list 2)) [1 2])))
+(count (distinct (list a b c))) -- 2
+(map count (value (group (list a b c)))) -- [2 1]
+
+;; With a nested TIMESPAN the conservative hash still lets equal columns
+;; of different types meet.  The first cell is the group representative.
+(set mk (fn [v] (list (table [a] (list v)))))
+(set ts (mk (as 'TIMESPAN [1 2])))
+(set i (mk [1 2]))
+(set j (mk [1i 2i]))
+(count (distinct (list ts i j))) -- 1
+(map count (value (group (list ts i j)))) -- [3]
+(count (distinct (list i ts j))) -- 2
+(map count (value (group (list i ts j)))) -- [2 1]
