@@ -24,6 +24,10 @@
 (Z (select {from: P by: {gg: g} s: (avg (+ d 1)) n: (sum i)})) -- (Z (select {from: T by: {gg: g} s: (avg (+ d 1)) n: (sum i)}))
 (at (xasc (select {from: P by: {gg: g} s: (avg (+ d 1)) n: (sum i)}) 'gg) 'n) -- [90 100]
 
+;; an argument the DAG does not compile at all, with and without where:
+(Z (select {from: P by: {gg: g} s: (sum (in i (list 1 2 13)))})) -- (Z (select {from: T by: {gg: g} s: (sum (in i (list 1 2 13)))}))
+(Z (select {from: P by: {gg: g} where: (> i 3) s: (sum (in i (list 1 2 13)))})) -- (Z (select {from: T by: {gg: g} where: (> i 3) s: (sum (in i (list 1 2 13)))}))
+
 ;; the shapes that already streamed keep their answers
 (Z (select {from: P by: {gg: g} s: (sum (+ i 1))})) -- [100 110]
 (Z (select {from: P by: {gg: g} s: (avg d)})) -- (Z (select {from: T by: {gg: g} s: (avg d)}))
