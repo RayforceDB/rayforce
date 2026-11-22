@@ -1,0 +1,15 @@
+;; Only the carry into row 98304 (a morsel boundary) makes the 2
+;; generate a product sentinel. The skipped input repeats that product.
+(set a (raze (list [4611686018427387904] (take [1] 98303) [2 0Nl 2] (take [1] 1693))))
+(set b (raze (list [9223372036854775807] (take [0] 98303) [1 0Nl 1] (take [0] 1693))))
+(set T (table [a b] (list a b)))
+(set R (select {from: T p: (prds a) s: (sums b)}))
+(sum (nil? (at R 'p))) -- 2
+(sum (nil? (at R 's))) -- 2
+(at (at R 'p) 98306) -- 0
+(at (at R 's) 98306) -- -9223372036854775807
+
+;; Nonzero-offset I64 slice: skip parent nulls and exclude both neighbors.
+(set z (key (take (dict [99 2 0Nl 3 4 88] (til 6)) [1 4])))
+(sums z) -- [2 2 5 9]
+(prds z) -- [2 2 6 24]
