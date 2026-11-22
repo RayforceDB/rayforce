@@ -834,6 +834,7 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     return ray_table_col_meta(tbl, sym, &m);
 }
+static bool agg_arg_is_list_col(ray_t* arg, ray_t* tbl);   /* defined below */
 
 /* Column `sym` of `tbl` when it is a plain (generation-0 or in-memory)
  * vector, NULL for an encoded one or none: the page-level read-ahead and
@@ -2752,6 +2753,8 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
                 int8_t arg_t = dag_operand_type(g, arg);   /* the partition key's values */
                 if (arg_t > 0 && !agg_type_admitted(agg_op, arg_t))
                     return NULL;
+                if (!agg_list_on_dag(agg_op) && agg_arg_is_list_col(elems[1], g->table))
+                    return NULL;   /* #1283: the builtin sums or raises */
                 switch (agg_op) {
                     case OP_SUM:         return ray_sum(g, arg);
                     case OP_AVG:         return ray_avg(g, arg);
@@ -4464,6 +4467,17 @@ void ray_group_dag_probe_fail_set_for_test(int invocation) {
 
 /* out_err receives an owned failure, distinct from unsupported syntax.
  * A probe failure must not select the whole-column fallback. */
+static int8_t tbl_col_base_type(ray_t* tbl, int64_t sym);   /* defined below */
+
+/* Whether an aggregate's argument is a LIST column that an aggregate other
+ * than count/first/last would read as numbers (#1283).  Only a column
+ * reference counts: RAY_LIST is type 0, which dag_operand_type also gives
+ * for a type it cannot tell, such as an unknown name. */
+static bool agg_arg_is_list_col(ray_t* arg, ray_t* tbl) {
+    return arg && arg->type == -RAY_SYM && !(arg->attrs & ATTR_QUOTED) &&
+           tbl && tbl->type == RAY_TABLE && tbl_has_col(tbl, arg->i64) &&
+           tbl_col_base_type(tbl, arg->i64) == RAY_LIST;
+}
 static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_err) {
     *out_err = NULL;
     if (!is_group_dag_agg_expr(expr, tbl)) return 0;
@@ -4481,6 +4495,10 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_e
     }
 
     if (expr_contains_temporal_arith(agg_arg, tbl))
+        return 0;
+    /* A LIST column read by an aggregate that interprets its cells goes to
+     * the per-group builtins (#1283). */
+    if (!agg_list_on_dag(op) && agg_arg_is_list_col(agg_arg, tbl))
         return 0;
     if (agg_is_binary_agg(op)) {
         if (ray_len(expr) < 3) return 1;
@@ -25580,6 +25598,13 @@ by_dict_done:
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sagg_hdr);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type", "select: aggregation does not admit input type %s", ray_type_name(in_t));
+                }
+                /* A LIST input reaches the builtin, which sums a list of
+                 * numeric atoms or raises `type`; the typed kernel read the
+                 * cells' pointers as numbers (#1283). */
+                if (!agg_list_on_dag(op) && agg_arg_is_list_col(agg_elems[1], tbl)) {
+                    s_use_eval_fallback = 1;
+                    break;
                 }
                 if (agg_is_binary_agg(op)) {
                     if (ray_len(val_expr) < 3) {

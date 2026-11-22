@@ -315,6 +315,14 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
     }
 }
 
+/* Whether a typed DAG aggregate may read a LIST column: only the ones that
+ * do not interpret the cells.  Any other aggregate of a LIST goes to the
+ * per-group builtins, which sum a list of numeric atoms or raise `type`;
+ * the typed kernels read the cells' pointers as numbers (#1283). */
+static inline bool agg_list_on_dag(uint16_t op) {
+    return op == OP_COUNT || op == OP_FIRST || op == OP_LAST;
+}
+
 static inline bool agg_is_binary_agg(uint16_t op) {
     return op == OP_PEARSON_CORR || op == OP_COV || op == OP_SCOV ||
            op == OP_WSUM || op == OP_WAVG;
