@@ -18957,6 +18957,10 @@ bool ray_part_prune_stats_mask(ray_t* col, uint16_t cmp_op, bool swapped, ray_t*
         cval = read_col_i64(ray_data(lit), 0, lit->type, lit->attrs);
     } else return false;
 
+    /* An empty set holds no row, a null row included, so every partition
+     * prunes whether or not it carries statistics: a plain and a compressed
+     * save then read the same partitions (#1344). */
+    if (cmp_op == OP_IN && nset == 0) return wrapper->len > 0;
     bool pruned = false;
     for (int64_t p = 0; p < wrapper->len; p++) {
         ray_t* seg = col->type == RAY_ENCCOL ? ray_enccol_seg(col, p) : ((ray_t**)ray_data(wrapper))[p];
