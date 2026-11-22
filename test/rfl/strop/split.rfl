@@ -1,3 +1,4 @@
+;; @requires: posix  (the size check at the end runs wc and rm through the shell)
 ;; Invariants for `split`.
 
 (split "a,b,c" ",") -- ["a" "b" "c"]
@@ -113,6 +114,6 @@
 (set segs (split big (* 100 (til 200))))
 (count segs) -- 200
 (.db.splayed.set "/tmp/rfl_split_size/t/" (table [k v] (list (til 200) segs)))
-(.sys.exec "[ $(du -sk /tmp/rfl_split_size/t/v | cut -f1) -lt 4096 ]") -- 0
+(.sys.exec "[ $(wc -c < /tmp/rfl_split_size/t/v) -lt 4194304 ]") -- 0
 (count (at (.db.splayed.get "/tmp/rfl_split_size/t/") 'v)) -- 200
 (.sys.exec "rm -rf /tmp/rfl_split_size") -- 0
