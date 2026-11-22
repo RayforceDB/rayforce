@@ -122,6 +122,7 @@ static void ipc_teardown(void) {
         ray_poll_destroy(p);
     }
     ray_runtime_destroy(__RUNTIME);
+    ray_ipc_cancel_state_reset_for_test();   /* nothing left for the next file's tests (#1265) */
 }
 
 /* ---- Helpers ------------------------------------------------------------- */
