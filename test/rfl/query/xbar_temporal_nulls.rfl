@@ -1,0 +1,190 @@
+;; @requires: posix  (splayed / parted fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; @also-unfused
+;; A temporal result computed in a query (xbar, %, a cast to DATE / TIME)
+;; keeps its nulls for every reader, as the eager form does (#1339).
+;;
+;; The DAG lowers `(xbar d 7)` to x - (x % b) in an integer lane and casts
+;; the result back to DATE; a TIME / DATE cast leaves its result in an I32
+;; lane typed DATE / TIME.  The fused ISNULL kernel dispatched on that type
+;; and, finding no DATE arm, read the 4-byte lane as 8-byte values: no
+;; NULL_I64 there, so `nil?` came back all false (and with it `not`, `sum`
+;; and `where:` over it).  Every answer here is the eager one.
+
+(set nul (fn [v m z] (at (concat v (enlist z)) (+ (til (count v)) (* (- (count v) (til (count v))) (as 'I64 m))))))
+(set mk (fn [J m] (table [d t p i g] (list (nul (+ 2024.01.01 (% J 400)) m 0Nd) (nul (as 'TIME (* 1237 (% J 50000))) m 0Nt) (nul (+ 2024.01.01D00:00:00.000000000 (* 1000003 J)) m 0Np) (nul (as 'I32 (% (* J 37) 9000)) m 0Ni) (% J 3)))))
+
+;; per form: values, nil?, fill, sum of not nil?, count under where:,
+;; nil? under where:, update nil?, update fill, sum of nil? by:
+
+;; (xbar d 7)
+(set Q0 (fn [tb] (list (at (select {r: (xbar d 7) from: tb}) 'r) (at (select {r: (nil? (xbar d 7)) from: tb}) 'r) (at (select {r: (fill 2000.01.01 (xbar d 7)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar d 7)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar d 7)))}) 'c) (at (select {r: (nil? (xbar d 7)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar d 7)) from: tb}) 'r) (at (update {r: (fill 2000.01.01 (xbar d 7)) from: tb}) 'r) (select {c: (sum (nil? (xbar d 7))) from: tb by: g}))))
+(set E0 (fn [tb] (list (xbar (at tb 'd) 7) (nil? (xbar (at tb 'd) 7)) (fill 2000.01.01 (xbar (at tb 'd) 7)) (enlist (sum (not (nil? (xbar (at tb 'd) 7))))) (enlist (sum (not (nil? (xbar (at tb 'd) 7))))) (at (nil? (xbar (at tb 'd) 7)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 'd) 7)) (fill 2000.01.01 (xbar (at tb 'd) 7)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 'd) 7)))) by: g}))))
+;; (xbar d 7i)
+(set Q1 (fn [tb] (list (at (select {r: (xbar d 7i) from: tb}) 'r) (at (select {r: (nil? (xbar d 7i)) from: tb}) 'r) (at (select {r: (fill 2000.01.01 (xbar d 7i)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar d 7i)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar d 7i)))}) 'c) (at (select {r: (nil? (xbar d 7i)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar d 7i)) from: tb}) 'r) (at (update {r: (fill 2000.01.01 (xbar d 7i)) from: tb}) 'r) (select {c: (sum (nil? (xbar d 7i))) from: tb by: g}))))
+(set E1 (fn [tb] (list (xbar (at tb 'd) 7i) (nil? (xbar (at tb 'd) 7i)) (fill 2000.01.01 (xbar (at tb 'd) 7i)) (enlist (sum (not (nil? (xbar (at tb 'd) 7i))))) (enlist (sum (not (nil? (xbar (at tb 'd) 7i))))) (at (nil? (xbar (at tb 'd) 7i)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 'd) 7i)) (fill 2000.01.01 (xbar (at tb 'd) 7i)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 'd) 7i)))) by: g}))))
+;; (xbar t 1000)
+(set Q2 (fn [tb] (list (at (select {r: (xbar t 1000) from: tb}) 'r) (at (select {r: (nil? (xbar t 1000)) from: tb}) 'r) (at (select {r: (fill 00:00:00.000 (xbar t 1000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar t 1000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar t 1000)))}) 'c) (at (select {r: (nil? (xbar t 1000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar t 1000)) from: tb}) 'r) (at (update {r: (fill 00:00:00.000 (xbar t 1000)) from: tb}) 'r) (select {c: (sum (nil? (xbar t 1000))) from: tb by: g}))))
+(set E2 (fn [tb] (list (xbar (at tb 't) 1000) (nil? (xbar (at tb 't) 1000)) (fill 00:00:00.000 (xbar (at tb 't) 1000)) (enlist (sum (not (nil? (xbar (at tb 't) 1000))))) (enlist (sum (not (nil? (xbar (at tb 't) 1000))))) (at (nil? (xbar (at tb 't) 1000)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 't) 1000)) (fill 00:00:00.000 (xbar (at tb 't) 1000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 't) 1000)))) by: g}))))
+;; (xbar t 00:00:01.000)
+(set Q3 (fn [tb] (list (at (select {r: (xbar t 00:00:01.000) from: tb}) 'r) (at (select {r: (nil? (xbar t 00:00:01.000)) from: tb}) 'r) (at (select {r: (fill 00:00:00.000 (xbar t 00:00:01.000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar t 00:00:01.000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar t 00:00:01.000)))}) 'c) (at (select {r: (nil? (xbar t 00:00:01.000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar t 00:00:01.000)) from: tb}) 'r) (at (update {r: (fill 00:00:00.000 (xbar t 00:00:01.000)) from: tb}) 'r) (select {c: (sum (nil? (xbar t 00:00:01.000))) from: tb by: g}))))
+(set E3 (fn [tb] (list (xbar (at tb 't) 00:00:01.000) (nil? (xbar (at tb 't) 00:00:01.000)) (fill 00:00:00.000 (xbar (at tb 't) 00:00:01.000)) (enlist (sum (not (nil? (xbar (at tb 't) 00:00:01.000))))) (enlist (sum (not (nil? (xbar (at tb 't) 00:00:01.000))))) (at (nil? (xbar (at tb 't) 00:00:01.000)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 't) 00:00:01.000)) (fill 00:00:00.000 (xbar (at tb 't) 00:00:01.000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 't) 00:00:01.000)))) by: g}))))
+;; (xbar p 1000000000)
+(set Q4 (fn [tb] (list (at (select {r: (xbar p 1000000000) from: tb}) 'r) (at (select {r: (nil? (xbar p 1000000000)) from: tb}) 'r) (at (select {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 1000000000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar p 1000000000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar p 1000000000)))}) 'c) (at (select {r: (nil? (xbar p 1000000000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar p 1000000000)) from: tb}) 'r) (at (update {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 1000000000)) from: tb}) 'r) (select {c: (sum (nil? (xbar p 1000000000))) from: tb by: g}))))
+(set E4 (fn [tb] (list (xbar (at tb 'p) 1000000000) (nil? (xbar (at tb 'p) 1000000000)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 1000000000)) (enlist (sum (not (nil? (xbar (at tb 'p) 1000000000))))) (enlist (sum (not (nil? (xbar (at tb 'p) 1000000000))))) (at (nil? (xbar (at tb 'p) 1000000000)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 'p) 1000000000)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 1000000000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 'p) 1000000000)))) by: g}))))
+;; (xbar p 01:00:00.000)
+(set Q5 (fn [tb] (list (at (select {r: (xbar p 01:00:00.000) from: tb}) 'r) (at (select {r: (nil? (xbar p 01:00:00.000)) from: tb}) 'r) (at (select {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 01:00:00.000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar p 01:00:00.000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar p 01:00:00.000)))}) 'c) (at (select {r: (nil? (xbar p 01:00:00.000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar p 01:00:00.000)) from: tb}) 'r) (at (update {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 01:00:00.000)) from: tb}) 'r) (select {c: (sum (nil? (xbar p 01:00:00.000))) from: tb by: g}))))
+(set E5 (fn [tb] (list (xbar (at tb 'p) 01:00:00.000) (nil? (xbar (at tb 'p) 01:00:00.000)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 01:00:00.000)) (enlist (sum (not (nil? (xbar (at tb 'p) 01:00:00.000))))) (enlist (sum (not (nil? (xbar (at tb 'p) 01:00:00.000))))) (at (nil? (xbar (at tb 'p) 01:00:00.000)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 'p) 01:00:00.000)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 01:00:00.000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 'p) 01:00:00.000)))) by: g}))))
+;; (xbar p 1D)
+(set Q6 (fn [tb] (list (at (select {r: (xbar p 1D) from: tb}) 'r) (at (select {r: (nil? (xbar p 1D)) from: tb}) 'r) (at (select {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 1D)) from: tb}) 'r) (at (select {c: (sum (not (nil? (xbar p 1D)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (xbar p 1D)))}) 'c) (at (select {r: (nil? (xbar p 1D)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (xbar p 1D)) from: tb}) 'r) (at (update {r: (fill 2000.01.01D00:00:00.000000000 (xbar p 1D)) from: tb}) 'r) (select {c: (sum (nil? (xbar p 1D))) from: tb by: g}))))
+(set E6 (fn [tb] (list (xbar (at tb 'p) 1D) (nil? (xbar (at tb 'p) 1D)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 1D)) (enlist (sum (not (nil? (xbar (at tb 'p) 1D))))) (enlist (sum (not (nil? (xbar (at tb 'p) 1D))))) (at (nil? (xbar (at tb 'p) 1D)) (where (> (at tb 'g) 0))) (nil? (xbar (at tb 'p) 1D)) (fill 2000.01.01D00:00:00.000000000 (xbar (at tb 'p) 1D)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (xbar (at tb 'p) 1D)))) by: g}))))
+;; (% d 7)
+(set Q7 (fn [tb] (list (at (select {r: (% d 7) from: tb}) 'r) (at (select {r: (nil? (% d 7)) from: tb}) 'r) (at (select {r: (fill 2000.01.01 (% d 7)) from: tb}) 'r) (at (select {c: (sum (not (nil? (% d 7)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (% d 7)))}) 'c) (at (select {r: (nil? (% d 7)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (% d 7)) from: tb}) 'r) (at (update {r: (fill 2000.01.01 (% d 7)) from: tb}) 'r) (select {c: (sum (nil? (% d 7))) from: tb by: g}))))
+(set E7 (fn [tb] (list (% (at tb 'd) 7) (nil? (% (at tb 'd) 7)) (fill 2000.01.01 (% (at tb 'd) 7)) (enlist (sum (not (nil? (% (at tb 'd) 7))))) (enlist (sum (not (nil? (% (at tb 'd) 7))))) (at (nil? (% (at tb 'd) 7)) (where (> (at tb 'g) 0))) (nil? (% (at tb 'd) 7)) (fill 2000.01.01 (% (at tb 'd) 7)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (% (at tb 'd) 7)))) by: g}))))
+;; (% t 1000)
+(set Q8 (fn [tb] (list (at (select {r: (% t 1000) from: tb}) 'r) (at (select {r: (nil? (% t 1000)) from: tb}) 'r) (at (select {r: (fill 00:00:00.000 (% t 1000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (% t 1000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (% t 1000)))}) 'c) (at (select {r: (nil? (% t 1000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (% t 1000)) from: tb}) 'r) (at (update {r: (fill 00:00:00.000 (% t 1000)) from: tb}) 'r) (select {c: (sum (nil? (% t 1000))) from: tb by: g}))))
+(set E8 (fn [tb] (list (% (at tb 't) 1000) (nil? (% (at tb 't) 1000)) (fill 00:00:00.000 (% (at tb 't) 1000)) (enlist (sum (not (nil? (% (at tb 't) 1000))))) (enlist (sum (not (nil? (% (at tb 't) 1000))))) (at (nil? (% (at tb 't) 1000)) (where (> (at tb 'g) 0))) (nil? (% (at tb 't) 1000)) (fill 00:00:00.000 (% (at tb 't) 1000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (% (at tb 't) 1000)))) by: g}))))
+;; (% p 1000)
+(set Q9 (fn [tb] (list (at (select {r: (% p 1000) from: tb}) 'r) (at (select {r: (nil? (% p 1000)) from: tb}) 'r) (at (select {r: (fill 2000.01.01D00:00:00.000000000 (% p 1000)) from: tb}) 'r) (at (select {c: (sum (not (nil? (% p 1000)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (% p 1000)))}) 'c) (at (select {r: (nil? (% p 1000)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (% p 1000)) from: tb}) 'r) (at (update {r: (fill 2000.01.01D00:00:00.000000000 (% p 1000)) from: tb}) 'r) (select {c: (sum (nil? (% p 1000))) from: tb by: g}))))
+(set E9 (fn [tb] (list (% (at tb 'p) 1000) (nil? (% (at tb 'p) 1000)) (fill 2000.01.01D00:00:00.000000000 (% (at tb 'p) 1000)) (enlist (sum (not (nil? (% (at tb 'p) 1000))))) (enlist (sum (not (nil? (% (at tb 'p) 1000))))) (at (nil? (% (at tb 'p) 1000)) (where (> (at tb 'g) 0))) (nil? (% (at tb 'p) 1000)) (fill 2000.01.01D00:00:00.000000000 (% (at tb 'p) 1000)) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (% (at tb 'p) 1000)))) by: g}))))
+;; (as 'DATE i)
+(set Q10 (fn [tb] (list (at (select {r: (as 'DATE i) from: tb}) 'r) (at (select {r: (nil? (as 'DATE i)) from: tb}) 'r) (at (select {r: (fill 2000.01.01 (as 'DATE i)) from: tb}) 'r) (at (select {c: (sum (not (nil? (as 'DATE i)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (as 'DATE i)))}) 'c) (at (select {r: (nil? (as 'DATE i)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (as 'DATE i)) from: tb}) 'r) (at (update {r: (fill 2000.01.01 (as 'DATE i)) from: tb}) 'r) (select {c: (sum (nil? (as 'DATE i))) from: tb by: g}))))
+(set E10 (fn [tb] (list (as 'DATE (at tb 'i)) (nil? (as 'DATE (at tb 'i))) (fill 2000.01.01 (as 'DATE (at tb 'i))) (enlist (sum (not (nil? (as 'DATE (at tb 'i)))))) (enlist (sum (not (nil? (as 'DATE (at tb 'i)))))) (at (nil? (as 'DATE (at tb 'i))) (where (> (at tb 'g) 0))) (nil? (as 'DATE (at tb 'i))) (fill 2000.01.01 (as 'DATE (at tb 'i))) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (as 'DATE (at tb 'i))))) by: g}))))
+;; (as 'TIME i)
+(set Q11 (fn [tb] (list (at (select {r: (as 'TIME i) from: tb}) 'r) (at (select {r: (nil? (as 'TIME i)) from: tb}) 'r) (at (select {r: (fill 00:00:00.000 (as 'TIME i)) from: tb}) 'r) (at (select {c: (sum (not (nil? (as 'TIME i)))) from: tb}) 'c) (at (select {c: (count g) from: tb where: (not (nil? (as 'TIME i)))}) 'c) (at (select {r: (nil? (as 'TIME i)) from: tb where: (> g 0)}) 'r) (at (update {r: (nil? (as 'TIME i)) from: tb}) 'r) (at (update {r: (fill 00:00:00.000 (as 'TIME i)) from: tb}) 'r) (select {c: (sum (nil? (as 'TIME i))) from: tb by: g}))))
+(set E11 (fn [tb] (list (as 'TIME (at tb 'i)) (nil? (as 'TIME (at tb 'i))) (fill 00:00:00.000 (as 'TIME (at tb 'i))) (enlist (sum (not (nil? (as 'TIME (at tb 'i)))))) (enlist (sum (not (nil? (as 'TIME (at tb 'i)))))) (at (nil? (as 'TIME (at tb 'i))) (where (> (at tb 'g) 0))) (nil? (as 'TIME (at tb 'i))) (fill 00:00:00.000 (as 'TIME (at tb 'i))) (select {c: (sum n) from: (table [g n] (list (at tb 'g) (nil? (as 'TIME (at tb 'i))))) by: g}))))
+
+;; ── flat: a null first, in the middle, last; all nulls; none ──────────
+(set J (til 6))
+(set T1 (mk J (== J 0)))
+(set T2 (mk J (== J 2)))
+(set T3 (mk J (== J 5)))
+(set T4 (mk J (>= J 0)))
+(set T5 (mk J (< J 0)))
+(nil? (at (select {r: (xbar d 7) from: T2}) 'r)) -- [false false true false false false]
+(at (select {r: (nil? (xbar d 7)) from: T2}) 'r) -- [false false true false false false]
+(at (select {r: (nil? (xbar t 1000)) from: T2}) 'r) -- [false false true false false false]
+(at (select {r: (nil? (% d 7)) from: T2}) 'r) -- [false false true false false false]
+(at (select {r: (nil? (as 'DATE i)) from: T4}) 'r) -- [true true true true true true]
+(at (select {c: (count g) from: T2 where: (nil? (xbar d 7))}) 'c) -- [1]
+;; readers of the nil? mask: if, and, or, where: with a second conjunct
+(at (select {r: (if (nil? (xbar d 7)) 1 2) from: T2}) 'r) -- [2 2 1 2 2 2]
+(at (select {r: (and (nil? (xbar d 7)) (nil? (xbar t 1000))) from: T2}) 'r) -- [false false true false false false]
+(at (select {r: (or (nil? (% t 1000)) (== g 2)) from: T2}) 'r) -- [false false true false false true]
+(at (select {r: d from: T2 where: (nil? (xbar d 7))}) 'r) -- [0Nd]
+(at (select {r: d from: T2 where: (and (> g -1) (not (nil? (xbar t 1000))))}) 'r) -- (at (at T2 'd) [0 1 3 4 5])
+
+;; T1
+(Q0 T1) -- (E0 T1)
+(Q1 T1) -- (E1 T1)
+(Q2 T1) -- (E2 T1)
+(Q3 T1) -- (E3 T1)
+(Q4 T1) -- (E4 T1)
+(Q5 T1) -- (E5 T1)
+(Q6 T1) -- (E6 T1)
+(Q7 T1) -- (E7 T1)
+(Q8 T1) -- (E8 T1)
+(Q9 T1) -- (E9 T1)
+(Q10 T1) -- (E10 T1)
+(Q11 T1) -- (E11 T1)
+;; T2
+(Q0 T2) -- (E0 T2)
+(Q1 T2) -- (E1 T2)
+(Q2 T2) -- (E2 T2)
+(Q3 T2) -- (E3 T2)
+(Q4 T2) -- (E4 T2)
+(Q5 T2) -- (E5 T2)
+(Q6 T2) -- (E6 T2)
+(Q7 T2) -- (E7 T2)
+(Q8 T2) -- (E8 T2)
+(Q9 T2) -- (E9 T2)
+(Q10 T2) -- (E10 T2)
+(Q11 T2) -- (E11 T2)
+;; T3
+(Q0 T3) -- (E0 T3)
+(Q1 T3) -- (E1 T3)
+(Q2 T3) -- (E2 T3)
+(Q3 T3) -- (E3 T3)
+(Q4 T3) -- (E4 T3)
+(Q5 T3) -- (E5 T3)
+(Q6 T3) -- (E6 T3)
+(Q7 T3) -- (E7 T3)
+(Q8 T3) -- (E8 T3)
+(Q9 T3) -- (E9 T3)
+(Q10 T3) -- (E10 T3)
+(Q11 T3) -- (E11 T3)
+;; T4
+(Q0 T4) -- (E0 T4)
+(Q1 T4) -- (E1 T4)
+(Q2 T4) -- (E2 T4)
+(Q3 T4) -- (E3 T4)
+(Q4 T4) -- (E4 T4)
+(Q5 T4) -- (E5 T4)
+(Q6 T4) -- (E6 T4)
+(Q7 T4) -- (E7 T4)
+(Q8 T4) -- (E8 T4)
+(Q9 T4) -- (E9 T4)
+(Q10 T4) -- (E10 T4)
+(Q11 T4) -- (E11 T4)
+;; T5
+(Q0 T5) -- (E0 T5)
+(Q1 T5) -- (E1 T5)
+(Q2 T5) -- (E2 T5)
+(Q3 T5) -- (E3 T5)
+(Q4 T5) -- (E4 T5)
+(Q5 T5) -- (E5 T5)
+(Q6 T5) -- (E6 T5)
+(Q7 T5) -- (E7 T5)
+(Q8 T5) -- (E8 T5)
+(Q9 T5) -- (E9 T5)
+(Q10 T5) -- (E10 T5)
+(Q11 T5) -- (E11 T5)
+
+;; ── flat, 70k rows: past the parallel threshold, nulls across morsels ──
+(set n 70000)
+(set J (til n))
+(set B (mk J (or (== 0 (% J 997)) (or (== J 35000) (== J (- n 1))))))
+(at (select {c: (sum (nil? (xbar d 7))) from: B}) 'c) -- [73]
+(Q0 B) -- (E0 B)
+(Q2 B) -- (E2 B)
+(Q4 B) -- (E4 B)
+(Q7 B) -- (E7 B)
+(Q10 B) -- (E10 B)
+
+;; ── splayed and parted: nulls first, in the middle, last ────────────
+(.sys.exec "rm -rf /tmp/rfl_xbar_temporal_nulls")
+(set J (til 9))
+(set M (mk J (or (== J 0) (or (== J 4) (== J 8)))))
+(.db.splayed.set "/tmp/rfl_xbar_temporal_nulls/sp/t/" M "/tmp/rfl_xbar_temporal_nulls/sp/.sym")
+(set S (.db.splayed.get "/tmp/rfl_xbar_temporal_nulls/sp/t/" "/tmp/rfl_xbar_temporal_nulls/sp/.sym"))
+(at (select {c: (sum (nil? (xbar d 7))) from: S}) 'c) -- [3]
+(Q0 S) -- (E0 S)
+(Q1 S) -- (E1 S)
+(Q2 S) -- (E2 S)
+(Q3 S) -- (E3 S)
+(Q4 S) -- (E4 S)
+(Q5 S) -- (E5 S)
+(Q6 S) -- (E6 S)
+(Q7 S) -- (E7 S)
+(Q8 S) -- (E8 S)
+(Q9 S) -- (E9 S)
+(Q10 S) -- (E10 S)
+(Q11 S) -- (E11 S)
+
+;; parted: two partitions, a null in each
+(.db.splayed.set "/tmp/rfl_xbar_temporal_nulls/db/2024.01.01/t/" (take M 5) "/tmp/rfl_xbar_temporal_nulls/db/.sym")
+(.db.splayed.set "/tmp/rfl_xbar_temporal_nulls/db/2024.01.02/t/" (drop M 5) "/tmp/rfl_xbar_temporal_nulls/db/.sym")
+(set P (.db.parted.get "/tmp/rfl_xbar_temporal_nulls/db/" 't))
+(at (select {c: (sum (nil? (xbar d 7))) from: P}) 'c) -- [3]
+(Q0 P) -- (E0 P)
+(Q1 P) -- (E1 P)
+(Q2 P) -- (E2 P)
+(Q3 P) -- (E3 P)
+(Q4 P) -- (E4 P)
+(Q5 P) -- (E5 P)
+(Q6 P) -- (E6 P)
+(Q7 P) -- (E7 P)
+(Q8 P) -- (E8 P)
+(Q9 P) -- (E9 P)
+(Q10 P) -- (E10 P)
+(Q11 P) -- (E11 P)
+(.sys.exec "rm -rf /tmp/rfl_xbar_temporal_nulls")
