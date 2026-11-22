@@ -3115,13 +3115,30 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             return ray_error("oom", NULL);
         }
         for (int64_t j = 0; j < k1->len; j++) hashset_insert(&hs, j);
+        /* hs contains only k1 row indices.  Track accepted k2 rows in a
+         * separate set so repeated new RHS cells are appended just once,
+         * in their first-occurrence order, without changing k1 duplicates. */
+        hashset_t added;
+        bool added_ready = false;
         int8_t v2_type = k2->type;
         void*  v2_data = ray_data(k2);
         int64_t extra = 0;
         for (int64_t i = 0; i < len2; i++) {
-            if (hashset_find_xrow(&hs, k2, i, v2_type, v2_data) == HS_EMPTY)
-                idx[extra++] = i;
+            if (hashset_find_xrow(&hs, k2, i, v2_type, v2_data) != HS_EMPTY)
+                continue;
+            /* A RHS wholly covered by k1 needs no second table. */
+            if (!added_ready) {
+                if (!hashset_init(&added, k2, len2)) {
+                    hashset_destroy(&hs);
+                    if (keys) ray_release(keys);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
+                added_ready = true;
+            }
+            if (hashset_insert(&added, i)) idx[extra++] = i;
         }
+        if (added_ready) hashset_destroy(&added);
         hashset_destroy(&hs);
         if (keys) ray_release(keys);
         ray_t* part2 = gather_by_idx(vec2, idx, extra);
