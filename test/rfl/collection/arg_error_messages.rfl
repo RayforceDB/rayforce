@@ -77,3 +77,7 @@
 (at (try (.sys.querylog 1) (fn [e] e)) 'msg) -- ".sys.querylog takes no arguments; usage: (.sys.querylog)"
 (at (try (.sys.profile.enable 'a) (fn [e] e)) 'msg) -- ".sys.profile.enable: flag must be i64, got sym; usage: (.sys.profile.enable [<on: i64, 0 or 1>])"
 (at (try (.sys.profile.reset 1) (fn [e] e)) 'msg) -- ".sys.profile.reset takes no arguments; usage: (.sys.profile.reset)"
+
+;; a function is no collection: no internal message comes out of take
+(at (try (take (fn [x] x) 1) (fn [e] e)) 'msg) -- "take: expected (take collection count) where collection is a vector, list, string, dict or table; got collection LAMBDA and count i64"
+(at (try (take + 2) (fn [e] e)) 'msg) -- "take: expected (take collection count) where collection is a vector, list, string, dict or table; got collection BINARY and count i64"

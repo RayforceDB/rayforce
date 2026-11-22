@@ -3738,7 +3738,9 @@ static ray_t* count_arg_error(const char* fn, ray_t* vec, ray_t* n_obj, const ch
             "%s: the collection comes first and the count second, but the first argument is the "
             "count (%s) and the second is %s; write (%s <collection> <count>)",
             fn, vt, nt, fn);
-    bool vec_ok = vec && (!ray_is_atom(vec) || vec->type == -RAY_STR);
+    bool is_function = vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
+                               vec->type == RAY_BINARY || vec->type == RAY_VARY);
+    bool vec_ok = vec && !is_function && (!ray_is_atom(vec) || vec->type == -RAY_STR);
     if (!vec_ok)
         return ray_error("type",
             "%s: expected (%s collection count) where collection is a vector, list, string, dict or table; got collection %s and count %s",
@@ -3757,6 +3759,10 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
      * and surface as "oom" — misleading for what is really a type error. */
     if (ray_is_atom(n_obj) && (n_obj->type == -RAY_F64 || n_obj->type == -RAY_F32))
         return ray_error("type", "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection %s and count %s", ray_type_name(vec->type), ray_type_name(n_obj->type));
+    /* A function value has a positive type but holds no elements. */
+    if (vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
+                vec->type == RAY_BINARY || vec->type == RAY_VARY))
+        return count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
     /* Range take: (take collection [start amount]) — slice from start for amount elements */
     if (ray_is_vec(n_obj) && n_obj->type == RAY_I64 && ray_len(n_obj) == 2) {
         int64_t* idx = (int64_t*)ray_data(n_obj);
