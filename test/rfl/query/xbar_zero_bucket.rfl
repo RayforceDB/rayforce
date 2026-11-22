@@ -1,0 +1,799 @@
+;; @also-unfused
+;; xbar_zero_bucket.rfl -- a query's xbar by a zero or null bucket raises
+;; domain, as the builtin does (issue #1355).
+;;
+;; The query lowers (xbar x b) to (- x (% x b)), and the modulo kernels turn
+;; a zero (or null) divisor into a null, so a projection, a by: key and a
+;; where: predicate gave nulls where (xbar V 0) raises.  A literal bucket is
+;; now checked when the query compiles, a column bucket by the modulo kernels
+;; of the fused evaluator and of the per-node executor.  Each lane pins the
+;; builtin's error first, then every query route; a nonzero bucket keeps the
+;; builtin's answer.  A TIMESPAN bucket buckets through the builtin's duration
+;; kernel, whose zero gives a null: the query keeps that too.
+
+;; --- U8 values ---
+(set V (as 'U8 [0 5 200 17]))
+;; U8 by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; U8 by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; U8 by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; U8 by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+
+;; --- I16 values ---
+(set V [-7h 5h 0Nh 32767h])
+;; I16 by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I16 by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I16 by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I16 by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+
+;; --- I32 values ---
+(set V [-7i 5i 0Ni 2147483647i])
+;; I32 by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I32 by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I32 by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I32 by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+
+;; --- I64 values ---
+(set V [-7 5 0Nl 9223372036854775807])
+;; I64 by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I64 by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I64 by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; I64 by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+
+;; --- DATE values ---
+(set V [2024.01.01 1999.12.31 0Nd 2024.02.29])
+;; DATE by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; DATE by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; DATE by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; DATE by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; DATE by TIMESPAN: the duration kernel's zero is a null, in a query too
+(set T (table [v s z] (list V [0D00:05:00 0D00:00:00.007 0D01:00:00 0D00:00:01] [0D00:05:00 0D 0D01:00:00 0D00:00:01])))
+(at (select {from: T r: (xbar v 0D)}) 'r) -- (xbar V 0D)
+(at (select {from: T r: (xbar v z)}) 'r) -- (xbar V (at T 'z))
+(at (select {from: T r: (xbar v s)}) 'r) -- (xbar V (at T 's))
+(at (select {from: T r: (xbar v 0D00:05:00)}) 'r) -- (xbar V 0D00:05:00)
+
+;; --- TIME values ---
+(set V [10:00:00.000 00:00:01.234 0Nt 23:59:59.999])
+;; TIME by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIME by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIME by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIME by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIME by TIMESPAN: the duration kernel's zero is a null, in a query too
+(set T (table [v s z] (list V [0D00:05:00 0D00:00:00.007 0D01:00:00 0D00:00:01] [0D00:05:00 0D 0D01:00:00 0D00:00:01])))
+(at (select {from: T r: (xbar v 0D)}) 'r) -- (xbar V 0D)
+(at (select {from: T r: (xbar v z)}) 'r) -- (xbar V (at T 'z))
+(at (select {from: T r: (xbar v s)}) 'r) -- (xbar V (at T 's))
+(at (select {from: T r: (xbar v 0D00:05:00)}) 'r) -- (xbar V 0D00:05:00)
+
+;; --- TIMESTAMP values ---
+(set V [2024.01.01D10:00:00.123456789 1999.12.31D23:59:59.999999999 0Np 2024.02.29D00:00:00.000000001])
+;; TIMESTAMP by U8
+(set W (as 'U8 [3 7 2 5]))
+(set Z1 (as 'U8 [3 0 2 5]))
+(set Z2 (as 'U8 [3 7 0 5]))
+(set T (table [v w z1 z2] (list V W Z1 Z2)))
+(xbar V 0x00) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(select {from: T r: (xbar v 0x00)}) !- domain
+(select {from: T by: {k: (xbar v 0x00)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0x00) (xbar v 0x00)) n: (count v)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 0x07)}) 'r) -- (xbar V 0x07)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIMESTAMP by I16
+(set W (as 'I16 [3 7 2 5]))
+(set Z1 (as 'I16 [3 0 2 5]))
+(set Z2 (as 'I16 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I16 [3 7 0N 5]))))
+(xbar V 0h) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nh) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0h)}) !- domain
+(select {from: T by: {k: (xbar v 0h)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0h) (xbar v 0h)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nh)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7h)}) 'r) -- (xbar V 7h)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIMESTAMP by I32
+(set W (as 'I32 [3 7 2 5]))
+(set Z1 (as 'I32 [3 0 2 5]))
+(set Z2 (as 'I32 [3 7 0 5]))
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 (as 'I32 [3 7 0N 5]))))
+(xbar V 0i) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Ni) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0i)}) !- domain
+(select {from: T by: {k: (xbar v 0i)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0i) (xbar v 0i)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Ni)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7i)}) 'r) -- (xbar V 7i)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIMESTAMP by I64
+(set W [3 7 2 5])
+(set Z1 [3 0 2 5])
+(set Z2 [3 7 0 5])
+(set T (table [v w z1 z2 nb] (list V W Z1 Z2 [3 7 0N 5])))
+(xbar V 0) !- domain
+(xbar V Z1) !- domain
+(xbar V Z2) !- domain
+(xbar V 0Nl) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v 0) (xbar v 0)) n: (count v)}) !- domain
+(select {from: T r: (xbar v 0Nl)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z2) (xbar v z2)) n: (count v)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(at (select {from: T r: (xbar v 7)}) 'r) -- (xbar V 7)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V W)
+(asc (at (select {from: T by: {k: (xbar v w)} n: (count v)}) 'k)) -- (asc (distinct (xbar V W)))
+(at (select {from: T where: (== (xbar v w) (xbar v w)) r: (xbar v w)}) 'r) -- (at (xbar V W) (where (== (xbar V W) (xbar V W))))
+;; TIMESTAMP by TIME: the bucket is milliseconds
+(set T (table [v w z1 nb] (list V [00:00:01.000 00:00:00.007 00:00:00.002 00:01:00.000] [00:00:01.000 00:00:00.000 00:00:00.002 00:01:00.000] [00:00:01.000 0Nt 00:00:00.002 00:01:00.000])))
+(xbar V 00:00:00.000) !- domain
+(xbar V (at T 'z1)) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 00:00:00.000)}) !- domain
+(select {from: T r: (xbar v 0Nt)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z1) (xbar v z1)) n: (count v)}) !- domain
+(at (select {from: T r: (xbar v 00:00:00.007)}) 'r) -- (xbar V 00:00:00.007)
+(at (select {from: T r: (xbar v w)}) 'r) -- (xbar V (at T 'w))
+;; TIMESTAMP by TIMESPAN: the duration kernel's zero is a null, in a query too
+(set T (table [v s z] (list V [0D00:05:00 0D00:00:00.007 0D01:00:00 0D00:00:01] [0D00:05:00 0D 0D01:00:00 0D00:00:01])))
+(at (select {from: T r: (xbar v 0D)}) 'r) -- (xbar V 0D)
+(at (select {from: T r: (xbar v z)}) 'r) -- (xbar V (at T 'z))
+(at (select {from: T r: (xbar v s)}) 'r) -- (xbar V (at T 's))
+(at (select {from: T r: (xbar v 0D00:05:00)}) 'r) -- (xbar V 0D00:05:00)
+
+;; --- F64 values and buckets ---
+(set V [1.5 -2.5 0Nf 7.25])
+(set T (table [v w z1 z2 nb i] (list V [0.5 2.0 1.5 3.0] [0.5 0.0 1.5 3.0] [0.5 2.0 0.0 3.0] [0.5 0Nf 1.5 3.0] [1 2 3 4])))
+(xbar V 0.0) !- domain
+(xbar V (at T 'z1)) !- domain
+(xbar V (at T 'nb)) !- domain
+(select {from: T r: (xbar v 0.0)}) !- domain
+(select {from: T r: (xbar v 0Nf)}) !- domain
+(select {from: T r: (xbar i 0.0)}) !- domain
+(select {from: T r: (xbar v z1)}) !- domain
+(select {from: T r: (xbar v z2)}) !- domain
+(select {from: T r: (xbar v nb)}) !- domain
+(select {from: T r: (xbar i z1)}) !- domain
+(select {from: T by: {k: (xbar v z1)} n: (count v)}) !- domain
+(select {from: T where: (> (xbar v z1) 0.0) n: (count v)}) !- domain
+
+;; --- the issue's repro, compositions and folded buckets ---
+(set T (table [v w] (list [1 -1 0Nl] [0 0 0])))
+(xbar (at T 'v) 0) !- domain
+(xbar (at T 'v) (at T 'w)) !- domain
+(select {from: T r: (xbar v 0)}) !- domain
+(select {from: T r: (xbar v w)}) !- domain
+(select {from: T by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: T r: (xbar (min v v) 0)}) !- domain
+(set T (table [k v w x] (list [1 1 2 2] [10 -11 12 0Nl] [3 0 3 3] [3 3 3 3])))
+(select {from: T r: (+ 1 (xbar v w))}) !- domain
+(select {from: T r: (xbar v (- 2 2))}) !- domain
+(select {from: T r: (xbar v (- x 3))}) !- domain
+(select {from: T r: (xbar v (* w x))}) !- domain
+(select {from: T r: (xbar 5 0)}) !- domain
+(select {from: T r: (xbar 5 w)}) !- domain
+(select {from: T s: (sum (xbar v w))}) !- domain
+(select {from: T by: k s: (sum (xbar v w))}) !- domain
+(select {from: T by: k s: (sum (xbar v 0))}) !- domain
+(select {from: T by: {b: (xbar v w)} s: (sum v)}) !- domain
+(select {from: T by: {b: (xbar v w) k: k} s: (sum v)}) !- domain
+(select {from: T where: (> (xbar v w) 0)}) !- domain
+(select {from: T where: (and (> x 0) (> (xbar v w) 0))}) !- domain
+(update {from: T r: (xbar v w)}) !- domain
+;; the builtin's message: its vector-by-integer path says non-zero, the rest
+;; also name null; an empty column is still an error for a literal bucket
+(set M (fn [e] (at e 'msg)))
+(try (select {from: T r: (xbar v 0)}) M) -- (try (xbar (at T 'v) 0) M)
+(try (select {from: T r: (xbar v 0i)}) M) -- (try (xbar (at T 'v) 0i) M)
+(try (select {from: T r: (xbar v 0Nl)}) M) -- (try (xbar (at T 'v) 0Nl) M)
+(try (select {from: T r: (xbar v 0x00)}) M) -- (try (xbar (at T 'v) 0x00) M)
+(try (select {from: T r: (xbar v w)}) M) -- (try (xbar (at T 'v) (at T 'w)) M)
+(try (select {from: T by: {b: (xbar v 0)} n: (count v)}) M) -- (try (xbar (at T 'v) 0) M)
+(try (select {from: T where: (> (xbar v w) 0)}) M) -- (try (xbar (at T 'v) (at T 'w)) M)
+(try (select {from: T r: (xbar 5 0)}) M) -- (try (xbar 5 0) M)
+(try (select {from: T r: (xbar (as 'U8 x) 0)}) M) -- (try (xbar (as 'U8 (at T 'x)) 0) M)
+(set E (take T 0))
+(xbar (at E 'v) 0) !- domain
+(select {from: E r: (xbar v 0)}) !- domain
+(select {from: E r: (xbar v 0h)}) !- domain
+(select {from: E by: {b: (xbar v 0)} n: (count v)}) !- domain
+(select {from: E where: (> (xbar v 0i) 0) n: (count v)}) !- domain
+;; ... the other zero or null literals raise per row, so an empty column
+;; gives an empty result
+(at (select {from: E r: (xbar v 0Nl)}) 'r) -- (xbar (at E 'v) 0Nl)
+(at (select {from: E r: (xbar v 0x00)}) 'r) -- (xbar (at E 'v) 0x00)
+(at (select {from: E r: (xbar v w)}) 'r) -- (xbar (at E 'v) (at E 'w))
+(at (select {from: E r: (xbar (as 'F64 v) 0.0)}) 'r) -- (xbar (as 'F64 (at E 'v)) 0.0)
+(at (select {from: T r: (xbar v x)}) 'r) -- (xbar (at T 'v) (at T 'x))
+(at (select {from: T r: (+ 1 (xbar v x))}) 'r) -- (+ 1 (xbar (at T 'v) (at T 'x)))
+(at (select {from: T by: k s: (sum (xbar v x))}) 's) -- [-3 12]
+;; a row where: drops is not bucketed, so its zero bucket is no error (as
+;; the builtin over the kept rows, and the per-row route)
+(set T (table [v w x f g] (list [10 -11 12 13] [3 0 3 0Nl] [3 -1 3 -1] [1.5 2.5 3.5 4.5] [0.5 0.0 1.0 0Nf])))
+(at (select {from: T where: (> x 0) r: (xbar v w)}) 'r) -- (xbar [10 12] 3)
+(at (select {from: T where: (> x 0) r: (xbar v w)}) 'r) -- (at (select {from: T where: (> x 0) r: (xbar (min v v) w)}) 'r)
+(at (select {from: T where: (> x 0) r: (xbar f g)}) 'r) -- (xbar [1.5 3.5] [0.5 1.0])
+(at (select {from: T where: (> x 0) r: (+ 1 (xbar v w))}) 'r) -- [10 13]
+(at (select {from: T where: (> x 0) by: {k: (xbar v w)} n: (count v)}) 'k) -- [9 12]
+(at (select {from: T where: (> x 0) s: (sum (xbar v w))}) 's) -- [21]
+(at (select {from: T where: (> x 0) by: x s: (sum (xbar v w))}) 's) -- [21]
+(at (select {from: T where: (> w 0) r: (xbar v w)}) 'r) -- [9 12]
+(select {from: T where: (!= w 0) r: (xbar v w)}) !- domain
+(count (select {from: T where: (and (> x 0) (> (xbar v w) 0))})) -- 2
+;; (update buckets every row, the per-row route included)
+(update {from: T where: (> x 0) v: (xbar (min v v) w)}) !- domain
+(update {from: T where: (> x 0) v: (xbar v w)}) !- domain
+;; ... while a kept row's zero bucket still raises
+(select {from: T where: (> v 0) r: (xbar v w)}) !- domain
+(select {from: T where: (> v 0) by: {k: (xbar v w)} n: (count v)}) !- domain
+(select {from: T where: (> v -20) r: (xbar f g)}) !- domain
+(update {from: T where: (> v 0) v: (xbar v w)}) !- domain
+;; the same over many morsels: one zero bucket on a dropped row in the middle
+(set N 300000)
+(set W (concat (take (+ 1 (% (til N) 5)) 150000) (concat [0] (take (+ 1 (% (til N) 5)) (- N 150001)))))
+(set X (concat (take (+ 1 (% (til N) 7)) 150000) (concat [-1] (take (+ 1 (% (til N) 7)) (- N 150001)))))
+(set B (table [v w x] (list (til N) W X)))
+(set K (where (> X 0)))
+(at (select {from: B where: (> x 0) r: (xbar v w)}) 'r) -- (xbar (at (til N) K) (at W K))
+(first (at (select {from: B where: (> x 0) s: (sum (xbar v w))}) 's)) -- (sum (xbar (at (til N) K) (at W K)))
+(count (select {from: B where: (> x 0) by: {k: (xbar v w)} n: (count v)})) -- (count (distinct (xbar (at (til N) K) (at W K))))
+(select {from: B r: (xbar v w)}) !- domain
+(select {from: B where: (> v 100) r: (xbar v w)}) !- domain
+(select {from: B where: (> v 100) by: {k: (xbar v w)} n: (count v)}) !- domain
+
+;; --- a parted table: the zero sits in the second partition ---
+(.sys.exec "rm -rf /tmp/rfl_xbar_zero")
+(.db.splayed.set "/tmp/rfl_xbar_zero/1/t/" (table [v w x] (list [10 -11 12] [3 3 3] [3 3 3])))
+(.db.splayed.set "/tmp/rfl_xbar_zero/2/t/" (table [v w x] (list [13 0Nl 15] [3 0 3] [3 -1 3])))
+(set Pt (.db.parted.get "/tmp/rfl_xbar_zero/" 't))
+(select {from: Pt r: (xbar v 0)}) !- domain
+(select {from: Pt r: (xbar v w)}) !- domain
+(select {from: Pt by: {k: (xbar v w)} n: (count v)}) !- domain
+(select {from: Pt by: {k: (xbar v 0)} n: (count v)}) !- domain
+(select {from: Pt where: (> (xbar v w) 0) n: (count v)}) !- domain
+(select {from: Pt s: (sum (xbar v w))}) !- domain
+(at (select {from: Pt r: (xbar v x)}) 'r) -- [9 -12 12 12 0Nl 15]
+(asc (at (select {from: Pt by: {k: (xbar v x)} n: (count v)}) 'k)) -- [0Nl -12 9 12 15]
+(at (select {from: Pt where: (> x 0) r: (xbar v w)}) 'r) -- [9 -12 12 12 15]
+(at (select {from: Pt where: (> x 0) by: {k: (xbar v w)} n: (count v)}) 'n) -- [1 1 2 1]
+(select {from: Pt where: (> w -5) r: (xbar v w)}) !- domain
+(select {from: Pt where: (> w -5) by: {k: (xbar v w)} n: (count v)}) !- domain
+(.sys.exec "rm -rf /tmp/rfl_xbar_zero")

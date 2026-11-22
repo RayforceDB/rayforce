@@ -68,6 +68,7 @@
 #include "rayforce.h"
 #include "ops/ops.h"   /* RAY_SEL_NONE/ALL/MIX, RAY_MORSEL_ELEMS */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* RAY_MORSEL_ELEMS must fit in uint16_t for morsel-local indices. */
@@ -106,6 +107,27 @@ static inline uint32_t* ray_rowsel_offsets(ray_t* block) {
 static inline uint16_t* ray_rowsel_idx(ray_t* block) {
     ray_rowsel_t* m = ray_rowsel_meta(block);
     return (uint16_t*)(ray_rowsel_offsets(block) + (m->n_segs + 1));
+}
+
+/* Whether `sel` keeps `row` (0 <= row < nrows).  A MIX segment's idx[]
+ * is ascending: binary search.  For a rare per-row question (an error
+ * path), not a scan. */
+static inline bool ray_rowsel_has(ray_t* sel, int64_t row) {
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    if (row < 0 || row >= m->nrows) return false;
+    uint32_t seg = (uint32_t)(row / RAY_MORSEL_ELEMS);
+    uint8_t f = ray_rowsel_flags(sel)[seg];
+    if (f != RAY_SEL_MIX) return f == RAY_SEL_ALL;
+    const uint32_t* off = ray_rowsel_offsets(sel);
+    const uint16_t* ix = ray_rowsel_idx(sel);
+    uint16_t want = (uint16_t)(row % RAY_MORSEL_ELEMS);
+    uint32_t lo = off[seg], hi = off[seg + 1];
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (ix[mid] < want) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < off[seg + 1] && ix[lo] == want;
 }
 
 /* Compute the total bytes needed for the inline payload.

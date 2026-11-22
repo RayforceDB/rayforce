@@ -1147,6 +1147,7 @@ typedef struct {
     uint8_t src2;       /* source 2 register (0xFF for unary) */
     uint8_t null_aware; /* 1 = use sentinel-checking kernel variant */
     uint8_t u8_mod_zero; /* U8 divisor: modulo by zero yields 0 */
+    uint8_t xbar;       /* OP_MOD of an xbar: a zero or null divisor raises */
 } expr_ins_t;
 
 enum { REG_SCAN = 0, REG_CONST = 1, REG_SCRATCH = 2 };
@@ -1158,6 +1159,12 @@ typedef struct {
     uint8_t out_reg;
     int8_t  out_type;       /* RAY_F64, RAY_I64, or RAY_BOOL */
     bool    has_parted;     /* true if any REG_SCAN refs a parted column */
+    /* An xbar instruction's row domain (borrowed g->selection, NULL: every
+     * row): a bad divisor on a row the selection drops is no error, as the
+     * builtin over the selected rows would not see it.  sel_off maps a
+     * morsel's row (segment-relative in a parted run) to the selection's. */
+    ray_t*  sel;
+    int64_t sel_off;
     struct {
         uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
         int8_t      type;       /* computational type: RAY_F64 / RAY_I64 / RAY_BOOL */

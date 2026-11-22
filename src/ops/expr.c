@@ -1861,6 +1861,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     .u8_mod_zero = (op == OP_MOD && ot == RAY_I64 &&
                                     op_child(g, node, 1) &&
                                     op_child(g, node, 1)->out_type == RAY_U8),
+                    .xbar = (op == OP_MOD && (node->flags & OP_FLAG_XBAR)),
                 };
                 /* The planner types narrow integer arithmetic in its own
                  * width (I16 * I16 is I16 and wraps), as the builtins do;
@@ -1934,6 +1935,11 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
         assert(out->out_type == pt && "fused result type differs from the plan");
     }
 #endif
+    /* xbar's row domain: the installed selection, when it covers this
+     * table's rows (else every row may raise). */
+    if (g->selection && ray_rowsel_meta(g->selection)->nrows == ray_table_nrows(tbl))
+        for (uint8_t i = 0; i < out->n_ins; i++)
+            if (out->ins[i].xbar) { out->sel = g->selection; break; }
     ray_expr_compile_ok++;
     return true;
 }
@@ -2058,9 +2064,13 @@ static void expr_load_f64(double* dst, const void* data, int8_t col_type,
  *
  * AND/OR on I64-dst: task derivation forces BOOL dst for AND/OR since Task 6,
  *   so these I64-dst cases are unreachable for null_aware programs; left plain.
+ *
+ * xbar (the OP_MOD of an xbar, I64 or F64 lanes, #1355): the zero-divisor
+ * and null branches, taken anyway, also set *bad on a zero or null divisor
+ * (expr_xbar_bad_kept then decides the error).  Untouched otherwise.
  */
 static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_zero,
-                              int8_t dt, void* dp,
+                              uint8_t xbar, int* bad, int8_t dt, void* dp,
                               int8_t t1, const void* ap,
                               int8_t t2, const void* bp, int64_t n) {
     (void)t2;
@@ -2108,7 +2118,18 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] * b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
             case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
-            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64; break;
+            case OP_MOD:
+                if (xbar) {
+                    int nb = 0;
+                    for (int64_t j = 0; j < n; j++) {
+                        nb |= (b[j] == 0.0) | (b[j] != b[j]);
+                        d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
+                    }
+                    *bad = nb;
+                    return;
+                }
+                for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
+                break;
             case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
@@ -2149,8 +2170,9 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
                     }
                     break;
                 case OP_MOD: for (int64_t j=0;j<n;j++) {
-                    if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    if (b[j]==0) { d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
+                    /* xbar: a zero or null divisor, null value or not */
+                    if (I64_ISN(a[j])||I64_ISN(b[j])) { if (xbar && (I64_ISN(b[j])||b[j]==0)) *bad=1; d[j]=NULL_I64; continue; }
+                    if (b[j]==0) { if (xbar) *bad=1; d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
                     if (b[j]==-1&&a[j]==INT64_MIN) { d[j]=NULL_I64; continue; }
                     int64_t m=a[j]%b[j];
                     if (m&&(m^b[j])<0) m+=b[j];
@@ -2190,7 +2212,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
                     }
                     break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0) { d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
+                    if (b[j]==0) { if (xbar) *bad=1; d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
                     if (b[j]==-1 && a[j]==INT64_MIN) { d[j]=NULL_I64; continue; }
                     int64_t m = a[j]%b[j];
                     if (m && (m^b[j])<0) m+=b[j];
@@ -2772,6 +2794,24 @@ static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, u
                              ray_enc_vview_t* vbuf, void** scratch, void** rptrs,
                              int64_t start, int64_t n, ray_t** err);
 
+/* A morsel [start, start + n) whose xbar divisor (lanes bp, type dt) had a
+ * zero or null: whether one sits on a row expr->sel keeps (every row
+ * without a selection).  A dropped row keeps the null its kernel wrote.
+ * The error path only: the kernel's pass already ran. */
+__attribute__((noinline, cold))
+static bool expr_xbar_bad_kept(const ray_expr_t* expr, int8_t dt, const void* bp,
+                               int64_t start, int64_t n) {
+    if (!expr->sel) return true;
+    int64_t row0 = expr->sel_off + start;
+    for (int64_t j = 0; j < n; j++) {
+        bool bad = dt == RAY_F64
+            ? (((const double*)bp)[j] == 0.0 || ((const double*)bp)[j] != ((const double*)bp)[j])
+            : (((const int64_t*)bp)[j] == 0 || ((const int64_t*)bp)[j] == NULL_I64);
+        if (bad && ray_rowsel_has(expr->sel, row0 + j)) return true;
+    }
+    return false;
+}
+
 /* Evaluate compiled expression for morsel [start, end).
  * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
  * rsc: one range scratch per register index, NULL when no register is
@@ -2819,10 +2859,15 @@ EXPR_ONE_COPY static void* expr_eval_morsel(const ray_expr_t* expr, const expr_e
         }
         int8_t dt = expr->regs[ins->dst].type;
         if (ins->src2 != 0xFF) {
+            int bad = 0;
             expr_exec_binary(ins->opcode, ins->null_aware, ins->u8_mod_zero,
-                             dt, rptrs[ins->dst],
+                             ins->xbar, &bad, dt, rptrs[ins->dst],
                              expr->regs[ins->src1].type, rptrs[ins->src1],
                              expr->regs[ins->src2].type, rptrs[ins->src2], n);
+            if (RAY_UNLIKELY(bad) && expr_xbar_bad_kept(expr, dt, rptrs[ins->src2], start, n)) {
+                *err = ray_error("domain", RAY_XBAR_BUCKET_ERR);
+                return NULL;
+            }
         } else {
             expr_exec_unary(ins->opcode, ins->null_aware, dt, rptrs[ins->dst],
                             expr->regs[ins->src1].type, rptrs[ins->src1], n);
@@ -3505,6 +3550,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
 
         /* Stack-copy expr, rebind parted registers to this segment */
         ray_expr_t seg_expr = *expr;
+        seg_expr.sel_off = global_off;   /* rows of segment s start there */
         ray_col_src_t seg_src[EXPR_MAX_REGS];     /* bound in place, released below */
         uint8_t n_seg_src = 0;
         bool seg_ok = true;
@@ -5597,6 +5643,49 @@ done:
     if (rsym_buf) ray_free_raw(rsym_buf);
 }
 
+/* The divisor of an xbar's OP_MOD has no zero and no null on any of the
+ * len rows sel keeps (NULL: every row; ray_xbar_fn raises domain on
+ * either).  One pass over a vector, reduced branch-free; a scalar is read
+ * once.  Only a bad divisor asks which rows sel keeps. */
+static bool xbar_divisor_ok(ray_t* rhs, bool r_scalar, double rf, int64_t ri,
+                            int64_t len, ray_t* sel) {
+    if (len == 0) return true;   /* no row to bucket, as the builtin's per-row path */
+    if (r_scalar) {
+        int8_t t = rhs->type < 0 ? (int8_t)-rhs->type : rhs->type;
+        bool null = ray_is_atom(rhs) ? RAY_ATOM_IS_NULL(rhs) : ray_vec_is_null(rhs, 0);
+        if (!null && (t == RAY_F64 || t == RAY_F32 ? rf != 0.0 : ri != 0)) return true;
+        return sel && ray_rowsel_meta(sel)->total_pass == 0;
+    }
+    const void* d = ray_data(rhs);
+#define XBAR_DIV_SCAN(T, BAD) do {                                            \
+        const T* b = (const T*)d;                                             \
+        int bad = 0;                                                          \
+        for (int64_t i = 0; i < len; i++) bad |= BAD;                         \
+        if (!bad) return true;                                                \
+        if (!sel) return false;                                               \
+        for (int64_t i = 0; i < len; i++)                                     \
+            if ((BAD) && ray_rowsel_has(sel, i)) return false;                \
+        return true;                                                          \
+    } while (0)
+    switch (rhs->type) {
+        case RAY_I64: case RAY_TIMESTAMP:
+            XBAR_DIV_SCAN(int64_t, (b[i] == 0) | (b[i] == NULL_I64));
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+            XBAR_DIV_SCAN(int32_t, (b[i] == 0) | (b[i] == NULL_I32));
+        case RAY_I16:
+            XBAR_DIV_SCAN(int16_t, (b[i] == 0) | (b[i] == NULL_I16));
+        case RAY_U8: case RAY_BOOL:
+            XBAR_DIV_SCAN(uint8_t, b[i] == 0);
+        case RAY_F64:
+            XBAR_DIV_SCAN(double, (b[i] == 0.0) | (b[i] != b[i]));
+        case RAY_F32:
+            XBAR_DIV_SCAN(float, (b[i] == 0.0f) | (b[i] != b[i]));
+        default:
+            return true;
+    }
+#undef XBAR_DIV_SCAN
+}
+
 /* Context for parallel binary dispatch */
 typedef struct {
     ray_op_t* op;
@@ -5962,6 +6051,17 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
     }
 
+    /* The OP_MOD of an xbar: a zero or null divisor is the builtin's domain
+     * error.  This pass over the divisor stands in for the zero-divisor
+     * pass below, which it makes moot. */
+    if (RAY_UNLIKELY(op->flags & OP_FLAG_XBAR) &&
+        !xbar_divisor_ok(rhs, r_scalar, r_f64_val, r_i64_val, len,
+                         g && g->selection && ray_rowsel_meta(g->selection)->nrows == len
+                             ? g->selection : NULL)) {
+        ray_release(result);
+        return ray_error("domain", RAY_XBAR_BUCKET_ERR);
+    }
+
     ray_pool_t* pool = ray_pool_get();
     if (pool && len >= RAY_PARALLEL_THRESHOLD) {
         par_binary_ctx_t ctx = {
@@ -6013,7 +6113,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     /* Div/mod: mark zero-divisor positions as null.
      * The morsel loop writes 0 for b==0 but can't set bitmap nulls. */
     uint16_t opc = op->opcode;
-    if (opc == OP_DIV || opc == OP_IDIV || opc == OP_MOD) {
+    if ((opc == OP_DIV || opc == OP_IDIV || opc == OP_MOD) && !(op->flags & OP_FLAG_XBAR)) {
         if (!r_scalar) {
             int8_t rt = rhs->type;
             if (rt == RAY_I64 || rt == RAY_TIMESTAMP) {

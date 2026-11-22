@@ -911,6 +911,43 @@ static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     }
 }
 
+/* A literal xbar bucket that is zero or null, where ray_xbar_fn raises
+ * whatever the column holds: its vector-by-integer fast path (an I16 / I32 /
+ * I64 bucket on an integer or temporal column, empty too, message
+ * "non-zero"), and an atom value.  Sets that domain error and returns true.
+ * Any other zero or null literal is left to the modulo kernels, which raise
+ * per row as the builtin's per-element path does (an empty column gives an
+ * empty result in both). */
+static bool xbar_literal_bucket_bad(ray_graph_t* g, ray_op_t* b, ray_op_t* col,
+                                    int8_t col_t) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v)) return false;
+    bool zero, ib = false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: zero = as_i64(v) == 0; ib = true; break;
+        case -RAY_F64: case -RAY_F32: zero = as_f64(v) == 0.0; break;
+        case -RAY_U8: case -RAY_BOOL: zero = v->u8 == 0; break;
+        case -RAY_DATE: case -RAY_TIME: zero = v->i32 == 0; break;
+        case -RAY_TIMESTAMP: zero = v->i64 == 0; break;
+        default: return false;
+    }
+    bool null = RAY_ATOM_IS_NULL(v);
+    if (!null && !zero) return false;
+    bool int_col = col_t == RAY_I64 || col_t == RAY_I32 || col_t == RAY_I16 ||
+                   col_t == RAY_TIMESTAMP || col_t == RAY_DATE || col_t == RAY_TIME;
+    bool atom = dag_const_is_atom(g, col);
+    bool fast = int_col && !atom && ib && !null;
+    if (!fast && !(atom && (int_col || col_t == RAY_U8 || col_t == RAY_BOOL ||
+                            col_t == RAY_F64 || col_t == RAY_F32)))
+        return false;
+    if (!g->compile_err)
+        g->compile_err = ray_error("domain", fast ? "xbar: bucket size must be non-zero"
+                                                  : RAY_XBAR_BUCKET_ERR);
+    return true;
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -2336,7 +2373,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             uint32_t col_id = col->id;
             ray_op_t* bucket = compile_expr_dag(g, elems[2]);
             if (!bucket) return NULL;
-            uint32_t bucket_id = bucket->id;
+            uint32_t bucket_id = bucket->id, lit_id = bucket->id;
             col = &g->nodes[col_id];
             /* xbar(x, b) = x - (x % b)  (stays in integer domain).
              *
@@ -2369,8 +2406,15 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                     col = &g->nodes[col_id];
                 }
             }
+            /* A zero or null bucket is ray_xbar_fn's domain error (#1355).
+             * A literal one the builtin rejects outright is decided here,
+             * once; every other one by the modulo kernels (OP_FLAG_XBAR),
+             * whose zero-divisor branch raises instead of writing a null. */
+            if (xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
+                return NULL;
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;
+            m->flags |= OP_FLAG_XBAR;
             col = &g->nodes[col_id];
             ray_op_t* r = ray_sub(g, col, m);
             if (!r || !temporal) return r;
