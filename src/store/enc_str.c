@@ -83,6 +83,11 @@ bool ray_enc_fsst_write(const uint64_t* clen, int n, const uint8_t* bytes, uint6
     return false;
 }
 
+const uint8_t* ray_enc_fsst_lengths(const uint8_t* p, size_t avail, int n, uint64_t* clen) {
+    int64_t a = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_FSST_LENGTHS, 1, NULL, clen);
+    return p + a + 8;                                           /* past the u64 total */
+}
+
 void ray_enc_fsst_parse(const uint8_t* p, size_t avail, int n, const ray_fsst_table_t* t,
                         uint64_t* clen, uint64_t* xlen, const uint8_t** bytes) {
     int64_t a = ray_enc_read(p, avail, 0, 0, n, K_U32, RAY_ENC_SLOT_FSST_LENGTHS, 1, NULL, clen);

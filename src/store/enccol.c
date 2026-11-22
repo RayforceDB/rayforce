@@ -2048,6 +2048,74 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
     return ray_enccol_desc_pool_bytes(e, c, j, &ray_enccol_descs(e, c)[j], out);
 }
 
+/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  Only that
+ * cell is read: an FSST vector's lengths are parsed and the one slice
+ * decoded (its decoded length compared first), a STR_DICT vector's codes
+ * read and the one entry compared, a RAW vector's cell (and the pooled
+ * lengths before it) read in place.  The vector is never decoded whole. */
+ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq) {
+    *eq = false;
+    if (e->type != RAY_STR || row < 0 || row >= e->len)
+        return ray_error("range", "column %s: row %lld", e->path, (long long)row);
+    const int64_t vec = row / RAY_ENC_VEC;
+    const int i = (int)(row % RAY_ENC_VEC);
+    const int64_t c = vec / RAY_ENC_VECS_PER_CHUNK;
+    const int j = (int)(vec % RAY_ENC_VECS_PER_CHUNK);
+    const ray_enc_desc_t* d = &ray_enccol_descs(e, c)[j];
+    const int64_t rows = chunk_rows(e, c);
+    const int vlen = (int)(rows - (int64_t)j * RAY_ENC_VEC < RAY_ENC_VEC ? rows - (int64_t)j * RAY_ENC_VEC : RAY_ENC_VEC);
+    if (i >= vlen) return ray_error("range", "column %s: row %lld", e->path, (long long)row);
+    const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
+    payload_parts(e, c, d, &body, &avail, &bm);
+    if (bm && ((bm[i >> 3] >> (i & 7)) & 1)) { *eq = l == 0; return NULL; }
+    if (d->encoding == RAY_ENC_STR_DICT) {
+        const ray_enc_sdict_t* sd;
+        ray_t* err = ray_enccol_strdict(e, &sd);
+        if (err) return err;
+        uint64_t codes[RAY_ENC_VEC];
+        ray_enc_strdict_read(body, (size_t)avail, vlen, codes);
+        const char* sp; uint32_t len;
+        ray_enc_sdict_entry(sd, (uint32_t)codes[i], &sp, &len);
+        *eq = len == l && (l == 0 || memcmp(sp, s, l) == 0);
+        return NULL;
+    }
+    if (d->encoding == RAY_ENC_FSST) {
+        const ray_fsst_table_t* t;
+        ray_t* err = enc_fsst(e, &t);
+        if (err) return err;
+        uint64_t clen[RAY_ENC_VEC];
+        const uint8_t* cb = ray_enc_fsst_lengths(body, (size_t)avail, vlen, clen);
+        uint64_t at = 0;
+        for (int k = 0; k < i; k++) at += clen[k];
+        if ((uint64_t)ray_fsst_expanded_len(t, cb + at, (uint32_t)clen[i]) != l) return NULL;
+        if (l == 0) { *eq = true; return NULL; }
+        uint8_t stack[256];
+        uint8_t* buf = l + 8 <= sizeof stack ? stack : (uint8_t*)ray_alloc_raw(l + 8);
+        if (!buf) return ray_error("oom", NULL);
+        (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], buf);
+        *eq = memcmp(buf, s, l) == 0;
+        if (buf != stack) ray_free_raw(buf);
+        return NULL;
+    }
+    if (d->encoding == RAY_ENC_CONST) {
+        uint32_t len; memcpy(&len, body, 4);
+        *eq = len == l && (l == 0 || memcmp(body + 8, s, l) == 0);
+        return NULL;
+    }
+    /* RAW: 16-byte cells, then the pooled bytes in row order */
+    const uint8_t* w = body + (size_t)i * 16;
+    uint32_t len; memcpy(&len, w, 4);
+    if (len != l) return NULL;
+    if (len <= RAY_STR_INLINE_MAX) { *eq = l == 0 || memcmp(w + 4, s, l) == 0; return NULL; }
+    uint64_t run = 0;
+    for (int k = 0; k < i; k++) {
+        uint32_t kl; memcpy(&kl, body + (size_t)k * 16, 4);
+        if (kl > RAY_STR_INLINE_MAX) run += kl;
+    }
+    *eq = memcmp(body + (uint64_t)vlen * 16 + 8 + run, s, l) == 0;
+    return NULL;
+}
+
 /* ---- Single-column materialization (spec "Materialized equivalence") ---- */
 
 typedef struct { ray_enc_snap_t snap; bool failed; bool done; } enc_task_res_t;

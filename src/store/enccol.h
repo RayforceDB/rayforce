@@ -248,6 +248,9 @@ ray_t* ray_enccol_desc_pool_bytes(ray_enccol_t* e, int64_t c, int j, const ray_e
  * bytes at pool_out[pool_base ...], sized by ray_enccol_vec_pool_bytes. */
 ray_t* ray_enccol_decode_vec(ray_enccol_t* e, int64_t vec, void* out, char* pool_out, uint64_t pool_base);
 ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out);
+/* Whether row `row` of the STR column `e` holds s[0..l), reading that cell
+ * alone (no vector decode).  NULL with *eq set, or an owned error. */
+ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq);
 uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width */
 
 /* The plain column (borrowed, cached for the object's lifetime) or an
