@@ -1,0 +1,178 @@
+;; @also-unfused
+;; @requires: posix  (parted and splayed fixtures under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; Keyless first / last skip a typed vector's nulls whatever route evaluates
+;; the argument (issue #1360).
+;;
+;; In a select, keyless or grouped, `first` and `last` skip nulls on typed
+;; vectors (docs: all-functions, first).  The keyless select did so for an
+;; argument the planner compiles (a plain column), but an argument it
+;; declines, such as `(+ d 0)` over a DATE column or an `if` with such an
+;; arm, went to the evaluator and took the cell by position.  So did every
+;; output of a select with one declined output beside it.  The evaluator
+;; route now skips nulls too, so the answer is the one over the column the
+;; argument computes, written by `update`.  A direct call outside a query
+;; stays positional.
+
+;; ── the issue's cases ───────────────────────────────────────────────────────
+(set N (table [e c k] (list [0Nd 2024.01.03 2024.01.05 0Nd] [1 5 6 2] [0 0 0 0])))
+(at (select {from: N s: (first e)}) 's)                          -- [2024.01.03]
+(at (select {from: N s: (first (+ e 0))}) 's)                    -- [2024.01.03]
+(at (select {from: N s: (last e)}) 's)                           -- [2024.01.05]
+(at (select {from: N s: (last (+ e 0))}) 's)                     -- [2024.01.05]
+(at (select {from: N by: k s: (first (+ e 0))}) 's)              -- [2024.01.03]
+(at (select {from: N by: k s: (last (+ e 0))}) 's)               -- [2024.01.05]
+(at (select {from: N s: (first (if (> c 4) (+ e 1) 0Nd))}) 's)   -- [2024.01.04]
+(at (select {from: N s: (last (if (> c 4) (+ e 1) 0Nd))}) 's)    -- [2024.01.06]
+;; outside a query the call is positional, as documented
+(first [0Nd 2024.01.03])                                         -- 0Nd
+(last [2024.01.03 0Nd])                                          -- 0Nd
+
+;; ── every typed vector, beside a declined output ────────────────────────────
+;; z declines, so the whole select goes to the evaluator: each plain column
+;; must answer as it does alone, where the planner compiles it
+(set G (as 'GUID "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"))
+(set T (table [h i l e f d t p n s g x b u c] (list (as 'I16 [0Nh 3 5 0Nh]) [0Ni 3i 5i 0Ni] [0Nl 3 5 0Nl] (as 'F32 [0Nf 3.0 5.0 0Nf]) [0Nf 3.0 5.0 0Nf] [0Nd 2024.01.03 2024.01.05 0Nd] [0Nt 10:00:00.000 11:00:00.000 0Nt] (as 'TIMESTAMP [0Nl 1000 2000 0Nl]) (as 'TIMESPAN [0Nl 1000 2000 0Nl]) [' a b '] (as 'GUID (list 0Ng G G 0Ng)) (list "" "x" "y" "") [false true true false] (as 'U8 [0 3 5 0]) [1 5 6 2])))
+(set R (fn [q] (at q 0)))
+(set A1 (R (select {from: T s1: (first h) s2: (first i) s3: (first l) s4: (first e) s5: (first f) s6: (first d) s7: (first t) s8: (first p) s9: (first n) s10: (first s) s11: (first g) s12: (first x) s13: (first b) s14: (first u)})))
+(set A2 (R (select {from: T z: (first (+ d 0)) s1: (first h) s2: (first i) s3: (first l) s4: (first e) s5: (first f) s6: (first d) s7: (first t) s8: (first p) s9: (first n) s10: (first s) s11: (first g) s12: (first x) s13: (first b) s14: (first u)})))
+(set B1 (R (select {from: T s1: (last h) s2: (last i) s3: (last l) s4: (last e) s5: (last f) s6: (last d) s7: (last t) s8: (last p) s9: (last n) s10: (last s) s11: (last g) s12: (last x) s13: (last b) s14: (last u)})))
+(set B2 (R (select {from: T z: (last (+ d 0)) s1: (last h) s2: (last i) s3: (last l) s4: (last e) s5: (last f) s6: (last d) s7: (last t) s8: (last p) s9: (last n) s10: (last s) s11: (last g) s12: (last x) s13: (last b) s14: (last u)})))
+(at A2 'z)  -- 2024.01.03
+(at B2 'z)  -- 2024.01.05
+(at A2 's1) -- (at A1 's1)
+(at A2 's2) -- (at A1 's2)
+(at A2 's3) -- (at A1 's3)
+(at A2 's4) -- (at A1 's4)
+(at A2 's5) -- (at A1 's5)
+(at A2 's6) -- (at A1 's6)
+(at A2 's7) -- (at A1 's7)
+(at A2 's8) -- (at A1 's8)
+(at A2 's9) -- (at A1 's9)
+(at A2 's10) -- (at A1 's10)
+(at A2 's11) -- (at A1 's11)
+(at A2 's12) -- (at A1 's12)
+(at A2 's13) -- (at A1 's13)
+(at A2 's14) -- (at A1 's14)
+(at B2 's1) -- (at B1 's1)
+(at B2 's2) -- (at B1 's2)
+(at B2 's3) -- (at B1 's3)
+(at B2 's4) -- (at B1 's4)
+(at B2 's5) -- (at B1 's5)
+(at B2 's6) -- (at B1 's6)
+(at B2 's7) -- (at B1 's7)
+(at B2 's8) -- (at B1 's8)
+(at B2 's9) -- (at B1 's9)
+(at B2 's10) -- (at B1 's10)
+(at B2 's11) -- (at B1 's11)
+(at B2 's12) -- (at B1 's12)
+(at B2 's13) -- (at B1 's13)
+(at B2 's14) -- (at B1 's14)
+;; and the values themselves
+(at A2 's1)  -- 3h
+(at A2 's2)  -- 3i
+(at A2 's6)  -- 2024.01.03
+(at A2 's7)  -- 10:00:00.000
+(== (at A2 's8) (as 'TIMESTAMP 1000)) -- true
+(== (at A2 's9) (as 'TIMESPAN 1000))  -- true
+(at A2 's10) -- 'a
+(at A2 's11) -- G
+(at A2 's12) -- "x"
+(at B2 's1)  -- 5h
+(at B2 's2)  -- 5i
+(at B2 's6)  -- 2024.01.05
+(at B2 's7)  -- 11:00:00.000
+(at B2 's10) -- 'b
+(at B2 's12) -- "y"
+(== (at B2 's4) (as 'F32 5.0)) -- true
+
+;; ── an argument the planner declines, against its materialized column ──────
+;; a lambda the planner opens is its body; `(+ d 0)` over a temporal column is
+;; left to the builtin
+(set w (fn [y] (+ y 0)))
+(set mkF (fn [n] (let r (til n)) (let X (table ['g 'c 'd 't 'p 'i 'j 'h] (list (take ['a 'b 'c] n) (% (* 7 r) 10) (+ 2024.01.01 (% r 50)) (+ 10:00:00.000 (% r 50)) (+ 2024.01.01D10:00:00.000000000 (% r 50)) r (as 'I32 r) (as 'I16 (% r 30))))) (update {from: X d: (if (< c 3) 0Nd d) t: (if (< c 3) 0Nt t) p: (if (< c 3) 0Np p) i: (if (< c 3) 0N i) j: (if (< c 3) 0Ni j) h: (if (< c 3) 0Nh h)})))
+(set mkO (fn [F] (update {from: F d1: (+ d 1) t1: (+ t 1) p1: (+ p 1) m1: (if (> c 4) (+ d 1) 0Nd) m2: (if (> c 4) d (+ d 1)) m3: (if (> c 6) (+ t 1) 0Nt) m4: (if (> c 4) j i) m5: (if (> c 5) h 0Nh) m6: (if (> c 4) (+ p 1) 0Np)})))
+(set F (mkF 3000))
+(set O (mkO F))
+;; d, t, p and the integers are null where c < 3, row 0 among them
+(take (at F 'c) 4)            -- [0 7 4 1]
+(first (at F 'd))             -- 0Nd
+(set K (fn [q] (at q 's)))
+(K (select {from: F s: (first (+ d 1))}))   -- (K (select {from: O s: (first d1)}))
+(K (select {from: F s: (last (+ d 1))}))    -- (K (select {from: O s: (last d1)}))
+(K (select {from: F s: (first (+ t 1))}))   -- (K (select {from: O s: (first t1)}))
+(K (select {from: F s: (last (+ t 1))}))    -- (K (select {from: O s: (last t1)}))
+(K (select {from: F s: (first (+ p 1))}))   -- (K (select {from: O s: (first p1)}))
+(K (select {from: F s: (last (+ p 1))}))    -- (K (select {from: O s: (last p1)}))
+(K (select {from: F s: (first (w d))}))     -- (K (select {from: O s: (first d)}))
+(K (select {from: F s: (first (if (> c 4) (+ d 1) 0Nd))}))  -- (K (select {from: O s: (first m1)}))
+(K (select {from: F s: (last (if (> c 4) (+ d 1) 0Nd))}))   -- (K (select {from: O s: (last m1)}))
+(K (select {from: F s: (first (if (> c 4) d (+ d 1)))}))    -- (K (select {from: O s: (first m2)}))
+(K (select {from: F s: (last (if (> c 4) d (+ d 1)))}))     -- (K (select {from: O s: (last m2)}))
+(K (select {from: F s: (first (if (> c 6) (+ t 1) 0Nt))}))  -- (K (select {from: O s: (first m3)}))
+(K (select {from: F s: (last (if (> c 4) (+ p 1) 0Np))}))   -- (K (select {from: O s: (last m6)}))
+;; integer arms of three widths beside a declined output
+(K (select {from: F z: (first (+ d 1)) s: (first (if (> c 4) j i))}))  -- (K (select {from: O s: (first m4)}))
+(K (select {from: F z: (first (+ d 1)) s: (last (if (> c 5) h 0Nh))})) -- (K (select {from: O s: (last m5)}))
+(K (select {from: F z: (first (+ d 1)) s: (first h)}))                 -- (K (select {from: O s: (first h)}))
+(K (select {from: F z: (first (+ d 1)) s: (last j)}))                  -- (K (select {from: O s: (last j)}))
+(type (K (select {from: F s: (first (if (> c 4) (+ d 1) 0Nd))})))     -- 'DATE
+;; the same as by: with one group
+(K (select {from: F s: (first (if (> c 4) (+ d 1) 0Nd))})) -- (K (select {from: (update {from: F k: 0}) by: k s: (first (if (> c 4) (+ d 1) 0Nd))}))
+(K (select {from: F s: (last (+ t 1))}))                   -- (K (select {from: (update {from: F k: 0}) by: k s: (last (+ t 1))}))
+
+;; ── where: ──────────────────────────────────────────────────────────────────
+(K (select {from: F where: (> c 1) s: (first (+ d 1))}))   -- (K (select {from: O where: (> c 1) s: (first d1)}))
+(K (select {from: F where: (< c 8) s: (last (+ d 1))}))    -- (K (select {from: O where: (< c 8) s: (last d1)}))
+(K (select {from: F where: (> c 1) s: (first (if (> c 4) (+ d 1) 0Nd))})) -- (K (select {from: O where: (> c 1) s: (first m1)}))
+(K (select {from: F where: (> i 100) z: (first (+ d 1)) s: (first j)}))  -- (K (select {from: O where: (> i 100) s: (first j)}))
+
+;; ── all null, and no row kept: that type's null ─────────────────────────────
+(K (select {from: F s: (first (if (> c 100) (+ d 1) 0Nd))}))   -- [0Nd]
+(K (select {from: F s: (last (if (> c 100) (+ d 1) 0Nd))}))    -- [0Nd]
+(K (select {from: F where: (< c 3) s: (first (+ d 1))}))       -- [0Nd]
+(K (select {from: F where: (< c 3) s: (last (+ t 1))}))        -- [0Nt]
+(K (select {from: F where: (> c 100) s: (first (+ d 1))}))     -- (K (select {from: F where: (> c 100) s: (first d)}))
+(K (select {from: F where: (> c 100) s: (last (+ p 1))}))      -- (K (select {from: F where: (> c 100) s: (last p)}))
+(type (K (select {from: F where: (> c 100) s: (first (+ d 1))}))) -- 'DATE
+
+;; ── a whole-column verb's result: nulls skipped, as under by: ──────────────
+(set V (table [s x d k] (list [bb ' aa '] (list "bb" "" "aa" "") [0Nd 2024.01.03 2024.01.05 0Nd] [0 0 0 0])))
+(K (select {from: V s: (first (asc s))}))  -- [aa]
+(K (select {from: V s: (first (asc x))}))  -- ["aa"]
+(K (select {from: V s: (last (desc d))}))  -- [2024.01.03]
+(K (select {from: V s: (first (asc s))}))  -- (K (select {from: V by: k s: (first (asc s))}))
+(K (select {from: V s: (first (asc d))}))  -- (K (select {from: V by: k s: (first (asc d))}))
+
+;; ── a LIST column answers as it did, as under by: ───────────────────────────
+(set L (table [x c k] (list (list (list 0Nl) 0Nl "a" 0Nl) [1 5 6 2] [0 0 0 0])))
+(K (select {from: L s: (first x)})) -- (K (select {from: L by: k s: (first x)}))
+(K (select {from: L s: (last x)}))  -- (K (select {from: L by: k s: (last x)}))
+
+;; ── splayed ─────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_keyless_first_last_nulls/") -- 0
+(.db.splayed.set "/tmp/rfl_keyless_first_last_nulls/s/t/" F)
+(set S (.db.splayed.get "/tmp/rfl_keyless_first_last_nulls/s/t/"))
+(K (select {from: S s: (first (+ d 1))}))                      -- (K (select {from: O s: (first d1)}))
+(K (select {from: S s: (last (if (> c 4) (+ p 1) 0Np))}))      -- (K (select {from: O s: (last m6)}))
+(K (select {from: S z: (first (+ d 1)) s: (first j)}))         -- (K (select {from: O s: (first j)}))
+(K (select {from: S where: (> c 1) s: (first (if (> c 4) (+ d 1) 0Nd))})) -- (K (select {from: O where: (> c 1) s: (first m1)}))
+
+;; ── parted: a data column and the partition key ─────────────────────────────
+;; the first partition holds the even rows, so its first row (row 0) is null
+(set mkP (fn [o] (select {from: F where: (== (% (til (count F)) 2) o)})))
+(.db.splayed.set "/tmp/rfl_keyless_first_last_nulls/p/2024.01.01/t/" (mkP 0) "/tmp/rfl_keyless_first_last_nulls/p/.sym")
+(.db.splayed.set "/tmp/rfl_keyless_first_last_nulls/p/2024.01.02/t/" (mkP 1) "/tmp/rfl_keyless_first_last_nulls/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_keyless_first_last_nulls/p/" 't))
+(set PO (mkO (select {from: P})))
+(K (select {from: P s: (first (+ d 1))}))                       -- (K (select {from: PO s: (first d1)}))
+(K (select {from: P s: (last (+ d 1))}))                        -- (K (select {from: PO s: (last d1)}))
+(K (select {from: P s: (first (if (> c 4) (+ d 1) 0Nd))}))      -- (K (select {from: PO s: (first m1)}))
+(K (select {from: P s: (last (if (> c 6) (+ t 1) 0Nt))}))       -- (K (select {from: PO s: (last m3)}))
+(K (select {from: P z: (first (+ d 1)) s: (first i)}))          -- (K (select {from: PO s: (first i)}))
+(K (select {from: P where: (> c 1) s: (first (+ p 1))}))        -- (K (select {from: PO where: (> c 1) s: (first p1)}))
+(K (select {from: P s: (first (+ date 0))}))                    -- [2024.01.01]
+;; the mapped tables go first, so the unfused pass can write the fixture again
+(set P 0)
+(set PO 0)
+(set S 0)
+(.sys.exec "rm -rf /tmp/rfl_keyless_first_last_nulls/") -- 0
