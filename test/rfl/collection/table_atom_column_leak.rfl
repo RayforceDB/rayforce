@@ -1,0 +1,13 @@
+;; table wraps an atom column in a one-element vector and used to keep that wrapper
+;; alive: two atom columns left 128 bytes per call (5000 calls: 640 KB).  The
+;; wrapper is also released on the row-count error.
+
+(table [a b] (list 1 2.5)) -- (table [a b] (list [1] [2.5]))
+(set tmem0 (at (.sys.mem) 'bytes-allocated))
+(times 5000 (table [a b] (list 1 2.5)))
+(< (- (at (.sys.mem) 'bytes-allocated) tmem0) 100000) -- true
+
+(at (try (table [a b] (list 1 [1 2])) (fn [e] e)) 'code) -- 'domain
+(set tmem1 (at (.sys.mem) 'bytes-allocated))
+(times 5000 (try (table [a b] (list 1 [1 2])) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) tmem1) 100000) -- true

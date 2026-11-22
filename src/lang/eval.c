@@ -2766,13 +2766,17 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
 
         /* If the column is already a typed vector, use it directly */
         if (ray_is_vec(col_src)) {
+            /* A wrapped atom is owned by this function: the table takes its
+             * own reference below, and ours is dropped with the call. */
+            bool wrapped = atom_wrap && !RAY_IS_ERR(atom_wrap);
             int64_t nrows = ray_len(col_src);
             if (expected_rows < 0) expected_rows = nrows;
             else if (nrows != expected_rows)
-                { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got %lld", (long long)expected_rows, (long long)nrows); }
+                { if (wrapped) ray_release(atom_wrap); ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got %lld", (long long)expected_rows, (long long)nrows); }
             ray_retain(col_src);
             tbl = ray_table_add_col(tbl, name_id, col_src);
             ray_release(col_src);
+            if (wrapped) ray_release(atom_wrap);
             if (RAY_IS_ERR(tbl)) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return tbl; }
             continue;
         }
