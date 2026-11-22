@@ -1,0 +1,17 @@
+;; #1374: a LIST needle's vector or list cell is one value to look up (the
+;; first haystack cell atom_eq calls equal), not a set of needles whose
+;; result's length was read as a row.
+(find (list [7] 1 [0.0] 3) (list [1 2 3])) -- [0Nl]
+(find (list [7] 1 [0.0]) (list [0.0])) -- [2]
+(find (list [7] 1 [0.0]) (list [7] 1 [0.0] 'a)) -- [0 1 2 0Nl]
+;; nested lists, strings and numbers meet by value
+(find (list (list 1 [2]) "ab" 5) (list "ab" (list 1 [2]) 5.0)) -- [1 0 2]
+;; a typed haystack holds no vector cell
+(find [1 2 3] (list [1 2] 2)) -- [0Nl 1]
+;; atom needles are unchanged
+(find (list 1 2 3) (list 2 3)) -- [1 2]
+(find (list 1 2 3) [2 3]) -- [1 2]
+;; each answer equals looking each cell up on its own in a one-cell list needle
+(set H (list [7 7] 1 [0.0] "s" (list 1 [2]) 3.0))
+(set N (list [7 7] [0.0] (list 1 [2]) 3 "s" [9]))
+(find H N) -- (raze (map (fn [c] (find H (enlist c))) N))

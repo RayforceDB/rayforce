@@ -4733,6 +4733,21 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             for (int64_t j = 0; j < vlen; j++) {
                 int alloc = 0;
                 ray_t* ve = collection_elem(val, j, &alloc);
+                if (ve && !ray_is_atom(ve)) {
+                    /* A vector or list cell is one value to look up, not a
+                     * set of needles: the first haystack cell atom_eq calls
+                     * equal, which only a LIST haystack can hold (#1374). */
+                    int64_t pos = NULL_I64;
+                    if (vec->type == RAY_LIST) {
+                        ray_t** cells = (ray_t**)ray_data(vec);
+                        for (int64_t k = 0; k < vec->len; k++)
+                            if (atom_eq(cells[k], ve)) { pos = k; break; }
+                    }
+                    if (alloc) ray_release(ve);
+                    if (pos == NULL_I64) { out[j] = NULL_I64; any_null = true; }
+                    else out[j] = pos;
+                    continue;
+                }
                 ray_t* one = ray_find_fn(vec, ve);   /* scalar → i64 atom or 0Nl */
                 if (alloc) ray_release(ve);
                 if (RAY_IS_ERR(one)) { ray_release(result); return one; }
