@@ -1652,9 +1652,19 @@ static int sym_vec_eq(ray_t* a, ray_t* b) {
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
         if (ray_timespan_binary_type(OP_EQ, a->type, b->type) <= 0) return 0;
+        /* An atom never equals a vector, and two vectors are equal when
+         * every element is: reading b8 of a BOOL vector read the low byte
+         * of its length, so any two vectors of 1..255 cells met. */
+        if ((a->type < 0) != (b->type < 0)) return 0;
+        if (a->type > 0 && a->len != b->len) return 0;
         ray_t* result = ray_timespan_binary(OP_EQ, a, b);
-        if (RAY_IS_ERR(result)) return 0;
-        int equal = result->b8;
+        if (!result || RAY_IS_ERR(result)) return 0;
+        int equal = 1;
+        if (result->type == -RAY_BOOL) equal = result->b8;
+        else if (result->type == RAY_BOOL) {
+            const uint8_t* v = ray_data(result);
+            for (int64_t i = 0; i < result->len && equal; i++) equal = v[i] != 0;
+        } else equal = 0;
         ray_release(result);
         return equal;
     }
@@ -1752,6 +1762,79 @@ int atom_eq(ray_t* a, ray_t* b) {
         }
         return 0;
     }
+}
+
+/* A hash for atom_eq: two cells atom_eq calls equal hash equal.  Hash sets
+ * over key cells (keyed-table ==, xkey's duplicate check) probe with it,
+ * so a vector cell is hashed by its contents, not by type and length
+ * (which put every vector of one type and length in one bucket).
+ *
+ * `spans` comes from ray_key_spans over every cell the set compares: a
+ * TIMESPAN anywhere sends atom_eq through ray_timespan_binary, which
+ * rounds numbers and reads TIME as ns (RAY_KEY_SPAN_ATOM normalizes atoms
+ * the same way) and compares a TIMESPAN vector element by element with
+ * other types (RAY_KEY_SPAN_VEC puts every vector in one bucket). */
+uint64_t ray_key_hash(ray_t* x, int spans) {
+    bool durations = spans & RAY_KEY_SPAN_ATOM;
+    if (!x || RAY_ATOM_IS_NULL(x)) return 0;
+    if (is_numeric(x)) return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
+    switch (x->type) {
+    case -RAY_SYM: return ray_hash_i64(x->i64);
+    case -RAY_TIMESTAMP:
+    case -RAY_TIMESPAN:
+        return durations ? ray_hash_f64((double)x->i64) : ray_hash_i64(x->i64);
+    case -RAY_TIME:
+        return durations ? ray_hash_f64((double)((int64_t)x->i32 * 1000000)) : ray_hash_i64(x->i32);
+    case -RAY_DATE: return ray_hash_i64(x->i32);
+    case -RAY_GUID:
+        return ray_hash_bytes(x->obj ? ray_data(x->obj) : ray_data(x), 16);
+    case -RAY_STR: return ray_hash_bytes(ray_str_ptr(x), ray_str_len(x));
+    case RAY_LIST: {
+        uint64_t h = ray_hash_i64(x->len);
+        ray_t** cells = ray_data(x);
+        for (int64_t i = 0; i < x->len; i++)
+            h = ray_hash_i64((int64_t)(h ^ ray_key_hash(cells[i], spans)));
+        return h;
+    }
+    case RAY_TABLE:
+    case RAY_DICT:
+        return spans ? 0 : ray_atom_hash(x);
+    }
+    /* No TIMESPAN vector anywhere: vector pairs compare by bytes (or by
+     * symbol), whatever the atoms do. */
+    if (spans & RAY_KEY_SPAN_VEC) return 0;
+    /* A SYM vector hashes its cells' text: atom_eq calls two SYM vectors
+     * equal when every cell is the same symbol, in any domain or stored
+     * width (#1311), and the text is what such cells share. */
+    if (x->type == RAY_SYM) {
+        uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
+        for (int64_t i = 0; i < x->len; i++) {
+            ray_t* s = ray_sym_vec_cell(x, i);
+            h = ray_hash_combine(h, s ? ray_hash_bytes(ray_str_ptr(s), ray_str_len(s)) : 0);
+        }
+        return h;
+    }
+    /* atom_eq's other vector arm: same type and length, then memcmp of
+     * len * ray_elem_size bytes, so type tags, null sentinels, NaN bits and
+     * STR descriptors all compare raw.  Hash those bytes. */
+    if (x->type > RAY_LIST && x->type <= RAY_STR)
+        return ray_hash_combine(ray_hash_i64(((int64_t)x->type << 32) ^ x->len),
+                                ray_hash_bytes(ray_data(x), (size_t)x->len * ray_elem_size(x->type)));
+    return 0;
+}
+
+/* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
+int ray_key_spans(ray_t* x) {
+    if (!x) return 0;
+    if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
+    if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
+    int spans = 0;
+    if (x->type == RAY_LIST) {
+        ray_t** cells = ray_data(x);
+        for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++)
+            spans |= ray_key_spans(cells[i]);
+    }
+    return spans;
 }
 
 /* Forward declaration */

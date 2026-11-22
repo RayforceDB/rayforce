@@ -35,8 +35,10 @@
 (value (== (kt2 (list [1 2] [3]) ['a 'b] [5 6]) (kt2 (list [3] [1 2]) ['b 'a] [6 5]))) -- (list {v: true} {v: true})
 (count (key (== (kt2 (list [1 2] [3]) ['a 'b] [5 6]) (kt2 (list [3] [1 2]) ['a 'b] [6 5])))) -- 4
 (value (== (kt2 (list [1 2] [3]) (list "p" "q") [5 6]) (kt2 (list [3] [1 2]) (list "q" "p") [6 5]))) -- (list {v: true} {v: true})
-;; A TIMESPAN vector cell keeps dev's duration compare (it meets [1 2]).
-(value (== (kt (list (as 'TIMESPAN [1 2]) [3 4]) [1 2]) (kt (list [3 4] [1 2]) [2 1]))) -- (list {v: false} {v: true})
+;; A TIMESPAN vector cell compares by duration, element by element: it meets
+;; [1 2] and not [3 4] (atom_eq read a length byte and met [3 4] too).
+(value (== (kt (list (as 'TIMESPAN [1 2]) [3 4]) [1 2]) (kt (list [3 4] [1 2]) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt (list (as 'TIMESPAN [1 2]) [5 6]) [1 2]) (kt (list [3 4] [5 6]) [1 2]))) -- (list false {v: true} false)
 ;; Keyed tables refuse duplicate vector keys.
 (kt (list [1 2] [1 2]) [1 2]) !- domain
 ;; Many reordered vector keys, and one changed cell among them.

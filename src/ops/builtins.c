@@ -3241,11 +3241,11 @@ static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
 }
 
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
- * unique group (one slot per gi), recomputed on grow via atom_hash. */
-typedef struct { ray_t** gkeys; } ght_list_ctx_t;
+ * unique group (one slot per gi), recomputed on grow via ray_key_hash. */
+typedef struct { ray_t** gkeys; int spans; } ght_list_ctx_t;
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return ray_atom_hash(c->gkeys[gi]);
+    return ray_key_hash(c->gkeys[gi], c->spans);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -3347,11 +3347,13 @@ ray_t* ray_group_indices_fn(ray_t* x) {
             ray_free(val_block); ray_free(ivblock); ray_free(kblock);
             return ray_error("oom", NULL);
         }
-        ght_list_ctx_t lctx = { .gkeys = gkeys };
+        /* atom_eq groups, so ray_key_hash: ray_atom_hash put every vector
+         * cell of one type and length in one bucket. */
+        ght_list_ctx_t lctx = { .gkeys = gkeys, .spans = ray_key_spans(x) };
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = ray_atom_hash(elem);
+            uint64_t h = ray_key_hash(elem, lctx.spans);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {

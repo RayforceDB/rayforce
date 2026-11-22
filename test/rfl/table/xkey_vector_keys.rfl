@@ -1,0 +1,92 @@
+;; xkey over vector and list key cells (#1310).  The duplicate check hashes
+;; each cell by its contents (ray_key_hash), consistently with atom_eq: a
+;; vector cell equals one of the same type, length and bytes; a SYM vector
+;; one of the same symbols in any domain or width.  Answers are dev's.
+(set kt (fn [ks] (count (xkey (table [k v] (list ks (til (count ks)))) [k]))))
+(set kt2 (fn [ks js] (count (xkey (table [k j v] (list ks js (til (count ks)))) [k j]))))
+;; Vector cells: equal bytes are a duplicate, another order or type is not.
+(kt (list [1 2] [1 2])) !- domain
+(kt (list [1 2] [2 1])) -- 2
+(kt (list [1 2] [1i 2i])) -- 2
+(kt (list [1 2] [1.0 2.0])) -- 2
+(kt (list (as 'DATE [1 2]) (as 'DATE [1 2]))) !- domain
+(kt (list (as 'DATE [1 2]) [1i 2i])) -- 2
+(kt (list [true false] [true false])) !- domain
+;; Nulls and NaN match themselves; -0.0 and 0.0 cells differ (bytes compare).
+(kt (list [1.0 0Nf] [1.0 0Nf])) !- domain
+(kt (list (enlist (/ 0.0 0.0)) (enlist (/ 0.0 0.0)))) !- domain
+(kt (list [-0.0] [0.0])) -- 2
+(kt (list [0Nl] [0Nl])) !- domain
+(kt (list [0Nl] [0Ni])) -- 2
+;; Empty vectors: one type's empties are one key, another type's differ.
+(kt (list (til 0) (til 0))) !- domain
+(kt (list (til 0) (as 'F64 (til 0)))) -- 2
+(kt (list (til 0) (list))) -- 2
+;; SYM and STR cells, short and pooled strings.
+(kt (list ['a 'b] ['a 'b])) !- domain
+(kt (list ['a 'b] ['b 'a])) -- 2
+(kt (list (list "ab" "cd") (list "ab" "cd"))) !- domain
+(kt (list (list "abcdefghijklmnopq") (list "abcdefghijklmnopq"))) !- domain
+(kt (list "ab" "ab")) !- domain
+(kt (list "ab" "ba")) -- 2
+;; Nested lists and composite keys mixing atom and vector cells; atoms in a
+;; list cell compare numerically across types.
+(kt (list (list 'x [1 2]) (list 'x [1 2]))) !- domain
+(kt (list (list 'x [1 2]) (list 'x [1 3]))) -- 2
+(kt (list (list [1] (list [2] "s")) (list [1] (list [2] "s")))) !- domain
+(kt (list (list 1 [2]) (list 1.0 [2]))) !- domain
+(kt2 (list [1 2] [1 2]) ['a 'b]) -- 2
+(kt2 (list [1 2] [1 2]) ['a 'a]) !- domain
+(kt2 (list [1 2] [1 2]) (list "p" "p")) !- domain
+;; Table and dict cells keep their compare.
+(kt (list (dict [a] [1]) (dict [a] [1]))) !- domain
+(kt (list (table [a] (list [1])) (table [a] (list [1])))) !- domain
+(kt (list (table [a] (list [1])) (table [a] (list [2])))) -- 2
+;; TIMESPAN: atom_eq compares by duration, element by element, so a
+;; TIMESPAN vector cell meets an equal I64 one and no other.
+(kt (list (as 'TIMESPAN [1 2]) [1 2])) !- domain
+(kt (list (as 'TIMESPAN [1 2]) [3 4])) -- 2
+(kt (list (as 'TIMESPAN [1 2]) (as 'TIMESPAN [3 4]))) -- 2
+(kt (list (as 'TIMESPAN [1 0Nl]) (as 'TIMESPAN [1 0Nl]))) !- domain
+(kt (list (as 'TIMESPAN (til 256)) (as 'TIMESPAN (til 256)))) !- domain
+(kt (list (as 'TIMESPAN [1 2]) (as 'TIMESPAN [1 2 3]))) -- 2
+(kt2 [1 1] (as 'TIMESPAN [1 1])) !- domain
+(kt2 (list [1] [1]) (as 'TIMESPAN [1 2])) -- 2
+(kt2 (list [1] [1]) (as 'TIMESPAN [1 1])) !- domain
+(count (distinct (list (as 'TIMESPAN [1 2]) (as 'TIMESPAN [3 4])))) -- 2
+(count (distinct (list (as 'TIMESPAN [1 2]) 1))) -- 2
+;; 20k vector and composite keys, then one duplicate at the end.
+(set m 20000)
+(set vk (map (fn [i] (enlist i)) (til m)))
+(kt vk) -- m
+(kt (concat vk (enlist (enlist 19999)))) !- domain
+(set lk (map (fn [i] (list 'x (enlist i))) (til m)))
+(kt lk) -- m
+(kt (concat lk (enlist (list 'x (enlist 7))))) !- domain
+(set sk (map (fn [i] (enlist (as 'SYM (as 'STR i)))) (til m)))
+(kt sk) -- m
+(kt (concat sk (enlist (enlist '123)))) !- domain
+;; SYM vectors read from disk against in-memory copies: a narrow
+;; file-domain vector, and a splayed column of SYM vector cells.
+(.sys.exec "rm -rf /tmp/rfl_xkey_vector_keys") -- 0
+(.db.splayed.set "/tmp/rfl_xkey_vector_keys/a/t/" (table [s] (list [a b c])) "/tmp/rfl_xkey_vector_keys/a/sym")
+(.db.splayed.set "/tmp/rfl_xkey_vector_keys/b/t/" (table [k v] (list (list [a b] [c] [b a]) [1 2 3])) "/tmp/rfl_xkey_vector_keys/b/sym")
+(set N (at (.db.splayed.get "/tmp/rfl_xkey_vector_keys/a/t/" "/tmp/rfl_xkey_vector_keys/a/sym") 's))
+(set T (.db.splayed.get "/tmp/rfl_xkey_vector_keys/b/t/" "/tmp/rfl_xkey_vector_keys/b/sym"))
+(kt (list N [a b c])) !- domain
+(kt (list [a b c] N)) !- domain
+(kt (list N [a b d])) -- 2
+(kt2 (list N [a b c]) ['x 'x]) !- domain
+(kt (concat sk (list N [a b c]))) !- domain
+(kt (concat sk (enlist N))) -- (+ m 1)
+(count (xkey T [k])) -- 3
+(kt (concat (at T 'k) (list [b a]))) !- domain
+(kt (concat (list [b a]) (at T 'k))) !- domain
+(kt (concat (at T 'k) (list [a c]))) -- 4
+(.sys.exec "rm -rf /tmp/rfl_xkey_vector_keys") -- 0
+;; group over a list takes the same hash: vector cells by content.
+(value (group (list [1 2] [2 1] [1 2] (til 0) (as 'F64 (til 0)) (til 0)))) -- (list [0 2] [1] [3 5] [4])
+(value (group (list (list 'x [1]) (list 'x [1.0]) (list 'x [1])))) -- (list [0 2] [1])
+(value (group (list (as 'TIMESPAN [1 2]) [3 4] [1 2]))) -- (list [0 2] [1])
+(count (group vk)) -- m
+(count (group (concat lk lk))) -- m
