@@ -52,7 +52,9 @@ A later projection can read an earlier output alias in the same `select`:
 ```
 
 The alias is bound after its own expression. `where:` and `by:` use the source
-table rather than projection aliases; sort keys have their own scope rules.
+table rather than projection aliases. A sort key (`asc:`, `desc:`) names a
+column of the result: an output alias wins, and a source column is used only
+when no output has that name.
 A quoted symbol used as data can also name a column in query context. See
 [Select](../queries/select.md) for these query-specific rules.
 

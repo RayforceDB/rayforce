@@ -453,6 +453,19 @@ Mix ascending and descending with separate clauses. Sort priority follows the or
 (select {from: t asc: sym desc: price})
 ```
 
+A sort key names a column of the result. A key that names an output sorts by
+that output's values, computed or renamed, even when a source column has the
+same name; the answer is the one `xasc`/`xdesc` gives on the unsorted select. A
+source column is used only when no output has the key's name, and it is not
+added to the result:
+
+```lisp
+(set t (table [a b] (list [3 1 2] [0 2 1])))
+(select {r: (+ a 1) from: t asc: r})   ; r: [2 3 4]
+(select {b: a from: t asc: b})         ; the output b: [1 2 3]
+(select {c: a from: t asc: b})         ; the source b: c is [3 2 1]
+```
+
 The sort is stable: rows that tie on every sort key keep the order in which
 they first appear in the source, and in a grouped select the group whose first
 source row comes first wins a tie. A `take:` after the sort therefore returns

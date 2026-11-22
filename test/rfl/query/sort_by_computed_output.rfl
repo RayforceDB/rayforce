@@ -1,10 +1,10 @@
 ;; @also-unfused
-;; A select sorted by one of its own outputs that is not a source column
-;; (#1338): `{r: (+ i 1) from: T asc: r}` raised `nyi` because the sort key
-;; was resolved as a source column.  It sorts by the output's values, the
-;; same rows in the same order (ties stable) as sorting the select's result
-;; afterwards with xasc / xdesc.  A source column of the key's name still
-;; wins (see sort_key_not_projected.rfl).
+;; A select's asc:/desc: key names a column of its result (#1338):
+;; `{r: (+ i 1) from: T asc: r}` raised `nyi` because the key was resolved
+;; as a source column.  A key naming an output sorts by the output's values,
+;; even when a source column has the same name: the same rows in the same
+;; order (ties stable) as xasc / xdesc of the unsorted select, on every
+;; route.  A key naming no output is a source column, as before.
 (set n 40)
 (set I (til n))
 (set nz (fn [v z] (at (concat v (enlist z)) (+ I (* (- n I) (as 'I64 (== 0 (% I 9))))))))
@@ -95,8 +95,135 @@
 (set P 0)
 (.sys.exec "rm -rf rf_test_sortcomp") -- 0
 
-;; a source column of the key's name still wins over an output (pinned by
-;; sort_key_not_projected.rfl): sorted by the source b, not the output b
-(set HB (table [a b] (list [3 1 2] [0 2 1])))
-(at (select {b: (+ a 1) from: HB asc: b}) 'b) -- [4 3 2]
-(at (select {b: a from: HB asc: b}) 'b) -- [3 2 1]
+;; an output that shadows a source column of the key's name: the output
+;; wins on every route (keyless DAG, fused top-k, evaluator fallback, a
+;; temporal output, by:, an all-aggregate select)
+(set HB (table [a b k] (list [3 1 2] [0 2 1] [0 1 0])))
+(at (select {b: (+ a 1) from: HB asc: b}) 'b) -- [2 3 4]
+(at (select {b: a from: HB asc: b}) 'b) -- [1 2 3]
+(at (select {b: a from: HB desc: b take: 2}) 'b) -- [3 2]
+(select {b: (+ a 1) from: HB asc: b}) -- (xasc (select {b: (+ a 1) from: HB}) 'b)
+(select {b: a k: k from: HB desc: b take: 2}) -- (take (xdesc (select {b: a k: k from: HB}) 'b) 2)
+(select {b: a k: k from: HB where: (> a 1) desc: b take: 1}) -- (take (xdesc (select {b: a k: k from: HB where: (> a 1)}) 'b) 1)
+(select {b: (+ (min a a) 1) from: HB asc: b}) -- (xasc (select {b: (+ (min a a) 1) from: HB}) 'b)
+(select {b: (sum a) from: HB by: k asc: b}) -- (xasc (select {b: (sum a) from: HB by: k}) 'b)
+(select {b: (sum a) from: HB asc: b}) -- (table [b] (list [6]))
+(select {d: (+ d 1) k: k from: T asc: [d k]}) -- (xasc (select {d: (+ d 1) k: k from: T}) ['d 'k])
+(select {t: (+ t 1) i: i from: T desc: t take: 4}) -- (take (xdesc (select {t: (+ t 1) i: i from: T}) 't) 4)
+(select {i: (- 0 i) k: k from: T asc: i take: 6}) -- (take (xasc (select {i: (- 0 i) k: k from: T}) 'i) 6)
+(select {s: str k: k from: T desc: s}) -- (xdesc (select {s: str k: k from: T}) 's)
+;; an earlier output scans the source column the key names, a later output
+;; carries the key's name: the key reads the later output
+(select {k: i i: (% k 3) from: T asc: i}) -- (xasc (select {k: i i: (% k 3) from: T}) 'i)
+(select {a: b b: c from: (table [a b c] (list [3 1 2] [0 2 1] [5 4 6])) asc: b}) -- (table [a b] (list [2 0 1] [4 5 6]))
+(select {a: b b: (+ c 1) from: (table [a b c] (list [3 1 2] [0 2 1] [5 4 6])) desc: b take: 2}) -- (table [a b] (list [1 0] [7 6]))
+
+;; generated: outputs that shadow, rename, compute or pass source columns
+;; through; keys naming outputs or only source columns (the hidden-key
+;; route), in either direction and in groups; where:, take:; a small, a
+;; large and a parted table.  A key naming no output is pinned against
+;; sorting a select that also carries it as zk_<name>.
+(set I2 (til 40))
+(set ST (table [a b c s f] (list (% (* I2 7) 11) (% (* I2 5) 6) (% (* I2 3) 4) (at ['q 'p 'r] (% I2 3)) (* 0.5 (% (* I2 5) 7)))))
+(set J2 (til 20000))
+(set SB (table [a b c s f] (list (% (* J2 7919) 1009) (% J2 13) (% J2 7) (at ['q 'p 'r] (% J2 3)) (* 0.25 (% J2 101)))))
+(.sys.exec "rm -rf rf_test_sortcomp2") -- 0
+(.db.splayed.set "rf_test_sortcomp2/2024.01.01/t/" (take ST 15) "rf_test_sortcomp2/.sym")
+(.db.splayed.set "rf_test_sortcomp2/2024.01.02/t/" (take (drop ST 15) 15) "rf_test_sortcomp2/.sym")
+(.db.splayed.set "rf_test_sortcomp2/2024.01.03/t/" (drop ST 30) "rf_test_sortcomp2/.sym")
+(set SP (.db.parted.get "rf_test_sortcomp2/" 't))
+(select {b: a from: SP where: (> a 1) desc: f asc: s take: 3}) -- (select {b: b from: (take (xdesc (xasc (select {b: a zk_f: f zk_s: s from: SP where: (> a 1)}) 'zk_s) 'zk_f) 3)})
+(select {b: a from: SP desc: [f a] take: 100}) -- (select {b: b from: (take (xdesc (xdesc (select {b: a zk_f: f zk_a: a from: SP}) 'zk_a) 'zk_f) (min 100 (count (xdesc (xdesc (select {b: a zk_f: f zk_a: a from: SP}) 'zk_a) 'zk_f))))})
+(select {b: a from: ST asc: [b s] desc: a take: 100}) -- (select {b: b from: (take (xasc (xasc (xdesc (select {b: a zk_s: s zk_a: a from: ST}) 'zk_a) 'zk_s) 'b) (min 100 (count (xasc (xasc (xdesc (select {b: a zk_s: s zk_a: a from: ST}) 'zk_a) 'zk_s) 'b))))})
+(select {b: a from: ST where: (> a 1) desc: b take: 100}) -- (take (xdesc (select {b: a from: ST where: (> a 1)}) 'b) (min 100 (count (xdesc (select {b: a from: ST where: (> a 1)}) 'b))))
+(select {b: a from: SB where: (> a 1) asc: c desc: s take: -4}) -- (select {b: b from: (take (xasc (xdesc (select {b: a zk_c: c zk_s: s from: SB where: (> a 1)}) 'zk_s) 'zk_c) -4)})
+(select {b: a from: SP where: (> (+ a 1) 3) desc: b take: [2 3]}) -- (take (xdesc (select {b: a from: SP where: (> (+ a 1) 3)}) 'b) [2 3])
+(select {b: (+ a 1) from: SB where: (> a 1) desc: c take: 100}) -- (select {b: b from: (take (xdesc (select {b: (+ a 1) zk_c: c from: SB where: (> a 1)}) 'zk_c) (min 100 (count (xdesc (select {b: (+ a 1) zk_c: c from: SB where: (> a 1)}) 'zk_c))))})
+(select {b: (+ a 1) from: ST asc: b take: [2 3]}) -- (take (xasc (select {b: (+ a 1) from: ST}) 'b) [2 3])
+(select {b: (+ a 1) from: ST desc: s}) -- (select {b: b from: (xdesc (select {b: (+ a 1) zk_s: s from: ST}) 'zk_s)})
+(select {b: (+ a 1) from: ST where: (in s ['p 'q]) desc: b take: [2 3]}) -- (take (xdesc (select {b: (+ a 1) from: ST where: (in s ['p 'q])}) 'b) [2 3])
+(select {b: (+ a 1) from: ST desc: [a c] take: [2 3]}) -- (select {b: b from: (take (xdesc (xdesc (select {b: (+ a 1) zk_a: a zk_c: c from: ST}) 'zk_c) 'zk_a) [2 3])})
+(select {b: (+ a 1) from: SB asc: a}) -- (select {b: b from: (xasc (select {b: (+ a 1) zk_a: a from: SB}) 'zk_a)})
+(select {b: c a: b from: SP where: (> a 1) desc: [a f] take: [2 3]}) -- (select {b: b a: a from: (take (xdesc (xdesc (select {b: c a: b zk_f: f from: SP where: (> a 1)}) 'zk_f) 'a) [2 3])})
+(select {b: c a: b from: SB where: (> (+ a 1) 3) desc: [b s] take: 100}) -- (select {b: b a: a from: (take (xdesc (xdesc (select {b: c a: b zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) 'b) (min 100 (count (xdesc (xdesc (select {b: c a: b zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) 'b))))})
+(select {b: c a: b from: ST desc: a}) -- (xdesc (select {b: c a: b from: ST}) 'a)
+(select {b: c a: b from: SB where: (> (+ a 1) 3) desc: s take: -4}) -- (select {b: b a: a from: (take (xdesc (select {b: c a: b zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) -4)})
+(select {b: c a: b from: SP where: (> a 1) desc: b}) -- (xdesc (select {b: c a: b from: SP where: (> a 1)}) 'b)
+(select {b: c a: b from: SB where: (> a 1) asc: c take: 100}) -- (select {b: b a: a from: (take (xasc (select {b: c a: b zk_c: c from: SB where: (> a 1)}) 'zk_c) (min 100 (count (xasc (select {b: c a: b zk_c: c from: SB where: (> a 1)}) 'zk_c))))})
+(select {a: b b: a from: ST where: (> a 1) desc: [b s] take: 100}) -- (select {a: a b: b from: (take (xdesc (xdesc (select {a: b b: a zk_s: s from: ST where: (> a 1)}) 'zk_s) 'b) (min 100 (count (xdesc (xdesc (select {a: b b: a zk_s: s from: ST where: (> a 1)}) 'zk_s) 'b))))})
+(select {a: b b: a from: SP where: (in s ['p 'q]) asc: [b f c] take: [2 3]}) -- (select {a: a b: b from: (take (xasc (xasc (xasc (select {a: b b: a zk_f: f zk_c: c from: SP where: (in s ['p 'q])}) 'zk_c) 'zk_f) 'b) [2 3])})
+(select {a: b b: a from: SP desc: s}) -- (select {a: a b: b from: (xdesc (select {a: b b: a zk_s: s from: SP}) 'zk_s)})
+(select {a: b b: a from: SB where: (in s ['p 'q]) asc: b take: -4}) -- (take (xasc (select {a: b b: a from: SB where: (in s ['p 'q])}) 'b) -4)
+(select {a: b b: a from: ST asc: [s c] take: 3}) -- (select {a: a b: b from: (take (xasc (xasc (select {a: b b: a zk_s: s zk_c: c from: ST}) 'zk_c) 'zk_s) 3)})
+(select {a: b b: a from: ST where: (> a 1) desc: f asc: a}) -- (select {a: a b: b from: (xdesc (xasc (select {a: b b: a zk_f: f from: ST where: (> a 1)}) 'a) 'zk_f)})
+(select {c: (- 0 c) a: a from: ST desc: s}) -- (select {c: c a: a from: (xdesc (select {c: (- 0 c) a: a zk_s: s from: ST}) 'zk_s)})
+(select {c: (- 0 c) a: a from: SB where: (> a 1) asc: b}) -- (select {c: c a: a from: (xasc (select {c: (- 0 c) a: a zk_b: b from: SB where: (> a 1)}) 'zk_b)})
+(select {c: (- 0 c) a: a from: ST where: (> a 1) asc: s take: 100}) -- (select {c: c a: a from: (take (xasc (select {c: (- 0 c) a: a zk_s: s from: ST where: (> a 1)}) 'zk_s) (min 100 (count (xasc (select {c: (- 0 c) a: a zk_s: s from: ST where: (> a 1)}) 'zk_s))))})
+(select {c: (- 0 c) a: a from: ST where: (> (+ a 1) 3) asc: s}) -- (select {c: c a: a from: (xasc (select {c: (- 0 c) a: a zk_s: s from: ST where: (> (+ a 1) 3)}) 'zk_s)})
+(select {c: (- 0 c) a: a from: ST where: (> a 1) desc: [c s]}) -- (select {c: c a: a from: (xdesc (xdesc (select {c: (- 0 c) a: a zk_s: s from: ST where: (> a 1)}) 'zk_s) 'c)})
+(select {c: (- 0 c) a: a from: SB where: (> a 1) asc: [f b] take: -4}) -- (select {c: c a: a from: (take (xasc (xasc (select {c: (- 0 c) a: a zk_f: f zk_b: b from: SB where: (> a 1)}) 'zk_b) 'zk_f) -4)})
+(select {r: (* a 2) s: s from: ST desc: f take: [2 3]}) -- (select {r: r s: s from: (take (xdesc (select {r: (* a 2) s: s zk_f: f from: ST}) 'zk_f) [2 3])})
+(select {r: (* a 2) s: s from: ST asc: c desc: r take: 100}) -- (select {r: r s: s from: (take (xasc (xdesc (select {r: (* a 2) s: s zk_c: c from: ST}) 'r) 'zk_c) (min 100 (count (xasc (xdesc (select {r: (* a 2) s: s zk_c: c from: ST}) 'r) 'zk_c))))})
+(select {r: (* a 2) s: s from: SP where: (> (+ a 1) 3) asc: r take: [2 3]}) -- (take (xasc (select {r: (* a 2) s: s from: SP where: (> (+ a 1) 3)}) 'r) [2 3])
+(select {r: (* a 2) s: s from: SB where: (in s ['p 'q]) asc: b take: [2 3]}) -- (select {r: r s: s from: (take (xasc (select {r: (* a 2) s: s zk_b: b from: SB where: (in s ['p 'q])}) 'zk_b) [2 3])})
+(select {r: (* a 2) s: s from: ST asc: r desc: c take: [2 3]}) -- (select {r: r s: s from: (take (xasc (xdesc (select {r: (* a 2) s: s zk_c: c from: ST}) 'zk_c) 'r) [2 3])})
+(select {r: (* a 2) s: s from: ST where: (in s ['p 'q]) desc: f take: -4}) -- (select {r: r s: s from: (take (xdesc (select {r: (* a 2) s: s zk_f: f from: ST where: (in s ['p 'q])}) 'zk_f) -4)})
+(select {s: f c: c from: ST where: (> a 1) desc: a take: 100}) -- (select {s: s c: c from: (take (xdesc (select {s: f c: c zk_a: a from: ST where: (> a 1)}) 'zk_a) (min 100 (count (xdesc (select {s: f c: c zk_a: a from: ST where: (> a 1)}) 'zk_a))))})
+(select {s: f c: c from: SB where: (> a 1) desc: b take: -4}) -- (select {s: s c: c from: (take (xdesc (select {s: f c: c zk_b: b from: SB where: (> a 1)}) 'zk_b) -4)})
+(select {s: f c: c from: ST where: (> a 1) desc: a asc: [c f] take: [2 3]}) -- (select {s: s c: c from: (take (xdesc (xasc (xasc (select {s: f c: c zk_a: a zk_f: f from: ST where: (> a 1)}) 'zk_f) 'c) 'zk_a) [2 3])})
+(select {s: f c: c from: SB desc: [a c]}) -- (select {s: s c: c from: (xdesc (xdesc (select {s: f c: c zk_a: a from: SB}) 'c) 'zk_a)})
+(select {s: f c: c from: SB where: (> (+ a 1) 3) desc: s take: 3}) -- (take (xdesc (select {s: f c: c from: SB where: (> (+ a 1) 3)}) 's) 3)
+(select {s: f c: c from: ST where: (in s ['p 'q]) asc: [f b] take: -4}) -- (select {s: s c: c from: (take (xasc (xasc (select {s: f c: c zk_f: f zk_b: b from: ST where: (in s ['p 'q])}) 'zk_b) 'zk_f) -4)})
+(select {a: a b: b c: c from: SP asc: c take: -4}) -- (take (xasc (select {a: a b: b c: c from: SP}) 'c) -4)
+(select {a: a b: b c: c from: SB asc: c take: 3}) -- (take (xasc (select {a: a b: b c: c from: SB}) 'c) 3)
+(select {a: a b: b c: c from: SP where: (> a 1) asc: b desc: a}) -- (xasc (xdesc (select {a: a b: b c: c from: SP where: (> a 1)}) 'a) 'b)
+(select {a: a b: b c: c from: SP where: (> (+ a 1) 3) desc: s}) -- (select {a: a b: b c: c from: (xdesc (select {a: a b: b c: c zk_s: s from: SP where: (> (+ a 1) 3)}) 'zk_s)})
+(select {a: a b: b c: c from: SP where: (> (+ a 1) 3) asc: b take: 3}) -- (take (xasc (select {a: a b: b c: c from: SP where: (> (+ a 1) 3)}) 'b) 3)
+(select {a: a b: b c: c from: ST asc: s take: 3}) -- (select {a: a b: b c: c from: (take (xasc (select {a: a b: b c: c zk_s: s from: ST}) 'zk_s) 3)})
+(select {x: c y: a from: SP where: (> a 1) desc: f take: [2 3]}) -- (select {x: x y: y from: (take (xdesc (select {x: c y: a zk_f: f from: SP where: (> a 1)}) 'zk_f) [2 3])})
+(select {x: c y: a from: SB where: (in s ['p 'q]) desc: x take: 3}) -- (take (xdesc (select {x: c y: a from: SB where: (in s ['p 'q])}) 'x) 3)
+(select {x: c y: a from: SB where: (> (+ a 1) 3) asc: y desc: s take: [2 3]}) -- (select {x: x y: y from: (take (xasc (xdesc (select {x: c y: a zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) 'y) [2 3])})
+(select {x: c y: a from: SB where: (> (+ a 1) 3) desc: y asc: [x s] take: 100}) -- (select {x: x y: y from: (take (xdesc (xasc (xasc (select {x: c y: a zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) 'x) 'y) (min 100 (count (xdesc (xasc (xasc (select {x: c y: a zk_s: s from: SB where: (> (+ a 1) 3)}) 'zk_s) 'x) 'y))))})
+(select {x: c y: a from: ST where: (> (+ a 1) 3) asc: s take: 100}) -- (select {x: x y: y from: (take (xasc (select {x: c y: a zk_s: s from: ST where: (> (+ a 1) 3)}) 'zk_s) (min 100 (count (xasc (select {x: c y: a zk_s: s from: ST where: (> (+ a 1) 3)}) 'zk_s))))})
+(select {x: c y: a from: SB where: (in s ['p 'q]) desc: b take: -4}) -- (select {x: x y: y from: (take (xdesc (select {x: c y: a zk_b: b from: SB where: (in s ['p 'q])}) 'zk_b) -4)})
+(select {f: (neg f) r: (% a 3) from: ST asc: r take: [2 3]}) -- (take (xasc (select {f: (neg f) r: (% a 3) from: ST}) 'r) [2 3])
+(select {f: (neg f) r: (% a 3) from: ST where: (> a 1) desc: c take: [2 3]}) -- (select {f: f r: r from: (take (xdesc (select {f: (neg f) r: (% a 3) zk_c: c from: ST where: (> a 1)}) 'zk_c) [2 3])})
+(select {f: (neg f) r: (% a 3) from: SP where: (in s ['p 'q]) asc: [s c] take: 100}) -- (select {f: f r: r from: (take (xasc (xasc (select {f: (neg f) r: (% a 3) zk_s: s zk_c: c from: SP where: (in s ['p 'q])}) 'zk_c) 'zk_s) (min 100 (count (xasc (xasc (select {f: (neg f) r: (% a 3) zk_s: s zk_c: c from: SP where: (in s ['p 'q])}) 'zk_c) 'zk_s))))})
+(select {f: (neg f) r: (% a 3) from: SP where: (> (+ a 1) 3) desc: r take: 100}) -- (take (xdesc (select {f: (neg f) r: (% a 3) from: SP where: (> (+ a 1) 3)}) 'r) (min 100 (count (xdesc (select {f: (neg f) r: (% a 3) from: SP where: (> (+ a 1) 3)}) 'r))))
+(select {f: (neg f) r: (% a 3) from: SP where: (> (+ a 1) 3) asc: c take: -4}) -- (select {f: f r: r from: (take (xasc (select {f: (neg f) r: (% a 3) zk_c: c from: SP where: (> (+ a 1) 3)}) 'zk_c) -4)})
+(select {f: (neg f) r: (% a 3) from: SB where: (> (+ a 1) 3) desc: [c r] take: 100}) -- (select {f: f r: r from: (take (xdesc (xdesc (select {f: (neg f) r: (% a 3) zk_c: c from: SB where: (> (+ a 1) 3)}) 'r) 'zk_c) (min 100 (count (xdesc (xdesc (select {f: (neg f) r: (% a 3) zk_c: c from: SB where: (> (+ a 1) 3)}) 'r) 'zk_c))))})
+(take (select {b: a from: SB desc: b}) 5) -- (take (xdesc (select {b: a from: SB}) 'b) 5)
+(first (select {b: a from: ST asc: b})) -- (first (xasc (select {b: a from: ST}) 'b))
+(take (select {b: (+ a 1) from: SB desc: b}) 5) -- (take (xdesc (select {b: (+ a 1) from: SB}) 'b) 5)
+(first (select {b: (+ a 1) from: ST asc: b})) -- (first (xasc (select {b: (+ a 1) from: ST}) 'b))
+(take (select {b: c a: b from: SB desc: b}) 5) -- (take (xdesc (select {b: c a: b from: SB}) 'b) 5)
+(first (select {b: c a: b from: ST asc: b})) -- (first (xasc (select {b: c a: b from: ST}) 'b))
+(take (select {a: b b: a from: SB desc: a}) 5) -- (take (xdesc (select {a: b b: a from: SB}) 'a) 5)
+(first (select {a: b b: a from: ST asc: a})) -- (first (xasc (select {a: b b: a from: ST}) 'a))
+(take (select {c: (- 0 c) a: a from: SB desc: c}) 5) -- (take (xdesc (select {c: (- 0 c) a: a from: SB}) 'c) 5)
+(first (select {c: (- 0 c) a: a from: ST asc: c})) -- (first (xasc (select {c: (- 0 c) a: a from: ST}) 'c))
+;; parted routes that read sort keys from the partitions (the pre-sorted
+;; concat, the per-partition top-k, the key sort and gather) decline a key
+;; naming a renaming or computed output
+(select {b: a from: SP desc: [b f] take: 3}) -- (select {b: b from: (take (xdesc (xdesc (select {b: a zk_f: f from: SP}) 'zk_f) 'b) 3)})
+(select {s: f c: c from: SP desc: [s f] take: -4}) -- (select {s: s c: c from: (take (xdesc (xdesc (select {s: f c: c zk_f: f from: SP}) 'zk_f) 's) -4)})
+(select {s: f c: c from: SP asc: [s c] take: [2 3]}) -- (take (xasc (xasc (select {s: f c: c from: SP}) 'c) 's) [2 3])
+(select {s: f c: c from: SP desc: s take: 3}) -- (take (xdesc (select {s: f c: c from: SP}) 's) 3)
+(select {s: f c: c from: SP asc: s}) -- (xasc (select {s: f c: c from: SP}) 's)
+(select {a: (- 0 a) from: SP asc: a}) -- (xasc (select {a: (- 0 a) from: SP}) 'a)
+(select {a: (- 0 a) c: c from: SP where: (> c 0) desc: a take: 4}) -- (take (xdesc (select {a: (- 0 a) c: c from: SP where: (> c 0)}) 'a) 4)
+(set SP 0)
+(.sys.exec "rm -rf rf_test_sortcomp2") -- 0
+;; partitions already sorted on the source b, the output b renaming a: the
+;; pre-sorted concat route would return the partitions in order unsorted
+(.sys.exec "rm -rf rf_test_sortcomp3") -- 0
+(.db.splayed.set "rf_test_sortcomp3/2024.01.01/t/" (table [a b] (list [5 3 9] [1 2 3])))
+(.db.splayed.set "rf_test_sortcomp3/2024.01.02/t/" (table [a b] (list [4 8 1] [4 5 6])))
+(set SQ (.db.parted.get "rf_test_sortcomp3/" 't))
+(select {b: a from: SQ asc: b}) -- (table [b] (list [1 3 4 5 8 9]))
+(select {b: a from: SQ asc: b}) -- (xasc (select {b: a from: SQ}) 'b)
+(select {b: a from: SQ desc: b take: 2}) -- (take (xdesc (select {b: a from: SQ}) 'b) 2)
+(select {b: (+ a 1) from: SQ asc: b take: 2}) -- (take (xasc (select {b: (+ a 1) from: SQ}) 'b) 2)
+(select {c: a from: SQ asc: b}) -- (table [c] (list [5 3 9 4 8 1]))
+(set SQ 0)
+(.sys.exec "rm -rf rf_test_sortcomp3") -- 0
