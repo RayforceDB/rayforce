@@ -1375,6 +1375,38 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     }
 }
 
+/* A LIST cell's cast as one value for a typed cell (#1395).  The cell
+ * loops below read an atom's payload; a cell that casts to a vector (a GUID
+ * vector, `[1]`, a nested LIST) has none: its length was read as the value,
+ * or a GUID vector's header followed as a pointer.  An empty vector cell is
+ * the type's null (*null set), a one-element one its element, a longer one
+ * a type error.  Takes `cast`; returns an owned atom or an error. */
+static ray_t* cast_cell_atom(ray_t* cast, int8_t out_type, bool* null) {
+    *null = false;
+    if (ray_is_atom(cast)) return cast;
+    int64_t n = ray_len(cast);
+    if (n > 1) {
+        ray_t* e = ray_error("type", "as: cannot cast to %s: a LIST cell is a %s of %lld values",
+                             ray_type_name((int8_t)-out_type), ray_type_name(cast->type), (long long)n);
+        ray_release(cast);
+        return e;
+    }
+    ray_t* a;
+    if (n == 0) { a = ray_typed_null((int8_t)-out_type); *null = true; }
+    else {
+        int alloc = 0;
+        a = collection_elem(cast, 0, &alloc);
+        if (a && !RAY_IS_ERR(a) && !alloc) ray_retain(a);
+        if (a && !RAY_IS_ERR(a) && !ray_is_atom(a)) {   /* a nested vector */
+            ray_release(cast);
+            return cast_cell_atom(a, out_type, null);
+        }
+        if (a && !RAY_IS_ERR(a) && RAY_ATOM_IS_NULL(a)) *null = true;
+    }
+    ray_release(cast);
+    return a ? a : ray_error("oom", NULL);
+}
+
 static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
@@ -1442,6 +1474,11 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         ray_t* cast = ray_cast_fn(type_sym, elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        bool cell_null = false;
+        if (!ray_is_atom(cast)) {
+            cast = cast_cell_atom(cast, out_type, &cell_null);
+            if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        }
         switch (out_type) {
         case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)out)[i] = cast->i64; break;
@@ -1455,6 +1492,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         default: break;
         }
         ray_release(cast);
+        if (cell_null) ray_vec_set_null(vec, i, true);
     }
     /* STAGE 2 (ingest/cast → F64 vector): the per-element recursion routes
      * STR→F64 through make_f64, which canonicalizes any non-finite parse
@@ -2224,9 +2262,15 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             for (int64_t i = 0; i < n2; i++) {
                 ray_t* cast = ray_cast_fn(type_sym, items[i]);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                bool cell_null = false;
+                if (!ray_is_atom(cast)) {
+                    cast = cast_cell_atom(cast, RAY_GUID, &cell_null);
+                    if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                }
                 if (cast->obj) memcpy(data + i * 16, ray_data(cast->obj), 16);
                 else memcpy(data + i * 16, ray_data(cast), 16);
                 ray_release(cast);
+                if (cell_null) ray_vec_set_null(vec, i, true);
             }
             ray_t* result = cast_vec_copy_nulls(vec, val);
             if (RAY_IS_ERR(result)) return result;
