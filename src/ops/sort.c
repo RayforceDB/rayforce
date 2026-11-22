@@ -3655,13 +3655,25 @@ ray_t* topk_take_vec(ray_t* v, int64_t k, uint8_t desc) {
     return out;
 }
 
+/* The count is an integer atom: as_i64 of a float reads its bit pattern (and of a
+ * vector, whatever its first bytes hold), so (top [3 1 2] 1.5) answered a vector. */
+static bool topk_count_ok(const ray_t* n_obj) {
+    return n_obj && ray_is_atom(n_obj) &&
+           (n_obj->type == -RAY_I64 || n_obj->type == -RAY_I32 ||
+            n_obj->type == -RAY_I16 || n_obj->type == -RAY_U8);
+}
+
 ray_t* ray_top_fn(ray_t* v, ray_t* n_obj) {
-    if (!is_numeric(n_obj)) return ray_error("type", "top: n must be integer");
+    if (!topk_count_ok(n_obj))
+        return ray_error("type", "top: n must be an integer atom, got %s",
+                         n_obj ? ray_type_name(n_obj->type) : "null");
     return topk_take_vec(v, as_i64(n_obj), /*desc=*/1);
 }
 
 ray_t* ray_bot_fn(ray_t* v, ray_t* n_obj) {
-    if (!is_numeric(n_obj)) return ray_error("type", "bot: n must be integer");
+    if (!topk_count_ok(n_obj))
+        return ray_error("type", "bot: n must be an integer atom, got %s",
+                         n_obj ? ray_type_name(n_obj->type) : "null");
     return topk_take_vec(v, as_i64(n_obj), /*desc=*/0);
 }
 

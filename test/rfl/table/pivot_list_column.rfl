@@ -1,0 +1,24 @@
+;; #1375: a LIST pivot column's cells cannot name output columns; pivot raises
+;; nyi, as for a STR pivot column, instead of naming columns from pointers.
+(set mk (fn [p] (table [k p v] (list [1 1 2] p [10 20 30]))))
+(pivot (mk (list [1 2] [3] [1 2])) 'k 'p 'v sum) !- nyi
+(pivot (mk (list [1] 'a [1])) 'k 'p 'v sum) !- nyi
+(pivot (mk ["a" "b" "a"]) 'k 'p 'v sum) !- nyi
+;; scalar pivot columns still name their columns
+(cols (pivot (mk ['a 'b 'a]) 'k 'p 'v sum)) -- ['k 'a 'b]
+(count (cols (pivot (mk [5 6 5]) 'k 'p 'v sum))) -- 3
+;; the second (fallback) route, taken for med and lambdas, refuses LIST too,
+;; and names F32 and GUID columns as the first route does
+(set f (fn [x] (sum x)))
+(pivot (mk (list [1 2] [3] [1 2])) 'k 'p 'v f) !- nyi
+(cols (pivot (mk (as 'F32 [1.5 2.0 1.5])) 'k 'p 'v f)) -- (cols (pivot (mk (as 'F32 [1.5 2.0 1.5])) 'k 'p 'v sum))
+(set G (at (guid 2) [0 0 1]))
+(cols (pivot (mk G) 'k 'p 'v f)) -- (cols (pivot (mk G) 'k 'p 'v sum))
+;; a parted LIST or STR pivot column is refused as the in-memory one is
+(.sys.exec "rm -rf /tmp/rfl_pivot_list")
+(.db.splayed.set "/tmp/rfl_pivot_list/2024.01.01/t/" (table [k s l v] (list ['a 'b 'a] ["x" "y" "x"] (list [1 2] [3] [1 2]) [1 2 3])) "/tmp/rfl_pivot_list/.sym")
+(.db.splayed.set "/tmp/rfl_pivot_list/2024.01.02/t/" (table [k s l v] (list ['b 'a] ["y" "x"] (list [3] [1 2]) [4 5])) "/tmp/rfl_pivot_list/.sym")
+(set P (.db.parted.get "/tmp/rfl_pivot_list" 't))
+(pivot P 'k 'l 'v sum) !- nyi
+(pivot P 'k 's 'v sum) !- nyi
+(.sys.exec "rm -rf /tmp/rfl_pivot_list")

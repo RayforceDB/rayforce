@@ -1,0 +1,10 @@
+;; top and bot read a float count as its bit pattern ((top [3 1 2] 1.5) answered a
+;; vector); the count is an integer atom, as for take, drop, rotate and xrank.
+
+(at (try (top [3 1 2] 1.5) (fn [e] e)) 'code) -- 'type
+(at (try (bot [3 1 2] 1.5) (fn [e] e)) 'code) -- 'type
+(at (try (top [3 1 2] [1 2]) (fn [e] e)) 'code) -- 'type
+(at (try (top [3 1 2] true) (fn [e] e)) 'code) -- 'type
+(top [3 1 2] 2) -- [3 2]
+(bot [3 1 2] 2) -- [1 2]
+(top [3 1 2] 2i) -- [3 2]
