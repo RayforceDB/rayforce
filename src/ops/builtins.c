@@ -1375,6 +1375,46 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     }
 }
 
+/* A LIST cell's cast as one value for a typed cell (#1395).  The cell
+ * loops below read an atom's payload; a cell that casts to a vector (a GUID
+ * vector, `[1]`, a nested LIST) has none: its length was read as the value,
+ * or a GUID vector's header followed as a pointer.  A one-element cell is
+ * its element, null as the inner vector marks it (a narrow sentinel such as
+ * INT16_MIN stays a value, as in a vector cast); an empty cell is the
+ * type's null (BOOL and U8 have none: false / 0x00); a longer cell is a
+ * type error.  `cell_type` is the LIST cell's own type, for the message.
+ * Takes `cast`; returns an owned atom or an error, *null when the output
+ * cell is to be marked null. */
+static ray_t* cast_cell_atom(ray_t* cast, int8_t out_type, int8_t cell_type, bool* null) {
+    *null = false;
+    if (ray_is_atom(cast)) return cast;
+    int64_t n = ray_len(cast);
+    if (n > 1) {
+        ray_t* e = ray_error("type", "as: cannot cast to %s: a LIST cell holds %lld values (%s)",
+                             ray_type_name((int8_t)-out_type), (long long)n, ray_type_name(cell_type));
+        ray_release(cast);
+        return e;
+    }
+    ray_t* a;
+    if (n == 0) {
+        a = ray_typed_null((int8_t)-out_type);
+        *null = out_type != RAY_BOOL && out_type != RAY_U8;
+    } else {
+        bool inner_null = cast->type != RAY_LIST && ray_vec_is_null(cast, 0);
+        int alloc = 0;
+        a = collection_elem(cast, 0, &alloc);
+        if (a && !RAY_IS_ERR(a) && !alloc) ray_retain(a);
+        if (a && !RAY_IS_ERR(a) && !ray_is_atom(a)) {   /* a nested vector */
+            ray_release(cast);
+            return cast_cell_atom(a, out_type, cell_type, null);
+        }
+        if (a && !RAY_IS_ERR(a))
+            *null = cast->type == RAY_LIST ? RAY_ATOM_IS_NULL(a) : inner_null;
+    }
+    ray_release(cast);
+    return a ? a : ray_error("oom", NULL);
+}
+
 static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
@@ -1439,9 +1479,15 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
         if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        int8_t cell_type = elem->type;
         ray_t* cast = ray_cast_fn(type_sym, elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        bool cell_null = false;
+        if (!ray_is_atom(cast)) {
+            cast = cast_cell_atom(cast, out_type, cell_type, &cell_null);
+            if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        }
         switch (out_type) {
         case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)out)[i] = cast->i64; break;
@@ -1455,6 +1501,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         default: break;
         }
         ray_release(cast);
+        if (cell_null) ray_vec_set_null(vec, i, true);
     }
     /* STAGE 2 (ingest/cast → F64 vector): the per-element recursion routes
      * STR→F64 through make_f64, which canonicalizes any non-finite parse
@@ -1529,14 +1576,20 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
         if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        int8_t cell_type = elem->type;
         ray_t* cast = may_nest ? ray_cast_fn(type_sym, elem)
                       : RAY_ATOM_IS_NULL(elem) ? ray_str("", 0)
                       : cast_str_atom(elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
         if (!cast) { ray_release(vec); return ray_error("oom", NULL); }
-        /* Each output cell needs a string atom. A nested input can
-         * recursively produce a STR vector, not an atom to inspect. */
+        /* Each output cell needs a string atom.  A nested cell casts to a
+         * STR vector: one value, a null or a type error (cast_cell_atom). */
+        bool cell_null = false;
+        if (may_nest && !ray_is_atom(cast)) {
+            cast = cast_cell_atom(cast, RAY_STR, cell_type, &cell_null);
+            if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        }
         if (may_nest && cast->type != -RAY_STR) {
             ray_release(cast);
             ray_release(vec);
@@ -1547,6 +1600,7 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
         ray_release(cast);
         if (RAY_IS_ERR(vec)) return vec;
+        if (cell_null) ray_vec_set_null(vec, i, true);
     }
     ray_t* result = cast_vec_copy_nulls(vec, val);
     if (RAY_IS_ERR(result)) return result;
@@ -2224,9 +2278,15 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             for (int64_t i = 0; i < n2; i++) {
                 ray_t* cast = ray_cast_fn(type_sym, items[i]);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                bool cell_null = false;
+                if (!ray_is_atom(cast)) {
+                    cast = cast_cell_atom(cast, RAY_GUID, items[i]->type, &cell_null);
+                    if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                }
                 if (cast->obj) memcpy(data + i * 16, ray_data(cast->obj), 16);
                 else memcpy(data + i * 16, ray_data(cast), 16);
                 ray_release(cast);
+                if (cell_null) ray_vec_set_null(vec, i, true);
             }
             ray_t* result = cast_vec_copy_nulls(vec, val);
             if (RAY_IS_ERR(result)) return result;
@@ -3253,7 +3313,14 @@ static _Atomic(int64_t) group_boxed_i64_runs = 0;
 
 typedef struct { ray_t** gkeys; int spans; bool exact_i64; bool counted; } ght_list_ctx_t;
 static uint64_t ght_list_hash(ray_t* key, ght_list_ctx_t* c) {
-    if (!c->exact_i64) return ray_key_hash(key, c->spans);
+    if (!c->exact_i64) {
+        /* the float-free exact-integer hash counts as the same route */
+        if ((c->spans & RAY_KEY_EXACT_INT) && !c->counted) {
+            atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
+            c->counted = true;
+        }
+        return ray_key_hash(key, c->spans);
+    }
     uint64_t h = ray_hash_i64(key->i64);
     /* Count actual exact-hash use once per invocation, not per key. */
     if (!c->counted) {
@@ -3378,8 +3445,26 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         for (int64_t i = 0; i < n; i++) {
             if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
         }
-        ght_list_ctx_t lctx = { .gkeys = gkeys,
-            .spans = exact_i64 ? 0 : ray_key_spans(x), .exact_i64 = exact_i64 };
+        /* One walk gathers the cells' span bits (as ray_key_spans) and
+         * whether any float atom is present.  A set with neither hashes
+         * integer atoms at any depth by their integer value (#1333). */
+        int lspans = 0;
+        bool float_free = true;
+        if (!exact_i64) {
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* c = elems[i];
+                if (!c) continue;
+                if (c->type < 0) {
+                    if (c->type == -RAY_TIMESPAN) lspans |= RAY_KEY_SPAN_ATOM;
+                    else if (c->type == -RAY_F64 || c->type == -RAY_F32) float_free = false;
+                } else {
+                    if (lspans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) lspans |= ray_key_spans(c);
+                    if (float_free && !ray_key_float_free(c)) float_free = false;
+                }
+            }
+            if (lspans == 0 && float_free) lspans = RAY_KEY_EXACT_INT;
+        }
+        ght_list_ctx_t lctx = { .gkeys = gkeys, .spans = lspans, .exact_i64 = exact_i64 };
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];

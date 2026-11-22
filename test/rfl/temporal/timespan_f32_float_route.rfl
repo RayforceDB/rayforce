@@ -1,0 +1,40 @@
+;; @also-unfused
+;; #1371: an F32 operand in TIMESPAN `+`, `-`, `*` and `%` takes the float
+;; route, as F64 does: the answer is the F64 nanosecond arithmetic of the
+;; span's count, not the F32 rounded to an integer first (2.5e was 3, so
+;; `(+ s 2.5e)` was 13ns).  `div` and the comparisons are unchanged.
+(set s (as 'TIMESPAN 10))
+(type (+ s 2.5e)) -- 'f64
+(== (+ s 2.5e) (+ s 2.5)) -- true
+(== (+ 2.5e s) (+ 2.5 s)) -- true
+(== (- s 2.5e) (- s 2.5)) -- true
+(== (- 2.5e s) (- 2.5 s)) -- true
+(== (* s 2.5e) (* s 2.5)) -- true
+(== (* 2.5e s) (* 2.5 s)) -- true
+(== (% s 3.5e) (% s 3.5)) -- true
+(== (% 7.5e s) (% 7.5 s)) -- true
+(== (+ s 2.5e) 12.5) -- true
+(== (* s 2.5e) 25.0) -- true
+(== (% s 3.5e) 3.0) -- true
+(== (% (as 'TIMESPAN -10) 3.5e) 0.5) -- true
+;; unchanged: div keeps TIMESPAN, / is already F64, comparisons
+(div s 2.5e) -- (div s 2.5)
+(type (/ s 2.5e)) -- 'f64
+(< s 2.5e) -- false
+;; nulls and zero divisors
+(nil? (+ (as 'TIMESPAN 0Nl) 1.5e)) -- true
+(nil? (% s 0.0e)) -- true
+(nil? (+ s 0Ne)) -- true
+;; vectors, eager and in a query
+(set S (as 'TIMESPAN [10 20 0Nl -7]))
+(set F (as 'F32 [2.5 0.5 1.0 3.5]))
+(== (+ S F) (+ S (as 'F64 F))) -- [true true true true]
+(nil? (+ S F)) -- [false false true false]
+(== (* S F) (* S (as 'F64 F))) -- [true true true true]
+(== (% S F) (% S (as 'F64 F))) -- [true true true true]
+(set T (table [s f] (list S F)))
+(== (at (select {r: (+ s f) from: T}) 'r) (+ S (as 'F64 F))) -- [true true true true]
+(== (at (select {r: (* s f) from: T}) 'r) (* S (as 'F64 F))) -- [true true true true]
+(== (at (select {r: (% s 3.5e) from: T}) 'r) (% S 3.5)) -- [true true true true]
+(== (at (select {r: (- f s) from: T}) 'r) (- (as 'F64 F) S)) -- [true true true true]
+(== (at (select {x: (sum (* s f)) from: T}) 'x) (enlist (sum (* S (as 'F64 F))))) -- [true]

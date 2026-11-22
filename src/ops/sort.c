@@ -3733,15 +3733,11 @@ ray_t* ray_sort(ray_t** cols, uint8_t* descs, uint8_t* nulls_first,
     return result;
 }
 
-/* The column of `tbl` a scan sort key reads.  When the sort runs directly
- * over a SELECT and the key is one of that SELECT's columns, bind by
- * POSITION: the projection names scans by their source column and
- * expressions `_e<c>`, so a hidden key or a renamed output can share a
- * name with another projected column and a name lookup would read the
- * wrong one.  Any other key resolves by name.  Borrowed; NULL when absent,
- * an owned error when an encoded column fails to materialize. */
-static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
-                                uint32_t key_id, int64_t key_sym) {
+/* Key `key_id`'s column of `tbl` when the sort runs directly over a SELECT
+ * that projects it, by POSITION — a scan or a computed output alike (the
+ * computed op reads the source schema, not the projected one, so it is
+ * never re-executed over `tbl`).  NULL when the key is not projected. */
+static ray_t* sort_key_proj_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl, uint32_t key_id) {
     ray_op_t* child = g ? op_child(g, op, 0) : NULL;
     if (child && child->opcode == OP_SELECT) {
         ray_op_ext_t* se = find_ext(g, child->id);
@@ -3751,7 +3747,20 @@ static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 if (se->sort.columns[c] == key_id)
                     return ray_table_col_idx(tbl, c);
     }
-    return ray_table_col(tbl, key_sym);
+    return NULL;
+}
+
+/* The column of `tbl` a scan sort key reads.  When the sort runs directly
+ * over a SELECT and the key is one of that SELECT's columns, bind by
+ * POSITION: the projection names scans by their source column and
+ * expressions `_e<c>`, so a hidden key or a renamed output can share a
+ * name with another projected column and a name lookup would read the
+ * wrong one.  Any other key resolves by name.  Borrowed; NULL when absent,
+ * an owned error when an encoded column fails to materialize. */
+static ray_t* sort_key_scan_col(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                uint32_t key_id, int64_t key_sym) {
+    ray_t* col = sort_key_proj_col(g, op, tbl, key_id);
+    return col ? col : ray_table_col(tbl, key_sym);
 }
 
 /* ---- The top-k shortcut's gate, one copy for exec_sort and
@@ -3775,13 +3784,15 @@ static inline bool topk_scan_key(ray_graph_t* g, const ray_op_ext_t* ext, uint32
     return true;
 }
 
-/* Key k's column of `tbl` as the shortcut reads it (sort_key_scan_col);
- * NULL for a computed key or a missing column (an error, freed: the full
+/* Key k's column of `tbl` as the shortcut reads it (sort_key_scan_col, or
+ * by position for a computed output of the SELECT below); NULL for any
+ * other computed key or a missing column (an error, freed: the full
  * sort re-reads the key and reports it). */
 static inline ray_t* topk_key_col(ray_graph_t* g, ray_op_t* op, const ray_op_ext_t* ext, ray_t* tbl, uint32_t k) {
     uint32_t id; int64_t sym;
-    if (!topk_scan_key(g, ext, k, &id, &sym)) return NULL;
-    ray_t* col = sort_key_scan_col(g, op, tbl, id, sym);
+    ray_t* col;
+    if (topk_scan_key(g, ext, k, &id, &sym)) col = sort_key_scan_col(g, op, tbl, id, sym);
+    else col = sort_key_proj_col(g, op, tbl, ext->sort.columns[k]);   /* a projected computed key */
     if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
     return col;
 }
@@ -3817,7 +3828,8 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
     /* ---- Top-K shortcut ----
      * Triggered by the SORT+HEAD fusion (HEAD passes limit > 0).  When
      * K is well below nrows (K << n) and every sort key is a direct
-     * OP_SCAN of a column on `tbl`, run a partial selection instead of
+     * OP_SCAN of a column on `tbl` (or an output the SELECT below
+     * projected), run a partial selection instead of
      * the full O(n log n) sort.  Single key → radix-encoded selection
      * on the pool (topk_indices_single, O(n + K log K)); multi-key →
      * comparator heap (O(n log K) in compares, big win when K << n).
@@ -3869,6 +3881,8 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
         ray_op_ext_t* key_ext = find_ext(g, key_op->id);
         if (key_ext && key_ext->base.opcode == OP_SCAN) {
             sort_vecs[k] = sort_key_scan_col(g, op, tbl, key_op->id, key_ext->sym);
+        } else if ((sort_vecs[k] = sort_key_proj_col(g, op, tbl, key_op->id))) {
+            /* a computed output the SELECT below already projected */
         } else {
             ray_t* saved = g->table;
             g->table = tbl;
