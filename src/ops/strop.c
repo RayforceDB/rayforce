@@ -767,6 +767,20 @@ ray_t* ray_str_join_fn(ray_t* items, ray_t* delim) {
     return out;
 }
 
+/* Positions of a split by indices.  A position is an offset into the data, so
+ * a negative one (a null reads as the smallest integer) addressed memory before
+ * it; one past the end addressed memory after it.  The string form always
+ * clamped the latter, and now every form does; the former is an error. */
+static ray_t* split_positions_check(int64_t* idx, int64_t n, int64_t total) {
+    for (int64_t i = 0; i < n; i++) {
+        if (idx[i] < 0)
+            return ray_error("domain", "split: positions must not be negative or null, got %lld at index %lld",
+                             (long long)idx[i], (long long)i);
+        if (idx[i] > total) idx[i] = total;
+    }
+    return NULL;
+}
+
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
     if (str->type == RAY_LIST &&
@@ -781,6 +795,8 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx, str->len);
+        if (bad_pos) return bad_pos;
         int64_t total = str->len;
         ray_t** items = (ray_t**)ray_data(str);
         ray_t* result = ray_list_new(nidx + 1);
@@ -840,6 +856,9 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx,
+            ray_is_atom(str) ? (int64_t)ray_str_len(str) : str->len);
+        if (bad_pos) return bad_pos;
         /* String split by indices */
         if (ray_is_atom(str) && (-str->type) == RAY_STR) {
             const char* sp2 = ray_str_ptr(str);
@@ -863,7 +882,6 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         }
         /* Vector split by indices */
         int64_t total = str->len;
-        int esz = ray_elem_size(str->type);
         ray_t* result = ray_list_new(nidx + 1);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < nidx; i++) {
@@ -871,10 +889,25 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             int64_t end = (i + 1 < nidx) ? idx_buf[i + 1] : total;
             int64_t seglen = end - start;
             if (seglen < 0) seglen = 0;
-            ray_t* seg = ray_vec_new(str->type, seglen);
+            /* a segment keeps the null flags and the strings of the source; a raw
+             * copy of the cells dropped both (a null came out as its sentinel value,
+             * a string that is not inline as an empty one) */
+            ray_t* seg;
+            if (str->type == RAY_STR) {
+                /* A string segment is copied: a slice of a string vector shares the
+                 * pool of the whole vector, so saving 200 segments wrote the pool
+                 * 200 times (178x the size), each reload allocated it again, and
+                 * every reader of ->str_pool had to know about slices. The copy
+                 * holds only the bytes its own cells reference. */
+                int64_t* rows = (int64_t*)ray_alloc_raw((size_t)(seglen > 0 ? seglen : 1) * sizeof(int64_t));
+                if (!rows) { ray_release(result); return ray_error("oom", NULL); }
+                for (int64_t r = 0; r < seglen; r++) rows[r] = start + r;
+                seg = gather_by_idx(str, rows, seglen);
+                ray_free_raw(rows);
+            } else {
+                seg = ray_vec_slice(str, start, seglen);
+            }
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
-            seg->len = seglen;
-            if (seglen > 0) memcpy(ray_data(seg), (char*)ray_data(str) + start * esz, seglen * esz);
             result = ray_list_append(result, seg);
             ray_release(seg);
             if (RAY_IS_ERR(result)) return result;
