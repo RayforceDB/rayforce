@@ -13532,8 +13532,8 @@ static int agg_list_spans(ray_t* const* cells, const int64_t* rows, int64_t n) {
     return spans ? spans : RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
 }
 static inline uint64_t agg_key_hash_at(ray_t* col, const void* data, int64_t r, int spans,
-                                       const ray_group_sym_view_t* view, bool* seen) {
-    if (col->type == RAY_LIST) return ray_key_hash_view(((ray_t* const*)data)[r], spans, view, seen);
+                                       const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
+    if (col->type == RAY_LIST) return ray_key_hash_view(((ray_t* const*)data)[r], spans, view, seen, inexact);
     if (col->type == RAY_F32 || col->type == RAY_F64) return ray_hash_i64((int64_t)agg_float_key(col, data, r));
     if (col->type == RAY_GUID) return ray_hash_bytes((const char*)data + (size_t)r * 16, 16);
     if (col->type == RAY_STR) {
@@ -13603,7 +13603,7 @@ static void agg_distinct_indexed_run(void* raw, uint32_t wid, int64_t start, int
             distinct = 0;
             for (int64_t i = 0; i < n; i++) {
                 ray_t* x = cells[rows[i]];
-                uint64_t h = ray_key_hash_view(x, spans, &c->symbols, spans ? NULL : &seen), slot = h & (size - 1);
+                uint64_t h = ray_key_hash_view(x, spans, &c->symbols, spans ? NULL : &seen, NULL), slot = h & (size - 1);
                 if (RAY_UNLIKELY(seen)) { seen = false; spans = agg_list_spans(cells, rows, n); goto rehash; }
                 while (entries[slot] && (hashes[slot] != h || !agg_cell_eq(cells[entries[slot] - 1], x)))
                     slot = (slot + 1) & (size - 1);
@@ -13621,7 +13621,7 @@ static void agg_distinct_indexed_run(void* raw, uint32_t wid, int64_t start, int
         int64_t distinct = 0;
         for (int64_t i = 0; i < c->counts[g]; i++) {
             int64_t row = c->rows[c->offsets[g] + i];
-            uint64_t slot = agg_key_hash_at(c->source, c->data, row, 0, NULL, NULL) & (size - 1);
+            uint64_t slot = agg_key_hash_at(c->source, c->data, row, 0, NULL, NULL, NULL) & (size - 1);
             while (entries[slot] && !agg_key_eq_at(c->source, c->data, row, entries[slot] - 1))
                 slot = (slot + 1) & (size - 1);
             if (!entries[slot]) { entries[slot] = row + 1; distinct++; }
@@ -13663,6 +13663,8 @@ typedef struct {
     agg_groups_t* out;
     ray_group_sym_view_t symbols;
     _Atomic(bool) spanned;   /* a LIST key cell holds a TIMESPAN: group serially */
+    _Atomic(uint8_t) inexact; /* RAY_KEY_BIG_I64 | RAY_KEY_FLOAT seen in LIST
+                               * keys; both: group serially (#1330) */
 } agg_key_build_t;
 
 /* Coarse aligned ranges avoid concurrent first writes to common 2 MiB
@@ -13692,6 +13694,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
 #define KEY_DIRECTORY_INSERT(TYPE, EMPTY) do { \
         _Atomic TYPE* first_slots = c->first; \
         bool spanned = false; \
+        uint8_t inexact = 0; \
         for (int64_t r = start; r < end; r++) { \
             uint64_t slot = 0; \
             if (c->dense) { \
@@ -13701,7 +13704,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
             } else { \
                 uint64_t hash = UINT64_C(1469598103934665603); \
                 for (uint32_t k = 0; k < c->nkeys; k++) { \
-                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, 0, &c->symbols, &spanned); \
+                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, 0, &c->symbols, &spanned, &inexact); \
                     hash *= UINT64_C(1099511628211); \
                 } \
                 slot = hash & (c->capacity - 1); \
@@ -13721,6 +13724,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
             } \
         } \
         if (spanned) atomic_store_explicit(&c->spanned, true, memory_order_relaxed); \
+        if (inexact) atomic_fetch_or_explicit(&c->inexact, inexact, memory_order_relaxed); \
     } while (0)
     if (c->narrow) KEY_DIRECTORY_INSERT(int32_t, INT32_MAX);
     else KEY_DIRECTORY_INSERT(int64_t, INT64_MAX);
@@ -13809,7 +13813,8 @@ static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
     ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
-    if (atomic_load(&c.spanned)) { rc = AGG_KEYS_SERIAL; goto done; }
+    if (atomic_load(&c.spanned) ||
+        atomic_load(&c.inexact) == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) { rc = AGG_KEYS_SERIAL; goto done; }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
     if (agg_cancelled()) goto done;
@@ -13832,15 +13837,17 @@ done:
 
 int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out) {
     if (nrows < 0 || nrows > INT32_MAX) return -1;
-    /* A TIMESPAN in a LIST key makes atom_eq non-transitive: a row joins
-     * the earliest group whose first row equals it, as `group` and
-     * `distinct` decide, which only this scan in row order reproduces.
-     * The parallel directory sees such a cell as it hashes and declines. */
+    /* A TIMESPAN in a LIST key, or an I64 past ±2^53 beside floats (#1330),
+     * makes atom_eq non-transitive: a row joins the earliest group whose
+     * first row equals it, as `group` and `distinct` decide, which only this
+     * scan in row order reproduces.  The parallel directory sees such a
+     * cell as it hashes and declines. */
     bool spanned = false;
     if (ray_pool_par_dispatch_ok(ray_pool_get(), nrows, RAY_PARALLEL_THRESHOLD)) {
         int rc = agg_group_keys_parallel(key_cols, n_keys, nrows, NULL, out);
+        /* Declined: the scan below starts with spans 0 and finds any
+         * TIMESPAN itself (a large I64 needs no span bits, #1330). */
         if (rc != AGG_KEYS_SERIAL) return rc;
-        spanned = true;
     }
     /* Unbounded keys: cut-3 lifted both admission gates (the GROUP path and the
      * keys-only DISTINCT path via agg_select_distinct), so the key-data pointer
@@ -13883,7 +13890,7 @@ rescan:
     for (int64_t r = 0; r < nrows; r++) {
         uint64_t h = 1469598103934665603ULL;
         for (uint32_t k = 0; k < n_keys; k++) {
-            h ^= agg_key_hash_at(key_cols[k], data[k], r, spans, &symbols, spans ? NULL : &spanned);
+            h ^= agg_key_hash_at(key_cols[k], data[k], r, spans, &symbols, spans ? NULL : &spanned, NULL);
             h *= 1099511628211ULL;
         }
         if (RAY_UNLIKELY(spanned && !spans)) goto rescan;
