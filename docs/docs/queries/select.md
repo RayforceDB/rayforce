@@ -232,8 +232,9 @@ select them first:
 ```
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
-`desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
-surviving rows only, and under `by:` each group's surviving rows.
+`desc`, `reverse`, `iasc`, `idesc`, `rank`, `xrank`, `rotate`, `take`, `drop`,
+`where`) are different: they see the surviving rows only, and under `by:` each
+group's surviving rows.
 
 The same holds under `by:`. A running function in a grouped select runs over
 the whole table, not over each group, and the groups then take their rows of
