@@ -4590,10 +4590,36 @@ static __attribute__((noinline, cold)) ray_t* find_in_f64_hay(ray_t* vec, ray_t*
     return r;
 }
 
+/* A TIME/TIMESTAMP meets a TIMESPAN by nanosecond duration, not raw
+ * payload. Recast only that point side, keeping haystack row numbers and
+ * letting the existing span routes find the first duplicate. An atom
+ * needle must stay an atom even though span_keys returns a vector. */
+static __attribute__((noinline, cold)) ray_t* find_span_pair(ray_t* vec, ray_t* val) {
+    ray_t* hay = vec;
+    ray_t* needle = val;
+    ray_t* keys = span_pair_keys(&hay, &needle);
+    if (!keys || RAY_IS_ERR(keys)) return keys ? keys : ray_error("oom", NULL);
+    ray_t* atom = NULL;
+    if (ray_is_atom(val) && needle != val) {
+        atom = ray_timespan(((const int64_t*)ray_data(keys))[0]);
+        if (!atom || RAY_IS_ERR(atom)) {
+            ray_release(keys);
+            return atom ? atom : ray_error("oom", NULL);
+        }
+        needle = atom;
+    }
+    ray_t* result = ray_find_fn(hay, needle);
+    if (atom) ray_release(atom);
+    ray_release(keys);
+    return result;
+}
+
 /* (find vec val) — index of first occurrence, or -1 */
 ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
+    if (RAY_UNLIKELY(ray_is_vec(vec) && span_point_pair(vec->type, val->type)))
+        return find_span_pair(vec, val);
     /* String find: (find "hello" 'l') → index of char in string */
     if (ray_is_atom(vec) && (-vec->type) == RAY_STR && ray_is_atom(val) && val->type == -RAY_STR && ray_str_len(val) == 1) {
         const char* s = ray_str_ptr(vec);
