@@ -22,6 +22,16 @@
 (at (select {from:T lo:(min v) hi:(max v) where:(== g 'a)}) 'lo) -- [0Nn]
 (at (select {from:T lo:(min v) hi:(max v) where:(== g 'a)}) 'hi) -- [0Nn]
 
+;; A real endpoint beside an all-null group keeps its value.
+(set E (table [g v] (list [a a b b] [0Wn -0Wn 0Nn 0Nn])))
+(at (select {from:E by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [-0Wn 0Nn]
+(at (select {from:E by:g lo:(min v) hi:(max v) asc:g}) 'hi) -- [0Wn 0Nn]
+;; Many rows: the grouped route merges partial states; groups 2..6 are all null.
+(set n 300000)
+(set G (table [g v] (list (% (til n) 7) (as 'TIMESPAN (map (fn [i] (if (< (% i 7) 2) i 0N)) (til n))))))
+(at (select {from:G by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [0D00:00:00.000000000 0D00:00:00.000000001 0Nn 0Nn 0Nn 0Nn 0Nn]
+(at (select {from:G by:g hi:(max v) asc:g}) 'hi) -- [0D00:00:00.000299999 0D00:00:00.000299993 0Nn 0Nn 0Nn 0Nn 0Nn]
+
 ;; Parted: no partition holds a non-null value.
 (.sys.exec "rm -rf /tmp/rfl_timespan_minmax_null") -- 0
 (.db.splayed.set "/tmp/rfl_timespan_minmax_null/1/t/" (table [v] (list [0Nn 0Nn])))
@@ -29,6 +39,10 @@
 (set P (.db.parted.get "/tmp/rfl_timespan_minmax_null/" 't))
 (min (at P 'v)) -- 0Nn
 (max (at P 'v)) -- 0Nn
+(.db.splayed.set "/tmp/rfl_timespan_minmax_null/3/t/" (table [v] (list [0Nn 2D 0Nn])))
+(set P (.db.parted.get "/tmp/rfl_timespan_minmax_null/" 't))
+(min (at P 'v)) -- 2D
+(max (at P 'v)) -- 2D
 (.sys.exec "rm -rf /tmp/rfl_timespan_minmax_null") -- 0
 
 ;; Encoded storage answers from its chunk zones: an all-null column has no non-null chunk.
