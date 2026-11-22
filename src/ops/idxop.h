@@ -737,6 +737,15 @@ ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l);
  * group dense enough for the scan, as ray_index_hash_eq_rowsel declines);
  * -1: *err owned. */
 int    ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err);
+/* ray_enc_hash_eq_rowsel for a single-file generation-2 STR column and the
+ * needle p[0..l): the region's byte-hash words are walked, and a word hit
+ * is confirmed against the group's first row read back by row id; the
+ * column is not materialized.  "" (the null rows the hash leaves out)
+ * declines.  1 / 0 / -1 as ray_enc_hash_eq_rowsel. */
+int    ray_enc_hash_eq_str_rowsel(ray_t* encv, const char* p, size_t l, ray_t** sel, ray_t** err);
+/* The `in` twin: every element of the STR set `set_vec` probed so; a ""
+ * element, a dense union or another set type declines. */
+int    ray_enc_hash_in_str_rowsel(ray_t* encv, ray_t* set_vec, ray_t** sel, ray_t** err);
 /* Test hook: probes ray_enc_hash_eq_rowsel answered since process start. */
 uint64_t ray_enc_hash_test_probes(void);
 

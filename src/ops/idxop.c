@@ -3338,6 +3338,121 @@ int ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err) {
     return 1;
 }
 
+static int cmp_i64_plain(const void* a, const void* b);
+
+/* ---- STR on a mapped region ----
+ *
+ * A generation-2 STR column with a recorded HASH: the region holds each
+ * group's byte-hash word (str_key_word), so a needle's word walks it as an
+ * integer key walks ray_enc_hash_eq_rowsel's.  A word hit is confirmed
+ * against the bytes of the group's first row, read as that one cell
+ * (ray_enccol_str_cell_eq): no vector is decoded, the column is never
+ * materialized. */
+
+/* The region of `encv` when it is a single-file STR column with a HASH. */
+static ray_enccol_t* enc_str_hash_col(ray_t* encv, const uint8_t** b, ray_enc_idx_hash_t* h) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_HASH ||
+        e->type != RAY_STR) return NULL;
+    *b = e->base + e->hdr.index_off;
+    memcpy(h, *b + 16, sizeof *h);
+    return e;
+}
+
+/* The group of the needle p[0..l) in the region: its id, -1 when absent,
+ * -2 on a failed read (*err set). */
+static int64_t enc_str_hash_gid(ray_t* encv, const uint8_t* b, const ray_enc_idx_hash_t* h,
+                                const char* p, size_t l, ray_t** err) {
+    const int64_t kw = (int64_t)str_key_word(p, l);
+    uint64_t slot = mix64((uint64_t)kw) & h->mask;
+    for (;;) {
+        int64_t gp1 = ehp_at(b, h->table, (int64_t)slot);
+        if (gp1 == 0) return -1;
+        if (ehp_at(b, h->gkeys, gp1 - 1) == kw) {
+            int64_t rid = ehp_at(b, h->rows, ehp_at(b, h->offs, gp1 - 1));
+            bool eq = false;
+            ray_t* e2 = ray_enccol_str_cell_eq(ray_enccol_of(encv), rid, p, l, &eq);
+            if (e2) { *err = e2; return -2; }
+            if (eq) return gp1 - 1;
+        }
+        slot = (slot + 1) & h->mask;
+    }
+}
+
+int ray_enc_hash_eq_str_rowsel(ray_t* encv, const char* p, size_t l, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    const uint8_t* b = NULL;
+    ray_enc_idx_hash_t h;
+    ray_enccol_t* e = enc_str_hash_col(encv, &b, &h);
+    if (!e || !p || l == 0) return 0;            /* "": the null rows the hash leaves out */
+    const int64_t len = e->len;
+    int64_t gid = enc_str_hash_gid(encv, b, &h, p, l, err);
+    if (gid == -2) return -1;
+    if (gid < 0) {
+        *sel = rowsel_from_sorted_ids(len, NULL, 0);
+        if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+        atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+        return 1;
+    }
+    const int64_t o0 = ehp_at(b, h.offs, gid), o1 = ehp_at(b, h.offs, gid + 1);
+    const int64_t gsz = o1 - o0;
+    if (gsz > 64 && gsz > (len >> 3)) return 0;     /* dense: the scan answers */
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)(gsz > 0 ? gsz : 1) * sizeof(int64_t));
+    if (!ids) { *err = ray_error("oom", NULL); return -1; }
+    memcpy(ids, b + h.rows + o0 * 8, (size_t)gsz * 8);
+    *sel = rowsel_from_sorted_ids(len, ids, gsz);
+    scratch_free(ids_hdr);
+    if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+    atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+    return 1;
+}
+
+int ray_enc_hash_in_str_rowsel(ray_t* encv, ray_t* set_vec, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    const uint8_t* b = NULL;
+    ray_enc_idx_hash_t h;
+    ray_enccol_t* e = enc_str_hash_col(encv, &b, &h);
+    if (!e || !set_vec || RAY_IS_ERR(set_vec) || set_vec->type != RAY_STR) return 0;
+    const int64_t len = e->len, m = set_vec->len;
+    ray_t* gid_hdr = NULL;
+    int64_t* gids = (int64_t*)scratch_alloc(&gid_hdr, (size_t)(m > 0 ? m : 1) * 3 * sizeof(int64_t));
+    if (!gids) { *err = ray_error("oom", NULL); return -1; }
+    int64_t ng = 0;
+    for (int64_t i = 0; i < m; i++) {
+        size_t l = 0;
+        const char* p = ray_str_vec_get(set_vec, i, &l);
+        if (!p || l == 0) { scratch_free(gid_hdr); return 0; }   /* "": the scan */
+        int64_t gid = enc_str_hash_gid(encv, b, &h, p, l, err);
+        if (gid == -2) { scratch_free(gid_hdr); return -1; }
+        if (gid >= 0) gids[ng++] = gid;
+    }
+    qsort(gids, (size_t)ng, sizeof(int64_t), cmp_i64_plain);
+    int64_t w = 0, total = 0;
+    for (int64_t i = 0; i < ng; i++) {
+        if (w > 0 && gids[i] == gids[w - 1]) continue;
+        gids[w++] = gids[i];
+        total += ehp_at(b, h.offs, gids[i] + 1) - ehp_at(b, h.offs, gids[i]);
+    }
+    if (total > 64 && total > (len >> 4)) { scratch_free(gid_hdr); return 0; }   /* dense union */
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+    if (!ids) { scratch_free(gid_hdr); *err = ray_error("oom", NULL); return -1; }
+    int64_t k = 0;
+    for (int64_t i = 0; i < w; i++) {
+        int64_t o0 = ehp_at(b, h.offs, gids[i]), o1 = ehp_at(b, h.offs, gids[i] + 1);
+        memcpy(ids + k, b + h.rows + o0 * 8, (size_t)(o1 - o0) * 8);
+        k += o1 - o0;
+    }
+    scratch_free(gid_hdr);
+    if (w > 1 && k > 1) qsort(ids, (size_t)k, sizeof(int64_t), hash_match_cmp_i64);
+    *sel = rowsel_from_sorted_ids(len, ids, k);
+    scratch_free(ids_hdr);
+    if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+    atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+    return 1;
+}
+
 /* --------------------------------------------------------------------------
  * Hash/part-index IN probe
  *
@@ -3563,7 +3678,7 @@ static ray_t* hash_in_rowsel_from_gids(ray_index_t* ix, int64_t n, const int64_t
  * A "" needle (the STR null, whose rows the builder leaves out) declines
  * to the scan. */
 static ray_t* str_in_rowsel(ray_t* col, ray_t* set_vec) {
-    if (set_vec->type != RAY_STR) return NULL;
+    if (!set_vec || set_vec->type != RAY_STR) return NULL;
     int64_t m = set_vec->len, n = col->len;
     if (m == 0) return rowsel_from_sorted_ids(n, NULL, 0);
     ray_t* gid_hdr = NULL;
@@ -3606,10 +3721,7 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     /* A STR or GUID hash index is keyed on byte hashes — the int64 probes
      * below do not apply: a STR set probes by its bytes (str_in_rowsel);
      * a GUID one is left to the scan. */
-    if (col->type == RAY_STR && kind == RAY_IDX_HASH) {
-        if (!set_vec || RAY_IS_ERR(set_vec) || ray_is_atom(set_vec)) return NULL;
-        return str_in_rowsel(col, set_vec);
-    }
+    if (col->type == RAY_STR && kind == RAY_IDX_HASH) return str_in_rowsel(col, set_vec);
     if (hash_byte_keyed(col->type)) return NULL;
     bool col_is_sym = (col->type == RAY_SYM);
 
