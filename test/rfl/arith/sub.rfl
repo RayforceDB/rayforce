@@ -152,7 +152,6 @@
 
 ;; Null propagation across temporal-numeric arms
 (nil? (- (as 'DATE 7305) 0Ni))    -- true
-(nil? (- 0Ni (as 'DATE 7305)))    -- true
-(type (- 0Ni (as 'DATE 7305)))    -- 'date
+(- 0Ni (as 'DATE 7305))           !- type
 (nil? (- (as 'TIME 5000) 0Ni))    -- true
 (type (- (as 'TIME 5000) 0Ni))    -- 'time
