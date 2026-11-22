@@ -4547,21 +4547,19 @@ static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
                    (ray_unary_fn)(uintptr_t)fn->i64 == native);
 }
 
-/* True when a projection's TOP-LEVEL call is a "whole-column verb": a
- * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
- * consumes an entire column vector and returns a vector.  The DAG compiler
- * has no bucket for these — they are neither element-wise ops nor
- * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
- * projection lands in the eval fallback.  There the default per-row scatter
- * feeds the verb one scalar cell at a time: `distinct` errors ("argument must
- * be a list"), `where` errors (it takes a B8 vector, and got one b8 cell:
- * `(count (where (> i 2)))` never counted anything) and `asc`/`desc`/`reverse`
- * silently return the column untouched (reordering a 1-element slice is a
- * no-op).  All are wrong; such a
- * projection must instead be evaluated once against the full column
- * (see eval_expr_whole_column).  Matched on the top-level head only —
- * a whole-column verb nested under an element-wise op has ambiguous length
- * semantics and is left to the per-row path. */
+/* A JSON read's argument that is one value for every row: a dict, a
+ * string or a quoted symbol written in place, or a name that is not a
+ * column holding a string, a symbol or a dict. */
+static bool json_const_arg(ray_t* a, ray_t* tbl) {
+    if (!a) return false;
+    if (a->type == RAY_DICT || a->type == -RAY_STR) return true;
+    if (a->type != -RAY_SYM) return false;
+    if (a->attrs & ATTR_QUOTED) return true;
+    if (expr_refs_row_column(a, tbl)) return false;
+    ray_t* v = ray_env_get(a->i64);
+    return v && !RAY_IS_ERR(v) && (v->type == -RAY_STR || v->type == -RAY_SYM || v->type == RAY_DICT);
+}
+
 /* The JSON readers take a whole string column and type the result from
  * every row's value (a missing field is that type's null); one cell at a
  * time each row would come back untyped, and an element-wise call around
@@ -4594,8 +4592,10 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
     }
     int r = json ? 1 : 0;
     for (int64_t i = 1; i < ray_len(e); i++) {
-        /* a limits dict passed to a JSON read is a constant */
-        if (json && i == 3 && el[i]->type == RAY_DICT) continue;
+        /* a JSON read's path and limits: a column, a literal, or a name
+         * holding a string, a symbol or a dict (a global, a parameter, a
+         * let), which is one value for every row */
+        if (json && i >= 2 && json_const_arg(el[i], tbl)) continue;
         int k = json_rowwise(el[i], tbl);
         if (k < 0) return -1;
         if (k > r) r = k;
@@ -4603,6 +4603,21 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
     return r;
 }
 
+/* True when a projection's TOP-LEVEL call is a "whole-column verb": a
+ * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
+ * consumes an entire column vector and returns a vector.  The DAG compiler
+ * has no bucket for these — they are neither element-wise ops nor
+ * scalar-reducing aggregations — so `compile_expr_dag` returns NULL and the
+ * projection lands in the eval fallback.  There the default per-row scatter
+ * feeds the verb one scalar cell at a time: `distinct` errors ("argument must
+ * be a list"), `where` errors (it takes a B8 vector, and got one b8 cell:
+ * `(count (where (> i 2)))` never counted anything) and `asc`/`desc`/`reverse`
+ * silently return the column untouched (reordering a 1-element slice is a
+ * no-op).  All are wrong; such a
+ * projection must instead be evaluated once against the full column
+ * (see eval_expr_whole_column).  Matched on the top-level head only —
+ * a whole-column verb nested under an element-wise op has ambiguous length
+ * semantics and is left to the per-row path. */
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
