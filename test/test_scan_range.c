@@ -3215,6 +3215,50 @@ static test_result_t test_scalar_route_f64_unaligned(void) {
     PASS();
 }
 
+/* #1363 review: the eager sum / avg of a float vector and the select's
+ * scalar route add the same lanes over the same chunks, so they give the
+ * same bits for F64 and F32, with nulls or without, one chunk or many, and
+ * at 8388609 rows, where a chunk holds two blocks (RED_MAX_CHUNKS chunks of
+ * RED_BLOCK rows end one row short).  The values are large and non-integral,
+ * so any other order shows in the low bits. */
+static test_result_t test_eager_select_float_bits(void) {
+    static const int64_t ns[] = { 1000, 70000, 8388609 };
+    static const char* const qs[][2] = {
+        { "(sum fx)", "(first (at (select {s: (sum fx) from: FT}) 's))" },
+        { "(avg fx)", "(first (at (select {s: (avg fx) from: FT}) 's))" },
+    };
+    for (size_t k = 0; k < sizeof ns / sizeof ns[0]; k++)
+        for (int shape = 0; shape < 4; shape++) {
+            const int64_t n = ns[k];
+            const bool f32 = shape & 1, nulls = shape & 2;
+            if (n > 70000 && shape) continue;                 /* the long one: F64 only */
+            ray_t* v = ray_vec_new(f32 ? RAY_F32 : RAY_F64, n); v->len = n;
+            for (int64_t r = 0; r < n; r++) {
+                double x = (double)((r * 7919) % 1000003) * 1.0000001e10 + 0.37 * (double)(r % 13);
+                bool nul = nulls && r % 7 == 0;
+                if (f32) ((float*)ray_data(v))[r] = nul ? NULL_F32 : (float)(x * 1e-12);
+                else ((double*)ray_data(v))[r] = nul ? NULL_F64 : x;
+            }
+            if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+            ray_env_set(ray_sym_intern("fx", 2), v); ray_release(v);
+            sr_eval_ok("(set FT (table [fx] (list fx)))");
+            for (size_t q = 0; q < sizeof qs / sizeof qs[0]; q++) {
+                ray_t* a = sr_eval(qs[q][0]);
+                ray_t* b = sr_eval(qs[q][1]);
+                TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && a->type == -RAY_F64 && b && !RAY_IS_ERR(b) && b->type == -RAY_F64,
+                                "n %lld shape %d: %s", (long long)n, shape, qs[q][0]);
+                bool same = memcmp(&a->f64, &b->f64, sizeof a->f64) == 0;
+                double av = a->f64, bv = b->f64;
+                sr_drop(a); sr_drop(b);
+                TEST_ASSERT_FMT(same, "n %lld %s%s: %s %a vs select %a", (long long)n, f32 ? "F32" : "F64",
+                                nulls ? " nulls" : "", qs[q][0], av, bv);
+            }
+        }
+    sr_eval_ok("(set FT 0)");
+    sr_eval_ok("(set fx 0)");
+    PASS();
+}
+
 /* The route hook: 1 takes the legacy ladder instead of the v2 engine; the
  * answers are the same; ray_test_hooks_off disarms it. */
 static test_result_t test_group_route_hook(void) {
@@ -6531,6 +6575,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_combine", test_scalar_route_f64_combine, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_unaligned", test_scalar_route_f64_unaligned, srr_setup, srr_teardown },
+    { "scanrange/eager_select_float_bits", test_eager_select_float_bits, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
     { "scanrange/da_route_parted",    test_da_route_parted,    srr_setup, srr_teardown },

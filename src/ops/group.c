@@ -232,49 +232,86 @@ int64_t ray_group_test_minmax_staged_rows(void) {
 #endif
 typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
 
-/* Rows [row0, row0 + n) at d into the lanes. */
-static void sc_f64_lanes_add(sc_f64_lanes_t* restrict s, const double* restrict d, int64_t row0, int64_t n) {
-    int64_t i = 0;
-    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++) {
-        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
-        SC_F64_PIN(v);
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
-    }
+/* Rows [row0, row0 + n) of d (F64 or F32) into the lanes; the non-null rows
+ * out.  An F32 row widens in register (exactly), and under NULLS a null (NaN)
+ * row adds -0.0, the exact additive identity, so it leaves its lane's bits
+ * as a skipped row would. */
+#define SC_LANE_ROW(T, NULLS) do { \
+    double v_ = (double)d[i]; \
+    if (!(NULLS) || v_ == v_) { \
+        double* l_ = &s->l[(row0 + i) & (SC_F64_LANES - 1)]; \
+        double t_ = *l_ + v_; \
+        SC_F64_PIN(t_); \
+        *l_ = t_; nn++; \
+    } \
+} while (0)
 #if defined(__GNUC__)
-    /* SC_F64_LANES / SC_V lanes per vector, lanes {0..SC_V-1} in vector 0
-     * and so on: each lane still one row-order chain (a vector add is
-     * lane-wise), so the 4-lane (AVX), 2-lane and scalar forms give the same
-     * bits.  The vectors are independent chains: their count, not the add
-     * latency, bounds the throughput. */
+/* SC_F64_LANES / SC_V lanes per vector, lanes {0..SC_V-1} in vector 0 and so
+ * on: each lane still one row-order chain (a vector add is lane-wise), so the
+ * 4-lane (AVX), 2-lane and scalar forms give the same bits.  The vectors are
+ * independent chains: their count, not the add latency, bounds the
+ * throughput. */
 #if defined(__AVX__)
 #define SC_V 4
 #else
 #define SC_V 2
 #endif
-    typedef double sc_vd __attribute__((vector_size(SC_V * 8)));
-    sc_vd v[SC_F64_LANES / SC_V];
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) {
-        memcpy(&v[k], &s->l[k * SC_V], sizeof v[k]);
-        SC_F64_PIN(v[k]);           /* the head's last adds stay folded in */
-    }
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
-        for (int k = 0; k < SC_F64_LANES / SC_V; k++) {
-            sc_vd x;
-            memcpy(&x, d + i + k * SC_V, sizeof x);
-            v[k] += x;
-            SC_F64_PIN(v[k]);
-        }
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) memcpy(&s->l[k * SC_V], &v[k], sizeof v[k]);
-#undef SC_V
+typedef double  sc_vd __attribute__((vector_size(SC_V * 8)));
+typedef float   sc_vf __attribute__((vector_size(SC_V * 4)));
+typedef int64_t sc_vl __attribute__((vector_size(SC_V * 8)));
+#define SC_LANES_BODY(T, VT, NULLS) do { \
+    sc_vd v[SC_F64_LANES / SC_V]; \
+    sc_vl cnt = { 0 }, nz = cnt + (int64_t)INT64_MIN;   /* -0.0's bits */ \
+    for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
+        memcpy(&v[k], &s->l[k * SC_V], sizeof v[k]); \
+        SC_F64_PIN(v[k]);           /* the head's last adds stay folded in */ \
+    } \
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) \
+        for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
+            VT x; \
+            memcpy(&x, d + i + k * SC_V, sizeof x); \
+            sc_vd y = __builtin_convertvector(x, sc_vd); \
+            if (NULLS) { \
+                sc_vl m = (sc_vl)(y == y); \
+                y = (sc_vd)(((sc_vl)y & m) | (nz & ~m)); \
+                cnt -= m; \
+            } \
+            v[k] += y; \
+            SC_F64_PIN(v[k]); \
+        } \
+    for (int k = 0; k < SC_F64_LANES / SC_V; k++) memcpy(&s->l[k * SC_V], &v[k], sizeof v[k]); \
+    if (NULLS) for (int k = 0; k < SC_V; k++) nn += cnt[k]; \
+} while (0)
 #else
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES)
-        for (int l = 0; l < SC_F64_LANES; l++) { double v = s->l[l] + d[i + l]; SC_F64_PIN(v); s->l[l] = v; }
+#define SC_LANES_BODY(T, VT, NULLS) do { } while (0)    /* the row loop below takes every row */
 #endif
-    for (; i < n; i++) {
-        double v = s->l[(row0 + i) & (SC_F64_LANES - 1)] + d[i];
-        SC_F64_PIN(v);
-        s->l[(row0 + i) & (SC_F64_LANES - 1)] = v;
-    }
+#define SC_LANES_FN(NAME, T, VT, NULLS) \
+static int64_t NAME(sc_f64_lanes_t* restrict s, const T* restrict d, int64_t row0, int64_t n) { \
+    int64_t i = 0, nn = 0; \
+    for (; i < n && ((row0 + i) & (SC_F64_LANES - 1)); i++) SC_LANE_ROW(T, NULLS); \
+    int64_t i0_ = i; \
+    SC_LANES_BODY(T, VT, NULLS); \
+    if (!(NULLS)) nn += i - i0_; \
+    for (; i < n; i++) SC_LANE_ROW(T, NULLS); \
+    return nn; \
+}
+SC_LANES_FN(sc_lanes_f64,    double, sc_vd, 0)
+SC_LANES_FN(sc_lanes_f64_nn, double, sc_vd, 1)
+SC_LANES_FN(sc_lanes_f32,    float,  sc_vf, 0)
+SC_LANES_FN(sc_lanes_f32_nn, float,  sc_vf, 1)
+#undef SC_LANES_FN
+#undef SC_LANES_BODY
+#undef SC_LANE_ROW
+
+/* Rows [row0, row0 + n) of an F64 / F32 column at d into the lanes, nulls
+ * skipped when the column may hold them; the rows added out. */
+static inline int64_t sc_lanes_add(sc_f64_lanes_t* s, int8_t type, const void* d, int64_t row0, int64_t n, bool nulls) {
+    if (type == RAY_F32) return nulls ? sc_lanes_f32_nn(s, d, row0, n) : sc_lanes_f32(s, d, row0, n);
+    return nulls ? sc_lanes_f64_nn(s, d, row0, n) : sc_lanes_f64(s, d, row0, n);
+}
+
+static void sc_f64_lanes_add(sc_f64_lanes_t* s, const double* d, int64_t row0, int64_t n) {
+    (void)sc_lanes_f64(s, d, row0, n);
 }
 
 /* The lanes combined pairwise: lanes 2k and 2k + 1, then those sums the
@@ -782,38 +819,25 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
  * call) then add the same rows in the same order under any FP flags
  * (#1363); an accumulating loop leaves the association to the compiler,
  * which with -fassociative-math vectorizes it per call, so the cut showed
- * in the low bits.  A null-free F64 range adds in place; F32 widens, and a
- * null (NaN) row becomes -0.0, the exact additive identity, in a stack
+ * in the low bits.  A range adds in place (sc_lanes_add: F32 widened in
+ * register, a null skipped); only a selection gathers its rows into a stack
  * block first.  cnt counts the non-null rows, AVG's divisor. */
 #define RED_LANES_BLK 256
-#define RED_LANES_FILL(T, HAS_IDX, HAS_NULLS) \
-    for (int64_t i = 0; i < n; i++) { \
-        double v_ = (double)((const T*)base)[(HAS_IDX) ? idx[b + i] : b + i]; \
-        if (HAS_NULLS) { bool ok_ = v_ == v_; tmp[i] = ok_ ? v_ : -0.0; nn += ok_; } \
-        else tmp[i] = v_; \
-    }
 static void reduce_lanes_add(reduce_acc_t* acc, int8_t type, const void* base, int64_t start, int64_t end,
                              int64_t key0, bool has_nulls, const int64_t* idx) {
-    if (type == RAY_F64 && !has_nulls && !idx) {
-        sc_f64_lanes_add(&acc->sum_l, (const double*)base + start, key0, end - start);
-        acc->cnt += end - start;
+    size_t esz = type == RAY_F32 ? 4 : 8;
+    if (!idx) {
+        acc->cnt += sc_lanes_add(&acc->sum_l, type, (const char*)base + (size_t)start * esz, key0, end - start, has_nulls);
         return;
     }
-    double tmp[RED_LANES_BLK];
+    double tmp[RED_LANES_BLK];                          /* the selected rows, gathered */
     for (int64_t b = start; b < end; b += RED_LANES_BLK) {
-        int64_t n = end - b < RED_LANES_BLK ? end - b : RED_LANES_BLK, nn = 0;
-        if (type == RAY_F64) {
-            if (idx) { if (has_nulls) RED_LANES_FILL(double, 1, 1) else RED_LANES_FILL(double, 1, 0) }
-            else if (has_nulls) RED_LANES_FILL(double, 0, 1)
-        } else {
-            if (idx) { if (has_nulls) RED_LANES_FILL(float, 1, 1) else RED_LANES_FILL(float, 1, 0) }
-            else { if (has_nulls) RED_LANES_FILL(float, 0, 1) else RED_LANES_FILL(float, 0, 0) }
-        }
-        sc_f64_lanes_add(&acc->sum_l, tmp, key0 + (b - start), n);
-        acc->cnt += has_nulls ? nn : n;
+        int64_t n = end - b < RED_LANES_BLK ? end - b : RED_LANES_BLK;
+        if (type == RAY_F32) for (int64_t i = 0; i < n; i++) tmp[i] = (double)((const float*)base)[idx[b + i]];
+        else                 for (int64_t i = 0; i < n; i++) tmp[i] = ((const double*)base)[idx[b + i]];
+        acc->cnt += sc_lanes_add(&acc->sum_l, RAY_F64, tmp, key0 + (b - start), n, has_nulls);
     }
 }
-#undef RED_LANES_FILL
 
 /* A chunk's float SUM / AVG lanes into sum_f, after its last row. */
 static inline void reduce_lanes_fold(reduce_acc_t* acc, int8_t type, uint16_t opcode) {
@@ -10108,6 +10132,8 @@ struct scalar_ctx_s {
     int64_t        chunk_rows;
     scalar_range_fn_t range_fn;
     da_accum_t*    acc;          /* the chunk being scanned (scalar_red_chunk_run) */
+    sc_f64_lanes_t* lanes;       /* scalar_sum_f_fn: the chunk's lanes */
+    bool           lane_nulls;   /* scalar_sum_f_fn: the input may hold nulls */
 };
 
 /* Aim acc's 1-slot arrays at chunk k's block. */
@@ -10267,10 +10293,11 @@ SCALAR_SUM_NARROW(scalar_sum_i16, int16_t)
 SCALAR_SUM_NARROW(scalar_sum_u8,  uint8_t)
 #undef SCALAR_SUM_NARROW
 
-/* The scalar route's single SUM / AVG of f64 (no mask) adds by the explicit
- * lanes above (sc_f64_lanes_add): its task's partial is the lanes combined in
- * one fixed order, so a staged task reading zero-copy pieces, its lanes
- * carried across them, gives generation 0's bits for the same task. */
+/* The scalar route's single SUM / AVG of F64 or F32 (no mask, nulls or not)
+ * adds by the explicit lanes above (sc_lanes_add), the lanes carried across
+ * the blocks and pieces of one scan chunk (scalar_red_chunk_run) and combined
+ * when it ends.  Its chunks are the keyless reduction's (red_chunk_rows), so
+ * the select gives the bits of the eager sum on either generation. */
 
 static void scalar_f64_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
     (void)wid;
@@ -10296,19 +10323,31 @@ void ray_group_test_f64_lanes(const double* d, int64_t row0, int64_t n, const in
     *cut = sc_f64_lanes_total(&b);
 }
 
-static void scalar_sum_f64_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+typedef struct { const scalar_ctx_t* c; int64_t nn; } scalar_f_piece_ctx_t;
+
+static void scalar_f_piece(void* ctx, uint32_t wid, int64_t b, int64_t e, const ray_col_piece_t* p) {
+    (void)wid;
+    scalar_f_piece_ctx_t* x = (scalar_f_piece_ctx_t*)ctx;
+    x->nn += sc_lanes_add(x->c->lanes, x->c->agg_types[0], p[0].data, b, e - b, x->c->lane_nulls);
+}
+
+static void scalar_sum_f_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
     scalar_ctx_t* c = (scalar_ctx_t*)ctx;
     da_accum_t* acc = c->acc;
-    sc_f64_lanes_t lanes = { { 0 } };
+    int8_t t = c->agg_types[0];
+    int64_t nn;
     if (!c->staged) {
-        sc_f64_lanes_add(&lanes, (const double*)c->agg_ptrs[0] + start, start, end - start);
+        size_t esz = t == RAY_F32 ? 4 : 8;
+        nn = sc_lanes_add(c->lanes, t, (const char*)c->agg_ptrs[0] + (size_t)start * esz, start, end - start, c->lane_nulls);
     } else {
         if (ray_scan_fail_skip(c->fail, start)) return;
-        ray_t* err = ray_col_walk(c->srcs, c->plain, 1, start, end, false, &lanes, worker_id, scalar_f64_piece);
+        scalar_f_piece_ctx_t x = { c, 0 };
+        ray_t* err = ray_col_walk(c->srcs, c->plain, 1, start, end, false, &x, worker_id, scalar_f_piece);
         if (err) { ray_scan_fail_note(c->fail, start, err); return; }
+        nn = x.nn;
     }
-    acc->sum[0].f += sc_f64_lanes_total(&lanes);
     acc->count[0] += end - start;
+    if (acc->nn_count) acc->nn_count[0] += nn;
 }
 
 /* Tight loop for single SUM/AVG on integer linear expression (no mask).
@@ -10981,12 +11020,17 @@ static void scalar_red_chunk_run(scalar_ctx_t* c, const sc_chunk_ctx_t* cc, uint
             scalar_chunk_fn(&lcc, wid, b, hi - b > step ? b + step : hi);
         return;
     }
+    sc_f64_lanes_t lanes;
+    bool by_lanes = c->range_fn == scalar_sum_f_fn;
+    if (by_lanes) { memset(&lanes, 0, sizeof lanes); local.lanes = &lanes; }
     int64_t step = c->n_scan < RAY_PARALLEL_THRESHOLD ? hi - lo : RED_BLOCK;
     for (int64_t b = lo; b < hi; b += step) {
         int64_t e = hi - b > step ? b + step : hi;
         if (!c->match_idx && !c->staged) ray_pool_scan_at(c->n_scan, b, hi);
         c->range_fn(&local, wid, b, e);
     }
+    /* the chunk's lanes combined once, as exec_reduction combines its chunk's */
+    if (by_lanes) acc.sum[0].f = sc_f64_lanes_total(&lanes);
 }
 
 typedef struct { scalar_ctx_t* c; const sc_chunk_ctx_t* cc; } scalar_red_ctx_t;
@@ -17112,15 +17156,19 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * raw-cell sum loops even when SUM does not track nulls. */
         /* A staged single input takes the tight kernels through the piece
          * walk (never a SYM one: SYM always may hold nulls). */
-        if (n_aggs == 1 && !match_idx && !rowsel && (agg_ptrs[0] != NULL || sc_staged) && !agg0_has_nulls &&
+        if (n_aggs == 1 && !match_idx && !rowsel && (agg_ptrs[0] != NULL || sc_staged) && !agg_strlen[0] &&
+            !agg_prod[0].enabled && (ext->agg_ops[0] == OP_SUM || ext->agg_ops[0] == OP_AVG) &&
+            (agg_types[0] == RAY_F64 || agg_types[0] == RAY_F32)) {
+            /* float SUM / AVG, nulls or not: the reduction's lanes */
+            sc_fn = scalar_sum_f_fn;
+            sc_ctx.lane_nulls = agg0_has_nulls;
+        } else if (n_aggs == 1 && !match_idx && !rowsel && (agg_ptrs[0] != NULL || sc_staged) && !agg0_has_nulls &&
             !agg_strlen[0]) {
             uint16_t op0 = ext->agg_ops[0];
             int8_t   t0  = agg_types[0];
             if ((op0 == OP_SUM || op0 == OP_AVG) &&
                 (t0 == RAY_I64 || t0 == RAY_SYM || t0 == RAY_TIMESTAMP))
                 sc_fn = scalar_sum_i64_fn;
-            else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_F64)
-                sc_fn = scalar_sum_f64_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I32)
                 sc_fn = scalar_sum_i32_fn;
             else if ((op0 == OP_SUM || op0 == OP_AVG) && t0 == RAY_I16)
