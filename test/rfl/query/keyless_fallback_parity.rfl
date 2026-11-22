@@ -1,0 +1,80 @@
+;; @also-unfused
+;; The keyless per-row fallback answers as the compiled route and as by:
+;; with one group do (issue #1370).
+;;
+;; When one output of a keyless select does not compile, `z: (first (+ w
+;; 0))` here (DATE plus an integer declines), every output goes to the
+;; evaluator's fallback.  For first and last it gave an untyped null over an
+;; empty where:, swallowed the type error of an `if` mixing SYM and DATE
+;; arms, fed `at` and `except` one cell per row, and returned a LIST answer
+;; unboxed.  Each form is pinned beside the declined output, alone, and
+;; under by: with a single group.
+
+(set T (table [d u c s w m k L] (list [2024.01.01 0Nd 2024.01.03 2024.01.04] (as 'U8 [7 8 9 10]) [1 5 6 2] ['aa 'bb 'cc 'dd] [2024.02.01 2024.02.02 0Nd 2024.02.04] (list (list 1) (list 2 3) (list 4) (list 5)) [0 0 0 0] (list (list "a") (list "b" "c") (list "d") (list "e")))))
+(set S (fn [q] (at q 's)))
+
+;; ── 1. a lambda over an empty where: is the typed null of its result ──────
+(S (select {from: T where: (> c 100) s: (first ((fn [y] (let q y) q) d)) z: (first (+ w 0))}))  -- [0Nd]
+(S (select {from: T where: (> c 100) s: (last ((fn [y] (let q y) q) d)) z: (first (+ w 0))}))   -- [0Nd]
+(S (select {from: T where: (> c 100) s: (first ((fn [y] (let q y) q) d))}))                      -- [0Nd]
+(S (select {from: T where: (> c 100) s: (first d)}))                                             -- [0Nd]
+(type (S (select {from: T where: (> c 100) s: (first ((fn [y] (let q y) q) d)) z: (first (+ w 0))})))  -- 'DATE
+;; over rows it is the column's first non-null, as under by:
+(S (select {from: T where: (> c 1) s: (first ((fn [y] (let q y) q) d)) z: (first (+ w 0))}))    -- [2024.01.03]
+(S (select {from: T where: (> c 1) by: k s: (first ((fn [y] (let q y) q) d))}))                  -- [2024.01.03]
+
+;; ── 2. an `if` with a U8 arm over an empty where: is U8 ────────────────────
+(S (select {from: T where: (> c 100) s: (first (if (> c 4) u (as 'U8 3))) z: (first (+ w 0))}))  -- [0x00]
+(S (select {from: T where: (> c 100) s: (last (if (> c 4) u (as 'U8 3))) z: (first (+ w 0))}))   -- [0x00]
+(S (select {from: T where: (> c 100) s: (first (if (> c 4) u (as 'U8 3)))}))                      -- [0x00]
+(S (select {from: T s: (first (if (> c 4) u (as 'U8 3))) z: (first (+ w 0))}))                   -- [0x03]
+(S (select {from: T s: (last (if (> c 4) u (as 'U8 3))) z: (first (+ w 0))}))                    -- [0x03]
+(S (select {from: T s: (first (if (> c 4) u (as 'U8 3)))}))                                       -- [0x03]
+(S (select {from: T by: k s: (first (if (> c 4) u (as 'U8 3)))}))                                 -- [0x03]
+(S (select {from: T s: (first (if (> c 4) u (as 'U8 3))) z: (first (+ w 0))}))                   -- (S (select {from: T s: (first (if (> c 4) u (as 'U8 3)))}))
+
+;; ── 3. an `if` mixing SYM and DATE arms raises, on every route ─────────────
+(try (S (select {from: T s: (last (if (> c 4) s w)) z: (first (+ w 0))})) (fn [e] (at e 'msg)))   -- "if: branches mix SYM and DATE"
+(try (S (select {from: T s: (first (if (> c 4) s w)) z: (first (+ w 0))})) (fn [e] (at e 'msg)))  -- "if: branches mix SYM and DATE"
+(try (S (select {from: T s: (last (if (> c 4) s w))})) (fn [e] (at e 'msg)))                       -- "if: branches mix SYM and DATE"
+(try (S (select {from: T by: k s: (last (if (> c 4) s w))})) (fn [e] (at e 'msg)))                 -- "if: branches mix SYM and DATE"
+
+;; ── 4. a builtin over the whole column, as under by: ───────────────────────
+(S (select {from: T s: (first (at s (til 4))) z: (first (+ w 0))}))   -- [aa]
+(S (select {from: T s: (last (at s (til 4))) z: (first (+ w 0))}))    -- [dd]
+(S (select {from: T s: (first (at s (til 4)))}))                       -- [aa]
+(S (select {from: T by: k s: (first (at s (til 4)))}))                 -- [aa]
+(S (select {from: T s: (first (except s 'aa)) z: (first (+ w 0))}))   -- [bb]
+(S (select {from: T s: (last (except s 'dd)) z: (first (+ w 0))}))    -- [cc]
+(S (select {from: T s: (first (except s 'aa))}))                       -- [bb]
+(S (select {from: T by: k s: (first (except s 'aa))}))                 -- [bb]
+(S (select {from: T where: (> c 1) s: (first (except s 'bb)) z: (first (+ w 0))}))  -- [cc]
+(S (select {from: T where: (> c 1) by: k s: (first (except s 'bb))}))                -- [cc]
+;; nulls are skipped in the column it gives
+(S (select {from: T s: (last (at d [0 1])) z: (first (+ w 0))}))      -- [2024.01.01]
+
+;; its error is by:'s: operands of different lengths raise `length`, as on
+;; the compiled route, and `til` of a column `type`
+(S (select {from: T s: (first (+ c [10 20])) z: (first (+ w 0))})) !- length
+(S (select {from: T s: (first (+ c [10 20]))})) !- length
+(S (select {from: T by: k s: (first (+ c [10 20]))})) !- length
+(S (select {from: T s: (first (if (> c 4) (+ d [1 2]) d)) z: (first (+ w 0))})) !- length
+(S (select {from: T by: k s: (first (if (> c 4) (+ d [1 2]) d))})) !- length
+(S (select {from: T s: (first (til c)) z: (first (+ w 0))})) !- type
+(S (select {from: T by: k s: (first (til c))})) !- type
+;; an aggregate in the argument is over the rows, as alone
+(S (select {from: T s: (first (count s)) z: (first (+ w 0))}))       -- [4]
+(S (select {from: T s: (first (count s))}))                          -- [4]
+(S (select {from: T s: (last (+ d (count d))) z: (first (+ w 0))}))  -- [2024.01.08]
+
+;; ── 5. a LIST answer is one boxed cell ─────────────────────────────────────
+(S (select {from: T s: (first m) z: (first (+ w 0))}))                -- (list (list 1))
+(S (select {from: T s: (last m) z: (first (+ w 0))}))                 -- (list (list 5))
+(S (select {from: T s: (first m)}))                                    -- (list (list 1))
+(S (select {from: T by: k s: (first m)}))                              -- (list (list 1))
+(S (select {from: T where: (> c 1) s: (first m) z: (first (+ w 0))}))  -- (list (list 2 3))
+(S (select {from: T where: (> c 1) by: k s: (first m)}))                -- (list (list 2 3))
+(S (select {from: T s: (first m) z: (first (+ w 0))}))                -- (S (select {from: T by: k s: (first m)}))
+(S (select {from: T s: (first L) z: (first (+ w 0))}))                -- (list (list "a"))
+(S (select {from: T s: (first L)}))                                    -- (list (list "a"))
+(S (select {from: T by: k s: (first L)}))                              -- (list (list "a"))

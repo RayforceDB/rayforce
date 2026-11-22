@@ -14321,6 +14321,72 @@ static bool scalar_edge_src_vectorizes(ray_t* e, ray_t* tbl, int depth) {
     return true;
 }
 
+/* Is `e` builtin calls over columns and literals, each `if` in it blended
+ * per row: no lambda, no special form.  Evaluated once over the columns it
+ * is the argument `by:` gives one group, `(at v (til 4))` and `(except v
+ * 'b)` included, which the per-row pass feeds one cell. */
+static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return true;
+    if (depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (!rw_if_kind(e, tbl)) {
+        ray_t* h = es[0];
+        if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+            tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+        ray_t* fn = ray_env_get(h->i64);
+        if (!fn || RAY_IS_ERR(fn) || fn->type < RAY_UNARY || fn->type > RAY_VARY ||
+            (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* first/last's argument over the rows in one pass, where the answer is the
+ * one the compiled route or `by:` gives.  An elementwise argument is the
+ * column the compiled route computes, so its error is the query's (an `if`
+ * mixing SYM and DATE arms), save a length mismatch: an atomic expression
+ * fails so only where an `if`'s condition or arm is not one value per row,
+ * which the per-row pass reads one cell at a time.  Other builtin calls
+ * without an effect are evaluated as `by:` evaluates them, so their error
+ * is `by:`'s: operands of different lengths (`(+ c [1 2])`), or `(til c)`.
+ * NULL leaves the argument to the per-row pass. */
+static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
+    bool elementwise = scalar_edge_src_vectorizes(e, tbl, 0);
+    if (!elementwise && !(scalar_edge_src_builtin(e, tbl, 0) && query_expr_effect_free(e)))
+        return NULL;
+    ray_t* src = eval_expr_whole_column_impl(e, tbl);
+    if (!src) return NULL;
+    if (RAY_IS_ERR(src)) {
+        if (!elementwise || strcmp(ray_err_code(src), "length")) return src;
+        rw_swallow(src);
+        return NULL;
+    }
+    if (elementwise && ((!ray_is_vec(src) && src->type != RAY_LIST) || src->len != nrows)) {
+        ray_release(src);
+        return NULL;
+    }
+    return src;
+}
+
+/* The per-row pass over no rows evaluates nothing and leaves an empty LIST,
+ * so first/last would answer the untyped null 0Nl.  The argument evaluated
+ * once over the empty columns gives its result type, as the compiled route
+ * types it: `((fn [y] (let q y) q) v)` over a DATE v is an empty DATE
+ * vector.  An argument with an effect, one that fails, or one that is not
+ * an empty typed vector keeps the LIST. */
+static ray_t* scalar_edge_empty_src(ray_t* e, ray_t* tbl, ray_t* src) {
+    if (src->type != RAY_LIST || src->len != 0 || !query_expr_effect_free(e)) return src;
+    ray_t* typed = eval_expr_whole_column_impl(e, tbl);
+    if (typed && !RAY_IS_ERR(typed) && ray_is_vec(typed) && typed->type != RAY_LIST && typed->len == 0) {
+        ray_release(src);
+        return typed;
+    }
+    if (typed && RAY_IS_ERR(typed)) rw_swallow(typed);
+    else if (typed) ray_release(typed);
+    return src;
+}
+
 /* `(first v)` / `(last v)` in a select skip a typed vector's nulls, as the
  * compiled route's reduction does (exec_reduction): the first (last)
  * non-null cell.  NULL leaves `v` to the builtin: no null in it, every
@@ -14411,18 +14477,15 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             }
         }
         else {
-            /* first/last of an elementwise source: its column in one
+            /* first/last of a builtin-call source: its column in one
              * vectorized pass (an `if` blended per row), not one eval per
-             * row.  Anything else, or a pass that fails or is not one
-             * value per row, runs per row as before. */
-            if (edge && scalar_edge_src_vectorizes(agg_src_expr, tbl, 0)) {
-                src = eval_expr_whole_column_impl(agg_src_expr, tbl);
-                if (src && RAY_IS_ERR(src)) { rw_swallow(src); src = NULL; }
-                else if (src && ((!ray_is_vec(src) && src->type != RAY_LIST) || src->len != nrows)) {
-                    ray_release(src); src = NULL;
-                }
+             * row (scalar_edge_src_whole).  Anything else runs per row. */
+            if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
+            if (!src) {
+                src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+                if (edge && nrows == 0 && src && !RAY_IS_ERR(src))
+                    src = scalar_edge_empty_src(agg_src_expr, tbl, src);
             }
-            if (!src) src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
         }
         ray_release(agg_src_expr);
         if (!src || RAY_IS_ERR(src)) {
@@ -14440,9 +14503,10 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
         }
 
-        /* The aggregate of a column-free source is one value, a collection
-         * too: boxed as one cell, as each group takes it under by:. */
-        if (column_free && !ray_is_atom(agg_value)) {
+        /* An aggregate is one value, a collection too (`(first l)` over a
+         * LIST column of lists): boxed as one cell, as the compiled route
+         * and each group under by: take it. */
+        if (!ray_is_atom(agg_value)) {
             ray_t* box = ray_list_new(1);
             if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
             ray_release(agg_value);
