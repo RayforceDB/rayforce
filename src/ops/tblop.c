@@ -957,11 +957,22 @@ ray_t* ray_xkey_fn(ray_t* tbl, ray_t* keys_arg) {
     }
     for (size_t i = 0; i < ht_cap; i++) ht[i] = -1;
 
+    /* The check is atom_eq, so hash with ray_key_hash; its TIMESPAN
+     * normalization must be known before the first key is hashed.  A typed
+     * column's cells are atoms; any other column kind takes both bits. */
+    int spans = 0;
+    for (int64_t k = 0; k < nkeys; k++) {
+        ray_t* col = key_cols[k];
+        if (col->type == RAY_LIST) spans |= ray_key_spans(col);
+        else if (ray_has_timespan(col)) spans |= RAY_KEY_SPAN_ATOM;
+        else if (col->type <= RAY_LIST || col->type > RAY_STR) spans |= RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
+    }
+
     for (int64_t r = 0; r < nrows; r++) {
         ray_t* k = table_row_key(key_cols, nkeys, r);
         if (!k || RAY_IS_ERR(k)) { ray_free_raw(ht); ray_release(keys); ray_release(vals); ray_free_raw(key_cols); ray_free_raw(key_syms); return k ? k : ray_error("oom", NULL); }
         ray_t** key_items = (ray_t**)ray_data(keys);
-        size_t slot = (size_t)ray_atom_hash(k) & (ht_cap - 1);
+        size_t slot = (size_t)ray_key_hash(k, spans) & (ht_cap - 1);
         while (ht[slot] >= 0) {
             if (atom_eq(key_items[ht[slot]], k)) {
                 ray_release(k);

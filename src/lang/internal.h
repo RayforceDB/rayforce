@@ -484,6 +484,12 @@ ray_t* ray_quantile_per_group_buf(ray_t* src,
 
 /* Collection helpers (formerly static in eval.c, now in collection.c) */
 int    atom_eq(ray_t* a, ray_t* b);
+/* Hash consistent with atom_eq for hash sets over key cells (collection.c).
+ * Pass spans = ray_key_spans() over every cell the set will compare. */
+#define RAY_KEY_SPAN_ATOM 1
+#define RAY_KEY_SPAN_VEC  2
+uint64_t ray_key_hash(ray_t* x, int spans);
+int      ray_key_spans(ray_t* x);
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
 /* Collection builtins (formerly static in eval.c, now in collection.c) */
