@@ -81,6 +81,28 @@ ray_err_t ray_splay_resolve_dir(const char* dir, char* out, size_t out_sz);
 /* Does dir hold a published table (a schema in its selected generation)? */
 bool ray_splay_has_schema(const char* dir);
 
+/* A transaction's writes.  While ray_splay_defer is set, a write that
+ * finishes is complete on disk but not published: it waits, holding its
+ * table's lock, and this process's readers resolve the table to it.
+ * ray_splay_pending_end publishes them all or removes them all, and
+ * releases the locks.  A write whose lock is taken fails at once instead
+ * of waiting. */
+extern bool ray_splay_defer;
+int64_t     ray_splay_pending_count(void);
+const char* ray_splay_pending_root(int64_t i);
+const char* ray_splay_pending_gen(int64_t i);
+const char* ray_splay_pending_prev(int64_t i);
+ray_err_t   ray_splay_pending_end(bool publish);
+#ifdef DEBUG
+void        ray_splay_pending_abandon(void);   /* tests: as a dead process leaves them */
+#endif
+/* Make `gen` (as ray_splay_pending_gen named it) the current generation of
+ * the table at `root`, if it is still there and `prev` (as
+ * ray_splay_pending_prev named it) is still the current one: what recovery
+ * does for a commit whose publication a crash cut short.  A table published
+ * again since is left alone. */
+ray_err_t   ray_splay_publish(const char* root, const char* gen, const char* prev);
+
 /* Splayed table I/O.
  *
  * sym_path names the table's symfile (domain): save distinct-merges the

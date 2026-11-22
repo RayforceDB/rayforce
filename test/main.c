@@ -150,6 +150,7 @@ extern const test_entry_t join_buildside_entries[];
 extern const test_entry_t join_mask_entries[];
 extern const test_entry_t join_prefilter_entries[];
 extern const test_entry_t journal_entries[];
+extern const test_entry_t wal_entries[];
 extern const test_entry_t lang_entries[];
 extern const test_entry_t link_entries[];
 extern const test_entry_t lftj_entries[];
@@ -230,7 +231,7 @@ static const test_entry_t* const compiled_groups[] = {
     join_buildside_entries,
     join_mask_entries,
     join_prefilter_entries,
-    journal_entries,
+    journal_entries,  wal_entries,
     lang_entries,     link_entries,
     lftj_entries,     list_entries,     meta_entries,     morsel_entries,
     mcast_entries,

@@ -1,0 +1,1177 @@
+/*
+ *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+ *
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+ *
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+ *
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
+/* The journal's physical records: every way a global changes must come
+ * back, the same value, in a process that only applies the log.
+ *
+ * Each case runs its statements with a journal open (one ray_eval_str is
+ * one commit), formats what a probe expression reads, destroys the
+ * runtime, recovers into a fresh one and compares the probe again. */
+
+#define _GNU_SOURCE
+#include "test.h"
+#include <rayforce.h>
+#include "store/journal.h"
+#include "store/serde.h"
+#include "lang/eval.h"
+#include "lang/env.h"
+#include "lang/format.h"
+#include "core/runtime.h"
+#include "mem/sys.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include "store/fileio.h"
+#include "store/splay.h"
+#include "core/timer.h"
+
+static void wal_setup(void)    { ray_runtime_create(0, NULL); }
+static void wal_teardown(void) { ray_runtime_destroy(__RUNTIME); }
+
+static void wal_base(char* base, size_t sz, const char* tag) {
+    snprintf(base, sz, "/tmp/wal_test_%s_XXXXXX", tag);
+    int fd = mkstemp(base);
+    if (fd >= 0) { close(fd); unlink(base); }
+}
+
+static void wal_cleanup(const char* base) {
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "rm -f %s.log %s.qdb %s.lk %s.*.log", base, base, base, base);
+    if (system(cmd) != 0) { /* best effort */ }
+}
+
+static bool wal_run(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    if (!r) return true;
+    if (RAY_IS_ERR(r)) { ray_error_free(r); return false; }
+    if (r != RAY_NULL_OBJ) ray_release(r);
+    return true;
+}
+
+/* What `probe` reads, in the repr the rfl runner compares values by
+ * (attrs that are only hints, such as HAS_NULLS on a column without a
+ * null, are not part of a value); NULL when it raises. */
+static uint8_t* wal_probe(const char* probe, int64_t* len) {
+    *len = 0;
+    ray_t* v = ray_eval_str(probe);
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return NULL; }
+    ray_t* str = ray_fmt(v, 0);
+    if (v != RAY_NULL_OBJ) ray_release(v);
+    if (!str || RAY_IS_ERR(str)) return NULL;
+    int64_t n = (int64_t)ray_str_len(str);
+    uint8_t* buf = (uint8_t*)ray_sys_alloc((size_t)n + 1);
+    if (buf) { memcpy(buf, ray_str_ptr(str), (size_t)n); *len = n; }
+    ray_release(str);
+    return buf;
+}
+
+static int64_t wal_file_size(const char* base) {
+    char path[300];
+    snprintf(path, sizeof(path), "%s.log", base);
+    struct stat st;
+    return stat(path, &st) == 0 ? (int64_t)st.st_size : -1;
+}
+
+/* Run `ops` (statements separated by '\n', one commit each) under a
+ * journal, then recover in a fresh runtime: `probe` must read the same
+ * value.  0 on success, else the step that failed. */
+static int wal_roundtrip(const char* ops, const char* probe) {
+    char base[256];
+    wal_base(base, sizeof(base), "rt");
+    int fail = 0;
+    uint8_t *want = NULL, *got = NULL;
+    int64_t nwant = 0, ngot = 0;
+
+    wal_teardown();                                /* nothing the log does not hold */
+    wal_setup();
+    if (ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) { fail = 1; goto done; }
+    char* copy = strdup(ops);
+    for (char* line = strtok(copy, "\n"); line && !fail; line = strtok(NULL, "\n"))
+        if (!wal_run(line)) fail = 2;
+    free(copy);
+    if (!fail) {
+        want = wal_probe(probe, &nwant);
+        if (!want) fail = 3;
+    }
+    if (ray_journal_close() != RAY_OK && !fail) fail = 4;
+    if (fail) goto done;
+
+    wal_teardown();                                /* the process is gone */
+    wal_setup();
+    got = wal_probe(probe, &ngot);                 /* and so is what it held */
+    if (got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0) { fail = 8; goto done; }
+    if (got) { ray_sys_free(got); got = NULL; }
+    if (ray_journal_recover(base) != RAY_OK) { fail = 5; goto done; }
+    got = wal_probe(probe, &ngot);
+    if (!got) fail = 6;
+    else if (ngot != nwant || memcmp(got, want, (size_t)nwant) != 0) fail = 7;
+
+done:
+    if (ray_journal_is_open()) ray_journal_close();
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(base);
+    return fail;
+}
+
+/* The comparison these tests rest on sees a table's cells, not its shape. */
+static test_result_t test_wal_probe_sees_content(void) {
+    int64_t na = 0, nb = 0;
+    uint8_t* a = wal_probe("(table [k s] (list [1 2] ['a 'b]))", &na);
+    uint8_t* b = wal_probe("(table [k s] (list [1 2] ['a 'c]))", &nb);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    bool differ = na != nb || memcmp(a, b, (size_t)na) != 0;
+    ray_sys_free(a);
+    ray_sys_free(b);
+    TEST_ASSERT_TRUE(differ);
+    PASS();
+}
+
+/* ── every path that changes a global ─────────────────────────────── */
+
+#define T3 "(table [k v s] (list [1 2 3] [10 20 30] ['a 'b 'c]))"
+
+static const struct { const char* name; const char* ops; const char* probe; } wal_cases[] = {
+    { "set atom",        "(set x 42)", "x" },
+    { "set vector",      "(set x [1 2 3])", "x" },
+    { "set list",        "(set x (list 1 \"two\" 'three [4.0 5.0]))", "x" },
+    { "set dict",        "(set x (dict ['a 'b] (list 1 [2 3])))", "x" },
+    { "set table",       "(set t " T3 ")", "t" },
+    { "set lambda",      "(set y 5)\n(set f (fn [a] (+ a y)))", "(list f (f 1))" },
+    { "set twice",       "(set x 1)\n(set x 2)", "x" },
+    { "two in a commit", "(do (set x 1) (set y [2 3]))", "(list x y)" },
+    { "del",             "(set x 1)\n(set y 2)\n(del x)", "(list y (try x (fn [e] 'unbound)))" },
+    { "set from fn",     "(set f (fn [] (set g 5)))\n(f)", "g" },
+    /* #1006: data whose head names a builtin stays data */
+    { "list with a builtin head", "(set x (list 'count [1 2 3]))", "x" },
+    /* settled once: replay must not draw again */
+    { "rand",            "(set r (rand 20 1000000))", "r" },
+
+    { "dotted set",      "(set ns.a 1)\n(set ns.b.c [1 2])", "(list ns.a ns.b.c)" },
+    { "dotted table",    "(set ns.t " T3 ")", "ns.t" },
+    { "dotted del",      "(set ns.a 1)\n(set ns.b 2)\n(del ns.a)", "ns" },
+
+    { "insert row",      "(set t " T3 ")\n(insert 't (list 4 40 'd))", "t" },
+    { "insert rows",     "(set t " T3 ")\n(insert 't (table [k v s] (list [4 5] [40 50] ['d 'e])))", "t" },
+    { "insert many",     "(set t " T3 ")\n(insert 't (list 4 40 'd))\n(insert 't (list 5 50 'e))\n(insert 't (list 6 60 'f))", "t" },
+    { "insert shared",   "(set t " T3 ")\n(set u t)\n(insert 't (list 4 40 'd))", "(list t u)" },
+    { "insert dotted",   "(set ns.t " T3 ")\n(insert 'ns.t (list 4 40 'd))", "ns.t" },
+    { "insert vector",   "(set v [1 2 3])\n(insert 'v 4)", "v" },
+    { "insert list",     "(set l (list 1 \"a\"))\n(insert 'l 'x)", "l" },
+    { "insert in a fn",  "(set t " T3 ")\n(set f (fn [] (insert 't (list 4 40 'd))))\n(f)", "t" },
+    { "insert nulls",    "(set t " T3 ")\n(insert 't (list 0Nl 40 'd))\n(insert 't (list 5 0Nl 'e))", "(list t (nil? (at t 'k)) (nil? (at t 'v)))" },
+    /* the first rows give a table of typeless columns its types: not an append */
+    { "insert typeless", "(set t (table [a b] (list (list) (list))))\n(insert 't (list 1 2.5))\n(insert 't (list 2 3.5))", "(list t (count t))" },
+    { "insert into empty", "(set t (take " T3 " 0))\n(insert 't (list 1 10 'a))\n(insert 't (list 2 20 'b))", "(list t (count t))" },
+    { "insert a local",  "(set t " T3 ")\n(set f (fn [t] (do (insert 't (list 9 9 'q)) (count t))))\n(f (table [k v s] (list [8] [8] ['p])))", "t" },
+    { "vector appends",  "(set v [1 2 3])\n(insert 'v 4)\n(alter 'v concat 5)\n(alter 'v concat [6 7])\n(insert 'v 8)", "v" },
+    { "list appends",    "(set l (list 1 \"a\"))\n(insert 'l 'x)\n(alter 'l concat (list 2.5 [1 2]))", "l" },
+    { "empty vector",    "(set v (take [1] 0))\n(insert 'v 4)\n(insert 'v 5)", "v" },
+    { "insert new sym",  "(set t " T3 ")\n(insert 't (list 4 40 'never_seen_before_sym))", "t" },
+
+    { "upsert new",      "(set t " T3 ")\n(upsert 't 1 (list 4 40 'd))", "t" },
+    { "upsert existing", "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))", "t" },
+    { "upsert twice",    "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))\n(upsert 't 1 (list 9 99 'y))", "t" },
+    { "upsert shared",   "(set t " T3 ")\n(set u t)\n(upsert 't 1 (list 2 77 'z))", "(list t u)" },
+    { "upsert a local",  "(set t " T3 ")\n(set f (fn [t] (do (upsert 't 1 (list 2 77 'z)) (count t))))\n(f (table [k v s] (list [9] [9] ['q])))", "t" },
+    { "upsert dict row", "(set t " T3 ")\n(upsert 't 1 (dict ['k 'v 's] (list 2 55 'w)))", "t" },
+    { "upsert dotted",   "(set ns.t " T3 ")\n(upsert 'ns.t 1 (list 2 77 'z))", "ns.t" },
+
+    { "update where",    "(set t " T3 ")\n(update {from: 't v: 99 where: (== k 2)})", "t" },
+    { "update all",      "(set t " T3 ")\n(update {from: 't v: (* v 2)})", "t" },
+    { "update by",       "(set t " T3 ")\n(update {from: 't tot: (sum v) by: s})", "t" },
+    { "update shared",   "(set t " T3 ")\n(set u t)\n(update {from: 't v: 99 where: (== k 2)})", "(list t u)" },
+    { "update dotted",   "(set ns.t " T3 ")\n(update {from: 'ns.t v: 99 where: (== k 2)})", "ns.t" },
+
+    { "update nulls",    "(set t " T3 ")\n(update {from: 't v: 0Nl where: (== k 2)})\n(update {from: 't s: 'zz where: (> k 1)})", "(list t (nil? (at t 'v)))" },
+    { "update twice",    "(set t " T3 ")\n(update {from: 't v: (+ v 1) where: (> k 1)})\n(update {from: 't v: (* v 3) where: (< k 3)})", "t" },
+    { "delete all",      "(set t " T3 ")\n(delete {from: 't where: (> k 0)})\n(insert 't (list 9 90 'q))", "t" },
+    { "delete then upsert", "(set t " T3 ")\n(upsert 't 1 (list 2 77 'z))\n(delete {from: 't where: (== k 1)})\n(upsert 't 1 (list 3 33 'y))\n(upsert 't 1 (list 1 11 'x))", "t" },
+    { "delete where",    "(set t " T3 ")\n(delete {from: 't where: (> k 1)})", "t" },
+    { "delete shared",   "(set t " T3 ")\n(set u t)\n(delete {from: 't where: (> k 1)})", "(list t u)" },
+    { "delete dotted",   "(set ns.t " T3 ")\n(delete {from: 'ns.t where: (== k 2)})", "ns.t" },
+
+    { "alter set",       "(set v [1 2 3])\n(alter 'v set 0 9)", "v" },
+    { "alter concat",    "(set v [1 2 3])\n(alter 'v concat [4 5])", "v" },
+    { "alter dotted",    "(set ns.v [1 2 3])\n(alter 'ns.v set 1 9)", "ns.v" },
+
+    { "mixed",           "(set t " T3 ")\n(insert 't (list 4 40 'd))\n(update {from: 't v: 0 where: (== k 4)})\n"
+                         "(insert 't (list 5 50 'e))\n(delete {from: 't where: (== k 1)})\n(insert 't (list 6 60 'f))", "t" },
+};
+
+static test_result_t test_wal_roundtrip_paths(void) {
+    for (size_t i = 0; i < sizeof(wal_cases) / sizeof(wal_cases[0]); i++) {
+        int fail = wal_roundtrip(wal_cases[i].ops, wal_cases[i].probe);
+        if (fail) {
+            static char msg[160];
+            snprintf(msg, sizeof(msg), "case '%s' failed at step %d", wal_cases[i].name, fail);
+            FAIL(msg);
+        }
+    }
+    PASS();
+}
+
+/* ── transactions: the undo log ───────────────────────────────────── */
+
+/* Every path again, this time undone: build the case's state, then inside
+ * a transaction run its mutating statements once more (they now start
+ * from that state) and bind a new name; rollback must leave what the
+ * probe read before, and nothing of the new name. */
+static test_result_t test_tx_rollback_paths(void) {
+    for (size_t i = 0; i < sizeof(wal_cases) / sizeof(wal_cases[0]); i++) {
+        wal_teardown();
+        wal_setup();
+        int fail = 0;
+        char* copy = strdup(wal_cases[i].ops);
+        char* rest = strchr(copy, '\n');           /* past the statement that creates the state */
+        for (char* line = strtok(copy, "\n"); line && !fail; line = strtok(NULL, "\n"))
+            if (!wal_run(line)) fail = 1;
+        free(copy);
+        int64_t nwant = 0, ngot = 0;
+        uint8_t* want = fail ? NULL : wal_probe(wal_cases[i].probe, &nwant);
+        if (!fail && !want) fail = 2;
+
+        if (!fail && ray_tx_begin(RAY_TX_LOCAL, 0, 0) != RAY_OK) fail = 3;
+        if (!fail) {
+            copy = strdup(wal_cases[i].ops);
+            rest = strchr(copy, '\n');
+            for (char* line = rest ? strtok(rest + 1, "\n") : NULL; line; line = strtok(NULL, "\n"))
+                (void)wal_run(line);
+            free(copy);
+            if (!wal_run("(set tx_new_name [1 2 3])")) fail = 4;
+            if (!wal_run("(set tx_ns.inner 1)")) fail = 4;
+            ray_tx_rollback();
+            if (ray_tx_active) fail = 5;
+        }
+        uint8_t* got = fail ? NULL : wal_probe(wal_cases[i].probe, &ngot);
+        if (!fail && !got) fail = 6;
+        if (!fail && (ngot != nwant || memcmp(got, want, (size_t)nwant) != 0)) fail = 7;
+        if (!fail && (wal_run("tx_new_name") || wal_run("tx_ns"))) fail = 8;
+        if (want) ray_sys_free(want);
+        if (got) ray_sys_free(got);
+        if (fail) {
+            static char msg[160];
+            snprintf(msg, sizeof(msg), "case '%s' failed at step %d", wal_cases[i].name, fail);
+            FAIL(msg);
+        }
+    }
+    PASS();
+}
+
+/* A value somebody else also holds is not written through: neither by the
+ * transaction's writes nor by the rollback. */
+static test_result_t test_tx_leaves_aliases_alone(void) {
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(set ns.t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(set alias t)"));
+    TEST_ASSERT_TRUE(wal_run("(set nsalias ns)"));
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list alias nsalias t ns)", &nwant);
+    TEST_ASSERT_NOT_NULL(want);
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(wal_run("(update {from: 't v: 0 where: (== k 1)})"));
+    TEST_ASSERT_TRUE(wal_run("(upsert 'ns.t 1 (list 2 77 'z))"));
+    TEST_ASSERT_TRUE(wal_run("(delete {from: 'ns.t where: (== k 3)})"));
+    TEST_ASSERT_TRUE(wal_run("(insert 'ns.t (list 9 90 'q))"));
+    int64_t nmid = 0;
+    uint8_t* mid = wal_probe("(list alias nsalias)", &nmid);
+    ray_tx_rollback();
+    uint8_t* got = wal_probe("(list alias nsalias t ns)", &ngot);
+    TEST_ASSERT_NOT_NULL(got);
+    bool same = ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    uint8_t* aliases = wal_probe("(list alias nsalias)", &ngot);
+    bool untouched = mid && aliases && ngot == nmid && memcmp(mid, aliases, (size_t)nmid) == 0;
+    ray_sys_free(want); ray_sys_free(got);
+    if (mid) ray_sys_free(mid);
+    if (aliases) ray_sys_free(aliases);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_TRUE(untouched);
+    PASS();
+}
+
+/* Created, changed and deleted in one transaction, each undone; and
+ * several changes of one name go back to what it held before the first. */
+static test_result_t test_tx_rollback_create_change_delete(void) {
+    TEST_ASSERT_TRUE(wal_run("(set keep 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set gone [1 2 3])"));
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set keep 2)"));
+    TEST_ASSERT_TRUE(wal_run("(set keep 3)"));
+    TEST_ASSERT_TRUE(wal_run("(del keep)"));
+    TEST_ASSERT_TRUE(wal_run("(set keep 4)"));
+    TEST_ASSERT_TRUE(wal_run("(del gone)"));
+    TEST_ASSERT_TRUE(wal_run("(set made 5)"));
+    TEST_ASSERT_TRUE(wal_run("(del made)"));
+    TEST_ASSERT_TRUE(wal_run("(set made 6)"));
+    ray_tx_rollback();
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list 1 [1 2 3] 'unbound)", &nwant);
+    uint8_t* got  = wal_probe("(list keep gone (try made (fn [e] 'unbound)))", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* The undo log holds one reference to each old value and gives every one
+ * back: after either ending the binding is the table's only owner again,
+ * which is what lets the next insert append in place. */
+static test_result_t test_tx_gives_references_back(void) {
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    int64_t sym = ray_sym_intern("t", 1);
+    TEST_ASSERT_EQ_I(ray_env_get_global(sym)->rc, 1);
+    for (int commit = 0; commit < 2; commit++) {
+        TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+        TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
+        TEST_ASSERT_TRUE(wal_run("(update {from: 't v: 0 where: (== k 1)})"));
+        if (commit) TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+        else ray_tx_rollback();
+        TEST_ASSERT_FALSE(ray_tx_active);
+        TEST_ASSERT_EQ_I(ray_env_get_global(sym)->rc, 1);
+    }
+    PASS();
+}
+
+/* One transaction is one journal commit; a rolled back one is none. */
+static test_result_t test_tx_is_one_commit(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "txc");
+    snprintf(path, sizeof(path), "%s.log", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    int64_t chunks0 = 0, bytes0 = 0, chunks = 0, bytes = 0;
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks0, &bytes0), RAY_OK);
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(wal_run("(set a 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set b 2)"));
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(bytes, bytes0);               /* nothing reaches the log before the commit */
+    ray_tx_rollback();
+    TEST_ASSERT_TRUE(wal_run("(sum [1 2])"));      /* an evaluation boundary after it */
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(bytes, bytes0);
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
+    TEST_ASSERT_TRUE(wal_run("(set a 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set b 2)"));
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(chunks, chunks0 + 1);
+
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list t a b)", &nwant);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    uint8_t* got = wal_probe("(list t a b)", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* Only one at a time, and the ends need one open. */
+static test_result_t test_tx_begin_commit_rules(void) {
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_ERR_DOMAIN);
+    ray_tx_rollback();                             /* no-op */
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_ERR_DOMAIN);
+    TEST_ASSERT_TRUE(ray_tx_active);               /* the refused begin did not end it */
+    TEST_ASSERT_EQ_I(ray_tx_left_ms(), INT64_MAX);
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_tx_begin(7, 50, 1000), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_tx_owner(), 7);
+    TEST_ASSERT_TRUE(ray_tx_left_ms() > 0 && ray_tx_left_ms() <= 50);
+    ray_tx_rollback();
+    TEST_ASSERT_FALSE(ray_tx_active);
+    PASS();
+}
+
+/* ── transactions: tables on disk ─────────────────────────────────── */
+
+static void txd_dir(char* dir, size_t sz, const char* tag) {
+    snprintf(dir, sz, "/tmp/wal_test_db_%s_%d", tag, (int)getpid());
+    char cmd[400];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    if (system(cmd) != 0) { /* best effort */ }
+}
+
+/* The generation the table's .current names, "" when it has none. */
+static void txd_current(const char* dir, char* out, size_t sz) {
+    char path[400];
+    snprintf(path, sizeof(path), "%s/.current", dir);
+    out[0] = '\0';
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    size_t n = fread(out, 1, sz - 1, f);
+    out[n] = '\0';
+    fclose(f);
+}
+
+static int txd_generations(const char* dir) {
+    char cmd[500];
+    snprintf(cmd, sizeof(cmd), "test \"$(ls %s/.generations 2>/dev/null | wc -l)\" -eq 1", dir);
+    return system(cmd) == 0 ? 1 : 0;
+}
+
+static bool txd_evalf(const char* fmt, const char* dir) {
+    char src[700];
+    snprintf(src, sizeof(src), fmt, dir);
+    return wal_run(src);
+}
+
+/* Rows of the table as this process reads it, -1 when it cannot. */
+static int64_t txd_rows(const char* dir) {
+    char src[500];
+    snprintf(src, sizeof(src), "(count (.db.splayed.get \"%s/\"))", dir);
+    ray_t* v = ray_eval_str(src);
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return -1; }
+    int64_t n = v->i64;
+    ray_release(v);
+    return n;
+}
+
+/* A table written in a transaction is on disk but not published: its
+ * owner reads the new rows, .current still names the old generation, and
+ * a rollback removes what was written. */
+static test_result_t test_tx_table_write_waits_for_commit(void) {
+    char dir[256], before[300], during[300], after[300];
+    txd_dir(dir, sizeof(dir), "wait");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));     /* now a generation */
+    txd_current(dir, before, sizeof(before));
+    TEST_ASSERT_TRUE(before[0] != '\0');
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    txd_current(dir, during, sizeof(during));
+    TEST_ASSERT_STR_EQ(during, before);            /* nobody else sees it */
+    TEST_ASSERT_EQ_I(txd_rows(dir), 4);            /* its owner does */
+    TEST_ASSERT_FALSE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));    /* once per transaction */
+    ray_tx_rollback();
+    txd_current(dir, after, sizeof(after));
+    TEST_ASSERT_STR_EQ(after, before);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    TEST_ASSERT_EQ_I(txd_generations(dir), 1);     /* the unpublished one is gone */
+
+    /* ...and a commit publishes it. */
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    txd_current(dir, after, sizeof(after));
+    TEST_ASSERT_TRUE(strcmp(after, before) != 0);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 4);
+    TEST_ASSERT_EQ_I(txd_generations(dir), 1);
+    /* A commit that cannot publish a table says so: it is committed, and
+     * the reader would otherwise take the old table for the new. */
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 6 60 'f))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    if (geteuid() != 0) {                          /* root renames into a read-only directory */
+        chmod(dir, 0555);
+        ray_err_t ce = ray_tx_commit();
+        chmod(dir, 0755);
+        TEST_ASSERT_EQ_I(ce, RAY_ERR_IO);
+        TEST_ASSERT_TRUE(ray_tx_unpublished);
+        TEST_ASSERT_FALSE(ray_tx_active);
+        TEST_ASSERT_TRUE(wal_run("(if (== (count t) 5) 1 (no_such_function))"));   /* committed in memory */
+        TEST_ASSERT_EQ_I(txd_rows(dir), 4);                                        /* the old table on disk */
+        TEST_ASSERT_TRUE(wal_run("(delete {from: 't where: (== k 6)})"));
+    } else {
+        ray_tx_rollback();
+    }
+    /* Outside a transaction a write publishes at once, as ever. */
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(txd_rows(dir), 5);
+    txd_dir(dir, sizeof(dir), "wait");
+    PASS();
+}
+
+/* A table that did not exist: nothing of it is published before the
+ * commit, and after a rollback there is no table. */
+static test_result_t test_tx_new_table_waits_for_commit(void) {
+    char dir[256], cur[300];
+    txd_dir(dir, sizeof(dir), "new");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    txd_current(dir, cur, sizeof(cur));
+    TEST_ASSERT_STR_EQ(cur, "");
+    char schema[300];
+    snprintf(schema, sizeof(schema), "%s/.d", dir);
+    TEST_ASSERT_TRUE(access(schema, F_OK) != 0);   /* nor the first-write layout */
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    ray_tx_rollback();
+    TEST_ASSERT_EQ_I(txd_rows(dir), -1);
+    txd_current(dir, cur, sizeof(cur));
+    TEST_ASSERT_STR_EQ(cur, "");
+
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    TEST_ASSERT_EQ_I(ray_tx_commit(), RAY_OK);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    txd_dir(dir, sizeof(dir), "new");
+    PASS();
+}
+
+/* A table another process is writing: the transaction's write fails at
+ * once.  Waiting would stop the server for everyone. */
+static test_result_t test_tx_table_locked_elsewhere_fails_fast(void) {
+    char dir[256], lock[300];
+    txd_dir(dir, sizeof(dir), "lock");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    snprintf(lock, sizeof(lock), "%s/.write.lock", dir);
+    int to_child[2], from_child[2];
+    TEST_ASSERT_EQ_I(pipe(to_child), 0);
+    TEST_ASSERT_EQ_I(pipe(from_child), 0);
+    pid_t pid = fork();
+    if (pid == 0) {                                /* hold the table's lock until told */
+        ray_fd_t fd = ray_file_open(lock, RAY_OPEN_READ | RAY_OPEN_WRITE | RAY_OPEN_CREATE);
+        char c = fd != RAY_FD_INVALID && ray_file_lock_ex(fd) == RAY_OK ? 'k' : 'x';
+        if (write(from_child[1], &c, 1) != 1) _exit(1);
+        if (read(to_child[0], &c, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    char c = 0;
+    TEST_ASSERT_EQ_I((int64_t)read(from_child[0], &c, 1), 1);
+    int64_t t0 = ray_time_now_ms();
+    bool wrote = true;
+    if (c == 'k' && ray_tx_begin(RAY_TX_LOCAL, 0, 0) == RAY_OK) {
+        wrote = txd_evalf("(.db.splayed.set \"%s/\" t)", dir);
+        ray_tx_rollback();
+    }
+    int64_t took = ray_time_now_ms() - t0;
+    if (write(to_child[1], &c, 1) != 1) { /* the child exits on EOF too */ }
+    close(to_child[1]); close(from_child[0]); close(to_child[0]); close(from_child[1]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    TEST_ASSERT_EQ_I(c, 'k');
+    TEST_ASSERT_FALSE(wrote);
+    TEST_ASSERT_TRUE(took < 2000);
+    TEST_ASSERT_EQ_I(txd_rows(dir), 3);
+    txd_dir(dir, sizeof(dir), "lock");
+    PASS();
+}
+
+/* A process that dies after its commit reached the journal but before the
+ * tables were published: recovery publishes them, once.  One that dies
+ * before the commit leaves the tables as they were. */
+static test_result_t test_tx_crash_around_commit(void) {
+#ifndef DEBUG
+    SKIP("needs the debug build's ray_tx_crash_for_test");
+#else
+    char base[256], d1[256], d2[256], cur1[300], cur2[300], now1[300], now2[300];
+    wal_base(base, sizeof(base), "txcrash");
+    txd_dir(d1, sizeof(d1), "c1");
+    txd_dir(d2, sizeof(d2), "c2");
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+    txd_current(d1, cur1, sizeof(cur1));
+    txd_current(d2, cur2, sizeof(cur2));            /* "": d2 does not exist yet */
+
+    for (int logged = 0; logged < 2; logged++) {
+        TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_SYNC), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+        TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+        TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
+        TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d2));
+        char g1[300], p1[300];                      /* what the commit logs for d1 */
+        snprintf(g1, sizeof(g1), "%s", ray_splay_pending_gen(0));
+        snprintf(p1, sizeof(p1), "%s", ray_splay_pending_prev(0));
+        ray_tx_crash_for_test(logged);              /* the process dies here */
+        if (!logged) {
+            /* The generation it left is published only over the one it was
+             * written over: a table published again since keeps the newer. */
+            txd_current(d1, now1, sizeof(now1));
+            TEST_ASSERT_EQ_I(ray_splay_publish(d1, g1, ".generations/g-0-0-0"), RAY_OK);
+            txd_current(d1, now2, sizeof(now2));
+            TEST_ASSERT_STR_EQ(now2, now1);
+            TEST_ASSERT_TRUE(strlen(p1) > 0 && strstr(now1, p1) != NULL);
+        }
+        TEST_ASSERT_FALSE(ray_tx_active);
+        TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+        /* Either way nothing is published yet. */
+        txd_current(d1, now1, sizeof(now1));
+        txd_current(d2, now2, sizeof(now2));
+        TEST_ASSERT_STR_EQ(now1, cur1);
+        TEST_ASSERT_STR_EQ(now2, cur2);
+
+        wal_teardown();
+        wal_setup();
+        TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+        if (!logged) {
+            TEST_ASSERT_EQ_I(txd_rows(d1), 3);      /* never committed: as it was */
+            TEST_ASSERT_EQ_I(txd_rows(d2), -1);
+        } else {
+            TEST_ASSERT_EQ_I(txd_rows(d1), 4);      /* committed: both tables, and memory */
+            TEST_ASSERT_EQ_I(txd_rows(d2), 4);
+            TEST_ASSERT_TRUE(wal_run("(if (== (count t) 4) 1 (no_such_function))"));
+            txd_current(d1, now1, sizeof(now1));
+            TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);   /* a second recovery changes nothing */
+            txd_current(d1, now2, sizeof(now2));
+            TEST_ASSERT_STR_EQ(now2, now1);
+            TEST_ASSERT_EQ_I(txd_rows(d1), 4);
+        }
+        wal_cleanup(base);
+    }
+    txd_dir(d1, sizeof(d1), "c1");
+    txd_dir(d2, sizeof(d2), "c2");
+    PASS();
+#endif
+}
+
+/* ── a random history ─────────────────────────────────────────────── */
+
+static uint32_t rnd_state;
+static uint32_t rnd(uint32_t n) {
+    rnd_state = rnd_state * 1664525u + 1013904223u;
+    return (rnd_state >> 8) % n;
+}
+
+/* One random change to one of three names: two tables (one under a
+ * namespace) and a vector. */
+static void rnd_op(void) {
+    static const char* tbl[2] = { "t", "ns.t" };
+    const char* t = tbl[rnd(2)];
+    int k = (int)rnd(6), v = (int)rnd(1000);
+    char src[300];
+    switch (rnd(9)) {
+    case 0: snprintf(src, sizeof(src), "(insert '%s (list %d %d 'r%d))", t, k, v, k); break;
+    case 1: snprintf(src, sizeof(src), "(insert '%s (table [k v s] (list [%d %d] [%d %d] ['a 'b])))", t, k, k + 1, v, v + 1); break;
+    case 2: snprintf(src, sizeof(src), "(upsert '%s 1 (list %d %d 'u%d))", t, k, v, k); break;
+    case 3: snprintf(src, sizeof(src), "(update {from: '%s v: %d where: (== k %d)})", t, v, k); break;
+    case 4: snprintf(src, sizeof(src), "(delete {from: '%s where: (== k %d)})", t, k); break;
+    case 5: snprintf(src, sizeof(src), "(set vec (rand %d 100))", k + 1); break;
+    case 6: snprintf(src, sizeof(src), "(insert 'vec %d)", v); break;
+    case 7: snprintf(src, sizeof(src), "(set extra%d %d)", k, v); break;
+    default: snprintf(src, sizeof(src), "(try (del extra%d) (fn [e] 0))", k); break;
+    }
+    (void)wal_run(src);                            /* one that fails is part of the history too */
+}
+
+/* A long random history of changes, transactions that commit or roll back,
+ * snapshots and restarts.  Two things must hold throughout: a rollback
+ * leaves exactly what the transaction found, and a restart brings back
+ * exactly what the process held. */
+static int rnd_history(uint32_t seed, int steps) {
+    static const char* probe = "(list t ns vec (try extra0 (fn [e] 0)) (try extra3 (fn [e] 0)) (try extra5 (fn [e] 0)))";
+    char base[256];
+    wal_base(base, sizeof(base), "rnd");
+    rnd_state = seed;
+    int fail = 0;
+    wal_teardown();
+    wal_setup();
+    if (ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) fail = 1;
+    if (!fail && !(wal_run("(set t " T3 ")") && wal_run("(set ns.t " T3 ")") && wal_run("(set vec [1 2 3])"))) fail = 2;
+    for (int i = 0; i < steps && !fail; i++) {
+        uint32_t what = rnd(20);
+        if (what == 0) {                           /* restart */
+            int64_t nwant = 0, ngot = 0;
+            uint8_t* want = wal_probe(probe, &nwant);
+            if (ray_journal_close() != RAY_OK) fail = 3;
+            wal_teardown();
+            wal_setup();
+            if (!fail && ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) fail = 4;
+            uint8_t* got = fail ? NULL : wal_probe(probe, &ngot);
+            if (!fail && !(want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0)) fail = 5;
+            if (want) ray_sys_free(want);
+            if (got) ray_sys_free(got);
+        } else if (what == 1) {
+            if (ray_journal_snapshot() != RAY_OK) fail = 6;
+        } else if (what < 6) {                     /* a transaction of a few changes */
+            int64_t nwant = 0, ngot = 0;
+            uint8_t* want = wal_probe(probe, &nwant);
+            if (ray_tx_begin(RAY_TX_LOCAL, 0, 0) != RAY_OK) fail = 7;
+            for (uint32_t k = rnd(6); k > 0 && !fail; k--) rnd_op();
+            if (!fail && rnd(2)) {
+                if (ray_tx_commit() != RAY_OK) fail = 8;
+            } else if (!fail) {
+                ray_tx_rollback();
+                uint8_t* got = wal_probe(probe, &ngot);
+                if (!(want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0)) fail = 9;
+                if (got) ray_sys_free(got);
+            }
+            if (want) ray_sys_free(want);
+        } else {
+            rnd_op();
+        }
+    }
+    if (ray_journal_is_open()) ray_journal_close();
+    wal_cleanup(base);
+    return fail;
+}
+
+static test_result_t test_tx_random_histories(void) {
+    for (uint32_t seed = 1; seed <= 8; seed++) {
+        int fail = rnd_history(seed * 2654435761u, 400);
+        TEST_ASSERT_FMT(fail == 0, "seed %u failed at step kind %d", (unsigned)seed, fail);
+    }
+    PASS();
+}
+
+/* An insert is logged as the rows it adds: the commit of one row into a
+ * large table must not grow with the table. */
+static test_result_t test_wal_insert_logs_rows_not_table(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "rows");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set big (table [k v] (list (til 100000) (til 100000))))"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(before > 100000);             /* the table itself was logged whole */
+    TEST_ASSERT_TRUE(wal_run("(insert 'big (list 7 7))"));
+    int64_t one = wal_file_size(base) - before;
+    TEST_ASSERT_TRUE(wal_run("(insert 'big (list 8 8))"));
+    int64_t two = wal_file_size(base) - before - one;
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(one > 0 && one < 512);
+    TEST_ASSERT_EQ_I(two, one);
+    PASS();
+}
+
+/* So is an upsert: its key and its rows, whether it changes a row that is
+ * there or adds one. */
+static test_result_t test_wal_upsert_logs_rows_not_table(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "ups");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set big (table [k v] (list (til 100000) (til 100000))))"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (list 7 -1))"));
+    int64_t changed = wal_file_size(base) - before;
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (list 500000 -2))"));
+    int64_t added = wal_file_size(base) - before - changed;
+    TEST_ASSERT_TRUE(wal_run("(upsert 'big 1 (table [k v] (list [8 500001] [-3 -4])))"));
+    int64_t both = wal_file_size(base) - before - changed - added;
+    /* ...and an update or a delete of a few rows: those rows. */
+    int64_t mark = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: -9 where: (== k 11)})"));
+    int64_t updated = wal_file_size(base) - mark;
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: (* v 2) where: (< k 5)})"));
+    mark = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(delete {from: 'big where: (== k 12)})"));
+    int64_t deleted = wal_file_size(base) - mark;
+    TEST_ASSERT_TRUE(wal_run("(delete {from: 'big where: (and (> k 20) (< k 25))})"));
+    TEST_ASSERT_TRUE(wal_run("(update {from: 'big v: 0 where: (== k 99999999)})"));   /* matches nothing */
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list (count big) (sum (at big 'v)) (sum (at big 'k)) (take (at big 'v) 30) (take (at big 'k) 30))", &nwant);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    uint8_t* got = wal_probe("(list (count big) (sum (at big 'v)) (sum (at big 'k)) (take (at big 'v) 30) (take (at big 'k) 30))", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(changed > 0 && changed < 512);
+    TEST_ASSERT_TRUE(added > 0 && added < 512);
+    TEST_ASSERT_TRUE(both > 0 && both < 1024);
+    TEST_ASSERT_TRUE(updated > 0 && updated < 512);
+    TEST_ASSERT_TRUE(deleted > 0 && deleted < 512);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* A mutator that amended a local leaves the global of that name alone, so
+ * it logs nothing; and an append to a vector logs what it appended. */
+static test_result_t test_wal_local_target_and_vector_append(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "loc");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t (table [k v] (list (til 100000) (til 100000))))"));
+    TEST_ASSERT_TRUE(wal_run("(set v (til 100000))"));
+    /* insert and alter write the local they resolved.  (update, upsert and
+     * delete publish to the global whatever they resolved, so there the
+     * global does change and is logged.) */
+    TEST_ASSERT_TRUE(wal_run("(set f (fn [t v] (do (insert 't (list 1 1)) (insert 'v 5) (alter 'v concat 6) (+ (count t) (count v)))))"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(f (table [k v] (list [1 2] [3 4])) [1 2])"));
+    TEST_ASSERT_TRUE(wal_run("(f (table [k v] (list [1 2] [3 4])) [1 2])"));
+    int64_t local = wal_file_size(base) - before;
+    before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(alter 'v concat 7)"));
+    TEST_ASSERT_TRUE(wal_run("(insert 'v 8)"));
+    TEST_ASSERT_TRUE(wal_run("(alter 'v concat [9 10 11])"));
+    int64_t appended = wal_file_size(base) - before;
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_cleanup(base);
+    TEST_ASSERT_EQ_I(local, 0);
+    TEST_ASSERT_TRUE(appended > 0 && appended < 1024);
+    PASS();
+}
+
+/* A mark .sys.trust puts on a lambda that is already bound comes back. */
+static test_result_t test_wal_trust_mark_is_logged(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "trust");
+    int64_t f = ray_sym_intern("wal_trusted_f", 13), g = ray_sym_intern("wal_plain_g", 11);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set wal_trusted_f (fn [x] (+ x 1)))"));
+    TEST_ASSERT_TRUE(wal_run("(set wal_plain_g (fn [x] (+ x 2)))"));
+    TEST_ASSERT_TRUE(wal_run("(.sys.trust 'wal_trusted_f)"));
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(ray_env_get_global(f)) != 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    f = ray_sym_intern("wal_trusted_f", 13);       /* a fresh runtime numbers its symbols anew */
+    g = ray_sym_intern("wal_plain_g", 11);
+    ray_t* fv = ray_env_get_global(f);
+    ray_t* gv = ray_env_get_global(g);
+    wal_cleanup(base);
+    TEST_ASSERT_NOT_NULL(fv);
+    TEST_ASSERT_NOT_NULL(gv);
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(fv) != 0);
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(gv) == 0);
+    PASS();
+}
+
+/* A record that does not apply stops recovery: the server must not start
+ * on a state the rest of the log was not written on. */
+static test_result_t test_wal_unappliable_record_is_fatal(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "apply");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set before 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));       /* an append to t */
+    TEST_ASSERT_TRUE(wal_run("(set after 2)"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    /* Cut the entry that binds t out of the log: the append has nothing to append to. */
+    char path[300], cmd[900];
+    snprintf(path, sizeof(path), "%s.log", base);
+    int64_t chunks = 0, bytes = 0;
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 4);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t* img = (uint8_t*)ray_sys_alloc((size_t)bytes);
+    TEST_ASSERT_EQ_I((int64_t)fread(img, 1, (size_t)bytes, f), bytes);
+    fclose(f);
+    int64_t off[5]; off[0] = 16;
+    for (int i = 0; i < 4; i++) {
+        ray_ipc_header_t h;
+        memcpy(&h, img + off[i], sizeof(h));
+        off[i + 1] = off[i] + (int64_t)sizeof(h) + h.size;
+    }
+    f = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fwrite(img, 1, (size_t)off[1], f);
+    fwrite(img + off[2], 1, (size_t)(bytes - off[2]), f);
+    fclose(f);
+    ray_sys_free(img);
+    (void)cmd;
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    TEST_ASSERT_FALSE(wal_run("after"));           /* nothing past the bad entry was applied */
+    wal_cleanup(base);
+    PASS();
+}
+
+/* A frame in the middle whose size was corrupted to reach past the end of
+ * the file reads like a commit cut short.  It is not: real commits follow
+ * it, and recovery must refuse instead of cutting them off. */
+static test_result_t test_wal_corrupt_size_is_not_a_torn_tail(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "size");
+    snprintf(path, sizeof(path), "%s.log", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set a 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set b [1 2 3])"));
+    TEST_ASSERT_TRUE(wal_run("(set c (table [k] (list [1 2])))"));
+    TEST_ASSERT_TRUE(wal_run("(set d 4)"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    int64_t full = wal_file_size(base);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    ray_ipc_header_t h;
+    TEST_ASSERT_EQ_I(fseek(f, 16, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fread(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    int64_t second = 16 + (int64_t)sizeof(h) + h.size;       /* the second commit's header */
+    TEST_ASSERT_EQ_I(fseek(f, (long)second, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fread(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    h.size += 100000;                                         /* past the end of the file */
+    TEST_ASSERT_EQ_I(fseek(f, (long)second, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fwrite(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    fclose(f);
+
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(wal_file_size(base), full);              /* nothing was cut off */
+    wal_cleanup(base);
+    PASS();
+}
+
+/* A long evaluation is many commits, not one that has to fit an entry. */
+static test_result_t test_wal_long_statement_commits_as_it_goes(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "long");
+    snprintf(path, sizeof(path), "%s.log", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(do (set a (til 3000000)) (set b (til 3000000)) (set c (til 3000000)) (set d 1))"));
+    int64_t chunks = 0, bytes = 0;
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    bool back = wal_run("(if (== 9000001 (+ (+ d (count a)) (+ (count b) (count c)))) 1 (no_such_function))");
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(chunks >= 2);
+    TEST_ASSERT_TRUE(back);
+    PASS();
+}
+
+/* (.log.replay file) on a server with a journal open: what it changes is
+ * logged like any other change, or the open log would not hold the names
+ * later entries amend. */
+static test_result_t test_wal_replay_into_an_open_journal(void) {
+    char a[256], b[256], src[400];
+    wal_base(a, sizeof(a), "rpa");
+    wal_base(b, sizeof(b), "rpb");
+    TEST_ASSERT_EQ_I(ray_journal_open(a, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(b, RAY_JOURNAL_ASYNC), RAY_OK);
+    snprintf(src, sizeof(src), "(.log.replay \"%s.log\")", a);
+    TEST_ASSERT_TRUE(wal_run(src));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));       /* amends what the replay bound */
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("t", &nwant);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(b), RAY_OK);
+    uint8_t* got = wal_probe("t", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(a);
+    wal_cleanup(b);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* A statement that changes nothing writes nothing. */
+static test_result_t test_wal_read_writes_no_frame(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "ro");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set x [1 2 3])"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(sum x)"));
+    TEST_ASSERT_TRUE(wal_run("(insert x 4)"));     /* functional: no global changes */
+    TEST_ASSERT_TRUE(!wal_run("(nosuchfn 1)"));
+    int64_t after = wal_file_size(base);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_cleanup(base);
+    TEST_ASSERT_EQ_I(after, before);
+    PASS();
+}
+
+/* A statement that fails half way: what it changed before failing is in
+ * memory, so it is in the log too. */
+static test_result_t test_wal_failed_statement_logs_what_it_changed(void) {
+    TEST_ASSERT_EQ_I(wal_roundtrip("(set x 1)\n(try (do (set x 2) (nosuchfn 1)) (fn [e] 0))", "x"), 0);
+    PASS();
+}
+
+/* A value serde cannot write is refused before it is bound. */
+static test_result_t test_wal_unloggable_value_is_refused(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "refuse");
+    TEST_ASSERT_TRUE(wal_run("(set e (table [src dst w] (list [0 1] [1 2] [1.0 2.0])))"));
+    TEST_ASSERT_TRUE(wal_run("(set g0 (.graph.build e 'src 'dst 'w))"));   /* no journal: fine */
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(!wal_run("(set g1 (.graph.build e 'src 'dst 'w))"));
+    TEST_ASSERT_TRUE(!wal_run("g1"));              /* not bound */
+    TEST_ASSERT_TRUE(wal_run("(set ok 1)"));       /* and the log is not stale */
+    TEST_ASSERT_TRUE(wal_file_size(base) > before);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_cleanup(base);
+    PASS();
+}
+
+/* Cut the log at every byte of its last commit: recovery drops exactly
+ * that commit, keeps the ones before it, and leaves a log that the next
+ * commit extends cleanly. */
+static test_result_t test_wal_torn_commit_at_every_byte(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "torn");
+    snprintf(path, sizeof(path), "%s.log", base);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set keep [1 2 3])"));
+    int64_t good = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(set lost (table [a] (list [1 2 3 4])))"));
+    int64_t full = wal_file_size(base);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(good > 0 && full > good);
+
+    uint8_t* image = (uint8_t*)ray_sys_alloc((size_t)full);
+    TEST_ASSERT_NOT_NULL(image);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I((int64_t)fread(image, 1, (size_t)full, f), full);
+    fclose(f);
+
+    int bad = 0;
+    for (int64_t cut = good + 1; cut < full && !bad; cut++) {
+        f = fopen(path, "wb");
+        if (!f || fwrite(image, 1, (size_t)cut, f) != (size_t)cut) bad = 1;
+        if (f) fclose(f);
+        wal_teardown();
+        wal_setup();
+        if (!bad && ray_journal_open(base, RAY_JOURNAL_ASYNC) != RAY_OK) bad = 2;
+        if (!bad && wal_file_size(base) != good) bad = 3;       /* cut back to the last commit */
+        if (!bad && !wal_run("(sum keep)")) bad = 4;
+        if (!bad && wal_run("lost")) bad = 5;                   /* never applied */
+        if (!bad && !wal_run("(set after 9)")) bad = 6;
+        if (ray_journal_is_open() && ray_journal_close() != RAY_OK && !bad) bad = 7;
+        wal_teardown();
+        wal_setup();
+        if (!bad && ray_journal_recover(base) != RAY_OK) bad = 8;   /* the appended commit reads back */
+        if (!bad && !wal_run("(+ after (sum keep))")) bad = 9;
+    }
+    ray_sys_free(image);
+    wal_cleanup(base);
+    TEST_ASSERT_EQ_I(bad, 0);
+    PASS();
+}
+
+/* Snapshot plus the tail written after it is the same state as the whole log. */
+static test_result_t test_wal_snapshot_plus_tail(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "snap");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
+    TEST_ASSERT_TRUE(wal_run("(set after [1 2])"));
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("(list t after)", &nwant);
+    TEST_ASSERT_NOT_NULL(want);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    uint8_t* got = wal_probe("(list t after)", &ngot);
+    TEST_ASSERT_NOT_NULL(got);
+    bool same = ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    ray_sys_free(want);
+    ray_sys_free(got);
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
+/* Changes buffered when a snapshot is taken belong before it: they must
+ * not land on the fresh log and apply a second time. */
+static test_result_t test_wal_snapshot_inside_a_commit(void) {
+    TEST_ASSERT_EQ_I(wal_roundtrip("(set t " T3 ")\n(do (insert 't (list 4 40 'd)) (.log.snapshot) (insert 't (list 5 50 'e)))",
+                                   "t"), 0);
+    PASS();
+}
+
+/* Recovery applies; it does not log what it applies. */
+static test_result_t test_wal_recovery_is_not_logged(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "norelog");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set x [1 2 3])"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    int64_t size = wal_file_size(base);
+    for (int i = 0; i < 3; i++) {                  /* three restarts */
+        wal_teardown();
+        wal_setup();
+        TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+        TEST_ASSERT_TRUE(wal_run("(sum x)"));
+        TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+        TEST_ASSERT_EQ_I(wal_file_size(base), size);
+    }
+    wal_cleanup(base);
+    PASS();
+}
+
+const test_entry_t wal_entries[] = {
+    { "wal/probe_sees_content",     test_wal_probe_sees_content,     wal_setup, wal_teardown },
+    { "wal/roundtrip_paths",        test_wal_roundtrip_paths,        wal_setup, wal_teardown },
+    { "wal/insert_logs_rows",       test_wal_insert_logs_rows_not_table, wal_setup, wal_teardown },
+    { "wal/upsert_logs_rows",       test_wal_upsert_logs_rows_not_table, wal_setup, wal_teardown },
+    { "wal/local_and_vector_append", test_wal_local_target_and_vector_append, wal_setup, wal_teardown },
+    { "wal/trust_mark_logged",      test_wal_trust_mark_is_logged,   wal_setup, wal_teardown },
+    { "wal/unappliable_is_fatal",   test_wal_unappliable_record_is_fatal, wal_setup, wal_teardown },
+    { "wal/corrupt_size_not_torn",  test_wal_corrupt_size_is_not_a_torn_tail, wal_setup, wal_teardown },
+    { "wal/long_statement_commits", test_wal_long_statement_commits_as_it_goes, wal_setup, wal_teardown },
+    { "wal/replay_into_open_journal", test_wal_replay_into_an_open_journal, wal_setup, wal_teardown },
+    { "wal/read_writes_no_frame",   test_wal_read_writes_no_frame,   wal_setup, wal_teardown },
+    { "wal/failed_statement",       test_wal_failed_statement_logs_what_it_changed, wal_setup, wal_teardown },
+    { "wal/unloggable_refused",     test_wal_unloggable_value_is_refused, wal_setup, wal_teardown },
+    { "wal/torn_commit_every_byte", test_wal_torn_commit_at_every_byte, wal_setup, wal_teardown },
+    { "wal/snapshot_plus_tail",     test_wal_snapshot_plus_tail,     wal_setup, wal_teardown },
+    { "wal/snapshot_inside_commit", test_wal_snapshot_inside_a_commit, wal_setup, wal_teardown },
+    { "wal/recovery_not_logged",    test_wal_recovery_is_not_logged, wal_setup, wal_teardown },
+    { "tx/rollback_paths",          test_tx_rollback_paths,          wal_setup, wal_teardown },
+    { "tx/leaves_aliases_alone",    test_tx_leaves_aliases_alone,    wal_setup, wal_teardown },
+    { "tx/rollback_create_change_delete", test_tx_rollback_create_change_delete, wal_setup, wal_teardown },
+    { "tx/gives_references_back",   test_tx_gives_references_back,   wal_setup, wal_teardown },
+    { "tx/is_one_commit",           test_tx_is_one_commit,           wal_setup, wal_teardown },
+    { "tx/begin_commit_rules",      test_tx_begin_commit_rules,      wal_setup, wal_teardown },
+    { "tx/table_write_waits",       test_tx_table_write_waits_for_commit, wal_setup, wal_teardown },
+    { "tx/new_table_waits",         test_tx_new_table_waits_for_commit, wal_setup, wal_teardown },
+    { "tx/table_locked_elsewhere",  test_tx_table_locked_elsewhere_fails_fast, wal_setup, wal_teardown },
+    { "tx/crash_around_commit",     test_tx_crash_around_commit,     wal_setup, wal_teardown },
+    { "tx/random_histories",        test_tx_random_histories,        wal_setup, wal_teardown },
+    { NULL, NULL, NULL, NULL },
+};

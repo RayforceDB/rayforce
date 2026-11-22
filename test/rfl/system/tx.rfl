@@ -1,0 +1,337 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; Transactions over IPC — (.tx.begin) / (.tx.commit) / (.tx.rollback).
+;;
+;; One server under -L, driven by this process as the owner (h) and by
+;; second clients: a connection of this process where the answer does not
+;; have to wait, a background ./rayforce where it does (the server serves
+;; nobody but the owner while a transaction is open, so a client that asks
+;; in the middle of one must be a process of its own).
+;;
+;; Port: 19981.  Base: /tmp/rftest_tx.
+
+(set wait_ipc (fn [addr n] (try (.ipc.open addr 500) (if (== n 0) (.ipc.open addr 500) (do (.sys.exec "sleep 0.1") (wait_ipc addr (- n 1)))))))
+(set start_server (fn [] (.sys.exec "./rayforce -L /tmp/rftest_tx -p 19981 </dev/null >/dev/null 2>&1 &")))
+(set stop_server (fn [] (do (.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_tx' 2>/dev/null; true") (.sys.exec "for i in $(seq 50); do pgrep -f '[r]ayforce -L /tmp/rftest_tx' >/dev/null || exit 0; sleep 0.05; done; exit 1"))))
+
+(stop_server)
+(.sys.exec "rm -rf /tmp/rftest_tx*")
+(start_server)
+(set h (wait_ipc "127.0.0.1:19981" 50))
+(>= h 0) -- true
+
+(.ipc.send h "(set t (table [k v] (list [1 2 3] [10 20 30])))")
+(.ipc.send h "(set n 1)") -- 1
+
+;; ── the ends need a transaction ─────────────────────────────────────
+(.ipc.send h "(.tx.commit)") !- tx
+(.ipc.send h "(.tx.rollback)") !- tx
+(.ipc.send h "(.tx.begin 1 2 3)") !- arity
+(.ipc.send h "(.tx.begin \"soon\")") !- type
+(.ipc.send h "n") -- 1
+
+;; ── rollback: the owner reads its own writes, then none remain ──────
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 't (list 4 40))") -- 't
+(.ipc.send h "(update {from: 't v: 99 where: (== k 1)})") -- 't
+(.ipc.send h "(set n 2)") -- 2
+(.ipc.send h "(set made 5)") -- 5
+(.ipc.send h "(at t 'v)") -- [99 20 30 40]
+(.ipc.send h "(list n made)") -- [2 5]
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "(at t 'v)") -- [10 20 30]
+(.ipc.send h "n") -- 1
+(.ipc.send h "(try made (fn [e] 'unbound))") -- 'unbound
+
+;; ── commit: a second client waits for it, and sees it ───────────────
+;; The background client asks while the transaction is open; its answer
+;; file stays empty until the commit and then holds the committed rows.
+(.sys.exec "printf '(set b (.ipc.open \"127.0.0.1:19981\"))\\n(println (.ipc.send b \"(count t)\"))\\n' > /tmp/rftest_tx_b.rfl; rm -f /tmp/rftest_tx_b.out")
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 't (list 4 40))") -- 't
+(.sys.exec "./rayforce -f /tmp/rftest_tx_b.rfl </dev/null >/tmp/rftest_tx_b.out 2>&1 &")
+(.sys.exec "sleep 0.5")
+(.ipc.send h "(insert 't (list 5 50))") -- 't
+(.sys.exec "test ! -s /tmp/rftest_tx_b.out") -- 0
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(.sys.exec "for i in $(seq 50); do test -s /tmp/rftest_tx_b.out && exit 0; sleep 0.05; done; exit 1") -- 0
+(.sys.exec "grep -qx 5 /tmp/rftest_tx_b.out") -- 0
+(.ipc.send h "(at t 'k)") -- [1 2 3 4 5]
+
+;; ── the same wait across a rollback: the second client sees none of it
+(.sys.exec "rm -f /tmp/rftest_tx_b.out")
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(delete {from: 't where: (> k 1)})") -- 't
+(.ipc.send h "(count t)") -- 1
+(.sys.exec "./rayforce -f /tmp/rftest_tx_b.rfl </dev/null >/tmp/rftest_tx_b.out 2>&1 &")
+(.sys.exec "sleep 0.5")
+(.sys.exec "test ! -s /tmp/rftest_tx_b.out") -- 0
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.sys.exec "for i in $(seq 50); do test -s /tmp/rftest_tx_b.out && exit 0; sleep 0.05; done; exit 1") -- 0
+(.sys.exec "grep -qx 5 /tmp/rftest_tx_b.out") -- 0
+
+;; ── an error ends the transaction: all of it is undone ──────────────
+;; ...and the owner's next messages take no effect until it says
+;; (.tx.rollback) itself, so a write meant for the transaction cannot land
+;; outside it.
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.send h "(insert 't (list 6 60))") -- 't
+(.ipc.send h "(no_such_function 1)") !- name
+(.ipc.send h "(set n 8)") !- tx
+(.ipc.send h "(insert 't (list 7 70))") !- tx
+(.ipc.send h "(.tx.commit)") !- tx
+(.ipc.send h "n") !- tx
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+(.ipc.send h "(at t 'k)") -- [1 2 3 4 5]
+;; the server is nobody's while the owner is in that state
+(set h2 (.ipc.open "127.0.0.1:19981"))
+(.ipc.send h2 "n") -- 1
+(.ipc.close h2)
+
+;; the acknowledgement and a new begin in one message: the new transaction
+;; is a real one, and the connection is no longer answered as aborted
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(do (.tx.rollback) (.tx.begin))")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.send h "n") -- 7
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(do (.tx.rollback) (.tx.begin))")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(.ipc.send h "n") -- 7
+(.ipc.send h "(set n 1)") -- 1
+
+;; an async message has no reply to carry its error, and ends it all the same
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.post h "(no_such_function 1)")
+(.ipc.send h "(set n 8)") !- tx
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+;; and one that succeeds is part of the transaction
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.post h "(set n 7)")
+(.ipc.send h "n") -- 7
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+
+;; a second begin is such an error
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.send h "(.tx.begin)") !- tx
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+
+;; an error caught inside the message is not one
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(try (no_such_function 1) (fn [e] 0))") -- 0
+(.ipc.send h "(set n 3)") -- 3
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(.ipc.send h "n") -- 3
+
+;; ── the owner goes quiet: rolled back, and disconnected ─────────────
+(nil? (.ipc.send h "(.tx.begin 200 0)")) -- true
+(.ipc.send h "(set n 50)") -- 50
+(.sys.exec "sleep 0.6")
+(try (.ipc.send h "n") (fn [e] "closed")) -- "closed"
+(set h (.ipc.open "127.0.0.1:19981"))
+(.ipc.send h "n") -- 3
+
+;; ── the owner takes too long, though never quiet ────────────────────
+(nil? (.ipc.send h "(.tx.begin 0 300)")) -- true
+(.ipc.send h "(set n 51)") -- 51
+(.sys.exec "sleep 0.2")
+(.ipc.send h "(set n 52)") -- 52
+(.sys.exec "sleep 0.3")
+(try (.ipc.send h "n") (fn [e] "closed")) -- "closed"
+(set h (.ipc.open "127.0.0.1:19981"))
+(.ipc.send h "n") -- 3
+
+;; ── the server's own time over a message is not the owner's silence ─
+;; One statement that takes several times the idle limit to compute: the
+;; owner was not quiet, the server was busy.
+(nil? (.ipc.send h "(.tx.begin 200 0)")) -- true
+(.ipc.send h "(set n 53)") -- 53
+(.ipc.send h "((fn [] (do (let i 0) (while (< i 10000000) (let i (+ i 1))) i)))") -- 10000000
+(.ipc.send h "n") -- 53
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 3
+
+;; ── limits lifted: quiet for longer than the default idle limit is fine
+(nil? (.ipc.send h "(.tx.begin 0 0)")) -- true
+(.ipc.send h "(set n 4)") -- 4
+(.sys.exec "sleep 0.3")
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(.ipc.send h "n") -- 4
+
+;; ── what a rollback could not take back is refused inside one ───────
+;; ...and being an error, the refusal rolls the transaction back.  Outside
+;; a transaction the same verbs run as ever.
+(.ipc.send h "(.sys.exec \"true\")") -- 0
+(nil? (.ipc.send h "(.log.sync)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.exec \"true\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.trust (quote n))") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.sys.listen 19982)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write \"/tmp/rftest_tx_w\" \"x\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write-bytes \"/tmp/rftest_tx_w\" \"x\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(write-csv t \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.write t \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.splayed \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.csv.parted \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.parquet.splayed \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.parquet.parted \"/tmp/rftest_tx_w\" \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(hnsw-save 0 \"/tmp/rftest_tx_w\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.db.parted.fill \"/tmp/rftest_tx_d\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.open (quote async) \"/tmp/rftest_tx_other\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.replay \"/tmp/rftest_tx_none\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.replay_report \"/tmp/rftest_tx_none\")") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.roll)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.snapshot)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.sync)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.close)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 99)") -- 99
+(.ipc.send h "(.log.purge)") !- access
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 4
+(.sys.exec "test ! -e /tmp/rftest_tx_w && test ! -e /tmp/rftest_tx_d && test ! -e /tmp/rftest_tx_other.log") -- 0
+
+;; ── a table written in a transaction is published by its commit ─────
+;; This process reads the directory as any other process would; the owner
+;; reads its own write through the server.
+(.sys.exec "rm -rf /tmp/rftest_tx_db")
+(.ipc.send h "(set d (table [k v] (list [1 2 3] [10 20 30])))")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 4 40))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/fresh/\" d)")
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/d/\"))") -- 4
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/fresh/\"))") -- 4
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(.sys.exec "test ! -e /tmp/rftest_tx_db/fresh/.current && test ! -e /tmp/rftest_tx_db/fresh/.d") -- 0
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(.ipc.send h "(count (.db.splayed.get \"/tmp/rftest_tx_db/d/\"))") -- 3
+(.sys.exec "test ! -e /tmp/rftest_tx_db/fresh/.current && test ! -e /tmp/rftest_tx_db/fresh/.d") -- 0
+
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 4 40))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/fresh/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 3
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+(count (.db.splayed.get "/tmp/rftest_tx_db/fresh/")) -- 4
+
+;; an error after the write: the table stays as it was
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(insert 'd (list 5 50))") -- 'd
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+;; and the table is free to write again
+(.ipc.send h "(.db.splayed.set \"/tmp/rftest_tx_db/d/\" d)")
+(count (.db.splayed.get "/tmp/rftest_tx_db/d/")) -- 4
+
+;; ── the owner disconnects: rolled back, the server goes on ──────────
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 60)") -- 60
+(.ipc.send h "(insert 't (list 8 80))") -- 't
+(.ipc.close h)
+(set h (.ipc.open "127.0.0.1:19981"))
+(.ipc.send h "n") -- 4
+(.ipc.send h "(at t 'k)") -- [1 2 3 4 5]
+
+;; ── durability: after kill -9 exactly the committed state is back ───
+(.ipc.close h)
+(stop_server) -- 0
+(start_server)
+(set h (wait_ipc "127.0.0.1:19981" 50))
+(.ipc.send h "n") -- 4
+(.ipc.send h "(at t 'k)") -- [1 2 3 4 5]
+(.ipc.send h "(at t 'v)") -- [10 20 30 40 50]
+(.ipc.send h "(try made (fn [e] 'unbound))") -- 'unbound
+
+;; killed in the middle of a transaction: none of it is back
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(set n 70)") -- 70
+(.ipc.send h "(insert 't (list 9 90))") -- 't
+(stop_server) -- 0
+(start_server)
+(set h (wait_ipc "127.0.0.1:19981" 50))
+(.ipc.send h "n") -- 4
+(.ipc.send h "(count t)") -- 5
+
+;; ── teardown ────────────────────────────────────────────────────────
+(.ipc.close h)
+(stop_server)
+(.sys.exec "rm -rf /tmp/rftest_tx*")

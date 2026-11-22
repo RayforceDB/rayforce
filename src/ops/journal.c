@@ -175,70 +175,6 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
-/* (.log.write expr) — append a synthetic entry containing the
- * serialized form of `expr`.  Useful for users who want REPL-driven
- * mutations captured in the log alongside the IPC stream.
- *
- * If the journal isn't open, ERROR rather than silently no-op — a
- * silent no-op would lie to the user about durability ("I logged
- * your change") when in fact nothing was persisted. */
-static ray_t* log_write_held(ray_t* expr);
-
-ray_t* ray_log_write_fn(ray_t* expr) {
-    ray_serde_msg_hold();
-    ray_t* r = log_write_held(expr);
-    ray_serde_msg_release();
-    return r;
-}
-
-static ray_t* log_write_held(ray_t* expr) {
-    if (!ray_journal_is_open())
-        return ray_error("noopen", ".log.write: no journal open (start with -l/-L)");
-    if (ray_ipc_auto_journal_eval())
-        return ray_error("domain", ".log.write is disabled inside auto-journaled IPC eval");
-    if (!expr) return ray_error("type", ".log.write expects an argument");
-
-    bool owned = false;
-    if (ray_is_lazy(expr)) {
-        ray_retain(expr);
-        expr = ray_lazy_materialize(expr); /* consumes the retain */
-        if (RAY_IS_ERR(expr)) return expr;
-        owned = true;
-    }
-
-    int64_t pay_size = ray_serde_size(expr);
-    if (pay_size <= 0) {
-        if (owned) ray_release(expr);
-        return ray_error("domain", ".log.write: serde size 0");
-    }
-
-    uint8_t* payload = (uint8_t*)ray_sys_alloc((size_t)pay_size);
-    if (!payload) {
-        if (owned) ray_release(expr);
-        return ray_error("oom", NULL);
-    }
-
-    int64_t written = ray_ser_raw(payload, expr);
-    if (written != pay_size) {
-        ray_sys_free(payload);
-        if (owned) ray_release(expr);
-        return ray_error("io", NULL);
-    }
-
-    ray_ipc_header_t hdr = {
-        .prefix  = RAY_SERDE_PREFIX,
-        .version = RAY_SERDE_WIRE_VERSION,
-        .flags   = 0,
-        .endian  = RAY_SERDE_ENDIAN,
-        .msgtype = RAY_IPC_MSG_ASYNC,
-        .size    = pay_size,
-    };
-    ray_err_t e = ray_journal_write_bytes(&hdr, payload, pay_size);
-    ray_sys_free(payload);
-    if (owned) ray_release(expr);
-    return err_to_ray(e, "io");
-}
-
 /* Prepare the private report BEFORE evaluating any journal entry.  A result-
  * construction failure must not first apply the log and then hide its counts.
  * The dictionary owns both vectors; its two I64 cells are filled after replay. */
@@ -295,13 +231,22 @@ static ray_t* log_replay_impl(ray_t* path, bool reporting) {
                          "%s: framing broken after %lld entries (valid bytes = %lld)",
                          p, (long long)chunks, (long long)valid_bytes);
     }
+    case RAY_JREPLAY_TORN:
+        return ray_error("badtail",
+                         "%s: the last entry is cut short after %lld entries (an unfinished commit)",
+                         p, (long long)chunks);
+    case RAY_JREPLAY_APPLY:
+        return ray_error("apply",
+                         "%s: a recorded change did not apply at chunk %lld; the entries before it are applied",
+                         p, (long long)chunks);
+    case RAY_JREPLAY_FORMAT:
+        return ray_error("format",
+                         "%s: a command entry of the old log format at chunk %lld; "
+                         "snapshot it with the previous version",
+                         p, (long long)chunks);
     case RAY_JREPLAY_DESER:
         return ray_error("deser",
                          "%s: deserialization failed at chunk %lld — framing intact, content/version skew",
-                         p, (long long)chunks);
-    case RAY_JREPLAY_DECOMP:
-        return ray_error("decompress",
-                         "%s: decompression failed at chunk %lld — framing intact, do not truncate",
                          p, (long long)chunks);
     case RAY_JREPLAY_OOM:
         return ray_error("oom",
@@ -383,4 +328,52 @@ ray_t* ray_log_purge_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("arity", ".log.purge takes no arguments");
     return err_to_ray(ray_journal_purge(), "io");
+}
+
+/* ── .tx.* ─────────────────────────────────────────────────────────── */
+
+#define TX_IDLE_MS   5000     /* the owner's silence between two messages */
+#define TX_TOTAL_MS 60000     /* the whole transaction */
+
+/* (.tx.begin) or (.tx.begin idle-ms total-ms): open a transaction owned
+ * by the calling connection.  Until it commits or rolls back, the server
+ * serves nobody else; 0 lifts a limit. */
+ray_t* ray_tx_begin_fn(ray_t** args, int64_t n) {
+    /* The REPL and scripts have no limits: nobody else is asked to wait
+     * without the console's operator knowing. */
+    int64_t owner = ray_ipc_current_handle();
+    int64_t lim[2] = { owner < 0 ? 0 : TX_IDLE_MS, owner < 0 ? 0 : TX_TOTAL_MS };
+    if (n > 2) return ray_error("arity", ".tx.begin: expects at most 2 arguments, got %lld", (long long)n);
+    for (int64_t i = 0; i < n; i++) {
+        if (!args[i] || args[i]->type != -RAY_I64 || args[i]->i64 < 0)
+            return ray_error("type", ".tx.begin: a limit is a non-negative i64 of milliseconds");
+        lim[i] = args[i]->i64;
+    }
+    if (owner < 0) owner = RAY_TX_LOCAL;
+    if (ray_tx_active) return ray_error("tx", ".tx.begin: a transaction is already open");
+    return err_to_ray(ray_tx_begin(owner, lim[0], lim[1]), "io");
+}
+
+static bool tx_is_mine(void) {
+    return ray_tx_active && ray_tx_owner() == ray_ipc_current_handle();
+}
+
+/* (.tx.commit): make the transaction's changes durable and visible. */
+ray_t* ray_tx_commit_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    if (!tx_is_mine()) return ray_error("tx", ".tx.commit: no transaction open");
+    ray_err_t e = ray_tx_commit();
+    if (ray_tx_unpublished)
+        return ray_error("io", ".tx.commit: committed, but a table it wrote could not be published; "
+                               "readers see the old one until a restart with the journal");
+    if (e == RAY_ERR_DOMAIN) return ray_error("tx", ".tx.commit: the transaction was rolled back");
+    return err_to_ray(e, "io");
+}
+
+/* (.tx.rollback): undo everything since (.tx.begin). */
+ray_t* ray_tx_rollback_fn(ray_t** args, int64_t n) {
+    (void)args; (void)n;
+    if (!tx_is_mine()) return ray_error("tx", ".tx.rollback: no transaction open");
+    ray_tx_rollback();
+    return RAY_NULL_OBJ;
 }

@@ -9180,9 +9180,6 @@ static test_result_t test_eval_restricted_server_state_ops(void) {
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(.graph.free 0)"));
     /* #47: free a server HNSW index handle. */
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(hnsw-free 0)"));
-    /* #41: persist WAL work that would replay outside restricted mode. */
-    TEST_ASSERT_TRUE(restricted_expr_returns_access(
-        "(.log.write (list 'set '__rf_restr_wal 1))"));
 
     /* The gate is scoped to restricted eval, not a blanket ban: in normal mode
      * the same call reaches its body and fails for a non-access reason (a bogus

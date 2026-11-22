@@ -37,6 +37,7 @@
 #define RAY_FN_AGGR          0x08  /* aggregation function */
 #define RAY_FN_SPECIAL_FORM  0x10  /* receives unevaluated args */
 #define RAY_FN_RESTRICTED    0x20  /* forbidden during -U restricted IPC evals */
+#define RAY_FN_NO_TX         0x40  /* forbidden inside a transaction: rollback cannot undo it */
 #define RAY_FN_LAZY_AWARE    0x80  /* fn extends or starts lazy chains;
                                       dispatcher must NOT materialise its
                                       args. Without this flag, dispatcher
@@ -304,26 +305,6 @@ void ray_eval_restrict_leave(const ray_restrict_save_t* s);
  * untrusted, when a part of it cannot be serialized. */
 bool ray_eval_lambda_trust(ray_t* lambda, int64_t name);
 
-/* The trusted calls of one journaled restricted request (#787), so that
- * replay lifts exactly the calls that ran lifted live.  The IPC path
- * records into a log around a request it journals: each call that runs
- * lifted appends the identity of its lambda.  Replay checks against the
- * identities the request's journal note holds: a call runs lifted only if
- * its lambda is the next one recorded, so a call refused live (its trust
- * revoked after the snapshot replay restores) stays refused.  Logs nest;
- * each begin is paired with ray_eval_lift_done on the same thread. */
-typedef struct ray_lift_log {
-    bool     check;             /* replay: match, else record */
-    bool     failed;            /* record: an identity could not be kept */
-    int64_t* ids;               /* record: owned when ids != inline_ids */
-    int64_t  n, cap, next;
-    int64_t  inline_ids[8];
-    struct ray_lift_log* prev;
-} ray_lift_log_t;
-void    ray_eval_lift_record(ray_lift_log_t* log);
-void    ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n);
-void    ray_eval_lift_done(ray_lift_log_t* log);
-
 /* ===== Rayfall Builtin Functions ===== */
 
 /* Arithmetic */
@@ -444,6 +425,7 @@ ray_t* ray_window_fn(ray_t** args, int64_t n);
 ray_t* ray_update_fn(ray_t** args, int64_t n);
 ray_t* ray_insert_fn(ray_t** args, int64_t n);
 ray_t* ray_upsert_fn(ray_t** args, int64_t n);
+ray_t* ray_delete_fn(ray_t** args, int64_t n);
 ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket);
 
 /* Joins */

@@ -1,11 +1,34 @@
 # `.log.*` — write-ahead log
 
-A binary append-only journal of serialised Rayfall expressions. The runtime keeps one journal open at a time. While open, every IPC mutation (and any value explicitly handed to `.log.write`) is appended; `replay` deserialises and re-evaluates each entry to reconstruct state. Files use the same 16-byte IPC header + serialized-payload frames as `.ipc.send`, with optional delta+RLE compression on large entries — the journal is interoperable with the wire format.
+A binary append-only journal of what changed. The runtime keeps one journal open at a time. While it is open, every change to a global is recorded as it is made, and written at the end of the evaluation that made it: an IPC message of any kind, a REPL line, a script, a timer callback. Recovery applies the recorded changes in order; it evaluates nothing.
 
-The journal is intentionally minimal: there's no per-entry timestamp or transaction grouping at the journal layer. Snapshot + replay is the only recovery model.
+Each entry is one **commit**. It holds physical records, not the command that produced them:
+
+| Record | Written for | Recovery does |
+|---|---|---|
+| bind | `set`, top-level `let`, `alter`, and any mutator that had to rebuild its table | binds the name to the recorded value |
+| unbind | `del` | removes the name |
+| append | `insert` into a named table, vector or list; `alter … concat` | appends the recorded rows or elements |
+| upsert | `upsert` into a named table | upserts the recorded rows by the recorded key |
+| rows | `update` with `where:`, made in place | writes the recorded rows at the recorded positions |
+| drop | `delete`, made in place | removes the rows at the recorded positions |
+| publish | a splayed table written in a [transaction](tx.md) | makes its new generation current, if it is not already |
+
+Consequences worth knowing:
+
+- **Recovery is deterministic.** `rand`, the clock and anything else a command consulted were settled when the change was made; recovery reproduces the values, not the computation.
+- **A change costs its rows.** `insert` and `upsert` write the rows they were given; an `update` with `where:` and a `delete` write the rows they touched. The whole table is written only when the mutator could not work in place and rebuilt it: an `update` without `where:` or with `by:`, one that adds a column, any `alter`, a table that something else also holds, or the first write to a table inside a [transaction](tx.md).
+- **An entry cannot exceed 256 MB.** A single change larger than that is refused with `limit`. Outside a transaction a long evaluation — a script, a loop — is written as it goes, in several entries, so only one change has to fit. A [transaction](tx.md) is one entry: everything it changes has to fit together.
+- **A value that cannot be serialised cannot be bound while a journal is open** (a graph or index handle, for example): `set` fails with `domain` and the name stays as it was.
+- **Only globals come back.** A timer, a listener, an open handle or a file written by a request is not re-created by recovery.
+- **A failed statement keeps what it changed.** Outside a transaction each change stands on its own, as each statement does under autocommit in SQL: the changes a statement made before it failed are in memory, so they are in the log too. Use a [transaction](tx.md) for all-or-nothing.
+
+If a commit cannot be written (disk full, I/O error) the reply is `io`, the change stays in memory, and the journal refuses every later commit until [`.log.snapshot`](#log-snapshot) writes memory out whole. A partly written entry is taken back out of the file.
+
+Logs written by earlier versions held commands. They are not replayed: recovery stops with a message. Start the earlier version on such a log, run `(.log.snapshot)`, then start this one — the snapshot format is unchanged.
 
 !!! note "Restricted under `-U`"
-    `.log.open`, `.log.write`, `.log.replay`, `.log.replay_report`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.sync`, `.log.validate`, `.log.status`) are unrestricted. Replay executes journal expressions; the reporting variant is **not** a read-only status getter.
+    `.log.open`, `.log.replay`, `.log.replay_report`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.sync`, `.log.validate`, `.log.status`) are unrestricted. Replay changes globals; the reporting variant is **not** a read-only status getter.
 
 ## Reference
 
@@ -13,12 +36,11 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 |---|---|---|---|
 | [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode. |
 | [`.log.status`](#log-status) | variadic | — | Report the journal state as a dict. |
-| [`.log.write`](#log-write) | unary | restricted | Append a serialised expression to the open journal. |
 | [`.log.sync`](#log-sync) | nullary | — | `fsync` the journal. |
 | [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment. |
 | [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one. |
-| [`.log.replay`](#log-replay) | unary | restricted | Replay a journal file; return the processed-entry count, including evaluation errors. |
-| [`.log.replay_report`](#log-replay-report) | unary | restricted | Replay once; return `entries` and `eval_errors` on a clean tail. |
+| [`.log.replay`](#log-replay) | unary | restricted | Apply a journal file; return the number of entries, including those with a record that did not apply. |
+| [`.log.replay_report`](#log-replay-report) | unary | restricted | Apply once; return `entries` and `eval_errors` on a clean tail. |
 | [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)`. |
 | [`.log.close`](#log-close) | nullary | restricted | Flush and close the active journal. |
 | [`.log.purge`](#log-purge) | nullary | restricted | Close the active journal and delete all its files. |
@@ -27,8 +49,8 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 
 Signature: `(.log.open mode "base")`. `mode` is `'async` or `'sync`; `base` is the journal base path (the actual file ends with `.log` and rolled segments use numeric suffixes).
 
-- `'async` — buffered writes; faster, may lose entries on a crash within the write window.
-- `'sync` — each write is `fsync`'d before returning. Durable, ~10–100× slower per write.
+- `'async` — each commit is handed to the operating system; a crash of the process loses nothing, a crash of the machine may lose the last commits.
+- `'sync` — each commit is `fsync`'d before its reply is sent. Durable, ~10–100× slower per commit.
 
 Returns the null object on success.
 
@@ -56,7 +78,7 @@ Signature: `(.log.status)`. Returns a dict describing the journal; read-only, an
 | `path` | string, or null | the last **successfully** opened log file (`<base>.log`); null if there was none |
 | `mode` | sym, or null | `'sync` or `'async` of that journal; null if there was none |
 | `bytes` | i64, or null | size of the active log in bytes; `0` when `open` is false, null if the size could not be read |
-| `auto` | bool | the current evaluation runs inside an auto-journaled IPC request (same value as [`.ipc.auto_journal_eval`](#log-write)) |
+| `auto` | bool | the value of `(.ipc.auto_journal_eval)`: set only by an embedder that journals requests itself |
 
 `path` and `mode` are committed only when an open succeeds. A failed `.log.open` therefore never reports an identity (`opened_ok` stays false, `path` and `mode` stay null) and never replaces the remembered one. They keep the values of the last successful journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, sync requests are no longer journaled, and `.log.sync` still returns null; `open` is false while `opened_ok` is true. An embedder that must not run unjournaled can check it and stop:
 
@@ -75,54 +97,17 @@ The getter only reports. Whether a request is acknowledged while the journal is 
 (.log.close)
 ```
 
-## `.log.write` { #log-write }
-
-Signature: `(.log.write expr)`. Serialises `expr` and appends a frame to the open journal.
-
-Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
-
-Inside an auto-journaled IPC request the request itself is the journal entry and is re-evaluated on replay, so an extra frame would apply the change twice. Code shared between journaled request handlers and other paths tests `(.ipc.auto_journal_eval)` and skips its own write there:
-
-```lisp
-(if (.ipc.auto_journal_eval) null (.log.write expr))
-```
-
-```lisp
-(.log.open 'async "/tmp/rayforce-journal")
-(.log.write 42)
-(.log.write [1 2 3 4 5])
-(.log.close)
-```
-
 ## `.log.sync` { #log-sync }
 
-Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null. No-op when no journal is open (the underlying call returns `RAY_OK`).
+Signature: `(.log.sync)`. Writes what the current evaluation has changed so far as a commit and forces an `fsync` on the active segment. Returns null. No-op when no journal is open (the underlying call returns `RAY_OK`).
 
 ## `.log.snapshot` { #log-snapshot }
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
-A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
+What the current evaluation changed before the call is committed first, so it lands in the snapshot and not in the fresh log. A snapshot also ends the refusal that follows a failed commit.
 
-- After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters, its body and its captures, computed once by `.sys.trust`. A captured lambda counts by its own parameters, body and captures, not by whether it is trusted.
-- On replay a call runs lifted only if its lambda is marked and is the next one its request's note lists. A request with no note replays with no lifted call.
-
-When a verb's mark changed between the snapshot and the restart:
-
-- **Trust removed after the snapshot** (the boot script no longer marks the verb): the snapshot still marks it during replay, but a call that was refused live is in no note and is refused again. That holds when another verb of the same text is still trusted, since a note entry names the verb.
-- **Trust added after the snapshot**: replay finds the verb unmarked, or not bound at all if the boot script defines it, so a call that ran lifted live is refused on replay until a snapshot holds the verb marked. Take a snapshot after changing what the boot script trusts.
-- **The verb's name, parameters, body or captures changed after the snapshot**: its identity changed with them, so calls logged since are refused on replay until a snapshot holds the new verb.
-
-Limits:
-
-- The identity includes the name only for a verb trusted by name and bound directly to that global. A lambda trusted as a value has the identity of its parameters, body and captures alone: two closures of one factory differ by their captures, but two such lambdas that are the same in all three share an identity, so trust verbs by name when one of a pair may later be revoked.
-- One lambda is trusted under one name. `.sys.trust` refuses a second name for the same object with `domain`, since recovery would give each binding its own identity. A trusted lambda also bound to a second name without `.sys.trust`, or held in a dict, runs lifted live through either, but a call made through the second name or the dict is refused on replay.
-- A trusted call that rolls the log itself (`.log.roll`, or `.log.snapshot`) leaves its request in the old log and its note in the new one, where it names nothing: that request's lift record is dropped. A snapshot already holds what the call wrote before it; after a bare roll the old log is no longer replayed at startup at all.
-- If the note cannot be written (disk full, I/O error), the request answers `io`, but its trusted calls already ran and their writes are in effect in the running process. Replay will refuse them, so the state after a restart lacks those writes.
-- A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer.
-- A binary that predates notes reads each one as an extra log entry: the note evaluates to its vector of integers, changes nothing and is counted among the replayed entries. Such a binary also loads the snapshot's lambdas unmarked.
-
-Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot and in the journal, and recovery restores it; marking a lambda by name logs its binding again, so a mark made after the lambda was bound is kept too. The mark is kept only there; `ser`, `de` and IPC never carry it. A journal entry is written only by the server, and a frame of that type arriving on a connection closes it.
 
 Errors: `domain` (no journal open), `io`.
 
@@ -134,43 +119,42 @@ Errors: `domain` (no journal open), `io`.
 
 ## `.log.replay` { #log-replay }
 
-Signature: `(.log.replay "path")`. Reads each frame in the file, deserialises the payload, and `eval`s the result. Returns the number of **processed entries**, including entries whose evaluation returned an error. Such errors produce a warning and replay continues with the next entry; the integer is **not** a count of successful evaluations.
+Signature: `(.log.replay "path")`. Reads each entry in the file and applies its records. Returns the number of entries applied.
 
-This legacy integer result is unchanged. Use [`.log.replay_report`](#log-replay-report) **instead of** `.log.replay` when the caller needs the evaluation-error count; the reporting verb performs its own replay, not an inspection of a previous call. Neither verb rolls back an entry's partial effects or an already-applied prefix. After an error, retry only from an appropriate known state rather than blindly applying the same log again.
+A record that does not apply (an append to a name that is not bound, for example) stops the replay with `apply`: the entries before it are applied, nothing after it is. The log recorded a change made on a state that memory is no longer in, so going on would build on the difference. Recovery at startup treats it the same way and does not start. Neither verb rolls back an already-applied prefix.
 
-Errors are precise enough to distinguish recovery strategies:
+Unlike recovery at startup, the verb does not drop an entry cut short at the end of the file: it reports it. Called while a journal is open, what it changes is logged there like any other change.
 
 | Error code | Meaning | Action |
 |---|---|---|
-| `badtail` | Framing or version not accepted after a prefix. | Confirm the expected format/version and inspect `.log.validate` before manual recovery; an older reader is not a reason to truncate an intact newer log. |
-| `deser` | Frame intact but payload deserialisation failed — content/version skew. | Do **not** truncate; inspect and fix. |
-| `decompr` | Compressed-frame decompression failed. | Same as `deser`. |
+| `badtail` | Framing not accepted after a prefix, or the last entry is cut short (an unfinished commit). | Inspect with `.log.validate`. Startup recovery drops an entry cut short at the very end by itself; broken framing anywhere else — including an entry that runs past the end of the file with whole entries inside what it claims — needs a decision. |
+| `apply` | A recorded change did not apply; memory no longer follows the log. | Do **not** truncate; restore from a snapshot taken before that entry. |
+| `format` | An entry of the earlier command format. | Snapshot the log with the earlier version. |
+| `deser` | Entry intact but a record could not be decoded — content/version skew. | Do **not** truncate; inspect and fix. |
 | `oom` / `io` | Resource exhaustion / read failure. | Resolve the cause and rebuild from a known state before retrying; earlier entries may already have taken effect. |
-| `cancel` | Replay interrupted; the log is intact. | No implicit interrupt clearing or rollback. Reconstruct the intended state before retrying. |
+| `cancel` | Replay interrupted; the log is intact. | Reconstruct the intended state before retrying. |
 
 ```lisp
 (.log.replay "/tmp/rayforce-journal.log")
-;; => 2   (processed entries, not proof both evaluations succeeded)
+;; => 2
 ```
 
 ## `.log.replay_report` { #log-replay-report }
 
-Signature: `(.log.replay_report "path")`. **Replays the file once**, with the same evaluation and continuation rules as `.log.replay`. On a clean tail it returns a dictionary of two I64 fields:
+Signature: `(.log.replay_report "path")`. **Applies the file once**, under the same rules as `.log.replay`. On a clean tail it returns a dictionary of two I64 fields:
 
-- `entries`: processed entries, including entries that returned an evaluation error.
-- `eval_errors`: entries whose evaluation returned an error. A successful null result is not an evaluation error.
+- `entries`: entries applied.
+- `eval_errors`: always `0`; a record that does not apply is an `apply` error, not a count.
 
-The private report is allocated before replay starts; failure to allocate it or intern its keys raises `oom` without applying journal entries. Terminal framing/read/decode/allocation/interruption failures during replay raise the same errors as `.log.replay`, rather than returning a report for that terminal failure. They may follow an already-applied prefix.
-
-For example, for three valid entries with an evaluation error in the middle, a **single** reporting call returns `entries: 3` and `eval_errors: 1`, and the third expression still runs:
+The report is allocated before replay starts; failure to allocate it raises `oom` without applying anything. Terminal failures raise the same errors as `.log.replay`, and may follow an already-applied prefix.
 
 ```lisp
 (set report (.log.replay_report "/tmp/rayforce-journal.log"))
 (get report 'entries)      ;; 3
-(get report 'eval_errors)  ;; 1
+(get report 'eval_errors)  ;; 0
 ```
 
-This is observability, not fail-fast execution, atomic recovery, rollback, or validation of application invariants. Even `eval_errors == 0` does not certify the expected application prefix. A strict recovery caller must validate the complete expected state before publishing it; partially reconstructed state after an error must not be treated as successful recovery. `.log.validate` checks framing, not those semantic properties.
+This is observability, not atomic recovery or validation of application invariants. `.log.validate` checks framing only.
 
 ## `.log.validate` { #log-validate }
 
@@ -187,7 +171,7 @@ Signature: `(.log.close)`. Flushes and closes the active journal. Returns null. 
 
 ## `.log.purge` { #log-purge }
 
-Signature: `(.log.purge)`. Closes the active journal (if open) and deletes its **entire** on-disk footprint: the active `<base>.log`, every rolled `<base>.<stamp>.log` archive, the `<base>.qdb` snapshot, a stray `<base>.qdb.tmp` and the `<base>.lk` lock file. It fails with `io` while another process has the journal open. Takes no path argument — it acts on the current journal, the same one `.log.open` / `.log.write` / `.log.close` operate on (the base survives `.log.close`, so purge works after a close). Returns null on success; errors with `domain` if no journal has been opened in this process. Best-effort delete: a missing file is not an error.
+Signature: `(.log.purge)`. Closes the active journal (if open) and deletes its **entire** on-disk footprint: the active `<base>.log`, every rolled `<base>.<stamp>.log` archive, the `<base>.qdb` snapshot, a stray `<base>.qdb.tmp` and the `<base>.lk` lock file. It fails with `io` while another process has the journal open. Takes no path argument — it acts on the current journal, the same one `.log.open` / `.log.close` operate on (the base survives `.log.close`, so purge works after a close). Returns null on success; errors with `domain` if no journal has been opened in this process. Best-effort delete: a missing file is not an error.
 
 ```
 (.log.close)
@@ -196,4 +180,5 @@ Signature: `(.log.purge)`. Closes the active journal (if open) and deletes its *
 
 ## See also
 
+- [`.tx.*` — Transactions](tx.md) — several changes as one commit.
 - [IPC & Serialization](../storage/ipc.md) — wire format used by journal frames.

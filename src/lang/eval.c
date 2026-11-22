@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "store/journal.h"
 #include "lang/eval.h"
 #include "core/runtime.h"
 #include "lang/internal.h"
@@ -223,26 +224,6 @@ void ray_eval_restrict_leave(const ray_restrict_save_t* s) {
     __VM->restricted_base = s->base;
 }
 
-/* The lift log of the request in progress on this thread (see eval.h),
- * NULL when none: then every trusted call runs lifted. */
-static _Thread_local ray_lift_log_t* g_lift_log;
-
-void ray_eval_lift_record(ray_lift_log_t* log) {
-    *log = (ray_lift_log_t){ .ids = log->inline_ids, .cap = 8, .prev = g_lift_log };
-    g_lift_log = log;
-}
-
-void ray_eval_lift_check(ray_lift_log_t* log, const int64_t* ids, int64_t n) {
-    *log = (ray_lift_log_t){ .check = true, .ids = (int64_t*)ids, .n = n, .prev = g_lift_log };
-    g_lift_log = log;
-}
-
-void ray_eval_lift_done(ray_lift_log_t* log) {
-    g_lift_log = log->prev;
-    if (!log->check && log->ids != log->inline_ids) ray_sys_free(log->ids);
-    log->ids = log->inline_ids;
-}
-
 static uint64_t trust_hash(uint64_t h, const void* bytes, int64_t n) {
     const uint8_t* p = (const uint8_t*)bytes;
     for (int64_t i = 0; i < n; i++) { h ^= p[i]; h *= UINT64_C(0x100000001b3); }
@@ -285,31 +266,6 @@ bool ray_eval_lambda_trust(ray_t* lambda, int64_t name) {
     return LAMBDA_TRUSTED(lambda) != 0;
 }
 
-/* Whether a trusted call of restricted code may run lifted, given the
- * request's lift log: recording keeps its identity (and refuses the lift
- * when it cannot, so that replay, which will find no record, agrees);
- * checking lets it run lifted only as the next call recorded live. */
-static bool lift_permitted(ray_t* lambda) {
-    ray_lift_log_t* log = g_lift_log;
-    if (!log) return true;
-    int64_t id = (int64_t)LAMBDA_TRUSTED(lambda);
-    if (log->check) {
-        if (log->next < log->n && log->ids[log->next] == id) { log->next++; return true; }
-        return false;
-    }
-    if (log->n == log->cap) {
-        int64_t cap = log->cap * 2;
-        int64_t* ids = (int64_t*)ray_sys_alloc((size_t)cap * sizeof(int64_t));
-        if (!ids) { log->failed = true; return false; }
-        memcpy(ids, log->ids, (size_t)log->n * sizeof(int64_t));
-        if (log->ids != log->inline_ids) ray_sys_free(log->ids);
-        log->ids = ids;
-        log->cap = cap;
-    }
-    log->ids[log->n++] = id;
-    return true;
-}
-
 bool ray_fn_is_local_mutator(const ray_t* fn) {
     if (!fn || fn->type != RAY_VARY) return false;
     ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn->i64;
@@ -326,8 +282,11 @@ static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
     return !ray_env_get_local(hd->i64) && ray_env_get_global(hd->i64) == head;
 }
 
+/* Also what a transaction refuses: a verb whose effect a rollback could
+ * not take back. */
 static inline bool fn_is_restricted(ray_t* fn_obj) {
-    return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
+    return (__VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED)) ||
+           (ray_tx_active && (fn_obj->attrs & RAY_FN_NO_TX));
 }
 
 /* A lambda the server marked with .sys.trust, called by restricted code:
@@ -704,7 +663,14 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
             int64_t id = x->type == -RAY_SYM ? x->i64
                                              : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
             ray_t* fn = ray_env_get(id);   /* borrowed */
-            if (pass == 1) { LAMBDA_TRUSTED(fn) = idents[i]; continue; }
+            if (pass == 1) {
+                LAMBDA_TRUSTED(fn) = idents[i];
+                /* The mark is part of what the name holds: log the binding
+                 * again, or recovery brings the lambda back without it. */
+                if (ray_journal_capture && ray_journal_note_set(id, fn) != RAY_OK)
+                    ray_journal_mark_lost();
+                continue;
+            }
             if (!fn) { err = undefined_name_error(id); break; }
             if (fn->type != RAY_LAMBDA) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */
@@ -3644,7 +3610,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
                                bool query, uint64_t row_args, bool named,
                                int8_t* out_rows) {
     if (out_rows) *out_rows = -1;
-    if (RAY_UNLIKELY(lambda_lifts(lambda)) && lift_permitted(lambda)) {
+    if (RAY_UNLIKELY(lambda_lifts(lambda))) {
         /* Isolated as well as lifted: the body sees its arguments, its
          * captures and the globals, as it would called at the top level.
          * The caller's locals, eval windows and query stay hidden, so a
@@ -5381,10 +5347,10 @@ static void ray_register_builtins(void) {
     /* Query operations */
     register_vary("select",    RAY_FN_SPECIAL_FORM, ray_select);
     register_vary("window",    RAY_FN_SPECIAL_FORM, ray_window_fn);
-    register_vary("update",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_update);
-    register_vary("insert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_insert);
-    register_vary("upsert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_upsert);
-    register_vary("delete",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_delete);
+    register_vary("update",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_update_fn);
+    register_vary("insert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_insert_fn);
+    register_vary("upsert",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_upsert_fn);
+    register_vary("delete",    RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED, ray_delete_fn);
     /* xbar is registered NON-atomic so the call path lands in
      * ray_xbar_fn(VEC, scalar) directly.  ray_xbar_fn handles the
      * vector fast path itself (tight per-element loop, no per-atom
@@ -5415,23 +5381,23 @@ static void ray_register_builtins(void) {
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary("write-csv",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
-    register_vary(".csv.splayed",      RAY_FN_RESTRICTED, ray_read_csv_splayed_fn);
-    register_vary(".csv.parted",       RAY_FN_RESTRICTED, ray_read_csv_parted_fn);
-    register_vary(".csv.write",        RAY_FN_RESTRICTED, ray_write_csv_fn);
+    register_vary(".csv.splayed",      RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_read_csv_splayed_fn);
+    register_vary(".csv.parted",       RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_read_csv_parted_fn);
+    register_vary(".csv.write",        RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_csv_fn);
     register_vary(".parquet.scan",     RAY_FN_RESTRICTED, ray_parquet_scan_fn);
     register_unary(".parquet.meta",    RAY_FN_RESTRICTED, ray_parquet_metadata_fn);
     register_vary(".parquet.read",     RAY_FN_RESTRICTED, ray_parquet_read_fn);
     register_vary(".parquet.each",     RAY_FN_RESTRICTED, ray_parquet_each_fn);
-    register_vary(".parquet.splayed",  RAY_FN_RESTRICTED, ray_parquet_splayed_fn);
-    register_vary(".parquet.parted",   RAY_FN_RESTRICTED, ray_parquet_parted_fn);
+    register_vary(".parquet.splayed",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_parquet_splayed_fn);
+    register_vary(".parquet.parted",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_parquet_parted_fn);
     register_binary("as",       RAY_FN_NONE, ray_cast_fn);
     register_unary("type",      RAY_FN_NONE, ray_type_fn);
     register_unary("read",      RAY_FN_RESTRICTED, ray_read_file_fn);
     register_unary("read-bytes", RAY_FN_RESTRICTED, ray_read_bytes_fn);
-    register_binary("write",    RAY_FN_RESTRICTED, ray_write_file_fn);
-    register_binary("write-bytes", RAY_FN_RESTRICTED, ray_write_bytes_fn);
+    register_binary("write",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_file_fn);
+    register_binary("write-bytes", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_write_bytes_fn);
     register_unary("load",      RAY_FN_RESTRICTED, ray_load_file_fn);
     register_unary("exit",      RAY_FN_RESTRICTED, ray_exit_fn);
     register_vary("resolve",    RAY_FN_SPECIAL_FORM, ray_resolve_fn);
@@ -5477,7 +5443,7 @@ static void ray_register_builtins(void) {
     register_vary(".db.splayed.get",   RAY_FN_NONE,       ray_get_splayed_fn);
     register_vary(".db.parted.get",    RAY_FN_NONE,       ray_get_parted_fn);
     register_vary(".db.parted.tables", RAY_FN_NONE,       ray_get_parted_tables_fn);
-    register_vary(".db.parted.fill",   RAY_FN_RESTRICTED, ray_fill_parted_fn);
+    register_vary(".db.parted.fill",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_fill_parted_fn);
 
     /* GUID generation */
     register_unary("guid",       RAY_FN_NONE, ray_guid_fn);
@@ -5517,7 +5483,7 @@ static void ray_register_builtins(void) {
      * user code can't shadow them and a glance at the name identifies
      * the category. */
     register_vary (".sys.gc",   RAY_FN_NONE,        ray_gc_fn);
-    register_vary (".sys.exec", RAY_FN_RESTRICTED,  ray_system_fn);
+    register_vary (".sys.exec", RAY_FN_RESTRICTED | RAY_FN_NO_TX,  ray_system_fn);
     register_unary(".mem.objsize", RAY_FN_NONE,      ray_mem_objsize_fn);
     register_vary (".mem.ts",      RAY_FN_SPECIAL_FORM, ray_mem_ts_fn);
     /* Registry-dispatched system commands.  `.sys.cmd "name args"` is
@@ -5526,8 +5492,8 @@ static void ray_register_builtins(void) {
      * in hand.  All share the table in lang/syscmd.c. */
     register_unary(".sys.cmd",    RAY_FN_RESTRICTED, ray_syscmd_string_dispatch_fn);
     register_vary (".sys.timeit", RAY_FN_NONE,       ray_sys_timeit_fn);
-    register_unary(".sys.listen", RAY_FN_RESTRICTED, ray_sys_listen_fn);
-    register_unary(".sys.trust",  RAY_FN_RESTRICTED, ray_sys_trust_fn);
+    register_unary(".sys.listen", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_sys_listen_fn);
+    register_unary(".sys.trust",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_sys_trust_fn);
     register_vary (".sys.env",    RAY_FN_NONE,       ray_sys_env_fn);
     register_vary (".sys.args",   RAY_FN_NONE,       ray_sys_args_fn);
 
@@ -5581,17 +5547,21 @@ static void ray_register_builtins(void) {
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at
      * startup; these builtins expose the same machinery to Rayfall code
      * for manual control (open from a script, snapshot on demand, etc). */
-    register_vary(".log.open",     RAY_FN_RESTRICTED, ray_log_open_fn);
+    register_vary(".log.open",     RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_open_fn);
     register_vary(  ".log.status", RAY_FN_NONE,       ray_log_status_fn);
-    register_unary(".log.write",   RAY_FN_RESTRICTED, ray_log_write_fn);
-    register_unary(".log.replay",  RAY_FN_RESTRICTED, ray_log_replay_fn);
-    register_unary(".log.replay_report", RAY_FN_RESTRICTED, ray_log_replay_report_fn);
+    register_unary(".log.replay",  RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_replay_fn);
+    register_unary(".log.replay_report", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_replay_report_fn);
     register_unary(".log.validate",RAY_FN_NONE,       ray_log_validate_fn);
-    register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
-    register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
-    register_vary(".log.sync",     RAY_FN_NONE,       ray_log_sync_fn);
-    register_vary(".log.close",    RAY_FN_RESTRICTED, ray_log_close_fn);
-    register_vary(".log.purge",    RAY_FN_RESTRICTED, ray_log_purge_fn);
+    register_vary(".log.roll",     RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_roll_fn);
+    register_vary(".log.snapshot", RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_snapshot_fn);
+    register_vary(".log.sync",     RAY_FN_NONE | RAY_FN_NO_TX,       ray_log_sync_fn);
+    register_vary(".log.close",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_close_fn);
+    register_vary(".log.purge",    RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_log_purge_fn);
+
+    /* Transactions under `.tx.*`: one at a time, owned by a connection. */
+    register_vary(".tx.begin",     RAY_FN_RESTRICTED, ray_tx_begin_fn);
+    register_vary(".tx.commit",    RAY_FN_RESTRICTED, ray_tx_commit_fn);
+    register_vary(".tx.rollback",  RAY_FN_RESTRICTED, ray_tx_rollback_fn);
 
     /* quote — special form (unevaluated argument) */
     register_vary("quote",       RAY_FN_SPECIAL_FORM, ray_quote_fn);
@@ -5683,7 +5653,7 @@ static void ray_register_builtins(void) {
     register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);
     register_unary ("hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
-    register_binary("hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
+    register_binary("hnsw-save",   RAY_FN_RESTRICTED | RAY_FN_NO_TX, ray_hnsw_save_fn);
     register_unary ("hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
     register_unary ("hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
 
@@ -6327,5 +6297,12 @@ ray_t* ray_eval_str(const char* source) {
      * chain before returning to callers who expect a concrete value. */
     if (ray_is_lazy(result))
         result = ray_lazy_materialize(result);
+    /* And a commit: what the source changed reaches the journal before
+     * the caller hears it ran. */
+    if (ray_journal_capture && ray_journal_commit() != RAY_OK) {
+        if (result && RAY_IS_ERR(result)) ray_error_free(result);
+        else if (result) ray_release(result);
+        result = ray_error("io", "journal write failed; this change is not logged");
+    }
     return result;
 }

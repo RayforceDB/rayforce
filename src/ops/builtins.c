@@ -53,6 +53,7 @@ static inline double clear_neg_zero(double v) {
 #include "store/col.h"
 #include "store/part.h"
 #include "store/splay.h"
+#include "store/journal.h"
 #include "table/sym.h"
 #include "core/profile.h"
 #include "mem/sys.h"
@@ -602,6 +603,10 @@ ray_t* ray_exit_fn(ray_t* arg) {
         return ray_error("type", "exit: the status must be an integer atom, got %s",
                          ray_type_name(arg->type));
     if (arg) code = (int)as_i64(arg);
+    /* What this evaluation changed before asking to leave is as done as
+     * anything: commit it.  A transaction left open is not. */
+    ray_tx_rollback();
+    (void)ray_journal_close();
     exit(code);
     return NULL; /* unreachable */
 #endif

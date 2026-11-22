@@ -746,6 +746,51 @@ static test_result_t test_repl_pty_eval_then_quit(void) {
     PASS();
 }
 
+/* A transaction typed at the terminal: while it is open the REPL serves
+ * only its own input (repl_tx_serve), lines of it see what earlier lines
+ * wrote, a rollback undoes them and a commit keeps them.  The last line
+ * leaves a file only if every value came out right. */
+static test_result_t test_repl_pty_transaction(void) {
+#ifndef RAY_OS_WINDOWS
+    const char* marker = "/tmp/rf_repl_pty_tx_ok";
+    unlink(marker);
+    int rc = run_pty_with_input(
+        "(set txi 1)\n"
+        "(.tx.begin)\n"
+        "(set txi 2)\n"
+        "(set own (== txi 2))\n"
+        "(.tx.rollback)\n"
+        "(set undone (== txi 1))\n"
+        "(.tx.begin)\n"
+        "(set txj 7)\n"
+        "(.tx.commit)\n"
+        "(.tx.begin)\n"
+        "(set txj 8)\n"
+        "(no_such_function 1)\n"
+        "(set txj 9)\n"
+        "(.tx.rollback)\n"
+        "(if (and undone (== txj 7) (== (try own (fn [e] 0)) 0)) (write \"/tmp/rf_repl_pty_tx_ok\" \"ok\") 0)\n"
+        ":q\n", 1);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
+    if (rc == 0) {
+        TEST_ASSERT_FMT(access(marker, F_OK) == 0, "the transaction lines did not leave %s", marker);
+        unlink(marker);
+    }
+#endif
+    PASS();
+}
+
+/* Quitting inside a transaction rolls it back and still exits. */
+static test_result_t test_repl_pty_transaction_quit_inside(void) {
+#ifndef RAY_OS_WINDOWS
+    int rc = run_pty_with_input("(.tx.begin)\n(set txq 1)\n:q\n", 1);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
+    rc = run_pty_with_input("(.tx.begin)\n(set txq 1)\n\x04", 1);
+    TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
+#endif
+    PASS();
+}
+
 /* Ctrl-D on empty buffer → ray_term_feed returns RAY_TERM_EOF →
  * repl_read's RAY_TERM_EOF branch fires ray_poll_exit. */
 static test_result_t test_repl_pty_ctrl_d(void) {
@@ -3283,6 +3328,8 @@ const test_entry_t repl_entries[] = {
     { "repl/pty/quit",                       test_repl_pty_quit,                       repl_setup, repl_teardown },
     { "repl/pty/backslash_exit",             test_repl_pty_backslash_exit,             repl_setup, repl_teardown },
     { "repl/pty/eval_then_quit",             test_repl_pty_eval_then_quit,             repl_setup, repl_teardown },
+    { "repl/pty_transaction",             test_repl_pty_transaction,             repl_setup, repl_teardown },
+    { "repl/pty_transaction_quit_inside",             test_repl_pty_transaction_quit_inside,             repl_setup, repl_teardown },
     { "repl/pty/ctrl_d",                     test_repl_pty_ctrl_d,                     repl_setup, repl_teardown },
     { "repl/pty/timer_fires_while_idle",     test_repl_pty_timer_fires_while_idle,     repl_setup, repl_teardown },
     { "repl/pty/periodic_timer_while_idle",  test_repl_pty_periodic_timer_while_idle,  repl_setup, repl_teardown },

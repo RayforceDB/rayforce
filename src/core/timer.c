@@ -32,6 +32,7 @@
 #include "core/runtime.h"   /* ray_error_msg */
 #include "lang/internal.h"
 #include "mem/sys.h"
+#include "store/journal.h"
 #include <stdio.h>
 #include <string.h>
 #if defined(RAY_OS_WINDOWS)
@@ -207,6 +208,12 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
         ray_timer_frame_t frame = { timer, false, t->firing };
         t->firing = &frame;
         ray_t* result = call_fn1(timer->fn, arg);
+        /* Nothing would end a transaction a callback left open. */
+        if (ray_tx_active && ray_tx_owner() == RAY_TX_LOCAL) {
+            ray_tx_rollback();
+            fprintf(stderr, "tx: a timer callback left a transaction open; rolled back\n");
+        }
+        (void)ray_journal_commit();   /* a callback is a commit */
         /* The callback may have re-entered this function; every nested
          * frame has unwound by now, so t->firing is &frame again. */
         t->firing = frame.prev;

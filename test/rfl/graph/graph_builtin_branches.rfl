@@ -45,7 +45,8 @@
 (ser (table [g] (list (list (list Wg))))) !- domain
 (ser ((fn [] (let captured Wg) (fn [] captured)))) !- domain
 (nil? (.log.open 'async "/tmp/rfl_graph_serde_handle")) -- true
-(.log.write Wg) !- domain
+;; ...nor bound to a global the journal has to log.
+(set WgLogged Wg) !- domain
 (nil? (.log.purge)) -- true
 
 ;; ====================================================================

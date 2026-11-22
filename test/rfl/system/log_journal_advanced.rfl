@@ -132,26 +132,6 @@
 (.sys.exec "rm -f /tmp/rftest_jerr*")
 
 ;; ════════════════════════════════════════════════════════════════════
-;; Phase D — .log.write inside auto-journaled IPC eval is rejected
-;; ════════════════════════════════════════════════════════════════════
-;; A journaled server logs every SYNC IPC payload before evaluation.
-;; Letting the payload call .log.write as well would persist nested
-;; writes in addition to the already-logged outer request.
-
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_jwr*")
-(.sys.exec "./rayforce -l /tmp/rftest_jwr -p 19994 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
-
-(set hD (wait_ipc "127.0.0.1:19994" 50))
-(.ipc.send hD "(.log.write \"(set d1 999)\")") !- domain
-(.ipc.close hD)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_jwr*")
-
-;; ════════════════════════════════════════════════════════════════════
 ;; Phase E — function bindings survive snapshot restart
 ;; ════════════════════════════════════════════════════════════════════
 ;; A function-bearing snapshot must load into a fresh server runtime.

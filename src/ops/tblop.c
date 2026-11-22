@@ -33,6 +33,7 @@
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "mem/heap.h"
+#include "store/journal.h"
 #include <stdio.h>
 #include <inttypes.h>
 
@@ -1518,7 +1519,12 @@ static ray_t* alter_target(ray_t** args, int64_t n,
                            const ray_env_target_t* target, ray_t* var,
                            ray_t* name_sym);
 
+static ray_t* alter_impl(ray_t** args, int64_t n);
 ray_t* ray_alter_fn(ray_t** args, int64_t n) {
+    return ray_journal_mutator(alter_impl, args, n);
+}
+
+static ray_t* alter_impl(ray_t** args, int64_t n) {
     bool via_callee = ray_env_mutator_callee_take();   /* before anything else runs */
     if (n < 3) return ray_error("domain", "alter: expects at least 3 arguments (var, op, ...), got %lld", (long long)n);
     /* First arg: evaluate to get the symbol */
@@ -1536,6 +1542,7 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n) {
     /* Argument evaluation can rebind the target or grow a scope frame. Keep
      * the original value alive and publish through the resolved scope. */
     ray_retain(var);
+    if (ray_journal_capture) ray_journal_mut_resolved(name_sym->i64, target.scope < 0 ? var : NULL);
     ray_t* result = alter_target(args, n, &target, var, name_sym);
     ray_release(var);
     return result;
@@ -1767,6 +1774,8 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         if (n < 3) { ray_release(name_sym); return ray_error("arity", "alter concat: expects 3 arguments (var, concat, val), got %lld", (long long)n); }
         ray_t* val = ray_eval(args[2]);
         if (!val || RAY_IS_ERR(val)) { ray_release(name_sym); return val ? val : ray_error("type", "alter concat: value argument evaluated to null"); }
+        /* The journal notes what this appends, not the value it leaves. */
+        if (target->scope < 0) ray_journal_mut_target(name_sym->i64, var);
         ray_t* new_vec = ray_concat_fn(var, val);
         ray_release(val);
         if (!new_vec || RAY_IS_ERR(new_vec)) { ray_release(name_sym); return new_vec ? new_vec : ray_error("oom", NULL); }

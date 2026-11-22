@@ -10,7 +10,7 @@
 ;;       the payload (unknown type tag, bad length, etc.).  Crafting the
 ;;       binary file with .sys.exec/python3 is the only RFL-reachable path.
 ;;
-;;   (b) ray_log_replay_fn: RAY_JREPLAY_DECOMP switch arm.
+;;   (b) ray_log_replay_fn: RAY_JREPLAY_FORMAT switch arm.
 ;;       Reached when the COMPRESSED flag is set in the frame header but
 ;;       the compressed bytes cannot be decompressed.
 ;;
@@ -64,10 +64,10 @@
 (nil? (.log.open 'async "/tmp/rfl_ops_journal")) -- true
 
 ;; Write various self-evaluating values through the serialise path.
-(nil? (.log.write 42))          -- true
-(nil? (.log.write 3.14))        -- true
-(nil? (.log.write -7))          -- true
-(nil? (.log.write [1 2 3 4 5])) -- true
+(set jw_e 42)          -- 42
+(set jw_e 3.14)        -- 3.14
+(set jw_e -7)          -- -7
+(set jw_e [1 2 3 4 5]) -- [1 2 3 4 5]
 
 (nil? (.log.close)) -- true
 
@@ -83,7 +83,7 @@
 ;;   version = 3          (RAY_SERDE_WIRE_VERSION)
 ;;   flags   = 0          (no compression)
 ;;   endian  = 0
-;;   msgtype = 0          (async)
+;;   msgtype = 5          (a journal commit)
 ;;   size    = 2          (payload is 2 bytes)
 ;; Payload: [0x80, 0x00]
 ;;   type byte = 0x80 = -128 (signed int8): an atom type, but -128 is not in
@@ -91,24 +91,20 @@
 ;;   flags byte = 0x00.
 ;; ray_journal_replay sees !msg || RAY_IS_ERR(msg) → status = JREPLAY_DESER.
 ;; ════════════════════════════════════════════════════════════════════════
-(.sys.exec "python3 -c \"\nimport struct\nprefix = 0xcefadefa\nver = 3; flags = 0; endian = 0; msgtype = 0\npay = bytes([0x80, 0x00])\nhdr = struct.pack('<IbbbbQ', prefix, ver, flags, endian, msgtype, len(pay))\nopen('/tmp/rfl_ops_journal_deser.log','wb').write(hdr + pay)\n\"") -- 0
+(.sys.exec "python3 -c \"\nimport struct\nprefix = 0xcefadefa\nver = 3; flags = 0; endian = 0; msgtype = 5\npay = bytes([0x80, 0x00])\nhdr = struct.pack('<IbbbbQ', prefix, ver, flags, endian, msgtype, len(pay))\nopen('/tmp/rfl_ops_journal_deser.log','wb').write(hdr + pay)\n\"") -- 0
 
 ;; .log.replay must return a deser error, not silently skip or badtail.
 (.log.replay "/tmp/rfl_ops_journal_deser.log") !- deser
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; 3. RAY_JREPLAY_DECOMP — compressed frame, bad payload (lines 154-157).
+;; 3. RAY_JREPLAY_FORMAT — an entry of the old command format.
 ;;
-;; Craft a 16-byte IPC header with flags = 0x01 (RAY_IPC_FLAG_COMPRESSED).
-;; Payload: 4-byte uncompressed-size claim (100 bytes) + 3 bytes of garbage
-;; that are NOT valid lz4/zstd compressed data.
-;; ray_journal_replay calls decompress_if_needed → failure → JREPLAY_DECOMP.
+;; A well-framed entry whose msgtype is not a journal commit (0 = async, what
+;; the command log wrote): replay would have to evaluate it, and refuses.
 ;; ════════════════════════════════════════════════════════════════════════
-(.sys.exec "python3 -c \"\nimport struct\nprefix = 0xcefadefa\nver = 3; flags = 1; endian = 0; msgtype = 0\nuncomp_size = 100\npay = struct.pack('<I', uncomp_size) + bytes([0xAA, 0xBB, 0xCC])\nhdr = struct.pack('<IbbbbQ', prefix, ver, flags, endian, msgtype, len(pay))\nopen('/tmp/rfl_ops_journal_decomp.log','wb').write(hdr + pay)\n\"") -- 0
+(.sys.exec "python3 -c \"\nimport struct\nprefix = 0xcefadefa\nver = 3; flags = 0; endian = 0; msgtype = 0\npay = bytes([0xf9, 0x00, 0x2a, 0, 0, 0, 0, 0, 0, 0])\nhdr = struct.pack('<IbbbbQ', prefix, ver, flags, endian, msgtype, len(pay))\nopen('/tmp/rfl_ops_journal_decomp.log','wb').write(hdr + pay)\n\"") -- 0
 
-;; .log.replay must return a decompress error.
-;; Note: ray_error("decompress", ...) stores only 7 chars → code = "decompr".
-(.log.replay "/tmp/rfl_ops_journal_decomp.log") !- decompr
+(.log.replay "/tmp/rfl_ops_journal_decomp.log") !- format
 
 ;; ── teardown ─────────────────────────────────────────────────────────────
 (.sys.exec "rm -f /tmp/rfl_ops_journal.log /tmp/rfl_ops_journal_deser.log /tmp/rfl_ops_journal_decomp.log")

@@ -1106,7 +1106,7 @@ static test_result_t test_ipc_restricted_trusted_replay(void) {
     TEST_ASSERT_EQ_I(kv2, 19);
     TEST_ASSERT_EQ_I(kv3, 8);
     TEST_ASSERT_EQ_I(kv4, 8);
-    TEST_ASSERT_EQ_I(kv5, 5);   /* the changed verb's call is refused on replay */
+    TEST_ASSERT_EQ_I(kv5, 60);  /* what run 2 left: recovery applies values, it calls no verb again */
     TEST_ASSERT_EQ_I(kv6, 5);
     TEST_ASSERT_EQ_I(kv7, 4);
     TEST_ASSERT_TRUE(restored);
@@ -3178,7 +3178,7 @@ static test_result_t test_ipc_wire_unknown_msgtype_is_evaluated(void) {
     PASS();
 }
 
-/* A journal note (RAY_IPC_MSG_JNOTE) exists only in a log the server wrote:
+/* A journal commit (RAY_IPC_MSG_JREC) exists only in a log the server wrote:
  * a frame of that type on the wire drops the connection, unevaluated. */
 static test_result_t test_ipc_wire_journal_note_rejected(void) {
     ray_poll_t* poll; ray_vm_t* vm; uint16_t port; ray_thread_t tid;
@@ -3188,7 +3188,7 @@ static test_result_t test_ipc_wire_journal_note_rejected(void) {
     ray_sock_t s = wire_connect(port);
     TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
     ray_t* q = ray_str("(set _wire_note 99)", 19);
-    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_JNOTE, q), 0);
+    TEST_ASSERT_EQ_I(wire_send(s, RAY_IPC_MSG_JREC, q), 0);
     ray_release(q);
     uint8_t byte;
     TEST_ASSERT_EQ_I(wire_recv_exact(s, &byte, 1), -1);   /* closed, no reply */

@@ -141,6 +141,7 @@ nav:
           - .repl — REPL control: docs/namespaces/repl.md
           - .sys — System info: docs/namespaces/sys.md
           - .time — Clock & timers: docs/namespaces/time.md
+          - .tx — Transactions: docs/namespaces/tx.md
       - Data & Types:
           - Data Types: docs/data-types/index.md
           - Collections: docs/data-types/collections.md

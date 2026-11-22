@@ -84,11 +84,9 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
 /* An upgrade record (below): the payload is the record's bytes, not a
  * serialized value, and is never evaluated or journaled. */
 #define RAY_IPC_MSG_UPGRADE 3
-/* A journal note: written by the server after a journaled restricted
- * request whose trusted calls ran lifted, never sent on the wire.  Its
- * payload is an I64 vector of those lambdas' identities, in call order;
- * replay pairs it with the frame right before it (ray_lift_log_t). */
-#define RAY_IPC_MSG_JNOTE   4
+/* A journal commit: the physical records of one commit (store/journal.c),
+ * written by the server, never sent on the wire. */
+#define RAY_IPC_MSG_JREC    5
 
 /* ===== Transports =====
  *
@@ -127,14 +125,6 @@ const char* ray_ipc_xport_kind_name(int kind);
 int         ray_ipc_xport_policy_parse(const char* s, size_t n);
 
 #define RAY_IPC_FLAG_COMPRESSED 0x01
-/* Set by the journal hook in core/ipc.c eval_payload when the inbound
- * IPC message arrived on a `-U` restricted connection.  Used ONLY for
- * persisted log frames; the live IPC path ignores it (the connection's
- * restricted state is the source of truth there).  Replay reads the
- * bit to re-impose the original sender's restrictions, otherwise a
- * crash + restart silently elevates restricted commands to full
- * privilege. */
-#define RAY_IPC_FLAG_RESTRICTED 0x02
 /* Set by clients that want a "verbose" eval response: the server
  * captures whatever the eval wrote to stdout/stderr and returns a
  * 2-element list [captured_str, result] instead of bare result.
