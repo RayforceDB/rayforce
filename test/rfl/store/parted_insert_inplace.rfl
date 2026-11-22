@@ -121,7 +121,8 @@
 (count (select {from: N where: (nil? s)})) -- 2
 (count (select {from: N where: (== x "")})) -- 2
 (count (select {from: N where: (< s 'bb)})) -- 9
-(nil? (at (select {m: (first (asc s)) from: N}) 'm)) -- [true]
-(at (select {m: (first (asc x)) from: N}) 'm) -- [""]
+;; the sorted column leads with the nulls (a select's first would skip them)
+(nil? (first (at (select {m: (asc s) from: N}) 'm))) -- true
+(first (at (select {m: (asc x) from: N}) 'm)) -- ""
 (select {c: (count id) from: N by: s where: (== date 2026.08.05)}) -- (table ['s 'c] (list ['aa 'bb 'brand-new '] [4 3 1 2]))
 (.sys.exec "rm -rf /tmp/rfl_pins_inplace") -- 0

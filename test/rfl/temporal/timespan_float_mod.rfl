@@ -1,0 +1,42 @@
+;; @also-unfused
+;; #1362: a TIMESPAN with a float `%` is the floor modulo rounded once, the
+;; same rule as every other float route (#1349): the result lies in [0,b)
+;; for b > 0 and in (b,0] for b < 0, and a remainder that would round to b
+;; is 0.  Each case is pinned exactly and against the plain float form.
+(set t (as 'TIMESPAN 9000000000000000001))
+(type (% t 7.0)) -- 'f64
+;; a quotient past 2^53
+(== (% t 7.0) 2.0) -- true
+(== (% t 7.0) (% 9000000000000000001 7.0)) -- true
+(== (% (neg t) 7.0) (% -9000000000000000001 7.0)) -- true
+;; a remainder that would round to the divisor
+(== (% (as 'TIMESPAN -1) 1e17) 0.0) -- true
+(== (% (as 'TIMESPAN -1) 1e17) (% -1 1e17)) -- true
+;; a tiny divisor keeps its remainder
+(== (% (as 'TIMESPAN 5) 1e-300) (% 5.0 1e-300)) -- true
+(> (% (as 'TIMESPAN 5) 1e-300) 0.0) -- true
+;; float on the left
+(== (% 1e300 (as 'TIMESPAN 7)) 1.0) -- true
+(== (% 1e300 (as 'TIMESPAN 7)) (% 1e300 7.0)) -- true
+(== (% 7.0 (as 'TIMESPAN 3)) 1.0) -- true
+;; every sign pair
+(== (% (as 'TIMESPAN 10) 3.0) 1.0) -- true
+(== (% (as 'TIMESPAN -10) 3.0) 2.0) -- true
+(== (% (as 'TIMESPAN 10) -3.0) -2.0) -- true
+(== (% (as 'TIMESPAN -10) -3.0) -1.0) -- true
+;; a non-whole F64 divisor
+(== (% (as 'TIMESPAN 10) 3.5) 3.0) -- true
+(== (% (as 'TIMESPAN -10) 3.5) 0.5) -- true
+;; zero divisor and nulls stay null
+(nil? (% (as 'TIMESPAN 5) 0.0)) -- true
+(nil? (% (as 'TIMESPAN 0Nl) 7.0)) -- true
+(nil? (% t 0Nf)) -- true
+;; vectors, eager and in a query, against the integer form
+(set n [9000000000000000001 -1 5 10 -10 0])
+(set s (as 'TIMESPAN n))
+(== (% s 7.0) (% n 7.0)) -- [true true true true true true]
+(== (% s -1e17) (% n -1e17)) -- [true true true true true true]
+(set T (table [s n] (list s n)))
+(== (at (select {r: (% s 7.0) from: T}) 'r) (% n 7.0)) -- [true true true true true true]
+(== (at (select {r: (% s 1e17) from: T}) 'r) (% n 1e17)) -- [true true true true true true]
+(== (at (select {r: (sum (% s 7.0)) from: T}) 'r) (enlist (sum (% n 7.0)))) -- [true]

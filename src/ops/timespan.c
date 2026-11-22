@@ -140,7 +140,10 @@ static span_result_t span_eval(uint16_t op, ray_t* a, ray_t* b, int8_t out) {
         double y = is_numeric(b) ? as_f64(b) : (double)bv;
         double v = op == OP_ADD ? x + y : op == OP_SUB ? x - y :
                    op == OP_MUL ? x * y : op == OP_DIV ? x / y :
-                   op == OP_IDIV ? floor(x / y) : op == SPAN_BUCKET ? y * floor(x / y) : x - y * floor(x / y);
+                   op == OP_IDIV ? floor(x / y) : op == SPAN_BUCKET ? y * floor(x / y) :
+                   /* % is the floor modulo rounded once, as every other float
+                    * route (#1362); a zero divisor is non-finite: null below */
+                   (y != 0 ? ray_fmod_floor(x, y) : NAN);
         return (span_result_t){.f = __builtin_isfinite(v) ? v : NULL_F64};
     }
     if (out == RAY_TIME && (op == OP_ADD || op == OP_SUB)) {

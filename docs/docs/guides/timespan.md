@@ -50,6 +50,7 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | `span div integer`, `span div span` | TIMESPAN |
 | `span / span`, `span / integer` | F64 |
 | `span % integer` | TIMESPAN |
+| `span % F64`, `F64 % span` | F64: the float `%` of the nanosecond count, the floor modulo rounded once (in [0,b) for b > 0, (b,0] for b < 0); a zero divisor gives null |
 | `span % span`, `span * span` | Type error |
 | Comparisons with another span or an integer count | BOOL |
 | `sum spans` | TIMESPAN; skips nulls |

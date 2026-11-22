@@ -1717,8 +1717,20 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
     if (!exists && !create) { ray_sys_free(rpath); return NULL; }
 
     dom_lock();
-    for (ray_sym_domain_t* d = g_domains; d; d = d->next) {
+    for (ray_sym_domain_t** pp = &g_domains; *pp; pp = &(*pp)->next) {
+        ray_sym_domain_t* d = *pp;
         if (dom_path_eq(d->path, rpath)) {
+            /* The file this entry was read from or flushed to is gone (its
+             * root deleted) while columns still hold the entry: they keep it
+             * and their symbols, out of the cache, and a create starts the
+             * path afresh exactly as it would with nothing held.  Only a
+             * create gets here (a plain open of a missing file failed above);
+             * an entry with no file yet (disk_size 0) is a save in progress. */
+            if (!exists && d->disk_size) {
+                *pp = d->next;
+                d->next = NULL;
+                break;
+            }
             /* Revalidate: external append-only growth extends in place;
              * any other divergence is loud (NULL). */
             size_t cur_size = exists ? (size_t)st.st_size : 0;
