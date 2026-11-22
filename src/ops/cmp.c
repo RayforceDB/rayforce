@@ -258,12 +258,22 @@ static uint64_t eq_key_hash(ray_t* x, int spans) {
             h = ray_hash_i64((int64_t)(h ^ eq_key_hash(cells[i], spans)));
         return h;
     }
-    /* atom_eq's vector arm: same type and length, then memcmp of
-     * len * ray_elem_size bytes, so type tags, null sentinels, NaN bits,
-     * raw SYM ids and STR descriptors all compare raw.  Hash those bytes;
-     * a narrow SYM vector hashes the width it stores. */
+    /* A SYM vector hashes its cells' text: atom_eq calls two SYM vectors
+     * equal when every cell is the same symbol, in any domain or stored
+     * width (#1311), and the text is what such cells share. */
+    if (x->type == RAY_SYM && !spans) {
+        uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
+        for (int64_t i = 0; i < x->len; i++) {
+            ray_t* s = ray_sym_vec_cell(x, i);
+            h = ray_hash_combine(h, s ? ray_hash_bytes(ray_str_ptr(s), ray_str_len(s)) : 0);
+        }
+        return h;
+    }
+    /* atom_eq's other vector arm: same type and length, then memcmp of
+     * len * ray_elem_size bytes, so type tags, null sentinels, NaN bits and
+     * STR descriptors all compare raw.  Hash those bytes. */
     if (x->type > RAY_LIST && x->type <= RAY_STR && !spans) {
-        size_t esz = x->type == RAY_SYM ? RAY_SYM_ELEM(x->attrs) : ray_elem_size(x->type);
+        size_t esz = ray_elem_size(x->type);
         return ray_hash_combine(ray_hash_i64(((int64_t)x->type << 32) ^ x->len),
                                 ray_hash_bytes(ray_data(x), (size_t)x->len * esz));
     }

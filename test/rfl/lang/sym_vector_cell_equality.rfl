@@ -1,0 +1,31 @@
+;; #1311: two SYM vectors holding the same symbols are equal cells whatever
+;; domain or width each stores them in.  atom_eq compared len * 8 raw bytes:
+;; it read past a narrow vector and told the same symbols apart.
+(.sys.exec "rm -rf /tmp/rfl_sym_vec_cell_eq") -- 0
+(.db.splayed.set "/tmp/rfl_sym_vec_cell_eq/a/t/" (table [s] (list [a b c])) "/tmp/rfl_sym_vec_cell_eq/a/sym")
+(.db.splayed.set "/tmp/rfl_sym_vec_cell_eq/b/t/" (table [s] (list [z y x c b a])) "/tmp/rfl_sym_vec_cell_eq/b/sym")
+(set N (at (.db.splayed.get "/tmp/rfl_sym_vec_cell_eq/a/t/" "/tmp/rfl_sym_vec_cell_eq/a/sym") 's))
+(set M (at (.db.splayed.get "/tmp/rfl_sym_vec_cell_eq/b/t/" "/tmp/rfl_sym_vec_cell_eq/b/sym") 's))
+(set M3 (take M -3))
+(set W [a b c])
+
+;; a narrow file-domain vector against the runtime one, and two file domains
+;; that store the same symbols at different positions
+(count (distinct (list N W))) -- 1
+(count (distinct (list W N))) -- 1
+(count (distinct (list (reverse M3) W N))) -- 1
+(count (distinct (list N [a b d]))) -- 2
+(count (distinct (list N [a b]))) -- 2
+(count (distinct (list M3 W))) -- 2
+
+;; keyed-table == over such cells (the hash agrees with the equality)
+(set K1 (xkey (table [k v] (list (list N [x y]) [1 2])) [k]))
+(set K2 (xkey (table [k v] (list (list [x y] W) [2 1])) [k]))
+(== K1 K2) -- (== K1 K1)
+(set K3 (xkey (table [k v] (list (list [x y] W) [2 9])) [k]))
+(== K1 K3) -- (xkey (table [k v] (list (list N [x y]) [false true])) [k])
+
+;; grouping by a list of such cells
+(count (distinct (list N W (reverse M3) [a b c]))) -- 1
+
+(.sys.exec "rm -rf /tmp/rfl_sym_vec_cell_eq") -- 0

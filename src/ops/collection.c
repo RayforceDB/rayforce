@@ -1606,8 +1606,8 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
  * ══════════════════════════════════════════ */
 
 /* atom_eq for a column of a table / dict cell.  A SYM column is read at
- * its storage width (the vector branch reads 8 bytes a cell) and compared
- * by text across domains; a STR column by content (a descriptor holds a
+ * its storage width and compared by text across domains (atom_eq's SYM
+ * vectors take the same rule, sym_vec_eq); a STR column by content (a descriptor holds a
  * pool offset and a cached hash).  Other columns take atom_eq. */
 static int atom_eq_cell_col(ray_t* a, ray_t* b) {
     if (a->type != b->type || a->len != b->len ||
@@ -1632,6 +1632,20 @@ static int atom_eq_cell_col(ray_t* a, ray_t* b) {
         }
     }
     return 1;
+}
+
+/* Two SYM vectors are equal when every cell is the same symbol, whatever
+ * domain or width each stores it in: positions within one domain, text
+ * across two.  Comparing len * 8 raw bytes read past a narrow vector and
+ * told the same symbols at two widths apart (#1311).  It reads borrowed
+ * cells only and interns nothing, so it is safe in a pool worker. */
+static int sym_vec_eq(ray_t* a, ray_t* b) {
+    if (a->len != b->len) return 0;
+    if (ray_sym_vec_domain(a) == ray_sym_vec_domain(b) &&
+        RAY_SYM_ELEM(a->attrs) == RAY_SYM_ELEM(b->attrs))
+        return memcmp(ray_data(a), ray_data(b),
+                      (size_t)a->len * RAY_SYM_ELEM(a->attrs)) == 0;
+    return atom_eq_cell_col(a, b);
 }
 
 /* Helper: compare two atoms for equality (value-based) */
@@ -1728,6 +1742,8 @@ int atom_eq(ray_t* a, ray_t* b) {
         if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
         return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
+    case RAY_SYM:
+        return b->type == RAY_SYM && sym_vec_eq(a, b);
     default:
         /* Vector equality: same type and length, element-wise comparison */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
