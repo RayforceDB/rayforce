@@ -21341,7 +21341,15 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 if (kid == from_id || kid == where_id || kid == by_id ||
                     kid == take_id || kid == asc_id || kid == desc_id ||
                     kid == nearest_id) continue;
-                if (!is_group_dag_agg_expr(dict_elems[i + 1], tbl)) defer_ok = false;
+                /* The output must lower on the DAG, not only look like an
+                 * aggregate: one that does not — (avg (+ d 1)) over a DATE
+                 * column, temporal arithmetic the DAG leaves to the builtin —
+                 * goes to the per-group route, which reads the key column
+                 * by the deferred alias the table does not have (#1306). */
+                ray_t* probe_err = NULL;
+                if (!is_group_dag_agg_expr_dag_safe(dict_elems[i + 1], tbl, &probe_err))
+                    defer_ok = false;
+                if (probe_err) ray_error_free(probe_err);
             }
             for (int64_t i = 0; i < nk && defer_ok; i++) {
                 ray_t* k = d_elems[i * 2];
