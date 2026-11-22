@@ -1,0 +1,276 @@
+;; pivot_names.rfl — pivot names its value columns one way on both routes (#1397).
+;; @requires: posix
+;;
+;; OP_PIVOT (sum avg min max count first last, pivot.c exec_pivot) and the
+;; generic route (med and lambdas, tblop.c) named their columns apart: BOOL
+;; true false / false true, I32 and I16 1 2 / col1 col2, U8 and TIMESPAN
+;; col1 col2, DATE TIME TIMESTAMP raw counts (a parted date 8766 8767) /
+;; col1 col2.  OP_PIVOT dropped the rows whose pivot value is null; the
+;; generic route kept them under -9223372036854775808, nan or col2147483648;
+;; a null symbol gave an empty name.  %g gave 1.0000001 and 1.0000002 one
+;; name, and a pivot value equal to an index column's name a second k.
+;;
+;; The rule, the same code on both routes (tblop.c pivot_col_names):
+;;  - a column is named (format "%" v): dates and times as such, every
+;;    integer width in decimal, U8 as 0x.., BOOL true/false, F64 as %g, F32
+;;    with its e, GUID as text;
+;;  - a null pivot value keeps its rows, as one column named by the type's
+;;    null (0Nl, 0Nd, ...; the null symbol as ');
+;;  - columns come in the order each value is first seen, the null too;
+;;  - floats whose texts coincide take their round-trip digits;
+;;  - a name an index column or an earlier column holds takes the smallest
+;;    suffix _1, _2, ... no column has.
+;;
+;; One table W holds a pivot column per type, k a a b b c, v 1..5; each
+;; pivot column is X N Y X N (N null where the type has one), so the names
+;; are X N Y.  P is W in two partitions.
+
+(set W (table [k v pI64 pI32 pI16 pU8 pBOOL pBOOLF pF64 pF32 pDATE pTIME pTIMESTAMP pTIMESPAN pSYM pGUID] (list [a a b b c] [1 2 3 4 5] [1 0Nl 2 1 0Nl] (as 'I32 [1 0Nl 2 1 0Nl]) (as 'I16 [1 0Nl 2 1 0Nl]) (as 'U8 [1 3 2 1 3]) (as 'BOOL [1 0 0 1 0]) (as 'BOOL [0 1 1 0 1]) (as 'F64 [1.5 0Nl 2 1.5 0Nl]) (as 'F32 [1.5 0Nl 2 1.5 0Nl]) (as 'DATE [8766 0Nl 8767 8766 0Nl]) (as 'TIME [34200000 0Nl 36000000 34200000 0Nl]) (as 'TIMESTAMP [1000 0Nl 2000 1000 0Nl]) (as 'TIMESPAN [1 0Nl 2 1 0Nl]) (as 'SYM (list "x" "" "y" "x" "")) (as 'GUID (list "00000001-1111-1111-1111-111111111111" "" "00000002-1111-1111-1111-111111111111" "00000001-1111-1111-1111-111111111111" "")))))
+(.sys.exec "rm -rf /tmp/rfl_pivot_names")
+(.db.splayed.set "/tmp/rfl_pivot_names/2024.01.01/t/" (take W 2) "/tmp/rfl_pivot_names/.sym")
+(.db.splayed.set "/tmp/rfl_pivot_names/2024.01.02/t/" (drop W 2) "/tmp/rfl_pivot_names/.sym")
+(set P (.db.parted.get "/tmp/rfl_pivot_names" 't))
+(count P) -- 5
+;; the rows a pivot's value columns count: none is lost
+(set tot (fn [R] (sum (map (fn [c] (sum (at R c))) (drop (cols R) 1)))))
+;; ---- flat table
+;; I64
+(key (pivot W 'k 'pI64 'v sum)) -- (as 'SYM (list "k" "1" "0Nl" "2"))
+(key (pivot W 'k 'pI64 'v med)) -- (as 'SYM (list "k" "1" "0Nl" "2"))
+(identical (pivot W 'k 'pI64 'v sum) (pivot W 'k 'pI64 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pI64 'v count)) -- 5
+(tot (pivot W 'k 'pI64 'v (fn [x] (count x)))) -- 5
+;; I32
+(key (pivot W 'k 'pI32 'v sum)) -- (as 'SYM (list "k" "1" "0Ni" "2"))
+(key (pivot W 'k 'pI32 'v med)) -- (as 'SYM (list "k" "1" "0Ni" "2"))
+(identical (pivot W 'k 'pI32 'v sum) (pivot W 'k 'pI32 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pI32 'v count)) -- 5
+(tot (pivot W 'k 'pI32 'v (fn [x] (count x)))) -- 5
+;; I16
+(key (pivot W 'k 'pI16 'v sum)) -- (as 'SYM (list "k" "1" "0Nh" "2"))
+(key (pivot W 'k 'pI16 'v med)) -- (as 'SYM (list "k" "1" "0Nh" "2"))
+(identical (pivot W 'k 'pI16 'v sum) (pivot W 'k 'pI16 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pI16 'v count)) -- 5
+(tot (pivot W 'k 'pI16 'v (fn [x] (count x)))) -- 5
+;; U8
+(key (pivot W 'k 'pU8 'v sum)) -- (as 'SYM (list "k" "0x01" "0x03" "0x02"))
+(key (pivot W 'k 'pU8 'v med)) -- (as 'SYM (list "k" "0x01" "0x03" "0x02"))
+(identical (pivot W 'k 'pU8 'v sum) (pivot W 'k 'pU8 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pU8 'v count)) -- 5
+(tot (pivot W 'k 'pU8 'v (fn [x] (count x)))) -- 5
+;; BOOL
+(key (pivot W 'k 'pBOOL 'v sum)) -- (as 'SYM (list "k" "true" "false"))
+(key (pivot W 'k 'pBOOL 'v med)) -- (as 'SYM (list "k" "true" "false"))
+(identical (pivot W 'k 'pBOOL 'v sum) (pivot W 'k 'pBOOL 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pBOOL 'v count)) -- 5
+(tot (pivot W 'k 'pBOOL 'v (fn [x] (count x)))) -- 5
+;; BOOLF
+(key (pivot W 'k 'pBOOLF 'v sum)) -- (as 'SYM (list "k" "false" "true"))
+(key (pivot W 'k 'pBOOLF 'v med)) -- (as 'SYM (list "k" "false" "true"))
+(identical (pivot W 'k 'pBOOLF 'v sum) (pivot W 'k 'pBOOLF 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pBOOLF 'v count)) -- 5
+(tot (pivot W 'k 'pBOOLF 'v (fn [x] (count x)))) -- 5
+;; F64
+(key (pivot W 'k 'pF64 'v sum)) -- (as 'SYM (list "k" "1.5" "0Nf" "2"))
+(key (pivot W 'k 'pF64 'v med)) -- (as 'SYM (list "k" "1.5" "0Nf" "2"))
+(identical (pivot W 'k 'pF64 'v sum) (pivot W 'k 'pF64 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pF64 'v count)) -- 5
+(tot (pivot W 'k 'pF64 'v (fn [x] (count x)))) -- 5
+;; F32
+(key (pivot W 'k 'pF32 'v sum)) -- (as 'SYM (list "k" "1.5e" "0Ne" "2.0e"))
+(key (pivot W 'k 'pF32 'v med)) -- (as 'SYM (list "k" "1.5e" "0Ne" "2.0e"))
+(identical (pivot W 'k 'pF32 'v sum) (pivot W 'k 'pF32 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pF32 'v count)) -- 5
+(tot (pivot W 'k 'pF32 'v (fn [x] (count x)))) -- 5
+;; DATE
+(key (pivot W 'k 'pDATE 'v sum)) -- (as 'SYM (list "k" "2024.01.01" "0Nd" "2024.01.02"))
+(key (pivot W 'k 'pDATE 'v med)) -- (as 'SYM (list "k" "2024.01.01" "0Nd" "2024.01.02"))
+(identical (pivot W 'k 'pDATE 'v sum) (pivot W 'k 'pDATE 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pDATE 'v count)) -- 5
+(tot (pivot W 'k 'pDATE 'v (fn [x] (count x)))) -- 5
+;; TIME
+(key (pivot W 'k 'pTIME 'v sum)) -- (as 'SYM (list "k" "09:30:00.000" "0Nt" "10:00:00.000"))
+(key (pivot W 'k 'pTIME 'v med)) -- (as 'SYM (list "k" "09:30:00.000" "0Nt" "10:00:00.000"))
+(identical (pivot W 'k 'pTIME 'v sum) (pivot W 'k 'pTIME 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pTIME 'v count)) -- 5
+(tot (pivot W 'k 'pTIME 'v (fn [x] (count x)))) -- 5
+;; TIMESTAMP
+(key (pivot W 'k 'pTIMESTAMP 'v sum)) -- (as 'SYM (list "k" "2000.01.01D00:00:00.000001000" "0Np" "2000.01.01D00:00:00.000002000"))
+(key (pivot W 'k 'pTIMESTAMP 'v med)) -- (as 'SYM (list "k" "2000.01.01D00:00:00.000001000" "0Np" "2000.01.01D00:00:00.000002000"))
+(identical (pivot W 'k 'pTIMESTAMP 'v sum) (pivot W 'k 'pTIMESTAMP 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pTIMESTAMP 'v count)) -- 5
+(tot (pivot W 'k 'pTIMESTAMP 'v (fn [x] (count x)))) -- 5
+;; TIMESPAN
+(key (pivot W 'k 'pTIMESPAN 'v sum)) -- (as 'SYM (list "k" "0D00:00:00.000000001" "0Nn" "0D00:00:00.000000002"))
+(key (pivot W 'k 'pTIMESPAN 'v med)) -- (as 'SYM (list "k" "0D00:00:00.000000001" "0Nn" "0D00:00:00.000000002"))
+(identical (pivot W 'k 'pTIMESPAN 'v sum) (pivot W 'k 'pTIMESPAN 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pTIMESPAN 'v count)) -- 5
+(tot (pivot W 'k 'pTIMESPAN 'v (fn [x] (count x)))) -- 5
+;; SYM
+(key (pivot W 'k 'pSYM 'v sum)) -- (as 'SYM (list "k" "x" "'" "y"))
+(key (pivot W 'k 'pSYM 'v med)) -- (as 'SYM (list "k" "x" "'" "y"))
+(identical (pivot W 'k 'pSYM 'v sum) (pivot W 'k 'pSYM 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pSYM 'v count)) -- 5
+(tot (pivot W 'k 'pSYM 'v (fn [x] (count x)))) -- 5
+;; GUID
+(key (pivot W 'k 'pGUID 'v sum)) -- (as 'SYM (list "k" "00000001-1111-1111-1111-111111111111" "0Ng" "00000002-1111-1111-1111-111111111111"))
+(key (pivot W 'k 'pGUID 'v med)) -- (as 'SYM (list "k" "00000001-1111-1111-1111-111111111111" "0Ng" "00000002-1111-1111-1111-111111111111"))
+(identical (pivot W 'k 'pGUID 'v sum) (pivot W 'k 'pGUID 'v (fn [x] (sum x)))) -- true
+(tot (pivot W 'k 'pGUID 'v count)) -- 5
+(tot (pivot W 'k 'pGUID 'v (fn [x] (count x)))) -- 5
+;; ---- parted table
+;; I64
+(key (pivot P 'k 'pI64 'v sum)) -- (as 'SYM (list "k" "1" "0Nl" "2"))
+(key (pivot P 'k 'pI64 'v med)) -- (as 'SYM (list "k" "1" "0Nl" "2"))
+(identical (pivot P 'k 'pI64 'v sum) (pivot P 'k 'pI64 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pI64 'v count)) -- 5
+(tot (pivot P 'k 'pI64 'v (fn [x] (count x)))) -- 5
+;; I32
+(key (pivot P 'k 'pI32 'v sum)) -- (as 'SYM (list "k" "1" "0Ni" "2"))
+(key (pivot P 'k 'pI32 'v med)) -- (as 'SYM (list "k" "1" "0Ni" "2"))
+(identical (pivot P 'k 'pI32 'v sum) (pivot P 'k 'pI32 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pI32 'v count)) -- 5
+(tot (pivot P 'k 'pI32 'v (fn [x] (count x)))) -- 5
+;; I16
+(key (pivot P 'k 'pI16 'v sum)) -- (as 'SYM (list "k" "1" "0Nh" "2"))
+(key (pivot P 'k 'pI16 'v med)) -- (as 'SYM (list "k" "1" "0Nh" "2"))
+(identical (pivot P 'k 'pI16 'v sum) (pivot P 'k 'pI16 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pI16 'v count)) -- 5
+(tot (pivot P 'k 'pI16 'v (fn [x] (count x)))) -- 5
+;; U8
+(key (pivot P 'k 'pU8 'v sum)) -- (as 'SYM (list "k" "0x01" "0x03" "0x02"))
+(key (pivot P 'k 'pU8 'v med)) -- (as 'SYM (list "k" "0x01" "0x03" "0x02"))
+(identical (pivot P 'k 'pU8 'v sum) (pivot P 'k 'pU8 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pU8 'v count)) -- 5
+(tot (pivot P 'k 'pU8 'v (fn [x] (count x)))) -- 5
+;; BOOL
+(key (pivot P 'k 'pBOOL 'v sum)) -- (as 'SYM (list "k" "true" "false"))
+(key (pivot P 'k 'pBOOL 'v med)) -- (as 'SYM (list "k" "true" "false"))
+(identical (pivot P 'k 'pBOOL 'v sum) (pivot P 'k 'pBOOL 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pBOOL 'v count)) -- 5
+(tot (pivot P 'k 'pBOOL 'v (fn [x] (count x)))) -- 5
+;; BOOLF
+(key (pivot P 'k 'pBOOLF 'v sum)) -- (as 'SYM (list "k" "false" "true"))
+(key (pivot P 'k 'pBOOLF 'v med)) -- (as 'SYM (list "k" "false" "true"))
+(identical (pivot P 'k 'pBOOLF 'v sum) (pivot P 'k 'pBOOLF 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pBOOLF 'v count)) -- 5
+(tot (pivot P 'k 'pBOOLF 'v (fn [x] (count x)))) -- 5
+;; F64
+(key (pivot P 'k 'pF64 'v sum)) -- (as 'SYM (list "k" "1.5" "0Nf" "2"))
+(key (pivot P 'k 'pF64 'v med)) -- (as 'SYM (list "k" "1.5" "0Nf" "2"))
+(identical (pivot P 'k 'pF64 'v sum) (pivot P 'k 'pF64 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pF64 'v count)) -- 5
+(tot (pivot P 'k 'pF64 'v (fn [x] (count x)))) -- 5
+;; F32
+(key (pivot P 'k 'pF32 'v sum)) -- (as 'SYM (list "k" "1.5e" "0Ne" "2.0e"))
+(key (pivot P 'k 'pF32 'v med)) -- (as 'SYM (list "k" "1.5e" "0Ne" "2.0e"))
+(identical (pivot P 'k 'pF32 'v sum) (pivot P 'k 'pF32 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pF32 'v count)) -- 5
+(tot (pivot P 'k 'pF32 'v (fn [x] (count x)))) -- 5
+;; DATE
+(key (pivot P 'k 'pDATE 'v sum)) -- (as 'SYM (list "k" "2024.01.01" "0Nd" "2024.01.02"))
+(key (pivot P 'k 'pDATE 'v med)) -- (as 'SYM (list "k" "2024.01.01" "0Nd" "2024.01.02"))
+(identical (pivot P 'k 'pDATE 'v sum) (pivot P 'k 'pDATE 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pDATE 'v count)) -- 5
+(tot (pivot P 'k 'pDATE 'v (fn [x] (count x)))) -- 5
+;; TIME
+(key (pivot P 'k 'pTIME 'v sum)) -- (as 'SYM (list "k" "09:30:00.000" "0Nt" "10:00:00.000"))
+(key (pivot P 'k 'pTIME 'v med)) -- (as 'SYM (list "k" "09:30:00.000" "0Nt" "10:00:00.000"))
+(identical (pivot P 'k 'pTIME 'v sum) (pivot P 'k 'pTIME 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pTIME 'v count)) -- 5
+(tot (pivot P 'k 'pTIME 'v (fn [x] (count x)))) -- 5
+;; TIMESTAMP
+(key (pivot P 'k 'pTIMESTAMP 'v sum)) -- (as 'SYM (list "k" "2000.01.01D00:00:00.000001000" "0Np" "2000.01.01D00:00:00.000002000"))
+(key (pivot P 'k 'pTIMESTAMP 'v med)) -- (as 'SYM (list "k" "2000.01.01D00:00:00.000001000" "0Np" "2000.01.01D00:00:00.000002000"))
+(identical (pivot P 'k 'pTIMESTAMP 'v sum) (pivot P 'k 'pTIMESTAMP 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pTIMESTAMP 'v count)) -- 5
+(tot (pivot P 'k 'pTIMESTAMP 'v (fn [x] (count x)))) -- 5
+;; TIMESPAN
+(key (pivot P 'k 'pTIMESPAN 'v sum)) -- (as 'SYM (list "k" "0D00:00:00.000000001" "0Nn" "0D00:00:00.000000002"))
+(key (pivot P 'k 'pTIMESPAN 'v med)) -- (as 'SYM (list "k" "0D00:00:00.000000001" "0Nn" "0D00:00:00.000000002"))
+(identical (pivot P 'k 'pTIMESPAN 'v sum) (pivot P 'k 'pTIMESPAN 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pTIMESPAN 'v count)) -- 5
+(tot (pivot P 'k 'pTIMESPAN 'v (fn [x] (count x)))) -- 5
+;; SYM
+(key (pivot P 'k 'pSYM 'v sum)) -- (as 'SYM (list "k" "x" "'" "y"))
+(key (pivot P 'k 'pSYM 'v med)) -- (as 'SYM (list "k" "x" "'" "y"))
+(identical (pivot P 'k 'pSYM 'v sum) (pivot P 'k 'pSYM 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pSYM 'v count)) -- 5
+(tot (pivot P 'k 'pSYM 'v (fn [x] (count x)))) -- 5
+;; GUID
+(key (pivot P 'k 'pGUID 'v sum)) -- (as 'SYM (list "k" "00000001-1111-1111-1111-111111111111" "0Ng" "00000002-1111-1111-1111-111111111111"))
+(key (pivot P 'k 'pGUID 'v med)) -- (as 'SYM (list "k" "00000001-1111-1111-1111-111111111111" "0Ng" "00000002-1111-1111-1111-111111111111"))
+(identical (pivot P 'k 'pGUID 'v sum) (pivot P 'k 'pGUID 'v (fn [x] (sum x)))) -- true
+(tot (pivot P 'k 'pGUID 'v count)) -- 5
+(tot (pivot P 'k 'pGUID 'v (fn [x] (count x)))) -- 5
+;; ---- the cells: null rows land in the null column on both routes
+(set E (table (as 'SYM (list "k" "1" "0Nl" "2")) (list [a b c] [1 4 0Nl] [2 0Nl 5] [0Nl 3 0Nl])))
+(identical (pivot W 'k 'pI64 'v sum) E) -- true
+(identical (pivot W 'k 'pI64 'v (fn [x] (sum x))) E) -- true
+(identical (pivot P 'k 'pI64 'v sum) E) -- true
+(identical (pivot P 'k 'pI64 'v (fn [x] (sum x))) E) -- true
+(at (pivot W 'k 'pSYM 'v sum) (as 'SYM "'")) -- [2 0Nl 5]
+(at (pivot W 'k 'pSYM 'v med) (as 'SYM "'")) -- [2.0 0Nf 5.0]
+(at (pivot W 'k 'pDATE 'v sum) (as 'SYM "0Nd")) -- [2 0Nl 5]
+(at (pivot W 'k 'pGUID 'v (fn [x] (sum x))) (as 'SYM "0Ng")) -- [2 0Nl 5]
+;; a pivot column of nulls only
+(set Z (table [k p v] (list [a b a] [0Nl 0Nl 0Nl] [1 2 3])))
+(identical (pivot Z 'k 'p 'v sum) (table (as 'SYM (list "k" "0Nl")) (list [a b] [4 2]))) -- true
+(identical (pivot Z 'k 'p 'v (fn [x] (sum x))) (pivot Z 'k 'p 'v sum)) -- true
+;; null index keys and null pivot values together, two index columns
+(set M (table [k j p v] (list (as 'SYM (list "a" "a" "b" "b" "")) [1 0Nl 1 0Nl 1] [0Nl 0Nl 2 0Nl 2] [1 2 3 4 5])))
+(identical (pivot M [k j] 'p 'v sum) (pivot M [k j] 'p 'v (fn [x] (sum x)))) -- true
+(key (pivot M [k j] 'p 'v sum)) -- (as 'SYM (list "k" "j" "0Nl" "2"))
+(at (pivot M [k j] 'p 'v sum) (as 'SYM "0Nl")) -- [1 2 0Nl 4 0Nl]
+;; ---- a parted table's partition column names its columns as dates
+(key (pivot P 'k 'date 'v sum)) -- (as 'SYM (list "k" "2024.01.01" "2024.01.02"))
+(key (pivot P 'k 'date 'v med)) -- (as 'SYM (list "k" "2024.01.01" "2024.01.02"))
+(identical (pivot P 'k 'date 'v sum) (pivot P 'k 'date 'v (fn [x] (sum x)))) -- true
+;; ---- floats that %g writes alike take their round-trip digits
+(set F (table [k p v] (list [a a b c] [1.0000001 1.0000002 1.0000001 2.5] [1 2 3 4])))
+(key (pivot F 'k 'p 'v sum)) -- (as 'SYM (list "k" "1.0000001" "1.0000002" "2.5"))
+(key (pivot F 'k 'p 'v med)) -- (as 'SYM (list "k" "1.0000001" "1.0000002" "2.5"))
+(identical (pivot F 'k 'p 'v sum) (pivot F 'k 'p 'v (fn [x] (sum x)))) -- true
+(set F2 (table [k p v] (list [a b c] [1e300 1.0000001e300 0.5] [1 2 3])))
+(key (pivot F2 'k 'p 'v sum)) -- (as 'SYM (list "k" "1e+300" "1.0000001e+300" "0.5"))
+(set F3 (table [k p v] (list [a b c] (as 'F32 [1.00001 1.00002 1.5]) [1 2 3])))
+(key (pivot F3 'k 'p 'v sum)) -- (as 'SYM (list "k" "1.00001e" "1.00002e" "1.5e"))
+(key (pivot F3 'k 'p 'v med)) -- (as 'SYM (list "k" "1.00001e" "1.00002e" "1.5e"))
+;; ---- a name an index column or an earlier column holds takes a suffix
+(set S (table [k p v] (list [a a b] ['x 'k 'x] [10 20 30])))
+(key (pivot S 'k 'p 'v sum)) -- (as 'SYM (list "k" "x" "k_1"))
+(key (pivot S 'k 'p 'v med)) -- (as 'SYM (list "k" "x" "k_1"))
+(identical (pivot S 'k 'p 'v sum) (pivot S 'k 'p 'v (fn [x] (sum x)))) -- true
+(at (pivot S 'k 'p 'v sum) 'k_1) -- [20 0Nl]
+;; k_1 is a value's own name, so the colliding k skips to k_2
+(set S2 (table [k p v] (list [a b c d] ['k 'k_1 'x 'k] [1 2 3 4])))
+(key (pivot S2 'k 'p 'v sum)) -- (as 'SYM (list "k" "k_2" "k_1" "x"))
+(key (pivot S2 'k 'p 'v med)) -- (as 'SYM (list "k" "k_2" "k_1" "x"))
+;; two index columns: either name collides
+(set S3 (table [k j p v] (list [a b] [1 2] ['j 'k] [1 2])))
+(key (pivot S3 [k j] 'p 'v sum)) -- (as 'SYM (list "k" "j" "j_1" "k_1"))
+(key (pivot S3 [k j] 'p 'v med)) -- (as 'SYM (list "k" "j" "j_1" "k_1"))
+;; a value equal to the null symbol's name
+(set S4 (table [k p v] (list [a b] (as 'SYM (list "'" "")) [1 2])))
+(key (pivot S4 'k 'p 'v sum)) -- (as 'SYM (list "k" "'" "'_1"))
+(key (pivot S4 'k 'p 'v med)) -- (as 'SYM (list "k" "'" "'_1"))
+;; ---- a STR pivot column cannot name columns, on either route
+(set R (table [k p v] (list [a b] (list "x" "y") [1 2])))
+(pivot R 'k 'p 'v sum) !- nyi
+(pivot R 'k 'p 'v med) !- nyi
+;; ---- the column order: first seen, on both routes (the generic route
+;; ordered numbers as distinct sorts them), and so are the index rows
+(set O (table [k p v] (list [3 1 3 2] [30 10 20 10] [1 2 3 4])))
+(key (pivot O 'k 'p 'v sum)) -- (as 'SYM (list "k" "30" "10" "20"))
+(identical (pivot O 'k 'p 'v sum) (pivot O 'k 'p 'v (fn [x] (sum x)))) -- true
+(at (pivot O 'k 'p 'v med) 'k) -- [3 1 2]
+;; past the parallel threshold: every type's nulls and order agree
+(set N 200000)
+(set B (table [k p v] (list (% (* 7 (til N)) 5) (at (concat [0Nl] (- (til 7) 3)) (% (+ 5 (* 13 (til N))) 8)) (til N))))
+(key (pivot B 'k 'p 'v sum)) -- (as 'SYM (list "k" "1" "-2" "3" "0" "-3" "2" "-1" "0Nl"))
+(identical (pivot B 'k 'p 'v sum) (pivot B 'k 'p 'v (fn [x] (sum x)))) -- true
+(tot (pivot B 'k 'p 'v count)) -- N
+(set B2 (table [k p v] (list (at B 'k) (as 'DATE (at B 'p)) (at B 'v))))
+(identical (pivot B2 'k 'p 'v sum) (pivot B2 'k 'p 'v (fn [x] (sum x)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_pivot_names")
+

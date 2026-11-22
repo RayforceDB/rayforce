@@ -177,7 +177,7 @@ Use the specialized running verbs (`sums`, `prds`, `avgs`, `mins`, `maxs`) and m
 └─────────────────────────────────────┘
 ```
 
-The distinct values of the column key (`Product`) become the new column headers. Use any aggregation function: `sum`, `avg`, `count`, `min`, `max`, `first`, `last`, `med`, or a custom lambda like `(fn [x] (sum (* x x)))`.
+The distinct values of the column key (`Product`) become the new column headers, in the order they first appear, each named as `(format "%" v)` writes it: a date key gives columns like `2024.01.01`, and rows with a null key are kept under a column named by the null (`0Nl`). See [Column names](../queries/pivot.md#column-names) for floats and name collisions. Use any aggregation function: `sum`, `avg`, `count`, `min`, `max`, `first`, `last`, `med`, or a custom lambda like `(fn [x] (sum (* x x)))`.
 
 ## 5. ASOF Joins { #asof-join }
 

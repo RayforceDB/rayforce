@@ -77,6 +77,10 @@ ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause);
  * back the same way whichever printer wrote it. */
 const char* ray_fmt_null_literal(int8_t type);
 
+/* The text (format "%" a) gives `a`: in buf (cap >= 64) or borrowed from
+ * `a` (returns NULL), inside the returned owned STR, or an error. */
+ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len);
+
 /* Display settings */
 void ray_fmt_set_precision(int digits);
 void ray_fmt_set_width(int cols);
