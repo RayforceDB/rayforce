@@ -163,7 +163,9 @@ ray_t* ray_sub_fn(ray_t* a, ray_t* b) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(a->type);
     }
-    if (is_numeric(a) && is_temporal(b)) {
+    /* int - TIME is the one int-minus-temporal pair; int - DATE / TIMESTAMP
+     * falls to the type error below, a null on either side included (#1336). */
+    if (is_numeric(a) && b->type == -RAY_TIME) {
         if (RAY_ATOM_IS_NULL(a) || RAY_ATOM_IS_NULL(b))
             return ray_typed_null(b->type);
     }

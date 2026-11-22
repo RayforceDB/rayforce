@@ -258,3 +258,61 @@
 (identical (at (select {r: (+ x d) from: BQ where: (> c 4)}) 'r) (+ (at BI32 (where (> (% (til n) 10) 4))) (at BD (where (> (% (til n) 10) 4))))) -- true
 (select {a: (avg (+ d 1)) lo: (min (+ s y)) from: BQ by: g}) -- (table (as 'SYM (list "g" "a" "lo")) (list [0 1 2 3 4 5 6] [-16347507.825325325 -16414999.863563564 -16516998.088688688 -16404004.57977978 -16291011.07087087 -16178017.561961962 -16065024.053053053] [1707.10.08D22:55:48.151319930 1707.10.31D09:08:49.126752578 1707.11.22D19:21:50.102185226 1707.12.15D05:34:51.077617874 1708.01.06D15:47:52.053050522 1707.09.23D23:16:26.650764040 1707.09.23D09:13:51.849395959]))
 (select {r: (avg (if (> c 4) d (+ d 1))) from: BQ by: g}) -- (table (as 'SYM (list "g" "r")) (list [0 1 2 3 4 5 6] [-16347508.325825825 -16415000.364064064 -16516998.589189189 -16404005.08028028 -16291011.57137137 -16178018.062462462 -16065024.553553553]))
+
+;; an integer minus a DATE or TIMESTAMP is a type error, and a null on
+;; either side is no exception (#1336): every shape, every integer type,
+;; eager and in a query.  int - TIME stays the one int-minus-temporal pair.
+(try (- 1 2024.01.01) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- 1 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- 0N 2024.01.01) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- 0Nl 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- true 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract b8 and date")
+(try (- (as 'U8 1) 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract u8 and date")
+(try (- 1h 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i16 and date")
+(try (- 1i 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and date")
+(try (- 0Ni 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and date")
+(try (- [1 2] 2024.01.01) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- [1 2] 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- [0Nl 0Nl] 2024.01.01) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- 1 [0Nd 0Nd]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- 0N [2024.01.01 0Nd]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- [1 2] [0Nd 0Nd]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- [1 2] [0Nd 2024.01.01]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- XB8 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract b8 and date")
+(try (- XU8 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract u8 and date")
+(try (- XI16 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i16 and date")
+(try (- XI32 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and date")
+(try (- XI64 0Nd) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (- XI32 (as 'DATE [0Ni 0Ni 0Ni 0Ni 0Ni 0Ni 0Ni])) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and date")
+(try (- XI16 TD) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i16 and date")
+(try (- 1 0Np) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (- 0N 2024.01.01D00:00:00.000000000) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (- 1i 0Np) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and timestamp")
+(try (- [1 2] 0Np) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (- 1 [0Np 0Np]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (- [1 2] [0Np 0Np]) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (- XU8 TS) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract u8 and timestamp")
+(set NQ (table [a b u h i d e p] (list [1 2 3] (as 'B8 [1 0 1]) (as 'U8 [1 2 3]) [1h 2h 3h] [1i 2i 3i] [0Nd 0Nd 0Nd] [0Nd 2024.01.01 0Nd] [0Np 0Np 0Np])))
+(try (select {r: (- a d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- a e) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- a 0Nd) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- 1 d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- b d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract b8 and date")
+(try (select {r: (- u 0Nd) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract u8 and date")
+(try (select {r: (- h d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i16 and date")
+(try (select {r: (- i d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and date")
+(try (select {r: (- (+ a 1) d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- a d) from: NQ where: (> a 1)}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (sum (- a d)) from: NQ by: b}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (select {r: (- a p) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and timestamp")
+(try (select {r: (- i 0Np) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i32 and timestamp")
+(try (update {r: (- a d) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (update {r: (- a 0Nd) from: NQ where: (> a 1)}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract i64 and date")
+(try (update {r: (- u p) from: NQ}) (fn [e] (list (at e 'code) (at e 'msg)))) -- (list 'type "cannot subtract u8 and timestamp")
+;; controls: int + null DATE and null DATE - int stay null DATEs, int - null TIME stays a null TIME
+(repr (list (+ 1 0Nd) (+ 0Nd 1) (+ [1 2] 0Nd) (+ 1 [0Nd 0Nd]) (- 0Nd 1) (- 0Nd [1 2]) (- [0Nd 0Nd] 1) (- [0Nd 2024.01.01] [1 2]))) -- "(list 0Nd 0Nd [0Nd 0Nd] [0Nd 0Nd] 0Nd [0Nd 0Nd] [0Nd 0Nd] [0Nd 2023.12.30])"
+(repr (list (+ 1 0Np) (- 0Np 1) (- [0Np 0Np] [1 2]))) -- "(list 0Np 0Np [0Np 0Np])"
+(repr (list (- 1 0Nt) (- 0N 12:00:00.000) (- [1 2] 0Nt) (- 1 [0Nt 0Nt]) (- [1 2] [0Nt 00:00:00.005]) (- (as 'U8 1) 0Nt) (- 1h 0Nt) (- 1i 0Nt) (- true 0Nt))) -- "(list 0Nt 0Nt [0Nt 0Nt] [0Nt 0Nt] [0Nt -00:00:00.003] 0Nt 0Nt 0Nt 0Nt)"
+(at (select {r: (+ a d) s: (- d a) t: (- a 0Nt) from: NQ}) 'r) -- (as 'DATE [0Ni 0Ni 0Ni])
+(repr (at (select {r: (+ a d) s: (- d a) t: (- a 0Nt) from: NQ}) 't)) -- "[0Nt 0Nt 0Nt]"
+(repr (at (update {r: (- u 0Nt) from: NQ}) 'r)) -- "[0Nt 0Nt 0Nt]"

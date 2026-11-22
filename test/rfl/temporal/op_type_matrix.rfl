@@ -2,9 +2,11 @@
 ;; each other and against I64, I32 and F64 (#1081), in atom, null-atom,
 ;; vector, vector-atom and select forms.  Generated from a differential
 ;; sweep against dev: only TIME +/- TIME and TIMESPAN, and TIME div, / and
-;; xbar with a TIMESPAN, answer differently from dev.  Pins the rest so a
-;; temporal rule cannot bleed into another operator unnoticed.  Temporal values
-;; are compared as their I64 counts (large hours or years do not parse).
+;; xbar with a TIMESPAN, answer differently from dev, and an integer minus a
+;; null DATE or TIMESTAMP is the type error any DATE or TIMESTAMP gives (#1336).
+;; Pins the rest so a temporal rule cannot bleed into another operator
+;; unnoticed.  Temporal values are compared as their I64 counts (large hours
+;; or years do not parse).
 ;;
 ;; Pairs whose vector and query forms already disagree on dev are listed at
 ;; the end and not pinned.
@@ -2402,7 +2404,7 @@
 (type (at (select {r: (+ x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) 'r)) -- 'DATE
 (as 'I64 (at (select {r: (+ x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) 'r)) -- [8773 0Nl -3 7]
 (- 2 2024.03.01) !- type
-(as 'I64 (- 2 0Nd)) -- 0Nl
+(- 2 0Nd) !- type
 (- [3 0Nl -2 7] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)) !- type
 (- [3 0Nl -2 7] 2024.03.01) !- type
 (select {r: (- x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) !- type
@@ -2445,7 +2447,7 @@
 (type (at (select {r: (+ x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) 'r)) -- 'TIMESTAMP
 (as 'I64 (at (select {r: (+ x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) 'r)) -- [757503000123456792 0Nl -3600000000002 8]
 (- 2 2024.01.01D10:45:00.000000000) !- type
-(as 'I64 (- 2 0Np)) -- 0Nl
+(- 2 0Np) !- type
 (- [3 0Nl -2 7] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)) !- type
 (- [3 0Nl -2 7] 2024.01.01D10:45:00.000000000) !- type
 (select {r: (- x y) from: (table [x y] (list [3 0Nl -2 7] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) !- type
@@ -2641,7 +2643,7 @@
 (type (at (select {r: (+ x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) 'r)) -- 'DATE
 (as 'I64 (at (select {r: (+ x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) 'r)) -- [8773 0Nl -3 7]
 (- 2i 2024.03.01) !- type
-(as 'I64 (- 2i 0Nd)) -- 0Nl
+(- 2i 0Nd) !- type
 (- [3i 0Ni -2i 7i] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)) !- type
 (- [3i 0Ni -2i 7i] 2024.03.01) !- type
 (select {r: (- x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.05 0Nd 1999.12.31 2000.01.01)))}) !- type
@@ -2684,7 +2686,7 @@
 (type (at (select {r: (+ x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) 'r)) -- 'TIMESTAMP
 (as 'I64 (at (select {r: (+ x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) 'r)) -- [757503000123456792 0Nl -3600000000002 8]
 (- 2i 2024.01.01D10:45:00.000000000) !- type
-(as 'I64 (- 2i 0Np)) -- 0Nl
+(- 2i 0Np) !- type
 (- [3i 0Ni -2i 7i] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)) !- type
 (- [3i 0Ni -2i 7i] 2024.01.01D10:45:00.000000000) !- type
 (select {r: (- x y) from: (table [x y] (list [3i 0Ni -2i 7i] (enlist 2024.01.02D09:30:00.123456789 0Np 1999.12.31D23:00:00.000000000 2000.01.01D00:00:00.000000001)))}) !- type
