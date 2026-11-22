@@ -28628,7 +28628,7 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
-                                  ray_t* rows) {
+                                  ray_t* mask) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
@@ -28637,9 +28637,17 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
             op = ray_optimize(g, op);
-            g->xbar_rows = rows;          /* borrowed; the rows where: updates */
+            /* Under where: (mask, one BOOL per row) an xbar buckets the
+             * matched rows only.  Their selection is built only when the
+             * plan holds an xbar, so any other update pays nothing. */
+            ray_t* rows = NULL;
+            if (mask)
+                for (uint32_t i = 0; i < g->node_count; i++)
+                    if (g->nodes[i].flags & OP_FLAG_XBAR) { rows = ray_rowsel_from_pred(mask); break; }
+            g->xbar_rows = rows;          /* the rows where: updates */
             out = ray_execute(g, op);
             g->xbar_rows = NULL;
+            if (rows) ray_rowsel_release(rows);
         } else {
             cerr = graph_take_compile_err(g);
             if (dag_declined) *dag_declined = true;
@@ -28706,11 +28714,8 @@ static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
  * on the matched rows only, so an xbar buckets those alone; a dropped row
  * keeps its old value and never raises, as in a select (#1355). */
 static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
-    ray_t* rows = mask && mask->type == RAY_BOOL && mask->len == ray_table_nrows(tbl)
-                ? ray_rowsel_from_pred(mask) : NULL;
-    ray_t* v = update_eval_on_impl(tbl, expr, true, NULL, rows);
-    if (rows) ray_rowsel_release(rows);
-    return v;
+    bool ok = mask && mask->type == RAY_BOOL && mask->len == ray_table_nrows(tbl);
+    return update_eval_on_impl(tbl, expr, true, NULL, ok ? mask : NULL);
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
