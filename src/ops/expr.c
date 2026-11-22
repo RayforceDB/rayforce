@@ -2400,9 +2400,18 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
         } else { /* both bool */
             const uint8_t* a = (const uint8_t*)ap;
             const uint8_t* b = (const uint8_t*)bp;
+            /* The operands of a comparison of two predicates stay in byte lanes
+             * (see the promotion above); a BOOL has no null, and false < true.
+             * With no case here `(== p p)` wrote nothing and came out all false. */
             switch (opcode) {
                 case OP_AND: for (int64_t j = 0; j < n; j++) d[j] = a[j] && b[j]; break;
                 case OP_OR:  for (int64_t j = 0; j < n; j++) d[j] = a[j] || b[j]; break;
+                case OP_EQ:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) == (b[j] != 0); break;
+                case OP_NE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) != (b[j] != 0); break;
+                case OP_LT:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) <  (b[j] != 0); break;
+                case OP_LE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) <= (b[j] != 0); break;
+                case OP_GT:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) >  (b[j] != 0); break;
+                case OP_GE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) >= (b[j] != 0); break;
                 default: break;
             }
         }
