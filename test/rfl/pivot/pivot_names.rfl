@@ -272,5 +272,24 @@
 (tot (pivot B 'k 'p 'v count)) -- N
 (set B2 (table [k p v] (list (at B 'k) (as 'DATE (at B 'p)) (at B 'v))))
 (identical (pivot B2 'k 'p 'v sum) (pivot B2 'k 'p 'v (fn [x] (sum x)))) -- true
+;; ---- -0.0 and F64 nulls together: the -0.0 fold rebuilt the pivot column
+;; without its null flag, so the generic route grouped each NaN null apart
+;; and raised "pivot value without a source row" (OP_PIVOT was right)
+(set Q (table [k p v] (list [a b c] [0Nf -0.0 0Nf] [10 20 30])))
+(identical (pivot Q 'k 'p 'v med) (table (as 'SYM (list "k" "0Nf" "0")) (list [a b c] [10.0 0Nf 30.0] [0Nf 20.0 0Nf]))) -- true
+(identical (pivot Q 'k 'p 'v sum) (table (as 'SYM (list "k" "0Nf" "0")) (list [a b c] [10 0Nl 30] [0Nl 20 0Nl]))) -- true
+(identical (pivot Q 'k 'p 'v sum) (pivot Q 'k 'p 'v (fn [x] (sum x)))) -- true
+;; more groups, both zero signs, a group holding both a null and a zero
+(set Q2 (table [k p v] (list [a b c d e a] [0Nf -0.0 0Nf 0.0 0Nf -0.0] [1 2 3 4 5 6])))
+(set E2 (table (as 'SYM (list "k" "0Nf" "0")) (list [a b c d e] [1 0Nl 3 0Nl 5] [6 2 0Nl 4 0Nl])))
+(identical (pivot Q2 'k 'p 'v sum) E2) -- true
+(identical (pivot Q2 'k 'p 'v (fn [x] (sum x))) E2) -- true
+(key (pivot Q2 'k 'p 'v med)) -- (as 'SYM (list "k" "0Nf" "0"))
+(tot (pivot Q2 'k 'p 'v count)) -- 6
+(tot (pivot Q2 'k 'p 'v (fn [x] (count x)))) -- 6
+;; two null rows of one index row are one cell
+(set Q3 (table [k p v] (list [a a b] [0Nf 0Nf -0.0] [1 2 4])))
+(identical (pivot Q3 'k 'p 'v (fn [x] (sum x))) (table (as 'SYM (list "k" "0Nf" "0")) (list [a b] [3 0Nl] [0Nl 4]))) -- true
+(identical (pivot Q3 'k 'p 'v sum) (pivot Q3 'k 'p 'v (fn [x] (sum x)))) -- true
 (.sys.exec "rm -rf /tmp/rfl_pivot_names")
 

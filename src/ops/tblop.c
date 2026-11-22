@@ -82,6 +82,9 @@ static ray_t* pivot_normalize_f64_key(ray_t* tbl, int64_t pcol_name) {
     norm->len = nr;
     double* dst = (double*)ray_data(norm);
     for (int64_t i = 0; i < nr; i++) dst[i] = clear_neg_zero(src[i]);
+    /* keep the null flag: without it the group took each NaN null for a
+     * value of its own (#1397) */
+    if (ray_vec_may_have_nulls(pcol)) norm->attrs |= RAY_ATTR_HAS_NULLS;
     int64_t ncols = ray_table_ncols(tbl);
     ray_t* wt = ray_table_new(ncols);
     if (!wt || RAY_IS_ERR(wt)) { ray_release(norm); return wt ? wt : ray_error("oom", NULL); }
@@ -323,6 +326,55 @@ ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl) {
     return out;
 }
 
+/* The generic route's pivot value number per group of `g_pcol` (the
+ * grouped table's pivot column), in group order: an I64 vector of n_grps,
+ * *n_pv the count.  Equal cells share a number as atom_eq compares them,
+ * hashed as FB_CELL_HASH does (every null alike).  NULL on oom. */
+static __attribute__((noinline)) ray_t* pivot_fb_number_values(ray_t* g_pcol, int64_t n_grps, int64_t* n_pv) {
+    ray_t* out = ray_vec_new(RAY_I64, n_grps);
+    if (!out || RAY_IS_ERR(out)) return out;
+    out->len = n_grps;
+    int64_t* num = (int64_t*)ray_data(out);
+    uint64_t cap = 16;
+    while (cap < 2 * (uint64_t)n_grps) cap <<= 1;
+    ray_t* ht_hdr = NULL;
+    int64_t* ht = (int64_t*)scratch_alloc(&ht_hdr, (size_t)cap * sizeof(int64_t));
+    if (!ht) { ray_release(out); return NULL; }
+    memset(ht, 0xFF, (size_t)cap * sizeof(int64_t));
+    uint64_t mask = cap - 1;
+    bool nullable = (g_pcol->attrs & (RAY_ATTR_HAS_NULLS | RAY_ATTR_SLICE)) != 0;
+    int64_t n = 0;
+    for (int64_t gi = 0; gi < n_grps; gi++) {
+        uint64_t h;
+        if (g_pcol->type == RAY_STR || g_pcol->type == RAY_GUID)
+            h = fb_wide_hash(g_pcol, gi, 0);
+        else if (nullable && ray_vec_is_null(g_pcol, gi))
+            h = 0x9E3779B97F4A7C15ULL;
+        else if (g_pcol->type == RAY_F64) {
+            double d = ((const double*)ray_data(g_pcol))[gi];
+            h = d != d ? 0x9E3779B97F4A7C15ULL : ray_hash_f64(d);   /* NaN is the F64 null */
+        } else
+            h = ray_hash_i64(read_col_i64(ray_data(g_pcol), gi, g_pcol->type, g_pcol->attrs));
+        uint64_t slot = h & mask;
+        int a1 = 0;
+        ray_t* v = collection_elem(g_pcol, gi, &a1);
+        num[gi] = -1;
+        while (ht[slot] >= 0) {
+            int a2 = 0;
+            ray_t* w = collection_elem(g_pcol, ht[slot], &a2);
+            bool eq = atom_eq(v, w);
+            if (a2) ray_release(w);
+            if (eq) { num[gi] = num[ht[slot]]; break; }
+            slot = (slot + 1) & mask;
+        }
+        if (a1) ray_release(v);
+        if (num[gi] < 0) { ht[slot] = gi; num[gi] = n++; }
+    }
+    scratch_free(ht_hdr);
+    *n_pv = n;
+    return out;
+}
+
 /* The generic route's index rows in the order of their first source row:
  * ix_row[r] (a source row of index row r) becomes its first one, the
  * least gm_row (each group's first source row) of its groups, and the
@@ -349,7 +401,7 @@ static __attribute__((noinline)) bool pivot_fb_order_rows(int64_t* ix_row, int64
 /* The generic route's value columns, added to `result` (consumed; the
  * result or an error comes back): one per pivot value p (gm_pv), in the
  * order of its first source row (gm_row per group), as OP_PIVOT orders
- * them (dvals comes sorted for numbers), named by pivot_col_names from
+ * them (distinct would sort numbers), named by pivot_col_names from
  * that row; cell (r, p) is the result ar[gi] of the group gi at index row
  * gm_ix[gi].  Out of line, as pivot_fb_order_rows. */
 static __attribute__((noinline)) ray_t* pivot_fb_value_cols(ray_t* result, ray_t* pcol, int64_t n_ix, int64_t n_pv,
@@ -640,21 +692,15 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
         return g_pcol;
     }
 
-    /* Collect distinct pivot values and index keys from grouped table.
-     * ray_distinct_fn returns a lazy for concrete vecs; materialise here
-     * since pivot C-code needs a concrete result to iterate over. */
-    ray_retain(g_pcol);
-    ray_t* dvals = ray_distinct_fn(g_pcol);
-    ray_release(g_pcol);
-    if (RAY_IS_ERR(dvals)) { scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr); return dvals; }
-    if (ray_is_lazy(dvals)) {
-        dvals = ray_lazy_materialize(dvals);
-        if (!dvals || RAY_IS_ERR(dvals)) {
-            scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
-            return dvals ? dvals : ray_error("oom", NULL);
-        }
+    /* Number the pivot values from the groups themselves: dvals[gi] is
+     * group gi's pivot value number (distinct over g_pcol could disagree
+     * with the groups, as when it counted two NaN nulls apart). */
+    int64_t n_pv = 0;
+    ray_t* dvals = pivot_fb_number_values(g_pcol, n_grps, &n_pv);
+    if (!dvals || RAY_IS_ERR(dvals)) {
+        scratch_free(g_icols_hdr); ray_release(grouped); scratch_free(ic_hdr);
+        return dvals ? dvals : ray_error("oom", NULL);
     }
-    int64_t n_pv = ray_len(dvals);
 
     /* Re-scan original table to assign a grouped-row index to each
      * input row.  Previously this was an O(nrows * n_grps) nested loop
@@ -866,18 +912,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     ray_t* ix_list = ray_list_new(16);
 
     for (int64_t gi = 0; gi < n_grps; gi++) {
-        /* Find pivot index */
-        int a1 = 0;
-        ray_t* pv = collection_elem(g_pcol, gi, &a1);
-        gm_pv[gi] = -1;
-        for (int64_t p = 0; p < n_pv; p++) {
-            int a2 = 0;
-            ray_t* dv = collection_elem(dvals, p, &a2);
-            bool eq = atom_eq(pv, dv);
-            if (a2) ray_release(dv);
-            if (eq) { gm_pv[gi] = p; break; }
-        }
-        if (a1) ray_release(pv);
+        gm_pv[gi] = ((const int64_t*)ray_data(dvals))[gi];
 
         /* Find or insert index key */
         gm_ix[gi] = -1;
