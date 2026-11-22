@@ -1823,7 +1823,45 @@ int atom_eq(ray_t* a, ray_t* b) {
  * TIMESPAN anywhere sends atom_eq through ray_timespan_binary, which
  * rounds numbers and reads TIME as ns (RAY_KEY_SPAN_ATOM normalizes atoms
  * the same way) and compares a TIMESPAN vector element by element with
- * other types (RAY_KEY_SPAN_VEC puts every vector in one bucket). */
+ * other types (RAY_KEY_SPAN_VEC normalizes those vectors' elements so,
+ * span_vec_hash). */
+/* Under RAY_KEY_SPAN_VEC, a vector of a type atom_eq compares with a
+ * TIMESPAN vector (ray_timespan_binary, span_eval per element): its length
+ * and each element as the number span_eval compares, hashed as the atom
+ * arm hashes atoms beside a TIMESPAN.  TIME is ns, a TIMESTAMP its time of
+ * day, a float rounded (so an equal integer meets it).  span_eval calls
+ * two nulls equal whatever their types, so every null hashes alike.  Two
+ * such vectors of one type that memcmp equal hash equal too.  False for
+ * any other type (SYM, STR, GUID, DATE): atom_eq never calls one equal to
+ * a TIMESPAN vector, so it keeps its content hash. */
+static bool span_vec_hash(ray_t* x, uint64_t* out) {
+    const int64_t day = INT64_C(86400000000000);
+    uint64_t h = ray_hash_i64(x->len);
+    int64_t n = x->len;
+#define SPAN_VEC_HASH(T, IS_NULL, VALUE) do { \
+        const T* d = ray_data(x); \
+        for (int64_t i = 0; i < n; i++) \
+            h = ray_hash_combine(h, IS_NULL ? 0 : ray_hash_f64(VALUE)); \
+    } while (0)
+    switch (x->type) {
+    case RAY_BOOL: case RAY_U8: SPAN_VEC_HASH(uint8_t, false, (double)d[i]); break;
+    case RAY_I16: SPAN_VEC_HASH(int16_t, d[i] == NULL_I16, (double)d[i]); break;
+    case RAY_I32: SPAN_VEC_HASH(int32_t, d[i] == NULL_I32, (double)d[i]); break;
+    case RAY_I64: case RAY_TIMESPAN:
+        SPAN_VEC_HASH(int64_t, d[i] == NULL_I64, (double)d[i]); break;
+    case RAY_F32: SPAN_VEC_HASH(float, d[i] != d[i], round((double)d[i])); break;
+    case RAY_F64: SPAN_VEC_HASH(double, d[i] != d[i], round(d[i])); break;
+    case RAY_TIME:
+        SPAN_VEC_HASH(int32_t, d[i] == NULL_I32, (double)((int64_t)d[i] * 1000000)); break;
+    case RAY_TIMESTAMP:
+        SPAN_VEC_HASH(int64_t, d[i] == NULL_I64, (double)(((d[i] % day) + day) % day)); break;
+    default: return false;
+    }
+#undef SPAN_VEC_HASH
+    *out = h;
+    return true;
+}
+
 /* `seen`, when given, is set when x holds a TIMESPAN (ray_key_spans != 0)
  * found as the hash walks it, so a caller hashing with spans 0 learns
  * that it should not have, without a second pass. */
@@ -1868,9 +1906,12 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         return spans ? 0 : ray_atom_hash(x);
     }
     if (seen && ray_has_timespan(x)) *seen = true;
-    /* No TIMESPAN vector anywhere: vector pairs compare by bytes (or by
-     * symbol), whatever the atoms do. */
-    if (spans & RAY_KEY_SPAN_VEC) return 0;
+    if (spans & RAY_KEY_SPAN_VEC) {
+        uint64_t h;
+        if (span_vec_hash(x, &h)) return h;
+    }
+    /* No TIMESPAN vector anywhere, or a type no TIMESPAN vector equals:
+     * vector pairs compare by bytes (or by symbol), whatever the atoms do. */
     /* A SYM vector hashes its cells' text: atom_eq calls two SYM vectors
      * equal when every cell is the same symbol, in any domain or stored
      * width (#1311), and the text is what such cells share. */
