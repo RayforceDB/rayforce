@@ -254,7 +254,8 @@ int main(int argc, char** argv) {
             fprintf(stdout,
                 "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-Q 0|1] [-i]"
                 " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
-                "  -f, --file FILE     run script file (or pass as a positional arg)\n"
+                "  -f, --file FILE     run script file (or pass as a positional arg);\n"
+                "                      FILE may be a pipe or FIFO, and - is stdin\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
                 "      --port HOST:PORT  bind the listener to HOST only (e.g. 127.0.0.1:7701)\n"
                 "  -c, --cores N       decimal digits; 0 = auto, 1..1023 includes main thread\n"
