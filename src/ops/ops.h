@@ -427,6 +427,10 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 #define OP_FLAG_DEAD         0x02
 #define OP_FLAG_INVALID_SCAN 0x04  /* query compiler emitted an unknown column */
 #define OP_FLAG_TEMPORAL_INT 0x08  /* temporal +/- integer lowered by the query compiler (#1302) */
+#define OP_FLAG_XBAR         0x10  /* OP_MOD of an xbar: a zero or null divisor raises domain (#1355) */
+
+/* ray_xbar_fn's error for a zero or null bucket */
+#define RAY_XBAR_BUCKET_ERR "xbar: bucket size must be non-zero and non-null"
 
 /* Sentinel node id for "no input".  Node id 0 is a valid node (the first
  * one allocated), so zero cannot mean "none" — use the max value.  All
@@ -563,6 +567,9 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    ray_t*          xbar_rows;   /* borrowed rowsel: the rows an xbar buckets when no
+                                  * selection is installed (an update's where:);
+                                  * NULL = every row (#1355) */
     struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).

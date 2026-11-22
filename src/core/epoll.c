@@ -358,9 +358,16 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
         }
 
         int n = epoll_wait((int)poll->fd, events, RAY_POLL_MAX_EVENTS, wait_ms);
+        /* errno of the wait, kept across xport_woke: that call makes system calls
+         * of its own and leaves its errno behind.  A process stopped and continued
+         * (SIGSTOP, SIGCONT, a debugger) wakes with EINTR; with a shared-memory
+         * transport open the EINTR was overwritten, the loop returned -1, and a
+         * server reading its script from a pipe took that for an exit request and
+         * ended with status 0. */
+        int wait_errno = errno;
         if (poll->n_xport > 0) xport_woke(poll);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (wait_errno == EINTR) continue;
             return -1;
         }
 

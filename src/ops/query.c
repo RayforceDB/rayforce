@@ -911,6 +911,61 @@ static bool const_op_i64(ray_graph_t* g, ray_op_t* op, int64_t* out) {
     }
 }
 
+/* A literal xbar bucket that is zero or null, where ray_xbar_fn raises
+ * whatever the column holds: its vector-by-integer fast path (an I16 / I32 /
+ * I64 bucket on an integer or temporal column, empty too, message
+ * "non-zero"), and an atom value.  Sets that domain error and returns true.
+ * Any other zero or null literal is left to the modulo kernels, which raise
+ * per row as the builtin's per-element path does (an empty column gives an
+ * empty result in both). */
+static bool xbar_literal_bucket_bad(ray_graph_t* g, ray_op_t* b, ray_op_t* col,
+                                    int8_t col_t) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v)) return false;
+    bool zero, ib = false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: zero = as_i64(v) == 0; ib = true; break;
+        case -RAY_F64: case -RAY_F32: zero = as_f64(v) == 0.0; break;
+        case -RAY_U8: case -RAY_BOOL: zero = v->u8 == 0; break;
+        case -RAY_DATE: case -RAY_TIME: zero = v->i32 == 0; break;
+        case -RAY_TIMESTAMP: zero = v->i64 == 0; break;
+        default: return false;
+    }
+    bool null = RAY_ATOM_IS_NULL(v);
+    if (!null && !zero) return false;
+    bool int_col = col_t == RAY_I64 || col_t == RAY_I32 || col_t == RAY_I16 ||
+                   col_t == RAY_TIMESTAMP || col_t == RAY_DATE || col_t == RAY_TIME;
+    bool atom = dag_const_is_atom(g, col);
+    bool fast = int_col && !atom && ib && !null;
+    if (!fast && !(atom && (int_col || col_t == RAY_U8 || col_t == RAY_BOOL ||
+                            col_t == RAY_F64 || col_t == RAY_F32)))
+        return false;
+    if (!g->compile_err)
+        g->compile_err = ray_error("domain", fast ? "xbar: bucket size must be non-zero"
+                                                  : RAY_XBAR_BUCKET_ERR);
+    return true;
+}
+
+/* A literal bucket that is neither zero nor null: no row can raise, so the
+ * xbar is a plain modulo and the plan carries no OP_FLAG_XBAR (an update
+ * under where: then builds no row selection for it). */
+static bool xbar_literal_bucket_ok(ray_graph_t* g, ray_op_t* b) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v) || RAY_ATOM_IS_NULL(v)) return false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: return as_i64(v) != 0;
+        case -RAY_F64: case -RAY_F32: { double d = as_f64(v); return d == d && d != 0.0; }
+        case -RAY_U8: case -RAY_BOOL: return v->u8 != 0;
+        case -RAY_DATE: case -RAY_TIME: return v->i32 != 0;
+        case -RAY_TIMESTAMP: return v->i64 != 0;
+        default: return false;
+    }
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -2336,7 +2391,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             uint32_t col_id = col->id;
             ray_op_t* bucket = compile_expr_dag(g, elems[2]);
             if (!bucket) return NULL;
-            uint32_t bucket_id = bucket->id;
+            uint32_t bucket_id = bucket->id, lit_id = bucket->id;
             col = &g->nodes[col_id];
             /* xbar(x, b) = x - (x % b)  (stays in integer domain).
              *
@@ -2369,8 +2424,19 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                     col = &g->nodes[col_id];
                 }
             }
+            /* A zero or null bucket is ray_xbar_fn's domain error (#1355).
+             * A literal one the builtin rejects outright is decided here,
+             * once; every other one by the modulo kernels (OP_FLAG_XBAR),
+             * whose zero-divisor branch raises instead of writing a null.
+             * In an arm of an `if` / `cond` only the rows that take the arm
+             * bucket, so the kernels decide there too. */
+            if (g->if_arm_depth == 0 &&
+                xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
+                return NULL;
+            bool lit_ok = xbar_literal_bucket_ok(g, &g->nodes[lit_id]);
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;
+            if (!lit_ok) m->flags |= OP_FLAG_XBAR;
             col = &g->nodes[col_id];
             ray_op_t* r = ray_sub(g, col, m);
             if (!r || !temporal) return r;
@@ -14321,6 +14387,167 @@ static bool scalar_edge_src_vectorizes(ray_t* e, ray_t* tbl, int depth) {
     return true;
 }
 
+/* Does `e` read a LIST column: a name of one, not quoted, not a local. */
+static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM)
+        return !(e->attrs & ATTR_QUOTED) && !ray_env_has_lexical_local(e->i64) &&
+               tbl_has_col(tbl, e->i64) && tbl_col_base_type(tbl, e->i64) == RAY_LIST;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (expr_reads_list_col(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+/* The rows' cells of a scalar aggregate source that is one value `a`
+ * (consumed): a typed vector of it, or a LIST of it for a type no vector
+ * holds. */
+static ray_t* scalar_atom_rows(ray_t* a, int64_t nrows) {
+    ray_t* cells = atom_broadcast_vec(a, nrows);
+    if (!cells) {
+        cells = ray_list_new(nrows);
+        for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
+            cells = ray_list_append(cells, a);
+    }
+    ray_release(a);
+    return cells ? cells : ray_error("oom", NULL);
+}
+
+/* Is `e` builtin calls over columns and literals, each `if` in it blended
+ * per row: no lambda, no special form.  Evaluated once over the columns it
+ * is the argument `by:` gives one group, `(at v (til 4))` and `(except v
+ * 'b)` included, which the per-row pass feeds one cell. */
+static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return true;
+    if (depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (!rw_if_kind(e, tbl)) {
+        ray_t* h = es[0];
+        if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+            tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+        ray_t* fn = ray_env_get(h->i64);
+        if (!fn || RAY_IS_ERR(fn) || fn->type < RAY_UNARY || fn->type > RAY_VARY ||
+            (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* first/last's argument over the rows in one pass, where the answer is the
+ * one the compiled route or `by:` gives.  An elementwise argument is the
+ * column the compiled route computes, so its error is the query's (an `if`
+ * mixing SYM and DATE arms), save a length mismatch: an atomic expression
+ * fails so only where an `if`'s condition or arm is not one value per row,
+ * which the per-row pass reads one cell at a time.  Other builtin calls
+ * without an effect are evaluated as `by:` evaluates them, so their error
+ * is `by:`'s: operands of different lengths (`(+ c [1 2])`), or `(til c)`.
+ * One that reads a LIST column is compiled first, as on those routes, so
+ * one the planner runs fails as it does there: `(+ m 1)` raises `type`
+ * where the evaluator maps over the cells.  Only then: run through the
+ * planner, `(first (+ d 1))` over 10M DATE rows took four times as long.
+ * A scalar it gives stands for every row, as `1` does in `(sum 1)`, so over
+ * no rows `(first (count d))` is the null the compiled route gives.  Over
+ * rows text stays one value, as first takes its first character: `(first
+ * (format "%" c))` is "[".  NULL leaves the argument to the per-row pass. */
+static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
+    bool elementwise = scalar_edge_src_vectorizes(e, tbl, 0);
+    if (!elementwise && !(scalar_edge_src_builtin(e, tbl, 0) && query_expr_effect_free(e)))
+        return NULL;
+    /* eval_expr_whole_column_impl, the DAG tried before the evaluator over
+     * a LIST column */
+    bool dag = expr_reads_list_col(e, tbl, 0);
+    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* bind_err = NULL;
+    ray_t* aqt = bind_referenced_query(tbl, &e, 1, &bind_err);
+    int64_t aqr = g_active_query_row;
+    g_active_query_row = -1;
+    rw_ctx_t c = { .tbl = tbl, .nrows = nrows };
+    ray_t* src = bind_err ? bind_err : dag ? rw_value(e, &c, 0) : rw_force(query_eval_bound(e, tbl));
+    g_active_query_table = aqt;
+    g_active_query_row = aqr;
+    ray_env_pop_scope();
+    if (RAY_IS_ERR(src)) {
+        if (!elementwise || strcmp(ray_err_code(src), "length")) return src;
+        rw_swallow(src);
+        return NULL;
+    }
+    if (elementwise && ((!ray_is_vec(src) && src->type != RAY_LIST) || src->len != nrows)) {
+        ray_release(src);
+        return NULL;
+    }
+    if (ray_is_atom(src) && (src->type != -RAY_STR || nrows == 0)) src = scalar_atom_rows(src, nrows);
+    return src;
+}
+
+static bool expr_holds_vector_const(ray_t* expr, ray_t* tbl);
+
+/* Is every vector written as a value in `e` (expr_holds_vector_const) read
+ * row by row: an operand of elementwise calls (atomic builtins, an `if`)
+ * all the way up, as `GI` in `(+ c GI)`?  Such a vector stands for a column
+ * of the table before a where:.  One that is an argument of another call,
+ * such as the index list of `(at d [0 1])`, is a value: it reads the rows
+ * the where: keeps.  `rows` says whether the calls above `e` are all
+ * elementwise. */
+static bool expr_vconst_on_rows(ray_t* e, ray_t* tbl, bool rows, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0)
+        return rows || !expr_holds_vector_const(e, tbl);
+    ray_t** es = (ray_t**)ray_data(e);
+    if (e->len == 2 && es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED) &&
+        es[0]->i64 == ray_sym_intern("quote", 5)) return true;
+    bool ew = rw_if_kind(e, tbl);
+    if (!ew) {
+        ray_t* h = es[0];
+        ray_t* fn = h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) &&
+                    !tbl_has_col(tbl, h->i64) && !ray_env_has_lexical_local(h->i64)
+                  ? ray_env_get(h->i64) : NULL;
+        ew = fn && !RAY_IS_ERR(fn) && fn->type >= RAY_UNARY && fn->type <= RAY_VARY &&
+             (fn->attrs & RAY_FN_ATOMIC);
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!expr_vconst_on_rows(es[i], tbl, rows && ew, depth + 1)) return false;
+    return true;
+}
+
+/* `src`, the argument evaluated over the rows before a where:, at the rows
+ * the where: keeps (`sel`).  One value per row is compacted as a column
+ * is; anything else (an atom, a collection of another length) stands as
+ * it is.  Consumes `src`. */
+static ray_t* scalar_edge_keep_rows(ray_t* src, int64_t nrows, ray_t* sel) {
+    if (RAY_IS_ERR(src) || !(ray_is_vec(src) || src->type == RAY_LIST) || src->len != nrows)
+        return src;
+    ray_t* t = ray_table_new(1);
+    if (t && !RAY_IS_ERR(t)) t = ray_table_add_col(t, ray_sym_intern("v", 1), src);
+    ray_release(src);
+    if (!t || RAY_IS_ERR(t)) return t ? t : ray_error("oom", NULL);
+    ray_t* kept = sel_compact(NULL, t, sel, NULL, 0);
+    ray_t* col = kept && !RAY_IS_ERR(kept) ? ray_table_col_idx(kept, 0) : kept;
+    if (col && !RAY_IS_ERR(col)) ray_retain(col);
+    if (kept && !RAY_IS_ERR(kept) && kept != t) ray_release(kept);
+    ray_release(t);
+    return col ? col : ray_error("oom", NULL);
+}
+
+/* The per-row pass over no rows evaluates nothing and leaves an empty LIST,
+ * so first/last would answer the untyped null 0Nl.  The argument evaluated
+ * once over the empty columns gives its result type, as the compiled route
+ * types it: `((fn [y] (let q y) q) v)` over a DATE v is an empty DATE
+ * vector.  An argument with an effect, one that fails, or one that is not
+ * an empty typed vector keeps the LIST. */
+static ray_t* scalar_edge_empty_src(ray_t* e, ray_t* tbl, ray_t* src) {
+    if (src->type != RAY_LIST || src->len != 0 || !query_expr_effect_free(e)) return src;
+    ray_t* typed = eval_expr_whole_column_impl(e, tbl);
+    if (typed && !RAY_IS_ERR(typed) && ray_is_vec(typed) && typed->type != RAY_LIST && typed->len == 0) {
+        ray_release(src);
+        return typed;
+    }
+    if (typed && RAY_IS_ERR(typed)) rw_swallow(typed);
+    else if (typed) ray_release(typed);
+    return src;
+}
+
 /* `(first v)` / `(last v)` in a select skip a typed vector's nulls, as the
  * compiled route's reduction does (exec_reduction): the first (last)
  * non-null cell.  NULL leaves `v` to the builtin: no null in it, every
@@ -14338,8 +14565,11 @@ static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
     return x ? x : ray_error("oom", NULL);
 }
 
+/* `tbl` holds the rows where: keeps; `src_tbl` and `sel`, when where: ran
+ * over a flat table, the rows before it and the selection that keeps them
+ * (NULL otherwise). */
 static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
-                                      ray_t* tbl,
+                                      ray_t* tbl, ray_t* src_tbl, ray_t* sel,
                                       int64_t from_id, int64_t where_id,
                                       int64_t by_id, int64_t take_id,
                                       int64_t asc_id, int64_t desc_id,
@@ -14399,30 +14629,33 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
              * this one value.  Evaluated once either way, so an effect in
              * it runs once. */
             src = eval_expr_whole_column_impl(agg_src_expr, tbl);
-            if (src && !RAY_IS_ERR(src) && ray_is_atom(src)) {
-                ray_t* cells = atom_broadcast_vec(src, nrows);
-                if (!cells) {
-                    cells = ray_list_new(nrows);
-                    for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
-                        cells = ray_list_append(cells, src);
-                }
-                ray_release(src);
-                src = cells ? cells : ray_error("oom", NULL);
-            }
+            if (src && !RAY_IS_ERR(src) && ray_is_atom(src))
+                src = scalar_atom_rows(src, nrows);
         }
         else {
-            /* first/last of an elementwise source: its column in one
+            /* first/last of a builtin-call source: its column in one
              * vectorized pass (an `if` blended per row), not one eval per
-             * row.  Anything else, or a pass that fails or is not one
-             * value per row, runs per row as before. */
-            if (edge && scalar_edge_src_vectorizes(agg_src_expr, tbl, 0)) {
-                src = eval_expr_whole_column_impl(agg_src_expr, tbl);
-                if (src && RAY_IS_ERR(src)) { rw_swallow(src); src = NULL; }
-                else if (src && ((!ray_is_vec(src) && src->type != RAY_LIST) || src->len != nrows)) {
-                    ray_release(src); src = NULL;
+             * row (scalar_edge_src_whole).  Anything else runs per row.
+             * A vector written as a value that elementwise calls read row
+             * by row stands for a column of the table it was written
+             * against, as by: and the compiled route read it: `(+ c GI)`
+             * is evaluated over the rows before the where:, which then
+             * keeps its rows (expr_vconst_on_rows).  Over a parted table it
+             * runs per row, as before. */
+            bool vconst = edge && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
+                          expr_vconst_on_rows(agg_src_expr, tbl, true, 0);
+            if (vconst) {
+                if (src_tbl) {
+                    int64_t sn = ray_table_nrows(src_tbl);
+                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn);
+                    if (src) src = scalar_edge_keep_rows(src, sn, sel);
                 }
+            } else if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
+            if (!src) {
+                src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
+                if (edge && nrows == 0 && src && !RAY_IS_ERR(src))
+                    src = scalar_edge_empty_src(agg_src_expr, tbl, src);
             }
-            if (!src) src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
         }
         ray_release(agg_src_expr);
         if (!src || RAY_IS_ERR(src)) {
@@ -14440,9 +14673,10 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
         }
 
-        /* The aggregate of a column-free source is one value, a collection
-         * too: boxed as one cell, as each group takes it under by:. */
-        if (column_free && !ray_is_atom(agg_value)) {
+        /* An aggregate is one value, a collection too (`(first l)` over a
+         * LIST column of lists): boxed as one cell, as the compiled route
+         * and each group under by: take it. */
+        if (!ray_is_atom(agg_value)) {
             ray_t* box = ray_list_new(1);
             if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
             ray_release(agg_value);
@@ -25931,6 +26165,8 @@ by_dict_done:
                     release_eval_tbl = 1;
                 }
                 ray_t* result = eval_scalar_agg_outputs(dict_elems, dict_n, eval_tbl,
+                                                        g->selection && !table_has_parted_columns(tbl) ? tbl : NULL,
+                                                        g->selection,
                                                         from_id, where_id, by_id,
                                                         take_id, asc_id, desc_id,
                                                         nearest_id);
@@ -28580,7 +28816,8 @@ static bool update_dag_err_final(ray_t* out, bool if_refused) {
  * so the groups after the first skip the graph and go to the evaluator
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
-static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined) {
+static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
+                                  ray_t* mask) {
     ray_t* out = NULL;
     ray_t* cerr = NULL;
     bool if_refused = false;
@@ -28589,7 +28826,17 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         ray_op_t* op = compile_expr_dag(g, expr);
         if (op) {
             op = ray_optimize(g, op);
+            /* Under where: (mask, one BOOL per row) an xbar buckets the
+             * matched rows only.  Their selection is built only when the
+             * plan holds an xbar, so any other update pays nothing. */
+            ray_t* rows = NULL;
+            if (mask)
+                for (uint32_t i = 0; i < g->node_count; i++)
+                    if (g->nodes[i].flags & OP_FLAG_XBAR) { rows = ray_rowsel_from_pred(mask); break; }
+            g->xbar_rows = rows;          /* the rows where: updates */
             out = ray_execute(g, op);
+            g->xbar_rows = NULL;
+            if (rows) ray_rowsel_release(rows);
         } else {
             cerr = graph_take_compile_err(g);
             if (dag_declined) *dag_declined = true;
@@ -28649,7 +28896,15 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
 }
 
 static ray_t* update_eval_on(ray_t* sub, ray_t* expr) {
-    return update_eval_on_impl(sub, expr, true, NULL);
+    return update_eval_on_impl(sub, expr, true, NULL, NULL);
+}
+
+/* update_eval_on under where: (mask, one BOOL per row): the value is read
+ * on the matched rows only, so an xbar buckets those alone; a dropped row
+ * keeps its old value and never raises, as in a select (#1355). */
+static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    bool ok = mask && mask->type == RAY_BOOL && mask->len == ray_table_nrows(tbl);
+    return update_eval_on_impl(tbl, expr, true, NULL, ok ? mask : NULL);
 }
 
 static bool update_numeric_promo(int8_t ct, int8_t et) {
@@ -29151,7 +29406,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     dependencies.table = sub_tbl;
                     g_query_dependencies = &dependencies;
                 }
-                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined);
+                ray_t* agg_result = update_eval_on_impl(sub_tbl, agg_expr, expand, &dag_declined, NULL);
                 g_query_dependencies = prev_dependencies;
                 ray_release(sub_tbl);
 
@@ -29381,7 +29636,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
-                ray_t* expr_vec = update_eval_on(tbl, update_expr);
+                ray_t* expr_vec = update_eval_where(tbl, update_expr, mask_vec);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
                 if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
                     int64_t got = ray_len(expr_vec);
@@ -29630,7 +29885,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_eval_on(tbl, dict_elems[d + 1]);
+            ray_t* v = update_eval_where(tbl, dict_elems[d + 1], mask_vec);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {
