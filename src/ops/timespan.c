@@ -33,10 +33,6 @@ static int8_t span_base(int8_t t) {
     return RAY_IS_PARTED(t) ? (int8_t)RAY_PARTED_BASETYPE(t) : t;
 }
 
-bool ray_has_timespan(const ray_t* x) {
-    return x && span_base(x->type) == RAY_TIMESPAN;
-}
-
 static bool span_number(int8_t t) { return t >= RAY_BOOL && t <= RAY_F64; }
 static bool span_divisor(int8_t t) {
     return span_number(t) || t == RAY_TIMESPAN || t == RAY_TIME ||

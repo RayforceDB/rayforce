@@ -1824,9 +1824,16 @@ int atom_eq(ray_t* a, ray_t* b) {
  * rounds numbers and reads TIME as ns (RAY_KEY_SPAN_ATOM normalizes atoms
  * the same way) and compares a TIMESPAN vector element by element with
  * other types (RAY_KEY_SPAN_VEC puts every vector in one bucket). */
-uint64_t ray_key_hash(ray_t* x, int spans) {
+/* `seen`, when given, is set when x holds a TIMESPAN (ray_key_spans != 0)
+ * found as the hash walks it, so a caller hashing with spans 0 learns
+ * that it should not have, without a second pass. */
+static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
-    if (!x || RAY_ATOM_IS_NULL(x)) return 0;
+    if (!x) return 0;
+    if (RAY_ATOM_IS_NULL(x)) {
+        if (seen && x->type == -RAY_TIMESPAN) *seen = true;
+        return 0;
+    }
     if (is_numeric(x)) return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
     switch (x->type) {
     case -RAY_SYM: return ray_hash_i64(x->i64);
@@ -1840,6 +1847,7 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
         }
         return ray_hash_i64(x->i64);
     case -RAY_TIMESPAN:
+        if (seen) *seen = true;
         return durations ? ray_hash_f64((double)x->i64) : ray_hash_i64(x->i64);
     case -RAY_TIME:
         return durations ? ray_hash_f64((double)((int64_t)x->i32 * 1000000)) : ray_hash_i64(x->i32);
@@ -1851,13 +1859,15 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
         uint64_t h = ray_hash_i64(x->len);
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len; i++)
-            h = ray_hash_i64((int64_t)(h ^ ray_key_hash(cells[i], spans)));
+            h = ray_hash_i64((int64_t)(h ^ key_hash(cells[i], spans, view, seen)));
         return h;
     }
     case RAY_TABLE:
     case RAY_DICT:
+        if (seen && !spans && ray_key_spans(x)) *seen = true;
         return spans ? 0 : ray_atom_hash(x);
     }
+    if (seen && ray_has_timespan(x)) *seen = true;
     /* No TIMESPAN vector anywhere: vector pairs compare by bytes (or by
      * symbol), whatever the atoms do. */
     if (spans & RAY_KEY_SPAN_VEC) return 0;
@@ -1867,7 +1877,9 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
     if (x->type == RAY_SYM) {
         uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
         for (int64_t i = 0; i < x->len; i++) {
-            ray_t* s = ray_sym_vec_cell(x, i);
+            ray_t* s = view ? ray_group_sym_read(view, ray_sym_vec_domain(x),
+                                                 ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs))
+                            : ray_sym_vec_cell(x, i);
             h = ray_hash_combine(h, s ? ray_hash_bytes(ray_str_ptr(s), ray_str_len(s)) : 0);
         }
         return h;
@@ -1892,16 +1904,28 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
     return 0;
 }
 
+uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NULL); }
+
+/* ray_key_hash for a pool worker: runtime-domain symbols read from the
+ * borrowed `view`, not through ray_sym_str's lock.  Same text, same hash.
+ * `seen` (may be NULL) is set when x holds a TIMESPAN. */
+uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen) {
+    return key_hash(x, spans, view, seen);
+}
+
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
 int ray_key_spans(ray_t* x) {
     if (!x) return 0;
-    if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
+    if (x->type < 0) return x->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
     if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
     int spans = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++)
-            spans |= ray_key_spans(cells[i]);
+        for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
+            ray_t* c = cells[i];
+            if (c && c->type < 0) spans |= c->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
+            else spans |= ray_key_spans(c);
+        }
     } else if (x->type == RAY_TABLE) {
         /* atom_eq compares a table's columns (a dict's keys and values)
          * with atom_eq too, so a TIMESPAN inside meets numbers element by

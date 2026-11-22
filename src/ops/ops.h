@@ -61,7 +61,6 @@ static inline bool ray_is_lazy(ray_t* x) {
 ray_t*    ray_lazy_materialize(ray_t* val);
 ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
-bool ray_has_timespan(const ray_t* x);
 /* Two TIMEs or two TIMESTAMPs (atoms or vectors): their difference is a
  * TIMESPAN, computed by ray_timespan_binary. */
 static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
@@ -91,6 +90,15 @@ void     ray_cancel_reset(void);
 
 #define RAY_IS_PARTED(t)       ((t) >= RAY_PARTED_BASE && (t) < RAY_MAPCOMMON)
 #define RAY_PARTED_BASETYPE(t) ((t) - RAY_PARTED_BASE)
+
+/* A TIMESPAN atom, vector or parted column.  Inline: atom_eq and the key
+ * hashes ask it of every cell. */
+static inline bool ray_has_timespan(const ray_t* x) {
+    if (!x) return false;
+    int8_t t = x->type;
+    return t == -RAY_TIMESPAN || t == RAY_TIMESPAN ||
+           (RAY_IS_PARTED(t) && RAY_PARTED_BASETYPE(t) == RAY_TIMESPAN);
+}
 
 /* ===== Morsel Constants ===== */
 
