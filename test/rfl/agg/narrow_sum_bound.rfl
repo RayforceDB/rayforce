@@ -73,9 +73,9 @@
 (at (select {s: (sum (+ h k)) from: TS}) 's) -- (enlist (sum (+ hs ks)))
 (at (select {s: (avg (+ h k)) from: TS}) 's) -- (enlist (avg (+ hs ks)))
 (set hx (concat (take h W) (concat (enlist 32767h) (drop h (+ W 1)))))
-(set kx (concat (take k W) (concat (enlist 1h) (drop k (+ W 1)))))
-(set TX (table [h k] (list hx kx)))
-(at (select {s: (sum (+ h k)) from: TX}) 's) -- (enlist (sum (+ hx kx)))
+(set kq (concat (take k W) (concat (enlist 1h) (drop k (+ W 1)))))
+(set TX (table [h k] (list hx kq)))
+(at (select {s: (sum (+ h k)) from: TX}) 's) -- (enlist (sum (+ hx kq)))
 (at (select {s: (sum (+ h 1h)) from: TX}) 's) -- (enlist (sum (+ hx 1h)))
 (at (select {s: (avg (+ h 1h)) from: TX}) 's) -- (enlist (avg (+ hx 1h)))
 

@@ -642,7 +642,7 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     if (atomic_load_explicit(&x->fail, memory_order_relaxed)) return;
     int64_t n = end - start;
     if (n <= 0) return;
-    np_iv_t iv[AGG_LINEAR_MAX_TERMS];
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS] = {{0}};
     int64_t sums[AGG_LINEAR_MAX_TERMS];
     for (uint8_t t = 0; t < x->prog->n_terms; t++) {
         if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
@@ -700,7 +700,7 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
         np_count(NARROW_SUM_REFUSED);
         return NP_NO;
     }
-    np_iv_t iv[AGG_LINEAR_MAX_TERMS];
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS] = {{0}};
     for (uint8_t t = 0; t < p->n_terms; t++) iv[t] = np_type_iv(p->types[t]);
     if (np_eval(p, iv, NULL)) { np_count(NARROW_SUM_TYPE); return NP_PROVED; }
 

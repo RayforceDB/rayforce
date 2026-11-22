@@ -224,7 +224,7 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         /* a row landing on the I16 null, without a wrap and with one */
         "(set hs (_nW h -16384h)) (set ks (_nW k -16384h))",
         "(set _nTS (table [h k] (list hs ks)))",
-        "(set hx (_nW h 32767h)) (set kx (_nW k 1h)) (set _nTX (table [h k] (list hx kx)))",
+        "(set hx (_nW h 32767h)) (set kq (_nW k 1h)) (set _nTX (table [h k] (list hx kq)))",
         /* wraps in every block: the samples refuse */
         "(set hf (as 'I16 (- (% (* _nI 13) 65536) 32768)))",
         "(set _nTF (table [h k] (list hf hf)))",
@@ -249,7 +249,7 @@ static test_result_t test_narrow_sum_bound_routes(void) {
     };
     for (int q = 0; setup[q]; q++)
         TEST_ASSERT_FMT(narrow_sum_eval_ok(setup[q]), "setup %d", q);
-    char dir[256];
+    char dir[64];
     int dn = snprintf(dir, sizeof dir, "/tmp/rayforce_lang_narrow_sum_%ld", (long)getpid());
     TEST_ASSERT_TRUE(dn > 0 && (size_t)dn < sizeof dir);
     char cmd[900];
@@ -308,7 +308,7 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         { NS_Q("(select {s: (sum (+ h k)) from: _nTB})",  "(sum (+ hb hb))"), SAMPLE },
         /* a row on the null sentinel, with or without a wrap: refused */
         { NS_Q("(select {s: (sum (+ h k)) from: _nTS})",  "(sum (+ hs ks))"), REF },
-        { NS_Q("(select {s: (sum (+ h k)) from: _nTX})",  "(sum (+ hx kx))"), REF },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTX})",  "(sum (+ hx kq))"), REF },
         /* serial (below the parallel threshold, no samples) */
         { NS_Q("(select {s: (sum (+ h k)) from: _nts})",  "(sum (+ (take h 3000) (take k 3000)))"), SCAN | PRE },
         { NS_Q("(select {s: (sum (+ h k)) from: _ntw})",  "(sum (+ hsw hsw))"), PART | PRE },
