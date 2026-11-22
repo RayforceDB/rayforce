@@ -18763,10 +18763,14 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
              * a repeated run would repeat the effect. */
             key_bind_t pure_binds[KEY_PURE_MAX_BIND];
             key_pure_ctx_t pure_ctx = { NULL, pure_binds, 0, 0 };
-            bool pure = key_expr_pure(by_expr, 0, &pure_ctx);
+            /* A JSON read of a column, under element-wise builtins only, is
+             * read whole as a projection is (json_rowwise): it holds no
+             * conditional, and its error is the query's. */
+            bool json_whole = json_rowwise(by_expr, base) == 1;
+            bool pure = json_whole || key_expr_pure(by_expr, 0, &pure_ctx);
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
-            else if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
+            else if (!json_whole && (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec))) {
                 /* Also when the whole-column run failed: a body written for
                  * one row may not accept a column at all.  The failure is
                  * swallowed whole: its `raise` payload and trace go with it,
