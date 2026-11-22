@@ -1814,6 +1814,14 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
     switch (x->type) {
     case -RAY_SYM: return ray_hash_i64(x->i64);
     case -RAY_TIMESTAMP:
+        /* Beside a TIMESPAN, atom_eq (span_eval) compares a TIMESTAMP by its
+         * time of day, so it hashes that; two TIMESTAMPs equal in full share it. */
+        if (durations) {
+            int64_t v = x->i64 % INT64_C(86400000000000);
+            if (v < 0) v += INT64_C(86400000000000);
+            return ray_hash_f64((double)v);
+        }
+        return ray_hash_i64(x->i64);
     case -RAY_TIMESPAN:
         return durations ? ray_hash_f64((double)x->i64) : ray_hash_i64(x->i64);
     case -RAY_TIME:
@@ -1877,8 +1885,94 @@ int ray_key_spans(ray_t* x) {
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++)
             spans |= ray_key_spans(cells[i]);
+    } else if (x->type == RAY_TABLE) {
+        /* atom_eq compares a table's columns (a dict's keys and values)
+         * with atom_eq too, so a TIMESPAN inside meets numbers element by
+         * element, which ray_atom_hash's type-and-length vector hash does
+         * not see: a TIMESPAN [1 2] column and an I64 [1 2] one are equal.
+         * Any span bit hashes such a cell to 0 (ray_key_hash). */
+        for (int64_t c = 0; c < ray_table_ncols(x) && !spans; c++) {
+            ray_t* col = ray_table_col_idx(x, c);
+            if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
+            spans |= ray_key_spans(col);
+        }
+        if (spans) spans = RAY_KEY_SPAN_ATOM;
+    } else if (x->type == RAY_DICT) {
+        spans = ray_key_spans(ray_dict_keys(x)) | ray_key_spans(ray_dict_vals(x));
+        if (spans) spans = RAY_KEY_SPAN_ATOM;
     }
     return spans;
+}
+
+/* ── LIST cell sets ──────────────────────────────────────────────────
+ * distinct, in, except, sect and union over LIST operands decide with
+ * atom_eq.  A set hashes each cell once with ray_key_hash and asks atom_eq
+ * only within one hash: open addressing over distinct hashes, each slot
+ * heading a chain of every cell added with that hash.  Cells are never
+ * merged: atom_eq is not transitive (a TIMESPAN vector equals an I64 and
+ * an I32 vector that differ; I64s meet through one F64), so a probe asks
+ * every cell of its hash, which is the nested scan's answer. */
+typedef struct {
+    ray_t**   cells;  /* the cells added, by index */
+    uint64_t* hash;   /* per slot: its chain's hash */
+    int64_t*  head;   /* per slot: the last cell added, -1 when empty */
+    int64_t*  next;   /* per cell: the next cell of its chain, -1 at the end */
+    uint64_t  mask;
+    int       spans;
+} list_set_t;
+
+/* Below this many cell pairs (probes x cells) the nested atom_eq scan is
+ * cheaper than building a set: the two meet at 50-100 pairs, ~0.25 us,
+ * for atom and vector cells alike. */
+#define LIST_SET_MIN_PAIRS 64
+
+/* Room for n cells of `cells`, hashed with `spans` (ray_key_spans over
+ * every cell the set will compare, both operands). */
+static bool list_set_init(list_set_t* s, ray_t** cells, int64_t n, int spans) {
+    uint64_t cap = 16;
+    while (cap < (uint64_t)n * 2) cap <<= 1;
+    char* mem = ray_alloc_raw((size_t)cap * 16 + (size_t)n * sizeof(int64_t));
+    if (!mem) return false;
+    s->cells = cells;
+    s->hash  = (uint64_t*)mem;
+    s->head  = (int64_t*)(mem + cap * 8);
+    s->next  = (int64_t*)(mem + cap * 16);
+    s->mask  = cap - 1;
+    s->spans = spans;
+    memset(s->head, 0xff, (size_t)cap * 8);
+    return true;
+}
+
+static void list_set_destroy(list_set_t* s) { ray_free_raw(s->hash); }
+
+/* Add cells[i], whose ray_key_hash is h. */
+static inline void list_set_add(list_set_t* s, int64_t i, uint64_t h) {
+    uint64_t at = h & s->mask;
+    while (s->head[at] >= 0 && s->hash[at] != h) at = (at + 1) & s->mask;
+    s->hash[at] = h;
+    s->next[i] = s->head[at];
+    s->head[at] = i;
+}
+
+/* Whether a cell added equals x (hash h).  `left`: x is atom_eq's left
+ * operand, as in the scan this answers for. */
+static inline bool list_set_has(const list_set_t* s, ray_t* x, uint64_t h, bool left) {
+    for (uint64_t at = h & s->mask; s->head[at] >= 0; at = (at + 1) & s->mask) {
+        if (s->hash[at] != h) continue;
+        for (int64_t i = s->head[at]; i >= 0; i = s->next[i])
+            if (left ? atom_eq(x, s->cells[i]) : atom_eq(s->cells[i], x)) return true;
+        return false;
+    }
+    return false;
+}
+
+/* A set over every cell of the LIST `l`. */
+static bool list_set_of(list_set_t* s, ray_t* l, int spans) {
+    ray_t** cells = ray_data(l);
+    if (!list_set_init(s, cells, l->len, spans)) return false;
+    for (int64_t i = 0; i < l->len; i++)
+        list_set_add(s, i, ray_key_hash(cells[i], spans));
+    return true;
 }
 
 /* Forward declaration */
@@ -2171,26 +2265,46 @@ ray_t* ray_distinct_fn(ray_t* x) {
     ray_t** out = (ray_t**)ray_data(result);
     int64_t count = 0;
 
-    for (int64_t i = 0; i < len; i++) {
-        int dup = 0;
-        for (int64_t j = 0; j < count; j++) {
-            if (atom_eq(out[j], elems[i])) { dup = 1; break; }
+    if (len * len >= LIST_SET_MIN_PAIRS) {
+        /* A cell is new when no cell kept so far equals it. */
+        list_set_t s;
+        if (!list_set_init(&s, out, len, ray_key_spans(x))) {
+            result->len = 0;
+            ray_release(result);
+            if (_bx) ray_release(_bx);
+            return ray_error("oom", NULL);
         }
-        if (!dup) {
+        for (int64_t i = 0; i < len; i++) {
+            uint64_t h = ray_key_hash(elems[i], s.spans);
+            if (list_set_has(&s, elems[i], h, false)) continue;
             ray_retain(elems[i]);
-            out[count++] = elems[i];
+            out[count] = elems[i];
+            list_set_add(&s, count++, h);
+        }
+        list_set_destroy(&s);
+    } else {
+        for (int64_t i = 0; i < len; i++) {
+            int dup = 0;
+            for (int64_t j = 0; j < count; j++) {
+                if (atom_eq(out[j], elems[i])) { dup = 1; break; }
+            }
+            if (!dup) {
+                ray_retain(elems[i]);
+                out[count++] = elems[i];
+            }
         }
     }
     result->len = count;
-    /* Sort: atoms before vectors (scalars have negative type) */
-    for (int64_t i = 0; i < count - 1; i++) {
-        for (int64_t j = i + 1; j < count; j++) {
-            int ai = ray_is_atom(out[i]);
-            int aj = ray_is_atom(out[j]);
-            if (!ai && aj) {
-                ray_t* tmp = out[i]; out[i] = out[j]; out[j] = tmp;
-            }
-        }
+    /* Atoms before vectors, the order the pairwise swap this replaces gave
+     * (each non-atom slot, left to right, swapped with the first atom after
+     * it): in one pass, as the next such atom is never left of the last. */
+    for (int64_t i = 0, p = 1; i < count; i++) {
+        if (ray_is_atom(out[i])) continue;
+        if (p <= i) p = i + 1;
+        while (p < count && !ray_is_atom(out[p])) p++;
+        if (p >= count) break;
+        ray_t* tmp = out[i]; out[i] = out[p]; out[p] = tmp;
+        p++;
     }
     if (_bx) ray_release(_bx);
     return result;
@@ -2211,6 +2325,71 @@ static ray_t* in_row(ray_t* elem, ray_t* vec) {
         return make_bool(0);
     }
     return ray_in_fn(elem, vec);
+}
+
+/* in's probes are the left operand's leaves: a TIMESPAN anywhere there is
+ * a TIMESPAN atom probing the set, which rounds the numbers it meets. */
+static int in_probe_spans(ray_t* x) {
+    if (!x) return 0;
+    if (ray_has_timespan(x)) return RAY_KEY_SPAN_ATOM;
+    if (x->type != RAY_LIST) return ray_key_spans(x);
+    int spans = 0;
+    ray_t** cells = ray_data(x);
+    for (int64_t i = 0; i < x->len && !(spans & RAY_KEY_SPAN_ATOM); i++)
+        spans |= in_probe_spans(cells[i]);
+    return spans;
+}
+
+/* ray_in_fn's per-element walk of a collection `val` against the LIST
+ * `vec`, with `s` the set of vec's cells: the same answers and shapes (a
+ * bool vector, or a list from the first element that answers a vector),
+ * one probe per leaf instead of a scan.  An atom, table or dict element is
+ * a leaf; a list or non-string vector recurses, as ray_in_fn does; any
+ * other element takes in_row. */
+static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
+    int64_t vlen = ray_len(val);
+    ray_t* result = ray_vec_new(RAY_BOOL, vlen);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    result->len = vlen;
+    bool* out = (bool*)ray_data(result);
+    bool boxed = false;
+    for (int64_t i = 0; i < vlen; i++) {
+        int alloc = 0;
+        ray_t* elem = collection_elem(val, i, &alloc);
+        if (RAY_IS_ERR(elem)) { ray_release(result); return elem; }
+        ray_t* r = NULL;
+        int8_t t = elem->type;
+        if (t < 0 || t == RAY_TABLE || t == RAY_DICT) {
+            bool hit = list_set_has(s, elem, ray_key_hash(elem, s->spans), true);
+            if (alloc) ray_release(elem);
+            if (!boxed) { out[i] = hit; continue; }
+            r = make_bool(hit);
+        } else {
+            if (t == RAY_LIST || (ray_is_vector_type(t) && t != RAY_STR))
+                r = ray_len(elem) ? in_list_rows(elem, vec, s) : ray_vec_new(RAY_BOOL, 0);
+            else
+                r = in_row(elem, vec);
+            if (alloc) ray_release(elem);
+        }
+        if (!r || RAY_IS_ERR(r)) { ray_release(result); return r ? r : ray_error("oom", NULL); }
+        if (!boxed) {
+            if (r->type == -RAY_BOOL) { out[i] = r->b8; ray_release(r); continue; }
+            ray_t* lst = ray_list_new(vlen);
+            for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
+                ray_t* b = make_bool(out[k]);
+                lst = ray_list_append(lst, b);
+                ray_release(b);
+            }
+            ray_release(result);
+            result = lst;
+            boxed = true;
+            if (!result || RAY_IS_ERR(result)) { ray_release(r); return result ? result : ray_error("oom", NULL); }
+        }
+        result = ray_list_append(result, r);
+        ray_release(r);
+        if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    }
+    return result;
 }
 
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
@@ -2399,6 +2578,15 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             }
             hashset_destroy(&hs);
             return result;
+        }
+        /* A list set: hash its cells once and probe per leaf (#1314). */
+        if (vec->type == RAY_LIST && vlen * vec->len >= LIST_SET_MIN_PAIRS) {
+            list_set_t s;
+            if (!list_set_of(&s, vec, ray_key_spans(vec) | in_probe_spans(val)))
+                return ray_error("oom", NULL);
+            ray_t* r = in_list_rows(val, vec, &s);
+            list_set_destroy(&s);
+            return r;
         }
         /* One verdict per element: a bool vector while every answer is a
          * bool, a list from the first answer that is not (a nested element
@@ -2671,6 +2859,21 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
         for (int64_t i = 0; i < len1; i++) {
             if (!atom_eq(e1[i], vec2)) { ray_retain(e1[i]); out[count++] = e1[i]; }
         }
+    } else if (vec2->type == RAY_LIST && len1 * vec2->len >= LIST_SET_MIN_PAIRS) {
+        list_set_t s;
+        if (!list_set_of(&s, vec2, ray_key_spans(vec1) | ray_key_spans(vec2))) {
+            result->len = 0;
+            ray_release(result);
+            if (_bx1) ray_release(_bx1);
+            if (_bx2) ray_release(_bx2);
+            return ray_error("oom", NULL);
+        }
+        for (int64_t i = 0; i < len1; i++)
+            if (!list_set_has(&s, e1[i], ray_key_hash(e1[i], s.spans), true)) {
+                ray_retain(e1[i]);
+                out[count++] = e1[i];
+            }
+        list_set_destroy(&s);
     } else {
         int64_t len2 = ray_len(vec2);
         ray_t** e2 = (ray_t**)ray_data(vec2);
@@ -2739,11 +2942,34 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     ray_t** out = (ray_t**)ray_data(result);
     int64_t count = 0;
     for (int64_t i = 0; i < len1; i++) { ray_retain(e1[i]); out[count++] = e1[i]; }
-    for (int64_t i = 0; i < len2; i++) {
-        int found = 0;
-        for (int64_t j = 0; j < count; j++)
-            if (atom_eq(out[j], e2[i])) { found = 1; break; }
-        if (!found) { ray_retain(e2[i]); out[count++] = e2[i]; }
+    if ((len1 + len2) * len2 >= 2 * LIST_SET_MIN_PAIRS) {
+        /* A cell of vec2 is added when no cell kept so far (all of vec1,
+         * then vec2's added cells) equals it.  The scan meets up to
+         * len1 + len2 cells per probe, half that on average. */
+        list_set_t s;
+        if (!list_set_init(&s, out, len1 + len2, ray_key_spans(vec1) | ray_key_spans(vec2))) {
+            result->len = count;
+            ray_release(result);
+            if (_bx1) ray_release(_bx1);
+            if (_bx2) ray_release(_bx2);
+            return ray_error("oom", NULL);
+        }
+        for (int64_t i = 0; i < len1; i++) list_set_add(&s, i, ray_key_hash(e1[i], s.spans));
+        for (int64_t i = 0; i < len2; i++) {
+            uint64_t h = ray_key_hash(e2[i], s.spans);
+            if (list_set_has(&s, e2[i], h, false)) continue;
+            ray_retain(e2[i]);
+            out[count] = e2[i];
+            list_set_add(&s, count++, h);
+        }
+        list_set_destroy(&s);
+    } else {
+        for (int64_t i = 0; i < len2; i++) {
+            int found = 0;
+            for (int64_t j = 0; j < count; j++)
+                if (atom_eq(out[j], e2[i])) { found = 1; break; }
+            if (!found) { ray_retain(e2[i]); out[count++] = e2[i]; }
+        }
     }
     result->len = count;
     if (_bx1) ray_release(_bx1);
@@ -2798,9 +3024,26 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
     result->type = RAY_LIST;
     ray_t** out = (ray_t**)ray_data(result);
     int64_t count = 0;
-    for (int64_t i = 0; i < len1; i++) {
-        for (int64_t j = 0; j < len2; j++) {
-            if (atom_eq(e1[i], e2[j])) { ray_retain(e1[i]); out[count++] = e1[i]; break; }
+    if (len1 * len2 >= LIST_SET_MIN_PAIRS) {
+        list_set_t s;
+        if (!list_set_of(&s, vec2, ray_key_spans(vec1) | ray_key_spans(vec2))) {
+            result->len = 0;
+            ray_release(result);
+            if (_bx1) ray_release(_bx1);
+            if (_bx2) ray_release(_bx2);
+            return ray_error("oom", NULL);
+        }
+        for (int64_t i = 0; i < len1; i++)
+            if (list_set_has(&s, e1[i], ray_key_hash(e1[i], s.spans), true)) {
+                ray_retain(e1[i]);
+                out[count++] = e1[i];
+            }
+        list_set_destroy(&s);
+    } else {
+        for (int64_t i = 0; i < len1; i++) {
+            for (int64_t j = 0; j < len2; j++) {
+                if (atom_eq(e1[i], e2[j])) { ray_retain(e1[i]); out[count++] = e1[i]; break; }
+            }
         }
     }
     result->len = count;

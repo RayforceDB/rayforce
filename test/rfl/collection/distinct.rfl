@@ -232,9 +232,10 @@
 (distinct (as 'I32 [99 99 99])) -- (as 'I32 [99])
 (distinct (as 'I16 [9 9 9])) -- (as 'I16 [9])
 (distinct ['a 'a 'a]) -- ['a]
-;; distinct of mixed-type LIST — hits the RAY_LIST hs_hash_row arm at
-;; src/ops/collection.c lines 93-117 (numeric coercion + sym/date/time/timestamp/guid branches)
-;; numeric coercion: I64 1 and F64 1.0 hash as same value (atom_eq coerces both → 1.0)
+;; distinct of mixed-type LIST — ray_distinct_fn's LIST path, which decides
+;; with atom_eq (a scan below the cutoff, ray_key_hash buckets above it;
+;; see list_cell_sets.rfl), not hs_hash_row
+;; numeric coercion: I64 1 and F64 1.0 are equal (atom_eq compares both as f64)
 ;; so distinct values are {1, 'a, "b"} → count 3
 (count (distinct (list 1 1.0 'a "b" 1))) -- 3
 ;; numeric coercion: 1 and 1.0 collapse to a single representative (1)
