@@ -69,3 +69,15 @@
 ;; delim falls through and hits the "type" guard on line 280.
 (split "abc" 42)   !- type
 (split "abc" 1.5)  !- type
+
+;; positions are offsets into the data: a negative or null one used to read before
+;; it (a segfault or a hang for a null), one past the end read after it
+(at (try (split [1 2 3 4 5] [-1 2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0Nl 2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0i 0Ni]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0h 0Nh]) (fn [e] e)) 'code) -- 'domain
+(at (try (split (list 1 2 3) [0 -2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split "hello" [-3 2]) (fn [e] e)) 'code) -- 'domain
+(split [1 2 3 4 5] [0 9]) -- (list [1 2 3 4 5] [])
+(split (list 1 2 3) [1 9]) -- (list [2 3] ())
+(split "hello" [0 9]) -- (list "hello" "")

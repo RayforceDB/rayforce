@@ -767,6 +767,20 @@ ray_t* ray_str_join_fn(ray_t* items, ray_t* delim) {
     return out;
 }
 
+/* Positions of a split by indices.  A position is an offset into the data, so
+ * a negative one (a null reads as the smallest integer) addressed memory before
+ * it; one past the end addressed memory after it.  The string form always
+ * clamped the latter, and now every form does; the former is an error. */
+static ray_t* split_positions_check(int64_t* idx, int64_t n, int64_t total) {
+    for (int64_t i = 0; i < n; i++) {
+        if (idx[i] < 0)
+            return ray_error("domain", "split: positions must not be negative or null, got %lld at index %lld",
+                             (long long)idx[i], (long long)i);
+        if (idx[i] > total) idx[i] = total;
+    }
+    return NULL;
+}
+
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
     if (str->type == RAY_LIST &&
@@ -781,6 +795,8 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx, str->len);
+        if (bad_pos) return bad_pos;
         int64_t total = str->len;
         ray_t** items = (ray_t**)ray_data(str);
         ray_t* result = ray_list_new(nidx + 1);
@@ -840,6 +856,9 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx,
+            ray_is_atom(str) ? (int64_t)ray_str_len(str) : str->len);
+        if (bad_pos) return bad_pos;
         /* String split by indices */
         if (ray_is_atom(str) && (-str->type) == RAY_STR) {
             const char* sp2 = ray_str_ptr(str);
