@@ -223,7 +223,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
             case OP_MUL: r = lv * rv; break;
             case OP_DIV: r = rv != 0.0 ? lv / rv : NAN; break;
             case OP_IDIV: r = rv != 0.0 ? floor(lv / rv) : NAN; break;
-            case OP_MOD: { if (rv != 0.0) { r = fmod(lv, rv); if (r && ((r > 0) != (rv > 0))) r += rv; } else { r = NAN; } } break;
+            case OP_MOD: r = rv != 0.0 ? ray_fmod_floor(lv, rv) : NAN; break;
             case OP_POW: r = (lv != lv || rv != rv) ? NAN : pow(lv, rv); break;
             case OP_MIN2: r = lv < rv ? lv : rv; break;
             case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -2108,12 +2108,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] * b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
             case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
-            case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                if (b[j] == 0.0) { d[j] = NULL_F64; continue; }
-                double m = fmod(a[j], b[j]);
-                m = (m && ((m > 0) != (b[j] > 0))) ? m + b[j] : m;
-                d[j] = ray_f64_fin(m);
-            } break;
+            case OP_MOD: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64; break;
             case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
@@ -5379,7 +5374,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=ray_f64_fin(lv*rv); } break;
             case OP_DIV:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(lv/rv):NULL_F64; } break;
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(floor(lv/rv)):NULL_F64; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); double r; if(rv!=0.0){r=fmod(lv,rv);if(r&&((r>0)!=(rv>0)))r+=rv; r=ray_f64_fin(r);}else r=NULL_F64; odst[i]=r; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(ray_fmod_floor(lv,rv)):NULL_F64; } break;
             case OP_POW:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=(lv!=lv||rv!=rv)?NULL_F64:ray_f64_fin(pow(lv,rv)); } break;
             case OP_MIN2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
             case OP_MAX2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
@@ -5406,7 +5401,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_ADD:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)+RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_SUB:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)-RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_MUL:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)*RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=fmodf(lv,rv);if(v&&((v>0)!=(rv>0)))v+=rv;v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=ray_fmod_floor_f32(lv,rv);v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
             /* div over two F32 operands keeps F32 (#972): the floor of the
              * double quotient, rounded once, as the atom builtin does. */
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_to_f32_fin(floor(lv/rv)):NULL_F32; } break;
