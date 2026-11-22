@@ -101,7 +101,9 @@ ray_sym_domain_t* ray_sym_domain_open(const char* path);
 
 /* Like ray_sym_domain_open, but a missing file yields a fresh EMPTY
  * domain (vocabulary written on first flush).  The save path's
- * open-or-create entry point. */
+ * open-or-create entry point.  A cached domain whose file was deleted
+ * (its root removed while columns still hold it) leaves the cache to its
+ * holders, and the path starts afresh with a new domain. */
 ray_sym_domain_t* ray_sym_domain_open_or_create(const char* path);
 
 /* A fresh symbol file at `path` that one converter builds alone, the

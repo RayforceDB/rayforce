@@ -1,0 +1,81 @@
+;; @also-unfused
+;; A root is deleted while a table read from it is still held, then written
+;; again with the same symfile (#1364).  The held table's columns keep the
+;; old symfile's domain alive; the write must not try to revalidate that
+;; domain against a file that is gone (it failed with io), and must start the
+;; symfile afresh as it would with nothing held.  The held table keeps
+;; reading its own symbols from its mappings; a fresh read sees the new ones.
+;; The runner runs this file twice in one process, so the second run starts
+;; with every table of the first still held: its first delete and write are
+;; the same case.
+
+(set I (til 70000))
+(set T (table [k c] (list I (at ['a 'b 'c 'd] (% I 4)))))
+(set U (table [k c] (list (til 6) ['x 'y 'z 'x 'y 'w])))
+(set V (table [k c] (list (til 4) ['p 'q 'r 'p])))
+
+;; ─── parted, the case of the issue ─────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted/2024.01.01/t/" (take T 100) "/tmp/rfl_symfile_root_deleted/.sym")) -- 100
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted/2024.01.02/t/" (take T 50) "/tmp/rfl_symfile_root_deleted/.sym")) -- 50
+(set P (.db.parted.get "/tmp/rfl_symfile_root_deleted" 't))
+(count P) -- 150
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted/2024.01.01/t/" U "/tmp/rfl_symfile_root_deleted/.sym")) -- 6
+
+;; the held table: its old rows and symbols
+(count P) -- 150
+(at (select {n: (count k) from: P by: c}) 'n) -- [38 38 37 37]
+(count (select {from: P where: (== c 'b)})) -- 38
+(at (select {from: P where: (== k 5)}) 'c) -- ['b 'b]
+(at (select {from: P where: (== c 'x)}) 'c) -- (take 'a 0)
+
+;; a fresh mount: the new rows and symbols
+(set Q (.db.parted.get "/tmp/rfl_symfile_root_deleted" 't))
+(at Q 'c) -- ['x 'y 'z 'x 'y 'w]
+(at (select {from: Q where: (== c 'x)}) 'k) -- [0 3]
+(count (select {from: Q where: (== c 'b)})) -- 0
+
+;; ─── another table under the same root ─────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted/2024.01.01/u/" U "/tmp/rfl_symfile_root_deleted/.sym")) -- 6
+(at (.db.parted.get "/tmp/rfl_symfile_root_deleted" 'u) 'c) -- ['x 'y 'z 'x 'y 'w]
+(at P 'c) -- (at (raze (list (take T 100) (take T 50))) 'c)
+(at Q 'c) -- ['x 'y 'z 'x 'y 'w]
+
+;; ─── a splayed table held across the delete ────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted_s") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted_s/s/" V)) -- 4
+(set S (.db.splayed.get "/tmp/rfl_symfile_root_deleted_s/s/"))
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted_s") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted_s/s/" U)) -- 6
+(at S 'c) -- ['p 'q 'r 'p]
+(at (.db.splayed.get "/tmp/rfl_symfile_root_deleted_s/s/") 'c) -- ['x 'y 'z 'x 'y 'w]
+
+;; ─── a symfile per column ──────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted_c") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted_c/s/" V {symfile: 'column})) -- 4
+(set C (.db.splayed.get "/tmp/rfl_symfile_root_deleted_c/s/"))
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted_c") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted_c/s/" U {symfile: 'column})) -- 6
+(at C 'c) -- ['p 'q 'r 'p]
+(at (.db.splayed.get "/tmp/rfl_symfile_root_deleted_c/s/") 'c) -- ['x 'y 'z 'x 'y 'w]
+
+;; ─── an overlapping vocabulary in another order ────────────────────────
+;; The rewrite interns the old symbols again in reverse, so each new id
+;; names another text than the held table's same id.  Across the two
+;; domains, comparison, membership and grouping go by text.
+(set W (table [k c] (list (til 4) ['d 'c 'b 'a])))
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted") -- 0
+(count (.db.splayed.set "/tmp/rfl_symfile_root_deleted/2024.01.01/t/" W "/tmp/rfl_symfile_root_deleted/.sym")) -- 4
+(set R (.db.parted.get "/tmp/rfl_symfile_root_deleted" 't))
+(at R 'c) -- ['d 'c 'b 'a]
+(set RC (at R 'c))
+(take (at P 'c) 4) -- ['a 'b 'c 'd]
+(== (take (at P 'c) 4) (at R 'c)) -- [false false false false]
+(== (reverse (take (at P 'c) 4)) (at R 'c)) -- [true true true true]
+(in (at R 'c) (at P 'c)) -- [true true true true]
+(count (select {from: P where: (in c RC)})) -- 150
+(at (select {n: (count k) from: P where: (== c (first RC)) by: c}) 'n) -- [37]
+(count (distinct (raze (list (at R 'c) (take (at P 'c) 4))))) -- 4
+(.sys.exec "rm -rf /tmp/rfl_symfile_root_deleted") -- 0
