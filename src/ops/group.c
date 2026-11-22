@@ -10296,6 +10296,21 @@ static void scalar_sum_linear_i64_fn(void* ctx, uint32_t worker_id, int64_t star
     acc->count[0] += n;
 }
 
+/* The same when the no-wrap proof's pass already summed the terms
+ * (agg_linear_t.pre, #1287): each range counts its rows, and the one at row
+ * 0 adds the column's total, so the fold gives it once in any chunk order. */
+static void scalar_sum_linear_pre_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    scalar_ctx_t* c = (scalar_ctx_t*)ctx;
+    da_accum_t* acc = c->acc;
+    if (start == 0) {
+        int64_t s = c->agg_linear[0].pre_sum;
+        if (acc->sum_hi) ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, s);
+        else acc->sum[0].i = wrap_add_i64(acc->sum[0].i, s);
+    }
+    acc->count[0] += end - start;
+}
+
 /* An input the scalar route reads by pieces when it is staged: a fixed-width
  * type and a streaming op that scalar_accum_row (or a tight kernel) computes
  * from the values alone.  A count of any type reads no values (it counts
@@ -16185,6 +16200,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     /* The scalar route is the one that emits a FLOAT affine bias over an
      * integer column as F64 (emit_agg_columns); the others decline it. */
     bool sc_route = n_keys == 0 && nrows > 0 && !sc_has_binary;
+    /* A lone keyless SUM / AVG over every row: the scalar route's tight
+     * kernel, where a narrow linear plan may take its pass's total alone
+     * (agg_linear_t.pre_only, #1287). */
+    bool sc_lone = n_keys == 0 && nrows > 0 && n_aggs == 1 && !match_idx && !rowsel;
 
     ray_t* rerr = NULL;     /* a failed column bind in the planners below */
     for (uint32_t a = 0; a < n_aggs; a++) {
@@ -16194,7 +16213,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, tbl, agg_input_op, sc_route,
+            try_affine_sumavg_input(g, tbl, agg_input_op, sc_route, sc_lone,
                                     &agg_vecs[a], &agg_affine[a], &rerr)) {
             if (agg_vecs[a] && agg_vecs[a]->type == RAY_ENCCOL) {   /* staged base */
                 rerr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);
@@ -16223,7 +16242,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * without materializing the expression vector. */
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_linear_sumavg_input_i64(g, tbl, agg_input_op, &agg_linear[a], &rerr)) {
+            try_linear_sumavg_input_i64(g, tbl, agg_input_op, sc_lone, &agg_linear[a], &rerr)) {
             continue;
         }
         if (rerr) goto resolve_fail;
@@ -16875,7 +16894,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             /* The fallback emit cannot apply an F64 affine bias.  Report
              * the allocation failure instead of returning an I64 sum with
              * the bias silently dropped. */
-            if (sc_has_f64_affine) {
+            if (sc_has_f64_affine || agg_linear[0].pre_only) {   /* nor a pass's total */
                 rerr = ray_error("oom", NULL);
                 goto resolve_fail;
             }
@@ -17001,7 +17020,16 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         } else if (n_aggs == 1 && !match_idx && !rowsel && agg_linear[0].enabled) {
             uint16_t op0 = ext->agg_ops[0];
             if (op0 == OP_SUM || op0 == OP_AVG)
-                sc_fn = scalar_sum_linear_i64_fn;
+                sc_fn = agg_linear[0].pre ? scalar_sum_linear_pre_fn : scalar_sum_linear_i64_fn;
+        }
+        if (sc_fn == scalar_sum_linear_pre_fn)
+            atomic_fetch_add_explicit(&ray_narrow_sum_routes[NARROW_SUM_PRE], 1, memory_order_relaxed);
+        else if (agg_linear[0].pre_only) {
+            /* planned for the lone kernel (sc_lone): its total is the only answer */
+            scratch_free(sc_hdr);
+            scratch_free(sc_vla_hdr);
+            rerr = ray_error("nyi", "narrow linear sum: total outside the scalar kernel");
+            goto resolve_fail;
         }
 
         sc_ctx.range_fn = sc_fn;
@@ -17015,7 +17043,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             for (uint32_t a = 0; a < n_aggs; a++)
                 if (sc_srcs[a] && !sc_plain[a]) ray_col_src_advise(sc_srcs[a], 0, nrows);
         scalar_red_ctx_t sc_rc = { .c = &sc_ctx, .cc = sc_by_chunk ? &sc_cc : NULL };
-        bool sc_par = sc_n > 1 && ray_pool_par_dispatch_ok(sc_pool, n_scan, RAY_PARALLEL_THRESHOLD) &&
+        /* the pre-summed plan reads no rows: its chunks fold in a moment */
+        bool sc_par = sc_n > 1 && sc_fn != scalar_sum_linear_pre_fn &&
+                      ray_pool_par_dispatch_ok(sc_pool, n_scan, RAY_PARALLEL_THRESHOLD) &&
                       atomic_load_explicit(&g_scalar_test_grain, memory_order_relaxed) <= 0;
         if (sc_par) ray_pool_dispatch_n(sc_pool, scalar_red_chunk_fn, &sc_rc, (uint32_t)sc_n);
         else scalar_red_chunk_fn(&sc_rc, 0, 0, sc_n);

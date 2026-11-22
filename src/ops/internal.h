@@ -1052,6 +1052,14 @@ typedef struct {
     int8_t  term_types[AGG_LINEAR_MAX_TERMS];
     int64_t coeff_i64[AGG_LINEAR_MAX_TERMS];
     int64_t bias_i64;
+    /* The no-wrap proof of a narrow expression (#1287) read every term:
+     * pre_sum is the whole column's total, exact (it cannot leave int64),
+     * and a lone unfiltered SUM / AVG takes it without a pass. */
+    bool    pre;
+    int64_t pre_sum;
+    /* pre_sum also holds rows the pass summed row by row (they could wrap):
+     * the plan is the total alone, never the per-row terms */
+    bool    pre_only;
 } agg_linear_t;
 
 typedef struct {
@@ -1085,6 +1093,18 @@ typedef enum {
 
 extern uint64_t ray_expr_bail_counts[EXPR_BAIL__N];
 extern uint64_t ray_expr_compile_ok;
+/* #1287: the narrow linear / affine sum plans, by how the no-wrap proof
+ * went (diagnostic and test counters, not synchronized): proved from the
+ * types, from column metadata, by a min/max pass; refused. */
+typedef enum {
+    NARROW_SUM_TYPE, NARROW_SUM_META, NARROW_SUM_SCAN,
+    NARROW_SUM_PARTIAL,   /* the pass summed the slices it could not prove row by row */
+    NARROW_SUM_SAMPLE,    /* refused by the sample blocks, no pass */
+    NARROW_SUM_REFUSED,
+    NARROW_SUM_PRE,       /* a lone SUM / AVG took the pass's total (group.c) */
+    NARROW_SUM__N
+} narrow_sum_route_t;
+extern _Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
 extern bool     ray_expr_disable;
 extern bool     ray_opt_no_group_pushdown;
 extern bool     ray_join_no_build_swap;
@@ -1453,9 +1473,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
  * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
  * yet materialized declines them (*err NULL). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                             bool f64_bias_ok,
+                             bool f64_bias_ok, bool defer_scan,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
                                  agg_linear_t* out_plan, ray_t** err);
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                agg_prod_t* out, ray_t** err);

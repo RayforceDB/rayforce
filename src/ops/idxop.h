@@ -335,6 +335,10 @@ bool   ray_idx_lazy_hash_wanted(const ray_t* col);
  * element of the integer vector set.  The caller has ruled out nulls. */
 bool   ray_idx_zone_excludes(const ray_t* col, int64_t key);
 bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
+/* The whole-column [min, max] of an integer column's non-null values from
+ * its fresh CHUNK_ZONE or ZONE, never scanning; false without one (or with
+ * no non-null value). */
+bool   ray_idx_int_bounds(ray_t* col, int64_t* lo, int64_t* hi);
 /* Directory twins for a single-file generation-2 column (encv a
  * RAY_ENCCOL): the answer the zone its materialization would synthesize
  * (enc_synth_zone / enc_synth_chunk_zone, src/store/enccol.c) gives,

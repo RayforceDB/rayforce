@@ -5414,6 +5414,16 @@ static bool chunk_zone_extrema(const ray_t* col, int64_t* gmin, int64_t* gmax, u
     return true;
 }
 
+bool ray_idx_int_bounds(ray_t* col, int64_t* lo, int64_t* hi) {
+    if (chunk_zone_extrema(col, lo, hi, NULL)) return true;
+    if (!idx_fresh(col, RAY_IDX_ZONE) || (col->attrs & RAY_ATTR_SLICE)) return false;
+    if (numeric_elem_size(col->type) == 0 || col->type == RAY_F32 || col->type == RAY_F64) return false;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->u.zone.n_nulls >= col->len) return false;   /* no value: min = max = 0 */
+    *lo = ix->u.zone.min_i; *hi = ix->u.zone.max_i;
+    return true;
+}
+
 bool ray_idx_zone_excludes(const ray_t* col, int64_t key) {
     int64_t lo, hi;
     return chunk_zone_extrema(col, &lo, &hi, NULL) && (key < lo || key > hi);

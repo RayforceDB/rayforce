@@ -2621,7 +2621,7 @@ static test_result_t test_try_plans_bound(void) {
         ray_enc_counters_t kb; ray_enc_counters_get(&kb);
         TEST_ASSERT_EQ_U(kb.materialized, 0);               /* DAG construction decodes nothing */
         ray_enc_counters_reset();
-        TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, &lin, &err)); TEST_ASSERT_NULL(err);
+        TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, false, &lin, &err)); TEST_ASSERT_NULL(err);
         TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_ii, &prod, &err));    TEST_ASSERT_NULL(err);
         TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fv, &prod, &err));    TEST_ASSERT_NULL(err);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
@@ -2633,23 +2633,23 @@ static test_result_t test_try_plans_bound(void) {
              * pointers, so encoded terms not yet materialized decline them
              * (a shape decline: *err NULL, nothing decoded); the affine plan
              * hands back the encoded object for the caller to bind. */
-            TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_lin, false, &lin, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));   TEST_ASSERT_NULL(err);
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));   TEST_ASSERT_NULL(err);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_ENCCOL);
             TEST_ASSERT_TRUE(vec == ray_table_get_col_enc(t, ray_sym_intern("f", 1)));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_ENCCOL);
             ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0);
             /* a published materialization is a ready column: the plans take it */
             ray_t* fa = ray_table_col(t, ray_sym_intern("a", 1));
             ray_t* fb = ray_table_col(t, ray_sym_intern("b", 1));
             TEST_ASSERT_TRUE(fa && !RAY_IS_ERR(fa) && fb && !RAY_IS_ERR(fb));
-            TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, false, &lin, &err));
             TEST_ASSERT_TRUE(lin.term_ptrs[0] == ray_data(fb) || lin.term_ptrs[0] == ray_data(fa));
             ray_t* ff = ray_table_col(t, ray_sym_intern("f", 1));
             ray_t* fg = ray_table_col(t, ray_sym_intern("g", 1));
@@ -2657,14 +2657,14 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(prod.pa == ray_data(ff) && prod.pb == ray_data(fg));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(vec == ff && vec->type == RAY_F64 && aff.bias_f64 == -1.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(vec == fa && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         } else {
             /* linear: 2 * b + a + 7 */
-            TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, false, &lin, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 2 && lin.bias_i64 == 7);
             for (int64_t i = 0; i < CP_N; i += 997) {
@@ -2682,12 +2682,12 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
             /* affine: f - 1.5, a + 5 */
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
             TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         }
 
@@ -2704,7 +2704,7 @@ static test_result_t test_try_plans_bound(void) {
         ray_op_t* da = cp_dag(gr, "(- f 1.5)", &e3);
         TEST_ASSERT_TRUE(dl && dp && da);
         ray_graph_bind_test_fail_alloc(1);
-        bool r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+        bool r = try_linear_sumavg_input_i64(gr, t, dl, false, &lin, &err);
         ray_graph_bind_test_fail_alloc(0);
         bool bind_err = !r && cp_is_bind_error(err);
         if (err) ray_error_free(err);
@@ -2716,7 +2716,7 @@ static test_result_t test_try_plans_bound(void) {
         if (err) ray_error_free(err);
         err = NULL;
         ray_graph_bind_test_fail_alloc(1);
-        r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
+        r = try_affine_sumavg_input(gr, t, da, false, false, &vec, &aff, &err);
         ray_graph_bind_test_fail_alloc(0);
         bool bind_err3 = !r && cp_is_bind_error(err);
         if (err) ray_error_free(err);
@@ -2727,7 +2727,7 @@ static test_result_t test_try_plans_bound(void) {
          * encoded object), so the failure never fires */
         if (gen == 2) {
             ray_enccol_test_fail_alloc(1);
-            r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+            r = try_linear_sumavg_input_i64(gr, t, dl, false, &lin, &err);
             ray_enccol_test_fail_alloc(0);
             bool plain_err = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);
@@ -2740,7 +2740,7 @@ static test_result_t test_try_plans_bound(void) {
             err = NULL;
             ray_enccol_test_fail_alloc(1);
             memset(&aff, 0, sizeof aff);
-            r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
+            r = try_affine_sumavg_input(gr, t, da, false, false, &vec, &aff, &err);
             ray_enccol_test_fail_alloc(0);
             bool plain_err3 = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);
