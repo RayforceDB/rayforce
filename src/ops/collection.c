@@ -1596,7 +1596,12 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
     if (!is_list(vec) || !is_list(mask)) { if (_bx1) ray_release(_bx1); if (_bx2) ray_release(_bx2); return ray_error("type", "filter: vec and mask must be lists, got %s and %s", ray_type_name(vec->type), ray_type_name(mask->type)); }
     int64_t len = ray_len(vec);
     int64_t mlen = ray_len(mask);
-    if (len != mlen) return ray_error("length", "filter: mask length must equal vec length %lld, got %lld", (long long)len, (long long)mlen);
+    if (len != mlen) {
+        ray_t* err = ray_error("length", "filter: mask length must equal vec length %lld, got %lld", (long long)len, (long long)mlen);
+        if (_bx1) ray_release(_bx1);
+        if (_bx2) ray_release(_bx2);
+        return err;
+    }
 
     ray_t** velems = (ray_t**)ray_data(vec);
     ray_t** melems = (ray_t**)ray_data(mask);
