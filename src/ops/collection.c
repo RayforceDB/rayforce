@@ -4753,6 +4753,13 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 ray_t* one = ray_find_fn(vec, ve);   /* scalar → i64 atom or 0Nl */
                 if (alloc) ray_release(ve);
                 if (RAY_IS_ERR(one)) { ray_release(result); return one; }
+                /* One cell gives one row: a cell that is itself a set of
+                 * needles (a list cell over an atom haystack) is not a row. */
+                if (!ray_is_atom(one)) {
+                    ray_release(one); ray_release(result);
+                    return ray_error("type", "find: a needle cell must be one value for this haystack, got %s",
+                                     ray_type_name(ve ? ve->type : 0));
+                }
                 if (RAY_ATOM_IS_NULL(one)) { out[j] = NULL_I64; any_null = true; }
                 else out[j] = one->i64;
                 ray_release(one);

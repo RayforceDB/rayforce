@@ -20,3 +20,6 @@
 (find (table [a] (list [1 2])) (list [1 2])) !- type
 (find (dict [a] (list 1)) (list [1 2])) !- type
 (find 5 (list [1 2])) !- type
+(find "abc" (list (list "c"))) !- type
+(find "abc" (list (as 'STR (list "c" "a")))) !- type
+(find "abc" (list "c")) -- [2]
