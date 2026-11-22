@@ -1223,6 +1223,18 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
     return false;
 }
 
+/* `(+ temporal int)` and friends lower to the integer + / - with a CAST
+ * back to the temporal type, flagged OP_FLAG_TEMPORAL_INT
+ * (dag_temporal_int_arith, query.c).  The builtin reads a result that
+ * wraps onto the lane's sentinel as a null, so that CAST is a null
+ * producer: its register is nullable and the output is scanned for the
+ * sentinel (expr_flag_output_nulls), where the integer kernels keep the
+ * wrapped value as a number.  (The xbar CAST is not flagged.) */
+static bool expr_temporal_arith_cast(ray_graph_t* g, ray_op_t* node) {
+    (void)g;
+    return node->opcode == OP_CAST && (node->flags & OP_FLAG_TEMPORAL_INT);
+}
+
 /* A CAST may target a temporal type (the DAG retags a bucketed temporal
  * column, see the xbar branch of compile_expr_dag).  TIMESTAMP is an I64
  * lane and DATE / TIME are I32 lanes: the kernels, and the capability table,
@@ -1776,7 +1788,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 bool in_src  = out->regs[s1].null_src ||
                                (s2 != 0xFF && out->regs[s2].null_src);
                 bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
-                                                       s2 != 0xFF);
+                                                       s2 != 0xFF) ||
+                                expr_temporal_arith_cast(g, node);
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
                 if (in_null) {
@@ -3410,14 +3423,16 @@ static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t n
     uint8_t o = expr->out_reg;
     if (!expr->regs[o].nullable) return;
     if (expr->regs[o].null_src) { out->attrs |= RAY_ATTR_HAS_NULLS; return; }
-    if (expr->out_type == RAY_I64)      mark_i64_overflow_as_null(out, 0, nrows);
+    if (expr->out_type == RAY_I64 || expr->out_type == RAY_TIMESTAMP)
+        mark_i64_overflow_as_null(out, 0, nrows);
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
-    else if (expr->out_type == RAY_I32 || expr->out_type == RAY_I16) {
+    else if (expr->out_type == RAY_I32 || expr->out_type == RAY_I16 ||
+             expr->out_type == RAY_DATE || expr->out_type == RAY_TIME) {
         /* a narrowed result (#973): the null-aware CAST wrote the narrow
          * sentinel where the I64 lane held a produced null */
         const void* d = ray_data(out);
         bool any = false;
-        if (expr->out_type == RAY_I32)
+        if (expr->out_type != RAY_I16)
             for (int64_t i = 0; i < nrows && !any; i++) any = ((const int32_t*)d)[i] == NULL_I32;
         else
             for (int64_t i = 0; i < nrows && !any; i++) any = ((const int16_t*)d)[i] == NULL_I16;
@@ -4772,6 +4787,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
      * add/sub/mul/div perf-gate kernels, so the single pass is acceptable. */
     if (out_type == RAY_F64 && expr_is_f64_unary_math(op->opcode))
         mark_f64_nonfinite_as_null(result, 0, len);
+
+    /* A temporal +/- integer wrapped onto the sentinel is a null, as the
+     * builtin and the fused CAST read it (expr_temporal_arith_cast). */
+    if (g && expr_temporal_arith_cast(g, op)) {
+        if (out_type == RAY_TIMESTAMP) mark_i64_overflow_as_null(result, 0, len);
+        else {
+            const int32_t* d = (const int32_t*)ray_data(result);
+            for (int64_t i = 0; i < len; i++)
+                if (d[i] == NULL_I32) { result->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        }
+    }
 
     return result;
 }

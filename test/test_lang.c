@@ -2099,6 +2099,90 @@ static test_result_t test_eval_guid_cancel(void) {
     PASS();
 }
 
+/* Temporal +/- integer (#1302) over slices, past the parallel threshold: a
+ * slice reads through its parent as a copy of the same cells does, the
+ * answer is the same bytes and null flag, and a cancel under the dispatch
+ * answers "cancel" with nothing left allocated. */
+static test_result_t test_eval_temporal_int_slice(void) {
+    ray_t* d = ray_eval_str("(set _td (at (concat (as 'DATE (as 'I32 (- (* (% (til 131073) 7919) 271217) 1073741824))) (enlist 0Nd)) "
+                            "(+ (til 131073) (* (- 131073 (til 131073)) (as 'I64 (== 0 (% (til 131073) 1000)))))))");
+    ray_t* t = ray_eval_str("(set _tt (as 'TIME (as 'I32 (- (til 131073) 65536))))");
+    ray_t* x = ray_eval_str("(set _tx (at (concat (as 'I32 (- (* (til 131073) 543217) 7)) (enlist 0Ni)) "
+                            "(+ (til 131073) (* (- 131073 (til 131073)) (as 'I64 (== 0 (% (til 131073) 333)))))))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && t && !RAY_IS_ERR(t) && x && !RAY_IS_ERR(x));
+    int64_t off = 5, len = 100003;
+    TEST_ASSERT_TRUE(len >= RAY_PARALLEL_THRESHOLD);
+    ray_t* ds = ray_vec_slice(d, off, len);
+    ray_t* ts = ray_vec_slice(t, off, len);
+    ray_t* xs = ray_vec_slice(x, off, len);
+    TEST_ASSERT_TRUE(ds && !RAY_IS_ERR(ds) && (ds->attrs & RAY_ATTR_SLICE));
+    TEST_ASSERT_TRUE(ts && !RAY_IS_ERR(ts) && xs && !RAY_IS_ERR(xs));
+    ray_t* dc = ray_vec_new(RAY_DATE, len);
+    ray_t* tc = ray_vec_new(RAY_TIME, len);
+    ray_t* xc = ray_vec_new(RAY_I32, len);
+    dc->len = tc->len = xc->len = len;
+    memcpy(ray_data(dc), (int32_t*)ray_data(d) + off, (size_t)len * 4);
+    memcpy(ray_data(tc), (int32_t*)ray_data(t) + off, (size_t)len * 4);
+    memcpy(ray_data(xc), (int32_t*)ray_data(x) + off, (size_t)len * 4);
+    dc->attrs |= d->attrs & RAY_ATTR_HAS_NULLS;
+    xc->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
+    ray_t* one = ray_i64(4294967297LL);
+    for (int c = 0; c < 4; c++) {
+        ray_t* a = c == 0 ? atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs)
+                 : c == 1 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, ds, one)
+                 : c == 2 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, xs, ts)
+                 :          atomic_map_binary_op(ray_add_fn, OP_ADD, one, ts);
+        ray_t* b = c == 0 ? atomic_map_binary_op(ray_add_fn, OP_ADD, dc, xc)
+                 : c == 1 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, dc, one)
+                 : c == 2 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, xc, tc)
+                 :          atomic_map_binary_op(ray_add_fn, OP_ADD, one, tc);
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b));
+        TEST_ASSERT_EQ_I(a->type, c < 2 ? RAY_DATE : RAY_TIME);
+        TEST_ASSERT_EQ_I(a->type, b->type);
+        TEST_ASSERT_EQ_I(a->len, len);
+        TEST_ASSERT_EQ_I(a->attrs & RAY_ATTR_HAS_NULLS, b->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_TRUE(memcmp(ray_data(a), ray_data(b), (size_t)len * 4) == 0);
+        if (c == 0) {   /* a null on either side, nothing else */
+            const int32_t* o = (const int32_t*)ray_data(a);
+            const int32_t* pd = (const int32_t*)ray_data(d) + off;
+            const int32_t* px = (const int32_t*)ray_data(x) + off;
+            for (int64_t i = 0; i < len; i++) {
+                int32_t want = (pd[i] == NULL_I32 || px[i] == NULL_I32) ? NULL_I32
+                             : (int32_t)((uint32_t)pd[i] + (uint32_t)px[i]);
+                TEST_ASSERT_FMT(o[i] == want, "row %lld: %d, want %d", (long long)i, o[i], want);
+            }
+            TEST_ASSERT_TRUE(a->attrs & RAY_ATTR_HAS_NULLS);
+        }
+        ray_release(a);
+        ray_release(b);
+    }
+    /* a cancel under the dispatch */
+    if (ray_pool_get()) {
+        ray_t* w = atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs);   /* warm up */
+        TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+        ray_release(w);
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_request_interrupt();
+        ray_t* r = atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs);
+        bool still = ray_interrupted();
+        ray_clear_interrupt();
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        TEST_ASSERT_TRUE(still);
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "%zu bytes before, %zu after", m0.bytes_allocated, m1.bytes_allocated);
+    }
+    ray_release(one);
+    ray_release(dc); ray_release(tc); ray_release(xc);
+    ray_release(ds); ray_release(ts); ray_release(xs);
+    ray_release(d); ray_release(t); ray_release(x);
+    PASS();
+}
+
 /* ---- Test: except ---- */
 static test_result_t test_eval_except(void) {
     ray_t* result = ray_eval_str("(except [1 2 3] [2])");
@@ -2686,7 +2770,7 @@ static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
         }
     }
     static const char* const other[] = {
-        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1)", "(* t 2)", "(pow ts 2)",
+        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1.5)", "(* t 2)", "(pow ts 2)",
     };
     for (size_t k = 0; k < sizeof other / sizeof *other; k++) {
         ray_t* expr = ray_parse(other[k]);
@@ -2699,6 +2783,78 @@ static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
         ray_graph_free(g);
         ray_release(expr);
     }
+    ray_release(tbl);
+    PASS();
+}
+
+/* ---- Test: temporal +/- an integer lowers to the DAG (#1302) ----
+ * The builtin answers the raw count plus the offset wrapped to the temporal
+ * lane; the integer + / - computes the same in the lane's width, so
+ * compile_expr_dag lowers it to ADD / SUB cast back to the temporal type:
+ * any integer beside a TIMESTAMP, an I32 or narrower column or any non-null
+ * integer literal beside a DATE or TIME (an I64 literal by its low 32 bits),
+ * + in either order and int - TIME.  An I64 column beside a DATE or TIME
+ * (planned in I64, whose own sentinel would come first), a literal whose low
+ * 32 bits are the I32 null, a null or float literal, int - DATE / TIMESTAMP
+ * (an error) and a temporal literal decline (NULL) to the builtin. */
+static test_result_t test_eval_select_temporal_int_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts i h b u l] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "(as 'I32 [2 3]) (as 'I16 [2 3]) (as 'B8 [1 0]) (as 'U8 [2 3]) [2 3]))");
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    static const struct { const char* src; int8_t type; uint16_t op; } lowers[] = {
+        { "(+ d 2)", RAY_DATE, OP_ADD },         { "(- d 2i)", RAY_DATE, OP_SUB },
+        { "(+ 2h d)", RAY_DATE, OP_ADD },        { "(+ d i)", RAY_DATE, OP_ADD },
+        { "(- d h)", RAY_DATE, OP_SUB },         { "(+ b d)", RAY_DATE, OP_ADD },
+        { "(+ d 5000000000)", RAY_DATE, OP_ADD },{ "(- t u)", RAY_TIME, OP_SUB },
+        { "(- i t)", RAY_TIME, OP_SUB },         { "(- 5 t)", RAY_TIME, OP_SUB },
+        { "(+ ts l)", RAY_TIMESTAMP, OP_ADD },   { "(- ts i)", RAY_TIMESTAMP, OP_SUB },
+        { "(+ 1000 ts)", RAY_TIMESTAMP, OP_ADD },{ "(+ (+ d 1) i)", RAY_DATE, OP_ADD },
+    };
+    /* ... and is read only by another such pair or an `if` over arms of
+     * its type (dag_temporal_int_readers_ok): any other reader declines, as
+     * the builtin pair did before it lowered */
+    static const char* const declines[] = {
+        "(+ d l)", "(- t l)", "(+ l t)", "(+ d 2147483648)", "(+ d 0N)", "(+ d 2.5)",
+        "(- 5 d)", "(- i ts)", "(+ 2024.01.01 i)", "(+ d d)", "(* d 2)",
+        "(nil? (+ d 1))", "(== (+ d 1) d)", "(as 'I64 (+ ts 1))", "(sum (+ t 1))",
+        "(if (> i 2) d (+ t 1))", "(if (> i 2) (+ d 1) ts)", "(if (> i 2) (+ d 1) 0Nd)",
+        "(cond ((> i 2) (+ d 1)) (else d))", "(xbar (+ d 1) 7)", "(nil? (if (> i 2) d (+ d 1)))",
+    };
+    for (size_t k = 0; k < sizeof lowers / sizeof *lowers + sizeof declines / sizeof *declines; k++) {
+        bool want = k < sizeof lowers / sizeof *lowers;
+        const char* src = want ? lowers[k].src : declines[k - sizeof lowers / sizeof *lowers];
+        ray_t* expr = ray_parse(src);
+        TEST_ASSERT_TRUE(expr && !RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d", src, op != NULL, want);
+        if (op) {
+            TEST_ASSERT_FMT(op->opcode == OP_CAST && op->out_type == lowers[k].type,
+                            "%s: opcode %d out_type %d", src, (int)op->opcode, (int)op->out_type);
+            TEST_ASSERT_TRUE(op->flags & OP_FLAG_TEMPORAL_INT);
+            ray_op_t* m = &g->nodes[op->in_id[0]];
+            TEST_ASSERT_FMT(m->opcode == lowers[k].op, "%s: input opcode %d", src, (int)m->opcode);
+            /* a DATE / TIME sum is planned in I32, where it wraps as the builtin's */
+            if (lowers[k].type != RAY_TIMESTAMP)
+                TEST_ASSERT_FMT(m->out_type == RAY_I32, "%s: planned %d", src, (int)m->out_type);
+        }
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    /* an `if` whose arms are both of the pair's type stands for it */
+    ray_t* expr = ray_parse("(if (> i 2) d (+ d 1))");
+    TEST_ASSERT_TRUE(expr && !RAY_IS_ERR(expr));
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* op = compile_expr_dag(g, expr);
+    TEST_ASSERT_TRUE(op && op->opcode == OP_IF && op->out_type == RAY_DATE &&
+                     (op->flags & OP_FLAG_TEMPORAL_INT));
+    ray_graph_free(g);
+    ray_release(expr);
     ray_release(tbl);
     PASS();
 }
@@ -13632,6 +13788,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
+    { "lang/eval/temporal_int_slice", test_eval_temporal_int_slice, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },
@@ -13653,6 +13810,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_temporal_int_dag_admission", test_eval_select_temporal_int_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/empty_probe_error_ownership", test_eval_empty_probe_error_ownership, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },

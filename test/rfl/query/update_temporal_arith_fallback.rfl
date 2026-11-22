@@ -1,5 +1,5 @@
 ;; update_temporal_arith_fallback.rfl — `update` of a NEW column, and `update
-;; by:`, whose expression the DAG declines (temporal + - *) fall back to
+;; by:`, whose expression the DAG declines (a point difference) fall back to
 ;; eval-level evaluation like an update of an existing column already does.
 ;;
 ;; Both sites returned "failed to compile ... expression" instead, while the
@@ -13,12 +13,11 @@
 (type (at (update {from: t x: (+ i 1)}) 'x)) -- 'I64
 
 ;; ─── new column with temporal arithmetic ────────────────────────────────────
-(type (at (update {from: t x: (+ ts 1)}) 'x)) -- 'TIMESTAMP
-(at (update {from: t x: (+ ts 1)}) 'x) -- (+ (at t 'ts) 1)
+(type (at (update {from: t x: (- ts ts)}) 'x)) -- 'TIMESPAN
 (at (update {from: t x: (- ts ts)}) 'x) -- (- (at t 'ts) (at t 'ts))
 ;; the other columns are untouched
-(type (at (update {from: t x: (+ ts 1)}) 'name)) -- 'SYM
-(at (update {from: t x: (+ ts 1)}) 'name) -- [Alice Bob Carol]
+(type (at (update {from: t x: (- ts ts)}) 'name)) -- 'SYM
+(at (update {from: t x: (- ts ts)}) 'name) -- [Alice Bob Carol]
 ;; in place on a quoted table name
 (do (update {from: 't y: (- ts ts)}) (type (at t 'y))) -- 'TIMESPAN
 
