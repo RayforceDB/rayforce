@@ -74,7 +74,7 @@ A byte order mark before the value is not JSON whitespace, and is a `parse` erro
 | `input` | bytes of one document |
 | `depth` | nesting depth; the default is 128, and it never exceeds 1024 |
 | `nodes` | values, containers included |
-| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector (an array of 780,000 integers, 8 MB), and the atoms an array turns into when it turns out mixed are charged while the typed run still is, then the run's charge is returned, so the real peak stays close to the cap (about 1.1 times it, measured, in the worst case of 40-byte strings followed by an integer) |
+| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector (an array of 780,000 integers, 8 MB), and the atoms an array turns into when it turns out mixed are charged while the typed run still is, each string atom with its bytes, then the run's charge is returned. The real peak can still reach twice the cap, because a vector grows by doubling: the block a vector grows into is up to twice what it holds (measured under a 4 MB cap: 1.5 times the cap for an array of integers, twice it for a string followed by nulls) |
 
 The other two names, `grammar` and `symbol-bytes`, are accepted but have no effect on JSON. A cap is checked before the value it counts is built (a container's own growth is settled when it closes), so a hostile document stops at the cap and never exhausts the stack or the heap: 100,000 empty objects hold about 25 MB, and `{alloc: 8000000}` refuses them. For a vector, the caps apply to each element. A long document can be interrupted: the reader polls for cancellation every 1,024 members of a container.
 
@@ -112,6 +112,8 @@ A null (empty) document gives the type's null, like a missing field. `-0` is a n
 ```
 
 The type, the path and the limits may each be held by a name; in a `select` the typed call takes the same one-call-over-the-column route as the untyped one, in every position.
+
+A quoted type in the call is a type even when the table has a column of that name: in a table with a column `STR`, `(.json.get line "k" 'STR)` still reads strings. A type passed through a wrapper lambda's parameter, `(g line "k" 'STR)` with `(set g (fn [p q r] (.json.get p q r)))`, follows the rule for any lambda argument in a query: a quoted symbol that names a column is that column.
 
 ### Untyped
 
