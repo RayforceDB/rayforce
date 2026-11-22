@@ -42,6 +42,21 @@
 (.json.parse "[true,1]") -- (list true 1)
 (.json.parse "[1,true]") -- (list 1 true)
 (.json.parse "[null,true]") -- (list null true)
+;; a run that breaks into a list keeps each value as written: an integer
+;; that met a float stays an integer, exact past 2^53
+(.json.parse "[9007199254740993,0.5,\"x\"]") -- (list 9007199254740993 0.5 "x")
+(type (first (.json.parse "[9007199254740993,0.5,\"x\"]"))) -- 'i64
+(.json.parse "[1,2.5,true]") -- (list 1 2.5 true)
+(type (first (.json.parse "[1,2.5,true]"))) -- 'i64
+(.json.parse "[2.5,1,\"x\"]") -- (list 2.5 1 "x")
+(type (at (.json.parse "[2.5,1,\"x\"]") 1)) -- 'i64
+(.json.parse "[2.5,null,1,\"x\"]") -- (list 2.5 null 1 "x")
+(.json.get "{\"a\":[1,2.5,true]}" "a") -- (list 1 2.5 true)
+(.json.format (.json.parse "[1,2.5,true]")) -- "[1,2.5,true]"
+(.json.format (.json.parse "[9007199254740993,0.5,\"x\"]")) -- "[9007199254740993,0.5,\"x\"]"
+;; ... and the list is charged once: a run of a string and nulls then an
+;; integer fits the default cap
+(count (.json.parse (concat "[\"a\"" (concat (str-join (take [",null"] 999997) "") ",1]")))) -- 999999
 ;; so a large numeric array costs its vector: 780,000 integers fit the default cap
 (count (.json.parse (concat "[" (concat (str-join (as 'STR (% (til 780000) 10)) ",") "]")))) -- 780000
 ;; ... anything else stays a list: bool has no null, kinds do not mix
@@ -244,6 +259,8 @@
 (.json.get ["{\"a\":1}" "{\"b\":2}"] ["a" ""]) -- [1 0Nl]
 (.json.get ["{\"a\":1}" "{\"b\":2}"] ['a 'b]) -- [1 2]
 (.json.get "{\"a\":1,\"b\":[5]}" ["a" "b.0" "c"]) -- [1 5 0Nl]
+(M (fn [] (.json.get "{\"a\":1}" ["a" "x..y"]))) -- ".json.get: empty segment in path 1 at byte 2"
+(M (fn [] (.json.get "{\"a\":1" ["a" "b"]))) -- ".json.get: unexpected end of input, expected ',' or '}' at byte 6 of path 0"
 ;; the limits of .json.parse; a value only validated costs no node
 (.json.get "[1,2,3]" "0" {input: 3}) !- limit
 (.json.get "[1,2,3]" "0" {input: 7}) -- 1
@@ -291,6 +308,30 @@
 (at (select {from: T x: (+ 1 (.json.get line "n" {depth: 5}))}) 'x) -- [2.0 3.0 0Nf 3.5 0Nf]
 (nil? (at (at (select {from: T x: (.json.parse line {depth: 5})}) 'x) 2)) -- true
 (nil? (at (at (select {from: T x: (.json.parse line LD)}) 'x) 2)) -- true
+;; a vector of paths held by a name, or a lambda's parameter, is one path
+;; per row on every route, as update reads it; a wrong length is the
+;; update's length error
+(set T4 (table [line i] (list ["{\"k\":\"x\"}" "{\"k\":\"a\"}" "{}" "{\"k\":\"a\"}"] [0 1 2 3])))
+(set PV ["k" "k" "k" "k"])
+(set PV2 ["k" "k"])
+(at (select {from: T4 v: (== (.json.get line PV 'STR) "a")}) 'v) -- [false true false true]
+(at (update {from: T4 v: (== (.json.get line PV 'STR) "a")}) 'v) -- [false true false true]
+(at (select {from: T4 where: (== (.json.get line PV 'STR) "a") x: i}) 'x) -- [1 3]
+(at (select {from: T4 by: {k: (.json.get line PV 'STR)} c: (count i)}) 'c) -- (at (select {from: T4 by: {k: (.json.get line "k" 'STR)} c: (count i)}) 'c)
+(at ((fn [q] (select {from: T4 v: (== (.json.get line q 'STR) "a")})) PV) 'v) -- [false true false true]
+(at ((fn [q] (select {from: T4 where: (== (.json.get line q 'STR) "a") x: i})) PV) 'x) -- [1 3]
+(select {from: T4 v: (== (.json.get line PV2 'STR) "a")}) !- length
+(update {from: T4 v: (== (.json.get line PV2 'STR) "a")}) !- length
+(select {from: T4 where: (== (.json.get line PV2 'STR) "a")}) !- length
+((fn [q] (select {from: T4 v: (.json.get line q 'STR)})) PV2) !- length
+;; a quoted type names a type, also when the table has a column of its name
+(set T5 (table [line STR I64 F64] (list ["{\"k\":\"a\",\"n\":1}" "{\"n\":2.5}"] [7 8] [1 2] [0.5 0.5])))
+(at (select {from: T5 v: (.json.get line "k" 'STR)}) 'v) -- ["a" ""]
+(at (select {from: T5 v: (.json.get line "n" 'I64)}) 'v) -- [1 0Nl]
+(at (select {from: T5 v: (.json.get line "n" 'F64)}) 'v) -- [1.0 2.5]
+(at (select {from: T5 where: (== (.json.get line "k" 'STR) "a") v: I64}) 'v) -- [1]
+(at (update {from: T5 v: (.json.get line "n" 'I64)}) 'v) -- [1 0Nl]
+(at (select {from: T5 by: {k: (.json.get line "k" 'STR)} c: (count STR)}) 'c) -- [1 1]
 ;; one path per row
 (set PT (table [line p] (list ["{\"a\":1}" "{\"b\":2}" "{\"a\":3}"] ["a" "b" "b"])))
 (at (select {from: PT x: (.json.get line p)}) 'x) -- [1 2 0Nl]
