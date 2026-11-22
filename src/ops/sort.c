@@ -5082,14 +5082,24 @@ ray_t* ray_xdesc_fn(ray_t* tbl, ray_t* keys) {
  * → always true → all elements bucketed into group 0) and
  * algorithmically O(n^2). */
 ray_t* ray_xrank_fn(ray_t* n_obj, ray_t* vec) {
-    if (!is_numeric(n_obj))
-        return ray_error("type", "xrank: first arg must be integer");
+    /* The count is an integer atom: as_i64 of a float reads its bit pattern, and
+     * of a vector, whatever its first bytes hold. */
+    if (!n_obj || !ray_is_atom(n_obj) ||
+        (n_obj->type != -RAY_I64 && n_obj->type != -RAY_I32 &&
+         n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
+        return ray_error("type", "xrank: first arg must be an integer atom, got %s",
+                         n_obj ? ray_type_name(n_obj->type) : "null");
     if (!ray_is_vec(vec))
-        return ray_error("type", "xrank: second arg must be a vector");
+        return ray_error("type", "xrank: second arg must be a vector, got %s",
+                         vec ? ray_type_name(vec->type) : "null");
 
     int64_t n_groups = as_i64(n_obj);
     int64_t len = ray_len(vec);
     if (n_groups <= 0 || len == 0) return ray_vec_new(RAY_I64, 0);
+    /* the group of element i is i * n_groups / len, and i < len */
+    if (n_groups > INT64_MAX / len)
+        return ray_error("domain", "xrank: %lld groups is too many for a vector of %lld elements",
+                         (long long)n_groups, (long long)len);
 
     uint8_t desc = 0;
     ray_t* idx = ray_sort_indices(&vec, &desc, NULL, 1, len);
