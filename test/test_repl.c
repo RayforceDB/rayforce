@@ -387,6 +387,7 @@ static test_result_t test_repl_run_file_nonexistent(void) {
  * /proc/self/fd/N) is read to EOF, as the `read` builtin reads one.  It used to be
  * refused with "cannot determine size" (rc 1).  On other platforms the test is
  * skipped. */
+#if defined(__linux__)
 static int run_script_from_pipe(const char* text) {
     int pfds[2];
     if (pipe(pfds) != 0) return -1;
@@ -407,6 +408,7 @@ static int run_script_from_pipe(const char* text) {
     close(pfds[0]);
     return rc;
 }
+#endif
 
 static test_result_t test_repl_run_file_nonseekable(void) {
 #if defined(__linux__)
