@@ -90,3 +90,6 @@
 (value (group (list (as 'TIMESPAN [1 2]) [3 4] [1 2]))) -- (list [0 2] [1])
 (count (group vk)) -- m
 (count (group (concat lk lk))) -- m
+;; A TIMESTAMP equals a TIMESPAN by its time of day, so these keys are duplicates.
+(kt (list (list 'x (as 'TIMESPAN 1000000000)) (list 'x (+ (as 'TIMESTAMP 1000000000) 86400000000000)))) !- domain
+(kt (list (list 'x (as 'TIMESPAN 1000000000)) (list 'x (as 'TIMESTAMP 5)))) -- 2

@@ -368,4 +368,15 @@
 (sum (in AK (take AK 100))) -- 1400
 (sum (raze (in MK (take MK 1200)))) -- 0
 (sum (in (% (til 20000) 3000) (take AK 2000))) -- 10500
+;; Beside a TIMESPAN, a TIMESTAMP equals it by time of day (span_eval), so
+;; the hash must agree past the cutoff too: tpd2 is tpd a day later.
+(set tsd (as 'TIMESPAN 1000000000))
+(set tpd (as 'TIMESTAMP 1000000000))
+(set tpd2 (+ tpd 86400000000000))
+(count (distinct (list tsd tpd tpd2))) -- 1
+(count (distinct (Z (list tsd tpd tpd2)))) -- 1
+(count (except (Z (list tpd tpd2)) (Z (list tsd)))) -- 0
+(all (in (Z (list tpd tpd2)) (Z (list tsd)))) -- true
+(count (sect (Z (list tpd2)) (Z (list tsd)))) -- 65
+(count (distinct (Z (list tpd tpd2)))) -- 2
 (.sys.exec "rm -rf /tmp/rfl_list_cell_sets_1314") -- 0

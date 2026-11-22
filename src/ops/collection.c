@@ -1814,6 +1814,14 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
     switch (x->type) {
     case -RAY_SYM: return ray_hash_i64(x->i64);
     case -RAY_TIMESTAMP:
+        /* Beside a TIMESPAN, atom_eq (span_eval) compares a TIMESTAMP by its
+         * time of day, so it hashes that; two TIMESTAMPs equal in full share it. */
+        if (durations) {
+            int64_t v = x->i64 % INT64_C(86400000000000);
+            if (v < 0) v += INT64_C(86400000000000);
+            return ray_hash_f64((double)v);
+        }
+        return ray_hash_i64(x->i64);
     case -RAY_TIMESPAN:
         return durations ? ray_hash_f64((double)x->i64) : ray_hash_i64(x->i64);
     case -RAY_TIME:
