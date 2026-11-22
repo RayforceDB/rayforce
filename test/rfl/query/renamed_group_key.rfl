@@ -1,3 +1,4 @@
+;; @also-unfused
 ;; A group key projected under another name is an ordinary output (#1272).
 (set S (table [a h] (list [1 1 2 3 3 3] [10 20 30 40 50 60])))
 (cols (select {from: S x: a by: a})) -- [a x]
@@ -5,3 +6,20 @@
 (repr (at (select {from: S x: a by: a}) 'x)) -- (repr (at (select {from: S x: (+ a 0) by: a}) 'x))
 (repr (at (select {from: S u: (count h) x: a by: a}) 'x)) -- (repr (at (select {from: S u: (count h) x: (+ a 0) by: a}) 'x))
 (cols (select {from: S u: (count h) a: a by: a})) -- [a u]
+;; The count-distinct rewrite must not swallow another output.
+(set T (table [a b h] (list [1 1 2 3 3 3] [0 1 0 1 0 1] [10 20 30 40 50 40])))
+(cols (select {from: T u: (count (distinct h)) x: a by: a})) -- [a u x]
+(cols (select {from: T u: (count (distinct h)) x: a by: [a b]})) -- [a b u x]
+(cols (select {from: T u: (count (distinct h)) x: a by: {k: a}})) -- [k u x]
+(cols (select {from: T u: (count (distinct h)) a: a by: {k: a}})) -- [k u a]
+(cols (select {from: T u: (count (distinct h)) x: k by: {k: a}})) -- [k u x]
+(cols (select {from: T u: (count (distinct h)) x: k by: {k: (+ a 1)}})) -- [k u x]
+(cols (select {from: T x: a y: a by: a})) -- [a x y]
+(cols (select {from: T a: (+ a 1) by: a})) -- [a a]
+(cols (select {from: T u: (count (distinct h)) x: a by: a where: (> h 10) desc: u take: 2})) -- [a u x]
+(.db.splayed.set "/tmp/rfl_renamed_key/2024.01.01/t/" T "/tmp/rfl_renamed_key/.sym")
+(set Sp (.db.splayed.get "/tmp/rfl_renamed_key/2024.01.01/t/" "/tmp/rfl_renamed_key/.sym"))
+(set P (.db.parted.get "/tmp/rfl_renamed_key/" 't))
+(cols (select {from: Sp u: (count (distinct h)) x: a by: a})) -- [a u x]
+(cols (select {from: P u: (count (distinct h)) x: a by: a})) -- [a u x]
+(.sys.exec "rm -rf /tmp/rfl_renamed_key") -- 0

@@ -12713,10 +12713,10 @@ static ray_t* try_count_distinct_v2_rewrite(
                    !(val->attrs & ATTR_QUOTED)) {
             /* identity key projection (e.g. {K: K} or one element of a
              * multi-key dict) — accepted iff the referenced column is
-             * one of the by keys. */
+             * one of the by keys and the output keeps its alias. */
             int matched = 0;
             for (int j = 0; j < n_K; j++)
-                if (K_syms[j] == val->i64) { matched = 1; break; }
+                if (K_syms[j] == val->i64 && K_alias[j] == kid) { matched = 1; break; }
             if (!matched) n_other++;
         } else {
             n_other++;
