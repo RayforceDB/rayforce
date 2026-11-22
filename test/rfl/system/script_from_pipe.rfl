@@ -1,0 +1,45 @@
+;; @requires: posix  (the scripts are fed to ./rayforce through a POSIX shell)
+;; A script that cannot be sized (a pipe, a FIFO, process substitution) was refused
+;; with "cannot determine size"; it is read to EOF now, and "-" names stdin.  A
+;; script run this way behaves as a file does: it prints what it prints itself and
+;; the value of its last expression, unlike a pipe into the REPL, which prints the
+;; value of every expression.
+
+(.sys.exec "rm -rf /tmp/rfl_script_pipe; mkdir -p /tmp/rfl_script_pipe") -- 0
+
+;; /dev/stdin with a pipe behind it
+(.sys.exec "printf '(println 1)\\n(+ 1 2)\\n(println 7)\\n' | ./rayforce /dev/stdin > /tmp/rfl_script_pipe/a.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/a.out") -- "1\n7\n"
+
+;; "-"
+(.sys.exec "printf '(println 1)\\n(+ 1 2)\\n(println 7)\\n' | ./rayforce - > /tmp/rfl_script_pipe/b.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/b.out") -- "1\n7\n"
+
+;; a FIFO
+(.sys.exec "mkfifo /tmp/rfl_script_pipe/ff; (printf '(println 5)\\n' > /tmp/rfl_script_pipe/ff &); ./rayforce /tmp/rfl_script_pipe/ff > /tmp/rfl_script_pipe/c.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/c.out") -- "5\n"
+
+;; a script longer than the first buffer (64 KiB) and than its doubling
+(.sys.exec "awk 'BEGIN{printf \";\"; for(i=0;i<300000;i++) printf \"x\"; print \"\"; print \"(println 42)\"}' | ./rayforce - > /tmp/rfl_script_pipe/d.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/d.out") -- "42\n"
+
+;; the value of the last expression only, as for a file; the REPL prints each
+(.sys.exec "printf '(+ 1 2)\\n(+ 3 4)\\n' | ./rayforce - > /tmp/rfl_script_pipe/i.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/i.out") -- "7\n"
+(.sys.exec "printf '(+ 1 2)\\n(+ 3 4)\\n' | ./rayforce > /tmp/rfl_script_pipe/j.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/j.out") -- "3\n7\n"
+
+;; no script at all, and a script of comments, are no-ops
+(.sys.exec "./rayforce - < /dev/null > /tmp/rfl_script_pipe/e.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/e.out") -- ""
+(.sys.exec "printf ';; nothing\\n' | ./rayforce - > /tmp/rfl_script_pipe/f.out 2>&1") -- 0
+
+;; a script that fails reports it and fails the process
+(.sys.exec "printf '(println 1)\\n(+ 1 (quote a))\\n' | ./rayforce - > /tmp/rfl_script_pipe/g.out 2>&1") -- 1
+(read "/tmp/rfl_script_pipe/g.out") -- "1\nerror: type: cannot add i64 and sym\n"
+
+;; a regular file is read as before
+(.sys.exec "printf '(println 3)\\n' > /tmp/rfl_script_pipe/h.rfl; ./rayforce /tmp/rfl_script_pipe/h.rfl > /tmp/rfl_script_pipe/h.out 2>&1") -- 0
+(read "/tmp/rfl_script_pipe/h.out") -- "3\n"
+
+(.sys.exec "rm -rf /tmp/rfl_script_pipe") -- 0

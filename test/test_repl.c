@@ -383,17 +383,18 @@ static test_result_t test_repl_run_file_nonexistent(void) {
     PASS();
 }
 
-/* Non-seekable file (pipe) — fopen succeeds but fseek/ftell return -1,
- * hitting the `flen < 0` early-exit path (lines 1170-1173).  On Linux
- * we open a pipe and pass its read-end via /proc/self/fd/<N>.  On other
- * platforms the test is skipped. */
-static test_result_t test_repl_run_file_nonseekable(void) {
-#if defined(__linux__)
+/* A script that cannot be sized (a pipe, here: its read end opened by path through
+ * /proc/self/fd/N) is read to EOF, as the `read` builtin reads one.  It used to be
+ * refused with "cannot determine size" (rc 1).  On other platforms the test is
+ * skipped. */
+static int run_script_from_pipe(const char* text) {
     int pfds[2];
-    if (pipe(pfds) != 0) FAIL("pipe() failed");
-    /* Close the write end immediately — the read end is now an EOF pipe.
-     * /proc/self/fd/N lets fopen open the pipe fd by path. */
-    close(pfds[1]);
+    if (pipe(pfds) != 0) return -1;
+    if (text && *text) {
+        ssize_t n = (ssize_t)strlen(text);
+        if (write(pfds[1], text, (size_t)n) != n) { close(pfds[0]); close(pfds[1]); return -1; }
+    }
+    close(pfds[1]);              /* the read end now ends at the text */
 
     char path[64];
     snprintf(path, sizeof(path), "/proc/self/fd/%d", pfds[0]);
@@ -404,8 +405,23 @@ static test_result_t test_repl_run_file_nonseekable(void) {
     end_mute(&m);
 
     close(pfds[0]);
+    return rc;
+}
 
-    TEST_ASSERT_EQ_I(rc, 1);
+static test_result_t test_repl_run_file_nonseekable(void) {
+#if defined(__linux__)
+    /* an empty pipe is an empty script: nothing to run, no error */
+    TEST_ASSERT_EQ_I(run_script_from_pipe(""), 0);
+#endif
+    PASS();
+}
+
+static test_result_t test_repl_run_file_pipe_script(void) {
+#if defined(__linux__)
+    TEST_ASSERT_EQ_I(run_script_from_pipe("(+ 1 2)\n(+ 3 4)\n"), 0);
+    TEST_ASSERT_EQ_I(run_script_from_pipe(";; only a comment\n"), 0);
+    /* an error in the script fails the run, whatever carried the script */
+    TEST_ASSERT_EQ_I(run_script_from_pipe("(+ 1 (quote a))\n"), 1);
 #endif
     PASS();
 }
@@ -3186,6 +3202,7 @@ const test_entry_t repl_entries[] = {
     { "repl/run_file/comments_only",    test_repl_run_file_comments_only,    repl_setup, repl_teardown },
     { "repl/run_file/nonexistent",      test_repl_run_file_nonexistent,      repl_setup, repl_teardown },
     { "repl/run_file/nonseekable",      test_repl_run_file_nonseekable,      repl_setup, repl_teardown },
+    { "repl/run_file/pipe_script",      test_repl_run_file_pipe_script,      repl_setup, repl_teardown },
     { "repl/run_file/multiline_expr",   test_repl_run_file_multiline_expr,   repl_setup, repl_teardown },
     { "repl/run_file/lazy_result",      test_repl_run_file_lazy_result,      repl_setup, repl_teardown },
     { "repl/run_file/profile_active",   test_repl_run_file_profile_active,   repl_setup, repl_teardown },

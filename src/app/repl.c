@@ -1452,30 +1452,65 @@ void ray_repl_run(ray_repl_t* repl) {
     g_active_term = NULL;
 }
 
+/* Everything `f` yields up to EOF, in a block of its own.  For a stream whose
+ * size is not known beforehand: a pipe, a FIFO, process substitution, stdin
+ * from a pipe, and the /proc files that report a size of 0.  The block grows
+ * by doubling; NULL (nothing is printed) when memory runs out. */
+static ray_t* repl_slurp(FILE* f, size_t* out_len) {
+    size_t cap = 64 * 1024, len = 0;
+    char* buf = (char*)ray_alloc_raw(cap);
+    if (!buf) return NULL;
+    for (;;) {
+        size_t n = fread(buf + len, 1, cap - len, f);
+        len += n;
+        if (len < cap) break;                         /* short read: EOF or an error */
+        if (cap > SIZE_MAX / 2) { ray_free_raw(buf); return NULL; }
+        char* bigger = (char*)ray_alloc_raw(cap * 2);
+        if (!bigger) { ray_free_raw(buf); return NULL; }
+        memcpy(bigger, buf, len);
+        ray_free_raw(buf);
+        buf = bigger; cap *= 2;
+    }
+    ray_t* block = ray_alloc((int64_t)len + 1);
+    if (block) memcpy(ray_data(block), buf, len);
+    ray_free_raw(buf);
+    *out_len = len;
+    return block;
+}
+
 int ray_repl_run_file(const char* path) {
-    FILE* f = fopen(path, "r");
+    /* "-" is stdin, named so in errors and traces */
+    bool from_stdin = path[0] == '-' && path[1] == '\0';
+    FILE* f = from_stdin ? stdin : fopen(path, "r");
     if (!f) {
         fprintf(stderr, "error: cannot open '%s'\n", path);
         return 1;
     }
-    fseek(f, 0, SEEK_END);
-    long flen = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (flen < 0) {
-        fclose(f);
-        fprintf(stderr, "error: cannot determine size of '%s'\n", path);
-        return 1;
+    if (from_stdin) path = "<stdin>";
+
+    /* A regular file is sized and read in one go.  Anything that cannot be sized
+     * (a pipe, a FIFO, process substitution) or reports 0 (a /proc file) is read
+     * to EOF instead of being refused. */
+    long flen = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        flen = ftell(f);
+        if (fseek(f, 0, SEEK_SET) != 0) flen = -1;
     }
 
-    ray_t* block = ray_alloc((int64_t)flen + 1);
+    ray_t* block;
+    size_t nread = 0;
+    if (flen > 0) {
+        block = ray_alloc((int64_t)flen + 1);
+        if (block) nread = fread((char*)ray_data(block), 1, (size_t)flen, f);
+    } else {
+        block = repl_slurp(f, &nread);
+    }
+    if (!from_stdin) fclose(f);
     if (!block) {
-        fclose(f);
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
     char* buf = (char*)ray_data(block);
-    size_t nread = fread(buf, 1, (size_t)flen, f);
-    fclose(f);
     buf[nread] = '\0';
 
     if (nread == 0) { ray_release(block); return 0; }

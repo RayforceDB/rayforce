@@ -13,6 +13,9 @@ The `rayforce` binary operates in three modes depending on how it is invoked:
 # Run a script file
 ./rayforce script.rfl
 
+# Run a script from stdin, a pipe or a FIFO
+generate_script | ./rayforce -
+
 # Pipe mode — reads from stdin, no colour output
 echo '(+ 1 2)' | ./rayforce
 ```
@@ -143,5 +146,7 @@ Pass a `.rfl` file path to run it non-interactively:
 ```
 
 The entire file is read into memory and evaluated as a single Rayfall program via `ray_eval_str()`. The last expression's value is printed to stdout. If evaluation produces an error, it is printed to stderr and the process exits with code **1**; otherwise the exit code is **0**.
+
+The file does not have to be a regular file: a pipe, a FIFO or process substitution (`./rayforce <(generate_script)`) is read to EOF, and `-` as the file name reads stdin (`./rayforce /dev/stdin` does the same). A script read this way runs as a file does, and prints the value of its last expression. That differs from piping into the REPL with no file argument (`echo '(+ 1 2)' | ./rayforce`), which evaluates the input expression by expression and prints each value.
 
 Pipe mode works the same way but reads from stdin line by line, evaluating each balanced expression as it arrives.
