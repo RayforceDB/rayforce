@@ -35,11 +35,13 @@
  *
  * A builtin that runs other code (eval, try, load, the binding forms) is in
  * own_sigs below, not here: an error from the code it runs is not its own. */
-static const struct { const char* name; const char* usage; } sigs[] = {
+typedef struct { const char* name; const char* usage; } sig_t;
+
+static const sig_t sigs[] = {
     /* arithmetic and comparison */
     {"+", "(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"},
     {"-", "(- <left: num, date, time, timestamp or timespan> <right: the same kinds>)"},
-    {"*", "(* <left: num or timespan> <right: num>)"},
+    {"*", "(* <left: num or timespan> <right: num or timespan>)"},
     {"/", "(/ <left: num or timespan> <right: num>)"},
     {"%", "(% <left: num> <right: num>)"},
     {"div", "(div <left: num> <right: num>)"},
@@ -72,8 +74,8 @@ static const struct { const char* name; const char* usage; } sigs[] = {
     {"prod", "(prod <x: num, atom, vector or list>)"},
     {"avg", "(avg <x: num, atom, vector or list>)"},
     {"med", "(med <x: num, atom, vector or list>)"},
-    {"min", "(min <x: vector, atom or list>)"},
-    {"max", "(max <x: vector, atom or list>)"},
+    {"min", "(min <x: vector, atom or list>) or (min <a: num> <b: num>)"},
+    {"max", "(max <x: vector, atom or list>) or (max <a: num> <b: num>)"},
     {"var", "(var <x: num, atom, vector or list>)"},
     {"var_pop", "(var_pop <x: num, atom, vector or list>)"},
     {"dev", "(dev <x: num, atom, vector or list>)"},
@@ -130,7 +132,7 @@ static const struct { const char* name; const char* usage; } sigs[] = {
     {"reverse", "(reverse <x: vector or list>)"},
     {"raze", "(raze <x: list of vectors>)"},
     {"where", "(where <mask: B8 vector>)"},
-    {"til", "(til <n: int>)"},
+    {"til", "(til <n: i64 atom>)"},
     {"guid", "(guid <n: int>)"},
     {"bin", "(bin <sorted: I64 vector> <value: i64 atom or I64 vector>)"},
     {"binr", "(binr <sorted: I64 vector> <value: i64 atom or I64 vector>)"},
@@ -152,7 +154,7 @@ static const struct { const char* name; const char* usage; } sigs[] = {
     {"concat", "(concat <left: vector, list or str> <right: vector, list or str of the same kind>)"},
     {"fill", "(fill <replacement: atom> <x: vector>)"},
     {"xbar", "(xbar <x: numeric or temporal vector> <bucket: non-zero num>)"},
-    {"rand", "(rand <count: int> <max: int, or a vector to sample from>)"},
+    {"rand", "(rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)"},
     {"at", "(at <collection: vector, list, str, dict or table> <index: int, an integer vector, or a dict key>)"},
     {"get", "(get <source: dict or table> <key: sym>)"},
     {"identical", "(identical <a: any> <b: any>)"},
@@ -187,7 +189,7 @@ static const struct { const char* name; const char* usage; } sigs[] = {
     {"trunc", "(trunc <unit: sym, one of year quarter month week day hour minute second> <x: date, time or timestamp>)"},
     {"date", "(date <x: timestamp, date or 0>)"},
     {"time", "(time <x: timestamp, time or 0>)"},
-    {"timestamp", "(timestamp <x: 0>)"},
+    {"timestamp", "(timestamp <ignored: any, usually 0>)"},
     {"yyyy", "(yyyy <x: date, time or timestamp>)"},
     {"mm", "(mm <x: date, time or timestamp>)"},
     {"dd", "(dd <x: date, time or timestamp>)"},
@@ -229,7 +231,7 @@ static const struct { const char* name; const char* usage; } sigs[] = {
  * variable argument list.  An error that passes through them from the code
  * they run is not theirs, so their usage line is added only to a message
  * that starts with their own name (see own_message). */
-static const struct { const char* name; const char* usage; } own_sigs[] = {
+static const sig_t own_sigs[] = {
     {"map", "(map <fn: fn> <x: vector or list>) or (map <fn: fn> <val: any> <x: vector or list>)"},
     {"pmap", "(pmap <fn: fn> <x: vector or list>) or (pmap <fn: fn> <val: any> <x: vector or list>)"},
     {"map-left", "(map-left <fn: fn> <left: any> <right: any>)"},
@@ -239,9 +241,9 @@ static const struct { const char* name; const char* usage; } own_sigs[] = {
     {"fold-left", "(fold-left <fn: fn> <init: any> <x: vector or list>) or (fold-left <fn: fn> <x: vector or list>)"},
     {"fold-right", "(fold-right <fn: fn> <init: any> <x: vector or list>) or (fold-right <fn: fn> <x: vector or list>)"},
     {"fold-while", "(fold-while <pred: fn> <fn: fn> <init: any> <x: vector or list>)"},
-    {"scan", "(scan <fn: fn> <x: vector or list>) or (scan <fn: fn> <init: any> <x: vector or list>)"},
-    {"scan-left", "(scan-left <fn: fn> <x: vector or list>) or (scan-left <fn: fn> <init: any> <x: vector or list>)"},
-    {"scan-right", "(scan-right <fn: fn> <x: vector or list>) or (scan-right <fn: fn> <init: any> <x: vector or list>)"},
+    {"scan", "(scan <fn: fn> <x: vector or list>)"},
+    {"scan-left", "(scan-left <fn: fn> <x: vector or list>)"},
+    {"scan-right", "(scan-right <fn: fn> <x: vector or list>)"},
     {"prior", "(prior <fn: fn> <x: vector or list>)"},
     {"if", "(if <cond: bool> <then> [<cond> <then> ...] [<else>])"},
     {"while", "(while <cond: bool> <body>...)"},
@@ -287,7 +289,7 @@ static const struct { const char* name; const char* usage; } own_sigs[] = {
     {".mem.objsize", "(.mem.objsize <x: any>)"},
     {"resolve", "(resolve <name: sym> ...)"},
     {"rule", "(rule <head: (name ?var ...)> <body: clause>...)"},
-    {"env", "(env <0>)"},
+    {"env", "(env <ignored: any, usually 0>)"},
     {"read-csv", "(read-csv [<names: sym vector>] [<types: sym vector>] <path: str>)"},
     {".csv.read", "(.csv.read [<names: sym vector>] [<types: sym vector>] <path: str>)"},
     {"write-csv", "(write-csv <t: table> <path: str> [<options>])"},
@@ -307,9 +309,7 @@ static const struct { const char* name; const char* usage; } own_sigs[] = {
     {".log.purge", "(.log.purge)"},
     {".sys.prof", "(.sys.prof)"},
     {".sys.profile", "(.sys.profile)"},
-    {".sys.profile.enable", "(.sys.profile.enable [<on: bool>])"},
     {".sys.querylog", "(.sys.querylog)"},
-    {".sys.querylog.enable", "(.sys.querylog.enable [<on: bool>])"},
     {"datoms", "(datoms)"},
     {"assert-fact", "(assert-fact <db: datoms table> <entity> <attr: sym> <value>)"},
     {"retract-fact", "(retract-fact <db: datoms table> <entity> <attr: sym> <value>)"},
@@ -326,28 +326,39 @@ static const struct { const char* name; const char* usage; } own_sigs[] = {
 
 /* A builtin's registered name keeps at most 13 characters, so a longer name
  * reaches here cut off: an entry matches when its name is the one given, or
- * when the one given is the first 13 characters of a longer entry. */
+ * when the one given is the first 13 characters of a longer entry.  A cut-off
+ * name that fits two entries (.sys.profile.enable, .sys.profile.reset) has no
+ * match: it cannot be told which was called. */
 #define FN_NAME_MAX 13
 
 static bool name_matches(const char* entry, const char* name) {
+    if (entry[0] != name[0]) return false;
     if (strcmp(entry, name) == 0) return true;
     return strlen(name) >= FN_NAME_MAX && strncmp(entry, name, FN_NAME_MAX) == 0;
 }
 
-static const char* own_usage(const char* name, const char** full) {
+/* The entry of `name`, in either table; NULL when there is none or the name is
+ * ambiguous.  `*own` tells which table it came from. */
+static const sig_t* find_entry(const char* name, bool* own) {
+    const sig_t* hit = NULL;
+    int found = 0;
+    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
+        if (name_matches(sigs[i].name, name)) {
+            if (strcmp(sigs[i].name, name) == 0) { *own = false; return &sigs[i]; }
+            hit = &sigs[i]; *own = false; found++;
+        }
     for (size_t i = 0; i < sizeof own_sigs / sizeof *own_sigs; i++)
         if (name_matches(own_sigs[i].name, name)) {
-            if (full) *full = own_sigs[i].name;
-            return own_sigs[i].usage;
+            if (strcmp(own_sigs[i].name, name) == 0) { *own = true; return &own_sigs[i]; }
+            hit = &own_sigs[i]; *own = true; found++;
         }
-    return NULL;
+    return found == 1 ? hit : NULL;
 }
 
 const char* ray_sig_usage(const char* name) {
-    if (!name) return NULL;
-    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
-        if (name_matches(sigs[i].name, name)) return sigs[i].usage;
-    return own_usage(name, NULL);
+    bool own;
+    const sig_t* e = name ? find_entry(name, &own) : NULL;
+    return e ? e->usage : NULL;
 }
 
 /* Does `msg` start with `cand` and then a colon, or "expects", "takes" or
@@ -391,7 +402,7 @@ static void err_code(const ray_t* err, char out[8]) {
     out[err->slen] = '\0';
 }
 
-ray_t* ray_sig_note(const char* name, ray_t* result) {
+ray_t* ray_sig_note_err(const char* name, ray_t* result) {
     if (!result || !RAY_IS_ERR(result) || result == RAY_OOM_OBJ) return result;
     char code[8];
     err_code(result, code);
@@ -399,12 +410,12 @@ ray_t* ray_sig_note(const char* name, ray_t* result) {
     if (strcmp(code, "type") && strcmp(code, "length") &&
         strcmp(code, "rank") && strcmp(code, "arity") && !domain)
         return result;
-    const char* usage = ray_sig_usage(name);
-    if (!usage) return result;
+    bool own;
+    const sig_t* e = find_entry(name, &own);
+    if (!e) return result;
     const char* old = ray_error_msg();
-    /* Only the table of own-message builtins needs the guard. */
-    const char* full = NULL;
-    if (own_usage(name, &full) && (!old || !*old || !own_message(full, old))) return result;
+    /* Only the own-message table needs the guard. */
+    if (own && (!old || !*old || !own_message(e->name, old))) return result;
     /* A domain error is a bad value, not a bad call, unless it is about the
      * argument list. */
     if (domain && (!old || !strstr(old, " arg"))) return result;
@@ -412,29 +423,21 @@ ray_t* ray_sig_note(const char* name, ray_t* result) {
     if (old && *old) {
         /* A message that already names the call shape is left alone. */
         char head[40];
-        snprintf(head, sizeof head, "(%s ", name);
+        snprintf(head, sizeof head, "(%s ", e->name);
         if (strstr(old, head) || strstr(old, "; usage: ")) return result;
         snprintf(msg, sizeof msg, "%s", old);
     } else {
-        snprintf(msg, sizeof msg, "%s: argument of the wrong type", name);
+        snprintf(msg, sizeof msg, "%s: argument of the wrong type", e->name);
     }
-    ray_error_msg_set("%s; usage: %s", msg, usage);
+    ray_error_msg_set("%s; usage: %s", msg, e->usage);
     return result;
 }
 
-/* The builtin's full name, where `name` is its registered, possibly cut off,
- * one. */
-static const char* full_name(const char* name) {
-    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
-        if (name_matches(sigs[i].name, name)) return sigs[i].name;
-    const char* full = NULL;
-    return own_usage(name, &full) ? full : name;
-}
-
 ray_t* ray_sig_arity(const char* name, const char* want, int got) {
-    const char* usage = ray_sig_usage(name);
-    name = full_name(name);
-    return ray_error("arity", "%s: takes %s argument%s, got %d%s%s", name, want,
+    bool own;
+    const sig_t* e = find_entry(name, &own);
+    const char* shown = e ? e->name : name;
+    return ray_error("arity", "%s: takes %s argument%s, got %d%s%s", shown, want,
                      strcmp(want, "1") ? "s" : "", got,
-                     usage ? "; usage: " : "", usage ? usage : "");
+                     e ? "; usage: " : "", e ? e->usage : "");
 }

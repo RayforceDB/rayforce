@@ -1524,6 +1524,8 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
     }
 
     /* Fallback: boxed list path */
+    const char* vec_type_name = ray_type_name(vec->type);   /* as the caller passed them,  */
+    const char* mask_type_name = ray_type_name(mask->type); /* before the unboxing below */
     ray_t *_bx1 = NULL, *_bx2 = NULL;
     vec = unbox_vec_arg(vec, &_bx1);
     if (RAY_IS_ERR(vec)) return vec;
@@ -1531,10 +1533,10 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
     if (RAY_IS_ERR(mask)) { if (_bx1) ray_release(_bx1); return mask; }
     if (!is_list(vec) || !is_list(mask)) {
         ray_t* err = !is_list(mask)
-            ? ray_error("type", "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got mask %s%s",
-                        ray_type_name(mask->type), ray_is_atom(mask) ? " (a single value, not a vector)" : "")
-            : ray_error("type", "filter: expected (filter vec mask) where vec is a vector, list, string or table; got vec %s",
-                        ray_type_name(vec->type));
+            ? ray_error("type", "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got vec %s and mask %s%s",
+                        vec_type_name, mask_type_name, ray_is_atom(mask) ? " (a single value, not a vector)" : "")
+            : ray_error("type", "filter: expected (filter vec mask) where vec is a vector, list, string or table; got vec %s and mask %s",
+                        vec_type_name, mask_type_name);
         if (_bx1) ray_release(_bx1);
         if (_bx2) ray_release(_bx2);
         return err;
@@ -3739,11 +3741,11 @@ static ray_t* count_arg_error(const char* fn, ray_t* vec, ray_t* n_obj, const ch
     bool vec_ok = vec && (!ray_is_atom(vec) || vec->type == -RAY_STR);
     if (!vec_ok)
         return ray_error("type",
-            "%s: expected (%s collection count) where collection is a vector, list, string, dict or table; got collection %s",
-            fn, fn, vt);
+            "%s: expected (%s collection count) where collection is a vector, list, string, dict or table; got collection %s and count %s",
+            fn, fn, vt, nt);
     return ray_error("type",
-        "%s: expected (%s collection count) where count is %s; got count %s",
-        fn, fn, count_kind, nt);
+        "%s: expected (%s collection count) where count is %s; got collection %s and count %s",
+        fn, fn, count_kind, vt, nt);
 }
 
 /* (take vec n) — first n elements (positive) or last |n| elements (negative) */
@@ -3754,7 +3756,7 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
      * e.g. (take 1.0 2.0) to attempt a 4.6-quintillion-element allocation
      * and surface as "oom" — misleading for what is really a type error. */
     if (ray_is_atom(n_obj) && (n_obj->type == -RAY_F64 || n_obj->type == -RAY_F32))
-        return ray_error("type", "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got count %s", ray_type_name(n_obj->type));
+        return ray_error("type", "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection %s and count %s", ray_type_name(vec->type), ray_type_name(n_obj->type));
     /* Range take: (take collection [start amount]) — slice from start for amount elements */
     if (ray_is_vec(n_obj) && n_obj->type == RAY_I64 && ray_len(n_obj) == 2) {
         int64_t* idx = (int64_t*)ray_data(n_obj);

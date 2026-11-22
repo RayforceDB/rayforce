@@ -25,6 +25,7 @@
 #define RAY_SIG_H
 
 #include <rayforce.h>
+#include "core/platform.h"
 
 /* Usage line of a builtin: its call shape with each argument's name, type
  * and position, e.g. "(take <collection: ...> <count: ...>)".  NULL for a
@@ -36,7 +37,13 @@ const char* ray_sig_usage(const char* name);
  * which types and in which order.  Only type, length, rank and arity errors
  * are rewritten; any other result is returned as it is.  The message is
  * replaced in place and `result` is returned. */
-ray_t* ray_sig_note(const char* name, ray_t* result);
+ray_t* ray_sig_note_err(const char* name, ray_t* result);
+
+/* The test the success path pays: a call that did not fail goes by. */
+static inline ray_t* ray_sig_note(const char* name, ray_t* result) {
+    if (RAY_UNLIKELY(result && RAY_IS_ERR(result))) return ray_sig_note_err(name, result);
+    return result;
+}
 
 /* The arity error of builtin `name` called with `got` arguments where `want`
  * (a count, or a range such as "2 to 4") are taken; carries the usage line. */

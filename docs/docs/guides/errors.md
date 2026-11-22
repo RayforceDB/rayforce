@@ -23,17 +23,17 @@ Both arguments are passed unevaluated (`try` is a special form). The handler is 
 (try
   (+ 1 "hello")
   (fn [err] (println "caught:" err)))
-; caught: {code:type msg:"cannot add i64 and str"}
+; caught: {code:type msg:"cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
 ```
 
-When an error occurs without an explicit `raise`, the handler receives a dict of what the engine raised: `code`, the error's class as a symbol (`'type`, `'io`, `'name`, ...), and `msg`, its message as a string (`""` when the error carries none). The REPL prints the same error as `error: type: cannot add i64 and str`. Inside a function the handler gets the same dict as at the top level, so a long-running process can report what failed and carry on:
+When an error occurs without an explicit `raise`, the handler receives a dict of what the engine raised: `code`, the error's class as a symbol (`'type`, `'io`, `'name`, ...), and `msg`, its message as a string (`""` when the error carries none). The REPL prints the same error as `error: type: cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)` (the part after `;` is the usage line, see [Usage Lines](#usage-lines)). Inside a function the handler gets the same dict as at the top level, so a long-running process can report what failed and carry on:
 
 ```lisp
 (set safe (fn [f x]
   (try (f x)
     (fn [e] (dict ['error] (list (format "%: %" (at e 'code) (at e 'msg))))))))
 (safe (fn [x] (+ x 'a)) 1)
-; => {error:"type: cannot add i64 and sym"}
+; => {error:"type: cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
 ```
 
 If the dict itself can't be built because memory has run out, the handler gets `null` instead.

@@ -7,11 +7,11 @@
 (at (try (rotate 1 [1 2 3]) (fn [e] e)) 'msg) -- "rotate: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (rotate <collection> <count>)"
 
 ;; a count of the wrong type
-(at (try (drop [1 2 3] "a") (fn [e] e)) 'msg) -- "drop: expected (drop collection count) where count is an integer atom; got count str"
-(at (try (take [1 2 3] 1.5) (fn [e] e)) 'msg) -- "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got count f64"
+(at (try (drop [1 2 3] "a") (fn [e] e)) 'msg) -- "drop: expected (drop collection count) where count is an integer atom; got collection I64 and count str"
+(at (try (take [1 2 3] 1.5) (fn [e] e)) 'msg) -- "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection I64 and count f64"
 
 ;; a mask that is a single value
-(at (try (filter [1 2 3] true) (fn [e] e)) 'msg) -- "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got mask b8 (a single value, not a vector)"
+(at (try (filter [1 2 3] true) (fn [e] e)) 'msg) -- "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got vec I64 and mask b8 (a single value, not a vector)"
 
 ;; the calls that work still work
 (take [1 2 3] 2) -- [1 2]
@@ -45,3 +45,18 @@
 
 ;; an error that is not about the call is left as it is
 (at (try (quantile [1 2 3] 5.0) (fn [e] e)) 'msg) -- "quantile: probability out of range"
+
+;; an error from the argument of count or sum is the argument's, not the call's
+(set T (table [s k] (list [a b b] [1 2 3000])))
+(at (try (count (select {from: T where: (== s true)})) (fn [e] e)) 'msg) -- "=: incomparable operand types, got sym and b8"
+
+;; a usage line describes calls that work
+(scan + [1 2 3]) -- [1 3 6]
+(at (try (scan + 0 [1 2]) (fn [e] e)) 'msg) -- "scan: vec arg must be a list, got i64; usage: (scan <fn: fn> <x: vector or list>)"
+(at (try (rand 3 [7 8 9]) (fn [e] e)) 'msg) -- "rand: count and max must be atoms, got i64 and I64; usage: (rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)"
+(min 1 2) -- 1
+(at (try (til 3h) (fn [e] e)) 'msg) -- "til: argument must be an i64 atom, got i16; usage: (til <n: i64 atom>)"
+
+;; a registered name is cut at 13 characters: two builtins that share the cut
+;; name get no usage line rather than the wrong one
+(at (try (.sys.profile.enable 1 2 3) (fn [e] e)) 'msg) -- ".sys.profile.enable takes 0 or 1 arguments"

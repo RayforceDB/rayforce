@@ -2427,7 +2427,8 @@ ray_t* call_fn1(ray_t* fn, ray_t* arg) {
         return call_lambda(fn, args, 1);
     }
     if (fn->type == RAY_BINARY)
-        return ray_sig_arity(ray_fn_name(fn), "2", 1);
+        return ray_sig_note(ray_fn_name(fn),
+                            ray_error("arity", "call: '%s' expects 2 arguments, got 1", ray_fn_name(fn)));
     if (fn->type == RAY_VARY) {
         if (fn_is_vary(fn, ray_and_vary_fn) || fn_is_vary(fn, ray_or_vary_fn)) {
             /* (and x) is (or x) is x */
@@ -6017,14 +6018,14 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 ray_release(head); ret = arity_err; goto out;
             }
             char nm[16];
-            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
+            memcpy(nm, ray_fn_name(head), 14); nm[14] = '\0';   /* inline name: 13 characters and a NUL */
             uint8_t fn_attrs = head->attrs;
             if (fn == (ray_unary_fn)ray_count_fn) {
                 int handled = 0;
                 ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
                 if (handled) {
                     ray_release(head);
-                    ret = ray_sig_note(nm, fast ? fast : ray_error("type", NULL));
+                    ret = fast ? fast : ray_error("type", NULL);
                     rows = 0; goto out;
                 }
             }
@@ -6073,7 +6074,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             }
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             char nm[16];
-            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
+            memcpy(nm, ray_fn_name(head), 14); nm[14] = '\0';   /* inline name: 13 characters and a NUL */
             ray_binary_fn fn = (ray_binary_fn)(uintptr_t)head->i64;
             uint8_t fn_attrs = head->attrs;
             if (fn_attrs & RAY_FN_SPECIAL_FORM) {
@@ -6205,7 +6206,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
             ray_vary_fn fn = (ray_vary_fn)(uintptr_t)head->i64;
             char nm[16];
-            snprintf(nm, sizeof nm, "%s", ray_fn_name(head));
+            memcpy(nm, ray_fn_name(head), 14); nm[14] = '\0';   /* inline name: 13 characters and a NUL */
             /* insert or alter reached through any head but the literal name
              * or a global alias: an ordinary call, its operands evaluated
              * first, and its quoted target is no binding of this function. */
