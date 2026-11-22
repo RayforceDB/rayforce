@@ -8903,6 +8903,9 @@ typedef struct {
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
     ray_t* _h_touched;
+    /* A fused product overflowed in this worker while no nn_count is kept
+     * (#1349): an AVG over it reruns on ht_path.  Per worker, plain store. */
+    bool   prod_overflow;
 } da_accum_t;
 
 #define DA_LZ_SHIFT 6
@@ -11063,6 +11066,7 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
                 /* Fused product: an overflowed one is 0Nf, skipped. */
                 double v = prod_val_f64(&c->agg_prod[a], r);
                 if (RAY_LIKELY(__builtin_fabs(v) <= DBL_MAX)) { acc->sum[idx].f += v; if (nn) nn[idx]++; }
+                else if (!nn) acc->prod_overflow = true;
                 continue;
             }
             if (!c->agg_ptrs[a]) continue;
@@ -11121,6 +11125,8 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = ray_f64_fin(prod_val_f64(&c->agg_prod[a], r));
+            if (RAY_UNLIKELY(fv != fv) && !nn)
+                acc->prod_overflow = true;
             iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_strlen && c->agg_strlen[a]) {
             /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
@@ -17701,13 +17707,13 @@ da_path:;
                 }
                 if (agg_prod[a].enabled) {
                     /* Fused product: F64 accumulate, no source vec; an
-                     * overflowed product is null (prod_val_f64), skipped:
-                     * an AVG counts the non-null rows. */
+                     * overflowed product is null, skipped.  No nn_count is
+                     * forced for it: an AVG that meets one without counts
+                     * reruns on ht_path (da_ctx.prod_overflow). */
                     agg_ptrs[a]  = NULL;
                     agg_types[a] = RAY_F64;
                     agg_f64_mask |= ((uint64_t)1 << a);
                     da_int_null_sentinel[a] = 0;
-                    if (ext->agg_ops[a] == OP_AVG) da_any_nullable = true;
                     continue;
                 }
                 /* A staged input: type and nullability from its bound source
@@ -18072,6 +18078,20 @@ da_path:;
                 scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
                 rerr = da_err;
                 goto resolve_fail;
+            }
+            bool da_prod_over = false;
+            for (uint32_t w = 0; w < da_n_workers; w++) da_prod_over |= accums[w].prod_overflow;
+            if (RAY_UNLIKELY(da_prod_over)) {
+                bool prod_avg = false;
+                for (uint32_t a = 0; a < n_aggs; a++)
+                    prod_avg |= agg_prod[a].enabled && ext->agg_ops[a] == OP_AVG;
+                if (prod_avg) {
+                    for (uint32_t w = 0; w < da_n_workers; w++) da_accum_free(&accums[w]);
+                    scratch_free(accums_hdr);
+                    scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
+                    scalar_emit_vecs_free(da_kc_hdr, da_key_cols, key_vecs, n_keys);
+                    goto ht_path;
+                }
             }
 
             /* Merge target is always accums[0] */

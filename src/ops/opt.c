@@ -30,9 +30,8 @@
 #include "idiom.h"
 #include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
-#include "core/types.h"   /* ray_fmod_floor */
 #include "mem/heap.h"
-#include "core/types.h"   /* ray_cast_f64_to_i64_null */
+#include "core/types.h"   /* ray_cast_f64_to_i64_null, ray_fmod_floor */
 #include <float.h>
 #include <math.h>
 #include <string.h>
