@@ -15,6 +15,9 @@
 (set T (table [K w] (list (list [7 7] [1 2] 3.0 (dict ['a] (list 4))) [0 1 2 3])))
 (at (inner-join [K] S T) 'v) -- [0 1 2 3]
 (semi-mask [K] S T) -- [true true true true]
+;; and with the TIMESPAN side on the right, so both sides' spans count
+(at (inner-join [K] T S) 'w) -- [0 1 2 3]
+(semi-mask [K] T S) -- [true true true true]
 ;; table and dict cells hash by content: 20k distinct of each join in linear time
 (set N 20000)
 (set mkt (fn [L] (table [K v] (list (concat (enlist [7 7]) L) (til (+ 1 (count L)))))))
