@@ -5457,14 +5457,31 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     bool wrap_is_asc     = (wrap_n == 3 && memcmp(wrap_s, "asc", 3) == 0);
     bool wrap_is_desc    = (wrap_n == 4 && memcmp(wrap_s, "desc", 4) == 0);
     bool wrap_is_reverse = (wrap_n == 7 && memcmp(wrap_s, "reverse", 7) == 0);
-    if (!wrap_is_asc && !wrap_is_desc && !wrap_is_reverse) return false;
 
-    /* (count (asc|desc|reverse col)) -> (count col) — cardinality preserved */
+    /* (count (asc|desc|reverse|iasc|idesc|rank col)), (count (rotate col n))
+     * and (count (xrank n col)) -> (count col): each gives one cell per cell
+     * of col, and count counts nulls.  Only while the name is the builtin. */
     if (op_n == 5 && memcmp(op_s, "count", 5) == 0) {
+        ray_t* fn = ray_env_get(inner_e[0]->i64);
+        int64_t il = ray_len(inner);
+        ray_t* arg = NULL;
+        if (il == 2 && (wrap_is_asc || wrap_is_desc || wrap_is_reverse ||
+                        (fn && (head_is_builtin_unary(fn, ray_iasc_fn) ||
+                                head_is_builtin_unary(fn, ray_idesc_fn) ||
+                                head_is_builtin_unary(fn, ray_rank_fn)))))
+            arg = col_expr;
+        else if (il == 3 && fn && fn->type == RAY_BINARY &&
+                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_rotate_fn)
+            arg = inner_e[1];
+        else if (il == 3 && fn && fn->type == RAY_BINARY &&
+                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_xrank_fn)
+            arg = inner_e[2];
+        if (!arg) return false;
         *op_out = OP_COUNT;
-        *arg_out = col_expr;
+        *arg_out = arg;
         return true;
     }
+    if (!wrap_is_asc && !wrap_is_desc && !wrap_is_reverse) return false;
 
     /* (first|last (asc col)) -> (min|max col) — only when col is null-free */
     if (!wrap_is_asc) return false;
