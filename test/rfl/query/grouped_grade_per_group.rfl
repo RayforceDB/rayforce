@@ -117,14 +117,17 @@
 (set D16 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))})))
 (set D20 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))))))})))
 (at (D20) 'r) -- (+ 4 (at (D16) 'r))
-(< (timeit (D20) 3) (+ 50.0 (* 4.0 (timeit (D16) 3)))) -- true
+;; each side the best of 5 runs, so a scheduling spike under a loaded suite
+;; does not decide the comparison
+(set BT (fn [f] (min (map (fn [j] (timeit (f) 1)) (til 5)))))
+(< (BT D20) (+ 50.0 (* 4.0 (BT D16)))) -- true
 ;; (first (asc v)) is planned as (min v), (count (iasc w)) as (count w)
 (count (select {from: K5 by: k r: (count w)})) -- 100000
 (at (select {from: K5 by: k r: (first (asc v))}) 'r) -- (at (select {from: K5 by: k r: (min v)}) 'r)
-(< (timeit (select {from: K5 by: k r: (first (asc v))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (min v)}) 3)))) -- true
+(< (BT (fn [] (select {from: K5 by: k r: (first (asc v))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (min v)})))))) -- true
 (at (select {from: K5 by: k r: (count (iasc w))}) 'r) -- (at (select {from: K5 by: k r: (count w)}) 'r)
-(< (timeit (select {from: K5 by: k r: (count (iasc w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
-(< (timeit (select {from: K5 by: k r: (count (rank w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
+(< (BT (fn [] (select {from: K5 by: k r: (count (iasc w))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (count w)})))))) -- true
+(< (BT (fn [] (select {from: K5 by: k r: (count (rank w))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (count w)})))))) -- true
 (at (select {from: t by: g r: (count (xrank 2 v))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (rotate v 1))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (idesc v))}) 'r) -- [3 2]
