@@ -109,11 +109,22 @@ static bool pivot_dag_key_ok(int8_t t) {
     }
 }
 
-/* OP_PIVOT gives `op` over a `t` value column exactly as the builtin gives
+/* OP_PIVOT gives `op` over the value column `v` exactly as the builtin gives
  * it over a plain vector.  Every other pair takes the generic route, which
  * calls the builtin per cell: its result type, or its own error (sum over
- * SYM, DATE, GUID or LIST is a `type` error). */
-static bool pivot_dag_agg_ok(uint16_t op, int8_t t) {
+ * SYM, DATE, GUID or LIST is a `type` error).
+ *
+ * OP_PIVOT's first/last skip nulls; the builtin does so only for I64, F64
+ * and F32, so a column of another nullable type that may hold a null takes
+ * the generic route (the HAS_NULLS flag for the fixed-width types, a scan
+ * for SYM, whose null is id 0 and carries no flag). */
+static bool pivot_dag_agg_ok(uint16_t op, ray_t* v) {
+    int8_t t = v->type;
+    if ((op == OP_FIRST || op == OP_LAST) &&
+        (t == RAY_I16 || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
+         t == RAY_TIMESTAMP || t == RAY_TIMESPAN || t == RAY_SYM) &&
+        (t == RAY_SYM ? ray_vec_has_nulls(v) : ray_vec_may_have_nulls(v)))
+        return false;
     switch (t) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
         case RAY_F32: case RAY_F64: case RAY_TIME:
@@ -298,7 +309,7 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     /* DAG fast path: known agg builtins on hashable columns → OP_PIVOT */
     uint16_t agg_op = pivot_fn_to_agg_op(agg_fn);
     bool dag_ok = agg_op != 0 && pivot_dag_key_ok(pcol->type) &&
-                  pivot_dag_agg_ok(agg_op, vcol->type);
+                  pivot_dag_agg_ok(agg_op, vcol);
     for (int64_t i = 0; i < n_idx && dag_ok; i++)
         if (!pivot_dag_key_ok(icols[i]->type)) dag_ok = false;
 
@@ -718,6 +729,12 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
     for (int64_t ci = 0; ci < n_idx; ci++) {
         ray_t* col_vec = gather_by_idx(icols[ci], ix_row, n_ix);
         if (!col_vec || RAY_IS_ERR(col_vec)) { ray_release(result); result = col_vec ? col_vec : ray_error("oom", NULL); goto fb_cleanup; }
+        /* -0.0 keys group with 0.0; the row that names the group may hold
+         * either, so the key reads 0.0, as OP_PIVOT and the pivot column give */
+        if (col_vec->type == RAY_F64) {
+            double* d = (double*)ray_data(col_vec);
+            for (int64_t r = 0; r < n_ix; r++) d[r] = clear_neg_zero(d[r]);
+        }
         result = ray_table_add_col(result, idx_syms[ci], col_vec);
         ray_release(col_vec);
         if (RAY_IS_ERR(result)) goto fb_cleanup;
