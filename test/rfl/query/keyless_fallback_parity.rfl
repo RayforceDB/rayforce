@@ -78,3 +78,36 @@
 (S (select {from: T s: (first L) z: (first (+ w 0))}))                -- (list (list "a"))
 (S (select {from: T s: (first L)}))                                    -- (list (list "a"))
 (S (select {from: T by: k s: (first L)}))                              -- (list (list "a"))
+
+;; ── a vector written as a value is a column of the table before where: ────
+;; as by: and the compiled route read it: the where: keeps its rows
+(set GI [10 20 30 40])
+(S (select {from: T where: (> c 1) s: (first (+ c GI)) z: (first (+ w 0))}))           -- [25]
+(S (select {from: T where: (> c 1) s: (first (+ c GI))}))                              -- [25]
+(S (select {from: T where: (> c 1) by: k s: (first (+ c GI))}))                        -- [25]
+(S (select {from: T where: (> c 1) s: (last (+ c [10 20 30 40])) z: (first (+ w 0))}))  -- [42]
+(S (select {from: T where: (> c 1) s: (last (+ c [10 20 30 40]))}))                     -- [42]
+(S (select {from: T where: (> c 4) s: (last (if (> c 5) GI c)) z: (first (+ w 0))}))   -- [30]
+(S (select {from: T where: (> c 4) s: (last (if (> c 5) GI c))}))                      -- [30]
+(S (select {from: T where: (> c 4) by: k s: (last (if (> c 5) GI c))}))                -- [30]
+(S (select {from: T where: (> c 1) s: (first (at GI (- c 1))) z: (first (+ w 0))}))    -- [20]
+(S (select {from: T where: (> c 1) s: (first (at GI (- c 1)))}))                       -- [20]
+(S (select {from: T where: (> c 1) by: k s: (first (at GI (- c 1)))}))                 -- [20]
+(S (select {from: T where: (> c 100) s: (first (+ c GI)) z: (first (+ w 0))}))         -- [0Nl]
+(S (select {from: T where: (> c 100) s: (first (+ c GI))}))                            -- [0Nl]
+
+;; ── a scalar argument stands for every row, as on the compiled route ──────
+(S (select {from: T where: (> c 100) s: (first (count d)) z: (first (+ w 0))}))  -- [0Nl]
+(S (select {from: T where: (> c 100) s: (first (count d))}))                     -- [0Nl]
+(S (select {from: T where: (> c 100) s: (last (sum c)) z: (first (+ w 0))}))     -- [0Nl]
+(S (select {from: T where: (> c 100) s: (last (sum c))}))                        -- [0Nl]
+(S (select {from: T where: (> c 1) s: (first (count d)) z: (first (+ w 0))}))    -- [3]
+(S (select {from: T where: (> c 1) s: (first (count d))}))                       -- [3]
+
+;; ── an argument the planner runs over a LIST column fails as it does there
+(S (select {from: T s: (first (+ m 1)) z: (first (+ w 0))})) !- type
+(S (select {from: T s: (first (+ m 1))})) !- type
+(S (select {from: T by: k s: (first (+ m 1))})) !- type
+(S (select {from: T s: (first (nil? m)) z: (first (+ w 0))})) !- type
+(S (select {from: T s: (first (nil? m))})) !- type
+(S (select {from: T by: k s: (first (nil? m))})) !- type

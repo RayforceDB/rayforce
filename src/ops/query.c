@@ -14321,6 +14321,33 @@ static bool scalar_edge_src_vectorizes(ray_t* e, ray_t* tbl, int depth) {
     return true;
 }
 
+/* Does `e` read a LIST column: a name of one, not quoted, not a local. */
+static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM)
+        return !(e->attrs & ATTR_QUOTED) && !ray_env_has_lexical_local(e->i64) &&
+               tbl_has_col(tbl, e->i64) && tbl_col_base_type(tbl, e->i64) == RAY_LIST;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++)
+        if (expr_reads_list_col(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+/* The rows' cells of a scalar aggregate source that is one value `a`
+ * (consumed): a typed vector of it, or a LIST of it for a type no vector
+ * holds. */
+static ray_t* scalar_atom_rows(ray_t* a, int64_t nrows) {
+    ray_t* cells = atom_broadcast_vec(a, nrows);
+    if (!cells) {
+        cells = ray_list_new(nrows);
+        for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
+            cells = ray_list_append(cells, a);
+    }
+    ray_release(a);
+    return cells ? cells : ray_error("oom", NULL);
+}
+
 /* Is `e` builtin calls over columns and literals, each `if` in it blended
  * per row: no lambda, no special form.  Evaluated once over the columns it
  * is the argument `by:` gives one group, `(at v (til 4))` and `(except v
@@ -14350,13 +14377,32 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
  * which the per-row pass reads one cell at a time.  Other builtin calls
  * without an effect are evaluated as `by:` evaluates them, so their error
  * is `by:`'s: operands of different lengths (`(+ c [1 2])`), or `(til c)`.
- * NULL leaves the argument to the per-row pass. */
+ * One that reads a LIST column is compiled first, as on those routes, so
+ * one the planner runs fails as it does there: `(+ m 1)` raises `type`
+ * where the evaluator maps over the cells.  Only then: run through the
+ * planner, `(first (+ d 1))` over 10M DATE rows took four times as long.
+ * A scalar it gives stands for every row, as `1` does in `(sum 1)`, so over
+ * no rows `(first (count d))` is the null the compiled route gives.  NULL
+ * leaves the argument to the per-row pass. */
+static bool expr_holds_vector_const(ray_t* expr, ray_t* tbl);
+
 static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
     bool elementwise = scalar_edge_src_vectorizes(e, tbl, 0);
     if (!elementwise && !(scalar_edge_src_builtin(e, tbl, 0) && query_expr_effect_free(e)))
         return NULL;
-    ray_t* src = eval_expr_whole_column_impl(e, tbl);
-    if (!src) return NULL;
+    /* eval_expr_whole_column_impl, the DAG tried before the evaluator over
+     * a LIST column */
+    bool dag = expr_reads_list_col(e, tbl, 0);
+    if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* bind_err = NULL;
+    ray_t* aqt = bind_referenced_query(tbl, &e, 1, &bind_err);
+    int64_t aqr = g_active_query_row;
+    g_active_query_row = -1;
+    rw_ctx_t c = { .tbl = tbl, .nrows = nrows };
+    ray_t* src = bind_err ? bind_err : dag ? rw_value(e, &c, 0) : rw_force(query_eval_bound(e, tbl));
+    g_active_query_table = aqt;
+    g_active_query_row = aqr;
+    ray_env_pop_scope();
     if (RAY_IS_ERR(src)) {
         if (!elementwise || strcmp(ray_err_code(src), "length")) return src;
         rw_swallow(src);
@@ -14366,7 +14412,27 @@ static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
         ray_release(src);
         return NULL;
     }
+    if (ray_is_atom(src)) src = scalar_atom_rows(src, nrows);
     return src;
+}
+
+/* `src`, the argument evaluated over the rows before a where:, at the rows
+ * the where: keeps (`sel`).  One value per row is compacted as a column
+ * is; anything else (an atom, a collection of another length) stands as
+ * it is.  Consumes `src`. */
+static ray_t* scalar_edge_keep_rows(ray_t* src, int64_t nrows, ray_t* sel) {
+    if (RAY_IS_ERR(src) || !(ray_is_vec(src) || src->type == RAY_LIST) || src->len != nrows)
+        return src;
+    ray_t* t = ray_table_new(1);
+    if (t && !RAY_IS_ERR(t)) t = ray_table_add_col(t, ray_sym_intern("v", 1), src);
+    ray_release(src);
+    if (!t || RAY_IS_ERR(t)) return t ? t : ray_error("oom", NULL);
+    ray_t* kept = sel_compact(NULL, t, sel, NULL, 0);
+    ray_t* col = kept && !RAY_IS_ERR(kept) ? ray_table_col_idx(kept, 0) : kept;
+    if (col && !RAY_IS_ERR(col)) ray_retain(col);
+    if (kept && !RAY_IS_ERR(kept) && kept != t) ray_release(kept);
+    ray_release(t);
+    return col ? col : ray_error("oom", NULL);
 }
 
 /* The per-row pass over no rows evaluates nothing and leaves an empty LIST,
@@ -14404,8 +14470,11 @@ static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
     return x ? x : ray_error("oom", NULL);
 }
 
+/* `tbl` holds the rows where: keeps; `src_tbl` and `sel`, when where: ran
+ * over a flat table, the rows before it and the selection that keeps them
+ * (NULL otherwise). */
 static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
-                                      ray_t* tbl,
+                                      ray_t* tbl, ray_t* src_tbl, ray_t* sel,
                                       int64_t from_id, int64_t where_id,
                                       int64_t by_id, int64_t take_id,
                                       int64_t asc_id, int64_t desc_id,
@@ -14465,22 +14534,26 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
              * this one value.  Evaluated once either way, so an effect in
              * it runs once. */
             src = eval_expr_whole_column_impl(agg_src_expr, tbl);
-            if (src && !RAY_IS_ERR(src) && ray_is_atom(src)) {
-                ray_t* cells = atom_broadcast_vec(src, nrows);
-                if (!cells) {
-                    cells = ray_list_new(nrows);
-                    for (int64_t r = 0; r < nrows && cells && !RAY_IS_ERR(cells); r++)
-                        cells = ray_list_append(cells, src);
-                }
-                ray_release(src);
-                src = cells ? cells : ray_error("oom", NULL);
-            }
+            if (src && !RAY_IS_ERR(src) && ray_is_atom(src))
+                src = scalar_atom_rows(src, nrows);
         }
         else {
             /* first/last of a builtin-call source: its column in one
              * vectorized pass (an `if` blended per row), not one eval per
-             * row (scalar_edge_src_whole).  Anything else runs per row. */
-            if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
+             * row (scalar_edge_src_whole).  Anything else runs per row.
+             * A vector written as a value stands for a column of the table
+             * it was written against, as by: and the compiled route read
+             * it: `(+ c GI)` is evaluated over the rows before the where:,
+             * which then keeps its rows.  Over a parted table it runs per
+             * row, as before. */
+            bool vconst = edge && expr_holds_vector_const(agg_src_expr, tbl);
+            if (edge && vconst && sel) {
+                if (src_tbl) {
+                    int64_t sn = ray_table_nrows(src_tbl);
+                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn);
+                    if (src) src = scalar_edge_keep_rows(src, sn, sel);
+                }
+            } else if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
             if (!src) {
                 src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
                 if (edge && nrows == 0 && src && !RAY_IS_ERR(src))
@@ -25995,6 +26068,8 @@ by_dict_done:
                     release_eval_tbl = 1;
                 }
                 ray_t* result = eval_scalar_agg_outputs(dict_elems, dict_n, eval_tbl,
+                                                        g->selection && !table_has_parted_columns(tbl) ? tbl : NULL,
+                                                        g->selection,
                                                         from_id, where_id, by_id,
                                                         take_id, asc_id, desc_id,
                                                         nearest_id);
