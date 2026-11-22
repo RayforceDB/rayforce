@@ -35,6 +35,7 @@
 #include "lang/env.h"
 #include "lang/internal.h"
 #include "table/sym.h"
+#include "table/table.h"
 #include "store/splay.h"
 #include "mem/sys.h"
 
@@ -318,8 +319,11 @@ static struct {
 /* The mutator in flight on this thread, innermost first. */
 typedef struct jmut {
     struct jmut* prev;
-    int64_t target;      /* insert's global table, -1 when not announced */
-    int64_t rows0;       /* its row count before the insert */
+    int64_t target;      /* the global an append grows, -1 when not announced */
+    int64_t rows0;       /* its length before the append */
+    uint64_t shape0;     /* its type, and a table's column types, before it */
+    bool    resolved;    /* the mutator said what it amends... */
+    bool    local;       /* ...and it is not the global of that name */
     int64_t set_name;    /* last global this mutator published through ray_env_set */
     int64_t op;          /* the record a mutator made itself for `target`... */
     ray_t*  val;         /* ...and its value, owned; NULL for an insert */
@@ -385,13 +389,43 @@ ray_err_t ray_journal_note_set(int64_t name, ray_t* val) {
     return e;
 }
 
-void ray_journal_mut_target(int64_t name, int64_t rows0) {
-    if (!g_mut) return;
-    g_mut->target = name;
-    g_mut->rows0  = rows0;
+static ray_t* global_value(int64_t name);
+
+/* What an append must leave alone for its rows to be all that changed:
+ * the value's type, and for a table the type of every column (the first
+ * rows of a table with typeless columns give them one). */
+static uint64_t append_shape(ray_t* v) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325) ^ (uint8_t)v->type;
+    if (v->type != RAY_TABLE) return h;
+    int64_t n = ray_table_ncols(v);
+    for (int64_t c = 0; c < n; c++) {
+        ray_col_meta_t m;
+        h = (h ^ (uint8_t)(ray_table_col_meta_idx(v, c, &m) ? m.type : 0xff)) * UINT64_C(0x100000001b3);
+    }
+    return h;
 }
 
-static ray_t* global_value(int64_t name);
+static int64_t append_len(ray_t* v) {
+    return v->type == RAY_TABLE ? ray_table_nrows(v) : ray_len(v);
+}
+
+void ray_journal_mut_target(int64_t name, ray_t* v) {
+    if (!g_mut || !v) return;
+    g_mut->target = name;
+    g_mut->rows0  = append_len(v);
+    g_mut->shape0 = append_shape(v);
+}
+
+void ray_journal_mut_resolved(int64_t name, ray_t* v) {
+    jmut_t* m = g_mut;
+    if (!m || m->resolved) return;
+    ray_t* cur = global_value(name);
+    if (cur) ray_release(cur);
+    m->resolved = true;
+    m->local = cur != v;
+}
+
+void ray_journal_mark_lost(void) { g_rec.lost = true; }
 
 /* A mutator that amended `tbl` under `name` says what it did, as the record
  * `op` of the one or two values: it is noted in place of the table. */
@@ -441,11 +475,16 @@ static ray_t* global_value(int64_t name) {
 static ray_err_t mut_record(const jmut_t* m, int64_t name) {
     if (m->target != name && m->set_name == name) return RAY_OK;
     if (m->target == name && m->val) return rec_push(m->op, name, m->val);
+    if (m->resolved && m->local) return RAY_OK;  /* a local of that name: no global changed */
     ray_t* cur = global_value(name);
-    if (!cur) return RAY_OK;                     /* a local target: no global changed */
+    if (!cur) return RAY_OK;
     ray_err_t e;
-    int64_t added = m->target == name && cur->type == RAY_TABLE
-                  ? ray_table_nrows(cur) - m->rows0 : -1;
+    /* The rows past the old end are the whole change only if the value kept
+     * its shape and had rows to keep it by; otherwise the value is logged. */
+    int64_t added = m->target == name && m->rows0 > 0 &&
+                    (cur->type == RAY_TABLE || cur->type == RAY_LIST || ray_is_vec(cur)) &&
+                    append_shape(cur) == m->shape0
+                  ? append_len(cur) - m->rows0 : -1;
     if (added == 0) {
         e = RAY_OK;
     } else if (added > 0) {
@@ -468,7 +507,8 @@ static ray_err_t mut_record(const jmut_t* m, int64_t name) {
 
 ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n) {
     if (!ray_journal_capture) return impl(args, n);
-    jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1, .op = 0, .val = NULL };
+    jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1, .op = 0, .val = NULL,
+                 .shape0 = 0, .resolved = false, .local = false };
     g_mut = &m;
     ray_t* r = impl(args, n);
     g_mut = m.prev;
@@ -544,6 +584,7 @@ static ray_err_t log_truncate_open(int64_t len) {
  * held back and written as one frame by the commit. */
 
 bool ray_tx_active = false;
+bool ray_tx_unpublished = false;
 
 
 static struct {
@@ -562,7 +603,7 @@ static struct {
  * things.  Before the commit: nothing logged, the tables' generations on
  * disk unpublished.  After it reached the journal: the same, but logged. */
 static bool g_tx_crash;
-static void tx_end(bool undo);
+static bool tx_end(bool undo);
 void ray_tx_crash_for_test(bool committed) {
     if (!ray_tx_active) return;
     g_tx_crash = true;
@@ -617,7 +658,8 @@ void ray_tx_touch(int64_t name) {
 }
 
 /* Close the transaction; `undo` binds the kept values back first. */
-static void tx_end(bool undo) {
+static bool tx_end(bool undo) {
+    bool published = true;
     ray_tx_active = false;
     ray_splay_defer = false;
     /* The tables written in it: published now that the commit is logged,
@@ -626,9 +668,11 @@ static void tx_end(bool undo) {
 #ifdef DEBUG
     if (g_tx_crash) ray_splay_pending_abandon();
 #endif
-    if (ray_splay_pending_end(!undo) != RAY_OK)
+    if (ray_splay_pending_end(!undo) != RAY_OK) {
+        published = false;
         fprintf(stderr, "tx: ERROR  a table written by the transaction is committed but not "
                         "published; a restart with the journal publishes it\n");
+    }
     bool capture = ray_journal_capture;
     ray_journal_capture = false;                 /* restoring is not a change to log */
     for (int64_t i = g_tx.n - 1; i >= 0; i--) {
@@ -643,6 +687,7 @@ static void tx_end(bool undo) {
         ray_journal_rewind(g_tx.mark);
         g_rec.lost = false;
     }
+    return published;
 }
 
 void ray_tx_rollback(void) {
@@ -652,6 +697,7 @@ void ray_tx_rollback(void) {
 }
 
 ray_err_t ray_tx_commit(void) {
+    ray_tx_unpublished = false;
     if (!ray_tx_active) return RAY_ERR_DOMAIN;
     if (g_tx.broken || g_tx.doomed) { tx_end(true); return RAY_ERR_DOMAIN; }
     bool was_stale = g_rec.stale;
@@ -682,8 +728,10 @@ ray_err_t ray_tx_commit(void) {
         if (!g_rec.torn) g_rec.stale = was_stale;
         return e;
     }
-    tx_end(false);
-    return RAY_OK;
+    /* Committed either way; a table left unpublished is still an error to
+     * whoever asked, who would otherwise read the old one as the new. */
+    ray_tx_unpublished = !tx_end(false);
+    return ray_tx_unpublished ? RAY_ERR_IO : RAY_OK;
 }
 
 void ray_tx_doom(int64_t owner) {
@@ -762,8 +810,14 @@ static ray_err_t rec_apply(ray_t* rec) {
         ray_t* cur = global_value(name);
         if (!cur || !v) { if (cur) ray_release(cur); return RAY_ERR_DOMAIN; }
         ray_t* all = ray_concat_fn(cur, v);
+        bool grown = all && !RAY_IS_ERR(all) && all->type == cur->type &&
+                     append_len(all) == append_len(cur) + append_len(v);
         ray_release(cur);
-        if (!all || RAY_IS_ERR(all)) { if (all) ray_error_free(all); return RAY_ERR_DOMAIN; }
+        if (!grown) {
+            if (all && RAY_IS_ERR(all)) ray_error_free(all);
+            else if (all) ray_release(all);
+            return RAY_ERR_DOMAIN;
+        }
         ray_err_t e = ray_env_set(name, all);
         ray_release(all);
         return e;
@@ -850,6 +904,32 @@ ray_err_t ray_journal_write_bytes(const ray_ipc_header_t* hdr,
     return RAY_OK;
 }
 
+static bool frame_header_ok(const ray_ipc_header_t* h) {
+    return h->prefix == RAY_SERDE_PREFIX && ray_serde_wire_version_supported(h->version) &&
+           h->endian == RAY_SERDE_ENDIAN && h->msgtype == RAY_IPC_MSG_JREC &&
+           h->size > 0 && h->size <= RAY_JREC_MAX;
+}
+
+/* Do the `n` bytes that follow a frame header, up to the end of the file,
+ * hold a chain of whole frames that ends exactly there?  A payload can hold
+ * the prefix bytes by chance; a chain that fits to the last byte it cannot,
+ * short of being a log itself. */
+static bool tail_holds_frames(const uint8_t* p, size_t n) {
+    static const uint32_t magic = RAY_SERDE_PREFIX;
+    for (size_t i = 0; i + sizeof(ray_ipc_header_t) <= n; i++) {
+        if (memcmp(p + i, &magic, sizeof(magic)) != 0) continue;
+        size_t at = i;
+        while (at + sizeof(ray_ipc_header_t) <= n) {
+            ray_ipc_header_t h;
+            memcpy(&h, p + at, sizeof(h));
+            if (!frame_header_ok(&h) || (size_t)h.size > n - at - sizeof(h)) break;
+            at += sizeof(h) + (size_t)h.size;
+        }
+        if (at == n) return true;
+    }
+    return false;
+}
+
 /* Replay frames from `start_off` (bytes) to EOF.  The offset is either
  * the preamble size or the snapshot's covered length; seeking past EOF
  * just reads a clean end (a log shorter than the covered length is a
@@ -906,8 +986,11 @@ static ray_err_t journal_replay_from(const char*           path,
         size_t pr = read_full(f, buf, (size_t)hdr.size);
         if (pr == SIZE_MAX) { ray_sys_free(buf); status = RAY_JREPLAY_IO;      break; }
         if (pr != (size_t)hdr.size) {
+            /* The file ends before this frame does.  A commit cut short —
+             * unless what was read holds frames of its own: then the size
+             * is what is wrong, and the commits behind it are real. */
+            status = tail_holds_frames(buf, pr) ? RAY_JREPLAY_BADTAIL : RAY_JREPLAY_TORN;
             ray_sys_free(buf);
-            status = RAY_JREPLAY_TORN;
             break;
         }
         /* A frame of the command format this log used to hold: replaying
@@ -938,9 +1021,11 @@ static ray_err_t journal_replay_from(const char*           path,
             ray_err_t ae = rec_apply(rec);
             ray_release(rec);
             if (ae != RAY_OK) {
-                fprintf(stderr, "log: WARN  chunk %lld: a record did not apply (rc=%d)\n",
+                /* The log says a change was made that cannot be made again:
+                 * what follows was written on a state this is not. */
+                fprintf(stderr, "log: ERROR chunk %lld: a record did not apply (rc=%d)\n",
                         (long long)chunks, (int)ae);
-                errs++;
+                status = RAY_JREPLAY_APPLY;
             }
         }
         ray_serde_keep_trust(prev_trust);
@@ -1234,6 +1319,14 @@ ray_err_t ray_journal_recover(const char* base) {
                     "log:       valid prefix, then restart\n",
                     log_path, (long long)chunks,
                     (long long)valid_bytes, (long long)valid_bytes);
+            return RAY_ERR_DOMAIN;
+        }
+        case RAY_JREPLAY_APPLY: {
+            fprintf(stderr,
+                    "log: ERROR replay stopped at chunk %lld in %s: a recorded change did not\n"
+                    "log:       apply, so memory no longer follows the log.  Do NOT truncate;\n"
+                    "log:       restore from a snapshot taken before that entry.\n",
+                    (long long)chunks, log_path);
             return RAY_ERR_DOMAIN;
         }
         case RAY_JREPLAY_FORMAT: {

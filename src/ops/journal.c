@@ -235,6 +235,10 @@ static ray_t* log_replay_impl(ray_t* path, bool reporting) {
         return ray_error("badtail",
                          "%s: the last entry is cut short after %lld entries (an unfinished commit)",
                          p, (long long)chunks);
+    case RAY_JREPLAY_APPLY:
+        return ray_error("apply",
+                         "%s: a recorded change did not apply at chunk %lld; the entries before it are applied",
+                         p, (long long)chunks);
     case RAY_JREPLAY_FORMAT:
         return ray_error("format",
                          "%s: a command entry of the old log format at chunk %lld; "
@@ -359,6 +363,9 @@ ray_t* ray_tx_commit_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     if (!tx_is_mine()) return ray_error("tx", ".tx.commit: no transaction open");
     ray_err_t e = ray_tx_commit();
+    if (ray_tx_unpublished)
+        return ray_error("io", ".tx.commit: committed, but a table it wrote could not be published; "
+                               "readers see the old one until a restart with the journal");
     if (e == RAY_ERR_DOMAIN) return ray_error("tx", ".tx.commit: the transaction was rolled back");
     return err_to_ray(e, "io");
 }

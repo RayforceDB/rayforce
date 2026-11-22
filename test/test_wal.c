@@ -184,6 +184,13 @@ static const struct { const char* name; const char* ops; const char* probe; } wa
     { "insert list",     "(set l (list 1 \"a\"))\n(insert 'l 'x)", "l" },
     { "insert in a fn",  "(set t " T3 ")\n(set f (fn [] (insert 't (list 4 40 'd))))\n(f)", "t" },
     { "insert nulls",    "(set t " T3 ")\n(insert 't (list 0Nl 40 'd))\n(insert 't (list 5 0Nl 'e))", "(list t (nil? (at t 'k)) (nil? (at t 'v)))" },
+    /* the first rows give a table of typeless columns its types: not an append */
+    { "insert typeless", "(set t (table [a b] (list (list) (list))))\n(insert 't (list 1 2.5))\n(insert 't (list 2 3.5))", "(list t (count t))" },
+    { "insert into empty", "(set t (take " T3 " 0))\n(insert 't (list 1 10 'a))\n(insert 't (list 2 20 'b))", "(list t (count t))" },
+    { "insert a local",  "(set t " T3 ")\n(set f (fn [t] (do (insert 't (list 9 9 'q)) (count t))))\n(f (table [k v s] (list [8] [8] ['p])))", "t" },
+    { "vector appends",  "(set v [1 2 3])\n(insert 'v 4)\n(alter 'v concat 5)\n(alter 'v concat [6 7])\n(insert 'v 8)", "v" },
+    { "list appends",    "(set l (list 1 \"a\"))\n(insert 'l 'x)\n(alter 'l concat (list 2.5 [1 2]))", "l" },
+    { "empty vector",    "(set v (take [1] 0))\n(insert 'v 4)\n(insert 'v 5)", "v" },
     { "insert new sym",  "(set t " T3 ")\n(insert 't (list 4 40 'never_seen_before_sym))", "t" },
 
     { "upsert new",      "(set t " T3 ")\n(upsert 't 1 (list 4 40 'd))", "t" },
@@ -491,6 +498,24 @@ static test_result_t test_tx_table_write_waits_for_commit(void) {
     TEST_ASSERT_TRUE(strcmp(after, before) != 0);
     TEST_ASSERT_EQ_I(txd_rows(dir), 4);
     TEST_ASSERT_EQ_I(txd_generations(dir), 1);
+    /* A commit that cannot publish a table says so: it is committed, and
+     * the reader would otherwise take the old table for the new. */
+    TEST_ASSERT_EQ_I(ray_tx_begin(RAY_TX_LOCAL, 0, 0), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 6 60 'f))"));
+    TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
+    if (geteuid() != 0) {                          /* root renames into a read-only directory */
+        chmod(dir, 0555);
+        ray_err_t ce = ray_tx_commit();
+        chmod(dir, 0755);
+        TEST_ASSERT_EQ_I(ce, RAY_ERR_IO);
+        TEST_ASSERT_TRUE(ray_tx_unpublished);
+        TEST_ASSERT_FALSE(ray_tx_active);
+        TEST_ASSERT_TRUE(wal_run("(if (== (count t) 5) 1 (no_such_function))"));   /* committed in memory */
+        TEST_ASSERT_EQ_I(txd_rows(dir), 4);                                        /* the old table on disk */
+        TEST_ASSERT_TRUE(wal_run("(delete {from: 't where: (== k 6)})"));
+    } else {
+        ray_tx_rollback();
+    }
     /* Outside a transaction a write publishes at once, as ever. */
     TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));
     TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", dir));
@@ -776,6 +801,139 @@ static test_result_t test_wal_upsert_logs_rows_not_table(void) {
     PASS();
 }
 
+/* A mutator that amended a local leaves the global of that name alone, so
+ * it logs nothing; and an append to a vector logs what it appended. */
+static test_result_t test_wal_local_target_and_vector_append(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "loc");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t (table [k v] (list (til 100000) (til 100000))))"));
+    TEST_ASSERT_TRUE(wal_run("(set v (til 100000))"));
+    /* insert and alter write the local they resolved.  (update, upsert and
+     * delete publish to the global whatever they resolved, so there the
+     * global does change and is logged.) */
+    TEST_ASSERT_TRUE(wal_run("(set f (fn [t v] (do (insert 't (list 1 1)) (insert 'v 5) (alter 'v concat 6) (+ (count t) (count v)))))"));
+    int64_t before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(f (table [k v] (list [1 2] [3 4])) [1 2])"));
+    TEST_ASSERT_TRUE(wal_run("(f (table [k v] (list [1 2] [3 4])) [1 2])"));
+    int64_t local = wal_file_size(base) - before;
+    before = wal_file_size(base);
+    TEST_ASSERT_TRUE(wal_run("(alter 'v concat 7)"));
+    TEST_ASSERT_TRUE(wal_run("(insert 'v 8)"));
+    TEST_ASSERT_TRUE(wal_run("(alter 'v concat [9 10 11])"));
+    int64_t appended = wal_file_size(base) - before;
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_cleanup(base);
+    TEST_ASSERT_EQ_I(local, 0);
+    TEST_ASSERT_TRUE(appended > 0 && appended < 1024);
+    PASS();
+}
+
+/* A mark .sys.trust puts on a lambda that is already bound comes back. */
+static test_result_t test_wal_trust_mark_is_logged(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "trust");
+    int64_t f = ray_sym_intern("wal_trusted_f", 13), g = ray_sym_intern("wal_plain_g", 11);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set wal_trusted_f (fn [x] (+ x 1)))"));
+    TEST_ASSERT_TRUE(wal_run("(set wal_plain_g (fn [x] (+ x 2)))"));
+    TEST_ASSERT_TRUE(wal_run("(.sys.trust 'wal_trusted_f)"));
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(ray_env_get_global(f)) != 0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    f = ray_sym_intern("wal_trusted_f", 13);       /* a fresh runtime numbers its symbols anew */
+    g = ray_sym_intern("wal_plain_g", 11);
+    ray_t* fv = ray_env_get_global(f);
+    ray_t* gv = ray_env_get_global(g);
+    wal_cleanup(base);
+    TEST_ASSERT_NOT_NULL(fv);
+    TEST_ASSERT_NOT_NULL(gv);
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(fv) != 0);
+    TEST_ASSERT_TRUE(LAMBDA_TRUSTED(gv) == 0);
+    PASS();
+}
+
+/* A record that does not apply stops recovery: the server must not start
+ * on a state the rest of the log was not written on. */
+static test_result_t test_wal_unappliable_record_is_fatal(void) {
+    char base[256];
+    wal_base(base, sizeof(base), "apply");
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set before 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));       /* an append to t */
+    TEST_ASSERT_TRUE(wal_run("(set after 2)"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    /* Cut the entry that binds t out of the log: the append has nothing to append to. */
+    char path[300], cmd[900];
+    snprintf(path, sizeof(path), "%s.log", base);
+    int64_t chunks = 0, bytes = 0;
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(chunks, 4);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    uint8_t* img = (uint8_t*)ray_sys_alloc((size_t)bytes);
+    TEST_ASSERT_EQ_I((int64_t)fread(img, 1, (size_t)bytes, f), bytes);
+    fclose(f);
+    int64_t off[5]; off[0] = 16;
+    for (int i = 0; i < 4; i++) {
+        ray_ipc_header_t h;
+        memcpy(&h, img + off[i], sizeof(h));
+        off[i + 1] = off[i] + (int64_t)sizeof(h) + h.size;
+    }
+    f = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(f);
+    fwrite(img, 1, (size_t)off[1], f);
+    fwrite(img + off[2], 1, (size_t)(bytes - off[2]), f);
+    fclose(f);
+    ray_sys_free(img);
+    (void)cmd;
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_FALSE(ray_journal_is_open());
+    TEST_ASSERT_FALSE(wal_run("after"));           /* nothing past the bad entry was applied */
+    wal_cleanup(base);
+    PASS();
+}
+
+/* A frame in the middle whose size was corrupted to reach past the end of
+ * the file reads like a commit cut short.  It is not: real commits follow
+ * it, and recovery must refuse instead of cutting them off. */
+static test_result_t test_wal_corrupt_size_is_not_a_torn_tail(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "size");
+    snprintf(path, sizeof(path), "%s.log", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set a 1)"));
+    TEST_ASSERT_TRUE(wal_run("(set b [1 2 3])"));
+    TEST_ASSERT_TRUE(wal_run("(set c (table [k] (list [1 2])))"));
+    TEST_ASSERT_TRUE(wal_run("(set d 4)"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    int64_t full = wal_file_size(base);
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    ray_ipc_header_t h;
+    TEST_ASSERT_EQ_I(fseek(f, 16, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fread(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    int64_t second = 16 + (int64_t)sizeof(h) + h.size;       /* the second commit's header */
+    TEST_ASSERT_EQ_I(fseek(f, (long)second, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fread(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    h.size += 100000;                                         /* past the end of the file */
+    TEST_ASSERT_EQ_I(fseek(f, (long)second, SEEK_SET), 0);
+    TEST_ASSERT_EQ_I((int64_t)fwrite(&h, 1, sizeof(h), f), (int64_t)sizeof(h));
+    fclose(f);
+
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(wal_file_size(base), full);              /* nothing was cut off */
+    wal_cleanup(base);
+    PASS();
+}
+
 /* A statement that changes nothing writes nothing. */
 static test_result_t test_wal_read_writes_no_frame(void) {
     char base[256];
@@ -925,6 +1083,10 @@ const test_entry_t wal_entries[] = {
     { "wal/roundtrip_paths",        test_wal_roundtrip_paths,        wal_setup, wal_teardown },
     { "wal/insert_logs_rows",       test_wal_insert_logs_rows_not_table, wal_setup, wal_teardown },
     { "wal/upsert_logs_rows",       test_wal_upsert_logs_rows_not_table, wal_setup, wal_teardown },
+    { "wal/local_and_vector_append", test_wal_local_target_and_vector_append, wal_setup, wal_teardown },
+    { "wal/trust_mark_logged",      test_wal_trust_mark_is_logged,   wal_setup, wal_teardown },
+    { "wal/unappliable_is_fatal",   test_wal_unappliable_record_is_fatal, wal_setup, wal_teardown },
+    { "wal/corrupt_size_not_torn",  test_wal_corrupt_size_is_not_a_torn_tail, wal_setup, wal_teardown },
     { "wal/read_writes_no_frame",   test_wal_read_writes_no_frame,   wal_setup, wal_teardown },
     { "wal/failed_statement",       test_wal_failed_statement_logs_what_it_changed, wal_setup, wal_teardown },
     { "wal/unloggable_refused",     test_wal_unloggable_value_is_refused, wal_setup, wal_teardown },

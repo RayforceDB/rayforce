@@ -21,7 +21,7 @@ A transaction groups changes so that all of them happen or none does. It is open
 | `.tx.commit` | nullary | Make the transaction's changes durable and visible. |
 | `.tx.rollback` | nullary | Undo everything since `.tx.begin`. |
 
-Errors: `tx` (`.tx.begin` while one is open; `.tx.commit` or `.tx.rollback` with none open, or with one that was rolled back), `arity` / `type` (bad limits), `io` (the commit could not be logged; the transaction is rolled back).
+Errors: `tx` (`.tx.begin` while one is open; `.tx.commit` or `.tx.rollback` with none open, or with one that was rolled back), `arity` / `type` (bad limits), `io` (the commit could not be logged and the transaction is rolled back — or, as the message then says, it is committed but a table it wrote could not be published).
 
 ## What it guarantees
 
@@ -55,7 +55,7 @@ A transaction stops the server for everyone else, so one opened over a connectio
 
 | Limit | Default | Measures |
 |---|---|---|
-| idle | 5 s | the owner's silence between two of its messages |
+| idle | 5 s | the owner's silence between two of its messages; the time the server takes to answer one does not count |
 | total | 60 s | the whole transaction |
 
 `(.tx.begin idle-ms total-ms)` sets both; `0` lifts one. When a limit runs out the transaction is rolled back and the owner's connection is closed. A connection that closes for any reason has its transaction rolled back.
@@ -73,6 +73,7 @@ A transaction stops the server for everyone else, so one opened over a connectio
 `.db.splayed.set` inside a transaction writes the new table in full and stops short of publishing it. Other processes keep reading the table as it was; the owner reads what it wrote. `.tx.commit` publishes every table the transaction wrote, `.tx.rollback` removes what was written.
 
 - If the process dies after the commit reached the journal but before a table was published, recovery publishes it.
+- If publishing a table fails at the commit (an I/O error), `.tx.commit` answers `io` and says so: the transaction is committed, readers of that table see the old one, and a restart with the journal publishes it.
 - A transaction never waits for a table's write lock. A table being written by another process, or written a second time in the same transaction, fails the write with `io` — and so rolls the transaction back.
 - Without a journal the commit still publishes every table, but a crash in the middle can leave some published and some not.
 

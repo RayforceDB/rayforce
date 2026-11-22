@@ -1226,12 +1226,16 @@ static void ipc_sigurg_handler(int sig)
  * one connection pumped, one descriptor polled, with a deadline.  A message
  * the pump dispatches comes back through ipc_read_payload. */
 static bool g_tx_serving;
+static uint64_t g_tx_dispatched;      /* messages ipc_read_payload has evaluated */
 
 static void tx_serve(ray_poll_t* poll, int64_t id, ray_ipc_conn_data_t* cd)
 {
     g_tx_serving = true;
     while (ray_tx_active && ray_tx_owner() == id) {
+        uint64_t seen = g_tx_dispatched;
         int rc = ray_poll_serve_rx(poll, id);
+        /* The time the server took over a message is not the owner's silence. */
+        if (g_tx_dispatched != seen) ray_tx_heard();
         /* The pump can close the connection (ipc_on_close rolls back) and a
          * dispatched eval can open another under the same id. */
         ray_selector_t* sel = ray_poll_get(poll, id);
@@ -1542,6 +1546,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
      * is rolled back whatever it does, unless it is the owner's rollback. */
     bool doomed = cd->tx_aborted;
     if (doomed) ray_tx_doom(id);
+    g_tx_dispatched++;
     g_eval_failed = false;
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) cd->rx_sync_seq++;
     int cancel_seq = !sel->xport ? CANCEL_ANY

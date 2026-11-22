@@ -735,11 +735,13 @@ static test_result_t test_journal_replay_report_mixed(void) {
     char call[512];
     snprintf(call, sizeof(call), "(.log.replay_report \"%s\")", path);
     ray_t* report = ray_eval_str(call); /* also exercises builtin registration */
-    bool reported = replay_report_test_counts(report, 3, 1);
+    /* The middle entry cannot apply: the report is that error, the entry
+     * before it is applied and the one after it is not. */
+    bool reported = report && RAY_IS_ERR(report) && strcmp(ray_err_code(report), "apply") == 0;
     replay_report_test_free(report);
     ray_t* marker = ray_eval_str("_replay_report_marker");
     bool continued = marker && !RAY_IS_ERR(marker) &&
-                     marker->type == -RAY_I64 && marker->i64 == 11;
+                     marker->type == -RAY_I64 && marker->i64 == 1;
     replay_report_test_free(marker);
 
     init = ray_eval_str("(set _replay_report_marker 0)");
@@ -747,13 +749,12 @@ static test_result_t test_journal_replay_report_mixed(void) {
     replay_report_test_free(init);
     ray_t* arg = ray_str(path, strlen(path));
     ray_t* legacy = arg && !RAY_IS_ERR(arg) ? ray_log_replay_fn(arg) : NULL;
-    bool legacy_count = legacy && !RAY_IS_ERR(legacy) &&
-                        legacy->type == -RAY_I64 && legacy->i64 == 3;
+    bool legacy_count = legacy && RAY_IS_ERR(legacy) && strcmp(ray_err_code(legacy), "apply") == 0;
     replay_report_test_free(legacy);
     replay_report_test_free(arg);
     marker = ray_eval_str("_replay_report_marker");
     bool legacy_continued = marker && !RAY_IS_ERR(marker) &&
-                            marker->type == -RAY_I64 && marker->i64 == 11;
+                            marker->type == -RAY_I64 && marker->i64 == 1;
     replay_report_test_free(marker);
     bool after_ok = replay_report_test_read(path, after, sizeof(after), &na);
     bool unchanged = before_ok && after_ok && nb == na && memcmp(before, after, nb) == 0;
@@ -761,7 +762,7 @@ static test_result_t test_journal_replay_report_mixed(void) {
 
     TEST_ASSERT_TRUE(wrote && initialized);
     TEST_ASSERT_TRUE(reported);
-    TEST_ASSERT_TRUE(continued); /* one replay; later entry still applied */
+    TEST_ASSERT_TRUE(continued); /* one replay; it stopped at the entry that did not apply */
     TEST_ASSERT_TRUE(legacy_count && legacy_continued);
     TEST_ASSERT_TRUE(unchanged);
     PASS();
@@ -852,12 +853,12 @@ static test_result_t test_journal_replay_eval_error(void) {
     int64_t chunks = 0, errs = 0;
     ray_jreplay_status_t status = RAY_JREPLAY_OK;
     ray_err_t e = ray_journal_replay(lpath, &chunks, &errs, &status);
-    /* All 3 frames deserialized fine -> status RAY_JREPLAY_OK. */
-    TEST_ASSERT_EQ_I(e, RAY_OK);
-    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_OK);
-    TEST_ASSERT_EQ_I(chunks, 3);
-    /* The eval error frame was noted. */
-    TEST_ASSERT_TRUE(errs >= 1);
+    /* The second entry holds a record that cannot apply: replay stops
+     * there.  What follows was written on a state this is not. */
+    TEST_ASSERT_EQ_I(e, RAY_ERR_DOMAIN);
+    TEST_ASSERT_EQ_I(status, RAY_JREPLAY_APPLY);
+    TEST_ASSERT_EQ_I(chunks, 1);
+    TEST_ASSERT_EQ_I(errs, 0);
 
     cleanup_base(base);
     PASS();

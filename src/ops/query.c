@@ -29278,6 +29278,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
         tbl = ray_env_get(inplace_sym);
         if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "update: `from:` symbol is unbound");
+        if (ray_journal_capture) ray_journal_mut_resolved(inplace_sym, tbl);
         ray_retain(tbl);
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "update: `from:` must be a table, got %s", ray_type_name(tbl_t)); }
@@ -31645,6 +31646,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             if (err != RAY_OK)
                 return ray_error(err == RAY_ERR_NAME ? "domain" : ray_err_code_str(err),
                                  "insert: cannot resolve target binding");
+            if (ray_journal_capture) ray_journal_mut_resolved(inplace_sym, target.scope < 0 ? tbl : NULL);
             ray_retain(tbl);
         }
     }
@@ -31694,6 +31696,8 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 ray_release(tbl);
                 return val ? val : ray_error("type", "insert: value evaluation failed");
             }
+            /* The journal notes what this appends, not the vector it leaves. */
+            if (inplace_sym >= 0 && target.scope < 0) ray_journal_mut_target(inplace_sym, tbl);
             if (is_target_list) {
                 /* Always one slot — never splice on append. */
                 tbl = ray_list_append(tbl, val);
@@ -32014,7 +32018,7 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
     int64_t nrows = ray_table_nrows(tbl);
     /* Every argument is evaluated: from here the journal notes the rows
      * this insert adds, not the table it publishes. */
-    if (inplace_sym >= 0 && target.scope < 0) ray_journal_mut_target(inplace_sym, nrows);
+    if (inplace_sym >= 0 && target.scope < 0) ray_journal_mut_target(inplace_sym, tbl);
 
     /* ---- In-place append fast path (#455) -------------------------------
      * The rebuild below copies every existing row on every call, which
@@ -33425,6 +33429,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
             tbl = ray_env_get(inplace_sym);
             if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "upsert: target symbol is unbound");
+            if (ray_journal_capture) ray_journal_mut_resolved(inplace_sym, tbl);
             ray_retain(tbl);
         }
     }
@@ -36685,6 +36690,7 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
         if (ray_tx_active) ray_tx_touch(inplace_sym);   /* before any in-place write */
         tbl = ray_env_get(inplace_sym);
         if (!tbl || RAY_IS_ERR(tbl)) return ray_error("domain", "delete: `from:` symbol is unbound");
+        if (ray_journal_capture) ray_journal_mut_resolved(inplace_sym, tbl);
         ray_retain(tbl);
     }
     if (tbl->type != RAY_TABLE) {

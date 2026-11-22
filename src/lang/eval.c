@@ -663,7 +663,14 @@ ray_t* ray_sys_trust_fn(ray_t* x) {
             int64_t id = x->type == -RAY_SYM ? x->i64
                                              : ray_read_sym(ray_data(x), i, RAY_SYM, x->attrs);
             ray_t* fn = ray_env_get(id);   /* borrowed */
-            if (pass == 1) { LAMBDA_TRUSTED(fn) = idents[i]; continue; }
+            if (pass == 1) {
+                LAMBDA_TRUSTED(fn) = idents[i];
+                /* The mark is part of what the name holds: log the binding
+                 * again, or recovery brings the lambda back without it. */
+                if (ray_journal_capture && ray_journal_note_set(id, fn) != RAY_OK)
+                    ray_journal_mark_lost();
+                continue;
+            }
             if (!fn) { err = undefined_name_error(id); break; }
             if (fn->type != RAY_LAMBDA) {
                 ray_t* s = ray_sym_str(id);   /* borrowed */

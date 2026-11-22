@@ -66,6 +66,7 @@ typedef enum {
     RAY_JREPLAY_CANCEL  = 6, /* interrupted mid-replay — clean abort, log intact, DO NOT truncate */
     RAY_JREPLAY_TORN    = 7, /* the last frame ends early — a commit that never finished        */
     RAY_JREPLAY_FORMAT  = 8, /* a command entry of the old log format                           */
+    RAY_JREPLAY_APPLY   = 9, /* a recorded change did not apply: memory no longer follows the log */
 } ray_jreplay_status_t;
 
 /* Open the journal: load <base>.qdb, replay <base>.log, open log for append.
@@ -140,9 +141,15 @@ void      ray_journal_rewind(int64_t mark);
 /* Run a mutator (insert, upsert, update, delete, alter) and note what it
  * changed when it returns the name it amended. */
 ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n);
-/* insert, right before it appends to the global table `name` of `rows0`
- * rows: the rows past rows0 are noted in place of the whole table. */
-void ray_journal_mut_target(int64_t name, int64_t rows0);
+/* A mutator, right before it appends to the global `name`, which holds the
+ * table, vector or list `v`: what lies past v's end afterwards is noted in
+ * place of the whole value, provided the append left its shape alone. */
+void ray_journal_mut_target(int64_t name, ray_t* v);
+/* A mutator, once it has found what the name `name` gave it to amend: when
+ * that is not the global of that name (a local is), nothing is noted. */
+void ray_journal_mut_resolved(int64_t name, ray_t* v);
+/* A change was made that could not be noted: the next commit fails. */
+void ray_journal_mark_lost(void);
 /* upsert, once its key and rows are evaluated, amending `tbl` under the
  * name `name`: the two are noted in place of the table they leave. */
 void ray_journal_mut_upsert(int64_t name, ray_t* tbl, ray_t* key, ray_t* rows);
@@ -171,8 +178,11 @@ extern bool ray_tx_active;
  * whole transaction; 0 is no limit. */
 ray_err_t ray_tx_begin(int64_t owner, int64_t idle_ms, int64_t total_ms);
 /* Write the transaction's changes as one journal commit and close it.  On
- * an error nothing is logged and everything is rolled back. */
+ * an error nothing is logged and everything is rolled back — except when
+ * ray_tx_unpublished is set afterwards: then it is committed, and a table
+ * it wrote could not be published (a restart with the journal does it). */
 ray_err_t ray_tx_commit(void);
+extern bool ray_tx_unpublished;
 /* Bind every global back to what it held at begin and close.  No-op when
  * none is open. */
 void      ray_tx_rollback(void);

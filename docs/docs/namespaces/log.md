@@ -8,7 +8,7 @@ Each entry is one **commit**. It holds physical records, not the command that pr
 |---|---|---|
 | bind | `set`, top-level `let`, `alter`, and any mutator that had to rebuild its table | binds the name to the recorded value |
 | unbind | `del` | removes the name |
-| append | `insert` into a named table | appends the recorded rows |
+| append | `insert` into a named table, vector or list; `alter … concat` | appends the recorded rows or elements |
 | upsert | `upsert` into a named table | upserts the recorded rows by the recorded key |
 | rows | `update` with `where:`, made in place | writes the recorded rows at the recorded positions |
 | drop | `delete`, made in place | removes the rows at the recorded positions |
@@ -107,7 +107,7 @@ Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals se
 
 What the current evaluation changed before the call is committed first, so it lands in the snapshot and not in the fresh log. A snapshot also ends the refusal that follows a failed commit.
 
-A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot and in the journal, and recovery restores it. The mark is kept only there; `ser`, `de` and IPC never carry it. A journal entry is written only by the server, and a frame of that type arriving on a connection closes it.
+A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot and in the journal, and recovery restores it; marking a lambda by name logs its binding again, so a mark made after the lambda was bound is kept too. The mark is kept only there; `ser`, `de` and IPC never carry it. A journal entry is written only by the server, and a frame of that type arriving on a connection closes it.
 
 Errors: `domain` (no journal open), `io`.
 
@@ -119,15 +119,16 @@ Errors: `domain` (no journal open), `io`.
 
 ## `.log.replay` { #log-replay }
 
-Signature: `(.log.replay "path")`. Reads each entry in the file and applies its records. Returns the number of **entries**, including entries with a record that did not apply (an append to a name that is not bound, for example). Such a record produces a warning and replay continues; the integer is **not** a count of entries applied in full.
+Signature: `(.log.replay "path")`. Reads each entry in the file and applies its records. Returns the number of entries applied.
 
-Use [`.log.replay_report`](#log-replay-report) **instead of** `.log.replay` when the caller needs the count of such entries; the reporting verb performs its own replay, not an inspection of a previous call. Neither verb rolls back an already-applied prefix.
+A record that does not apply (an append to a name that is not bound, for example) stops the replay with `apply`: the entries before it are applied, nothing after it is. The log recorded a change made on a state that memory is no longer in, so going on would build on the difference. Recovery at startup treats it the same way and does not start. Neither verb rolls back an already-applied prefix.
 
 Unlike recovery at startup, the verb does not drop an entry cut short at the end of the file: it reports it.
 
 | Error code | Meaning | Action |
 |---|---|---|
-| `badtail` | Framing not accepted after a prefix, or the last entry is cut short (an unfinished commit). | Inspect with `.log.validate`. Startup recovery drops an entry cut short at the very end by itself; broken framing anywhere else needs a decision. |
+| `badtail` | Framing not accepted after a prefix, or the last entry is cut short (an unfinished commit). | Inspect with `.log.validate`. Startup recovery drops an entry cut short at the very end by itself; broken framing anywhere else — including an entry that runs past the end of the file with whole entries inside what it claims — needs a decision. |
+| `apply` | A recorded change did not apply; memory no longer follows the log. | Do **not** truncate; restore from a snapshot taken before that entry. |
 | `format` | An entry of the earlier command format. | Snapshot the log with the earlier version. |
 | `deser` | Entry intact but a record could not be decoded — content/version skew. | Do **not** truncate; inspect and fix. |
 | `oom` / `io` | Resource exhaustion / read failure. | Resolve the cause and rebuild from a known state before retrying; earlier entries may already have taken effect. |
@@ -135,22 +136,22 @@ Unlike recovery at startup, the verb does not drop an entry cut short at the end
 
 ```lisp
 (.log.replay "/tmp/rayforce-journal.log")
-;; => 2   (entries read, not proof every record applied)
+;; => 2
 ```
 
 ## `.log.replay_report` { #log-replay-report }
 
 Signature: `(.log.replay_report "path")`. **Applies the file once**, under the same rules as `.log.replay`. On a clean tail it returns a dictionary of two I64 fields:
 
-- `entries`: entries read, including those with a record that did not apply.
-- `eval_errors`: records that did not apply.
+- `entries`: entries applied.
+- `eval_errors`: always `0`; a record that does not apply is an `apply` error, not a count.
 
 The report is allocated before replay starts; failure to allocate it raises `oom` without applying anything. Terminal failures raise the same errors as `.log.replay`, and may follow an already-applied prefix.
 
 ```lisp
 (set report (.log.replay_report "/tmp/rayforce-journal.log"))
 (get report 'entries)      ;; 3
-(get report 'eval_errors)  ;; 1
+(get report 'eval_errors)  ;; 0
 ```
 
 This is observability, not atomic recovery or validation of application invariants. `.log.validate` checks framing only.

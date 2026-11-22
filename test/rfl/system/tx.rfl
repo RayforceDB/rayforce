@@ -135,6 +135,16 @@
 (set h (.ipc.open "127.0.0.1:19981"))
 (.ipc.send h "n") -- 3
 
+;; ── the server's own time over a message is not the owner's silence ─
+;; One statement that takes several times the idle limit to compute: the
+;; owner was not quiet, the server was busy.
+(nil? (.ipc.send h "(.tx.begin 200 0)")) -- true
+(.ipc.send h "(set n 53)") -- 53
+(.ipc.send h "((fn [] (do (let i 0) (while (< i 10000000) (let i (+ i 1))) i)))") -- 10000000
+(.ipc.send h "n") -- 53
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 3
+
 ;; ── limits lifted: quiet for longer than the default idle limit is fine
 (nil? (.ipc.send h "(.tx.begin 0 0)")) -- true
 (.ipc.send h "(set n 4)") -- 4

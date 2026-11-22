@@ -1417,6 +1417,7 @@ static ray_t* alter_impl(ray_t** args, int64_t n) {
     /* Argument evaluation can rebind the target or grow a scope frame. Keep
      * the original value alive and publish through the resolved scope. */
     ray_retain(var);
+    if (ray_journal_capture) ray_journal_mut_resolved(name_sym->i64, target.scope < 0 ? var : NULL);
     ray_t* result = alter_target(args, n, &target, var, name_sym);
     ray_release(var);
     return result;
@@ -1648,6 +1649,8 @@ static ray_t* alter_target(ray_t** args, int64_t n,
         if (n < 3) { ray_release(name_sym); return ray_error("arity", "alter concat: expects 3 arguments (var, concat, val), got %lld", (long long)n); }
         ray_t* val = ray_eval(args[2]);
         if (!val || RAY_IS_ERR(val)) { ray_release(name_sym); return val ? val : ray_error("type", "alter concat: value argument evaluated to null"); }
+        /* The journal notes what this appends, not the value it leaves. */
+        if (target->scope < 0) ray_journal_mut_target(name_sym->i64, var);
         ray_t* new_vec = ray_concat_fn(var, val);
         ray_release(val);
         if (!new_vec || RAY_IS_ERR(new_vec)) { ray_release(name_sym); return new_vec ? new_vec : ray_error("oom", NULL); }
