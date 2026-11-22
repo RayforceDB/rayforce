@@ -47,7 +47,9 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | `span + span`, `span - span`, `neg span`, `abs span` | TIMESPAN |
 | `span + integer`, `integer + span`, `span - integer` | TIMESPAN; integer counts nanoseconds |
 | `span * integer`, `integer * span` | TIMESPAN |
+| `span + float`, `float + span`, `span - float`, `float - span`, `span * float`, `float * span` (F64 or F32) | F64: the float arithmetic of the nanosecond count; a null operand gives null |
 | `span div integer`, `span div span` | TIMESPAN |
+| `span div F64`, `span div F32` | TIMESPAN: the float is rounded to an integer count first, as for an integer divisor |
 | `span / span`, `span / integer` | F64 |
 | `span % integer` | TIMESPAN |
 | `span % F64`, `F64 % span`, and the same with F32 | F64: the float `%` of the nanosecond count, the floor modulo rounded once (in [0,b) for b > 0, (b,0] for b < 0); a zero divisor gives null |
