@@ -498,8 +498,6 @@ static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
  * The temporal side is a column or a lowered expression (not a literal, not
  * a partition key's MAPCOMMON wrapper); the integer side a column or
  * expression of its type, or a non-null integer literal. */
-static _Thread_local uint32_t g_temporal_int_lowered;   /* pairs lowered, ever */
-
 static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t len,
                                         ray_op_t* left, ray_op_t* right,
                                         int8_t left_type, int8_t right_type) {
@@ -542,7 +540,7 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
     ray_op_t* c = ray_cast(g, m, tt);
     if (!c) return NULL;
     c->flags |= OP_FLAG_TEMPORAL_INT;
-    g_temporal_int_lowered++;
+    g->temporal_int_nodes++;
     return c;
 }
 
@@ -557,9 +555,20 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
  * `if` arm the row-wise blend runs on its own), an operand of another such
  * pair, or an arm of an `if` whose arms are all of its type and none a
  * literal, which then stands for it.  Any other node that reads it fails
- * the compile, as the builtin pair did.  Only the nodes made since `base`
- * are walked, and only when the compile lowered a pair. */
+ * the compile, as the builtin pair did: through an input, the third input
+ * of a 3-ary node (substr's length, replace's text), or a later
+ * projection's alias of it.  Only the nodes made since `base` are walked,
+ * and only in a graph that holds a lowered pair. */
 static bool dag_temporal_int_readers_ok(ray_graph_t* g, uint32_t base) {
+    /* the third input of a 3-ary node other than `if` (below) */
+    for (uint32_t e = 0; e < g->ext_count; e++) {
+        ray_op_ext_t* x = g->ext_nodes[e];
+        if (!x || x->base.id < base || x->base.opcode == OP_IF) continue;
+        uint32_t t = x->third_in;
+        if (t != RAY_OP_NONE && t != 0 && t < g->node_count &&
+            (g->nodes[t].flags & OP_FLAG_TEMPORAL_INT))
+            return false;
+    }
     for (uint32_t id = base; id < g->node_count; id++) {
         ray_op_t* n = &g->nodes[id];
         if (n->flags & (OP_FLAG_DEAD | OP_FLAG_TEMPORAL_INT)) continue;
@@ -1961,9 +1970,9 @@ static ray_op_t* compile_agg_arg_dag(ray_graph_t* g, ray_t* expr) {
 /* compile_expr_dag_node, with the readers of a lowered temporal +/- integer
  * held to dag_temporal_int_readers_ok at each level. */
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
-    uint32_t base = g->node_count, lowered = g_temporal_int_lowered;
+    uint32_t base = g->node_count;
     ray_op_t* r = compile_expr_dag_node(g, expr);
-    if (!r || lowered == g_temporal_int_lowered) return r;
+    if (!r || !g->temporal_int_nodes) return r;
     return dag_temporal_int_readers_ok(g, base) ? &g->nodes[r->id] : NULL;
 }
 

@@ -629,6 +629,12 @@ typedef struct ray_graph {
      * quiet inside an arm and let the arm compile as it always did. */
     int             if_arm_depth;
 
+    /* Temporal +/- integer pairs compile_expr_dag lowered into this graph
+     * (OP_FLAG_TEMPORAL_INT, #1302): while nonzero every compile level
+     * holds the nodes it made to the pair's reader rule, an alias of an
+     * earlier projection included. */
+    uint32_t        temporal_int_nodes;
+
     /* Result memo for shared nodes (exec.c, exec_node): a node with more
      * than one consumer in the graph is executed once and its result is
      * handed to every consumer as a retained ref; the memo's own ref is
