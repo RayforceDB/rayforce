@@ -241,6 +241,10 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         "(set ue (as 'U8 [255 0 3])) (set ve (as 'U8 [0 0 0])) (set _ntu (table [u v] (list ue ve)))",
         "(set uo (as 'U8 [255 0 3])) (set vo (as 'U8 [1 0 4])) (set _ntv (table [u v] (list uo vo)))",
         "(set ie [2147483647i -2147483647i]) (set je [0i 0i]) (set _nti (table [i j] (list ie je)))",
+        /* a nullable column whose coefficient cancels to zero */
+        "(set vc (as 'U8 [128 133 164])) (set ic [-927849349i -927849348i 0Ni]) (set _ntc (table [v i] (list vc ic)))",
+        "(set xc [1 2 3]) (set yc [1 2 0Nl]) (set _nty (table [x y] (list xc yc)))",
+        "(set _nt100 (table [x] (list (til 100))))",
         NULL,
     };
     for (int q = 0; setup[q]; q++)
@@ -318,6 +322,16 @@ static test_result_t test_narrow_sum_bound_routes(void) {
          * linear plan never takes a nullable term (no proof is tried) */
         { NS_Q("(select {s: (sum (+ h 1h)) from: _nTN})", "(sum (+ hn 1h))"), SCAN },
         { NS_Q("(select {s: (sum (+ h k)) from: _nTN})",  "(sum (+ hn k))"),  0 },
+        /* a nullable column the linear form drops (zero coefficient): no plan */
+        { NS_Q("(select {s: (avg (+ v (- i i))) from: _ntc})", "(avg (+ vc (- ic ic)))"), 0 },
+        { NS_Q("(select {s: (sum (+ v (* i 0i))) from: _ntc})", "(sum (+ vc (* ic 0i)))"), 0 },
+        { NS_Q("(select {s: (sum (- 7i (* i 0i))) from: _ntc})", "(sum (- 7i (* ic 0i)))"), 0 },
+        { NS_Q("(select {s: (sum (+ x (* y 0))) from: _nty})", "(sum (+ xc (* yc 0)))"), 0 },
+        { NS_Q("(select {s: (avg (+ x (- y y))) from: _nty})", "(avg (+ xc (- yc yc)))"), 0 },
+        { NS_Q("(select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: _nty})",
+               "(sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3)))"), 0 },
+        /* a narrow constant subtree that wraps: refused, per row */
+        { NS_Q("(select {s: (sum (* -12038h 0x7f)) from: _nt100})", "-2149800"), REF },
         /* I64: no narrow node, no proof */
         { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), 0 },
         { NULL, 0 },

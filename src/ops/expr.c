@@ -846,6 +846,22 @@ static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_
     return false;
 }
 
+/* True when a column `op` reads may hold nulls, a term the linear form
+ * dropped for a zero coefficient ((* y 0), (- y y)) included: the per-row
+ * answer skips its null rows, so the plan must not take the shape. */
+static bool linear_reads_nullable(ray_graph_t* g, ray_t* tbl, ray_op_t* op, int depth, ray_t** err) {
+    if (!op || depth > 64) return true;
+    if (op->opcode == OP_SCAN) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->base.opcode != OP_SCAN || ray_col_bind_declines(tbl, ext->sym)) return true;
+        ray_col_src_t* src = ray_graph_bind_col(g, tbl, ext->sym, err);
+        return !src || src->may_null;
+    }
+    for (int i = 0; i < op->arity; i++)
+        if (linear_reads_nullable(g, tbl, op_child(g, op, i), depth + 1, err)) return true;
+    return false;
+}
+
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
 bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
@@ -876,6 +892,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
          * scalar route evaluates the expression by range reads instead */
         if (!ray_col_src_base(srcs[i])) return false;
     }
+    if (linear_reads_nullable(g, tbl, input_op, 0, err)) return false;
     /* a narrow tree: the plan only under the no-wrap proof, whose pass
      * also leaves the terms' totals when it read every one; a lone
      * aggregate, which takes the total alone, lets the pass sum a slice it

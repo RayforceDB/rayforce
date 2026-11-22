@@ -155,3 +155,31 @@
 (at (select {s: (sum (+ h k)) from: P}) 's) -- (enlist (+ (sum (+ h k)) (sum (+ hw kw))))
 (at (select {s: (sum (+ h 1h)) from: P}) 's) -- (enlist (+ (sum (+ h 1h)) (sum (+ hw 1h))))
 (.sys.exec "rm -rf /tmp/rfl_narrow_sum_bound")
+
+;; ─── a nullable column whose coefficient cancels to zero ─────────────
+;; the per-row answer skips its null rows, so the plans must not drop it
+(set vc (as 'U8 [128 133 164]))
+(set ic [-927849349i -927849348i 0Ni])
+(set TC (table [v i] (list vc ic)))
+(at (select {s: (avg (+ v (- i i))) from: TC}) 's) -- (enlist (avg (+ vc (- ic ic))))
+(at (select {s: (avg (+ v (- i i))) from: TC}) 's) -- [130.5]
+(at (select {s: (sum (+ v (* i 0i))) from: TC}) 's) -- (enlist (sum (+ vc (* ic 0i))))
+(at (select {s: (sum (+ v (* i 0i))) from: TC}) 's) -- [261]
+(at (select {s: (sum (- 7i (* i 0i))) from: TC}) 's) -- (enlist (sum (- 7i (* ic 0i))))
+(at (select {s: (sum (- 7i (* i 0i))) from: TC}) 's) -- [14]
+(set xc [1 2 3])
+(set yc [1 2 0Nl])
+(set TY (table [x y] (list xc yc)))
+(at (select {s: (sum (+ x (* y 0))) from: TY}) 's) -- (enlist (sum (+ xc (* yc 0))))
+(at (select {s: (sum (+ x (* y 0))) from: TY}) 's) -- [3]
+(at (select {s: (avg (+ x (- y y))) from: TY}) 's) -- (enlist (avg (+ xc (- yc yc))))
+(at (select {s: (avg (+ x (- y y))) from: TY}) 's) -- [1.5]
+;; cancelling inside a longer chain
+(at (select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: TY}) 's) -- (enlist (sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3))))
+(at (select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: TY}) 's) -- [13]
+(at (select {s: (sum (+ (- v (* 2i i)) (+ (* i 2i) 1i))) from: TC}) 's) -- (enlist (sum (+ (- vc (* 2i ic)) (+ (* ic 2i) 1i))))
+
+;; a narrow constant subtree wraps in its width per row (not folded in I64)
+(set T100 (table [x] (list (til 100))))
+(at (select {s: (sum (* -12038h 0x7f)) from: T100}) 's) -- [-2149800]
+(at (select {s: (sum (+ x (* -12038h 0x7f))) from: T100}) 's) -- (enlist (sum (+ (til 100) (* -12038h 0x7f))))
