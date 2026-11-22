@@ -70,6 +70,22 @@
 ;; A single group is the keyless answer
 (at (select {from: (update {from: t g: 'a}) by: g r: (rank v)}) 'r) -- (list [4 2 3 0 1])
 
+;; A verb reached through a lambda's parameter, a let, or written into a
+;; built query as a function value is the same verb: its group's rows
+(set q1 (fn [f] (at (select {from: t by: g r: (f v)}) 'r)))
+(q1 rank) -- (list [2 0 1] [0 1])
+(set q1s (fn [f] (R (select {from: t by: s r: (f v)}))))
+(q1s rank) -- (list [2 0 1] [0 1])
+(set q4 (fn [] (let f rank) (at (select {from: t by: g r: (f v)}) 'r)))
+(q4) -- (list [2 0 1] [0 1])
+(q1 (fn [x] (- x (avg x)))) -- (list [10.0 -10.0 0.0] [-1.0 1.0])
+(set lf (fn [x] (- x (avg x))))
+(at (eval (list 'select (dict ['from 'by 'r] (list t 'g (list rank 'v))))) 'r) -- (list [2 0 1] [0 1])
+(at (eval (list 'select (dict ['from 'by 'r] (list t 'g (list lf 'v))))) 'r) -- (list [10.0 -10.0 0.0] [-1.0 1.0])
+;; a quoted column name evaluated per group reads its group's rows
+(at (select {from: t by: g r: (reverse 'v)}) 'r) -- (list [20 10 30] [7 5])
+(at (select {from: t by: g r: (rank 'v)}) 'r) -- (list [2 0 1] [0 1])
+
 ;; A verb in a running function's argument runs with that function, over
 ;; the whole table (the running-function rule, docs/queries/select.md): this
 ;; PR leaves it so
@@ -105,13 +121,27 @@
 ;; (first (asc v)) is planned as (min v), (count (iasc w)) as (count w)
 (count (select {from: K5 by: k r: (count w)})) -- 100000
 (at (select {from: K5 by: k r: (first (asc v))}) 'r) -- (at (select {from: K5 by: k r: (min v)}) 'r)
-(< (timeit (select {from: K5 by: k r: (first (asc v))}) 3) (+ 50.0 (* 4.0 (timeit (select {from: K5 by: k r: (min v)}) 3)))) -- true
+(< (timeit (select {from: K5 by: k r: (first (asc v))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (min v)}) 3)))) -- true
 (at (select {from: K5 by: k r: (count (iasc w))}) 'r) -- (at (select {from: K5 by: k r: (count w)}) 'r)
 (< (timeit (select {from: K5 by: k r: (count (iasc w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
 (< (timeit (select {from: K5 by: k r: (count (rank w))}) 3) (+ 5.0 (* 2.0 (timeit (select {from: K5 by: k r: (count w)}) 3)))) -- true
 (at (select {from: t by: g r: (count (xrank 2 v))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (rotate v 1))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (idesc v))}) 'r) -- [3 2]
+;; the count rewrite only where it is the same answer: the verb's other
+;; argument a literal it takes, for which it gives one cell per cell
+(select {from: t by: g r: (count (xrank 'a v))}) !- type
+(select {from: t by: g r: (count (rotate v 'a))}) !- type
+(select {from: t by: g r: (count (rotate 1 v))}) !- type
+(at (select {from: t by: g r: (count (xrank 0 v))}) 'r) -- [0 0]
+(at (select {from: t by: g r: (count (xrank -1 v))}) 'r) -- [0 0]
+(at (select {from: t by: g r: (count (rotate v -1))}) 'r) -- [3 2]
+;; and only while the verb's name is the builtin
+(set REV reverse)
+(set reverse (fn [x] (take x 1)))
+(at (select {from: t by: g r: (count (reverse v))}) 'r) -- [1 1]
+(set reverse REV)
+(at (select {from: t by: g r: (count (reverse v))}) 'r) -- [3 2]
 
 ;; Parted: a group spans partitions; its ranks are its rows' across them
 (.sys.exec "rm -rf /tmp/rfl_grouped_grade")
