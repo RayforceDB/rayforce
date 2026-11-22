@@ -105,3 +105,14 @@
 (set U (.db.splayed.get "/tmp/rfl_split_save/t/"))
 (at U 'v) -- (list ["aaaaaaaaaaaaaaaaaaaaaa"] ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "cccccccccccccccccccccc"])
 (.sys.exec "rm -rf /tmp/rfl_split_save") -- 0
+
+;; saving the segments of a split writes each segment's own strings, not the pool of
+;; the whole vector once per segment (200 segments of a 20,000-string vector: 158 MB
+;; against 0.89 MB)
+(set big (as 'STR (map (fn [i] (format "string-number-%-padding-padding" i)) (til 20000))))
+(set segs (split big (* 100 (til 200))))
+(count segs) -- 200
+(.db.splayed.set "/tmp/rfl_split_size/t/" (table [k v] (list (til 200) segs)))
+(.sys.exec "[ $(du -sk /tmp/rfl_split_size/t/v | cut -f1) -lt 4096 ]") -- 0
+(count (at (.db.splayed.get "/tmp/rfl_split_size/t/") 'v)) -- 200
+(.sys.exec "rm -rf /tmp/rfl_split_size") -- 0

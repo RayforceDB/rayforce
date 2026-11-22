@@ -889,10 +889,24 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             int64_t end = (i + 1 < nidx) ? idx_buf[i + 1] : total;
             int64_t seglen = end - start;
             if (seglen < 0) seglen = 0;
-            /* a slice keeps the null flags and the string pool of the source; a raw
+            /* a segment keeps the null flags and the strings of the source; a raw
              * copy of the cells dropped both (a null came out as its sentinel value,
              * a string that is not inline as an empty one) */
-            ray_t* seg = ray_vec_slice(str, start, seglen);
+            ray_t* seg;
+            if (str->type == RAY_STR) {
+                /* A string segment is copied: a slice of a string vector shares the
+                 * pool of the whole vector, so saving 200 segments wrote the pool
+                 * 200 times (178x the size), each reload allocated it again, and
+                 * every reader of ->str_pool had to know about slices. The copy
+                 * holds only the bytes its own cells reference. */
+                int64_t* rows = (int64_t*)ray_alloc_raw((size_t)(seglen > 0 ? seglen : 1) * sizeof(int64_t));
+                if (!rows) { ray_release(result); return ray_error("oom", NULL); }
+                for (int64_t r = 0; r < seglen; r++) rows[r] = start + r;
+                seg = gather_by_idx(str, rows, seglen);
+                ray_free_raw(rows);
+            } else {
+                seg = ray_vec_slice(str, start, seglen);
+            }
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
             result = ray_list_append(result, seg);
             ray_release(seg);
