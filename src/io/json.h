@@ -32,7 +32,7 @@
  *                             text is a `parse` error naming the byte, never
  *                             a partial value.  Never evaluates anything and
  *                             interns nothing: object keys are strings.
- *   (.json.get s path)        one field of each document, by a dotted path
+ *   (.json.get s path [limits]) one field of each document, by a dotted path
  *                             ("data.ids.0"), building only that field; a
  *                             missing path is null.
  *   (.json.format v)          a value to JSON text.
@@ -43,7 +43,7 @@
 #include <rayforce.h>
 
 ray_t* ray_json_parse_fn(ray_t** args, int64_t n);
-ray_t* ray_json_get_fn(ray_t* s, ray_t* path);
+ray_t* ray_json_get_fn(ray_t** args, int64_t n);
 ray_t* ray_json_format_fn(ray_t* v);
 
 #endif /* RAY_JSON_H */

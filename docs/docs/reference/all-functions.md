@@ -60,7 +60,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `mmu`, `lsq`, `hnsw-save`, `.attr.set`,
-`.col.link`, `.json.get`
+`.col.link`
 
 ### Variadic / Special
 
@@ -77,7 +77,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
-`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`
+`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`, `.json.get`
 
 ## Arithmetic
 
@@ -736,7 +736,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
 | `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | — | JSON text to a value (object to dict with string keys, array to a vector or list); element-wise over a string vector; strict, the limits of `read-value`. See [`.json.*`](../namespaces/json.md) | `(.json.parse "{\"a\":[1,2]}")` → `(dict ["a"] (list [1 2]))` |
-| `.json.get` | binary | — | One field of each JSON document by a dotted path, without building the rest; a missing path is null | `(.json.get line "data.ids.0")` |
+| `.json.get` | variadic | — | One field of each JSON document by a dotted path (or one path per row), without building the rest; optional limits; a missing path is null | `(.json.get line "data.ids.0")` |
 | `.json.format` | unary | — | A value as JSON text (a table as an array of objects) | `(.json.format [1 0Nl 3])` → `"[1,null,3]"` |
 
 ```lisp

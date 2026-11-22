@@ -93,6 +93,10 @@
 (.json.parse "\"\\x\"") !- parse
 (.json.parse "\"\\u12G4\"") !- parse
 (.json.parse "\"\\u12\"") !- parse
+(M (fn [] (.json.parse "\"\\u12\""))) -- ".json.parse: invalid hex digit in a \\u escape at byte 5"
+(M (fn [] (.json.parse "\"\\u12"))) -- ".json.parse: unexpected end of input in a \\u escape at byte 5"
+;; a byte order mark is not JSON
+(.json.parse "\357\273\277[1]") !- parse
 (.json.parse "\"a\001\"") !- parse
 (.json.parse "\"a\n\"") !- parse
 (.json.parse "\"a\377\"") !- parse
@@ -129,13 +133,27 @@
 ;; ─── duplicate keys: the first position, the last value ────────────────────
 (.json.parse "{\"a\":1,\"b\":2,\"a\":3}") -- (dict ["a" "b"] (list 3 2))
 (.json.parse "{\"a\":1,\"a\":{\"x\":true}}") -- (dict ["a"] (list (dict ["x"] (list true))))
-;; past a few keys the lookup is hashed; the same rule holds
+;; past a few keys the rule holds as well
 (set many (concat "{" (concat (str-join (map (fn [i] (format "\"k%\":%" (% i 50) i)) (til 200)) ",") "}")))
 (count (.json.parse many)) -- 50
 (at (.json.parse many) "k7") -- 157
 (key (.json.parse many)) -- (as 'STR (map (fn [i] (format "k%" i)) (til 50)))
+;; keys crafted to collide in a hash table cost what ordinary keys of the
+;; same count and length cost: duplicates are found by sorting the keys
+(set CK (read "test/data/json/collide_8000.json"))
+(set OK (concat "{" (concat (str-join (map (fn [i] (format "\"k%\":1" (+ 100000000000 i))) (til 8000)) ",") "}")))
+(count CK) -- (count OK)
+(count (.json.parse CK)) -- 8000
+(< (timeit (.json.parse CK) 3) (+ 20.0 (* 10.0 (timeit (.json.parse OK) 3)))) -- true
 
 ;; ─── caps: depth, nodes, input, allocation ─────────────────────────────────
+;; the allocation cap counts the blocks really built: 100,000 empty objects
+;; hold about 25 MB
+(set empties (concat "[" (concat (str-join (take ["{}"] 100000) ",") "]")))
+(.json.parse empties {alloc: 8000000}) !- limit
+(count (.json.parse empties)) -- 100000
+(M (fn [] (.json.parse "[1,2,3]" {input: 6}))) -- ".json.parse: input limit of 6 bytes exceeded (7 bytes)"
+(M (fn [] (.json.parse ["1" "[1,2,3]"] {input: 6}))) -- ".json.parse: input limit of 6 bytes exceeded by element 1 (7 bytes)"
 (.json.format (.json.parse (deep 128))) -- (deep 128)
 (type (.json.parse (deep 128))) -- 'LIST
 (.json.parse (deep 129)) !- limit
@@ -196,6 +214,17 @@
 (.json.get doc "a..b") !- domain
 (.json.get doc ".a") !- domain
 (.json.get doc 5) !- type
+;; one path per element of a vector, of the same length
+(.json.get ["{\"a\":1}" "{\"b\":[5,6]}"] ["a" "b.1"]) -- [1 6]
+(.json.get ["{\"a\":1}" "{\"b\":2}"] ["a"]) !- length
+(.json.get ["{\"a\":1}" "{\"b\":2}"] ["a" ""]) !- domain
+(M (fn [] (.json.get ["{\"a\":1}" "{\"b\":2}"] ["a" "x..y"]))) -- ".json.get: empty segment in path of element 1 at byte 2"
+;; the limits of .json.parse; a value only validated costs no node
+(.json.get "[1,2,3]" "0" {input: 3}) !- limit
+(.json.get "[1,2,3]" "0" {input: 7}) -- 1
+(.json.get (concat "{\"a\":1,\"z\":[" (concat (str-join (take ["0"] 1200000) ",") "]}")) "a") -- 1
+(.json.get (concat "{\"a\":1,\"z\":[" (concat (str-join (take ["0"] 10) ",") "]}")) "z" {nodes: 5}) !- limit
+(.json.get (concat "{\"a\":1,\"z\":[" (concat (str-join (take ["0"] 10) ",") "]}")) "a" {nodes: 5}) -- 1
 (.json.get 5 "a") !- type
 
 ;; over a string vector: one value per element, typed by every element's value
@@ -220,6 +249,16 @@
 (at (select {from: T i: i k: (.json.get line "k")}) 'k) -- ["x" "y" "" "" ""]
 (at (select {from: T i: i k: (.json.get line "n")}) 'k) -- [1.0 2.0 0Nf 2.5 0Nf]
 (at (update {from: T k: (.json.get line "k")}) 'k) -- ["x" "y" "" "" ""]
+;; under element-wise calls the read is still one call over the column
+(at (select {from: T x: (+ 1 (.json.get line "n"))}) 'x) -- [2.0 3.0 0Nf 3.5 0Nf]
+(at (select {from: T x: (== (.json.get line "k") "x")}) 'x) -- [true false false false false]
+(at (select {from: T x: (+ 1 (.json.get line "n"))}) 'x) -- (+ 1 (.json.get L "n"))
+;; a read of constants is one value, as a constant is
+(at (select {from: T x: (.json.get "{\"a\":1}" "a")}) 'x) -- [1 1 1 1 1]
+(at (select {from: T i: i x: (.json.parse "2")}) 'x) -- [2 2 2 2 2]
+;; one path per row
+(set PT (table [line p] (list ["{\"a\":1}" "{\"b\":2}" "{\"a\":3}"] ["a" "b" "b"])))
+(at (select {from: PT x: (.json.get line p)}) 'x) -- [1 2 0Nl]
 (at (at (select {from: T p: (.json.parse line)}) 'p) 1) -- (dict ["k" "n"] (list "y" 2))
 (nil? (at (at (select {from: T p: (.json.parse line)}) 'p) 2)) -- true
 (at (select {from: T where: (> i 0) k: (.json.get line "k")}) 'k) -- ["y" "" "" ""]
@@ -236,6 +275,10 @@
 (.db.splayed.set "/tmp/rfl_json_parted/s/" E {compress: true})
 (set SE (.db.splayed.get "/tmp/rfl_json_parted/s/"))
 (count (at (select {from: SE where: (== (.json.get line "kind") "ping") i: i}) 'i)) -- 2000
+;; a parted table writes as the table it reads as, its partition key included
+(count (.json.parse (.json.format PE))) -- 3000
+(key (first (.json.parse (.json.format PE)))) -- (as 'STR (map (fn [c] (as 'STR c)) (cols PE)))
+(.json.format (take (select {from: PE i: i}) 2)) -- "[{\"i\":0},{\"i\":1}]"
 (.sys.exec "rm -rf /tmp/rfl_json_parted") -- 0
 
 ;; ─── .json.format ──────────────────────────────────────────────────────────
@@ -257,6 +300,10 @@
 (.json.format -0.0) -- "-0.0"
 (.json.format 0.1) -- "0.1"
 (.json.format 1e300) -- "1e+300"
+(.json.format 5e-324) -- "5e-324"
+(.json.format 0.5) -- "0.5"
+(.json.format 100.0) -- "100.0"
+(.json.format (as 'F32 [1e-45 0.25])) -- "[1e-45,0.25]"
 (.json.format -1.5e-300) -- "-1.5e-300"
 (.json.format (as 'F32 [1.5 0.1])) -- "[1.5,0.1]"
 ;; string escapes
@@ -269,8 +316,13 @@
 ;; temporal and guid values as the strings they print as; their nulls as null
 (.json.format [2024.01.01 0Nd]) -- "[\"2024.01.01\",null]"
 (.json.format 12:30:00.000) -- "\"12:30:00.000\""
+;; a dict with other scalar keys (a keyed table's) names its members by
+;; the keys' JSON text; a multi-column key cannot name one
+(.json.format (dict [1 2] (list 1 2))) -- "{\"1\":1,\"2\":2}"
+(.json.format (xkey (table [k v] (list [1 2] ["a" "b"])) 'k)) -- "{\"1\":{\"v\":\"a\"},\"2\":{\"v\":\"b\"}}"
+(.json.format (dict [2024.01.01] (list 1))) -- "{\"2024.01.01\":1}"
+(.json.format (xkey (table [k j v] (list [1 2] ['a 'b] ["a" "b"])) [k j])) !- type
 ;; what JSON cannot hold
-(.json.format (dict [1 2] (list 1 2))) !- type
 (.json.format (fn [x] x)) !- type
 
 ;; ─── round trips ───────────────────────────────────────────────────────────

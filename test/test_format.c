@@ -31,6 +31,8 @@
 #include <string.h>
 #include <limits.h>
 #include <math.h>
+#include <locale.h>
+#include "io/json.h"
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -1972,6 +1974,35 @@ static test_result_t test_fmt_table_parted_ragged(void) {
 
 /* ---- Suite definition ---- */
 
+
+/* .json.format writes '.' whatever decimal point the host's LC_NUMERIC
+ * uses: under a comma locale snprintf writes "1,5", which is not JSON. */
+static test_result_t test_json_format_locale(void) {
+    static const char* const comma[] = { "de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8", "de_AT.utf8" };
+    const char* got_locale = NULL;
+    for (size_t i = 0; i < sizeof comma / sizeof *comma && !got_locale; i++)
+        got_locale = setlocale(LC_NUMERIC, comma[i]);
+    if (!got_locale || strcmp(localeconv()->decimal_point, ".") == 0) {
+        setlocale(LC_NUMERIC, "C");
+        SKIP("no locale with a comma decimal point");
+    }
+    double xs[3] = { 1.5, 0.1, 1e300 };
+    ray_t* v = ray_vec_from_raw(RAY_F64, xs, 3);
+    ray_t* a = ray_f64(-2.25);
+    ray_t* sv = ray_json_format_fn(v);
+    ray_t* sa = ray_json_format_fn(a);
+    setlocale(LC_NUMERIC, "C");
+    bool ok = sv && !RAY_IS_ERR(sv) && sa && !RAY_IS_ERR(sa) &&
+              ray_str_len(sv) == 16 && memcmp(ray_str_ptr(sv), "[1.5,0.1,1e+300]", 16) == 0 &&
+              ray_str_len(sa) == 5 && memcmp(ray_str_ptr(sa), "-2.25", 5) == 0;
+    if (sv) ray_release(sv);
+    if (sa) ray_release(sa);
+    ray_release(v);
+    ray_release(a);
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 const test_entry_t format_entries[] = {
     { "format/pp/dict_fits", test_fmt_pp_dict_fits, fmt_setup_full, fmt_teardown_full },
     { "format/pp/dict_breaks", test_fmt_pp_dict_breaks, fmt_setup_full, fmt_teardown_full },
@@ -2084,5 +2115,6 @@ const test_entry_t format_entries[] = {
     { "format/table/parted_ragged", test_fmt_table_parted_ragged, fmt_setup_full, fmt_teardown_full },
     { "format/lang_print/nulls", test_lang_print_nulls, fmt_setup_full, fmt_teardown_full },
     { "format/lang_print/values", test_lang_print_values, fmt_setup_full, fmt_teardown_full },
+    { "format/json/locale", test_json_format_locale, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };

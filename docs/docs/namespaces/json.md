@@ -5,7 +5,7 @@ Reads JSON text into values and writes values out as JSON. The reader is strict 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.json.parse`](#json-parse) | variadic | — | JSON text to a value; element-wise over a string vector. |
-| [`.json.get`](#json-get) | binary | — | One field of each document, by a dotted path, without building the rest. |
+| [`.json.get`](#json-get) | variadic | — | One field of each document, by a dotted path, without building the rest. |
 | [`.json.format`](#json-format) | unary | — | A value to JSON text. |
 
 All three are pure and always available, including in [restricted mode](../storage/ipc.md).
@@ -42,12 +42,12 @@ Signature: `(.json.parse s)` or `(.json.parse s limits)`.
 
 - strings and nulls give `STR`, with a null as `""` (the string null);
 - integers and nulls give `I64`, with a null as `0Nl`;
-- numbers and nulls where some number is not an integer give `F64`, with each integer converted;
+- numbers and nulls where some number is not an integer give `F64`, with each integer converted (an integer past 2^53 loses precision: `[9007199254740993,0.5]` reads as `[9007199254740992.0 0.5]`);
 - booleans give `B8`, but only with no null, since `B8` has no null.
 
-Every other array is a `LIST`: one with mixed kinds, a nested array or object, or only nulls. `[]` is an empty `LIST` and `{}` an empty dict.
+Every other array is a `LIST`: one with mixed kinds, a nested array or object, or only nulls. `[]` is an empty `LIST` and `{}` an empty dict. An empty string vector reads as an empty `LIST`, as an array of no elements (or of only nulls) does.
 
-**Numbers.** A number written without a fraction or an exponent, and within the `I64` range, is an `i64`. Every other number is an `f64`: `1.0`, `1e3`, a number beyond the `I64` range, and `-9223372036854775808`, which is the `I64` null `0Nl`. A number beyond the `F64` range (`1e999`) is a `domain` error, since the `F64` domain has no infinity. JSON's number grammar is enforced: a leading zero (`01`), a bare `.5` or `1.`, a leading `+`, `NaN` and `Infinity` are `parse` errors.
+**Numbers.** A number written without a fraction or an exponent, and within the `I64` range, is an `i64`. Every other number is an `f64`: `1.0`, `1e3`, a number beyond the `I64` range, and `-9223372036854775808`, which is the `I64` null `0Nl`. A number beyond the `F64` range (`1e999`) is a `domain` error, since the `F64` domain has no infinity. `-0` is the integer `0`. JSON's number grammar is enforced: a leading zero (`01`), a bare `.5` or `1.`, a leading `+`, `NaN` and `Infinity` are `parse` errors.
 
 **Strings.** Every JSON escape is decoded: `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX`. A surrogate pair decodes to its one code point. The following are `parse` errors:
 
@@ -55,6 +55,8 @@ Every other array is a `LIST`: one with mixed kinds, a nested array or object, o
 - any other escape;
 - a raw control character (below U+0020);
 - bytes that are not valid UTF-8.
+
+A byte order mark before the value is not JSON whitespace, and is a `parse` error.
 
 **Errors.** The error code is `parse` for malformed text, `domain` for an unrepresentable number, `limit` for a cap and `type` for an argument that is not a string. The message names the byte offset, and for a vector input the element:
 
@@ -72,9 +74,11 @@ Every other array is a `LIST`: one with mixed kinds, a nested array or object, o
 | `input` | bytes of one document |
 | `depth` | nesting depth; the default is 128, and it never exceeds 1024 |
 | `nodes` | values, containers included |
-| `alloc` | bytes of the values built |
+| `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the vector an array collapses to; a block freed while reading still counts |
 
-The other two names, `grammar` and `symbol-bytes`, are accepted but have no effect on JSON. A cap is checked before the value it counts is built, so a hostile document stops at the cap and never exhausts the stack or the heap. For a vector, the caps apply to each element.
+The other two names, `grammar` and `symbol-bytes`, are accepted but have no effect on JSON. A cap is checked before the value it counts is built (a container's own growth is settled when it closes), so a hostile document stops at the cap and never exhausts the stack or the heap: 100,000 empty objects hold about 25 MB, and `{alloc: 8000000}` refuses them. For a vector, the caps apply to each element. A long document can be interrupted: the reader polls for cancellation every 1,024 members of a container.
+
+Object keys are checked for repeats by sorting them, so the cost of an object is O(n log n) in its keys whatever they are; no choice of keys can make it slower.
 
 ```lisp
 (.json.parse "[[[1]]]" {depth: 2})
@@ -83,11 +87,15 @@ The other two names, `grammar` and `symbol-bytes`, are accepted but have no effe
 
 ## `.json.get` { #json-get }
 
-Signature: `(.json.get s path)`.
+Signature: `(.json.get s path)` or `(.json.get s path limits)`.
 
 Returns the value at `path` in the document `s`, or in each document of a string vector. Only that value is built. The rest of the document is still checked, so a malformed document is an error here too.
 
 `path` is a string (or a symbol) of keys separated by dots. A key made of digits, `"0"` or `"12"` but not `"01"`, also indexes an array: `"data.ids.0"` is the first element of the `ids` array of the `data` object. A missing path gives `null`, not an error. That covers a missing key, an index past the end, a key into a scalar, and a null (empty) document. An empty path, or one with an empty segment (`"a..b"`), is a `domain` error. A key that contains a dot cannot be addressed this way; use `.json.parse` for it. If a key is repeated, the last one is used, as `.json.parse` keeps it.
+
+Over a string vector, `path` may also be a string vector of the same length, one path per element; a different length is a `length` error.
+
+`limits` is the dict `.json.parse` takes. Only the value at the path is charged against `nodes` and `alloc`; the rest of the document is charged its `input` and `depth` only, so a document of a million values can still give one field.
 
 ```lisp
 (set doc "{\"kind\":\"note\",\"data\":{\"ids\":[10,20,30]}}")
@@ -105,7 +113,7 @@ Over a string vector, the result has one value per element. It is typed from eve
 | integers | `I64`, with a missing path as `0Nl` |
 | numbers, some of them not integers | `F64`, with a missing path as `0Nf` |
 | booleans, none missing | `B8` |
-| none: the path is missing everywhere | `STR` of `""` |
+| none: the path is missing everywhere, or there are no elements | `STR` of `""` (an empty `STR` for no elements) |
 | anything else | `LIST`, with a missing path as `null` |
 
 A string field therefore gives a `STR` column, and `==` against a string is false on the rows that lack it:
@@ -116,7 +124,7 @@ A string field therefore gives a `STR` column, and `==` against a string is fals
 (at (select {from: t n: (.json.get line "n")}) 'n)              ; [1.0 2.5 3.0]
 ```
 
-In a `select`, `.json.get` and `.json.parse` are called once over the column, so a projection, a `where:`, a `by:` and an `update` all type the result in the same way. They work on any string column: in memory, splayed, compressed (generation 2) and parted.
+In a `select`, a `.json.get` or `.json.parse` of a column is called once over the column, also when it stands inside element-wise builtins such as `(+ 1 (.json.get line "n"))` or `(== (.json.get line "k") "x")`. A projection, a `where:`, a `by:` and an `update` therefore type the result in the same way. Integers of a field that also holds non-integers become `F64` and, past 2^53, lose precision, as in an array. A call whose text is a constant is one value, like any constant: `(select {from: t x: (.json.get "{\"a\":1}" "a")})` gives `1` on every row. Inside a lambda the call runs per row, as every builtin does there, and a missing field is then an untyped `null`. They work on any string column: in memory, splayed, compressed (generation 2) and parted.
 
 ## `.json.format` { #json-format }
 
@@ -125,19 +133,20 @@ Signature: `(.json.format v)`. Returns a string of JSON text.
 | Value | JSON |
 |---|---|
 | dict with symbol or string keys | object |
-| table | array of objects, one per row |
+| dict with other scalar keys (a keyed table made by `xkey` on one column) | object whose member names are the keys' JSON text (`{"1":...}`, `{"2024.01.01":...}`); a multi-column key is a `type` error |
+| table, in memory, splayed, compressed or parted | array of objects, one per row (a parted table's partition key is a column) |
 | list, vector | array |
 | `i16` `i32` `i64` `u8` | number |
-| `f32` `f64` | the shortest number that reads back to the same float, always with a `.` or an exponent (`1.0`, `0.1`, `1e+300`) |
+| `f32` `f64` | the shortest number that reads back to the same float, always with a `.` or an exponent (`1.0`, `0.1`, `100.0`, `1e+300`, `5e-324`); written with `.` whatever the host's `LC_NUMERIC` is |
 | `b8` | `true` / `false` |
-| string, symbol | string |
+| string, symbol | string; the null string and the null symbol are `""` |
 | date, time, timestamp, timespan, guid | the string it prints as (`"2024.01.01"`) |
 | `null` and the null of a typed value | `null` |
 
 A string is escaped as JSON requires: `"` and `\` are escaped, `\b \f \n \r \t` use their short escapes, and other control characters become `\u00XX`. Every other character is written as its UTF-8 bytes. The following are errors:
 
 - a string that is not valid UTF-8 (`domain`);
-- a dict whose keys are not symbols or strings (`type`);
+- a dict whose keys are not scalars, such as a keyed table on several columns (`type`);
 - a lambda or another value JSON cannot hold (`type`);
 - nesting deeper than 1024 (`limit`).
 

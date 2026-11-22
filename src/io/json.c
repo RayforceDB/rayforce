@@ -51,6 +51,7 @@
 #include "ops/hash.h"          /* ray_hash_bytes */
 #include "core/numparse.h"     /* ray_parse_f64 */
 #include "table/sym.h"
+#include <locale.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -105,7 +106,9 @@ static bool jp_charge(jp_t* jp, size_t nbytes) {
     return jp_bytes(jp, nbytes);
 }
 
-#define JP_ATOM_BYTES 32   /* one atom block, as the charge counts it */
+#define JP_ATOM_BYTES 32   /* one atom block, as estimated before it is built */
+
+static ray_t* jp_scalar(jp_t* jp, ray_t* v, size_t est);
 
 static inline void jp_ws(jp_t* jp) {
     while (jp->p < jp->end && (*jp->p == ' ' || *jp->p == '\t' || *jp->p == '\n' || *jp->p == '\r'))
@@ -150,9 +153,9 @@ static int hexval(uint8_t c) {
 
 /* The four hex digits after "\u" at jp->p (jp->p on the 'u'). */
 static int64_t jp_hex4(jp_t* jp) {
-    if (jp->end - jp->p < 5) { jp->p = jp->end; jp_fail(jp, "parse", "unexpected end of input in a \\u escape"); return -1; }
     uint32_t v = 0;
     for (int i = 1; i <= 4; i++) {
+        if (jp->p + i >= jp->end) { jp->p = jp->end; jp_fail(jp, "parse", "unexpected end of input in a \\u escape"); return -1; }
         int h = hexval(jp->p[i]);
         if (h < 0) { jp->p += i; jp_fail(jp, "parse", "invalid hex digit in a \\u escape"); return -1; }
         v = (v << 4) | (uint32_t)h;
@@ -313,19 +316,19 @@ static ray_t* jp_number(jp_t* jp, bool build) {
         }
         /* -2^63 is the I64 null: an F64 like every number past the range */
         if (fits && (neg ? v < ((uint64_t)1 << 63) : v <= (uint64_t)INT64_MAX)) {
-            if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
             jp->p = q;
             if (!build) return RAY_NULL_OBJ;
-            return ray_i64(neg ? -(int64_t)v : (int64_t)v);
+            if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
+            return jp_scalar(jp, ray_i64(neg ? -(int64_t)v : (int64_t)v), JP_ATOM_BYTES);
         }
     }
     double f = 0.0;
     if (ray_parse_f64((const char*)st, len, &f) != len || !isfinite(f))
         return jp_fail(jp, "domain", "number out of the F64 range");
-    if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
     jp->p = q;
     if (!build) return RAY_NULL_OBJ;
-    return ray_f64(f);
+    if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
+    return jp_scalar(jp, ray_f64(f), JP_ATOM_BYTES);
 }
 
 static bool jp_literal(jp_t* jp, const char* word, size_t n) {
@@ -367,6 +370,11 @@ static int json_kind(ray_t* v) {
  * a field absent from every row). */
 static ray_t* json_collapse(ray_t* list, bool all_null_str) {
     int64_t n = list->len;
+    if (n == 0 && all_null_str) {
+        ray_release(list);
+        ray_t* e = ray_vec_new(RAY_STR, 0);
+        return e ? e : ray_error("oom", NULL);
+    }
     if (n == 0) return list;
     ray_t** it = (ray_t**)ray_data(list);
     bool any_int = false, any_float = false, any_bool = false, any_str = false, any_null = false;
@@ -424,20 +432,66 @@ static ray_t* json_collapse(ray_t* list, bool all_null_str) {
 
 static ray_t* jp_value(jp_t* jp, bool build);
 
+/* The bytes of the blocks `v` itself holds (ray_shallow_bytes: a typed
+ * vector with its string pool, an atom with its payload, a list's own
+ * block), and a dict's keys and values blocks too.  Children of a list are
+ * counted where they are built. */
+static size_t jp_own_bytes(ray_t* v) {
+    if (!v || RAY_IS_NULL(v) || RAY_IS_ERR(v)) return 0;
+    size_t n = ray_shallow_bytes(v);          /* a STR vector's pool, an atom's payload included */
+    if (v->type == RAY_DICT) {
+        ray_t* k = ray_dict_keys(v);
+        ray_t* vl = ray_dict_vals(v);
+        n += (k ? ray_shallow_bytes(k) : 0) + (vl ? ray_shallow_bytes(vl) : 0);
+    }
+    return n;
+}
+
+/* Charge what `v`'s blocks really hold beyond the `pre` bytes charged for
+ * them before they were built.  The value, or NULL (released) past the
+ * cap. */
+static ray_t* jp_settle(jp_t* jp, ray_t* v, size_t pre) {
+    size_t own = jp_own_bytes(v);
+    if (own > pre && !jp_bytes(jp, own - pre)) { ray_release(v); return NULL; }
+    return v;
+}
+
+/* Polled once per this many members of one container, so that one
+ * document of many members can be interrupted. */
+#define JP_POLL 1024
+
+static bool jp_poll(jp_t* jp, int64_t i) {
+    if ((i & (JP_POLL - 1)) == 0 && i > 0 && pool_cancelled(NULL)) {
+        jp_fail(jp, "cancel", "interrupted");
+        return false;
+    }
+    return true;
+}
+
+/* The bytes a slot of a growing list may cost: its pointer, and as much
+ * again for the doubling that grows it. */
+#define JP_SLOT_BYTES (2 * sizeof(ray_t*))
+
 static ray_t* jp_array(jp_t* jp, bool build) {
     jp->p++;                                   /* '[' */
     ray_t* list = NULL;
+    size_t pre = 0;
     if (build) {
         list = ray_list_new(4);
         if (!list || RAY_IS_ERR(list)) return jp_fail(jp, "oom", "out of memory");
     }
     jp_ws(jp);
-    if (jp->p < jp->end && *jp->p == ']') { jp->p++; return build ? list : RAY_NULL_OBJ; }
-    for (;;) {
+    if (jp->p < jp->end && *jp->p == ']') {
+        jp->p++;
+        return build ? jp_settle(jp, list, 0) : RAY_NULL_OBJ;
+    }
+    for (int64_t i = 0;; i++) {
+        if (!jp_poll(jp, i)) { if (list) ray_release(list); return NULL; }
+        if (build && !jp_bytes(jp, JP_SLOT_BYTES)) { ray_release(list); return NULL; }
+        pre += build ? JP_SLOT_BYTES : 0;
         ray_t* v = jp_value(jp, build);
         if (!v) { if (list) ray_release(list); return NULL; }
         if (build) {
-            if (!jp_bytes(jp, sizeof(ray_t*))) { ray_release(v); ray_release(list); return NULL; }
             list = ray_list_append(list, v);
             ray_release(v);
             if (RAY_IS_ERR(list)) { jp->err = list; return NULL; }
@@ -449,51 +503,101 @@ static ray_t* jp_array(jp_t* jp, bool build) {
         return jp_unexpected(jp, "',' or ']'");
     }
     if (!build) return RAY_NULL_OBJ;
+    list = jp_settle(jp, list, pre);
+    if (!list) return NULL;
+    /* the collapsed vector is a copy, built while the list still lives */
     ray_t* out = json_collapse(list, false);
     if (RAY_IS_ERR(out)) { jp->err = out; return NULL; }
+    if (out->type != RAY_LIST) out = jp_settle(jp, out, 0);
     return out;
 }
 
-/* Object keys seen so far: their positions in `keys`, by hash of the bytes,
- * open addressing.  Built once an object has more than a few keys. */
-typedef struct { int64_t* slot; size_t cap; } jkeys_t;
+/* One key of the duplicate pass: its bytes, and its first 8 bytes as a
+ * big-endian word so most comparisons are one integer compare. */
+typedef struct { const char* p; uint32_t l; uint64_t pre; } jkey_t;
 
-static int64_t jk_find(ray_t* keys, jkeys_t* h, const char* p, size_t l, uint64_t hv, size_t* slot_out) {
-    if (!h->slot) {
-        for (int64_t i = 0; i < keys->len; i++) {
-            size_t kl = 0;
-            const char* kp = ray_str_vec_get(keys, i, &kl);
-            if (kl == l && (l == 0 || memcmp(kp, p, l) == 0)) return i;
-        }
-        return -1;
-    }
-    size_t s = (size_t)hv & (h->cap - 1);
-    for (;;) {
-        int64_t i = h->slot[s];
-        if (i < 0) { *slot_out = s; return -1; }
-        size_t kl = 0;
-        const char* kp = ray_str_vec_get(keys, i, &kl);
-        if (kl == l && (l == 0 || memcmp(kp, p, l) == 0)) return i;
-        s = (s + 1) & (h->cap - 1);
-    }
+static inline int jp_key_cmp(const jkey_t* ks, int64_t i, int64_t j) {
+    const jkey_t* a = &ks[i];
+    const jkey_t* b = &ks[j];
+    if (a->pre != b->pre) return a->pre < b->pre ? -1 : 1;
+    size_t m = a->l < b->l ? a->l : b->l;
+    int c = m > 8 ? memcmp(a->p + 8, b->p + 8, m - 8) : 0;
+    if (c) return c;
+    if (a->l != b->l) return a->l < b->l ? -1 : 1;
+    return i < j ? -1 : i > j;
 }
 
-static bool jk_grow(jp_t* jp, ray_t* keys, jkeys_t* h) {
-    size_t cap = h->cap ? h->cap * 2 : 64;
-    if (!jp_charge(jp, cap * sizeof(int64_t))) return false;
-    int64_t* ns = (int64_t*)ray_alloc_raw(cap * sizeof(int64_t));
-    if (!ns) { jp_fail(jp, "oom", "out of memory"); return false; }
-    for (size_t i = 0; i < cap; i++) ns[i] = -1;
-    for (int64_t i = 0; i < keys->len; i++) {
-        size_t kl = 0;
-        const char* kp = ray_str_vec_get(keys, i, &kl);
-        size_t s = (size_t)ray_hash_bytes(kp ? kp : "", kl) & (cap - 1);
-        while (ns[s] >= 0) s = (s + 1) & (cap - 1);
-        ns[s] = i;
+/* A repeated key keeps its first position and its last value.  The keys
+ * are ordered by a merge sort on their bytes, O(n log n) whatever they
+ * are: no hash, so no input can be crafted to make the pass slow.  On
+ * success *keysp / *valsp are the deduplicated pair (the originals when no
+ * key repeats). */
+static bool jp_dedup(jp_t* jp, ray_t** keysp, ray_t** valsp) {
+    ray_t* keys = *keysp;
+    ray_t* vals = *valsp;
+    int64_t n = keys->len;
+    if (n < 2) return true;
+    size_t need = (size_t)n * (2 * sizeof(int64_t) + sizeof(jkey_t));
+    if (!jp_bytes(jp, need)) return false;
+    int64_t* idx = (int64_t*)ray_alloc_raw(need);
+    if (!idx) { jp_fail(jp, "oom", "out of memory"); return false; }
+    int64_t* tmp = idx + n;
+    jkey_t* ks = (jkey_t*)(tmp + n);
+    for (int64_t i = 0; i < n; i++) {
+        size_t l = 0;
+        const char* p = ray_str_vec_get(keys, i, &l);
+        uint64_t pre = 0;
+        for (size_t k = 0; k < 8; k++) pre = (pre << 8) | (k < l ? (uint8_t)p[k] : 0);
+        ks[i] = (jkey_t){ p ? p : "", (uint32_t)l, pre };
+        idx[i] = i;
     }
-    if (h->slot) ray_free_raw(h->slot);
-    h->slot = ns;
-    h->cap = cap;
+    for (int64_t w = 1; w < n; w *= 2) {
+        if (pool_cancelled(NULL)) { ray_free_raw(idx); jp_fail(jp, "cancel", "interrupted"); return false; }
+        for (int64_t lo = 0; lo < n; lo += 2 * w) {
+            int64_t mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
+            int64_t a = lo, b = mid, o = lo;
+            while (a < mid && b < hi) tmp[o++] = jp_key_cmp(ks, idx[a], idx[b]) <= 0 ? idx[a++] : idx[b++];
+            while (a < mid) tmp[o++] = idx[a++];
+            while (b < hi) tmp[o++] = idx[b++];
+        }
+        int64_t* t = idx; idx = tmp; tmp = t;
+    }
+    int64_t* base = idx < tmp ? idx : tmp;       /* the block to free */
+    /* tmp[i]: the position whose value position i keeps, -1 when dropped */
+    bool dup = false;
+    for (int64_t i = 0; i < n; i++) tmp[i] = -1;
+    for (int64_t a = 0; a < n; ) {
+        int64_t b = a + 1;
+        const jkey_t* ka = &ks[idx[a]];
+        for (; b < n; b++) {
+            const jkey_t* kb = &ks[idx[b]];
+            if (kb->l != ka->l || kb->pre != ka->pre ||
+                (ka->l > 8 && memcmp(ka->p + 8, kb->p + 8, ka->l - 8) != 0)) break;
+        }
+        tmp[idx[a]] = idx[b - 1];
+        dup |= b - a > 1;
+        a = b;
+    }
+    if (!dup) { ray_free_raw(base); return true; }
+    ray_t* nk = ray_vec_new(RAY_STR, n);
+    ray_t* nv = ray_list_new(n);
+    ray_t** items = (ray_t**)ray_data(vals);
+    for (int64_t i = 0; i < n && nk && !RAY_IS_ERR(nk) && nv && !RAY_IS_ERR(nv); i++) {
+        if (tmp[i] < 0) continue;
+        nk = ray_str_vec_append(nk, ks[i].p, ks[i].l);
+        if (!RAY_IS_ERR(nk)) nv = ray_list_append(nv, items[tmp[i]]);
+    }
+    ray_free_raw(base);
+    if (!nk || RAY_IS_ERR(nk) || !nv || RAY_IS_ERR(nv)) {
+        if (nk && !RAY_IS_ERR(nk)) ray_release(nk);
+        if (nv && !RAY_IS_ERR(nv)) ray_release(nv);
+        jp_fail(jp, "oom", "out of memory");
+        return false;
+    }
+    ray_release(keys);
+    ray_release(vals);
+    *keysp = nk;
+    *valsp = nv;
     return true;
 }
 
@@ -501,7 +605,7 @@ static ray_t* jp_object(jp_t* jp, bool build) {
     jp->p++;                                   /* '{' */
     ray_t* keys = NULL;
     ray_t* vals = NULL;
-    jkeys_t h = { NULL, 0 };
+    size_t pre = 0;
     if (build) {
         keys = ray_vec_new(RAY_STR, 4);
         vals = ray_list_new(4);
@@ -514,26 +618,18 @@ static ray_t* jp_object(jp_t* jp, bool build) {
     ray_t* out = NULL;
     jp_ws(jp);
     if (jp->p < jp->end && *jp->p == '}') { jp->p++; goto done; }
-    for (;;) {
+    for (int64_t i = 0;; i++) {
+        if (!jp_poll(jp, i)) goto fail;
         if (jp->p >= jp->end || *jp->p != '"') { jp_unexpected(jp, "a string key"); goto fail; }
         const char* kp; size_t kl;
         if (!jp_string(jp, &kp, &kl)) goto fail;
-        int64_t at = -1;
-        size_t slot = 0;
-        uint64_t hv = 0;
         if (build) {
-            if (!jp_bytes(jp, kl + 8)) goto fail;
-            hv = h.slot || keys->len >= 8 ? ray_hash_bytes(kp, kl) : 0;
-            if (!h.slot && keys->len >= 8 && !jk_grow(jp, keys, &h)) goto fail;
-            at = jk_find(keys, &h, kp, kl, hv, &slot);
-            if (at < 0) {
-                keys = ray_str_vec_append(keys, kp, kl);
-                if (RAY_IS_ERR(keys)) { jp->err = keys; keys = NULL; goto fail; }
-                if (h.slot) {
-                    h.slot[slot] = keys->len - 1;
-                    if ((size_t)keys->len * 2 > h.cap && !jk_grow(jp, keys, &h)) goto fail;
-                }
-            }
+            /* the key's bytes and its cell, and a slot of the values list */
+            size_t c = kl + 2 * 16 + JP_SLOT_BYTES;
+            if (!jp_bytes(jp, c)) goto fail;
+            pre += c;
+            keys = ray_str_vec_append(keys, kp, kl);
+            if (RAY_IS_ERR(keys)) { jp->err = keys; keys = NULL; goto fail; }
         }
         jp_ws(jp);
         if (jp->p >= jp->end || *jp->p != ':') { jp_unexpected(jp, "':'"); goto fail; }
@@ -542,16 +638,9 @@ static ray_t* jp_object(jp_t* jp, bool build) {
         ray_t* v = jp_value(jp, build);
         if (!v) goto fail;
         if (build) {
-            if (at < 0) {
-                vals = ray_list_append(vals, v);
-                ray_release(v);
-                if (RAY_IS_ERR(vals)) { jp->err = vals; vals = NULL; goto fail; }
-            } else {
-                /* a repeated key: its first position, its last value */
-                ray_t** items = (ray_t**)ray_data(vals);
-                ray_release(items[at]);
-                items[at] = v;
-            }
+            vals = ray_list_append(vals, v);
+            ray_release(v);
+            if (RAY_IS_ERR(vals)) { jp->err = vals; vals = NULL; goto fail; }
         }
         jp_ws(jp);
         if (jp->p < jp->end && *jp->p == ',') { jp->p++; jp_ws(jp); continue; }
@@ -560,27 +649,34 @@ static ray_t* jp_object(jp_t* jp, bool build) {
         goto fail;
     }
 done:
-    if (h.slot) ray_free_raw(h.slot);
     if (!build) return RAY_NULL_OBJ;
+    if (!jp_dedup(jp, &keys, &vals)) goto fail;
     out = ray_dict_new(keys, vals);
     if (RAY_IS_ERR(out)) { jp->err = out; return NULL; }
-    return out;
+    return jp_settle(jp, out, pre);
 fail:
-    if (h.slot) ray_free_raw(h.slot);
     if (keys) ray_release(keys);
     if (vals) ray_release(vals);
     return NULL;
 }
 
+/* A built scalar, charged: the node and the bytes it was estimated at
+ * before it was built (`est`, already charged), settled to its real size. */
+static ray_t* jp_scalar(jp_t* jp, ray_t* v, size_t est) {
+    if (!v || RAY_IS_ERR(v)) { jp->err = v ? v : ray_error("oom", NULL); return NULL; }
+    return jp_settle(jp, v, est);
+}
+
 /* One value at jp->p (whitespace before it skipped by the caller).  Owned
  * value, RAY_NULL_OBJ when `build` is false, NULL with jp->err set on a
- * failure. */
+ * failure.  A value that is only validated (`build` false) is charged its
+ * depth, not nodes or bytes. */
 static ray_t* jp_value(jp_t* jp, bool build) {
     if (jp->p >= jp->end) return jp_unexpected(jp, "a value");
     switch (*jp->p) {
     case '{': case '[': {
         if (++jp->depth > jp->max_depth) return jp_fail(jp, "limit", "depth limit of %zu exceeded", jp->max_depth);
-        if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
+        if (build && !jp_charge(jp, 0)) return NULL;
         ray_t* v = *jp->p == '{' ? jp_object(jp, build) : jp_array(jp, build);
         jp->depth--;
         return v;
@@ -588,20 +684,20 @@ static ray_t* jp_value(jp_t* jp, bool build) {
     case '"': {
         const char* sp; size_t sl;
         if (!jp_string(jp, &sp, &sl)) return NULL;
-        if (!jp_charge(jp, JP_ATOM_BYTES + sl)) return NULL;
         if (!build) return RAY_NULL_OBJ;
-        ray_t* s = ray_str(sp, sl);
-        if (!s || RAY_IS_ERR(s)) { jp->err = s ? s : ray_error("oom", NULL); return NULL; }
-        return s;
+        if (!jp_charge(jp, JP_ATOM_BYTES + sl)) return NULL;
+        return jp_scalar(jp, ray_str(sp, sl), JP_ATOM_BYTES + sl);
     }
-    case 't':
-        if (!jp_literal(jp, "true", 4) || !jp_charge(jp, JP_ATOM_BYTES)) return NULL;
-        return build ? ray_bool(true) : RAY_NULL_OBJ;
-    case 'f':
-        if (!jp_literal(jp, "false", 5) || !jp_charge(jp, JP_ATOM_BYTES)) return NULL;
-        return build ? ray_bool(false) : RAY_NULL_OBJ;
+    case 't': case 'f': {
+        bool t = *jp->p == 't';
+        if (!jp_literal(jp, t ? "true" : "false", t ? 4 : 5)) return NULL;
+        if (!build) return RAY_NULL_OBJ;
+        if (!jp_charge(jp, JP_ATOM_BYTES)) return NULL;
+        return jp_scalar(jp, ray_bool(t), JP_ATOM_BYTES);
+    }
     case 'n':
-        if (!jp_literal(jp, "null", 4) || !jp_charge(jp, 0)) return NULL;
+        if (!jp_literal(jp, "null", 4)) return NULL;
+        if (build && !jp_charge(jp, 0)) return NULL;
         return RAY_NULL_OBJ;
     default:
         if (*jp->p == '-' || (*jp->p >= '0' && *jp->p <= '9')) return jp_number(jp, build);
@@ -625,7 +721,10 @@ static bool jp_doc(jp_t* jp, const char* s, size_t len, int64_t row, const ray_r
     jp->row = row;
     jp->depth = jp->nodes = jp->bytes = 0;
     if (len > lim->max_input) {
-        jp_fail(jp, "limit", "input limit of %zu bytes exceeded (%zu bytes)", lim->max_input, len);
+        if (!jp->err)
+            jp->err = row >= 0
+                ? ray_error("limit", "%s: input limit of %zu bytes exceeded by element %lld (%zu bytes)", jp->who, lim->max_input, (long long)row, len)
+                : ray_error("limit", "%s: input limit of %zu bytes exceeded (%zu bytes)", jp->who, lim->max_input, len);
         return false;
     }
     return true;
@@ -747,24 +846,18 @@ typedef struct { const char* p; size_t l; int64_t idx; } jseg_t;   /* idx -1: no
 
 #define JSON_PATH_MAX 64
 
-/* Split the path at its dots.  A segment of digits (no leading zero) is also
- * an array index. */
-static ray_t* json_path(ray_t* path, jseg_t* segs, int* nseg) {
-    const char* p;
-    size_t l;
-    if (path && path->type == -RAY_STR) { p = ray_str_ptr(path); l = ray_str_len(path); }
-    else if (path && path->type == -RAY_SYM) {
-        ray_t* s = ray_sym_str(path->i64);
-        p = s ? ray_str_ptr(s) : "";
-        l = s ? ray_str_len(s) : 0;
-    } else return ray_error("type", ".json.get: path must be a string, got %s", path ? ray_type_name(path->type) : "null");
-    if (l == 0) return ray_error("domain", ".json.get: path is empty");
+/* Split the path p[0..l) at its dots.  A segment of digits (no leading
+ * zero) is also an array index. */
+static ray_t* json_path_bytes(const char* p, size_t l, jseg_t* segs, int* nseg, int64_t row) {
+    char of[48] = "";
+    if (row >= 0) snprintf(of, sizeof of, " of element %lld", (long long)row);
+    if (l == 0) return ray_error("domain", ".json.get: path%s is empty", of);
     int k = 0;
     size_t st = 0;
     for (size_t i = 0; i <= l; i++) {
         if (i < l && p[i] != '.') continue;
-        if (i == st) return ray_error("domain", ".json.get: empty segment in path at byte %zu", i);
-        if (k == JSON_PATH_MAX) return ray_error("limit", ".json.get: path has more than %d segments", JSON_PATH_MAX);
+        if (i == st) return ray_error("domain", ".json.get: empty segment in path%s at byte %zu", of, i);
+        if (k == JSON_PATH_MAX) return ray_error("limit", ".json.get: path%s has more than %d segments", of, JSON_PATH_MAX);
         jseg_t* sg = &segs[k++];
         sg->p = p + st;
         sg->l = i - st;
@@ -781,6 +874,17 @@ static ray_t* json_path(ray_t* path, jseg_t* segs, int* nseg) {
     return NULL;
 }
 
+/* The path argument as one path: a string or a symbol. */
+static ray_t* json_path(ray_t* path, jseg_t* segs, int* nseg) {
+    if (path && path->type == -RAY_STR) return json_path_bytes(ray_str_ptr(path), ray_str_len(path), segs, nseg, -1);
+    if (path && path->type == -RAY_SYM) {
+        ray_t* s = ray_sym_str(path->i64);
+        return json_path_bytes(s ? ray_str_ptr(s) : "", s ? ray_str_len(s) : 0, segs, nseg, -1);
+    }
+    return ray_error("type", ".json.get: path must be a string or a string vector, got %s",
+                     path ? ray_type_name(path->type) : "null");
+}
+
 /* The value at segs[k..] of the value at jp->p, built; RAY_NULL_OBJ when the
  * path is missing; NULL on a malformed document.  The rest of the value is
  * validated without being built.  In an object the last of a repeated key
@@ -794,13 +898,13 @@ static ray_t* jp_nav(jp_t* jp, const jseg_t* segs, int nseg, int k) {
         return v ? RAY_NULL_OBJ : NULL;
     }
     if (++jp->depth > jp->max_depth) return jp_fail(jp, "limit", "depth limit of %zu exceeded", jp->max_depth);
-    if (!jp_charge(jp, 0)) return NULL;
     jp->p++;
     ray_t* found = RAY_NULL_OBJ;
     jp_ws(jp);
     if (c == '{') {
         if (jp->p < jp->end && *jp->p == '}') { jp->p++; goto done; }
-        for (;;) {
+        for (int64_t i = 0;; i++) {
+            if (!jp_poll(jp, i)) goto fail;
             if (jp->p >= jp->end || *jp->p != '"') { jp_unexpected(jp, "a string key"); goto fail; }
             const char* kp; size_t kl;
             if (!jp_string(jp, &kp, &kl)) goto fail;
@@ -821,6 +925,7 @@ static ray_t* jp_nav(jp_t* jp, const jseg_t* segs, int nseg, int k) {
     } else {
         if (jp->p < jp->end && *jp->p == ']') { jp->p++; goto done; }
         for (int64_t i = 0;; i++) {
+            if (!jp_poll(jp, i)) goto fail;
             bool hit = segs[k].idx == i;
             ray_t* v = hit ? jp_nav(jp, segs, nseg, k + 1) : jp_value(jp, false);
             if (!v) goto fail;
@@ -845,13 +950,24 @@ typedef struct {
     const ray_read_limits_t* lim;
     const jseg_t* segs;
     int nseg;
+    ray_t* paths;          /* a STR vector of one path per row, or NULL */
 } jp_get_ctx_t;
 
 static ray_t* jp_get_doc(jp_t* jp, const char* s, size_t l, int64_t row, jp_get_ctx_t* c) {
+    jseg_t rsegs[JSON_PATH_MAX];
+    const jseg_t* segs = c->segs;
+    int nseg = c->nseg;
+    if (c->paths) {
+        size_t pl = 0;
+        const char* pp = ray_str_vec_get(c->paths, row, &pl);
+        ray_t* perr = json_path_bytes(pp ? pp : "", pp ? pl : 0, rsegs, &nseg, row);
+        if (perr) { jp->err = perr; return NULL; }
+        segs = rsegs;
+    }
     if (l == 0) return RAY_NULL_OBJ;           /* a null document: no field */
     if (!jp_doc(jp, s, l, row, c->lim)) return NULL;
     jp_ws(jp);
-    ray_t* v = jp_nav(jp, c->segs, c->nseg, 0);
+    ray_t* v = jp_nav(jp, segs, nseg, 0);
     if (!v) return NULL;
     if (!jp_end(jp)) { ray_release(v); return NULL; }
     return v;
@@ -867,23 +983,39 @@ static ray_t* jp_get_each(jp_t* jp, const char* s, size_t l, int64_t row, void* 
     return c->out;
 }
 
-ray_t* ray_json_get_fn(ray_t* s, ray_t* path) {
+ray_t* ray_json_get_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 3)
+        return ray_error("arity", ".json.get: expects text, a path and optional limits, got %lld arguments", (long long)n);
+    ray_read_limits_t lim = ray_read_limits_default();
+    if (n == 3) {
+        ray_t* err = ray_read_limits_apply(".json.get", args[2], &lim);
+        if (err) return err;
+    }
+    ray_t* path = jp_input(args[1]);
+    if (!path || RAY_IS_ERR(path)) return path;
     jseg_t segs[JSON_PATH_MAX];
     int nseg = 0;
-    ray_t* perr = json_path(path, segs, &nseg);
-    if (perr) return perr;
-    ray_t* x = jp_input(s);
+    ray_t* paths = path->type == RAY_STR ? path : NULL;
+    if (!paths) {
+        ray_t* perr = json_path(path, segs, &nseg);
+        if (perr) return perr;
+    }
+    ray_t* x = jp_input(args[0]);
     if (!x || RAY_IS_ERR(x)) return x;
-    ray_read_limits_t lim = ray_read_limits_default();
     jp_t jp;
     jp_init(&jp, ".json.get", &lim);
-    jp_get_ctx_t c = { NULL, &lim, segs, nseg };
-    if (x->type == -RAY_STR)
+    jp_get_ctx_t c = { NULL, &lim, segs, nseg, NULL };
+    if (x->type == -RAY_STR && !paths)
         return jp_finish(&jp, jp_get_doc(&jp, ray_str_ptr(x), ray_str_len(x), -1, &c));
     if (!jp_is_docs(x))
         return ray_error("type", ".json.get: expected a string or a string vector, got %s", ray_type_name(x->type));
-    int64_t n = RAY_IS_PARTED(x->type) ? ray_parted_nrows(x) : x->len;
-    c.out = ray_list_new(n > 0 ? n : 1);
+    int64_t rows = RAY_IS_PARTED(x->type) ? ray_parted_nrows(x) : x->len;
+    if (paths) {
+        if (paths->len != rows)
+            return ray_error("length", ".json.get: %lld paths for %lld documents", (long long)paths->len, (long long)rows);
+        c.paths = paths;
+    }
+    c.out = ray_list_new(rows > 0 ? rows : 1);
     if (!c.out || RAY_IS_ERR(c.out)) return c.out ? c.out : ray_error("oom", NULL);
     ray_t* err = jp_docs(&jp, x, jp_get_each, &c);
     if (jp.buf) ray_free_raw(jp.buf);
@@ -891,10 +1023,7 @@ ray_t* ray_json_get_fn(ray_t* s, ray_t* path) {
         if (c.out) ray_release(c.out);
         return err;
     }
-    if (c.out->len == 0) {                     /* no rows: an empty STR */
-        ray_release(c.out);
-        return ray_vec_new(RAY_STR, 0);
-    }
+    /* no rows: what rows that all lack the field give, an empty STR */
     return json_collapse(c.out, true);
 }
 
@@ -976,17 +1105,45 @@ static bool jw_i64(jw_t* w, int64_t v) {
     return jw_put(w, b, (size_t)k);
 }
 
-/* The shortest decimal that reads back as `d`, with a '.' or an exponent so
- * that it reads back as an F64. */
-static bool jw_f64(jw_t* w, double d) {
+/* snprintf writes the locale's decimal point; JSON's is '.'.  Rewrite it
+ * in place (k bytes in b), whatever the host set LC_NUMERIC to. */
+static int jw_c_locale(char* b, int k) {
+    const struct lconv* lc = localeconv();
+    const char* dp = lc && lc->decimal_point ? lc->decimal_point : ".";
+    size_t dl = strlen(dp);
+    if (dl == 0 || (dl == 1 && dp[0] == '.')) return k;
+    char* at = strstr(b, dp);
+    if (!at) return k;
+    *at = '.';
+    memmove(at + 1, at + dl, (size_t)(b + k - (at + dl)) + 1);
+    return k - (int)(dl - 1);
+}
+
+/* The shortest decimal that reads back as `d` (as an F32 when `f32`),
+ * with a '.' or an exponent so that it reads back as a float. */
+static bool jw_float(jw_t* w, double d, bool f32) {
     if (d != d) return JW_LIT(w, "null");
     if (!isfinite(d)) { w->err = ray_error("domain", ".json.format: a float is not finite"); return false; }
-    char b[40];
+    char b[48];
     int k = 0;
-    for (int prec = 15; prec <= 17; prec++) {
-        k = snprintf(b, sizeof b, "%.*g", prec, d);
+    int prec = 1;
+    for (; prec <= (f32 ? 9 : 17); prec++) {
+        k = jw_c_locale(b, snprintf(b, sizeof b, "%.*g", prec, d));
         double back = 0.0;
-        if (ray_parse_f64(b, (size_t)k, &back) == (size_t)k && back == d) break;
+        if (ray_parse_f64(b, (size_t)k, &back) == (size_t)k &&
+            (f32 ? (float)back == (float)d : back == d)) break;
+    }
+    /* %g writes 100 as 1e+02 once the digits run out: an integral or
+     * moderate value is written positionally, as long as it reads back */
+    double ad = d < 0 ? -d : d;
+    if (strchr(b, 'e') && ad >= 1.0 && ad < 1e17) {
+        int e10 = (int)floor(log10(ad));
+        int dec = prec - 1 - e10 > 0 ? prec - 1 - e10 : 0;
+        char c[48];
+        int kc = jw_c_locale(c, snprintf(c, sizeof c, "%.*f", dec, d));
+        double back = 0.0;
+        if (kc > 0 && kc < (int)sizeof c && ray_parse_f64(c, (size_t)kc, &back) == (size_t)kc &&
+            (f32 ? (float)back == (float)d : back == d)) { memcpy(b, c, (size_t)kc + 1); k = kc; }
     }
     bool marked = false;
     for (int i = 0; i < k; i++) if (b[i] == '.' || b[i] == 'e' || b[i] == 'E') marked = true;
@@ -994,22 +1151,8 @@ static bool jw_f64(jw_t* w, double d) {
     return jw_put(w, b, (size_t)k);
 }
 
-/* An F32 as the shortest decimal that reads back as that F32. */
-static bool jw_f32(jw_t* w, float f) {
-    if (f != f) return JW_LIT(w, "null");
-    if (!isfinite(f)) { w->err = ray_error("domain", ".json.format: a float is not finite"); return false; }
-    char b[40];
-    int k = 0;
-    for (int prec = 6; prec <= 9; prec++) {
-        k = snprintf(b, sizeof b, "%.*g", prec, (double)f);
-        double back = 0.0;
-        if (ray_parse_f64(b, (size_t)k, &back) == (size_t)k && (float)back == f) break;
-    }
-    bool marked = false;
-    for (int i = 0; i < k; i++) if (b[i] == '.' || b[i] == 'e' || b[i] == 'E') marked = true;
-    if (!marked && k + 2 < (int)sizeof b) { b[k++] = '.'; b[k++] = '0'; }
-    return jw_put(w, b, (size_t)k);
-}
+static bool jw_f64(jw_t* w, double d) { return jw_float(w, d, false); }
+static bool jw_f32(jw_t* w, float f)  { return jw_float(w, (double)f, true); }
 
 /* A temporal or guid value as the string of its printed form. */
 static bool jw_printed(jw_t* w, ray_t* atom) {
@@ -1023,6 +1166,8 @@ static bool jw_printed(jw_t* w, ray_t* atom) {
 }
 
 static bool jw_value(jw_t* w, ray_t* v);
+static const char* jw_type_name(int8_t t);
+static bool jw_rows(jw_t* w, ray_t* t, ray_t* vt);
 
 /* Cell i of the vector v. */
 static bool jw_cell(jw_t* w, ray_t* v, int64_t i) {
@@ -1055,20 +1200,114 @@ static bool jw_cell(jw_t* w, ray_t* v, int64_t i) {
     case RAY_TIMESPAN: { int64_t x; memcpy(&x, d + i * 8, 8); return jw_printed(w, ray_timespan(x)); }
     case RAY_GUID: return jw_printed(w, ray_guid(d + i * 16));
     default:
-        w->err = ray_error("type", ".json.format: cannot write a %s value", ray_type_name(v->type));
+        w->err = ray_error("type", ".json.format: cannot write a %s value", jw_type_name(v->type));
         return false;
     }
 }
 
+/* Key i of a dict.  A symbol or a string is the key; any other scalar
+ * (a keyed table's key: a number, a date, a guid, ...) is the text JSON
+ * writes for it, as a string; a null scalar the empty string.  A key that
+ * is not a scalar (a multi-column key) cannot name a member. */
 static bool jw_key(jw_t* w, ray_t* keys, int64_t i) {
     if (keys->type == RAY_STR || keys->type == RAY_SYM) return jw_cell(w, keys, i);
-    if (keys->type == RAY_LIST) {
-        ray_t* k = ((ray_t**)ray_data(keys))[i];
-        if (k && (k->type == -RAY_STR || k->type == -RAY_SYM)) return jw_value(w, k);
+    ray_t* k = keys->type == RAY_LIST ? ((ray_t**)ray_data(keys))[i] : NULL;
+    if (k && (k->type == -RAY_STR || k->type == -RAY_SYM)) return jw_value(w, k);
+    if (keys->type == RAY_LIST && (!k || !ray_is_atom(k) || RAY_IS_NULL(k))) {
+        w->err = ray_error("type", ".json.format: object keys must be scalars, got %s",
+                           k ? jw_type_name(k->type) : "null");
+        return false;
     }
-    w->err = ray_error("type", ".json.format: object keys must be symbols or strings, got %s",
-                       ray_type_name(keys->type == RAY_LIST ? ((ray_t**)ray_data(keys))[i]->type : keys->type));
-    return false;
+    jw_t sub = { NULL, 0, 0, NULL, w->depth };
+    bool ok = k ? jw_value(&sub, k) : jw_cell(&sub, keys, i);
+    if (!ok) { w->err = sub.err; if (sub.p) ray_free_raw(sub.p); return false; }
+    if (sub.len == 4 && memcmp(sub.p, "null", 4) == 0) ok = JW_LIT(w, "\"\"");
+    else if (sub.len && sub.p[0] == '"') ok = jw_put(w, sub.p, sub.len);
+    else ok = jw_string(w, sub.p, sub.len);
+    ray_free_raw(sub.p);
+    return ok;
+}
+
+/* A type as an error names it: a parted column and the partition key
+ * column read as what they are, not as an unnamed tag. */
+static const char* jw_type_name(int8_t t) {
+    static _Thread_local char b[48];
+    if (RAY_IS_PARTED(t)) {
+        snprintf(b, sizeof b, "parted %s", ray_type_name((int8_t)RAY_PARTED_BASETYPE(t)));
+        return b;
+    }
+    if (t == RAY_MAPCOMMON) return "partition key";
+    if (t == RAY_ENCCOL) return "compressed";
+    return ray_type_name(t);
+}
+
+/* The rows of `t` (and of `vt`, the value columns of a keyed table whose
+ * key columns `t` holds) as an array of objects.  A column that is not a
+ * plain vector or list (a parted, a partition key or a compressed one) is
+ * read as `at` reads it, one flat vector. */
+static bool jw_rows(jw_t* w, ray_t* t, ray_t* vt) {
+    ray_t* tabs[2] = { t, vt };
+    int ntab = vt ? 2 : 1;
+    int64_t nr = ray_table_nrows(t);
+    if (vt && ray_table_nrows(vt) != nr) {
+        w->err = ray_error("length", ".json.format: a keyed table's keys and values differ in length");
+        return false;
+    }
+    int64_t nc = 0;
+    for (int k = 0; k < ntab; k++) nc += ray_table_ncols(tabs[k]);
+    ray_t* hdr = NULL;
+    ray_t** cols = (ray_t**)scratch_alloc(&hdr, (size_t)(nc > 0 ? nc : 1) * 2 * sizeof(ray_t*));
+    if (!cols) { w->err = ray_error("oom", NULL); return false; }
+    int64_t* names = (int64_t*)(cols + nc);
+    int64_t got = 0;
+    bool ok = true;
+    for (int k = 0; ok && k < ntab; k++) {
+        for (int64_t c = 0; ok && c < ray_table_ncols(tabs[k]); c++) {
+            int64_t name = ray_table_col_name(tabs[k], c);
+            ray_t* col = ray_table_col_idx(tabs[k], c);
+            if (col && RAY_IS_ERR(col)) { w->err = col; ok = false; break; }
+            if (col && (col->type == RAY_LIST || ray_is_vec(col))) {
+                ray_retain(col);
+            } else {
+                ray_t* sym = ray_sym(name);
+                col = sym && !RAY_IS_ERR(sym) ? ray_at_fn(tabs[k], sym) : sym;
+                if (sym && !RAY_IS_ERR(sym)) ray_release(sym);
+                if (col && !RAY_IS_ERR(col) && ray_is_lazy(col)) col = ray_lazy_materialize(col);
+                if (!col || RAY_IS_ERR(col)) { w->err = col ? col : ray_error("oom", NULL); ok = false; break; }
+                if (col->type != RAY_LIST && !ray_is_vec(col)) {
+                    w->err = ray_error("type", ".json.format: cannot write a %s column", jw_type_name(col->type));
+                    ray_release(col);
+                    ok = false;
+                    break;
+                }
+            }
+            if (col->len != nr) {
+                w->err = ray_error("length", ".json.format: a column of %lld rows in a table of %lld",
+                                   (long long)col->len, (long long)nr);
+                ray_release(col);
+                ok = false;
+                break;
+            }
+            cols[got] = col;
+            names[got++] = name;
+        }
+    }
+    ok = ok && JW_LIT(w, "[");
+    for (int64_t r = 0; ok && r < nr; r++) {
+        if ((r & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) { w->err = ray_error("cancel", NULL); ok = false; break; }
+        ok = (r == 0 || JW_LIT(w, ",")) && JW_LIT(w, "{");
+        for (int64_t c = 0; ok && c < got; c++) {
+            ray_t* name = ray_sym_str(names[c]);
+            ok = (c == 0 || JW_LIT(w, ",")) &&
+                 jw_string(w, name ? ray_str_ptr(name) : "", name ? ray_str_len(name) : 0) &&
+                 JW_LIT(w, ":") && jw_cell(w, cols[c], r);
+        }
+        ok = ok && JW_LIT(w, "}");
+    }
+    ok = ok && JW_LIT(w, "]");
+    for (int64_t c = 0; c < got; c++) ray_release(cols[c]);
+    scratch_free(hdr);
+    return ok;
 }
 
 static bool jw_value(jw_t* w, ray_t* v) {
@@ -1097,7 +1336,7 @@ static bool jw_value(jw_t* w, ray_t* v) {
             ray_retain(v);
             return jw_printed(w, v);
         default:
-            w->err = ray_error("type", ".json.format: cannot write a %s value", ray_type_name(v->type));
+            w->err = ray_error("type", ".json.format: cannot write a %s value", jw_type_name(v->type));
             return false;
         }
     }
@@ -1106,7 +1345,10 @@ static bool jw_value(jw_t* w, ray_t* v) {
         return false;
     }
     bool ok = true;
-    if (v->type == RAY_DICT) {
+    if (v->type == RAY_DICT && ray_dict_keys(v) && ray_dict_keys(v)->type == RAY_TABLE &&
+        ray_dict_vals(v) && ray_dict_vals(v)->type == RAY_TABLE) {
+        ok = jw_rows(w, ray_dict_keys(v), ray_dict_vals(v));   /* a keyed table */
+    } else if (v->type == RAY_DICT) {
         ray_t* keys = ray_dict_keys(v);
         ray_t* vals = ray_dict_vals(v);
         if (!keys || !vals || (keys->type != RAY_LIST && !ray_is_vec(keys))) {
@@ -1120,34 +1362,7 @@ static bool jw_value(jw_t* w, ray_t* v) {
         }
         ok = ok && JW_LIT(w, "}");
     } else if (v->type == RAY_TABLE) {
-        int64_t nc = ray_table_ncols(v), nr = ray_table_nrows(v);
-        ray_t* hdr = NULL;
-        ray_t** cols = (ray_t**)scratch_alloc(&hdr, (size_t)(nc > 0 ? nc : 1) * sizeof(ray_t*));
-        if (!cols) { w->err = ray_error("oom", NULL); return false; }
-        for (int64_t c = 0; c < nc; c++) {
-            ray_t* col = ray_table_col_idx(v, c);
-            if (col && RAY_IS_ERR(col)) { w->err = col; scratch_free(hdr); return false; }
-            if (!col || (col->type != RAY_LIST && !ray_is_vec(col))) {
-                w->err = ray_error("type", ".json.format: cannot write a %s column", col ? ray_type_name(col->type) : "missing");
-                scratch_free(hdr);
-                return false;
-            }
-            cols[c] = col;
-        }
-        ok = JW_LIT(w, "[");
-        for (int64_t r = 0; ok && r < nr; r++) {
-            if ((r & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) { w->err = ray_error("cancel", NULL); ok = false; break; }
-            ok = (r == 0 || JW_LIT(w, ",")) && JW_LIT(w, "{");
-            for (int64_t c = 0; ok && c < nc; c++) {
-                ray_t* name = ray_sym_str(ray_table_col_name(v, c));
-                ok = (c == 0 || JW_LIT(w, ",")) &&
-                     jw_string(w, name ? ray_str_ptr(name) : "", name ? ray_str_len(name) : 0) &&
-                     JW_LIT(w, ":") && jw_cell(w, cols[c], r);
-            }
-            ok = ok && JW_LIT(w, "}");
-        }
-        ok = ok && JW_LIT(w, "]");
-        scratch_free(hdr);
+        ok = jw_rows(w, v, NULL);
     } else if (v->type == RAY_LIST || ray_is_vec(v)) {
         ok = JW_LIT(w, "[");
         for (int64_t i = 0; ok && i < v->len; i++) {
@@ -1156,7 +1371,7 @@ static bool jw_value(jw_t* w, ray_t* v) {
         }
         ok = ok && JW_LIT(w, "]");
     } else {
-        w->err = ray_error("type", ".json.format: cannot write a %s value", ray_type_name(v->type));
+        w->err = ray_error("type", ".json.format: cannot write a %s value", jw_type_name(v->type));
         ok = false;
     }
     w->depth--;
