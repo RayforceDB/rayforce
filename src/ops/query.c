@@ -28653,6 +28653,9 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
         ray_graph_free(g);
     }
     if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
+        /* The graph's error is replaced by whatever the interpreter says;
+         * left alone it was a block per failing update or delete. */
+        if (mask_vec) ray_error_free(mask_vec);
         ray_env_push_query_scope();
         ray_t* bind_err = NULL;
         ray_t* prev_table = bind_referenced_query(tbl, &where_expr, 1, &bind_err);
@@ -29568,6 +29571,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         }
         /* Fallback: eval-level predicate evaluation */
         if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
+            if (mask_vec) ray_error_free(mask_vec);   /* the interpreter's answer replaces it */
             /* Bind column names to column vectors in env, then eval */
             ray_env_push_query_scope();
             ray_t* bind_err = NULL;
