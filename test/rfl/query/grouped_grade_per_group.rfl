@@ -146,6 +146,39 @@
 (set reverse REV)
 (at (select {from: t by: g r: (count (reverse v))}) 'r) -- [3 2]
 
+;; A nested query inside a per-group output reads its own table's rows:
+;; the outer group's row indices index the outer table only, and a nested
+;; query (over another table, the same table, through a helper or a lambda,
+;; two levels deep, or itself grouped) opens its own scope above them; once
+;; it returns the outer group's rows apply again.  By a SYM and a STR key.
+(set u (table [k v] (list ['p 'q 'r 'p 'q 'r 'p 'q] [100 200 300 400 500 600 700 800])))
+(set hn (fn [] (sum (at (select {from: u x: (reverse 'v)}) 'x))))
+(set hq (fn [] (first (at (select {from: u x: (reverse 'v)}) 'x))))
+(set h2 (fn [] (sum (reverse v))))
+(R (select {from: t by: g r: (+ (rank v) (first (at (select {from: u x: (reverse 'v)}) 'x)))})) -- (list [802 800 801] [800 801])
+(R (select {from: t by: s r: (+ (rank v) (first (at (select {from: u x: (reverse 'v)}) 'x)))})) -- (list [802 800 801] [800 801])
+(R (select {from: t by: g r: (+ (rank v) (hn))})) -- (list [3602 3600 3601] [3600 3601])
+(R (select {from: t by: s r: (+ (rank v) (hn))})) -- (list [3602 3600 3601] [3600 3601])
+(R (select {from: t by: g r: (+ (rank v) (hq))})) -- (list [802 800 801] [800 801])
+(R (select {from: t by: s r: (+ (rank v) (hq))})) -- (list [802 800 801] [800 801])
+(R (select {from: t by: g r: (+ (rank v) (first (at (select {from: t x: (reverse 'v)}) 'x)))})) -- (list [9 7 8] [7 8])
+(R (select {from: t by: s r: (+ (rank v) (first (at (select {from: t x: (reverse 'v)}) 'x)))})) -- (list [9 7 8] [7 8])
+(R (select {from: t by: g r: (+ (rank v) (first (at (select {from: u x: (+ (reverse 'v) (first (at (select {from: t x: (reverse 'v)}) 'x)))}) 'x)))})) -- (list [809 807 808] [807 808])
+(R (select {from: t by: s r: (+ (rank v) (first (at (select {from: u x: (+ (reverse 'v) (first (at (select {from: t x: (reverse 'v)}) 'x)))}) 'x)))})) -- (list [809 807 808] [807 808])
+(R (select {from: t by: g r: (+ (rank v) (sum (at (select {from: u by: k x: (first (reverse 'v))}) 'x)))})) -- (list [2102 2100 2101] [2100 2101])
+(R (select {from: t by: s r: (+ (rank v) (sum (at (select {from: u by: k x: (first (reverse 'v))}) 'x)))})) -- (list [2102 2100 2101] [2100 2101])
+(R (select {from: t by: g r: (+ (at (at (select {from: u by: k x: (first (reverse 'v))}) 'x) 0) (reverse 'v))})) -- (list [720 710 730] [707 705])
+(R (select {from: t by: s r: (+ (at (at (select {from: u by: k x: (first (reverse 'v))}) 'x) 0) (reverse 'v))})) -- (list [720 710 730] [707 705])
+(R (select {from: t by: g r: (+ (rank v) (first (at (select {from: u x: (h2)}) 'x)))})) -- (list [102 100 101] [100 101])
+(R (select {from: t by: s r: (+ (rank v) (first (at (select {from: u x: (h2)}) 'x)))})) -- (list [102 100 101] [100 101])
+;; a small inner table under larger outer groups: the outer indices are
+;; never used to read it (this read past the inner column)
+(set t40 (table [g v] (list (% (til 40) 2) (til 40))))
+(set u3 (table [k v] (list ['p 'q 'r] [100 200 300])))
+(at (select {from: t40 by: g r: (+ (rank v) (first (at (select {from: u3 x: (reverse 'v)}) 'x)))}) 'r) -- (list (+ 300 (til 20)) (+ 300 (til 20)))
+(set tbig (table [g v] (list (% (til 200000) 2) (til 200000))))
+(at (select {from: tbig by: g r: (first (at (select {from: u3 x: (reverse 'v)}) 'x))}) 'r) -- [300 300]
+
 ;; Parted: a group spans partitions; its ranks are its rows' across them
 (.sys.exec "rm -rf /tmp/rfl_grouped_grade")
 (.db.splayed.set "/tmp/rfl_grouped_grade/1/t/" (table [g v] (list [0 1 0] [30 5 10])))
