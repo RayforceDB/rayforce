@@ -1,0 +1,7 @@
+;; guid took a float as its count and failed with a bare oom: it read the bits of
+;; the double as a length.
+
+(at (try (guid 1.5) (fn [e] e)) 'code) -- 'type
+(at (try (guid [1 2]) (fn [e] e)) 'code) -- 'type
+(count (guid 3)) -- 3
+(count (guid 0)) -- 0
