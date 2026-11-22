@@ -1,14 +1,19 @@
-;; #1333: wide consecutive boxed I64 keys stay distinct across table growth.
+;; #1333: wide consecutive boxed I64 keys stay distinct across per-group storage growth.
 (set offsets (% (til 24000) 3000))
 (set wide (as 'LIST (+ 4611686018427387904 offsets)))
 (type wide) -- 'LIST
 (type (at wide 0)) -- 'i64
+;; Keep inputs below the parallel dispatch threshold; pin the route, not time.
+(set runs_before (at (.sys.mem) 'group-boxed-i64-runs))
 (set groups (value (group wide)))
+(- (at (.sys.mem) 'group-boxed-i64-runs) runs_before) -- 1
 (count groups) -- 3000
 (all (map (fn [i] (all (== (at groups i) (+ i (* 3000 (til 8)))))) (til 3000))) -- true
 
 ;; A mixed list must keep the existing equality and row-order semantics.
+(set mixed_before (at (.sys.mem) 'group-boxed-i64-runs))
 (map count (value (group (list 9007199254740993 9007199254740992.0 9007199254740992)))) -- [2 1]
 (map count (value (group (list 9007199254740992.0 9007199254740993 9007199254740992)))) -- [3]
+(- (at (.sys.mem) 'group-boxed-i64-runs) mixed_before) -- 0
 ;; Nulls are ordinary grouping keys on the homogeneous path.
 (map count (value (group (list 4611686018427387904 0Nl 4611686018427387905 0Nl)))) -- [1 2 1]

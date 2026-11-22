@@ -3306,6 +3306,13 @@ static bool group_grow_listkeys(ray_t** val_block, ray_t** ivblock, ray_t** kblo
     return true;
 }
 
+/* Count serial exact-I64 groups once per invocation, not per key. */
+static _Atomic(int64_t) group_boxed_i64_runs = 0;
+
+int64_t ray_group_boxed_i64_runs(void) {
+    return atomic_load_explicit(&group_boxed_i64_runs, memory_order_relaxed);
+}
+
 ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
@@ -3358,6 +3365,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         for (int64_t i = 0; i < n; i++) {
             if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
         }
+        if (exact_i64)
+            atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
         ght_list_ctx_t lctx = { .gkeys = gkeys,
             .spans = exact_i64 ? 0 : ray_key_spans(x), .exact_i64 = exact_i64 };
 

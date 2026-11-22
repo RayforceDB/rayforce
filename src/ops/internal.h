@@ -1816,6 +1816,8 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Serial homogeneous boxed-I64 grouping route entries; O(1) per call. */
+int64_t ray_group_boxed_i64_runs(void);
 /* Monotonic count of exec_group_per_partition runs that returned their
  * result (not the concat fallback's NULL, not an error).  Tests. */
 int64_t ray_group_perpart_done(void);
