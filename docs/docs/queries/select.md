@@ -154,6 +154,17 @@ The positions `where` returns count those rows, not the table's:
 (select {i: (iasc v) from: g where: (> k 1)})   ; i: [1 0 2]
 ```
 
+Under `by:` the verb sees each group's surviving rows, as an aggregate does:
+the grades and ranks count within the group, never across groups. The same
+holds for `rotate` and `xrank`, for a verb under an element-wise call
+(`(+ 1 (rank v))`), and for one inside an aggregate's argument
+(`(sum (rank v))`, `(sum (asc v))`):
+
+```lisp
+(at (select {r: (rank v) from: g by: k}) 'r)        ; [[0 1] [1 0 2]]
+(at (select {r: (sum (rank v)) from: g by: k}) 'r)  ; [1 3]
+```
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its
@@ -218,7 +229,7 @@ select them first:
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
 `desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
-surviving rows only.
+surviving rows only, and under `by:` each group's surviving rows.
 
 The same holds under `by:`. A running function in a grouped select runs over
 the whole table, not over each group, and the groups then take their rows of

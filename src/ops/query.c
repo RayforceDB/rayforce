@@ -4745,6 +4745,7 @@ static bool expr_nests_agg(ray_t* expr, ray_t* tbl, bool inside_agg) {
     if (x) ray_release(x);
     return hit;
 }
+static bool expr_calls_whole_col_verb(ray_t* e);
 
 /* True when an aggregate's input must be evaluated per group rather than
  * lowered as a row-aligned input: a constant collection (its length is
@@ -4770,6 +4771,11 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
              * result is no row-aligned input, so aggregate what it returns
              * within each group. */
             return true;
+        } else if (expr_calls_whole_col_verb(arg)) {
+            /* `(rank v)`, `(asc v)`: a whole-column verb over the whole
+             * table, sliced by group, ranks or orders across the groups;
+             * written in a grouped aggregate it sees its group's rows. */
+            return true;
         } else if (!expr_contains_call_named(arg, "concat", 6) && !query_expr_has_helper(arg)) {
             if (expr_refs_row_column(arg, tbl)) return false;
             if (!collections && !expr_reads_no_column(arg, tbl)) return false;
@@ -4794,7 +4800,8 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
      * select_grouped_running_needed). */
     if (tbl && tbl->type == RAY_TABLE && query_expr_has_helper(arg)) {
         ray_t* expanded = query_inline_helpers(arg, tbl);
-        bool opaque = query_expr_has_helper(expanded);
+        bool opaque = query_expr_has_helper(expanded) ||
+                      expr_calls_whole_col_verb(expanded);
         ray_release(expanded);
         if (opaque) return true;
     }
@@ -4817,6 +4824,12 @@ static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
                                    NULL))
             return 0;
     }
+    /* (first (asc v)) and its kin are judged as the aggregate they
+     * rewrite to (simplify_agg_idiom): (min v) is the group's either way. */
+    uint16_t iop;
+    ray_t* iarg;
+    if (simplify_agg_idiom(expr, tbl, &iop, &iarg))
+        return !agg_input_needs_group_eval(iarg, tbl, iop == OP_COUNT);
     return !agg_input_needs_group_eval(elems[1], tbl, op == OP_COUNT);
 }
 
@@ -11050,7 +11063,6 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 
 static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl);
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth);
-static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl);
 static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget);
 
 /* Does `e` read only its own row: no aggregate and no whole-column verb
@@ -11059,6 +11071,18 @@ static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, i
 static bool expr_reads_own_row(ray_t* e, ray_t* tbl) {
     int budget = 4096;
     return !query_code_needs_group(e, tbl, false, 0, &budget);
+}
+
+static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth);
+
+/* The plain grouped output gate: must `e` be evaluated per group?  Only
+ * when its text names an aggregate, a whole-column verb or a helper
+ * (expr_names_group_code, a walk with no budget) and the deeper walk
+ * agrees (expr_reads_own_row).  That walk answers yes when its depth or
+ * budget runs out, which keeps a helper per group; a row-local expression
+ * nested past its depth is not sent per group for that. */
+static bool expr_needs_group_rows(ray_t* e, ray_t* tbl) {
+    return expr_names_group_code(e, tbl, false, 0) && !expr_reads_own_row(e, tbl);
 }
 
 /* A plain grouped output whose `if` chooses per row: evaluated once over
@@ -18939,10 +18963,59 @@ static const void* const query_whole_col_verbs[] = {
 
 static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget);
 
+/* Does the expression `e` call a whole-column verb (query_whole_col_verbs)
+ * by a name still bound to it?  Its code only: a quoted form is data, and
+ * the helpers it calls are not looked into. */
+static bool expr_calls_whole_col_verb(ray_t* e) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
+        ray_t* fn = ray_env_get(es[0]->i64);
+        if (fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY)) {
+            const void* fp = (const void*)(uintptr_t)fn->i64;
+            for (size_t i = 0; i < sizeof query_whole_col_verbs / sizeof *query_whole_col_verbs; i++)
+                if (query_whole_col_verbs[i] == fp) return true;
+        }
+    }
+    for (int64_t i = 0; i < e->len; i++)
+        if (expr_calls_whole_col_verb(es[i])) return true;
+    return false;
+}
+
 /* A value a name holds that is code: a lambda or a builtin. */
 static bool query_value_is_code(const ray_t* v) {
     return v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY));
 }
+
+/* Does the text of `e` name an aggregate (called, or passed as a value), a
+ * whole-column verb, or a helper (a lambda by name or written in place)?
+ * A walk of the expression alone, no budget and no helper bodies: when it
+ * says no, `e` reads only its own row.  `head` is set for a call's head. */
+static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
+    if (!e) return false;
+    if (depth > 4096) return true;            /* past any parsed nesting: keep it per group */
+    if (e->type == -RAY_SYM) {
+        if ((e->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, e->i64))) return false;
+        if (!head) {
+            uint16_t op = resolve_agg_opcode(e->i64);
+            if (op && op != OP_MIN && op != OP_MAX) return true;
+        }
+        ray_t* v = ray_env_get_global(e->i64);
+        if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
+        if (!query_value_is_code(v)) return false;
+        if (v->type == RAY_LAMBDA) return true;
+        int budget = 1;
+        return query_code_needs_group_v(v, NULL, 0, &budget);   /* a builtin: the verb table */
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    if (is_agg_expr(e)) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == RAY_LIST) return true;       /* ((fn ...) args) */
+    for (int64_t i = 0; i < e->len; i++)
+        if (expr_names_group_code(es[i], tbl, i == 0, depth + 1)) return true;
+    return false;
+}
+
 
 /* Does the code `e` (a helper's statement, or a value it names) need the
  * group's rows: does it use a whole-column verb, called or passed as a
@@ -19027,18 +19100,6 @@ static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
             query_code_needs_group(es[i], tbl, false, 0, &budget)) return false;
     return f->type == RAY_LAMBDA ? !query_code_needs_group_v(f, NULL, 0, &budget)
                                  : !query_code_needs_group(f, NULL, false, 0, &budget);
-}
-
-/* Does `e` call a helper whose code needs the group's rows
- * (query_code_needs_group), or pass such code to one?  A plain grouped
- * output that does is evaluated per group, not once over the kept rows and
- * split: `(hz i)`, `hz` demeaning through a `let`, demeans each group as
- * `(- i (avg i))` does.  False at once for an expression with no helper
- * call. */
-static bool query_expr_calls_group_helper(ray_t* e, ray_t* tbl) {
-    if (!query_expr_has_helper(e)) return false;
-    int budget = 4096;
-    return query_code_needs_group(e, tbl, false, 0, &budget);
 }
 
 /* What the call `e` is to the hoist: 1 a running call, 0 a call whose
@@ -24906,13 +24967,13 @@ by_dict_done:
                     agg_results[n_agg_out] = agg_vec;
                     n_agg_out++;
                 } else {
-                    /* an aggregate, or a helper call whose code reads the
-                     * group (query_expr_calls_group_helper), or an `if` under
-                     * a whole-column verb (`(distinct (if ...))`, which the
-                     * per-group pass reads off the if's column): per group */
+                    /* an output that does not read only its own row
+                     * (expr_reads_own_row): an aggregate in it, a
+                     * whole-column verb (`(rank v)`, `(distinct (if ...))`)
+                     * or a helper whose code uses one sees its group's
+                     * rows, not the whole table's split: per group */
                     if (is_agg_expr(val_expr_item) ||
-                        query_expr_calls_group_helper(val_expr_item, eval_tbl) ||
-                        (rw_has_if(val_expr_item, eval_tbl, 0) && !expr_reads_own_row(val_expr_item, eval_tbl))) {
+                        expr_needs_group_rows(val_expr_item, eval_tbl)) {
                         ray_t* per_group = nonagg_eval_per_group(
                             val_expr_item, eval_tbl, groups, n_groups);
                         if (RAY_IS_ERR(per_group)) {
@@ -28495,11 +28556,13 @@ by_dict_done:
                     /* Outer-agg or arith-of-aggs: must evaluate per group
                      * — a single full-table eval collapses every nested
                      * agg (max/min/sum/...) globally and broadcasts the
-                     * scalar across all groups. */
+                     * scalar across all groups.  So must an output that
+                     * does not read only its own row (expr_reads_own_row):
+                     * `(rank v)` over the whole table, split by group,
+                     * ranks across the groups. */
                     if (is_agg_expr(nonagg_exprs[ni]) ||
                         expr_contains_agg(nonagg_exprs[ni]) ||
-                        query_expr_calls_group_helper(nonagg_exprs[ni], tbl) ||
-                        (rw_has_if(nonagg_exprs[ni], tbl, 0) && !expr_reads_own_row(nonagg_exprs[ni], tbl))) {
+                        expr_needs_group_rows(nonagg_exprs[ni], tbl)) {
                         ray_t* per_group = nonagg_eval_per_group_buf(
                             nonagg_exprs[ni], tbl, idx_buf, offsets, grp_cnt, n_groups);
                         if (RAY_IS_ERR(per_group)) {
