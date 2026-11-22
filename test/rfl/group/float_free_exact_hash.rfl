@@ -1,0 +1,31 @@
+;; #1333: a serial `group` over a LIST with no float atom and no TIMESPAN, at
+;; any depth, hashes integer atoms by their value, so neighbours past 2^53
+;; no longer share a hash.  Its route counts in group-boxed-i64-runs.
+(set runs (fn [L] (do (set b (at (.sys.mem) 'group-boxed-i64-runs)) (group L) (- (at (.sys.mem) 'group-boxed-i64-runs) b))))
+(set w (as 'LIST (+ 1700000000000000000 (% (til 2000) 500))))
+;; a symbol, an I32 or a nested cell no longer turns the exact hash off
+(runs (concat w (list 'a))) -- 1
+(runs (concat w (list 7i))) -- 1
+(runs (map (fn [x] (list x)) w)) -- 1
+(runs (map (fn [x] (dict ['a] (list x))) w)) -- 1
+;; a float or a TIMESPAN anywhere keeps the double hash
+(runs (concat w (list 1.5))) -- 0
+(runs (concat w (list (list 1.5)))) -- 0
+(runs (concat w (list (as 'TIMESPAN 5)))) -- 0
+;; integers of every width still group together, as atom_eq meets them
+(map count (value (group (list 5 5i 5h (as 'U8 5) 6 'a)))) -- [4 1 1]
+(map count (value (group (list true 1 1i false 0 'b)))) -- [3 2 1]
+(map count (value (group (list (list 5) (list 5i) (dict ['k] (list 5)) (dict ['k] (list 5h)) 'c)))) -- [2 2 1]
+;; neighbours past 2^53 stay apart
+(set B 9007199254740993)
+(count (group (list B (+ B 1) (- B 1) B 'x))) -- 4
+(count (group (concat w (list 'a)))) -- 501
+;; the hash itself: 60k neighbours past 1.7e18 plus a symbol (below the parallel
+;; route's 65536-row floor, so the serial route at any worker count) group about as
+;; fast as small integers plus a symbol; hashing them by their double put
+;; hundreds in one bucket (20x slower).  A factor of 5 leaves a wide margin.
+(set big (concat (as 'LIST (+ 1700000000000000000 (% (til 60000) 5000))) (list 'a)))
+(set small (concat (as 'LIST (% (til 60000) 5000)) (list 'a)))
+(runs big) -- 1
+(set best (fn [f] (min (map (fn [k] (f)) (til 3)))))
+(< (best (fn [] (timeit (group big)))) (* 5 (+ 1.0 (best (fn [] (timeit (group small))))))) -- true

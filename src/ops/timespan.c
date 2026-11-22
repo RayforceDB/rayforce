@@ -60,7 +60,7 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
         if ((a == RAY_TIME && bn) || (an && b == RAY_TIME)) return RAY_TIME;
         if ((an || span_number(a) || a == RAY_TIME) &&
             (bn || span_number(b) || b == RAY_TIME))
-            return a == RAY_F64 || b == RAY_F64 ? RAY_F64 : RAY_TIMESPAN;
+            return a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32 ? RAY_F64 : RAY_TIMESPAN;
     }
     /* A TIME is a point of the day: it has no quotient by a duration.  (A
      * duration divided by a TIME reads the TIME as its millisecond count,
@@ -71,7 +71,7 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
         return an ? RAY_TIMESPAN : (a == RAY_F32 ? RAY_F64 : a == RAY_BOOL || a == RAY_U8 || a == RAY_I16 ? RAY_I32 : a);
     if ((op == OP_MUL || op == OP_MOD) && an != bn &&
         (an ? span_number(b) : span_number(a)))
-        return a == RAY_F64 || b == RAY_F64 ? RAY_F64 : RAY_TIMESPAN;
+        return a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32 ? RAY_F64 : RAY_TIMESPAN;
     if ((op == OP_MIN2 || op == OP_MAX2) && an && bn) return RAY_TIMESPAN;
     return -1;
 }

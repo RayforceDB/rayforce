@@ -409,8 +409,12 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
          * RAY_STR: also write attrs byte and the adjacent byte pool. */
         int64_t len = obj->len;
         if (fwrite(&len, 8, 1, f) != 1) return RAY_ERR_IO;
+        /* A slice has no pool of its own (its header words are slice_parent and
+         * slice_offset) and its SLICE bit means nothing in a file: the pool is
+         * the owner's, and only the attrs that may live on disk are written. */
+        ray_t* pool_owner = (obj->attrs & RAY_ATTR_SLICE) ? obj->slice_parent : obj;
         if (type == RAY_STR) {
-            uint8_t attrs = obj->attrs;
+            uint8_t attrs = obj->attrs & COL_DISK_ATTRS_MASK;
             if (fwrite(&attrs, 1, 1, f) != 1) return RAY_ERR_IO;
         }
         uint8_t esz = ray_sym_elem_size(type, obj->attrs);
@@ -418,10 +422,10 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
         if (data_size > 0 && fwrite(ray_data(obj), 1, data_size, f) != data_size)
             return RAY_ERR_IO;
         if (type == RAY_STR) {
-            uint64_t pool_size = (uint64_t)col_str_pool_payload_len(obj);
+            uint64_t pool_size = (uint64_t)col_str_pool_payload_len(pool_owner);
             if (fwrite(&pool_size, 8, 1, f) != 1) return RAY_ERR_IO;
             if (pool_size > 0 &&
-                fwrite(ray_data(obj->str_pool), 1, (size_t)pool_size, f) != pool_size)
+                fwrite(ray_data(pool_owner->str_pool), 1, (size_t)pool_size, f) != pool_size)
                 return RAY_ERR_IO;
         }
         return RAY_OK;

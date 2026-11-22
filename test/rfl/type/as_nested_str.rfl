@@ -5,7 +5,9 @@ NestedStrSource -- (list [1 2] [3 4])
 (as 'STR (list 7 [1 2])) !- type
 (as 'STR (list "a long first string cell" [1 2])) !- type
 (as 'STR (list (list 1 2))) !- type
-(as 'STR (list [])) !- type
+;; an empty cell is the type's null, one-element cells their element (#1395)
+(as 'STR (list [])) -- [""]
+(as 'STR (list [7])) -- ["7"]
 
 (as 'STR 42) -- "42"
 (as 'STR [1 2]) -- ["1" "2"]

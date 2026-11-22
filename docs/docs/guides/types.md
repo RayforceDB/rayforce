@@ -139,10 +139,21 @@ expression can succeed or fail. With `T: (table [k v] (list [1 1 2] [10 20 30]))
 | `(update {w: (as 'LIST v) from: T})` | whole column | `w` is a `LIST` column of i64 atoms |
 | `(update {w: (as 'LIST v) from: T where: (> v 15)})` | whole column | `type` error `update: a new column under where: must be a typed vector, got LIST` |
 
-Casting to `STR` produces a flat string vector from a vector or a LIST of
-atoms. Each outer element must convert to one string atom. A nested vector or
-LIST cell is rejected with a `type` error; this cast does not implicitly format
-or flatten a whole inner collection into a string cell.
+Casting a LIST to a typed vector (any target, `STR` included) reads one value
+per cell. An atom cell is cast as an atom. A cell that is itself a vector or a
+LIST is read as follows:
+
+- a one-element cell is its element, null when the inner vector marks it null
+  (`(as 'I64 (list [1] [2]))` is `[1 2]`);
+- an empty cell is the target type's null (`(as 'I64 (list [1] ()))` is
+  `[1 0Nl]`). `BOOL` and `U8` have no null, so for them it is `false` and
+  `0x00`. An empty cell is not checked against the target, so
+  `(as 'I64 (list (guid 0)))` is `[0Nl]`;
+- a longer cell is a `type` error. The cast does not format or flatten a
+  whole inner collection into one cell.
+
+Casting to `STR` produces a flat string vector by the same rule:
+`(as 'STR (list [1] 'a))` is `["1" "a"]`.
 
 ```lisp
 ; Cast an integer vector to float
