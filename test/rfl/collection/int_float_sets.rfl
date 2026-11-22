@@ -1,0 +1,100 @@
+;; #1328: an integer-family vector (I64, TIMESPAN, I32, I16, U8, BOOL)
+;; against an F64 or F32 vector answers in, except, sect, union and find as
+;; the list form does.  atom_eq meets an integer and a float through double,
+;; so 2^53 + 1 meets 2^53.0, as 2^53 does, and 2^63 - 1 meets 2^63.0; a null
+;; meets the other side's null.  Every typed answer is checked against the
+;; list form (L), in both directions, with nulls on neither, one or both
+;; sides, over sets that take each route: the small SIMD set (8 or fewer),
+;; the kernel's hash, the hashset and the hashed needles (nulls on both
+;; sides), an attached hash index, and 70k rows past the parallel cutoff.
+(set L (fn [x] (as 'LIST x)))
+(set CHK (fn [A B] (and (identical (in A B) (in (L A) (L B))) (identical (L (except A B)) (except (L A) (L B))) (identical (L (sect A B)) (sect (L A) (L B))) (identical (L (union A B)) (union (L A) (L B))) (identical (find B A) (find (L B) (L A))))))
+;; both directions; no operand holds two equal cells, as union's typed route
+;; adds the second operand's new cells without deduplicating them
+(set BOTH (fn [P S] (and (CHK P S) (CHK S P))))
+;; 70k rows: the big operand repeats cells, so union and find are left out
+(set BIG (fn [A B] (and (identical (in A B) (in (L A) (L B))) (identical (L (except A B)) (except (L A) (L B))) (identical (L (sect A B)) (sect (L A) (L B))))))
+(set N 70000)
+
+;; the issue's shapes
+(in (as 'TIMESPAN [9007199254740992 0Nl 9007199254740993]) (as 'F64 [0Nf 2e6 1e15 9007199254740992.0])) -- [true true true]
+(in [9007199254740992 0Nl 9007199254740993] (as 'F64 [0Nf 2e6 1e15 9007199254740992.0])) -- [true true true]
+(in [9007199254740993] [9007199254740992.0]) -- [true]
+(in [9007199254740993 0N] [0Nf 9007199254740992.0]) -- [true true]
+(find (as 'F64 [0Nf 2e6 1e15 9007199254740992.0]) [9007199254740992 0N 9007199254740993]) -- [3 0 3]
+(find [0Nf 2e6 1e15 9007199254740992.0] [9007199254740993 9007199254740992]) -- [3 3]
+(find (as 'F32 [0Nf 2e6 1e15 9223372036854775808.0]) [9223372036854775807 0N 9223372036854775806]) -- [3 0 3]
+;; a null needle is no number: 0Nl meets 0Nf, not -2^63.0
+(find [-9223372036854775808.0 2.0 3.0 4.0 5.0] [0N 2 3]) -- [0N 1 2]
+(in [0N 9223372036854775807 9223372036854775806] [0Nf -9223372036854775808.0 9223372036854775808.0 2.0 3.0]) -- [true true true]
+
+;; GO: the int operand IV (IVN with a null where its type has one) against
+;; floats FV (more cells than IVN) and FS (8 or fewer), with PR a few int
+;; cells that share a double, so fewer than either float set, and PL / FL
+;; 70k-row operands of either type.  Nulls go on either side or both.
+(set FLT (fn [F FV] (concat (as F [0N]) FV)))
+(set GO (fn [IV IVN PR F FV FS PL FL] (and (BOTH IV FS) (BOTH IVN FS) (BOTH IV (FLT F FS)) (BOTH IVN (FLT F FS)) (BOTH IV FV) (BOTH IVN FV) (BOTH IV (FLT F FV)) (BOTH IVN (FLT F FV)) (BOTH PR FS) (BOTH PR (FLT F FS)) (BOTH PR (FLT F FV)) (BOTH IV (.idx.hash FS)) (BOTH IV (.idx.hash FV)) (CHK FV (.idx.hash IV)) (CHK FS (.idx.hash IVN)))))
+(set GOBIG (fn [IVN F FV PL FL] (and (BIG PL FV) (BIG PL (FLT F FV)) (BIG FL IVN) (BIG (FLT F FL) IVN) (BIG PL (FLT F FL)) (BIG (FLT F FL) PL) (BIG PL (.idx.hash FV)))))
+
+(set F64V (as 'F64 [0.0 1.0 -3.0 0.5 255.0 32767.0 16777216.0 2147483647.0 9007199254740992.0 9007199254740994.0 -9007199254740992.0 4611686018427387904.0 9223372036854775808.0 -9223372036854775808.0 1e18 128.0 2.5]))
+(set F64S (as 'F64 [0.0 1.0 9007199254740992.0 9223372036854775808.0 -3.0 0.5]))
+(set F32V (as 'F32 [0.0 1.0 -3.0 0.5 255.0 32767.0 16777216.0 2147483648.0 9007199254740992.0 9007200328482816.0 -9007199254740992.0 4611686018427387904.0 9223372036854775808.0 -9223372036854775808.0 1e18 128.0 2.5]))
+(set F32S (as 'F32 [0.0 1.0 9007199254740992.0 9223372036854775808.0 -3.0 0.5]))
+(set FL64 (concat (* 0.5 (as 'F64 (- (til N) 30000))) F64V))
+(set FL32 (concat (as 'F32 (* 0.5 (as 'F64 (- (til N) 30000)))) F32V))
+
+;; I64: 2^53 and 2^53 + 1 meet 2^53.0, 2^63 - 1 meets 2^63.0
+(set IV [0 1 -3 255 32767 16777217 2147483647 9007199254740991 9007199254740992 9007199254740993 9007199254740995 -9007199254740993 4611686018427387905 9223372036854775807 -9223372036854775807])
+(set IVN (concat IV [0N]))
+(set PR [9007199254740992 9007199254740993 0N 9223372036854775807 9223372036854775806])
+(set PL (concat (- (% (til N) 60000) 30000) IVN))
+(GO IV IVN PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IVN PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IVN 'F64 F64V PL FL64) -- true
+(GOBIG IVN 'F32 F32V PL FL32) -- true
+
+;; TIMESPAN: a duration meets a number as its count
+(set IV (as 'TIMESPAN IV))
+(set IVN (as 'TIMESPAN IVN))
+(set PR (as 'TIMESPAN PR))
+(set PL (as 'TIMESPAN PL))
+(GO IV IVN PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IVN PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IVN 'F64 F64V PL FL64) -- true
+(GOBIG IVN 'F32 F32V PL FL32) -- true
+
+;; I32: 2^24 + 1 is not the F32 2^24
+(set IV (as 'I32 [0 1 -3 255 32767 16777216 16777217 2147483647 -2147483647 100000]))
+(set IVN (concat IV (as 'I32 [0N])))
+(set PR (as 'I32 [16777216 16777217 0N 2147483647]))
+(set PL (concat (as 'I32 (- (% (til N) 60000) 30000)) IVN))
+(GO IV IVN PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IVN PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IVN 'F64 F64V PL FL64) -- true
+(GOBIG IVN 'F32 F32V PL FL32) -- true
+
+;; I16
+(set IV (as 'I16 [0 1 -3 255 32767 -32767 128]))
+(set IVN (concat IV (as 'I16 [0N])))
+(set PR (as 'I16 [1 0N 32767]))
+(set PL (concat (as 'I16 (- (% (til N) 60000) 30000)) IVN))
+(GO IV IVN PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IVN PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IVN 'F64 F64V PL FL64) -- true
+(GOBIG IVN 'F32 F32V PL FL32) -- true
+
+;; U8 and BOOL hold no null
+(set IV (as 'U8 [0 1 3 255 128]))
+(set PR (as 'U8 [1 255]))
+(set PL (as 'U8 (% (til N) 256)))
+(GO IV IV PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IV PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IV 'F64 F64V PL FL64) -- true
+(GOBIG IV 'F32 F32V PL FL32) -- true
+(set IV (as 'BOOL [0 1]))
+(set PR (as 'BOOL [1]))
+(set PL (as 'BOOL (% (til N) 2)))
+(GO IV IV PR 'F64 F64V F64S PL FL64) -- true
+(GO IV IV PR 'F32 F32V F32S PL FL32) -- true
+(GOBIG IV 'F64 F64V PL FL64) -- true
+(GOBIG IV 'F32 F32V PL FL32) -- true

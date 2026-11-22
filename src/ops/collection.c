@@ -662,6 +662,44 @@ static bool find_sorted_integer(ray_t* hay, ray_t* nd, int64_t* out, bool* any_n
     }
 }
 
+/* An I64 or TIMESPAN vector `w` probed against a float vector `f`, or
+ * probing it.  atom_eq meets an integer and a float through double, so the
+ * row 2^53.0 equals both 2^53 and 2^53 + 1, and 2^63.0 both 2^63 - 1 and
+ * 2^63 - 2; a hashset over the ints keeps each pair apart (int cells compare
+ * exactly, #1323).  Where the int side is hashed and asked for one row per
+ * float, that row is only one of the equal cells: the hashed needles credit
+ * a haystack row to one needle, and the hashed haystack answers find with
+ * whichever cell its probe meets first, not the first row (#1328).  Those
+ * routes take the int side as its doubles (wide_ints_as_f64).  Narrower
+ * ints convert to distinct doubles; same-type pairs never get here. */
+static inline bool wide_int_vs_float(ray_t* w, ray_t* f) {
+    return (w->type == RAY_I64 || w->type == RAY_TIMESPAN) &&
+           (f->type == RAY_F64 || f->type == RAY_F32);
+}
+
+/* The cells of an I64 or TIMESPAN vector as an F64 vector, (double)i as
+ * as_f64 has it, a null as the F64 null.  NULL on OOM. */
+static ray_t* wide_ints_as_f64(ray_t* w) {
+    int64_t m = w->len;
+    ray_t* f = ray_vec_new(RAY_F64, m);
+    if (!f || RAY_IS_ERR(f)) return NULL;
+    f->len = m;
+    const int64_t* s = (const int64_t*)ray_data(w);
+    double* d = (double*)ray_data(f);
+    if (ray_vec_may_have_nulls(w)) {
+        bool nul = false;
+        for (int64_t i = 0; i < m; i++) {
+            bool z = s[i] == NULL_I64;
+            nul |= z;
+            d[i] = z ? NULL_F64 : (double)s[i];
+        }
+        if (nul) f->attrs |= RAY_ATTR_HAS_NULLS;
+    } else {
+        for (int64_t i = 0; i < m; i++) d[i] = (double)s[i];
+    }
+    return f;
+}
+
 /* Vector-needle find with the NEEDLES hashed and the haystack scanned once:
  * out[i] = first row of `hay` equal to needle i, NULL_I64 on a miss.  The
  * alternative (hash the haystack, probe the needles) costs a hash build over
@@ -671,7 +709,7 @@ static bool find_sorted_integer(ray_t* hay, ray_t* nd, int64_t* out, bool* any_n
  * key), so duplicate needles share one answer and a null needle matches the
  * haystack's first null exactly as the haystack-hashed path does.
  * Returns false only on OOM (caller falls back). */
-static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+static bool find_hash_needles_core(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
     int64_t m = nd->len, n = hay->len;
     hashset_t hs;
     if (!hashset_init(&hs, nd, m)) return false;
@@ -698,6 +736,23 @@ static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_nul
     ray_free_raw(first);
     hashset_destroy(&hs);
     return true;
+}
+
+/* Wide int needles against a float haystack: hash their doubles instead
+ * (wide_int_vs_float). */
+static __attribute__((noinline, cold)) bool
+find_hash_needles_f64(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    ray_t* f = wide_ints_as_f64(nd);
+    if (!f) return false;
+    bool ok = find_hash_needles_core(hay, f, out, any_null);
+    ray_release(f);
+    return ok;
+}
+
+static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+    if (RAY_UNLIKELY(wide_int_vs_float(nd, hay)))
+        return find_hash_needles_f64(hay, nd, out, any_null);
+    return find_hash_needles_core(hay, nd, out, any_null);
 }
 
 /* Hash the smaller side only when the scan side probes cheaply: SYM rows
@@ -4477,6 +4532,16 @@ ray_t* ray_fill_fn(ray_t* replacement, ray_t* value) {
     return out;
 }
 
+/* (find vec val) over vec's cells as doubles (wide_int_vs_float): rows
+ * are kept, so the answer indexes vec. */
+static __attribute__((noinline, cold)) ray_t* find_in_f64_hay(ray_t* vec, ray_t* val) {
+    ray_t* f = wide_ints_as_f64(vec);
+    if (!f) return ray_error("oom", NULL);
+    ray_t* r = ray_find_fn(f, val);
+    ray_release(f);
+    return r;
+}
+
 /* (find vec val) — index of first occurrence, or -1 */
 ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -4529,6 +4594,12 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 done = find_sorted_integer(vec, val, out, &any_null);
             if (!done && find_needle_side_ok(vec, val))
                 done = find_hash_needles(vec, val, out, &any_null);
+            /* Hashing a wide int haystack for float needles: hash its
+             * doubles instead (wide_int_vs_float). */
+            if (!done && RAY_UNLIKELY(wide_int_vs_float(vec, val))) {
+                ray_release(result);
+                return find_in_f64_hay(vec, val);
+            }
             if (!done) {
                 hashset_t hs;
                 if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
