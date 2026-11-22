@@ -373,10 +373,11 @@ static bool own_message(const char* name, const char* msg) {
     size_t len = strlen(name);
     while (len > 1 && name[len - 1] >= '0' && name[len - 1] <= '9') len--;
     if (starts_with_word(msg, name, len)) return true;
-    char joined[40];
+    char joined[40] = {0};
     size_t j = 0;
     for (size_t i = 0; i < len && j + 1 < sizeof joined; i++)
         if (name[i] != '-') joined[j++] = name[i];
+    joined[j] = '\0';
     if (starts_with_word(msg, joined, j)) return true;
     const char* dash = memchr(name, '-', len);
     if (!dash) return false;
