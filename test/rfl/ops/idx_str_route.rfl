@@ -119,6 +119,20 @@
 ;; "" (the null rows the hash leaves out) is the scan's
 (count (at (select {from: S3 where: (== id "") seq: seq}) 'seq)) -- 0
 (.idx.uses S3) -- {}
+;; the dense cut-off holds on generation 2: a key on over an eighth of the
+;; rows is the scan's, a rare key of the same column the index's
+(set dk (concat (take ["k"] 1000) (as 'STR (map (fn [j] (format "r%" j)) (til 1000)))))
+(.db.splayed.set "/tmp/rfl_idx_str_route/dk/" (table [id seq] (list (.idx.hash dk) (til 2000))) {compress: true})
+(set DK (.db.splayed.get "/tmp/rfl_idx_str_route/dk/"))
+(do (.idx.uses DK) null)
+(count (at (select {from: DK where: (== id "k") seq: seq}) 'seq)) -- 1000
+(.idx.uses DK) -- {}
+(count (at (select {from: DK where: (in id ["k" "r5"]) seq: seq}) 'seq)) -- 1001
+(.idx.uses DK) -- {}
+(at (select {from: DK where: (== id "r5") seq: seq}) 'seq) -- [1005]
+(at (.idx.uses DK) 'id) -- 1
+(at (select {from: DK where: (in id ["r5" "r7"]) seq: seq}) 'seq) -- [1005 1007]
+(at (.idx.uses DK) 'id) -- 1
 ;; the other string encodings of a vector: a dictionary of few values, long
 ;; strings, nulls among them
 (set lo (as 'STR (map (fn [j] (if (== 0 (% j 97)) "" (format "w%" (% j 1000)))) (til 20000))))
