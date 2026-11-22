@@ -4581,6 +4581,14 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!s) return 0;
     size_t l = ray_str_len(s);
     const char* p = ray_str_ptr(s);
+    /* The JSON readers take a whole string column and type the result from
+     * every row's value (a missing field is that type's null); one cell at
+     * a time each row would come back untyped.  Their value at a row is the
+     * row's alone, so one call over the column is the per-row answer.  A
+     * dotted name cannot be rebound. */
+    if ((l == 9 && memcmp(p, ".json.get", 9) == 0) ||
+        (l == 11 && memcmp(p, ".json.parse", 11) == 0))
+        return 1;
     if (l == 6 && memcmp(p, "concat", 6) == 0) {
         /* Preserve row-wise text concatenation when another projection
          * forces fallback, but evaluate collection concat once. Compilation

@@ -33,6 +33,7 @@
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
+#include "io/json.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "vec/vec.h"
@@ -5413,6 +5414,9 @@ static void ray_register_builtins(void) {
     register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
+    register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
+    register_binary(".json.get", RAY_FN_NONE, ray_json_get_fn);
+    register_unary(".json.format", RAY_FN_NONE, ray_json_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);

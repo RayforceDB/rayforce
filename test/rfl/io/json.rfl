@@ -1,0 +1,293 @@
+;; @requires: posix  (the parted fixtures are removed through a POSIX shell)
+;; JSON text in and out (#1412): .json.parse, .json.get, .json.format.
+;; docs/docs/namespaces/json.md is the contract these pin.
+(set M (fn [f] (try (do (f) "no error") (fn [e] (at e 'msg)))))
+(set deep (fn [n] (concat (str-join (take ["["] n) "") (str-join (take ["]"] n) ""))))
+
+;; ─── .json.parse: values ───────────────────────────────────────────────────
+(.json.parse "{\"a\":1,\"b\":[1,2]}") -- (dict ["a" "b"] (list 1 [1 2]))
+(type (key (.json.parse "{\"a\":1}"))) -- 'STR
+(at (.json.parse "{\"a\":{\"b\":\"x\"}}") "a") -- (dict ["b"] (list "x"))
+(at (at (.json.parse "{\"a\":{\"b\":\"x\"}}") "a") "b") -- "x"
+(.json.parse "\"text\"") -- "text"
+(.json.parse "true") -- true
+(.json.parse "false") -- false
+(nil? (.json.parse "null")) -- true
+(type (.json.parse "null")) -- 'null
+;; empty object and array
+(count (.json.parse "{}")) -- 0
+(type (.json.parse "{}")) -- 'DICT
+(type (.json.parse "[]")) -- 'LIST
+(count (.json.parse "[]")) -- 0
+(.json.parse "[[],{}]") -- (list (list) (.json.parse "{}"))
+;; an array of one kind of scalar is that vector; nulls become its nulls
+(.json.parse "[1,2,3]") -- [1 2 3]
+(.json.parse "[1,null,3]") -- [1 0Nl 3]
+(.json.parse "[1,2.5]") -- [1.0 2.5]
+(.json.parse "[1.5,null]") -- [1.5 0Nf]
+(.json.parse "[\"a\",\"b\"]") -- ["a" "b"]
+(.json.parse "[\"a\",null]") -- ["a" ""]
+(.json.parse "[true,false]") -- [true false]
+(type (.json.parse "[true,false]")) -- 'B8
+;; ... anything else stays a list: bool has no null, kinds do not mix
+(type (.json.parse "[true,null]")) -- 'LIST
+(type (.json.parse "[1,\"a\"]")) -- 'LIST
+(type (.json.parse "[null,null]")) -- 'LIST
+(type (.json.parse "[[1],[2]]")) -- 'LIST
+(.json.parse "[[1],[2]]") -- (list [1] [2])
+
+;; ─── numbers ───────────────────────────────────────────────────────────────
+(.json.parse "0") -- 0
+(.json.parse "-0") -- 0
+(type (.json.parse "-0")) -- 'i64
+(.json.parse "9223372036854775807") -- 9223372036854775807
+(.json.parse "-9223372036854775807") -- -9223372036854775807
+;; past the I64 range, and the I64 null itself, are F64
+(type (.json.parse "9223372036854775808")) -- 'f64
+(.json.parse "9223372036854775808") -- 9223372036854775808.0
+(type (.json.parse "-9223372036854775808")) -- 'f64
+(.json.parse "-9223372036854775808") -- -9223372036854775808.0
+(.json.parse "123456789012345678901234567890") -- 1.2345678901234568e29
+;; a fraction or an exponent makes an F64, whatever the value
+(type (.json.parse "1.0")) -- 'f64
+(.json.parse "1e3") -- 1000.0
+(.json.parse "1E3") -- 1000.0
+(.json.parse "1e+3") -- 1000.0
+(.json.parse "25e-1") -- 2.5
+(.json.parse "-1.5E-2") -- -0.015
+(.json.parse "0.1") -- 0.1
+(.json.parse "1e999") !- domain
+(.json.parse "-1e999") !- domain
+(.json.parse "01") !- parse
+(.json.parse "-01") !- parse
+(.json.parse "00") !- parse
+(.json.parse "1.") !- parse
+(.json.parse ".5") !- parse
+(.json.parse "1e") !- parse
+(.json.parse "1e+") !- parse
+(.json.parse "-") !- parse
+(.json.parse "+1") !- parse
+(.json.parse "NaN") !- parse
+(.json.parse "Infinity") !- parse
+(.json.parse "0x10") !- parse
+
+;; ─── strings and every escape ──────────────────────────────────────────────
+(.json.parse "\"\\\"\"") -- "\""
+(.json.parse "\"\\\\\"") -- "\\"
+(.json.parse "\"\\/\"") -- "/"
+(.json.parse "\"\\b\\f\\n\\r\\t\"") -- "\010\014\n\r\t"
+(.json.parse "\"\\u0041\\u00e9\\u20ac\"") -- "A\303\251\342\202\254"
+(.json.parse "\"\\u00E9\"") -- "\303\251"
+(.json.parse "\"\\ud834\\udd1e\"") -- "\360\235\204\236"
+(.json.parse "\"\\uD83D\\uDE00\"") -- "\360\237\230\200"
+(count (.json.parse "\"a\\u0000b\"")) -- 3
+(.json.parse "\"\303\251\"") -- "\303\251"
+;; lone surrogates
+(.json.parse "\"\\ud800\"") !- parse
+(.json.parse "\"\\udc00\"") !- parse
+(.json.parse "\"\\ud800x\"") !- parse
+(.json.parse "\"\\ud800\\u0041\"") !- parse
+(.json.parse "\"\\udbff\\udbff\"") !- parse
+(M (fn [] (.json.parse "\"ab\\udc00\""))) -- ".json.parse: lone low surrogate \\udc00 at byte 3"
+;; bad escapes, raw control characters, bad UTF-8, an open string
+(.json.parse "\"\\x\"") !- parse
+(.json.parse "\"\\u12G4\"") !- parse
+(.json.parse "\"\\u12\"") !- parse
+(.json.parse "\"a\001\"") !- parse
+(.json.parse "\"a\n\"") !- parse
+(.json.parse "\"a\377\"") !- parse
+(.json.parse "\"\300\200\"") !- parse
+(.json.parse "\"\355\240\200\"") !- parse
+(.json.parse "\"open") !- parse
+
+;; ─── structure: strict ─────────────────────────────────────────────────────
+(.json.parse "[1,]") !- parse
+(.json.parse "{\"a\":1,}") !- parse
+(.json.parse "[1,,2]") !- parse
+(.json.parse "[,1]") !- parse
+(.json.parse "{\"a\" 1}") !- parse
+(.json.parse "{a:1}") !- parse
+(.json.parse "{'a':1}") !- parse
+(.json.parse "{1:1}") !- parse
+(.json.parse "[1 2]") !- parse
+(.json.parse "[1") !- parse
+(.json.parse "{") !- parse
+(.json.parse "tru") !- parse
+(.json.parse "nul") !- parse
+(.json.parse "[1] [2]") !- parse
+(.json.parse "1 x") !- parse
+(.json.parse "/* c */ 1") !- parse
+(.json.parse "   ") !- parse
+;; the error names the byte, never a partial value
+(M (fn [] (.json.parse "{\"a\":[1,2,}"))) -- ".json.parse: unexpected character '}', expected a value at byte 10"
+(M (fn [] (.json.parse "[1] x"))) -- ".json.parse: unexpected character 'x', expected the end of input after the value at byte 4"
+(M (fn [] (.json.parse "01"))) -- ".json.parse: leading zero in a number at byte 1"
+;; whitespace: space, tab, newline, return, anywhere between tokens
+(.json.parse " \t\n\r{ \"a\" :\t[ 1 ,\n2 ] , \"b\" : null }\r\n ") -- (dict ["a" "b"] (list [1 2] null))
+(.json.parse "\n7\n") -- 7
+
+;; ─── duplicate keys: the first position, the last value ────────────────────
+(.json.parse "{\"a\":1,\"b\":2,\"a\":3}") -- (dict ["a" "b"] (list 3 2))
+(.json.parse "{\"a\":1,\"a\":{\"x\":true}}") -- (dict ["a"] (list (dict ["x"] (list true))))
+;; past a few keys the lookup is hashed; the same rule holds
+(set many (concat "{" (concat (str-join (map (fn [i] (format "\"k%\":%" (% i 50) i)) (til 200)) ",") "}")))
+(count (.json.parse many)) -- 50
+(at (.json.parse many) "k7") -- 157
+(key (.json.parse many)) -- (as 'STR (map (fn [i] (format "k%" i)) (til 50)))
+
+;; ─── caps: depth, nodes, input, allocation ─────────────────────────────────
+(.json.format (.json.parse (deep 128))) -- (deep 128)
+(type (.json.parse (deep 128))) -- 'LIST
+(.json.parse (deep 129)) !- limit
+(M (fn [] (.json.parse (deep 129)))) -- ".json.parse: depth limit of 128 exceeded at byte 128"
+(.json.parse (deep 100000)) !- limit
+(.json.parse (deep 5) {depth: 5}) -- (.json.parse (deep 5))
+(.json.parse (deep 5) {depth: 4}) !- limit
+(.json.parse "[1,2,3]" {nodes: 4}) -- [1 2 3]
+(.json.parse "[1,2,3]" {nodes: 3}) !- limit
+(.json.parse "[1,2,3]" {input: 7}) -- [1 2 3]
+(.json.parse "[1,2,3]" {input: 6}) !- limit
+(.json.parse "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"" {alloc: 40}) !- limit
+(.json.parse "[1]" {bogus: 1}) !- domain
+(.json.parse "[1]" 5) !- type
+(.json.get (deep 129) "0") !- limit
+
+;; ─── element-wise over a string vector ─────────────────────────────────────
+(.json.parse ["{\"a\":1}" "[1,2]" "3"]) -- (list (dict ["a"] (list 1)) [1 2] 3)
+(.json.parse ["1" "2" "3"]) -- [1 2 3]
+;; "" is the STR null: a null element reads as null
+(.json.parse ["1" "" "3"]) -- [1 0Nl 3]
+(nil? (.json.parse "")) -- true
+(type (.json.parse (take ["1"] 0))) -- 'LIST
+(.json.parse (list "1" "[2]")) -- (list 1 [2])
+(.json.parse ["[1]" "[1"]) !- parse
+(M (fn [] (.json.parse ["[1]" "[1"]))) -- ".json.parse: unexpected end of input, expected ',' or ']' at byte 2 of element 1"
+(.json.parse 42) !- type
+(.json.parse (list "1" 2)) !- type
+
+;; ─── .json.get ─────────────────────────────────────────────────────────────
+(set doc "{\"kind\":\"note\",\"data\":{\"ids\":[10,20,30],\"tag\":null},\"n\":2.5,\"ok\":true,\"0\":\"zero\"}")
+(.json.get doc "kind") -- "note"
+(.json.get doc "data.ids.1") -- 20
+(.json.get doc "data.ids") -- [10 20 30]
+(.json.get doc "data") -- (dict ["ids" "tag"] (list [10 20 30] null))
+(.json.get doc "n") -- 2.5
+(.json.get doc "ok") -- true
+(.json.get doc "0") -- "zero"
+(.json.get doc 'kind) -- "note"
+;; a missing path is null, not an error
+(nil? (.json.get doc "nope")) -- true
+(nil? (.json.get doc "data.ids.3")) -- true
+(nil? (.json.get doc "data.ids.x")) -- true
+(nil? (.json.get doc "kind.x")) -- true
+(nil? (.json.get doc "data.tag")) -- true
+(nil? (.json.get doc "data.ids.01")) -- true
+(nil? (.json.get "[1,2]" "-1")) -- true
+(.json.get "[[1,2],[3,4]]" "1.0") -- 3
+;; a repeated key: the last, as .json.parse keeps it
+(.json.get "{\"a\":1,\"a\":{\"b\":2}}" "a.b") -- 2
+(nil? (.json.get "{\"a\":{\"b\":2},\"a\":1}" "a.b")) -- true
+;; the rest of the document is still checked
+(.json.get "{\"a\":1,\"b\":[}" "a") !- parse
+(.json.get "{\"a\":1} x" "a") !- parse
+(.json.get "{\"b\":01,\"a\":1}" "a") !- parse
+;; the path
+(.json.get doc "") !- domain
+(.json.get doc "a..b") !- domain
+(.json.get doc ".a") !- domain
+(.json.get doc 5) !- type
+(.json.get 5 "a") !- type
+
+;; over a string vector: one value per element, typed by every element's value
+(set L ["{\"k\":\"x\",\"n\":1}" "{\"k\":\"y\",\"n\":2}" "" "{\"n\":2.5}" "{\"k\":null,\"b\":true}"])
+(.json.get L "k") -- ["x" "y" "" "" ""]
+(type (.json.get L "k")) -- 'STR
+(.json.get L "n") -- [1.0 2.0 0Nf 2.5 0Nf]
+(.json.get (take L 2) "n") -- [1 2]
+(.json.get ["{\"b\":true}" "{\"b\":false}"] "b") -- [true false]
+(type (.json.get L "b")) -- 'LIST
+(.json.get L "zz") -- ["" "" "" "" ""]
+(type (.json.get L "zz")) -- 'STR
+(type (.json.get ["{\"a\":[1]}" "{\"a\":2}"] "a")) -- 'LIST
+(.json.get (take L 0) "k") -- (take ["a"] 0)
+(.json.get (list "{\"k\":1}" "") "k") -- [1 0Nl]
+(.json.get ["{\"k\":1}" "{\"k\""] "k") !- parse
+
+;; ─── in a query ────────────────────────────────────────────────────────────
+(set T (table [line i] (list L (til 5))))
+(at (select {from: T where: (== (.json.get line "k") "x") i: i}) 'i) -- [0]
+(at (select {from: T where: (> (.json.get line "n") 1.5) i: i}) 'i) -- [1 3]
+(at (select {from: T i: i k: (.json.get line "k")}) 'k) -- ["x" "y" "" "" ""]
+(at (select {from: T i: i k: (.json.get line "n")}) 'k) -- [1.0 2.0 0Nf 2.5 0Nf]
+(at (update {from: T k: (.json.get line "k")}) 'k) -- ["x" "y" "" "" ""]
+(at (at (select {from: T p: (.json.parse line)}) 'p) 1) -- (dict ["k" "n"] (list "y" 2))
+(nil? (at (at (select {from: T p: (.json.parse line)}) 'p) 2)) -- true
+(at (select {from: T where: (> i 0) k: (.json.get line "k")}) 'k) -- ["y" "" "" ""]
+(at (select {from: (table [g line] (list [1 1 2 2 2] L)) by: g s: (sum (.json.get line "n"))}) 's) -- [3.0 2.5]
+;; a parted table of compressed (generation 2) string columns
+(.sys.exec "rm -rf /tmp/rfl_json_parted")
+(set E (table [line i] (list (as 'STR (map (fn [j] (format "{\"kind\":\"%\",\"n\":%}" (if (== 0 (% j 3)) "note" "ping") j)) (til 3000))) (til 3000))))
+(.db.splayed.set "/tmp/rfl_json_parted/1/t/" (take E 1500) {compress: true})
+(.db.splayed.set "/tmp/rfl_json_parted/2/t/" (take E -1500) {compress: true})
+(set PE (.db.parted.get "/tmp/rfl_json_parted/" 't))
+(count (at (select {from: PE where: (== (.json.get line "kind") "note") i: i}) 'i)) -- 1000
+(at (select {from: PE where: (== (.json.get line "kind") "note") i: i}) 'i) -- (* 3 (til 1000))
+(sum (at (select {from: PE where: (> (.json.get line "n") 2990) n: (.json.get line "n")}) 'n)) -- 26955
+(.db.splayed.set "/tmp/rfl_json_parted/s/" E {compress: true})
+(set SE (.db.splayed.get "/tmp/rfl_json_parted/s/"))
+(count (at (select {from: SE where: (== (.json.get line "kind") "ping") i: i}) 'i)) -- 2000
+(.sys.exec "rm -rf /tmp/rfl_json_parted") -- 0
+
+;; ─── .json.format ──────────────────────────────────────────────────────────
+(.json.format (dict ["a" "b"] (list 1 [1.5 2.0]))) -- "{\"a\":1,\"b\":[1.5,2.0]}"
+(.json.format {a: 1 b: 'c}) -- "{\"a\":1,\"b\":\"c\"}"
+(.json.format (table [a b] (list [1 2] ["x" "y"]))) -- "[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"b\":\"y\"}]"
+(.json.format (table [a] (list (take [1] 0)))) -- "[]"
+(.json.format (list 1 "a" null true 'sym)) -- "[1,\"a\",null,true,\"sym\"]"
+(.json.format (list)) -- "[]"
+(.json.format (dict (take ["a"] 0) (list))) -- "{}"
+(.json.format [1 0Nl 3]) -- "[1,null,3]"
+(.json.format [1.5 0Nf]) -- "[1.5,null]"
+(.json.format [0Ni 3i]) -- "[null,3]"
+(.json.format (as 'BOOL [1 0])) -- "[true,false]"
+(.json.format 9223372036854775807) -- "9223372036854775807"
+(.json.format -9223372036854775807) -- "-9223372036854775807"
+;; floats: the shortest text that reads back, always with a '.' or an exponent
+(.json.format 1.0) -- "1.0"
+(.json.format -0.0) -- "-0.0"
+(.json.format 0.1) -- "0.1"
+(.json.format 1e300) -- "1e+300"
+(.json.format -1.5e-300) -- "-1.5e-300"
+(.json.format (as 'F32 [1.5 0.1])) -- "[1.5,0.1]"
+;; string escapes
+(.json.format "q\"b\\s/") -- "\"q\\\"b\\\\s/\""
+(.json.format "\010\014\n\r\t") -- "\"\\b\\f\\n\\r\\t\""
+(.json.format "\001\037\177") -- "\"\\u0001\\u001f\177\""
+(.json.format "\303\251\360\237\230\200") -- "\"\303\251\360\237\230\200\""
+(.json.format "") -- "\"\""
+(.json.format "a\377") !- domain
+;; temporal and guid values as the strings they print as; their nulls as null
+(.json.format [2024.01.01 0Nd]) -- "[\"2024.01.01\",null]"
+(.json.format 12:30:00.000) -- "\"12:30:00.000\""
+;; what JSON cannot hold
+(.json.format (dict [1 2] (list 1 2))) !- type
+(.json.format (fn [x] x)) !- type
+
+;; ─── round trips ───────────────────────────────────────────────────────────
+(set RT (fn [v] (.json.parse (.json.format v))))
+(RT (dict ["a" "b" "c"] (list 1 [1.5 2.0] (dict ["d"] (list "x"))))) -- (dict ["a" "b" "c"] (list 1 [1.5 2.0] (dict ["d"] (list "x"))))
+(RT [1 2 3]) -- [1 2 3]
+(RT [1.5 -0.25 1e300 0.1]) -- [1.5 -0.25 1e300 0.1]
+(RT ["a" "q\"" "\\" "\n" "\303\251"]) -- ["a" "q\"" "\\" "\n" "\303\251"]
+(RT [true false]) -- [true false]
+(RT (list 1 "a" (list) [1 2])) -- (list 1 "a" (list) [1 2])
+(RT 9223372036854775807) -- 9223372036854775807
+(RT -9223372036854775807) -- -9223372036854775807
+(RT 0.30000000000000004) -- 0.30000000000000004
+(type (RT (list null))) -- 'LIST
+(nil? (first (RT (list null)))) -- true
+;; a list of one kind of scalar and nulls comes back as that vector
+(RT (list null 1)) -- [0Nl 1]
+(set doc2 "{\"a\":[1,2,{\"b\":null}],\"c\":\"\\u00e9\\n\",\"d\":-1.5e-7,\"e\":true}")
+(.json.parse (.json.format (.json.parse doc2))) -- (.json.parse doc2)
+(.json.format (.json.parse doc2)) -- "{\"a\":[1,2,{\"b\":null}],\"c\":\"\303\251\\n\",\"d\":-1.5e-07,\"e\":true}"
