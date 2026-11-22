@@ -4733,9 +4733,33 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             for (int64_t j = 0; j < vlen; j++) {
                 int alloc = 0;
                 ray_t* ve = collection_elem(val, j, &alloc);
+                if (ve && !ray_is_atom(ve) && (vec->type == RAY_LIST || ray_is_vec(vec))) {
+                    /* A vector or list cell is one value to look up, not a
+                     * set of needles: the first haystack cell atom_eq calls
+                     * equal, which only a LIST haystack can hold (#1374).  Any
+                     * other haystack (table, dict, atom) takes the per-cell
+                     * find below, which raises its type error. */
+                    int64_t pos = NULL_I64;
+                    if (vec->type == RAY_LIST) {
+                        ray_t** cells = (ray_t**)ray_data(vec);
+                        for (int64_t k = 0; k < vec->len; k++)
+                            if (atom_eq(cells[k], ve)) { pos = k; break; }
+                    }
+                    if (alloc) ray_release(ve);
+                    if (pos == NULL_I64) { out[j] = NULL_I64; any_null = true; }
+                    else out[j] = pos;
+                    continue;
+                }
                 ray_t* one = ray_find_fn(vec, ve);   /* scalar → i64 atom or 0Nl */
                 if (alloc) ray_release(ve);
                 if (RAY_IS_ERR(one)) { ray_release(result); return one; }
+                /* One cell gives one row: a cell that is itself a set of
+                 * needles (a list cell over an atom haystack) is not a row. */
+                if (!ray_is_atom(one)) {
+                    ray_release(one); ray_release(result);
+                    return ray_error("type", "find: a needle cell must be one value for this haystack, got %s",
+                                     ray_type_name(ve ? ve->type : 0));
+                }
                 if (RAY_ATOM_IS_NULL(one)) { out[j] = NULL_I64; any_null = true; }
                 else out[j] = one->i64;
                 ray_release(one);
