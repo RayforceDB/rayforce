@@ -5398,10 +5398,10 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #define BR_WRAP(T, L, OP, R) do {                                           \
         int any = 0;                                                        \
         for (int64_t i = 0; i < n; i++) {                                   \
-            T v = (T)((uint64_t)(L) OP (uint64_t)(R));                      \
-            odst[i] = v;                                                    \
+            uint64_t bits = (uint64_t)(L) OP (uint64_t)(R);                      \
+            odst[i] = (T)bits;                                                    \
             if (sizeof(T) == 8 && out_type == RAY_I64)                      \
-                any |= ((int64_t)v == NULL_I64);                            \
+                any |= (bits == (uint64_t)NULL_I64);                            \
         }                                                                   \
         if (any) __atomic_fetch_or(&result->attrs, RAY_ATTR_HAS_NULLS,      \
                                    __ATOMIC_RELAXED);                       \
