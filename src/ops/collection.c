@@ -1635,6 +1635,39 @@ static int atom_eq_cell_col(ray_t* a, ray_t* b) {
 }
 
 /* Helper: compare two atoms for equality (value-based) */
+/* Cell i of a SYM vector as a runtime intern id, the domain's LUT fetched
+ * once by the caller (sym_cell_runtime_id per cell, without the lookup):
+ * positions are relative to the vector's domain (a file domain's LUT maps
+ * them; the runtime domain's ids pass through), stored 1, 2, 4 or 8 bytes
+ * wide.  -1 for a position outside the domain. */
+static inline int64_t sym_vec_cell_rid(ray_t* v, const int64_t* lut, int64_t n, int64_t i) {
+    int64_t pos = ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs);
+    if (!lut) return pos;
+    return pos >= 0 && pos < n ? lut[pos] : -1;
+}
+
+/* Two SYM vectors are equal when every cell is the same symbol, whatever
+ * domain or width each stores it in.  Comparing len * 8 raw bytes read past
+ * a narrow vector and told the same symbols at two widths apart (#1311). */
+static int sym_vec_eq(ray_t* a, ray_t* b) {
+    if (a->len != b->len) return 0;
+    struct ray_sym_domain_s* da = ray_sym_vec_domain(a);
+    struct ray_sym_domain_s* db = ray_sym_vec_domain(b);
+    size_t wa = RAY_SYM_ELEM(a->attrs), wb = RAY_SYM_ELEM(b->attrs);
+    if (da == db && wa == wb)
+        return memcmp(ray_data(a), ray_data(b), (size_t)a->len * wa) == 0;
+    bool ra = da == ray_sym_runtime_domain(), rb = db == ray_sym_runtime_domain();
+    const int64_t* la = ra ? NULL : ray_sym_domain_runtime_lut(da);
+    const int64_t* lb = rb ? NULL : da == db ? la : ray_sym_domain_runtime_lut(db);
+    if ((!ra && !la) || (!rb && !lb)) return 0;   /* a domain that cannot resolve */
+    int64_t na = ra ? 0 : ray_sym_domain_count(da), nb = rb ? 0 : ray_sym_domain_count(db);
+    for (int64_t i = 0; i < a->len; i++) {
+        int64_t x = sym_vec_cell_rid(a, la, na, i);
+        if (x < 0 || x != sym_vec_cell_rid(b, lb, nb, i)) return 0;
+    }
+    return 1;
+}
+
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
         if (ray_timespan_binary_type(OP_EQ, a->type, b->type) <= 0) return 0;
@@ -1728,6 +1761,8 @@ int atom_eq(ray_t* a, ray_t* b) {
         if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
         return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
+    case RAY_SYM:
+        return b->type == RAY_SYM && sym_vec_eq(a, b);
     default:
         /* Vector equality: same type and length, element-wise comparison */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
