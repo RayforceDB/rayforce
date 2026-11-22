@@ -1,0 +1,52 @@
+;; Keyed-table == with vector and list key cells (#1276).  Unaligned keys
+;; match through a hash over each cell's contents; the answers are dev's
+;; (atom_eq: a vector cell equals one of the same type, length and bytes).
+(set kt (fn [ks vs] (xkey (table [k v] (list ks vs)) [k])))
+(set kt2 (fn [ks js vs] (xkey (table [k j v] (list ks js vs)) [k j])))
+;; Same order, another order, a differing value.
+(value (== (kt (list [1 2] [3 4] [5]) [1 2 3]) (kt (list [1 2] [3 4] [5]) [1 2 3]))) -- (list {v: true} {v: true} {v: true})
+(value (== (kt (list [1 2] [3 4] [5]) [1 2 3]) (kt (list [5] [1 2] [3 4]) [3 1 2]))) -- (list {v: true} {v: true} {v: true})
+(value (== (kt (list [1 2] [3 4] [5]) [1 2 3]) (kt (list [5] [1 2] [3 4]) [3 0 2]))) -- (list {v: false} {v: true} {v: true})
+;; One key cell differs in one element, or in length: both sides stay unmatched.
+(set d (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3 4] [1 3]) [2 1])))
+(key d) -- (list [1 2] [3 4] [1 3])
+(value d) -- (list false {v: true} false)
+(key (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3 4] [1]) [2 1]))) -- (list [1 2] [3 4] [1])
+;; Vector cells compare by type: I64 never matches I32 or F64 cells.
+(count (key (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3i 4i] [1i 2i]) [2 1])))) -- 4
+(value (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3 4] [1.0 2.0]) [2 1]))) -- (list false {v: true} false)
+;; Nulls and NaN match themselves; -0.0 and 0.0 cells differ (bytes compare).
+(value (== (kt (list [1.0 0Nf] [-0.0]) [1 2]) (kt (list [-0.0] [1.0 0Nf]) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt (list [-0.0] [1.0]) [1 2]) (kt (list [1.0] [0.0]) [2 1]))) -- (list false {v: true} false)
+(value (== (kt (list [0Nl 1] [2]) [1 2]) (kt (list [2] [0Nl 1]) [2 1]))) -- (list {v: true} {v: true})
+;; SYM and STR vectors, short and pooled strings.
+(value (== (kt (list ['a 'b] ['c]) [1 2]) (kt (list ['c] ['a 'b]) [2 1]))) -- (list {v: true} {v: true})
+(key (== (kt (list ['a 'b] ['c]) [1 2]) (kt (list ['c] ['b 'a]) [2 1]))) -- (list ['a 'b] ['c] ['b 'a])
+(value (== (kt (list (list "ab" "cd") (list "x")) [1 2]) (kt (list (list "x") (list "ab" "cd")) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt (list (list "ab" "cd") (list "x")) [1 2]) (kt (list (list "x") (list "ab" "ce")) [2 1]))) -- (list false {v: true} false)
+(value (== (kt (list (list "abcdefghijklmnopq") (list "x")) [1 2]) (kt (list (list "x") (list "abcdefghijklmnopq")) [2 1]))) -- (list {v: true} {v: true})
+;; Empty vectors: I64 and F64 empties are different keys.
+(value (== (kt (list (til 0) [1]) [1 2]) (kt (list [1] (til 0)) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt (list (til 0) (as 'F64 (til 0))) [1 2]) (kt (list (as 'F64 (til 0)) (til 0)) [2 1]))) -- (list {v: true} {v: true})
+;; Nested lists and composite keys mixing atom and vector cells.
+(value (== (kt (list (list 'x [1 2]) (list 'y [3])) [1 2]) (kt (list (list 'y [3]) (list 'x [1 2])) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt (list (list 'x [1 2]) (list 'y [3])) [1 2]) (kt (list (list 'y [3]) (list 'x [1 3])) [2 1]))) -- (list false {v: true} false)
+(value (== (kt (list (list [1] (list [2] "s")) [3]) [1 2]) (kt (list [3] (list [1] (list [2] "s"))) [2 1]))) -- (list {v: true} {v: true})
+(value (== (kt2 (list [1 2] [3]) ['a 'b] [5 6]) (kt2 (list [3] [1 2]) ['b 'a] [6 5]))) -- (list {v: true} {v: true})
+(count (key (== (kt2 (list [1 2] [3]) ['a 'b] [5 6]) (kt2 (list [3] [1 2]) ['a 'b] [6 5])))) -- 4
+(value (== (kt2 (list [1 2] [3]) (list "p" "q") [5 6]) (kt2 (list [3] [1 2]) (list "q" "p") [6 5]))) -- (list {v: true} {v: true})
+;; A TIMESPAN vector cell keeps dev's duration compare (it meets [1 2]).
+(value (== (kt (list (as 'TIMESPAN [1 2]) [3 4]) [1 2]) (kt (list [3 4] [1 2]) [2 1]))) -- (list {v: false} {v: true})
+;; Keyed tables refuse duplicate vector keys.
+(kt (list [1 2] [1 2]) [1 2]) !- domain
+;; Many reordered vector keys, and one changed cell among them.
+(set m 2000)
+(set vk (map (fn [i] (enlist i)) (til m)))
+(set x1 (kt vk (til m)))
+(set x2 (kt (reverse vk) (reverse (til m))))
+(identical (value (== x1 x2)) (value (== x1 x1))) -- true
+(set lk (map (fn [i] (list 'x (enlist i) (as 'STR i))) (til m)))
+(identical (value (== (kt lk (til m)) (kt (reverse lk) (reverse (til m))))) (value (== x1 x1))) -- true
+(set y2 (kt (concat (enlist (enlist -1)) (reverse (drop vk 1))) (reverse (til m))))
+(count (key (== x1 y2))) -- 2001
+(sum (map (fn [x] (== (type x) 'DICT)) (value (== x1 y2)))) -- 1999
