@@ -745,7 +745,7 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
         case RAY_I16:  (dst) = ((const int16_t*)cd)[_ix]; break;            \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
                        (dst) = ((const int32_t*)cd)[_ix]; break;            \
-        case RAY_I64:  case RAY_TIMESTAMP:                                  \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:               \
                        (dst) = ((const int64_t*)cd)[_ix]; break;            \
         case RAY_SYM:  (dst) = ray_read_sym(cd, _ix, ct, cattrs); break;    \
         default:       (dst) = 0; break;                                    \
@@ -759,7 +759,7 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
         case RAY_I16:  (dst) = (double)((const int16_t*)cd)[_ix]; break;    \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
                        (dst) = (double)((const int32_t*)cd)[_ix]; break;    \
-        case RAY_I64:  case RAY_TIMESTAMP:                                  \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:               \
                        (dst) = (double)((const int64_t*)cd)[_ix]; break;    \
         case RAY_F32:  (dst) = (double)((const float*)cd)[_ix]; break;      \
         case RAY_F64:  (dst) = ((const double*)cd)[_ix]; break;             \
@@ -963,6 +963,13 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
  * the bool path can surface nyi/oom while the fused path falls back. */
 typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_status_t;
 
+/* A TIMESPAN against a TIME or a TIMESTAMP (element types). */
+static inline bool in_span_point_pair(int8_t ct, int8_t st) {
+    if (ct == st) return false;
+    if (ct == RAY_TIMESPAN) return st == RAY_TIME || st == RAY_TIMESTAMP;
+    return st == RAY_TIMESPAN && (ct == RAY_TIME || ct == RAY_TIMESTAMP);
+}
+
 /* The body shared by in_build_worker_ctx (a column vector or atom) and
  * in_build_worker_ctx_meta (a bound source read by range), over the
  * column's description: `atom` is the column when it is an atom (else
@@ -998,6 +1005,10 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     int col_class = CLASSIFY(ct);
     int set_class = CLASSIFY(st);
 
+    /* A TIMESPAN meets a TIME or a TIMESTAMP as a duration (atom_eq's
+     * span_eval: milliseconds as nanoseconds, a TIMESTAMP by its time of
+     * day), not by payload: ray_in_fn answers that pair (#1319). */
+    if (in_span_point_pair(ct, st)) return IN_CTX_UNSUPPORTED;
     /* A temporal value equals only its own type: atom_eq — and so the
      * hashset behind find/except and the null-bearing `in` — never matches
      * a DATE to an int or to a TIMESTAMP.  Comparing raw payloads here
@@ -1039,7 +1050,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         case RAY_I16:  (dst) = ((const int16_t*)_d)[idx]; break;           \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
                        (dst) = ((const int32_t*)_d)[idx]; break;           \
-        case RAY_I64:  case RAY_TIMESTAMP:                                 \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
                        (dst) = ((const int64_t*)_d)[idx]; break;           \
         case RAY_SYM:  (dst) = ray_read_sym(_d, (idx), (type),             \
                                             (vec)->attrs); break;          \
@@ -1054,7 +1065,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         case RAY_I16:  (dst) = (double)((const int16_t*)_d)[idx]; break;   \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
                        (dst) = (double)((const int32_t*)_d)[idx]; break;   \
-        case RAY_I64:  case RAY_TIMESTAMP:                                 \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
                        (dst) = (double)((const int64_t*)_d)[idx]; break;   \
         case RAY_F32:  (dst) = (double)((const float*)_d)[idx]; break;     \
         case RAY_F64:  (dst) = ((const double*)_d)[idx]; break;            \
@@ -1413,6 +1424,7 @@ static bool in_has_general_fallback(ray_t* col, ray_t* set) {
     if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
     if (ct == RAY_GUID || st == RAY_GUID) return true;
+    if (in_span_point_pair(ct, st)) return true;   /* ray_in_fn: a bool per row */
     if (ct != RAY_STR && st != RAY_STR) return false;
     /* Only a column of cells answers one verdict per row: a LIST column's
      * cell may be a vector, and its answer a list no mask can use. */

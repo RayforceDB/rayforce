@@ -3527,6 +3527,11 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         if (set_is_float) return NULL;
         /* Check set type is integer-family (numeric_elem_size covers all int types) */
         if (numeric_elem_size(st) == 0) return NULL;
+        /* A DATE, TIME or TIMESTAMP against another type compares by duration
+         * (atom_eq), not by payload: leave it to the general route. */
+        bool col_point = col->type == RAY_DATE || col->type == RAY_TIME || col->type == RAY_TIMESTAMP;
+        bool set_point = st == RAY_DATE || st == RAY_TIME || st == RAY_TIMESTAMP;
+        if (col->type != st && (col_point || set_point)) return NULL;
     }
 
     int64_t set_len = set_vec->len;
@@ -5129,6 +5134,12 @@ int ray_index_find_vec(ray_t* col, ray_t* nd, int64_t* out, bool* any_miss) {
          * and cross-family promotion belong to the scan / hashset paths. */
         if (col->type == RAY_F32 || col->type == RAY_F64) return 0;
         if (nd->type == RAY_F32 || nd->type == RAY_F64 || numeric_elem_size(nd->type) == 0) return 0;
+        /* A DATE, TIME or TIMESTAMP meets only its own type by payload: atom_eq
+         * never matches a DATE to a TIMESPAN or an int, and meets a TIME or a
+         * TIMESTAMP with a TIMESPAN as a duration (#1319). */
+#define IDX_POINT(t) ((t) == RAY_DATE || (t) == RAY_TIME || (t) == RAY_TIMESTAMP)
+        if (col->type != nd->type && (IDX_POINT(col->type) || IDX_POINT(nd->type))) return 0;
+#undef IDX_POINT
         for (int64_t i = 0; i < m; i++) {
             if (nd_nulls && ray_vec_is_null(nd, i)) { out[i] = NULL_I64; miss = true; continue; }
             int64_t r = ray_index_find_row(col, set_vec_read_i64(nb, nd->type, i));
