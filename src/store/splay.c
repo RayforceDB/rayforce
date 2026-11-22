@@ -2154,6 +2154,13 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
 int64_t     ray_splay_pending_count(void)        { return g_npending; }
 const char* ray_splay_pending_root(int64_t i)    { return g_pending[i].root; }
 const char* ray_splay_pending_gen(int64_t i)     { return g_pending[i].generation; }
+/* The generation the write found current, as .current named it; "" for a
+ * table that had none (new, or still in the first-write layout). */
+const char* ray_splay_pending_prev(int64_t i) {
+    const ray_splay_write_t* w = &g_pending[i];
+    size_t rl = strlen(w->root);
+    return strncmp(w->cur, w->root, rl) == 0 && w->cur[rl] != '\0' ? w->cur + rl + 1 : "";
+}
 
 ray_err_t ray_splay_pending_end(bool publish) {
     ray_err_t result = RAY_OK;
@@ -2200,7 +2207,7 @@ void ray_splay_pending_abandon(void) {
 }
 #endif
 
-ray_err_t ray_splay_publish(const char* root, const char* gen) {
+ray_err_t ray_splay_publish(const char* root, const char* gen, const char* prev) {
     char schema[1200], cur[1024];
     int n = snprintf(schema, sizeof(schema), "%s/%s/.d", root, gen);
     if (n < 0 || (size_t)n >= sizeof(schema)) return RAY_ERR_RANGE;
@@ -2209,9 +2216,12 @@ ray_err_t ray_splay_publish(const char* root, const char* gen) {
     fclose(f);
     bool active = false;
     size_t rl = strlen(root);
-    if (splay_current_dir(root, cur, sizeof(cur), &active) == RAY_OK && active &&
-        strlen(cur) > rl + 1 && strcmp(cur + rl + 1, gen) == 0)
-        return RAY_OK;                           /* already current */
+    if (splay_current_dir(root, cur, sizeof(cur), &active) != RAY_OK) return RAY_ERR_IO;
+    const char* now = active && strlen(cur) > rl + 1 ? cur + rl + 1 : "";
+    if (strcmp(now, gen) == 0) return RAY_OK;    /* already current */
+    /* Somebody published the table again since: theirs is the newer write,
+     * and this generation is one their prune did not get to. */
+    if (strcmp(now, prev) != 0) return RAY_OK;
     /* shortcut: no .write.lock taken: recovery runs before this process
      * serves anyone; take it once another process may write the table then. */
     ray_err_t e = splay_publish_generation(root, gen, true);

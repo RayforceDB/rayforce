@@ -29234,8 +29234,12 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         uval[u] = v;
         err = update_value_check(slots[ucol[u]], v, k);
     }
-    for (int64_t u = 0; u < nu && !err; u++)
+    for (int64_t u = 0; u < nu && !err; u++) {
         err = update_scatter(slots, ucol[u], rows, k, uval[u]);
+        /* Columns before this one are written: memory changed and no record
+         * will say how.  The journal must not go on as if it followed. */
+        if (err && u > 0 && ray_journal_capture) ray_journal_mark_lost();
+    }
     /* The journal notes the rows as they now stand, not the table. */
     if (!err && idxv && ray_journal_capture) {
         ray_t* now = ray_at_fn(tbl, idxv);
@@ -36774,7 +36778,11 @@ ray_t* ray_delete(ray_t** args, int64_t n) {
     if (inplace) {
         ray_t** slots = (ray_t**)ray_data(live_cols);
         ray_t* cerr = delete_compact_cols(slots, ncols, nrows0, rows, k);
-        if (cerr) { scratch_free(rows_hdr); ray_release(tbl); return cerr; }
+        if (cerr) {
+            /* Some columns may be compacted already (see update, above). */
+            if (ray_journal_capture) ray_journal_mark_lost();
+            scratch_free(rows_hdr); ray_release(tbl); return cerr;
+        }
         ukey_patch_after_delete(tbl, rows, k, nrows0);
         /* The journal notes which rows went, not the table that is left. */
         if (ray_journal_capture) {

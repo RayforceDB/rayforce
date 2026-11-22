@@ -289,9 +289,9 @@ static size_t read_full(FILE* f, void* buf, size_t want) {
  *     [RAY_JREC_ROWS, name, [idx, rows]]  rows `idx` of the bound table now
  *                                    hold `rows` (an update with where:)
  *     [RAY_JREC_DROP, name, [idx]]   rows `idx` of it are gone (a delete)
- *     [RAY_JREC_PUBLISH, _, [root, gen]]  a splayed table written in a
- *                                    transaction: make `gen` its current
- *                                    generation, unless it already is
+ *     [RAY_JREC_PUBLISH, _, [root, gen, prev]]  a splayed table written in
+ *                                    a transaction: make `gen` its current
+ *                                    generation if `prev` still is
  *
  * Records are serialized as they are noted, so the buffer holds no reference
  * that would turn a later in-place write into a copy. */
@@ -376,7 +376,16 @@ static ray_err_t rec_push(int64_t op, int64_t name, ray_t* val) {
     return e;
 }
 
-int64_t ray_journal_mark(void) { return g_rec.len; }
+/* A long evaluation outside a transaction — a script, a loop — is many
+ * changes, each its own commit: write what has piled up before noting the
+ * next, so the pile never nears the size of one entry.  A transaction is
+ * one entry and waits for its commit. */
+#define RAY_JREC_FLUSH (16LL * 1024 * 1024)
+static void rec_room(void) {
+    if (g_rec.len >= RAY_JREC_FLUSH && !ray_tx_active) (void)ray_journal_commit();
+}
+
+int64_t ray_journal_mark(void) { rec_room(); return g_rec.len; }
 void    ray_journal_rewind(int64_t mark) { if (mark < g_rec.len) g_rec.len = mark; }
 
 ray_err_t ray_journal_note_set(int64_t name, ray_t* val) {
@@ -507,6 +516,7 @@ static ray_err_t mut_record(const jmut_t* m, int64_t name) {
 
 ray_t* ray_journal_mutator(ray_t* (*impl)(ray_t**, int64_t), ray_t** args, int64_t n) {
     if (!ray_journal_capture) return impl(args, n);
+    rec_room();
     jmut_t m = { .prev = g_mut, .target = -1, .rows0 = 0, .set_name = -1, .op = 0, .val = NULL,
                  .shape0 = 0, .resolved = false, .local = false };
     g_mut = &m;
@@ -634,7 +644,7 @@ ray_err_t ray_tx_begin(int64_t owner, int64_t idle_ms, int64_t total_ms) {
     g_tx.end_at = total_ms > 0 ? ray_time_now_ms() + total_ms : 0;
     g_tx.n = 0;
     g_tx.mark = ray_journal_mark();
-    g_tx.broken = g_tx.doomed = g_tx.acked = false;
+    g_tx.broken = g_tx.doomed = false;           /* acked is the doomed message's to keep */
     ray_tx_active = true;
     ray_splay_defer = true;                      /* table writes wait for the commit */
     ray_tx_heard();
@@ -705,9 +715,10 @@ ray_err_t ray_tx_commit(void) {
      * published even if the process dies before publishing them. */
     ray_err_t e = RAY_OK;
     for (int64_t i = 0; ray_journal_capture && i < ray_splay_pending_count() && e == RAY_OK; i++) {
-        const char* part[2] = { ray_splay_pending_root(i), ray_splay_pending_gen(i) };
-        ray_t* pair = ray_list_new(2);
-        for (int k = 0; k < 2 && pair && !RAY_IS_ERR(pair); k++) {
+        const char* part[3] = { ray_splay_pending_root(i), ray_splay_pending_gen(i),
+                                ray_splay_pending_prev(i) };
+        ray_t* pair = ray_list_new(3);
+        for (int k = 0; k < 3 && pair && !RAY_IS_ERR(pair); k++) {
             ray_t* str = ray_str(part[k], strlen(part[k]));
             ray_t* grown = str && !RAY_IS_ERR(str) ? ray_list_append(pair, str) : NULL;
             if (str && !RAY_IS_ERR(str)) ray_release(str);
@@ -735,6 +746,7 @@ ray_err_t ray_tx_commit(void) {
 }
 
 void ray_tx_doom(int64_t owner) {
+    g_tx.acked = false;
     if (ray_tx_begin(owner, 0, 0) == RAY_OK) g_tx.doomed = true;
 }
 
@@ -755,18 +767,22 @@ static ray_err_t rec_apply(ray_t* rec) {
     int64_t name = s->i64;
     switch (o->i64) {
     case RAY_JREC_PUBLISH: {
-        if (!v || v->type != RAY_LIST || v->len != 2) return RAY_ERR_DOMAIN;
+        if (!v || v->type != RAY_LIST || v->len != 3) return RAY_ERR_DOMAIN;
         ray_t* root = ray_list_get(v, 0);
         ray_t* gen  = ray_list_get(v, 1);
-        if (!root || root->type != -RAY_STR || !gen || gen->type != -RAY_STR) return RAY_ERR_DOMAIN;
-        char r[1024], g[256];
-        if (ray_str_len(root) >= sizeof(r) || ray_str_len(gen) >= sizeof(g)) return RAY_ERR_DOMAIN;
+        ray_t* prev = ray_list_get(v, 2);
+        if (!root || root->type != -RAY_STR || !gen || gen->type != -RAY_STR ||
+            !prev || prev->type != -RAY_STR) return RAY_ERR_DOMAIN;
+        char r[1024], g[256], pv[256];
+        if (ray_str_len(root) >= sizeof(r) || ray_str_len(gen) >= sizeof(g) ||
+            ray_str_len(prev) >= sizeof(pv)) return RAY_ERR_DOMAIN;
         memcpy(r, ray_str_ptr(root), ray_str_len(root)); r[ray_str_len(root)] = '\0';
         memcpy(g, ray_str_ptr(gen), ray_str_len(gen));   g[ray_str_len(gen)] = '\0';
+        memcpy(pv, ray_str_ptr(prev), ray_str_len(prev)); pv[ray_str_len(prev)] = '\0';
         /* A generation name is all this may put under the table. */
         if (strncmp(g, ".generations/g-", 15) != 0 || strchr(g + 13, '/') || strstr(g, ".."))
             return RAY_ERR_DOMAIN;
-        return ray_splay_publish(r, g);
+        return ray_splay_publish(r, g, pv);
     }
     case RAY_JREC_DEL:
         return ray_env_set(name, NULL);
@@ -955,8 +971,11 @@ static ray_err_t journal_replay_from(const char*           path,
         return RAY_ERR_IO;
     }
 
+    /* Recovery applies a log to memory that is about to follow it.  A replay
+     * asked for while a journal is open changes memory the open log has to
+     * follow too: there the changes are noted like any others. */
     bool prev_in_replay = g_journal.in_replay;
-    g_journal.in_replay = true;
+    if (!g_journal.fp) g_journal.in_replay = true;
     capture_sync();
 
     int64_t chunks = 0;

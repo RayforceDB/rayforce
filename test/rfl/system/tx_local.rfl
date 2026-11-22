@@ -34,6 +34,15 @@
 (run "(println n)\\n") -- 0
 (shows "2") -- 0
 
+;; ── a script that leaves with (exit): what it changed is committed ──
+;; ...and a transaction it was still inside is not.
+(run "(set z 9)\n(exit 0)\n") -- 0
+(run "(println z)\n") -- 0
+(shows "9") -- 0
+(run "(.tx.begin)\n(set z 10)\n(exit 0)\n") -- 0
+(run "(println z)\n") -- 0
+(shows "9") -- 0
+
 ;; ── what a rollback cannot undo is refused in a script's too ────────
 (run "(.tx.begin)\\n(set n 6)\\n(write \"/tmp/rftest_txl_w\" \"x\")\\n(.tx.commit)\\n") -- 1
 (.sys.exec "test ! -e /tmp/rftest_txl_w") -- 0

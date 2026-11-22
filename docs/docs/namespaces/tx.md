@@ -65,7 +65,7 @@ A transaction stops the server for everyone else, so one opened over a connectio
 `.tx.begin` outside a connection opens a transaction owned by the local console, under the same rules but **without time limits**: whoever is at the console answers for the wait.
 
 - **Terminal or piped REPL:** connections and timers wait until the transaction ends. Input that ends inside a transaction rolls it back.
-- **Script (`rayforce file.rfl`):** the script runs before anything else is served. A script that fails or ends inside a transaction rolls it back and exits non-zero.
+- **Script (`rayforce file.rfl`):** the script runs before anything else is served. A script that fails or ends inside a transaction rolls it back and exits non-zero; one that calls `(exit)` inside a transaction rolls it back too.
 - A timer callback or connection hook that returns with a transaction open has it rolled back.
 
 ## Tables on disk
@@ -88,6 +88,7 @@ Not refused, and not undone either: timers set, environment variables set, conne
 ## Costs
 
 - **The first write to a table in a transaction copies it.** The transaction keeps the old table for the rollback, so the write cannot be made in place. Later writes to the same table in the same transaction are in place again.
+- **A transaction is one journal entry**, at most 256 MB: a commit that would be larger fails with `io` and rolls back.
 - **Everyone waits.** Keep transactions short; a transaction that thinks between messages stops every other client for that long.
 - For the same reason the first `update` or `delete` of a table in a transaction logs the table it leaves, where outside a transaction it logs the rows it touched; `insert` and `upsert` log their rows either way (see [the journal](log.md)).
 

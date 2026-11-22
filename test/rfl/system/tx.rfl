@@ -89,6 +89,23 @@
 (.ipc.send h2 "n") -- 1
 (.ipc.close h2)
 
+;; the acknowledgement and a new begin in one message: the new transaction
+;; is a real one, and the connection is no longer answered as aborted
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(do (.tx.rollback) (.tx.begin))")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(.ipc.send h "n") -- 7
+(nil? (.ipc.send h "(.tx.rollback)")) -- true
+(.ipc.send h "n") -- 1
+(nil? (.ipc.send h "(.tx.begin)")) -- true
+(.ipc.send h "(no_such_function 1)") !- name
+(nil? (.ipc.send h "(do (.tx.rollback) (.tx.begin))")) -- true
+(.ipc.send h "(set n 7)") -- 7
+(nil? (.ipc.send h "(.tx.commit)")) -- true
+(.ipc.send h "n") -- 7
+(.ipc.send h "(set n 1)") -- 1
+
 ;; an async message has no reply to carry its error, and ends it all the same
 (nil? (.ipc.send h "(.tx.begin)")) -- true
 (.ipc.send h "(set n 7)") -- 7

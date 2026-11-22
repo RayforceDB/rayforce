@@ -46,6 +46,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include "store/fileio.h"
+#include "store/splay.h"
 #include "core/timer.h"
 
 static void wal_setup(void)    { ray_runtime_create(0, NULL); }
@@ -615,7 +616,19 @@ static test_result_t test_tx_crash_around_commit(void) {
         TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
         TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d1));
         TEST_ASSERT_TRUE(txd_evalf("(.db.splayed.set \"%s/\" t)", d2));
+        char g1[300], p1[300];                      /* what the commit logs for d1 */
+        snprintf(g1, sizeof(g1), "%s", ray_splay_pending_gen(0));
+        snprintf(p1, sizeof(p1), "%s", ray_splay_pending_prev(0));
         ray_tx_crash_for_test(logged);              /* the process dies here */
+        if (!logged) {
+            /* The generation it left is published only over the one it was
+             * written over: a table published again since keeps the newer. */
+            txd_current(d1, now1, sizeof(now1));
+            TEST_ASSERT_EQ_I(ray_splay_publish(d1, g1, ".generations/g-0-0-0"), RAY_OK);
+            txd_current(d1, now2, sizeof(now2));
+            TEST_ASSERT_STR_EQ(now2, now1);
+            TEST_ASSERT_TRUE(strlen(p1) > 0 && strstr(now1, p1) != NULL);
+        }
         TEST_ASSERT_FALSE(ray_tx_active);
         TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
         /* Either way nothing is published yet. */
@@ -934,6 +947,59 @@ static test_result_t test_wal_corrupt_size_is_not_a_torn_tail(void) {
     PASS();
 }
 
+/* A long evaluation is many commits, not one that has to fit an entry. */
+static test_result_t test_wal_long_statement_commits_as_it_goes(void) {
+    char base[256], path[300];
+    wal_base(base, sizeof(base), "long");
+    snprintf(path, sizeof(path), "%s.log", base);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(do (set a (til 3000000)) (set b (til 3000000)) (set c (til 3000000)) (set d 1))"));
+    int64_t chunks = 0, bytes = 0;
+    TEST_ASSERT_EQ_I(ray_journal_validate(path, &chunks, &bytes), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(base), RAY_OK);
+    bool back = wal_run("(if (== 9000001 (+ (+ d (count a)) (+ (count b) (count c)))) 1 (no_such_function))");
+    wal_cleanup(base);
+    TEST_ASSERT_TRUE(chunks >= 2);
+    TEST_ASSERT_TRUE(back);
+    PASS();
+}
+
+/* (.log.replay file) on a server with a journal open: what it changes is
+ * logged like any other change, or the open log would not hold the names
+ * later entries amend. */
+static test_result_t test_wal_replay_into_an_open_journal(void) {
+    char a[256], b[256], src[400];
+    wal_base(a, sizeof(a), "rpa");
+    wal_base(b, sizeof(b), "rpb");
+    TEST_ASSERT_EQ_I(ray_journal_open(a, RAY_JOURNAL_ASYNC), RAY_OK);
+    TEST_ASSERT_TRUE(wal_run("(set t " T3 ")"));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 4 40 'd))"));
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_open(b, RAY_JOURNAL_ASYNC), RAY_OK);
+    snprintf(src, sizeof(src), "(.log.replay \"%s.log\")", a);
+    TEST_ASSERT_TRUE(wal_run(src));
+    TEST_ASSERT_TRUE(wal_run("(insert 't (list 5 50 'e))"));       /* amends what the replay bound */
+    int64_t nwant = 0, ngot = 0;
+    uint8_t* want = wal_probe("t", &nwant);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    wal_teardown();
+    wal_setup();
+    TEST_ASSERT_EQ_I(ray_journal_recover(b), RAY_OK);
+    uint8_t* got = wal_probe("t", &ngot);
+    bool same = want && got && ngot == nwant && memcmp(got, want, (size_t)nwant) == 0;
+    if (want) ray_sys_free(want);
+    if (got) ray_sys_free(got);
+    wal_cleanup(a);
+    wal_cleanup(b);
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+
 /* A statement that changes nothing writes nothing. */
 static test_result_t test_wal_read_writes_no_frame(void) {
     char base[256];
@@ -1087,6 +1153,8 @@ const test_entry_t wal_entries[] = {
     { "wal/trust_mark_logged",      test_wal_trust_mark_is_logged,   wal_setup, wal_teardown },
     { "wal/unappliable_is_fatal",   test_wal_unappliable_record_is_fatal, wal_setup, wal_teardown },
     { "wal/corrupt_size_not_torn",  test_wal_corrupt_size_is_not_a_torn_tail, wal_setup, wal_teardown },
+    { "wal/long_statement_commits", test_wal_long_statement_commits_as_it_goes, wal_setup, wal_teardown },
+    { "wal/replay_into_open_journal", test_wal_replay_into_an_open_journal, wal_setup, wal_teardown },
     { "wal/read_writes_no_frame",   test_wal_read_writes_no_frame,   wal_setup, wal_teardown },
     { "wal/failed_statement",       test_wal_failed_statement_logs_what_it_changed, wal_setup, wal_teardown },
     { "wal/unloggable_refused",     test_wal_unloggable_value_is_refused, wal_setup, wal_teardown },

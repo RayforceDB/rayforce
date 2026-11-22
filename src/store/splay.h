@@ -91,14 +91,17 @@ extern bool ray_splay_defer;
 int64_t     ray_splay_pending_count(void);
 const char* ray_splay_pending_root(int64_t i);
 const char* ray_splay_pending_gen(int64_t i);
+const char* ray_splay_pending_prev(int64_t i);
 ray_err_t   ray_splay_pending_end(bool publish);
 #ifdef DEBUG
 void        ray_splay_pending_abandon(void);   /* tests: as a dead process leaves them */
 #endif
 /* Make `gen` (as ray_splay_pending_gen named it) the current generation of
- * the table at `root`, if it is still there and not current already: what
- * recovery does for a commit whose publication a crash cut short. */
-ray_err_t   ray_splay_publish(const char* root, const char* gen);
+ * the table at `root`, if it is still there and `prev` (as
+ * ray_splay_pending_prev named it) is still the current one: what recovery
+ * does for a commit whose publication a crash cut short.  A table published
+ * again since is left alone. */
+ray_err_t   ray_splay_publish(const char* root, const char* gen, const char* prev);
 
 /* Splayed table I/O.
  *

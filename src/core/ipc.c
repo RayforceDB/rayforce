@@ -393,6 +393,7 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
         fprintf(stderr, "tx: a connection hook left a transaction open; rolled back (handle=%lld)\n",
                 (long long)handle);
     }
+    (void)ray_journal_commit();   /* a hook is a commit */
     if (r && RAY_IS_ERR(r)) {
         const char* name = (idx == IPC_HOOK_OPEN) ? ".ipc.on.open" : ".ipc.on.close";
         fprintf(stderr, "ipc: %s hook raised an error (handle=%lld)\n",

@@ -18,7 +18,7 @@ Consequences worth knowing:
 
 - **Recovery is deterministic.** `rand`, the clock and anything else a command consulted were settled when the change was made; recovery reproduces the values, not the computation.
 - **A change costs its rows.** `insert` and `upsert` write the rows they were given; an `update` with `where:` and a `delete` write the rows they touched. The whole table is written only when the mutator could not work in place and rebuilt it: an `update` without `where:` or with `by:`, one that adds a column, any `alter`, a table that something else also holds, or the first write to a table inside a [transaction](tx.md).
-- **An entry cannot exceed 256 MB.** A change larger than that is refused.
+- **An entry cannot exceed 256 MB.** A single change larger than that is refused with `limit`. Outside a transaction a long evaluation — a script, a loop — is written as it goes, in several entries, so only one change has to fit. A [transaction](tx.md) is one entry: everything it changes has to fit together.
 - **A value that cannot be serialised cannot be bound while a journal is open** (a graph or index handle, for example): `set` fails with `domain` and the name stays as it was.
 - **Only globals come back.** A timer, a listener, an open handle or a file written by a request is not re-created by recovery.
 - **A failed statement keeps what it changed.** Outside a transaction each change stands on its own, as each statement does under autocommit in SQL: the changes a statement made before it failed are in memory, so they are in the log too. Use a [transaction](tx.md) for all-or-nothing.
@@ -123,7 +123,7 @@ Signature: `(.log.replay "path")`. Reads each entry in the file and applies its 
 
 A record that does not apply (an append to a name that is not bound, for example) stops the replay with `apply`: the entries before it are applied, nothing after it is. The log recorded a change made on a state that memory is no longer in, so going on would build on the difference. Recovery at startup treats it the same way and does not start. Neither verb rolls back an already-applied prefix.
 
-Unlike recovery at startup, the verb does not drop an entry cut short at the end of the file: it reports it.
+Unlike recovery at startup, the verb does not drop an entry cut short at the end of the file: it reports it. Called while a journal is open, what it changes is logged there like any other change.
 
 | Error code | Meaning | Action |
 |---|---|---|
