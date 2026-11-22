@@ -1219,6 +1219,13 @@ static volatile sig_atomic_t g_ipc_active_seq = CANCEL_ANY;
  * request's socket, so the reply can confirm it. */
 static volatile sig_atomic_t g_ipc_oob_taken = 0;
 
+void ray_ipc_cancel_state_reset_for_test(void)
+{
+    g_ipc_active_fd  = -1;
+    g_ipc_active_seq = CANCEL_ANY;
+    g_ipc_oob_taken  = 0;
+}
+
 /* Whether a pending cancel byte on `fd` is for the request `want` names,
  * taking it when it is and dropping it when it names another request.
  * A numbered byte taken either way sets *taken.  Async-signal-safe. */
