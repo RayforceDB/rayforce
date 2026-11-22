@@ -1868,40 +1868,39 @@ static inline bool i64_inexact(int64_t v) {
     return v != NULL_I64 && (v > (INT64_C(1) << 53) || v < -(INT64_C(1) << 53));
 }
 
-/* x (a dict or table cell, or something inside one) holds an I64 past
- * ±2^53: atom_eq compares dict values and table columns element by element,
- * so they meet floats through double as atoms do. */
-static bool key_has_inexact(ray_t* x) {
-    if (!x || RAY_IS_ERR(x)) return false;
-    if (x->type == -RAY_I64) return i64_inexact(x->i64);
-    if (x->type == RAY_I64) {
-        const int64_t* d = ray_data(x);
-        for (int64_t i = 0; i < x->len; i++) if (i64_inexact(d[i])) return true;
-        return false;
-    }
+/* The RAY_KEY_BIG_I64 / RAY_KEY_FLOAT atoms inside x (a dict or table
+ * cell, or something inside one): atom_eq compares dict values and table
+ * columns element by element, so their atoms meet as top-level atoms do.
+ * Typed vectors compare by type and bytes, so only atoms count. */
+static uint8_t key_inexact_bits(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return 0;
+    if (x->type == -RAY_I64) return i64_inexact(x->i64) ? RAY_KEY_BIG_I64 : 0;
+    if (x->type == -RAY_F64 || x->type == -RAY_F32) return RAY_KEY_FLOAT;
+    uint8_t bits = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len; i++) if (key_has_inexact(cells[i])) return true;
-        return false;
-    }
-    if (x->type == RAY_DICT) return key_has_inexact(ray_dict_keys(x)) || key_has_inexact(ray_dict_vals(x));
-    if (x->type == RAY_TABLE) {
+        for (int64_t i = 0; i < x->len && bits != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT); i++)
+            bits |= key_inexact_bits(cells[i]);
+    } else if (x->type == RAY_DICT) {
+        bits = key_inexact_bits(ray_dict_keys(x)) | key_inexact_bits(ray_dict_vals(x));
+    } else if (x->type == RAY_TABLE) {
         for (int64_t c = 0; c < ray_table_ncols(x); c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            if (key_has_inexact(col)) return true;
+            bits |= key_inexact_bits(col);
         }
     }
-    return false;
+    return bits;
 }
 
 /* `seen`, when given, is set when x holds a TIMESPAN (ray_key_spans != 0)
  * found as the hash walks it, so a caller hashing with spans 0 learns
  * that it should not have, without a second pass.  `inexact`, when given,
- * is set when x holds an I64 past ±2^53 that atom_eq may compare with a
- * float (#1330): the hash is right as it is, but equality is not
- * transitive, so only a scan in row order gives `group`'s answer. */
-static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, bool* inexact) {
+ * gathers RAY_KEY_BIG_I64 (an I64 past ±2^53) and RAY_KEY_FLOAT (an F64 or
+ * F32 atom).  A caller that sees both over its keys knows atom_eq is not
+ * transitive there (#1330): the hash is right as it is, but only a scan in
+ * row order gives `group`'s answer. */
+static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
     if (!x) return 0;
     if (RAY_ATOM_IS_NULL(x)) {
@@ -1912,8 +1911,12 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         /* Past 2^53 an I64 and an F64 compare through double, so atom_eq is
          * not transitive there (2^53+1 = 2^53.0 = 2^53, but 2^53+1 != 2^53):
          * only the row-order scan gives `group`'s answer, so report it
-         * through `inexact` (#1330). */
-        if (inexact && x->type == -RAY_I64 && i64_inexact(x->i64)) *inexact = true;
+         * through `inexact`, which records a large I64 and a float apart:
+         * only the two together break transitivity (#1330). */
+        if (inexact) {
+            if (x->type == -RAY_I64) { if (i64_inexact(x->i64)) *inexact |= RAY_KEY_BIG_I64; }
+            else if (x->type == -RAY_F64 || x->type == -RAY_F32) *inexact |= RAY_KEY_FLOAT;
+        }
         return ray_hash_f64(durations ? round(as_f64(x)) : as_f64(x));
     }
     switch (x->type) {
@@ -1946,7 +1949,7 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
     case RAY_TABLE:
     case RAY_DICT:
         if (seen && !spans && ray_key_spans(x)) *seen = true;
-        if (inexact && !*inexact && key_has_inexact(x)) *inexact = true;
+        if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
         return spans ? 0 : ray_atom_hash(x);
     }
     if (seen && ray_has_timespan(x)) *seen = true;
@@ -1993,9 +1996,9 @@ uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NUL
 
 /* ray_key_hash for a pool worker: runtime-domain symbols read from the
  * borrowed `view`, not through ray_sym_str's lock.  Same text, same hash.
- * `seen` (may be NULL) is set when x holds a TIMESPAN, `inexact` (may be
- * NULL) when it holds an I64 past ±2^53. */
-uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, bool* inexact) {
+ * `seen` (may be NULL) is set when x holds a TIMESPAN; `inexact` (may be
+ * NULL) gathers the RAY_KEY_BIG_I64 / RAY_KEY_FLOAT atoms x holds. */
+uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
     return key_hash(x, spans, view, seen, inexact);
 }
 

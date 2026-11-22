@@ -13532,7 +13532,7 @@ static int agg_list_spans(ray_t* const* cells, const int64_t* rows, int64_t n) {
     return spans ? spans : RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
 }
 static inline uint64_t agg_key_hash_at(ray_t* col, const void* data, int64_t r, int spans,
-                                       const ray_group_sym_view_t* view, bool* seen, bool* inexact) {
+                                       const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
     if (col->type == RAY_LIST) return ray_key_hash_view(((ray_t* const*)data)[r], spans, view, seen, inexact);
     if (col->type == RAY_F32 || col->type == RAY_F64) return ray_hash_i64((int64_t)agg_float_key(col, data, r));
     if (col->type == RAY_GUID) return ray_hash_bytes((const char*)data + (size_t)r * 16, 16);
@@ -13662,8 +13662,9 @@ typedef struct {
     int64_t* offsets;
     agg_groups_t* out;
     ray_group_sym_view_t symbols;
-    _Atomic(bool) spanned;   /* a LIST key cell holds a TIMESPAN, or an I64 past
-                              * ±2^53 (#1330): group serially */
+    _Atomic(bool) spanned;   /* a LIST key cell holds a TIMESPAN: group serially */
+    _Atomic(uint8_t) inexact; /* RAY_KEY_BIG_I64 | RAY_KEY_FLOAT seen in LIST
+                               * keys; both: group serially (#1330) */
 } agg_key_build_t;
 
 /* Coarse aligned ranges avoid concurrent first writes to common 2 MiB
@@ -13693,6 +13694,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
 #define KEY_DIRECTORY_INSERT(TYPE, EMPTY) do { \
         _Atomic TYPE* first_slots = c->first; \
         bool spanned = false; \
+        uint8_t inexact = 0; \
         for (int64_t r = start; r < end; r++) { \
             uint64_t slot = 0; \
             if (c->dense) { \
@@ -13702,7 +13704,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
             } else { \
                 uint64_t hash = UINT64_C(1469598103934665603); \
                 for (uint32_t k = 0; k < c->nkeys; k++) { \
-                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, 0, &c->symbols, &spanned, &spanned); \
+                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, 0, &c->symbols, &spanned, &inexact); \
                     hash *= UINT64_C(1099511628211); \
                 } \
                 slot = hash & (c->capacity - 1); \
@@ -13722,6 +13724,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
             } \
         } \
         if (spanned) atomic_store_explicit(&c->spanned, true, memory_order_relaxed); \
+        if (inexact) atomic_fetch_or_explicit(&c->inexact, inexact, memory_order_relaxed); \
     } while (0)
     if (c->narrow) KEY_DIRECTORY_INSERT(int32_t, INT32_MAX);
     else KEY_DIRECTORY_INSERT(int64_t, INT64_MAX);
@@ -13810,7 +13813,8 @@ static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
     ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
-    if (atomic_load(&c.spanned)) { rc = AGG_KEYS_SERIAL; goto done; }
+    if (atomic_load(&c.spanned) ||
+        atomic_load(&c.inexact) == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) { rc = AGG_KEYS_SERIAL; goto done; }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
     if (agg_cancelled()) goto done;

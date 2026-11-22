@@ -5,7 +5,7 @@
 ;; workers: the parallel directory (4 workers and up) used to vary from run
 ;; to run.  The harness runs at 2 workers, so test/data/group_past_2p53.rf
 ;; repeats every case under -c 8 and prints "ok" or the first that failed:
-;; flat, negative, nested, dict and table cells, the exact 2^53 boundary, and a time
+;; flat, negative, nested, dict and table cells, large integers with no float, the exact 2^53 boundary, and a time
 ;; bound against hashing every float alike.
 (.sys.exec "o=$(env -u RAYFORCE_CORES ./rayforce -c 8 -f test/data/group_past_2p53.rf 2>&1 | tail -1); [ \"$o\" = ok ] || { echo \"$o\" >&2; exit 1; }") -- 0
 

@@ -23,6 +23,11 @@
 ;; ±2^53 itself converts exactly: 2^53 = 2^53.0, a single group
 (set E (concat (list [7 7]) (cyc (list 9007199254740992 9007199254740992.0 9007199254740992))))
 (same8 "boundary" (fn [] (map count (value (group E)))) [1 89999])
+;; large integers with no float compare exactly: grouped as values, and
+;; they keep the parallel route (the time bound catches a serial fall back
+;; only loosely; the answer is the point)
+(set G (concat (list [7 7]) (cyc (list 9007199254740993 9007199254740992 9007199254740993))))
+(same8 "no float" (fn [] (map count (value (group G)))) [1 59999 30000])
 ;; one large integer among distinct floats stays linear (the declined route
 ;; must not hash every float alike): 40k rows well under a second
 (set F (concat (list [7 7] 9007199254740993) (as 'LIST (/ (til 40000) 40000.0))))
