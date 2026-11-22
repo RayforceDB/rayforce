@@ -1,0 +1,102 @@
+;; @also-unfused
+;; A select sorted by one of its own outputs that is not a source column
+;; (#1338): `{r: (+ i 1) from: T asc: r}` raised `nyi` because the sort key
+;; was resolved as a source column.  It sorts by the output's values, the
+;; same rows in the same order (ties stable) as sorting the select's result
+;; afterwards with xasc / xdesc.  A source column of the key's name still
+;; wins (see sort_key_not_projected.rfl).
+(set n 40)
+(set I (til n))
+(set nz (fn [v z] (at (concat v (enlist z)) (+ I (* (- n I) (as 'I64 (== 0 (% I 9))))))))
+(set T (table [i h f e d t s str k] (list (nz (% (* I 7) 11) 0Nl) (as 'I32 (% (* I 5) 6)) (nz (* 0.5 (% (* I 5) 7)) 0Nf) (as 'F32 (% (* I 3) 5)) (nz (+ 2024.01.01 (% (* I 3) 8)) 0Nd) (as 'TIMESTAMP (* 1000 (% (* I 3) 7))) (at ['c 'a 'b 'd] (% (* I 3) 4)) (at ["x" "" "ab" "b" "a"] (% I 5)) (% I 4))))
+
+;; the issue's query
+(set T3 (table [i] (list [3 1 2])))
+(select {r: (+ i 1) from: T3 asc: r}) -- (table [r] (list [2 3 4]))
+(select {r: (+ i 1) from: T3 desc: r}) -- (table [r] (list [4 3 2]))
+
+;; a computed integer output (nulls in the key, ties), either direction
+(select {r: (+ i 1) from: T asc: r}) -- (xasc (select {r: (+ i 1) from: T}) 'r)
+(select {r: (+ i 1) from: T desc: r}) -- (xdesc (select {r: (+ i 1) from: T}) 'r)
+(select {r: (- 0 i) k: k from: T asc: r}) -- (xasc (select {r: (- 0 i) k: k from: T}) 'r)
+(select {k: k r: (% i 3) from: T desc: r}) -- (xdesc (select {k: k r: (% i 3) from: T}) 'r)
+(select {r: (* h 2) k: k from: T asc: r}) -- (xasc (select {r: (* h 2) k: k from: T}) 'r)
+;; a renamed source column, the output after other outputs
+(select {k: k r: i from: T asc: r}) -- (xasc (select {k: k r: i from: T}) 'r)
+(select {k: k r: i from: T desc: r}) -- (xdesc (select {k: k r: i from: T}) 'r)
+;; floats
+(select {r: (* f 2.0) k: k from: T asc: r}) -- (xasc (select {r: (* f 2.0) k: k from: T}) 'r)
+(select {r: (* f 2.0) k: k from: T desc: r}) -- (xdesc (select {r: (* f 2.0) k: k from: T}) 'r)
+(select {r: (+ e 1.0) k: k from: T desc: r}) -- (xdesc (select {r: (+ e 1.0) k: k from: T}) 'r)
+;; temporal
+(select {r: (+ d 1) k: k from: T asc: r}) -- (xasc (select {r: (+ d 1) k: k from: T}) 'r)
+(select {r: d k: k from: T desc: r}) -- (xdesc (select {r: d k: k from: T}) 'r)
+(select {r: (+ t 1) k: k from: T desc: r}) -- (xdesc (select {r: (+ t 1) k: k from: T}) 'r)
+(select {r: t k: k from: T asc: r}) -- (xasc (select {r: t k: k from: T}) 'r)
+;; SYM and STR
+(select {r: s k: k from: T asc: r}) -- (xasc (select {r: s k: k from: T}) 'r)
+(select {r: s k: k from: T desc: r}) -- (xdesc (select {r: s k: k from: T}) 'r)
+(select {r: str k: k from: T asc: r}) -- (xasc (select {r: str k: k from: T}) 'r)
+(select {r: str k: k from: T desc: r}) -- (xdesc (select {r: str k: k from: T}) 'r)
+
+;; several keys, stored and computed mixed, either order and direction
+(select {r: (% i 3) i: i from: T asc: [r i]}) -- (xasc (select {r: (% i 3) i: i from: T}) ['r 'i])
+(select {r: (% i 3) from: T asc: [k r]}) -- (select {r: r from: (xasc (select {r: (% i 3) k: k from: T}) ['k 'r])})
+(select {r: (% i 3) i: i from: T desc: r asc: i}) -- (xdesc (xasc (select {r: (% i 3) i: i from: T}) 'i) 'r)
+(select {r: (% i 3) q: (* f 2.0) from: T asc: r desc: q}) -- (xasc (xdesc (select {r: (% i 3) q: (* f 2.0) from: T}) 'q) 'r)
+
+;; take: atom, from the end, a range, more than the rows
+(select {r: (+ i 1) k: k from: T asc: r take: 7}) -- (take (xasc (select {r: (+ i 1) k: k from: T}) 'r) 7)
+(select {r: (+ i 1) k: k from: T desc: r take: 7}) -- (take (xdesc (select {r: (+ i 1) k: k from: T}) 'r) 7)
+(select {r: (* f 2.0) k: k from: T desc: r take: 3}) -- (take (xdesc (select {r: (* f 2.0) k: k from: T}) 'r) 3)
+(select {r: (+ i 1) k: k from: T asc: r take: -5}) -- (take (xasc (select {r: (+ i 1) k: k from: T}) 'r) -5)
+(select {r: (+ i 1) k: k from: T asc: r take: [3 4]}) -- (take (xasc (select {r: (+ i 1) k: k from: T}) 'r) [3 4])
+(select {r: (+ i 1) from: T asc: r take: 100}) -- (xasc (select {r: (+ i 1) from: T}) 'r)
+(select {r: (% i 3) i: i from: T desc: r asc: i take: 6}) -- (take (xdesc (xasc (select {r: (% i 3) i: i from: T}) 'i) 'r) 6)
+
+;; where:, with and without take
+(select {r: (+ i 1) k: k from: T where: (> h 1) asc: r}) -- (xasc (select {r: (+ i 1) k: k from: T where: (> h 1)}) 'r)
+(select {r: (+ i 1) k: k from: T where: (> h 1) desc: r take: 4}) -- (take (xdesc (select {r: (+ i 1) k: k from: T where: (> h 1)}) 'r) 4)
+(select {r: s k: k from: T where: (in s ['a 'b]) desc: r take: 5}) -- (take (xdesc (select {r: s k: k from: T where: (in s ['a 'b])}) 'r) 5)
+
+;; by: a computed output, an aggregate, a renamed aggregate input
+(select {u: (sum i) from: T by: k desc: u}) -- (xdesc (select {u: (sum i) from: T by: k}) 'u)
+(select {u: (sum i) m: (max f) from: T by: k asc: m}) -- (xasc (select {u: (sum i) m: (max f) from: T by: k}) 'm)
+(select {c: (count i) from: T by: s desc: c take: 2}) -- (take (xdesc (select {c: (count i) from: T by: s}) 'c) 2)
+(select {r: (first (+ i 1)) from: T by: k asc: r}) -- (xasc (select {r: (first (+ i 1)) from: T by: k}) 'r)
+
+;; an all-aggregate select (one row)
+(select {u: (sum i) from: T asc: u}) -- (select {u: (sum i) from: T})
+(select {u: (sum i) c: (count h) from: T desc: [c u] take: 1}) -- (select {u: (sum i) c: (count h) from: T})
+
+;; a larger table: the parallel sort and the top-k selection
+(set N 20000)
+(set J (til N))
+(set B (table [a g] (list (% (* J 7919) 1009) (% J 13))))
+(select {r: (* a 3) g: g from: B asc: r}) -- (xasc (select {r: (* a 3) g: g from: B}) 'r)
+(select {r: (* a 3) g: g from: B desc: r}) -- (xdesc (select {r: (* a 3) g: g from: B}) 'r)
+(select {r: (* a 3) g: g from: B asc: r take: 50}) -- (take (xasc (select {r: (* a 3) g: g from: B}) 'r) 50)
+(select {r: (* a 3) g: g from: B desc: r take: 50}) -- (take (xdesc (select {r: (* a 3) g: g from: B}) 'r) 50)
+(select {r: (% a 5) g: g from: B asc: [r g] take: 30}) -- (take (xasc (select {r: (% a 5) g: g from: B}) ['r 'g]) 30)
+(select {r: (* a 3) g: g from: B where: (== g 4) desc: r take: 20}) -- (take (xdesc (select {r: (* a 3) g: g from: B where: (== g 4)}) 'r) 20)
+
+;; a parted table
+(.sys.exec "rm -rf rf_test_sortcomp") -- 0
+(.db.splayed.set "rf_test_sortcomp/2024.01.01/t/" (take T 25) "rf_test_sortcomp/.sym")
+(.db.splayed.set "rf_test_sortcomp/2024.01.02/t/" (drop T 25) "rf_test_sortcomp/.sym")
+(set P (.db.parted.get "rf_test_sortcomp/" 't))
+(select {r: (+ i 1) k: k from: P asc: r}) -- (xasc (select {r: (+ i 1) k: k from: P}) 'r)
+(select {r: (* f 2.0) k: k from: P desc: r take: 5}) -- (take (xdesc (select {r: (* f 2.0) k: k from: P}) 'r) 5)
+(select {r: s k: k from: P asc: [r k]}) -- (xasc (select {r: s k: k from: P}) ['r 'k])
+(select {r: (+ i 1) k: k from: P where: (== date 2024.01.02) desc: r}) -- (xdesc (select {r: (+ i 1) k: k from: P where: (== date 2024.01.02)}) 'r)
+(select {u: (sum i) from: P by: k desc: u}) -- (xdesc (select {u: (sum i) from: P by: k}) 'u)
+;; drop the handle first: a held parted table keeps the sym file's domain,
+;; and the unfused pass writes the fixture again
+(set P 0)
+(.sys.exec "rm -rf rf_test_sortcomp") -- 0
+
+;; a source column of the key's name still wins over an output (pinned by
+;; sort_key_not_projected.rfl): sorted by the source b, not the output b
+(set HB (table [a b] (list [3 1 2] [0 2 1])))
+(at (select {b: (+ a 1) from: HB asc: b}) 'b) -- [4 3 2]
+(at (select {b: a from: HB asc: b}) 'b) -- [3 2 1]

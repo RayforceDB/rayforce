@@ -1794,22 +1794,53 @@ static ray_op_t* sel_alias_lookup(ray_graph_t* g, int64_t sym) {
     return NULL;
 }
 
+/* Position of the output named `sym` among a select's outputs, or -1. */
+static int64_t select_output_pos(ray_t** dict_elems, int64_t dict_n, int64_t sym) {
+    int64_t from_id    = ray_sym_intern("from",    4);
+    int64_t where_id   = ray_sym_intern("where",   5);
+    int64_t by_id      = ray_sym_intern("by",      2);
+    int64_t take_id    = ray_sym_intern("take",    4);
+    int64_t asc_id     = ray_sym_intern("asc",     3);
+    int64_t desc_id    = ray_sym_intern("desc",    4);
+    int64_t nearest_id = ray_sym_intern("nearest", 7);
+    int64_t n = 0;
+    for (int64_t i = 0; i + 1 < dict_n; i += 2) {
+        int64_t kid = dict_elems[i]->i64;
+        if (kid == from_id || kid == where_id || kid == by_id ||
+            kid == take_id || kid == asc_id || kid == desc_id ||
+            kid == nearest_id) continue;
+        if (kid == sym) return n;
+        n++;
+    }
+    return -1;
+}
+
 /* The op a sort key binds to.  When the sort runs over a projection
  * (`root` is its SELECT), the key is the projected column that scans the
  * source column — an output, or the hidden key appended for it — so the
  * sort reads it by POSITION and no name lookup over the projected table
  * (scans named by source, expressions `_e<c>`) can pick another column.
- * Otherwise a fresh scan resolved by name, as before. */
-static ray_op_t* select_sort_key_op(ray_graph_t* g, ray_op_t* root, int64_t sym, const char* name) {
+ * A key that names no source column but an output (`{r: (+ i 1) ...
+ * asc: r}`) binds to that output's op, which exec_sort also reads by
+ * position; a source column of the key's name still wins.  Otherwise a
+ * fresh scan resolved by name, as before. */
+static ray_op_t* select_sort_key_op(ray_graph_t* g, ray_op_t* root, ray_t* tbl,
+                                    ray_t** dict_elems, int64_t dict_n,
+                                    int64_t sym, const char* name) {
     if (root && root->opcode == OP_SELECT) {
         ray_op_ext_t* se = find_ext(g, root->id);
-        if (se && se->base.opcode == OP_SELECT)
+        if (se && se->base.opcode == OP_SELECT) {
             for (uint32_t c = 0; c < se->sort.n_cols; c++) {
                 ray_op_t* col = &g->nodes[se->sort.columns[c]];
                 if (col->opcode != OP_SCAN) continue;
                 ray_op_ext_t* ce = find_ext(g, col->id);
                 if (ce && ce->base.opcode == OP_SCAN && ce->sym == sym) return col;
             }
+            /* the c-th output is the c-th projected column (hidden keys
+             * follow the outputs) */
+            int64_t c = tbl_has_col(tbl, sym) ? -1 : select_output_pos(dict_elems, dict_n, sym);
+            if (c >= 0 && c < (int64_t)se->sort.n_cols) return &g->nodes[se->sort.columns[c]];
+        }
     }
     return ray_scan(g, name);
 }
@@ -26254,9 +26285,11 @@ by_dict_done:
              * alias-blind).  A key some output scans bare is read from that
              * output (the sort binds to the projected column by position,
              * see exec_sort); a key no output scans is projected too, after
-             * the outputs, and dropped from the result afterwards.  Output
-             * aliases are not consulted: `{b: a ... asc: b}` sorts by the
-             * source column b, not by the output that renames a. */
+             * the outputs, and dropped from the result afterwards.  A
+             * source column wins over an output alias: `{b: a ... asc: b}`
+             * sorts by the source column b, not by the output that renames
+             * a.  Only a key that names no source column reads the output
+             * of its name (select_sort_key_op; nothing is added here). */
             if (!use_eval_fallback && has_sort) {
                 for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                     int64_t kid = dict_elems[i]->i64;
@@ -26606,6 +26639,10 @@ by_dict_done:
         if (!sort_keys) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL); }
         uint8_t* sort_descs = (uint8_t*)(sort_keys + n_sort_max);
         int64_t n_sort = 0;
+        /* An all-aggregate select is one row: a key naming one of its
+         * outputs (and no source column) leaves it as it is. */
+        ray_op_ext_t* root_ge = root && root->opcode == OP_GROUP ? find_ext(g, root->id) : NULL;
+        bool one_row_agg = root_ge && root_ge->base.opcode == OP_GROUP && root_ge->n_keys == 0;
         for (int64_t i = 0; i + 1 < dict_n; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             uint8_t is_desc = 0;
@@ -26615,15 +26652,20 @@ by_dict_done:
             ray_t* val = dict_elems[i + 1];
             if (val->type == -RAY_SYM) {
                 /* Single column name */
+                if (one_row_agg && !tbl_has_col(tbl, val->i64) &&
+                    select_output_pos(dict_elems, dict_n, val->i64) >= 0) continue;
                 ray_t* s = ray_sym_str(val->i64);
-                sort_keys[n_sort] = select_sort_key_op(g, root, val->i64, ray_str_ptr(s));
+                sort_keys[n_sort] = select_sort_key_op(g, root, tbl, dict_elems, dict_n, val->i64, ray_str_ptr(s));
                 sort_descs[n_sort] = is_desc;
                 n_sort++;
             } else if (ray_is_vec(val) && val->type == RAY_SYM) {
                 /* Multiple column names — cell-data via the vec's domain */
                 for (int64_t c = 0; c < val->len; c++) {
+                    int64_t ks = sym_cell_runtime_id(val, c);
+                    if (one_row_agg && !tbl_has_col(tbl, ks) &&
+                        select_output_pos(dict_elems, dict_n, ks) >= 0) continue;
                     ray_t* s = ray_sym_vec_cell(val, c);
-                    sort_keys[n_sort] = select_sort_key_op(g, root, sym_cell_runtime_id(val, c), ray_str_ptr(s));
+                    sort_keys[n_sort] = select_sort_key_op(g, root, tbl, dict_elems, dict_n, ks, ray_str_ptr(s));
                     sort_descs[n_sort] = is_desc;
                     n_sort++;
                 }
