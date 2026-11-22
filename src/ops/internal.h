@@ -78,6 +78,9 @@ static inline ray_t* ray_group_sym_read(const ray_group_sym_view_t* view, struct
         return id >= 0 && (uint64_t)id < view->count ? view->strings[id] : NULL;
     return ray_sym_domain_str(domain, id);
 }
+/* ray_key_hash (collection.c) reading runtime symbols from `view`; sets
+ * *seen (when given) if x holds a TIMESPAN. */
+uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen);
 
 
 #include <stdio.h>

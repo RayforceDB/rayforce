@@ -1,0 +1,87 @@
+;; #1320: a grouped count of distinct LIST cells is each group's
+;; (count (distinct <its cells in row order>)), the ungrouped answer over
+;; the same rows, and grouping BY a LIST column groups as `group` does.
+;; atom_eq is not transitive (a TIMESPAN vector equals an I64 and an I32
+;; vector that differ), so the answers depend on row order: every rule
+;; runs in several orders, grouped against ungrouped, flat and parted,
+;; with and without where:.
+(.sys.exec "rm -rf /tmp/rfl_cd_list_cells_1320") -- 0
+(.db.splayed.set "/tmp/rfl_cd_list_cells_1320/s/t/" (table [s] (list [a b c])) "/tmp/rfl_cd_list_cells_1320/s/sym")
+(set N (at (.db.splayed.get "/tmp/rfl_cd_list_cells_1320/s/t/" "/tmp/rfl_cd_list_cells_1320/s/sym") 's))
+(set TS (as 'TIMESPAN [1 2]))
+(set I32 (as 'I32 [1 2]))
+(set I64 [1 2])
+(set S1 (as 'TIMESPAN 1000000000))
+(set D1 2024.01.01D00:00:01.000000000)
+(set D2 2024.01.02D00:00:01.000000000)
+(set L1 ["a-long-string-000001" "b-long-string-000002"])
+(set L2 (drop (concat ["zzzzzzzzzzzzzzzzzzzzzz"] L1) 1))
+;; one group per case, cells in row order
+(set CS (list (list TS I64 I32) (list I64 TS I32) (list I64 I32 TS) (list I32 I64 TS) (list I32 TS I64) (list TS I32 I64) (list 1 (as 'I32 1) 1.0 (as 'TIMESPAN 1) 2) (list 1.5 (as 'TIMESPAN 2) 2) (list (as 'TIMESPAN 2) 1.5 2) (list S1 D1 D2) (list D1 S1 D2) (list D1 D2 S1) (list N [a b c] [a b d] 'a) (list L1 L2 "a-long-string-000001") (list 0Nl 0Ni 0Nf ' "" 0Nl) (list (list 1 TS) (list 1 I64) (list 1 I32)) (list (list 1 I64) (list 1 TS) (list 1 I32)) (list (table [a] (list TS)) (table [a] (list I64)) (table [a] (list I32))) (list (table [a] (list I64)) (table [a] (list TS)) (table [a] (list I32))) (list (dict [a] (list I64)) (dict [a] (list TS)) (dict [a] (list I32)))))
+(set NG (count CS))
+(set C (fold concat CS))
+(set G (fold concat (map (fn [i] (+ i (* 0 (til (count (at CS i)))))) (til NG))))
+(set T (table [g c r] (list G C (til (count C)))))
+(set E [1 2 2 2 2 1 2 2 2 1 2 2 3 2 3 1 2 1 2 2])
+;; the plain answer per group
+(map (fn [k] (count (distinct (at CS k)))) (til NG)) -- E
+;; grouped, the issue's query
+(at (select {from: T by: g n: (count (distinct c))}) 'n) -- E
+;; ungrouped over each group's rows
+(raze (map (fn [k] (at (select {from: T where: (== g k) n: (count (distinct c))}) 'n)) (til NG))) -- E
+;; the issue's table
+(at (select {from: (table [g c] (list [0 0 0 0] (list TS [1 2] [1i 2i] [1 2]))) by: g n: (count (distinct c))}) 'n) -- [1]
+(at (select {from: (table [g c] (list [0 0 0 0] (list [1 2] TS [1i 2i] [1 2]))) by: g n: (count (distinct c))}) 'n) -- [2]
+;; where: drops each group's first row (r is the row id)
+(set F (fold concat (map (fn [i] (drop (at CS i) 1)) (til NG))))
+(set EW (map (fn [k] (count (distinct (drop (at CS k) 1)))) (til NG)))
+EW -- [2 1 1 1 1 2 2 1 2 2 1 1 3 2 3 2 1 2 1 1]
+(set FIRSTS (map (fn [k] (first (at (select {from: T where: (== g k)}) 'r))) (til NG)))
+(at (select {from: T by: g where: (not (in r FIRSTS)) n: (count (distinct c))}) 'n) -- EW
+(raze (map (fn [k] (at (select {from: T where: (and (== g k) (not (in r FIRSTS))) n: (count (distinct c))}) 'n)) (til NG))) -- EW
+;; many copies of each group's first cell change no answer
+(set CP (map (fn [k] (concat (at CS k) (at (at CS k) (* 0 (til 64))))) (til NG)))
+(set TP (table [g c] (list (fold concat (map (fn [i] (+ i (* 0 (til (count (at CP i)))))) (til NG))) (fold concat CP))))
+(at (select {from: TP by: g n: (count (distinct c))}) 'n) -- E
+;; by: a LIST column groups as `group`: a row joins the earliest group
+;; whose first row equals it, so there are (count (distinct c)) groups
+;; Z, a cell equal to none of the others, leads so that a column of atoms
+;; stays a LIST; its group (the first) is dropped.
+(set Z (as 'I16 [9 9 9 9 9]))
+(set BY (fn [cells] (drop (at (select {from: (table [c r] (list (concat (list Z) cells) (til (+ 1 (count cells))))) by: c n: (count r)}) 'n) 1)))
+(BY (list TS I64 I32 I64)) -- [4]
+(BY (list I64 TS I32 I64)) -- [3 1]
+(BY (list I32 I64 TS)) -- [2 1]
+(BY (list D1 S1 D2)) -- [2 1]
+(BY (list (table [a] (list I64)) (table [a] (list TS)) (table [a] (list I32)))) -- [2 1]
+(BY (list (list 1 I64) (list 1 TS) (list 1 I32))) -- [2 1]
+(BY (list 1 (as 'I32 1) 1.0 (as 'TIMESPAN 1) 2)) -- [4 1]
+(map (fn [k] (BY (at CS k))) (til NG)) -- (map (fn [k] (map count (value (group (at CS k))))) (til NG))
+(map (fn [k] (count (BY (at CS k)))) (til NG)) -- E
+;; by: a LIST column past the parallel directory's row floor: a TIMESPAN
+;; cell sends the grouping to the scan in row order
+(set BIG (map (fn [i] (list 'x i)) (til 70000)))
+(count (BY (concat (list TS I64 I32 I64) BIG))) -- 70001
+(count (BY (concat (list I64 TS I32 I64) BIG))) -- 70002
+(take (BY (concat (list I64 TS I32 I64) BIG)) 3) -- [3 1 1]
+(count (BY (concat BIG (list I32 TS I64)))) -- 70002
+(count (BY BIG)) -- 70000
+(count (BY (concat (list 1.5 (as 'TIMESPAN 2) 2) BIG))) -- 70002
+(count (BY (concat (list (list 'y 2) (list 'y (as 'TIMESPAN 2)) (list 'y 2.0)) BIG))) -- 70001
+(count (BY (concat (list (table [a] (list I64)) (table [a] (list TS)) (table [a] (list I32))) BIG))) -- 70002
+;; parted: two partitions of the same rows, each group's cells twice
+(set PT (table [g c] (list G (fold concat CS))))
+(.db.splayed.set "/tmp/rfl_cd_list_cells_1320/p/1/t/" (select {from: PT where: (< g 12)}) "/tmp/rfl_cd_list_cells_1320/p/sym")
+(.db.splayed.set "/tmp/rfl_cd_list_cells_1320/p/2/t/" (select {from: PT where: (< g 12)}) "/tmp/rfl_cd_list_cells_1320/p/sym")
+(set P (.db.parted.get "/tmp/rfl_cd_list_cells_1320/p/" 't))
+(at (select {from: P by: g n: (count (distinct c))}) 'n) -- (take E 12)
+(at (select {from: P by: g where: (> g 2) n: (count (distinct c))}) 'n) -- (drop (take E 12) 3)
+(at (select {from: P where: (== g 1) n: (count (distinct c))}) 'n) -- [2]
+(at (select {from: P where: (== g 4) n: (count (distinct c))}) 'n) -- [2]
+;; by: the LIST column, parted against the same rows flat
+(set PF (select {from: PT where: (< g 12)}))
+(set TT (table [g c] (list (concat (at PF 'g) (at PF 'g)) (concat (at PF 'c) (at PF 'c)))))
+(at (select {from: TT by: c n: (count g)}) 'n) -- (map count (value (group (at TT 'c))))
+(at (select {from: P by: c n: (count g)}) 'n) -- (at (select {from: TT by: c n: (count g)}) 'n)
+(count (select {from: P by: c n: (count g)})) -- (count (distinct (at TT 'c)))
+(.sys.exec "rm -rf /tmp/rfl_cd_list_cells_1320") -- 0
