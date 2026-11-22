@@ -1648,6 +1648,35 @@ static int sym_vec_eq(ray_t* a, ray_t* b) {
     return atom_eq_cell_col(a, b);
 }
 
+/* Two STR vectors are equal when every cell holds the same text: a pooled
+ * cell's descriptor holds its pool offset, so equal text in two pools
+ * differs by bytes (#1318).  A slice reads its parent's descriptors and
+ * pool.  Reads only, so it is safe in a pool worker. */
+static int str_vec_eq(ray_t* a, ray_t* b) {
+    if (a->len != b->len) return 0;
+    ray_t* oa = a; int64_t fa = 0;
+    ray_t* ob = b; int64_t fb = 0;
+    if (a->attrs & RAY_ATTR_SLICE) { oa = a->slice_parent; fa = a->slice_offset; }
+    if (b->attrs & RAY_ATTR_SLICE) { ob = b->slice_parent; fb = b->slice_offset; }
+    const ray_str_t* da = (const ray_str_t*)oa->data + fa;
+    const ray_str_t* db = (const ray_str_t*)ob->data + fb;
+    const char* pa = NULL; const char* pb = NULL;   /* resolved on a pooled cell */
+    for (int64_t i = 0; i < a->len; i++) {
+        const ray_str_t* x = &da[i];
+        const ray_str_t* y = &db[i];
+        if (x->len != y->len) return 0;
+        if (ray_str_is_inline(x)) {
+            if (x->len && memcmp(x->data, y->data, x->len) != 0) return 0;
+            continue;
+        }
+        if (!pa) pa = oa->str_pool ? (const char*)ray_data(oa->str_pool) : NULL;
+        if (!pb) pb = ob->str_pool ? (const char*)ray_data(ob->str_pool) : NULL;
+        if (!pa || !pb) return 0;                       /* no pool to read */
+        if (!ray_str_t_eq(x, pa, y, pb)) return 0;
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
@@ -1754,6 +1783,10 @@ int atom_eq(ray_t* a, ray_t* b) {
     }
     case RAY_SYM:
         return b->type == RAY_SYM && sym_vec_eq(a, b);
+    case RAY_STR:
+        /* By text: a descriptor holds a pool offset, so the same string
+         * stored in two pools compared unequal by bytes (#1318). */
+        return b->type == RAY_STR && str_vec_eq(a, b);
     default:
         /* Vector equality: same type and length, element-wise comparison */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
@@ -1814,9 +1847,20 @@ uint64_t ray_key_hash(ray_t* x, int spans) {
         }
         return h;
     }
+    /* A STR vector hashes its cells' text, as atom_eq compares them: a
+     * descriptor holds a pool offset, not the text (#1318). */
+    if (x->type == RAY_STR) {
+        uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
+        for (int64_t i = 0; i < x->len; i++) {
+            size_t n = 0;
+            const char* s = ray_str_vec_get(x, i, &n);
+            h = ray_hash_combine(h, n ? ray_hash_bytes(s, n) : 0);
+        }
+        return h;
+    }
     /* atom_eq's other vector arm: same type and length, then memcmp of
-     * len * ray_elem_size bytes, so type tags, null sentinels, NaN bits and
-     * STR descriptors all compare raw.  Hash those bytes. */
+     * len * ray_elem_size bytes, so type tags, null sentinels and NaN bits
+     * compare raw.  Hash those bytes. */
     if (x->type > RAY_LIST && x->type <= RAY_STR)
         return ray_hash_combine(ray_hash_i64(((int64_t)x->type << 32) ^ x->len),
                                 ray_hash_bytes(ray_data(x), (size_t)x->len * ray_elem_size(x->type)));
