@@ -777,6 +777,26 @@
 (select {from: T where: (and (> (xbar v w) 5) (> w 0)) by: {k: (xbar v w)} n: (count v)}) !- domain
 (select {from: T where: (and (> (xbar v w) 5) (> w 0))}) !- domain
 (select {from: T where: (and (> v 0) (> (xbar v w) 5)) by: {k: (xbar v w)} n: (count v)}) !- domain
+;; ... in the order written: the cost-based reorder of a split where: keeps
+;; an xbar conjunct where it is, and a folded true conjunct changes nothing
+(set T (table [v w c] (list [10 11 12 13 14] [3 0 3 2 3] [1 1 2 2 3])))
+(at (select {from: T where: (and (> w 0) (== (xbar v w) 12)) n: (count v)}) 'n) -- [3]
+(select {from: T where: (and (> w 0) (== (xbar v w) 12)) by: c n: (count v)}) -- (table [c n] (list [2 3] [2 1]))
+(at (select {from: T where: (and (> w 0) (== (xbar v w) 12)) by: {b: (xbar v w)} n: (count v)}) 'n) -- [3]
+(select {from: T where: (and (> w 0) (== (xbar v w) 12)) by: {b: (% v 2)} n: (count v)}) -- (table [b n] (list [0 1] [2 1]))
+(at (select {from: T where: (and (> w 0) (in (xbar v w) [12 99])) n: (count v)}) 'n) -- [3]
+(count (select {from: T where: (and (> w 0) true (> (xbar v w) 5))})) -- 4
+(count (select {from: T where: (and true (> w 0) (> (xbar v w) 5))})) -- 4
+(count (select {from: T where: (and (> w 0) (> (xbar v w) 5) true)})) -- 4
+(at (select {from: T where: (and (> w 0) true (> (xbar v w) 5)) by: c n: (count v)}) 'n) -- [1 2 1]
+(select {from: T where: (and (== (xbar v w) 12) (> w 0))}) !- domain
+(select {from: T where: (and (== (xbar v w) 12) (> w 0)) by: c n: (count v)}) !- domain
+(select {from: T where: (and (> v 0) (== (xbar v w) 12))}) !- domain
+(select {from: T where: (and true (> v 0) (> (xbar v w) 5))}) !- domain
+;; a one-cell condition (a reduction) takes one arm for every row
+(at (select {from: T r: (if (> (sum v) 0) v (xbar v w))}) 'r) -- [10 11 12 13 14]
+(if (> (sum [1 2]) 0) 7 (xbar [10 11] [3 0])) -- 7
+(select {from: T r: (if (< (sum v) 0) v (xbar v w))}) !- domain
 ;; an arm of an if buckets only the rows that take it, a literal bucket too
 (at (select {from: T r: (if (> v 100) (xbar v 0) v)}) 'r) -- [10 11 12 13 14]
 (at (select {from: T r: (if (> v 100) (xbar v 0x00) v)}) 'r) -- [10 11 12 13 14]

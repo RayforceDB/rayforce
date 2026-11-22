@@ -1759,6 +1759,23 @@ static int collect_filter_chain(ray_graph_t* g, ray_op_t* top, ray_op_t** chain,
     return n;
 }
 
+/* Whether a predicate holds an xbar (OP_FLAG_XBAR); a tree deeper than
+ * the walk counts as holding one. */
+static bool pred_has_xbar(ray_graph_t* g, ray_op_t* n, int depth) {
+    if (!n) return false;
+    if (n->flags & OP_FLAG_XBAR) return true;
+    if (depth > 64) return true;
+    for (int k = 0; k < n->arity && k < 2; k++)
+        if (n->in_id[k] != RAY_OP_NONE && pred_has_xbar(g, op_child(g, n, k), depth + 1))
+            return true;
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        if (e && e->third_in != RAY_OP_NONE && pred_has_xbar(g, op_node(g, e->third_in), depth + 1))
+            return true;
+    }
+    return false;
+}
+
 static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
     if (!g || !root) return root;
 
@@ -1858,18 +1875,30 @@ static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
          * original order for equal keys). Highest key — least selective, or
          * equally selective but costlier — goes to chain[0] (outer, runs
          * last); lowest key — most selective — goes to chain[N-1] (inner,
-         * runs first). We swap predicates, not filter nodes. */
-        for (int c = 1; c < chain_len; c++) {
-            uint32_t pred_id = chain[c]->in_id[1];
-            int cost = costs[c];
-            int j = c - 1;
-            while (j >= 0 && costs[j] < cost) {
-                chain[j + 1]->in_id[1] = chain[j]->in_id[1];
-                costs[j + 1] = costs[j];
-                j--;
+         * runs first). We swap predicates, not filter nodes.
+         * A predicate holding an xbar stays where the user wrote it, and
+         * nothing crosses it: it buckets exactly the rows the conjuncts
+         * written before it keep, so its zero bucket raises on the same
+         * rows whatever the costs (#1355).  The runs between such
+         * predicates sort among themselves. */
+        int lo = 0;
+        while (lo < chain_len) {
+            if (pred_has_xbar(g, op_child(g, chain[lo], 1), 0)) { lo++; continue; }
+            int hi = lo + 1;
+            while (hi < chain_len && !pred_has_xbar(g, op_child(g, chain[hi], 1), 0)) hi++;
+            for (int c = lo + 1; c < hi; c++) {
+                uint32_t pred_id = chain[c]->in_id[1];
+                int cost = costs[c];
+                int j = c - 1;
+                while (j >= lo && costs[j] < cost) {
+                    chain[j + 1]->in_id[1] = chain[j]->in_id[1];
+                    costs[j + 1] = costs[j];
+                    j--;
+                }
+                chain[j + 1]->in_id[1] = pred_id;
+                costs[j + 1] = cost;
             }
-            chain[j + 1]->in_id[1] = pred_id;
-            costs[j + 1] = cost;
+            lo = hi;
         }
     }
 

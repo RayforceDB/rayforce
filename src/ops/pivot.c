@@ -1625,9 +1625,16 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
     ray_t* cond_v = cond_in ? cond_in : exec_node(g, op_child(g, op, 0));
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t else_id = ext->third_in;
-    /* a scalar condition takes one arm for every row */
-    int untaken = cond_v && !RAY_IS_ERR(cond_v) && ray_is_atom(cond_v)
-                ? (if_cond_atom(cond_v) ? 2 : 1) : 0;
+    /* A scalar condition takes one arm for every row: an atom, or one
+     * cell (a reduction such as `(> (sum v) 0)`; over a one-row table the
+     * one row takes that arm too). */
+    int untaken = 0;
+    if (cond_v && !RAY_IS_ERR(cond_v)) {
+        if (ray_is_atom(cond_v))
+            untaken = if_cond_atom(cond_v) ? 2 : 1;
+        else if (cond_v->len == 1 && if_cond_type_ok(cond_v->type))
+            untaken = if_cond_cell(cond_v, 0) ? 2 : 1;
+    }
     ray_t* then_v = untaken == 1 ? exec_if_untaken(g, op_child(g, op, 1))
                                  : exec_node(g, op_child(g, op, 1));
     ray_t* else_v = untaken == 2 ? exec_if_untaken(g, op_node(g, else_id))
