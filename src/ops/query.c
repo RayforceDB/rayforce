@@ -2409,8 +2409,11 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             /* A zero or null bucket is ray_xbar_fn's domain error (#1355).
              * A literal one the builtin rejects outright is decided here,
              * once; every other one by the modulo kernels (OP_FLAG_XBAR),
-             * whose zero-divisor branch raises instead of writing a null. */
-            if (xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
+             * whose zero-divisor branch raises instead of writing a null.
+             * In an arm of an `if` / `cond` only the rows that take the arm
+             * bucket, so the kernels decide there too. */
+            if (g->if_arm_depth == 0 &&
+                xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
                 return NULL;
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;

@@ -1583,14 +1583,55 @@ static ray_t* if_str_text_build(ray_t* result, const uint8_t* cond, int64_t len,
 
 /* `cond_in`: the condition exec_if already evaluated (ownership passes
  * here), or NULL to evaluate it. */
+/* Whether an arm holds an xbar (OP_FLAG_XBAR), whose zero bucket raises
+ * per row.  Deeper than the walk looks counts as holding one. */
+static bool if_arm_has_xbar(ray_graph_t* g, ray_op_t* n, int depth) {
+    if (!n) return false;
+    if (n->flags & OP_FLAG_XBAR) return true;
+    if (depth > 64) return true;
+    for (int k = 0; k < n->arity && k < 2; k++)
+        if (n->in_id[k] != RAY_OP_NONE && if_arm_has_xbar(g, op_node(g, n->in_id[k]), depth + 1))
+            return true;
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        if (e && if_arm_has_xbar(g, op_node(g, e->third_in), depth + 1)) return true;
+    }
+    return false;
+}
+
+/* An arm a scalar condition does not take, evaluated for its shape and type
+ * only: no row takes it, so an xbar's zero bucket in it is no error, as the
+ * interpreter's `if` never evaluates it (#1355).  The arm runs under a
+ * selection that keeps no row (the xbar kernels' row domain); every other
+ * arm runs as it is. */
+static ray_t* exec_if_untaken(ray_graph_t* g, ray_op_t* arm) {
+    if (!g->table || !if_arm_has_xbar(g, arm, 0)) return exec_node(g, arm);
+    int64_t nrows = ray_table_nrows(g->table);
+    ray_t* none = ray_rowsel_new(nrows, 0, 0);
+    if (!none) return ray_error("oom", NULL);
+    ray_rowsel_t* m = ray_rowsel_meta(none);
+    memset(ray_rowsel_flags(none), RAY_SEL_NONE, m->n_segs);
+    memset(ray_rowsel_offsets(none), 0, (size_t)(m->n_segs + 1) * sizeof(uint32_t));
+    ray_t* saved = g->selection;
+    g->selection = none;
+    ray_t* v = exec_node(g, arm);
+    g->selection = saved;
+    ray_rowsel_release(none);
+    return v;
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = cond_in ? cond_in : exec_node(g, op_child(g, op, 0));
-    ray_t* then_v = exec_node(g, op_child(g, op, 1));
-
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t else_id = ext->third_in;
-    ray_t* else_v = exec_node(g, op_node(g, else_id));
+    /* a scalar condition takes one arm for every row */
+    int untaken = cond_v && !RAY_IS_ERR(cond_v) && ray_is_atom(cond_v)
+                ? (if_cond_atom(cond_v) ? 2 : 1) : 0;
+    ray_t* then_v = untaken == 1 ? exec_if_untaken(g, op_child(g, op, 1))
+                                 : exec_node(g, op_child(g, op, 1));
+    ray_t* else_v = untaken == 2 ? exec_if_untaken(g, op_node(g, else_id))
+                                 : exec_node(g, op_node(g, else_id));
 
     if (!cond_v || RAY_IS_ERR(cond_v)) {
         if (then_v && !RAY_IS_ERR(then_v)) ray_release(then_v);

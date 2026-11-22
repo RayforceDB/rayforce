@@ -1863,6 +1863,13 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                                     op_child(g, node, 1)->out_type == RAY_U8),
                     .xbar = (op == OP_MOD && (node->flags & OP_FLAG_XBAR)),
                 };
+                /* An xbar by a constant that is neither zero nor null (the
+                 * lane's null: NaN, NULL_I64) has no row to raise on. */
+                if (out->ins[out->n_ins - 1].xbar && out->regs[s2].kind == REG_CONST &&
+                    (out->regs[s2].type == RAY_F64
+                         ? out->regs[s2].const_f64 != 0.0 && out->regs[s2].const_f64 == out->regs[s2].const_f64
+                         : out->regs[s2].const_i64 != 0 && out->regs[s2].const_i64 != NULL_I64))
+                    out->ins[out->n_ins - 1].xbar = 0;
                 /* The planner types narrow integer arithmetic in its own
                  * width (I16 * I16 is I16 and wraps), as the builtins do;
                  * the lanes here are I64.  One CAST brings the result back
@@ -2119,16 +2126,14 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
             case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
             case OP_MOD:
+                for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
+                /* The modulo loop does not vectorize; the divisor test is a
+                 * branch-free pass of its own over the morsel (in cache). */
                 if (xbar) {
                     int nb = 0;
-                    for (int64_t j = 0; j < n; j++) {
-                        nb |= (b[j] == 0.0) | (b[j] != b[j]);
-                        d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
-                    }
+                    for (int64_t j = 0; j < n; j++) nb |= (b[j] == 0.0) | (b[j] != b[j]);
                     *bad = nb;
-                    return;
                 }
-                for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
                 break;
             case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
