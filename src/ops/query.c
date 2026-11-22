@@ -27726,8 +27726,9 @@ static void xbar_par_fn(void* vctx, uint32_t worker_id,
                 int64_t a = in[i];
                 int64_t q = a / b;
                 if ((a ^ b) < 0 && q * b != a) q--;
-                /* Unsigned wrap: only the null sentinel (INT64_MIN) rounds
-                 * below INT64_MIN, and the caller rewrites it as null. */
+                /* Unsigned wrap: a value within |b| of INT64_MIN (b > 0) or
+                 * INT64_MAX (b < 0) rounds past the range and wraps; the
+                 * atom path wraps the same (#1348). */
                 o[i] = (int64_t)((uint64_t)q * (uint64_t)b);
             }
         }
@@ -27874,7 +27875,9 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(rt);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
-        return make_typed_int(rt, q * b);
+        /* Unsigned wrap, as the vector kernel: q * b of a value within |b|
+         * of INT64_MIN / INT64_MAX lies past the range (#1348). */
+        return make_typed_int(rt, (int64_t)((uint64_t)q * (uint64_t)b));
     }
     /* Float path: either operand is f64 */
     if (is_numeric(col) && is_numeric(bucket)) {
@@ -27904,7 +27907,10 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         if (RAY_ATOM_IS_NULL(col)) return ray_typed_null(col->type);
         int64_t q = a / b;
         if ((a ^ b) < 0 && q * b != a) q--;
-        int64_t result = q * b;
+        /* Unsigned wrap, as the vector kernel and the query lowering: a
+         * TIMESTAMP within |b| of INT64_MIN / INT64_MAX buckets past the
+         * range (#1348). */
+        int64_t result = (int64_t)((uint64_t)q * (uint64_t)b);
         if (col->type == -RAY_TIME) return ray_time(result);
         if (col->type == -RAY_DATE) return ray_date(result);
         return ray_timestamp(result);

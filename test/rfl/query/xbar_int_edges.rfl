@@ -1,0 +1,831 @@
+;; @also-unfused
+;; xbar_int_edges.rfl -- a query's xbar near the ends of an integer or
+;; temporal lane gives the eager vector xbar's answer, with no signed overflow
+;; (issue #1348).
+;;
+;; floor(a / b) * b of a value within |b| of the lane's minimum (b > 0) or
+;; maximum (b < 0) lies past the range.  The eager vector kernel wraps it
+;; through unsigned arithmetic; the atom xbar, which the query reaches through
+;; its per-row route and the eager vector-by-vector form, multiplied signed and
+;; overflowed.  Every golden here is the eager vector xbar over an atom bucket.
+;; Each bucket is checked through the eager atom xbar, the eager vector-by-vector
+;; form, the query's DAG projection, its per-row route (`(min v v)` declines the
+;; DAG compile), a vector divisor column, a by-dict key and a where predicate.
+;; The null (the lane's minimum) stays null, and a power-of-two bucket that
+;; rounds a value down to the minimum reads it back as null, as eager does.
+
+;; --- the issue's repro ---
+(set f [7.9 -7.9 1.5 1e300 -1e300 0.0 2.5])
+(set Tf (table [f] (list f)))
+(at (select {from: Tf r: (xbar (as 'TIMESTAMP f) 1000)}) 'r) -- (xbar (as 'TIMESTAMP f) 1000)
+(at (select {from: Tf r: (xbar (as 'TIMESTAMP f) -1000)}) 'r) -- (xbar (as 'TIMESTAMP f) -1000)
+(at (select {from: Tf r: (xbar (as 'I64 (as 'TIMESTAMP f)) 1000)}) 'r) -- (xbar (as 'I64 (as 'TIMESTAMP f)) 1000)
+
+;; --- I64 ---
+(set V (concat (as 'I64 [-9223372036854775807 -9223372036854775806 -9223372036854775805 -9223372036854775308 -9223372036854775001 -9223372036854774809 -9223372036854774808 -9223372036854774785 -9223372036854774784 -9223372036854774783 9223372036854775807 9223372036854775806 9223372036854775805 9223372036854775308 9223372036854775001 9223372036854774809 9223372036854774808 9223372036854774785 9223372036854774784 9223372036854774783 0 5 -5]) 0Nl))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 4611686018427387905))
+(set T (table [v w] (list V (take 4611686018427387905 n))))
+(map (fn [x] (xbar x 4611686018427387905)) V) -- E
+(xbar V (take 4611686018427387905 n)) -- E
+(at (select {from: T r: (xbar v 4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 4611686018427387905)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 4611686018427387905) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -4611686018427387905))
+(set T (table [v w] (list V (take -4611686018427387905 n))))
+(map (fn [x] (xbar x -4611686018427387905)) V) -- E
+(xbar V (take -4611686018427387905 n)) -- E
+(at (select {from: T r: (xbar v -4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -4611686018427387905)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -4611686018427387905) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+
+;; --- TIMESTAMP ---
+(set V (concat (as 'TIMESTAMP [-9223372036854775807 -9223372036854775806 -9223372036854775805 -9223372036854775308 -9223372036854775001 -9223372036854774809 -9223372036854774808 -9223372036854774785 -9223372036854774784 -9223372036854774783 9223372036854775807 9223372036854775806 9223372036854775805 9223372036854775308 9223372036854775001 9223372036854774809 9223372036854774808 9223372036854774785 9223372036854774784 9223372036854774783 0 5 -5]) 0Np))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 4611686018427387905))
+(set T (table [v w] (list V (take 4611686018427387905 n))))
+(map (fn [x] (xbar x 4611686018427387905)) V) -- E
+(xbar V (take 4611686018427387905 n)) -- E
+(at (select {from: T r: (xbar v 4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 4611686018427387905)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 4611686018427387905) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -4611686018427387905))
+(set T (table [v w] (list V (take -4611686018427387905 n))))
+(map (fn [x] (xbar x -4611686018427387905)) V) -- E
+(xbar V (take -4611686018427387905 n)) -- E
+(at (select {from: T r: (xbar v -4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -4611686018427387905)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -4611686018427387905)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -4611686018427387905) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 00:00:01.000))
+(set T (table [v] (list V)))
+(map (fn [x] (xbar x 00:00:01.000)) V) -- E
+(at (select {from: T r: (xbar v 00:00:01.000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 00:00:01.000)}) 'r) -- E
+(set E (xbar V -00:00:00.007))
+(set T (table [v] (list V)))
+(map (fn [x] (xbar x -00:00:00.007)) V) -- E
+(at (select {from: T r: (xbar v -00:00:00.007)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -00:00:00.007)}) 'r) -- E
+
+;; --- I32 ---
+(set V (concat (as 'I32 [-2147483647 -2147483646 -2147483645 -2147483148 -2147482841 -2147482649 -2147482648 -2147482625 -2147482624 -2147482623 2147483647 2147483646 2147483645 2147483148 2147482841 2147482649 2147482648 2147482625 2147482624 2147482623 0 5 -5]) 0Ni))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 4294967296))
+(set T (table [v w] (list V (take 4294967296 n))))
+(map (fn [x] (xbar x 4294967296)) V) -- E
+(xbar V (take 4294967296 n)) -- E
+(at (select {from: T r: (xbar v 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 4294967296)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 4294967296) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+
+;; --- DATE ---
+(set V (concat (as 'DATE [-2147483647 -2147483646 -2147483645 -2147483148 -2147482841 -2147482649 -2147482648 -2147482625 -2147482624 -2147482623 2147483647 2147483646 2147483645 2147483148 2147482841 2147482649 2147482648 2147482625 2147482624 2147482623 0 5 -5]) 0Nd))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 4294967296))
+(set T (table [v w] (list V (take 4294967296 n))))
+(map (fn [x] (xbar x 4294967296)) V) -- E
+(xbar V (take 4294967296 n)) -- E
+(at (select {from: T r: (xbar v 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 4294967296)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 4294967296) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+
+;; --- TIME ---
+(set V (concat (as 'TIME [-2147483647 -2147483646 -2147483645 -2147483148 -2147482841 -2147482649 -2147482648 -2147482625 -2147482624 -2147482623 2147483647 2147483646 2147483645 2147483148 2147482841 2147482649 2147482648 2147482625 2147482624 2147482623 0 5 -5]) 0Nt))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 4294967296))
+(set T (table [v w] (list V (take 4294967296 n))))
+(map (fn [x] (xbar x 4294967296)) V) -- E
+(xbar V (take 4294967296 n)) -- E
+(at (select {from: T r: (xbar v 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 4294967296)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 4294967296)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 4294967296) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+
+;; --- I16 ---
+(set V (concat (as 'I16 [-32767 -32766 -32765 -32268 -31961 -31769 -31768 -31745 -31744 -31743 32767 32766 32765 32268 31961 31769 31768 31745 31744 31743 0 5 -5]) 0Nh))
+(set n (count V))
+(set E (xbar V 1000))
+(set T (table [v w] (list V (take 1000 n))))
+(map (fn [x] (xbar x 1000)) V) -- E
+(xbar V (take 1000 n)) -- E
+(at (select {from: T r: (xbar v 1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 7))
+(set T (table [v w] (list V (take 7 n))))
+(map (fn [x] (xbar x 7)) V) -- E
+(xbar V (take 7 n)) -- E
+(at (select {from: T r: (xbar v 7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -7))
+(set T (table [v w] (list V (take -7 n))))
+(map (fn [x] (xbar x -7)) V) -- E
+(xbar V (take -7 n)) -- E
+(at (select {from: T r: (xbar v -7)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -7)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -7)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -7) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1000))
+(set T (table [v w] (list V (take -1000 n))))
+(map (fn [x] (xbar x -1000)) V) -- E
+(xbar V (take -1000 n)) -- E
+(at (select {from: T r: (xbar v -1000)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1000)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1000)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1000) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1))
+(set T (table [v w] (list V (take 1 n))))
+(map (fn [x] (xbar x 1)) V) -- E
+(xbar V (take 1 n)) -- E
+(at (select {from: T r: (xbar v 1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -1))
+(set T (table [v w] (list V (take -1 n))))
+(map (fn [x] (xbar x -1)) V) -- E
+(xbar V (take -1 n)) -- E
+(at (select {from: T r: (xbar v -1)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -1)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -1)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -1) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 1024))
+(set T (table [v w] (list V (take 1024 n))))
+(map (fn [x] (xbar x 1024)) V) -- E
+(xbar V (take 1024 n)) -- E
+(at (select {from: T r: (xbar v 1024)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 1024)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 1024)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 1024) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 3))
+(set T (table [v w] (list V (take 3 n))))
+(map (fn [x] (xbar x 3)) V) -- E
+(xbar V (take 3 n)) -- E
+(at (select {from: T r: (xbar v 3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V -3))
+(set T (table [v w] (list V (take -3 n))))
+(map (fn [x] (xbar x -3)) V) -- E
+(xbar V (take -3 n)) -- E
+(at (select {from: T r: (xbar v -3)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) -3)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v -3)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v -3) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 7)))
+(set T (table [v w] (list V (take (as 'I16 7) n))))
+(map (fn [x] (xbar x (as 'I16 7))) V) -- E
+(xbar V (take (as 'I16 7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I16 -1000)))
+(set T (table [v w] (list V (take (as 'I16 -1000) n))))
+(map (fn [x] (xbar x (as 'I16 -1000))) V) -- E
+(xbar V (take (as 'I16 -1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I16 -1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I16 -1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I16 -1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 1000)))
+(set T (table [v w] (list V (take (as 'I32 1000) n))))
+(map (fn [x] (xbar x (as 'I32 1000))) V) -- E
+(xbar V (take (as 'I32 1000) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 1000))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 1000))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 1000)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V (as 'I32 -7)))
+(set T (table [v w] (list V (take (as 'I32 -7) n))))
+(map (fn [x] (xbar x (as 'I32 -7))) V) -- E
+(xbar V (take (as 'I32 -7) n)) -- E
+(at (select {from: T r: (xbar v (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) (as 'I32 -7))}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v (as 'I32 -7))} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v (as 'I32 -7)) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+(set E (xbar V 65536))
+(set T (table [v w] (list V (take 65536 n))))
+(map (fn [x] (xbar x 65536)) V) -- E
+(xbar V (take 65536 n)) -- E
+(at (select {from: T r: (xbar v 65536)}) 'r) -- E
+(at (select {from: T r: (xbar (min v v) 65536)}) 'r) -- E
+(at (select {from: T r: (xbar v w)}) 'r) -- E
+(asc (at (select {from: T by: {k: (xbar v 65536)} c: (count v)}) 'k)) -- (asc (distinct E))
+(first (at (select {from: T where: (== (xbar v 65536) (at E 0)) c: (count v)}) 'c)) -- (sum (== E (at E 0)))
+
