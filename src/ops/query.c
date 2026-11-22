@@ -5421,12 +5421,13 @@ static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
  * `(select {m: (first (asc v)) by: k from: T})` errors `domain` while
  * the equivalent `(min v)` works.
  *
- * Patterns recognised (parallel to idiom.c's ray_idioms table):
+ * Patterns recognised (parallel to idiom.c's ray_idioms table), each only
+ * while the verb's name is still bound to the builtin:
  *   (first (asc col))    -> (min col)    if col is null-free
  *   (last  (asc col))    -> (max col)    if col is null-free
- *   (count (asc col))    -> (count col)
- *   (count (desc col))   -> (count col)
- *   (count (reverse col))-> (count col)
+ *   (count (V col))      -> (count col)  V asc, desc, reverse, iasc, idesc, rank
+ *   (count (rotate col n)) -> (count col)  n an integer literal
+ *   (count (xrank n col))  -> (count col)  n a positive integer literal
  *
  * The null-free precondition for first/last matches idiom.c's
  * pre_no_nulls_on_asc_input — first(asc null-bearing) returns the null
@@ -5434,6 +5435,20 @@ static int is_plain_count_expr(ray_t* expr, ray_t* tbl) {
  *
  * On match: *op_out and *arg_out point to the simpler op + col expr;
  * caller builds agg_ins[i] from *arg_out.  Returns true if rewritten. */
+/* An integer literal written in place (I16/I32/I64 atom, not null),
+ * positive when `positive`. */
+static bool idiom_int_literal(ray_t* a, bool positive) {
+    if (!a || !ray_is_atom(a) || RAY_ATOM_IS_NULL(a)) return false;
+    int64_t v;
+    switch (a->type) {
+    case -RAY_I64: v = a->i64; break;
+    case -RAY_I32: v = a->i32; break;
+    case -RAY_I16: v = a->i16; break;
+    default: return false;
+    }
+    return !positive || v > 0;
+}
+
 static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
                                 uint16_t* op_out, ray_t** arg_out) {
     if (!val_expr || val_expr->type != RAY_LIST || ray_len(val_expr) < 2) return false;
@@ -5454,15 +5469,23 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
     size_t wrap_n = ray_str_len(inner_nm);
     ray_t* col_expr = inner_e[1];
 
-    bool wrap_is_asc     = (wrap_n == 3 && memcmp(wrap_s, "asc", 3) == 0);
-    bool wrap_is_desc    = (wrap_n == 4 && memcmp(wrap_s, "desc", 4) == 0);
-    bool wrap_is_reverse = (wrap_n == 7 && memcmp(wrap_s, "reverse", 7) == 0);
+    /* the verb, only while its name is the builtin: a rebound `reverse` is
+     * the user's function, whose count is its own */
+    ray_t* fn = ray_env_get(inner_e[0]->i64);
+    bool wrap_is_asc     = (wrap_n == 3 && memcmp(wrap_s, "asc", 3) == 0) &&
+                           fn && head_is_builtin_unary(fn, ray_asc_fn);
+    bool wrap_is_desc    = (wrap_n == 4 && memcmp(wrap_s, "desc", 4) == 0) &&
+                           fn && head_is_builtin_unary(fn, ray_desc_fn);
+    bool wrap_is_reverse = (wrap_n == 7 && memcmp(wrap_s, "reverse", 7) == 0) &&
+                           fn && head_is_builtin_unary(fn, ray_reverse_fn);
 
     /* (count (asc|desc|reverse|iasc|idesc|rank col)), (count (rotate col n))
      * and (count (xrank n col)) -> (count col): each gives one cell per cell
-     * of col, and count counts nulls.  Only while the name is the builtin. */
+     * of col, and count counts nulls.  The other argument must be a literal
+     * the verb takes and for which that holds (rotate: an integer; xrank: a
+     * positive integer, as (xrank 0 x) is empty); anything else keeps the
+     * ordinary route and raises what the verb raises. */
     if (op_n == 5 && memcmp(op_s, "count", 5) == 0) {
-        ray_t* fn = ray_env_get(inner_e[0]->i64);
         int64_t il = ray_len(inner);
         ray_t* arg = NULL;
         if (il == 2 && (wrap_is_asc || wrap_is_desc || wrap_is_reverse ||
@@ -5471,10 +5494,12 @@ static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
                                 head_is_builtin_unary(fn, ray_rank_fn)))))
             arg = col_expr;
         else if (il == 3 && fn && fn->type == RAY_BINARY &&
-                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_rotate_fn)
+                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_rotate_fn &&
+                 idiom_int_literal(inner_e[2], false))
             arg = inner_e[1];
         else if (il == 3 && fn && fn->type == RAY_BINARY &&
-                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_xrank_fn)
+                 (ray_binary_fn)(uintptr_t)fn->i64 == ray_xrank_fn &&
+                 idiom_int_literal(inner_e[1], true))
             arg = inner_e[2];
         if (!arg) return false;
         *op_out = OP_COUNT;
@@ -11482,6 +11507,9 @@ ray_t* ray_active_query_literal(int64_t sym) {
     if (!qt || qt->type != RAY_TABLE) return NULL;
     ray_t* col = ray_table_col(qt, sym);
     if (!col || RAY_IS_ERR(col)) return col;
+    /* Per-group evaluation: the group's rows, as a bare name of the
+     * column is bound (ray_query_helper_value) */
+    if (g_active_query_group_idx) return slice_col_by_idx(col, g_active_query_group_idx);
     if (g_active_query_row < 0 || qt != g_active_query_row_tbl ||
         g_active_query_row >= ray_len(col) ||
         ray_env_query_scope_above(g_active_query_row_depth)) {
@@ -19012,17 +19040,23 @@ static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
     if (!e) return false;
     if (depth > 4096) return true;            /* past any parsed nesting: keep it per group */
     if (e->type == -RAY_SYM) {
-        if ((e->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, e->i64))) return false;
-        if (!head) {
+        if (e->attrs & ATTR_QUOTED) return false;
+        /* a name as the query reads it: a lexical local (a parameter, a
+         * let) first, then a column, then a global */
+        bool local = ray_env_has_lexical_local(e->i64);
+        if (!local && tbl && tbl_has_col(tbl, e->i64)) return false;
+        if (!head && !local) {
             uint16_t op = resolve_agg_opcode(e->i64);
             if (op && op != OP_MIN && op != OP_MAX) return true;
         }
-        ray_t* v = ray_env_get_global(e->i64);
-        if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
-        if (!query_value_is_code(v)) return false;
-        if (v->type == RAY_LAMBDA) return true;
+        ray_t* v = ray_env_get(e->i64);
+        /* code only: data a name holds is not walked */
+        return query_value_is_code(v) && expr_names_group_code(v, tbl, head, depth + 1);
+    }
+    if (query_value_is_code(e)) {               /* a function value, named or written in place */
+        if (e->type == RAY_LAMBDA) return true;
         int budget = 1;
-        return query_code_needs_group_v(v, NULL, 0, &budget);   /* a builtin: the verb table */
+        return query_code_needs_group_v(e, NULL, 0, &budget);   /* a builtin: the verb table */
     }
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
     if (is_agg_expr(e)) return true;
@@ -19033,15 +19067,16 @@ static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
     return false;
 }
 
-
 /* Does the code `e` (a helper's statement, or a value it names) need the
  * group's rows: does it use a whole-column verb, called or passed as a
  * value, or an aggregate (is_agg_expr, as the planner reads one inline; by
  * name when passed as a value), here or in the body of a helper or a
  * capture it reaches?  Either sees the surviving rows of its group when
  * written inline, `(- i (avg i))` as `(reverse i)`, so such a helper is
- * not called over the whole table.  Names resolve as globals, a column of
- * `tbl` (the call's arguments) as that column; `head` is set for a call's
+ * not called over the whole table.  In the query's own expression (`tbl`
+ * set) a name resolves as the query reads it: a lexical local, then a
+ * column of `tbl`, then a global; inside a helper's body names resolve as
+ * globals.  `head` is set for a call's
  * head, whose arity is_agg_expr has judged.  `*budget` bounds the walk,
  * and a walk that exhausts it says yes, which only keeps the helper per
  * group. */
@@ -19049,14 +19084,16 @@ static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, i
     if (!e) return false;
     if (--*budget < 0 || depth > 16) return true;
     if (e->type == -RAY_SYM) {
-        if ((e->attrs & ATTR_QUOTED) || (tbl && tbl_has_col(tbl, e->i64))) return false;
+        if (e->attrs & ATTR_QUOTED) return false;
+        bool local = tbl && ray_env_has_lexical_local(e->i64);
+        if (!local && tbl && tbl_has_col(tbl, e->i64)) return false;
         /* an aggregate passed as a value: `max`/`min` also name the
          * pairwise verbs, so only their unary calls count */
-        if (!head) {
+        if (!head && !local) {
             uint16_t op = resolve_agg_opcode(e->i64);
             if (op && op != OP_MIN && op != OP_MAX) return true;
         }
-        ray_t* v = ray_env_get_global(e->i64);
+        ray_t* v = local ? ray_env_get(e->i64) : ray_env_get_global(e->i64);
         if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
         /* code only: data a name holds is not walked */
         return query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget);
