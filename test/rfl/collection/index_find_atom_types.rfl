@@ -1,0 +1,21 @@
+;; #1350: an indexed, null-free haystack answers an atom find as the scan and
+;; the list form do.  A DATE, TIME or TIMESTAMP meets only its own type by
+;; payload (atom_eq never matches a DATE to a TIMESPAN or an int, and meets
+;; a TIME or a TIMESTAMP with a TIMESPAN as a duration); the index keyed
+;; every integer-family atom by its raw count.
+(set L (fn [x] (as 'LIST x)))
+(set same (fn [h v] (identical (find h v) (find (L h) v))))
+(find (.idx.hash (as 'TIME [7i 5i])) 5) -- 0Nl
+(find (.idx.hash (as 'DATE [7i 5i])) (as 'TIMESPAN 5)) -- 0Nl
+(find (.idx.hash (as 'TIMESPAN [7 5])) (as 'DATE 5)) -- 0Nl
+(find (.idx.hash [7 5]) (as 'DATE 5)) -- 0Nl
+(find (.idx.hash (as 'DATE [7i 5i])) (list (as 'TIMESPAN 5))) -- [0Nl]
+;; every pair against the list form, indexed and not
+(set H (list (as 'DATE [7i 5i]) (as 'TIME [7i 5i]) (as 'TIMESTAMP [7 5]) (as 'TIMESPAN [7 5]) [7 5] (as 'I32 [7 5]) (as 'I16 [7 5]) [7.0 5.0]))
+(set V (list (as 'DATE 5) (as 'TIME 5) (as 'TIMESTAMP 5) (as 'TIMESPAN 5) 5 5i 5h 5.0 (as 'TIMESPAN 5000000)))
+(all (raze (map (fn [h] (map (fn [v] (and (same (.idx.hash h) v) (same h v))) V)) H))) -- true
+;; same-type and same-family probes still answer through the index
+(find (.idx.hash (as 'DATE [7i 5i])) (as 'DATE 5)) -- 1
+(find (.idx.hash (as 'TIMESTAMP [7 5])) (as 'TIMESTAMP 5)) -- 1
+(find (.idx.hash [7 5]) 5i) -- 1
+(find (.idx.hash (as 'TIMESPAN [7 5])) 5) -- 1
