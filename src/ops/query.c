@@ -948,6 +948,24 @@ static bool xbar_literal_bucket_bad(ray_graph_t* g, ray_op_t* b, ray_op_t* col,
     return true;
 }
 
+/* A literal bucket that is neither zero nor null: no row can raise, so the
+ * xbar is a plain modulo and the plan carries no OP_FLAG_XBAR (an update
+ * under where: then builds no row selection for it). */
+static bool xbar_literal_bucket_ok(ray_graph_t* g, ray_op_t* b) {
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* ext = find_ext(g, b->id);
+    ray_t* v = ext ? ext->literal : NULL;
+    if (!v || RAY_IS_ERR(v) || !ray_is_atom(v) || RAY_ATOM_IS_NULL(v)) return false;
+    switch (v->type) {
+        case -RAY_I64: case -RAY_I32: case -RAY_I16: return as_i64(v) != 0;
+        case -RAY_F64: case -RAY_F32: { double d = as_f64(v); return d == d && d != 0.0; }
+        case -RAY_U8: case -RAY_BOOL: return v->u8 != 0;
+        case -RAY_DATE: case -RAY_TIME: return v->i32 != 0;
+        case -RAY_TIMESTAMP: return v->i64 != 0;
+        default: return false;
+    }
+}
+
 /* Map Rayfall aggregation name to DAG opcode */
 static uint16_t resolve_agg_opcode(int64_t sym_id) {
     ray_t* s = ray_sym_str(sym_id);
@@ -2415,9 +2433,10 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             if (g->if_arm_depth == 0 &&
                 xbar_literal_bucket_bad(g, &g->nodes[lit_id], &g->nodes[col_id], col_t))
                 return NULL;
+            bool lit_ok = xbar_literal_bucket_ok(g, &g->nodes[lit_id]);
             ray_op_t* m = ray_mod(g, col, bucket);
             if (!m) return NULL;
-            m->flags |= OP_FLAG_XBAR;
+            if (!lit_ok) m->flags |= OP_FLAG_XBAR;
             col = &g->nodes[col_id];
             ray_op_t* r = ray_sub(g, col, m);
             if (!r || !temporal) return r;
