@@ -1606,8 +1606,8 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
  * ══════════════════════════════════════════ */
 
 /* atom_eq for a column of a table / dict cell.  A SYM column is read at
- * its storage width (the vector branch reads 8 bytes a cell) and compared
- * by text across domains; a STR column by content (a descriptor holds a
+ * its storage width and compared by text across domains (atom_eq's SYM
+ * vectors take the same rule, sym_vec_eq); a STR column by content (a descriptor holds a
  * pool offset and a cached hash).  Other columns take atom_eq. */
 static int atom_eq_cell_col(ray_t* a, ray_t* b) {
     if (a->type != b->type || a->len != b->len ||
@@ -1634,40 +1634,21 @@ static int atom_eq_cell_col(ray_t* a, ray_t* b) {
     return 1;
 }
 
-/* Helper: compare two atoms for equality (value-based) */
-/* Cell i of a SYM vector as a runtime intern id, the domain's LUT fetched
- * once by the caller (sym_cell_runtime_id per cell, without the lookup):
- * positions are relative to the vector's domain (a file domain's LUT maps
- * them; the runtime domain's ids pass through), stored 1, 2, 4 or 8 bytes
- * wide.  -1 for a position outside the domain. */
-static inline int64_t sym_vec_cell_rid(ray_t* v, const int64_t* lut, int64_t n, int64_t i) {
-    int64_t pos = ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs);
-    if (!lut) return pos;
-    return pos >= 0 && pos < n ? lut[pos] : -1;
-}
-
 /* Two SYM vectors are equal when every cell is the same symbol, whatever
- * domain or width each stores it in.  Comparing len * 8 raw bytes read past
- * a narrow vector and told the same symbols at two widths apart (#1311). */
+ * domain or width each stores it in: positions within one domain, text
+ * across two.  Comparing len * 8 raw bytes read past a narrow vector and
+ * told the same symbols at two widths apart (#1311).  It reads borrowed
+ * cells only and interns nothing, so it is safe in a pool worker. */
 static int sym_vec_eq(ray_t* a, ray_t* b) {
     if (a->len != b->len) return 0;
-    struct ray_sym_domain_s* da = ray_sym_vec_domain(a);
-    struct ray_sym_domain_s* db = ray_sym_vec_domain(b);
-    size_t wa = RAY_SYM_ELEM(a->attrs), wb = RAY_SYM_ELEM(b->attrs);
-    if (da == db && wa == wb)
-        return memcmp(ray_data(a), ray_data(b), (size_t)a->len * wa) == 0;
-    bool ra = da == ray_sym_runtime_domain(), rb = db == ray_sym_runtime_domain();
-    const int64_t* la = ra ? NULL : ray_sym_domain_runtime_lut(da);
-    const int64_t* lb = rb ? NULL : da == db ? la : ray_sym_domain_runtime_lut(db);
-    if ((!ra && !la) || (!rb && !lb)) return 0;   /* a domain that cannot resolve */
-    int64_t na = ra ? 0 : ray_sym_domain_count(da), nb = rb ? 0 : ray_sym_domain_count(db);
-    for (int64_t i = 0; i < a->len; i++) {
-        int64_t x = sym_vec_cell_rid(a, la, na, i);
-        if (x < 0 || x != sym_vec_cell_rid(b, lb, nb, i)) return 0;
-    }
-    return 1;
+    if (ray_sym_vec_domain(a) == ray_sym_vec_domain(b) &&
+        RAY_SYM_ELEM(a->attrs) == RAY_SYM_ELEM(b->attrs))
+        return memcmp(ray_data(a), ray_data(b),
+                      (size_t)a->len * RAY_SYM_ELEM(a->attrs)) == 0;
+    return atom_eq_cell_col(a, b);
 }
 
+/* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
         if (ray_timespan_binary_type(OP_EQ, a->type, b->type) <= 0) return 0;
