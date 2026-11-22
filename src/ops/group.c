@@ -9833,7 +9833,12 @@ static bool sum_atom_value(ray_t* x, bool* is_f64, double* out_f64, int64_t* out
 /* agg_int_null_sentinel_for moved to internal.h (shared with pivot.c). */
 
 /* Fused SUM/AVG(a*b) per-row product — both sides promoted to double,
- * matching the expr path exactly (see try_prod_sumavg_input_f64). */
+ * matching the expr path exactly (see try_prod_sumavg_input_f64).  The
+ * columns are null-free, but the product can overflow: a non-finite one is
+ * 0Nf in the expression's own kernel, and every reader skips it as a null
+ * (#1349).  It comes back raw: each reader tests finiteness where it
+ * already branches on the row (canonicalizing here first, ray_f64_fin,
+ * cost the keyless SUM 6% single-threaded). */
 static inline double prod_val_f64(const agg_prod_t* p, int64_t r) {
     double x = (p->ta == RAY_F64) ? ((const double*)p->pa)[r]
              : (double)read_col_i64(p->pa, r, p->ta, p->aa);
@@ -9845,35 +9850,45 @@ static inline double prod_val_f64(const agg_prod_t* p, int64_t r) {
 /* Pool worker + fallback materializer for fused-product slots.  Group
  * paths WITHOUT the fused read (radix sp / HT row-layout) call this at
  * entry: each enabled slot becomes an ordinary owned F64 agg vector and
- * the slot is disabled — semantics identical to the never-fused flow.
- * Returns false on OOM (nothing partially converted is leaked: converted
- * slots are ordinary owned agg_vecs freed by the caller's error path). */
+ * the slot is disabled — semantics identical to the never-fused flow,
+ * HAS_NULLS included when a product overflowed.  *nulls (may be NULL) is
+ * set when any converted slot holds one.  Returns false on OOM (nothing
+ * partially converted is leaked: converted slots are ordinary owned
+ * agg_vecs freed by the caller's error path). */
 typedef struct {
     const agg_prod_t* prod;
     double*           dst;
+    ray_t*            vec;
 } prod_fill_ctx_t;
 
 static void prod_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     prod_fill_ctx_t* c = (prod_fill_ctx_t*)raw;
-    for (int64_t i = start; i < end; i++)
-        c->dst[i] = prod_val_f64(c->prod, i);
+    int any_nan = 0;
+    for (int64_t i = start; i < end; i++) {
+        double v = ray_f64_fin(prod_val_f64(c->prod, i));
+        c->dst[i] = v;
+        any_nan |= (v != v);
+    }
+    if (any_nan)
+        __atomic_fetch_or(&c->vec->attrs, (uint8_t)RAY_ATTR_HAS_NULLS, __ATOMIC_RELAXED);
 }
 
 static bool group_materialize_prod_slots(agg_prod_t* prod, ray_t** agg_vecs,
                                          uint8_t* agg_owned, uint8_t n_aggs,
-                                         int64_t nrows) {
+                                         int64_t nrows, bool* nulls) {
     for (uint32_t a = 0; a < n_aggs; a++) {
         if (!prod[a].enabled) continue;
         ray_t* v = ray_vec_new(RAY_F64, nrows > 0 ? nrows : 1);
         if (!v || RAY_IS_ERR(v)) return false;
         v->len = nrows;
-        prod_fill_ctx_t fc = { .prod = &prod[a], .dst = (double*)ray_data(v) };
+        prod_fill_ctx_t fc = { .prod = &prod[a], .dst = (double*)ray_data(v), .vec = v };
         ray_pool_t* pool = ray_pool_get();
         if (pool && nrows >= RAY_PARALLEL_THRESHOLD)
             ray_pool_dispatch(pool, prod_fill_fn, &fc, nrows);
         else
             prod_fill_fn(&fc, 0, 0, nrows);
+        if (nulls && (v->attrs & RAY_ATTR_HAS_NULLS)) *nulls = true;
         agg_vecs[a] = v;
         agg_owned[a] = 1;
         prod[a].enabled = false;
@@ -9899,6 +9914,8 @@ struct scalar_ctx_s {
     uint16_t*      agg_ops;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
+    int64_t*       prod_skipped; /* per agg: overflowed products skipped
+                                  * while no nn_count is kept (atomic) */
     uint32_t       n_aggs;
     uint8_t        need_flags;
     const int64_t* match_idx;    /* NULL = no selection */
@@ -10418,6 +10435,12 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
             fv = prod_val_f64(&c->agg_prod[a], r);
+            if (RAY_UNLIKELY(!(__builtin_fabs(fv) <= DBL_MAX))) {
+                /* overflowed: a null.  Without per-agg non-null counts an
+                 * AVG takes its divisor from the rows less these. */
+                fv = NULL_F64;
+                if (!nn) __atomic_fetch_add(&c->prod_skipped[a], 1, __ATOMIC_RELAXED);
+            }
             iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_linear && c->agg_linear[a].enabled) {
             const agg_linear_t* lin = &c->agg_linear[a];
@@ -11037,9 +11060,9 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
         for (uint32_t a = 0; a < n_aggs; a++) {
             size_t idx = base + a;
             if (c->agg_prod && c->agg_prod[a].enabled) {
-                /* Fused product: gated null-free, so every row counts. */
-                acc->sum[idx].f += prod_val_f64(&c->agg_prod[a], r);
-                if (nn) nn[idx]++;
+                /* Fused product: an overflowed one is 0Nf, skipped. */
+                double v = prod_val_f64(&c->agg_prod[a], r);
+                if (RAY_LIKELY(__builtin_fabs(v) <= DBL_MAX)) { acc->sum[idx].f += v; if (nn) nn[idx]++; }
                 continue;
             }
             if (!c->agg_ptrs[a]) continue;
@@ -11097,7 +11120,7 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
         size_t idx = base + a;
         double fv; int64_t iv;
         if (c->agg_prod && c->agg_prod[a].enabled) {
-            fv = prod_val_f64(&c->agg_prod[a], r);
+            fv = ray_f64_fin(prod_val_f64(&c->agg_prod[a], r));
             iv = ray_cast_f64_to_i64_null(fv);   /* an inf product: no raw cast (#1343) */
         } else if (c->agg_strlen && c->agg_strlen[a]) {
             /* SUM/AVG(strlen) only: as the SUM/AVG fast path above. */
@@ -14547,6 +14570,23 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
     }
 
+    /* A fused product that overflowed is a null the slice loops count as
+     * a row (#1349); it leaves the group's total non-finite.  Hand such a
+     * query to the selection the slices fold into, whose paths skip it. */
+    for (uint32_t a = 0; a < n_aggs && sums; a++) {
+        if (!prod[a].enabled) continue;
+        bool fin = true;
+        for (int64_t gi = 0; gi < K; gi++)
+            fin &= __builtin_fabs(sums[(size_t)gi * n_aggs + a].f) <= DBL_MAX;
+        if (!fin) {
+            scratch_free(sum_hdr); scratch_free(cnt_hdr);
+            scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+            scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+            scratch_free(sum_hi_hdr);
+            return NULL;
+        }
+    }
+
     /* Emit: key column (domain ids in slice order), then the shared agg
      * emitter — same types, same divisors, same fusion families as the
      * DA path. */
@@ -16562,7 +16602,9 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         bool sc_staged = false;
         for (uint32_t a = 0; a < n_aggs; a++) {
             if (agg_prod[a].enabled) {
-                /* Fused product: F64 accumulate, no source vec. */
+                /* Fused product: F64 accumulate, no source vec.  An
+                 * overflowed product is a null, skipped and counted apart
+                 * (sc_prod_skipped): no per-row non-null count. */
                 agg_ptrs[a]  = NULL;
                 agg_types[a] = RAY_F64;
                 sc_int_null_sentinel[a] = 0;
@@ -16814,6 +16856,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * statistics rule for every input (a plain column beside the staged
          * ones is read by rows). */
         uint8_t sc_rule[vla_aggs];
+        int64_t sc_prod_skipped[vla_aggs];
+        memset(sc_prod_skipped, 0, sizeof sc_prod_skipped);
         bool sc_chunk_route = sc_staged && !match_idx && !has_first_last &&
                               (!rowsel || ray_rowsel_meta(rowsel)->nrows == nrows);
         for (uint32_t a = 0; a < n_aggs; a++) {
@@ -16955,6 +16999,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .agg_ops    = ext->agg_ops,
             .agg_linear = agg_linear,
             .agg_prod   = agg_prod,
+            .prod_skipped = sc_prod_skipped,
             .n_aggs     = n_aggs,
             .need_flags = need_flags,
             .match_idx  = match_idx,
@@ -17163,11 +17208,21 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             return result ? result : ray_error("oom", NULL);
         }
 
+        /* Without nn_count every input but a fused product is null-free:
+         * the non-null rows are the count, less a product's skipped ones. */
+        int64_t sc_prod_nn[vla_aggs];
+        int64_t* sc_nn = m->nn_count;
+        for (uint32_t a = 0; a < n_aggs && !sc_nn; a++) {
+            if (!sc_prod_skipped[a]) continue;
+            for (uint32_t b = 0; b < n_aggs; b++)
+                sc_prod_nn[b] = m->count[0] - sc_prod_skipped[b];
+            sc_nn = sc_prod_nn;
+        }
         emit_agg_columns(&result, g, ext, emit_vecs, 1, n_aggs,
                          (double*)m->sum, (int64_t*)m->sum, m->sum_hi,
                          (double*)m->min_val, (double*)m->max_val,
                          (int64_t*)m->min_val, (int64_t*)m->max_val,
-                         m->count, agg_affine, agg_prod, m->sumsq_f64, m->nn_count,
+                         m->count, agg_affine, agg_prod, m->sumsq_f64, sc_nn,
                          NULL, NULL, NULL);
         scalar_emit_vecs_free(sv_hdr, emit_vecs, agg_vecs, n_aggs);
 
@@ -17645,11 +17700,14 @@ da_path:;
                         da_any_nullable = true;
                 }
                 if (agg_prod[a].enabled) {
-                    /* Fused product: F64 accumulate, no source vec. */
+                    /* Fused product: F64 accumulate, no source vec; an
+                     * overflowed product is null (prod_val_f64), skipped:
+                     * an AVG counts the non-null rows. */
                     agg_ptrs[a]  = NULL;
                     agg_types[a] = RAY_F64;
                     agg_f64_mask |= ((uint64_t)1 << a);
                     da_int_null_sentinel[a] = 0;
+                    if (ext->agg_ops[a] == OP_AVG) da_any_nullable = true;
                     continue;
                 }
                 /* A staged input: type and nullability from its bound source
@@ -18454,9 +18512,14 @@ da_path:;
         if (sp_eligible) {
             /* The radix entry layout reads agg_vecs directly — convert any
              * fused-product slots into ordinary materialized inputs.  OOM
-             * here simply skips the sp path; ht_path materializes again. */
+             * here simply skips the sp path; ht_path materializes again.
+             * The sp kernels read raw values, so an overflowed product
+             * (a null in the converted slot) also takes ht_path, as a
+             * nullable input does (the eligibility loop above). */
+            bool sp_prod_nulls = false;
             if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
-                                              n_aggs, nrows))
+                                              n_aggs, nrows, &sp_prod_nulls) ||
+                sp_prod_nulls)
                 goto ht_path;
             /* VLA sized to vla_aggs (== n_aggs): agg_ptrs/agg_types are
              * per-element arrays, not bitmasks.  sp_eligible caps n_aggs <=
@@ -19230,7 +19293,7 @@ ht_path:;
     /* The HT row-layout reads agg_vecs directly — convert any fused-product
      * slots into ordinary materialized inputs first. */
     if (!group_materialize_prod_slots(agg_prod, agg_vecs, agg_owned,
-                                      n_aggs, nrows)) {
+                                      n_aggs, nrows, NULL)) {
         for (uint32_t a = 0; a < n_aggs; a++)
             { if (agg_owned[a] && agg_vecs[a]) ray_release(agg_vecs[a]);
               if (agg_owned2[a] && agg_vecs2[a]) ray_release(agg_vecs2[a]); }

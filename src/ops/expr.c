@@ -1078,12 +1078,16 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     int8_t bt = base_src->type;
     ray_t* base_vec = NULL;
     if (bt == RAY_F64) {
+        /* sum(x) + n*c is the per-row sum only while no x + c overflows:
+         * an overflowing row is 0Nf per row and skipped (#1349).  Below
+         * 2^970, half an ulp of DBL_MAX, no finite x can carry x + c past
+         * it; a null c (x + 0Nf is all null) fails the test too. */
+        double bias = (double)sign * (c_is_f64 ? c_f : (double)c_i);
+        if (!(fabs(bias) < 0x1p970)) return false;
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
-        out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
-        /* An F64 base reads bias_f64; the int copy must not be a raw cast
-         * of an out-of-range or non-finite bias (#1343). */
-        out_affine->bias_i64 = ray_cast_f64_to_i64_null(out_affine->bias_f64);
+        out_affine->bias_f64 = bias;
+        out_affine->bias_i64 = ray_cast_f64_to_i64_null(bias);
         *out_vec = base_vec;
         return true;
     }
