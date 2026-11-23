@@ -24,6 +24,8 @@ Signatures:
 
 Returns: a `table`. Empty fields use the selected type's missing-input behavior. Sentinel-nullable columns record nulls with `RAY_ATTR_HAS_NULLS`; `SYM`/`STR` fields collapse to ordinary empty values and those columns do not acquire `RAY_ATTR_HAS_NULLS` from them.
 
+A UTF-8 byte-order mark (the bytes `EF BB BF`, as spreadsheet exports write) at the start of the file is skipped: it is part of neither the first column name nor, in a file without a header, the first cell. `.csv.splayed` and `.csv.parted` skip it too.
+
 Errors: `type` (bad arg), `domain` (path is null / too long, or zero columns), `io` (open/read failure), `limit` (>256 columns).
 
 Examples:
