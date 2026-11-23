@@ -72,5 +72,10 @@
 (update {v: (list 1 2 3) from: t}) !- type
 (update {v: (list 1 2 3) from: t where: (== k 'a)}) !- type
 (update {v: (list 1 2) from: t by: k}) !- type
-;; a LIST column still takes a LIST
-(at (update {c: (list 1 2 3) from: (table [k c] (list ['a 'b 'a] (list [1 2] "x" 'y)))}) 'c) -- (list 1 2 3)
+;; a LIST column keeps its type: a LIST is stored, an atom or a typed vector boxed
+(set L (table [k c] (list ['a 'b 'a] (list [1 2] "x" 'y))))
+(at (update {c: (list 1 2 3) from: L}) 'c) -- (list 1 2 3)
+(at (update {c: [1 2 3] from: L}) 'c) -- (list 1 2 3)
+(type (at (update {c: ['p 'q 'r] from: L}) 'c)) -- 'LIST
+(at (update {c: 7 from: L}) 'c) -- (list 7 7 7)
+(at (update {c: 'w from: L}) 'c) -- (list 'w 'w 'w)

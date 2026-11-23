@@ -29779,7 +29779,7 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
  * the column's type; anything else is a type error.  The widenings: BOOL and
  * U8 into any wider integer or float, I16 into I32 / I64 / F32 / F64, I32 into
  * I64 / F64, I64 into F64 (an integer literal into a float column), F32 into
- * F64.  A LIST column takes any value, as before. */
+ * F64.  A LIST column keeps its type: a typed value is boxed into it. */
 static bool update_widens(int8_t ct, int8_t vt) {
     if (vt == ct || ct == RAY_LIST) return true;
     switch (vt) {
@@ -29796,7 +29796,19 @@ static bool update_widens(int8_t ct, int8_t vt) {
 /* `v` (owned: an atom or a vector) as a value of the column type ct, or the
  * type error.  The value is consumed either way. */
 static ray_t* update_conform(ray_t* v, int8_t ct) {
-    if (!v || RAY_IS_ERR(v) || ct == RAY_LIST || ct <= 0) return v;
+    if (!v || RAY_IS_ERR(v)) return v;
+    if (ct == RAY_LIST) {
+        /* a LIST column keeps its type too: a typed vector is boxed, cell by
+         * cell (an atom is boxed into every row where it is broadcast) */
+        if (v->type <= 0 || !ray_is_vec(v)) return v;
+        ray_t* ts = ray_sym(ray_sym_intern("LIST", 4));
+        if (!ts || RAY_IS_ERR(ts)) { ray_release(v); return ts ? ts : ray_error("oom", NULL); }
+        ray_t* w = ray_cast_fn(ts, v);
+        ray_release(ts);
+        ray_release(v);
+        return w ? w : ray_error("oom", NULL);
+    }
+    if (ct <= 0) return v;
     bool atom = v->type < 0;
     int8_t vt = atom ? (int8_t)-v->type : v->type;
     if (vt == ct) return v;
@@ -29822,7 +29834,7 @@ static ray_t* update_value_check(ray_t* col, ray_t* val, int64_t k) {
     int8_t ct = col->type;
     if (val->type < 0) {
         int ok = (val->type == -ct) || update_widens(ct, (int8_t)-val->type) ||
-                 (ct == RAY_LIST && val->type == -RAY_SYM);
+                 ct == RAY_LIST;   /* an atom into a LIST column is boxed into each row */
         if (!ok) return ray_error("type", "update: cannot assign %s value to %s column",
                                   ray_type_name(val->type), ray_type_name(ct));
         return NULL;
@@ -30909,15 +30921,15 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 int8_t ct = oct;
                 /* Type check atom against column type BEFORE broadcast */
                 int ok = (expr_vec->type == -ct);
-                /* SYM atom → LIST column (LIST of SYM atoms) */
-                if (!ok && ct == RAY_LIST && expr_vec->type == -RAY_SYM) ok = 1;
+                /* any atom into a LIST column: boxed into every row (#1458) */
+                if (!ok && ct == RAY_LIST) ok = 1;
                 if (!ok) {
                     int8_t ev_t = expr_vec->type;            /* capture BEFORE free */
                     ray_release(expr_vec); ray_release(result); ray_release(tbl);
                     DICT_VIEW_CLOSE(upda); return ray_error("type", "update: cannot assign %s value to %s column", ray_type_name(ev_t), ray_type_name(ct));
                 }
-                /* SYM atom to LIST column: broadcast as boxed list */
-                if (ct == RAY_LIST && expr_vec->type == -RAY_SYM) {
+                /* an atom into a LIST column: broadcast as boxed list */
+                if (ct == RAY_LIST) {
                     ray_t* bcast = ray_list_new((int32_t)nrows);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     for (int64_t r = 0; r < nrows; r++) {

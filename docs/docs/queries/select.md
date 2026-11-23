@@ -601,7 +601,7 @@ So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every
 
 Integer arithmetic yields `I64`, so to update an `I32`, `I16` or `U8` column, write the literal in the column's type, as in `(update {qty: (+ qty 1i) from: 't})`, or cast the result.
 
-A `LIST` value into a typed column is a `type` error. A `LIST` column takes a `LIST` value. A new column takes the value's type.
+A `LIST` value into a typed column is a `type` error. A `LIST` column keeps its type too: a `LIST` value is stored as it is, and an atom or a typed vector is boxed into it cell by cell, so `(update {l: [1 2 3] from: t})` gives a `LIST` of three `i64` atoms. An update of a `LIST` column with `where:` or `by:` is not supported yet (#1468). A new column takes the value's type.
 
 ### Update with Group-by
 

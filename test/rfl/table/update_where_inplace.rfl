@@ -152,3 +152,9 @@
 (update {from: 'w g: f where: (> k 1)}) !- type
 (update {from: 'w e: (list 1 2 3) where: (> k 1)}) !- type
 (at w 'i) -- (as 'I32 [1 0Nl 9])
+;; an atom into a LIST column in place is boxed into each matched row
+(set L (table [k l] (list [1 1 2] (list [1 2] "x" 'y))))
+(update {from: 'L l: 7 where: (== k 1)})
+(at L 'l) -- (list 7 7 'y)
+(update {from: 'L l: 'z where: (== k 2)})
+(at L 'l) -- (list 7 7 'z)
