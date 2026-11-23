@@ -1,0 +1,94 @@
+;; @also-unfused
+;; A fused I16 / I32 + - * chain narrows each step, so a step that wraps or
+;; lands on the type's minimum gives the null (#1470).  When column bounds
+;; prove that no step can leave the type's non-null range, the chain keeps
+;; its I64 lane and narrows once (#1474).  Every answer here is the eager
+;; per-step one, with and without bounds; the route is pinned by the C test
+;; lang/eval/narrow_bounded_route.
+
+;; ─── bounds exactly at the I16 limits: + 1h and - 1h are not proved ──────
+(set h (.idx.zone [32767h -32767h 0h 5h]))
+(set T (table [h] (list h)))
+(at (select {z: (- (+ h 1h) 1h) from: T}) 'z) -- [0Nh -32767h 0h 5h]
+(at (select {z: (- (+ h 1h) 1h) from: T}) 'z) -- (- (+ h 1h) 1h)
+(nil? (at (select {z: (- (+ h 1h) 1h) from: T}) 'z)) -- [true false false false]
+(at (select {z: (+ (- h 1h) 1h) from: T}) 'z) -- [32767h 0Nh 0h 5h]
+(at (select {z: (- (- -1h h) 1h) from: T}) 'z) -- [0Nh 32765h -2h -7h]
+;; proved at the limits: the chain is the column itself
+(at (select {z: (+ (+ h 0h) 0h) from: T}) 'z) -- h
+(at (select {z: (* (- h 0h) 1h) from: T}) 'z) -- h
+(at (select {z: (- (- 0h h) 0h) from: T}) 'z) -- [-32767h 32767h 0h -5h]
+(nil? (at (select {z: (- (- 0h h) 0h) from: T}) 'z)) -- [false false false false]
+
+;; one inside the limits: proved, and the answer is the exact one
+(set k (.idx.zone [32766h -32767h 0h 5h]))
+(set K (table [k] (list k)))
+(at (select {z: (- (+ k 1h) 1h) from: K}) 'z) -- [32766h -32767h 0h 5h]
+(nil? (at (select {z: (- (+ k 1h) 1h) from: K}) 'z)) -- [false false false false]
+(at (select {z: (> (- (+ k 1h) 1h) 0h) from: K}) 'z) -- [true false false true]
+
+;; the same at the I32 limits
+(set i (.idx.zone [2147483647i -2147483647i 0i]))
+(set I (table [i] (list i)))
+(at (select {z: (- (+ i 1i) 1i) from: I}) 'z) -- [0Ni -2147483647i 0i]
+(at (select {z: (+ (- i 1i) 1i) from: I}) 'z) -- [2147483647i 0Ni 0i]
+(at (select {z: (+ (+ i 0i) 0i) from: I}) 'z) -- i
+(set j (.idx.zone [2147483646i -2147483647i 0i]))
+(set J (table [j] (list j)))
+(at (select {z: (- (+ j 1i) 1i) from: J}) 'z) -- j
+(at (select {z: (* (* j 1i) 2i) from: J}) 'z) -- (* (* j 1i) 2i)
+
+;; nulls present: the bounds cover the values, the null still propagates
+(set hn (.idx.zone [0Nh 100h -100h]))
+(set N (table [hn] (list hn)))
+(at (select {z: (- (+ (* hn 3h) hn) 7h) from: N}) 'z) -- [0Nh 393h -407h]
+(nil? (at (select {z: (- (+ (* hn 3h) hn) 7h) from: N}) 'z)) -- [true false false]
+(at (select {z: (> (+ (* hn 3h) hn) 5h) from: N}) 'z) -- (> (+ (* hn 3h) hn) 5h)
+(at (update {z: (- (+ (* hn 3h) hn) 7h) from: N}) 'z) -- [0Nh 393h -407h]
+
+;; an explicit cast stays a step that can give the null, even with bounds
+(set x (.idx.zone [32768i 1i]))
+(set X (table [x] (list x)))
+(at (select {z: (- (as 'I16 x) 1h) from: X}) 'z) -- [0Nh 0h]
+(nil? (at (select {z: (- (as 'I16 x) 1h) from: X}) 'z)) -- [true false]
+(at (select {z: (+ (- (as 'I16 x) 1h) 1h) from: X}) 'z) -- [0Nh 1h]
+
+;; sorted order is a bound too (no index)
+(set hs (.attr.set 'sorted [-32767h 0h 32767h]))
+(set S (table [hs] (list hs)))
+(at (select {z: (- (+ hs 1h) 1h) from: S}) 'z) -- [-32767h 0h 0Nh]
+(set ks (.attr.set 'sorted [-5h 0h 5h]))
+(set S2 (table [ks] (list ks)))
+(at (select {z: (- (+ (* ks 3h) ks) 7h) from: S2}) 'z) -- [-27h -7h 13h]
+
+;; no bounds: every step narrows, as before
+(set u [32767h -32767h 0h 5h])
+(set U (table [u] (list u)))
+(at (select {z: (- (+ u 1h) 1h) from: U}) 'z) -- [0Nh -32767h 0h 5h]
+
+;; 200k rows (the parallel path), with and without bounds, against eager
+(set n 200000)
+(set r (til n))
+(set a (as 'I16 (- (% r 2001) 1000)))
+(set b (as 'I16 (- (% (* r 7) 1999) 999)))
+(set p (as 'I32 (- (% r 200001) 100000)))
+(set q (as 'I32 (- (% (* r 7) 199999) 99999)))
+(set Z (table [a b p q] (list (.idx.zone a) (.idx.zone b) (.idx.zone p) (.idx.zone q))))
+(set P (table [a b p q] (list a b p q)))
+(at (select {z: (- (+ (* a 3h) b) 7h) from: Z}) 'z) -- (- (+ (* a 3h) b) 7h)
+(at (select {z: (- (+ (* a 3h) b) 7h) from: P}) 'z) -- (- (+ (* a 3h) b) 7h)
+(at (select {z: (- (+ (* p 3i) q) 7i) from: Z}) 'z) -- (- (+ (* p 3i) q) 7i)
+(at (select {z: (> (+ (* p 3i) q) 5i) from: Z}) 'z) -- (> (+ (* p 3i) q) 5i)
+(nil? (at (select {z: (- (+ (* p 3i) q) 7i) from: Z}) 'z)) -- (take false n)
+;; a chain the bounds cannot prove (a * 40h reaches 40000): wraps step by step
+(at (select {z: (- (* a 40h) b) from: Z}) 'z) -- (- (* a 40h) b)
+(sum (nil? (at (select {z: (- (* (+ a 1h) 33h) 1h) from: Z}) 'z))) -- (sum (nil? (- (* (+ a 1h) 33h) 1h)))
+;; a splayed load carries a chunk zone: the same answers from its bounds
+(.sys.exec "rm -rf /tmp/rfl_narrow_bounded_defer/") -- 0
+(.db.splayed.set "/tmp/rfl_narrow_bounded_defer/t/" P)
+(set D (.db.splayed.get "/tmp/rfl_narrow_bounded_defer/t/"))
+(at (.idx.info (at D 'a)) 'kind) -- 'chunk_zone
+(at (select {z: (- (+ (* a 3h) b) 7h) from: D}) 'z) -- (- (+ (* a 3h) b) 7h)
+(at (select {z: (> (+ (* p 3i) q) 5i) from: D}) 'z) -- (> (+ (* p 3i) q) 5i)
+(at (select {z: (- (* a 40h) b) from: D}) 'z) -- (- (* a 40h) b)
+(.sys.exec "rm -rf /tmp/rfl_narrow_bounded_defer/") -- 0
