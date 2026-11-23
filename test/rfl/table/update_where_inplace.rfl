@@ -32,7 +32,9 @@
 (update {from: 'p f: 7 where: (== k 2)})
 (at p 'f) -- [1.5 7.0 3.5]
 (update {from: 'p i: 2.9 where: (== k 2)}) !- type
-(update {from: 'p i: (* f 2) where: (== k 3)})
+(update {from: 'p i: (* f 2) where: (== k 3)}) !- type
+(at p 'i) -- [10 20 30]
+(update {from: 'p i: (as 'I64 (* f 2)) where: (== k 3)})
 (at p 'i) -- [10 20 7]
 (update {from: 'p f: (+ i 1) where: (== k 1)})
 (at p 'f) -- [11.0 7.0 3.5]

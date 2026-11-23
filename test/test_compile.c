@@ -442,16 +442,22 @@ static test_result_t test_compile_i64_scalar_null_propagation_slot_is_sentinel(v
 }
 
 static test_result_t test_compile_update_promo_f64_to_i64_null_slot_is_sentinel(void) {
-    /* UPDATE-WHERE that promotes an F64 expression with nulls into an
-     * I64 column must fill NULL_I64 in the destination payload, not the
-     * implementation-defined garbage from (int64_t)NaN. */
+    /* An F64 expression into an I64 column is a type error (#1458: the
+     * column keeps its type, only lossless widenings are stored).  An I32
+     * expression with nulls widens into it and must fill NULL_I64 in the
+     * destination payload, not a converted sentinel. */
+    ray_t* e = ray_eval_str(
+        "(do (set t (table [a b] (list [10 20 30] [1 2 3]))) "
+          "(update {a: [1.5 0Nf 3.5] where: (> b 0) from: t}))");
+    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
+    ray_error_free(e);
     ray_t* r = ray_eval_str(
         "(do "
           "(set t (table [a b] (list [10 20 30] [1 2 3]))) "
-          "(set u (update {a: [1.5 0Nf 3.5] where: (> b 0) from: t})) "
+          "(set u (update {a: (as 'I32 [1 0Nl 3]) where: (> b 0) from: t})) "
           "(at u 'a))");
     TEST_ASSERT_NOT_NULL(r);
-    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update promo f64->i64"); }
+    if (RAY_IS_ERR(r)) { ray_error_free(r); FAIL("eval error on update promo i32->i64"); }
     TEST_ASSERT(ray_is_vec(r), "expected vector");
     TEST_ASSERT(r->type == RAY_I64, "expected I64 vector");
     TEST_ASSERT(r->len == 3, "expected len 3");
