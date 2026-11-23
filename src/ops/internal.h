@@ -1063,7 +1063,7 @@ typedef struct {
      * pre_sum is the whole column's total, exact (it cannot leave int64),
      * and a lone unfiltered SUM / AVG takes it without a pass. */
     bool    pre;
-    int64_t pre_sum;
+    int64_t pre_sum, pre_hi;
     /* pre_sum also holds rows the pass summed row by row (they could wrap):
      * the plan is the total alone, never the per-row terms */
     bool    pre_only;
@@ -1491,10 +1491,19 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
  * (ray_col_src_bind) and reads by range.  try_linear_sumavg_input_i64 and
  * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
  * yet materialized declines them (*err NULL). */
+/* Borrowed identity of an exact plain I64 slice, valid within one group execution. */
+typedef struct {
+    const ray_t* obj;
+    const void* base;
+    int64_t rows, lo, hi;
+} affine_bounds_t;
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                              bool f64_bias_ok, bool defer_scan,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
+bool try_affine_sumavg_pair(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                             bool f64_bias_ok, bool defer_scan, affine_bounds_t* bounds,
+                             ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone, bool avg,
                                  agg_linear_t* out_plan, ray_t** err);
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                agg_prod_t* out, ray_t** err);
