@@ -1270,21 +1270,20 @@ static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
     return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
 }
 
-/* True when any GROUP BY key names a BOOL column of `tbl`.  A BOOL-keyed
- * group is emitted in key order (false before true) and query.c reorders the
- * finished result to first-occurrence AFTERWARDS, so a take must not be pushed
- * into the DAG ahead of that fix-up. */
-static bool group_keys_have_bool(ray_t* by_expr, ray_t* tbl) {
+/* True unless every GROUP BY key names a column of `tbl`.  A take is pushed
+ * into the DAG only for keys it resolves; the group then keeps the first N
+ * groups in first-seen order, a BOOL column key included (#1247). */
+static bool group_keys_unresolved(ray_t* by_expr, ray_t* tbl) {
     if (!by_expr || !tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return true;
     if (by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED)) {
         ray_col_meta_t m;
-        return !ray_table_col_meta(tbl, by_expr->i64, &m) || m.type == RAY_BOOL;
+        return !ray_table_col_meta(tbl, by_expr->i64, &m);
     }
     if (ray_is_vec(by_expr) && by_expr->type == RAY_SYM) {
         const int64_t* ids = (const int64_t*)ray_data(by_expr);
         for (int64_t i = 0; i < ray_len(by_expr); i++) {
             ray_col_meta_t m;
-            if (!ray_table_col_meta(tbl, ids[i], &m) || m.type == RAY_BOOL) return true;
+            if (!ray_table_col_meta(tbl, ids[i], &m)) return true;
         }
         return false;
     }
@@ -27393,11 +27392,11 @@ by_dict_done:
      * under-fill the answer.  A PARTED input takes the hint too: the parted
      * group keeps the first N groups in first-seen order (the per-partition
      * route carries each group's first global row and keeps the N smallest;
-     * the flattened group takes the hint itself).  A BOOL column key keeps
-     * the post-execution take: its groups are reordered after the group (the
-     * first-occurrence pass below).  A computed key and a name holding a
-     * value are never reordered there, so they take the hint, as their
-     * by-dict spelling does (#1460).  Nor
+     * the flattened group takes the hint itself).  A BOOL column key takes
+     * it too, and the first-occurrence pass below then leaves the groups in
+     * the order the group kept them (#1247).  A computed key and a name
+     * holding a value take the hint, as their by-dict spelling does (#1460).
+     * Nor
      * with a LIST-producing aggregate (top/bot): exec.c's HEAD/TAIL table trim
      * now retains LIST cells, but the group's LIST output has no reason to pay
      * a trim it can skip, and the take is a no-op there anyway. */
@@ -27406,7 +27405,8 @@ by_dict_done:
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
                             && (parted_bydict_deferred || computed_single_key || named_value_key
-                                || !group_keys_have_bool(by_expr, tbl)));
+                                || !group_keys_unresolved(by_expr, tbl)));
+    bool group_head_pushed = false;   /* the group kept the first groups seen */
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
         if (!tv || RAY_IS_ERR(tv)) { ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return tv ? tv : ray_error("domain", "select: failed to evaluate `take:`"); }
@@ -27425,7 +27425,7 @@ by_dict_done:
             }
             ray_release(tv);
             if (group_take_push) {
-                if (n_take > 0) root = ray_head(g, root, n_take);
+                if (n_take > 0) { root = ray_head(g, root, n_take); group_head_pushed = true; }
                 /* n_take <= 0 with a group-by: leave it to apply_sort_take. */
             } else if (n_take >= 0)
                 root = ray_head(g, root, n_take);
@@ -27442,8 +27442,10 @@ by_dict_done:
                 ray_release(tv);
                 /* [start amount] from the front reads only the first
                  * start+amount groups: push that bound like an atom take. */
-                if (take_pre.a >= 0 && take_pre.b > 0 && take_pre.a <= INT64_MAX - take_pre.b)
+                if (take_pre.a >= 0 && take_pre.b > 0 && take_pre.a <= INT64_MAX - take_pre.b) {
                     root = ray_head(g, root, take_pre.a + take_pre.b);
+                    group_head_pushed = true;
+                }
             } else take_range = tv;  /* apply after DAG execution */
         } else {
             int8_t tv_t = tv->type;            /* capture BEFORE free */
@@ -27528,8 +27530,10 @@ by_dict_done:
     }
 
     /* Post-process: reorder GROUP BY BOOL results to match first-occurrence
-     * order in the original table (exec.c radix sort puts false before true) */
-    if (by_expr && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
+     * order in the original table (exec.c radix sort puts false before true).
+     * A take pushed into the group already kept its groups in first-seen
+     * order, of the rows the where: keeps (#1247). */
+    if (by_expr && !group_head_pushed && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
             ray_col_meta_t rkm;
