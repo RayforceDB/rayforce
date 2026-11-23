@@ -43,6 +43,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A comma-decimal locale, so the tests that read and print floats under
+      # it (format/locale/independent, format/json/locale) run, not SKIP.
+      - name: Install a comma-decimal locale
+        if: runner.os == 'Linux' && matrix.target == 'debug'
+        run: sudo locale-gen de_DE.UTF-8
+
       - name: Build (${{ matrix.target }})
         run: make ${{ matrix.target }} CC=${{ matrix.compiler }}
 
@@ -94,6 +100,8 @@ jobs:
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 23
+      - name: Install a comma-decimal locale
+        run: sudo locale-gen de_DE.UTF-8
       - name: Test with Clang 23 (${{ env.TEST_TIER }})
         run: make ${{ env.TEST_TIER }} CC=clang-23
       - name: Upload test replay files
@@ -118,6 +126,8 @@ jobs:
       RAY_MARCH: x86-64
     steps:
       - uses: actions/checkout@v4
+      - name: Install a comma-decimal locale
+        run: sudo locale-gen de_DE.UTF-8
       - name: Test with NDEBUG
         run: make test-ndebug
 

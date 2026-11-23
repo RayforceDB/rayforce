@@ -1468,7 +1468,12 @@ static bool jw_float(jw_t* w, double d, bool f32) {
     while (prec < max_prec && !jw_reads_back(b, k, d, f32))
         k = jw_fmt_c(b, sizeof b, "%.*g", ++prec, d);
     if (k > 0) k = jw_mark_float(b, k, sizeof b);
-    if (k <= 0) { w->err = ray_error("domain", ".json.format: cannot write the float %g", d); return false; }
+    if (k <= 0) {
+        char t[32];
+        ray_snprintf_c(t, sizeof t, "%g", d);
+        w->err = ray_error("domain", ".json.format: cannot write the float %s", t);
+        return false;
+    }
     /* the positional form with the same significant digits */
     double ad = d < 0 ? -d : d;
     if (strchr(b, 'e') && ad >= 1e-6 && ad < 1e21) {

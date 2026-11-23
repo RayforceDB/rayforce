@@ -22,6 +22,7 @@
  */
 
 #include "ops.h"
+#include "core/numparse.h"   /* ray_snprintf_c */
 #include <stdio.h>
 
 /* Duplicate of find_ext() from opt.c — kept local for self-containment. */
@@ -229,7 +230,12 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
                 int8_t kind = lit->type < 0 ? -lit->type : lit->type;
                 switch (kind) {
                     case RAY_I64:  fprintf(f, "(%lld)", (long long)lit->i64); break;
-                    case RAY_F64:  fprintf(f, "(%.6g)", lit->f64); break;
+                    case RAY_F64: {
+                        char t[32];
+                        ray_snprintf_c(t, sizeof t, "%.6g", lit->f64);
+                        fprintf(f, "(%s)", t);
+                        break;
+                    }
                     case RAY_BOOL: fprintf(f, "(%s)", lit->i64 ? "true" : "false"); break;
                     case RAY_TABLE:fprintf(f, "(table)"); break;
                     default:      fprintf(f, "(?)"); break;
