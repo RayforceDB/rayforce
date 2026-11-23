@@ -1,12 +1,13 @@
-;; @requires: posix  (the server is spawned and stopped through bash: /dev/tcp, $RANDOM)
+;; @requires: posix  (the server is spawned and stopped through bash: test/serve.sh, /dev/tcp, kill)
 ;; An error object is not reference counted, so ray_release leaves it alone and every
 ;; place that released a decoded or evaluated result which turned out to be an error
 ;; left a 64-byte block in the server (300 failing requests: 19200 bytes).  A server
 ;; that outlives its clients grows with every bad message it is sent.  The server
-;; picks a free port and is stopped by its own pid only.
+;; gets a port of its own (test/serve.sh: it is the one listening there, not another
+;; suite's server) and is stopped by its own pid only.
 
-(.sys.exec "bash -c 'D=/tmp/rfl_ipc_leak; rm -rf $D; mkdir -p $D; while :; do P=$((30000 + RANDOM % 20000)); (echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null || break; done; echo $P > $D/port; ./rayforce -p $P </dev/null >/dev/null 2>&1 & echo $! > $D/pid'") -- 0
-(.sys.exec "bash -c 'for i in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$(cat /tmp/rfl_ipc_leak/port)) 2>/dev/null && exit 0; sleep 0.1; done; exit 1'") -- 0
+(.sys.exec "rm -rf /tmp/rfl_ipc_leak")
+(.sys.exec "test/serve.sh /tmp/rfl_ipc_leak") -- 0
 
 (set port (trim (read "/tmp/rfl_ipc_leak/port")))
 (set h (.ipc.open (format "127.0.0.1:%" port)))
@@ -63,4 +64,4 @@
 (< (- (smem) s7) 3000) -- true
 
 (try (.ipc.send h "(exit 0)") 0)
-(.sys.exec "bash -c 'kill $(cat /tmp/rfl_ipc_leak/pid) 2>/dev/null; rm -rf /tmp/rfl_ipc_leak; exit 0'") -- 0
+(.sys.exec "bash -c 'D=/tmp/rfl_ipc_leak; [ -f $D/pid ] && kill $(cat $D/pid) 2>/dev/null; rm -rf $D; exit 0'") -- 0

@@ -1,0 +1,31 @@
+;; @requires: posix  (test/serve.sh: bash, kill, ss or lsof)
+;; test/serve.sh starts the servers of the IPC tests (#1140).  A test stops at
+;; its first failing assertion and a run can be interrupted, so the stop at the
+;; end of a test file is not what keeps a server from outliving it: the server,
+;; and any helper tied to it, stop when the process that asked for them is gone,
+;; and their pid and port files go with them.  Here that process is a `sleep`
+;; named with --owner, killed by the test.
+
+(.sys.exec "rm -rf /tmp/rfl_serve_cleanup; mkdir -p /tmp/rfl_serve_cleanup") -- 0
+(.sys.exec "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_serve_cleanup/owner") -- 0
+(.sys.exec "test/serve.sh --owner $(cat /tmp/rfl_serve_cleanup/owner) /tmp/rfl_serve_cleanup/a") -- 0
+(.sys.exec "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_serve_cleanup/helper; test/serve.sh --owner $(cat /tmp/rfl_serve_cleanup/owner) --tie $! /tmp/rfl_serve_cleanup") -- 0
+
+;; the server is up, and it is the one on the port it wrote
+(.sys.exec "kill -0 $(cat /tmp/rfl_serve_cleanup/a/pid)") -- 0
+(set h (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_serve_cleanup/a/port")))))
+(.ipc.send h "(+ 1 2)") -- 3
+(.ipc.close h)
+
+;; the owner goes: the server and the helper follow, the files are removed
+(.sys.exec "cp /tmp/rfl_serve_cleanup/a/pid /tmp/rfl_serve_cleanup/server; kill $(cat /tmp/rfl_serve_cleanup/owner)") -- 0
+(.sys.exec "D=/tmp/rfl_serve_cleanup; P=$(cat $D/server); H=$(cat $D/helper); for i in $(seq 100); do kill -0 $P 2>/dev/null || kill -0 $H 2>/dev/null || [ -e $D/a/pid ] || [ -e $D/a/port ] || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; a server its test stops itself: the watchdog only removes the files
+(.sys.exec "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_serve_cleanup/owner2") -- 0
+(.sys.exec "test/serve.sh --owner $(cat /tmp/rfl_serve_cleanup/owner2) /tmp/rfl_serve_cleanup/b") -- 0
+(.sys.exec "kill $(cat /tmp/rfl_serve_cleanup/b/pid)") -- 0
+(.sys.exec "D=/tmp/rfl_serve_cleanup/b; for i in $(seq 100); do [ -e $D/pid ] || [ -e $D/port ] || exit 0; sleep 0.1; done; exit 1") -- 0
+
+;; owner2 is the one process still running (the others were waited for above)
+(.sys.exec "D=/tmp/rfl_serve_cleanup; kill $(cat $D/owner2) 2>/dev/null; rm -rf $D; exit 0") -- 0
