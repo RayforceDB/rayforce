@@ -335,6 +335,10 @@ bool   ray_idx_lazy_hash_wanted(const ray_t* col);
  * element of the integer vector set.  The caller has ruled out nulls. */
 bool   ray_idx_zone_excludes(const ray_t* col, int64_t key);
 bool   ray_idx_zone_excludes_set(const ray_t* col, const ray_t* set);
+/* The whole-column [min, max] of an integer column's non-null values from
+ * its fresh CHUNK_ZONE or ZONE, never scanning; false without one (or with
+ * no non-null value). */
+bool   ray_idx_int_bounds(ray_t* col, int64_t* lo, int64_t* hi);
 /* Directory twins for a single-file generation-2 column (encv a
  * RAY_ENCCOL): the answer the zone its materialization would synthesize
  * (enc_synth_zone / enc_synth_chunk_zone, src/store/enccol.c) gives,
@@ -546,6 +550,9 @@ bool ray_index_kind_admits(ray_idx_kind_t kind, int8_t parent_type);
  * ray_index_inline_map: patch an mmap'd region's child offsets → absolute ptrs
  *   in place and return the RAY_INDEX object (flagged RAY_MARK_MMAP). */
 int64_t ray_index_inline_size(const ray_index_t* ix);
+/* ray_index_inline_size of a RAY_IDX_DICT over `len` rows and `n_distinct`
+ * strings (I32 codes and first-occurrence rows), without building it. */
+int64_t ray_index_dict_inline_size(int64_t len, int64_t n_distinct);
 void    ray_index_inline_write(uint8_t* dst, const ray_index_t* ix);
 /* The same bytes as ray_index_inline_write, streamed to `f` block by block
  * straight from the child vecs: no region-sized staging buffer (a 100 M-row
@@ -712,6 +719,12 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key);
  * Floats are intentionally not supported — equality on F32/F64
  * has NaN / -0 semantics the unfused compare kernel handles. */
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
+/* ray_index_hash_eq_rowsel for a STR column and the needle's bytes
+ * (`p`, `l`): the hash a STR index is keyed on is the bytes', and each word
+ * hit is confirmed against them.  NULL for an empty needle (the STR null,
+ * whose rows the index leaves out), a stale or missing index, a dense
+ * group or OOM: the caller scans. */
+ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l);
 /* ray_index_hash_eq_rowsel for a single-file generation-2 column whose
  * recorded HASH region is probed where it is mapped, without materializing
  * the column or copying the region: the root's layout is checked against
@@ -724,6 +737,15 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
  * group dense enough for the scan, as ray_index_hash_eq_rowsel declines);
  * -1: *err owned. */
 int    ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err);
+/* ray_enc_hash_eq_rowsel for a single-file generation-2 STR column and the
+ * needle p[0..l): the region's byte-hash words are walked, and a word hit
+ * is confirmed against the group's first row read back by row id; the
+ * column is not materialized.  "" (the null rows the hash leaves out)
+ * declines.  1 / 0 / -1 as ray_enc_hash_eq_rowsel. */
+int    ray_enc_hash_eq_str_rowsel(ray_t* encv, const char* p, size_t l, ray_t** sel, ray_t** err);
+/* The `in` twin: every element of the STR set `set_vec` probed so; a ""
+ * element, a dense union or another set type declines. */
+int    ray_enc_hash_in_str_rowsel(ray_t* encv, ray_t* set_vec, ray_t** sel, ray_t** err);
 /* Test hook: probes ray_enc_hash_eq_rowsel answered since process start. */
 uint64_t ray_enc_hash_test_probes(void);
 
@@ -748,7 +770,8 @@ ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key);
  *   - A fresh rowsel block (rc=1) on success — install on g->selection.
  *     An empty set yields a valid all-NONE rowsel (NOT NULL).
  *   - NULL when the column is not eligible (no hash/part index, stale,
- *     float-family column, unsupported set type, OOM) or a hash-index union
+ *     float-family column, unsupported set type, a "" needle against a STR
+ *     column, OOM) or a hash-index union
  *     is too dense.  Part-index unions retain dense full morsels efficiently.
  *     Caller falls back to the scan path. */
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
@@ -938,9 +961,9 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col);
  * Walk the sort permutation once to collect the first-occurrence row id of
  * each distinct value (the first element of each equal-value run, which is
  * the minimum row id of the run because the sort is stable with iota
- * tie-breaking).  Returns an OWNED I64 vector of those row ids, sorted
- * ascending by VALUE (matching distinct_vec_eager's qsort-of-indices
- * contract), and sets *out_count to the number of distinct values.
+ * tie-breaking).  Returns an OWNED I64 vector of those row ids in VALUE
+ * order (the permutation's), and sets *out_count to the number of distinct
+ * values.  distinct_vec_eager puts them in row order (#1477).
  *
  * Returns NULL if not eligible (no sort index, stale, null-bearing) or on
  * OOM.  The caller is responsible for releasing the returned vector. */

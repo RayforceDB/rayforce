@@ -1515,7 +1515,7 @@ static test_result_t test_count_fast_path(void) {
     SR_SAME("(count (select {from: T where: (== g 3)}))", 0);       /* I16 */
     SR_SAME("(count (select {from: T where: (> k 150000)}))", 0);   /* I64 */
     SR_SAME("(count (select {from: T where: (!= u 7)}))", 0);        /* U8 */
-    SR_SAME("(count (select {from: T where: (< d 100)}))", 0);       /* DATE, integer literal */
+    SR_SAME("(count (select {from: T where: (< d 2000.04.10)}))", 0); /* DATE */
     SR_SAME("(count (select {from: T where: (== s 'c)}))", 0);       /* file-domain SYM */
     SR_SAME("(count (select {from: T where: (== s 'zz)}))", 0);      /* absent symbol */
     TEST_ASSERT_EQ_U(ray_query_test_count_fast() - f0, 12);          /* 6 shapes x 2 generations */
@@ -2047,7 +2047,7 @@ static test_result_t test_zone_dir_nulls(void) {
     if ((r = sr_sel_same(pred_v_gt)).status != TEST_PASS) return r;
     SR_SAME("(count (select {from: T where: (> v 1000000)}))", 0);   /* every chunk all-fail */
     SR_SAME("(count (select {from: T where: (< v 1000000)}))", 0);   /* nulls pass < : mixed */
-    SR_SAME("(count (select {from: T where: (>= d 899)}))", 0);
+    SR_SAME("(count (select {from: T where: (>= d 2002.06.18)}))", 0);
     PASS();
 }
 
@@ -3112,7 +3112,17 @@ static test_result_t test_scalar_route_shapes(void) {
     PASS();
 }
 
-/* The tight F64 kernel sums by explicit lanes (row mod 8, combined in one
+/* The lane reference: lanes 2k and 2k + 1 added, then those sums the same
+ * way down to one (group.c, sc_f64_lanes_total), each sum stored. */
+static double sr_lanes_ref(const volatile double* lane) {
+    volatile double t[32];
+    for (int k = 0; k < 32; k++) t[k] = lane[k];
+    for (int w = 16; w >= 1; w /= 2)
+        for (int k = 0; k < w; k++) t[k] = t[2 * k] + t[2 * k + 1];
+    return t[0];
+}
+
+/* The tight F64 kernel sums by explicit lanes (row mod 32, combined in one
  * fixed order) on both generations: a serial run (fewer rows than the
  * parallel threshold: one task, a deterministic order) over non-integral
  * values (whose sum depends on the order: a plain row-order sum differs)
@@ -3126,12 +3136,9 @@ static test_result_t test_scalar_route_f64_bits(void) {
     sr_eval_ok("(set R (table [x] (list (* (as 'F64 (% (* i 7919) 1000003)) 0.37))))");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf0/\" R {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sf2/\" R {compress: true})");
-    volatile double lane[8] = { 0 };
-    for (int64_t r = 0; r < n; r++) lane[r & 7] += (double)((r * 7919) % 1000003) * 0.37;
-    volatile double ab = (lane[0] + lane[1]), cd = (lane[2] + lane[3]);
-    volatile double ef = (lane[4] + lane[5]), gh = (lane[6] + lane[7]);
-    volatile double lo = ab + cd, hi = ef + gh;
-    double ref = lo + hi;
+    volatile double lane[32] = { 0 };
+    for (int64_t r = 0; r < n; r++) lane[r & 31] += (double)((r * 7919) % 1000003) * 0.37;
+    double ref = sr_lanes_ref(lane);
     static const char* const q[] = { "(select {s: (sum x) from: T})",
                                      "(select {s: (sum (+ x 0.5)) from: T})",
                                      "(select {a: (avg (+ x 0.25)) from: T})", NULL };
@@ -3157,7 +3164,8 @@ static test_result_t test_scalar_route_f64_bits(void) {
 
 /* Fix round 2: the lanes' combine order is the fixed tree, never a fold:
  * x[0] = 2^53 and x[1..7] = 1.0 (every other row 0) sum to exactly
- * 2^53 + 6 (lane 0's 2^53 + 1 rounds to 2^53, the other pairs are exact);
+ * 2^53 + 6 (lanes 0 and 1: 2^53 + 1 rounds to 2^53, the other pairs are
+ * exact);
  * a left fold gives 2^53.  Both generations, serially. */
 static test_result_t test_scalar_route_f64_combine(void) {
     const int64_t n = 60000;
@@ -3178,34 +3186,76 @@ static test_result_t test_scalar_route_f64_combine(void) {
     PASS();
 }
 
-/* Fix round 2: a piece starting at a row not a multiple of 8 realigns
+/* Fix round 2: a piece starting at a row not a multiple of 32 realigns
  * through the head loop; the cut sum equals the whole block's and the lane
  * reference, on lane-weighted data where any lane mix-up changes the bits.
  * (The engine's tasks and pieces start 1024-aligned: the hook drives the
  * staged piece function directly.) */
 static test_result_t test_scalar_route_f64_unaligned(void) {
     const int64_t n = 5000;
-    static const double m[8] = { -11, 11, -1, 1, 11, 1, -13, 1 };
+    static const double m[32] = { -11, 11, -1, 1, 11, 1, -13, 1, 7, -7, 3, -3, 13, -1, 5, -5,
+                                  -3, 3, -7, 7, 1, -11, 11, -13, 5, -5, 13, -1, -1, 1, 3, -3 };
     static double d[5000];
     static const int64_t row0s[] = { 0, 3, 1021 };
     static const int64_t cuts[] = { 5, 13, 1000, 1027, 2049, 4099 };
     for (size_t k = 0; k < sizeof row0s / sizeof row0s[0]; k++) {
         int64_t row0 = row0s[k];
-        volatile double lane[8] = { 0 };
+        volatile double lane[32] = { 0 };
         for (int64_t r = 0; r < n; r++) {
-            d[r] = 0.37 * (double)(((r + row0) * 7919) % 1000003) * m[(r + row0) & 7];
-            lane[(r + row0) & 7] += d[r];
+            d[r] = 0.37 * (double)(((r + row0) * 7919) % 1000003) * m[(r + row0) & 31];
+            lane[(r + row0) & 31] += d[r];
         }
-        volatile double ab = lane[0] + lane[1], cd = lane[2] + lane[3];
-        volatile double ef = lane[4] + lane[5], gh = lane[6] + lane[7];
-        volatile double lo = ab + cd, hi = ef + gh;
-        double ref = lo + hi, whole, cut;
+        double ref = sr_lanes_ref(lane), whole, cut;
         ray_group_test_f64_lanes(d, row0, n, cuts, (int)(sizeof cuts / sizeof cuts[0]), &whole, &cut);
         TEST_ASSERT_FMT(memcmp(&whole, &ref, sizeof ref) == 0, "row0 %lld: whole %.17g vs ref %.17g",
                         (long long)row0, whole, ref);
         TEST_ASSERT_FMT(memcmp(&cut, &ref, sizeof ref) == 0, "row0 %lld: cut %.17g vs ref %.17g",
                         (long long)row0, cut, ref);
     }
+    PASS();
+}
+
+/* #1363 review: the eager sum / avg of a float vector and the select's
+ * scalar route add the same lanes over the same chunks, so they give the
+ * same bits for F64 and F32, with nulls or without, one chunk or many, and
+ * at 8388609 rows, where a chunk holds two blocks (RED_MAX_CHUNKS chunks of
+ * RED_BLOCK rows end one row short).  The values are large and non-integral,
+ * so any other order shows in the low bits. */
+static test_result_t test_eager_select_float_bits(void) {
+    static const int64_t ns[] = { 1000, 70000, 8388609 };
+    static const char* const qs[][2] = {
+        { "(sum fx)", "(first (at (select {s: (sum fx) from: FT}) 's))" },
+        { "(avg fx)", "(first (at (select {s: (avg fx) from: FT}) 's))" },
+    };
+    for (size_t k = 0; k < sizeof ns / sizeof ns[0]; k++)
+        for (int shape = 0; shape < 4; shape++) {
+            const int64_t n = ns[k];
+            const bool f32 = shape & 1, nulls = shape & 2;
+            if (n > 70000 && shape) continue;                 /* the long one: F64 only */
+            ray_t* v = ray_vec_new(f32 ? RAY_F32 : RAY_F64, n); v->len = n;
+            for (int64_t r = 0; r < n; r++) {
+                double x = (double)((r * 7919) % 1000003) * 1.0000001e10 + 0.37 * (double)(r % 13);
+                bool nul = nulls && r % 7 == 0;
+                if (f32) ((float*)ray_data(v))[r] = nul ? NULL_F32 : (float)(x * 1e-12);
+                else ((double*)ray_data(v))[r] = nul ? NULL_F64 : x;
+            }
+            if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
+            ray_env_set(ray_sym_intern("fx", 2), v); ray_release(v);
+            sr_eval_ok("(set FT (table [fx] (list fx)))");
+            for (size_t q = 0; q < sizeof qs / sizeof qs[0]; q++) {
+                ray_t* a = sr_eval(qs[q][0]);
+                ray_t* b = sr_eval(qs[q][1]);
+                TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && a->type == -RAY_F64 && b && !RAY_IS_ERR(b) && b->type == -RAY_F64,
+                                "n %lld shape %d: %s", (long long)n, shape, qs[q][0]);
+                bool same = memcmp(&a->f64, &b->f64, sizeof a->f64) == 0;
+                double av = a->f64, bv = b->f64;
+                sr_drop(a); sr_drop(b);
+                TEST_ASSERT_FMT(same, "n %lld %s%s: %s %a vs select %a", (long long)n, f32 ? "F32" : "F64",
+                                nulls ? " nulls" : "", qs[q][0], av, bv);
+            }
+        }
+    sr_eval_ok("(set FT 0)");
+    sr_eval_ok("(set fx 0)");
     PASS();
 }
 
@@ -5213,7 +5263,7 @@ static test_result_t test_v2_parted_segment(void) {
  * gate (Task 12) moved them here, at zero. */
 #define SR_Q18 "(select {c: (count h) from: T by: {h: h s: s} take: 10})"
 #define SR_Q35 "(select {one: 1 s: s c: (count s) from: T by: s desc: c take: 10})"
-#define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 100) (<= d 400) " \
+#define SR_Q39 "(take (select {s: s p: (count s) from: T where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) " \
                "(== b false) (!= u 0)) by: s desc: p take: 1010}) -10)"
 #define SR_COMPACT_GROUP "(select {c: (count k) from: T where: (< k 1000) by: g})"
 #define SR_AND_COUNT "(count (select {from: T where: (and (== g 3) (!= u 0))}))"
@@ -5248,7 +5298,7 @@ static const char* const sr_clickbench_scan[] = {
     /* q41: TraficSourceID IN (-1, 6) later in a chain of == conjuncts: on a
      * parted table the `in` conjunct reads each segment by range and is
      * intersected with the selection (exec_in_parted_selection, P3 Task 12) */
-    "(select {h: h d: d c: (count h) from: T where: (and (== g 3) (>= d 100) (<= d 400) (== b false) "
+    "(select {h: h d: d c: (count h) from: T where: (and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04) (== b false) "
     "(in u [1 6]) (!= h 0)) by: {h: h d: d} desc: c take: 10})",                         /* q41 */
     NULL,
 };
@@ -5572,7 +5622,7 @@ static test_result_t test_count_and(void) {
     static const char* const splayed[] = {
         "(and (== g 3) (!= u 0))",
         "(and (> v 100) (< f 150000.0))",                    /* nullable I32 and F64 */
-        "(and (== g 3) (>= d 100) (<= d 400))",
+        "(and (== g 3) (>= d 2000.04.10) (<= d 2001.02.04))",
         "(and (== g 3) (== g 4))",                           /* all false */
         "(and (> k 199990) (== b true) (!= v 0))",
         NULL,
@@ -6446,7 +6496,63 @@ static test_result_t test_chain_zone_prune(void) {
     PASS();
 }
 
+/* first / last of a stored I64 / F64 column are positional (#1420) and read
+ * the one row from the column's source: a null at that end is the answer,
+ * and nothing is materialized. */
+static test_result_t test_edge_positional_no_materialize(void) {
+    sr_evalf_ok("(.db.splayed.set \"%s/edge/\" (table [v f] (list (concat [0Nl] (til 140000)) "
+                "(concat (as 'F64 (til 140000)) [0Nf]))) {compress: true})", SR_TMP);
+    sr_evalf_ok("(set T (.db.splayed.get \"%s/edge/\"))", SR_TMP);
+    static const char* const q[] = { "(first (at T 'v))", "(last (at T 'f))", NULL };
+    for (int i = 0; q[i]; i++) {
+        ray_enc_counters_reset();
+        ray_t* r = sr_eval(q[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && RAY_ATOM_IS_NULL(r));
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.materialized == 0, "%s materialized %llu", q[i], (unsigned long long)k.materialized);
+        sr_drop(r);
+    }
+    PASS();
+}
+
+/* The directory of a generation-2 TIMESPAN column answers min/max of an
+ * all-null column with 0Nn, as every route does (#1419), and a column with
+ * values with its extremes.  No query reaches it for TIMESPAN today
+ * (reduce_src_type, select_aggs_from_metadata), so it is called directly. */
+static test_result_t test_dir_answer_timespan_null(void) {
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "(.db.splayed.set \"%s/\" (table [v w] (list (take [0Nn] 140000) "
+             "(as 'TIMESPAN (* (til 140000) (at [1 0N] (%% (til 140000) 2)))))) {compress: true})",
+             ray_test_tmp(SR_TMP "/span"));
+    ray_t* r = ray_eval_str(cmd);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* t = ray_read_splayed(ray_test_tmp(SR_TMP "/span"), NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_col_meta_t m;
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("v", 1), &m));
+    TEST_ASSERT_TRUE(m.enc != NULL && m.type == RAY_TIMESPAN);
+    for (int k = 0; k < 2; k++) {
+        ray_t* a = ray_dir_answer(m.enc, k ? OP_MAX : OP_MIN);
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+        TEST_ASSERT_EQ_I(a->type, -RAY_TIMESPAN);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(a));
+        ray_release(a);
+    }
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("w", 1), &m));
+    TEST_ASSERT_TRUE(m.enc != NULL);
+    ray_t* lo = ray_dir_answer(m.enc, OP_MIN);
+    ray_t* hi = ray_dir_answer(m.enc, OP_MAX);
+    TEST_ASSERT_TRUE(lo && hi && !RAY_IS_ERR(lo) && !RAY_IS_ERR(hi));
+    TEST_ASSERT_EQ_I(lo->i64, 0);
+    TEST_ASSERT_EQ_I(hi->i64, 139998);
+    ray_release(lo); ray_release(hi); ray_release(t);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
+    { "scanrange/dir_answer_timespan_null", test_dir_answer_timespan_null, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/edge_positional_no_materialize", test_edge_positional_no_materialize, sr_rt_setup, sr_rt_teardown },
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
     { "scanrange/walk_decoded_cache",      test_walk_decoded_cache,      sr_setup,    sr_teardown },
@@ -6525,6 +6631,7 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_combine", test_scalar_route_f64_combine, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_unaligned", test_scalar_route_f64_unaligned, srr_setup, srr_teardown },
+    { "scanrange/eager_select_float_bits", test_eager_select_float_bits, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },
     { "scanrange/da_route_parted",    test_da_route_parted,    srr_setup, srr_teardown },

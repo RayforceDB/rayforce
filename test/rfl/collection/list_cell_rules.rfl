@@ -1,0 +1,129 @@
+;; @also-unfused
+;; LIST cells follow the documented rules (#1361).
+;; distinct over a list keeps each cell where it first occurs, atoms, vectors
+;; and nested lists alike, as a typed vector does: it used to move the atoms
+;; ahead of the vectors afterwards, which scrambled the vectors.
+(distinct (list [1] [2] 3 [4] 5)) -- (list [1] [2] 3 [4] 5)
+(distinct (list [1] 2 [1] 3 2 [4] [1])) -- (list [1] 2 3 [4])
+(distinct (list 'a [1 2] "s" (list 1 [2]) 'a (list 1 [2]) [1 2] 7)) -- (list 'a [1 2] "s" (list 1 [2]) 7)
+(distinct (list (list [1] 2) [3] (list [1] 2) 4 [3] (list (list 5)) (list (list 5)))) -- (list (list [1] 2) [3] 4 (list (list 5)))
+(distinct (list [2i 2i] 1.0 [2i 2i] 1 (enlist 'x))) -- (list [2i 2i] 1.0 (enlist 'x))
+;; past 64 cell pairs distinct hashes (list_set): same order
+(set OL (concat (map (fn [i] (if (== 0 (% i 2)) (enlist (% i 7)) (% i 5))) (til 40)) (list [0] 1 [6])))
+(distinct OL) -- (list [0] 1 [2] 3 [4] 0 [6] 2 [1] 4 [3] [5])
+(count (distinct OL)) -- 12
+(at (distinct OL) 0) -- [0]
+;; F64 and F32 vector cells follow the atom and identical rule: -0.0 equals
+;; 0.0 (#1361).  Cells compared and hashed their bytes, so a -0.0 cell met
+;; neither a 0.0 cell nor the hash of one.  NaN stays the F64 null.
+(set N (enlist (neg 0.0)))
+(set P [0.0])
+(set NE (as 'F32 N))
+(set PE (as 'F32 P))
+(identical P N) -- true
+(count (distinct (list 0.0 (neg 0.0)))) -- 1
+(count (distinct (list P N))) -- 1
+(count (distinct (list N P))) -- 1
+(count (distinct (list PE NE))) -- 1
+(count (distinct (list [0.0e] (enlist (neg 0.0e))))) -- 1
+(count (distinct (list [1.0 0.0 2.0] (concat 1.0 (concat (neg 0.0) 2.0))))) -- 1
+(count (distinct (list [1.0 0.0] [0.0 1.0] (concat (neg 0.0) 1.0)))) -- 2
+(count (distinct (list P PE N NE))) -- 2
+(count (distinct (list [1.0] [-1.0] (as 'F32 [1.0]) (as 'F32 [-1.0])))) -- 4
+;; nested lists, dict and table cells holding them
+(count (distinct (list (list 'a P) (list 'a N)))) -- 1
+(count (distinct (list (list (list N 1)) (list (list P 1))))) -- 1
+(count (distinct (list (list (list N 1)) (list (list P 2))))) -- 2
+(count (distinct (list (dict P [1]) (dict N [1])))) -- 1
+(count (distinct (list (dict ['a 'b] (list P 1)) (dict ['a 'b] (list N 1))))) -- 1
+(count (distinct (list (table [a] (list P)) (table [a] (list N))))) -- 1
+(count (distinct (list (table [a] (list NE)) (table [a] (list PE))))) -- 1
+;; NaN and null cells are unchanged: a null meets a null, not a zero
+(count (distinct (list [0Nf] [0Nf]))) -- 1
+(count (distinct (list [0Nf] P))) -- 2
+(count (distinct (list [0Nf] N))) -- 2
+(count (distinct (list [1.0 0Nf] (concat 1.0 0Nf)))) -- 1
+(count (distinct (list (as 'F32 [0Nf]) PE NE))) -- 2
+(count (distinct (list (til 0) (as 'F64 (til 0)) (as 'F32 (til 0))))) -- 3
+;; the hashed paths (past 64 cell pairs): every -0.0 / 0.0 copy is one cell
+(set Z (map (fn [i] (if (== 0 (% i 2)) (concat (as 'F64 (% i 3)) 0.0) (concat (as 'F64 (% i 3)) (neg 0.0)))) (til 60)))
+(set ZE (map (fn [i] (as 'F32 i)) Z))
+(count (distinct Z)) -- 3
+(count (distinct ZE)) -- 3
+(count (distinct (concat Z ZE))) -- 6
+;; every cell length the hash treats apart: up to 64 bytes, longer, and past
+;; one 4096-byte chunk (a -0.0 in the first chunk, in the last, in both)
+(set ZL (fn [n z] (concat (+ 1.0 (as 'F64 (til n))) z)))
+(set LEN (fn [n] (count (distinct (concat (map (fn [i] (ZL n 0.0)) (til 5)) (map (fn [i] (ZL n (neg 0.0))) (til 5)))))))
+(set LENE (fn [n] (count (distinct (concat (map (fn [i] (as 'F32 (ZL n 0.0))) (til 5)) (map (fn [i] (as 'F32 (ZL n (neg 0.0)))) (til 5)))))))
+(map LEN [0 1 2 3 4 7 8 69 511 600 1100]) -- [1 1 1 1 1 1 1 1 1 1 1]
+(map LENE [0 1 2 3 4 6 14 15 16 69 1023 1100 2100]) -- [1 1 1 1 1 1 1 1 1 1 1 1 1]
+(set LH (fn [z] (concat z (+ 1.0 (as 'F64 (til 700))))))
+(count (distinct (concat (map (fn [i] (LH 0.0)) (til 5)) (map (fn [i] (LH (neg 0.0))) (til 5))))) -- 1
+(set LB (fn [z] (concat z (concat (+ 1.0 (as 'F64 (til 700))) z))))
+(count (distinct (concat (map (fn [i] (LB 0.0)) (til 5)) (map (fn [i] (LB (neg 0.0))) (til 5))))) -- 1
+(count (distinct (concat (map (fn [i] (LB 0.0)) (til 5)) (map (fn [i] (LH (neg 0.0))) (til 5))))) -- 2
+(count (distinct (concat (map (fn [i] (ZL 600 0.0)) (til 5)) (list (ZL 600 1.0) (ZL 599 0.0))))) -- 3
+(count (distinct (concat Z (map neg Z)))) -- 5
+(count (distinct (concat ZE (map neg ZE)))) -- 5
+(distinct (concat (enlist N) (concat Z (enlist P)))) -- (list [0.0] [0.0 0.0] [1.0 0.0] [2.0 0.0])
+(count (distinct (map (fn [x] (list 'k x)) Z))) -- 3
+(count (distinct (map (fn [x] (table [a] (list x))) Z))) -- 3
+;; except, sect, union, scanned and hashed
+(except (list N 1) (list P)) -- (list 1)
+(except (list P 1) (list N)) -- (list 1)
+(sect (list N 1) (list P)) -- (list [0.0])
+(count (union (list N 1) (list P))) -- 2
+(count (union (list PE) (list NE))) -- 1
+(count (except Z (list N))) -- 60
+(count (except Z (list (concat 0.0 (neg 0.0))))) -- 40
+(count (except Z (take Z 3))) -- 0
+(count (sect Z (list P))) -- 0
+(count (sect Z (list [0.0 0.0]))) -- 20
+(count (sect (take Z 20) (concat (list 1) (enlist (concat 0.0 (neg 0.0)))))) -- 7
+;; union is a set (#1385): Z's duplicates go too, so this is 4, not Z's 60 elements plus one
+(count (union Z (list [0.0 0.0] [1.0 0.0] P))) -- 4
+(count (union (list P) Z)) -- 4
+;; in tests leaves, so its -0.0 meets a 0.0 atom as before
+(in (list N) (list 0.0)) -- (list [true])
+(in N (list P 0.0)) -- [true]
+;; group, select by:, count distinct
+(set G (group (list P N [1.0] N P)))
+(count G) -- 2
+(first (value G)) -- [0 1 3 4]
+(count (group Z)) -- 3
+(at (value (group Z)) 1) -- [1 4 7 10 13 16 19 22 25 28 31 34 37 40 43 46 49 52 55 58]
+(count (group ZE)) -- 3
+(set T (table [k v] (list (list P N [1.0] N) [1 2 3 4])))
+(at (select {n: (count v) from: T by: k}) 'n) -- [3 1]
+(at (select {n: (count (distinct k)) from: T}) 'n) -- [2]
+(set TZ (table [k g v] (list Z (% (til 60) 2) (til 60))))
+(count (select {n: (count v) from: TZ by: k})) -- 3
+(at (select {n: (count (distinct k)) from: TZ by: g}) 'n) -- [3 3]
+(at (select {n: (count (distinct k)) from: TZ}) 'n) -- [3]
+;; xkey and keyed-table ==
+(xkey (table [k v] (list (list P N) [1 2])) [k]) !- domain
+(xkey (table [k v] (list (list NE PE) [1 2])) [k]) !- domain
+(count (xkey (table [k v] (list (list N [1.0]) [1 2])) [k])) -- 2
+(set KA (xkey (table [k v] (list (list P [1.0]) [1 2])) [k]))
+(set KB (xkey (table [k v] (list (list [1.0] N) [2 1])) [k]))
+(set KC (xkey (table [k v] (list (list [1.0] N) [2 5])) [k]))
+(count (== KA KB)) -- 2
+(at (first (value (== KA KB))) 'v) -- true
+(count (== KA KC)) -- 2
+(at (first (value (== KA KC))) 'v) -- false
+(at (last (value (== KA KC))) 'v) -- true
+;; hash and equality agree: a set over many cells (hashed) gives the answer
+;; two-cell scans give (no hash) for every pair of the pool
+(set POOL (list P N PE NE [0Nf] (as 'F32 [0Nf]) [1.0 0.0] (concat 1.0 (neg 0.0)) (list N 'a) (list P 'a) (table [a] (list N)) (table [a] (list P)) (til 0) (as 'F64 (til 0)) [0Nl] 0.0 (neg 0.0)))
+(set PAIR (fn [x y] (== 1 (count (distinct (list x y))))))
+(set KEEP (fn [acc x] (if (any (map (fn [k] (PAIR k x)) acc)) acc (concat acc (list x)))))
+(set SCAN (fold KEEP (list) POOL))
+(set BIG (concat POOL (concat (reverse POOL) POOL)))
+(== (count SCAN) (count (distinct BIG))) -- true
+(identical SCAN (distinct BIG)) -- true
+(count (distinct BIG)) -- 11
+(count (group BIG)) -- 11
+(count (except BIG SCAN)) -- 0
+(count (sect BIG SCAN)) -- 51
+(count (union SCAN BIG)) -- 11

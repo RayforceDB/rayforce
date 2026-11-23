@@ -1366,22 +1366,25 @@ static test_result_t test_signed_zeros_battery(void) {
 }
 
 /* Review focus 5: float sums bit-identical while vectors change encoding:
- * cancellation, overflow to infinity, all -0.0, ALP decimals, and a column
+ * cancellation, overflow to infinity, all -0.0, ALP decimals, a column
  * whose vectors select CONST and DICT in turn (chunk 0's dictionary holds
- * every value, so DICT, its codes RLE where they run, takes the rest).  The
- * 70000-row tables pass RAY_PARALLEL_THRESHOLD: both generations fold their
- * float partials per chunk in chunk order (#744), so the sums are the same
- * bits at any worker count. */
+ * every value, so DICT, its codes RLE where they run, takes the rest), and
+ * the ALP decimals with nulls, as F64 and as F32.  The 70000-row tables
+ * pass RAY_PARALLEL_THRESHOLD: both generations fold their float partials
+ * per chunk in chunk order (#744), and inside a chunk add row r into lane
+ * r mod 32 whatever the call cut (a block of the plain column, a decoded
+ * vector of the compressed one), so the sums are the same bits at any
+ * worker count and under the release FP flags (#1363: the per-call
+ * vectorized loop gave the compressed sum different low bits). */
 static test_result_t test_float_sums(void) {
-    static const int64_t ns[] = { 70000, 4096, 5000, 70000, 70000 };
+    static const int64_t ns[] = { 70000, 4096, 5000, 70000, 70000, 70000, 70000 };
     static const int encs[] = { -1, RAY_ENC_RAW, RAY_ENC_RLE, RAY_ENC_CONST, RAY_ENC_ALP, RAY_ENC_ALP_RD };
     _Static_assert(70000 > RAY_PARALLEL_THRESHOLD, "the float sums run in parallel");
-    for (int t = 0; t < 5; t++)
+    for (int t = 0; t < 7; t++)
         for (size_t k = 0; k < sizeof encs / sizeof encs[0]; k++) {
             if (encs[k] == RAY_ENC_CONST && t != 2) continue;          /* constant per vector only there */
             const int64_t n = ns[t];
-            ray_t* f = ray_vec_new(RAY_F64, n); f->len = n;
-            double* fd = (double*)ray_data(f);
+            static double fd[70000];
             uint64_t s = 5;
             for (int64_t j = 0; j < n; j++) {
                 s ^= s << 13; s ^= s >> 7; s ^= s << 17;
@@ -1389,12 +1392,13 @@ static test_result_t test_float_sums(void) {
                 fd[j] = t == 0 ? ((j % 1024) < 512 ? 1e16 : 1.0)
                       : t == 1 ? (j % 2 == 0 ? 1.7976931348623157e308 : 1e308)
                       : t == 2 ? bd(NEG0_64)
-                      : t == 3 ? (double)(j % 997) / 10.0
+                      : t == 3 || t >= 5 ? (t >= 5 && j % 7 == 3 ? NULL_F64 : (double)(j % 997) / 10.0)
                       : v % 4 == 0 ? 1e16 + (double)v                  /* CONST */
                       : v % 4 == 1 ? (double)((j / 64) % 5) * 3.3     /* runs */
                       : v % 4 == 2 ? (j % 3 ? -1e16 : 0.1)             /* cancellation */
                       : (double)(s >> 11) / 1024.0 - 4e12;             /* random */
             }
+            ray_t* f = fl_typed(t == 6 ? RAY_F32 : RAY_F64, fd, n);      /* t >= 5: nulls; t == 6: F32 */
             char name[16]; snprintf(name, sizeof name, "s%d_%zu", t, k);
             TEST_ASSERT_TRUE(flr_save(name, flr_table(1, (const char* const[]){ "f" }, (ray_t* const[]){ f }), encs[k]));
             if (encs[k] >= 0) TEST_ASSERT_FMT(flr_enc(name, "f", 0) == encs[k], "%s: encoding %d", name, flr_enc(name, "f", 0));
@@ -1605,8 +1609,13 @@ static test_result_t test_resave_equals_resident(void) {
             TEST_ASSERT_TRUE(flr_live(dz, cols[c], pb, sizeof pb));
             TEST_ASSERT_FMT(flr_same_file(pa, pb) == 0, "force %d column %s: re-save differs (%d)", encs[k], cols[c], flr_same_file(pa, pb));
         }
-        /* no float sum: over 64 Ki rows it varies from run to run (float_sums) */
         FLR_SAME(name, "(select {c: (count d) lo: (min a) hi: (max g) from: T where: (== d -0.0)})");
+        FLR_SAME(name, "(sum (at T 'a))");
+        FLR_SAME(name, "(avg (at T 'g))");
+        FLR_SAME(name, "(sum (at T 'd))");
+        FLR_SAME(name, "(select {s: (sum a) from: T})");
+        FLR_SAME(name, "(select {s: (sum a) m: (avg g) from: T})");
+        FLR_SAME(name, "(select {s: (sum a) from: T where: (== d -0.0)})");
         FLR_SAME(name, "(at T 'd)");
     }
     PASS();

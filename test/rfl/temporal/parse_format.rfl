@@ -225,13 +225,19 @@
 (type (timestamp 'global))                     -- 'timestamp
 
 ;; The clock reads carry the system clock's sub-second part rather than
-;; a whole-second value with a zero fraction.  Five samples: the odds of
-;; every one landing exactly on a second (timestamp) or a millisecond
-;; (time) boundary are 1e-45 / 1e-15, so the assertion is stable.
-(set clock-ts (list (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'global)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 0))))
+;; a whole-second value with a zero fraction.  Reads taken back to back
+;; usually land in the same millisecond, so they are not independent
+;; samples (#1264).  clock-samples keeps reading until it has n values
+;; that differ from each other's predecessor; among a few consecutive
+;; milliseconds at most one is a whole second, so a real clock always
+;; passes, while a clock that only moves in whole seconds still fails:
+;; its distinct values are all whole seconds, or the read bound is hit.
+(set clock-samples (fn [f n] (do (set cs-acc (list (f))) (set cs-tries 0) (while (and (< (count cs-acc) n) (< cs-tries 5000000)) (do (set cs-v (f)) (if (!= cs-v (last cs-acc)) (set cs-acc (concat cs-acc (list cs-v))) 0) (set cs-tries (+ cs-tries 1)))) cs-acc)))
+(set clock-ts (concat (clock-samples (fn [] (as 'i64 (timestamp 'global))) 3) (list (as 'i64 (timestamp 'local)) (as 'i64 (timestamp 0)))))
 (any (!= 0 (% (as 'i64 clock-ts) 1000000000)))  -- true
-(set clock-tm (list (as 'i64 (time 'global)) (as 'i64 (time 'global)) (as 'i64 (time 'local)) (as 'i64 (time 'local)) (as 'i64 (time 0))))
+(set clock-tm (concat (clock-samples (fn [] (as 'i64 (time 'global))) 5) (list (as 'i64 (time 'local)) (as 'i64 (time 0)))))
 (any (!= 0 (% (as 'i64 clock-tm) 1000)))        -- true
+(count (clock-samples (fn [] (as 'i64 (time 'global))) 5))  -- 5
 
 ;; ═══════════════════════════════════════════════════════════════════
 ;;       8.  Duration arithmetic — DATE / TIMESTAMP differences

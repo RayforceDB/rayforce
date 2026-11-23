@@ -23,9 +23,11 @@
 
 #include "lang/internal.h"
 #include "ops/ops.h"   /* RAY_LAZY, ray_is_lazy, ray_lazy_materialize */
+#include "ops/internal.h" /* ray_table_col_value */
 #include "lang/format.h"   /* ray_type_name (error context) */
 
 #include <assert.h>
+#include "ops/hash.h"
 
 /* Helper: compare char atom vs string atom.
  * Returns: -1 if no char/string pair, else memcmp-like result via *out. */
@@ -178,29 +180,15 @@ ray_t* ray_lte_fn(ray_t* a, ray_t* b) {
     return make_bool(as_f64(a) <= as_f64(b) ? 1 : 0);
 }
 
-/* Rank of a numeric atom type in the promotion order min/max use, or -1. */
-static int minmax_rank(int8_t t) {
-    switch (t) {
-    case -RAY_BOOL: return 0;
-    case -RAY_U8:   return 1;
-    case -RAY_I16:  return 2;
-    case -RAY_I32:  return 3;
-    case -RAY_I64:  return 4;
-    case -RAY_F32:  return 5;
-    case -RAY_F64:  return 6;
-    default:        return -1;
-    }
-}
-
-/* The atom type the result of (min a b) / (max a b) takes: the wider of
- * two numeric types (BOOL < U8 < I16 < I32 < I64 < F32 < F64), or
- * TIMESTAMP for a DATE against a TIMESTAMP, so an integer against a float
- * is a float and a boolean against an integer an integer.  0 when the
- * types already agree or no promotion applies. */
+/* The atom type the result of (min a b) / (max a b) takes: the promotion
+ * table's (ray_num_type, core/types.h), so an integer against a float is a
+ * float, F32 against anything else F64, and a boolean against an integer an
+ * integer; or TIMESTAMP for a DATE against a TIMESTAMP.  0 when the types
+ * already agree or no promotion applies. */
 static int8_t minmax_type(ray_t* a, ray_t* b) {
     if (a->type == b->type) return 0;
-    int ra = minmax_rank(a->type), rb = minmax_rank(b->type);
-    if (ra >= 0 && rb >= 0) return ra > rb ? a->type : b->type;
+    int8_t t = ray_num_type((int8_t)-a->type, (int8_t)-b->type);
+    if (t) return (int8_t)-t;
     if ((a->type == -RAY_DATE && b->type == -RAY_TIMESTAMP) ||
         (a->type == -RAY_TIMESTAMP && b->type == -RAY_DATE))
         return -RAY_TIMESTAMP;
@@ -235,7 +223,185 @@ ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, 
 ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
 
 
+/* Use the language column accessor: stored PARTED and MAPCOMMON columns
+ * need flattening before ordinary equality kernels can consume them. */
+static ray_t* equality_column(ray_t* table, int64_t c) {
+    return ray_table_col_value(table, ray_table_col_name(table, c));
+}
+
+static ray_t* eq_key_find(ray_t* keys, ray_t* probes) {
+    if (keys->type != RAY_LIST) return ray_find_fn(keys, probes);
+    int spans = ray_key_spans(keys) | ray_key_spans(probes);
+    int64_t cap = 8;
+    while (cap / 2 < keys->len) {
+        if (cap > INT64_MAX / 2) return ray_error("oom", NULL);
+        cap *= 2;
+    }
+    ray_t* slots = ray_vec_new(RAY_I64, cap);
+    if (!slots || RAY_IS_ERR(slots)) return slots;
+    int64_t* index = ray_data(slots);
+    for (int64_t i = 0; i < cap; i++) index[i] = -1;
+    ray_t** data = ray_data(keys);
+    for (int64_t i = 0; i < keys->len; i++) {
+        uint64_t at = ray_key_hash(data[i], spans) & (cap - 1);
+        while (index[at] >= 0 && !atom_eq(data[index[at]], data[i]))
+            at = (at + 1) & (cap - 1);
+        if (index[at] < 0) index[at] = i;
+    }
+    ray_t* out = ray_vec_new(RAY_I64, probes->len);
+    if (!out || RAY_IS_ERR(out)) { ray_release(slots); return out; }
+    out->len = probes->len;
+    int64_t* result = ray_data(out);
+    ray_t** needle = ray_data(probes);
+    for (int64_t i = 0; i < probes->len; i++) {
+        uint64_t at = ray_key_hash(needle[i], spans) & (cap - 1);
+        while (index[at] >= 0 && !atom_eq(data[index[at]], needle[i]))
+            at = (at + 1) & (cap - 1);
+        result[i] = index[at] < 0 ? NULL_I64 : index[at];
+    }
+    ray_release(slots);
+    return out;
+}
+
+/* Keep equality's container shape while delegating cells to the existing
+ * atomic mapper, including numeric promotion and nested lists. */
+static ray_t* eq_container(ray_t* a, ray_t* b) {
+    bool tables = a->type == RAY_TABLE || b->type == RAY_TABLE;
+    ray_t* shape = tables ? (a->type == RAY_TABLE ? a : b)
+                          : (a->type == RAY_DICT ? a : b);
+    ray_t* other = shape == a ? b : a;
+    if (tables) {
+        if (other->type != RAY_TABLE && !ray_is_atom(other))
+            return ray_error("type", "==: table expects a table or atom");
+        int64_t nc = ray_table_ncols(shape);
+        if (other->type == RAY_TABLE) {
+            if (nc != ray_table_ncols(other) || ray_table_nrows(shape) != ray_table_nrows(other))
+                return ray_error("length", "==: table shapes differ");
+            for (int64_t c = 0; c < nc; c++)
+                if (ray_table_col_name(shape, c) != ray_table_col_name(other, c))
+                    return ray_error("length", "==: table column names differ");
+        }
+        ray_t* out = ray_table_new(nc);
+        if (!out || RAY_IS_ERR(out)) return out;
+        for (int64_t c = 0; c < nc; c++) {
+            ray_t* x = equality_column(shape, c);
+            ray_t* y = other->type == RAY_TABLE ? equality_column(other, c) : other;
+            if (other->type != RAY_TABLE) ray_retain(y);
+            if (!x || !y || RAY_IS_ERR(x) || RAY_IS_ERR(y)) {
+                ray_release(out);
+                ray_t* err = RAY_IS_ERR(x) ? x : RAY_IS_ERR(y) ? y : ray_error("type", "==: unreadable column");
+                if (x && x != err) ray_release(x);
+                if (y && y != err) ray_release(y);
+                return err;
+            }
+            ray_t* col = atomic_map_binary_op(ray_eq_fn, OP_EQ, x, y);
+            ray_release(x); ray_release(y);
+            if (!col || RAY_IS_ERR(col)) { ray_release(out); return col; }
+            out = ray_table_add_col(out, ray_table_col_name(shape, c), col);
+            ray_release(col);
+            if (!out || RAY_IS_ERR(out)) return out;
+        }
+        return out;
+    }
+    if (other->type != RAY_DICT && !ray_is_atom(other))
+        return ray_error("type", "==: dictionary expects a dictionary or atom");
+    ray_t* keys = ray_dict_keys(shape);
+    ray_t* vals = ray_dict_vals(shape);
+    ray_t* more = other->type == RAY_DICT ? ray_dict_keys(other) : NULL;
+    if (more && (!keys->len || !more->len)) {
+        ray_t* union_keys = keys->len ? keys : more;
+        ray_t* no = ray_vec_new(RAY_BOOL, union_keys->len);
+        if (!no || RAY_IS_ERR(no)) return no;
+        no->len = union_keys->len;
+        memset(ray_data(no), 0, (size_t)no->len);
+        ray_t* values = to_boxed_list(no);
+        ray_release(no);
+        ray_retain(union_keys);
+        return ray_dict_new(union_keys, values);
+    }
+    if (more && keys->type != more->type)
+        return ray_error("type", "==: dictionary key types must match");
+    if (more) {
+        ray_t* same = ray_identical_fn(keys, more);
+        if (!same || RAY_IS_ERR(same)) return same;
+        bool aligned = same->b8;
+        ray_release(same);
+        if (aligned) {
+            ray_t* values = atomic_map_binary_op(ray_eq_fn, OP_EQ, vals, ray_dict_vals(other));
+            if (!values || RAY_IS_ERR(values)) return values;
+            if (values->type != RAY_LIST) {
+                ray_t* boxed = to_boxed_list(values);
+                ray_release(values);
+                values = boxed;
+            }
+            ray_retain(keys);
+            return ray_dict_new(keys, values);
+        }
+    }
+    ray_t* matches = more ? eq_key_find(more, keys) : NULL;
+    if (matches && RAY_IS_ERR(matches)) return matches;
+    ray_t* reverse = more ? eq_key_find(keys, more) : NULL;
+    if (reverse && RAY_IS_ERR(reverse)) { ray_release(matches); return reverse; }
+    ray_t* result = ray_list_new(keys->len);
+    ray_t* outkeys = keys;
+    ray_retain(outkeys);
+    if (!result || RAY_IS_ERR(result) || !outkeys || RAY_IS_ERR(outkeys)) {
+        ray_release(matches); ray_release(reverse);
+        ray_t* err = RAY_IS_ERR(result) ? result : RAY_IS_ERR(outkeys) ? outkeys : ray_error("oom", NULL);
+        if (result != err) ray_release(result);
+        if (outkeys != err) ray_release(outkeys);
+        return err;
+    }
+    ray_t* err = NULL;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int ov = 0, oy = 0;
+        ray_t* x = collection_elem(vals, i, &ov);
+        int64_t j = more ? ((int64_t*)ray_data(matches))[i] : 0;
+        ray_t* y = more && j != NULL_I64 ? collection_elem(ray_dict_vals(other), j, &oy) : other;
+        ray_t* value = RAY_IS_ERR(x) ? x : RAY_IS_ERR(y) ? y :
+            more && j == NULL_I64 ? make_bool(0) : atomic_map_binary_op(ray_eq_fn, OP_EQ, x, y);
+        if (ov && x != value) ray_release(x);
+        if (oy && y != value) ray_release(y);
+        if (!value || RAY_IS_ERR(value)) {
+            err = value ? value : ray_error("oom", NULL);
+            break;
+        }
+        result = ray_list_append(result, value);
+        ray_release(value);
+        if (RAY_IS_ERR(result) || RAY_IS_ERR(outkeys)) break;
+    }
+    for (int64_t i = 0; !err && !RAY_IS_ERR(result) && !RAY_IS_ERR(outkeys) && more && i < more->len; i++) {
+        if (((int64_t*)ray_data(reverse))[i] != NULL_I64) continue;
+        ray_t* no = make_bool(0);
+        result = ray_list_append(result, no);
+        ray_release(no);
+    }
+    if (!err && more) {
+        ray_t* added = ray_vec_new(RAY_I64, more->len);
+        if (!added || RAY_IS_ERR(added)) err = added ? added : ray_error("oom", NULL);
+        else {
+            int64_t* rows = ray_data(added);
+            for (int64_t i = 0; i < more->len; i++)
+                if (((int64_t*)ray_data(reverse))[i] == NULL_I64) rows[added->len++] = i;
+            ray_t* extra = ray_at_fn(more, added);
+            ray_release(added);
+            if (!extra || RAY_IS_ERR(extra)) err = extra ? extra : ray_error("oom", NULL);
+            else {
+                ray_t* combined = ray_concat_fn(keys, extra);
+                ray_release(extra);
+                ray_release(outkeys);
+                outkeys = combined;
+            }
+        }
+    }
+    ray_release(matches); ray_release(reverse);
+    if (err) { ray_release(result); ray_release(outkeys); return err; }
+    return ray_dict_new(outkeys, result);
+}
+
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
+    if (a->type == RAY_DICT || b->type == RAY_DICT || a->type == RAY_TABLE || b->type == RAY_TABLE)
+        return eq_container(a, b);
     if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_EQ, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
@@ -524,4 +690,109 @@ ray_t* ray_not_fn(ray_t* x) {
         return ray_list_collapse_bool(out);
     }
     return make_bool(is_truthy(x) ? 0 : 1);
+}
+
+/* Whole-value equality deliberately does not use numeric promotion. */
+ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
+    if (!a || !b) return ray_error("type", "identical: missing value");
+    if (RAY_IS_ERR(a)) { ray_retain(a); return a; }
+    if (RAY_IS_ERR(b)) { ray_retain(b); return b; }
+    if (ray_is_lazy(a) || ray_is_lazy(b)) {
+        ray_retain(a); ray_retain(b);
+        ray_t* x = ray_is_lazy(a) ? ray_lazy_materialize(a) : a;
+        ray_t* y = ray_is_lazy(b) ? ray_lazy_materialize(b) : b;
+        if (!x || RAY_IS_ERR(x)) { ray_release(y); return x; }
+        if (!y || RAY_IS_ERR(y)) { ray_release(x); return y; }
+        ray_t* result = ray_identical_fn(x, y);
+        ray_release(x); ray_release(y);
+        return result;
+    }
+    if (a->type != b->type) return make_bool(0);
+    if (a == b) return make_bool(1);
+    if (a->type >= RAY_LAMBDA) {
+        if (a->type == RAY_UNARY || a->type == RAY_BINARY || a->type == RAY_VARY)
+            return make_bool(a->i64 == b->i64);
+        return make_bool(0);
+    }
+    if (a->type == RAY_DICT) {
+        ray_t* keys = ray_identical_fn(ray_dict_keys(a), ray_dict_keys(b));
+        if (!keys || RAY_IS_ERR(keys) || !keys->b8) return keys;
+        ray_release(keys);
+        return ray_identical_fn(ray_dict_vals(a), ray_dict_vals(b));
+    }
+    if (a->type == RAY_TABLE) {
+        if (ray_table_ncols(a) != ray_table_ncols(b) ||
+            ray_table_nrows(a) != ray_table_nrows(b)) return make_bool(0);
+        for (int64_t c = 0; c < ray_table_ncols(a); c++) {
+            if (ray_table_col_name(a, c) != ray_table_col_name(b, c)) return make_bool(0);
+            ray_t* x = equality_column(a, c);
+            ray_t* y = equality_column(b, c);
+            if (RAY_IS_ERR(x)) { if (y) ray_release(y); return x; }
+            if (RAY_IS_ERR(y)) { if (x) ray_release(x); return y; }
+            if (!x || !y) { ray_release(x); ray_release(y); return ray_error("type", "identical: unreadable column"); }
+            ray_t* equal = ray_identical_fn(x, y);
+            ray_release(x); ray_release(y);
+            if (!equal || RAY_IS_ERR(equal) || !equal->b8) return equal;
+            ray_release(equal);
+        }
+        return make_bool(1);
+    }
+    if (ray_is_vec(a)) {
+        if (a->len != b->len) return make_bool(0);
+        if (!ray_elem_size(a->type))
+            return ray_error("type", "identical: unreadable vector type");
+        const unsigned char* ad = ray_data(a);
+        const unsigned char* bd = ray_data(b);
+        bool nulls = ray_vec_may_have_nulls(a) || ray_vec_may_have_nulls(b);
+        if (!nulls && a->type != RAY_SYM && a->type != RAY_STR &&
+            a->type != RAY_F32 && a->type != RAY_F64)
+            return make_bool(memcmp(ad, bd, (size_t)a->len * ray_elem_size(a->type)) == 0);
+        for (int64_t i = 0; i < a->len; i++) {
+            if (nulls) {
+                bool an = ray_vec_is_null(a, i), bn = ray_vec_is_null(b, i);
+                if (an != bn) return make_bool(0);
+                if (an) continue;
+            }
+            bool same;
+            if (a->type == RAY_F64) {
+                const double* xa = ray_data(a), *xb = ray_data(b);
+                double x = xa[i], y = xb[i];
+                same = x == y || (isnan(x) && isnan(y));
+            } else if (a->type == RAY_F32) {
+                const float* xa = ray_data(a), *xb = ray_data(b);
+                float x = xa[i], y = xb[i];
+                same = x == y || (isnan(x) && isnan(y));
+            } else if (a->type == RAY_SYM) {
+                same = sym_cell_runtime_id(a, i) == sym_cell_runtime_id(b, i);
+            } else if (a->type == RAY_STR) {
+                size_t al, bl;
+                const char* ap = ray_str_vec_get(a, i, &al);
+                const char* bp = ray_str_vec_get(b, i, &bl);
+                if (!ap || !bp) return ray_error("type", "identical: unreadable string");
+                same = al == bl && memcmp(ap, bp, al) == 0;
+            } else {
+                size_t size = ray_elem_size(a->type);
+                same = memcmp(ad + i * size, bd + i * size, size) == 0;
+            }
+            if (!same) return make_bool(0);
+        }
+        return make_bool(1);
+    }
+    if (a->type == RAY_LIST) {
+        if (a->len != b->len) return make_bool(0);
+        for (int64_t i = 0; i < a->len; i++) {
+            int oa = 0, ob = 0;
+            ray_t* x = collection_elem(a, i, &oa);
+            ray_t* y = collection_elem(b, i, &ob);
+            ray_t* equal = ray_identical_fn(x, y);
+            if (oa) ray_release(x);
+            if (ob) ray_release(y);
+            if (!equal || RAY_IS_ERR(equal)) return equal;
+            int yes = equal->b8;
+            ray_release(equal);
+            if (!yes) return make_bool(0);
+        }
+        return make_bool(1);
+    }
+    return ray_eq_fn(a, b);
 }

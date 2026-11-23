@@ -1,0 +1,147 @@
+;; Running functions under where: off the DAG (#1243).
+;; A running, moving or shift function runs over the whole table under a
+;; where: (#916, docs/queries/select.md "Running functions under where:");
+;; a whole-column verb sees the rows the where: keeps (of its group, under
+;; by:), and an aggregate under an aggregate's argument each group's of them
+;; (#1452).  The answer must not depend on take:, on the table being flat,
+;; parted or splayed, or on a where: that keeps every row.
+(set n (til 20000))
+(set T (table [k h v i] (list (% (* n 7919) 40) (% (* n 7919) 6000) (% n 27) (+ 1 (% n 997)))))
+(.db.splayed.set "/tmp/rfl_where_running_ev/1/t/" (take T 10000))
+(.db.splayed.set "/tmp/rfl_where_running_ev/2/t/" (take T -10000))
+(.db.splayed.set "/tmp/rfl_where_running_ev_s/t/" T)
+(set P (.db.parted.get "/tmp/rfl_where_running_ev/" 't))
+(set S (.db.splayed.get "/tmp/rfl_where_running_ev_s/t/"))
+(set I (at T 'i))
+(set H17 (where (== (at T 'h) 17)))
+(set R (fn [x] (sum (at x H17))))
+(set lp (fn [x] (prior - x)))
+(set lf (fn [x] (- x (first x))))
+(count H17) -- 3
+(R (deltas (as 'I32 I))) -- 3
+
+;; A cast spelled (quote I32) lowers like 'I32: deltas runs on the DAG over
+;; the whole table, with or without take:, flat or parted.
+(at (select {from: T where: (== h 17) by: h z: (sum (deltas (as (quote I32) i)))}) 'z) -- [3]
+(at (select {from: T where: (== h 17) by: h z: (sum (deltas (as (quote I32) i))) take: 5}) 'z) -- [3]
+(at (select {from: P where: (== h 17) by: h z: (sum (deltas (as (quote I32) i)))}) 'z) -- [3]
+(at (select {from: P where: (== h 17) by: h z: (sum (deltas (as (quote I32) i))) take: 5}) 'z) -- [3]
+(as 'I64 (at (select {from: P where: (== h 17) by: h z: (sum (sums (as (quote F64) i))) take: 5}) 'z)) -- (as 'I64 (at (select {from: P where: (== h 17) by: h z: (sum (sums (as 'F64 i)))}) 'z))
+;; Only from a numeric input: a symbol cast keeps the eager `as`.
+(set Y (table [s i] (list ['a 'b 'a] [1 2 3])))
+(try (select {from: Y where: (> i 1) z: (as (quote I64) s)}) (fn [e] 'refused)) -- 'refused
+
+;; On a parted table a where: on the group key ran on the groups after
+;; grouping, so a whole-column verb saw the whole table without take:.  It
+;; sees the kept rows: 3 of them here, ranks 0 1 2.
+(at (select {from: P where: (== h 17) by: h z: (sum (rank i))}) 'z) -- [3]
+(at (select {from: P where: (== h 17) by: h z: (sum (rank i)) take: 5}) 'z) -- [3]
+(at (select {from: P where: (== h 17) by: h z: (sum (iasc i))}) 'z) -- [3]
+(at (select {from: P where: (== h 17) by: h z: (sum (* i (reverse i)))}) 'z) -- (enlist (sum (* (at I H17) (reverse (at I H17)))))
+(at (select {from: P where: (== h 17) by: h z: (sum (xrank 2 i))}) 'z) -- (enlist (sum (xrank 2 (at I H17))))
+(set W (select {from: T where: (> k 3)}))
+(set WO (fn [x] (at (xasc (select {from: (table [k x] (list (at W 'k) x)) by: k z: (sum x)}) 'k) 'z)))
+;; ... and, under by:, its group's kept rows (#1151): each k ranks its own.
+(set WG (fn [f] (map (fn [kk] (f (at (at W 'i) (where (== (at W 'k) kk))))) (asc (distinct (at W 'k))))))
+(set WR (fn [x] (sum (* x (rank x)))))
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (* i (rank i)))}) 'k) 'z) -- (WG WR)
+(at (xasc (select {from: T where: (> k 3) by: k z: (sum (* i (rank i)))}) 'k) 'z) -- (WG WR)
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (lf i))}) 'k) 'z) -- (WG (fn [x] (sum (lf x))))
+(at (select {from: P where: (== k 5) by: k z: (sum (lf i))}) 'z) -- (at (select {from: P where: (== k 5) by: k z: (sum (lf i)) take: 5}) 'z)
+;; A row-local or DAG running input still defers it, with the same answer.
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (sums i))}) 'k) 'z) -- (at (xasc (select {from: T where: (> k 3) by: k z: (sum (sums i))}) 'k) 'z)
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (* i 2))}) 'k) 'z) -- (at (xasc (select {from: T where: (> k 3) by: k z: (sum (* i 2))}) 'k) 'z)
+
+;; A count(distinct) beside a DAG aggregate over a running input on a parted
+;; table filtered the rows first only under take: (no key-where deferral).
+(set CF (fn [s] (at (xasc (select {from: s where: (> k 3) by: k z: (sum (sums i)) c: (count (distinct v))}) 'k) 'z)))
+(set CT (fn [s] (at (xasc (select {from: s where: (> k 3) by: k z: (sum (sums i)) c: (count (distinct v)) take: 100}) 'k) 'z)))
+(count (CF T)) -- 36
+(CT P) -- (CF T)
+(CF P) -- (CF T)
+(CT T) -- (CF T)
+;; Grouped outputs the evaluator runs: a where: that keeps every row gives
+;; the answer no where: gives, on T, P and S alike (whole table under by:
+;; too, #1249: rfl/query/grouped_running_whole_table).
+(set G (fn [s q] (at (xasc (select q) 'k) 'z)))
+(set Q0 (fn [s] (xasc (select {from: s by: k z: (sum (prior - i)) c: (sums v)}) 'k)))
+(set Q1 (fn [s] (xasc (select {from: s by: k where: (> i 0) z: (sum (prior - i)) c: (sums v)}) 'k)))
+(Q1 T) -- (Q0 T)
+(Q1 P) -- (Q0 T)
+(Q1 S) -- (Q0 T)
+(Q0 P) -- (Q0 T)
+(set Q2 (fn [s] (at (xasc (select {from: s by: k where: (> i 0) z: (first (prior - i)) y: (sum (lp i))}) 'k) 'z)))
+(Q2 T) -- (at (xasc (select {from: T by: k z: (first (prior - i)) y: (sum (lp i))}) 'k) 'z)
+(Q2 P) -- (Q2 T)
+(Q2 S) -- (Q2 T)
+(set Q3 (fn [s] (at (xasc (select {from: s by: k where: (> k 3) z: (sum (prior - i)) r: (sum (rank v))}) 'k) 'z)))
+(set Q4 (fn [s] (at (xasc (select {from: s by: k where: (> i 600) z: (sum (prior - i)) r: (sum (rank v))}) 'k) 'z)))
+(count (Q3 T)) -- 36
+(Q3 P) -- (Q3 T)
+(Q3 S) -- (Q3 T)
+(count (Q4 T)) -- 40
+(Q4 P) -- (Q4 T)
+
+;; Keyless: a running call the DAG does not lower runs over the whole table.
+(at (select {from: T where: (== h 17) z: (sum (prior - i))}) 'z) -- (enlist (R (prior - I)))
+(at (select {from: P where: (== h 17) z: (sum (prior - i))}) 'z) -- (enlist (R (prior - I)))
+(at (select {from: T where: (== h 17) z: (sum (sums i)) r: (sum (rank v))}) 'z) -- (enlist (R (sums I)))
+(at (select {from: T where: (== h 17) z: (lp i)}) 'z) -- (at (prior - I) H17)
+;; With or without a where: that keeps every row, on T, P and S alike.
+(set K (fn [s] (at (select {from: s where: (> i 0) z: (prior - i) q: (sum i)}) 'z)))
+(at (select {from: T z: (prior - i) q: (sum i)}) 'z) -- (prior - I)
+(K T) -- (prior - I)
+(K P) -- (prior - I)
+(K S) -- (prior - I)
+(at (select {from: P z: (prior - i) q: (sum i)}) 'z) -- (prior - I)
+;; An output sees the outputs before it: a call over a rebound name is not
+;; run over the source column (the evaluator answers it, or refuses it, as
+;; without the hoist; never with the source column's sums).
+(set U (table [k i] (list [1 2 1 2 1 2] [10 20 30 40 50 60])))
+(at (select {from: U where: (> i 20) i: (* i 2) j: (sums i)}) 'j) -- [120 200 300 420]
+(try (at (select {from: U where: (> i 20) i: (* i 2) j: (sums i) p: (prior - k)}) 'j) (fn [e] [120 200 300 420])) -- [120 200 300 420]
+(try (at (select {from: U where: (> i 20) i: (sums i) j: (prior - i)}) 'j) (fn [e] [60 90 120 150])) -- [60 90 120 150]
+;; The hidden column takes no name that is bound already.
+(set __run0 1000)
+(at (select {from: U where: (> i 20) q: (+ i __run0) p: (prior - i)}) 'q) -- [1030 1040 1050 1060]
+(count (select {from: U where: (> __run0 i) p: (prior - i)})) -- 6
+;; The hoist runs only where a keyless select falls back to the evaluator:
+;; the scalar reduction (every output an aggregate, one the DAG declines,
+;; or a count over a constant collection) and the projection.  A select
+;; the DAG runs whole keeps the DAG's answer.
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'a) -- [40]
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'b) -- [10]
+(at (select {from: U where: (> i 20) a: (sum (sums i)) c: (count (til 3))}) 'a) -- [520]
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) c: (count [1 2 3])}) 'c) -- [3]
+(at (select {from: U where: (> i 20) z: (prior - i) take: 2}) 'z) -- [10 10]
+(at (select {from: U where: (> i 20) z: (sums i) q: (+ i 1)}) 'z) -- [60 100 150 210]
+(at (select {from: U where: (> i 20) z: (sum (sums i))}) 'z) -- [520]
+;; An unbound name in a value, a where: or a take: is never the hidden
+;; column: it is not found, as without the hoist.
+(select {from: U where: (> __run1 5) z: (prior - i)}) !- schema
+(select {from: U where: (> i 20) z: (prior - i) q: (+ i __run1)}) !- schema
+(select {from: U where: (> i 20) z: (prior - i) q: (sum i) take: __run1}) !- name
+;; No count of calls, outputs or names makes the hoist give up.
+(set W (table [k i] (list [1 2 3 4 5 6 7] [5 1 9 2 8 3 7])))
+(set WR (rank (at (deltas (at W 'i)) (where (> (at W 'i) 2)))))
+WR -- [0 4 3 1 2]
+(at (select {from: W where: (> i 2) a1: (rank (deltas i)) a2: (rank (deltas i)) a3: (rank (deltas i)) a4: (rank (deltas i)) a5: (rank (deltas i)) a6: (rank (deltas i)) a7: (rank (deltas i)) a8: (rank (deltas i)) a9: (rank (deltas i)) a10: (rank (deltas i)) a11: (rank (deltas i)) a12: (rank (deltas i)) a13: (rank (deltas i)) a14: (rank (deltas i)) a15: (rank (deltas i)) a16: (rank (deltas i)) a17: (rank (deltas i))}) 'a17) -- WR
+(at (select {from: W where: (> i 2) b1: k b2: k b3: k b4: k b5: k b6: k b7: k b8: k b9: k b10: k b11: k b12: k b13: k b14: k b15: k b16: k b17: k b18: k b19: k b20: k b21: k b22: k b23: k b24: k b25: k b26: k b27: k b28: k b29: k b30: k b31: k b32: k b33: k b34: k b35: k b36: k b37: k b38: k b39: k b40: k b41: k b42: k b43: k b44: k b45: k b46: k b47: k b48: k b49: k b50: k b51: k b52: k b53: k b54: k b55: k b56: k b57: k b58: k b59: k b60: k b61: k b62: k b63: k b64: k b65: k z: (rank (deltas i))}) 'z) -- WR
+(set WC (table [k i c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17 c18 c19 c20 c21 c22 c23 c24 c25 c26 c27 c28 c29 c30 c31 c32 c33 c34 c35 c36 c37 c38 c39 c40 c41 c42 c43 c44 c45 c46 c47 c48 c49 c50 c51 c52 c53 c54 c55 c56 c57 c58 c59 c60 c61 c62 c63 c64 c65 c66 c67 c68 c69] (list [1 2 3 4 5 6 7] [5 1 9 2 8 3 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7] [1 2 3 4 5 6 7])))
+(at (select {from: WC where: (> i 2) z: (rank (deltas (+ (+ (+ (+ (+ (+ c0 c1) (+ c2 c3)) (+ (+ c4 c5) (+ c6 c7))) (+ (+ (+ c8 c9) (+ c10 c11)) (+ (+ c12 c13) (+ c14 (+ c15 c16))))) (+ (+ (+ (+ c17 c18) (+ c19 c20)) (+ (+ c21 c22) (+ c23 (+ c24 c25)))) (+ (+ (+ c26 c27) (+ c28 c29)) (+ (+ c30 c31) (+ c32 (+ c33 c34)))))) (+ (+ (+ (+ (+ c35 c36) (+ c37 c38)) (+ (+ c39 c40) (+ c41 c42))) (+ (+ (+ c43 c44) (+ c45 c46)) (+ (+ c47 c48) (+ c49 (+ c50 c51))))) (+ (+ (+ (+ c52 c53) (+ c54 c55)) (+ (+ c56 c57) (+ c58 (+ c59 c60)))) (+ (+ (+ c61 c62) (+ c63 c64)) (+ (+ c65 c66) (+ c67 (+ c68 c69)))))))))}) 'z) -- (rank (at (deltas (* 70 (at WC 'k))) (where (> (at WC 'i) 2))))
+
+;; prior over + - * is one vector op; it gives the cell-by-cell answer,
+;; nulls, wrapping and float edges included, and its type does not depend
+;; on the data.
+(set PG (fn [f v] (prior (fn [a b] (f a b)) v)))
+(prior - [5 7 10 -3]) -- [0 2 3 -13]
+(type (prior - [5 7 10 -3])) -- 'I64
+(type (prior - [1 0Nl 4])) -- 'I64
+(prior - [1 0Nl 4]) -- [0 0Nl 0Nl]
+(as 'LIST (prior + (as 'I16 [1 32767 -32767 4]))) -- (PG + (as 'I16 [1 32767 -32767 4]))
+(as 'LIST (prior * (as 'I32 [5 7 2147483647 -2]))) -- (PG * (as 'I32 [5 7 2147483647 -2]))
+(as 'LIST (prior - [9223372036854775807 -1 -9223372036854775807])) -- (PG - [9223372036854775807 -1 -9223372036854775807])
+(as 'LIST (prior * [1.5 -2.25 1e300 1e300])) -- (PG * [1.5 -2.25 1e300 1e300])
+(as 'LIST (prior + [0Nf 1.5 0Nf -0.0])) -- (PG + [0Nf 1.5 0Nf -0.0])
+(as 'LIST (prior - (as 'I32 [0Nl 5 0Nl 2147483647 1]))) -- (PG - (as 'I32 [0Nl 5 0Nl 2147483647 1]))
+(.sys.exec "rm -rf /tmp/rfl_where_running_ev /tmp/rfl_where_running_ev_s")

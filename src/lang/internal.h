@@ -170,37 +170,17 @@ static inline int both_f32_atoms(ray_t* a, ray_t* b) {
 
 /* RAY_ATOM_IS_NULL and ray_typed_null are in rayforce.h */
 
-/* Return a typed null for the promoted result type of two operands */
-static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
-    if (a->type == -RAY_F64 || b->type == -RAY_F64)
-        return ray_typed_null(-RAY_F64);
-    if (a->type == -RAY_F32 || b->type == -RAY_F32)
-        return ray_typed_null(both_f32_atoms(a, b) ? -RAY_F32 : -RAY_F64);
-    if (a->type == -RAY_I64 || b->type == -RAY_I64)
-        return ray_typed_null(-RAY_I64);
-    if (a->type == -RAY_I32 || b->type == -RAY_I32)
-        return ray_typed_null(-RAY_I32);
-    if (a->type == -RAY_I16 || b->type == -RAY_I16)
-        return ray_typed_null(-RAY_I16);
-    return ray_typed_null(-RAY_I64);
+/* The atom type (negative) of + - * div % over two numeric atoms: the
+ * promotion table (ray_arith_type, core/types.h).  -RAY_I64 when either is
+ * not numeric. */
+static inline int8_t arith_atom_type(ray_t* a, ray_t* b) {
+    int8_t t = ray_arith_type((int8_t)-a->type, (int8_t)-b->type);
+    return t ? (int8_t)-t : -RAY_I64;
 }
 
-/* ══════════════════════════════════════════
- * Type promotion
- * ══════════════════════════════════════════ */
-
-/* Determine the promoted integer result type for two numeric operands.
- * Returns atom type code (negative). */
-static inline int8_t promote_int_type(ray_t* a, ray_t* b) {
-    if (a->type == -RAY_I64 || b->type == -RAY_I64) return -RAY_I64;
-    if (a->type == -RAY_I32 || b->type == -RAY_I32) return -RAY_I32;
-    if (a->type == -RAY_U8 || b->type == -RAY_U8) {
-        /* u8 op u8 -> u8, but u8 op i16 -> i16 etc */
-        if (a->type == -RAY_U8 && b->type == -RAY_U8) return -RAY_U8;
-        return (a->type == -RAY_I16 || b->type == -RAY_I16) ? -RAY_I16 : -RAY_I64;
-    }
-    if (a->type == -RAY_I16 || b->type == -RAY_I16) return -RAY_I16;
-    return -RAY_I64;
+/* Return a typed null for the promoted result type of two operands */
+static inline ray_t* null_for_promoted(ray_t* a, ray_t* b) {
+    return ray_typed_null(arith_atom_type(a, b));
 }
 
 /* Create a result atom of the given type from an int64_t value */
@@ -441,6 +421,9 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
  * ══════════════════════════════════════════ */
 
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right);
+/* Vectors the typed temporal +/- integer pass answered (eval.c, #1302):
+ * a test counter, as ray_narrow_sum_routes. */
+extern _Atomic(uint64_t) ray_tempint_routes;
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg);
 ray_t* to_boxed_list(ray_t* x);
 ray_t* unbox_vec_arg(ray_t* x, ray_t** _bx);
@@ -504,6 +487,17 @@ ray_t* ray_quantile_per_group_buf(ray_t* src,
 
 /* Collection helpers (formerly static in eval.c, now in collection.c) */
 int    atom_eq(ray_t* a, ray_t* b);
+/* Hash consistent with atom_eq for hash sets over key cells (collection.c).
+ * Pass spans = ray_key_spans() over every cell the set will compare. */
+#define RAY_KEY_SPAN_ATOM 1
+#define RAY_KEY_SPAN_VEC  2
+/* Not a span bit: the key set holds no float atom and no TIMESPAN
+ * (ray_key_float_free), so atom_eq meets integer atoms exactly and they
+ * hash by their integer value, not their double (#1333). */
+#define RAY_KEY_EXACT_INT 4
+uint64_t ray_key_hash(ray_t* x, int spans);
+bool ray_key_float_free(ray_t* x);
+int      ray_key_spans(ray_t* x);
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
 /* Collection builtins (formerly static in eval.c, now in collection.c) */
@@ -682,6 +676,10 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n);
 ray_t* ray_prof_fn(ray_t** args, int64_t n);
 ray_t* ray_qlog_fn(ray_t** args, int64_t n);
 ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n);
+ray_t* ray_join_par_min_fn(ray_t** args, int64_t n);
+ray_t* ray_callprof_fn(ray_t** args, int64_t n);
+ray_t* ray_callprof_enable_fn(ray_t** args, int64_t n);
+ray_t* ray_callprof_reset_fn(ray_t** args, int64_t n);
 ray_t* ray_sysinfo_fn(ray_t** args, int64_t n);
 ray_t* ray_sys_args_fn(ray_t** args, int64_t n);
 ray_t* ray_ser_fn(ray_t* val);
@@ -811,6 +809,8 @@ ray_t* ray_left_join_fn(ray_t** args, int64_t n);
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n);
 ray_t* ray_full_join_fn(ray_t** args, int64_t n);
 ray_t* ray_anti_join_fn(ray_t** args, int64_t n);
+ray_t* ray_semi_mask_fn(ray_t** args, int64_t n);
+ray_t* ray_anti_mask_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join_fn(ray_t** args, int64_t n);
 ray_t* ray_window_join1_fn(ray_t** args, int64_t n);
 ray_t* ray_asof_join_fn(ray_t** args, int64_t n);

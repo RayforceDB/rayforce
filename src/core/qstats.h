@@ -35,6 +35,9 @@
 /* Mode bits (set on the main thread before a dispatch). */
 #define RAY_QS_PROF     0x1u   /* capture busy-ns / task counts for stats */
 #define RAY_QS_PROGRESS 0x2u   /* accumulate rows_done for progress pumping */
+#define RAY_QS_CALLS    0x4u   /* accumulate busy-ns into calls_busy_ns (call
+                                * profiler, lang/callprof.h); sticky across
+                                * ray_qstats_set_mode, never reset */
 
 /* One worker's counters.  rows_done is the only field read cross-thread
  * (by the progress pump), so it is atomic; the rest are written and read
@@ -49,6 +52,11 @@ typedef struct RAY_ALIGN(64) {
 typedef struct {
     _Atomic(uint32_t) mode;              /* RAY_QS_* bits, 0 = disabled */
     uint64_t          phase_rows_total;  /* set by dispatch; main-thread only */
+    /* Worker busy-ns summed over every task since the process started,
+     * while RAY_QS_CALLS is set.  Monotonic (the per-query resets leave it
+     * alone), so the call profiler takes a delta across one builtin call.
+     * Its own cache line: workers add to it once per task. */
+    RAY_ALIGN(64) _Atomic(uint64_t) calls_busy_ns;
     ray_wstat_t       slot[RAY_QS_MAX_WORKERS];
 } ray_qstats_t;
 
@@ -57,9 +65,22 @@ extern ray_qstats_t g_qstats;
 
 /* ── main-thread control (call between dispatches, never in a hot loop) ── */
 
-/* Enable/disable capture.  Passing 0 disables everything. */
+/* Enable/disable capture.  Passing 0 disables everything but the call
+ * profiler's RAY_QS_CALLS bit, which only ray_qstats_set_calls changes: the
+ * per-query arming at each eval boundary must not switch it off. */
 static inline void ray_qstats_set_mode(uint32_t mode) {
-    atomic_store_explicit(&g_qstats.mode, mode, memory_order_relaxed);
+    uint32_t calls = atomic_load_explicit(&g_qstats.mode, memory_order_relaxed) & RAY_QS_CALLS;
+    atomic_store_explicit(&g_qstats.mode, (mode & ~RAY_QS_CALLS) | calls, memory_order_relaxed);
+}
+
+static inline void ray_qstats_set_calls(bool on) {
+    uint32_t m = atomic_load_explicit(&g_qstats.mode, memory_order_relaxed);
+    atomic_store_explicit(&g_qstats.mode, on ? (m | RAY_QS_CALLS) : (m & ~RAY_QS_CALLS),
+                          memory_order_relaxed);
+}
+
+static inline uint64_t ray_qstats_calls_busy(void) {
+    return atomic_load_explicit(&g_qstats.calls_busy_ns, memory_order_relaxed);
 }
 
 static inline uint32_t ray_qstats_mode(void) {
@@ -106,10 +127,10 @@ static inline void ray_qstats_agg(uint32_t* workers_used,
 /* ── per-task hooks (called by the pool around each t->fn) ────────────── */
 
 /* Read the mode once per task.  Returns the mode; stashes a start
- * timestamp in *t0 iff PROF is active (0 otherwise). */
+ * timestamp in *t0 iff PROF or CALLS is active (0 otherwise). */
 static inline uint32_t ray_qstats_task_begin(int64_t* t0) {
     uint32_t m = atomic_load_explicit(&g_qstats.mode, memory_order_relaxed);
-    *t0 = (m & RAY_QS_PROF) ? ray_profile_now_ns() : 0;
+    *t0 = (m & (RAY_QS_PROF | RAY_QS_CALLS)) ? ray_profile_now_ns() : 0;
     return m;
 }
 
@@ -119,9 +140,14 @@ static inline void ray_qstats_task_end(uint32_t mode, uint32_t worker_id,
     if (!mode) return;
     ray_wstat_t* s = &g_qstats.slot[worker_id & (RAY_QS_MAX_WORKERS - 1)];
     atomic_fetch_add_explicit(&s->rows_done, (uint64_t)n_rows, memory_order_relaxed);
-    if (mode & RAY_QS_PROF) {
-        s->tasks_run++;
-        s->busy_ns += (uint64_t)(ray_profile_now_ns() - t0);
+    if (mode & (RAY_QS_PROF | RAY_QS_CALLS)) {
+        uint64_t ns = (uint64_t)(ray_profile_now_ns() - t0);
+        if (mode & RAY_QS_PROF) {
+            s->tasks_run++;
+            s->busy_ns += ns;
+        }
+        if (mode & RAY_QS_CALLS)
+            atomic_fetch_add_explicit(&g_qstats.calls_busy_ns, ns, memory_order_relaxed);
     }
 }
 

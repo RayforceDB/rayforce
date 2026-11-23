@@ -328,7 +328,11 @@ static int64_t str_cells_size(ray_t* obj) {
 
 static int64_t str_cells_write(uint8_t* buf, ray_t* obj) {
     ray_str_t* elems = (ray_str_t*)ray_data(obj);
-    const char* pool = obj->str_pool ? (const char*)ray_data(obj->str_pool) : NULL;
+    /* A slice (a segment of split, a take or drop of a vector) has no pool of its
+     * own: its header words hold slice_parent and slice_offset, and str_pool read
+     * from it is the offset taken for a pointer.  The pool is the owner's. */
+    ray_t* own = (obj->attrs & RAY_ATTR_SLICE) ? obj->slice_parent : obj;
+    const char* pool = own->str_pool ? (const char*)ray_data(own->str_pool) : NULL;
     int64_t c = 0;
     for (int64_t i = 0; i < obj->len; i++) {
         int64_t slen = (int64_t)elems[i].len;

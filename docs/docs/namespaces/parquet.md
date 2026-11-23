@@ -110,7 +110,12 @@ a source containing an integer ID and text can be imported as:
 
 Convert into `root/<partition-number>/<table-name>`, preserving source row
 order. The default maximum partition size is 65,536 rows. `rows` accepts
-1 through 1,048,576; source row-group boundaries also end partitions.
+1 through 1,048,576. A row group larger than `rows` is split into several
+partitions; row groups smaller than `rows` are packed together, in order and
+across files, into partitions of up to `rows` rows, so many small files do not
+leave as many tiny partitions. A pack never crosses the batch of files an import
+works on at once (up to 256 files, or 64 partitions' worth of rows), so the
+partition count can exceed `total rows / rows` by about one per batch.
 
 ```lisp
 (.parquet.parted {types: [I64 SYM] rows: 262144}
@@ -119,7 +124,8 @@ order. The default maximum partition size is 65,536 rows. `rows` accepts
 ```
 
 `.parquet.parted` also takes a list of paths in place of the path. The files
-are concatenated in order into one table: partitions continue across the files,
+are concatenated in order into one table: partitions continue across the files
+(one partition can hold rows of several files),
 string columns imported as `SYM` share one vocabulary, and the files must have the
 same columns, in order, with the same native types after the import's type
 conversions (a column that differs is refused, naming it). This is how the
@@ -141,7 +147,7 @@ errors; argument, I/O, allocation, and cancellation errors also propagate.
 The options dict also takes `compress`: `true` writes generation-2
 (compressed) column files where the column is eligible, `false` (or no
 option, since the destination is always new) generation 0. A non-bool
-`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, because the import writes through the same splayed-table writer as `.db.splayed.set`.
+`compress` or a second options dict is a `domain` error. Compressed files keep their chunk zones and persist the same indexes a generation-0 save does, unless a string column's dictionary would make the file larger than the generation-0 one (mostly distinct strings; see `.db.splayed.set` in [Storage](../storage/index.md)): the import writes through the same splayed-table writer as `.db.splayed.set`.
 For example:
 
 ```lisp

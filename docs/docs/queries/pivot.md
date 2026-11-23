@@ -14,7 +14,7 @@ Pivot a table to wide format.
 
 - **table** — source table
 - **index** — row index column (symbol or vector of symbols for multi-index)
-- **pivot_col** — column whose distinct values become new column headers
+- **pivot_col** — column whose distinct values become new column headers, named as described in [Column names](#column-names). A STR or LIST pivot column, in memory or parted, raises `nyi`
 - **value_col** — column to aggregate
 - **agg_fn** — aggregation function (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`, `med`, or a custom lambda)
 
@@ -62,6 +62,30 @@ Pivot a table to wide format.
 
 ; Median Price
 (pivot trades 'Symbol 'Side 'Price med)
+```
+
+Each cell's value is what the aggregate gives over that cell's rows as a plain vector. So `first` and `last` take the cell's first and last row by position, a null included, for every type, as a direct `(first v)` does. This differs from `select … by:`, which skips nulls.
+
+### Column names
+
+Every aggregation names and orders the value columns by the same rule, whether `pivot` runs as one `OP_PIVOT` node (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`; `first` and `last` of a column that may hold a null run over the rows' numbers and then read each cell's row, so they stay positional) or calls the function per cell (`med`, a lambda):
+
+- A column is named what `(format "%" v)` gives its pivot value `v`: a symbol its name, an integer of any width in decimal, a date, time, timestamp or timespan as such (`2024.01.01`, `09:30:00.000`), an F64 at `%g` precision (`1.5`), an F32 with its `e` (`1.5e`), a U8 as `0x01`, a boolean `true` or `false`, a GUID as its text.
+- Rows whose pivot value is null are kept, in one column named by the type's null: `0Nl`, `0Ni`, `0Nf`, `0Nd`, `0Np`, `0Ng`, and so on. The null symbol's column is named `'`, as `format` writes it.
+- Columns come in the order their pivot value first appears in the table, a null included; index rows likewise.
+- Floats that `%g` writes alike (`1.0000001` and `1.0000002` both give `1`) are named by their shortest round-trip digits instead, as `repr` writes them.
+- A name that an index column or an earlier value column already has takes the smallest suffix `_1`, `_2`, ... that no column of the result has: a symbol pivot value `k` next to an index column `k` names the column `k_1`.
+
+```lisp
+(set t (table [k p v] (list [a a b] [1 0Nl 1] [10 20 30])))
+(pivot t 'k 'p 'v sum)
+; k  1   0Nl
+; -  --  ---
+; a  10  20
+; b  30  0Nl
+
+(set t (table [k p v] (list [a a b] ['x 'k 'x] [10 20 30])))
+(cols (pivot t 'k 'p 'v sum))    ; [k x k_1]
 ```
 
 ### Custom Aggregation

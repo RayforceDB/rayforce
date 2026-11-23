@@ -147,6 +147,7 @@ extern const test_entry_t idx_route_entries[];
 extern const test_entry_t index_entries[];
 extern const test_entry_t ipc_entries[];
 extern const test_entry_t join_buildside_entries[];
+extern const test_entry_t join_mask_entries[];
 extern const test_entry_t join_prefilter_entries[];
 extern const test_entry_t journal_entries[];
 extern const test_entry_t lang_entries[];
@@ -227,6 +228,7 @@ static const test_entry_t* const compiled_groups[] = {
     idx_route_entries,
     index_entries,    ipc_entries,
     join_buildside_entries,
+    join_mask_entries,
     join_prefilter_entries,
     journal_entries,
     lang_entries,     link_entries,
@@ -585,9 +587,31 @@ done:
     return res;
 }
 
+/* ";; @also-unfused" in a file runs it a second time with the fused
+ * expression evaluator turned off, so every query also goes through the
+ * typed per-node executor (the path a fused program falls back to when it
+ * runs out of registers) and is held to the same answers. */
+extern bool ray_expr_disable;
+static bool rfl_file_has(const char* path, const char* needle) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    char line[512];
+    bool found = false;
+    while (!found && fgets(line, sizeof line, f)) found = strstr(line, needle) != NULL;
+    fclose(f);
+    return found;
+}
+
 static test_result_t run_rfl_at(int idx) {
     if (idx < 0 || idx >= g_rfl_count) FAIL("invalid .rfl index");
-    return run_rfl_file(g_rfl_paths[idx]);
+    test_result_t r = run_rfl_file(g_rfl_paths[idx]);
+    if (r.status == TEST_PASS && rfl_file_has(g_rfl_paths[idx], ";; @also-unfused")) {
+        ray_expr_disable = true;
+        r = run_rfl_file(g_rfl_paths[idx]);
+        ray_expr_disable = false;
+        if (r.status == TEST_FAIL) fprintf(stderr, "        (in the unfused pass)\n");
+    }
+    return r;
 }
 
 /* The runtime poll mirrors main.c: unified IPC handles are selector ids
@@ -962,6 +986,7 @@ void ray_test_hooks_off(void) {
     ray_expr_test_parted_all_segments(false);
     ray_group_test_route(0);
     ray_query_test_cd_route(0);
+    ray_query_test_cancel_net_off(false);
     ray_query_test_cd_firstn_set_max(-1);
     ray_group_test_fail_scalar_alloc(0);
     ray_group_test_scalar_grain(0);
@@ -1169,6 +1194,8 @@ static const char* const exclusive_tests[] = {
     "heap/raw_discard",            /* process-wide anon / direct byte counts */
     "rfl/system/ipc_diff",         /* fixed server port 19999, shared with ... */
     "equiv/rfl/system/ipc_diff",   /* ... its equivalence-pass twin */
+    "rfl/query/grouped_grade_per_group",        /* in-run route-cost comparisons ... */
+    "equiv/rfl/query/grouped_grade_per_group",  /* ... that a saturated machine skews */
     NULL,
 };
 /* -j hands these out first, so each is the first test of a newly forked

@@ -1,0 +1,14 @@
+;; @requires: posix  (servers are spawned and stopped through bash: /dev/tcp, $RANDOM, kill)
+;; A server that holds a shared-memory connection and is stopped then continued
+;; (SIGSTOP, SIGCONT: a debugger, a container freeze, a timed-out request's peer)
+;; must stay up.  epoll_wait returned EINTR on the continue, xport_woke overwrote
+;; the errno before it was looked at, the poll loop returned -1, and a server whose
+;; script comes from a pipe or /dev/null took that for a request to exit and ended
+;; with status 0 (#1391).
+
+(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; rm -rf $D; mkdir -p $D; pick() { while :; do P=$((30000 + RANDOM % 20000)); (echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null || break; done; echo $P; }; A=$(pick); B=$(pick); [ $A = $B ] && B=$((B + 1)); echo \"(set ping (fn [] 42))\" > $D/peer.rfl; printf \"(set peer (.ipc.open \\\"127.0.0.1:%s\\\" 1000))\\n(set ping (fn [] 42))\\n\" $A > $D/owner.rfl; ./rayforce -c 1 -p $A $D/peer.rfl </dev/null >$D/a.log 2>&1 & echo $! > $D/apid; for i in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$A) 2>/dev/null && break; sleep 0.1; done; ./rayforce -c 1 -p $B $D/owner.rfl </dev/null >$D/b.log 2>&1 & echo $! > $D/bpid; for i in $(seq 50); do (echo > /dev/tcp/127.0.0.1/$B) 2>/dev/null && break; sleep 0.1; done; echo $B > $D/bport'") -- 0
+
+(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; kill -STOP $(cat $D/bpid); sleep 0.5; kill -CONT $(cat $D/bpid); sleep 1; kill -0 $(cat $D/bpid)'") -- 0
+(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; B=$(cat $D/bport); (echo > /dev/tcp/127.0.0.1/$B)'") -- 0
+
+(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; kill $(cat $D/apid) $(cat $D/bpid) 2>/dev/null; rm -rf $D; exit 0'") -- 0

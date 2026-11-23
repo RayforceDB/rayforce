@@ -20,18 +20,17 @@
 
 ;; I32 + I16 -> I32 (promote_type line 61-62: a==RAY_I32 arm)
 (set T32_16 (table [a b] (list [1i 2i 3i] [10h 20h 30h])))
-(at (select {c: (+ a b) from: T32_16}) 'c) -- [11 22 33]
+(at (select {c: (+ a b) from: T32_16}) 'c) -- [11i 22i 33i]
 
-;; I16 + I16 — promoted to I64 (binary fast paths emit I64 outputs;
-;; narrow-output is reserved for explicit casts).
+;; I16 + I16 — stays I16, as the builtin (#973).
 (set T16_16 (table [a b] (list [1h 2h 3h] [10h 20h 30h])))
-(at (select {c: (+ a b) from: T16_16}) 'c) -- [11 22 33]
-(type (at (select {c: (+ a b) from: T16_16}) 'c)) -- 'I64
+(at (select {c: (+ a b) from: T16_16}) 'c) -- [11h 22h 33h]
+(type (at (select {c: (+ a b) from: T16_16}) 'c)) -- 'I16
 
 ;; BOOL + I16 -> I16 (promote_type line 61-62: via DATE/TIME/I32 arm? or default)
 ;; atom_to_numeric line 290-295: RAY_U8 fallthrough arm (bool value as u8)
 (set T_bool (table [a b] (list [true false true] [1h 2h 3h])))
-(at (select {c: (+ a b) from: T_bool}) 'c) -- [2 2 4]
+(at (select {c: (+ a b) from: T_bool}) 'c) -- [2h 2h 4h]
 
 ;; ====================================================================
 ;; Section 2: fold_unary_const — uncovered branches

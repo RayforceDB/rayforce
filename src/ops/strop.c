@@ -767,6 +767,86 @@ ray_t* ray_str_join_fn(ray_t* items, ray_t* delim) {
     return out;
 }
 
+/* Positions of a split by indices.  A position is an offset into the data, so
+ * a negative one (a null reads as the smallest integer) addressed memory before
+ * it; one past the end addressed memory after it.  The string form always
+ * clamped the latter, and now every form does; the former is an error. */
+static ray_t* split_positions_check(int64_t* idx, int64_t n, int64_t total) {
+    for (int64_t i = 0; i < n; i++) {
+        if (idx[i] < 0)
+            return ray_error("domain", "split: positions must not be negative or null, got %lld at index %lld",
+                             (long long)idx[i], (long long)i);
+        if (idx[i] > total) idx[i] = total;
+    }
+    return NULL;
+}
+
+/* The parts of one string at each occurrence of `dp`: a list of string
+ * atoms.  A delimiter that is empty or longer than the input leaves the
+ * input whole. */
+static ray_t* split_bytes(const char* sp, size_t slen, const char* dp, size_t dlen) {
+    ray_t* result = ray_list_new(8);
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
+    size_t start = 0;
+    if (dlen > 0 && slen >= dlen) {
+        for (size_t i = 0; i <= slen - dlen; ) {
+            if (memcmp(sp + i, dp, dlen) == 0) {
+                ray_t* part = ray_str(sp + start, i - start);
+                if (!part || RAY_IS_ERR(part)) { ray_release(result); return part ? part : ray_error("oom", NULL); }
+                result = ray_list_append(result, part);
+                ray_release(part);
+                if (RAY_IS_ERR(result)) return result;
+                i += dlen;
+                start = i;
+            } else {
+                i++;
+            }
+        }
+    }
+    ray_t* part = ray_str(sp + start, slen - start);
+    if (!part || RAY_IS_ERR(part)) { ray_release(result); return part ? part : ray_error("oom", NULL); }
+    result = ray_list_append(result, part);
+    ray_release(part);
+    return result;
+}
+
+/* Is `x` a collection split takes cell by cell: a string or symbol vector,
+ * or a list (of string or symbol atoms)? */
+static bool split_cells_input(ray_t* x) {
+    return x->type == RAY_STR || x->type == RAY_SYM || x->type == RAY_LIST;
+}
+
+/* (split v delim) for a split_cells_input `v`: a list with one entry per
+ * cell, the list of that cell's parts (what the cell, as an atom, splits
+ * into). */
+static ray_t* split_cells(ray_t* v, const char* dp, size_t dlen) {
+    ray_t* out = ray_list_new(v->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** items = v->type == RAY_LIST ? (ray_t**)ray_data(v) : NULL;
+    for (int64_t i = 0; i < v->len; i++) {
+        if ((i & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(NULL)) {
+            ray_release(out);
+            return ray_error("cancel", NULL);
+        }
+        const char* sp = NULL;
+        size_t sl = 0;
+        if (!items) {
+            str_vec_cell_bytes(v, i, &sp, &sl);   /* a STR or SYM vector: every cell has bytes */
+        } else if (!str_atom_bytes(items[i], &sp, &sl, NULL)) {
+            int8_t t = items[i]->type;
+            ray_release(out);
+            return ray_error("type", "split: list items must be string or symbol atoms, got %s",
+                             ray_type_name(t));
+        }
+        ray_t* parts = split_bytes(sp, sl, dp, dlen);
+        if (!parts || RAY_IS_ERR(parts)) { ray_release(out); return parts ? parts : ray_error("oom", NULL); }
+        out = ray_list_append(out, parts);
+        ray_release(parts);
+        if (RAY_IS_ERR(out)) return out;
+    }
+    return out;
+}
+
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
     if (str->type == RAY_LIST &&
@@ -781,6 +861,8 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx, str->len);
+        if (bad_pos) return bad_pos;
         int64_t total = str->len;
         ray_t** items = (ray_t**)ray_data(str);
         ray_t* result = ray_list_new(nidx + 1);
@@ -840,6 +922,9 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             idx_buf[ii] = as_i64(ie);
             if (alloc) ray_release(ie);
         }
+        ray_t* bad_pos = split_positions_check(idx_buf, nidx,
+            ray_is_atom(str) ? (int64_t)ray_str_len(str) : str->len);
+        if (bad_pos) return bad_pos;
         /* String split by indices */
         if (ray_is_atom(str) && (-str->type) == RAY_STR) {
             const char* sp2 = ray_str_ptr(str);
@@ -863,7 +948,6 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         }
         /* Vector split by indices */
         int64_t total = str->len;
-        int esz = ray_elem_size(str->type);
         ray_t* result = ray_list_new(nidx + 1);
         if (RAY_IS_ERR(result)) return result;
         for (int64_t i = 0; i < nidx; i++) {
@@ -871,71 +955,48 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             int64_t end = (i + 1 < nidx) ? idx_buf[i + 1] : total;
             int64_t seglen = end - start;
             if (seglen < 0) seglen = 0;
-            ray_t* seg = ray_vec_new(str->type, seglen);
+            /* a segment keeps the null flags and the strings of the source; a raw
+             * copy of the cells dropped both (a null came out as its sentinel value,
+             * a string that is not inline as an empty one) */
+            ray_t* seg;
+            if (str->type == RAY_STR) {
+                /* A string segment is copied: a slice of a string vector shares the
+                 * pool of the whole vector, so saving 200 segments wrote the pool
+                 * 200 times (178x the size), each reload allocated it again, and
+                 * every reader of ->str_pool had to know about slices. The copy
+                 * holds only the bytes its own cells reference. */
+                int64_t* rows = (int64_t*)ray_alloc_raw((size_t)(seglen > 0 ? seglen : 1) * sizeof(int64_t));
+                if (!rows) { ray_release(result); return ray_error("oom", NULL); }
+                for (int64_t r = 0; r < seglen; r++) rows[r] = start + r;
+                seg = gather_by_idx(str, rows, seglen);
+                ray_free_raw(rows);
+            } else {
+                seg = ray_vec_slice(str, start, seglen);
+            }
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
-            seg->len = seglen;
-            if (seglen > 0) memcpy(ray_data(seg), (char*)ray_data(str) + start * esz, seglen * esz);
             result = ray_list_append(result, seg);
             ray_release(seg);
             if (RAY_IS_ERR(result)) return result;
         }
         return result;
     }
-    /* Normalize str and delim to string pointers */
-    const char *sp, *dp;
-    size_t slen, dlen;
-    ray_t* sym_str_s = NULL;
-    ray_t* sym_str_d = NULL;
-    if (str->type == -RAY_STR) { sp = ray_str_ptr(str); slen = ray_str_len(str); }
-    else if (str->type == -RAY_SYM) { sym_str_s = ray_sym_str(str->i64); if (!sym_str_s) return ray_error("domain", "split: unresolved sym for input string"); sp = ray_str_ptr(sym_str_s); slen = ray_str_len(sym_str_s); }
-    /* RAY_CHAR removed — all chars are now -RAY_STR */
-    else return ray_error("type", "split: expected str or sym input, got %s", ray_type_name(str->type));
-    if (delim->type == -RAY_STR) { dp = ray_str_ptr(delim); dlen = ray_str_len(delim); }
-    /* RAY_CHAR removed — all chars are now -RAY_STR */
-    else { int8_t dt = delim->type; if (sym_str_s) ray_release(sym_str_s); return ray_error("type", "split: expected str delimiter, got %s", ray_type_name(dt)); }
-
-    ray_t* result = ray_list_new(8);
-    if (RAY_IS_ERR(result)) { if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return result; }
-
-    /* A longer delimiter cannot occur in the input.  Guard the unsigned
-     * slen - dlen bound in the search loop below. */
-    if (dlen == 0 || slen < dlen) {
-        ray_t* part = ray_str(sp, slen);
-        if (!part || RAY_IS_ERR(part)) {
-            ray_release(result);
-            if (sym_str_s) ray_release(sym_str_s);
-            if (sym_str_d) ray_release(sym_str_d);
-            return part ? part : ray_error("oom", NULL);
-        }
-        result = ray_list_append(result, part);
-        ray_release(part);
-        if (sym_str_s) ray_release(sym_str_s);
-        if (sym_str_d) ray_release(sym_str_d);
-        return result;
+    /* A string delimiter: an atom splits into its parts, a string or
+     * symbol vector (flat or parted) or a list of such atoms splits each
+     * cell, one list of parts per cell. */
+    if (delim->type != -RAY_STR) {
+        if (str->type != -RAY_STR && str->type != -RAY_SYM && !split_cells_input(str))
+            return ray_error("type", "split: expected str or sym input, got %s", ray_type_name(str->type));
+        return ray_error("type", "split: expected str delimiter, got %s", ray_type_name(delim->type));
     }
-
-    size_t start = 0;
-    for (size_t i = 0; i <= slen - dlen; ) {
-        if (memcmp(sp + i, dp, dlen) == 0) {
-            ray_t* part = ray_str(sp + start, i - start);
-            if (RAY_IS_ERR(part)) { ray_release(result); if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return part; }
-            result = ray_list_append(result, part);
-            ray_release(part);
-            if (RAY_IS_ERR(result)) { if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return result; }
-            i += dlen;
-            start = i;
-        } else {
-            i++;
-        }
-    }
-    /* Last part */
-    ray_t* part = ray_str(sp + start, slen - start);
-    if (RAY_IS_ERR(part)) { ray_release(result); if (sym_str_s) ray_release(sym_str_s); if (sym_str_d) ray_release(sym_str_d); return part; }
-    result = ray_list_append(result, part);
-    ray_release(part);
-    if (sym_str_s) ray_release(sym_str_s);
-    if (sym_str_d) ray_release(sym_str_d);
-    return result;
+    const char* dp = ray_str_ptr(delim);
+    size_t dlen = ray_str_len(delim);
+    const char* sp = NULL;
+    size_t slen = 0;
+    if (str_atom_bytes(str, &sp, &slen, NULL))
+        return split_bytes(sp, slen, dp, dlen);
+    if (split_cells_input(str))
+        return split_cells(str, dp, dlen);
+    return ray_error("type", "split: expected str or sym input, got %s", ray_type_name(str->type));
 }
 
 /* (like str pattern) — glob-style pattern matching.

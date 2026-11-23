@@ -51,6 +51,7 @@ static void jp_setup(void) {
 }
 static void jp_teardown(void) {
     ray_join_no_prefilter = false;
+    ray_join_set_par_min(RAY_JOIN_PAR_MIN_DEFAULT);
     (void)ray_test_rm_rf(ray_test_tmp(JP_TMP));
     ray_runtime_destroy(__RUNTIME);
 }
@@ -539,6 +540,74 @@ static test_result_t test_jp_knob(void) {
     PASS();
 }
 
+/* #599: run `src` with the probe floor at `floor`; *probes gets the number of
+ * chained-probe passes that went to the pool: 2 (count and fill) for a
+ * dispatched join with matches, 0 for a serial one. */
+static ray_t* jp_at_floor(const char* src, int64_t floor, uint64_t* probes) {
+    ray_join_set_par_min(floor);
+    uint64_t p0 = atomic_load(&ray_join_par_probes);
+    ray_t* r = ray_eval_str(src);
+    *probes = atomic_load(&ray_join_par_probes) - p0;
+    ray_join_set_par_min(RAY_JOIN_PAR_MIN_DEFAULT);
+    return r;
+}
+
+/* #599: the probe floor decides where the chained probe runs and nothing
+ * else.  At the default a probe of more than one morsel is dispatched; with
+ * the floor above the probe side it runs on this thread; the floor is
+ * inclusive; a one-morsel probe never splits, even at floor 0.  Every answer
+ * is the default's, cell for cell and in order. */
+static test_result_t test_jp_par_min(void) {
+    if (!ray_pool_get()) SKIP("no pool");
+    TEST_ASSERT_EQ_I(ray_join_par_min(), RAY_JOIN_PAR_MIN_DEFAULT);
+    jp_bind("L", jp_left(JP_NL, RAY_SYM_W16, RAY_SYM_W32, 0));
+    jp_bind("S", jp_left(8192, RAY_SYM_W16, RAY_SYM_W32, 0));
+    static const int64_t books[] = { 3, 40, 41 };
+    jp_bind_right("R", books, 3, RAY_SYM_W64, RAY_SYM_W16, false);
+
+    static const char* const srcs[] = {
+        "(inner-join [venue instrument] L R)",
+        "(left-join [venue instrument] L R)",
+        "(full-join [venue instrument] L R)",
+    };
+    /* floor -> dispatched passes.  JP_NL is 40000 rows, five morsels; every
+     * join here has matches, so a dispatched one sends both count and fill. */
+    static const struct { int64_t floor; uint64_t want; } cases[] = {
+        { RAY_JOIN_PAR_MIN_DEFAULT, 2 }, { 0, 2 }, { JP_NL, 2 },
+        { JP_NL + 1, 0 }, { 65536, 0 }, { INT64_MAX, 0 },
+    };
+    for (size_t s = 0; s < sizeof srcs / sizeof srcs[0]; s++) {
+        uint64_t probes = 0;
+        ray_join_no_prefilter = false;
+        ray_t* want = jp_at_floor(srcs[s], RAY_JOIN_PAR_MIN_DEFAULT, &probes);
+        TEST_ASSERT(want && !RAY_IS_ERR(want), "default join");
+        TEST_ASSERT_EQ_I((int64_t)probes, 2);
+        for (size_t c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            ray_t* got = jp_at_floor(srcs[s], cases[c].floor, &probes);
+            test_result_t r = jp_tables_equal(got, want);
+            ray_release(got);
+            if (r.status != TEST_PASS) { ray_release(want); return r; }
+            if (probes != cases[c].want) {
+                ray_release(want);
+                snprintf(ray_test_fail_buf, sizeof ray_test_fail_buf,
+                         "floor %lld: %llu dispatched probes, want %llu: %s",
+                         (long long)cases[c].floor, (unsigned long long)probes,
+                         (unsigned long long)cases[c].want, srcs[s]);
+                return (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+            }
+        }
+        ray_release(want);
+    }
+
+    /* One morsel: serial at every floor. */
+    uint64_t probes = 0;
+    ray_t* r = jp_at_floor("(inner-join [venue instrument] S R)", 0, &probes);
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "one-morsel join");
+    TEST_ASSERT_EQ_I((int64_t)probes, 0);
+    ray_release(r);
+    PASS();
+}
+
 const test_entry_t join_prefilter_entries[] = {
     { "join_prefilter/two_key_mixed_widths", test_jp_two_key_mixed_widths, jp_setup, jp_teardown },
     { "join_prefilter/three_key",            test_jp_three_key,            jp_setup, jp_teardown },
@@ -550,5 +619,6 @@ const test_entry_t join_prefilter_entries[] = {
     { "join_prefilter/int_offset",           test_jp_int_offset,           jp_setup, jp_teardown },
     { "join_prefilter/width_classes",        test_jp_width_classes,        jp_setup, jp_teardown },
     { "join_prefilter/knob",                 test_jp_knob,                 jp_setup, jp_teardown },
+    { "join_prefilter/par_min",              test_jp_par_min,              jp_setup, jp_teardown },
     { NULL, NULL, NULL, NULL },
 };

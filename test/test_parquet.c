@@ -408,11 +408,11 @@ static test_result_t test_pq_parted_files(void) {
         ray_t* col = ray_table_get_col_idx(p,1);
         TEST_ASSERT_EQ_I(col->type,RAY_SYM);
         if (!parts) firstname = ray_sym_vec_cell(col,1);
-        lastname = ray_sym_vec_cell(col,1);
+        lastname = ray_sym_vec_cell(col,ray_table_nrows(p) > 19 ? 19 : 1);   /* row 1 of the second file */
         TEST_ASSERT_TRUE(ray_str_len(firstname) == ray_str_len(lastname));
         ray_release(p);
     }
-    TEST_ASSERT_TRUE(parts >= 2 && parts%2 == 0);
+    TEST_ASSERT_EQ_I(parts,1);   /* the small row groups of both files are packed together */
     TEST_ASSERT_EQ_I(rows,36);
     pq_rm_rf(root);
     /* Files that are not one table refuse. */
@@ -478,6 +478,140 @@ static test_result_t test_pq_lz4_multichunk(void) {
     TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(),"multi-chunk Hadoop frame"));
     ray_error_free(n); ray_release(types);
     char partial[200]; snprintf(partial,sizeof(partial),"%s.parquet-partial",root); pq_rm_rf(partial); pq_rm_rf(root);
+    PASS();
+}
+/* A staged tree is flushed with one call where the host has one (Linux syncfs on
+ * a local filesystem), opened before the writes. Where it has none, or the
+ * filesystem is not one syncfs is known to work on (a container's overlay, a
+ * network mount), begin answers NONE and the caller syncs each file: so every
+ * answer is accepted here, and each must be consistent. */
+static test_result_t test_pq_sync_tree(void) {
+    char dir[128]; snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-sync-%d",(int)getpid());
+    TEST_ASSERT_EQ_I(mkdir(dir,0755),0);
+    int h = ray_file_sync_tree_begin(dir);
+    TEST_ASSERT_TRUE(h >= 0 || h == RAY_SYNC_TREE_NONE || h == RAY_SYNC_TREE_SKIP);
+    if (h >= 0) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else if (h == RAY_SYNC_TREE_SKIP) { TEST_ASSERT_TRUE(ray_file_sync_tree_end(h)); }
+    else { TEST_ASSERT_FALSE(ray_file_sync_tree_end(h)); }
+    /* A handle that is aborted is only closed. */
+    h = ray_file_sync_tree_begin(dir);
+    ray_file_sync_tree_abort(h);
+    /* Nothing to open: the caller syncs each file. */
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin("/nonexistent-rayforce-dir/x"),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(NULL),RAY_SYNC_TREE_NONE);
+    TEST_ASSERT_FALSE(ray_file_sync_tree_end(RAY_SYNC_TREE_NONE));
+    /* The knob that forces the fallback. */
+    ray_file_sync_tree_force_fallback(true);
+    TEST_ASSERT_EQ_I(ray_file_sync_tree_begin(dir),RAY_SYNC_TREE_NONE);
+    ray_file_sync_tree_force_fallback(false);
+    rmdir(dir);
+    PASS();
+}
+/* The per-file fallback of a native import (the only path on other hosts, before
+ * Linux 5.8 and on filesystems syncfs is not trusted on) still produces the table:
+ * the Linux suite would otherwise only run the single flush. */
+static test_result_t test_pq_sync_fallback(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    const char* two[] = {FIX "flat-1-v1.parquet",FIX "flat-1-v2.parquet"};
+    char root[160];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-fallback-%d",(int)getpid());
+    ray_file_sync_tree_force_fallback(true);
+    ray_t* n = ray_parquet_parted_files(two,2,root,"hits",types);
+    ray_file_sync_tree_force_fallback(false);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,36); ray_release(n);
+    ray_t* t = ray_read_parted(root,"hits");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),36);
+    ray_release(t);
+    pq_rm_rf(root);
+    ray_release(types);
+    PASS();
+}
+/* Many small files make few partitions: the row groups are packed, in file order,
+ * into partitions of up to `rows`, and one table results: every row, partitions
+ * in file order, one symbol vocabulary. More files than one batch are reached
+ * two ways: PQ_FILE_BATCH (256) files, and PQ_BATCH_PARTS (64) partitions' worth
+ * of rows, whichever comes first; packing never crosses a batch boundary, so a
+ * boundary can cost one partition more than a single batch would make. */
+static test_result_t test_pq_parted_many_files(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    enum { FILES = 400 };
+    const char* files[FILES];
+    for (int i = 0; i < FILES; i++) files[i] = FIX "flat-1-v2.parquet";
+    /* Each file has two 9-row groups (800 groups). Default size: one partition per
+     * batch, and the file cap makes batches of 256 and 144 files. rows 100: eleven
+     * groups per partition; the file cap again (512 groups -> 47 partitions, then
+     * 288 -> 27). rows 50: five groups per partition, and the row cap ends a batch
+     * after 178 files (356 groups -> 72, twice, then 88 groups -> 18): 162, where one
+     * batch would make 160. rows 17: no two groups fit together. */
+    struct { int64_t rows; int parts; } cases[] = {{0,2},{100,74},{50,162},{17,2*FILES}};
+    for (size_t k = 0; k < sizeof(cases)/sizeof(cases[0]); k++) {
+        ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+        ray_t* arg = types;
+        if (cases[k].rows) {
+            int64_t keys[] = {ray_sym_intern("types",5),ray_sym_intern("rows",4)};
+            ray_t* values = ray_list_new(2);
+            ((ray_t**)ray_data(values))[0] = types;
+            ((ray_t**)ray_data(values))[1] = ray_i64(cases[k].rows);
+            values->len = 2;
+            arg = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,2),values);
+        }
+        char root[160], sym[200], leaf[220];
+        snprintf(root,sizeof(root),"/tmp/rayforce-pq-many-%d",(int)getpid());
+        ray_t* n = ray_parquet_parted_files(files,FILES,root,"hits",arg);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(n)); TEST_ASSERT_EQ_I(n->i64,FILES*18); ray_release(n);
+        ray_t* t = ray_read_parted(root,"hits");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(t)); TEST_ASSERT_EQ_I(ray_table_nrows(t),FILES*18); ray_release(t);
+        snprintf(sym,sizeof(sym),"%s/.sym",root);
+        int parts = 0; int64_t rows = 0;
+        for (;; parts++) {
+            snprintf(leaf,sizeof(leaf),"%s/%d/hits",root,parts);
+            if (access(leaf,F_OK) != 0) break;
+            ray_t* p = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(p));
+            rows += ray_table_nrows(p);
+            /* The same string in every file is one symbol: its length is the same wherever it landed. */
+            for (int64_t i = 1; i < ray_table_nrows(p); i += 18)
+                TEST_ASSERT_EQ_I(ray_str_len(ray_sym_vec_cell(ray_table_get_col_idx(p,1),i)),31);
+            ray_release(p);
+        }
+        TEST_ASSERT_EQ_I(parts,cases[k].parts);
+        TEST_ASSERT_EQ_I(rows,FILES*18);
+        pq_rm_rf(root);
+        ray_release(arg);
+    }
+    PASS();
+}
+/* A corrupt file in the middle of a pack is named: four small files land in one
+ * partition, the third is damaged, and the error says file 3 whatever file the
+ * pack began with. The staging directory is left behind, as for any failed import. */
+static test_result_t test_pq_parted_pack_error(void) {
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("I16",3),
+        ray_sym_intern("I64",3),ray_sym_intern("DATE",4),ray_sym_intern("TIMESTAMP",9),ray_sym_intern("F64",3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM,ids,7);
+    char dir[160], root[200], partial[240]; static char names[4][220]; const char* files[4];
+    snprintf(dir,sizeof(dir),"/tmp/rayforce-pq-packerr-%d",(int)getpid());
+    pq_rm_rf(dir); TEST_ASSERT_EQ_I(mkdir(dir,0700),0);
+    FILE* in = fopen(FIX "flat-1-v2.parquet","rb"); TEST_ASSERT_NOT_NULL(in);
+    static uint8_t buf[1<<16]; size_t len = fread(buf,1,sizeof buf,in); fclose(in);
+    TEST_ASSERT_TRUE(len > 100 && len < sizeof buf);
+    for (int i = 0; i < 4; i++) {
+        snprintf(names[i],sizeof(names[i]),"%s/f%d.parquet",dir,i); files[i] = names[i];
+        if (i == 2) buf[60] ^= 0xff;                 /* inside the first column's page */
+        FILE* out = fopen(names[i],"wb"); TEST_ASSERT_NOT_NULL(out);
+        TEST_ASSERT_EQ_I(fwrite(buf,1,len,out),len); fclose(out);
+        if (i == 2) buf[60] ^= 0xff;
+    }
+    snprintf(root,sizeof(root),"%s/out",dir); snprintf(partial,sizeof(partial),"%s.parquet-partial",root);
+    ray_t* n = ray_parquet_parted_files(files,4,root,"hits",types);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(n));
+    const char* msg = ray_error_msg();
+    TEST_ASSERT_TRUE(msg && strstr(msg,"file 3 (") && strstr(msg,"f2.parquet") && !strstr(msg,"file 1 ("));
+    ray_error_free(n);
+    TEST_ASSERT_TRUE(access(partial,F_OK) == 0);     /* kept for inspection */
+    TEST_ASSERT_TRUE(access(root,F_OK) != 0);        /* nothing published */
+    pq_rm_rf(dir); ray_release(types);
     PASS();
 }
 static test_result_t test_pq_matrix(void) {
@@ -1791,7 +1925,7 @@ static test_result_t test_pq_native_edges(void) {
     t = ray_read_parted(dir,"hits"); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
     TEST_ASSERT_EQ_I(ray_table_nrows(t),18); ray_release(t);
     snprintf(sym,sizeof(sym),"%s/.sym",dir);
-    for (int part = 0; part < 2; part++) {
+    for (int part = 0; part < 1; part++) {   /* the two small row groups are one partition */
         char leaf[200]; snprintf(leaf,sizeof(leaf),"%s/%d/hits",dir,part);
         t = ray_read_splayed(leaf,sym); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
         TEST_ASSERT_EQ_I(ray_table_get_col_idx(t,1)->type,RAY_SYM);
@@ -1810,8 +1944,14 @@ static test_result_t test_pq_parted_symbols(void) {
     ray_t* types = ray_vec_from_raw(RAY_SYM,ids,3);
     char root[160],sym[200],leaf[200];
     snprintf(root,sizeof(root),"/tmp/rayforce-pq-parted-symbols-%d",(int)getpid());
-    ray_t* result = ray_parquet_parted_typed(FIX "row-groups.parquet",root,"hits",types);
-    ray_release(types);
+    /* rows 10001: no two of the row groups (5003 to 10001 rows) pack together */
+    int64_t okeys[] = {ray_sym_intern("types",5),ray_sym_intern("rows",4)};
+    ray_t* ovals = ray_list_new(2);
+    ((ray_t**)ray_data(ovals))[0] = types; ((ray_t**)ray_data(ovals))[1] = ray_i64(10001);
+    ovals->len = 2;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,okeys,2),ovals);
+    ray_t* result = ray_parquet_parted_typed(FIX "row-groups.parquet",root,"hits",opts);
+    ray_release(opts);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result)); TEST_ASSERT_EQ_I(result->i64,44009); ray_release(result);
     snprintf(sym,sizeof(sym),"%s/.sym",root);
     const int starts[] = {0,5003,15004,22005,27006,33007,39008,44009};
@@ -5439,7 +5579,11 @@ const test_entry_t parquet_entries[] = {
     {"parquet/decimal-rounding",test_pq_decimal_rounding,pq_setup,pq_teardown},
     {"parquet/unsupported-columns",test_pq_unsupported_columns,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
+    {"parquet/parted_many_files",test_pq_parted_many_files,pq_setup,pq_teardown},
+    {"parquet/parted_pack_error",test_pq_parted_pack_error,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
+    {"parquet/sync_tree",test_pq_sync_tree,pq_setup,pq_teardown},
+    {"parquet/sync_fallback",test_pq_sync_fallback,pq_setup,pq_teardown},
     {"parquet/batch_matrix",test_pq_matrix,pq_setup,pq_teardown},
     {"parquet/optional_bulk",test_pq_optional_bulk,pq_setup,pq_teardown},
     {"parquet/cert_cancel",test_pq_cert_cancel,pq_setup,pq_teardown},

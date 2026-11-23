@@ -13,13 +13,14 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.fs.*`](fs.md) | Filesystem metadata: `size`, `list`. |
 | [`.graph.*`](graph.md) | Graph builders and algorithms (PageRank, Louvain, Dijkstra, MST, BFS/DFS, expand, …). |
 | [`.idx.*`](idx.md) | Accelerator indexes: bloom, hash, sort, zone. |
+| [`.json.*`](json.md) | JSON text in and out: `parse`, `get` (one field of a string column), `format`. |
 | [`.ipc.*`](ipc.md) | Client IPC (TCP, moving to shared memory or RDMA when both sides can), the transport policy, and the server connection-hook accessor. |
 | [`.log.*`](log.md) | Write-ahead log: open, write, sync, snapshot, roll, replay, validate. |
 | [`.mem.*`](mem.md) | Value sizing and scoped time/allocation measurement. |
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
 | [`.parquet.*`](parquet.md) | Parquet metadata, reads, lazy queries, callbacks, and native imports. |
 | [`.repl.*`](repl.md) | Interactive REPL control — attach the local REPL to a remote server. |
-| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, querylog, gc, exec, listen, timeit, env, cmd. |
+| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, profile, querylog, gc, exec, listen, timeit, env, cmd. |
 | [`.time.*`](time.md) | Monotonic clock and timer scheduler. |
 
 ## Restricted-mode summary
@@ -33,7 +34,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`
-- `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.trust`
+- `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset`, `.sys.trust`
 - `.time.timer.set`, `.time.timer.del`
 
-`.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, `.mem.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.
+`.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, `.json.*`, `.mem.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.profile`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.

@@ -1,3 +1,4 @@
+;; @requires: posix  (the size check at the end runs wc and rm through the shell)
 ;; Invariants for `split`.
 
 (split "a,b,c" ",") -- ["a" "b" "c"]
@@ -69,3 +70,50 @@
 ;; delim falls through and hits the "type" guard on line 280.
 (split "abc" 42)   !- type
 (split "abc" 1.5)  !- type
+
+;; positions are offsets into the data: a negative or null one used to read before
+;; it (a segfault or a hang for a null), one past the end read after it
+(at (try (split [1 2 3 4 5] [-1 2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0Nl 2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0i 0Ni]) (fn [e] e)) 'code) -- 'domain
+(at (try (split [1 2 3 4 5] [0h 0Nh]) (fn [e] e)) 'code) -- 'domain
+(at (try (split (list 1 2 3) [0 -2]) (fn [e] e)) 'code) -- 'domain
+(at (try (split "hello" [-3 2]) (fn [e] e)) 'code) -- 'domain
+(split [1 2 3 4 5] [0 9]) -- (list [1 2 3 4 5] [])
+(split (list 1 2 3) [1 9]) -- (list [2 3] ())
+(split "hello" [0 9]) -- (list "hello" "")
+
+;; a segment keeps the null flags and the string pool of its source: a raw copy of the
+;; cells gave the null's sentinel value (nil? all false) and an empty string for one
+;; that is not stored inline
+(split [1 0Nl 3 4] [0 2]) -- (list [1 0Nl] [3 4])
+(map nil? (first (split [1 0Nl 3 4] [0 2]))) -- [false true]
+(split [1.5 0Nf 3.5] [0 1]) -- (list [1.5] [0Nf 3.5])
+(split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc" "d"]) [0 2]) -- (list ["aaaaaaaaaaaaaaaaaaaaaaaa" "b"] ["cccccccccccccccccccccc" "d"])
+
+;; a segment is a slice, which has no pool of its own: serialising one (every IPC reply
+;; does) read the slice offset as the pool pointer and crashed
+(set seg (at (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc"]) [0 1]) 1))
+(de (ser seg)) -- ["b" "cccccccccccccccccccccc"]
+(de (ser (first (split (as 'STR ["aaaaaaaaaaaaaaaaaaaaaaaa" "b" "cccccccccccccccccccccc"]) [0 1])))) -- ["aaaaaaaaaaaaaaaaaaaaaaaa"]
+(de (ser (at (split [1 0Nl 3 4] [0 2]) 0))) -- [1 0Nl]
+
+;; saving a table whose LIST column holds string segments: the writer read the slice's
+;; offset as the pool pointer, and wrote its SLICE bit into the file
+(set src ["aaaaaaaaaaaaaaaaaaaaaa" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "cccccccccccccccccccccc"])
+(set T (table [k v] (list [1 2] (split src [0 1]))))
+(.db.splayed.set "/tmp/rfl_split_save/t/" T)
+(set U (.db.splayed.get "/tmp/rfl_split_save/t/"))
+(at U 'v) -- (list ["aaaaaaaaaaaaaaaaaaaaaa"] ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "cccccccccccccccccccccc"])
+(.sys.exec "rm -rf /tmp/rfl_split_save") -- 0
+
+;; saving the segments of a split writes each segment's own strings, not the pool of
+;; the whole vector once per segment (200 segments of a 20,000-string vector: 158 MB
+;; against 0.89 MB)
+(set big (as 'STR (map (fn [i] (format "string-number-%-padding-padding" i)) (til 20000))))
+(set segs (split big (* 100 (til 200))))
+(count segs) -- 200
+(.db.splayed.set "/tmp/rfl_split_size/t/" (table [k v] (list (til 200) segs)))
+(.sys.exec "[ $(wc -c < /tmp/rfl_split_size/t/v) -lt 4194304 ]") -- 0
+(count (at (.db.splayed.get "/tmp/rfl_split_size/t/") 'v)) -- 200
+(.sys.exec "rm -rf /tmp/rfl_split_size") -- 0

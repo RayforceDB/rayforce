@@ -745,7 +745,7 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
         case RAY_I16:  (dst) = ((const int16_t*)cd)[_ix]; break;            \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
                        (dst) = ((const int32_t*)cd)[_ix]; break;            \
-        case RAY_I64:  case RAY_TIMESTAMP:                                  \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:               \
                        (dst) = ((const int64_t*)cd)[_ix]; break;            \
         case RAY_SYM:  (dst) = ray_read_sym(cd, _ix, ct, cattrs); break;    \
         default:       (dst) = 0; break;                                    \
@@ -759,7 +759,7 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
         case RAY_I16:  (dst) = (double)((const int16_t*)cd)[_ix]; break;    \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                        \
                        (dst) = (double)((const int32_t*)cd)[_ix]; break;    \
-        case RAY_I64:  case RAY_TIMESTAMP:                                  \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:               \
                        (dst) = (double)((const int64_t*)cd)[_ix]; break;    \
         case RAY_F32:  (dst) = (double)((const float*)cd)[_ix]; break;      \
         case RAY_F64:  (dst) = ((const double*)cd)[_ix]; break;             \
@@ -963,6 +963,13 @@ static void exec_in_worker(void* vctx, uint32_t worker_id,
  * the bool path can surface nyi/oom while the fused path falls back. */
 typedef enum { IN_CTX_UNSUPPORTED = 0, IN_CTX_OK = 1, IN_CTX_OOM = 2 } in_ctx_status_t;
 
+/* A TIMESPAN against a TIME or a TIMESTAMP (element types). */
+static inline bool in_span_point_pair(int8_t ct, int8_t st) {
+    if (ct == st) return false;
+    if (ct == RAY_TIMESPAN) return st == RAY_TIME || st == RAY_TIMESTAMP;
+    return st == RAY_TIMESPAN && (ct == RAY_TIME || ct == RAY_TIMESTAMP);
+}
+
 /* The body shared by in_build_worker_ctx (a column vector or atom) and
  * in_build_worker_ctx_meta (a bound source read by range), over the
  * column's description: `atom` is the column when it is an atom (else
@@ -998,6 +1005,10 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     int col_class = CLASSIFY(ct);
     int set_class = CLASSIFY(st);
 
+    /* A TIMESPAN meets a TIME or a TIMESTAMP as a duration (atom_eq's
+     * span_eval: milliseconds as nanoseconds, a TIMESTAMP by its time of
+     * day), not by payload: ray_in_fn answers that pair (#1319). */
+    if (in_span_point_pair(ct, st)) return IN_CTX_UNSUPPORTED;
     /* A temporal value equals only its own type: atom_eq — and so the
      * hashset behind find/except and the null-bearing `in` — never matches
      * a DATE to an int or to a TIMESTAMP.  Comparing raw payloads here
@@ -1039,7 +1050,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         case RAY_I16:  (dst) = ((const int16_t*)_d)[idx]; break;           \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
                        (dst) = ((const int32_t*)_d)[idx]; break;           \
-        case RAY_I64:  case RAY_TIMESTAMP:                                 \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
                        (dst) = ((const int64_t*)_d)[idx]; break;           \
         case RAY_SYM:  (dst) = ray_read_sym(_d, (idx), (type),             \
                                             (vec)->attrs); break;          \
@@ -1054,7 +1065,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         case RAY_I16:  (dst) = (double)((const int16_t*)_d)[idx]; break;   \
         case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
                        (dst) = (double)((const int32_t*)_d)[idx]; break;   \
-        case RAY_I64:  case RAY_TIMESTAMP:                                 \
+        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
                        (dst) = (double)((const int64_t*)_d)[idx]; break;   \
         case RAY_F32:  (dst) = (double)((const float*)_d)[idx]; break;     \
         case RAY_F64:  (dst) = ((const double*)_d)[idx]; break;            \
@@ -1413,6 +1424,7 @@ static bool in_has_general_fallback(ray_t* col, ray_t* set) {
     if (RAY_IS_PARTED(ct)) ct = (int8_t)RAY_PARTED_BASETYPE(ct);
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
     if (ct == RAY_GUID || st == RAY_GUID) return true;
+    if (in_span_point_pair(ct, st)) return true;   /* ray_in_fn: a bool per row */
     if (ct != RAY_STR && st != RAY_STR) return false;
     /* Only a column of cells answers one verdict per row: a LIST column's
      * cell may be a vector, and its answer a list no mask can use. */
@@ -2645,7 +2657,24 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
     case -RAY_F64:       key_f = cv->f64;    is_float = 1; break;
     case -RAY_F32:       key_f = cv->f64;    is_float = 1; break; /* F32 atoms use f64 slot */
     case -RAY_SYM:       key_i = cv->i64;               break; /* global intern id; domain-resolved at consult */
+    case -RAY_TIMESPAN:  key_i = cv->i64;               break;
     default: return 0;  /* str / guid — not eligible */
+    }
+
+    /* The probe is the literal's raw value, so it must be in the column's
+     * own unit, as the comparison reads it (#974): a DATE / TIME /
+     * TIMESTAMP column takes a literal of its own type (a cross-temporal
+     * one is rewritten to it at plan time, cmp_temporal_rewrite; anything
+     * else is not that compare); a TIMESPAN literal only a TIMESPAN column
+     * (an integer meets a TIMESPAN as nanoseconds, as the builtin does);
+     * a symbol only a SYM column.  Any other pair takes the scan. */
+    {
+        int8_t ct = m.type, lt = (int8_t)-cv->type;
+        bool ctemp = ct == RAY_DATE || ct == RAY_TIME || ct == RAY_TIMESTAMP;
+        bool ltemp = lt == RAY_DATE || lt == RAY_TIME || lt == RAY_TIMESTAMP;
+        if ((ctemp || ltemp) && ct != lt) return 0;
+        if (lt == RAY_TIMESPAN && ct != RAY_TIMESPAN) return 0;
+        if ((ct == RAY_SYM) != (lt == RAY_SYM)) return 0;
     }
 
     /* Reconcile the literal's family with the COLUMN's family.  Index
@@ -2679,6 +2708,38 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
     *out_key_i    = key_i;
     *out_key_f    = key_f;
     *out_is_float = is_float;
+    return 1;
+}
+
+/* Decode (== s "lit"): an equality of a STR column of the default table
+ * carrying a hash index against a STR atom.  *out_lit is the literal
+ * (borrowed from the ext).  A generation-2 column not yet materialized
+ * sets *out_enc (its region is probed where it is mapped) and leaves
+ * *out_col NULL; otherwise *out_col is the column.  1 on a match. */
+static int idx_filter_str_eq_decode(ray_graph_t* g, ray_op_t* pred_op,
+                                    ray_t** out_col, ray_t** out_enc, ray_t** out_lit) {
+    if (!pred_op || pred_op->arity != 2 || pred_op->opcode != OP_EQ) return 0;
+    ray_op_t* lhs = op_child(g, pred_op, 0);
+    ray_op_t* rhs = op_child(g, pred_op, 1);
+    if (!lhs || !rhs || lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
+    ray_op_ext_t* lext = find_ext(g, lhs->id);
+    ray_op_ext_t* rext = find_ext(g, rhs->id);
+    if (!lext || !rext || !rext->literal || rext->literal->type != -RAY_STR) return 0;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, lext->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0 || !g->table) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(g->table, lext->sym, &m)) return 0;
+    if (m.type != RAY_STR || m.index_kind != RAY_IDX_HASH) return 0;
+    *out_lit = rext->literal;
+    if (m.enc && !ray_enccol_decoded_peek(m.enc)) {
+        *out_enc = m.enc;
+        return 1;
+    }
+    ray_t* col = idx_decode_col(g->table, lext->sym);
+    if (!col || col->type != RAY_STR) return 0;
+    *out_col = col;
+    *out_lit = rext->literal;
     return 1;
 }
 
@@ -3459,6 +3520,108 @@ static ray_t* scan_table_of(ray_graph_t* g, ray_op_ext_t* ext) {
     return g->table;
 }
 
+/* Over node n's subtree: 1 when it is row-wise only (elementwise nodes,
+ * `if`, `in` against a constant set, over scans and constants), with *xbar
+ * set when it holds an xbar (OP_FLAG_XBAR); 0 otherwise. */
+static int filter_rowwise_tree(ray_graph_t* g, ray_op_t* n, bool* xbar, int depth) {
+    if (!n || depth > 64) return 0;
+    if (n->opcode == OP_SCAN || n->opcode == OP_CONST) return 1;
+    /* an AND with a true arm folds to an alias of the other */
+    if (n->opcode == OP_ALIAS && n->arity == 1)
+        return filter_rowwise_tree(g, op_node(g, n->in_id[0]), xbar, depth + 1);
+    /* `if` buckets each arm over the rows that take it; `in` / `not-in`
+     * test one value per row against a constant set */
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        return e && e->third_in != RAY_OP_NONE &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_child(g, n, 1), xbar, depth + 1) &&
+               filter_rowwise_tree(g, op_node(g, e->third_in), xbar, depth + 1);
+    }
+    if (n->opcode == OP_IN || n->opcode == OP_NOT_IN) {
+        ray_op_t* set = op_child(g, n, 1);
+        return n->arity == 2 && set && set->opcode == OP_CONST &&
+               filter_rowwise_tree(g, op_child(g, n, 0), xbar, depth + 1);
+    }
+    if (!op_is_elementwise(n->opcode) || n->arity > 2) return 0;
+    if (n->flags & OP_FLAG_XBAR) *xbar = true;
+    for (int k = 0; k < n->arity; k++)
+        if (!filter_rowwise_tree(g, op_node(g, n->in_id[k]), xbar, depth + 1)) return 0;
+    return 1;
+}
+
+/* `where: (and a b ...)` kept as one predicate (a filter pushed below a
+ * group is not split) with an xbar in a conjunct after the first.  The one
+ * fused pass runs first, as for any predicate; only when it raises the xbar's
+ * domain error (or cannot run) do the conjuncts run left to right as the
+ * split chain does, each over the rows the earlier ones keep (the selection
+ * is an xbar's row domain), so a zero bucket on a row an earlier conjunct
+ * rejects is no error, with by: or without (#1355).  input with the
+ * selection installed, an owned error (input released), or NULL: not such
+ * a predicate. */
+static __attribute__((noinline)) ray_t* exec_filter_xbar_chain(ray_graph_t* g, ray_op_t* op, ray_t* input) {
+    ray_op_t* pred = op_child(g, op, 1);
+    while (pred && pred->opcode == OP_ALIAS && pred->arity == 1) pred = op_child(g, pred, 0);
+    if (!pred || pred->opcode != OP_AND || g->selection || !g->table ||
+        ray_table_nrows(input) != ray_table_nrows(g->table)) return NULL;
+    /* the conjuncts in order: an in-order walk of the AND tree */
+    uint32_t conj[64], stk[64];
+    int nc = 0, sp = 0;
+    ray_op_t* cur = pred;
+    while (cur || sp) {
+        while (cur && cur->opcode == OP_ALIAS && cur->arity == 1) cur = op_child(g, cur, 0);
+        while (cur && cur->opcode == OP_AND && cur->arity == 2 && sp < 64) {
+            stk[sp++] = cur->id;
+            cur = op_child(g, cur, 0);
+        }
+        if (cur) { if (nc == 64) return NULL; conj[nc++] = cur->id; }
+        if (!sp) break;
+        cur = op_child(g, op_node(g, stk[--sp]), 1);
+    }
+    /* every conjunct row-wise, so a selection changes none of their rows */
+    bool later = false;
+    for (int k = 0; k < nc; k++) {
+        bool xb = false;
+        if (!filter_rowwise_tree(g, op_node(g, conj[k]), &xb, 0)) return NULL;
+        later |= k > 0 && xb;
+    }
+    if (!later) return NULL;
+    int64_t nrows = ray_table_nrows(input);
+    /* the fused pass over every row: when it raises nothing, its answer is
+     * the chain's (the conjuncts are row-wise) at dev's cost */
+    bool all_pass = false;
+    ray_t* fsel = exec_pred_to_selection(g, pred, nrows, &all_pass);
+    if (fsel && RAY_IS_ERR(fsel)) {
+        if (strcmp(ray_err_code(fsel), "domain") != 0) { ray_release(input); return fsel; }
+        ray_error_free(fsel);
+    } else if (fsel || all_pass) {
+        g->selection = fsel;                 /* NULL when all rows pass */
+        return input;
+    }
+    ray_t* sel = NULL;                       /* NULL: every row */
+    for (int k = 0; k < nc; k++) {
+        g->selection = sel;
+        ray_t* pv = exec_node(g, op_node(g, conj[k]));
+        g->selection = NULL;
+        pv = ray_where_mask_coerce(pv, nrows, "where");
+        if (pv && !RAY_IS_ERR(pv) && (pv->type != RAY_BOOL || pv->len != nrows)) {
+            ray_release(pv);
+            pv = ray_error("type", "where: predicate must be boolean");
+        }
+        if (!pv || RAY_IS_ERR(pv)) {
+            if (sel) ray_rowsel_release(sel);
+            ray_release(input);
+            return pv ? pv : ray_error("oom", NULL);
+        }
+        ray_t* ns = sel ? ray_rowsel_refine(sel, pv) : ray_rowsel_from_pred(pv);
+        ray_release(pv);
+        if (sel) ray_rowsel_release(sel);
+        sel = ns;                            /* NULL: every row passes so far */
+    }
+    g->selection = sel;
+    return input;
+}
+
 /* A chained filter's refinement over a generation-2 predicate column: the
  * predicate is evaluated on the segments the selection keeps, through the
  * fused path's encoded leaves (views and vector statistics), and ANDed with
@@ -4060,6 +4223,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     }
                 }
             }
+            if (input->type == RAY_TABLE && !g->selection) {
+                ray_t* xr = exec_filter_xbar_chain(g, op, input);
+                if (xr) return xr;           /* input (filtered), or an owned error */
+            }
             /* Hash-index point-lookup fast path: when the predicate is
              * `col == K` on a column with RAY_IDX_HASH attached and
              * built for the column's current length, install the
@@ -4461,6 +4628,39 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (eq_lazy) ray_release(eq_lazy);
                 }
 
+                /* 3b. Hash EQ on a STR column: its index is keyed on a
+                 * hash of each row's bytes, so the probe is the literal's
+                 * bytes, which idx_filter_decode (integer keys) does not
+                 * give.  A generation-2 column not yet materialized is
+                 * probed in its mapped region, never decoded. */
+                {
+                    ray_t* scol = NULL;
+                    ray_t* senc = NULL;
+                    ray_t* slit = NULL;
+                    if (idx_filter_str_eq_decode(g, op_child(g, op, 1), &scol, &senc, &slit) && senc) {
+                        ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                        ray_t* hsel = NULL; ray_t* herr = NULL;
+                        int hrc = ray_enc_hash_eq_str_rowsel(senc, ray_str_ptr(slit), ray_str_len(slit), &hsel, &herr);
+                        if (hrc < 0) { ray_release(input); return herr; }
+                        if (hrc == 1) {
+                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                            ray_idx_note_use_enc(senc);
+                            g->selection = hsel;
+                            return input;
+                        }
+                    } else if (scol) {
+                        ray_idx_consults[IDX_SITE_FILTER_HASH]++;
+                        ray_t* sel = ray_index_hash_eq_str_rowsel(scol, ray_str_ptr(slit),
+                                                                  ray_str_len(slit));
+                        if (sel) {
+                            ray_idx_hits[IDX_SITE_FILTER_HASH]++;
+                            ray_idx_note_use(scol);
+                            g->selection = sel;
+                            return input;
+                        }
+                    }
+                }
+
                 /* 5. Hash/part-index IN probe:
                  * FILTER(IN(SCAN col, CONST set_vec)).  Hash indexes probe
                  * each unique set element; part indexes select their
@@ -4478,6 +4678,21 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     bool in_enc_done = false;
                     bool im_ok = idx_filter_in_decode(g, op_child(g, op, 1), IDXW_INDEX, NULL, &in_set_lit, &im);
                     bool im_uses = im_ok && im.enc && idx_enc_in_uses_index(&im);
+                    /* a STR set against a generation-2 STR column's HASH:
+                     * probed in its mapped region, never decoded (as ==) */
+                    if (im_uses && im.type == RAY_STR && im.index_kind == RAY_IDX_HASH &&
+                        !ray_enccol_decoded_peek(im.enc)) {
+                        ray_idx_consults[IDX_SITE_IN]++;
+                        ray_t* isel = NULL; ray_t* ierr = NULL;
+                        int irc = ray_enc_hash_in_str_rowsel(im.enc, in_set_lit, &isel, &ierr);
+                        if (irc < 0) { ray_release(input); return ierr; }
+                        if (irc == 1) {
+                            ray_idx_hits[IDX_SITE_IN]++;
+                            ray_idx_note_use_enc(im.enc);
+                            g->selection = isel;
+                            return input;
+                        }
+                    }
                     if (im_ok && idx_enc_from_dir(&im, im_uses)) {
                         in_enc_done = true;
                         ray_t* isel = NULL; ray_t* ierr = NULL;

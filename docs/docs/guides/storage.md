@@ -428,11 +428,21 @@ write pass. A native STR pool has 32-bit offsets: use `SYM` or partitioned outpu
 when a column's pooled bytes exceed 4 GiB. CSV splayed STR import now uses the
 same streaming column writer, without materializing the entire CSV.
 
-Partitioned conversion dispatches row groups independently and assigns numeric
+Partitioned conversion dispatches partitions independently and assigns numeric
 partition IDs in source order, with at most 65,536 rows per partition by default.
+For a multi-file import the dispatch covers all the files of a batch (up to 256
+files, or 64 partitions' worth of rows) at once, and its unit is a partition: a
+row group larger than `rows` makes several, and smaller row groups, across files
+too, are packed into one. Parallelism is therefore bounded by the number of
+partitions, so a very large `rows` trades parallelism for fewer, larger
+partitions; a pack is assembled in memory, so peak memory rises with `rows` and the
+workers. Symbols of a `SYM` column are interned by whichever worker reaches them
+first, so the vocabulary order (the `.sym` file and the ids in the column) can differ
+between runs of the same import; the values do not.
 An import options dictionary can replace the positional type vector:
 `{types: [I64 SYM] rows: 262144 strict: true}`. `types` and `strict` are optional;
-`rows` accepts 1 through 1,048,576. Row-group boundaries also end partitions.
+`rows` accepts 1 through 1,048,576. A row group larger than `rows` is split; smaller
+ones are packed together into partitions of up to `rows`.
 Larger batches require more memory. Partitions holding long strings are
 smaller than `rows`, since a partition is one decode batch and batches keep
 STR pools near 64 MiB. Splayed imports accept the same options to control their decode batches.
@@ -440,10 +450,20 @@ The importer writes
 exact native numeric zone indexes while each decoded batch is resident (F32
 currently excluded). STR pools stay local to each partition. Typed SYM imports
 use a shared file dictionary. Group decoding and independent partition writes
-remain parallel; the dictionary is flushed once after workers finish. Column
-files are then synced, followed by each leaf and partition directory, before
-the staged root is published. This avoids syncing a directory after every
-individual column rename while preserving durability at publication.
+remain parallel; the dictionary is flushed once after workers finish. The
+staged tree is then made durable before the root is published. On Linux 5.8 and
+later, on ext4, xfs, btrfs, f2fs or tmpfs, one `syncfs` flushes the filesystem
+holding it: the importer opens the staging directory before its first write, so
+a writeback error is reported whoever else has run `syncfs` meanwhile. That flush
+waits for all the dirty data of the filesystem, other processes' included, so on
+a busy shared volume it can take longer than the import's own data needs, and it
+is neither a check that every column file exists nor interruptible: the writers
+report their own errors and cancellation. On other hosts, other filesystems
+(FUSE and network mounts, whose `syncfs` does not ask the server to persist
+anything), and when the flush fails, every column file, leaf and partition
+directory is synced in turn instead, which finds a failed write itself. This
+avoids syncing a directory after every individual column rename while preserving
+durability at publication.
 
 Parquet conversions write to `<destination>.parquet-partial` and publish the
 result after successful writes. Existing destinations or staging directories

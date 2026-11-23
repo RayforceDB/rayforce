@@ -1553,6 +1553,12 @@ int64_t ray_index_inline_size(const ray_index_t* ix) {
     return total;
 }
 
+/* The same blocks for a DICT: the head, the I32 codes, the I32
+ * first-occurrence rows (ray_index_dict_compute, ray_dict_acc_finish). */
+int64_t ray_index_dict_inline_size(int64_t len, int64_t n_distinct) {
+    return IDX_HEAD_BYTES + IDX_ALIGN32(32 + len * 4) + IDX_ALIGN32(32 + n_distinct * 4);
+}
+
 /* Persisted-index layout generation, carried in the RAY_INDEX block's
  * on-disk-free `order` byte (mirrors the column-header scheme in col.h).
  * The index region is a rebuildable ACCELERATOR: a mismatched generation is
@@ -3259,6 +3265,24 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
     return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
 }
 
+ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l) {
+    if (!col || RAY_IS_ERR(col) || col->type != RAY_STR || !p) return NULL;
+    /* "" is the STR null, whose rows the builder leaves out: the scan
+     * selects them.  Any other needle never matches a null row, so a
+     * null-bearing column is probed as SYM is with a nonzero key. */
+    if (l == 0 || !idx_fresh(col, RAY_IDX_HASH)) return NULL;
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup_str(col, p, l, &gid);
+    if (!ix) return NULL;
+    int64_t n = col->len;
+    if (gid < 0) return rowsel_from_sorted_ids(n, NULL, 0);
+    const ray_t* ofv = ix->u.hash.offs;
+    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    if (gsz > 64 && gsz > (n >> 3))
+        return NULL;   /* dense: the scan wins, as for ray_index_hash_eq_rowsel */
+    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+}
+
 static _Atomic(uint64_t) g_enc_hash_probes;   /* test hook */
 uint64_t ray_enc_hash_test_probes(void) { return atomic_load_explicit(&g_enc_hash_probes, memory_order_relaxed); }
 
@@ -3308,6 +3332,121 @@ int ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err) {
     if (!ids) { *err = ray_error("oom", NULL); return -1; }
     memcpy(ids, b + h.rows + o0 * 8, (size_t)gsz * 8);
     *sel = rowsel_from_sorted_ids(len, ids, gsz);
+    scratch_free(ids_hdr);
+    if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+    atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+    return 1;
+}
+
+static int cmp_i64_plain(const void* a, const void* b);
+
+/* ---- STR on a mapped region ----
+ *
+ * A generation-2 STR column with a recorded HASH: the region holds each
+ * group's byte-hash word (str_key_word), so a needle's word walks it as an
+ * integer key walks ray_enc_hash_eq_rowsel's.  A word hit is confirmed
+ * against the bytes of the group's first row, read as that one cell
+ * (ray_enccol_str_cell_eq): no vector is decoded, the column is never
+ * materialized. */
+
+/* The region of `encv` when it is a single-file STR column with a HASH. */
+static ray_enccol_t* enc_str_hash_col(ray_t* encv, const uint8_t** b, ray_enc_idx_hash_t* h) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e || e->kind != RAY_ENCCOL_SINGLE || e->synthetic || e->hdr.index_kind != RAY_IDX_HASH ||
+        e->type != RAY_STR) return NULL;
+    *b = e->base + e->hdr.index_off;
+    memcpy(h, *b + 16, sizeof *h);
+    return e;
+}
+
+/* The group of the needle p[0..l) in the region: its id, -1 when absent,
+ * -2 on a failed read (*err set). */
+static int64_t enc_str_hash_gid(ray_t* encv, const uint8_t* b, const ray_enc_idx_hash_t* h,
+                                const char* p, size_t l, ray_t** err) {
+    const int64_t kw = (int64_t)str_key_word(p, l);
+    uint64_t slot = mix64((uint64_t)kw) & h->mask;
+    for (;;) {
+        int64_t gp1 = ehp_at(b, h->table, (int64_t)slot);
+        if (gp1 == 0) return -1;
+        if (ehp_at(b, h->gkeys, gp1 - 1) == kw) {
+            int64_t rid = ehp_at(b, h->rows, ehp_at(b, h->offs, gp1 - 1));
+            bool eq = false;
+            ray_t* e2 = ray_enccol_str_cell_eq(ray_enccol_of(encv), rid, p, l, &eq);
+            if (e2) { *err = e2; return -2; }
+            if (eq) return gp1 - 1;
+        }
+        slot = (slot + 1) & h->mask;
+    }
+}
+
+int ray_enc_hash_eq_str_rowsel(ray_t* encv, const char* p, size_t l, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    const uint8_t* b = NULL;
+    ray_enc_idx_hash_t h;
+    ray_enccol_t* e = enc_str_hash_col(encv, &b, &h);
+    if (!e || !p || l == 0) return 0;            /* "": the null rows the hash leaves out */
+    const int64_t len = e->len;
+    int64_t gid = enc_str_hash_gid(encv, b, &h, p, l, err);
+    if (gid == -2) return -1;
+    if (gid < 0) {
+        *sel = rowsel_from_sorted_ids(len, NULL, 0);
+        if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+        atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+        return 1;
+    }
+    const int64_t o0 = ehp_at(b, h.offs, gid), o1 = ehp_at(b, h.offs, gid + 1);
+    const int64_t gsz = o1 - o0;
+    if (gsz > 64 && gsz > (len >> 3)) return 0;     /* dense: the scan answers */
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)(gsz > 0 ? gsz : 1) * sizeof(int64_t));
+    if (!ids) { *err = ray_error("oom", NULL); return -1; }
+    memcpy(ids, b + h.rows + o0 * 8, (size_t)gsz * 8);
+    *sel = rowsel_from_sorted_ids(len, ids, gsz);
+    scratch_free(ids_hdr);
+    if (!*sel) { *err = ray_error("oom", NULL); return -1; }
+    atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
+    return 1;
+}
+
+int ray_enc_hash_in_str_rowsel(ray_t* encv, ray_t* set_vec, ray_t** sel, ray_t** err) {
+    *sel = NULL; *err = NULL;
+    const uint8_t* b = NULL;
+    ray_enc_idx_hash_t h;
+    ray_enccol_t* e = enc_str_hash_col(encv, &b, &h);
+    if (!e || !set_vec || RAY_IS_ERR(set_vec) || set_vec->type != RAY_STR) return 0;
+    const int64_t len = e->len, m = set_vec->len;
+    ray_t* gid_hdr = NULL;
+    int64_t* gids = (int64_t*)scratch_alloc(&gid_hdr, (size_t)(m > 0 ? m : 1) * 3 * sizeof(int64_t));
+    if (!gids) { *err = ray_error("oom", NULL); return -1; }
+    int64_t ng = 0;
+    for (int64_t i = 0; i < m; i++) {
+        size_t l = 0;
+        const char* p = ray_str_vec_get(set_vec, i, &l);
+        if (!p || l == 0) { scratch_free(gid_hdr); return 0; }   /* "": the scan */
+        int64_t gid = enc_str_hash_gid(encv, b, &h, p, l, err);
+        if (gid == -2) { scratch_free(gid_hdr); return -1; }
+        if (gid >= 0) gids[ng++] = gid;
+    }
+    qsort(gids, (size_t)ng, sizeof(int64_t), cmp_i64_plain);
+    int64_t w = 0, total = 0;
+    for (int64_t i = 0; i < ng; i++) {
+        if (w > 0 && gids[i] == gids[w - 1]) continue;
+        gids[w++] = gids[i];
+        total += ehp_at(b, h.offs, gids[i] + 1) - ehp_at(b, h.offs, gids[i]);
+    }
+    if (total > 64 && total > (len >> 4)) { scratch_free(gid_hdr); return 0; }   /* dense union */
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+    if (!ids) { scratch_free(gid_hdr); *err = ray_error("oom", NULL); return -1; }
+    int64_t k = 0;
+    for (int64_t i = 0; i < w; i++) {
+        int64_t o0 = ehp_at(b, h.offs, gids[i]), o1 = ehp_at(b, h.offs, gids[i] + 1);
+        memcpy(ids + k, b + h.rows + o0 * 8, (size_t)(o1 - o0) * 8);
+        k += o1 - o0;
+    }
+    scratch_free(gid_hdr);
+    if (w > 1 && k > 1) qsort(ids, (size_t)k, sizeof(int64_t), hash_match_cmp_i64);
+    *sel = rowsel_from_sorted_ids(len, ids, k);
     scratch_free(ids_hdr);
     if (!*sel) { *err = ray_error("oom", NULL); return -1; }
     atomic_fetch_add_explicit(&g_enc_hash_probes, 1, memory_order_relaxed);
@@ -3494,17 +3633,95 @@ ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key) {
     return rowsel_from_sorted_ids(col->len, NULL, 0);
 }
 
+/* The rowsel of the union of the hash groups `gids[0..ngid)` (distinct,
+ * `total` rows between them) over a column of n rows; frees `gid_hdr`, the
+ * scratch holding `gids`.  NULL when the union is dense or on OOM. */
+static ray_t* hash_in_rowsel_from_gids(ray_index_t* ix, int64_t n, const int64_t* gids,
+                                       int64_t ngid, int64_t total, ray_t* gid_hdr) {
+    const ray_t* ofv = ix->u.hash.offs;
+    const ray_t* rwv = ix->u.hash.rows;
+    /* Dense union: the SIMD membership scan wins — bail with zero waste.
+     * Tighter than the eq probe's n/8: a multi-key union pays an
+     * O(m log m) qsort the single-slice path doesn't. */
+    if (total > 64 && total > (n >> 4)) {
+        scratch_free(gid_hdr);
+        return NULL;
+    }
+    if (total == 0) {
+        scratch_free(gid_hdr);
+        return rowsel_from_sorted_ids(n, NULL, 0);
+    }
+
+    /* Concatenate the groups' ascending slices and sort once — distinct
+     * keys → disjoint slices, no duplicate row ids. */
+    ray_t* match_hdr = ray_alloc(total * (int64_t)sizeof(int64_t));
+    if (!match_hdr) { scratch_free(gid_hdr); return NULL; }
+    int64_t* matches = (int64_t*)ray_data(match_hdr);
+    int64_t mcnt = 0;
+    for (int64_t si = 0; si < ngid; si++) {
+        int64_t gid = gids[si];
+        int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+        hx_copy_rows(matches + mcnt, rwv, hx_get(ofv, gid), gsz);
+        mcnt += gsz;
+    }
+    scratch_free(gid_hdr);
+    if (ngid > 1 && mcnt > 1)
+        qsort(matches, (size_t)mcnt, sizeof(int64_t), hash_match_cmp_i64);
+
+    ray_t* block = rowsel_from_sorted_ids(n, matches, mcnt);
+    ray_release(match_hdr);
+    return block;
+}
+
+/* ray_index_in_rowsel over a STR column: each distinct non-empty needle of
+ * the STR set resolves to its group by its bytes (hash_probe_setup_str).
+ * A "" needle (the STR null, whose rows the builder leaves out) declines
+ * to the scan. */
+static ray_t* str_in_rowsel(ray_t* col, ray_t* set_vec) {
+    if (!set_vec || set_vec->type != RAY_STR) return NULL;
+    int64_t m = set_vec->len, n = col->len;
+    if (m == 0) return rowsel_from_sorted_ids(n, NULL, 0);
+    ray_t* gid_hdr = NULL;
+    int64_t* gids = (int64_t*)scratch_alloc(&gid_hdr, (size_t)m * sizeof(int64_t));
+    if (!gids) return NULL;
+    ray_index_t* ix = NULL;
+    int64_t ngid = 0;
+    for (int64_t i = 0; i < m; i++) {
+        size_t l = 0;
+        const char* p = ray_str_vec_get(set_vec, i, &l);
+        if (!p || l == 0) { scratch_free(gid_hdr); return NULL; }
+        int64_t gid = -1;
+        ix = hash_probe_setup_str(col, p, l, &gid);
+        if (!ix) { scratch_free(gid_hdr); return NULL; }
+        if (gid >= 0) gids[ngid++] = gid;
+    }
+    if (!ix) { scratch_free(gid_hdr); return NULL; }
+    /* a needle given twice is one group: its rows once */
+    qsort(gids, (size_t)ngid, sizeof(int64_t), cmp_i64_plain);
+    int64_t total = 0, w = 0;
+    const ray_t* ofv = ix->u.hash.offs;
+    for (int64_t i = 0; i < ngid; i++) {
+        if (w > 0 && gids[i] == gids[w - 1]) continue;
+        gids[w++] = gids[i];
+        total += hx_get(ofv, gids[i] + 1) - hx_get(ofv, gids[i]);
+    }
+    return hash_in_rowsel_from_gids(ix, n, gids, w, total, gid_hdr);
+}
+
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
-    /* Gate: integer-family or SYM column with a fresh hash/part index. */
+    /* Gate: integer-family, SYM or STR column with a fresh hash/part index.
+     * SYM and STR needles are never null here (the null symbol and "" take
+     * the scan), so a null-bearing column of theirs is probed as it is. */
     ray_idx_kind_t kind = ray_index_kind(col);
+    bool byte_or_sym = col && (col->type == RAY_SYM || col->type == RAY_STR);
     if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
-        !(col && col->type == RAY_SYM ? idx_fresh(col, kind)
-                                      : idx_fresh_nonull(col, kind))) return NULL;
+        !(byte_or_sym ? idx_fresh(col, kind) : idx_fresh_nonull(col, kind))) return NULL;
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
     if (col_is_float) return NULL;
     /* A STR or GUID hash index is keyed on byte hashes — the int64 probes
-     * below do not apply (the eval-level `in` consults it via
-     * ray_index_find_vec). */
+     * below do not apply: a STR set probes by its bytes (str_in_rowsel);
+     * a GUID one is left to the scan. */
+    if (col->type == RAY_STR && kind == RAY_IDX_HASH) return str_in_rowsel(col, set_vec);
     if (hash_byte_keyed(col->type)) return NULL;
     bool col_is_sym = (col->type == RAY_SYM);
 
@@ -3521,6 +3738,11 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         if (set_is_float) return NULL;
         /* Check set type is integer-family (numeric_elem_size covers all int types) */
         if (numeric_elem_size(st) == 0) return NULL;
+        /* A DATE, TIME or TIMESTAMP against another type compares by duration
+         * (atom_eq), not by payload: leave it to the general route. */
+        bool col_point = col->type == RAY_DATE || col->type == RAY_TIME || col->type == RAY_TIMESTAMP;
+        bool set_point = st == RAY_DATE || st == RAY_TIME || st == RAY_TIMESTAMP;
+        if (col->type != st && (col_point || set_point)) return NULL;
     }
 
     int64_t set_len = set_vec->len;
@@ -3622,7 +3844,6 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
 
     int64_t total = 0;
     const ray_t* ofv = NULL;
-    const ray_t* rwv = NULL;
     {
         ray_index_t* ix = ray_index_payload(col->index);
         if (!ix->u.hash.table || !ix->u.hash.gkeys ||
@@ -3632,7 +3853,6 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
             return NULL;
         }
         ofv = ix->u.hash.offs;
-        rwv = ix->u.hash.rows;
         int es = numeric_elem_size(col->type);
         int64_t ngid = 0;
         for (int64_t si = 0; si < set_len; si++) {
@@ -3657,38 +3877,7 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
         set_len = ngid;
     }
     ray_release(set_hdr);
-
-    /* Dense union: the SIMD membership scan wins — bail with zero waste.
-     * Tighter than the eq probe's n/8: a multi-key union pays an
-     * O(m log m) qsort the single-slice path doesn't. */
-    if (total > 64 && total > (n >> 4)) {
-        scratch_free(gid_hdr);
-        return NULL;
-    }
-    if (total == 0) {
-        scratch_free(gid_hdr);
-        return rowsel_from_sorted_ids(n, NULL, 0);
-    }
-
-    /* Concatenate the groups' ascending slices and sort once — distinct
-     * keys → disjoint slices, no duplicate row ids. */
-    ray_t* match_hdr = ray_alloc(total * (int64_t)sizeof(int64_t));
-    if (!match_hdr) { scratch_free(gid_hdr); return NULL; }
-    int64_t* matches = (int64_t*)ray_data(match_hdr);
-    int64_t mcnt = 0;
-    for (int64_t si = 0; si < set_len; si++) {
-        int64_t gid = gids[si];
-        int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
-        hx_copy_rows(matches + mcnt, rwv, hx_get(ofv, gid), gsz);
-        mcnt += gsz;
-    }
-    scratch_free(gid_hdr);
-    if (set_len > 1 && mcnt > 1)
-        qsort(matches, (size_t)mcnt, sizeof(int64_t), hash_match_cmp_i64);
-
-    ray_t* block = rowsel_from_sorted_ids(n, matches, mcnt);
-    ray_release(match_hdr);
-    return block;
+    return hash_in_rowsel_from_gids(ray_index_payload(col->index), n, gids, set_len, total, gid_hdr);
 }
 
 /* --------------------------------------------------------------------------
@@ -4060,17 +4249,15 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col) {
 /* --------------------------------------------------------------------------
  * Sort-index distinct fast path
  *
- * Walk the sort permutation once.  The perm is a stable ascending sort with
- * iota tie-breaking, so within each equal-value run the row ids appear in
- * ascending order; the FIRST element of each run is already the minimum row
- * id (= first occurrence) for that value.
+ * Walk the sort permutation once and keep, for each run of equal keys, its
+ * smallest row id (= the value's first occurrence).  The perm is a stable
+ * ascending sort with iota tie-breaking, but it orders -0.0 before 0.0,
+ * which the run treats as one key, so the first element of a run is not
+ * always its smallest row.
  *
- * After collecting the first-in-run ids we sort them by VALUE (not by row)
- * to match distinct_vec_eager's distinct_sort_indices contract: output is
- * numerically sorted, not first-occurrence ordered.  Because the perm
- * already provides one representative per value in ascending value order, we
- * can emit them directly without a second sort — the perm walk order is
- * already value-ascending, which is exactly the required output order.
+ * The ids come out in value order (the permutation's); distinct_vec_eager
+ * puts them back in row order, so distinct keeps first-occurrence order
+ * (#1477).
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
@@ -4094,22 +4281,22 @@ ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
     int64_t* ids        = (int64_t*)ray_data(out);
     int64_t  count      = 0;
 
-    /* First element of the perm always starts the first run. */
+    /* One id per run of equal keys: the smallest row id in the run, its
+     * value's first occurrence.  Within a run the rows are ascending by the
+     * stable sort, except where the sort orders keys the run treats as one
+     * (-0.0 before 0.0), so the minimum is taken, not the first. */
     ids[count++] = p[0];
     for (int64_t i = 1; i < n; i++) {
-        /* Compare value at current perm position to previous one.
-         * The perm is sorted ascending, so equal values form contiguous runs;
-         * we emit one id per run (the first element, which is the min row id
-         * because the sort is stable with iota tie-breaking). */
         if (numeric_key_word(base, col->type, p[i]) !=
             numeric_key_word(base, col->type, p[i-1])) {
             ids[count++] = p[i];
+        } else if (p[i] < ids[count - 1]) {
+            ids[count - 1] = p[i];
         }
     }
 
-    /* The perm walk produces ids in VALUE-ascending order (perm is sorted
-     * ascending).  distinct_vec_eager's contract (from distinct_sort_indices)
-     * is also value-ascending, so no second sort is needed. */
+    /* The perm walk gives the ids in value order; the caller puts them in
+     * row order (#1477). */
     out->len   = count;
     *out_count = count;
     return out;
@@ -5065,6 +5252,16 @@ int64_t ray_index_find_atom(ray_t* col, ray_t* a) {
         return hx_get(ix->u.hash.rows, hx_get(ix->u.hash.offs, gid));
     }
     default: {
+        /* As ray_index_find_vec: a DATE, TIME or TIMESTAMP meets only its own
+         * type by payload (atom_eq never matches a DATE to a TIMESPAN or an
+         * int, and meets a TIME or a TIMESTAMP with a TIMESPAN as a
+         * duration), and a float column keeps the scan's promotion (#1350). */
+        int8_t at = (int8_t)-a->type;
+        if (col->type == RAY_F32 || col->type == RAY_F64) return -2;
+        if (col->type != at &&
+            (col->type == RAY_DATE || col->type == RAY_TIME || col->type == RAY_TIMESTAMP ||
+             at == RAY_DATE || at == RAY_TIME || at == RAY_TIMESTAMP))
+            return -2;
         int64_t k = 0;
         if (!int_atom_key(a, &k)) return -2;
         return ray_index_find_row(col, k);
@@ -5123,6 +5320,12 @@ int ray_index_find_vec(ray_t* col, ray_t* nd, int64_t* out, bool* any_miss) {
          * and cross-family promotion belong to the scan / hashset paths. */
         if (col->type == RAY_F32 || col->type == RAY_F64) return 0;
         if (nd->type == RAY_F32 || nd->type == RAY_F64 || numeric_elem_size(nd->type) == 0) return 0;
+        /* A DATE, TIME or TIMESTAMP meets only its own type by payload: atom_eq
+         * never matches a DATE to a TIMESPAN or an int, and meets a TIME or a
+         * TIMESTAMP with a TIMESPAN as a duration (#1319). */
+#define IDX_POINT(t) ((t) == RAY_DATE || (t) == RAY_TIME || (t) == RAY_TIMESTAMP)
+        if (col->type != nd->type && (IDX_POINT(col->type) || IDX_POINT(nd->type))) return 0;
+#undef IDX_POINT
         for (int64_t i = 0; i < m; i++) {
             if (nd_nulls && ray_vec_is_null(nd, i)) { out[i] = NULL_I64; miss = true; continue; }
             int64_t r = ray_index_find_row(col, set_vec_read_i64(nb, nd->type, i));
@@ -5405,6 +5608,16 @@ static bool chunk_zone_extrema(const ray_t* col, int64_t* gmin, int64_t* gmax, u
     if (n_eff == 0) return false;
     *gmin = lo; *gmax = hi;
     if (nc_eff) *nc_eff = n_eff;
+    return true;
+}
+
+bool ray_idx_int_bounds(ray_t* col, int64_t* lo, int64_t* hi) {
+    if (chunk_zone_extrema(col, lo, hi, NULL)) return true;
+    if (!idx_fresh(col, RAY_IDX_ZONE) || (col->attrs & RAY_ATTR_SLICE)) return false;
+    if (numeric_elem_size(col->type) == 0 || col->type == RAY_F32 || col->type == RAY_F64) return false;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->u.zone.n_nulls >= col->len) return false;   /* no value: min = max = 0 */
+    *lo = ix->u.zone.min_i; *hi = ix->u.zone.max_i;
     return true;
 }
 

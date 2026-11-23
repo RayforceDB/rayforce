@@ -68,17 +68,18 @@
 ;; U8 mod by 0 → 0
 (% (as 'U8 100) (as 'U8 0)) -- 0x00
 
-;; Integer modulo: result type follows RIGHT operand width
-(type (% 100 (as 'I32 7))) -- 'i32
-(type (% 100 (as 'I16 7))) -- 'i16
+;; Integer modulo: the promoted (wider) type of both operands (#972)
+(type (% 100 (as 'I32 7))) -- 'i64
+(type (% 100 (as 'I16 7))) -- 'i64
+(type (% 100i (as 'I16 7))) -- 'i32
 (% 100 (as 'I32 7)) -- 2
 
-;; Integer modulo by zero — typed-null on right
+;; Integer modulo by zero — typed null of the promoted type
 (nil? (% 100 (as 'I32 0))) -- true
-(type (% 100 (as 'I32 0))) -- 'i32
-(nil? (% 100 (as 'I16 0))) -- true
-(type (% 100 (as 'I16 0))) -- 'i16
+(type (% 100 (as 'I32 0))) -- 'i64
+(nil? (% 100h (as 'I16 0))) -- true
+(type (% 100h (as 'I16 0))) -- 'i16
 
-;; U8-left, non-U8 right (mod follows b's type per line 261-263 fallthrough)
+;; U8-left, wider right: the wider type
 (type (% (as 'U8 100) (as 'I32 7))) -- 'i32
 (type (% (as 'U8 100) (as 'I16 7))) -- 'i16

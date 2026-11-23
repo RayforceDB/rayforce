@@ -189,69 +189,20 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 ray_retain(a);
                 a = a_owned = ray_lazy_materialize(a);
             }
-            int tlen = 0;
-            if (!a || RAY_IS_ERR(a)) {
-                tlen = snprintf(tmp, sizeof(tmp), "error");
-            } else if (a->type != -RAY_STR && a->type != -RAY_SYM &&
-                       RAY_ATOM_IS_NULL(a)) {
-                tlen = snprintf(tmp, sizeof(tmp), "%s", ray_fmt_null_literal(-a->type));
-            } else if (a->type == -RAY_I64) {
-                tlen = snprintf(tmp, sizeof(tmp), "%" PRId64, a->i64);
-            } else if (a->type == -RAY_F64) {
-                double fv = a->f64;
-                fv = clear_neg_zero(fv);
-                tlen = snprintf(tmp, sizeof(tmp), "%g", fv);
-            } else if (a->type == -RAY_BOOL) {
-                tlen = snprintf(tmp, sizeof(tmp), "%s", a->b8 ? "true" : "false");
-            } else if (a->type == -RAY_STR) {
-                const char* sp = ray_str_ptr(a);
-                size_t sl = ray_str_len(a);
-                while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                memcpy(buf + pos, sp, sl);
-                pos += sl;
+            const char* sp = NULL;
+            size_t sl = 0;
+            ray_t* own = ray_fmt_pct(a, tmp, sizeof(tmp), &sp, &sl);
+            if (own && RAY_IS_ERR(own)) {
                 if (a_owned) ray_release(a_owned);
-                continue;
-            } else if (a->type == -RAY_SYM) {
-                ray_t* ss = ray_sym_str(a->i64);
-                if (ss) {
-                    const char* sp = ray_str_ptr(ss);
-                    size_t sl = ray_str_len(ss);
-                    /* sym 0 resolves to "" — the empty symbol shows as ' */
-                    if (sl == 0) { sp = "'"; sl = 1; }
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                    memcpy(buf + pos, sp, sl);
-                    pos += sl;
-                    ray_release(ss);
-                    if (a_owned) ray_release(a_owned);
-                    continue;
-                }
-                tlen = snprintf(tmp, sizeof(tmp), "'?");
-            } else {
-                /* Fall back to ray_fmt */
-                ray_t* formatted = ray_fmt(a, RAY_FMT_COMPACT);
-                if (formatted && !RAY_IS_ERR(formatted)) {
-                    const char* sp = ray_str_ptr(formatted);
-                    size_t sl = ray_str_len(formatted);
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                    memcpy(buf + pos, sp, sl);
-                    pos += sl;
-                    ray_release(formatted);
-                    if (a_owned) ray_release(a_owned);
-                    continue;
-                }
-                if (formatted && RAY_IS_ERR(formatted)) {
-                    if (a_owned) ray_release(a_owned);
-                    ray_free_raw(buf);
-                    *err = formatted;
-                    return NULL;
-                }
-                if (formatted) ray_release(formatted);
-                tlen = snprintf(tmp, sizeof(tmp), "<type:%d>", a->type);
+                ray_free_raw(buf);
+                *err = own;
+                return NULL;
             }
+            while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            memcpy(buf + pos, sp, sl);
+            pos += sl;
+            if (own) ray_release(own);
             if (a_owned && !RAY_IS_ERR(a_owned)) ray_release(a_owned);
-            while (pos + (size_t)tlen + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-            memcpy(buf + pos, tmp, (size_t)tlen);
-            pos += (size_t)tlen;
         } else {
             if (pos + 2 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
             buf[pos++] = fmt[i];
@@ -428,32 +379,37 @@ ray_t* ray_read_limits_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
+ray_t* ray_read_limits_apply(const char* who, ray_t* d, ray_read_limits_t* lim) {
+    if (!d || d->type != RAY_DICT) return ray_error("type", "%s: limits must be a dict, got %s", who, d ? ray_type_name(d->type) : "null");
+    ray_t* keys = ray_dict_keys(d);
+    ray_t* vals = ray_dict_vals(d);
+    /* The language's {} has LIST keys: an empty dict overrides nothing. */
+    if (keys->len > 0 && keys->type != RAY_SYM) return ray_error("type", "%s: limit names must be symbols", who);
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* kn = ray_sym_vec_cell(keys, i);
+        size_t found = READ_LIMIT_COUNT;
+        for (size_t j = 0; j < READ_LIMIT_COUNT; j++)
+            if (kn && strlen(read_limit_names[j].name) == ray_str_len(kn) &&
+                memcmp(read_limit_names[j].name, ray_str_ptr(kn), ray_str_len(kn)) == 0) found = j;
+        if (found == READ_LIMIT_COUNT) return ray_error("domain", "%s: unknown limit '%.*s'", who, kn ? (int)ray_str_len(kn) : 0, kn ? ray_str_ptr(kn) : "");
+        int64_t v;
+        if (vals->type == RAY_I64) v = ((int64_t*)ray_data(vals))[i];
+        else if (vals->type == RAY_LIST && ((ray_t**)ray_data(vals))[i]->type == -RAY_I64) v = ((ray_t**)ray_data(vals))[i]->i64;
+        else return ray_error("type", "%s: limits must be integers", who);
+        if (v < 0 || v == INT64_MIN) return ray_error("domain", "%s: limits must not be negative", who);
+        *(size_t*)((char*)lim + read_limit_names[found].off) = (size_t)v;
+    }
+    return NULL;
+}
+
 ray_t* ray_read_value_fn(ray_t** args, int64_t n) {
     if (n < 1 || n > 2) return ray_error("arity", "read-value: expects text and optional limits, got %lld arguments", (long long)n);
     if (!args[0] || args[0]->type != -RAY_STR)
         return ray_error("type", "read-value: text must be a string, got %s", args[0] ? ray_type_name(args[0]->type) : "null");
     ray_read_limits_t lim = ray_read_limits_default();
     if (n == 2) {
-        ray_t* d = args[1];
-        if (!d || d->type != RAY_DICT) return ray_error("type", "read-value: limits must be a dict, got %s", d ? ray_type_name(d->type) : "null");
-        ray_t* keys = ray_dict_keys(d);
-        ray_t* vals = ray_dict_vals(d);
-        /* The language's {} has LIST keys: an empty dict overrides nothing. */
-        if (keys->len > 0 && keys->type != RAY_SYM) return ray_error("type", "read-value: limit names must be symbols");
-        for (int64_t i = 0; i < keys->len; i++) {
-            ray_t* kn = ray_sym_vec_cell(keys, i);
-            size_t found = READ_LIMIT_COUNT;
-            for (size_t j = 0; j < READ_LIMIT_COUNT; j++)
-                if (kn && strlen(read_limit_names[j].name) == ray_str_len(kn) &&
-                    memcmp(read_limit_names[j].name, ray_str_ptr(kn), ray_str_len(kn)) == 0) found = j;
-            if (found == READ_LIMIT_COUNT) return ray_error("domain", "read-value: unknown limit '%.*s'", kn ? (int)ray_str_len(kn) : 0, kn ? ray_str_ptr(kn) : "");
-            int64_t v;
-            if (vals->type == RAY_I64) v = ((int64_t*)ray_data(vals))[i];
-            else if (vals->type == RAY_LIST && ((ray_t**)ray_data(vals))[i]->type == -RAY_I64) v = ((ray_t**)ray_data(vals))[i]->i64;
-            else return ray_error("type", "read-value: limits must be integers");
-            if (v < 0 || v == INT64_MIN) return ray_error("domain", "read-value: limits must not be negative");
-            *(size_t*)((char*)&lim + read_limit_names[found].off) = (size_t)v;
-        }
+        ray_t* err = ray_read_limits_apply("read-value", args[1], &lim);
+        if (err) return err;
     }
     return ray_read_value(ray_str_ptr(args[0]), ray_str_len(args[0]), &lim);
 }
@@ -594,7 +550,14 @@ ray_t* ray_exit_fn(ray_t* arg) {
     return ray_error("restricted", "exit disabled under fuzzing");
 #else
     int code = 0;
-    if (arg && is_numeric(arg)) code = (int)as_i64(arg);
+    if (arg && (!ray_is_atom(arg) ||
+                (arg->type != -RAY_I64 && arg->type != -RAY_I32 &&
+                 arg->type != -RAY_I16 && arg->type != -RAY_U8)))
+        /* as_i64 of a float is its bit pattern: the status of the process was whatever
+         * the low bits of the double happened to be */
+        return ray_error("type", "exit: the status must be an integer atom, got %s",
+                         ray_type_name(arg->type));
+    if (arg) code = (int)as_i64(arg);
     exit(code);
     return NULL; /* unreachable */
 #endif
@@ -1368,6 +1331,46 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     }
 }
 
+/* A LIST cell's cast as one value for a typed cell (#1395).  The cell
+ * loops below read an atom's payload; a cell that casts to a vector (a GUID
+ * vector, `[1]`, a nested LIST) has none: its length was read as the value,
+ * or a GUID vector's header followed as a pointer.  A one-element cell is
+ * its element, null as the inner vector marks it (a narrow sentinel such as
+ * INT16_MIN stays a value, as in a vector cast); an empty cell is the
+ * type's null (BOOL and U8 have none: false / 0x00); a longer cell is a
+ * type error.  `cell_type` is the LIST cell's own type, for the message.
+ * Takes `cast`; returns an owned atom or an error, *null when the output
+ * cell is to be marked null. */
+static ray_t* cast_cell_atom(ray_t* cast, int8_t out_type, int8_t cell_type, bool* null) {
+    *null = false;
+    if (ray_is_atom(cast)) return cast;
+    int64_t n = ray_len(cast);
+    if (n > 1) {
+        ray_t* e = ray_error("type", "as: cannot cast to %s: a LIST cell holds %lld values (%s)",
+                             ray_type_name((int8_t)-out_type), (long long)n, ray_type_name(cell_type));
+        ray_release(cast);
+        return e;
+    }
+    ray_t* a;
+    if (n == 0) {
+        a = ray_typed_null((int8_t)-out_type);
+        *null = out_type != RAY_BOOL && out_type != RAY_U8;
+    } else {
+        bool inner_null = cast->type != RAY_LIST && ray_vec_is_null(cast, 0);
+        int alloc = 0;
+        a = collection_elem(cast, 0, &alloc);
+        if (a && !RAY_IS_ERR(a) && !alloc) ray_retain(a);
+        if (a && !RAY_IS_ERR(a) && !ray_is_atom(a)) {   /* a nested vector */
+            ray_release(cast);
+            return cast_cell_atom(a, out_type, cell_type, null);
+        }
+        if (a && !RAY_IS_ERR(a))
+            *null = cast->type == RAY_LIST ? RAY_ATOM_IS_NULL(a) : inner_null;
+    }
+    ray_release(cast);
+    return a ? a : ray_error("oom", NULL);
+}
+
 static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     int64_t n2 = val->len;
     ray_t* vec = ray_vec_new(out_type, n2);
@@ -1432,9 +1435,15 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
         if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        int8_t cell_type = elem->type;
         ray_t* cast = ray_cast_fn(type_sym, elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        bool cell_null = false;
+        if (!ray_is_atom(cast)) {
+            cast = cast_cell_atom(cast, out_type, cell_type, &cell_null);
+            if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        }
         switch (out_type) {
         case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
             ((int64_t*)out)[i] = cast->i64; break;
@@ -1448,6 +1457,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
         default: break;
         }
         ray_release(cast);
+        if (cell_null) ray_vec_set_null(vec, i, true);
     }
     /* STAGE 2 (ingest/cast → F64 vector): the per-element recursion routes
      * STR→F64 through make_f64, which canonicalizes any non-finite parse
@@ -1522,14 +1532,20 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
         if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        int8_t cell_type = elem->type;
         ray_t* cast = may_nest ? ray_cast_fn(type_sym, elem)
                       : RAY_ATOM_IS_NULL(elem) ? ray_str("", 0)
                       : cast_str_atom(elem);
         if (alloc) ray_release(elem);
         if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
         if (!cast) { ray_release(vec); return ray_error("oom", NULL); }
-        /* Each output cell needs a string atom. A nested input can
-         * recursively produce a STR vector, not an atom to inspect. */
+        /* Each output cell needs a string atom.  A nested cell casts to a
+         * STR vector: one value, a null or a type error (cast_cell_atom). */
+        bool cell_null = false;
+        if (may_nest && !ray_is_atom(cast)) {
+            cast = cast_cell_atom(cast, RAY_STR, cell_type, &cell_null);
+            if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+        }
         if (may_nest && cast->type != -RAY_STR) {
             ray_release(cast);
             ray_release(vec);
@@ -1540,6 +1556,7 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
         ray_release(cast);
         if (RAY_IS_ERR(vec)) return vec;
+        if (cell_null) ray_vec_set_null(vec, i, true);
     }
     ray_t* result = cast_vec_copy_nulls(vec, val);
     if (RAY_IS_ERR(result)) return result;
@@ -2217,9 +2234,15 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             for (int64_t i = 0; i < n2; i++) {
                 ray_t* cast = ray_cast_fn(type_sym, items[i]);
                 if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                bool cell_null = false;
+                if (!ray_is_atom(cast)) {
+                    cast = cast_cell_atom(cast, RAY_GUID, items[i]->type, &cell_null);
+                    if (RAY_IS_ERR(cast)) { ray_release(vec); return cast; }
+                }
                 if (cast->obj) memcpy(data + i * 16, ray_data(cast->obj), 16);
                 else memcpy(data + i * 16, ray_data(cast), 16);
                 ray_release(cast);
+                if (cell_null) ray_vec_set_null(vec, i, true);
             }
             ray_t* result = cast_vec_copy_nulls(vec, val);
             if (RAY_IS_ERR(result)) return result;
@@ -2974,6 +2997,12 @@ static void where_emit_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) 
     }
 }
 
+/* as pool_cancelled (ops/internal.h, which builtins.c cannot include) */
+static inline bool where_cancelled(ray_pool_t* pool) {
+    return RAY_UNLIKELY(ray_interrupted()) ||
+           RAY_UNLIKELY(atomic_load_explicit(&pool->cancelled, memory_order_relaxed));
+}
+
 ray_t* ray_where_fn(ray_t* x) {
     if (!ray_is_vec(x) || x->type != RAY_BOOL)
         return ray_error("type", "where: argument must be a B8 vector, got %s%s",
@@ -2998,6 +3027,9 @@ ray_t* ray_where_fn(ray_t* x) {
             where_ctx_t wc = { .data = data, .n = n, .chunk_rows = chunk_rows,
                                .chunk_counts = chunk_counts, .out = NULL };
             ray_pool_dispatch_n(pool, where_count_fn, &wc, (uint32_t)n_chunks);
+            /* the chunks a cancel skips leave their counts, then their
+             * rows, unwritten (a count would size the result) */
+            if (where_cancelled(pool)) { ray_release(cc_hdr); return ray_error("cancel", NULL); }
             int64_t cum = 0;
             for (int64_t ch = 0; ch < n_chunks; ch++) {
                 int64_t v = chunk_counts[ch];
@@ -3008,8 +3040,9 @@ ray_t* ray_where_fn(ray_t* x) {
             if (RAY_IS_ERR(result)) { ray_release(cc_hdr); return result; }
             wc.out = (int64_t*)ray_data(result);
             ray_pool_dispatch_n(pool, where_emit_fn, &wc, (uint32_t)n_chunks);
-            result->len = cum;
             ray_release(cc_hdr);
+            if (where_cancelled(pool)) { ray_release(result); return ray_error("cancel", NULL); }
+            result->len = cum;
             return result;
         }
         /* scratch OOM → sequential fallback below */
@@ -3155,6 +3188,7 @@ uint64_t ray_atom_hash(ray_t* a) {
         case -RAY_SYM:       return ray_hash_i64(a->i64);
         case -RAY_DATE:
         case -RAY_TIME:      return ray_hash_i64((int64_t)a->i32);
+        case -RAY_TIMESPAN:
         case -RAY_TIMESTAMP: return ray_hash_i64(a->i64);
         case -RAY_GUID: {
             const uint8_t* g = a->obj
@@ -3230,11 +3264,30 @@ static uint64_t ght_str_hash_gi(uint32_t gi, void* ctx) {
 }
 
 /* Context for the LIST-path rehash: gkeys holds atom pointers for each
- * unique group (one slot per gi), recomputed on grow via atom_hash. */
-typedef struct { ray_t** gkeys; } ght_list_ctx_t;
+ * unique group (one slot per gi), hashed the same way on insert and grow. */
+static _Atomic(int64_t) group_boxed_i64_runs = 0;
+
+typedef struct { ray_t** gkeys; int spans; bool exact_i64; bool counted; } ght_list_ctx_t;
+static uint64_t ght_list_hash(ray_t* key, ght_list_ctx_t* c) {
+    if (!c->exact_i64) {
+        /* the float-free exact-integer hash counts as the same route */
+        if ((c->spans & RAY_KEY_EXACT_INT) && !c->counted) {
+            atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
+            c->counted = true;
+        }
+        return ray_key_hash(key, c->spans);
+    }
+    uint64_t h = ray_hash_i64(key->i64);
+    /* Count actual exact-hash use once per invocation, not per key. */
+    if (!c->counted) {
+        atomic_fetch_add_explicit(&group_boxed_i64_runs, 1, memory_order_relaxed);
+        c->counted = true;
+    }
+    return h;
+}
 static uint64_t ght_list_hash_gi(uint32_t gi, void* ctx) {
     ght_list_ctx_t* c = (ght_list_ctx_t*)ctx;
-    return ray_atom_hash(c->gkeys[gi]);
+    return ght_list_hash(c->gkeys[gi], c);
 }
 
 /* Grow the per-group bookkeeping arrays used by ray_group_indices_fn.
@@ -3292,6 +3345,10 @@ static bool group_grow_listkeys(ray_t** val_block, ray_t** ivblock, ray_t** kblo
     return true;
 }
 
+int64_t ray_group_boxed_i64_runs(void) {
+    return atomic_load_explicit(&group_boxed_i64_runs, memory_order_relaxed);
+}
+
 ray_t* ray_group_indices_fn(ray_t* x) {
     if (!ray_is_vec(x) && x->type != RAY_LIST)
         return ray_error("type", "group: argument must be a vector or list, got %s", ray_type_name(x->type));
@@ -3336,11 +3393,38 @@ ray_t* ray_group_indices_fn(ray_t* x) {
             ray_free(val_block); ray_free(ivblock); ray_free(kblock);
             return ray_error("oom", NULL);
         }
-        ght_list_ctx_t lctx = { .gkeys = gkeys };
+        /* atom_eq groups, so ray_key_hash: ray_atom_hash put every vector
+         * cell of one type and length in one bucket. */
+        /* Only a homogeneous atom list permits exact I64 hashing: mixed
+         * numeric keys must retain their shared equality-compatible hash. */
+        bool exact_i64 = true;
+        for (int64_t i = 0; i < n; i++) {
+            if (!elems[i] || elems[i]->type != -RAY_I64) { exact_i64 = false; break; }
+        }
+        /* One walk gathers the cells' span bits (as ray_key_spans) and
+         * whether any float atom is present.  A set with neither hashes
+         * integer atoms at any depth by their integer value (#1333). */
+        int lspans = 0;
+        bool float_free = true;
+        if (!exact_i64) {
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* c = elems[i];
+                if (!c) continue;
+                if (c->type < 0) {
+                    if (c->type == -RAY_TIMESPAN) lspans |= RAY_KEY_SPAN_ATOM;
+                    else if (c->type == -RAY_F64 || c->type == -RAY_F32) float_free = false;
+                } else {
+                    if (lspans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) lspans |= ray_key_spans(c);
+                    if (float_free && !ray_key_float_free(c)) float_free = false;
+                }
+            }
+            if (lspans == 0 && float_free) lspans = RAY_KEY_EXACT_INT;
+        }
+        ght_list_ctx_t lctx = { .gkeys = gkeys, .spans = lspans, .exact_i64 = exact_i64 };
 
         for (int64_t i = 0; i < n; i++) {
             ray_t* elem = elems[i];
-            uint64_t h = ray_atom_hash(elem);
+            uint64_t h = ght_list_hash(elem, &lctx);
             uint32_t slot = (uint32_t)(h & ht.mask);
             uint32_t gi_found = GHT_EMPTY;
             while (ht.slots[slot] != GHT_EMPTY) {

@@ -61,7 +61,13 @@ static inline bool ray_is_lazy(ray_t* x) {
 ray_t*    ray_lazy_materialize(ray_t* val);
 ray_t*    ray_lazy_append_param(ray_t* lazy, uint16_t opcode, int64_t param);
 
-bool ray_has_timespan(const ray_t* x);
+/* Two TIMEs or two TIMESTAMPs (atoms or vectors): their difference is a
+ * TIMESPAN, computed by ray_timespan_binary. */
+static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
+    int8_t x = a->type < 0 ? (int8_t)-a->type : a->type;
+    int8_t y = b->type < 0 ? (int8_t)-b->type : b->type;
+    return x == y && (x == RAY_TIME || x == RAY_TIMESTAMP);
+}
 int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
 ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
@@ -84,6 +90,15 @@ void     ray_cancel_reset(void);
 
 #define RAY_IS_PARTED(t)       ((t) >= RAY_PARTED_BASE && (t) < RAY_MAPCOMMON)
 #define RAY_PARTED_BASETYPE(t) ((t) - RAY_PARTED_BASE)
+
+/* A TIMESPAN atom, vector or parted column.  Inline: atom_eq and the key
+ * hashes ask it of every cell. */
+static inline bool ray_has_timespan(const ray_t* x) {
+    if (!x) return false;
+    int8_t t = x->type;
+    return t == -RAY_TIMESPAN || t == RAY_TIMESPAN ||
+           (RAY_IS_PARTED(t) && RAY_PARTED_BASETYPE(t) == RAY_TIMESPAN);
+}
 
 /* ===== Morsel Constants ===== */
 
@@ -177,7 +192,7 @@ void     ray_cancel_reset(void);
 #define OP_DATE_TRUNC   46
 #define OP_IN           47   /* binary: col in set_vec -> BOOL */
 #define OP_NOT_IN       48   /* binary: col not in set_vec -> BOOL */
-#define OP_IDIV         49   /* binary: integer floor division -> I64 */
+#define OP_IDIV         49   /* binary: floor division, promoted type (#972) */
 #define OP_SIN          137  /* unary: sine -> F64 */
 #define OP_ASIN         138  /* unary: arcsine -> F64 */
 #define OP_COS          139  /* unary: cosine -> F64 */
@@ -308,6 +323,14 @@ static inline bool agg_type_admitted(uint16_t op, int8_t t) {
     }
 }
 
+/* Whether a typed DAG aggregate may read a LIST column: only the ones that
+ * do not interpret the cells.  Any other aggregate of a LIST goes to the
+ * per-group builtins, which sum a list of numeric atoms or raise `type`;
+ * the typed kernels read the cells' pointers as numbers (#1283). */
+static inline bool agg_list_on_dag(uint16_t op) {
+    return op == OP_COUNT || op == OP_FIRST || op == OP_LAST;
+}
+
 static inline bool agg_is_binary_agg(uint16_t op) {
     return op == OP_PEARSON_CORR || op == OP_COV || op == OP_SCOV ||
            op == OP_WSUM || op == OP_WAVG;
@@ -403,6 +426,11 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 #define OP_FLAG_PUSHED       0x01  /* filter interposed below a GROUP by predicate pushdown */
 #define OP_FLAG_DEAD         0x02
 #define OP_FLAG_INVALID_SCAN 0x04  /* query compiler emitted an unknown column */
+#define OP_FLAG_TEMPORAL_INT 0x08  /* temporal +/- integer lowered by the query compiler (#1302) */
+#define OP_FLAG_XBAR         0x10  /* OP_MOD of an xbar: a zero or null divisor raises domain (#1355) */
+
+/* ray_xbar_fn's error for a zero or null bucket */
+#define RAY_XBAR_BUCKET_ERR "xbar: bucket size must be non-zero and non-null"
 
 /* Sentinel node id for "no input".  Node id 0 is a valid node (the first
  * one allocated), so zero cannot mean "none" — use the max value.  All
@@ -539,6 +567,9 @@ typedef struct ray_graph {
     uint32_t       ext_count;   /* number of extended nodes */
     uint32_t       ext_cap;     /* capacity of ext_nodes array */
     ray_t*          selection;   /* RAY_SEL bitmap — lazy filter (NULL = all pass) */
+    ray_t*          xbar_rows;   /* borrowed rowsel: the rows an xbar buckets when no
+                                  * selection is installed (an update's where:);
+                                  * NULL = every row (#1355) */
     struct ray_col_binds_s* binds;   /* sources bound by this execution (ops/colbind.c) */
 
     /* Slice-group hint (FILTER(in/eq on c) + GROUP(by c) fusion).
@@ -605,6 +636,12 @@ typedef struct ray_graph {
      * quiet inside an arm and let the arm compile as it always did. */
     int             if_arm_depth;
 
+    /* Temporal +/- integer pairs compile_expr_dag lowered into this graph
+     * (OP_FLAG_TEMPORAL_INT, #1302): while nonzero every compile level
+     * holds the nodes it made to the pair's reader rule, an alias of an
+     * earlier projection included. */
+    uint32_t        temporal_int_nodes;
+
     /* Result memo for shared nodes (exec.c, exec_node): a node with more
      * than one consumer in the graph is executed once and its result is
      * handed to every consumer as a retained ref; the memo's own ref is
@@ -623,7 +660,8 @@ typedef struct ray_graph {
     ray_t*          memo_table;
 
     /* Set when an `if` refuses its operands (a text result with a numeric
-     * branch, a condition with no truth value).  Such an error is the
+     * branch, a condition with no truth value, arms of two temporal
+     * types at compile time).  Such an error is the
      * expression's answer: a caller with an interpreter fallback must not
      * retry, since the interpreter's `if` tests one truth value and would
      * write the then-branch to every row. */
@@ -1032,6 +1070,8 @@ typedef struct {
     ray_t*  table;
     ray_t*  source;
     ray_t*  group_idx;
+    ray_t*  group_tbl;
+    int32_t group_depth;
     int64_t row;
     ray_t*  row_tbl;
     int32_t row_depth;

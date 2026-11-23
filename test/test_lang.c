@@ -35,6 +35,8 @@
 #include "table/domain.h"
 #include "table/sym.h"
 #include "lang/internal.h"
+#include "lang/callprof.h"
+#include "core/pool.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -159,6 +161,262 @@ static void lang_setup(void) {
 
 static void lang_teardown(void) {
     ray_runtime_destroy(__RUNTIME);
+}
+
+/* ---- #1287: the narrow linear / affine sum plans, by proof route ---- */
+
+#define NSR(k) (1u << (k))
+/* Run `q` (a boolean: the query against its eager per-row answer) and
+ * report the no-wrap proof routes it took: the bit of each counter of
+ * ray_narrow_sum_routes it moved. */
+static unsigned narrow_sum_routes_of(const char* q, bool* same) {
+    uint64_t before[NARROW_SUM__N];
+    for (int k = 0; k < NARROW_SUM__N; k++)
+        before[k] = atomic_load_explicit(&ray_narrow_sum_routes[k], memory_order_relaxed);
+    ray_t* r = ray_eval_str(q);
+    *same = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    unsigned moved = 0;
+    for (int k = 0; k < NARROW_SUM__N; k++)
+        if (atomic_load_explicit(&ray_narrow_sum_routes[k], memory_order_relaxed) != before[k])
+            moved |= NSR(k);
+    return moved;
+}
+
+static bool narrow_sum_eval_ok(const char* src) {
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return ok;
+}
+
+typedef struct { const char* q; unsigned routes; } narrow_sum_case_t;
+
+static test_result_t narrow_sum_run_cases(const narrow_sum_case_t* cases) {
+    for (int c = 0; cases[c].q; c++) {
+        bool same = false;
+        unsigned got = narrow_sum_routes_of(cases[c].q, &same);
+        TEST_ASSERT_FMT(same, "case %d: answer differs from the eager one: %s", c, cases[c].q);
+        TEST_ASSERT_FMT(got == cases[c].routes, "case %d: routes 0x%x, want 0x%x: %s",
+                        c, got, cases[c].routes, cases[c].q);
+    }
+    PASS();
+}
+
+#define NS_Q(sel, eager) "(all (== (at " sel " 's) (enlist " eager ")))"
+
+static test_result_t test_narrow_sum_bound_routes(void) {
+    static const char* const setup[] = {
+        "(set _odd (table [k a b] (list [0 1 2] [1 4611686018427387904 1] [1 9223372036854775807 1])))",
+        "(set _nI (til 200000))",
+        "(set h (as 'I16 (- (% _nI 2001) 1000)))",
+        "(set k (as 'I16 (- (% (* _nI 7) 1999) 999)))",
+        "(set u (as 'U8 (% _nI 100)))",
+        "(set v (as 'U8 (% (* _nI 3) 101)))",
+        "(set i (as 'I32 (- (% _nI 200001) 100000)))",
+        "(set j (as 'I32 (% (* _nI 7) 99991)))",
+        "(set _nT (table [h k u v i j] (list h k u v i j)))",
+        /* one row outside the sample blocks wraps: 30000h + 30000h,
+         * 3 * 30000h, 0xc8 + 0x64, 2e9i + 2e9i */
+        "(set _nW (fn [x a] (concat (take x 170001) (concat (enlist a) (drop x 170002)))))",
+        "(set hw (_nW h 30000h)) (set kw (_nW k 30000h)) (set uw (_nW u 0xc8)) (set vw (_nW v 0x64))",
+        "(set iw (_nW i 2000000000i)) (set jw (_nW j 2000000000i))",
+        "(set _nTW (table [h k u v i j] (list hw kw uw vw iw jw)))",
+        /* a row landing on the I16 null, without a wrap and with one */
+        "(set hs (_nW h -16384h)) (set ks (_nW k -16384h))",
+        "(set _nTS (table [h k] (list hs ks)))",
+        "(set hx (_nW h 32767h)) (set kq (_nW k 1h)) (set _nTX (table [h k] (list hx kq)))",
+        /* wraps in every block: the samples refuse */
+        "(set hf (as 'I16 (- (% (* _nI 13) 65536) 32768)))",
+        "(set _nTF (table [h k] (list hf hf)))",
+        /* wraps in the first sample block only */
+        "(set hb (concat (enlist 30000h) (drop h 1))) (set _nTB (table [h k] (list hb hb)))",
+        "(set hn (_nW h 0Nh)) (set _nTN (table [h k] (list hn k)))",
+        "(set _nTZ (table [h k] (list (.idx.zone h) (.idx.zone k))))",
+        "(set _nso (.attr.set 'sorted (asc h))) (set _nTO (table [h k] (list _nso _nso)))",
+        /* small tables: the serial pass, no samples; the safe range's edges */
+        "(set _nts (table [h k] (list (take h 3000) (take k 3000))))",
+        "(set hsw (concat (take h 2999) (enlist 30000h))) (set _ntw (table [h k] (list hsw hsw)))",
+        "(set he [32767h -32767h 5h]) (set ke [0h 0h 0h]) (set _nte (table [h k] (list he ke)))",
+        "(set hm [-32767h 5h]) (set km [-1h 1h]) (set _ntm (table [h k] (list hm km)))",
+        "(set ue (as 'U8 [255 0 3])) (set ve (as 'U8 [0 0 0])) (set _ntu (table [u v] (list ue ve)))",
+        "(set uo (as 'U8 [255 0 3])) (set vo (as 'U8 [1 0 4])) (set _ntv (table [u v] (list uo vo)))",
+        "(set ie [2147483647i -2147483647i]) (set je [0i 0i]) (set _nti (table [i j] (list ie je)))",
+        /* a nullable column whose coefficient cancels to zero */
+        "(set vc (as 'U8 [128 133 164])) (set ic [-927849349i -927849348i 0Ni]) (set _ntc (table [v i] (list vc ic)))",
+        "(set xc [1 2 3]) (set yc [1 2 0Nl]) (set _nty (table [x y] (list xc yc)))",
+        "(set _nt100 (table [x] (list (til 100))))",
+        NULL,
+    };
+    for (int q = 0; setup[q]; q++)
+        TEST_ASSERT_FMT(narrow_sum_eval_ok(setup[q]), "setup %d", q);
+    char dir[64];
+    int dn = snprintf(dir, sizeof dir, "/tmp/rayforce_lang_narrow_sum_%ld", (long)getpid());
+    TEST_ASSERT_TRUE(dn > 0 && (size_t)dn < sizeof dir);
+    char cmd[900];
+    snprintf(cmd, sizeof cmd, "(do (.db.splayed.set \"%s/s0/\" _nT {compress: false})"
+                              " (.db.splayed.set \"%s/w0/\" _nTW {compress: false})"
+                              " (.db.splayed.set \"%s/s2/\" _nT {compress: true})"
+                              " (set _nS0 (.db.splayed.get \"%s/s0/\"))"
+                              " (set _nW0 (.db.splayed.get \"%s/w0/\"))"
+                              " (set _nS2 (.db.splayed.get \"%s/s2/\")) 0)", dir, dir, dir, dir, dir, dir);
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok(cmd));
+
+    const unsigned SCAN = NSR(NARROW_SUM_SCAN), PRE = NSR(NARROW_SUM_PRE), TYPE = NSR(NARROW_SUM_TYPE),
+                   META = NSR(NARROW_SUM_META), PART = NSR(NARROW_SUM_PARTIAL),
+                   SAMPLE = NSR(NARROW_SUM_SAMPLE), REF = NSR(NARROW_SUM_REFUSED);
+    const narrow_sum_case_t cases[] = {
+        /* #1434: a sentinel produced in an intermediate must propagate even
+         * when adding one more would make the root look non-null. */
+        { NS_Q("(select {from: _odd s: (sum (* a 2))})", "4"), REF },
+        { NS_Q("(select {from: _odd s: (avg (* a 2))})", "2.0"), REF },
+        { NS_Q("(select {from: _odd s: (sum (+ (* a 2) 1))})", "6"), REF },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (avg (+ b 1))})", "2.0"), REF },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (* a 2))})", "2"), REF },
+        /* INT64_MAX + 2 wraps to MIN + 1, which is a value, not null. */
+        { NS_Q("(select {from: _odd s: (sum (+ b 2))})", "-9223372036854775801"), REF },
+        { NS_Q("(select {from: _odd s: (sum (* k 2))})", "6"), SCAN | PRE },
+        /* Each product fits I64, but their total needs AVG's wide accumulator. */
+        { NS_Q("(select {from: (table [v] (list [3000000000000000000 3000000000000000000]))"
+               " s: (avg (* v 2))})", "6.0e18"), SCAN | PRE },
+        /* nothing can wrap: proved by the pass, a lone SUM / AVG takes its total */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nT})",   "(sum (+ h k))"),   SCAN | PRE },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nT})",  "(sum (* h 3h))"),  SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nT})",   "(sum (+ u v))"),   SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nT})",   "(sum (+ i j))"),   SCAN | PRE },
+        { NS_Q("(select {s: (avg (+ i j)) from: _nT})",   "(avg (+ i j))"),   SCAN | PRE },
+        /* the affine shape goes to the linear plan for its pass */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nT})",  "(sum (+ h 1h))"),  SCAN | PRE },
+        /* filtered, or beside another aggregate: proved, summed per term */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nT where: (> i 0)})",
+               "(sum (+ (at h (where (> i 0))) (at k (where (> i 0)))))"),     SCAN },
+        { NS_Q("(select {s: (sum (+ h k)) c: (count h) from: _nT})", "(sum (+ h k))"), SCAN },
+        /* from the types: an I32 node over an I16 column */
+        { NS_Q("(select {s: (sum (+ h 5i)) from: _nT})",  "(sum (+ h 5i))"),  TYPE },
+        /* from the column metadata */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTZ})",  "(sum (+ h k))"),   META },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTO})",  "(sum (+ _nso _nso))"), META },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nS0})",  "(sum (+ h k))"),   META },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nS0})", "(sum (* h 3h))"),  META },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nS0})",  "(sum (+ u v))"),   META },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nS0})",  "(sum (+ i j))"),   META },
+        /* compressed: the chunk directory (the affine plan reads it staged) */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nS2})", "(sum (+ h 1h))"),  META },
+        /* one row can wrap: the pass sums its slice per row, the rest from the terms */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTW})",  "(sum (+ hw kw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (* h 3h)) from: _nTW})", "(sum (* hw 3h))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _nTW})",  "(sum (+ uw vw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nTW})",  "(sum (+ iw jw))"), PART | PRE },
+        { NS_Q("(select {s: (avg (+ i j)) from: _nTW})",  "(avg (+ iw jw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ h 30000h)) from: _nTW})", "(sum (+ hw 30000h))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ h 2000h)) from: _nTW})", "(sum (+ hw 2000h))"), SCAN | PRE },
+        /* the filtered rows (a compacted table here) are summed the same way */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTW where: (> i -1000000)})", "(sum (+ hw kw))"), PART | PRE },
+        /* ... but where the per-term plan would run: refused, per row */
+        { NS_Q("(select {s: (sum (+ h k)) c: (count h) from: _nTW})", "(sum (+ hw kw))"), REF },
+        /* metadata that does not prove it: the pass */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nW0})",  "(sum (+ hw kw))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nW0})",  "(sum (+ iw jw))"), PART | PRE },
+        /* refused by the samples, before any pass */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTF})",  "(sum (+ hf hf))"), SAMPLE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTB})",  "(sum (+ hb hb))"), SAMPLE },
+        /* a row on the null sentinel, with or without a wrap: refused */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTS})",  "(sum (+ hs ks))"), REF },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTX})",  "(sum (+ hx kq))"), REF },
+        /* serial (below the parallel threshold, no samples) */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nts})",  "(sum (+ (take h 3000) (take k 3000)))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _ntw})",  "(sum (+ hsw hsw))"), PART | PRE },
+        /* the safe range's edges: 32767 and -32767 in, -32768 out; U8 255 in, 256 wraps */
+        { NS_Q("(select {s: (sum (+ h k)) from: _nte})",  "(sum (+ he ke))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ h k)) from: _ntm})",  "(sum (+ hm km))"), REF },
+        { NS_Q("(select {s: (sum (+ u v)) from: _ntu})",  "(sum (+ ue ve))"), SCAN | PRE },
+        { NS_Q("(select {s: (sum (+ u v)) from: _ntv})",  "(sum (+ uo vo))"), PART | PRE },
+        { NS_Q("(select {s: (sum (+ i j)) from: _nti})",  "(sum (+ ie je))"), SCAN | PRE },
+        /* a nullable base: the affine plan proves the non-null rows; the
+         * linear plan never takes a nullable term (no proof is tried) */
+        { NS_Q("(select {s: (sum (+ h 1h)) from: _nTN})", "(sum (+ hn 1h))"), SCAN },
+        { NS_Q("(select {s: (sum (+ h k)) from: _nTN})",  "(sum (+ hn k))"),  0 },
+        /* a nullable column the linear form drops (zero coefficient): no plan */
+        { NS_Q("(select {s: (avg (+ v (- i i))) from: _ntc})", "(avg (+ vc (- ic ic)))"), 0 },
+        { NS_Q("(select {s: (sum (+ v (* i 0i))) from: _ntc})", "(sum (+ vc (* ic 0i)))"), 0 },
+        { NS_Q("(select {s: (sum (- 7i (* i 0i))) from: _ntc})", "(sum (- 7i (* ic 0i)))"), 0 },
+        { NS_Q("(select {s: (sum (+ x (* y 0))) from: _nty})", "(sum (+ xc (* yc 0)))"), 0 },
+        { NS_Q("(select {s: (avg (+ x (- y y))) from: _nty})", "(avg (+ xc (- yc yc)))"), 0 },
+        { NS_Q("(select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: _nty})",
+               "(sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3)))"), 0 },
+        /* a narrow constant subtree that wraps: refused, per row */
+        { NS_Q("(select {s: (sum (* -12038h 0x7f)) from: _nt100})", "-2149800"), REF },
+        /* Plain I64 pair SUM accounts for sentinel hits directly, without a bounds scan. */
+        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), PRE },
+        { NULL, 0 },
+    };
+    test_result_t r = narrow_sum_run_cases(cases);
+    snprintf(cmd, sizeof cmd, "(.sys.exec \"rm -rf %s\")", dir);
+    narrow_sum_eval_ok(cmd);
+    return r;
+}
+
+/* A cancel at any dispatch of the proof pass or the scalar kernel: the
+ * query is cancelled or answers exactly, never a partial total. */
+static test_result_t test_narrow_sum_bound_cancel(void) {
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    static const char* const setup[] = {
+        "(set _cI (til 600000))",
+        "(set h (as 'I16 (- (% _cI 2001) 1000)))",
+        "(set k (as 'I16 (- (% (* _cI 7) 1999) 999)))",
+        "(set i (as 'I32 (- (% _cI 200001) 100000)))",
+        "(set j (as 'I32 (% (* _cI 7) 99991)))",
+        "(set hw (concat (take h 500001) (concat (enlist 30000h) (drop h 500002))))",
+        "(set z (- (% _cI 100003) 50001))",
+        "(set _cT (table [h k i j hw z] (list h k i j hw z)))",
+        NULL,
+    };
+    int bad = 0;
+    for (int q = 0; setup[q]; q++) if (!narrow_sum_eval_ok(setup[q])) bad++;
+    static const char* const qs[] = {
+        "(select {s: (sum (+ h k)) from: _cT})",
+        "(select {s: (avg (+ i j)) from: _cT})",
+        "(select {s: (sum (+ h 1h)) from: _cT})",
+        "(select {s: (sum (+ hw hw)) from: _cT})",
+        "(select {s: (avg (+ z 7)) from: _cT})",
+        "(select {s: (sum (* z 2)) from: _cT})",
+        "(select {s: (sum (+ (* z -6) 4)) from: _cT})",
+        NULL,
+    };
+    static const char* const ex[] = {
+        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))", "(enlist (avg (+ z 7)))", "(enlist (sum (* z 2)))",
+        "(enlist (sum (+ (* z -6) 4)))",
+    };
+    int cancelled = 0, answered = 0;
+    for (int qi = 0; qs[qi] && !bad; qi++)
+        for (int mode = 0; mode < 2; mode++)
+            for (uint32_t nth = 1; nth <= 12; nth++) {
+                ray_pool_test_cancel_at(nth, mode == 1);
+                ray_t* got = ray_eval_str(qs[qi]);
+                ray_pool_test_cancel_at(0, false);
+                ray_clear_interrupt();
+                if (!got) { bad++; continue; }
+                if (RAY_IS_ERR(got)) {
+                    if (strcmp(ray_err_code(got), "cancel") == 0) cancelled++; else bad++;
+                    ray_error_free(got);
+                    continue;
+                }
+                ray_env_set(ray_sym_intern("_cQ", 3), got);
+                ray_release(got);
+                char chk[256];
+                snprintf(chk, sizeof chk, "(all (== (at _cQ 's) %s))", ex[qi]);
+                ray_t* v = ray_eval_str(chk);
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                if (ok) answered++; else bad++;
+            }
+    ray_pool_destroy();
+    ray_pool_init_total(cores);
+    TEST_ASSERT_FMT(bad == 0, "%d bad outcomes (%d cancelled, %d answered)", bad, cancelled, answered);
+    TEST_ASSERT_TRUE(cancelled > 0 && answered > 0);
+    PASS();
 }
 
 /* ---- Group classifier owned-error versus unsupported fallback ---- */
@@ -1860,6 +2118,134 @@ static test_result_t test_eval_guid_cancel(void) {
     PASS();
 }
 
+/* Temporal +/- integer (#1302) over slices, past the parallel threshold: a
+ * slice reads through its parent as a copy of the same cells does, the
+ * answer is the same bytes and null flag, and a cancel under the dispatch
+ * answers "cancel" with nothing left allocated. */
+static test_result_t test_eval_temporal_int_slice(void) {
+    ray_t* d = ray_eval_str("(set _td (at (concat (as 'DATE (as 'I32 (- (* (% (til 131073) 7919) 271217) 1073741824))) (enlist 0Nd)) "
+                            "(+ (til 131073) (* (- 131073 (til 131073)) (as 'I64 (== 0 (% (til 131073) 1000)))))))");
+    ray_t* t = ray_eval_str("(set _tt (as 'TIME (as 'I32 (- (til 131073) 65536))))");
+    ray_t* x = ray_eval_str("(set _tx (at (concat (as 'I32 (- (* (til 131073) 543217) 7)) (enlist 0Ni)) "
+                            "(+ (til 131073) (* (- 131073 (til 131073)) (as 'I64 (== 0 (% (til 131073) 333)))))))");
+    TEST_ASSERT_TRUE(d && !RAY_IS_ERR(d) && t && !RAY_IS_ERR(t) && x && !RAY_IS_ERR(x));
+    int64_t off = 5, len = 100003;
+    TEST_ASSERT_TRUE(len >= RAY_PARALLEL_THRESHOLD);
+    ray_t* ds = ray_vec_slice(d, off, len);
+    ray_t* ts = ray_vec_slice(t, off, len);
+    ray_t* xs = ray_vec_slice(x, off, len);
+    TEST_ASSERT_TRUE(ds && !RAY_IS_ERR(ds) && (ds->attrs & RAY_ATTR_SLICE));
+    TEST_ASSERT_TRUE(ts && !RAY_IS_ERR(ts) && xs && !RAY_IS_ERR(xs));
+    ray_t* dc = ray_vec_new(RAY_DATE, len);
+    ray_t* tc = ray_vec_new(RAY_TIME, len);
+    ray_t* xc = ray_vec_new(RAY_I32, len);
+    dc->len = tc->len = xc->len = len;
+    memcpy(ray_data(dc), (int32_t*)ray_data(d) + off, (size_t)len * 4);
+    memcpy(ray_data(tc), (int32_t*)ray_data(t) + off, (size_t)len * 4);
+    memcpy(ray_data(xc), (int32_t*)ray_data(x) + off, (size_t)len * 4);
+    dc->attrs |= d->attrs & RAY_ATTR_HAS_NULLS;
+    xc->attrs |= x->attrs & RAY_ATTR_HAS_NULLS;
+    ray_t* one = ray_i64(4294967297LL);
+    for (int c = 0; c < 4; c++) {
+        ray_t* a = c == 0 ? atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs)
+                 : c == 1 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, ds, one)
+                 : c == 2 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, xs, ts)
+                 :          atomic_map_binary_op(ray_add_fn, OP_ADD, one, ts);
+        ray_t* b = c == 0 ? atomic_map_binary_op(ray_add_fn, OP_ADD, dc, xc)
+                 : c == 1 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, dc, one)
+                 : c == 2 ? atomic_map_binary_op(ray_sub_fn, OP_SUB, xc, tc)
+                 :          atomic_map_binary_op(ray_add_fn, OP_ADD, one, tc);
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b));
+        TEST_ASSERT_EQ_I(a->type, c < 2 ? RAY_DATE : RAY_TIME);
+        TEST_ASSERT_EQ_I(a->type, b->type);
+        TEST_ASSERT_EQ_I(a->len, len);
+        TEST_ASSERT_EQ_I(a->attrs & RAY_ATTR_HAS_NULLS, b->attrs & RAY_ATTR_HAS_NULLS);
+        TEST_ASSERT_TRUE(memcmp(ray_data(a), ray_data(b), (size_t)len * 4) == 0);
+        if (c == 0) {   /* a null on either side, nothing else */
+            const int32_t* o = (const int32_t*)ray_data(a);
+            const int32_t* pd = (const int32_t*)ray_data(d) + off;
+            const int32_t* px = (const int32_t*)ray_data(x) + off;
+            for (int64_t i = 0; i < len; i++) {
+                int32_t want = (pd[i] == NULL_I32 || px[i] == NULL_I32) ? NULL_I32
+                             : (int32_t)((uint32_t)pd[i] + (uint32_t)px[i]);
+                TEST_ASSERT_FMT(o[i] == want, "row %lld: %d, want %d", (long long)i, o[i], want);
+            }
+            TEST_ASSERT_TRUE(a->attrs & RAY_ATTR_HAS_NULLS);
+        }
+        ray_release(a);
+        ray_release(b);
+    }
+    /* a cancel under the dispatch */
+    if (ray_pool_get()) {
+        ray_t* w = atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs);   /* warm up */
+        TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w));
+        ray_release(w);
+        ray_mem_stats_t m0, m1;
+        ray_mem_stats(&m0);
+        ray_request_interrupt();
+        ray_t* r = atomic_map_binary_op(ray_add_fn, OP_ADD, ds, xs);
+        bool still = ray_interrupted();
+        ray_clear_interrupt();
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+        TEST_ASSERT_TRUE(still);
+        ray_error_free(r);
+        ray_error_clear();
+        ray_mem_stats(&m1);
+        TEST_ASSERT_FMT(m1.bytes_allocated == m0.bytes_allocated,
+                        "%zu bytes before, %zu after", m0.bytes_allocated, m1.bytes_allocated);
+    }
+    ray_release(one);
+    ray_release(dc); ray_release(tc); ray_release(xc);
+    ray_release(ds); ray_release(ts); ray_release(xs);
+    ray_release(d); ray_release(t); ray_release(x);
+    PASS();
+}
+
+#ifdef DEBUG
+static test_result_t test_eval_narrow_left_route(void) {
+    static const struct { const char* src; int8_t type; bool typed; } cases[] = {
+        { "(- 5i [1i 8i])", RAY_I32, true }, { "(- 5h [1h 8h])", RAY_I16, true },
+        { "(+ 5i [1i 8i])", RAY_I32, true }, { "(* 5h [1h 8h])", RAY_I16, true },
+        { "(- 5h [1i 8i])", RAY_I32, false }, { "(- 5 [1i 8i])", RAY_I64, false },
+        { "(- 0Ni [1i 8i])", RAY_I32, false },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        uint64_t before = atomic_load_explicit(&ray_narrow_left_ranges, memory_order_relaxed);
+        ray_t* r = ray_eval_str(cases[k].src);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == cases[k].type, "%s: type", cases[k].src);
+        ray_release(r);
+        bool hit = atomic_load_explicit(&ray_narrow_left_ranges, memory_order_relaxed) != before;
+        TEST_ASSERT_FMT(hit == cases[k].typed, "%s: typed scalar-left route = %d", cases[k].src, hit);
+    }
+    PASS();
+}
+#endif
+
+/* The typed temporal +/- integer pass (#1302) answers the vector forms, and
+ * nothing else: ray_tempint_routes moves once per vector it answers. */
+static test_result_t test_eval_temporal_int_route(void) {
+    static const struct { const char* src; uint64_t moves; } cases[] = {
+        { "(+ (as 'DATE (til 100)) 1)", 1 },          { "(- (as 'TIME (til 100)) 1i)", 1 },
+        { "(+ 2h (as 'TIMESTAMP (til 100)))", 1 },    { "(- (til 100) (as 'TIME (til 100)))", 1 },
+        { "(+ 2024.01.01 (til 100))", 1 },            { "(+ (as 'DATE (til 100)) 0Nl)", 1 },
+        { "(+ (til 100) 1)", 0 },                     { "(- (as 'DATE (til 100)) (as 'DATE (til 100)))", 0 },
+        { "(+ (as 'TIME (til 100)) (- 00:00:01.000 00:00:00.000))", 0 },{ "(+ 2024.01.01 1)", 0 },
+        { "(try (- (til 100) (as 'DATE (til 100))) 0)", 0 },
+        { "(try (+ (as 'DATE (til 100)) 1.5) 0)", 0 },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        uint64_t before = atomic_load_explicit(&ray_tempint_routes, memory_order_relaxed);
+        ray_t* r = ray_eval_str(cases[k].src);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: failed", cases[k].src);
+        ray_release(r);
+        uint64_t moved = atomic_load_explicit(&ray_tempint_routes, memory_order_relaxed) - before;
+        TEST_ASSERT_FMT(moved == cases[k].moves, "%s: the pass ran %llu times, want %llu",
+                        cases[k].src, (unsigned long long)moved, (unsigned long long)cases[k].moves);
+    }
+    PASS();
+}
+
 /* ---- Test: except ---- */
 static test_result_t test_eval_except(void) {
     ray_t* result = ray_eval_str("(except [1 2 3] [2])");
@@ -2447,7 +2833,7 @@ static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
         }
     }
     static const char* const other[] = {
-        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1)", "(* t 2)", "(pow ts 2)",
+        "(% 2024.01.01 2)", "(/ d 2)", "(div d 2)", "(+ d 1.5)", "(* t 2)", "(pow ts 2)",
     };
     for (size_t k = 0; k < sizeof other / sizeof *other; k++) {
         ray_t* expr = ray_parse(other[k]);
@@ -2460,6 +2846,79 @@ static test_result_t test_eval_select_temporal_mod_dag_admission(void) {
         ray_graph_free(g);
         ray_release(expr);
     }
+    ray_release(tbl);
+    PASS();
+}
+
+/* ---- Test: temporal +/- an integer lowers to the DAG (#1302) ----
+ * The builtin answers the raw count plus the offset wrapped to the temporal
+ * lane; the integer + / - computes the same in the lane's width, so
+ * compile_expr_dag lowers it to ADD / SUB cast back to the temporal type:
+ * any integer beside a TIMESTAMP, an I32 or narrower column or any non-null
+ * integer literal beside a DATE or TIME (an I64 literal by its low 32 bits),
+ * + in either order and int - TIME.  An I64 column beside a DATE or TIME
+ * (planned in I64, whose own sentinel would come first), a literal whose low
+ * 32 bits are the I32 null, a null or float literal, int - DATE / TIMESTAMP
+ * (an error) and a temporal literal decline (NULL) to the builtin. */
+static test_result_t test_eval_select_temporal_int_dag_admission(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [d t ts i h b u l] (list [2024.01.01 2024.01.02] "
+        "[10:00:00.000 11:00:00.000] "
+        "[2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000] "
+        "(as 'I32 [2 3]) (as 'I16 [2 3]) (as 'B8 [1 0]) (as 'U8 [2 3]) [2 3]))");
+    TEST_ASSERT_TRUE(tbl && !RAY_IS_ERR(tbl));
+    static const struct { const char* src; int8_t type; uint16_t op; } lowers[] = {
+        { "(+ d 2)", RAY_DATE, OP_ADD },         { "(- d 2i)", RAY_DATE, OP_SUB },
+        { "(+ 2h d)", RAY_DATE, OP_ADD },        { "(+ d i)", RAY_DATE, OP_ADD },
+        { "(- d h)", RAY_DATE, OP_SUB },         { "(+ b d)", RAY_DATE, OP_ADD },
+        { "(+ d 5000000000)", RAY_DATE, OP_ADD },{ "(- t u)", RAY_TIME, OP_SUB },
+        { "(- i t)", RAY_TIME, OP_SUB },         { "(- 5 t)", RAY_TIME, OP_SUB },
+        { "(+ ts l)", RAY_TIMESTAMP, OP_ADD },   { "(- ts i)", RAY_TIMESTAMP, OP_SUB },
+        { "(+ 1000 ts)", RAY_TIMESTAMP, OP_ADD },{ "(+ (+ d 1) i)", RAY_DATE, OP_ADD },
+    };
+    /* ... and is read only by another such pair or an `if` over arms of
+     * its type (dag_temporal_int_readers_ok): any other reader declines, as
+     * the builtin pair did before it lowered */
+    static const char* const declines[] = {
+        "(+ d l)", "(- t l)", "(+ l t)", "(+ d 2147483648)", "(+ d 0N)", "(+ d 2.5)",
+        "(- 5 d)", "(- i ts)", "(+ 2024.01.01 i)", "(+ d d)", "(* d 2)",
+        "(+ d (+ i 1i))", "(- (+ i 1i) t)", "(+ ts (+ l 1))", "(+ d (as 'I32 l))", "(+ (xbar d 7) 1)",
+        "(nil? (+ d 1))", "(== (+ d 1) d)", "(as 'I64 (+ ts 1))", "(sum (+ t 1))",
+        "(if (> i 2) d (+ t 1))", "(if (> i 2) (+ d 1) ts)", "(if (> i 2) (+ d 1) 0Nd)",
+        "(cond ((> i 2) (+ d 1)) (else d))", "(xbar (+ d 1) 7)", "(nil? (if (> i 2) d (+ d 1)))",
+    };
+    for (size_t k = 0; k < sizeof lowers / sizeof *lowers + sizeof declines / sizeof *declines; k++) {
+        bool want = k < sizeof lowers / sizeof *lowers;
+        const char* src = want ? lowers[k].src : declines[k - sizeof lowers / sizeof *lowers];
+        ray_t* expr = ray_parse(src);
+        TEST_ASSERT_TRUE(expr && !RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        TEST_ASSERT_FMT((op != NULL) == want, "%s: lowered=%d, want %d", src, op != NULL, want);
+        if (op) {
+            TEST_ASSERT_FMT(op->opcode == OP_CAST && op->out_type == lowers[k].type,
+                            "%s: opcode %d out_type %d", src, (int)op->opcode, (int)op->out_type);
+            TEST_ASSERT_TRUE(op->flags & OP_FLAG_TEMPORAL_INT);
+            ray_op_t* m = &g->nodes[op->in_id[0]];
+            TEST_ASSERT_FMT(m->opcode == lowers[k].op, "%s: input opcode %d", src, (int)m->opcode);
+            /* a DATE / TIME sum is planned in I32, where it wraps as the builtin's */
+            if (lowers[k].type != RAY_TIMESTAMP)
+                TEST_ASSERT_FMT(m->out_type == RAY_I32, "%s: planned %d", src, (int)m->out_type);
+        }
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    /* an `if` whose arms are both of the pair's type stands for it */
+    ray_t* expr = ray_parse("(if (> i 2) d (+ d 1))");
+    TEST_ASSERT_TRUE(expr && !RAY_IS_ERR(expr));
+    ray_graph_t* g = ray_graph_new(tbl);
+    TEST_ASSERT_NOT_NULL(g);
+    ray_op_t* op = compile_expr_dag(g, expr);
+    TEST_ASSERT_TRUE(op && op->opcode == OP_IF && op->out_type == RAY_DATE &&
+                     (op->flags & OP_FLAG_TEMPORAL_INT));
+    ray_graph_free(g);
+    ray_release(expr);
     ray_release(tbl);
     PASS();
 }
@@ -2685,10 +3144,58 @@ static test_result_t test_eval_select_global_scalar(void) {
     PASS();
 }
 
+/* pivot's first / last of a value column that may hold a null run as one
+ * OP_PIVOT over row numbers (#1420), not per cell on the generic route: the
+ * same answers, ~40x faster at 200k rows.  Pinned by the route's counter. */
+static test_result_t test_eval_pivot_edge_by_row(void) {
+    static const char* const q[] = {
+        "(pivot t 'k 'p 'v first)", "(pivot t 'k 'p 'v last)", "(pivot t 'k 'p 's first)", "(pivot t 'k 'p 'f last)", NULL };
+    ray_t* setup = ray_eval_str("(set t (table [k p v s f] (list (% (til 200000) 100) (at [x y] (% (til 200000) 2)) "
+                                "(concat [0Nl] (til 199999)) (at (as 'SYM [\"a\" \"\"]) (% (til 200000) 3)) "
+                                "(concat (as 'F64 (til 199999)) [0Nf]))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    for (int i = 0; q[i]; i++) {
+        int64_t before = ray_pivot_test_by_row();
+        ray_t* r = ray_eval_str(q[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE);
+        TEST_ASSERT_FMT(ray_pivot_test_by_row() == before + 1, "%s did not run over row numbers", q[i]);
+        ray_release(r);
+    }
+    PASS();
+}
+
 /* Multi-index pivot with mixed-type composite key: (sym, i64) index,
  * sym pivot col, i64 value col.  Regression against an older bug where
  * composite-key grouping dropped or duplicated rows.  Verify each
  * cell is the correct sum for its (a, b, c) combination. */
+/* window min / max of SYM rank the column's own distinct ids (#1447): with
+ * many symbols interned, a 2-row window's rank map stays small, not one slot
+ * per symbol in the process. */
+static test_result_t test_eval_window_sym_rank_map_small(void) {
+    ray_t* r = ray_eval_str("(do (set many (as 'SYM (map (fn [j] (format \"rk1447_%\" j)) (til 200000)))) "
+                            "(set T (table [k i s] (list [a a] [0 1] (at many [199999 199998])))) "
+                            "(at (window {from: T part: [k] order: [i] funcs: {x: (min s) y: (max s)}}) 'x))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_SYM && r->len == 2);
+    ray_release(r);
+    TEST_ASSERT_FMT(ray_window_test_rank_slots() <= 4096, "rank map of %lld slots for a 2-row window",
+                    (long long)ray_window_test_rank_slots());
+    ray_t* ok = ray_eval_str("(== (at (window {from: T part: [k] order: [i] funcs: {x: (min s)}}) 'x) (as 'SYM [\"rk1447_199998\" \"rk1447_199998\"]))");
+    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
+    TEST_ASSERT_TRUE(ok->type == RAY_BOOL && ((bool*)ray_data(ok))[0] && ((bool*)ray_data(ok))[1]);
+    ray_release(ok);
+    /* 3000 rows of the newest symbols: the hash grows past its first 1024
+     * slots, and min / max agree with by:'s */
+    ray_t* big = ray_eval_str("(do (set n 3000) (set B (table [k i s] (list (% (til n) 37) (til n) (at many (- 199999 (% (* 7919 (til n)) 5000)))))) "
+                              "(and (identical (at (window {from: B part: [k] order: [i] funcs: {x: (min s)}}) 'x) (at (at (select {m: (min s) from: B by: k asc: k}) 'm) (at B 'k))) "
+                              "(identical (at (window {from: B part: [k] order: [i] funcs: {x: (max s)}}) 'x) (at (at (select {m: (max s) from: B by: k asc: k}) 'm) (at B 'k)))))");
+    TEST_ASSERT_TRUE(big && !RAY_IS_ERR(big) && big->type == -RAY_BOOL && big->b8);
+    ray_release(big);
+    TEST_ASSERT_FMT(ray_window_test_rank_slots() > 1024 && ray_window_test_rank_slots() <= 16384,
+                    "rank map of %lld slots for 3000 rows", (long long)ray_window_test_rank_slots());
+    PASS();
+}
+
 static test_result_t test_eval_pivot_multi_index(void) {
     ray_t* r = ray_eval_str(
         "(do (set t (table [a b c v] (list "
@@ -4785,6 +5292,39 @@ static test_result_t test_eval_select_parted_stats_impl(const char* root) {
         TEST_ASSERT_EQ_U(parts1 - parts0, cases[i].pruned);
     }
 
+    /* A name bound to a constant prunes as the constant written out does:
+     * a global, a `let`, a lambda's argument; an atom anywhere, a typed
+     * vector as the set of an `in`.  A name beside a literal conjunct does
+     * not cost that conjunct its pruning.  A vector compared by position
+     * is no constant: nothing is pruned, the rows still line up. */
+    struct { const char* src; const char* want; uint64_t pruned; } bound[] = {
+        { "(do (set lo 2024.01.16D12:00:00.000) (at (select {from: p where: (>= Time lo)}) 'v))", "[5 6]", 1 },
+        { "(do (let hi 2024.01.15D20:00:00.000) (at (select {from: p where: (<= Time hi)}) 'v))", "[1 2 4]", 1 },
+        { "((fn [t] (at (select {from: p where: (> Time t)}) 'v)) 2024.01.17D00:30:00.000)", "[6]", 2 },
+        { "(do (set ts [2024.01.15D20:00:00.000 2024.01.17D01:00:00.000]) (at (select {from: p where: (in Time ts)}) 'v))", "[2 6]", 1 },
+        { "(do (let vs [6 1]) (at (select {from: p where: (and (> Time 2024.01.17D00:30:00.000) (in v vs))}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.17) (at (select {from: p where: (== date d)}) 'v))", "[6]", 2 },
+        { "(do (let d 2024.01.16) (let vs [3 5 6]) (at (select {from: p where: (and (>= date d) (in v vs))}) 'v))", "[3 5 6]", 1 },
+        { "(do (set vv [1 0 3 0 5 6]) (at (select {from: p where: (and (> Time 2024.01.15D12:00:00.000) (== v vv))}) 'v))", "[3 5 6]", 0 },
+    };
+    for (size_t i = 0; i < sizeof bound / sizeof bound[0]; i++) {
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        ray_t* r = ray_eval_str(bound[i].src);
+        TEST_ASSERT_NOT_NULL(r);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_t* want = ray_eval_str(bound[i].want);
+        TEST_ASSERT_NOT_NULL(want);
+        TEST_ASSERT_EQ_I(r->len, want->len);
+        for (int64_t k = 0; k < r->len; k++)
+            TEST_ASSERT_EQ_I(((int64_t*)ray_data(r))[k], ((int64_t*)ray_data(want))[k]);
+        ray_release(r);
+        ray_release(want);
+        ray_query_test_part_prune(&runs1, &parts1);
+        TEST_ASSERT_EQ_U(runs1 - runs0, bound[i].pruned ? 1 : 0);
+        TEST_ASSERT_EQ_U(parts1 - parts0, bound[i].pruned);
+    }
+
     /* The same answers as the plain scan: the count fast path and a sum. */
     ray_t* r = ray_eval_str("(count (select {from: p where: (< Time 2024.01.15D12:00:00.000)}))");
     TEST_ASSERT_NOT_NULL(r);
@@ -4876,6 +5416,95 @@ static test_result_t test_eval_select_parted_stats_absent(void) {
     test_result_t result = test_eval_select_parted_stats_absent_impl(root);
     lang_parted_insert_rm_rf(root);
     return result;
+}
+
+/* ---- Test: an if answers the same with and without pool workers -------- */
+
+/* With no workers the selected arm of OP_IF (compact each branch's rows,
+ * scatter back) runs only under a sparse where; otherwise the eager fill,
+ * typed when both sides already hold the output's cells.  Every shape must
+ * give the same bytes at one worker as at four. */
+static test_result_t test_eval_if_workers_same(void) {
+    static const char* const qs[] = {
+        "(select {from: wt r: (if (> i 50) i j)})",
+        "(select {from: wt r: (if (> i 50) i 0N)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) 7 i)})",
+        "(select {from: wt where: (> j 5) r: (if (> i 50) i 0)})",
+        "(select {from: wt r: (if (> x 5.0) x 0N) s: (if (> x 5.0) 1.5 x)})",
+        "(select {from: wt where: (> j -6) r: (if (> x 5.0) x y)})",
+        "(select {from: wt r: (if (> i 5) d 0Nd) s: (if (> i 5) d e)})",
+        "(select {from: wt r: (if (> i 5) h (as 'I32 1)) s: (if (> i 5) h i)})",
+        "(select {from: wt r: (if (> i 5) sp 00:00:01.000) s: (if (> i 5) ts 2020.01.01D00:00:00.000)})",
+        "(select {from: wt r: (if (> i 5) i sp)})",
+        "(select {from: wt r: (if (> i 5) x i)})",
+        "(select {from: wt where: (> j -5) r: (if (> i 50) s 'none) t: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j 4) r: (if (> i 50) str \"no\")})",
+        "(select {from: wt where: (> j -5) by: s r: (sum (if (> i 50) i 0)) q: (sum (if (> x 5.0) x 0.0))})",
+    };
+    enum { NQ = sizeof qs / sizeof qs[0] };
+    ray_t* setup = ray_eval_str(
+        "(do (set N 200000)"
+        " (set wt (table ['i 'j 'x 'y 'd 'e 'h 'sp 'ts 's 'str]"
+        "  (list (% (til N) 97) (- (% (til N) 13) 6) (* 0.5 (as 'F64 (% (til N) 50))) (as 'F64 (% (til N) 7))"
+        "   (+ 2024.01.01 (% (til N) 30)) (+ 2025.01.01 (% (til N) 11)) (as 'I32 (% (til N) 33))"
+        "   (as 'TIMESPAN (* 1000000 (% (til N) 9))) (+ 2024.01.01D00:00:00.000 (% (til N) 1000))"
+        "   (take ['a 'b 'c] N) (take [\"p\" \"qq\" \"rrr\"] N))))"
+        " (set wt (update {from: wt i: (if (== (% i 10) 0) 0N i) x: (if (== (% i 7) 0) 0N x)})) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_t* ser[2][NQ] = {{ NULL }};
+    static const uint32_t totals[2] = { 1, 4 };
+    for (int w = 0; w < 2; w++) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(totals[w]), RAY_OK);
+        for (int q = 0; q < NQ; q++) {
+            char src[1024];
+            snprintf(src, sizeof src, "(ser (try %s (fn [e] e)))", qs[q]);
+            ser[w][q] = ray_eval_str(src);
+        }
+    }
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
+    /* Values, against the interpreter's if row by row: scalar and column
+     * sides of the typed fills, F64 beside I64 (j has no nulls: #1279). */
+    static const char* const vals[] = {
+        "(if (> x 5.0) x 1.5)", "(if (> x 5.0) -2.5 x)", "(if (> x 5.0) 0.25 -0.5)",
+        "(if (> x 5.0) x j)", "(if (> x 5.0) j x)", "(if (> x 5.0) j 0.5)", "(if (> x 5.0) 0.5 j)",
+        "(if (> i 50) i -7)", "(if (> i 50) 9 j)", "(if (> i 50) d 2020.01.01)",
+    };
+    for (size_t v = 0; v < sizeof vals / sizeof vals[0]; v++) {
+        char src[1024];
+        snprintf(src, sizeof src,
+                 "(do (set ws (take wt 20000))"
+                 " (set got (at (select {from: ws r: %s}) 'r))"
+                 " (set wI (at ws 'i)) (set wJ (at ws 'j)) (set wX (at ws 'x)) (set wD (at ws 'd))"
+                 " (set want (map (fn [k] (do (let i (at wI k)) (let j (at wJ k)) (let x (at wX k))"
+                 "  (let d (at wD k)) %s)) (til (count ws))))"
+                 /* mixed branches: the interpreter's atoms form a list */
+                 " (if (== (type want) 'LIST) (set want (as (type got) want)) 0)"
+                 " (and (== (type got) (type want)) (all (== got want))))", vals[v], vals[v]);
+        ray_t* ok = ray_eval_str(src);
+        bool good = ok && !RAY_IS_ERR(ok) && ok->type == -RAY_BOOL && ok->b8;
+        if (ok) { if (RAY_IS_ERR(ok)) ray_error_free(ok); else ray_release(ok); }
+        TEST_ASSERT_FMT(good, "if values differ from the interpreter: %s", vals[v]);
+    }
+    test_result_t res = { TEST_PASS, NULL };
+    for (int q = 0; q < NQ; q++) {
+        ray_t* a = ser[0][q];
+        ray_t* b = ser[1][q];
+        bool same = a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) &&
+                    a->type == b->type && a->len == b->len &&
+                    memcmp(ray_data(a), ray_data(b), (size_t)a->len) == 0;
+        if (!same && res.status == TEST_PASS) {
+            static char msg[256];
+            snprintf(msg, sizeof msg, "worker counts disagree: %s", qs[q]);
+            res = (test_result_t){ TEST_FAIL, msg };
+        }
+        if (a) { if (RAY_IS_ERR(a)) ray_error_free(a); else ray_release(a); }
+        if (b) { if (RAY_IS_ERR(b)) ray_error_free(b); else ray_release(b); }
+    }
+    return res;
 }
 
 static test_result_t test_eval_select_parted_stats(void) {
@@ -6035,8 +6664,9 @@ static test_result_t test_eval_insert_parted_inplace_text_nulls_impl(const char*
 
     ASSERT_EQ("(count (select {from: pn where: (nil? acct)}))", "1");
     ASSERT_EQ("(count (select {from: pn where: (nil? note)}))", "1");
-    ASSERT_EQ("(nil? (at (at (select {m: (first (asc acct)) from: pn}) 'm) 0))", "true");
-    ASSERT_EQ("(at (select {n: (first (asc note)) from: pn}) 'n)", "[\"\"]");
+    /* the sorted column leads with the nulls (a select's first skips them) */
+    ASSERT_EQ("(nil? (first (at (select {m: (asc acct) from: pn}) 'm)))", "true");
+    ASSERT_EQ("(first (at (select {n: (asc note) from: pn}) 'n))", "\"\"");
     PASS();
 }
 
@@ -11042,7 +11672,8 @@ static test_result_t test_builtin_within_fn(void) {
 }
 
 /* ── builtins.c coverage: ray_idiv_fn ───────────────────────────────────────
- * ray_idiv_fn always returns I64, handles zero-div and nulls. */
+ * ray_idiv_fn takes the promotion table's type (#972): F64 over floats,
+ * handles zero-div and nulls. */
 static test_result_t test_builtin_idiv_fn(void) {
     /* Normal division: floor(7.0 / 2.0) = 3 */
     ray_t* a = ray_f64(7.0);
@@ -11050,8 +11681,8 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r = ray_idiv_fn(a, b);
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
-    TEST_ASSERT_EQ_I(r->type, -RAY_I64);
-    TEST_ASSERT_EQ_I(r->i64, 3);
+    TEST_ASSERT_EQ_I(r->type, -RAY_F64);
+    TEST_ASSERT_TRUE(r->f64 == 3.0);
     ray_release(r);
     ray_release(a);
     ray_release(b);
@@ -11062,7 +11693,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r2 = ray_idiv_fn(c, z);
     TEST_ASSERT_NOT_NULL(r2);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r2));
-    TEST_ASSERT_EQ_I(r2->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r2->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r2));
     ray_release(r2);
     ray_release(c);
@@ -11074,7 +11705,7 @@ static test_result_t test_builtin_idiv_fn(void) {
     ray_t* r3 = ray_idiv_fn(tn, d);
     TEST_ASSERT_NOT_NULL(r3);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r3));
-    TEST_ASSERT_EQ_I(r3->type, -RAY_I64);
+    TEST_ASSERT_EQ_I(r3->type, -RAY_F64);
     TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r3));
     ray_release(r3);
     ray_release(tn);
@@ -11369,7 +12000,8 @@ static test_result_t test_builtin_within_rfl(void) {
 /* ── builtins.c coverage: ray_idiv_fn via rfl ───────────────────────────────
  * Covers the div builtin (integer floor division). */
 static test_result_t test_builtin_idiv_rfl(void) {
-    ASSERT_EQ("(div 7.0 2.0)", "3");
+    ASSERT_EQ("(div 7.0 2.0)", "3.0");
+    ASSERT_EQ("(div 7 2)", "3");
     PASS();
 }
 
@@ -12988,8 +13620,218 @@ static test_result_t test_dotted_local_read_slot(void) {
     PASS();
 }
 
+/* ---- Call profiler: every timed call closes its frame ---- */
+/* An error leaves a timed call by its normal return (the VM and the tree
+ * walker test for errors after the callee returns), so the frame stack is
+ * empty after each top-level expression, whatever failed inside it: a
+ * builtin's error in compiled code, caught or not, one inside a lambda run
+ * by map, one at top level, and a call that switched profiling off or
+ * reset it while frames were open. */
+static test_result_t test_callprof_error_unwinds(void) {
+    static const char* const setup[] = {
+        "(set pe-bad (fn [x] (+ x 'a)))",
+        "(set pe-map (fn [v] (map (fn [y] (+ y 'a)) v)))",
+        "(set pe-try (fn [x] (try (pe-bad x) 0)))",
+        "(set pe-deep (fn [x] (sum (map pe-try (til x)))))",
+        "(set pe-off (fn [] (.sys.profile.enable 0) (+ 1 2)))",
+        "(set pe-reset (fn [] (.sys.profile.reset) (map (fn [y] (+ y 1)) [1 2])))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    static const struct { const char* src; bool err; } runs[] = {
+        { "(pe-bad 1)",          true  },
+        { "(pe-map [1 2])",      true  },
+        { "(map pe-bad [1 2])",  true  },
+        { "(pe-try 1)",          false },
+        { "(pe-deep 4)",         false },
+        { "(+ 1 'a)",            true  },
+        { "(raise 'boom)",       true  },
+        { "(pe-reset)",          false },
+        { "(pe-off)",            false },
+    };
+    for (size_t i = 0; i < sizeof runs / sizeof *runs; i++) {
+        ray_callprof_set_enabled(true);
+        TEST_ASSERT_TRUE(ray_callprof_on());
+        ray_t* r = ray_eval_str(runs[i].src);
+        TEST_ASSERT_EQ_I(RAY_IS_ERR(r) ? 1 : 0, runs[i].err ? 1 : 0);
+        if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
+        TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    }
+    /* An erroring call is still counted at its site: from scratch, pe-deep
+     * reaches pe-bad's `+` once per element, each error caught by pe-try. */
+    ray_callprof_set_enabled(false);
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    ray_t* r = ray_eval_str("(pe-deep 4)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+    r = ray_eval_str("(sum (at (select {from: (.sys.profile) where: (== fn 'pe-bad)}) 'calls))");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 4);
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_callprof_depth(), 0);
+    PASS();
+}
+
+/* Rows of (.sys.profile), and the calls of the rows named `fn`. */
+static int64_t cp_rows(void) {
+    ray_t* r = ray_eval_str("(count (.sys.profile))");
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+static int64_t cp_calls(const char* fn) {
+    char q[256];
+    snprintf(q, sizeof q, "(sum (at (select {from: (.sys.profile) where: (== fn '%s)}) 'calls))", fn);
+    ray_t* r = ray_eval_str(q);
+    int64_t n = r && !RAY_IS_ERR(r) ? r->i64 : -1;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return n;
+}
+
+/* Every text request is a fresh parse.  Top-level sites are source
+ * positions, so repeats aggregate into the rows they had, the cap stays
+ * free for the sites that follow, and no request's parse tree outlives it. */
+static test_result_t test_callprof_repeated_requests(void) {
+    static const char* const setup[] = {
+        "(set rq-work (fn [x] (+ x 1)))",
+        "(set rq-later (fn [x] (* x 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    int64_t n = RAY_CALLPROF_SITES_MAX + 200;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* r = ray_eval_str("(rq-work 10)");
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    /* A large literal per request: kept by nothing once it has run. */
+    char big[8192];
+    int len = snprintf(big, sizeof big, "(count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(big + len, sizeof big - (size_t)len, "%d ", i);
+    snprintf(big + len, sizeof big - (size_t)len, "])");
+    ray_t* r = ray_eval_str(big);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_mem_stats_t ms;
+    ray_mem_stats(&ms);
+    size_t mem0 = ms.bytes_allocated;
+    for (int i = 0; i < 300; i++) {
+        r = ray_eval_str(big);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->i64, 1000);
+        ray_release(r);
+    }
+    ray_mem_stats(&ms);
+    TEST_ASSERT_TRUE(ms.bytes_allocated < mem0 + 64 * 1024);
+    /* A lambda written in the request is compiled anew each time: its
+     * calls are one site all the same, and the profile pins none of its
+     * code.  (Requests that make lambdas retain some memory profiled or
+     * not: the bound is on what profiling adds.) */
+    char lam[8192];
+    len = snprintf(lam, sizeof lam, "((fn [] (count [");
+    for (int i = 0; i < 1000; i++) len += snprintf(lam + len, sizeof lam - (size_t)len, "%d ", i);
+    snprintf(lam + len, sizeof lam - (size_t)len, "])))");
+    int64_t grow[2];
+    for (int on = 0; on < 2; on++) {
+        ray_callprof_set_enabled(on);
+        ray_mem_stats(&ms);
+        mem0 = ms.bytes_allocated;
+        for (int i = 0; i < 1000; i++) {
+            r = ray_eval_str(lam);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+            TEST_ASSERT_EQ_I(r->i64, 1000);
+            ray_release(r);
+        }
+        ray_mem_stats(&ms);
+        grow[on] = (int64_t)ms.bytes_allocated - (int64_t)mem0;
+    }
+    TEST_ASSERT_TRUE(grow[1] < grow[0] + 512 * 1024);
+    r = ray_eval_str("(rq-later 5)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_callprof_set_enabled(false);
+
+    /* One row per callee at top level, every call counted: the requests'
+     * outermost calls share line 1 of `repl`, the callee tells them apart.
+     * The lambda requests' head is no name: one `<top>` row by their text,
+     * and one for the `fn` form inside.  rq-work's `+`, rq-later's `*` and
+     * the request lambda's `count` keep rows of their own; nothing folds
+     * into `<other>`. */
+    TEST_ASSERT_EQ_I(cp_rows(), 8);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("<top>count"), 301);
+    TEST_ASSERT_EQ_I(cp_calls("<top>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>fn"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<top>rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("rq-work"), n);
+    TEST_ASSERT_EQ_I(cp_calls("rq-later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<lambda@1>"), 1000);
+    TEST_ASSERT_EQ_I(cp_calls("<other>"), 0);
+    ray_callprof_reset();
+    PASS();
+}
+
+/* REPL lines and IPC requests are separate parses, each from line 1 column
+ * 1 of `repl`: different calls there are different rows, and so are
+ * lambdas defined on different lines at the same column. */
+static test_result_t test_callprof_repl_calls(void) {
+    static const char* const setup[] = {
+        "(set work (fn [n] (+ n 1)))",
+        "(set later (fn [n] (* n 2)))",
+        "(set wa (fn [n] (+ n 1)))",
+        "(set wb (fn [n] (* n 2)))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_reset();
+    ray_callprof_set_enabled(true);
+    static const char* const lines[] = {
+        "(work 10)", "(work 10)", "(later 5)", "(neg 3)", "(wa 1)", "(wa 2)", "(wb 3)",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof *lines; i++) {
+        ray_t* r = ray_eval_str(lines[i]);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        ray_release(r);
+    }
+    ray_callprof_set_enabled(false);
+    TEST_ASSERT_EQ_I(cp_rows(), 9);
+    TEST_ASSERT_EQ_I(cp_calls("<top>work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>neg"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("<top>wb"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("work"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("later"), 1);
+    TEST_ASSERT_EQ_I(cp_calls("wa"), 2);
+    TEST_ASSERT_EQ_I(cp_calls("wb"), 1);
+    ray_callprof_reset();
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
+    { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
+#ifdef DEBUG
+    { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
+#endif
+    { "lang/query/narrow_sum_bound_routes", test_narrow_sum_bound_routes, lang_setup, lang_teardown },
+    { "lang/query/narrow_sum_bound_cancel", test_narrow_sum_bound_cancel, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },
     { "lang/env/write_index_lifecycle", test_env_write_index_lifecycle, lang_setup, lang_teardown },
     { "lang/env/write_index_flags_capacity", test_env_write_index_flags_and_capacity, lang_setup, lang_teardown },
@@ -13062,6 +13904,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },
+    { "lang/eval/temporal_int_slice", test_eval_temporal_int_slice, lang_setup, lang_teardown },
+    { "lang/eval/temporal_int_route", test_eval_temporal_int_route, lang_setup, lang_teardown },
     { "lang/eval/except", test_eval_except, lang_setup, lang_teardown },
     { "lang/eval/union", test_eval_union, lang_setup, lang_teardown },
     { "lang/eval/sect", test_eval_sect, lang_setup, lang_teardown },
@@ -13083,6 +13927,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_temporal_int_dag_admission", test_eval_select_temporal_int_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/empty_probe_error_ownership", test_eval_empty_probe_error_ownership, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_i64", test_eval_select_where_in_i64, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_mixed_numeric", test_eval_select_where_in_mixed_numeric, lang_setup, lang_teardown },
@@ -13091,6 +13936,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym_vs_atom_mismatch", test_eval_select_where_in_sym_vs_atom_mismatch, lang_setup, lang_teardown },
     { "lang/eval/select_where_eq_null_literal", test_eval_select_where_eq_null_literal, lang_setup, lang_teardown },
     { "lang/eval/pivot_multi_index", test_eval_pivot_multi_index, lang_setup, lang_teardown },
+    { "lang/eval/window_sym_rank_map_small", test_eval_window_sym_rank_map_small, lang_setup, lang_teardown },
+    { "lang/eval/pivot_edge_by_row", test_eval_pivot_edge_by_row, lang_setup, lang_teardown },
     { "lang/eval/select_named_lambda", test_eval_select_named_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_recursive_self_lambda", test_eval_select_recursive_self_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_global_scalar", test_eval_select_global_scalar, lang_setup, lang_teardown },
@@ -13151,6 +13998,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/insert_guid", test_eval_insert_guid, lang_setup, lang_teardown },
     { "lang/eval/insert_positional_errors", test_eval_insert_positional_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_e2e", test_eval_insert_parted_e2e, lang_setup, lang_teardown },
+    { "lang/eval/if_workers_same", test_eval_if_workers_same, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },

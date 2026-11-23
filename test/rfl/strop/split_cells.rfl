@@ -1,0 +1,69 @@
+;; split over a collection of strings (#1149).  With a string delimiter a
+;; STR or SYM vector, or a list of string or symbol atoms, splits each
+;; element: one list of parts per element, the parts the element splits into
+;; as an atom.  It raised `type: split: expected str or sym input, got STR`.
+
+;; The issue
+(split ["a b" "c d e"] " ") -- (list (list "a" "b") (list "c" "d" "e"))
+(split ["a,b" "c"] ",") -- (list (list "a" "b") (list "c"))
+
+;; Each element is split as the atom is, into a list of string atoms
+(type (first (split ["a b"] " "))) -- (type (split "a b" " "))
+(type (first (first (split ["a b"] " ")))) -- (type "a")
+(set V ["a,b" "" "c" ",x," "a,,b"])
+(split V ",") -- (map (fn [x] (split x ",")) V)
+(split V "--") -- (map (fn [x] (split x "--")) V)
+(split ["a--b--c" "--"] "--") -- (list (list "a" "b" "c") (list "" ""))
+;; an empty delimiter, or one longer than the element, leaves it whole
+(split ["abc" "d"] "") -- (list (list "abc") (list "d"))
+(split ["ab" "x"] "abc") -- (list (list "ab") (list "x"))
+
+;; A symbol vector, and a list of string or symbol atoms
+(split ['a.b 'c] ".") -- (list (list "a" "b") (list "c"))
+(split (list "a b" 'c.d) " ") -- (list (list "a" "b") (list "c.d"))
+(split (list "a.b" 'c.d) ".") -- (list (list "a" "b") (list "c" "d"))
+(split (list "a b" 1) " ") !- type
+(split (list "a b" ["c d"]) " ") !- type
+
+;; Nulls: the null string and the null symbol split as the empty string
+(split ["a,b" "" "c"] ",") -- (list (list "a" "b") (list "") (list "c"))
+(split ['a.b ' 'c] ".") -- (list (list "a" "b") (list "") (list "c"))
+(nil? (first (at (split ["a" ""] ",") 1))) -- true
+
+;; Empty and one element
+(count (split (take ["a"] 0) ",")) -- 0
+(type (split (take ["a"] 0) ",")) -- 'LIST
+(count (split (list) ",")) -- 0
+(split ["a,b"] ",") -- (list (list "a" "b"))
+(count (split ["a,b"] ",")) -- 1
+
+;; The delimiter is still a string atom
+(split ["a,b"] ',) !- type
+(split ["a,b"] ["," ";"]) !- type
+(split ["a,b"] 1) !- type
+
+;; An index vector still cuts the vector itself into pieces
+(split ["ab" "cd" "ef"] [0 1]) -- (list ["ab"] ["cd" "ef"])
+
+;; A computed input: eval materializes a lazy string transform before the call
+(split (lower ["A,B" "C"]) ",") -- (list (list "a" "b") (list "c"))
+
+;; In a query: the per-row and whole-column forms agree, flat, parted, splayed
+(set T (table [k s] (list [1 1 2] ["a b" "c" "d e f"])))
+(at (select {from: T r: (split s " ")}) 'r) -- (split (at T 's) " ")
+(at (update {from: T r: (split s " ")}) 'r) -- (split (at T 's) " ")
+(.sys.exec "rm -rf /tmp/rfl_split_cells")
+(.db.splayed.set "/tmp/rfl_split_cells/1/t/" (table [s y] (list ["a b" "c"] ['p.q 'r])))
+(.db.splayed.set "/tmp/rfl_split_cells/2/t/" (table [s y] (list ["" "d e f"] [' 's.t])))
+(set P (.db.parted.get "/tmp/rfl_split_cells/" 't))
+(split (at P 's) " ") -- (list (list "a" "b") (list "c") (list "") (list "d" "e" "f"))
+(split (at P 'y) ".") -- (list (list "p" "q") (list "r") (list "") (list "s" "t"))
+(at (select {from: P r: (split s " ")}) 'r) -- (split (at P 's) " ")
+(.db.splayed.set "/tmp/rfl_split_cells/sp/t/" T)
+(set S (.db.splayed.get "/tmp/rfl_split_cells/sp/t/"))
+(split (at S 's) " ") -- (split (at T 's) " ")
+(.sys.exec "rm -rf /tmp/rfl_split_cells") -- 0
+
+;; Many elements: the same as splitting each
+(set B (as 'STR (map (fn [i] (format "%,%,%" i (* 2 i) (* 3 i))) (til 5000))))
+(split B ",") -- (map (fn [x] (split x ",")) B)

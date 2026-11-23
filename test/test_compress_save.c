@@ -2621,7 +2621,7 @@ static test_result_t test_try_plans_bound(void) {
         ray_enc_counters_t kb; ray_enc_counters_get(&kb);
         TEST_ASSERT_EQ_U(kb.materialized, 0);               /* DAG construction decodes nothing */
         ray_enc_counters_reset();
-        TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, &lin, &err)); TEST_ASSERT_NULL(err);
+        TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_null, false, false, &lin, &err)); TEST_ASSERT_NULL(err);
         TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_ii, &prod, &err));    TEST_ASSERT_NULL(err);
         TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fv, &prod, &err));    TEST_ASSERT_NULL(err);
         ray_enc_counters_t k; ray_enc_counters_get(&k);
@@ -2633,23 +2633,23 @@ static test_result_t test_try_plans_bound(void) {
              * pointers, so encoded terms not yet materialized decline them
              * (a shape decline: *err NULL, nothing decoded); the affine plan
              * hands back the encoded object for the caller to bind. */
-            TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(gr, t, d_lin, false, false, &lin, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err));   TEST_ASSERT_NULL(err);
             TEST_ASSERT_FALSE(try_prod_sumavg_input_f64(gr, t, d_fa, &prod, &err));   TEST_ASSERT_NULL(err);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_ENCCOL);
             TEST_ASSERT_TRUE(vec == ray_table_get_col_enc(t, ray_sym_intern("f", 1)));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_ENCCOL);
             ray_enc_counters_get(&k); TEST_ASSERT_EQ_U(k.materialized, 0);
             /* a published materialization is a ready column: the plans take it */
             ray_t* fa = ray_table_col(t, ray_sym_intern("a", 1));
             ray_t* fb = ray_table_col(t, ray_sym_intern("b", 1));
             TEST_ASSERT_TRUE(fa && !RAY_IS_ERR(fa) && fb && !RAY_IS_ERR(fb));
-            TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(gr, t, d_lin, false, false, &lin, &err));
             TEST_ASSERT_TRUE(lin.term_ptrs[0] == ray_data(fb) || lin.term_ptrs[0] == ray_data(fa));
             ray_t* ff = ray_table_col(t, ray_sym_intern("f", 1));
             ray_t* fg = ray_table_col(t, ray_sym_intern("g", 1));
@@ -2657,14 +2657,14 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(try_prod_sumavg_input_f64(gr, t, d_fg, &prod, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(prod.pa == ray_data(ff) && prod.pb == ray_data(fg));
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err)); TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(vec == ff && vec->type == RAY_F64 && aff.bias_f64 == -1.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(vec == fa && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         } else {
             /* linear: 2 * b + a + 7 */
-            TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, &lin, &err));
+            TEST_ASSERT_TRUE(d_lin && try_linear_sumavg_input_i64(gr, t, d_lin, false, false, &lin, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 2 && lin.bias_i64 == 7);
             for (int64_t i = 0; i < CP_N; i += 997) {
@@ -2682,12 +2682,12 @@ static test_result_t test_try_plans_bound(void) {
             TEST_ASSERT_TRUE(prod.ta == RAY_F64 && prod.tb == RAY_I64);
             /* affine: f - 1.5, a + 5 */
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_af && try_affine_sumavg_input(gr, t, d_af, false, false, &vec, &aff, &err));
             TEST_ASSERT_NULL(err);
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_f64 == -1.5 && vec && vec->type == RAY_F64 && vec->len == CP_N);
             TEST_ASSERT_TRUE(((const double*)ray_data(vec))[5] == 2.5);
             memset(&aff, 0, sizeof aff);
-            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, &vec, &aff, &err));
+            TEST_ASSERT_TRUE(d_ai && try_affine_sumavg_input(gr, t, d_ai, false, false, &vec, &aff, &err));
             TEST_ASSERT_TRUE(aff.enabled && aff.bias_i64 == 5 && vec->type == RAY_I64 && ((const int64_t*)ray_data(vec))[1234] == 234);
         }
 
@@ -2704,7 +2704,7 @@ static test_result_t test_try_plans_bound(void) {
         ray_op_t* da = cp_dag(gr, "(- f 1.5)", &e3);
         TEST_ASSERT_TRUE(dl && dp && da);
         ray_graph_bind_test_fail_alloc(1);
-        bool r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+        bool r = try_linear_sumavg_input_i64(gr, t, dl, false, false, &lin, &err);
         ray_graph_bind_test_fail_alloc(0);
         bool bind_err = !r && cp_is_bind_error(err);
         if (err) ray_error_free(err);
@@ -2716,7 +2716,7 @@ static test_result_t test_try_plans_bound(void) {
         if (err) ray_error_free(err);
         err = NULL;
         ray_graph_bind_test_fail_alloc(1);
-        r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
+        r = try_affine_sumavg_input(gr, t, da, false, false, &vec, &aff, &err);
         ray_graph_bind_test_fail_alloc(0);
         bool bind_err3 = !r && cp_is_bind_error(err);
         if (err) ray_error_free(err);
@@ -2727,7 +2727,7 @@ static test_result_t test_try_plans_bound(void) {
          * encoded object), so the failure never fires */
         if (gen == 2) {
             ray_enccol_test_fail_alloc(1);
-            r = try_linear_sumavg_input_i64(gr, t, dl, &lin, &err);
+            r = try_linear_sumavg_input_i64(gr, t, dl, false, false, &lin, &err);
             ray_enccol_test_fail_alloc(0);
             bool plain_err = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);
@@ -2740,7 +2740,7 @@ static test_result_t test_try_plans_bound(void) {
             err = NULL;
             ray_enccol_test_fail_alloc(1);
             memset(&aff, 0, sizeof aff);
-            r = try_affine_sumavg_input(gr, t, da, false, &vec, &aff, &err);
+            r = try_affine_sumavg_input(gr, t, da, false, false, &vec, &aff, &err);
             ray_enccol_test_fail_alloc(0);
             bool plain_err3 = !r && err && RAY_IS_ERR(err);
             if (err) ray_error_free(err);
@@ -4544,6 +4544,17 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "a: a", "(and (== date 2024.01.02) (== (and (> a 0) (< a 12000)) true))", 2999, true },
         { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, true },
         { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
+        /* an IF beside other row-local outputs (#1181) */
+        { "b: b a: a q: (if (or (< a 8) (> a 11990)) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "q: (if (< a 8) a b) r: (if (> b a) 1 0) s: (+ a b)", "(and (== date 2024.01.02) (> a 5))", 2998, true },
+        { "q: (if (< a 8) a 0) r: (if (> a 11992) b a)", "(> date 2024.01.03)", 0, true },
+        { "a: a q: (if (< a 8) a 0)", "(>= date 2024.01.01)", 9000, false },
+        { "a: a q: (if (< a 8) a 0) take: 5", "(== date 2024.01.02)", 5, false },
+        /* an IF operand in where: (#1181) */
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b a) 10))", 2997, true },
+        { "a: a b: b", "(and (== date 2024.01.02) (== (if (< a 8) a b) (if (> a 4) b a)))", 3000, true },
+        { "a: a", "(and (>= date 2024.01.02) (> (if (< a 8) b a) 10))", 5994, true },
+        { "a: a", "(and (== date 2024.01.02) (> (if (< a 8) b (sum a)) 10))", 2998, false },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
@@ -4764,6 +4775,96 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
     PASS();
 }
 
+/* F64 conditions, F64 and SYM branches (#1181): pruned and unpruned answers
+ * agree, nulls (an F64 NaN is null) and symbols outside the root's domain
+ * included; mixed I64/F64 branches keep the full source. */
+static test_result_t test_select_parted_prunes_if_f64_sym(void) {
+    /* rows: of the answer over 2024.01.02 */
+    static const struct { const char* output; bool pruned; const char* pred; int64_t rows; } cases[] = {
+        { "q: (if (>= px 1.0) qty 0)", true, NULL, 8 },
+        { "q: (if (< px 1.0) 1 0) r: (if (== px px) 1 0) s: (if (!= px 0.0) 1 0)", true, NULL, 8 },
+        { "q: (if (> qty 2) px 0.0) r: (if (> px 0.5) px -1.5) px: px", true, NULL, 8 },
+        { "q: (if (> qty 2) act 'none) r: (if (== side 'b) act side)", true, NULL, 8 },
+        { "q: (if (and (> px 0.5) (== act 'New)) 'Hit (if (< px 0.5) 'Low act))", true, NULL, 8 },
+        { "by: g n: (sum (if (>= px 1.0) qty 0)) m: (sum (if (> qty 2) px 0.0))", true, NULL, 2 },
+        { "by: g n: (sum (if (< px 1.0) px 0.5)) c: (count qty)", true, NULL, 2 },
+        { "q: (if (> qty 2) px qty)", false, NULL, 8 },
+        { "by: g n: (sum (if (> qty 2) px qty))", false, NULL, 2 },
+        /* an output rebinding a column the IF reads */
+        { "px: (* px 2.0) q: (if (> px 1.0) px 0.0)", false, NULL, 8 },
+        { "qty: (avg qty) q: (if (> px 1.0) qty 0)", false, NULL, 8 },
+        /* an IF operand in where: */
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) 'A 'B) 'B))", 4 },
+        { "q: qty", true, "(and (== date 2024.01.02) (== (if (== side 'b) act side) 'New))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))", 5 },
+        { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))", 2 },
+        { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
+        /* not an operand: a bare conjunct, under a logic head, in by: */
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) qty 0))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) act side))", -1 },
+        { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
+        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256], sym_path[512];
+        snprintf(root, sizeof root, "%s/if_f64_sym%d", ray_test_tmp(CS_TMP), gen);
+        snprintf(sym_path, sizeof sym_path, "%s/.sym", root);
+        for (int p = 0; p < 3; p++) {
+            char dir[512], src[1024];
+            snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+            snprintf(src, sizeof src,
+                "(table [g px qty act side] (list [7 7 7 7 8 8 8 8] "
+                "(+ %d.0 [0.5 1.5 0Nf 2.0 -0.0 1.0 0.25 0Nf]) [1 3 0Nl 4 5 0Nl 2 9] "
+                "(as 'SYM [\"New\" \"Accepted\" \"\" \"New\" \"Rejected\" \"New\" \"Accepted\" \"P%d\"]) "
+                "(as 'SYM [\"b\" \"s\" \"b\" \"\" \"s\" \"b\" \"s\" \"b\"])))", p, p);
+            ray_t* t = ray_eval_str(src);
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t) && t->type == RAY_TABLE);
+            ray_err_t err = ray_splay_save_mode(t, dir, sym_path,
+                gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+            ray_release(t);
+            TEST_ASSERT_TRUE(err == RAY_OK);
+        }
+        ray_t* t = ray_read_parted(root, "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        sp_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[1024], ref[1536];
+            const char* pred = cases[i].pred ? cases[i].pred : "(== date 2024.01.02)";
+            snprintf(q, sizeof q, "(xasc (select {from: t where: %s %s}) (key (select {from: t where: %s %s})))",
+                     pred, cases[i].output, pred, cases[i].output);
+            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or %s %s) %s}) (key (select {from: t where: (or %s %s) %s})))",
+                     pred, pred, cases[i].output, pred, pred, cases[i].output);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            /* the query runs the select twice: the rows and their key */
+            structure = ray_query_test_parted_pruned_sources(true) == (cases[i].pruned ? 2u : 0u);
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE &&
+                          (cases[i].rows < 0 || ray_table_nrows(r) == cases[i].rows) && sp_same(r, u);
+            /* rows -1: the answer may be an error; both sources must agree on it */
+            if (cases[i].rows < 0 && r && u && RAY_IS_ERR(r) && RAY_IS_ERR(u))
+                values = strcmp(ray_err_code(r), ray_err_code(u)) == 0;
+            drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                sp_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "if f64/sym gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        sp_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 /* SYM conditions in the separate ungrouped IF proof. A tick name that
  * resolves to a source column is not a literal, even when values agree. */
 static test_result_t test_select_parted_prunes_if_symbols(void) {
@@ -4970,19 +5071,172 @@ static test_result_t test_select_parted_prunes_grouped_if(void) {
     PASS();
 }
 
+/* Partitions that differ row for row, so a wrong partition shows. */
+static const char* const pdb_mix_parts[3] = {
+    "(table [g x a b act qty] (list [7 7 7 7 8 8 8 8] [-1 1 0 2 -1 1 0 2] "
+    "[10 20 0Nl 40 0Nl 2 0Nl 4] [100 200 300 0Nl 5 0Nl 7 8] "
+    "(as 'SYM [\"Accepted\" \"\" \"New\" \"Accepted\" \"Accepted\" \"\" \"New\" \"Accepted\"]) "
+    "[10 0Nl 30 40 0Nl 2 0Nl 4]))",
+    "(table [g x a b act qty] (list [8 7 8 7 7 8 9 7] [2 -3 1 0 5 -1 1 2] "
+    "[3 0Nl 5 6 7 8 0Nl 1] [0Nl 11 12 13 14 15 16 17] "
+    "(as 'SYM [\"New\" \"New\" \"\" \"Rejected\" \"Accepted\" \"Accepted\" \"\" \"New\"]) "
+    "[1 2 0Nl 4 5 6 7 0Nl]))",
+    "(table [g x a b act qty] (list [9 9 7 8 7 8 7 8] [1 1 -1 0 3 2 1 -2] "
+    "[50 60 70 0Nl 90 100 0Nl 120] [1 2 3 4 0Nl 6 7 8] "
+    "(as 'SYM [\"Rejected\" \"\" \"Accepted\" \"New\" \"New\" \"Rejected\" \"Accepted\" \"\"]) "
+    "[0Nl 9 8 7 6 5 4 3]))",
+};
+
+/* The same rows three ways: parted (_pm_p), splayed (_pm_s, the partition
+ * key a column) and in memory (_pm_f). */
+static bool pdb_mix_bind(const char* root, bool compressed) {
+    char path[512], src[2048];
+    snprintf(path, sizeof path, "%s/.sym", root);
+    for (int p = 0; p < 3; p++) {
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s/2024.01.0%d/t", root, p + 1);
+        ray_t* t = ray_eval_str(pdb_mix_parts[p]);
+        if (!t || RAY_IS_ERR(t) || t->type != RAY_TABLE) { drop_out(t); return false; }
+        ray_err_t err = ray_splay_save_mode(t, dir, path, compressed ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+        ray_release(t);
+        if (err != RAY_OK) return false;
+    }
+    ray_t* t = ray_read_parted(root, "t");
+    if (!t || RAY_IS_ERR(t)) { drop_out(t); return false; }
+    ray_env_set(ray_sym_intern("_pm_p", 5), t);
+    ray_release(t);
+    int n = snprintf(src, sizeof src, "(do (.db.splayed.set \"%s_s/t/\" _pm_p) "
+                     "(set _pm_s (.db.splayed.get \"%s_s/t/\")) 0)", root, root);
+    if (n < 0 || (size_t)n >= sizeof src) return false;
+    ray_t* r = ray_eval_str(src);
+    bool ok = r && !RAY_IS_ERR(r);
+    drop_out(r);
+    n = snprintf(src, sizeof src, "(do (set _pm_1 %s) (set _pm_2 %s) (set _pm_3 %s) "
+                 "(set _pm_f (table [date g x a b act qty] (list "
+                 "(concat (take 2024.01.01 8) (concat (take 2024.01.02 8) (take 2024.01.03 8))) "
+                 "(concat (at _pm_1 'g) (concat (at _pm_2 'g) (at _pm_3 'g))) "
+                 "(concat (at _pm_1 'x) (concat (at _pm_2 'x) (at _pm_3 'x))) "
+                 "(concat (at _pm_1 'a) (concat (at _pm_2 'a) (at _pm_3 'a))) "
+                 "(concat (at _pm_1 'b) (concat (at _pm_2 'b) (at _pm_3 'b))) "
+                 "(concat (at _pm_1 'act) (concat (at _pm_2 'act) (at _pm_3 'act))) "
+                 "(concat (at _pm_1 'qty) (concat (at _pm_2 'qty) (at _pm_3 'qty)))))) 0)",
+                 pdb_mix_parts[0], pdb_mix_parts[1], pdb_mix_parts[2]);
+    if (!ok || n < 0 || (size_t)n >= sizeof src) return false;
+    r = ray_eval_str(src);
+    ok = r && !RAY_IS_ERR(r);
+    drop_out(r);
+    return ok;
+}
+
+static void pdb_mix_unbind(void) {
+    static const char* const names[] = { "_pm_p", "_pm_s", "_pm_f", "_pm_r", "_pm_1", "_pm_2", "_pm_3" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+        ray_env_set(ray_sym_intern(names[i], strlen(names[i])), NULL);
+}
+
+/* SUM(IF) beside other aggregates, and grouped by a SYM column. Each answer
+ * equals, cell for cell, the unpruned parted answer (in order), and the
+ * splayed and in-memory answers sorted by the key; the part-prune counter
+ * pins which shapes prune. Declined: an unproven companion (a bare
+ * projection, COUNT(DISTINCT)), an output name another output spells, a
+ * composite or partition-key BY. */
+static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
+    static const struct {
+        const char* pred;
+        const char* by;
+        const char* outputs;
+        uint64_t pruned;           /* partitions dropped; 0: declined */
+        const char* want;          /* optional: (at <sorted> 's) */
+    } cases[] = {
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) m:(sum qty)", 2, "[32 23 0]" },
+        { "(== date 2024.01.02)", "g",
+          "s:(sum (if (> x 0) a b)) c:(count qty) v:(avg a) lo:(min b) hi:(max qty)", 2, "[32 23 0]" },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (== act 'New) qty 0)) f:(first act) l:(last qty) md:(med a)", 2, "[2 1 0]" },
+        { "(== date 2024.01.02)", "g", "qty:(sum qty) s:(sum (if (!= act 'New) 1 0))", 2, NULL },
+        { "(and (== date 2024.01.02) (!= act 'Rejected))", "g", "s:(sum (if (> x 0) a b)) n:(count b)", 2, NULL },
+        { "(>= date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) m:(sum (+ qty a))", 1, NULL },
+        { "(== date 2024.01.02)", "act", "s:(sum (if (> x 0) a b)) m:(sum qty)", 2, "[5 22 15 13]" },
+        { "(== date 2024.01.02)", "act", "s:(sum (if (> x 0) a b)) t:(sum (if (<= x 0) a b))", 2, NULL },
+        { "(>= date 2024.01.02)", "act", "s:(sum (if (and (> x 0) (!= g 9)) a 0)) f:(first g) c:(count x)", 1, NULL },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) q:qty", 0, NULL },
+        { "(== date 2024.01.02)", "g", "s:(sum (if (> x 0) a b)) c:(count (distinct act))", 0, NULL },
+        { "(== date 2024.01.02)", "g", "a:(sum qty) s:(sum (if (> x 0) a b))", 0, NULL },
+        { "(== date 2024.01.02)", "[g act]", "s:(sum (if (> x 0) a b)) m:(sum qty)", 0, NULL },
+        { "(== date 2024.01.02)", "date", "s:(sum (if (> x 0) a b)) m:(sum qty)", 0, NULL },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256];
+        snprintf(root, sizeof root, "%s/group_mix%d", ray_test_tmp(CS_TMP), gen);
+        if (!pdb_mix_bind(root, gen != 0)) { pdb_mix_unbind(); FAIL("grouped mix fixture"); }
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            /* sorted by the whole key: a composite one sorts by its columns */
+            char key[32];
+            snprintf(key, sizeof key, cases[i].by[0] == '[' ? "%s" : "'%s", cases[i].by);
+            char q[1024], ref[1536], flat[1536], spl[1536], want[64];
+            int n0 = snprintf(q, sizeof q, "(select {from:_pm_p where:%s by:%s %s})",
+                              cases[i].pred, cases[i].by, cases[i].outputs);
+            int n1 = snprintf(ref, sizeof ref, "(select {from:_pm_p where:(or %s %s) by:%s %s})",
+                              cases[i].pred, cases[i].pred, cases[i].by, cases[i].outputs);
+            int n2 = snprintf(flat, sizeof flat, "(xasc (select {from:_pm_f where:%s by:%s %s}) %s)",
+                              cases[i].pred, cases[i].by, cases[i].outputs, key);
+            int n3 = snprintf(spl, sizeof spl, "(xasc (select {from:_pm_s where:%s by:%s %s}) %s)",
+                              cases[i].pred, cases[i].by, cases[i].outputs, key);
+            int n4 = snprintf(want, sizeof want, "(at (xasc _pm_r %s) 's)", key);
+            if (n0 < 0 || (size_t)n0 >= sizeof q || n1 < 0 || (size_t)n1 >= sizeof ref ||
+                n2 < 0 || (size_t)n2 >= sizeof flat || n3 < 0 || (size_t)n3 >= sizeof spl ||
+                n4 < 0 || (size_t)n4 >= sizeof want) {
+                pdb_mix_unbind(); FAIL("grouped mix query buffer");
+            }
+            uint64_t runs0, parts0, runs1, parts1, runs2, parts2;
+            ray_query_test_part_prune(&runs0, &parts0);
+            ray_t* r = ray_eval_str(q);
+            ray_query_test_part_prune(&runs1, &parts1);
+            ray_t* u = ray_eval_str(ref);
+            ray_query_test_part_prune(&runs2, &parts2);
+            bool counted = runs1 - runs0 == (cases[i].pruned ? 1u : 0u) &&
+                           parts1 - parts0 == cases[i].pruned && runs2 == runs1 && parts2 == parts1;
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) > 0 && sp_same(r, u);
+            if (values) ray_env_set(ray_sym_intern("_pm_r", 5), r);
+            char sorted[96];
+            snprintf(sorted, sizeof sorted, "(xasc _pm_r %s)", key);
+            ray_t* rs = values ? ray_eval_str(sorted) : NULL;
+            ray_t* f = values ? ray_eval_str(flat) : NULL;
+            ray_t* sp = values ? ray_eval_str(spl) : NULL;
+            values = values && t29_same(rs, f) && t29_same(rs, sp);
+            if (values && cases[i].want) {
+                ray_t* got = ray_eval_str(want);
+                ray_t* exp = ray_eval_str(cases[i].want);
+                values = got && exp && !RAY_IS_ERR(got) && !RAY_IS_ERR(exp) && t29_same(got, exp);
+                drop_out(got); drop_out(exp);
+            }
+            drop_out(rs); drop_out(f); drop_out(sp); drop_out(r); drop_out(u);
+            if (!values || !counted) {
+                pdb_mix_unbind();
+                TEST_ASSERT_FMT(values && counted, "grouped mix gen %d case %zu: values=%d counted=%d "
+                                "(runs %llu parts %llu): %s", gen, i, (int)values, (int)counted,
+                                (unsigned long long)(runs1 - runs0), (unsigned long long)(parts1 - parts0), q);
+            }
+        }
+        pdb_mix_unbind();
+    }
+    PASS();
+}
+
 /* Local canonical-looking heads and earlier output aliases must not be
  * mistaken for the native, fresh-name grammar. Keep one admitted control so
  * blanket rejection cannot satisfy the decline assertions. */
 static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
     /* These concrete lexical calls intentionally retain their evaluator
-     * semantics. Local IF/NOT prevents rowwise IF lowering; the nonempty
-     * condition vector is truthy, selecting whole a/b columns. A local SUM
-     * still aggregates the rowwise-lowered inner IF in this query shape. */
+     * semantics. A local IF is no `if`: the nonempty condition vector is
+     * truthy, selecting whole a/b columns. A local NOT only stops the DAG
+     * lowering; the `if` still chooses per row over the evaluated condition
+     * (#1300). A local SUM still aggregates the rowwise-lowered inner IF in
+     * this query shape. */
     static const struct { const char* local; bool pruned; int64_t expected[4]; } heads[] = {
         { NULL,  true,  { 370, 13, 300, 13 } },
         { "if",  false, {  70,  6, 600, 20 } },
         { "sum", false, { 370, 13, 300, 13 } },
-        { "not", false, {  70,  6, 600, 20 } },
+        { "not", false, { 370, 13, 300, 13 } },
     };
     for (int gen = 0; gen < 2; gen++) {
         char path[256];
@@ -5865,9 +6119,11 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_fetch",   test_select_parted_prunes_fetch,   rt_setup, rt_teardown },
     { "compress/select_parted_prunes_same",    test_select_parted_prunes_same,    rt_setup, rt_teardown },
     { "compress/select_parted_prunes_local_shapes", test_select_parted_prunes_local_shapes, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_if_f64_sym", test_select_parted_prunes_if_f64_sym, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_grouped_if_mixed", test_select_parted_prunes_grouped_if_mixed, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_group_limits", test_select_parted_prunes_group_limits, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_if_symbols", test_select_parted_prunes_if_symbols, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_if_limits", test_select_parted_prunes_if_limits, rt_setup, rt_teardown },

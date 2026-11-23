@@ -1,0 +1,45 @@
+;; @also-unfused
+;; #1283: an aggregate that interprets its cells, over a LIST column, gives
+;; the eager builtin's answer: `type` for cells that are not numeric atoms.
+;; The typed kernels read the cells' pointers as numbers, grouped and keyless.
+(set T (table [k i] (list [0 1 0 1 0 1] [1 2 4 8 16 32])))
+(set Z (update {from: T zz: (map (fn [a] (list a a)) i) ss: (map (fn [a] (list 'x 'x)) i)}))
+(set E (fn [e] (format "%" e)))
+(type (at Z 'zz)) -- 'LIST
+
+;; grouped, each the eager error
+(try (select {from: Z by: k z: (sum zz)}) E) -- (try (sum (at Z 'zz)) E)
+(try (select {from: Z by: k z: (avg zz)}) E) -- (try (avg (at Z 'zz)) E)
+(try (select {from: Z by: k z: (min zz)}) E) -- (try (min (at Z 'zz)) E)
+(try (select {from: Z by: k z: (max zz)}) E) -- (try (max (at Z 'zz)) E)
+(try (select {from: Z by: k z: (sum ss)}) E) -- (try (sum (at Z 'ss)) E)
+(try (select {from: Z by: k z: (sum zz) where: (> i 1)}) E) -- (try (sum (at Z 'zz)) E)
+
+;; keyless, the same
+(try (select {from: Z z: (sum zz)}) E) -- (try (sum (at Z 'zz)) E)
+(try (select {from: Z z: (avg zz)}) E) -- (try (avg (at Z 'zz)) E)
+(try (select {from: Z z: (max zz) where: (> i 1)}) E) -- (try (max (at Z 'zz)) E)
+
+;; an aggregate inside an expression under by: (the hidden-aggregate rewrite;
+;; (+ 1 (max zz)) crashed there)
+(try (select {from: Z by: k z: (+ 1 (max zz))}) E) -- (try (max (at Z 'zz)) E)
+(try (select {from: Z by: k z: (+ 1 (sum zz))}) E) -- (try (sum (at Z 'zz)) E)
+(try (select {from: Z by: k z: (+ (sum zz) (sum i))}) E) -- (try (sum (at Z 'zz)) E)
+
+;; a binary aggregate's second argument, grouped and keyless, both orders
+(try (select {from: Z by: k z: (wavg i zz)}) E) -- (try (wavg (at Z 'i) (at Z 'zz)) E)
+(try (select {from: Z by: k z: (cov i zz)}) E) -- (try (cov (at Z 'i) (at Z 'zz)) E)
+(try (select {from: Z z: (wavg i zz)}) E) -- (try (wavg (at Z 'i) (at Z 'zz)) E)
+(try (select {from: Z z: (wavg zz i)}) E) -- (try (wavg (at Z 'zz) (at Z 'i)) E)
+(try (select {from: Z z: (cov i zz)}) E) -- (try (cov (at Z 'i) (at Z 'zz)) E)
+
+;; the aggregates that do not interpret cells keep the DAG and their answers
+(at (select {from: Z by: k z: (count zz)}) 'z) -- [3 3]
+(at (select {from: Z by: k z: (first zz)}) 'z) -- (list [1 1] [2 2])
+(at (select {from: Z by: k z: (last zz)}) 'z) -- (list [16 16] [32 32])
+(at (select {from: Z z: (count zz)}) 'z) -- [6]
+
+;; a numeric column beside it is unchanged
+(at (select {from: Z by: k z: (sum i)}) 'z) -- [21 42]
+(at (select {from: Z by: k z: (+ 1 (sum i))}) 'z) -- [22 43]
+(at (select {from: Z z: (wavg i i)}) 'z) -- (enlist (wavg (at Z 'i) (at Z 'i)))

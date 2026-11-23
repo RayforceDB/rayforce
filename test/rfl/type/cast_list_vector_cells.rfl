@@ -1,0 +1,84 @@
+;; #1395: casting a LIST to a typed vector reads one value per cell.  A cell
+;; that casts to a vector (a GUID vector, `[1]`, a nested LIST) used to be
+;; read as an atom: a GUID vector cell was followed as a pointer (a crash),
+;; and an I64 vector cell gave its length (`(as 'I64 (list [1] [2]))` was
+;; [1 1]).  Now a one-element cell is its element, an empty cell the type's
+;; null, and a longer cell a type error.
+
+;; GUID: atom cells, nulls and strings
+(set G (first (guid 1)))
+(set H (first (guid 1)))
+(count (as 'GUID (list G H))) -- 2
+(== (at (as 'GUID (list G H)) 1) H) -- true
+(type (as 'GUID (list G H))) -- 'GUID
+(nil? (as 'GUID (list 0Ng G))) -- [true false]
+(== (at (as 'GUID (list "00000000-0000-0000-0000-000000000001")) 0) (as 'GUID "00000000-0000-0000-0000-000000000001")) -- true
+(as 'GUID (list)) -- (as 'GUID [])
+(as 'GUID (list 1 2)) !- type
+
+;; GUID vector cells (the crash): one element, empty, nested, longer
+(set V (guid 1))
+(set W (guid 1))
+(count (as 'GUID (list V W))) -- 2
+(== (as 'GUID (list V W)) (concat V W)) -- [true true]
+(== (at (as 'GUID (list G V)) 1) (first V)) -- true
+(nil? (as 'GUID (list V (guid 0)))) -- [false true]
+(== (at (as 'GUID (list (list G))) 0) G) -- true
+(as 'GUID (list (guid 2))) !- type
+(as 'GUID (list G (guid 3))) !- type
+
+;; numeric, temporal and SYM targets: the same rule
+(as 'I64 (list 1 2)) -- [1 2]
+(as 'F64 (list 1 2.5)) -- [1.0 2.5]
+(as 'I64 (list [1] [2])) -- [1 2]
+(as 'I64 (list [1] () 3)) -- [1 0Nl 3]
+(nil? (as 'I64 (list [1] () 3))) -- [false true false]
+(as 'I64 (list (list (list 7)))) -- [7]
+(as 'F64 (list [1.5] (list 2))) -- [1.5 2.0]
+(as 'I32 (list [1] [2])) -- [1i 2i]
+(as 'DATE (list [1] ())) -- [2000.01.02 0Nd]
+(as 'SYM (list ['a] ['b])) -- ['a 'b]
+(as 'SYM (list 'a 'b)) -- ['a 'b]
+(as 'SYM (list "ab" (raze (take (list "a") 0)))) -- ['ab ']
+(as 'I64 (list [1 2])) !- type
+(as 'I64 (list 1 [2 3])) !- type
+(as 'U8 (list [1 2])) !- type
+(as 'F64 (list [1.5 2.5])) !- type
+(as 'TIMESPAN (list [1 2])) !- type
+(as 'SYM (list ['a 'b])) !- type
+
+;; a one-element cell's null is the inner vector's own: a narrow sentinel
+;; (INT16_MIN, INT32_MIN) stays a value, as in an atom or vector cast
+(nil? (as 'I16 (list [-32768] 1))) -- [false false]
+(nil? (as 'I16 (list -32768 1))) -- [false false]
+(nil? (as 'I16 [-32768 1])) -- [false false]
+(sum (as 'I16 (list [-32768] 1))) -- (sum (as 'I16 [-32768 1]))
+(nil? (as 'I32 (list [-2147483648] 1))) -- [false false]
+(nil? (as 'DATE (list [-2147483648] 1))) -- [false false]
+(nil? (as 'I64 (list [0Nl] 1))) -- [true false]
+(nil? (as 'I16 (list (as 'I16 [0Nh]) 1))) -- [true false]
+
+;; more targets
+(nil? (as 'I16 (list [1] () 3))) -- [false true false]
+(type (as 'I16 (list [1] () 3))) -- 'I16
+(nil? (as 'F32 (list [1.5] ()))) -- [false true]
+(== (at (as 'F32 (list [1.5] ())) 0) 1.5e) -- true
+(as 'TIME (list [1] ())) -- [00:00:00.001 0Nt]
+(nil? (as 'TIMESTAMP (list [1] ()))) -- [false true]
+(as 'TIMESTAMP (list [1])) -- (as 'TIMESTAMP [1])
+(as 'TIME (list [1 2])) !- type
+(as 'TIMESTAMP (list [1 2])) !- type
+;; BOOL and U8 have no null: an empty cell is false / 0x00
+(as 'BOOL (list () [1] [0])) -- [false true false]
+(as 'B8 (list [1] ())) -- [true false]
+(as 'U8 (list () [3])) -- [0x00 0x03]
+(as 'BOOL (list [1 0])) !- type
+;; an empty cell is not checked against the target: it is the null
+(as 'I64 (list (guid 0))) -- [0Nl]
+
+;; STR follows the same rule
+(as 'STR (list [1] 'a)) -- ["1" "a"]
+(as 'STR (list () 'a)) -- ["" "a"]
+(nil? (as 'STR (list () 'a))) -- [true false]
+(as 'STR (list (list 'x))) -- ["x"]
+(as 'STR (list [1 2])) !- type

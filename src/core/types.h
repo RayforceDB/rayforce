@@ -84,6 +84,42 @@ static inline float ray_f64_to_f32_fin(double v) {
     return (v <= (double)FLT_MAX && v >= -(double)FLT_MAX) ? (float)v : NULL_F32;
 }
 
+/* Float `%`: the floor modulo a - b*floor(a/b) of finite a and b != 0,
+ * rounded once, so it lies in [0,b) for b > 0 and in (b,0] for b < 0 (a
+ * remainder that would round to b itself is 0).  One rule for the atom
+ * builtin, the vector kernels and the constant folds (#1349).  While the
+ * quotient is below 2^52 (2^23 for F32) the fused a - b*floor(q) is the
+ * remainder exactly: floor(q) is the true floor or, when q rounded up to
+ * an integer, one more, whose remainder is the exact IEEE one, and adding b
+ * back rounds once.  Past that, fmod (exact, but a loop over the exponent
+ * gap: ~9 ns at a quotient of 100, ~80 ns at 1e11) and the sign fix. */
+double ray_fmod_floor_wide(double a, double b);
+float  ray_fmod_floor_wide_f32(float a, float b);
+
+static inline double ray_fmod_floor(double a, double b) {
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+    double q = a / b;
+    if (__builtin_expect(__builtin_fabs(q) < 0x1p52, 1)) {
+        double r = __builtin_fma(-b, __builtin_floor(q), a);
+        if (b > 0 ? r < 0 : r > 0) r += b;
+        return r == b ? 0.0 : r;
+    }
+#endif
+    return ray_fmod_floor_wide(a, b);
+}
+
+static inline float ray_fmod_floor_f32(float a, float b) {
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+    float q = a / b;
+    if (__builtin_expect(__builtin_fabsf(q) < 0x1p23f, 1)) {
+        float r = __builtin_fmaf(-b, __builtin_floorf(q), a);
+        if (b > 0 ? r < 0 : r > 0) r += b;
+        return r == b ? 0.0f : r;
+    }
+#endif
+    return ray_fmod_floor_wide_f32(a, b);
+}
+
 static inline uint8_t ray_cast_f64_to_u8_null(double v) {
     if (v != v || v <= 0.0) return 0;
     if (v >= (double)UINT8_MAX) return UINT8_MAX;
@@ -106,6 +142,30 @@ static inline int64_t wrap_add_i64(int64_t a, int64_t b) {
 }
 static inline int64_t wrap_mul_i64(int64_t a, int64_t b) {
     return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+
+/* The numeric promotion table (#972), the one rule for atoms, vectors, the
+ * planner and the fused evaluator: B8 < U8 < I16 < I32 < I64 < F32 < F64 and
+ * the wider type wins, two operands of one type keep it (an integer result
+ * wraps in that width), and F32 beside any other type is F64.  Symmetric.
+ * Takes and returns vector (positive) type codes; 0 when either operand is
+ * not one of the seven numeric types.  The type codes are the ranks. */
+_Static_assert(RAY_BOOL == 1 && RAY_U8 == 2 && RAY_I16 == 3 && RAY_I32 == 4 &&
+               RAY_I64 == 5 && RAY_F32 == 6 && RAY_F64 == 7,
+               "ray_num_type ranks numeric types by their codes");
+static inline int8_t ray_num_type(int8_t a, int8_t b) {
+    if ((uint8_t)(a - RAY_BOOL) > RAY_F64 - RAY_BOOL ||
+        (uint8_t)(b - RAY_BOOL) > RAY_F64 - RAY_BOOL) return 0;
+    if (a == b) return a;
+    if (a == RAY_F32 || b == RAY_F32) return RAY_F64;
+    return a > b ? a : b;
+}
+
+/* The table for + - * div %: as ray_num_type, but B8 with B8 counts as I64
+ * (`(+ true true)` is 2).  min and max keep B8 (ray_num_type). */
+static inline int8_t ray_arith_type(int8_t a, int8_t b) {
+    int8_t t = ray_num_type(a, b);
+    return t == RAY_BOOL ? RAY_I64 : t;
 }
 
 #endif /* RAY_TYPES_H */

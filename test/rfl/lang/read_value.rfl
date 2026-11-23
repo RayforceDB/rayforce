@@ -191,7 +191,7 @@ marker -- 0
 (read-value "(list 1") !- parse
 (read-value "[1 2") !- parse
 (read-value "\"abc") !- parse
-(read-value "[1 2.5]") !- parse
+(type (read-value "[1 2.5]")) -- 'F64
 (read-value "[1h 2i]") !- parse
 (read-value "[1 \"a\"]") !- parse
 (read-value "['a \"a\"]") !- parse

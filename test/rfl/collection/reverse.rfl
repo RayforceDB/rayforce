@@ -53,11 +53,11 @@
 (at (reverse _reverse_boxed) 'b) -- "x"
 
 ;; OP_REVERSE vector-input guard: a lazy chain whose previous op is
-;; an aggregator (FIRST) yields a scalar at materialisation; OP_REVERSE
+;; an aggregator (SUM, MAX) yields a scalar at materialisation; OP_REVERSE
 ;; must reject the non-vec input rather than dispatching to
 ;; reverse_vec_eager.  Covers exec.c L1085.
-(reverse (first [1 2 3 4])) !- type
-(reverse (last [1 2 3 4])) !- type
+(reverse (sum [1 2 3 4])) !- type
+(reverse (max [1 2 3 4])) !- type
 
 ;; ---- RAY_IS_ERR propagation: reverse(erroring arg) ----
 (reverse (+ "a" 1))     !- type

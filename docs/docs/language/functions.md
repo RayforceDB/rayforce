@@ -16,7 +16,7 @@ Arithmetic operators auto-map over vectors and broadcast scalars. Numeric typed-
 | `*` | binary | Multiplication | `(* 3 4)` → `12` |
 | `/` | binary | Float division (always f64) | `(/ 7 2)` → `3.5` |
 | `%` | binary | Modulo | `(% 7 3)` → `1` |
-| `div` | binary | Integer division (floor) | `(div 7 2)` → `3` |
+| `div` | binary | Floor division, promoted type | `(div 7 2)` → `3` |
 | `neg` | unary | Negate | `(neg 5)` → `-5` |
 | `round` | unary | Round to nearest integer | `(round 3.7)` → `4.0` |
 | `floor` | unary | Floor (round down) | `(floor 3.7)` → `3.0` |
@@ -59,6 +59,7 @@ All comparison operators are **atomic** and return boolean results.
 | `<` | binary | Less than | `(< 3 5)` → `true` |
 | `>=` | binary | Greater than or equal | `(>= 5 5)` → `true` |
 | `<=` | binary | Less than or equal | `(<= 3 5)` → `true` |
+| `identical` | binary | Same type, shape and contents | `(identical 1 1i)` → `false` |
 | `==` | binary | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | Check which vector elements fall within a range | `(within [1 5 10] [3 7])` → `[false true false]` |
@@ -67,8 +68,8 @@ All comparison operators are **atomic** and return boolean results.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
-| `or` | binary | Logical OR; element-wise on vectors and lists (lengths must match) | `(or true false)` → `true` |
+| `and` | binary | Logical AND; element-wise on vectors and lists, each element by its truthiness (zero, null and NaN are false), in a query too (lengths must match) | `(and true false)` → `false`, `(and [1 0 2] [1 1 0])` → `[true false false]` |
+| `or` | binary | Logical OR; element-wise on vectors and lists, each element by its truthiness, in a query too (lengths must match) | `(or true false)` → `true` |
 | `not` | unary | Logical NOT; element-wise over a BOOL, numeric or temporal vector (zero and null are not true) | `(not true)` → `false`, `(not [1 0 0N])` → `[false true true]` |
 
 ## Aggregation
@@ -100,8 +101,8 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
 | `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
 | `percentile` | binary, aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
-| `first` | unary | First element of vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `1` |
-| `last` | unary | Last element of vector. Nulls are skipped on I64, F64 and F32 vectors and inside `select … by:` on typed vectors; a direct call on lists or other vector types takes the element positionally, `(at v (- (count v) 1))` | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `2` |
+| `first` | unary | First element of vector. A direct call takes the element by position, nulls included, for every type: `(first [0Nl 1])` is `0Nl`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, whether its argument is a column or computed (`(first (+ d 1))`, `(first (if c d 0Nd))`); a computed argument that reads no column, such as `(first (take X 4))`, stays positional | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `0Nl` |
+| `last` | unary | Last element of vector. A direct call takes the element by position, nulls included, for every type: `(at v (- (count v) 1))`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, whether its argument is a column or computed (`(last (+ d 1))`, `(last (if c d 0Nd))`); a computed argument that reads no column, such as `(last (take X 4))`, stays positional | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `0Nl` |
 
 Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, aggregate reducers lower to morsel-based DAG paths that can run in parallel and poll for cancellation.
 
@@ -184,12 +185,12 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `distinct` | unary | Remove duplicates, in the order the values first appear, for every type | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
-| `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
-| `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
-| `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
+| `except` | binary | Elements of the left operand not in the right; keeps the left operand's duplicates | `(except [1 1 2 3] [3])` → `[1 1 2]` |
+| `union` | binary | Set union (deduplicated, order of first appearance) | `(union [1 2] [2 3])` → `[1 2 3]` |
+| `sect` | binary | Elements of the left operand also in the right; keeps the left operand's duplicates | `(sect [1 1 2 2 3] [1 2])` → `[1 1 2 2]` |
 | `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
@@ -202,7 +203,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `til` | unary | Range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |
 | `lead` | unary | Shift values one row forward; last row is null/sentinel | `(lead [10 20 30])` → `[20 30 0Nl]` |
-| `deltas` | unary | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIME, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
+| `deltas` | unary | Adjacent differences, of the type `-` gives: TIMESTAMP → TIMESPAN, TIME → TIMESPAN, DATE → I32 (days), TIMESPAN → TIMESPAN, other integers → I64, floats → F64; first row is null | `(deltas [10 15 13])` → `[0Nl 5 -2]` |
 | `ratios` | unary | Adjacent ratios as f64; first row is null | `(ratios [2 4 8])` → `[0Nf 2.0 2.0]` |
 | `fills` | unary | Forward-fill nullable vectors, or every column of a table | `(fills (as 'I64 (list 0N 2 0N)))` → `[0Nl 2 2]` |
 | `sums` | unary | Running sum; nulls are skipped | `(sums [1 2 3])` → `[1 3 6]` |
@@ -346,7 +347,7 @@ The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `
 
 Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
 
-`update` with `where:` into a named flat table writes the matched rows in place: the predicate is resolved through a fresh `.idx.hash` index on the column when it is a plain equality (`(== sym 'AAPL)`), elementwise update expressions (arithmetic, comparisons, and other atomic builtins over columns and literals) are evaluated over the matched rows only, and the results are scattered into the live columns. Any other expression, such as one with an aggregate, an order-dependent function like `deltas`, or a free variable, is evaluated over the whole table as before, so both spellings of `from:` agree. A mistyped or wrong-length value is rejected before anything is written.
+`update` with `where:` into a named flat table writes the matched rows in place: the predicate is resolved through a fresh `.idx.hash` index on the column when it is a plain equality (`(== sym 'AAPL)`), elementwise update expressions (arithmetic, comparisons, and other atomic builtins over columns and literals) are evaluated over the matched rows only, and the results are scattered into the live columns. An aggregate is computed over the rows `where:` keeps, as in `select` with the same `where:`, including one inside a larger expression (`(- v (avg v))`) or inside a helper: `(update {v: (max v) from: 't where: (== k 1)})` writes the largest `v` among the rows with `k` 1. Running and order-dependent functions such as `sums`, `deltas` and `prior` run over the whole table, as in `select` ([Running functions under `where:`](../queries/select.md#running-functions-under-where)), and the kept rows take their values; in an expression that mixes both, such as `(- (sums v) (max v))`, the running call sees the whole table and the aggregate the kept rows. A free variable and a whole-column verb such as `reverse` are read over the whole table too. When `where:` keeps no row nothing is written, but every expression is still evaluated over the table, so one that cannot be evaluated raises its error. Both spellings of `from:` agree. A mistyped or wrong-length value is rejected before anything is written.
 
 ## Joins
 
@@ -358,6 +359,8 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `inner-join` | variadic | Inner join — only matching rows. |
 | `full-join` | variadic | Full outer join. All left and right rows are preserved; unmatched columns are null. |
 | `anti-join` | variadic | Anti-semi-join. Keep left rows with no right match. |
+| `semi-mask` | variadic | Boolean vector over the left rows: true where the row has a right match. |
+| `anti-mask` | variadic | Boolean vector over the left rows: true where the row has no right match. |
 | `window-join` | variadic, special | Join with time window constraint. Match rows within a time range. |
 | `asof-join` | variadic | As-of join — match the most recent preceding value. |
 
@@ -420,7 +423,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `split` | binary | Split string by delimiter (returns a list) | `(split "a,b,c" ",")` → `("a" "b" "c")` |
+| `split` | binary | Split string by delimiter (returns a list); a string or symbol vector, or a list of string or symbol atoms, splits each element | `(split "a,b,c" ",")` → `("a" "b" "c")` |
 | `str-find` | binary | First byte index of a literal substring (no wildcards; use `like` for patterns); returns `0Nl` when absent | `(str-find "banana" "na")` → `2` |
 | `str-join` | binary | Join strings or symbols with a delimiter | `(str-join ["a" "b"] ",")` → `"a,b"` |
 | `strlen` | unary | Length of each string. `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null. | `(strlen "hello")` → `5` |
@@ -563,7 +566,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
@@ -603,6 +606,9 @@ spills exactly as it did before.
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
+| `.json.parse` | variadic | JSON text to a value; element-wise over a string vector; see [`.json.*`](../namespaces/json.md) | `(.json.parse "[1,2]")` |
+| `.json.get` | variadic | One field of each JSON document by a dotted path (or one path per row), with an optional type (`'STR`, `'I64`, `'F64`: always that type, null where absent or another kind) and optional limits | `(.json.get line "kind")` |
+| `.json.format` | unary | A value as JSON text | `(.json.format (dict ["a"] (list 1)))` |
 | `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |

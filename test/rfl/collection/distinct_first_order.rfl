@@ -1,0 +1,61 @@
+;; @also-unfused
+;; distinct keeps each value's first occurrence, in the order the values first
+;; appear, for every typed vector (#1477), as SYM, STR and LIST already did;
+;; numeric and temporal vectors came back sorted.  A null is kept once, where
+;; it first occurs.
+
+(distinct [3 1 3 2]) -- [3 1 2]
+(distinct [3.5 1.5 3.5 2.5]) -- [3.5 1.5 2.5]
+(distinct (as 'F32 [3 1 3 2])) -- (as 'F32 [3 1 2])
+(distinct (as 'I32 [3 1 3 2])) -- (as 'I32 [3 1 2])
+(distinct (as 'I16 [3 1 3 2])) -- (as 'I16 [3 1 2])
+(distinct (as 'U8 [3 1 3 2])) -- (as 'U8 [3 1 2])
+(distinct [true false true]) -- [true false]
+(distinct (as 'DATE [3 1 3 2])) -- (as 'DATE [3 1 2])
+(distinct (as 'TIME [3 1 3 2])) -- (as 'TIME [3 1 2])
+(distinct (as 'TIMESTAMP [3 1 3 2])) -- (as 'TIMESTAMP [3 1 2])
+(distinct (as 'TIMESPAN [3 1 3 2])) -- (as 'TIMESPAN [3 1 2])
+(distinct [3 0Nl 1 0Nl 3]) -- [3 0Nl 1]
+(distinct [0Nf 2.5 0Nf 1.5]) -- [0Nf 2.5 1.5]
+(distinct ['c 'a 'c 'b]) -- ['c 'a 'b]
+
+;; the oracle: the rows where each value first occurs (group's first row of
+;; each value, in row order)
+(set first_rows (fn [v] (at v (asc (map (fn [l] (first l)) (value (group v)))))))
+;; past the radix kernel's threshold (1 << 16 rows), its ids come per partition
+(set big (% (* 7919 (til 300000)) 50021))
+(identical (distinct big) (first_rows big)) -- true
+(set bigf (as 'F64 (% (* 13 (til 200000)) 997)))
+(identical (distinct bigf) (first_rows bigf)) -- true
+(set bigi (as 'I32 (% (* 31 (til 200000)) 3001)))
+(identical (distinct bigi) (first_rows bigi)) -- true
+(set bign (concat (take [7] 70000) (concat [0Nl 3] (take [7 3] 70000))))
+(distinct bign) -- [7 0Nl 3]
+;; a sort index: one first-occurrence row per value, put back in row order
+(set s (.idx.sort (% (* 7919 (til 100000)) 5003)))
+(at (.idx.info s) 'kind) -- 'sort
+(identical (distinct s) (first_rows (.idx.drop s))) -- true
+
+;; -0.0 and 0.0 are one value; the sort index orders -0.0 first within the
+;; run, so the run's smallest row, not its first, is the first occurrence
+(set z (concat [3.0 0.0 1.0] (concat (* -1.0 [0.0]) [3.0 0.0])))
+(distinct (.idx.sort (take z 100))) -- (distinct (take z 100))
+(distinct (.idx.sort (take z 100))) -- [3.0 0.0 1.0]
+(distinct (.idx.sort (take z 20))) -- [3.0 0.0 1.0]
+(set zf (as 'F32 (take z 100)))
+(distinct (.idx.sort zf)) -- (distinct zf)
+(set zw (concat (* 1.0 (til 80)) (concat (* -1.0 [0.0]) (take z 100))))
+(distinct (.idx.sort zw)) -- (distinct zw)
+
+;; select, by:, a lazy chain and a parted table answer the same way
+(set T (table [k v] (list [a a b b a] [3 1 2 1 5])))
+(at (select {d: (distinct v) from: T}) 'd) -- [3 1 2 5]
+(at (select {d: (distinct v) from: T by: k}) 'd) -- (list [3 1 5] [2 1])
+(distinct (+ [3 1 3 2] 1)) -- [4 2 3]
+(count (distinct [3 1 3 2])) -- 3
+(.sys.exec "rm -rf /tmp/rfl_distinct_first_order") -- 0
+(.db.splayed.set "/tmp/rfl_distinct_first_order/2024.01.01/t/" (table [v] (list [9 4 9])) "/tmp/rfl_distinct_first_order/.sym")
+(.db.splayed.set "/tmp/rfl_distinct_first_order/2024.01.02/t/" (table [v] (list [1 4 2])) "/tmp/rfl_distinct_first_order/.sym")
+(set P (.db.parted.get "/tmp/rfl_distinct_first_order" 't))
+(distinct (at P 'v)) -- [9 4 1 2]
+(.sys.exec "rm -rf /tmp/rfl_distinct_first_order") -- 0

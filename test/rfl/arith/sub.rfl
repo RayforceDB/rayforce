@@ -134,8 +134,8 @@
 ;; int - TIME → TIME (negative)
 (type (- 1000 (as 'TIME 500))) -- 'time
 
-;; TIME - TIME → TIME
-(- (as 'TIME 5000) (as 'TIME 2000)) -- 00:00:03.000
+;; TIME - TIME → TIMESPAN
+(- (as 'TIME 5000) (as 'TIME 2000)) -- 0D00:00:03
 
 ;; TIMESTAMP - int → TIMESTAMP
 (type (- (as 'TIMESTAMP 5000) 1000)) -- 'timestamp
@@ -152,7 +152,6 @@
 
 ;; Null propagation across temporal-numeric arms
 (nil? (- (as 'DATE 7305) 0Ni))    -- true
-(nil? (- 0Ni (as 'DATE 7305)))    -- true
-(type (- 0Ni (as 'DATE 7305)))    -- 'date
+(- 0Ni (as 'DATE 7305))           !- type
 (nil? (- (as 'TIME 5000) 0Ni))    -- true
 (type (- (as 'TIME 5000) 0Ni))    -- 'time

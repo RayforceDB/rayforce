@@ -15,10 +15,10 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 |---|---|---|
 | `.idx.zone` | `filter` — comparison predicates (EQ/NE/LT/LE/GT/GE) | O(1) all/none short-circuit: if the constant falls outside the column's [min, max] range the filter returns 0 rows without scanning; if every row must pass the whole table is returned.  Integer and float families both supported. |
 | `.idx.bloom` | `filter` — EQ on integer-family columns | Definite-absent proof: if all k probe bits are clear the key is absent and the filter returns 0 rows without scanning.  False positives fall through to the scan; there are no false absences. |
-| `.idx.hash` | `filter` — EQ on integer-family columns | Direct rowsel from hash-chain probe: matching rows are collected in O(matches) without a full column scan.  Null-free columns only (HAS_NULLS → scan). |
+| `.idx.hash` | `filter` — EQ on integer-family, `SYM` and `STR` columns | Direct rowsel from hash-chain probe: matching rows are collected in O(matches) without a full column scan.  Integer columns must be null-free (HAS_NULLS → scan); a `SYM` or `STR` column may hold nulls, since a nonzero symbol or a non-empty string never matches one.  A `STR` probe hashes the literal's bytes and confirms each hit against them; `(== s "")` (the `STR` null, whose rows the index leaves out) scans.  A generation-2 (compressed) `STR` column's saved hash is probed where it is mapped: each hit is confirmed by reading that one cell, so the column is never decompressed or loaded whole. |
 | `part` backing (`.attr.set 'parted`) | `filter` — EQ predicates | Locate the value block and build the rowsel directly from its contiguous `[start, len)` span, including dense blocks. |
 | `.idx.sort` | `filter` — range predicates (EQ/LT/LE/GT/GE) | Binary search over the row-id permutation to identify the matching span, then a rowsel is built from that span.  NE (two disjoint spans) falls back.  A selectivity guard fires when the span exceeds n/128 (~0.78%) — see [Performance Characteristics](#performance-characteristics) for the measured rationale. |
-| `.idx.hash` | `filter` — IN predicates on integer-family columns | Hash-chain probe for each set element; result is the union rowsel over all matches. |
+| `.idx.hash` | `filter` — IN predicates on integer-family, `SYM` and `STR` columns | Hash-chain probe for each set element; result is the union rowsel over all matches.  A `STR` set probes by each element's bytes; a set holding `""` scans.  On a generation-2 `STR` column the saved hash is probed where it is mapped, as for EQ. |
 | `part` backing (`.attr.set 'parted`) | `filter` — IN predicates | Match partition keys once and build the rowsel from their contiguous physical spans. |
 | `.idx.hash` / `part` backing | `where key IN …` + `group by key` | Resolve only the requested key slices and aggregate them directly, skipping filter scan and group discovery. Part slices stream as contiguous ranges. |
 | `.idx.sort` | ORDER BY — single ascending key | The pre-built permutation is reused directly rather than re-sorting.  Descending ORDER BY falls back to recompute (reversing the perm would swap tie-group positions relative to stable DESC sort). |
@@ -33,7 +33,7 @@ All five sites apply the same prechecks before consulting an index:
 
 - **Fresh:** the index's `built_for_len` must match the column's current length (mismatch → stale → fallback).
 - **No nulls (new paths):** `HAS_NULLS` set on the column → fallback for all paths except hash-EQ at the filter site, which also re-checks `HAS_NULLS` explicitly.
-- **Not parted / not MAPCOMMON:** parted and MAPCOMMON columns skip routing at the filter and IN sites.
+- **Not parted / not MAPCOMMON:** parted and MAPCOMMON columns skip routing at the filter and IN sites: a hash attached to each partition's column is not consulted by `==` or `in`, for any type.
 - **Default table:** filter and IN sites only route columns from the query's default table (non-default table references are skipped).
 
 A write to existing rows (`(alter 'v set i val)`, an `update`) drops the attached index, so the column has `HAS_INDEX` clear afterward; reattach explicitly after the write.  An append keeps a hash index and drops any other kind: `insert` (into a vector or a table's column, in place or not), `concat` and `(alter 'v concat vals)` extend the hash over the appended rows — see [Mutation Drops the Index](#mutation-drops-the-index).
@@ -54,7 +54,7 @@ Match the shape of your *query*, not the shape of the data.
 |---|---|---|
 | Constant predicate may fall outside the column's value range | `.idx.zone` | Yes — O(1) all/none short-circuit at the filter site |
 | Repeated `==` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
-| Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY and distinct |
+| Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY; distinct walks the permutation instead of hashing |
 | Cheap probabilistic membership rejection | `.idx.bloom` | Yes — definite-absent proof at filter EQ site (integer-family only) |
 
 ## Why Per-Column Indexes
@@ -65,7 +65,7 @@ An **accelerator index** is a precomputed data structure attached to the column 
 
 - `zone` — min/max plus null count (~32 bytes per column).  Prunes whole-column filter work when a constant predicate falls outside the range.
 - `hash` — chained open-addressing table.  O(1) eq / in / find; stays useful for non-unique columns via the chain.
-- `sort` — ascending row-id permutation.  Binary search for range predicates; pre-sorted ORDER BY and distinct.
+- `sort` — ascending row-id permutation.  Binary search for range predicates; pre-sorted ORDER BY; distinct without a hash table.
 - `bloom` — m-bit probabilistic membership filter (k=3 hashes).  Cheap, small, no false negatives — EQ definite-absent rejection at the filter site.
 
 ## Observability

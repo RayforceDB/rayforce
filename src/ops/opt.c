@@ -31,6 +31,7 @@
 #include "table/table.h"   /* ray_table_col_meta */
 #include "core/profile.h"
 #include "mem/heap.h"
+#include "core/types.h"   /* ray_cast_f64_to_i64_null, ray_fmod_floor */
 #include <float.h>
 #include <math.h>
 #include <string.h>
@@ -299,14 +300,16 @@ static bool atom_to_numeric(ray_t* v, double* out_f, int64_t* out_i, bool* is_f6
     if (!v || !ray_is_atom(v)) return false;
     if (RAY_ATOM_IS_NULL(v)) return false;
     switch (v->type) {
+        /* *out_i of a float is read by no fold (is_f64 says so); keep it
+         * defined past the int64 range ((% 1e300 7) reaches here). */
         case -RAY_F64:
             *out_f = v->f64;
-            *out_i = (int64_t)v->f64;
+            *out_i = ray_cast_f64_to_i64_null(v->f64);   /* not a raw cast (#1343) */
             *is_f64 = true;
             return true;
         case -RAY_F32:
             *out_f = (double)(float)v->f64;
-            *out_i = (int64_t)(float)v->f64;
+            *out_i = ray_cast_f64_to_i64_null((double)(float)v->f64);
             *is_f64 = true;
             return true;
         case -RAY_I64:
@@ -467,6 +470,12 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
     if (!le || !re || !le->literal || !re->literal) return false;
     if (!ray_is_atom(le->literal) || !ray_is_atom(re->literal)) return false;
 
+    /* A TIME counts milliseconds, a TIMESPAN nanoseconds: the arms below
+     * would mix the raw counts.  The kernel (ray_timespan_binary) scales. */
+    if ((lhs->out_type == RAY_TIME && rhs->out_type == RAY_TIMESPAN) ||
+        (lhs->out_type == RAY_TIMESPAN && rhs->out_type == RAY_TIME))
+        return false;
+
     /* Symbol ids cannot be constant-folded as ordered integers (#738). */
     if ((node->opcode == OP_LT || node->opcode == OP_LE ||
          node->opcode == OP_GT || node->opcode == OP_GE) &&
@@ -491,8 +500,7 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MUL: r = lv * rv; break;
                 case OP_MOD:
                     if (rv == 0.0f) return false;   /* 0Nf at run time */
-                    r = fmodf(lv, rv);
-                    if (r != 0.0f && ((r > 0.0f) != (rv > 0.0f))) r += rv;
+                    r = ray_fmod_floor_f32(lv, rv);
                     break;
                 case OP_MIN2: r = lv < rv ? lv : rv; break;
                 case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -512,8 +520,8 @@ static bool fold_binary_const(ray_graph_t* g, ray_op_t* node) {
                 case OP_MUL: r = lv * rv; break;
                 case OP_DIV: r = lv / rv; break;
                 case OP_MOD:
-                    r = fmod(lv, rv);
-                    if (r != 0.0 && ((r > 0.0) != (rv > 0.0))) r += rv;
+                    if (rv == 0.0) return false;    /* 0Nf at run time */
+                    r = ray_fmod_floor(lv, rv);
                     break;
                 case OP_POW:
                     if (!pow_atom_type_admitted(le->literal) ||
@@ -1751,6 +1759,23 @@ static int collect_filter_chain(ray_graph_t* g, ray_op_t* top, ray_op_t** chain,
     return n;
 }
 
+/* Whether a predicate holds an xbar (OP_FLAG_XBAR); a tree deeper than
+ * the walk counts as holding one. */
+static bool pred_has_xbar(ray_graph_t* g, ray_op_t* n, int depth) {
+    if (!n) return false;
+    if (n->flags & OP_FLAG_XBAR) return true;
+    if (depth > 64) return true;
+    for (int k = 0; k < n->arity && k < 2; k++)
+        if (n->in_id[k] != RAY_OP_NONE && pred_has_xbar(g, op_child(g, n, k), depth + 1))
+            return true;
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        if (e && e->third_in != RAY_OP_NONE && pred_has_xbar(g, op_node(g, e->third_in), depth + 1))
+            return true;
+    }
+    return false;
+}
+
 static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
     if (!g || !root) return root;
 
@@ -1850,18 +1875,30 @@ static ray_op_t* pass_filter_reorder(ray_graph_t* g, ray_op_t* root) {
          * original order for equal keys). Highest key — least selective, or
          * equally selective but costlier — goes to chain[0] (outer, runs
          * last); lowest key — most selective — goes to chain[N-1] (inner,
-         * runs first). We swap predicates, not filter nodes. */
-        for (int c = 1; c < chain_len; c++) {
-            uint32_t pred_id = chain[c]->in_id[1];
-            int cost = costs[c];
-            int j = c - 1;
-            while (j >= 0 && costs[j] < cost) {
-                chain[j + 1]->in_id[1] = chain[j]->in_id[1];
-                costs[j + 1] = costs[j];
-                j--;
+         * runs first). We swap predicates, not filter nodes.
+         * A predicate holding an xbar stays where the user wrote it, and
+         * nothing crosses it: it buckets exactly the rows the conjuncts
+         * written before it keep, so its zero bucket raises on the same
+         * rows whatever the costs (#1355).  The runs between such
+         * predicates sort among themselves. */
+        int lo = 0;
+        while (lo < chain_len) {
+            if (pred_has_xbar(g, op_child(g, chain[lo], 1), 0)) { lo++; continue; }
+            int hi = lo + 1;
+            while (hi < chain_len && !pred_has_xbar(g, op_child(g, chain[hi], 1), 0)) hi++;
+            for (int c = lo + 1; c < hi; c++) {
+                uint32_t pred_id = chain[c]->in_id[1];
+                int cost = costs[c];
+                int j = c - 1;
+                while (j >= lo && costs[j] < cost) {
+                    chain[j + 1]->in_id[1] = chain[j]->in_id[1];
+                    costs[j + 1] = costs[j];
+                    j--;
+                }
+                chain[j + 1]->in_id[1] = pred_id;
+                costs[j + 1] = cost;
             }
-            chain[j + 1]->in_id[1] = pred_id;
-            costs[j + 1] = cost;
+            lo = hi;
         }
     }
 

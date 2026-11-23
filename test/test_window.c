@@ -2286,7 +2286,8 @@ static test_result_t test_window_i16_value(void) {
         ray_t* result = ray_execute(g, w);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
         ray_t* rc = win_result_col(result, 2);
-        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rc->type, RAY_I16);   /* min / max keep the value's type (#1447) */
+        int16_t* rd = (int16_t*)ray_data(rc);
         TEST_ASSERT_EQ_I(rd[0], 10);
         TEST_ASSERT_EQ_I(rd[2], 30);
         ray_release(result); ray_graph_free(g);
@@ -2353,7 +2354,8 @@ static test_result_t test_window_u8_value(void) {
         ray_t* result = ray_execute(g, w);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
         ray_t* rc = win_result_col(result, 2);
-        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rc->type, RAY_U8);   /* min / max keep the value's type (#1447) */
+        uint8_t* rd = (uint8_t*)ray_data(rc);
         TEST_ASSERT_EQ_I(rd[0], 20);
         TEST_ASSERT_EQ_I(rd[2], 40);
         ray_release(result); ray_graph_free(g);
@@ -2406,7 +2408,8 @@ static test_result_t test_window_f64_from_i32_value(void) {
         ray_t* result = ray_execute(g, w);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
         ray_t* rc = win_result_col(result, 2);
-        int64_t* rd = (int64_t*)ray_data(rc);
+        TEST_ASSERT_EQ_I(rc->type, RAY_I32);   /* min / max keep the value's type (#1447) */
+        int32_t* rd = (int32_t*)ray_data(rc);
         TEST_ASSERT_EQ_I(rd[0], 10);
         TEST_ASSERT_EQ_I(rd[2], 30);
         ray_release(result); ray_graph_free(g);
@@ -2794,6 +2797,8 @@ static test_result_t test_window_f64_value_lag(void) {
      * FIRST_VALUE similarly.  So win_read_i64 RAY_F64 may not be reachable
      * directly from the public API (output type mirrors input type).
      * Skip this specific sub-arm; focus on confirmed reachable ones. */
+    ray_sym_destroy();
+    ray_heap_destroy();
     PASS();
 }
 

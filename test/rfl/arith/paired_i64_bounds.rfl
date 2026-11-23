@@ -1,0 +1,28 @@
+;; A full parallel proof over a plain I64 source. Check each aggregate
+;; against materialized rows, independent of aggregate planner rewrites.
+(set v (til 200001))
+(set T (table [v] (list v)))
+(set S (+ v 1))
+(set A (+ v 2))
+(set R (select {from: T s: (sum (+ v 1)) a: (avg (+ v 2))}))
+(== (at (at R 's) 0) (sum S)) -- true
+(== (at (at R 'a) 0) (avg A)) -- true
+;; The final partial morsel establishes the maximum. Only AVG's literal
+;; generates the null: SUM's proof is not a proof of AVG's root.
+(set w (concat (til 200000) [9223372036854775806]))
+(set T (table [w] (list w)))
+(set S (+ w 1))
+(set A (+ w 2))
+(set R (select {from: T s: (sum (+ w 1)) a: (avg (+ w 2))}))
+(== (at (at R 's) 0) (sum S)) -- true
+(== (at (at R 'a) 0) (avg A)) -- true
+;; One MIN in the final partial slice, then two MINs in separate slices.
+(set x (concat (concat [9223372036854775807] (til 200000)) [9223372036854775807]))
+(set y (concat (concat [2] (til 200000)) [1]))
+(set T (table [x y] (list x y)))
+(set rows (+ x y))
+(== (at (at (select {from: T s: (sum (+ x y))}) 's) 0) (sum rows)) -- true
+(set y (concat (concat [1] (til 200000)) [1]))
+(set T (table [x y] (list x y)))
+(set rows (+ x y))
+(== (at (at (select {from: T s: (sum (+ x y))}) 's) 0) (sum rows)) -- true

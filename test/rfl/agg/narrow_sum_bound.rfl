@@ -1,0 +1,185 @@
+;; @also-unfused
+;; A narrow sum, (sum (+ h k)) over I16 columns and the like, is summed term
+;; by term in I64 (the linear and affine plans) only when the columns' bounds
+;; prove that no row of a narrow node wraps or lands on its type's null
+;; (#1287); otherwise it is summed row by row.  Every answer here is the
+;; eager per-row one.  The routes are pinned by the C test
+;; lang/query/narrow_sum_bound_routes.
+
+;; ─── flat, 200k rows (the parallel proof pass) ───────────────────────
+(set n 200000)
+(set I (til n))
+(set h (as 'I16 (- (% I 2001) 1000)))
+(set k (as 'I16 (- (% (* I 7) 1999) 999)))
+(set u (as 'U8 (% I 100)))
+(set v (as 'U8 (% (* I 3) 101)))
+(set i (as 'I32 (- (% I 200001) 100000)))
+(set j (as 'I32 (% (* I 7) 99991)))
+(set T (table [h k u v i j] (list h k u v i j)))
+
+;; nothing can wrap: the plans
+(at (select {s: (sum (+ h k)) from: T}) 's) -- (enlist (sum (+ h k)))
+(at (select {s: (sum (* h 3h)) from: T}) 's) -- (enlist (sum (* h 3h)))
+(at (select {s: (sum (+ u v)) from: T}) 's) -- (enlist (sum (+ u v)))
+(at (select {s: (sum (+ i j)) from: T}) 's) -- (enlist (sum (+ i j)))
+(at (select {s: (sum (- (* 2h h) k)) from: T}) 's) -- (enlist (sum (- (* 2h h) k)))
+(at (select {s: (avg (+ h k)) from: T}) 's) -- (enlist (avg (+ h k)))
+(at (select {s: (avg (+ i j)) from: T}) 's) -- (enlist (avg (+ i j)))
+(at (select {s: (sum (+ h 1h)) from: T}) 's) -- (enlist (sum (+ h 1h)))
+(at (select {s: (sum (+ h 5i)) from: T}) 's) -- (enlist (sum (+ h 5i)))
+(at (select {s: (sum (+ h k)) from: T where: (> i 0)}) 's) -- (enlist (sum (+ (at h (where (> i 0))) (at k (where (> i 0))))))
+(at (select {s: (sum (+ h k)) c: (count h) from: T}) 's) -- (enlist (sum (+ h k)))
+(sum (+ h k)) -- -160300
+
+;; one row can wrap, outside the sampled blocks (rows n/4*k .. +1023): per row
+(set W 170001)
+(set hw (concat (take h W) (concat (enlist 30000h) (drop h (+ W 1)))))
+(set kw (concat (take k W) (concat (enlist 30000h) (drop k (+ W 1)))))
+(set uw (concat (take u W) (concat (enlist 0xc8) (drop u (+ W 1)))))
+(set vw (concat (take v W) (concat (enlist 0x64) (drop v (+ W 1)))))
+(set iw (concat (take i W) (concat (enlist 2000000000i) (drop i (+ W 1)))))
+(set jw (concat (take j W) (concat (enlist 2000000000i) (drop j (+ W 1)))))
+(set TW (table [h k u v i j] (list hw kw uw vw iw jw)))
+(at (select {s: (sum (+ h k)) from: TW}) 's) -- (enlist (sum (+ hw kw)))
+(at (select {s: (sum (* h 3h)) from: TW}) 's) -- (enlist (sum (* hw 3h)))
+(at (select {s: (sum (+ u v)) from: TW}) 's) -- (enlist (sum (+ uw vw)))
+(at (select {s: (sum (+ i j)) from: TW}) 's) -- (enlist (sum (+ iw jw)))
+(at (select {s: (avg (+ i j)) from: TW}) 's) -- (enlist (avg (+ iw jw)))
+(at (select {s: (sum (+ h k)) from: TW where: (> i -1000000)}) 's) -- (enlist (sum (+ hw kw)))
+;; the slice holding it is summed row by row by the pass, the rest from the terms
+(at (select {s: (sum (+ h 30000h)) from: TW}) 's) -- (enlist (sum (+ hw 30000h)))
+(at (select {s: (avg (- (neg h) k)) from: TW}) 's) -- (enlist (avg (- (neg hw) kw)))
+(at (select {s: (sum (+ (* h 2h) (+ k 1h))) from: TW}) 's) -- (enlist (sum (+ (* hw 2h) (+ kw 1h))))
+(at (select {s: (sum (+ (* h 3h) i)) from: TW}) 's) -- (enlist (sum (+ (* hw 3h) iw)))
+(at (select {s: (sum (+ u (+ v 0x64))) from: TW}) 's) -- (enlist (sum (+ uw (+ vw 0x64))))
+;; two aggregates: the per-term plan cannot take it, per row
+(at (select {s: (sum (+ h k)) c: (sum (+ u v)) from: TW}) 'c) -- (enlist (sum (+ uw vw)))
+(at (select {s: (sum (+ h k)) c: (sum (+ u v)) from: TW}) 's) -- (enlist (sum (+ hw kw)))
+;; the wrapped row, against the I64 sum of the terms
+(- (sum (+ hw kw)) (+ (sum hw) (sum kw))) -- -65536
+(- (sum (+ uw vw)) (+ (sum uw) (sum vw))) -- -256
+(- (sum (+ iw jw)) (+ (sum iw) (sum jw))) -- -4294967296
+
+;; a wrap in every block: the sample refuses at once
+(set hf (as 'I16 (- (% (* I 13) 65536) 32768)))
+(set TF (table [h k] (list hf hf)))
+(at (select {s: (sum (+ h k)) from: TF}) 's) -- (enlist (sum (+ hf hf)))
+(at (select {s: (sum (* h 3h)) from: TF}) 's) -- (enlist (sum (* hf 3h)))
+
+;; a row landing on the null sentinel, without a wrap and with one: per row
+(set hs (concat (take h W) (concat (enlist -16384h) (drop h (+ W 1)))))
+(set ks (concat (take k W) (concat (enlist -16384h) (drop k (+ W 1)))))
+(set TS (table [h k] (list hs ks)))
+(at (select {s: (sum (+ h k)) from: TS}) 's) -- (enlist (sum (+ hs ks)))
+(at (select {s: (avg (+ h k)) from: TS}) 's) -- (enlist (avg (+ hs ks)))
+(set hx (concat (take h W) (concat (enlist 32767h) (drop h (+ W 1)))))
+(set kq (concat (take k W) (concat (enlist 1h) (drop k (+ W 1)))))
+(set TX (table [h k] (list hx kq)))
+(at (select {s: (sum (+ h k)) from: TX}) 's) -- (enlist (sum (+ hx kq)))
+(at (select {s: (sum (+ h 1h)) from: TX}) 's) -- (enlist (sum (+ hx 1h)))
+(at (select {s: (avg (+ h 1h)) from: TX}) 's) -- (enlist (avg (+ hx 1h)))
+
+;; nulls in the columns: the null rows are skipped as per row
+(set hn (concat (take h W) (concat (enlist 0Nh) (drop h (+ W 1)))))
+(set in (concat (take i W) (concat (enlist 0Ni) (drop i (+ W 1)))))
+(set TN (table [h k i j] (list hn k in j)))
+(at (select {s: (sum (+ h k)) from: TN}) 's) -- (enlist (sum (+ hn k)))
+(at (select {s: (sum (+ i j)) from: TN}) 's) -- (enlist (sum (+ in j)))
+(at (select {s: (sum (+ h 1h)) from: TN}) 's) -- (enlist (sum (+ hn 1h)))
+(at (select {s: (avg (+ h 1h)) from: TN}) 's) -- (enlist (avg (+ hn 1h)))
+(at (select {s: (sum (- h 7h)) from: TN}) 's) -- (enlist (sum (- hn 7h)))
+(set hnx (concat (take hx W) (concat (enlist 0Nh) (drop hx (+ W 1)))))
+(set TNX (table [h] (list hnx)))
+(at (select {s: (sum (+ h 1h)) from: TNX}) 's) -- (enlist (sum (+ hnx 1h)))
+
+;; grouped
+(set G (table [g h k] (list (% I 5) h k)))
+(set GW (table [g h k] (list (% I 5) hw kw)))
+(at (select {s: (sum (+ h k)) from: G by: g}) 's) -- (map (fn [x] (sum (+ (at h (where (== (% I 5) x))) (at k (where (== (% I 5) x)))))) (til 5))
+(at (select {s: (sum (+ h k)) from: GW by: g}) 's) -- (map (fn [x] (sum (+ (at hw (where (== (% I 5) x))) (at kw (where (== (% I 5) x)))))) (til 5))
+(at (select {s: (sum (+ h 1h)) from: GW by: g}) 's) -- (map (fn [x] (sum (+ (at hw (where (== (% I 5) x))) 1h))) (til 5))
+
+;; ─── small (one serial pass) ─────────────────────────────────────────
+(set ts (table [h k u v] (list [1h -2h 300h] [4h 5h -6h] (as 'U8 [1 2 3]) (as 'U8 [250 1 2]))))
+(at (select {s: (sum (+ h k)) from: ts}) 's) -- [302]
+(at (select {s: (sum (* h 200h)) from: ts}) 's) -- (enlist (sum (* [1h -2h 300h] 200h)))
+(at (select {s: (sum (* h 200h)) from: ts}) 's) -- [-5736]
+(at (select {s: (sum (+ u v)) from: ts}) 's) -- [259]
+(at (select {s: (sum (+ u (+ v 5))) from: ts}) 's) -- [274]
+(at (select {s: (sum (+ u (+ v 0x05))) from: ts}) 's) -- [18]
+
+;; ─── column metadata: zone, sorted, splayed (chunk zone) ─────────────
+(set TZ (table [h k] (list (.idx.zone h) (.idx.zone k))))
+(at (select {s: (sum (+ h k)) from: TZ}) 's) -- (enlist (sum (+ h k)))
+(set TZW (table [h k] (list (.idx.zone hw) (.idx.zone kw))))
+(at (select {s: (sum (+ h k)) from: TZW}) 's) -- (enlist (sum (+ hw kw)))
+(set hsort (.attr.set 'sorted (asc h)))
+(set TO (table [h k] (list hsort hsort)))
+(at (select {s: (sum (+ h k)) from: TO}) 's) -- (enlist (sum (+ hsort hsort)))
+(set hsortw (.attr.set 'sorted (asc hw)))
+(set TOW (table [h k] (list hsortw hsortw)))
+(at (select {s: (sum (+ h k)) from: TOW}) 's) -- (enlist (sum (+ hsortw hsortw)))
+
+(.sys.exec "rm -rf /tmp/rfl_narrow_sum_bound")
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/s0/" T {compress: false})
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/w0/" TW {compress: false})
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/s2/" T {compress: true})
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/w2/" TW {compress: true})
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/n2/" TN {compress: true})
+(set S0 (.db.splayed.get "/tmp/rfl_narrow_sum_bound/s0/"))
+(set W0 (.db.splayed.get "/tmp/rfl_narrow_sum_bound/w0/"))
+(set S2 (.db.splayed.get "/tmp/rfl_narrow_sum_bound/s2/"))
+(set W2 (.db.splayed.get "/tmp/rfl_narrow_sum_bound/w2/"))
+(set N2 (.db.splayed.get "/tmp/rfl_narrow_sum_bound/n2/"))
+(at (select {s: (sum (+ h k)) a: (sum (* h 3h)) b: (sum (+ u v)) c: (sum (+ i j)) d: (sum (+ h 1h)) from: S0}) 's) -- (enlist (sum (+ h k)))
+(at (select {s: (sum (+ h k)) from: S0}) 's) -- (enlist (sum (+ h k)))
+(at (select {s: (sum (* h 3h)) from: S0}) 's) -- (enlist (sum (* h 3h)))
+(at (select {s: (sum (+ u v)) from: S0}) 's) -- (enlist (sum (+ u v)))
+(at (select {s: (sum (+ i j)) from: S0}) 's) -- (enlist (sum (+ i j)))
+(at (select {s: (sum (+ h 1h)) from: S0}) 's) -- (enlist (sum (+ h 1h)))
+(at (select {s: (sum (+ h k)) from: W0}) 's) -- (enlist (sum (+ hw kw)))
+(at (select {s: (sum (* h 3h)) from: W0}) 's) -- (enlist (sum (* hw 3h)))
+(at (select {s: (sum (+ u v)) from: W0}) 's) -- (enlist (sum (+ uw vw)))
+(at (select {s: (sum (+ i j)) from: W0}) 's) -- (enlist (sum (+ iw jw)))
+(at (select {s: (sum (+ h k)) from: S2}) 's) -- (enlist (sum (+ h k)))
+(at (select {s: (sum (+ h 1h)) from: S2}) 's) -- (enlist (sum (+ h 1h)))
+(at (select {s: (sum (+ h k)) from: W2}) 's) -- (enlist (sum (+ hw kw)))
+(at (select {s: (sum (+ h 1h)) from: W2}) 's) -- (enlist (sum (+ hw 1h)))
+(at (select {s: (sum (+ h 1h)) from: N2}) 's) -- (enlist (sum (+ hn 1h)))
+(at (select {s: (avg (+ h 1h)) from: N2}) 's) -- (enlist (avg (+ hn 1h)))
+
+;; parted: per partition, per row
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/p/1/t/" T)
+(.db.splayed.set "/tmp/rfl_narrow_sum_bound/p/2/t/" TW)
+(set P (.db.parted.get "/tmp/rfl_narrow_sum_bound/p/" 't))
+(at (select {s: (sum (+ h k)) from: P}) 's) -- (enlist (+ (sum (+ h k)) (sum (+ hw kw))))
+(at (select {s: (sum (+ h 1h)) from: P}) 's) -- (enlist (+ (sum (+ h 1h)) (sum (+ hw 1h))))
+(.sys.exec "rm -rf /tmp/rfl_narrow_sum_bound")
+
+;; ─── a nullable column whose coefficient cancels to zero ─────────────
+;; the per-row answer skips its null rows, so the plans must not drop it
+(set vc (as 'U8 [128 133 164]))
+(set ic [-927849349i -927849348i 0Ni])
+(set TC (table [v i] (list vc ic)))
+(at (select {s: (avg (+ v (- i i))) from: TC}) 's) -- (enlist (avg (+ vc (- ic ic))))
+(at (select {s: (avg (+ v (- i i))) from: TC}) 's) -- [130.5]
+(at (select {s: (sum (+ v (* i 0i))) from: TC}) 's) -- (enlist (sum (+ vc (* ic 0i))))
+(at (select {s: (sum (+ v (* i 0i))) from: TC}) 's) -- [261]
+(at (select {s: (sum (- 7i (* i 0i))) from: TC}) 's) -- (enlist (sum (- 7i (* ic 0i))))
+(at (select {s: (sum (- 7i (* i 0i))) from: TC}) 's) -- [14]
+(set xc [1 2 3])
+(set yc [1 2 0Nl])
+(set TY (table [x y] (list xc yc)))
+(at (select {s: (sum (+ x (* y 0))) from: TY}) 's) -- (enlist (sum (+ xc (* yc 0))))
+(at (select {s: (sum (+ x (* y 0))) from: TY}) 's) -- [3]
+(at (select {s: (avg (+ x (- y y))) from: TY}) 's) -- (enlist (avg (+ xc (- yc yc))))
+(at (select {s: (avg (+ x (- y y))) from: TY}) 's) -- [1.5]
+;; cancelling inside a longer chain
+(at (select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: TY}) 's) -- (enlist (sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3))))
+(at (select {s: (sum (- (+ (+ x (* 3 y)) 5) (* y 3))) from: TY}) 's) -- [13]
+(at (select {s: (sum (+ (- v (* 2i i)) (+ (* i 2i) 1i))) from: TC}) 's) -- (enlist (sum (+ (- vc (* 2i ic)) (+ (* ic 2i) 1i))))
+
+;; a narrow constant subtree wraps in its width per row (not folded in I64)
+(set T100 (table [x] (list (til 100))))
+(at (select {s: (sum (* -12038h 0x7f)) from: T100}) 's) -- [-2149800]
+(at (select {s: (sum (+ x (* -12038h 0x7f))) from: T100}) 's) -- (enlist (sum (+ (til 100) (* -12038h 0x7f))))

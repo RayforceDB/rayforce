@@ -261,6 +261,12 @@ int       ray_ipc_send_cancel(int64_t handle);
  * `handle` the server has not confirmed yet, or -1. */
 void      ray_ipc_hold_cancel_for_test(bool hold);
 int       ray_ipc_cancel_unconfirmed_for_test(int64_t handle);
+/* Clear the process-wide cancel state (the connection being evaluated,
+ * its cancel number, a taken byte).  The rule is one serving thread per
+ * process; a test that runs a client and a server on two threads of one
+ * process breaks it, and their save/restore of this state can interleave
+ * and leave a stale descriptor behind for the next test (#1265). */
+void      ray_ipc_cancel_state_reset_for_test(void);
 /* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
  * On expiry the connection is closed (on.close fires) and an `io` error
  * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */

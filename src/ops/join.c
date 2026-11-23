@@ -57,6 +57,21 @@ bool ray_join_no_prefilter = false;
 uint64_t ray_join_prefilter_builds = 0;
 _Atomic(uint64_t) ray_join_prefilter_skips = 0;
 
+/* #599: probe-side rows from which the chained probe goes to the pool, set by
+ * (.sys.join.par.min).  The default reproduces the morsel rule — a probe of
+ * more than one JOIN_MORSEL splits — so a value at or below it changes
+ * nothing.  Raising it trades latency for CPU on joins under the floor.  Read
+ * once per join, relaxed: a concurrent set takes effect from the next join. */
+static _Atomic(int64_t) g_join_par_min = RAY_JOIN_PAR_MIN_DEFAULT;
+int64_t ray_join_par_min(void) {
+    return atomic_load_explicit(&g_join_par_min, memory_order_relaxed);
+}
+void ray_join_set_par_min(int64_t rows) {
+    atomic_store_explicit(&g_join_par_min, rows, memory_order_relaxed);
+}
+/* Diagnostic: chained-probe passes (count, fill) dispatched to the pool. */
+_Atomic(uint64_t) ray_join_par_probes = 0;
+
 /* ── #597: null-free key proof ───────────────────────────────────────────
  * ray_vec_is_null is an out-of-line call (no LTO), and the join makes one
  * per key column per row in hash_row_keys plus two per key column per
@@ -180,8 +195,28 @@ static inline bool join_str_eq_hashed(const ray_str_t* a, const char* pool_a,
  * real key's hash is resolved by join_keys_eq, as for any other hash. */
 #define JOIN_NULL_KEY_HASH INT64_C(0x5B7A6D3F2E1C0A94)
 
+/* RAY_KEY_SPAN_* bits over both sides' LIST key columns, folded with the
+ * nullfree proof into the flags every key hash and compare reads. */
+static uint8_t join_key_flags(ray_t* const* l_vecs, ray_t* const* r_vecs,
+                              uint32_t n_keys, bool nullfree) {
+    int spans = 0;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        if (l_vecs[k] && l_vecs[k]->type == RAY_LIST) spans |= ray_key_spans(l_vecs[k]);
+        if (r_vecs[k] && r_vecs[k]->type == RAY_LIST) spans |= ray_key_spans(r_vecs[k]);
+    }
+    return (uint8_t)((nullfree ? 1u : 0u) | ((unsigned)spans << 1));
+}
+
+/* Join key flags, built once per join (join_key_flags): bit 0 says no key
+ * column can hold a null (#597); the bits above hold the RAY_KEY_SPAN_*
+ * bits of every LIST key cell on either side, so LIST cells hash with the
+ * spans atom_eq needs and no coarser (#1373). */
+#define JOIN_KF_NULLFREE 1u
+#define JOIN_KF_SPANS(kf) ((int)((kf) >> 1))
+
 static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
-                              bool nullfree) {
+                              uint8_t kf) {
+    bool nullfree = kf & JOIN_KF_NULLFREE;
     uint64_t h = 0;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* col = key_vecs[k];
@@ -203,6 +238,11 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
             kh = ray_hash_bytes((const uint8_t*)ray_data(col) + row * 16, 16);
         } else if (col->type == RAY_F64) {
             kh = ray_hash_f64(((double*)ray_data(col))[row]);
+        } else if (col->type == RAY_LIST) {
+            /* A LIST key cell hashes as group and distinct hash it, with the
+             * span bits of both sides' LIST keys (join_key_flags), so the
+             * hash agrees with atom_eq across them (#1373). */
+            kh = ray_key_hash(((ray_t**)ray_data(col))[row], JOIN_KF_SPANS(kf));
         } else {
             int64_t kv = read_col_i64(ray_data(col), row, col->type, col->attrs);
             /* sym-domain Phase 2: a SYM cell id is a position in the
@@ -293,7 +333,7 @@ typedef struct {
     uint32_t* hashes;    /* output: hash[row] */
     const ray_str_t* str_desc; /* one-key STR specialization, else NULL */
     const char*       str_pool;
-    bool      nullfree;  /* #597: no key column can hold a null */
+    uint8_t      nullfree;  /* #597: no key column can hold a null */
 } join_radix_hash_ctx_t;
 
 static void join_radix_hash_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -315,7 +355,7 @@ static void join_radix_hash_fn(void* raw, uint32_t wid, int64_t start, int64_t e
 }
 
 static join_radix_hash_ctx_t join_radix_hash_ctx(ray_t** keys, uint32_t n_keys,
-                                                  uint32_t* hashes, bool nullfree) {
+                                                  uint32_t* hashes, uint8_t nullfree) {
     join_radix_hash_ctx_t c = {
         .key_vecs = keys, .n_keys = n_keys, .hashes = hashes,
         .str_desc = NULL, .str_pool = NULL, .nullfree = nullfree,
@@ -661,7 +701,8 @@ static ray_t* join_gather_col_rows(ray_t* src, const int64_t* idx,
 
 /* Key equality helper — shared by count + fill phases */
 static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint32_t n_keys,
-                                 int64_t l, int64_t r, bool nullfree) {
+                                 int64_t l, int64_t r, uint8_t kf) {
+    bool nullfree = kf & JOIN_KF_NULLFREE;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* lc = l_vecs[k];
         ray_t* rc = r_vecs[k];
@@ -685,6 +726,13 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
              * equal only to their own kind. */
             if ((lc->type == RAY_STR)  != (rc->type == RAY_STR))  return false;
             if ((lc->type == RAY_GUID) != (rc->type == RAY_GUID)) return false;
+            continue;
+        }
+        if (lc->type == RAY_LIST || rc->type == RAY_LIST) {
+            /* LIST key cells compare by value (atom_eq), not by pointer;
+             * a LIST key meets only a LIST key, as STR meets only STR. */
+            if (lc->type != RAY_LIST || rc->type != RAY_LIST) return false;
+            if (!atom_eq(((ray_t**)ray_data(lc))[l], ((ray_t**)ray_data(rc))[r])) return false;
             continue;
         }
         if (lc->type == RAY_STR || rc->type == RAY_STR) {
@@ -745,7 +793,7 @@ typedef struct {
     const char*      l_str_pool;
     const char*      r_str_pool;
     uint8_t        join_type;
-    bool           nullfree;     /* #597: no key column can hold a null */
+    uint8_t           nullfree;     /* #597: no key column can hold a null */
     /* Per-partition output: pp_l[p], pp_r[p] are local buffers */
     int32_t**      pp_l;         /* per-partition left indices (int32_t) */
     int32_t**      pp_r;         /* per-partition right indices (int32_t) */
@@ -988,7 +1036,7 @@ typedef struct {
     /* ASP-Join: semijoin filter from factorized left side (NULL if N/A) */
     uint64_t* asp_bits;
     int64_t   asp_key_max;
-    bool      nullfree;     /* #597: no key column can hold a null */
+    uint8_t      nullfree;     /* #597: no key column can hold a null */
 } join_build_ctx_t;
 
 static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
@@ -1026,6 +1074,8 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 }
 
 #define JOIN_MORSEL 8192
+_Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
+               "the default probe floor must keep the one-morsel split rule");
 
 /* ── #595: right-side key bitmap prefilter ────────────────────────────────
  * One bitmap per chosen key column, over the right side's values of that
@@ -1285,7 +1335,7 @@ typedef struct {
     /* #595: key bitmap prefilter, n_pf == 0 when not applicable */
     const join_pf_col_t* pf;
     uint32_t     n_pf;
-    bool         nullfree;  /* #597: no key column can hold a null */
+    uint8_t         nullfree;  /* #597: no key column can hold a null */
     /* One null-free 8-byte integer key on both sides: its cells, read in
      * place of hash_row_keys / join_keys_eq (NULL otherwise). */
     const int64_t* l64;
@@ -1545,6 +1595,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
     /* #597: one proof for the whole join — see join_keys_nullfree. */
     bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
+    uint8_t keys_kf = join_key_flags(l_key_vecs, r_key_vecs, n_keys, keys_nullfree);
     if (keys_nullfree) ray_join_nullfree_keys++;
 
     ray_pool_t* pool = ray_pool_get();
@@ -1634,8 +1685,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             if (l_hash_hdr) scratch_free(l_hash_hdr);
             goto chained_ht_fallback;
         }
-        join_radix_hash_ctx_t rhctx = join_radix_hash_ctx(build_keys, n_keys, r_hashes, keys_nullfree);
-        join_radix_hash_ctx_t lhctx = join_radix_hash_ctx(probe_keys, n_keys, l_hashes, keys_nullfree);
+        join_radix_hash_ctx_t rhctx = join_radix_hash_ctx(build_keys, n_keys, r_hashes, keys_kf);
+        join_radix_hash_ctx_t lhctx = join_radix_hash_ctx(probe_keys, n_keys, l_hashes, keys_kf);
         if (pool) {
             ray_pool_dispatch(pool, join_radix_hash_fn, &rhctx, build_rows);
             ray_pool_dispatch(pool, join_radix_hash_fn, &lhctx, probe_rows);
@@ -1729,7 +1780,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
         join_radix_bp_ctx_t bp_ctx = {
             .l_parts = l_parts, .r_parts = r_parts,
             .l_key_vecs = probe_keys, .r_key_vecs = build_keys,
-            .n_keys = n_keys, .join_type = join_type, .nullfree = keys_nullfree,
+            .n_keys = n_keys, .join_type = join_type, .nullfree = keys_kf,
             .l_str_desc = lhctx.str_desc, .r_str_desc = rhctx.str_desc,
             .l_str_pool = lhctx.str_pool, .r_str_pool = rhctx.str_pool,
             .pp_l = pp_l, .pp_r = pp_r,
@@ -1906,7 +1957,7 @@ chained_ht_fallback:;
             .n_keys     = n_keys,
             .asp_bits   = asp_bits,
             .asp_key_max = asp_key_max,
-            .nullfree   = keys_nullfree,
+            .nullfree   = keys_kf,
         };
         if (pool && right_rows > RAY_PARALLEL_THRESHOLD)
             ray_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
@@ -1930,6 +1981,9 @@ chained_ht_fallback:;
     /* Pass 2: Parallel probe (two-pass: count → prefix-sum → fill) */
     uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
     if (n_tasks == 0) n_tasks = 1;
+    /* #599: below the settable floor the morsels run on this thread.  Same
+     * morsels either way, so the output and its order do not change. */
+    bool par_probe = pool && n_tasks > 1 && left_rows >= ray_join_par_min();
 
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
@@ -1961,7 +2015,7 @@ chained_ht_fallback:;
         .matched_right = matched_right,
         .pf          = pf_cols,
         .n_pf        = n_pf,
-        .nullfree    = keys_nullfree,
+        .nullfree    = keys_kf,
     };
     if (n_keys == 1 && keys_nullfree && l_key_vecs[0] && r_key_vecs[0] &&
         !ray_is_atom(l_key_vecs[0]) && !ray_is_atom(r_key_vecs[0]) &&
@@ -1978,9 +2032,10 @@ chained_ht_fallback:;
         ? (pf_s64 ? join_count_s64_fn : join_count_fn)
         : (pf_s64 ? join_count_tiny_s64_fn : join_count_tiny_fn);
     /* 2a: Count matches per morsel */
-    if (pool && n_tasks > 1)
+    if (par_probe) {
+        atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
         ray_pool_dispatch_n(pool, count_probe, &probe_ctx, n_tasks);
-    else
+    } else
         for (uint32_t t = 0; t < n_tasks; t++)
             count_probe(&probe_ctx, 0, t, t + 1);
 
@@ -2008,9 +2063,10 @@ chained_ht_fallback:;
         const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP
             ? (pf_s64 ? join_fill_s64_fn : join_fill_fn)
             : (pf_s64 ? join_fill_tiny_s64_fn : join_fill_tiny_fn);
-        if (pool && n_tasks > 1)
+        if (par_probe) {
+            atomic_fetch_add_explicit(&ray_join_par_probes, 1, memory_order_relaxed);
             ray_pool_dispatch_n(pool, fill_probe, &probe_ctx, n_tasks);
-        else
+        } else
             for (uint32_t t = 0; t < n_tasks; t++)
                 fill_probe(&probe_ctx, 0, t, t + 1);
     }
@@ -2539,6 +2595,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
 
     /* #597: one proof for the whole anti-join — see join_keys_nullfree. */
     bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
+    uint8_t keys_kf = join_key_flags(l_key_vecs, r_key_vecs, n_keys, keys_nullfree);
     if (keys_nullfree) ray_join_nullfree_keys++;
 
     /* Build chained hash table from right side */
@@ -2574,7 +2631,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             .n_keys     = n_keys,
             .asp_bits   = NULL,
             .asp_key_max = 0,
-            .nullfree   = keys_nullfree,
+            .nullfree   = keys_kf,
         };
         if (pool && right_rows > RAY_PARALLEL_THRESHOLD)
             ray_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
@@ -2613,11 +2670,11 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             scratch_free(key_vecs_hdr);
             return ray_error("cancel", NULL);
         }
-        uint64_t h = hash_row_keys(l_key_vecs, n_keys, l, keys_nullfree);
+        uint64_t h = hash_row_keys(l_key_vecs, n_keys, l, keys_kf);
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
         for (uint32_t r = ht_heads[slot]; r != JHT_EMPTY; r = ht_next[r]) {
-            if (join_keys_eq(l_key_vecs, r_key_vecs, n_keys, l, (int64_t)r, keys_nullfree)) {
+            if (join_keys_eq(l_key_vecs, r_key_vecs, n_keys, l, (int64_t)r, keys_kf)) {
                 matched = true;
                 break;  /* anti-join: one match is enough to exclude */
             }
@@ -2709,6 +2766,225 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
 ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
                             ray_t* left_table, ray_t* right_table) {
     return join_with_parted_guard(g, op, left_table, right_table, exec_antijoin_flat);
+}
+
+/* ============================================================================
+ * semi-mask / anti-mask (#596): the probe's matched flag per left row,
+ * written as a BOOL vector over the left side instead of gathered.  Same
+ * build, the same #595 prefilter and the same key equality as the inner
+ * join, so a left row is true in the semi mask iff the inner join emits it.
+ * ============================================================================ */
+
+typedef struct {
+    _Atomic(uint32_t)* ht_heads;
+    const uint32_t*    ht_next;
+    uint32_t           ht_mask;
+    ray_t**            l_key_vecs;
+    ray_t**            r_key_vecs;
+    uint32_t           n_keys;
+    const join_pf_col_t* pf;
+    uint32_t           n_pf;
+    uint8_t               nullfree;
+    uint8_t            hit;     /* written for a matched row: 1 semi, 0 anti */
+    uint8_t*           out;
+} join_mask_ctx_t;
+
+RAY_INLINE uint8_t join_mask_probe(const join_mask_ctx_t* c, int64_t l, uint64_t h) {
+    for (uint32_t r = c->ht_heads[(uint32_t)(h & c->ht_mask)]; r != JHT_EMPTY; r = c->ht_next[r])
+        if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree))
+            return c->hit;
+    return (uint8_t)!c->hit;
+}
+
+RAY_INLINE void join_mask_rows(void* raw, int64_t start, int64_t end,
+                               bool prefetch_heads, bool single64) {
+    join_mask_ctx_t* c = (join_mask_ctx_t*)raw;
+    if (prefetch_heads) {
+        /* Row l+8's hash is computed once: prefetched, then kept in an
+         * 8-slot ring for its own probe.  The caller takes this path only
+         * without a prefilter, so no row is rejected. */
+        uint8_t* restrict out = c->out;
+        uint64_t ring[8];
+        int64_t pre = end - start < 8 ? end : start + 8;
+        for (int64_t l = start; l < pre; l++) {
+            uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+            ring[l & 7] = h;
+            __builtin_prefetch(&c->ht_heads[(uint32_t)(h & c->ht_mask)], 0, 1);
+        }
+        for (int64_t l = start; l < end; l++) {
+            uint64_t h = ring[l & 7];
+            if (l + 8 < end) {
+                uint64_t nh = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
+                ring[l & 7] = nh;
+                __builtin_prefetch(&c->ht_heads[(uint32_t)(nh & c->ht_mask)], 0, 1);
+            }
+            out[l] = join_mask_probe(c, l, h);
+        }
+        return;
+    }
+    const join_pf_col_t* pf = c->pf;
+    uint32_t n_pf = c->n_pf;
+    const int64_t*  d64    = single64 ? (const int64_t*)pf[0].data : NULL;
+    const uint64_t* bits64 = single64 ? pf[0].bits : NULL;
+    uint64_t base64 = single64 ? (uint64_t)pf[0].base : 0;
+    uint64_t span64 = single64 ? pf[0].span : 0;
+    uint8_t miss = (uint8_t)!c->hit;
+    uint8_t* restrict out = c->out;
+
+    int64_t skipped = 0;
+    for (int64_t l = start; l < end; l++) {
+        if (JOIN_PF_REJECT(l)) { out[l] = miss; skipped++; continue; }
+        out[l] = join_mask_probe(c, l, hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree));
+    }
+    if (skipped)
+        atomic_fetch_add_explicit(&ray_join_prefilter_skips, (uint64_t)skipped,
+                                  memory_order_relaxed);
+}
+
+static void join_mask_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, true, false);
+}
+static void join_mask_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, false, false);
+}
+static void join_mask_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid; join_mask_rows(raw, start, end, false, true);
+}
+
+/* BOOL vector over left's rows: true where some right row equals it on
+ * every key in key_names[0..n_keys) (anti: the negation).  Keys are column
+ * names present in both tables (the caller checks).  Flat tables only:
+ * ray_join_mask below flattens a parted side first. */
+static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
+                             const int64_t* key_names, uint32_t n_keys, bool anti) {
+    int64_t left_rows  = ray_table_nrows(left_table);
+    int64_t right_rows = ray_table_nrows(right_table);
+    if (right_rows > (int64_t)INT32_MAX || left_rows > (int64_t)INT32_MAX)
+        return ray_error("nyi", NULL);
+
+    ray_t* mask = ray_vec_new(RAY_BOOL, left_rows);
+    if (!mask || RAY_IS_ERR(mask)) return mask ? mask : ray_error("oom", NULL);
+    mask->len = left_rows;
+    uint8_t* out = (uint8_t*)ray_data(mask);
+    if (right_rows == 0 || left_rows == 0) {
+        memset(out, anti, (size_t)left_rows);
+        return mask;
+    }
+
+    ray_t* key_vecs_hdr = NULL;
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
+                                               (size_t)n_keys * 2 * sizeof(ray_t*));
+    if (!key_vecs) { ray_release(mask); return ray_error("oom", NULL); }
+    ray_t** l_key_vecs = key_vecs;
+    ray_t** r_key_vecs = key_vecs + n_keys;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* lc = ray_table_col(left_table, key_names[k]);
+        ray_t* rc = ray_table_col(right_table, key_names[k]);
+        ray_t* e = (lc && RAY_IS_ERR(lc)) ? lc : (rc && RAY_IS_ERR(rc)) ? rc : NULL;
+        if (e || !lc || !rc) {
+            scratch_free(key_vecs_hdr); ray_release(mask);
+            return e ? e : ray_error("domain", "mask: key column not found");
+        }
+        l_key_vecs[k] = lc;
+        r_key_vecs[k] = rc;
+    }
+
+    ray_t* err = NULL;
+    ray_t* ht_next_hdr = NULL;
+    ray_t* ht_heads_hdr = NULL;
+    join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
+    uint32_t n_pf = 0;
+
+    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
+        err = ray_error("oom", "join: sym domain runtime-id LUT build failed");
+        goto out;
+    }
+    bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
+    uint8_t keys_kf = join_key_flags(l_key_vecs, r_key_vecs, n_keys, keys_nullfree);
+    if (keys_nullfree) ray_join_nullfree_keys++;
+
+    uint64_t ht_cap64 = JHT_MIN_CAP;
+    while (ht_cap64 < (uint64_t)right_rows * 2) ht_cap64 *= 2;
+    if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
+    uint32_t ht_cap = (uint32_t)ht_cap64;
+    uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr, (size_t)right_rows * sizeof(uint32_t));
+    _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr,
+                                                                     ht_cap * sizeof(uint32_t));
+    if (!ht_next || !ht_heads) { err = ray_error("oom", NULL); goto out; }
+    memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY */
+
+    ray_pool_t* pool = ray_pool_get();
+    join_build_ctx_t bctx = {
+        .ht_heads = ht_heads, .ht_next = ht_next, .ht_mask = ht_cap - 1,
+        .r_key_vecs = r_key_vecs, .n_keys = n_keys,
+        .asp_bits = NULL, .asp_key_max = 0, .nullfree = keys_kf,
+    };
+    if (pool && right_rows > RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
+    else
+        join_build_fn(&bctx, 0, 0, right_rows);
+    if (pool_cancelled(pool)) { err = ray_error("cancel", NULL); goto out; }
+
+    /* Same gate as the join's Pass 1.5. */
+    if (!ray_join_no_prefilter && left_rows > right_rows * 2) {
+        n_pf = join_pf_choose(pf_cols, l_key_vecs, r_key_vecs, n_keys,
+                              left_rows, right_rows);
+        if (n_pf) ray_join_prefilter_builds++;
+    }
+
+    join_mask_ctx_t mctx = {
+        .ht_heads = ht_heads, .ht_next = ht_next, .ht_mask = ht_cap - 1,
+        .l_key_vecs = l_key_vecs, .r_key_vecs = r_key_vecs, .n_keys = n_keys,
+        .pf = pf_cols, .n_pf = n_pf, .nullfree = keys_kf,
+        .hit = (uint8_t)!anti, .out = out,
+    };
+    /* Lookahead hashing pays only when heads outgrow cache and most rows
+     * reach the probe; behind a prefilter the survivors are few. */
+    ray_pool_fn probe = join_pf_single64(pf_cols, n_pf) ? join_mask_s64_fn
+                      : (ht_cap > JHT_MIN_CAP && !n_pf) ? join_mask_fn
+                      : join_mask_tiny_fn;
+    if (pool && left_rows > RAY_PARALLEL_THRESHOLD)
+        ray_pool_dispatch(pool, probe, &mctx, left_rows);
+    else
+        probe(&mctx, 0, 0, left_rows);
+    if (pool_cancelled(pool)) err = ray_error("cancel", NULL);
+
+out:
+    for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+    if (ht_next_hdr) scratch_free(ht_next_hdr);
+    if (ht_heads_hdr) scratch_free(ht_heads_hdr);
+    scratch_free(key_vecs_hdr);
+    if (err) { ray_release(mask); return err; }
+    return mask;
+}
+
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti) {
+    bool lp = join_table_has_parted_col(left_table);
+    bool rp = join_table_has_parted_col(right_table);
+    if (!lp && !rp)
+        return join_mask_flat(left_table, right_table, key_names, n_keys, anti);
+    /* Parted sides: flatten, as join_with_parted_guard does for a join.  A
+     * table whose only special column is MAPCOMMON has no segments, and
+     * flattens to NULL: an error, as there. */
+    ray_t* lf = NULL;
+    ray_t* rf = NULL;
+    if (lp) {
+        lf = join_flatten_parted(left_table);
+        if (!lf || RAY_IS_ERR(lf)) return lf ? lf : ray_error("oom", NULL);
+    }
+    if (rp) {
+        rf = join_flatten_parted(right_table);
+        if (!rf || RAY_IS_ERR(rf)) {
+            if (lf) ray_release(lf);
+            return rf ? rf : ray_error("oom", NULL);
+        }
+    }
+    ray_t* m = join_mask_flat(lf ? lf : left_table, rf ? rf : right_table,
+                              key_names, n_keys, anti);
+    if (lf) ray_release(lf);
+    if (rf) ray_release(rf);
+    return m;
 }
 
 /* ============================================================================

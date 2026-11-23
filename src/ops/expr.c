@@ -223,7 +223,7 @@ static bool eval_const_numeric_expr(ray_graph_t* g, ray_op_t* op,
             case OP_MUL: r = lv * rv; break;
             case OP_DIV: r = rv != 0.0 ? lv / rv : NAN; break;
             case OP_IDIV: r = rv != 0.0 ? floor(lv / rv) : NAN; break;
-            case OP_MOD: { if (rv != 0.0) { r = fmod(lv, rv); if (r && ((r > 0) != (rv > 0))) r += rv; } else { r = NAN; } } break;
+            case OP_MOD: r = rv != 0.0 ? ray_fmod_floor(lv, rv) : NAN; break;
             case OP_POW: r = (lv != lv || rv != rv) ? NAN : pow(lv, rv); break;
             case OP_MIN2: r = lv < rv ? lv : rv; break;
             case OP_MAX2: r = lv > rv ? lv : rv; break;
@@ -324,9 +324,536 @@ static bool linear_expr_add_scaled(linear_expr_i64_t* dst, const linear_expr_i64
     return true;
 }
 
+/* A node planned in a narrow integer width (I16 + I16 is I16, #972) wraps
+ * there per row; a sum of its terms' sums does not, so the linear and the
+ * affine plan take such a tree apart only under the no-wrap proof below. */
+static inline int8_t op_base_type(const ray_op_t* op) {
+    int8_t t = op->out_type;
+    return RAY_IS_PARTED(t) ? (int8_t)RAY_PARTED_BASETYPE(t) : t;
+}
+static inline bool op_narrow_int(const ray_op_t* op) {
+    int8_t t = op_base_type(op);
+    return t == RAY_U8 || t == RAY_I16 || t == RAY_I32;
+}
+
+/* ---- The no-wrap proof of a narrow linear / affine sum (#1287) ----
+ *
+ * The linear and affine plans sum an expression's terms in I64.  Over a
+ * node planned in U8 / I16 / I32 the per-row answer wraps in that width,
+ * and a value landing on the I16 / I32 minimum is that type's null; the
+ * plans agree with it exactly when no row of any narrow node leaves
+ * [min + 1, max] of its type ([0, 255] for U8): then nothing wraps and
+ * nothing reads as null.  np_prog_t is the tree as a postfix program of
+ * interval steps over its column terms.  A term's bounds come from its type,
+ * from what the column carries (SORTED ends, a fresh ZONE / CHUNK_ZONE,
+ * a generation-2 directory's chunk statistics), or, for a plain vector
+ * carrying none, from a min/max pass (np_scan_fn) in 64K-row slices, after
+ * four sample blocks: each slice proves its own rows from their own bounds,
+ * and the pass stops at the first slice that cannot.  The pass sums the terms
+ * on the way (agg_linear_t.pre_sum); for a lone unfiltered SUM / AVG, which
+ * takes that total and nothing else, a slice that cannot be proved is summed
+ * row by row right there, wrapped per narrow node as the per-row path does
+ * (np_wrap_slice), so one wrapping row costs one slice, not a second pass.
+ * Nothing keeps the bounds between executions. */
+_Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
+static inline void np_count(narrow_sum_route_t k) {
+    atomic_fetch_add_explicit(&ray_narrow_sum_routes[k], 1, memory_order_relaxed);
+}
+
+#define NP_MAX_NODES 32
+#define NP_MAX_DEPTH 8                    /* np_wrap_slice's value stack */
+#define NP_SLICE ((int64_t)8 * RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)   /* 64K rows */
+#define NP_BLK   256
+enum { NP_TERM = 0xFE, NP_CONST = 0xFF };
+
+typedef struct {
+    uint8_t op;          /* NP_TERM, NP_CONST, OP_ADD, OP_SUB, OP_MUL, OP_NEG */
+    uint8_t term;        /* NP_TERM: term slot */
+    int8_t  type;        /* planned type of the node */
+    int64_t c;           /* NP_CONST */
+} np_node_t;
+
+typedef struct {
+    np_node_t n[NP_MAX_NODES];
+    uint8_t   n_nodes;
+    uint8_t   n_terms;
+    uint8_t   depth, max_depth;           /* the program's value stack */
+    int64_t   syms[AGG_LINEAR_MAX_TERMS];
+    int8_t    types[AGG_LINEAR_MAX_TERMS];
+} np_prog_t;
+
+typedef struct { __int128 lo, hi; } np_iv_t;
+
+/* |v| <= 2^63 stands for "no bound": clamping a wider interval there keeps
+ * every narrow check that it fails failing, and keeps products in range. */
+#define NP_BIG ((__int128)1 << 63)
+static inline __int128 np_clamp(__int128 v) { return v > NP_BIG ? NP_BIG : v < -NP_BIG ? -NP_BIG : v; }
+
+/* The values a node of type t may hold without wrapping or reading as null;
+ * false for a type that is not narrow. */
+static bool np_safe_range(int8_t t, int64_t* lo, int64_t* hi) {
+    switch (t) {
+    case RAY_U8:  *lo = 0;              *hi = UINT8_MAX; return true;
+    case RAY_I16: *lo = INT16_MIN + 1;  *hi = INT16_MAX; return true;
+    case RAY_I64: *lo = INT64_MIN + 1;  *hi = INT64_MAX; return true;
+    case RAY_I32: *lo = INT32_MIN + 1;  *hi = INT32_MAX; return true;
+    default:      return false;
+    }
+}
+
+/* Every value a column of type t can hold. */
+static np_iv_t np_type_iv(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: return (np_iv_t){ 0, 1 };
+    case RAY_U8:   return (np_iv_t){ 0, UINT8_MAX };
+    case RAY_I16:  return (np_iv_t){ INT16_MIN, INT16_MAX };
+    case RAY_I32:  return (np_iv_t){ INT32_MIN, INT32_MAX };
+    default:       return (np_iv_t){ -NP_BIG, NP_BIG };
+    }
+}
+
+static bool np_needs_proof(ray_graph_t* g, ray_op_t* op, int depth) {
+    if (!op || depth > 64) return true;
+    if (op->opcode != OP_SCAN && op->opcode != OP_CONST &&
+        (op_narrow_int(op) || op_base_type(op) == RAY_I64)) return true;
+    for (int i = 0; i < op->arity; i++)
+        if (np_needs_proof(g, op_child(g, op, i), depth + 1)) return true;
+    return false;
+}
+
+static bool np_push(np_prog_t* p, np_node_t n) {
+    if (p->n_nodes >= NP_MAX_NODES) return false;
+    p->n[p->n_nodes++] = n;
+    if (n.op == NP_TERM || n.op == NP_CONST) {
+        if (++p->depth > p->max_depth) p->max_depth = p->depth;
+    } else if (n.op != OP_NEG) {
+        p->depth--;
+    }
+    return true;
+}
+
+static bool np_build(ray_graph_t* g, ray_op_t* op, np_prog_t* p, int depth) {
+    if (!op || depth > 64) return false;
+    int8_t t = op_base_type(op);
+    if (op->opcode == OP_SCAN) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->base.opcode != OP_SCAN) return false;
+        uint8_t k = 0;
+        while (k < p->n_terms && p->syms[k] != ext->sym) k++;
+        if (k == p->n_terms) {
+            if (k >= AGG_LINEAR_MAX_TERMS) return false;
+            p->syms[k] = ext->sym;
+            p->types[k] = t;
+            p->n_terms++;
+        }
+        return np_push(p, (np_node_t){ .op = NP_TERM, .term = k, .type = t });
+    }
+    bool arith = (op->opcode == OP_ADD || op->opcode == OP_SUB || op->opcode == OP_MUL) &&
+                 op->arity == 2;
+    if (arith || (op->opcode == OP_NEG && op->arity == 1)) {
+        for (int i = 0; i < op->arity; i++)
+            if (!np_build(g, op_child(g, op, i), p, depth + 1)) return false;
+        return np_push(p, (np_node_t){ .op = (uint8_t)op->opcode, .type = t });
+    }
+    /* any other constant: folded in I64 (eval_const_numeric_expr), exact
+     * only while nothing in it is narrow */
+    if (op->opcode != OP_CONST && np_needs_proof(g, op, depth)) return false;
+    double cf; int64_t ci; bool is_f64;
+    if (!eval_const_numeric_expr(g, op, &cf, &ci, &is_f64) || is_f64 || ci == NULL_I64) return false;
+    return np_push(p, (np_node_t){ .op = NP_CONST, .type = t, .c = ci });
+}
+
+/* Run the program over the terms' bounds: true when no narrow node can
+ * leave its safe range.  *root: the root's interval. */
+static bool np_eval(const np_prog_t* p, const np_iv_t* terms, np_iv_t* root) {
+    np_iv_t st[NP_MAX_NODES];
+    int sp = 0;
+    for (uint8_t i = 0; i < p->n_nodes; i++) {
+        const np_node_t* n = &p->n[i];
+        switch (n->op) {
+        case NP_TERM:  st[sp++] = terms[n->term]; break;
+        case NP_CONST: st[sp].lo = st[sp].hi = n->c; sp++; break;
+        case OP_NEG: { np_iv_t a = st[sp - 1]; st[sp - 1] = (np_iv_t){ -a.hi, -a.lo }; break; }
+        default: {
+            np_iv_t b = st[--sp], a = st[sp - 1], r;
+            if (n->op == OP_ADD)      r = (np_iv_t){ a.lo + b.lo, a.hi + b.hi };
+            else if (n->op == OP_SUB) r = (np_iv_t){ a.lo - b.hi, a.hi - b.lo };
+            else {
+                __int128 c1 = a.lo * b.lo, c2 = a.lo * b.hi, c3 = a.hi * b.lo, c4 = a.hi * b.hi;
+                r.lo = c1 < c2 ? c1 : c2; if (c3 < r.lo) r.lo = c3; if (c4 < r.lo) r.lo = c4;
+                r.hi = c1 > c2 ? c1 : c2; if (c3 > r.hi) r.hi = c3; if (c4 > r.hi) r.hi = c4;
+            }
+            st[sp - 1] = r;
+            break;
+        }
+        }
+        np_iv_t* top = &st[sp - 1];
+        top->lo = np_clamp(top->lo); top->hi = np_clamp(top->hi);
+        int64_t lo, hi;
+        if (n->op != NP_TERM && n->op != NP_CONST && np_safe_range(n->type, &lo, &hi) &&
+            (top->lo < lo || top->hi > hi))
+            return false;
+    }
+    if (root) *root = st[0];
+    return true;
+}
+
+/* A term column's bounds from what it carries, never scanning. */
+static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
+    ray_t* col = ray_col_src_ready(src);
+    if (col && ray_is_vec(col) && !(col->attrs & RAY_ATTR_SLICE) && col->len > 0) {
+        int64_t lo, hi;
+        if (ray_idx_int_bounds(col, &lo, &hi)) { *out = (np_iv_t){ lo, hi }; return true; }
+        if ((col->attrs & RAY_ATTR_SORTED) && !src->may_null) {
+            const void* d = ray_data(col);
+            switch (col->type) {
+            case RAY_U8:  *out = (np_iv_t){ ((const uint8_t*)d)[0], ((const uint8_t*)d)[col->len - 1] }; return true;
+            case RAY_I16: *out = (np_iv_t){ ((const int16_t*)d)[0], ((const int16_t*)d)[col->len - 1] }; return true;
+            case RAY_I64: *out = (np_iv_t){ ((const int64_t*)d)[0], ((const int64_t*)d)[col->len - 1] }; return true;
+            case RAY_I32: *out = (np_iv_t){ ((const int32_t*)d)[0], ((const int32_t*)d)[col->len - 1] }; return true;
+            default: break;
+            }
+        }
+        return false;
+    }
+    /* a generation-2 column: its chunks' directory statistics */
+    ray_enc_chunk_stat_t st;
+    __int128 lo = NP_BIG, hi = -NP_BIG;
+    int64_t c = 0;
+    for (; ray_col_src_chunk_stat(src, c, &st); c++) {
+        if (st.has_minmax) {
+            if (st.min < lo) lo = st.min;
+            if (st.max > hi) hi = st.max;
+        } else if (st.null_count < st.rows) {
+            return false;
+        }
+    }
+    if (c == 0 || lo > hi) return false;
+    *out = (np_iv_t){ lo, hi };
+    return true;
+}
+
+typedef struct {
+    bool capture;
+    _Atomic(int64_t) min, max;
+    const np_prog_t*  prog;
+    np_iv_t           glob[AGG_LINEAR_MAX_TERMS];   /* the bounds of a term not scanned */
+    const void*       data[AGG_LINEAR_MAX_TERMS];   /* a scanned term's rows (NULL: not scanned) */
+    bool              nulls[AGG_LINEAR_MAX_TERMS];  /* skip the type's null sentinel */
+    const linear_expr_i64_t* wide;   /* AVG: recover an exact total for each proved slice */
+    int64_t coeff[AGG_LINEAR_MAX_TERMS];
+    _Atomic(uint64_t) low, high;
+    bool collect;
+    _Atomic(bool)     wide_total;                   /* a slice exceeded the per-row budget */
+    bool              wrap;                         /* sum a slice that fails row by row */
+    _Atomic(bool)     fail;
+    _Atomic(int64_t)  rows;                         /* rows proved or summed row by row */
+    _Atomic(int64_t)  pass_rows;                    /* rows proved */
+    _Atomic(uint64_t) sum[AGG_LINEAR_MAX_TERMS];    /* a term's total over the proved rows */
+    _Atomic(uint64_t) wsum;                         /* the per-row total of the other rows */
+    _Atomic(int64_t)  wslices;                      /* slices summed row by row */
+} np_scan_ctx_t;
+
+/* Rows [start, end) summed as the per-row path computes them: the program
+ * over int64 lanes, each narrow node wrapped to its width (I16 * I16 wraps
+ * in 16 bits whatever its consumer).  The terms are null-free, the root is
+ * narrow, and so is every arithmetic node under it.  False when a narrow
+ * node lands on its type's null (the per-row paths read that value
+ * differently by route): the caller gives up the plan. */
+static bool np_wrap_slice(const np_scan_ctx_t* x, int64_t start, int64_t end, int64_t* out) {
+    const np_prog_t* p = x->prog;
+    int64_t buf[NP_MAX_DEPTH][NP_BLK];
+    int64_t total = 0;
+    for (int64_t b = start; b < end; b += NP_BLK) {
+        int64_t m = end - b < NP_BLK ? end - b : NP_BLK;
+        int sp = 0;
+        for (uint8_t i = 0; i < p->n_nodes; i++) {
+            const np_node_t* n = &p->n[i];
+            if (n->op == NP_TERM) {
+                int64_t* d = buf[sp++];
+                const void* src = x->data[n->term];
+                switch (p->types[n->term]) {
+                case RAY_I64: return false;   /* no I64 partial-wrap route */
+                case RAY_I16: for (int64_t r = 0; r < m; r++) d[r] = ((const int16_t*)src)[b + r]; break;
+                case RAY_I32: for (int64_t r = 0; r < m; r++) d[r] = ((const int32_t*)src)[b + r]; break;
+                default:      for (int64_t r = 0; r < m; r++) d[r] = ((const uint8_t*)src)[b + r]; break;
+                }
+                continue;
+            }
+            if (n->op == NP_CONST) {
+                int64_t* d = buf[sp++];
+                for (int64_t r = 0; r < m; r++) d[r] = n->c;
+                continue;
+            }
+            uint64_t* a = (uint64_t*)buf[n->op == OP_NEG ? sp - 1 : sp - 2];
+            if (n->op == OP_NEG) {
+                for (int64_t r = 0; r < m; r++) a[r] = 0 - a[r];
+            } else {
+                const uint64_t* c = (const uint64_t*)buf[--sp];
+                if (n->op == OP_ADD)      for (int64_t r = 0; r < m; r++) a[r] += c[r];
+                else if (n->op == OP_SUB) for (int64_t r = 0; r < m; r++) a[r] -= c[r];
+                else                      for (int64_t r = 0; r < m; r++) a[r] *= c[r];
+            }
+            int64_t* v = (int64_t*)a;
+            bool hit = false;
+            switch (n->type) {
+            case RAY_U8:
+                for (int64_t r = 0; r < m; r++) v[r] = (uint8_t)a[r];
+                break;
+            case RAY_I16:
+                for (int64_t r = 0; r < m; r++) { v[r] = (int16_t)(uint16_t)a[r]; hit |= v[r] == NULL_I16; }
+                break;
+            case RAY_I32:
+                for (int64_t r = 0; r < m; r++) { v[r] = (int32_t)(uint32_t)a[r]; hit |= v[r] == NULL_I32; }
+                break;
+            default:
+                return false;   /* not narrow: no wrap model here */
+            }
+            if (hit) return false;
+        }
+        for (int64_t r = 0; r < m; r++) total += buf[0][r];
+    }
+    *out = total;
+    return true;
+}
+
+/* ACC: a block's sum type (8192 rows of a U8 / I16 stay inside int32). */
+#define NP_SCAN(T, NUL, ACC) do {                                              \
+    const T* d = (const T*)x->data[t] + start;                                 \
+    T mn = d[0], mx = d[0]; uint64_t s = 0;                                    \
+    if (x->nulls[t]) {                                                         \
+        bool any = false;                                                      \
+        for (int64_t r = 0; r < n; r++) {                                      \
+            T v = d[r];                                                        \
+            if (v == (NUL)) continue;                                          \
+            if (!any || v < mn) mn = v;                                        \
+            if (!any || v > mx) mx = v;                                        \
+            any = true;                                                        \
+        }                                                                      \
+        if (!any) mn = mx = 0;   /* every row null: no row uses the term */    \
+    } else {                                                                   \
+        for (int64_t b = 0; b < n; b += 8192) {                                \
+            int64_t e = n - b > 8192 ? b + 8192 : n;                           \
+            ACC bs = 0;                                                        \
+            for (int64_t r = b; r < e; r++) {                                  \
+                T v = d[r];                                                    \
+                mn = v < mn ? v : mn; mx = v > mx ? v : mx; bs += v;           \
+            }                                                                  \
+            s += bs;                                                           \
+        }                                                                      \
+    }                                                                          \
+    iv[t] = (np_iv_t){ mn, mx }; sums[t] = s;                                  \
+} while (0)
+
+static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    np_scan_ctx_t* x = (np_scan_ctx_t*)ctx;
+    if (atomic_load_explicit(&x->fail, memory_order_relaxed)) return;
+    int64_t n = end - start;
+    if (n <= 0) return;
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS] = {{0}};
+    int64_t sums[AGG_LINEAR_MAX_TERMS];
+    for (uint8_t t = 0; t < x->prog->n_terms; t++) {
+        if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
+        switch (x->prog->types[t]) {
+        case RAY_I64: NP_SCAN(int64_t, NULL_I64, uint64_t); break;
+        case RAY_I16: NP_SCAN(int16_t, NULL_I16, int32_t); break;
+        case RAY_I32: NP_SCAN(int32_t, NULL_I32, int64_t); break;
+        default:      NP_SCAN(uint8_t, (uint8_t)0, int32_t); break;   /* U8: never nulls[] */
+        }
+    }
+    np_iv_t root;
+    if (!np_eval(x->prog, iv, &root)) {
+        int64_t w;
+        if (x->wrap && np_wrap_slice(x, start, end, &w)) {   /* the rows are cache-hot */
+            atomic_fetch_add_explicit(&x->wsum, (uint64_t)w, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->wslices, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
+            return;
+        }
+        atomic_store_explicit(&x->fail, true, memory_order_relaxed);
+        return;
+    }
+    if (x->capture) {
+        int64_t lo = iv[0].lo, hi = iv[0].hi;
+        int64_t v = atomic_load_explicit(&x->min, memory_order_relaxed);
+        while (lo < v && !atomic_compare_exchange_weak_explicit(&x->min, &v, lo,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+        v = atomic_load_explicit(&x->max, memory_order_relaxed);
+        while (hi > v && !atomic_compare_exchange_weak_explicit(&x->max, &v, hi,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+    }
+    if (x->wide) {
+        /* Lift the modular slice total relative to its proven lower bound.
+         * If the interval spans a full modulus there is no unique lift:
+         * leave the total to the ordinary wide AVG kernel. */
+        if ((root.hi - root.lo) * n > UINT64_MAX) {
+            atomic_store_explicit(&x->wide_total, true, memory_order_relaxed);
+        } else {
+            uint64_t lo = (uint64_t)x->wide->bias_i64 * n;
+            for (uint8_t t = 0; t < x->prog->n_terms; t++)
+                lo += (uint64_t)sums[t] * x->coeff[t];
+            __int128 lower = root.lo * n;
+            __int128 exact = lower + (uint64_t)(lo - (uint64_t)lower);
+            uint64_t old = atomic_fetch_add_explicit(&x->low, lo, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->high, (uint64_t)(exact >> 64) + (old > UINT64_MAX - lo), memory_order_relaxed);
+        }
+    }
+    for (uint8_t t = 0; t < x->prog->n_terms; t++)
+        if (x->collect && !x->wide && x->data[t])
+            atomic_fetch_add_explicit(&x->sum[t], (uint64_t)sums[t], memory_order_relaxed);
+    atomic_fetch_add_explicit(&x->pass_rows, n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
+}
+#undef NP_SCAN
+
+/* The pass's totals (np_prove): sums[t] keyed by p->syms over pass_rows
+ * proved rows, wsum the per-row total of the rest. */
+typedef struct {
+    int64_t hi, low;
+    bool lifted;
+    bool    summed;       /* every term was read: the totals below hold */
+    bool    partial;      /* some rows were summed per row: only the total holds */
+    int64_t sums[AGG_LINEAR_MAX_TERMS];
+    int64_t pass_rows;
+    int64_t wsum;
+} np_total_t;
+
+typedef enum { NP_NO, NP_PROVED, NP_NEED_SCAN } np_res_t;
+
+/* Prove that no row of the narrow nodes of `root` wraps or reads as null
+ * (NP_PROVED at once when the tree has none).  nrows: the rows the plan
+ * sums.  scan: a min/max pass may run (else NP_NEED_SCAN where one would,
+ * counted nowhere).  tot (optional): the pass's totals, which need
+ * null-free terms; with tot->partial preset, a slice that cannot be proved
+ * is summed per row instead of failing the pass (the caller then takes the
+ * total and nothing else).  A failed bind: NP_NO with *err. */
+static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nrows, bool scan,
+                         np_prog_t* p, np_total_t* tot, const linear_expr_i64_t* wide, affine_bounds_t* bounds, ray_t** err) {
+    bool want_partial = tot && tot->partial;
+    if (tot) memset(tot, 0, sizeof(*tot));
+    memset(p, 0, sizeof(*p));
+    if (!np_needs_proof(g, root, 0)) return NP_PROVED;
+    if (!np_build(g, root, p, 0)) {
+        np_count(NARROW_SUM_REFUSED);
+        return NP_NO;
+    }
+    np_iv_t iv[AGG_LINEAR_MAX_TERMS] = {{0}};
+    for (uint8_t t = 0; t < p->n_terms; t++) iv[t] = np_type_iv(p->types[t]);
+    if (np_eval(p, iv, NULL)) { np_count(NARROW_SUM_TYPE); return NP_PROVED; }
+
+    ray_col_src_t* srcs[AGG_LINEAR_MAX_TERMS];
+    bool tight = false;
+    for (uint8_t t = 0; t < p->n_terms; t++) {
+        if (ray_col_bind_declines(tbl, p->syms[t])) goto refuse;
+        srcs[t] = ray_graph_bind_col(g, tbl, p->syms[t], err);
+        if (!srcs[t]) return NP_NO;
+        if (srcs[t]->parted) goto refuse;
+        np_iv_t m;
+        if (np_meta_bounds(srcs[t], &m)) { iv[t] = m; tight = true; }
+    }
+    if (tight && np_eval(p, iv, NULL)) { np_count(NARROW_SUM_META); return NP_PROVED; }
+
+    /* the pass: over the narrow terms of plain columns (a column without
+     * metadata and not plain cannot be proved here) */
+    np_scan_ctx_t x;
+    memset(&x, 0, sizeof x);
+    x.prog = p;
+    bool all = true;
+    for (uint8_t t = 0; t < p->n_terms; t++) {
+        x.glob[t] = iv[t];
+        int8_t ty = p->types[t];
+        bool scan_col = ty == RAY_U8 || ty == RAY_I16 || ty == RAY_I32 || ty == RAY_I64;
+        const void* base = scan_col ? ray_col_src_base(srcs[t]) : NULL;
+        if (!base || srcs[t]->type != ty || srcs[t]->len != nrows) { all = false; continue; }
+        x.data[t] = base;
+        x.nulls[t] = srcs[t]->may_null && ty != RAY_U8;
+        if (x.nulls[t]) all = false;
+    }
+    bool any = false;
+    for (uint8_t t = 0; t < p->n_terms; t++) any |= x.data[t] != NULL;
+    if (!any || nrows <= 0) goto refuse;
+    if (!scan) return NP_NEED_SCAN;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    if (bounds && par && all && p->n_terms == 1 && p->n_nodes == 3 &&
+        srcs[0]->obj->type == RAY_I64 && p->types[0] == RAY_I64 && !tot && !wide &&
+        !atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+        if (bounds->obj == srcs[0]->obj && bounds->base == x.data[0] && bounds->rows == nrows) {
+            iv[0] = (np_iv_t){ bounds->lo, bounds->hi };
+            if (np_eval(p, iv, NULL)) return NP_PROVED;
+            goto refuse;
+        }
+        x.capture = !bounds->obj;
+        atomic_init(&x.min, INT64_MAX);
+        atomic_init(&x.max, INT64_MIN);
+    }
+    if (nrows >= RAY_PARALLEL_THRESHOLD) {
+        /* Four sample blocks first: rows that can wrap usually show in any
+         * block, and then no pass is made. */
+        np_scan_ctx_t smp;
+        memset(&smp, 0, sizeof smp);
+        smp.prog = p;
+        memcpy(smp.glob, x.glob, sizeof x.glob);
+        memcpy(smp.data, x.data, sizeof x.data);
+        memcpy(smp.nulls, x.nulls, sizeof x.nulls);
+        for (int64_t k = 0; k < 4; k++) {
+            int64_t s0 = nrows / 4 * k;
+            np_scan_fn(&smp, 0, s0, s0 + RAY_MORSEL_ELEMS);   /* nrows >= 64 morsels */
+        }
+        if (atomic_load_explicit(&smp.fail, memory_order_relaxed)) {
+            np_count(NARROW_SUM_SAMPLE);
+            return NP_NO;
+        }
+    }
+    /* the root narrow and every row's value in its width: below 2^32 rows
+     * the total cannot leave int64 */
+    x.collect = tot && all;
+    if (wide && x.collect && op_base_type(root) == RAY_I64) {
+        x.wide = wide;
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            for (uint8_t k = 0; k < wide->n_terms; k++)
+                if (wide->syms[k] == p->syms[t]) x.coeff[t] = wide->coeff_i64[k];
+    }
+    x.wrap = want_partial && all && op_narrow_int(root) && p->max_depth <= NP_MAX_DEPTH &&
+             nrows <= ((int64_t)1 << 32);
+    /* slices of 64K rows: the per-slice proof and its atomics stay off the
+     * per-row cost, and a slice that fails ends the pass */
+    if (par)
+        ray_pool_dispatch_grain(pool, np_scan_fn, &x, nrows, NP_SLICE);
+    else
+        for (int64_t s0 = 0; s0 < nrows && !atomic_load_explicit(&x.fail, memory_order_relaxed); s0 += NP_SLICE)
+            np_scan_fn(&x, 0, s0, nrows - s0 > NP_SLICE ? s0 + NP_SLICE : nrows);
+    if (atomic_load_explicit(&x.fail, memory_order_relaxed) ||
+        atomic_load_explicit(&x.rows, memory_order_relaxed) != nrows)
+        goto refuse;   /* a slice that could not be proved, or a cancel */
+    if (x.capture && !atomic_load_explicit(&pool->cancelled, memory_order_relaxed))
+        *bounds = (affine_bounds_t){ srcs[0]->obj, x.data[0], nrows,
+            atomic_load_explicit(&x.min, memory_order_relaxed),
+            atomic_load_explicit(&x.max, memory_order_relaxed) };
+    bool partial = atomic_load_explicit(&x.wslices, memory_order_relaxed) > 0;
+    np_count(partial ? NARROW_SUM_PARTIAL : NARROW_SUM_SCAN);
+    if (all && tot && !atomic_load_explicit(&x.wide_total, memory_order_relaxed)) {
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            tot->sums[t] = (int64_t)atomic_load_explicit(&x.sum[t], memory_order_relaxed);
+        tot->pass_rows = atomic_load_explicit(&x.pass_rows, memory_order_relaxed);
+        tot->wsum = (int64_t)atomic_load_explicit(&x.wsum, memory_order_relaxed);
+        tot->lifted = x.wide != NULL;
+        tot->hi = atomic_load_explicit(&x.high, memory_order_relaxed);
+        tot->low = atomic_load_explicit(&x.low, memory_order_relaxed);
+        tot->summed = true;
+        tot->partial = partial;
+    }
+    return NP_PROVED;
+refuse:
+    np_count(NARROW_SUM_REFUSED);
+    return NP_NO;
+}
+
 /* Parse an expression tree into integer linear form:
  *   sum(coeff[i] * scan(sym[i])) + bias
- * Supports +, -, unary -, and multiplication by integer constants. */
+ * Supports +, -, unary -, and multiplication by integer constants.  A
+ * narrow node parses as any other: the caller holds the no-wrap proof. */
 static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_t* out) {
     if (!g || !op || !out) return false;
     memset(out, 0, sizeof(*out));
@@ -384,9 +911,118 @@ static bool parse_linear_i64_expr(ray_graph_t* g, ray_op_t* op, linear_expr_i64_
     return false;
 }
 
+/* True when a column `op` reads may hold nulls, a term the linear form
+ * dropped for a zero coefficient ((* y 0), (- y y)) included: the per-row
+ * answer skips its null rows, so the plan must not take the shape. */
+static bool linear_reads_nullable(ray_graph_t* g, ray_t* tbl, ray_op_t* op, int depth, ray_t** err) {
+    if (!op || depth > 64) return true;
+    if (op->opcode == OP_SCAN) {
+        ray_op_ext_t* ext = find_ext(g, op->id);
+        if (!ext || ext->base.opcode != OP_SCAN || ray_col_bind_declines(tbl, ext->sym)) return true;
+        ray_col_src_t* src = ray_graph_bind_col(g, tbl, ext->sym, err);
+        return !src || src->may_null;
+    }
+    for (int i = 0; i < op->arity; i++)
+        if (linear_reads_nullable(g, tbl, op_child(g, op, i), depth + 1, err)) return true;
+    return false;
+}
+
+typedef struct {
+    const uint64_t *x, *y;
+    uint64_t k, c, mask, mul_hit, final_hit;
+    bool nested;
+    ray_pool_t* pool;
+    _Atomic(uint64_t) total, rows;
+} parity_sum_ctx_t;
+
+static bool parity_literal(ray_graph_t* g, ray_op_t* op, uint64_t* out) {
+    ray_op_ext_t* e = op && op->opcode == OP_CONST ? find_ext(g, op->id) : NULL;
+    if (!e || !e->literal || e->literal->type != -RAY_I64 || RAY_ATOM_IS_NULL(e->literal)) return false;
+    *out = (uint64_t)e->literal->i64;
+    return true;
+}
+
+/* Match syntax, not just the flattened coefficients: each arithmetic node
+ * can produce a null which propagates through its parent. */
+static bool parity_shape(ray_graph_t* g, ray_op_t* root, parity_sum_ctx_t* q) {
+    ray_op_t *a = op_child(g, root, 0), *b = op_child(g, root, 1);
+    bool reversed = a && a->opcode == OP_CONST;
+    if (reversed) { ray_op_t* t = a; a = b; b = t; }
+    uint64_t v;
+    if (!a || !parity_literal(g, b, &v)) return false;
+    q->k = 1;
+    if (root->opcode == OP_ADD) {
+        q->c = v;
+        if (a->opcode == OP_MUL && a->arity == 2 && op_base_type(a) == RAY_I64) {
+            b = op_child(g, a, 1);
+            a = op_child(g, a, 0);
+            if (!parity_literal(g, b, &q->k)) return false;
+            q->nested = q->c != 0;
+        }
+    } else if (root->opcode == OP_SUB) {
+        q->k = reversed ? UINT64_MAX : 1;
+        q->c = reversed ? v : -v;
+    } else if (root->opcode == OP_MUL) q->k = v;
+    else return false;
+    if (!a || a->opcode != OP_SCAN) return false;
+    if (!q->k) return true; /* known non-null source times zero */
+
+    /* k*x == target mod 2^64: divide out gcd(k,2^64), then invert
+     * the odd factor modulo the remaining power of two. Each Newton
+     * step doubles the number of correct low bits (initially one). */
+    unsigned shift = (unsigned)__builtin_ctzll(q->k);
+    uint64_t odd = q->k >> shift, inv = 1;
+    for (int i = 0; i < 6; i++) inv *= 2 - odd * inv;
+    uint64_t h = UINT64_C(1) << 63, target = h - q->c;
+    q->mask = UINT64_MAX >> shift;
+    q->mul_hit = ((h >> shift) * inv) & q->mask;
+    /* An indivisible target has no preimage. Then shift > 0, so
+     * UINT64_MAX lies outside the range of masked inputs. */
+    q->final_hit = (target & ((UINT64_C(1) << shift) - 1)) ? UINT64_MAX :
+                   ((target >> shift) * inv) & q->mask;
+    return true;
+}
+static void parity_sum_slice(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
+    parity_sum_ctx_t* q = ctx;
+    if (ray_interrupted() || (q->pool && atomic_load_explicit(&q->pool->cancelled, memory_order_acquire))) return;
+    /* Skipping INT64_MIN toggles bit 63 once per odd number of hits. */
+    uint64_t s = 0, p = 0;
+    const uint64_t h = UINT64_C(1) << 63;
+    if (q->y) {
+        for (int64_t i = lo; i < hi; i++) {
+            uint64_t row = q->x[i] + q->y[i];
+            s += row;
+            p ^= row == h;
+        }
+    } else if (!q->k) {
+        s = (uint64_t)(hi-lo) * q->c;
+    } else {
+        uint64_t skipped = 0;
+        if (q->nested) {
+            /* c != 0: the two hit sets are disjoint. The raw affine sum
+             * includes h+c for each generated multiply null; remove all
+             * of it, not just bit 63. */
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i], bits = v & q->mask;
+                s += v;
+                skipped += bits == q->mul_hit;
+                p ^= bits == q->final_hit;
+            }
+        } else {
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i];
+                s += v;
+                p ^= (v & q->mask) == q->final_hit;
+            }
+        }
+        s = s*q->k + (uint64_t)(hi-lo)*q->c - skipped*(h+q->c);
+    }
+    atomic_fetch_add_explicit(&q->total, s ^ (p << 63), memory_order_relaxed);
+    atomic_fetch_add_explicit(&q->rows, (uint64_t)(hi-lo), memory_order_relaxed);
+}
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone, bool avg,
                                         agg_linear_t* out_plan, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_plan) return false;
@@ -414,6 +1050,46 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
          * scalar route evaluates the expression by range reads instead */
         if (!ray_col_src_base(srcs[i])) return false;
     }
+    if (linear_reads_nullable(g, tbl, input_op, 0, err)) return false;
+    /* a narrow tree: the plan only under the no-wrap proof, whose pass
+     * also leaves the terms' totals when it read every one; a lone
+     * aggregate, which takes the total alone, lets the pass sum a slice it
+     * cannot prove row by row */
+    int64_t nrows = ray_table_nrows(tbl);
+    np_prog_t np;
+    np_total_t tot = { .partial = lone };
+    np_iv_t existing_bounds;
+    bool pair = lin.n_terms == 2 && input_op->opcode == OP_ADD && input_op->arity == 2 &&
+                op_child(g,input_op,0)->opcode == OP_SCAN && op_child(g,input_op,1)->opcode == OP_SCAN;
+    if (lone && !avg && nrows >= NP_SLICE && (lin.n_terms == 1 || pair) && input_op->arity == 2 &&
+        op_base_type(input_op) == RAY_I64 && srcs[0]->type == RAY_I64 &&
+        srcs[0]->obj->type == RAY_I64 && !(srcs[0]->attrs & RAY_ATTR_SLICE) && srcs[0]->len == nrows &&
+        !np_meta_bounds(srcs[0], &existing_bounds)) {
+        if (pair && (srcs[1]->type != RAY_I64 || srcs[1]->obj->type != RAY_I64 ||
+                     (srcs[1]->attrs & RAY_ATTR_SLICE) || srcs[1]->len != nrows ||
+                     np_meta_bounds(srcs[1], &existing_bounds))) pair = false;
+        parity_sum_ctx_t q = {.x = ray_col_src_base(srcs[0])};
+        if (pair) q.y = ray_col_src_base(srcs[1]);
+        if (pair || (lin.n_terms == 1 && parity_shape(g, input_op, &q))) {
+            ray_pool_t* pool = q.pool = ray_pool_get();
+            if (ray_pool_par_dispatch_ok(pool,nrows,RAY_PARALLEL_THRESHOLD))
+                ray_pool_dispatch_grain(pool,parity_sum_slice,&q,nrows,NP_SLICE);
+            else for (int64_t lo = 0; lo < nrows && !ray_interrupted(); lo += NP_SLICE)
+                parity_sum_slice(&q,0,lo,nrows-lo > NP_SLICE ? lo+NP_SLICE : nrows);
+            if (atomic_load_explicit(&q.rows,memory_order_relaxed) != (uint64_t)nrows || ray_interrupted() ||
+                (pool && atomic_load_explicit(&pool->cancelled,memory_order_acquire))) return false;
+            for (uint8_t i = 0; i < lin.n_terms; i++) {
+                out_plan->term_ptrs[i] = ray_data(srcs[i]->obj);
+                out_plan->term_types[i] = RAY_I64;
+                out_plan->coeff_i64[i] = lin.coeff_i64[i];
+            }
+            out_plan->enabled = out_plan->pre = out_plan->pre_only = true;
+            out_plan->pre_sum = (int64_t)atomic_load_explicit(&q.total,memory_order_relaxed);
+            out_plan->pre_hi = (out_plan->pre_sum < 0 ? -1 : 0);
+            return true;
+        }
+    }
+    if (np_prove(g, tbl, input_op, nrows, true, &np, lone ? &tot : NULL, avg ? &lin : NULL, NULL, err) != NP_PROVED) return false;
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
         *err = ray_col_src_plain(srcs[i], &col);   /* ready-only */
@@ -422,6 +1098,24 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         out_plan->term_types[i] = srcs[i]->type;
         out_plan->coeff_i64[i] = lin.coeff_i64[i];
     }
+    /* Use the modular linear sum as a signed total only when it is exact:
+     * narrow results fit at this row limit; for I64 np_prove checked the
+     * root interval of every slice against the full row count. */
+    if (tot.summed && ((op_narrow_int(input_op) && nrows <= ((int64_t)1 << 32)) ||
+                       op_base_type(input_op) == RAY_I64)) {
+        int64_t s = wrap_add_i64(wrap_mul_i64(lin.bias_i64, tot.pass_rows), tot.wsum);
+        bool ok = true;
+        for (uint8_t i = 0; i < lin.n_terms && ok; i++) {
+            uint8_t k = 0;
+            while (k < np.n_terms && np.syms[k] != lin.syms[i]) k++;
+            if (k == np.n_terms) { ok = false; break; }
+            s = wrap_add_i64(s, wrap_mul_i64(lin.coeff_i64[i], tot.sums[k]));
+        }
+        if (tot.lifted) s = tot.low;
+        out_plan->pre_hi = tot.lifted ? tot.hi : (s < 0 ? -1 : 0);
+        if (ok) { out_plan->pre = true; out_plan->pre_sum = s; out_plan->pre_only = tot.partial; }
+    }
+    if (tot.partial && !out_plan->pre_only) return false;   /* the rows' plan does not hold */
     out_plan->enabled = true;
     return true;
 }
@@ -508,7 +1202,14 @@ static bool affine_int_f64_bias_exact(int8_t bt, double bias, int64_t nrows,
  * (sum,count) directly.  f64_bias_ok: the caller emits a FLOAT bias over an
  * integer column as F64 (agg_affine_t.f64). */
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                                    bool f64_bias_ok,
+                                    bool f64_bias_ok, bool defer_scan,
+                                    ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
+    return try_affine_sumavg_pair(g, tbl, input_op, f64_bias_ok, defer_scan, NULL,
+                                 out_vec, out_affine, err);
+}
+
+bool try_affine_sumavg_pair(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                                    bool f64_bias_ok, bool defer_scan, affine_bounds_t* bounds,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
@@ -560,14 +1261,31 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     ray_col_src_t* base_src = ray_graph_bind_col(g, tbl, base_ext->sym, err);
     if (!base_src) return false;
     if (base_src->parted) return false;     /* a parted wrapper matches no arm below */
+    /* (scan +/- c) with a narrow node: sum(scan) + n*c is the per-row sum
+     * only under the no-wrap proof (both skip the base's null rows).  When
+     * proving needs a pass over a null-free plain base, defer_scan leaves
+     * the shape to the linear plan, whose pass sums as it goes. */
+    {
+        np_prog_t np;
+        bool defer = defer_scan && !base_src->may_null && ray_col_src_base(base_src);
+        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, NULL,
+                               c_is_f64 ? NULL : bounds, err);
+        if (pr != NP_PROVED) return false;
+    }
 
     int8_t bt = base_src->type;
     ray_t* base_vec = NULL;
     if (bt == RAY_F64) {
+        /* sum(x) + n*c is the per-row sum only while no x + c overflows:
+         * an overflowing row is 0Nf per row and skipped (#1349).  Below
+         * 2^970, half an ulp of DBL_MAX, no finite x can carry x + c past
+         * it; a null c (x + 0Nf is all null) fails the test too. */
+        double bias = (double)sign * (c_is_f64 ? c_f : (double)c_i);
+        if (!(fabs(bias) < 0x1p970)) return false;
         base_vec = affine_base_obj(base_src);
         out_affine->enabled = true;
-        out_affine->bias_f64 = (double)sign * (c_is_f64 ? c_f : (double)c_i);
-        out_affine->bias_i64 = (int64_t)out_affine->bias_f64;
+        out_affine->bias_f64 = bias;
+        out_affine->bias_i64 = ray_cast_f64_to_i64_null(bias);
         *out_vec = base_vec;
         return true;
     }
@@ -651,6 +1369,18 @@ static inline bool expr_is_elementwise(uint16_t op) {
            op == OP_POW || (op >= OP_SIN && op <= OP_SIGNUM);
 }
 
+/* Magnitude bound of a narrow integer type's values: |v| < 2^bits.  63
+ * (no bound) for every other type. */
+static inline uint8_t expr_type_bits(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: return 1;
+    case RAY_U8:   return 8;
+    case RAY_I16:  return 16;
+    case RAY_I32:  return 32;
+    default:       return 63;
+    }
+}
+
 /* Insert CAST instruction to promote register to target type */
 static uint8_t expr_ensure_type(ray_expr_t* out, uint8_t src, int8_t target) {
     if (out->regs[src].type == target) return src;
@@ -672,12 +1402,12 @@ static uint8_t expr_ensure_type(ray_expr_t* out, uint8_t src, int8_t target) {
 /* Can this instruction write a null sentinel into its destination even
  * when every source lane is a real value?  F64: any op that ray_f64_fin /
  * a zero-divisor test canonicalizes to NULL_F64 (overflow, x/0, sqrt(<0),
- * log(<=0), ...).  I64: zero-divisor IDIV/MOD and the INT64_MIN overflow of
- * NEG/ABS.  Such a destination is nullable for every downstream instruction
- * (so CAST F64->I64, I64 arithmetic and MIN2/MAX2 pick their null-aware
+ * log(<=0), ...).  I64: ADD/SUB/MUL wrapping to the sentinel, zero-divisor
+ * IDIV/MOD and the INT64_MIN overflow of NEG/ABS.  Such a destination is
+ * nullable downstream (so CAST, I64 arithmetic and MIN2/MAX2 pick their null-aware
  * kernels) and, when nothing upstream is a nullable column, the output flag
  * comes from a precise sentinel scan rather than the conservative attr. */
-static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binary) {
+static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binary, int8_t planned) {
     if (ot == RAY_F64) {
         switch (op) {
             case OP_ADD: case OP_SUB: case OP_MUL:
@@ -691,10 +1421,29 @@ static bool expr_op_generates_null(uint16_t op, int8_t ot, int8_t t1, bool binar
         }
     }
     if (ot == RAY_I64) {
-        if (binary) return op == OP_DIV || op == OP_IDIV || op == OP_MOD;
+        if (binary) {
+            if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
+                /* Narrow nodes also use I64 scratch lanes, but wrap in their own width. */
+                if (RAY_IS_PARTED(planned)) planned = (int8_t)RAY_PARTED_BASETYPE(planned);
+                return planned == RAY_I64;
+            }
+            return op == OP_DIV || op == OP_IDIV || op == OP_MOD;
+        }
         return (op == OP_NEG || op == OP_ABS) && t1 == RAY_I64;
     }
     return false;
+}
+
+/* `(+ temporal int)` and friends lower to the integer + / - with a CAST
+ * back to the temporal type, flagged OP_FLAG_TEMPORAL_INT
+ * (dag_temporal_int_arith, query.c).  The builtin reads a result that
+ * wraps onto the lane's sentinel as a null, so that CAST is a null
+ * producer: its register is nullable and the output is scanned for the
+ * sentinel (expr_flag_output_nulls), where the integer kernels keep the
+ * wrapped value as a number.  (The xbar CAST is not flagged.) */
+static bool expr_temporal_arith_cast(ray_graph_t* g, ray_op_t* node) {
+    (void)g;
+    return node->opcode == OP_CAST && (node->flags & OP_FLAG_TEMPORAL_INT);
 }
 
 /* A CAST may target a temporal type (the DAG retags a bucketed temporal
@@ -802,6 +1551,55 @@ static bool expr_sym_lit_in(ray_graph_t* g, ray_op_t* n, const ray_col_src_t* sr
     return true;
 }
 
+/* Whether node `want` lies in node n's subtree (the walk gives up, false,
+ * past its depth). */
+static bool expr_subtree_has(ray_graph_t* g, ray_op_t* n, uint32_t want, int depth) {
+    if (!n || depth > 64) return false;
+    if (n->id == want) return true;
+    for (int k = 0; k < n->arity && k < 2; k++)
+        if (n->in_id[k] != RAY_OP_NONE && expr_subtree_has(g, op_child(g, n, k), want, depth + 1))
+            return true;
+    return false;
+}
+
+/* A program whose root is an AND (a where: predicate run as one pass): an
+ * xbar in conjunct k buckets only the rows conjuncts 0..k-1, as written,
+ * keep, as the split filter chain does (#1355).  Records the conjuncts'
+ * registers (out->conj_reg) and each xbar instruction's count of them
+ * (xbar_guard).  A conjunct whose register is not computed per morsel ends
+ * the guard list there (conservative: fewer guards raise more). */
+static void expr_xbar_guards(ray_graph_t* g, ray_op_t* root, ray_expr_t* out,
+                             const uint8_t* node_reg, uint32_t nc, const uint32_t* ins_node) {
+    bool any = false;
+    for (uint8_t i = 0; i < out->n_ins; i++) any |= out->ins[i].xbar;
+    if (!any || root->opcode != OP_AND) return;
+    uint32_t conj[EXPR_MAX_CONJ], stk[64];
+    int ncj = 0, sp = 0;
+    ray_op_t* cur = root;
+    while ((cur || sp) && ncj < EXPR_MAX_CONJ) {
+        while (cur && cur->opcode == OP_AND && cur->arity == 2 && sp < 64) {
+            stk[sp++] = cur->id;
+            cur = op_child(g, cur, 0);
+        }
+        if (cur) conj[ncj++] = cur->id;
+        if (!sp) break;
+        cur = op_child(g, &g->nodes[stk[--sp]], 1);
+    }
+    uint8_t usable = 0;
+    for (; usable < ncj; usable++) {
+        uint8_t r = conj[usable] < nc ? node_reg[conj[usable]] : 0xFF;
+        if (r == 0xFF || out->regs[r].kind != REG_SCRATCH) break;
+        out->conj_reg[usable] = r;
+    }
+    for (uint8_t i = 0; i < out->n_ins; i++) {
+        if (!out->ins[i].xbar) continue;
+        int k = 0;
+        while (k < ncj && !expr_subtree_has(g, &g->nodes[conj[k]], ins_node[i], 0)) k++;
+        if (k == ncj) k = 0;                  /* not found: no guard */
+        out->ins[i].xbar_guard = (uint8_t)(k < usable ? k : usable);
+    }
+}
+
 /* Compile expression DAG into flat instruction array.
  * Returns true on success. Only compiles element-wise subtrees. */
 bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, ray_t** err) {
@@ -815,6 +1613,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
     uint32_t nc = g->node_count;
     if (nc > 4096) EXPR_BAIL(EXPR_BAIL_SIZE); /* guard against stack overflow from VLA */
     uint8_t node_reg[nc];
+    uint32_t ins_node[EXPR_MAX_INS];   /* an xbar instruction's node */
     memset(node_reg, 0xFF, nc * sizeof(uint8_t));
 
     /* Issue #533: which nodes may skip the SYM null proof.  A null SYM is
@@ -842,6 +1641,24 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
     /* Per register: the bound file-domain SYM source of a scan register
      * admitted by sym_eq_only; a STR constant absent from the global
      * intern table (usable only once re-translated into such a domain). */
+    /* #973: which nodes must hold their exact planned narrow value.  A
+     * narrow + - * (or neg) whose every consumer is a same-typed + - * / neg
+     * may stay in its I64 lane: wrapping once at the end equals wrapping
+     * after each op (arithmetic modulo 2^w).  Any other consumer, or the
+     * root, reads the value as it is, so it needs the narrowing CAST. */
+    uint8_t exact_use[nc];
+    memset(exact_use, 0, nc * sizeof(uint8_t));
+    /* Per node: |value| < 2^nbits in its lane (63: no bound).  A deferred
+     * wrap is taken only while the bound stays below 2^62, so the I64 lane
+     * never wraps and never reaches the INT64_MIN null sentinel. */
+    uint8_t nbits[nc];
+    memset(nbits, 63, nc * sizeof(uint8_t));
+    /* One widening CAST per narrow register, shared by all its readers
+     * (registers are written once, so a widened copy stays valid). */
+    uint8_t wide_i64[EXPR_MAX_REGS], wide_f64[EXPR_MAX_REGS];
+    memset(wide_i64, 0xFF, sizeof wide_i64);
+    memset(wide_f64, 0xFF, sizeof wide_f64);
+    if (root->id < nc) exact_use[root->id] = 1;
     ray_col_src_t* fd_src[EXPR_MAX_REGS];
     bool           const_unres[EXPR_MAX_REGS];
     memset(fd_src, 0, sizeof fd_src);
@@ -877,6 +1694,10 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     }
                 }
                 if (!safe) sym_cmp_safe[ch->id] = 0;
+                if (!((n->opcode == OP_ADD || n->opcode == OP_SUB ||
+                       n->opcode == OP_MUL || n->opcode == OP_NEG) &&
+                      n->out_type == ch->out_type))
+                    exact_use[ch->id] = 1;
                 if (!(eqne && expr_sym_lit(g, tbl, op_child(g, n, 1 - i), ch))) sym_eq_only[ch->id] = 0;
                 if (!seen[ch->id]) { seen[ch->id] = 1; stk[ssp++] = ch->id; }
             }
@@ -909,6 +1730,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
             sp--;
             uint8_t r = out->n_regs;
             if (r >= EXPR_MAX_REGS) EXPR_BAIL(EXPR_BAIL_REGS);
+            bool wrap_null = false;
+            int8_t narrow_to = 0;   /* planned narrow type of an I64-lane result */
 
             if (node->opcode == OP_SCAN) {
                 ray_op_ext_t* ext = find_ext(g, node->id);
@@ -1003,6 +1826,7 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 ray_t* ready = ray_col_src_ready(src);
                 bool enc = !src->parted && !ready;
                 bool enc_parted = src->parted && !ready;
+                if (node->id < nc) nbits[node->id] = expr_type_bits(elem);
                 out->regs[r].kind = REG_SCAN;
                 out->regs[r].src = src;
                 out->regs[r].enc = enc;
@@ -1081,6 +1905,10 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                         EXPR_BAIL(EXPR_BAIL_CONST);
                     }
                 }
+                if (node->id < nc) {
+                    int8_t ct = node->out_type;
+                    nbits[node->id] = expr_type_bits(RAY_IS_PARTED(ct) ? (int8_t)RAY_PARTED_BASETYPE(ct) : ct);
+                }
                 out->regs[r].kind = REG_CONST;
                 out->regs[r].type = is_f64 ? RAY_F64 : RAY_I64;
                 out->regs[r].const_f64 = cf;
@@ -1155,9 +1983,15 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                  * mismatched kernel.  Skip for OP_CAST — the instruction
                  * itself IS the conversion. */
 #define EXPR_PROMOTE(sreg, T) do {                                   \
+                    uint8_t _src = (sreg);                            \
+                    uint8_t* _wc = (T) == RAY_I64 ? &wide_i64[_src]   \
+                                 : (T) == RAY_F64 ? &wide_f64[_src]   \
+                                 : NULL;                              \
+                    if (_wc && *_wc != 0xFF) { (sreg) = *_wc; break; }\
                     (sreg) = expr_ensure_type(out, (sreg), (T));      \
                     if (out->regs[(sreg)].type != (T))                \
                         EXPR_BAIL(EXPR_BAIL_REGS);                    \
+                    if (_wc && (sreg) != _src) *_wc = (sreg);         \
                 } while (0)
                 if (op == OP_CAST) {
                     /* No promotion needed; CAST handles the conversion */
@@ -1216,7 +2050,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 bool in_src  = out->regs[s1].null_src ||
                                (s2 != 0xFF && out->regs[s2].null_src);
                 bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
-                                                       s2 != 0xFF);
+                                                       s2 != 0xFF, node->out_type) ||
+                                expr_temporal_arith_cast(g, node);
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
                 if (in_null) {
@@ -1282,12 +2117,56 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     .u8_mod_zero = (op == OP_MOD && ot == RAY_I64 &&
                                     op_child(g, node, 1) &&
                                     op_child(g, node, 1)->out_type == RAY_U8),
+                    .xbar = (op == OP_MOD && (node->flags & OP_FLAG_XBAR)),
                 };
+                /* An xbar by a constant that is neither zero nor null (the
+                 * lane's null: NaN, NULL_I64) has no row to raise on. */
+                if (out->ins[out->n_ins - 1].xbar && out->regs[s2].kind == REG_CONST &&
+                    (out->regs[s2].type == RAY_F64
+                         ? out->regs[s2].const_f64 != 0.0 && out->regs[s2].const_f64 == out->regs[s2].const_f64
+                         : out->regs[s2].const_i64 != 0 && out->regs[s2].const_i64 != NULL_I64))
+                    out->ins[out->n_ins - 1].xbar = 0;
+                if (out->ins[out->n_ins - 1].xbar) ins_node[out->n_ins - 1] = node->id;
+                /* The planner types narrow integer arithmetic in its own
+                 * width (I16 * I16 is I16 and wraps), as the builtins do;
+                 * the lanes here are I64.  One CAST brings the result back
+                 * to the planned type, so every consumer and the output see
+                 * the wrapped value the typed executor computes (#973). */
+                if (ot == RAY_I64 && op != OP_CAST) {
+                    int8_t pt = node->out_type;
+                    if (RAY_IS_PARTED(pt)) pt = (int8_t)RAY_PARTED_BASETYPE(pt);
+                    /* Signed +, -, * can land on the lane's null even with
+                     * real inputs. Materialize the wrap before any consumer:
+                     * modular arithmetic cannot propagate an intermediate null. */
+                    wrap_null = (pt == RAY_I16 || pt == RAY_I32) &&
+                                (op == OP_ADD || op == OP_SUB || op == OP_MUL);
+                    bool narrow = pt == RAY_BOOL || pt == RAY_U8 || pt == RAY_I16 || pt == RAY_I32;
+                    if (narrow && node->id < nc) {
+                        uint8_t b1 = nbits[node->in_id[0]];
+                        uint8_t b2 = node->arity >= 2 ? nbits[node->in_id[1]] : 0;
+                        unsigned bb = op == OP_MUL ? (unsigned)b1 + b2
+                                    : op == OP_NEG ? (unsigned)b1 + 1
+                                    : (unsigned)(b1 > b2 ? b1 : b2) + 1;
+                        bool defer = !exact_use[node->id] && bb <= 62 &&
+                                     (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_NEG) &&
+                                     !gen_null && !wrap_null;
+                        if (defer) nbits[node->id] = (uint8_t)bb;
+                        else { narrow_to = pt; nbits[node->id] = expr_type_bits(pt); }
+                    } else if (narrow) {
+                        narrow_to = pt;
+                    }
+                }
             } else {
                 EXPR_BAIL(EXPR_BAIL_OTHER);
             }
 
             out->n_regs++;
+            if (narrow_to) {
+                uint8_t nr = expr_ensure_type(out, r, narrow_to);
+                if (out->regs[nr].type != narrow_to) EXPR_BAIL(EXPR_BAIL_REGS);
+                if (wrap_null) out->regs[nr].nullable = true;
+                r = nr;
+            }
             if (node->id < nc) node_reg[node->id] = r;
         }
     }
@@ -1313,6 +2192,22 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
             EXPR_BAIL(EXPR_BAIL_NULL_SHAPE);
     }
 
+#ifdef DEBUG
+    /* The fused result has the planned type (#973): the projection, the
+     * aggregate input and the predicate all read it as the node's. */
+    {
+        int8_t pt = root->out_type;
+        if (RAY_IS_PARTED(pt)) pt = (int8_t)RAY_PARTED_BASETYPE(pt);
+        assert(out->out_type == pt && "fused result type differs from the plan");
+    }
+#endif
+    expr_xbar_guards(g, root, out, node_reg, nc, ins_node);
+    /* xbar's row domain: the installed selection (else an update's where:
+     * rows), when it covers this table's rows (else every row may raise). */
+    ray_t* xdom = g->selection ? g->selection : g->xbar_rows;
+    if (xdom && ray_rowsel_meta(xdom)->nrows == ray_table_nrows(tbl))
+        for (uint8_t i = 0; i < out->n_ins; i++)
+            if (out->ins[i].xbar) { out->sel = xdom; break; }
     ray_expr_compile_ok++;
     return true;
 }
@@ -1437,9 +2332,13 @@ static void expr_load_f64(double* dst, const void* data, int8_t col_type,
  *
  * AND/OR on I64-dst: task derivation forces BOOL dst for AND/OR since Task 6,
  *   so these I64-dst cases are unreachable for null_aware programs; left plain.
+ *
+ * xbar (the OP_MOD of an xbar, I64 or F64 lanes, #1355): the zero-divisor
+ * and null branches, taken anyway, also set *bad on a zero or null divisor
+ * (expr_xbar_bad_kept then decides the error).  Untouched otherwise.
  */
 static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_zero,
-                              int8_t dt, void* dp,
+                              uint8_t xbar, int* bad, int8_t dt, void* dp,
                               int8_t t1, const void* ap,
                               int8_t t2, const void* bp, int64_t n) {
     (void)t2;
@@ -1487,12 +2386,16 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
             case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(a[j] * b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(a[j] / b[j]) : NULL_F64; break;
             case OP_IDIV: for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(floor(a[j] / b[j])) : NULL_F64; break;
-            case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                if (b[j] == 0.0) { d[j] = NULL_F64; continue; }
-                double m = fmod(a[j], b[j]);
-                m = (m && ((m > 0) != (b[j] > 0))) ? m + b[j] : m;
-                d[j] = ray_f64_fin(m);
-            } break;
+            case OP_MOD:
+                for (int64_t j = 0; j < n; j++) d[j] = b[j] != 0.0 ? ray_f64_fin(ray_fmod_floor(a[j], b[j])) : NULL_F64;
+                /* The modulo loop does not vectorize; the divisor test is a
+                 * branch-free pass of its own over the morsel (in cache). */
+                if (xbar) {
+                    int nb = 0;
+                    for (int64_t j = 0; j < n; j++) nb |= (b[j] == 0.0) | (b[j] != b[j]);
+                    *bad = nb;
+                }
+                break;
             case OP_POW: for (int64_t j = 0; j < n; j++) d[j] = ray_f64_fin(pow(a[j], b[j])); break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
             case OP_MAX2: for (int64_t j = 0; j < n; j++) d[j] = a[j] > b[j] ? a[j] : b[j]; break;
@@ -1533,8 +2436,9 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
                     }
                     break;
                 case OP_MOD: for (int64_t j=0;j<n;j++) {
-                    if (I64_ISN(a[j])||I64_ISN(b[j])) { d[j]=NULL_I64; continue; }
-                    if (b[j]==0) { d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
+                    /* xbar: a zero or null divisor, null value or not */
+                    if (I64_ISN(a[j])||I64_ISN(b[j])) { if (xbar && (I64_ISN(b[j])||b[j]==0)) *bad=1; d[j]=NULL_I64; continue; }
+                    if (b[j]==0) { if (xbar) *bad=1; d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
                     if (b[j]==-1&&a[j]==INT64_MIN) { d[j]=NULL_I64; continue; }
                     int64_t m=a[j]%b[j];
                     if (m&&(m^b[j])<0) m+=b[j];
@@ -1574,7 +2478,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
                     }
                     break;
                 case OP_MOD: for (int64_t j = 0; j < n; j++) {
-                    if (b[j]==0) { d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
+                    if (b[j]==0) { if (xbar) *bad=1; d[j]=u8_mod_zero ? 0 : NULL_I64; continue; }
                     if (b[j]==-1 && a[j]==INT64_MIN) { d[j]=NULL_I64; continue; }
                     int64_t m = a[j]%b[j];
                     if (m && (m^b[j])<0) m+=b[j];
@@ -1619,7 +2523,7 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
         switch (opcode) {
             case OP_ADD: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] + (uint16_t)b[j]); break;
             case OP_SUB: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] - (uint16_t)b[j]); break;
-            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)((uint16_t)a[j] * (uint16_t)b[j]); break;
+            case OP_MUL: for (int64_t j = 0; j < n; j++) d[j] = (int16_t)(uint16_t)((uint32_t)(uint16_t)a[j] * (uint16_t)b[j]); break;
             case OP_DIV: for (int64_t j = 0; j < n; j++) { d[j] = b[j] ? a[j] / b[j] : 0; } break;
             case OP_MOD: for (int64_t j = 0; j < n; j++) { d[j] = b[j] ? a[j] % b[j] : 0; } break;
             case OP_MIN2: for (int64_t j = 0; j < n; j++) d[j] = a[j] < b[j] ? a[j] : b[j]; break;
@@ -1704,9 +2608,18 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
         } else { /* both bool */
             const uint8_t* a = (const uint8_t*)ap;
             const uint8_t* b = (const uint8_t*)bp;
+            /* The operands of a comparison of two predicates stay in byte lanes
+             * (see the promotion above); a BOOL has no null, and false < true.
+             * With no case here `(== p p)` wrote nothing and came out all false. */
             switch (opcode) {
                 case OP_AND: for (int64_t j = 0; j < n; j++) d[j] = a[j] && b[j]; break;
                 case OP_OR:  for (int64_t j = 0; j < n; j++) d[j] = a[j] || b[j]; break;
+                case OP_EQ:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) == (b[j] != 0); break;
+                case OP_NE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) != (b[j] != 0); break;
+                case OP_LT:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) <  (b[j] != 0); break;
+                case OP_LE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) <= (b[j] != 0); break;
+                case OP_GT:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) >  (b[j] != 0); break;
+                case OP_GE:  for (int64_t j = 0; j < n; j++) d[j] = (a[j] != 0) >= (b[j] != 0); break;
                 default: break;
             }
         }
@@ -1721,10 +2634,11 @@ static void expr_exec_binary(uint8_t opcode, uint8_t null_aware, uint8_t u8_mod_
  * the mark_i64_overflow_as_null post-pass (INT64_MIN result → null). */
 static void expr_exec_unary(uint8_t opcode, uint8_t null_aware, int8_t dt, void* dp,
                              int8_t t1, const void* ap, int64_t n) {
-    if (opcode == OP_CAST) {
-        dt = expr_cast_lane_type(dt);
-        t1 = expr_cast_lane_type(t1);
-    }
+    /* A CAST to DATE / TIME / TIMESTAMP (xbar, temporal %) leaves a
+     * register typed by its temporal result; every reader of it (ISNULL,
+     * NOT, a chained CAST) dispatches on the lane it sits in (#1339). */
+    t1 = expr_cast_lane_type(t1);
+    if (opcode == OP_CAST) dt = expr_cast_lane_type(dt);
     if (dt == RAY_F64) {
         double* d = (double*)dp;
         if (t1 == RAY_F64) {
@@ -2155,6 +3069,116 @@ static int expr_leaf_on_view(const ray_expr_t* expr, const expr_enc_plan_t* p, u
                              ray_enc_vview_t* vbuf, void** scratch, void** rptrs,
                              int64_t start, int64_t n, ray_t** err);
 
+/* A zero or null xbar divisor at lane j of d (lane type t). */
+static inline bool xbar_lane_bad(int8_t t, const void* d, int64_t j) {
+    switch (t) {
+        case RAY_I64: case RAY_TIMESTAMP: { int64_t v = ((const int64_t*)d)[j]; return v == 0 || (uint64_t)v == (uint64_t)NULL_I64; }
+        case RAY_I32: case RAY_DATE: case RAY_TIME: { int32_t v = ((const int32_t*)d)[j]; return v == 0 || (uint32_t)v == (uint32_t)NULL_I32; }
+        case RAY_I16: { int16_t v = ((const int16_t*)d)[j]; return v == 0 || (uint16_t)v == (uint16_t)NULL_I16; }
+        case RAY_U8: case RAY_BOOL: return ((const uint8_t*)d)[j] == 0;
+        case RAY_F64: { double v = ((const double*)d)[j]; return v == 0.0 || v != v; }
+        case RAY_F32: { float v = ((const float*)d)[j]; return v == 0.0f || v != v; }
+        default: return false;
+    }
+}
+
+/* Rows [row0, row0 + n) of sel, lanes d (type t, lane j = row - row0),
+ * known to hold a zero or null divisor somewhere: whether one sits on a
+ * row sel keeps.  Decided per segment from its flag: NONE keeps no row,
+ * ALL every row (its lanes scanned), MIX its kept rows (its index list
+ * walked once).  Rows past sel's count are kept. */
+static bool xbar_bad_on_kept(ray_t* sel, int64_t row0, int64_t n, int8_t t, const void* d) {
+    if (!sel) {
+        for (int64_t j = 0; j < n; j++) if (xbar_lane_bad(t, d, j)) return true;
+        return false;
+    }
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const uint8_t* fl = ray_rowsel_flags(sel);
+    const uint32_t* off = ray_rowsel_offsets(sel);
+    const uint16_t* ix = ray_rowsel_idx(sel);
+    int64_t end = row0 + n, r = row0;
+    while (r < end) {
+        if (r >= m->nrows) {                       /* outside the selection */
+            for (; r < end; r++) if (xbar_lane_bad(t, d, r - row0)) return true;
+            return false;
+        }
+        int64_t seg = r / RAY_MORSEL_ELEMS, s0 = seg * RAY_MORSEL_ELEMS;
+        int64_t se = s0 + RAY_MORSEL_ELEMS < end ? s0 + RAY_MORSEL_ELEMS : end;
+        if (se > m->nrows) se = m->nrows;
+        uint8_t f = fl[seg];
+        if (f == RAY_SEL_ALL) {
+            for (int64_t q = r; q < se; q++) if (xbar_lane_bad(t, d, q - row0)) return true;
+        } else if (f == RAY_SEL_MIX) {
+            for (uint32_t k = off[seg]; k < off[seg + 1]; k++) {
+                int64_t q = s0 + ix[k];
+                if (q < r) continue;
+                if (q >= se) break;
+                if (xbar_lane_bad(t, d, q - row0)) return true;
+            }
+        }
+        r = se;
+    }
+    return false;
+}
+
+/* Whether lane j of a register (lanes d, type t) is false: a conjunct
+ * that rejects the row. */
+static inline bool expr_lane_false(int8_t t, const void* d, int64_t j) {
+    switch (t) {
+        case RAY_F64: return ((const double*)d)[j] == 0.0;
+        case RAY_I64: case RAY_TIMESTAMP: return ((const int64_t*)d)[j] == 0;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return ((const int32_t*)d)[j] == 0;
+        case RAY_I16: return ((const int16_t*)d)[j] == 0;
+        default: return ((const uint8_t*)d)[j] == 0;
+    }
+}
+
+/* A morsel [start, start + n) whose xbar instruction had a zero or null
+ * divisor: whether one sits on a row the xbar buckets, i.e. a row
+ * expr->sel keeps (every row without one) that no conjunct written before
+ * it rejects (ins->xbar_guard).  A dropped row keeps the null its kernel
+ * wrote.  Runs only for a morsel with such a divisor. */
+__attribute__((noinline, cold))
+static bool expr_xbar_bad_kept(const ray_expr_t* expr, const expr_ins_t* ins, void* const* rptrs,
+                               int64_t start, int64_t n) {
+    int8_t dt = expr->regs[ins->dst].type;
+    const void* bp = rptrs[ins->src2];
+    if (!ins->xbar_guard)
+        return !expr->sel || xbar_bad_on_kept(expr->sel, expr->sel_off + start, n, dt, bp);
+    /* The common shape: no selection, guards of BOOL lanes, an I64
+     * divisor: one branch-free pass (bad divisor AND every guard true). */
+    bool flat = !expr->sel && dt != RAY_F64;
+    for (uint8_t k = 0; k < ins->xbar_guard && flat; k++)
+        flat = expr->regs[expr->conj_reg[k]].type == RAY_BOOL;
+    if (flat) {
+        const int64_t* b = (const int64_t*)bp;
+        uint8_t keep[EXPR_MORSEL];
+        memcpy(keep, rptrs[expr->conj_reg[0]], (size_t)n);
+        for (uint8_t k = 1; k < ins->xbar_guard; k++) {
+            const uint8_t* gk = (const uint8_t*)rptrs[expr->conj_reg[k]];
+            for (int64_t j = 0; j < n; j++) keep[j] &= gk[j];
+        }
+        int acc = 0;
+        for (int64_t j = 0; j < n; j++) acc |= ((b[j] == 0) | (b[j] == NULL_I64)) & (keep[j] != 0);
+        return acc != 0;
+    }
+    /* otherwise the rows a guard keeps hold the bad divisor: masked into a
+     * scratch divisor whose guarded-out rows read 1 */
+    int64_t one[EXPR_MORSEL];
+    double onef[EXPR_MORSEL];
+    void* m = dt == RAY_F64 ? (void*)onef : (void*)one;
+    for (int64_t j = 0; j < n; j++) {
+        bool out = false;
+        for (uint8_t k = 0; k < ins->xbar_guard && !out; k++) {
+            uint8_t r = expr->conj_reg[k];
+            out = expr_lane_false(expr->regs[r].type, rptrs[r], j);
+        }
+        if (dt == RAY_F64) onef[j] = out ? 1.0 : ((const double*)bp)[j];
+        else one[j] = out ? 1 : ((const int64_t*)bp)[j];
+    }
+    return xbar_bad_on_kept(expr->sel, expr->sel_off + start, n, dt, m);
+}
+
 /* Evaluate compiled expression for morsel [start, end).
  * scratch: array of EXPR_MAX_REGS buffers, each EXPR_MORSEL*8 bytes.
  * rsc: one range scratch per register index, NULL when no register is
@@ -2179,6 +3203,8 @@ EXPR_ONE_COPY static void* expr_eval_morsel(const ray_expr_t* expr, const expr_e
 
     void* rptrs[EXPR_MAX_REGS];
     bool loaded[EXPR_MAX_REGS];
+    uint8_t pend[EXPR_MAX_INS];   /* guarded xbar instructions with a bad divisor */
+    int npend = 0;
     for (uint8_t r = 0; r < expr->n_regs; r++) {
         if (plan && !plan->load_reg[r]) { rptrs[r] = scratch[r]; loaded[r] = false; continue; }
         loaded[r] = true;
@@ -2202,15 +3228,29 @@ EXPR_ONE_COPY static void* expr_eval_morsel(const ray_expr_t* expr, const expr_e
         }
         int8_t dt = expr->regs[ins->dst].type;
         if (ins->src2 != 0xFF) {
+            int bad = 0;
             expr_exec_binary(ins->opcode, ins->null_aware, ins->u8_mod_zero,
-                             dt, rptrs[ins->dst],
+                             ins->xbar, &bad, dt, rptrs[ins->dst],
                              expr->regs[ins->src1].type, rptrs[ins->src1],
                              expr->regs[ins->src2].type, rptrs[ins->src2], n);
+            if (RAY_UNLIKELY(bad)) {
+                /* a guarded xbar waits for its conjuncts' registers */
+                if (ins->xbar_guard) pend[npend++] = i;
+                else if (expr_xbar_bad_kept(expr, ins, rptrs, start, n)) {
+                    *err = ray_error("domain", RAY_XBAR_BUCKET_ERR);
+                    return NULL;
+                }
+            }
         } else {
             expr_exec_unary(ins->opcode, ins->null_aware, dt, rptrs[ins->dst],
                             expr->regs[ins->src1].type, rptrs[ins->src1], n);
         }
     }
+    for (int p = 0; p < npend; p++)
+        if (expr_xbar_bad_kept(expr, &expr->ins[pend[p]], rptrs, start, n)) {
+            *err = ray_error("domain", RAY_XBAR_BUCKET_ERR);
+            return NULL;
+        }
 
     return rptrs[expr->out_reg];
 }
@@ -2642,6 +3682,7 @@ static int expr_leaf_emit(const ray_expr_t* expr, const expr_enc_plan_t* p, ray_
 typedef struct {
     const ray_expr_t* expr;
     void*  out_data;
+    atomic_bool* int_null;             /* shared only for generated-only integer results */
     int8_t out_type;
     rowsel_builder_t* sel_builders;    /* NULL = normal bool/vec output */
     uint32_t          n_sel_builders;  /* slot count (fused mode only)  */
@@ -2686,6 +3727,7 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
 
     /* Chunk-zone skip is only possible for a BOOL predicate over a zone-
      * indexed column; compute the gate once, not per morsel. */
+    bool found_null = false;
     bool zone = expr_zone_eligible(expr);
     int64_t skips = 0;
     /* encoded leaves: one vector view on this task's stack (never the heap) */
@@ -2751,11 +3793,27 @@ static void expr_full_block(void* ctx, uint32_t worker_id, int64_t start, int64_
             if (!result) { memset(scratch[0], 0, (size_t)(me - ms)); result = scratch[0]; }
             rowsel_emit_segment(sb, lseg, (const uint8_t*)result, me - ms);
         } else if (result) {
-            memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
+            /* Combine copy and detection while the final register is hot. */
+            if (c->int_null && !found_null) {
+#define COPY_AND_FLAG(T, S) do {                         \
+                    const T* src = result;                            \
+                    T* dst = (T*)c->out_data + ms;                    \
+                    for (int64_t j = 0; j < me - ms; j++) {           \
+                        dst[j] = src[j];                              \
+                        found_null |= src[j] == (S);                  \
+                    }                                                 \
+                } while (0)
+                if (c->out_type == RAY_I16) COPY_AND_FLAG(int16_t, NULL_I16);
+                else if (c->out_type == RAY_I32) COPY_AND_FLAG(int32_t, NULL_I32);
+                else COPY_AND_FLAG(int64_t, NULL_I64);
+#undef COPY_AND_FLAG
+            } else
+                memcpy((char*)c->out_data + ms * esz, result, (size_t)(me - ms) * esz);
         }
     }
     if (rsc) for (uint8_t r = 0; r < expr->n_regs; r++) ray_col_scratch_free(&rsc[r]);
     scratch_free(scratch_hdr);
+    if (found_null) atomic_store_explicit(c->int_null, true, memory_order_relaxed);
     if (skips) atomic_fetch_add_explicit(&g_expr_zone_skips, skips, memory_order_relaxed);
 }
 
@@ -2789,6 +3847,12 @@ static void mark_i64_overflow_as_null(ray_t* result, int64_t off, int64_t len) {
     }
 }
 
+static bool expr_track_int_null(const ray_expr_t* expr) {
+    uint8_t o = expr->out_reg;
+    return (expr->out_type == RAY_I64 || expr->out_type == RAY_I32 || expr->out_type == RAY_I16)
+           && expr->regs[o].nullable && !expr->regs[o].null_src;
+}
+
 /* HAS_NULLS on a fused output.  A register whose nullability traces to a
  * nullable column gets the conservative attr — REQUIRED, not cosmetic:
  * group.c feeds this vec to aggregates whose check-free fast path is gated
@@ -2799,17 +3863,25 @@ static void mark_i64_overflow_as_null(ray_t* result, int64_t off, int64_t len) {
  * critical because this output is often an input to the NEXT op /
  * aggregate, and a spurious HAS_NULLS would force that consumer onto the
  * slow null-aware path (measured: conservative flagging regressed chained
- * float kernels catastrophically by poisoning inputs).  The scan looks at
- * the whole program's generators, not just the last instruction: the
- * sentinel survives every downstream null-aware kernel (abs, +, cast, ...).
- * Produced once (post-join of all morsels), so the pass is not the per-op
- * hot loop.  Mirrors the fallback's shape-based flagging (VM == fallback). */
-static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t nrows) {
+ * float kernels catastrophically by poisoning inputs). Integer workers check the
+ * final register during the output copy; the coordinator sets the attribute
+ * once after join. Other generated types keep their post-join scan. */
+static void expr_flag_output_nulls(const ray_expr_t* expr, ray_t* out, int64_t nrows,
+                                   const atomic_bool* int_null) {
     uint8_t o = expr->out_reg;
     if (!expr->regs[o].nullable) return;
     if (expr->regs[o].null_src) { out->attrs |= RAY_ATTR_HAS_NULLS; return; }
-    if (expr->out_type == RAY_I64)      mark_i64_overflow_as_null(out, 0, nrows);
+    if (expr_track_int_null(expr)) {
+        if (atomic_load_explicit(int_null, memory_order_relaxed)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    } else if (expr->out_type == RAY_TIMESTAMP)
+        mark_i64_overflow_as_null(out, 0, nrows);
     else if (expr->out_type == RAY_F64) mark_f64_nonfinite_as_null(out, 0, nrows);
+    else if (expr->out_type == RAY_DATE || expr->out_type == RAY_TIME) {
+        const int32_t* d = ray_data(out);
+        for (int64_t i = 0; i < nrows; i++) {
+            if (d[i] == NULL_I32) { out->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        }
+    }
 }
 
 /* Test hook: the parted evaluator runs every segment instead of stopping
@@ -2857,6 +3929,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
 
     int64_t n_segs = expr_nsegs(ref_parted);
     uint8_t esz = ray_elem_size(expr->out_type);
+    atomic_bool int_null = false;   /* sticky across all segments */
     ray_pool_t* pool = ray_pool_get();
     int64_t global_off = 0;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
@@ -2875,6 +3948,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
 
         /* Stack-copy expr, rebind parted registers to this segment */
         ray_expr_t seg_expr = *expr;
+        seg_expr.sel_off = global_off;   /* rows of segment s start there */
         ray_col_src_t seg_src[EXPR_MAX_REGS];     /* bound in place, released below */
         uint8_t n_seg_src = 0;
         bool seg_ok = true;
@@ -2920,6 +3994,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
             expr_enc_plan_t plan;
             expr_full_ctx_t ctx = {
                 .expr = &seg_expr,
+                .int_null = expr_track_int_null(expr) ? &int_null : NULL,
                 .out_data = (char*)ray_data(out) + global_off * esz,
                 .out_type = expr->out_type,
                 .fail = &fail,
@@ -2945,7 +4020,7 @@ static ray_t* expr_eval_full_parted(const ray_expr_t* expr, int64_t nrows) {
     }
     ray_t* ferr = ray_scan_fail_finish(&fail, dispatched ? pool : NULL);
     if (ferr) { ray_release(out); return ferr; }
-    expr_flag_output_nulls(expr, out, nrows);
+    expr_flag_output_nulls(expr, out, nrows, &int_null);
     return out;
 }
 
@@ -2959,9 +4034,11 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
     if (!out || RAY_IS_ERR(out)) return out;
     out->len = nrows;
 
+    atomic_bool int_null = false;
     ray_scan_fail_t fail; ray_scan_fail_init(&fail);
     expr_enc_plan_t plan;
     expr_full_ctx_t ctx = {
+        .int_null = expr_track_int_null(expr) ? &int_null : NULL,
         .expr = expr, .out_data = ray_data(out), .out_type = expr->out_type, .fail = &fail,
         .plan = expr_enc_plan_build(expr, &plan),
     };
@@ -2978,7 +4055,7 @@ ray_t* expr_eval_full(const ray_expr_t* expr, int64_t nrows) {
 
     ray_t* ferr = ray_scan_fail_finish(&fail, par ? pool : NULL);
     if (ferr) { ray_release(out); return ferr; }
-    expr_flag_output_nulls(expr, out, nrows);
+    expr_flag_output_nulls(expr, out, nrows, &int_null);
     return out;
 }
 
@@ -3755,7 +4832,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             if (opc == OP_SIGNUM)
                 for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0f) - (src[i] < 0.0f);
             else
-                for (int64_t i=0;i<n;i++) dst[i] = (int64_t)src[i];
+                /* A float null, ±inf or an out-of-range value has no int64_t:
+                 * a raw cast is undefined (#1343). */
+                for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null((double)src[i]);
             out_off += n;
         }
     } else if (in_type == RAY_F64 && out_type == RAY_F64) {
@@ -3794,15 +4873,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             double* src = (double*)m.morsel_ptr;
             int64_t* dst = (int64_t*)((char*)ray_data(result) + out_off * sizeof(int64_t));
             switch (opc) {
-                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)(-src[i]); break;
-                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)fabs(src[i]); break;
-                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)sqrt(src[i]); break;
-                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)log(src[i]); break;
-                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = (int64_t)exp(src[i]); break;
+                /* Through ray_cast_f64_to_i64_null: a raw cast of a null,
+                 * ±inf or out-of-range result is undefined (#1343). */
+                case OP_NEG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(-src[i]); break;
+                case OP_ABS:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(fabs(src[i])); break;
+                case OP_SQRT:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(sqrt(src[i])); break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(log(src[i])); break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(exp(src[i])); break;
                 case OP_SIGNUM:for (int64_t i=0;i<n;i++) dst[i] = (src[i] > 0.0) - (src[i] < 0.0); break;
-                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = (int64_t)ceil(src[i]); break;
-                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)floor(src[i]); break;
-                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = (int64_t)round(src[i]); break;
+                case OP_CEIL:  for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(ceil(src[i])); break;
+                case OP_FLOOR: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(floor(src[i])); break;
+                case OP_ROUND: for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(round(src[i])); break;
                 default:       for (int64_t i=0;i<n;i++) dst[i] = ray_cast_f64_to_i64_null(src[i]); break;
             }
             out_off += n;
@@ -3854,6 +4935,9 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                  in_type == RAY_I16 ? (double)((int16_t*)m.morsel_ptr)[i] : \
                                       (double)((uint8_t*)m.morsel_ptr)[i])
             switch (opc) {
+                case OP_SQRT:  for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(sqrt(v)); } break;
+                case OP_LOG:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(log(v)); } break;
+                case OP_EXP:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(exp(v)); } break;
                 case OP_SIN:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(sin(v)); } break;
                 case OP_ASIN:  for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(asin(v)); } break;
                 case OP_COS:   for (int64_t i=0;i<n;i++){ double v=SRC_NARROW_D(i); dst[i]=ray_f64_fin(cos(v)); } break;
@@ -3932,6 +5016,45 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
             } else {
                 const uint8_t* src = (const uint8_t*)m.morsel_ptr;
                 for (int64_t i = 0; i < n; i++) dst[i] = !src[i];
+            }
+            out_off += n;
+        }
+    } else if ((opc == OP_NEG || opc == OP_ABS) && in_type == out_type &&
+               (in_type == RAY_I32 || in_type == RAY_I16)) {
+        /* neg / abs over a narrow integer keeps its width and wraps there,
+         * as the builtins do.  Without this arm the result was allocated
+         * and never written (a query that fell back here, e.g. once the
+         * fused program ran out of registers, read garbage). */
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            if (in_type == RAY_I32) {
+                const int32_t* src = (const int32_t*)m.morsel_ptr;
+                int32_t* dst = (int32_t*)ray_data(result) + out_off;
+                if (opc == OP_NEG) for (int64_t i = 0; i < n; i++) dst[i] = (int32_t)(0u - (uint32_t)src[i]);
+                else for (int64_t i = 0; i < n; i++) dst[i] = src[i] < 0 ? (int32_t)(0u - (uint32_t)src[i]) : src[i];
+            } else {
+                const int16_t* src = (const int16_t*)m.morsel_ptr;
+                int16_t* dst = (int16_t*)ray_data(result) + out_off;
+                if (opc == OP_NEG) for (int64_t i = 0; i < n; i++) dst[i] = (int16_t)(uint16_t)(0u - (uint16_t)src[i]);
+                else for (int64_t i = 0; i < n; i++) dst[i] = src[i] < 0 ? (int16_t)(uint16_t)(0u - (uint16_t)src[i]) : src[i];
+            }
+            out_off += n;
+        }
+    } else if (opc == OP_CAST && in_type == RAY_F32 &&
+               (out_type == RAY_I32 || out_type == RAY_I16 ||
+                out_type == RAY_U8 || out_type == RAY_BOOL)) {
+        /* F32 to a narrow type: as the F64 arm below, through double. */
+        size_t osz = ray_elem_size(out_type);
+        while (ray_morsel_next(&m)) {
+            int64_t n = m.morsel_len;
+            const float* src = (const float*)m.morsel_ptr;
+            char* dst = (char*)ray_data(result) + (size_t)out_off * osz;
+            for (int64_t i = 0; i < n; i++) {
+                double v = (double)src[i];
+                if (out_type == RAY_I32)      ((int32_t*)dst)[i] = ray_cast_f64_to_i32_null(v);
+                else if (out_type == RAY_I16) ((int16_t*)dst)[i] = ray_cast_f64_to_i16_null(v);
+                else if (out_type == RAY_U8)  ((uint8_t*)dst)[i] = ray_cast_f64_to_u8_null(v);
+                else                          ((uint8_t*)dst)[i] = ray_cast_f64_to_bool_null(v);
             }
             out_off += n;
         }
@@ -4118,6 +5241,17 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
     if (out_type == RAY_F64 && expr_is_f64_unary_math(op->opcode))
         mark_f64_nonfinite_as_null(result, 0, len);
 
+    /* A temporal +/- integer wrapped onto the sentinel is a null, as the
+     * builtin and the fused CAST read it (expr_temporal_arith_cast). */
+    if (g && expr_temporal_arith_cast(g, op)) {
+        if (out_type == RAY_TIMESTAMP) mark_i64_overflow_as_null(result, 0, len);
+        else {
+            const int32_t* d = (const int32_t*)ray_data(result);
+            for (int64_t i = 0; i < len; i++)
+                if (d[i] == NULL_I32) { result->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        }
+    }
+
     return result;
 }
 
@@ -4240,6 +5374,10 @@ __attribute__((noinline)) static void br_u8_scalar(const uint8_t* restrict d, ui
     case OP_GE: for (int64_t i = 0; i < n; i++) o[i] = (d[i] >= cvt); break;
     }
 }
+
+#ifdef DEBUG
+_Atomic(uint64_t) ray_narrow_left_ranges;
+#endif
 
 static void binary_range(ray_op_t* op, int8_t out_type,
                          ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
@@ -4483,6 +5621,20 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         return;
     }
 
+    /* Even non-null operands can wrap to the output-width null payload. Reduce while
+     * storing, without a second column pass or a per-row metadata update. */
+#define BR_WRAP(T, TYPE, NIL, L, OP, R) do {                                           \
+        int any = 0;                                                        \
+        for (int64_t i = 0; i < n; i++) {                                   \
+            T v = (T)((uint64_t)(L) OP (uint64_t)(R));                      \
+            odst[i] = v;                                                    \
+            any |= (v == (NIL));                                            \
+        }                                                                   \
+        if (out_type == (TYPE) && any)                                       \
+            __atomic_fetch_or(&result->attrs, RAY_ATTR_HAS_NULLS,           \
+                                   __ATOMIC_RELAXED);                       \
+    } while (0)
+
     /* Fast path: integer-vec vs integer-scalar arithmetic with
      * matching output type (e.g. (- ClientIP 1) → I32 from I32 col).
      * Same motivation as the BOOL fast path: the LV_READ macro chain
@@ -4507,22 +5659,22 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         int64_t cv = r_i64;
         uint16_t opc = op->opcode;
 
-        #define BR_AR_FAST(T) do {                                          \
+        #define BR_AR_FAST(T, TYPE, NIL) do {                                          \
             const T* d = (const T*)lbase;                                   \
             T* odst = (T*)dst;                                              \
             T cvt = (T)cv;                                                  \
             switch (opc) {                                                  \
-            case OP_ADD:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] + (uint64_t)cvt); break; \
-            case OP_SUB:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] - (uint64_t)cvt); break; \
-            case OP_MUL:  for (int64_t i = 0; i < n; i++) odst[i] = (T)((uint64_t)d[i] * (uint64_t)cvt); break; \
+            case OP_ADD:  BR_WRAP(T, TYPE, NIL, d[i], +, cvt); break; \
+            case OP_SUB:  BR_WRAP(T, TYPE, NIL, d[i], -, cvt); break; \
+            case OP_MUL:  BR_WRAP(T, TYPE, NIL, d[i], *, cvt); break; \
             case OP_MIN2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] < cvt ? d[i] : cvt; break; \
             case OP_MAX2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] > cvt ? d[i] : cvt; break; \
             }                                                               \
         } while (0)
 
-        if (l_esz == 8) { BR_AR_FAST(int64_t); return; }
-        if (l_esz == 4) { BR_AR_FAST(int32_t); return; }
-        if (l_esz == 2) { BR_AR_FAST(int16_t); return; }
+        if (l_esz == 8) { BR_AR_FAST(int64_t, RAY_I64, NULL_I64); return; }
+        if (l_esz == 4) { BR_AR_FAST(int32_t, RAY_I32, NULL_I32); return; }
+        if (l_esz == 2) { BR_AR_FAST(int16_t, RAY_I16, NULL_I16); return; }
         #undef BR_AR_FAST
     }
 
@@ -4610,6 +5762,29 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         else if (rhs->type == RAY_BOOL || rhs->type == RAY_U8) rp_bool = (uint8_t*)rbase;
     }
 
+    /* Exact-width add/sub/mul only. Mixed types still go through LV_INT /
+     * RV_INT; vector/scalar already has its own path above. Use the resolved
+     * pointers so a slice and a worker subrange keep their original offsets. */
+#define BR_NARROW_OPS(T, TYPE, NIL, L, R) do {                              \
+        T* odst = (T*)dst;                                                  \
+        switch (op->opcode) {                                               \
+        case OP_ADD: BR_WRAP(T, TYPE, NIL, L, +, R); goto narrow_done;      \
+        case OP_SUB: BR_WRAP(T, TYPE, NIL, L, -, R); goto narrow_done;      \
+        case OP_MUL: BR_WRAP(T, TYPE, NIL, L, *, R); goto narrow_done;      \
+        }                                                                   \
+    } while (0)
+    if (!r_scalar && rhs->type == out_type &&
+        (lhs->type == out_type || lhs->type == -out_type)) {
+        if (out_type == RAY_I16) {
+            if (l_scalar) BR_NARROW_OPS(int16_t, RAY_I16, NULL_I16, l_i64, rp_i16[i]);
+            else          BR_NARROW_OPS(int16_t, RAY_I16, NULL_I16, lp_i16[i], rp_i16[i]);
+        } else if (out_type == RAY_I32) {
+            if (l_scalar) BR_NARROW_OPS(int32_t, RAY_I32, NULL_I32, l_i64, rp_i32[i]);
+            else          BR_NARROW_OPS(int32_t, RAY_I32, NULL_I32, lp_i32[i], rp_i32[i]);
+        }
+    }
+#undef BR_NARROW_OPS
+
     /* Resolve the lhs/rhs reader to a single decision made once before the loop.
      * Each of these yields a double for the given index. */
 #define LV_READ(i)  (lp_f64 ? lp_f64[i] : lp_f32 ? (double)lp_f32[i] : lp_i64 ? (double)lp_i64[i] : lp_i32 ? (double)lp_i32[i] : lp_u32 ? (double)lp_u32[i] : lp_i16 ? (double)lp_i16[i] : lp_bool ? (double)lp_bool[i] : (l_scalar && (lhs->type == -RAY_F64 || lhs->type == RAY_F64 || lhs->type == -RAY_F32 || lhs->type == RAY_F32)) ? l_f64 : (double)l_i64)
@@ -4687,7 +5862,7 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_MUL:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=ray_f64_fin(lv*rv); } break;
             case OP_DIV:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(lv/rv):NULL_F64; } break;
             case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(floor(lv/rv)):NULL_F64; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); double r; if(rv!=0.0){r=fmod(lv,rv);if(r&&((r>0)!=(rv>0)))r+=rv; r=ray_f64_fin(r);}else r=NULL_F64; odst[i]=r; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_fin(ray_fmod_floor(lv,rv)):NULL_F64; } break;
             case OP_POW:  for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=(lv!=lv||rv!=rv)?NULL_F64:ray_f64_fin(pow(lv,rv)); } break;
             case OP_MIN2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
             case OP_MAX2: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
@@ -4714,13 +5889,17 @@ static void binary_range(ray_op_t* op, int8_t out_type,
             case OP_ADD:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)+RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_SUB:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)-RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
             case OP_MUL:  for (int64_t i=0;i<n;i++) { float v=(float)(LV_READ(i)*RV_READ(i)); odst[i]=isfinite(v)?v:NULL_F32; } break;
-            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=fmodf(lv,rv);if(v&&((v>0)!=(rv>0)))v+=rv;v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
+            case OP_MOD:  for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); float v; if(rv!=0.0f){v=ray_fmod_floor_f32(lv,rv);v=isfinite(v)?v:NULL_F32;}else v=NULL_F32;odst[i]=v; } break;
+            /* div over two F32 operands keeps F32 (#972): the floor of the
+             * double quotient, rounded once, as the atom builtin does. */
+            case OP_IDIV: for (int64_t i=0;i<n;i++) { double lv=LV_READ(i),rv=RV_READ(i); odst[i]=rv!=0.0?ray_f64_to_f32_fin(floor(lv/rv)):NULL_F32; } break;
             case OP_MIN2: for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); odst[i]=lv<rv?lv:rv; } break;
             case OP_MAX2: for (int64_t i=0;i<n;i++) { float lv=(float)LV_READ(i),rv=(float)RV_READ(i); odst[i]=lv>rv?lv:rv; } break;
             default:      for (int64_t i=0;i<n;i++) odst[i]=0.0f; break;
         }
         if (op->opcode == OP_ADD || op->opcode == OP_SUB ||
-            op->opcode == OP_MUL || op->opcode == OP_MOD) {
+            op->opcode == OP_MUL || op->opcode == OP_MOD ||
+            op->opcode == OP_IDIV) {
             int any_nan = 0;
             for (int64_t i = 0; i < n; i++) any_nan |= (odst[i] != odst[i]);
             if (any_nan)
@@ -4729,10 +5908,25 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         }
     } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
         int64_t* odst = (int64_t*)dst;
+        /* The right broadcast already has a typed loop. Keep the remaining
+         * common I64 shapes out of per-element reader dispatch as well. */
+        if (out_type == RAY_I64 && rhs->type == RAY_I64 && !r_scalar &&
+            (lhs->type == RAY_I64 || lhs->type == -RAY_I64)) {
+#define BR_I64(OP) do {                                                     \
+                if (l_scalar) BR_WRAP(int64_t, RAY_I64, NULL_I64, l_i64, OP, rp_i64[i]);       \
+                else BR_WRAP(int64_t, RAY_I64, NULL_I64, lp_i64[i], OP, rp_i64[i]);            \
+            } while (0)
+            switch (op->opcode) {
+                case OP_ADD: BR_I64(+); return;
+                case OP_SUB: BR_I64(-); return;
+                case OP_MUL: BR_I64(*); return;
+            }
+#undef BR_I64
+        }
         switch (op->opcode) {
-            case OP_ADD: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li+(uint64_t)ri);}break;
-            case OP_SUB: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li-(uint64_t)ri);}break;
-            case OP_MUL: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i);odst[i]=(int64_t)((uint64_t)li*(uint64_t)ri);}break;
+            case OP_ADD: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), *, RV_INT(i)); break;
             case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}break;
             case OP_IDIV:
                 if (rp_i16) {
@@ -4801,9 +5995,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
         int32_t* odst = (int32_t*)dst;
         switch (op->opcode) {
-            case OP_ADD: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_INT(i),ri=(int32_t)RV_INT(i);odst[i]=(int32_t)((uint32_t)li+(uint32_t)ri);}break;
-            case OP_SUB: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_INT(i),ri=(int32_t)RV_INT(i);odst[i]=(int32_t)((uint32_t)li-(uint32_t)ri);}break;
-            case OP_MUL: for(int64_t i=0;i<n;i++){int32_t li=(int32_t)LV_INT(i),ri=(int32_t)RV_INT(i);odst[i]=(int32_t)((uint32_t)li*(uint32_t)ri);}break;
+            case OP_ADD: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), *, RV_INT(i)); break;
             /* OP_DIV omitted — ray_binop hard-codes F64 for OP_DIV, so
              * narrow-output OP_DIV is unreachable through any caller. */
             case OP_IDIV:
@@ -4823,9 +6017,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_I16) {
         int16_t* odst = (int16_t*)dst;
         switch (op->opcode) {
-            case OP_ADD: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=(int16_t)((uint16_t)li+(uint16_t)ri);}break;
-            case OP_SUB: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=(int16_t)((uint16_t)li-(uint16_t)ri);}break;
-            case OP_MUL: for(int64_t i=0;i<n;i++){int16_t li=(int16_t)LV_INT(i),ri=(int16_t)RV_INT(i);odst[i]=(int16_t)((uint16_t)li*(uint16_t)ri);}break;
+            case OP_ADD: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), *, RV_INT(i)); break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
             case OP_IDIV:
                 if (src_is_i64_all && !idiv_i64_small) {
@@ -4899,11 +6093,55 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #undef RV_READ
 #undef LV_READ_I64
 #undef RV_READ_I64
+#undef BR_WRAP
 #undef LV_INT
 #undef RV_INT
+    goto done;
+narrow_done:
+#ifdef DEBUG
+    if (l_scalar) atomic_fetch_add_explicit(&ray_narrow_left_ranges, 1, memory_order_relaxed);
+#endif
 done:
     if (lsym_buf) ray_free_raw(lsym_buf);
     if (rsym_buf) ray_free_raw(rsym_buf);
+}
+
+/* An xbar's rows over len rows: the installed selection, else an update's
+ * where: rows (g->xbar_rows), when it covers them; NULL: every row. */
+static ray_t* xbar_row_domain(ray_graph_t* g, int64_t len) {
+    ray_t* d = g ? (g->selection ? g->selection : g->xbar_rows) : NULL;
+    return d && ray_rowsel_meta(d)->nrows == len ? d : NULL;
+}
+
+/* A scalar xbar divisor with no zero and no null, or one no row of len
+ * sees (an empty column, or a row domain that keeps no row); ray_xbar_fn
+ * raises domain otherwise. */
+static bool xbar_scalar_ok(ray_t* rhs, double rf, int64_t ri, int64_t len, ray_t* dom) {
+    if (len == 0) return true;   /* no row to bucket, as the builtin's per-row path */
+    int8_t t = rhs->type < 0 ? (int8_t)-rhs->type : rhs->type;
+    bool null = ray_is_atom(rhs) ? RAY_ATOM_IS_NULL(rhs) : ray_vec_is_null(rhs, 0);
+    if (!null && (t == RAY_F64 || t == RAY_F32 ? rf != 0.0 : ri != 0)) return true;
+    return dom && ray_rowsel_meta(dom)->total_pass == 0;
+}
+
+/* Whether the xbar divisor vector holds a zero or null in [s, e): one
+ * branch-free pass, run by the task that just computed those rows. */
+static bool xbar_range_bad(ray_t* rhs, int64_t s, int64_t e) {
+    const void* d = ray_data(rhs);
+    int bad = 0;
+#define XBAR_RANGE(T, BAD) do { const T* b = (const T*)d;                     \
+        for (int64_t i = s; i < e; i++) bad |= BAD; } while (0)
+    switch (rhs->type) {
+        case RAY_I64: case RAY_TIMESTAMP: XBAR_RANGE(int64_t, (b[i] == 0) | (b[i] == NULL_I64)); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: XBAR_RANGE(int32_t, (b[i] == 0) | (b[i] == NULL_I32)); break;
+        case RAY_I16: XBAR_RANGE(int16_t, (b[i] == 0) | (b[i] == NULL_I16)); break;
+        case RAY_U8: case RAY_BOOL: XBAR_RANGE(uint8_t, b[i] == 0); break;
+        case RAY_F64: XBAR_RANGE(double, (b[i] == 0.0) | (b[i] != b[i])); break;
+        case RAY_F32: XBAR_RANGE(float, (b[i] == 0.0f) | (b[i] != b[i])); break;
+        default: break;
+    }
+#undef XBAR_RANGE
+    return bad != 0;
 }
 
 /* Context for parallel binary dispatch */
@@ -4927,6 +6165,10 @@ typedef struct {
     const uint32_t* sel_offs;
     const uint16_t* sel_idx;
     uint32_t        sel_n_segs;
+    /* An xbar's vector divisor: each task tests the rows it computed and
+     * sets xbad on a zero or null (xbar_range_bad). */
+    bool            xbar_scan;
+    int             xbad;
 } par_binary_ctx_t;
 
 static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -4937,6 +6179,8 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      start, end);
+        if (RAY_UNLIKELY(c->xbar_scan) && xbar_range_bad(c->rhs, start, end))
+            __atomic_store_n(&c->xbad, 1, __ATOMIC_RELAXED);
         return;
     }
     /* Selection-aware: walk per-morsel and skip RAY_SEL_NONE segments.
@@ -4956,6 +6200,8 @@ static void par_binary_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t 
                      c->l_scalar, c->r_scalar,
                      c->l_f64, c->r_f64, c->l_i64, c->r_i64,
                      s_lo, s_hi);
+        if (RAY_UNLIKELY(c->xbar_scan) && xbar_range_bad(c->rhs, s_lo, s_hi))
+            __atomic_store_n(&c->xbad, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -4966,14 +6212,22 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     int8_t right_type = g->nodes[op->in_id[1]].out_type;
     if (ray_has_timespan(lhs) || ray_has_timespan(rhs) ||
         left_type == RAY_TIMESPAN || right_type == RAY_TIMESPAN ||
-        (op->opcode == OP_SUB && left_type == RAY_TIMESTAMP && right_type == RAY_TIMESTAMP)) {
-        /* Constant payloads are integers; the graph carries their temporal types. */
+        (op->opcode == OP_SUB && left_type == right_type &&
+         (left_type == RAY_TIMESTAMP || left_type == RAY_TIME))) {
+        /* Constant payloads are integers; the graph carries their temporal
+         * types.  A TIME constant may hold an I64 null. */
         ray_t left_atom, right_atom;
-        if (ray_is_atom(lhs) && (left_type == RAY_TIMESPAN || left_type == RAY_TIMESTAMP)) {
+        if (ray_is_atom(lhs) && (left_type == RAY_TIMESPAN || left_type == RAY_TIMESTAMP ||
+                                 left_type == RAY_TIME)) {
             left_atom = *lhs; left_atom.type = -left_type; lhs = &left_atom;
+            if (left_type == RAY_TIME)
+                left_atom.i64 = left_atom.i64 == NULL_I64 ? NULL_I32 : (int32_t)left_atom.i64;
         }
-        if (ray_is_atom(rhs) && (right_type == RAY_TIMESPAN || right_type == RAY_TIMESTAMP)) {
+        if (ray_is_atom(rhs) && (right_type == RAY_TIMESPAN || right_type == RAY_TIMESTAMP ||
+                                 right_type == RAY_TIME)) {
             right_atom = *rhs; right_atom.type = -right_type; rhs = &right_atom;
+            if (right_type == RAY_TIME)
+                right_atom.i64 = right_atom.i64 == NULL_I64 ? NULL_I32 : (int32_t)right_atom.i64;
         }
         return ray_timespan_binary(op->opcode, lhs, rhs);
     }
@@ -5057,11 +6311,11 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
     }
 
-    /* GUID comparison: 16-byte cells, memcmp equality.  Without this
-     * branch a guid predicate fell into the numeric loops, which read
-     * the cells at the wrong width and silently matched nothing.  Only
-     * == and != are defined for guid operands here (cmp.c orders guid
-     * ATOMS, but a ranged guid predicate over a column has no use). */
+    /* GUID comparison: 16-byte cells, memcmp order, as cmp.c orders guid
+     * atoms (a null guid is all zero bytes and sorts first).  Without this
+     * branch a guid predicate fell into the numeric loops, which read the
+     * cells at the wrong width and silently matched nothing.  A guid
+     * against any other type is the builtins' type error. */
     {
         bool l_guid = (l_scalar ? (lhs->type == -RAY_GUID || lhs->type == RAY_GUID)
                                 : lhs->type == RAY_GUID);
@@ -5069,14 +6323,48 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
                                 : rhs->type == RAY_GUID);
         if (l_guid || r_guid) {
             uint16_t opc = op->opcode;
-            if (!l_guid || !r_guid) {
+            if (opc < OP_EQ || opc > OP_GE) {
                 ray_release(result);
-                return ray_error("type", "expr eval: cannot compare %s and %s",
-                                 ray_type_name(lhs->type), ray_type_name(rhs->type));
+                return ray_error("type", "expr eval: guid operands support only comparisons");
             }
-            if (opc != OP_EQ && opc != OP_NE) {
+            if (!l_guid || !r_guid) {
+                /* == / != against a null literal of any type answers by the
+                 * guid cell's own nullness (all zero bytes), as cmp.c's
+                 * null forms do before looking at types. */
+                ray_t* o = l_guid ? rhs : lhs;
+                ray_t* gv = l_guid ? lhs : rhs;
+                bool g_scalar = l_guid ? l_scalar : r_scalar;
+                if ((opc == OP_EQ || opc == OP_NE) && ray_is_atom(o) && RAY_ATOM_IS_NULL(o)) {
+                    uint8_t* out = (uint8_t*)ray_data(result);
+                    const uint8_t* gb = gv->type == -RAY_GUID
+                                      ? (const uint8_t*)ray_data(gv->obj)
+                                      : (const uint8_t*)ray_data(gv);
+                    static const uint8_t zero16[16];
+                    for (int64_t i = 0; i < len; i++) {
+                        uint8_t isnull = memcmp(gb + (g_scalar ? 0 : i * 16), zero16, 16) == 0;
+                        out[i] = opc == OP_EQ ? isnull : (uint8_t)!isnull;
+                    }
+                    return result;
+                }
+                /* The mirror: a null guid literal against a cell of another
+                 * type answers by that cell's nullness. */
+                if ((opc == OP_EQ || opc == OP_NE) && ray_is_atom(gv) && RAY_ATOM_IS_NULL(gv)) {
+                    bool o_scalar = l_guid ? r_scalar : l_scalar;
+                    uint8_t* out = (uint8_t*)ray_data(result);
+                    for (int64_t i = 0; i < len; i++) {
+                        uint8_t isnull = ray_is_atom(o) ? RAY_ATOM_IS_NULL(o)
+                                       : ray_vec_is_null(o, o_scalar ? 0 : i);
+                        out[i] = opc == OP_EQ ? isnull : (uint8_t)!isnull;
+                    }
+                    return result;
+                }
                 ray_release(result);
-                return ray_error("type", "expr eval: guid operands support only == and !=");
+                if (opc == OP_EQ || opc == OP_NE)
+                    return ray_error("type", "%s: incomparable operand types, got %s and %s",
+                                     opc == OP_EQ ? "=" : "<>",
+                                     ray_type_name((int8_t)-lt), ray_type_name((int8_t)-rt));
+                return ray_error("type", "cannot compare %s and %s",
+                                 ray_type_name((int8_t)-lt), ray_type_name((int8_t)-rt));
             }
             uint8_t* out = (uint8_t*)ray_data(result);
             const uint8_t* lb = (lhs->type == -RAY_GUID)
@@ -5088,8 +6376,17 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             for (int64_t i = 0; i < len; i++) {
                 const uint8_t* lp = lb + (l_scalar ? 0 : i * 16);
                 const uint8_t* rp = rb + (r_scalar ? 0 : i * 16);
-                uint8_t eq = (memcmp(lp, rp, 16) == 0) ? 1 : 0;
-                out[i] = (opc == OP_EQ) ? eq : (uint8_t)!eq;
+                int c = memcmp(lp, rp, 16);
+                uint8_t v;
+                switch (opc) {
+                case OP_EQ: v = c == 0; break;
+                case OP_NE: v = c != 0; break;
+                case OP_LT: v = c < 0;  break;
+                case OP_LE: v = c <= 0; break;
+                case OP_GT: v = c > 0;  break;
+                default:    v = c >= 0; break;
+                }
+                out[i] = v;
             }
             return result;
         }
@@ -5220,6 +6517,19 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
         }
     }
 
+    /* The OP_MOD of an xbar: a zero or null divisor is the builtin's domain
+     * error.  A scalar is read once here; a vector is tested by each task
+     * over the rows it computed (in cache), and only a bad one asks which
+     * rows the xbar's row domain keeps.  This stands in for the
+     * zero-divisor pass below, which it makes moot. */
+    bool xbar = RAY_UNLIKELY(op->flags & OP_FLAG_XBAR);
+    ray_t* xdom = xbar ? xbar_row_domain(g, len) : NULL;
+    if (xbar && r_scalar && !xbar_scalar_ok(rhs, r_f64_val, r_i64_val, len, xdom)) {
+        ray_release(result);
+        return ray_error("domain", RAY_XBAR_BUCKET_ERR);
+    }
+    int xbad = 0;
+
     ray_pool_t* pool = ray_pool_get();
     if (pool && len >= RAY_PARALLEL_THRESHOLD) {
         par_binary_ctx_t ctx = {
@@ -5233,6 +6543,8 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             .sel_offs   = NULL,
             .sel_idx    = NULL,
             .sel_n_segs = 0,
+            .xbar_scan  = xbar && !r_scalar,
+            .xbad       = 0,
         };
         if (g && g->selection) {
             ray_rowsel_t* sm = ray_rowsel_meta(g->selection);
@@ -5244,11 +6556,18 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
             }
         }
         ray_pool_dispatch(pool, par_binary_fn, &ctx, len);
+        xbad = ctx.xbad;
     } else {
         binary_range(op, out_type, lhs, rhs, result, ray_data(result),
                      l_scalar, r_scalar,
                      l_f64_val, r_f64_val, l_i64_val, r_i64_val,
                      0, len);
+        xbad = xbar && !r_scalar && xbar_range_bad(rhs, 0, len);
+    }
+    if (RAY_UNLIKELY(xbad) &&
+        (!xdom || xbar_bad_on_kept(xdom, 0, len, rhs->type, ray_data(rhs)))) {
+        ray_release(result);
+        return ray_error("domain", RAY_XBAR_BUCKET_ERR);
     }
 
     /* Null propagation from inputs.  Skipped when str_resolved: we resolved
@@ -5271,7 +6590,7 @@ ray_t* exec_elementwise_binary(ray_graph_t* g, ray_op_t* op, ray_t* lhs, ray_t* 
     /* Div/mod: mark zero-divisor positions as null.
      * The morsel loop writes 0 for b==0 but can't set bitmap nulls. */
     uint16_t opc = op->opcode;
-    if (opc == OP_DIV || opc == OP_IDIV || opc == OP_MOD) {
+    if ((opc == OP_DIV || opc == OP_IDIV || opc == OP_MOD) && !(op->flags & OP_FLAG_XBAR)) {
         if (!r_scalar) {
             int8_t rt = rhs->type;
             if (rt == RAY_I64 || rt == RAY_TIMESTAMP) {

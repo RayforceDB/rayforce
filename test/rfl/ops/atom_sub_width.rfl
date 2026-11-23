@@ -1,17 +1,18 @@
 ;; #970: atom subtraction uses both operand types, as existing atom addition does.
-;; Five integral kinds, both orders. No new global widening/overflow policy.
+;; Five integral kinds, both orders, by the promotion table (#972): the wider
+;; type wins and a same-width result wraps; B8 with B8 is I64.
 (type (- true true)) -- 'i64
 (- true true) -- 0
-(type (- true 0x03)) -- 'i64
-(- true 0x03) -- -2
+(type (- true 0x03)) -- 'u8
+(- true 0x03) -- 0xfe
 (type (- true 30000h)) -- 'i16
 (- true 30000h) -- -29999h
 (type (- true 90000i)) -- 'i32
 (- true 90000i) -- -89999i
 (type (- true 100000)) -- 'i64
 (- true 100000) -- -99999
-(type (- 0x03 true)) -- 'i64
-(- 0x03 true) -- 2
+(type (- 0x03 true)) -- 'u8
+(- 0x03 true) -- 0x02
 (type (- 0x03 0x03)) -- 'u8
 (- 0x03 0x03) -- 0x00
 (type (- 0x03 30000h)) -- 'i16
@@ -79,7 +80,7 @@
 (- 2.5e 1.0e) -- 1.5e
 (- 2024.01.03 2024.01.02) -- 1i
 (- 2024.01.03 1h) -- 2024.01.02
-(- 10:30:00.000 09:30:00.000) -- 01:00:00.000
+(- 10:30:00.000 09:30:00.000) -- 0D01:00:00
 (type (- 2024.01.03D00:00:00.000000000 2024.01.02D00:00:00.000000000)) -- 'timespan
 
 ;; The compiled atom call must not reintroduce right-width narrowing.

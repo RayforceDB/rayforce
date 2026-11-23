@@ -298,7 +298,7 @@ static inline int64_t if_f64_to_i64(double x) {
 
 static int64_t if_atom_i64(ray_t* v) {
     switch (-v->type) {
-    case RAY_I64: case RAY_TIMESTAMP: return v->i64;
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: return v->i64;
     case RAY_I32: case RAY_DATE: case RAY_TIME: return v->i32;
     case RAY_I16: return v->i16;
     case RAY_BOOL: case RAY_U8: return v->b8;
@@ -336,11 +336,35 @@ static int64_t if_vec_i64(ray_t* v, int64_t idx) {
     return read_col_i64(ray_data(v), idx, v->type, v->attrs);
 }
 
+/* An integer null widens to the F64 null, as `as 'F64` widens it: converting
+ * the stored sentinel instead gives an ordinary huge number (#1279). */
 static double if_vec_f64(ray_t* v, int64_t idx) {
     if (v->type == RAY_F64) return ((double*)ray_data(v))[idx];
     if (v->type == RAY_F32) return (double)((float*)ray_data(v))[idx];
+    if (ray_vec_is_null(v, idx)) return (double)NAN;
     return (double)if_vec_i64(v, idx);
 }
+
+/* The null of an integer-celled output type, or 0 when it has none. */
+static inline int64_t if_int_null(int8_t out_type) {
+    switch (out_type) {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: return NULL_I64;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
+    case RAY_I16: return NULL_I16;
+    default: return 0;
+    }
+}
+
+/* One cell widened or narrowed to an integer output: a null cell becomes the
+ * output type's null.  Reading the stored sentinel instead keeps its own
+ * width's value, so an I32 null in an I64 output was -2147483648 (#1279). */
+static inline int64_t if_vec_int_as(ray_t* v, int64_t idx, int8_t out_type) {
+    if (v->type != RAY_F64 && v->type != RAY_F32 &&
+        ray_vec_may_have_nulls(v) && ray_vec_is_null(v, idx))
+        return if_int_null(out_type);
+    return if_vec_i64(v, idx);
+}
+
 
 static int64_t if_scalar_i64(ray_t* v) {
     return ray_is_atom(v) ? if_atom_i64(v) : if_vec_i64(v, 0);
@@ -348,6 +372,15 @@ static int64_t if_scalar_i64(ray_t* v) {
 
 static double if_scalar_f64(ray_t* v) {
     return ray_is_atom(v) ? if_atom_f64(v) : if_vec_f64(v, 0);
+}
+
+/* if_scalar_i64 for an integer output: a null atom (or one-cell null
+ * vector) broadcasts the output type's null. */
+static int64_t if_scalar_int_as(ray_t* v, int8_t out_type) {
+    bool null = ray_is_atom(v) ? RAY_ATOM_IS_NULL(v)
+              : (v->type != RAY_F64 && v->type != RAY_F32 &&
+                 ray_vec_may_have_nulls(v) && ray_vec_is_null(v, 0));
+    return null ? if_int_null(out_type) : if_scalar_i64(v);
 }
 
 static int8_t if_value_type(ray_t* v) {
@@ -454,14 +487,18 @@ static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
             double x = ray_is_atom(value) ? if_atom_f64(value)
                      : if_vec_f64(value, src);
             ((double*)ray_data(result))[dst] = x;
-        } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+        } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP ||
+                   out_type == RAY_TIMESPAN) {
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int64_t*)ray_data(result))[dst] = x;
         } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int32_t*)ray_data(result))[dst] = (int32_t)x;
         } else if (out_type == RAY_I16) {
-            int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
+            int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
+                      : if_vec_int_as(value, src, out_type);
             ((int16_t*)ray_data(result))[dst] = (int16_t)x;
         } else {
             int64_t x = ray_is_atom(value) ? if_atom_i64(value) : if_vec_i64(value, src);
@@ -827,8 +864,8 @@ static bool if_lazy_supported_type(int8_t out_type) {
     return out_type == RAY_F64 || out_type == RAY_I64 ||
            out_type == RAY_I32 || out_type == RAY_I16 ||
            out_type == RAY_BOOL || out_type == RAY_U8 ||
-           out_type == RAY_TIMESTAMP || out_type == RAY_TIME ||
-           out_type == RAY_DATE || out_type == RAY_STR ||
+           out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN ||
+           out_type == RAY_TIME || out_type == RAY_DATE || out_type == RAY_STR ||
            out_type == RAY_SYM;
 }
 
@@ -848,6 +885,13 @@ static bool if_branch_trivial(ray_graph_t* g, ray_op_t* op) {
         return ext && ext->literal && ray_is_atom(ext->literal);
     }
     return false;
+}
+
+/* A literal branch, under any alias. */
+static bool if_branch_const(ray_graph_t* g, ray_op_t* op) {
+    while (op && (op->opcode == OP_ALIAS || op->opcode == OP_MATERIALIZE))
+        op = op_child(g, op, 0);
+    return op && op->opcode == OP_CONST;
 }
 
 /* A branch that is cheap to evaluate over ALL rows and total (no row can
@@ -901,13 +945,16 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
          * it to an unwritten result buffer). */
         case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
         case RAY_U8: case RAY_BOOL:
-        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE: case RAY_GUID:
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_TIME: case RAY_DATE:
+        case RAY_GUID:
             return true;
         default: return false;
     }
 }
 
-static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
+/* Out of line: inlined into exec_if it cost the serial STR descriptor
+ * build there about 5% (same instructions, its loops laid out worse). */
+static __attribute__((noinline)) ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
     if (!g || !g->table || !cond_v || cond_v->type != RAY_BOOL)
         return NULL;
     int64_t nrows = ray_table_nrows(g->table);
@@ -922,9 +969,9 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
 
     /* Both branches trivial AND type-safe for the eager fill → eager
      * (POOL-PARALLEL elementwise) wins over the serial id-scaffolding
-     * here.  Only when workers exist: with a 0-worker pool (-c 1) the
-     * eager fill runs serially over ALL rows for BOTH branches, which
-     * loses to the selected path's touch-only-passing-rows scheme. */
+     * here.  With a 0-worker pool (-c 1) the eager fill runs serially over
+     * ALL rows, which loses to the selected path's touch-only-passing-rows
+     * scheme only under a sparse selection (below). */
     /* Whether the eager arm is even a candidate for this node — not whether
      * it runs, which also depends on the pool.  Where it is, this arm must
      * answer exactly as it would, or the same expression gets two types
@@ -970,9 +1017,15 @@ static ray_t* exec_if_selected(ray_graph_t* g, ray_op_t* op, ray_t* cond_v) {
                            (then_op->out_type == RAY_SYM || then_op->out_type == RAY_STR) &&
                            (else_op->out_type == RAY_SYM || else_op->out_type == RAY_STR) &&
                            if_branch_trivial(g, then_op) && if_branch_trivial(g, else_op));
+    /* Serially too unless the selection is sparse: the typed eager fill
+     * costs about a nanosecond a row, this arm's compaction and scatter
+     * several per selected row (#1181).  Not a STR result with a literal
+     * side: the serial descriptor build for it loses to this arm. */
     {
         ray_pool_t* rp = ray_pool_get();
-        if (rp && rp->n_workers > 0 && eager_possible)
+        bool serial_eager = !sparse_sel &&
+            !(op->out_type == RAY_STR && (if_branch_const(g, then_op) || if_branch_const(g, else_op)));
+        if (eager_possible && ((rp && rp->n_workers > 0) || serial_eager))
             return NULL;
     }
 
@@ -1094,10 +1147,65 @@ static inline int64_t if_fill_sym_cell(const if_fill_ctx_t* c, if_sym_side_t* si
     return if_sym_cell_value(side, i);
 }
 
+/* Both sides already stored as the output's cells (a vector of that width,
+ * or a scalar): a typed select per row the compiler can vectorise, instead
+ * of if_vec_i64/if_vec_f64's per-cell call and type switch, which cost
+ * about three times the select (#1181).  Same cells as the generic loop. */
+#define IF_FILL_SAME(T, TSC, ESC) do {                                        \
+    T* dst_ = (T*)c->dst;                                                     \
+    const T* tp_ = c->then_scalar ? NULL : (const T*)ray_data(c->then_v);     \
+    const T* ep_ = c->else_scalar ? NULL : (const T*)ray_data(c->else_v);     \
+    T ts_ = (T)(TSC), es_ = (T)(ESC);                                         \
+    if (tp_ && ep_)                                                           \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? tp_[i] : ep_[i]; \
+    else if (tp_)                                                             \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? tp_[i] : es_; \
+    else if (ep_)                                                             \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? ts_ : ep_[i]; \
+    else                                                                      \
+        for (int64_t i = i0; i < i1; i++) dst_[i] = cond_p[i] ? ts_ : es_;    \
+} while (0)
+
+static inline bool if_side_i64_cells(ray_t* v, bool scalar) {
+    return scalar || v->type == RAY_I64 || v->type == RAY_TIMESTAMP || v->type == RAY_TIMESPAN;
+}
+
 static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     const uint8_t* cond_p = c->cond;
     switch (c->out_type) {
     case RAY_F64: {
+        if ((c->then_scalar || c->then_v->type == RAY_F64) &&
+            (c->else_scalar || c->else_v->type == RAY_F64)) {
+            IF_FILL_SAME(double, c->t_f64, c->e_f64);
+            break;
+        }
+        /* An I64-cell side beside an F64 or scalar one: (double) of the raw
+         * cell, except that the I64 null (shared by TIMESTAMP and TIMESPAN)
+         * widens to the F64 null, as `as 'F64` does (#1279). */
+        bool t_i = !c->then_scalar && if_side_i64_cells(c->then_v, false);
+        bool e_i = !c->else_scalar && if_side_i64_cells(c->else_v, false);
+        if ((t_i || c->then_scalar || c->then_v->type == RAY_F64) &&
+            (e_i || c->else_scalar || c->else_v->type == RAY_F64)) {
+            double* dst = (double*)c->dst;
+            const void* tp = c->then_scalar ? NULL : ray_data(c->then_v);
+            const void* ep = c->else_scalar ? NULL : ray_data(c->else_v);
+            const int64_t* ti = (const int64_t*)tp;
+            const int64_t* ei = (const int64_t*)ep;
+            const double* tf = (const double*)tp;
+            const double* ef = (const double*)ep;
+            double ts = c->t_f64, es = c->e_f64;
+#define IF_W(x) ((x) == NULL_I64 ? (double)NAN : (double)(x))
+#define IF_FILL_LOOP(TX, EX) \
+            for (int64_t i = i0; i < i1; i++) dst[i] = cond_p[i] ? (TX) : (EX)
+            if (t_i && e_i)          IF_FILL_LOOP(IF_W(ti[i]), IF_W(ei[i]));
+            else if (t_i && ep)      IF_FILL_LOOP(IF_W(ti[i]), ef[i]);
+            else if (t_i)            IF_FILL_LOOP(IF_W(ti[i]), es);
+            else if (tp)             IF_FILL_LOOP(tf[i], IF_W(ei[i]));
+            else                     IF_FILL_LOOP(ts, IF_W(ei[i]));
+#undef IF_FILL_LOOP
+#undef IF_W
+            break;
+        }
         double* dst = (double*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
             double tv = c->then_scalar ? c->t_f64 : if_vec_f64(c->then_v, i);
@@ -1105,11 +1213,16 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
-    case RAY_I64: case RAY_TIMESTAMP: {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: {
+        if (if_side_i64_cells(c->then_v, c->then_scalar) &&
+            if_side_i64_cells(c->else_v, c->else_scalar)) {
+            IF_FILL_SAME(int64_t, c->t_i64, c->e_i64);
+            break;
+        }
         int64_t* dst = (int64_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int64_t tv = c->then_scalar ? c->t_i64 : if_vec_i64(c->then_v, i);
-            int64_t ev = c->else_scalar ? c->e_i64 : if_vec_i64(c->else_v, i);
+            int64_t tv = c->then_scalar ? c->t_i64 : if_vec_int_as(c->then_v, i, c->out_type);
+            int64_t ev = c->else_scalar ? c->e_i64 : if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
@@ -1125,18 +1238,23 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
         }
         break; }
     case RAY_I32: case RAY_TIME: case RAY_DATE: {
+        if ((c->then_scalar || c->then_v->type == c->out_type) &&
+            (c->else_scalar || c->else_v->type == c->out_type)) {
+            IF_FILL_SAME(int32_t, c->t_i64, c->e_i64);
+            break;
+        }
         int32_t* dst = (int32_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_i64(c->then_v, i);
-            int32_t ev = c->else_scalar ? (int32_t)c->e_i64 : (int32_t)if_vec_i64(c->else_v, i);
+            int32_t tv = c->then_scalar ? (int32_t)c->t_i64 : (int32_t)if_vec_int_as(c->then_v, i, c->out_type);
+            int32_t ev = c->else_scalar ? (int32_t)c->e_i64 : (int32_t)if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
     case RAY_I16: {
         int16_t* dst = (int16_t*)c->dst;
         for (int64_t i = i0; i < i1; i++) {
-            int16_t tv = c->then_scalar ? (int16_t)c->t_i64 : (int16_t)if_vec_i64(c->then_v, i);
-            int16_t ev = c->else_scalar ? (int16_t)c->e_i64 : (int16_t)if_vec_i64(c->else_v, i);
+            int16_t tv = c->then_scalar ? (int16_t)c->t_i64 : (int16_t)if_vec_int_as(c->then_v, i, c->out_type);
+            int16_t ev = c->else_scalar ? (int16_t)c->e_i64 : (int16_t)if_vec_int_as(c->else_v, i, c->out_type);
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
@@ -1166,6 +1284,7 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
     default: break;
     }
 }
+#undef IF_FILL_SAME
 
 static void if_fill_par_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
@@ -1466,14 +1585,62 @@ static ray_t* if_str_text_build(ray_t* result, const uint8_t* cond, int64_t len,
 
 /* `cond_in`: the condition exec_if already evaluated (ownership passes
  * here), or NULL to evaluate it. */
+/* Whether an arm holds an xbar (OP_FLAG_XBAR), whose zero bucket raises
+ * per row.  Deeper than the walk looks counts as holding one. */
+static bool if_arm_has_xbar(ray_graph_t* g, ray_op_t* n, int depth) {
+    if (!n) return false;
+    if (n->flags & OP_FLAG_XBAR) return true;
+    if (depth > 64) return true;
+    for (int k = 0; k < n->arity && k < 2; k++)
+        if (n->in_id[k] != RAY_OP_NONE && if_arm_has_xbar(g, op_node(g, n->in_id[k]), depth + 1))
+            return true;
+    if (n->opcode == OP_IF) {
+        ray_op_ext_t* e = find_ext(g, n->id);
+        if (e && if_arm_has_xbar(g, op_node(g, e->third_in), depth + 1)) return true;
+    }
+    return false;
+}
+
+/* An arm a scalar condition does not take, evaluated for its shape and type
+ * only: no row takes it, so an xbar's zero bucket in it is no error, as the
+ * interpreter's `if` never evaluates it (#1355).  The arm runs under a
+ * selection that keeps no row (the xbar kernels' row domain); every other
+ * arm runs as it is. */
+static ray_t* exec_if_untaken(ray_graph_t* g, ray_op_t* arm) {
+    if (!g->table || !if_arm_has_xbar(g, arm, 0)) return exec_node(g, arm);
+    int64_t nrows = ray_table_nrows(g->table);
+    ray_t* none = ray_rowsel_new(nrows, 0, 0);
+    if (!none) return ray_error("oom", NULL);
+    ray_rowsel_t* m = ray_rowsel_meta(none);
+    memset(ray_rowsel_flags(none), RAY_SEL_NONE, m->n_segs);
+    memset(ray_rowsel_offsets(none), 0, (size_t)(m->n_segs + 1) * sizeof(uint32_t));
+    ray_t* saved = g->selection;
+    g->selection = none;
+    ray_t* v = exec_node(g, arm);
+    g->selection = saved;
+    ray_rowsel_release(none);
+    return v;
+}
+
 static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
     /* cond = inputs[0], then = inputs[1], else_id stored in ext->third_in */
     ray_t* cond_v = cond_in ? cond_in : exec_node(g, op_child(g, op, 0));
-    ray_t* then_v = exec_node(g, op_child(g, op, 1));
-
     ray_op_ext_t* ext = find_ext(g, op->id);
     uint32_t else_id = ext->third_in;
-    ray_t* else_v = exec_node(g, op_node(g, else_id));
+    /* A scalar condition takes one arm for every row: an atom, or one
+     * cell (a reduction such as `(> (sum v) 0)`; over a one-row table the
+     * one row takes that arm too). */
+    int untaken = 0;
+    if (cond_v && !RAY_IS_ERR(cond_v)) {
+        if (ray_is_atom(cond_v))
+            untaken = if_cond_atom(cond_v) ? 2 : 1;
+        else if (cond_v->len == 1 && if_cond_type_ok(cond_v->type))
+            untaken = if_cond_cell(cond_v, 0) ? 2 : 1;
+    }
+    ray_t* then_v = untaken == 1 ? exec_if_untaken(g, op_child(g, op, 1))
+                                 : exec_node(g, op_child(g, op, 1));
+    ray_t* else_v = untaken == 2 ? exec_if_untaken(g, op_node(g, else_id))
+                                 : exec_node(g, op_node(g, else_id));
 
     if (!cond_v || RAY_IS_ERR(cond_v)) {
         if (then_v && !RAY_IS_ERR(then_v)) ray_release(then_v);
@@ -1710,8 +1877,8 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
                     ? ray_sym_intern(ray_str_ptr(else_v), ray_str_len(else_v))
                     : sym_scalar_runtime_id(else_v);
         } else {
-            if (then_scalar) { fc.t_f64 = if_scalar_f64(then_v); fc.t_i64 = if_scalar_i64(then_v); }
-            if (else_scalar) { fc.e_f64 = if_scalar_f64(else_v); fc.e_i64 = if_scalar_i64(else_v); }
+            if (then_scalar) { fc.t_f64 = if_scalar_f64(then_v); fc.t_i64 = if_scalar_int_as(then_v, out_type); }
+            if (else_scalar) { fc.e_f64 = if_scalar_f64(else_v); fc.e_i64 = if_scalar_int_as(else_v, out_type); }
         }
 
         ray_pool_t* pool = ray_pool_get();
@@ -1850,30 +2017,40 @@ static bool pivot_table_has_parted_col(ray_t* tbl) {
     return false;
 }
 
+/* A parted table as one in-RAM table: every segment concatenated in order.
+ * NULL when `tbl` has no parted column (the caller keeps `tbl`), else a new
+ * reference or an error.  pivot (tblop.c) flattens before it picks a route,
+ * so both routes and their column-type gates see the base types. */
+ray_t* pivot_flatten_parted(ray_t* tbl) {
+    if (!pivot_table_has_parted_col(tbl)) return NULL;
+    int64_t nseg = pivot_parted_seg_count(tbl);
+    ray_t* flat = NULL;
+    for (int64_t s = 0; s < nseg; s++) {
+        ray_t* seg = build_segment_table(tbl, (int32_t)s);
+        if (!seg || RAY_IS_ERR(seg)) { if (flat) ray_release(flat); return seg ? seg : ray_error("oom", NULL); }
+        if (!flat) flat = seg;
+        else {
+            ray_t* m = ray_result_merge(flat, seg);
+            ray_release(flat); ray_release(seg);
+            if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+            flat = m;
+        }
+    }
+    return flat ? flat : ray_table_new(0);
+}
+
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     /* Parted-input guard: exec_pivot fetches columns via ray_table_col and
      * indexes them by row up to ray_table_nrows.  A raw RAY_PARTED/MAPCOMMON
      * column (whose data is a tiny segs array, not nrows elements) would be
-     * indexed out of bounds → OOB read / SIGSEGV.  Flatten (concat all
-     * segments) and recompute on the flat table, mirroring exec_window /
-     * join_with_parted_guard.  A flat table has no parted column, so the
+     * indexed out of bounds.  pivot flattens first; this keeps the op safe
+     * on any other input.  A flat table has no parted column, so the
      * recursive call falls straight through this guard (one level). */
-    if (pivot_table_has_parted_col(tbl)) {
-        int64_t nseg = pivot_parted_seg_count(tbl);
-        ray_t* flat = NULL;
-        for (int64_t s = 0; s < nseg; s++) {
-            ray_t* seg = build_segment_table(tbl, (int32_t)s);
-            if (!seg || RAY_IS_ERR(seg)) { if (flat) ray_release(flat); return seg ? seg : ray_error("oom", NULL); }
-            if (!flat) flat = seg;
-            else {
-                ray_t* m = ray_result_merge(flat, seg);
-                ray_release(flat); ray_release(seg);
-                if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
-                flat = m;
-            }
-        }
+    ray_t* flat = pivot_flatten_parted(tbl);
+    if (flat) {
+        if (RAY_IS_ERR(flat)) return flat;
         ray_t* r = exec_pivot(g, op, flat);
         ray_release(flat);
         return r;
@@ -2030,7 +2207,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * index keys + 1 pivot key, followed by the ceil(n_keys/64) key-null
      * mask words written by group_rows_range (ly.null_words; Task 3). */
 
-    /* SQL PIVOT treats a null pivot key as "no column" — drop those groups.
+    /* A null pivot key is one more pivot value: its rows make one column,
+     * named by the type's null (pivot_col_names), as the generic route
+     * gives it.  pv_null is its position, UINT32_MAX until a group has it.
      * The pivot key is the LAST of the n_keys keys, at bit position n_idx —
      * word-indexed per the Task-3/4 convention (word k>>6, bit k&63; the
      * unsigned-shift idiom sidesteps UB at bit 63) since n_idx can now
@@ -2059,18 +2238,24 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!pv_vals) { scratch_free(pv_first_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     const char* pvt_base = pvt_wide ? (const char*)key_data[n_idx] : NULL;
+    uint32_t pv_null = UINT32_MAX;
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
         group_ht_t* ph = &pg.part_hts[_p];
         uint32_t pcount = ph->grp_count;
         for (uint32_t gi_local = 0; gi_local < pcount; gi_local++) {
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* rkeys = (const int64_t*)(row + 8);
-            if (rkeys[n_keys + pvt_null_word] & pvt_null_bit) continue;
+            bool pnull = (rkeys[n_keys + pvt_null_word] & pvt_null_bit) != 0;
             int64_t pval = rkeys[n_idx];
             int64_t gfirst;
             memcpy(&gfirst, row + ly.off_group_first, 8);
             bool found = false;
-            for (uint32_t p = 0; p < pv_count; p++) {
+            if (pnull && pv_null != UINT32_MAX) {
+                found = true;
+                if (gfirst < pv_first[pv_null]) pv_first[pv_null] = gfirst;
+            }
+            for (uint32_t p = 0; p < pv_count && !pnull; p++) {
+                if (p == pv_null) continue;
                 if (pvt_wide) {
                     if (memcmp(pvt_base + (size_t)pv_vals[p] * 16,
                                pvt_base + (size_t)pval * 16, 16) == 0) { found = true; if (gfirst < pv_first[p]) pv_first[p] = gfirst; break; }
@@ -2089,6 +2274,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     pv_vals = new_pv; pv_first = new_pf;
                     pv_cap = new_cap; pv_first_cap = new_cap;
                 }
+                if (pnull) pv_null = pv_count;
                 pv_first[pv_count] = gfirst;
                 pv_vals[pv_count++] = pval;
             }
@@ -2129,9 +2315,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     memset(ix_ht, 0xFF, ix_ht_cap * sizeof(uint32_t));
     uint32_t ix_ht_mask = ix_ht_cap - 1;
 
-    /* Map: group_id -> (ix_row, pv_idx) for result cell placement */
+    /* Map: group_id -> (ix_row, pv_idx) for result cell placement, after
+     * nw_tmp: a null pivot key's group's index null words (8-byte words
+     * first, so both stay aligned). */
     ray_t* map_hdr = NULL;
-    uint32_t* grp_ix  = (uint32_t*)scratch_alloc(&map_hdr, grp_count * 2 * sizeof(uint32_t));
+    int64_t* nw_tmp = (int64_t*)scratch_alloc(&map_hdr,
+        (size_t)null_words * sizeof(int64_t) + (size_t)grp_count * 2 * sizeof(uint32_t));
+    uint32_t* grp_ix  = nw_tmp ? (uint32_t*)(nw_tmp + null_words) : NULL;
     if (!grp_ix) {
         scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr);
         pivot_ingest_free(&pg); ght_layout_free(&ly);
@@ -2152,19 +2342,19 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             uint32_t gi = gi_base + gi_local;
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* keys = (const int64_t*)(row + 8);
-            if (keys[n_keys + pvt_null_word] & pvt_null_bit) {
-                grp_ix[gi] = UINT32_MAX;
-                grp_pv[gi] = UINT32_MAX;
-                continue;
-            }
+            bool pnull = (keys[n_keys + pvt_null_word] & pvt_null_bit) != 0;
             int64_t gfirst;
             memcpy(&gfirst, row + ly.off_group_first, 8);
-        /* Index-key null words: keys[n_keys .. n_keys+null_words) as-is.
-         * The pivot key's own null bit (position n_idx, word pvt_null_word)
-         * is guaranteed 0 here — the check just above already `continue`d
-         * on it being set — so these words already carry exactly the
-         * index-key null flags with no separate masking needed. */
+        /* Index-key null words: keys[n_keys .. n_keys+null_words), with the
+         * pivot key's own null bit (position n_idx, word pvt_null_word)
+         * cleared when it is set, so a row with a null pivot value finds
+         * the index row of its index keys.  Per group, not per row. */
         const int64_t* idx_nwords = keys + n_keys;
+        if (pnull) {
+            memcpy(nw_tmp, idx_nwords, (size_t)null_words * 8);
+            nw_tmp[pvt_null_word] &= ~pvt_null_bit;
+            idx_nwords = nw_tmp;
+        }
 
         /* Hash index keys only (exclude pivot key) + null words.
          * Wide keys (GUID) resolve actual bytes via key_data[k]. */
@@ -2249,8 +2439,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * are source row indices — resolve to actual bytes for compare,
          * otherwise duplicate GUID pivot values map to the wrong column. */
         int64_t pval = keys[n_idx];
-        uint32_t pv_idx = UINT32_MAX;
-        for (uint32_t p = 0; p < pv_count; p++) {
+        uint32_t pv_idx = pnull ? pv_null : UINT32_MAX;
+        for (uint32_t p = 0; p < pv_count && !pnull; p++) {
+            if (p == pv_null) continue;
             if (pvt_wide) {
                 if (memcmp(pvt_base + (size_t)pv_vals[p] * 16,
                            pvt_base + (size_t)pval * 16, 16) == 0) { pv_idx = p; break; }
@@ -2292,6 +2483,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
         for (uint32_t r = 0; r < pv_count; r++) pv_tmp[r] = pv_vals[pv_rank[r]];
         memcpy(pv_vals, pv_tmp, (size_t)pv_count * sizeof(int64_t));
+        /* pv_first in rank order too: each column's first source row, the
+         * row its name is read from */
+        for (uint32_t r = 0; r < pv_count; r++) pv_tmp[r] = pv_first[pv_rank[r]];
+        memcpy(pv_first, pv_tmp, (size_t)pv_count * sizeof(int64_t));
         for (uint32_t r = 0; r < pv_count; r++) pv_tmp[pv_rank[r]] = r;   /* invert: old -> new */
         for (uint32_t p = 0; p < pv_count; p++) pv_rank[p] = (uint32_t)pv_tmp[p];
         /* index rows */
@@ -2361,7 +2556,6 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         scratch_free(rank_hdr);
     }
     scratch_free(ix_first_hdr);
-    scratch_free(pv_first_hdr);
     ray_progress_update("pivot", "scatter", 0, (uint64_t)pv_count);
     /* The group accumulators hold F32 and F64 values alike in F64 lanes;
      * min / max / first / last of an F32 column are F32 cells. */
@@ -2370,11 +2564,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     switch (agg_op) {
         case OP_AVG:   out_agg_type = RAY_F64; break;
         case OP_COUNT: out_agg_type = RAY_I64; break;
-        case OP_SUM:   out_agg_type = val_is_f64 ? RAY_F64 : RAY_I64; break;
+        /* a sum of durations is a duration, as (sum v) is */
+        case OP_SUM:   out_agg_type = val_is_f64 ? RAY_F64
+                                    : (vcol->type == RAY_TIME || vcol->type == RAY_TIMESPAN)
+                                    ? vcol->type : RAY_I64; break;
         default:       out_agg_type = vcol->type; break;
     }
 
     int64_t out_ncols = (int64_t)n_idx + (int64_t)pv_count;
+    ray_t* names = NULL;
     ray_t* result = ray_table_new(out_ncols);
     if (!result || RAY_IS_ERR(result)) goto pivot_cleanup;
 
@@ -2436,6 +2634,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (RAY_IS_ERR(result)) goto pivot_cleanup;
     }
 
+    /* Value column names: read from each column's first source row by the
+     * code the generic route names its columns with. */
+    names = pivot_col_names(pcol, pv_first, (int64_t)pv_count, result);
+    if (!names || RAY_IS_ERR(names)) {
+        ray_release(result); result = names ? names : ray_error("oom", NULL);
+        names = NULL;
+        goto pivot_cleanup;
+    }
+
     /* Value columns — one per distinct pivot value */
     {
     int8_t s = ly.agg_val_slot[0]; /* single agg input -> slot 0 */
@@ -2452,9 +2659,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * overwritten in the scatter loop below; whatever remains is null.
          * par_finalize_nulls (after scatter) flips HAS_NULLS if any
          * sentinel survives.  Types without a dedicated initialization arm
-         * (SYM/STR/BOOL/U8/GUID) fall back to zero-fill.  For SYM/STR/BOOL/U8
-         * that is an ordinary zero/empty value and cannot represent "no
-         * data"; GUID is also zero-filled on this path. */
+         * (SYM/BOOL/U8) fall back to zero-fill: the empty symbol is SYM's
+         * null, and BOOL/U8 vectors hold no null.  pivot sends GUID, LIST
+         * and STR values to its other route. */
         switch (new_col->type) {
             case RAY_F64: {
                 double* d = (double*)ray_data(new_col);
@@ -2466,7 +2673,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                 for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_F32;
                 break;
             }
-            case RAY_I64: case RAY_TIMESTAMP: {
+            case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: {
                 int64_t* d = (int64_t*)ray_data(new_col);
                 for (int64_t r = 0; r < (int64_t)ix_count; r++) d[r] = NULL_I64;
                 break;
@@ -2578,55 +2785,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (new_col->type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, vcol);
 
-        /* Column name from pivot value — match pivot_val_to_sym semantics */
-        int64_t pval = pv_vals[p];
-        int64_t col_sym;
-        if (pcol->type == RAY_SYM) {
-            /* pivot value (cell-data) becomes a column NAME — names live
-             * in the runtime table, so re-express the id there. */
-            col_sym = sym_id_runtime(pcol, pval);
-        } else if (pvt_wide) {
-            /* GUID: format 16 bytes as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
-             * pval is a source row index into pvt_base. */
-            static const char hex[] = "0123456789abcdef";
-            static const int groups[] = {4, 2, 2, 2, 6};
-            char buf[37];
-            const uint8_t* bytes = (const uint8_t*)pvt_base + (size_t)pval * 16;
-            int pos = 0, bpos = 0;
-            for (int g = 0; g < 5; g++) {
-                if (g > 0) buf[bpos++] = '-';
-                for (int j = 0; j < groups[g]; j++) {
-                    buf[bpos++] = hex[bytes[pos] >> 4];
-                    buf[bpos++] = hex[bytes[pos] & 0x0F];
-                    pos++;
-                }
-            }
-            col_sym = ray_sym_intern(buf, (size_t)bpos);
-        } else {
-            char buf[128];
-            int len = 0;
-            int8_t pt = key_types[n_idx];
-            if (pt == RAY_F64) {
-                double fv;
-                memcpy(&fv, &pval, 8);
-                fv = clear_neg_zero(fv);
-                len = snprintf(buf, sizeof(buf), "%g", fv);
-            } else if (pt == RAY_F32) {
-                /* the key holds the float's bits */
-                uint32_t bits = (uint32_t)pval;
-                float f;
-                memcpy(&f, &bits, 4);
-                len = snprintf(buf, sizeof(buf), "%g", clear_neg_zero((double)f));
-            } else if (pt == RAY_BOOL) {
-                len = snprintf(buf, sizeof(buf), "%s", pval ? "true" : "false");
-            } else if (pt == RAY_I64 || pt == RAY_I32 || pt == RAY_I16 ||
-                       pt == RAY_DATE || pt == RAY_TIME || pt == RAY_TIMESTAMP) {
-                len = snprintf(buf, sizeof(buf), "%" PRId64, pval);
-            } else {
-                len = snprintf(buf, sizeof(buf), "col%" PRId64, pval);
-            }
-            col_sym = ray_sym_intern(buf, (size_t)len);
-        }
+        int64_t col_sym = ((const int64_t*)ray_data(names))[p];
 
         /* Flip HAS_NULLS if any pivot cell carries the type-correct NULL
          * sentinel — either a missing cell (no source row) left as null by
@@ -2641,6 +2800,8 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
 pivot_cleanup:
+    if (names) ray_release(names);
+    scratch_free(pv_first_hdr);
     ght_layout_free(&ly);   /* no-op when inline (n_keys <= 8); frees the
                              * owned spill block otherwise (see above) */
     scratch_free(map_hdr);

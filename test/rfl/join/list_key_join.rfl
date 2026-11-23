@@ -1,0 +1,44 @@
+;; @also-unfused
+;; #1373: a join on a LIST key column compares cells by value (atom_eq) and
+;; hashes them consistently; it used to hash and compare the cells' pointers.
+(set A (table [K v] (list (list [7 7] [3 3] [1] [0.5]) [10 20 30 40])))
+(set B (table [K w] (list (list [7 7] [0.5] [2]) [100 200 300])))
+(set J (inner-join [K] A B))
+(at J 'v) -- [10 40]
+(at J 'w) -- [100 200]
+(at (left-join [K] A B) 'w) -- [100 0Nl 0Nl 200]
+(at (anti-join [K] A B) 'v) -- [20 30]
+(semi-mask [K] A B) -- [true false false true]
+;; a TIMESPAN cell meets an equal I64 or F64 cell (atom_eq's span rule), as
+;; an atom, a vector and inside a dict, so the LIST hash takes the span bits
+(set S (table [K v] (list (list [7 7] (as 'TIMESPAN [1 2]) (as 'TIMESPAN 3) (dict ['a] (list (as 'TIMESPAN 4)))) [0 1 2 3])))
+(set T (table [K w] (list (list [7 7] [1 2] 3.0 (dict ['a] (list 4))) [0 1 2 3])))
+(at (inner-join [K] S T) 'v) -- [0 1 2 3]
+(semi-mask [K] S T) -- [true true true true]
+;; and with the TIMESPAN side on the right, so both sides' spans count
+(at (inner-join [K] T S) 'w) -- [0 1 2 3]
+(semi-mask [K] T S) -- [true true true true]
+;; table and dict cells hash by content: 20k distinct of each join in linear time
+(set N 20000)
+(set mkt (fn [L] (table [K v] (list (concat (enlist [7 7]) L) (til (+ 1 (count L)))))))
+(set ta (mkt (map (fn [i] (table [x] (list (concat i 1)))) (til N))))
+(set tb (mkt (map (fn [i] (table [x] (list (concat i 1)))) (reverse (til N)))))
+(count (inner-join [K] ta tb)) -- 20001
+(< (timeit (inner-join [K] ta tb)) 2000.0) -- true
+(set da (mkt (map (fn [i] (dict ['a 'b] (list i 2))) (til N))))
+(set db (mkt (map (fn [i] (dict ['a 'b] (list i 2))) (reverse (til N)))))
+(< (timeit (inner-join [K] da db)) 2000.0) -- true
+;; atoms, nested lists and mixed numeric cells meet by value
+(set C (table [K v] (list (list [1 2] 1 (list 'a [3]) 2.0 "s") [1 2 3 4 5])))
+(set D (table [K w] (list (list (list 'a [3]) 2 [1 2] "s" 9) [10 20 30 40 50])))
+(at (inner-join [K] C D) 'v) -- [1 3 4 5]
+(at (inner-join [K] C D) 'w) -- [30 10 20 40]
+;; against a STR-keyed oracle: for I64 vector cells, atom_eq equality is
+;; text equality, so the same join on the formatted keys gives the same row
+;; pairs (the routes may order them differently, so pairs are compared sorted)
+(set mk (fn [n m] (map (fn [i] (as 'I64 (list (% i m) (% (* i 7) m)))) (til n))))
+(set fmt (fn [L] (map (fn [c] (format "%" c)) L)))
+(set pairs (fn [J] (asc (+ (* (at J 'v) 10000000) (fill -1 (at J 'w))))))
+(set chk (fn [n m] (do (set KL (mk n m)) (set KR (reverse (mk (div n 2) m))) (set L (table [K v] (list KL (til n)))) (set R (table [K w] (list KR (til (count KR))))) (set LS (table [K v] (list (fmt KL) (til n)))) (set RS (table [K w] (list (fmt KR) (til (count KR))))) (and (> (count (inner-join [K] L R)) 0) (== (format "%" (pairs (inner-join [K] L R))) (format "%" (pairs (inner-join [K] LS RS)))) (== (format "%" (pairs (left-join [K] L R))) (format "%" (pairs (left-join [K] LS RS))))))))
+(chk 2000 97) -- true
+(chk 140000 100003) -- true

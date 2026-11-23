@@ -26,11 +26,12 @@
 (nil? (at (at r3 'c) 1)) -- true
 (nil? (at (at r3 'c) 2)) -- true
 
-;; Type-promotion overlay — F64 expr written back to I64 col under WHERE.
-;; The path memcpy's orig values, so the null state had to be carried over
-;; manually for both unmasked rows (orig nulls) and masked rows (expr null).
+;; An F64 expr into an I64 column under WHERE is a type error (#1458: the
+;; column keeps its type); cast it explicitly.  The null state is carried
+;; for both unmasked rows (orig nulls) and masked rows (expr null).
 (set t4 (table [a b] (list [1 2 0N 4] [10 20 30 40])))
-(set r4 (update {a: (* a 1.5) where: (> b 15) from: t4}))
+(update {a: (* a 1.5) where: (> b 15) from: t4}) !- type
+(set r4 (update {a: (as 'I64 (* a 1.5)) where: (> b 15) from: t4}))
 ;; row 0: untouched, was 1 → 1
 (at (at r4 'a) 0) -- 1
 ;; row 1: 2 * 1.5 = 3.0 → 3

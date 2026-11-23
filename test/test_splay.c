@@ -3401,7 +3401,7 @@ static test_result_t test_per_column_symfiles(void) {
         snprintf(pb, sizeof pb, "%s/.b.sym", dir);
         snprintf(pn, sizeof pn, "%s/.n.sym", dir);
         TEST_ASSERT_EQ_I(ray_splay_save_layout(t, dir, shared, gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF,
-                                               RAY_SYMFILE_COLUMN, true, true), RAY_OK);
+                                               RAY_SYMFILE_COLUMN, RAY_INDEX_ABSENT, true), RAY_OK);
         struct stat st;
         TEST_ASSERT_TRUE(stat(shared, &st) != 0);            /* no shared symfile */
         TEST_ASSERT_TRUE(stat(pn, &st) != 0);                /* none for a non-SYM column */
@@ -3615,7 +3615,7 @@ static test_result_t test_save_symfile_appends(void) {
     const char* last[3] = { "appset_1", "appset_new", "appset_newer" };
     for (int k = 0; k < 3; k++) {
         TEST_ASSERT_EQ_I(ray_splay_save_layout(ts[k], dir, sym, RAY_COMPRESS_OFF,
-                                               RAY_SYMFILE_COLUMN, true, true), RAY_OK);
+                                               RAY_SYMFILE_COLUMN, RAY_INDEX_ABSENT, true), RAY_OK);
         if (k) TEST_ASSERT_TRUE(sym_set_reads_back(dir, NULL, N, last[k]));
     }
     ray_release(t0); ray_release(t1); ray_release(t2);

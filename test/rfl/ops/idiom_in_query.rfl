@@ -272,15 +272,15 @@ MXX -- 9
 ;; pre_no_nulls_on_asc_input returns false when literal has
 ;; RAY_ATTR_HAS_NULLS; rw_first_asc_to_min / rw_last_asc_to_max do NOT
 ;; replace.  Slow path runs (true asc + first/last) and produces the
-;; right answer per existing semantics (first(asc null-bearing) = the
-;; smallest non-null since xasc places nulls first; last(asc) = max
-;; element).  Verified upstream in test/rfl/ops/idiom.rfl lines 33-37;
+;; right answer: first is positional (#1420) and xasc places nulls
+;; first, so first(asc null-bearing) is the null; last(asc) = max
+;; element.  Verified upstream in test/rfl/ops/idiom.rfl lines 33-37;
 ;; we replay the same idiom inside the DAG-VM `set` context here so
 ;; the slow-path graph is built under ray_optimize.
 
 (set Vn [1 0Nl 2 0Nl 3])
 (set MnN (first (asc Vn)))
-MnN -- 1
+MnN -- 0Nl
 (set MxN (last (asc Vn)))
 MxN -- 3
 

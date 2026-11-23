@@ -7,7 +7,7 @@
 ;; with nulls (null is a distinct value; count includes it)
 (count (distinct [1 0Nl 2 0Nl 1])) -- 3
 ;; value-check: numeric distinct sorts; null is least value, kept once
-(distinct [1 0Nl 2 0Nl 1]) -- [0Nl 1 2]
+(distinct [1 0Nl 2 0Nl 1]) -- [1 0Nl 2]
 
 ;; empty
 (count (distinct (as 'I64 ()))) -- 0
@@ -38,11 +38,10 @@
 (first (asc [3 1 4 1 5 9 2 6])) -- 1
 (last  (asc [3 1 4 1 5 9 2 6])) -- 9
 
-;; (first (asc v)) on null-bearing input — in this codebase, both
-;; first and min skip nulls, so semantics match.  The precondition
-;; fires false for null-bearing OP_CONST (conservative), so the
-;; slow path runs and must still produce the correct answer.
-(first (asc [1 0Nl 2])) -- 1
+;; (first (asc v)) on null-bearing input: the precondition fires false
+;; for a null-bearing OP_CONST, so the slow path runs.  first is
+;; positional (#1420) and asc puts nulls first: the answer is the null.
+(first (asc [1 0Nl 2])) -- 0Nl
 
 ;; (last (asc v)) on null-bearing input — last after asc is the
 ;; largest non-null in this case (nulls at the start).

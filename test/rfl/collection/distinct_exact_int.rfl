@@ -1,0 +1,32 @@
+;; #1333: keep representatives in input order.
+(set p (as 'LIST (+ 10 (til 80))))
+(set a 9007199254740993)
+(set b 9007199254740992)
+(set f 9007199254740992.0)
+(identical (distinct (concat p (list a f b))) (concat p (list a b))) -- true
+(identical (distinct (concat p (list f a b))) (concat p (list f))) -- true
+(identical (distinct (concat p (list (list a) (list f) (list b)))) (concat p (list (list a) (list b)))) -- true
+(identical (distinct (concat p (list (as 'TIMESPAN 2) 2 3))) (concat p (list (as 'TIMESPAN 2) 3))) -- true
+;; #1361: a list keeps first-occurrence order; atoms are no longer moved ahead of vector cells.
+(identical (distinct (list [1 2] [3 4] 'a [1 2] 'b [5 6] 'a 'b)) (list [1 2] [3 4] 'a 'b [5 6])) -- true
+;; Compare against a small-integer control to tolerate slower instrumented builds.
+(set ids (% (til 200000) 5000))
+(set B 4611686018427387904)
+(set small (concat (as 'LIST ids) (list 'marker)))
+(set wide (concat (as 'LIST (+ B ids)) (list 'marker)))
+(identical (distinct wide) (concat (as 'LIST (+ B (til 5000))) (list 'marker))) -- true
+(set best (fn [f] (min (map (fn [i] (f)) (til 3)))))
+(< (best (fn [] (timeit (distinct wide)))) (* 8 (+ 1.0 (best (fn [] (timeit (distinct small))))))) -- true
+(set pad (as 'LIST (+ 10 (til 80))))
+(set ts (as 'TIMESPAN [1 2]))
+(set iv [1 2])
+(set jv (as 'I32 [1 2]))
+(set D (fn [v] (dict [a] (list v))))
+(set T (fn [v] (table [a] (list v))))
+(set chk (fn [cells n] (== (count (distinct (concat pad cells))) (+ (count pad) n))))
+(chk (list (D ts) (D iv) (D jv)) 1) -- true
+(chk (list (D iv) (D ts) (D jv)) 2) -- true
+(chk (list (T ts) (T iv) (T jv)) 1) -- true
+(chk (list (T iv) (T ts) (T jv)) 2) -- true
+(chk (list (D 1.0) (D 1.0)) 1) -- true
+(chk (list (T [1.0]) (T [1.0])) 1) -- true

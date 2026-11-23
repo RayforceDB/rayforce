@@ -1,0 +1,287 @@
+;; #1319: a typed vector of TIME, TIMESTAMP, DATE, I64, I32 or F64 against
+;; a typed TIMESPAN vector answers in, except, sect and union as the list
+;; and atom forms do.  Those decide with atom_eq, whose TIMESPAN rule
+;; (span_eval) compares durations: a TIME's milliseconds as nanoseconds, a
+;; TIMESTAMP by its time of day, a number as a count, a DATE never; a null
+;; equals the other side's null.  Every typed answer is checked against the
+;; list form (L), in both directions, small and past the hashset, SIMD-set
+;; and parallel cutoffs, with nulls on neither, one or both sides, over an
+;; attached hash index, and inside a query.
+(set L (fn [x] (as 'LIST x)))
+(set CHK (fn [A B] (and (identical (in A B) (in (L A) (L B))) (identical (L (except A B)) (except (L A) (L B))) (identical (L (sect A B)) (sect (L A) (L B))) (identical (L (union A B)) (union (L A) (L B))))))
+;; both directions; the set side (B) holds no two equal cells, as union's
+;; typed route adds the second operand's new cells without deduplicating
+;; them (the list form drops a repeat), so every operand holds at most one null
+(set BOTH (fn [P S] (and (CHK P S) (CHK S P))))
+;; atom forms: each cell of the left operand as an atom
+(set ATOMS (fn [A B] (and (identical (L (in A B)) (L (map (fn [x] (in x B)) (L A)))) (identical (L (except A (at B 0))) (except (L A) (at B 0))))))
+(set Q (fn [A B] (and (identical (at (select {from: (table [a] (list A)) where: (in a B)}) 'a) (at (select {from: (table [a] (list A)) where: (in a (L B))}) 'a)) (identical (at (select {from: (table [a] (list A)) where: (not-in a B)}) 'a) (at (select {from: (table [a] (list A)) where: (not-in a (L B))}) 'a)))))
+(set QA (fn [A b] (and (identical (at (select {from: (table [a] (list A)) where: (in a b)}) 'a) (at (select {from: (table [a] (list A)) where: (in a (list b))}) 'a)) (identical (in A b) (in A (list b))))))
+(set N 70000)
+
+;; distinct takes one operand, and a typed vector holds one type: only a
+;; list mixes TIME and TIMESPAN cells, and its route already asks atom_eq
+;; (which never meets a TIME with a TIMESTAMP)
+(distinct (list (as 'TIME 1) (as 'TIMESPAN 1000000) (as 'TIMESTAMP 86400001000000))) -- (list (as 'TIME 1) (as 'TIMESTAMP 86400001000000))
+;; the issue's shapes
+(L (except (as 'TIME [1]) (as 'TIMESPAN [1000000]))) -- (except (list (as 'TIME 1)) (list (as 'TIMESPAN 1000000)))
+(in (as 'TIME [1]) (as 'TIMESPAN [1000000])) -- [true]
+(in (as 'TIME 1) (as 'TIMESPAN [1000000])) -- true
+(sect (as 'TIME [1 2]) (as 'TIMESPAN [1000000 5])) -- (as 'TIME [1])
+(union (as 'TIME [1 2]) (as 'TIMESPAN [1000000 5])) -- (list (as 'TIME 1) (as 'TIME 2) (as 'TIMESPAN 5))
+(in (as 'TIMESPAN [1000000 2]) (as 'TIME [1 2])) -- [true false]
+;; a TIMESTAMP by its time of day: day 1 at 00:00:01 is the TIMESPAN 1s
+(in (as 'TIMESTAMP [86401000000000 1000000000 -1]) (as 'TIMESPAN [1000000000 86399999999999])) -- [true true true]
+(in (as 'TIMESPAN [1000000000 2]) (as 'TIMESTAMP [86401000000000])) -- [true false]
+;; a DATE never meets a TIMESPAN, null or not
+(in (as 'DATE [0 3 0N]) (as 'TIMESPAN [0 3 0N])) -- [false false false]
+;; nulls meet nulls across the pair
+(in (as 'TIME [0N 1]) (as 'TIMESPAN [0N 7])) -- [true false]
+(in (as 'TIMESPAN [0N 7]) (as 'TIMESTAMP [0N 1])) -- [true false]
+;; numbers meet as counts; a float through f64 (2^53 + 1 rounds to 2^53)
+(in [9007199254740993 3] (as 'TIMESPAN [9007199254740992 3])) -- [false true]
+(in [9007199254740992.0 3.5] (as 'TIMESPAN [9007199254740993 3])) -- [true false]
+;; the typed membership kernel read TIMESPAN cells as 0
+(in (as 'TIMESPAN [1 2 0]) (as 'TIMESPAN [2])) -- [false true false]
+(in [1 2 0] (as 'TIMESPAN [2])) -- [false true false]
+(in (as 'TIMESPAN [1 2 0]) [2.0]) -- [false true false]
+
+(set S0 (as 'TIMESPAN [1000000 0N -5000000 86399999000000 3 2000001 1000000000 -86400000000000 0 9007199254740992 86399999999999 5]))
+(set S1 (as 'TIMESPAN [1000000 -5000000 3 2000001 1000000000]))
+(set S2 (as 'TIMESPAN [1000000 -5000000 86399999000000 3 2000001 1000000000 -86400000000000 0 9007199254740992 86399999999999 5 7000000]))
+(set BL (as 'TIMESPAN (* 3000000 (til N))))
+(set BLN (concat BL (as 'TIMESPAN [0N])))
+
+;; TIME against TIMESPAN
+(set P (as 'TIME [1 0N -5 2 86399999 7 100000 -86400000 1]))
+(set PN (as 'TIME [1 -5 2 86399999 7 100000 -86400000 1]))
+(set PL (as 'TIME (- (* 7 (til N)) 300000)))
+(set PLN (concat PL (as 'TIME [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+
+;; TIMESTAMP against TIMESPAN
+(set P (as 'TIMESTAMP [1000000 0N 86401000000000 -1 5 -86399000000000 172800000000003 2000000]))
+(set PN (as 'TIMESTAMP [1000000 86401000000000 -1 5 -86399000000000 172800000000003 2000000]))
+(set PL (as 'TIMESTAMP (+ (* 86400000000000 (% (til N) 5)) (* 7000000 (til N)))))
+(set PLN (concat PL (as 'TIMESTAMP [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+
+;; DATE against TIMESPAN
+(set P (as 'DATE [0 0N 3 -1 1000000 7]))
+(set PN (as 'DATE [0 3 -1 1000000 7]))
+(set PL (as 'DATE (- (til N) 500)))
+(set PLN (concat PL (as 'DATE [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+
+;; I64 against TIMESPAN
+(set P [3 0N -5 2000001 9007199254740993 1000000 -5000000 4])
+(set PN [3 -5 2000001 9007199254740993 1000000 -5000000 4])
+(set PL (- (* 7000000 (til N)) 300000))
+(set PLN (concat PL (as 'I64 [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+
+;; I32 against TIMESPAN
+(set P (as 'I32 [3 0N -5 7 1000000 2000001]))
+(set PN (as 'I32 [3 -5 7 1000000 2000001]))
+(set PL (as 'I32 (- (* 7 (til N)) 300000)))
+(set PLN (concat PL (as 'I32 [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+
+;; F64 against TIMESPAN
+(set P [3.0 0Nf -5.0 3.5 9007199254740992.0 1000000.0 -0.0 2000001.0])
+(set PN [3.0 -5.0 3.5 9007199254740992.0 1000000.0 -0.0 2000001.0])
+(set PL (as 'F64 (- (* 7000000 (til N)) 300000)))
+(set PLN (concat PL (as 'F64 [0N])))
+(set DP (distinct P))
+(set DPN (distinct PN))
+(BOTH P S0) -- true
+(ATOMS P S0) -- true
+(ATOMS S0 DP) -- true
+(BOTH P S1) -- true
+(ATOMS P S1) -- true
+(ATOMS S1 DP) -- true
+(BOTH P S2) -- true
+(ATOMS P S2) -- true
+(ATOMS S2 DP) -- true
+(BOTH PN S0) -- true
+(ATOMS PN S0) -- true
+(ATOMS S0 DPN) -- true
+(BOTH PN S1) -- true
+(ATOMS PN S1) -- true
+(ATOMS S1 DPN) -- true
+(BOTH PN S2) -- true
+(ATOMS PN S2) -- true
+(ATOMS S2 DPN) -- true
+(CHK PL S1) -- true
+(CHK PL BL) -- true
+(BOTH PLN BLN) -- true
+(BOTH P (.idx.hash S1)) -- true
+(CHK (as 'TIMESPAN [1000000 3 1000000000 7]) (.idx.hash DPN)) -- true
+(Q P S0) -- true
+(Q P S2) -- true
+(Q PLN BLN) -- true
+(Q S0 DP) -- true
+(QA BLN (at DP 1)) -- true
+(QA PLN (at S0 0)) -- true
+;; The index on the column side inside a select (ray_index_in_rowsel): a
+;; DATE, TIME or TIMESTAMP column or set of another type compares by duration.
+(set IXQ (fn [A B] (at (select {from: (table [a] (list (.idx.hash A))) where: (in a B)}) 'a)))
+(set IXN (fn [A B] (count (select {from: (table [a] (list (.idx.hash A))) where: (in a B)}))))
+(IXQ (as 'TIME [3600000 5]) (as 'TIMESPAN [3600000000000])) -- (as 'TIME [3600000])
+(IXQ (as 'TIMESPAN [7 5]) (as 'TIME [7])) -- (as 'TIMESPAN [])
+(IXQ (as 'TIMESPAN [3600000000000 5]) (as 'TIMESTAMP [90000000000000])) -- (as 'TIMESPAN [3600000000000])
+(IXN (as 'TIMESPAN [3600000000000 5]) (as 'TIMESTAMP [90000000000000])) -- 1
+(IXN (as 'TIMESTAMP [90000000000000 5]) (as 'TIMESPAN [3600000000000])) -- 1
+(IXN (as 'DATE [1 2]) (as 'TIMESPAN [1 86400000000000])) -- 0
+(IXQ (as 'TIMESPAN [7 5]) [7]) -- (as 'TIMESPAN [7])
+(IXQ (as 'TIME [7 5]) (as 'TIME [7])) -- (as 'TIME [7])

@@ -22,6 +22,22 @@
  */
 
 #include "core/types.h"
+#include <math.h>
+
+/* The out-of-line arm of ray_fmod_floor (core/types.h): fmod is exact, the
+ * sign fix rounds once.  Out of line so the compiler cannot hoist the call
+ * above the quotient test. */
+double ray_fmod_floor_wide(double a, double b) {
+    double r = fmod(a, b);
+    if (r != 0.0 && ((r < 0) != (b < 0))) r += b;
+    return r == b ? 0.0 : r;
+}
+
+float ray_fmod_floor_wide_f32(float a, float b) {
+    float r = fmodf(a, b);
+    if (r != 0.0f && ((r < 0) != (b < 0))) r += b;
+    return r == b ? 0.0f : r;
+}
 
 /* Element sizes indexed by type tag.  Concrete vectors and LIST have
  * non-zero entries; internal tag holes remain zero. */

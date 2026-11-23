@@ -133,6 +133,7 @@ nav:
           - .graph — Graph algorithms: docs/namespaces/graph.md
           - .idx — Indexes: docs/namespaces/idx.md
           - .ipc — IPC client: docs/namespaces/ipc.md
+          - .json — JSON text: docs/namespaces/json.md
           - .log — Write-ahead log: docs/namespaces/log.md
           - .mc — Multicast: multicast-usage.md
           - .mem — Measurement: docs/namespaces/mem.md

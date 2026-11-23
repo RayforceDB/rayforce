@@ -40,6 +40,7 @@
 #include "core/runtime.h"  /* __VM — (return x) parks its value on the VM */
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
+#include "lang/callprof.h"  /* (.sys.profile) */
 #include "store/serde.h"
 #include "store/enccol.h"
 #include "store/splay.h"
@@ -214,7 +215,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     }
     /* options: compress (true/false), symfile ('shared/'column) and index
      * (true/false: false builds no automatic dictionary or chunk zone; an
-     * index the column already carries is written as usual) and durable
+     * index the column already carries is written as usual; true also keeps
+     * a generation-2 dictionary absent leaves out for its size) and durable
      * (true/false: false takes the bulk path, no fsync) */
     ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
     for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
@@ -233,8 +235,8 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     ray_symfile_t layout;
     oerr = ray_symfile_opt_parse(opts, &layout);
     if (oerr) return oerr;
-    bool auto_index;
-    oerr = ray_splay_index_opt_parse(opts, &auto_index);
+    ray_index_opt_t index;
+    oerr = ray_splay_index_opt_parse(opts, &index);
     if (oerr) return oerr;
     bool durable;
     oerr = ray_splay_durable_opt_parse(opts, &durable);
@@ -256,7 +258,7 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
-    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, auto_index, durable);
+    ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, index, durable);
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
@@ -1382,6 +1384,7 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "lock-failed",     11, ray_heap_lock_failures()      },
         { "lock-skipped",    12, ray_heap_lock_skipped()       },
         { "group-perpart-runs", 18, ray_group_perpart_runs()   },
+        { "group-boxed-i64-runs", sizeof("group-boxed-i64-runs") - 1, ray_group_boxed_i64_runs() },
         { "asof-perpart-runs",  17, ray_asof_perpart_runs()    },
         { "sort-perpart-runs",  17, ray_sort_perpart_runs()    },
         { "window-perpart-runs", 19, ray_window_perpart_runs() },
@@ -1588,6 +1591,78 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     }
     ray_qlog_set_enabled(on);
     return make_i64(on ? 1 : 0);
+}
+
+/* (.sys.join.par.min [rows]) — the probe-side row count from which a hash
+ * join's chained probe is split across the pool (#599).  No arg reads it; an
+ * i64 >= 0 sets it.  Returns the value in effect.  Values at or below the
+ * default (8193) all behave as the default: a probe of one 8192-row morsel
+ * never splits.  Restricted: it changes server-wide behaviour. */
+ray_t* ray_join_par_min_fn(ray_t** args, int64_t n) {
+    if (n > 1) return ray_error("arity", ".sys.join.par.min takes no argument or a row count");
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".sys.join.par.min: rows must be i64, got %s",
+                             ray_type_name(args[0]->type));
+        if (RAY_ATOM_IS_NULL(args[0]) || args[0]->i64 < 0)
+            return ray_error("domain", ".sys.join.par.min: rows must be a non-negative count");
+        ray_join_set_par_min(args[0]->i64);
+    }
+    return make_i64(ray_join_par_min());
+}
+
+/* (.sys.profile) — the call profiler's rows as a table: one per Rayfall
+ * call site timed while profiling was on (lang/callprof.h), highest self
+ * time first.  Columns:
+ *
+ *   file      source file of the call (`repl` for typed input)
+ *   line      1-based line of the call, 0 when unknown
+ *   fn        the global the enclosing lambda is bound to; `<lambda@N>`
+ *             for an unbound lambda whose body starts on line N; `<top>`
+ *             for top-level code; `<other>` for calls past the site cap
+ *   calls     times the call ran
+ *   self-ms   wall time inside the call, less the timed calls it made
+ *   total-ms  wall time inside the call (a recursive site counts its
+ *             outermost activation)
+ *   busy-ms   pool worker time spent while the call ran, less the timed
+ *             calls it made: the parallel work the call dispatched
+ *
+ * Empty until `(.sys.profile.enable 1)`; rows accumulate until
+ * `(.sys.profile.reset)`. */
+ray_t* ray_callprof_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.profile takes no arguments");
+    if (!ray_callprof_owner()) return ray_error("state", ".sys.profile: main thread only");
+    return ray_callprof_table();
+}
+
+/* (.sys.profile.enable [flag]) — toggle the call profiler, as
+ * .sys.querylog.enable toggles logging: no argument flips it, 0 disables,
+ * non-zero enables.  Returns the new state as i64 (0/1).  Turning it off
+ * keeps the rows. */
+ray_t* ray_callprof_enable_fn(ray_t** args, int64_t n) {
+    bool on;
+    if (n == 0) {
+        on = !ray_callprof_on();
+    } else if (n == 1) {
+        if (args[0]->type != -RAY_I64) return ray_error("type", "flag must be i64");
+        on = args[0]->i64 != 0;
+    } else {
+        return ray_error("domain", ".sys.profile.enable takes 0 or 1 arguments");
+    }
+    if (!ray_callprof_owner()) return ray_error("state", ".sys.profile.enable: main thread only");
+    ray_callprof_set_enabled(on);
+    return make_i64(ray_callprof_on() ? 1 : 0);
+}
+
+/* (.sys.profile.reset) — drop the call profiler's rows; profiling stays as
+ * it was.  Returns null. */
+ray_t* ray_callprof_reset_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.profile.reset takes no arguments");
+    if (!ray_callprof_owner()) return ray_error("state", ".sys.profile.reset: main thread only");
+    ray_callprof_reset();
+    return RAY_NULL_OBJ;
 }
 
 /* Process id of this process.  getpid() is already used internally for heap

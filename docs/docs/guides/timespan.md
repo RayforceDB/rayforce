@@ -38,14 +38,21 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 
 | Expression | Result |
 |---|---|
-| `timestamp - timestamp` | TIMESPAN |
+| `timestamp - timestamp`, `time - time` | TIMESPAN |
 | `timestamp + span`, `timestamp - span`, `span + timestamp` | TIMESTAMP |
+| `time + span`, `time - span`, `span + time`, `span - time` | TIME, floored to the millisecond; no 24 h wrap, a result past the 32-bit range is null |
+| `time + time` | Type error, as `timestamp + timestamp` |
+| `time div span`, `time / span` | Type error (a span divided by a time reads the time as its millisecond count) |
+| `xbar time span` | TIME: the start of the time's bucket, floored to the millisecond |
 | `span + span`, `span - span`, `neg span`, `abs span` | TIMESPAN |
 | `span + integer`, `integer + span`, `span - integer` | TIMESPAN; integer counts nanoseconds |
 | `span * integer`, `integer * span` | TIMESPAN |
+| `span + float`, `float + span`, `span - float`, `float - span`, `span * float`, `float * span` (F64 or F32) | F64: the float arithmetic of the nanosecond count; a null operand gives null |
 | `span div integer`, `span div span` | TIMESPAN |
+| `span div F64`, `span div F32` | TIMESPAN: the float is rounded to an integer count first, as for an integer divisor |
 | `span / span`, `span / integer` | F64 |
 | `span % integer` | TIMESPAN |
+| `span % F64`, `F64 % span`, and the same with F32 | F64: the float `%` of the nanosecond count, the floor modulo rounded once (in [0,b) for b > 0, (b,0] for b < 0); a zero divisor gives null |
 | `span % span`, `span * span` | Type error |
 | Comparisons with another span or an integer count | BOOL |
 | `sum spans` | TIMESPAN; skips nulls |
@@ -65,12 +72,13 @@ up to 2^53 nanoseconds (about 104 days) per value.
 
 Inside a query the same functions give the same answers, nulls included.
 
-On empty or all-null duration vectors, `min` returns `0Wn` and `max`
-returns `-0Wn`.
+On empty or all-null duration vectors, `min` and `max` return `0Nn`, as
+every other type returns its null; this holds inside a query too, for a
+group with no non-null value.
 
-F64 operands promote ordinary duration addition and multiplication to F64
-nanosecond arithmetic. F32 operands are rounded to an integer count for
-these duration operations. Integer division preserves the left operand's
+F64 and F32 operands promote duration addition, subtraction,
+multiplication and `%` to F64 nanosecond arithmetic: `(+ 0D00:00:00.000000010 2.5e)` is
+`12.5`, as with `2.5`. Integer division preserves the left operand's
 type: a span divided by a span is a duration containing the quotient count,
 not a dimensionless integer. Division floors toward negative infinity.
 For example, `(div -0D00:00:00.000000001 2)` is minus one nanosecond, and
@@ -80,11 +88,13 @@ Nulls propagate through arithmetic. Integer division, remainder, and duration bu
 typed null. F64 results retain the engine's existing
 policy of converting non-finite results to `0Nf`.
 
-`xbar` accepts a TIMESPAN bucket width for timestamps:
+`xbar` accepts a TIMESPAN bucket width for timestamps and times:
 
 ```lisp
 (xbar 2024.01.15D12:34:56.000000000 0D01:00:00)
 ; 2024.01.15D12:00:00.000000000
+(xbar 10:37:00.000 0D00:15:00)
+; 10:30:00.000
 ```
 
 Scalar, vector and query column expressions use the same duration arithmetic.
@@ -92,11 +102,14 @@ Ordinary, encoded and partitioned storage preserve duration types and nulls.
 Explicit CSV schemas accept TIMESPAN and CSV writes use its literal syntax.
 Parquet duration and clock-time annotations are not remapped by this change.
 
-## Migrating timestamp differences
+## Migrating timestamp and time differences
 
-Timestamp subtraction previously returned I64. It now returns TIMESPAN,
-including in queries and updates. To retain the previous integer-count
-behavior, explicitly cast the difference before further arithmetic:
+Timestamp subtraction previously returned I64, and time subtraction a TIME.
+Both now return TIMESPAN, including in queries, updates and `deltas`, and
+`time ± span` returns a TIME (it returned a TIMESPAN). `time + time` is a
+type error. To retain the previous integer-count behavior, explicitly cast
+the difference before further arithmetic (`(as 'TIME (div (as 'I64 (- t1
+t0)) 1000000))` gives back the old TIME difference):
 
 ```lisp
 (as 'I64 (- finish start))

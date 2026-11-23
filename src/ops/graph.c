@@ -28,6 +28,7 @@
 #include "store/csr.h"
 #include "table/table.h"   /* ray_table_col_meta */
 #include "store/hnsw.h"
+#include "lang/format.h"     /* ray_type_name */
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -464,11 +465,14 @@ static ray_op_t* make_binary(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_o
     return n;
 }
 
-/* Type promotion: BOOL < U8 < I16 < I32 < I64 < F32 < F64.
- * Two F32 operands retain F32 arithmetic and storage; mixing F32 with another
- * numeric width promotes to F64 so no integer precision is silently narrowed.
+/* Type promotion.  Two numeric types take the promotion table
+ * (ray_num_type, core/types.h: BOOL < U8 < I16 < I32 < I64 < F32 < F64,
+ * F32 beside another width is F64), the one the builtins use.  The rest
+ * folds SYM and the temporal types into their integer lanes.
  * RAY_STR is its own type class — not promotable to numeric types. */
 static int8_t promote(int8_t a, int8_t b) {
+    int8_t nt = ray_num_type(a, b);
+    if (nt) return nt;
     if (a == RAY_STR || b == RAY_STR) return RAY_STR;
     if (a == RAY_F64 || b == RAY_F64) return RAY_F64;
     if (a == RAY_F32 || b == RAY_F32)
@@ -482,18 +486,30 @@ static int8_t promote(int8_t a, int8_t b) {
     return RAY_BOOL;
 }
 
-static bool type_is_temporal(int8_t t) {
-    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+/* + - * div %: the promotion table with B8 beside B8 as I64, as the
+ * builtins answer (`(+ true true)` is 2).  min / max keep B8 (promote). */
+static int8_t arith_promote(int8_t a, int8_t b) {
+    return (a == RAY_BOOL && b == RAY_BOOL) ? RAY_I64 : promote(a, b);
 }
+
+static bool type_is_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+}
+
+/* No common type for an `if`'s two arms: ray_if raises `type`. */
+#define IF_TYPE_MIX (-2)
 
 /* GUID has no numeric promotion: two GUID branches keep the type, and a
  * GUID beside anything else has no column type.  promote() used to fall
  * through to BOOL for it, and the fill then read the 16-byte cells as
  * bytes (#691).  -1 for the mixed case so ray_if declines the node and
- * the projection falls back to the interpreter. */
+ * the projection falls back to the interpreter.  Two temporal arms keep
+ * their type; two different ones have none (#1337): promote() folded
+ * them into one integer lane and the fill blended days, ms and ns as
+ * raw counts. */
 static int8_t promote_if_type(int8_t a, int8_t b) {
     if (a == RAY_GUID || b == RAY_GUID) return a == b ? RAY_GUID : -1;
-    if (a == b && type_is_temporal(a)) return a;
+    if (type_is_temporal(a) && type_is_temporal(b)) return a == b ? a : IF_TYPE_MIX;
     return promote(a, b);
 }
 
@@ -659,18 +675,30 @@ ray_op_t* ray_binop(ray_graph_t* g, uint16_t opcode, ray_op_t* a, ray_op_t* b) {
         out = RAY_BOOL; break;
     case OP_DIV: case OP_POW:
         out = RAY_F64; break;
-    default:
+    case OP_MIN2: case OP_MAX2:
         out = promote(a->out_type, b->out_type); break;
+    case OP_IDIV:
+        out = ray_num_type(a->out_type, b->out_type)
+            ? arith_promote(a->out_type, b->out_type) : RAY_I64;
+        break;
+    default:
+        out = arith_promote(a->out_type, b->out_type); break;
     }
     return make_binary(g, opcode, a, b, out);
 }
 
-ray_op_t* ray_add(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_ADD, a, b, promote(a->out_type, b->out_type)); }
-ray_op_t* ray_sub(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_SUB, a, b, promote(a->out_type, b->out_type)); }
-ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MUL, a, b, promote(a->out_type, b->out_type)); }
+ray_op_t* ray_add(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_ADD, a, b, arith_promote(a->out_type, b->out_type)); }
+ray_op_t* ray_sub(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_SUB, a, b, arith_promote(a->out_type, b->out_type)); }
+ray_op_t* ray_mul(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MUL, a, b, arith_promote(a->out_type, b->out_type)); }
 ray_op_t* ray_div(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_DIV, a, b, RAY_F64); }
-ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_IDIV, a, b, RAY_I64); }
-ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MOD, a, b, promote(a->out_type, b->out_type)); }
+/* div takes the promotion table's type over numeric operands (#972);
+ * anything else (a temporal the projection hands to the builtin) keeps I64. */
+ray_op_t* ray_idiv(ray_graph_t* g, ray_op_t* a, ray_op_t* b) {
+    int8_t out = ray_num_type(a->out_type, b->out_type)
+               ? arith_promote(a->out_type, b->out_type) : RAY_I64;
+    return make_binary(g, OP_IDIV, a, b, out);
+}
+ray_op_t* ray_mod(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_MOD, a, b, arith_promote(a->out_type, b->out_type)); }
 ray_op_t* ray_pow_op(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_binary(g, OP_POW, a, b, RAY_F64); }
 
 ray_op_t* ray_eq(ray_graph_t* g, ray_op_t* a, ray_op_t* b) { return make_cmp(g, OP_EQ, a, b); }
@@ -723,6 +751,12 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     else if (type_is_temporal(et) && tt != et && tt != RAY_STR && tt != RAY_SYM &&
              tt != RAY_GUID && if_const_null_atom(g, then_id))
         out_type = et;
+    if (out_type == IF_TYPE_MIX) {
+        g->if_refused = true;
+        graph_compile_failure(g, ray_error("type", "if: branches mix %s and %s",
+                                           ray_type_name(tt), ray_type_name(et)));
+        return NULL;
+    }
     if (out_type < 0) return NULL;
     /* A LIST column scans as the untyped node (out_type 0), which promote()
      * also folds to BOOL and the fill then reads the cell pointers as bytes.
@@ -2118,8 +2152,7 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_LEAD:
             out_type = prev->out_type; break;     /* shifts preserve type */
         case OP_DELTAS:
-            out_type = (prev->out_type == RAY_F64 || prev->out_type == RAY_F32) ? RAY_F64 : RAY_I64;
-            break;
+            out_type = deltas_out_type(prev->out_type); break;
         case OP_RATIOS:
             out_type = RAY_F64; break;
         case OP_FILLS:

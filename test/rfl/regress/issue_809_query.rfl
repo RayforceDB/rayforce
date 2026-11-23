@@ -1,0 +1,9 @@
+;; @also-unfused
+;; A fused I64 +, -, or * can produce the null sentinel from non-null
+;; operands. Its next reader must propagate it, even across a float cast.
+(set T (table [a b c] (list (take [1 4611686018427387904] 8192) (take [1 9223372036854775807] 8192) (take [1 -9223372036854775807] 8192))))
+(at (select {from: T r: (* (* a 2) 1.0)}) 'r) -- (take [2.0 0Nf] 8192)
+(at (select {from: T r: (- (+ b 1) 1)}) 'r) -- (take [1 0N] 8192)
+(at (select {from: T r: (+ (- c 1) 1)}) 'r) -- (take [1 0N] 8192)
+;; Overflow not landing on the sentinel still wraps, not nulls.
+(at (select {from: T r: (+ (+ b 2) 1)}) 'r) -- (take [4 -9223372036854775806] 8192)

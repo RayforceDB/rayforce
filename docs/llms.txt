@@ -34,6 +34,7 @@ Every dotted top-level namespace has its own page listing all builtins with arit
 - [.graph — Graph algorithms](https://rayforcedb.com/docs/namespaces/graph/)
 - [.idx — Indexes](https://rayforcedb.com/docs/namespaces/idx/)
 - [.ipc — IPC client](https://rayforcedb.com/docs/namespaces/ipc/)
+- [.json — JSON text](https://rayforcedb.com/docs/namespaces/json/)
 - [.log — Write-ahead log](https://rayforcedb.com/docs/namespaces/log/)
 - [.os — Filesystem & env](https://rayforcedb.com/docs/namespaces/os/)
 - [.repl — REPL control](https://rayforcedb.com/docs/namespaces/repl/)

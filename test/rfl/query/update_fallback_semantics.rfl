@@ -1,5 +1,5 @@
 ;; update_fallback_semantics.rfl — an `update` expression the DAG declines
-;; (temporal + - *) is evaluated with the same row semantics as the compiled
+;; (a point difference such as `(- ts ts)`) is evaluated with the same row semantics as the compiled
 ;; path (review of #690, second pass).
 ;;
 ;; The eval fallback evaluated the expression once with whole columns bound.
@@ -43,9 +43,9 @@
 ;; an `if` whose condition mixes a row column with an aggregate cannot be
 ;; evaluated per row (the aggregate would see one cell); it stays an error
 ;; until the fallback can reduce aggregates first (#692)
-(update {x: (if (> i (avg i)) (+ ts 1) ts) from: t}) !- nyi
+(update {x: (if (> i (avg i)) (- ts ts) (- ts ts)) from: t}) !- nyi
 (update {i: (if (> i (avg i)) 1 (as 'I64 (- ts ts))) from: t where: (> i 1)}) !- nyi
-(update {x: (if (> i (avg i)) (+ ts 1) ts) by: k from: t}) !- nyi
+(update {x: (if (> i (avg i)) (- ts ts) (- ts ts)) by: k from: t}) !- nyi
 ;; an aggregate over a literal or a global is the same on every row: fine
 (at (update {x: (if (> i 2) (count [1 2 3]) (as 'I64 (- ts ts))) from: t}) 'x) -- [0 0 3 3 3]
 (set GL [1 2 3 4])

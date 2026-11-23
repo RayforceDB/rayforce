@@ -85,8 +85,12 @@ void agg_route_reason(agg_v2_reason_t reason) {
 /* Dense direct-index serial grouping; defined below agg_run_one. */
 static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
                                 const dense_plan_t* dp, agg_groups_t* out);
+/* 0, -1 on failure, or AGG_KEYS_SERIAL: a LIST key needs the serial scan. */
+enum { AGG_KEYS_SERIAL = -2 };
 static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
-                                    const dense_plan_t* dp, agg_groups_t* out);
+                                    const dense_plan_t* dp, int hash_mode, agg_groups_t* out);
+static int agg_group_keys_mode(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                               int hash_mode, agg_groups_t* out);
 
 static bool agg_cancelled(void) {
     ray_pool_t* pool = ray_pool_get();
@@ -11398,7 +11402,9 @@ ray_t* agg_group_indices(ray_t* source) {
     dense_plan_t plan;
     bool dense = agg_dense_plan(&source, 1, NULL, 0, n, &plan);
     int rc = dense ? agg_group_keys_dense(&source, n, &plan, &groups)
-                   : agg_group_keys(&source, 1, n, &groups);
+                   : agg_group_keys_mode(&source, 1, n,
+                                         source->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
+                                         &groups);
     if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     int64_t ng = groups.ngroups;
     int64_t* scratch = ray_calloc_raw((size_t)(n + 3 * ng + 1) * sizeof(int64_t));
@@ -11436,7 +11442,9 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     bool dense = agg_dense_plan(keys, ext->n_keys, NULL, 0, nrows, &dp);
     route_stats.dense_plan_available = dense;
     int rc = dense ? agg_group_keys_dense(keys, nrows, &dp, &groups)
-                   : agg_group_keys(keys, ext->n_keys, nrows, &groups);
+                   : agg_group_keys_mode(keys, ext->n_keys, nrows,
+                                         ext->n_keys == 1 && keys[0]->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
+                                         &groups);
     agg_dense_plan_free(&dp);   /* compaction tables serve the key build only */
     if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     if (agg_cancelled()) { agg_groups_free(&groups); return ray_error("cancel", NULL); }
@@ -13459,7 +13467,7 @@ static int agg_group_keys_dense(ray_t** key_cols, int64_t nrows,
      * Small pools cannot amortize the extra traffic and barriers. */
     if (ray_pool_par_dispatch_ok(ray_pool_get(), nrows, RAY_PARALLEL_THRESHOLD) &&
             ray_pool_total_workers(ray_pool_get()) >= 4)
-        return agg_group_keys_parallel(key_cols, dp->n_keys, nrows, dp, out);
+        return agg_group_keys_parallel(key_cols, dp->n_keys, nrows, dp, 0, out);
     const void* data[16];   /* [16]: dense path is <=16-key by construction (agg_dense_plan
                              * rejects wider shapes to v2's hash/radix; dp->n_keys is that <=16) */
     for (uint32_t k = 0; k < dp->n_keys; k++) data[k] = ray_data(key_cols[k]);
@@ -13515,83 +13523,23 @@ static uint64_t agg_float_key(ray_t* col, const void* data, int64_t r) {
     if (v == 0) return 0;
     uint64_t bits; memcpy(&bits, &v, sizeof(bits)); return bits;
 }
-/* Domain/owner-aware vector comparison for nested LIST keys. Raw descriptor
- * equality is unsuitable for narrow SYM vectors and separately pooled strings. */
-static bool agg_list_key_eq(ray_t* a, ray_t* b, const ray_group_sym_view_t* view) {
-    if (a == b) return true;
-    if (!a || !b) return false;
-    if (a->type == RAY_LIST && b->type == RAY_LIST) {
-        if (a->len != b->len) return false;
-        for (int64_t i = 0; i < a->len; i++)
-            if (!agg_list_key_eq(ray_list_get(a, i), ray_list_get(b, i), view)) return false;
-        return true;
-    }
-    if (a->type == b->type && (a->type == RAY_SYM || a->type == RAY_STR)) {
-        if (a->len != b->len) return false;
-        for (int64_t i = 0; i < a->len; i++) {
-            if (a->type == RAY_SYM) {
-                ray_t* x = ray_group_sym_read(view, ray_sym_vec_domain(a), ray_read_sym(ray_data(a), i, a->type, a->attrs));
-                ray_t* y = ray_group_sym_read(view, ray_sym_vec_domain(b), ray_read_sym(ray_data(b), i, b->type, b->attrs));
-                if (ray_str_cmp(x, y)) return false;
-            } else {
-                size_t nx = 0, ny = 0;
-                const char* x = ray_str_vec_get(a, i, &nx);
-                const char* y = ray_str_vec_get(b, i, &ny);
-                if (nx != ny || (nx && memcmp(x, y, nx))) return false;
-            }
-        }
-        return true;
-    }
-    return atom_eq(a, b);
+/* LIST cells group and count as distinct does (#1320): atom_eq, the
+ * earlier cell on the left, and a hash consistent with it (ray_key_hash
+ * over the RAY_KEY_SPAN_* bits of every cell compared, `spans`).  A probe
+ * asks every cell of its run, so non-transitive pairs (a TIMESPAN vector
+ * equals an I64 and an I32 one that differ) give the scan's answer.
+ * Callers hash with spans 0, right unless some cell holds a TIMESPAN:
+ * ray_key_hash_view reports one through `seen`, and only then is the run
+ * redone with the bits agg_list_spans finds (never 0, so once). */
+static int agg_list_spans(ray_t* const* cells, const int64_t* rows, int64_t n) {
+    int spans = 0;
+    for (int64_t i = 0; i < n && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++)
+        spans |= ray_key_spans(cells[rows ? rows[i] : i]);
+    return spans ? spans : RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
 }
-
-/* Match atom_eq's structural LIST / byte-exact typed-vector contract. */
-static uint64_t agg_list_key_hash(ray_t* value, const ray_group_sym_view_t* view) {
-    if (!value || ray_is_atom(value)) return ray_atom_hash(value);
-    if (value->type == RAY_LIST) {
-        uint64_t hash = ray_hash_i64(value->len);
-        ray_t* const* children = ray_data(value);
-        for (int64_t i = 0; i < value->len; i++) hash = ray_hash_combine(hash, agg_list_key_hash(children[i], view));
-        return hash;
-    }
-    /* TABLE / DICT cells compare in atom_eq (the fallthrough of
-     * agg_list_key_eq).  Hashing their names and columns only spreads the
-     * buckets: the fallback hash (type and length) puts every table of one
-     * length in one bucket, a linear scan per row. */
-    if (value->type == RAY_TABLE) {
-        int64_t nc = ray_table_ncols(value);
-        uint64_t hash = ray_hash_i64(nc);
-        for (int64_t c = 0; c < nc; c++) {
-            hash = ray_hash_combine(hash, ray_hash_i64(ray_table_col_name(value, c)));
-            ray_t* col = ray_table_col_idx(value, c);
-            if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }   /* hashes as absent */
-            hash = ray_hash_combine(hash, agg_list_key_hash(col, view));
-        }
-        return hash;
-    }
-    if (value->type == RAY_DICT)
-        return ray_hash_combine(agg_list_key_hash(ray_dict_keys(value), view),
-                                agg_list_key_hash(ray_dict_vals(value), view));
-    if (value->type == RAY_SYM || value->type == RAY_STR) {
-        uint64_t hash = ray_hash_i64(value->type);
-        for (int64_t i = 0; i < value->len; i++) {
-            size_t len = 0; const char* str;
-            if (value->type == RAY_SYM) {
-                ray_t* atom = ray_group_sym_read(view, ray_sym_vec_domain(value), ray_read_sym(ray_data(value), i, value->type, value->attrs));
-                str = ray_str_ptr(atom); len = ray_str_len(atom);
-            } else str = ray_str_vec_get(value, i, &len);
-            hash = ray_hash_combine(hash, ray_hash_bytes(str ? str : "", len));
-        }
-        return hash;
-    }
-    if (ray_is_vec(value)) {
-        size_t bytes = (size_t)value->len * ray_elem_size(value->type);
-        return ray_hash_combine(ray_hash_i64(value->type), ray_hash_bytes(ray_data(value), bytes));
-    }
-    return ray_atom_hash(value);
-}
-static inline uint64_t agg_key_hash_at(ray_t* col, const void* data, int64_t r, const ray_group_sym_view_t* view) {
-    if (col->type == RAY_LIST) return agg_list_key_hash(((ray_t* const*)data)[r], view);
+static inline uint64_t agg_key_hash_at(ray_t* col, const void* data, int64_t r, int spans,
+                                       const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
+    if (col->type == RAY_LIST) return ray_key_hash_view(((ray_t* const*)data)[r], spans, view, seen, inexact);
     if (col->type == RAY_F32 || col->type == RAY_F64) return ray_hash_i64((int64_t)agg_float_key(col, data, r));
     if (col->type == RAY_GUID) return ray_hash_bytes((const char*)data + (size_t)r * 16, 16);
     if (col->type == RAY_STR) {
@@ -13601,8 +13549,14 @@ static inline uint64_t agg_key_hash_at(ray_t* col, const void* data, int64_t r, 
     }
     return (uint64_t)agg_read_key_i64(col, data, r);
 }
-static inline int agg_key_eq_at(ray_t* col, const void* data, int64_t a, int64_t b, const ray_group_sym_view_t* view) {
-    if (col->type == RAY_LIST) return agg_list_key_eq(((ray_t* const*)data)[a], ((ray_t* const*)data)[b], view);
+/* Two LIST cells, the earlier one first: atom_eq, a missing cell equal
+ * only to another (as in atom_eq's LIST arm). */
+static inline bool agg_cell_eq(ray_t* kept, ray_t* x) {
+    return kept && x ? atom_eq(kept, x) : kept == x;
+}
+/* Row a against row b, the earlier key (b) as atom_eq's left operand. */
+static inline int agg_key_eq_at(ray_t* col, const void* data, int64_t a, int64_t b) {
+    if (col->type == RAY_LIST) return agg_cell_eq(((ray_t* const*)data)[b], ((ray_t* const*)data)[a]);
     if (col->type == RAY_F32 || col->type == RAY_F64) return agg_float_key(col, data, a) == agg_float_key(col, data, b);
     if (col->type == RAY_GUID) return memcmp((const char*)data + (size_t)a * 16, (const char*)data + (size_t)b * 16, 16) == 0;
     if (col->type == RAY_STR) {
@@ -13630,11 +13584,48 @@ static void agg_distinct_indexed_run(void* raw, uint32_t wid, int64_t start, int
     for (int64_t g = start; g < end; g++) if (c->counts[g] > largest) largest = c->counts[g];
     uint64_t capacity = 16;
     while (capacity < (uint64_t)largest * 2) {
-        if (capacity > SIZE_MAX / sizeof(int64_t) / 2) { atomic_store(&c->failed, true); return; }
+        if (capacity > SIZE_MAX / sizeof(int64_t) / 4) { atomic_store(&c->failed, true); return; }
         capacity *= 2;
     }
-    int64_t* entries = ray_alloc_raw((size_t)capacity * sizeof(int64_t));
+    bool list = c->source->type == RAY_LIST;
+    int64_t* entries = ray_alloc_raw((size_t)capacity * (list ? 2 : 1) * sizeof(int64_t));
     if (!entries) { atomic_store(&c->failed, true); return; }
+    if (list) {
+        /* Each group counts (distinct <its cells in row order>): a cell is
+         * new when no cell kept before it equals it.  Its own cells' span
+         * bits keep a TIMESPAN in one group from coarsening the others. */
+        ray_t* const* cells = c->data;
+        uint64_t* hashes = (uint64_t*)(entries + capacity);
+        for (int64_t g = start; g < end && !agg_cancelled(); g++) {
+            const int64_t* rows = c->rows + c->offsets[g];
+            int64_t n = c->counts[g];
+            uint64_t size = 16;
+            while (size < (uint64_t)n * 2) size *= 2;
+            int mode = RAY_KEY_EXACT_INT;
+            int64_t distinct;
+        rehash:
+            memset(entries, 0, (size_t)size * sizeof(int64_t));
+            distinct = 0;
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* x = cells[rows[i]];
+                bool seen = false;
+                uint8_t inexact = 0;
+                uint64_t h = ray_key_hash_view(x, mode, &c->symbols,
+                    mode & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC) ? NULL : &seen,
+                    mode == RAY_KEY_EXACT_INT ? &inexact : NULL);
+                /* Restart this group from row zero, not just its survivors. */
+                if (RAY_UNLIKELY(seen)) { mode = agg_list_spans(cells, rows, n); goto rehash; }
+                if (RAY_UNLIKELY(inexact & RAY_KEY_FLOAT)) { mode = 0; goto rehash; }
+                uint64_t slot = h & (size - 1);
+                while (entries[slot] && (hashes[slot] != h || !agg_cell_eq(cells[entries[slot] - 1], x)))
+                    slot = (slot + 1) & (size - 1);
+                if (!entries[slot]) { entries[slot] = rows[i] + 1; hashes[slot] = h; distinct++; }
+            }
+            c->output[g] = distinct;
+        }
+        ray_free_raw(entries);
+        return;
+    }
     for (int64_t g = start; g < end && !agg_cancelled(); g++) {
         uint64_t size = 16;
         while (size < (uint64_t)c->counts[g] * 2) size *= 2;
@@ -13642,8 +13633,8 @@ static void agg_distinct_indexed_run(void* raw, uint32_t wid, int64_t start, int
         int64_t distinct = 0;
         for (int64_t i = 0; i < c->counts[g]; i++) {
             int64_t row = c->rows[c->offsets[g] + i];
-            uint64_t slot = agg_key_hash_at(c->source, c->data, row, &c->symbols) & (size - 1);
-            while (entries[slot] && !agg_key_eq_at(c->source, c->data, row, entries[slot] - 1, &c->symbols))
+            uint64_t slot = agg_key_hash_at(c->source, c->data, row, 0, NULL, NULL, NULL) & (size - 1);
+            while (entries[slot] && !agg_key_eq_at(c->source, c->data, row, entries[slot] - 1))
                 slot = (slot + 1) & (size - 1);
             if (!entries[slot]) { entries[slot] = row + 1; distinct++; }
         }
@@ -13679,10 +13670,14 @@ typedef struct {
     const dense_plan_t* dense;
     void* first;
     bool narrow;
+    int hash_mode;
     uint8_t* unique;
     int64_t* offsets;
     agg_groups_t* out;
     ray_group_sym_view_t symbols;
+    _Atomic(bool) spanned;   /* a LIST key cell holds a TIMESPAN: group serially */
+    _Atomic(uint8_t) inexact; /* RAY_KEY_BIG_I64 | RAY_KEY_FLOAT seen in LIST
+                               * keys; both: group serially (#1330) */
 } agg_key_build_t;
 
 /* Coarse aligned ranges avoid concurrent first writes to common 2 MiB
@@ -13711,7 +13706,12 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
     (void)wid; agg_key_build_t* c = raw;
 #define KEY_DIRECTORY_INSERT(TYPE, EMPTY) do { \
         _Atomic TYPE* first_slots = c->first; \
+        bool spanned = false; \
+        uint8_t inexact = 0; \
+        bool speculative = c->hash_mode == RAY_KEY_EXACT_INT; \
         for (int64_t r = start; r < end; r++) { \
+            if (speculative && ((r - start) & 1023) == 0 && \
+                (atomic_load_explicit(&c->inexact, memory_order_relaxed) & RAY_KEY_FLOAT)) break; \
             uint64_t slot = 0; \
             if (c->dense) { \
                 for (uint32_t k = 0; k < c->nkeys; k++) \
@@ -13720,8 +13720,12 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
             } else { \
                 uint64_t hash = UINT64_C(1469598103934665603); \
                 for (uint32_t k = 0; k < c->nkeys; k++) { \
-                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, &c->symbols); \
+                    hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, c->hash_mode, &c->symbols, &spanned, &inexact); \
                     hash *= UINT64_C(1099511628211); \
+                } \
+                if (speculative && (inexact & RAY_KEY_FLOAT)) { \
+                    atomic_fetch_or_explicit(&c->inexact, RAY_KEY_FLOAT, memory_order_relaxed); \
+                    break; \
                 } \
                 slot = hash & (c->capacity - 1); \
             } \
@@ -13730,7 +13734,7 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
                 if (!c->dense && first != EMPTY) { \
                     bool equal = true; \
                     for (uint32_t k = 0; k < c->nkeys && equal; k++) \
-                        equal = agg_key_eq_at(c->keys[k], c->data[k], r, first, &c->symbols); \
+                        equal = agg_key_eq_at(c->keys[k], c->data[k], r, first); \
                     if (!equal) { slot = (slot + 1) & (c->capacity - 1); continue; } \
                 } \
                 if (r < first && !atomic_compare_exchange_weak_explicit(&first_slots[slot], &first, (TYPE)r, \
@@ -13739,6 +13743,8 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
                 break; \
             } \
         } \
+        if (spanned) atomic_store_explicit(&c->spanned, true, memory_order_relaxed); \
+        if (inexact) atomic_fetch_or_explicit(&c->inexact, inexact, memory_order_relaxed); \
     } while (0)
     if (c->narrow) KEY_DIRECTORY_INSERT(int32_t, INT32_MAX);
     else KEY_DIRECTORY_INSERT(int64_t, INT64_MAX);
@@ -13794,14 +13800,14 @@ static void agg_key_directory_remap(void* raw, uint32_t wid, int64_t start, int6
 #undef KEY_DIRECTORY_REMAP
 }
 static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
-                                    const dense_plan_t* dp, agg_groups_t* out) {
+                                    const dense_plan_t* dp, int hash_mode, agg_groups_t* out) {
     ray_pool_t* pool = ray_pool_get();
     uint32_t tasks = ray_pool_total_workers(pool) * 4;
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     int64_t cap = dp ? dp->total_slots : 16;
     if (!dp) while (cap < rows * 2) cap *= 2;
     agg_key_build_t c = {.keys = keys, .nkeys = nkeys, .tasks = tasks, .rows = rows,
-        .capacity = cap, .dense = dp, .out = out, .narrow = rows <= INT32_MAX};
+        .capacity = cap, .dense = dp, .out = out, .narrow = rows <= INT32_MAX, .hash_mode = hash_mode};
     for (uint32_t k = 0; k < nkeys; k++) if (keys[k]->type == RAY_LIST) {
         ray_sym_strings_borrow(&c.symbols.strings, &c.symbols.count); break;
     }
@@ -13821,12 +13827,26 @@ static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
     uint64_t init_bytes = ((uintptr_t)c.first & (AGG_DIRECTORY_INIT_BYTES - 1)) + (uint64_t)cap * entry_size;
     c.init_pages = (init_bytes + AGG_DIRECTORY_INIT_BYTES - 1) / AGG_DIRECTORY_INIT_BYTES;
     c.init_tasks = c.init_pages < tasks ? (uint32_t)c.init_pages : tasks;
+retry_insert:
     if (c.init_tasks == 1) agg_key_directory_init(&c, 0, 0, 1);
     else ray_pool_dispatch_n(pool, agg_key_directory_init, &c, c.init_tasks);
     ray_profile_tick("directory: initialized");
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
     ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
+    uint8_t inexact = atomic_load(&c.inexact);
+    if (c.hash_mode == RAY_KEY_EXACT_INT && (inexact & RAY_KEY_FLOAT)) {
+        /* The joined speculative pass may have skipped rows. Discard its
+         * slots and flags, and let the complete general pass decide fallback. */
+        c.hash_mode = 0;
+        atomic_store_explicit(&c.inexact, 0, memory_order_relaxed);
+        atomic_store_explicit(&c.spanned, false, memory_order_relaxed);
+        goto retry_insert;
+    }
+    if (atomic_load(&c.spanned) || inexact == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) {
+        rc = AGG_KEYS_SERIAL;
+        goto done;
+    }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
     if (agg_cancelled()) goto done;
@@ -13847,10 +13867,22 @@ done:
     return rc;
 }
 
-int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out) {
+static int agg_group_keys_mode(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
+                               int hash_mode, agg_groups_t* out) {
     if (nrows < 0 || nrows > INT32_MAX) return -1;
-    if (ray_pool_par_dispatch_ok(ray_pool_get(), nrows, RAY_PARALLEL_THRESHOLD))
-        return agg_group_keys_parallel(key_cols, n_keys, nrows, NULL, out);
+    /* A TIMESPAN in a LIST key, or an I64 past ±2^53 beside floats (#1330),
+     * makes atom_eq non-transitive: a row joins the earliest group whose
+     * first row equals it, as `group` and `distinct` decide, which only this
+     * scan in row order reproduces.  The parallel directory sees such a
+     * cell as it hashes and declines. */
+    bool spanned = false;
+    if (ray_pool_par_dispatch_ok(ray_pool_get(), nrows, RAY_PARALLEL_THRESHOLD)) {
+        int rc = agg_group_keys_parallel(key_cols, n_keys, nrows, NULL, hash_mode, out);
+        /* Declined: the scan below starts with spans 0 and finds any
+         * TIMESPAN itself (a large I64 needs no span bits, #1330). */
+        if (rc != AGG_KEYS_SERIAL) return rc;
+        hash_mode = 0; /* The complete directory pass found incompatible keys. */
+    }
     /* Unbounded keys: cut-3 lifted both admission gates (the GROUP path and the
      * keys-only DISTINCT path via agg_select_distinct), so the key-data pointer
      * table is an exact carve, not a fixed [16]. */
@@ -13877,14 +13909,33 @@ int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_
         ray_free_raw(ht_gid); ray_free_raw(out->gids); ray_free_raw(out->first_row);
         out->gids = NULL; out->first_row = NULL; return -1;
     }
+    /* Hash with spans 0 until a LIST cell shows a TIMESPAN (or the
+     * directory declined for one), then group again with the bits. */
+    int spans = 0;
+    int64_t ngroups;
+rescan:
+    if (spanned) {
+        for (uint32_t k = 0; k < n_keys; k++)
+            if (key_cols[k]->type == RAY_LIST) spans |= agg_list_spans(data[k], NULL, nrows);
+        if (!spans) spans = RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC;
+    }
     for (int64_t i = 0; i < cap; i++) ht_gid[i] = -1;
-
-    int64_t ngroups = 0;
+    ngroups = 0;
     for (int64_t r = 0; r < nrows; r++) {
         uint64_t h = 1469598103934665603ULL;
+        uint8_t inexact = 0;
         for (uint32_t k = 0; k < n_keys; k++) {
-            h ^= agg_key_hash_at(key_cols[k], data[k], r, &symbols); h *= 1099511628211ULL;
+            h ^= agg_key_hash_at(key_cols[k], data[k], r, spans | hash_mode, &symbols,
+                                spans ? NULL : &spanned, hash_mode ? &inexact : NULL);
+            h *= 1099511628211ULL;
         }
+        if (RAY_UNLIKELY(hash_mode && (spanned || (inexact & RAY_KEY_FLOAT)))) {
+            /* Rebuild from row zero: the earlier representatives were chosen
+             * with a different hash. TIMESPAN also needs the span bits. */
+            hash_mode = 0;
+            goto rescan;
+        }
+        if (RAY_UNLIKELY(spanned && !spans)) goto rescan;
         uint64_t slot = h & mask;
         for (;;) {
             int32_t gptr = ht_gid[slot];
@@ -13898,7 +13949,7 @@ int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_
             int64_t fr = out->first_row[gptr];
             int eq = 1;
             for (uint32_t k = 0; k < n_keys; k++) {
-                if (!agg_key_eq_at(key_cols[k], data[k], r, fr, &symbols)) { eq = 0; break; }
+                if (!agg_key_eq_at(key_cols[k], data[k], r, fr)) { eq = 0; break; }
             }
             if (eq) { out->gids[r] = (uint32_t)gptr; break; }
             slot = (slot + 1) & mask;                /* linear probe */
@@ -13908,6 +13959,10 @@ int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_
     ray_free_raw(ht_gid);
     scratch_free(data_hdr);
     return 0;
+}
+
+int agg_group_keys(ray_t** key_cols, uint32_t n_keys, int64_t nrows, agg_groups_t* out) {
+    return agg_group_keys_mode(key_cols, n_keys, nrows, 0, out);
 }
 
 void agg_groups_free(agg_groups_t* out) {

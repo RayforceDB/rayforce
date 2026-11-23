@@ -33,6 +33,7 @@
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
+#include "io/json.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "vec/vec.h"
@@ -40,6 +41,7 @@
 #include "core/qstats.h"   /* per-worker parallelism counters for eval-path spans */
 #include "core/qmeasure.h" /* shared per-query worker lifecycle */
 #include "core/qlog.h"     /* ray_qlog_enabled — arm capture for query logging */
+#include "lang/callprof.h" /* per-call-site profiler */
 #include "store/serde.h"   /* ray_serde_size — result footprint for spans */
 #include "table/sym.h"
 #include "store/col.h"    /* ray_col_want_rows — gather read-ahead */
@@ -88,14 +90,13 @@ static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
 #define RAY_EVAL_MAX_DEPTH 512
 
 typedef struct {
-    const ray_t* vec;
+    ray_t* vec;  /* owned until this evaluation root finishes */
     const void* data;
     int64_t len;
     int8_t type;
     uint8_t attrs;
-    int is_f64;
     int64_t sum_i;
-    double sum_f;
+    int64_t lo, hi;  /* integer vector bounds; lo > hi for empty */
 } affine_sum_cache_entry_t;
 
 #define AFFINE_SUM_CACHE_N 16
@@ -103,7 +104,13 @@ static _Thread_local affine_sum_cache_entry_t affine_sum_cache[AFFINE_SUM_CACHE_
 static _Thread_local uint8_t affine_sum_cache_n = 0;
 
 static void affine_sum_cache_clear(void) {
+    /* Detach before releasing: completed roots must not leave borrowed
+     * identities that can match a later allocation at the same address. */
+    ray_t* owners[AFFINE_SUM_CACHE_N];
+    uint8_t n = affine_sum_cache_n;
+    for (uint8_t i = 0; i < n; i++) owners[i] = affine_sum_cache[i].vec;
     affine_sum_cache_n = 0;
+    for (uint8_t i = 0; i < n; i++) ray_release(owners[i]);
 }
 
 /* Eval-context nfo (source locations) and the error trace (list of
@@ -394,27 +401,6 @@ static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
     return NULL;
 }
 
-static int64_t numeric_atom_i64(ray_t* x) {
-    switch (x->type) {
-    case -RAY_I64:
-    case -RAY_TIMESPAN:
-    case -RAY_TIMESTAMP:
-    case -RAY_SYM:
-        return x->i64;
-    case -RAY_I32:
-    case -RAY_DATE:
-    case -RAY_TIME:
-        return x->i32;
-    case -RAY_I16:
-        return x->i16;
-    case -RAY_U8:
-    case -RAY_BOOL:
-        return x->u8;
-    default:
-        return (int64_t)as_f64(x);
-    }
-}
-
 static ray_t* materialize_owned_value(ray_t* x) {
     if (x && ray_is_lazy(x))
         x = ray_lazy_materialize(x);
@@ -435,7 +421,9 @@ static int affine_sum_cache_lookup(ray_t* vec, affine_sum_cache_entry_t* out) {
 }
 
 static void affine_sum_cache_store(ray_t* vec, const affine_sum_cache_entry_t* in) {
-    if (affine_sum_cache_n >= AFFINE_SUM_CACHE_N) return;
+    /* Arena values cannot acquire an independent owner via ray_retain. */
+    if (affine_sum_cache_n >= AFFINE_SUM_CACHE_N || (vec->attrs & RAY_ATTR_ARENA)) return;
+    ray_retain(vec);
     affine_sum_cache[affine_sum_cache_n++] = *in;
 }
 
@@ -515,81 +503,111 @@ static ray_t* take_count_arg(ray_t* e, ray_t* x) {
     return NULL;
 }
 
-static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
-    *handled = 0;
-    if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
-        return NULL;
-    ray_t** e = (ray_t**)ray_data(expr);
-    if (!e[0] || e[0]->type != -RAY_SYM)
-        return NULL;
-    ray_t* name = ray_sym_str(e[0]->i64);
-    if (!name || ray_str_len(name) != 1 || ray_str_ptr(name)[0] != '+')
-        return NULL;
+/* One partial per task, not per worker: tasks may be stolen. */
+typedef struct { uint64_t sum; int64_t lo, hi; } affine_part_t;
+typedef struct {
+    const int64_t* data;
+    int64_t len, grain;
+    affine_part_t* parts;
+} affine_scan_t;
 
-    ray_t* vec_expr = NULL;
-    ray_t* c_expr = NULL;
-    if (ray_is_atom(e[1]) && is_numeric(e[1])) {
-        c_expr = e[1];
-        vec_expr = e[2];
-    } else if (ray_is_atom(e[2]) && is_numeric(e[2])) {
-        vec_expr = e[1];
-        c_expr = e[2];
+static void affine_part_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    affine_scan_t* s = ctx;
+    int64_t off = start * s->grain, n = s->len - off;
+    if (n > s->grain) n = s->grain;
+    const int64_t* data = s->data + off;
+    affine_part_t p = { 0, INT64_MAX, INT64_MIN };
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x = data[i];
+        p.sum += (uint64_t)x;
+        if (x < p.lo) p.lo = x;
+        if (x > p.hi) p.hi = x;
+    }
+    s->parts[start] = p;
+}
+
+static bool affine_i64_scan(affine_sum_cache_entry_t* ce) {
+    affine_part_t parts[64];
+    affine_scan_t s = { ce->data, ce->len, ce->len, parts };
+    ray_pool_t* pool = ce->len >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
+    uint32_t nt = 1;
+    if (ray_pool_par_dispatch_ok(pool, ce->len, RAY_PARALLEL_THRESHOLD)) {
+        nt = ray_pool_total_workers(pool);
+        if (nt > sizeof(parts)/sizeof(parts[0])) nt = sizeof(parts)/sizeof(parts[0]);
+        s.grain = 1 + (ce->len - 1) / nt;
+        nt = (uint32_t)(1 + (ce->len - 1) / s.grain);
+        ray_pool_dispatch_n(pool, affine_part_fn, &s, nt);
+        if (ray_interrupted() || atomic_load_explicit(&pool->cancelled, memory_order_acquire))
+            return false;
     } else {
-        return NULL;
+        affine_part_fn(&s, 0, 0, 1);
     }
+    affine_part_t total = parts[0];
+    for (uint32_t i = 1; i < nt; i++) {
+        total.sum += parts[i].sum;
+        if (parts[i].lo < total.lo) total.lo = parts[i].lo;
+        if (parts[i].hi > total.hi) total.hi = parts[i].hi;
+    }
+    ce->sum_i = (int64_t)total.sum;
+    ce->lo = total.lo;
+    ce->hi = total.hi;
+    return true;
+}
 
-    ray_t* vec = ray_eval(vec_expr);
-    if (!vec || RAY_IS_ERR(vec))
-        return vec ? vec : ray_error("type", NULL);
-    vec = materialize_owned_value(vec);
-    if (!vec || RAY_IS_ERR(vec))
-        return vec ? vec : ray_error("type", NULL);
-    if (!ray_is_vec(vec)) {
-        ray_release(vec);
-        *handled = 0;
-        return NULL;
-    }
-    if (ray_vec_may_have_nulls(vec)) {
-        ray_release(vec);
-        *handled = 0;
-        return NULL;
-    }
+/* Borrow the ordinary addition's evaluated operands; only a syntactic
+ * integer literal qualifies. NULL declines without consuming either ref. */
+static bool affine_literal(ray_t* x) {
+    return (x->type == -RAY_I64 || x->type == -RAY_I32 ||
+            x->type == -RAY_I16 || x->type == -RAY_U8) && !RAY_ATOM_IS_NULL(x);
+}
 
-    *handled = 1;
+static ray_t* try_sum_affine(ray_t* vec, ray_t* literal) {
+    if (vec->type != RAY_I64 || ray_vec_may_have_nulls(vec) ||
+        ray_arith_type(vec->type, -literal->type) != RAY_I64)
+        return NULL;
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
-        ray_t* sum = ray_sum_fn(vec);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-        sum = materialize_owned_value(sum);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-
         memset(&ce, 0, sizeof(ce));
         ce.vec = vec;
         ce.data = ray_data(vec);
         ce.len = vec->len;
         ce.type = vec->type;
         ce.attrs = vec->attrs;
-        ce.is_f64 = (sum->type == -RAY_F64);
-        if (ce.is_f64) ce.sum_f = as_f64(sum);
-        else           ce.sum_i = numeric_atom_i64(sum);
-        ray_release(sum);
+        if (!ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
+            if (!affine_i64_scan(&ce)) {
+                return ray_error("cancel", "interrupted");
+            }
+        } else {
+            ray_t* sum = ray_sum_fn(vec);
+            if (!sum || RAY_IS_ERR(sum)) {
+                return sum ? sum : ray_error("type", NULL);
+            }
+            sum = materialize_owned_value(sum);
+            if (!sum || RAY_IS_ERR(sum)) {
+                return sum ? sum : ray_error("type", NULL);
+            }
+            ce.sum_i = sum->i64;
+            ray_release(sum);
+        }
         affine_sum_cache_store(vec, &ce);
     }
 
-    int64_t n = vec->len;
-    ray_release(vec);
-    if (ce.is_f64 || c_expr->type == -RAY_F64) {
-        double base = ce.is_f64 ? ce.sum_f : (double)ce.sum_i;
-        double out = base + as_f64(c_expr) * (double)n;
-        return make_f64(out);
+    {
+        /* Only MIN - c (mod 2^64) adds to the null sentinel. Ordinary
+         * wrap is safe, but sum must skip rows that produce MIN. */
+        int64_t c = as_i64(literal);
+        int64_t hit = (int64_t)((uint64_t)INT64_MIN - (uint64_t)c);
+        if (ce.lo <= hit && hit <= ce.hi) {
+            int64_t total = 0;
+            for (int64_t i = 0; i < vec->len; i++) {
+                int64_t x = ray_vec_get_i64(vec, i);
+                if (x != hit) total = wrap_add_i64(total, wrap_add_i64(x, c));
+            }
+            return make_i64(total);
+        }
     }
-    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(numeric_atom_i64(c_expr), n));
+    int64_t n = vec->len;
+    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(as_i64(literal), n));
     return make_i64(out);
 }
 
@@ -1385,7 +1403,171 @@ static ray_t* bool_cmp_fast(uint16_t op, ray_t* left, ray_t* right) {
     return out;
 }
 
+/* ---- Temporal +/- integer (#1302) ----
+ *
+ * DATE / TIME / TIMESTAMP plus or minus a B8 / U8 / I16 / I32 / I64 operand,
+ * either order for +, and int - TIME (the builtin's one int-minus-temporal
+ * pair).  ray_add_fn / ray_sub_fn answer each cell as the temporal count
+ * plus the integer, wrapped to the temporal lane (ray_date / ray_time keep
+ * the low 32 bits, TIMESTAMP wraps in 64), and a null on either side is the
+ * temporal null; a result that wraps onto the sentinel reads as null too.
+ * The DAG below cannot carry that (promote() types DATE + I64 as I64 and
+ * the narrow lane is lost), so the pair ran the boxed per-element loop at
+ * ~27 ns a cell.  Here it is one typed pass over the raw counts: the same
+ * wrap, the same nulls, the temporal type.  (A query lowers the same pairs
+ * to the DAG itself: dag_temporal_int_arith, src/ops/query.c.) */
+enum { TI_ADD, TI_SUB, TI_RSUB };          /* t + x, t - x, x - t */
+enum { TI_VV, TI_VA, TI_AV };              /* t vec x vec, t vec x atom, t atom x vec */
+
+typedef struct {
+    const void* t;  const void* x;  void* out;
+    int64_t tc, xc;                        /* the atom side's value */
+    int8_t  tw, xt;                        /* temporal lane bytes, int type */
+    uint8_t op, shape;
+    _Atomic(uint8_t) has_null;             /* some cell is the sentinel */
+} tempint_ctx_t;
+
+static inline __attribute__((always_inline))
+void tempint_span(tempint_ctx_t* c, int64_t lo, int64_t hi,
+                  const int tw, const int8_t xt, const int op, const int shape) {
+    const int32_t* t32 = (const int32_t*)c->t;
+    const int64_t* t64 = (const int64_t*)c->t;
+    bool any = false;
+    for (int64_t j = lo; j < hi; j++) {
+        int64_t tv = shape == TI_AV ? c->tc : tw == 4 ? (int64_t)t32[j] : t64[j];
+        int64_t xv;
+        bool xn = false;
+        if (shape == TI_VA) xv = c->xc;
+        else switch (xt) {
+        case RAY_BOOL: case RAY_U8: xv = ((const uint8_t*)c->x)[j]; break;
+        case RAY_I16: xv = ((const int16_t*)c->x)[j]; xn = xv == NULL_I16; break;
+        case RAY_I32: xv = ((const int32_t*)c->x)[j]; xn = xv == NULL_I32; break;
+        default:      xv = ((const int64_t*)c->x)[j]; xn = xv == NULL_I64; break;
+        }
+        if (tw == 4) {
+            bool tn = shape != TI_AV && tv == NULL_I32;
+            uint32_t a = (uint32_t)tv, b = (uint32_t)xv;
+            uint32_t r = op == TI_ADD ? a + b : op == TI_SUB ? a - b : b - a;
+            int32_t o = (tn || xn) ? NULL_I32 : (int32_t)r;
+            ((int32_t*)c->out)[j] = o;
+            any |= o == NULL_I32;
+        } else {
+            bool tn = shape != TI_AV && tv == NULL_I64;
+            uint64_t a = (uint64_t)tv, b = (uint64_t)xv;
+            uint64_t r = op == TI_ADD ? a + b : op == TI_SUB ? a - b : b - a;
+            int64_t o = (tn || xn) ? NULL_I64 : (int64_t)r;
+            ((int64_t*)c->out)[j] = o;
+            any |= o == NULL_I64;
+        }
+    }
+    /* a wrap onto the sentinel is a null too, as the boxed store reads it */
+    if (any) atomic_store_explicit(&c->has_null, 1, memory_order_relaxed);
+}
+
+#define TEMPINT_SHAPES(TW, XT, OP)                                             \
+    switch (c->shape) {                                                        \
+    case TI_VV: tempint_span(c, lo, hi, TW, XT, OP, TI_VV); break;             \
+    case TI_VA: tempint_span(c, lo, hi, TW, XT, OP, TI_VA); break;             \
+    default:    tempint_span(c, lo, hi, TW, XT, OP, TI_AV); break;             \
+    }
+#define TEMPINT_OPS(TW, XT)                                                    \
+    switch (c->op) {                                                           \
+    case TI_ADD: TEMPINT_SHAPES(TW, XT, TI_ADD) break;                         \
+    case TI_SUB: TEMPINT_SHAPES(TW, XT, TI_SUB) break;                         \
+    default:     TEMPINT_SHAPES(TW, XT, TI_RSUB) break;                        \
+    }
+/* an atom offset is read once (xc): one instantiation serves every type */
+#define TEMPINT_XTYPES(TW)                                                     \
+    switch (c->shape == TI_VA ? RAY_I64 : c->xt) {                             \
+    case RAY_BOOL: case RAY_U8: TEMPINT_OPS(TW, RAY_U8) break;                 \
+    case RAY_I16: TEMPINT_OPS(TW, RAY_I16) break;                              \
+    case RAY_I32: TEMPINT_OPS(TW, RAY_I32) break;                              \
+    default:      TEMPINT_OPS(TW, RAY_I64) break;                              \
+    }
+
+static void tempint_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    tempint_ctx_t* c = (tempint_ctx_t*)vctx;
+    if (c->tw == 4) { TEMPINT_XTYPES(4) }
+    else            { TEMPINT_XTYPES(8) }
+}
+#undef TEMPINT_XTYPES
+#undef TEMPINT_OPS
+#undef TEMPINT_SHAPES
+
+_Atomic(uint64_t) ray_tempint_routes;
+
+static bool tempint_is_int(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 || t == RAY_I64;
+}
+
+/* NULL when the operands are not a temporal-vs-integer +/- pair the typed
+ * pass answers (the caller then takes its usual route); otherwise the
+ * result vector of type `out_type` (the probe's), or an error.  Plain
+ * vectors and atoms only: parted, LIST and the rest keep their paths. */
+static ray_t* tempint_arith(uint16_t dag_opcode, ray_t* left, ray_t* right,
+                            int8_t out_type, int64_t len) {
+    if (dag_opcode != OP_ADD && dag_opcode != OP_SUB) return NULL;
+    if (out_type != RAY_DATE && out_type != RAY_TIME && out_type != RAY_TIMESTAMP)
+        return NULL;
+    bool lvec = ray_is_vec(left), rvec = ray_is_vec(right);
+    if (!lvec && !ray_is_atom(left)) return NULL;
+    if (!rvec && !ray_is_atom(right)) return NULL;
+    if (!lvec && !rvec) return NULL;
+    int8_t lt = lvec ? left->type : (int8_t)-left->type;
+    int8_t rt = rvec ? right->type : (int8_t)-right->type;
+    ray_t *tv, *xv;
+    uint8_t op;
+    if (lt == out_type && tempint_is_int(rt)) {
+        tv = left; xv = right; op = dag_opcode == OP_ADD ? TI_ADD : TI_SUB;
+    } else if (rt == out_type && tempint_is_int(lt) &&
+               (dag_opcode == OP_ADD || out_type == RAY_TIME)) {
+        tv = right; xv = left; op = dag_opcode == OP_ADD ? TI_ADD : TI_RSUB;
+    } else {
+        return NULL;
+    }
+    bool tvec = tv == left ? lvec : rvec;
+    bool xvec = xv == left ? lvec : rvec;
+    ray_t* out = ray_vec_new(out_type, len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = len;
+    atomic_fetch_add_explicit(&ray_tempint_routes, 1, memory_order_relaxed);
+    int tw = out_type == RAY_TIMESTAMP ? 8 : 4;
+    /* A null atom is a null for every cell, as the builtin answers it. */
+    if ((!tvec && RAY_ATOM_IS_NULL(tv)) || (!xvec && RAY_ATOM_IS_NULL(xv))) {
+        if (tw == 4) { int32_t* d = (int32_t*)ray_data(out); for (int64_t j = 0; j < len; j++) d[j] = NULL_I32; }
+        else         { int64_t* d = (int64_t*)ray_data(out); for (int64_t j = 0; j < len; j++) d[j] = NULL_I64; }
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+    tempint_ctx_t c = {
+        .t = tvec ? ray_data(tv) : NULL, .x = xvec ? ray_data(xv) : NULL,
+        .out = ray_data(out),
+        .tc = tvec ? 0 : tv->i64, .xc = xvec ? 0 : as_i64(xv),
+        .tw = (int8_t)tw, .xt = xvec ? xv->type : (int8_t)-xv->type,
+        .op = op, .shape = tvec && xvec ? TI_VV : tvec ? TI_VA : TI_AV,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && len >= RAY_PARALLEL_THRESHOLD) {
+        ray_pool_dispatch(pool, tempint_fn, &c, len);
+        if (ray_interrupted() ||
+            atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+            ray_release(out);
+            return ray_error("cancel", "interrupted");
+        }
+    } else {
+        tempint_fn(&c, 0, 0, len);
+    }
+    if (atomic_load_explicit(&c.has_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
+        (left->type == RAY_DICT || right->type == RAY_DICT ||
+                            left->type == RAY_TABLE || right->type == RAY_TABLE))
+        return fn(left, right);
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
         return atomic_map_binary_parted(fn, dag_opcode, left, right);
@@ -1396,9 +1578,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         fn == ray_gt_fn || fn == ray_gte_fn;
     if (duration_binary && left->type != RAY_LIST && right->type != RAY_LIST &&
         (ray_has_timespan(left) || ray_has_timespan(right) ||
-         (fn == ray_sub_fn &&
-          (left->type == RAY_TIMESTAMP || left->type == -RAY_TIMESTAMP) &&
-          (right->type == RAY_TIMESTAMP || right->type == -RAY_TIMESTAMP))))
+         (fn == ray_sub_fn && ray_point_diff(left, right))))
         return fn(left, right);
 
     int left_coll = is_collection(left);
@@ -1479,61 +1659,19 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     int force_boxed = (left_coll && left->type == RAY_LIST) ||
                       (right_coll && right->type == RAY_LIST);
 
-    /* When the probed result is a null atom, the fn already chose the correct
-     * result type (e.g., division returns left-operand-typed null).  Skip the
-     * wider-wins promotion so the typed null lands in the right vector type. */
-    int e0_null = RAY_ATOM_IS_NULL(e0);
-
-    /* When the probed result is a boolean (from comparison ops like ==, <, etc.),
-     * preserve the bool output type — do not promote to wider integer type. */
-    int e0_bool = (e0->type == -RAY_BOOL);
-
-    /* When LEFT is scalar broadcast to RIGHT vector, the output type follows
-     * the RIGHT vector's element type for integer types,
-     * unless float or temporal promotion is involved. */
-    /* Not for the dyadic min/max: their result type is already the
-     * operands' promoted one (minmax_type), and narrowing it here would
-     * wrap a chosen scalar, (max 300 u8vec) giving 0x2c. */
-    if (!e0_null && !e0_bool && !left_coll && right_coll && ray_is_vec(right) && out_type != RAY_F64 &&
-        fn != ray_min2_fn && fn != ray_max2_fn) {
-        int8_t vec_type = right->type;
-        /* Only override for integer family: if probed type is wider int, downcast */
-        int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
-        int vec_is_int = (vec_type == RAY_I64 || vec_type == RAY_I32 || vec_type == RAY_I16 || vec_type == RAY_U8);
-        if (out_is_int && vec_is_int)
-            out_type = vec_type;
-        /* For temporal: only override if both are same temporal family */
-        if ((vec_type == RAY_DATE || vec_type == RAY_TIME || vec_type == RAY_TIMESTAMP) &&
-            out_type == vec_type)
-            out_type = vec_type; /* no-op, just keep it */
-    }
-    /* When LEFT is vector and RIGHT is scalar, output follows WIDER integer
-     * type between left vector and right scalar */
-    if (!e0_null && !e0_bool && left_coll && !right_coll && ray_is_vec(left) && out_type != RAY_F64 &&
-        ray_is_atom(right)) {
-        int8_t vt = left->type, st = -(right->type);
-        int vt_int = (vt == RAY_I64 || vt == RAY_I32 || vt == RAY_I16 || vt == RAY_U8);
-        int st_int = (st == RAY_I64 || st == RAY_I32 || st == RAY_I16 || st == RAY_U8);
-        int out_is_int = (out_type == RAY_I64 || out_type == RAY_I32 || out_type == RAY_I16 || out_type == RAY_U8);
-        if (out_is_int && vt_int && st_int)
-            out_type = (vt >= st) ? vt : st; /* wider wins */
-    }
-    /* When both are vectors, output type follows wider integer type */
-    if (!e0_null && !e0_bool && left_coll && right_coll && ray_is_vec(left) && ray_is_vec(right) && out_type != RAY_F64) {
-        int8_t lt = left->type, rt = right->type;
-        int lt_int = (lt == RAY_I64 || lt == RAY_I32 || lt == RAY_I16 || lt == RAY_U8);
-        int rt_int = (rt == RAY_I64 || rt == RAY_I32 || rt == RAY_I16 || rt == RAY_U8);
-        if (lt_int && rt_int) {
-            /* Pick wider: I64 > I32 > I16 > U8 (using type tag ordering) */
-            out_type = (lt >= rt) ? lt : rt;
-        }
-    }
-
-    /* When LEFT is a vector collection, override i32 output to match the
-     * left vector type or i64 (e.g., [DATE]-DATE → i64, [i64]-i32 → i64).
-     * Keeps i32 only when left vector is actually i32. */
-    if (!e0_null && !e0_bool && out_type == RAY_I32 && left_coll && ray_is_vec(left) && left->type != RAY_I32) {
+    /* The probe's type is the result type: the builtins take it from the
+     * promotion table (ray_num_type, core/types.h), the same for either
+     * operand order and for atoms as for vectors (#972), and the DAG below
+     * plans the same one.  The one adjustment left is for a left vector
+     * outside the numeric table (temporal, TIMESPAN, ...): an I32 probe
+     * answers I64 there, as it always has (DATE - DATE days, (min span 5i)). */
+    if (out_type == RAY_I32 && left_coll && ray_is_vec(left) &&
+        !ray_num_type(left->type, left->type) && !RAY_ATOM_IS_NULL(e0))
         out_type = RAY_I64;
+
+    if (!force_boxed) {
+        ray_t* r = tempint_arith(dag_opcode, left, right, out_type, len);
+        if (r) { ray_release(e0); return r; }
     }
 
     /* DAG executor — for F64 and comparisons */
@@ -1613,7 +1751,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (dl_scalar) {
                         if (dl->type == -RAY_F64)
                             lop = ray_const_f64(g, dl->f64);
-                        else if (dl->type == -RAY_F32)
+                        /* The exact-width scalar-left kernel checks the literal's
+                         * runtime tag, not just the DAG node's out_type. */
+                        else if (dl->type == -RAY_F32 ||
+                                 ((dop == OP_ADD || dop == OP_SUB || dop == OP_MUL) &&
+                                  (lt == RAY_I16 || lt == RAY_I32) && lt == rt))
                             lop = ray_const_atom(g, dl);
                         else {
                             int64_t sv = as_i64(dl);
@@ -2689,11 +2831,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         bool col_has_nulls = false;
 
         for (int64_t j = 0; j < nrows; j++) {
-            /* F64 promotion of an I64 null produces a finite double, not
-             * a null sentinel in the destination column. */
-            if (RAY_ATOM_IS_NULL(row_elems[j]) &&
-                !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
-                col_has_nulls = true;
+            /* Promotion preserves logical nulls, not the source sentinel's
+             * numeric value. Publish the column flag after filling it. */
+            bool cell_is_null = RAY_ATOM_IS_NULL(row_elems[j]);
+            if (cell_is_null) col_has_nulls = true;
             if (col_type == RAY_STR) {
                 if (row_elems[j]->type != -RAY_STR) {
                     int8_t et = row_elems[j]->type;
@@ -2728,7 +2869,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 void* val_ptr;
                 double promoted;
                 if (col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) {
-                    promoted = (double)row_elems[j]->i64;
+                    promoted = cell_is_null ? NULL_F64 : (double)row_elems[j]->i64;
                     val_ptr = &promoted;
                 } else if (col_type == RAY_I64) val_ptr = &row_elems[j]->i64;
                 else if (col_type == RAY_F64) val_ptr = &row_elems[j]->f64;
@@ -3673,6 +3814,17 @@ static bool vm_text_value(const ray_t* v) {
     return v->type == RAY_SYM || v->type == RAY_STR || v->type == -RAY_SYM || v->type == -RAY_STR;
 }
 
+/* A unary builtin applied by compiled code to `arg` (borrowed). */
+static inline ray_t* vm_apply_unary(ray_t* fn_obj, ray_t* arg) {
+    ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
+    if (RAY_UNLIKELY(RAY_IS_NULL(arg)))
+        return (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
+               ? fn(arg) : ray_error("type", NULL);
+    if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
+        return atomic_map_unary(fn, arg);
+    return fn(arg);
+}
+
 /* A binary builtin applied by compiled code.  Consumes `left` and `right`;
  * `left_rows`/`right_rows` are their row-provenance flags and `*out_rows`
  * receives the result's.  Returns an owned result or error. */
@@ -3695,7 +3847,7 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     }
     RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
     if (RAY_UNLIKELY(RAY_IS_NULL(left) || RAY_IS_NULL(right))) {
-        result = (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
+        result = (fn == ray_identical_fn || fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn)
                  ? fn(left, right) : ray_error("type", NULL);
     } else if (fn == ray_concat_fn && (left_rows == 1 || right_rows == 1) &&
                vm_text_value(left) && vm_text_value(right) &&
@@ -3721,6 +3873,42 @@ static ray_t* vm_call_binary(ray_t* fn_obj, ray_t* left, ray_t* right,
     }
     ray_release(left);
     ray_release(right);
+    return result;
+}
+
+/* The calls above, timed by the call profiler under the running lambda
+ * `self` and the call's offset `ip`.  Out of line: the dispatch loop pays
+ * only the test of the profiler flag. */
+static __attribute__((noinline))
+ray_t* vm_prof_unary(ray_t* fn_obj, ray_t* arg, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = vm_apply_unary(fn_obj, arg);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_binary(ray_t* fn_obj, ray_t* left, ray_t* right, uint8_t left_rows,
+                      uint8_t right_rows, uint8_t* out_rows, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, out_rows);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_vary(ray_vary_fn fn, ray_t** args, int64_t n, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = fn(args, n);
+    ray_callprof_exit(frame);
+    return result;
+}
+
+static __attribute__((noinline))
+ray_t* vm_prof_eval(ray_t* ast, ray_t* self, int32_t ip) {
+    int32_t frame = ray_callprof_enter_vm(self, ip);
+    ray_t* result = ray_eval(ast);
+    ray_callprof_exit(frame);
     return result;
 }
 
@@ -4002,6 +4190,92 @@ op_jmpf: {
     DISPATCH();
 }
 
+/* The builtin call handlers, as macros: each opcode's handler and its
+ * profiled twin (the *_prof labels below, reached when the call profiler
+ * is on) differ only in how they apply the builtin.  The twin's entry is
+ * the handler's first test, so the hot handler keeps its own registers. */
+#define VM_CALL1(APPLY) {                                                   \
+    ray_t *arg = POP();                                                     \
+    uint8_t arg_rows = POPPED_ROWS();                                       \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        ray_release(arg);                                                   \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    /* Materialise lazy args for non-lazy-aware fns.  arg is an owned ref   \
+     * (POPped from VM stack); ray_lazy_materialize consumes it. */         \
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && arg && ray_is_lazy(arg)) {  \
+        arg = ray_lazy_materialize(arg);                                    \
+        if (!arg || RAY_IS_ERR(arg)) {                                      \
+            ray_release(fn_obj);                                            \
+            vm_err_obj = arg ? arg : ray_error("type", NULL);               \
+            goto vm_error;                                                  \
+        }                                                                   \
+    }                                                                       \
+    RAY_ASSERT_VALUE(arg);                                                  \
+    ray_t *result = APPLY;                                                  \
+    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0; \
+    ray_release(arg);                                                       \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
+#define VM_CALL2(APPLY) {                                                   \
+    ray_t *right = POP();                                                   \
+    uint8_t right_rows = POPPED_ROWS();                                     \
+    ray_t *left = POP();                                                    \
+    uint8_t left_rows = POPPED_ROWS();                                      \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        ray_release(left);                                                  \
+        ray_release(right);                                                 \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    uint8_t result_rows = 0;                                                \
+    ray_t *result = APPLY;                                                  \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
+#define VM_CALLN(APPLY) {                                                   \
+    uint8_t n = code[ip++];                                                 \
+    if (n > 64) goto vm_error;                                              \
+    ray_t *fn_args[64];                                                     \
+    uint8_t args_rows = 0;                                                  \
+    for (int32_t i = n - 1; i >= 0; i--) {                                  \
+        fn_args[i] = POP();                                                 \
+        args_rows = vrows_join(args_rows, POPPED_ROWS());                   \
+    }                                                                       \
+    ray_t *fn_obj = POP();                                                  \
+    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
+        for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);            \
+        ray_release(fn_obj);                                                \
+        vm_err_obj = ray_error("access", "restricted");                     \
+        goto vm_error;                                                      \
+    }                                                                       \
+    ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;                   \
+    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {                             \
+        ray_t* err = materialize_owned_args(fn_args, n);                    \
+        if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }  \
+    }                                                                       \
+    ray_t *result = APPLY;                                                  \
+    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0; \
+    for (int32_t i = 0; i < n; i++)                                         \
+        ray_release(fn_args[i]);                                            \
+    ray_release(fn_obj);                                                    \
+    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
+    PUSHR(result, result_rows);                                             \
+    DISPATCH();                                                             \
+}
+
 op_call1r:
     /* A builtin a closure body resolved when it ran: OP_CALL1 while the
      * name still holds a unary builtin, the general call (which reads
@@ -4011,91 +4285,22 @@ op_call1r:
                      RAY_IS_NULL(vm.ps[vm.sp - 1])))
         goto op_callf;
     ip++;
-op_call1: {
-    ray_t *arg = POP();
-    uint8_t arg_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(arg);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    ray_unary_fn fn = (ray_unary_fn)(uintptr_t)fn_obj->i64;
-    ray_t *result;
-    /* Materialise lazy args for non-lazy-aware fns.
-     * arg is an owned ref (POPped from VM stack); ray_lazy_materialize consumes
-     * it internally — no extra ray_release needed here. */
-    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && arg && ray_is_lazy(arg)) {
-        arg = ray_lazy_materialize(arg); /* consumes owned ref; result is new owned ref */
-        if (!arg || RAY_IS_ERR(arg)) {
-            ray_release(fn_obj);
-            vm_err_obj = arg ? arg : ray_error("type", NULL);
-            goto vm_error;
-        }
-    }
-    RAY_ASSERT_VALUE(arg);
-    if (RAY_UNLIKELY(RAY_IS_NULL(arg))) {
-        result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn)
-                 ? fn(arg) : ray_error("type", NULL);
-    } else if ((fn_obj->attrs & RAY_FN_ATOMIC) && arg->type >= 0)
-        result = atomic_map_unary(fn, arg);
-    else
-        result = fn(arg);
-    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;
-    ray_release(arg);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_call1:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call1_prof;
+    VM_CALL1(vm_apply_unary(fn_obj, arg))
 
-op_call2r: {
+op_call2r:
     /* OP_CALL2 for a resolved binary builtin, with the same rows in and
      * out as a baked call; the general call when the name holds anything
      * else. */
     if (RAY_UNLIKELY(!vm.ps[vm.sp - 3] || vm.ps[vm.sp - 3]->type != RAY_BINARY)) goto op_callf;
     ip++;
-    ray_t *right = POP();
-    uint8_t right_rows = POPPED_ROWS();
-    ray_t *left = POP();
-    uint8_t left_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(left);
-        ray_release(right);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    uint8_t result_rows = 0;
-    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call2_prof;
+    VM_CALL2(vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows))
 
-op_call2: {
-    ray_t *right = POP();
-    uint8_t right_rows = POPPED_ROWS();
-    ray_t *left = POP();
-    uint8_t left_rows = POPPED_ROWS();
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        ray_release(left);
-        ray_release(right);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    uint8_t result_rows = 0;
-    ray_t *result = vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_call2:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_call2_prof;
+    VM_CALL2(vm_call_binary(fn_obj, left, right, left_rows, right_rows, &result_rows))
 
 op_callnr: {
     /* OP_CALLN for a resolved variadic builtin; the general call when the
@@ -4105,36 +4310,9 @@ op_callnr: {
     goto op_calln;
 }
 
-op_calln: {
-    uint8_t n = code[ip++];
-    if (n > 64) goto vm_error;
-    ray_t *fn_args[64];
-    uint8_t args_rows = 0;
-    for (int32_t i = n - 1; i >= 0; i--) {
-        fn_args[i] = POP();
-        args_rows = vrows_join(args_rows, POPPED_ROWS());
-    }
-    ray_t *fn_obj = POP();
-    if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {
-        for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
-        ray_release(fn_obj);
-        vm_err_obj = ray_error("access", "restricted");
-        goto vm_error;
-    }
-    ray_vary_fn fn = (ray_vary_fn)(uintptr_t)fn_obj->i64;
-    if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE)) {
-        ray_t* err = materialize_owned_args(fn_args, n);
-        if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }
-    }
-    ray_t *result = fn(fn_args, n);
-    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0;
-    for (int32_t i = 0; i < n; i++)
-        ray_release(fn_args[i]);
-    ray_release(fn_obj);
-    if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
-    PUSHR(result, result_rows);
-    DISPATCH();
-}
+op_calln:
+    if (RAY_UNLIKELY(ray_callprof_on())) goto op_calln_prof;
+    VM_CALLN(fn(fn_args, n))
 
 op_pathget: {
     /* A dotted name whose head is a local: the head was loaded as the name
@@ -4234,6 +4412,8 @@ op_callf: {
     {
         ray_t *result;
         int8_t lambda_rows = -1;
+        int32_t prof_frame = -1;
+        if (RAY_UNLIKELY(ray_callprof_on())) prof_frame = ray_callprof_enter_vm(vm.fn, ip - 1);
         switch (fn_obj->type) {
         case RAY_UNARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
@@ -4329,6 +4509,7 @@ unary_done:
             result = head_not_callable_error(fn_obj->type);
             break;
         }
+        if (RAY_UNLIKELY(prof_frame >= 0)) ray_callprof_exit(prof_frame);
         uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
             : fn_obj->type == RAY_BINARY ? (uint8_t)(lambda_rows == 1)
             : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_VARY) &&
@@ -4373,7 +4554,7 @@ op_calld: {
     if (n == 0) {
         /* n=0: the AST itself is on the stack, eval it directly */
         ray_t *ast = POP();
-        ray_t *result = ray_eval(ast);
+        ray_t *result = RAY_UNLIKELY(ray_callprof_on()) ? vm_prof_eval(ast, vm.fn, ip - 1) : ray_eval(ast);
         ray_release(ast);
         if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
         PUSHR(result, vrows_from(g_eval_rows));
@@ -4398,7 +4579,8 @@ op_calld: {
     for (int32_t i = 0; i < n; i++)
         elems[i + 1] = fn_args[i];
 
-    ray_t *result = ray_eval(call_list);
+    ray_t *result = RAY_UNLIKELY(ray_callprof_on()) ? vm_prof_eval(call_list, vm.fn, ip - 1)
+                                                    : ray_eval(call_list);
     ray_release(call_list);
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }
     PUSHR(result, vrows_from(g_eval_rows));
@@ -4699,6 +4881,18 @@ op_scope_end: {
     ray_release(syms);
     DISPATCH();
 }
+
+/* The call handlers' profiled twins (the call profiler is on).  `ip`
+ * is inside the call instruction, which is all the site key needs. */
+op_call1_prof:
+    VM_CALL1(vm_prof_unary(fn_obj, arg, vm.fn, ip - 1))
+op_call2_prof:
+    VM_CALL2(vm_prof_binary(fn_obj, left, right, left_rows, right_rows, &result_rows, vm.fn, ip - 1))
+op_calln_prof:
+    VM_CALLN(vm_prof_vary(fn, fn_args, n, vm.fn, ip - 1))
+#undef VM_CALL1
+#undef VM_CALL2
+#undef VM_CALLN
 
     const char *vm_err_str = "domain";
     const char *vm_err_detail = NULL;
@@ -5116,6 +5310,7 @@ static void ray_register_builtins(void) {
     register_vary("apply",  RAY_FN_NONE, ray_apply_fn);
 
     /* Collection operations */
+    register_binary("identical", RAY_FN_NONE, ray_identical_fn);
     register_unary("distinct", RAY_FN_NONE | RAY_FN_LAZY_AWARE, ray_distinct_fn);
     register_binary("in",      RAY_FN_NONE, ray_in_eval_fn);
     register_binary("not-in",  RAY_FN_NONE, ray_not_in_fn);
@@ -5194,6 +5389,8 @@ static void ray_register_builtins(void) {
     register_vary("inner-join",  RAY_FN_NONE, ray_inner_join_fn);
     register_vary("full-join",   RAY_FN_NONE, ray_full_join_fn);
     register_vary("anti-join",   RAY_FN_NONE, ray_anti_join_fn);
+    register_vary("semi-mask",   RAY_FN_NONE, ray_semi_mask_fn);
+    register_vary("anti-mask",   RAY_FN_NONE, ray_anti_mask_fn);
     register_vary("window-join", RAY_FN_SPECIAL_FORM, ray_window_join_fn);
     register_vary("window-join1", RAY_FN_SPECIAL_FORM, ray_window_join1_fn);
     /* Special form: asof-join inspects its operand ASTs (parted-select
@@ -5208,6 +5405,9 @@ static void ray_register_builtins(void) {
     register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
+    register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
+    register_vary(".json.get", RAY_FN_NONE, ray_json_get_fn);
+    register_unary(".json.format", RAY_FN_NONE, ray_json_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
@@ -5432,6 +5632,10 @@ static void ray_register_builtins(void) {
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
+    register_vary(".sys.join.par.min",    RAY_FN_RESTRICTED, ray_join_par_min_fn);
+    register_vary(".sys.profile",         RAY_FN_NONE,       ray_callprof_fn);
+    register_vary(".sys.profile.enable",  RAY_FN_RESTRICTED, ray_callprof_enable_fn);
+    register_vary(".sys.profile.reset",   RAY_FN_RESTRICTED, ray_callprof_reset_fn);
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);
@@ -5543,6 +5747,7 @@ ray_err_t ray_lang_init(void) {
 void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
     closure_tmpl_reset();
+    ray_callprof_destroy();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();
@@ -5578,7 +5783,16 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     }
 }
 
+/* Only the direct argument of ordinary SUM gets a fusion request. Nested
+ * evaluations (including special forms) enter through ray_eval as usual. */
+static ray_t* eval_impl(ray_t* obj, bool* summed);
+
 ray_t* ray_eval(ray_t* obj) {
+    return eval_impl(obj, NULL);
+}
+
+static ray_t* eval_impl(ray_t* obj, bool* summed) {
+
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
     /* All eval-context state (depth, scope, restricted, nfo/trace) lives
@@ -5621,6 +5835,7 @@ ray_t* ray_eval(ray_t* obj) {
     ray_prof_span_t* ev_span = NULL;
     const char*      ev_name = NULL;
     int64_t          ev_idx  = -1;
+    int32_t          cp_frame = -1;   /* call profiler frame (lang/callprof.h) */
 
     /* Atoms: return themselves (retain) */
     if (ray_is_atom(obj)) {
@@ -5752,6 +5967,9 @@ ray_t* ray_eval(ray_t* obj) {
         }
     }
 
+    /* The call profiler times top-level calls by their parsed list. */
+    if (RAY_UNLIKELY(ray_callprof_on())) cp_frame = ray_callprof_enter_node(obj);
+
     switch (head->type) {
         case RAY_UNARY: {
             if (fn_is_restricted(head)) { ray_release(head); ret = ray_error("access", "restricted"); goto out; }
@@ -5784,15 +6002,6 @@ ray_t* ray_eval(ray_t* obj) {
             }
             if (n != 2) { ray_release(head); ret = ray_error("arity", "expected 1 arg, got %d", (int)(n-1)); goto out; }
             uint8_t fn_attrs = head->attrs;
-            if (fn == (ray_unary_fn)ray_sum_fn) {
-                int handled = 0;
-                ray_t* fast = try_sum_affine_expr(elems[1], &handled);
-                if (handled) {
-                    ray_release(head);
-                    ret = fast ? fast : ray_error("type", NULL);
-                    rows = 0; goto out;
-                }
-            }
             if (fn == (ray_unary_fn)ray_count_fn) {
                 int handled = 0;
                 ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
@@ -5813,7 +6022,9 @@ ray_t* ray_eval(ray_t* obj) {
                     rows = 0; goto out;
                 }
             }
-            ray_t* arg = ray_eval(elems[1]);
+            bool fused = false;
+            ray_t* arg = eval_impl(elems[1], fn == (ray_unary_fn)ray_sum_fn ? &fused : NULL);
+            if (fused) { ray_release(head); ret = arg; rows = 0; goto out; }
             rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }
@@ -5906,7 +6117,7 @@ ray_t* ray_eval(ray_t* obj) {
             /* If either arg is NULL/void, only == and != can handle it */
             RAY_ASSERT_VALUE(left); RAY_ASSERT_VALUE(right);
             if (RAY_IS_NULL(left) || RAY_IS_NULL(right)) {
-                if (fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn) {
+                if (fn == ray_identical_fn || fn == (ray_binary_fn)ray_eq_fn || fn == (ray_binary_fn)ray_neq_fn) {
                     ray_release(head);
                     ray_t* result = fn(left, right);
                     ray_release(left);
@@ -5923,6 +6134,16 @@ ray_t* ray_eval(ray_t* obj) {
             ray_release(head);
             ray_t* result;
             rows = rowwise ? rows_join(left_rows, right_rows) : 0;
+            if (summed && fn == ray_add_fn) {
+                result = affine_literal(elems[1]) ? try_sum_affine(right, left) :
+                         affine_literal(elems[2]) ? try_sum_affine(left, right) : NULL;
+                if (result) {
+                    *summed = true;
+                    ray_release(left);
+                    ray_release(right);
+                    ret = result; goto out;
+                }
+            }
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
             else if (fn == ray_concat_fn && ray_active_query_table() &&
@@ -5987,7 +6208,16 @@ ray_t* ray_eval(ray_t* obj) {
             }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
-                args[i] = ray_eval(elems[i + 1]);
+                /* .json.get's type, a quoted symbol after the path, names a
+                 * type, never a column a query would read it as */
+                ray_t* ai = elems[i + 1];
+                if (i == 2 && fn == ray_json_get_fn && ai && ai->type == -RAY_SYM &&
+                    (ai->attrs & ATTR_QUOTED)) {
+                    ray_retain(ai);
+                    args[i] = ai;
+                    continue;
+                }
+                args[i] = ray_eval(ai);
                 any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
@@ -6055,6 +6285,7 @@ ray_t* ray_eval(ray_t* obj) {
     }
 
 out:
+    if (RAY_UNLIKELY(cp_frame >= 0)) ray_callprof_exit(cp_frame);
     /* Close the direct-builtin span opened before the dispatch switch.
      * ev_span is non-NULL only when profiling is active and we opened one,
      * so error/atom paths (which never reach the switch) skip this. */
@@ -6084,7 +6315,12 @@ out:
      * returns to 0 guarantees the progress bar is cleared no matter
      * which builtin drove the update (including ray_group_indices_fn etc.
      * that bypass ray_execute). */
-    if (__VM->eval_depth == 0) ray_progress_end();
+    if (__VM->eval_depth == 0) {
+        /* Release pins before a final progress callback can start more work,
+         * and before a caller is allowed to destroy its runtime. */
+        affine_sum_cache_clear();
+        ray_progress_end();
+    }
     return ret;
 }
 

@@ -38,7 +38,7 @@
 (at (select {x: (div k b) from: T}) 'x) -- (div (at T 'k) (at T 'b))
 (at (select {x: (div k f) from: T}) 'x) -- (div (at T 'k) (at T 'f))
 (at (select {x: (div k e) from: T}) 'x) -- (div (at T 'k) (at T 'e))
-(at (select {x: (div e e) from: T}) 'x) -- [1 0Nl 1 0Nl 1 1]
+(at (select {x: (div e e) from: T}) 'x) -- [1.0e 0Ne 1.0e 0Ne 1.0e 1.0e]
 (at (select {x: (/ k 0) from: T}) 'x) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
 (at (select {x: (/ k i) from: T}) 'x) -- (/ (at T 'k) (at T 'i))
 (at (select {x: (/ k u) from: T}) 'x) -- (/ (at T 'k) (at T 'u))

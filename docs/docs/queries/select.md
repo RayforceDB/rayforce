@@ -82,7 +82,9 @@ aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
 sum. An aggregate cannot be aggregated again, through an alias or written
 out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
-`domain`. And an output may not mix a source column with a reference to an earlier
+`domain`. An aggregate that still folds the group's rows may use one:
+`mx: (max (+ price (count price)))` adds each group's count to its prices
+and takes the largest. And an output may not mix a source column with a reference to an earlier
 per-group alias outside an aggregate: `f: (* price n)` with `n: (count price)` raises
 `domain`; write `(* (sum price) n)` or whichever aggregate is meant.
 
@@ -152,6 +154,21 @@ The positions `where` returns count those rows, not the table's:
 (select {i: (iasc v) from: g where: (> k 1)})   ; i: [1 0 2]
 ```
 
+Under `by:` the verb sees each group's surviving rows, as an aggregate does:
+its grades and ranks count within the group. The same holds for `rotate`
+and `xrank`, for a verb under an element-wise call (`(+ 1 (rank v))`), and
+for one inside an aggregate's argument (`(sum (rank v))`, `(sum (asc v))`):
+
+```lisp
+(at (select {r: (rank v) from: g by: k}) 'r)        ; [[0 1] [1 0 2]]
+(at (select {r: (sum (rank v)) from: g by: k}) 'r)  ; [1 3]
+```
+
+A verb inside a running function's argument runs with that function, over
+the whole table (see [running functions](#running-functions-under-where)):
+`(sums (rank v))` by `k` takes each group's rows of the running sum of the
+whole table's ranks, not the running sum of each group's ranks.
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its
@@ -180,6 +197,14 @@ Combine multiple conditions:
 ; GOOG   280    400
 ```
 
+The predicate itself must give a boolean mask (or a scalar truth value): a
+numeric column alone, `where: volume`, is a `type` error. Inside `and` and
+`or`, though, an operand is read by its truth value, as outside a query, so
+`where: (and volume (> price 100))` keeps the rows with a non-zero, non-null
+volume. Comparisons take the operand types they take outside a query
+([Comparison](../language/math.md#comparison)): `where: (> date 8000)` over
+a `DATE` column is a `type` error; compare with a date, `(> date 2021.11.26)`.
+
 ### Running functions under `where:`
 
 A running, moving or shift function in a projection (`sums`, `deltas`,
@@ -207,8 +232,55 @@ select them first:
 ```
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
-`desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
-surviving rows only.
+`desc`, `reverse`, `iasc`, `idesc`, `rank`, `xrank`, `rotate`, `take`, `drop`,
+`where`) are different: they see the surviving rows only, and under `by:` each
+group's surviving rows.
+
+The same holds under `by:`. A running function in a grouped select runs over
+the whole table, not over each group, and the groups then take their rows of
+what it gave: an aggregate over it aggregates them, and a running output on
+its own is that whole-table column split by group. A helper is no different,
+whether the planner inlines it or not, named or written in place: a helper
+with several statements, or one that passes a builtin as a value, is called
+once over the whole columns. A helper runs once per group instead when
+
+- an argument holds an aggregate (`(f i (avg i))`): that aggregate is the
+  group's, as it is written inline;
+- it has an effect (it prints, sets a global), so it runs as often as before;
+- its code uses an aggregate anywhere, in any statement
+  (`(fn [x] (let y x) (- y (avg y)))`, `(fn [x] (let n (count x)) (% x n))`),
+  or a helper it calls does, or one is passed to it (`(f avg i)`): the
+  aggregate is the group's, as `(- i (avg i))` gives it inline;
+- its code uses a whole-column verb (`(fn [x] (let y x) (reverse y))`), in
+  the same ways: the verb sees each group's surviving rows, as `(reverse i)`
+  does inline. These are the verbs above and `rotate`, `xrank`, `xasc`,
+  `xdesc`, `group`, `take` and `drop`;
+- or its call over the whole table fails or gives anything but one typed
+  value per row (a scalar, a LIST). That call is a probe: its cost is paid
+  once over the whole table before the helper runs per group.
+
+A running call in the arguments of a helper that runs per group still runs
+over the whole table: given `(sums i)`, the reversing helper above reverses
+each group's surviving rows of the whole-table `sums`. A running call in the
+helper's own body runs with the helper, over the group's rows:
+`(fn [x] (let y (sums x)) (reverse y))` and
+`(fn [x] (let s (sums x)) (- s (avg s)))` sum each group. The same holds for
+a plain output of such a helper: it is the helper over each group's rows.
+Over the table `r` above:
+
+```lisp
+(select {s: (sums score) from: r by: room})                         ; A: [60 125], B: [80 160]
+(select {s: (last (sums score)) from: r by: room})                  ; s: [125 160]
+(select {s: (sum (sums score)) from: r by: room where: (> score 30)}) ; s: [185 160]
+```
+
+The running sum over all four rows is `60 80 125 160`; room A keeps rows 1
+and 3, room B rows 2 and 4. For a running column per group, use `update`
+with `by:`, which runs the function over each group's rows:
+
+```lisp
+(update {s: (sums score) from: r by: room})   ; s: [60 20 105 55]
+```
 
 ### Group-by Aggregation
 
@@ -245,15 +317,18 @@ Group by multiple keys:
 ```
 
 An output that projects a key column as itself (`sym: sym`) is the key
-column: it is not repeated after the keys, with one key or with several, and
-the select gives the same rows in the same order as without it. With several
-keys the result is exactly the select without the projections: the keys
-come first, in `by:` order, wherever the projections are written. A single
-key keeps its projection where it was written: `{total: (sum qty) sym: sym}
-by: sym` gives the columns `total sym`. A renamed (`s: sym`) or computed
-projection of a key is an ordinary output.
+column: it is not repeated after the keys, and the result is exactly the
+select without the projections, the same columns and the same rows in the
+same order. The keys come first, in `by:` order, wherever the projections
+are written, with one key or with several: `{total: (sum qty) sym: sym}
+by: sym` gives the columns `sym total`, and `{n: (count qty) k: k}
+by: {k: sym}` gives `k n`. A select whose only outputs are key projections
+is the select with no outputs. A key projected under another name (`x: sym`)
+is an ordinary output containing each group's key values. A computed projection of a key is an
+ordinary output.
 
 ```lisp
+(select {from: trades by: sym total: (sum qty) sym: sym})   ; columns sym total
 (select {from: trades by: [sym side]
          sym: sym side: side total: (sum qty)})   ; columns sym side total
 (select {from: trades by: [sym side]
@@ -288,6 +363,16 @@ What an aggregate reads depends on what its argument is. A column, or an
 expression over columns, gives one value per row, and each group aggregates
 its own rows. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
+
+A keyless select gives `first` and `last` the argument `by:` gives its one
+group, whichever route evaluates it: builtin calls over the columns, such as
+`(first (at s (til 4)))` or `(first (except s 'b))`, are evaluated over the
+whole column and their error is the query's (`(last (if c s d))` with SYM
+and DATE arms raises `if: branches mix SYM and DATE`); over an empty
+`where:` the answer is the null of the argument's type, `0Nd` for a DATE
+lambda, `0x00` for U8; and an answer that is a collection, such as the cell
+of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
+`(list (list 1))`.
 
 A vector written as a value — a literal, a global holding one, or a bound
 value: a lambda parameter or a `let`, which hides a column of its name —
@@ -324,8 +409,11 @@ stands for a column:
 A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, an
 expression of constants, a call of a single-expression helper included — is
 evaluated once for the whole query, not once per row or per group, so a side
-effect in it runs once. A helper with several statements is not inlined and
-runs once per group. A collection it
+effect in it runs once. A helper with several statements is not inlined.
+Given no argument that reads the rows, it runs once per group; given one, it
+is called once over the whole table unless one of the exceptions in
+[Running functions under `where:`](#running-functions-under-where) sends it
+per group. A collection it
 returns is aggregated as it stands, as outside a select, and gives the same
 value in every group; a scalar stands for every row, as `1` does in
 `(sum 1)`, which counts the rows:
@@ -381,6 +469,24 @@ Mix ascending and descending with separate clauses. Sort priority follows the or
 ```lisp
 ; Primary: sym ascending. Secondary: price descending.
 (select {from: t asc: sym desc: price})
+```
+
+A sort key names a column of the result. A key that names an output sorts by
+that output's values, computed or renamed, even when a source column has the
+same name; the answer is the one `xasc`/`xdesc` gives on the unsorted select. A
+source column is used only when no output has the key's name, and it is not
+added to the result. That fallback applies to a plain select only: in a select
+with `by:`, or one whose outputs are all aggregates, the result rows are groups
+(or one row), so a sort key must name an output. A key that names only a
+source column there is not supported, e.g. `(select {r: (sum a) from: t by: k
+asc: c})`. A key missing from the sortable result raises a `schema` error
+that includes the key, for example `sort key 'zz' is not available to this SELECT`:
+
+```lisp
+(set t (table [a b] (list [3 1 2] [0 2 1])))
+(select {r: (+ a 1) from: t asc: r})   ; r: [2 3 4]
+(select {b: a from: t asc: b})         ; the output b: [1 2 3]
+(select {c: a from: t asc: b})         ; the source b: c is [3 2 1]
 ```
 
 The sort is stable: rows that tie on every sort key keep the order in which
@@ -461,6 +567,41 @@ Set a column to a constant for matching rows:
 ```lisp
 (update {price: 0 from: 'tab where: (== volume 901)})
 ```
+
+An aggregate in an update with `where:` is computed over the rows the
+`where:` keeps, as in a `select` with the same `where:`, whether it stands
+alone, inside a larger expression or inside a helper. Running functions
+(`sums`, `deltas`, `prior` and the rest) run over the whole table, as in
+[Running functions under `where:`](#running-functions-under-where), and the
+kept rows take their values. Rows the `where:` drops keep their old value
+(a new column is null there):
+
+```lisp
+(set r (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(update {s: (max score) from: r where: (== room 'A)})               ; s: [60 0Nl 60 0Nl]
+(update {s: (- score (avg score)) from: r where: (== room 'A)})     ; s: [7.5 0Nf -7.5 0Nf]
+(update {s: (sums score) from: r where: (== room 'A)})              ; s: [60 0Nl 125 0Nl]
+(update {s: (- (sums score) (max score)) from: r where: (== room 'A)}) ; s: [0 0Nl 65 0Nl]
+```
+
+The named (`from: 'r`, in place) and value (`from: r`) spellings give the
+same values.
+
+### Column types
+
+An updated column keeps its type, with or without `where:` and `by:`. A value of the column's type is stored as it is. A value of a type that widens into it without loss is stored at the column's type:
+
+- `BOOL` and `U8` widen into any wider integer or float;
+- `I16` widens into `I32`, `I64`, `F32` or `F64`;
+- `I32` widens into `I64` or `F64`;
+- `I64` widens into `F64`;
+- `F32` widens into `F64`.
+
+So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every row. Any other type is a `type` error: an `F64` value into an `I64` column, an `I64` value into an `I32` column, or an integer into a `DATE` column. Cast explicitly to store it, for example `(update {salary: (as 'I64 (* salary 1.1)) from: 't})`.
+
+Integer arithmetic yields `I64`, so to update an `I32`, `I16` or `U8` column, write the literal in the column's type, as in `(update {qty: (+ qty 1i) from: 't})`, or cast the result.
+
+A `LIST` value into a typed column is a `type` error. A `LIST` column keeps its type too: a `LIST` value is stored as it is, and an atom or a typed vector is boxed into it cell by cell, so `(update {l: [1 2 3] from: t})` gives a `LIST` of three `i64` atoms. An update of a `LIST` column with `where:` or `by:` is not supported yet (#1468). A new column takes the value's type.
 
 ### Update with Group-by
 

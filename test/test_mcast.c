@@ -42,6 +42,7 @@ typedef struct {
 static poll_thread_ctx_t g_server_ctx;
 
 static void mcast_setup(void) {
+    ray_ipc_cancel_state_reset_for_test();
     ray_runtime_create(0, NULL);
     ray_poll_t* p = ray_poll_create();
     if (p) ray_runtime_set_poll(p);
@@ -54,6 +55,9 @@ static void mcast_teardown(void) {
         ray_poll_destroy(p);
     }
     ray_runtime_destroy(__RUNTIME);
+    /* The client (this thread) and the server thread both saved and
+     * restored the process-wide cancel state; leave none behind (#1265). */
+    ray_ipc_cancel_state_reset_for_test();
 }
 
 static void sleep_ms(long ms) {

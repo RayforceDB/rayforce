@@ -1,0 +1,24 @@
+;; Call profiler fixture (test/rfl/system/profile.rfl asserts on its line
+;; numbers: keep every expression on the line it is on).
+(set prof-inc (fn [x]
+  (+ x 1)))
+(set prof-loop (fn [n]
+  (let i 0)
+  (let acc 0)
+  (while (< i n)
+    (let acc (+ acc (prof-inc i)))
+    (let i (+ i 1)))
+  acc))
+(set prof-map (fn [v]
+  (sum (map (fn [y]
+    (* y 2)) v))))
+(set prof-bad (fn [x]
+  (+ x 'a)))
+(set prof-catch (fn [x]
+  (try (prof-bad x) -1)))
+(set prof.ns.inner (fn [x]
+  (neg x)))
+(set prof-apply (fn [f x]
+  (f x)))
+(set prof-sel (fn [t]
+  (select {from: t where: (> a 1)})))

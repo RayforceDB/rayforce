@@ -1,0 +1,42 @@
+;; TIME counts milliseconds; TIMESTAMP compares by normalized time of day.
+(find (as 'TIMESPAN [5 1000000]) (as 'TIME [1])) -- [1]
+(find (as 'TIME [5 1 1]) (as 'TIMESPAN [1000000 5000000 2])) -- [1 0 0Nl]
+(set _fL (fn [x] (as 'LIST x)))
+(set _fcheck (fn [a b] (identical (find a b) (find (_fL a) (_fL b)))))
+(set _fboth (fn [a b] (and (_fcheck a b) (_fcheck b a))))
+(set _fscalar (fn [a b] (identical (find a b) (find (_fL a) b))))
+(set _fspan (as 'TIMESPAN [1000000 5 1000000 0Nl -1 86399999999999 5000000]))
+(set _ftime (as 'TIME [1 5 1 0N 2 0]))
+(set _fstamp (as 'TIMESTAMP [86400001000000 1000000 -1 0Nl 5000000 0]))
+(_fboth _fspan _ftime) -- true
+(_fboth _fspan _fstamp) -- true
+;; Both hash-size orientations, duplicates, NULLs, missing values and tails.
+(_fboth (take _fspan 70000) _ftime) -- true
+(_fboth _fspan (take _ftime 70000)) -- true
+(_fboth (take _fspan 70000) _fstamp) -- true
+(_fboth _fspan (take _fstamp 70000)) -- true
+(_fboth (as 'TIMESPAN []) (as 'TIME [1 0N])) -- true
+(_fboth (as 'TIMESPAN [0Nl]) (as 'TIMESTAMP [])) -- true
+;; Scalar output remains an I64 atom. An attached raw-count index may not
+;; answer cross-unit probes before the comparison keys have been recast.
+(_fscalar _fspan (as 'TIME 1)) -- true
+(_fscalar _fspan (as 'TIME 0N)) -- true
+(_fscalar _ftime (as 'TIMESPAN 1000000)) -- true
+(_fscalar _fstamp (as 'TIMESPAN 86399999999999)) -- true
+(identical (type (find _fspan (as 'TIME 1))) (type 0)) -- true
+(_fboth (.idx.hash _fspan) _ftime) -- true
+(_fboth (.idx.hash _ftime) _fspan) -- true
+(_fboth (.idx.hash _fstamp) _fspan) -- true
+(_fscalar (.idx.hash (as 'TIMESPAN [5 1000000 1000000])) (as 'TIME 1)) -- true
+(_fscalar (.idx.hash (as 'TIME [5 1 1])) (as 'TIMESPAN 1000000)) -- true
+;; row 0 matches by time of day only (raw 86400001000000), so a raw-count
+;; probe misses it: the first match is 0, and a payload compare would say 2
+(_fscalar (.idx.hash (as 'TIMESTAMP [86400001000000 7 1000000])) (as 'TIMESPAN 1000000)) -- true
+(find (.idx.hash (as 'TIMESTAMP [86400001000000 7 1000000])) (as 'TIMESPAN 1000000)) -- 0
+(find (as 'TIMESTAMP [86400001000000 7 1000000]) (as 'TIMESPAN 1000000)) -- 0
+(find (.idx.hash (as 'TIME [7i 5i 1i])) (as 'TIMESPAN 1000000)) -- 2
+;; Existing count/floating/DATE comparison families are unchanged.
+(_fboth _fspan [1000000 5 0Nl -1]) -- true
+(_fboth _fspan (as 'I32 [5 0N -1])) -- true
+(_fboth _fspan [1000000.0 5.0 0Nf -1.0]) -- true
+(_fboth _fspan (as 'DATE [0 5 0N])) -- true

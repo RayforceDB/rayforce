@@ -78,6 +78,13 @@ static inline ray_t* ray_group_sym_read(const ray_group_sym_view_t* view, struct
         return id >= 0 && (uint64_t)id < view->count ? view->strings[id] : NULL;
     return ray_sym_domain_str(domain, id);
 }
+/* ray_key_hash (collection.c) reading runtime symbols from `view`; sets
+ * *seen (when given) if x holds a TIMESPAN. */
+/* ray_key_hash_view's `inexact` bits: an I64 atom past ±2^53, a float atom.
+ * Both among the keys make atom_eq non-transitive (#1330). */
+#define RAY_KEY_BIG_I64 1
+#define RAY_KEY_FLOAT   2
+uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact);
 
 
 #include <stdio.h>
@@ -190,14 +197,13 @@ static inline int64_t sym_intern_safe(const char* s, size_t len) {
 }
 
 /* Result type of `deltas`: the type `-` answers between consecutive elements.
- * A difference of two TIMESTAMPs is a TIMESPAN, of two TIMEs a TIME and of two
- * DATEs an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64
- * and every other integer family I64. */
+ * A difference of two TIMESTAMPs or two TIMEs is a TIMESPAN and of two DATEs
+ * an I32 count of days; a TIMESPAN stays a TIMESPAN; floats answer F64 and
+ * every other integer family I64. */
 static inline int8_t deltas_out_type(int8_t t) {
     switch (t) {
         case RAY_F32: case RAY_F64:      return RAY_F64;
-        case RAY_TIMESTAMP: case RAY_TIMESPAN: return RAY_TIMESPAN;
-        case RAY_TIME:                   return RAY_TIME;
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_TIME: return RAY_TIMESPAN;
         case RAY_DATE:                   return RAY_I32;
         default:                         return RAY_I64;
     }
@@ -1053,6 +1059,14 @@ typedef struct {
     int8_t  term_types[AGG_LINEAR_MAX_TERMS];
     int64_t coeff_i64[AGG_LINEAR_MAX_TERMS];
     int64_t bias_i64;
+    /* The no-wrap proof of a narrow expression (#1287) read every term:
+     * pre_sum is the whole column's total, exact (it cannot leave int64),
+     * and a lone unfiltered SUM / AVG takes it without a pass. */
+    bool    pre;
+    int64_t pre_sum, pre_hi;
+    /* pre_sum also holds rows the pass summed row by row (they could wrap):
+     * the plan is the total alone, never the per-row terms */
+    bool    pre_only;
 } agg_linear_t;
 
 typedef struct {
@@ -1086,6 +1100,21 @@ typedef enum {
 
 extern uint64_t ray_expr_bail_counts[EXPR_BAIL__N];
 extern uint64_t ray_expr_compile_ok;
+/* #1287: the narrow linear / affine sum plans, by how the no-wrap proof
+ * went (diagnostic and test counters, not synchronized): proved from the
+ * types, from column metadata, by a min/max pass; refused. */
+typedef enum {
+    NARROW_SUM_TYPE, NARROW_SUM_META, NARROW_SUM_SCAN,
+    NARROW_SUM_PARTIAL,   /* the pass summed the slices it could not prove row by row */
+    NARROW_SUM_SAMPLE,    /* refused by the sample blocks, no pass */
+    NARROW_SUM_REFUSED,
+    NARROW_SUM_PRE,       /* a lone SUM / AVG took the pass's total (group.c) */
+    NARROW_SUM__N
+} narrow_sum_route_t;
+extern _Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
+#ifdef DEBUG
+extern _Atomic(uint64_t) ray_narrow_left_ranges;
+#endif
 extern bool     ray_expr_disable;
 extern bool     ray_opt_no_group_pushdown;
 extern bool     ray_join_no_build_swap;
@@ -1101,6 +1130,12 @@ extern uint64_t ray_join_nullfree_keys;
 extern bool     ray_join_no_prefilter;
 extern uint64_t ray_join_prefilter_builds;
 extern _Atomic(uint64_t) ray_join_prefilter_skips;
+/* #599: settable dispatch floor of the chained probe (.sys.join.par.min).
+ * The default is one join morsel plus one row: the split rule before #599. */
+#define RAY_JOIN_PAR_MIN_DEFAULT 8193
+int64_t  ray_join_par_min(void);
+void     ray_join_set_par_min(int64_t rows);
+extern _Atomic(uint64_t) ray_join_par_probes; /* count + fill dispatches */
 extern bool     ray_agg_engine_v2; /* route OP_GROUP through v2 agg engine; default ON (agg_engine.c) */
 void ray_expr_stats_init(void);
 
@@ -1115,7 +1150,12 @@ typedef struct {
     uint8_t src2;       /* source 2 register (0xFF for unary) */
     uint8_t null_aware; /* 1 = use sentinel-checking kernel variant */
     uint8_t u8_mod_zero; /* U8 divisor: modulo by zero yields 0 */
+    uint8_t xbar;       /* OP_MOD of an xbar: a zero or null divisor raises */
+    uint8_t xbar_guard; /* xbar under a where: AND: conjuncts (conj_reg[0..n))
+                         * written before it, whose false rows it never sees */
 } expr_ins_t;
+
+#define EXPR_MAX_CONJ 16
 
 enum { REG_SCAN = 0, REG_CONST = 1, REG_SCRATCH = 2 };
 
@@ -1126,6 +1166,13 @@ typedef struct {
     uint8_t out_reg;
     int8_t  out_type;       /* RAY_F64, RAY_I64, or RAY_BOOL */
     bool    has_parted;     /* true if any REG_SCAN refs a parted column */
+    /* An xbar instruction's row domain (borrowed g->selection, NULL: every
+     * row): a bad divisor on a row the selection drops is no error, as the
+     * builtin over the selected rows would not see it.  sel_off maps a
+     * morsel's row (segment-relative in a parted run) to the selection's. */
+    ray_t*  sel;
+    int64_t sel_off;
+    uint8_t conj_reg[EXPR_MAX_CONJ];   /* a root AND's conjuncts, in order (xbar_guard) */
     struct {
         uint8_t     kind;       /* REG_SCAN / REG_CONST / REG_SCRATCH */
         int8_t      type;       /* computational type: RAY_F64 / RAY_I64 / RAY_BOOL */
@@ -1447,10 +1494,19 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
  * (ray_col_src_bind) and reads by range.  try_linear_sumavg_input_i64 and
  * try_prod_sumavg_input_f64 read whole-column pointers: an encoded term not
  * yet materialized declines them (*err NULL). */
+/* Borrowed identity of an exact plain I64 slice, valid within one group execution. */
+typedef struct {
+    const ray_t* obj;
+    const void* base;
+    int64_t rows, lo, hi;
+} affine_bounds_t;
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
-                             bool f64_bias_ok,
+                             bool f64_bias_ok, bool defer_scan,
                              ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+bool try_affine_sumavg_pair(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                             bool f64_bias_ok, bool defer_scan, affine_bounds_t* bounds,
+                             ray_t** out_vec, agg_affine_t* out_affine, ray_t** err);
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone, bool avg,
                                  agg_linear_t* out_plan, ray_t** err);
 bool try_prod_sumavg_input_f64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                agg_prod_t* out, ray_t** err);
@@ -1505,6 +1561,10 @@ void ray_query_test_cd_gate(uint64_t* rewrite, uint64_t* slices);
  * whatever it decides — 0 the gate's, 1 the rewrite, 2 the slices.
  * Disarmed by ray_test_hooks_off. */
 void ray_query_test_cd_route(int route);
+/* query.c test hook: true turns off ray_select_impl's net (a select that
+ * answers while the pool's dispatches were cancelled answers `cancel`), so a
+ * test pins each stage's own check.  Disarmed by ray_test_hooks_off. */
+void ray_query_test_cancel_net_off(bool off);
 /* query.c test hook: the largest unordered take the rewrite's first-N pick
  * serves from its small set (CD_FIRSTN_SET_MAX); past it, every group's
  * first row is found.  Negative restores the default; disarmed by
@@ -1673,6 +1733,8 @@ ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,
                      ray_t* left_table, ray_t* right_table);
 ray_t* exec_window_join(ray_graph_t* g, ray_op_t* op,
                         ray_t* left_table, ray_t* right_table);
+ray_t* ray_join_mask(ray_t* left_table, ray_t* right_table,
+                     const int64_t* key_names, uint32_t n_keys, bool anti);
 
 /* ── group.c ── */
 ray_t* exec_reduction(ray_graph_t* g, ray_op_t* op, ray_t* input);
@@ -1778,6 +1840,8 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Serial grouping invocations that used exact boxed-I64 hashing. */
+int64_t ray_group_boxed_i64_runs(void);
 /* Monotonic count of exec_group_per_partition runs that returned their
  * result (not the concat fallback's NULL, not an error).  Tests. */
 int64_t ray_group_perpart_done(void);
@@ -1813,6 +1877,11 @@ ray_t* parted_flatten_fixed_c(ray_t* col, int64_t total, const int64_t* cnt, int
 /* Test hook: parted_flatten_fixed calls since process start (the flat
  * copies of parted columns the group fallbacks make). */
 int64_t ray_group_test_flat_copies(void);
+/* Test hook: pivots whose first / last ran over row numbers (pivot_edge_by_row,
+ * the positional route for a value column that may hold a null, #1420). */
+int64_t ray_pivot_test_by_row(void);
+/* Test hook: slots of window min / max's last SYM rank map (dense ids or hash). */
+int64_t ray_window_test_rank_slots(void);
 /* The widest SYM width class over a parted SYM column's segments (a plain
  * parted wrapper or a RAY_ENCCOL_PARTED slot), read from their headers: the
  * width a vector holding every segment's ids needs.  0 for anything else. */
@@ -1867,6 +1936,15 @@ bool ray_expr_subset_invariant(ray_graph_t* g, uint32_t root_id);
  * and materializations only?  Defined in opt.c; the correspondence
  * ray_expr_subset_invariant leaves to its caller. */
 bool filter_input_default_domain(ray_graph_t* g, uint32_t id);
+
+/* Does every node under `root_id` read only its own row or run over the
+ * whole table (a running, moving or shift function, #916)?  Defined in
+ * group.c; an aggregate, an order or distinct op, or anything else whose
+ * value depends on which rows a where: keeps answers false. */
+bool ray_group_expr_whole_table_ok(ray_graph_t* g, uint32_t root_id);
+/* Does every node under `root_id` read only its own row?  Defined in
+ * group.c (group_expr_src_syms). */
+bool ray_group_expr_rowlocal_ok(ray_graph_t* g, uint32_t root_id);
 
 /* Ordered concat-merge of two partial partition-streamed results (tables:
  * per-column concat; vectors: direct concat).  Returns an OWNED result.
@@ -2333,6 +2411,8 @@ typedef struct {
 void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
 void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+ray_t* pivot_flatten_parted(ray_t* tbl);
+ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl);
 
 /* ── embedding_exec.c ── */
 ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
@@ -2504,6 +2584,7 @@ void ray_group_winners(ray_group_winner_fn fn, void* context, const int64_t* row
     const int64_t* offsets, const int64_t* counts, int64_t groups, int64_t* winners);
 
 /* Gather winning group rows, retaining source domains and native types. */
+ray_t* ray_tbl_col_empty(ray_t* tbl, int64_t sym);
 ray_t* ray_group_gather(ray_t* column, const int64_t* rows, int64_t count);
 /* Keep a grouped key column's "may have nulls" flag only when a key value is
  * null (vectorised, pool-split scan); see agg_engine.c. */

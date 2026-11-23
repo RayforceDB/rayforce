@@ -1,12 +1,12 @@
 ;; Scalar result types and values at duration operation boundaries.
 (type (min [0Nn])) -- 'timespan
-(as 'I64 (min [0Nn])) -- 9223372036854775807
+(min [0Nn]) -- 0Nn
 (type (max [0Nn])) -- 'timespan
-(as 'I64 (max [0Nn])) -- -9223372036854775807
+(max [0Nn]) -- 0Nn
 (type (min (as 'TIMESPAN []))) -- 'timespan
-(as 'I64 (min (as 'TIMESPAN []))) -- 9223372036854775807
+(min (as 'TIMESPAN [])) -- 0Nn
 (type (max (as 'TIMESPAN []))) -- 'timespan
-(as 'I64 (max (as 'TIMESPAN []))) -- -9223372036854775807
+(max (as 'TIMESPAN [])) -- 0Nn
 (type (min [0Wn])) -- 'timespan
 (as 'I64 (min [0Wn])) -- 9223372036854775807
 (type (max [-0Wn])) -- 'timespan
@@ -77,18 +77,19 @@
 (as 'I64 (- 1D 1)) -- 86399999999999
 (type (- 1 1D)) -- 'timespan
 (as 'I64 (- 1 1D)) -- -86399999999999
-(type (+ 1D (as 'F32 1))) -- 'timespan
-(as 'I64 (+ 1D (as 'F32 1))) -- 86400000000001
+;; an F32 operand takes the float route, as F64 does (#1371)
+(type (+ 1D (as 'F32 1))) -- 'f64
+(== (+ 1D (as 'F32 1)) 86400000000001.0) -- true
 (type (+ 1D 1.0)) -- 'f64
-(+ 1D 1.0) -- 86400000000000.0
+(== (+ 1D 1.0) 86400000000001.0) -- true
 (type (* 1D 2)) -- 'timespan
 (as 'I64 (* 1D 2)) -- 172800000000000
 (type (* 2 1D)) -- 'timespan
 (as 'I64 (* 2 1D)) -- 172800000000000
-(type (* 1D (as 'F32 0.5))) -- 'timespan
-(as 'I64 (* 1D (as 'F32 0.5))) -- 86400000000000
+(type (* 1D (as 'F32 0.5))) -- 'f64
+(== (* 1D (as 'F32 0.5)) 43200000000000.0) -- true
 (type (* 1D 0.5)) -- 'f64
-(* 1D 0.5) -- 43200000000000.0
+(== (* 1D 0.5) 43200000000000.0) -- true
 (* 1D 1D) !- type
 (type (div 1D 1D)) -- 'timespan
 (as 'I64 (div 1D 1D)) -- 1

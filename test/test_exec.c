@@ -6776,37 +6776,37 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
 
     /* I64 values may round on conversion before the addition. */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, false, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_FALSE(aff.enabled);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_f, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_FALSE(aff.enabled);
     /* Small whole-number biases on a narrow type have exact row and sum
      * arithmetic; a fractional or very large bias does not. */
-    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, &vec, &aff, &err));
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_h, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     TEST_ASSERT_TRUE(aff.enabled && aff.f64 && aff.bias_f64 == 5.0);
     TEST_ASSERT_TRUE(vec && vec->type == RAY_I16);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_big, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, add_h_fraction, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     /* (ts + 5.0) is no F64 sum at all: declined either way */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, &vec, &aff, &err));
+    TEST_ASSERT_FALSE(try_affine_sumavg_input(g, tbl, ts_f, true, false, &vec, &aff, &err));
     TEST_ASSERT_NULL(err);
     /* control: (a + 5) is an integer bias on every route */
     memset(&aff, 0, sizeof aff);
-    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, &vec, &aff, &err));
+    TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, false, &vec, &aff, &err));
     TEST_ASSERT_TRUE(aff.enabled && !aff.f64 && aff.bias_i64 == 5);
     /* linear: (a * 2.0) declines, (a * 2) is planned (control) */
-    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, &lin, &err));
+    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, false, false, &lin, &err));
     TEST_ASSERT_NULL(err);
-    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, &lin, &err));
+    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, false, false, &lin, &err));
     TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 1 && lin.coeff_i64[0] == 2);
     ray_graph_free(g);
 
@@ -10663,8 +10663,8 @@ static test_result_t test_expr_binary_f64_idiv_mod(void) {
     ray_op_t* s   = ray_sum(g, d);
     ray_t* result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* idiv(7.0,3.0)=2, idiv(-7.0,3.0)=-3, idiv(10.0,3.0)=3, null → sum=2 */
-    TEST_ASSERT_EQ_I(result->i64, 2);
+    /* idiv(7.0,3.0)=2, idiv(-7.0,3.0)=-3, idiv(10.0,3.0)=3, null → sum=2.0 */
+    TEST_ASSERT_TRUE(result->f64 == 2.0);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11291,7 +11291,7 @@ static test_result_t test_expr_const_eval_branches(void) {
     ray_release(result);
     ray_graph_free(g);
 
-    /* F64 IDIV const: 10.0 // 3.0 = 3 */
+    /* F64 IDIV const: 10.0 // 3.0 = 3.0 (F64, #972) */
     g = ray_graph_new(tbl);
     col = ray_scan(g, "x");
     ray_op_t* c10f = ray_const_f64(g, 10.0);
@@ -11301,7 +11301,7 @@ static test_result_t test_expr_const_eval_branches(void) {
     s    = ray_sum(g, mul);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_EQ_I(result->i64, 3);
+    TEST_ASSERT_EQ_F(result->f64, 3.0, 1e-9);
     ray_release(result);
     ray_graph_free(g);
 
@@ -11333,8 +11333,8 @@ static test_result_t test_expr_const_eval_branches(void) {
     s    = ray_sum(g, add);
     result = ray_execute(g, s);
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    /* col=[1], idiv(10.0,3.0)=3 → 1+3 = 4 */
-    TEST_ASSERT_EQ_I(result->i64, 4);
+    /* col=[1], idiv(10.0,3.0)=3.0 → 1+3.0 = 4.0 (F64, #972) */
+    TEST_ASSERT_EQ_F(result->f64, 4.0, 1e-9);
     ray_release(result);
     ray_graph_free(g);
 
@@ -12980,11 +12980,11 @@ static test_result_t test_expr_binary_f64_all_lhs_types(void) {
         ray_op_t* a = ray_scan(g, "af");
         ray_op_t* c = ray_const_f64(g, 3.0);
         ray_op_t* op = ray_idiv(g, a, c);
-        /* ray_idiv → out_type=I64, but lhs is F64 → binary_range I64 block, lp_f64 */
+        /* ray_idiv over an F64 operand → out_type F64 (#972), F64 IDIV block */
         ray_op_t* s = ray_sum(g, op);
         ray_t* result = ray_execute(g, s);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 9);  /* 2+3+4=9 */
+        TEST_ASSERT_TRUE(result->f64 == 9.0);  /* 2+3+4=9 */
         ray_release(result);
         ray_graph_free(g);
 
@@ -13548,7 +13548,7 @@ static test_result_t test_expr_binary_range_rhs_types(void) {
             ray_release(result);
             ray_graph_free(g);
 
-            /* IDIV: floor(6/2)=3, floor(9/3)=3, floor(12/4)=3 → I64 out, lp_f64+rp_i64 in I64 IDIV */
+            /* IDIV: floor(6/2)=3, floor(9/3)=3, floor(12/4)=3 → F64 out (#972), lp_f64+rp_i64 */
             g = ray_graph_new(tbl);
             a = ray_scan(g, "lf");
             b = ray_scan(g, "ri64");
@@ -13556,7 +13556,7 @@ static test_result_t test_expr_binary_range_rhs_types(void) {
             s = ray_sum(g, op);
             result = ray_execute(g, s);
             TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-            TEST_ASSERT_EQ_I(result->i64, 9);
+            TEST_ASSERT_TRUE(result->f64 == 9.0);
             ray_release(result);
             ray_graph_free(g);
 
@@ -14407,7 +14407,7 @@ static test_result_t test_expr_binary_scalar_f64_lhs(void) {
         ray_release(result);
         ray_graph_free(g);
 
-        /* IDIV: floor(12/2)=6, floor(12/3)=4, floor(12/4)=3 → I64 out, cond7 in I64 IDIV */
+        /* IDIV: floor(12/2)=6, floor(12/3)=4, floor(12/4)=3 → F64 out (#972) */
         g = ray_graph_new(tbl);
         a = ray_const_f64(g, 12.0);
         b = ray_scan(g, "vb64");
@@ -14415,7 +14415,7 @@ static test_result_t test_expr_binary_scalar_f64_lhs(void) {
         s = ray_sum(g, op);
         result = ray_execute(g, s);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 13);
+        TEST_ASSERT_TRUE(result->f64 == 13.0);
         ray_release(result);
         ray_graph_free(g);
 
@@ -15256,14 +15256,14 @@ static test_result_t test_expr_binary_scalar_i64_lhs_all_ops(void) {
         TEST_ASSERT_EQ_F(result->f64, 27.0, 1e-9);
         ray_release(result); ray_graph_free(g);
 
-        /* IDIV: 12 idiv [2,3,4] → I64 out, l_i64 + rp_f64
+        /* IDIV: 12 idiv [2,3,4] → F64 out (#972), l_i64 + rp_f64
          * floor(12/2)=6, floor(12/3)=4, floor(12/4)=3 → sum=13 */
         g = ray_graph_new(tbl);
         a = ray_const_i64(g, 12); b = ray_scan(g, "vfd");
         op = ray_idiv(g, a, b); s = ray_sum(g, op);
         result = ray_execute(g, s);
         TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-        TEST_ASSERT_EQ_I(result->i64, 13);
+        TEST_ASSERT_TRUE(result->f64 == 13.0);
         ray_release(result); ray_graph_free(g);
 
         /* MIN2: min(3, [2,3,4]) = 2+3+3=8 */
