@@ -1,0 +1,52 @@
+;; Nine partitions cross the eight-partition merge boundary.
+;; An even number of 2^62 inputs can produce a non-null INT64_MIN partial.
+(.sys.exec "rm -rf /tmp/rfl_parted_i64_sum_partial")
+(set mk (fn [n v] (table [k x z] (list (* 0 (til n)) (+ v (* 0 (til n))) (+ 2 (* 0 (til n)))))))
+(set G (fn [t] (at (select {s: (sum x) from: t by: k}) 's)))
+(set S (fn [t] (at (select {s: (sum x) from: t}) 's)))
+(set W (mk 70002 4611686018427387904))
+(set O (mk 70003 1))
+(set Z (mk 70000 0))
+(set N (table [k x z] (list [0 0] [0N 0N] [2 2])))
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/1/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/2/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/3/hits/" N "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/4/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/5/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/6/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/7/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/8/hits/" W "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70002/9/hits/" O "/tmp/rfl_parted_i64_sum_partial/carry70002/.sym" {compress: false})
+(set Q (.db.parted.get "/tmp/rfl_parted_i64_sum_partial/carry70002/" 'hits))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z Z) N) Z) Z) Z) Z) W) O))
+(set before (at (.sys.mem) 'group-perpart-runs))
+(set gp (G Q))
+(== (- (at (.sys.mem) 'group-perpart-runs) before) 1) -- true
+(== (at gp 0) (at (G F) 0)) -- true
+(== (at gp 0) (at (S Q) 0)) -- true
+(== (at gp 0) (at (S F) 0)) -- true
+(== (at gp 0) -9223372036854705805) -- true
+(set W (mk 70001 4611686018427387904))
+(set O (mk 70003 1))
+(set Z (mk 70000 0))
+(set N (table [k x z] (list [0 0] [0N 0N] [2 2])))
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/1/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/2/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/3/hits/" N "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/4/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/5/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/6/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/7/hits/" Z "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/8/hits/" W "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_i64_sum_partial/carry70001/9/hits/" O "/tmp/rfl_parted_i64_sum_partial/carry70001/.sym" {compress: false})
+(set Q (.db.parted.get "/tmp/rfl_parted_i64_sum_partial/carry70001/" 'hits))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z Z) N) Z) Z) Z) Z) W) O))
+(set before (at (.sys.mem) 'group-perpart-runs))
+(set gp (G Q))
+(== (- (at (.sys.mem) 'group-perpart-runs) before) 1) -- true
+(== (at gp 0) (at (G F) 0)) -- true
+(== (at gp 0) (at (S Q) 0)) -- true
+(== (at gp 0) (at (S F) 0)) -- true
+(== (at gp 0) 4611686018427457907) -- true
+
+(.sys.exec "rm -rf /tmp/rfl_parted_i64_sum_partial")

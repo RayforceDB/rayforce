@@ -2202,6 +2202,26 @@ static test_result_t test_eval_temporal_int_slice(void) {
     PASS();
 }
 
+#ifdef DEBUG
+static test_result_t test_eval_narrow_left_route(void) {
+    static const struct { const char* src; int8_t type; bool typed; } cases[] = {
+        { "(- 5i [1i 8i])", RAY_I32, true }, { "(- 5h [1h 8h])", RAY_I16, true },
+        { "(+ 5i [1i 8i])", RAY_I32, true }, { "(* 5h [1h 8h])", RAY_I16, true },
+        { "(- 5h [1i 8i])", RAY_I32, false }, { "(- 5 [1i 8i])", RAY_I64, false },
+        { "(- 0Ni [1i 8i])", RAY_I32, false },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        uint64_t before = atomic_load_explicit(&ray_narrow_left_ranges, memory_order_relaxed);
+        ray_t* r = ray_eval_str(cases[k].src);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == cases[k].type, "%s: type", cases[k].src);
+        ray_release(r);
+        bool hit = atomic_load_explicit(&ray_narrow_left_ranges, memory_order_relaxed) != before;
+        TEST_ASSERT_FMT(hit == cases[k].typed, "%s: typed scalar-left route = %d", cases[k].src, hit);
+    }
+    PASS();
+}
+#endif
+
 /* The typed temporal +/- integer pass (#1302) answers the vector forms, and
  * nothing else: ray_tempint_routes moves once per vector it answers. */
 static test_result_t test_eval_temporal_int_route(void) {
@@ -13807,6 +13827,9 @@ const test_entry_t lang_entries[] = {
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
+#ifdef DEBUG
+    { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
+#endif
     { "lang/query/narrow_sum_bound_routes", test_narrow_sum_bound_routes, lang_setup, lang_teardown },
     { "lang/query/narrow_sum_bound_cancel", test_narrow_sum_bound_cancel, lang_setup, lang_teardown },
     { "lang/query/group_classifier_membership_fallback", test_query_group_classifier_membership_fallback, lang_setup, lang_teardown },

@@ -1,0 +1,33 @@
+;; A narrow arithmetic node can produce its width's null from real inputs.
+;; Check vector metadata, propagation before the final wrap, and a neighboring
+;; overflow that wraps past the sentinel but is still a number.
+(set T (table [i h] (list [2147483647i 1i] [32767h 1h])))
+(set z (at (select {from: T z: (+ i 1i)}) 'z))
+(type z) -- 'I32
+(nil? z) -- [true false]
+(nil? (at z 0)) -- true
+(at (select {from: T z: (+ (+ i 1i) 1i)}) 'z) -- [0Ni 3i]
+(at (select {from: T z: (+ i 2i)}) 'z) -- [-2147483647i 3i]
+(at (select {from: T z: (+ (+ h 1h) 1h)}) 'z) -- [0Nh 3h]
+(at (select {from: T where: (nil? (+ i 1i))}) 'i) -- [2147483647i]
+(at (update {from: T z: (+ (+ h 1h) 1h)}) 'z) -- [0Nh 3h]
+(set S (table [h i] (list [-32767h 8h] [1073741824i 1i])))
+(at (select {from: S z: (nil? (- h 1h))}) 'z) -- [true false]
+(at (select {from: S z: (nil? (* i 2i))}) 'z) -- [true false]
+;; Only the second partition generates a null; neither input is nullable.
+(.db.splayed.set "/tmp/rfl_fused_narrow_generated/1/t/" (drop T 1))
+(.db.splayed.set "/tmp/rfl_fused_narrow_generated/2/t/" (take T 1))
+(set P (.db.parted.get "/tmp/rfl_fused_narrow_generated/" 't))
+(nil? (at (select {from: P z: (+ h 1h)}) 'z)) -- [false true]
+(at (select {from: P z: (+ (+ h 1h) 1h)}) 'z) -- [3h 0Nh]
+(at (select {from: P where: (nil? (+ i 1i))}) 'i) -- [2147483647i]
+;; Compare whole-vector metadata with indexed lanes and scalar arithmetic.
+(set pz (at (select {from: P z: (- (- h -1h) -1h)}) 'z))
+(nil? pz) -- [false true]
+(map (fn [k] (nil? (at pz k))) (til 2)) -- [false true]
+(set h0 (at T 'h))
+(map (fn [k] (nil? (+ (+ (at h0 k) 1h) 1h))) (til 2)) -- [true false]
+(set iz (at (select {from: T z: (- 10i (+ i 1i))}) 'z))
+(nil? iz) -- [true false]
+(map (fn [k] (nil? (at iz k))) (til 2)) -- [true false]
+(.sys.exec "rm -rf /tmp/rfl_fused_narrow_generated/") -- 0
