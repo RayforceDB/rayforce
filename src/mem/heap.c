@@ -2958,6 +2958,12 @@ void ray_heap_init(void) {
         /* Environment belongs to the adopting thread, not the old owner. */
         heap_swap_dir(reuse->swap_path, sizeof(reuse->swap_path));
         ray_tl_heap = reuse;
+        /* Blocks of this heap freed by other threads while it was idle sat
+         * on its foreign list, which only an owner drains: take them back
+         * now, as its thread did when it left, so the adopter starts with
+         * that memory on its freelists rather than queued (and with nothing
+         * of the old owner's pending, for code that reads the list). */
+        heap_drain_foreign(reuse);
         return;
     }
 

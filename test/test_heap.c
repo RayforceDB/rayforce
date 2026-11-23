@@ -913,6 +913,37 @@ static test_result_t test_heap_abandon_is_adopted(void) {
     PASS();
 }
 
+/* Blocks freed to a heap while it is idle are taken back when a thread
+ * adopts it: the adopter starts with them on its freelists, not on its
+ * foreign list.  A test that ran threads which left their heaps, and freed
+ * their blocks after, handed the next test a heap with frees still queued
+ * (heap/cross_heap_cycle_bounds after compress/concurrent_col_index, #1553). */
+static test_result_t test_heap_adopt_drains_foreign(void) {
+    ray_heap_t* heap_a = ray_tl_heap;
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    ray_heap_t* heap_b = ray_tl_heap;
+    TEST_ASSERT_NOT_NULL(heap_b);
+    ray_t* blk = ray_alloc(4096);
+    TEST_ASSERT_NOT_NULL(blk);
+    ray_heap_abandon();
+
+    ray_tl_heap = heap_a;
+    ray_free(blk);                                   /* to heap_b, idle */
+    TEST_ASSERT_EQ_U((uintptr_t)atomic_load(&heap_b->foreign), (uintptr_t)blk);
+
+    ray_tl_heap = NULL;
+    ray_heap_init();
+    bool adopted = ray_tl_heap == heap_b;
+    bool drained = atomic_load(&heap_b->foreign) == NULL;
+    if (adopted) ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    TEST_ASSERT(adopted, "the idle heap was adopted");
+    TEST_ASSERT(drained, "its foreign list was taken back on adoption");
+    PASS();
+}
+
 /* Environment is process state, not a property of an abandoned heap.  A new
  * owner must see the same swap directory as a newly mapped heap would. */
 static test_result_t test_heap_abandon_refreshes_swap_path(void) {
@@ -6686,6 +6717,7 @@ const test_entry_t heap_entries[] = {
     { "heap/reclaim_worker_drains_owner", test_reclaim_worker_drains_owner_list, heap_setup, heap_teardown },
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
+    { "heap/adopt_drains_foreign",     test_heap_adopt_drains_foreign,   heap_setup, heap_teardown },
     { "heap/abandon_refreshes_swap_path", test_heap_abandon_refreshes_swap_path, heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
