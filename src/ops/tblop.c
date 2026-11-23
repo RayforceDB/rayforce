@@ -23,6 +23,7 @@
 
 /*  Table builtins — extracted from eval.c  */
 
+#include <stdatomic.h>
 #include "lang/format.h"
 #include "lang/internal.h"
 #include "lang/env.h"
@@ -459,6 +460,9 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
  * first / last skip nulls, so it is run over a hidden row-number column,
  * which holds none, and each cell then reads the value column at its row.
  * Flat tables only; NULL leaves the pivot to the generic route. */
+static _Atomic(int64_t) g_pivot_by_row;   /* test hook: pivots answered by pivot_edge_by_row */
+int64_t ray_pivot_test_by_row(void) { return atomic_load_explicit(&g_pivot_by_row, memory_order_relaxed); }
+
 static ray_t* pivot_edge_by_row(ray_t* tbl, ray_t* index_arg, int64_t n_idx, ray_t* pivot_col_name,
                                 ray_t* vcol, ray_t* agg_fn) {
     if (!ray_is_vec(vcol) || vcol->type == RAY_LIST || RAY_IS_PARTED(vcol->type)) return NULL;
@@ -504,6 +508,7 @@ static ray_t* pivot_edge_by_row(ray_t* tbl, ray_t* index_arg, int64_t n_idx, ray
     }
     free(cells);
     ray_release(piv);
+    if (out && !RAY_IS_ERR(out)) atomic_fetch_add_explicit(&g_pivot_by_row, 1, memory_order_relaxed);
     return out ? out : ray_error("oom", NULL);
 }
 
