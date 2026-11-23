@@ -503,6 +503,8 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 
+An `as` to I16, I32, DATE or TIME whose result is the target's minimum gives that type's null, so `(as 'I16 [-32768 32768 5])` is `[0Nh 0Nh 5]`: the minimum is the null sentinel, and an integer that wraps onto it when narrowed is null too. A float source clamps to the minimum plus one instead. See [Null Semantics in Casting](../guides/types.md#null-semantics).
+
 `guid` and `rand` draw from **different** sources on purpose:
 
 - `guid` is seeded from the OS at first use, per thread, so values are unique

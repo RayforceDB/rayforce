@@ -133,20 +133,20 @@
 (count (select {c: (count v) from: Ti16 where: (< v 32768) by: g})) -- 1
 ;; v > -32769 (one below INT16_MIN) is also a tautology
 (count (select {c: (count v) from: Ti16 where: (> v -32769) by: g})) -- 1
-;; v < -32768 matches no row (no value is smaller)
-(count (select {c: (count v) from: Ti16 where: (< v -32768) by: g})) -- 0
+;; The explicit cast produces a typed null, which orders below numbers.
+(count (select {c: (count v) from: Ti16 where: (< v -32768) by: g})) -- 1
+(set Ni16 (table [v g] (list [0Nh -1h 0h 1h 32767h] [0 0 0 0 0])))
+(count (select {c: (count v) from: Ni16 where: (< v -32768) by: g})) -- 1
 
-;; I16 SUM with full range:  -32768 + -1 + 0 + 1 + 32767 = -1
-(sum (at (select {s: (sum v) from: Ti16 where: (>= g 0) by: g}) 's)) -- -1
-;; MIN, MAX: INT16_MIN (-32768) IS NULL_I16, so a user-stored -32768
-;; round-trips as 0Nh (null).
-(min (at (select {m: (min v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- 0Nh
+;; SUM and MIN skip the null sentinel.
+(sum (at (select {s: (sum v) from: Ti16 where: (>= g 0) by: g}) 's)) -- 32767
+(min (at (select {m: (min v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- -1
 (max (at (select {m: (max v) from: Ti16 where: (>= g 0) by: g}) 'm)) -- 32767
 
 ;; I32 boundaries — same pattern.  INT32_MAX = 2147483647.
-;; v32 = -2^31 + 0 + 2^31-1 = -1 across three rows.
+;; v32 contains a typed null followed by 0 and INT32_MAX.
 (set Ti32 (table [v g] (list (as 'I32 [-2147483648 0 2147483647]) [0 0 0])))
-(sum (at (select {s: (sum v) from: Ti32 where: (>= g 0) by: g}) 's)) -- -1
+(sum (at (select {s: (sum v) from: Ti32 where: (>= g 0) by: g}) 's)) -- 2147483647
 ;; v == INT32_MAX+1 (= 2147483648) folds to 0 — out-of-range for I32
 (count (select {c: (count v) from: Ti32 where: (== v 2147483648) by: g})) -- 0
 

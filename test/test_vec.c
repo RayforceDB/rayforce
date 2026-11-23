@@ -3221,7 +3221,37 @@ static test_result_t test_vec_grow_ordinary_cow_modes(void) {
     PASS();
 }
 
+static test_result_t test_cast_unflagged_i32_temporal(void) {
+    if (ray_sym_init() != RAY_OK) FAIL("symbol setup");
+    ray_t* src = ray_vec_new(RAY_I32, 2);
+    bool ok = src && !RAY_IS_ERR(src);
+    if (ok) {
+        src->len = 2;
+        int32_t* data = ray_data(src);
+        data[0] = INT32_MIN;
+        data[1] = 5;
+        ok = !(src->attrs & RAY_ATTR_HAS_NULLS) && !ray_vec_is_null(src, 0);
+        const char* names[] = { "DATE", "TIME" };
+        const int8_t types[] = { RAY_DATE, RAY_TIME };
+        for (int i = 0; i < 2; i++) {
+            ray_t* sym = ray_sym(ray_sym_intern(names[i], 4));
+            ray_t* dst = ray_cast_fn(sym, src);
+            ok = ok && dst && !RAY_IS_ERR(dst) && dst->type == types[i] && dst->len == 2 &&
+                 (dst->attrs & RAY_ATTR_HAS_NULLS) && ray_vec_is_null(dst, 0) &&
+                 !ray_vec_is_null(dst, 1) && ((const int32_t*)ray_data(dst))[1] == 5 &&
+                 !(src->attrs & RAY_ATTR_HAS_NULLS);
+            ray_release(dst);
+            ray_release(sym);
+        }
+    }
+    ray_release(src);
+    ray_sym_destroy();
+    TEST_ASSERT_TRUE(ok);
+    PASS();
+}
+
 const test_entry_t vec_entries[] = {
+    { "vec/cast_unflagged_i32_temporal", test_cast_unflagged_i32_temporal, vec_setup, vec_teardown },
     { "vec/grow_ordinary_cow_modes", test_vec_grow_ordinary_cow_modes, vec_setup, vec_teardown },
     { "vec/grow_slice_isolation", test_vec_grow_slice_isolation, vec_setup, vec_teardown },
     { "vec/grow_slice_backing_source", test_vec_grow_slice_backing_source, vec_setup, vec_teardown },

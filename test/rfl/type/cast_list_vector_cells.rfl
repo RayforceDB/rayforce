@@ -47,14 +47,14 @@
 (as 'TIMESPAN (list [1 2])) !- type
 (as 'SYM (list ['a 'b])) !- type
 
-;; a one-element cell's null is the inner vector's own: a narrow sentinel
-;; (INT16_MIN, INT32_MIN) stays a value, as in an atom or vector cast
-(nil? (as 'I16 (list [-32768] 1))) -- [false false]
-(nil? (as 'I16 (list -32768 1))) -- [false false]
-(nil? (as 'I16 [-32768 1])) -- [false false]
+;; LIST and typed-vector casts both mark reserved narrow output sentinels.
+(nil? (as 'I16 (list [-32768] 1))) -- [true false]
+(nil? (as 'I16 (list -32768 1))) -- [true false]
+(nil? (as 'I16 [-32768 1])) -- [true false]
 (sum (as 'I16 (list [-32768] 1))) -- (sum (as 'I16 [-32768 1]))
-(nil? (as 'I32 (list [-2147483648] 1))) -- [false false]
-(nil? (as 'DATE (list [-2147483648] 1))) -- [false false]
+(nil? (as 'I32 (list [-2147483648] 1))) -- [true false]
+;; DATE uses the same bit pattern as a reserved sentinel.
+(nil? (as 'DATE (list [-2147483648] 1))) -- [true false]
 (nil? (as 'I64 (list [0Nl] 1))) -- [true false]
 (nil? (as 'I16 (list (as 'I16 [0Nh]) 1))) -- [true false]
 
@@ -82,3 +82,12 @@
 (nil? (as 'STR (list () 'a))) -- [true false]
 (as 'STR (list (list 'x))) -- ["x"]
 (as 'STR (list [1 2])) !- type
+
+;; Edges of the narrow-sentinel rule that do not change: a float source
+;; clamps to the minimum plus one, a string that parses to the minimum is a
+;; domain error, and a widening cast keeps the null.
+(as 'I16 [-32768.0 -40000.0]) -- (as 'I16 [-32767 -32767])
+(nil? (as 'I16 [-32768.0 -40000.0])) -- [false false]
+(as 'I16 ["-32768"]) !- domain
+(as 'I64 (as 'I32 [-2147483648 1])) -- [0Nl 1]
+(sum (as 'I32 [-2147483648 0 2147483647])) -- 2147483647

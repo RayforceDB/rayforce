@@ -199,7 +199,7 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
 !!! note "Coercion rules"
 
     - **One promotion table:** `+ - * div %` and the two-argument `min` and `max` take their result type from the operand types alone, the same for atoms, vectors and `select` / `update` columns, and the same with the operands swapped. The order is **b8 < u8 < i16 < i32 < i64 < f32 < f64** and the wider type wins: `(+ 2h 3i)` is i32, `(+ 1 2.0)` is f64, `(+ true 0xff)` is u8.
-    - **Same width keeps the width:** two operands of one integer type give that type, and the result wraps there as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`, `(* 50000i 50000i)` is `-1794967296`. Cast an operand first (`(* (as 'I64 x) x)`) to compute wider. A query computes the same values: `(select {r: (* x x) from: t})` over an i16 column is an i16 column. For i16, i32 and i64, the minimum value is the null sentinel, so a result that wraps exactly onto it is that null: `(+ 32767h 1h)` is `0Nh`. Vector and indexed reads agree even when neither input contains a null: `(nil? (+ [2147483647i 5i] [1i 0i]))` is `[true false]`. `fill` and aggregates treat the generated null as missing. Cast to a wider type first when a result can reach the minimum.
+    - **Same width keeps the width:** two operands of one integer type give that type, and the result wraps there as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`, `(* 50000i 50000i)` is `-1794967296`. Cast an operand first (`(* (as 'I64 x) x)`) to compute wider. A query computes the same values: `(select {r: (* x x) from: t})` over an i16 column is an i16 column. For i16, i32 and i64, the minimum value is the null sentinel, so a result that wraps exactly onto it is that null: `(+ 32767h 1h)` is `0Nh`. Vector and indexed reads agree even when neither input contains a null: `(nil? (+ [2147483647i 5i] [1i 0i]))` is `[true false]`. `fill` and aggregates treat the generated null as missing. Cast to a wider type first when a result can reach the minimum. An explicit `as` follows the same rule (see [Null Semantics in Casting](#null-semantics)).
     - **f32 op f32 → f32:** `+ - * div % min max` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with any other type, integer or f64, widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
     - **b8 with b8:** `+ - * div %` of two booleans give i64 (`(+ true true)` is `2`); `min` and `max` of two booleans give b8.
     - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
@@ -291,6 +291,24 @@ as `false`. Invalid numeric string parses raise a domain error.
 (as 'B8 [0 0Nl 1])       ; [false true true]
 (as 'U8 0Nl)             ; 0x00
 (nil? (as 'U8 0Nl))      ; false
+```
+
+A cast to I16, I32, DATE or TIME whose result is the target's minimum value
+gives that type's null, for an atom as for a vector, a list or a query column:
+the minimum is the null sentinel, never a value. This includes an integer that
+wraps onto the minimum when it is narrowed: `(as 'I16 [32768])` is `[0Nh]`.
+`nil?` reports the cell, and `fill`, `find`, `sum`, `min`, `avg` and sorting
+treat it as missing, as they treat any null. A float source does not wrap: it
+clamps to the minimum plus one. A string that parses to the minimum raises
+`domain`. Cast to a wider type when the minimum is meant as a value.
+
+```lisp
+(as 'I16 [-32768 1])                 ; [0Nh 1]
+(nil? (as 'I32 [-2147483648 1]))     ; [true false]
+(as 'I16 [32768 5])                  ; [0Nh 5]
+(sum (as 'I32 [-2147483648 0 2147483647]))  ; 2147483647
+(as 'I16 [-32768.0 -40000.0])        ; [-32767 -32767]
+(as 'I64 [-2147483648 1])            ; [-2147483648 1]
 ```
 
 ```text

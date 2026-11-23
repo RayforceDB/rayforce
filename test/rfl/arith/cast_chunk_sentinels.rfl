@@ -1,0 +1,21 @@
+;; The only I32 sentinel lands in the second 65,536-element chunk.
+;; This input is too short for parallel dispatch even with multiple workers.
+(set serial (- (til 100000) 2147563648))
+(set sn (nil? (as 'I32 serial)))
+(sum sn) -- 1
+(at sn [79999 80000 80001]) -- [false true false]
+
+;; All inputs are above the parallel threshold and have exactly one target
+;; sentinel, away from the first-element probe. Run with multiple workers
+;; to exercise worker-side detection and transfer to the output vector.
+(set pi16 (concat (take 7 200000) (concat (enlist 32768) (take 9 99999))))
+(set pl (- (til 300000) 2147683648))
+(set hn (nil? (as 'I16 pi16)))
+(set inull (nil? (as 'I32 pl)))
+(set dn (nil? (as 'DATE pl)))
+(sum hn) -- 1
+(sum inull) -- 1
+(sum dn) -- 1
+(at hn [199999 200000 200001]) -- [false true false]
+(at inull [199999 200000 200001]) -- [false true false]
+(at dn [199999 200000 200001]) -- [false true false]

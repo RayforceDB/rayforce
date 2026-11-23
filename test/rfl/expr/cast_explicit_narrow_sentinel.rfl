@@ -1,0 +1,16 @@
+;; @also-unfused
+;; Explicit casts mark an output sentinel, but leave adjacent lanes valid.
+(set C (table [x y] (list [-32768 5 -32767] [-2147483648 5 -2147483647])))
+(set R (select {from: C h: (as 'I16 x) i: (as 'I32 y) ah: (+ (as 'I16 x) 1) ai: (+ (as 'I32 y) 1)}))
+(set U (update {from: C h: (as 'I16 x) i: (as 'I32 y) ah: (+ (as 'I16 x) 1) ai: (+ (as 'I32 y) 1)}))
+(nil? (at R 'h)) -- [true false false]
+(nil? (at R 'i)) -- [true false false]
+(nil? (at U 'h)) -- [true false false]
+(nil? (at U 'i)) -- [true false false]
+(at R 'ah) -- [0Nl 6 -32766]
+(at R 'ai) -- [0Nl 6 -2147483646]
+(at U 'ah) -- [0Nl 6 -32766]
+(at U 'ai) -- [0Nl 6 -2147483646]
+(set F (table [x] (list [8 9 10])))
+(nil? (at (select {from: F h: (as 'I16 x)}) 'h)) -- [false false false]
+(nil? (at (update {from: F i: (as 'I32 x)}) 'i)) -- [false false false]

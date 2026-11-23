@@ -2051,7 +2051,8 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                                (s2 != 0xFF && out->regs[s2].null_src);
                 bool gen_null = expr_op_generates_null(op, ot, out->regs[s1].type,
                                                        s2 != 0xFF, node->out_type) ||
-                                expr_temporal_arith_cast(g, node);
+                                expr_temporal_arith_cast(g, node) ||
+                                (op == OP_CAST && (node->flags & OP_FLAG_NARROW_AS));
                 bool ins_null_aware = false;
                 bool dst_nullable   = false;
                 if (in_null) {
@@ -5240,6 +5241,18 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
      * add/sub/mul/div perf-gate kernels, so the single pass is acceptable. */
     if (out_type == RAY_F64 && expr_is_f64_unary_math(op->opcode))
         mark_f64_nonfinite_as_null(result, 0, len);
+
+    if (op->opcode == OP_CAST && (op->flags & OP_FLAG_NARROW_AS)) {
+        bool hit = false;
+        if (out_type == RAY_I16) {
+            const int16_t* data = ray_data(result);
+            for (int64_t i = 0; i < len; i++) hit |= data[i] == NULL_I16;
+        } else if (out_type == RAY_I32) {
+            const int32_t* data = ray_data(result);
+            for (int64_t i = 0; i < len; i++) hit |= data[i] == NULL_I32;
+        }
+        if (hit) result->attrs |= RAY_ATTR_HAS_NULLS;
+    }
 
     /* A temporal +/- integer wrapped onto the sentinel is a null, as the
      * builtin and the fused CAST read it (expr_temporal_arith_cast). */

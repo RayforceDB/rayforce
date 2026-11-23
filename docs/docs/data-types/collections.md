@@ -51,6 +51,8 @@ Null state is encoded in-band via a type-correct sentinel in the payload:
 and so on. `RAY_ATTR_HAS_NULLS` is a fast "may contain nulls" hint; when it is
 clear, null-aware code paths are skipped entirely.
 
+A cast keeps the hint truthful: an `as` to I16, I32, DATE or TIME whose result is the target's minimum (`INT16_MIN` or `INT32_MIN`, including an integer that wraps onto it when narrowed) gives the null and sets `RAY_ATTR_HAS_NULLS`, so vector and indexed reads agree. See [Null Semantics in Casting](../guides/types.md#null-semantics).
+
 ```c
 // C API: null state
 ray_vec_set_null(vec, 3, true);   // mark index 3 as null

@@ -2763,7 +2763,9 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                 if (it != RAY_BOOL && it != RAY_U8 && it != RAY_I16 && it != RAY_I32 &&
                     it != RAY_I64 && it != RAY_F32 && it != RAY_F64) return NULL;
             }
-            return ray_cast(g, col, tgt);
+            ray_op_t* cast = ray_cast(g, col, tgt);
+            if (cast && (tgt == RAY_I16 || tgt == RAY_I32)) cast->flags |= OP_FLAG_NARROW_AS;
+            return cast;
         }
 
         /* (within col range) — inclusive range membership.  Lowers to
