@@ -37,6 +37,17 @@
 (WFwhole (as 'F32 [0Nf 1.0 2.0 3.0 4.0 5.0 0Nf])) -- (as 'F32 [0Nf 0Nf 0Nf 3.0 3.0 5.0 5.0])
 (WLwhole (as 'DATE [0Nl 1 2 3 4 5 0Nl])) -- (as 'DATE [2 2 2 4 4 0Nl 0Nl])
 
+;; a STR or GUID null at a row other than 0 is that type's null
+(set G2 (as 'GUID (list "00000001-1111-1111-1111-111111111111" "00000002-1111-1111-1111-111111111111" "00000003-1111-1111-1111-111111111111" "00000004-1111-1111-1111-111111111111" "00000005-1111-1111-1111-111111111111" "00000006-1111-1111-1111-111111111111" "")))
+(WLwhole (as 'STR (list "x" "bb" "cc" "dd" "ee" "ff" ""))) -- (as 'STR (list "cc" "cc" "cc" "ee" "ee" "" ""))
+(nil? (WLwhole G2)) -- [false false false false false true true]
+(WLwhole G2) -- (at G2 [2 2 2 4 4 6 6])
+;; SYM results are as wide as their largest id: past 65535 ids, four bytes
+(set many (as 'SYM (map (fn [j] (format "w1443_%" j)) (til 70000))))
+(set wide (concat (at many [0 1 2 69999 69998 5]) (as 'SYM [""])))
+(WFwhole wide) -- (at wide [0 0 0 3 3 5 5])
+(WLwhole wide) -- (at wide [2 2 2 4 4 6 6])
+
 ;; a parted table is flattened, then answers as the flat one
 (.sys.exec "rm -rf /tmp/rfl_window_first_last_types") -- 0
 (set T (table [k i s d] (list K I (as 'SYM ["" "b" "c" "d" "e" "f" ""]) (as 'DATE [0Nl 1 2 3 4 5 0Nl]))))

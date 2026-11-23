@@ -717,10 +717,17 @@ static ray_t* win_gather_rows(ray_t* v, ray_t* rows) {
 
 /* first / last of a fixed-width type or SYM: the kernel's I64 (F64 for F32)
  * result back in the value's type, nulls kept.  A SYM cell is a runtime id
- * (win_read_i64), so the vector is runtime-domain. */
+ * (win_read_i64), so the vector is runtime-domain, at the width its largest
+ * id needs. */
 static ray_t* win_narrow(ray_t* r, int8_t t) {
     int64_t n = r->len;
-    ray_t* out = t == RAY_SYM ? ray_sym_vec_new(ray_sym_dict_width((int64_t)ray_sym_count()), n)
+    /* a SYM column as wide as its largest runtime id needs */
+    int64_t maxid = 0;
+    if (t == RAY_SYM) {
+        const int64_t* s = (const int64_t*)ray_data(r);
+        for (int64_t i = 0; i < n; i++) if (s[i] > maxid) maxid = s[i];
+    }
+    ray_t* out = t == RAY_SYM ? ray_sym_vec_new(ray_sym_dict_width(maxid + 1), n)
                               : ray_vec_new(t, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
@@ -1587,6 +1594,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         ray_t* cells = by_row[f] ? win_gather_rows(by_row[f], result_vecs[f])
                                  : win_narrow(result_vecs[f], fv->type);
         if (!cells || RAY_IS_ERR(cells)) {
+            if (cells) ray_error_free(cells);
             for (uint32_t j = 0; j < n_funcs; j++) {
                 ray_release(result_vecs[j]);
                 result_vecs[j] = NULL;
