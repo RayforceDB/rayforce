@@ -307,8 +307,7 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
             }
         }
     }
-    if (!found) return base == RAY_TIMESPAN
-        ? ray_timespan(want_max ? -INT64_MAX : INT64_MAX) : ray_typed_null(-base);
+    if (!found) return ray_typed_null(-base);
     if (base == RAY_F64) return make_f64(best_f);
     if (base == RAY_F32) return ray_f32((float)best_f);
     return agg_atom_i64_for_type(base, best_i);
@@ -673,7 +672,7 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
         }
         int64_t m = mx ? z.max_i : z.min_i;
         if (t == RAY_TIMESPAN)
-            return ray_timespan(z.nonnull ? m : (mx ? -INT64_MAX : INT64_MAX));
+            return z.nonnull ? ray_timespan(m) : ray_typed_null(-RAY_TIMESPAN);
         /* all-null by the non-null counts when the directory has sums */
         if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
         switch (t) {
@@ -1061,9 +1060,17 @@ ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
+            /* the null (INT64_MIN) would win a <, so it is skipped.  best stays 0Wn
+             * when no value is there or 0Wn is the least: only then is a 0Wn
+             * looked for, so the main loop stays as plain as dev's. */
             int64_t best = INT64_MAX;
             for (int64_t i = 0; i < x->len; i++)
                 if (d[i] != NULL_I64 && d[i] < best) best = d[i];
+            if (best == INT64_MAX) {
+                bool seen = false;
+                for (int64_t i = 0; i < x->len && !seen; i++) seen = d[i] == INT64_MAX;
+                if (!seen) return ray_typed_null(-RAY_TIMESPAN);
+            }
             return ray_timespan(best);
         }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
@@ -1135,10 +1142,12 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
-            int64_t best = -INT64_MAX;
+            /* the null (INT64_MIN) never wins a >: starting from it, best stays null
+             * exactly when no value is there, and -0Wn still wins */
+            int64_t best = NULL_I64;
             for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && d[i] > best) best = d[i];
-            return ray_timespan(best);
+                if (d[i] > best) best = d[i];
+            return best == NULL_I64 ? ray_typed_null(-RAY_TIMESPAN) : ray_timespan(best);
         }
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);

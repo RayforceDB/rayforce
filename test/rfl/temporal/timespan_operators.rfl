@@ -1,12 +1,12 @@
 ;; Scalar result types and values at duration operation boundaries.
 (type (min [0Nn])) -- 'timespan
-(as 'I64 (min [0Nn])) -- 9223372036854775807
+(min [0Nn]) -- 0Nn
 (type (max [0Nn])) -- 'timespan
-(as 'I64 (max [0Nn])) -- -9223372036854775807
+(max [0Nn]) -- 0Nn
 (type (min (as 'TIMESPAN []))) -- 'timespan
-(as 'I64 (min (as 'TIMESPAN []))) -- 9223372036854775807
+(min (as 'TIMESPAN [])) -- 0Nn
 (type (max (as 'TIMESPAN []))) -- 'timespan
-(as 'I64 (max (as 'TIMESPAN []))) -- -9223372036854775807
+(max (as 'TIMESPAN [])) -- 0Nn
 (type (min [0Wn])) -- 'timespan
 (as 'I64 (min [0Wn])) -- 9223372036854775807
 (type (max [-0Wn])) -- 'timespan
