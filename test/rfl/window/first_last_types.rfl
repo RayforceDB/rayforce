@@ -48,6 +48,12 @@
 (WFwhole wide) -- (at wide [0 0 0 3 3 5 5])
 (WLwhole wide) -- (at wide [2 2 2 4 4 6 6])
 
+;; a LIST column gives its cells, gathered by row number
+(set TL (table [k o v] (list [a a b] [2 1 0] (list [1 2] "x" 's))))
+(at (window {from: TL part: [k] order: [o] funcs: {x: (first v)}}) 'x) -- (list "x" "x" 's)
+(at (window {from: TL part: [k] order: [o] funcs: {x: (last v)}}) 'x) -- (list [1 2] [1 2] 's)
+(at (window {from: TL part: [k] order: [o] frame: 'running funcs: {x: (last v)}}) 'x) -- (list [1 2] "x" 's)
+
 ;; a parted table is flattened, then answers as the flat one
 (.sys.exec "rm -rf /tmp/rfl_window_first_last_types") -- 0
 (set T (table [k i s d] (list K I (as 'SYM ["" "b" "c" "d" "e" "f" ""]) (as 'DATE [0Nl 1 2 3 4 5 0Nl]))))

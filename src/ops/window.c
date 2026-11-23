@@ -715,6 +715,16 @@ static ray_t* win_gather_rows(ray_t* v, ray_t* rows) {
     return out ? out : ray_error("oom", NULL);
 }
 
+/* The types win_narrow carries back from the kernels' I64 / F64 result;
+ * any other (STR, GUID, LIST) is gathered by row number. */
+static bool win_narrow_type(int8_t t) {
+    switch (t) {
+    case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16: case RAY_BOOL: case RAY_U8:
+    case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_SYM: case RAY_F32: return true;
+    default: return false;
+    }
+}
+
 /* first / last of a fixed-width type or SYM: the kernel's I64 (F64 for F32)
  * result back in the value's type, nulls kept.  A SYM cell is a runtime id
  * (win_read_i64), so the vector is runtime-domain, at the width its largest
@@ -997,9 +1007,9 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     /* first / last keep the value's type (#1443).  The kernels below write
      * I64 or F64.  A fixed-width type (and SYM, read as runtime ids) is
-     * narrowed back from that result (win_narrow).  STR and GUID, which the
-     * kernels cannot carry, run over the rows' numbers, null where the value
-     * is, and the cells are gathered from the value column once every
+     * narrowed back from that result (win_narrow).  STR, GUID and LIST, which
+     * the kernels cannot carry, run over the rows' numbers, null where the
+     * value is, and the cells are gathered from the value column once every
      * partition is done (win_gather_rows).  by_row[f] keeps that column and
      * whether this call owns it. */
     ray_t** by_row = (ray_t**)calloc(n_funcs ? n_funcs : 1, sizeof(ray_t*) + 1);
@@ -1018,7 +1028,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         uint8_t kind = ext->window.func_kinds[f];
         ray_t* fv = func_vecs[f];
         if ((kind != RAY_WIN_FIRST_VALUE && kind != RAY_WIN_LAST_VALUE) || !fv ||
-            !ray_is_vec(fv) || (fv->type != RAY_STR && fv->type != RAY_GUID)) continue;
+            fv->type == RAY_I64 || fv->type == RAY_F64 || win_narrow_type(fv->type)) continue;
         ray_t* rows = win_row_numbers(fv, nrows);
         if (!rows || RAY_IS_ERR(rows)) {
             win_drop_by_row(by_row, by_row_owned, n_funcs);
