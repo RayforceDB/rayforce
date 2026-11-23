@@ -22241,6 +22241,194 @@ static int64_t pp_strlen_scan_sym(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_
     return -1;
 }
 
+/* Bounds [lo, hi] of the non-null values of a 64-bit integer partition
+ * segment from its metadata (a generation-0 chunk zone or zone index, a
+ * generation-2 directory), or by a scan of a segment short enough to have
+ * none.  False when unknown.  Every row null: [0, 0]. */
+static bool pp_seg_i64_bounds(ray_t* seg, int64_t* lo, int64_t* hi) {
+    if (!seg || RAY_IS_ERR(seg)) return false;
+    if (seg->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(seg);
+        if (!e) return false;
+        int64_t l = INT64_MAX, h = INT64_MIN;
+        for (int64_t c = 0; c < e->n_chunks; c++) {
+            ray_enc_chunk_stat_t st;
+            ray_enccol_chunk_stat(e, c, &st);
+            if (st.has_minmax) {
+                if (st.min < l) l = st.min;
+                if (st.max > h) h = st.max;
+            } else if ((int64_t)st.null_count < st.rows) {
+                return false;
+            }
+        }
+        if (l > h) l = h = 0;
+        *lo = l; *hi = h;
+        return true;
+    }
+    if (seg->type != RAY_I64 && seg->type != RAY_TIMESPAN && seg->type != RAY_TIMESTAMP)
+        return false;
+    if (seg->len == 0) { *lo = *hi = 0; return true; }
+    if (ray_idx_int_bounds(seg, lo, hi)) return true;
+    if (seg->len > 65536) return false;   /* no metadata: never a full pass here */
+    const int64_t* d = (const int64_t*)ray_data(seg);
+    int64_t l = INT64_MAX, h = INT64_MIN;
+    for (int64_t r = 0; r < seg->len; r++) {
+        int64_t v = d[r];
+        if (v == NULL_I64) continue;
+        l = v < l ? v : l;
+        h = v > h ? v : h;
+    }
+    if (l > h) l = h = 0;
+    *lo = l; *hi = h;
+    return true;
+}
+
+/* Bounds of a per-partition AVG input over every partition: a 64-bit
+ * column, an integer literal, or +, -, * and negation of those, each
+ * intermediate kept inside int64 (a step that could wrap is unknown: the
+ * row it wraps on can be a generated null).  False when unknown. */
+static bool pp_expr_i64_bounds(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
+                               int32_t n_parts, int depth, int64_t* lo, int64_t* hi) {
+    if (!op || depth > 8) return false;
+    switch (op->opcode) {
+    case OP_SCAN: {
+        ray_op_ext_t* x = find_ext(g, op->id);
+        if (!x) return false;
+        int64_t l = INT64_MAX, h = INT64_MIN;
+        for (int32_t p = 0; p < n_parts; p++) {
+            int64_t sl, sh;
+            if (!pp_seg_i64_bounds(ray_table_parted_seg(parted_tbl, x->sym, p), &sl, &sh)) return false;
+            l = sl < l ? sl : l;
+            h = sh > h ? sh : h;
+        }
+        if (l > h) l = h = 0;
+        *lo = l; *hi = h;
+        return true;
+    }
+    case OP_CONST: {
+        ray_op_ext_t* x = find_ext(g, op->id);
+        ray_t* lit = x ? x->literal : NULL;
+        if (!lit || RAY_IS_ERR(lit) || !ray_is_atom(lit)) return false;
+        int64_t v;
+        switch (lit->type) {
+        case -RAY_I64: v = lit->i64; if (v == NULL_I64) return false; break;
+        case -RAY_I32: v = lit->i32; if (v == NULL_I32) return false; break;
+        case -RAY_I16: v = lit->i16; if (v == NULL_I16) return false; break;
+        default: return false;
+        }
+        *lo = *hi = v;
+        return true;
+    }
+    case OP_NEG: {
+        int64_t l, h;
+        if (op->arity != 1 || !pp_expr_i64_bounds(g, op_child(g, op, 0), parted_tbl, n_parts, depth + 1, &l, &h))
+            return false;
+        if (l == INT64_MIN) return false;
+        *lo = -h; *hi = -l;
+        return true;
+    }
+    case OP_ADD: case OP_SUB: case OP_MUL: {
+        int64_t al, ah, bl, bh;
+        if (op->arity != 2 ||
+            !pp_expr_i64_bounds(g, op_child(g, op, 0), parted_tbl, n_parts, depth + 1, &al, &ah) ||
+            !pp_expr_i64_bounds(g, op_child(g, op, 1), parted_tbl, n_parts, depth + 1, &bl, &bh))
+            return false;
+        int64_t c[4];
+        bool ovf;
+        if (op->opcode == OP_ADD) {
+            ovf = __builtin_add_overflow(al, bl, &c[0]) || __builtin_add_overflow(ah, bh, &c[1]);
+            c[2] = c[0]; c[3] = c[1];
+        } else if (op->opcode == OP_SUB) {
+            ovf = __builtin_sub_overflow(al, bh, &c[0]) || __builtin_sub_overflow(ah, bl, &c[1]);
+            c[2] = c[0]; c[3] = c[1];
+        } else {
+            ovf = __builtin_mul_overflow(al, bl, &c[0]) || __builtin_mul_overflow(al, bh, &c[1]) ||
+                  __builtin_mul_overflow(ah, bl, &c[2]) || __builtin_mul_overflow(ah, bh, &c[3]);
+        }
+        if (ovf) return false;
+        int64_t l = c[0], h = c[0];
+        for (int i = 1; i < 4; i++) { l = c[i] < l ? c[i] : l; h = c[i] > h ? c[i] : h; }
+        if (l == NULL_I64) return false;   /* a row could read as the null */
+        *lo = l; *hi = h;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/* A wide AVG partial (exec_group_per_partition): each partition's group
+ * answers, per group, the wrapped I64 SUM L of the input (exact modulo
+ * 2^64), its non-null count n and its exact mean m (the engine divides
+ * the 128-bit total once, see ray_i128_to_f64).  The total T is the one
+ * value congruent to L modulo 2^64 within 2^63 of m * n: three roundings
+ * put m * n within 2^-51 |T| of T, and |T| < n 2^63, so for n < 2^40 the
+ * error stays below 2^62 and the nearest multiple of 2^64 is unique.
+ * T is rewritten as three I64 components c0 + c1 2^32 + c2 2^64 with
+ * c0, c1 in [0, 2^32): summing each component over fewer than 2^31
+ * partials cannot wrap, so the merge's plain SUM keeps the total exact,
+ * where merging L alone wraps (#1440).  The SUM column at `si` becomes
+ * c0, the mean at `mi` c1, and c2 is appended as a new last column
+ * named `hi_name` (*partp is replaced).  False, *partp possibly NULL,
+ * when the partial cannot be read or a group is too large: the caller
+ * declines and the concat path answers. */
+#define PP_WIDE_AVG_MAX_N ((int64_t)1 << 40)
+static bool pp_wide_avg_split(ray_t** partp, int64_t si, int64_t mi, int64_t ci, int64_t hi_name) {
+    ray_t* part = *partp;
+    ray_t* sc = ray_table_col_idx(part, si);
+    ray_t* mc = ray_table_col_idx(part, mi);
+    ray_t* cc = ray_table_col_idx(part, ci);
+    if (!sc || !mc || !cc || RAY_IS_ERR(sc) || RAY_IS_ERR(mc) || RAY_IS_ERR(cc)) return false;
+    if (mc->type != RAY_F64 || cc->type != RAY_I64 ||
+        (sc->type != RAY_I64 && sc->type != RAY_TIMESPAN && sc->type != RAY_TIMESTAMP))
+        return false;
+    int64_t n = sc->len;
+    if (mc->len != n || cc->len != n) return false;
+    ray_t* c0 = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    ray_t* c1 = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    ray_t* c2 = ray_vec_new(RAY_I64, n > 0 ? n : 1);
+    bool ok = c0 && c1 && c2 && !RAY_IS_ERR(c0) && !RAY_IS_ERR(c1) && !RAY_IS_ERR(c2);
+    if (ok) {
+        const int64_t* lv = (const int64_t*)ray_data(sc);
+        const double*  mv = (const double*)ray_data(mc);
+        const int64_t* nv = (const int64_t*)ray_data(cc);
+        int64_t* o0 = (int64_t*)ray_data(c0);
+        int64_t* o1 = (int64_t*)ray_data(c1);
+        int64_t* o2 = (int64_t*)ray_data(c2);
+        for (int64_t r = 0; r < n && ok; r++) {
+            uint64_t l = (uint64_t)lv[r];
+            double k = 0.0;
+            if (nv[r] > 0) {
+                double m = mv[r];
+                if (!(m == m) || nv[r] >= PP_WIDE_AVG_MAX_N) { ok = false; break; }
+                k = nearbyint((m * (double)nv[r] - (double)l) / 18446744073709551616.0);
+            } else if (l != 0) {
+                ok = false;   /* no rows, yet a total */
+                break;
+            }
+            o0[r] = (int64_t)(l & 0xffffffffu);
+            o1[r] = (int64_t)(l >> 32);
+            o2[r] = (int64_t)k;   /* |k| < 2^39 */
+        }
+    }
+    if (ok) {
+        c0->len = c1->len = c2->len = n;
+        ray_table_set_col_idx(part, si, c0);
+        ray_table_set_col_idx(part, mi, c1);
+        part = ray_table_add_col(part, hi_name, c2);
+        if (!part || RAY_IS_ERR(part)) {
+            if (part) ray_error_free(part);
+            part = NULL;
+            ok = false;
+        }
+        *partp = part;
+    }
+    if (c0 && !RAY_IS_ERR(c0)) ray_release(c0); else if (c0) ray_error_free(c0);
+    if (c1 && !RAY_IS_ERR(c1)) ray_release(c1); else if (c1) ray_error_free(c1);
+    if (c2 && !RAY_IS_ERR(c2)) ray_release(c2); else if (c2) ray_error_free(c2);
+    return ok;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -22300,7 +22488,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
                  aop == OP_VAR || aop == OP_VAR_POP) n_std++;
     }
-    uint32_t part_n_aggs_max = n_aggs + n_avg + 2 * n_std + 1;   /* + the first-row slot */
+    /* + the first-row slot, + two hidden slots per wide AVG (pp_wide_avg_split) */
+    uint32_t part_n_aggs_max = n_aggs + 3 * n_avg + 2 * n_std + 1;
 
     size_t key_n = n_keys ? n_keys : 1;             /* min-1 guarded */
     size_t agg_n = n_aggs ? n_aggs : 1;
@@ -22341,6 +22530,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     uint8_t*  std_cnt_slot = scratch_alloc(&std_cnt_slot_hdr, agg_n * sizeof(uint8_t));
     ray_t* cnt_nn_hdr = NULL;   /* per count slot (AVG's, then STDDEV/VAR's): counts non-nulls */
     uint8_t*  cnt_nn       = scratch_alloc(&cnt_nn_hdr,       agg_n * sizeof(uint8_t));
+    /* per AVG: its first hidden slot (the mean; the next one the high
+     * word), 0 when the AVG is not wide (see pp_wide_avg_split) */
+    ray_t* wide_slot_hdr = NULL;
+    uint32_t* wide_slot    = scratch_alloc(&wide_slot_hdr,    2 * agg_n * sizeof(uint32_t));
+    uint32_t* wide_hi      = wide_slot ? wide_slot + agg_n : NULL;   /* its high-word slot */
+    uint32_t  n_wide = 0;
 
     /* decomposed per-partition/merge slot carves (sized part_n_aggs_max) */
     ray_t *part_ops_hdr = NULL, *merge_ops_hdr = NULL, *part_agg_syms_hdr = NULL,
@@ -22360,7 +22555,7 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                                         (key_n + pna_n) * sizeof(int64_t));
 
     if (!mc_sym_ids || !pk_syms || !pkeys || !mkeys || !avg_idx || !std_idx ||
-        !std_orig_op || !std_sq_slot || !std_cnt_slot || !cnt_nn || !part_ops ||
+        !std_orig_op || !std_sq_slot || !std_cnt_slot || !cnt_nn || !wide_slot || !part_ops ||
         !merge_ops || !part_agg_syms || !part_needs_sq || !agg_name_ids ||
         !pagg_ins || !magg_ins || !unique_agg || !mcol_names)
         goto pp_cleanup;
@@ -22553,12 +22748,55 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         }
     }
 
+    /* A wide AVG (a 64-bit integer input, whose SUM partial can wrap):
+     * a hidden partition slot, its mean, and a merge slot for the high
+     * word, which pp_wide_avg_split builds with the SUM partial into the
+     * three components of the exact total.  Each merges as a SUM. */
+    for (uint32_t i = 0; i < n_avg; i++) {
+        uint32_t a = avg_idx[i];
+        wide_slot[i] = 0;
+        int8_t t = 0;
+        if (agg_is_expr[a]) {
+            ray_op_t* in = op_node(g, ext->agg_ins[a]);
+            if (in && in->opcode != OP_STRLEN) t = in->out_type;
+        } else {
+            ray_col_meta_t am;
+            if (ray_table_col_meta(parted_tbl, agg_syms[a], &am) && RAY_IS_PARTED(am.type))
+                t = (int8_t)RAY_PARTED_BASETYPE(am.type);
+        }
+        if (t != RAY_I64 && t != RAY_TIMESPAN && t != RAY_TIMESTAMP) continue;
+        /* Bounded rows cannot wrap a total of any rows of the table: the
+         * plain SUM partial is exact, and the AVG keeps its two slots. */
+        int64_t blo, bhi, bm, bt;
+        if (pp_expr_i64_bounds(g, op_node(g, ext->agg_ins[a]), parted_tbl, n_parts, 0, &blo, &bhi)) {
+            bm = blo == INT64_MIN ? INT64_MAX : (blo < 0 ? -blo : blo);
+            bm = bhi > bm ? bhi : bm;
+            int64_t rows = ray_table_nrows(parted_tbl);
+            if (rows >= 0 && !__builtin_mul_overflow(bm, rows, &bt)) continue;
+        }
+        wide_slot[i] = part_n_aggs;
+        part_agg_syms[part_n_aggs] = agg_syms[a];
+        part_ops[part_n_aggs++] = OP_AVG;
+        n_wide++;
+    }
+    /* The high words last: the partition's group does not compute them
+     * (pp_wide_avg_split appends each column), only the merge sums them. */
+    for (uint32_t i = 0; i < n_avg; i++) {
+        if (!wide_slot[i]) continue;
+        wide_hi[i] = part_n_aggs;
+        part_agg_syms[part_n_aggs] = agg_syms[avg_idx[i]];
+        part_ops[part_n_aggs++] = OP_SUM;
+    }
+    uint32_t part_n_exec = part_n_aggs - n_wide;   /* slots the partition's group computes */
+
     /* Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX,
      * FIRST→FIRST, LAST→LAST, all appended slots → SUM */
     for (uint32_t a = 0; a < part_n_aggs; a++) {
         merge_ops[a] = part_ops[a];
         if (merge_ops[a] == OP_COUNT) merge_ops[a] = OP_SUM;
     }
+    for (uint32_t i = 0; i < n_avg; i++)
+        if (wide_slot[i]) merge_ops[wide_slot[i]] = merge_ops[wide_hi[i]] = OP_SUM;
 
     /* Agg input syms for the decomposed ops.
      * AVG's COUNT uses same input column as the AVG itself.
@@ -22922,8 +23160,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!pagg_ins[cs]) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
             }
 
+            /* A wide AVG's hidden slots read the SUM slot's input. */
+            for (uint32_t j = 0; j < n_avg; j++)
+                if (wide_slot[j]) pagg_ins[wide_slot[j]] = pagg_ins[avg_idx[j]];
+
             ray_op_t* proot = ray_group(pg, pkeys, n_part_keys,
-                                       part_ops, pagg_ins, part_n_aggs);
+                                       part_ops, pagg_ins, part_n_exec);
             proot = ray_optimize(pg, proot);
 
             /* Pushed-down WHERE: translate this partition's global survivor
@@ -22967,6 +23209,14 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 bp[bi] = empty;
                 if (bp[bi] && RAY_IS_ERR(bp[bi])) { ray_error_free(bp[bi]); bp[bi] = NULL; }
                 if (!bp[bi]) goto batch_fail;
+            }
+            for (uint32_t j = 0; j < n_avg; j++) {   /* in slot order: appends wide_hi[j] */
+                if (!wide_slot[j]) continue;
+                int64_t pk = (int64_t)n_part_keys;
+                if (ray_table_ncols(bp[bi]) != pk + wide_hi[j] ||
+                    !pp_wide_avg_split(&bp[bi], pk + avg_idx[j], pk + wide_slot[j],
+                                       pk + n_aggs + n_std + j, mcol_names[n_keys + wide_hi[j]]))
+                    goto batch_fail;
             }
             if (ref_bi < 0) ref_bi = bi;   /* first built partial in this batch */
 
@@ -23413,6 +23663,33 @@ batch_fail:
 
                 double* out = (double*)ray_data(avg_col);
                 const int64_t* cv = (const int64_t*)ray_data(cnt_col);
+                if (wide_slot[avg_i]) {
+                    /* the exact total from its merged components */
+                    ray_t* c1 = ray_table_col_idx(result, (int64_t)n_keys + wide_slot[avg_i]);
+                    ray_t* c2 = ray_table_col_idx(result, (int64_t)n_keys + wide_hi[avg_i]);
+                    if (!c1 || !c2 || RAY_IS_ERR(c1) || RAY_IS_ERR(c2) ||
+                        sum_col->type != RAY_I64 || c1->type != RAY_I64 || c2->type != RAY_I64 ||
+                        c1->len != nrows || c2->len != nrows) {
+                        ray_release(avg_col); ray_release(trimmed); ray_release(result);
+                        if (merge_tbl) ray_release(merge_tbl);
+                        goto pp_cleanup;
+                    }
+                    const int64_t* v0 = (const int64_t*)ray_data(sum_col);
+                    const int64_t* v1 = (const int64_t*)ray_data(c1);
+                    const int64_t* v2 = (const int64_t*)ray_data(c2);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        if (cv[r] <= 0) { out[r] = NULL_F64; ray_vec_set_null(avg_col, r, true); continue; }
+                        int64_t th = v2[r];
+                        uint64_t tl = 0;
+                        ray_i128_add128(&th, &tl, (int64_t)((uint64_t)v1[r] >> 32), (uint64_t)v1[r] << 32);
+                        ray_i128_add(&th, &tl, v0[r]);
+                        out[r] = ray_f64_fin(ray_i128_to_f64(th, tl) / (double)cv[r]);
+                    }
+                    grp_finalize_nulls(avg_col);
+                    trimmed = ray_table_add_col(trimmed, nm, avg_col);
+                    ray_release(avg_col);
+                    continue;
+                }
                 bool sum_f64 = sum_col->type == RAY_F64;
                 const double*  svf = (const double*)ray_data(sum_col);
                 const int64_t* svi = (const int64_t*)ray_data(sum_col);
@@ -23567,6 +23844,7 @@ pp_cleanup:
     scratch_free(std_sq_slot_hdr);
     scratch_free(std_cnt_slot_hdr);
     scratch_free(cnt_nn_hdr);
+    scratch_free(wide_slot_hdr);
     scratch_free(part_ops_hdr);
     scratch_free(merge_ops_hdr);
     scratch_free(part_agg_syms_hdr);
