@@ -72,8 +72,9 @@ up to 2^53 nanoseconds (about 104 days) per value.
 
 Inside a query the same functions give the same answers, nulls included.
 
-On empty or all-null duration vectors, `min` returns `0Wn` and `max`
-returns `-0Wn`.
+On empty or all-null duration vectors, `min` and `max` return `0Nn`, as
+every other type returns its null; this holds inside a query too, for a
+group with no non-null value.
 
 F64 and F32 operands promote duration addition, subtraction,
 multiplication and `%` to F64 nanosecond arithmetic: `(+ 0D00:00:00.000000010 2.5e)` is

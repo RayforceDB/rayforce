@@ -1077,8 +1077,8 @@
 (set TNc (table [k v] (list ['a 'b 'a] [1 2 3])))
 ;; desc:c on a result that does NOT have a 'c' agg col (only 's') →
 ;; match returns false; planner falls through to the post-sort+take path,
-;; which then fails because 'c' is not a known column → nyi.
-(count (select {s: (sum v) by: k from: TNc desc: c take: 2})) !- nyi
+;; which then reports that sort key 'c' is not available to this SELECT.
+(count (select {s: (sum v) by: k from: TNc desc: c take: 2})) !- schema
 ;; Valid match: desc:s with a sum alias 's'.
 (count (select {s: (sum v) by: k from: TNc desc: s take: 2})) -- 2
 

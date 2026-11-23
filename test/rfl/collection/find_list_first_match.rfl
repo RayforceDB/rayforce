@@ -1,0 +1,25 @@
+;; #1394: first-match parity on small lists that stay on the scan.
+;; Preserve the first equal row, including nontransitive numeric equality.
+(set h (list [7] [7] (as 'TIMESTAMP 86400001000000) (as 'TIME 1) 9007199254740993 9007199254740992 0Nl (list [5i])))
+(set n (list [7] (as 'TIMESPAN 1000000) 9007199254740992.0 9007199254740992 0Ni (list (as 'TIMESPAN [5])) [9] 'missing))
+(find h (take n 7)) -- [0 2 4 5 6 7 0Nl]
+(find h n) -- [0 2 4 5 6 7 0Nl 0Nl]
+(find h (concat n (list [7]))) -- [0 2 4 5 6 7 0Nl 0Nl 0]
+(find (reverse h) n) -- [6 4 2 2 1 0 0Nl 0Nl]
+(find (list 9007199254740993 9007199254740992 0Nl 0Ni [7] (list [7]) (list [7]) "s") (list 9007199254740992.0 9007199254740992 0Ni [7] (list [7]) "s" 's [0])) -- [0 1 2 4 5 7 0Nl 0Nl]
+;; Equal cells must stay in order; an earlier hit wins outright.
+(set h (list [7] [1] [2] [3] 9007199254740993 9007199254740992 [7] [8] [8] [9] [10] [11] [12] [13] [14] [15] [16] [17] [18] [19] [20]))
+(find h (list [7] 9007199254740992.0 9007199254740992 [8] [21] [9] [10] [11])) -- [0 4 5 7 0Nl 9 10 11]
+
+;; Seventeen unresolved LIST needles after 256 rows justify hashing the suffix.
+;; The symbol prevents map output packing into a typed vector.
+;; Duplicate equal suffix rows; TIMESPAN on only one operand at a time.
+(set padding (map (fn [x] (enlist x)) (til 512)))
+(set ts (as 'TIMESTAMP 86400001000000))
+(set span (as 'TIMESPAN 1000000))
+(set h (concat (concat padding (list ts ts)) padding))
+(set n (concat (map (fn [x] span) (til 16)) (list 'missing)))
+(find h n) -- [512 512 512 512 512 512 512 512 512 512 512 512 512 512 512 512 0Nl]
+(set h (concat (concat padding (list span span)) padding))
+(set n (concat (map (fn [x] ts) (til 16)) (list 'missing)))
+(find h n) -- [512 512 512 512 512 512 512 512 512 512 512 512 512 512 512 512 0Nl]

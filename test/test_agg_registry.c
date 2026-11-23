@@ -521,6 +521,51 @@ static test_result_t test_topn_botn_f64(void) {
     PASS();
 }
 
+/* A parted TIMESPAN column reaches min/max through agg_parted_minmax: with no
+ * non-null value in any partition (one missing) the answer is 0Nn, as for every
+ * other type (#1419); a value in one partition is the answer, -0Wn included. */
+static ray_t* timespan_seg(const int64_t* xs, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_TIMESPAN, n);
+    if (!v || RAY_IS_ERR(v)) return NULL;
+    v->len = n;
+    memcpy(ray_data(v), xs, (size_t)n * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++) if (xs[i] == NULL_I64) ray_vec_set_null(v, i, true);
+    return v;
+}
+static ray_t* parted_of(ray_t** segs, int64_t k) {
+    ray_t* p = ray_alloc((size_t)k * sizeof(ray_t*));
+    if (!p) return NULL;
+    p->type = RAY_PARTED_BASE + RAY_TIMESPAN; p->len = k; p->attrs = 0; memset(p->aux, 0, 16);
+    memcpy(ray_data(p), segs, (size_t)k * sizeof(ray_t*));
+    return p;
+}
+static test_result_t test_parted_timespan_minmax_null(void) {
+    ray_heap_init();
+    (void)ray_sym_init();
+    int64_t nulls[] = { NULL_I64, NULL_I64 };
+    int64_t some[] = { NULL_I64, -INT64_MAX, 7 };
+    ray_t* none[] = { timespan_seg(nulls, 2), NULL, timespan_seg(nulls, 1) };
+    ray_t* mixed[] = { timespan_seg(nulls, 2), timespan_seg(some, 3) };
+    ray_t* p = parted_of(none, 3);
+    ray_t* q = parted_of(mixed, 2);
+    TEST_ASSERT_TRUE(p && q && RAY_IS_PARTED(p->type));
+    for (int m = 0; m < 2; m++) {
+        ray_t* r = m ? ray_max_fn(p) : ray_min_fn(p);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        TEST_ASSERT_EQ_I(r->type, -RAY_TIMESPAN);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(r));
+        ray_release(r);
+        r = m ? ray_max_fn(q) : ray_min_fn(q);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_TIMESPAN && !RAY_ATOM_IS_NULL(r));
+        TEST_ASSERT_EQ_I(r->i64, m ? 7 : -INT64_MAX);
+        ray_release(r);
+    }
+    ray_release(p); ray_release(q);
+    ray_sym_destroy();
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t agg_registry_entries[] = {
     { "agg_registry/sum_i64_matches_reduction", test_sum_i64_matches_reduction, NULL, NULL },
     { "agg_registry/minmax_count_i64_match", test_minmax_count_i64_match, NULL, NULL },
@@ -533,5 +578,6 @@ const test_entry_t agg_registry_entries[] = {
     { "agg_registry/median", test_median, NULL, NULL },
     { "agg_registry/topn_botn_i64", test_topn_botn_i64, NULL, NULL },
     { "agg_registry/topn_botn_f64", test_topn_botn_f64, NULL, NULL },
+    { "agg_registry/parted_timespan_minmax_null", test_parted_timespan_minmax_null, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };

@@ -307,8 +307,7 @@ static ray_t* agg_parted_minmax(ray_t* x, int want_max) {
             }
         }
     }
-    if (!found) return base == RAY_TIMESPAN
-        ? ray_timespan(want_max ? -INT64_MAX : INT64_MAX) : ray_typed_null(-base);
+    if (!found) return ray_typed_null(-base);
     if (base == RAY_F64) return make_f64(best_f);
     if (base == RAY_F32) return ray_f32((float)best_f);
     return agg_atom_i64_for_type(base, best_i);
@@ -574,14 +573,17 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
         break;
     default: break;
     }
-    bool elem_type = t == RAY_SYM || t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
+    /* first / last of a column reference are positional for every type, as
+     * over the vector (#1420) */
+    bool elem_type = t == RAY_SYM || t == RAY_I64 || t == RAY_F64 || t == RAY_F32 ||
+                     t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
                      t == RAY_BOOL || t == RAY_U8 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     if (!r) {
         if (op == OP_COUNT) {
             r = make_i64(src.len);
         } else if (edge && elem_type) {
             r = ray_reduce_src_elem(&src, op == OP_LAST);
-            if (!r) {                                 /* SYM / STR / GUID: the column's own element */
+            if (!r) {                                 /* SYM / STR / GUID / TIMESPAN: the column's own element */
                 ray_col_src_release(&src);
                 ray_retain(x);                        /* materialize consumes one reference */
                 ray_t* v = ray_lazy_materialize(x);
@@ -673,7 +675,7 @@ static ray_t* dir_answer(ray_enccol_t* e, uint16_t opcode) {
         }
         int64_t m = mx ? z.max_i : z.min_i;
         if (t == RAY_TIMESPAN)
-            return ray_timespan(z.nonnull ? m : (mx ? -INT64_MAX : INT64_MAX));
+            return z.nonnull ? ray_timespan(m) : ray_typed_null(-RAY_TIMESPAN);
         /* all-null by the non-null counts when the directory has sums */
         if (have_aggs ? z.nonnull == 0 : m == (mx ? INT64_MIN : INT64_MAX)) return ray_typed_null(-t);
         switch (t) {
@@ -1061,9 +1063,17 @@ ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
+            /* the null (INT64_MIN) would win a <, so it is skipped.  best stays 0Wn
+             * when no value is there or 0Wn is the least: only then is a 0Wn
+             * looked for, so the main loop stays as plain as dev's. */
             int64_t best = INT64_MAX;
             for (int64_t i = 0; i < x->len; i++)
                 if (d[i] != NULL_I64 && d[i] < best) best = d[i];
+            if (best == INT64_MAX) {
+                bool seen = false;
+                for (int64_t i = 0; i < x->len && !seen; i++) seen = d[i] == INT64_MAX;
+                if (!seen) return ray_typed_null(-RAY_TIMESPAN);
+            }
             return ray_timespan(best);
         }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
@@ -1135,10 +1145,12 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
-            int64_t best = -INT64_MAX;
+            /* the null (INT64_MIN) never wins a >: starting from it, best stays null
+             * exactly when no value is there, and -0Wn still wins */
+            int64_t best = NULL_I64;
             for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && d[i] > best) best = d[i];
-            return ray_timespan(best);
+                if (d[i] > best) best = d[i];
+            return best == NULL_I64 ? ray_typed_null(-RAY_TIMESPAN) : ray_timespan(best);
         }
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);
@@ -1198,8 +1210,55 @@ ray_t* ray_max_fn(ray_t* x) {
     return has_float ? make_f64(fmax) : make_i64(imax);
 }
 
+/* Whether a lazy value is known to hold no null: a chain of ops that only
+ * reorder or drop cells (asc, desc, reverse, distinct) over a literal or a
+ * table column without nulls.  Then the DAG's first / last, which skip nulls,
+ * take the positional cell, and the first(asc) -> min idiom still applies. */
+static bool lazy_null_free(ray_t* x) {
+    if (!x || x->type != RAY_LAZY) return false;
+    ray_graph_t* g = RAY_LAZY_GRAPH(x);
+    ray_op_t* op = RAY_LAZY_OP(x);
+    if (!g || !op) return false;
+    while (op && (op->opcode == OP_ASC || op->opcode == OP_DESC ||
+                  op->opcode == OP_REVERSE || op->opcode == OP_DISTINCT))
+        op = op->arity >= 1 ? op_child(g, op, 0) : NULL;
+    if (!op) return false;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return false;
+    if (op->opcode == OP_CONST)
+        return ext->literal && ray_is_vec(ext->literal) && ext->literal->type != RAY_LIST &&
+               !ray_vec_has_nulls(ext->literal);
+    if (op->opcode == OP_SCAN) {
+        uint16_t stored = 0;
+        memcpy(&stored, op->pad, sizeof(uint16_t));
+        ray_t* tbl = stored > 0 ? (g->tables && (uint16_t)(stored - 1) < g->n_tables ? g->tables[stored - 1] : NULL)
+                                : g->table;
+        ray_col_meta_t m;
+        if (!tbl || !ray_table_col_meta(tbl, ext->sym, &m)) return false;
+        if (!ray_is_vector_type(m.type) || m.type == RAY_LIST) return false;
+        return !ray_table_col_has_nulls(tbl, ext->sym);
+    }
+    return false;
+}
+
+/* first / last of a lazy value, positional (#1420): a column reference reads
+ * its row; a chain known to hold no null keeps the DAG op (and its idioms);
+ * anything else is materialized and its cell taken. */
+static ray_t* edge_of_lazy(ray_t* x, bool last) {
+    bool done;
+    ray_t* r = colref_answer(x, last ? OP_LAST : OP_FIRST, &done);
+    if (done) return r;
+    if (lazy_null_free(x)) return ray_lazy_append(x, last ? OP_LAST : OP_FIRST);
+    ray_retain(x);                                     /* materialize consumes one reference */
+    ray_t* v = ray_lazy_materialize(x);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    r = last ? ray_last_fn(v) : ray_first_fn(v);
+    ray_release(v);
+    return r;
+}
+
 ray_t* ray_first_fn(ray_t* x) {
-    if (ray_is_lazy(x)) AGG_LAZY(x, OP_FIRST);
+    if (ray_is_lazy(x)) return edge_of_lazy(x, false);
     /* String first: return first char */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
         size_t slen = ray_str_len(x);
@@ -1218,17 +1277,10 @@ ray_t* ray_first_fn(ray_t* x) {
     }
     if (ray_is_vec(x)) {
         if (ray_len(x) == 0) return ray_typed_null(-x->type);
-        /* For non-I64/F64 types route through collection_elem which
-         * preserves the element type.  The DAG path widens to i64 for
-         * DATE/TIME/TIMESTAMP/BOOL/U8 — bypass it. */
-        if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
-            x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
-            x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
-            int alloc = 0;
-            return collection_elem(x, 0, &alloc);
-        }
-        AGG_VEC_VIA_DAG(x, ray_first);
+        /* A direct call is positional for every type, nulls included (#1420):
+         * inside a select the query's own first/last skips them (#1368). */
+        int alloc = 0;
+        return collection_elem(x, 0, &alloc);
     }
     if (!is_list(x)) return ray_error("type", "first: unsupported type %s", ray_type_name(x->type));
     if (ray_len(x) == 0) return ray_typed_null(-RAY_I64);
@@ -1238,7 +1290,7 @@ ray_t* ray_first_fn(ray_t* x) {
 }
 
 ray_t* ray_last_fn(ray_t* x) {
-    if (ray_is_lazy(x)) AGG_LAZY(x, OP_LAST);
+    if (ray_is_lazy(x)) return edge_of_lazy(x, true);
     /* String last: return last char */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
         size_t slen = ray_str_len(x);
@@ -1258,15 +1310,9 @@ ray_t* ray_last_fn(ray_t* x) {
     }
     if (ray_is_vec(x)) {
         if (ray_len(x) == 0) return ray_typed_null(-x->type);
-        /* See ray_first_fn for rationale on the type whitelist. */
-        if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
-            x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
-            x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
-            int alloc = 0;
-            return collection_elem(x, ray_len(x) - 1, &alloc);
-        }
-        AGG_VEC_VIA_DAG(x, ray_last);
+        /* Positional for every type: see ray_first_fn. */
+        int alloc = 0;
+        return collection_elem(x, ray_len(x) - 1, &alloc);
     }
     if (!is_list(x)) return ray_error("type", "last: unsupported type %s", ray_type_name(x->type));
     int64_t len = ray_len(x);

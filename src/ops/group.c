@@ -5389,7 +5389,8 @@ ray_t* exec_reduction_src(ray_graph_t* g, ray_op_t* op, ray_col_src_t* src) {
  * collection_elem: row 0 (len - 1) itself, nulls included. */
 ray_t* ray_reduce_src_elem(ray_col_src_t* src, bool last) {
     int8_t t = src->type;
-    if (!(t == RAY_I32 || t == RAY_I16 || t == RAY_BOOL || t == RAY_U8 ||
+    if (!(t == RAY_I64 || t == RAY_F64 || t == RAY_F32 ||
+          t == RAY_I32 || t == RAY_I16 || t == RAY_BOOL || t == RAY_U8 ||
           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP)) return NULL;
     if ((t == RAY_BOOL || t == RAY_U8) && src->may_null) return NULL;
     return reduce_src_edge(src, last, false);

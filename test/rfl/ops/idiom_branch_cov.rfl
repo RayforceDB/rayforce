@@ -103,7 +103,7 @@
 ;; Exercises scan_source_col line 96 (tbl not null) and line 126
 ;; returning false because RAY_ATTR_HAS_NULLS is set.
 (set TAN (table [v] (list [5 0Nl 3 0Nl 1])))
-(first (asc (at TAN 'v))) -- 1
+(first (asc (at TAN 'v))) -- 0Nl
 (last  (asc (at TAN 'v))) -- 5
 (count (distinct (at TAN 'v))) -- 4
 (distinct (at TAN 'v)) -- [0N 1 3 5]
@@ -122,7 +122,7 @@
 ;; ──────────────────────────────────────────────────────────────────────
 ;; OP_CONST with a vector literal (already covered in idiom.rfl).
 ;; OP_CONST with null-bearing vector: precondition returns false.
-(first (asc [10 0Nl 20 0Nl 30])) -- 10
+(first (asc [10 0Nl 20 0Nl 30])) -- 0Nl
 (last  (asc [10 0Nl 20 0Nl 30])) -- 30
 
 ;; OP_CONST null-free F64 vector — precondition returns true
@@ -318,7 +318,7 @@
 (set TN (table [k v] (list ['a 'a 'a 'b 'b] [1 0Nl 3 0Nl 5])))
 
 ;; first/last(asc) on null-bearing scan column — precondition false → slow path
-(first (asc (at TN 'v))) -- 1
+(first (asc (at TN 'v))) -- 0Nl
 (last  (asc (at TN 'v))) -- 5
 
 ;; count-based idioms work fine in select-by with nulls

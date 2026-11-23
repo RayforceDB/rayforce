@@ -23,6 +23,7 @@
 
 /*  Table builtins — extracted from eval.c  */
 
+#include <stdatomic.h>
 #include "lang/format.h"
 #include "lang/internal.h"
 #include "lang/env.h"
@@ -117,15 +118,15 @@ static bool pivot_dag_key_ok(int8_t t) {
  * calls the builtin per cell: its result type, or its own error (sum over
  * SYM, DATE, GUID or LIST is a `type` error).
  *
- * OP_PIVOT's first/last skip nulls; the builtin does so only for I64, F64
- * and F32, so a column of another nullable type that may hold a null takes
- * the generic route (the HAS_NULLS flag for the fixed-width types, a scan
- * for SYM, whose null is id 0 and carries no flag). */
+ * OP_PIVOT's first/last skip nulls; the builtin is positional for every
+ * type (#1420), so a column that may hold a null takes the generic route
+ * (the HAS_NULLS flag for the fixed-width types, a scan for SYM, whose null
+ * is id 0 and carries no flag). */
 static bool pivot_dag_agg_ok(uint16_t op, ray_t* v) {
     int8_t t = v->type;
     if ((op == OP_FIRST || op == OP_LAST) &&
-        (t == RAY_I16 || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
-         t == RAY_TIMESTAMP || t == RAY_TIMESPAN || t == RAY_SYM) &&
+        (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64 ||
+         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN || t == RAY_SYM) &&
         (t == RAY_SYM ? ray_vec_has_nulls(v) : ray_vec_may_have_nulls(v)))
         return false;
     switch (t) {
@@ -452,6 +453,66 @@ static __attribute__((noinline)) ray_t* pivot_fb_value_cols(ray_t* result, ray_t
 
 /* (pivot table index_col pivot_col value_col agg_fn) — pivot table */
 static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
+                            ray_t* value_col_name, ray_t* agg_fn);
+
+/* pivot's first / last of a value column that may hold a null are positional
+ * (#1420): each cell's first (last) row, a null included.  OP_PIVOT's own
+ * first / last skip nulls, so it is run over a hidden row-number column,
+ * which holds none, and each cell then reads the value column at its row.
+ * Flat tables only; NULL leaves the pivot to the generic route. */
+static _Atomic(int64_t) g_pivot_by_row;   /* test hook: pivots answered by pivot_edge_by_row */
+int64_t ray_pivot_test_by_row(void) { return atomic_load_explicit(&g_pivot_by_row, memory_order_relaxed); }
+
+static ray_t* pivot_edge_by_row(ray_t* tbl, ray_t* index_arg, int64_t n_idx, ray_t* pivot_col_name,
+                                ray_t* vcol, ray_t* agg_fn) {
+    if (!ray_is_vec(vcol) || vcol->type == RAY_LIST || RAY_IS_PARTED(vcol->type)) return NULL;
+    int64_t nc = ray_table_ncols(tbl), nrows = ray_table_nrows(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_col_idx(tbl, c);
+        if (!col || RAY_IS_ERR(col) || !ray_is_vec(col) || RAY_IS_PARTED(col->type)) return NULL;
+    }
+    int64_t row_sym = ray_sym_intern(" pivot row", 10);         /* no column name a user writes */
+    ray_t* rows = ray_vec_new(RAY_I64, nrows);
+    if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+    rows->len = nrows;
+    for (int64_t r = 0; r < nrows; r++) ((int64_t*)ray_data(rows))[r] = r;
+    ray_t* t2 = ray_table_new(nc + 1);
+    for (int64_t c = 0; c < nc && t2 && !RAY_IS_ERR(t2); c++)
+        t2 = ray_table_add_col(t2, ray_table_col_name(tbl, c), ray_table_col_idx(tbl, c));
+    if (t2 && !RAY_IS_ERR(t2)) t2 = ray_table_add_col(t2, row_sym, rows);
+    ray_release(rows);
+    if (!t2 || RAY_IS_ERR(t2)) return t2 ? t2 : ray_error("oom", NULL);
+    ray_t* rs = ray_sym(row_sym);
+    ray_t* piv = rs && !RAY_IS_ERR(rs) ? pivot_fn_impl(t2, index_arg, pivot_col_name, rs, agg_fn) : rs;
+    if (rs && !RAY_IS_ERR(rs)) ray_release(rs);
+    ray_release(t2);
+    if (!piv || RAY_IS_ERR(piv)) return piv ? piv : ray_error("oom", NULL);
+    int64_t pn = ray_table_ncols(piv), np = ray_table_nrows(piv);
+    ray_t* out = ray_table_new(pn);
+    ray_t** cells = np > 0 ? (ray_t**)calloc((size_t)np, sizeof(ray_t*)) : NULL;
+    if (np > 0 && !cells) { ray_release(piv); ray_release(out); return ray_error("oom", NULL); }
+    for (int64_t c = 0; c < pn && out && !RAY_IS_ERR(out); c++) {
+        ray_t* col = ray_table_col_idx(piv, c);
+        if (c < n_idx) { out = ray_table_add_col(out, ray_table_col_name(piv, c), col); continue; }
+        const int64_t* ix = (const int64_t*)ray_data(col);
+        for (int64_t r = 0; r < np; r++) {
+            int alloc = 0;
+            cells[r] = ray_vec_is_null(col, r) ? NULL : collection_elem(vcol, ix[r], &alloc);
+            if (cells[r] && !alloc) ray_retain(cells[r]);
+        }
+        ray_t* vc = pivot_cells_col(cells, np);
+        for (int64_t r = 0; r < np; r++) if (cells[r]) { ray_release(cells[r]); cells[r] = NULL; }
+        if (!vc || RAY_IS_ERR(vc)) { ray_release(out); out = vc ? vc : ray_error("oom", NULL); break; }
+        out = ray_table_add_col(out, ray_table_col_name(piv, c), vc);
+        ray_release(vc);
+    }
+    free(cells);
+    ray_release(piv);
+    if (out && !RAY_IS_ERR(out)) atomic_fetch_add_explicit(&g_pivot_by_row, 1, memory_order_relaxed);
+    return out ? out : ray_error("oom", NULL);
+}
+
+static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
                             ray_t* value_col_name, ray_t* agg_fn) {
 
     if (tbl->type != RAY_TABLE)
@@ -560,6 +621,13 @@ static ray_t* pivot_fn_impl(ray_t* tbl, ray_t* index_arg, ray_t* pivot_col_name,
                   pivot_dag_agg_ok(agg_op, vcol);
     for (int64_t i = 0; i < n_idx && dag_ok; i++)
         if (!pivot_dag_key_ok(icols[i]->type)) dag_ok = false;
+    if (!dag_ok && (agg_op == OP_FIRST || agg_op == OP_LAST) && pivot_dag_key_ok(pcol->type)) {
+        bool keys_ok = true;
+        for (int64_t i = 0; i < n_idx && keys_ok; i++)
+            if (!pivot_dag_key_ok(icols[i]->type)) keys_ok = false;
+        ray_t* by_row = keys_ok ? pivot_edge_by_row(tbl, index_arg, n_idx, pivot_col_name, vcol, agg_fn) : NULL;
+        if (by_row) { scratch_free(ic_hdr); return by_row; }
+    }
 
     if (dag_ok) {
         ray_graph_t* g = ray_graph_new(tbl);

@@ -1913,13 +1913,15 @@ static ray_t* sum_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
     (void)a; (void)param;
     return ray_timespan(((const sum_i64_state*)s)->sum);
 }
+/* A group with no non-null value is null, as for every other type (#1419). */
 static bool ext_timespan_value(const void* s, void* dst) {
-    *(int64_t*)dst = ((const ext_i64_state*)s)->v;
-    return false;
+    const ext_i64_state* st = s;
+    *(int64_t*)dst = st->cnt ? st->v : NULL_I64;
+    return !st->cnt;
 }
 static ray_t* ext_timespan_final(const void* s, acc_arena_t* a, int64_t param) {
-    (void)a; (void)param;
-    return ray_timespan(((const ext_i64_state*)s)->v);
+    (void)a; (void)param; const ext_i64_state* st = s;
+    return st->cnt ? ray_timespan(st->v) : ray_typed_null(-RAY_TIMESPAN);
 }
 static const agg_vtable_t SUM_TIMESPAN = {
     .state_size = sizeof(sum_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
@@ -1931,13 +1933,9 @@ static const agg_vtable_t MIN_TIMESPAN = {
     .init = min_i64_init, .update_batch = min_timestamp_native_update,
     .merge = min_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
 };
-static void max_timespan_init(void* s) {
-    max_i64_init(s);
-    ((ext_i64_state*)s)->v = -INT64_MAX;
-}
 static const agg_vtable_t MAX_TIMESPAN = {
     .state_size = sizeof(ext_i64_state), .kind = ACC_STREAMING, .out_type = RAY_TIMESPAN,
-    .init = max_timespan_init, .update_batch = max_timestamp_native_update,
+    .init = max_i64_init, .update_batch = max_timestamp_native_update,
     .merge = max_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
 };
 

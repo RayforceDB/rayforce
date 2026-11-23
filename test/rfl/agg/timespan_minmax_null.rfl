@@ -1,0 +1,54 @@
+;; min and max of a TIMESPAN with no non-null value are 0Nn, as every other type answers its null (#1419).
+;; Every route agrees: the builtin, by:, a filtered keyless select, parted and encoded storage.
+
+(min (as 'TIMESPAN [0Nl])) -- 0Nn
+(max (as 'TIMESPAN [0Nl])) -- 0Nn
+(min (as 'TIMESPAN [0Nl 0Nl])) -- 0Nn
+(max (as 'TIMESPAN [0Nl 0Nl])) -- 0Nn
+(min (as 'TIMESPAN [])) -- 0Nn
+(max (as 'TIMESPAN [])) -- 0Nn
+(min [0Nl]) -- 0Nl
+;; One non-null value is the answer, endpoints included.
+(min (as 'TIMESPAN [0Nl 5])) -- 0D00:00:00.000000005
+(max (as 'TIMESPAN [0Nl 5])) -- 0D00:00:00.000000005
+(min [0Nn -0Wn 0Wn]) -- -0Wn
+(max [0Nn -0Wn 0Wn]) -- 0Wn
+(max [0Nn -0Wn]) -- -0Wn
+(min [0Nn 0Wn]) -- 0Wn
+
+(set T (table [g v] (list [a a b] [0Nn 0Nn 3D])))
+(at (select {from:T by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [0Nn 3D]
+(at (select {from:T by:g lo:(min v) hi:(max v) asc:g}) 'hi) -- [0Nn 3D]
+(at (select {from:T lo:(min v) hi:(max v) where:(== g 'a)}) 'lo) -- [0Nn]
+(at (select {from:T lo:(min v) hi:(max v) where:(== g 'a)}) 'hi) -- [0Nn]
+
+;; A real endpoint beside an all-null group keeps its value.
+(set E (table [g v] (list [a a b b] [0Wn -0Wn 0Nn 0Nn])))
+(at (select {from:E by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [-0Wn 0Nn]
+(at (select {from:E by:g lo:(min v) hi:(max v) asc:g}) 'hi) -- [0Wn 0Nn]
+;; Many rows: the grouped route merges partial states; groups 2..6 are all null.
+(set n 300000)
+(set G (table [g v] (list (% (til n) 7) (as 'TIMESPAN (* (til n) (at [1 1 0N 0N 0N 0N 0N] (% (til n) 7)))))))
+(at (select {from:G by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [0D00:00:00.000000000 0D00:00:00.000000001 0Nn 0Nn 0Nn 0Nn 0Nn]
+(at (select {from:G by:g hi:(max v) asc:g}) 'hi) -- [0D00:00:00.000299999 0D00:00:00.000299993 0Nn 0Nn 0Nn 0Nn 0Nn]
+
+;; Parted: no partition holds a non-null value.
+(.sys.exec "rm -rf /tmp/rfl_timespan_minmax_null") -- 0
+(.db.splayed.set "/tmp/rfl_timespan_minmax_null/1/t/" (table [v] (list [0Nn 0Nn])))
+(.db.splayed.set "/tmp/rfl_timespan_minmax_null/2/t/" (table [v] (list [0Nn])))
+(set P (.db.parted.get "/tmp/rfl_timespan_minmax_null/" 't))
+(min (at P 'v)) -- 0Nn
+(max (at P 'v)) -- 0Nn
+(.db.splayed.set "/tmp/rfl_timespan_minmax_null/3/t/" (table [v] (list [0Nn 2D 0Nn])))
+(set P (.db.parted.get "/tmp/rfl_timespan_minmax_null/" 't))
+(min (at P 'v)) -- 2D
+(max (at P 'v)) -- 2D
+(.sys.exec "rm -rf /tmp/rfl_timespan_minmax_null") -- 0
+
+;; Encoded storage answers from its chunk zones: an all-null column has no non-null chunk.
+(.sys.exec "rm -rf /tmp/rfl_timespan_minmax_zone") -- 0
+(.db.splayed.set "/tmp/rfl_timespan_minmax_zone" (table [v] (list [0Nn 0Nn 0Nn])) {compress:true})
+(set Z (.db.splayed.get "/tmp/rfl_timespan_minmax_zone"))
+(min (at Z 'v)) -- 0Nn
+(max (at Z 'v)) -- 0Nn
+(.sys.exec "rm -rf /tmp/rfl_timespan_minmax_zone") -- 0

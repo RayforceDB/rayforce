@@ -128,10 +128,13 @@
 
 ;; ─── OP_FIRST / OP_LAST on null-bearing vectors (short-circuit + null skip) ──
 ;; OP_FIRST on vec with leading null skips it; hits the `has_nulls` check.
-(first (as 'I64 [0N 2 3])) -- 2
-(last  (as 'I64 [1 2 0N])) -- 2
-(first (as 'F64 [0N 2.5 3.5])) -- 2.5
-(last  (as 'F64 [1.5 2.5 0N])) -- 2.5
+;; A select reaches the op; the builtin outside one is positional (#1420).
+(at (select {f: (first v) from: (table [v] (list (as 'I64 [0N 2 3])))}) 'f) -- [2]
+(at (select {l: (last v) from: (table [v] (list (as 'I64 [1 2 0N])))}) 'l) -- [2]
+(at (select {f: (first v) from: (table [v] (list (as 'F64 [0N 2.5 3.5])))}) 'f) -- [2.5]
+(at (select {l: (last v) from: (table [v] (list (as 'F64 [1.5 2.5 0N])))}) 'l) -- [2.5]
+(first (as 'I64 [0N 2 3])) -- 0Nl
+(last  (as 'F64 [1.5 2.5 0N])) -- 0Nf
 
 ;; ─── OP_FIRST / OP_LAST on all-null vector (returns typed null) ───────
 ;; The short-circuit inner loop finds no valid row → returns typed null.

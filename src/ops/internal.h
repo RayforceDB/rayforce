@@ -1874,6 +1874,11 @@ ray_t* parted_flatten_fixed_c(ray_t* col, int64_t total, const int64_t* cnt, int
 /* Test hook: parted_flatten_fixed calls since process start (the flat
  * copies of parted columns the group fallbacks make). */
 int64_t ray_group_test_flat_copies(void);
+/* Test hook: pivots whose first / last ran over row numbers (pivot_edge_by_row,
+ * the positional route for a value column that may hold a null, #1420). */
+int64_t ray_pivot_test_by_row(void);
+/* Test hook: slots of window min / max's last SYM rank map (dense ids or hash). */
+int64_t ray_window_test_rank_slots(void);
 /* The widest SYM width class over a parted SYM column's segments (a plain
  * parted wrapper or a RAY_ENCCOL_PARTED slot), read from their headers: the
  * width a vector holding every segment's ids needs.  0 for anything else. */

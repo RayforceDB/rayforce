@@ -2106,17 +2106,24 @@ uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view
 }
 
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
-int ray_key_spans(ray_t* x) {
+enum { KEY_SPAN_WALK_FLOAT = 8 };
+static int key_span_flags(ray_t* x, bool track_float) {
     if (!x) return 0;
-    if (x->type < 0) return x->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
+    if (x->type < 0) {
+        if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
+        return track_float && (x->type == -RAY_F64 || x->type == -RAY_F32) ? KEY_SPAN_WALK_FLOAT : 0;
+    }
     if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
     int spans = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
+        for (int64_t i = 0; i < x->len && (spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
             ray_t* c = cells[i];
-            if (c && c->type < 0) spans |= c->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
-            else spans |= ray_key_spans(c);
+            if (c && c->type < 0) {
+                int type = c->type;
+                if (type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
+                else if (track_float && (type == -RAY_F64 || type == -RAY_F32)) spans |= KEY_SPAN_WALK_FLOAT;
+            } else spans |= key_span_flags(c, track_float);
         }
     } else if (x->type == RAY_TABLE) {
         /* atom_eq compares a table's columns (a dict's keys and values)
@@ -2127,15 +2134,17 @@ int ray_key_spans(ray_t* x) {
         for (int64_t c = 0; c < ray_table_ncols(x) && !spans; c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            spans |= ray_key_spans(col);
+            spans |= key_span_flags(col, false);
         }
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     } else if (x->type == RAY_DICT) {
-        spans = ray_key_spans(ray_dict_keys(x)) | ray_key_spans(ray_dict_vals(x));
+        spans = key_span_flags(ray_dict_keys(x), false) | key_span_flags(ray_dict_vals(x), false);
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     }
     return spans;
 }
+
+int ray_key_spans(ray_t* x) { return key_span_flags(x, false); }
 
 /* ── LIST cell sets ──────────────────────────────────────────────────
  * distinct, in, except, sect and union over LIST operands decide with
@@ -2501,7 +2510,11 @@ ray_t* ray_distinct_fn(ray_t* x) {
     if (len * len >= LIST_SET_MIN_PAIRS) {
         /* A cell is new when no cell kept so far equals it. */
         list_set_t s;
-        if (!list_set_init(&s, out, len, ray_key_spans(x))) {
+        /* Detect floats only where key_hash propagates exact mode. Still
+         * detect TIMESPAN inside tables and dicts for their span hash. */
+        int flags = key_span_flags(x, true);
+        int mode = flags == 0 ? RAY_KEY_EXACT_INT : flags & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
+        if (!list_set_init(&s, out, len, mode)) {
             result->len = 0;
             ray_release(result);
             if (_bx) ray_release(_bx);
@@ -4760,6 +4773,65 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                     else out[i] = row;
                 }
                 hashset_destroy(&hs);
+            }
+        } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen >= 8 && vec->len >= 16) {
+            ray_t** cells = ray_data(vec);
+            ray_t** needles = ray_data(val);
+            /* Start with enough rows to catch cheap hits. Grow the window only
+             * for unresolved needles, and pay for a hash build only after
+             * spending roughly four comparisons per remaining haystack cell. */
+            int64_t prefix = 0, limit = 16, unresolved = vlen;
+            uint64_t compared = 0;
+            /* A dense needle batch can pay for building the whole set. */
+            bool dense = vlen >= vec->len;
+            if (dense) for (int64_t j = 0; j < vlen; j++) out[j] = NULL_I64;
+            while (!dense && unresolved >= 8 && prefix < vec->len) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (prefix != 0 && out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < limit && !atom_eq(cells[i], needles[j])) i++;
+                    compared += (uint64_t)(i - prefix) + (i < limit);
+                    out[j] = i < limit ? i : NULL_I64;
+                    unresolved -= i < limit;
+                }
+                prefix = limit;
+                int64_t left = vec->len - prefix;
+                if (compared / 4 >= (uint64_t)left) break;
+                limit += limit < left ? limit : left;
+            }
+            int64_t suffix = vec->len - prefix;
+            if (unresolved >= 8 && suffix >= 8 && (dense || compared / 4 >= (uint64_t)suffix)) {
+                list_set_t set;
+                int spans = ray_key_spans(vec) | ray_key_spans(val);
+                if (!list_set_init(&set, cells + prefix, suffix, spans)) {
+                    ray_release(result);
+                    return ray_error("oom", NULL);
+                }
+                /* Prepend every cell in reverse to probe in haystack order. */
+                for (int64_t i = suffix; i-- > 0;)
+                    list_set_add(&set, i, ray_key_hash(set.cells[i], spans));
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    ray_t* needle = needles[j];
+                    uint64_t h = ray_key_hash(needle, spans);
+                    for (uint64_t at = h & set.mask; set.head[at] >= 0; at = (at + 1) & set.mask) {
+                        if (set.hash[at] != h) continue;
+                        for (int64_t i = set.head[at]; i >= 0; i = set.next[i]) {
+                            if (atom_eq(set.cells[i], needle)) { out[j] = prefix + i; break; }
+                        }
+                        break;
+                    }
+                    if (out[j] == NULL_I64) any_null = true;
+                }
+                list_set_destroy(&set);
+            } else if (unresolved) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < vec->len && !atom_eq(cells[i], needles[j])) i++;
+                    if (i < vec->len) out[j] = i;
+                    else any_null = true;
+                }
             }
         } else {
             /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
