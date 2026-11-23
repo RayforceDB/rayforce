@@ -283,12 +283,12 @@ Query `concat` joins text row by row when an operand comes from a source column,
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `distinct` | unary | — | Remove duplicates, keeping each value at its first occurrence, in the order the values first appear, for every type; a null is kept once | `(distinct [3 1 3 2])` → `[3 1 2]` |
+| `distinct` | unary | — | Remove duplicates, keeping each value at its first occurrence, in the order the values first appear, for every type, list cells included; a null is kept once; `-0.0` equals `0.0` in float vector cells, as between atoms | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | — | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | — | Negated membership test | `(not-in 2 [1 3])` → `true` |
-| `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
-| `union` | binary | — | Set union (deduplicated) | `(union [1 2] [2 3])` → `[1 2 3]` |
-| `sect` | binary | — | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
+| `except` | binary | — | Elements of A not in B. Not a set: the duplicates of A are kept | `(except [1 1 2 3] [3])` → `[1 1 2]` |
+| `union` | binary | — | Set union: distinct elements of the left operand, then those of the right it lacks, in order of first appearance | `(union [1 2] [2 3])` → `[1 2 3]` |
+| `sect` | binary | — | Elements of A that are also in B. Not a set: the duplicates of A are kept | `(sect [1 1 2 2 3] [1 2])` → `[1 1 2 2]` |
 | `take` | binary | — | Take first N elements (negative N takes from end); past the length it cycles. A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] -5)` → `[2 3 1 2 3]` |
 | `drop` | binary | — | Drop first N elements (negative N drops from end) | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | — | Rotate left by N positions (negative rotates right) | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
@@ -339,8 +339,14 @@ Query `concat` joins text row by row when an operand comes from a source column,
 
 ; Set operations
 (union [1 2 3] [3 4 5])   ; [1 2 3 4 5]
+(union [1 1 2] [2 3 3])   ; [1 2 3]    a set: duplicates go, from either operand
 (sect [1 2 3] [2 3 4])    ; [2 3]
+(sect [1 1 2 2] [1 2])    ; [1 1 2 2]  keeps the duplicates of the left operand
 (except [1 2 3] [2])      ; [1 3]
+(except [1 1 2] [3])      ; [1 1 2]    keeps the duplicates of the left operand
+
+; union is the only one of the three that returns a set: use (distinct (sect a b))
+; or (distinct (except a b)) when a set is wanted from the other two.
 
 ; Time-series vector helpers
 (deltas [10 15 13])       ; [0Nl 5 -2]

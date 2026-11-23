@@ -13,6 +13,8 @@
 (set TS (as 'TIMESPAN [1 2]))
 (set I32 (as 'I32 [1 2]))
 (set Z (fn [xs] (concat xs (at xs (* 0 (til 64))))))
+;; a union is a set (#1385): for list operands it is the distinct of the concatenation, in order of first appearance
+(set UD (fn [a b] (identical (union a b) (distinct (concat a b)))))
 
 ;; rule 1: numeric atoms of different types meet through f64
 (distinct (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3)) -- (list 1 2 3)
@@ -26,9 +28,9 @@
 (sect (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (list 1.0 (as 'I16 2))) -- (list 1 1.0 1i 2 2e true 0x02)
 (sect (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (Z (list 1.0 (as 'I16 2)))) -- (list 1 1.0 1i 2 2e true 0x02)
 (sect (list 1.0 (as 'I16 2)) (Z (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3))) -- (list 1.0 2h)
-(union (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (list 1.0 (as 'I16 2))) -- (list 1 1.0 1i 2 2e true 0x02 3)
-(union (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (Z (list 1.0 (as 'I16 2)))) -- (list 1 1.0 1i 2 2e true 0x02 3)
-(union (list 1.0 (as 'I16 2)) (Z (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3))) -- (list 1.0 2h 3)
+(UD (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (list 1.0 (as 'I16 2))) -- true
+(UD (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (Z (list 1.0 (as 'I16 2)))) -- true
+(UD (list 1.0 (as 'I16 2)) (Z (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3))) -- true
 ;; rule 2: numeric vector cells need the same type
 (distinct (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1])) -- (list [1 2] [1i 2i] [1.0 2.0] [1h 2h] [2 1])
 (distinct (Z (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]))) -- (list [1 2] [1i 2i] [1.0 2.0] [1h 2h] [2 1])
@@ -41,9 +43,9 @@
 (sect (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (list I32 [2.0 1.0])) -- (list [1i 2i])
 (sect (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (Z (list I32 [2.0 1.0]))) -- (list [1i 2i])
 (sect (list I32 [2.0 1.0]) (Z (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]))) -- (list [1i 2i])
-(union (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (list I32 [2.0 1.0])) -- (list [1 2] [1i 2i] [1.0 2.0] [1 2] [1h 2h] [2 1] [2.0 1.0])
-(union (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (Z (list I32 [2.0 1.0]))) -- (list [1 2] [1i 2i] [1.0 2.0] [1 2] [1h 2h] [2 1] [2.0 1.0])
-(union (list I32 [2.0 1.0]) (Z (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]))) -- (list [1i 2i] [2.0 1.0] [1 2] [1.0 2.0] [1h 2h] [2 1])
+(UD (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (list I32 [2.0 1.0])) -- true
+(UD (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]) (Z (list I32 [2.0 1.0]))) -- true
+(UD (list I32 [2.0 1.0]) (Z (list [1 2] I32 [1.0 2.0] [1 2] (as 'I16 [1 2]) [2 1]))) -- true
 ;; rule 3: a TIMESPAN vector meets a numeric vector element by element
 (distinct (list TS [1 2] [1 3] (as 'TIMESPAN [1 3]))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 3])
 (distinct (Z (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 3])
@@ -56,9 +58,9 @@
 (sect (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (list [1 2])) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
 (sect (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (Z (list [1 2]))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
 (sect (list [1 2]) (Z (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])))) -- (list [1 2])
-(union (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (list [1 2])) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1 3] [0D00:00:00.000000001 0D00:00:00.000000003])
-(union (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (Z (list [1 2]))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1 3] [0D00:00:00.000000001 0D00:00:00.000000003])
-(union (list [1 2]) (Z (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])))) -- (list [1 2] [1 3])
+(UD (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (list [1 2])) -- true
+(UD (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])) (Z (list [1 2]))) -- true
+(UD (list [1 2]) (Z (list TS [1 2] [1 3] (as 'TIMESPAN [1 3])))) -- true
 ;; rule 3b: not transitive, TIMESPAN first
 (distinct (list TS [1 2] I32)) -- (list [0D00:00:00.000000001 0D00:00:00.000000002])
 (distinct (Z (list TS [1 2] I32))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002])
@@ -71,9 +73,9 @@
 (sect (list TS [1 2] I32) (list [1 2] I32)) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1i 2i])
 (sect (list TS [1 2] I32) (Z (list [1 2] I32))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1i 2i])
 (sect (list [1 2] I32) (Z (list TS [1 2] I32))) -- (list [1 2] [1i 2i])
-(union (list TS [1 2] I32) (list [1 2] I32)) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1i 2i])
-(union (list TS [1 2] I32) (Z (list [1 2] I32))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002] [1 2] [1i 2i])
-(union (list [1 2] I32) (Z (list TS [1 2] I32))) -- (list [1 2] [1i 2i])
+(UD (list TS [1 2] I32) (list [1 2] I32)) -- true
+(UD (list TS [1 2] I32) (Z (list [1 2] I32))) -- true
+(UD (list [1 2] I32) (Z (list TS [1 2] I32))) -- true
 ;; rule 3b: not transitive, I64 first
 (distinct (list [1 2] TS I32)) -- (list [1 2] [1i 2i])
 (distinct (Z (list [1 2] TS I32))) -- (list [1 2] [1i 2i])
@@ -86,9 +88,9 @@
 (sect (list [1 2] TS I32) (list TS)) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002] [1i 2i])
 (sect (list [1 2] TS I32) (Z (list TS))) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002] [1i 2i])
 (sect (list TS) (Z (list [1 2] TS I32))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002])
-(union (list [1 2] TS I32) (list TS)) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002] [1i 2i])
-(union (list [1 2] TS I32) (Z (list TS))) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002] [1i 2i])
-(union (list TS) (Z (list [1 2] TS I32))) -- (list [0D00:00:00.000000001 0D00:00:00.000000002])
+(UD (list [1 2] TS I32) (list TS)) -- true
+(UD (list [1 2] TS I32) (Z (list TS))) -- true
+(UD (list TS) (Z (list [1 2] TS I32))) -- true
 ;; rule 3b: not transitive, I32 first
 (distinct (list I32 [1 2] TS)) -- (list [1i 2i] [1 2])
 (distinct (Z (list I32 [1 2] TS))) -- (list [1i 2i] [1 2])
@@ -101,9 +103,9 @@
 (sect (list I32 [1 2] TS) (list [1 2])) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002])
 (sect (list I32 [1 2] TS) (Z (list [1 2]))) -- (list [1 2] [0D00:00:00.000000001 0D00:00:00.000000002])
 (sect (list [1 2]) (Z (list I32 [1 2] TS))) -- (list [1 2])
-(union (list I32 [1 2] TS) (list [1 2])) -- (list [1i 2i] [1 2] [0D00:00:00.000000001 0D00:00:00.000000002])
-(union (list I32 [1 2] TS) (Z (list [1 2]))) -- (list [1i 2i] [1 2] [0D00:00:00.000000001 0D00:00:00.000000002])
-(union (list [1 2]) (Z (list I32 [1 2] TS))) -- (list [1 2] [1i 2i])
+(UD (list I32 [1 2] TS) (list [1 2])) -- true
+(UD (list I32 [1 2] TS) (Z (list [1 2]))) -- true
+(UD (list [1 2]) (Z (list I32 [1 2] TS))) -- true
 ;; rule 3b: not transitive, I32 then TIMESPAN then I64
 (distinct (list I32 TS [1 2])) -- (list [1i 2i] [1 2])
 (distinct (Z (list I32 TS [1 2]))) -- (list [1i 2i] [1 2])
@@ -116,9 +118,9 @@
 (sect (list I32 TS [1 2]) (list I32 TS)) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
 (sect (list I32 TS [1 2]) (Z (list I32 TS))) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
 (sect (list I32 TS) (Z (list I32 TS [1 2]))) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002])
-(union (list I32 TS [1 2]) (list I32 TS)) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
-(union (list I32 TS [1 2]) (Z (list I32 TS))) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002] [1 2])
-(union (list I32 TS) (Z (list I32 TS [1 2]))) -- (list [1i 2i] [0D00:00:00.000000001 0D00:00:00.000000002])
+(UD (list I32 TS [1 2]) (list I32 TS)) -- true
+(UD (list I32 TS [1 2]) (Z (list I32 TS))) -- true
+(UD (list I32 TS) (Z (list I32 TS [1 2]))) -- true
 ;; rule 4: SYM cells compare by text across domains and widths
 (distinct (list N W (reverse M3) [a b d] M3 [a b])) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "d")) (as 'SYM (list "c" "b" "a")) (as 'SYM (list "a" "b")))
 (distinct (Z (list N W (reverse M3) [a b d] M3 [a b]))) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "d")) (as 'SYM (list "c" "b" "a")) (as 'SYM (list "a" "b")))
@@ -131,9 +133,9 @@
 (sect (list N W (reverse M3) [a b d] M3 [a b]) (list W)) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")))
 (sect (list N W (reverse M3) [a b d] M3 [a b]) (Z (list W))) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")))
 (sect (list W) (Z (list N W (reverse M3) [a b d] M3 [a b]))) -- (list (as 'SYM (list "a" "b" "c")))
-(union (list N W (reverse M3) [a b d] M3 [a b]) (list W)) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "d")) (as 'SYM (list "c" "b" "a")) (as 'SYM (list "a" "b")))
-(union (list N W (reverse M3) [a b d] M3 [a b]) (Z (list W))) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "d")) (as 'SYM (list "c" "b" "a")) (as 'SYM (list "a" "b")))
-(union (list W) (Z (list N W (reverse M3) [a b d] M3 [a b]))) -- (list (as 'SYM (list "a" "b" "c")) (as 'SYM (list "a" "b" "d")) (as 'SYM (list "c" "b" "a")) (as 'SYM (list "a" "b")))
+(UD (list N W (reverse M3) [a b d] M3 [a b]) (list W)) -- true
+(UD (list N W (reverse M3) [a b d] M3 [a b]) (Z (list W))) -- true
+(UD (list W) (Z (list N W (reverse M3) [a b d] M3 [a b]))) -- true
 ;; rule 5: STR atoms compare by bytes
 (distinct (list "a" "a" "b" "" 'a "ab")) -- (list "a" "b" "" (as 'SYM "a") "ab")
 (distinct (Z (list "a" "a" "b" "" 'a "ab"))) -- (list "a" "b" "" (as 'SYM "a") "ab")
@@ -146,9 +148,9 @@
 (sect (list "a" "a" "b" "" 'a "ab") (list "a" 'b)) -- (list "a" "a")
 (sect (list "a" "a" "b" "" 'a "ab") (Z (list "a" 'b))) -- (list "a" "a")
 (sect (list "a" 'b) (Z (list "a" "a" "b" "" 'a "ab"))) -- (list "a")
-(union (list "a" "a" "b" "" 'a "ab") (list "a" 'b)) -- (list "a" "a" "b" "" (as 'SYM "a") "ab" (as 'SYM "b"))
-(union (list "a" "a" "b" "" 'a "ab") (Z (list "a" 'b))) -- (list "a" "a" "b" "" (as 'SYM "a") "ab" (as 'SYM "b"))
-(union (list "a" 'b) (Z (list "a" "a" "b" "" 'a "ab"))) -- (list "a" (as 'SYM "b") "b" "" (as 'SYM "a") "ab")
+(UD (list "a" "a" "b" "" 'a "ab") (list "a" 'b)) -- true
+(UD (list "a" "a" "b" "" 'a "ab") (Z (list "a" 'b))) -- true
+(UD (list "a" 'b) (Z (list "a" "a" "b" "" 'a "ab"))) -- true
 ;; rule 5b: STR vector cells compare descriptors (pinned as it stands)
 (distinct (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"])) -- (list ["abcdefghijklmnopq" "x"] ["a"])
 (distinct (Z (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]))) -- (list ["abcdefghijklmnopq" "x"] ["a"])
@@ -161,9 +163,9 @@
 (sect (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (list ["abcdefghijklmnopq" "x"] ["a"])) -- (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["a"] ["a"])
 (sect (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["a"]))) -- (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["a"] ["a"])
 (sect (list ["abcdefghijklmnopq" "x"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]))) -- (list ["abcdefghijklmnopq" "x"] ["a"])
-(union (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (list ["abcdefghijklmnopq" "x"] ["a"])) -- (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["a"] ["a"])
-(union (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["a"]))) -- (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] ["a"] ["a"])
-(union (list ["abcdefghijklmnopq" "x"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]))) -- (list ["abcdefghijklmnopq" "x"] ["a"])
+(UD (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (list ["abcdefghijklmnopq" "x"] ["a"])) -- true
+(UD (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["a"]))) -- true
+(UD (list ["abcdefghijklmnopq" "x"] ["a"]) (Z (list ["abcdefghijklmnopq" "x"] ["abcdefghijklmnopq" "x"] (drop ["y" "abcdefghijklmnopq" "x"] 1) ["a"] ["a"]))) -- true
 ;; rule 6: nulls are equal within a null class
 (distinct (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl))) -- (list 0Nl ' "" 0 0Np)
 (distinct (Z (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)))) -- (list 0Nl ' "" 0 0Np)
@@ -176,9 +178,9 @@
 (sect (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (list 0Ni "")) -- (list 0Nl 0Ni 0Nf "" 0Nl)
 (sect (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (Z (list 0Ni ""))) -- (list 0Nl 0Ni 0Nf "" 0Nl)
 (sect (list 0Ni "") (Z (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)))) -- (list 0Ni "")
-(union (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (list 0Ni "")) -- (list 0Nl 0Ni 0Nf ' "" 0Nl 0 0Np)
-(union (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (Z (list 0Ni ""))) -- (list 0Nl 0Ni 0Nf ' "" 0Nl 0 0Np)
-(union (list 0Ni "") (Z (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)))) -- (list 0Ni "" ' 0 0Np)
+(UD (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (list 0Ni "")) -- true
+(UD (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)) (Z (list 0Ni ""))) -- true
+(UD (list 0Ni "") (Z (list 0Nl 0Ni 0Nf (as 'SYM "") "" 0Nl 0 (as 'TIMESTAMP 0Nl)))) -- true
 ;; rule 7: NaN is the F64 null
 (distinct (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0))) -- (list 0Nf 1.0)
 (distinct (Z (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)))) -- (list 0Nf 1.0)
@@ -191,24 +193,25 @@
 (sect (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (list 0Nf)) -- (list 0Nf 0Nf 0Nf)
 (sect (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (Z (list 0Nf))) -- (list 0Nf 0Nf 0Nf)
 (sect (list 0Nf) (Z (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)))) -- (list 0Nf)
-(union (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (list 0Nf)) -- (list 0Nf 0Nf 1.0 0Nf)
-(union (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (Z (list 0Nf))) -- (list 0Nf 0Nf 1.0 0Nf)
-(union (list 0Nf) (Z (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)))) -- (list 0Nf 1.0)
-;; rule 8: -0.0 and 0.0 meet as atoms, not as vector cells
-(distinct (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)) -- (list -0.0 [-0.0] [0.0])
-(distinct (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- (list -0.0 [-0.0] [0.0])
+(UD (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (list 0Nf)) -- true
+(UD (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)) (Z (list 0Nf))) -- true
+(UD (list 0Nf) (Z (list (/ 0.0 0.0) 0Nf 1.0 (/ 0.0 0.0)))) -- true
+;; rule 8: -0.0 and 0.0 meet as atoms and as vector cells (#1361: cells
+;; compared by bytes)
+(distinct (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)) -- (list -0.0 [-0.0])
+(distinct (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- (list -0.0 [-0.0])
 (in (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- (list true true [true] [true] [true] true)
 (in (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- (list true true [true] [true] [true] true)
 (in (list 0.0 [0.0]) (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- (list true [true])
-(except (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- (list [-0.0] [-0.0])
-(except (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- (list [-0.0] [-0.0])
+(except (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- ()
+(except (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- ()
 (except (list 0.0 [0.0]) (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- ()
-(sect (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- (list -0.0 0.0 [0.0] 0)
-(sect (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- (list -0.0 0.0 [0.0] 0)
+(sect (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)
+(sect (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)
 (sect (list 0.0 [0.0]) (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- (list 0.0 [0.0])
-(union (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)
-(union (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0)
-(union (list 0.0 [0.0]) (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- (list 0.0 [0.0] [-0.0])
+(UD (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (list 0.0 [0.0])) -- true
+(UD (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0) (Z (list 0.0 [0.0]))) -- true
+(UD (list 0.0 [0.0]) (Z (list -0.0 0.0 [-0.0] [0.0] [-0.0] 0))) -- true
 ;; rule 9: nested lists recurse
 (distinct (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0)))) -- (list (list 1 [2]) (list 1 [2.0]) (list 1 (list 2)) ())
 (distinct (Z (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))))) -- (list (list 1 [2]) (list 1 [2.0]) (list 1 (list 2)) ())
@@ -221,9 +224,9 @@
 (sect (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (list (list 1.0 [2]) (list))) -- (list (list 1 [2]) (list 1.0 [2]) ())
 (sect (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (Z (list (list 1.0 [2]) (list)))) -- (list (list 1 [2]) (list 1.0 [2]) ())
 (sect (list (list 1.0 [2]) (list)) (Z (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))))) -- (list (list 1.0 [2]) ())
-(union (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (list (list 1.0 [2]) (list))) -- (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) () (list 1 (list 2.0)))
-(union (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (Z (list (list 1.0 [2]) (list)))) -- (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) () (list 1 (list 2.0)))
-(union (list (list 1.0 [2]) (list)) (Z (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))))) -- (list (list 1.0 [2]) () (list 1 [2.0]) (list 1 (list 2)))
+(UD (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (list (list 1.0 [2]) (list))) -- true
+(UD (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))) (Z (list (list 1.0 [2]) (list)))) -- true
+(UD (list (list 1.0 [2]) (list)) (Z (list (list 1 [2]) (list 1.0 [2]) (list 1 [2.0]) (list 1 (list 2)) (list) (list 1 (list 2.0))))) -- true
 ;; rule 10: dict values promote
 (distinct (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3)))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "b" "a")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)))
 (distinct (Z (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "b" "a")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)))
@@ -236,9 +239,9 @@
 (sect (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3)))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2.0)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)))
 (sect (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2.0)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)))
 (sect (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)))
-(union (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3)))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2.0)) (dict (as 'SYM (list "b" "a")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)))
-(union (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2)) (dict (as 'SYM (list "a" "b")) (list 1.0 2.0)) (dict (as 'SYM (list "b" "a")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [0D00:00:00.000000001 0D00:00:00.000000002] 3)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)))
-(union (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))))) -- (list (dict (as 'SYM (list "a" "b")) (list 1 2)) (dict (as 'SYM (list "a" "b")) (list [1 2] 3)) (dict (as 'SYM (list "b" "a")) (list 1 2)))
+(UD (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3)))) -- true
+(UD (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))))) -- true
+(UD (list (dict [a b] (list 1 2)) (dict [a b] (list [1 2] 3))) (Z (list (dict [a b] [1 2]) (dict [a b] (list 1.0 2)) (dict [a b] [1.0 2.0]) (dict [b a] [1 2]) (dict [a b] (list TS 3)) (dict [a b] (list [1 2] 3))))) -- true
 ;; rule 11: tables compare names, then columns
 (distinct (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32)))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "b")) (list [1 2])) (table (as 'SYM (list "a")) (list [1i 2i])))
 (distinct (Z (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "b")) (list [1 2])) (table (as 'SYM (list "a")) (list [1i 2i])))
@@ -251,9 +254,9 @@
 (sect (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (list (table [a] (list TS)))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1i 2i])))
 (sect (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (Z (list (table [a] (list TS))))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1i 2i])))
 (sect (list (table [a] (list TS))) (Z (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])))
-(union (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (list (table [a] (list TS)))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "b")) (list [1 2])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1i 2i])))
-(union (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (Z (list (table [a] (list TS))))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "b")) (list [1 2])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1i 2i])))
-(union (list (table [a] (list TS))) (Z (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "b")) (list [1 2])))
+(UD (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (list (table [a] (list TS)))) -- true
+(UD (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))) (Z (list (table [a] (list TS))))) -- true
+(UD (list (table [a] (list TS))) (Z (list (table [a] (list [1 2])) (table [b] (list [1 2])) (table [a] (list [1 2])) (table [a] (list TS)) (table [a] (list I32))))) -- true
 ;; rule 11: a TIMESPAN column first
 (distinct (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32)))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])))
 (distinct (Z (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])))
@@ -266,9 +269,9 @@
 (sect (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (list (table [a] (list [1 2])))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1 2])))
 (sect (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (Z (list (table [a] (list [1 2]))))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1 2])))
 (sect (list (table [a] (list [1 2]))) (Z (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [1 2])))
-(union (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (list (table [a] (list [1 2])))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [1i 2i])))
-(union (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (Z (list (table [a] (list [1 2]))))) -- (list (table (as 'SYM (list "a")) (list [0D00:00:00.000000001 0D00:00:00.000000002])) (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [1i 2i])))
-(union (list (table [a] (list [1 2]))) (Z (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))))) -- (list (table (as 'SYM (list "a")) (list [1 2])) (table (as 'SYM (list "a")) (list [1i 2i])))
+(UD (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (list (table [a] (list [1 2])))) -- true
+(UD (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))) (Z (list (table [a] (list [1 2]))))) -- true
+(UD (list (table [a] (list [1 2]))) (Z (list (table [a] (list TS)) (table [a] (list [1 2])) (table [a] (list I32))))) -- true
 ;; rule 12: GUIDs compare 16 bytes
 (distinct (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "00000000-0000-0000-0000-000000000001"))
 (distinct (Z (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "00000000-0000-0000-0000-000000000001"))
@@ -281,9 +284,9 @@
 (sect (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (list (as 'GUID G))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4"))
 (sect (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (Z (list (as 'GUID G)))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4"))
 (sect (list (as 'GUID G)) (Z (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4"))
-(union (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (list (as 'GUID G))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4"))
-(union (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (Z (list (as 'GUID G)))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4"))
-(union (list (as 'GUID G)) (Z (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)))) -- (list (as 'GUID "8ec25d82-9ee6-44ef-b9d0-4971d6f97dd4") (as 'GUID "00000000-0000-0000-0000-000000000001"))
+(UD (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (list (as 'GUID G))) -- true
+(UD (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)) (Z (list (as 'GUID G)))) -- true
+(UD (list (as 'GUID G)) (Z (list (as 'GUID G) (as 'GUID G) (as 'GUID "00000000-0000-0000-0000-000000000001") (as 'GUID G)))) -- true
 ;; in keeps ray_in_fn's shapes: a leaf per answer, a list once a cell answers a vector
 (in (list [1 2] 3) (list [1 2] 3)) -- (list [false false] true)
 (in (list 3 [1 2] (list 1 [3 9])) (list [1 2] 3 1)) -- (list true [true false] (list true [true false]))
@@ -309,8 +312,8 @@
 (except (list 1 [2]) (list)) -- (list 1 [2])
 (sect (list 1 [2]) (list)) -- ()
 (sect (list) (list 1)) -- ()
-(union (list) (list 1 1 [2] [2])) -- (list 1 [2])
-(union (list 1 1 [2]) (list)) -- (list 1 1 [2])
+(UD (list) (list 1 1 [2] [2])) -- true
+(UD (list 1 1 [2]) (list)) -- true
 ;; a typed left operand against a list: unboxed as before, an empty result typed
 (except [1 2 3 2] (list 2.0 [3])) -- (list 1 3)
 (except [1 2] (list 1 2.0)) -- (as 'I64 [])
@@ -318,7 +321,7 @@
 (except ['a 'b 'a] (list 'a)) -- (list (as 'SYM "b"))
 (sect [1 2 2 3] (list 2 3.0 [1])) -- (list 2 2 3)
 (sect I32 (list 1.0)) -- (list 1i)
-(union [1 2] (list 2.0 3 [1])) -- (list 1 2 3 [1])
+(UD [1 2] (list 2.0 3 [1])) -- true
 (except (list 1 2 [3]) [2 3]) -- (list 1 [3])
 (sect (list 1 2 [3]) [2 3]) -- (list 2)
 (union (list 1 [3]) [1 2 1]) -- (list 1 [3] 2)
@@ -343,8 +346,8 @@
 (except ['a 'b 'a] (Z (list 'a))) -- (list (as 'SYM "b"))
 (sect [1 2 2 3] (Z (list 2 3.0 [1]))) -- (list 2 2 3)
 (sect I32 (Z (list 1.0))) -- (list 1i)
-(union [1 2] (Z (list 2.0 3 [1]))) -- (list 1 2 3 [1])
-(union (list) (Z (list 1 1 [2] [2]))) -- (list 1 [2])
+(UD [1 2] (Z (list 2.0 3 [1]))) -- true
+(UD (list) (Z (list 1 1 [2] [2]))) -- true
 ;; 20k cells with duplicates
 (set VK (map (fn [i] (enlist (% i 1000))) (til 20000)))
 (set AK (as 'LIST (% (til 20000) 1500)))
@@ -353,9 +356,11 @@
 (take (distinct VK) 3) -- (list [0] [1] [2])
 (count (distinct AK)) -- 1500
 (count (distinct MK)) -- 3000
-(take (distinct MK) 2) -- (list 0 1)
-(at (distinct MK) 1500) -- [500]
-(at (distinct MK) 2499) -- [499]
+;; first-occurrence order: VK's 1000, AK's 1500, then the I32 cells (#1361)
+(take (distinct MK) 2) -- (list [0] [1])
+(at (distinct MK) 1000) -- 0
+(at (distinct MK) 2499) -- 1499
+(at (distinct MK) 2500) -- (as 'I32 [0])
 (count (except VK (take VK 500))) -- 10000
 (take (except VK (take VK 500)) 2) -- (list [500] [501])
 (count (except MK (take VK 700))) -- 26500
@@ -380,3 +385,10 @@
 (count (sect (Z (list tpd2)) (Z (list tsd)))) -- 65
 (count (distinct (Z (list tpd tpd2)))) -- 2
 (.sys.exec "rm -rf /tmp/rfl_list_cell_sets_1314") -- 0
+
+;; literal expectations, so that a change to distinct does not carry union along:
+;; numeric atoms of every width are one value; vector cells need the same type
+(union (list 1 1.0 (as 'I32 1) 2 (as 'F32 2.0) true (as 'U8 2) 3) (list 1.0 (as 'I16 2))) -- [1 2 3]
+(count (union (list [1 2] (as 'I32 [1 2]) [1 2] [2 1]) (list [2 1] [3]))) -- 4
+(union (list 1 1 'a "x" "x") (list "x" 'a 2)) -- (list 1 'a "x" 2)
+(union (list 1.0 (as 'I16 2)) (list 1 (as 'I32 2) 3)) -- (list 1.0 2h 3)

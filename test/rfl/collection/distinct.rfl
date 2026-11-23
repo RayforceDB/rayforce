@@ -29,7 +29,8 @@
 (distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000]) -- [2024.01.01D10:00:00.000000000]
 (distinct ['a 'b 'ab 'aa 'a 'aa]) -- ['a 'b 'ab 'aa]
 (set l (guid 2)) (set l (concat l l)) (count (distinct l)) -- 2
-(distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list 2i [3i 3i])
+;; a list keeps first-occurrence order too (#1361: atoms were moved first)
+(distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list [3i 3i] 2i)
 ;; tables and dicts in a list: equal ones collapse, different ones stay
 ;; (cell equality saw every table / dict of one length as equal)
 (count (distinct (list (table [q] (list [1])) (table [q] (list [2])) (table [q] (list [1])) (table [r] (list [1]))))) -- 3

@@ -1,7 +1,7 @@
-;; Keep A, including its repeats, then the first new cell of B.
+;; A set (#1385): the distinct cells of A in order, then the first new cell of B.
 (union [1 2] [3 3]) -- [1 2 3]
 (union [1 2] [2 3 3 4 4]) -- [1 2 3 4]
-(union [1 1 2] [3 3 2 4 3]) -- [1 1 2 3 4]
+(union [1 1 2] [3 3 2 4 3]) -- [1 2 3 4]
 (set _union_chk (fn [a b] (identical (as 'LIST (union a b)) (union (as 'LIST a) (as 'LIST b)))))
 (map (fn [t] (_union_chk (as t [1 1 2 0N]) (as t [2 3 3 0N 4 4]))) ['I16 'I32 'I64 'F32 'F64 'DATE 'TIME 'TIMESTAMP 'TIMESPAN]) -- (take [true] 9)
 (_union_chk (as 'U8 [1 1 255]) (as 'U8 [255 128 128 0 0])) -- true
@@ -17,7 +17,7 @@
 (map (fn [t] (_union_chk (as t [1 2 0N]) (as 'TIMESPAN [1000000 1000000 5 5 0N 0N]))) ['TIME 'TIMESTAMP 'DATE 'I64 'I32 'F64]) -- (take [true] 6)
 (map (fn [t] (_union_chk (as 'TIMESPAN [1000000 5 0N]) (as t [1 1 2 2 0N 0N]))) ['TIME 'TIMESTAMP 'DATE 'I64 'I32 'F64]) -- (take [true] 6)
 
-;; Empty sides and a wholly covered RHS preserve the same identities/order.
+;; Empty sides and a wholly covered RHS: the same identities and order.
 (union (as 'I64 []) [3 3 4 4]) -- [3 4]
-(union [1 1 2] (as 'I64 [])) -- [1 1 2]
-(union [1 1 2] [2 2 1 1]) -- [1 1 2]
+(union [1 1 2] (as 'I64 [])) -- [1 2]
+(union [1 1 2] [2 2 1 1]) -- [1 2]

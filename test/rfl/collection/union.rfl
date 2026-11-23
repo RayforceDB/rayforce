@@ -1,6 +1,6 @@
-;; Invariants for `union` — distinct set combination.
-;; Current rayforce keeps A's duplicates and appends only new-from-B elements.
-;; Treat it as a weak "contains all and no extras beyond A" relation.
+;; Invariants for `union` — a set: no duplicates in the result, from either operand.
+;; The distinct elements of A come first, in order of first appearance, then those
+;; of B that A lacks, each once (#1385).
 
 (union [1 2 3] [3 4 5]) -- [1 2 3 4 5]
 (union [] [1 2]) -- [1 2]
@@ -15,8 +15,8 @@
 ;; every element of B is in union(A,B)
 (count B) -- (sum (in B (union A B)))
 
-;; count is between distinct(A ++ B) and count(A) + count(B)
-1 -- (as 'I64 (>= (count (union A B)) (count (distinct (concat A B)))))
+;; count is exactly distinct(A ++ B): a set has no duplicates
+1 -- (as 'I64 (== (count (union A B)) (count (distinct (concat A B)))))
 1 -- (as 'I64 (<= (count (union A B)) (+ (count A) (count B))))
 
 ;; ────────────── per-type — exercises type switch in ray_union_fn ──────────────
@@ -34,3 +34,49 @@
 (union (list 1 'a "x") (list 'a 2 "y")) -- (list 1 'a "x" 2 "y")
 (union (list 1 2 3) (list 1 2 3))       -- (list 1 2 3)
 (union (list) (list 1 2))               -- (list 1 2)
+
+
+;; ────────────── duplicates in the left operand are dropped (#1385) ──────────────
+(union [1 1 2] [2 3])                -- [1 2 3]
+(union [1 1 2] [1 1 2])              -- [1 2]
+(union [3 1 3 2] [2 5 5 1])          -- [3 1 2 5]
+(union [2 2] [])                     -- [2]
+(union [] [1 1])                     -- [1]
+(union ['a 'a 'b] ['b 'c 'c])        -- ['a 'b 'c]
+(union ["a" "a" "b"] ["b" "c" "c"])  -- ["a" "b" "c"]
+(union [1.5 1.5 2.5] [2.5 3.5])      -- [1.5 2.5 3.5]
+(union [true true] [false false])    -- [true false]
+(union [2024.01.01 2024.01.01] [2024.01.02]) -- [2024.01.01 2024.01.02]
+(union [1 0Nl 0Nl 2] [0Nl 3])       -- [1 0Nl 2 3]
+(union (list 1 1 'a) (list 'a 2 2))  -- (list 1 'a 2)
+(union (list "x" "x") (list "x"))    -- (list "x")
+
+;; large enough for the hashed paths
+(count (union (til 5000) (concat (til 5000) (til 7000)))) -- 7000
+(count (union (take [1 2 3 4 5 6 7] 4000) (take [6 7 8 9] 3000))) -- 9
+(count (union (take (list 1 'a "x") 3000) (take (list 'a 2) 2000)))  -- 4
+
+;; the same on every column type of a table with duplicates: the count is the
+;; distinct count of the concatenation
+(set D (table [i f s y] (list [1 1 2 2 3] [1.5 1.5 2.5 2.5 3.5] ["a" "a" "b" "b" "c"] ['p 'p 'q 'q 'r])))
+(count (union (at D 'i) (at D 'i))) -- 3
+(count (union (at D 'f) (at D 'f))) -- 3
+(count (union (at D 's) (at D 's))) -- 3
+(count (union (at D 'y) (at D 'y))) -- 3
+
+;; union is a set; except and sect are not (they keep the left operand's duplicates, as
+;; documented): the difference is on purpose (#1385)
+(except [1 1 2 3] [3]) -- [1 1 2]
+(sect [1 1 2 2 3] [1 2]) -- [1 1 2 2]
+(distinct (sect [1 1 2 2 3] [1 2])) -- [1 2]
+
+;; more rows than a morsel (65,536), against literal counts
+(count (union (take [1 2 3 4 5 6 7] 70000) (take [6 7 8 9 10] 70000))) -- 10
+(count (union (til 70000) (+ 35000 (til 70000)))) -- 105000
+(count (union (take (list 1 'a "x") 70000) (take (list 'a 2) 70000))) -- 4
+;; a TIMESTAMP against a TIMESPAN (compared by key): a left with duplicates, and one
+;; without, both above a morsel
+(count (union (as 'TIMESTAMP (% (til 70000) 100)) (as 'TIMESPAN (til 50)))) -- 100
+(count (union (as 'TIMESTAMP (til 70000)) (as 'TIMESPAN (til 100)))) -- 70000
+(count (union (as 'TIMESTAMP (til 70000)) (as 'TIMESPAN (+ 70000 (til 100))))) -- 70100
+
