@@ -4086,6 +4086,18 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             }
             ray_t* input = exec_node(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
+            /* (count (distinct <chain>)) of a chain whose result is an
+             * atom (a string atom: (first (distinct V)) of a string
+             * vector) counts what distinct gives that atom concretely,
+             * as OP_DISTINCT does (#1527). */
+            if (ray_is_atom(input)) {
+                ray_t* d = ray_distinct_fn(input);
+                ray_release(input);
+                if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+                ray_t* result = ray_count_fn(d);
+                ray_release(d);
+                return result;
+            }
             ray_t* result = exec_count_distinct(g, op, input);
             ray_release(input);
             return result;
@@ -4094,6 +4106,16 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
         case OP_DISTINCT: {
             ray_t* input = exec_node_all_rows(g, op_child(g, op, 0));
             if (!input || RAY_IS_ERR(input)) return input;
+            /* ray_distinct_fn appends OP_DISTINCT to any lazy chain, whose
+             * result need not be a vector: (first (distinct V)) of a
+             * string vector is a string atom.  An atom is answered as the
+             * concrete atom is (#1527); ray_distinct_fn's atom paths run
+             * eagerly and build no graph. */
+            if (ray_is_atom(input)) {
+                ray_t* result = ray_distinct_fn(input);
+                ray_release(input);
+                return result;
+            }
             if (!ray_is_vec(input)) {
                 ray_release(input);
                 return ray_error("type", "OP_DISTINCT expects a vector input");
