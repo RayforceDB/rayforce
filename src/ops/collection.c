@@ -428,70 +428,6 @@ static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_
     return HS_EMPTY;
 }
 
-/* qsort comparator state for distinct_sort_indices: thread-local so
- * the standard qsort entry point can pull it without a context arg.
- * Single-threaded VM-eval is the only caller, so TLS is fine. */
-static _Thread_local ray_t* g_dsort_src;
-static _Thread_local int8_t g_dsort_type;
-static _Thread_local const void* g_dsort_data;
-
-static int distinct_sort_cmp(const void* a, const void* b) {
-    int64_t ia = *(const int64_t*)a;
-    int64_t ib = *(const int64_t*)b;
-    switch (g_dsort_type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
-            int64_t va = ((const int64_t*)g_dsort_data)[ia];
-            int64_t vb = ((const int64_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_I32: case RAY_DATE: case RAY_TIME: {
-            int32_t va = ((const int32_t*)g_dsort_data)[ia];
-            int32_t vb = ((const int32_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_I16: {
-            int16_t va = ((const int16_t*)g_dsort_data)[ia];
-            int16_t vb = ((const int16_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_U8: case RAY_BOOL: {
-            uint8_t va = ((const uint8_t*)g_dsort_data)[ia];
-            uint8_t vb = ((const uint8_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_F64: {
-            double va = ((const double*)g_dsort_data)[ia];
-            double vb = ((const double*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_F32: {
-            float va = ((const float*)g_dsort_data)[ia];
-            float vb = ((const float*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        default: {
-            /* Fall back to boxed compare for less-common element kinds. */
-            int alloc_a = 0, alloc_b = 0;
-            ray_t* a_e = collection_elem(g_dsort_src, ia, &alloc_a);
-            ray_t* b_e = collection_elem(g_dsort_src, ib, &alloc_b);
-            double va = a_e ? as_f64(a_e) : 0.0;
-            double vb = b_e ? as_f64(b_e) : 0.0;
-            if (alloc_a && a_e) ray_release(a_e);
-            if (alloc_b && b_e) ray_release(b_e);
-            return (va > vb) - (va < vb);
-        }
-    }
-}
-
-/* Sort `count` indices by their numeric value in `src`.  Preserves
- * the existing `distinct` semantic of returning numeric output sorted. */
-static void distinct_sort_indices(ray_t* src, int64_t* idx, int64_t count) {
-    g_dsort_src = src;
-    g_dsort_type = src->type;
-    g_dsort_data = ray_data(src);
-    qsort(idx, (size_t)count, sizeof(int64_t), distinct_sort_cmp);
-}
-
 /* Insert row i (from the set's build-side src) if absent.
  * Returns true if newly inserted, false if duplicate.  On grow OOM
  * the set silently keeps the previous capacity (caller proceeds). */
@@ -2223,6 +2159,33 @@ ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 /* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
  * Factored out so the executor doesn't go through ray_distinct_fn, which
  * is now a lazy producer for vectors and would re-wrap into a chain. */
+/* The first-occurrence row ids `idx[0..count)` (one per value, each a row of
+ * a `len`-row vector) put in row order, so the distinct values come out in
+ * first-occurrence order (#1361): a bitmap of the ids, scanned once.  False
+ * on oom. */
+static int i64_asc_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+static bool distinct_ids_in_row_order(int64_t* idx, int64_t count, int64_t len) {
+    if (count < 2) return true;
+    if (count <= 64) { qsort(idx, (size_t)count, sizeof(int64_t), i64_asc_cmp); return true; }
+    size_t words = (size_t)((len + 63) / 64);
+    uint64_t* bits = (uint64_t*)ray_calloc_raw(words * sizeof(uint64_t));
+    if (!bits) return false;
+    for (int64_t k = 0; k < count; k++) bits[idx[k] >> 6] |= 1ull << (idx[k] & 63);
+    int64_t c = 0;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t b = bits[w];
+        while (b) {
+            idx[c++] = (int64_t)(w * 64) + __builtin_ctzll(b);
+            b &= b - 1;
+        }
+    }
+    ray_free_raw(bits);
+    return true;
+}
+
 ray_t* distinct_vec_eager(ray_t* x) {
     int64_t len = ray_len(x);
     if (len == 0) { ray_retain(x); return x; }
@@ -2241,6 +2204,12 @@ ray_t* distinct_vec_eager(ray_t* x) {
         if (ids) {
             ray_idx_hits[IDX_SITE_DISTINCT]++;
             ray_idx_note_use(x);
+            /* one first-occurrence row per value, in value order: put the
+             * rows in row order */
+            if (!distinct_ids_in_row_order((int64_t*)ray_data(ids), count, len)) {
+                ray_release(ids);
+                return ray_error("oom", NULL);
+            }
             ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), count);
             ray_release(ids);
             return result;
@@ -2357,11 +2326,9 @@ ray_t* distinct_vec_eager(ray_t* x) {
         hashset_destroy(&hs);
     }
 
-    /* Sort unique indices by value for numeric/temporal types — preserves
-     * pre-existing distinct semantics.  qsort-based; was O(count^2). */
-    if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR && count > 1) {
-        distinct_sort_indices(x, idx, count);
-    }
+    /* Every type keeps first-occurrence order (#1361): the hash passes and
+     * the radix kernel (which sweeps its first-row flags by row) all give
+     * the ids in row order already, so no sort follows. */
 
     ray_t* result = gather_by_idx(x, idx, count);
     if (idx != idx_stack) ray_free_raw(idx);

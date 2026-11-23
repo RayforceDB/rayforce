@@ -2208,14 +2208,11 @@ static test_result_t test_distinct_f64_nan_no_null_attr(void) {
 /* distinct_order_contract: pin the output order for the duplicates fixture.
  *
  * vec {5,1,9,3,7,1,9,5,3,7}:
- *   hashset collects first-occurrence row ids: 0(=5),1(=1),2(=9),3(=3),4(=7)
- *   distinct_sort_indices sorts those ids BY VALUE:
- *     value-order:  1 < 3 < 5 < 7 < 9
- *     row ids:      1,  3,  0,  4,  2
- *   → output {1,3,5,7,9}  (VALUE-SORTED order, not first-occurrence order)
+ *   first-occurrence row ids: 0(=5),1(=1),2(=9),3(=3),4(=7)
+ *   → output {5,1,9,3,7}  (first-occurrence order, #1361)
  *
- * Contract: distinct on a numeric vector returns values in ASCENDING VALUE
- * order (not in first-occurrence order).  This test must pass with OR
+ * Contract: distinct on a numeric vector returns its values in the order
+ * they first occur, as for every other type.  This test must pass with OR
  * without a sort index attached. */
 static test_result_t test_distinct_order_contract(void) {
     ray_heap_init();
@@ -2229,12 +2226,12 @@ static test_result_t test_distinct_order_contract(void) {
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_len(r), 5);
 
-    /* Value-sorted contract: {1,3,5,7,9} */
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 0), 1);
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 1), 3);
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 2), 5);
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 3), 7);
-    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 4), 9);
+    /* First-occurrence contract: {5,1,9,3,7} */
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 0), 5);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 1), 1);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 2), 9);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 3), 3);
+    TEST_ASSERT_EQ_I(ray_vec_get_i64(r, 4), 7);
 
     ray_release(r);
     ray_release(v);

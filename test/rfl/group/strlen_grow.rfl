@@ -347,7 +347,7 @@
 (count (.sys.exec "ls /tmp/rfl_strlen_ix/.sym.ix")) -- 1
 (all (== (strlen (at Fix 's)) (strlen SYx))) -- true
 (sum (strlen (at Fix 's))) -- 16595145
-(distinct (strlen (at Fix 's))) -- [0Nl 1 5 6 254 255 256 258 300 1000]
+(distinct (strlen (at Fix 's))) -- [0Nl 1 5 254 255 256 300 1000 6 258]
 (sum (at (select {t: (sum (strlen s)) from: Fix}) 't)) -- 16595145
 (at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Fix where: (!= s "")}) where: (> c 100)}) 'l) -- (at (select {from: (select {l: (avg (strlen s)) c: (count s) by: k from: Tix where: (!= s "")}) where: (> c 100)}) 'l)
 (at (select {t: (sum (strlen s)) c: (count s) by: k from: Fix}) 't) -- (at (select {t: (sum (strlen s)) c: (count s) by: k from: Tix}) 't)

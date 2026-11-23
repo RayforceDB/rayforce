@@ -283,7 +283,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `distinct` | unary | — | Remove duplicates, preserving order | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `distinct` | unary | — | Remove duplicates, keeping each value at its first occurrence, in the order the values first appear, for every type; a null is kept once | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | — | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | — | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | — | Set difference (elements in A not in B) | `(except [1 2 3] [2])` → `[1 3]` |
