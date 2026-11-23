@@ -11316,6 +11316,7 @@ static ray_t* nonagg_first_last_hidden(ray_t* e, ray_t* tbl, idx_feeder_fn feede
 }
 
 static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res);
+static ray_t* rw_cells_as_temporal(ray_t* res, int8_t tt);
 
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
@@ -11610,15 +11611,37 @@ static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res) {
         ray_release(res);
         return ray_error("type", "if: branches mix %s and %s", ray_type_name(tt), ray_type_name(other));
     }
-    ray_t* out = ray_vec_new(tt, res->len);
-    if (!out || RAY_IS_ERR(out)) { ray_release(res); return out ? out : ray_error("oom", NULL); }
-    out->len = res->len;
-    for (int64_t i = 0; i < res->len; i++) {
-        if (RAY_ATOM_IS_NULL(cells[i])) ray_vec_set_null(out, i, true);
-        else store_typed_elem(out, i, cells[i]);
+    return rw_cells_as_temporal(res, tt);
+}
+
+/* An `if` under a call of the per-row pass, `(+ 0 (if c d i))`, yields
+ * its cells to the call, so its arms are judged on its own cells
+ * (rw_if_cells_check): each such `if` without an effect, reached through
+ * builtin calls as rw_has_if reaches it, is run per row by itself.  An
+ * error, a mix among them, is the query's; NULL when none is found. */
+static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows);
+static ray_t* rw_inner_ifs_check(ray_t* e, ray_t* tbl, int64_t nrows, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32)
+        return NULL;
+    if (depth > 0 && rw_if_kind(e, tbl)) {
+        if (!rw_pure(e, tbl, 0)) return NULL;
+        ray_t* v = eval_expr_per_row_impl(e, tbl, nrows);
+        if (v && RAY_IS_ERR(v)) return v;
+        if (v) ray_release(v);
+        return NULL;
     }
-    ray_release(res);
-    return out;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
+        return NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* err = rw_inner_ifs_check(es[i], tbl, nrows, depth + 1);
+        if (err) return err;
+    }
+    return NULL;
 }
 
 static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
@@ -11826,6 +11849,11 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
         result->type = RAY_LIST;
         result->len = 0;
     }
+    if (!RAY_IS_ERR(result) && result->type == RAY_LIST && tbl && tbl->type == RAY_TABLE &&
+        !rw_if_kind(expr, tbl) && rw_has_if(expr, tbl, 0)) {
+        ray_t* err = rw_inner_ifs_check(expr, tbl, nrows, 0);
+        if (err) { ray_release(result); return err; }
+    }
     return rw_if_cells_check(expr, tbl, result);
 }
 
@@ -12013,6 +12041,21 @@ static _Thread_local uint32_t g_if_mixes;
  * no type for gets the per-row boxing (rw_list_blend).  An arm that is not
  * one value per row: a `length` error when it reads the rows (it has no
  * value for some of them), else it stands whole in every row. */
+/* A LIST of the temporal type `tt`'s cells and of nulls as that type's
+ * column; `res` is consumed. */
+static ray_t* rw_cells_as_temporal(ray_t* res, int8_t tt) {
+    ray_t** cells = (ray_t**)ray_data(res);
+    ray_t* out = ray_vec_new(tt, res->len);
+    if (!out || RAY_IS_ERR(out)) { ray_release(res); return out ? out : ray_error("oom", NULL); }
+    out->len = res->len;
+    for (int64_t i = 0; i < res->len; i++) {
+        if (RAY_ATOM_IS_NULL(cells[i])) ray_vec_set_null(out, i, true);
+        else store_typed_elem(out, i, cells[i]);
+    }
+    ray_release(res);
+    return out;
+}
+
 static ray_t* rw_blend(ray_t* cv, ray_t* tv, ray_t* ev, ray_t* te, ray_t* ee, rw_ctx_t* c) {
     ray_t* out = NULL;
     bool tw = rw_row_shaped(tv, c), ew = rw_row_shaped(ev, c);

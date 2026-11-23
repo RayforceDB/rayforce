@@ -268,6 +268,12 @@
 ;; does not own the call's values, whose cells stay as they were
 (set DV [2024.05.05])
 (R (select {from: T r: (at (enlist (at DV 0) 7) (if (> g 0) 0 1))})) -- (list 7 2024.05.05 2024.05.05)
+;; an `if` under a call is judged on its own cells, in select and update
+(select {from: T r: (+ 0 (if (> g 0) (at DV 0) i))}) !- type
+(update {from: T r: (+ 0 (if (> g 0) (at DV 0) i))}) !- type
+(select {from: T r: (+ 1 (if (> g 0) (at DV 0) (at [0Nl] 0)))}) !- type
+(select {from: T r: (+ 0 (if (> g 0) (at DV 0) (at [2024.01.01D00:00:00.000000000] 0)))}) !- type
+(R (select {from: T r: (+ 1 (if (> g 0) (at [5] 0) i))})) -- [11 6 6]
 ;; a computed null is its arm's type, not a null literal: I64 beside DATE
 (select {from: T r: (if (> g 0) (at DV 0) (at [0Nl] 0))}) !- type
 (select {from: T r: (if (> g 0) (at DV 0) (> e 5) 5 (at DV 0))}) !- type
