@@ -4583,11 +4583,20 @@ static test_result_t test_topk_range_keys(void) {
     TEST_ASSERT_FMT(g_aw_unaligned || aw_col_decoded("ts") < 300000 * 8 / 2, "ts decoded %llu",
                     (unsigned long long)aw_col_decoded("ts"));
     AW_SAME("tk", "(select {ts: ts t: t from: T desc: [ts t] take: 10})", 0);
-    /* the first key's directory still prunes the range-read key */
+    /* the first key's directory still prunes the range-read key.  A
+     * morsel is skipped only once the tasks have published a bound it cannot
+     * beat, and t is a permutation: split over twenty-odd tasks, each reaches
+     * its last morsel with the k-th best of a morsel or two and prunes
+     * nothing (#1536).  Four workers, as the suite's own runs would have. */
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
     aw_eval_ok("(set T (.db.splayed.get \"" AW_TMP "/tk2/\"))");
     aw_eval_ok("(select {t: t v: v from: T where: (> v 100) desc: t take: 20})");
     uint64_t pc = 0, pv = 0;
     ray_fused_topk_test_pruned(&pc, &pv);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(cores), RAY_OK);
     TEST_ASSERT_TRUE(g_aw_unaligned || pv > 0);
     /* a STR key keeps the materialized path: both keys */
     AW_SAME("tk", "(select {u: u v: v from: T where: (> v 990) asc: [u v] take: 6})", 2);
