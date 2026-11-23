@@ -185,12 +185,12 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `distinct` | unary | Remove duplicates, in the order the values first appear, for every type | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
-| `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
-| `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
-| `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
+| `except` | binary | Elements of the left operand not in the right; keeps the left operand's duplicates | `(except [1 1 2 3] [3])` → `[1 1 2]` |
+| `union` | binary | Set union (deduplicated, order of first appearance) | `(union [1 2] [2 3])` → `[1 2 3]` |
+| `sect` | binary | Elements of the left operand also in the right; keeps the left operand's duplicates | `(sect [1 1 2 2 3] [1 2])` → `[1 1 2 2]` |
 | `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
@@ -250,7 +250,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `list` | variadic | Create a list from vectors | `(list [1 2] [A B])` |
-| `table` | binary | Create table from column names + list of vectors | `(table [x y] (list [1 2] [A B]))` |
+| `table` | binary | Create a table from column names and columns. A LIST of numeric atoms of one type keeps that type; mixed numeric atoms use the wider type (BOOL < U8 < I16 < I32 < I64 < F32 < F64), except F32 mixed with another numeric type gives F64. Typed nulls stay null except in BOOL and U8 columns, which store false and zero respectively. | `(table [x y] (list [1 2] [A B]))` |
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
@@ -345,7 +345,7 @@ A same-key insert through a quoted symbol appends to the active segment in place
 
 The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID`; a key is matched by value, and the same key updates on a flat in-memory table and on a splayed or mapped one. A `SYM` or `GUID` key column needs a `SYM` or `GUID` key value, and a `STR` key column a `STR` one (otherwise a `type` error). A null `F32`, `F64`, `DATE` or `TIME` key never matches, so it always appends a row; a null `I16`, `I32`, `I64`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID` key matches an existing null key. `F32` keys are compared by a scan of the key column rather than through the hashed fast path.
 
-Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
+Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F32`, `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
 
 `update` with `where:` into a named flat table writes the matched rows in place: the predicate is resolved through a fresh `.idx.hash` index on the column when it is a plain equality (`(== sym 'AAPL)`), elementwise update expressions (arithmetic, comparisons, and other atomic builtins over columns and literals) are evaluated over the matched rows only, and the results are scattered into the live columns. An aggregate is computed over the rows `where:` keeps, as in `select` with the same `where:`, including one inside a larger expression (`(- v (avg v))`) or inside a helper: `(update {v: (max v) from: 't where: (== k 1)})` writes the largest `v` among the rows with `k` 1. Running and order-dependent functions such as `sums`, `deltas` and `prior` run over the whole table, as in `select` ([Running functions under `where:`](../queries/select.md#running-functions-under-where)), and the kept rows take their values; in an expression that mixes both, such as `(- (sums v) (max v))`, the running call sees the whole table and the aggregate the kept rows. A free variable and a whole-column verb such as `reverse` are read over the whole table too. When `where:` keeps no row nothing is written, but every expression is still evaluated over the table, so one that cannot be evaluated raises its error. Both spellings of `from:` agree. A mistyped or wrong-length value is rejected before anything is written.
 

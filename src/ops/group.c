@@ -14854,11 +14854,200 @@ static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
     return false;
 }
 
-/* v2 bridge for expression agg inputs — see the call site in
- * exec_group_run.  Returns the v2 result (or an error), or NULL when the
- * shape is ineligible and the caller should continue on the legacy path. */
+/* Evaluate the expression node `in` (a computed key or aggregate input)
+ * over every row of `tbl` into *out.  False when the bridge must leave the
+ * group to the legacy path; *cerr then holds an error that is the query's
+ * (a failed column bind, a failed range read), or NULL.  `rowlocal` (a key)
+ * takes only an expression that reads its own row: a running function as a
+ * key keeps the legacy route. */
+static bool grp_expr_materialize(ray_graph_t* g, ray_t* tbl, ray_op_t* in, int64_t nrows,
+                                 bool rowlocal, ray_t** out, ray_t** cerr) {
+    *out = NULL;
+    ray_expr_t ex;
+    ray_t* v;
+    int64_t rl_syms[64];
+    int rl = -1;
+    if (in->opcode == OP_CONST) {
+        v = group_const_input_rows(g, in, nrows);
+    } else if (expr_compile(g, tbl, in, &ex, cerr)) {
+        v = expr_eval_full(&ex, nrows);
+        if (expr_eval_err_fatal(v)) { *cerr = v; return false; }   /* a range read failed */
+    } else if (*cerr || in->opcode == OP_STRLEN ||
+               (rowlocal ? (rl = group_expr_src_syms(g, in->id, rl_syms, 64)) < 0 &&
+                           (g->selection || tbl != g->table || grp_expr_reads_enc(g, tbl, in))
+                         : grp_expr_reads_enc(g, tbl, in))) {
+        /* a failed column bind (the query's error); a strlen, which the
+         * legacy path aggregates inline (try_strlen_sumavg_input: a null
+         * cell as length 0, as the keyless select does); an input over an
+         * encoded column: the executor would materialize the column, the
+         * legacy path reads it by range; or a key that reads other rows
+         * (a running function) under a where:.  Without one such a key is
+         * the same over the whole table, which is what it reads. */
+        return false;
+    } else {
+        /* An input the element-wise compiler declines — an `if`, say:
+         * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
+         * the legacy path, 6x slower under a WHERE selection (#756).  The
+         * DAG executor materializes it row-wise over the whole table; the
+         * selection is cleared around the call so the vector comes back
+         * at full length (the final gather only compacts tables, but the
+         * node's own paths need not see the selection). */
+        for (int i = 0; i < rl; i++)
+            if (ray_table_get_col_enc(tbl, rl_syms[i])) return false;
+        ray_t* saved_sel = g->selection;
+        ray_t* saved_tbl = g->table;
+        /* An input that reads only its own row reads the group's table,
+         * which a sparse where: may have compacted to its survivors
+         * (group_sel_precompact); over g->table it came back at the
+         * table's length and the group fell to the legacy path (#1234).
+         * An input that reads other rows keeps g->table: it runs over
+         * the whole table, and a length that differs from tbl's keeps
+         * the legacy path. */
+        if (tbl != g->table && (rl >= 0 || group_expr_src_syms(g, in->id, rl_syms, 64) >= 0))
+            g->table = tbl;
+        g->selection = NULL;
+        v = ray_execute(g, in);
+        g->selection = saved_sel;
+        g->table = saved_tbl;
+    }
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
+        if (v && !RAY_IS_ERR(v)) ray_release(v);
+        else if (v) ray_error_free(v);
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* A synthetic column name `<base><i>` that no column of tbl has: the base
+ * is lengthened with leading underscores until it is free, so a user column
+ * of that name never sends the group to the legacy route (#1460). */
+static int64_t grp_synth_name(ray_t* tbl, const char* base, uint32_t i, char* buf, size_t cap) {
+    char pre[12] = "";
+    for (int u = 0; u < 8; u++) {
+        int n = snprintf(buf, cap, "%s%s%u", pre, base, (unsigned)i);
+        int64_t sym = ray_sym_intern(buf, (size_t)n);
+        ray_col_meta_t m;
+        if (!ray_table_col_meta(tbl, sym, &m)) return sym;
+        pre[u] = '_';
+        pre[u + 1] = '\0';
+    }
+    return -1;
+}
+
+/* An xbar key with a positive integer literal bucket: `(xbar x b)` lowers to
+ * x - (x mod b), cast back to x's type when x is temporal (query.c).  Its
+ * values are b apart, so a range-sized dense slab of them is b times larger
+ * than the groups need.  The key is grouped on the quotient (div x b), whose
+ * range is the bucket count, and emitted as quotient * b.  *x_id: the
+ * column expression; *b: the bucket; *xt: the integer type the quotient is
+ * computed in (0: x itself is one).  False for any other key. */
+static bool grp_xbar_key(ray_graph_t* g, ray_op_t* kn, uint32_t* x_id, int64_t* b, int8_t* xt) {
+    ray_op_t* r = kn;
+    if (r->opcode == OP_CAST && r->arity >= 1) r = op_node(g, r->in_id[0]);
+    if (!r || r->opcode != OP_SUB || r->arity < 2) return false;
+    ray_op_t* m = op_node(g, r->in_id[1]);
+    if (!m || m->opcode != OP_MOD || m->arity < 2 || (m->flags & OP_FLAG_XBAR) ||
+        m->in_id[0] != r->in_id[0]) return false;
+    ray_op_t* bn = op_node(g, m->in_id[1]);
+    ray_op_ext_t* bx = bn && bn->opcode == OP_CONST ? find_ext(g, bn->id) : NULL;
+    ray_t* lit = bx ? bx->literal : NULL;
+    if (!lit || RAY_IS_ERR(lit) || !ray_is_atom(lit)) return false;
+    int64_t bv;
+    switch (lit->type) {
+    case -RAY_I64: bv = lit->i64; break;
+    case -RAY_I32: bv = lit->i32; break;
+    case -RAY_I16: bv = lit->i16; break;
+    default: return false;
+    }
+    if (bv <= 1 || bv == NULL_I64 || bv == NULL_I32 || bv == NULL_I16) return false;
+    ray_op_t* x = op_node(g, r->in_id[0]);
+    if (!x) return false;
+    int8_t t = x->out_type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    int8_t kt = kn->out_type;
+    if (RAY_IS_PARTED(kt)) kt = (int8_t)RAY_PARTED_BASETYPE(kt);
+    switch (t) {
+    case RAY_I16: case RAY_I32: case RAY_I64: *xt = 0; break;
+    case RAY_DATE: case RAY_TIME: *xt = RAY_I32; break;
+    case RAY_TIMESTAMP: *xt = RAY_I64; break;
+    default: return false;
+    }
+    if (kt != t) return false;           /* the key keeps x's type (xbar's rule) */
+    *x_id = x->id;
+    *b = bv;
+    return true;
+}
+
+/* The key column of an xbar key grouped on its quotient: q * b in type t,
+ * a null quotient a null.  An owned vector or error; NULL when a bucket
+ * q * b does not land strictly inside t's range.  Then x - (x mod b) is
+ * the type's null sentinel (b a power of two, x within b of the minimum)
+ * or wraps, and the written-out key groups such rows with the nulls or
+ * elsewhere: the caller groups the key as written instead.  It sees every
+ * group, since the quotient is used only for a full emit. */
+static ray_t* grp_xbar_emit(ray_t* q, int64_t b, int8_t t) {
+    int64_t n = q->len;
+    uint8_t esz = ray_elem_size(t);
+    int64_t tmin = esz == 8 ? INT64_MIN : esz == 4 ? (int64_t)INT32_MIN : (int64_t)INT16_MIN;
+    int64_t tmax = esz == 8 ? INT64_MAX : esz == 4 ? (int64_t)INT32_MAX : (int64_t)INT16_MAX;
+    const void* qd = ray_data(q);
+    bool nulls = ray_vec_may_have_nulls(q);
+    for (int64_t i = 0; i < n; i++) {
+        if (nulls && ray_vec_is_null(q, i)) continue;
+        int64_t v;
+        if (__builtin_mul_overflow(agg_read_key_i64(q, qd, i), b, &v) || v <= tmin || v > tmax)
+            return NULL;
+    }
+    ray_t* out = ray_vec_new(t, n > 0 ? n : 1);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    void* od = ray_data(out);
+    for (int64_t i = 0; i < n; i++) {
+        if (nulls && ray_vec_is_null(q, i)) { ray_vec_set_null(out, i, true); continue; }
+        int64_t v = agg_read_key_i64(q, qd, i) * b;   /* checked above */
+        if (esz == 8) ((int64_t*)od)[i] = v;
+        else if (esz == 4) ((int32_t*)od)[i] = (int32_t)v;
+        else ((int16_t*)od)[i] = (int16_t)v;
+    }
+    return out;
+}
+
+/* Does a key of the group `op` compute its value (no column scan)?  Under
+ * the route test hook (ray_group_test_route >= 1) none does: the hook keeps
+ * such a group on the legacy ladder it pins. */
+static bool grp_has_computed_key(ray_graph_t* g, ray_op_t* op) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || g_group_test_route >= 1) return false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (kn && kn->opcode != OP_SCAN) return true;
+    }
+    return false;
+}
+
+/* v2 bridge for computed keys and expression agg inputs — see the call
+ * site in exec_group_run.  Returns the v2 result (or an error), or NULL when
+ * the shape is ineligible and the caller should continue on the legacy
+ * path. */
+static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                      int64_t group_limit, bool xbar_q, bool* xbar_bad);
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                   int64_t group_limit) {
+    /* An xbar key groups on its quotient only for a full emit (no group
+     * limit, no top-N filter): grp_xbar_emit then sees every group and can
+     * send a key whose buckets leave the type back to be grouped as
+     * written. */
+    bool bad = false;
+    bool xq = group_limit == 0 && !ray_group_emit_filter_active().enabled;
+    ray_t* r = exec_group_v2_exprs_run(g, op, tbl, group_limit, xq, &bad);
+    if (bad) r = exec_group_v2_exprs_run(g, op, tbl, group_limit, false, &bad);
+    return r;
+}
+
+static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                      int64_t group_limit, bool xbar_q, bool* xbar_bad) {
+    *xbar_bad = false;
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* Own gate: this v2-expression shadow path serves any key/agg count
@@ -14867,13 +15056,25 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * every index loop below is uint32_t. */
     if (!ext || ext->n_keys < 1 || ext->n_aggs < 1) return NULL;
 
-    /* At least one agg input must be a compiled-expression node or a
-     * constant with rows to give (group_const_input_rows); scans, COUNT
-     * and binary/holistic second inputs pass through untouched. */
+    /* At least one key or agg input must be a compiled-expression node or
+     * a constant with rows to give (group_const_input_rows); scans, COUNT
+     * and binary/holistic second inputs pass through untouched.  A computed
+     * key (`by: (% v 3)`, `by: (xbar t 60)`) is materialized as the by-dict
+     * form `{k: (% v 3)}` materializes it, so both spellings take the same
+     * v2 strategy: the same group order, and under an unordered take: the
+     * first N groups seen (#1460).  The legacy ladder emits key order. */
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;
     uint32_t na = ext->n_aggs, nkk = ext->n_keys;
     bool any_expr = false;
+    for (uint32_t k = 0; k < nkk; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (!kn) return NULL;
+        if (kn->opcode == OP_SCAN) continue;
+        if (g_group_test_route >= 1 ||
+            (kn->opcode == OP_CONST && !group_const_input_spreads(g, kn, nrows))) return NULL;
+        any_expr = true;
+    }
     for (uint32_t a = 0; a < na; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
@@ -14888,70 +15089,75 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * is applied by exec_group_v2 itself).  VLA scratch, n_aggs/n_keys-sized;
      * names[a] holds "_e" + up to 10 uint32 digits + NUL ≤ 16. */
     ray_t* synth[na];
-    char   names[na][16];
+    char   names[na][24];
+    ray_t* ksynth[nkk];
+    char   knames[nkk][24];
+    int64_t kxb[nkk];       /* an xbar key grouped on its quotient: the bucket, else 0 */
+    int8_t  kxt[nkk];       /* ... and the key's type */
     for (uint32_t a = 0; a < na; a++) synth[a] = NULL;
+    for (uint32_t k = 0; k < nkk; k++) { ksynth[k] = NULL; kxb[k] = 0; kxt[k] = 0; }
     ray_t* sub = NULL;
     ray_t* cerr = NULL;     /* a failed column bind: returned instead of the legacy path */
+    /* A float key on 2 to 8 workers is left to the legacy engine by v2's
+     * admission; decide it from the key's type before evaluating the key,
+     * which the legacy engine would evaluate again. */
+    {
+        int8_t kt[nkk];
+        bool fp = false;
+        for (uint32_t k = 0; k < nkk; k++) {
+            ray_op_t* kn = op_node(g, ext->keys[k]);
+            kt[k] = kn->opcode == OP_SCAN ? 0 : kn->out_type;
+            fp |= kt[k] == RAY_F64 || kt[k] == RAY_F32;
+        }
+        int8_t it[na];
+        memset(it, 0, sizeof it);
+        for (uint32_t a = 0; a < na; a++) {
+            ray_op_t* in = op_node(g, ext->agg_ins[a]);
+            it[a] = !in || in->opcode == OP_SCAN ? 0 : in->out_type;
+            if (RAY_IS_PARTED(it[a])) it[a] = (int8_t)RAY_PARTED_BASETYPE(it[a]);
+        }
+        if (fp && agg_v2_parallel_wide(g, op, tbl, kt, it)) return NULL;
+    }
     bool ok = true;
+    for (uint32_t k = 0; k < nkk && ok; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (kn->opcode == OP_SCAN) continue;
+        if (grp_synth_name(tbl, "_k", k, knames[k], sizeof(knames[k])) < 0) { ok = false; break; }
+        uint32_t x_id;
+        int64_t xb;
+        int8_t xt;
+        if (xbar_q && grp_xbar_key(g, kn, &x_id, &xb, &xt)) {
+            /* the quotient: (div x b), x cast to its integer lane first
+             * when temporal.  Any failure evaluates the key as written. */
+            int8_t ktype = kn->out_type;
+            uint32_t b_id = op_node(g, op_node(g, kn->opcode == OP_CAST ? kn->in_id[0] : kn->id)->in_id[1])->in_id[1];
+            ray_op_t* x = op_node(g, x_id);
+            if (xt) x = ray_cast(g, x, xt);
+            ray_op_t* qn = x ? ray_idiv(g, x, op_node(g, b_id)) : NULL;
+            ray_t* qerr = NULL;
+            if (qn && grp_expr_materialize(g, tbl, qn, nrows, true, &ksynth[k], &qerr) &&
+                agg_key_i64_type(ksynth[k]->type) && ksynth[k]->type != RAY_SYM && ksynth[k]->type != RAY_BOOL) {
+                kxb[k] = xb;
+                kxt[k] = RAY_IS_PARTED(ktype) ? (int8_t)RAY_PARTED_BASETYPE(ktype) : ktype;
+                continue;
+            }
+            if (ksynth[k]) { ray_release(ksynth[k]); ksynth[k] = NULL; }
+            if (qerr) ray_error_free(qerr);
+            kn = op_node(g, ext->keys[k]);   /* node creation may move g->nodes */
+        }
+        ok = grp_expr_materialize(g, tbl, kn, nrows, true, &ksynth[k], &cerr);
+    }
     for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (in->opcode == OP_SCAN) continue;
         if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
-        snprintf(names[a], sizeof(names[a]), "_e%u", (unsigned)a);
-        ray_col_meta_t shm;
-        if (ray_table_col_meta(tbl, ray_sym_intern(names[a], strlen(names[a])), &shm)) {
-            ok = false; break;   /* user column shadows the synthetic name */
-        }
-        ray_expr_t ex;
-        ray_t* v;
-        if (in->opcode == OP_CONST) {
-            v = group_const_input_rows(g, in, nrows);
-        } else if (expr_compile(g, tbl, in, &ex, &cerr)) {
-            v = expr_eval_full(&ex, nrows);
-            if (expr_eval_err_fatal(v)) { cerr = v; ok = false; break; }   /* a range read failed */
-        } else if (cerr || in->opcode == OP_STRLEN || grp_expr_reads_enc(g, tbl, in)) {
-            /* a failed column bind (the query's error); a strlen, which the
-             * legacy path aggregates inline (try_strlen_sumavg_input: a null
-             * cell as length 0, as the keyless select does); or an input
-             * over an encoded column: the executor would materialize the
-             * column, the legacy path reads it by range */
-            ok = false; break;
-        } else {
-            /* An input the element-wise compiler declines — an `if`, say:
-             * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
-             * the legacy path, 6x slower under a WHERE selection (#756).  The
-             * DAG executor materializes it row-wise over the whole table; the
-             * selection is cleared around the call so the vector comes back
-             * at full length (the final gather only compacts tables, but the
-             * node's own paths need not see the selection). */
-            ray_t* saved_sel = g->selection;
-            ray_t* saved_tbl = g->table;
-            /* An input that reads only its own row reads the group's table,
-             * which a sparse where: may have compacted to its survivors
-             * (group_sel_precompact); over g->table it came back at the
-             * table's length and the group fell to the legacy path (#1234).
-             * An input that reads other rows keeps g->table: it runs over
-             * the whole table, and a length that differs from tbl's keeps
-             * the legacy path. */
-            int64_t rl_syms[64];
-            if (tbl != g->table && group_expr_src_syms(g, in->id, rl_syms, 64) >= 0)
-                g->table = tbl;
-            g->selection = NULL;
-            v = ray_execute(g, in);
-            g->selection = saved_sel;
-            g->table = saved_tbl;
-        }
-        if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
-            if (v && !RAY_IS_ERR(v)) ray_release(v);
-            else if (v) ray_error_free(v);
-            ok = false; break;
-        }
-        synth[a] = v;
+        if (grp_synth_name(tbl, "_e", a, names[a], sizeof(names[a])) < 0) { ok = false; break; }
+        ok = grp_expr_materialize(g, tbl, in, nrows, false, &synth[a], &cerr);
     }
     if (ok) {
         int64_t ncols = ray_table_ncols(tbl);
-        sub = ray_table_new(ncols + na);
+        sub = ray_table_new(ncols + na + nkk);
         if (!sub || RAY_IS_ERR(sub)) { ok = false; }
         for (int64_t c = 0; c < ncols && ok; c++) {
             ray_t* pc = ray_table_slot_idx(tbl, c);   /* encoded slots pass undecoded */
@@ -14964,15 +15170,29 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_sym_intern(names[a], strlen(names[a])), synth[a]);
             if (!sub || RAY_IS_ERR(sub)) ok = false;
         }
+        for (uint32_t k = 0; k < nkk && ok; k++) {
+            if (!ksynth[k]) continue;
+            sub = ray_table_add_col(sub,
+                    ray_sym_intern(knames[k], strlen(knames[k])), ksynth[k]);
+            if (!sub || RAY_IS_ERR(sub)) ok = false;
+        }
     }
     ray_op_t* op2 = NULL;
     if (ok) {
         /* Shadow GROUP node: original key/scan/second inputs by node,
-         * expression inputs replaced by scans of the synthetic columns.
-         * Build all scans BEFORE the group node — node creation may
-         * realloc g->nodes and dangle earlier ray_op_t pointers. */
+         * expression keys and inputs replaced by scans of the synthetic
+         * columns.  Build all scans BEFORE the group node — node creation
+         * may realloc g->nodes and dangle earlier ray_op_t pointers. */
         uint32_t in_ids[na];
+        uint32_t key_ids[nkk];
         bool has2 = false, hask = false;
+        for (uint32_t k = 0; k < nkk && ok; k++) {
+            key_ids[k] = ext->keys[k];
+            if (!ksynth[k]) continue;
+            ray_op_t* sc = ray_scan(g, knames[k]);
+            if (!sc) { ok = false; break; }
+            key_ids[k] = sc->id;
+        }
         for (uint32_t a = 0; a < na && ok; a++) {
             if (synth[a]) {
                 ray_op_t* sc = ray_scan(g, names[a]);
@@ -14989,7 +15209,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_op_t* ins[na];
             ray_op_t* ins2[na];
             for (uint32_t k = 0; k < nkk; k++)
-                keys[k] = op_node(g, ext->keys[k]);
+                keys[k] = op_node(g, key_ids[k]);
             for (uint32_t a = 0; a < na; a++) {
                 ins[a] = op_node(g, in_ids[a]);
                 ins2[a] = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
@@ -15009,8 +15229,33 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     ray_t* result = NULL;
     if (ok && agg_v2_can_handle(g, op2, sub))
         result = exec_group_v2(g, op2, sub, group_limit);
+    /* an xbar key grouped on its quotient comes back as its buckets */
+    for (uint32_t k = 0; k < nkk && result && !RAY_IS_ERR(result); k++) {
+        if (!kxb[k]) continue;
+        if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
+        if (!result || RAY_IS_ERR(result) || result->type != RAY_TABLE) break;
+        int64_t ks = ray_sym_intern(knames[k], strlen(knames[k]));
+        int64_t nc = ray_table_ncols(result), ci = -1;
+        for (int64_t c = 0; c < nc && ci < 0; c++) if (ray_table_col_name(result, c) == ks) ci = c;
+        ray_t* qc = ci >= 0 ? ray_table_col_idx(result, ci) : NULL;
+        ray_t* kc = qc && !RAY_IS_ERR(qc) && agg_key_i64_type(qc->type) ? grp_xbar_emit(qc, kxb[k], kxt[k]) : NULL;
+        if (!kc && qc && !RAY_IS_ERR(qc) && agg_key_i64_type(qc->type)) {
+            ray_release(result); result = NULL; *xbar_bad = true; break;    /* group the key as written */
+        }
+        if (!kc) { ray_release(result); result = ray_error("domain", "group: xbar key column not found"); break; }
+        if (RAY_IS_ERR(kc)) { ray_release(result); result = kc; break; }
+        ray_t* rebuilt = ray_table_new(nc);
+        for (int64_t c = 0; c < nc && rebuilt && !RAY_IS_ERR(rebuilt); c++)
+            rebuilt = ray_table_add_col(rebuilt, ray_table_col_name(result, c),
+                                        c == ci ? kc : ray_table_slot_idx(result, c));
+        ray_release(kc);
+        ray_release(result);
+        result = rebuilt ? rebuilt : ray_error("oom", NULL);
+    }
     for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
+    for (uint32_t k = 0; k < nkk; k++)
+        if (ksynth[k]) ray_release(ksynth[k]);
     if (sub) { ray_graph_unbind_table(g, sub); ray_release(sub); }
     if (cerr) return cerr;
     return result;   /* NULL → legacy path */
@@ -15969,9 +16214,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * inputs at scans of them, and dispatch v2.  `_e{a}` is chosen so
      * v2's scan-input naming (agg_result_col_name) emits the SAME
      * `_e{a}_{op}` output names the legacy expression emit produced.
-     * Any ineligibility falls through to the legacy path unchanged. */
+     * Any ineligibility falls through to the legacy path unchanged.
+     * A computed key takes the bridge under an armed top-N emit filter too:
+     * v2 owns that filter (the shadow node keeps the aggregates in order),
+     * and the by-dict spelling of the same key already reaches it there. */
     if (ray_agg_engine_v2 && group_limit >= 0
-        && !ray_group_emit_filter_active().enabled) {
+        && (!ray_group_emit_filter_active().enabled || grp_has_computed_key(g, op))) {
         ray_t* r = exec_group_v2_exprs(g, op, tbl, group_limit);
         if (r) return r;
     }
@@ -21539,6 +21787,109 @@ static bool grp_first_keys_scan(ray_t* pt, const int64_t* key_syms, uint32_t n_k
     return ok;                                         /* every row read (or n found): all the groups */
 }
 
+/* A borrowed source segment the prefix scan below can slice: a plain
+ * fixed-width vector (an encoded or text segment, or a SYM one, whose ids
+ * belong to the segment's own domain, declines). */
+static bool grp_prefix_seg_ok(ray_t* seg) {
+    if (!seg || RAY_IS_ERR(seg)) return false;
+    switch (seg->type) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* grp_first_keys_scan for keys that are row-local expressions (key_is_expr)
+ * beside plain columns: the first N distinct key tuples, read from a growing
+ * prefix of each partition's rows.  An expression key is evaluated over its
+ * source segments sliced to that prefix, so the first N groups cost a few
+ * thousand evaluated rows (the same budget as the column scan) instead of a
+ * hidden row-id column and a MIN over every row (#1460).  False when a
+ * source segment is not a plain fixed-width vector, a key's value is not an
+ * integer one, or the budget runs out before the input does. */
+static bool grp_first_expr_keys_scan(ray_graph_t* g, ray_op_ext_t* ext, ray_t* pt,
+                                     const int64_t* key_syms, const uint8_t* key_is_expr,
+                                     uint32_t n_keys, const int64_t* borrow_syms, int n_borrow,
+                                     int32_t n_parts, const int64_t* sel_ids, int64_t sel_total,
+                                     const int64_t* part_off, int64_t n, grp_keyset_t* ks,
+                                     ray_t** err) {
+    *err = NULL;
+    if (n_keys == 0 || n_keys > 16 || n > AGG_FIRSTN_MAX || n_borrow <= 0 || n_borrow > 64) return false;
+    int64_t budget = n * 64 > AGG_FIRSTN_PROBE_ROWS ? n * 64 : AGG_FIRSTN_PROBE_ROWS;
+    int64_t scanned = 0;
+    int64_t kv[16];
+    ray_t* segs[64];
+    ray_t* kvec[16];
+    bool ok = true;
+    for (int32_t p = 0; p < n_parts && ok && ks->n_found < n; p++) {
+        int64_t len = -1;
+        for (int j = 0; j < n_borrow && ok; j++) {
+            segs[j] = ray_table_parted_seg(pt, borrow_syms[j], p);
+            if (!grp_prefix_seg_ok(segs[j]) || (len >= 0 && segs[j]->len != len)) ok = false;
+            else len = segs[j]->len;
+        }
+        if (!ok || len < 0) { ok = false; break; }
+        int64_t lo = 0, hi = len;
+        if (sel_ids) {                                 /* this partition's selected rows */
+            lo = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p]);
+            hi = grp_sorted_lower_bound(sel_ids, sel_total, part_off[p + 1]);
+        }
+        int64_t chunk = 1024;
+        for (int64_t j = lo; ok && j < hi && ks->n_found < n; ) {
+            /* the local rows [a, b) hold the next selected rows */
+            int64_t a = sel_ids ? sel_ids[j] - part_off[p] : j;
+            int64_t b = a + chunk < len ? a + chunk : len;
+            if (scanned + (b - a) > budget) { ok = false; break; }
+            scanned += b - a;
+            chunk *= 2;
+            ray_t* sub = ray_table_new(n_borrow);
+            for (int c = 0; c < n_borrow && sub && !RAY_IS_ERR(sub); c++) {
+                ray_t* sl = ray_vec_slice(segs[c], a, b - a);
+                if (!sl || RAY_IS_ERR(sl)) { ray_release(sub); sub = sl; break; }
+                sub = ray_table_add_col(sub, borrow_syms[c], sl);
+                ray_release(sl);
+            }
+            if (!sub || RAY_IS_ERR(sub)) { if (sub) ray_error_free(sub); ok = false; break; }
+            uint32_t nk = 0;
+            for (; nk < n_keys; nk++) {
+                ray_t* v;
+                if (key_is_expr[nk]) {
+                    ray_t* saved = g->table;
+                    g->table = sub;
+                    v = exec_node(g, op_node(g, ext->keys[nk]));
+                    g->table = saved;
+                } else {
+                    v = ray_table_col(sub, key_syms[nk]);
+                    if (v && !RAY_IS_ERR(v)) ray_retain(v);
+                }
+                if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+                if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != b - a ||
+                    v->type == RAY_SYM || !agg_key_i64_type(v->type)) {
+                    if (v && RAY_IS_ERR(v)) ray_error_free(v);
+                    else if (v) ray_release(v);
+                    break;
+                }
+                kvec[nk] = v;
+            }
+            if (nk == n_keys) {
+                for (; j < hi && ks->n_found < n; j++) {
+                    int64_t r = sel_ids ? sel_ids[j] - part_off[p] : j;
+                    if (r >= b) break;
+                    for (uint32_t k = 0; k < n_keys; k++)
+                        kv[k] = agg_read_key_i64(kvec[k], ray_data(kvec[k]), r - a);
+                    grp_keyset_probe(ks, kv, true);
+                }
+            } else ok = false;
+            for (uint32_t k = 0; k < nk; k++) ray_release(kvec[k]);
+            ray_graph_unbind_table(g, sub);
+            ray_release(sub);
+        }
+    }
+    return ok;                                         /* every row read (or n found): all the groups */
+}
+
 /* The rows of `result` (key columns 0..n_keys) whose key is in the set,
  * ordered by first-seen rank: an owned table, NULL when a found key has no
  * result row (the caller declines), or an owned error. */
@@ -22013,9 +22364,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             bool any_expr = false;
             for (uint32_t k = 0; k < n_keys; k++) any_expr |= key_is_expr[k] != 0;
             ray_t* serr = NULL;
-            frow_by_keys = !any_expr &&
-                grp_first_keys_scan(parted_tbl, key_syms, n_keys, n_parts, saved_sel ? sel_ids : NULL,
-                                    sel_total, part_off, group_limit, &fks, &serr);
+            frow_by_keys = !any_expr
+                ? grp_first_keys_scan(parted_tbl, key_syms, n_keys, n_parts, saved_sel ? sel_ids : NULL,
+                                      sel_total, part_off, group_limit, &fks, &serr)
+                : grp_first_expr_keys_scan(g, ext, parted_tbl, key_syms, key_is_expr, n_keys,
+                                           borrow_syms, n_borrow, n_parts, saved_sel ? sel_ids : NULL,
+                                           sel_total, part_off, group_limit, &fks, &serr);
             if (serr) { ret = serr; goto pp_cleanup; }
         }
         if (frow_by_keys) {                    /* drop the hidden slot */
@@ -22077,6 +22431,33 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
      * Bounds peak memory to O(MERGE_BATCH × groups_per_partition). */
 #define MERGE_BATCH 8
 
+    /* Keep exact totals for a single unfiltered I64 AVG. Affine inputs
+     * still execute their original graph; never commute or re-associate. */
+    bool exact_avg = false;
+    if (n_keys == 0 && n_aggs == 1 && ext->agg_ops[0] == OP_AVG &&
+        !saved_sel && group_limit == 0 && !ef_saved.enabled) {
+        ray_op_t* expr = op_node(g, ext->agg_ins[0]);
+        ray_op_t* input = expr && expr->opcode == OP_SCAN ? expr : NULL;
+        if (expr && (expr->opcode == OP_ADD || expr->opcode == OP_SUB)) {
+            ray_op_t* lhs = op_node(g, expr->in_id[0]);
+            ray_op_t* rhs = op_node(g, expr->in_id[1]);
+            ray_op_t* lit = NULL;
+            if (lhs && rhs && lhs->opcode == OP_SCAN && rhs->opcode == OP_CONST) {
+                input = lhs; lit = rhs;
+            } else if (lhs && rhs && rhs->opcode == OP_SCAN && lhs->opcode == OP_CONST) {
+                input = rhs; lit = lhs;
+            }
+            if (!lit || (lit->out_type != RAY_I16 && lit->out_type != RAY_I32 &&
+                         lit->out_type != RAY_I64)) input = NULL;
+        }
+        ray_op_ext_t* scan = input ? find_ext(g, input->id) : NULL;
+        ray_col_meta_t meta;
+        exact_avg = scan && ray_table_col_meta(parted_tbl, scan->sym, &meta) &&
+                    meta.type == RAY_PARTED_BASE + RAY_I64;
+    }
+    reduce_acc_t exact_total;
+    if (exact_avg) reduce_acc_init(&exact_total);
+
     /* Capture agg column name IDs from first partition result
      * (agg_name_ids carved above, sized part_n_aggs_max). */
     int agg_names_captured = 0;
@@ -22105,6 +22486,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         int32_t batch_end = batch_start + MERGE_BATCH;
         if (batch_end > n_parts) batch_end = n_parts;
         int32_t batch_n = batch_end - batch_start;
+        reduce_acc_t exact_batch;
+        if (exact_avg) reduce_acc_init(&exact_batch);
 
         /* Pass 1: exec_group each partition in this batch */
         ray_t* bp[MERGE_BATCH];
@@ -22192,6 +22575,31 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!fill) ray_retain(seg);
                 sub = ray_table_add_col(sub, borrow_syms[j], fill ? fill : seg);
                 ray_release(fill ? fill : seg);
+                if (exact_avg && (!sub || RAY_IS_ERR(sub))) {
+                    ret = sub ? sub : ray_error(ray_interrupted() ? "cancel" : "oom", NULL);
+                    goto batch_fail;
+                }
+            }
+
+            if (exact_avg && !agg_is_expr[0]) {
+                ray_t* col = ray_table_slot(sub, agg_syms[0]);
+                if (!col) { pp_release_sub(g, sub); goto batch_fail; }
+                ray_col_src_t src;
+                ret = ray_col_src_bind(col, &src);
+                if (!ret) {
+                    reduce_acc_t partial;
+                    if (src.type != RAY_I64 || src.len != part_nrows) {
+                        ray_col_src_release(&src);
+                        pp_release_sub(g, sub);
+                        goto batch_fail;
+                    }
+                    ret = reduce_src_walk(&src, 0, src.len, OP_AVG, &partial);
+                    if (!ret) reduce_merge(&exact_batch, &partial, RAY_I64, NULL, OP_AVG);
+                    ray_col_src_release(&src);
+                }
+                pp_release_sub(g, sub);
+                if (ret) goto batch_fail;
+                continue;
             }
 
             /* Materialize expression keys / agg inputs over this partition.
@@ -22228,12 +22636,35 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                     (part_nrows >= 0 && v->len != part_nrows)) {
                     /* decline: the concat fallback re-evaluates the
                      * expression and reports its error */
-                    if (v && RAY_IS_ERR(v)) ray_error_free(v);
+                    if (v && RAY_IS_ERR(v)) { if (exact_avg) ret = v; else ray_error_free(v); }
                     else if (v) ray_release(v);
                     pp_release_sub(g, sub); goto batch_fail;
                 }
+                if (exact_avg) {
+                    if (v->type != RAY_I64) {
+                        ray_release(v);
+                        pp_release_sub(g, sub);
+                        goto batch_fail; /* non-I64 uses the existing concat fallback */
+                    }
+                    ray_col_src_t src;
+                    ret = ray_col_src_bind(v, &src);
+                    if (!ret) {
+                        reduce_acc_t partial;
+                        ret = reduce_src_walk(&src, 0, src.len, OP_AVG, &partial);
+                        if (!ret) reduce_merge(&exact_batch, &partial, RAY_I64, NULL, OP_AVG);
+                        ray_col_src_release(&src);
+                    }
+                    ray_release(v);
+                    if (ret) { pp_release_sub(g, sub); goto batch_fail; }
+                    continue;
+                }
                 sub = ray_table_add_col(sub, agg_syms[a], v);
                 ray_release(v);
+            }
+
+            if (exact_avg) {
+                pp_release_sub(g, sub);
+                continue;
             }
 
             if (frow_sym >= 0) {
@@ -22371,6 +22802,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                         bp[bi], (int64_t)n_part_keys + a);
                 agg_names_captured = 1;
             }
+        }
+
+        if (exact_avg) {
+            reduce_merge(&exact_total, &exact_batch, RAY_I64, NULL, OP_AVG);
+            continue;
         }
 
         /* Pass 2: concat (running + batch_partials + MAPCOMMON) */
@@ -22683,6 +23119,27 @@ batch_fail:
     ray_progress_update("group", "per-partition aggregate",
                         (uint64_t)n_parts, (uint64_t)n_parts);
 
+    if (exact_avg) {
+        /* Keep the column name produced by the decomposed SUM slot. */
+        int64_t nm = agg_result_col_name(agg_syms[0], OP_SUM);
+        if (nm < 0) { ret = ray_error("oom", NULL); goto pp_cleanup; }
+        ray_t* col = ray_vec_new(RAY_F64, 1);
+        if (!col || RAY_IS_ERR(col)) {
+            ret = col ? col : ray_error(ray_interrupted() ? "cancel" : "oom", NULL);
+            goto pp_cleanup;
+        }
+        col->len = 1;
+        *(double*)ray_data(col) = exact_total.cnt > 0
+            ? ray_f64_fin(ray_i128_to_f64(exact_total.sum_hi, (uint64_t)exact_total.sum_i) / (double)exact_total.cnt)
+            : NULL_F64;
+        grp_finalize_nulls(col);
+        ret = ray_table_new(1);
+        if (ret && !RAY_IS_ERR(ret)) ret = ray_table_add_col(ret, nm, col);
+        ray_release(col);
+        if (!ret) ret = ray_error(ray_interrupted() ? "cancel" : "oom", NULL);
+        goto pp_served;
+    }
+
     ray_t* result = running;
 
     if (!result || RAY_IS_ERR(result)) {
@@ -22912,6 +23369,7 @@ batch_fail:
     ret = result;
     if (agg_emit_filter_targets(&ef_trim, ext))
         ret = agg_emit_filter_trim(ret, n_keys, n_aggs, ext->agg_ops, &ef_trim);
+pp_served:
     if (ret && !RAY_IS_ERR(ret))
         atomic_fetch_add_explicit(&ray_group_perpart_done_ctr, 1, memory_order_relaxed);
     /* Count the result served (O(1); see ray_group_perpart_runs_ctr).  A bail

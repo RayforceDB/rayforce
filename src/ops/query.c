@@ -27393,7 +27393,11 @@ by_dict_done:
      * under-fill the answer.  A PARTED input takes the hint too: the parted
      * group keeps the first N groups in first-seen order (the per-partition
      * route carries each group's first global row and keeps the N smallest;
-     * the flattened group takes the hint itself).  Nor
+     * the flattened group takes the hint itself).  A BOOL column key keeps
+     * the post-execution take: its groups are reordered after the group (the
+     * first-occurrence pass below).  A computed key and a name holding a
+     * value are never reordered there, so they take the hint, as their
+     * by-dict spelling does (#1460).  Nor
      * with a LIST-producing aggregate (top/bot): exec.c's HEAD/TAIL table trim
      * now retains LIST cells, but the group's LIST output has no reason to pay
      * a trim it can skip, and the take is a no-op there anyway. */
@@ -27401,7 +27405,7 @@ by_dict_done:
     take_pre_t take_pre = {0};   /* decoded take: value, reused by apply_sort_take */
     bool group_take_push = (take_expr && by_expr && !nearest_expr && !has_sort
                             && !post_group_where_expr && !has_list_agg
-                            && (parted_bydict_deferred
+                            && (parted_bydict_deferred || computed_single_key || named_value_key
                                 || !group_keys_have_bool(by_expr, tbl)));
     if (take_expr && !nearest_expr && (!by_expr || group_take_push)) {
         ray_t* tv = ray_eval(take_expr);
@@ -29175,8 +29179,8 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F64: {
-        if (at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
-        double v = (at == -RAY_F64) ? atom->f64 : (double)as_i64(atom);
+        if (at != -RAY_F32 && at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
+        double v = is_int ? (double)as_i64(atom) : atom->f64;
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F32: {
@@ -33563,7 +33567,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_BOOL:      ok = (at == -RAY_BOOL); break;
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
                         ok = is_int; break;
-    case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_F64:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_F32:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;

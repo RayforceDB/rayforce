@@ -1,0 +1,32 @@
+;; (union a b) is a set (#1385): the left operand's duplicates go too.  Release build,
+;; best of 5 in ms (./rayforce -c 4 bench/union_set.rfl).  dev -> the change, on a laptop:
+;;   i64 5M distinct 585 -> 575, i64 heavy duplicates 72 -> 70, i64 moderate duplicates
+;;   467 -> 441, sym 38 -> 38, str 42 -> 38, f64 75 -> 75, empty left 315 -> 294,
+;;   30k-cell lists 0.62 -> 0.62, span/point (10M TIMESTAMP against a TIMESPAN):
+;;   distinct left 596 -> 569, duplicate left 261 -> 259, 1000-row left 225 -> 226.
+;; The extra work is one gather, and only when the left operand has a duplicate; on the
+;; span/point route a second hash set is built only when two keys collide.
+(set best (fn [f] (do (set m 1e18) (times 5 (do (set t (timeit (f))) (if (< t m) (set m t) 0))) m)))
+(set N 5000000)
+(set u (til N))                                   ; all distinct
+(set d (% (til N) 1000))                          ; heavy duplicates
+(set h (% (* (til N) 7) 3000000))                 ; moderate duplicates
+(set s (as 'SYM (% (til 2000000) 50000)))
+(set st (as 'STR (% (til 1000000) 100000)))
+(set f (as 'F64 (% (til N) 70000)))
+(set l1 (as 'LIST (til 30000)))
+(set l2 (as 'LIST (+ 15000 (til 30000))))
+(println "i64 distinct x distinct :" (best (fn [] (union u (+ 2500000 u)))))
+(println "i64 dups x dups         :" (best (fn [] (union d (+ 500 d)))))
+(println "i64 moderate dups       :" (best (fn [] (union h (+ 100000 h)))))
+(println "sym dups                :" (best (fn [] (union s s))))
+(println "str dups                :" (best (fn [] (union st st))))
+(println "f64 dups                :" (best (fn [] (union f f))))
+(println "i64 left empty          :" (best (fn [] (union (take u 0) u))))
+(println "list 30k x 30k          :" (best (fn [] (union l1 l2))))
+(set ts (as 'TIMESTAMP (til 10000000)))
+(set tsd (as 'TIMESTAMP (% (til 10000000) 100000)))
+(set sp (as 'TIMESPAN (% (til 10000000) 50000)))
+(println "span/point distinct left:" (best (fn [] (union ts sp))))
+(println "span/point duplicate left:" (best (fn [] (union tsd sp))))
+(println "span/point small left   :" (best (fn [] (union (take ts 1000) sp))))
