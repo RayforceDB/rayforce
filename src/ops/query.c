@@ -16013,6 +16013,7 @@ ray_t* ray_try_select_head_expr(ray_t* expr, int64_t n, int* handled) {
 
 static ray_t* count_select_on(ray_t* tbl, ray_t* where_expr, int* handled);
 static ray_t* count_select_over(ray_t* dict, ray_t* src);
+static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where);
 
 ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
     if (handled) *handled = 0;
@@ -16059,6 +16060,19 @@ ray_t* ray_try_count_select_expr(ray_t* expr, int* handled) {
         ray_release(tbl);
         if (handled) *handled = 1;
         return q ? count_select_over(dict, q) : ray_error("oom", NULL);
+    }
+    /* Prune as the select does: the stand-in row fails the where like the
+     * rows it replaces, so the count is the same (#1503). */
+    {
+        ray_t* pruned = select_prune_partitions(dict, tbl, where_expr);
+        if (pruned) {
+            ray_release(tbl);
+            if (RAY_IS_ERR(pruned)) {
+                if (handled) *handled = 1;
+                return pruned;
+            }
+            tbl = pruned;
+        }
     }
     int on_handled = 0;
     ray_retain(tbl);
