@@ -1,0 +1,86 @@
+;; @also-unfused
+;; An `if` over mixed temporal/numeric arms raises `type` on the routes the
+;; planner leaves to the evaluator too, and chooses its arm per row there
+;; (#1488).  A where: predicate went to the evaluator's `if`, which tests the
+;; condition vector whole, so every row took the `then` arm; a call such as
+;; `nil?` around the `if` hid the mix; a chain with no fallback boxed DATE
+;; cells beside I64 ones; `cond` raised `name`.
+
+(set T (table [g c i d] (list [0 1 1 0] [true false true false] [1 2 3 4] (+ 2024.01.01 (til 4)))))
+(set DV [2024.05.05 2024.06.06])
+(set U (table [c s u] (list [1 5 6 2] (as 'TIMESPAN [1 2 3 4]) (as 'TIMESPAN [10 20 30 40]))))
+(set Bg (fn [q] (at (xasc q 'g) 'r)))
+
+;; ── 1. a where: predicate with a per-row arm ──
+(select {from: T where: (not (nil? (if c (at DV 0) i)))}) !- type
+(select {from: T where: (> (if c (at DV 0) i) 2)}) !- type
+(select {from: T where: (not (nil? (if c (at DV 0) i))) by: g r: (count i)}) !- type
+(update {from: T where: (not (nil? (if c (at DV 0) i))) r: 1}) !- type
+;; the arm is chosen per row, as on the planned route
+(at (select {from: T where: (> (if c (at DV 0) (at DV 1)) 2024.05.10)}) 'i) -- [2 4]
+(at (select {from: T where: (if c (> i 2) (== (at DV 0) 2024.05.05))}) 'i) -- [2 3 4]
+(at (select {from: T where: (> (if c (at DV 0) (at DV 1)) 2024.05.10) by: g r: (count i)}) 'r) -- [1 1]
+(at (update {from: T where: (> (if c (at DV 0) (at DV 1)) 2024.05.10) r: 1}) 'r) -- [0N 1 0N 1]
+(at (select {from: U where: (> (if (> c 4) s u) (as 'TIMESPAN 5))}) 'c) -- [1 2]
+(at (select {from: U where: (> (if (> c 4) s u) 0D00:00:00.000000005)}) 'c) -- [1 2]
+;; a call around the `if` does not hide the mix
+(select {from: T r: (nil? (if c (at DV 0) i))}) !- type
+(select {from: T r: (not (nil? (if c (at DV 0) i)))}) !- type
+(select {from: T r: (nil? (if c (at DV 0) i)) by: g}) !- type
+(update {from: T r: (nil? (if c (at DV 0) i))}) !- type
+(at (select {from: T r: (nil? (if c (at DV 0) (at DV 1)))}) 'r) -- [false false false false]
+
+;; ── 2. a chain with no fallback ──
+(select {from: T where: (> i 1) r: (if (> g 0) d (> i 3) i)}) !- type
+(select {from: T r: (if (> g 0) d (> i 3) i)}) !- type
+(update {from: T r: (if (> g 0) d (> i 3) i)}) !- type
+;; a row no condition takes is 0, an I64, beside the DATE arm
+(select {from: T r: (if (> g 0) d (> i 3) d)}) !- type
+(at (select {from: T where: (> i 1) r: (if (> g 0) d (> i 3) d)}) 'r) -- [2024.01.02 2024.01.03 2024.01.04]
+(at (select {from: T r: (if (> g 0) i (> i 3) 7)}) 'r) -- [0 2 3 7]
+
+;; ── 3. per group, each row takes its own arm ──
+(select {from: T r: (first (if (> g 0) (at DV 0) 7)) by: g}) !- type
+(Bg (select {from: T r: (first (if (> g 0) (at DV 0) (at DV 1))) by: g})) -- [2024.06.06 2024.05.05]
+(Bg (select {from: T r: (sum (if c i 10)) by: g})) -- [11 13]
+(Bg (select {from: T r: (first (if c (at DV 0) (at DV 1))) by: g})) -- [2024.05.05 2024.06.06]
+
+;; ── 4. `cond` is its `if` chain ──
+(select {from: T r: (cond ((> g 0) (at DV 0)) (else 7))}) !- type
+(select {from: T r: (first (cond ((> g 0) (at DV 0)) (else 7))) by: g}) !- type
+(update {from: T r: (cond ((> g 0) (at DV 0)) (else 7))}) !- type
+(select {from: T r: (cond ((> g 0) (at DV 0)) ((> i 3) (at DV 1)))}) !- type
+(at (select {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (select {from: T r: (cond ((> g 0) (at DV 0)) ((> i 3) (at DV 1)) (else d))}) 'r) -- [2024.01.01 2024.05.05 2024.05.05 2024.06.06]
+(Bg (select {from: T r: (first (cond ((> g 0) (at DV 0)) (else (at DV 1)))) by: g})) -- [2024.06.06 2024.05.05]
+(at (select {from: T where: (cond ((> g 0) (> (at DV 0) d)) (else (> i 3)))}) 'i) -- [2 3 4]
+(at (update {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (update {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1))) by: g}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (xasc (select {from: T r: (count i) by: {k: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}}) 'k) 'r) -- [2 2]
+(at (select {from: T r: (cond ((> g 0) 1) (else 7))}) 'r) -- [7 1 1 7]
+;; a lone else is its arm
+(at (select {from: T r: (cond (else 7))}) 'r) -- [7 7 7 7]
+(at (select {from: T r: (cond (else (at DV 1)))}) 'r) -- [2024.06.06 2024.06.06 2024.06.06 2024.06.06]
+
+;; ── update by: with an aggregate over a per-group `if` ──
+;; each row takes its own arm, as select by: does; it took one arm per group
+(set V (table [g i j d] (list [0 1 0 1] [1 2 3 4] (as 'I32 [5 6 7 8]) (+ 2024.01.01 (til 4)))))
+(set DW [2025.05.05])
+(set IV (as 'I32 [9]))
+(set FV [9.5])
+(at (update {r: (first (if (> g 0) (at DW 0) d)) from: V by: g}) 'r) -- [2024.01.01 2025.05.05 2024.01.01 2025.05.05]
+(at (update {r: (sum (if (> g 0) (at IV 0) i)) from: V by: g}) 'r) -- [4 18 4 18]
+(at (update {r: (first (if (> g 0) (at DW 0) 0Nd)) from: V by: g}) 'r) -- [0Nd 2025.05.05 0Nd 2025.05.05]
+(update {r: (first (if (> g 0) (at DW 0) 7)) from: V by: g}) !- type
+(try (update {r: (first (if (> g 0) (at DW 0) 7)) from: V by: g}) (fn [e] (at e 'msg))) -- "if: branches mix DATE and I64"
+(at (update {r: (if (> g 0) (at IV 0) i) from: V by: g}) 'r) -- [1 9 3 9]
+
+;; ── per row, numeric arms take the promotion table, as on the planned route ──
+(at (select {r: (if (> g 0) (at IV 0) i) from: V}) 'r) -- [1 9 3 9]
+(type (at (select {r: (if (> g 0) (at IV 0) i) from: V}) 'r)) -- 'I64
+(type (at (select {r: (if (> g 0) (at IV 0) j) from: V}) 'r)) -- 'I32
+(at (select {r: (if (> g 0) (at FV 0) i) from: V}) 'r) -- [1.0 9.5 3.0 9.5]
+(at (select {r: (if (> g 0) (at FV 0) i) from: V where: (> i 1)}) 'r) -- [9.5 3.0 9.5]
+(at (select {r: (if (> g 0) (at FV 0) 0N) from: V}) 'r) -- [0Nf 9.5 0Nf 9.5]
+(at (update {r: (if (> g 0) (at FV 0) i) from: V}) 'r) -- [1.0 9.5 3.0 9.5]
+(at (select {r: (if (> g 0) (at FV 0) (> i 2) (at IV 0) 1) from: V}) 'r) -- [1.0 9.5 9.0 9.5]

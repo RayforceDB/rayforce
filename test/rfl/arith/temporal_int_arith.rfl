@@ -219,7 +219,7 @@
 ;; a DATE arm beside a TIME arm has no common type (#1337; this boxed the
 ;; cells per row)
 (select {r: (if (> c 4) (+ d 1) t) from: Q}) !- type
-(try (select {r: (cond ((> c 4) (+ d 1)) (else d)) from: Q}) (fn [e] (at e 'msg))) -- "'cond' undefined"
+(at (select {r: (cond ((> c 4) (+ d 1)) (else d)) from: Q}) 'r) -- (at (select {r: (if (> c 4) (+ d 1) d) from: Q}) 'r)
 ;; a null literal beside a TIME arm is a TIME null, on this per-row route too
 ;; (#1485; it boxed the cells with a DATE null)
 (repr (at (select {r: (if (> c 4) (+ t 1000) 0Nd) from: Q}) 'r)) -- "[0Nt 00:00:01.001 00:00:00.999 0Nt -596:31:22.647 0Nt 24:00:00.999]"
