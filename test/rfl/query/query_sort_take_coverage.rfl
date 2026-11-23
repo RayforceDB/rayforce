@@ -1163,7 +1163,10 @@ Ctg -- 1
 ;; the eval-level route copies the columns its clauses name, not the other
 ;; eight (a whole copy peaked at 13 MB here; the aggregate route stays
 ;; under 0.7 MB, 1.25 MB with a carried key; a where: on the key's hidden
-;; name carries it at 1.35 MB, 5.8 MB as a whole copy)
+;; name carries it at 1.35 MB, 5.8 MB as a whole copy).  A value key groups
+;; on v2 as a column key does (#1460): under a where: its serial path peaks
+;; at 3.1 MB on these 40000 rows, a column key's at 2.5 MB; over 4M flat
+;; rows both routes peak at 0.46 MB.
 (.db.splayed.set "/tmp/rfl_cklocal/m/2024.01.01/t/" (table [k y a b c d e f g h] (list (% (til 20000) 7) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000))))
 (.db.splayed.set "/tmp/rfl_cklocal/m/2024.01.02/t/" (table [k y a b c d e f g h] (list (% (til 20000) 7) (+ 20000 (til 20000)) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000) (til 20000))))
 (set Pmk (.db.parted.get "/tmp/rfl_cklocal/m/" 't))
@@ -1171,7 +1174,7 @@ Ctg -- 1
 (set Kmk (% (til 40000) 5))
 (set fmk (fn [t k] (select {s: (sum y) by: k from: t where: (> y 15)})))
 (set gmk (fn [t k] (select {s: (count (distinct y)) by: k from: t where: (> y 15)})))
-(< (at (.mem.ts (fmk Pmk Kmk)) 'peak-live-bytes) 1000000) -- true
+(< (at (.mem.ts (fmk Pmk Kmk)) 'peak-live-bytes) 4000000) -- true
 (< (at (.mem.ts (gmk Pmk Kmk)) 'peak-live-bytes) 8000000) -- true
 (fmk Pmk Kmk) -- (fmk Fmk Kmk)
 (set hmk (fn [t k] (select {s: (sum y) by: k from: t where: (> k 1)})))
@@ -1189,8 +1192,9 @@ Ctg -- 1
 ((fn [t k] (value (select {c: (count (distinct y)) by: k from: t where: (< k 3)}))) Pcd Kcr) -- (list [1 2] [2 2])
 ((fn [t k] (value (select {c: (count (distinct y)) by: k from: t where: (== k 1)}))) Pcd Kcr) -- (list [1] [2])
 ;; the aggregate grouping by a local named like a column, under a where:
-;; on that name, reads the local on a parted table too (it raised length)
-((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Pcd Kcr) -- (list [2 3] [90 20])
+;; on that name, reads the local on a parted table too (it raised length);
+;; its groups come first-seen, as the count-distinct form's above (#1460)
+((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Pcd Kcr) -- (list [3 2] [20 90])
 ((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Pcd Kcr) -- ((fn [t k] (value (select {c: (sum y) by: k from: t where: (> k 1)}))) Tcd Kcr)
 ;; the key's own name in an aggregate reads the local as any other name of
 ;; that value does on the same grouping
