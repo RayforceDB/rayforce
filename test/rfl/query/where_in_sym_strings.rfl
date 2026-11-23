@@ -36,6 +36,39 @@
 (.sys.exec "printf '%s\n' '(set L (list \"b16_fresh_a\" \"b16_fresh_b\"))' '(set V [\"b16_fresh_a\" \"b16_fresh_b\"])' '(set D \"/tmp/rfl_where_in_sym_strings/\")' '(set f (fn [t] (println (at (select {from: t where: (in s L) n: n}) (quote n))) (println (at (select {from: t where: (in s V) n: n}) (quote n))) (println (at (select {from: t where: (in s \"b16_fresh_a\") n: n}) (quote n)))))' '(f (.db.splayed.get (concat D \"fp/\")))' '(f (.db.splayed.get (concat D \"fh/\")))' '(f (.db.splayed.get (concat D \"fc/\")))' '(f (.db.parted.get (concat D \"fq/\") (quote t)))' > /tmp/rfl_where_in_sym_strings/fresh.rfl") -- 0
 (.sys.exec "./rayforce /tmp/rfl_where_in_sym_strings/fresh.rfl </dev/null > /tmp/rfl_where_in_sym_strings/fresh.out 2>&1") -- 0
 (.sys.exec "printf '[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4 1 2 4]\n[1 2 4 1 2 4]\n[1 4 1 4]\n' | cmp -s - /tmp/rfl_where_in_sym_strings/fresh.out") -- 0
+;; Every representation, every route, each in a fresh process that has not
+;; interned the column's symbols (the child script spells them as strings
+;; only): plain, hashed, compressed, compressed hashed, parted and compressed
+;; parted; a literal vector, list and atom, a bound vector, list and atom, a
+;; non-scan operand, a conjunct, and the evaluator's fallback.  The set mixes
+;; a present string, an absent one and "" (which selects the null rows, as
+;; == does).
+(set FX (table [s n] (list (as 'SYM ["b16_fx_a" "b16_fx_b" "" "b16_fx_a"]) [1 2 3 4])))
+(set FH (table [s n] (list (.idx.hash (at FX 's)) (at FX 'n))))
+(set FD "/tmp/rfl_where_in_sym_strings/fx/")
+(.db.splayed.set (concat FD "sp/") FX {compress: false})
+(.db.splayed.set (concat FD "sh/") FH {compress: false})
+(.db.splayed.set (concat FD "sc/") FX {compress: true})
+(.db.splayed.set (concat FD "sch/") FH {compress: true})
+(.db.splayed.set (concat FD "p/1/t/") FX (concat FD "p/.sym"))
+(.db.splayed.set (concat FD "p/2/t/") FX (concat FD "p/.sym"))
+(.db.splayed.set (concat FD "pc/1/t/") FX (concat FD "pc/.sym") {compress: true})
+(.db.splayed.set (concat FD "pc/2/t/") FX (concat FD "pc/.sym") {compress: true})
+;; one child: `pre` then `pred` against the table `ld` loads; 0 when it prints `exp`
+(set FR (fn [ld pre pred exp] (.sys.exec (str-join (list "printf '%s\n' '" pre "' '(set X " ld ")' '(println (at (select {from: X where: " pred " n: n}) (quote n)))' > " FD "c.rfl && [ \"$(./rayforce " FD "c.rfl 2>&1)\" = '" exp "' ]") ""))))
+(set M "[\"b16_fx_a\" \"b16_fx_zz\" \"\"]")
+(set FRALL (fn [ld E] (list (FR ld "" (str-join (list "(in s " M ")") "") (at E 0)) (FR ld "" (str-join (list "(not-in s " M ")") "") (at E 1)) (FR ld "" "(in s (list \"b16_fx_a\" \"b16_fx_zz\" \"\"))" (at E 0)) (FR ld "" "(in s \"b16_fx_a\")" (at E 2)) (FR ld "" "(not-in s \"b16_fx_a\")" (at E 3)) (FR ld (str-join (list "(set V " M ")") "") "(in s V)" (at E 0)) (FR ld "(set L (list \"b16_fx_a\" \"b16_fx_zz\" \"\"))" "(in s L)" (at E 0)) (FR ld "(set A \"b16_fx_a\")" "(in s A)" (at E 2)) (FR ld "" (str-join (list "(in (first s) " M ")") "") (at E 4)) (FR ld "" (str-join (list "(and (> n 0) (in s " M "))") "") (at E 0)) (FR ld "(set pos1 (fn [x] (> x 0)))" (str-join (list "(and (pos1 n) (in s " M "))") "") (at E 0)))))
+(set Z11 (take 0 11))
+(FRALL (str-join (list "(.db.splayed.get \"" FD "sp/\")") "") ["[1 3 4]" "[2]" "[1 4]" "[2]" "[1 2 3 4]"]) -- Z11
+(FRALL (str-join (list "(.db.splayed.get \"" FD "sh/\")") "") ["[1 3 4]" "[2]" "[1 4]" "[2]" "[1 2 3 4]"]) -- Z11
+(FRALL (str-join (list "(.db.splayed.get \"" FD "sc/\")") "") ["[1 3 4]" "[2]" "[1 4]" "[2]" "[1 2 3 4]"]) -- Z11
+(FRALL (str-join (list "(.db.splayed.get \"" FD "sch/\")") "") ["[1 3 4]" "[2]" "[1 4]" "[2]" "[1 2 3 4]"]) -- Z11
+(FRALL (str-join (list "(.db.parted.get \"" FD "p/\" (quote t))") "") ["[1 3 4 1 3 4]" "[2 2]" "[1 4 1 4]" "[2 2]" "[1 2 3 4 1 2 3 4]"]) -- Z11
+(FRALL (str-join (list "(.db.parted.get \"" FD "pc/\" (quote t))") "") ["[1 3 4 1 3 4]" "[2 2]" "[1 4 1 4]" "[2 2]" "[1 2 3 4 1 2 3 4]"]) -- Z11
+;; "" agrees with ==: the null rows, in memory too
+(at (select {from: FX where: (in s [""]) n: n}) 'n) -- (at (select {from: FX where: (== s "") n: n}) 'n)
+(at (select {from: FX where: (not-in s [""]) n: n}) 'n) -- (at (select {from: FX where: (!= s "") n: n}) 'n)
+(at (select {from: FX where: (in s (list "" "b16_fx_b")) n: n}) 'n) -- [2 3]
 ;; a string no symbol spells matches no row and is never interned: many
 ;; distinct absent strings leave the symbol table where it was
 (set ABS1493 (as 'STR (map (fn [j] (format "b16_absent_%" j)) (til 500))))

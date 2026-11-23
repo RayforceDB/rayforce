@@ -2056,94 +2056,52 @@ static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
     return v ? v : ray_error("oom", NULL);
 }
 
-/* The symbol domain the SYM column `col_op` scans resolves its cells over,
- * read without decoding the column: a generation-2 column's directory, a
- * plain or parted vector's own (a parted one's representative segment).
- * NULL when `col_op` is not a scan of a column of the default table. */
-static struct ray_sym_domain_s* in_sym_col_domain(ray_graph_t* g, ray_op_t* col_op) {
-    if (!col_op || col_op->opcode != OP_SCAN || !g->table || g->table->type != RAY_TABLE)
-        return NULL;
-    ray_op_ext_t* x = find_ext(g, col_op->id);
-    if (!x) return NULL;
-    uint16_t tid = 0;
-    memcpy(&tid, x->base.pad, sizeof tid);
-    if (tid != 0) return NULL;
-    ray_col_meta_t m;
-    if (!ray_table_col_meta(g->table, x->sym, &m)) return NULL;
-    if (m.enc) {
-        ray_enccol_t* ee = ray_enccol_of(m.enc);
-        return ee ? ee->dom : NULL;
-    }
-    ray_t* col = ray_table_col(g->table, x->sym);
-    if (!col || RAY_IS_ERR(col)) { if (col) ray_error_free(col); return NULL; }
-    ray_t* rep = sym_domain_rep(col);
-    return rep ? ray_sym_vec_domain(rep) : NULL;
-}
-
-/* The global symbol id of the string p[0..l) for a membership against a
- * column over `dom`: the symbol when the process already has it; else,
- * when the column's own domain holds the string (a column loaded from disk
- * holds symbols a fresh process has not interned), the string interned, so
- * the SYM kernel maps the id into the column's domain by its text, as for
- * a 'sym literal.  -1 when neither holds it: no row matches, and the
- * symbol table does not grow by a string the data never held. */
-static int64_t in_sym_set_id(struct ray_sym_domain_s* dom, const char* p, size_t l) {
-    int64_t id = ray_sym_find(p, l);
-    if (id >= 0) return id;
-    if (dom && ray_sym_domain_find(dom, p, l) >= 0) return ray_sym_intern(p, l);
-    return -1;
-}
-
-/* The set of `(in col set)` over a SYM column when it holds strings — a
- * string atom, a string vector literal ["a" "b"], or a list of atoms in_list_set_atoms
- * accepts with at least one string — as the symbol vector it means: a
- * string reads as the symbol it spells, as it does against `==` (expr.c's
- * SYM vs STR comparison), a quoted symbol stays itself, and an atom of
- * another type matches no row and is dropped.  A name bound to such a set
- * is read through its value.  Strings resolve through in_sym_set_id: a
- * string no symbol spells matches no row and is never interned.
- * NULL when `set` holds no string: the set compiles as before. */
-static ray_t* in_sym_set_const(ray_graph_t* g, ray_t* set, ray_op_t* col_op) {
+/* The set of `(in col set)` over a SYM operand when it holds strings — a
+ * string atom, a string vector ["a" "b"], or a list of atoms
+ * in_list_set_atoms accepts with at least one string, literal or through a
+ * bound name — as the string vector of its texts: a string as written, a
+ * quoted symbol by its name; an atom of another type matches no row and is
+ * dropped.  The membership kernel reads a string set against a SYM operand
+ * as the symbols it spells, each looked up in the operand's own domain
+ * (in_build_ctx_core), so a string reads as `==` reads it in a query, and
+ * nothing is interned: a string no symbol of the column spells matches no
+ * row.  "" (the null symbol's text) is left out and reported in *has_empty:
+ * the caller adds `(== col "")` so it selects what `==` selects.  NULL when
+ * `set` holds no string: the set compiles as before. */
+static ray_t* in_sym_set_const(ray_graph_t* g, ray_t* set, bool* has_empty) {
+    *has_empty = false;
     if (!set || (set->attrs & ATTR_QUOTED)) return NULL;
-    struct ray_sym_domain_s* dom = in_sym_col_domain(g, col_op);
     /* a name bound to a string vector or a string atom: its value */
     ray_t* bv = in_set_bound_value(g, set);
     if (bv && (bv->type == RAY_STR || bv->type == -RAY_STR)) set = bv;
     ray_t** e = NULL;
-    int64_t from = 0, n = 0;
-    bool strvec = set->type == RAY_STR;
-    if (set->type == -RAY_STR) {                           /* (in s "a") */
-        int64_t id = in_sym_set_id(dom, ray_str_ptr(set), ray_str_len(set));
-        ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 1);
-        if (v && !RAY_IS_ERR(v) && id >= 0) v = ray_vec_append(v, &id);
-        return v ? v : ray_error("oom", NULL);
-    }
-    if (!strvec) {
+    int64_t from = 0, n = 1;
+    if (set->type == RAY_STR) {
+        n = ray_len(set);
+    } else if (set->type != -RAY_STR) {
         if (!in_list_set_atoms(g, set, &e, &from, &n)) return NULL;
         bool any_str = false;
         for (int64_t i = from; i < n; i++)
             if (e[i]->type == -RAY_STR) { any_str = true; break; }
         if (!any_str) return NULL;
-    } else {
-        n = ray_len(set);
     }
-    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, n - from);
+    ray_t* v = ray_vec_new(RAY_STR, n - from);
     for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++) {
-        int64_t id;
-        if (strvec) {
-            size_t len = 0;
-            const char* p = ray_str_vec_get(set, i, &len);
-            if (!p) continue;                              /* a null string */
-            id = in_sym_set_id(dom, p, len);
+        const char* p = NULL;
+        size_t len = 0;
+        if (set->type == RAY_STR) {
+            p = ray_str_vec_get(set, i, &len);
+        } else if (set->type == -RAY_STR) {
+            p = ray_str_ptr(set); len = ray_str_len(set);
         } else if (e[i]->type == -RAY_STR) {
-            id = in_sym_set_id(dom, ray_str_ptr(e[i]), ray_str_len(e[i]));
+            p = ray_str_ptr(e[i]); len = ray_str_len(e[i]);
         } else if (e[i]->type == -RAY_SYM) {
-            id = e[i]->i64;
-        } else {
-            continue;
+            ray_t* t = ray_sym_str(e[i]->i64);
+            if (t) { p = ray_str_ptr(t); len = ray_str_len(t); }
         }
-        if (id < 0) continue;
-        v = ray_vec_append(v, &id);
+        if (!p) continue;
+        if (len == 0) { *has_empty = true; continue; }
+        v = ray_str_vec_append(v, p, len);
     }
     return v ? v : ray_error("oom", NULL);
 }
@@ -3074,9 +3032,38 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                     return NULL;
                 }
                 if ((ctor == ray_in || ctor == ray_not_in) &&
-                    left->opcode != OP_CONST && (lt == RAY_STR || lt == RAY_SYM)) {
-                    ray_t* sv = lt == RAY_SYM ? in_sym_set_const(g, elems[2], left)
-                                              : in_str_set_const(g, elems[2]);
+                    left->opcode != OP_CONST && lt == RAY_SYM) {
+                    bool has_empty = false;
+                    ray_t* sv = in_sym_set_const(g, elems[2], &has_empty);
+                    if (sv && RAY_IS_ERR(sv)) {
+                        graph_compile_failure(g, sv);
+                        return NULL;
+                    }
+                    if (sv) {
+                        right = ray_const_vec(g, sv);
+                        ray_release(sv);
+                        if (!right) return NULL;
+                        ray_op_t* m = ctor(g, &g->nodes[left_id], right);
+                        if (!m || !has_empty) return m;
+                        /* "" selects what (== col "") selects (the null
+                         * symbol's rows), which membership masks out */
+                        uint32_t m_id = m->id;
+                        ray_t* es = ray_str("", 0);
+                        if (!es || RAY_IS_ERR(es)) return NULL;
+                        ray_op_t* c = ray_const_atom(g, es);
+                        ray_release(es);
+                        if (!c) return NULL;
+                        bool in = ctor == ray_in;
+                        ray_op_t* q = in ? ray_eq(g, &g->nodes[left_id], c)
+                                         : ray_ne(g, &g->nodes[left_id], c);
+                        if (!q) return NULL;
+                        return in ? ray_or(g, &g->nodes[m_id], q)
+                                  : ray_and(g, &g->nodes[m_id], q);
+                    }
+                }
+                if ((ctor == ray_in || ctor == ray_not_in) &&
+                    left->opcode != OP_CONST && lt == RAY_STR) {
+                    ray_t* sv = in_str_set_const(g, elems[2]);
                     if (sv && RAY_IS_ERR(sv)) {
                         graph_compile_failure(g, sv);
                         return NULL;
