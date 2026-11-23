@@ -11556,10 +11556,14 @@ ray_t* ray_active_query_literal(int64_t sym) {
 /* A per-row or per-group pass runs an `if` as control flow, one arm a row,
  * so arms with no common type come back as a LIST of their cells where the
  * planned routes raise (#1337, #1485): a temporal arm beside a numeric or
- * another temporal one.  For `expr` holding an `if`, such a LIST of atoms
- * raises the planner's error; one temporal type beside null cells only (a
- * null literal arm) is that type's column, as ray_if makes it.  `res` is
- * consumed; anything else is returned as it is. */
+ * another temporal one.  Only an `expr` that IS the `if` is judged (its
+ * cells are its arms' values; an `if` inside a call, `(at v (if c 0 1))`,
+ * does not make the call's values its arms').  Its arms, through nested
+ * `if`s in arm position, are walked for null literals: a null cell of a
+ * null literal's type is that literal and takes the other arms' type, as
+ * ray_if makes it; any other cell, a computed null included, counts by its
+ * type.  A mix raises the planner's error; one temporal type is that
+ * type's column.  `res` is consumed; anything else is returned as it is. */
 static bool rw_cell_temporal(int8_t t) {
     return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
 }
@@ -11567,9 +11571,27 @@ static bool rw_cell_numeric(int8_t t) {
     return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
            t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
 }
+/* The types of the null literal arms of the `if` `e` into `nt` (a bitmap
+ * over atom types), through nested `if`s in arm position. */
+static void rw_if_null_arms(ray_t* e, ray_t* tbl, uint64_t* nt, int depth);
+static void rw_if_null_arm(ray_t* arm, ray_t* tbl, uint64_t* nt, int depth) {
+    if (arm && ray_is_atom(arm) && RAY_ATOM_IS_NULL(arm)) {
+        int8_t t = (int8_t)-arm->type;
+        if (t > 0 && t < 64) *nt |= (uint64_t)1 << t;
+    } else rw_if_null_arms(arm, tbl, nt, depth + 1);
+}
+static void rw_if_null_arms(ray_t* e, ray_t* tbl, uint64_t* nt, int depth) {
+    if (depth > 32 || !rw_if_kind(e, tbl)) return;
+    /* (if c1 a1 c2 a2 ... else): arms at the even slots, the else last */
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 2; i < e->len - 1; i += 2) rw_if_null_arm(es[i], tbl, nt, depth);
+    rw_if_null_arm(es[e->len - 1], tbl, nt, depth);
+}
 static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res) {
     if (!res || RAY_IS_ERR(res) || res->type != RAY_LIST || res->len == 0 || !tbl ||
-        tbl->type != RAY_TABLE || !rw_has_if(expr, tbl, 0)) return res;
+        tbl->type != RAY_TABLE || !rw_if_kind(expr, tbl)) return res;
+    uint64_t nt = 0;
+    rw_if_null_arms(expr, tbl, &nt, 0);
     ray_t** cells = (ray_t**)ray_data(res);
     int8_t tt = 0, other = 0;
     for (int64_t i = 0; i < res->len; i++) {
@@ -11577,7 +11599,7 @@ static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res) {
         if (!c || !ray_is_atom(c)) return res;
         int8_t t = (int8_t)-c->type;
         if (!rw_cell_temporal(t) && !rw_cell_numeric(t)) return res;
-        if (RAY_ATOM_IS_NULL(c)) continue;
+        if (RAY_ATOM_IS_NULL(c) && t > 0 && t < 64 && (nt >> t & 1)) continue;
         if (rw_cell_temporal(t)) {
             if (tt == 0) tt = t;
             else if (t != tt) { other = t; break; }

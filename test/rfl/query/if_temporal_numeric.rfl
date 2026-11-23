@@ -262,8 +262,18 @@
 (select {from: T r: (if (> g 0) d (count (distinct k)))}) !- type
 (update {from: T r: (if (> g 0) d (at V 0))}) !- type
 (select {from: T r: (if (> g 0) d (at [2024.01.01D00:00:00.000000000] 0))}) !- type
-(R (select {from: T r: (if (> g 0) d (at [0N] 0))})) -- [0Nd 2024.01.02 2024.01.03]
+(select {from: T r: (if (> g 0) d (at [0N] 0))}) !- type
 (R (select {from: T r: (if (> g 0) (at V 0) (at V 1))})) -- [2 1 1]
+;; only the `if` itself is judged: an `if` that picks an index inside a call
+;; does not own the call's values, whose cells stay as they were
+(set DV [2024.05.05])
+(R (select {from: T r: (at (enlist (at DV 0) 7) (if (> g 0) 0 1))})) -- (list 7 2024.05.05 2024.05.05)
+;; a computed null is its arm's type, not a null literal: I64 beside DATE
+(select {from: T r: (if (> g 0) (at DV 0) (at [0Nl] 0))}) !- type
+(select {from: T r: (if (> g 0) (at DV 0) (> e 5) 5 (at DV 0))}) !- type
+;; null literals in a chain and in a nested `if` still take the DATE type
+(R (select {from: T r: (if (> g 0) (at DV 0) (> e 25) 0N (at DV 0))})) -- [2024.05.05 2024.05.05 2024.05.05]
+(R (select {from: T r: (if (> g 0) (if (> e 25) (at DV 0) 0N) 0Nd)})) -- [0Nd 0Nd 2024.05.05]
 ;; a TIMESPAN computed from two times or timestamps is a temporal arm too
 (select {from: T r: (if (> g 0) (- p p) 5)}) !- type
 (select {from: T r: (if (> g 0) (- t t) e)}) !- type
