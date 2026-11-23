@@ -160,6 +160,7 @@ static void lang_setup(void) {
 }
 
 static void lang_teardown(void) {
+    ray_test_hooks_off();                 /* kept decodes drained before the heap goes */
     ray_runtime_destroy(__RUNTIME);
 }
 
@@ -12754,6 +12755,90 @@ static test_result_t test_select_gen2_ranged_no_decode(void) {
     PASS();
 }
 
+/* A grouped (or keyless) aggregate whose argument is an expression is
+ * evaluated with the columns the expression reads bound, not every column
+ * of the table: over a compressed (generation 2) table the columns it does
+ * not read stay encoded.  Binding them all decoded the whole table for an
+ * aggregate that read one column of it, and a server holding a 100-column
+ * table decoded all of them for every such query.  Every query answers as
+ * over the plain table. */
+static test_result_t test_select_agg_expr_decodes_read_columns(void) {
+    ray_t* r = ray_eval_str(
+        ray_test_tmp("(do (set __ae_i (til 140000)) "
+        "    (set __ae_h (% (* __ae_i 2654435761) 1000003)) "
+        "    (set __ae_u (% __ae_h 9000)) "
+        "    (set __ae_et (+ 2013.07.01 (% __ae_h 31))) "
+        "    (set __ae_x (- (% (* __ae_h 7919) 100000) 50000)) "
+        "    (set __ae_y (/ (as 'F64 (% __ae_h 2500)) 7.0)) "
+        "    (set __ae_s (as 'STR (% (* __ae_h 13) 100003))) "
+        "    (set __ae_T (table [u et x y s] (list __ae_u __ae_et __ae_x __ae_y __ae_s))) "
+        "    (.sys.exec \"rm -rf /tmp/rf_test_agg_expr/\") "
+        "    (.db.splayed.set \"/tmp/rf_test_agg_expr/t/\" __ae_T {compress: true}) "
+        "    (set __ae_F (.db.splayed.get \"/tmp/rf_test_agg_expr/t/\")) "
+        "    (set __ae_fp (fn [x] (ser (xasc x (cols x))))) "
+        "    0)"));
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FMT(!RAY_IS_ERR(r), "setup: %s", ray_error_msg() ? ray_error_msg() : "");
+    ray_release(r);
+    ray_t* F = ray_eval_str("__ae_F");
+    TEST_ASSERT_NOT_NULL(F); TEST_ASSERT_FALSE(RAY_IS_ERR(F));
+    static const char* const C[] = { "u", "et", "x", "y", "s" };
+    enum { NC = sizeof C / sizeof C[0] };
+    ray_t* E[NC];
+    for (int c = 0; c < NC; c++) {
+        E[c] = ray_table_get_col_enc(F, ray_sym_intern(C[c], strlen(C[c])));
+        TEST_ASSERT_FMT(E[c] != NULL, "column %s is not stored encoded", C[c]);
+        TEST_ASSERT_NULL(ray_enccol_decoded_peek(E[c]));
+    }
+    /* each query and the columns it reads; the others must stay encoded */
+    static const struct { const char* q; const char* reads; } Q[] = {
+        { "(select {from: %s by: u f: (min (dd et))})",                 "u et" },
+        { "(select {from: %s by: u f: (max (+ x 1))})",                 "u x" },
+        { "(select {from: %s by: u d: (count (distinct (+ x 1)))})",    "u x" },
+        { "(select {from: %s by: u m: (med (+ y 1.0))})",               "u y" },
+        { "(select {from: %s by: u s: (sum (- et 2013.07.01))})",       "u et" },
+        { "(select {from: %s by: u l: (max (strlen s))})",              "u s" },
+        { "(select {from: %s by: x d: (count (distinct (dd et)))})",    "x et" },
+        { "(select {from: %s by: s d: (count (distinct (+ x 1)))})",    "s x" },
+        { "(select {from: %s by: s m: (med (+ y 1.0))})",               "s y" },
+        { "(select {from: %s by: [u s] m: (med (+ y 1.0))})",           "u s y" },
+        { "(select {from: %s by: [u s] d: (count (distinct (+ x 1)))})", "u s x" },
+        { "(select {from: %s by: [u s] d: (count (distinct (+ x 1))) m: (med (+ y 1.0))})", "u s x y" },
+        { "(select {from: %s f: (min (dd et))})",                       "et" },
+        { "(select {from: %s m: (med (+ y 1.0))})",                     "y" },
+    };
+    const char* why = NULL;
+    size_t at = 0;
+    int64_t wm = ray_heap_anon_watermark();
+    for (; at < sizeof Q / sizeof Q[0] && !why; at++) {
+        ray_heap_set_anon_watermark(1);         /* no decode kept from the query before */
+        ray_enccol_cache_trim();
+        ray_heap_set_anon_watermark(wm);
+        char qf[512], qt[512], q[1400];
+        snprintf(qf, sizeof qf, Q[at].q, "__ae_F");
+        snprintf(qt, sizeof qt, Q[at].q, "__ae_T");
+        snprintf(q, sizeof q, "(do (set __ae_a (__ae_fp %s)) (set __ae_b (__ae_fp %s)) (if (== (count __ae_a) (count __ae_b)) (all (== __ae_a __ae_b)) false))", qf, qt);
+        ray_t* same = ray_eval_str(q);
+        if (!same || RAY_IS_ERR(same)) why = "error";
+        else if (same->type != -RAY_BOOL || !same->b8) why = "answers differ";
+        if (same) ray_release(same);
+        char reads[32], name[16];
+        snprintf(reads, sizeof reads, " %s ", Q[at].reads);
+        for (int c = 0; c < NC && !why; c++) {
+            snprintf(name, sizeof name, " %s ", C[c]);
+            if (!strstr(reads, name) && ray_enccol_decoded_peek(E[c])) why = C[c];
+        }
+    }
+    ray_heap_set_anon_watermark(1);
+    ray_enccol_cache_trim();
+    ray_heap_set_anon_watermark(wm);
+    ray_t* cleanup = ray_eval_str(ray_test_tmp("(.sys.exec \"rm -rf /tmp/rf_test_agg_expr/\")"));
+    ray_release(cleanup);
+    ray_release(F);
+    TEST_ASSERT_FMT(!why, "query %zu %s: %s decoded", at - 1, Q[at - 1].q, why ? why : "");
+    PASS();
+}
+
 /* ---- The exact top-N-by-count grouping (ops/query.c select_topk_hh) ----
  * 200 K rows over 110 K groups: thirteen heavy ones (800-900 rows, four tied
  * at 850 and two at 820, so a cut of 4, 6 or 10 falls inside a tie), the
@@ -14813,6 +14898,7 @@ const test_entry_t lang_entries[] = {
     { "lang/select/derived_key_two_pass", test_select_derived_key_two_pass, lang_setup, lang_teardown },
     { "lang/select/derived_key_gen2_no_decode", test_select_derived_key_gen2_no_decode, lang_setup, lang_teardown },
     { "lang/select/gen2_ranged_no_decode", test_select_gen2_ranged_no_decode, lang_setup, lang_teardown },
+    { "lang/select/agg_expr_decodes_read_columns", test_select_agg_expr_decodes_read_columns, lang_setup, lang_teardown },
     { "lang/select/topk_count_exact", test_select_topk_count_exact, lang_setup, lang_teardown },
     { "lang/select/topk_count_guards", test_select_topk_count_guards, lang_setup, lang_teardown },
     { "lang/select/topk_count_mem_gate", test_select_topk_count_mem_gate, lang_setup, lang_teardown },

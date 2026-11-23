@@ -3208,7 +3208,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
  * names are reserved cannot occur for a real table column, so a rejected
  * bind is simply skipped. */
 /* Active query from-table for tree-walk literal-column resolution (B3
- * Part 2).  bind_all_columns sets it (returning the previous value); each
+ * Part 2).  bind_referenced_query sets it (returning the previous value); each
  * caller restores that saved value via `g_active_query_table = _aqt;`
  * before every matching ray_env_pop_scope (including error returns).
  * Column-membership scoped and query-only by construction — see
@@ -4100,30 +4100,6 @@ void ray_query_resume(const ray_query_state_t* saved) {
     g_query_dependencies = (query_dependency_cache_t*)saved->dependencies;
 }
 
-
-/* Mount columns AND publish `tbl` as the active query table; `*err` is the
- * owned error of a column that failed to materialize (else NULL).  Returns the
- * previously-active table so the caller can restore it after the matching
- * ray_env_pop_scope (sub-selects nest, so save/restore is required). */
-static ray_t* bind_all_columns(ray_t* tbl, ray_t** err) {
-    ray_t* prev = g_active_query_table;
-    g_active_query_table = tbl;
-    *err = NULL;
-    int64_t ncols = ray_table_ncols(tbl);
-    for (int64_t c = 0; c < ncols; c++) {
-        int64_t cn = ray_table_col_name(tbl, c);
-        ray_t*  cv = ray_table_col_idx(tbl, c);
-        if (cv && RAY_IS_ERR(cv)) {
-            /* A column that cannot materialize: the caller takes the error
-             * in place of its evaluation result, then restores the previous
-             * table and pops the scope as on any other error. */
-            *err = cv;
-            break;
-        }
-        if (cv) ray_env_set_query_local(cn, cv);
-    }
-    return prev;
-}
 
 static ray_t* group_key_eval(ray_t* v, ray_t* tbl);
 static ray_t* query_eval_bound(ray_t* e, ray_t* tbl);
@@ -11069,9 +11045,9 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
-     * tree-walk eval below (mirrors the DAG path's bind_all_columns).  Save
+     * tree-walk eval below (mirrors the DAG path's bind_referenced_query).  Save
      * the previous value and restore it before EVERY exit from this scope
-     * (including error returns), exactly as the bind_all_columns sites do. */
+     * (including error returns), exactly as the bind_referenced_query sites do. */
     ray_t* _aqt = g_active_query_table;
     g_active_query_table = tbl;
 
@@ -11825,9 +11801,9 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
     /* B3 Part 2: publish `tbl` as the active query table so a literal
      * column-name symbol inside `expr` resolves to its column during the
-     * tree-walk eval below (mirrors the DAG path's bind_all_columns).  Save
+     * tree-walk eval below (mirrors the DAG path's bind_referenced_query).  Save
      * the previous value and restore it before EVERY exit from this scope
-     * (including error returns), exactly as the bind_all_columns sites do. */
+     * (including error returns), exactly as the bind_referenced_query sites do. */
     ray_t* _aqt = g_active_query_table;
     int64_t _aqr = g_active_query_row;
     ray_t*  _aqrt = g_active_query_row_tbl;
@@ -12017,7 +11993,7 @@ static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
 /* Evaluate a whole-column projection (is_whole_column_projection) ONCE against
  * the full table: every column is bound as a complete vector (via
- * bind_all_columns, exactly as the DAG path does) and the expression is
+ * bind_referenced_query, exactly as the DAG path does) and the expression is
  * evaluated a single time, so `distinct`/`asc`/`desc`/`reverse` receive the
  * whole column instead of one scalar cell.  The returned vector (caller owns)
  * defines its output column's length, which may differ from the table's row
@@ -12623,7 +12599,7 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
         /* Bind table cols and eval — same pattern as the existing path. */
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err_ = NULL;
-        ray_t* _aqt = bind_all_columns(tbl, &bind_err_);
+        ray_t* _aqt = bind_referenced_query(tbl, &col_expr, 1, &bind_err_);   /* decodes what col_expr reads */
         src = bind_err_ ? bind_err_ : query_eval_bound(col_expr, tbl);
         g_active_query_table = _aqt;
         ray_env_pop_scope();
@@ -12761,7 +12737,7 @@ static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
     if (!src) {
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err_ = NULL;
-        ray_t* _aqt = bind_all_columns(tbl, &bind_err_);
+        ray_t* _aqt = bind_referenced_query(tbl, &col_expr, 1, &bind_err_);   /* decodes what col_expr reads */
         src = bind_err_ ? bind_err_ : query_eval_bound(col_expr, tbl);
         g_active_query_table = _aqt;
         ray_env_pop_scope();
@@ -13997,7 +13973,7 @@ static ray_t* count_distinct_per_group_buf(ray_t* inner_expr, ray_t* tbl,
     if (!src) {
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err_ = NULL;
-        ray_t* _aqt = bind_all_columns(tbl, &bind_err_);
+        ray_t* _aqt = bind_referenced_query(tbl, &inner_expr, 1, &bind_err_);   /* decodes what inner_expr reads */
         src = bind_err_ ? bind_err_ : query_eval_bound(inner_expr, tbl);
         g_active_query_table = _aqt;
         ray_env_pop_scope();
@@ -14217,7 +14193,7 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
     if (!src) {
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err_ = NULL;
-        ray_t* _aqt = bind_all_columns(tbl, &bind_err_);
+        ray_t* _aqt = bind_referenced_query(tbl, &inner_expr, 1, &bind_err_);   /* decodes what inner_expr reads */
         src = bind_err_ ? bind_err_ : query_eval_bound(inner_expr, tbl);
         g_active_query_table = _aqt;
         ray_env_pop_scope();
@@ -16740,10 +16716,13 @@ static ray_t* bind_referenced_columns(ray_t* tbl, ray_t* const* exprs, int64_t n
     return NULL;
 }
 
-/* bind_referenced_columns with bind_all_columns' contract: publishes `tbl`
- * as the active query table and returns the previous one (the caller
- * restores it after the matching ray_env_pop_scope); `*err` is the owned
- * error of a column that failed to materialize, else NULL. */
+/* Mount the columns exprs[0..n) read (bind_referenced_columns) AND publish
+ * `tbl` as the active query table; `*err` is the owned error of a column
+ * that failed to materialize (else NULL).  Returns the previously-active
+ * table so the caller can restore it after the matching ray_env_pop_scope
+ * (sub-selects nest, so save/restore is required).  Every evaluation of an
+ * expression over the table binds this way: binding every column decoded
+ * the whole table for an aggregate that read one column of it. */
 static ray_t* bind_referenced_query(ray_t* tbl, ray_t* const* exprs, int64_t n, ray_t** err) {
     ray_t* prev = g_active_query_table;
     g_active_query_table = tbl;
@@ -17115,7 +17094,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl, unsigned p
                 !temporal_materialize_pure(es[arg], tbl)) continue;
             if (ray_env_push_query_scope() != RAY_OK) goto oom;
             ray_t* bind_err_ = NULL;
-            ray_t* previous = bind_all_columns(tbl, &bind_err_);
+            ray_t* previous = bind_referenced_query(tbl, &es[arg], 1, &bind_err_);   /* decodes what the argument reads */
             ray_t* value = bind_err_ ? bind_err_ : query_eval_bound(es[arg], tbl);
             g_active_query_table = previous;
             ray_env_pop_scope();
@@ -27404,7 +27383,7 @@ by_dict_done:
                      * reads, as sel_compact does for the where: rows.  A
                      * select reading no column (`(count [1 2 3])`) keeps
                      * the parted table: its columns are bound as they are
-                     * (bind_all_columns in eval_expr_whole_column_impl),
+                     * (bind_referenced_query in eval_expr_whole_column_impl),
                      * but nothing reads one, so none is materialised. */
                     eval_tbl = parted_flatten_read_cols(dict, tbl, true, NULL);
                     if (!eval_tbl || RAY_IS_ERR(eval_tbl)) {

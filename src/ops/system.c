@@ -1381,6 +1381,10 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "anon-committed",  14, ray_heap_anon_committed()     },
         { "anon-peak",        9, ray_heap_anon_peak()          },
         { "anon-watermark",  14, ray_heap_anon_watermark()     },
+        /* the whole-column decodes of encoded columns kept from one statement
+         * to the next (ray_enccol_cache_trim keeps them within a quarter of
+         * the watermark), pools and parted segments included */
+        { "decode-cache-bytes", 18, ray_enccol_cache_bytes()   },
         /* the heap's mappings locked against swap-out (bytes mapped, not
          * resident), the kernel's refusals, and the bytes left unlocked */
         { "locked-bytes",    12, ray_heap_locked_bytes()       },
