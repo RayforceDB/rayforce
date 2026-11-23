@@ -151,6 +151,12 @@
 (try (select {s: (max (+ V3 (count v))) from: T by: k}) Re)               -- Refold
 ;; under `at` it is the whole vector, never sliced
 (Sk (select {s: (max (+ v (at WV (count v)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (at WV (count (at r 'v)))))))
+;; read in a helper the planner inlines, as written out
+(set hw (fn [x] (+ WV (count x))))
+(Sk (select {s: (max (hw v)) from: T by: k}) 'k)                           -- (Sk (select {s: (max (+ WV (count v))) from: T by: k}) 'k)
+(Sk (select {s: (max (hw v)) from: T by: k}) 'k)                           -- (Rw Kk TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ v (hw v))) from: T by: k}) 'k)                     -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
+(Sk (select {s: (max (+ v (hw v))) from: T where: (> v 2) by: k}) 'k)     -- (Rw Kk (> (at T 'v) 2) (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
 
 ;; ── the shapes dev answered keep their route ────────────────────────────────
 ;; an aggregate the DAG declines for temporal arithmetic, under a bare key,
@@ -213,8 +219,23 @@
 (Sk (select {s: (max (+ WF (count v))) from: P by: k}) 'k)                  -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ w (count (at r 'v))))))
 (Sk (select {s: (max (+ WF (count v))) from: P where: (> v 2) by: k}) 'k)   -- (PW (at F 'k) (> (at F 'v) 2) (fn [w r] (max (+ w (count (at r 'v))))))
 (Sk (select {s: (max (h v)) from: P by: k}) 'k)                             -- (Rc F (at F 'k) 'v (fn [x] (max (h x))))
+(set hf (fn [x] (+ WF (count x))))
+(Sk (select {s: (max (hf v)) from: P by: k}) 'k)                            -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ v (hf v))) from: P by: k}) 'k)                      -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
+;; a DATE plus an integer over a parted table under a bare key: that route
+;; has no key column for it there, so it takes the by-dict form
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/pd/2024.01.01/t/" (select {from: TD where: (== (% (til (count TD)) 2) 0)}) "/tmp/rfl_by_nested_aggregate/pd/.sym")
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/pd/2024.01.02/t/" (select {from: TD where: (== (% (til (count TD)) 2) 1)}) "/tmp/rfl_by_nested_aggregate/pd/.sym")
+(set PD (.db.parted.get "/tmp/rfl_by_nested_aggregate/pd/" 't))
+(set FD (select {from: PD}))
+(Sk (select {s: (first (+ d 1)) from: PD by: (% v 3)}) 'v)   -- (Rc FD (% (at FD 'v) 3) 'd (fn [x] (first (+ x 1))))
+(Sk (select {s: (max (- d 1)) from: PD by: (% v 3)}) 'v)     -- (Rc FD (% (at FD 'v) 3) 'd (fn [x] (max (- x 1))))
+(Sk (select {s: (first (+ d 1)) from: PD where: (> v 2) by: (% v 3)}) 'v)  -- (Rc (select {from: FD where: (> v 2)}) (% (at (select {from: FD where: (> v 2)}) 'v) 3) 'd (fn [x] (first (+ x 1))))
+(Sk (select {s: (first (+ d 1)) from: PD by: (xbar v 5)}) 'v)  -- (Rc FD (xbar (at FD 'v) 5) 'd (fn [x] (first (+ x 1))))
 ;; the mapped table goes first, so the unfused pass can write the fixture again
 (set P 0)
 (set F 0)
 (set FW 0)
+(set PD 0)
+(set FD 0)
 (.sys.exec "rm -rf /tmp/rfl_by_nested_aggregate/") -- 0

@@ -16883,16 +16883,16 @@ static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg) {
  * makes a column).  An unbound name counts, so its own
  * error (schema, name) is the one reported.  A lambda or let body is its
  * own scope and is not descended. */
-static bool sym_is_row_global(int64_t s, ray_t* tbl);         /* defined below */
+static bool sym_is_row_global(ray_t* e, ray_t* tbl);         /* defined below */
 static bool head_reads_rows_elementwise(ray_t* e);
 
 static bool expr_reads_rows_outside_agg(ray_t* e, ray_t* tbl, bool elementwise) {
     if (!e) return false;
+    if (elementwise && sym_is_row_global(e, tbl)) return true;
     if (e->type == -RAY_SYM)
         return !(e->attrs & ATTR_QUOTED) &&
                (ray_sym_is_dotted(e->i64) || tbl_has_col(tbl, e->i64) ||
-                !(ray_env_get_lexical_local(e->i64) || ray_env_get(e->i64)) ||
-                (elementwise && sym_is_row_global(e->i64, tbl)));
+                !(ray_env_get_lexical_local(e->i64) || ray_env_get(e->i64)));
     if (e->type != RAY_LIST || e->len < 1) return false;
     ray_t** el = (ray_t**)ray_data(e);
     if (select_alias_skip_form(el[0]) || is_agg_expr(e)) return false;
@@ -18418,15 +18418,34 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     return out ? out : ray_error("oom", NULL);
 }
 
-/* A global vector as long as the table, read where a column would be: an
+/* A vector as long as the table, a global or a literal (an inlined
+ * helper's global arrives as its quoted value), read where a column would be: an
  * operand of an atomic builtin or an aggregate's argument, as the DAG
  * reads it ((max (+ W 0)) slices W by the group).  Not under a call that
- * indexes it, (at W i), where the whole vector is meant. */
-static bool sym_is_row_global(int64_t s, ray_t* tbl) {
-    if (tbl_has_col(tbl, s) || ray_sym_is_dotted(s) || ray_env_has_lexical_local(s)) return false;
-    ray_t* b = ray_env_get(s);
+ * indexes it, (at W i), where the whole vector is meant.  The vector, or
+ * NULL. */
+static ray_t* row_global_value(ray_t* e, ray_t* tbl) {
+    ray_t* b = NULL;
+    if (e->type == -RAY_SYM) {
+        int64_t s = e->i64;
+        if ((e->attrs & ATTR_QUOTED) || tbl_has_col(tbl, s) || ray_sym_is_dotted(s) ||
+            ray_env_has_lexical_local(s)) return NULL;
+        b = ray_env_get(s);
+    } else if (e->type > 0 && e->type != RAY_LIST) {
+        b = e;
+    } else if (e->type == RAY_LIST && e->len == 2) {
+        ray_t** el = (ray_t**)ray_data(e);   /* (quote vec), as inlining writes a global */
+        if (el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED) &&
+            el[0]->i64 == ray_sym_intern("quote", 5) && el[1] && el[1]->type > 0 &&
+            el[1]->type != RAY_LIST)
+            b = el[1];
+    }
     int64_t nr = ray_table_nrows(tbl);
-    return b && ray_is_vec(b) && nr > 1 && ray_len(b) == nr;
+    return b && ray_is_vec(b) && nr > 1 && ray_len(b) == nr ? b : NULL;
+}
+
+static bool sym_is_row_global(ray_t* e, ray_t* tbl) {
+    return row_global_value(e, tbl) != NULL;
 }
 
 static bool head_reads_rows_elementwise(ray_t* e) {
@@ -18441,14 +18460,14 @@ static bool head_reads_rows_elementwise(ray_t* e) {
 /* Collects into elem[] the row globals `e` reads elementwise, into other[]
  * those it reads any other way.  A lambda or let body is not descended. */
 static void row_globals_walk(ray_t* e, ray_t* tbl, bool elementwise,
-                             int64_t* elem, int* ne, int64_t* other, int* no, int cap) {
+                             ray_t** elem, int* ne, ray_t** other, int* no, int cap) {
     if (!e) return;
-    if (e->type == -RAY_SYM) {
-        if ((e->attrs & ATTR_QUOTED) || !sym_is_row_global(e->i64, tbl)) return;
-        int64_t* set = elementwise ? elem : other;
+    ray_t* b = row_global_value(e, tbl);
+    if (b) {
+        ray_t** set = elementwise ? elem : other;
         int* n = elementwise ? ne : no;
-        for (int i = 0; i < *n; i++) if (set[i] == e->i64) return;
-        if (*n < cap) set[(*n)++] = e->i64;
+        for (int i = 0; i < *n; i++) if (set[i] == b) return;
+        if (*n < cap) set[(*n)++] = b;
         return;
     }
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return;
@@ -18460,8 +18479,8 @@ static void row_globals_walk(ray_t* e, ray_t* tbl, bool elementwise,
 }
 
 /* The row globals `e` reads only elementwise, into out[0..cap). */
-static int row_globals_of(ray_t* e, ray_t* tbl, int64_t* out, int cap) {
-    int64_t other[16];
+static int row_globals_of(ray_t* e, ray_t* tbl, ray_t** out, int cap) {
+    ray_t* other[16];
     int ne = 0, no = 0;
     row_globals_walk(e, tbl, false, out, &ne, other, &no, cap < 16 ? cap : 16);
     int n = 0;
@@ -18473,18 +18492,20 @@ static int row_globals_of(ray_t* e, ray_t* tbl, int64_t* out, int cap) {
     return n;
 }
 
-/* Each name in syms[0..n) replaced by the hidden column names[i], outside
- * lambda and let bodies.  A new reference. */
-static ray_t* row_globals_subst(ray_t* e, const int64_t* syms, const int64_t* names, int n) {
-    if (e && e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
-        for (int i = 0; i < n; i++) if (syms[i] == e->i64) return ray_sym(names[i]);
+/* Each read of the vector vecs[i] (a name bound to it, or the value
+ * itself) replaced by the hidden column names[i], outside lambda and let
+ * bodies.  A new reference. */
+static ray_t* row_globals_subst(ray_t* e, ray_t* tbl, ray_t* const* syms, const int64_t* names, int n) {
+    ray_t* b = e ? row_global_value(e, tbl) : NULL;
+    if (b) {
+        for (int i = 0; i < n; i++) if (syms[i] == b) return ray_sym(names[i]);
     }
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 ||
         select_alias_skip_form(((ray_t**)ray_data(e))[0])) { if (e) ray_retain(e); return e; }
     ray_t* out = ray_list_new(e->len);
     ray_t** el = (ray_t**)ray_data(e);
     for (int64_t i = 0; i < e->len && out && !RAY_IS_ERR(out); i++) {
-        ray_t* c = i == 0 ? (ray_retain(el[0]), el[0]) : row_globals_subst(el[i], syms, names, n);
+        ray_t* c = i == 0 ? (ray_retain(el[0]), el[0]) : row_globals_subst(el[i], tbl, syms, names, n);
         if (!c || RAY_IS_ERR(c)) { ray_release(out); return c ? c : ray_error("oom", NULL); }
         out = ray_list_append(out, c);
         ray_release(c);
@@ -18534,14 +18555,17 @@ static ray_t* select_plan_row_globals(ray_t* dict, ray_t* tbl) {
     if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
     const int64_t* rid = select_clause_ids();
     int64_t nd = ray_dict_len(dict);
-    int64_t syms[8], names[8];
+    ray_t* syms[8];
+    int64_t names[8];
     int ns = 0;
     for (int64_t i = 0; i < nd; i++) {
         if (select_clause_key(rid, sym_cell_runtime_id(keys, i))) continue;
         ray_t* v = ((ray_t**)ray_data(vals))[i];
-        if (!v || v->type != RAY_LIST || !grouped_output_nested_agg(v, false)) continue;
-        int64_t rg[8];
-        int n = row_globals_of(v, tbl, rg, 8);
+        ray_t* x = NULL;
+        if (!v || v->type != RAY_LIST || !grouped_nested_agg_inlined(v, tbl, false, &x)) continue;
+        ray_t* rg[8];
+        int n = row_globals_of(x ? x : v, tbl, rg, 8);
+        if (x) ray_release(x);
         for (int j = 0; j < n && ns < 8; j++) {
             bool seen = false;
             for (int k = 0; k < ns; k++) seen |= syms[k] == rg[j];
@@ -18557,7 +18581,7 @@ static ray_t* select_plan_row_globals(ray_t* dict, ray_t* tbl) {
         int bn = snprintf(buf, sizeof buf, "__rg%d", i);
         names[i] = ray_sym_intern(buf, (size_t)bn);
         if (tbl_has_col(base, names[i])) { ray_release(base); return NULL; }
-        base = ray_table_add_col(base, names[i], ray_env_get(syms[i]));
+        base = ray_table_add_col(base, names[i], syms[i]);
     }
     if (!base || RAY_IS_ERR(base)) return base ? base : ray_error("oom", NULL);
     ray_t* engine = dict;
@@ -18566,8 +18590,11 @@ static ray_t* select_plan_row_globals(ray_t* dict, ray_t* tbl) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         if (select_clause_key(rid, kid)) continue;
         ray_t* v = ((ray_t**)ray_data(vals))[i];
-        if (!v || v->type != RAY_LIST || !grouped_output_nested_agg(v, false)) continue;
-        ray_t* nv = row_globals_subst(v, syms, names, ns);
+        ray_t* x = NULL;
+        if (!v || v->type != RAY_LIST || !grouped_nested_agg_inlined(v, tbl, false, &x)) continue;
+        /* a helper's global is renamed in its inlined body */
+        ray_t* nv = row_globals_subst(x ? x : v, tbl, syms, names, ns);
+        if (x) ray_release(x);
         if (!nv || RAY_IS_ERR(nv)) { ray_release(engine); engine = nv; break; }
         ray_t* k = ray_sym(kid);
         engine = k && !RAY_IS_ERR(k) ? ray_dict_upsert(engine, k, nv) : engine;
@@ -18707,6 +18734,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         }
     }
     bool needs_eval = keyed != NULL;
+    bool parted = table_has_parted_columns(tbl);
     for (int64_t i = 0; i < nd; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         bool clause = false;
@@ -18719,8 +18747,15 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         /* An aggregate whose argument has no DAG node, (first (at V i)),
          * is evaluated per group: it needs the by-dict form too (#1452).
          * The aggregates the DAG declines for another reason (temporal
-         * arithmetic, a LIST column) keep the bare key they answer on. */
-        if (is_group_dag_agg_expr(v, tbl) && !group_agg_arg_has_no_node(v, tbl)) continue;
+         * arithmetic, a LIST column) keep the bare key they answer on, over
+         * a flat table; over a parted one that route has no key column for
+         * them, so every declined aggregate takes the by-dict form. */
+        if (parted) {
+            ray_t* cerr = NULL;
+            int dag = is_group_dag_agg_expr_dag_safe(v, tbl, &cerr);
+            if (cerr) { ray_error_free(cerr); continue; }
+            if (dag) continue;
+        } else if (is_group_dag_agg_expr(v, tbl) && !group_agg_arg_has_no_node(v, tbl)) continue;
         if (is_decomposable_agg_compound(v, tbl)) continue;
         needs_eval = true;
     }
