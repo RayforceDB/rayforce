@@ -2543,22 +2543,21 @@ ray_t* ray_distinct_fn(ray_t* x) {
         return out;
     }
 
-    /* String distinct: unique chars, sorted */
+    /* String distinct: unique chars in first-occurrence order, as every
+     * other distinct (#1478, #1486) */
     if (ray_is_atom(x) && (-x->type) == RAY_STR) {
         const char* sp = ray_str_ptr(x);
         size_t slen = ray_str_len(x);
         if (slen == 0) { ray_retain(x); return x; }
         char uniq[256];
+        bool seen[256] = {false};
         int nu = 0;
         for (size_t i = 0; i < slen; i++) {
-            int dup = 0;
-            for (int j = 0; j < nu; j++) { if (uniq[j] == sp[i]) { dup = 1; break; } }
-            if (!dup && nu < 256) uniq[nu++] = sp[i];
+            unsigned char c = (unsigned char)sp[i];
+            if (seen[c]) continue;
+            seen[c] = true;
+            uniq[nu++] = (char)c;
         }
-        /* Sort */
-        for (int i = 0; i < nu - 1; i++)
-            for (int j = i + 1; j < nu; j++)
-                if ((unsigned char)uniq[i] > (unsigned char)uniq[j]) { char t = uniq[i]; uniq[i] = uniq[j]; uniq[j] = t; }
         // cppcheck-suppress uninitvar // only the first nu bytes, filled above, are read
         return ray_str(uniq, (size_t)nu);
     }

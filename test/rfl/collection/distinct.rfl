@@ -16,7 +16,7 @@
 
 (distinct [true true]) -- [true]
 (distinct [0x12 0x12 0x10]) -- [0x12 0x10]
-(distinct "test") -- "est"
+(distinct "test") -- "tes"
 (distinct "") -- ""
 (distinct [1h 2h 2h]) -- [1 2]
 (count (distinct [1i 0Ni 1i])) -- 2
