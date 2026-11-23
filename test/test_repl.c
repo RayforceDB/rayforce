@@ -594,6 +594,65 @@ static int run_piped_with_input(const char* script) {
     return repl ? 0 : -1;
 }
 
+/* ─── REPL children: a fresh process, never a forked copy ─────────── */
+
+/* A test that drives the REPL from a forked child execs this binary with
+ * `--repl-child VARIANT` (test/main.c) rather than running the REPL in the
+ * forked copy of the test process.  A forked copy inherits the parent's
+ * heaps: its frees and allocations would act on blocks the parent owns, and
+ * a spill mapping is not inherited at all (heap_spill_no_fork, #1138), so a
+ * copy that reached spilled memory would fault.  The runtime's contract is
+ * that a forked child execs.  What the child keeps across exec — its pty or
+ * pipe as stdin/stdout/stderr, an ignored SIGHUP, the environment — is set
+ * up before the exec.  VARIANT: "poll" or "nopoll" (a REPL with or without
+ * a poll), "poll-rt" (the poll also wired to the runtime, for :listen), and
+ * "piped-listen" (as poll-rt, its output discarded, a SIGALRM ending the
+ * poll loop, 2 s at the latest). */
+#ifndef RAY_OS_WINDOWS
+const char* test_self_exe(void);   /* test/main.c */
+
+static void repl_exec_child(const char* variant) {
+    const char* exe = test_self_exe();
+    execl(exe, exe, "--repl-child", variant, (char*)NULL);
+    _exit(127);
+}
+#endif
+
+int repl_child_main(const char* variant) {
+#ifdef RAY_OS_WINDOWS
+    (void)variant;
+    return 2;
+#else
+    bool rt_poll  = strcmp(variant, "poll-rt") == 0 || strcmp(variant, "piped-listen") == 0;
+    bool use_poll = rt_poll || strcmp(variant, "poll") == 0;
+    if (!use_poll && strcmp(variant, "nopoll") != 0) return 2;
+    ray_runtime_create(0, NULL);
+    ray_poll_t* poll = use_poll ? ray_poll_create() : NULL;
+    if (use_poll && !poll) { ray_runtime_destroy(__RUNTIME); return 1; }
+    if (rt_poll) ray_runtime_set_poll(poll);
+    if (strcmp(variant, "piped-listen") == 0) {
+        g_alarm_exit_poll = poll;
+        signal(SIGALRM, alarm_poll_exit_handler);
+        alarm(2);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+    }
+    ray_repl_t* repl = ray_repl_create(poll);
+    if (repl) {
+        ray_repl_run(repl);
+        ray_repl_destroy(repl);
+    }
+    if (poll) ray_poll_destroy(poll);
+    ray_runtime_destroy(__RUNTIME);
+    /* exit() (not _exit) lets an atexit-installed coverage writer flush. */
+    exit(0);
+#endif
+}
+
 /* ─── PTY helper for interactive (run_interactive) coverage ──────── */
 
 #ifndef RAY_OS_WINDOWS
@@ -619,18 +678,8 @@ static int run_pty_with_input(const char* input, int use_poll)
     if (pid < 0) return -1;
 
     if (pid == 0) {
-        /* Child: re-init runtime since worker threads don't survive fork. */
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = use_poll ? ray_poll_create() : NULL;
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        /* exit() (not _exit) lets atexit-installed llvm-cov writer flush. */
-        exit(0);
+        /* Child: exec this binary to run the REPL in a fresh process (#1138). */
+        repl_exec_child(use_poll ? "poll" : "nopoll");
     }
 
     /* Parent: non-blocking master so we can drain without hanging. */
@@ -1839,35 +1888,7 @@ static int run_piped_with_poll_listen(void)
         close(pfd[0]);
         clearerr(stdin);
 
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = ray_poll_create();
-        if (!poll) { ray_runtime_destroy(__RUNTIME); exit(1); }
-
-        /* Wire poll to runtime so :listen can call ray_ipc_listen. */
-        ray_runtime_set_poll(poll);
-
-        /* SIGALRM exits the poll: from the parent once the loop answers,
-         * or after 2 s at the latest. */
-        g_alarm_exit_poll = poll;
-        signal(SIGALRM, alarm_poll_exit_handler);
-        alarm(2);
-
-        /* Redirect stdout/stderr to /dev/null — child output not needed. */
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);   /* enters run_piped → hits line 1146 */
-            ray_repl_destroy(repl);
-        }
-        ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child("piped-listen");
     }
 
     /* Parent: write ":listen PORT\n" then close write end to signal EOF.
@@ -1940,16 +1961,7 @@ static int run_pty_with_env_and_input(const char* input, int use_poll,
 
     if (pid == 0) {
         if (envvar) setenv(envvar, envval, 1);
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = use_poll ? ray_poll_create() : NULL;
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child(use_poll ? "poll" : "nopoll");
     }
 
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -2253,18 +2265,7 @@ static int run_pty_listen_with_poll(const char* input)
     if (pid < 0) return -1;
 
     if (pid == 0) {
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = ray_poll_create();
-        /* Wire poll to runtime so h_listen can bind. */
-        if (poll) ray_runtime_set_poll(poll);
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child("poll-rt");
     }
 
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -2489,15 +2490,7 @@ static int run_pty_nopoll_master_close(void)
          * line 959 in the no-poll loop. */
         signal(SIGHUP, SIG_IGN);
         pty_child_stderr_off();
-        ray_runtime_create(0, NULL);
-        /* No poll — uses blocking fallback loop. */
-        ray_repl_t* repl = ray_repl_create(NULL);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child("nopoll");
     }
 
     /* Wait for the child to print banner and start blocking on getc. */
@@ -2562,16 +2555,7 @@ static int run_pty_remote_ctrlD(uint16_t server_port)
     if (pid < 0) return -1;
 
     if (pid == 0) {
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = ray_poll_create();
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child("poll");
     }
 
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -2693,16 +2677,7 @@ static int run_pty_remote_master_close(uint16_t server_port)
          * enough for ray_term_getc to see EIO and take the sz<=0 path. */
         signal(SIGHUP, SIG_IGN);
         pty_child_stderr_off();
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = ray_poll_create();
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) {
-            ray_repl_run(repl);
-            ray_repl_destroy(repl);
-        }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child("poll");
     }
 
     int flags = fcntl(master_fd, F_GETFL, 0);
@@ -2787,13 +2762,7 @@ static int run_pty_sigint_during_eval(int use_poll)
     if (pid < 0) return -1;
 
     if (pid == 0) {
-        ray_runtime_create(0, NULL);
-        ray_poll_t* poll = use_poll ? ray_poll_create() : NULL;
-        ray_repl_t* repl = ray_repl_create(poll);
-        if (repl) { ray_repl_run(repl); ray_repl_destroy(repl); }
-        if (poll) ray_poll_destroy(poll);
-        ray_runtime_destroy(__RUNTIME);
-        exit(0);
+        repl_exec_child(use_poll ? "poll" : "nopoll");
     }
 
     int flags = fcntl(master_fd, F_GETFL, 0);

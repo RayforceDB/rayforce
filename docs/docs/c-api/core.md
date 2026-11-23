@@ -67,6 +67,10 @@ int main(int argc, char** argv) {
 }
 ```
 
+#### Processes and `fork()`
+
+A child that an embedding process `fork()`s and that runs Rayforce code must `exec` a fresh program, which then calls `ray_runtime_create` itself.  Calling `ray_runtime_create` in the forked copy does not give it an allocator of its own: the copy keeps the parent's heaps.  Memory that has spilled to files is not inherited by a forked child at all, so a forked copy that reaches it faults.  See [the memory guide on spilling](../guides/memory.md#8-total-ram-and-out-of-core-spill).
+
 ## Memory Management
 
 Rayforce uses its own buddy allocator with slab cache. Never use `malloc`/`free` for `ray_t` objects. All objects use COW (copy-on-write) ref counting for safe sharing.

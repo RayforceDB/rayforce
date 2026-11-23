@@ -1694,6 +1694,15 @@ static void results_drain(pool_t* P, int timeout_ms) {
  * it.  Write the worker's history up to and including it, one name a line,
  * for `--replay FILE` to run in that order in one process. */
 static const char* g_argv0 = "./rayforce.test";
+
+/* This binary's path, for a test child that execs it (test_repl.c). */
+const char* test_self_exe(void) {
+#if defined(__linux__)
+    if (access("/proc/self/exe", X_OK) == 0) return "/proc/self/exe";
+#endif
+    return g_argv0;
+}
+int repl_child_main(const char* variant);   /* test_repl.c */
 static void replay_note(const worker_t* me, int job) {
     static int seq;
     char path[128];
@@ -1814,6 +1823,9 @@ static int run_parallel(int nworkers, const char* times_path,
 int main(int argc, char** argv) {
 #if !defined(_WIN32)
     g_argv0 = argv[0];
+    /* A REPL test's child: a fresh process running one REPL (test_repl.c). */
+    if (argc == 3 && strcmp(argv[1], "--repl-child") == 0)
+        return repl_child_main(argv[2]);
 #endif
 #if defined(_WIN32)
     (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */

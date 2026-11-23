@@ -195,6 +195,58 @@ static void dfd_validate_freelists(void);
 #define dfd_purge_range(lo, hi) ((void)0)
 #endif
 
+/* A spill mapping is MAP_SHARED over its file, so a fork()ed child that
+ * inherited it would write the parent's pages: its frees, allocations and
+ * reference counts would rewrite blocks and freelist links the parent still
+ * reads (#1138).  The runtime's contract is that a forked child execs (the
+ * process's own children do, through system() and popen()), so a spill
+ * mapping is not inherited at all: the child of a fork() has no mapping
+ * there, and a child that breaks the contract and reaches spilled memory
+ * faults at once instead of corrupting the parent.  Copying the spilled
+ * bytes into the child instead would put them back in RAM in every child,
+ * a fork()+exec() one included, which is what spilling avoids.  Linux
+ * marks the range MADV_DONTFORK; macOS and the BSDs give it no inheritance
+ * with minherit (VM_INHERIT_NONE from <mach/vm_inherit.h> on macOS,
+ * INHERIT_NONE or MAP_INHERIT_NONE from <sys/mman.h> on the BSDs).  A
+ * POSIX platform with none of these fails to compile rather than keep the
+ * shared inheritance silently; WebAssembly has no fork().  A call the
+ * kernel refuses is reported once on stderr: the mapping stays usable, only
+ * the guard is missing. */
+#if RAY_HEAP_FILE_SPILL
+#if defined(__APPLE__)
+#  include <mach/vm_inherit.h>   /* VM_INHERIT_NONE, for minherit */
+#endif
+#if defined(MADV_DONTFORK)
+#  define RAY_SPILL_NO_FORK(p, len)  madvise((p), (len), MADV_DONTFORK)
+#  define RAY_SPILL_NO_FORK_CALL     "madvise(MADV_DONTFORK)"
+#elif defined(__linux__)
+#  error "MADV_DONTFORK is needed: spill mappings must not be inherited by fork() (#1138)"
+#elif defined(__APPLE__) && defined(VM_INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK(p, len)  minherit((p), (len), VM_INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK_CALL     "minherit(VM_INHERIT_NONE)"
+#elif defined(INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK(p, len)  minherit((p), (len), INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK_CALL     "minherit(INHERIT_NONE)"
+#elif defined(MAP_INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK(p, len)  minherit((p), (len), MAP_INHERIT_NONE)
+#  define RAY_SPILL_NO_FORK_CALL     "minherit(MAP_INHERIT_NONE)"
+#elif defined(RAY_OS_WASM) || defined(__EMSCRIPTEN__)
+#  define RAY_SPILL_NO_FORK(p, len)  ((void)(p), (void)(len), 0)   /* no fork() */
+#  define RAY_SPILL_NO_FORK_CALL     "none"
+#else
+#  error "no way to keep spill mappings from being inherited by fork() on this platform (#1138)"
+#endif
+static void heap_spill_no_fork(void* p, size_t len) {
+    if (RAY_SPILL_NO_FORK(p, len) != 0) {
+        static _Atomic(bool) warned = false;
+        if (!atomic_exchange_explicit(&warned, true, memory_order_relaxed))
+            fprintf(stderr, "rayforce: %s on a spill mapping failed (errno %d %s): "
+                            "a forked child would share spilled memory\n",
+                    RAY_SPILL_NO_FORK_CALL, errno, strerror(errno));
+    }
+}
+#endif
+
 /* Portable disk-block preallocation.  Returns 0 on success, errno-style
  * code on failure (matching posix_fallocate's contract).  Linux has
  * posix_fallocate natively.  macOS uses fcntl(F_PREALLOCATE) — try
@@ -348,9 +400,9 @@ void ray_mem_trace_end(ray_mem_trace_t* out) {
  * never OOM-kill).  When a new anon mapping would push this past the
  * watermark, it is routed to a spill file instead — or, when no spill file can
  * be made, to RAM anyway: this never rejects work, it just picks disk over
- * RAM.  A spill mapping is MAP_SHARED: after fork() parent and child share
- * it instead of each having a copy, so a child that keeps running rayforce
- * code must not write blocks the parent spilled. */
+ * RAM.  A spill mapping is MAP_SHARED, and a fork()ed child does not inherit
+ * it (heap_spill_no_fork): a child that keeps running rayforce code faults on
+ * spilled memory rather than writing the parent's pages. */
 static _Atomic(int64_t) g_anon_committed = 0;
 static _Atomic(int64_t) g_anon_watermark = 0;   /* 0 = the default (heap_anon_watermark) */
 static _Atomic(int64_t) g_anon_peak      = 0;   /* high-water of g_anon_committed */
@@ -1012,6 +1064,7 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
             swap_path = NULL;
             break;
         }
+        heap_spill_no_fork(mapped, pool_size);
 
         /* Count the swap-backed pool as committed working set — it is a RAM
          * substitute with preallocated blocks, not an evictable file cache.
@@ -1645,6 +1698,7 @@ static void* heap_direct_map_file(ray_heap_t* h, size_t map_size,
     if (mapped == MAP_FAILED) {
         close(fd); unlink(path); ray_sys_free(path); return NULL;
     }
+    heap_spill_no_fork(mapped, map_size);
     /* Count as committed working set — a RAM substitute with preallocated
      * blocks (matches heap_add_pool's swap-pool accounting). */
     ray_sys_track_add((int64_t)map_size);
@@ -2892,6 +2946,7 @@ static void* heap_sys_map_file(size_t size) {
     if (heap_preallocate(fd, 0, (off_t)size) == 0) {
         p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED) p = NULL;
+        else heap_spill_no_fork(p, size);
     }
     unlink(path);
     close(fd);
