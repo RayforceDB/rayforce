@@ -1,3 +1,4 @@
+;; @requires: posix
 ;; A leading UTF-8 byte-order mark (EF BB BF) is an encoding signature, not
 ;; data (#1147).  It used to stay glued to the first header name, or to the
 ;; first cell when the file has no header.
