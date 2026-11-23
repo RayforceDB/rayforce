@@ -2173,6 +2173,8 @@ static ray_t* table_materialise(ray_t* t) {
         ray_t* key = ray_sym(name_id);
         ray_t* col = ray_at_fn(t, key);
         ray_release(key);
+        /* a compressed partition answers a lazy column: it is read here, once */
+        if (col && !RAY_IS_ERR(col) && ray_is_lazy(col)) col = ray_lazy_materialize(col);
         if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("oom", NULL); }
         out = ray_table_add_col(out, name_id, col);
         ray_release(col);
