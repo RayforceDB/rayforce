@@ -59,6 +59,25 @@ static test_result_t test_atom_bool(void) {
     PASS();
 }
 
+/* A BOOL atom is read by its b8 byte when it is stored into a wider vector
+ * (#1513): the rest of the payload word is not part of the value, and
+ * elem_as_i64 used to return the whole word. */
+static test_result_t test_atom_bool_store_reads_b8(void) {
+    ray_t* t = ray_bool(true);
+    TEST_ASSERT_NOT_NULL(t);
+    t->i64 = (int64_t)0x7700000000000001ULL;   /* b8 stays 1, the word does not */
+    TEST_ASSERT_EQ_U(t->b8, 1);
+    TEST_ASSERT_EQ_I(elem_as_i64(t), 1);
+    ray_t* v = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = 1;
+    TEST_ASSERT_EQ_I(store_typed_elem(v, 0, t), 0);
+    TEST_ASSERT_EQ_I(((int64_t*)ray_data(v))[0], 1);
+    ray_release(v);
+    ray_release(t);
+    PASS();
+}
+
 /* ---- U8 atom ----------------------------------------------------------- */
 
 static test_result_t test_atom_u8(void) {
@@ -640,6 +659,7 @@ const test_entry_t atom_entries[] = {
     { "atom/bool", test_atom_bool, atom_setup, atom_teardown },
     { "atom/u8", test_atom_u8, atom_setup, atom_teardown },
     { "atom/single_char_str", test_atom_single_char_str, atom_setup, atom_teardown },
+    { "atom/bool_store_reads_b8", test_atom_bool_store_reads_b8, atom_setup, atom_teardown },
     { "atom/i16", test_atom_i16, atom_setup, atom_teardown },
     { "atom/i32", test_atom_i32, atom_setup, atom_teardown },
     { "atom/i64", test_atom_i64, atom_setup, atom_teardown },
