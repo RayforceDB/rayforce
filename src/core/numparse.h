@@ -57,6 +57,23 @@ size_t ray_parse_f64(const char *src, size_t len, double   *dst);
 size_t ray_parse_u64_hex(const char *src, size_t len, uint64_t *dst);
 
 /* ----------------------------------------------------------------------------
+ * Float text independent of the process's LC_NUMERIC.
+ *
+ *   ray_strtod_c   — strtod in the C locale: reads '.' as the decimal point.
+ *   ray_snprintf_c — snprintf whose output is a single number (a %g/%f/%e
+ *                    conversion, optionally signed): the locale's decimal
+ *                    point is written as '.'.  Returns what snprintf returns,
+ *                    less the bytes a multibyte decimal point gave up.
+ * ---------------------------------------------------------------------------- */
+
+double ray_strtod_c(const char *s, char **end);
+int    ray_snprintf_c(char *buf, size_t cap, const char *fmt, ...)
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    ;
+
+/* ----------------------------------------------------------------------------
  * SWAR (SIMD Within A Register) digit primitives.
  *
  * Caller must guarantee 8 readable bytes at `p` for the 8-digit forms,

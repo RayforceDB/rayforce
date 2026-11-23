@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "core/numparse.h"   /* ray_snprintf_c */
 
 /* ============================================================================
  * Graph execution functions
@@ -985,8 +986,11 @@ ray_t* exec_dijkstra(ray_graph_t* g, ray_op_t* op,
 
     /* Dijkstra requires non-negative edge weights */
     for (int64_t i = 0; i < m; i++) {
-        if (weights[i] < 0.0)
-            return ray_error("domain", "graph.dijkstra: edge weights must be non-negative, got %g at edge %lld", weights[i], (long long)i);
+        if (weights[i] < 0.0) {
+            char t[32];
+            ray_snprintf_c(t, sizeof t, "%g", weights[i]);
+            return ray_error("domain", "graph.dijkstra: edge weights must be non-negative, got %s at edge %lld", t, (long long)i);
+        }
     }
 
     /* Allocate working arrays.
