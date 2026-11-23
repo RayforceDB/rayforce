@@ -359,11 +359,12 @@
 (set TLS (table [l n] (list (list ["a" "b"] "a" ["c"]) [1 2 3])))
 (select {from: TLS where: (in l ["a"])}) !- nyi
 
-;; a column of another type against a string set matches no row, as bare
+;; a numeric column against a string set matches no row, as bare; a SYM
+;; column reads the strings as symbols in a query, as == does (#1493)
 (set TY (table [y n] (list ['p 'qq] [1 2])))
 (in ['p 'qq] ["qq"]) -- [false false]
-(count (select {from: TY where: (in y ["qq"])})) -- 0
-(count (select {from: TY where: (not-in y ["qq"])})) -- 2
+(count (select {from: TY where: (in y ["qq"])})) -- 1
+(count (select {from: TY where: (not-in y ["qq"])})) -- 1
 (count (select {from: TY where: (in n ["qq"])})) -- 0
 
 ;; a mapped (splayed) string column answers the same
