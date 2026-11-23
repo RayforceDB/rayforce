@@ -6496,6 +6496,25 @@ static test_result_t test_chain_zone_prune(void) {
     PASS();
 }
 
+/* first / last of a stored I64 / F64 column are positional (#1420) and read
+ * the one row from the column's source: a null at that end is the answer,
+ * and nothing is materialized. */
+static test_result_t test_edge_positional_no_materialize(void) {
+    sr_evalf_ok("(.db.splayed.set \"%s/edge/\" (table [v f] (list (concat [0Nl] (til 140000)) "
+                "(concat (as 'F64 (til 140000)) [0Nf]))) {compress: true})", SR_TMP);
+    sr_evalf_ok("(set T (.db.splayed.get \"%s/edge/\"))", SR_TMP);
+    static const char* const q[] = { "(first (at T 'v))", "(last (at T 'f))", NULL };
+    for (int i = 0; q[i]; i++) {
+        ray_enc_counters_reset();
+        ray_t* r = sr_eval(q[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && RAY_ATOM_IS_NULL(r));
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.materialized == 0, "%s materialized %llu", q[i], (unsigned long long)k.materialized);
+        sr_drop(r);
+    }
+    PASS();
+}
+
 /* The directory of a generation-2 TIMESPAN column answers min/max of an
  * all-null column with 0Nn, as every route does (#1419), and a column with
  * values with its extremes.  No query reaches it for TIMESPAN today
@@ -6533,6 +6552,7 @@ static test_result_t test_dir_answer_timespan_null(void) {
 
 const test_entry_t scanrange_entries[] = {
     { "scanrange/dir_answer_timespan_null", test_dir_answer_timespan_null, sr_rt_setup, sr_rt_teardown },
+    { "scanrange/edge_positional_no_materialize", test_edge_positional_no_materialize, sr_rt_setup, sr_rt_teardown },
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
     { "scanrange/walk_decoded_cache",      test_walk_decoded_cache,      sr_setup,    sr_teardown },

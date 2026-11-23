@@ -13,6 +13,19 @@
 (first (as 'I64 [])) -- 0Nl
 (set x [0Nl 3])
 (first (+ x 1)) -- 0Nl
+;; a lazy argument too (reverse, asc, desc, distinct return one)
+(first (reverse [3 4 0Nl])) -- 0Nl
+(last (reverse [0Nl 4 3])) -- 0Nl
+(first (reverse [3.0 4.0 0Nf])) -- 0Nf
+(first (reverse (as 'I32 [3 4 0Nl]))) -- 0Ni
+(first (reverse (as 'DATE [3 4 0Nl]))) -- 0Nd
+(first (asc [3 0Nl 4])) -- 0Nl
+(last (desc [3 0Nl 4])) -- 0Nl
+(first (distinct [3 4 0Nl])) -- 0Nl
+(first (reverse (reverse [0Nl 3]))) -- 0Nl
+;; with no null the chain keeps its idiom: first of asc is the min
+(first (asc [3 1 4])) -- 1
+(last (asc [3 1 4])) -- 4
 
 ;; A select skips them, whichever route the argument takes.
 (set T (table [k v f i] (list [a a b] [0Nl 3 0Nl] [0Nf 2.5 0Nf] [0 1 2])))
@@ -52,3 +65,7 @@
 (identical (pivot W 'k 'p 'v first) (pivot W 'k 'p 'v (fn [c] (first c)))) -- true
 (identical (pivot W 'k 'p 'v last) (pivot W 'k 'p 'v (fn [c] (last c)))) -- true
 (at (pivot W 'k 'p 'v first) 'x) -- [0Nl 2]
+(set WS (table [k p s d] (list [a a b b] [x x x x] (as 'SYM ["" "u" "w" ""]) (as 'DATE [0Nl 1 2 0Nl]))))
+(identical (pivot WS 'k 'p 's first) (pivot WS 'k 'p 's (fn [c] (first c)))) -- true
+(identical (pivot WS 'k 'p 'd last) (pivot WS 'k 'p 'd (fn [c] (last c)))) -- true
+(at (pivot WS 'k 'p 'd last) 'x) -- [2000.01.02 0Nd]

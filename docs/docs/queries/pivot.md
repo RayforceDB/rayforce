@@ -68,7 +68,7 @@ Each cell's value is what the aggregate gives over that cell's rows as a plain v
 
 ### Column names
 
-Every aggregation names and orders the value columns by the same rule, whether `pivot` runs as one `OP_PIVOT` node (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`) or calls the function per cell (`med`, a lambda):
+Every aggregation names and orders the value columns by the same rule, whether `pivot` runs as one `OP_PIVOT` node (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`; `first` and `last` of a column that may hold a null run over the rows' numbers and then read each cell's row, so they stay positional) or calls the function per cell (`med`, a lambda):
 
 - A column is named what `(format "%" v)` gives its pivot value `v`: a symbol its name, an integer of any width in decimal, a date, time, timestamp or timespan as such (`2024.01.01`, `09:30:00.000`), an F64 at `%g` precision (`1.5`), an F32 with its `e` (`1.5e`), a U8 as `0x01`, a boolean `true` or `false`, a GUID as its text.
 - Rows whose pivot value is null are kept, in one column named by the type's null: `0Nl`, `0Ni`, `0Nf`, `0Nd`, `0Np`, `0Ng`, and so on. The null symbol's column is named `'`, as `format` writes it.
