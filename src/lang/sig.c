@@ -495,17 +495,18 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
     /* A domain error is a bad value, not a bad call, unless it is about the
      * argument list. */
     if (domain && (!old || !strstr(old, " arg"))) return result;
-    char msg[256];
+    /* The builtin that was called is the innermost one that noted the error: a call
+     * nested inside another keeps the shape of the first, as it keeps the message. */
+    if (ray_error_usage()) return result;
     if (old && *old) {
         /* A message that already names the call shape is left alone. */
         char head[40];
         snprintf(head, sizeof head, "(%s ", e->name);
-        if (strstr(old, head) || strstr(old, "; usage: ")) return result;
-        snprintf(msg, sizeof msg, "%s", old);
-    } else {
-        snprintf(msg, sizeof msg, "%s: argument of the wrong type", e->name);
+        if (strstr(old, head)) return result;
     }
-    ray_error_msg_set("%s; usage: %s", msg, e->usage);
+    /* The message stays what the builtin wrote: the call shape is a field of its
+     * own, which the REPL prints and `try` hands to its handler. */
+    ray_error_usage_set(e->usage);
     return result;
 }
 
@@ -513,7 +514,8 @@ ray_t* ray_sig_arity(const char* name, const char* want, int got) {
     bool own;
     const ray_sig_entry_t* e = find_entry(name, &own, NULL);
     const char* shown = e ? e->name : name;
-    return ray_error("arity", "%s: takes %s argument%s, got %d%s%s", shown, want,
-                     strcmp(want, "1") ? "s" : "", got,
-                     e ? "; usage: " : "", e ? e->usage : "");
+    ray_t* err = ray_error("arity", "%s: takes %s argument%s, got %d", shown, want,
+                           strcmp(want, "1") ? "s" : "", got);
+    if (e) ray_error_usage_set(e->usage);
+    return err;
 }

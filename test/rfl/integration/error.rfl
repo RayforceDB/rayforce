@@ -10,8 +10,8 @@
 ;; A runtime error hands the handler a dict of its code and message inside
 ;; a function as at the top level, never the error object itself: that is
 ;; not refcounted, so a handler returning it rethrew it, and none freed it.
-(try (+ 1 'a) (fn [e] e)) -- (dict [code msg] (list 'type "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"))
-((fn [x] (try (+ x 'a) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"))
+(try (+ 1 'a) (fn [e] (take e 2))) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
+((fn [x] (try (+ x 'a) (fn [e] (take e 2)))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
 ((fn [x] (try (+ x 'a) (fn [e] (type e)))) 1) -- 'DICT
 ((fn [x] (try (raise x) (fn [e] (+ e 1)))) 1) -- 2
 ((fn [x] (try (try (raise x) (fn [e] (raise (+ e 10)))) (fn [e] e))) 1) -- 11

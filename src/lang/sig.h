@@ -32,11 +32,12 @@
  * builtin without an entry. */
 const char* ray_sig_usage(const char* name);
 
-/* An error a builtin returned for a bad call is rewritten to end with the
- * builtin's usage line, so the caller sees which arguments are expected, of
- * which types and in which order.  Only type, length, rank and arity errors
- * are rewritten; any other result is returned as it is.  The message is
- * replaced in place and `result` is returned. */
+/* An error a builtin returned for a bad call gets the builtin's usage line in the
+ * thread's error usage (ray_error_usage), a field of its own next to the message:
+ * the caller sees which arguments are expected, of which types and in which order, and
+ * the message is left as the builtin wrote it.  Only type, length, rank and arity errors
+ * (and a domain error about the argument list) are noted; any other result goes by, and
+ * an error that already has a usage keeps it.  `result` is returned. */
 ray_t* ray_sig_note_err(const char* name, ray_t* result);
 
 /* The test the success path pays: a call that did not fail goes by. */
@@ -46,7 +47,7 @@ static inline ray_t* ray_sig_note(const char* name, ray_t* result) {
 }
 
 /* The arity error of builtin `name` called with `got` arguments where `want`
- * (a count, or a range such as "2 to 4") are taken; carries the usage line. */
+ * (a count, or a range such as "2 to 4") are taken; its usage is the builtin's. */
 ray_t* ray_sig_arity(const char* name, const char* want, int got);
 
 #endif

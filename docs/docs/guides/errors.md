@@ -23,17 +23,17 @@ Both arguments are passed unevaluated (`try` is a special form). The handler is 
 (try
   (+ 1 "hello")
   (fn [err] (println "caught:" err)))
-; caught: {code:type msg:"cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
+; caught: {code:type msg:"cannot add i64 and str" usage:"(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
 ```
 
-When an error occurs without an explicit `raise`, the handler receives a dict of what the engine raised: `code`, the error's class as a symbol (`'type`, `'io`, `'name`, ...), and `msg`, its message as a string (`""` when the error carries none). The REPL prints the same error as `error: type: cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)` (the part after `;` is the usage line, see [Usage Lines](#usage-lines)). Inside a function the handler gets the same dict as at the top level, so a long-running process can report what failed and carry on:
+When an error occurs without an explicit `raise`, the handler receives a dict of what the engine raised: `code`, the error's class as a symbol (`'type`, `'io`, `'name`, ...), and `msg`, its message as a string (`""` when the error carries none). An error from a builtin called with the wrong arguments also has `usage`, the call shape as a string (see [Usage Lines](#usage-lines)): a field of its own, so `msg` is exactly what the builtin wrote and nothing has to be cut off it to compare it. The REPL prints the same error as `error: type: cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)`. Inside a function the handler gets the same dict as at the top level, so a long-running process can report what failed and carry on:
 
 ```lisp
 (set safe (fn [f x]
   (try (f x)
     (fn [e] (dict ['error] (list (format "%: %" (at e 'code) (at e 'msg))))))))
 (safe (fn [x] (+ x 'a)) 1)
-; => {error:"type: cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
+; => {error:"type: cannot add i64 and sym"}
 ```
 
 If the dict itself can't be built because memory has run out, the handler gets `null` instead.
@@ -114,17 +114,23 @@ Occur when a function receives the wrong number of arguments:
 
 ### Usage Lines
 
-A builtin called with the wrong arguments ends its message with `usage:`, the call shape with each
-argument's name and type in the order the builtin takes them, so a caller (a person or a program)
-sees what to change without looking the function up:
+A builtin called with the wrong arguments gives the call shape in `usage`, a field of the error next to
+`code` and `msg`: each argument's name and type, in the order the builtin takes them, so a caller (a person
+or a program) sees what to change without looking the function up. `msg` is unchanged, what the builtin
+wrote; the REPL prints the usage after it, and `try` hands it to the handler as the dict's third key:
 
 ```text
 (top [5 1 9 3])
 ; error: arity: top: takes 2 arguments, got 1; usage: (top <x: vector> <n: int>)
 
-(mavg [1 2 3] 2)
-; error: type: mavg window must be an integer atom; usage: (mavg <window: int> <x: numeric vector>)
+(try (top [5 1 9 3]) (fn [e] e))
+; {code:arity msg:"top: takes 2 arguments, got 1" usage:"(top <x: vector> <n: int>)"}
+
+(try (mavg [1 2 3] 2) (fn [e] (at e 'usage)))
+; "(mavg <window: int> <x: numeric vector>)"
 ```
+
+Match on `code` for the class of the error and read `usage` to show the shape; do not match on the text of `msg`.
 
 The order differs between builtins (`mavg` takes its window first, `top` its vector first), which is
 what the usage line is for. Where a builtin gets its arguments in the wrong order the message says so:

@@ -21,10 +21,10 @@
 (try (sum null) (fn [e] -99)) -- -99
 (try (neg null) (fn [e] -2)) -- -2
 ;; The error's code as a symbol and its message as a string: what the REPL
-;; prints for it, "type: cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)".
-(try (+ 1 'a) (fn [e] e)) -- (dict [code msg] (list 'type "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"))
+;; prints for it, "type: cannot add i64 and sym".
+(try (+ 1 'a) (fn [e] (take e 2))) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
 (try (+ 1 'a) (fn [e] (type (at e 'code)))) -- 'sym
-(try (+ 1 'a) (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "type: cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(try (+ 1 'a) (fn [e] (format "%: %" (at e 'code) (at e 'msg)))) -- "type: cannot add i64 and sym"
 (try (1 2) (fn [e] e)) -- (dict [code msg] (list 'type "head is not callable, got i64"))
 ((fn [] (try (1 2) (fn [e] e)))) -- (dict [code msg] (list 'type "head is not callable, got i64"))
 (try (.db.splayed.get "/no-such-dir-try-raise/t/") (fn [e] (at e 'code))) -- 'io
@@ -33,19 +33,19 @@
 (try (+ 1 'a) type) -- 'DICT
 ;; The same inside a function (the compiled path), from the function's own
 ;; body or from a callee.
-((fn [x] (try (+ x 'a) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"))
+((fn [x] (try (+ x 'a) (fn [e] (take e 2)))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
 (set add_sym (fn [x] (+ x 'b)))
-((fn [x] (try (add_sym x) (fn [e] e))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"))
+((fn [x] (try (add_sym x) (fn [e] (take e 2)))) 1) -- (dict [code msg] (list 'type "cannot add i64 and sym"))
 ((fn [] (try (.db.splayed.get "/no-such-dir-try-raise/t/") (fn [e] (at e 'code))))) -- 'io
 (set add2 (fn [a b] (+ a b)))
 ((fn [] (try (add2 1 2 3) (fn [e] e)))) -- (dict [code msg] (list 'arity "expected 2 args, got 3"))
 (try (map (fn [x] (+ x 'a)) [1 2]) (fn [e] (at e 'code))) -- 'type
-((fn [] (try (map (fn [x] (+ x 'a)) [1 2]) (fn [e] (at e 'msg))))) -- "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+((fn [] (try (map (fn [x] (+ x 'a)) [1 2]) (fn [e] (at e 'msg))))) -- "cannot add i64 and sym"
 ;; A handler sees its own error, not one an earlier try caught.
 (try (do (try (+ 1 'a) 0) (1 2)) (fn [e] (at e 'msg))) -- "head is not callable, got i64"
 ((fn [] (try (do (try (+ 1 'a) 0) (1 2)) (fn [e] (at e 'msg))))) -- "head is not callable, got i64"
 ;; A handler can rethrow the message.
-(try (try (+ 1 'a) (fn [e] (raise (at e 'msg)))) (fn [e] e)) -- "cannot add i64 and sym; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(try (try (+ 1 'a) (fn [e] (raise (at e 'msg)))) (fn [e] e)) -- "cannot add i64 and sym"
 
 ;; ── undefined name error trapped ────────────────────────────────────────────
 (try undefined_name_xyz (fn [e] 0)) -- 0
@@ -99,7 +99,7 @@
 ((fn [] (+ 10 (try (+ 1 'a) 5)))) -- 15
 ((fn [] (+ 10 (try (+ 1 'a) (fn [e] 5))))) -- 15
 ;; Nested either way round with a handler that reads the error.
-((fn [] (try (do (try (+ 1 'a) 0) (+ 2 "b")) (fn [e] (at e 'msg))))) -- "cannot add i64 and str; usage: (+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+((fn [] (try (do (try (+ 1 'a) 0) (+ 2 "b")) (fn [e] (at e 'msg))))) -- "cannot add i64 and str"
 ((fn [] (try (try (+ 1 'a) (fn [e] (raise (at e 'code)))) 7))) -- 7
 ;; Twenty catches in one frame: each trap is taken down.
 ((fn [n] (let i 0) (let s 0) (while (< i n) (let s (+ s (try (+ i 'a) 1))) (let i (+ i 1))) s) 20) -- 20

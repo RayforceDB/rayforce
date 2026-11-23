@@ -752,52 +752,68 @@ static void try_drop(ray_t* v) {
 /* The value a `try` handler receives for an error the engine raised
  * itself (a (raise x) hands it x): the dict
  * {code: 'type msg: "cannot add i64 and sym"}, the code and message the
- * REPL prints for the error, msg "" when it carries none.  Called before
+ * REPL prints for the error, msg "" when it carries none.  An error from a
+ * builtin called with the wrong arguments also has `usage`, the call shape,
+ * "(take <collection: ...> <count: ...>)": a field of its own, so that the
+ * message is what the builtin wrote and nobody matches on a suffix.  Called before
  * the error is freed or the handler runs, since msg is usually
  * ray_error_msg(), the thread's last error message.  null, which takes no
  * allocation, if the dict cannot be built. */
-static ray_t* try_error_value(const char* code, const char* msg) {
+static ray_t* try_error_value(const char* code, const char* msg, const char* usage) {
     if (!code) code = "error";
     if (!msg) msg = "";
+    if (usage && !*usage) usage = NULL;
+    int nkeys = usage ? 3 : 2;
     /* The keys' ids hold for the symbol table's lifetime: one lookup each
      * per table, not per catch.  An epoch of 0 is no table yet. */
     static _Thread_local uint64_t key_epoch;
-    static _Thread_local int64_t kc, km;
-    ray_t *sm, *sc = NULL, *keys = NULL, *vals = NULL, *d;
+    static _Thread_local int64_t kc, km, ku;
+    ray_t *sm, *su = NULL, *sc = NULL, *keys = NULL, *vals = NULL, *d;
     int64_t kv;
     /* The message first: a failure below makes an error of its own,
      * which overwrites the thread's last message. */
     sm = ray_str(msg, strlen(msg));
     if (RAY_IS_ERR(sm)) goto fail;
+    if (usage) {
+        su = ray_str(usage, strlen(usage));
+        if (RAY_IS_ERR(su)) { su = NULL; goto fail; }
+    }
     uint64_t epoch = ray_sym_epoch();
     if (key_epoch != epoch || !epoch) {
         kc = ray_sym_intern("code", 4);
         km = ray_sym_intern("msg", 3);
-        if (kc < 0 || km < 0) { key_epoch = 0; goto fail; }
+        ku = ray_sym_intern("usage", 5);
+        if (kc < 0 || km < 0 || ku < 0) { key_epoch = 0; goto fail; }
         key_epoch = epoch;
     }
     kv = ray_sym_intern(code, strlen(code));
     if (kv < 0) goto fail;
     sc = ray_sym(kv);
     if (RAY_IS_ERR(sc)) goto fail;
-    keys = ray_sym_vec_new(RAY_SYM_W64, 2);
+    keys = ray_sym_vec_new(RAY_SYM_W64, nkeys);
     if (RAY_IS_ERR(keys)) goto fail;
-    vals = ray_list_new(2);
+    vals = ray_list_new(nkeys);
     if (RAY_IS_ERR(vals)) goto fail;
     /* Filled in place, vals taking sc and sm over: nothing between the
      * allocations above and the dict's own can fail. */
     ((int64_t*)ray_data(keys))[0] = kc;
     ((int64_t*)ray_data(keys))[1] = km;
-    keys->len = 2;
     ((ray_t**)ray_data(vals))[0] = sc;
     ((ray_t**)ray_data(vals))[1] = sm;   /* not-a-table */
-    vals->len = 2;
+    if (usage) {
+        ((int64_t*)ray_data(keys))[2] = ku;
+        ((ray_t**)ray_data(vals))[2] = su;
+        su = NULL;   /* vals owns it now */
+    }
+    keys->len = nkeys;
+    vals->len = nkeys;
     d = ray_dict_new(keys, vals);   /* consumes keys and vals, failing too */
     if (!RAY_IS_ERR(d)) return d;
     ray_error_free(d);
     return RAY_NULL_OBJ;
 fail:
     try_drop(sm);
+    try_drop(su);
     try_drop(sc);
     try_drop(keys);
     try_drop(vals);
@@ -806,7 +822,7 @@ fail:
 
 #ifdef DEBUG
 ray_t* ray_try_error_value_for_test(const char* code, const char* msg) {
-    return try_error_value(code, msg);
+    return try_error_value(code, msg, NULL);
 }
 #endif
 
@@ -873,7 +889,7 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     __VM->raise_val = NULL;
     if (!err_val)
         err_val = ray_try_handler_is_value(handler_expr) ? RAY_NULL_OBJ
-                : try_error_value(ray_err_code(result), ray_error_msg());
+                : try_error_value(ray_err_code(result), ray_error_msg(), ray_error_usage());
     /* The caught error itself goes no further: errors are not refcounted,
      * so ray_release would leave it allocated.  Nor does the trace its
      * unwind recorded. */
@@ -4987,8 +5003,8 @@ vm_error_cleanup: {
             err_val = NULL;
         } else if (!err_val)
             err_val = vm_err_obj && RAY_IS_ERR(vm_err_obj)
-                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg())
-                : try_error_value(vm_err_str, vm_err_detail);
+                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg(), ray_error_usage())
+                : try_error_value(vm_err_str, vm_err_detail, NULL);
         if (vm_err_obj) {
             if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);
             else ray_release(vm_err_obj);
