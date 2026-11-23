@@ -20196,7 +20196,7 @@ static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
     ray_t* l = lb && lb->type != -RAY_SYM ? lb : x[1];
     ray_t* r = rb && rb->type != -RAY_SYM ? rb : x[2];
     int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
-    bool l_key = l_col == key_id, r_key = r_col == key_id;
+    bool l_key = key_id >= 0 && l_col == key_id, r_key = key_id >= 0 && r_col == key_id;
     if (l_key == r_key) {
         /* a data column against a literal: its partitions' statistics */
         if ((l_col >= 0) == (r_col >= 0)) return;
@@ -20892,8 +20892,8 @@ void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts) {
 }
 
 /* The pruned source for the select `dict` (where: `where`) over the parted
- * table `tbl`; NULL when tbl is not a whole parted table (one MAPCOMMON key,
- * every other column parted over the same partitions), the shape may read
+ * table `tbl`; NULL when tbl is not a whole parted table (at most one
+ * MAPCOMMON key, every other column parted over the same partitions), the shape may read
  * rows the where rejects, the key is shadowed, nothing is pruned, or a kept
  * partition is ragged; or an error. */
 static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
@@ -20915,19 +20915,28 @@ static ray_t* select_prune_partitions(ray_t* dict, ray_t* tbl, ray_t* where) {
         key_id = ray_table_col_name(tbl, c);
         key_col = c;
     }
-    if (!kv || kv->len <= 0) return NULL;
-    if (ray_env_has_lexical_local(key_id)) return NULL;          /* a formal shadows the key */
-    /* the widths ray_part_prune_mask reads: 4-byte DATE/I32/TIME keys, 8 otherwise */
-    bool narrow = kv->type == RAY_DATE || kv->type == RAY_I32 || kv->type == RAY_TIME;
-    if (ray_sym_elem_size(kv->type, kv->attrs) != (narrow ? 4 : 8)) return NULL;
-    int64_t n_parts = kv->len;
+    int64_t n_parts = -1;
+    if (kv) {
+        if (kv->len <= 0) return NULL;
+        if (ray_env_has_lexical_local(key_id)) return NULL;      /* a formal shadows the key */
+        /* the widths ray_part_prune_mask reads: 4-byte DATE/I32/TIME keys, 8 otherwise */
+        bool narrow = kv->type == RAY_DATE || kv->type == RAY_I32 || kv->type == RAY_TIME;
+        if (ray_sym_elem_size(kv->type, kv->attrs) != (narrow ? 4 : 8)) return NULL;
+        n_parts = kv->len;
+    }
+    /* Without its key column (dropped by xcols, #1498) the table still
+     * holds parted columns over the same partitions: their statistics
+     * prune as they do beside the key, and the stand-in row fails the where
+     * by the column whose statistics dropped its partition. */
     for (int64_t c = 0; c < ncols; c++) {
         ray_col_meta_t m;
         if (!ray_table_col_meta_idx(tbl, c, &m)) return NULL;
         if (m.type == RAY_MAPCOMMON) continue;
+        if (n_parts < 0 && RAY_IS_PARTED(m.type)) n_parts = m.n_segs;
         if (!RAY_IS_PARTED(m.type) || m.n_segs != n_parts) return NULL;
         if (!prune_stand_in_type_ok((int8_t)RAY_PARTED_BASETYPE(m.type))) return NULL;
     }
+    if (n_parts <= 0) return NULL;
     int64_t n_words = (n_parts + 63) / 64;
     uint64_t* acc = (uint64_t*)ray_alloc_raw((size_t)n_words * 2 * sizeof(uint64_t));
     if (!acc) return NULL;                                       /* no pruning: the full source is correct */
