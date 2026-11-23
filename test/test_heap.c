@@ -944,6 +944,35 @@ static test_result_t test_heap_adopt_drains_foreign(void) {
     PASS();
 }
 
+/* A thread started with ray_thread_create that allocated hands its heap on
+ * when its function returns: the heap is idle, for the next thread to
+ * adopt, not left registered with its pools and no owner.  Test servers and
+ * helper threads that ended that way piled up heaps whose pools stayed
+ * counted against the anonymous watermark (900 MB in one worker), and
+ * agg_contract/dense_wide_after_wide_pool, which sizes its plan from that
+ * count, took the radix route (#1559). */
+static void heap_thread_allocates(void* arg) {
+    ray_t* v = ray_alloc(4096);
+    *(ray_heap_t**)arg = ray_tl_heap;
+    if (v) ray_free(v);
+}
+
+static test_result_t test_heap_thread_exit_abandons(void) {
+    ray_heap_t* heap_a = ray_tl_heap;
+    ray_heap_t* theirs = NULL;
+    ray_thread_t tid;
+    TEST_ASSERT_EQ_I(ray_thread_create(&tid, heap_thread_allocates, &theirs), RAY_OK);
+    ray_thread_join(tid);
+    TEST_ASSERT_NOT_NULL(theirs);
+    ray_tl_heap = NULL;
+    ray_heap_init();                    /* the idle list is LIFO: theirs first */
+    bool adopted = ray_tl_heap == theirs;
+    ray_heap_destroy();
+    ray_tl_heap = heap_a;
+    TEST_ASSERT(adopted, "the thread's heap went idle when it ended");
+    PASS();
+}
+
 /* Environment is process state, not a property of an abandoned heap.  A new
  * owner must see the same swap directory as a newly mapped heap would. */
 static test_result_t test_heap_abandon_refreshes_swap_path(void) {
@@ -6718,6 +6747,7 @@ const test_entry_t heap_entries[] = {
     { "heap/cross_heap_cycle_bounds",  test_cross_heap_cycle_bounds_pools, heap_setup, heap_teardown },
     { "heap/abandon_is_adopted",       test_heap_abandon_is_adopted,     heap_setup, heap_teardown },
     { "heap/adopt_drains_foreign",     test_heap_adopt_drains_foreign,   heap_setup, heap_teardown },
+    { "heap/thread_exit_abandons",     test_heap_thread_exit_abandons,   heap_setup, heap_teardown },
     { "heap/abandon_refreshes_swap_path", test_heap_abandon_refreshes_swap_path, heap_setup, heap_teardown },
     { "heap/alloc_copy_list",          test_alloc_copy_list_retains,     heap_setup, heap_teardown },
     { "heap/str_pool_owned_ref",       test_str_pool_owned_ref,          heap_setup, heap_teardown },
