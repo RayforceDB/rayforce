@@ -3221,6 +3221,8 @@ typedef struct {
     ray_t*  names;     /* capture names (SYM vector) or NULL */
     ray_t*  tmpl;      /* the compiled template, or NULL when `failed` */
     int64_t bytes;     /* what the literal's text holds (ray_closure_mentioned_syms) */
+    ray_t*  nfo;       /* the nfo the template pins (it holds the reference) */
+    int64_t nfo_bytes; /* ray_nfo_bytes(nfo) on one entry per pinned nfo, 0 on the rest */
     ray_t*  deps;      /* a definition's entry (nothing captured, builtins
                         * baked on its first call): the call heads its code
                         * depends on (ray_compile_definition); NULL for a
@@ -3229,15 +3231,33 @@ typedef struct {
 /* The entries keep their literals' text alive after every closure made
  * from them is gone, so the table is bounded by bytes: a literal holding
  * more than CLOSURE_TMPL_MAX_BYTES is not kept, and older entries make
- * room once the table holds CLOSURE_TMPL_BUDGET. */
+ * room once the table holds CLOSURE_TMPL_BUDGET.  A template also pins
+ * the nfo of the text its literal was read from: under ray_eval_str that
+ * is the request's whole source and a span record per node.  Each pinned
+ * nfo counts once toward the budget, however many entries share it. */
 enum { CLOSURE_TMPL_MAX_BYTES = RAY_CLOSURE_TMPL_MAX_BYTES, CLOSURE_TMPL_BUDGET = 1024 * 1024 };
 static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
 static _Thread_local uint32_t g_closure_tmpl_next;
 static _Thread_local uint64_t g_closure_tmpl_epoch;
-static _Thread_local int64_t g_closure_tmpl_bytes;   /* sum of the entries' bytes */
+static _Thread_local int64_t g_closure_tmpl_bytes;   /* sum of the entries' bytes
+                                                       * and of their nfos' */
+
+/* An entry other than `except` whose template pins `nfo`, or NULL. */
+static closure_tmpl_t* closure_tmpl_pinning(ray_t* nfo, const closure_tmpl_t* except) {
+    if (!nfo) return NULL;
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++)
+        if (&g_closure_tmpl[i] != except && g_closure_tmpl[i].nfo == nfo) return &g_closure_tmpl[i];
+    return NULL;
+}
 
 static void closure_tmpl_drop(closure_tmpl_t* e) {
     g_closure_tmpl_bytes -= e->bytes;
+    if (e->nfo_bytes) {
+        /* Another entry pinning the nfo carries its bytes on. */
+        closure_tmpl_t* heir = closure_tmpl_pinning(e->nfo, e);
+        if (heir) heir->nfo_bytes = e->nfo_bytes;
+        else g_closure_tmpl_bytes -= e->nfo_bytes;
+    }
     if (e->params) ray_release(e->params);
     for (int64_t i = 0; i < e->nbody && i < CLOSURE_TMPL_MAX_BODY; i++) if (e->body[i]) ray_release(e->body[i]);
     if (e->mentioned) ray_release(e->mentioned);
@@ -3263,6 +3283,26 @@ static void closure_tmpl_forget(void) {
     memset(g_closure_tmpl, 0, sizeof g_closure_tmpl);
     g_closure_tmpl_next = 0;
     g_closure_tmpl_bytes = 0;
+}
+
+/* Take the next slot for an entry of `weight` bytes whose template pins
+ * `nfo`, making room within the budget, oldest entries first.  NULL when
+ * the two alone pass the budget: the literal is not kept. */
+static closure_tmpl_t* closure_tmpl_claim(int64_t weight, ray_t* nfo) {
+    int64_t nfo_bytes = ray_nfo_bytes(nfo);
+    if (weight + nfo_bytes > CLOSURE_TMPL_BUDGET) return NULL;
+    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
+    closure_tmpl_drop(e);
+    int64_t extra = closure_tmpl_pinning(nfo, e) ? 0 : nfo_bytes;
+    for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight + extra > CLOSURE_TMPL_BUDGET; k++) {
+        closure_tmpl_drop(&g_closure_tmpl[(g_closure_tmpl_next + k) % CLOSURE_TMPL_SLOTS]);
+        if (!closure_tmpl_pinning(nfo, e)) extra = nfo_bytes;
+    }
+    e->bytes = weight;
+    e->nfo = nfo;
+    e->nfo_bytes = extra;
+    g_closure_tmpl_bytes += weight + extra;
+    return e;
 }
 
 /* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
@@ -3359,19 +3399,19 @@ static void closure_share_template(ray_t* lambda) {
         tmpl = NULL;
         LAMBDA_NLOCALS(lambda) = -1;
     }
-    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
-    closure_tmpl_drop(e);
-    /* Make room within the budget, oldest entries first. */
-    for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight > CLOSURE_TMPL_BUDGET; k++)
-        closure_tmpl_drop(&g_closure_tmpl[(g_closure_tmpl_next + k) % CLOSURE_TMPL_SLOTS]);
+    closure_tmpl_t* e = closure_tmpl_claim(weight, tmpl ? LAMBDA_NFO(tmpl) : NULL);
+    if (!e) {
+        if (compiled) { closure_share_from(lambda, tmpl); ray_release(tmpl); }
+        if (names) ray_release(names);
+        ray_release(mentioned);
+        return;
+    }
     ray_retain(params); e->params = params;
     for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
     e->nbody = body->len;
     e->mentioned = mentioned;   /* owned */
     e->dynamic = dynamic;
     e->failed = !compiled;
-    e->bytes = weight;
-    g_closure_tmpl_bytes += weight;
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned, NULL when failed */
     if (compiled) closure_share_from(lambda, tmpl);
@@ -3423,16 +3463,12 @@ static void definition_compile(ray_t* lambda) {
     }
     ray_t* deps = NULL;
     if (!ray_compile_definition(lambda, &deps)) { ray_release(mentioned); return; }
-    closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
-    closure_tmpl_drop(e);
-    for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight > CLOSURE_TMPL_BUDGET; k++)
-        closure_tmpl_drop(&g_closure_tmpl[(g_closure_tmpl_next + k) % CLOSURE_TMPL_SLOTS]);
+    closure_tmpl_t* e = closure_tmpl_claim(weight, LAMBDA_NFO(lambda));
+    if (!e) { if (deps) ray_release(deps); ray_release(mentioned); return; }
     ray_retain(params); e->params = params;
     for (int64_t k = 0; k < body->len; k++) { ray_retain(bn[k]); e->body[k] = bn[k]; }
     e->nbody = body->len;
     e->mentioned = mentioned;   /* owned */
-    e->bytes = weight;
-    g_closure_tmpl_bytes += weight;
     ray_retain(lambda); e->tmpl = lambda;   /* its bytecode is the template's */
     e->deps = deps;             /* owned */
 }

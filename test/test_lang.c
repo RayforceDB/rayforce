@@ -752,6 +752,42 @@ static test_result_t test_closure_heavy_literal_captures(void) {
     PASS();
 }
 
+/* ---- Test: the closure template table holds no more than its budget ----
+ * A lambda made under ray_eval_str retains the request's nfo: its whole
+ * source text and a span record per parsed node.  The template table's
+ * entry for the literal pins that nfo through the template, so the nfo
+ * counts toward the table's 1 MiB budget.  Each request below carries
+ * ~49 KB of text (~330 KB with its spans); before the nfo counted, 256 of
+ * them stayed live per thread, ~84 MB.  A definition (nothing captured,
+ * its entry made on the first call) and a closure (captures `k`, its entry
+ * made when the literal is evaluated) both pin it. */
+static size_t tmpl_mem(void) {
+    ray_mem_stats_t m;
+    ray_mem_stats(&m);
+    return m.bytes_allocated + m.direct_bytes;
+}
+
+static test_result_t test_closure_tmpl_request_nfo_budget(void) {
+    static const char* heads[] = {
+        "(do ((fn [x] x) 1) (count [",
+        "(do (set mkTn (fn [k] (if false (set 1 2)) (fn [x] (+ x k)))) ((mkTn 1) 2) (count [",
+    };
+    static char src[10000 * 6 + 256];
+    for (size_t h = 0; h < sizeof heads / sizeof heads[0]; h++) {
+        size_t n = (size_t)snprintf(src, sizeof src, "%s", heads[h]);
+        for (int i = 0; i < 10000; i++) n += (size_t)snprintf(src + n, sizeof src - n, "%d ", i);
+        snprintf(src + n, sizeof src - n, "]))");
+        ray_t* r = ray_eval_str(src);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 10000);
+        ray_release(r);
+        size_t m0 = tmpl_mem();
+        for (int i = 0; i < 400; i++) ray_release(ray_eval_str(src));
+        size_t grew = tmpl_mem() - m0;
+        TEST_ASSERT_FMT(grew < 2u * 1024 * 1024, "case %zu: 400 requests kept %zu bytes", h, grew);
+    }
+    PASS();
+}
+
 /* ---- Dummy function for testing ---- */
 static ray_t* dummy_unary(ray_t* x) { return ray_retain(x), x; }
 static ray_t* dummy_binary(ray_t* x, ray_t* y) { (void)y; return ray_retain(x), x; }
@@ -14320,6 +14356,7 @@ const test_entry_t lang_entries[] = {
     { "lang/closure_sym_walk_guard", test_closure_sym_walk_guard, lang_setup, lang_teardown },
     { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
     { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
+    { "lang/closure_tmpl_request_nfo_budget", test_closure_tmpl_request_nfo_budget, lang_setup, lang_teardown },
     { "lang/clock_local_follows_tz", test_clock_local_follows_tz, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
