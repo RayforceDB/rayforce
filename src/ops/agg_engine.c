@@ -11442,7 +11442,9 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     bool dense = agg_dense_plan(keys, ext->n_keys, NULL, 0, nrows, &dp);
     route_stats.dense_plan_available = dense;
     int rc = dense ? agg_group_keys_dense(keys, nrows, &dp, &groups)
-                   : agg_group_keys(keys, ext->n_keys, nrows, &groups);
+                   : agg_group_keys_mode(keys, ext->n_keys, nrows,
+                                         ext->n_keys == 1 && keys[0]->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
+                                         &groups);
     agg_dense_plan_free(&dp);   /* compaction tables serve the key build only */
     if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     if (agg_cancelled()) { agg_groups_free(&groups); return ray_error("cancel", NULL); }
@@ -13879,6 +13881,7 @@ static int agg_group_keys_mode(ray_t** key_cols, uint32_t n_keys, int64_t nrows,
         /* Declined: the scan below starts with spans 0 and finds any
          * TIMESPAN itself (a large I64 needs no span bits, #1330). */
         if (rc != AGG_KEYS_SERIAL) return rc;
+        hash_mode = 0; /* The complete directory pass found incompatible keys. */
     }
     /* Unbounded keys: cut-3 lifted both admission gates (the GROUP path and the
      * keys-only DISTINCT path via agg_select_distinct), so the key-data pointer
@@ -13920,9 +13923,17 @@ rescan:
     ngroups = 0;
     for (int64_t r = 0; r < nrows; r++) {
         uint64_t h = 1469598103934665603ULL;
+        uint8_t inexact = 0;
         for (uint32_t k = 0; k < n_keys; k++) {
-            h ^= agg_key_hash_at(key_cols[k], data[k], r, spans, &symbols, spans ? NULL : &spanned, NULL);
+            h ^= agg_key_hash_at(key_cols[k], data[k], r, spans | hash_mode, &symbols,
+                                spans ? NULL : &spanned, hash_mode ? &inexact : NULL);
             h *= 1099511628211ULL;
+        }
+        if (RAY_UNLIKELY(hash_mode && (spanned || (inexact & RAY_KEY_FLOAT)))) {
+            /* Rebuild from row zero: the earlier representatives were chosen
+             * with a different hash. TIMESPAN also needs the span bits. */
+            hash_mode = 0;
+            goto rescan;
         }
         if (RAY_UNLIKELY(spanned && !spans)) goto rescan;
         uint64_t slot = h & mask;
