@@ -1,0 +1,23 @@
+;; Single LIST key on the indexed aggregate path: preserve ordered groups
+;; when speculative exact hashing has to restart.
+(set p (map (fn [i] (list i)) (% (til 70000) 3)))
+(set a (list 9007199254740993))
+(set b (list 9007199254740992))
+(set f (list 9007199254740992.0))
+(set t (list (as 'TIMESPAN 2)))
+(set run (fn [keys] (do (let T (table [k r] (list keys (til (count keys))))) (let Q (select {from: T by: k n: (count r) lo: (first r) hi: (last r)})) (let G (group keys)) (let gs (value G)) (and (identical (at Q 'k) (key G)) (and (identical (at Q 'n) (map count gs)) (and (identical (at Q 'lo) (map first gs)) (identical (at Q 'hi) (map last gs))))))))
+(run (concat p (list a f b))) -- true
+(run (concat (list f) (concat p (list a b)))) -- true
+(run (concat (list (list 0.0)) (concat p (list t)))) -- true
+(run (concat p (list t))) -- true
+;; Wide-key performance versus a same-shape small-key control.
+(set offset (% (til 100000) 5000))
+(set rows (til 100001))
+(set small (concat (map (fn [i] (list i)) offset) (list 'marker)))
+(set wide (concat (map (fn [i] (list i)) (+ 4611686018427387904 offset)) (list 'marker)))
+(run wide) -- true
+(set S (table [k r] (list small rows)))
+(set W (table [k r] (list wide rows)))
+(set query (fn [T] (select {from: T by: k n: (count r) lo: (first r) hi: (last r)})))
+(set best (fn [g] (min (map (fn [i] (g)) (til 3)))))
+(< (best (fn [] (timeit (query W)))) (* 10 (+ 2.0 (best (fn [] (timeit (query S))))))) -- true
