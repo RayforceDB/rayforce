@@ -2834,7 +2834,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
             /* Promotion preserves logical nulls, not the source sentinel's
              * numeric value. Publish the column flag after filling it. */
             bool cell_is_null = RAY_ATOM_IS_NULL(row_elems[j]);
-            if (cell_is_null) col_has_nulls = true;
+            if (cell_is_null && col_type != RAY_BOOL && col_type != RAY_U8) col_has_nulls = true;
             if (col_type == RAY_STR) {
                 if (row_elems[j]->type != -RAY_STR) {
                     int8_t et = row_elems[j]->type;
@@ -2865,7 +2865,9 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                     return ray_error("type", "table: %s column element type mismatch, got %s", ray_type_name(col_type), ray_type_name(et));
                 }
                 if (numeric) {
-                    if (cell_is_null) ray_vec_set_null(col_vec, j, true);
+                    if (cell_is_null && (col_type == RAY_BOOL || col_type == RAY_U8))
+                        ((uint8_t*)ray_data(col_vec))[j] = 0;
+                    else if (cell_is_null) ray_vec_set_null(col_vec, j, true);
                     else if (col_type == RAY_F64) ((double*)ray_data(col_vec))[j] = (cell->type == -RAY_F64 ? cell->f64 : as_f64(cell));
                     else if (cell->type == -RAY_BOOL && col_type != RAY_BOOL) {
                         ray_t n = { .type = -RAY_I64, .i64 = cell->b8 ? 1 : 0 };

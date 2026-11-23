@@ -32,3 +32,6 @@ _s -- (as 'TIMESPAN [42 0Nl])
 (_col _bytes) -- (as 'U8 _bytes)
 (_col (list (as 'U8 255) (as 'I16 0Nl) true)) -- (as 'I16 [255 0Nl 1])
 (_col (list 1.5 (as 'U8 255) false)) -- [1.5 255.0 0.0]
+(_col (list true (first (take [true] 0)) false)) -- [true false false]
+(_col (list (as 'U8 255) (first (take [0x01] 0)))) -- (as 'U8 [255 0])
+(_col (list (first (take [true] 0)) (as 'I32 3) (first (take [0x01] 0)))) -- (as 'I32 [0Nl 3 0Nl])
