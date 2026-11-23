@@ -7942,6 +7942,7 @@ typedef struct {
     bool    src_f64;
     uint16_t agg_op;
     bool    affine;
+    bool    affine_i64;   /* an integer bias: AVG divides one exact total */
     double  bias_f64;
     int64_t bias_i64;
     void*   dst;
@@ -8116,6 +8117,13 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             break;
                         case OP_AVG:
                             if (nn == 0) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
+                            if (!sf && ao->affine_i64) {   /* x + c: one exact total (#1441) */
+                                int64_t lo = ROW_RD_I64(row, ly->off_sum, s);
+                                int64_t hi = (ly->need_flags & GHT_NEED_SUM128)
+                                    ? ROW_RD_I64(row, ly->off_sum_hi, s) : (lo < 0 ? -1 : 0);
+                                v = ray_i128_affine_mean(hi, (uint64_t)lo, ao->bias_i64, nn);
+                                break;
+                            }
                             v = sf ? ROW_RD_F64(row, ly->off_sum, s) / nn
                               : (ly->need_flags & GHT_NEED_SUM128)
                                 ? ray_i128_to_f64(ROW_RD_I64(row, ly->off_sum_hi, s),
@@ -9232,6 +9240,12 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v = sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx])
                                          : (double)sum_i64[idx];
                             v = (v + affine[a].bias_f64 * nn) / nn;
+                            break;
+                        }
+                        if (!is_f64 && affine && affine[a].enabled) {   /* x + c: one exact total (#1441) */
+                            int64_t lo = sum_i64[idx];
+                            int64_t hi = sum_hi64 ? sum_hi64[idx] : (lo < 0 ? -1 : 0);
+                            v = ray_i128_affine_mean(hi, (uint64_t)lo, affine[a].bias_i64, nn);
                             break;
                         }
                         v = is_f64 ? sum_f64[idx] / nn
@@ -20931,6 +20945,7 @@ v2_emit:;
                 .out_type = out_type, .src_f64 = is_f64,
                 .agg_op = agg_op,
                 .affine = agg_affine[a].enabled,
+                .affine_i64 = agg_affine[a].enabled && !agg_affine[a].f64,
                 .bias_f64 = agg_affine[a].bias_f64,
                 .bias_i64 = agg_affine[a].bias_i64,
                 .dst = ray_data(new_col),
@@ -21603,6 +21618,13 @@ sequential_fallback:;
                         break;
                     case OP_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
+                        if (!is_f64 && agg_affine[a].enabled && !agg_affine[a].f64) {   /* x + c: one exact total (#1441) */
+                            int64_t lo = ROW_RD_I64(row, ly->off_sum, s);
+                            int64_t hi = (ly->need_flags & GHT_NEED_SUM128)
+                                ? ROW_RD_I64(row, ly->off_sum_hi, s) : (lo < 0 ? -1 : 0);
+                            v = ray_i128_affine_mean(hi, (uint64_t)lo, agg_affine[a].bias_i64, nn);
+                            break;
+                        }
                         v = is_f64 ? ROW_RD_F64(row, ly->off_sum, s) / nn
                           : (ly->need_flags & GHT_NEED_SUM128)
                             ? ray_i128_to_f64(ROW_RD_I64(row, ly->off_sum_hi, s),
