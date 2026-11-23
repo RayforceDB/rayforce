@@ -3283,6 +3283,30 @@ ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l) {
     return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
 }
 
+/* The all-zero GUID is the GUID null.  The builder keeps null GUID rows in
+ * the index (it groups cells by their bytes), but a where: never selects a
+ * null row for == or in (exec_in masks them), so a null needle takes the
+ * scan; any other needle never matches a null row. */
+static bool guid_bytes_null(const uint8_t* p) {
+    static const uint8_t z[16] = {0};
+    return memcmp(p, z, 16) == 0;
+}
+
+ray_t* ray_index_hash_eq_guid_rowsel(ray_t* col, const uint8_t* p) {
+    if (!col || RAY_IS_ERR(col) || col->type != RAY_GUID || !p) return NULL;
+    if (guid_bytes_null(p) || !idx_fresh(col, RAY_IDX_HASH)) return NULL;
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup_guid(col, p, &gid);
+    if (!ix) return NULL;
+    int64_t n = col->len;
+    if (gid < 0) return rowsel_from_sorted_ids(n, NULL, 0);
+    const ray_t* ofv = ix->u.hash.offs;
+    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    if (gsz > 64 && gsz > (n >> 3))
+        return NULL;   /* dense: the scan wins, as for ray_index_hash_eq_rowsel */
+    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+}
+
 static _Atomic(uint64_t) g_enc_hash_probes;   /* test hook */
 uint64_t ray_enc_hash_test_probes(void) { return atomic_load_explicit(&g_enc_hash_probes, memory_order_relaxed); }
 
@@ -3708,20 +3732,55 @@ static ray_t* str_in_rowsel(ray_t* col, ray_t* set_vec) {
     return hash_in_rowsel_from_gids(ix, n, gids, w, total, gid_hdr);
 }
 
+/* ray_index_in_rowsel over a GUID column: each distinct needle of the
+ * GUID set resolves to its group by its 16 bytes (hash_probe_setup_guid).
+ * A null needle declines to the scan (guid_bytes_null). */
+static ray_t* guid_in_rowsel(ray_t* col, ray_t* set_vec) {
+    if (!set_vec || RAY_IS_ERR(set_vec) || set_vec->type != RAY_GUID) return NULL;
+    int64_t m = set_vec->len, n = col->len;
+    if (m == 0) return rowsel_from_sorted_ids(n, NULL, 0);
+    const uint8_t* sb = (const uint8_t*)ray_data(set_vec);
+    ray_t* gid_hdr = NULL;
+    int64_t* gids = (int64_t*)scratch_alloc(&gid_hdr, (size_t)m * sizeof(int64_t));
+    if (!gids) return NULL;
+    ray_index_t* ix = NULL;
+    int64_t ngid = 0;
+    for (int64_t i = 0; i < m; i++) {
+        if (guid_bytes_null(sb + i * 16)) { scratch_free(gid_hdr); return NULL; }
+        int64_t gid = -1;
+        ix = hash_probe_setup_guid(col, sb + i * 16, &gid);
+        if (!ix) { scratch_free(gid_hdr); return NULL; }
+        if (gid >= 0) gids[ngid++] = gid;
+    }
+    /* a needle given twice is one group: its rows once */
+    qsort(gids, (size_t)ngid, sizeof(int64_t), cmp_i64_plain);
+    int64_t total = 0, w = 0;
+    const ray_t* ofv = ix->u.hash.offs;
+    for (int64_t i = 0; i < ngid; i++) {
+        if (w > 0 && gids[i] == gids[w - 1]) continue;
+        gids[w++] = gids[i];
+        total += hx_get(ofv, gids[i] + 1) - hx_get(ofv, gids[i]);
+    }
+    return hash_in_rowsel_from_gids(ix, n, gids, w, total, gid_hdr);
+}
+
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
-    /* Gate: integer-family, SYM or STR column with a fresh hash/part index.
-     * SYM and STR needles are never null here (the null symbol and "" take
-     * the scan), so a null-bearing column of theirs is probed as it is. */
+    /* Gate: integer-family, SYM, STR or GUID column with a fresh hash/part
+     * index.  SYM, STR and GUID needles are never null here (the null
+     * symbol, "" and the null GUID take the scan), so a null-bearing column
+     * of theirs is probed as it is. */
     ray_idx_kind_t kind = ray_index_kind(col);
-    bool byte_or_sym = col && (col->type == RAY_SYM || col->type == RAY_STR);
+    bool byte_or_sym = col && (col->type == RAY_SYM || col->type == RAY_STR ||
+                               col->type == RAY_GUID);
     if ((kind != RAY_IDX_HASH && kind != RAY_IDX_PART) ||
         !(byte_or_sym ? idx_fresh(col, kind) : idx_fresh_nonull(col, kind))) return NULL;
     bool col_is_float = (col->type == RAY_F32 || col->type == RAY_F64);
     if (col_is_float) return NULL;
     /* A STR or GUID hash index is keyed on byte hashes — the int64 probes
-     * below do not apply: a STR set probes by its bytes (str_in_rowsel);
-     * a GUID one is left to the scan. */
+     * below do not apply: a STR set probes by its bytes (str_in_rowsel), a
+     * GUID set by its 16 bytes (guid_in_rowsel). */
     if (col->type == RAY_STR && kind == RAY_IDX_HASH) return str_in_rowsel(col, set_vec);
+    if (col->type == RAY_GUID && kind == RAY_IDX_HASH) return guid_in_rowsel(col, set_vec);
     if (hash_byte_keyed(col->type)) return NULL;
     bool col_is_sym = (col->type == RAY_SYM);
 

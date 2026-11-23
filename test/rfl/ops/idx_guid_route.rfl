@@ -1,0 +1,127 @@
+;; @requires: posix  (cleanup runs through a POSIX shell via .sys.exec)
+;; A hash index on a GUID column answers `==` and `in` in a select (#1421).
+;; .idx.hash built it, and `find` probed it, but the where: routes decoded
+;; integer, symbol and string keys only, so `(== g k)` and `(in g ks)`
+;; scanned and .idx.uses stayed empty.  The index is keyed on a hash of each
+;; cell's 16 bytes; a probe hashes the needle's and confirms every hit
+;; against them.  The all-zero GUID is the null: a null needle takes the
+;; scan.  Every answer below equals the scan's on the same table without
+;; the index.
+(do (.idx.uses (table [a] (list [1]))) null)
+(set u (concat (guid 5) (as 'GUID (list "00000000-0000-0000-0000-000000000000"))))
+(set s (at u [1 0 5 2 0 5 3 0]))
+(set H (table [s i] (list (.idx.hash s) (til 8))))
+(set T (table [s i] (list s (til 8))))
+
+;; The issue: equality and membership go through the index
+(set k3 (at u 3))
+(at (select {from: H where: (== s k3) i: i}) 'i) -- [6]
+(at (.idx.uses H) 's) -- 1
+(set k32 (at u [3 2]))
+(at (select {from: H where: (in s k32) i: i}) 'i) -- [3 6]
+(at (.idx.uses H) 's) -- 1
+;; a key on several rows: all of them, in row order
+(set k0 (at u 0))
+(at (select {from: H where: (== s k0) i: i}) 'i) -- [1 4 7]
+(at (.idx.uses H) 's) -- 1
+(at (select {from: T where: (== s k0) i: i}) 'i) -- [1 4 7]
+;; an absent key: no rows, from the index
+(set k4 (at u 4))
+(count (at (select {from: H where: (== s k4) i: i}) 'i)) -- 0
+(at (.idx.uses H) 's) -- 1
+(set k44 (at u [4 4]))
+(count (at (select {from: H where: (in s k44) i: i}) 'i)) -- 0
+(at (.idx.uses H) 's) -- 1
+;; a needle given twice selects its rows once
+(set k020 (at u [0 2 0]))
+(at (select {from: H where: (in s k020) i: i}) 'i) -- [1 3 4 7]
+(at (.idx.uses H) 's) -- 1
+
+;; Nulls: a null needle is the scan's, the index left alone
+(set kn (at u 5))
+(at (select {from: H where: (== s kn) i: i}) 'i) -- (at (select {from: T where: (== s kn) i: i}) 'i)
+(.idx.uses H) -- {}
+(set kn0 (at u [5 0]))
+(at (select {from: H where: (in s kn0) i: i}) 'i) -- (at (select {from: T where: (in s kn0) i: i}) 'i)
+(.idx.uses H) -- {}
+;; an empty set selects nothing
+(set ke (take k020 0))
+(count (at (select {from: H where: (in s ke) i: i}) 'i)) -- 0
+
+;; The rest of a where: refines the index's rows
+(at (select {from: H where: (and (== s k0) (> i 2)) i: i}) 'i) -- [4 7]
+(set k02 (at u [0 2]))
+(at (select {from: H where: (and (> i 2) (in s k02)) i: i}) 'i) -- [3 4 7]
+;; and the other spellings still answer as the scan does
+(at (select {from: H where: (!= s k0) i: i}) 'i) -- (at (select {from: T where: (!= s k0) i: i}) 'i)
+(at (select {from: H where: (not (in s k02)) i: i}) 'i) -- (at (select {from: T where: (not (in s k02)) i: i}) 'i)
+(at (select {from: H by: s where: (== s k0) c: (count i)}) 'c) -- [3]
+
+;; One row, and a key on most rows (dense: the scan's)
+(set H1 (table [s i] (list (.idx.hash (at u [1])) [0])))
+(at (select {from: H1 where: (== s (at u 1)) i: i}) 'i) -- [0]
+(count (at (select {from: H1 where: (== s k0) i: i}) 'i)) -- 0
+(set HR (table [s i] (list (.idx.hash (concat (take (at u [0]) 500) (at u [1]))) (til 501))))
+(do (.idx.uses HR) null)
+(count (at (select {from: HR where: (== s k0) i: i}) 'i)) -- 500
+(.idx.uses HR) -- {}
+(set k1 (at u 1))
+(at (select {from: HR where: (== s k1) i: i}) 'i) -- [500]
+(at (.idx.uses HR) 's) -- 1
+(set k1v (at u [1]))
+(at (select {from: HR where: (in s k1v) i: i}) 'i) -- [500]
+(at (.idx.uses HR) 's) -- 1
+
+;; A first-row-only index (a concat repeated a key) is not read for rows:
+;; the scan finds the repeat
+(set HC (table [s i] (list (concat (.idx.hash (at u [0 1 2])) (at u [0 3])) (til 5))))
+(at (.idx.info (at HC 's)) 'first_only) -- true
+(at (select {from: HC where: (== s k0) i: i}) 'i) -- [0 3]
+(set k03 (at u [0 3]))
+(at (select {from: HC where: (in s k03) i: i}) 'i) -- [0 3 4]
+(.idx.uses HC) -- {}
+;; after .idx.drop the scan gives the same rows
+(set HX (table [s i] (list (.idx.drop (.idx.hash s)) (til 8))))
+(at (select {from: HX where: (in s k02) i: i}) 'i) -- [1 3 4 7]
+
+;; Many rows on a worker pool: the index's rows are the scan's
+(set n 200000)
+(set pool (guid 50021))
+(set ids (at pool (map (fn [j] (% (* j 7919) 50021)) (til n))))
+(set BH (table [id seq] (list (.idx.hash ids) (til n))))
+(set BT (table [id seq] (list ids (til n))))
+(set b77 (at pool 77))
+(set b775 (at pool [77 5 77]))
+(do (.idx.uses BH) null)
+(at (select {from: BH where: (== id b77) seq: seq}) 'seq) -- (at (select {from: BT where: (== id b77) seq: seq}) 'seq)
+(at (.idx.uses BH) 'id) -- 1
+(at (select {from: BH where: (in id b775) seq: seq}) 'seq) -- (at (select {from: BT where: (in id b775) seq: seq}) 'seq)
+(at (.idx.uses BH) 'id) -- 1
+
+;; Saved and loaded: plain, compressed (generation 2) and parted
+(.sys.exec "rm -rf /tmp/rfl_idx_guid_route")
+(.db.splayed.set "/tmp/rfl_idx_guid_route/sp/" BH {compress: false})
+(set S0 (.db.splayed.get "/tmp/rfl_idx_guid_route/sp/"))
+(at (.idx.info (at S0 'id)) 'kind) -- 'hash
+(do (.idx.uses S0) null)
+(at (select {from: S0 where: (== id b77) seq: seq}) 'seq) -- (at (select {from: BT where: (== id b77) seq: seq}) 'seq)
+(at (.idx.uses S0) 'id) -- 1
+(at (select {from: S0 where: (in id b775) seq: seq}) 'seq) -- (at (select {from: BT where: (in id b775) seq: seq}) 'seq)
+(at (.idx.uses S0) 'id) -- 1
+(.db.splayed.set "/tmp/rfl_idx_guid_route/sc/" BH {compress: true})
+(set S2 (.db.splayed.get "/tmp/rfl_idx_guid_route/sc/"))
+(do (.idx.uses S2) null)
+(at (select {from: S2 where: (== id b77) seq: seq}) 'seq) -- (at (select {from: BT where: (== id b77) seq: seq}) 'seq)
+(at (.idx.uses S2) 'id) -- 1
+(set S3 (.db.splayed.get "/tmp/rfl_idx_guid_route/sc/"))
+(do (.idx.uses S3) null)
+(at (select {from: S3 where: (in id b775) seq: seq}) 'seq) -- (at (select {from: BT where: (in id b775) seq: seq}) 'seq)
+(at (.idx.uses S3) 'id) -- 1
+;; parted: a per-partition hash is not consulted (for any type); the scan answers
+(.db.splayed.set "/tmp/rfl_idx_guid_route/p/1/t/" (take BH 1000))
+(.db.splayed.set "/tmp/rfl_idx_guid_route/p/2/t/" (take BH -1000))
+(set P (.db.parted.get "/tmp/rfl_idx_guid_route/p/" 't))
+(set PT (table [id seq] (list (concat (take ids 1000) (take ids -1000)) (concat (take (til n) 1000) (take (til n) -1000)))))
+(at (select {from: P where: (== id b77) seq: seq}) 'seq) -- (at (select {from: PT where: (== id b77) seq: seq}) 'seq)
+(at (select {from: P where: (in id b775) seq: seq}) 'seq) -- (at (select {from: PT where: (in id b775) seq: seq}) 'seq)
+(.sys.exec "rm -rf /tmp/rfl_idx_guid_route") -- 0
