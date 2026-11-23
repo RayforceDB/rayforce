@@ -254,3 +254,33 @@
 (at (update {x: (if true (year 2020.01.01) x) from: TyL}) 'x) -- [2020 2020 2020 2020]
 (at (select {m: (month 2020.03.15) y: x from: TyL}) 'm) -- [3 3 3 3]
 (at (select {d: (day 2020.03.15) y: x from: TyL}) 'd) -- [15 15 15 15]
+
+;; The accessor builtins themselves compile as the extract (`(dd d)` is
+;; `d.dd`), matched on the binding: a name rebound to a user function is
+;; that function, and a literal stays one value.
+(set TdB (table [ts d] (list (as 'TIMESTAMP [1710513451123456789 0N 951782400000000000]) (as 'DATE [8840 0N 0]))))
+(at (select {v: (dd ts) from: TdB}) 'v)   -- [15 0Nl 28]
+(at (select {v: (yyyy d) from: TdB}) 'v)  -- [2024 0Nl 2000]
+(at (select {v: (doy d) from: TdB}) 'v)   -- [75 0Nl 1]
+(at (select {v: (+ 1 (mm d)) from: TdB where: (> (dd d) 10)}) 'v) -- [4]
+(at (select {d: (dd 2020.03.15) y: x from: TyL}) 'd) -- [15 15 15 15]
+(set fdd (fn [dd] (select {v: (dd x) from: TyL})))
+(at (fdd (fn [z] (* z 10))) 'v) -- [0 10 20 30]
+(set ddb dd)
+(set dd type)
+(at (at (select {v: (dd x) from: TyL}) 'v) 0) -- 'i64
+(set dd ddb)
+(at (select {v: (dd 2020.03.15) y: x from: TyL}) 'v) -- [15 15 15 15]
+;; a column that is not a date, time or timestamp is the builtin's type
+;; error, whichever way the extract is written
+(set TdX (table [i f b] (list [1 2 3] [1.5 2.5 3.5] [true false true])))
+(select {v: (dd i) from: TdX}) !- type
+(select {v: (yyyy f) from: TdX}) !- type
+(select {v: (dd b) from: TdX}) !- type
+(select {v: i.dd from: TdX}) !- type
+(update {v: (hh i) from: TdX}) !- type
+(select {from: TdX where: (== (dd i) 1)}) !- type
+;; a column named like an accessor shadows it, as in eval
+(set TdS (table [dd d] (list [10 20 30] [2024.01.15 2024.02.20 2024.03.31])))
+(select {r: (dd d) from: TdS}) !- type
+(at (select {r: (mm d) from: TdS}) 'r) -- [1 2 3]
