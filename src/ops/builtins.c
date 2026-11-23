@@ -3708,7 +3708,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
          * an 8-byte stride and walks off the end of the buffer. */
         if (x->type == RAY_SYM)
             v = ray_read_sym(ray_data(x), i, x->type, x->attrs);
-        else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP)
+        else if (x->type == RAY_I64 || x->type == RAY_TIMESTAMP ||
+                 x->type == RAY_TIMESPAN)
             v = ((int64_t*)ray_data(x))[i];
         else if (x->type == RAY_I32 || x->type == RAY_DATE || x->type == RAY_TIME)
             v = ((int32_t*)ray_data(x))[i];
@@ -3804,7 +3805,8 @@ ray_t* ray_group_indices_fn(ray_t* x) {
         switch (key_type) {
             case RAY_SYM:
             case RAY_I64:
-            case RAY_TIMESTAMP: {
+            case RAY_TIMESTAMP:
+            case RAY_TIMESPAN: {
                 int64_t v = gvals[g];
                 keys_vec = ray_vec_append(keys_vec, &v); break;
             }

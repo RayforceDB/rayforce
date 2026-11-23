@@ -11463,7 +11463,7 @@ ray_t* agg_group_indices(ray_t* source) {
     switch (source->type) {
         case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
         case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
-        case RAY_SYM: case RAY_GUID: case RAY_STR: case RAY_LIST: break;
+        case RAY_TIMESPAN: case RAY_SYM: case RAY_GUID: case RAY_STR: case RAY_LIST: break;
         default: return NULL;
     }
     agg_groups_t groups = {0};
