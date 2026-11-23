@@ -2840,8 +2840,9 @@ void ray_mem_stats(ray_mem_stats_t* out) {
  * -------------------------------------------------------------------------- */
 
 
-/* Heaps whose thread exited: still registered, pools intact, waiting for the
- * next thread to adopt them.  Guarded by the registry lock — pushed and
+/* Heaps whose thread exited: still registered, keeping the pools that hold a
+ * live or queued block (ray_heap_abandon unmaps the empty ones), waiting for
+ * the next thread to adopt them.  Guarded by the registry lock — pushed and
  * popped once per thread lifetime, never on an allocation path. */
 static ray_heap_t* g_heap_idle = NULL;
 

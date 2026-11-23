@@ -873,8 +873,9 @@ static test_result_t test_cross_heap_cycle_bounds_pools(void) {
  * ray_free resolves the owning heap through ray_heap_registry and pushes the
  * block onto it WITHOUT a lock.  That is only sound while a registered heap
  * outlives every block it owns, so a thread that exits abandons its heap —
- * still registered, pools intact — instead of unregistering and munmapping
- * it underneath a lookup already in flight.  The next thread up adopts it. */
+ * still registered, keeping every pool that holds a live block — instead of
+ * unregistering and munmapping it underneath a lookup already in flight.
+ * The next thread up adopts it. */
 
 static test_result_t test_heap_abandon_is_adopted(void) {
     ray_heap_t* heap_a = ray_tl_heap;
