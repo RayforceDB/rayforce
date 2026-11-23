@@ -4751,8 +4751,15 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
 ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
     if (!tbl || tbl->type != RAY_TABLE)
         return ray_error("type", "xasc/xdesc expects a table as first argument");
-    if (table_has_parted_col(tbl))
-        return ray_error("nyi", "xasc/xdesc: parted table input not supported");
+    if (table_has_parted_col(tbl)) {
+        /* The gather below indexes every column by row; a parted column holds
+         * its segments, so sort a flattened copy, as select's sort does. */
+        ray_t* flat = exec_flatten_parted_table(tbl);
+        if (!flat || RAY_IS_ERR(flat)) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = sort_table_by_keys(flat, keys, descending);
+        ray_release(flat);
+        return r;
+    }
 
     /* keys can be a SYM atom, a SYM vector, or a list of SYM atoms */
     int64_t n_keys;
