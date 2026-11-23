@@ -1,0 +1,17 @@
+;; distinct over a lazy chain whose result is an atom answers as it does
+;; on the same atom given concretely (#1527).  (first (distinct V)) of a
+;; string vector is a lazy chain whose result is a string atom.
+(distinct (first (distinct ["tset" "banana"]))) -- (distinct "tset")
+(distinct (last (distinct ["tset" "banana"]))) -- (distinct "banana")
+(distinct (first (distinct ["" "a"]))) -- ""
+;; count of it fuses into a count-distinct, which counts the same
+(count (distinct (first (distinct ["aaaa" "b"])))) -- 1
+(count (distinct (first (distinct ["tset" "banana"])))) -- (count (distinct "tset"))
+(count (distinct (first (distinct ["" "a"])))) -- 0
+;; a chained distinct on top keeps working
+(distinct (distinct (first (distinct ["tset" "banana"])))) -- (distinct "tset")
+;; a lazy non-string atom raises the concrete atom's type error
+(distinct (first (distinct [3 1 3]))) !- type
+(count (distinct (first (distinct [3 1 3])))) !- type
+;; a lazy vector result still goes through the vector kernel
+(distinct (asc [3 1 3 2 1])) -- [1 2 3]
