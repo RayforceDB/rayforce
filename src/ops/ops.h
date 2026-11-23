@@ -1069,6 +1069,8 @@ typedef struct {
     ray_t*  table;
     ray_t*  source;
     ray_t*  group_idx;
+    ray_t*  group_tbl;
+    int32_t group_depth;
     int64_t row;
     ray_t*  row_tbl;
     int32_t row_depth;
