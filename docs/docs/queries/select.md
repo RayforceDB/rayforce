@@ -568,6 +568,41 @@ Set a column to a constant for matching rows:
 (update {price: 0 from: 'tab where: (== volume 901)})
 ```
 
+An aggregate in an update with `where:` is computed over the rows the
+`where:` keeps, as in a `select` with the same `where:`, whether it stands
+alone, inside a larger expression or inside a helper. Running functions
+(`sums`, `deltas`, `prior` and the rest) run over the whole table, as in
+[Running functions under `where:`](#running-functions-under-where), and the
+kept rows take their values. Rows the `where:` drops keep their old value
+(a new column is null there):
+
+```lisp
+(set r (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(update {s: (max score) from: r where: (== room 'A)})               ; s: [60 0Nl 60 0Nl]
+(update {s: (- score (avg score)) from: r where: (== room 'A)})     ; s: [7.5 0Nf -7.5 0Nf]
+(update {s: (sums score) from: r where: (== room 'A)})              ; s: [60 0Nl 125 0Nl]
+(update {s: (- (sums score) (max score)) from: r where: (== room 'A)}) ; s: [0 0Nl 65 0Nl]
+```
+
+The named (`from: 'r`, in place) and value (`from: r`) spellings give the
+same values.
+
+### Column types
+
+An updated column keeps its type, with or without `where:` and `by:`. A value of the column's type is stored as it is. A value of a type that widens into it without loss is stored at the column's type:
+
+- `BOOL` and `U8` widen into any wider integer or float;
+- `I16` widens into `I32`, `I64`, `F32` or `F64`;
+- `I32` widens into `I64` or `F64`;
+- `I64` widens into `F64`;
+- `F32` widens into `F64`.
+
+So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every row. Any other type is a `type` error: an `F64` value into an `I64` column, an `I64` value into an `I32` column, or an integer into a `DATE` column. Cast explicitly to store it, for example `(update {salary: (as 'I64 (* salary 1.1)) from: 't})`.
+
+Integer arithmetic yields `I64`, so to update an `I32`, `I16` or `U8` column, write the literal in the column's type, as in `(update {qty: (+ qty 1i) from: 't})`, or cast the result.
+
+A `LIST` value into a typed column is a `type` error. A `LIST` column keeps its type too: a `LIST` value is stored as it is, and an atom or a typed vector is boxed into it cell by cell, so `(update {l: [1 2 3] from: t})` gives a `LIST` of three `i64` atoms. An update of a `LIST` column with `where:` or `by:` is not supported yet (#1468). A new column takes the value's type.
+
 ### Update with Group-by
 
 Combine `where:` and `by:` for grouped conditional updates:

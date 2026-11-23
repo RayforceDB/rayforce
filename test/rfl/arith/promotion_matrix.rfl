@@ -2697,8 +2697,8 @@
 (set W (table [x] (list [32767h 32767h])))
 (at (select {s: (sum (+ x x)) from: W}) 's) -- [-4]
 (sum (+ [32767h 32767h] [32767h 32767h])) -- -4
-(at (select {s: (sum (+ x 1h)) from: W}) 's) -- [-65536]
-(sum (+ [32767h 32767h] 1h)) -- -65536
+(at (select {s: (sum (+ x 1h)) from: W}) 's) -- [0]
+(sum (+ [32767h 32767h] 1h)) -- 0
 ;; a pool-parallel fused evaluation
 (set N (as 'I16 (til 200000)))
 (set P (table [x] (list N)))
@@ -2734,8 +2734,8 @@
 (at (select {r: (- (* a 2h) (neg a)) from: Z}) 'r) -- (- (* A 2h) (neg A))
 (at (select {s: (sum (* a a)) from: Z where: (> c 7i)}) 's) -- [10050]
 (set W (table [x] (list [32767h 1h -2h])))
-(as 'I64 (at (select {r: (+ (+ x 1h) 0h) from: W}) 'r)) -- [-32768 2 -1]
-;; a long narrow chain: wraps once at the end, same values
+(as 'I64 (at (select {r: (+ (+ x 1h) 0h) from: W}) 'r)) -- [0Nl 2 -1]
+;; a long narrow chain: each intermediate keeps its own width and nulls
 (set D (as 'I16 (til 100)))
 (set DT (table [x] (list D)))
 (all (== (at (select {r: (+ (* (+ (* (+ (* (+ (* (+ (* x x) x) x) x) x) x) x) x) x) (* (- (* x 3h) x) (+ x 2h))) from: DT}) 'r) (+ (* (+ (* (+ (* (+ (* (+ (* D D) D) D) D) D) D) D) D) D) (* (- (* D 3h) D) (+ D 2h))))) -- true

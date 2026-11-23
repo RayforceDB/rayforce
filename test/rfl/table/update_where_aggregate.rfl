@@ -1,0 +1,181 @@
+;; @also-unfused  (the kept-row evaluation runs on both executor routes)
+;; #1435: in a keyless update with where:, an aggregate is computed over the
+;; rows the where: keeps, as in a select with the same where:.  It used to
+;; read the whole table.  A running function (sums, deltas, ...) keeps its
+;; whole-table value at the kept rows (#1280), and an elementwise
+;; expression its row's.  The named (in place) and value spellings of
+;; from: agree.  Every aggregate is pinned against the select broadcast to
+;; the kept rows and against the eager aggregate over the kept rows.
+(set T (table [k i f j d s] (list [1 2 1 2 1 3] [5 7 0Nl 1 9 4] [1.5 2.0 0Nf 4.0 -3.5 8.0] (as 'I32 [3 1 4 1 5 9]) (as 'DATE [8000 8001 8002 8003 8004 8005]) ['x 'y 'z 'y 'w 'v])))
+(set K (where (== (at T 'k) 1)))
+(set D (where (!= (at T 'k) 1)))
+(set I (at (at T 'i) K))
+(set F (at (at T 'f) K))
+K -- [0 2 4]
+
+;; ── every aggregate, as a new column: the kept rows get the aggregate of
+;;    the kept rows, the dropped rows null ──
+(at (at (update {r: (sum i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (sum i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (sum i) from: T where: (== k 1)}) 'r) K) -- (take (sum I) 3)
+(at (at (update {r: (sum i) from: T where: (== k 1)}) 'r) K) -- [14 14 14]
+(nil? (at (at (update {r: (sum i) from: T where: (== k 1)}) 'r) D)) -- [true true true]
+(at (at (update {r: (avg f) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (avg f) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (avg f) from: T where: (== k 1)}) 'r) K) -- (take (avg F) 3)
+(at (at (update {r: (avg f) from: T where: (== k 1)}) 'r) K) -- [-1.0 -1.0 -1.0]
+(at (at (update {r: (avg i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (avg i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (avg i) from: T where: (== k 1)}) 'r) K) -- (take (avg I) 3)
+(at (at (update {r: (min i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (min i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (min i) from: T where: (== k 1)}) 'r) K) -- (take (min I) 3)
+(at (at (update {r: (min i) from: T where: (== k 1)}) 'r) K) -- [5 5 5]
+(at (at (update {r: (max i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (max i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (max i) from: T where: (== k 1)}) 'r) K) -- (take (max I) 3)
+(at (at (update {r: (max i) from: T where: (== k 1)}) 'r) K) -- [9 9 9]
+(at (at (update {r: (count i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (count i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (count i) from: T where: (== k 1)}) 'r) K) -- (take (count I) 3)
+(at (at (update {r: (count i) from: T where: (== k 1)}) 'r) K) -- [3 3 3]
+(at (at (update {r: (first i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (first i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (first i) from: T where: (== k 1)}) 'r) K) -- (take (first I) 3)
+(at (at (update {r: (first i) from: T where: (== k 1)}) 'r) K) -- [5 5 5]
+(at (at (update {r: (last i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (last i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (last i) from: T where: (== k 1)}) 'r) K) -- (take (last I) 3)
+(at (at (update {r: (last i) from: T where: (== k 1)}) 'r) K) -- [9 9 9]
+(at (at (update {r: (med f) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (med f) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (med f) from: T where: (== k 1)}) 'r) K) -- (take (med F) 3)
+(at (at (update {r: (med i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (med i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (med i) from: T where: (== k 1)}) 'r) K) -- [7.0 7.0 7.0]
+(at (at (update {r: (dev f) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (dev f) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (dev f) from: T where: (== k 1)}) 'r) K) -- (take (dev F) 3)
+(at (at (update {r: (dev f) from: T where: (== k 1)}) 'r) K) -- [2.5 2.5 2.5]
+(at (at (update {r: (var f) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (var f) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (var f) from: T where: (== k 1)}) 'r) K) -- (take (var F) 3)
+(at (at (update {r: (var i) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (var i) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (var i) from: T where: (== k 1)}) 'r) K) -- [8.0 8.0 8.0]
+
+;; ── typed columns: I32, DATE, SYM (via first and last) ──
+(at (at (update {r: (sum j) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (sum j) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (sum j) from: T where: (== k 1)}) 'r) K) -- (take (sum (at (at T 'j) K)) 3)
+(at (update {j: (min j) from: T where: (== k 1)}) 'j) -- (as 'I32 [3 1 3 1 3 9])
+(at (at (update {r: (max d) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (max d) from: T where: (== k 1)}) 'r)) 3)
+(at (update {d: (max d) from: T where: (== k 1)}) 'd) -- (as 'DATE [8004 8001 8004 8003 8004 8005])
+(at (at (update {r: (first s) from: T where: (== k 1)}) 'r) K) -- (take (first (at (select {r: (first s) from: T where: (== k 1)}) 'r)) 3)
+(at (at (update {r: (first s) from: T where: (== k 1)}) 'r) K) -- ['x 'x 'x]
+(nil? (at (update {r: (first s) from: T where: (== k 1)}) 'r)) -- [false true false true false true]
+(at (update {s: (last s) from: T where: (== k 1)}) 's) -- ['w 'y 'w 'y 'w 'v]
+(at (update {f: (avg f) from: T where: (== k 1)}) 'f) -- [-1.0 2.0 -1.0 4.0 -1.0 8.0]
+
+;; ── the named spelling writes the same values in place ──
+(set N (table [k i f j d s] (list [1 2 1 2 1 3] [5 7 0Nl 1 9 4] [1.5 2.0 0Nf 4.0 -3.5 8.0] (as 'I32 [3 1 4 1 5 9]) (as 'DATE [8000 8001 8002 8003 8004 8005]) ['x 'y 'z 'y 'w 'v])))
+(update {i: (max i) f: (avg f) j: (min j) d: (max d) s: (last s) from: 'N where: (== k 1)}) -- 'N
+(at N 'i) -- [9 7 9 1 9 4]
+(at N 'f) -- [-1.0 2.0 -1.0 4.0 -1.0 8.0]
+(at N 'j) -- (as 'I32 [3 1 3 1 3 9])
+(at N 'd) -- (as 'DATE [8004 8001 8004 8003 8004 8005])
+(at N 's) -- ['w 'y 'w 'y 'w 'v]
+(at (update {i: (max i) f: (avg f) j: (min j) d: (max d) s: (last s) from: T where: (== k 1)}) 'i) -- (at N 'i)
+;; an elementwise update beside an aggregate in the same call
+(set N (table [k i f] (list [1 2 1 2 1 3] [5 7 0Nl 1 9 4] [1.5 2.0 0Nf 4.0 -3.5 8.0])))
+(update {i: (+ i 1) f: (- f (avg f)) from: 'N where: (== k 1)})
+(at N 'i) -- [6 7 0Nl 1 10 4]
+(at N 'f) -- [2.5 2.0 0Nf 4.0 -2.5 8.0]
+(at (update {i: (+ i 1) f: (- f (avg f)) from: T where: (== k 1)}) 'f) -- (at N 'f)
+;; every expression reads the table as it was before the update
+(set N (table [k i] (list [1 2 1] [1 2 5])))
+(update {i: (+ i 100) r: (max i) from: 'N where: (== k 1)})
+(at N 'i) -- [101 2 105]
+(at N 'r) -- [5 0Nl 5]
+
+;; ── an aggregate inside arithmetic and inside helpers: inline, a helper the
+;;    planner inlines, one it cannot open (several statements) ──
+(at (at (update {r: (- f (avg f)) from: T where: (== k 1)}) 'r) K) -- (at (select {r: (- f (avg f)) from: T where: (== k 1)}) 'r)
+(at (at (update {r: (- f (avg f)) from: T where: (== k 1)}) 'r) K) -- (- F (avg F))
+(at (at (update {r: (- i (max i)) from: T where: (== k 1)}) 'r) K) -- [-4 0Nl 0]
+(at (at (update {r: (* (count i) (+ (min i) 1)) from: T where: (== k 1)}) 'r) K) -- [18 18 18]
+(set hi (fn [x] (- x (avg x))))
+(set ho (fn [x] (let y x) (- y (avg y))))
+(at (at (update {r: (hi f) from: T where: (== k 1)}) 'r) K) -- (- F (avg F))
+(at (at (update {r: (hi f) from: T where: (== k 1)}) 'r) K) -- (at (select {r: (hi f) from: T where: (== k 1)}) 'r)
+(at (at (update {r: (ho f) from: T where: (== k 1)}) 'r) K) -- (- F (avg F))
+(set N (table [k f] (list [1 2 1 2 1 3] [1.5 2.0 0Nf 4.0 -3.5 8.0])))
+(update {f: (ho f) from: 'N where: (== k 1)})
+(at N 'f) -- [2.5 2.0 0Nf 4.0 -2.5 8.0]
+(set N (table [k f] (list [1 2 1 2 1 3] [1.5 2.0 0Nf 4.0 -3.5 8.0])))
+(update {f: (hi f) from: 'N where: (== k 1)})
+(at N 'f) -- [2.5 2.0 0Nf 4.0 -2.5 8.0]
+;; an aggregate over a global, not a column, is the same on every row
+(set G [100 200])
+(at (update {r: (+ i (max G)) from: T where: (== k 1)}) 'r) -- [205 0Nl 0Nl 0Nl 209 0Nl]
+
+;; ── running functions keep the whole-table value at the kept rows ──
+(set U (table [g w] (list ['a 'b 'a 'b] [1 2 3 4])))
+(at (select {s: (sums w) from: U where: (== g 'a)}) 's) -- [1 6]
+(at (update {s: (sums w) from: U where: (== g 'a)}) 's) -- [1 0Nl 6 0Nl]
+(at (update {w: (sums w) from: U where: (== g 'a)}) 'w) -- [1 2 6 4]
+(at (update {s: (deltas w) from: U where: (== g 'a)}) 's) -- [0Nl 0Nl 1 0Nl]
+(at (update {s: (msum 2 w) from: U where: (== g 'a)}) 's) -- [1 0Nl 5 0Nl]
+(set V (table [g w] (list ['a 'b 'a 'b] [1 2 3 4])))
+(update {w: (sums w) from: 'V where: (== g 'a)})
+(at V 'w) -- [1 2 6 4]
+;; a whole-column verb is no aggregate: it keeps reading the whole table in
+;; update, inline or in a helper (#1435 changes aggregates only)
+(set hr (fn [x] (let y x) (reverse y)))
+(at (update {s: (reverse w) from: U where: (== g 'a)}) 's) -- [4 0Nl 2 0Nl]
+(at (update {s: (hr w) from: U where: (== g 'a)}) 's) -- [4 0Nl 2 0Nl]
+
+;; ── running and aggregate mixed: each as select gives it, the running call
+;;    over the whole table, the aggregate beside it over the kept rows, one
+;;    nested in the running call over the whole table ──
+(at (select {s: (- (sums w) (max w)) from: U where: (== g 'a)}) 's) -- [-2 3]
+(at (update {s: (- (sums w) (max w)) from: U where: (== g 'a)}) 's) -- [-2 0Nl 3 0Nl]
+(at (select {s: (max (sums w)) from: U where: (== g 'a)}) 's) -- [6]
+(at (update {s: (max (sums w)) from: U where: (== g 'a)}) 's) -- [6 0Nl 6 0Nl]
+(at (select {s: (sums (- w (avg w))) from: U where: (== g 'a)}) 's) -- [-1.5 -1.5]
+(at (update {s: (sums (- w (avg w))) from: U where: (== g 'a)}) 's) -- [-1.5 0Nf -1.5 0Nf]
+(at (select {s: (- (deltas w) (avg w)) from: U where: (== g 'a)}) 's) -- [0Nf -1.0]
+(at (update {s: (- (deltas w) (avg w)) from: U where: (== g 'a)}) 's) -- [0Nf 0Nf -1.0 0Nf]
+(at (select {s: (- (prior - w) (avg w)) from: U where: (== g 'a)}) 's) -- (at (at (update {s: (- (prior - w) (avg w)) from: U where: (== g 'a)}) 's) [0 2])
+(set V (table [g w] (list ['a 'b 'a 'b] [1 2 3 4])))
+(update {w: (- (sums w) (max w)) from: 'V where: (== g 'a)})
+(at V 'w) -- [-2 2 3 4]
+
+;; ── a where: that keeps no row writes nothing ──
+(at (update {r: (max i) from: T where: (== k 9)}) 'r) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {i: (max i) from: T where: (== k 9)}) 'i) -- (at T 'i)
+(at (update {f: (- f (avg f)) from: T where: (== k 9)}) 'f) -- (at T 'f)
+(set N (table [k i] (list [1 2 1] [1 2 5])))
+(update {i: (max i) from: 'N where: (== k 9)})
+(at N 'i) -- [1 2 5]
+(set N (table [k f] (list [1 2 1] [1.5 2.5 4.0])))
+(update {f: (- f (avg f)) from: 'N where: (== k 9)})
+(at N 'f) -- [1.5 2.5 4.0]
+;; ...yet its expression is still evaluated over the table, as before
+;; #1435, so an error in it surfaces: an existing and a new column, both
+;; spellings, and the elementwise form alike
+(set A (table [g w] (list ['a 'a 'b] [1 2 3])))
+(update {r: (max (+ w 'x)) from: A where: (== g 'z)}) !- type
+(update {w: (max (+ w 'x)) from: A where: (== g 'z)}) !- type
+(update {r: (max (+ w 'x)) from: 'A where: (== g 'z)}) !- type
+(update {w: (max (+ w 'x)) from: 'A where: (== g 'z)}) !- type
+(update {w: (+ w 'x) from: 'A where: (== g 'z)}) !- type
+(update {w: (+ w 'x) from: A where: (== g 'z)}) !- type
+(at A 'w) -- [1 2 3]
+(key A) -- ['g 'w]
+
+;; ── every row kept: the whole-table aggregate, as without where: ──
+(at (update {r: (max i) from: T where: (> k 0)}) 'r) -- (at (update {r: (max i) from: T}) 'r)
+
+;; ── a parted table is read flat: the same answer as the flat table ──
+(.sys.exec "rm -rf /tmp/rfl_update_where_agg")
+(.db.splayed.set "/tmp/rfl_update_where_agg/1/t/" (take T 3))
+(.db.splayed.set "/tmp/rfl_update_where_agg/2/t/" (take T -3))
+(set P (.db.parted.get "/tmp/rfl_update_where_agg/" 't))
+(at (update {r: (max i) from: P where: (== k 1)}) 'r) -- (at (update {r: (max i) from: T where: (== k 1)}) 'r)
+(at (update {r: (max i) from: P where: (== k 1)}) 'r) -- [9 0Nl 9 0Nl 9 0Nl]
+(at (update {f: (- f (avg f)) from: P where: (== k 1)}) 'f) -- [2.5 2.0 0Nf 4.0 -2.5 8.0]
+(at (update {r: (- (sums i) (min i)) from: P where: (== k 1)}) 'r) -- (at (update {r: (- (sums i) (min i)) from: T where: (== k 1)}) 'r)
+(.sys.exec "rm -rf /tmp/rfl_update_where_agg")
+
+;; ── keyed update with by: and no where: is per group, unchanged ──
+(at (update {r: (max i) from: T by: k}) 'r) -- [9 7 9 7 9 4]
+(at (update {r: (sums w) from: U by: g}) 'r) -- [1 2 4 6]
+;; by: and where: together are not supported yet
+(update {r: (max i) from: T by: k where: (== k 1)}) !- nyi

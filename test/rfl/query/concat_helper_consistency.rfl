@@ -53,7 +53,9 @@ G -- 700
 (set G 0)
 (at (update {r: (+ (bump x) (hg x)) from: TG}) 'r) -- (take 290 20)
 (set G 0)
-(at (update {r: (+ (bump x) (hg x)) from: TG where: (> x 17)}) 'r) -- [0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 290 290]
+;; under where: the helper's sum is over the kept rows, 18 + 19 (#1435)
+(at (update {r: (+ (bump x) (hg x)) from: TG where: (> x 17)}) 'r) -- [0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 0N 137 137]
+G -- 100
 (set G 0)
 ;; once per group, as update by: runs it: no whole-table call first
 (at (select {r: (+ (bump x) (hg x)) by: k from: TG}) 'r) -- [121 224 327 430 533 636 719]

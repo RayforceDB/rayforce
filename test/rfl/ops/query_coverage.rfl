@@ -303,11 +303,13 @@
 
 ;; ====================================================================
 ;; Update with WHERE + numeric type promotion — query.c:4076-4113.
-;; Column is I64, expression yields F64 (* col 1.5) — must promote.
+;; Column is I64, expression yields F64 (* col 1.5): a type error, the column
+;; keeps its type (#1458); cast it explicitly.
 ;; ====================================================================
 
 (set Tup (table [id v] (list [1 2 3 4] [10 20 30 40])))
-(set Tup2 (update {v: (* v 1.5) from: Tup where: (> id 2)}))
+(update {v: (* v 1.5) from: Tup where: (> id 2)}) !- type
+(set Tup2 (update {v: (as 'I64 (* v 1.5)) from: Tup where: (> id 2)}))
 ;; Untouched rows preserved; masked rows get F64-cast back to I64.
 (at (at Tup2 'v) 0) -- 10
 (at (at Tup2 'v) 1) -- 20

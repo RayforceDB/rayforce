@@ -1,0 +1,81 @@
+;; @also-unfused
+;; An updated column keeps its type on every route: keyless, where:, by:, in
+;; place and parted (#1458).  A value of a type that widens into the column
+;; without loss is stored at the column's type; any other is a type error.
+
+(set t (table [k v f i d e w bl] (list ['a 'b 'a] [1.5 2.5 3.5] (as 'F32 [1.5 2.5 3.5]) (as 'I32 [1 2 3]) (as 'DATE [1 2 3]) [1 2 3] (as 'I16 [1 2 3]) [true false true])))
+
+;; the issue: an integer literal into an F64 column, with and without by:
+(at (update {v: 7 from: t}) 'v) -- [7.0 7.0 7.0]
+(at (update {v: 7 from: t by: k}) 'v) -- [7.0 7.0 7.0]
+(at (update {v: 7 from: t where: (== k 'a)}) 'v) -- [7.0 2.5 7.0]
+
+;; widenings, on every route
+(at (update {v: i from: t}) 'v) -- [1.0 2.0 3.0]
+(at (update {v: i from: t by: k}) 'v) -- [1.0 2.0 3.0]
+(at (update {v: i from: t where: (== k 'a)}) 'v) -- [1.0 2.5 3.0]
+(at (update {v: f from: t by: k}) 'v) -- [1.5 2.5 3.5]
+(at (update {e: w from: t}) 'e) -- [1 2 3]
+(at (update {e: i from: t by: k}) 'e) -- [1 2 3]
+(at (update {i: w from: t where: (== k 'b)}) 'i) -- (as 'I32 [1 2 3])
+(at (update {f: w from: t}) 'f) -- (as 'F32 [1.0 2.0 3.0])
+(at (update {w: bl from: t by: k}) 'w) -- (as 'I16 [1 0 1])
+(type (at (update {v: (sum i) from: t by: k}) 'v)) -- 'F64
+(at (update {v: (sum i) from: t by: k}) 'v) -- [4.0 2.0 4.0]
+(at (update {v: (sums e) from: t by: k}) 'v) -- [1.0 2.0 4.0]
+(at (update {d: (+ d 1) from: t by: k}) 'd) -- (as 'DATE [2 3 4])
+
+;; narrowing or another type: a type error on every route
+(update {e: v from: t}) !- type
+(update {e: v from: t by: k}) !- type
+(update {e: v from: t where: (== k 'a)}) !- type
+(update {e: 7.5 from: t by: k}) !- type
+(update {i: 7 from: t}) !- type
+(update {i: 7 from: t by: k}) !- type
+(update {i: (count i) from: t by: k}) !- type
+(update {f: v from: t by: k}) !- type
+(update {f: 7.5 from: t where: (== k 'a)}) !- type
+(update {d: 7 from: t by: k}) !- type
+(update {w: e from: t}) !- type
+(update {e: (avg e) from: t by: k}) !- type
+
+;; nulls widen to the column's null
+(at (update {v: 0Nl from: t by: k}) 'v) -- [0Nf 0Nf 0Nf]
+(at (update {e: (as 'I32 [0Nl 5 6]) from: t where: (== k 'a)}) 'e) -- [0Nl 2 6]
+(at (update {v: (as 'F32 [1.5 0Nf 3.5]) from: t}) 'v) -- [1.5 0Nf 3.5]
+
+;; a new column takes the value's type
+(type (at (update {n: 7 from: t by: k}) 'n)) -- 'I64
+(type (at (update {n: 7.5 from: t where: (== k 'a)}) 'n)) -- 'F64
+
+;; in place
+(set u t)
+(update {v: 7 from: 'u by: k}) -- 'u
+(at u 'v) -- [7.0 7.0 7.0]
+(update {v: 8 from: 'u where: (== k 'a)}) -- 'u
+(at u 'v) -- [8.0 7.0 8.0]
+(update {e: 7.5 from: 'u where: (== k 'a)}) !- type
+(at u 'e) -- [1 2 3]
+
+;; a parted table
+(.sys.exec "rm -rf /tmp/rfl_update_keeps_type") -- 0
+(set P0 (table [k v] (list ['a 'b 'a 'b] [1.5 2.5 3.5 4.5])))
+(.db.splayed.set "/tmp/rfl_update_keeps_type/2024.01.01/t/" (take P0 2) "/tmp/rfl_update_keeps_type/.sym")
+(.db.splayed.set "/tmp/rfl_update_keeps_type/2024.01.02/t/" (drop P0 2) "/tmp/rfl_update_keeps_type/.sym")
+(set P (.db.parted.get "/tmp/rfl_update_keeps_type" 't))
+(at (update {v: 7 from: P by: k}) 'v) -- [7.0 7.0 7.0 7.0]
+(at (update {v: 7 from: P where: (== k 'a)}) 'v) -- [7.0 2.5 7.0 4.5]
+(update {v: (as 'I64 v) from: P by: k}) -- (update {v: (as 'F64 (as 'I64 v)) from: P by: k})
+(.sys.exec "rm -rf /tmp/rfl_update_keeps_type") -- 0
+
+;; a LIST value into a typed column: a type error on every route
+(update {v: (list 1 2 3) from: t}) !- type
+(update {v: (list 1 2 3) from: t where: (== k 'a)}) !- type
+(update {v: (list 1 2) from: t by: k}) !- type
+;; a LIST column keeps its type: a LIST is stored, an atom or a typed vector boxed
+(set L (table [k c] (list ['a 'b 'a] (list [1 2] "x" 'y))))
+(at (update {c: (list 1 2 3) from: L}) 'c) -- (list 1 2 3)
+(at (update {c: [1 2 3] from: L}) 'c) -- (list 1 2 3)
+(type (at (update {c: ['p 'q 'r] from: L}) 'c)) -- 'LIST
+(at (update {c: 7 from: L}) 'c) -- (list 7 7 7)
+(at (update {c: 'w from: L}) 'c) -- (list 'w 'w 'w)
