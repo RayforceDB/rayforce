@@ -927,7 +927,61 @@ static bool linear_reads_nullable(ray_graph_t* g, ray_t* tbl, ray_op_t* op, int 
     return false;
 }
 
-typedef struct { const uint64_t *x, *y; uint64_t c; bool twice; ray_pool_t* pool; _Atomic(uint64_t) total, rows; } parity_sum_ctx_t;
+typedef struct {
+    const uint64_t *x, *y;
+    uint64_t k, c, mask, mul_hit, final_hit;
+    bool nested;
+    ray_pool_t* pool;
+    _Atomic(uint64_t) total, rows;
+} parity_sum_ctx_t;
+
+static bool parity_literal(ray_graph_t* g, ray_op_t* op, uint64_t* out) {
+    ray_op_ext_t* e = op && op->opcode == OP_CONST ? find_ext(g, op->id) : NULL;
+    if (!e || !e->literal || e->literal->type != -RAY_I64 || RAY_ATOM_IS_NULL(e->literal)) return false;
+    *out = (uint64_t)e->literal->i64;
+    return true;
+}
+
+/* Match syntax, not just the flattened coefficients: each arithmetic node
+ * can produce a null which propagates through its parent. */
+static bool parity_shape(ray_graph_t* g, ray_op_t* root, parity_sum_ctx_t* q) {
+    ray_op_t *a = op_child(g, root, 0), *b = op_child(g, root, 1);
+    bool reversed = a && a->opcode == OP_CONST;
+    if (reversed) { ray_op_t* t = a; a = b; b = t; }
+    uint64_t v;
+    if (!a || !parity_literal(g, b, &v)) return false;
+    q->k = 1;
+    if (root->opcode == OP_ADD) {
+        q->c = v;
+        if (a->opcode == OP_MUL && a->arity == 2 && op_base_type(a) == RAY_I64) {
+            b = op_child(g, a, 1);
+            a = op_child(g, a, 0);
+            if (!parity_literal(g, b, &q->k)) return false;
+            q->nested = q->c != 0;
+        }
+    } else if (root->opcode == OP_SUB) {
+        q->k = reversed ? UINT64_MAX : 1;
+        q->c = reversed ? v : -v;
+    } else if (root->opcode == OP_MUL) q->k = v;
+    else return false;
+    if (!a || a->opcode != OP_SCAN) return false;
+    if (!q->k) return true; /* known non-null source times zero */
+
+    /* k*x == target mod 2^64: divide out gcd(k,2^64), then invert
+     * the odd factor modulo the remaining power of two. Each Newton
+     * step doubles the number of correct low bits (initially one). */
+    unsigned shift = (unsigned)__builtin_ctzll(q->k);
+    uint64_t odd = q->k >> shift, inv = 1;
+    for (int i = 0; i < 6; i++) inv *= 2 - odd * inv;
+    uint64_t h = UINT64_C(1) << 63, target = h - q->c;
+    q->mask = UINT64_MAX >> shift;
+    q->mul_hit = ((h >> shift) * inv) & q->mask;
+    /* An indivisible target has no preimage. Then shift > 0, so
+     * UINT64_MAX lies outside the range of masked inputs. */
+    q->final_hit = (target & ((UINT64_C(1) << shift) - 1)) ? UINT64_MAX :
+                   ((target >> shift) * inv) & q->mask;
+    return true;
+}
 static void parity_sum_slice(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
     parity_sum_ctx_t* q = ctx;
     if (ray_interrupted() || (q->pool && atomic_load_explicit(&q->pool->cancelled, memory_order_acquire))) return;
@@ -940,12 +994,28 @@ static void parity_sum_slice(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
             s += row;
             p ^= row == h;
         }
-    } else if (q->twice) {
-        for (int64_t i = lo; i < hi; i++) { uint64_t v = q->x[i]; s += v; p ^= (v & (h-1)) == h/2; }
-        s *= 2;
+    } else if (!q->k) {
+        s = (uint64_t)(hi-lo) * q->c;
     } else {
-        for (int64_t i = lo; i < hi; i++) { uint64_t v = q->x[i]; s += v; p ^= v == h-q->c; }
-        s += (uint64_t)(hi-lo)*q->c;
+        uint64_t skipped = 0;
+        if (q->nested) {
+            /* c != 0: the two hit sets are disjoint. The raw affine sum
+             * includes h+c for each generated multiply null; remove all
+             * of it, not just bit 63. */
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i], bits = v & q->mask;
+                s += v;
+                skipped += bits == q->mul_hit;
+                p ^= bits == q->final_hit;
+            }
+        } else {
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i];
+                s += v;
+                p ^= (v & q->mask) == q->final_hit;
+            }
+        }
+        s = s*q->k + (uint64_t)(hi-lo)*q->c - skipped*(h+q->c);
     }
     atomic_fetch_add_explicit(&q->total, s ^ (p << 63), memory_order_relaxed);
     atomic_fetch_add_explicit(&q->rows, (uint64_t)(hi-lo), memory_order_relaxed);
@@ -993,19 +1063,14 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                 op_child(g,input_op,0)->opcode == OP_SCAN && op_child(g,input_op,1)->opcode == OP_SCAN;
     if (lone && !avg && nrows >= NP_SLICE && (lin.n_terms == 1 || pair) && input_op->arity == 2 &&
         op_base_type(input_op) == RAY_I64 && srcs[0]->type == RAY_I64 &&
-        srcs[0]->obj->type == RAY_I64 && !(srcs[0]->attrs & RAY_ATTR_SLICE) && srcs[0]->len == nrows && !np_meta_bounds(srcs[0], &existing_bounds) &&
-        (input_op->opcode == OP_ADD || input_op->opcode == OP_MUL)) {
-        ray_op_t *a = op_child(g,input_op,0), *b = op_child(g,input_op,1);
-        if (a && a->opcode == OP_CONST) { ray_op_t* t = a; a = b; b = t; }
-        ray_op_ext_t* e = b && b->opcode == OP_CONST ? find_ext(g,b->id) : NULL;
-        double f; int64_t c = 0; bool fp;
+        srcs[0]->obj->type == RAY_I64 && !(srcs[0]->attrs & RAY_ATTR_SLICE) && srcs[0]->len == nrows &&
+        !np_meta_bounds(srcs[0], &existing_bounds)) {
         if (pair && (srcs[1]->type != RAY_I64 || srcs[1]->obj->type != RAY_I64 ||
                      (srcs[1]->attrs & RAY_ATTR_SLICE) || srcs[1]->len != nrows ||
                      np_meta_bounds(srcs[1], &existing_bounds))) pair = false;
-        if (pair || (a && a->opcode == OP_SCAN && e && e->literal && e->literal->type == -RAY_I64 && !RAY_ATOM_IS_NULL(e->literal) &&
-            eval_const_numeric_expr(g,b,&f,&c,&fp) && !fp && c != NULL_I64 &&
-            (input_op->opcode == OP_ADD || c == 2))) {
-            parity_sum_ctx_t q = {.x = ray_col_src_base(srcs[0]), .y = pair ? ray_col_src_base(srcs[1]) : NULL, .c = (uint64_t)c, .twice = input_op->opcode == OP_MUL};
+        parity_sum_ctx_t q = {.x = ray_col_src_base(srcs[0])};
+        if (pair) q.y = ray_col_src_base(srcs[1]);
+        if (pair || (lin.n_terms == 1 && parity_shape(g, input_op, &q))) {
             ray_pool_t* pool = q.pool = ray_pool_get();
             if (ray_pool_par_dispatch_ok(pool,nrows,RAY_PARALLEL_THRESHOLD))
                 ray_pool_dispatch_grain(pool,parity_sum_slice,&q,nrows,NP_SLICE);

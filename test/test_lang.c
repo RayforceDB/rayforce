@@ -380,11 +380,14 @@ static test_result_t test_narrow_sum_bound_cancel(void) {
         "(select {s: (avg (+ i j)) from: _cT})",
         "(select {s: (sum (+ h 1h)) from: _cT})",
         "(select {s: (sum (+ hw hw)) from: _cT})",
+        "(select {s: (avg (+ z 7)) from: _cT})",
         "(select {s: (sum (* z 2)) from: _cT})",
+        "(select {s: (sum (+ (* z -6) 4)) from: _cT})",
         NULL,
     };
     static const char* const ex[] = {
-        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))", "(enlist (sum (* z 2)))",
+        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))", "(enlist (avg (+ z 7)))", "(enlist (sum (* z 2)))",
+        "(enlist (sum (+ (* z -6) 4)))",
     };
     int cancelled = 0, answered = 0;
     for (int qi = 0; qs[qi] && !bad; qi++)
