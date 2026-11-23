@@ -117,6 +117,49 @@ static bool agg_col_meta(ray_graph_t* g, ray_t* tbl, int64_t sym, ray_col_meta_t
     return true;
 }
 
+/* The native float hash reducer avoids building row slices for small
+ * parallel pools. At larger pools its replicated group states cost more
+ * than the shared directory. Byte/structural keys always use full-key
+ * grouping, and ordered/buffered consumers always share row slices.  So a
+ * float key on 2 to 8 workers leaves v2 (AGG_V2_PARALLEL_WIDE).  key_types,
+ * when given, names the type of key k that is not yet a column of tbl (a
+ * computed key the expression bridge has still to evaluate, 0 when not
+ * known); a key it gives no type for is read from tbl.  in_types does the
+ * same for the aggregate inputs (an expression input the bridge evaluates
+ * into a column of that type). */
+bool agg_v2_parallel_wide(ray_graph_t* g, ray_op_t* op, ray_t* tbl, const int8_t* key_types,
+                          const int8_t* in_types) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return false;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t workers = pool ? ray_pool_total_workers(pool) : 1;
+    if (ext->n_keys > 8 || workers < 2 || workers > 8 ||
+            ray_table_nrows(tbl) < RAY_PARALLEL_THRESHOLD) return false;
+    bool floating = false, indexed = false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        int8_t t = key_types ? key_types[k] : 0;
+        if (!t) {
+            ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+            ray_col_meta_t cm;
+            if (!ke || !agg_col_meta(g, tbl, ke->sym, &cm)) continue;   /* present: the admission's key loop checked */
+            t = cm.type;
+        }
+        if (t == RAY_F32 || t == RAY_F64) floating = true;
+        if (t == RAY_STR || t == RAY_GUID || t == RAY_LIST) indexed = true;
+    }
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        int8_t t = in_types ? in_types[a] : 0;
+        if (!t) {
+            ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
+            ray_col_meta_t cm;
+            if (!ie || !agg_col_meta(g, tbl, ie->sym, &cm)) continue;
+            t = cm.type;
+        }
+        if (agg_indexed_supported(ext->agg_ops[a], t)) indexed = true;
+    }
+    return floating && !indexed;
+}
+
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!g || !op || !tbl) return AGG_V2_SHAPE;
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -172,29 +215,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
     }
 
-    /* The native float hash reducer avoids building row slices for small
-     * parallel pools. At larger pools its replicated group states cost more
-     * than the shared directory. Byte/structural keys always use full-key
-     * grouping, and ordered/buffered consumers always share row slices. */
-    ray_pool_t* pool = ray_pool_get();
-    uint32_t workers = pool ? ray_pool_total_workers(pool) : 1;
-    if (ext->n_keys <= 8 && workers >= 2 && workers <= 8 &&
-            ray_table_nrows(tbl) >= RAY_PARALLEL_THRESHOLD) {
-        bool floating = false, indexed = false;
-        for (uint32_t k = 0; k < ext->n_keys; k++) {
-            ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
-            ray_col_meta_t cm;
-            if (!agg_col_meta(g, tbl, ke->sym, &cm)) continue;   /* present: the key loop above checked */
-            if (cm.type == RAY_F32 || cm.type == RAY_F64) floating = true;
-            if (cm.type == RAY_STR || cm.type == RAY_GUID || cm.type == RAY_LIST) indexed = true;
-        }
-        for (uint32_t a = 0; a < ext->n_aggs; a++) {
-            ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
-            ray_col_meta_t cm;
-            if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
-        }
-        if (floating && !indexed) return AGG_V2_PARALLEL_WIDE;
-    }
+    if (agg_v2_parallel_wide(g, op, tbl, NULL, NULL)) return AGG_V2_PARALLEL_WIDE;
 
     /* every aggregate must be a registry-resolvable plain-column scan */
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
@@ -1405,16 +1426,46 @@ static int64_t agg_dense_wide_slots(void) {
     return s < (int64_t)UINT32_MAX ? s : (int64_t)UINT32_MAX;
 }
 
-/* Whether the single key has many groups: of 1024 rows spread over the table,
- * at least a quarter hold distinct keys.  A wide dense plan pays for its
- * whole range, so a key with a few groups spread over a wide range (which
- * the table stack and the hash routes answer from their own few entries)
- * does not take it.  *err is set on a failed range read. */
-static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows, ray_t** err) {
+/* Fewer groups than this (as the sample estimates them) fit a cache-resident
+ * hash table, which answers at about 6.6 ns a row on one core against the
+ * slab's 4.6 ns a row plus 1 ns a slot of range (10M rows, a 10M-slot range,
+ * 1000 to 1M groups): the slab wins for so few groups only while its range
+ * is at most AGG_WIDE_FEW_RANGE_PER_ROW slots a row.  On many workers the
+ * few hot slots of a shared slab also contend (1000 groups over 1M rows at
+ * 8 workers: 4.4 ms on the slab, 1.5 ms hashed).  More groups keep the
+ * wide plan up to AGG_WIDE_RANGE_PER_ROW, where it beats the radix route. */
+#define AGG_WIDE_FEW_GROUPS 4096
+#define AGG_WIDE_FEW_RANGE_PER_ROW 2
+
+/* The group count a sample suggests, from its distinct keys and those it
+ * drew once (f1) and twice (f2): the bias-corrected Chao1 estimate,
+ * distinct + f1 (f1 - 1) / (2 (f2 + 1)).  Unlike an estimate from the
+ * distinct count alone it does not take a skewed key (one hot group, a long
+ * tail of rare ones) for a few groups: the tail shows as singletons.  A
+ * sorted key, whose strided sample meets each group about once, reads as
+ * many groups too, which it is for the slab: its rows fill the range in
+ * order. */
+static int64_t agg_groups_from_sample(int64_t distinct, int64_t f1, int64_t f2) {
+    return distinct + (int64_t)((double)f1 * (double)(f1 > 0 ? f1 - 1 : 0) / (2.0 * (double)(f2 + 1)));
+}
+
+/* Whether the single key has many groups for its range: of 1024 rows spread
+ * over the table, at least a quarter hold distinct keys, and either the
+ * groups the sample suggests (agg_groups_from_sample) are not few
+ * (AGG_WIDE_FEW_GROUPS) or the range is
+ * short for the rows (AGG_WIDE_FEW_RANGE_PER_ROW).  A wide dense plan pays
+ * for its whole range, so a key with few groups spread over a wide range
+ * (which the table stack and the hash routes answer from their own few
+ * entries) does not take it: a thousand xbar buckets ten thousand apart over
+ * 1M rows are a thousand groups, not a ten-million-slot slab (#1460).
+ * *err is set on a failed range read. */
+static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows,
+                               int64_t range, ray_t** err) {
     enum { SAMPLES = 1024, CAP = 2048 };
     *err = NULL;
     if (nrows < SAMPLES) return false;
     int64_t seen[CAP];
+    uint16_t hits[CAP];
     bool used[CAP];
     memset(used, 0, sizeof used);
     agg_curs_t cs; cs.cur = NULL;
@@ -1428,15 +1479,32 @@ static bool agg_wide_populated(ray_t* key_col, const agg_rr_t* rr, int64_t nrows
         for (int i = 0; i < SAMPLES; i++) wrow[i] = i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step);
         agg_want_points(rr, 1, wrow, SAMPLES);
     }
+    int64_t prev = INT64_MIN, descents = 0;
     for (int i = 0; i < SAMPLES && !*err; i++) {
         int64_t v = agg_key_at(rr, &cs, 0, i * step + (int64_t)(ray_hash_i64(i) % (uint64_t)step), err);
         if (*err) break;
+        descents += v < prev;
+        prev = v;
         uint32_t at = ray_hash_i64(v) & (CAP - 1);
         while (used[at] && seen[at] != v) at = (at + 1) & (CAP - 1);
-        if (!used[at]) { used[at] = true; seen[at] = v; distinct++; }
+        if (!used[at]) { used[at] = true; seen[at] = v; hits[at] = 0; distinct++; }
+        hits[at]++;
     }
     agg_curs_free(&cs, rr);
-    return !*err && distinct * 4 >= SAMPLES;
+    if (*err || distinct * 4 < SAMPLES) return false;
+    if (range <= AGG_WIDE_FEW_RANGE_PER_ROW * nrows) return true;
+    /* Keys in row order fill the slab in order: its slots are touched once
+     * each, front to back, and the slab beats a hash however few the groups
+     * (1000 sorted groups over a range of three slots a row, 10M rows: 134
+     * ms on the slab, 146 hashed, 1 core). */
+    if (descents * 64 <= SAMPLES) return true;
+    int64_t f1 = 0, f2 = 0;
+    for (int i = 0; i < CAP; i++) {
+        if (!used[i]) continue;
+        f1 += hits[i] == 1;
+        f2 += hits[i] == 2;
+    }
+    return agg_groups_from_sample(distinct, f1, f2) >= AGG_WIDE_FEW_GROUPS;
 }
 
 /* Whether a single-key plan of total_slots runs as the one shared slab of a
@@ -1455,7 +1523,7 @@ static bool agg_wide_shared_fits(const agg_vtable_t** vts, uint32_t n_aggs, size
     size_t slot_bytes = agg_count32_slab(vts, n_aggs, eff_n) ? sizeof(uint32_t) : block;
     double need = (double)total_slots * (double)slot_bytes + (double)total_slots / 8;
     if (need > (double)agg_dense_wide_room() / 4 * 3) return false;
-    return agg_wide_populated(key_col, rr, nrows, err);
+    return agg_wide_populated(key_col, rr, nrows, total_slots, err);
 }
 
 /* agg_dense_plan over keys bound for range reads: krr's staged keys (their

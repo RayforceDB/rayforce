@@ -1,0 +1,158 @@
+;; @also-unfused
+;; @requires: posix  (parted fixture under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; A grouped select's groups, and the groups an unordered take: keeps, do not
+;; depend on how the key is spelled (issue #1460).  A bare expression key,
+;; `by: (% v 3)`, and an xbar key were grouped on the legacy ladder, which
+;; emits the groups in key order and trimmed take: from that; the by-dict
+;; spelling `by: {kk: (% v 3)}` and a column key keep the first N groups
+;; seen.  Now every spelling takes the same strategy: take: N keeps the first
+;; N groups in first-seen order, and a full result has the order the by-dict
+;; spelling of the same key has.
+;;
+;; The first-seen order is computed eagerly: the key's values at the first
+;; row of each value (a stable sort's first index per run), in row order.
+
+;; the distinct values of K in the order they first appear
+(set FSr (fn [K s m] (at K (asc (at s (where (concat [true] (!= (at (at K s) (+ 1 (til (- m 1)))) (at (at K s) (til (- m 1)))))))))))
+(set FS (fn [K] (FSr K (iasc K) (count K))))
+;; the key column of a by: result
+(set K0 (fn [q] (at q (at (key q) 0))))
+(set K01 (fn [q] (list (at q (at (key q) 0)) (at q (at (key q) 1)))))
+
+;; ── a small table: the serial routes ───────────────────────────────────────
+(set S (table [k j v d] (list [2 1 0 2 1 0 2 1] [1 0 1 0 1 0 1 0] [10 4 3 5 6 7 8 9] (+ 2024.01.01 [0 1 2 3 4 5 6 7]))))
+(FS [3 1 3 0 1 2 0])                                                      -- [3 1 0 2]
+(FS (% (at S 'v) 3))                                                      -- [1 0 2]
+(K0 (select {s: (sum v) from: S by: (% v 3)}))                            -- [1 0 2]
+(K0 (select {s: (sum v) from: S by: (% v 3) take: 2}))                    -- [1 0]
+(at (select {s: (sum v) from: S by: (% v 3) take: 2}) 's)                 -- [21 18]
+(K0 (select {s: (sum v) from: S by: {kk: (% v 3)} take: 2}))              -- [1 0]
+(K0 (select {s: (sum v) e: (first (+ d 1)) from: S by: (% v 3) take: 2})) -- [1 0]
+(at (select {s: (sum v) e: (first (+ d 1)) from: S by: (% v 3) take: 2}) 'e)  -- [2024.01.02 2024.01.04]
+(K0 (select {s: (sum v) from: S by: (xbar v 3)}))                         -- [9 3 6]
+(K0 (select {s: (sum v) from: S by: (xbar v 3) take: 2}))                 -- [9 3]
+(K0 (select {s: (sum v) from: S by: (+ k j)}))                            -- [3 1 2 0]
+(K0 (select {s: (sum v) from: S by: (== j 0)}))                           -- [false true]
+(K0 (select {s: (sum v) from: S by: (+ k j) where: (> v 4)}))             -- [3 2 0 1]
+(K0 (select {s: (sum v) from: S by: (+ k j) where: (> v 4) take: 2}))     -- [3 2]
+(K0 (select {s: (sum v) from: S by: k take: 2}))                          -- [2 1]
+(K01 (select {s: (sum v) from: S by: [k j] take: 3}))                     -- (list [2 1 0] [1 0 1])
+;; a tie on the ordering aggregate goes to the group seen first
+(K0 (select {c: (count v) from: S by: (% k 3) desc: c take: 2}))          -- [2 1]
+(K0 (select {c: (count v) from: S by: (xbar v 3) desc: c take: 2}))       -- [3 6]
+
+;; ── 100000 rows: the parallel dense and hash routes ─────────────────────────
+;; v's last three digits first appear as 0 729 458 187 ..., k's as 500 419
+;; 338 ...; neither is ascending
+(set n 100000)
+(set T (table [k j v g d] (list (% (+ 500 (* (til n) 7919)) 1000) (% (+ 2 (til n)) 3) (+ 1000000 (% (* (til n) 104729) 1000003)) (at [c a b d e] (% (* (til n) 7) 5)) (+ 2024.01.01 (% (* (til n) 13) 400)))))
+(set Kv (% (at T 'v) 1000))
+(set Kb (xbar (at T 'v) 1000))
+(set Kd (xbar (at T 'd) 7))
+(set Kkj (+ (at T 'k) (at T 'j)))
+(take (FS Kv) 4)                                                          -- [0 729 458 187]
+(take (FS (at T 'k)) 4)                                                   -- [500 419 338 257]
+;; take: N keeps the first N groups seen, whatever the spelling
+(K0 (select {s: (sum v) from: T by: (% v 1000) take: 5}))                 -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) from: T by: {kk: (% v 1000)} take: 5}))           -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) c: (count v) from: T by: (% v 1000) take: 5}))    -- (take (FS Kv) 5)
+(K0 (select {s: (max (* v 2)) from: T by: (% v 1000) take: 5}))           -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: (% v 1000) take: 5}))  -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))              -- (take (FS Kb) 5)
+(K0 (select {s: (sum v) from: T by: (xbar d 7) take: 5}))                 -- (take (FS Kd) 5)
+(K0 (select {s: (sum v) from: T by: (+ k j) take: 5}))                    -- (take (FS Kkj) 5)
+(K0 (select {s: (sum v) from: T by: k take: 5}))                          -- (take (FS (at T 'k)) 5)
+(K0 (select {s: (sum v) from: T by: [k j] take: 5}))                      -- (take (at T 'k) 5)
+(K0 (select {s: (sum v) from: T by: (== g 'a) take: 2}))                  -- (FS (== (at T 'g) 'a))
+;; a name holding a vector as long as the table is a key too
+(set G (at T 'k))
+(K0 (select {s: (sum v) from: T by: G take: 5}))                          -- (take (FS G) 5)
+((fn [x] (K0 (select {s: (sum v) from: T by: x take: 5}))) Kv)            -- (take (FS Kv) 5)
+;; the kept groups' values are their own
+(at (select {s: (sum v) from: T by: (% v 1000) take: 3}) 's)              -- (map (fn [x] (sum (at (at T 'v) (where (== Kv x))))) (take (FS Kv) 3))
+;; under a where: the first groups among the kept rows
+(set W (> (at T 'v) 1500000))
+(K0 (select {s: (sum v) from: T where: (> v 1500000) by: (% v 1000) take: 5}))  -- (take (FS (at Kv (where W))) 5)
+(K0 (select {s: (sum v) from: T where: (> v 1500000) by: (xbar v 1000) take: 5}))  -- (take (FS (at Kb (where W))) 5)
+((fn [x] (K0 (select {s: (sum v) from: T where: (> v 1500000) by: x take: 5}))) Kv)  -- (take (FS (at Kv (where W))) 5)
+;; an output ordered by an aggregate keeps the groups the by-dict spelling
+;; keeps, ties included: count ties every group of (* k 2) at 100 rows
+(K0 (select {c: (count v) from: T by: (* k 2) desc: c take: 4}))         -- (K0 (select {c: (count v) from: T by: {kk: (* k 2)} desc: c take: 4}))
+(K0 (select {s: (sum j) from: T by: (* k 2) asc: s take: 4}))            -- (K0 (select {s: (sum j) from: T by: {kk: (* k 2)} asc: s take: 4}))
+(K0 (select {s: (sum v) from: T by: (% v 1000) desc: s take: 4}))        -- (K0 (select {s: (sum v) from: T by: {kk: (% v 1000)} desc: s take: 4}))
+;; the full result has the by-dict spelling's order
+(K0 (select {s: (sum v) from: T by: (% v 1000)}))                         -- (K0 (select {s: (sum v) from: T by: {kk: (% v 1000)}}))
+;; (an xbar key groups densely on its quotient, the by-dict column by hash:
+;; the same groups, in each strategy's order)
+(asc (K0 (select {s: (sum v) from: T by: (xbar v 1000)})))                -- (asc (K0 (select {s: (sum v) from: T by: {kk: (xbar v 1000)}})))
+(K0 (select {s: (sum v) from: T by: (+ k j)}))                            -- (K0 (select {s: (sum v) from: T by: {kk: (+ k j)}}))
+(K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: (% v 1000)}))      -- (K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: {kk: (% v 1000)}}))
+
+;; ── xbar keys grouped on their quotient ───────────────────────────────────
+;; an xbar key with a literal bucket groups on (div x b) and comes back as
+;; its buckets: every type xbar keeps, negative values, nulls, a where:
+(set X (table [v i h d t tm] (list [10 -4 3 0Nl 6 -17 8 9 25 -4] (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4]) (as 'I16 [10 -4 3 0N 6 -17 8 9 25 -4]) (+ 2024.01.01 (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4])) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 [10 -4 3 0N 6 -17 8 9 25 -4])) (as 'TIME (* 1000 [10 4 3 0N 6 17 8 9 25 4])))))
+(set XS (fn [c b] (do (set kb (xbar (at X c) b)) (list (FS kb) (map (fn [x] (count (where (== kb x)))) (FS kb))))))
+(set XQ (fn [q] (list (K0 q) (at q 'n))))
+(XQ (select {n: (count v) from: X by: (xbar v 10)}))              -- (XS 'v 10)
+(XQ (select {n: (count v) from: X by: (xbar i 7)}))               -- (XS 'i 7)
+(XQ (select {n: (count v) from: X by: (xbar h 3)}))               -- (XS 'h 3)
+(XQ (select {n: (count v) from: X by: (xbar d 7)}))               -- (XS 'd 7)
+(XQ (select {n: (count v) from: X by: (xbar t 7000000000)}))      -- (XS 't 7000000000)
+(XQ (select {n: (count v) from: X by: (xbar tm 7000)}))           -- (XS 'tm 7000)
+(K0 (select {n: (count v) from: X by: (xbar v 10) take: 2}))      -- (take (FS (xbar (at X 'v) 10)) 2)
+(K0 (select {n: (count v) from: X by: (xbar v 10) where: (> i 0)}))  -- (FS (xbar (at (select {from: X where: (> i 0)}) 'v) 10))
+(type (K0 (select {n: (count v) from: X by: (xbar d 7)})))        -- (type (xbar (at X 'd) 7))
+(type (K0 (select {n: (count v) from: X by: (xbar t 7000000000)})))  -- (type (at X 't))
+(asc (K0 (select {s: (sum v) from: T by: (xbar d 7)})))           -- (asc (K0 (select {s: (sum v) from: T by: {kk: (xbar d 7)}})))
+(at (xasc (select {s: (sum v) from: T by: (xbar d 7)}) 'd) 's)    -- (at (xasc (select {s: (sum v) from: T by: {kk: (xbar d 7)}}) 'kk) 's)
+(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))      -- (take (FS Kb) 5)
+
+;; a bucket that would reach the type's minimum: x - (x mod b) lands on the
+;; null sentinel (b a power of two) or wraps (b = 3 at the I64 minimum); the
+;; quotient path declines and the key is grouped as written, as its by-dict
+;; spelling is
+(set XB (table [h i x v] (list (as 'I16 (concat [-32767 0N] (% (til 1998) 100))) (as 'I32 (concat [-2147483647 0N] (% (til 1998) 100))) (concat [-9223372036854775807 0Nl] (til 1998)) (til 2000))))
+(set XD (fn [q c] (list (count q) (at (xasc q c) c) (at (xasc q c) 'n))))
+(XD (select {n: (count v) from: XB by: (xbar h 2h)}) 'h)          -- (XD (select {n: (count v) from: XB by: {kk: (xbar h 2h)}}) 'kk)
+(take (at (xasc (select {n: (count v) from: XB by: (xbar h 2h)}) 'h) 'n) 2)  -- [2 40]
+(take (at (xasc (select {n: (count v) from: XB by: (xbar h 2h)}) 'h) 'h) 2)  -- (as 'I16 [0N 0])
+(XD (select {n: (count v) from: XB by: (xbar i 2i)}) 'i)          -- (XD (select {n: (count v) from: XB by: {kk: (xbar i 2i)}}) 'kk)
+(XD (select {n: (count v) from: XB by: (xbar x 2)}) 'x)           -- (XD (select {n: (count v) from: XB by: {kk: (xbar x 2)}}) 'kk)
+(XD (select {n: (count v) from: XB by: (xbar x 4611686018427387904)}) 'x)  -- (XD (select {n: (count v) from: XB by: {kk: (xbar x 4611686018427387904)}}) 'kk)
+(count (select {n: (count v) from: XB by: (xbar x 3)}))           -- (count (select {n: (count v) from: XB by: {kk: (xbar x 3)}}))
+
+;; ── a column named like the bridge's hidden ones ───────────────────────────
+(set H (table [k v _k0 _e0 __k0] (list [2 1 0 2 1 0 2 1] [10 4 3 5 6 7 8 9] [9 9 9 9 1 1 1 1] [9 9 9 9 1 1 1 1] [7 7 7 7 7 7 7 7])))
+(K0 (select {s: (sum v) from: H by: (% v 3) take: 2}))            -- [1 0]
+(at (select {s: (sum _k0) from: H by: (% v 3) take: 2}) 's)      -- [19 11]
+(K0 (select {s: (sum (* v 2)) from: H by: (% v 3)}))              -- [1 0 2]
+(at (select {s: (sum (* v 2)) from: H by: (% v 3)}) 's)           -- [42 36 26]
+
+;; ── a key that reads other rows (a running function), with no where: ──────
+(K0 (select {s: (sum v) from: T by: (% (sums v) 7) take: 5}))     -- (take (FS (% (sums (at T 'v)) 7)) 5)
+(K0 (select {s: (sum v) from: T by: (deltas k) take: 5}))         -- (FS (deltas (at T (quote k))))
+(K0 (select {s: (sum v) from: S by: (deltas k)}))                 -- (FS (deltas (at S 'k)))
+
+;; ── parted ──────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_by_first_seen_order/") -- 0
+(.db.splayed.set "/tmp/rfl_by_first_seen_order/p/2024.01.01/t/" (select {from: T where: (< (til n) 50000)}) "/tmp/rfl_by_first_seen_order/p/.sym")
+(.db.splayed.set "/tmp/rfl_by_first_seen_order/p/2024.01.02/t/" (select {from: T where: (>= (til n) 50000)}) "/tmp/rfl_by_first_seen_order/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_by_first_seen_order/p/" 't))
+(K0 (select {s: (sum v) from: P by: (% v 1000) take: 5}))                 -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) from: P by: {kk: (% v 1000)} take: 5}))           -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) c: (count v) from: P by: (% v 1000) take: 5}))    -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) e: (first (+ d 1)) from: P by: (% v 1000) take: 5}))  -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) from: P by: (xbar v 1000) take: 5}))              -- (take (FS Kb) 5)
+(K0 (select {s: (sum v) from: P by: {kk: (xbar v 1000)} take: 5}))        -- (take (FS Kb) 5)
+(K0 (select {s: (sum v) from: P by: (xbar d 7) take: 5}))                 -- (take (FS Kd) 5)
+(K0 (select {s: (sum v) from: P by: (+ k j) take: 5}))                    -- (take (FS Kkj) 5)
+(K0 (select {s: (sum v) from: P by: k take: 5}))                          -- (take (FS (at T 'k)) 5)
+(K0 (select {s: (sum v) from: P by: [k j] take: 5}))                      -- (take (at T 'k) 5)
+((fn [x] (K0 (select {s: (sum v) from: P by: x take: 5}))) Kv)            -- (take (FS Kv) 5)
+(K0 (select {s: (sum v) from: P where: (> v 1500000) by: (% v 1000) take: 5}))  -- (take (FS (at Kv (where W))) 5)
+(at (select {s: (sum v) from: P by: (% v 1000) take: 3}) 's)              -- (map (fn [x] (sum (at (at T 'v) (where (== Kv x))))) (take (FS Kv) 3))
+(K0 (select {s: (sum v) from: P by: (% v 1000)}))                         -- (K0 (select {s: (sum v) from: P by: {kk: (% v 1000)}}))
+;; the mapped table goes first, so the unfused pass can write the fixture again
+(set P 0)
+(.sys.exec "rm -rf /tmp/rfl_by_first_seen_order/") -- 0
