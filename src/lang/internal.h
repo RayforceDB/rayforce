@@ -325,12 +325,32 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
     }
 }
 
+/* True when a value of type vt is stored into a vector or column of type ct
+ * without loss: the same type, or a widening.  The widenings: BOOL and U8
+ * into any wider integer or float, I16 into I32 / I64 / F32 / F64, I32 into
+ * I64 / F64, I64 into F64 (an integer literal into a float vector), F32 into
+ * F64.  Both types are positive (vector types).  update and alter set share
+ * this rule (#1458, #1513). */
+static inline bool ray_type_widens(int8_t ct, int8_t vt) {
+    if (vt == ct) return true;
+    switch (vt) {
+    case RAY_BOOL: return ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_U8:   return ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_I16:  return ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_I32:  return ct == RAY_I64 || ct == RAY_F64;
+    case RAY_I64:  return ct == RAY_F64;
+    case RAY_F32:  return ct == RAY_F64;
+    default:       return false;
+    }
+}
+
 /* Extract a value from an atom for storage, handling cross-type casting.
  * Returns the value as int64_t (for integer/temporal types). */
 static inline int64_t elem_as_i64(ray_t* elem) {
     if (elem->type == -RAY_I64 || elem->type == -RAY_TIMESTAMP ||
         elem->type == -RAY_DATE || elem->type == -RAY_TIME ||
         elem->type == -RAY_SYM) return elem->i64;
+    if (elem->type == -RAY_BOOL) return (int64_t)(elem->b8 != 0);
     if (elem->type == -RAY_I32)  return (int64_t)elem->i32;
     if (elem->type == -RAY_I16)  return (int64_t)elem->i16;
     if (elem->type == -RAY_U8)   return (int64_t)elem->u8;
@@ -370,7 +390,7 @@ static inline int store_typed_elem(ray_t* vec, int64_t i, ray_t* elem) {
     }
     switch (vec->type) {
         case RAY_I64:       ((int64_t*)ray_data(vec))[i]  = elem_as_i64(elem); return 0;
-        case RAY_F64:       ((double*)ray_data(vec))[i]    = (elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem); return 0;
+        case RAY_F64:       ((double*)ray_data(vec))[i]    = (elem->type == -RAY_F64 || elem->type == -RAY_F32) ? elem->f64 : (double)elem_as_i64(elem); return 0;
         case RAY_F32:       ((float*)ray_data(vec))[i]     = (elem->type == -RAY_F32) ? (float)elem->f64 : (float)((elem->type == -RAY_F64) ? elem->f64 : (double)elem_as_i64(elem)); return 0;
         case RAY_I32:       ((int32_t*)ray_data(vec))[i]   = (int32_t)elem_as_i64(elem); return 0;
         case RAY_I16:       ((int16_t*)ray_data(vec))[i]   = (int16_t)elem_as_i64(elem); return 0;

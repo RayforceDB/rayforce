@@ -29809,22 +29809,11 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
 }
 
 /* An updated column keeps its type on every route (#1458): a value of the
- * column's type, or of a type that widens into it without loss, is stored as
- * the column's type; anything else is a type error.  The widenings: BOOL and
- * U8 into any wider integer or float, I16 into I32 / I64 / F32 / F64, I32 into
- * I64 / F64, I64 into F64 (an integer literal into a float column), F32 into
- * F64.  A LIST column keeps its type: a typed value is boxed into it. */
+ * column's type, or of a type that widens into it without loss (the list is
+ * at ray_type_widens), is stored as the column's type; anything else is a
+ * type error.  A LIST column keeps its type: a typed value is boxed into it. */
 static bool update_widens(int8_t ct, int8_t vt) {
-    if (vt == ct || ct == RAY_LIST) return true;
-    switch (vt) {
-    case RAY_BOOL: return ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_U8:   return ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_I16:  return ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_I32:  return ct == RAY_I64 || ct == RAY_F64;
-    case RAY_I64:  return ct == RAY_F64;
-    case RAY_F32:  return ct == RAY_F64;
-    default:       return false;
-    }
+    return ct == RAY_LIST || ray_type_widens(ct, vt);
 }
 
 /* `v` (owned: an atom or a vector) as a value of the column type ct, or the
