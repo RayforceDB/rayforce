@@ -20452,6 +20452,13 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return prune_if_projection(e, tbl, &budget, 0) != 0;
     }
     int sub = mode ? 2 : 0;
+    /* (xbar x b) with a constant atom bucket: a row's bucket reads only
+     * that row (a by: of it groups the rows the where keeps, #1499) */
+    if (n == 3 && fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+        (ray_binary_fn)(uintptr_t)fn->i64 == ray_xbar_fn && prune_head_named(el[0], "xbar"))
+        return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
+               ((el[2]->type < 0 && el[2]->type != -RAY_SYM) ||
+                (el[2]->type == -RAY_SYM && prune_bound_const(el[2], tbl, false)));
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
