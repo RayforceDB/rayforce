@@ -13700,7 +13700,10 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
         _Atomic TYPE* first_slots = c->first; \
         bool spanned = false; \
         uint8_t inexact = 0; \
+        bool speculative = c->hash_mode == RAY_KEY_EXACT_INT; \
         for (int64_t r = start; r < end; r++) { \
+            if (speculative && ((r - start) & 1023) == 0 && \
+                (atomic_load_explicit(&c->inexact, memory_order_relaxed) & RAY_KEY_FLOAT)) break; \
             uint64_t slot = 0; \
             if (c->dense) { \
                 for (uint32_t k = 0; k < c->nkeys; k++) \
@@ -13711,6 +13714,10 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
                 for (uint32_t k = 0; k < c->nkeys; k++) { \
                     hash ^= agg_key_hash_at(c->keys[k], c->data[k], r, c->hash_mode, &c->symbols, &spanned, &inexact); \
                     hash *= UINT64_C(1099511628211); \
+                } \
+                if (speculative && (inexact & RAY_KEY_FLOAT)) { \
+                    atomic_fetch_or_explicit(&c->inexact, RAY_KEY_FLOAT, memory_order_relaxed); \
+                    break; \
                 } \
                 slot = hash & (c->capacity - 1); \
             } \
@@ -13820,16 +13827,17 @@ retry_insert:
     ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
     uint8_t inexact = atomic_load(&c.inexact);
+    if (c.hash_mode == RAY_KEY_EXACT_INT && (inexact & RAY_KEY_FLOAT)) {
+        /* The joined speculative pass may have skipped rows. Discard its
+         * slots and flags, and let the complete general pass decide fallback. */
+        c.hash_mode = 0;
+        atomic_store_explicit(&c.inexact, 0, memory_order_relaxed);
+        atomic_store_explicit(&c.spanned, false, memory_order_relaxed);
+        goto retry_insert;
+    }
     if (atomic_load(&c.spanned) || inexact == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) {
         rc = AGG_KEYS_SERIAL;
         goto done;
-    }
-    if (c.hash_mode == RAY_KEY_EXACT_INT && (inexact & RAY_KEY_FLOAT)) {
-        /* Reinitialize the slots; insert overwrites every row's slot,
-         * and group counts have not been computed yet. */
-        c.hash_mode = 0;
-        atomic_store_explicit(&c.inexact, 0, memory_order_relaxed);
-        goto retry_insert;
     }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
