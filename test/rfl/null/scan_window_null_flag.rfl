@@ -1,0 +1,41 @@
+;; #1167: a running or moving-window result that is null is null to every
+;; reader.  An F64 overflow maps to 0Nf and an I64 window total that wraps
+;; onto INT64_MIN is the null sentinel; the vector's nil? (which trusts the
+;; vector-wide null flag), the per-cell nil? and the null-skipping
+;; aggregates all have to agree.
+;; agree: the vector's null count equals the per-cell one.
+(set agree (fn [v] (== (sum (nil? v)) (sum (map (fn [k] (nil? (at v k))) (til (count v)))))))
+(set F [1e308 1e308 1.0 2.0])
+(nil? (sums [1e308 1e308])) -- [false true]
+(nil? (at (sums [1e308 1e308]) 1)) -- true
+(avg (sums [1e308 1e308])) -- 1e308
+(sum (nil? (sums F))) -- 3
+(sum (nil? (prds [1e200 1e200 1.0]))) -- 2
+(agree (avgs F)) -- true
+(agree (msum 2 F)) -- true
+(agree (mavg 2 F)) -- true
+(agree (msum 3 [-1e308 -1e308 1.0 2.0])) -- true
+(nil? (mvar 2 [1e200 -1e200])) -- [false true]
+(nil? (mdev 2 [1e200 -1e200])) -- [false true]
+(agree (mvar 3 [1e200 -1e200 1.0 2.0])) -- true
+;; The null cell is skipped by the aggregates.
+(avg (msum 2 [1e308 1e308])) -- 1e308
+(max (mvar 2 [1e200 -1e200])) -- 0.0
+;; I64 window totals wrap; only a total of exactly INT64_MIN is null.
+(set G [4611686018427387904 4611686018427387904 1 2])
+(nil? (msum 2 G)) -- [false true false false]
+(sum (nil? (msum 3 [9223372036854775807 1 2 3]))) -- 1
+(msum 2 [9223372036854775807 2]) -- [9223372036854775807 -9223372036854775807]
+;; The same through a query, on enough rows for the parallel paths.
+(set T (table [x i] (list (take F 10000) (take G 10000))))
+(set rs (at (select {r: (sums x) from: T}) 'r))
+(agree rs) -- true
+(sum (nil? rs)) -- 9999
+(set rm (at (update {r: (msum 2 i) from: T}) 'r))
+(agree rm) -- true
+(sum (nil? rm)) -- 2500
+(agree (at (select {r: (mvar 2 x) from: T}) 'r)) -- true
+(agree (at (update {r: (prds x) from: T}) 'r)) -- true
+;; No null produced, no flag: a clean input stays clean.
+(sum (nil? (msum 2 [1.0 2.0 3.0]))) -- 0
+(sum (nil? (sums [1 2 3]))) -- 0

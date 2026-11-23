@@ -129,6 +129,7 @@ extern const test_entry_t dump_entries[];
 extern const test_entry_t embedding_entries[];
 extern const test_entry_t exec_entries[];
 extern const test_entry_t expr_null_entries[];
+extern const test_entry_t null_flag_entries[];
 extern const test_entry_t f64_nullmodel_entries[];
 extern const test_entry_t format_entries[];
 extern const test_entry_t fvec_entries[];
@@ -214,6 +215,7 @@ static const test_entry_t* const compiled_groups[] = {
     parquet_entries, csv_entries,      datalog_entries,  dict_entries,     domain_entries,
     dump_entries,
     embedding_entries, exec_entries,   expr_null_entries,
+    null_flag_entries,
     f64_nullmodel_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
     agg_registry_entries,
@@ -942,6 +944,43 @@ static int name_matches_filter(const char* name, const char* filter) {
 }
 
 /* ---- Shell-free filesystem helpers (declared in test.h) ---- */
+
+bool ray_test_nulls_agree(ray_t* v, char* why, size_t cap) {
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v)) return true;
+    switch (v->type) {
+        case RAY_F64: case RAY_F32:
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+        case RAY_I32: case RAY_DATE: case RAY_TIME:
+        case RAY_I16: case RAY_GUID:
+            break;
+        default:
+            return true;
+    }
+    /* A slice has no flag of its own: readers consult the parent's.
+     * ray_data resolves the slice's window into the parent's payload. */
+    const ray_t* base = (v->attrs & RAY_ATTR_SLICE) ? v->slice_parent : v;
+    bool flag = (base->attrs & RAY_ATTR_HAS_NULLS) != 0;
+    const void* data = ray_data(v);
+    int64_t first = -1, count = 0;
+    for (int64_t i = 0; i < v->len; i++) {
+        if (ray_raw_is_null(v->type, base->attrs, data, i)) {
+            if (first < 0) first = i;
+            count++;
+        }
+    }
+    if (!flag && count > 0) {
+        snprintf(why, cap, "%s vector of %lld has %lld null sentinel(s), first at %lld, "
+                 "but HAS_NULLS is clear", ray_type_name(v->type),
+                 (long long)v->len, (long long)count, (long long)first);
+        return false;
+    }
+    if (flag && count == 0 && !(v->attrs & RAY_ATTR_SLICE)) {
+        snprintf(why, cap, "%s vector of %lld has HAS_NULLS set but no null sentinel",
+                 ray_type_name(v->type), (long long)v->len);
+        return false;
+    }
+    return true;
+}
 
 int ray_test_rm_rf(const char* path) {
     struct stat st;
