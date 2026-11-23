@@ -1,0 +1,28 @@
+;; update and delete evaluate `where:` through a graph first and, when that
+;; fails, through the interpreter.  The graph's error was dropped without being
+;; freed: a block per failing call (64 bytes: 2000 calls left 128 KB).  A name the
+;; table does not have is the usual way to get there.
+
+(set T (table [a b] (list [1 2 3] [1.0 2.0 3.0])))
+(try (update {a: 0 from: T where: (> zz 5)}) 0)
+(try (delete {from: T where: zz}) 0)
+
+(set m0 (at (.sys.mem) 'bytes-allocated))
+(times 2000 (try (update {a: 0 from: T where: (> zz 5)}) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) m0) 20000) -- true
+
+(set m1 (at (.sys.mem) 'bytes-allocated))
+(times 2000 (try (update {a: 0 from: T where: zz}) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) m1) 20000) -- true
+
+(set m2 (at (.sys.mem) 'bytes-allocated))
+(times 2000 (try (delete {from: T where: (> zz 5)}) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) m2) 20000) -- true
+
+(set m3 (at (.sys.mem) 'bytes-allocated))
+(times 2000 (try (delete {from: T where: zz}) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) m3) 20000) -- true
+
+;; the error is still the interpreter's
+(at (try (update {a: 0 from: T where: (> zz 5)}) (fn [e] e)) 'msg) -- "'zz' undefined"
+(at (try (delete {from: T where: zz}) (fn [e] e)) 'msg) -- "'zz' undefined"

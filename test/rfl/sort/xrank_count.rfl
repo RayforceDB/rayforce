@@ -1,0 +1,9 @@
+;; xrank read the bit pattern of a float count (3 * 4609434218613702656 is a signed
+;; overflow) and took a vector's first bytes as a count.  The count is an integer
+;; atom, and one so large that i * n would overflow is refused.
+
+(at (try (xrank 1.5 [3 1 2]) (fn [e] e)) 'code) -- 'type
+(at (try (xrank [4 4] [3 1 2]) (fn [e] e)) 'code) -- 'type
+(at (try (xrank 4611686018427387904 [3 1 2]) (fn [e] e)) 'code) -- 'domain
+(xrank 3 [30 10 20]) -- [2 0 1]
+(xrank 2 [30 10 20 40]) -- [1 0 0 1]

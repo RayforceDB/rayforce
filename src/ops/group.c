@@ -7663,6 +7663,12 @@ static inline void radix_buf_push(radix_buf_t* buf, uint16_t entry_stride,
                                    int64_t row, uint16_t key_region,
                                    uint32_t cap0) {
     if (__builtin_expect(buf->count >= buf->cap, 0)) {
+        /* A buffer that could not grow stays full, so every later row of this
+         * partition came back here and asked again: with a heap that spills to
+         * disk, each failed attempt reserved and gave back a pool file, and the
+         * query ran for as long as it had rows.  The flag is read after the
+         * phase; the rows are dropped until then. */
+        if (buf->oom) return;
         uint32_t old_cap = buf->cap;
         if (old_cap > UINT32_MAX / 2) { buf->oom = true; return; }
         uint32_t new_cap = old_cap ? old_cap * 2 : (cap0 ? cap0 : 1);

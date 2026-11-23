@@ -25641,7 +25641,21 @@ by_dict_done:
                 }
                 for (int64_t gi = 0; gi < n_groups; gi++) {
                     ray_t* il = gi_items[gi * 2 + 1];
+                    if (il && il->type == RAY_I64 && il->len > 0) {
+                        fi[gi] = ((const int64_t*)ray_data(il))[0];   /* a plain index: nothing to allocate */
+                        continue;
+                    }
+                    /* collection_elem allocates the atom and answers an error when it
+                     * cannot; as_i64 of that read garbage, and the gather below indexed
+                     * the columns with it (a segfault when memory ran out mid-query). */
                     int a = 0; ray_t* i0 = collection_elem(il, 0, &a);
+                    if (!i0 || RAY_IS_ERR(i0)) {
+                        if (i0) ray_error_free(i0);   /* errors are not refcounted: release would leave it */
+                        if (fi_hdr) ray_free(fi_hdr);
+                        ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                        return ray_error("oom", NULL);
+                    }
                     fi[gi] = as_i64(i0);
                     if (a) ray_release(i0);
                 }
@@ -25693,6 +25707,11 @@ by_dict_done:
                             dst->len = n_groups;
                             for (int64_t gi = 0; gi < n_groups; gi++) {
                                 int a = 0; ray_t* v = collection_elem(sc, fi[gi], &a);
+                                if (!v || RAY_IS_ERR(v)) {          /* no memory for the cell's atom */
+                                    if (v) ray_error_free(v);
+                                    ray_release(dst); dst = NULL;
+                                    break;
+                                }
                                 store_typed_elem(dst, gi, v);
                                 if (a) ray_release(v);
                             }
@@ -29782,6 +29801,9 @@ static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr) {
         ray_graph_free(g);
     }
     if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
+        /* The graph's error is replaced by whatever the interpreter says;
+         * left alone it was a block per failing update or delete. */
+        if (mask_vec) ray_error_free(mask_vec);
         ray_env_push_query_scope();
         ray_t* bind_err = NULL;
         ray_t* prev_table = bind_referenced_query(tbl, &where_expr, 1, &bind_err);
@@ -30932,6 +30954,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         }
         /* Fallback: eval-level predicate evaluation */
         if (!rejected && (!mask_vec || RAY_IS_ERR(mask_vec))) {
+            if (mask_vec) ray_error_free(mask_vec);   /* the interpreter's answer replaces it */
             /* Bind column names to column vectors in env, then eval */
             ray_env_push_query_scope();
             ray_t* bind_err = NULL;
