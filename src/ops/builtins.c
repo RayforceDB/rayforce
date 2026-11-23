@@ -1323,7 +1323,9 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * cast_vec_copy_nulls only carries source nulls, so scan the output and
  * flip HAS_NULLS for any reserved sentinel.
  *
- * Typed fast paths check narrow integer and temporal lanes in chunks. */
+ * The typed fast path checks I16, I32, DATE and TIME in its copy or
+ * conversion chunks and skips this final scan for those targets. The
+ * per-atom slow path still uses this scan for all four. */
 static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     const void* out = ray_data(vec);
     switch (out_type) {

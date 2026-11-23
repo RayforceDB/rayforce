@@ -503,6 +503,8 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
 
+An explicit `as` to I16, I32, DATE or TIME marks a result equal to the target’s reserved minimum as null. This includes an integer that wraps onto that minimum, for example `(as 'I16 [32768])` returns `[0Nh]`.
+
 `guid` and `rand` draw from **different** sources on purpose:
 
 - `guid` is seeded from the OS at first use, per thread, so values are unique

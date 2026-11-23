@@ -981,7 +981,6 @@
 (at wm_xr 'k0) -- ["a" "b"]
 (at wm_xr 'sm) -- [1224965000 1225000000]
 
-
 ;; Raw-sentinel 33/64/65-aggregate checks live in lang/query/group_wide_null_masks.
 
 ;; ── keyless, EMPTY table (0 rows), 9 total aggs — n_keys==0 so the DA

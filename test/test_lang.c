@@ -13822,8 +13822,16 @@ static test_result_t test_callprof_repl_calls(void) {
     PASS();
 }
 
-/* 33/64/65 aggregates: preserve the null-mask alias checks from width_matrix.
- * A raw unflagged I32 minimum is intentional; an explicit cast now flags it. */
+/* Preserve the width_matrix checks for per-aggregate mask boundaries.
+ * At 33 aggregates, a33's real I32 null sets bit 32. In the old 32-bit
+ * mask that could alias bit 0 and make a01 drop its raw unflagged I32
+ * minimum: group 1 would sum to 100, not -2147483548. Group 2 is a
+ * sentinel-free control. An explicit cast can no longer supply this raw cell.
+ * At 64 aggregates, a64 exercises bit 63, the widened mask's upper bound.
+ * At 65, dense/sparse admission must decline to the hash path, whose
+ * per-aggregate flags are bytes. A65 uses non-null F64 to test the type
+ * flag at index 64 (which must not alias a01), independently of the
+ * legacy hash path's handling of narrow-integer nulls in SUM. */
 static test_result_t test_group_wide_null_masks(void) {
     ray_t* va = ray_vec_new(RAY_I32, 4);
     TEST_ASSERT_NOT_NULL(va);

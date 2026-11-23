@@ -638,6 +638,8 @@ Type checking, casting, null testing, and object inspection.
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |
 
+An explicit `as` to I16, I32, DATE or TIME marks a result equal to the target’s reserved minimum as null. This includes an integer that wraps onto that minimum, for example `(as 'I16 [32768])` returns `[0Nh]`.
+
 ```lisp
 ; Type checking and casting
 (type [1 2 3])              ; I64

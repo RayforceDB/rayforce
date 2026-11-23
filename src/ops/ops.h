@@ -427,8 +427,8 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 #define OP_FLAG_DEAD         0x02
 #define OP_FLAG_INVALID_SCAN 0x04  /* query compiler emitted an unknown column */
 #define OP_FLAG_TEMPORAL_INT 0x08  /* temporal +/- integer lowered by the query compiler (#1302) */
-#define OP_FLAG_NARROW_AS    0x20  /* explicit as to I16/I32 can produce a null sentinel */
 #define OP_FLAG_XBAR         0x10  /* OP_MOD of an xbar: a zero or null divisor raises domain (#1355) */
+#define OP_FLAG_NARROW_AS    0x20  /* explicit as to I16/I32 can produce a null sentinel */
 
 /* ray_xbar_fn's error for a zero or null bucket */
 #define RAY_XBAR_BUCKET_ERR "xbar: bucket size must be non-zero and non-null"
