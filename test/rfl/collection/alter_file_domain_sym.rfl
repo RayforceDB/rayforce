@@ -1,3 +1,4 @@
+;; @requires: posix
 ;; alter set on a SYM vector that still resolves over a symbol file (#1494).
 ;; A column read from a splayed table with its symbol file, and a vector
 ;; gathered from it, keep the file's symbol domain.  A symbol the file holds
