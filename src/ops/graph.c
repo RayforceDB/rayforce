@@ -754,7 +754,8 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
      * promote() makes of DATE + I64, and `(if c ts 0Nd)` a TIMESTAMP one,
      * not the I64 the two widths fold to.  Same rule as the text null
      * below: the literal is then swapped for the typed null.  A non-null
-     * value beside a temporal still promotes, as before. */
+     * number beside a temporal has no common type (promote_if_type) and
+     * is refused below. */
     if (type_is_temporal(tt) && et != tt && et != RAY_STR && et != RAY_SYM &&
         et != RAY_GUID && if_const_null_atom(g, else_id))
         out_type = tt;

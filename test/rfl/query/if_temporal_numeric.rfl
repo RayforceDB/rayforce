@@ -317,3 +317,11 @@
 (if true 2024.01.01 5) -- 2024.01.01
 (if false 2024.01.01 5) -- 5
 
+
+;; ── per group, an `if` hoisted out of a call whose values come back as a
+;; LIST: the cells are judged against the query's own expression and table,
+;; not the hoisted copies, which are gone by then.  The `if` here is not the
+;; expression itself, so dev's LIST stays ──
+(set H (table ['g 'c 'i 'd] (list ['a 'a 'a 'b 'b 'b] [9 0 9 0 9 9] [1 2 3 4 5 6] (+ 2024.01.01 (til 6)))))
+(at (select {from: H by: g q: (at (list (max d) (sum i)) (at (if (> c 4) 0 1) 0))}) 'q) -- (list 2024.01.03 15)
+(at (select {from: H by: g q: (at (if (> c 4) d (+ d 1)) 0)}) 'q) -- [2024.01.01 2024.01.05]

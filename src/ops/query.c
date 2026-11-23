@@ -11323,6 +11323,10 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          int64_t n_groups) {
     ray_t* split = nonagg_rowwise_if_split(expr, tbl, feeder, fstate, n_groups);
     if (split) return split;
+    /* the caller's expression and table: the hoist below swaps both for
+     * objects this function owns and drops before it returns */
+    ray_t* expr0 = expr;
+    ray_t* tbl0 = tbl;
     /* an `if` beside or under an aggregate: its column over the rows */
     if_hoist_t hs = { .tbl = tbl };
     ray_t* hoisted = NULL;
@@ -11365,7 +11369,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     if (hs.out) ray_release(hs.out);
     for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
     g_query_dependencies = prev;
-    return rw_if_cells_check(expr, tbl, result);
+    return rw_if_cells_check(expr0, tbl0, result);
 }
 
 /* idx_feeder for the eval-fallback's LIST `groups` layout. */
