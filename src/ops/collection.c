@@ -2106,17 +2106,24 @@ uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view
 }
 
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
-int ray_key_spans(ray_t* x) {
+enum { KEY_SPAN_WALK_FLOAT = 8 };
+static int key_span_flags(ray_t* x, bool track_float) {
     if (!x) return 0;
-    if (x->type < 0) return x->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
+    if (x->type < 0) {
+        if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
+        return track_float && (x->type == -RAY_F64 || x->type == -RAY_F32) ? KEY_SPAN_WALK_FLOAT : 0;
+    }
     if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
     int spans = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len && spans != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
+        for (int64_t i = 0; i < x->len && (spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
             ray_t* c = cells[i];
-            if (c && c->type < 0) spans |= c->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
-            else spans |= ray_key_spans(c);
+            if (c && c->type < 0) {
+                int type = c->type;
+                if (type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
+                else if (track_float && (type == -RAY_F64 || type == -RAY_F32)) spans |= KEY_SPAN_WALK_FLOAT;
+            } else spans |= key_span_flags(c, track_float);
         }
     } else if (x->type == RAY_TABLE) {
         /* atom_eq compares a table's columns (a dict's keys and values)
@@ -2127,15 +2134,17 @@ int ray_key_spans(ray_t* x) {
         for (int64_t c = 0; c < ray_table_ncols(x) && !spans; c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            spans |= ray_key_spans(col);
+            spans |= key_span_flags(col, false);
         }
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     } else if (x->type == RAY_DICT) {
-        spans = ray_key_spans(ray_dict_keys(x)) | ray_key_spans(ray_dict_vals(x));
+        spans = key_span_flags(ray_dict_keys(x), false) | key_span_flags(ray_dict_vals(x), false);
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     }
     return spans;
 }
+
+int ray_key_spans(ray_t* x) { return key_span_flags(x, false); }
 
 /* ── LIST cell sets ──────────────────────────────────────────────────
  * distinct, in, except, sect and union over LIST operands decide with
@@ -2501,7 +2510,11 @@ ray_t* ray_distinct_fn(ray_t* x) {
     if (len * len >= LIST_SET_MIN_PAIRS) {
         /* A cell is new when no cell kept so far equals it. */
         list_set_t s;
-        if (!list_set_init(&s, out, len, ray_key_spans(x))) {
+        /* Detect floats only where key_hash propagates exact mode. Still
+         * detect TIMESPAN inside tables and dicts for their span hash. */
+        int flags = key_span_flags(x, true);
+        int mode = flags == 0 ? RAY_KEY_EXACT_INT : flags & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
+        if (!list_set_init(&s, out, len, mode)) {
             result->len = 0;
             ray_release(result);
             if (_bx) ray_release(_bx);
