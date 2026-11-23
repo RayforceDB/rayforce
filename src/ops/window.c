@@ -676,6 +676,98 @@ int64_t ray_window_perpart_runs(void) {
                                  memory_order_relaxed);
 }
 
+/* An I64 vector of the row numbers 0..n-1, null where `v` is: first / last
+ * over it give each output row's source row (#1443). */
+static ray_t* win_row_numbers(ray_t* v, int64_t n) {
+    ray_t* rows = ray_vec_new(RAY_I64, n);
+    if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+    rows->len = n;
+    int64_t* d = (int64_t*)ray_data(rows);
+    bool nulls = ray_vec_may_have_nulls(v);
+    bool any = false;
+    for (int64_t i = 0; i < n; i++) {
+        if (nulls && ray_vec_is_null(v, i)) { d[i] = NULL_I64; any = true; }
+        else d[i] = i;
+    }
+    if (any) rows->attrs |= RAY_ATTR_HAS_NULLS;
+    return rows;
+}
+
+/* The cells of `v` at the rows `rows` names, in v's type; a null row is
+ * that type's null. */
+static ray_t* win_gather_rows(ray_t* v, ray_t* rows) {
+    int64_t n = rows->len;
+    ray_t* ix_hdr = NULL;
+    int64_t* ix = (int64_t*)scratch_alloc(&ix_hdr, (size_t)(n ? n : 1) * sizeof(int64_t));
+    if (!ix) return ray_error("oom", NULL);
+    const int64_t* r = (const int64_t*)ray_data(rows);
+    bool any = false;
+    for (int64_t i = 0; i < n; i++) {
+        bool nl = r[i] == NULL_I64;
+        any |= nl;
+        ix[i] = nl ? 0 : r[i];
+    }
+    ray_t* out = gather_by_idx(v, ix, n);
+    if (out && !RAY_IS_ERR(out) && any)
+        for (int64_t i = 0; i < n; i++)
+            if (r[i] == NULL_I64) ray_vec_set_null(out, i, true);
+    scratch_free(ix_hdr);
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* first / last of a fixed-width type or SYM: the kernel's I64 (F64 for F32)
+ * result back in the value's type, nulls kept.  A SYM cell is a runtime id
+ * (win_read_i64), so the vector is runtime-domain. */
+static ray_t* win_narrow(ray_t* r, int8_t t) {
+    int64_t n = r->len;
+    ray_t* out = t == RAY_SYM ? ray_sym_vec_new(ray_sym_dict_width((int64_t)ray_sym_count()), n)
+                              : ray_vec_new(t, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    void* d = ray_data(out);
+    /* the kernels leave NULL_I64 (NaN for F64) in a null slot: each loop maps
+     * it to the type's own null, so HAS_NULLS is all that is left to set */
+    if (r->type == RAY_F64) {
+        const double* s = (const double*)ray_data(r);
+        float* o = (float*)d;
+        for (int64_t i = 0; i < n; i++) o[i] = (float)s[i];
+    } else {
+        const int64_t* s = (const int64_t*)ray_data(r);
+#define WIN_NARROW(T, NUL) do { T* o = (T*)d; \
+            for (int64_t i = 0; i < n; i++) o[i] = s[i] == NULL_I64 ? (NUL) : (T)s[i]; } while (0)
+        switch (t) {
+        case RAY_I32: case RAY_DATE: case RAY_TIME: WIN_NARROW(int32_t, NULL_I32); break;
+        case RAY_I16: WIN_NARROW(int16_t, NULL_I16); break;
+        case RAY_BOOL: case RAY_U8: WIN_NARROW(uint8_t, 0); break;
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: memcpy(d, s, (size_t)n * sizeof(int64_t)); break;
+        case RAY_SYM:
+            switch (out->attrs & RAY_SYM_W_MASK) {
+            case RAY_SYM_W8:  WIN_NARROW(uint8_t, 0); break;
+            case RAY_SYM_W16: WIN_NARROW(uint16_t, 0); break;
+            case RAY_SYM_W32: WIN_NARROW(uint32_t, 0); break;
+            default:          WIN_NARROW(uint64_t, 0); break;
+            }
+            break;
+        default:
+            for (int64_t i = 0; i < n; i++) {
+                if (s[i] == NULL_I64) ray_vec_set_null(out, i, true);
+                else write_col_i64(d, i, s[i], t, out->attrs);
+            }
+            break;
+        }
+#undef WIN_NARROW
+    }
+    if ((r->attrs & RAY_ATTR_HAS_NULLS) && t != RAY_BOOL && t != RAY_U8) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
+static void win_drop_by_row(ray_t** by_row, uint8_t* owned, uint32_t n) {
+    if (!by_row) return;
+    for (uint32_t f = 0; f < n; f++)
+        if (by_row[f] && owned[f] && !RAY_IS_ERR(by_row[f])) ray_release(by_row[f]);
+    free(by_row);
+}
+
 ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
@@ -896,6 +988,48 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
     }
 
+    /* first / last keep the value's type (#1443).  The kernels below write
+     * I64 or F64.  A fixed-width type (and SYM, read as runtime ids) is
+     * narrowed back from that result (win_narrow).  STR and GUID, which the
+     * kernels cannot carry, run over the rows' numbers, null where the value
+     * is, and the cells are gathered from the value column once every
+     * partition is done (win_gather_rows).  by_row[f] keeps that column and
+     * whether this call owns it. */
+    ray_t** by_row = (ray_t**)calloc(n_funcs ? n_funcs : 1, sizeof(ray_t*) + 1);
+    if (!by_row) {
+        for (uint32_t j = 0; j < n_funcs; j++)
+            if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
+                ray_release(func_vecs[j]);
+        for (uint32_t j = 0; j < n_sort; j++)
+            if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
+                ray_release(sort_vecs[j]);
+        scratch_free(frame_hdr);
+        return ray_error("oom", NULL);
+    }
+    uint8_t* by_row_owned = (uint8_t*)(by_row + (n_funcs ? n_funcs : 1));
+    for (uint32_t f = 0; f < n_funcs; f++) {
+        uint8_t kind = ext->window.func_kinds[f];
+        ray_t* fv = func_vecs[f];
+        if ((kind != RAY_WIN_FIRST_VALUE && kind != RAY_WIN_LAST_VALUE) || !fv ||
+            !ray_is_vec(fv) || (fv->type != RAY_STR && fv->type != RAY_GUID)) continue;
+        ray_t* rows = win_row_numbers(fv, nrows);
+        if (!rows || RAY_IS_ERR(rows)) {
+            win_drop_by_row(by_row, by_row_owned, n_funcs);
+            for (uint32_t j = 0; j < n_funcs; j++)
+                if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
+                    ray_release(func_vecs[j]);
+            for (uint32_t j = 0; j < n_sort; j++)
+                if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
+                    ray_release(sort_vecs[j]);
+            scratch_free(frame_hdr);
+            return rows ? rows : ray_error("oom", NULL);
+        }
+        by_row[f] = fv;
+        by_row_owned[f] = func_owned[f];
+        func_vecs[f] = rows;
+        func_owned[f] = 1;
+    }
+
     /* Sequential runtime-id LUT warm-up: win_read_i64/f64 re-express
      * FILE-domain SYM cells via sym_cell_runtime_id inside the win_par_fn
      * workers — the FIRST LUT request interns the domain's vocabulary,
@@ -910,6 +1044,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (!ray_sym_domain_runtime_lut(fdom)) {
             ray_t* err = ray_error("oom",
                 "window: sym domain runtime-id LUT build failed");
+            win_drop_by_row(by_row, by_row_owned, n_funcs);
             for (uint32_t j = 0; j < n_funcs; j++)
                 if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
                     ray_release(func_vecs[j]);
@@ -1364,6 +1499,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             for (uint32_t f = 0; f < n_funcs; f++)
                 if (func_owned[f] && func_vecs[f] && !RAY_IS_ERR(func_vecs[f]))
                     ray_release(func_vecs[f]);
+            win_drop_by_row(by_row, by_row_owned, n_funcs);
             scratch_free(frame_hdr);
             return ray_error("cancel", NULL);
         }
@@ -1443,6 +1579,26 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             win_finalize_nulls(result_vecs[f]);
     }
 
+    for (uint32_t f = 0; f < n_funcs; f++) {
+        uint8_t kind = ext->window.func_kinds[f];
+        ray_t* fv = by_row[f] ? by_row[f] : func_vecs[f];
+        if ((kind != RAY_WIN_FIRST_VALUE && kind != RAY_WIN_LAST_VALUE) || !fv ||
+            fv->type == RAY_I64 || fv->type == RAY_F64) continue;
+        ray_t* cells = by_row[f] ? win_gather_rows(by_row[f], result_vecs[f])
+                                 : win_narrow(result_vecs[f], fv->type);
+        if (!cells || RAY_IS_ERR(cells)) {
+            for (uint32_t j = 0; j < n_funcs; j++) {
+                ray_release(result_vecs[j]);
+                result_vecs[j] = NULL;
+            }
+            scratch_free(poff_hdr);
+            scratch_free(indices_hdr);
+            goto oom;
+        }
+        ray_release(result_vecs[f]);
+        result_vecs[f] = cells;
+    }
+
     /* --- Pass 4: Build result table --- */
     ray_t* result = ray_table_new(ncols + n_funcs);
     if (!result || RAY_IS_ERR(result)) {
@@ -1491,6 +1647,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     for (uint32_t f = 0; f < n_funcs; f++)
         if (func_owned[f] && func_vecs[f] && !RAY_IS_ERR(func_vecs[f]))
             ray_release(func_vecs[f]);
+    win_drop_by_row(by_row, by_row_owned, n_funcs);
 
     /* frame_hdr backs sort_vecs/sort_owned/func_vecs/func_owned/
      * result_vecs/is_f64/win_enum_rank_hdrs — free it LAST, after every
@@ -1514,6 +1671,7 @@ oom:
         if (result_vecs[f] && !RAY_IS_ERR(result_vecs[f]))
             ray_release(result_vecs[f]);
     }
+    win_drop_by_row(by_row, by_row_owned, n_funcs);
     /* Same free-order rule as the success path above. */
     scratch_free(frame_hdr);
     return ray_error("oom", NULL);
