@@ -233,8 +233,10 @@ void     ray_heap_init(void);
 void     ray_heap_destroy(void);
 
 /* Detach the calling thread from its heap WITHOUT tearing the heap down:
- * the heap stays registered with its pools intact and is handed to the next
- * thread that calls ray_heap_init().
+ * the heap stays registered and is handed to the next thread that calls
+ * ray_heap_init().  It keeps the pools that hold a live block; its empty
+ * pools are unmapped and the pages of its other free blocks given back,
+ * since no maintenance point visits an idle heap.
  *
  * This is what a thread that exits must use.  A cross-thread free resolves
  * the owning heap through ray_heap_registry and pushes the block onto it
