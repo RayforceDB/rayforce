@@ -2839,11 +2839,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         bool col_has_nulls = false;
 
         for (int64_t j = 0; j < nrows; j++) {
-            /* F64 promotion of an I64 null produces a finite double, not
-             * a null sentinel in the destination column. */
-            if (RAY_ATOM_IS_NULL(row_elems[j]) &&
-                !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
-                col_has_nulls = true;
+            /* Promotion preserves logical nulls, not the source sentinel's
+             * numeric value. Publish the column flag after filling it. */
+            bool cell_is_null = RAY_ATOM_IS_NULL(row_elems[j]);
+            if (cell_is_null) col_has_nulls = true;
             if (col_type == RAY_STR) {
                 if (row_elems[j]->type != -RAY_STR) {
                     int8_t et = row_elems[j]->type;
@@ -2878,7 +2877,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 void* val_ptr;
                 double promoted;
                 if (col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) {
-                    promoted = (double)row_elems[j]->i64;
+                    promoted = cell_is_null ? NULL_F64 : (double)row_elems[j]->i64;
                     val_ptr = &promoted;
                 } else if (col_type == RAY_I64) val_ptr = &row_elems[j]->i64;
                 else if (col_type == RAY_F64) val_ptr = &row_elems[j]->f64;
