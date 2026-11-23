@@ -904,31 +904,43 @@ static void print_status(test_status_t s, double ms, const char* msg) {
     }
 }
 
+#include "env_restore.h"   /* run_one: env_snapshot / env_restore */
+
+/* The test body under the setjmp escape: any scalar-returning helper that
+ * hits an unrecoverable error calls ray_test_fatal(), which longjmp's back
+ * here.  The runner reports the test as FAIL with the message helpers wrote
+ * into ray_test_fail_buf, then continues to the next test.
+ *
+ * Its own function so that nothing run_one keeps across the test (the
+ * environment snapshot, the start time) lives in the frame setjmp returns
+ * into: a local of that frame is indeterminate after the longjmp unless it
+ * is volatile (C11 7.13.2.1), and gcc -Wclobbered warns on any it cannot
+ * prove safe.  A function that calls setjmp is never inlined. */
+static test_result_t run_guarded(const test_entry_t* e) {
+    if (setjmp(ray_test_jmp) == 0) {
+        ray_test_jmp_active = 1;
+        test_result_t r = e->func();
+        ray_test_jmp_active = 0;
+        return r;
+    }
+    ray_test_jmp_active = 0;
+    return (test_result_t){ TEST_FAIL, ray_test_fail_buf };
+}
+
 static int run_one(const test_entry_t* e, int* pass, int* fail, int* skip) {
     printf("  %-52s  ", e->name);
     fflush(stdout);
 
+    char** env = env_snapshot();
     if (e->setup) e->setup();
 
     clock_t t0 = clock();
-    test_result_t r;
-
-    /* setjmp escape: any scalar-returning helper that hits an unrecoverable
-     * error calls ray_test_fatal() which longjmp's back here.  The runner
-     * reports the test as FAIL with the message helpers wrote into
-     * ray_test_fail_buf, then continues to the next test. */
-    if (setjmp(ray_test_jmp) == 0) {
-        ray_test_jmp_active = 1;
-        r = e->func();
-        ray_test_jmp_active = 0;
-    } else {
-        ray_test_jmp_active = 0;
-        r = (test_result_t){ TEST_FAIL, ray_test_fail_buf };
-    }
+    test_result_t r = run_guarded(e);
 
     double ms = (double)(clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
 
     if (e->teardown) e->teardown();
+    env_restore(env);
 
     print_status(r.status, ms, r.msg);
 

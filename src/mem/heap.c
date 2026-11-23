@@ -96,8 +96,7 @@ static atomic_flag  dfd_lock_flag = ATOMIC_FLAG_INIT;
 static bool dfd_enabled(void) {
     static int on = -1;
     if (on < 0) {
-        const char* e = getenv("RAY_DFD");
-        on = (e && *e && *e != '0') ? 1 : 0;
+        on = ray_env_flag("RAY_DFD") ? 1 : 0;
     }
     return on == 1;
 }
@@ -176,7 +175,7 @@ static void dfd_report(const char* who, const void* p) {
     backtrace_symbols_fd(frames, n, 2);
 #endif
     fflush(stderr);
-    if (!getenv("RAY_DFD_NO_ABORT")) abort();
+    if (!ray_env_flag("RAY_DFD_NO_ABORT")) abort();
 }
 
 /* Called from cow.c (ray_release / ray_retain). */

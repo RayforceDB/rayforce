@@ -49,7 +49,8 @@
 #  define RAY_PATH_MAX 4096
 #endif
 
-#include <stdlib.h>   /* getenv: RAYFORCE_NO_FSYNC */
+#include <stdlib.h>
+#include "core/platform.h"   /* ray_env_flag: RAYFORCE_NO_FSYNC */
 #include <string.h>
 
 /* -1 = not read yet, 0 = flush, 1 = skip.  A benign race: every reader
@@ -59,8 +60,7 @@ static int g_fsync_disabled = -1;
 bool ray_fsync_disabled(void) {
     int v = __atomic_load_n(&g_fsync_disabled, __ATOMIC_RELAXED);
     if (v < 0) {
-        const char* e = getenv("RAYFORCE_NO_FSYNC");
-        v = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+        v = ray_env_flag("RAYFORCE_NO_FSYNC") ? 1 : 0;
         __atomic_store_n(&g_fsync_disabled, v, __ATOMIC_RELAXED);
     }
     return v == 1;

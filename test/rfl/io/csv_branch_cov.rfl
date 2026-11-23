@@ -344,6 +344,9 @@
 (count Rpt) -- 3
 (sum (at Rpt 'a)) -- 6
 (sum (at Rpt 'b)) -- 60
+;; trace off again: an empty value is off (ray_env_flag), for this process
+;; and the ones it starts; the runner also puts the environment back after
+;; every test, so a failure above cannot leave the trace on (#1552)
 (.os.setenv "RAY_CSV_TRACE" "") -- ""
 (.sys.exec "rm -rf rf_test_csvbc_pttrace") -- 0
 

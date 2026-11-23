@@ -455,7 +455,7 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) {
     atomic_init(&m->active[1], 0);
     atomic_init(&m->reserved, false);
     for (int k = 0; k < SI_ST_N; k++) atomic_init(&m->st[k], 0);
-    m->stats = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' trace: its only reader */
+    m->stats = ray_env_flag("RAY_CSV_TRACE");   /* the converters' trace: its only reader */
     m->fd = -1;
     m->count_out = count;
     size_t pl = strlen(path);

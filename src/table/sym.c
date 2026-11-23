@@ -150,7 +150,7 @@ ray_err_t ray_sym_init(void) {
 
     /* RAY_SYM_AUDIT: cache the env check once (the hot ray_sym_vec_cell
      * inline branches on the cached byte, never on getenv). */
-    ray_g_sym_audit = getenv("RAY_SYM_AUDIT") != NULL ? 1 : 0;
+    ray_g_sym_audit = ray_env_flag("RAY_SYM_AUDIT") ? 1 : 0;
 
     g_sym.bucket_cap = SYM_INIT_CAP;
     /* ray_sys_alloc uses mmap(MAP_ANONYMOUS) which zero-initializes. */

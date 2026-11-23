@@ -872,7 +872,7 @@ ray_t* ray_read_csv_parted_fn(ray_t** args, int64_t n) {
     }
 
     ray_t* out = ray_read_parted(root, table_name);
-    if (getenv("RAY_CSV_TRACE") && out && RAY_IS_ERR(out)) {
+    if (ray_env_flag("RAY_CSV_TRACE") && out && RAY_IS_ERR(out)) {
         fprintf(stderr, "csv.parted: read_parted failure root=%s table=%s err=%s\n",
                 root, table_name, ray_err_code(out));
     }

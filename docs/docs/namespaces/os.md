@@ -36,6 +36,17 @@ Errors: `type` (either arg not a string), `domain` (null pointer).
 (.os.setenv "RAY_DEBUG" "1")
 ```
 
+There is no unset: setting a variable to the empty string (or to `"0"`) is
+how a script turns a switch off again.  Rayforce's on/off switches
+(`RAY_IDX_STATS`, the `RAY_CSV_TRACE` trace) are on
+only for a value other than the empty string and `0`, in this process and in
+the processes it starts, which inherit the variable.
+
+```lisp
+(.os.setenv "RAY_CSV_TRACE" "1")   ;; trace the next imports
+(.os.setenv "RAY_CSV_TRACE" "")    ;; and off again
+```
+
 ## See also
 
 - [`.fs.*`](fs.md) — filesystem metadata (`size` / `list`).

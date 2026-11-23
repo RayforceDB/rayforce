@@ -1878,3 +1878,8 @@ void ray_io_counters(bool thread, ray_io_counters_t* out) {
     (void)thread;
 #endif
 }
+
+bool ray_env_flag(const char* name) {
+    const char* v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}

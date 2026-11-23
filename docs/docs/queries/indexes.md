@@ -70,7 +70,7 @@ An **accelerator index** is a precomputed data structure attached to the column 
 
 ## Observability
 
-Set `RAY_IDX_STATS=1` before running a process.  At exit, per-site consult and hit counters are printed to stderr in the form:
+Set `RAY_IDX_STATS=1` before running a process (any value but the empty string and `0` turns it on).  At exit, per-site consult and hit counters are printed to stderr in the form:
 
 ```
 idx_route filter_zone   consults=3 hits=2

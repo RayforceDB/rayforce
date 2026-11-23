@@ -200,6 +200,15 @@ void  ray_file_writebehind_end(int fd);
  * trusts them.  ray_runtime_destroy calls it, so no thread is left behind
  * a runtime. */
 int64_t ray_file_writeback_errors(void);
+
+/* Whether the on/off switch `name` (RAY_CSV_TRACE, RAY_SYM_AUDIT, RAY_DFD,
+ * RAYFORCE_NO_FSYNC, ...) is on: set to a value other than the empty string
+ * and "0".  `NAME=` and `NAME=0` turn one off, for a process and the
+ * processes it starts; there is no unsetenv in the language, and
+ * (.os.setenv "NAME" "") or (.os.setenv "NAME" "0") is how a script turns
+ * one off again.  Switches read as numbers (RAY_SYM_INDEX_MIN) parse their
+ * value instead. */
+bool ray_env_flag(const char* name);
 #ifdef DEBUG
 /* Test hooks (C tests only): with hold on, the background thread stops at
  * the next request it takes, before its writeback, until hold is turned

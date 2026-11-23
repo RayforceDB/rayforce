@@ -25,6 +25,7 @@
  */
 
 #include "splay.h"
+#include "core/platform.h"   /* ray_env_flag */
 #include "core/runtime.h"
 #include "core/pool.h"
 #include "mem/sys.h"
@@ -1613,7 +1614,7 @@ static void splay_resolve_orders(ray_t* tbl) {
 static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                                   bool use_mmap, bool col_syms) {
     if (!dir) return ray_error("io", NULL);
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_CSV_TRACE");
     if (trace)
         fprintf(stderr, "splayed.get: dir=%s mmap=%d\n", dir, use_mmap ? 1 : 0);
 

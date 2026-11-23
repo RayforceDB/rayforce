@@ -4050,7 +4050,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
         if (ce != RAY_OK) { err = ray_error(ray_err_code_str(ce),"parquet: column writer"); goto done; }
         nchunked++;
     }
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;   /* the converters' phase trace */
+    bool trace = ray_env_flag("RAY_CSV_TRACE");   /* the converters' phase trace */
     spare = ray_calloc_raw((size_t)workers*sizeof(*spare));   /* best effort */
     if (spare) nspare = workers;
     if (nchunked) {
@@ -4071,7 +4071,7 @@ static ray_t* pq_write_direct(ray_parquet_t* r, ray_col_stream_t* writers) {
      * instead of output that no pass reads again.  Best effort. */
     if (colwise) wbf = ray_alloc_raw((size_t)r->ncols*sizeof(*wbf));
 #if defined(DEBUG)
-    work.reverse = getenv("RAY_PQ_DIRECT_REVERSE") != NULL;   /* the suite: positions not in task order */
+    work.reverse = ray_env_flag("RAY_PQ_DIRECT_REVERSE");   /* the suite: positions not in task order */
 #endif
     {
         const char* e = getenv("RAY_PQ_PREFETCH");
@@ -4541,7 +4541,7 @@ ray_t* ray_parquet_splayed_typed(const char* path, const char* dir, ray_t* types
     }
     bool direct = true;
     for (int64_t c = 0; c < r->ncols; c++) if (writers[c].type == RAY_STR) direct = false;
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_CSV_TRACE");
     int64_t tp = trace ? ray_profile_now_ns() : 0;
     if (direct) {
         err = pq_write_direct(r,writers);
