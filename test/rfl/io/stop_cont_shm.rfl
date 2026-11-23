@@ -15,4 +15,4 @@
 (.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; kill -STOP $(cat $D/b/pid); sleep 0.5; kill -CONT $(cat $D/b/pid); sleep 1; kill -0 $(cat $D/b/pid)'") -- 0
 (.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; B=$(cat $D/b/port); (echo > /dev/tcp/127.0.0.1/$B)'") -- 0
 
-(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; kill $(cat $D/a/pid) $(cat $D/b/pid) 2>/dev/null; rm -rf $D; exit 0'") -- 0
+(.sys.exec "bash -c 'D=/tmp/rfl_stop_cont; for f in $D/a/pid $D/b/pid; do [ -f $f ] && kill $(cat $f) 2>/dev/null; done; rm -rf $D; exit 0'") -- 0

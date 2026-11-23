@@ -64,4 +64,4 @@
 (< (- (smem) s7) 3000) -- true
 
 (try (.ipc.send h "(exit 0)") 0)
-(.sys.exec "bash -c 'kill $(cat /tmp/rfl_ipc_leak/pid) 2>/dev/null; rm -rf /tmp/rfl_ipc_leak; exit 0'") -- 0
+(.sys.exec "bash -c 'D=/tmp/rfl_ipc_leak; [ -f $D/pid ] && kill $(cat $D/pid) 2>/dev/null; rm -rf $D; exit 0'") -- 0

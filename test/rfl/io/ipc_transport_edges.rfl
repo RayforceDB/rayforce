@@ -21,7 +21,9 @@
 ;;
 ;; Readiness probe: completes a real handshake (see log_journal.rfl).
 ;; Every process the test starts is stopped by the pid it wrote, never by
-;; a pattern, which would reach another suite's (#1140).
+;; a pattern, which would reach another suite's (#1140); one this file does
+;; not get to stop (a failed assertion ends it, a run is interrupted) is
+;; stopped by serve.sh's watchdog once the test process is gone.
 ;; The server notices a client's close on its own schedule, so wherever a
 ;; step needs the rings a closed connection held, it retries a bounded
 ;; number of times rather than sleeping a fixed while.  The side-channel
@@ -58,7 +60,7 @@ m -- 400
 ;; A helper holds every slot of the server's side channel; the next
 ;; client is turned away there, after the offer, and stays on TCP.
 (.sys.exec "printf '%s\\n' 'import os, socket, sys, time' 'pid = sys.argv[1]' 'names = [l.split()[-1] for l in open(\"/proc/net/unix\") if (\"@rayforce-shm.\" + pid + \".\") in l]' 'ss = []' 'for i in range(64): ss.append(socket.socket(socket.AF_UNIX)); ss[-1].connect(chr(0) + names[0][1:])' 'time.sleep(0.5)' 'open(sys.argv[2], \"w\").write(\"ok\")' 'end = time.time() + float(sys.argv[3])' 'while time.time() < end and not os.path.exists(sys.argv[2] + \".go\"): time.sleep(0.05)' > /tmp/rftest_xport_hold.py")
-(.sys.exec "python3 /tmp/rftest_xport_hold.py $(cat /tmp/rftest_xport/pid) /tmp/rftest_xport_held 9 >/dev/null 2>&1 & echo $! > /tmp/rftest_xport/hold_pid")
+(.sys.exec "python3 /tmp/rftest_xport_hold.py $(cat /tmp/rftest_xport/pid) /tmp/rftest_xport_held 9 >/dev/null 2>&1 & echo $! > /tmp/rftest_xport/hold_pid; test/serve.sh --tie $! /tmp/rftest_xport")
 (.sys.exec "for i in $(seq 50); do [ -f /tmp/rftest_xport_held ] && exit 0; sleep 0.1; done; exit 1") -- 0
 (set c (.ipc.open addr))
 (get (.ipc.handle c) 'transport) -- 'tcp
@@ -109,5 +111,6 @@ m -- 400
 (.ipc.send c (list 'count (til 6000000))) !- io
 
 ;; ── teardown ────────────────────────────────────────────────────────
-(.sys.exec "kill -KILL $(cat /tmp/rftest_xport/pid) $(cat /tmp/rftest_xport/hold_pid) 2>/dev/null; true")
+;; the server was killed above and the helper waited for; their watchdogs
+;; have nothing left to stop
 (.sys.exec "rm -rf /tmp/rftest_xport /tmp/rftest_xport_edges.rfl /tmp/rftest_xport_hold.py /tmp/rftest_xport_held /tmp/rftest_xport_held.go")
