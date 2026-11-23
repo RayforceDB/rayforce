@@ -64,3 +64,15 @@
 (str-join [1 2] ",") !- type
 (str-join ["a"] 1) !- type
 (str-join (list "a" 2) ",") !- type
+;; a lazy pattern is borrowed (#1423): str-find used to hand the caller's own
+;; reference to ray_lazy_materialize, which consumes it, so the caller released
+;; it a second time and the freed block was reused under live bindings (`i`
+;; below turned into a string on the third pass)
+(set SFV ["abc" "xbz"])
+(str-find SFV (first (distinct ["b" "c"]))) -- [1 1]
+(str-find "abc" (first (distinct ["c" "b"]))) -- 2
+(do (set i 0) (set acc 0) (while (< i 50) (do (set acc (+ acc (sum (str-find SFV (first (distinct ["b" "c"])))))) (set i (+ i 1)))) (list i acc)) -- (list 50 100)
+(str-find SFV (distinct ["b"])) !- type
+;; str-join is not lazy-aware: lazy arguments arrive materialised
+(str-join (distinct ["a" "b" "a"]) ",") -- "a,b"
+(str-join ["a" "b"] (first (distinct [";" ","]))) -- "a;b"
