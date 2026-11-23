@@ -1060,11 +1060,16 @@ ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
+            /* the null (INT64_MIN) would win a <, so it is skipped; whether any value
+             * was seen is an OR folded into the same pass, which stays vectorizable */
             int64_t best = INT64_MAX;
-            bool found = false;
-            for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && (!found || d[i] < best)) { best = d[i]; found = true; }
-            return found ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
+            bool seen = false;
+            for (int64_t i = 0; i < x->len; i++) {
+                bool v = d[i] != NULL_I64;
+                seen |= v;
+                if (v && d[i] < best) best = d[i];
+            }
+            return seen ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
         }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
          * Only valid when the index was built for the column's current len
@@ -1135,11 +1140,12 @@ ray_t* ray_max_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
-            int64_t best = -INT64_MAX;
-            bool found = false;
+            /* the null (INT64_MIN) never wins a >: starting from it, best stays null
+             * exactly when no value is there, and -0Wn still wins */
+            int64_t best = NULL_I64;
             for (int64_t i = 0; i < x->len; i++)
-                if (d[i] != NULL_I64 && (!found || d[i] > best)) { best = d[i]; found = true; }
-            return found ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
+                if (d[i] > best) best = d[i];
+            return best == NULL_I64 ? ray_typed_null(-RAY_TIMESPAN) : ray_timespan(best);
         }
         if (ray_index_kind(x) == RAY_IDX_CHUNK_ZONE) {
             ray_index_t* ix = ray_index_payload(x->index);

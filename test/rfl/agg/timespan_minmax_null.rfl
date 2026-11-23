@@ -28,7 +28,7 @@
 (at (select {from:E by:g lo:(min v) hi:(max v) asc:g}) 'hi) -- [0Wn 0Nn]
 ;; Many rows: the grouped route merges partial states; groups 2..6 are all null.
 (set n 300000)
-(set G (table [g v] (list (% (til n) 7) (as 'TIMESPAN (map (fn [i] (if (< (% i 7) 2) i 0N)) (til n))))))
+(set G (table [g v] (list (% (til n) 7) (as 'TIMESPAN (* (til n) (at [1 1 0N 0N 0N 0N 0N] (% (til n) 7)))))))
 (at (select {from:G by:g lo:(min v) hi:(max v) asc:g}) 'lo) -- [0D00:00:00.000000000 0D00:00:00.000000001 0Nn 0Nn 0Nn 0Nn 0Nn]
 (at (select {from:G by:g hi:(max v) asc:g}) 'hi) -- [0D00:00:00.000299999 0D00:00:00.000299993 0Nn 0Nn 0Nn 0Nn 0Nn]
 
