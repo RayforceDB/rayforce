@@ -24,10 +24,30 @@
 (count (select {from: P where: (== s "a")})) -- 4
 (count (select {from: P where: (in s (list "a" "b"))})) -- 6
 (count (select {from: P where: (in s ["a" "b"])})) -- 6
+;; A fresh process reading the saved tables has not interned their symbols:
+;; the strings still read as the symbols the columns hold (plain, hashed and
+;; compressed splayed, parted), with == and in agreeing
+(set TF (table [s n] (list ['b16_fresh_a 'b16_fresh_b 'b16_fresh_c 'b16_fresh_a] [1 2 3 4])))
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/fp/" TF {compress: false})
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/fh/" (table [s n] (list (.idx.hash (at TF 's)) (at TF 'n))) {compress: false})
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/fc/" (table [s n] (list (.idx.hash (at TF 's)) (at TF 'n))) {compress: true})
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/fq/1/t/" TF "/tmp/rfl_where_in_sym_strings/fq/.sym")
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/fq/2/t/" TF "/tmp/rfl_where_in_sym_strings/fq/.sym")
+(.sys.exec "printf '%s\n' '(set L (list \"b16_fresh_a\" \"b16_fresh_b\"))' '(set V [\"b16_fresh_a\" \"b16_fresh_b\"])' '(set D \"/tmp/rfl_where_in_sym_strings/\")' '(set f (fn [t] (println (at (select {from: t where: (in s L) n: n}) (quote n))) (println (at (select {from: t where: (in s V) n: n}) (quote n))) (println (at (select {from: t where: (in s \"b16_fresh_a\") n: n}) (quote n)))))' '(f (.db.splayed.get (concat D \"fp/\")))' '(f (.db.splayed.get (concat D \"fh/\")))' '(f (.db.splayed.get (concat D \"fc/\")))' '(f (.db.parted.get (concat D \"fq/\") (quote t)))' > /tmp/rfl_where_in_sym_strings/fresh.rfl") -- 0
+(.sys.exec "./rayforce /tmp/rfl_where_in_sym_strings/fresh.rfl </dev/null > /tmp/rfl_where_in_sym_strings/fresh.out 2>&1") -- 0
+(.sys.exec "printf '[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4 1 2 4]\n[1 2 4 1 2 4]\n[1 4 1 4]\n' | cmp -s - /tmp/rfl_where_in_sym_strings/fresh.out") -- 0
+;; a name bound to a string vector or a string atom reads as the literal does
+(set V1493 ["a" "b"])
+(set A1493 "a")
+(count (select {from: T where: (in s V1493)})) -- 3
+(count (select {from: T where: (in s A1493)})) -- 2
 (set G (table [g] (list (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000002")))))
 (count (select {from: G where: (== g "0a5c0a5c-0000-4000-8000-000000000001")})) !- type
 (count (select {from: G where: (in g (list "0a5c0a5c-0000-4000-8000-000000000001"))})) !- type
 (count (select {from: G where: (in g ["0a5c0a5c-0000-4000-8000-000000000001"])})) !- type
+(count (select {from: G where: (in g V1493)})) !- type
+;; inside an if arm the pair is the evaluator's: an arm never selected raises nothing
+(count (select {from: G where: (if false (in g ["bad"]) true)})) -- 2
 (set K1493 (at (at G 'g) [0]))
 (count (select {from: G where: (in g K1493)})) -- 1
 (.sys.exec "rm -rf /tmp/rfl_where_in_sym_strings") -- 0
