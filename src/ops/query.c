@@ -11930,6 +11930,16 @@ static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl) {
     return result;
 }
 
+/* A keyless quantile's computed probability that reads no column and has
+ * no effect, (+ P 0): its value, evaluated once, as the builtin's argument
+ * is (#981).  NULL for any other probability; else the value or its error. */
+static ray_t* quantile_computed_prob(ray_t* prob_expr, ray_t* tbl) {
+    if (!prob_expr || prob_expr->type != RAY_LIST ||
+        !expr_reads_no_column(prob_expr, tbl) || !query_expr_effect_free(prob_expr))
+        return NULL;
+    return eval_expr_whole_column_impl(prob_expr, tbl);
+}
+
 static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     ray_t* expanded = query_inline_helpers(expr, tbl);
     ray_t* result = eval_expr_whole_column_impl(expanded, tbl);
@@ -27092,12 +27102,22 @@ by_dict_done:
                                     ray_table_slot(tbl, head->i64)
                             ? NULL : ray_env_get(head->i64);
                         ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
-                        if (fn && fn->type == RAY_BINARY &&
-                            (ray_binary_fn)(uintptr_t)fn->i64 == native &&
-                            quantile_keyless_prob(agg_elems[2], tbl, percentile, &q)) {
+                        bool native_fn = fn && fn->type == RAY_BINARY &&
+                                         (ray_binary_fn)(uintptr_t)fn->i64 == native;
+                        ray_t* pv = native_fn ? quantile_computed_prob(agg_elems[2], tbl) : NULL;
+                        if (pv && RAY_IS_ERR(pv)) {
+                            if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                            ray_graph_free(g); ray_release(tbl);
+                            scratch_free(sagg_hdr);
+                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return pv;
+                        }
+                        if (native_fn &&
+                            (pv ? quantile_literal_prob(pv, percentile, &q)
+                                : quantile_keyless_prob(agg_elems[2], tbl, percentile, &q))) {
                             agg_k[s_n_aggs] = encode_agg_f64_param(q);
                             s_has_param = 1;
                         }
+                        if (pv) ray_release(pv);
                     }
                 }
                 s_agg_ops[s_n_aggs] = op;
