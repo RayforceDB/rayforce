@@ -24,7 +24,8 @@
 #include "ops/internal.h"
 #include "ops/hash.h"
 #include "ops/idxop.h"
-#include "lang/internal.h"  /* sym_id_runtime, sym_domain_rep (sym-domain Phase 2) */
+#include "lang/internal.h"  /* collection_elem, store_typed_elem */
+#include "table/domain.h"   /* raw symfile snapshot for join_sym_xlat */
 
 /* Test knob: force the legacy build-on-right behavior so the differential
  * harness can compare swap vs no-swap in one binary. */
@@ -144,6 +145,29 @@ static int join_store_key_cell(ray_t* dst, int64_t dst_row,
         return (r && !RAY_IS_ERR(r)) ? 0 : -1;
     }
 
+    /* SYM to SYM by id: raw within one domain, else this one string looked
+     * up (interned, for a runtime output) in dst's domain.  The atom route
+     * below would re-express the cell as a runtime id through the domain's
+     * LUT, interning src's WHOLE vocabulary for a right-only row. */
+    if (dst->type == RAY_SYM && src->type == RAY_SYM) {
+        struct ray_sym_domain_s* sd = ray_sym_vec_domain(src);
+        struct ray_sym_domain_s* dd = ray_sym_vec_domain(dst);
+        int64_t pos = ray_read_sym(ray_data(src), src_row, RAY_SYM, src->attrs);
+        if (sd != dd) {
+            ray_t* s = ray_sym_domain_str(sd, pos);
+            if (!s) return -1;
+            pos = dd == ray_sym_runtime_domain()
+                ? ray_sym_intern(ray_str_ptr(s), ray_str_len(s))
+                : ray_sym_domain_find(dd, ray_str_ptr(s), ray_str_len(s));
+            if (pos < 0) return -1;   /* not in the output's file vocabulary */
+        }
+        uint8_t w = dst->attrs & RAY_SYM_W_MASK;
+        if (w != RAY_SYM_W64 && (uint64_t)pos > ((1ull << (8u << w)) - 1ull))
+            return -1;                /* position does not fit the column width */
+        ray_write_sym(ray_data(dst), dst_row, (uint64_t)pos, RAY_SYM, dst->attrs);
+        return 0;
+    }
+
     int allocated = 0;
     ray_t* elem = collection_elem(src, src_row, &allocated);
     if (!elem || RAY_IS_ERR(elem)) {
@@ -244,12 +268,10 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
              * hash agrees with atom_eq across them (#1373). */
             kh = ray_key_hash(((ray_t**)ray_data(col))[row], JOIN_KF_SPANS(kf));
         } else {
+            /* A SYM cell id is a position in the COLUMN's domain; the two
+             * sides of a SYM key pair share one domain by the time any row
+             * is hashed (join_align_sym_keys), so the raw id is the key. */
             int64_t kv = read_col_i64(ray_data(col), row, col->type, col->attrs);
-            /* sym-domain Phase 2: a SYM cell id is a position in the
-             * COLUMN's domain — build and probe sides must hash into ONE
-             * id space, so canonicalize to the runtime id.  Runtime-domain
-             * columns (the only pre-flip case) pass through unchanged. */
-            if (col->type == RAY_SYM) kv = sym_id_runtime(col, kv);
             kh = ray_hash_i64(kv);
         }
         h = (k == 0) ? kh : ray_hash_combine(h, kh);
@@ -257,31 +279,143 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
     return h;
 }
 
-/* hash_row_keys / join_keys_eq translate FILE-domain SYM cells through
- * the per-domain runtime-id LUT and run inside ray_pool_dispatch
- * workers.  The FIRST LUT request interns the domain's vocabulary into
- * the global table — a sequential one-time cost that must be paid HERE,
- * in join setup, never inside a worker (sym.c's frozen-table rule; a
- * worker-side intern would also leak the joined vocabulary build into
- * parallel execution).  No-op while every key is runtime-domain (LUT is
- * NULL for the singleton).
+/* ── SYM key domains ──────────────────────────────────────────────────────
+ * hash_row_keys and join_keys_eq read SYM key cells as raw ids, which only
+ * compare within ONE domain.  A key pair whose sides resolve over two
+ * domains (a splayed column against a runtime literal, two tables with
+ * different symfiles) is aligned once, here in sequential setup: the side
+ * that is cheaper to translate gets a W64 copy re-expressed as positions
+ * in the OTHER side's domain, by string lookup of each distinct id.  No
+ * lookup interns: ray_sym_domain_find probes the runtime table (ray_sym_find)
+ * or the symfile's reverse index.  The join used to canonicalize every SYM
+ * key to a runtime id through the per-domain LUT instead, which interns the
+ * domain's WHOLE vocabulary into the global table — never freed, and
+ * O(|vocabulary|) however small the joined tables are (a 30 x 10 row join
+ * over columns of a 100M-row table took 97 s and 35 GB the first time).
  *
- * Returns false on LUT-build OOM for a FILE domain — the caller MUST
- * abort the join: silent -1 translations downstream would make
- * cross-domain keys spuriously equal (7a-review hardening). */
-static bool join_warm_sym_luts(ray_t* const* l_vecs, ray_t* const* r_vecs,
-                               uint32_t n_keys) {
-    for (uint32_t k = 0; k < n_keys; k++) {
-        ray_t* sides[2] = { l_vecs[k], r_vecs[k] };
-        for (int s = 0; s < 2; s++) {
-            ray_t* v = sides[s];
-            if (!v || v->type != RAY_SYM) continue;
-            struct ray_sym_domain_s* dom = ray_sym_vec_domain(v);
-            if (dom == ray_sym_runtime_domain()) continue;
-            if (!ray_sym_domain_runtime_lut(dom)) return false;
+ * The key vectors array holds, per side, the vectors the hash and compare
+ * read (a translated copy or the table's column) and the table's own
+ * column (join_keys_orig): output cells, such as the full-join key fill,
+ * are always taken from the latter so results keep their cells and domain.
+ *
+ * Translating a side costs one lookup per distinct id, plus — when the
+ * target is a FILE domain — its reverse index, built on the first find
+ * over that symfile (the cost `(= col "x")` pays) and kept by the domain.
+ * So a FILE side against a runtime side is translated into the runtime
+ * table unless it has far more rows than the other side has rows plus
+ * the symfile has entries (measured on 2M-row columns: translating the
+ * rows beat indexing the vocabulary up to about 1:1). */
+#define JOIN_KEYS_ARRAYS 4
+
+static inline ray_t** join_keys_orig(ray_t** key_vecs, size_t key_slots, int side) {
+    return key_vecs + (size_t)(2 + side) * key_slots;
+}
+
+/* The lookups of one translation: open addressing on the source id, so a
+ * side with many rows over few distinct symbols looks each one up once. */
+typedef struct { int64_t id; int64_t pos; } join_sym_memo_t;
+
+/* `src`'s cells as positions in `dst`'s domain (W64, adopting that domain).
+ * An absent string becomes -1: it equals no cell of `dst`, whose ids are
+ * >= 0.  The null is id 0 in every domain and stays 0, so null == null
+ * keeps holding across the pair. */
+static ray_t* join_sym_xlat(ray_t* src, ray_t* dst) {
+    struct ray_sym_domain_s* sd = ray_sym_vec_domain(src);
+    struct ray_sym_domain_s* dd = ray_sym_vec_domain(dst);
+    int64_t n = src->len;
+    ray_t* out = ray_sym_vec_new(RAY_SYM_W64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    int64_t* o = (int64_t*)ray_data(out);
+
+    uint64_t cap = 64;
+    int64_t distinct_max = ray_sym_domain_count(sd);
+    if (distinct_max > n) distinct_max = n;
+    while (cap < (uint64_t)distinct_max * 2) cap <<= 1;
+    ray_t* memo_hdr = NULL;
+    join_sym_memo_t* memo = (join_sym_memo_t*)scratch_alloc(&memo_hdr, cap * sizeof *memo);
+    if (!memo) { ray_release(out); return ray_error("oom", NULL); }
+    for (uint64_t i = 0; i < cap; i++) memo[i].id = -1;
+
+    /* A symfile's strings are read where they lie (no atom per entry: 2M
+     * distinct ids materialized 260 bytes each the other way). */
+    ray_sym_domain_raw_t raw;
+    bool raw_ok = ray_sym_domain_raw_pin(sd, &raw);
+
+    const void* sdata = ray_data(src);
+    for (int64_t r = 0; r < n; r++) {
+        int64_t id = ray_read_sym(sdata, r, RAY_SYM, src->attrs);
+        if (id == 0) { o[r] = 0; continue; }
+        uint64_t slot = ray_hash_i64(id) & (cap - 1);
+        while (memo[slot].id != -1 && memo[slot].id != id) slot = (slot + 1) & (cap - 1);
+        if (memo[slot].id == -1) {
+            const char* p = NULL;
+            size_t l = 0;
+            /* the pinned snapshot covers the file prefix only; entries
+             * appended in this session resolve through the domain */
+            if (raw_ok && id < raw.count) {
+                p = ray_sym_domain_raw_str(&raw, id, &l);
+            } else {
+                ray_t* s = ray_sym_domain_str(sd, id);
+                if (s) { p = ray_str_ptr(s); l = ray_str_len(s); }
+            }
+            memo[slot].id  = id;
+            memo[slot].pos = p ? ray_sym_domain_find(dd, p, l) : -1;
         }
+        o[r] = memo[slot].pos;
     }
-    return true;
+    if (raw_ok) ray_sym_domain_raw_unpin(sd);
+    scratch_free(memo_hdr);
+    ray_sym_vec_adopt_domain(out, dst);
+    return out;
+}
+
+/* What translating `side` into `target`'s domain costs, in symfile
+ * entries indexed: one lookup per row (memoized per distinct id) weighs
+ * JOIN_SYM_XLAT_ROW of them, and a FILE target adds its entry count for
+ * the reverse index the first find over it builds.  Measured on a 6M-entry
+ * compressed symfile against 2M rows of distinct ids: the index 65 ns and
+ * 130 B per entry, the lookups 150 ns per row. */
+#define JOIN_SYM_XLAT_ROW 2
+static int64_t join_sym_xlat_cost(ray_t* side, ray_t* target) {
+    struct ray_sym_domain_s* td = ray_sym_vec_domain(target);
+    return side->len * JOIN_SYM_XLAT_ROW +
+           (td == ray_sym_runtime_domain() ? 0 : ray_sym_domain_count(td));
+}
+
+/* Aligns every cross-domain SYM key pair (see above); on return each pair
+ * the hash and compare read shares one domain.  Records the tables' own
+ * columns in the orig arrays first, so join_keys_drop can tell a translated
+ * copy from a borrowed column.  Returns an error atom on OOM, else NULL. */
+static ray_t* join_align_sym_keys(ray_t** key_vecs, size_t key_slots, uint32_t n_keys) {
+    ray_t** l = key_vecs;
+    ray_t** r = key_vecs + key_slots;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        join_keys_orig(key_vecs, key_slots, 0)[k] = l[k];
+        join_keys_orig(key_vecs, key_slots, 1)[k] = r[k];
+    }
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* lc = l[k];
+        ray_t* rc = r[k];
+        if (!lc || !rc || lc->type != RAY_SYM || rc->type != RAY_SYM) continue;
+        if (!ray_is_vec(lc) || !ray_is_vec(rc)) continue;
+        if (ray_sym_vec_domain(lc) == ray_sym_vec_domain(rc)) continue;
+        bool xl_left = join_sym_xlat_cost(lc, rc) <= join_sym_xlat_cost(rc, lc);
+        ray_t* x = xl_left ? join_sym_xlat(lc, rc) : join_sym_xlat(rc, lc);
+        if (RAY_IS_ERR(x)) return x;
+        if (xl_left) l[k] = x; else r[k] = x;
+    }
+    return NULL;
+}
+
+/* Frees the key vectors array, releasing the translated copies it holds. */
+static void join_keys_drop(ray_t* key_vecs_hdr, size_t key_slots) {
+    ray_t** key_vecs = (ray_t**)ray_data(key_vecs_hdr);
+    for (size_t i = 0; i < 2 * key_slots; i++) {
+        ray_t* orig = key_vecs[2 * key_slots + i];
+        if (orig && key_vecs[i] != orig) ray_release(key_vecs[i]);
+    }
+    scratch_free(key_vecs_hdr);
 }
 
 /* ============================================================================
@@ -750,20 +884,10 @@ static inline bool join_keys_eq(ray_t* const* l_vecs, ray_t* const* r_vecs, uint
         } else if (lc->type == RAY_F64) {
             if (((double*)ray_data(lc))[l] != ((double*)ray_data(rc))[r]) return false;
         } else {
+            /* Raw ids: a SYM pair shares one domain (join_align_sym_keys),
+             * where ids are injective, so raw equality is string equality. */
             int64_t lv = read_col_i64(ray_data(lc), l, lc->type, lc->attrs);
             int64_t rv = read_col_i64(ray_data(rc), r, rc->type, rc->attrs);
-            /* Raw SYM ids only compare within ONE domain — gate on domain
-             * identity and translate both sides to runtime ids on mismatch
-             * (collection.c hashset precedent; matches hash_row_keys'
-             * canonical hashing).  Same-domain compares stay raw: per-domain
-             * translation is injective, so raw equality ⇔ runtime equality.
-             * Pre-flip both sides are the runtime singleton: byte-identical
-             * fast path. */
-            if (lc->type == RAY_SYM && rc->type == RAY_SYM &&
-                ray_sym_vec_domain(lc) != ray_sym_vec_domain(rc)) {
-                lv = sym_id_runtime(lc, lv);
-                rv = sym_id_runtime(rc, rv);
-            }
             if (lv != rv) return false;
         }
     }
@@ -1085,13 +1209,13 @@ _Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
  * emits it unmatched — exactly what the full probe would have produced).
  *
  * The value space is the one join_keys_eq compares in: read_col_i64 for
- * the integer family, raw SYM ids when both sides share a domain, runtime
- * ids when they do not.  Negative values (integer null sentinels, an
- * untranslatable SYM id) are never rejected; they take the full probe, so
- * null == null holds with no special case.  The SYM null is id 0 in every
- * domain and is kept as 0 by the translation, so a left null passes iff
- * the right side holds one.  Rejecting is the only thing the filter does,
- * and it rejects only values no right row holds.
+ * the integer family, raw SYM ids (the pair shares a domain, see
+ * join_align_sym_keys).  Negative values (integer null sentinels, a SYM id
+ * absent from the other side's domain) are never rejected; they take the
+ * full probe, so null == null holds with no special case.  The SYM null is
+ * id 0 in every domain, so a left null passes iff the right side holds
+ * one.  Rejecting is the only thing the filter does, and it rejects only
+ * values no right row holds.
  *
  * Bits cover [base, base + span] where base is the smallest non-negative
  * right value; a value below base wraps to a huge offset and is rejected
@@ -1103,8 +1227,6 @@ _Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
 
 typedef struct {
     const void*    data;     /* left key payload (slice-resolved) */
-    const int64_t* lut;      /* left SYM domain -> runtime id, NULL = raw */
-    int64_t        lut_n;
     uint64_t*      bits;
     int64_t        base;
     uint64_t       span;
@@ -1156,15 +1278,8 @@ static bool join_pf_int_type(int8_t t) {
     }
 }
 
-/* SYM id in the filter's value space: raw (lut NULL) or runtime. */
-static inline int64_t join_pf_xlat(int64_t v, const int64_t* lut, int64_t lut_n) {
-    if (!lut || v == 0) return v;
-    return (v > 0 && v < lut_n) ? lut[v] : -1;
-}
-
 static inline bool join_pf_pass(const join_pf_col_t* p, int64_t row) {
     int64_t v = join_pf_read(p->data, row, p->kind);
-    if (RAY_UNLIKELY(p->lut != NULL)) v = join_pf_xlat(v, p->lut, p->lut_n);
     if (v < 0) return true;
     uint64_t off = (uint64_t)v - (uint64_t)p->base;
     return off <= p->span && RAY_SEL_BIT_TEST(p->bits, off);
@@ -1176,12 +1291,12 @@ static inline bool join_pf_reject(const join_pf_col_t* pf, uint32_t n_pf, int64_
     return false;
 }
 
-/* One plain 8-byte column (I64 family, or a W64 SYM compared raw) is the
- * common single-key shape.  Its probe variant keeps the column in scalar
+/* One plain 8-byte column (I64 family, or a W64 SYM) is the common
+ * single-key shape.  Its probe variant keeps the column in scalar
  * locals: the general path reloads every descriptor field per row, because
  * the out-of-line hash/compare calls in the same loop may clobber memory. */
 static bool join_pf_single64(const join_pf_col_t* pf, uint32_t n_pf) {
-    return n_pf == 1 && pf[0].kind == JOIN_PF_K_I64 && !pf[0].lut;
+    return n_pf == 1 && pf[0].kind == JOIN_PF_K_I64;
 }
 
 /* join_pf_pass negated, for that column. */
@@ -1206,32 +1321,11 @@ static bool join_pf_build_col(join_pf_col_t* p, ray_t* lc, ray_t* rc,
      * pairing is not worth a filter, leave it to the probe. */
     if ((lc->type == RAY_SYM) != (rc->type == RAY_SYM)) return false;
 
-    const int64_t* llut = NULL; int64_t llut_n = 0;
-    const int64_t* rlut = NULL; int64_t rlut_n = 0;
-    if (lc->type == RAY_SYM) {
-        struct ray_sym_domain_s* ld = ray_sym_vec_domain(lc);
-        struct ray_sym_domain_s* rd = ray_sym_vec_domain(rc);
-        if (ld != rd) {
-            /* LUTs were built by join_warm_sym_luts; NULL = runtime domain. */
-            if (ld != ray_sym_runtime_domain()) {
-                llut = ray_sym_domain_runtime_lut(ld);
-                llut_n = ray_sym_domain_count(ld);
-                if (!llut) return false;
-            }
-            if (rd != ray_sym_runtime_domain()) {
-                rlut = ray_sym_domain_runtime_lut(rd);
-                rlut_n = ray_sym_domain_count(rd);
-                if (!rlut) return false;
-            }
-        }
-    }
-
     const void* rdata = ray_data(rc);
     int8_t rt = rc->type; uint8_t ra = rc->attrs;
     int64_t lo = INT64_MAX, hi = -1;
     for (int64_t i = 0; i < right_rows; i++) {
         int64_t v = read_col_i64(rdata, i, rt, ra);
-        if (rt == RAY_SYM) v = join_pf_xlat(v, rlut, rlut_n);
         if (v < 0) continue;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
@@ -1247,12 +1341,10 @@ static bool join_pf_build_col(join_pf_col_t* p, ray_t* lc, ray_t* rc,
     if (!bits) return false;
     for (int64_t i = 0; i < right_rows; i++) {
         int64_t v = read_col_i64(rdata, i, rt, ra);
-        if (rt == RAY_SYM) v = join_pf_xlat(v, rlut, rlut_n);
         if (v < 0) continue;
         RAY_SEL_BIT_SET(bits, (uint64_t)(v - lo));
     }
     p->data = ray_data(lc);
-    p->lut = llut; p->lut_n = llut_n;
     p->bits = bits; p->base = lo; p->span = span;
     p->kind = join_pf_kind(lc);
     return true;
@@ -1553,13 +1645,15 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
     /* n_keys is unbounded post-lift (no fixed key-count ceiling) — a stack
      * VLA here would be a stack blow for a wide join.  One zero-inited
-     * carve holds both l_key_vecs and r_key_vecs (key_slots each); guard
-     * >=1 slot so the carve is never zero-sized when n_keys == 0.  Freed
-     * on every return between here and the end of the function (join_cleanup
-     * covers the fall-through paths; direct returns free it explicitly). */
+     * carve holds l_key_vecs, r_key_vecs and their orig arrays (key_slots
+     * each, see join_align_sym_keys); guard >=1 slot so the carve is never
+     * zero-sized when n_keys == 0.  Dropped on every return between here
+     * and the end of the function (join_cleanup covers the fall-through
+     * paths; direct returns drop it explicitly). */
     size_t key_slots = n_keys ? n_keys : 1;
     ray_t* key_vecs_hdr = NULL;
-    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr, key_slots * 2 * sizeof(ray_t*));
+    ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
+                                               key_slots * JOIN_KEYS_ARRAYS * sizeof(ray_t*));
     if (!key_vecs) return ray_error("oom", NULL);
     ray_t** l_key_vecs = key_vecs;
     ray_t** r_key_vecs = key_vecs + key_slots;
@@ -1571,7 +1665,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             l_key_vecs[k] = ray_table_col(left_table, lk->sym);
             if (l_key_vecs[k] && RAY_IS_ERR(l_key_vecs[k])) {
                 ray_t* e = l_key_vecs[k];
-                scratch_free(key_vecs_hdr);
+                join_keys_drop(key_vecs_hdr, key_slots);
                 return e;
             }
         }
@@ -1579,7 +1673,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             r_key_vecs[k] = ray_table_col(right_table, rk->sym);
             if (r_key_vecs[k] && RAY_IS_ERR(r_key_vecs[k])) {
                 ray_t* e = r_key_vecs[k];
-                scratch_free(key_vecs_hdr);
+                join_keys_drop(key_vecs_hdr, key_slots);
                 return e;
             }
         }
@@ -1587,10 +1681,11 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             r_key_vecs[k] = rk->literal;
     }
 
-    /* Sequential LUT warm-up BEFORE any dispatch (see join_warm_sym_luts). */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
-        scratch_free(key_vecs_hdr);
-        return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    /* Cross-domain SYM keys are aligned here, sequentially, BEFORE any
+     * dispatch (see join_align_sym_keys). */
+    {
+        ray_t* e = join_align_sym_keys(key_vecs, key_slots, n_keys);
+        if (e) { join_keys_drop(key_vecs_hdr, key_slots); return e; }
     }
 
     /* #597: one proof for the whole join — see join_keys_nullfree. */
@@ -1697,7 +1792,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
 
         if (pool_cancelled(pool)) {
             scratch_free(r_hash_hdr); scratch_free(l_hash_hdr);
-            scratch_free(key_vecs_hdr);
+            join_keys_drop(key_vecs_hdr, key_slots);
             return ray_error("cancel", NULL);
         }
 
@@ -1731,7 +1826,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
                 if (l_parts[rp2].entries_hdr) scratch_free(l_parts[rp2].entries_hdr);
             }
             scratch_free(r_parts_hdr); scratch_free(l_parts_hdr);
-            scratch_free(key_vecs_hdr);
+            join_keys_drop(key_vecs_hdr, key_slots);
             return ray_error("cancel", NULL);
         }
 
@@ -1812,7 +1907,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
             scratch_free(pp_meta_hdr); scratch_free(pcounts_hdr);
             if (matched_right_hdr) { scratch_free(matched_right_hdr); matched_right_hdr = NULL; }
             matched_right = NULL;
-            if (bp_cancelled) { scratch_free(key_vecs_hdr); return ray_error("cancel", NULL); }
+            if (bp_cancelled) { join_keys_drop(key_vecs_hdr, key_slots); return ray_error("cancel", NULL); }
             if (bp_pathological) ray_join_dup_fallbacks++;
             goto chained_ht_fallback;
         }
@@ -1851,7 +1946,7 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
                 scratch_free(pcounts_hdr);
                 if (matched_right_hdr) scratch_free(matched_right_hdr);
                 matched_right_hdr = NULL;
-                scratch_free(key_vecs_hdr);
+                join_keys_drop(key_vecs_hdr, key_slots);
                 return ray_error("oom", NULL);
             }
 
@@ -1912,7 +2007,7 @@ chained_ht_fallback:;
     _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr, ht_cap * sizeof(uint32_t));
     if (!ht_next || !ht_heads) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
-        scratch_free(key_vecs_hdr);
+        join_keys_drop(key_vecs_hdr, key_slots);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY = 0xFFFFFFFF */
@@ -1989,7 +2084,7 @@ chained_ht_fallback:;
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
     if (!morsel_counts) {
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
-        scratch_free(key_vecs_hdr);
+        join_keys_drop(key_vecs_hdr, key_slots);
         for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
         if (asp_sel) ray_release(asp_sel);
         return ray_error("oom", NULL);
@@ -2324,7 +2419,8 @@ join_gather:;
                 ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
                 if (!lk || lk->base.opcode != OP_SCAN || lk->sym != name_id)
                     continue;
-                r_key_col = r_key_vecs[k];
+                /* the table's own column: output cells keep their domain */
+                r_key_col = join_keys_orig(key_vecs, key_slots, 1)[k];
                 break;
             }
             if (!r_key_col) continue;
@@ -2371,7 +2467,7 @@ join_cleanup:
     scratch_free(r_idx_hdr);
     if (counts_hdr) scratch_free(counts_hdr);
     scratch_free(matched_right_hdr);
-    scratch_free(key_vecs_hdr);
+    join_keys_drop(key_vecs_hdr, key_slots);
     for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
     if (asp_sel) ray_release(asp_sel);
 
@@ -2557,12 +2653,13 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
      * a separate cap on a different call path) — carve instead of a fixed
      * [16] or a stack VLA (both wrong for an unbounded key count).  One
      * zero-inited carve holds both l_key_vecs and r_key_vecs. */
+    size_t key_slots = n_keys ? n_keys : 1;
     ray_t* key_vecs_hdr = NULL;
     ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
-                            (size_t)(n_keys ? n_keys : 1) * 2 * sizeof(ray_t*));
+                                               key_slots * JOIN_KEYS_ARRAYS * sizeof(ray_t*));
     if (!key_vecs) return ray_error("oom", NULL);
     ray_t** l_key_vecs = key_vecs;
-    ray_t** r_key_vecs = key_vecs + n_keys;
+    ray_t** r_key_vecs = key_vecs + key_slots;
 
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]);
@@ -2571,7 +2668,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             l_key_vecs[k] = ray_table_col(left_table, lk->sym);
             if (l_key_vecs[k] && RAY_IS_ERR(l_key_vecs[k])) {
                 ray_t* e = l_key_vecs[k];
-                scratch_free(key_vecs_hdr);
+                join_keys_drop(key_vecs_hdr, key_slots);
                 return e;
             }
         }
@@ -2579,7 +2676,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             r_key_vecs[k] = ray_table_col(right_table, rk->sym);
             if (r_key_vecs[k] && RAY_IS_ERR(r_key_vecs[k])) {
                 ray_t* e = r_key_vecs[k];
-                scratch_free(key_vecs_hdr);
+                join_keys_drop(key_vecs_hdr, key_slots);
                 return e;
             }
         }
@@ -2587,10 +2684,10 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             r_key_vecs[k] = rk->literal;
     }
 
-    /* Sequential LUT warm-up BEFORE the parallel build dispatch. */
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
-        scratch_free(key_vecs_hdr);
-        return ray_error("oom", "join: sym domain runtime-id LUT build failed");
+    /* Cross-domain SYM keys aligned sequentially, BEFORE the build dispatch. */
+    {
+        ray_t* e = join_align_sym_keys(key_vecs, key_slots, n_keys);
+        if (e) { join_keys_drop(key_vecs_hdr, key_slots); return e; }
     }
 
     /* #597: one proof for the whole anti-join — see join_keys_nullfree. */
@@ -2615,7 +2712,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     if (!ht_next || !ht_heads) {
         if (ht_next_hdr) scratch_free(ht_next_hdr);
         if (ht_heads_hdr) scratch_free(ht_heads_hdr);
-        scratch_free(key_vecs_hdr);
+        join_keys_drop(key_vecs_hdr, key_slots);
         return ray_error("oom", NULL);
     }
     memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));  /* JHT_EMPTY */
@@ -2642,7 +2739,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     if (pool_cancelled(pool)) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
-        scratch_free(key_vecs_hdr);
+        join_keys_drop(key_vecs_hdr, key_slots);
         return ray_error("cancel", NULL);
     }
 
@@ -2653,7 +2750,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
     if (!out_idx) {
         scratch_free(ht_next_hdr);
         scratch_free(ht_heads_hdr);
-        scratch_free(key_vecs_hdr);
+        join_keys_drop(key_vecs_hdr, key_slots);
         return ray_error("oom", NULL);
     }
 
@@ -2667,7 +2764,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
             scratch_free(out_idx_hdr);
             scratch_free(ht_next_hdr);
             scratch_free(ht_heads_hdr);
-            scratch_free(key_vecs_hdr);
+            join_keys_drop(key_vecs_hdr, key_slots);
             return ray_error("cancel", NULL);
         }
         uint64_t h = hash_row_keys(l_key_vecs, n_keys, l, keys_kf);
@@ -2686,7 +2783,7 @@ static ray_t* exec_antijoin_flat(ray_graph_t* g, ray_op_t* op,
 
     scratch_free(ht_next_hdr);
     scratch_free(ht_heads_hdr);
-    scratch_free(key_vecs_hdr);
+    join_keys_drop(key_vecs_hdr, key_slots);
 
     /* Gather: build result table with only left columns.  The column
      * shape (schema) is emitted UNCONDITIONALLY, even when out_count == 0
@@ -2871,18 +2968,19 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
         return mask;
     }
 
+    size_t key_slots = n_keys ? n_keys : 1;
     ray_t* key_vecs_hdr = NULL;
     ray_t** key_vecs = (ray_t**)scratch_calloc(&key_vecs_hdr,
-                                               (size_t)n_keys * 2 * sizeof(ray_t*));
+                                               key_slots * JOIN_KEYS_ARRAYS * sizeof(ray_t*));
     if (!key_vecs) { ray_release(mask); return ray_error("oom", NULL); }
     ray_t** l_key_vecs = key_vecs;
-    ray_t** r_key_vecs = key_vecs + n_keys;
+    ray_t** r_key_vecs = key_vecs + key_slots;
     for (uint32_t k = 0; k < n_keys; k++) {
         ray_t* lc = ray_table_col(left_table, key_names[k]);
         ray_t* rc = ray_table_col(right_table, key_names[k]);
         ray_t* e = (lc && RAY_IS_ERR(lc)) ? lc : (rc && RAY_IS_ERR(rc)) ? rc : NULL;
         if (e || !lc || !rc) {
-            scratch_free(key_vecs_hdr); ray_release(mask);
+            join_keys_drop(key_vecs_hdr, key_slots); ray_release(mask);
             return e ? e : ray_error("domain", "mask: key column not found");
         }
         l_key_vecs[k] = lc;
@@ -2895,10 +2993,7 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
     join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
     uint32_t n_pf = 0;
 
-    if (!join_warm_sym_luts(l_key_vecs, r_key_vecs, n_keys)) {
-        err = ray_error("oom", "join: sym domain runtime-id LUT build failed");
-        goto out;
-    }
+    if ((err = join_align_sym_keys(key_vecs, key_slots, n_keys)) != NULL) goto out;
     bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
     uint8_t keys_kf = join_key_flags(l_key_vecs, r_key_vecs, n_keys, keys_nullfree);
     if (keys_nullfree) ray_join_nullfree_keys++;
@@ -2953,7 +3048,7 @@ out:
     for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
     if (ht_next_hdr) scratch_free(ht_next_hdr);
     if (ht_heads_hdr) scratch_free(ht_heads_hdr);
-    scratch_free(key_vecs_hdr);
+    join_keys_drop(key_vecs_hdr, key_slots);
     if (err) { ray_release(mask); return err; }
     return mask;
 }
