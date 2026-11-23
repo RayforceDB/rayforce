@@ -487,6 +487,10 @@ static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
             double x = ray_is_atom(value) ? if_atom_f64(value)
                      : if_vec_f64(value, src);
             ((double*)ray_data(result))[dst] = x;
+        } else if (out_type == RAY_F32) {
+            double x = ray_is_atom(value) ? if_atom_f64(value)
+                     : if_vec_f64(value, src);
+            ((float*)ray_data(result))[dst] = (float)x;
         } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP ||
                    out_type == RAY_TIMESPAN) {
             int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
@@ -1211,6 +1215,21 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             double tv = c->then_scalar ? c->t_f64 : if_vec_f64(c->then_v, i);
             double ev = c->else_scalar ? c->e_f64 : if_vec_f64(c->else_v, i);
             dst[i] = cond_p[i] ? tv : ev;
+        }
+        break; }
+    case RAY_F32: {
+        /* Two F32 arms (or an F32 arm beside a scalar) keep F32 cells (#1366):
+         * there was no F32 lane, so the result was left as zeros. */
+        if ((c->then_scalar || c->then_v->type == RAY_F32) &&
+            (c->else_scalar || c->else_v->type == RAY_F32)) {
+            IF_FILL_SAME(float, (float)c->t_f64, (float)c->e_f64);
+            break;
+        }
+        float* dst = (float*)c->dst;
+        for (int64_t i = i0; i < i1; i++) {
+            double tv = c->then_scalar ? c->t_f64 : if_vec_f64(c->then_v, i);
+            double ev = c->else_scalar ? c->e_f64 : if_vec_f64(c->else_v, i);
+            dst[i] = (float)(cond_p[i] ? tv : ev);
         }
         break; }
     case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: {
