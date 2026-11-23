@@ -173,7 +173,7 @@
 (count (distinct [true false true])) -- 2
 ;; distinct on numeric typed vecs is sorted (distinct_sort_cmp), so
 ;; even though true comes first in input, false sorts first.
-(distinct [true false true]) -- [false true]
+(distinct [true false true]) -- [true false]
 ;; DATE distinct (line 79 hash, line 262 sort)
 (count (distinct [2025.01.01 2025.01.02 2025.01.01 2025.01.03])) -- 3
 ;; TIME distinct (line 80 hash, line 262 sort)
@@ -257,28 +257,28 @@
 
 ;; I32 (line 262): distinct on I32 vec with multiple unique values
 (count (distinct [3i 1i 2i 1i 3i])) -- 3
-;; Verify sorted output
-(at (distinct [3i 1i 2i]) 0) -- 1i
+;; first-occurrence order, every type (#1477)
+(at (distinct [3i 1i 2i]) 0) -- 3i
 
-;; DATE (line 262): distinct on date vec with sorted output
+;; DATE (line 262): distinct on date vec, first-occurrence order
 (count (distinct [2025.01.03 2025.01.01 2025.01.02 2025.01.01])) -- 3
-(at (distinct [2025.01.03 2025.01.01 2025.01.02]) 0) -- 2025.01.01
+(at (distinct [2025.01.03 2025.01.01 2025.01.02]) 0) -- 2025.01.03
 
-;; TIME (line 262): distinct on time vec with sorted output
+;; TIME (line 262): distinct on time vec, first-occurrence order
 (count (distinct [12:00:00.000 10:00:00.000 11:00:00.000 10:00:00.000])) -- 3
-(at (distinct [12:00:00.000 10:00:00.000 11:00:00.000]) 0) -- 10:00:00.000
+(at (distinct [12:00:00.000 10:00:00.000 11:00:00.000]) 0) -- 12:00:00.000
 
 ;; I16 (line 267): distinct on I16 vec
 (count (distinct [3h 1h 2h 1h 3h])) -- 3
-(at (distinct [3h 1h 2h]) 0) -- 1h
+(at (distinct [3h 1h 2h]) 0) -- 3h
 
 ;; U8/BOOL (line 272): distinct on U8 vec
 (count (distinct [0x03 0x01 0x02 0x01])) -- 3
-(at (distinct [0x03 0x01 0x02 0x01]) 0) -- 0x01
+(at (distinct [0x03 0x01 0x02 0x01]) 0) -- 0x03
 
 ;; F64 (line 277): distinct on F64 vec
 (count (distinct [3.0 1.0 2.0 1.0])) -- 3
-(at (distinct [3.0 1.0 2.0]) 0) -- 1.0
+(at (distinct [3.0 1.0 2.0]) 0) -- 3.0
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; Section 12: hashset_insert null paths (lines 308-329)

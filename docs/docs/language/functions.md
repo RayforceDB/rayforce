@@ -185,7 +185,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `distinct` | unary | Remove duplicates, in the order the values first appear, for every type | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
 | `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |

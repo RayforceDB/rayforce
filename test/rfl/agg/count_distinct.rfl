@@ -104,7 +104,7 @@
 (set Tcdpg7 (table [g v] (list (% (til Ncdpg) 51000) (% (til Ncdpg) 7))))
 (set Rcdpg7 (select {n: (count (distinct v)) from: Tcdpg7 by: g}))
 (count Rcdpg7) -- 51000
-(distinct (at Rcdpg7 'n)) -- [3 4]
+(distinct (at Rcdpg7 'n)) -- [4 3]
 (min (at Rcdpg7 'n)) -- 3
 (max (at Rcdpg7 'n)) -- 4
 ;; 47000 groups with 4 distinct + 4000 groups with 3 distinct.

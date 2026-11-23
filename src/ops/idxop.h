@@ -961,9 +961,9 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col);
  * Walk the sort permutation once to collect the first-occurrence row id of
  * each distinct value (the first element of each equal-value run, which is
  * the minimum row id of the run because the sort is stable with iota
- * tie-breaking).  Returns an OWNED I64 vector of those row ids, sorted
- * ascending by VALUE (matching distinct_vec_eager's qsort-of-indices
- * contract), and sets *out_count to the number of distinct values.
+ * tie-breaking).  Returns an OWNED I64 vector of those row ids in VALUE
+ * order (the permutation's), and sets *out_count to the number of distinct
+ * values.  distinct_vec_eager puts them in row order (#1477).
  *
  * Returns NULL if not eligible (no sort index, stale, null-bearing) or on
  * OOM.  The caller is responsible for releasing the returned vector. */

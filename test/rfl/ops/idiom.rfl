@@ -7,7 +7,7 @@
 ;; with nulls (null is a distinct value; count includes it)
 (count (distinct [1 0Nl 2 0Nl 1])) -- 3
 ;; value-check: numeric distinct sorts; null is least value, kept once
-(distinct [1 0Nl 2 0Nl 1]) -- [0Nl 1 2]
+(distinct [1 0Nl 2 0Nl 1]) -- [1 0Nl 2]
 
 ;; empty
 (count (distinct (as 'I64 ()))) -- 0
