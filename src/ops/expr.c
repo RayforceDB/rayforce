@@ -5421,16 +5421,15 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 
     /* Even non-null operands can wrap to the output-width null payload. Reduce while
      * storing, without a second column pass or a per-row metadata update. */
-#define BR_WRAP(T, L, OP, R) do {                                           \
+#define BR_WRAP(T, TYPE, NIL, L, OP, R) do {                                           \
         int any = 0;                                                        \
         for (int64_t i = 0; i < n; i++) {                                   \
             T v = (T)((uint64_t)(L) OP (uint64_t)(R));                      \
             odst[i] = v;                                                    \
-            any |= (sizeof(T) == 2 && out_type == RAY_I16 && v == NULL_I16) || \
-                   (sizeof(T) == 4 && out_type == RAY_I32 && v == NULL_I32) || \
-                   (sizeof(T) == 8 && out_type == RAY_I64 && v == NULL_I64);   \
+            any |= (v == (NIL));                                            \
         }                                                                   \
-        if (any) __atomic_fetch_or(&result->attrs, RAY_ATTR_HAS_NULLS,      \
+        if (out_type == (TYPE) && any)                                       \
+            __atomic_fetch_or(&result->attrs, RAY_ATTR_HAS_NULLS,           \
                                    __ATOMIC_RELAXED);                       \
     } while (0)
 
@@ -5458,22 +5457,22 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         int64_t cv = r_i64;
         uint16_t opc = op->opcode;
 
-        #define BR_AR_FAST(T) do {                                          \
+        #define BR_AR_FAST(T, TYPE, NIL) do {                                          \
             const T* d = (const T*)lbase;                                   \
             T* odst = (T*)dst;                                              \
             T cvt = (T)cv;                                                  \
             switch (opc) {                                                  \
-            case OP_ADD:  BR_WRAP(T, d[i], +, cvt); break; \
-            case OP_SUB:  BR_WRAP(T, d[i], -, cvt); break; \
-            case OP_MUL:  BR_WRAP(T, d[i], *, cvt); break; \
+            case OP_ADD:  BR_WRAP(T, TYPE, NIL, d[i], +, cvt); break; \
+            case OP_SUB:  BR_WRAP(T, TYPE, NIL, d[i], -, cvt); break; \
+            case OP_MUL:  BR_WRAP(T, TYPE, NIL, d[i], *, cvt); break; \
             case OP_MIN2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] < cvt ? d[i] : cvt; break; \
             case OP_MAX2: for (int64_t i = 0; i < n; i++) odst[i] = d[i] > cvt ? d[i] : cvt; break; \
             }                                                               \
         } while (0)
 
-        if (l_esz == 8) { BR_AR_FAST(int64_t); return; }
-        if (l_esz == 4) { BR_AR_FAST(int32_t); return; }
-        if (l_esz == 2) { BR_AR_FAST(int16_t); return; }
+        if (l_esz == 8) { BR_AR_FAST(int64_t, RAY_I64, NULL_I64); return; }
+        if (l_esz == 4) { BR_AR_FAST(int32_t, RAY_I32, NULL_I32); return; }
+        if (l_esz == 2) { BR_AR_FAST(int16_t, RAY_I16, NULL_I16); return; }
         #undef BR_AR_FAST
     }
 
@@ -5560,6 +5559,29 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         else if (rhs->type == RAY_I16) rp_i16 = (int16_t*)rbase;
         else if (rhs->type == RAY_BOOL || rhs->type == RAY_U8) rp_bool = (uint8_t*)rbase;
     }
+
+    /* Exact-width add/sub/mul only. Mixed types still go through LV_INT /
+     * RV_INT; vector/scalar already has its own path above. Use the resolved
+     * pointers so a slice and a worker subrange keep their original offsets. */
+#define BR_NARROW_OPS(T, TYPE, NIL, L, R) do {                              \
+        T* odst = (T*)dst;                                                  \
+        switch (op->opcode) {                                               \
+        case OP_ADD: BR_WRAP(T, TYPE, NIL, L, +, R); goto done;             \
+        case OP_SUB: BR_WRAP(T, TYPE, NIL, L, -, R); goto done;             \
+        case OP_MUL: BR_WRAP(T, TYPE, NIL, L, *, R); goto done;             \
+        }                                                                   \
+    } while (0)
+    if (!r_scalar && rhs->type == out_type &&
+        (lhs->type == out_type || lhs->type == -out_type)) {
+        if (out_type == RAY_I16) {
+            if (l_scalar) BR_NARROW_OPS(int16_t, RAY_I16, NULL_I16, l_i64, rp_i16[i]);
+            else          BR_NARROW_OPS(int16_t, RAY_I16, NULL_I16, lp_i16[i], rp_i16[i]);
+        } else if (out_type == RAY_I32) {
+            if (l_scalar) BR_NARROW_OPS(int32_t, RAY_I32, NULL_I32, l_i64, rp_i32[i]);
+            else          BR_NARROW_OPS(int32_t, RAY_I32, NULL_I32, lp_i32[i], rp_i32[i]);
+        }
+    }
+#undef BR_NARROW_OPS
 
     /* Resolve the lhs/rhs reader to a single decision made once before the loop.
      * Each of these yields a double for the given index. */
@@ -5689,8 +5711,8 @@ static void binary_range(ray_op_t* op, int8_t out_type,
         if (out_type == RAY_I64 && rhs->type == RAY_I64 && !r_scalar &&
             (lhs->type == RAY_I64 || lhs->type == -RAY_I64)) {
 #define BR_I64(OP) do {                                                     \
-                if (l_scalar) BR_WRAP(int64_t, l_i64, OP, rp_i64[i]);       \
-                else BR_WRAP(int64_t, lp_i64[i], OP, rp_i64[i]);            \
+                if (l_scalar) BR_WRAP(int64_t, RAY_I64, NULL_I64, l_i64, OP, rp_i64[i]);       \
+                else BR_WRAP(int64_t, RAY_I64, NULL_I64, lp_i64[i], OP, rp_i64[i]);            \
             } while (0)
             switch (op->opcode) {
                 case OP_ADD: BR_I64(+); return;
@@ -5700,9 +5722,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #undef BR_I64
         }
         switch (op->opcode) {
-            case OP_ADD: BR_WRAP(int64_t, LV_INT(i), +, RV_INT(i)); break;
-            case OP_SUB: BR_WRAP(int64_t, LV_INT(i), -, RV_INT(i)); break;
-            case OP_MUL: BR_WRAP(int64_t, LV_INT(i), *, RV_INT(i)); break;
+            case OP_ADD: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int64_t, RAY_I64, NULL_I64, LV_INT(i), *, RV_INT(i)); break;
             case OP_DIV: for(int64_t i=0;i<n;i++){int64_t li=LV_INT(i),ri=RV_INT(i),q=0;odst[i]=floor_idiv_i64_checked(li,ri,&q)?q:0;}break;
             case OP_IDIV:
                 if (rp_i16) {
@@ -5771,9 +5793,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_I32 || out_type == RAY_DATE || out_type == RAY_TIME) {
         int32_t* odst = (int32_t*)dst;
         switch (op->opcode) {
-            case OP_ADD: BR_WRAP(int32_t, LV_INT(i), +, RV_INT(i)); break;
-            case OP_SUB: BR_WRAP(int32_t, LV_INT(i), -, RV_INT(i)); break;
-            case OP_MUL: BR_WRAP(int32_t, LV_INT(i), *, RV_INT(i)); break;
+            case OP_ADD: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int32_t, RAY_I32, NULL_I32, LV_INT(i), *, RV_INT(i)); break;
             /* OP_DIV omitted — ray_binop hard-codes F64 for OP_DIV, so
              * narrow-output OP_DIV is unreachable through any caller. */
             case OP_IDIV:
@@ -5793,9 +5815,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
     } else if (out_type == RAY_I16) {
         int16_t* odst = (int16_t*)dst;
         switch (op->opcode) {
-            case OP_ADD: BR_WRAP(int16_t, LV_INT(i), +, RV_INT(i)); break;
-            case OP_SUB: BR_WRAP(int16_t, LV_INT(i), -, RV_INT(i)); break;
-            case OP_MUL: BR_WRAP(int16_t, LV_INT(i), *, RV_INT(i)); break;
+            case OP_ADD: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), +, RV_INT(i)); break;
+            case OP_SUB: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), -, RV_INT(i)); break;
+            case OP_MUL: BR_WRAP(int16_t, RAY_I16, NULL_I16, LV_INT(i), *, RV_INT(i)); break;
             /* OP_DIV omitted — unreachable, see I32 arm. */
             case OP_IDIV:
                 if (src_is_i64_all && !idiv_i64_small) {
