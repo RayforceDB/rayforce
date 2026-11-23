@@ -660,7 +660,8 @@ typedef struct ray_graph {
     ray_t*          memo_table;
 
     /* Set when an `if` refuses its operands (a text result with a numeric
-     * branch, a condition with no truth value).  Such an error is the
+     * branch, a condition with no truth value, arms of two temporal
+     * types at compile time).  Such an error is the
      * expression's answer: a caller with an interpreter fallback must not
      * retry, since the interpreter's `if` tests one truth value and would
      * write the then-branch to every row. */
