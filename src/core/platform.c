@@ -76,6 +76,7 @@ uint64_t ray_vm_willneed_bytes(void) {
 #endif
 #endif
 #include "mem/sys.h"
+#include "mem/heap.h"   /* ray_heap_abandon: thread_trampoline */
 
 /* --------------------------------------------------------------------------
  * Virtual memory
@@ -746,6 +747,12 @@ static void* thread_trampoline(void* raw) {
     sigaddset(&urg, SIGURG);
     pthread_sigmask(SIG_BLOCK, &urg, NULL);
     ctx.fn(ctx.arg);
+    /* A heap this thread brought up (its first ray_alloc) stays registered
+     * after it ends, pools and all: hand it on as an idle heap for the next
+     * thread, as a pool worker does, rather than leave it to no owner and
+     * counted against the anonymous watermark for the rest of the process.
+     * A no-op when the thread never allocated, or already handed it on. */
+    ray_heap_abandon();
     return NULL;
 }
 
@@ -1545,6 +1552,7 @@ static DWORD WINAPI thread_trampoline(LPVOID raw) {
     ray_thread_trampoline_t ctx = *(ray_thread_trampoline_t*)raw;
     HeapFree(GetProcessHeap(), 0, raw);
     ctx.fn(ctx.arg);
+    ray_heap_abandon();   /* as on POSIX: the thread's heap goes idle, not orphaned */
     return 0;
 }
 
