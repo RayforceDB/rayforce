@@ -268,6 +268,8 @@ The example assumes `account` and `qty` are I64 columns. A declined proof change
 
 A predicate on a parted integer or temporal data column prunes as well, by the partitions' statistics: the non-null minimum and maximum of a column saved with `compress: true` (its chunk directory) or of a plain column of 65,536 rows or more (its chunk zone). A partition is dropped only when they decide the comparison false for every row, by the rule row-level zone skipping uses, so nulls are kept and a partition without statistics is kept. `(> time 2024.01.16D12:00:00.000)` over a date-partitioned table thus reads the partitions whose `time` range reaches past the literal and no other. Partition directories may also be named `YYYY.MM.DD.HH.MM.SS`, which gives a `timestamp` partition key. See [`.db.parted.get`](../namespaces/db.md#db-parted-get).
 
+A parted table whose partition-key column was dropped, as `(xcols P (drop (cols P) 1))` does, still narrows by its data columns' statistics, as the table with its key does.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.
