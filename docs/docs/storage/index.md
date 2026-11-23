@@ -274,6 +274,8 @@ A parted table whose partition-key column was dropped, as `(xcols P (drop (cols 
 
 A date literal compared with a timestamp column or a timestamp partition key narrows as the timestamp at the start of its day does, the instant the filter compares it as: `(>= time 2024.01.16)` reads what `(>= time 2024.01.16D00:00:00.000)` reads.
 
+A `by:` of `(xbar column bucket)` with a constant atom bucket, written or bound to a name, keeps the narrowing the `where:` gives, as a `by:` of a plain column does; so does such an `xbar` as an output.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.

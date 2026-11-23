@@ -5699,6 +5699,32 @@ static test_result_t test_eval_part_skip_date_literal(void) {
     return part_skip_run("date_lit", cases, sizeof cases / sizeof cases[0]);
 }
 
+/* A by: of xbar over a column skips what a by: of a plain column skips
+ * (#1499): a bare key and a by-dict, a bucket bound to a name, a null row
+ * in a kept partition, the date key, the timestamp key; a bucket that is
+ * an expression is not admitted and skips nothing.  Group order is not
+ * compared: both sides are sorted on every column. */
+static test_result_t test_eval_part_skip_xbar_by(void) {
+    ray_t* w = ray_eval_str("(set B 3600000000000)");
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+#define XS(sel) "(do (set R " sel ") (xasc R (key R)))"
+    static const part_skip_t cases[] = {
+        { XS("(select {c: (count v) by: (xbar ts 3600000000000) from: %s where: (>= ts 2026.01.06D00:00:00.000)})"), false, 1 },
+        { XS("(select {c: (count v) s: (sum v) by: (xbar ts 3600000000000) from: %s where: (< ts 2026.01.06D02:00:00.000)})"), false, 2 },
+        { XS("(select {c: (count v) by: {h: (xbar ts 86400000000000)} from: %s where: (>= date 2026.01.07)})"), false, 2 },
+        { XS("(select {c: (count v) by: (xbar ts B) from: %s where: (>= ts 2026.01.06D00:00:00.000)})"), false, 1 },
+        { XS("(select {c: (count v) by: (xbar v 2) from: %s where: (> v 5)})"), false, 2 },
+        { XS("(select {h: (xbar ts 3600000000000) v: v from: %s where: (>= ts 2026.01.07D00:00:00.000)})"), false, 2 },
+        { XS("(select {c: (count v) by: (xbar v (* 1 2)) from: %s where: (> v 5)})"), false, 0 },
+        { XS("(select {c: (count v) by: (xbar ts 3600000000000) from: %s where: (>= part 2026.01.07D00:00:00.000)})"), true, 2 },
+        { XS("(select {c: (count v) by: (xbar ts 3600000000000) from: %s where: (>= ts 2026.01.07D00:00:00.000)})"), true, 2 },
+    };
+#undef XS
+    return part_skip_run("xbar_by", cases, sizeof cases / sizeof cases[0]);
+}
+
 /* ---- Test: an if answers the same with and without pool workers -------- */
 
 /* With no workers the selected arm of OP_IF (compact each branch's rows,
@@ -14285,6 +14311,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/part_skip_keyless", test_eval_part_skip_keyless, lang_setup, lang_teardown },
     { "lang/eval/part_skip_count_select", test_eval_part_skip_count_select, lang_setup, lang_teardown },
     { "lang/eval/part_skip_date_literal", test_eval_part_skip_date_literal, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_xbar_by", test_eval_part_skip_xbar_by, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
