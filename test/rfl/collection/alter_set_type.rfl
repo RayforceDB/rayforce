@@ -111,6 +111,24 @@ D -- [0Nd 2024.01.02]
 (alter 'G set 0 0N) -- 'G
 (nil? G) -- [true false]
 
+;; a value vector of nulls only, of any type, writes the vector's nulls; one
+;; with a value of another kind is still rejected whole
+(set D [2024.01.01 2024.01.02 2024.01.03])
+(alter 'D set [0 2] [0N 0N]) -- 'D
+D -- [0Nd 2024.01.02 0Nd]
+(set D [2024.01.01 2024.01.02 2024.01.03])
+(alter 'D set [0 2] [7 0N]) !- type
+D -- [2024.01.01 2024.01.02 2024.01.03]
+(set R ['p 'q 'r])
+(alter 'R set [0 2] [0N 0N]) -- 'R
+(nil? R) -- [true false true]
+(set I [1 2 3])
+(alter 'I set [0 2] [0Nd 0Nd]) -- 'I
+(nil? I) -- [true false true]
+(set G (guid 3))
+(alter 'G set [0 2] [0N 0N]) -- 'G
+(nil? G) -- [true false true]
+
 ;; ── a sorted or indexed vector keeps its attributes on a rejected write ─
 (set S (.attr.set 'sorted [1 2 3]))
 (.attr.get S) -- ['sorted]

@@ -1828,8 +1828,8 @@ static int8_t alter_value_kind(int8_t t) {
  * integer into a SYM vector an id that may not exist, an F64 into a SYM
  * vector a cell that crashed the printer (#1513).  A value must be of the
  * vector's kind: a number into a numeric vector (converted by the vector's
- * type, as before), otherwise the vector's own type.  A null of any type
- * writes the vector's null.  A STR vector keeps its own check in
+ * type, as before), otherwise the vector's own type.  A null of any type,
+ * or a value vector of nulls only, writes the vector's null.  A STR vector keeps its own check in
  * alter_store_cell.  Checking up front keeps the vector unchanged on an
  * error, where a failure on a later index would leave the earlier cells
  * written. */
@@ -1849,6 +1849,13 @@ static ray_t* alter_set_check(ray_t* var, ray_t* val, bool pairwise, int64_t nid
     if (!pairwise && RAY_ATOM_IS_NULL(val)) return NULL;
     int8_t et = pairwise ? val->type : (val->type < 0 ? (int8_t)-val->type : val->type);
     if (alter_value_kind(et) == alter_value_kind(vt)) return NULL;
+    /* A value vector whose every cell is null writes the vector's nulls,
+     * as each of its null atoms would. */
+    if (pairwise) {
+        int64_t k = 0;
+        while (k < val->len && ray_vec_is_null(val, k)) k++;
+        if (k == val->len) return NULL;
+    }
     return ray_error("type", "alter set: cannot store %s in a %s vector",
                      ray_type_name(val->type), ray_type_name(vt));
 }
