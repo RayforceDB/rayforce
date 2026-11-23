@@ -10,6 +10,12 @@
 (run (concat (list f) (concat p (list a b)))) -- true
 (run (concat (list (list 0.0)) (concat p (list t)))) -- true
 (run (concat p (list t))) -- true
+;; Below the directory threshold, cover the serial restart at any core count.
+(set p (map (fn [i] (list i)) (% (til 3000) 3)))
+(run (concat p (list a f b))) -- true
+(run (concat (list f) (concat p (list a b)))) -- true
+(run (concat (list (list 0.0)) (concat p (list t)))) -- true
+(run (concat p (list t))) -- true
 ;; Wide-key performance versus a same-shape small-key control.
 (set offset (% (til 100000) 5000))
 (set rows (til 100001))
