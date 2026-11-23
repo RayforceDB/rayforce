@@ -801,12 +801,41 @@ static bool jp_dedup(jp_t* jp, ray_t** keysp, ray_t** valsp, size_t* prep) {
         a = b;
     }
     if (!dup) { ray_free_raw(base); jp->bytes -= need < jp->bytes ? need : jp->bytes; return true; }
+    /* The pair is this parse's alone (it always is: jp_object built it):
+     * compact it in place, so no second pair exists and nothing more is
+     * charged.  A kept key's cell moves down over a dropped one (its pooled
+     * bytes stay where they are), and the values a repeated key replaced
+     * are released.  Position i keeps value tmp[i] >= i, and a move only
+     * writes below i, so no value is read after it was overwritten. */
+    if (ray_atomic_load(&keys->rc) == 1 && ray_atomic_load(&vals->rc) == 1 &&
+        !(keys->attrs & RAY_ATTR_SLICE) && !(vals->attrs & RAY_ATTR_SLICE) &&
+        keys->type == RAY_STR && vals->type == RAY_LIST) {
+        ray_t** items = (ray_t**)ray_data(vals);
+        ray_str_t* cells = (ray_str_t*)ray_data(keys);
+        uint8_t* used = (uint8_t*)idx;              /* idx is no longer needed */
+        memset(used, 0, (size_t)n);
+        for (int64_t i = 0; i < n; i++) if (tmp[i] >= 0) used[tmp[i]] = 1;
+        for (int64_t i = 0; i < n; i++)
+            if (!used[i]) { ray_release(items[i]); items[i] = NULL; }
+        int64_t j = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (tmp[i] < 0) continue;
+            cells[j] = cells[i];
+            items[j] = items[tmp[i]];
+            j++;
+        }
+        keys->len = j;
+        vals->len = j;
+        ray_free_raw(base);
+        jp->bytes -= need < jp->bytes ? need : jp->bytes;
+        return true;
+    }
     /* the new pair: room for n key cells and n value slots (both made at
      * n), and the kept keys' pooled bytes, doubled for the pool's growth
      * as for the keys read */
     size_t kept_bytes = 0;
     for (int64_t i = 0; i < n; i++)
-        if (tmp[i] >= 0) kept_bytes += ks[i].l;
+        if (tmp[i] >= 0 && ks[i].l > RAY_STR_INLINE_MAX) kept_bytes += ks[i].l;
     size_t built = (size_t)n * (16 + sizeof(ray_t*)) + 2 * kept_bytes;
     if (!jp_bytes(jp, built)) { ray_free_raw(base); return false; }
     ray_t* nk = ray_vec_new(RAY_STR, n);
@@ -860,8 +889,9 @@ static ray_t* jp_object(jp_t* jp, bool build) {
         if (build) {
             /* the key's cell and its pooled bytes, each doubled for the
              * growth that copies them (a cell of a string run, jarr_add),
-             * and a slot of the values list */
-            size_t c = 2 * 16 + 2 * kl + JP_SLOT_BYTES;
+             * and a slot of the values list.  A key of up to
+             * RAY_STR_INLINE_MAX bytes lives in its cell: no pooled bytes. */
+            size_t c = 2 * 16 + (kl > RAY_STR_INLINE_MAX ? 2 * kl : 0) + JP_SLOT_BYTES;
             if (!jp_bytes(jp, c)) goto fail;
             pre += c;
             keys = ray_str_vec_append(keys, kp, kl);

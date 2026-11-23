@@ -219,10 +219,18 @@
 (set objts (.mem.ts (try (do (.json.parse obj4k {alloc: 6000000 input: 1000000000}) "parsed") (fn [e] (at e 'code)))))
 (at objts 'result) -- 'limit
 (< (at objts 'peak-live-bytes) 9000000) -- true
-;; within the cap the repeated key still keeps its first place and last value
-(set obj3 (.json.parse (concat "{" (concat (str-join (map k4k [0 1 2 0]) ",") "}")) {alloc: 100000}))
+;; within the cap a repeated long key keeps its first place and its last
+;; value (keys 0, 1, 2 and 0 again, values 10, 11, 12 and 9)
+(set kv4k (fn [i v] (concat "\"" (concat (format "%" i) (concat (str-join (take ["k"] 4000) "") (concat "\":" (format "%" v)))))))
+(set obj3 (.json.parse (concat "{" (concat (str-join (list (kv4k 0 10) (kv4k 1 11) (kv4k 2 12) (kv4k 0 9)) ",") "}")) {alloc: 100000}))
 (count obj3) -- 3
-(count (at (key obj3) 0)) -- 4001
+(map (fn [k] (take k 1)) (key obj3)) -- ["0" "1" "2"]
+(value obj3) -- (list 9 11 12)
+;; a repeated key's pass compacts the keys and values in place, so an
+;; object of many short keys whose real peak fits the default cap parses:
+;; 340,000 keys and one repeat peak at about 51 MB under the 64 MiB default
+(set many (concat "{" (concat (str-join (map (fn [i] (concat "\"k" (concat (format "%" i) "\":0"))) (concat (til 340000) [0])) ",") "}")))
+(count (.json.parse many)) -- 340000
 (.json.parse "[1]" {bogus: 1}) !- domain
 (.json.parse "[1]" 5) !- type
 (.json.get (deep 129) "0") !- limit
