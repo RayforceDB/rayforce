@@ -1,10 +1,10 @@
 ;; @requires: posix
 ;; union-all concatenated the columns of two parted tables.  A parted column has
 ;; one segment per partition and no elements of its own, so the "column" it built
-;; had no segments and the process crashed when the table was freed.  The error
-;; names the column's type too: ray_type_name had no name for a parted column
-;; or for the virtual partition key, and printed "?" (concat of a parted table
-;; with itself said "cannot concatenate ? and ?").
+;; had no segments and the process crashed when the table was freed.  union-all
+;; now reads a parted table into memory first.  concat of the columns themselves is
+;; refused, naming the types: ray_type_name had no name for a parted column or for
+;; the virtual partition key, and printed "?".
 
 (.sys.exec "rm -rf /tmp/rfl_parted_concat")
 (set Tp (table [a b] (list [1 2 3] [1.0 2.0 3.0])))
@@ -13,11 +13,20 @@
 (set PT (.db.parted.get "/tmp/rfl_parted_concat/" 't))
 
 (count PT) -- 6
-(at (try (union-all PT PT) (fn [e] e)) 'code) -- 'type
-(first (split (at (try (union-all PT PT) (fn [e] e)) 'msg) "; usage:")) -- "union-all: a parted table cannot be concatenated as it is; read it into memory first, (table (key t) (map (fn [c] (at t c)) (key t)))"
 
-;; the recipe the message gives works, and the copy can be concatenated
+;; the owner decided (#1389): two parted tables are read into memory and concatenated,
+;; the result is a plain table with every partition's rows, the partition key included
+(count (union-all PT PT)) -- 12
+(type (union-all PT PT)) -- 'TABLE
+(key (union-all PT PT)) -- (key PT)
+(sum (at (union-all PT PT) 'a)) -- 24
+(sum (at (union-all PT PT) 'b)) -- 24.0
+(count (distinct (at (union-all PT PT) 'date))) -- 2
 (set MT (table (key PT) (map (fn [c] (at PT c)) (key PT))))
+(count (union-all PT MT)) -- 12
+(count (union-all MT PT)) -- 12
+(count (union-all PT (take MT 2))) -- 8
+;; the copy read into memory by hand gives the same answer
 (count (union-all MT MT)) -- 12
 
 ;; the same operations on the table read into memory still work
