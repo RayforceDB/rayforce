@@ -10126,6 +10126,56 @@ static bool group_materialize_prod_slots(agg_prod_t* prod, ray_t** agg_vecs,
 
 /* ---- Scalar aggregate (n_keys==0): one flat scan, no GID, no hash ---- */
 typedef struct scalar_ctx_s scalar_ctx_t;
+/* Keep the operations, not just their composed coefficients: each intermediate
+ * I64 result can create a null that every subsequent operation must retain. */
+#define SC_SELECTED_STEPS 4
+typedef struct {
+    uint64_t arg[SC_SELECTED_STEPS];
+    uint16_t op[SC_SELECTED_STEPS];
+    uint8_t n;
+} sc_selected_t;
+
+static ray_t* sc_selected_plan(ray_graph_t* g, ray_t* tbl, ray_op_t* node,
+                               int64_t rows, sc_selected_t* p, ray_t** err) {
+    sc_selected_t plan = {0};
+    while (node && node->arity == 2 && node->out_type == RAY_I64 &&
+           (node->opcode == OP_ADD || node->opcode == OP_SUB || node->opcode == OP_MUL)) {
+        if (plan.n == SC_SELECTED_STEPS) return NULL;
+        ray_op_t* x = op_child(g, node, 0);
+        ray_op_t* lit = op_child(g, node, 1);
+        if (x && x->opcode == OP_CONST && node->opcode != OP_SUB) {
+            ray_op_t* tmp = x; x = lit; lit = tmp;
+        }
+        if (!lit || lit->opcode != OP_CONST) return NULL;
+        ray_op_ext_t* l = find_ext(g, lit->id);
+        if (!l || !l->literal || l->literal->type != -RAY_I64 || RAY_ATOM_IS_NULL(l->literal)) return NULL;
+        plan.op[plan.n] = node->opcode;
+        plan.arg[plan.n++] = (uint64_t)l->literal->i64;
+        node = x;
+    }
+    if (!plan.n || !node || node->opcode != OP_SCAN) return NULL;
+    ray_op_ext_t* b = find_ext(g, node->id);
+    if (!b) return NULL;
+    uint16_t stored_id;
+    memcpy(&stored_id, b->base.pad, sizeof(stored_id));
+    if (stored_id || ray_col_bind_declines(tbl, b->sym)) return NULL;
+    ray_col_src_t* src = ray_graph_bind_col(g, tbl, b->sym, err);
+    if (!src || src->parted || src->type != RAY_I64 || src->len != rows) return NULL;
+    ray_t* v = ray_col_src_ready(src);
+    if (!v || v->type != RAY_I64) return NULL;
+    *p = plan;
+    return v;
+}
+
+static inline uint64_t sc_selected_value(const sc_selected_t* p, uint64_t x) {
+    for (unsigned i = p->n; i && x != (uint64_t)NULL_I64;) {
+        --i;
+        uint64_t k = p->arg[i];
+        x = p->op[i] == OP_ADD ? x + k : p->op[i] == OP_SUB ? x - k : x * k;
+    }
+    return x;
+}
+
 /* A range kernel: rows [start, end) into the context's current chunk
  * accumulator (c->acc); worker_id is the walk's worker (decode scratch). */
 typedef void (*scalar_range_fn_t)(void* ctx, uint32_t worker_id, int64_t start, int64_t end);
@@ -10140,6 +10190,7 @@ struct scalar_ctx_s {
     const ray_sym_domain_raw_t* agg_raw;  /* strlen-on-SYM: pinned vocabulary per agg (agg_raw_ok) */
     const uint8_t* agg_raw_ok;
     uint16_t*      agg_ops;
+    const sc_selected_t* selected;
     agg_linear_t*  agg_linear;
     agg_prod_t*    agg_prod;     /* fused SUM/AVG(a*b) slots (may be NULL) */
     int64_t*       prod_skipped; /* per agg: overflowed products skipped
@@ -11000,6 +11051,20 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
                               int64_t start, int64_t n, const uint16_t* idx) {
     uint16_t op = c->agg_ops[a];
     if (op == OP_COUNT) return true;            /* count[0] is the caller's */
+    if (c->selected && c->selected[a].n) {
+#ifdef DEBUG
+        atomic_fetch_add_explicit(&ray_narrow_sum_routes[NARROW_SUM_SELECTED], 1, memory_order_relaxed);
+#endif
+        const int64_t* data = c->agg_ptrs[a];
+        for (int64_t i = 0; i < n; ++i) {
+            int64_t v = (int64_t)sc_selected_value(&c->selected[a], (uint64_t)data[SC_ROW(i) - c->row_base]);
+            if (v == NULL_I64) continue;
+            if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, v);
+            else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, v);
+            ++acc->nn_count[a];
+        }
+        return true;
+    }
     if (c->agg_linear && c->agg_linear[a].enabled && (op == OP_SUM || op == OP_AVG)) {
         const agg_linear_t* lin = &c->agg_linear[a];   /* null-free terms */
         int8_t t0 = lin->term_types[0];
@@ -17083,6 +17148,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * (agg_linear_t.pre_only, #1287). */
     bool sc_lone = n_keys == 0 && nrows > 0 && n_aggs == 1 && !match_idx && !rowsel;
 
+    sc_selected_t selected[2] = {0};
+    bool use_selected = sc_route && rowsel && !match_idx && n_aggs <= 2;
+    for (uint32_t a = 0; use_selected && a < n_aggs; ++a)
+        if (ext->agg_ops[a] != OP_SUM && ext->agg_ops[a] != OP_AVG && ext->agg_ops[a] != OP_COUNT) use_selected = false;
+    bool has_selected = false;
     affine_bounds_t bounds = {0};
     bool pair = sc_route && !match_idx && !rowsel && n_aggs == 2 &&
                 ((ext->agg_ops[0] == OP_SUM && ext->agg_ops[1] == OP_AVG) ||
@@ -17094,6 +17164,11 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
 
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
+        if (use_selected && (agg_kind == OP_SUM || agg_kind == OP_AVG)) {
+            agg_vecs[a] = sc_selected_plan(g, tbl, agg_input_op, nrows, &selected[a], &rerr);
+            if (rerr) goto resolve_fail;
+            if (agg_vecs[a]) { has_selected = true; continue; }
+        }
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
             try_affine_sumavg_pair(g, tbl, agg_input_op, sc_route, sc_lone,
                                    pair ? &bounds : NULL,
@@ -17437,7 +17512,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * with no fixed cap, so a fixed-width bitmask would silently alias
          * once n_aggs exceeded its bit width. */
         bool     *sc_int_null_has      = (bool*)(agg_types + vla_aggs);
-        bool sc_any_nullable = false;
+        bool sc_any_nullable = has_selected;
         /* Integer AVG divides the exact 128-bit sum: carry high words. */
         bool sc_need_sum128 = false;
         bool sc_has_f64_affine = false;
@@ -17701,7 +17776,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         uint8_t sc_rule[vla_aggs];
         int64_t sc_prod_skipped[vla_aggs];
         memset(sc_prod_skipped, 0, sizeof sc_prod_skipped);
-        bool sc_chunk_route = sc_staged && !match_idx && !has_first_last &&
+        bool sc_chunk_route = !has_selected && sc_staged && !match_idx && !has_first_last &&
                               (!rowsel || ray_rowsel_meta(rowsel)->nrows == nrows);
         for (uint32_t a = 0; a < n_aggs; a++) {
             sc_rule[a] = SC_RULE_NONE;
@@ -17781,7 +17856,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             /* The fallback emit cannot apply an F64 affine bias.  Report
              * the allocation failure instead of returning an I64 sum with
              * the bias silently dropped. */
-            if (sc_has_f64_affine || agg_linear[0].pre_only) {   /* nor a pass's total */
+            if (has_selected || sc_has_f64_affine || agg_linear[0].pre_only) {   /* nor a pass's total */
                 rerr = ray_error("oom", NULL);
                 goto resolve_fail;
             }
@@ -17830,6 +17905,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
 
         scalar_ctx_t sc_ctx = {
+            .selected = has_selected ? selected : NULL,
             .agg_ptrs   = agg_ptrs,
             .agg_types  = agg_types,
             .agg_cols   = agg_vecs,
@@ -17944,7 +18020,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* R-FAIL: a range error (or a cancelled staged dispatch) is the
          * answer; the partial accumulators are discarded. */
         ray_t* sc_err = sc_staged ? ray_scan_fail_finish(&sc_fail, sc_par ? sc_pool : NULL) : NULL;
-        if (!sc_err && sc_par && pool_cancelled(sc_pool)) sc_err = ray_error("cancel", NULL);
+        if (!sc_err && (sc_par ? pool_cancelled(sc_pool) : has_selected && ray_interrupted())) sc_err = ray_error("cancel", NULL);
         if (sc_err) {
             scratch_free(sc_hdr);
             scratch_free(sc_vla_hdr);

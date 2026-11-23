@@ -2636,6 +2636,61 @@ static test_result_t test_parted_flatten_parallel(void) {
     PASS();
 }
 
+/* Install the WHERE rowsel before arming so dispatch 1 is the reduction,
+ * not predicate construction. Forced scalar grain would disable dispatch. */
+static test_result_t selected_affine_error(bool cancel) {
+    int64_t n = cancel ? 2 * RAY_PARALLEL_THRESHOLD : 53;
+    if (cancel) {
+        ray_pool_destroy();
+        TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
+    }
+    ray_t* tbl = diff_make_i64(n, 7);
+    int64_t expected = 0;
+    ray_t* pred = ray_vec_new(RAY_BOOL, n);
+    pred->len = n;
+    for (int64_t i = 0; i < n; ++i) {
+        ((uint8_t*)ray_data(pred))[i] = i % 3 == 0;
+        if (i % 3 == 0) expected += (i * 7) % 101 - 50 + 1;
+    }
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    ray_release(pred);
+    TEST_ASSERT_TRUE(sel && !RAY_IS_ERR(sel));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ray_graph_t* g = ray_graph_new(tbl);
+        ray_op_t* input[] = { ray_add(g, ray_scan(g, "v"), ray_const_i64(g, 1)) };
+        uint16_t op[] = { OP_SUM };
+        ray_op_t* grp = ray_group(g, NULL, 0, op, input, 1);
+        g->selection = sel;
+        ray_group_test_route(1);
+        if (attempt == 0) {
+            if (cancel) ray_pool_test_cancel_at(1, true);
+            else ray_group_test_fail_scalar_alloc(1);
+        }
+        ray_t* out = exec_group(g, grp, tbl, 0);
+        ray_pool_test_cancel_at(0, false);
+        ray_group_test_fail_scalar_alloc(0);
+        ray_group_test_route(0);
+        g->selection = NULL;
+        ray_graph_free(g);
+        if (attempt == 0) {
+            TEST_ASSERT_TRUE(out && RAY_IS_ERR(out));
+            TEST_ASSERT_TRUE(strcmp(ray_err_code(out), cancel ? "cancel" : "oom") == 0);
+        } else {
+            TEST_ASSERT_TRUE(out && !RAY_IS_ERR(out) && out->type == RAY_TABLE);
+            TEST_ASSERT_EQ_I(ray_table_nrows(out), 1);
+            ray_t* sum = ray_table_get_col_idx(out, 0);
+            TEST_ASSERT_TRUE(sum && sum->type == RAY_I64);
+            TEST_ASSERT_EQ_I(col_read_i64(sum, 0), expected);
+        }
+        ae_drop(out);
+    }
+    ray_rowsel_release(sel);
+    ray_release(tbl);
+    PASS();
+}
+static test_result_t test_selected_affine_oom(void) { return selected_affine_error(false); }
+static test_result_t test_selected_affine_cancel(void) { return selected_affine_error(true); }
+
 /* Cancellation under the dense output stage.  The pool skips every ticket
  * of a cancelled query, so a dispatch the cancel lands before writes none
  * of its per-task output: the occupancy bitmap made of the first-row array,
@@ -2941,6 +2996,8 @@ const test_entry_t agg_engine_entries[] = {
     { "radix_fused_capped_decode_once", test_radix_fused_capped_decode_once, ae_rt_setup, ae_rt_teardown },
     { "radix_fused_capped_below_half", test_radix_fused_capped_below_half, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
+    { "selected_affine_oom", test_selected_affine_oom, ae_rt_setup, ae_rt_teardown },
+    { "selected_affine_cancel", test_selected_affine_cancel, ae_rt_setup, ae_rt_teardown },
     { "dense_partitioned_cancel_at_dispatch", test_dense_partitioned_cancel_at_dispatch, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },

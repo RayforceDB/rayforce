@@ -216,6 +216,27 @@ static test_result_t narrow_sum_run_cases(const narrow_sum_case_t* cases) {
 
 #define NS_Q(sel, eager) "(all (== (at " sel " 's) (enlist " eager ")))"
 
+#ifdef DEBUG
+static test_result_t test_selected_mixed_wide_avg(void) {
+    /* #1463: sparse rows in two morsels. The SUM includes row 1027,
+     * but there v*2 hits the I64 null sentinel before the +7. AVG must
+     * divide the surviving total (12000000000000000023) by three. */
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok(
+        "(set i (til 1030))"
+        "(set v (concat (til 1024) [99 3000000000000000000 99 4611686018427387904 99 3000000000000000000]))"
+        "(set T (table [i v] (list i v)))"));
+    bool ok = false;
+    unsigned routes = narrow_sum_routes_of(
+        "(do (set Q (select {from: T where: (or (== i 1) (and (> i 1023) (== (% i 2) 1)))"
+        " s: (sum i) a: (avg (+ (* v 2) 7))})) true)", &ok);
+    TEST_ASSERT_TRUE(ok);
+    ASSERT_EQ("(identical (at Q 's) (enlist 3082))", "true");
+    ASSERT_EQ("(identical (at Q 'a) (enlist 4.0e18))", "true");
+    TEST_ASSERT_FMT(routes == NSR(NARROW_SUM_SELECTED), "expected selected route only, got 0x%x", routes);
+    PASS();
+}
+#endif
+
 static test_result_t test_narrow_sum_bound_routes(void) {
     static const char* const setup[] = {
         "(set _odd (table [k a b] (list [0 1 2] [1 4611686018427387904 1] [1 9223372036854775807 1])))",
@@ -282,8 +303,8 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         { NS_Q("(select {from: _odd s: (sum (* a 2))})", "4"), REF },
         { NS_Q("(select {from: _odd s: (avg (* a 2))})", "2.0"), REF },
         { NS_Q("(select {from: _odd s: (sum (+ (* a 2) 1))})", "6"), REF },
-        { NS_Q("(select {from: _odd where: (< k 2) s: (avg (+ b 1))})", "2.0"), REF },
-        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (* a 2))})", "2"), REF },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (avg (+ b 1))})", "2.0"), NSR(NARROW_SUM_SELECTED) },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (* a 2))})", "2"), NSR(NARROW_SUM_SELECTED) },
         /* INT64_MAX + 2 wraps to MIN + 1, which is a value, not null. */
         { NS_Q("(select {from: _odd s: (sum (+ b 2))})", "-9223372036854775801"), REF },
         { NS_Q("(select {from: _odd s: (sum (* k 2))})", "6"), SCAN | PRE },
@@ -15204,6 +15225,7 @@ const test_entry_t lang_entries[] = {
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
 #ifdef DEBUG
+    { "lang/query/selected_mixed_wide_avg", test_selected_mixed_wide_avg, lang_setup, lang_teardown },
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
     { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
 #endif

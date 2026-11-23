@@ -1109,6 +1109,7 @@ typedef enum {
     NARROW_SUM_SAMPLE,    /* refused by the sample blocks, no pass */
     NARROW_SUM_REFUSED,
     NARROW_SUM_PRE,       /* a lone SUM / AVG took the pass's total (group.c) */
+    NARROW_SUM_SELECTED,  /* evaluate each operation on selected rows */
     NARROW_SUM__N
 } narrow_sum_route_t;
 extern _Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
