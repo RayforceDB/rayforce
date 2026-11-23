@@ -4761,6 +4761,65 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 }
                 hashset_destroy(&hs);
             }
+        } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen >= 8 && vec->len >= 16) {
+            ray_t** cells = ray_data(vec);
+            ray_t** needles = ray_data(val);
+            /* Start with enough rows to catch cheap hits. Grow the window only
+             * for unresolved needles, and pay for a hash build only after
+             * spending roughly four comparisons per remaining haystack cell. */
+            int64_t prefix = 0, limit = 16, unresolved = vlen;
+            uint64_t compared = 0;
+            /* A dense needle batch can pay for building the whole set. */
+            bool dense = vlen >= vec->len;
+            if (dense) for (int64_t j = 0; j < vlen; j++) out[j] = NULL_I64;
+            while (!dense && unresolved >= 8 && prefix < vec->len) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (prefix != 0 && out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < limit && !atom_eq(cells[i], needles[j])) i++;
+                    compared += (uint64_t)(i - prefix) + (i < limit);
+                    out[j] = i < limit ? i : NULL_I64;
+                    unresolved -= i < limit;
+                }
+                prefix = limit;
+                int64_t left = vec->len - prefix;
+                if (compared / 4 >= (uint64_t)left) break;
+                limit += limit < left ? limit : left;
+            }
+            int64_t suffix = vec->len - prefix;
+            if (unresolved >= 8 && suffix >= 8 && (dense || compared / 4 >= (uint64_t)suffix)) {
+                list_set_t set;
+                int spans = ray_key_spans(vec) | ray_key_spans(val);
+                if (!list_set_init(&set, cells + prefix, suffix, spans)) {
+                    ray_release(result);
+                    return ray_error("oom", NULL);
+                }
+                /* Prepend every cell in reverse to probe in haystack order. */
+                for (int64_t i = suffix; i-- > 0;)
+                    list_set_add(&set, i, ray_key_hash(set.cells[i], spans));
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    ray_t* needle = needles[j];
+                    uint64_t h = ray_key_hash(needle, spans);
+                    for (uint64_t at = h & set.mask; set.head[at] >= 0; at = (at + 1) & set.mask) {
+                        if (set.hash[at] != h) continue;
+                        for (int64_t i = set.head[at]; i >= 0; i = set.next[i]) {
+                            if (atom_eq(set.cells[i], needle)) { out[j] = prefix + i; break; }
+                        }
+                        break;
+                    }
+                    if (out[j] == NULL_I64) any_null = true;
+                }
+                list_set_destroy(&set);
+            } else if (unresolved) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < vec->len && !atom_eq(cells[i], needles[j])) i++;
+                    if (i < vec->len) out[j] = i;
+                    else any_null = true;
+                }
+            }
         } else {
             /* Fallback (LIST/mixed): per-element scalar find into the dense buffer. */
             for (int64_t j = 0; j < vlen; j++) {
