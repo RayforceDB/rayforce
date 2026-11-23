@@ -43,19 +43,14 @@
  * (.json.get s path) walks the same grammar, building only the value at the
  * path and validating the rest of the document without building it.
  */
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L     /* newlocale / uselocale */
-#endif
 #include "io/json.h"
 #include "lang/internal.h"
 #include "lang/readval.h"      /* ray_read_limits_t, ray_read_limits_apply */
 #include "lang/format.h"       /* ray_type_name, ray_fmt */
 #include "ops/internal.h"      /* pool_cancelled, RAY_IS_PARTED */
 #include "ops/hash.h"          /* ray_hash_bytes */
-#include "core/numparse.h"     /* ray_parse_f64 */
-#include "core/platform.h"     /* RAY_OS_WINDOWS */
+#include "core/numparse.h"     /* ray_parse_f64, ray_strtod_c, ray_snprintf_c */
 #include "table/sym.h"
-#include <locale.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1421,63 +1416,13 @@ static bool jw_i64(jw_t* w, int64_t v) {
     return jw_put(w, b, (size_t)k);
 }
 
-/* strtod in the C locale, whatever the host set LC_NUMERIC to: the
- * read-back test of a candidate must parse the '.' the writer wrote. */
-#if defined(RAY_OS_WINDOWS)
-static double jw_strtod_c(const char* s, char** end) {
-    static _locale_t cl;
-    _locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
-    if (!l) {
-        _locale_t n = _create_locale(LC_NUMERIC, "C");
-        _locale_t exp = NULL;
-        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            _free_locale(n);
-            n = exp;
-        }
-        l = n;
-    }
-    return l ? _strtod_l(s, end, l) : strtod(s, end);
-}
-#else
-static double jw_strtod_c(const char* s, char** end) {
-    static locale_t cl;
-    locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
-    if (!l) {
-        locale_t n = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
-        locale_t exp = (locale_t)0;
-        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            freelocale(n);
-            n = exp;
-        }
-        l = n;
-    }
-    if (!l) return strtod(s, end);
-    locale_t old = uselocale(l);
-    double v = strtod(s, end);
-    uselocale(old);
-    return v;
-}
-#endif
-
 /* `d` printed with `fmt` ("%.*g" or "%.*f") at `prec` into b[0..cap),
  * NUL-terminated: its length, or -1 when snprintf fails or the result does
- * not fit.  snprintf writes the locale's decimal point; JSON's is '.', so
- * it is rewritten in place, and an exponent is written short ("1e+05" as
- * "1e5"). */
+ * not fit.  The decimal point is '.' whatever the host's locale
+ * (ray_snprintf_c), and an exponent is written short ("1e+05" as "1e5"). */
 static int jw_fmt_c(char* b, size_t cap, const char* fmt, int prec, double d) {
-    int k = snprintf(b, cap, fmt, prec, d);
+    int k = ray_snprintf_c(b, cap, fmt, prec, d);
     if (k < 0 || (size_t)k >= cap) { b[0] = '\0'; return -1; }
-    const struct lconv* lc = localeconv();
-    const char* dp = lc && lc->decimal_point ? lc->decimal_point : ".";
-    size_t dl = strlen(dp);
-    if (dl > 0 && !(dl == 1 && dp[0] == '.')) {
-        char* at = strstr(b, dp);
-        if (at) {
-            *at = '.';
-            memmove(at + 1, at + dl, (size_t)(b + k - (at + dl)) + 1);
-            k -= (int)(dl - 1);
-        }
-    }
     char* e = strchr(b, 'e');
     if (e) {
         char* q = e + 1;
@@ -1495,7 +1440,7 @@ static int jw_fmt_c(char* b, size_t cap, const char* fmt, int prec, double d) {
 static bool jw_reads_back(const char* b, int k, double d, bool f32) {
     if (k <= 0) return false;
     char* end = NULL;
-    double back = jw_strtod_c(b, &end);
+    double back = ray_strtod_c(b, &end);
     return end == b + k && (f32 ? (float)back == (float)d : back == d);
 }
 

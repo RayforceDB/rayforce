@@ -21,15 +21,92 @@
  *   SOFTWARE.
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L     /* newlocale / uselocale */
+#endif
 #include "core/numparse.h"
+#include "core/platform.h"     /* RAY_OS_WINDOWS */
 
 #include <rayforce.h>
 
 #include <float.h>
+#include <locale.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ----------------------------------------------------------------------------
+ * Float text in the C locale
+ *
+ * strtod and the printf family read and write the decimal point of the
+ * process's LC_NUMERIC.  The standalone binary never calls setlocale, but a
+ * process that embeds the library may have set a locale whose decimal point
+ * is a comma, and Rayforce's float text is always written with '.'.
+ * ---------------------------------------------------------------------------- */
+
+#if defined(RAY_OS_WINDOWS)
+double ray_strtod_c(const char* s, char** end) {
+    static _locale_t cl;
+    _locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
+    if (!l) {
+        _locale_t n = _create_locale(LC_NUMERIC, "C");
+        _locale_t exp = NULL;
+        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            _free_locale(n);
+            n = exp;
+        }
+        l = n;
+    }
+    return l ? _strtod_l(s, end, l) : strtod(s, end);
+}
+#else
+double ray_strtod_c(const char* s, char** end) {
+    static locale_t cl;
+    locale_t l = __atomic_load_n(&cl, __ATOMIC_ACQUIRE);
+    if (!l) {
+        locale_t n = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+        locale_t exp = (locale_t)0;
+        if (n && !__atomic_compare_exchange_n(&cl, &exp, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            freelocale(n);
+            n = exp;
+        }
+        l = n;
+    }
+    if (!l) return strtod(s, end);
+    locale_t old = uselocale(l);
+    double v = strtod(s, end);
+    uselocale(old);
+    return v;
+}
+#endif
+
+/* Is `c` a byte the printf family writes for a number in the C locale? */
+static inline bool c_num_byte(unsigned char c) {
+    return (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' ||
+           ((c | 0x20) >= 'a' && (c | 0x20) <= 'z');   /* e, inf, nan */
+}
+
+int ray_snprintf_c(char* buf, size_t cap, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(buf, cap, fmt, ap);
+    va_end(ap);
+    if (k < 0 || (size_t)k >= cap) return k;
+    /* The only byte run outside the C locale's number alphabet is the
+     * locale's decimal point (one byte, or a multibyte sequence): it
+     * becomes '.'.  No grouping is written without the ' flag. */
+    for (int i = 0; i < k; i++) {
+        if (c_num_byte((unsigned char)buf[i])) continue;
+        int j = i + 1;
+        while (j < k && !c_num_byte((unsigned char)buf[j])) j++;
+        buf[i] = '.';
+        memmove(buf + i + 1, buf + j, (size_t)(k - j) + 1);
+        return k - (j - i - 1);
+    }
+    return k;
+}
 
 /* ----------------------------------------------------------------------------
  * SWAR digit detection
@@ -428,7 +505,7 @@ size_t ray_parse_f64(const char *src, size_t len, double *dst) {
             memcpy(buf, src, i);
             buf[i] = '\0';
             char *endp = NULL;
-            double v = strtod(buf, &endp);
+            double v = ray_strtod_c(buf, &endp);
             bool ok = (endp == buf + i);
             if (buf_block) ray_free(buf_block);
             if (ok) {

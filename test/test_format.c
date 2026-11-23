@@ -2013,6 +2013,100 @@ static test_result_t test_json_format_locale(void) {
     PASS();
 }
 
+/* Switch LC_NUMERIC to a locale whose decimal point is not '.': true on
+ * success, false (and back in the C locale) when none is installed. */
+static bool set_comma_locale(void) {
+    static const char* const comma[] = { "de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "fr_FR.utf8",
+                                         "ru_RU.UTF-8", "ru_RU.utf8", "de_AT.utf8", "de_DE" };
+    for (size_t i = 0; i < sizeof comma / sizeof *comma; i++)
+        if (setlocale(LC_NUMERIC, comma[i]) && strcmp(localeconv()->decimal_point, ".") != 0) return true;
+    setlocale(LC_NUMERIC, "C");
+    return false;
+}
+
+/* Each case's text, or NULL when it did not evaluate to a string. */
+#define LOCALE_NCASES 13
+static const char* const locale_src[LOCALE_NCASES] = {
+    "(repr 9007199254740993.0)",           /* ray_parse_f64's strtod lane */
+    "(repr 0.1234567890123456789)",
+    "(repr 1.5)",
+    "(repr [1.5 0.25])",
+    "(repr 1.5e)",
+    "(format \"%\" 1.5)",
+    "(format \"%\" [1.5 1e10 0.0])",
+    "(as 'STR 1.5)",
+    "(as 'STR (as 'F32 \"0.5\"))",
+    "(as 'STR (as 'SYM 1.5))",
+    "(repr (as 'F64 \"2.5\"))",            /* the STR -> F64 cast */
+    "(repr (as 'F32 \"2.5\"))",
+    "(repr (as 'F64 \"9007199254740993.0\"))",
+};
+static const char* const locale_want[LOCALE_NCASES] = {
+    "9007199254740992.0", "0.12345678901234568", "1.5", "[1.5 0.25]", "1.5e",
+    "1.5", "[1.5 1.00e+10 0.0]", "1.5", "0.5", "1.5", "2.5", "2.5e", "9007199254740992.0",
+};
+
+static void locale_cases(char out[LOCALE_NCASES][64]) {
+    for (int i = 0; i < LOCALE_NCASES; i++) {
+        ray_t* r = ray_eval_str(locale_src[i]);
+        if (!r || RAY_IS_ERR(r) || r->type != -RAY_STR || ray_str_len(r) >= 64) {
+            snprintf(out[i], 64, "<no string: %s>", locale_src[i]);
+            if (r && !RAY_IS_ERR(r)) ray_release(r);
+            continue;
+        }
+        memcpy(out[i], ray_str_ptr(r), ray_str_len(r));
+        out[i][ray_str_len(r)] = '\0';
+        ray_release(r);
+    }
+}
+
+/* The text println and a CSV file give a float: "<println>|<csv body>". */
+static bool locale_print_csv(char* out, size_t cap) {
+    out[0] = '\0';
+    ray_t* f = ray_f64(1.5);
+    char p[32];
+    size_t pn = lang_print_to_buf(f, p, sizeof p);
+    ray_release(f);
+    if (pn == 0) return false;
+    const char* path = ray_test_tmp("/tmp/rfl_fmt_locale.csv");
+    char src[256];
+    snprintf(src, sizeof src, "(.csv.write (table [a b] (list [1.5 -0.25] [1 2])) \"%s\")", path);
+    ray_t* w = ray_eval_str(src);
+    if (!w || RAY_IS_ERR(w)) { if (w && !RAY_IS_ERR(w)) ray_release(w); return false; }
+    ray_release(w);
+    FILE* fp = fopen(path, "rb");
+    if (!fp) return false;
+    char c[64];
+    size_t cn = fread(c, 1, sizeof c - 1, fp);
+    fclose(fp);
+    remove(path);
+    c[cn] = '\0';
+    snprintf(out, cap, "%s|%s", p, c);
+    return true;
+}
+
+/* Reading and printing a float do not depend on the host's LC_NUMERIC: an
+ * embedding process under a comma locale reads and prints the C locale's
+ * text (#1424).  Skipped where no comma locale is installed. */
+static test_result_t test_fmt_locale_independent(void) {
+    static char in_c[LOCALE_NCASES][64], in_comma[LOCALE_NCASES][64];
+    char pc[128], pcomma[128];
+    locale_cases(in_c);
+    TEST_ASSERT_TRUE(locale_print_csv(pc, sizeof pc));
+    if (!set_comma_locale()) SKIP("no locale with a comma decimal point");
+    locale_cases(in_comma);
+    bool ok = locale_print_csv(pcomma, sizeof pcomma);
+    setlocale(LC_NUMERIC, "C");
+    TEST_ASSERT_TRUE(ok);
+    for (int i = 0; i < LOCALE_NCASES; i++) {
+        TEST_ASSERT_STR_EQ(in_c[i], locale_want[i]);
+        TEST_ASSERT_STR_EQ(in_comma[i], locale_want[i]);
+    }
+    TEST_ASSERT_STR_EQ(pc, "1.5|a,b\n1.5,1\n-0.25,2\n");
+    TEST_ASSERT_STR_EQ(pcomma, "1.5|a,b\n1.5,1\n-0.25,2\n");
+    PASS();
+}
+
 const test_entry_t format_entries[] = {
     { "format/pp/dict_fits", test_fmt_pp_dict_fits, fmt_setup_full, fmt_teardown_full },
     { "format/pp/dict_breaks", test_fmt_pp_dict_breaks, fmt_setup_full, fmt_teardown_full },
@@ -2126,5 +2220,6 @@ const test_entry_t format_entries[] = {
     { "format/lang_print/nulls", test_lang_print_nulls, fmt_setup_full, fmt_teardown_full },
     { "format/lang_print/values", test_lang_print_values, fmt_setup_full, fmt_teardown_full },
     { "format/json/locale", test_json_format_locale, fmt_setup_full, fmt_teardown_full },
+    { "format/locale/independent", test_fmt_locale_independent, fmt_setup_full, fmt_teardown_full },
     { NULL, NULL, NULL, NULL },
 };
