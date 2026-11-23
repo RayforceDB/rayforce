@@ -209,6 +209,20 @@
 (set runs11 (concat "[" (concat (str-join (take (enlist run480) 11) ",") "]")))
 (.json.parse runs11 {alloc: 4194304 input: 1000000000}) !- limit
 (count (.json.parse runs11 {input: 1000000000})) -- 11
+;; an object with long keys stays near its cap while it is built (#1438):
+;; each key is charged like a cell of a string run (its pool grows by
+;; doubling), and the deduplicated keys and values a repeated key builds
+;; beside the old ones are charged before they are built.  1,100 keys of
+;; about 4 KB and one repeat peaked at 3.5 times a 6 MB cap; now about 1.06
+(set k4k (fn [i] (concat "\"" (concat (format "%" i) (concat (str-join (take ["k"] 4000) "") "\":0")))))
+(set obj4k (concat "{" (concat (str-join (map k4k (concat (til 1100) [0])) ",") "}")))
+(set objts (.mem.ts (try (do (.json.parse obj4k {alloc: 6000000 input: 1000000000}) "parsed") (fn [e] (at e 'code)))))
+(at objts 'result) -- 'limit
+(< (at objts 'peak-live-bytes) 9000000) -- true
+;; within the cap the repeated key still keeps its first place and last value
+(set obj3 (.json.parse (concat "{" (concat (str-join (map k4k [0 1 2 0]) ",") "}")) {alloc: 100000}))
+(count obj3) -- 3
+(count (at (key obj3) 0)) -- 4001
 (.json.parse "[1]" {bogus: 1}) !- domain
 (.json.parse "[1]" 5) !- type
 (.json.get (deep 129) "0") !- limit
