@@ -562,7 +562,8 @@ Last element of a vector.
 
 Unique elements of a vector or list, in the order values first appear. A list
 keeps each cell where it first occurs, whether its cells are atoms, vectors or
-nested lists.
+nested lists. A string atom gives its characters, in the order they first
+appear: `(distinct "tset")` is `"tse"`.
 
 List cells are equal when their values are, the rule `distinct`,
 `except`, `sect`, `union`, `group`, `xkey` and keyed-table `==` share: a

@@ -680,8 +680,8 @@
 ;; Empty string → identity (lines 813-814)
 (distinct "") -- ""
 
-;; Non-empty string → unique chars sorted (lines 815-825)
-(distinct "banana") -- "abn"
+;; Non-empty string → unique chars in first-occurrence order
+(distinct "banana") -- "ban"
 (distinct "aaabbb") -- "ab"
 
 ;; ══════════════════════════════════════════════════════════════════════

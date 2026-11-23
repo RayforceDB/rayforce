@@ -59,3 +59,13 @@
 (set P (.db.parted.get "/tmp/rfl_distinct_first_order" 't))
 (distinct (at P 'v)) -- [9 4 1 2]
 (.sys.exec "rm -rf /tmp/rfl_distinct_first_order") -- 0
+;; a string atom keeps its characters in first-occurrence order too (#1486):
+;; it used to come back sorted ("tset" gave "est")
+(distinct "tset") -- "tse"
+(distinct "bbaacc") -- "bac"
+(distinct "a") -- "a"
+(distinct "") -- ""
+(distinct "zZ\tz\t") -- "zZ\t"
+(type (distinct "tset")) -- 'str
+;; STR cells: each string kept whole, where it first occurs
+(distinct (list "tset" "b" "tset" "a")) -- (list "tset" "b" "a")
