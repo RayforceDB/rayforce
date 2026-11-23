@@ -256,3 +256,12 @@
 (distinct (at MR 'n)) -- [2]
 (at (at MR 'c) 2999) -- (table [q] (list [2999 3000]))
 (count (distinct MT2)) -- 3000
+;; TIMESPAN keys group by value, as TIMESTAMP keys do (#1479): every row used
+;; to land in its own group, keyed by its row number
+(group (as 'TIMESPAN [3 1 3 2])) -- (dict (as 'TIMESPAN [3 1 2]) (list [0 2] [1] [3]))
+(count (group (as 'TIMESPAN (% (til 1000) 7)))) -- 7
+(group (as 'TIMESPAN [3 0N 3 2 0N])) -- (dict (as 'TIMESPAN [3 0N 2]) (list [0 2] [1 4] [3]))
+(set GS (group (as 'TIMESPAN (concat (% (til 200000) 7) [0N]))))
+(count GS) -- 8
+(count (get GS 0Nn)) -- 1
+(count (get GS (as 'TIMESPAN 6))) -- 28571
