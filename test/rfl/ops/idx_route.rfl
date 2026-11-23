@@ -105,11 +105,11 @@
 ;; in distinct_vec_eager (collection.c:779) when the vector has a sort index
 ;; and no HAS_NULLS.  s_raw = [10 9 8 7 6 5 4 3 2 1] — all 10 values unique.
 (count (distinct s_idx)) -- 10
-(distinct s_idx) -- [1 2 3 4 5 6 7 8 9 10]
+(distinct s_idx) -- [10 9 8 7 6 5 4 3 2 1]
 
 ;; drop-differential: same results via hashset path
 (count (distinct (.idx.drop s_idx))) -- 10
-(distinct (.idx.drop s_idx)) -- [1 2 3 4 5 6 7 8 9 10]
+(distinct (.idx.drop s_idx)) -- [10 9 8 7 6 5 4 3 2 1]
 
 ;; ════════════════════════════════════════════════════════════════════════════
 ;; 6.  FIND on a hash-indexed column

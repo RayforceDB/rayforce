@@ -33,6 +33,24 @@ other result, are never evaluated:
 
 Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form, and a text literal in it becomes a symbol cell; a chain without a fallback is left to the evaluator.
 
+A query's `if` gives one column, so its arms must have a common type. Two
+numeric arms take the [promotion table](math.md#result-types) (`(if c i 1.5)`
+over an i64 column is f64). Two temporal arms of one type keep it, and a
+temporal arm beside a null literal (`0N`, `0Nd`, `0Np`, ...) keeps its own
+type, the null becoming its null. Arms of two different temporal types (any
+two of DATE, TIME, TIMESTAMP and TIMESPAN) have no common type and raise a
+`type` error, as a text arm beside a number does:
+
+```lisp
+‣ (set t (table [g d p] (list [0 1] [2024.01.01 2024.01.02] [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000])))
+‣ (select {from: t r: (if (> g 0) d p)})
+error: type: if: branches mix DATE and TIMESTAMP
+‣ (select {from: t r: (if (> g 0) d (as 'DATE p))})   ; convert one arm first
+```
+
+Outside a query `if` evaluates one arm only, so its arms are never typed
+against each other.
+
 ## Sequential Evaluation: do
 
 `do` evaluates expressions in order and returns the last result. At the top

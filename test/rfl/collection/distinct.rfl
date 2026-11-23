@@ -15,28 +15,29 @@
 ;; Ported from test_lang_rf.inc::test_rf_distinct.
 
 (distinct [true true]) -- [true]
-(distinct [0x12 0x12 0x10]) -- [0x10 0x12]
+(distinct [0x12 0x12 0x10]) -- [0x12 0x10]
 (distinct "test") -- "est"
 (distinct "") -- ""
 (distinct [1h 2h 2h]) -- [1 2]
 (count (distinct [1i 0Ni 1i])) -- 2
-;; nulls preserved — 2 distinct values
-(nil? (at (distinct [1i 0Ni 1i]) 0)) -- true
-;; null is first
+;; nulls preserved — 2 distinct values, in first-occurrence order (#1477)
+(nil? (at (distinct [1i 0Ni 1i]) 1)) -- true
+(nil? (at (distinct [0Ni 1i 1i]) 0)) -- true
 (distinct [2012.12.12 2012.12.12]) -- [2012.12.12]
 (distinct [10:00:00.000 20:10:10.500 10:00:00.000]) -- [10:00:00.000 20:10:10.500]
 (distinct [1 1 1 2 3 4 2 3 4 2 3 4]) -- [1 2 3 4]
 (distinct [2024.01.01D10:00:00.000000000 2024.01.01D10:00:00.000000000]) -- [2024.01.01D10:00:00.000000000]
 (distinct ['a 'b 'ab 'aa 'a 'aa]) -- ['a 'b 'ab 'aa]
 (set l (guid 2)) (set l (concat l l)) (count (distinct l)) -- 2
-(distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list 2i [3i 3i])
+;; a list keeps first-occurrence order too (#1361: atoms were moved first)
+(distinct (list [3i 3i] 2i [3i 3i] 2i)) -- (list [3i 3i] 2i)
 ;; tables and dicts in a list: equal ones collapse, different ones stay
 ;; (cell equality saw every table / dict of one length as equal)
 (count (distinct (list (table [q] (list [1])) (table [q] (list [2])) (table [q] (list [1])) (table [r] (list [1]))))) -- 3
 (count (distinct (list {p: 1} {p: 2} {p: 1} {r: 1}))) -- 3
 ;; ========== NULL BITMAP PROPAGATION ==========
 ;; distinct preserves one null
-(distinct [1 0Nl 2 0Nl 1]) -- [0Nl 1 2]
+(distinct [1 0Nl 2 0Nl 1]) -- [1 0Nl 2]
 ;; concat preserves null bitmaps
 (nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 1)) -- true
 (nil? (at (concat [1 0Nl 3] [0Nl 5 6]) 3)) -- true
@@ -62,7 +63,7 @@
 (count (distinct [0Nl 0Nl 0Nl])) -- 1
 (nil? (at (distinct [0Nl 0Nl 0Nl]) 0)) -- true
 ;; distinct: no nulls unchanged
-(distinct [3 1 2 1]) -- [1 2 3]
+(distinct [3 1 2 1]) -- [3 1 2]
 ;; cast from list preserves nulls
 (nil? (at (as 'I64 (list 1 0Nl 3)) 1)) -- true
 (at (as 'I64 (list 1 0Nl 3)) 0) -- 1
@@ -262,18 +263,18 @@
 ;; ---- Parallel radix path ----
 ;; Vectors of >= 65536 rows route fixed-width types through the
 ;; radix-partitioned kernel (distinct_radix_first_ids); everything below
-;; must agree with the small-vector hashset semantics above: value-sorted
-;; output, declared nulls collapsed to one (sentinel sorts first).
+;; must agree with the small-vector hashset semantics above: first-
+;; occurrence order (#1477), declared nulls collapsed to one.
 
 ;; i64: duplicates spread across the whole vector, null in the tail
 (set big (concat (concat [5 7 5] (take [9] 100000)) (concat [7 3 0Nl] (take [5] 100000))))
 (count big) -- 200006
-(distinct big) -- [0Nl 3 5 7 9]
+(distinct big) -- [5 7 9 3 0Nl]
 ;; the fused count(distinct) kernel (OP_COUNT_DISTINCT) must agree with
 ;; the materializing kernel — two independent implementations
 (count (distinct big)) -- 5
 ;; idempotent on the radix path
-(distinct (distinct big)) -- [0Nl 3 5 7 9]
+(distinct (distinct big)) -- [5 7 9 3 0Nl]
 ;; dedup invariant at radix scale
 (count (distinct big)) -- (count (distinct (concat big big)))
 
@@ -289,11 +290,11 @@
 
 ;; i16 lane
 (set bigh (concat (take [1h] 70000) (concat [3h 2h] (take [2h] 70000))))
-(distinct bigh) -- [1 2 3]
+(distinct bigh) -- [1 3 2]
 
 ;; temporal lanes: time (i32) and timestamp (i64)
 (set bigt (concat (take [09:30:00.000] 70000) (concat [09:31:00.000 0Nt] (take [09:30:00.000] 70000))))
-(distinct bigt) -- [0Nt 09:30:00.000 09:31:00.000]
+(distinct bigt) -- [09:30:00.000 09:31:00.000 0Nt]
 (set bigp (concat (take [2024.01.01D10:00:00.000000000] 70000) (take [2024.01.02D10:00:00.000000000] 70000)))
 (distinct bigp) -- [2024.01.01D10:00:00.000000000 2024.01.02D10:00:00.000000000]
 

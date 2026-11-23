@@ -216,7 +216,9 @@
 (at (select {r: (first (+ d i32)) from: Q where: (> c 4)}) 'r) -- [2000.01.03]
 (at (select {r: (dev (+ d i16)) from: Q}) 'r) -- [858977952.7502966]
 (at (select {r: (nil? (+ d 1)) from: Q}) 'r) -- [false false false true false true false]
-(repr (at (select {r: (if (> c 4) (+ d 1) t) from: Q}) 'r)) -- "(list 00:00:00.000 2000.01.03 2000.01.01 596:31:23.647 -5877611.06.24 0Nt 2024.01.02)"
+;; a DATE arm beside a TIME arm has no common type (#1337; this boxed the
+;; cells per row)
+(select {r: (if (> c 4) (+ d 1) t) from: Q}) !- type
 (try (select {r: (cond ((> c 4) (+ d 1)) (else d)) from: Q}) (fn [e] (at e 'msg))) -- "'cond' undefined"
 (repr (at (select {r: (if (> c 4) (+ t 1000) 0Nd) from: Q}) 'r)) -- "(list 0Nd 00:00:01.001 00:00:00.999 0Nd -596:31:22.647 0Nd 24:00:00.999)"
 (repr (at (select {r: (+ d 1) from: Q asc: r}) 'r)) -- "[0Nd 0Nd -5877611.06.24 2000.01.01 2000.01.02 2000.01.03 2024.01.02]"
@@ -227,7 +229,9 @@
 (set A (table [d t c s] (list (as 'DATE [8766i 8767i 0Ni 2147483647i 8770i]) (as 'TIME [1i 0Ni 3i 2147483647i 5i]) [1 5 7 2 9] (as 'STR (list "abcdef" "bcdefg" "cdefgh" "defghi" "efghij")))))
 (try (at (select {r: (+ d 1) s: (nil? r) from: A}) 's) (fn [e] (at e 'msg))) -- [false false true true false]
 (try (at (select {r: (+ d 1) s: (== r d) from: A}) 's) (fn [e] (at e 'msg))) -- [false false true false false]
-(repr (try (at (select {r: (+ d 1) s: (if (> c 4) r t) from: A}) 's) (fn [e] (at e 'msg)))) -- "(list 00:00:00.001 2024.01.03 0Nd 596:31:23.647 2024.01.06)"
+;; a DATE alias beside a TIME arm has no common type (#1337; this boxed the
+;; cells per row)
+(try (at (select {r: (+ d 1) s: (if (> c 4) r t) from: A}) 's) (fn [e] (at e 'msg))) -- "if: branches mix DATE and TIME"
 (try (at (select {d: (+ d 1) u: (nil? d) from: A}) 'u) (fn [e] (at e 'msg))) -- [false false true true false]
 (try (at (select {r: (+ d 1) s: r u: (nil? s) from: A}) 'u) (fn [e] (at e 'msg))) -- [false false true true false]
 (try (at (select {r: (+ d 1) s: (nil? r) from: A where: (> c 1)}) 's) (fn [e] (at e 'msg))) -- [false true true false]

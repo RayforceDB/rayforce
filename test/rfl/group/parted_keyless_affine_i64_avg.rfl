@@ -1,0 +1,43 @@
+;; Combine exact I64 totals across the eight-partition batch boundary.
+(.sys.exec "rm -rf /tmp/rfl_parted_keyless_affine_avg")
+(set mk (fn [n v] (table [k x] (list (concat (* 0 (til n)) [1 1]) (concat (+ v (* 0 (til n))) [0N 0N])))))
+(set Z (mk 70000 0))
+(set H (mk 70000 9223372036854775807))
+(set L (mk 70000 -9223372036854775807))
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/1/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/2/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/3/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/4/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/5/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/6/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/7/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/8/hits/" H "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/9/hits/" L "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(set P (.db.parted.get "/tmp/rfl_parted_keyless_affine_avg/" 'hits))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z Z) Z) Z) Z) Z) Z) H) L))
+(set A (fn [t] (select {mean: (avg (+ x 1)) from: t})))
+(set B (fn [t] (select {mean: (avg (- x 1)) from: t})))
+(set runs (fn [] (at (.sys.mem) 'group-perpart-runs)))
+(set before (runs))
+(set ap (A P))
+(== (- (runs) before) 1) -- true
+(set af (A F))
+(== (at (at ap 'mean) 0) (at (at af 'mean) 0)) -- true
+(== (type (at ap 'mean)) (type (at af 'mean))) -- true
+(set before (runs))
+(set bp (B P))
+(== (- (runs) before) 1) -- true
+(== (at (at bp 'mean) 0) (at (at (B F) 'mean) 0)) -- true
+(set P 0)
+;; Unlike H + L above, both wide partitions below contribute positive totals.
+(set W (mk 70000 1152921504606846976))
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/8/hits/" W "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: true})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/9/hits/" W "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: true})
+(set P (.db.parted.get "/tmp/rfl_parted_keyless_affine_avg/" 'hits))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z Z) Z) Z) Z) Z) Z) W) W))
+(set D (fn [t] (select {mean: (avg x) from: t})))
+(set M (fn [t] (select {mean: (avg (- 1h x)) from: t})))
+(set N (fn [t] (select {mean: (avg (+ x 1i)) from: t})))
+(map (fn [q] (set n (runs)) (set p (at (q P) 'mean)) (set r (at (q F) 'mean)) (list (- (runs) n) (type p) (== (at p 0) (at r 0)))) (list D M N)) -- (list (list 1 'F64 true) (list 1 'F64 true) (list 1 'F64 true))
+(set P 0)
+(.sys.exec "rm -rf /tmp/rfl_parted_keyless_affine_avg")

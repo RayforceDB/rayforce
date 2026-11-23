@@ -718,8 +718,9 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (type (at (select {r: (if x tm (if x tm tm)) from: TIF}) 'r)) -- 'TIME
 ;; values are untouched by the type rule
 (as 'I64 (at (select {r: (if x ts (if x ts ts)) from: TIF}) 'r)) -- [100 200 300]
-;; branches of DIFFERENT temporal types have no shared meaning — still widened
-(type (at (select {r: (if x d (if x ts ts)) from: TIF}) 'r)) -- 'I64
+;; branches of DIFFERENT temporal types have no shared meaning: no common
+;; type, a `type` error (#1337; this blended day and ns counts into I64)
+(select {r: (if x d (if x ts ts)) from: TIF}) !- type
 
 ;; A branch that supplies no rows must not change the answer either.  With an
 ;; all-true condition the else branch is empty, and the selected arm used to
@@ -729,7 +730,8 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (set TAT (table [x ts d] (list [true true true] (as 'TIMESTAMP [100 200 300]) (as 'DATE [1 2 3]))))
 (type (at (select {r: (if x ts 5) from: TAT}) 'r)) -- 'I64
 (type (at (select {r: (if x ts 5.5) from: TAT}) 'r)) -- 'F64
-(type (at (select {r: (if x d ts) from: TAT}) 'r)) -- 'I64
+;; DATE beside TIMESTAMP has no common type (#1337)
+(select {r: (if x d ts) from: TAT}) !- type
 
 ;; ── a null branch value must still read as a null ───────────────────────
 ;; An atom null IS the sentinel value and carries no attribute of its own, so
@@ -787,12 +789,12 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 (at (select {r: (if c (+ b b) (+ b b)) from: TW}) 'r) -- [-5536h -5536h -5536h]
 
 ;; ── narrowing belongs to the branch that supplied nothing ──────────────
-;; Two temporal branches promote to I64 because of the pair, not because of
-;; either one, so an empty branch must not hand the answer to the survivor:
-;; the nested form and the plain form are the same expression.
+;; Two different temporal branches have no common type (#1337; they were
+;; blended into I64), and an empty branch must not hand the answer to the
+;; survivor: the nested form and the plain form both raise.
 (set TD (table [x d ts] (list [true true true] (as 'DATE [1 2 3]) (as 'TIMESTAMP [100 200 300]))))
-(type (at (select {r: (if x (if x d d) ts) from: TD}) 'r)) -- 'I64
-(type (at (select {r: (if x d ts) from: TD}) 'r)) -- 'I64
+(select {r: (if x (if x d d) ts) from: TD}) !- type
+(select {r: (if x d ts) from: TD}) !- type
 
 ;; ── a null atom stays null when the width changes ──────────────────────
 ;; 0N is the I64 sentinel; converting it into an F64 column as a number gave

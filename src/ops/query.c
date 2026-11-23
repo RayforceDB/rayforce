@@ -11932,6 +11932,12 @@ static ray_t* rw_list_blend(ray_t* cv, ray_t* tv, ray_t* ev, rw_ctx_t* c) {
     return out;
 }
 
+/* Bumped when the blend below finds arms of no common type (two temporal
+ * types, #1337).  That `type` error is the query's: a caller that retries a
+ * failed whole-column pass row by row (a computed by: key) must not box the
+ * cells instead. */
+static _Thread_local uint32_t g_if_mixes;
+
 /* OP_IF over the evaluated pieces (owned, consumed): its promotion, null,
  * broadcast and refusal rules are the keyless select's.  A pair OP_IF has
  * no type for gets the per-row boxing (rw_list_blend).  An arm that is not
@@ -11964,6 +11970,11 @@ static ray_t* rw_blend(ray_t* cv, ray_t* tv, ray_t* ev, ray_t* te, ray_t* ee, rw
              * An `if` that compiles whole is refused as keyless refuses it
              * (rw_value). */
             if (RAY_IS_ERR(out) && g->if_refused) { rw_swallow(out); out = NULL; }
+        } else if (en && g->compile_err) {
+            /* arms of no common type (two different temporals, #1337):
+             * the query's error, as the `if` compiled whole raises it */
+            out = graph_take_compile_err(g);
+            g_if_mixes++;
         }
         ray_graph_free(g);
         if (!en) { out = ray_error("oom", NULL); goto done; }
@@ -12191,6 +12202,19 @@ static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl) {
 static ray_t* query_eval_bound(ray_t* e, ray_t* tbl) {
     ray_t* v = query_eval_rowwise_if(e, tbl);
     return v ? v : ray_eval(e);
+}
+
+/* The planner's refusal of an `if` in `e` whose arms have no common type
+ * (two temporal types, #1337), or NULL.  A per-row pass boxes such cells;
+ * the query raises instead, as its planned routes do.  One compile, and
+ * only for an expression holding such an `if`. */
+static ray_t* rw_if_mix_err(ray_t* e, ray_t* tbl) {
+    if (!tbl || tbl->type != RAY_TABLE || !rw_has_if(e, tbl, 0)) return NULL;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_t* err = !compile_expr_dag(g, e) && g->if_refused ? graph_take_compile_err(g) : NULL;
+    ray_graph_free(g);
+    return err;
 }
 
 static bool update_expr_elementwise(ray_t* e, ray_t* tbl, bool meta_cols);
@@ -15026,6 +15050,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
                     if (src) src = scalar_edge_keep_rows(src, sn, sel);
                 }
             } else if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
+            if (!src) src = rw_if_mix_err(agg_src_expr, tbl);
             if (!src) {
                 src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
                 if (edge && nrows == 0 && src && !RAY_IS_ERR(src))
@@ -18857,6 +18882,7 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
              * output with a condition is. */
             int64_t nrows = ray_table_nrows(base);
             int32_t conds = __VM->rows_cond;
+            uint32_t mixes = g_if_mixes;
             /* A body with an effect runs once per row, never whole first:
              * a repeated run would repeat the effect. */
             key_bind_t pure_binds[KEY_PURE_MAX_BIND];
@@ -18868,7 +18894,8 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
             bool pure = json_whole || key_expr_pure(by_expr, 0, &pure_ctx);
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
-            else if (!json_whole && (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec))) {
+            else if (!json_whole && g_if_mixes == mixes &&
+                     (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec))) {
                 /* Also when the whole-column run failed: a body written for
                  * one row may not accept a column at all.  The failure is
                  * swallowed whole: its `raise` payload and trace go with it,
@@ -29500,12 +29527,14 @@ static int expr_contains_agg_over_column(ray_t* expr, ray_t* tbl) {
 }
 
 /* Whether a DAG error must stand rather than hand the expression to the
- * interpreter: only when an `if` refused its operands (g->if_refused).  The
- * interpreter's `if` tests one truth value, so retrying there wrote the
- * then-branch to every matched row.  Other DAG failures, such as an
- * operation the DAG does not take, keep the fallback. */
-static bool update_dag_err_final(ray_t* out, bool if_refused) {
-    return if_refused && out && RAY_IS_ERR(out);
+ * interpreter: only when an `if` refused its operands (g->if_refused), at
+ * run time (`out`) or at compile time (`cerr`: arms of two temporal types,
+ * #1337).  The interpreter's `if` tests one truth value, so retrying there
+ * wrote the then-branch to every matched row, and per row it boxed the
+ * mixed cells.  Other DAG failures, such as an operation the DAG does not
+ * take, keep the fallback. */
+static bool update_dag_err_final(ray_t* out, ray_t* cerr, bool if_refused) {
+    return if_refused && ((out && RAY_IS_ERR(out)) || (!out && cerr));
 }
 
 /* Evaluate an update expression over `sub`: the DAG first, then the
@@ -29551,7 +29580,8 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         if_refused = g->if_refused;
         ray_graph_free(g);
     }
-    if (update_dag_err_final(out, if_refused)) {
+    if (update_dag_err_final(out, cerr, if_refused)) {
+        if (!out) return cerr;
         if (cerr) ray_error_free(cerr);
         return out;
     }

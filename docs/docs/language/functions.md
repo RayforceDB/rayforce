@@ -185,12 +185,12 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `distinct` | unary | Remove duplicates | `(distinct [1 2 2 3])` → `[1 2 3]` |
+| `distinct` | unary | Remove duplicates, in the order the values first appear, for every type | `(distinct [3 1 3 2])` → `[3 1 2]` |
 | `in` | binary | Membership test; a string in a list is one whole value | `(in "ab" (list "ab" "c"))` → `true` |
 | `not-in` | binary | Negated membership test | `(not-in 2 [1 3])` → `true` |
-| `except` | binary | Set difference | `(except [1 2 3] [2])` → `[1 3]` |
-| `union` | binary | Set union | `(union [1 2] [2 3])` → `[1 2 3]` |
-| `sect` | binary | Set intersection | `(sect [1 2 3] [2 3 4])` → `[2 3]` |
+| `except` | binary | Elements of the left operand not in the right; keeps the left operand's duplicates | `(except [1 1 2 3] [3])` → `[1 1 2]` |
+| `union` | binary | Set union (deduplicated, order of first appearance) | `(union [1 2] [2 3])` → `[1 2 3]` |
+| `sect` | binary | Elements of the left operand also in the right; keeps the left operand's duplicates | `(sect [1 1 2 2 3] [1 2])` → `[1 1 2 2]` |
 | `take` | binary | Take first/last N elements; past the length it cycles (`select … take:` stops at the table's length). A parted table handle (`.db.parted.get`) is taken as its flat table: the same rows `(at table (til n))` returns, cycling past the row count | `(take [10 20 30] 2)` → `[10 20]`; `(take [1 2 3] 5)` → `[1 2 3 1 2]` |
 | `drop` | binary | Drop first/last N elements | `(drop [10 20 30] 1)` → `[20 30]` |
 | `rotate` | binary | Rotate left by N positions; negative rotates right | `(rotate [1 2 3 4] 1)` → `[2 3 4 1]` |
@@ -566,7 +566,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional: condition/result pairs, optional final else | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |

@@ -428,70 +428,6 @@ static int64_t hashset_find_xrow(hashset_t* hs, ray_t* probe_src, int64_t probe_
     return HS_EMPTY;
 }
 
-/* qsort comparator state for distinct_sort_indices: thread-local so
- * the standard qsort entry point can pull it without a context arg.
- * Single-threaded VM-eval is the only caller, so TLS is fine. */
-static _Thread_local ray_t* g_dsort_src;
-static _Thread_local int8_t g_dsort_type;
-static _Thread_local const void* g_dsort_data;
-
-static int distinct_sort_cmp(const void* a, const void* b) {
-    int64_t ia = *(const int64_t*)a;
-    int64_t ib = *(const int64_t*)b;
-    switch (g_dsort_type) {
-        case RAY_I64: case RAY_TIMESTAMP: {
-            int64_t va = ((const int64_t*)g_dsort_data)[ia];
-            int64_t vb = ((const int64_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_I32: case RAY_DATE: case RAY_TIME: {
-            int32_t va = ((const int32_t*)g_dsort_data)[ia];
-            int32_t vb = ((const int32_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_I16: {
-            int16_t va = ((const int16_t*)g_dsort_data)[ia];
-            int16_t vb = ((const int16_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_U8: case RAY_BOOL: {
-            uint8_t va = ((const uint8_t*)g_dsort_data)[ia];
-            uint8_t vb = ((const uint8_t*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_F64: {
-            double va = ((const double*)g_dsort_data)[ia];
-            double vb = ((const double*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        case RAY_F32: {
-            float va = ((const float*)g_dsort_data)[ia];
-            float vb = ((const float*)g_dsort_data)[ib];
-            return (va > vb) - (va < vb);
-        }
-        default: {
-            /* Fall back to boxed compare for less-common element kinds. */
-            int alloc_a = 0, alloc_b = 0;
-            ray_t* a_e = collection_elem(g_dsort_src, ia, &alloc_a);
-            ray_t* b_e = collection_elem(g_dsort_src, ib, &alloc_b);
-            double va = a_e ? as_f64(a_e) : 0.0;
-            double vb = b_e ? as_f64(b_e) : 0.0;
-            if (alloc_a && a_e) ray_release(a_e);
-            if (alloc_b && b_e) ray_release(b_e);
-            return (va > vb) - (va < vb);
-        }
-    }
-}
-
-/* Sort `count` indices by their numeric value in `src`.  Preserves
- * the existing `distinct` semantic of returning numeric output sorted. */
-static void distinct_sort_indices(ray_t* src, int64_t* idx, int64_t count) {
-    g_dsort_src = src;
-    g_dsort_type = src->type;
-    g_dsort_data = ray_data(src);
-    qsort(idx, (size_t)count, sizeof(int64_t), distinct_sort_cmp);
-}
-
 /* Insert row i (from the set's build-side src) if absent.
  * Returns true if newly inserted, false if duplicate.  On grow OOM
  * the set silently keeps the previous capacity (caller proceeds). */
@@ -1749,6 +1685,36 @@ static int str_vec_eq(ray_t* a, ray_t* b) {
     return 1;
 }
 
+/* A float cell's bits with -0.0 as +0.0 and every other value, NaN too, as
+ * it is: float vector cells compare and hash by these, so -0.0 equals 0.0
+ * there as it does between atoms (#1361).  Integer ops on the bits, which
+ * -fno-signed-zeros cannot fold away as it can `v + 0.0`. */
+static inline uint64_t f64_cell_bits(const uint8_t* p) {
+    uint64_t b; memcpy(&b, p, 8);
+    return b & ((uint64_t)(b == UINT64_C(0x8000000000000000)) - 1);
+}
+static inline uint32_t f32_cell_bits(const uint8_t* p) {
+    uint32_t b; memcpy(&b, p, 4);
+    return b & ((uint32_t)(b == UINT32_C(0x80000000)) - 1);
+}
+
+/* Two F64 or F32 vectors of one length, cell by cell on those bits.  Equal
+ * bytes are equal cells, so only cells whose bytes differ are walked. */
+static int float_vec_eq(ray_t* a, ray_t* b) {
+    const uint8_t* pa = ray_data(a);
+    const uint8_t* pb = ray_data(b);
+    int64_t n = a->len;
+    if (memcmp(pa, pb, (size_t)n * (a->type == RAY_F64 ? 8 : 4)) == 0) return 1;
+    if (a->type == RAY_F64) {
+        for (int64_t i = 0; i < n; i++)
+            if (f64_cell_bits(pa + i * 8) != f64_cell_bits(pb + i * 8)) return 0;
+    } else {
+        for (int64_t i = 0; i < n; i++)
+            if (f32_cell_bits(pa + i * 4) != f32_cell_bits(pb + i * 4)) return 0;
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
@@ -1860,8 +1826,10 @@ int atom_eq(ray_t* a, ray_t* b) {
          * stored in two pools compared unequal by bytes (#1318). */
         return b->type == RAY_STR && str_vec_eq(a, b);
     default:
-        /* Vector equality: same type and length, element-wise comparison */
+        /* Vector equality: same type and length, element-wise comparison:
+         * float cells on f64_cell_bits / f32_cell_bits, the rest by bytes. */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
+            if (a->type == RAY_F64 || a->type == RAY_F32) return float_vec_eq(a, b);
             int esz = ray_elem_size(a->type);
             return memcmp(ray_data(a), ray_data(b), (size_t)(a->len * esz)) == 0;
         }
@@ -1915,6 +1883,84 @@ static bool span_vec_hash(ray_t* x, uint64_t* out) {
 #undef SPAN_VEC_HASH
     *out = h;
     return true;
+}
+
+/* float_vec_hash for a chunk that holds a -0.0: its cells' f64_cell_bits /
+ * f32_cell_bits hashed, which is what the same chunk with +0.0 hashes to. */
+#define FLOAT_HASH_CHUNK 4096
+static __attribute__((cold, noinline))
+uint64_t float_chunk_hash_cleared(const uint8_t* p, size_t k, bool f64) {
+    uint8_t buf[FLOAT_HASH_CHUNK];
+    if (f64) {
+        for (size_t j = 0; j < k; j += 8) {
+            uint64_t v = f64_cell_bits(p + j);
+            memcpy(buf + j, &v, 8);
+        }
+    } else {
+        for (size_t j = 0; j < k; j += 4) {
+            uint32_t v = f32_cell_bits(p + j);
+            memcpy(buf + j, &v, 4);
+        }
+    }
+    return ray_hash_bytes(buf, k);
+}
+
+/* An F64 or F32 vector's hash as atom_eq compares it.  Up to 64 bytes of
+ * cells (the common short cell) mix their f64_cell_bits / f32_cell_bits
+ * directly, 16 bytes a step with the type and byte count, as
+ * ray_hash_bytes's serial steps mix bytes.  A longer vector hashes its type
+ * and length, then its bytes a FLOAT_HASH_CHUNK at a time, each in place
+ * unless it holds a -0.0 (one compare per cell finds out), which then
+ * hashes as +0.0. */
+static uint64_t float_vec_hash(ray_t* x) {
+    const uint8_t* d = ray_data(x);
+    bool f64 = x->type == RAY_F64;
+    size_t nb = (size_t)x->len * (f64 ? 8 : 4);
+    if (nb <= 64) {
+        uint64_t w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (f64) {
+            for (size_t j = 0; j < nb / 8; j++) w[j] = f64_cell_bits(d + j * 8);
+        } else {
+            /* Two cells per word: clear bit 31 or 63 where a half is -0.0. */
+            for (size_t j = 0; j < nb / 8; j++) {
+                uint64_t v; memcpy(&v, d + j * 8, 8);
+                w[j] = v & ~(((uint64_t)((uint32_t)v == UINT32_C(0x80000000)) << 31) |
+                             ((uint64_t)((v >> 32) == UINT32_C(0x80000000)) << 63));
+            }
+            if (nb & 4) w[nb / 8] = f32_cell_bits(d + nb - 4);
+        }
+        uint64_t seed = ray__wyp[0] ^ ((uint64_t)x->type << 56);
+        size_t i = 0;
+        for (; i + 16 < nb; i += 16) seed = ray__wymix(w[i / 8] ^ ray__wyp[1], w[i / 8 + 1] ^ seed);
+        uint64_t a = w[i / 8], b = w[i / 8 + 1];
+        a ^= ray__wyp[1];
+        b ^= seed ^ nb;
+        ray__wymum(&a, &b);
+        return ray__wymix(a ^ ray__wyp[0], b ^ ray__wyp[1]);
+    }
+    uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
+    for (size_t at = 0; at < nb; at += FLOAT_HASH_CHUNK) {
+        const uint8_t* p = d + at;
+        size_t k = nb - at < FLOAT_HASH_CHUNK ? nb - at : FLOAT_HASH_CHUNK;
+        bool neg;
+        if (f64) {
+            uint64_t acc = 0;
+            for (size_t j = 0; j < k / 8; j++) {
+                uint64_t v; memcpy(&v, p + j * 8, 8);
+                acc |= v == UINT64_C(0x8000000000000000);
+            }
+            neg = acc != 0;
+        } else {
+            uint32_t acc = 0;
+            for (size_t j = 0; j < k / 4; j++) {
+                uint32_t v; memcpy(&v, p + j * 4, 4);
+                acc |= v == UINT32_C(0x80000000);
+            }
+            neg = acc != 0;
+        }
+        h = ray_hash_combine(h, neg ? float_chunk_hash_cleared(p, k, f64) : ray_hash_bytes(p, k));
+    }
+    return h;
 }
 
 /* An I64 past ±2^53 has no exact double, so atom_eq's double comparison
@@ -2063,6 +2109,8 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         }
         return h;
     }
+    /* atom_eq's float vectors: cells on f64_cell_bits / f32_cell_bits. */
+    if (x->type == RAY_F64 || x->type == RAY_F32) return float_vec_hash(x);
     /* atom_eq's other vector arm: same type and length, then memcmp of
      * len * ray_elem_size bytes, so type tags, null sentinels and NaN bits
      * compare raw.  Hash those bytes. */
@@ -2220,17 +2268,45 @@ static bool list_set_of(list_set_t* s, ray_t* l, int spans) {
 /* Forward declaration */
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
+/* The first-occurrence row ids `idx[0..count)` (one per value, each a row of
+ * a `len`-row vector) put in row order, so the distinct values come out in
+ * first-occurrence order (#1477): a bitmap of the ids, scanned once.  False
+ * on oom. */
+static int i64_asc_cmp(const void* a, const void* b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+static bool distinct_ids_in_row_order(int64_t* idx, int64_t count, int64_t len) {
+    if (count < 2) return true;
+    if (count <= 64) { qsort(idx, (size_t)count, sizeof(int64_t), i64_asc_cmp); return true; }
+    size_t words = (size_t)((len + 63) / 64);
+    uint64_t* bits = (uint64_t*)ray_calloc_raw(words * sizeof(uint64_t));
+    if (!bits) return false;
+    for (int64_t k = 0; k < count; k++) bits[idx[k] >> 6] |= 1ull << (idx[k] & 63);
+    int64_t c = 0;
+    for (size_t w = 0; w < words; w++) {
+        uint64_t b = bits[w];
+        while (b) {
+            idx[c++] = (int64_t)(w * 64) + __builtin_ctzll(b);
+            b &= b - 1;
+        }
+    }
+    ray_free_raw(bits);
+    return true;
+}
+
 /* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
  * Factored out so the executor doesn't go through ray_distinct_fn, which
- * is now a lazy producer for vectors and would re-wrap into a chain. */
+ * is now a lazy producer for vectors and would re-wrap into a chain.
+ * Every typed vector keeps first-occurrence order (#1477). */
 ray_t* distinct_vec_eager(ray_t* x) {
     int64_t len = ray_len(x);
     if (len == 0) { ray_retain(x); return x; }
 
     /* Fast path: when a fresh, null-free sort index is attached, walk the
-     * permutation once to collect the first-in-run row ids.  The walk
-     * produces ids in value-ascending order (matching the hashset path's
-     * distinct_sort_indices contract) in O(n) with no hash table.
+     * permutation once to collect the first-in-run row ids (each value's
+     * first occurrence), in O(n) with no hash table.  The walk gives them in
+     * value order; they are put back in row order below.
      * Guard on ray_index_has to avoid a consult bump when no index exists
      * (mirrors the find fast-path's !has_nulls && ray_index_has gate). */
     if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR
@@ -2241,6 +2317,12 @@ ray_t* distinct_vec_eager(ray_t* x) {
         if (ids) {
             ray_idx_hits[IDX_SITE_DISTINCT]++;
             ray_idx_note_use(x);
+            /* one first-occurrence row per value, in value order: put the
+             * rows in row order */
+            if (!distinct_ids_in_row_order((int64_t*)ray_data(ids), count, len)) {
+                ray_release(ids);
+                return ray_error("oom", NULL);
+            }
             ray_t* result = gather_by_idx(x, (int64_t*)ray_data(ids), count);
             ray_release(ids);
             return result;
@@ -2318,8 +2400,8 @@ ray_t* distinct_vec_eager(ray_t* x) {
      * partition scheme as exec_count_distinct, producing the same row-id
      * set the hashset pass below would (one first-occurrence id per
      * value).  NULL means the kernel declined (type, size, pool, or
-     * memory) and the hashset handles it.  Either way the ids flow into the shared
-     * sort + gather tail, so result semantics are identical. */
+     * memory) and the hashset handles it.  Either way the ids are in row
+     * order and flow into the shared gather, so the results are identical. */
     int64_t count = 0;
     ray_t* rids = distinct_radix_first_ids(x);
     if (rids && RAY_IS_ERR(rids)) {
@@ -2357,11 +2439,9 @@ ray_t* distinct_vec_eager(ray_t* x) {
         hashset_destroy(&hs);
     }
 
-    /* Sort unique indices by value for numeric/temporal types — preserves
-     * pre-existing distinct semantics.  qsort-based; was O(count^2). */
-    if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR && count > 1) {
-        distinct_sort_indices(x, idx, count);
-    }
+    /* Every type keeps first-occurrence order (#1477): the hash passes and
+     * the radix kernel (which sweeps its first-row flags by row) all give
+     * the ids in row order already, so no sort follows. */
 
     ray_t* result = gather_by_idx(x, idx, count);
     if (idx != idx_stack) ray_free_raw(idx);
@@ -2541,17 +2621,6 @@ ray_t* ray_distinct_fn(ray_t* x) {
         }
     }
     result->len = count;
-    /* Atoms before vectors, the order the pairwise swap this replaces gave
-     * (each non-atom slot, left to right, swapped with the first atom after
-     * it): in one pass, as the next such atom is never left of the last. */
-    for (int64_t i = 0, p = 1; i < count; i++) {
-        if (ray_is_atom(out[i])) continue;
-        if (p <= i) p = i + 1;
-        while (p < count && !ray_is_atom(out[p])) p++;
-        if (p >= count) break;
-        ray_t* tmp = out[i]; out[i] = out[p]; out[p] = tmp;
-        p++;
-    }
     if (_bx) ray_release(_bx);
     return result;
 }
@@ -3250,7 +3319,8 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
     return result;
 }
 
-/* (union vec1 vec2) — elements in vec1 + elements in vec2 not already in vec1 */
+/* (union vec1 vec2) — a set: the distinct elements of vec1, then those of vec2 that
+ * vec1 lacks, each once, in order of first appearance. */
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     if (ray_is_lazy(vec1)) vec1 = ray_lazy_materialize(vec1);
     if (ray_is_lazy(vec2)) vec2 = ray_lazy_materialize(vec2);
@@ -3278,10 +3348,60 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
-        for (int64_t j = 0; j < k1->len; j++) hashset_insert(&hs, j);
+        /* A union is a set: the rows of vec1 that are not an earlier row's duplicate
+         * come first, in their order, then the rows of vec2 that vec1 lacks, once each.
+         * idx1 is only built when vec1 holds a duplicate. */
+        int64_t* idx1 = NULL;
+        int64_t kept1 = 0;
+        /* The rows of vec1 are told apart by their own cells.  Its keys (a span/point
+         * pair) are what vec2 is compared with and can make two points of vec1 collide
+         * (two timestamps a day apart have one time of day), so they only serve the
+         * probes below; without keys hs is that set and the pass below builds it.
+         * Two equal cells have equal keys: when no two keys collide vec1 holds no
+         * duplicate, and the second set is not built. */
+        hashset_t hs_own;
+        hashset_t* self = &hs;
+        bool own_ready = false;
+        bool exact_pass = true;
+        if (keys) {
+            bool key_dup = false;
+            for (int64_t j = 0; j < k1->len; j++)
+                if (!hashset_insert(&hs, j)) key_dup = true;
+            exact_pass = key_dup;
+            kept1 = vec1->len;
+            if (key_dup) {
+                kept1 = 0;
+                if (!hashset_init(&hs_own, vec1, vec1->len)) {
+                    hashset_destroy(&hs);
+                    ray_release(keys);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
+                own_ready = true;
+                self = &hs_own;
+            }
+        }
+        for (int64_t j = 0; exact_pass && j < vec1->len; j++) {
+            if (hashset_insert(self, j)) {
+                if (idx1) idx1[kept1] = j;
+                kept1++;
+            } else if (!idx1) {
+                idx1 = (int64_t*)ray_alloc_raw((size_t)vec1->len * sizeof(int64_t));
+                if (!idx1) {
+                    if (own_ready) hashset_destroy(&hs_own);
+                    hashset_destroy(&hs);
+                    if (keys) ray_release(keys);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
+                for (int64_t r = 0; r < kept1; r++) idx1[r] = r;   /* the rows before the first duplicate are all kept */
+                /* j itself is the duplicate: not kept */
+            }
+        }
+        if (own_ready) hashset_destroy(&hs_own);
         /* hs contains only k1 row indices.  Track accepted k2 rows in a
          * separate set so repeated new RHS cells are appended just once,
-         * in their first-occurrence order, without changing k1 duplicates. */
+         * in their first-occurrence order. */
         hashset_t added;
         bool added_ready = false;
         int8_t v2_type = k2->type;
@@ -3294,6 +3414,7 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (!added_ready) {
                 if (!hashset_init(&added, k2, len2)) {
                     hashset_destroy(&hs);
+                    if (idx1) ray_free_raw(idx1);
                     if (keys) ray_release(keys);
                     if (idx != idx_stack) ray_free_raw(idx);
                     return ray_error("oom", NULL);
@@ -3307,8 +3428,15 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
         if (keys) ray_release(keys);
         ray_t* part2 = gather_by_idx(vec2, idx, extra);
         if (idx != idx_stack) ray_free_raw(idx);
-        if (RAY_IS_ERR(part2)) return part2;
-        ray_t* result = ray_concat_fn(vec1, part2);
+        if (RAY_IS_ERR(part2)) { if (idx1) ray_free_raw(idx1); return part2; }
+        ray_t* part1 = vec1;
+        if (idx1) {
+            part1 = gather_by_idx(vec1, idx1, kept1);
+            ray_free_raw(idx1);
+            if (RAY_IS_ERR(part1)) { ray_release(part2); return part1; }
+        }
+        ray_t* result = ray_concat_fn(part1, part2);
+        if (idx1) ray_release(part1);
         ray_release(part2);
         return result;
     }
@@ -3329,11 +3457,9 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     result->type = RAY_LIST;
     ray_t** out = (ray_t**)ray_data(result);
     int64_t count = 0;
-    for (int64_t i = 0; i < len1; i++) { ray_retain(e1[i]); out[count++] = e1[i]; }
-    if ((len1 + len2) * len2 >= 2 * LIST_SET_MIN_PAIRS) {
-        /* A cell of vec2 is added when no cell kept so far (all of vec1,
-         * then vec2's added cells) equals it.  The scan meets up to
-         * len1 + len2 cells per probe, half that on average. */
+    /* A union is a set: a cell of vec1, then of vec2, is added when no cell kept so
+     * far equals it, so the duplicates of vec1 go too. */
+    if ((len1 + len2) * (len1 + len2) >= 2 * LIST_SET_MIN_PAIRS) {
         list_set_t s;
         if (!list_set_init(&s, out, len1 + len2, ray_key_spans(vec1) | ray_key_spans(vec2))) {
             result->len = count;
@@ -3342,21 +3468,28 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (_bx2) ray_release(_bx2);
             return ray_error("oom", NULL);
         }
-        for (int64_t i = 0; i < len1; i++) list_set_add(&s, i, ray_key_hash(e1[i], s.spans));
-        for (int64_t i = 0; i < len2; i++) {
-            uint64_t h = ray_key_hash(e2[i], s.spans);
-            if (list_set_has(&s, e2[i], h, false)) continue;
-            ray_retain(e2[i]);
-            out[count] = e2[i];
-            list_set_add(&s, count++, h);
+        for (int pass = 0; pass < 2; pass++) {
+            ray_t** src = pass ? e2 : e1;
+            int64_t n = pass ? len2 : len1;
+            for (int64_t i = 0; i < n; i++) {
+                uint64_t h = ray_key_hash(src[i], s.spans);
+                if (list_set_has(&s, src[i], h, false)) continue;
+                ray_retain(src[i]);
+                out[count] = src[i];
+                list_set_add(&s, count++, h);
+            }
         }
         list_set_destroy(&s);
     } else {
-        for (int64_t i = 0; i < len2; i++) {
-            int found = 0;
-            for (int64_t j = 0; j < count; j++)
-                if (atom_eq(out[j], e2[i])) { found = 1; break; }
-            if (!found) { ray_retain(e2[i]); out[count++] = e2[i]; }
+        for (int pass = 0; pass < 2; pass++) {
+            ray_t** src = pass ? e2 : e1;
+            int64_t n = pass ? len2 : len1;
+            for (int64_t i = 0; i < n; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < count; j++)
+                    if (atom_eq(out[j], src[i])) { found = 1; break; }
+                if (!found) { ray_retain(src[i]); out[count++] = src[i]; }
+            }
         }
     }
     result->len = count;
