@@ -598,8 +598,23 @@ static ray_t* str_find_vec(ray_t* hay, const str_needle_t* pattern) {
     return out;
 }
 
+static ray_t* str_find_impl(ray_t* hay, ray_t* pattern);
+
+/* str-find is lazy-aware for its haystack only (a lazy one extends its
+ * chain).  A lazy pattern is borrowed, and ray_lazy_materialize consumes
+ * its argument: materialise an owned reference, never the caller's (#1423;
+ * consuming the borrowed one freed the caller's value under it). */
 ray_t* ray_str_find_fn(ray_t* hay, ray_t* pattern) {
-    if (ray_is_lazy(pattern)) pattern = ray_lazy_materialize(pattern);
+    if (!ray_is_lazy(pattern)) return str_find_impl(hay, pattern);
+    ray_retain(pattern);
+    ray_t* pat = ray_lazy_materialize(pattern);
+    if (!pat || RAY_IS_ERR(pat)) return pat ? pat : ray_error("oom", NULL);
+    ray_t* out = str_find_impl(hay, pat);
+    ray_release(pat);
+    return out;
+}
+
+static ray_t* str_find_impl(ray_t* hay, ray_t* pattern) {
     if (!hay || RAY_IS_ERR(hay)) return hay;
     if (!pattern || RAY_IS_ERR(pattern)) return pattern;
 
@@ -703,8 +718,7 @@ static bool str_size_add(size_t* total, size_t add) {
 }
 
 ray_t* ray_str_join_fn(ray_t* items, ray_t* delim) {
-    if (ray_is_lazy(items)) items = ray_lazy_materialize(items);
-    if (ray_is_lazy(delim)) delim = ray_lazy_materialize(delim);
+    /* Not lazy-aware: eval materialises both arguments before the call. */
     if (!items || RAY_IS_ERR(items)) return items;
     if (!delim || RAY_IS_ERR(delim)) return delim;
 
