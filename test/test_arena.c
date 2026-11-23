@@ -26,6 +26,7 @@
 #include <rayforce.h>
 #include "mem/heap.h"
 #include "mem/arena.h"
+#include "mem/sys.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -435,9 +436,18 @@ static test_result_t test_arena_spills_past_watermark(void) {
     SKIP("file-backed spill is POSIX-only");
 #endif
     ray_heap_init();
-    ray_heap_direct_cache_drain();
-    int64_t base = ray_heap_anon_committed();
     int64_t previous = ray_heap_anon_watermark();
+    /* A block about to cross the watermark first makes room
+     * (heap_make_room): it drains the direct-block cache and unmaps the empty
+     * anonymous pools of this thread's heap and of the parked pool workers'.
+     * Whatever earlier tests in this process left there would leave with the
+     * arena's first spilled chunk and read as a shortfall after the destroy
+     * (#1293).  Cross the watermark once here, with a block that spills, so
+     * the footprint measured below is one the arena's growth cannot reduce. */
+    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+    void* probe = ray_sys_alloc((size_t)1 << 20);   /* RAY_SYS_SPILL_MIN */
+    ray_sys_free(probe);
+    int64_t base = ray_heap_anon_committed();
     ray_heap_set_anon_watermark(base + INT64_C(4) * 1024 * 1024);
 
     ray_arena_t* arena = ray_arena_new(64 * 1024);
@@ -471,6 +481,18 @@ static test_result_t test_arena_spills_past_watermark(void) {
     PASS();
 }
 
+/* #1293: the same, on a heap an earlier test left up with empty pools (any
+ * test without a setup leaves the thread's heap as it found it). */
+static test_result_t test_arena_spills_after_empty_pools(void) {
+    ray_heap_init();
+    ray_t* b[3];
+    for (int i = 0; i < 3; i++) b[i] = ray_alloc((16u << 20) - 4096);   /* a pool each */
+    bool mapped = b[0] && b[1] && b[2];
+    for (int i = 0; i < 3; i++) if (b[i]) ray_free(b[i]);
+    TEST_ASSERT_TRUE(mapped);
+    return test_arena_spills_past_watermark();
+}
+
 /* ---- ray_arena_reset NULL arena guard ----------------------------------- */
 
 static test_result_t test_arena_reset_null(void) {
@@ -500,6 +522,7 @@ const test_entry_t arena_entries[] = {
     { "arena/total_used_multi_chunk",   test_arena_total_used_multi_chunk,   NULL, NULL },
     { "arena/reset_null",               test_arena_reset_null,               NULL, NULL },
     { "arena/spills_past_watermark",    test_arena_spills_past_watermark,    NULL, NULL },
+    { "arena/spills_after_empty_pools", test_arena_spills_after_empty_pools, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
