@@ -1350,8 +1350,9 @@ static test_result_t test_count_distinct_runs_partitions(void) {
 
     /* distinct values shares the partition function and slots its own
      * table on the top bits of val * K1: 1M distinct values, then 1M
-     * multiples of 4096, each kept once, ascending (a partition on those
-     * same bits packs its values into 1/P of the table: minutes) */
+     * multiples of 4096, each kept once, in first-occurrence order, so the
+     * output is the input (#1477) (a partition on those same bits packs its
+     * values into 1/P of the table: minutes) */
     const int64_t m = (int64_t)1 << 20;
     for (int pass = 0; pass < 2; pass++) {
         v = ray_vec_new(RAY_I64, m);
@@ -1364,14 +1365,9 @@ static test_result_t test_count_distinct_runs_partitions(void) {
         TEST_ASSERT(d && !RAY_IS_ERR(d), "distinct values");
         TEST_ASSERT_EQ_I(d->len, m);
         const int64_t* q64 = (const int64_t*)ray_data(d);
-        int64_t rising = 0, sum_in = 0, sum_out = 0;
-        for (int64_t i = 0; i < m; i++) {
-            rising += i == 0 || q64[i] > q64[i - 1];
-            sum_in += p[i];
-            sum_out += q64[i];
-        }
-        TEST_ASSERT_EQ_I(rising, m);
-        TEST_ASSERT_EQ_I(sum_out, sum_in);
+        int64_t same = 0;
+        for (int64_t i = 0; i < m; i++) same += q64[i] == p[i];
+        TEST_ASSERT_EQ_I(same, m);
         ray_release(d);
         ray_release(v);
     }

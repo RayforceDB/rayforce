@@ -560,10 +560,20 @@ Last element of a vector.
 
 ### `(distinct x)` — aggregate
 
-Unique elements of a vector.
+Unique elements of a vector or list, in the order values first appear. A list
+keeps each cell where it first occurs, whether its cells are atoms, vectors or
+nested lists.
+
+List cells are equal when their values are, the rule `distinct`,
+`except`, `sect`, `union`, `group`, `xkey` and keyed-table `==` share: a
+vector cell equals one of the same type, length and elements, and in F64
+and F32 vector cells, as between float atoms, negative zero equals positive
+zero. NaN, the F64 null, equals NaN and no number.
 
 ```lisp
-(distinct [1 2 2 3 1])  ; [1 2 3]
+(distinct [3 1 3 2 1])          ; [3 1 2], in the order values first appear
+(distinct (list [1] [2] 3 [1])) ; [[1] [2] 3]
+(count (distinct (list [0.0] (enlist (neg 0.0))))) ; 1
 ```
 
 ## Ordering

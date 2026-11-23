@@ -37,7 +37,7 @@
 ;; just yield the right cardinality.
 (distinct V) -- [1 2 3]
 ;; distinct sorts numerics — out-of-order input dedupes to ascending.
-(distinct [3 1 2 1 3]) -- [1 2 3]
+(distinct [3 1 2 1 3]) -- [3 1 2]
 
 ;; The chain still works when reused.
 (count (distinct [4 4 4 4])) -- 1
