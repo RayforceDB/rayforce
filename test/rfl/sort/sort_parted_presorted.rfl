@@ -134,8 +134,8 @@
 ;; ══════════════════════════════════════════════════════════════════════════
 (set Bg (at (.sys.mem) 'sort-perpart-runs))
 ;; DECLINED (aggregate output) → an aggregate under a sort without by: is
-;; refused, as it is over a flat table (`nyi`).
-(select {Tot: (sum Seq) from: Pp asc: Time}) !- nyi
+;; refused with a name error: Time names no aggregate output.
+(select {Tot: (sum Seq) from: Pp asc: Time}) !- name
 (set Ag (at (.sys.mem) 'sort-perpart-runs))
 (- Ag Bg) -- 0
 

@@ -1,0 +1,30 @@
+;; @also-unfused
+;; Missing sort names must report the name on DAG and evaluator routes.
+;; Plain selects may still carry source-only keys; grouped/aggregate results cannot.
+(set T (table [a b c k] (list [3 1 2] [0 2 1] [9 7 8] [0 1 0])))
+(select {r: a from: T asc: zz}) !- name
+(at (try (select {r: a from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: a from: T desc: zz take: 1}) !- name
+(at (try (select {r: a from: T desc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: a from: T where: (> a 0) asc: zz take: 1}) !- name
+(at (try (select {r: a from: T where: (> a 0) asc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: (+ (min a a) 1) from: T asc: zz}) !- name
+(at (try (select {r: (+ (min a a) 1) from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: (sum a) from: T by: k asc: zz}) !- name
+(at (try (select {r: (sum a) from: T by: k asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {from: T asc: zz}) !- name
+(at (try (select {from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: (sum a) from: T by: k asc: c}) !- name
+(at (try (select {r: (sum a) from: T by: k asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' names no output column"
+(select {r: (sum a) from: T asc: c}) !- name
+(at (try (select {r: (sum a) from: T asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' names no output column"
+(select {r: a from: T asc: [r zz]}) !- name
+(at (try (select {r: a from: T asc: [r zz]}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: a from: T where: (> a 99) asc: zz}) !- name
+(at (try (select {r: a from: T where: (> a 99) asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+
+;; Positive output bindings and the plain-select source-only carry remain valid.
+(select {r: a from: T asc: c}) -- (table [r] (list [1 2 3]))
+(select {r: (+ a 1) from: T asc: r}) -- (table [r] (list [2 3 4]))
+(select {c: a from: T asc: c}) -- (table [c] (list [1 2 3]))
+(select {r: (sum a) from: T by: k asc: r}) -- (xasc (select {r: (sum a) from: T by: k}) 'r)
