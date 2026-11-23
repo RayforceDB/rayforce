@@ -203,6 +203,7 @@ Rayfall performs automatic type promotion in certain contexts. These coercions h
     - **f32 op f32 → f32:** `+ - * div % min max` over two f32 values (vectors or atoms) keep f32; `/` answers f64. Mixing f32 with any other type, integer or f64, widens to f64. An f32 result of these operators that overflows the f32 range is null, for atoms as for vectors; only a cast with `as 'F32` or an f32 literal saturates (see above).
     - **b8 with b8:** `+ - * div %` of two booleans give i64 (`(+ true true)` is `2`); `min` and `max` of two booleans give b8.
     - **f32 selection keeps f32:** `min`, `max`, `first`, `last` (also as `select` or `by:` columns), the scans `mins`, `maxs`, `mmin`, `mmax`, and `fill` return f32 for an f32 vector. `sum`, `avg`, `med`, `var`, and `dev` widen to f64.
+    - **Query `if` arms:** in a `select` or `update`, the two arms of an `if` give one column. Numeric arms take the promotion table; two arms of one temporal type keep it, and a temporal arm beside a null literal keeps its own type. Two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) have no common type: `(if c d ts)` raises `type` rather than mixing day and nanosecond counts. Convert one arm with `as` first.
     - **bool → 1/0:** Booleans count as 1/0 in arithmetic contexts.
     - **i64 → bool:** In boolean contexts (if, cond), 0 is false, non-zero is true.
     - **Narrower → wider:** Comparisons across numeric types promote the narrower operand.

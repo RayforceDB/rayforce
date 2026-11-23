@@ -1,0 +1,235 @@
+;; @also-unfused
+;; An `if` whose two arms are different temporal types (any two of DATE,
+;; TIME, TIMESTAMP and TIMESPAN) raises `type`, as other arm pairs with no
+;; common type do (#1337).  The planner folded the pair into one integer
+;; lane, and the fill blended the raw counts: days beside nanoseconds.  The
+;; refusal is OP_IF's type promotion (ray_if, src/ops/graph.c), so every
+;; route raises it: a column or an atom on either arm, a per-row or a
+;; one-value condition, select (keyless, where:, by:, a by: key, an
+;; aggregate's argument) and update.  A temporal arm beside a null literal,
+;; typed or not, keeps its type, and so do two arms of the same type.
+
+(set T (table [g i k d t p s] (list [0 1 1] [10 20 30] [a a b] (+ 2024.01.01 (til 3)) (as 'TIME [3600000 7200000 10800000]) (+ 2024.01.01D01:00:00.000000000 (* 3600000000000 (til 3))) (as 'TIMESPAN [3600000000000 7200000000000 10800000000000]))))
+(set R (fn [x] (at x 'r)))
+
+;; ── the issue's example ─────────────────────────────────────────────────────
+(set TI (table [g d p] (list [0 1 1] (+ 2024.01.01 (til 3)) (as 'TIMESTAMP [1000 2000 3000]))))
+(at (select {from: TI r: (if (> g 0) d p)}) 'r) !- type
+(try (at (select {from: TI r: (if (> g 0) d p)}) 'r) (fn [e] (at e 'msg))) -- "if: branches mix DATE and TIMESTAMP"
+
+;; ── DATE then TIME ──
+(select {from: T r: (if (> g 0) d t)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 10:00:00.000)}) !- type
+(select {from: T r: (if (> g 0) d 10:00:00.000)}) !- type
+(select {from: T r: (if true d t)}) !- type
+(select {from: T r: (if (> g 0) d t) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) d t) by: k}) !- type
+(select {from: T r: (first (if (> g 0) d t)) by: k}) !- type
+(update {from: T r: (if (> g 0) d t)}) !- type
+
+;; ── DATE then TIMESTAMP ──
+(select {from: T r: (if (> g 0) d p)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) d 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if true d p)}) !- type
+(select {from: T r: (if (> g 0) d p) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) d p) by: k}) !- type
+(select {from: T r: (first (if (> g 0) d p)) by: k}) !- type
+(update {from: T r: (if (> g 0) d p)}) !- type
+
+;; ── DATE then TIMESPAN ──
+(select {from: T r: (if (> g 0) d s)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) d 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if true d s)}) !- type
+(select {from: T r: (if (> g 0) d s) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) d s) by: k}) !- type
+(select {from: T r: (first (if (> g 0) d s)) by: k}) !- type
+(update {from: T r: (if (> g 0) d s)}) !- type
+
+;; ── TIME then DATE ──
+(select {from: T r: (if (> g 0) t d)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 2020.01.01)}) !- type
+(select {from: T r: (if (> g 0) t 2020.01.01)}) !- type
+(select {from: T r: (if true t d)}) !- type
+(select {from: T r: (if (> g 0) t d) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) t d) by: k}) !- type
+(select {from: T r: (first (if (> g 0) t d)) by: k}) !- type
+(update {from: T r: (if (> g 0) t d)}) !- type
+
+;; ── TIME then TIMESTAMP ──
+(select {from: T r: (if (> g 0) t p)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) t 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if true t p)}) !- type
+(select {from: T r: (if (> g 0) t p) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) t p) by: k}) !- type
+(select {from: T r: (first (if (> g 0) t p)) by: k}) !- type
+(update {from: T r: (if (> g 0) t p)}) !- type
+
+;; ── TIME then TIMESPAN ──
+(select {from: T r: (if (> g 0) t s)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) t 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if true t s)}) !- type
+(select {from: T r: (if (> g 0) t s) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) t s) by: k}) !- type
+(select {from: T r: (first (if (> g 0) t s)) by: k}) !- type
+(update {from: T r: (if (> g 0) t s)}) !- type
+
+;; ── TIMESTAMP then DATE ──
+(select {from: T r: (if (> g 0) p d)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 2020.01.01)}) !- type
+(select {from: T r: (if (> g 0) p 2020.01.01)}) !- type
+(select {from: T r: (if true p d)}) !- type
+(select {from: T r: (if (> g 0) p d) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) p d) by: k}) !- type
+(select {from: T r: (first (if (> g 0) p d)) by: k}) !- type
+(update {from: T r: (if (> g 0) p d)}) !- type
+
+;; ── TIMESTAMP then TIME ──
+(select {from: T r: (if (> g 0) p t)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 10:00:00.000)}) !- type
+(select {from: T r: (if (> g 0) p 10:00:00.000)}) !- type
+(select {from: T r: (if true p t)}) !- type
+(select {from: T r: (if (> g 0) p t) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) p t) by: k}) !- type
+(select {from: T r: (first (if (> g 0) p t)) by: k}) !- type
+(update {from: T r: (if (> g 0) p t)}) !- type
+
+;; ── TIMESTAMP then TIMESPAN ──
+(select {from: T r: (if (> g 0) p s)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) p 0D10:00:00.000000000)}) !- type
+(select {from: T r: (if true p s)}) !- type
+(select {from: T r: (if (> g 0) p s) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) p s) by: k}) !- type
+(select {from: T r: (first (if (> g 0) p s)) by: k}) !- type
+(update {from: T r: (if (> g 0) p s)}) !- type
+
+;; ── TIMESPAN then DATE ──
+(select {from: T r: (if (> g 0) s d)}) !- type
+(select {from: T r: (if (> g 0) 0D10:00:00.000000000 2020.01.01)}) !- type
+(select {from: T r: (if (> g 0) s 2020.01.01)}) !- type
+(select {from: T r: (if true s d)}) !- type
+(select {from: T r: (if (> g 0) s d) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) s d) by: k}) !- type
+(select {from: T r: (first (if (> g 0) s d)) by: k}) !- type
+(update {from: T r: (if (> g 0) s d)}) !- type
+
+;; ── TIMESPAN then TIME ──
+(select {from: T r: (if (> g 0) s t)}) !- type
+(select {from: T r: (if (> g 0) 0D10:00:00.000000000 10:00:00.000)}) !- type
+(select {from: T r: (if (> g 0) s 10:00:00.000)}) !- type
+(select {from: T r: (if true s t)}) !- type
+(select {from: T r: (if (> g 0) s t) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) s t) by: k}) !- type
+(select {from: T r: (first (if (> g 0) s t)) by: k}) !- type
+(update {from: T r: (if (> g 0) s t)}) !- type
+
+;; ── TIMESPAN then TIMESTAMP ──
+(select {from: T r: (if (> g 0) s p)}) !- type
+(select {from: T r: (if (> g 0) 0D10:00:00.000000000 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if (> g 0) s 2020.01.01D10:00:00.000000000)}) !- type
+(select {from: T r: (if true s p)}) !- type
+(select {from: T r: (if (> g 0) s p) where: (> i 15)}) !- type
+(select {from: T r: (if (> g 0) s p) by: k}) !- type
+(select {from: T r: (first (if (> g 0) s p)) by: k}) !- type
+(update {from: T r: (if (> g 0) s p)}) !- type
+
+
+;; ── one type on both arms, an atom of that type, and null arms ────────────
+(R (select {from: T r: (if (> g 0) d d)})) -- [2024.01.01 2024.01.02 2024.01.03]
+(type (R (select {from: T r: (if (> g 0) d 2020.01.01)}))) -- 'DATE
+(R (select {from: T r: (if (> g 0) d 2020.01.01)})) -- [2020.01.01 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 2020.01.01 d) where: (> i 15)})) -- [2020.01.01 2020.01.01]
+(R (select {from: T r: (last (if (> g 0) d 2020.01.01)) by: k})) -- [2024.01.02 2024.01.03]
+(R (update {from: T r: (if (> g 0) d d)})) -- [2024.01.01 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) d 0N)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0N d)})) -- [2024.01.01 0Nd 0Nd]
+(R (select {from: T r: (if (> g 0) d 0Nd)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0Nd d)})) -- [2024.01.01 0Nd 0Nd]
+(R (select {from: T r: (if (> g 0) d 0Nt)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0Nt d)})) -- [2024.01.01 0Nd 0Nd]
+(R (select {from: T r: (if (> g 0) d 0Np)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0Np d)})) -- [2024.01.01 0Nd 0Nd]
+(R (select {from: T r: (if (> g 0) d 0Nn)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0Nn d)})) -- [2024.01.01 0Nd 0Nd]
+(R (update {from: T r: (if (> g 0) 0N d) where: (> i 15)})) -- [0Nd 0Nd 0Nd]
+(R (select {from: T r: (if (> g 0) t t)})) -- [01:00:00.000 02:00:00.000 03:00:00.000]
+(type (R (select {from: T r: (if (> g 0) t 10:00:00.000)}))) -- 'TIME
+(R (select {from: T r: (if (> g 0) t 10:00:00.000)})) -- [10:00:00.000 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 10:00:00.000 t) where: (> i 15)})) -- [10:00:00.000 10:00:00.000]
+(R (select {from: T r: (last (if (> g 0) t 10:00:00.000)) by: k})) -- [02:00:00.000 03:00:00.000]
+(R (update {from: T r: (if (> g 0) t t)})) -- [01:00:00.000 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) t 0N)})) -- [0Nt 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 0N t)})) -- [01:00:00.000 0Nt 0Nt]
+(R (select {from: T r: (if (> g 0) t 0Nt)})) -- [0Nt 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 0Nt t)})) -- [01:00:00.000 0Nt 0Nt]
+(R (select {from: T r: (if (> g 0) t 0Nd)})) -- [0Nt 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 0Nd t)})) -- [01:00:00.000 0Nt 0Nt]
+(R (select {from: T r: (if (> g 0) t 0Np)})) -- [0Nt 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 0Np t)})) -- [01:00:00.000 0Nt 0Nt]
+(R (select {from: T r: (if (> g 0) t 0Nn)})) -- [0Nt 02:00:00.000 03:00:00.000]
+(R (select {from: T r: (if (> g 0) 0Nn t)})) -- [01:00:00.000 0Nt 0Nt]
+(R (update {from: T r: (if (> g 0) 0N t) where: (> i 15)})) -- [0Nt 0Nt 0Nt]
+(R (select {from: T r: (if (> g 0) p p)})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(type (R (select {from: T r: (if (> g 0) p 2020.01.01D10:00:00.000000000)}))) -- 'TIMESTAMP
+(R (select {from: T r: (if (> g 0) p 2020.01.01D10:00:00.000000000)})) -- [2020.01.01D10:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 p) where: (> i 15)})) -- [2020.01.01D10:00:00.000000000 2020.01.01D10:00:00.000000000]
+(R (select {from: T r: (last (if (> g 0) p 2020.01.01D10:00:00.000000000)) by: k})) -- [2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (update {from: T r: (if (> g 0) p p)})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) p 0N)})) -- [0Np 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0N p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (select {from: T r: (if (> g 0) p 0Np)})) -- [0Np 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Np p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (select {from: T r: (if (> g 0) p 0Nd)})) -- [0Np 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nd p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (select {from: T r: (if (> g 0) p 0Nt)})) -- [0Np 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nt p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (select {from: T r: (if (> g 0) p 0Nn)})) -- [0Np 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nn p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (update {from: T r: (if (> g 0) 0N p) where: (> i 15)})) -- [0Np 0Np 0Np]
+(R (select {from: T r: (if (> g 0) s s)})) -- [0D01:00:00.000000000 0D02:00:00.000000000 0D03:00:00.000000000]
+(type (R (select {from: T r: (if (> g 0) s 0D10:00:00.000000000)}))) -- 'TIMESPAN
+(R (select {from: T r: (if (> g 0) s 0D10:00:00.000000000)})) -- [0D10:00:00.000000000 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0D10:00:00.000000000 s) where: (> i 15)})) -- [0D10:00:00.000000000 0D10:00:00.000000000]
+(R (select {from: T r: (last (if (> g 0) s 0D10:00:00.000000000)) by: k})) -- [0D02:00:00.000000000 0D03:00:00.000000000]
+(R (update {from: T r: (if (> g 0) s s)})) -- [0D01:00:00.000000000 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) s 0N)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0N s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
+(R (select {from: T r: (if (> g 0) s 0Nn)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nn s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
+(R (select {from: T r: (if (> g 0) s 0Nd)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nd s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
+(R (select {from: T r: (if (> g 0) s 0Nt)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Nt s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
+(R (select {from: T r: (if (> g 0) s 0Np)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(R (select {from: T r: (if (> g 0) 0Np s)})) -- [0D01:00:00.000000000 0Nn 0Nn]
+(R (update {from: T r: (if (> g 0) 0N s) where: (> i 15)})) -- [0Nn 0Nn 0Nn]
+
+;; ── chains, nesting, cond, and other places an `if` sits ───────────────────
+(select {from: T r: (if (> g 1) d (> g 0) d p)}) !- type
+(select {from: T r: (if (> g 0) (if (> i 0) d d) p)}) !- type
+(select {from: T r: (cond ((> g 0) d) (else p))}) !- type
+(select {from: T r: (if (> g 0) (+ d 1) p)}) !- type
+(select {from: T r: (+ 1 (if (> g 0) d p))}) !- type
+(select {from: T r: (max (if (> g 0) d p))}) !- type
+(select {from: T r: (count (if (> g 0) d p))}) !- type
+(select {from: T r: (first (if (> g 0) d p))}) !- type
+(select {from: T r: (count i) by: (if (> g 0) d p)}) !- type
+(select {from: T r: i where: (> (if (> g 0) d p) 0)}) !- type
+(update {from: T r: (if (> g 0) d p) where: (> i 15)}) !- type
+(update {from: T r: (if (> g 0) d p) by: k}) !- type
+(update {from: T d: (if (> g 0) d p)}) !- type
+(try (at (select {from: T r: (if (> g 0) s t)}) 'r) (fn [e] (at e 'msg))) -- "if: branches mix TIMESPAN and TIME"
+(R (select {from: T r: (if (> g 1) d (> g 0) d 0Np)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (cond ((> g 0) p) (else p))})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
+
+;; ── a temporal beside a number still promotes, as before ────────────────────
+(R (select {from: T r: (if (> g 0) d i)})) -- [10 8767 8768]
+(R (select {from: T r: (if (> g 0) i 1.5)})) -- [1.5 20.0 30.0]
+
+;; ── outside a query `if` is control flow: one arm is evaluated ──────────────
+(if true 2024.01.01 2024.01.01D00:00:00.000000000) -- 2024.01.01
+(if false 2024.01.01 2024.01.01D00:00:00.000000000) -- 2024.01.01D00:00:00.000000000
