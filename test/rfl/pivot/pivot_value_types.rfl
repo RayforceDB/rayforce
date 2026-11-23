@@ -328,21 +328,21 @@
 (identical (pivot W 'k 'p 'fTIMESPAN first) (pivot W 'k 'p 'fTIMESPAN (fn [x] (first x)))) -- true
 (identical (pivot W 'k 'p 'lTIMESPAN last) (pivot W 'k 'p 'lTIMESPAN (fn [x] (last x)))) -- true
 (set R (pivot W 'k 'p 'fI64 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 6] [2 4 0Nl]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 0Nl] [2 4 0Nl]))) -- true
 (set R (pivot W 'k 'p 'lI64 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 0Nl] [2 4 0Nl]))) -- true
 (identical (pivot W 'k 'p 'fI64 first) (pivot W 'k 'p 'fI64 (fn [x] (first x)))) -- true
 (identical (pivot W 'k 'p 'lI64 last) (pivot W 'k 'p 'lI64 (fn [x] (last x)))) -- true
 (set R (pivot W 'k 'p 'fF64 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 6.0] [2.0 4.0 0Nf]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 0Nf] [2.0 4.0 0Nf]))) -- true
 (set R (pivot W 'k 'p 'lF64 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.0] [2.0 4.0 0Nf]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 0Nf] [2.0 4.0 0Nf]))) -- true
 (identical (pivot W 'k 'p 'fF64 first) (pivot W 'k 'p 'fF64 (fn [x] (first x)))) -- true
 (identical (pivot W 'k 'p 'lF64 last) (pivot W 'k 'p 'lF64 (fn [x] (last x)))) -- true
 (set R (pivot W 'k 'p 'fF32 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 6e] [2e 4e 0Ne]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 0Ne] [2e 4e 0Ne]))) -- true
 (set R (pivot W 'k 'p 'lF32 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 5e] [2e 4e 0Ne]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 0Ne] [2e 4e 0Ne]))) -- true
 (identical (pivot W 'k 'p 'fF32 first) (pivot W 'k 'p 'fF32 (fn [x] (first x)))) -- true
 (identical (pivot W 'k 'p 'lF32 last) (pivot W 'k 'p 'lF32 (fn [x] (last x)))) -- true
 (set R (pivot W 'k 'p 'fSYM first))
@@ -756,21 +756,21 @@
 (identical (pivot P 'k 'p 'fTIMESPAN first) (pivot P 'k 'p 'fTIMESPAN (fn [x] (first x)))) -- true
 (identical (pivot P 'k 'p 'lTIMESPAN last) (pivot P 'k 'p 'lTIMESPAN (fn [x] (last x)))) -- true
 (set R (pivot P 'k 'p 'fI64 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 6] [2 4 0Nl]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 0Nl] [2 4 0Nl]))) -- true
 (set R (pivot P 'k 'p 'lI64 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 5] [2 4 0Nl]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1 3 0Nl] [2 4 0Nl]))) -- true
 (identical (pivot P 'k 'p 'fI64 first) (pivot P 'k 'p 'fI64 (fn [x] (first x)))) -- true
 (identical (pivot P 'k 'p 'lI64 last) (pivot P 'k 'p 'lI64 (fn [x] (last x)))) -- true
 (set R (pivot P 'k 'p 'fF64 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 6.0] [2.0 4.0 0Nf]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 0Nf] [2.0 4.0 0Nf]))) -- true
 (set R (pivot P 'k 'p 'lF64 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 5.0] [2.0 4.0 0Nf]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1.0 3.0 0Nf] [2.0 4.0 0Nf]))) -- true
 (identical (pivot P 'k 'p 'fF64 first) (pivot P 'k 'p 'fF64 (fn [x] (first x)))) -- true
 (identical (pivot P 'k 'p 'lF64 last) (pivot P 'k 'p 'lF64 (fn [x] (last x)))) -- true
 (set R (pivot P 'k 'p 'fF32 first))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 6e] [2e 4e 0Ne]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 0Ne] [2e 4e 0Ne]))) -- true
 (set R (pivot P 'k 'p 'lF32 last))
-(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 5e] [2e 4e 0Ne]))) -- true
+(identical R (table (as 'SYM (list "k" "x" "y")) (list (as 'SYM (list "a" "b" "c")) [1e 3e 0Ne] [2e 4e 0Ne]))) -- true
 (identical (pivot P 'k 'p 'fF32 first) (pivot P 'k 'p 'fF32 (fn [x] (first x)))) -- true
 (identical (pivot P 'k 'p 'lF32 last) (pivot P 'k 'p 'lF32 (fn [x] (last x)))) -- true
 (set R (pivot P 'k 'p 'fSYM first))

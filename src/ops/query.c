@@ -10616,6 +10616,27 @@ static ray_t* typed_vec_to_list(ray_t* tv, int64_t fill, int64_t n_groups) {
  * Returns either a typed vec (homogeneous scalars) or a LIST col. */
 typedef ray_t* (*idx_feeder_fn)(int64_t gi, void* state);
 
+static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last);
+
+/* `(first a)` / `(last a)` at the head of a by: output whose argument reads a
+ * column: its argument, and whether it is last.  Per group the argument's
+ * nulls are skipped, as in every select (#1368); the builtin outside a query
+ * is positional (#1420).  NULL: no such call. */
+static ray_t* nonagg_edge_arg(ray_t* e, ray_t* tbl, bool* last) {
+    if (!e || e->type != RAY_LIST || e->len != 2 || (e->attrs & ATTR_QUOTED)) return NULL;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || ray_env_has_lexical_local(h->i64) ||
+        tbl_has_col(tbl, h->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type != RAY_UNARY) return NULL;
+    void* fp = (void*)(uintptr_t)fn->i64;
+    *last = fp == (void*)ray_last_fn;
+    if (!*last && fp != (void*)ray_first_fn) return NULL;
+    if (expr_reads_no_column(es[1], tbl)) return NULL;
+    return es[1];
+}
+
 static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -10689,6 +10710,8 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
         return result ? result : ray_error("oom", NULL);
     }
 
+    bool edge_last = false;
+    ray_t* edge_arg = nonagg_edge_arg(expr, tbl, &edge_last);
     for (int64_t gi = 0; gi < n_groups; gi++) {
         ray_t* idx_list = feeder(gi, fstate);
         if (!idx_list) {
@@ -10710,7 +10733,16 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
         }
         ray_t* prev_group_idx = g_active_query_group_idx;
         g_active_query_group_idx = idx_list;
-        ray_t* cell = ray_eval(expr);
+        ray_t* cell;
+        if (edge_arg) {
+            ray_t* src = ray_eval(edge_arg);
+            if (src && !RAY_IS_ERR(src) && ray_is_lazy(src)) src = ray_lazy_materialize(src);
+            if (src && !RAY_IS_ERR(src)) {
+                cell = scalar_edge_skip_nulls(src, edge_last);
+                if (!cell) cell = edge_last ? ray_last_fn(src) : ray_first_fn(src);
+                ray_release(src);
+            } else cell = src;
+        } else cell = ray_eval(expr);
         g_active_query_group_idx = prev_group_idx;
         if (!cell || RAY_IS_ERR(cell)) {
             g_active_query_table = _aqt;

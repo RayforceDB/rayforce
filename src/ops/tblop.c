@@ -117,15 +117,15 @@ static bool pivot_dag_key_ok(int8_t t) {
  * calls the builtin per cell: its result type, or its own error (sum over
  * SYM, DATE, GUID or LIST is a `type` error).
  *
- * OP_PIVOT's first/last skip nulls; the builtin does so only for I64, F64
- * and F32, so a column of another nullable type that may hold a null takes
- * the generic route (the HAS_NULLS flag for the fixed-width types, a scan
- * for SYM, whose null is id 0 and carries no flag). */
+ * OP_PIVOT's first/last skip nulls; the builtin is positional for every
+ * type (#1420), so a column that may hold a null takes the generic route
+ * (the HAS_NULLS flag for the fixed-width types, a scan for SYM, whose null
+ * is id 0 and carries no flag). */
 static bool pivot_dag_agg_ok(uint16_t op, ray_t* v) {
     int8_t t = v->type;
     if ((op == OP_FIRST || op == OP_LAST) &&
-        (t == RAY_I16 || t == RAY_I32 || t == RAY_DATE || t == RAY_TIME ||
-         t == RAY_TIMESTAMP || t == RAY_TIMESPAN || t == RAY_SYM) &&
+        (t == RAY_I16 || t == RAY_I32 || t == RAY_I64 || t == RAY_F32 || t == RAY_F64 ||
+         t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN || t == RAY_SYM) &&
         (t == RAY_SYM ? ray_vec_has_nulls(v) : ray_vec_may_have_nulls(v)))
         return false;
     switch (t) {

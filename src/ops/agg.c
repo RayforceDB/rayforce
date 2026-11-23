@@ -573,14 +573,17 @@ static ray_t* colref_answer(ray_t* x, uint16_t op, bool* done) {
         break;
     default: break;
     }
-    bool elem_type = t == RAY_SYM || t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
+    /* first / last of a column reference are positional for every type, as
+     * over the vector (#1420) */
+    bool elem_type = t == RAY_SYM || t == RAY_I64 || t == RAY_F64 || t == RAY_F32 ||
+                     t == RAY_I32 || t == RAY_I16 || t == RAY_GUID || t == RAY_STR ||
                      t == RAY_BOOL || t == RAY_U8 || t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
     if (!r) {
         if (op == OP_COUNT) {
             r = make_i64(src.len);
         } else if (edge && elem_type) {
             r = ray_reduce_src_elem(&src, op == OP_LAST);
-            if (!r) {                                 /* SYM / STR / GUID: the column's own element */
+            if (!r) {                                 /* SYM / STR / GUID / TIMESPAN: the column's own element */
                 ray_col_src_release(&src);
                 ray_retain(x);                        /* materialize consumes one reference */
                 ray_t* v = ray_lazy_materialize(x);
@@ -1227,17 +1230,10 @@ ray_t* ray_first_fn(ray_t* x) {
     }
     if (ray_is_vec(x)) {
         if (ray_len(x) == 0) return ray_typed_null(-x->type);
-        /* For non-I64/F64 types route through collection_elem which
-         * preserves the element type.  The DAG path widens to i64 for
-         * DATE/TIME/TIMESTAMP/BOOL/U8 — bypass it. */
-        if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
-            x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
-            x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
-            int alloc = 0;
-            return collection_elem(x, 0, &alloc);
-        }
-        AGG_VEC_VIA_DAG(x, ray_first);
+        /* A direct call is positional for every type, nulls included (#1420):
+         * inside a select the query's own first/last skips them (#1368). */
+        int alloc = 0;
+        return collection_elem(x, 0, &alloc);
     }
     if (!is_list(x)) return ray_error("type", "first: unsupported type %s", ray_type_name(x->type));
     if (ray_len(x) == 0) return ray_typed_null(-RAY_I64);
@@ -1267,15 +1263,9 @@ ray_t* ray_last_fn(ray_t* x) {
     }
     if (ray_is_vec(x)) {
         if (ray_len(x) == 0) return ray_typed_null(-x->type);
-        /* See ray_first_fn for rationale on the type whitelist. */
-        if (x->type == RAY_SYM   || x->type == RAY_I32  || x->type == RAY_I16 ||
-            x->type == RAY_GUID  || x->type == RAY_STR  || x->type == RAY_BOOL ||
-            x->type == RAY_U8    || x->type == RAY_DATE || x->type == RAY_TIME ||
-            x->type == RAY_TIMESTAMP || x->type == RAY_TIMESPAN) {
-            int alloc = 0;
-            return collection_elem(x, ray_len(x) - 1, &alloc);
-        }
-        AGG_VEC_VIA_DAG(x, ray_last);
+        /* Positional for every type: see ray_first_fn. */
+        int alloc = 0;
+        return collection_elem(x, ray_len(x) - 1, &alloc);
     }
     if (!is_list(x)) return ray_error("type", "last: unsupported type %s", ray_type_name(x->type));
     int64_t len = ray_len(x);

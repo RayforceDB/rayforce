@@ -13,8 +13,9 @@
 (type (last v)) -- 'f32
 (type (min v)) -- 'f32
 (type (max v)) -- 'f32
-(first (as 'F32 [0Nf 2.5])) -- 2.5e
-(last (as 'F32 [2.5 0Nf])) -- 2.5e
+(first (as 'F32 [0Nf 2.5])) -- 0Ne
+(last (as 'F32 [2.5 0Nf])) -- 0Ne
+(at (select {f: (first v) from: (table [v] (list (as 'F32 [0Nf 2.5])))}) 'f) -- [2.5e]
 (type (mins v)) -- 'F32
 (type (maxs v)) -- 'F32
 (type (mmin 2 v)) -- 'F32
@@ -55,7 +56,7 @@
 (maxs (+ w w)) -- (as 'F32 [0Nf 2.0 2.0 4.0])
 (max (+ w w)) -- 4.0e
 (min (+ w w)) -- 2.0e
-(first (+ w w)) -- 2.0e
+(first (+ w w)) -- 0Ne
 (type (+ w (as 'F32 1.0))) -- 'F32
 (+ [1e308 1.0] [1e308 1.0]) -- [0Nf 2.0]
 (at (select {x: (+ w w) from: (table [w] (list w))}) 'x) -- (as 'F32 [0Nf 2.0 0Nf 4.0])

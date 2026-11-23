@@ -11,6 +11,8 @@
 (avg [10 20 0N 40]) -- 23.333333333333332
 (avg [0N 0N 5]) -- 5.0
 
-;; first/last skip leading/trailing nulls
-(first [0N 0N 7 8]) -- 7
-(last [7 8 0N 0N]) -- 8
+;; first/last outside a query are positional (#1420); in a select they skip nulls
+(first [0N 0N 7 8]) -- 0Nl
+(last [7 8 0N 0N]) -- 0Nl
+(at (select {f: (first v) from: (table [v] (list [0N 0N 7 8]))}) 'f) -- [7]
+(at (select {l: (last v) from: (table [v] (list [7 8 0N 0N]))}) 'l) -- [8]
