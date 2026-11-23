@@ -2253,12 +2253,67 @@ ray_t* ray_row_fn(ray_t* tbl, ray_t* idx) {
  * ══════════════════════════════════════════ */
 
 /* (union-all t1 t2) — concatenate two tables row-wise (same schema) */
+/* A table read with .db.parted.get keeps one segment per partition in each column and
+ * has a virtual partition column: none of them can be concatenated as vectors. */
+static bool table_is_parted(ray_t* t) {
+    int64_t n = ray_table_ncols(t);
+    for (int64_t c = 0; c < n; c++) {
+        ray_t* col = ray_table_col_idx(t, c);
+        if (col && !RAY_IS_ERR(col) && (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON))
+            return true;
+    }
+    return false;
+}
+
+/* A parted table (.db.parted.get) read into memory: one flat column per column of
+ * t, the partition-key column written out once per row, as (at t c) answers it. */
+static ray_t* table_materialise(ray_t* t) {
+    int64_t n = ray_table_ncols(t);
+    ray_t* out = ray_table_new(n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t c = 0; c < n; c++) {
+        int64_t name_id = ray_table_col_name(t, c);
+        ray_t* key = ray_sym(name_id);
+        ray_t* col = ray_at_fn(t, key);
+        ray_release(key);
+        /* a compressed partition answers a lazy column: it is read here, once */
+        if (col && !RAY_IS_ERR(col) && ray_is_lazy(col)) col = ray_lazy_materialize(col);
+        if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("oom", NULL); }
+        out = ray_table_add_col(out, name_id, col);
+        ray_release(col);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    return out;
+}
+
+static ray_t* union_all_flat(ray_t* t1, ray_t* t2);
+
+/* (union-all t1 t2): the rows of t1 then those of t2.  A parted table is read into
+ * memory first, as a table of its own columns, and the result is a plain table. */
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
     if (t1->type != RAY_TABLE)
         return ray_error("type", "union-all: first arg must be a table, got %s", ray_type_name(t1->type));
     if (t2->type != RAY_TABLE)
         return ray_error("type", "union-all: second arg must be a table, got %s", ray_type_name(t2->type));
+    ray_t* m1 = NULL;
+    ray_t* m2 = NULL;
+    if (table_is_parted(t1)) {
+        m1 = table_materialise(t1);
+        if (!m1 || RAY_IS_ERR(m1)) return m1 ? m1 : ray_error("oom", NULL);
+        t1 = m1;
+    }
+    if (table_is_parted(t2)) {
+        m2 = table_materialise(t2);
+        if (!m2 || RAY_IS_ERR(m2)) { if (m1) ray_release(m1); return m2 ? m2 : ray_error("oom", NULL); }
+        t2 = m2;
+    }
+    ray_t* r = union_all_flat(t1, t2);
+    if (m1) ray_release(m1);
+    if (m2) ray_release(m2);
+    return r;
+}
 
+static ray_t* union_all_flat(ray_t* t1, ray_t* t2) {
     int64_t ncols = ray_table_ncols(t1);
     if (ncols != ray_table_ncols(t2))
         return ray_error("type", "union-all: tables must have same number of columns, got %lld and %lld", (long long)ncols, (long long)ray_table_ncols(t2));

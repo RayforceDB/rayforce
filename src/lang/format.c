@@ -263,6 +263,20 @@ void ray_fmt_set_width(int cols) {
 /* Single type-name function. Negative type (atom) → lowercase,
  * positive type (vector/collection) → uppercase. */
 const char* ray_type_name(int8_t type) {
+    /* A parted column wraps a vector type (a column of a table read with
+     * .db.parted.get); its partition key is a virtual MAPCOMMON column.  The
+     * names rotate through four buffers so that one message can hold several: a
+     * message names at most two types, and the buffer is read before the next
+     * ray_type_name of the same thread comes four calls later.  A caller that keeps
+     * the pointer past its own printf has to copy it. */
+    if (type >= RAY_PARTED_BASE && type < RAY_MAPCOMMON) {
+        static _Thread_local char ring[4][24];
+        static _Thread_local unsigned next;
+        char* b = ring[next++ & 3];
+        snprintf(b, sizeof ring[0], "PARTED_%s", ray_type_name((int8_t)RAY_PARTED_BASETYPE(type)));
+        return b;
+    }
+    if (type == RAY_MAPCOMMON) return "MAPCOMMON";
     switch (type < 0 ? -type : type) {
     case RAY_BOOL:      return type < 0 ? "b8"        : "B8";
     case RAY_U8:        return type < 0 ? "u8"        : "U8";

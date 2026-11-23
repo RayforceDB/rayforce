@@ -1,0 +1,83 @@
+;; @requires: posix
+;; union-all concatenated the columns of two parted tables.  A parted column has
+;; one segment per partition and no elements of its own, so the "column" it built
+;; had no segments and the process crashed when the table was freed.  The owner decided
+;; (#1389): union-all reads a parted table into memory first and concatenates, the
+;; result a plain table with the partition key as a column.  concat of the parted
+;; columns themselves is refused, naming the types: ray_type_name had no name for a
+;; parted column or for the virtual partition key, and printed "?".
+;; The paths carry the pid: this suite may run beside another copy of itself.
+
+(set d (format "/tmp/rf_parted_concat_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf %" d))
+
+;; ────────────── two plain partitions: numbers, symbols, strings ──────────────
+(set Tp (table [a b s t] (list [1 2 3] [1.0 2.0 3.0] ['x 'y 'z] ["p" "q" "r"])))
+(.db.splayed.set (format "%/p/2024.01.01/t/" d) Tp)
+(.db.splayed.set (format "%/p/2024.01.02/t/" d) Tp)
+(set PT (.db.parted.get (format "%/p/" d) 't))
+(count PT) -- 6
+
+(set U (union-all PT PT))
+(count U) -- 12
+(type U) -- 'TABLE
+(key U) -- (key PT)
+(sum (at U 'a)) -- 24
+(sum (at U 'b)) -- 24.0
+(count (distinct (at U 'date))) -- 2
+(at U 's) -- (take ['x 'y 'z] 12)
+(at U 't) -- (take ["p" "q" "r"] 12)
+
+;; a plain copy read in by hand, in both orders, and a slice of the parted table
+(set MT (table (key PT) (map (fn [c] (at PT c)) (key PT))))
+(count (union-all MT MT)) -- 12
+(count (union-all PT MT)) -- 12
+(count (union-all MT PT)) -- 12
+(count (union-all PT (take MT 2))) -- 8
+(count (union-all (select {from: PT where: (> a 1)}) PT)) -- 10
+(count (union-all (select {from: PT where: (> a 1)}) (select {from: PT where: (> a 2)}))) -- 6
+(sum (at (union-all PT (select {from: PT where: (> a 2)})) 'a)) -- 18
+
+;; two parted roots
+(.db.splayed.set (format "%/q/2024.01.03/t/" d) Tp)
+(set QT (.db.parted.get (format "%/q/" d) 't))
+(count (union-all PT QT)) -- 9
+(count (union-all QT PT)) -- 9
+
+;; ────────────── nulls ──────────────
+(set Tn (table [a b] (list [1 0Nl 3] [1.0 0Nf 3.0])))
+(.db.splayed.set (format "%/n/2024.01.01/t/" d) Tn)
+(.db.splayed.set (format "%/n/2024.01.02/t/" d) Tn)
+(set NT (.db.parted.get (format "%/n/" d) 't))
+(count (at (union-all NT NT) 'a)) -- 12
+(sum (nil? (at (union-all NT NT) 'a))) -- 4
+(sum (nil? (at (union-all NT NT) 'b))) -- 4
+
+;; ────────────── compressed partitions (a lazy column, #1389 review) ──────────────
+(.db.splayed.set (format "%/c/2024.01.01/t/" d) Tp {compress: true})
+(.db.splayed.set (format "%/c/2024.01.02/t/" d) Tp {compress: true})
+(set CT (.db.parted.get (format "%/c/" d) 't))
+(count (union-all CT CT)) -- 12
+(sum (at (union-all CT CT) 'a)) -- 24
+(count (union-all CT PT)) -- 12
+(count (union-all PT CT)) -- 12
+
+;; ────────────── more rows than a morsel (65,536) ──────────────
+(set Big (table [a b] (list (til 70000) (as 'F64 (til 70000)))))
+(.db.splayed.set (format "%/b/2024.01.01/t/" d) Big)
+(.db.splayed.set (format "%/b/2024.01.02/t/" d) Big)
+(set BT (.db.parted.get (format "%/b/" d) 't))
+(count (union-all BT BT)) -- 280000
+(sum (at (union-all BT BT) 'a)) -- 9799860000
+(count (distinct (at (union-all BT BT) 'date))) -- 2
+
+;; ────────────── a schema mismatch is an error, not a crash ──────────────
+(at (try (union-all PT (table [x] (list [1 2 3]))) (fn [e] e)) 'code) -- 'type
+(at (try (union-all PT (table [date a b s z] (list [2024.01.01] [1] [1.0] ['x] ["p"]))) (fn [e] e)) 'code) -- 'type
+(at (try (union-all PT 5) (fn [e] e)) 'code) -- 'type
+
+;; ────────────── concat of parted tables is still refused (the owner is deciding) ──────────────
+;; the code only: what concat should do with parted tables is not settled here
+(at (try (concat PT PT) (fn [e] e)) 'code) -- 'type
+
+(.sys.exec (format "rm -rf %" d))
