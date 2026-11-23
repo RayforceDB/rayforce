@@ -3105,10 +3105,6 @@ static test_result_t test_eval_select_global_scalar(void) {
     PASS();
 }
 
-/* Multi-index pivot with mixed-type composite key: (sym, i64) index,
- * sym pivot col, i64 value col.  Regression against an older bug where
- * composite-key grouping dropped or duplicated rows.  Verify each
- * cell is the correct sum for its (a, b, c) combination. */
 /* pivot's first / last of a value column that may hold a null run as one
  * OP_PIVOT over row numbers (#1420), not per cell on the generic route: the
  * same answers, ~40x faster at 200k rows.  Pinned by the route's counter. */
@@ -3130,6 +3126,10 @@ static test_result_t test_eval_pivot_edge_by_row(void) {
     PASS();
 }
 
+/* Multi-index pivot with mixed-type composite key: (sym, i64) index,
+ * sym pivot col, i64 value col.  Regression against an older bug where
+ * composite-key grouping dropped or duplicated rows.  Verify each
+ * cell is the correct sum for its (a, b, c) combination. */
 static test_result_t test_eval_pivot_multi_index(void) {
     ray_t* r = ray_eval_str(
         "(do (set t (table [a b c v] (list "
