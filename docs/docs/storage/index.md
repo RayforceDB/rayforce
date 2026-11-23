@@ -97,6 +97,10 @@ does not read its own output back. The converters add no hash index of their
 own: a hash index is persisted only when the column carries one built with
 `.idx.hash` when the table is saved (a table resaved from an older store keeps
 a hash it already has), and a parted conversion builds none for its segments.
+A table save also persists the index behind a `grouped` or `parted` attribute,
+a `SYM` column's rebuilt over the symbol file's ids, and the column that index
+is ordered by: by name in a compressed file, by its position in the table in
+an uncompressed one, so it is restored only when the table is read whole.
 An index that cannot be written (for example, the disk fills) is dropped and the
 column is published without it. Writers to the same table serialize on
 `.write.lock`; readers resolve the manifest once and continue using that generation. The symbol vocabulary stays at its original

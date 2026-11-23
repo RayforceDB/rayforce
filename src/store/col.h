@@ -231,6 +231,21 @@ bool      ray_col_cold(ray_t* col);
 void      ray_col_want_row(ray_t* col, int64_t row);
 void      ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n);
 
+/* Generation 0: an index region has no place for the name of the column a
+ * HASH / PART is ordered by (order_sym), so a splayed save stores that
+ * column's position in the table instead, as RAY_IDX_ORDER_POS(pos); the
+ * table reader turns it back into the column's name (#838).  A position
+ * means nothing outside its table, and every reader compares order_sym with
+ * a symbol id, never a negative value, so a column loaded on its own just
+ * carries no order. */
+#define RAY_IDX_ORDER_POS(pos)   (-2 - (int64_t)(pos))
+#define RAY_IDX_ORDER_POS_OF(v)  (-2 - (int64_t)(v))
+
+/* Store `code` as the order_sym of the HASH / PART region of the
+ * generation-0 column file `path`.  RAY_OK, or RAY_ERR_DOMAIN when the file
+ * has no such region (left unchanged); best effort, like the region. */
+ray_err_t ray_col_set_index_order(const char* path, int64_t code);
+
 /* Append an inline index region to an existing (index-less) column file — used
  * by the streaming .csv.splayed builder which writes raw columns first.  `ix`
  * is a const ray_index_t* (void to avoid the ops/ type dependency in this

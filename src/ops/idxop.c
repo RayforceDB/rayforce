@@ -1278,11 +1278,12 @@ ray_t* ray_index_attach_built(ray_t** vp, ray_t* idx) {
     ray_index_t* ix = ray_index_payload(idx);
     bool is_dict = ix->kind == RAY_IDX_DICT;
     bool is_hash = ix->kind == RAY_IDX_HASH;
+    bool is_part = ix->kind == RAY_IDX_PART;
     bool is_marker = ix->kind == RAY_IDX_NONE && (ix->markers & RAY_MARK_UNIQUE);
     /* STR carries the dict and (since the vector-needle find work) the hash;
-     * SYM and GUID carry the hash.  rc=1 → ray_cow no-op. */
+     * SYM carries the hash and the part; GUID the hash.  rc=1 → ray_cow no-op. */
     ray_t* v = prepare_attach_ex(vp, "index", is_dict || is_hash || is_marker,
-                                 is_hash || is_marker, is_hash);
+                                 is_hash || is_part || is_marker, is_hash);
     if (RAY_IS_ERR(v)) return v;
     return attach_finalize(v, idx);
 }
@@ -1664,6 +1665,29 @@ static uint8_t idx_format_of(const ray_index_t* ix) {
     return RAY_IDX_FORMAT_MAJOR;
 }
 
+/* What a region may not carry from a heap root (#838).  order_sym is a
+ * runtime symbol id and a region has no name to resolve it by: read in
+ * another process the id can name another column, and the as-of route
+ * would trust an unsorted one as ordered (generation 2 stores the name; a
+ * splayed save then stores the column's position, splay_note_orders).
+ * A SYM child's header holds this process's domain pointer at bytes 8-15;
+ * the column file's symfile is the keys' domain on load, so none is kept. */
+static void idx_region_head_scrub(ray_index_t* on) {
+    if (on->kind == RAY_IDX_HASH) on->u.hash.order_sym = -1;
+    else if (on->kind == RAY_IDX_PART) on->u.part.order_sym = -1;
+}
+/* On map: a symbol id goes (older files wrote one); a table position a
+ * splayed save stored (RAY_IDX_ORDER_POS, store/col.h: below -1) stays for
+ * the table reader to resolve. */
+static void idx_region_map_scrub(ray_index_t* ix) {
+    int64_t* o = ix->kind == RAY_IDX_HASH ? &ix->u.hash.order_sym
+               : ix->kind == RAY_IDX_PART ? &ix->u.part.order_sym : NULL;
+    if (o && *o >= -1) *o = -1;
+}
+static void idx_region_child_scrub(ray_t* chdr) {
+    if (chdr->type == RAY_SYM) chdr->sym_domain = NULL;
+}
+
 /* Serialize `ix` into `dst` (>= ray_index_inline_size bytes, pre-zeroed by the
  * caller for clean 32-pad).  Child pointers become region-relative offsets. */
 void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
@@ -1677,6 +1701,7 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
     ray_index_t* on = (ray_index_t*)(dst + 32);
     memcpy(on, ix, sizeof(ray_index_t));   /* scalars + child ptrs (overwritten below) */
     on->markers |= RAY_MARK_MMAP;           /* on-disk indexes are always mmap-resident */
+    idx_region_head_scrub(on);
 
     ray_t** src_slots[4];
     ray_t** on_slots[4];
@@ -1689,6 +1714,7 @@ void ray_index_inline_write(uint8_t* dst, const ray_index_t* ix) {
         ray_t chdr;
         memcpy(&chdr, c, 32);
         chdr.mmod = 1; chdr.rc = 1;
+        idx_region_child_scrub(&chdr);
         memcpy(dst + off, &chdr, 32);
         size_t dbytes = (size_t)c->len * ray_elem_size(c->type);
         if (dbytes) memcpy(dst + off + 32, ray_data(c), dbytes);
@@ -1711,6 +1737,7 @@ static void idx_inline_head(uint8_t* head, const ray_index_t* ix) {
     ray_index_t* on = (ray_index_t*)(head + 32);
     memcpy(on, ix, sizeof(ray_index_t));
     on->markers |= RAY_MARK_MMAP;
+    idx_region_head_scrub(on);
 
     ray_t** src_slots[4];
     ray_t** on_slots[4];
@@ -1738,6 +1765,7 @@ bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
         ray_t chdr;
         memcpy(&chdr, c, 32);
         chdr.mmod = 1; chdr.rc = 1;
+        idx_region_child_scrub(&chdr);
         if (fwrite(&chdr, 1, 32, f) != 32) return false;
         size_t dbytes = (size_t)c->len * ray_elem_size(c->type);
         if (dbytes && fwrite(ray_data(c), 1, dbytes, f) != dbytes) return false;
@@ -1811,6 +1839,16 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
          (ix->u.chunk_zone.aggs->len != 2 * (int64_t)ix->u.chunk_zone.n_chunks &&
           ix->u.chunk_zone.aggs->len != 3 * (int64_t)ix->u.chunk_zone.n_chunks)))
         ix->u.chunk_zone.aggs = NULL;
+    /* A PART's keys are the column's type, its starts and lengths I64. */
+    if (ix->kind == RAY_IDX_PART &&
+        ((ix->u.part.keys && ix->u.part.keys->type != ix->parent_type) ||
+         (ix->u.part.starts && ix->u.part.starts->type != RAY_I64) ||
+         (ix->u.part.lens && ix->u.part.lens->type != RAY_I64)))
+        return NULL;
+    /* Regions written before idx_region_head_scrub may hold either. */
+    idx_region_map_scrub(ix);
+    for (int i = 0; i < nch; i++)
+        if (*slots[i]) idx_region_child_scrub(*slots[i]);
     ix->markers |= RAY_MARK_MMAP;
     idx->mmod = 1;
     return idx;

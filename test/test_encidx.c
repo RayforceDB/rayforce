@@ -2108,8 +2108,8 @@ static test_result_t test_encoded_keep_copies(void) {
 /* Review minor 1: a stale SYM HASH / PART is rebuilt from the column on
  * generation 2 (every SYM index is rebuilt over the target ids), without
  * the stale root's UNIQUE or order name (colw_region_prepare's `!stale`):
- * after a splayed save and reload, generation 2 keeps at least what
- * generation 0 keeps (a rebuilt HASH; no PART). */
+ * after a splayed save and reload, generation 2 keeps what generation 0
+ * keeps (a rebuilt HASH and PART, #838). */
 static test_result_t test_sym_stale_rebuild(void) {
     char wb[16];
     ray_t* g = ray_sym_vec_new(RAY_SYM_W64, 4000); g->len = 4000;
@@ -2149,7 +2149,9 @@ static test_result_t test_sym_stale_rebuild(void) {
     ray_t* p2 = ray_table_col(l2, ray_sym_intern("p", 1));
     TEST_ASSERT_TRUE(g2 && !RAY_IS_ERR(g2) && p2 && !RAY_IS_ERR(p2));
     TEST_ASSERT_EQ_I(ray_index_kind(g0), RAY_IDX_HASH);              /* generation 0 rebuilds the HASH */
-    TEST_ASSERT_TRUE(ray_index_kind(p0) != RAY_IDX_PART);            /* and drops the PART */
+    TEST_ASSERT_EQ_I(ray_index_kind(p0), RAY_IDX_PART);              /* and the PART (#838) */
+    TEST_ASSERT_EQ_I(ray_index_payload(p0->index)->u.part.order_sym, -1);
+    TEST_ASSERT_EQ_I(ray_index_payload(p0->index)->u.part.n_parts, 8);
     TEST_ASSERT_EQ_I(ray_index_kind(g2), RAY_IDX_HASH);
     TEST_ASSERT_EQ_I(ray_index_kind(p2), RAY_IDX_PART);
     TEST_ASSERT_FALSE(ray_index_payload(g2->index)->markers & RAY_MARK_UNIQUE);   /* a stale flag is not kept */
@@ -2502,10 +2504,9 @@ static test_result_t test_stale_root_chunk_zone(void) {
 
 /* D1: the SYM HASH / PART a splayed save writes as generation 2 keep the
  * source's UNIQUE (checked against the in-memory source), and every query
- * answers as on generation 0.  Generation 0's own save drops the SYM PART
- * (a SYM PART's keys carry a domain no generation-0 region can hold), the
- * attribute difference D1 accepts; it keeps the HASH's UNIQUE
- * (splay_build_index_col). */
+ * answers as on generation 0.  Generation 0's own save rebuilds both over
+ * the file-local ids (splay_build_index_col): the HASH keeps its UNIQUE,
+ * and the PART is kept (#838). */
 static test_result_t test_sym_splay_kept(void) {
     ray_t* r = ixr_eval("(set SY (as 'SYM (map (fn [i] (concat \"k\" (as 'STR i))) (til 6000))))");
     TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
@@ -2534,8 +2535,8 @@ static test_result_t test_sym_splay_kept(void) {
         NULL,
     };
     for (int i = 0; kept[i]; i++) TEST_ASSERT_FMT(ixr_i64(kept[i]) == 1, "%s", kept[i]);
-    /* generation 0: the PART is still lost (D1), the HASH keeps UNIQUE */
-    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'parted (.attr.get (at X0 'p))) 1 0)"), 0);
+    /* generation 0: the PART is kept (#838), the HASH keeps UNIQUE */
+    TEST_ASSERT_EQ_I(ixr_i64("(if (in 'parted (.attr.get (at X0 'p))) 1 0)"), 1);
     TEST_ASSERT_EQ_I(ixr_i64("(if (in 'unique (.attr.get (at X0 'g))) 1 0)"), 1);
     static const char* const qs[] = {
         "(sum (at (select {from: %s where: (== p 'b)}) 'v))",

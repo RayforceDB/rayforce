@@ -566,6 +566,7 @@ static ray_err_t splay_validate_save(ray_t* tbl, const char* dir,
 
 static void splay_build_indexes_gens(const char* dir, ray_t* tbl, const uint8_t* gens,
                                      bool auto_index);
+static void splay_note_orders(const char* dir, ray_t* tbl, const uint8_t* gens);
 
 /* Distinct-merge SYM column `col`'s vocabulary into `dom` (find-or-append,
  * by a walk of its cells read by range, so an encoded column decodes one
@@ -1103,6 +1104,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
      * Generation-2 files record theirs in the enc header instead. */
     if (build_indexes)
         splay_build_indexes_gens(dir, tbl, gens, auto_index);
+    splay_note_orders(dir, tbl, gens);
 
     /* A cancel before the commit marker leaves nothing committed: the
      * write finish removes what this save created. */
@@ -1562,6 +1564,29 @@ ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const cha
 /* col_syms: a column's own symfile (the per-column layout) is honoured; a
  * partition of a parted table (ray_read_splayed_dom) refuses one instead,
  * as its segments must all resolve over the table's one domain. */
+/* The order_sym field of `col`'s HASH / PART, or NULL. */
+static int64_t* splay_order_slot(ray_t* col) {
+    if (!col || RAY_IS_ERR(col) || !ray_is_vec(col) || !ray_index_has(col)) return NULL;
+    ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->built_for_len != col->len) return NULL;
+    return ix->kind == RAY_IDX_HASH ? &ix->u.hash.order_sym
+         : ix->kind == RAY_IDX_PART ? &ix->u.part.order_sym : NULL;
+}
+
+/* A generation-0 region stores the column its HASH / PART is ordered by as
+ * the column's position in the table (RAY_IDX_ORDER_POS, set by
+ * splay_note_orders): the name it stands for, now the table is read, or
+ * none for a position the table does not have. */
+static void splay_resolve_orders(ray_t* tbl) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        int64_t* o = splay_order_slot(ray_table_slot_idx(tbl, c));
+        if (!o || *o > -2) continue;
+        int64_t pos = RAY_IDX_ORDER_POS_OF(*o);
+        *o = (pos >= 0 && pos < nc && pos != c) ? ray_table_col_name(tbl, pos) : -1;
+    }
+}
+
 static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
                                   bool use_mmap, bool col_syms) {
     if (!dir) return ray_error("io", NULL);
@@ -1721,6 +1746,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
     }
 
     ray_release(schema);
+    splay_resolve_orders(tbl);
     return tbl;
 }
 
@@ -1935,7 +1961,8 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                          * positions are a one-to-one renaming of the ids, so
                          * it carries over.  order_sym does not: it is a
                          * runtime symbol id and a generation-0 region holds
-                         * no name to resolve it by, so it stays unset. */
+                         * no name to resolve it by, so it stays unset
+                         * (idx_region_head_scrub). */
                         ray_index_t* six = ray_index_payload(col->index);
                         if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len) {
                             /* re-checked on the saved values: a failed
@@ -1953,6 +1980,36 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                     }
                 }
             }
+            return;
+        }
+
+        /* Explicit SYM PART: the same reason as the hash above -- the keys
+         * are runtime ids and the file holds file-local positions -- so the
+         * PART is rebuilt over the written column.  A SYM PART's runs are
+         * kept by the renaming, so the build over the file-local column
+         * gives the same parts.  UNIQUE is one row per part. */
+        if (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_PART) {
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (!nstr || RAY_IS_ERR(nstr)) return;
+            char path[1024];
+            int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                             (int)ray_str_len(nstr), ray_str_ptr(nstr));
+            if (n <= 0 || n >= (int)sizeof(path)) return;
+            ray_t* fc = ray_col_load(path);  /* file-local codes */
+            if (!fc || RAY_IS_ERR(fc)) { if (fc) ray_error_free(fc); return; }
+            ray_t* pc = ray_index_attach_part(&fc);
+            if (pc && !RAY_IS_ERR(pc) && (pc->attrs & RAY_ATTR_HAS_INDEX)) {
+                fc = pc;
+                ray_index_t* fix = ray_index_payload(fc->index);
+                ray_index_t* six = ray_index_payload(col->index);
+                if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len &&
+                    fix->u.part.n_parts == fc->len)
+                    fix->markers |= RAY_MARK_UNIQUE;
+                (void)ray_col_append_index(path, fix, fc->len, RAY_SYM);
+            } else if (pc && RAY_IS_ERR(pc)) {
+                ray_error_free(pc);
+            }
+            ray_release(fc);
             return;
         }
 
@@ -2092,5 +2149,32 @@ ray_t* ray_read_splayed_dom(const char* dir, struct ray_sym_domain_s* dom) {
         if (why < 0) return splay_retry_error(why, dir, tbl);
         if (!why) return tbl;
         ray_error_free(tbl);
+    }
+}
+
+/* The column a HASH / PART is ordered by, recorded in a generation-0 file
+ * as its position in the table (#838): the region has no place for a name,
+ * and a symbol id means nothing in another process.  Generation 2 stores
+ * the name itself.  Best effort, as the index is: a column whose file holds
+ * no such region is left as written. */
+static void splay_note_orders(const char* dir, ray_t* tbl, const uint8_t* gens) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        if (gens && gens[c] == 2) continue;
+        ray_t* slot = splay_slot(tbl, c);
+        if (!slot || RAY_IS_ERR(slot) || splay_slot_parted(slot) || !ray_is_vec(slot)) continue;
+        int64_t* o = splay_order_slot(slot);
+        if (!o || *o < 0) continue;
+        int64_t pos = -1;
+        for (int64_t k = 0; k < nc && pos < 0; k++)
+            if (k != c && ray_table_col_name(tbl, k) == *o) pos = k;
+        if (pos < 0) continue;
+        ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+        if (!nstr || RAY_IS_ERR(nstr)) continue;
+        char path[1100];
+        int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                         (int)ray_str_len(nstr), ray_str_ptr(nstr));
+        if (n > 0 && n < (int)sizeof(path))
+            (void)ray_col_set_index_order(path, RAY_IDX_ORDER_POS(pos));
     }
 }
