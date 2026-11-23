@@ -2712,10 +2712,12 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
 }
 
 /* Decode (== s "lit"): an equality of a STR column of the default table
- * carrying a hash index against a STR atom.  *out_lit is the literal
- * (borrowed from the ext).  A generation-2 column not yet materialized
- * sets *out_enc (its region is probed where it is mapped) and leaves
- * *out_col NULL; otherwise *out_col is the column.  1 on a match. */
+ * carrying a hash index against a STR atom, or of a GUID column carrying
+ * one against a GUID atom.  *out_lit is the literal (borrowed from the
+ * ext).  A generation-2 STR column not yet materialized sets *out_enc (its
+ * region is probed where it is mapped) and leaves *out_col NULL; otherwise
+ * *out_col is the column (a GUID one materialized for its index, as `in`
+ * does).  1 on a match. */
 static int idx_filter_str_eq_decode(ray_graph_t* g, ray_op_t* pred_op,
                                     ray_t** out_col, ray_t** out_enc, ray_t** out_lit) {
     if (!pred_op || pred_op->arity != 2 || pred_op->opcode != OP_EQ) return 0;
@@ -2724,14 +2726,23 @@ static int idx_filter_str_eq_decode(ray_graph_t* g, ray_op_t* pred_op,
     if (!lhs || !rhs || lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
     ray_op_ext_t* lext = find_ext(g, lhs->id);
     ray_op_ext_t* rext = find_ext(g, rhs->id);
-    if (!lext || !rext || !rext->literal || rext->literal->type != -RAY_STR) return 0;
+    if (!lext || !rext || !rext->literal) return 0;
+    int8_t lt = rext->literal->type;
+    if (lt != -RAY_STR && lt != -RAY_GUID) return 0;
     uint16_t stored_table_id = 0;
     memcpy(&stored_table_id, lext->base.pad, sizeof(uint16_t));
     if (stored_table_id != 0 || !g->table) return 0;
     ray_col_meta_t m;
     if (!ray_table_col_meta(g->table, lext->sym, &m)) return 0;
-    if (m.type != RAY_STR || m.index_kind != RAY_IDX_HASH) return 0;
+    if (m.type != (int8_t)-lt || m.index_kind != RAY_IDX_HASH) return 0;
     *out_lit = rext->literal;
+    if (m.type == RAY_GUID) {
+        if (!rext->literal->obj) return 0;
+        ray_t* col = idx_decode_col(g->table, lext->sym);
+        if (!col || col->type != RAY_GUID) return 0;
+        *out_col = col;
+        return 1;
+    }
     if (m.enc && !ray_enccol_decoded_peek(m.enc)) {
         *out_enc = m.enc;
         return 1;
@@ -4628,7 +4639,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     if (eq_lazy) ray_release(eq_lazy);
                 }
 
-                /* 3b. Hash EQ on a STR column: its index is keyed on a
+                /* 3b. Hash EQ on a STR or GUID column: its index is keyed on a
                  * hash of each row's bytes, so the probe is the literal's
                  * bytes, which idx_filter_decode (integer keys) does not
                  * give.  A generation-2 column not yet materialized is
@@ -4650,8 +4661,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                     } else if (scol) {
                         ray_idx_consults[IDX_SITE_FILTER_HASH]++;
-                        ray_t* sel = ray_index_hash_eq_str_rowsel(scol, ray_str_ptr(slit),
-                                                                  ray_str_len(slit));
+                        ray_t* sel = scol->type == RAY_GUID
+                            ? ray_index_hash_eq_guid_rowsel(scol, (const uint8_t*)ray_data(slit->obj))
+                            : ray_index_hash_eq_str_rowsel(scol, ray_str_ptr(slit), ray_str_len(slit));
                         if (sel) {
                             ray_idx_hits[IDX_SITE_FILTER_HASH]++;
                             ray_idx_note_use(scol);

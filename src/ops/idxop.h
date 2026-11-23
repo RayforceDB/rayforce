@@ -725,6 +725,8 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
  * whose rows the index leaves out), a stale or missing index, a dense
  * group or OOM: the caller scans. */
 ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l);
+/* GUID twin: the needle is a GUID's 16 bytes; a null needle declines. */
+ray_t* ray_index_hash_eq_guid_rowsel(ray_t* col, const uint8_t* p);
 /* ray_index_hash_eq_rowsel for a single-file generation-2 column whose
  * recorded HASH region is probed where it is mapped, without materializing
  * the column or copying the region: the root's layout is checked against

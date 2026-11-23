@@ -65,7 +65,7 @@ Match the shape of your query to the structure that fits it.
 | Want to… | Structure | Active today? |
 |---|---|---|
 | Skip whole columns where a predicate constant lies outside the value range | `.idx.zone` — min/max plus null count | Yes — O(1) all/none short-circuit at the filter site (int + float) |
-| Make repeated `=` / `in` / `find` over a numeric, symbol or string column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites (a guid column: find and `in` needles only) |
+| Make repeated `=` / `in` / `find` over a numeric, symbol, string or guid column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites (symbol, string and guid columns included) |
 | Binary-search a numeric column for range predicates or reuse the permutation for ORDER BY / distinct | `.idx.sort` — ascending row-id permutation | Yes — filter range (EQ/LT/LE/GT/GE), single-key ASC ORDER BY, distinct |
 | Cheaply reject "definitely not in this set" probes for integer EQ filters | `.idx.bloom` — m-bit probabilistic filter | Yes — definite-absent proof at the filter EQ site (integer-family only) |
 | Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(hnsw-build)` + `(ann)` | Yes — `(ann)` consults the index |
