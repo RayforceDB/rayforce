@@ -103,3 +103,13 @@
 (set PartSlice (drop (til 200002) 1))
 (set PartRef (+ PartSlice 9223372036854575807))
 (== (sum (+ PartSlice 9223372036854575807)) (sum PartRef)) -- true
+
+;; #1439: compare eager addition with the same rows summed after materialization.
+(set spans (as 'TIMESPAN [5 7]))
+(set spanRows (+ spans 1))
+(type (sum (+ spans 1))) -- 'timespan
+(== (sum (+ spans 1)) (sum spanRows)) -- true
+(set big [9223372036854775807 2])
+(set floatRows (+ big 1.5))
+(== (sum (+ big 1.5)) (sum floatRows)) -- true
+(== (sum (+ 1.5 big)) (sum floatRows)) -- true

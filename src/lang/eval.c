@@ -95,10 +95,8 @@ typedef struct {
     int64_t len;
     int8_t type;
     uint8_t attrs;
-    int is_f64;
     int64_t sum_i;
     int64_t lo, hi;  /* integer vector bounds; lo > hi for empty */
-    double sum_f;
 } affine_sum_cache_entry_t;
 
 #define AFFINE_SUM_CACHE_N 16
@@ -599,46 +597,29 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     } else {
         return NULL;
     }
-    /* sum(v) + n*c is the per-row sum only for a non-null c that no row can
-     * overflow with (#1349): v + null is null per row and sums to 0, and
-     * below 2^970 no finite v + c can pass DBL_MAX (as expr.c's affine
-     * plan).  Decided before v is evaluated, so a decline evaluates once. */
-    if (RAY_ATOM_IS_NULL(c_expr) ||
-        ((c_expr->type == -RAY_F64 || c_expr->type == -RAY_F32) &&
-         !(fabs(as_f64(c_expr)) < 0x1p970)))
+    /* Only fold a plain I64 column plus an I64 literal. In particular, a
+     * floating addition rounds per row and a TIMESPAN sum keeps its type.
+     * Decline computed operands before evaluating them: fallback must not
+     * evaluate an expression with side effects twice. */
+    if (c_expr->type != -RAY_I64 || RAY_ATOM_IS_NULL(c_expr) ||
+        !vec_expr || vec_expr->type != -RAY_SYM)
         return NULL;
 
     ray_t* vec = ray_eval(vec_expr);
-    if (!vec || RAY_IS_ERR(vec))
+    if (!vec || RAY_IS_ERR(vec)) {
+        *handled = 1;
         return vec ? vec : ray_error("type", NULL);
-    vec = materialize_owned_value(vec);
-    if (!vec || RAY_IS_ERR(vec))
-        return vec ? vec : ray_error("type", NULL);
-    if (!ray_is_vec(vec)) {
-        ray_release(vec);
-        *handled = 0;
-        return NULL;
     }
-    if (ray_vec_may_have_nulls(vec)) {
+    vec = materialize_owned_value(vec);
+    if (!vec || RAY_IS_ERR(vec)) {
+        *handled = 1;
+        return vec ? vec : ray_error("type", NULL);
+    }
+    if (vec->type != RAY_I64 || ray_vec_may_have_nulls(vec)) {
         ray_release(vec);
-        *handled = 0;
         return NULL;
     }
     *handled = 1;
-    /* A narrow result (I16 + I16 is I16, #972) wraps or rounds per row in
-     * its own width, which sum(x) + n*c does not: sum the rows instead
-     * (the vector is evaluated once either way). */
-    int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
-    {
-        if (rt == RAY_U8 || rt == RAY_I16 || rt == RAY_I32 || rt == RAY_F32) {
-            ray_t* rows = atomic_map_binary_op(ray_add_fn, OP_ADD, vec, c_expr);
-            ray_release(vec);
-            if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
-            ray_t* sum = ray_sum_fn(rows);
-            ray_release(rows);
-            return materialize_owned_value(sum);
-        }
-    }
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
         memset(&ce, 0, sizeof(ce));
@@ -647,15 +628,7 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         ce.len = vec->len;
         ce.type = vec->type;
         ce.attrs = vec->attrs;
-        /* Literal-independent conservative bounds: only scan actual rows
-         * for a generated null if its preimage fits the input type. */
-        switch (vec->type) {
-        case RAY_BOOL:
-        case RAY_U8:  ce.lo = 0;         ce.hi = UINT8_MAX; break;
-        case RAY_I16: ce.lo = INT16_MIN; ce.hi = INT16_MAX; break;
-        case RAY_I32: ce.lo = INT32_MIN; ce.hi = INT32_MAX; break;
-        }
-        if (vec->type == RAY_I64 && !ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
+        if (!ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
             if (!affine_i64_scan(&ce)) {
                 ray_release(vec);
                 return ray_error("cancel", "interrupted");
@@ -671,15 +644,13 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
                 ray_release(vec);
                 return sum ? sum : ray_error("type", NULL);
             }
-            ce.is_f64 = (sum->type == -RAY_F64);
-            if (ce.is_f64) ce.sum_f = as_f64(sum);
-            else           ce.sum_i = numeric_atom_i64(sum);
+            ce.sum_i = sum->i64;
             ray_release(sum);
         }
         affine_sum_cache_store(vec, &ce);
     }
 
-    if (rt == RAY_I64) {
+    {
         /* Only MIN - c (mod 2^64) adds to the null sentinel. Ordinary
          * wrap is safe, but sum must skip rows that produce MIN. */
         int64_t c = numeric_atom_i64(c_expr);
@@ -696,11 +667,6 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     }
     int64_t n = vec->len;
     ray_release(vec);
-    if (ce.is_f64 || c_expr->type == -RAY_F64) {
-        double base = ce.is_f64 ? ce.sum_f : (double)ce.sum_i;
-        double out = base + as_f64(c_expr) * (double)n;
-        return make_f64(out);
-    }
     int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(numeric_atom_i64(c_expr), n));
     return make_i64(out);
 }
