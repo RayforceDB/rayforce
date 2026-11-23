@@ -2412,6 +2412,10 @@ void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* sa
 void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 ray_t* pivot_flatten_parted(ray_t* tbl);
+/* A flattened copy of a table with a parted / mapcommon column (a ragged
+ * partition's missing rows as typed nulls), the others carried as they are;
+ * NULL when every column is already dense.  Owned table or RAY_ERR. */
+ray_t* exec_flatten_parted_table(ray_t* tbl);
 ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl);
 
 /* ── embedding_exec.c ── */

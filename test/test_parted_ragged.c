@@ -121,6 +121,8 @@ static const char* const queries[] = {
     "(select {x: (+ a b) y: (* f 2) from: t})",
     "(xasc (select {a: a b: b from: t}) 'b)",
     "(xdesc (select {a: a d: d from: t}) 'd)",
+    "(xasc t 'b)",
+    "(xdesc t ['d 'a])",
     "(select {s: (sum a) from: t where: (> b 15)})",
     "(select {a: a from: t where: (== s 'x)})",
     "(select {c: (count (distinct b)) by: date from: t})",

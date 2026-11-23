@@ -614,7 +614,9 @@ Return indices that would sort the vector descending (grade down).
 
 ### `(xasc table col)`
 
-Sort a table ascending by the named column.
+Sort a table ascending by the named column. A parted table is sorted across
+all of its partitions into an in-memory table, the partition-key column
+included; see [Loading Partitioned Data](../storage/index.md#loading-partitioned-data).
 
 ```lisp
 (set trades (table [sym price] (list [AAPL GOOG AAPL] [150.0 280.0 151.0])))
@@ -623,7 +625,8 @@ Sort a table ascending by the named column.
 
 ### `(xdesc table col)`
 
-Sort a table descending by the named column.
+Sort a table descending by the named column. A parted table is sorted as
+`xasc` sorts one.
 
 ```lisp
 (xdesc trades 'price)

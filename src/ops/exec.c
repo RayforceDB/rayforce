@@ -6753,6 +6753,10 @@ static ray_t* flatten_parted_table(ray_t* tbl, ray_t* counts_src) {
     return out ? out : ray_error("oom", NULL);
 }
 
+ray_t* exec_flatten_parted_table(ray_t* tbl) {
+    return flatten_parted_table(tbl, NULL);
+}
+
 static ray_t* ray_execute_inner(ray_graph_t* g, ray_op_t* root, bool reset_cancel) {
     ray_enc_note_exec_start();
     if (!g || !root) return ray_error("nyi", NULL);
