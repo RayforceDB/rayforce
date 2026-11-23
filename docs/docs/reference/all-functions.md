@@ -446,7 +446,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `xkey` | binary | — | Build a dict keyed by unique column value(s), with row dict values for remaining columns | `(xkey trades 'time)` |
 | `xgroup` | binary | — | Group rows by column value(s), returning dict key -> table slice | `(xgroup trades 'sym)` |
 | `fkeys` | unary | — | Inspect linked-column metadata as `column -> target table` | `(fkeys fact)` |
-| `union-all` | binary | — | Concatenate two tables (all rows, no dedup) | `(union-all t1 t2)` |
+| `union-all` | binary | — | Concatenate two tables (all rows, no dedup). A parted operand (`.db.parted.get`) is read into memory first: the result is a plain table, and the partition key becomes a column | `(union-all t1 t2)` |
 | `unify` | binary | — | Merge two tables/dicts (second takes precedence) | `(unify d1 d2)` |
 | `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
 | `delete` | unary | special, restricted | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |

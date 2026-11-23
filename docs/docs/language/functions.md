@@ -641,7 +641,7 @@ Built-in support for triple stores. The EAV table has three columns: `e` (entity
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `union-all` | binary | Concatenate two tables (all rows) | `(union-all t1 t2)` |
+| `union-all` | binary | Concatenate two tables (all rows). A parted operand (`.db.parted.get`) is read into memory first: the result is a plain table, and the partition key becomes a column | `(union-all t1 t2)` |
 | `distinct` | unary | Remove duplicate rows from a table | `(distinct t)` |
 | `anti-join` | variadic | Anti-semi-join: rows in left not in right | `(anti-join [x] t1 t2)` |
 
