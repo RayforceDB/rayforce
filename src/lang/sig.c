@@ -23,7 +23,9 @@
 
 #include "lang/sig.h"
 #include "lang/env.h"
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -401,7 +403,7 @@ static bool name_matches(const char* entry, const char* name) {
  * ambiguous.  `*own` tells which table it came from. */
 static bool own_message(const char* name, const char* msg);
 
-static const ray_sig_entry_t* find_entry(const char* name, bool* own, const char* msg) {
+static const ray_sig_entry_t* find_entry_scan(const char* name, bool* own, const char* msg) {
     const ray_sig_entry_t* hit = NULL;
     int found = 0;
     for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
@@ -428,6 +430,99 @@ static const ray_sig_entry_t* find_entry(const char* name, bool* own, const char
         if (picks == 1) { *own = true; return pick; }
     }
     return NULL;
+}
+
+/* The scan above reads both tables and compares every name: about 470 strcmp per
+ * noted error.  The tables are static, so each entry is put once in a hash table of
+ * its key, the name cut at 13 characters (the longest a registered name keeps), and a
+ * lookup visits only the entries of its own key.  The table is built on the first use,
+ * by whichever thread gets there first; the others scan until it is ready.  An ambiguous
+ * name (several entries on one key) goes to the scan, which tells them apart by the
+ * message. */
+#define SIG_KEY_LEN (FN_NAME_MAX + 1)
+#define SIG_IDX_SIZE 2048u
+#define SIG_NITEMS (sizeof sigs / sizeof *sigs + sizeof own_sigs / sizeof *own_sigs)
+_Static_assert(SIG_NITEMS * 2 <= SIG_IDX_SIZE, "sig index too small for the tables");
+typedef struct { char key[SIG_KEY_LEN]; const ray_sig_entry_t* e; bool own; } sig_item_t;
+static sig_item_t sig_items[SIG_NITEMS];
+static uint16_t sig_slots[SIG_IDX_SIZE];     /* item index + 1; 0 is empty */
+static _Atomic int sig_idx_state;            /* 0 not built, 1 building, 2 ready */
+
+static void sig_key(const char* name, char out[SIG_KEY_LEN]) {
+    size_t n = strlen(name);
+    if (n > FN_NAME_MAX) n = FN_NAME_MAX;
+    memset(out, 0, SIG_KEY_LEN);
+    memcpy(out, name, n);
+}
+
+static size_t sig_hash(const char key[SIG_KEY_LEN]) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < SIG_KEY_LEN && key[i]; i++) h = (h ^ (uint8_t)key[i]) * 16777619u;
+    return (size_t)h & (SIG_IDX_SIZE - 1);
+}
+
+static void sig_index_build(void) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&sig_idx_state, &expected, 1)) return;
+    size_t n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        const ray_sig_entry_t* t = pass ? own_sigs : sigs;
+        size_t cnt = pass ? sizeof own_sigs / sizeof *own_sigs : sizeof sigs / sizeof *sigs;
+        for (size_t i = 0; i < cnt; i++, n++) {
+            sig_item_t* it = &sig_items[n];
+            sig_key(t[i].name, it->key);
+            it->e = &t[i];
+            it->own = pass == 1;
+            size_t h = sig_hash(it->key);
+            while (sig_slots[h]) h = (h + 1) & (SIG_IDX_SIZE - 1);
+            sig_slots[h] = (uint16_t)(n + 1);
+        }
+    }
+    atomic_store_explicit(&sig_idx_state, 2, memory_order_release);
+}
+
+static const ray_sig_entry_t* find_entry(const char* name, bool* own, const char* msg) {
+    int st = atomic_load_explicit(&sig_idx_state, memory_order_acquire);
+    if (st != 2) {
+        if (st == 0) sig_index_build();
+        if (atomic_load_explicit(&sig_idx_state, memory_order_acquire) != 2)
+            return find_entry_scan(name, own, msg);
+    }
+    /* The same builtin failing again and again (a try in a loop) is answered from
+     * the last lookup of the thread, whose answer did not depend on the message. */
+    static _Thread_local struct {
+        char name[SIG_KEY_LEN + 2];
+        const ray_sig_entry_t* e;
+        bool own, valid;
+    } last;
+    size_t nlen = strlen(name);
+    if (last.valid && nlen <= SIG_KEY_LEN && !memcmp(last.name, name, nlen + 1)) {
+        *own = last.own;
+        return last.e;
+    }
+    char key[SIG_KEY_LEN];
+    sig_key(name, key);
+    const sig_item_t* hit = NULL;
+    int found = 0;
+    const ray_sig_entry_t* res = NULL;
+    bool res_own = false, decided = false;
+    for (size_t h = sig_hash(key); sig_slots[h]; h = (h + 1) & (SIG_IDX_SIZE - 1)) {
+        const sig_item_t* it = &sig_items[sig_slots[h] - 1];
+        if (memcmp(it->key, key, SIG_KEY_LEN) || !name_matches(it->e->name, name)) continue;
+        if (nlen < FN_NAME_MAX && strcmp(it->e->name, name) == 0) { res = it->e; res_own = it->own; decided = true; break; }
+        hit = it; found++;
+    }
+    if (!decided) {
+        if (found == 1) { res = hit->e; res_own = hit->own; decided = true; }
+        else if (found > 1) return find_entry_scan(name, own, msg);   /* told apart by the message: not cached */
+        else decided = true;                                           /* no entry: res stays NULL */
+    }
+    if (nlen <= SIG_KEY_LEN) {
+        memcpy(last.name, name, nlen + 1);
+        last.e = res; last.own = res_own; last.valid = true;
+    }
+    *own = res_own;
+    return res;
 }
 
 const char* ray_sig_usage(const char* name) {
@@ -472,34 +567,33 @@ static bool own_message(const char* name, const char* msg) {
     return starts_with_word(msg, dash + 1, len - (size_t)(dash + 1 - name));
 }
 
-/* The error's code, copied out of the object. */
-static void err_code(const ray_t* err, char out[8]) {
-    memcpy(out, err->sdata, err->slen);
-    out[err->slen] = '\0';
-}
-
 ray_t* ray_sig_note_err(const char* name, ray_t* result) {
+    /* The builtin that was called is the innermost one that noted the error: a call
+     * nested inside another keeps the shape of the first, as it keeps the message.
+     * Checked first, so an error passing up through nested builtins is looked up once. */
+    if (ray_error_usage()) return result;
     if (!result || !RAY_IS_ERR(result) || result == RAY_OOM_OBJ) return result;
-    char code[8];
-    err_code(result, code);
-    bool domain = !strcmp(code, "domain");
-    if (strcmp(code, "type") && strcmp(code, "length") &&
-        strcmp(code, "rank") && strcmp(code, "arity") && !domain)
-        return result;
+    /* type, length, rank and arity are about a call; domain only when about the
+     * argument list (below).  The code is at most 7 bytes in the object: compare it by
+     * length and bytes, no copy and no strcmp. */
+    const char* c = (const char*)result->sdata;
+    size_t cn = result->slen;
+    bool domain = cn == 6 && !memcmp(c, "domain", 6);
+    bool call = domain || (cn == 4 && (!memcmp(c, "type", 4) || !memcmp(c, "rank", 4))) ||
+                (cn == 5 && !memcmp(c, "arity", 5)) || (cn == 6 && !memcmp(c, "length", 6));
+    if (!call) return result;
     bool own;
     const char* old = ray_error_msg();
+    /* A domain error is a bad value, not a bad call, unless it is about the
+     * argument list: told from the message before any table is read. */
+    if (domain && (!old || !strstr(old, " arg"))) return result;
     const ray_sig_entry_t* e = find_entry(name, &own, old);
     if (!e) return result;
     /* Only the own-message table needs the guard. */
     if (own && (!old || !*old || !own_message(e->name, old))) return result;
-    /* A domain error is a bad value, not a bad call, unless it is about the
-     * argument list. */
-    if (domain && (!old || !strstr(old, " arg"))) return result;
-    /* The builtin that was called is the innermost one that noted the error: a call
-     * nested inside another keeps the shape of the first, as it keeps the message. */
-    if (ray_error_usage()) return result;
-    if (old && *old) {
-        /* A message that already names the call shape is left alone. */
+    if (old && strchr(old, '(')) {
+        /* A message that already names the call shape is left alone (only a message
+         * with a parenthesis can: most have none, and skip the formatting). */
         char head[40];
         snprintf(head, sizeof head, "(%s ", e->name);
         if (strstr(old, head)) return result;
@@ -510,12 +604,36 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
     return result;
 }
 
+/* Append `src` to buf at *n, never past cap - 1. */
+static void put_str(char* buf, size_t cap, size_t* n, const char* src) {
+    size_t l = strlen(src);
+    if (l > cap - 1 - *n) l = cap - 1 - *n;
+    memcpy(buf + *n, src, l);
+    *n += l;
+}
+
 ray_t* ray_sig_arity(const char* name, const char* want, int got) {
     bool own;
     const ray_sig_entry_t* e = find_entry(name, &own, NULL);
     const char* shown = e ? e->name : name;
-    ray_t* err = ray_error("arity", "%s: takes %s argument%s, got %d", shown, want,
-                           strcmp(want, "1") ? "s" : "", got);
+    /* "<name>: takes <want> argument(s), got <n>", written by hand: this is the message of
+     * a try in a loop, and four printf conversions were most of its cost. */
+    char msg[160];
+    size_t n = 0;
+    put_str(msg, sizeof msg, &n, shown);
+    put_str(msg, sizeof msg, &n, ": takes ");
+    put_str(msg, sizeof msg, &n, want);
+    put_str(msg, sizeof msg, &n, strcmp(want, "1") ? " arguments, got " : " argument, got ");
+    char digits[12];
+    size_t d = 0;
+    unsigned v = got < 0 ? 0u : (unsigned)got;
+    do { digits[d++] = (char)('0' + v % 10); v /= 10; } while (v && d < sizeof digits);
+    char num[12];
+    for (size_t i = 0; i < d; i++) num[i] = digits[d - 1 - i];
+    num[d] = '\0';
+    put_str(msg, sizeof msg, &n, num);
+    msg[n] = '\0';
+    ray_t* err = ray_error("arity", "%s", msg);
     if (e) ray_error_usage_set(e->usage);
     return err;
 }

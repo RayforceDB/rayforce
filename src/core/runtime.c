@@ -60,8 +60,10 @@ static _Thread_local char ray_last_err_msg[256] = {0};
 /* The call shape the thread's last error was raised against, when a builtin was
  * called with the wrong arguments: "(take <collection: ...> <count: ...>)".  Kept next
  * to the message and not in it, so that the message stays what the builtin wrote and
- * nobody has to cut a suffix off to compare it.  Cleared by every new error. */
-static _Thread_local char ray_last_err_usage[256] = {0};
+ * nobody has to cut a suffix off to compare it.  A pointer to static text (the builtin's
+ * entry in lang/sig.c), not a copy: noting an error costs a store.  Cleared by every new
+ * error. */
+static _Thread_local const char* ray_last_err_usage = NULL;
 
 /* Zero a VM and set the non-zero defaults.  Every VM must go through
  * here — a bare memset leaves ipc_handle at 0, which is a VALID
@@ -157,7 +159,7 @@ static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
      * that path still has to leave ray_error_msg() consistent with this
      * call.  The buffer is thread-local storage, so this does not depend
      * on the heap and stays valid even when ray_alloc below fails. */
-    ray_last_err_usage[0] = '\0';
+    ray_last_err_usage = NULL;
     if (fmt) {
         va_list copy;
         va_copy(copy, ap);
@@ -203,7 +205,7 @@ ray_t* ray_error(const char* code, const char* fmt, ...) {
      * the persistent message buffer FIRST so the deep-OOM sentinel path
      * doesn't leave stale text from an earlier error visible. */
     ray_last_err_msg[0] = '\0';
-    ray_last_err_usage[0] = '\0';
+    ray_last_err_usage = NULL;
     if (__VM) __VM->err.msg[0] = '\0';
     ray_t* err = ray_alloc(0);
     if (!err) return &__ray_oom;  /* sentinel — see __ray_oom comment */
@@ -261,17 +263,15 @@ void ray_error_msg_set(const char* fmt, ...) {
 }
 
 const char* ray_error_usage(void) {
-    if (!ray_last_err_usage[0]) return NULL;
     return ray_last_err_usage;
 }
 
 void ray_error_usage_set(const char* usage) {
-    if (!usage) { ray_last_err_usage[0] = '\0'; return; }
-    snprintf(ray_last_err_usage, sizeof ray_last_err_usage, "%s", usage);
+    ray_last_err_usage = (usage && *usage) ? usage : NULL;
 }
 
 void ray_error_clear(void) {
-    ray_last_err_usage[0] = '\0';
+    ray_last_err_usage = NULL;
     ray_last_err_msg[0] = '\0';
     if (__VM) __VM->err.msg[0] = '\0';
 }

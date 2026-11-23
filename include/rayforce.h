@@ -278,7 +278,8 @@ void ray_error_msg_set(const char* fmt, ...);
 /* The call shape of the builtin the thread's last error was raised against, NULL when
  * it was not a bad call of a builtin.  A separate field of the error, next to the message:
  * the message is not changed to carry it.  Set by the caller that knows the builtin,
- * cleared by the next error. */
+ * cleared by the next error.  `usage` must be static text: only the pointer is kept, so
+ * that noting an error allocates and copies nothing. */
 const char* ray_error_usage(void);
 void        ray_error_usage_set(const char* usage);
 void        ray_error_clear(void);
