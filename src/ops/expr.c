@@ -1085,7 +1085,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
             }
             out_plan->enabled = out_plan->pre = out_plan->pre_only = true;
             out_plan->pre_sum = (int64_t)atomic_load_explicit(&q.total,memory_order_relaxed);
-            out_plan->pre_hi = out_plan->pre_sum >> 63;
+            out_plan->pre_hi = (out_plan->pre_sum < 0 ? -1 : 0);
             return true;
         }
     }
@@ -1112,7 +1112,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
             s = wrap_add_i64(s, wrap_mul_i64(lin.coeff_i64[i], tot.sums[k]));
         }
         if (tot.lifted) s = tot.low;
-        out_plan->pre_hi = tot.lifted ? tot.hi : s >> 63;
+        out_plan->pre_hi = tot.lifted ? tot.hi : (s < 0 ? -1 : 0);
         if (ok) { out_plan->pre = true; out_plan->pre_sum = s; out_plan->pre_only = tot.partial; }
     }
     if (tot.partial && !out_plan->pre_only) return false;   /* the rows' plan does not hold */
