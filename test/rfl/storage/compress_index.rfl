@@ -60,8 +60,8 @@
 (at (.idx.info (.db.splayed.get "/tmp/rf_test_p4idx/q2/") 'id) 'index) -- 'part
 ;; the answers: tables do not compare with ==, so column by column
 (.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYMBOL) (format \"w%\" j))) (til 2000)))' '(set Q2 (.db.splayed.get \"/tmp/rf_test_p4idx/q2/\"))' '(set Q0 (.db.splayed.get \"/tmp/rf_test_p4idx/q0/\"))' '(set L (table [id ts] (list [0 1 2] [100 200 2999])))' '(set A2 (asof-join [id ts] L Q2))' '(set A0 (asof-join [id ts] L Q0))' '(println (and (== (count A2) (count A0)) (all (map (fn [c] (all (== (at A2 c) (at A0 c)))) (key A0)))))' > /tmp/rf_test_p4idx_child.rfl") -- 0
-;; the route, on the generation-2 load alone (generation 0 keeps an integer
-;; PART's order too, so the answer script would show it either way)
+;; the route, on the generation-2 load alone (generation 0 stores no order
+;; name, so its reload has no order_sym: store/sym_part_persist.rfl)
 (.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYMBOL) (format \"w%\" j))) (til 2000)))' '(set Q2 (.db.splayed.get \"/tmp/rf_test_p4idx/q2/\"))' '(set L (table [id ts] (list [0 1 2] [100 200 2999])))' '(println (count (asof-join [id ts] L Q2)))' > /tmp/rf_test_p4idx_route.rfl") -- 0
 (.sys.exec "RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_p4idx_route.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
 (.sys.exec "./rayforce -f /tmp/rf_test_p4idx_child.rfl 2>/dev/null | tail -1 | grep -q true") -- 0

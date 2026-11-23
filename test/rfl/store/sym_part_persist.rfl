@@ -1,0 +1,71 @@
+;; @requires: posix
+;; #838: a generation-0 splayed save keeps a SYM column's PART index.  The
+;; column is written as file-local symfile positions, so the index is
+;; rebuilt over those positions; before the fix it was not written at all
+;; and the reloaded column came back with no index.  The global symbol
+;; domain is polluted first so file-local and runtime ids differ.
+(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl")
+(set junk ['z0 'z1 'z2 'z3 'z4 'z5 'z6 'z7 'z8 'z9 'p 'q 'r 's 't 'u 'w 'x 'y])
+
+(set P (.attr.set 'parted (asc (take ['a 'b 'c] 600))))
+(set U (.attr.set 'parted (.attr.set 'unique (as 'SYM (map (fn [i] (as 'SYM (concat "k" (as 'STR (+ 1000 i))))) (til 600))))))
+(set G (.attr.set 'grouped (.attr.set 'unique (as 'SYM (map (fn [i] (as 'SYM (as 'STR i))) (til 600))))))
+(set T (table [p u g v] (list P U G (til 600))))
+(.attr.get (at T 'p)) -- '[parted]
+(.attr.get (at T 'u)) -- '[unique parted]
+
+;; per-column symfiles (default) and a shared symfile
+(.db.splayed.set "/tmp/rfl_sym_part_persist/a/" T {compress: false})
+(.db.splayed.set "/tmp/rfl_sym_part_persist/b/" T "/tmp/rfl_sym_part_persist/b.sym" {compress: false})
+(set A (.db.splayed.get "/tmp/rfl_sym_part_persist/a/"))
+(set B (.db.splayed.get "/tmp/rfl_sym_part_persist/b/" "/tmp/rfl_sym_part_persist/b.sym"))
+
+;; PART kept, UNIQUE kept with it, the HASH unchanged
+(.attr.get (at A 'p)) -- '[parted]
+(.attr.get (at B 'p)) -- '[parted]
+(at (.idx.info (at A 'p)) 'kind) -- 'part
+(at (.idx.info (at B 'p)) 'kind) -- 'part
+(at (.idx.info (at A 'p)) 'n_parts) -- 3
+(.attr.get (at A 'u)) -- '[unique parted]
+(.attr.get (at B 'u)) -- '[unique parted]
+(.attr.get (at A 'g)) -- '[unique grouped]
+
+;; answers through the reloaded index: hits, a symbol never saved, in, find
+(count (at (select {from: A where: (== p 'b)}) 'v)) -- 200
+(sum (at (select {from: A where: (== p 'c)}) 'v)) -- (sum (at (select {from: T where: (== p 'c)}) 'v))
+(sum (at (select {from: B where: (== p 'a)}) 'v)) -- (sum (at (select {from: T where: (== p 'a)}) 'v))
+(count (at (select {from: A where: (== p 'nosuch)}) 'v)) -- 0
+(sum (at (select {from: A where: (in p ['a 'c 'nosuch])}) 'v)) -- (sum (at (select {from: T where: (in p ['a 'c])}) 'v))
+(sum (at (select {from: A where: (== u 'k1300)}) 'v)) -- 300
+(sum (at (select {from: B where: (== u 'k1599)}) 'v)) -- 599
+(count (at (select {from: A where: (== u 'k1)}) 'v)) -- 0
+(select {c: (count v) from: A by: p asc: p}) -- (select {c: (count v) from: T by: p asc: p})
+(find (at A 'p) ['b 'nosuch 'a]) -- [200 0N 0]
+(find (at A 'u) ['k1300 'nosuch]) -- [300 0N]
+(at (at A 'p) 599) -- 'c
+
+;; a reloaded column re-saves with its index
+(.db.splayed.set "/tmp/rfl_sym_part_persist/c/" A {compress: false})
+(set C (.db.splayed.get "/tmp/rfl_sym_part_persist/c/"))
+(.attr.get (at C 'p)) -- '[parted]
+(count (at (select {from: C where: (== p 'b)}) 'v)) -- 200
+
+;; control: generation 2 records the PART in the file header
+(.db.splayed.set "/tmp/rfl_sym_part_persist/d/" T {compress: true})
+(.attr.get (at (.db.splayed.get "/tmp/rfl_sym_part_persist/d/") 'p)) -- '[parted]
+
+;; Generation 0 also drops order_sym, for every column type.  An index
+;; region stored it as a runtime symbol id, with no name to resolve it by.
+;; Reloaded in another process, where the same id names another column, it
+;; told as-of that the PART on kq was ordered by that column, and as-of
+;; then binary-searched an unsorted one.  Two child processes: the writer
+;; interns kq tq vq, the reader kq vq tq, so the reader's vq has the id the
+;; writer's tq had.  xasc twice stamps PART on kq ordered by tq
+;; (compress_index.rfl).  The reader compares with the same rows in a
+;; fresh table that has no index; both must give [2502 2401].
+(.sys.exec "printf '%s\n' '(set Q (xasc (xasc (table [kq tq vq] (list (% (til 3000) 3) (til 3000) (- 5000 (til 3000)))) (list (quote kq) (quote tq))) (list (quote kq) (quote tq))))' '(.db.splayed.set \"/tmp/rfl_sym_part_persist/q/\" Q {compress: false})' '(println (at (.idx.info (at Q (quote kq))) (quote kind)))' > /tmp/rfl_sym_part_persist_w.rfl") -- 0
+(.sys.exec "printf '%s\n' '(set T0 (table [kq vq tq] (list [0] [0] [0])))' '(set Q0 (.db.splayed.get \"/tmp/rfl_sym_part_persist/q/\"))' '(set P0 (table [kq tq vq] (list (+ 0 (at Q0 (quote kq))) (+ 0 (at Q0 (quote tq))) (+ 0 (at Q0 (quote vq))))))' '(set L (table [kq vq] (list [0 1] [2500 2600])))' '(println (at (asof-join [kq vq] L Q0) (quote tq)) (at (asof-join [kq vq] L P0) (quote tq)))' > /tmp/rfl_sym_part_persist_r.rfl") -- 0
+(.sys.exec "./rayforce -f /tmp/rfl_sym_part_persist_w.rfl 2>/dev/null | tail -1 | grep -qx \"'part\"") -- 0
+(.sys.exec "./rayforce -f /tmp/rfl_sym_part_persist_r.rfl 2>/dev/null | tail -1 | grep -qxF '[2502 2401] [2502 2401]'") -- 0
+
+(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl") -- 0

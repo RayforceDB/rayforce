@@ -1935,7 +1935,8 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                          * positions are a one-to-one renaming of the ids, so
                          * it carries over.  order_sym does not: it is a
                          * runtime symbol id and a generation-0 region holds
-                         * no name to resolve it by, so it stays unset. */
+                         * no name to resolve it by, so it stays unset
+                         * (idx_region_head_scrub). */
                         ray_index_t* six = ray_index_payload(col->index);
                         if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len) {
                             /* re-checked on the saved values: a failed
@@ -1953,6 +1954,36 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                     }
                 }
             }
+            return;
+        }
+
+        /* Explicit SYM PART: the same reason as the hash above -- the keys
+         * are runtime ids and the file holds file-local positions -- so the
+         * PART is rebuilt over the written column.  A SYM PART's runs are
+         * kept by the renaming, so the build over the file-local column
+         * gives the same parts.  UNIQUE is one row per part. */
+        if (col->type == RAY_SYM && ray_index_kind(col) == RAY_IDX_PART) {
+            ray_t* nstr = ray_sym_str(ray_table_col_name(tbl, c));
+            if (!nstr || RAY_IS_ERR(nstr)) return;
+            char path[1024];
+            int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
+                             (int)ray_str_len(nstr), ray_str_ptr(nstr));
+            if (n <= 0 || n >= (int)sizeof(path)) return;
+            ray_t* fc = ray_col_load(path);  /* file-local codes */
+            if (!fc || RAY_IS_ERR(fc)) { if (fc) ray_error_free(fc); return; }
+            ray_t* pc = ray_index_attach_part(&fc);
+            if (pc && !RAY_IS_ERR(pc) && (pc->attrs & RAY_ATTR_HAS_INDEX)) {
+                fc = pc;
+                ray_index_t* fix = ray_index_payload(fc->index);
+                ray_index_t* six = ray_index_payload(col->index);
+                if ((six->markers & RAY_MARK_UNIQUE) && six->built_for_len == col->len &&
+                    fix->u.part.n_parts == fc->len)
+                    fix->markers |= RAY_MARK_UNIQUE;
+                (void)ray_col_append_index(path, fix, fc->len, RAY_SYM);
+            } else if (pc && RAY_IS_ERR(pc)) {
+                ray_error_free(pc);
+            }
+            ray_release(fc);
             return;
         }
 
