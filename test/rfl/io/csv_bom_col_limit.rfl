@@ -1,0 +1,40 @@
+;; A leading UTF-8 byte-order mark (EF BB BF) is an encoding signature, not
+;; data (#1147).  It used to stay glued to the first header name, or to the
+;; first cell when the file has no header.
+(.sys.exec "rm -rf /tmp/rfl_csv_bom && mkdir -p /tmp/rfl_csv_bom") -- 0
+(.sys.exec "printf '\\357\\273\\277id,txt\\n1,a\\n2,b\\n' > /tmp/rfl_csv_bom/h.csv") -- 0
+(key (.csv.read "/tmp/rfl_csv_bom/h.csv")) -- ['id 'txt]
+(at (.csv.read "/tmp/rfl_csv_bom/h.csv") 'id) -- [1 2]
+(key (.csv.read [I64 SYMBOL] "/tmp/rfl_csv_bom/h.csv")) -- ['id 'txt]
+
+;; explicit names, no header: the first cell is parsed without the mark
+(.sys.exec "printf '\\357\\273\\2777,a\\n8,b\\n' > /tmp/rfl_csv_bom/n.csv") -- 0
+(at (.csv.read [id txt] [I64 SYMBOL] "/tmp/rfl_csv_bom/n.csv") 'id) -- [7 8]
+;; explicit names over a file that carries the matching header after the mark
+(at (.csv.read [id txt] [I64 SYMBOL] "/tmp/rfl_csv_bom/h.csv") 'id) -- [1 2]
+
+;; a quoted first name, and a tab-delimited file
+(.sys.exec "printf '\\357\\273\\277\"id\",txt\\n1,a\\n' > /tmp/rfl_csv_bom/q.csv") -- 0
+(key (.csv.read "/tmp/rfl_csv_bom/q.csv")) -- ['id 'txt]
+(.sys.exec "printf '\\357\\273\\277id\\ttxt\\n1\\ta\\n' > /tmp/rfl_csv_bom/t.csv") -- 0
+(key (.csv.read "/tmp/rfl_csv_bom/t.csv")) -- ['id 'txt]
+
+;; the same bytes later in the file are data
+(.sys.exec "printf 'id,txt\\n1,\\357\\273\\277a\\n' > /tmp/rfl_csv_bom/m.csv") -- 0
+(count (at (at (.csv.read [I64 STR] "/tmp/rfl_csv_bom/m.csv") 'txt) 0)) -- 4
+
+;; the splayed and parted loaders skip it too
+(key (.csv.splayed "/tmp/rfl_csv_bom/h.csv" "/tmp/rfl_csv_bom/sp/")) -- ['id 'txt]
+(at (.csv.splayed [id txt] [I64 SYMBOL] "/tmp/rfl_csv_bom/n.csv" "/tmp/rfl_csv_bom/sn/") 'id) -- [7 8]
+(.csv.parted "/tmp/rfl_csv_bom/h.csv" "/tmp/rfl_csv_bom/db/" 'bt)
+(at (select {from: (.db.parted.get "/tmp/rfl_csv_bom/db/" 'bt)}) 'id) -- [1 2]
+
+;; more than 256 columns is a `limit` error, as csv.md says; it was `range`
+;; (#1145).  256 columns still load.
+(.sys.exec "(seq -s, 1 256; seq -s, 1 256) > /tmp/rfl_csv_bom/w256.csv") -- 0
+(count (key (.csv.read "/tmp/rfl_csv_bom/w256.csv"))) -- 256
+(.sys.exec "(seq -s, 1 300; seq -s, 1 300) > /tmp/rfl_csv_bom/w300.csv") -- 0
+(.csv.read "/tmp/rfl_csv_bom/w300.csv") !- limit
+(.csv.splayed "/tmp/rfl_csv_bom/w300.csv" "/tmp/rfl_csv_bom/w300sp/") !- limit
+(.csv.parted "/tmp/rfl_csv_bom/w300.csv" "/tmp/rfl_csv_bom/db/" 'wide) !- limit
+(.sys.exec "rm -rf /tmp/rfl_csv_bom") -- 0
