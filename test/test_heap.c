@@ -84,6 +84,8 @@ static int munmap(void* p, size_t len) {
 #include <sys/mman.h>
 #include <sys/stat.h>   /* fstat: spill-file link count */
 #include <sched.h>      /* sched_yield: a task waiting for the other workers */
+#include <sys/wait.h>   /* waitpid: forked children */
+#include <signal.h>     /* sigaction: a forked child's fault handler */
 #endif
 #if defined(__linux__)
 #include <sys/inotify.h>  /* IN_ACCESS: when the cgroup files are read */
@@ -3887,6 +3889,89 @@ static test_result_t test_relieve_spill_cloexec(void) {
 #endif
 }
 
+/* A fork()ed child cannot write the parent's spilled memory (#1138).  A
+ * spill mapping is MAP_SHARED over its file; inherited, a child that kept
+ * running rayforce code (an in-process REPL under forkpty, say) rewrote
+ * blocks and freelist links the parent still read, and the parent later
+ * crashed in fl_remove or ray_release_owned_refs.  Spill mappings are not
+ * inherited: here a live heap spills a pool block, a large block and an
+ * off-heap (sys) block, and a child forked for each tries to overwrite it.
+ * The child faults (its handler exits 42) and the parent's bytes are as it
+ * wrote them; without the fix the child's write lands in the parent. */
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+static void fork_spill_fault(int sig) { (void)sig; _exit(42); }
+
+/* Fork a child that writes `len` bytes of 0xEE at p; its exit status. */
+static int fork_spill_child_write(void* p, size_t len) {
+    fflush(stdout); fflush(stderr);
+    pid_t c = fork();
+    if (c == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = fork_spill_fault;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        memset(p, 0xEE, len);
+        _exit(0);
+    }
+    int st = -1;
+    if (c < 0 || waitpid(c, &st, 0) != c) return -1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+}
+
+static bool fork_spill_intact(const void* p, size_t len, uint8_t b) {
+    const uint8_t* q = (const uint8_t*)p;
+    for (size_t i = 0; i < len; i++) if (q[i] != b) return false;
+    return true;
+}
+#endif
+
+static test_result_t test_fork_child_does_not_share_spill(void) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    SKIP("file-backed spill and fork() are POSIX-only");
+#else
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+    ray_t* a = ray_alloc(RELIEVE_HALF);
+    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+    ray_t* s = ray_alloc(RELIEVE_HALF);             /* a block in a spill pool */
+    ray_t* d = ray_alloc((size_t)48 << 20);          /* a spilled large block */
+    int64_t c0 = ray_heap_anon_committed();
+    void* sb = ray_sys_alloc((size_t)48 << 20);      /* a spilled off-heap block */
+    bool sys = sb && ray_heap_anon_committed() == c0;
+    bool spilled = s && relieve_pool_is_backed(h, s) && d && ray_direct_file_backed(d) && sys;
+    const size_t n = 4096;
+    int st_pool = -1, st_large = -1, st_sys = -1;
+    bool ok_pool = true, ok_large = true, ok_sys = true;
+    if (spilled) {
+        memset(ray_data(s), 0x5A, n);
+        memset(ray_data(d), 0x5B, n);
+        memset(sb, 0x5C, n);
+        st_pool  = fork_spill_child_write(ray_data(s), n);
+        st_large = fork_spill_child_write(ray_data(d), n);
+        st_sys   = fork_spill_child_write(sb, n);
+        ok_pool  = fork_spill_intact(ray_data(s), n, 0x5A);
+        ok_large = fork_spill_intact(ray_data(d), n, 0x5B);
+        ok_sys   = fork_spill_intact(sb, n, 0x5C);
+    }
+    if (sb) ray_sys_free(sb);
+    if (d) ray_free(d);
+    if (s) ray_free(s);
+    if (a) ray_free(a);
+    relieve_env_end(&e, h, NULL);
+    if (!spilled) SKIP("no spill file could be made (RAY_HEAP_SWAP directory)");
+    TEST_ASSERT(ok_pool,  "a forked child wrote the parent's spill pool block");
+    TEST_ASSERT(ok_large, "a forked child wrote the parent's spilled large block");
+    TEST_ASSERT(ok_sys,   "a forked child wrote the parent's spilled off-heap block");
+    TEST_ASSERT_EQ_I(st_pool, 42);
+    TEST_ASSERT_EQ_I(st_large, 42);
+    TEST_ASSERT_EQ_I(st_sys, 42);
+    PASS();
+#endif
+}
+
 /* An idle process gives back pages through the decay — but a spill pool's
  * pages are page cache that releasing does not free, so the decay unmaps
  * empty spill pools instead.  Anon pools stay. */
@@ -6741,6 +6826,83 @@ static test_result_t test_calloc_raw_never_dispatches(void) {
     PASS();
 }
 
+/* A heap leaving its thread gives up its empty spill pools, the last one
+ * too (#1138).  A spill pool is MAP_SHARED over its file: an abandoned heap
+ * that kept one would hand it to whichever thread adopts the heap next, and
+ * after a fork() that is the child's, whose allocations then write the
+ * parent's pages — the parent's copy of the heap still lists those blocks
+ * free, with the links they had, and its next adopter (or the next child's)
+ * unlinks through what the first child wrote.  Here the heap's only pool
+ * spills; it is abandoned empty; one child adopts it and allocates, and a
+ * second child adopts the parent's copy and allocates as well. */
+static int abandon_spill_child_allocs(ray_heap_t* want) {
+    ray_tl_heap = NULL;
+    ray_heap_init();                       /* adopts the abandoned heap */
+    if (ray_tl_heap != want) return 2;
+    ray_t* v[64];
+    for (int i = 0; i < 64; i++) {
+        v[i] = ray_alloc((size_t)(64 << (i % 8)));
+        if (!v[i]) return 3;
+        memset(ray_data(v[i]), 0x38, (size_t)(64 << (i % 8)));
+    }
+    for (int i = 0; i < 64; i += 2) ray_free(v[i]);
+    return 0;
+}
+
+static test_result_t test_abandon_drops_last_spill_pool(void) {
+#if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    SKIP("file-backed spill and fork are POSIX-only");
+#else
+    relieve_env_t e;
+    memset(&e, 0, sizeof(e));
+    e.base = ray_tl_heap;
+    int64_t wm = ray_heap_anon_watermark();
+    ray_heap_t* s = relieve_heap_new(&e);
+    bool spilled = false;
+    if (s) {
+        ray_heap_set_anon_watermark(ray_heap_anon_committed() + 1);
+        ray_t* b = ray_alloc(64);              /* maps the heap's first pool */
+        ray_heap_set_anon_watermark(wm);
+        spilled = b && s->pool_count == 1 && relieve_pool_is_backed(s, b);
+        if (b) { memset(ray_data(b), 0x5A, 64); ray_free(b); }
+        ray_heap_abandon();                    /* s, empty, to the idle list */
+    }
+    uint32_t kept = 0;
+    for (uint32_t p = 0; s && p < s->pool_count; p++) kept += s->pools[p].backed;
+
+    int st1 = -1, st2 = -1;
+    if (spilled) {
+        fflush(stdout); fflush(stderr);
+        pid_t c1 = fork();
+        if (c1 == 0) _exit(abandon_spill_child_allocs(s));
+        if (c1 > 0 && waitpid(c1, &st1, 0) != c1) st1 = -1;
+        pid_t c2 = fork();
+        if (c2 == 0) _exit(abandon_spill_child_allocs(s));
+        if (c2 > 0 && waitpid(c2, &st2, 0) != c2) st2 = -1;
+    }
+
+    /* Take s back off the idle list and destroy it; put the rest back. */
+    if (s) {
+        ray_tl_heap = NULL;
+        ray_heap_init();
+        if (ray_tl_heap == s) ray_heap_destroy();
+        else if (ray_tl_heap) ray_heap_abandon();
+    }
+    for (int i = e.n; i-- > 0; ) { ray_tl_heap = e.parked[i]; ray_heap_abandon(); }
+    ray_tl_heap = e.base;
+    ray_heap_set_anon_watermark(wm);
+
+    TEST_ASSERT_NOT_NULL(s);
+    if (!spilled) SKIP("no spill file");
+    TEST_ASSERT_FMT(kept == 0, "the abandoned heap kept %u empty spill pool(s)", kept);
+    TEST_ASSERT_FMT(WIFEXITED(st1) && WEXITSTATUS(st1) == 0,
+                    "first child adopting the heap: status %d", st1);
+    TEST_ASSERT_FMT(WIFEXITED(st2) && WEXITSTATUS(st2) == 0,
+                    "second child adopting the parent's copy: status %d", st2);
+    PASS();
+#endif
+}
+
 const test_entry_t heap_entries[] = {
     { "heap/slab_overflow",            test_slab_overflow_falls_through, heap_setup, heap_teardown },
     { "heap/multi_pool_growth",        test_multi_pool_growth,           heap_setup, heap_teardown },
@@ -6834,6 +6996,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_discard",    test_relieve_spill_discard,       heap_setup, heap_teardown },
     { "heap/relieve_spill_fallback",   test_relieve_spill_fallback,      heap_setup, heap_teardown },
     { "heap/relieve_spill_cloexec",    test_relieve_spill_cloexec,       heap_setup, heap_teardown },
+    { "heap/fork_child_does_not_share_spill", test_fork_child_does_not_share_spill, heap_setup, heap_teardown },
     { "heap/relieve_spill_age",        test_relieve_spill_age,           heap_setup, heap_teardown },
     { "heap/relieve_spill_age_unmap", test_relieve_spill_age_unmap, heap_setup, heap_teardown },
     { "heap/relieve_far_visit",        test_relieve_far_visit,           heap_setup, heap_teardown },
@@ -6865,6 +7028,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_needed_baseline",  test_relieve_needed_baseline,     heap_setup, heap_teardown },
     { "heap/relieve_needed_peak",      test_relieve_needed_peak,         heap_setup, heap_teardown },
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
+    { "heap/abandon_drops_last_spill_pool", test_abandon_drops_last_spill_pool, heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/anon_watermark_spill_after_empty_pools", test_anon_watermark_spill_after_empty_pools, heap_setup, heap_teardown },

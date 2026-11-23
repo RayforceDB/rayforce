@@ -364,10 +364,16 @@ bounds only its own
 locking: on a machine shared by several heavy rayforce processes, give each a
 `-m` that adds up, or turn locking off.
 
-A spill file is mapped shared.  An embedding process that `fork()`s and keeps
-running rayforce code in the child shares the spilled blocks with the parent
-instead of getting its own copy, so the child must not write them; run the
-child through `exec` (as `.sys.exec` does) or start it before anything spills.
+A spill file is mapped shared, and a `fork()`ed child does not inherit the
+mapping: spilled pool blocks, spilled large blocks and spilled off-heap blocks
+are absent from the child, so the child can never write the parent's spilled
+memory.  A forked child that runs rayforce code must therefore `exec` (as
+`.sys.exec` does): one that keeps running in the forked copy faults if it
+reaches a spilled block.  Copying the spilled bytes into every child instead
+would bring them back into RAM in each one, a `fork()` followed by `exec`
+included.  A child forked before anything spills inherits ordinary memory and
+is unaffected.  This applies to Linux, macOS and the BSDs; Windows does not
+spill to files.
 
 ## 9. Practical Patterns
 

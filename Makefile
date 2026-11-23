@@ -643,9 +643,13 @@ tidy:
 # the Windows/macOS/WASM branches are not analysed here; every Linux file is.
 # __has_attribute is given as 0: the analyser cannot evaluate the builtin in
 # an #if (parse.c), and the attributes it guards change no code paths.
+# System headers are not read (missingIncludeSystem), so a macro they define
+# that the code tests in an #if is given here with its Linux value:
+# MADV_DONTFORK (<sys/mman.h>), whose absence on Linux is an #error in
+# mem/heap.c (a spill mapping must not be inherited by fork(), #1138).
 CPPCHECK_DEFS = -D__linux__ -D__GNUC__ -D__x86_64__ -D__SIZEOF_INT128__=16 \
   -D__ORDER_LITTLE_ENDIAN__=1234 -D__BYTE_ORDER__=1234 -D__GLIBC__ -DDEBUG \
-  '-D__has_attribute(x)=0'
+  '-D__has_attribute(x)=0' -DMADV_DONTFORK=10
 
 cppcheck:
 	@command -v cppcheck >/dev/null || { echo "cppcheck: not found"; exit 1; }
