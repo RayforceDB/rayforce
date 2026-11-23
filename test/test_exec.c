@@ -3154,7 +3154,9 @@ static test_result_t test_exec_str_if_scalar(void) {
     ray_t* tbl = make_str_table();
     ray_graph_t* g = ray_graph_new(tbl);
 
-    /* IF(name == "hello", "YES", "NO") — scalar SYM branches, STR condition column */
+    /* IF(name == "hello", "YES", "NO"): string literal branches, STR
+     * condition column.  Two string literals give a STR column, as one
+     * literal standing alone does (#1495). */
     ray_op_t* name = ray_scan(g, "name");
     ray_op_t* lit = ray_const_str(g, "hello", 5);
     ray_op_t* cond = ray_eq(g, name, lit);
@@ -3164,22 +3166,19 @@ static test_result_t test_exec_str_if_scalar(void) {
     ray_t* result = ray_execute(g, if_op);
 
     TEST_ASSERT_FALSE(RAY_IS_ERR(result));
-    TEST_ASSERT_TRUE(RAY_IS_SYM(result->type));  /* scalar str branches → RAY_SYM output */
+    TEST_ASSERT_EQ_I(result->type, RAY_STR);
     TEST_ASSERT_EQ_I(result->len, 5);
 
     /* row 0: "hello" == "hello" → true → "YES" */
-    int64_t sid0 = ray_read_sym(ray_data(result), 0, result->type, result->attrs);
-    ray_t* sym0 = ray_sym_str(sid0);
-    TEST_ASSERT_NOT_NULL(sym0);
-    TEST_ASSERT_EQ_U(ray_str_len(sym0), 3);
-    TEST_ASSERT_MEM_EQ(3, ray_str_ptr(sym0), "YES");
+    size_t len = 0;
+    const char* s0 = ray_str_vec_get(result, 0, &len);
+    TEST_ASSERT_EQ_U(len, 3);
+    TEST_ASSERT_MEM_EQ(3, s0, "YES");
 
     /* row 1: "WORLD" != "hello" → false → "NO" */
-    int64_t sid1 = ray_read_sym(ray_data(result), 1, result->type, result->attrs);
-    ray_t* sym1 = ray_sym_str(sid1);
-    TEST_ASSERT_NOT_NULL(sym1);
-    TEST_ASSERT_EQ_U(ray_str_len(sym1), 2);
-    TEST_ASSERT_MEM_EQ(2, ray_str_ptr(sym1), "NO");
+    const char* s1 = ray_str_vec_get(result, 1, &len);
+    TEST_ASSERT_EQ_U(len, 2);
+    TEST_ASSERT_MEM_EQ(2, s1, "NO");
 
     ray_release(result);
     ray_graph_free(g);

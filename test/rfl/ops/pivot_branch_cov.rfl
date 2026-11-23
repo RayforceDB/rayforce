@@ -290,21 +290,21 @@
 
 ;; ====================================================================
 ;; Section O: exec_if — STR output, string-atom then + string-atom else
-;;            When both then and else are string literals, the planner
-;;            may produce SYM output (atom->sym promotion).  Verify the
-;;            correct count and that the result values match the symbols.
+;;            Two string literals give a STR column, as one literal
+;;            standing alone does (#1495).  Verify the count and values.
 ;; ====================================================================
 
 (set TCond (table [x] (list [true false true false true])))
 
-;; (if x "yes" "no"): both are string atoms; planner promotes to SYM.
+;; (if x "yes" "no"): both are string atoms; the column is STR.
 (set ROstr (at (select {v: (if x "yes" "no") from: TCond}) 'v))
 (count ROstr) -- 5
-(at ROstr 0) -- 'yes
-(at ROstr 1) -- 'no
-(at ROstr 2) -- 'yes
-(at ROstr 3) -- 'no
-(at ROstr 4) -- 'yes
+(type ROstr) -- 'STR
+(at ROstr 0) -- "yes"
+(at ROstr 1) -- "no"
+(at ROstr 2) -- "yes"
+(at ROstr 3) -- "no"
+(at ROstr 4) -- "yes"
 
 ;; ====================================================================
 ;; Section P: exec_pivot — AVG on I64 value column

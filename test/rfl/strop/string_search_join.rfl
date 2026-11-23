@@ -51,7 +51,8 @@
 (at (select {from: SF where: (>= (str-find s "[b]") 0)}) 's) -- ["a[b]c"]
 (at (select {from: SF where: (>= (str-find s "b?1") 0)}) 's) -- []
 (count (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)})) -- 2
-(at (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)}) 'c) -- [1 7]
+(at (xasc (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)}) 'key) 'c) -- [7 1]
+(at (xasc (select {from: SF by: (if (== (str-find s "?") 1) "q" "o") c: (count s)}) 'key) 'key) -- ["o" "q"]
 
 (str-join ["a" "b" "c"] ",") -- "a,b,c"
 (str-join ['a 'b 'c] "-") -- "a-b-c"

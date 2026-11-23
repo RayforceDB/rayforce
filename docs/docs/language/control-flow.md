@@ -31,7 +31,7 @@ other result, are never evaluated:
 0
 ```
 
-Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form, and a text literal in it becomes a symbol cell; a chain without a fallback is left to the evaluator.
+Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form; a chain without a fallback is left to the evaluator.
 
 A query's `if` gives one column, so its arms must have a common type. Two
 numeric arms take the [promotion table](math.md#result-types) (`(if c i 1.5)`
@@ -56,6 +56,31 @@ error: type: if: branches mix DATE and TIMESTAMP
 error: type: if: branches mix DATE and I64
 ‣ (select {from: t r: (if (> g 0) (as 'I64 d) 0)})     ; the raw day count
 ```
+
+Text arms keep the type of the text. String literals (`(if c "a" "b")`, the
+same chain, or `(cond ((> n 2) "a") (else "b"))`) give a string (`STR`)
+column, as a string literal standing alone in a select does, so the two
+compare. A symbol arm, such as a symbol column or a `'b` literal, makes the
+column symbols (`SYM`). Use string arms when the column is compared with
+strings, and symbol arms when it is compared with symbols, joined on a symbol
+key or stored as a symbol column:
+
+```lisp
+‣ (set t (table [n s] (list [1 2 3] ['a 'b 'a])))
+‣ (set u (select {from: t s: s r: (if (> n 1) "a" "b") q: (if (> n 1) 'a 'b)}))
+‣ (count (select {from: u where: (== r "a")}))    ; r is a string column
+2
+‣ (count (select {from: u where: (== q s)}))      ; q is a symbol column
+1
+‣ (select {from: u where: (== r s)})
+error: type: =: incomparable operand types, got str and sym
+```
+
+A string column does not mix with symbols: `==` against a symbol raises
+`type`, a join on a symbol key raises `type`, and `concat` with symbols gives
+a list. `in` against a set of symbols raises nothing and matches no row, so
+`(in r ['a])` over a string column `r` is always false: test it with
+strings, `(in r ["a"])`, or convert it first, `(in (as 'SYM r) ['a])`.
 
 Outside a query `if` evaluates one arm only, so its arms are never typed
 against each other.

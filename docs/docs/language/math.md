@@ -245,6 +245,13 @@ nothing, and `""` selects the null rows, as `(== sym "")` does. A set
 computed while the query runs reads the same way as a written one. A `GUID`
 column against a string is a `type` error, for `==` and for `in` alike.
 
+The reverse is not converted. A `STR` value (a string column, or an `if` over
+string literals, see [control flow](control-flow.md)) against a symbol is a
+`type` error for `==`, but `in` against a set of symbols answers `false` for
+every cell, with no error: `(in s ['a])` over a string column `s` keeps no
+row. Write the set as strings, `(in s ["a"])`, or convert the column,
+`(in (as 'SYM s) ['a])`.
+
 ### `(== a b)` — atomic
 
 Equal. Works on all types including strings and symbols.
