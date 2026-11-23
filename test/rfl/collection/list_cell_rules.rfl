@@ -81,7 +81,8 @@
 (count (sect Z (list P))) -- 0
 (count (sect Z (list [0.0 0.0]))) -- 20
 (count (sect (take Z 20) (concat (list 1) (enlist (concat 0.0 (neg 0.0)))))) -- 7
-(count (union Z (list [0.0 0.0] [1.0 0.0] P))) -- 61
+;; union is a set (#1385): Z's duplicates go too, so this is 4, not Z's 60 elements plus one
+(count (union Z (list [0.0 0.0] [1.0 0.0] P))) -- 4
 (count (union (list P) Z)) -- 4
 ;; in tests leaves, so its -0.0 meets a 0.0 atom as before
 (in (list N) (list 0.0)) -- (list [true])
