@@ -15110,6 +15110,7 @@ static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             fp |= kt[k] == RAY_F64 || kt[k] == RAY_F32;
         }
         int8_t it[na];
+        memset(it, 0, sizeof it);
         for (uint32_t a = 0; a < na; a++) {
             ray_op_t* in = op_node(g, ext->agg_ins[a]);
             it[a] = !in || in->opcode == OP_SCAN ? 0 : in->out_type;
