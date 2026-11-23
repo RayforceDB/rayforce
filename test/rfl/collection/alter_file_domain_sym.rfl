@@ -1,0 +1,46 @@
+;; alter set on a SYM vector that still resolves over a symbol file (#1494).
+;; A column read from a splayed table with its symbol file, and a vector
+;; gathered from it, keep the file's symbol domain.  A symbol the file holds
+;; was written; a symbol it does not hold was dropped without an error, and
+;; alter returned the name as if it had succeeded.  The vector now moves to
+;; the runtime domain first, as dict keys do on an upsert.
+(.sys.exec "rm -rf /tmp/rfl_alter_fsym && mkdir -p /tmp/rfl_alter_fsym") -- 0
+(.db.splayed.set "/tmp/rfl_alter_fsym/t/" (table [k] (list ['p 'q 'p])) "/tmp/rfl_alter_fsym/.sym")
+
+;; a gathered vector
+(set V (at (get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k) [0 1 2]))
+(alter 'V set [2] 'q) -- 'V
+V -- ['p 'q 'q]
+(alter 'V set [1] 'rfl_alter_fsym_z) -- 'V
+V -- ['p 'rfl_alter_fsym_z 'q]
+;; the cells written before the move keep their symbols, and later writes land
+(alter 'V set 0 'q) -- 'V
+V -- ['q 'rfl_alter_fsym_z 'q]
+(== V ['q 'rfl_alter_fsym_z 'q]) -- [true true true]
+(count (distinct V)) -- 2
+
+;; an atom index, a symbol the file does not hold
+(set A (at (get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k) [0 1 2]))
+(alter 'A set 2 'rfl_alter_fsym_y) -- 'A
+A -- ['p 'q 'rfl_alter_fsym_y]
+
+;; pairwise values: one held by the file, one not
+(set P (at (get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k) [0 1 2]))
+(alter 'P set [0 2] ['rfl_alter_fsym_x 'q]) -- 'P
+P -- ['rfl_alter_fsym_x 'q 'q]
+
+;; the mapped column itself, bound to a name
+(set M (get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k))
+(alter 'M set 1 'rfl_alter_fsym_w) -- 'M
+M -- ['p 'rfl_alter_fsym_w 'p]
+
+;; another binding sharing the vector keeps its contents
+(set B (at (get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k) [0 1 2]))
+(set C B)
+(alter 'B set 0 'rfl_alter_fsym_v) -- 'B
+B -- ['rfl_alter_fsym_v 'q 'p]
+C -- ['p 'q 'p]
+
+;; neither the table on disk nor its symbol file is touched
+(get (.db.splayed.get "/tmp/rfl_alter_fsym/t/" "/tmp/rfl_alter_fsym/.sym") 'k) -- ['p 'q 'p]
+(.sys.exec "rm -rf /tmp/rfl_alter_fsym") -- 0
