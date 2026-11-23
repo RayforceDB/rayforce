@@ -11619,7 +11619,9 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
      * Templated by key element size: the entire loop is stamped out per width
      * so the compiler generates direct movzbl/movzwl/movl/movq — zero dispatch. */
     #define DA_PF_DIST 8
-    /* The prefetch row stays below `end`, the piece end when staged. */
+    /* The prefetch row stays below `end`, the piece end when staged, and is
+     * one the selection keeps: the key range covers the kept rows only, so
+     * a dropped row's key may lie below kmin (#1482). */
     #define DA_SINGLE_KEY_LOOP(KTYPE, KCAST) \
     do { \
         const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
@@ -11628,7 +11630,8 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
         for (int64_t i = start; i < end; i++) { \
             int64_t r = match_idx ? match_idx[i] : i; \
             if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
-            if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
+            if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end) && (match_idx || !c->rowsel || \
+                    group_rowsel_pass(c->rowsel, i + DA_PF_DIST))) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
                 int64_t pfk = (int64_t)KCAST kp[pf_r - rb]; \
                 if (c->key_types[0] == RAY_SYM && pfk == 0) pfk = kmin; \

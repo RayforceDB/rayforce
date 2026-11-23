@@ -184,6 +184,47 @@ static test_result_t test_f32_extrema_routes(void) {
     PASS();
 }
 
+/* The legacy direct-array single-key loop under a where: prefetches only
+ * rows the selection keeps (#1482).  The key range is taken over the kept
+ * rows, so a dropped row's key can lie below it: here every dropped row has
+ * key 0 and every kept one 50000 or more.  Prefetching such a row formed a
+ * slot pointer below the count array (UBSan: pointer overflow).  Route 1
+ * forces the legacy route; its groups match the default route's. */
+static test_result_t test_dense_single_key_prefetch_where(void) {
+    ray_t* init = ray_eval_str(
+        "(set pfw (% (til 2000) 51)) "
+        "(set pft (table [v k w] (list (til 2000) "
+        "(* (> pfw 5) (+ 50000 (% (* (til 2000) 7919) 60000))) pfw)))");
+    TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
+    const char* q = "(select {s: (sum v) from: pft by: k where: (> w 5)})";
+    ray_group_test_route(1);
+    agg_route_reset();
+    ray_t* got = ray_eval_str(q);
+    agg_route_stats_t st = agg_route_stats();
+    ray_group_test_route(0);
+    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE);
+    TEST_ASSERT_TRUE(st.routes[AGG_ROUTE_LEGACY] >= 1);
+    ray_t* want = ray_eval_str(q);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want) && want->type == RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(got), 1760);
+    TEST_ASSERT_EQ_I(ray_table_nrows(want), 1760);
+    int64_t gs = 0, ws = 0, gk = 0, wk = 0;
+    const int64_t* gkd = ray_data(ray_table_get_col_idx(got, 0));
+    const int64_t* gsd = ray_data(ray_table_get_col_idx(got, 1));
+    const int64_t* wkd = ray_data(ray_table_get_col_idx(want, 0));
+    const int64_t* wsd = ray_data(ray_table_get_col_idx(want, 1));
+    for (int64_t i = 0; i < 1760; i++) {
+        gs += gsd[i]; ws += wsd[i];
+        gk += gkd[i] * gsd[i]; wk += wkd[i] * wsd[i];
+        TEST_ASSERT_TRUE(gkd[i] >= 50000);
+    }
+    TEST_ASSERT_EQ_I(gs, ws);
+    TEST_ASSERT_EQ_I(gk, wk);
+    ray_release(got); ray_release(want);
+    ray_release(ray_eval_str("(set pft 0) (set pfw 0)"));
+    PASS();
+}
+
 /* A NaN payload whose HAS_NULLS bit was lost (a producer that skipped the
  * flag) must not pin an extreme at NaN: the reduction kernel itself skips
  * it, so no scalar shortcut is needed in front of the DAG. */
@@ -6449,6 +6490,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
+    { "agg_contract/dense_single_key_prefetch_where", test_dense_single_key_prefetch_where, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_unflagged_nan", test_f32_extrema_unflagged_nan, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
