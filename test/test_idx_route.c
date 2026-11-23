@@ -2209,7 +2209,7 @@ static test_result_t test_distinct_f64_nan_no_null_attr(void) {
  *
  * vec {5,1,9,3,7,1,9,5,3,7}:
  *   first-occurrence row ids: 0(=5),1(=1),2(=9),3(=3),4(=7)
- *   → output {5,1,9,3,7}  (first-occurrence order, #1361)
+ *   → output {5,1,9,3,7}  (first-occurrence order, #1477)
  *
  * Contract: distinct on a numeric vector returns its values in the order
  * they first occur, as for every other type.  This test must pass with OR

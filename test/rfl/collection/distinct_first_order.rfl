@@ -1,6 +1,6 @@
 ;; @also-unfused
 ;; distinct keeps each value's first occurrence, in the order the values first
-;; appear, for every typed vector (#1361), as SYM, STR and LIST already did;
+;; appear, for every typed vector (#1477), as SYM, STR and LIST already did;
 ;; numeric and temporal vectors came back sorted.  A null is kept once, where
 ;; it first occurs.
 

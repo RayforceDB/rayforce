@@ -10,7 +10,7 @@ Three rules of thumb to start with.
 
 - **One-shot scans:** don't build an index. The build is itself a full pass; you'd pay it twice for a single query with no payoff.
 - **Repeated point lookups against the same column:** a hash index lets filter EQ, filter IN, and find use O(matches) hash probes instead of O(n) scans.  Build it for any column that sees repeated equality queries during a session.
-- **Range or sorted-output queries against a stable column:** a sort index gives the filter site an O(log n) binary-search path and lets ORDER BY (single ascending key) and distinct skip re-sorting entirely.
+- **Range or sorted-output queries against a stable column:** a sort index gives the filter site an O(log n) binary-search path and lets ORDER BY (single ascending key) skip re-sorting entirely and distinct skip its hash table.
 
 A useful lower bound: if you are not planning to run at least a handful of queries against the indexed column before mutating it, the index loses on round-trip cost.
 

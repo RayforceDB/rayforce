@@ -257,7 +257,7 @@
 
 ;; I32 (line 262): distinct on I32 vec with multiple unique values
 (count (distinct [3i 1i 2i 1i 3i])) -- 3
-;; first-occurrence order, every type (#1361)
+;; first-occurrence order, every type (#1477)
 (at (distinct [3i 1i 2i]) 0) -- 3i
 
 ;; DATE (line 262): distinct on date vec, first-occurrence order

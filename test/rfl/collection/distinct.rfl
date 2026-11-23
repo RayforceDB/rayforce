@@ -20,7 +20,7 @@
 (distinct "") -- ""
 (distinct [1h 2h 2h]) -- [1 2]
 (count (distinct [1i 0Ni 1i])) -- 2
-;; nulls preserved — 2 distinct values, in first-occurrence order (#1361)
+;; nulls preserved — 2 distinct values, in first-occurrence order (#1477)
 (nil? (at (distinct [1i 0Ni 1i]) 1)) -- true
 (nil? (at (distinct [0Ni 1i 1i]) 0)) -- true
 (distinct [2012.12.12 2012.12.12]) -- [2012.12.12]
@@ -263,7 +263,7 @@
 ;; Vectors of >= 65536 rows route fixed-width types through the
 ;; radix-partitioned kernel (distinct_radix_first_ids); everything below
 ;; must agree with the small-vector hashset semantics above: first-
-;; occurrence order (#1361), declared nulls collapsed to one.
+;; occurrence order (#1477), declared nulls collapsed to one.
 
 ;; i64: duplicates spread across the whole vector, null in the tail
 (set big (concat (concat [5 7 5] (take [9] 100000)) (concat [7 3 0Nl] (take [5] 100000))))

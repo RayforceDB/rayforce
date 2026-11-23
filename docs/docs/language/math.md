@@ -563,7 +563,7 @@ Last element of a vector.
 Unique elements of a vector.
 
 ```lisp
-(distinct [1 2 2 3 1])  ; [1 2 3]
+(distinct [3 1 3 2 1])  ; [3 1 2], in the order values first appear
 ```
 
 ## Ordering

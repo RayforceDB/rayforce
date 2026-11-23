@@ -2156,12 +2156,9 @@ static bool list_set_of(list_set_t* s, ray_t* l, int spans) {
 /* Forward declaration */
 ray_t* list_to_typed_vec(ray_t* list, int8_t orig_vec_type);
 
-/* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
- * Factored out so the executor doesn't go through ray_distinct_fn, which
- * is now a lazy producer for vectors and would re-wrap into a chain. */
 /* The first-occurrence row ids `idx[0..count)` (one per value, each a row of
  * a `len`-row vector) put in row order, so the distinct values come out in
- * first-occurrence order (#1361): a bitmap of the ids, scanned once.  False
+ * first-occurrence order (#1477): a bitmap of the ids, scanned once.  False
  * on oom. */
 static int i64_asc_cmp(const void* a, const void* b) {
     int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
@@ -2186,14 +2183,18 @@ static bool distinct_ids_in_row_order(int64_t* idx, int64_t count, int64_t len) 
     return true;
 }
 
+/* Eager vector dedup — called by the DAG executor's OP_DISTINCT case.
+ * Factored out so the executor doesn't go through ray_distinct_fn, which
+ * is now a lazy producer for vectors and would re-wrap into a chain.
+ * Every typed vector keeps first-occurrence order (#1477). */
 ray_t* distinct_vec_eager(ray_t* x) {
     int64_t len = ray_len(x);
     if (len == 0) { ray_retain(x); return x; }
 
     /* Fast path: when a fresh, null-free sort index is attached, walk the
-     * permutation once to collect the first-in-run row ids.  The walk
-     * produces ids in value-ascending order (matching the hashset path's
-     * distinct_sort_indices contract) in O(n) with no hash table.
+     * permutation once to collect the first-in-run row ids (each value's
+     * first occurrence), in O(n) with no hash table.  The walk gives them in
+     * value order; they are put back in row order below.
      * Guard on ray_index_has to avoid a consult bump when no index exists
      * (mirrors the find fast-path's !has_nulls && ray_index_has gate). */
     if (x->type != RAY_SYM && x->type != RAY_GUID && x->type != RAY_STR
@@ -2326,7 +2327,7 @@ ray_t* distinct_vec_eager(ray_t* x) {
         hashset_destroy(&hs);
     }
 
-    /* Every type keeps first-occurrence order (#1361): the hash passes and
+    /* Every type keeps first-occurrence order (#1477): the hash passes and
      * the radix kernel (which sweeps its first-row flags by row) all give
      * the ids in row order already, so no sort follows. */
 

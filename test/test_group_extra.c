@@ -1351,7 +1351,7 @@ static test_result_t test_count_distinct_runs_partitions(void) {
     /* distinct values shares the partition function and slots its own
      * table on the top bits of val * K1: 1M distinct values, then 1M
      * multiples of 4096, each kept once, in first-occurrence order, so the
-     * output is the input (#1361) (a partition on those same bits packs its
+     * output is the input (#1477) (a partition on those same bits packs its
      * values into 1/P of the table: minutes) */
     const int64_t m = (int64_t)1 << 20;
     for (int pass = 0; pass < 2; pass++) {

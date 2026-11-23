@@ -4254,12 +4254,9 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col) {
  * ascending order; the FIRST element of each run is already the minimum row
  * id (= first occurrence) for that value.
  *
- * After collecting the first-in-run ids we sort them by VALUE (not by row)
- * to match distinct_vec_eager's distinct_sort_indices contract: output is
- * numerically sorted, not first-occurrence ordered.  Because the perm
- * already provides one representative per value in ascending value order, we
- * can emit them directly without a second sort — the perm walk order is
- * already value-ascending, which is exactly the required output order.
+ * The ids come out in value order (the permutation's); distinct_vec_eager
+ * puts them back in row order, so distinct keeps first-occurrence order
+ * (#1477).
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
@@ -4296,9 +4293,8 @@ ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
         }
     }
 
-    /* The perm walk produces ids in VALUE-ascending order (perm is sorted
-     * ascending).  distinct_vec_eager's contract (from distinct_sort_indices)
-     * is also value-ascending, so no second sort is needed. */
+    /* The perm walk gives the ids in value order; the caller puts them in
+     * row order (#1477). */
     out->len   = count;
     *out_count = count;
     return out;
