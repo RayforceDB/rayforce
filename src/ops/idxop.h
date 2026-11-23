@@ -719,6 +719,12 @@ bool ray_index_bloom_absent(ray_t* col, int64_t key);
  * Floats are intentionally not supported — equality on F32/F64
  * has NaN / -0 semantics the unfused compare kernel handles. */
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
+/* ray_index_hash_eq_rowsel for a STR column and the needle's bytes
+ * (`p`, `l`): the hash a STR index is keyed on is the bytes', and each word
+ * hit is confirmed against them.  NULL for an empty needle (the STR null,
+ * whose rows the index leaves out), a stale or missing index, a dense
+ * group or OOM: the caller scans. */
+ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l);
 /* ray_index_hash_eq_rowsel for a single-file generation-2 column whose
  * recorded HASH region is probed where it is mapped, without materializing
  * the column or copying the region: the root's layout is checked against
@@ -731,6 +737,15 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key);
  * group dense enough for the scan, as ray_index_hash_eq_rowsel declines);
  * -1: *err owned. */
 int    ray_enc_hash_eq_rowsel(ray_t* encv, int64_t key, ray_t** sel, ray_t** err);
+/* ray_enc_hash_eq_rowsel for a single-file generation-2 STR column and the
+ * needle p[0..l): the region's byte-hash words are walked, and a word hit
+ * is confirmed against the group's first row read back by row id; the
+ * column is not materialized.  "" (the null rows the hash leaves out)
+ * declines.  1 / 0 / -1 as ray_enc_hash_eq_rowsel. */
+int    ray_enc_hash_eq_str_rowsel(ray_t* encv, const char* p, size_t l, ray_t** sel, ray_t** err);
+/* The `in` twin: every element of the STR set `set_vec` probed so; a ""
+ * element, a dense union or another set type declines. */
+int    ray_enc_hash_in_str_rowsel(ray_t* encv, ray_t* set_vec, ray_t** sel, ray_t** err);
 /* Test hook: probes ray_enc_hash_eq_rowsel answered since process start. */
 uint64_t ray_enc_hash_test_probes(void);
 
@@ -755,7 +770,8 @@ ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key);
  *   - A fresh rowsel block (rc=1) on success — install on g->selection.
  *     An empty set yields a valid all-NONE rowsel (NOT NULL).
  *   - NULL when the column is not eligible (no hash/part index, stale,
- *     float-family column, unsupported set type, OOM) or a hash-index union
+ *     float-family column, unsupported set type, a "" needle against a STR
+ *     column, OOM) or a hash-index union
  *     is too dense.  Part-index unions retain dense full morsels efficiently.
  *     Caller falls back to the scan path. */
 ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
