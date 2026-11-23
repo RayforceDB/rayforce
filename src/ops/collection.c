@@ -2288,8 +2288,8 @@ ray_t* distinct_vec_eager(ray_t* x) {
      * partition scheme as exec_count_distinct, producing the same row-id
      * set the hashset pass below would (one first-occurrence id per
      * value).  NULL means the kernel declined (type, size, pool, or
-     * memory) and the hashset handles it.  Either way the ids flow into the shared
-     * sort + gather tail, so result semantics are identical. */
+     * memory) and the hashset handles it.  Either way the ids are in row
+     * order and flow into the shared gather, so the results are identical. */
     int64_t count = 0;
     ray_t* rids = distinct_radix_first_ids(x);
     if (rids && RAY_IS_ERR(rids)) {

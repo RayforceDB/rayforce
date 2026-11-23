@@ -36,6 +36,17 @@
 (at (.idx.info s) 'kind) -- 'sort
 (identical (distinct s) (first_rows (.idx.drop s))) -- true
 
+;; -0.0 and 0.0 are one value; the sort index orders -0.0 first within the
+;; run, so the run's smallest row, not its first, is the first occurrence
+(set z (concat [3.0 0.0 1.0] (concat (* -1.0 [0.0]) [3.0 0.0])))
+(distinct (.idx.sort (take z 100))) -- (distinct (take z 100))
+(distinct (.idx.sort (take z 100))) -- [3.0 0.0 1.0]
+(distinct (.idx.sort (take z 20))) -- [3.0 0.0 1.0]
+(set zf (as 'F32 (take z 100)))
+(distinct (.idx.sort zf)) -- (distinct zf)
+(set zw (concat (* 1.0 (til 80)) (concat (* -1.0 [0.0]) (take z 100))))
+(distinct (.idx.sort zw)) -- (distinct zw)
+
 ;; select, by:, a lazy chain and a parted table answer the same way
 (set T (table [k v] (list [a a b b a] [3 1 2 1 5])))
 (at (select {d: (distinct v) from: T}) 'd) -- [3 1 2 5]

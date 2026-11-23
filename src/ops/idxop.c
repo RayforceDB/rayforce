@@ -4249,10 +4249,11 @@ ray_t* ray_index_sort_perm_fresh(ray_t* col) {
 /* --------------------------------------------------------------------------
  * Sort-index distinct fast path
  *
- * Walk the sort permutation once.  The perm is a stable ascending sort with
- * iota tie-breaking, so within each equal-value run the row ids appear in
- * ascending order; the FIRST element of each run is already the minimum row
- * id (= first occurrence) for that value.
+ * Walk the sort permutation once and keep, for each run of equal keys, its
+ * smallest row id (= the value's first occurrence).  The perm is a stable
+ * ascending sort with iota tie-breaking, but it orders -0.0 before 0.0,
+ * which the run treats as one key, so the first element of a run is not
+ * always its smallest row.
  *
  * The ids come out in value order (the permutation's); distinct_vec_eager
  * puts them back in row order, so distinct keeps first-occurrence order
@@ -4280,16 +4281,17 @@ ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count) {
     int64_t* ids        = (int64_t*)ray_data(out);
     int64_t  count      = 0;
 
-    /* First element of the perm always starts the first run. */
+    /* One id per run of equal keys: the smallest row id in the run, its
+     * value's first occurrence.  Within a run the rows are ascending by the
+     * stable sort, except where the sort orders keys the run treats as one
+     * (-0.0 before 0.0), so the minimum is taken, not the first. */
     ids[count++] = p[0];
     for (int64_t i = 1; i < n; i++) {
-        /* Compare value at current perm position to previous one.
-         * The perm is sorted ascending, so equal values form contiguous runs;
-         * we emit one id per run (the first element, which is the min row id
-         * because the sort is stable with iota tie-breaking). */
         if (numeric_key_word(base, col->type, p[i]) !=
             numeric_key_word(base, col->type, p[i-1])) {
             ids[count++] = p[i];
+        } else if (p[i] < ids[count - 1]) {
+            ids[count - 1] = p[i];
         }
     }
 
