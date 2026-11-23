@@ -96,6 +96,7 @@ typedef struct {
     uint8_t attrs;
     int is_f64;
     int64_t sum_i;
+    int64_t lo, hi;  /* integer vector bounds; lo > hi for empty */
     double sum_f;
 } affine_sum_cache_entry_t;
 
@@ -575,8 +576,8 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     /* A narrow result (I16 + I16 is I16, #972) wraps or rounds per row in
      * its own width, which sum(x) + n*c does not: sum the rows instead
      * (the vector is evaluated once either way). */
+    int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
     {
-        int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
         if (rt == RAY_U8 || rt == RAY_I16 || rt == RAY_I32 || rt == RAY_F32) {
             ray_t* rows = atomic_map_binary_op(ray_add_fn, OP_ADD, vec, c_expr);
             ray_release(vec);
@@ -588,30 +589,72 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     }
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
-        ray_t* sum = ray_sum_fn(vec);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-        sum = materialize_owned_value(sum);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-
         memset(&ce, 0, sizeof(ce));
         ce.vec = vec;
         ce.data = ray_data(vec);
         ce.len = vec->len;
         ce.type = vec->type;
         ce.attrs = vec->attrs;
-        ce.is_f64 = (sum->type == -RAY_F64);
-        if (ce.is_f64) ce.sum_f = as_f64(sum);
-        else           ce.sum_i = numeric_atom_i64(sum);
-        ray_release(sum);
+        bool need_bounds = vec->type >= RAY_BOOL && vec->type <= RAY_I64 &&
+                           !ray_idx_int_bounds(vec, &ce.lo, &ce.hi);
+        if (vec->type == RAY_I64 && need_bounds) {
+            /* No nulls or index extrema: sum the slice and find its bounds
+             * in one pass. Unsigned addition gives the modular I64 sum. */
+            const int64_t* data = ce.data;
+            uint64_t total = 0;
+            int64_t lo = INT64_MAX, hi = INT64_MIN;
+            for (int64_t i = 0; i < vec->len; i++) {
+                int64_t x = data[i];
+                total += (uint64_t)x;
+                if (x < lo) lo = x;
+                if (x > hi) hi = x;
+            }
+            ce.sum_i = (int64_t)total;
+            ce.lo = lo;
+            ce.hi = hi;
+        } else {
+            ray_t* sum = ray_sum_fn(vec);
+            if (!sum || RAY_IS_ERR(sum)) {
+                ray_release(vec);
+                return sum ? sum : ray_error("type", NULL);
+            }
+            sum = materialize_owned_value(sum);
+            if (!sum || RAY_IS_ERR(sum)) {
+                ray_release(vec);
+                return sum ? sum : ray_error("type", NULL);
+            }
+            ce.is_f64 = (sum->type == -RAY_F64);
+            if (ce.is_f64) ce.sum_f = as_f64(sum);
+            else           ce.sum_i = numeric_atom_i64(sum);
+            ray_release(sum);
+            if (need_bounds) {
+                ce.lo = INT64_MAX;
+                ce.hi = INT64_MIN;
+                for (int64_t i = 0; i < vec->len; i++) {
+                    int64_t x = ray_vec_get_i64(vec, i);
+                    if (x < ce.lo) ce.lo = x;
+                    if (x > ce.hi) ce.hi = x;
+                }
+            }
+        }
         affine_sum_cache_store(vec, &ce);
     }
 
+    if (rt == RAY_I64) {
+        /* Only MIN - c (mod 2^64) adds to the null sentinel. Ordinary
+         * wrap is safe, but sum must skip rows that produce MIN. */
+        int64_t c = numeric_atom_i64(c_expr);
+        int64_t hit = (int64_t)((uint64_t)INT64_MIN - (uint64_t)c);
+        if (ce.lo <= hit && hit <= ce.hi) {
+            int64_t total = 0;
+            for (int64_t i = 0; i < vec->len; i++) {
+                int64_t x = ray_vec_get_i64(vec, i);
+                if (x != hit) total = wrap_add_i64(total, wrap_add_i64(x, c));
+            }
+            ray_release(vec);
+            return make_i64(total);
+        }
+    }
     int64_t n = vec->len;
     ray_release(vec);
     if (ce.is_f64 || c_expr->type == -RAY_F64) {

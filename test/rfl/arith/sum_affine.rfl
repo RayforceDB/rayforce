@@ -80,5 +80,16 @@
 ;; add must wrap deterministically in int64 two's-complement, matching flat sum.
 ;;   v=[MAX MAX], c=2: sum_i = -2 (wrap), + 2*2 => 2
 (sum (+ [9223372036854775807 9223372036854775807] 2)) -- 2
-;;   v=[MAX 1],  c=1: sum_i = MIN (wrap), + 1*2 => MIN+2
-(sum (+ [9223372036854775807 1] 1)) -- -9223372036854775806
+;; MAX+1 is I64 null, so only 1+1 contributes.
+(sum (+ [9223372036854775807 1] 1)) -- 2
+(set edge [1 9223372036854775807 1])
+(sum (+ 1 edge)) -- 4
+(sum (+ edge 2)) -- -9223372036854775801
+;; The same cached bounds must be checked against each new constant.
+(+ (sum (+ edge 1)) (sum (+ edge 2))) -- -9223372036854775797
+(sum (+ [-2 1 4] 3)) -- 12
+;; A narrow input can also hit I64 null after promotion (1 + MAX).
+(sum (+ [1h 0h] 9223372036854775807)) -- 9223372036854775807
+;; Input null and a generated null must both be skipped.
+(sum (+ [0Nl 9223372036854775807 1] 1)) -- 2
+(avg (+ [0Nl 9223372036854775807 1] 1)) -- 2.0

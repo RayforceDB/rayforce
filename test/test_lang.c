@@ -207,6 +207,7 @@ static test_result_t narrow_sum_run_cases(const narrow_sum_case_t* cases) {
 
 static test_result_t test_narrow_sum_bound_routes(void) {
     static const char* const setup[] = {
+        "(set _odd (table [k a b] (list [0 1 2] [1 4611686018427387904 1] [1 9223372036854775807 1])))",
         "(set _nI (til 200000))",
         "(set h (as 'I16 (- (% _nI 2001) 1000)))",
         "(set k (as 'I16 (- (% (* _nI 7) 1999) 999)))",
@@ -265,6 +266,19 @@ static test_result_t test_narrow_sum_bound_routes(void) {
                    META = NSR(NARROW_SUM_META), PART = NSR(NARROW_SUM_PARTIAL),
                    SAMPLE = NSR(NARROW_SUM_SAMPLE), REF = NSR(NARROW_SUM_REFUSED);
     const narrow_sum_case_t cases[] = {
+        /* #1434: a sentinel produced in an intermediate must propagate even
+         * when adding one more would make the root look non-null. */
+        { NS_Q("(select {from: _odd s: (sum (* a 2))})", "4"), REF },
+        { NS_Q("(select {from: _odd s: (avg (* a 2))})", "2.0"), REF },
+        { NS_Q("(select {from: _odd s: (sum (+ (* a 2) 1))})", "6"), REF },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (avg (+ b 1))})", "2.0"), REF },
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (* a 2))})", "2"), REF },
+        /* INT64_MAX + 2 wraps to MIN + 1, which is a value, not null. */
+        { NS_Q("(select {from: _odd s: (sum (+ b 2))})", "-9223372036854775801"), REF },
+        { NS_Q("(select {from: _odd s: (sum (* k 2))})", "6"), SCAN | PRE },
+        /* Each product fits I64, but their total needs AVG's wide accumulator. */
+        { NS_Q("(select {from: (table [v] (list [3000000000000000000 3000000000000000000]))"
+               " s: (avg (* v 2))})", "6.0e18"), SCAN },
         /* nothing can wrap: proved by the pass, a lone SUM / AVG takes its total */
         { NS_Q("(select {s: (sum (+ h k)) from: _nT})",   "(sum (+ h k))"),   SCAN | PRE },
         { NS_Q("(select {s: (sum (* h 3h)) from: _nT})",  "(sum (* h 3h))"),  SCAN | PRE },
@@ -332,8 +346,8 @@ static test_result_t test_narrow_sum_bound_routes(void) {
                "(sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3)))"), 0 },
         /* a narrow constant subtree that wraps: refused, per row */
         { NS_Q("(select {s: (sum (* -12038h 0x7f)) from: _nt100})", "-2149800"), REF },
-        /* I64: no narrow node, no proof */
-        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), 0 },
+        /* I64 addition can generate null; safe bounds permit the rewrite. */
+        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), SCAN | PRE },
         { NULL, 0 },
     };
     test_result_t r = narrow_sum_run_cases(cases);
