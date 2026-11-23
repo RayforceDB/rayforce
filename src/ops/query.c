@@ -4225,6 +4225,7 @@ static bool expr_has_collection_concat(ray_t* expr, ray_t* tbl) {
 }
 
 static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl);  /* defined below */
+static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg);  /* defined below */
 static bool simplify_agg_idiom(ray_t* val_expr, ray_t* tbl,
                                uint16_t* out_op, ray_t** out_arg);
 
@@ -4315,6 +4316,30 @@ static bool hidden_agg_arg_declines(ray_t* arg, ray_t* tbl) {
     bool declined = !compile_agg_arg_dag(g, arg) && !g->compile_err;
     ray_graph_free(g);
     return declined;
+}
+
+/* The error a nested-aggregate output's lowering reports, or NULL: a type
+ * error the compile raises, or a misspelt column in an output that lowers
+ * (the scan execution would reject).  The output itself is evaluated per
+ * group, which would name neither; the keyless select reports both (#1452).
+ * An output that does not lower is evaluated there too, and its own
+ * evaluation error stands. */
+static ray_t* nested_agg_compile_err(ray_t* expr, ray_t* tbl) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* op = compile_expr_dag(g, expr);
+    ray_t* err = graph_take_compile_err(g);
+    for (uint32_t i = 0; op && !err && i < g->node_count; i++) {
+        if (g->nodes[i].opcode != OP_SCAN || !(g->nodes[i].flags & OP_FLAG_INVALID_SCAN))
+            continue;
+        ray_op_ext_t* ext = find_ext(g, g->nodes[i].id);
+        ray_t* name = ext ? ray_sym_str(ext->sym) : NULL;
+        err = name ? ray_error("schema", "column '%.*s' not found",
+                               (int)ray_str_len(name), ray_str_ptr(name))
+                   : ray_error("schema", "column not found");
+    }
+    ray_graph_free(g);
+    return err;
 }
 
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
@@ -4646,6 +4671,10 @@ static bool expr_is_constant_collection(ray_t* expr, ray_t* tbl, bool* lowered) 
  * compile — the planner asks this for every aggregate several times. */
 static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections) {
     if (!arg) return false;
+    /* An aggregate inside the argument, (+ v (count v)), reduces the
+     * group's rows, not the table's: the argument is evaluated per group
+     * (#1452). */
+    if (grouped_output_nested_agg(arg, true)) return true;
     if (tbl && tbl->type == RAY_TABLE) {
         if (arg->type == -RAY_SYM) {
             bool local = !(arg->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(arg->i64);
@@ -4691,6 +4720,10 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
 
 static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
     if (!is_agg_expr(expr)) return 0;
+    /* An aggregate inside an argument, (max (+ v (count v))), is one value
+     * per group: the DAG would fold it over the whole table.  The output
+     * is evaluated per group instead (#1452). */
+    if (grouped_output_nested_agg(expr, false)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
     if (expr_contains_call_named(elems[1], "distinct", 8)) return 0;
@@ -16801,6 +16834,45 @@ static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg) {
     return NULL;
 }
 
+/* Whether `e` names a source column outside every aggregate in it: the
+ * rows an enclosing aggregate folds.  An unbound name counts, so its own
+ * error (schema, name) is the one reported.  A lambda or let body is its
+ * own scope and is not descended. */
+static bool expr_reads_rows_outside_agg(ray_t* e, ray_t* tbl) {
+    if (!e) return false;
+    if (e->type == -RAY_SYM)
+        return !(e->attrs & ATTR_QUOTED) &&
+               (ray_sym_is_dotted(e->i64) || tbl_has_col(tbl, e->i64) ||
+                !(ray_env_get_lexical_local(e->i64) || ray_env_get(e->i64)));
+    if (e->type != RAY_LIST || e->len < 1) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_alias_skip_form(el[0]) || is_agg_expr(e)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (expr_reads_rows_outside_agg(el[i], tbl)) return true;
+    return false;
+}
+
+/* The first aggregate in `expr` that folds only aggregates of the group,
+ * (max (sum v)) or (max (+ (sum v) 1)), or NULL.  Its argument is one
+ * value per group: there are no rows left to fold.  An aggregate that
+ * also reads rows, (max (+ v (count v))), is evaluated per group (#1452). */
+static ray_t* grouped_output_refolds_agg(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST || expr->len < 1) return NULL;
+    ray_t** el = (ray_t**)ray_data(expr);
+    if (select_alias_skip_form(el[0])) return NULL;
+    if (is_agg_expr(expr) && grouped_output_nested_agg(expr, false)) {
+        bool rows = false;
+        for (int64_t i = 1; i < expr->len && !rows; i++)
+            rows = expr_reads_rows_outside_agg(el[i], tbl);
+        if (!rows) return expr;
+    }
+    for (int64_t i = 1; i < expr->len; i++) {
+        ray_t* hit = grouped_output_refolds_agg(el[i], tbl);
+        if (hit) return hit;
+    }
+    return NULL;
+}
+
 /* ── Grouped alias planning ───────────────────────────────────────────────
  * A grouped select's outputs may name earlier outputs.  Two kinds of alias:
  *
@@ -18430,7 +18502,13 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         ray_t* v = ((ray_t**)ray_data(vals))[i];
         /* the routing's own test for an output the DAG group cannot serve */
         if (is_single_group_key_projection(by_expr, kid, v)) continue;
-        if (is_group_dag_agg_expr(v, tbl)) continue;
+        /* An aggregate whose argument has no DAG node, (first (at V i)),
+         * is evaluated per group: it needs the by-dict form too (#1452).
+         * A lowering that raises keeps the DAG route, which reports it. */
+        ray_t* cerr = NULL;
+        int dag = is_group_dag_agg_expr_dag_safe(v, tbl, &cerr);
+        if (cerr) { ray_error_free(cerr); continue; }
+        if (dag) continue;
         if (is_decomposable_agg_compound(v, tbl)) continue;
         needs_eval = true;
     }
@@ -24827,7 +24905,7 @@ by_dict_done:
                 ray_t* expr = dict_elems[i + 1];
                 if (is_single_group_key_projection(by_expr, kid, expr))
                     continue;
-                if (grouped_output_nested_agg(expr, false)) {
+                if (grouped_output_refolds_agg(expr, tbl)) {
                     ray_t* nm = ray_sym_str(kid);
                     for (int ci = 0; ci < n_compound; ci++)
                         ray_release(compound_rw[ci]);
@@ -24837,8 +24915,10 @@ by_dict_done:
                         "select by: output `%.*s` aggregates an aggregate of the group",
                         nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
                 }
-                ray_t* classifier_err = NULL;
-                int dag_safe = is_group_dag_agg_expr_dag_safe(expr, tbl, &classifier_err);
+                ray_t* classifier_err = grouped_output_nested_agg(expr, false)
+                                        ? nested_agg_compile_err(expr, tbl) : NULL;
+                int dag_safe = classifier_err ? 0
+                             : is_group_dag_agg_expr_dag_safe(expr, tbl, &classifier_err);
                 if (classifier_err) {
                     for (int ci = 0; ci < n_compound; ci++)
                         ray_release(compound_rw[ci]);
