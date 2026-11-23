@@ -4761,24 +4761,33 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
                 }
                 hashset_destroy(&hs);
             }
-        } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen > 0 &&
-                   vec->len > 0 && vec->len >= 1 + (LIST_SET_MIN_PAIRS - 1) / vlen) {
+        } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen >= 8 && vec->len >= 16) {
             ray_t** cells = ray_data(vec);
             ray_t** needles = ray_data(val);
-            /* The full pair count says nothing about where matches are.
-             * Give each needle a short, bounded chance to hit before hashing. */
-            int64_t prefix = (LIST_SET_MIN_PAIRS - 1) / vlen + 1;
-            if (prefix < 4) prefix = 4;
-            if (prefix > vec->len) prefix = vec->len;
-            int64_t unresolved = 0;
-            for (int64_t j = 0; j < vlen; j++) {
-                int64_t i = 0;
-                while (i < prefix && !atom_eq(cells[i], needles[j])) i++;
-                out[j] = i < prefix ? i : NULL_I64;
-                unresolved += i == prefix;
+            /* Start with enough rows to catch cheap hits. Grow the window only
+             * for unresolved needles, and pay for a hash build only after
+             * spending roughly four comparisons per remaining haystack cell. */
+            int64_t prefix = 0, limit = 16, unresolved = vlen;
+            uint64_t compared = 0;
+            /* A dense needle batch can pay for building the whole set. */
+            bool dense = vlen >= vec->len;
+            if (dense) for (int64_t j = 0; j < vlen; j++) out[j] = NULL_I64;
+            while (!dense && unresolved >= 8 && prefix < vec->len) {
+                for (int64_t j = 0; j < vlen; j++) {
+                    if (prefix != 0 && out[j] != NULL_I64) continue;
+                    int64_t i = prefix;
+                    while (i < limit && !atom_eq(cells[i], needles[j])) i++;
+                    compared += (uint64_t)(i - prefix) + (i < limit);
+                    out[j] = i < limit ? i : NULL_I64;
+                    unresolved -= i < limit;
+                }
+                prefix = limit;
+                int64_t left = vec->len - prefix;
+                if (compared / 4 >= (uint64_t)left) break;
+                limit += limit < left ? limit : left;
             }
             int64_t suffix = vec->len - prefix;
-            if (unresolved && suffix >= 1 + (LIST_SET_MIN_PAIRS - 1) / unresolved) {
+            if (unresolved >= 8 && suffix >= 8 && (dense || compared / 4 >= (uint64_t)suffix)) {
                 list_set_t set;
                 int spans = ray_key_spans(vec) | ray_key_spans(val);
                 if (!list_set_init(&set, cells + prefix, suffix, spans)) {
