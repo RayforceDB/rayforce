@@ -1628,7 +1628,7 @@ void ray_sym_domain_preload(ray_sym_domain_t* d, int64_t headroom) {
     const char* e = getenv("RAY_SYM_PRELOAD");
     int mode = (e && *e) ? atoi(e) : -1;   /* -1: by the memory left; 0 never; 1 always */
     if (mode == 0) return;
-    bool trace = getenv("RAY_SYM_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_SYM_TRACE");
     int64_t lim = ray_sys_ram_limit();
     int64_t anon = ray_heap_anon_committed();
     int64_t had = atomic_fetch_add_explicit(&g_dom_preloaded, (int64_t)size, memory_order_relaxed);

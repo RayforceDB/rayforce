@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 #include "part.h"
+#include "core/platform.h"   /* ray_env_flag */
 #include "table/table.h"
 #include "store/enccol.h"
 #include "store/encw.h"      /* ray_encw_null_image */
@@ -780,7 +781,7 @@ void ray_parted_cache_clear(void) {
 
 ray_t* ray_read_parted(const char* db_root, const char* table_name) {
     if (!db_root || !table_name) return ray_error("io", NULL);
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_CSV_TRACE");
     if (trace)
         fprintf(stderr, "parted.get: root=%s table=%s\n", db_root, table_name);
 

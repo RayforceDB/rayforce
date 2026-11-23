@@ -3592,7 +3592,7 @@ static ray_err_t csv_save_splayed_to_dir(const char* path, char delimiter, bool 
     if (!path || !dir || !sym_path) return RAY_ERR_DOMAIN;
     if (rows_per_chunk <= 0) rows_per_chunk = CSV_PART_ROWS_DEFAULT;
     /* RAY_CSV_TRACE: phase timings to stderr, as csv.parted prints them. */
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_CSV_TRACE");
     int64_t tr_t0 = ray_profile_now_ns();
     int64_t tr_scan = 0, tr_parse = 0, tr_append = 0, tr_chunks = 0;
     int64_t tr_col_ns[CSV_MAX_COLS];
@@ -4011,7 +4011,7 @@ static ray_err_t csv_save_parted_impl(const char* path, char delimiter, bool hea
     if (ray_interrupted()) return RAY_ERR_CANCEL;
     if (!path || !root || !table_name) return RAY_ERR_DOMAIN;
     if (rows_per_part <= 0) rows_per_part = CSV_PART_ROWS_DEFAULT;
-    bool trace = getenv("RAY_CSV_TRACE") != NULL;
+    bool trace = ray_env_flag("RAY_CSV_TRACE");
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return RAY_ERR_IO;

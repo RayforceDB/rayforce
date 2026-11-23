@@ -22,6 +22,7 @@
  */
 
 #include "ops/internal.h"
+#include "core/platform.h"   /* ray_env_flag */
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name */
 #include "ops/rowsel.h"
@@ -1358,7 +1359,7 @@ static void expr_stats_dump(void) {
 }
 
 void ray_expr_stats_init(void) {
-    if (getenv("RAY_EXPR_STATS")) atexit(expr_stats_dump);
+    if (ray_env_flag("RAY_EXPR_STATS")) atexit(expr_stats_dump);
 }
 
 /* Is this opcode an element-wise op suitable for expression compilation? */

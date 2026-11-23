@@ -21,9 +21,12 @@
  *   SOFTWARE.
  */
 
+#define _POSIX_C_SOURCE 200809L  /* setenv / unsetenv / strdup: env_restore.h */
 #include "test.h"
 #include <rayforce.h>
 #include "mem/sys.h"
+#include "env_restore.h"
+#include "core/platform.h"   /* ray_env_flag */
 #include <string.h>
 
 /* ---- test_sys_alloc_free ----------------------------------------------- */
@@ -119,8 +122,71 @@ static test_result_t test_sys_get_stat(void) {
 
 /* ---- Suite definition -------------------------------------------------- */
 
+/* The runner puts the environment back after every test (test/main.c,
+ * run_one): a variable a test added goes, one it changed or removed comes
+ * back as it was.  A test that set RAY_CSV_TRACE and stopped at a failure
+ * before clearing it left every later test, and every process those
+ * started, tracing (#1552). */
+static test_result_t test_sys_env_restore(void) {
+#if defined(_WIN32)
+    SKIP("the runner restores the environment on POSIX only");
+#else
+    setenv("RFL_ENV_RESTORE_KEEP", "kept", 1);
+    setenv("RFL_ENV_RESTORE_GONE", "here", 1);
+    unsetenv("RFL_ENV_RESTORE_ADDED");
+    char** snap = env_snapshot();
+    TEST_ASSERT_NOT_NULL(snap);
+    setenv("RFL_ENV_RESTORE_ADDED", "1", 1);      /* added by the "test" */
+    setenv("RFL_ENV_RESTORE_KEEP", "changed", 1); /* changed */
+    unsetenv("RFL_ENV_RESTORE_GONE");             /* removed */
+    env_restore(snap);
+    bool added_gone = getenv("RFL_ENV_RESTORE_ADDED") == NULL;
+    const char* keep = getenv("RFL_ENV_RESTORE_KEEP");
+    const char* gone = getenv("RFL_ENV_RESTORE_GONE");
+    bool kept = keep && strcmp(keep, "kept") == 0;
+    bool back = gone && strcmp(gone, "here") == 0;
+    unsetenv("RFL_ENV_RESTORE_KEEP");
+    unsetenv("RFL_ENV_RESTORE_GONE");
+    TEST_ASSERT(added_gone, "a variable the test added is removed");
+    TEST_ASSERT(kept, "a variable the test changed is set back");
+    TEST_ASSERT(back, "a variable the test removed is set again");
+    PASS();
+#endif
+}
+
+/* An on/off switch is on only with a value other than "" and "0":
+ * RAY_CSV_TRACE= (empty, as (.os.setenv "RAY_CSV_TRACE" "") leaves it, the
+ * language having no unsetenv) is off, for this process and the ones it
+ * starts (#1552), and so is RAY_CSV_TRACE=0, as for RAY_DFD and
+ * RAYFORCE_NO_FSYNC. */
+static test_result_t test_sys_env_flag_empty_off(void) {
+#if defined(_WIN32)
+    SKIP("setenv is POSIX");
+#else
+    unsetenv("RFL_ENV_FLAG_PROBE");
+    bool unset_off = !ray_env_flag("RFL_ENV_FLAG_PROBE");
+    setenv("RFL_ENV_FLAG_PROBE", "", 1);
+    bool empty_off = !ray_env_flag("RFL_ENV_FLAG_PROBE");
+    setenv("RFL_ENV_FLAG_PROBE", "1", 1);
+    bool set_on = ray_env_flag("RFL_ENV_FLAG_PROBE");
+    setenv("RFL_ENV_FLAG_PROBE", "0", 1);
+    bool zero_off = !ray_env_flag("RFL_ENV_FLAG_PROBE");
+    setenv("RFL_ENV_FLAG_PROBE", "yes", 1);
+    bool word_on = ray_env_flag("RFL_ENV_FLAG_PROBE");
+    unsetenv("RFL_ENV_FLAG_PROBE");
+    TEST_ASSERT(unset_off, "unset is off");
+    TEST_ASSERT(empty_off, "an empty value is off");
+    TEST_ASSERT(set_on, "1 is on");
+    TEST_ASSERT(zero_off, "0 is off");
+    TEST_ASSERT(word_on, "any other value is on");
+    PASS();
+#endif
+}
+
 const test_entry_t sys_entries[] = {
     { "sys/alloc_free", test_sys_alloc_free, NULL, NULL },
+    { "sys/env_restore", test_sys_env_restore, NULL, NULL },
+    { "sys/env_flag_empty_off", test_sys_env_flag_empty_off, NULL, NULL },
     { "sys/realloc", test_sys_realloc, NULL, NULL },
     { "sys/strdup", test_sys_strdup, NULL, NULL },
     { "sys/get_stat", test_sys_get_stat, NULL, NULL },

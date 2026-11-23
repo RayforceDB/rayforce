@@ -238,8 +238,10 @@
 (.sys.exec "mkdir -p /tmp/rfl_pbc_traceerr/2024.09.02")
 (.db.parted.get "/tmp/rfl_pbc_traceerr/" 't) !- io
 ;; restore: trace OFF for subsequent files (cleared to the empty string,
-;; which getenv returns with count 0 — assert that rather than the formatted
-;; empty literal, which the harness renders differently inside comparisons)
+;; which is off: ray_env_flag; the runner also puts the environment back
+;; after every test, #1552; getenv returns it with count 0 — assert that
+;; rather than the formatted empty literal, which the harness renders
+;; differently inside comparisons)
 (.os.setenv "RAY_CSV_TRACE" "")
 (count (.os.getenv "RAY_CSV_TRACE")) -- 0
 

@@ -161,7 +161,7 @@ static void idx_stats_dump(void) {
 }
 
 void ray_idx_stats_init(void) {
-    if (getenv("RAY_IDX_STATS")) atexit(idx_stats_dump);
+    if (ray_env_flag("RAY_IDX_STATS")) atexit(idx_stats_dump);
 }
 
 /* Width of one element of a numeric vector type, or 0 if unsupported. */
