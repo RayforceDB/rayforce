@@ -47,7 +47,7 @@
 (set n 100000)
 (set T (table [k j v g d] (list (% (+ 500 (* (til n) 7919)) 1000) (% (+ 2 (til n)) 3) (+ 1000000 (% (* (til n) 104729) 1000003)) (at [c a b d e] (% (* (til n) 7) 5)) (+ 2024.01.01 (% (* (til n) 13) 400)))))
 (set Kv (% (at T 'v) 1000))
-(set Kx (xbar (at T 'v) 1000))
+(set Kb (xbar (at T 'v) 1000))
 (set Kd (xbar (at T 'd) 7))
 (set Kkj (+ (at T 'k) (at T 'j)))
 (take (FS Kv) 4)                                                          -- [0 729 458 187]
@@ -58,7 +58,7 @@
 (K0 (select {s: (sum v) c: (count v) from: T by: (% v 1000) take: 5}))    -- (take (FS Kv) 5)
 (K0 (select {s: (max (* v 2)) from: T by: (% v 1000) take: 5}))           -- (take (FS Kv) 5)
 (K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: (% v 1000) take: 5}))  -- (take (FS Kv) 5)
-(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))              -- (take (FS Kx) 5)
+(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))              -- (take (FS Kb) 5)
 (K0 (select {s: (sum v) from: T by: (xbar d 7) take: 5}))                 -- (take (FS Kd) 5)
 (K0 (select {s: (sum v) from: T by: (+ k j) take: 5}))                    -- (take (FS Kkj) 5)
 (K0 (select {s: (sum v) from: T by: k take: 5}))                          -- (take (FS (at T 'k)) 5)
@@ -73,7 +73,7 @@
 ;; under a where: the first groups among the kept rows
 (set W (> (at T 'v) 1500000))
 (K0 (select {s: (sum v) from: T where: (> v 1500000) by: (% v 1000) take: 5}))  -- (take (FS (at Kv (where W))) 5)
-(K0 (select {s: (sum v) from: T where: (> v 1500000) by: (xbar v 1000) take: 5}))  -- (take (FS (at Kx (where W))) 5)
+(K0 (select {s: (sum v) from: T where: (> v 1500000) by: (xbar v 1000) take: 5}))  -- (take (FS (at Kb (where W))) 5)
 ((fn [x] (K0 (select {s: (sum v) from: T where: (> v 1500000) by: x take: 5}))) Kv)  -- (take (FS (at Kv (where W))) 5)
 ;; an output ordered by an aggregate keeps the groups the by-dict spelling
 ;; keeps, ties included: count ties every group of (* k 2) at 100 rows
@@ -92,7 +92,7 @@
 ;; an xbar key with a literal bucket groups on (div x b) and comes back as
 ;; its buckets: every type xbar keeps, negative values, nulls, a where:
 (set X (table [v i h d t tm] (list [10 -4 3 0Nl 6 -17 8 9 25 -4] (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4]) (as 'I16 [10 -4 3 0N 6 -17 8 9 25 -4]) (+ 2024.01.01 (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4])) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 [10 -4 3 0N 6 -17 8 9 25 -4])) (as 'TIME (* 1000 [10 4 3 0N 6 17 8 9 25 4])))))
-(set XS (fn [c b] (do (set kx (xbar (at X c) b)) (list (FS kx) (map (fn [x] (count (where (== kx x)))) (FS kx))))))
+(set XS (fn [c b] (do (set kb (xbar (at X c) b)) (list (FS kb) (map (fn [x] (count (where (== kb x)))) (FS kb))))))
 (set XQ (fn [q] (list (K0 q) (at q 'n))))
 (XQ (select {n: (count v) from: X by: (xbar v 10)}))              -- (XS 'v 10)
 (XQ (select {n: (count v) from: X by: (xbar i 7)}))               -- (XS 'i 7)
@@ -106,7 +106,7 @@
 (type (K0 (select {n: (count v) from: X by: (xbar t 7000000000)})))  -- (type (at X 't))
 (asc (K0 (select {s: (sum v) from: T by: (xbar d 7)})))           -- (asc (K0 (select {s: (sum v) from: T by: {kk: (xbar d 7)}})))
 (at (xasc (select {s: (sum v) from: T by: (xbar d 7)}) 'd) 's)    -- (at (xasc (select {s: (sum v) from: T by: {kk: (xbar d 7)}}) 'kk) 's)
-(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))      -- (take (FS Kx) 5)
+(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))      -- (take (FS Kb) 5)
 
 ;; a bucket that would reach the type's minimum: x - (x mod b) lands on the
 ;; null sentinel (b a power of two) or wraps (b = 3 at the I64 minimum); the
@@ -143,8 +143,8 @@
 (K0 (select {s: (sum v) from: P by: {kk: (% v 1000)} take: 5}))           -- (take (FS Kv) 5)
 (K0 (select {s: (sum v) c: (count v) from: P by: (% v 1000) take: 5}))    -- (take (FS Kv) 5)
 (K0 (select {s: (sum v) e: (first (+ d 1)) from: P by: (% v 1000) take: 5}))  -- (take (FS Kv) 5)
-(K0 (select {s: (sum v) from: P by: (xbar v 1000) take: 5}))              -- (take (FS Kx) 5)
-(K0 (select {s: (sum v) from: P by: {kk: (xbar v 1000)} take: 5}))        -- (take (FS Kx) 5)
+(K0 (select {s: (sum v) from: P by: (xbar v 1000) take: 5}))              -- (take (FS Kb) 5)
+(K0 (select {s: (sum v) from: P by: {kk: (xbar v 1000)} take: 5}))        -- (take (FS Kb) 5)
 (K0 (select {s: (sum v) from: P by: (xbar d 7) take: 5}))                 -- (take (FS Kd) 5)
 (K0 (select {s: (sum v) from: P by: (+ k j) take: 5}))                    -- (take (FS Kkj) 5)
 (K0 (select {s: (sum v) from: P by: k take: 5}))                          -- (take (FS (at T 'k)) 5)
