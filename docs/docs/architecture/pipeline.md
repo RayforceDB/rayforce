@@ -233,6 +233,10 @@ Grouped aggregates run on the parallel aggregation engine, which picks a strateg
 
 Without an explicit ordering clause, full grouped results can follow the selected
 strategy's group order. Use `asc:` or `desc:` when result positions matter.
+A computed key (`by: (% v 3)`, `by: (xbar t 60)`) or a name holding a vector is
+evaluated into a column first and grouped as its by-dict spelling
+`by: {k: (% v 3)}` is, so every spelling of a key takes the same strategy and
+gives the same group order.
 
 Arithmetic over aggregates (`(- (max v1) (min v2))`, `(pow (pearson_corr a b) 2)`) is decomposed at compile time: the aggregates run as hidden slots inside the same group pass, and the outer expression is evaluated once over the grouped result. This applies to any number of keys and to binary aggregates. The exception is an aggregate whose argument has no DAG node, such as a global vector indexed by a column (`(first (at V i))`) or a DATE plus an integer: then the whole output, wrapper included, is evaluated per group, as the lone aggregate is, so a helper in the wrapper runs once per group.
 

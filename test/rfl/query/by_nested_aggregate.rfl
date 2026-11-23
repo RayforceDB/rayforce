@@ -160,12 +160,13 @@
 
 ;; ── the shapes dev answered keep their route ────────────────────────────────
 ;; an aggregate the DAG declines for temporal arithmetic, under a bare key,
-;; keeps the grouping it had: keys in order, take: the first groups
+;; keeps the grouping it had; its groups come in first-seen order, as every
+;; key spelling's do, and take: keeps the first groups seen (#1460)
 (set TD (table [k v d] (list [0 1 2 0 1 2 0 0] [1 2 3 4 5 6 7 8] (+ 2024.01.01 [5 3 1 7 2 9 4 6]))))
-(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 'v)                 -- [0 1 2]
-(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 's)                 -- [2024.01.03 2024.01.07 2024.01.05]
-(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'v)  -- [0 1]
-(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'a)  -- [9 12]
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 'v)                 -- [1 2 0]
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 's)                 -- [2024.01.07 2024.01.05 2024.01.03]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'v)  -- [1 2]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'a)  -- [12 15]
 (at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 'v)               -- [0 5]
 (at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 's)               -- [2024.01.09 2024.01.08]
 (at (select {s: (first (+ d 1)) from: TD by: (+ k 0)}) 's)                 -- [2024.01.07 2024.01.05 2024.01.03]

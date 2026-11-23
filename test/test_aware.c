@@ -4610,7 +4610,10 @@ static test_result_t aw_topn_case(const char* shape, int n, int gen, int iters, 
     snprintf(q, sizeof q, "(select %s)", body);
     for (int it = 0; it < iters; it++) {
         agg_route_reset();
+        /* the computed key keeps the group off v2 only under the hook (#1460) */
+        ray_group_test_route(1);
         ray_t* got = aw_eval(q);
+        ray_group_test_route(0);
         TEST_ASSERT_FMT(got && !RAY_IS_ERR(got), "%s: %s", q, ray_error_msg());
         agg_route_stats_t st = agg_route_stats();
         /* the flattened parted group, on the radix ladder, not v2 */
@@ -4655,7 +4658,8 @@ static test_result_t aw_topn_check(const char* shape, int n, int gen, int iters)
  * only by taking the minimum across workers and partitions.  50 more rows
  * go to groups 0..49 at the end.  Every cut falls inside a tie set of
  * thousands of groups.  The SYM keys beside a computed one take the
- * flattened parted group onto the radix fat-entry path; the integer keys
+ * flattened parted group onto the radix fat-entry path under the legacy
+ * route hook (a computed key otherwise groups on v2); the integer keys
  * take its v2 direct-insert phase 2. */
 static test_result_t test_group_topn_ties(void) {
     aw_eval_ok("(set K (concat (concat (% (* (til 20000) (til 20000)) 10007) (+ 10007 (% (* (til 20000) (til 20000)) 5003))) "

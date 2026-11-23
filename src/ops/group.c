@@ -14854,9 +14854,85 @@ static bool grp_expr_reads_enc(ray_graph_t* g, ray_t* tbl, ray_op_t* in) {
     return false;
 }
 
-/* v2 bridge for expression agg inputs — see the call site in
- * exec_group_run.  Returns the v2 result (or an error), or NULL when the
- * shape is ineligible and the caller should continue on the legacy path. */
+/* Evaluate the expression node `in` (a computed key or aggregate input)
+ * over every row of `tbl` into *out.  False when the bridge must leave the
+ * group to the legacy path; *cerr then holds an error that is the query's
+ * (a failed column bind, a failed range read), or NULL.  `rowlocal` (a key)
+ * takes only an expression that reads its own row: a running function as a
+ * key keeps the legacy route. */
+static bool grp_expr_materialize(ray_graph_t* g, ray_t* tbl, ray_op_t* in, int64_t nrows,
+                                 bool rowlocal, ray_t** out, ray_t** cerr) {
+    *out = NULL;
+    ray_expr_t ex;
+    ray_t* v;
+    int64_t rl_syms[64];
+    int rl = -1;
+    if (in->opcode == OP_CONST) {
+        v = group_const_input_rows(g, in, nrows);
+    } else if (expr_compile(g, tbl, in, &ex, cerr)) {
+        v = expr_eval_full(&ex, nrows);
+        if (expr_eval_err_fatal(v)) { *cerr = v; return false; }   /* a range read failed */
+    } else if (*cerr || in->opcode == OP_STRLEN ||
+               (rowlocal ? (rl = group_expr_src_syms(g, in->id, rl_syms, 64)) < 0
+                         : grp_expr_reads_enc(g, tbl, in))) {
+        /* a failed column bind (the query's error); a strlen, which the
+         * legacy path aggregates inline (try_strlen_sumavg_input: a null
+         * cell as length 0, as the keyless select does); an input over an
+         * encoded column: the executor would materialize the column, the
+         * legacy path reads it by range; or a key that reads other rows */
+        return false;
+    } else {
+        /* An input the element-wise compiler declines — an `if`, say:
+         * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
+         * the legacy path, 6x slower under a WHERE selection (#756).  The
+         * DAG executor materializes it row-wise over the whole table; the
+         * selection is cleared around the call so the vector comes back
+         * at full length (the final gather only compacts tables, but the
+         * node's own paths need not see the selection). */
+        for (int i = 0; i < rl; i++)
+            if (ray_table_get_col_enc(tbl, rl_syms[i])) return false;
+        ray_t* saved_sel = g->selection;
+        ray_t* saved_tbl = g->table;
+        /* An input that reads only its own row reads the group's table,
+         * which a sparse where: may have compacted to its survivors
+         * (group_sel_precompact); over g->table it came back at the
+         * table's length and the group fell to the legacy path (#1234).
+         * An input that reads other rows keeps g->table: it runs over
+         * the whole table, and a length that differs from tbl's keeps
+         * the legacy path. */
+        if (tbl != g->table && (rl >= 0 || group_expr_src_syms(g, in->id, rl_syms, 64) >= 0))
+            g->table = tbl;
+        g->selection = NULL;
+        v = ray_execute(g, in);
+        g->selection = saved_sel;
+        g->table = saved_tbl;
+    }
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
+        if (v && !RAY_IS_ERR(v)) ray_release(v);
+        else if (v) ray_error_free(v);
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* Does a key of the group `op` compute its value (no column scan)?  Under
+ * the route test hook (ray_group_test_route >= 1) none does: the hook keeps
+ * such a group on the legacy ladder it pins. */
+static bool grp_has_computed_key(ray_graph_t* g, ray_op_t* op) {
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || g_group_test_route >= 1) return false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (kn && kn->opcode != OP_SCAN) return true;
+    }
+    return false;
+}
+
+/* v2 bridge for computed keys and expression agg inputs — see the call
+ * site in exec_group_run.  Returns the v2 result (or an error), or NULL when
+ * the shape is ineligible and the caller should continue on the legacy
+ * path. */
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                   int64_t group_limit) {
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
@@ -14867,13 +14943,25 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * every index loop below is uint32_t. */
     if (!ext || ext->n_keys < 1 || ext->n_aggs < 1) return NULL;
 
-    /* At least one agg input must be a compiled-expression node or a
-     * constant with rows to give (group_const_input_rows); scans, COUNT
-     * and binary/holistic second inputs pass through untouched. */
+    /* At least one key or agg input must be a compiled-expression node or
+     * a constant with rows to give (group_const_input_rows); scans, COUNT
+     * and binary/holistic second inputs pass through untouched.  A computed
+     * key (`by: (% v 3)`, `by: (xbar t 60)`) is materialized as the by-dict
+     * form `{k: (% v 3)}` materializes it, so both spellings take the same
+     * v2 strategy: the same group order, and under an unordered take: the
+     * first N groups seen (#1460).  The legacy ladder emits key order. */
     int64_t nrows = ray_table_nrows(tbl);
     if (nrows <= 0) return NULL;
     uint32_t na = ext->n_aggs, nkk = ext->n_keys;
     bool any_expr = false;
+    for (uint32_t k = 0; k < nkk; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (!kn) return NULL;
+        if (kn->opcode == OP_SCAN) continue;
+        if (g_group_test_route >= 1 ||
+            (kn->opcode == OP_CONST && !group_const_input_spreads(g, kn, nrows))) return NULL;
+        any_expr = true;
+    }
     for (uint32_t a = 0; a < na; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
@@ -14889,69 +14977,37 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * names[a] holds "_e" + up to 10 uint32 digits + NUL ≤ 16. */
     ray_t* synth[na];
     char   names[na][16];
+    ray_t* ksynth[nkk];
+    char   knames[nkk][16];
     for (uint32_t a = 0; a < na; a++) synth[a] = NULL;
+    for (uint32_t k = 0; k < nkk; k++) ksynth[k] = NULL;
     ray_t* sub = NULL;
     ray_t* cerr = NULL;     /* a failed column bind: returned instead of the legacy path */
+    ray_col_meta_t shm;
     bool ok = true;
+    for (uint32_t k = 0; k < nkk && ok; k++) {
+        ray_op_t* kn = op_node(g, ext->keys[k]);
+        if (kn->opcode == OP_SCAN) continue;
+        snprintf(knames[k], sizeof(knames[k]), "_k%u", (unsigned)k);
+        if (ray_table_col_meta(tbl, ray_sym_intern(knames[k], strlen(knames[k])), &shm)) {
+            ok = false; break;   /* user column shadows the synthetic name */
+        }
+        ok = grp_expr_materialize(g, tbl, kn, nrows, true, &ksynth[k], &cerr);
+    }
     for (uint32_t a = 0; a < na && ok; a++) {
         if (ext->agg_ops[a] == OP_COUNT) continue;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (in->opcode == OP_SCAN) continue;
         if (in->opcode == OP_CONST && !group_const_input_spreads(g, in, nrows)) continue;
         snprintf(names[a], sizeof(names[a]), "_e%u", (unsigned)a);
-        ray_col_meta_t shm;
         if (ray_table_col_meta(tbl, ray_sym_intern(names[a], strlen(names[a])), &shm)) {
             ok = false; break;   /* user column shadows the synthetic name */
         }
-        ray_expr_t ex;
-        ray_t* v;
-        if (in->opcode == OP_CONST) {
-            v = group_const_input_rows(g, in, nrows);
-        } else if (expr_compile(g, tbl, in, &ex, &cerr)) {
-            v = expr_eval_full(&ex, nrows);
-            if (expr_eval_err_fatal(v)) { cerr = v; ok = false; break; }   /* a range read failed */
-        } else if (cerr || in->opcode == OP_STRLEN || grp_expr_reads_enc(g, tbl, in)) {
-            /* a failed column bind (the query's error); a strlen, which the
-             * legacy path aggregates inline (try_strlen_sumavg_input: a null
-             * cell as length 0, as the keyless select does); or an input
-             * over an encoded column: the executor would materialize the
-             * column, the legacy path reads it by range */
-            ok = false; break;
-        } else {
-            /* An input the element-wise compiler declines — an `if`, say:
-             * `(sum (if (== st 'bad) 1 0))` used to drop the whole group onto
-             * the legacy path, 6x slower under a WHERE selection (#756).  The
-             * DAG executor materializes it row-wise over the whole table; the
-             * selection is cleared around the call so the vector comes back
-             * at full length (the final gather only compacts tables, but the
-             * node's own paths need not see the selection). */
-            ray_t* saved_sel = g->selection;
-            ray_t* saved_tbl = g->table;
-            /* An input that reads only its own row reads the group's table,
-             * which a sparse where: may have compacted to its survivors
-             * (group_sel_precompact); over g->table it came back at the
-             * table's length and the group fell to the legacy path (#1234).
-             * An input that reads other rows keeps g->table: it runs over
-             * the whole table, and a length that differs from tbl's keeps
-             * the legacy path. */
-            int64_t rl_syms[64];
-            if (tbl != g->table && group_expr_src_syms(g, in->id, rl_syms, 64) >= 0)
-                g->table = tbl;
-            g->selection = NULL;
-            v = ray_execute(g, in);
-            g->selection = saved_sel;
-            g->table = saved_tbl;
-        }
-        if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->len != nrows) {
-            if (v && !RAY_IS_ERR(v)) ray_release(v);
-            else if (v) ray_error_free(v);
-            ok = false; break;
-        }
-        synth[a] = v;
+        ok = grp_expr_materialize(g, tbl, in, nrows, false, &synth[a], &cerr);
     }
     if (ok) {
         int64_t ncols = ray_table_ncols(tbl);
-        sub = ray_table_new(ncols + na);
+        sub = ray_table_new(ncols + na + nkk);
         if (!sub || RAY_IS_ERR(sub)) { ok = false; }
         for (int64_t c = 0; c < ncols && ok; c++) {
             ray_t* pc = ray_table_slot_idx(tbl, c);   /* encoded slots pass undecoded */
@@ -14964,15 +15020,29 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_sym_intern(names[a], strlen(names[a])), synth[a]);
             if (!sub || RAY_IS_ERR(sub)) ok = false;
         }
+        for (uint32_t k = 0; k < nkk && ok; k++) {
+            if (!ksynth[k]) continue;
+            sub = ray_table_add_col(sub,
+                    ray_sym_intern(knames[k], strlen(knames[k])), ksynth[k]);
+            if (!sub || RAY_IS_ERR(sub)) ok = false;
+        }
     }
     ray_op_t* op2 = NULL;
     if (ok) {
         /* Shadow GROUP node: original key/scan/second inputs by node,
-         * expression inputs replaced by scans of the synthetic columns.
-         * Build all scans BEFORE the group node — node creation may
-         * realloc g->nodes and dangle earlier ray_op_t pointers. */
+         * expression keys and inputs replaced by scans of the synthetic
+         * columns.  Build all scans BEFORE the group node — node creation
+         * may realloc g->nodes and dangle earlier ray_op_t pointers. */
         uint32_t in_ids[na];
+        uint32_t key_ids[nkk];
         bool has2 = false, hask = false;
+        for (uint32_t k = 0; k < nkk && ok; k++) {
+            key_ids[k] = ext->keys[k];
+            if (!ksynth[k]) continue;
+            ray_op_t* sc = ray_scan(g, knames[k]);
+            if (!sc) { ok = false; break; }
+            key_ids[k] = sc->id;
+        }
         for (uint32_t a = 0; a < na && ok; a++) {
             if (synth[a]) {
                 ray_op_t* sc = ray_scan(g, names[a]);
@@ -14989,7 +15059,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_op_t* ins[na];
             ray_op_t* ins2[na];
             for (uint32_t k = 0; k < nkk; k++)
-                keys[k] = op_node(g, ext->keys[k]);
+                keys[k] = op_node(g, key_ids[k]);
             for (uint32_t a = 0; a < na; a++) {
                 ins[a] = op_node(g, in_ids[a]);
                 ins2[a] = (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE)
@@ -15011,6 +15081,8 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         result = exec_group_v2(g, op2, sub, group_limit);
     for (uint32_t a = 0; a < na; a++)
         if (synth[a]) ray_release(synth[a]);
+    for (uint32_t k = 0; k < nkk; k++)
+        if (ksynth[k]) ray_release(ksynth[k]);
     if (sub) { ray_graph_unbind_table(g, sub); ray_release(sub); }
     if (cerr) return cerr;
     return result;   /* NULL → legacy path */
@@ -15969,9 +16041,12 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * inputs at scans of them, and dispatch v2.  `_e{a}` is chosen so
      * v2's scan-input naming (agg_result_col_name) emits the SAME
      * `_e{a}_{op}` output names the legacy expression emit produced.
-     * Any ineligibility falls through to the legacy path unchanged. */
+     * Any ineligibility falls through to the legacy path unchanged.
+     * A computed key takes the bridge under an armed top-N emit filter too:
+     * v2 owns that filter (the shadow node keeps the aggregates in order),
+     * and the by-dict spelling of the same key already reaches it there. */
     if (ray_agg_engine_v2 && group_limit >= 0
-        && !ray_group_emit_filter_active().enabled) {
+        && (!ray_group_emit_filter_active().enabled || grp_has_computed_key(g, op))) {
         ray_t* r = exec_group_v2_exprs(g, op, tbl, group_limit);
         if (r) return r;
     }
