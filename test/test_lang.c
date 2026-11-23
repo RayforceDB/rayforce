@@ -5418,6 +5418,124 @@ static test_result_t test_eval_select_parted_stats_absent(void) {
     return result;
 }
 
+/* ---- Partition skips: the hook's count, the flat copy's answer --------- */
+
+/* Writes two roots of four partitions each, compressed so every column
+ * carries statistics: `pd` keyed by date, `pt` by timestamp (directories
+ * named YYYY.MM.DD.HH.MM.SS).  ts rises with the key; the second
+ * partition holds a null.  `fd` and `ft` are flat copies of the two: a
+ * select over them has no partition to skip, so it is the unpruned route
+ * a pruned answer must match. */
+static test_result_t part_skip_fixture(const char* root) {
+    static const char* const parts[4][2] = {
+        { "2026.01.05", "(list [2026.01.05D01:00:00.000 2026.01.05D02:00:00.000] [1 2])" },
+        { "2026.01.06", "(list [2026.01.06D01:00:00.000 0Np 2026.01.06D05:00:00.000] [3 4 5])" },
+        { "2026.01.07", "(list [2026.01.07D01:00:00.000] [6])" },
+        { "2026.01.08", "(list [2026.01.08D03:00:00.000 2026.01.08D04:00:00.000] [7 8])" },
+    };
+    char src[1024];
+    for (int i = 0; i < 4; i++) {
+        for (int k = 0; k < 2; k++) {
+            int n = snprintf(src, sizeof(src),
+                             "(.db.splayed.set \"%s/%c/%s%s/t/\" (table [ts v] %s) {compress: true})",
+                             root, k ? 't' : 'd', parts[i][0], k ? ".00.00.00" : "", parts[i][1]);
+            TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format splayed set");
+            ray_t* w = ray_eval_str(src);
+            TEST_ASSERT_NOT_NULL(w);
+            TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+            ray_release(w);
+        }
+    }
+    int n = snprintf(src, sizeof(src),
+                     "(do (set pd (.db.parted.get \"%s/d/\" 't)) (set pt (.db.parted.get \"%s/t/\" 't))"
+                     " (set fd (table [date ts v] (list (at pd 'date) (at pd 'ts) (at pd 'v))))"
+                     " (set ft (table [part ts v] (list (at pt 'part) (at pt 'ts) (at pt 'v)))) 0)", root, root);
+    TEST_ASSERT(n > 0 && (size_t)n < sizeof(src), "format parted get");
+    ray_t* w = ray_eval_str(src);
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    /* the copies are flat: no parted or partition-key column */
+    const char* flat[] = { "fd", "ft" };
+    for (int k = 0; k < 2; k++) {
+        ray_t* t = ray_eval_str(flat[k]);
+        TEST_ASSERT_NOT_NULL(t);
+        TEST_ASSERT_EQ_I(t->type, RAY_TABLE);
+        for (int64_t c = 0; c < ray_table_ncols(t); c++) {
+            ray_col_meta_t m;
+            TEST_ASSERT(ray_table_col_meta_idx(t, c, &m), "column meta");
+            TEST_ASSERT(!RAY_IS_PARTED(m.type) && m.type != RAY_MAPCOMMON, "flat copy");
+        }
+        ray_release(t);
+    }
+    PASS();
+}
+
+/* `q` is a query with a %s for its table (formatted once with the parted
+ * name `p` and once with its flat copy `f`): over the parted table it drops
+ * `pruned` partitions before fetch (ray_query_test_part_prune) and answers
+ * what it answers over the flat copy. */
+static test_result_t part_skip_case(const char* q, const char* p, const char* f, uint64_t pruned) {
+    char qp[1024], qf[1024];
+    int n1 = snprintf(qp, sizeof(qp), q, p, p);
+    int n2 = snprintf(qf, sizeof(qf), q, f, f);
+    TEST_ASSERT(n1 > 0 && (size_t)n1 < sizeof(qp) && n2 > 0 && (size_t)n2 < sizeof(qf), "format query");
+    uint64_t runs0, parts0, runs1, parts1;
+    ray_query_test_part_prune(&runs0, &parts0);
+    ASSERT_EQ(qp, qf);
+    ray_query_test_part_prune(&runs1, &parts1);
+    if (parts1 - parts0 != pruned || runs1 - runs0 != (pruned ? 1u : 0u)) {
+        fprintf(stderr, "  pruned %llu partitions in %llu selects, want %llu: %s\n",
+                (unsigned long long)(parts1 - parts0), (unsigned long long)(runs1 - runs0),
+                (unsigned long long)pruned, qp);
+        FAIL("partitions pruned");
+    }
+    PASS();
+}
+
+typedef struct { const char* q; bool ts_key; uint64_t pruned; } part_skip_t;
+
+static test_result_t part_skip_run(const char* tag, const part_skip_t* cases, size_t n_cases) {
+    char root[512];
+    int n = snprintf(root, sizeof(root), "/tmp/rayforce_lang_part_skip_%s_%ld", tag, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t r = part_skip_fixture(root);
+    for (size_t i = 0; r.status == TEST_PASS && i < n_cases; i++)
+        r = part_skip_case(cases[i].q, cases[i].ts_key ? "pt" : "pd", cases[i].ts_key ? "ft" : "fd",
+                           cases[i].pruned);
+    lang_parted_insert_rm_rf(root);
+    return r;
+}
+
+/* An `or` or a `not` as the whole where: skips the partitions every
+ * branch rules out (#1502): a `not` narrows as the complementary
+ * comparison (nulls rank lowest), an `or` by the union of its operands,
+ * an operand that cannot narrow keeps every partition. */
+static test_result_t test_eval_part_skip_or_not(void) {
+    static const part_skip_t cases[] = {
+        { "(select {from: %s where: (or (>= ts 2026.01.07D00:00:00.000) (< ts 2026.01.05D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (not (< ts 2026.01.06D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (not (>= ts 2026.01.06D00:00:00.000))})", false, 2 },
+        { "(select {from: %s where: (or (== date 2026.01.07) (== date 2026.01.08))})", false, 2 },
+        { "(select {from: %s where: (not (< date 2026.01.07))})", false, 2 },
+        { "(select {from: %s where: (not (or (< ts 2026.01.07D00:00:00.000) (> ts 2026.01.08D03:30:00.000)))})", false, 2 },
+        { "(select {from: %s where: (not (and (>= ts 2026.01.06D00:00:00.000) (<= ts 2026.01.07D05:00:00.000)))})", false, 1 },
+        { "(select {from: %s where: (or (>= ts 2026.01.08D00:00:00.000) (in v [1 2]))})", false, 2 },
+        { "(select {from: %s where: (or (>= ts 2026.01.08D00:00:00.000) (> (* v 2) 100))})", false, 0 },
+        { "(select {from: %s where: (not (!= ts 2026.01.07D01:00:00.000))})", false, 3 },
+        { "(select {from: %s where: (not (in v [1 2]))})", false, 0 },
+        { "(select {from: %s where: (and (or (< ts 2026.01.06D00:00:00.000) (>= ts 2026.01.08D00:00:00.000)) (> v 1))})", false, 1 },
+        { "(select {from: %s where: (or (not (> ts 2026.01.05D01:30:00.000)) (== v 7))})", false, 1 },
+        { "(select {c: (count v) from: %s where: (or (>= ts 2026.01.07D00:00:00.000) (< ts 2026.01.05D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (or (>= part 2026.01.07D00:00:00.000) (< part 2026.01.04D00:00:00.000))})", true, 2 },
+        { "(select {from: %s where: (not (< part 2026.01.07D00:00:00.000))})", true, 2 },
+        { "(select {from: %s where: (not (== part 2026.01.07D00:00:00.000))})", true, 1 },
+    };
+    return part_skip_run("or_not", cases, sizeof cases / sizeof cases[0]);
+}
+
 /* ---- Test: an if answers the same with and without pool workers -------- */
 
 /* With no workers the selected arm of OP_IF (compact each branch's rows,
@@ -14001,6 +14119,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/if_workers_same", test_eval_if_workers_same, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_or_not", test_eval_part_skip_or_not, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

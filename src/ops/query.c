@@ -20176,18 +20176,70 @@ typedef struct { int64_t col[PRUNE_STAT_COLS]; int n; } prune_stat_cols_t;
  * with a literal of the key's exact type, or of a parted data column with
  * a literal (ray_part_prune_stats_mask); anything else keeps every
  * partition.  `tmp` is scratch of the same width. */
-static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
-                             uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
-    if (!e || e->type != RAY_LIST || ray_len(e) < 2) return;
+/* The native unary `not`, unshadowed (fn from prune_head_fn). */
+static bool prune_not_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_UNARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_unary_fn)(uintptr_t)fn->i64 == ray_not_fn && prune_head_named(head, "not");
+}
+
+/* The comparison a row passes exactly when it fails `op`: nulls rank
+ * below every value and equal each other, on the filter's routes as in the
+ * statistics (zone_cmp_core), so the order is total and `not (< c x)` is
+ * `(>= c x)`.  0 for `in`, whose negation no mask reads. */
+static uint16_t prune_cmp_negate(uint16_t op) {
+    switch (op) {
+    case OP_LT: return OP_GE;
+    case OP_GE: return OP_LT;
+    case OP_GT: return OP_LE;
+    case OP_LE: return OP_GT;
+    case OP_EQ: return OP_NE;
+    case OP_NE: return OP_EQ;
+    default:    return 0;
+    }
+}
+
+/* Bounds the and/or/not nesting the mask walks (deeper keeps every
+ * partition, which is always correct). */
+#define PRUNE_MASK_MAX_DEPTH 16
+
+/* `e` under `neg` negations: an `and` that is not negated, or an `or` that
+ * is, holds where every operand holds (the masks intersect); the other two
+ * hold where any operand holds (the masks unite, #1502).  A pruned
+ * partition then fails every operand of a union, each by a comparison
+ * whose column or key the stand-in row carries, so that row still fails
+ * the where. */
+static void prune_where_mask_at(ray_t* e, bool neg, int depth, ray_t* tbl, int64_t key_id, ray_t* kv,
+                                uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
+    if (!e || e->type != RAY_LIST || ray_len(e) < 2 || depth > PRUNE_MASK_MAX_DEPTH) return;
     ray_t** x = (ray_t**)ray_data(e);
     int64_t n = ray_len(e);
     ray_t* fn = prune_head_fn(x[0], tbl);
-    if (prune_logic_head(x[0], fn) == 1) {
+    if (n == 2 && prune_not_head(x[0], fn)) {
+        prune_where_mask_at(x[1], !neg, depth + 1, tbl, key_id, kv, acc, tmp, n_words, sc);
+        return;
+    }
+    int logic = prune_logic_head(x[0], fn);
+    if (logic && (logic == 1) != neg) {
         for (int64_t i = 1; i < n; i++)
-            prune_where_mask(x[i], tbl, key_id, kv, acc, tmp, n_words, sc);
+            prune_where_mask_at(x[i], neg, depth + 1, tbl, key_id, kv, acc, tmp, n_words, sc);
+        return;
+    }
+    if (logic) {
+        uint64_t* u = (uint64_t*)ray_alloc_raw((size_t)n_words * 2 * sizeof(uint64_t));
+        if (!u) return;                                           /* no narrowing: correct */
+        uint64_t* part = u + n_words;
+        memset(u, 0, (size_t)n_words * sizeof(uint64_t));
+        for (int64_t i = 1; i < n; i++) {
+            for (int64_t w = 0; w < n_words; w++) part[w] = ~0ULL;
+            prune_where_mask_at(x[i], neg, depth + 1, tbl, key_id, kv, part, tmp, n_words, sc);
+            for (int64_t w = 0; w < n_words; w++) u[w] |= part[w];
+        }
+        for (int64_t w = 0; w < n_words; w++) acc[w] &= u[w];
+        ray_free_raw(u);
         return;
     }
     uint16_t op = prune_cmp_op(x[0], fn);
+    if (neg) op = prune_cmp_negate(op);
     if (!op || n != 3) return;
     /* a name bound to a constant compares as that constant (a symbol it
      * holds is left to the filter: it reads here as a name would) */
@@ -20227,6 +20279,11 @@ static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
     memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
     if (!ray_part_prune_mask(kv, op, r_key, lit, tmp)) return;
     for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
+}
+
+static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
+                             uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
+    prune_where_mask_at(e, false, 0, tbl, key_id, kv, acc, tmp, n_words, sc);
 }
 
 /* Can a one-row zero-cell stand-in segment of this base type be built? */
@@ -20404,10 +20461,6 @@ static bool parted_partition_whole(ray_t* tbl, int64_t p, int64_t key_col) {
  * newly admitted logical special forms need this native identity proof. */
 /* NOT is admitted only over the bounded BOOL-condition grammar below,
  * not over arbitrary collection-valued calls or nonnumeric vectors. */
-static bool prune_not_head(ray_t* head, ray_t* fn) {
-    return fn && fn->type == RAY_UNARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
-           (ray_unary_fn)(uintptr_t)fn->i64 == ray_not_fn && prune_head_named(head, "not");
-}
 enum {
     PRUNE_IF_MAX_VISITS = 128,
     PRUNE_IF_MAX_DEPTH = 32,
@@ -20419,6 +20472,38 @@ enum {
 
 static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth);
 static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth);
+
+/* In where: (#1502), a `not` over comparisons (not `in`) of a column, an
+ * atom or a name bound to one, joined by and/or/not: every comparison
+ * answers a BOOL per row, so the `not` reads only that row.  Bounded as
+ * prune_if_cond is. */
+static bool prune_where_not_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
+    if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return false;
+    if (e->type == -RAY_BOOL) return true;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) < 2) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    if (ray_len(e) == 2 && prune_not_head(el[0], fn))
+        return prune_where_not_cond(el[1], tbl, budget, depth + 1);
+    if (prune_logic_head(el[0], fn)) {
+        for (int64_t i = 1; i < ray_len(e); i++)
+            if (!prune_where_not_cond(el[i], tbl, budget, depth + 1)) return false;
+        return true;
+    }
+    uint16_t op = prune_cmp_op(el[0], fn);
+    if (!op || op == OP_IN || ray_len(e) != 3) return false;
+    for (int i = 1; i <= 2; i++) {
+        ray_t* a = el[i];
+        if (!a || a->type >= 0 || (a->type == -RAY_SYM && (a->attrs & ATTR_QUOTED))) return false;
+        if (a->type == -RAY_SYM) {
+            if (prune_bound_const(a, tbl, false)) continue;
+            if (ray_env_has_lexical_local(a->i64)) return false;
+            ray_t* c = ray_table_slot(tbl, a->i64);
+            if (!c || RAY_IS_ERR(c)) return false;
+        }
+    }
+    return true;
+}
 
 /* `mode`: 0 outside where:; 1 in where:, at a conjunct; 2 in where:, an
  * operand of a call. */
@@ -20438,7 +20523,9 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     ray_t* fn = prune_head_fn(el[0], tbl);
     if (n == 2 && prune_not_head(el[0], fn)) {
         int budget = PRUNE_IF_MAX_VISITS;
-        return prune_if_cond(el[1], tbl, &budget, 0);
+        if (prune_if_cond(el[1], tbl, &budget, 0)) return true;
+        budget = PRUNE_IF_MAX_VISITS;
+        return mode && prune_where_not_cond(el[1], tbl, &budget, 0);
     }
     /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
      * value per row, never a necessary partition constraint (the mask reads
