@@ -59,6 +59,7 @@ void agg_route_note_da_lazy(uint64_t skipped_chunks) {
     route_stats.da_lazy_merges++;
     route_stats.da_lazy_skipped += skipped_chunks;
 }
+void agg_route_note_da_prefetch_skipped(uint64_t n) { route_stats.da_prefetch_skipped += n; }
 void agg_route_record(agg_route_t route) {
     static const char* const names[AGG_ROUTE_COUNT] = {
         "group: none", "group: legacy", "group: slices", "group: parted",
