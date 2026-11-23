@@ -1,9 +1,10 @@
 ;; Running functions under where: off the DAG (#1243).
 ;; A running, moving or shift function runs over the whole table under a
 ;; where: (#916, docs/queries/select.md "Running functions under where:");
-;; a whole-column verb or an aggregate under an aggregate's argument sees the
-;; rows the where: keeps.  The answer must not depend on take:, on the table
-;; being flat, parted or splayed, or on a where: that keeps every row.
+;; a whole-column verb sees the rows the where: keeps (of its group, under
+;; by:), and an aggregate under an aggregate's argument each group's of them
+;; (#1452).  The answer must not depend on take:, on the table being flat,
+;; parted or splayed, or on a where: that keeps every row.
 (set n (til 20000))
 (set T (table [k h v i] (list (% (* n 7919) 40) (% (* n 7919) 6000) (% n 27) (+ 1 (% n 997)))))
 (.db.splayed.set "/tmp/rfl_where_running_ev/1/t/" (take T 10000))
@@ -40,8 +41,12 @@
 (at (select {from: P where: (== h 17) by: h z: (sum (xrank 2 i))}) 'z) -- (enlist (sum (xrank 2 (at I H17))))
 (set W (select {from: T where: (> k 3)}))
 (set WO (fn [x] (at (xasc (select {from: (table [k x] (list (at W 'k) x)) by: k z: (sum x)}) 'k) 'z)))
-(at (xasc (select {from: P where: (> k 3) by: k z: (sum (rank i))}) 'k) 'z) -- (WO (rank (at W 'i)))
-(at (xasc (select {from: P where: (> k 3) by: k z: (sum (lf i))}) 'k) 'z) -- (WO (lf (at W 'i)))
+;; ... and, under by:, its group's kept rows (#1151): each k ranks its own.
+(set WG (fn [f] (map (fn [kk] (f (at (at W 'i) (where (== (at W 'k) kk))))) (asc (distinct (at W 'k))))))
+(set WR (fn [x] (sum (* x (rank x)))))
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (* i (rank i)))}) 'k) 'z) -- (WG WR)
+(at (xasc (select {from: T where: (> k 3) by: k z: (sum (* i (rank i)))}) 'k) 'z) -- (WG WR)
+(at (xasc (select {from: P where: (> k 3) by: k z: (sum (lf i))}) 'k) 'z) -- (WG (fn [x] (sum (lf x))))
 (at (select {from: P where: (== k 5) by: k z: (sum (lf i))}) 'z) -- (at (select {from: P where: (== k 5) by: k z: (sum (lf i)) take: 5}) 'z)
 ;; A row-local or DAG running input still defers it, with the same answer.
 (at (xasc (select {from: P where: (> k 3) by: k z: (sum (sums i))}) 'k) 'z) -- (at (xasc (select {from: T where: (> k 3) by: k z: (sum (sums i))}) 'k) 'z)

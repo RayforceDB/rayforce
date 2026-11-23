@@ -33,6 +33,7 @@
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
+#include "io/json.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "vec/vec.h"
@@ -96,6 +97,7 @@ typedef struct {
     uint8_t attrs;
     int is_f64;
     int64_t sum_i;
+    int64_t lo, hi;  /* integer vector bounds; lo > hi for empty */
     double sum_f;
 } affine_sum_cache_entry_t;
 
@@ -524,6 +526,57 @@ static ray_t* take_count_arg(ray_t* e, ray_t* x) {
     return NULL;
 }
 
+/* One partial per task, not per worker: tasks may be stolen. */
+typedef struct { uint64_t sum; int64_t lo, hi; } affine_part_t;
+typedef struct {
+    const int64_t* data;
+    int64_t len, grain;
+    affine_part_t* parts;
+} affine_scan_t;
+
+static void affine_part_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    affine_scan_t* s = ctx;
+    int64_t off = start * s->grain, n = s->len - off;
+    if (n > s->grain) n = s->grain;
+    const int64_t* data = s->data + off;
+    affine_part_t p = { 0, INT64_MAX, INT64_MIN };
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x = data[i];
+        p.sum += (uint64_t)x;
+        if (x < p.lo) p.lo = x;
+        if (x > p.hi) p.hi = x;
+    }
+    s->parts[start] = p;
+}
+
+static bool affine_i64_scan(affine_sum_cache_entry_t* ce) {
+    affine_part_t parts[64];
+    affine_scan_t s = { ce->data, ce->len, ce->len, parts };
+    ray_pool_t* pool = ce->len >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
+    uint32_t nt = 1;
+    if (ray_pool_par_dispatch_ok(pool, ce->len, RAY_PARALLEL_THRESHOLD)) {
+        nt = ray_pool_total_workers(pool);
+        if (nt > sizeof(parts)/sizeof(parts[0])) nt = sizeof(parts)/sizeof(parts[0]);
+        s.grain = 1 + (ce->len - 1) / nt;
+        nt = (uint32_t)(1 + (ce->len - 1) / s.grain);
+        ray_pool_dispatch_n(pool, affine_part_fn, &s, nt);
+        if (ray_interrupted() || atomic_load_explicit(&pool->cancelled, memory_order_acquire))
+            return false;
+    } else {
+        affine_part_fn(&s, 0, 0, 1);
+    }
+    affine_part_t total = parts[0];
+    for (uint32_t i = 1; i < nt; i++) {
+        total.sum += parts[i].sum;
+        if (parts[i].lo < total.lo) total.lo = parts[i].lo;
+        if (parts[i].hi > total.hi) total.hi = parts[i].hi;
+    }
+    ce->sum_i = (int64_t)total.sum;
+    ce->lo = total.lo;
+    ce->hi = total.hi;
+    return true;
+}
+
 static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
@@ -575,8 +628,8 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     /* A narrow result (I16 + I16 is I16, #972) wraps or rounds per row in
      * its own width, which sum(x) + n*c does not: sum the rows instead
      * (the vector is evaluated once either way). */
+    int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
     {
-        int8_t rt = ray_arith_type(vec->type, (int8_t)-c_expr->type);
         if (rt == RAY_U8 || rt == RAY_I16 || rt == RAY_I32 || rt == RAY_F32) {
             ray_t* rows = atomic_map_binary_op(ray_add_fn, OP_ADD, vec, c_expr);
             ray_release(vec);
@@ -588,30 +641,59 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     }
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
-        ray_t* sum = ray_sum_fn(vec);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-        sum = materialize_owned_value(sum);
-        if (!sum || RAY_IS_ERR(sum)) {
-            ray_release(vec);
-            return sum ? sum : ray_error("type", NULL);
-        }
-
         memset(&ce, 0, sizeof(ce));
         ce.vec = vec;
         ce.data = ray_data(vec);
         ce.len = vec->len;
         ce.type = vec->type;
         ce.attrs = vec->attrs;
-        ce.is_f64 = (sum->type == -RAY_F64);
-        if (ce.is_f64) ce.sum_f = as_f64(sum);
-        else           ce.sum_i = numeric_atom_i64(sum);
-        ray_release(sum);
+        /* Literal-independent conservative bounds: only scan actual rows
+         * for a generated null if its preimage fits the input type. */
+        switch (vec->type) {
+        case RAY_BOOL:
+        case RAY_U8:  ce.lo = 0;         ce.hi = UINT8_MAX; break;
+        case RAY_I16: ce.lo = INT16_MIN; ce.hi = INT16_MAX; break;
+        case RAY_I32: ce.lo = INT32_MIN; ce.hi = INT32_MAX; break;
+        }
+        if (vec->type == RAY_I64 && !ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
+            if (!affine_i64_scan(&ce)) {
+                ray_release(vec);
+                return ray_error("cancel", "interrupted");
+            }
+        } else {
+            ray_t* sum = ray_sum_fn(vec);
+            if (!sum || RAY_IS_ERR(sum)) {
+                ray_release(vec);
+                return sum ? sum : ray_error("type", NULL);
+            }
+            sum = materialize_owned_value(sum);
+            if (!sum || RAY_IS_ERR(sum)) {
+                ray_release(vec);
+                return sum ? sum : ray_error("type", NULL);
+            }
+            ce.is_f64 = (sum->type == -RAY_F64);
+            if (ce.is_f64) ce.sum_f = as_f64(sum);
+            else           ce.sum_i = numeric_atom_i64(sum);
+            ray_release(sum);
+        }
         affine_sum_cache_store(vec, &ce);
     }
 
+    if (rt == RAY_I64) {
+        /* Only MIN - c (mod 2^64) adds to the null sentinel. Ordinary
+         * wrap is safe, but sum must skip rows that produce MIN. */
+        int64_t c = numeric_atom_i64(c_expr);
+        int64_t hit = (int64_t)((uint64_t)INT64_MIN - (uint64_t)c);
+        if (ce.lo <= hit && hit <= ce.hi) {
+            int64_t total = 0;
+            for (int64_t i = 0; i < vec->len; i++) {
+                int64_t x = ray_vec_get_i64(vec, i);
+                if (x != hit) total = wrap_add_i64(total, wrap_add_i64(x, c));
+            }
+            ray_release(vec);
+            return make_i64(total);
+        }
+    }
     int64_t n = vec->len;
     ray_release(vec);
     if (ce.is_f64 || c_expr->type == -RAY_F64) {
@@ -2843,11 +2925,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         bool col_has_nulls = false;
 
         for (int64_t j = 0; j < nrows; j++) {
-            /* F64 promotion of an I64 null produces a finite double, not
-             * a null sentinel in the destination column. */
-            if (RAY_ATOM_IS_NULL(row_elems[j]) &&
-                !(col_type == RAY_F64 && row_elems[j]->type == -RAY_I64))
-                col_has_nulls = true;
+            /* Promotion preserves logical nulls, not the source sentinel's
+             * numeric value. Publish the column flag after filling it. */
+            bool cell_is_null = RAY_ATOM_IS_NULL(row_elems[j]);
+            if (cell_is_null) col_has_nulls = true;
             if (col_type == RAY_STR) {
                 if (row_elems[j]->type != -RAY_STR) {
                     int8_t et = row_elems[j]->type;
@@ -2882,7 +2963,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 void* val_ptr;
                 double promoted;
                 if (col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) {
-                    promoted = (double)row_elems[j]->i64;
+                    promoted = cell_is_null ? NULL_F64 : (double)row_elems[j]->i64;
                     val_ptr = &promoted;
                 } else if (col_type == RAY_I64) val_ptr = &row_elems[j]->i64;
                 else if (col_type == RAY_F64) val_ptr = &row_elems[j]->f64;
@@ -5418,6 +5499,9 @@ static void ray_register_builtins(void) {
     register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
+    register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
+    register_vary(".json.get", RAY_FN_NONE, ray_json_get_fn);
+    register_unary(".json.format", RAY_FN_NONE, ray_json_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
@@ -6206,7 +6290,16 @@ ray_t* ray_eval(ray_t* obj) {
             }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
-                args[i] = ray_eval(elems[i + 1]);
+                /* .json.get's type, a quoted symbol after the path, names a
+                 * type, never a column a query would read it as */
+                ray_t* ai = elems[i + 1];
+                if (i == 2 && fn == ray_json_get_fn && ai && ai->type == -RAY_SYM &&
+                    (ai->attrs & ATTR_QUOTED)) {
+                    ray_retain(ai);
+                    args[i] = ai;
+                    continue;
+                }
+                args[i] = ray_eval(ai);
                 any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];

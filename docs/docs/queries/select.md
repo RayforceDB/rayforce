@@ -82,7 +82,9 @@ aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
 sum. An aggregate cannot be aggregated again, through an alias or written
 out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
-`domain`. And an output may not mix a source column with a reference to an earlier
+`domain`. An aggregate that still folds the group's rows may use one:
+`mx: (max (+ price (count price)))` adds each group's count to its prices
+and takes the largest. And an output may not mix a source column with a reference to an earlier
 per-group alias outside an aggregate: `f: (* price n)` with `n: (count price)` raises
 `domain`; write `(* (sum price) n)` or whichever aggregate is meant.
 
@@ -152,6 +154,21 @@ The positions `where` returns count those rows, not the table's:
 (select {i: (iasc v) from: g where: (> k 1)})   ; i: [1 0 2]
 ```
 
+Under `by:` the verb sees each group's surviving rows, as an aggregate does:
+its grades and ranks count within the group. The same holds for `rotate`
+and `xrank`, for a verb under an element-wise call (`(+ 1 (rank v))`), and
+for one inside an aggregate's argument (`(sum (rank v))`, `(sum (asc v))`):
+
+```lisp
+(at (select {r: (rank v) from: g by: k}) 'r)        ; [[0 1] [1 0 2]]
+(at (select {r: (sum (rank v)) from: g by: k}) 'r)  ; [1 3]
+```
+
+A verb inside a running function's argument runs with that function, over
+the whole table (see [running functions](#running-functions-under-where)):
+`(sums (rank v))` by `k` takes each group's rows of the running sum of the
+whole table's ranks, not the running sum of each group's ranks.
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its
@@ -215,8 +232,9 @@ select them first:
 ```
 
 The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
-`desc`, `reverse`, `iasc`, `idesc`, `rank`, `where`) are different: they see the
-surviving rows only.
+`desc`, `reverse`, `iasc`, `idesc`, `rank`, `xrank`, `rotate`, `take`, `drop`,
+`where`) are different: they see the surviving rows only, and under `by:` each
+group's surviving rows.
 
 The same holds under `by:`. A running function in a grouped select runs over
 the whole table, not over each group, and the groups then take their rows of
@@ -549,6 +567,25 @@ Set a column to a constant for matching rows:
 ```lisp
 (update {price: 0 from: 'tab where: (== volume 901)})
 ```
+
+An aggregate in an update with `where:` is computed over the rows the
+`where:` keeps, as in a `select` with the same `where:`, whether it stands
+alone, inside a larger expression or inside a helper. Running functions
+(`sums`, `deltas`, `prior` and the rest) run over the whole table, as in
+[Running functions under `where:`](#running-functions-under-where), and the
+kept rows take their values. Rows the `where:` drops keep their old value
+(a new column is null there):
+
+```lisp
+(set r (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(update {s: (max score) from: r where: (== room 'A)})               ; s: [60 0Nl 60 0Nl]
+(update {s: (- score (avg score)) from: r where: (== room 'A)})     ; s: [7.5 0Nf -7.5 0Nf]
+(update {s: (sums score) from: r where: (== room 'A)})              ; s: [60 0Nl 125 0Nl]
+(update {s: (- (sums score) (max score)) from: r where: (== room 'A)}) ; s: [0 0Nl 65 0Nl]
+```
+
+The named (`from: 'r`, in place) and value (`from: r`) spellings give the
+same values.
 
 ### Update with Group-by
 

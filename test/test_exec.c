@@ -6804,9 +6804,9 @@ static test_result_t test_expr_affine_f64_bias_route(void) {
     TEST_ASSERT_TRUE(try_affine_sumavg_input(g, tbl, add_i, false, false, &vec, &aff, &err));
     TEST_ASSERT_TRUE(aff.enabled && !aff.f64 && aff.bias_i64 == 5);
     /* linear: (a * 2.0) declines, (a * 2) is planned (control) */
-    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, false, &lin, &err));
+    TEST_ASSERT_FALSE(try_linear_sumavg_input_i64(g, tbl, mul_f, false, false, &lin, &err));
     TEST_ASSERT_NULL(err);
-    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, false, &lin, &err));
+    TEST_ASSERT_TRUE(try_linear_sumavg_input_i64(g, tbl, mul_i, false, false, &lin, &err));
     TEST_ASSERT_TRUE(lin.enabled && lin.n_terms == 1 && lin.coeff_i64[0] == 2);
     ray_graph_free(g);
 

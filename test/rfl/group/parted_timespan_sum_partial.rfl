@@ -1,0 +1,20 @@
+;; A TIMESPAN SUM partial equal to INT64_MIN is a numeric value.
+(.sys.exec "rm -rf /tmp/rfl_parted_timespan_sum_partial")
+(set mk (fn [n v] (table [k s] (list (* 0 (til n)) (as 'TIMESPAN (+ v (* 0 (til n))))))))
+(set A (mk 70003 1))
+(set B (mk 70002 4611686018427387904))
+(.db.splayed.set "/tmp/rfl_parted_timespan_sum_partial/1/hits/" A "/tmp/rfl_parted_timespan_sum_partial/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_timespan_sum_partial/2/hits/" B "/tmp/rfl_parted_timespan_sum_partial/.sym" {compress: false})
+(set P (.db.parted.get "/tmp/rfl_parted_timespan_sum_partial/" 'hits))
+(set F (concat A B))
+(set G (fn [t] (at (at (select {v: (sum s) from: t by: k}) 'v) 0)))
+(set K (fn [t] (at (at (select {v: (sum s) from: t}) 'v) 0)))
+(set b (at (.sys.mem) 'group-perpart-runs))
+(set gp (G P))
+(== (- (at (.sys.mem) 'group-perpart-runs) b) 1) -- true
+(== (type gp) (type (G F))) -- true
+(== gp (as 'TIMESPAN -9223372036854705805)) -- true
+(== gp (G F)) -- true
+(== gp (K P)) -- true
+(== gp (K F)) -- true
+(.sys.exec "rm -rf /tmp/rfl_parted_timespan_sum_partial")

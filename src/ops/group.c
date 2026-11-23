@@ -10424,7 +10424,7 @@ static void scalar_sum_linear_pre_fn(void* ctx, uint32_t worker_id, int64_t star
     da_accum_t* acc = c->acc;
     if (start == 0) {
         int64_t s = c->agg_linear[0].pre_sum;
-        if (acc->sum_hi) ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, s);
+        if (acc->sum_hi) ray_i128_add128(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, c->agg_linear[0].pre_hi, (uint64_t)s);
         else acc->sum[0].i = wrap_add_i64(acc->sum[0].i, s);
     }
     acc->count[0] += end - start;
@@ -16355,6 +16355,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * (agg_linear_t.pre_only, #1287). */
     bool sc_lone = n_keys == 0 && nrows > 0 && n_aggs == 1 && !match_idx && !rowsel;
 
+    affine_bounds_t bounds = {0};
+    bool pair = sc_route && !match_idx && !rowsel && n_aggs == 2 &&
+                ((ext->agg_ops[0] == OP_SUM && ext->agg_ops[1] == OP_AVG) ||
+                 (ext->agg_ops[0] == OP_AVG && ext->agg_ops[1] == OP_SUM));
     ray_t* rerr = NULL;     /* a failed column bind in the planners below */
     for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
@@ -16363,7 +16367,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, tbl, agg_input_op, sc_route, sc_lone,
+            try_affine_sumavg_pair(g, tbl, agg_input_op, sc_route, sc_lone,
+                                   pair ? &bounds : NULL,
                                     &agg_vecs[a], &agg_affine[a], &rerr)) {
             if (agg_vecs[a] && agg_vecs[a]->type == RAY_ENCCOL) {   /* staged base */
                 rerr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);
@@ -16392,7 +16397,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * without materializing the expression vector. */
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_linear_sumavg_input_i64(g, tbl, agg_input_op, sc_lone, &agg_linear[a], &rerr)) {
+            try_linear_sumavg_input_i64(g, tbl, agg_input_op, sc_lone, agg_kind == OP_AVG, &agg_linear[a], &rerr)) {
             continue;
         }
         if (rerr) goto resolve_fail;
@@ -22612,8 +22617,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
             }
 
-            /* Null propagation: propagate HAS_NULLS from copied sources. */
-            flat->attrs |= src_nulls;
+            /* I64 and TIMESPAN SUM partials already excluded null rows. A partial
+             * can legitimately equal NULL_I64, even after a batch merge. */
+            if (part_ops[a] == OP_SUM && (flat->type == RAY_I64 || flat->type == RAY_TIMESPAN))
+                flat->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+            else
+                flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, mcol_names[n_keys + a], flat);
             ray_release(flat);
             if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;

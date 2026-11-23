@@ -528,7 +528,9 @@
 (Z (select {from: T by: k z: (hz i (first i))})) -- (list [0 3 15] [0 6 30])
 (Z (select {from: T by: k z: (hz i (avg i))})) -- (list [-6.0 -3.0 9.0] [-12.0 -6.0 18.0])
 (Z (select {from: T by: k where: (> i 2) z: (hz i (first i))})) -- (list [0 12] [0 24])
-(select {from: T by: k z: (sum (hz i (count i)))}) !- domain
+;; an aggregate inside the summed argument is the group's too (#1452)
+(Z (select {from: T by: k z: (sum (hz i (count i)))})) -- (map (fn [g] (sum (hz g (count g)))) (list [1 4 16] [2 8 32]))
+(Z (select {from: T by: k z: (sum (hz i (count i)))})) -- [12 33]
 (Z (select {from: T by: k z: (hz (sums i) (sum i))})) -- (list [-20 -14 10] [-39 -27 21])
 ;; A call that runs per group still takes the running calls in its
 ;; arguments over the whole table.

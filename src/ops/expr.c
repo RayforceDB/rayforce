@@ -378,7 +378,6 @@ typedef struct {
     uint8_t   n_nodes;
     uint8_t   n_terms;
     uint8_t   depth, max_depth;           /* the program's value stack */
-    bool      narrow;                     /* some node needs the proof */
     int64_t   syms[AGG_LINEAR_MAX_TERMS];
     int8_t    types[AGG_LINEAR_MAX_TERMS];
 } np_prog_t;
@@ -396,6 +395,7 @@ static bool np_safe_range(int8_t t, int64_t* lo, int64_t* hi) {
     switch (t) {
     case RAY_U8:  *lo = 0;              *hi = UINT8_MAX; return true;
     case RAY_I16: *lo = INT16_MIN + 1;  *hi = INT16_MAX; return true;
+    case RAY_I64: *lo = INT64_MIN + 1;  *hi = INT64_MAX; return true;
     case RAY_I32: *lo = INT32_MIN + 1;  *hi = INT32_MAX; return true;
     default:      return false;
     }
@@ -412,11 +412,12 @@ static np_iv_t np_type_iv(int8_t t) {
     }
 }
 
-static bool np_has_narrow(ray_graph_t* g, ray_op_t* op, int depth) {
+static bool np_needs_proof(ray_graph_t* g, ray_op_t* op, int depth) {
     if (!op || depth > 64) return true;
-    if (op->opcode != OP_SCAN && op->opcode != OP_CONST && op_narrow_int(op)) return true;
+    if (op->opcode != OP_SCAN && op->opcode != OP_CONST &&
+        (op_narrow_int(op) || op_base_type(op) == RAY_I64)) return true;
     for (int i = 0; i < op->arity; i++)
-        if (np_has_narrow(g, op_child(g, op, i), depth + 1)) return true;
+        if (np_needs_proof(g, op_child(g, op, i), depth + 1)) return true;
     return false;
 }
 
@@ -452,14 +453,13 @@ static bool np_build(ray_graph_t* g, ray_op_t* op, np_prog_t* p, int depth) {
     if (arith || (op->opcode == OP_NEG && op->arity == 1)) {
         for (int i = 0; i < op->arity; i++)
             if (!np_build(g, op_child(g, op, i), p, depth + 1)) return false;
-        if (op_narrow_int(op)) p->narrow = true;
         return np_push(p, (np_node_t){ .op = (uint8_t)op->opcode, .type = t });
     }
     /* any other constant: folded in I64 (eval_const_numeric_expr), exact
      * only while nothing in it is narrow */
-    if (op->opcode != OP_CONST && np_has_narrow(g, op, depth)) return false;
+    if (op->opcode != OP_CONST && np_needs_proof(g, op, depth)) return false;
     double cf; int64_t ci; bool is_f64;
-    if (!eval_const_numeric_expr(g, op, &cf, &ci, &is_f64) || is_f64) return false;
+    if (!eval_const_numeric_expr(g, op, &cf, &ci, &is_f64) || is_f64 || ci == NULL_I64) return false;
     return np_push(p, (np_node_t){ .op = NP_CONST, .type = t, .c = ci });
 }
 
@@ -509,6 +509,7 @@ static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
             switch (col->type) {
             case RAY_U8:  *out = (np_iv_t){ ((const uint8_t*)d)[0], ((const uint8_t*)d)[col->len - 1] }; return true;
             case RAY_I16: *out = (np_iv_t){ ((const int16_t*)d)[0], ((const int16_t*)d)[col->len - 1] }; return true;
+            case RAY_I64: *out = (np_iv_t){ ((const int64_t*)d)[0], ((const int64_t*)d)[col->len - 1] }; return true;
             case RAY_I32: *out = (np_iv_t){ ((const int32_t*)d)[0], ((const int32_t*)d)[col->len - 1] }; return true;
             default: break;
             }
@@ -533,10 +534,17 @@ static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
 }
 
 typedef struct {
+    bool capture;
+    _Atomic(int64_t) min, max;
     const np_prog_t*  prog;
     np_iv_t           glob[AGG_LINEAR_MAX_TERMS];   /* the bounds of a term not scanned */
     const void*       data[AGG_LINEAR_MAX_TERMS];   /* a scanned term's rows (NULL: not scanned) */
     bool              nulls[AGG_LINEAR_MAX_TERMS];  /* skip the type's null sentinel */
+    const linear_expr_i64_t* wide;   /* AVG: recover an exact total for each proved slice */
+    int64_t coeff[AGG_LINEAR_MAX_TERMS];
+    _Atomic(uint64_t) low, high;
+    bool collect;
+    _Atomic(bool)     wide_total;                   /* a slice exceeded the per-row budget */
     bool              wrap;                         /* sum a slice that fails row by row */
     _Atomic(bool)     fail;
     _Atomic(int64_t)  rows;                         /* rows proved or summed row by row */
@@ -565,6 +573,7 @@ static bool np_wrap_slice(const np_scan_ctx_t* x, int64_t start, int64_t end, in
                 int64_t* d = buf[sp++];
                 const void* src = x->data[n->term];
                 switch (p->types[n->term]) {
+                case RAY_I64: return false;   /* no I64 partial-wrap route */
                 case RAY_I16: for (int64_t r = 0; r < m; r++) d[r] = ((const int16_t*)src)[b + r]; break;
                 case RAY_I32: for (int64_t r = 0; r < m; r++) d[r] = ((const int32_t*)src)[b + r]; break;
                 default:      for (int64_t r = 0; r < m; r++) d[r] = ((const uint8_t*)src)[b + r]; break;
@@ -611,7 +620,7 @@ static bool np_wrap_slice(const np_scan_ctx_t* x, int64_t start, int64_t end, in
 /* ACC: a block's sum type (8192 rows of a U8 / I16 stay inside int32). */
 #define NP_SCAN(T, NUL, ACC) do {                                              \
     const T* d = (const T*)x->data[t] + start;                                 \
-    T mn = d[0], mx = d[0]; int64_t s = 0;                                     \
+    T mn = d[0], mx = d[0]; uint64_t s = 0;                                    \
     if (x->nulls[t]) {                                                         \
         bool any = false;                                                      \
         for (int64_t r = 0; r < n; r++) {                                      \
@@ -647,12 +656,14 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     for (uint8_t t = 0; t < x->prog->n_terms; t++) {
         if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
         switch (x->prog->types[t]) {
+        case RAY_I64: NP_SCAN(int64_t, NULL_I64, uint64_t); break;
         case RAY_I16: NP_SCAN(int16_t, NULL_I16, int32_t); break;
         case RAY_I32: NP_SCAN(int32_t, NULL_I32, int64_t); break;
         default:      NP_SCAN(uint8_t, (uint8_t)0, int32_t); break;   /* U8: never nulls[] */
         }
     }
-    if (!np_eval(x->prog, iv, NULL)) {
+    np_iv_t root;
+    if (!np_eval(x->prog, iv, &root)) {
         int64_t w;
         if (x->wrap && np_wrap_slice(x, start, end, &w)) {   /* the rows are cache-hot */
             atomic_fetch_add_explicit(&x->wsum, (uint64_t)w, memory_order_relaxed);
@@ -663,8 +674,33 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
         atomic_store_explicit(&x->fail, true, memory_order_relaxed);
         return;
     }
+    if (x->capture) {
+        int64_t lo = iv[0].lo, hi = iv[0].hi;
+        int64_t v = atomic_load_explicit(&x->min, memory_order_relaxed);
+        while (lo < v && !atomic_compare_exchange_weak_explicit(&x->min, &v, lo,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+        v = atomic_load_explicit(&x->max, memory_order_relaxed);
+        while (hi > v && !atomic_compare_exchange_weak_explicit(&x->max, &v, hi,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+    }
+    if (x->wide) {
+        /* Lift the modular slice total relative to its proven lower bound.
+         * If the interval spans a full modulus there is no unique lift:
+         * leave the total to the ordinary wide AVG kernel. */
+        if ((root.hi - root.lo) * n > UINT64_MAX) {
+            atomic_store_explicit(&x->wide_total, true, memory_order_relaxed);
+        } else {
+            uint64_t lo = (uint64_t)x->wide->bias_i64 * n;
+            for (uint8_t t = 0; t < x->prog->n_terms; t++)
+                lo += (uint64_t)sums[t] * x->coeff[t];
+            __int128 lower = root.lo * n;
+            __int128 exact = lower + (uint64_t)(lo - (uint64_t)lower);
+            uint64_t old = atomic_fetch_add_explicit(&x->low, lo, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->high, (uint64_t)(exact >> 64) + (old > UINT64_MAX - lo), memory_order_relaxed);
+        }
+    }
     for (uint8_t t = 0; t < x->prog->n_terms; t++)
-        if (x->data[t])
+        if (x->collect && !x->wide && x->data[t])
             atomic_fetch_add_explicit(&x->sum[t], (uint64_t)sums[t], memory_order_relaxed);
     atomic_fetch_add_explicit(&x->pass_rows, n, memory_order_relaxed);
     atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
@@ -674,6 +710,8 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
 /* The pass's totals (np_prove): sums[t] keyed by p->syms over pass_rows
  * proved rows, wsum the per-row total of the rest. */
 typedef struct {
+    int64_t hi, low;
+    bool lifted;
     bool    summed;       /* every term was read: the totals below hold */
     bool    partial;      /* some rows were summed per row: only the total holds */
     int64_t sums[AGG_LINEAR_MAX_TERMS];
@@ -691,12 +729,12 @@ typedef enum { NP_NO, NP_PROVED, NP_NEED_SCAN } np_res_t;
  * is summed per row instead of failing the pass (the caller then takes the
  * total and nothing else).  A failed bind: NP_NO with *err. */
 static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nrows, bool scan,
-                         np_prog_t* p, np_total_t* tot, ray_t** err) {
+                         np_prog_t* p, np_total_t* tot, const linear_expr_i64_t* wide, affine_bounds_t* bounds, ray_t** err) {
     bool want_partial = tot && tot->partial;
     if (tot) memset(tot, 0, sizeof(*tot));
     memset(p, 0, sizeof(*p));
-    if (!np_has_narrow(g, root, 0)) return NP_PROVED;
-    if (!np_build(g, root, p, 0) || !p->narrow) {
+    if (!np_needs_proof(g, root, 0)) return NP_PROVED;
+    if (!np_build(g, root, p, 0)) {
         np_count(NARROW_SUM_REFUSED);
         return NP_NO;
     }
@@ -725,8 +763,8 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
     for (uint8_t t = 0; t < p->n_terms; t++) {
         x.glob[t] = iv[t];
         int8_t ty = p->types[t];
-        bool narrow_col = ty == RAY_U8 || ty == RAY_I16 || ty == RAY_I32;
-        const void* base = narrow_col ? ray_col_src_base(srcs[t]) : NULL;
+        bool scan_col = ty == RAY_U8 || ty == RAY_I16 || ty == RAY_I32 || ty == RAY_I64;
+        const void* base = scan_col ? ray_col_src_base(srcs[t]) : NULL;
         if (!base || srcs[t]->type != ty || srcs[t]->len != nrows) { all = false; continue; }
         x.data[t] = base;
         x.nulls[t] = srcs[t]->may_null && ty != RAY_U8;
@@ -736,6 +774,20 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
     for (uint8_t t = 0; t < p->n_terms; t++) any |= x.data[t] != NULL;
     if (!any || nrows <= 0) goto refuse;
     if (!scan) return NP_NEED_SCAN;
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    if (bounds && par && all && p->n_terms == 1 && p->n_nodes == 3 &&
+        srcs[0]->obj->type == RAY_I64 && p->types[0] == RAY_I64 && !tot && !wide &&
+        !atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) {
+        if (bounds->obj == srcs[0]->obj && bounds->base == x.data[0] && bounds->rows == nrows) {
+            iv[0] = (np_iv_t){ bounds->lo, bounds->hi };
+            if (np_eval(p, iv, NULL)) return NP_PROVED;
+            goto refuse;
+        }
+        x.capture = !bounds->obj;
+        atomic_init(&x.min, INT64_MAX);
+        atomic_init(&x.max, INT64_MIN);
+    }
     if (nrows >= RAY_PARALLEL_THRESHOLD) {
         /* Four sample blocks first: rows that can wrap usually show in any
          * block, and then no pass is made. */
@@ -756,12 +808,18 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
     }
     /* the root narrow and every row's value in its width: below 2^32 rows
      * the total cannot leave int64 */
+    x.collect = tot && all;
+    if (wide && x.collect && op_base_type(root) == RAY_I64) {
+        x.wide = wide;
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            for (uint8_t k = 0; k < wide->n_terms; k++)
+                if (wide->syms[k] == p->syms[t]) x.coeff[t] = wide->coeff_i64[k];
+    }
     x.wrap = want_partial && all && op_narrow_int(root) && p->max_depth <= NP_MAX_DEPTH &&
              nrows <= ((int64_t)1 << 32);
     /* slices of 64K rows: the per-slice proof and its atomics stay off the
      * per-row cost, and a slice that fails ends the pass */
-    ray_pool_t* pool = ray_pool_get();
-    if (ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD))
+    if (par)
         ray_pool_dispatch_grain(pool, np_scan_fn, &x, nrows, NP_SLICE);
     else
         for (int64_t s0 = 0; s0 < nrows && !atomic_load_explicit(&x.fail, memory_order_relaxed); s0 += NP_SLICE)
@@ -769,13 +827,20 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
     if (atomic_load_explicit(&x.fail, memory_order_relaxed) ||
         atomic_load_explicit(&x.rows, memory_order_relaxed) != nrows)
         goto refuse;   /* a slice that could not be proved, or a cancel */
+    if (x.capture && !atomic_load_explicit(&pool->cancelled, memory_order_relaxed))
+        *bounds = (affine_bounds_t){ srcs[0]->obj, x.data[0], nrows,
+            atomic_load_explicit(&x.min, memory_order_relaxed),
+            atomic_load_explicit(&x.max, memory_order_relaxed) };
     bool partial = atomic_load_explicit(&x.wslices, memory_order_relaxed) > 0;
     np_count(partial ? NARROW_SUM_PARTIAL : NARROW_SUM_SCAN);
-    if (all && tot) {
+    if (all && tot && !atomic_load_explicit(&x.wide_total, memory_order_relaxed)) {
         for (uint8_t t = 0; t < p->n_terms; t++)
             tot->sums[t] = (int64_t)atomic_load_explicit(&x.sum[t], memory_order_relaxed);
         tot->pass_rows = atomic_load_explicit(&x.pass_rows, memory_order_relaxed);
         tot->wsum = (int64_t)atomic_load_explicit(&x.wsum, memory_order_relaxed);
+        tot->lifted = x.wide != NULL;
+        tot->hi = atomic_load_explicit(&x.high, memory_order_relaxed);
+        tot->low = atomic_load_explicit(&x.low, memory_order_relaxed);
         tot->summed = true;
         tot->partial = partial;
     }
@@ -862,9 +927,102 @@ static bool linear_reads_nullable(ray_graph_t* g, ray_t* tbl, ray_op_t* op, int 
     return false;
 }
 
+typedef struct {
+    const uint64_t *x, *y;
+    uint64_t k, c, mask, mul_hit, final_hit;
+    bool nested;
+    ray_pool_t* pool;
+    _Atomic(uint64_t) total, rows;
+} parity_sum_ctx_t;
+
+static bool parity_literal(ray_graph_t* g, ray_op_t* op, uint64_t* out) {
+    ray_op_ext_t* e = op && op->opcode == OP_CONST ? find_ext(g, op->id) : NULL;
+    if (!e || !e->literal || e->literal->type != -RAY_I64 || RAY_ATOM_IS_NULL(e->literal)) return false;
+    *out = (uint64_t)e->literal->i64;
+    return true;
+}
+
+/* Match syntax, not just the flattened coefficients: each arithmetic node
+ * can produce a null which propagates through its parent. */
+static bool parity_shape(ray_graph_t* g, ray_op_t* root, parity_sum_ctx_t* q) {
+    ray_op_t *a = op_child(g, root, 0), *b = op_child(g, root, 1);
+    bool reversed = a && a->opcode == OP_CONST;
+    if (reversed) { ray_op_t* t = a; a = b; b = t; }
+    uint64_t v;
+    if (!a || !parity_literal(g, b, &v)) return false;
+    q->k = 1;
+    if (root->opcode == OP_ADD) {
+        q->c = v;
+        if (a->opcode == OP_MUL && a->arity == 2 && op_base_type(a) == RAY_I64) {
+            b = op_child(g, a, 1);
+            a = op_child(g, a, 0);
+            if (!parity_literal(g, b, &q->k)) return false;
+            q->nested = q->c != 0;
+        }
+    } else if (root->opcode == OP_SUB) {
+        q->k = reversed ? UINT64_MAX : 1;
+        q->c = reversed ? v : -v;
+    } else if (root->opcode == OP_MUL) q->k = v;
+    else return false;
+    if (!a || a->opcode != OP_SCAN) return false;
+    if (!q->k) return true; /* known non-null source times zero */
+
+    /* k*x == target mod 2^64: divide out gcd(k,2^64), then invert
+     * the odd factor modulo the remaining power of two. Each Newton
+     * step doubles the number of correct low bits (initially one). */
+    unsigned shift = (unsigned)__builtin_ctzll(q->k);
+    uint64_t odd = q->k >> shift, inv = 1;
+    for (int i = 0; i < 6; i++) inv *= 2 - odd * inv;
+    uint64_t h = UINT64_C(1) << 63, target = h - q->c;
+    q->mask = UINT64_MAX >> shift;
+    q->mul_hit = ((h >> shift) * inv) & q->mask;
+    /* An indivisible target has no preimage. Then shift > 0, so
+     * UINT64_MAX lies outside the range of masked inputs. */
+    q->final_hit = (target & ((UINT64_C(1) << shift) - 1)) ? UINT64_MAX :
+                   ((target >> shift) * inv) & q->mask;
+    return true;
+}
+static void parity_sum_slice(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
+    parity_sum_ctx_t* q = ctx;
+    if (ray_interrupted() || (q->pool && atomic_load_explicit(&q->pool->cancelled, memory_order_acquire))) return;
+    /* Skipping INT64_MIN toggles bit 63 once per odd number of hits. */
+    uint64_t s = 0, p = 0;
+    const uint64_t h = UINT64_C(1) << 63;
+    if (q->y) {
+        for (int64_t i = lo; i < hi; i++) {
+            uint64_t row = q->x[i] + q->y[i];
+            s += row;
+            p ^= row == h;
+        }
+    } else if (!q->k) {
+        s = (uint64_t)(hi-lo) * q->c;
+    } else {
+        uint64_t skipped = 0;
+        if (q->nested) {
+            /* c != 0: the two hit sets are disjoint. The raw affine sum
+             * includes h+c for each generated multiply null; remove all
+             * of it, not just bit 63. */
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i], bits = v & q->mask;
+                s += v;
+                skipped += bits == q->mul_hit;
+                p ^= bits == q->final_hit;
+            }
+        } else {
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = q->x[i];
+                s += v;
+                p ^= (v & q->mask) == q->final_hit;
+            }
+        }
+        s = s*q->k + (uint64_t)(hi-lo)*q->c - skipped*(h+q->c);
+    }
+    atomic_fetch_add_explicit(&q->total, s ^ (p << 63), memory_order_relaxed);
+    atomic_fetch_add_explicit(&q->rows, (uint64_t)(hi-lo), memory_order_relaxed);
+}
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone, bool avg,
                                         agg_linear_t* out_plan, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_plan) return false;
@@ -900,7 +1058,38 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     int64_t nrows = ray_table_nrows(tbl);
     np_prog_t np;
     np_total_t tot = { .partial = lone };
-    if (np_prove(g, tbl, input_op, nrows, true, &np, &tot, err) != NP_PROVED) return false;
+    np_iv_t existing_bounds;
+    bool pair = lin.n_terms == 2 && input_op->opcode == OP_ADD && input_op->arity == 2 &&
+                op_child(g,input_op,0)->opcode == OP_SCAN && op_child(g,input_op,1)->opcode == OP_SCAN;
+    if (lone && !avg && nrows >= NP_SLICE && (lin.n_terms == 1 || pair) && input_op->arity == 2 &&
+        op_base_type(input_op) == RAY_I64 && srcs[0]->type == RAY_I64 &&
+        srcs[0]->obj->type == RAY_I64 && !(srcs[0]->attrs & RAY_ATTR_SLICE) && srcs[0]->len == nrows &&
+        !np_meta_bounds(srcs[0], &existing_bounds)) {
+        if (pair && (srcs[1]->type != RAY_I64 || srcs[1]->obj->type != RAY_I64 ||
+                     (srcs[1]->attrs & RAY_ATTR_SLICE) || srcs[1]->len != nrows ||
+                     np_meta_bounds(srcs[1], &existing_bounds))) pair = false;
+        parity_sum_ctx_t q = {.x = ray_col_src_base(srcs[0])};
+        if (pair) q.y = ray_col_src_base(srcs[1]);
+        if (pair || (lin.n_terms == 1 && parity_shape(g, input_op, &q))) {
+            ray_pool_t* pool = q.pool = ray_pool_get();
+            if (ray_pool_par_dispatch_ok(pool,nrows,RAY_PARALLEL_THRESHOLD))
+                ray_pool_dispatch_grain(pool,parity_sum_slice,&q,nrows,NP_SLICE);
+            else for (int64_t lo = 0; lo < nrows && !ray_interrupted(); lo += NP_SLICE)
+                parity_sum_slice(&q,0,lo,nrows-lo > NP_SLICE ? lo+NP_SLICE : nrows);
+            if (atomic_load_explicit(&q.rows,memory_order_relaxed) != (uint64_t)nrows || ray_interrupted() ||
+                (pool && atomic_load_explicit(&pool->cancelled,memory_order_acquire))) return false;
+            for (uint8_t i = 0; i < lin.n_terms; i++) {
+                out_plan->term_ptrs[i] = ray_data(srcs[i]->obj);
+                out_plan->term_types[i] = RAY_I64;
+                out_plan->coeff_i64[i] = lin.coeff_i64[i];
+            }
+            out_plan->enabled = out_plan->pre = out_plan->pre_only = true;
+            out_plan->pre_sum = (int64_t)atomic_load_explicit(&q.total,memory_order_relaxed);
+            out_plan->pre_hi = (out_plan->pre_sum < 0 ? -1 : 0);
+            return true;
+        }
+    }
+    if (np_prove(g, tbl, input_op, nrows, true, &np, lone ? &tot : NULL, avg ? &lin : NULL, NULL, err) != NP_PROVED) return false;
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
         *err = ray_col_src_plain(srcs[i], &col);   /* ready-only */
@@ -909,12 +1098,11 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
         out_plan->term_types[i] = srcs[i]->type;
         out_plan->coeff_i64[i] = lin.coeff_i64[i];
     }
-    /* The pass's totals give the answer: every row's value is exact in
-     * the root's narrow type, so below 2^32 rows the total cannot leave
-     * int64 and the wraparound sum below is the exact one (AVG's 128-bit
-     * total too).  Same arithmetic as scalar_sum_linear_i64_fn over the
-     * proved rows, plus the per-row total of the others. */
-    if (tot.summed && op_narrow_int(input_op) && nrows > 0 && nrows <= ((int64_t)1 << 32)) {
+    /* Use the modular linear sum as a signed total only when it is exact:
+     * narrow results fit at this row limit; for I64 np_prove checked the
+     * root interval of every slice against the full row count. */
+    if (tot.summed && ((op_narrow_int(input_op) && nrows <= ((int64_t)1 << 32)) ||
+                       op_base_type(input_op) == RAY_I64)) {
         int64_t s = wrap_add_i64(wrap_mul_i64(lin.bias_i64, tot.pass_rows), tot.wsum);
         bool ok = true;
         for (uint8_t i = 0; i < lin.n_terms && ok; i++) {
@@ -923,6 +1111,8 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
             if (k == np.n_terms) { ok = false; break; }
             s = wrap_add_i64(s, wrap_mul_i64(lin.coeff_i64[i], tot.sums[k]));
         }
+        if (tot.lifted) s = tot.low;
+        out_plan->pre_hi = tot.lifted ? tot.hi : (s < 0 ? -1 : 0);
         if (ok) { out_plan->pre = true; out_plan->pre_sum = s; out_plan->pre_only = tot.partial; }
     }
     if (tot.partial && !out_plan->pre_only) return false;   /* the rows' plan does not hold */
@@ -1014,6 +1204,13 @@ static bool affine_int_f64_bias_exact(int8_t bt, double bias, int64_t nrows,
 bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
                                     bool f64_bias_ok, bool defer_scan,
                                     ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
+    return try_affine_sumavg_pair(g, tbl, input_op, f64_bias_ok, defer_scan, NULL,
+                                 out_vec, out_affine, err);
+}
+
+bool try_affine_sumavg_pair(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
+                                    bool f64_bias_ok, bool defer_scan, affine_bounds_t* bounds,
+                                    ray_t** out_vec, agg_affine_t* out_affine, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_vec || !out_affine) return false;
     if (input_op->opcode != OP_ADD && input_op->opcode != OP_SUB) return false;
@@ -1071,7 +1268,8 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     {
         np_prog_t np;
         bool defer = defer_scan && !base_src->may_null && ray_col_src_base(base_src);
-        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, err);
+        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, NULL,
+                               c_is_f64 ? NULL : bounds, err);
         if (pr != NP_PROVED) return false;
     }
 

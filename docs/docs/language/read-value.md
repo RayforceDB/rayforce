@@ -8,6 +8,8 @@ saved state and be loaded safely.
 `(eval (parse s))` is not a safe way to load data: it runs whatever the text
 says, including `(.sys.exec ...)` and `(write ...)`. `read-value` has a closed
 grammar, takes no names from the environment, and has fixed resource limits.
+It reads Rayfall's own text, not JSON: for JSON use
+[`.json.parse`](../namespaces/json.md), which applies the same limits.
 
 ```lisp
 ray> (read-value "{lookback: 20 symbols: ['BTCUSDT 'ETHUSDT] fee: 0.0004}")
