@@ -6496,7 +6496,43 @@ static test_result_t test_chain_zone_prune(void) {
     PASS();
 }
 
+/* The directory of a generation-2 TIMESPAN column answers min/max of an
+ * all-null column with 0Nn, as every route does (#1419), and a column with
+ * values with its extremes.  No query reaches it for TIMESPAN today
+ * (reduce_src_type, select_aggs_from_metadata), so it is called directly. */
+static test_result_t test_dir_answer_timespan_null(void) {
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "(.db.splayed.set \"%s/\" (table [v w] (list (take [0Nn] 140000) "
+             "(as 'TIMESPAN (* (til 140000) (at [1 0N] (%% (til 140000) 2)))))) {compress: true})",
+             ray_test_tmp(SR_TMP "/span"));
+    ray_t* r = ray_eval_str(cmd);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* t = ray_read_splayed(ray_test_tmp(SR_TMP "/span"), NULL);
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_col_meta_t m;
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("v", 1), &m));
+    TEST_ASSERT_TRUE(m.enc != NULL && m.type == RAY_TIMESPAN);
+    for (int k = 0; k < 2; k++) {
+        ray_t* a = ray_dir_answer(m.enc, k ? OP_MAX : OP_MIN);
+        TEST_ASSERT_TRUE(a && !RAY_IS_ERR(a));
+        TEST_ASSERT_EQ_I(a->type, -RAY_TIMESPAN);
+        TEST_ASSERT_TRUE(RAY_ATOM_IS_NULL(a));
+        ray_release(a);
+    }
+    TEST_ASSERT_TRUE(ray_table_col_meta(t, ray_sym_intern("w", 1), &m));
+    TEST_ASSERT_TRUE(m.enc != NULL);
+    ray_t* lo = ray_dir_answer(m.enc, OP_MIN);
+    ray_t* hi = ray_dir_answer(m.enc, OP_MAX);
+    TEST_ASSERT_TRUE(lo && hi && !RAY_IS_ERR(lo) && !RAY_IS_ERR(hi));
+    TEST_ASSERT_EQ_I(lo->i64, 0);
+    TEST_ASSERT_EQ_I(hi->i64, 139998);
+    ray_release(lo); ray_release(hi); ray_release(t);
+    PASS();
+}
+
 const test_entry_t scanrange_entries[] = {
+    { "scanrange/dir_answer_timespan_null", test_dir_answer_timespan_null, sr_rt_setup, sr_rt_teardown },
     { "scanrange/walk_gen0_zero_copy",     test_walk_gen0_zero_copy,     sr_setup,    sr_teardown },
     { "scanrange/walk_gen2_vectors",       test_walk_gen2_vectors,       sr_setup,    sr_teardown },
     { "scanrange/walk_decoded_cache",      test_walk_decoded_cache,      sr_setup,    sr_teardown },

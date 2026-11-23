@@ -1060,16 +1060,18 @@ ray_t* ray_min_fn(ray_t* x) {
     if (ray_is_vec(x)) {
         if (x->type == RAY_TIMESPAN) {
             const int64_t* d = ray_data(x);
-            /* the null (INT64_MIN) would win a <, so it is skipped; whether any value
-             * was seen is an OR folded into the same pass, which stays vectorizable */
+            /* the null (INT64_MIN) would win a <, so it is skipped.  best stays 0Wn
+             * when no value is there or 0Wn is the least: only then is a 0Wn
+             * looked for, so the main loop stays as plain as dev's. */
             int64_t best = INT64_MAX;
-            bool seen = false;
-            for (int64_t i = 0; i < x->len; i++) {
-                bool v = d[i] != NULL_I64;
-                seen |= v;
-                if (v && d[i] < best) best = d[i];
+            for (int64_t i = 0; i < x->len; i++)
+                if (d[i] != NULL_I64 && d[i] < best) best = d[i];
+            if (best == INT64_MAX) {
+                bool seen = false;
+                for (int64_t i = 0; i < x->len && !seen; i++) seen = d[i] == INT64_MAX;
+                if (!seen) return ray_typed_null(-RAY_TIMESPAN);
             }
-            return seen ? ray_timespan(best) : ray_typed_null(-RAY_TIMESPAN);
+            return ray_timespan(best);
         }
         /* Per-chunk zone index fast path: O(n_chunks) instead of O(n_rows).
          * Only valid when the index was built for the column's current len
