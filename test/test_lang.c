@@ -3130,6 +3130,33 @@ static test_result_t test_eval_pivot_edge_by_row(void) {
  * sym pivot col, i64 value col.  Regression against an older bug where
  * composite-key grouping dropped or duplicated rows.  Verify each
  * cell is the correct sum for its (a, b, c) combination. */
+/* window min / max of SYM rank the column's own distinct ids (#1447): with
+ * many symbols interned, a 2-row window's rank map stays small, not one slot
+ * per symbol in the process. */
+static test_result_t test_eval_window_sym_rank_map_small(void) {
+    ray_t* r = ray_eval_str("(do (set many (as 'SYM (map (fn [j] (format \"rk1447_%\" j)) (til 200000)))) "
+                            "(set T (table [k i s] (list [a a] [0 1] (at many [199999 199998])))) "
+                            "(at (window {from: T part: [k] order: [i] funcs: {x: (min s) y: (max s)}}) 'x))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_SYM && r->len == 2);
+    ray_release(r);
+    TEST_ASSERT_FMT(ray_window_test_rank_slots() <= 4096, "rank map of %lld slots for a 2-row window",
+                    (long long)ray_window_test_rank_slots());
+    ray_t* ok = ray_eval_str("(== (at (window {from: T part: [k] order: [i] funcs: {x: (min s)}}) 'x) (as 'SYM [\"rk1447_199998\" \"rk1447_199998\"]))");
+    TEST_ASSERT_TRUE(ok && !RAY_IS_ERR(ok));
+    TEST_ASSERT_TRUE(ok->type == RAY_BOOL && ((bool*)ray_data(ok))[0] && ((bool*)ray_data(ok))[1]);
+    ray_release(ok);
+    /* 3000 rows of the newest symbols: the hash grows past its first 1024
+     * slots, and min / max agree with by:'s */
+    ray_t* big = ray_eval_str("(do (set n 3000) (set B (table [k i s] (list (% (til n) 37) (til n) (at many (- 199999 (% (* 7919 (til n)) 5000)))))) "
+                              "(and (identical (at (window {from: B part: [k] order: [i] funcs: {x: (min s)}}) 'x) (at (at (select {m: (min s) from: B by: k asc: k}) 'm) (at B 'k))) "
+                              "(identical (at (window {from: B part: [k] order: [i] funcs: {x: (max s)}}) 'x) (at (at (select {m: (max s) from: B by: k asc: k}) 'm) (at B 'k)))))");
+    TEST_ASSERT_TRUE(big && !RAY_IS_ERR(big) && big->type == -RAY_BOOL && big->b8);
+    ray_release(big);
+    TEST_ASSERT_FMT(ray_window_test_rank_slots() > 1024 && ray_window_test_rank_slots() <= 16384,
+                    "rank map of %lld slots for 3000 rows", (long long)ray_window_test_rank_slots());
+    PASS();
+}
+
 static test_result_t test_eval_pivot_multi_index(void) {
     ray_t* r = ray_eval_str(
         "(do (set t (table [a b c v] (list "
@@ -13867,6 +13894,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym_vs_atom_mismatch", test_eval_select_where_in_sym_vs_atom_mismatch, lang_setup, lang_teardown },
     { "lang/eval/select_where_eq_null_literal", test_eval_select_where_eq_null_literal, lang_setup, lang_teardown },
     { "lang/eval/pivot_multi_index", test_eval_pivot_multi_index, lang_setup, lang_teardown },
+    { "lang/eval/window_sym_rank_map_small", test_eval_window_sym_rank_map_small, lang_setup, lang_teardown },
     { "lang/eval/pivot_edge_by_row", test_eval_pivot_edge_by_row, lang_setup, lang_teardown },
     { "lang/eval/select_named_lambda", test_eval_select_named_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_recursive_self_lambda", test_eval_select_recursive_self_lambda, lang_setup, lang_teardown },

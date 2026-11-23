@@ -461,7 +461,8 @@ added to the result. That fallback applies to a plain select only: in a select
 with `by:`, or one whose outputs are all aggregates, the result rows are groups
 (or one row), so a sort key must name an output. A key that names only a
 source column there is not supported, e.g. `(select {r: (sum a) from: t by: k
-asc: c})`:
+asc: c})`. A key missing from the sortable result raises a `schema` error
+that includes the key, for example `sort key 'zz' is not available to this SELECT`:
 
 ```lisp
 (set t (table [a b] (list [3 1 2] [0 2 1])))
