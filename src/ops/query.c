@@ -29774,9 +29774,58 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     return out;
 }
 
-static bool update_numeric_promo(int8_t ct, int8_t et) {
-    return (ct == RAY_I64 || ct == RAY_I32 || ct == RAY_F64) &&
-           (et == RAY_I64 || et == RAY_I32 || et == RAY_F64);
+/* An updated column keeps its type on every route (#1458): a value of the
+ * column's type, or of a type that widens into it without loss, is stored as
+ * the column's type; anything else is a type error.  The widenings: BOOL and
+ * U8 into any wider integer or float, I16 into I32 / I64 / F32 / F64, I32 into
+ * I64 / F64, I64 into F64 (an integer literal into a float column), F32 into
+ * F64.  A LIST column keeps its type: a typed value is boxed into it. */
+static bool update_widens(int8_t ct, int8_t vt) {
+    if (vt == ct || ct == RAY_LIST) return true;
+    switch (vt) {
+    case RAY_BOOL: return ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_U8:   return ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_I16:  return ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
+    case RAY_I32:  return ct == RAY_I64 || ct == RAY_F64;
+    case RAY_I64:  return ct == RAY_F64;
+    case RAY_F32:  return ct == RAY_F64;
+    default:       return false;
+    }
+}
+
+/* `v` (owned: an atom or a vector) as a value of the column type ct, or the
+ * type error.  The value is consumed either way. */
+static ray_t* update_conform(ray_t* v, int8_t ct) {
+    if (!v || RAY_IS_ERR(v)) return v;
+    if (ct == RAY_LIST) {
+        /* a LIST column keeps its type too: a typed vector is boxed, cell by
+         * cell (an atom is boxed into every row where it is broadcast) */
+        if (v->type <= 0 || !ray_is_vec(v)) return v;
+        ray_t* ts = ray_sym(ray_sym_intern("LIST", 4));
+        if (!ts || RAY_IS_ERR(ts)) { ray_release(v); return ts ? ts : ray_error("oom", NULL); }
+        ray_t* w = ray_cast_fn(ts, v);
+        ray_release(ts);
+        ray_release(v);
+        return w ? w : ray_error("oom", NULL);
+    }
+    if (ct <= 0) return v;
+    bool atom = v->type < 0;
+    int8_t vt = atom ? (int8_t)-v->type : v->type;
+    if (vt == ct) return v;
+    if (!atom && v->type != RAY_LIST && !ray_is_vec(v)) return v;   /* a table or dict: the caller's error */
+    if (!update_widens(ct, vt)) {   /* a LIST value into a typed column included */
+        ray_release(v);
+        return atom ? ray_error("type", "update: cannot assign %s value to %s column", ray_type_name((int8_t)-vt), ray_type_name(ct))
+                    : ray_error("type", "update: expression type %s does not match %s column", ray_type_name(vt), ray_type_name(ct));
+    }
+    const char* nm = ray_type_name(ct);
+    ray_t* ts = ray_sym(ray_sym_intern(nm, strlen(nm)));
+    if (!ts || RAY_IS_ERR(ts)) { ray_release(v); return ts ? ts : ray_error("oom", NULL); }
+    ray_t* w = ray_cast_fn(ts, v);
+    ray_release(ts);
+    ray_release(v);
+    if (w && !RAY_IS_ERR(w) && ray_is_lazy(w)) w = ray_lazy_materialize(w);
+    return w ? w : ray_error("oom", NULL);
 }
 
 /* Validate one evaluated update value against its column: NULL on ok,
@@ -29784,9 +29833,8 @@ static bool update_numeric_promo(int8_t ct, int8_t et) {
 static ray_t* update_value_check(ray_t* col, ray_t* val, int64_t k) {
     int8_t ct = col->type;
     if (val->type < 0) {
-        int ok = (val->type == -ct) ||
-                 (ct == RAY_F64 && val->type == -RAY_I64) ||
-                 (ct == RAY_LIST && val->type == -RAY_SYM);
+        int ok = (val->type == -ct) || update_widens(ct, (int8_t)-val->type) ||
+                 ct == RAY_LIST;   /* an atom into a LIST column is boxed into each row */
         if (!ok) return ray_error("type", "update: cannot assign %s value to %s column",
                                   ray_type_name(val->type), ray_type_name(ct));
         return NULL;
@@ -29797,8 +29845,7 @@ static ray_t* update_value_check(ray_t* col, ray_t* val, int64_t k) {
     if (ray_len(val) != k)
         return ray_error("length", "update: expression yields %lld values for %lld matched rows",
                          (long long)ray_len(val), (long long)k);
-    if (val->type == ct) return NULL;
-    if (update_numeric_promo(ct, val->type)) return NULL;
+    if (val->type == ct || update_widens(ct, val->type)) return NULL;
     return ray_error("type", "update: expression type %s does not match %s column",
                      ray_type_name(val->type), ray_type_name(ct));
 }
@@ -30030,8 +30077,12 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     for (int64_t u = 0; u < nu && !err; u++) {
         ray_t* v = uagg[u] ? update_eval_kept(tbl, uexpr[u], idxv) : update_eval_on(sub, uexpr[u]);
         if (RAY_IS_ERR(v)) { err = v; break; }
-        uval[u] = v;
         err = update_value_check(slots[ucol[u]], v, k);
+        if (!err) {                       /* a widening is stored at the column's type */
+            v = update_conform(v, slots[ucol[u]]->type);
+            if (RAY_IS_ERR(v)) { err = v; v = NULL; }
+        }
+        uval[u] = v;
     }
     for (int64_t u = 0; u < nu && !err; u++)
         err = update_scatter(slots, ucol[u], rows, k, uval[u]);
@@ -30345,6 +30396,11 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                         if (RAY_IS_ERR(nc)) store_err = nc; else out_col = nc;
                         if (alloc) ray_release(cell);
                     }
+                } else if (agg_result->type == RAY_LIST) {
+                    /* a boxed per-group result has no typed cell to store */
+                    ray_release(agg_result); ray_release(out_col);
+                    UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                    return ray_error("type", "update by: a group gives a LIST, which a typed column cannot hold");
                 } else {
                     int64_t got = ray_is_vec(agg_result) ? ray_len(agg_result) : -1;
                     ray_release(agg_result); ray_release(out_col);
@@ -30378,6 +30434,16 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (upd_names[u] == cn) { ui = u; break; }
             }
             if (ui >= 0) {
+                /* The column keeps its type (#1458), as without by:. */
+                ray_col_meta_t om;
+                ray_table_col_meta_idx(tbl, c, &om);
+                int8_t ot = RAY_IS_PARTED(om.type) ? (int8_t)RAY_PARTED_BASETYPE(om.type) : om.type;
+                upd_cols[ui] = update_conform(upd_cols[ui], ot);
+                if (!upd_cols[ui] || RAY_IS_ERR(upd_cols[ui])) {
+                    ray_t* e = upd_cols[ui] ? upd_cols[ui] : ray_error("oom", NULL);
+                    upd_cols[ui] = NULL;
+                    ray_release(result); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return e;
+                }
                 result = ray_table_add_col(result, cn, upd_cols[ui]);
                 ray_release(upd_cols[ui]);
                 upd_cols[ui] = NULL;
@@ -30516,66 +30582,16 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
                     DICT_VIEW_CLOSE(updw); return ray_error("length", "update: column has %lld values for %lld rows", (long long)got, (long long)nrows);
                 }
+                /* The column keeps its type (#1458): a widening is stored at
+                 * it, any other type (F64 into I64 included) is an error. */
+                expr_vec = update_conform(expr_vec, ct);
+                if (RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec; }
 
-                /* WHERE update: expression result replaces ONLY masked rows.
-                 * When type differs (e.g., I64 col, F64 expr from (* col 1.1)),
-                 * keep original column type and cast expr results.
-                 * Only numeric promotions are allowed — STR↔numeric is a type error. */
-                int8_t expr_type = (expr_vec->type < 0) ? -expr_vec->type : expr_vec->type;
-                if (expr_type != ct && expr_type > 0 && ray_is_vec(expr_vec)) {
-                    /* Only allow numeric promotions (I64↔F64, I32↔F64) */
-                    int is_numeric_promo = (ct == RAY_I64 || ct == RAY_I32 || ct == RAY_F64) &&
-                                           (expr_type == RAY_I64 || expr_type == RAY_I32 || expr_type == RAY_F64);
-                    if (!is_numeric_promo) {
-                        ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
-                        DICT_VIEW_CLOSE(updw); return ray_error("type", "update: cannot assign %s expression to %s column", ray_type_name(expr_type), ray_type_name(ct));
-                    }
-                    /* Copy original column values first */
-                    int esz = ray_elem_size(ct);
-                    memcpy(ray_data(new_col), ray_data(orig_col), (size_t)(nrows * esz));
-                    new_col->len = nrows;
-                    /* Overlay masked rows with type conversion */
-                    for (int64_t r = 0; r < nrows; r++) {
-                        if (!mask[r]) continue;
-                        if (ct == RAY_I64 && expr_type == RAY_F64)
-                            ((int64_t*)ray_data(new_col))[r] = ray_cast_f64_to_i64_null(((double*)ray_data(expr_vec))[r]);
-                        else if (ct == RAY_I32 && expr_type == RAY_F64)
-                            ((int32_t*)ray_data(new_col))[r] = ray_cast_f64_to_i32_null(((double*)ray_data(expr_vec))[r]);
-                        else if (ct == RAY_F64 && expr_type == RAY_I64)
-                            ((double*)ray_data(new_col))[r] = (double)((int64_t*)ray_data(expr_vec))[r];
-                    }
-                    /* Null propagation: the memcpy above only copies values,
-                     * so re-flag null rows here — orig_col's nulls for the
-                     * untouched rows, expr_vec's nulls for the masked rows.
-                     * Also overwrite the destination payload with the
-                     * dest-width sentinel: casting a NaN/INT_MIN sentinel
-                     * across widths produces implementation-defined garbage
-                     * that wouldn't match the typed null encoding. */
-                    for (int64_t r = 0; r < nrows; r++) {
-                        ray_t* src = mask[r] ? expr_vec : orig_col;
-                        if (ray_vec_is_null(src, r)) {
-                            ray_vec_set_null(new_col, r, true);
-                            switch (ct) {
-                                case RAY_F64:                              ((double*)ray_data(new_col))[r]  = NULL_F64; break;
-                                case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:          ((int64_t*)ray_data(new_col))[r] = NULL_I64; break;
-                                case RAY_I32: case RAY_DATE: case RAY_TIME:((int32_t*)ray_data(new_col))[r] = NULL_I32; break;
-                                case RAY_I16:                              ((int16_t*)ray_data(new_col))[r] = NULL_I16; break;
-                                default: break;
-                            }
-                        }
-                    }
-                    ray_release(expr_vec);
-                    result = ray_table_add_col(result, col_name, new_col);
-                    ray_release(new_col);
-                    if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
-                    continue;
-                }
 
                 /* Broadcast scalar atom to full column vector if needed */
                 if (expr_vec->type < 0) {
                     /* Type check atom against column type BEFORE broadcast */
                     int ok = (expr_vec->type == -ct);
-                    if (!ok && ct == RAY_F64 && expr_vec->type == -RAY_I64) ok = 1;
                     if (!ok && ct == RAY_LIST && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok && ct == RAY_SYM && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok) {
@@ -30674,29 +30690,6 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     expr_vec = bcast;
                 }
 
-                /* Promote I64 vector to F64 if column is F64 */
-                if (expr_vec->type == RAY_I64 && ct == RAY_F64) {
-                    int64_t nr = ray_len(expr_vec);
-                    ray_t* promoted = ray_vec_new(RAY_F64, nr);
-                    if (RAY_IS_ERR(promoted)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return promoted; }
-                    int64_t* src_data = (int64_t*)ray_data(expr_vec);
-                    for (int64_t r = 0; r < nr; r++) {
-                        double v = (double)src_data[r];
-                        promoted = ray_vec_append(promoted, &v);
-                        if (RAY_IS_ERR(promoted)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return promoted; }
-                    }
-                    /* Carry nulls across the I64→F64 promotion and overwrite
-                     * the slot with NULL_F64 (NaN) so the payload encodes null. */
-                    double* dst = (double*)ray_data(promoted);
-                    for (int64_t r = 0; r < nr; r++) {
-                        if (ray_vec_is_null(expr_vec, r)) {
-                            ray_vec_set_null(promoted, r, true);
-                            dst[r] = NULL_F64;
-                        }
-                    }
-                    ray_release(expr_vec);
-                    expr_vec = promoted;
-                }
 
                 /* Type check: expr_vec must match original column type */
                 if (expr_vec->type != ct) {
@@ -30917,6 +30910,10 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_release(expr_vec); ray_release(result); ray_release(tbl);
                 DICT_VIEW_CLOSE(upda); return ray_error("length", "update: column has %lld values for %lld rows", (long long)got, (long long)ray_table_nrows(tbl));
             }
+            /* The column keeps its type (#1458): a widening is stored at it,
+             * any other type is an error. */
+            expr_vec = update_conform(expr_vec, RAY_IS_PARTED(oct) ? (int8_t)RAY_PARTED_BASETYPE(oct) : oct);
+            if (RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec; }
 
             /* Broadcast scalar atom to full column vector if needed */
             if (expr_vec->type < 0) {
@@ -30924,16 +30921,15 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 int8_t ct = oct;
                 /* Type check atom against column type BEFORE broadcast */
                 int ok = (expr_vec->type == -ct);
-                if (!ok && ct == RAY_F64 && expr_vec->type == -RAY_I64) ok = 1;
-                /* SYM atom → LIST column (LIST of SYM atoms) */
-                if (!ok && ct == RAY_LIST && expr_vec->type == -RAY_SYM) ok = 1;
+                /* any atom into a LIST column: boxed into every row (#1458) */
+                if (!ok && ct == RAY_LIST) ok = 1;
                 if (!ok) {
                     int8_t ev_t = expr_vec->type;            /* capture BEFORE free */
                     ray_release(expr_vec); ray_release(result); ray_release(tbl);
                     DICT_VIEW_CLOSE(upda); return ray_error("type", "update: cannot assign %s value to %s column", ray_type_name(ev_t), ray_type_name(ct));
                 }
-                /* SYM atom to LIST column: broadcast as boxed list */
-                if (ct == RAY_LIST && expr_vec->type == -RAY_SYM) {
+                /* an atom into a LIST column: broadcast as boxed list */
+                if (ct == RAY_LIST) {
                     ray_t* bcast = ray_list_new((int32_t)nrows);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return bcast; }
                     for (int64_t r = 0; r < nrows; r++) {
@@ -31000,29 +30996,6 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 expr_vec = bcast;
             }
 
-            /* Promote I64 vector to F64 if column is F64 */
-            if (expr_vec->type == RAY_I64 && oct == RAY_F64) {
-                int64_t nr = ray_len(expr_vec);
-                ray_t* promoted = ray_vec_new(RAY_F64, nr);
-                if (RAY_IS_ERR(promoted)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return promoted; }
-                int64_t* src_data = (int64_t*)ray_data(expr_vec);
-                for (int64_t r = 0; r < nr; r++) {
-                    double v = (double)src_data[r];
-                    promoted = ray_vec_append(promoted, &v);
-                    if (RAY_IS_ERR(promoted)) { ray_release(expr_vec); ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return promoted; }
-                }
-                /* Carry nulls across the I64→F64 promotion and overwrite
-                 * the slot with NULL_F64 (NaN) so the payload encodes null. */
-                double* dst = (double*)ray_data(promoted);
-                for (int64_t r = 0; r < nr; r++) {
-                    if (ray_vec_is_null(expr_vec, r)) {
-                        ray_vec_set_null(promoted, r, true);
-                        dst[r] = NULL_F64;
-                    }
-                }
-                ray_release(expr_vec);
-                expr_vec = promoted;
-            }
 
             /* No-WHERE update: allow type change for same-category types.
              * Atoms (type<0) will be broadcast later, check after broadcast.

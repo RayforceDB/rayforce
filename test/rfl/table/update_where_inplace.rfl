@@ -32,7 +32,9 @@
 (update {from: 'p f: 7 where: (== k 2)})
 (at p 'f) -- [1.5 7.0 3.5]
 (update {from: 'p i: 2.9 where: (== k 2)}) !- type
-(update {from: 'p i: (* f 2) where: (== k 3)})
+(update {from: 'p i: (* f 2) where: (== k 3)}) !- type
+(at p 'i) -- [10 20 30]
+(update {from: 'p i: (as 'I64 (* f 2)) where: (== k 3)})
 (at p 'i) -- [10 20 7]
 (update {from: 'p f: (+ i 1) where: (== k 1)})
 (at p 'f) -- [11.0 7.0 3.5]
@@ -127,3 +129,32 @@
 (at (at big 'sz) 18999) -- 18999
 (at (at big 'sz) 19000) -- -19000
 (sum (at big 'sz)) -- 160991000
+
+;; ── the column keeps its type (#1458): widenings are stored at it ──
+(set w (table [k f e i h u bl g] (list [1 2 3] [1.5 2.5 3.5] [10 20 30] (as 'I32 [1 2 3]) (as 'I16 [7 0Nl 9]) (as 'U8 [4 5 6]) [true false true] (as 'F32 [0.5 0Nf 1.5]))))
+(update {from: 'w f: h where: (> k 1)})
+(at w 'f) -- [1.5 0Nf 9.0]
+(update {from: 'w i: h where: (> k 1)})
+(at w 'i) -- (as 'I32 [1 0Nl 9])
+(update {from: 'w f: u where: (== k 1)})
+(at w 'f) -- [4.0 0Nf 9.0]
+(update {from: 'w e: bl where: (> k 1)})
+(at w 'e) -- [10 0 1]
+(update {from: 'w f: g where: (> k 0)})
+(at w 'f) -- [0.5 0Nf 1.5]
+(update {from: 'w f: (as 'I32 7) where: (== k 2)})
+(at w 'f) -- [0.5 7.0 1.5]
+(update {from: 'w e: (as 'I32 [0Nl 5 6]) where: (== k 1)})
+(at w 'e) -- [0Nl 0 1]
+;; narrowing or another type: refused, the column untouched
+(update {from: 'w i: e where: (> k 1)}) !- type
+(update {from: 'w h: i where: (> k 1)}) !- type
+(update {from: 'w g: f where: (> k 1)}) !- type
+(update {from: 'w e: (list 1 2 3) where: (> k 1)}) !- type
+(at w 'i) -- (as 'I32 [1 0Nl 9])
+;; an atom into a LIST column in place is boxed into each matched row
+(set L (table [k l] (list [1 1 2] (list [1 2] "x" 'y))))
+(update {from: 'L l: 7 where: (== k 1)})
+(at L 'l) -- (list 7 7 'y)
+(update {from: 'L l: 'z where: (== k 2)})
+(at L 'l) -- (list 7 7 'z)

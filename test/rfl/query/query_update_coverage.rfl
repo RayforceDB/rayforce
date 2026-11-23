@@ -27,13 +27,16 @@
 (set Tu_pow (table [id val] (list [1 2 3 4] [2 3 4 5])))
 ;; WHERE id>1 masks rows 1,2,3; pow([2,3,4,5], 2) = [4.0,9.0,16.0,25.0]
 ;; Row 0 (id=1): unchanged val=2; rows 1-3: val = trunc(pow) = 9,16,25
-(count (update {val: (pow val 2) from: Tu_pow where: (> id 1)})) -- 4
-(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 0) -- 2
-(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 1) -- 9
+(update {val: (pow val 2) from: Tu_pow where: (> id 1)}) !- type
+;; the column keeps its type (#1458): an F64 result is cast explicitly
+(set Tu_pow2 (fn [t] (update {val: (as 'I64 (pow val 2)) from: t where: (> id 1)})))
+(count (Tu_pow2 Tu_pow)) -- 4
+(at (at (Tu_pow2 Tu_pow) 'val) 0) -- 2
+(at (at (Tu_pow2 Tu_pow) 'val) 1) -- 9
 ;; Verify ALL the mutated rows, not just the first one
-(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 2) -- 16
-(at (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val) 3) -- 25
-(sum (at (update {val: (pow val 2) from: Tu_pow where: (> id 1)}) 'val)) -- 52
+(at (at (Tu_pow2 Tu_pow) 'val) 2) -- 16
+(at (at (Tu_pow2 Tu_pow) 'val) 3) -- 25
+(sum (at (Tu_pow2 Tu_pow) 'val)) -- 52
 
 ;; ────────────────────────────────────────────────────────────────────
 ;; WHERE-branch update: I32 column update with F64 promotion + nulls
@@ -55,7 +58,9 @@
 ;; Now do cross-type F64 update on the I32-with-null column
 ;; Update where id==3i so row 2 is masked, rows 0,1 are unmasked
 ;; Row 0 (id=1,val=0Ni) is unmasked → null prop fires → switch case RAY_I32
-(set Ti32_u (update {val: (* val 1.5) from: Ti32n where: (== id 3i)}))
+(update {val: (* val 1.5) from: Ti32n where: (== id 3i)}) !- type
+;; the column keeps its type (#1458): cast the F64 result explicitly
+(set Ti32_u (update {val: (as 'I32 (* val 1.5)) from: Ti32n where: (== id 3i)}))
 ;; Count should be 3 (table size unchanged)
 (count Ti32_u) -- 3
 ;; Row 0 has null (propagated) — nil? should return true
