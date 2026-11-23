@@ -12,10 +12,11 @@
 (kt (list (as 'DATE [1 2]) (as 'DATE [1 2]))) !- domain
 (kt (list (as 'DATE [1 2]) [1i 2i])) -- 2
 (kt (list [true false] [true false])) !- domain
-;; Nulls and NaN match themselves; -0.0 and 0.0 cells differ (bytes compare).
+;; Nulls and NaN match themselves; -0.0 and 0.0 cells are one key, as the
+;; atoms are (#1361: they compared by bytes).
 (kt (list [1.0 0Nf] [1.0 0Nf])) !- domain
 (kt (list (enlist (/ 0.0 0.0)) (enlist (/ 0.0 0.0)))) !- domain
-(kt (list [-0.0] [0.0])) -- 2
+(kt (list [-0.0] [0.0])) !- domain
 (kt (list [0Nl] [0Nl])) !- domain
 (kt (list [0Nl] [0Ni])) -- 2
 ;; Empty vectors: one type's empties are one key, another type's differ.

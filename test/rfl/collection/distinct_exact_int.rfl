@@ -1,4 +1,4 @@
-;; #1333: keep representatives in input order before the legacy atom reorder.
+;; #1333: keep representatives in input order.
 (set p (as 'LIST (+ 10 (til 80))))
 (set a 9007199254740993)
 (set b 9007199254740992)
@@ -7,7 +7,8 @@
 (identical (distinct (concat p (list f a b))) (concat p (list f))) -- true
 (identical (distinct (concat p (list (list a) (list f) (list b)))) (concat p (list (list a) (list b)))) -- true
 (identical (distinct (concat p (list (as 'TIMESPAN 2) 2 3))) (concat p (list (as 'TIMESPAN 2) 3))) -- true
-(identical (distinct (list [1 2] [3 4] 'a [1 2] 'b [5 6] 'a 'b)) (list 'a 'b [1 2] [3 4] [5 6])) -- true
+;; #1361: a list keeps first-occurrence order; atoms are no longer moved ahead of vector cells.
+(identical (distinct (list [1 2] [3 4] 'a [1 2] 'b [5 6] 'a 'b)) (list [1 2] [3 4] 'a 'b [5 6])) -- true
 ;; Compare against a small-integer control to tolerate slower instrumented builds.
 (set ids (% (til 200000) 5000))
 (set B 4611686018427387904)

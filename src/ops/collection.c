@@ -1685,6 +1685,36 @@ static int str_vec_eq(ray_t* a, ray_t* b) {
     return 1;
 }
 
+/* A float cell's bits with -0.0 as +0.0 and every other value, NaN too, as
+ * it is: float vector cells compare and hash by these, so -0.0 equals 0.0
+ * there as it does between atoms (#1361).  Integer ops on the bits, which
+ * -fno-signed-zeros cannot fold away as it can `v + 0.0`. */
+static inline uint64_t f64_cell_bits(const uint8_t* p) {
+    uint64_t b; memcpy(&b, p, 8);
+    return b & ((uint64_t)(b == UINT64_C(0x8000000000000000)) - 1);
+}
+static inline uint32_t f32_cell_bits(const uint8_t* p) {
+    uint32_t b; memcpy(&b, p, 4);
+    return b & ((uint32_t)(b == UINT32_C(0x80000000)) - 1);
+}
+
+/* Two F64 or F32 vectors of one length, cell by cell on those bits.  Equal
+ * bytes are equal cells, so only cells whose bytes differ are walked. */
+static int float_vec_eq(ray_t* a, ray_t* b) {
+    const uint8_t* pa = ray_data(a);
+    const uint8_t* pb = ray_data(b);
+    int64_t n = a->len;
+    if (memcmp(pa, pb, (size_t)n * (a->type == RAY_F64 ? 8 : 4)) == 0) return 1;
+    if (a->type == RAY_F64) {
+        for (int64_t i = 0; i < n; i++)
+            if (f64_cell_bits(pa + i * 8) != f64_cell_bits(pb + i * 8)) return 0;
+    } else {
+        for (int64_t i = 0; i < n; i++)
+            if (f32_cell_bits(pa + i * 4) != f32_cell_bits(pb + i * 4)) return 0;
+    }
+    return 1;
+}
+
 /* Helper: compare two atoms for equality (value-based) */
 int atom_eq(ray_t* a, ray_t* b) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
@@ -1796,8 +1826,10 @@ int atom_eq(ray_t* a, ray_t* b) {
          * stored in two pools compared unequal by bytes (#1318). */
         return b->type == RAY_STR && str_vec_eq(a, b);
     default:
-        /* Vector equality: same type and length, element-wise comparison */
+        /* Vector equality: same type and length, element-wise comparison:
+         * float cells on f64_cell_bits / f32_cell_bits, the rest by bytes. */
         if (a->type > 0 && a->type == b->type && a->len == b->len) {
+            if (a->type == RAY_F64 || a->type == RAY_F32) return float_vec_eq(a, b);
             int esz = ray_elem_size(a->type);
             return memcmp(ray_data(a), ray_data(b), (size_t)(a->len * esz)) == 0;
         }
@@ -1851,6 +1883,84 @@ static bool span_vec_hash(ray_t* x, uint64_t* out) {
 #undef SPAN_VEC_HASH
     *out = h;
     return true;
+}
+
+/* float_vec_hash for a chunk that holds a -0.0: its cells' f64_cell_bits /
+ * f32_cell_bits hashed, which is what the same chunk with +0.0 hashes to. */
+#define FLOAT_HASH_CHUNK 4096
+static __attribute__((cold, noinline))
+uint64_t float_chunk_hash_cleared(const uint8_t* p, size_t k, bool f64) {
+    uint8_t buf[FLOAT_HASH_CHUNK];
+    if (f64) {
+        for (size_t j = 0; j < k; j += 8) {
+            uint64_t v = f64_cell_bits(p + j);
+            memcpy(buf + j, &v, 8);
+        }
+    } else {
+        for (size_t j = 0; j < k; j += 4) {
+            uint32_t v = f32_cell_bits(p + j);
+            memcpy(buf + j, &v, 4);
+        }
+    }
+    return ray_hash_bytes(buf, k);
+}
+
+/* An F64 or F32 vector's hash as atom_eq compares it.  Up to 64 bytes of
+ * cells (the common short cell) mix their f64_cell_bits / f32_cell_bits
+ * directly, 16 bytes a step with the type and byte count, as
+ * ray_hash_bytes's serial steps mix bytes.  A longer vector hashes its type
+ * and length, then its bytes a FLOAT_HASH_CHUNK at a time, each in place
+ * unless it holds a -0.0 (one compare per cell finds out), which then
+ * hashes as +0.0. */
+static uint64_t float_vec_hash(ray_t* x) {
+    const uint8_t* d = ray_data(x);
+    bool f64 = x->type == RAY_F64;
+    size_t nb = (size_t)x->len * (f64 ? 8 : 4);
+    if (nb <= 64) {
+        uint64_t w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (f64) {
+            for (size_t j = 0; j < nb / 8; j++) w[j] = f64_cell_bits(d + j * 8);
+        } else {
+            /* Two cells per word: clear bit 31 or 63 where a half is -0.0. */
+            for (size_t j = 0; j < nb / 8; j++) {
+                uint64_t v; memcpy(&v, d + j * 8, 8);
+                w[j] = v & ~(((uint64_t)((uint32_t)v == UINT32_C(0x80000000)) << 31) |
+                             ((uint64_t)((v >> 32) == UINT32_C(0x80000000)) << 63));
+            }
+            if (nb & 4) w[nb / 8] = f32_cell_bits(d + nb - 4);
+        }
+        uint64_t seed = ray__wyp[0] ^ ((uint64_t)x->type << 56);
+        size_t i = 0;
+        for (; i + 16 < nb; i += 16) seed = ray__wymix(w[i / 8] ^ ray__wyp[1], w[i / 8 + 1] ^ seed);
+        uint64_t a = w[i / 8], b = w[i / 8 + 1];
+        a ^= ray__wyp[1];
+        b ^= seed ^ nb;
+        ray__wymum(&a, &b);
+        return ray__wymix(a ^ ray__wyp[0], b ^ ray__wyp[1]);
+    }
+    uint64_t h = ray_hash_i64(((int64_t)x->type << 32) ^ x->len);
+    for (size_t at = 0; at < nb; at += FLOAT_HASH_CHUNK) {
+        const uint8_t* p = d + at;
+        size_t k = nb - at < FLOAT_HASH_CHUNK ? nb - at : FLOAT_HASH_CHUNK;
+        bool neg;
+        if (f64) {
+            uint64_t acc = 0;
+            for (size_t j = 0; j < k / 8; j++) {
+                uint64_t v; memcpy(&v, p + j * 8, 8);
+                acc |= v == UINT64_C(0x8000000000000000);
+            }
+            neg = acc != 0;
+        } else {
+            uint32_t acc = 0;
+            for (size_t j = 0; j < k / 4; j++) {
+                uint32_t v; memcpy(&v, p + j * 4, 4);
+                acc |= v == UINT32_C(0x80000000);
+            }
+            neg = acc != 0;
+        }
+        h = ray_hash_combine(h, neg ? float_chunk_hash_cleared(p, k, f64) : ray_hash_bytes(p, k));
+    }
+    return h;
 }
 
 /* An I64 past ±2^53 has no exact double, so atom_eq's double comparison
@@ -1999,6 +2109,8 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
         }
         return h;
     }
+    /* atom_eq's float vectors: cells on f64_cell_bits / f32_cell_bits. */
+    if (x->type == RAY_F64 || x->type == RAY_F32) return float_vec_hash(x);
     /* atom_eq's other vector arm: same type and length, then memcmp of
      * len * ray_elem_size bytes, so type tags, null sentinels and NaN bits
      * compare raw.  Hash those bytes. */
@@ -2509,17 +2621,6 @@ ray_t* ray_distinct_fn(ray_t* x) {
         }
     }
     result->len = count;
-    /* Atoms before vectors, the order the pairwise swap this replaces gave
-     * (each non-atom slot, left to right, swapped with the first atom after
-     * it): in one pass, as the next such atom is never left of the last. */
-    for (int64_t i = 0, p = 1; i < count; i++) {
-        if (ray_is_atom(out[i])) continue;
-        if (p <= i) p = i + 1;
-        while (p < count && !ray_is_atom(out[p])) p++;
-        if (p >= count) break;
-        ray_t* tmp = out[i]; out[i] = out[p]; out[p] = tmp;
-        p++;
-    }
     if (_bx) ray_release(_bx);
     return result;
 }
