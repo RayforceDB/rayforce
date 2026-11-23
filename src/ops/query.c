@@ -4304,6 +4304,19 @@ static bool agg_arith_head_is_control(int64_t sym) {
     return false;
 }
 
+/* A hidden slot's argument the DAG has no node for, (at V i) over a global
+ * vector, declines: the whole output keeps the per-group evaluation the
+ * lone aggregate gets (#1444).  A lowering that raises (a missing column)
+ * still claims the slot, so its compile in the group pass reports it. */
+static bool hidden_agg_arg_declines(ray_t* arg, ray_t* tbl) {
+    if (!arg || arg->type != RAY_LIST) return false;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    bool declined = !compile_agg_arg_dag(g, arg) && !g->compile_err;
+    ray_graph_free(g);
+    return declined;
+}
+
 static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
                                 ray_t** hexprs, int64_t* hnames,
                                 int* n_hidden, int cap, int* ok) {
@@ -4316,6 +4329,7 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
         /* nested agg inside the agg argument: not a DAG shape — bail */
         if (expr_contains_agg(el[1])) { *ok = 0; return NULL; }
         if (ray_len(expr) > 2 && expr_contains_agg(el[2])) { *ok = 0; return NULL; }
+        if (hidden_agg_arg_declines(el[1], tbl)) { *ok = 0; return NULL; }
         if (*n_hidden >= cap) { *ok = 0; return NULL; }
         char buf[24];
         int bn = snprintf(buf, sizeof buf, "__ha%d", *n_hidden);
