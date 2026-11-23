@@ -1,0 +1,20 @@
+;; replace over a vector takes string or symbol atoms for from and to, as it
+;; does over an atom (#1547).  The vector kernel read a symbol atom as a
+;; string header and crashed the process, so try could not catch it.
+(replace ['cd 'ab] 'ab 'ab) -- ['cd 'ab]
+(replace ['cdab 'ab] 'ab 'x) -- ['cdx 'x]
+(replace ["ba" "cd"] 'ab 'ab) -- ["ba" "cd"]
+(replace ["bab" "cd"] 'ab "Z") -- ["bZ" "cd"]
+(replace ["bab" "cd"] "ab" 'Z) -- ["bZ" "cd"]
+(replace ['cd 'ab] 'F64 'F64) -- ['cd 'ab]
+(replace 'cdab 'ab 'x) -- 'cdx
+
+;; in a query, the same kernel gets whatever the expressions give: symbol
+;; atoms are text, and a column or a non-text input is a type error, not
+;; an answer read through the wrong representation
+(set T (table [s f v] (list ['ab 'ba] ["a" "b"] [1 2])))
+(at (select {r: (replace s 'a 'b) from: T}) 'r) -- ['bb 'bb]
+(at (select {r: (replace s "a" "b") from: T}) 'r) -- ['bb 'bb]
+(select {r: (replace s f "b") from: T}) !- type
+(select {r: (replace s "a" f) from: T}) !- type
+(select {r: (replace v "a" "b") from: T}) !- type

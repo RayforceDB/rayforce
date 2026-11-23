@@ -1677,11 +1677,24 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
         return r;
     }
 
-    /* from_v and to_v should be string constants (SYM atoms) */
-    const char* from_str = ray_str_ptr(from_v);
-    size_t from_len = ray_str_len(from_v);
-    const char* to_str = ray_str_ptr(to_v);
-    size_t to_len = ray_str_len(to_v);
+    /* from and to are string or symbol atoms, as for an atom input
+     * (replace_atom): a symbol is its text, never a string header.  A query
+     * compiles any expression into these slots, so a column, a vector or
+     * another type is refused here, as is an input that is not text. */
+    const char* from_str = NULL;
+    const char* to_str = NULL;
+    size_t from_len = 0, to_len = 0;
+    bool from_ok = exec_string_atom_arg(from_v, &from_str, &from_len);
+    if (!from_ok || !exec_string_atom_arg(to_v, &to_str, &to_len)) {
+        ray_release(input); ray_release(from_v); ray_release(to_v);
+        return ray_error("type", "replace: %s must be string or symbol atom",
+                         from_ok ? "to" : "from");
+    }
+    if (input->type != RAY_STR && input->type != RAY_SYM) {
+        int8_t t = input->type;
+        ray_release(input); ray_release(from_v); ray_release(to_v);
+        return ray_error("type", "replace: expected string or symbol, got %s", ray_type_name(t));
+    }
 
     int64_t nrows = input->len;
     bool is_str = (input->type == RAY_STR);
