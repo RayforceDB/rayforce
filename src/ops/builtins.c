@@ -1144,9 +1144,26 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
     return false;
 }
 
+static bool cast_tracks_narrow_sentinel(int8_t type) {
+    return type == RAY_I16 || type == RAY_I32 || type == RAY_DATE || type == RAY_TIME;
+}
+
+static bool cast_has_narrow_sentinel(const void* data, int8_t type, int64_t lo, int64_t hi) {
+    bool found = false;
+    if (type == RAY_I16) {
+        const int16_t* lanes = data;
+        for (int64_t i = lo; i < hi; i++) found |= lanes[i] == NULL_I16;
+    } else {
+        const int32_t* lanes = data;
+        for (int64_t i = lo; i < hi; i++) found |= lanes[i] == NULL_I32;
+    }
+    return found;
+}
+
 typedef struct {
     const void* src;
     void*       dst;
+    _Atomic bool narrow_null;
     int8_t      in_type;
     int8_t      out_type;
 } cast_par_ctx_t;
@@ -1161,6 +1178,10 @@ static void cast_par_fn(void* arg, uint32_t worker_id, int64_t lo, int64_t hi) {
     if (ray_interrupted()) return;
     cast_par_ctx_t* ctx = (cast_par_ctx_t*)arg;
     cast_range_worker(ctx->src, ctx->dst, lo, hi, ctx->in_type, ctx->out_type);
+    if (cast_tracks_narrow_sentinel(ctx->out_type) &&
+        !atomic_load_explicit(&ctx->narrow_null, memory_order_relaxed) &&
+        cast_has_narrow_sentinel(ctx->dst, ctx->out_type, lo, hi))
+        atomic_store_explicit(&ctx->narrow_null, true, memory_order_relaxed);
 }
 
 /* Threshold below which the dispatch overhead outweighs the speedup.
@@ -1202,6 +1223,8 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
      * the user asked to abort.  Break the copy into ~1 MB chunks and
      * poll cancel between them; max in-flight work between checks is
      * one chunk (~100 µs at realistic bandwidth). */
+    bool track_narrow = cast_tracks_narrow_sentinel(out_type);
+    bool narrow_null = false;
     if (cast_vec_relabel_compat(in_type, out_type)) {
         size_t esz = (size_t)ray_elem_size(out_type);
         if (n2 > 0 && esz > 0) {
@@ -1215,12 +1238,15 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
                 size_t cn = total - off;
                 if (cn > chunk_bytes) cn = chunk_bytes;
                 memcpy(dp + off, sp + off, cn);
+                if (track_narrow && !narrow_null)
+                    narrow_null = cast_has_narrow_sentinel(dp, out_type, off / esz, (off + cn) / esz);
                 off += cn;
             }
         }
         /* Post-check: a cancel landing in the final chunk would have
          * been missed by the in-loop check (we copy then exit). */
         if (CANCELLED()) return ray_error("cancel", NULL);
+        if (narrow_null) vec->attrs |= RAY_ATTR_HAS_NULLS;
         return vec;
     }
 
@@ -1249,6 +1275,8 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
         if (n2 > 0 && cast_range_worker(src_p, dst_p, 0, 1, in_type, out_type)) {
             ray_pool_dispatch(pool, cast_par_fn, &pctx, n2);
             if (CANCELLED()) return ray_error("cancel", NULL);
+            if (atomic_load_explicit(&pctx.narrow_null, memory_order_relaxed))
+                vec->attrs |= RAY_ATTR_HAS_NULLS;
             return vec;
         }
         CHECK_CANCEL_OR(NULL);
@@ -1272,14 +1300,17 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
      * unsupported here and the caller falls through. */
     if (!cast_range_worker(src_p, dst_p, lo, hi, in_type, out_type))
         CHECK_CANCEL_OR(NULL);
+    if (track_narrow) narrow_null = cast_has_narrow_sentinel(dst_p, out_type, lo, hi);
     lo = hi;
     while (lo < n2) {
         if (CANCELLED()) return ray_error("cancel", NULL);
         hi = lo + chunk;
         if (hi > n2) hi = n2;
         cast_range_worker(src_p, dst_p, lo, hi, in_type, out_type);
+        if (track_narrow && !narrow_null) narrow_null = cast_has_narrow_sentinel(dst_p, out_type, lo, hi);
         lo = hi;
     }
+    if (narrow_null) vec->attrs |= RAY_ATTR_HAS_NULLS;
     CHECK_CANCEL_OR(vec);
 #undef CHECK_CANCEL_OR
 #undef CANCELLED
@@ -1295,12 +1326,9 @@ static ray_t* cast_vec_numeric_fast(ray_t* val, ray_t* vec, int8_t out_type) {
  * cast_vec_copy_nulls only carries source nulls, so scan the output and
  * flip HAS_NULLS for any reserved sentinel.
  *
- * Scope MATCHES the validator (src/vec/validate.c): only F64/F32/I64/
- * TIMESTAMP sentinels are reserved.  I16/I32 (and I32-backed DATE/TIME) are
- * DELIBERATELY excluded — narrow-int arithmetic/truncation wraps modulo the
- * width (documented wrap rule), so INT16_MIN/INT32_MIN are legitimate
- * computed values, not nulls (see test/rfl/expr/narrow_binary.rfl).  Forcing
- * HAS_NULLS for them would make a wrapped result read back as null. */
+ * The typed fast path checks I16, I32, DATE and TIME in its copy or
+ * conversion chunks and skips this final scan for those targets. The
+ * per-atom slow path still uses this scan for all four. */
 static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
     const void* out = ray_data(vec);
     switch (out_type) {
@@ -1322,6 +1350,9 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
                 if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
             return;
         }
+        case RAY_I16: case RAY_I32: case RAY_DATE: case RAY_TIME:
+            if (cast_has_narrow_sentinel(out, out_type, 0, n)) vec->attrs |= RAY_ATTR_HAS_NULLS;
+            return;
         case RAY_SYM:
             for (int64_t i = 0; i < n; i++) {
                 if (ray_read_sym(out, i, RAY_SYM, vec->attrs) == 0) {
@@ -1410,7 +1441,8 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
 #undef _FP_CANCELLED
             /* Null propagation: a narrowing fast cast may have produced a
              * reserved sentinel not present in the source. */
-            cast_mark_output_sentinels(vec, out_type, n2);
+            if (!cast_tracks_narrow_sentinel(out_type))
+                cast_mark_output_sentinels(vec, out_type, n2);
             return vec;
         }
     }

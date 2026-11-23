@@ -202,7 +202,7 @@
 ;; I16 signed wraparound at +/-32768, stays I16 (no promotion to I32)
 (+ [32767h] [1h]) -- [0Nh]                       ;; INT16_MAX + 1 wraps to MIN
 (type (+ [32767h] [1h])) -- 'I16
-(- (as 'I16 [-32768]) (as 'I16 [1])) -- [32767]  ;; INT16_MIN - 1 wraps to MAX
+(- (as 'I16 [-32768]) (as 'I16 [1])) -- [0Nh]    ;; an explicit cast to INT16_MIN produces null
 (type (- (as 'I16 [-32768]) (as 'I16 [1]))) -- 'I16
 (* [32000h] [2h]) -- [-1536]                     ;; 64000 wraps (64000 - 65536)
 (type (* [32000h] [2h])) -- 'I16

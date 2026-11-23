@@ -226,8 +226,8 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         "(set hs (_nW h -16384h)) (set ks (_nW k -16384h))",
         "(set _nTS (table [h k] (list hs ks)))",
         "(set hx (_nW h 32767h)) (set kq (_nW k 1h)) (set _nTX (table [h k] (list hx kq)))",
-        /* wraps in every block: the samples refuse */
-        "(set hf (as 'I16 (- (% (* _nI 13) 65536) 32768)))",
+        /* Wraps in every block without a null input: the samples refuse. */
+        "(set hf (as 'I16 (- (% (* _nI 13) 65535) 32767)))",
         "(set _nTF (table [h k] (list hf hf)))",
         /* wraps in the first sample block only */
         "(set hb (concat (enlist 30000h) (drop h 1))) (set _nTB (table [h k] (list hb hb)))",
@@ -14276,7 +14276,60 @@ static test_result_t test_callprof_repl_calls(void) {
     PASS();
 }
 
+/* Preserve the width_matrix checks for per-aggregate mask boundaries.
+ * At 33 aggregates, a33's real I32 null sets bit 32. In the old 32-bit
+ * mask that could alias bit 0 and make a01 drop its raw unflagged I32
+ * minimum: group 1 would sum to 100, not -2147483548. Group 2 is a
+ * sentinel-free control. An explicit cast can no longer supply this raw cell.
+ * At 64 aggregates, a64 exercises bit 63, the widened mask's upper bound.
+ * At 65, dense/sparse admission must decline to the hash path, whose
+ * per-aggregate flags are bytes. A65 uses non-null F64 to test the type
+ * flag at index 64 (which must not alias a01), independently of the
+ * legacy hash path's handling of narrow-integer nulls in SUM. */
+static test_result_t test_group_wide_null_masks(void) {
+    ray_t* va = ray_vec_new(RAY_I32, 4);
+    TEST_ASSERT_NOT_NULL(va);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(va));
+    const int32_t cells[] = { INT32_MIN, 100, 10, 20 };
+    memcpy(ray_data(va), cells, sizeof(cells));
+    va->len = 4;
+    TEST_ASSERT_FALSE(va->attrs & RAY_ATTR_HAS_NULLS);
+    ray_err_t err = ray_env_set(ray_sym_intern("wm5_va", 6), va);
+    ray_release(va);
+    TEST_ASSERT_EQ_I(err, RAY_OK);
+    ASSERT_EQ("(nil? wm5_va)", "[false false false false]");
+    ASSERT_EQ("(sum wm5_va)", "-2147483518");
+    ASSERT_EQ("(at wm5_va 1)", "100");
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_vf [7i 7i 3i 3i])"));
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_vn [0Ni 5i 0Ni 8i])"));
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_t (table [k va vf vn] (list [1 1 2 2] wm5_va wm5_vf wm5_vn)))"));
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_r33 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vn) by: {gk: k}}))"));
+    ASSERT_EQ("(at (meta wm5_r33) 'len)", "34");
+    ASSERT_EQ("(at wm5_r33 'gk)", "[1 2]");
+    ASSERT_EQ("(at wm5_r33 'a01)", "[-2147483548 30]");
+    ASSERT_EQ("(at wm5_r33 'a02)", "[14 6]");
+    ASSERT_EQ("(at wm5_r33 'a32)", "[14 6]");
+    ASSERT_EQ("(at wm5_r33 'a33)", "[5 8]");
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_r64 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vn) by: {gk: k}}))"));
+    ASSERT_EQ("(at (meta wm5_r64) 'len)", "65");
+    ASSERT_EQ("(at wm5_r64 'gk)", "[1 2]");
+    ASSERT_EQ("(at wm5_r64 'a01)", "[-2147483548 30]");
+    ASSERT_EQ("(at wm5_r64 'a02)", "[14 6]");
+    ASSERT_EQ("(at wm5_r64 'a63)", "[14 6]");
+    ASSERT_EQ("(at wm5_r64 'a64)", "[5 8]");
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_vd [1.5 2.5 10.5 20.5])"));
+    TEST_ASSERT_TRUE(narrow_sum_eval_ok("(set wm5_r65 (select {from: wm5_t a01: (sum wm5_va) a02: (sum wm5_vf) a03: (sum wm5_vf) a04: (sum wm5_vf) a05: (sum wm5_vf) a06: (sum wm5_vf) a07: (sum wm5_vf) a08: (sum wm5_vf) a09: (sum wm5_vf) a10: (sum wm5_vf) a11: (sum wm5_vf) a12: (sum wm5_vf) a13: (sum wm5_vf) a14: (sum wm5_vf) a15: (sum wm5_vf) a16: (sum wm5_vf) a17: (sum wm5_vf) a18: (sum wm5_vf) a19: (sum wm5_vf) a20: (sum wm5_vf) a21: (sum wm5_vf) a22: (sum wm5_vf) a23: (sum wm5_vf) a24: (sum wm5_vf) a25: (sum wm5_vf) a26: (sum wm5_vf) a27: (sum wm5_vf) a28: (sum wm5_vf) a29: (sum wm5_vf) a30: (sum wm5_vf) a31: (sum wm5_vf) a32: (sum wm5_vf) a33: (sum wm5_vf) a34: (sum wm5_vf) a35: (sum wm5_vf) a36: (sum wm5_vf) a37: (sum wm5_vf) a38: (sum wm5_vf) a39: (sum wm5_vf) a40: (sum wm5_vf) a41: (sum wm5_vf) a42: (sum wm5_vf) a43: (sum wm5_vf) a44: (sum wm5_vf) a45: (sum wm5_vf) a46: (sum wm5_vf) a47: (sum wm5_vf) a48: (sum wm5_vf) a49: (sum wm5_vf) a50: (sum wm5_vf) a51: (sum wm5_vf) a52: (sum wm5_vf) a53: (sum wm5_vf) a54: (sum wm5_vf) a55: (sum wm5_vf) a56: (sum wm5_vf) a57: (sum wm5_vf) a58: (sum wm5_vf) a59: (sum wm5_vf) a60: (sum wm5_vf) a61: (sum wm5_vf) a62: (sum wm5_vf) a63: (sum wm5_vf) a64: (sum wm5_vf) a65: (sum wm5_vd) by: {gk: k}}))"));
+    ASSERT_EQ("(at (meta wm5_r65) 'len)", "66");
+    ASSERT_EQ("(at wm5_r65 'gk)", "[1 2]");
+    ASSERT_EQ("(at wm5_r65 'a01)", "[-2147483548 30]");
+    ASSERT_EQ("(at wm5_r65 'a02)", "[14 6]");
+    ASSERT_EQ("(at wm5_r65 'a64)", "[14 6]");
+    ASSERT_EQ("(at wm5_r65 'a65)", "[4.0 31.0]");
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
+    { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },

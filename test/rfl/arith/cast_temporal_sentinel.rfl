@@ -1,0 +1,27 @@
+;; @also-unfused
+;; Raw unflagged I32 retagging is covered by vec/cast_unflagged_i32_temporal.
+(set i (as 'I32 [-2147483648 5]))
+(set w [2147483648 5])
+(nil? i) -- [true false]
+(nil? w) -- [false false]
+(set d (as 'DATE i))
+(set t (as 'TIME w))
+(nil? d) -- [true false]
+(nil? t) -- [true false]
+(nil? (as 'DATE (as 'I32 [-2147483647 5]))) -- [false false]
+(nil? (as 'TIME [2147483649 5])) -- [false false]
+(set T (table [i w d t] (list i w d t)))
+(set S (select {from: T d0: (as 'DATE i) t0: (as 'TIME w) d1: (+ d 1) t1: (+ t 1)}))
+(set U (update {from: T d0: (as 'DATE i) t0: (as 'TIME w) d1: (+ d 1) t1: (+ t 1)}))
+(nil? (at S 'd0)) -- [true false]
+(nil? (at S 't0)) -- [true false]
+(nil? (at U 'd0)) -- [true false]
+(nil? (at U 't0)) -- [true false]
+(at S 'd1) -- (+ d 1)
+(at S 't1) -- (+ t 1)
+(at U 'd1) -- (+ d 1)
+(at U 't1) -- (+ t 1)
+;; A non-null string can produce INT64_MIN; TIMESTAMP already flags it.
+(set stamps ["1707-09-23T00:11:43.145224192+23:59" "2000-01-01T00:00:00.000000005Z"])
+(nil? stamps) -- [false false]
+(nil? (as 'TIMESTAMP stamps)) -- [true false]
