@@ -1,15 +1,12 @@
-;; sort_parted_guard.rfl — the raw table-sort builtins must REJECT a raw parted
-;; table with a clean error instead of proceeding to index its columns.
+;; sort_parted_guard.rfl — the raw table-sort builtins over a raw parted
+;; table.
 ;;
 ;; A parted column wrapper's storage is an array of SEGMENT pointers sized to
 ;; the partition count (tens/hundreds), but ray_table_nrows() reports the TRUE
-;; total row count (millions).  sort_table_by_keys (xasc/xdesc) resolves the
-;; parted key columns and drives the whole-table gather off nrows-1 indices —
-;; a shape that has no business touching a raw parted wrapper.  The fix detects
-;; any RAY_IS_PARTED / RAY_MAPCOMMON column up front and returns `nyi` with a
-;; clear message, rather than an incidental type error from deep in the gather
-;; (or a future out-of-bounds read if the gather ever learned to allocate a
-;; parted-typed output column).
+;; total row count (millions).  sort_table_by_keys (xasc/xdesc) must never
+;; drive its whole-table gather off such a wrapper: it sorts a flattened copy
+;; of the parted table (#726), as select's sort does, so the answer equals
+;; the sort of the equivalent flat table and the stored table is untouched.
 ;;
 ;; Note on arg order: xasc/xdesc are (xasc TABLE KEYS) — table first, keys
 ;; second.  Note on top/bot: those are vector builtins and `at` materializes a
@@ -18,8 +15,7 @@
 ;; C entry points are guarded defensively but are only ever reached (via select
 ;; / OP_SORT) with an already-materialized result table.
 ;;
-;; The guard must NOT false-positive on an ordinary in-memory table — the last
-;; case confirms xasc still sorts a plain (non-parted) table correctly.
+;; The last case confirms xasc still sorts a plain (non-parted) table.
 
 ;; ── build a 2-partition parted table sharing one .sym ────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_sort_parted")
@@ -32,17 +28,38 @@
 ;; sanity: the parted table reports the true total row count (2 parts × 3 rows).
 (count Pt) -- 6
 
-;; ── xasc / xdesc on the raw parted table → clean `nyi`, not an index-past-end.
-;;    Cover an integer-family key (Time), a SYM key, an F64 key, and multi-key. ─
-(xasc Pt [Time])      !- nyi
-(xdesc Pt [Time])     !- nyi
-(xasc Pt [Sym])       !- nyi
-(xasc Pt [Px])        !- nyi
-(xdesc Pt [Px])       !- nyi
-(xasc Pt [Sym Time])  !- nyi
-(xdesc Pt [Sym Time]) !- nyi
+;; ── xasc / xdesc on the raw parted table sort every row across partitions.
+;;    Cover an integer-family key (Time), a SYM key, an F64 key, and multi-key;
+;;    equal keys keep their partition order (a stable sort). ─────────────────
+(at (xasc Pt [Time]) 'Px)       -- (as 'F64 [10.0 11.0 12.0 20.0 21.0 22.0])
+(at (xdesc Pt [Time]) 'Px)      -- (as 'F64 [22.0 21.0 20.0 12.0 11.0 10.0])
+(at (xasc Pt [Sym]) 'Px)        -- (as 'F64 [10.0 12.0 21.0 11.0 20.0 22.0])
+(at (xasc Pt [Px]) 'Px)         -- (as 'F64 [10.0 11.0 12.0 20.0 21.0 22.0])
+(at (xdesc Pt [Px]) 'Px)        -- (as 'F64 [22.0 21.0 20.0 12.0 11.0 10.0])
+(at (xasc Pt [Sym Time]) 'Px)   -- (as 'F64 [10.0 12.0 21.0 11.0 20.0 22.0])
+(at (xdesc Pt [Sym Time]) 'Px)  -- (as 'F64 [22.0 20.0 11.0 21.0 12.0 10.0])
+(at (xasc Pt 'Sym) 'Sym)        -- [a a a b b b]
+;; every column comes along, the partition key too, in the same order as
+;; select's sort, and the stored table is unchanged
+(xasc Pt [Time])                -- (select {from: Pt asc: Time})
+(xdesc Pt [Px])                 -- (select {from: Pt desc: Px})
+(count (xasc Pt [Time]))        -- 6
+(at Pt 'Px)                     -- (as 'F64 [10.0 11.0 12.0 20.0 21.0 22.0])
+;; a key that is not a column still fails
+(xasc Pt [Nope])                !- domain
 
-;; ── the guard is parted-only: xasc on an ordinary in-memory table still sorts
+;; ── the issue's repro (#726): the rows of both days sort together ─────────
+(.sys.exec "rm -rf /tmp/rfl_sort_parted_726")
+(.db.splayed.set "/tmp/rfl_sort_parted_726/2024.01.01/t/" (table [a b] (list [1 2 3] [30 20 10])))
+(.db.splayed.set "/tmp/rfl_sort_parted_726/2024.01.02/t/" (table [a b] (list [4 5] [50 40])))
+(set P726 (.db.parted.get "/tmp/rfl_sort_parted_726/" 't))
+(at (xasc P726 'b) 'b)          -- [10 20 30 40 50]
+(at (xasc P726 'b) 'a)          -- [3 2 1 5 4]
+(at (xdesc P726 'b) 'a)         -- [4 5 1 2 3]
+(xasc P726 'b)                  -- (select {from: P726 asc: b})
+(.sys.exec "rm -rf /tmp/rfl_sort_parted_726")
+
+;; ── xasc on an ordinary in-memory table still sorts
 ;;    (rows given out of Time order come back ascending → Px 10,11,12). ─────────
 (set TF (table [Time Px] (list [2024.01.01D10:00:02.000000000 2024.01.01D10:00:00.000000000 2024.01.01D10:00:01.000000000] (as 'F64 [12.0 10.0 11.0]))))
 (at (xasc TF [Time]) 'Px) -- (as 'F64 [10.0 11.0 12.0])
