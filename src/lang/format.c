@@ -335,7 +335,7 @@ static void fmt_f64(fmt_buf_t* b, double val, int mode) {
         int n = 0;
         if (isfinite(val)) {
             for (int digits = 1; digits <= 17; digits++) {
-                n = snprintf(tmp, sizeof(tmp), "%.*g", digits, val);
+                n = ray_snprintf_c(tmp, sizeof(tmp), "%.*g", digits, val);
                 if (n <= 0 || n >= (int)sizeof(tmp)) break;
                 double parsed = 0.0;
                 if (ray_parse_f64(tmp, (size_t)n, &parsed) == (size_t)n &&
@@ -355,7 +355,7 @@ static void fmt_f64(fmt_buf_t* b, double val, int mode) {
     if (val == 0.0) {
         /* Zero: format as "0.0" (after trailing-zero strip) */
         char tmp[16];
-        int n = snprintf(tmp, sizeof(tmp), "%.*f", g_precision, 0.0);
+        int n = ray_snprintf_c(tmp, sizeof(tmp), "%.*f", g_precision, 0.0);
         char* dot = strchr(tmp, '.');
         if (dot) { char* end = tmp + n - 1; while (end > dot + 1 && *end == '0') end--; n = (int)(end - tmp + 1); }
         fmt_putn(b, tmp, (int32_t)n);
@@ -368,9 +368,9 @@ static void fmt_f64(fmt_buf_t* b, double val, int mode) {
     char tmp[64];
     int n;
     if (val != 0.0 && (order > 6 || order < -1))
-        n = snprintf(tmp, sizeof(tmp), "%.*e", g_precision, val);
+        n = ray_snprintf_c(tmp, sizeof(tmp), "%.*e", g_precision, val);
     else
-        n = snprintf(tmp, sizeof(tmp), "%.*f", g_precision, val);
+        n = ray_snprintf_c(tmp, sizeof(tmp), "%.*f", g_precision, val);
 
     if (n <= 0 || n >= (int)sizeof(tmp)) {
         fmt_puts(b, "?");
@@ -397,7 +397,7 @@ static void fmt_f32(fmt_buf_t* b, float val, int mode) {
         int n = 0;
         if (isfinite(val)) {
             for (int digits = 1; digits <= 9; digits++) {
-                n = snprintf(tmp, sizeof(tmp), "%.*g", digits, (double)val);
+                n = ray_snprintf_c(tmp, sizeof(tmp), "%.*g", digits, (double)val);
                 if (n <= 0 || n >= (int)sizeof(tmp)) break;
                 double parsed = 0.0;
                 if (ray_parse_f64(tmp, (size_t)n, &parsed) == (size_t)n &&
@@ -603,7 +603,7 @@ ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* le
     } else if (a->type == -RAY_I64) {
         n = snprintf(buf, cap, "%" PRId64, a->i64);
     } else if (a->type == -RAY_F64) {
-        n = snprintf(buf, cap, "%g", clear_neg_zero(a->f64));
+        n = ray_snprintf_c(buf, cap, "%g", clear_neg_zero(a->f64));
     } else if (a->type == -RAY_BOOL) {
         n = snprintf(buf, cap, "%s", a->b8 ? "true" : "false");
     } else if (a->type == -RAY_STR) {

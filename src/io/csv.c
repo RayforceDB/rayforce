@@ -4490,9 +4490,13 @@ static void csv_write_timestamp(csv_writer_t* w, int64_t ns) {
 static void csv_write_f64(csv_writer_t* w, double v) {
     if (isnan(v)) { cw_puts(w, "nan"); return; }
     if (isinf(v)) { cw_puts(w, v < 0 ? "-inf" : "inf"); return; }
-    /* %.17g is the standard round-trip format; wrap in cw_printf so
-     * a 64-byte buffer stack overflow guards the write. */
-    cw_printf(w, "%.17g", v);
+    /* %.17g is the standard round-trip format, with a '.' whatever the
+     * host's LC_NUMERIC (a comma would also split the field). */
+    if (w->err) return;
+    char buf[64];
+    int n = ray_snprintf_c(buf, sizeof(buf), "%.17g", v);
+    if (n < 0 || (size_t)n >= sizeof(buf)) { w->err = 1; return; }
+    cw_write(w, buf, (size_t)n);
 }
 
 static void csv_write_guid(csv_writer_t* w, const uint8_t* g) {

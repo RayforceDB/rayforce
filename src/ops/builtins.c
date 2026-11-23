@@ -26,6 +26,7 @@
 
 #include "table/domain.h"   /* symbols a print must resolve */
 #include "core/timespan.h"
+#include "core/numparse.h"    /* ray_strtod_c, ray_snprintf_c */
 #include <errno.h>
 #include <stdint.h>
 #include "lang/eval.h"
@@ -103,7 +104,9 @@ void ray_lang_print(FILE* fp, ray_t* val) {
     case -RAY_F64: {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
-        fprintf(fp, "%g", fv);
+        char buf[32];
+        int n = ray_snprintf_c(buf, sizeof(buf), "%g", fv);
+        if (n > 0 && (size_t)n < sizeof(buf)) fputs(buf, fp);
         break;
     }
     case -RAY_BOOL: fprintf(fp, "%s", val->b8 ? "true" : "false"); break;
@@ -1498,14 +1501,14 @@ ray_t* cast_str_atom(ray_t* val) {
     if (val->type == -RAY_F64) {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
-        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%g", fv);
+        char buf[32]; int n2 = ray_snprintf_c(buf, sizeof(buf), "%g", fv);
         return ray_str(buf, (size_t)n2);
     }
     if (val->type == -RAY_F32) {
         /* Data conversion uses plain decimal text, independent of the
          * literal printer and its configured display precision. */
         double fv = clear_neg_zero((double)(float)val->f64);
-        char buf[32]; int n2 = snprintf(buf, sizeof(buf), "%.9g", fv);
+        char buf[32]; int n2 = ray_snprintf_c(buf, sizeof(buf), "%.9g", fv);
         return ray_str(buf, (size_t)n2);
     }
     if (val->type == -RAY_BOOL) {
@@ -1779,7 +1782,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f64");
             char* end;
             errno = 0;
-            double v = strtod(sp, &end);
+            double v = ray_strtod_c(sp, &end);
             if (end == sp) return ray_error("domain", "as: cannot parse str as f64");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as f64, unexpected trailing characters");
@@ -1815,7 +1818,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             if (!sp) return ray_error("domain", "as: cannot parse empty str as f32");
             char* end;
             errno = 0;
-            double v = strtod(sp, &end);
+            double v = ray_strtod_c(sp, &end);
             if (end == sp) return ray_error("domain", "as: cannot parse str as f32");
             if (*end != '\0')
                 return ray_error("domain", "as: cannot parse str as f32, unexpected trailing characters");
@@ -1871,11 +1874,11 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
             else if (val->type == -RAY_F64) {
                 double fv = val->f64;
                 fv = clear_neg_zero(fv);
-                n2 = snprintf(buf, sizeof(buf), "%.17g", fv);
+                n2 = ray_snprintf_c(buf, sizeof(buf), "%.17g", fv);
             }
             else if (val->type == -RAY_F32) {
                 double fv = clear_neg_zero((double)(float)val->f64);
-                n2 = snprintf(buf, sizeof(buf), "%.9g", fv);
+                n2 = ray_snprintf_c(buf, sizeof(buf), "%.9g", fv);
             }
             else n2 = snprintf(buf, sizeof(buf), "%lld", (long long)as_i64(val));
             if (n2 > 0) {
