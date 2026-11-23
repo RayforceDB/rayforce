@@ -5066,6 +5066,135 @@ static ray_t* attr_set_parted(ray_t* v) {
     return attach_backing_index_carry_markers(v, ray_index_attach_part);
 }
 
+/* ===== Order notes and the table they hold for (RAY_ATTR_ORDER_NOTES) ===== */
+
+/* The order note of table slot `slot`, or -1.  An encoded slot's note is the
+ * name its file's HASH / PART region records, read from the region head
+ * without decoding the column (a parted one is streamed and records none). */
+static int64_t slot_order_sym(ray_t* slot) {
+    if (!slot || RAY_IS_ERR(slot)) return -1;
+    if (slot->type != RAY_ENCCOL) return ray_is_vec(slot) ? index_order_sym(slot) : -1;
+    if (ray_enccol_is_parted(slot)) return -1;
+    ray_enccol_t* e = ray_enccol_of(slot);
+    if (!e || (e->hdr.index_kind != RAY_IDX_HASH && e->hdr.index_kind != RAY_IDX_PART))
+        return -1;
+    ray_enc_idx_view_t iv;
+    ray_enc_index_view(e->base + e->hdr.index_off, e->hdr.end_off - e->hdr.index_off,
+                       e->hdr.index_kind, e->type, e->attrs, e->len, &iv);
+    if (!iv.order_name || iv.order_len == 0) return -1;
+    return ray_sym_intern(iv.order_name, iv.order_len);
+}
+
+static bool slot_may_carry_order(ray_t* slot) { return slot_order_sym(slot) != -1; }
+
+bool ray_table_order_notes_hold(ray_t* tbl) {
+    return tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE &&
+           (tbl->attrs & RAY_ATTR_ORDER_NOTES);
+}
+
+void ray_table_mark_order_notes(ray_t* tbl) {
+    if (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE)
+        tbl->attrs |= RAY_ATTR_ORDER_NOTES;
+}
+
+bool ray_table_order_notes_absent(ray_t* tbl, int64_t except) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++)
+        if (c != except && slot_may_carry_order(ray_table_slot_idx(tbl, c)))
+            return false;
+    return true;
+}
+
+/* Whether `slot` is one of `tbl`'s column objects. */
+static bool table_has_slot(ray_t* tbl, ray_t* slot) {
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++)
+        if (ray_table_slot_idx(tbl, c) == slot) return true;
+    return false;
+}
+
+/* `out` was built by an operation over `src` (xcol, xcols, select, update,
+ * a join) and may hold some of src's column objects, under any names.  A
+ * note is a fact about two column objects: the rows of the noted column's
+ * parts are ordered in the column its note names.  It still holds in `out`
+ * when src vouched for it, the noted column is the object src had, and the
+ * name it gives is, in `out`, the very object it is in src (or names nothing
+ * in out).  Every noted column of `out` must pass: one that src never held,
+ * or a note src cannot vouch for (a position code), leaves `out` without
+ * the mark, and its notes are not consulted.  Pointer identity is the proof
+ * the values did not change: an edit makes a new object, or clears the mark
+ * of the table it edits in place. */
+void ray_table_carry_order_notes(ray_t* out, ray_t* src) {
+    if (!ray_table_order_notes_hold(src) || !out || RAY_IS_ERR(out) ||
+        out->type != RAY_TABLE || out == src)
+        return;
+    int64_t nc = ray_table_ncols(out);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* x = ray_table_slot_idx(out, c);
+        int64_t note = slot_order_sym(x);
+        if (note == -1) continue;
+        if (note < 0 || !table_has_slot(src, x)) return;
+        ray_t* y = ray_table_slot(out, note);
+        if (y && y != ray_table_slot(src, note)) return;
+    }
+    out->attrs |= RAY_ATTR_ORDER_NOTES;
+}
+
+/* `col` with no order note: retained as is when it carries none, else a
+ * copy whose HASH / PART index is rebuilt without one (the markers carry,
+ * as attach_backing_index_carry_markers carries them).  Owned result. */
+static ray_t* col_without_order(ray_t* col) {
+    if (index_order_sym(col) == -1) { ray_retain(col); return col; }
+    ray_index_t* sx = ray_index_payload(col->index);
+    ray_idx_kind_t kind = (ray_idx_kind_t)sx->kind;
+    uint8_t carry = (uint8_t)(sx->markers &
+                    ~(RAY_MARK_HASH_HIGH | RAY_MARK_FIRST_ONLY | RAY_MARK_MMAP));
+    ray_t* w = col;
+    ray_retain(w);
+    ray_t* d = ray_index_drop(&w);          /* copies: the caller holds col */
+    if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+    ray_t* r = kind == RAY_IDX_HASH ? ray_index_attach_hash(&w)
+                                    : ray_index_attach_part(&w);
+    /* a rebuild that fails leaves the copy without an index: the save
+     * keeps the values, and a reload answers by scanning */
+    if (r && RAY_IS_ERR(r)) ray_error_free(r);
+    if (carry && (w->attrs & RAY_ATTR_HAS_INDEX))
+        ray_index_payload(w->index)->markers |= carry;
+    return w;
+}
+
+ray_t* ray_table_without_order_notes(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE ||
+        ray_table_order_notes_hold(tbl) || ray_table_order_notes_absent(tbl, -1)) {
+        if (tbl && !RAY_IS_ERR(tbl)) ray_retain(tbl);
+        return tbl;
+    }
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new(nc);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* slot = ray_table_slot_idx(tbl, c);
+        ray_t* col;
+        if (!slot_may_carry_order(slot)) {
+            col = slot;
+            ray_retain(col);
+        } else {
+            /* an encoded one is decoded: its index is rebuilt in memory */
+            ray_t* plain = slot->type == RAY_ENCCOL ? ray_enccol_materialize(slot) : slot;
+            if (!plain || RAY_IS_ERR(plain)) {
+                ray_release(out);
+                return plain ? plain : ray_error("oom", NULL);
+            }
+            col = col_without_order(plain);
+        }
+        if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("oom", NULL); }
+        out = ray_table_add_col(out, ray_table_col_name(tbl, c), col);
+        ray_release(col);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    return out;
+}
+
 /* Set the sorted marker after verifying.  Borrowed v in, owning ref out. */
 static ray_t* attr_set_sorted(ray_t* v) {
     if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("type", "attr: null");

@@ -156,6 +156,9 @@ ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
 
     tbl = ray_cow(tbl);
     if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    /* a column added under a name a note gives is not the column the note
+     * was made for; the builders that know it is mark the table afterwards */
+    tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;
 
     ray_t** slots = tbl_slots(tbl);
     ray_t* schema = slots[0];
@@ -410,6 +413,7 @@ void ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
     cols = ray_cow(cols);
     if (!cols || RAY_IS_ERR(cols)) return;
     slots[1] = cols;
+    tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;   /* a new column object */
     ray_t** cv = (ray_t**)ray_data(cols);
     ray_retain(col_vec);
     ray_release(cv[idx]);
@@ -443,6 +447,7 @@ void ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id) {
     if (!schema || RAY_IS_ERR(schema)) return;
     slots[0] = schema;
     ((int64_t*)ray_data(schema))[idx] = name_id;
+    tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;   /* a note names by symbol */
 }
 
 /* --------------------------------------------------------------------------
@@ -510,6 +515,8 @@ ray_t* ray_table_cols_inplace(ray_t* tbl) {
     ray_t** cv = (ray_t**)ray_data(cols);
     for (int64_t i = 0; i < cols->len; i++)
         if (cv[i] && cv[i]->type == RAY_ENCCOL) return NULL;
+    /* the caller may replace column objects in place */
+    tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;
     return cols;
 }
 

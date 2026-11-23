@@ -237,7 +237,9 @@ void      ray_col_want_rows(ray_t* col, const int64_t* idx, int64_t n);
  * table reader turns it back into the column's name (#838).  A position
  * means nothing outside its table, and every reader compares order_sym with
  * a symbol id, never a negative value, so a column loaded on its own just
- * carries no order. */
+ * carries no order.  A position is written only for a table carrying
+ * RAY_ATTR_ORDER_NOTES (mem/heap.h): a save of any other table writes its
+ * noted columns without a note (splay_write_table_impl). */
 #define RAY_IDX_ORDER_POS(pos)   (-2 - (int64_t)(pos))
 #define RAY_IDX_ORDER_POS_OF(v)  (-2 - (int64_t)(v))
 

@@ -929,7 +929,7 @@ static ray_err_t splay_write_col(ray_t* col, const char* path, const char* name,
 
 /* write: the held lock's state (mode, current generation; receives the
  * resolved generations), or NULL for a private directory. */
-static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
+static ray_err_t splay_write_table_cols(ray_t* tbl, ray_t* gen_src, const char* dir,
                                         const char* sym_path, bool durable,
                                         bool flush_sym, bool build_indexes,
                                         ray_compress_t mode, ray_splay_write_t* write,
@@ -961,7 +961,7 @@ static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
             ray_free_raw(gens);
             return write->cur_err;                         /* inheritance needs the destination */
         }
-        ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(tbl, c),
+        ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(gen_src, c),
                                                  write ? write->cur : NULL,
                                                  ray_str_ptr(na), ray_str_len(na), &gens[c]);
         if (gerr != RAY_OK) { ray_free_raw(gens); return gerr; }   /* nothing written yet */
@@ -1136,6 +1136,29 @@ out:
     if (!write) ray_free_raw(gens);
     return ret;
 }
+
+/* A note on a column names an order column by symbol (RAY_ATTR_ORDER_NOTES):
+ * a table that does not vouch for its notes is written as a table whose
+ * noted columns carry none, so no file states an order its table never had.
+ * Each file's generation is still resolved from the caller's own slots. */
+static ray_err_t splay_write_table_impl(ray_t* tbl, const char* dir,
+                                        const char* sym_path, bool durable,
+                                        bool flush_sym, bool build_indexes,
+                                        ray_compress_t mode, ray_splay_write_t* write,
+                                        bool sym_col) {
+    ray_t* w = (tbl && !RAY_IS_ERR(tbl) && tbl->type == RAY_TABLE)
+               ? ray_table_without_order_notes(tbl) : NULL;
+    if (w && RAY_IS_ERR(w)) {
+        ray_err_t e = ray_err_from_obj(w);
+        ray_error_free(w);
+        return e;
+    }
+    ray_err_t e = splay_write_table_cols(w ? w : tbl, tbl, dir, sym_path, durable, flush_sym,
+                                         build_indexes, mode, write, sym_col);
+    if (w) ray_release(w);
+    return e;
+}
+
 
 ray_err_t ray_splay_write_table(ray_t* tbl, const char* dir,
                                  const char* sym_path, bool durable) {
@@ -1747,6 +1770,9 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
 
     ray_release(schema);
     splay_resolve_orders(tbl);
+    /* a save writes order notes (names or positions) only for a table that
+     * holds them (splay_write_table_impl), so the notes read back hold */
+    ray_table_mark_order_notes(tbl);
     return tbl;
 }
 

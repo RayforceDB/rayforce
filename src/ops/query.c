@@ -18068,6 +18068,7 @@ typedef struct {
     ray_pool_scan_t defer;     /* read after the filter, requested once it ran */
     ray_t**         args;      /* the select this registration belongs to */
     ray_t*          gate_hdr;  /* scratch block behind scan.gate */
+    ray_t*          from_tbl;  /* the table `from:` gave this select (owned), or NULL */
     bool            filled;
 } select_scan_t;
 static RAY_TLS select_scan_t* t_select_scan;
@@ -18664,6 +18665,13 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     t_select_scan = prev_ss;
     ray_pool_scan_set(prev_scan);
     if (ss.gate_hdr) scratch_free(ss.gate_hdr);
+    /* the columns a select passes through keep the order notes they had in
+     * the table it reads (ray_table_carry_order_notes proves each) */
+    if (ss.from_tbl) {
+        if (r && !RAY_IS_ERR(r) && r->type == RAY_TABLE)
+            ray_table_carry_order_notes(r, ss.from_tbl);
+        ray_release(ss.from_tbl);
+    }
     if (folded) ray_release(folded);
     if (merged) ray_release(merged);
     return r;
@@ -22354,6 +22362,12 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     if (emit_filter_set)
         ray_group_emit_filter_set(prev_emit_filter);
     if (RAY_IS_ERR(tbl)) return tbl;
+    /* the table this select reads, for its result's order notes (ray_select) */
+    if (t_select_scan && t_select_scan->args == args && !t_select_scan->from_tbl &&
+        tbl->type == RAY_TABLE) {
+        ray_retain(tbl);
+        t_select_scan->from_tbl = tbl;
+    }
     if (tbl->type == RAY_DICT) {
         bool complete;
         ray_t* scan = ray_parquet_select_source(tbl,dict,&complete);
@@ -31034,6 +31048,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         #undef UPDATE_BY_CLEANUP_COLS
 
         ray_release(groups);
+        /* the columns kept from `from:` keep the order notes they had there */
+        if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
         /* Store in-place and return the symbol if amending by name. */
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             ray_env_set(inplace_sym, result);
@@ -31423,6 +31439,8 @@ ray_t* ray_update(ray_t** args, int64_t n) {
         }
 
         ray_release(mask_vec);
+        /* the columns kept from `from:` keep the order notes they had there */
+        if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             ray_env_set(inplace_sym, result);
             ray_release(result);
@@ -31685,6 +31703,10 @@ no_where_add_col:
         ray_release(expr_vec);
         if (RAY_IS_ERR(result)) { ray_release(tbl); DICT_VIEW_CLOSE(upda); return result; }
     }
+
+    /* the columns kept from `from:` keep the order notes they had there */
+
+    if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
 
     /* Store in-place and return the symbol if amending by name (from: 't). */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
@@ -35577,7 +35599,17 @@ static ray_t* join_impl(ray_t** args, int64_t n, uint8_t join_type) {
     return r;
 }
 
-ray_t* ray_left_join_fn(ray_t** args, int64_t n)  { return join_impl(args, n, 1); }
+/* A left join keeps the left table's rows in place, so its columns pass
+ * through as the same objects and keep the order notes they had there
+ * (ray_table_carry_order_notes proves each against one input). */
+ray_t* ray_left_join_fn(ray_t** args, int64_t n) {
+    ray_t* r = join_impl(args, n, 1);
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE) return r;
+    for (int64_t i = 0; i < n && !ray_table_order_notes_hold(r); i++)
+        if (args[i] && !RAY_IS_ERR(args[i]) && args[i]->type == RAY_TABLE)
+            ray_table_carry_order_notes(r, args[i]);
+    return r;
+}
 ray_t* ray_inner_join_fn(ray_t** args, int64_t n) { return join_impl(args, n, 0); }
 ray_t* ray_full_join_fn(ray_t** args, int64_t n)  { return join_impl(args, n, 2); }
 

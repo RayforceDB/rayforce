@@ -611,6 +611,22 @@ ray_err_t ray_index_hash_build_region(ray_t* v, ray_index_region_fn map, void* c
  * pre-attach aux state byte-for-byte.  Returns *vp. */
 ray_t* ray_index_drop(ray_t** vp);
 
+/* ===== Order notes (RAY_ATTR_ORDER_NOTES, mem/heap.h) =====
+ * A HASH / PART index's order_sym names, by symbol, a column ordered within
+ * each group.  It holds only for a table carrying RAY_ATTR_ORDER_NOTES. */
+bool   ray_table_order_notes_hold(ray_t* tbl);
+void   ray_table_mark_order_notes(ray_t* tbl);
+/* No column of `tbl` except position `except` (-1: none) carries a note. */
+bool   ray_table_order_notes_absent(ray_t* tbl, int64_t except);
+/* Mark `out`, built from `src`'s column objects, when src's notes still
+ * hold in it: src has the mark and each of out's columns is the object src
+ * had under that name. */
+void   ray_table_carry_order_notes(ray_t* out, ray_t* src);
+/* `tbl` retained when its notes hold or it carries none; else a table of
+ * the same columns whose notes are removed (a noted column is copied with
+ * its index rebuilt without the note).  Owned result. */
+ray_t* ray_table_without_order_notes(ray_t* tbl);
+
 /* ===== Table-resident key index (RAY_IDX_UKEY) =====
  * Attached to a RAY_TABLE, not to a vector, so the generic attach path does
  * not apply: a table's aux is zero-init, there is nothing to snapshot and
