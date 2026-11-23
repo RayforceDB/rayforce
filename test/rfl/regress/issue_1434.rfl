@@ -1,0 +1,71 @@
+;; MAX + 1 generates an I64 null. Materialize the row expression before
+;; aggregation so the reference cannot use an affine sum rewrite.
+(set k [0 1 2 3 0 1 2 3])
+(set b [9223372036854775807 3 2 1 12 4 2 1])
+(set T (table [k b] (list k b)))
+(set R (table [k v] (list k (+ b 1))))
+(select {from: T by: (% k 2) s: (sum (+ b 1)) asc: k}) -- (select {from: R by: (% k 2) s: (sum v) asc: k})
+;; Four distinct totals: counting the null changes the top three keys.
+(select {from: T by: k s: (sum (+ b 1)) desc: s take: 3}) -- (select {from: R by: k s: (sum v) desc: s take: 3})
+
+;; Above the parallel proof threshold, with one hit in the short final
+;; slice outside all four sample blocks. The samples alone are not proof.
+(set b (concat (til 99998) [9223372036854775807]))
+(set T (table [b] (list b)))
+(set rows (+ b 1))
+(at (at (select {from: T s: (sum (+ b 1))}) 's) 0) -- (sum rows)
+;; Exercise the lone SUM path above its 64K threshold, across both
+;; multiplication preimages and an odd addition hit in the final slice.
+(set pv (concat (til 199999) [4611686018427387904 -4611686018427387904 9223372036854775807]))
+(set PT (table [pv] (list pv)))
+(set pd (* pv 2))
+(set pa (+ pv 1))
+(== (first (at (select {from: PT s: (sum (* pv 2))}) 's)) (sum pd)) -- true
+(== (first (at (select {from: PT s: (sum (+ pv 1))}) 's)) (sum pa)) -- true
+
+;; Three multiply-by-2 hits (two residues), two final +2 hits, and
+;; both subtraction orders hit MIN at MIN+1. Include both signs
+;; and values that wrap without hitting the sentinel.
+(set x (concat (til 199999) [4611686018427387904 -4611686018427387904 4611686018427387904 4611686018427387903 4611686018427387903 -9223372036854775807 9223372036854775807]))
+(set X (table [x] (list x)))
+(set rows (- x 1))
+(at (select {from: X s: (sum (- x 1))}) 's) -- (enlist (sum rows))
+(set rows (- 1 x))
+(at (select {from: X s: (sum (- 1 x))}) 's) -- (enlist (sum rows))
+(set rows (* x 2))
+(at (select {from: X s: (sum (* x 2))}) 's) -- (enlist (sum rows))
+(set rows (* x -6))
+(at (select {from: X s: (sum (* x -6))}) 's) -- (enlist (sum rows))
+(set rows (* x 3))
+(at (select {from: X s: (sum (* x 3))}) 's) -- (enlist (sum rows))
+(set rows (+ (* x 2) 2))
+(at (select {from: X s: (sum (+ (* x 2) 2))}) 's) -- (enlist (sum rows))
+(set rows (+ (* x -2) 1))
+(at (select {from: X s: (sum (+ (* x -2) 1))}) 's) -- (enlist (sum rows))
+(set rows (+ (* x 3) -1))
+(at (select {from: X s: (sum (+ (* x 3) -1))}) 's) -- (enlist (sum rows))
+(set rows (* x 0))
+(at (select {from: X s: (sum (* x 0))}) 's) -- (enlist (sum rows))
+(set rows (+ (* x 0) 42))
+(at (select {from: X s: (sum (+ (* x 0) 42))}) 's) -- (enlist (sum rows))
+(set rows (+ (* (+ x 1) 2) 2))
+(at (select {from: X s: (sum (+ (* (+ x 1) 2) 2))}) 's) -- (enlist (sum rows))
+
+;; Lone AVG must sum signed wrapped rows at full width and drop every generated MIN.
+(set v (+ (til 600003) 1700000000000000000))
+(set T (table [v] (list v)))
+(set rows (+ v 7))
+(at (select {from: T a: (avg (+ v 7))}) 'a) -- (enlist (avg rows))
+(set v (take [9223372036854775807 9223372036854775806 10 9223372036854775806 -50000] 600003))
+(set T (table [v] (list v)))
+(set rows (+ v 2))
+(at (select {from: T a: (avg (+ v 2))}) 'a) -- (enlist (avg rows))
+(set v (take [-9223372036854775807 -9223372036854775806 7 -11] 600003))
+(set T (table [v] (list v)))
+(set rows (+ v -2))
+(at (select {from: T a: (avg (+ v -2))}) 'a) -- (enlist (avg rows))
+(set v (take (enlist 9223372036854775807) 600003))
+(set T (table [v] (list v)))
+(set rows (+ v 1))
+(nil? (avg rows)) -- true
+(nil? (first (at (select {from: T a: (avg (+ v 1))}) 'a))) -- true

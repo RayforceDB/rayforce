@@ -16,11 +16,11 @@ Three properties hold for every kind of index documented on this page:
 
 ### 1. Per-column accelerators — `.idx.zone` / `.idx.hash` / `.idx.sort` / `.idx.bloom`
 
-Attach one of four kinds to a numeric vector. Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot — one kind at a time today.
+Attach one of four kinds to a numeric vector (`.idx.hash` also to a symbol, string or guid vector). Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot — one kind at a time today.
 
 **Today's status:** all four are *built, inspectable via `(.idx.info)`, and consulted by the executor at six routing sites* — filter comparisons, filter IN, ORDER BY (single ascending key), distinct, and find.  The routing is transparent: a query against an indexed column uses the fast path; the same query without the index falls back to the linear scan and returns identical results.
 
-**Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric/boolean columns (`RAY_BOOL` through `RAY_TIMESTAMP`) are supported by all kinds; `.idx.hash` additionally accepts `RAY_SYM`. `RAY_STR` (and `RAY_SYM` for the non-hash kinds) are deferred.
+**Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric/boolean columns (`RAY_BOOL` through `RAY_TIMESTAMP`) are supported by all kinds; `.idx.hash` additionally accepts `RAY_SYM`, `RAY_STR` and `RAY_GUID`. `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the non-hash kinds are deferred.
 
 **See:** [Accelerator Indexes (reference)](indexes.md) · [Indexes Guide: choosing a kind](../guides/indexes.md#choose).
 
@@ -65,7 +65,7 @@ Match the shape of your query to the structure that fits it.
 | Want to… | Structure | Active today? |
 |---|---|---|
 | Skip whole columns where a predicate constant lies outside the value range | `.idx.zone` — min/max plus null count | Yes — O(1) all/none short-circuit at the filter site (int + float) |
-| Make repeated `=` / `in` / `find` over a numeric column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites |
+| Make repeated `=` / `in` / `find` over a numeric, symbol or string column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites (a guid column: find and `in` needles only) |
 | Binary-search a numeric column for range predicates or reuse the permutation for ORDER BY / distinct | `.idx.sort` — ascending row-id permutation | Yes — filter range (EQ/LT/LE/GT/GE), single-key ASC ORDER BY, distinct |
 | Cheaply reject "definitely not in this set" probes for integer EQ filters | `.idx.bloom` — m-bit probabilistic filter | Yes — definite-absent proof at the filter EQ site (integer-family only) |
 | Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(hnsw-build)` + `(ann)` | Yes — `(ann)` consults the index |
