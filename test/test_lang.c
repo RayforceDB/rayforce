@@ -5670,6 +5670,35 @@ static test_result_t test_eval_part_skip_count_select(void) {
     return part_skip_run("count", cases, sizeof cases / sizeof cases[0]);
 }
 
+/* A date literal against a timestamp column or key skips what the
+ * timestamp of the start of its day skips (#1501): either side, bound to a
+ * name, on a partition edge; a null date narrows nothing, a date past the
+ * timestamp range saturates as the filter's does. */
+static test_result_t test_eval_part_skip_date_literal(void) {
+    ray_t* w = ray_eval_str("(set D 2026.01.07)");
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    static const part_skip_t cases[] = {
+        { "(select {from: %s where: (>= ts 2026.01.06)})", false, 1 },
+        { "(select {from: %s where: (< ts 2026.01.06)})", false, 2 },
+        { "(select {from: %s where: (== ts 2026.01.07)})", false, 4 },
+        { "(select {from: %s where: (> 2026.01.07 ts)})", false, 2 },
+        { "(select {from: %s where: (>= ts D)})", false, 2 },
+        { "(select {from: %s where: (>= ts 0Nd)})", false, 0 },
+        { "(select {from: %s where: (< ts 2300.01.01)})", false, 0 },
+        { "(select {from: %s where: (> ts 2300.01.01)})", false, 4 },
+        { "(select {from: %s where: (and (>= ts 2026.01.06) (< v 6))})", false, 3 },
+        { "(select {from: %s where: (>= part 2026.01.07)})", true, 2 },
+        { "(select {from: %s where: (== part 2026.01.07)})", true, 3 },
+        { "(select {from: %s where: (<= part 2026.01.06)})", true, 2 },
+        { "(select {from: %s where: (> 2026.01.06 part)})", true, 3 },
+        { "(select {from: %s where: (>= ts 2026.01.07)})", true, 2 },
+        { "(select {c: (count v) from: %s where: (>= ts 2026.01.06)})", false, 1 },
+    };
+    return part_skip_run("date_lit", cases, sizeof cases / sizeof cases[0]);
+}
+
 /* ---- Test: an if answers the same with and without pool workers -------- */
 
 /* With no workers the selected arm of OP_IF (compact each branch's rows,
@@ -14255,6 +14284,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/part_skip_keyless", test_eval_part_skip_keyless, lang_setup, lang_teardown },
     { "lang/eval/part_skip_count_select", test_eval_part_skip_count_select, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_date_literal", test_eval_part_skip_date_literal, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },
