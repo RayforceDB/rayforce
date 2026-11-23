@@ -8673,6 +8673,43 @@ static test_result_t test_eval_alter_dict_extract_oom(void) {
  * the constructor's oom error is a block of its own; failed with the
  * error's allocation too, it is the static RAY_OOM_OBJ.  Either way the
  * handler gets null and nothing is left allocated. */
+/* (select {from: T by: <STR column>}) with each of its allocations failed in turn (#1383).
+ * The gather of the group's first rows and the three scratch blocks of
+ * ray_group_indices_fn each trusted an allocation that can fail: a NULL block, or an
+ * error object, went on to be read.  Every failure must be a clean error or the 500-row
+ * table, never a crash. */
+static test_result_t test_select_by_str_alloc_sweep(void) {
+#ifndef DEBUG
+    SKIP("allocation injection requires DEBUG");
+#else
+    ray_t* r = ray_eval_str("(set _TT (table [k a f s cst] (list (% (til 3000) 7) (til 3000) (as 'F64 (til 3000)) (as 'SYM (% (til 3000) 11)) (map (fn [i] (format \"key-%-long-enough-to-leave-inline\" (% i 500))) (til 3000)))))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* op = ray_parse("(select {from: _TT by: cst})");
+    TEST_ASSERT_TRUE(op && !RAY_IS_ERR(op));
+    ray_mem_trace_t tr;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    r = ray_eval(op);
+    ray_mem_trace_end(&tr);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(ray_table_nrows(r), 500);
+    ray_release(r);
+    int64_t failed = 0;
+    for (int64_t nth = 1; nth <= (int64_t)tr.alloc_count + 4; nth++) {
+        ray_alloc_fail_set_for_test(nth, 1);
+        r = ray_eval(op);
+        ray_alloc_fail_set_for_test(0, 0);
+        bool err = r && RAY_IS_ERR(r);
+        if (err) { failed++; ray_error_free(r); }
+        else { TEST_ASSERT_TRUE(r && r->type == RAY_TABLE); TEST_ASSERT_EQ_I(ray_table_nrows(r), 500); ray_release(r); }
+        ray_error_clear();
+    }
+    fprintf(stderr, "sweep: %lld allocations, %lld failed cleanly\n", (long long)tr.alloc_count, (long long)failed);
+    ray_release(op);
+    PASS();
+#endif
+}
+
 static test_result_t test_eval_try_error_value_oom(void) {
     static const char* msgs[] = { "", "abc", "1234567", "cannot add i64 and sym" };
     for (size_t i = 0; i < sizeof(msgs) / sizeof(msgs[0]); i++) {
@@ -14044,6 +14081,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/get_error_trace", test_eval_get_error_trace, lang_setup, lang_teardown },
     { "lang/eval/try_raise_value", test_eval_try_raise_value, lang_setup, lang_teardown },
     { "lang/eval/alter_dict_extract_oom", test_eval_alter_dict_extract_oom, lang_setup, lang_teardown },
+    { "lang/eval/select_by_str_alloc_sweep", test_select_by_str_alloc_sweep, lang_setup, lang_teardown },
     { "lang/eval/try_error_value_oom", test_eval_try_error_value_oom, lang_setup, lang_teardown },
     { "lang/eval/try_value_handler_builds_nothing", test_eval_try_value_handler_builds_nothing, lang_setup, lang_teardown },
     { "lang/eval/try_catch_releases", test_eval_try_catch_releases, lang_setup, lang_teardown },

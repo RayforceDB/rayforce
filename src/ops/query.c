@@ -24558,6 +24558,7 @@ by_dict_done:
                      * the columns with it (a segfault when memory ran out mid-query). */
                     int a = 0; ray_t* i0 = collection_elem(il, 0, &a);
                     if (!i0 || RAY_IS_ERR(i0)) {
+                        if (i0) ray_error_free(i0);   /* errors are not refcounted: release would leave it */
                         if (fi_hdr) ray_free(fi_hdr);
                         ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
@@ -24615,6 +24616,7 @@ by_dict_done:
                             for (int64_t gi = 0; gi < n_groups; gi++) {
                                 int a = 0; ray_t* v = collection_elem(sc, fi[gi], &a);
                                 if (!v || RAY_IS_ERR(v)) {          /* no memory for the cell's atom */
+                                    if (v) ray_error_free(v);
                                     ray_release(dst); dst = NULL;
                                     break;
                                 }

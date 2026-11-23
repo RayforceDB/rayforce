@@ -3344,13 +3344,15 @@ ray_t* ray_group_indices_fn(ray_t* x) {
      * starting at 1024 keeps the initial allocation cheap. */
     int64_t max_groups = n < 1024 ? n : 1024;
     ray_t* val_block = ray_alloc((size_t)(max_groups * sizeof(int64_t)));
-    if (RAY_IS_ERR(val_block)) return val_block;
+    /* ray_alloc answers NULL when the heap is exhausted, an error object when it
+     * refuses the size: both stop here (a NULL went on to ray_data) */
+    if (!val_block || RAY_IS_ERR(val_block)) return val_block ? val_block : ray_error("oom", NULL);
     int64_t* gvals = (int64_t*)ray_data(val_block);
 
     /* For each group, store indices in a separate i64 vector */
     ray_t** idx_vecs = NULL;
     ray_t* ivblock = ray_alloc((size_t)(max_groups * sizeof(ray_t*)));
-    if (RAY_IS_ERR(ivblock)) { ray_free(val_block); return ivblock; }
+    if (!ivblock || RAY_IS_ERR(ivblock)) { ray_free(val_block); return ivblock ? ivblock : ray_error("oom", NULL); }
     idx_vecs = (ray_t**)ray_data(ivblock);
     int64_t ngroups = 0;
 
@@ -3361,7 +3363,7 @@ ray_t* ray_group_indices_fn(ray_t* x) {
     if (x->type == RAY_LIST) {
         ray_t** elems = (ray_t**)ray_data(x);
         ray_t* kblock = ray_alloc((size_t)(max_groups * sizeof(ray_t*)));
-        if (RAY_IS_ERR(kblock)) { ray_free(val_block); ray_free(ivblock); return kblock; }
+        if (!kblock || RAY_IS_ERR(kblock)) { ray_free(val_block); ray_free(ivblock); return kblock ? kblock : ray_error("oom", NULL); }
         ray_t** gkeys = (ray_t**)ray_data(kblock);
 
         group_ht_t ht;
