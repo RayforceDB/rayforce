@@ -1450,6 +1450,21 @@ static test_result_t test_dense_wide_after_worker_budget(void) {
     PASS();
 }
 
+/* #1461: the same, after a wider pool whose workers each mapped pools of
+ * their own.  Those workers' heaps go idle when the pool is rebuilt, and
+ * their empty pools must leave the anonymous watermark's count with them, or
+ * the room this test measures from would carry what ran before it. */
+static test_result_t test_dense_wide_after_wide_pool(void) {
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total(28), RAY_OK);
+    ray_t* r = ray_eval_str("(set wwp_t (table [k v] (list (% (* (til 16000000) 7919) 12000017) (til 16000000))))"
+                            "(count (select {c: (count v) s: (sum v) from: wwp_t by: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(set wwp_t 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    return test_dense_wide_after_worker_budget();
+}
+
 /* The same ordering under a where filter: the plan within the row count whose
  * per-worker slabs do not fit is promoted to the one shared slab, which
  * counts the selected rows only. */
@@ -6468,6 +6483,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/dense_task_local", test_dense_task_local, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_range", test_dense_wide_range, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_after_worker_budget", test_dense_wide_after_worker_budget, contract_setup, contract_teardown },
+    { "agg_contract/dense_wide_after_wide_pool", test_dense_wide_after_wide_pool, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_budget", test_dense_wide_budget, contract_setup, contract_teardown },
     { "agg_contract/dense_wide_budget_sel", test_dense_wide_budget_sel, contract_setup, contract_teardown },
     { "agg_contract/dense_cache_bound", test_dense_cache_bound, contract_setup, contract_teardown },

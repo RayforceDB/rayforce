@@ -798,7 +798,8 @@ static bool heap_unpark(ray_heap_t* h, bool spill, bool relock);
 static void heap_unpark_all(ray_heap_t* h);
 static bool heap_make_room(size_t bytes);
 static int64_t heap_decay_threshold_ms(void);
-static void heap_abandon_spill(ray_heap_t* h);
+static void heap_abandon_pools(ray_heap_t* h);
+static int64_t heap_release_free_pages(ray_heap_t* h);
 
 /* --------------------------------------------------------------------------
  * Freelist operations (circular sentinel via fl_prev/fl_next)
@@ -2943,10 +2944,10 @@ void ray_heap_sys_unmap(void* p, size_t size, bool spilled, bool locked) {
 void ray_heap_init(void) {
     if (ray_tl_heap) return;
 
-    /* Adopt an abandoned heap before mapping a new one.  Its pools are
-     * already faulted in and its slab caches are warm, and — the reason this
-     * exists at all — a heap that is never destroyed can be looked up on the
-     * lock-free cross-thread free path without racing a munmap. */
+    /* Adopt an abandoned heap before mapping a new one: a heap that is never
+     * destroyed can be looked up on the lock-free cross-thread free path
+     * without racing a munmap.  It comes with only the pools that still hold
+     * a live block (heap_abandon_pools). */
     ray_registry_lock();
     ray_heap_t* reuse = g_heap_idle;
     if (reuse) g_heap_idle = reuse->idle_next;
@@ -3046,7 +3047,7 @@ void ray_heap_abandon(void) {
      * handed on with its memory on its freelists rather than on a list the
      * adopter has to notice. */
     heap_drain_foreign(h);
-    heap_abandon_spill(h);
+    heap_abandon_pools(h);
 
     ray_registry_lock();
     h->idle_next = g_heap_idle;
@@ -3181,6 +3182,10 @@ static void dfd_validate_freelists(void) {
 #define RAY_RECLAIM_OVERSIZED  1u
 #define RAY_RECLAIM_SPILL      2u
 #define RAY_RECLAIM_ANON       4u
+/* With the above: the heap's last pool too, which a heap otherwise keeps —
+ * for a heap its thread is leaving (heap_abandon_pools), which may stay
+ * idle for the rest of the process. */
+#define RAY_RECLAIM_LAST       8u
 
 static bool heap_reclaim_admits(const ray_pool_entry_t* pe, unsigned mode) {
     return ((mode & RAY_RECLAIM_OVERSIZED) && pe->pool_order > RAY_HEAP_POOL_ORDER)
@@ -3204,7 +3209,7 @@ static bool heap_reclaim_admits(const ray_pool_entry_t* pe, unsigned mode) {
  * on no list. */
 static uint32_t heap_empty_pool_candidates(ray_heap_t* h, unsigned mode,
                                            uint32_t* out) {
-    if (h->pool_count <= 1) return 0;
+    if (h->pool_count <= ((mode & RAY_RECLAIM_LAST) ? 0u : 1u)) return 0;
     if (!(h->avail & (UINT64_MAX << (RAY_HEAP_POOL_ORDER - 1)))) return 0;
     uint32_t n = 0;
     for (uint32_t p = 0; p < h->pool_count; p++) {
@@ -3328,8 +3333,9 @@ static int64_t heap_pool_unmap(ray_heap_t* h, uint32_t p) {
 }
 
 /* Unmap the pools of h that `mode` admits and whose bytes are all free,
- * parked ones included, keeping h's last pool; returns the anonymous bytes
- * unmapped.  Same conditions as heap_find_empty_pools. */
+ * parked ones included, keeping h's last pool unless `mode` has
+ * RAY_RECLAIM_LAST; returns the anonymous bytes unmapped.  Same conditions
+ * as heap_find_empty_pools. */
 static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
     uint8_t empty[RAY_MAX_POOLS];
     memset(empty, 0, h->pool_count);
@@ -3346,7 +3352,7 @@ static int64_t heap_reclaim_empty_pools(ray_heap_t* h, unsigned mode) {
     int64_t anon = 0;
     for (uint32_t p = h->pool_count; p-- > 0; ) {
         if (!empty[p]) continue;
-        if (h->pool_count <= 1) break;   /* a heap keeps its last pool */
+        if (h->pool_count <= 1 && !(mode & RAY_RECLAIM_LAST)) break;   /* a heap keeps its last pool */
         if (!h->pools[p].parked) heap_pool_unlist(h, p);
         anon += heap_pool_unmap(h, p);
     }
@@ -3430,16 +3436,19 @@ static void heap_relock_pools(ray_heap_t* h) {
     }
 }
 
-/* An abandoned heap is visited by no boundary (heap_each_quiescent), so its
- * empty spill pools would never age (heap_spill_pools_age): they go as its
- * thread leaves it, which still owns it then. */
-static void heap_abandon_spill(ray_heap_t* h) {
-    for (uint32_t p = 0; p < h->pool_count; p++)
-        if (h->pools[p].backed) {
-            heap_flush_slabs(h);
-            (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_SPILL);
-            return;
-        }
+/* An abandoned heap is visited by no boundary (heap_each_quiescent) — not
+ * by the idle decay, a relief or (.sys.gc 1) — until a thread adopts it, so
+ * what it holds as its thread leaves it, which still owns it then, it holds
+ * for as long as the pool runs smaller: its empty spill pools would never age
+ * (heap_spill_pools_age), and its empty anonymous pools, the last one
+ * included, would stay committed and count against the anonymous watermark,
+ * every planner's room (#1461).  Unmap every empty pool, and give back the
+ * pages of the free blocks of the pools still holding a live block.  The
+ * adopter maps a pool as it allocates, as a fresh heap does. */
+static void heap_abandon_pools(ray_heap_t* h) {
+    heap_flush_slabs(h);
+    (void)heap_reclaim_empty_pools(h, RAY_RECLAIM_ANON | RAY_RECLAIM_SPILL | RAY_RECLAIM_LAST);
+    (void)heap_release_free_pages(h);
 }
 
 /* The heaps a maintenance point may work on from this thread: its own, and
