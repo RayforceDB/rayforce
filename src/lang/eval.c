@@ -1763,7 +1763,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
                     if (dl_scalar) {
                         if (dl->type == -RAY_F64)
                             lop = ray_const_f64(g, dl->f64);
-                        else if (dl->type == -RAY_F32)
+                        /* The exact-width scalar-left kernel checks the literal's
+                         * runtime tag, not just the DAG node's out_type. */
+                        else if (dl->type == -RAY_F32 ||
+                                 ((dop == OP_ADD || dop == OP_SUB || dop == OP_MUL) &&
+                                  (lt == RAY_I16 || lt == RAY_I32) && lt == rt))
                             lop = ray_const_atom(g, dl);
                         else {
                             int64_t sv = as_i64(dl);

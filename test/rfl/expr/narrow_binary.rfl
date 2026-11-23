@@ -291,3 +291,8 @@
 (nil? (at (select {from: NW z: (+ (* h k) 1h)}) 'z)) -- [true false]
 (at (select {from: NW z: (+ (- -2147483647i i) 1i)}) 'z) -- [0Ni 2147483647i]
 (nil? (at (select {from: NW z: (+ i j)}) 'z)) -- [true false]
+
+;; Scalar-left keeps operand order, vector nulls, and wrap-to-null.
+(- 5i [8i 0Ni -2147483643i]) -- [-3i 0Ni 0Ni]
+(- 5h [8h 0Nh -32763h]) -- [-3h 0Nh 0Nh]
+(- 0Ni [1i 8i]) -- [0Ni 0Ni]

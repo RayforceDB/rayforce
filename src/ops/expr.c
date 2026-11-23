@@ -5177,6 +5177,10 @@ __attribute__((noinline)) static void br_u8_scalar(const uint8_t* restrict d, ui
     }
 }
 
+#ifdef DEBUG
+_Atomic(uint64_t) ray_narrow_left_ranges;
+#endif
+
 static void binary_range(ray_op_t* op, int8_t out_type,
                          ray_t* lhs, ray_t* rhs, ray_t* result, void* rdata,
                          bool l_scalar, bool r_scalar,
@@ -5566,9 +5570,9 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #define BR_NARROW_OPS(T, TYPE, NIL, L, R) do {                              \
         T* odst = (T*)dst;                                                  \
         switch (op->opcode) {                                               \
-        case OP_ADD: BR_WRAP(T, TYPE, NIL, L, +, R); goto done;             \
-        case OP_SUB: BR_WRAP(T, TYPE, NIL, L, -, R); goto done;             \
-        case OP_MUL: BR_WRAP(T, TYPE, NIL, L, *, R); goto done;             \
+        case OP_ADD: BR_WRAP(T, TYPE, NIL, L, +, R); goto narrow_done;      \
+        case OP_SUB: BR_WRAP(T, TYPE, NIL, L, -, R); goto narrow_done;      \
+        case OP_MUL: BR_WRAP(T, TYPE, NIL, L, *, R); goto narrow_done;      \
         }                                                                   \
     } while (0)
     if (!r_scalar && rhs->type == out_type &&
@@ -5894,6 +5898,11 @@ static void binary_range(ray_op_t* op, int8_t out_type,
 #undef BR_WRAP
 #undef LV_INT
 #undef RV_INT
+    goto done;
+narrow_done:
+#ifdef DEBUG
+    if (l_scalar) atomic_fetch_add_explicit(&ray_narrow_left_ranges, 1, memory_order_relaxed);
+#endif
 done:
     if (lsym_buf) ray_free_raw(lsym_buf);
     if (rsym_buf) ray_free_raw(rsym_buf);

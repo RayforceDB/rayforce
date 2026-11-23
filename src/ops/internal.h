@@ -1112,6 +1112,9 @@ typedef enum {
     NARROW_SUM__N
 } narrow_sum_route_t;
 extern _Atomic(uint64_t) ray_narrow_sum_routes[NARROW_SUM__N];
+#ifdef DEBUG
+extern _Atomic(uint64_t) ray_narrow_left_ranges;
+#endif
 extern bool     ray_expr_disable;
 extern bool     ray_opt_no_group_pushdown;
 extern bool     ray_join_no_build_swap;
