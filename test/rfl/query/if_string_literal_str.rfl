@@ -1,0 +1,52 @@
+;; @also-unfused
+;; Inside a select an `if` whose arms are string literals is a STR column, as
+;; a string literal standing alone is (#1495).  It was SYM, so the two could
+;; not be compared ("incomparable operand types, got str and sym").  A real
+;; symbol arm (a SYM column or a `'b` literal) keeps the column SYM.
+
+(set T (table [n k s y] (list [1 2 3 4] [a a b b] (list "p" "q" "r" "s") [x y z w])))
+(set Bk (fn [q] (at (xasc q 'k) 'r)))
+
+;; ── the issue ──
+(set R (select {from: T x: "a" y: (if (> n 2) "a" "b")}))
+(type (at R 'x)) -- 'STR
+(type (at R 'y)) -- 'STR
+(count (select {from: R where: (== x y)})) -- 2
+
+;; ── every route ──
+(at (select {from: T r: (if (> n 2) "a" "b")}) 'r) -- ["b" "b" "a" "a"]
+(at (select {from: T r: (if (> n 2) "a" "b") where: (> n 1)}) 'r) -- ["b" "a" "a"]
+(at (select {from: T where: (== (if (> n 2) "a" "b") "a")}) 'n) -- [3 4]
+(Bk (select {from: T r: (first (if (> n 2) "a" "b")) by: k})) -- ["b" "a"]
+(Bk (select {from: T r: (if (> n 2) "a" "b") by: k})) -- (list ["b" "b"] ["a" "a"])
+(at (xasc (select {from: T c: (count n) by: (if (> n 2) "a" "b")}) 'key) 'key) -- ["a" "b"]
+(at (update {from: T r: (if (> n 2) "a" "b")}) 'r) -- ["b" "b" "a" "a"]
+(at (update {from: T r: (if (> n 2) "a" "b") where: (> n 1)}) 'r) -- ["" "b" "a" "a"]
+(at (update {from: T r: (if (> n 2) "a" "b") by: k}) 'r) -- ["b" "b" "a" "a"]
+;; a chain, a nested if and a null literal arm
+(at (select {from: T r: (if (> n 3) "a" (> n 1) "b" "c")}) 'r) -- ["c" "b" "b" "a"]
+(at (select {from: T r: (if (> n 3) "a" (if (> n 1) "b" "c"))}) 'r) -- ["c" "b" "b" "a"]
+(type (at (select {from: T r: (if (> n 2) "a" 0N)}) 'r)) -- 'STR
+;; a literal beside a STR column is STR, beside a symbol arm SYM
+(at (select {from: T r: (if (> n 2) s "b")}) 'r) -- ["b" "b" "r" "s"]
+(at (select {from: T r: (if (> n 2) y "b")}) 'r) -- [b b z w]
+(at (select {from: T r: (if (> n 2) "a" 'b)}) 'r) -- [b b a a]
+(at (select {from: T r: (if (> n 2) 'a 'b)}) 'r) -- [b b a a]
+
+;; ── cond is its if chain: string literals give STR there too ──
+(type (at (select {from: T r: (cond ((> n 3) "a") ((> n 1) "b") (else "c"))}) 'r)) -- 'STR
+(type (at (update {from: T r: (cond ((> n 3) "a") (else "c")) by: k}) 'r)) -- 'STR
+(type (at (select {from: T r: (cond ((> n 3) 'a) (else "c"))}) 'r)) -- 'SYM
+
+;; ── the column is a string column, so it does not mix with symbols ──
+(set U (select {from: T y: y r: (if (> n 2) "a" "b") q: (if (> n 2) 'a 'b)}))
+(select {from: U where: (== r 'a)}) !- type
+(select {from: U where: (== r y)}) !- type
+(left-join [r] U (table [r v] (list [a b] [1 2]))) !- type
+(type (concat (at U 'r) ['z])) -- 'LIST
+(count (select {from: U where: (== q 'a)})) -- 2
+;; `in` against a symbol set converts nothing and matches no row, as for any
+;; string column; strings, or a cast, find the rows
+(count (select {from: U where: (in r ['a])})) -- 0
+(count (select {from: U where: (in r ["a"])})) -- 2
+(count (select {from: U where: (in (as 'SYM r) ['a])})) -- 2

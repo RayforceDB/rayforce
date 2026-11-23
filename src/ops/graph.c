@@ -743,6 +743,16 @@ static bool if_const_null_atom(ray_graph_t* g, uint32_t id) {
            RAY_ATOM_IS_NULL(bx->literal);
 }
 
+/* Is node `id` a string literal (`"a"`)?  ray_const_str types it SYM, the
+ * type it compares as beside a symbol column; standing as a column alone it
+ * is STR. */
+static bool if_const_str_atom(ray_graph_t* g, uint32_t id) {
+    ray_op_t* b = &g->nodes[id];
+    if (b->opcode != OP_CONST) return false;
+    ray_op_ext_t* bx = find_ext(g, id);
+    return bx && bx->literal && bx->literal->type == -RAY_STR;
+}
+
 ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* else_val) {
     /* 3-input node: cond, then, else — needs ext node */
     uint32_t cond_id = cond->id;
@@ -781,6 +791,15 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     if (out_type != RAY_STR &&
         (then_val->out_type == RAY_SYM || else_val->out_type == RAY_SYM))
         out_type = RAY_SYM;
+    /* A string literal arm is not a symbol (#1495): `(if c "a" "b")` is a
+     * STR column, as `"a"` alone is in a select, so the two compare.  Only
+     * a real symbol arm (a SYM column, a `'b` literal, an expression typed
+     * SYM) keeps the result SYM. */
+    if (out_type == RAY_SYM) {
+        bool t_sym = then_val->out_type == RAY_SYM && !if_const_str_atom(g, then_id);
+        bool e_sym = else_val->out_type == RAY_SYM && !if_const_str_atom(g, else_id);
+        if (!t_sym && !e_sym) out_type = RAY_STR;
+    }
     uint32_t est = cond->est_rows;
 
     /* A null literal such as `0N` or `0Nf` beside a text branch is the text
