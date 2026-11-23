@@ -222,6 +222,44 @@ Every connection queues outbound bytes the socket cannot take immediately (async
 
 The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of `0` means unlimited. Changing the default applies to every connection without an override, including ones already open. `.mc.stats` reports the default as `tx_limit_bytes` / `tx_limit_frames` and the largest backlog any connection has held as `tx_hwm_bytes`. `.ipc.txlimit` is restricted: it decides when a peer is dropped.
 
+## Multicast topics { #multicast }
+
+A server can fan one stream of updates out to many connected clients with the `.mc.*` builtins: clients subscribe to a named topic, and the server publishes to it.
+
+| Function | Arity | Flags | Description |
+|---|---|---|---|
+| `.mc.sub` | variadic (1-2) | — | `(.mc.sub topic)` or `(.mc.sub topic filter)`: subscribe the calling connection. `topic` is a symbol or a string. `filter` must be null; a non-null filter raises `nyi`. Returns the sequence number the next publication on the topic will carry. Subscribing again from the same connection keeps one subscription. |
+| `.mc.unsub` | unary | — | `(.mc.unsub topic)`: remove the calling connection's subscription. Null; an unknown topic is not an error. |
+| `.mc.pub` | binary | restricted | `(.mc.pub topic payload)`: send `payload` to every subscriber. Returns the publication's sequence number, or `0` when the topic has no subscribers (nothing is sent and the sequence does not advance). |
+| `.mc.stats` | variadic (0) | — | Counters for the process, as a dict. |
+
+`.mc.sub` and `.mc.unsub` act on the connection that sent the request, so they are called over IPC, from the client's side of an `.ipc.send`; called outside a connection they raise `domain`.
+
+A subscriber receives each publication as an asynchronous call of a function it defines, named `upd`: `(upd topic seq payload)`, where `topic` is a string, `seq` an `i64` and `payload` the published value. Sequence numbers start at `1` for each topic and rise by one for every publication that had at least one subscriber, so a subscriber detects a gap by comparing `seq` with the previous value plus one.
+
+```lisp
+;; publisher process (port 5000)
+(.mc.pub "depth" (table [px] (list [10 11])))   ;; => 0 while nobody subscribes
+
+;; subscriber process
+(set upd (fn [topic seq batch] (println topic seq (count batch))))
+(set h (.ipc.open "localhost:5000"))
+(.ipc.send h (list '.mc.sub "depth" null))      ;; => 1, the next sequence number
+;; each later .mc.pub on the publisher now calls upd here
+```
+
+A publication is serialized once for each distinct compression policy among the subscribers, not once per subscriber. Each connection queues what its socket cannot take immediately, bounded by [`.ipc.txlimit`](#ipctxlimit): a subscriber whose backlog would exceed the limit is removed from the topic and its connection is closed, so a lagging consumer finds out instead of silently missing updates. `.mc.stats` reports:
+
+| Key | Meaning |
+|---|---|
+| `topics`, `subscriptions` | Topics with at least one subscriber, and subscriptions across all of them. |
+| `published` | Publications that had at least one subscriber. |
+| `delivered` | Frames successfully queued to a subscriber. |
+| `dropped` | Subscribers removed because a send failed or the backlog limit was exceeded. |
+| `framed` | Wire frames built: one per distinct compression policy per publication. |
+| `tx_limit_bytes`, `tx_limit_frames` | The backlog policy in force. |
+| `tx_hwm_bytes` | The largest backlog any connection has held. |
+
 ## Connection Hooks
 
 The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `(.ipc.auto_journal_eval)` answers `true` while the current evaluation runs inside an auto-journaled request (a sync one, or an async one while the [posts switch](../namespaces/log.md#log-posts) is on), where the request is already the journal entry and handlers must not `.log.write` frames of their own. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
