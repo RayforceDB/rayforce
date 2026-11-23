@@ -64,6 +64,8 @@ Pivot a table to wide format.
 (pivot trades 'Symbol 'Side 'Price med)
 ```
 
+Each cell's value is what the aggregate gives over that cell's rows as a plain vector. So `first` and `last` take the cell's first and last row by position, a null included, for every type, as a direct `(first v)` does. This differs from `select … by:`, which skips nulls.
+
 ### Column names
 
 Every aggregation names and orders the value columns by the same rule, whether `pivot` runs as one `OP_PIVOT` node (`sum`, `avg`, `count`, `min`, `max`, `first`, `last`) or calls the function per cell (`med`, a lambda):

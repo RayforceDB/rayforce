@@ -26,6 +26,17 @@
 (at (select {s: (first (at GI i)) from: T by: k asc: k}) 's) -- [20 30]
 (at (select {s: (last (at GI (- 2 i))) from: T by: k asc: k}) 's) -- [20 0Nl]
 
+;; a first / last nested in a by: output skips them as at its head
+(set N (table [k v f i] (list [a a b b] [0Nl 3 0Nl 5] [0Nf 2.5 0Nf 1.5] [0 1 2 3])))
+(at (select {a: (if (> (count v) 1) (first v) 0) from: N by: k}) 'a) -- [3 5]
+(at (select {a: (if (> (count f) 1) (first f) 0.0) from: N by: k}) 'a) -- [2.5 1.5]
+(at (select {a: (do (first v)) from: N by: k}) 'a) -- [3 5]
+(at (select {a: (if (> (count v) 1) (first (+ v 1)) 0) from: N by: k}) 'a) -- [4 6]
+(at (select {a: (if (> (sum i) 1) (first v) 0) from: N by: k}) 'a) -- [0 5]
+(at (select {a: (if true (last v) 0) from: (table [k v] (list [a a b b] [3 0Nl 5 0Nl])) by: k}) 'a) -- [3 5]
+;; an argument that reads no column stays positional
+(at (select {a: (first (take [0Nl 1] 2)) from: N by: k}) 'a) -- [0Nl 0Nl]
+
 ;; A stored column answers as the vector does: positional outside a query.
 (.sys.exec "rm -rf /tmp/rfl_first_last_positional") -- 0
 (set S (table [v] (list (concat [0Nl] (til 140000)))))
