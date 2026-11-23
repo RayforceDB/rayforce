@@ -5601,6 +5601,22 @@ static test_result_t part_skip_case(const char* q, const char* p, const char* f,
     PASS();
 }
 
+typedef struct { const char* q; bool ts_key; uint64_t pruned; } part_skip_t;
+
+static test_result_t part_skip_run(const char* tag, const part_skip_t* cases, size_t n_cases) {
+    char root[512];
+    int n = snprintf(root, sizeof(root), "/tmp/rayforce_lang_part_skip_%s_%ld", tag, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t r = part_skip_fixture(root);
+    for (size_t i = 0; r.status == TEST_PASS && i < n_cases; i++)
+        r = part_skip_case(cases[i].q, cases[i].ts_key ? "pt" : "pd", cases[i].ts_key ? "ft" : "fd",
+                           cases[i].pruned);
+    lang_parted_insert_rm_rf(root);
+    return r;
+}
+
 /* A parted table whose key column is dropped (xcols) skips by its other
  * columns' statistics what the table with its key skips (#1498); a
  * renamed key (xcol) is the control.  The flat references drop the same
@@ -5634,6 +5650,24 @@ static test_result_t test_eval_part_skip_keyless(void) {
         r = part_skip_case(cases[i].q, cases[i].p, cases[i].f, cases[i].pruned);
     lang_parted_insert_rm_rf(root);
     return r;
+}
+
+/* count written around a select skips what the select skips (#1503), on
+ * the count's own shortcut and on a where it hands back to the select. */
+static test_result_t test_eval_part_skip_count_select(void) {
+    static const part_skip_t cases[] = {
+        { "(count (select {from: %s where: (>= ts 2026.01.06D00:00:00.000)}))", false, 1 },
+        { "(count (select {from: %s where: (< ts 2026.01.05D01:30:00.000)}))", false, 2 },
+        { "(count (select {from: %s where: (== ts 2026.01.06D03:00:00.000)}))", false, 3 },
+        { "(count (select {from: %s where: (> ts 2027.01.01D00:00:00.000)}))", false, 4 },
+        { "(count (select {from: %s where: (== date 2026.01.07)}))", false, 3 },
+        { "(count (select {from: %s where: (and (>= ts 2026.01.06D00:00:00.000) (> v 6))}))", false, 3 },
+        { "(count (select {from: %s where: (and (>= ts 2026.01.06D00:00:00.000) (> (* v 2) 7))}))", false, 1 },
+        { "(count (select {from: %s where: (> v 0)}))", false, 0 },
+        { "(count (select {from: %s where: (>= part 2026.01.07D00:00:00.000)}))", true, 2 },
+        { "(count (select {from: %s where: (>= ts 2026.01.08D03:00:00.000)}))", true, 3 },
+    };
+    return part_skip_run("count", cases, sizeof cases / sizeof cases[0]);
 }
 
 /* ---- Test: an if answers the same with and without pool workers -------- */
@@ -14220,6 +14254,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_parted_stats", test_eval_select_parted_stats, lang_setup, lang_teardown },
     { "lang/eval/select_parted_stats_absent", test_eval_select_parted_stats_absent, lang_setup, lang_teardown },
     { "lang/eval/part_skip_keyless", test_eval_part_skip_keyless, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_count_select", test_eval_part_skip_count_select, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

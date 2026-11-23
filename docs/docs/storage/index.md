@@ -270,6 +270,8 @@ A predicate on a parted integer or temporal data column prunes as well, by the p
 
 A parted table whose partition-key column was dropped, as `(xcols P (drop (cols P) 1))` does, still narrows by its data columns' statistics, as the table with its key does.
 
+`count` written directly around a select over a parted table, `(count (select {from: P where: ...}))`, reads the same partitions as that select alone.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.
