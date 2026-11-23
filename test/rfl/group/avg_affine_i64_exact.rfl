@@ -1,0 +1,37 @@
+;; avg of an I64 column plus a constant divides the exact total of the rows
+;; (#1441).  The affine route sums the column and folds the constant in at
+;; emit; adding it to the divided mean in floating point cancelled when the
+;; mean and the constant are both near 2^62.  Rows alternate 2^62+1 and
+;; -2^62+3 (w + 2^62), so each pair totals 4 and every whole-pair mean is 2.
+(set n 100000)
+(set d (til n))
+(set w (+ (* (% d 2) -9223372036854775806) 1))
+(set k (% (div d 2) 3))
+(set f (as 'F64 k))
+(set T (table [k w f] (list k w f)))
+(set C 4611686018427387904)
+(set R (+ w C))
+(avg R) -- 2.0
+;; keyless: alone, with a where:, beside a second aggregate, both
+(at (select {from: T a: (avg (+ w C))}) 'a) -- [2.0]
+(at (select {from: T where: (> k 0) a: (avg (+ w C))}) 'a) -- [2.0]
+(at (select {from: T a: (avg (+ w C)) c: (count w)}) 'a) -- [2.0]
+(at (select {from: T a: (avg (+ w C)) s: (sum (+ w C))}) 'a) -- [2.0]
+(at (select {from: T where: (> k 0) a: (avg (+ w C)) c: (count w)}) 'a) -- [2.0]
+(at (select {from: T where: (> k 0) a: (avg (+ w C)) s: (sum w)}) 'a) -- [2.0]
+;; the constant on the left, and subtracted
+(at (select {from: T where: (> k 0) a: (avg (+ C w))}) 'a) -- [2.0]
+(at (select {from: T where: (> k 0) a: (avg (- (+ w C) 1))}) 'a) -- [1.0]
+(at (select {from: T where: (> k 0) a: (avg (- (* w -1) C))}) 'a) -- [-2.0]
+;; grouped, grouped with a where:, grouped beside a second aggregate
+(at (select {from: T by: k a: (avg (+ w C))}) 'a) -- [2.0 2.0 2.0]
+(at (select {from: T where: (> k 0) by: k a: (avg (+ w C))}) 'a) -- [2.0 2.0]
+(at (select {from: T by: k a: (avg (+ w C)) c: (count w)}) 'a) -- [2.0 2.0 2.0]
+;; float keys: the legacy radix engine emits the affine mean
+(at (select {from: T by: f a: (avg (+ w C))}) 'a) -- [2.0 2.0 2.0]
+(at (select {from: T where: (> k 0) by: f a: (avg (+ w C))}) 'a) -- [2.0 2.0]
+(at (select {from: T by: f a: (avg (+ w C)) c: (count w)}) 'a) -- [2.0 2.0 2.0]
+;; an odd row count: the mean of the selected rows as the builtin divides it
+(set S (fn [m] (at (select {from: T where: (< d m) a: (avg (+ w C))}) 'a)))
+(== (first (S 99999)) (avg (take R 99999))) -- true
+(== (first (S 7)) (avg (take R 7))) -- true

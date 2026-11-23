@@ -460,6 +460,29 @@ static inline double ray_i128_to_f64(int64_t hi, uint64_t lo) {
     double d = (double)h * 18446744073709551616.0 + (double)l;
     return neg ? -d : d;
 }
+/* (hi, lo) += a * b, the 128-bit product of two int64 values: exact for
+ * every pair (|a * b| < 2^126). */
+static inline void ray_i128_add_mul(int64_t* hi, uint64_t* lo, int64_t a, int64_t b) {
+    bool neg = (a < 0) != (b < 0);
+    uint64_t x = a < 0 ? 0u - (uint64_t)a : (uint64_t)a;
+    uint64_t y = b < 0 ? 0u - (uint64_t)b : (uint64_t)b;
+    uint64_t x0 = (uint32_t)x, x1 = x >> 32, y0 = (uint32_t)y, y1 = y >> 32;
+    uint64_t p00 = x0 * y0, p01 = x0 * y1, p10 = x1 * y0, p11 = x1 * y1;
+    uint64_t mid = (p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
+    uint64_t pl = (mid << 32) | (uint32_t)p00;
+    uint64_t ph = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    if (neg) { pl = ~pl + 1u; ph = ~ph + (pl == 0 ? 1u : 0u); }
+    ray_i128_add128(hi, lo, (int64_t)ph, pl);
+}
+/* The mean of an integer affine input `x + bias` over nn non-null rows
+ * from the exact 128-bit total of x: one division of the exact total of
+ * the rows, as the builtin avg of the materialized rows answers.  Adding
+ * the bias to the divided mean in floating point instead cancels when
+ * the mean and the bias are both large (#1441). */
+static inline double ray_i128_affine_mean(int64_t hi, uint64_t lo, int64_t bias, int64_t nn) {
+    ray_i128_add_mul(&hi, &lo, bias, nn);
+    return ray_i128_to_f64(hi, lo) / (double)nn;
+}
 
 /* Whole-column sum (int64 wraparound) and non-null count of an integer
  * column from its chunk-zone per-chunk aggregates; false when the column
