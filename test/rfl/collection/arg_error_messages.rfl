@@ -3,6 +3,9 @@
 
 ;; count given before the collection
 (at (try (take 3 [1 2 3]) (fn [e] e)) 'msg) -- "take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)"
+(at (try (take 3 [1 2]) (fn [e] e)) 'msg) -- "take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)"
+(at (try (take 3 [1 2]) (fn [e] e)) 'code) -- 'type
+(take [1 2 3 4] [1 2]) -- [2 3]
 (at (try (drop 3 [1 2 3]) (fn [e] e)) 'msg) -- "drop: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (drop <collection> <count>)"
 (at (try (rotate 1 [1 2 3]) (fn [e] e)) 'msg) -- "rotate: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (rotate <collection> <count>)"
 

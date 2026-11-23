@@ -3763,6 +3763,13 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
                 vec->type == RAY_BINARY || vec->type == RAY_VARY))
         return count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
+    /* A count given first and a vector second, (take 3 [1 2]): the usual slip, told before
+     * the range branch below, which would take [1 2] for a [start amount] range of an
+     * integer atom and answer "range take unsupported". */
+    if (vec && ray_is_atom(vec) &&
+        (vec->type == -RAY_I64 || vec->type == -RAY_I32 || vec->type == -RAY_I16 || vec->type == -RAY_U8) &&
+        n_obj && !ray_is_atom(n_obj))
+        return count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
     /* Range take: (take collection [start amount]) — slice from start for amount elements */
     if (ray_is_vec(n_obj) && n_obj->type == RAY_I64 && ray_len(n_obj) == 2) {
         int64_t* idx = (int64_t*)ray_data(n_obj);
