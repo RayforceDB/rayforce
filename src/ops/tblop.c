@@ -1805,6 +1805,61 @@ static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
     return r;
 }
 
+/* The kind of value a vector type holds: every numeric type (BOOL, U8, I16,
+ * I32, I64, F32, F64) is one kind, any other type is its own. */
+static int8_t alter_value_kind(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64:
+        return RAY_F64;
+    default:
+        return t;
+    }
+}
+
+/* The value `alter ... set` is about to write into the typed vector `var`,
+ * checked before any cell, the sorted flag or an attached index is touched:
+ * NULL when it may be written, the type error otherwise.  `pairwise` says
+ * `val` is a vector whose cells go one per index; otherwise `val` itself is
+ * written at every index and must be an atom.
+ *
+ * store_typed_elem converts a cell by the vector's type and does not look at
+ * the value's: a symbol written into an I64 vector became its interned id, an
+ * integer into a SYM vector an id that may not exist, an F64 into a SYM
+ * vector a cell that crashed the printer (#1513).  A value must be of the
+ * vector's kind: a number into a numeric vector (converted by the vector's
+ * type, as before), otherwise the vector's own type.  A null of any type,
+ * or a value vector of nulls only, writes the vector's null.  A STR vector keeps its own check in
+ * alter_store_cell.  Checking up front keeps the vector unchanged on an
+ * error, where a failure on a later index would leave the earlier cells
+ * written. */
+static ray_t* alter_set_check(ray_t* var, ray_t* val, bool pairwise, int64_t nidx) {
+    int8_t vt = var->type;
+    if (vt == RAY_STR) return NULL;
+    if (!pairwise && (ray_is_vec(val) || val->type == RAY_LIST)) {
+        if (nidx < 0)
+            return ray_error("type", "alter set: an atom index takes an atom value, got a %s",
+                             ray_type_name(val->type));
+        if (ray_is_vec(val))
+            return ray_error("type", "alter set: %lld values for %lld indices; a value vector needs one value per index",
+                             (long long)val->len, (long long)nidx);
+        return ray_error("type", "alter set: cannot store a %s in a %s vector",
+                         ray_type_name(val->type), ray_type_name(vt));
+    }
+    if (!pairwise && RAY_ATOM_IS_NULL(val)) return NULL;
+    int8_t et = pairwise ? val->type : (val->type < 0 ? (int8_t)-val->type : val->type);
+    if (alter_value_kind(et) == alter_value_kind(vt)) return NULL;
+    /* A value vector whose every cell is null writes the vector's nulls,
+     * as each of its null atoms would. */
+    if (pairwise) {
+        int64_t k = 0;
+        while (k < val->len && ray_vec_is_null(val, k)) k++;
+        if (k == val->len) return NULL;
+    }
+    return ray_error("type", "alter set: cannot store %s in a %s vector",
+                     ray_type_name(val->type), ray_type_name(vt));
+}
+
 static ray_t* alter_target(ray_t** args, int64_t n,
                            const ray_env_target_t* target, ray_t* var,
                            ray_t* name_sym);
@@ -1983,6 +2038,16 @@ static ray_t* alter_target(ray_t** args, int64_t n,
                 ray_release(var);
                 ray_release(idx); ray_release(val); ray_release(name_sym);
                 return ray_error("index", NULL);
+            }
+        }
+
+        {
+            bool pairwise = idx_is_vec && ray_is_vec(val) && val->len == idx->len;
+            ray_t* terr = alter_set_check(var, val, pairwise, idx_is_vec ? idx->len : -1);
+            if (terr) {
+                ray_release(var);
+                ray_release(idx); ray_release(val); ray_release(name_sym);
+                return terr;
             }
         }
 

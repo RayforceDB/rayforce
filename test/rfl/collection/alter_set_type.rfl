@@ -1,0 +1,176 @@
+;; @requires: posix
+;; alter set writes only a value of the vector's type, or one that widens into
+;; it without loss (#1513).  The cell writer converted every value by the
+;; vector's type and never looked at the value's: a symbol into an I64 vector
+;; became its interned id, an integer into a SYM vector an id that may not
+;; exist, an F64 into a SYM vector a cell that crashed the printer.  Each case
+;; is now a type error and leaves the vector as it was.
+
+;; ── the issue's cases ───────────────────────────────────────────────────
+(set R ['p 'q 'p])
+(alter 'R set [1] 5) !- type
+R -- ['p 'q 'p]
+(set I [1 2 3])
+(alter 'I set [1] 'p) !- type
+I -- [1 2 3]
+(alter 'I set [1] "x") !- type
+I -- [1 2 3]
+(set F [1.5 2.5])
+(alter 'F set [0] 'p) !- type
+F -- [1.5 2.5]
+(set D [2024.01.01 2024.01.02])
+(alter 'D set [0] 'p) !- type
+D -- [2024.01.01 2024.01.02]
+(set R ['p 'q])
+(alter 'R set [0] "z") !- type
+R -- ['p 'q]
+(alter 'R set [0] 1.5) !- type
+R -- ['p 'q]
+(format "%" R) -- "[p q]"
+
+;; ── an atom index, a broadcast and pairwise values ──────────────────────
+(set R ['p 'q 'p])
+(alter 'R set 0 5) !- type
+(alter 'R set [0 2] 1.5) !- type
+(alter 'R set [0 2] [1 2]) !- type
+R -- ['p 'q 'p]
+;; a LIST value is not a vector of cells: it is rejected whole, even when
+;; every item is of the vector's type
+(set L [1 2 3])
+(alter 'L set [0 1] (list 7 8)) !- type
+(alter 'L set [0 1] (list 7 'p)) !- type
+L -- [1 2 3]
+;; a value vector needs one value per index, and an atom index takes an atom
+(alter 'L set [0 1] [7 8 9]) !- type
+(alter 'L set 0 [7 8]) !- type
+L -- [1 2 3]
+
+;; ── other kinds: temporal, bool, guid ───────────────────────────────────
+(set B [true false])
+(alter 'B set 0 'p) !- type
+(alter 'B set 0 "x") !- type
+B -- [true false]
+(set T [2024.01.01D00:00:00.000000000])
+(alter 'T set 0 2024.01.02) !- type
+(alter 'T set 0 5) !- type
+T -- [2024.01.01D00:00:00.000000000]
+(set I [1 2 3])
+(alter 'I set 0 2024.01.02) !- type
+I -- [1 2 3]
+(set F [1.5 2.5])
+(alter 'F set 0 12:00:00.000) !- type
+F -- [1.5 2.5]
+(set G (guid 1))
+(set G0 G)
+(alter 'G set 0 1) !- type
+(alter 'G set 0 1.5) !- type
+(== G G0) -- [true]
+
+;; ── a number into a numeric vector is converted by the vector's type ────
+(set F [1.5 2.5])
+(alter 'F set 0 3) -- 'F
+F -- [3.0 2.5]
+;; an F32 keeps its fraction in an F64 vector (it was stored as 1.0)
+(alter 'F set 1 1.5e) -- 'F
+F -- [3.0 1.5]
+(alter 'F set [0 1] (as 'F32 [0.25 0.5])) -- 'F
+F -- [0.25 0.5]
+(alter 'F set [0 1] [1h 2h]) -- 'F
+F -- [1.0 2.0]
+(set E (as 'F32 [1.0 2.0]))
+(alter 'E set 0 1.5) -- 'E
+(alter 'E set 1 5) -- 'E
+E -- (as 'F32 [1.5 5.0])
+(set I [1 2 3])
+(alter 'I set 0 7i) -- 'I
+(alter 'I set 1 true) -- 'I
+(alter 'I set 2 2.0) -- 'I
+I -- [7 1 2]
+(set W (as 'I32 [1 2 3]))
+(alter 'W set 0 7) -- 'W
+(alter 'W set [1 2] [8 9]) -- 'W
+W -- (as 'I32 [7 8 9])
+
+;; ── a null of any type writes the vector's null ─────────────────────────
+(set I [1 2 3])
+(alter 'I set 0 null) -- 'I
+(alter 'I set 1 0Nd) -- 'I
+(nil? I) -- [true true false]
+(set R ['p 'q 'r])
+(alter 'R set 0 null) -- 'R
+(alter 'R set 1 0N) -- 'R
+(nil? R) -- [true true false]
+(set D [2024.01.01 2024.01.02])
+(alter 'D set 0 0N) -- 'D
+D -- [0Nd 2024.01.02]
+(set E (as 'F32 [1.5 2.5]))
+(alter 'E set 0 0N) -- 'E
+(alter 'E set 1 null) -- 'E
+(nil? E) -- [true true]
+(set G (guid 2))
+(alter 'G set 0 0N) -- 'G
+(nil? G) -- [true false]
+
+;; a value vector of nulls only, of any type, writes the vector's nulls; one
+;; with a value of another kind is still rejected whole
+(set D [2024.01.01 2024.01.02 2024.01.03])
+(alter 'D set [0 2] [0N 0N]) -- 'D
+D -- [0Nd 2024.01.02 0Nd]
+(set D [2024.01.01 2024.01.02 2024.01.03])
+(alter 'D set [0 2] [7 0N]) !- type
+D -- [2024.01.01 2024.01.02 2024.01.03]
+(set R ['p 'q 'r])
+(alter 'R set [0 2] [0N 0N]) -- 'R
+(nil? R) -- [true false true]
+(set I [1 2 3])
+(alter 'I set [0 2] [0Nd 0Nd]) -- 'I
+(nil? I) -- [true false true]
+(set G (guid 3))
+(alter 'G set [0 2] [0N 0N]) -- 'G
+(nil? G) -- [true false true]
+
+;; ── a sorted or indexed vector keeps its attributes on a rejected write ─
+(set S (.attr.set 'sorted [1 2 3]))
+(.attr.get S) -- ['sorted]
+(alter 'S set 0 'p) !- type
+(.attr.get S) -- ['sorted]
+S -- [1 2 3]
+;; a write that lands drops the flag
+(alter 'S set 0 9) -- 'S
+(in 'sorted (.attr.get S)) -- false
+(set X (.idx.zone [5 1 9]))
+(alter 'X set 0 'p) !- type
+(.idx.has? X) -- true
+X -- [5 1 9]
+
+;; ── a dict leaf and a column taken from a table ─────────────────────────
+(set DC (dict [v] (list [1 2 3])))
+(alter 'DC.v set 0 'p) !- type
+DC.v -- [1 2 3]
+(set TC (at (table [a b] (list [1 2] ['x 'y])) 'b))
+(alter 'TC set 1 2) !- type
+TC -- ['x 'y]
+
+;; ── mapped columns of a splayed table, a FILE-domain SYM column ─────────
+(.sys.exec "rm -rf /tmp/rfl_alter_settype && mkdir -p /tmp/rfl_alter_settype") -- 0
+(.db.splayed.set "/tmp/rfl_alter_settype/t/" (table [k n] (list ['p 'q 'p] [1 2 3])) "/tmp/rfl_alter_settype/.sym")
+(set MK (get (.db.splayed.get "/tmp/rfl_alter_settype/t/" "/tmp/rfl_alter_settype/.sym") 'k))
+(alter 'MK set 1 5) !- type
+(alter 'MK set [0 1] 1.5) !- type
+MK -- ['p 'q 'p]
+(set MN (get (.db.splayed.get "/tmp/rfl_alter_settype/t/" "/tmp/rfl_alter_settype/.sym") 'n))
+(alter 'MN set 1 'p) !- type
+(alter 'MN set [0 2] "x") !- type
+MN -- [1 2 3]
+;; a gathered FILE-domain SYM vector
+(set GK (at MK [0 1 2]))
+(alter 'GK set 2 5) !- type
+GK -- ['p 'q 'p]
+;; a value of the right type still lands, and the table on disk is untouched
+(alter 'MN set 1 20) -- 'MN
+MN -- [1 20 3]
+(alter 'MK set 1 'rfl_alter_settype_z) -- 'MK
+MK -- ['p 'rfl_alter_settype_z 'p]
+(get (.db.splayed.get "/tmp/rfl_alter_settype/t/" "/tmp/rfl_alter_settype/.sym") 'k) -- ['p 'q 'p]
+(get (.db.splayed.get "/tmp/rfl_alter_settype/t/" "/tmp/rfl_alter_settype/.sym") 'n) -- [1 2 3]
+(.sys.exec "rm -rf /tmp/rfl_alter_settype") -- 0
