@@ -3752,6 +3752,7 @@ static ray_t* guid_in_rowsel(ray_t* col, ray_t* set_vec) {
         if (!ix) { scratch_free(gid_hdr); return NULL; }
         if (gid >= 0) gids[ngid++] = gid;
     }
+    if (!ix) { scratch_free(gid_hdr); return NULL; }
     /* a needle given twice is one group: its rows once */
     qsort(gids, (size_t)ngid, sizeof(int64_t), cmp_i64_plain);
     int64_t total = 0, w = 0;
