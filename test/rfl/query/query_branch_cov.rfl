@@ -1078,7 +1078,7 @@
 ;; desc:c on a result that does NOT have a 'c' agg col (only 's') →
 ;; match returns false; planner falls through to the post-sort+take path,
 ;; which then reports that 'c' names no output column.
-(count (select {s: (sum v) by: k from: TNc desc: c take: 2})) !- name
+(count (select {s: (sum v) by: k from: TNc desc: c take: 2})) !- schema
 ;; Valid match: desc:s with a sum alias 's'.
 (count (select {s: (sum v) by: k from: TNc desc: s take: 2})) -- 2
 

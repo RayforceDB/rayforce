@@ -3894,7 +3894,7 @@ ray_t* exec_sort(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t limit) {
             ray_t* err = sort_vecs[k];
             if (!err && key_ext && key_ext->base.opcode == OP_SCAN) {
                 ray_t* name = ray_sym_str(key_ext->sym);  /* borrowed */
-                err = ray_error("name", "sort key '%.*s' names no output column",
+                err = ray_error("schema", "sort key '%.*s' is not available to this SELECT",
                                 name ? (int)ray_str_len(name) : 0,
                                 name ? ray_str_ptr(name) : "");
             }

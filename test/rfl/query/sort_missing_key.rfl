@@ -2,29 +2,45 @@
 ;; Missing sort names must report the name on DAG and evaluator routes.
 ;; Plain selects may still carry source-only keys; grouped/aggregate results cannot.
 (set T (table [a b c k] (list [3 1 2] [0 2 1] [9 7 8] [0 1 0])))
-(select {r: a from: T asc: zz}) !- name
-(at (try (select {r: a from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: a from: T desc: zz take: 1}) !- name
-(at (try (select {r: a from: T desc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: a from: T where: (> a 0) asc: zz take: 1}) !- name
-(at (try (select {r: a from: T where: (> a 0) asc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: (+ (min a a) 1) from: T asc: zz}) !- name
-(at (try (select {r: (+ (min a a) 1) from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: (sum a) from: T by: k asc: zz}) !- name
-(at (try (select {r: (sum a) from: T by: k asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {from: T asc: zz}) !- name
-(at (try (select {from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: (sum a) from: T by: k asc: c}) !- name
-(at (try (select {r: (sum a) from: T by: k asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' names no output column"
-(select {r: (sum a) from: T asc: c}) !- name
-(at (try (select {r: (sum a) from: T asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' names no output column"
-(select {r: a from: T asc: [r zz]}) !- name
-(at (try (select {r: a from: T asc: [r zz]}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
-(select {r: a from: T where: (> a 99) asc: zz}) !- name
-(at (try (select {r: a from: T where: (> a 99) asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' names no output column"
+(select {r: a from: T asc: zz}) !- schema
+(at (try (select {r: a from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: a from: T desc: zz take: 1}) !- schema
+(at (try (select {r: a from: T desc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: a from: T where: (> a 0) asc: zz take: 1}) !- schema
+(at (try (select {r: a from: T where: (> a 0) asc: zz take: 1}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: (+ (min a a) 1) from: T asc: zz}) !- schema
+(at (try (select {r: (+ (min a a) 1) from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: (sum a) from: T by: k asc: zz}) !- schema
+(at (try (select {r: (sum a) from: T by: k asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {from: T asc: zz}) !- schema
+(at (try (select {from: T asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: (sum a) from: T by: k asc: c}) !- schema
+(at (try (select {r: (sum a) from: T by: k asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' is not available to this SELECT"
+(select {r: (sum a) from: T asc: c}) !- schema
+(at (try (select {r: (sum a) from: T asc: c}) (fn [e] e)) 'msg) -- "sort key 'c' is not available to this SELECT"
+(select {r: a from: T asc: [r zz]}) !- schema
+(at (try (select {r: a from: T asc: [r zz]}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: a from: T where: (> a 99) asc: zz}) !- schema
+(at (try (select {r: a from: T where: (> a 99) asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
 
 ;; Positive output bindings and the plain-select source-only carry remain valid.
 (select {r: a from: T asc: c}) -- (table [r] (list [1 2 3]))
 (select {r: (+ a 1) from: T asc: r}) -- (table [r] (list [2 3 4]))
 (select {c: a from: T asc: c}) -- (table [c] (list [1 2 3]))
 (select {r: (sum a) from: T by: k asc: r}) -- (xasc (select {r: (sum a) from: T by: k}) 'r)
+
+;; Above the streaming threshold, missing names still fail for a TAKE plan.
+(set L (table [a c] (list (til 70000) (- 70000 (til 70000)))))
+(select {r: a from: L asc: zz take: 3}) !- schema
+(at (try (select {r: a from: L asc: zz take: 3}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(at (select {r: a from: L asc: c take: 3}) 'r) -- [69999 69998 69997]
+
+;; A real two-partition source exercises the storage-backed sort route.
+(.db.splayed.set "/tmp/rfl_sort_missing_1418/2026.01.01/t" T)
+(.db.splayed.set "/tmp/rfl_sort_missing_1418/2026.01.02/t" T)
+(set P (.db.parted.get "/tmp/rfl_sort_missing_1418" 't))
+(select {r: a from: P asc: zz}) !- schema
+(at (try (select {r: a from: P asc: zz}) (fn [e] e)) 'msg) -- "sort key 'zz' is not available to this SELECT"
+(select {r: (sum a) from: P by: k desc: c take: 2}) !- schema
+(at (select {r: a from: P asc: c take: 2}) 'r) -- [1 1]
+(.sys.exec "rm -rf /tmp/rfl_sort_missing_1418")
