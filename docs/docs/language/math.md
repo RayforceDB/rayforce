@@ -237,7 +237,10 @@ looking at the other type: `(== 2024.01.02 0N)` is `false`.
 
 The same rule holds inside a query, with the same errors. The one difference
 is a string literal, which a query reads as a symbol, so `(== sym "AAPL")`
-compares a `SYM` column with the symbol `AAPL`.
+compares a `SYM` column with the symbol `AAPL`, and `in` reads a set of
+strings the same way: `(in sym (list "AAPL" "MSFT"))` and
+`(in sym ["AAPL" "MSFT"])` keep the rows holding either symbol. A `GUID`
+column against a string is a `type` error, for `==` and for `in` alike.
 
 ### `(== a b)` — atomic
 

@@ -1,0 +1,33 @@
+;; @requires: posix (parted fixture cleanup via .sys.exec)
+;; #1493: in a where:, a string against a SYM column reads as the symbol it
+;; spells — for `in` over a list (or vector) of strings exactly as for `==`.
+;; A GUID column refuses a string set (type), as `==` refuses the string.
+(set T (table [s n] (list ['a 'b 'c 'a] [1 2 3 4])))
+(count (select {from: T where: (== s "a")})) -- 2
+(count (select {from: T where: (in s ['a 'b])})) -- 3
+(count (select {from: T where: (in s (list "a" "b"))})) -- 3
+(count (select {from: T where: (in s ["a" "b"])})) -- 3
+(count (select {from: T where: (in s "a")})) -- 2
+(count (select {from: T where: (in s (list 'a "c"))})) -- 3
+(count (select {from: T where: (not-in s (list "a" "b"))})) -- 1
+(count (select {from: T where: (in s (list "zz_1493_absent"))})) -- 0
+(count (select {from: T where: (not-in s (list "zz_1493_absent"))})) -- 4
+(set L1493 (list "a" "zz_1493_absent"))
+(count (select {from: T where: (in s L1493)})) -- 2
+(at (select {from: T where: (in s (list "c" "b")) n: n}) 'n) -- [2 3]
+(set B (table [s n] (list (take ['a 'b 'c 'a] 1000000) (til 1000000))))
+(count (select {from: B where: (in s (list "a" "b"))})) -- 750000
+(.sys.exec "rm -rf /tmp/rfl_where_in_sym_strings && mkdir -p /tmp/rfl_where_in_sym_strings") -- 0
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/1/t/" T "/tmp/rfl_where_in_sym_strings/.sym")
+(.db.splayed.set "/tmp/rfl_where_in_sym_strings/2/t/" T "/tmp/rfl_where_in_sym_strings/.sym")
+(set P (.db.parted.get "/tmp/rfl_where_in_sym_strings/" 't))
+(count (select {from: P where: (== s "a")})) -- 4
+(count (select {from: P where: (in s (list "a" "b"))})) -- 6
+(count (select {from: P where: (in s ["a" "b"])})) -- 6
+(set G (table [g] (list (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000002")))))
+(count (select {from: G where: (== g "0a5c0a5c-0000-4000-8000-000000000001")})) !- type
+(count (select {from: G where: (in g (list "0a5c0a5c-0000-4000-8000-000000000001"))})) !- type
+(count (select {from: G where: (in g ["0a5c0a5c-0000-4000-8000-000000000001"])})) !- type
+(set K1493 (at (at G 'g) [0]))
+(count (select {from: G where: (in g K1493)})) -- 1
+(.sys.exec "rm -rf /tmp/rfl_where_in_sym_strings") -- 0
