@@ -1,8 +1,8 @@
 ;; @also-unfused
-;; The I32 sentinel can be an ordinary narrow integer, but not a DATE/TIME.
+;; Raw unflagged I32 retagging is covered by vec/cast_unflagged_i32_temporal.
 (set i (as 'I32 [-2147483648 5]))
 (set w [2147483648 5])
-(nil? i) -- [false false]
+(nil? i) -- [true false]
 (nil? w) -- [false false]
 (set d (as 'DATE i))
 (set t (as 'TIME w))

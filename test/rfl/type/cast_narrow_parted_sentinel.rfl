@@ -1,0 +1,12 @@
+;; @requires: posix
+(.db.splayed.set "__cast_narrow/2024.01.01/t/" (table [x y] (list [32768 5] [2147483648 5])))
+(.db.splayed.set "__cast_narrow/2024.01.02/t/" (table [x y] (list [6 32768] [6 2147483648])))
+(set P (.db.parted.get "__cast_narrow/" 't))
+(set Q (select {from: P h: (as 'I16 x) i: (as 'I32 y)}))
+(nil? (at Q 'h)) -- [true false false true]
+(nil? (at Q 'i)) -- [true false false true]
+(nil? (at (at Q 'h) 0)) -- true
+(nil? (at (at Q 'i) [0 1 2 3])) -- [true false false true]
+(set Q 0)
+(set P 0)
+(.sys.exec "rm -rf __cast_narrow")
