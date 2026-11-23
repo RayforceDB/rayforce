@@ -22617,9 +22617,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
             }
 
-            /* I64 SUM partials already excluded null input rows. A partial
+            /* I64 and TIMESPAN SUM partials already excluded null rows. A partial
              * can legitimately equal NULL_I64, even after a batch merge. */
-            if (part_ops[a] == OP_SUM && flat->type == RAY_I64)
+            if (part_ops[a] == OP_SUM && (flat->type == RAY_I64 || flat->type == RAY_TIMESPAN))
                 flat->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
             else
                 flat->attrs |= src_nulls;
