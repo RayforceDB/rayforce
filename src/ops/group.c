@@ -22077,21 +22077,29 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
      * Bounds peak memory to O(MERGE_BATCH × groups_per_partition). */
 #define MERGE_BATCH 8
 
-    /* A keyless integer AVG needs the exact total, not a vector of wrapped
-     * SUM results. Start with a single unfiltered scan plus/minus a constant. */
+    /* Keep exact totals for a single unfiltered I64 AVG. Affine inputs
+     * still execute their original graph; never commute or re-associate. */
     bool exact_avg = false;
     if (n_keys == 0 && n_aggs == 1 && ext->agg_ops[0] == OP_AVG &&
-        agg_is_expr[0] && !saved_sel && group_limit == 0 && !ef_saved.enabled) {
+        !saved_sel && group_limit == 0 && !ef_saved.enabled) {
         ray_op_t* expr = op_node(g, ext->agg_ins[0]);
+        ray_op_t* input = expr && expr->opcode == OP_SCAN ? expr : NULL;
         if (expr && (expr->opcode == OP_ADD || expr->opcode == OP_SUB)) {
             ray_op_t* lhs = op_node(g, expr->in_id[0]);
             ray_op_t* rhs = op_node(g, expr->in_id[1]);
-            ray_op_ext_t* scan = lhs && lhs->opcode == OP_SCAN ? find_ext(g, lhs->id) : NULL;
-            ray_col_meta_t meta;
-            exact_avg = scan && rhs && rhs->opcode == OP_CONST && rhs->out_type == RAY_I64 &&
-                ray_table_col_meta(parted_tbl, scan->sym, &meta) &&
-                meta.type == RAY_PARTED_BASE + RAY_I64;
+            ray_op_t* lit = NULL;
+            if (lhs && rhs && lhs->opcode == OP_SCAN && rhs->opcode == OP_CONST) {
+                input = lhs; lit = rhs;
+            } else if (lhs && rhs && rhs->opcode == OP_SCAN && lhs->opcode == OP_CONST) {
+                input = rhs; lit = lhs;
+            }
+            if (!lit || (lit->out_type != RAY_I16 && lit->out_type != RAY_I32 &&
+                         lit->out_type != RAY_I64)) input = NULL;
         }
+        ray_op_ext_t* scan = input ? find_ext(g, input->id) : NULL;
+        ray_col_meta_t meta;
+        exact_avg = scan && ray_table_col_meta(parted_tbl, scan->sym, &meta) &&
+                    meta.type == RAY_PARTED_BASE + RAY_I64;
     }
     reduce_acc_t exact_total;
     if (exact_avg) reduce_acc_init(&exact_total);
@@ -22213,6 +22221,31 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 if (!fill) ray_retain(seg);
                 sub = ray_table_add_col(sub, borrow_syms[j], fill ? fill : seg);
                 ray_release(fill ? fill : seg);
+                if (exact_avg && (!sub || RAY_IS_ERR(sub))) {
+                    ret = sub ? sub : ray_error(ray_interrupted() ? "cancel" : "oom", NULL);
+                    goto batch_fail;
+                }
+            }
+
+            if (exact_avg && !agg_is_expr[0]) {
+                ray_t* col = ray_table_slot(sub, agg_syms[0]);
+                if (!col) { pp_release_sub(g, sub); goto batch_fail; }
+                ray_col_src_t src;
+                ret = ray_col_src_bind(col, &src);
+                if (!ret) {
+                    reduce_acc_t partial;
+                    if (src.type != RAY_I64 || src.len != part_nrows) {
+                        ray_col_src_release(&src);
+                        pp_release_sub(g, sub);
+                        goto batch_fail;
+                    }
+                    ret = reduce_src_walk(&src, 0, src.len, OP_AVG, &partial);
+                    if (!ret) reduce_merge(&exact_batch, &partial, RAY_I64, NULL, OP_AVG);
+                    ray_col_src_release(&src);
+                }
+                pp_release_sub(g, sub);
+                if (ret) goto batch_fail;
+                continue;
             }
 
             /* Materialize expression keys / agg inputs over this partition.
