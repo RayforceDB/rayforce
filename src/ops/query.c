@@ -20176,6 +20176,24 @@ typedef struct { int64_t col[PRUNE_STAT_COLS]; int n; } prune_stat_cols_t;
  * with a literal of the key's exact type, or of a parted data column with
  * a literal (ray_part_prune_stats_mask); anything else keeps every
  * partition.  `tmp` is scratch of the same width. */
+/* Is `head` the native `within`, unshadowed (fn from prune_head_fn)? */
+static bool prune_within_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_within_fn && prune_head_named(head, "within");
+}
+
+/* The [lo hi] range of a `within`: a typed two-element vector, written or
+ * bound to a name.  Borrowed; NULL for anything else. */
+static ray_t* prune_within_range(ray_t* x, ray_t* tbl) {
+    ray_t* v = x && x->type == -RAY_SYM ? prune_bound_const(x, tbl, true) : x;
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->type == RAY_LIST || v->type == RAY_SYM ||
+        (v->attrs & ATTR_QUOTED) || v->len != 2) return NULL;
+    return v;
+}
+
+static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                           uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc);
+
 static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
                              uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
     if (!e || e->type != RAY_LIST || ray_len(e) < 2) return;
@@ -20187,14 +20205,40 @@ static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
             prune_where_mask(x[i], tbl, key_id, kv, acc, tmp, n_words, sc);
         return;
     }
+    /* (within c [lo hi]) passes the rows (and (>= c lo) (<= c hi)) passes:
+     * the select compiles it to exactly that, and the builtin compares the
+     * raw values, a null lowest, as the statistics do (#1500) */
+    if (n == 3 && prune_within_head(x[0], fn)) {
+        ray_t* rng = prune_within_range(x[2], tbl);
+        if (!rng) return;
+        for (int64_t i = 0; i < 2; i++) {
+            ray_t* idx = ray_i64(i);
+            ray_t* b = idx && !RAY_IS_ERR(idx) ? ray_at_fn(rng, idx) : NULL;
+            if (idx && !RAY_IS_ERR(idx)) ray_release(idx);
+            if (!b || RAY_IS_ERR(b) || b->type >= 0) {
+                if (b && RAY_IS_ERR(b)) ray_error_free(b);
+                else if (b) ray_release(b);
+                return;                                   /* no bound: the other side keeps what it narrowed */
+            }
+            prune_cmp_mask(i ? OP_LE : OP_GE, x[1], b, tbl, key_id, kv, acc, tmp, n_words, sc);
+            ray_release(b);
+        }
+        return;
+    }
     uint16_t op = prune_cmp_op(x[0], fn);
     if (!op || n != 3) return;
+    prune_cmp_mask(op, x[1], x[2], tbl, key_id, kv, acc, tmp, n_words, sc);
+}
+
+/* AND into `acc` the partitions `x1 op x2` can pass (prune_where_mask). */
+static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                           uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
     /* a name bound to a constant compares as that constant (a symbol it
      * holds is left to the filter: it reads here as a name would) */
-    ray_t* lb = prune_bound_const(x[1], tbl, op == OP_IN);
-    ray_t* rb = prune_bound_const(x[2], tbl, op == OP_IN);
-    ray_t* l = lb && lb->type != -RAY_SYM ? lb : x[1];
-    ray_t* r = rb && rb->type != -RAY_SYM ? rb : x[2];
+    ray_t* lb = prune_bound_const(x1, tbl, op == OP_IN);
+    ray_t* rb = prune_bound_const(x2, tbl, op == OP_IN);
+    ray_t* l = lb && lb->type != -RAY_SYM ? lb : x1;
+    ray_t* r = rb && rb->type != -RAY_SYM ? rb : x2;
     int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
     bool l_key = l_col == key_id, r_key = r_col == key_id;
     if (l_key == r_key) {
@@ -20452,6 +20496,9 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return prune_if_projection(e, tbl, &budget, 0) != 0;
     }
     int sub = mode ? 2 : 0;
+    /* within: a row's answer reads only that row and a constant range (#1500) */
+    if (n == 3 && prune_within_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, sub) && prune_within_range(el[2], tbl);
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
