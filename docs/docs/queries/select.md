@@ -568,6 +568,25 @@ Set a column to a constant for matching rows:
 (update {price: 0 from: 'tab where: (== volume 901)})
 ```
 
+An aggregate in an update with `where:` is computed over the rows the
+`where:` keeps, as in a `select` with the same `where:`, whether it stands
+alone, inside a larger expression or inside a helper. Running functions
+(`sums`, `deltas`, `prior` and the rest) run over the whole table, as in
+[Running functions under `where:`](#running-functions-under-where), and the
+kept rows take their values. Rows the `where:` drops keep their old value
+(a new column is null there):
+
+```lisp
+(set r (table [name room score] (list ['Ann 'Bob 'Cid 'Dan] ['A 'B 'A 'B] [60 20 45 35])))
+(update {s: (max score) from: r where: (== room 'A)})               ; s: [60 0Nl 60 0Nl]
+(update {s: (- score (avg score)) from: r where: (== room 'A)})     ; s: [7.5 0Nf -7.5 0Nf]
+(update {s: (sums score) from: r where: (== room 'A)})              ; s: [60 0Nl 125 0Nl]
+(update {s: (- (sums score) (max score)) from: r where: (== room 'A)}) ; s: [0 0Nl 65 0Nl]
+```
+
+The named (`from: 'r`, in place) and value (`from: r`) spellings give the
+same values.
+
 ### Update with Group-by
 
 Combine `where:` and `by:` for grouped conditional updates:

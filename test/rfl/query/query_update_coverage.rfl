@@ -605,7 +605,8 @@
 (set F32V (fn [x] (at (select {from: (table [v] (list x)) v: (as 'F32 v)}) 'v)))
 (set TF (table [x f] (list (til 3) (F32V [1.5 2.5 3.5]))))
 (at (update {f: (as 'F32 (+ (sum f) 0)) from: TF}) 'f) -- (F32V [7.5 7.5 7.5])
-(at (update {f: (as 'F32 (+ (sum f) 0)) from: TF where: (> x 0)}) 'f) -- (F32V [1.5 7.5 7.5])
+;; under where: the sum is over the kept rows, 2.5 + 3.5 (#1435)
+(at (update {f: (as 'F32 (+ (sum f) 0)) from: TF where: (> x 0)}) 'f) -- (F32V [1.5 6.0 6.0])
 (at (update {g: (as 'F32 (+ (sum f) 0)) from: TF}) 'g) -- (F32V [7.5 7.5 7.5])
 
 ;; By group, a one-element result is the group's scalar.
@@ -620,7 +621,9 @@
 (at (update {x: (if (> (count GL) 2) 9 x) from: TQ where: (> x 1)}) 'x) -- [0 1 9 9]
 (at (update {x: (if true (count GL) x) from: TQ}) 'x) -- [3 3 3 3]
 (at (update {a: (if true (as 'I32 0N) a) from: TQ where: (> x 1)}) 'a) -- (concat (as 'I32 [1 2]) (take 0Ni 2))
-(at (update {x: (if (> (count x) 2) 1 (neg 0N)) from: TQ where: (> x 1)}) 'x) -- [0 1 1 1]
+;; (count x) counts the two kept rows (#1435)
+(at (update {x: (if (> (count x) 1) 1 (neg 0N)) from: TQ where: (> x 1)}) 'x) -- [0 1 1 1]
+(at (update {x: (if (> (count x) 2) 1 (neg 0N)) from: TQ where: (> x 1)}) 'x) -- [0 1 0Nl 0Nl]
 (as 'STR (at (update {s: (if (> x 1) s 0Nf) from: TW where: (> x 0)}) 's)) -- ["ab" "" "ef" "gh"]
 
 ;; By group, a STR cell is written through the string pool; it came out "".
