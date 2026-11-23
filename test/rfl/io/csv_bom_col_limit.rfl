@@ -30,10 +30,11 @@
 (at (select {from: (.db.parted.get "/tmp/rfl_csv_bom/db/" 'bt)}) 'id) -- [1 2]
 
 ;; more than 256 columns is a `limit` error, as csv.md says; it was `range`
-;; (#1145).  256 columns still load.
-(.sys.exec "(seq -s, 1 256; seq -s, 1 256) > /tmp/rfl_csv_bom/w256.csv") -- 0
+;; (#1145).  256 columns still load.  (paste, not seq -s: one seq ends the
+;; line with a separator, which is one more column.)
+(.sys.exec "(seq 1 256 | paste -sd, -; seq 1 256 | paste -sd, -) > /tmp/rfl_csv_bom/w256.csv") -- 0
 (count (key (.csv.read "/tmp/rfl_csv_bom/w256.csv"))) -- 256
-(.sys.exec "(seq -s, 1 300; seq -s, 1 300) > /tmp/rfl_csv_bom/w300.csv") -- 0
+(.sys.exec "(seq 1 300 | paste -sd, -; seq 1 300 | paste -sd, -) > /tmp/rfl_csv_bom/w300.csv") -- 0
 (.csv.read "/tmp/rfl_csv_bom/w300.csv") !- limit
 (.csv.splayed "/tmp/rfl_csv_bom/w300.csv" "/tmp/rfl_csv_bom/w300sp/") !- limit
 (.csv.parted "/tmp/rfl_csv_bom/w300.csv" "/tmp/rfl_csv_bom/db/" 'wide) !- limit
