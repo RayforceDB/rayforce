@@ -1,0 +1,40 @@
+;; @also-unfused
+;; A row-wise `if` over two F32 arms keeps F32 cells (#1366): the fill had no
+;; F32 lane, so every row came out 0.0e in a projection, an aggregate's
+;; argument, a by: group and an update, and garbage on the per-group scatter.
+;; Two TIMESPAN arms keep TIMESPAN on every route.
+
+(set Bc (fn [q] (at (xasc q 'c) 'r)))
+(set Bk (fn [q] (at (xasc q 'k) 'r)))
+(set T (table [c k f g s u] (list [1 5 6 2] [a a b b] (as 'F32 [1.5 2.5 3.5 4.5]) (as 'F32 [9.5 8.5 7.5 6.5]) (as 'TIMESPAN [1 2 3 4]) (as 'TIMESPAN [10 20 30 40]))))
+
+;; ── two F32 arms ──
+(at (select {r: (if (> c 4) f g) from: T}) 'r) -- (as 'F32 [9.5 2.5 3.5 6.5])
+(type (at (select {r: (if (> c 4) f g) from: T}) 'r)) -- 'F32
+(at (select {r: (if (> c 4) f g) from: T where: (> c 1)}) 'r) -- (as 'F32 [2.5 3.5 6.5])
+(at (select {r: (sum (if (> c 4) f g)) from: T}) 'r) -- [22.0]
+(Bc (select {r: (sum (if (> c 4) f g)) from: T by: c})) -- [9.5 6.5 2.5 3.5]
+(Bk (select {r: (sum (if (> c 4) f g)) from: T by: k})) -- [12.0 10.0]
+(Bc (select {r: (first (if (> c 4) f g)) from: T by: c})) -- (as 'F32 [9.5 6.5 2.5 3.5])
+(Bk (select {r: (if (> c 4) f g) from: T by: k})) -- (list (as 'F32 [9.5 2.5]) (as 'F32 [3.5 6.5]))
+(at (select {from: T where: (> (if (> c 4) f g) 3.0e)}) 'c) -- [1 6 2]
+(at (update {r: (if (> c 4) f g) from: T}) 'r) -- (as 'F32 [9.5 2.5 3.5 6.5])
+(at (update {r: (if (> c 4) f g) from: T where: (> c 1)}) 'r) -- [0Ne 2.5e 3.5e 6.5e]
+(at (update {r: (if (> c 4) f g) from: T by: k}) 'r) -- (as 'F32 [9.5 2.5 3.5 6.5])
+;; an F32 arm beside a scalar, and beside a null
+(at (select {r: (if (> c 4) f 1.0e) from: T}) 'r) -- (as 'F32 [1.0 2.5 3.5 1.0])
+(at (select {r: (if (> c 4) 2.0e g) from: T}) 'r) -- (as 'F32 [9.5 2.0 2.0 6.5])
+(at (select {r: (if (> c 4) f 0Ne) from: T}) 'r) -- [0Ne 2.5e 3.5e 0Ne]
+;; an F32 arm beside an F64 one widens to F64
+(at (select {r: (if (> c 4) f (as 'F64 g)) from: T}) 'r) -- [9.5 2.5 3.5 6.5]
+
+;; ── two TIMESPAN arms ──
+(at (select {r: (if (> c 4) s u) from: T}) 'r) -- (as 'TIMESPAN [10 2 3 40])
+(type (at (select {r: (if (> c 4) s u) from: T}) 'r)) -- 'TIMESPAN
+(at (select {r: (if (> c 4) s u) from: T where: (> c 1)}) 'r) -- (as 'TIMESPAN [2 3 40])
+(at (select {r: (sum (if (> c 4) s u)) from: T}) 'r) -- (as 'TIMESPAN [55])
+(Bc (select {r: (first (if (> c 4) s u)) from: T by: c})) -- (as 'TIMESPAN [10 40 2 3])
+(Bk (select {r: (if (> c 4) s u) from: T by: k})) -- (list (as 'TIMESPAN [10 2]) (as 'TIMESPAN [3 40]))
+(at (update {r: (if (> c 4) s u) from: T}) 'r) -- (as 'TIMESPAN [10 2 3 40])
+(at (update {r: (if (> c 4) s u) from: T by: k}) 'r) -- (as 'TIMESPAN [10 2 3 40])
+(at (update {r: (if (> c 4) s u) from: T where: (> c 1)}) 'r) -- (as 'TIMESPAN [0N 2 3 40])
