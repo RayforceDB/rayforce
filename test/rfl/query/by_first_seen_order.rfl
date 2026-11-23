@@ -82,9 +82,43 @@
 (K0 (select {s: (sum v) from: T by: (% v 1000) desc: s take: 4}))        -- (K0 (select {s: (sum v) from: T by: {kk: (% v 1000)} desc: s take: 4}))
 ;; the full result has the by-dict spelling's order
 (K0 (select {s: (sum v) from: T by: (% v 1000)}))                         -- (K0 (select {s: (sum v) from: T by: {kk: (% v 1000)}}))
-(K0 (select {s: (sum v) from: T by: (xbar v 1000)}))                      -- (K0 (select {s: (sum v) from: T by: {kk: (xbar v 1000)}}))
+;; (an xbar key groups densely on its quotient, the by-dict column by hash:
+;; the same groups, in each strategy's order)
+(asc (K0 (select {s: (sum v) from: T by: (xbar v 1000)})))                -- (asc (K0 (select {s: (sum v) from: T by: {kk: (xbar v 1000)}})))
 (K0 (select {s: (sum v) from: T by: (+ k j)}))                            -- (K0 (select {s: (sum v) from: T by: {kk: (+ k j)}}))
 (K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: (% v 1000)}))      -- (K0 (select {s: (sum v) e: (first (+ d 1)) from: T by: {kk: (% v 1000)}}))
+
+;; ── xbar keys grouped on their quotient ───────────────────────────────────
+;; an xbar key with a literal bucket groups on (div x b) and comes back as
+;; its buckets: every type xbar keeps, negative values, nulls, a where:
+(set X (table [v i h d t tm] (list [10 -4 3 0Nl 6 -17 8 9 25 -4] (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4]) (as 'I16 [10 -4 3 0N 6 -17 8 9 25 -4]) (+ 2024.01.01 (as 'I32 [10 -4 3 0N 6 -17 8 9 25 -4])) (+ 2024.01.01D00:00:00.000000000 (* 1000000000 [10 -4 3 0N 6 -17 8 9 25 -4])) (as 'TIME (* 1000 [10 4 3 0N 6 17 8 9 25 4])))))
+(set XS (fn [c b] (do (set kx (xbar (at X c) b)) (list (FS kx) (map (fn [x] (count (where (== kx x)))) (FS kx))))))
+(set XQ (fn [q] (list (K0 q) (at q 'n))))
+(XQ (select {n: (count v) from: X by: (xbar v 10)}))              -- (XS 'v 10)
+(XQ (select {n: (count v) from: X by: (xbar i 7)}))               -- (XS 'i 7)
+(XQ (select {n: (count v) from: X by: (xbar h 3)}))               -- (XS 'h 3)
+(XQ (select {n: (count v) from: X by: (xbar d 7)}))               -- (XS 'd 7)
+(XQ (select {n: (count v) from: X by: (xbar t 7000000000)}))      -- (XS 't 7000000000)
+(XQ (select {n: (count v) from: X by: (xbar tm 7000)}))           -- (XS 'tm 7000)
+(K0 (select {n: (count v) from: X by: (xbar v 10) take: 2}))      -- (take (FS (xbar (at X 'v) 10)) 2)
+(K0 (select {n: (count v) from: X by: (xbar v 10) where: (> i 0)}))  -- (FS (xbar (at (select {from: X where: (> i 0)}) 'v) 10))
+(type (K0 (select {n: (count v) from: X by: (xbar d 7)})))        -- (type (xbar (at X 'd) 7))
+(type (K0 (select {n: (count v) from: X by: (xbar t 7000000000)})))  -- (type (at X 't))
+(asc (K0 (select {s: (sum v) from: T by: (xbar d 7)})))           -- (asc (K0 (select {s: (sum v) from: T by: {kk: (xbar d 7)}})))
+(at (xasc (select {s: (sum v) from: T by: (xbar d 7)}) 'd) 's)    -- (at (xasc (select {s: (sum v) from: T by: {kk: (xbar d 7)}}) 'kk) 's)
+(K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))      -- (take (FS Kx) 5)
+
+;; ── a column named like the bridge's hidden ones ───────────────────────────
+(set H (table [k v _k0 _e0 __k0] (list [2 1 0 2 1 0 2 1] [10 4 3 5 6 7 8 9] [9 9 9 9 1 1 1 1] [9 9 9 9 1 1 1 1] [7 7 7 7 7 7 7 7])))
+(K0 (select {s: (sum v) from: H by: (% v 3) take: 2}))            -- [1 0]
+(at (select {s: (sum _k0) from: H by: (% v 3) take: 2}) 's)      -- [19 11]
+(K0 (select {s: (sum (* v 2)) from: H by: (% v 3)}))              -- [1 0 2]
+(at (select {s: (sum (* v 2)) from: H by: (% v 3)}) 's)           -- [42 36 26]
+
+;; ── a key that reads other rows (a running function), with no where: ──────
+(K0 (select {s: (sum v) from: T by: (% (sums v) 7) take: 5}))     -- (take (FS (% (sums (at T 'v)) 7)) 5)
+(K0 (select {s: (sum v) from: T by: (deltas k) take: 5}))         -- (FS (deltas (at T (quote k))))
+(K0 (select {s: (sum v) from: S by: (deltas k)}))                 -- (FS (deltas (at S 'k)))
 
 ;; ── parted ──────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_by_first_seen_order/") -- 0

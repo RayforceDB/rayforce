@@ -82,6 +82,9 @@ typedef enum {
 } agg_v2_reason_t;
 
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
+/* A float key on 2 to 8 workers, which v2 leaves to the legacy engine;
+ * key_types (or NULL) gives the types of keys tbl does not hold yet. */
+bool agg_v2_parallel_wide(ray_graph_t* g, ray_op_t* op, ray_t* tbl, const int8_t* key_types);
 
 typedef enum {
     AGG_ROUTE_NONE,
