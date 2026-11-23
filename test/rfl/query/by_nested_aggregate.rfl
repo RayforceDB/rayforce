@@ -1,0 +1,241 @@
+;; @also-unfused
+;; @requires: posix  (parted fixture under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; Two grouped outputs the DAG cannot serve answer per group (issue #1452).
+;;
+;; An aggregate whose argument has no DAG node, `(first (at V i))`, is
+;; evaluated per group.  Under a bare expression key, `by: (% v 2)`, the
+;; planner still took it for a DAG aggregate, kept the bare key, and the
+;; per-group evaluation found no key column: the select raised `domain`.
+;;
+;; An aggregate inside an aggregate's argument, `(max (+ v (count v)))`,
+;; was refused with `domain`.  The inner aggregate is one value per group
+;; and the outer one still folds the group's rows, so the output is the
+;; expression evaluated over each group's rows.  An aggregate that folds
+;; only aggregates, `(max (sum v))`, has no rows left and still raises.
+;;
+;; Each answer is pinned against the expression evaluated eagerly over each
+;; group's rows, in key order.
+
+(set V [100 250 300 475 500 600 725 800])
+(set T (table [k j i v g] (list [0 1 0 1 0 1 2 2] [0 0 1 1 0 0 1 1] [5 4 3 2 1 0 7 6] [1 2 3 4 5 6 7 8] [a b a c b a c c])))
+;; s of a by: result in key order
+(set Sk (fn [q c] (at (xasc q c) 's)))
+;; f over each group's rows of t, groups of K in key order
+(set R (fn [t K f] (map (fn [x] (f (at t (where (== K x))))) (asc (distinct K)))))
+;; f over each group's column c
+(set Rc (fn [t K c f] (R t K (fn [r] (f (at r c))))))
+;; the message of a select that aggregates only aggregates of the group
+(set Re (fn [e] (at e 'msg)))
+(set Refold "select by: output `s` aggregates an aggregate of the group")
+
+;; ── the issue's forms ───────────────────────────────────────────────────────
+(Sk (select {s: (first (at V i)) from: T by: (% v 2)}) 'v)           -- [500 600]
+(Sk (select {s: (sum (at V i)) from: T by: (% v 2)}) 'v)             -- [1625 2125]
+(Sk (select {s: (max (+ v (count v))) from: T by: k}) 'k)            -- [8 9 10]
+(Sk (select {s: (+ 1 (max (+ v (count v)))) from: T by: k}) 'k)     -- [9 10 11]
+
+;; ── a bare expression key: each aggregate over (at V i) ────────────────────
+(set K2 (% (at T 'v) 2))
+(Sk (select {s: (first (at V i)) from: T by: (% v 2)}) 'v)   -- (Rc T K2 'i (fn [x] (first (at V x))))
+(Sk (select {s: (last (at V i)) from: T by: (% v 2)}) 'v)    -- (Rc T K2 'i (fn [x] (last (at V x))))
+(Sk (select {s: (sum (at V i)) from: T by: (% v 2)}) 'v)     -- (Rc T K2 'i (fn [x] (sum (at V x))))
+(Sk (select {s: (max (at V i)) from: T by: (% v 2)}) 'v)     -- (Rc T K2 'i (fn [x] (max (at V x))))
+(Sk (select {s: (min (at V i)) from: T by: (% v 2)}) 'v)     -- (Rc T K2 'i (fn [x] (min (at V x))))
+(Sk (select {s: (avg (at V i)) from: T by: (% v 2)}) 'v)     -- (Rc T K2 'i (fn [x] (avg (at V x))))
+(Sk (select {s: (count (at V i)) from: T by: (% v 2)}) 'v)   -- (Rc T K2 'i (fn [x] (count (at V x))))
+;; beside compiled outputs, which keep their answers
+(set Q (select {a: (sum v) s: (first (at V i)) b: (first v) from: T by: (% v 2)}))
+(Sk Q 'v)                                          -- (Rc T K2 'i (fn [x] (first (at V x))))
+(at (xasc Q 'v) 'a)                                -- (Rc T K2 'v sum)
+(at (xasc Q 'v) 'b)                                -- (Rc T K2 'v first)
+;; a key over two columns
+(set Kkj (+ (at T 'k) (at T 'j)))
+(Sk (select {s: (first (at V i)) from: T by: (+ k j)}) 'j)   -- (Rc T Kkj 'i (fn [x] (first (at V x))))
+(Sk (select {s: (sum (at V i)) from: T by: (+ k j)}) 'j)     -- (Rc T Kkj 'i (fn [x] (sum (at V x))))
+;; a key derived from a SYM column
+(set Kg (== (at T 'g) 'a))
+(Sk (select {s: (first (at V i)) from: T by: (== g 'a)}) 'g) -- (Rc T Kg 'i (fn [x] (first (at V x))))
+(Sk (select {s: (max (at V i)) from: T by: (== g 'a)}) 'g)   -- (Rc T Kg 'i (fn [x] (max (at V x))))
+;; the dict key and a column key answered so already, and still do
+(Sk (select {s: (first (at V i)) from: T by: {kk: (% v 2)}}) 'kk)   -- (Rc T K2 'i (fn [x] (first (at V x))))
+(Sk (select {s: (first (at V i)) from: T by: k}) 'k)                -- (Rc T (at T 'k) 'i (fn [x] (first (at V x))))
+
+;; ── nested aggregates ───────────────────────────────────────────────────────
+(set Kk (at T 'k))
+(Sk (select {s: (max (+ v (count v))) from: T by: k}) 'k)              -- (Rc T Kk 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (first (- v (min v))) from: T by: k}) 'k)              -- (Rc T Kk 'v (fn [x] (first (- x (min x)))))
+(Sk (select {s: (last (* v (first v))) from: T by: k}) 'k)             -- (Rc T Kk 'v (fn [x] (last (* x (first x)))))
+(Sk (select {s: (sum (- v (avg v))) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (sum (- x (avg x)))))
+(Sk (select {s: (min (+ v (sum v))) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (min (+ x (sum x)))))
+(Sk (select {s: (avg (* v (max v))) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (avg (* x (max x)))))
+(Sk (select {s: (count (+ v (max v))) from: T by: k}) 'k)              -- (Rc T Kk 'v (fn [x] (count (+ x (max x)))))
+;; deeper: an aggregate inside an aggregate inside an aggregate
+(Sk (select {s: (sum (+ v (max (- v (min v))))) from: T by: k}) 'k)    -- (Rc T Kk 'v (fn [x] (sum (+ x (max (- x (min x)))))))
+(Sk (select {s: (max (* v (count (+ v (first v))))) from: T by: k}) 'k) -- (Rc T Kk 'v (fn [x] (max (* x (count (+ x (first x)))))))
+;; a binary aggregate, the nested one in either argument
+(Sk (select {s: (wsum v (+ v (count v))) from: T by: k}) 'k)           -- (R T Kk (fn [r] (wsum (at r 'v) (+ (at r 'v) (count (at r 'v))))))
+(Sk (select {s: (wavg i (- v (min v))) from: T by: k}) 'k)             -- (R T Kk (fn [r] (wavg (at r 'i) (- (at r 'v) (min (at r 'v))))))
+(Sk (select {s: (wsum (- v (min v)) i) from: T by: k}) 'k)             -- (R T Kk (fn [r] (wsum (- (at r 'v) (min (at r 'v))) (at r 'i))))
+;; under a wrapper, and beside a compiled aggregate in the wrapper
+(Sk (select {s: (+ 1 (max (+ v (count v)))) from: T by: k}) 'k)       -- (Rc T Kk 'v (fn [x] (+ 1 (max (+ x (count x))))))
+(Sk (select {s: (- (sum v) (max (- v (min v)))) from: T by: k}) 'k)    -- (Rc T Kk 'v (fn [x] (- (sum x) (max (- x (min x))))))
+;; two columns, and the declined argument inside
+(Sk (select {s: (max (+ v (count i))) from: T by: k}) 'k)              -- (R T Kk (fn [r] (max (+ (at r 'v) (count (at r 'i))))))
+(Sk (select {s: (max (+ (at V i) (sum v))) from: T by: k}) 'k)        -- (R T Kk (fn [r] (max (+ (at V (at r 'i)) (sum (at r 'v))))))
+;; next to compiled outputs, which keep their answers
+(set Q (select {a: (sum v) s: (max (+ v (count v))) b: (+ 0 (first v)) c: (first (at V i)) from: T by: k}))
+(Sk Q 'k)                                    -- (Rc T Kk 'v (fn [x] (max (+ x (count x)))))
+(at (xasc Q 'k) 'a)                          -- (Rc T Kk 'v sum)
+(at (xasc Q 'k) 'b)                          -- (Rc T Kk 'v first)
+(at (xasc Q 'k) 'c)                          -- (Rc T Kk 'i (fn [x] (first (at V x))))
+;; under a bare expression key
+(Sk (select {s: (max (+ v (count v))) from: T by: (% v 2)}) 'v)        -- (Rc T K2 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (max (+ v (count v))) from: T by: (== g 'a)}) 'g)      -- (Rc T Kg 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (avg (+ v (first (at V i)))) from: T by: (% v 2)}) 'v) -- (R T K2 (fn [r] (avg (+ (at r 'v) (first (at V (at r 'i)))))))
+;; a SYM column key
+(Sk (select {s: (max (+ v (count v))) from: T by: g}) 'g)              -- (Rc T (at T 'g) 'v (fn [x] (max (+ x (count x)))))
+;; the keyless form, for parity
+(at (select {s: (max (+ v (count v))) from: T}) 's)                    -- (enlist (max (+ (at T 'v) (count (at T 'v)))))
+
+;; ── where: ──────────────────────────────────────────────────────────────────
+(set W (select {from: T where: (> v 2)}))
+(Sk (select {s: (max (+ v (count v))) from: T where: (> v 2) by: k}) 'k)   -- (Rc W (at W 'k) 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (first (at V i)) from: T where: (> v 2) by: (% v 2)}) 'v)  -- (Rc W (% (at W 'v) 2) 'i (fn [x] (first (at V x))))
+(Sk (select {s: (max (+ v (count v))) from: T where: (> v 2) by: (% v 2)}) 'v)  -- (Rc W (% (at W 'v) 2) 'v (fn [x] (max (+ x (count x)))))
+(count (select {s: (max (+ v (count v))) from: T where: (> v 100) by: k}))       -- 0
+(count (select {s: (first (at V i)) from: T where: (> v 100) by: (% v 2)}))      -- 0
+
+;; ── multi-key by: ───────────────────────────────────────────────────────────
+(set KJ (+ (* 10 (at T 'k)) (at T 'j)))
+(Sk (select {s: (max (+ v (count v))) from: T by: [k j]}) [k j])       -- (Rc T KJ 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (sum (- v (min v))) from: T by: [k j]}) [k j])         -- (Rc T KJ 'v (fn [x] (sum (- x (min x)))))
+(Sk (select {s: (max (+ v (count v))) from: T by: {kk: (+ (* 10 k) j)}}) 'kk)  -- (Rc T KJ 'v (fn [x] (max (+ x (count x)))))
+
+;; ── the spelling does not change the answer ────────────────────────────────
+;; a helper the planner inlines nests as the written-out form does: the inner
+;; count is the group's, never the table's
+(set h (fn [x] (+ x (count x))))
+(set hm (fn [x] (let y x) (+ y (count y))))
+(set hs (fn [x] (sum x)))
+(Sk (select {s: (max (h v)) from: T by: k}) 'k)                -- (Sk (select {s: (max (+ v (count v))) from: T by: k}) 'k)
+(Sk (select {s: (max (h v)) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (max (h x))))
+(Sk (select {s: (max (hm v)) from: T by: k}) 'k)               -- (Rc T Kk 'v (fn [x] (max (hm x))))
+(Sk (select {s: (+ 1 (max (h v))) from: T by: k}) 'k)          -- (Rc T Kk 'v (fn [x] (+ 1 (max (h x)))))
+(Sk (select {s: (sum (h v)) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (sum (h x))))
+(Sk (select {s: (max (h v)) from: T by: (% v 2)}) 'v)          -- (Rc T K2 'v (fn [x] (max (h x))))
+(Sk (select {s: (max (h v)) from: T where: (> v 2) by: k}) 'k) -- (Rc W (at W 'k) 'v (fn [x] (max (h x))))
+;; and a helper that refolds refolds
+(try (select {s: (max (hs v)) from: T by: k}) Re)             -- Refold
+(try (select {s: (+ 1 (max (hs v))) from: T by: (% v 2)}) Re) -- Refold
+
+;; ── a global vector as long as the table ────────────────────────────────────
+;; read elementwise it is sliced by the group, as the DAG slices it in
+;; (max (+ WV 0)); read through `at` it is the whole vector
+(set WV [10 20 30 40 50 60 70 80])
+(set TM (take true (count T)))
+(set Rw (fn [K M f] (map (fn [x] ((fn [ix] (f (at WV ix) (at T ix))) (where (and M (== K x))))) (asc (distinct (at K (where M)))))))
+(Sk (select {s: (max (+ WV 0)) from: T by: k}) 'k)                         -- (Rw Kk TM (fn [w r] (max w)))
+(Sk (select {s: (max (+ WV (count v))) from: T by: k}) 'k)                 -- (Rw Kk TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (+ 1 (max (+ WV (count v)))) from: T by: k}) 'k)          -- (Rw Kk TM (fn [w r] (+ 1 (max (+ w (count (at r 'v)))))))
+(Sk (select {s: (max (- WV (min WV))) from: T by: k}) 'k)                  -- (Rw Kk TM (fn [w r] (max (- w (min w)))))
+(Sk (select {s: (sum (* WV (count (+ v WV)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (sum (* w (count (+ (at r 'v) w))))))
+(Sk (select {s: (max (+ (+ WV (at V i)) (count v))) from: T by: k}) 'k)  -- (Rw Kk TM (fn [w r] (max (+ (+ w (at V (at r 'i))) (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T where: (> v 2) by: k}) 'k) -- (Rw Kk (> (at T 'v) 2) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T by: (% v 3)}) 'v)          -- (Rw (% (at T 'v) 3) TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T by: [k j]}) [k j])          -- (Rw KJ TM (fn [w r] (max (+ w (count (at r 'v))))))
+(set Q (select {a: (max WV) s: (max (+ WV (count v))) b: (first (at V i)) from: T by: k}))
+(at (xasc Q 'k) 'a)                                                        -- (Rw Kk TM (fn [w r] (max w)))
+(at (xasc Q 'k) 'b)                                                        -- (Rc T Kk 'i (fn [x] (first (at V x))))
+;; a vector of another length is no column: the aggregate refolds
+(set V3 [1 2 3])
+(try (select {s: (max (+ V3 (count v))) from: T by: k}) Re)               -- Refold
+;; under `at` it is the whole vector, never sliced
+(Sk (select {s: (max (+ v (at WV (count v)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (at WV (count (at r 'v)))))))
+;; read in a helper the planner inlines, as written out
+(set hw (fn [x] (+ WV (count x))))
+(Sk (select {s: (max (hw v)) from: T by: k}) 'k)                           -- (Sk (select {s: (max (+ WV (count v))) from: T by: k}) 'k)
+(Sk (select {s: (max (hw v)) from: T by: k}) 'k)                           -- (Rw Kk TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ v (hw v))) from: T by: k}) 'k)                     -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
+(Sk (select {s: (max (+ v (hw v))) from: T where: (> v 2) by: k}) 'k)     -- (Rw Kk (> (at T 'v) 2) (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
+
+;; ── the shapes dev answered keep their route ────────────────────────────────
+;; an aggregate the DAG declines for temporal arithmetic, under a bare key,
+;; keeps the grouping it had: keys in order, take: the first groups
+(set TD (table [k v d] (list [0 1 2 0 1 2 0 0] [1 2 3 4 5 6 7 8] (+ 2024.01.01 [5 3 1 7 2 9 4 6]))))
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 'v)                 -- [0 1 2]
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 's)                 -- [2024.01.03 2024.01.07 2024.01.05]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'v)  -- [0 1]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'a)  -- [9 12]
+(at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 'v)               -- [0 5]
+(at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 's)               -- [2024.01.09 2024.01.08]
+(at (select {s: (first (+ d 1)) from: TD by: (+ k 0)}) 's)                 -- [2024.01.07 2024.01.05 2024.01.03]
+
+;; ── errors still stand ──────────────────────────────────────────────────────
+;; a misspelt column is schema, as in the keyless select
+(try (select {s: (max (+ zz (count v))) from: T by: k}) (fn [e] (at e 'code)))          -- 'schema
+(try (select {s: (max (+ v (count zz))) from: T by: k}) (fn [e] (at e 'code)))          -- 'schema
+(try (select {s: (+ 1 (max (+ v (count zz)))) from: T by: k}) (fn [e] (at e 'code)))    -- 'schema
+(try (select {s: (max (+ v (count zz))) from: T by: (% v 2)}) (fn [e] (at e 'code)))    -- 'schema
+(try (select {s: (max (+ v (count zz))) from: T}) (fn [e] (at e 'code)))                -- 'schema
+(try (select {s: (first (+ zz 1)) from: T by: (% v 2)}) (fn [e] (at e 'code)))          -- 'schema
+(try (select {s: (first (at V i)) from: T by: (% zz 2)}) (fn [e] (at e 'code)))         -- 'schema
+;; an undefined name inside a call the DAG has no node for is name
+(try (select {s: (max (+ v (count (at V zz)))) from: T by: k}) (fn [e] (at e 'code)))   -- 'name
+(try (select {s: (first (at V zz)) from: T by: (% v 2)}) (fn [e] (at e 'code)))         -- 'name
+;; a type error raises, also when no row is kept
+(try (select {s: (max (+ v (sum (+ v "x")))) from: T by: k}) (fn [e] (at e 'code)))                  -- 'type
+(try (select {s: (max (+ v (sum (+ v "x")))) from: T where: (> v 100) by: k}) (fn [e] (at e 'code))) -- 'type
+(try (select {s: (max (+ v (sum (+ v "x")))) from: T where: (> v 100) by: (% v 2)}) (fn [e] (at e 'code))) -- 'type
+(try (select {s: (sum (+ v "x")) from: T where: (> v 100) by: (% v 2)}) (fn [e] (at e 'code)))     -- 'type
+;; an aggregate that folds only aggregates of the group has no rows left to
+;; fold, written out or through an alias, under any key
+(try (select {s: (max (sum v)) from: T by: k}) Re)                       -- Refold
+(try (select {s: (max (+ (sum v) 1)) from: T by: k}) Re)                 -- Refold
+(try (select {s: (+ 1 (min (sum v))) from: T by: k}) Re)                 -- Refold
+(try (select {s: (max (+ v (sum (count v)))) from: T by: k}) Re)         -- Refold
+(try (select {s: (max (sum v)) from: T by: (% v 2)}) Re)                 -- Refold
+(try (select {s: (max (sum v)) from: T by: [k j]}) Re)                   -- Refold
+(try (select {s: (max (sum v)) from: T where: (> v 100) by: k}) Re)     -- Refold
+(try (select {a: (sum v) s: (max a) from: T by: k}) (fn [e] (at e 'code)))              -- 'domain
+
+;; ── parted ──────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_by_nested_aggregate/") -- 0
+(set mkP (fn [o] (select {from: T where: (== (% (til (count T)) 2) o)})))
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/p/2024.01.01/t/" (mkP 0) "/tmp/rfl_by_nested_aggregate/p/.sym")
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/p/2024.01.02/t/" (mkP 1) "/tmp/rfl_by_nested_aggregate/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_by_nested_aggregate/p/" 't))
+(set F (select {from: P}))
+(set FW (select {from: F where: (> v 2)}))
+(Sk (select {s: (max (+ v (count v))) from: P by: k}) 'k)                   -- (Rc F (at F 'k) 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (+ 1 (max (+ v (count v)))) from: P by: k}) 'k)            -- (Rc F (at F 'k) 'v (fn [x] (+ 1 (max (+ x (count x))))))
+(Sk (select {s: (max (+ v (count v))) from: P where: (> v 2) by: k}) 'k)    -- (Rc FW (at FW 'k) 'v (fn [x] (max (+ x (count x)))))
+(Sk (select {s: (first (at V i)) from: P by: (% v 2)}) 'v)                  -- (Rc F (% (at F 'v) 2) 'i (fn [x] (first (at V x))))
+(Sk (select {s: (sum (at V i)) from: P where: (> v 2) by: (% v 2)}) 'v)     -- (Rc FW (% (at FW 'v) 2) 'i (fn [x] (sum (at V x))))
+(Sk (select {s: (max (+ v (count v))) from: P by: (% v 2)}) 'v)             -- (Rc F (% (at F 'v) 2) 'v (fn [x] (max (+ x (count x)))))
+(try (select {s: (max (+ v (count zz))) from: P by: k}) (fn [e] (at e 'code)))  -- 'schema
+(try (select {s: (max (sum v)) from: P by: k}) Re)                          -- Refold
+(set WF (* 10 (at F 'v)))
+(set PW (fn [K M f] (map (fn [x] ((fn [ix] (f (at WF ix) (at F ix))) (where (and M (== K x))))) (asc (distinct (at K (where M)))))))
+(Sk (select {s: (max (+ WF (count v))) from: P by: k}) 'k)                  -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WF (count v))) from: P where: (> v 2) by: k}) 'k)   -- (PW (at F 'k) (> (at F 'v) 2) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (h v)) from: P by: k}) 'k)                             -- (Rc F (at F 'k) 'v (fn [x] (max (h x))))
+(set hf (fn [x] (+ WF (count x))))
+(Sk (select {s: (max (hf v)) from: P by: k}) 'k)                            -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ v (hf v))) from: P by: k}) 'k)                      -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ (at r 'v) (+ w (count (at r 'v)))))))
+;; a DATE plus an integer over a parted table under a bare key: that route
+;; has no key column for it there, so it takes the by-dict form
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/pd/2024.01.01/t/" (select {from: TD where: (== (% (til (count TD)) 2) 0)}) "/tmp/rfl_by_nested_aggregate/pd/.sym")
+(.db.splayed.set "/tmp/rfl_by_nested_aggregate/pd/2024.01.02/t/" (select {from: TD where: (== (% (til (count TD)) 2) 1)}) "/tmp/rfl_by_nested_aggregate/pd/.sym")
+(set PD (.db.parted.get "/tmp/rfl_by_nested_aggregate/pd/" 't))
+(set FD (select {from: PD}))
+(Sk (select {s: (first (+ d 1)) from: PD by: (% v 3)}) 'v)   -- (Rc FD (% (at FD 'v) 3) 'd (fn [x] (first (+ x 1))))
+(Sk (select {s: (max (- d 1)) from: PD by: (% v 3)}) 'v)     -- (Rc FD (% (at FD 'v) 3) 'd (fn [x] (max (- x 1))))
+(Sk (select {s: (first (+ d 1)) from: PD where: (> v 2) by: (% v 3)}) 'v)  -- (Rc (select {from: FD where: (> v 2)}) (% (at (select {from: FD where: (> v 2)}) 'v) 3) 'd (fn [x] (first (+ x 1))))
+(Sk (select {s: (first (+ d 1)) from: PD by: (xbar v 5)}) 'v)  -- (Rc FD (xbar (at FD 'v) 5) 'd (fn [x] (first (+ x 1))))
+;; the mapped table goes first, so the unfused pass can write the fixture again
+(set P 0)
+(set F 0)
+(set FW 0)
+(set PD 0)
+(set FD 0)
+(.sys.exec "rm -rf /tmp/rfl_by_nested_aggregate/") -- 0

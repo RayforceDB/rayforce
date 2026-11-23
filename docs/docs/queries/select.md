@@ -82,7 +82,9 @@ aggregate's argument a name that is a source column is always the source
 column, so `s: (sum s) mx: (max s)` takes the maximum of the rows, not of a
 sum. An aggregate cannot be aggregated again, through an alias or written
 out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
-`domain`. And an output may not mix a source column with a reference to an earlier
+`domain`. An aggregate that still folds the group's rows may use one:
+`mx: (max (+ price (count price)))` adds each group's count to its prices
+and takes the largest. And an output may not mix a source column with a reference to an earlier
 per-group alias outside an aggregate: `f: (* price n)` with `n: (count price)` raises
 `domain`; write `(* (sum price) n)` or whichever aggregate is meant.
 
