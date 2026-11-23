@@ -1,0 +1,101 @@
+;; @also-unfused
+;; @requires: posix  (parted fixture under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; An expression around an aggregate the DAG cannot lower answers per group
+;; under by:, as the lone aggregate does (issue #1444).
+;;
+;; `(first (at V i))` over a global vector has no DAG node, so alone it is
+;; evaluated per group.  Wrapped, `(+ 0 (first (at V i)))`, the output was
+;; taken for an arithmetic of aggregates: the aggregate became a hidden slot
+;; of the group pass, its argument failed to compile there, and the select
+;; raised "select by: failed to compile aggregation argument".  A slot whose
+;; argument declines now leaves the whole output to the per-group
+;; evaluation.  Each answer is pinned against the expression evaluated
+;; eagerly over each group's rows.
+
+(set V [100 250 300 475 500 600 725 800])
+(set T (table [k j i v] (list [0 1 0 1 0 1 2 2] [0 0 1 1 0 0 1 1] [5 4 3 2 1 0 7 6] [1 2 3 4 5 6 7 8])))
+(set S (fn [q] (at q 's)))
+;; the groups in key order: s of a by: result, and f over each group's i
+(set Sk (fn [q c] (at (xasc q c) 's)))
+(set G (fn [t K f] (map (fn [g] (f (at (at t 'i) (where (== K g))))) (asc (distinct K)))))
+(set Gk (fn [f] (G T (at T 'k) f)))
+
+;; ── the issue's forms ───────────────────────────────────────────────────────
+(S (select {s: (+ 0 (first (at V i))) from: T by: k}))                    -- [600 500 800]
+(Sk (select {s: (+ 0 (first (at V i))) from: T by: k}) 'k)                    -- (Gk (fn [x] (+ 0 (first (at V x)))))
+(Sk (select {s: (+ (first (at V i)) (last (at V i))) from: T by: k}) 'k)      -- (Gk (fn [x] (+ (first (at V x)) (last (at V x)))))
+(Sk (select {s: (first (at V i)) from: T by: k}) 'k)                          -- (Gk (fn [x] (first (at V x))))
+(type (S (select {s: (+ 0 (first (at V i))) from: T by: k})))             -- 'I64
+
+;; ── each aggregate under a wrapper ──────────────────────────────────────────
+(Sk (select {s: (+ 0 (last (at V i))) from: T by: k}) 'k)                     -- (Gk (fn [x] (+ 0 (last (at V x)))))
+(Sk (select {s: (+ 0 (sum (at V i))) from: T by: k}) 'k)                      -- (Gk (fn [x] (+ 0 (sum (at V x)))))
+(Sk (select {s: (+ 0 (max (at V i))) from: T by: k}) 'k)                      -- (Gk (fn [x] (+ 0 (max (at V x)))))
+(Sk (select {s: (+ 0 (min (at V i))) from: T by: k}) 'k)                      -- (Gk (fn [x] (+ 0 (min (at V x)))))
+(Sk (select {s: (+ 0 (avg (at V i))) from: T by: k}) 'k)                      -- (Gk (fn [x] (+ 0 (avg (at V x)))))
+(Sk (select {s: (+ 0 (count (at V i))) from: T by: k}) 'k)                    -- (Gk (fn [x] (+ 0 (count (at V x)))))
+(Sk (select {s: (- (max (at V i)) (min (at V i))) from: T by: k}) 'k)         -- (Gk (fn [x] (- (max (at V x)) (min (at V x)))))
+
+;; ── nested wrappers, and a compiled aggregate beside the declined one ──────
+(Sk (select {s: (+ 1 (* 2 (first (at V i)))) from: T by: k}) 'k)              -- (Gk (fn [x] (+ 1 (* 2 (first (at V x))))))
+(Sk (select {s: (/ (sum (at V i)) (count (at V i))) from: T by: k}) 'k)       -- (Gk (fn [x] (/ (sum (at V x)) (count (at V x)))))
+(S (select {s: (+ (sum v) (first (at V i))) from: T by: k}))              -- [609 512 815]
+(S (select {s: (+ (sum v) (first (at V i))) a: (sum v) b: (+ 0 (first v)) from: T by: k}))  -- [609 512 815]
+(Sk (select {a: (sum v) b: (+ 0 (first v)) s: (+ 0 (first (at V i))) from: T by: k}) 'k)        -- (Gk (fn [x] (+ 0 (first (at V x)))))
+(at (select {a: (sum v) b: (+ 0 (first v)) s: (+ 0 (first (at V i))) from: T by: k}) 'a)    -- [9 12 15]
+(at (select {a: (sum v) b: (+ 0 (first v)) s: (+ 0 (first (at V i))) from: T by: k}) 'b)    -- [1 2 7]
+
+;; ── string wrappers ─────────────────────────────────────────────────────────
+(Sk (select {s: (format "%" (first (at V i))) from: T by: k}) 'k)             -- (Gk (fn [x] (format "%" (first (at V x)))))
+(S (select {s: (format "%" (first (at V i))) from: T by: k}))             -- ["600" "500" "800"]
+(Sk (select {s: (as 'STR (last (at V i))) from: T by: k}) 'k)                 -- (Gk (fn [x] (as 'STR (last (at V x)))))
+
+;; ── a DATE plus an integer, which the DAG aggregate also declines ──────────
+(set D (table [k d] (list [0 1 0 1] [2024.01.01 2024.01.02 2024.01.03 2024.01.04])))
+(at (select {s: (first (+ d 1)) from: D by: k}) 's)                       -- [2024.01.02 2024.01.03]
+(at (select {s: (+ 0 (first (+ d 1))) from: D by: k}) 's)                 -- [2024.01.02 2024.01.03]
+(at (select {s: (- (max (+ d 1)) (min d)) from: D by: k}) 's)             -- [3 3]
+
+;; ── where: ──────────────────────────────────────────────────────────────────
+(set W (select {from: T where: (> v 1)}))
+(Sk (select {s: (+ 1 (* 2 (first (at V i)))) from: T where: (> v 1) by: k}) 'k)   -- (G W (at W 'k) (fn [x] (+ 1 (* 2 (first (at V x))))))
+(Sk (select {s: (+ 0 (sum (at V i))) from: T where: (> v 1) by: k}) 'k)           -- (G W (at W 'k) (fn [x] (+ 0 (sum (at V x)))))
+(count (S (select {s: (+ 0 (first (at V i))) from: T where: (> v 100) by: k})))  -- 0
+
+;; ── multi-key by: ───────────────────────────────────────────────────────────
+(set KJ (+ (* 10 (at T 'k)) (at T 'j)))
+(Sk (select {s: (+ 1 (* 2 (first (at V i)))) from: T by: [k j]}) [k j])         -- (G T KJ (fn [x] (+ 1 (* 2 (first (at V x))))))
+(Sk (select {s: (+ (first (at V i)) (last (at V i))) from: T by: [k j]}) [k j])  -- (G T KJ (fn [x] (+ (first (at V x)) (last (at V x)))))
+(Sk (select {s: (+ 0 (max (at V i))) from: T by: {kk: (+ (* 10 k) j)}}) 'kk)   -- (G T KJ (fn [x] (+ 0 (max (at V x)))))
+
+;; ── keyless: the same answer over the whole table ──────────────────────────
+(S (select {s: (+ 0 (first (at V i))) from: T}))                          -- (enlist (+ 0 (first (at V (at T 'i)))))
+(S (select {s: (+ (first (at V i)) (last (at V i))) from: T}))            -- (enlist (+ (first (at V (at T 'i))) (last (at V (at T 'i)))))
+(S (select {s: (+ 0 (avg (at V i))) from: T}))                            -- (enlist (+ 0 (avg (at V (at T 'i)))))
+
+;; ── a missing column still raises ──────────────────────────────────────────
+(try (select {s: (+ 0 (first (+ zz 1))) from: T by: k}) (fn [e] (at e 'code)))   -- 'schema
+(try (select {s: (+ 0 (first zz)) from: T by: k}) (fn [e] (at e 'code)))         -- 'schema
+(try (select {s: (+ 0 (first (+ v zz))) from: T by: k}) (fn [e] (at e 'code)))   -- 'schema
+(try (select {s: (+ 0 (first (at V zz))) from: T by: k}) (fn [e] (at e 'code)))  -- 'name
+;; an argument that fails to lower raises even when no row is kept, alone or
+;; wrapped: it does not go to a per-group evaluation that runs on no group
+(try (select {s: (sum (+ v "x")) from: T where: (> v 100) by: k}) (fn [e] (at e 'code)))      -- 'type
+(try (select {s: (+ 0 (sum (+ v "x"))) from: T where: (> v 100) by: k}) (fn [e] (at e 'code))) -- 'type
+
+;; ── parted ──────────────────────────────────────────────────────────────────
+(.sys.exec "rm -rf /tmp/rfl_by_wrapped_aggregate/") -- 0
+(set mkP (fn [o] (select {from: T where: (== (% (til (count T)) 2) o)})))
+(.db.splayed.set "/tmp/rfl_by_wrapped_aggregate/p/2024.01.01/t/" (mkP 0) "/tmp/rfl_by_wrapped_aggregate/p/.sym")
+(.db.splayed.set "/tmp/rfl_by_wrapped_aggregate/p/2024.01.02/t/" (mkP 1) "/tmp/rfl_by_wrapped_aggregate/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_by_wrapped_aggregate/p/" 't))
+(set F (select {from: P}))
+(Sk (select {s: (+ 0 (first (at V i))) from: P by: k}) 'k)                    -- (G F (at F 'k) (fn [x] (+ 0 (first (at V x)))))
+(Sk (select {s: (+ (first (at V i)) (last (at V i))) from: P by: k}) 'k)      -- (G F (at F 'k) (fn [x] (+ (first (at V x)) (last (at V x)))))
+(Sk (select {s: (+ 0 (sum (at V i))) from: P where: (> v 1) by: k}) 'k)       -- (G (select {from: F where: (> v 1)}) (at (select {from: F where: (> v 1)}) 'k) (fn [x] (+ 0 (sum (at V x)))))
+(Sk (select {s: (format "%" (max (at V i))) from: P by: k}) 'k)               -- (G F (at F 'k) (fn [x] (format "%" (max (at V x)))))
+(S (select {s: (+ 0 (first (at V i))) from: P}))                          -- (enlist (+ 0 (first (at V (at F 'i)))))
+;; the mapped table goes first, so the unfused pass can write the fixture again
+(set P 0)
+(set F 0)
+(.sys.exec "rm -rf /tmp/rfl_by_wrapped_aggregate/") -- 0
