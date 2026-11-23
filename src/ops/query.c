@@ -11460,11 +11460,18 @@ static ray_t* nonagg_first_last_hidden(ray_t* e, ray_t* tbl, idx_feeder_fn feede
     return out ? out : ray_error("oom", NULL);
 }
 
+static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res);
+static ray_t* rw_cells_as_temporal(ray_t* res, int8_t tt);
+
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
     ray_t* split = nonagg_rowwise_if_split(expr, tbl, feeder, fstate, n_groups);
     if (split) return split;
+    /* the caller's expression and table: the hoist below swaps both for
+     * objects this function owns and drops before it returns */
+    ray_t* expr0 = expr;
+    ray_t* tbl0 = tbl;
     /* an `if` beside or under an aggregate: its column over the rows */
     if_hoist_t hs = { .tbl = tbl };
     ray_t* hoisted = NULL;
@@ -11507,7 +11514,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     if (hs.out) ray_release(hs.out);
     for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
     g_query_dependencies = prev;
-    return result;
+    return rw_if_cells_check(expr0, tbl0, result);
 }
 
 /* idx_feeder for the eval-fallback's LIST `groups` layout. */
@@ -11694,6 +11701,96 @@ ray_t* ray_active_query_literal(int64_t sym) {
     if (!cell || RAY_IS_ERR(cell)) return cell;
     if (!allocated) ray_retain(cell);
     return cell;
+}
+
+/* A per-row or per-group pass runs an `if` as control flow, one arm a row,
+ * so arms with no common type come back as a LIST of their cells where the
+ * planned routes raise (#1337, #1485): a temporal arm beside a numeric or
+ * another temporal one.  Only an `expr` that IS the `if` is judged (its
+ * cells are its arms' values; an `if` inside a call, `(at v (if c 0 1))`,
+ * does not make the call's values its arms').  Its arms, through nested
+ * `if`s in arm position, are walked for null literals: a null cell of a
+ * null literal's type is that literal and takes the other arms' type, as
+ * ray_if makes it; any other cell, a computed null included, counts by its
+ * type.  A mix raises the planner's error; one temporal type is that
+ * type's column.  `res` is consumed; anything else is returned as it is. */
+static bool rw_cell_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+}
+static bool rw_cell_numeric(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
+           t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
+}
+/* The types of the null literal arms of the `if` `e` into `nt` (a bitmap
+ * over atom types), through nested `if`s in arm position. */
+static void rw_if_null_arms(ray_t* e, ray_t* tbl, uint64_t* nt, int depth);
+static void rw_if_null_arm(ray_t* arm, ray_t* tbl, uint64_t* nt, int depth) {
+    if (arm && ray_is_atom(arm) && RAY_ATOM_IS_NULL(arm)) {
+        int8_t t = (int8_t)-arm->type;
+        if (t > 0 && t < 64) *nt |= (uint64_t)1 << t;
+    } else rw_if_null_arms(arm, tbl, nt, depth + 1);
+}
+static void rw_if_null_arms(ray_t* e, ray_t* tbl, uint64_t* nt, int depth) {
+    if (depth > 32 || !rw_if_kind(e, tbl)) return;
+    /* (if c1 a1 c2 a2 ... else): arms at the even slots, the else last */
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 2; i < e->len - 1; i += 2) rw_if_null_arm(es[i], tbl, nt, depth);
+    rw_if_null_arm(es[e->len - 1], tbl, nt, depth);
+}
+static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res) {
+    if (!res || RAY_IS_ERR(res) || res->type != RAY_LIST || res->len == 0 || !tbl ||
+        tbl->type != RAY_TABLE || !rw_if_kind(expr, tbl)) return res;
+    uint64_t nt = 0;
+    rw_if_null_arms(expr, tbl, &nt, 0);
+    ray_t** cells = (ray_t**)ray_data(res);
+    int8_t tt = 0, other = 0;
+    for (int64_t i = 0; i < res->len; i++) {
+        ray_t* c = cells[i];
+        if (!c || !ray_is_atom(c)) return res;
+        int8_t t = (int8_t)-c->type;
+        if (!rw_cell_temporal(t) && !rw_cell_numeric(t)) return res;
+        if (RAY_ATOM_IS_NULL(c) && t > 0 && t < 64 && (nt >> t & 1)) continue;
+        if (rw_cell_temporal(t)) {
+            if (tt == 0) tt = t;
+            else if (t != tt) { other = t; break; }
+        } else if (!other) other = t;
+    }
+    if (!tt) return res;                          /* numbers only: as before */
+    if (other) {
+        ray_release(res);
+        return ray_error("type", "if: branches mix %s and %s", ray_type_name(tt), ray_type_name(other));
+    }
+    return rw_cells_as_temporal(res, tt);
+}
+
+/* An `if` under a call of the per-row pass, `(+ 0 (if c d i))`, yields
+ * its cells to the call, so its arms are judged on its own cells
+ * (rw_if_cells_check): each such `if` without an effect, reached through
+ * builtin calls as rw_has_if reaches it, is run per row by itself.  An
+ * error, a mix among them, is the query's; NULL when none is found. */
+static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows);
+static ray_t* rw_inner_ifs_check(ray_t* e, ray_t* tbl, int64_t nrows, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32)
+        return NULL;
+    if (depth > 0 && rw_if_kind(e, tbl)) {
+        if (!rw_pure(e, tbl, 0)) return NULL;
+        ray_t* v = eval_expr_per_row_impl(e, tbl, nrows);
+        if (v && RAY_IS_ERR(v)) return v;
+        if (v) ray_release(v);
+        return NULL;
+    }
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
+        return NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* err = rw_inner_ifs_check(es[i], tbl, nrows, depth + 1);
+        if (err) return err;
+    }
+    return NULL;
 }
 
 static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
@@ -11901,7 +11998,12 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
         result->type = RAY_LIST;
         result->len = 0;
     }
-    return result;
+    if (!RAY_IS_ERR(result) && result->type == RAY_LIST && tbl && tbl->type == RAY_TABLE &&
+        !rw_if_kind(expr, tbl) && rw_has_if(expr, tbl, 0)) {
+        ray_t* err = rw_inner_ifs_check(expr, tbl, nrows, 0);
+        if (err) { ray_release(result); return err; }
+    }
+    return rw_if_cells_check(expr, tbl, result);
 }
 
 static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {
@@ -12098,6 +12200,21 @@ static _Thread_local uint32_t g_if_mixes;
  * no type for gets the per-row boxing (rw_list_blend).  An arm that is not
  * one value per row: a `length` error when it reads the rows (it has no
  * value for some of them), else it stands whole in every row. */
+/* A LIST of the temporal type `tt`'s cells and of nulls as that type's
+ * column; `res` is consumed. */
+static ray_t* rw_cells_as_temporal(ray_t* res, int8_t tt) {
+    ray_t** cells = (ray_t**)ray_data(res);
+    ray_t* out = ray_vec_new(tt, res->len);
+    if (!out || RAY_IS_ERR(out)) { ray_release(res); return out ? out : ray_error("oom", NULL); }
+    out->len = res->len;
+    for (int64_t i = 0; i < res->len; i++) {
+        if (RAY_ATOM_IS_NULL(cells[i])) ray_vec_set_null(out, i, true);
+        else store_typed_elem(out, i, cells[i]);
+    }
+    ray_release(res);
+    return out;
+}
+
 static ray_t* rw_blend(ray_t* cv, ray_t* tv, ray_t* ev, ray_t* te, ray_t* ee, rw_ctx_t* c) {
     ray_t* out = NULL;
     bool tw = rw_row_shaped(tv, c), ew = rw_row_shaped(ev, c);
