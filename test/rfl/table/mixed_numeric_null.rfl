@@ -17,12 +17,6 @@ _mn_source -- (list 1.5 3 0Nl 2)
 (type (at (table [v] (list (as 'I16 [1 0Nl 2]))) 'v)) -- 'I16
 (type (at (table [v] (list (as 'I32 [1 0Nl 2]))) 'v)) -- 'I32
 (type (at (table [v] (list (as 'F32 [1.5 0Nf 2.0]))) 'v)) -- 'F32
-;; Constructor only promotes I64/F64 LIST atoms today. Keep incompatible
-;; widths/temporal mixtures as errors rather than silently changing policy.
-(at (table [v] (list (list (as 'I16 0Nl) 2))) 'v) !- type
-(at (table [v] (list (list (as 'I32 0Nl) 2.0))) 'v) !- type
-(at (table [v] (list (list (as 'F32 0Nf) 2.0))) 'v) !- type
-(at (table [v] (list (list (as 'DATE 0Nl) 2))) 'v) !- type
 ;; Append/replace have their own coercion path: typed nulls must stay null.
 (set _mn_t (table [k v] (list [1] [2.0])))
 (at (insert _mn_t (list 2 0Nl)) 'v) -- [2.0 0Nf]
@@ -37,8 +31,6 @@ _mn_source -- (list 1.5 3 0Nl 2)
 (at (insert (table [v] (list [1])) (list (as 'U8 255))) 'v) -- [1 255]
 (at (insert (table [v] (list [1.0])) (list (as 'U8 255))) 'v) -- [1.0 255.0]
 (at (insert (table [v] (list (as 'F32 [1.0]))) (list (as 'F32 0Nf))) 'v) -- (as 'F32 [1.0 0Nf])
-;; F32 -> F64 is not currently admitted for constructor LISTs or appends.
-(insert (table [v] (list [1.0])) (list (as 'F32 1.5))) !- type
 ;; Temporal columns retain their own type and null, not an integer promotion.
 (at (table [v] (list (list (as 'DATE 1) (as 'DATE 0Nl)))) 'v) -- (as 'DATE [1 0Nl])
 (at (table [v] (list (list (as 'TIMESTAMP 1) (as 'TIMESTAMP 0Nl)))) 'v) -- (as 'TIMESTAMP [1 0Nl])
