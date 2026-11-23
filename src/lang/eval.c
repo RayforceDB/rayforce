@@ -2699,9 +2699,8 @@ ray_t* ray_list_fn(ray_t** args, int64_t n) {
     return result;
 }
 
-/* BOOL and U8 are not part of numeric widening in the table constructor. */
 static bool table_widens_atom(int8_t t) {
-    return t <= -RAY_I16 && t >= -RAY_F64;
+    return t <= -RAY_BOOL && t >= -RAY_F64;
 }
 
 /* (table [col_names] (list col1 col2 ...)) — build a RAY_TABLE */
@@ -2867,8 +2866,11 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 }
                 if (numeric) {
                     if (cell_is_null) ray_vec_set_null(col_vec, j, true);
-                    else if (col_type == RAY_F64) ((double*)ray_data(col_vec))[j] = as_f64(cell);
-                    else store_typed_elem(col_vec, j, cell);
+                    else if (col_type == RAY_F64) ((double*)ray_data(col_vec))[j] = (cell->type == -RAY_F64 ? cell->f64 : as_f64(cell));
+                    else if (cell->type == -RAY_BOOL && col_type != RAY_BOOL) {
+                        ray_t n = { .type = -RAY_I64, .i64 = cell->b8 ? 1 : 0 };
+                        store_typed_elem(col_vec, j, &n);
+                    } else store_typed_elem(col_vec, j, cell);
                 } else {
                     const void* payload = col_type == RAY_BOOL ? (void*)&cell->b8 : (void*)&cell->i64;
                     col_vec = ray_vec_append(col_vec, payload);

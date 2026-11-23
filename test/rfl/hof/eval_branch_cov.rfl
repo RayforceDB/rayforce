@@ -66,7 +66,7 @@
 ;; element type mismatch in F64 column (non-promotable) → type
 (table ['a] (list (list 1.5 'x))) !- type
 ;; element type mismatch in BOOL column → type
-(table ['a] (list (list true 5))) !- type
+(table ['a] (list (list true "x"))) !- type
 ;; element type mismatch in SYM column → type
 (table ['a] (list (list 'a 5))) !- type
 ;; element type mismatch in STR column → type (line 1328)
