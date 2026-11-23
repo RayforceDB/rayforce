@@ -113,3 +113,45 @@
 (set floatRows (+ big 1.5))
 (== (sum (+ big 1.5)) (sum floatRows)) -- true
 (== (sum (+ 1.5 big)) (sum floatRows)) -- true
+
+;; TIME is not an integer literal: keep both the value and SUM's type.
+(set ticks [5 7])
+(set clock 00:00:00.010)
+(set clockRows (+ clock ticks))
+(type (sum (+ 00:00:00.010 ticks))) -- 'time
+(sum (+ 00:00:00.010 ticks)) -- (sum clockRows)
+(type (sum (+ ticks 00:00:00.010))) -- 'time
+(sum (+ ticks 00:00:00.010)) -- (sum clockRows)
+
+;; An integer literal also leaves a computed TIME vector on the ordinary path.
+(set clocks (as 'TIME ticks))
+(set shifted (+ clocks 1))
+(type (sum (+ (as 'TIME ticks) 1))) -- 'time
+(sum (+ 1 (as 'TIME ticks))) -- (sum shifted)
+
+;; Narrow integer literals still produce I64 for an I64 vector.
+(sum (+ (til 5) 1h)) -- 15
+(sum (+ 2i (til 5))) -- 20
+
+;; Nontrivial operands run once, whether fusion succeeds or declines.
+(set visits 0)
+(sum (+ (do (set visits (+ visits 1)) [9223372036854775807 4]) 1)) -- 5
+visits -- 1
+(sum (+ 1 (do (set visits (+ visits 1)) [4 9223372036854775807]))) -- 5
+visits -- 2
+(sum (+ 1 (do (set visits (+ visits 1)) [0Nl 2]))) -- 3
+visits -- 3
+(sum (+ (do (set visits (+ visits 1)) [1.5 2.5]) 1)) -- 6.0
+visits -- 4
+(try (sum (+ 1 (do (set visits (+ visits 1)) (raise 71)))) (fn [e] e)) -- 71
+visits -- 5
+
+;; Dispatch is by resolved callee rather than spelling. An ordinary shadow
+;; can reorder noncommutative operands; a special form controls evaluation.
+(set savedPlus +)
+(set + -)
+(sum (+ 1 ticks)) -- -10
+(sum (+ ticks 1)) -- 10
+(set + and)
+(sum (+ false (raise 99))) -- false
+(set + savedPlus)

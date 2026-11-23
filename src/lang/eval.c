@@ -401,27 +401,6 @@ static ray_t* materialize_owned_args(ray_t** args, int64_t n) {
     return NULL;
 }
 
-static int64_t numeric_atom_i64(ray_t* x) {
-    switch (x->type) {
-    case -RAY_I64:
-    case -RAY_TIMESPAN:
-    case -RAY_TIMESTAMP:
-    case -RAY_SYM:
-        return x->i64;
-    case -RAY_I32:
-    case -RAY_DATE:
-    case -RAY_TIME:
-        return x->i32;
-    case -RAY_I16:
-        return x->i16;
-    case -RAY_U8:
-    case -RAY_BOOL:
-        return x->u8;
-    default:
-        return (int64_t)as_f64(x);
-    }
-}
-
 static ray_t* materialize_owned_value(ray_t* x) {
     if (x && ray_is_lazy(x))
         x = ray_lazy_materialize(x);
@@ -575,51 +554,17 @@ static bool affine_i64_scan(affine_sum_cache_entry_t* ce) {
     return true;
 }
 
-static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
-    *handled = 0;
-    if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
-        return NULL;
-    ray_t** e = (ray_t**)ray_data(expr);
-    if (!e[0] || e[0]->type != -RAY_SYM)
-        return NULL;
-    ray_t* name = ray_sym_str(e[0]->i64);
-    if (!name || ray_str_len(name) != 1 || ray_str_ptr(name)[0] != '+')
-        return NULL;
+/* Borrow the ordinary addition's evaluated operands; only a syntactic
+ * integer literal qualifies. NULL declines without consuming either ref. */
+static bool affine_literal(ray_t* x) {
+    return (x->type == -RAY_I64 || x->type == -RAY_I32 ||
+            x->type == -RAY_I16 || x->type == -RAY_U8) && !RAY_ATOM_IS_NULL(x);
+}
 
-    ray_t* vec_expr = NULL;
-    ray_t* c_expr = NULL;
-    if (ray_is_atom(e[1]) && is_numeric(e[1])) {
-        c_expr = e[1];
-        vec_expr = e[2];
-    } else if (ray_is_atom(e[2]) && is_numeric(e[2])) {
-        vec_expr = e[1];
-        c_expr = e[2];
-    } else {
+static ray_t* try_sum_affine(ray_t* vec, ray_t* literal) {
+    if (vec->type != RAY_I64 || ray_vec_may_have_nulls(vec) ||
+        ray_arith_type(vec->type, -literal->type) != RAY_I64)
         return NULL;
-    }
-    /* Only fold a plain I64 column plus an I64 literal. In particular, a
-     * floating addition rounds per row and a TIMESPAN sum keeps its type.
-     * Decline computed operands before evaluating them: fallback must not
-     * evaluate an expression with side effects twice. */
-    if (c_expr->type != -RAY_I64 || RAY_ATOM_IS_NULL(c_expr) ||
-        !vec_expr || vec_expr->type != -RAY_SYM)
-        return NULL;
-
-    ray_t* vec = ray_eval(vec_expr);
-    if (!vec || RAY_IS_ERR(vec)) {
-        *handled = 1;
-        return vec ? vec : ray_error("type", NULL);
-    }
-    vec = materialize_owned_value(vec);
-    if (!vec || RAY_IS_ERR(vec)) {
-        *handled = 1;
-        return vec ? vec : ray_error("type", NULL);
-    }
-    if (vec->type != RAY_I64 || ray_vec_may_have_nulls(vec)) {
-        ray_release(vec);
-        return NULL;
-    }
-    *handled = 1;
     affine_sum_cache_entry_t ce;
     if (!affine_sum_cache_lookup(vec, &ce)) {
         memset(&ce, 0, sizeof(ce));
@@ -630,18 +575,15 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         ce.attrs = vec->attrs;
         if (!ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
             if (!affine_i64_scan(&ce)) {
-                ray_release(vec);
                 return ray_error("cancel", "interrupted");
             }
         } else {
             ray_t* sum = ray_sum_fn(vec);
             if (!sum || RAY_IS_ERR(sum)) {
-                ray_release(vec);
                 return sum ? sum : ray_error("type", NULL);
             }
             sum = materialize_owned_value(sum);
             if (!sum || RAY_IS_ERR(sum)) {
-                ray_release(vec);
                 return sum ? sum : ray_error("type", NULL);
             }
             ce.sum_i = sum->i64;
@@ -653,7 +595,7 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     {
         /* Only MIN - c (mod 2^64) adds to the null sentinel. Ordinary
          * wrap is safe, but sum must skip rows that produce MIN. */
-        int64_t c = numeric_atom_i64(c_expr);
+        int64_t c = as_i64(literal);
         int64_t hit = (int64_t)((uint64_t)INT64_MIN - (uint64_t)c);
         if (ce.lo <= hit && hit <= ce.hi) {
             int64_t total = 0;
@@ -661,13 +603,11 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
                 int64_t x = ray_vec_get_i64(vec, i);
                 if (x != hit) total = wrap_add_i64(total, wrap_add_i64(x, c));
             }
-            ray_release(vec);
             return make_i64(total);
         }
     }
     int64_t n = vec->len;
-    ray_release(vec);
-    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(numeric_atom_i64(c_expr), n));
+    int64_t out = wrap_add_i64(ce.sum_i, wrap_mul_i64(as_i64(literal), n));
     return make_i64(out);
 }
 
@@ -5839,7 +5779,16 @@ static inline void eval_span_payload(ray_prof_span_t* s, ray_t* result) {
     }
 }
 
+/* Only the direct argument of ordinary SUM gets a fusion request. Nested
+ * evaluations (including special forms) enter through ray_eval as usual. */
+static ray_t* eval_impl(ray_t* obj, bool* summed);
+
 ray_t* ray_eval(ray_t* obj) {
+    return eval_impl(obj, NULL);
+}
+
+static ray_t* eval_impl(ray_t* obj, bool* summed) {
+
     if (!obj || RAY_IS_ERR(obj)) return obj;
 
     /* All eval-context state (depth, scope, restricted, nfo/trace) lives
@@ -6049,15 +5998,6 @@ ray_t* ray_eval(ray_t* obj) {
             }
             if (n != 2) { ray_release(head); ret = ray_error("arity", "expected 1 arg, got %d", (int)(n-1)); goto out; }
             uint8_t fn_attrs = head->attrs;
-            if (fn == (ray_unary_fn)ray_sum_fn) {
-                int handled = 0;
-                ray_t* fast = try_sum_affine_expr(elems[1], &handled);
-                if (handled) {
-                    ray_release(head);
-                    ret = fast ? fast : ray_error("type", NULL);
-                    rows = 0; goto out;
-                }
-            }
             if (fn == (ray_unary_fn)ray_count_fn) {
                 int handled = 0;
                 ray_t* fast = ray_try_count_select_expr(elems[1], &handled);
@@ -6078,7 +6018,9 @@ ray_t* ray_eval(ray_t* obj) {
                     rows = 0; goto out;
                 }
             }
-            ray_t* arg = ray_eval(elems[1]);
+            bool fused = false;
+            ray_t* arg = eval_impl(elems[1], fn == (ray_unary_fn)ray_sum_fn ? &fused : NULL);
+            if (fused) { ray_release(head); ret = arg; rows = 0; goto out; }
             rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }
@@ -6188,6 +6130,16 @@ ray_t* ray_eval(ray_t* obj) {
             ray_release(head);
             ray_t* result;
             rows = rowwise ? rows_join(left_rows, right_rows) : 0;
+            if (summed && fn == ray_add_fn) {
+                result = affine_literal(elems[1]) ? try_sum_affine(right, left) :
+                         affine_literal(elems[2]) ? try_sum_affine(left, right) : NULL;
+                if (result) {
+                    *summed = true;
+                    ray_release(left);
+                    ray_release(right);
+                    ret = result; goto out;
+                }
+            }
             if ((fn_attrs & RAY_FN_ATOMIC) && (is_collection(left) || is_collection(right)))
                 result = atomic_map_binary_op(fn, fn_opcode, left, right);
             else if (fn == ray_concat_fn && ray_active_query_table() &&
