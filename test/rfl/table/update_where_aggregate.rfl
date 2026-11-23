@@ -144,6 +144,21 @@ K -- [0 2 4]
 (set N (table [k i] (list [1 2 1] [1 2 5])))
 (update {i: (max i) from: 'N where: (== k 9)})
 (at N 'i) -- [1 2 5]
+(set N (table [k f] (list [1 2 1] [1.5 2.5 4.0])))
+(update {f: (- f (avg f)) from: 'N where: (== k 9)})
+(at N 'f) -- [1.5 2.5 4.0]
+;; ...yet its expression is still evaluated over the table, as before
+;; #1435, so an error in it surfaces: an existing and a new column, both
+;; spellings, and the elementwise form alike
+(set A (table [g w] (list ['a 'a 'b] [1 2 3])))
+(update {r: (max (+ w 'x)) from: A where: (== g 'z)}) !- type
+(update {w: (max (+ w 'x)) from: A where: (== g 'z)}) !- type
+(update {r: (max (+ w 'x)) from: 'A where: (== g 'z)}) !- type
+(update {w: (max (+ w 'x)) from: 'A where: (== g 'z)}) !- type
+(update {w: (+ w 'x) from: 'A where: (== g 'z)}) !- type
+(update {w: (+ w 'x) from: A where: (== g 'z)}) !- type
+(at A 'w) -- [1 2 3]
+(key A) -- ['g 'w]
 
 ;; ── every row kept: the whole-table aggregate, as without where: ──
 (at (update {r: (max i) from: T where: (> k 0)}) 'r) -- (at (update {r: (max i) from: T}) 'r)

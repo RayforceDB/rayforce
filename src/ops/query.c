@@ -29756,6 +29756,10 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     ray_t* kept = ray_where_fn(mask);
     if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
     int64_t k = kept->len;
+    /* No kept row: nothing is written, and the expression is evaluated
+     * over the table as before, so its errors still surface (over no row
+     * `(max (+ w 'x))` would raise nothing). */
+    if (k == 0) { ray_release(kept); return update_eval_where(tbl, expr, mask); }
     ray_t* v = update_eval_kept(tbl, expr, kept);
     ray_release(kept);
     if (!v || RAY_IS_ERR(v) || ray_is_atom(v)) return v;
