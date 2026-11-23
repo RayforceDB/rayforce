@@ -36,6 +36,19 @@
 (.sys.exec "printf '%s\n' '(set L (list \"b16_fresh_a\" \"b16_fresh_b\"))' '(set V [\"b16_fresh_a\" \"b16_fresh_b\"])' '(set D \"/tmp/rfl_where_in_sym_strings/\")' '(set f (fn [t] (println (at (select {from: t where: (in s L) n: n}) (quote n))) (println (at (select {from: t where: (in s V) n: n}) (quote n))) (println (at (select {from: t where: (in s \"b16_fresh_a\") n: n}) (quote n)))))' '(f (.db.splayed.get (concat D \"fp/\")))' '(f (.db.splayed.get (concat D \"fh/\")))' '(f (.db.splayed.get (concat D \"fc/\")))' '(f (.db.parted.get (concat D \"fq/\") (quote t)))' > /tmp/rfl_where_in_sym_strings/fresh.rfl") -- 0
 (.sys.exec "./rayforce /tmp/rfl_where_in_sym_strings/fresh.rfl </dev/null > /tmp/rfl_where_in_sym_strings/fresh.out 2>&1") -- 0
 (.sys.exec "printf '[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4]\n[1 2 4]\n[1 4]\n[1 2 4 1 2 4]\n[1 2 4 1 2 4]\n[1 4 1 4]\n' | cmp -s - /tmp/rfl_where_in_sym_strings/fresh.out") -- 0
+;; a string no symbol spells matches no row and is never interned: many
+;; distinct absent strings leave the symbol table where it was
+(set ABS1493 (as 'STR (map (fn [j] (format "b16_absent_%" j)) (til 500))))
+(set ABSA1493 (concat ABS1493 ["a"]))
+(do (.sys.mem) null)
+(set SC1493 (get (.sys.mem) 'sym-count))
+(count (select {from: T where: (in s ABS1493)})) -- 0
+(count (select {from: T where: (in s ABSA1493)})) -- 2
+(count (select {from: T where: (not-in s ABS1493)})) -- 4
+(count (select {from: T where: (in s (list "b16_absent_lit1" "b16_absent_lit2" "a"))})) -- 2
+(count (select {from: T where: (in s "b16_absent_lit3")})) -- 0
+(count (select {from: P where: (in s ABSA1493)})) -- 4
+(- (get (.sys.mem) 'sym-count) SC1493) -- 0
 ;; a name bound to a string vector or a string atom reads as the literal does
 (set V1493 ["a" "b"])
 (set A1493 "a")
