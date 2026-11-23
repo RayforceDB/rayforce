@@ -99,3 +99,18 @@
 (set P 0)
 (set F 0)
 (.sys.exec "rm -rf /tmp/rfl_by_wrapped_aggregate/") -- 0
+
+;; ── the null rule on the wrapped route: as the lone form (skip nulls) ───────
+;; group 0 takes i [5 3 1], NV null at its first and last rows; group 1 i [4 2 0];
+;; group 2 i [7 6] (last row null)
+(set NV [100 0Nl 300 475 500 0Nl 0Nl 800])
+(Sk (select {s: (+ 0 (first (at NV i))) from: T by: k}) 'k)   -- (+ 0 (Sk (select {s: (first (at NV i)) from: T by: k}) 'k))
+(Sk (select {s: (+ 0 (last (at NV i))) from: T by: k}) 'k)    -- (+ 0 (Sk (select {s: (last (at NV i)) from: T by: k}) 'k))
+(Sk (select {s: (+ 0 (first (at NV i))) from: T by: k}) 'k)   -- [475 500 800]
+(Sk (select {s: (+ 0 (last (at NV i))) from: T by: k}) 'k)    -- [475 100 800]
+
+;; ── conditional, lambda and take: wrappers ─────────────────────────────────
+(Sk (select {s: (if (> (first (at V i)) 300) 1 0) from: T by: k}) 'k)   -- (Gk (fn [x] (if (> (first (at V x)) 300) 1 0)))
+(Sk (select {s: ((fn [z] (+ z 1)) (first (at V i))) from: T by: k}) 'k)  -- (Gk (fn [x] ((fn [z] (+ z 1)) (first (at V x)))))
+(count (select {s: (+ 0 (first (at V i))) from: T by: k take: 1}))       -- 1
+(S (select {s: (+ 0 (first (at V i))) from: T by: k take: 1}))           -- [600]
