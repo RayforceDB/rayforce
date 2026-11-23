@@ -1026,14 +1026,13 @@
 (set Bsd (at (.sys.mem) 'sort-perpart-runs))
 (count (select {x: x from: Qlc where: (>= (rand 6 100) 0) desc: x take: 2})) -- 2
 (- (at (.sys.mem) 'sort-perpart-runs) Bsd) -- 0
-;; count and count(distinct) of a bound vector (a lambda parameter, a let,
-;; a global) count the collection, whole, in every group, whatever its name
-;; (functions.md: counting a constant collection returns its length): a
-;; parameter named like a column is no column, on every count-distinct
-;; route (the composite rewrite, the per-group kernel, the high-cardinality
-;; global hash, the eval-level grouping), flat, splayed and parted, with and
-;; without take:.  The routes read the column of the name.  A key a local
-;; holds groups by the local's values.
+;; count and count(distinct) of a bound vector as long as the table (a
+;; lambda parameter, a let, a global) read it as a column, as sum does
+;; (#1462): each group counts its own slice, whatever the name, a parameter
+;; named like a column included, on every count-distinct route (the
+;; composite rewrite, the per-group kernel, the high-cardinality global
+;; hash, the eval-level grouping), flat, splayed and parted, with and
+;; without take:.  A key a local holds groups by the local's values.
 (.db.splayed.set "/tmp/rfl_cklocal/c/2024.01.01/t/" (table [k y] (list [1 1 2] [10 10 20])))
 (.db.splayed.set "/tmp/rfl_cklocal/c/2024.01.02/t/" (table [k y] (list [2 3 3] [30 40 50])))
 (.db.splayed.set "/tmp/rfl_cklocal/d/t/" (table [k y] (list [1 1 2 2 3 3] [10 10 20 30 40 50])))
@@ -1044,12 +1043,12 @@
 (set cdl (fn [tbl y] (at (select {c: (count (distinct y)) by: k from: tbl}) 'c)))
 (set cdle (fn [tbl y] (at (select {c: (count (distinct (+ y 0))) by: k from: tbl}) 'c)))
 (set cdz (fn [tbl z] (at (select {c: (count (distinct z)) by: k from: tbl}) 'c)))
-(cdl Tcd Vcd) -- [4 4 4]
+(cdl Tcd Vcd) -- [2 1 1]
 (cdl Tcd Vcd) -- (cdz Tcd Vcd)
 (cdl Tcd Vcd) -- (cdle Tcd Vcd)
-(cdl Scd Vcd) -- [4 4 4]
-(cdl Pcd Vcd) -- [4 4 4]
-(cdz Pcd Vcd) -- [4 4 4]
+(cdl Scd Vcd) -- [2 1 1]
+(cdl Pcd Vcd) -- [2 1 1]
+(cdz Pcd Vcd) -- [2 1 1]
 ;; a helper that reads a column, itself or through another helper, reads
 ;; the rows: its operand is counted per group, as sum sees it
 (set gycd (fn [] y))
@@ -1067,32 +1066,30 @@
 ((fn [tbl y] (at (select {c: (count y) by: k from: tbl}) 'c)) Tcd Vcd) -- ((fn [tbl z] (at (select {c: (count z) by: k from: tbl}) 'c)) Tcd Vcd)
 (set cdlt (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c take: 1})))
 (set cdltn (fn [tbl y] (select {c: (count (distinct y)) by: k from: tbl desc: c})))
-(value (cdlt Tcd Vcd)) -- (list [1] [4])
+(value (cdlt Tcd Vcd)) -- (list [1] [2])
 (cdlt Tcd Vcd) -- (select {from: (cdltn Tcd Vcd) take: 1})
 (cdlt Scd Vcd) -- (select {from: (cdltn Scd Vcd) take: 1})
 (cdlt Pcd Vcd) -- (select {from: (cdltn Pcd Vcd) take: 1})
 (set cdlw (fn [tbl y] (at (select {c: (count (distinct y)) by: k from: tbl where: (> k 1)}) 'c)))
-(cdlw Tcd Vcd) -- [4 4]
-(cdlw Pcd Vcd) -- [4 4]
+(cdlw Tcd Vcd) -- [1 1]
+(cdlw Pcd Vcd) -- [1 1]
 (cdlw Tcd Vcd) -- ((fn [tbl z] (at (select {c: (count (distinct z)) by: k from: tbl where: (> k 1)}) 'c)) Tcd Vcd)
-;; NOTE: sum and first of a bound vector of the table's length stay row-wise
-;; on the DAG grouping (s below is per group), unlike count: that
-;; inconsistency is kept as it is
-(value ((fn [tbl y] (select {c: (count (distinct y)) s: (sum y) by: k from: tbl})) Tcd Vcd)) -- (list [1 2 3] [4 4 4] [3 6 8])
+;; sum reads the same slice of the bound vector as count does
+(value ((fn [tbl y] (select {c: (count (distinct y)) s: (sum y) by: k from: tbl})) Tcd Vcd)) -- (list [1 2 3] [2 1 1] [3 6 8])
 ;; a scalar local is no list, as outside a query
 (cdl Tcd 7) !- type
 (cdl Pcd 7) !- type
 ;; over 50000 groups (the global hash): the column y has 2 values per group,
-;; the parameter 3 values in all
+;; the parameter one value per group (k and k+60000 agree modulo 3)
 (set Nhc 120000)
 (set Thc (table [k y] (list (% (til Nhc) 60000) (til Nhc))))
-(distinct (cdl Thc (% (til Nhc) 3))) -- [3]
+(distinct (cdl Thc (% (til Nhc) 3))) -- [1]
 (count (cdl Thc (% (til Nhc) 3))) -- 60000
 ;; dense keys take the composite (K, X) rewrite
 (set Tdn (table [k y] (list (% (til 1200) 3) (% (til 1200) 4))))
-(cdl Tdn (% (til 1200) 6)) -- [6 6 6]
+(cdl Tdn (% (til 1200) 6)) -- [2 2 2]
 (cdl Tdn (% (til 1200) 6)) -- (cdz Tdn (% (til 1200) 6))
-(value (cdlt Tdn (% (til 1200) 6))) -- (list [0] [6])
+(value (cdlt Tdn (% (til 1200) 6))) -- (list [0] [2])
 ;; a key a local holds, or a global vector, groups by its values
 (set Kcd [1 1 1 2 2 2])
 (set cdk (fn [tbl k] (at (select {c: (count (distinct y)) by: k from: tbl}) 'c)))
@@ -1121,14 +1118,15 @@
 (value (cdkw Tcd Kcd)) -- (list [1 2] [1 3])
 (value (cdkw Pcd Kcd)) -- (list [1 2] [1 3])
 (value (cdkw Tcd Kcd)) -- (value ((fn [tbl k] (select {c: (count y) by: k from: tbl where: (> y 15)})) Tcd Kcd))
-;; a bound vector of another length than the table is a collection too; an
-;; operand over a column of another length (a take of it) has no value for
-;; some rows: the per-group kernel read past it
+;; a bound list is a collection; a bound vector of another length than the
+;; table is a length error, as in every aggregate (#1462); an operand over a
+;; column of another length (a take of it) has no value for some rows: the
+;; per-group kernel read past it
 (set Tln (table [k y] (list (% (til 1000) 10) (til 1000))))
 (cdl Tln (list "a" "b")) -- (cdz Tln (list "a" "b"))
 (distinct (cdl Tln (list "a" "b"))) -- [2]
-(distinct (cdl Tln [1 2])) -- [2]
-(distinct (cdl Thc [1 2])) -- [2]
+(cdl Tln [1 2]) !- length
+(cdl Thc [1 2]) !- length
 (select {c: (count (distinct (take y 2))) by: k from: Tln}) !- length
 ;; a named key must have one value per row of the table, under a where: too
 ;; (a key as long as the rows the where: keeps is no key of the table)

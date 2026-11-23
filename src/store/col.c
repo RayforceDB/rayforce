@@ -71,7 +71,15 @@ _Static_assert(COL_DISK_ATTRS_MASK == (uint8_t)(RAY_SYM_W_MASK | RAY_ATTR_SORTED
 
 static ray_err_t validate_sym_bounds(const void* data, int64_t len,
                                      uint8_t attrs, uint32_t sym_count) {
-    if (sym_count == 0 || len == 0) return RAY_OK;
+    if (len == 0) return RAY_OK;
+    /* No bound to check against: still never a query's private id
+     * (table/sym.h), which only a W32 or W64 cell can hold. */
+    if (sym_count == 0) {
+        int w = attrs & RAY_SYM_W_MASK;
+        for (int64_t i = 0; (w == RAY_SYM_W32 || w == RAY_SYM_W64) && i < len; i++)
+            if (ray_sym_is_private(ray_read_sym(data, i, RAY_SYM, attrs))) return RAY_ERR_CORRUPT;
+        return RAY_OK;
+    }
 
     uint64_t max_id = 0;
     switch (attrs & RAY_SYM_W_MASK) {

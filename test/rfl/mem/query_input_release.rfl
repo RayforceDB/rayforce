@@ -34,8 +34,30 @@
 ;; a scalar aggregate that reads no column binds nothing of the table:
 ;; it flattens none of it
 (set pk0 (at (.sys.mem) 'peak-bytes))
-(at (select {x: (count [1 2 3]) from: Pmw}) 'x) -- [3]
+(at (select {x: (count (til 3)) from: Pmw}) 'x) -- [3]
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; a written vector of another length is refused before anything is read
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(select {x: (count [1 2 3]) from: Pmw}) !- length
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+;; a free vector as long as the table (#1462): keyless it is read whole and
+;; flattens nothing; under where: only the columns the select names are
+;; flattened beside it, never the whole table (half of it bounds a compressed
+;; table, whose where: column is decoded: 1.16 MB of 3.84 MB, where the whole
+;; table flattened is 7.2 MB)
+(set Wmw (til (* 8 Nmw)))
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {x: (count Wmw) from: Pmw}) 'x) -- [40000]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {x: (count Wmw) from: Pmw where: (> k 100)}) 'x) -- [39899]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 2)) -- true
+(at (select {x: (count Wmw) from: Pmw where: (> k 100)}) 'x) -- (at (select {x: (count k) from: Pmw where: (> k 100)}) 'x)
+;; through an inlined helper too: the rewritten query is what names columns
+(set Hmw (fn [x] (+ x (count Wmw))))
+(set pk0 (at (.sys.mem) 'peak-bytes))
+(at (select {x: (Hmw 0) from: Pmw where: (> k 100)}) 'x) -- [39899]
+(< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 2)) -- true
 (set pk0 (at (.sys.mem) 'peak-bytes))
 (at (select {x: (first (asc [3 1 2])) from: Pmw}) 'x) -- [1]
 (< (- (at (.sys.mem) 'peak-bytes) pk0) (/ Bmw 4)) -- true

@@ -374,22 +374,60 @@ lambda, `0x00` for U8; and an answer that is a collection, such as the cell
 of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
 `(list (list 1))`.
 
-A vector written as a value — a literal, a global holding one, or a bound
-value: a lambda parameter or a `let`, which hides a column of its name —
-stands for a column:
+A vector written as a value — a literal, a global holding one, a global a
+single-expression helper reads, or a bound value: a lambda parameter or a
+`let`, which hides a column of its name — stands for a column wherever an
+aggregate reads its rows: as the aggregate's argument (both arguments of
+`wavg`, `wsum`, `cov`, `scov` and `pearson_corr`), through every call in it
+that maps that argument element by element, and as the source of
+`distinct`. A call maps an argument element by element when, as the
+builtin is applied there, each element gives one result from itself alone:
+arithmetic and comparisons, `if`, `and`, `or`, `not`, `nil?`, binary
+`(min W 30)` and `(max W 30)` (the one-argument forms are aggregates), a
+cast's value `(as 'F64 W)`, `xbar`, `neg`, `abs`, `round`, `floor`, `ceil`,
+`sqrt`, `log`, `exp`, `pow`, `fill`, `div`, `sin`, `cos`, `tan`, `asin`,
+`acos`, `atan`, `reciprocal`, `signum`, the date and time parts (`yyyy`,
+`mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`), `upper`, `lower`, `trim`,
+`strlen`, `sym-name`, `substr`'s and `replace`'s text, and the tested side of `in`,
+`not-in`, `like`, `str-find` and `within`. There, in every
+aggregate, `count` included, in `select` and `update`, keyless, under
+`where:` and under `by:`:
 
 - a vector as long as the table is sliced per group, and filtered by
-  `where:` like any column (the table's rows before the filter);
+  `where:` like any column (the table's rows before the filter):
+  `(count W)` counts each group's rows, `(count (distinct v))` each
+  group's distinct values, `(max (+ W (count x)))` adds each group's
+  count to its own slice;
 - a one-element vector, like an atom, is spread over the rows: `(sum [7])`
-  and `(sum 7)` over ten rows are `70`;
-- a vector of any other length raises a `length` error;
-- `count` keeps a vector's own length: `(count [1 2 3])` is `3` in every
-  group;
-- `count (distinct v)` of a bound vector counts the distinct values of the
-  whole collection, the same in every group, whatever its length or name.
-  A helper whose body reads a column, itself or through another helper,
-  reads the rows: `(count (distinct (f)))` with `f` = `(fn [] y)` counts
-  each group's values of `y`.
+  and `(sum 7)` over ten rows are `70`, and `(count [7])` is `1`, as
+  `(count 7)` is, even over a one-row table;
+- a vector of any other length raises a `length` error, `count` included:
+  `(count [1 2 3])` over ten rows is an error, as `(sum [1 2 3])` is
+  (count kept the vector's own length until 2026-11; a computed
+  collection such as `(count (til 3))` still counts its values, see
+  below); over an empty table nothing of the vector is read:
+  `(count (til 0))` and a bound empty vector both count `0`.
+
+The rule is by length alone: over a three-row table with `g` `[a b b]`,
+`(sum [1 2 3])` by `g` is `[1 5]`, while over ten rows it is a `length`
+error. A vector meant as one whole value that happens to be as long as the
+table is read as a column too; read it through a call that takes it whole,
+`(sum (raze W))`, or a helper of several statements. An earlier output's alias is that output, not a vector of
+the same name: in `{W: (* x 2) s: (sum W)}` the sum reads the projected
+`W`. A helper's global is never an alias.
+
+Lookups and sets are read whole: neither side of a lookup is sliced unless
+it is a column. The source and the index of `at` (`(sum (at W [0 1]))`,
+`(sum (at W I))` with `I` a table-length vector), the list and the needles
+of `find`, the breaks and the values of `bin` and `binr`, the set of `in` and
+`not-in`, the pattern of `like` and `str-find`, the bounds of `within`, and
+the operands of `concat`, `raze`, `take`, `asc`, `reverse` and every other
+call that does not map element by element are the whole vector, the same
+in every group. To index per row, put the index in a column:
+`(sum (at W i))` with `i` a column reads `W` at each row's index. A helper
+whose body reads a column, itself or through another helper, reads the
+rows: `(count (distinct (f)))` with `f` = `(fn [] y)` counts each group's
+values of `y`. Projections, outputs with no aggregate, are read as before.
 
 ```lisp
 (set t (table [g x] (list [a a b b b c c c c c] (til 10))))
@@ -401,9 +439,13 @@ stands for a column:
 ; b  90
 ; c 350
 (select {s: (sum W) by: g from: t where: (> x 2)})   ; s [70 350]
+(select {s: (count W) by: g from: t})                ; s [2 3 5]
+(select {s: (count W) from: t where: (> x 4)})       ; s [5]
+(update {s: (sum W) from: t where: (> x 4)})         ; s [0N 0N 0N 0N 0N 350 350 350 350 350]
 (select {s: (sum [1 2 3]) by: g from: t})            ; error: length
+(select {s: (count [1 2 3]) by: g from: t})          ; error: length
 ((fn [v] (select {d: (count (distinct v)) by: g from: t})) [1 1 2 2 3 3 4 4 5 5])
-; d [5 5 5]
+; d [1 2 3]
 ```
 
 A computed argument that reads no column — `(til 5)`, `(at [1 2 3] 0)`, an

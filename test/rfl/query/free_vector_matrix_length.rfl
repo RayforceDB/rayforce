@@ -1,0 +1,160 @@
+;; The free-vector rule (#1462): a vector of another length than the
+;; table is a length error in every aggregate, on every route.  One case per line.
+(set t (table [g v] (list [a a b b b c c c c c] (til 10))))
+(set W [1 2 3])
+(select {s: (sum W) from: t }) !- length
+(select {s: (sum W) from: t where: (> v 5)}) !- length
+(select {s: (sum W) from: t by: g}) !- length
+(update {s: (sum W) from: t }) !- length
+(update {s: (sum W) from: t where: (> v 5)}) !- length
+(update {s: (sum W) from: t by: g}) !- length
+(select {s: (count W) from: t }) !- length
+(select {s: (count W) from: t where: (> v 5)}) !- length
+(select {s: (count W) from: t by: g}) !- length
+(update {s: (count W) from: t }) !- length
+(update {s: (count W) from: t where: (> v 5)}) !- length
+(update {s: (count W) from: t by: g}) !- length
+(select {s: (avg W) from: t }) !- length
+(select {s: (avg W) from: t where: (> v 5)}) !- length
+(select {s: (avg W) from: t by: g}) !- length
+(update {s: (avg W) from: t }) !- length
+(update {s: (avg W) from: t where: (> v 5)}) !- length
+(update {s: (avg W) from: t by: g}) !- length
+(select {s: (min W) from: t }) !- length
+(select {s: (min W) from: t where: (> v 5)}) !- length
+(select {s: (min W) from: t by: g}) !- length
+(update {s: (min W) from: t }) !- length
+(update {s: (min W) from: t where: (> v 5)}) !- length
+(update {s: (min W) from: t by: g}) !- length
+(select {s: (max W) from: t }) !- length
+(select {s: (max W) from: t where: (> v 5)}) !- length
+(select {s: (max W) from: t by: g}) !- length
+(update {s: (max W) from: t }) !- length
+(update {s: (max W) from: t where: (> v 5)}) !- length
+(update {s: (max W) from: t by: g}) !- length
+(select {s: (first W) from: t }) !- length
+(select {s: (first W) from: t where: (> v 5)}) !- length
+(select {s: (first W) from: t by: g}) !- length
+(update {s: (first W) from: t }) !- length
+(update {s: (first W) from: t where: (> v 5)}) !- length
+(update {s: (first W) from: t by: g}) !- length
+(select {s: (last W) from: t }) !- length
+(select {s: (last W) from: t where: (> v 5)}) !- length
+(select {s: (last W) from: t by: g}) !- length
+(update {s: (last W) from: t }) !- length
+(update {s: (last W) from: t where: (> v 5)}) !- length
+(update {s: (last W) from: t by: g}) !- length
+(select {s: (med W) from: t }) !- length
+(select {s: (med W) from: t where: (> v 5)}) !- length
+(select {s: (med W) from: t by: g}) !- length
+(update {s: (med W) from: t }) !- length
+(update {s: (med W) from: t where: (> v 5)}) !- length
+(update {s: (med W) from: t by: g}) !- length
+(select {s: (dev W) from: t }) !- length
+(select {s: (dev W) from: t where: (> v 5)}) !- length
+(select {s: (dev W) from: t by: g}) !- length
+(update {s: (dev W) from: t }) !- length
+(update {s: (dev W) from: t where: (> v 5)}) !- length
+(update {s: (dev W) from: t by: g}) !- length
+(select {s: (var W) from: t }) !- length
+(select {s: (var W) from: t where: (> v 5)}) !- length
+(select {s: (var W) from: t by: g}) !- length
+(update {s: (var W) from: t }) !- length
+(update {s: (var W) from: t where: (> v 5)}) !- length
+(update {s: (var W) from: t by: g}) !- length
+(select {s: (stddev W) from: t }) !- length
+(select {s: (stddev W) from: t where: (> v 5)}) !- length
+(select {s: (stddev W) from: t by: g}) !- length
+(update {s: (stddev W) from: t }) !- length
+(update {s: (stddev W) from: t where: (> v 5)}) !- length
+(update {s: (stddev W) from: t by: g}) !- length
+(select {s: (dev_pop W) from: t }) !- length
+(select {s: (dev_pop W) from: t where: (> v 5)}) !- length
+(select {s: (dev_pop W) from: t by: g}) !- length
+(update {s: (dev_pop W) from: t }) !- length
+(update {s: (dev_pop W) from: t where: (> v 5)}) !- length
+(update {s: (dev_pop W) from: t by: g}) !- length
+(select {s: (var_pop W) from: t }) !- length
+(select {s: (var_pop W) from: t where: (> v 5)}) !- length
+(select {s: (var_pop W) from: t by: g}) !- length
+(update {s: (var_pop W) from: t }) !- length
+(update {s: (var_pop W) from: t where: (> v 5)}) !- length
+(update {s: (var_pop W) from: t by: g}) !- length
+(select {s: (prod W) from: t }) !- length
+(select {s: (prod W) from: t where: (> v 5)}) !- length
+(select {s: (prod W) from: t by: g}) !- length
+(update {s: (prod W) from: t }) !- length
+(update {s: (prod W) from: t where: (> v 5)}) !- length
+(update {s: (prod W) from: t by: g}) !- length
+(select {s: (all W) from: t }) !- length
+(select {s: (all W) from: t where: (> v 5)}) !- length
+(select {s: (all W) from: t by: g}) !- length
+(update {s: (all W) from: t }) !- length
+(update {s: (all W) from: t where: (> v 5)}) !- length
+(update {s: (all W) from: t by: g}) !- length
+(select {s: (any W) from: t }) !- length
+(select {s: (any W) from: t where: (> v 5)}) !- length
+(select {s: (any W) from: t by: g}) !- length
+(update {s: (any W) from: t }) !- length
+(update {s: (any W) from: t where: (> v 5)}) !- length
+(update {s: (any W) from: t by: g}) !- length
+(select {s: (mode W) from: t }) !- length
+(select {s: (mode W) from: t where: (> v 5)}) !- length
+(select {s: (mode W) from: t by: g}) !- length
+(update {s: (mode W) from: t }) !- length
+(update {s: (mode W) from: t where: (> v 5)}) !- length
+(update {s: (mode W) from: t by: g}) !- length
+(select {s: (count (distinct W)) from: t }) !- length
+(select {s: (count (distinct W)) from: t where: (> v 5)}) !- length
+(select {s: (count (distinct W)) from: t by: g}) !- length
+(update {s: (count (distinct W)) from: t }) !- length
+(update {s: (count (distinct W)) from: t where: (> v 5)}) !- length
+(update {s: (count (distinct W)) from: t by: g}) !- length
+(select {s: (cov W v) from: t }) !- length
+(select {s: (cov W v) from: t where: (> v 5)}) !- length
+(select {s: (cov W v) from: t by: g}) !- length
+(update {s: (cov W v) from: t }) !- length
+(update {s: (cov W v) from: t where: (> v 5)}) !- length
+(update {s: (cov W v) from: t by: g}) !- length
+(select {s: (scov v W) from: t }) !- length
+(select {s: (scov v W) from: t where: (> v 5)}) !- length
+(select {s: (scov v W) from: t by: g}) !- length
+(update {s: (scov v W) from: t }) !- length
+(update {s: (scov v W) from: t where: (> v 5)}) !- length
+(update {s: (scov v W) from: t by: g}) !- length
+(select {s: (wavg v W) from: t }) !- length
+(select {s: (wavg v W) from: t where: (> v 5)}) !- length
+(select {s: (wavg v W) from: t by: g}) !- length
+(update {s: (wavg v W) from: t }) !- length
+(update {s: (wavg v W) from: t where: (> v 5)}) !- length
+(update {s: (wavg v W) from: t by: g}) !- length
+(select {s: (wsum W v) from: t }) !- length
+(select {s: (wsum W v) from: t where: (> v 5)}) !- length
+(select {s: (wsum W v) from: t by: g}) !- length
+(update {s: (wsum W v) from: t }) !- length
+(update {s: (wsum W v) from: t where: (> v 5)}) !- length
+(update {s: (wsum W v) from: t by: g}) !- length
+(select {s: (pearson_corr W v) from: t }) !- length
+(select {s: (pearson_corr W v) from: t where: (> v 5)}) !- length
+(select {s: (pearson_corr W v) from: t by: g}) !- length
+(update {s: (pearson_corr W v) from: t }) !- length
+(update {s: (pearson_corr W v) from: t where: (> v 5)}) !- length
+(update {s: (pearson_corr W v) from: t by: g}) !- length
+(select {s: (quantile W 0.5) from: t }) !- length
+(select {s: (quantile W 0.5) from: t where: (> v 5)}) !- length
+(select {s: (quantile W 0.5) from: t by: g}) !- length
+(update {s: (quantile W 0.5) from: t }) !- length
+(update {s: (quantile W 0.5) from: t where: (> v 5)}) !- length
+(update {s: (quantile W 0.5) from: t by: g}) !- length
+(select {s: (top W 2) from: t }) !- length
+(select {s: (top W 2) from: t where: (> v 5)}) !- length
+(select {s: (top W 2) from: t by: g}) !- length
+(update {s: (top W 2) from: t }) !- length
+(update {s: (top W 2) from: t where: (> v 5)}) !- length
+(update {s: (top W 2) from: t by: g}) !- length
+(select {s: (bot W 2) from: t }) !- length
+(select {s: (bot W 2) from: t where: (> v 5)}) !- length
+(select {s: (bot W 2) from: t by: g}) !- length
+(update {s: (bot W 2) from: t }) !- length
+(update {s: (bot W 2) from: t where: (> v 5)}) !- length
+(update {s: (bot W 2) from: t by: g}) !- length

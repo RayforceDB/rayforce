@@ -61,6 +61,16 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <assert.h>
+
+/* Debug builds check at every query's exit that its result holds no
+ * private id (#1462; fv_holds_private, below). */
+#ifndef NDEBUG
+static bool fv_holds_private(ray_t* v, int depth);
+#define fv_assert_no_private(v) assert(!fv_holds_private((v), 0))
+#else
+#define fv_assert_no_private(v) ((void)0)
+#endif
 
 /* ══════════════════════════════════════════
  * Select query — DAG bridge
@@ -2230,6 +2240,12 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
             if (ray_is_vec(local))  return ray_const_vec(g, local);
             return NULL;
+        }
+        /* a query's private column (sym.h): scanned by its id, no string */
+        if (ray_sym_is_private(expr->i64)) {
+            ray_col_meta_t pm;
+            return g->table && g->table->type == RAY_TABLE &&
+                   ray_table_col_meta(g->table, expr->i64, &pm) ? ray_scan_sym(g, expr->i64) : NULL;
         }
         ray_t* s = ray_sym_str(expr->i64);
         if (!s) return NULL;
@@ -4639,6 +4655,8 @@ static ray_t* nested_agg_compile_err(ray_t* expr, ray_t* tbl) {
         ray_t* name = ext ? ray_sym_str(ext->sym) : NULL;
         err = name ? ray_error("schema", "column '%.*s' not found",
                                (int)ray_str_len(name), ray_str_ptr(name))
+            : ext && ray_sym_is_private(ext->sym)
+                   ? ray_error("schema", "a vector the query reads as a column is not available")
                    : ray_error("schema", "column not found");
     }
     ray_graph_free(g);
@@ -6072,9 +6090,9 @@ static bool derived_key_expr_ok(ray_t* e, ray_t* tbl, int64_t col_sym, int64_t* 
         for (int64_t i = 1; i < n; i++) {
             if (el[i]->type != RAY_LIST || ray_len(el[i]) != 2) return false;
             ray_t** cp = (ray_t**)ray_data(el[i]);
-            bool is_else = cp[0]->type == -RAY_SYM && !(cp[0]->attrs & ATTR_QUOTED) &&
-                           ray_str_len(ray_sym_str(cp[0]->i64)) == 4 &&
-                           memcmp(ray_str_ptr(ray_sym_str(cp[0]->i64)), "else", 4) == 0;
+            ray_t* cs = cp[0]->type == -RAY_SYM && !(cp[0]->attrs & ATTR_QUOTED)
+                      ? ray_sym_str(cp[0]->i64) : NULL;   /* NULL for a private id */
+            bool is_else = cs && ray_str_len(cs) == 4 && memcmp(ray_str_ptr(cs), "else", 4) == 0;
             if (!is_else && !derived_key_expr_ok(cp[0], tbl, col_sym, bound, nbound)) return false;
             if (!derived_key_expr_ok(cp[1], tbl, col_sym, bound, nbound)) return false;
         }
@@ -15598,6 +15616,7 @@ enum {
     SELECT_ALIASES_RESOLVED    = 1,   /* grouped aliases planned */
     SELECT_COLUMN_FREE_PLANNED = 2,   /* column-free aggregate sources evaluated */
     SELECT_RUNNING_PLANNED     = 4,   /* keyless running calls hoisted */
+    SELECT_FREE_VECS_PLANNED   = 8,   /* free vectors read as rows made columns */
 };
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan);
 ray_t* ray_update(ray_t** args, int64_t n);
@@ -18885,6 +18904,7 @@ static ray_t* ray_select_lowered(ray_t** args, int64_t n) {
     const ray_pool_scan_t* prev_scan = ray_pool_scan_get();
     t_select_scan = &ss;
     ray_t* r = ray_select_impl(args, n, 0);
+    fv_assert_no_private(r);
     t_select_scan = prev_ss;
     ray_pool_scan_set(prev_scan);
     if (ss.gate_hdr) scratch_free(ss.gate_hdr);
@@ -19119,6 +19139,316 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     return out ? out : ray_error("oom", NULL);
 }
 
+/* ---- Free vectors read by aggregates (#1462, #1471) ----
+ * A free vector is a vector a query reads that is no column of its table: a
+ * literal, a global, a local of the frame the query runs in (a lambda's
+ * parameter, a let, one named like a column included, as it hides it), or
+ * an inlined helper's global (its quoted value).  Read where an aggregate
+ * reads its rows (fv_subst), it stands for a column: one as long as the
+ * table is sliced per group and filtered by the where: in every aggregate,
+ * count included, on every route; one of one value is spread over the rows
+ * as an atom is; one of any other length is a `length` error, count's
+ * source included (over an empty table nothing of it is read).  Elsewhere,
+ * an argument a builtin consumes whole or a projection, it is read as
+ * before.
+ *
+ * Such a vector becomes a private column of the query's working table:
+ * named by a private id (sym.h), which the symbol table never issues, so
+ * no name a user writes, casts, evals or receives can reach it, and every
+ * route that gathers, filters or binds the table's columns carries it as it
+ * carries any column.  The ids are reused by every query, so nothing
+ * holding one may outlive its query (fv_assert_no_private). */
+
+/* The free vectors read as rows, each a private column, and the output
+ * aliases in scope (a select's earlier outputs), which name no free
+ * vector. */
+typedef struct {
+    ray_t*         vecs;     /* LIST of the vectors, or NULL */
+    ray_t*         names;    /* I64 vector of their private ids, or NULL */
+    const int64_t* aliases;
+    int64_t        naliases;
+} fv_cols_t;
+
+static void fv_cols_free(fv_cols_t* fc) {
+    if (fc->vecs) ray_release(fc->vecs);
+    if (fc->names) ray_release(fc->names);
+    fc->vecs = fc->names = NULL;
+}
+
+static int64_t fv_cols_n(const fv_cols_t* fc) { return fc->vecs ? fc->vecs->len : 0; }
+
+/* The free vector `e` is, or NULL. */
+static ray_t* fv_value(ray_t* e, ray_t* tbl, const fv_cols_t* fc) {
+    ray_t* b = NULL;
+    if (e->type == -RAY_SYM) {
+        int64_t s = e->i64;
+        if ((e->attrs & ATTR_QUOTED) || ray_sym_is_private(s)) return NULL;
+        for (int64_t i = 0; i < fc->naliases; i++)
+            if (fc->aliases[i] == s) return NULL;
+        b = ray_env_get_lexical_local(s);
+        if (!b) {
+            if (tbl_has_col(tbl, s)) return NULL;
+            if (ray_sym_is_dotted(s)) {
+                const int64_t* segs;
+                if (ray_sym_segs(s, &segs) >= 1 && tbl_has_col(tbl, segs[0])) return NULL;
+            }
+            b = ray_env_get(s);
+        }
+    } else if (e->type > 0 && e->type != RAY_LIST) {
+        b = e;
+    } else if (e->type == RAY_LIST && e->len == 2 && !(e->attrs & ATTR_QUOTED)) {
+        ray_t** el = (ray_t**)ray_data(e);   /* (quote vec), as inlining writes a global */
+        if (el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED) &&
+            el[0]->i64 == ray_sym_intern("quote", 5) && el[1])
+            b = el[1];
+    }
+    return b && ray_is_vec(b) ? b : NULL;
+}
+
+/* The builtin the call `e` invokes, or NULL: a head no column or local
+ * shadows, bound to a builtin. */
+static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl) {
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64) ||
+        ray_env_has_lexical_local(h->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    return fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY ? fn : NULL;
+}
+
+/* Is the `i`th argument of the call `e` read as rows, given whether `e`
+ * itself is (`rows`)?  An aggregate reads its source as rows, and both
+ * operands of a paired one ((wavg w v), (cov a b)); not a parameter such as
+ * quantile's or top's.  Any other call read as rows reads as rows exactly
+ * the arguments its builtin maps element by element at that arity
+ * (ray_fn_row_arg: atomic builtins, (min W 30), (as 'F64 W), if, ...);
+ * and `distinct` its source, as (count (distinct v)) counts each group's
+ * values. */
+static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows) {
+    if (is_agg_expr(e)) {
+        if (i == 1) return true;
+        uint16_t op = resolve_agg_opcode(((ray_t**)ray_data(e))[0]->i64);
+        return i == 2 && (op == OP_COV || op == OP_SCOV || op == OP_WSUM || op == OP_WAVG ||
+                          op == OP_PEARSON_CORR);
+    }
+    if (!rows) return false;
+    ray_t* fn = fv_head_builtin(e, tbl);
+    if (!fn) return false;
+    if (ray_fn_row_arg(fn, e->len - 1, i)) return true;
+    static int64_t distinct_id = -1;
+    if (distinct_id < 0) distinct_id = ray_sym_intern("distinct", 8);
+    return i == 1 && e->len == 2 && ((ray_t**)ray_data(e))[0]->i64 == distinct_id;
+}
+
+/* `e` with each free vector it reads as rows (`rows`: `e` itself is read
+ * so) replaced by the private id of a column holding it, registered in
+ * `fc`; a free vector there of neither one value nor the table's length is
+ * a `length` error.  Lambda, let and quote bodies are not entered.  A new
+ * reference. */
+static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
+    ray_t* b = rows ? fv_value(e, tbl, fc) : NULL;
+    if (b) {
+        int64_t nr = ray_table_nrows(tbl);
+        /* one value is spread as an atom, and over no row nothing is read,
+         * whatever the table's length: both keep their answers */
+        if (b->len == 1 || nr == 0) { ray_retain(e); return e; }
+        if (b->len != nr)
+            return ray_error("length", "aggregate input has %lld values for %lld rows",
+                             (long long)b->len, (long long)nr);
+        int64_t n = fv_cols_n(fc);
+        int64_t i = 0;
+        while (i < n && ((ray_t**)ray_data(fc->vecs))[i] != b) i++;
+        if (i == n) {
+            /* the next private id the table does not hold yet (a table a
+             * query planned before may carry some) */
+            int64_t k = n;
+            for (;;) {
+                int64_t id = ray_sym_private(k);
+                bool used = tbl_has_col(tbl, id);
+                for (int64_t j = 0; j < n && !used; j++)
+                    used = ((int64_t*)ray_data(fc->names))[j] == id;
+                if (!used) break;
+                k++;
+            }
+            int64_t id = ray_sym_private(k);
+            if (!fc->vecs) fc->vecs = ray_list_new(4);
+            if (!fc->names) fc->names = ray_vec_new(RAY_I64, 4);
+            if (!fc->vecs || RAY_IS_ERR(fc->vecs) || !fc->names || RAY_IS_ERR(fc->names)) {
+                ray_t* err = fc->vecs && RAY_IS_ERR(fc->vecs) ? fc->vecs
+                           : fc->names && RAY_IS_ERR(fc->names) ? fc->names : ray_error("oom", NULL);
+                if (fc->vecs == err) fc->vecs = NULL;
+                if (fc->names == err) fc->names = NULL;
+                return err;
+            }
+            ray_t* nl = ray_list_append(fc->vecs, b);
+            if (!nl || RAY_IS_ERR(nl)) return nl ? nl : ray_error("oom", NULL);
+            fc->vecs = nl;
+            ray_t* nn = ray_vec_append(fc->names, &id);
+            if (!nn || RAY_IS_ERR(nn)) return nn ? nn : ray_error("oom", NULL);
+            fc->names = nn;
+        }
+        return ray_sym(((int64_t*)ray_data(fc->names))[i]);
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 ||
+        select_alias_skip_form(((ray_t**)ray_data(e))[0])) { ray_retain(e); return e; }
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* out = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* c = fv_subst(el[i], tbl, fv_arg_rows(e, i, tbl, rows), fc);
+        if (!c || RAY_IS_ERR(c)) { if (out) ray_release(out); return c ? c : ray_error("oom", NULL); }
+        if (!out && c == el[i]) { ray_release(c); continue; }
+        if (!out) {
+            out = ray_list_new(e->len);
+            for (int64_t j = 0; j < i && out && !RAY_IS_ERR(out); j++) out = ray_list_append(out, el[j]);
+        }
+        if (out && !RAY_IS_ERR(out)) out = ray_list_append(out, c);
+        ray_release(c);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (!out) { ray_retain(e); return e; }
+    out->attrs = e->attrs;
+    return out;
+}
+
+/* `tbl` with the private columns of `fc` added (ray_table_add_col copies
+ * the header; the vectors are retained, not copied).  A parted table is
+ * first flattened to the columns the query `dict` reads (none, when it
+ * reads none: the private columns alone).  A new reference. */
+static ray_t* fv_add_cols(ray_t* tbl, const fv_cols_t* fc, ray_t* dict) {
+    ray_t* t;
+    if (!table_has_parted_columns(tbl)) { ray_retain(tbl); t = tbl; }
+    else {
+        t = parted_flatten_read_cols(dict, tbl, true, NULL);
+        if (t == tbl) {                     /* it reads no column of the table */
+            ray_release(t);
+            t = ray_table_new((int32_t)fv_cols_n(fc));
+        }
+    }
+    int64_t n = fv_cols_n(fc);
+    for (int64_t i = 0; i < n && t && !RAY_IS_ERR(t); i++)
+        t = ray_table_add_col(t, ((int64_t*)ray_data(fc->names))[i], ((ray_t**)ray_data(fc->vecs))[i]);
+    return t ? t : ray_error("oom", NULL);
+}
+
+/* `expr` (its helpers inlined, so a helper's global counts) with the free
+ * vectors it reads as rows replaced by private columns, in `fc`; NULL when
+ * it reads none. */
+static ray_t* fv_expr(ray_t* expr, ray_t* tbl, fv_cols_t* fc) {
+    if (!expr || expr->type != RAY_LIST) return NULL;
+    ray_t* x = query_inline_helpers(expr, tbl);
+    if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
+    ray_t* s = fv_subst(x, tbl, false, fc);
+    bool same = s == x;
+    ray_release(x);
+    if (!s || RAY_IS_ERR(s)) return s ? s : ray_error("oom", NULL);
+    if (same) { ray_release(s); return NULL; }
+    return s;
+}
+
+/* `tbl` without its private columns (a header copy), or `tbl` itself,
+ * retained, when it has none: what a query returns or stores. */
+static ray_t* fv_strip_private(ray_t* tbl) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) return tbl;
+    int64_t nc = ray_table_ncols(tbl);
+    int64_t np = 0;
+    for (int64_t c = 0; c < nc; c++) np += ray_sym_is_private(ray_table_col_name(tbl, c));
+    if (np == 0) return tbl;
+    ray_t* out = ray_table_new((int32_t)(nc - np));
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(tbl, c);
+        if (ray_sym_is_private(cn)) continue;
+        ray_t* col = ray_table_slot_idx(tbl, c);
+        out = ray_table_add_col(out, cn, col);
+    }
+    ray_release(tbl);
+    return out ? out : ray_error("oom", NULL);
+}
+
+#ifndef NDEBUG
+/* Does `v` hold a private id anywhere: a symbol atom or cell, a table's
+ * column name or cell, a dict key or value, a list element, a lambda's
+ * code, constants or captures (recursively, `depth` bounded)?  A lazy
+ * value's graph is not walked: this check does not cover one. */
+static bool fv_holds_private(ray_t* v, int depth) {
+    if (!v || RAY_IS_ERR(v) || depth > 64) return false;
+    if (v->type == -RAY_SYM) return ray_sym_is_private(v->i64);
+    if (v->type == RAY_SYM) {
+        for (int64_t i = 0; i < v->len; i++)
+            if (ray_sym_is_private(sym_cell_runtime_id(v, i))) return true;
+        return false;
+    }
+    if (v->type == RAY_TABLE) {   /* its names, then its cells */
+        for (int64_t c = 0; c < ray_table_ncols(v); c++)
+            if (ray_sym_is_private(ray_table_col_name(v, c))) return true;
+        for (int64_t c = 0; c < ray_table_ncols(v); c++) {
+            ray_t* col = ray_table_slot_idx(v, c);
+            if (col && !RAY_IS_ERR(col) && fv_holds_private(col, depth + 1)) return true;
+        }
+        return false;
+    }
+    if (v->type == RAY_DICT)
+        return fv_holds_private(ray_dict_keys(v), depth + 1) ||
+               fv_holds_private(ray_dict_vals(v), depth + 1);
+    if (v->type == RAY_LAMBDA)   /* its code, constants and captured locals */
+        return fv_holds_private(LAMBDA_PARAMS(v), depth + 1) ||
+               fv_holds_private(LAMBDA_BODY(v), depth + 1) ||
+               fv_holds_private(LAMBDA_CONSTS(v), depth + 1) ||
+               fv_holds_private(LAMBDA_CLOSURE(v), depth + 1);
+    if (v->type == RAY_LIST)
+        for (int64_t i = 0; i < v->len; i++)
+            if (fv_holds_private(((ray_t**)ray_data(v))[i], depth + 1)) return true;
+    return false;
+}
+#endif
+
+/* The query `dict` (a select's or an update's clauses and outputs) with
+ * each free vector an output reads as rows a private column of the working
+ * table, or NULL when no output reads one.  The working table, with those
+ * columns, goes in *work, a new reference.  With `aliases` (a select), an
+ * earlier output's alias names that output, never a free vector.  Select
+ * and update both plan through this one function. */
+static const int64_t* select_clause_ids(void);   /* defined below */
+static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+static ray_t* fv_bind(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work) {
+    *work = NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    const int64_t* rid = select_clause_ids();
+    int64_t nd = ray_dict_len(dict);
+    ray_t* al_hdr = NULL;
+    int64_t* al = (int64_t*)scratch_alloc(&al_hdr, (size_t)(nd > 0 ? nd : 1) * sizeof(int64_t));
+    if (!al) return ray_error("oom", NULL);
+    fv_cols_t fc = { .aliases = al };
+    ray_t* engine = NULL;
+    ray_t* err = NULL;
+    for (int64_t i = 0; i < nd && !err; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (select_clause_key(rid, kid)) continue;
+        ray_t* nv = fv_expr(((ray_t**)ray_data(vals))[i], tbl, &fc);
+        if (aliases) al[fc.naliases++] = kid;
+        if (!nv) continue;
+        if (RAY_IS_ERR(nv)) { err = nv; break; }
+        if (!engine) { engine = dict; ray_retain(engine); }
+        ray_t* k = ray_sym(kid);
+        engine = k && !RAY_IS_ERR(k) ? ray_dict_upsert(engine, k, nv) : engine;
+        if (k) ray_release(k);
+        ray_release(nv);
+        if (!engine || RAY_IS_ERR(engine)) { err = engine ? engine : ray_error("oom", NULL); engine = NULL; }
+    }
+    scratch_free(al_hdr);
+    fc.aliases = NULL;
+    if (err || !engine) {
+        if (engine) ray_release(engine);
+        fv_cols_free(&fc);
+        return err;
+    }
+    ray_t* base = fv_add_cols(tbl, &fc, engine);
+    fv_cols_free(&fc);
+    if (!base || RAY_IS_ERR(base)) { ray_release(engine); return base; }
+    *work = base;
+    return engine;
+}
+
 /* A vector as long as the table, a global or a literal (an inlined
  * helper's global arrives as its quoted value), read where a column would be: an
  * operand of an atomic builtin or an aggregate's argument, as the DAG
@@ -19217,6 +19547,20 @@ static ray_t* row_globals_subst(ray_t* e, ray_t* tbl, ray_t* const* syms, const 
 
 static const int64_t* select_clause_ids(void);   /* defined below */
 static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+
+/* The select with each free vector an output reads as rows a private
+ * column of its table (fv_bind), from: the working table; NULL when no
+ * output reads one. */
+static ray_t* select_plan_free_vectors(ray_t* dict, ray_t* tbl) {
+    ray_t* work = NULL;
+    ray_t* engine = fv_bind(dict, tbl, true, &work);
+    if (!engine || RAY_IS_ERR(engine)) return engine;
+    ray_t* k_from = ray_sym(select_clause_ids()[0]);
+    if (k_from && !RAY_IS_ERR(k_from)) engine = ray_dict_upsert(engine, k_from, work);
+    if (k_from) ray_release(k_from);
+    ray_release(work);
+    return engine ? engine : ray_error("oom", NULL);
+}
 
 /* The error for a grouped output that aggregates only aggregates of the
  * group, written out or through a helper, on any route; NULL if none. */
@@ -22600,6 +22944,18 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     }
     if (tbl->type != RAY_TABLE) { int8_t tbl_t = tbl->type; ray_release(tbl); return ray_error("type", "select: `from:` must evaluate to a table, got %s", ray_type_name(tbl_t)); }
     select_scan_register(args, dict, tbl, where_expr);
+
+    /* A free vector an aggregate reads is a column of the table (#1462). */
+    if (!(plan & SELECT_FREE_VECS_PLANNED)) {
+        ray_t* engine = select_plan_free_vectors(dict, tbl);
+        if (engine) {
+            ray_release(tbl);
+            if (RAY_IS_ERR(engine)) return engine;
+            ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_FREE_VECS_PLANNED);
+            ray_release(engine);
+            return fv_strip_private(r);   /* the working table's private columns stay behind */
+        }
+    }
 
     /* Prune partitions the where: rules out before any column is fetched. */
     {
@@ -30910,6 +31266,8 @@ ray_t* ray_update_fn(ray_t** args, int64_t n) {
 }
 
 static ray_t* ray_update_lowered(ray_t** args, int64_t n);
+static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym);
+
 ray_t* ray_update(ray_t** args, int64_t n) {
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
@@ -30958,6 +31316,27 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
         tbl = flat_tbl;
     }
 
+    /* A free vector an update expression's aggregate reads is a private
+     * column of the working table, planned as select plans it (fv_bind);
+     * every path below carries it with the rows, and no result keeps it. */
+    ray_t* work = NULL;
+    ray_t* fv_dict = fv_bind(dict, tbl, false, &work);
+    if (fv_dict && RAY_IS_ERR(fv_dict)) { ray_release(tbl); return fv_dict; }
+    if (!fv_dict) {
+        ray_t* r = ray_update_on(dict, tbl, inplace_sym);
+        fv_assert_no_private(r);
+        return r;
+    }
+    ray_release(tbl);
+    ray_t* r = ray_update_on(fv_dict, work, inplace_sym);
+    ray_release(fv_dict);
+    fv_assert_no_private(r);
+    return r;
+}
+
+/* ray_update over the table `tbl` (owned) from: names, `inplace_sym` the
+ * global it names or -1. */
+static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
     ray_t* where_expr = dict_get(dict, "where");
     ray_t* by_expr = dict_get(dict, "by");
 
@@ -31299,6 +31678,7 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
         /* the columns kept from `from:` keep the order notes they had there */
         if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
         /* Store in-place and return the symbol if amending by name. */
+        result = fv_strip_private(result);   /* the working table's private columns stay behind */
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
             ray_env_set(inplace_sym, result);
             ray_release(result);
@@ -31687,6 +32067,7 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
         }
 
         ray_release(mask_vec);
+        result = fv_strip_private(result);   /* the working table's private columns stay behind */
         /* the columns kept from `from:` keep the order notes they had there */
         if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
         if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
@@ -31957,6 +32338,7 @@ no_where_add_col:
     if (result && !RAY_IS_ERR(result)) ray_table_carry_order_notes(result, tbl);
 
     /* Store in-place and return the symbol if amending by name (from: 't). */
+    result = fv_strip_private(result);   /* the working table's private columns stay behind */
     if (inplace_sym >= 0 && result && !RAY_IS_ERR(result)) {
         ray_env_set(inplace_sym, result);
         ray_release(result);

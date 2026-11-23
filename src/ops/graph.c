@@ -260,14 +260,16 @@ static int8_t scan_out_type(int8_t col_type) {
 }
 
 ray_op_t* ray_scan(ray_graph_t* g, const char* col_name) {
+    /* Intern the column name to get symbol ID */
+    return ray_scan_sym(g, ray_sym_intern(col_name, strlen(col_name)));
+}
+
+ray_op_t* ray_scan_sym(ray_graph_t* g, int64_t sym_id) {
     ray_op_ext_t* ext = graph_alloc_ext_node(g);
     if (!ext) return NULL;
 
     ext->base.opcode = OP_SCAN;
     ext->base.arity = 0;
-
-    /* Intern the column name to get symbol ID */
-    int64_t sym_id = ray_sym_intern(col_name, strlen(col_name));
     ext->sym = sym_id;
 
     /* Infer output type from the bound table */

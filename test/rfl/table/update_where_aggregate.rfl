@@ -101,9 +101,15 @@ K -- [0 2 4]
 (set N (table [k f] (list [1 2 1 2 1 3] [1.5 2.0 0Nf 4.0 -3.5 8.0])))
 (update {f: (hi f) from: 'N where: (== k 1)})
 (at N 'f) -- [2.5 2.0 0Nf 4.0 -2.5 8.0]
-;; an aggregate over a global, not a column, is the same on every row
+;; an aggregate reads a global vector as a column, as select does (#1471):
+;; one as long as the table at the kept rows, one of another length is a
+;; length error
 (set G [100 200])
-(at (update {r: (+ i (max G)) from: T where: (== k 1)}) 'r) -- [205 0Nl 0Nl 0Nl 209 0Nl]
+(update {r: (+ i (max G)) from: T where: (== k 1)}) !- length
+(select {r: (+ i (max G)) from: T where: (== k 1)}) !- length
+(set G6 [100 200 300 400 500 600])
+(at (update {r: (+ i (max G6)) from: T where: (== k 1)}) 'r) -- [505 0Nl 0Nl 0Nl 509 0Nl]
+(at (update {r: (+ i (max G6)) from: T where: (== k 1)}) 'r) -- (at (update {r: (+ i (max g6)) from: (update {g6: G6 from: T}) where: (== k 1)}) 'r)
 
 ;; ── running functions keep the whole-table value at the kept rows ──
 (set U (table [g w] (list ['a 'b 'a 'b] [1 2 3 4])))

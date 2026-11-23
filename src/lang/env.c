@@ -292,7 +292,9 @@ ray_t* ray_env_capture_locals_rows(ray_t** flags_out, uint32_t* serial_out) {
     for (int32_t d = __VM->scope_depth - 1; d >= __VM->scope_base; d--) {
         ray_scope_frame_t* f = &__VM->scope_stack[d];
         for (int32_t i = 0; i < f->count; i++) {
-            if (!f->vals[i] || f->keys[i] == g_self_sym) continue;
+            /* a query's private column (sym.h) is no name a closure can
+             * read, and must not outlive its query */
+            if (!f->vals[i] || f->keys[i] == g_self_sym || ray_sym_is_private(f->keys[i])) continue;
             bool seen = false;
             for (int64_t k = 0; k < keys->len; k++)
                 if (key_ids[k] == f->keys[i]) { seen = true; break; }

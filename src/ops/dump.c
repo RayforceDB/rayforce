@@ -23,6 +23,7 @@
 
 #include "ops.h"
 #include "core/numparse.h"   /* ray_snprintf_c */
+#include "table/sym.h"
 #include <stdio.h>
 
 /* Duplicate of find_ext() from opt.c — kept local for self-containment. */
@@ -218,6 +219,8 @@ static void dump_node(FILE* f, ray_graph_t* g, ray_op_t* node, int depth) {
                 ray_t* s = ray_sym_str(ext->sym);
                 if (s)
                     fprintf(f, "(%.*s)", (int)ray_str_len(s), ray_str_ptr(s));
+                else if (ray_sym_is_private(ext->sym))
+                    fprintf(f, "(a vector)");   /* a query's private column */
             }
             break;
         case OP_CONST:

@@ -41,16 +41,18 @@
 
 (at (update {n: (+ (count (sfx s)) (count (distinct x))) by: k from: T}) 'n) -- [4 4 4 4 2]
 (at (select {v: (sfx s) e: (enlist 7) from: T}) 'v) -- ['a! 'b! 'c! 'd! 'e!]
-;; Constant collection counts are independent of the source row count.
+;; Computed collection counts are independent of the source row count.
 (at (select {n: (count (concat L 'c)) from: T}) 'n) -- [3]
-(at (select {n: (count [1 2]) from: T}) 'n) -- [2]
-(at (select {n: (count L) from: T}) 'n) -- [2]
-(at (select {n: (count L) m: (sum x) from: T}) 'n) -- [2]
-(at (select {n: (count L) from: T where: (> x 3)}) 'n) -- [2]
-(at (select {n: (count L) from: T where: (> x 9)}) 'n) -- [2]
-(at (select {n: (count L) by: k from: T asc: k}) 'n) -- [2 2 2]
+;; A written vector is read as a column (#1462, #1471): one of another
+;; length than the table's is a length error, in count as in sum.
+(select {n: (count [1 2]) from: T}) !- length
+(select {n: (count L) from: T}) !- length
+(select {n: (count L) m: (sum x) from: T}) !- length
+(select {n: (count L) from: T where: (> x 3)}) !- length
+(select {n: (count L) from: T where: (> x 9)}) !- length
+(select {n: (count L) by: k from: T asc: k}) !- length
 (at (select {n: (count (concat L 'c)) by: k from: T asc: k}) 'n) -- [3 3 3]
-(at (select {n: (count L) x: x from: T}) 'n) -- [2 2 2 2 2]
+(select {n: (count L) x: x from: T}) !- length
 ;; Free helper constants retain their global binding in fallback, including
 ;; when an earlier projection uses the same name as an alias.
 (set suffix "!")

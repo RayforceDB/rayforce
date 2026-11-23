@@ -348,6 +348,95 @@ static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
     return NULL;
 }
 
+/* Builtins that map over a vector element by element in some argument but
+ * are not registered atomic (they do not auto-map over lists): the argument
+ * positions that are row-shaped (bit i: argument i+1; these builtins take
+ * at most three).  An argument a builtin consumes whole -- in's set,
+ * like's pattern, within's bounds, bin's breaks, at's source -- is not
+ * listed.  The conformance test (lang/builtin_row_shape) measures every
+ * entry, and every pure builtin's undeclared positions. */
+static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
+    { (void*)ray_not_fn,             1, 1 }, { (void*)ray_nil_fn,             1, 1 },
+    { (void*)ray_sin_fn,             1, 1 }, { (void*)ray_cos_fn,             1, 1 },
+    { (void*)ray_tan_fn,             1, 1 }, { (void*)ray_asin_fn,            1, 1 },
+    { (void*)ray_acos_fn,            1, 1 }, { (void*)ray_atan_fn,            1, 1 },
+    { (void*)ray_reciprocal_fn,      1, 1 }, { (void*)ray_signum_fn,          1, 1 },
+    { (void*)ray_extract_ss_fn,      1, 1 }, { (void*)ray_extract_minute_fn,  1, 1 },
+    { (void*)ray_extract_hh_fn,      1, 1 }, { (void*)ray_extract_dd_fn,      1, 1 },
+    { (void*)ray_extract_mm_fn,      1, 1 }, { (void*)ray_extract_yyyy_fn,    1, 1 },
+    { (void*)ray_extract_dow_fn,     1, 1 }, { (void*)ray_extract_doy_fn,     1, 1 },
+    { (void*)ray_sym_name_fn,        1, 1 }, { (void*)ray_strlen_fn,          1, 1 },
+    { (void*)ray_cast_fn,            2, 2 }, { (void*)ray_xbar_fn,            2, 3 },
+    { (void*)ray_in_eval_fn,         2, 1 }, { (void*)ray_not_in_fn,          2, 1 },
+    { (void*)ray_like_fn,            2, 1 }, { (void*)ray_str_find_fn,        2, 1 },
+    { (void*)ray_within_fn,          2, 1 },
+    { (void*)ray_upper_fn,           1, 1 }, { (void*)ray_lower_fn,           1, 1 },
+    { (void*)ray_trim_fn,            1, 1 }, { (void*)ray_substr_fn,          3, 1 },
+    { (void*)ray_replace_fn,         3, 1 },
+};
+
+/* Positions that do map element by element but a query reads whole by
+ * decision, each with its reason.  Not row-shaped: ray_fn_row_arg leaves
+ * them out; the conformance test measures that each still maps, so the
+ * list cannot go stale or grow unseen. */
+static const struct { void* fn; uint8_t nargs; uint8_t mask; const char* why; } g_row_args_whole[] = {
+    /* lookups: neither side of a lookup is sliced unless it is a column */
+    { (void*)ray_at_fn,     2, 2, "at's index is a lookup: read whole, as its source" },
+    { (void*)ray_find_fn,   2, 2, "find's needles are a lookup: read whole, as its list" },
+    { (void*)ray_bin_fn,    2, 2, "bin's values are a lookup: read whole, as its breaks" },
+    { (void*)ray_binr_fn,   2, 2, "binr's values are a lookup: read whole, as its breaks" },
+    { (void*)ray_raze_fn,   1, 1, "raze is the identity on a flat vector; on a list it changes length" },
+    { (void*)ray_concat_fn, 2, 3, "a query concatenates a bound collection operand as a collection" },
+};
+
+bool ray_fn_row_arg_whole(ray_t* fn, int64_t nargs, int64_t pos, const char** why) {
+    if (why) *why = NULL;
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || pos < 1 || pos > nargs)
+        return false;
+    void* f = (void*)(uintptr_t)fn->i64;
+    for (size_t i = 0; i < sizeof g_row_args_whole / sizeof g_row_args_whole[0]; i++)
+        if (g_row_args_whole[i].fn == f && g_row_args_whole[i].nargs == nargs &&
+            ((g_row_args_whole[i].mask >> (pos - 1)) & 1)) {
+            if (why) *why = g_row_args_whole[i].why;
+            return true;
+        }
+    return false;
+}
+
+bool ray_fn_row_arg(ray_t* fn, int64_t nargs, int64_t pos) {
+    if (!fn || nargs < 1 || pos < 1 || pos > nargs) return false;
+    void* f = (void*)(uintptr_t)fn->i64;
+    switch (fn->type) {
+    case RAY_UNARY:
+        /* (min a b) / (max a b): the binary overload maps elementwise */
+        if (nargs == 2 && unary_binary_overload((ray_unary_fn)f)) return true;
+        if (nargs != 1) return false;
+        if (fn->attrs & RAY_FN_ATOMIC) return true;
+        break;
+    case RAY_BINARY:
+        if (nargs != 2) return false;
+        if (fn->attrs & RAY_FN_ATOMIC) return true;
+        if (pos == 1 && (fn->attrs & RAY_FN_LEFT_ATOMIC)) return true;
+        if (pos == 2 && (fn->attrs & RAY_FN_RIGHT_ATOMIC)) return true;
+        break;
+    case RAY_VARY:
+        /* and / or / if test and pick element by element, every operand
+         * however many: an if as a query evaluates one whose test reads
+         * rows (outside a query a vector test is one truth value) */
+        if (f == (void*)ray_and_vary_fn || f == (void*)ray_or_vary_fn ||
+            f == (void*)ray_cond_fn) return nargs >= 2;
+        if (fn->attrs & RAY_FN_ATOMIC) return true;
+        break;
+    default:
+        return false;
+    }
+    /* a declared builtin: pos <= nargs <= 3, inside its mask */
+    for (size_t i = 0; i < sizeof g_row_args / sizeof g_row_args[0]; i++)
+        if (g_row_args[i].fn == f && g_row_args[i].nargs == nargs)
+            return (g_row_args[i].mask >> (pos - 1)) & 1;
+    return false;
+}
+
 /* A LIST whose elements are all atoms of one numeric or temporal type, as
  * a vector of that type (the list is released); any other list as it is. */
 static ray_t* list_collapse_uniform(ray_t* list) {

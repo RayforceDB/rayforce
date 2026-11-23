@@ -6524,6 +6524,8 @@ static ray_t* validate_scan_columns(ray_graph_t* g) {
         if (name)
             return ray_error("schema", "column '%.*s' not found",
                              (int)ray_str_len(name), ray_str_ptr(name));
+        if (ray_sym_is_private(ext->sym))   /* a query's private column (table/sym.h) */
+            return ray_error("schema", "a vector the query reads as a column is not available");
         return ray_error("schema", "column not found");
     }
     return NULL;

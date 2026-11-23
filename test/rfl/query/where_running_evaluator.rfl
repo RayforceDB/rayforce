@@ -112,7 +112,8 @@
 (at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'a) -- [40]
 (at (select {from: U where: (> i 20) a: (sum (prior - i)) b: (max (prior - i))}) 'b) -- [10]
 (at (select {from: U where: (> i 20) a: (sum (sums i)) c: (count (til 3))}) 'a) -- [520]
-(at (select {from: U where: (> i 20) a: (sum (prior - i)) c: (count [1 2 3])}) 'c) -- [3]
+(at (select {from: U where: (> i 20) a: (sum (prior - i)) c: (count (at [1 2 3] [0 1 2]))}) 'c) -- [3]
+(select {from: U where: (> i 20) a: (sum (prior - i)) c: (count [1 2 3])}) !- length
 (at (select {from: U where: (> i 20) z: (prior - i) take: 2}) 'z) -- [10 10]
 (at (select {from: U where: (> i 20) z: (sums i) q: (+ i 1)}) 'z) -- [60 100 150 210]
 (at (select {from: U where: (> i 20) z: (sum (sums i))}) 'z) -- [520]

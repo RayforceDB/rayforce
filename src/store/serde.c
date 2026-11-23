@@ -1535,6 +1535,15 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
             int64_t name_id = (schema->type == RAY_I64)
                 ? ((int64_t*)name_data)[i]
                 : ray_read_sym(name_data, i, RAY_SYM, schema->attrs);
+            /* A legacy numeric schema carries raw ids: none may be a query's
+             * private column id (table/sym.h), which no name can reach. */
+            if (schema->type == RAY_I64 && ray_sym_is_private(name_id)) {
+                ray_release(tbl);
+                ray_release(schema);
+                ray_release(cols);
+                return ray_error("domain", "deserialize table: column name %lld is not a symbol",
+                                 (long long)name_id);
+            }
             ray_t* new_tbl = ray_table_add_col(tbl, name_id, col_ptrs[i]);
             if (!new_tbl || RAY_IS_ERR(new_tbl)) {
                 ray_release(schema);

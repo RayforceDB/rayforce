@@ -1,0 +1,297 @@
+;; @also-unfused
+;; @requires: posix  (parted fixture under /tmp, cleaned through a POSIX shell via .sys.exec)
+;; A vector a query reads that is no column of its table (a global, a
+;; literal, a lambda parameter, a let, a global read in an inlined helper)
+;; stands for a column where an aggregate reads its rows (#1462, #1471).
+;; As long as the table, it is sliced per group and filtered by where: in
+;; every aggregate, count included, on every route, in select and update.
+;; Of one value it is spread like an atom; of any other length it is a
+;; length error in every aggregate, count included.
+(set t (table [g v] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10])))
+(set W [0 10 20 30 40 50 60 70 80 90])
+;; the oracle: the same vector as a real column
+(set tw (table [g v w] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10] W)))
+
+;; ── by: ──
+(at (select {s: (sum W) by: g from: t}) 's) -- [10 90 350]
+(at (select {s: (count W) by: g from: t}) 's) -- [2 3 5]
+(at (select {s: (count W) by: g from: t}) 's) -- (at (select {s: (count w) by: g from: tw}) 's)
+(at (select {s: (avg W) by: g from: t}) 's) -- [5.0 30.0 70.0]
+(at (select {s: (first W) by: g from: t}) 's) -- [0 20 50]
+(at (select {s: (last W) by: g from: t}) 's) -- [10 40 90]
+(at (select {s: (min W) by: g from: t}) 's) -- [0 20 50]
+(at (select {s: (max (+ W 0)) by: g from: t}) 's) -- [10 40 90]
+(at (select {s: (med W) by: g from: t}) 's) -- (at (select {s: (med w) by: g from: tw}) 's)
+(at (select {s: (var W) by: g from: t}) 's) -- (at (select {s: (var w) by: g from: tw}) 's)
+(at (select {s: (count (distinct W)) by: g from: t}) 's) -- (at (select {s: (count (distinct w)) by: g from: tw}) 's)
+(at (select {s: (wavg W v) by: g from: t}) 's) -- (at (select {s: (wavg w v) by: g from: tw}) 's)
+(at (select {s: (wavg v W) by: g from: t}) 's) -- (at (select {s: (wavg v w) by: g from: tw}) 's)
+(at (select {s: (wsum v W) from: t where: (> v 5)}) 's) -- (at (select {s: (wsum v w) from: tw where: (> v 5)}) 's)
+(at (select {s: (quantile W 0.5) by: g from: t}) 's) -- (at (select {s: (quantile w 0.5) by: g from: tw}) 's)
+(at (select {s: (top W 2) by: g from: t}) 's) -- (at (select {s: (top w 2) by: g from: tw}) 's)
+(at (select {s: (sum (if (> v 3) W v)) by: g from: t}) 's) -- [3 73 350]
+(at (select {s: (max (+ W (count v))) by: g from: t}) 's) -- [12 43 95]
+(at (select {s: (max (+ v (count W))) by: g from: t}) 's) -- [4 8 15]
+(value (select {s: (sum W) c: (count W) a: (avg W) by: g from: t})) -- (value (select {s: (sum w) c: (count w) a: (avg w) by: g from: tw}))
+
+;; ── by: with where: ──
+(at (select {s: (sum W) by: g from: t where: (> v 2)}) 's) -- [90 350]
+(at (select {s: (count W) by: g from: t where: (> v 2)}) 's) -- [3 5]
+(at (select {s: (count W) by: g from: t where: (> v 3)}) 's) -- (at (select {s: (count w) by: g from: tw where: (> v 3)}) 's)
+
+;; ── keyless with where: (#1471) ──
+(at (select {s: (sum W) from: t where: (> v 5)}) 's) -- [350]
+(at (select {s: (count W) from: t where: (> v 5)}) 's) -- [5]
+(at (select {s: (first W) from: t where: (> v 5)}) 's) -- [50]
+(value (select {s: (sum W) c: (count W) from: t where: (> v 5)})) -- (list [350] [5])
+(at (select {s: (+ (sum v) (count W)) from: t where: (> v 5)}) 's) -- [45]
+(set A (table [g x] (list [a a b] [1 2 3])))
+(set gl [10 20 30])
+(at (select {s: (sum gl) from: A where: (== g 'a)}) 's) -- [30]
+(at (select {s: (count gl) from: A where: (== g 'a)}) 's) -- [2]
+(set h1471 (fn [x] (+ (sum x) (count gl))))
+(at (select {s: (h1471 x) from: A where: (== g 'a)}) 's) -- [5]
+(at (update {s: (h1471 x) from: A where: (== g 'a)}) 's) -- [5 5 0Nl]
+
+;; ── keyless without where: the whole table ──
+(at (select {s: (sum W) c: (count W) from: t}) 'c) -- [10]
+
+;; ── lambda parameters and let, the same as a global (#1462) ──
+(at ((fn [X] (select {s: (max (+ X (count v))) by: g from: t})) W) 's) -- [12 43 95]
+(at ((fn [X] (select {s: (count X) by: g from: t})) W) 's) -- [2 3 5]
+(at ((fn [X] (select {s: (sum X) by: g from: t})) W) 's) -- [10 90 350]
+(at ((fn [X] (select {c: (count X) from: t where: (> v 5)})) W) 'c) -- [5]
+(at ((fn [X] (select {s: (sum X) c: (count X) from: t where: (> v 5)})) W) 'c) -- [5]
+(at ((fn [] (let X W) (select {c: (count X) by: g from: t}))) 'c) -- [2 3 5]
+;; a parameter named like a column hides it, and is read as that column is
+(at ((fn [v] (select {s: (count v) by: g from: t})) W) 's) -- [2 3 5]
+(at ((fn [v] (select {s: (sum v) by: g from: t})) W) 's) -- [10 90 350]
+;; a literal
+(at (select {s: (count [0 10 20 30 40 50 60 70 80 90]) by: g from: t}) 's) -- [2 3 5]
+(at (select {s: (sum [0 10 20 30 40 50 60 70 80 90]) from: t where: (> v 5)}) 's) -- [350]
+;; a dotted global
+(set u1462 (dict [W] (list [0 10 20 30 40 50 60 70 80 90])))
+(at (select {s: (count u1462.W) by: g from: t}) 's) -- [2 3 5]
+(at (select {s: (sum u1462.W) by: g from: t}) 's) -- [10 90 350]
+(at (update {s: (sum u1462.W) by: g from: t}) 's) -- [10 10 90 90 90 350 350 350 350 350]
+;; a global read in an inlined helper
+(set hW (fn [x] (+ x (count W))))
+(at (select {s: (max (hW v)) by: g from: t}) 's) -- [4 8 15]
+
+;; ── update: by:, where:, keyless ──
+(at (update {s: (sum W) by: g from: t}) 's) -- [10 10 90 90 90 350 350 350 350 350]
+(at (update {s: (count W) by: g from: t}) 's) -- [2 2 3 3 3 5 5 5 5 5]
+(at ((fn [X] (update {s: (count X) by: g from: t})) W) 's) -- [2 2 3 3 3 5 5 5 5 5]
+(at (update {s: (wavg v W) by: g from: t}) 's) -- (at (update {s: (wavg v w) by: g from: tw}) 's)
+(at (update {s: (sum (if (> v 3) W v)) by: g from: t}) 's) -- (at (update {s: (sum (if (> v 3) w v)) by: g from: tw}) 's)
+(at (update {s: (max (+ W 0)) by: g from: t}) 's) -- (at (update {s: (max (+ w 0)) by: g from: tw}) 's)
+(at (update {s: (sum W) from: t where: (> v 5)}) 's) -- [0Nl 0Nl 0Nl 0Nl 0Nl 350 350 350 350 350]
+(at (update {s: (count W) from: t where: (> v 5)}) 's) -- [0Nl 0Nl 0Nl 0Nl 0Nl 5 5 5 5 5]
+(at (update {s: (count W) from: t}) 's) -- [10 10 10 10 10 10 10 10 10 10]
+;; in place, both the aggregating and the general where: routes
+(set T2 (table [g v] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10])))
+(update {v: (sum W) from: 'T2 where: (> v 5)})
+(at T2 'v) -- [1 2 3 4 5 350 350 350 350 350]
+(set T2 (table [g v] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10])))
+(update {v: (+ (sum v) (count W)) from: 'T2 where: (> v 5)})
+(at T2 'v) -- [1 2 3 4 5 45 45 45 45 45]
+;; the hidden columns never reach a result
+(key (select {s: (sum W) by: g from: t where: (> v 2)})) -- [g s]
+(key (update {s: (sum W) by: g from: t})) -- [g v s]
+(key (update {s: (count W) from: t where: (> v 5)})) -- [g v s]
+
+;; ── a vector of one value is spread like an atom ──
+(at (select {s: (sum [7]) by: g from: t}) 's) -- [14 21 35]
+(at (select {s: (count [7]) by: g from: t}) 's) -- [1 1 1]
+
+;; ── a vector of another length is a length error in every aggregate ──
+(select {s: (sum [1 2 3]) by: g from: t}) !- length
+(select {s: (count [1 2 3]) by: g from: t}) !- length
+(select {s: (count [1 2 3]) from: t}) !- length
+(select {s: (count [1 2 3]) from: t where: (> v 5)}) !- length
+(select {s: (first [1 2 3]) from: t}) !- length
+((fn [X] (select {s: (count X) by: g from: t})) [1 2 3]) !- length
+(update {s: (count [1 2 3]) by: g from: t}) !- length
+(update {s: (count [1 2 3]) from: t where: (> v 5)}) !- length
+(update {s: (count [1 2 3]) from: t}) !- length
+;; a computed collection is one value, as before
+(at (select {s: (count (til 3)) by: g from: t}) 's) -- [3 3 3]
+;; an index source is the whole vector, as before
+(at (select {s: (sum (at W [0 1])) by: g from: t}) 's) -- [10 10 10]
+
+;; ── a parted table ──
+(.sys.exec "rm -rf /tmp/rfl_free_vector_rule")
+(.db.splayed.set "/tmp/rfl_free_vector_rule/2024.01.01/t/" (table [g v] (list [a a b b b] [1 2 3 4 5])))
+(.db.splayed.set "/tmp/rfl_free_vector_rule/2024.01.02/t/" (table [g v] (list [c c c c c] [6 7 8 9 10])))
+(set P (.db.parted.get "/tmp/rfl_free_vector_rule/" 't))
+(at (select {s: (count W) by: g from: P}) 's) -- [2 3 5]
+(at (select {s: (sum W) from: P where: (> v 5)}) 's) -- [350]
+(.sys.exec "rm -rf /tmp/rfl_free_vector_rule")
+
+;; ── an earlier output's alias names that output, not a free vector ──
+(at (select {W: (* v 2) s: (sum W) from: t}) 's) -- [110 110 110 110 110 110 110 110 110 110]
+(set S1492 [1 2 3])
+(at (select {S1492: (* v 2) s: (sum S1492) from: t}) 's) -- [110 110 110 110 110 110 110 110 110 110]
+(select {W: (sum v) s: (count W) from: t by: g}) !- domain
+;; ... but a helper's global is no alias, and update has no output aliases
+(set h1492 (fn [x] (+ x (sum W))))
+(at (select {W: (* v 2) s: (h1492 0) by: g from: t}) 's) -- [10 90 350]
+(at (update {W: (* v 2) s: (sum W) by: g from: t}) 's) -- [10 10 90 90 90 350 350 350 350 350]
+
+;; ── the hidden columns capture no name a user writes, nor are captured ──
+((fn [__fv0] (at (select {s: (+ __fv0 (sum W)) by: g from: t}) 's)) 7) -- [17 97 357]
+((fn [__fv0] (at (update {s: (+ __fv0 (sum W)) by: g from: t}) 's)) 7) -- [17 17 97 97 97 357 357 357 357 357]
+(set __fv0 100)
+(at (select {s: (sum W) from: t where: (> __fv0 50)}) 's) -- [450]
+(at (select {__fv0: 7 s: (sum W) from: t}) 's) -- [450]
+(value (select {__fv0: 7 s: (sum W) from: t})) -- (value (select {__fv0: 7 s: (sum w) from: tw}))
+
+;; ── one value, and an empty table, keep their answers at equal lengths ──
+(set e1492 (table [v] (list (til 0))))
+(set Z1492 (til 0))
+(at (select {s: (count Z1492) from: e1492}) 's) -- [0]
+(at (select {s: (count Z1492) from: e1492}) 's) -- (at (select {s: (count (til 0)) from: e1492}) 's)
+(at (select {s: (count Z1492) from: e1492 where: (> v 0)}) 's) -- [0]
+(count (select {s: (count Z1492) by: v from: e1492})) -- 0
+(at (select {s: (count [7]) from: (table [v] (list [1])) where: (> v 5)}) 's) -- [1]
+(at (select {s: (count [0Nl]) from: (table [v] (list [1])) where: (> v 5)}) 's) -- [1]
+(at (select {s: (count (distinct [0Nl])) from: (table [v] (list [1])) where: (> v 5)}) 's) -- [1]
+
+;; ── no fixed number of free vectors: 257 distinct literals in one output ──
+(set t257 (table [g] (list [a b])))
+(at (select {s: (sum (+ (+ (+ (+ (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))))) (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))))) (+ (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))))) (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))))))) (+ (+ (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))))) (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))))) (+ (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))))) (+ (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))) (+ (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2]))) (+ (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])) (+ (+ [1 2] [1 2]) (+ [1 2] [1 2])))))))) [1 2])) by: g from: t257}) 's) -- [257 514]
+
+;; ── keyless, a helper's global and a dotted global are columns too ──
+(set Wn [0Nl 10 20 0Nl 40 50 60 0Nl 80 90])
+(set twn (table [g v w] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10] Wn)))
+(set hn (fn [v] (sum Wn)))
+(set nsn (dict [W] (list Wn)))
+(select {s: (hn v) from: t}) -- (select {s: (sum w) from: twn})
+(select {s: (first nsn.W) from: t}) -- (select {s: (first w) from: twn})
+(select {s: (cov nsn.W v) from: t}) -- (select {s: (cov w v) from: twn})
+(select {s: (hn v) from: t where: true}) -- (select {s: (sum w) from: twn where: true})
+
+;; ── hidden columns are reachable by no name a query or a table holds ──
+(set X2 [1 2])
+(set W2 [10 20])
+(set t2 (table [g v] (list [a b] [1 2])))
+;; a source table with columns named like hidden ones
+(set tc (table (concat [g] (as 'SYM ["#fv0" "#fv1" "#fv2"])) (list [a b] [100 100] [200 200] [300 300])))
+(value (select {s: (sum W2) x: (sum X2) from: tc by: g})) -- (list [a b] [10 20] [1 2])
+(at (update {s: (+ (sum W2) (sum X2)) from: tc by: g}) 's) -- [11 22]
+(key (update {s: (+ (sum W2) (sum X2)) from: tc by: g})) -- (concat (concat [g] (as 'SYM ["#fv0" "#fv1" "#fv2"])) [s])
+;; a global, an alias and a reference built at run time
+(set sp0 (as 'SYM "#fv0"))
+(eval (list 'set sp0 100))
+(at (eval (list 'select (dict [s from where] (list (list 'sum W2) t2 (list '> sp0 50))))) 's) -- [30]
+(at (eval (list 'select (dict (concat (enlist sp0) [s from where]) (list 7 (list 'sum W2) t2 true)))) 's) -- [30]
+(set sp3 (as 'SYM "#fv3"))
+(eval (list 'select (dict [s z from by] (list (list 'sum W2) sp3 t2 'g)))) !- name
+
+;; ── row shape follows how each builtin is applied (ray_fn_row_args) ──
+(set t3 (table [g h v] (list [a a b b b c c c c c] [0 1 0 1 0 1 0 1 0 1] [1 2 3 4 5 6 7 8 9 10])))
+(set tw3 (table [g h v w] (list [a a b b b c c c c c] [0 1 0 1 0 1 0 1 0 1] [1 2 3 4 5 6 7 8 9 10] W)))
+;; binary min / max map element by element, the unary ones aggregate
+(at (select {s: (sum (min W 30)) from: t3 by: g}) 's) -- [10 80 150]
+(at (select {s: (sum (max W 30)) from: t3 where: (> v 5)}) 's) -- [350]
+(at (update {s: (sum (min W 30)) from: t3 by: g}) 's) -- (at (update {s: (sum (min w 30)) from: tw3 by: g}) 's)
+;; a cast maps its value, in update as in select
+(at (update {s: (sum (as 'F64 W)) from: t3 where: (> v 5)}) 's) -- (at (update {s: (sum (as 'F64 w)) from: tw3 where: (> v 5)}) 's)
+(at (update {s: (sum (as 'F64 W)) from: t3 by: g}) 's) -- [10.0 10.0 90.0 90.0 90.0 350.0 350.0 350.0 350.0 350.0]
+;; other builtins that map without being atomic
+(at (select {s: (sum (not (> W 30))) from: t3 by: g}) 's) -- (at (select {s: (sum (not (> w 30))) from: tw3 by: g}) 's)
+(at (select {s: (sum (xbar W 25)) from: t3 by: g}) 's) -- (at (select {s: (sum (xbar w 25)) from: tw3 by: g}) 's)
+(at (select {s: (sum (signum (- W 45))) from: t3 by: g}) 's) -- (at (select {s: (sum (signum (- w 45))) from: tw3 by: g}) 's)
+(at (select {s: (count (in W [10 50 90])) from: t3 by: g}) 's) -- [2 3 5]
+(at (select {s: (sum (in W [10 50 90])) from: t3 by: g}) 's) -- (at (select {s: (sum (in w [10 50 90])) from: tw3 by: g}) 's)
+;; an argument a builtin reads whole stays whole: in's set, within's bounds,
+;; bin's breaks, at's source (a table-length lookup vector keeps working)
+(set S10 [5 15 25 35 45 55 65 75 85 95])
+(at (select {s: (sum (in v S10)) from: t3 by: g}) 's) -- (at (select {s: (sum (in v [5 15 25 35 45 55 65 75 85 95])) from: tw3 by: g}) 's)
+(at (select {s: (sum (at S10 (- v 1))) from: t3 by: g}) 's) -- (at (select {s: (sum (at [5 15 25 35 45 55 65 75 85 95] (- v 1))) from: tw3 by: g}) 's)
+(at (select {s: (sum (bin S10 v)) from: t3 by: g}) 's) -- (at (select {s: (sum (bin [5 15 25 35 45 55 65 75 85 95] v)) from: tw3 by: g}) 's)
+;; neither side of a lookup is sliced unless it is a column: a table-length
+;; index vector and needle vector are read whole, as on dev
+(set I10 [9 8 7 6 5 4 3 2 1 0])
+(at (select {s: (sum (at W I10)) from: t3 by: g}) 's) -- [450 450 450]
+(at (select {s: (count (at W I10)) from: t3 by: g}) 's) -- [10 10 10]
+(at (select {s: (sum (find W I10)) from: t3 by: g}) 's) -- (at (select {s: (sum (find W [9 8 7 6 5 4 3 2 1 0])) from: t3 by: g}) 's)
+(at (select {s: (count (find W I10)) from: t3 where: (> v 5)}) 's) -- [10]
+;; a per-row index is a column
+(at (select {s: (sum (at W i)) from: (update {i: I10 from: t3}) by: g}) 's) -- [170 180 100]
+;; raze is not row-shaped: the whole vector
+(at (select {s: (sum (raze W)) from: t3 by: g}) 's) -- [450 450 450]
+;; a table-length vector meant whole: read it through a call that takes it
+;; whole, (raze W), or through a helper of several statements
+(at (select {s: (sum (raze W)) from: t3 where: (> v 5)}) 's) -- [450]
+(at (update {s: (sum (raze W)) from: t3 by: g}) 's) -- [450 450 450 450 450 450 450 450 450 450]
+(set whole3 (fn [] (do 0 W)))
+(at (select {s: (sum (whole3)) from: t3 by: g}) 's) -- [450 450 450]
+
+;; ── the private columns: reachable by no name, interning nothing ──
+;; a name built while the query runs reaches no private column
+(set t4 (table [g v] (list [a b] [1 2])))
+(set W4 [10 20])
+(set late0 (fn [x] (do 0 (eval (as 'SYM (format "#fv%" 5))))))
+(value (select {s: (sum W4) z: (late0 v) from: t4})) !- name
+(set late1 (fn [x] (do (eval (list 'set (as 'SYM (format "#fv%" 6)) 100)) (eval (as 'SYM (format "#fv%" 6))))))
+(value (select {s: (sum W4) z: (late1 v) from: t4})) -- (list [30 30] [100 100])
+;; no symbol is interned per query, on any route
+(set fq (fn [i] (do (select {s: (sum W4) by: g from: t4}) (select {s: (count W4) from: t4 where: (> v 0)}) (select {s: (first W4) from: t4}) (update {s: (sum W4) by: g from: t4}) (update {s: (count W4) from: t4 where: (> v 1)}) 0)))
+(set sq0 0)
+(set sq1 0)
+(set sq2 0)
+;; (.sys.mem interns its own key names on its first calls)
+(set out (map fq (til 100)))
+(set sq0 (at (.sys.mem) 'sym-count))
+(set sq0 (at (.sys.mem) 'sym-count))
+(set out (map fq (til 1000)))
+(set sq1 (at (.sys.mem) 'sym-count))
+(set out (map fq (til 1000)))
+(set sq2 (at (.sys.mem) 'sym-count))
+(- sq1 sq0) -- 0
+(- sq2 sq1) -- 0
+;; nothing built inside a query keeps a private column: a closure made by a
+;; helper during the query, and a lazy value over a query's result, are
+;; used by a later, different query
+(set t5 (table [g v] (list [a a b b b c c c c c] (til 10))))
+(set mk5 (fn [x] (do 0 (fn [] (+ x 1)))))
+(set R5 (select {s: (sum W) f: (mk5 1) from: t5 where: (> v 5)}))
+(at R5 's) -- [300 300 300 300]
+((first (at R5 'f))) -- 2
+(at (select {s: (+ (sum W) ((first (at R5 'f)))) by: g from: t5}) 's) -- [12 92 352]
+(set L5 (asc (at (select {s: (sum W) by: g from: t5}) 's)))
+(at (select {s: (+ (sum W) (at L5 0)) by: g from: t5}) 's) -- [20 100 360]
+
+;; ── row shape at any position of a call: no limit on the operand count ──
+(set t6 (table [g v] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10])))
+(set B6 [true false true true false true false true true false])
+(set tb6 (table [g v b] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10] B6)))
+;; W after 32 other operands of and / or, in update and select
+(at (update {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true B6)) from: t6 by: g}) 's) -- [1 1 2 2 2 3 3 3 3 3]
+(at (update {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true B6)) from: t6 by: g}) 's) -- (at (update {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true b)) from: tb6 by: g}) 's)
+(at (update {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true B6)) from: t6 where: (> v 5)}) 's) -- [0Nl 0Nl 0Nl 0Nl 0Nl 3 3 3 3 3]
+(at (update {s: (sum (or false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false B6)) from: t6 by: g}) 's) -- [1 1 2 2 2 3 3 3 3 3]
+(at (select {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true B6)) from: t6 by: g}) 's) -- [1 2 3]
+(update {s: (sum (and true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true true [true false true])) from: t6 by: g}) !- length
+(select {s: (sum (or false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false false [true false true])) from: t6 where: (> v 5)}) !- length
+;; bin and binr are both lookups: their values are read whole, as on dev;
+;; a column's values are sliced
+(set W6 [0 10 20 30 40 50 60 70 80 90])
+(set tw6 (table [g v w] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10] W6)))
+(at (select {s: (sum (bin [0 25 50 75] W6)) from: t6 by: g}) 's) -- [14 14 14]
+(at (select {s: (sum (binr [0 25 50 75] W6)) from: t6 by: g}) 's) -- [20 20 20]
+(at (select {s: (sum (bin [0 25 50 75] W6)) from: t6 where: (> v 5)}) 's) -- [14]
+(at (select {s: (sum (binr [0 25 50 75] W6)) from: t6 where: (> v 5)}) 's) -- [20]
+(at (update {s: (sum (bin [0 25 50 75] W6)) from: t6 by: g}) 's) -- [14 14 14 14 14 14 14 14 14 14]
+(at (select {s: (sum (bin [0 25 50 75] w)) from: tw6 by: g}) 's) -- [0 2 12]
+(at (select {s: (sum (binr [0 25 50 75] w)) from: tw6 by: g}) 's) -- [1 5 14]
+;; a private id is no symbol: sym-name refuses one, as any unknown id
+(sym-name 4294967294) !- domain
+(sym-name 2147483648) !- domain
+(sym-name [1 4294967294]) !- domain
+;; replace maps its text row by row, as substr does
+(set S6 ["ab" "ab" "cd" "ab" "cd" "ef" "ab" "cd" "ef" "gh"])
+(set ts6 (table [g v s] (list [a a b b b c c c c c] [1 2 3 4 5 6 7 8 9 10] S6)))
+(at (select {s: (count (distinct (replace S6 "a" "z"))) from: t6 by: g}) 's) -- (at (select {s: (count (distinct (replace s "a" "z"))) from: ts6 by: g}) 's)
+(at (select {s: (count (distinct (replace S6 "a" "z"))) from: t6 by: g}) 's) -- [1 2 4]
