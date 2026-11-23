@@ -1319,6 +1319,12 @@ static void cast_mark_output_sentinels(ray_t* vec, int8_t out_type, int64_t n) {
                 if (d[i] == NULL_I64) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
             return;
         }
+        case RAY_DATE: case RAY_TIME: {
+            const int32_t* d = (const int32_t*)out;
+            for (int64_t i = 0; i < n; i++)
+                if (d[i] == NULL_I32) { vec->attrs |= RAY_ATTR_HAS_NULLS; return; }
+            return;
+        }
         case RAY_SYM:
             for (int64_t i = 0; i < n; i++) {
                 if (ray_read_sym(out, i, RAY_SYM, vec->attrs) == 0) {
