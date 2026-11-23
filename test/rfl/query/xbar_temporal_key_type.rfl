@@ -52,6 +52,26 @@
 ;; a float bucket is a type error on a temporal column, in a query as outside one
 (select {k: (xbar ts 2.5) from: t}) !- type
 (select {from: t by: {M: (xbar ts 2.5)} c: (count x)}) !- type
+;; an F32 bucket is the same type error, eager and in a query (#1409): it
+;; used to bucket by garbage (TIME to 00:00:00.000, TIMESTAMP past 2146)
+(xbar 12:00:00.000 2.5e) !- type
+(xbar 2024.01.15 2.5e) !- type
+(xbar 2024.01.15D12:34:56.000000000 -2.5e) !- type
+(xbar 12:00:00.000 2.5) !- type
+(xbar 2024.01.15 2.5) !- type
+(xbar [12:00:00.000 13:00:00.000] 2.5e) !- type
+(xbar [2024.01.15 2024.01.16] 2.5e) !- type
+(xbar [2024.01.15D12:34:56.000000000 0Np] 2.5e) !- type
+(xbar 0Nt 2.5e) !- type
+(select {k: (xbar ts 2.5e) from: t}) !- type
+(select {k: (xbar d 2.5e) from: t}) !- type
+(select {k: (xbar tm 2.5e) from: t}) !- type
+(select {k: (xbar d 2.5) from: t}) !- type
+(select {k: (xbar tm 2.5) from: t}) !- type
+(select {from: t by: {M: (xbar tm 2.5e)} c: (count x)}) !- type
+(select {from: t by: {M: (xbar d 2.5e)} c: (count x)}) !- type
+;; a TIMESPAN by a float stays numeric, by F32 as by F64
+(xbar 0D01:00:00 2.5e) -- (xbar 0D01:00:00 2.5)
 
 ;; ─── nulls stay null, in the column's type ───────────────────────────────────
 (set tn (table [ts d x] (list [2000.01.01D00:00:00.000000000 0Np 2000.01.01D00:01:30.000000000] [2000.01.01 0Nd 2000.01.09] [1 2 3])))
