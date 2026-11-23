@@ -778,10 +778,114 @@ static ray_t* win_narrow(ray_t* r, int8_t t) {
     return out;
 }
 
+/* min / max of SYM, STR or GUID order as asc does (text, bytes): each row's
+ * rank in the column's ascending order, null where the value is.  The I64
+ * kernels then compare ranks; *perm keeps the order to name the row back. */
+static ray_t* win_ranks(ray_t* v, int64_t n, ray_t** perm) {
+    ray_t* p = ray_iasc_fn(v);
+    if (!p || RAY_IS_ERR(p)) return p ? p : ray_error("oom", NULL);
+    if (ray_is_lazy(p)) p = ray_lazy_materialize(p);
+    if (!p || RAY_IS_ERR(p) || p->type != RAY_I64 || p->len != n) {
+        if (p && !RAY_IS_ERR(p)) ray_release(p);
+        return p && RAY_IS_ERR(p) ? p : ray_error("type", "window: min / max order");
+    }
+    ray_t* r = ray_vec_new(RAY_I64, n);
+    if (!r || RAY_IS_ERR(r)) { ray_release(p); return r ? r : ray_error("oom", NULL); }
+    r->len = n;
+    int64_t* rd = (int64_t*)ray_data(r);
+    const int64_t* pd = (const int64_t*)ray_data(p);
+    for (int64_t k = 0; k < n; k++) rd[pd[k]] = k;
+    if (ray_vec_may_have_nulls(v)) {
+        bool any = false;
+        for (int64_t i = 0; i < n; i++)
+            if (ray_vec_is_null(v, i)) { rd[i] = NULL_I64; any = true; }
+        if (any) r->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    *perm = p;
+    return r;
+}
+
+/* SYM: the same ranks without sorting the column.  The distinct cells are
+ * sorted by text and each row reads its cell's rank; *ids keeps the runtime
+ * id of each rank, so the kernels' result maps straight to symbols. */
+typedef struct { int64_t id; const char* p; size_t l; } win_sym_ent_t;
+static int win_sym_ent_cmp(const void* a, const void* b) {
+    const win_sym_ent_t* x = a; const win_sym_ent_t* y = b;
+    size_t m = x->l < y->l ? x->l : y->l;
+    int c = memcmp(x->p, y->p, m);
+    return c ? c : (x->l < y->l ? -1 : x->l > y->l);
+}
+static ray_t* win_sym_ranks(ray_t* v, int64_t n, ray_t** ids) {
+    const void* data = ray_data(v);
+    int64_t maxc = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t c = ray_read_sym(data, i, v->type, v->attrs);
+        if (c > maxc) maxc = c;
+    }
+    ray_t* lut_hdr = NULL;
+    int64_t* lut = (int64_t*)scratch_alloc(&lut_hdr, (size_t)(maxc + 1) * sizeof(int64_t));
+    if (!lut) return ray_error("oom", NULL);
+    for (int64_t c = 0; c <= maxc; c++) lut[c] = -1;
+    int64_t nd = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t c = ray_read_sym(data, i, v->type, v->attrs);
+        if (c != 0 && lut[c] < 0) { lut[c] = 0; nd++; }
+    }
+    ray_t* ent_hdr = NULL;
+    win_sym_ent_t* ent = (win_sym_ent_t*)scratch_alloc(&ent_hdr, (size_t)(nd ? nd : 1) * sizeof(win_sym_ent_t));
+    ray_t* idv = ray_vec_new(RAY_I64, nd ? nd : 1);
+    ray_t* r = ray_vec_new(RAY_I64, n);
+    if (!ent || !idv || RAY_IS_ERR(idv) || !r || RAY_IS_ERR(r)) {
+        if (idv && !RAY_IS_ERR(idv)) ray_release(idv);
+        if (r && !RAY_IS_ERR(r)) ray_release(r);
+        if (ent) scratch_free(ent_hdr);
+        scratch_free(lut_hdr);
+        return ray_error("oom", NULL);
+    }
+    int64_t k = 0;
+    for (int64_t c = 1; c <= maxc; c++) {
+        if (lut[c] < 0) continue;
+        int64_t rid = sym_id_runtime(v, c);
+        ray_t* str = ray_sym_str(rid);
+        ent[k].id = c;
+        ent[k].p = str ? ray_str_ptr(str) : "";
+        ent[k].l = str ? ray_str_len(str) : 0;
+        k++;
+    }
+    qsort(ent, (size_t)nd, sizeof(win_sym_ent_t), win_sym_ent_cmp);
+    int64_t* idd = (int64_t*)ray_data(idv);
+    idv->len = nd;
+    for (int64_t q = 0; q < nd; q++) { lut[ent[q].id] = q; idd[q] = sym_id_runtime(v, ent[q].id); }
+    r->len = n;
+    int64_t* rd = (int64_t*)ray_data(r);
+    bool any = false;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t c = ray_read_sym(data, i, v->type, v->attrs);
+        if (c == 0) { rd[i] = NULL_I64; any = true; }
+        else rd[i] = lut[c];
+    }
+    if (any) r->attrs |= RAY_ATTR_HAS_NULLS;
+    scratch_free(ent_hdr);
+    scratch_free(lut_hdr);
+    *ids = idv;
+    return r;
+}
+
+/* The kernels' result over ranks, turned into the rows they name (in place). */
+static void win_rank_rows(ray_t* r, ray_t* perm) {
+    int64_t* d = (int64_t*)ray_data(r);
+    const int64_t* pd = (const int64_t*)ray_data(perm);
+    for (int64_t i = 0; i < r->len; i++)
+        if (d[i] != NULL_I64) d[i] = pd[d[i]];
+}
+
 static void win_drop_by_row(ray_t** by_row, uint8_t* owned, uint32_t n) {
     if (!by_row) return;
-    for (uint32_t f = 0; f < n; f++)
+    ray_t** by_perm = by_row + (n ? n : 1);
+    for (uint32_t f = 0; f < n; f++) {
         if (by_row[f] && owned[f] && !RAY_IS_ERR(by_row[f])) ray_release(by_row[f]);
+        if (by_perm[f] && !RAY_IS_ERR(by_perm[f])) ray_release(by_perm[f]);
+    }
     free(by_row);
 }
 
@@ -1012,7 +1116,7 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * value is, and the cells are gathered from the value column once every
      * partition is done (win_gather_rows).  by_row[f] keeps that column and
      * whether this call owns it. */
-    ray_t** by_row = (ray_t**)calloc(n_funcs ? n_funcs : 1, sizeof(ray_t*) + 1);
+    ray_t** by_row = (ray_t**)calloc(n_funcs ? n_funcs : 1, 2 * sizeof(ray_t*) + 2);
     if (!by_row) {
         for (uint32_t j = 0; j < n_funcs; j++)
             if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
@@ -1023,12 +1127,59 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         scratch_free(frame_hdr);
         return ray_error("oom", NULL);
     }
-    uint8_t* by_row_owned = (uint8_t*)(by_row + (n_funcs ? n_funcs : 1));
+    /* by_perm[f]: for min / max of SYM, STR or GUID, the column's ascending
+     * order (iasc): the kernels compare the cells' ranks in it, and the
+     * winning rank names its row (#1447). */
+    ray_t** by_perm = by_row + (n_funcs ? n_funcs : 1);
+    uint8_t* by_row_owned = (uint8_t*)(by_perm + (n_funcs ? n_funcs : 1));
+    uint8_t* sym_ranked = by_row_owned + (n_funcs ? n_funcs : 1);   /* SYM min / max: by_perm holds rank -> runtime id */
     for (uint32_t f = 0; f < n_funcs; f++) {
         uint8_t kind = ext->window.func_kinds[f];
         ray_t* fv = func_vecs[f];
-        if ((kind != RAY_WIN_FIRST_VALUE && kind != RAY_WIN_LAST_VALUE) || !fv ||
-            fv->type == RAY_I64 || fv->type == RAY_F64 || win_narrow_type(fv->type)) continue;
+        bool edge = kind == RAY_WIN_FIRST_VALUE || kind == RAY_WIN_LAST_VALUE;
+        bool ext_m = kind == RAY_WIN_MIN || kind == RAY_WIN_MAX;
+        if (ext_m && fv && fv->type == RAY_LIST) {
+            win_drop_by_row(by_row, by_row_owned, n_funcs);
+            for (uint32_t j = 0; j < n_funcs; j++)
+                if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
+                    ray_release(func_vecs[j]);
+            for (uint32_t j = 0; j < n_sort; j++)
+                if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
+                    ray_release(sort_vecs[j]);
+            scratch_free(frame_hdr);
+            return ray_error("type", "window: min and max need a typed column, got LIST");
+        }
+        if (ext_m && fv && (fv->type == RAY_SYM || fv->type == RAY_STR || fv->type == RAY_GUID)) {
+            ray_t* perm = NULL;
+            bool sym = fv->type == RAY_SYM;
+            ray_t* ranks = sym ? win_sym_ranks(fv, nrows, &perm) : win_ranks(fv, nrows, &perm);
+            if (!ranks || RAY_IS_ERR(ranks)) {
+                win_drop_by_row(by_row, by_row_owned, n_funcs);
+                for (uint32_t j = 0; j < n_funcs; j++)
+                    if (func_owned[j] && func_vecs[j] && !RAY_IS_ERR(func_vecs[j]))
+                        ray_release(func_vecs[j]);
+                for (uint32_t j = 0; j < n_sort; j++)
+                    if (sort_owned[j] && sort_vecs[j] && !RAY_IS_ERR(sort_vecs[j]))
+                        ray_release(sort_vecs[j]);
+                scratch_free(frame_hdr);
+                return ranks ? ranks : ray_error("oom", NULL);
+            }
+            /* SYM maps ranks to runtime ids and narrows; the original column
+             * is not needed after, but is kept in by_row only for the gather
+             * types (STR, GUID). */
+            if (sym) {
+                if (func_owned[f]) ray_release(fv);
+            } else {
+                by_row[f] = fv;
+                by_row_owned[f] = func_owned[f];
+            }
+            by_perm[f] = perm;
+            func_vecs[f] = ranks;
+            func_owned[f] = 1;
+            sym_ranked[f] = sym;
+            continue;
+        }
+        if (!edge || !fv || fv->type == RAY_I64 || fv->type == RAY_F64 || win_narrow_type(fv->type)) continue;
         ray_t* rows = win_row_numbers(fv, nrows);
         if (!rows || RAY_IS_ERR(rows)) {
             win_drop_by_row(by_row, by_row_owned, n_funcs);
@@ -1598,9 +1749,32 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
 
     for (uint32_t f = 0; f < n_funcs; f++) {
         uint8_t kind = ext->window.func_kinds[f];
+        if (sym_ranked[f]) {
+            int64_t* d = (int64_t*)ray_data(result_vecs[f]);
+            const int64_t* ids = (const int64_t*)ray_data(by_perm[f]);
+            for (int64_t i = 0; i < result_vecs[f]->len; i++)
+                if (d[i] != NULL_I64) d[i] = ids[d[i]];
+            ray_t* syms = win_narrow(result_vecs[f], RAY_SYM);
+            if (!syms || RAY_IS_ERR(syms)) {
+                if (syms) ray_error_free(syms);
+                for (uint32_t j = 0; j < n_funcs; j++) {
+                    ray_release(result_vecs[j]);
+                    result_vecs[j] = NULL;
+                }
+                scratch_free(poff_hdr);
+                scratch_free(indices_hdr);
+                goto oom;
+            }
+            ray_release(result_vecs[f]);
+            result_vecs[f] = syms;
+            continue;
+        }
         ray_t* fv = by_row[f] ? by_row[f] : func_vecs[f];
-        if ((kind != RAY_WIN_FIRST_VALUE && kind != RAY_WIN_LAST_VALUE) || !fv ||
-            fv->type == RAY_I64 || fv->type == RAY_F64) continue;
+        bool keeps = kind == RAY_WIN_FIRST_VALUE || kind == RAY_WIN_LAST_VALUE ||
+                     kind == RAY_WIN_MIN || kind == RAY_WIN_MAX;
+        if (!keeps || !fv || fv->type == RAY_I64 || fv->type == RAY_F64) continue;
+        if (!by_row[f] && !win_narrow_type(fv->type)) continue;
+        if (by_perm[f]) win_rank_rows(result_vecs[f], by_perm[f]);
         ray_t* cells = by_row[f] ? win_gather_rows(by_row[f], result_vecs[f])
                                  : win_narrow(result_vecs[f], fv->type);
         if (!cells || RAY_IS_ERR(cells)) {
