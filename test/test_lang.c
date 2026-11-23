@@ -278,7 +278,7 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         { NS_Q("(select {from: _odd s: (sum (* k 2))})", "6"), SCAN | PRE },
         /* Each product fits I64, but their total needs AVG's wide accumulator. */
         { NS_Q("(select {from: (table [v] (list [3000000000000000000 3000000000000000000]))"
-               " s: (avg (* v 2))})", "6.0e18"), SCAN },
+               " s: (avg (* v 2))})", "6.0e18"), SCAN | PRE },
         /* nothing can wrap: proved by the pass, a lone SUM / AVG takes its total */
         { NS_Q("(select {s: (sum (+ h k)) from: _nT})",   "(sum (+ h k))"),   SCAN | PRE },
         { NS_Q("(select {s: (sum (* h 3h)) from: _nT})",  "(sum (* h 3h))"),  SCAN | PRE },

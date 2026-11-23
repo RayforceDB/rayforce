@@ -1,0 +1,16 @@
+;; MAX + 1 generates an I64 null. Materialize the row expression before
+;; aggregation so the reference cannot use an affine sum rewrite.
+(set k [0 1 2 3 0 1 2 3])
+(set b [9223372036854775807 3 2 1 12 4 2 1])
+(set T (table [k b] (list k b)))
+(set R (table [k v] (list k (+ b 1))))
+(select {from: T by: (% k 2) s: (sum (+ b 1)) asc: k}) -- (select {from: R by: (% k 2) s: (sum v) asc: k})
+;; Four distinct totals: counting the null changes the top three keys.
+(select {from: T by: k s: (sum (+ b 1)) desc: s take: 3}) -- (select {from: R by: k s: (sum v) desc: s take: 3})
+
+;; Above the parallel proof threshold, with one hit in the short final
+;; slice outside all four sample blocks. The samples alone are not proof.
+(set b (concat (til 99998) [9223372036854775807]))
+(set T (table [b] (list b)))
+(set rows (+ b 1))
+(at (at (select {from: T s: (sum (+ b 1))}) 's) 0) -- (sum rows)

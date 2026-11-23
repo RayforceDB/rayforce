@@ -525,6 +525,57 @@ static ray_t* take_count_arg(ray_t* e, ray_t* x) {
     return NULL;
 }
 
+/* One partial per task, not per worker: tasks may be stolen. */
+typedef struct { uint64_t sum; int64_t lo, hi; } affine_part_t;
+typedef struct {
+    const int64_t* data;
+    int64_t len, grain;
+    affine_part_t* parts;
+} affine_scan_t;
+
+static void affine_part_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
+    affine_scan_t* s = ctx;
+    int64_t off = start * s->grain, n = s->len - off;
+    if (n > s->grain) n = s->grain;
+    const int64_t* data = s->data + off;
+    affine_part_t p = { 0, INT64_MAX, INT64_MIN };
+    for (int64_t i = 0; i < n; i++) {
+        int64_t x = data[i];
+        p.sum += (uint64_t)x;
+        if (x < p.lo) p.lo = x;
+        if (x > p.hi) p.hi = x;
+    }
+    s->parts[start] = p;
+}
+
+static bool affine_i64_scan(affine_sum_cache_entry_t* ce) {
+    affine_part_t parts[64];
+    affine_scan_t s = { ce->data, ce->len, ce->len, parts };
+    ray_pool_t* pool = ce->len >= RAY_PARALLEL_THRESHOLD ? ray_pool_get() : NULL;
+    uint32_t nt = 1;
+    if (ray_pool_par_dispatch_ok(pool, ce->len, RAY_PARALLEL_THRESHOLD)) {
+        nt = ray_pool_total_workers(pool);
+        if (nt > sizeof(parts)/sizeof(parts[0])) nt = sizeof(parts)/sizeof(parts[0]);
+        s.grain = 1 + (ce->len - 1) / nt;
+        nt = (uint32_t)(1 + (ce->len - 1) / s.grain);
+        ray_pool_dispatch_n(pool, affine_part_fn, &s, nt);
+        if (ray_interrupted() || atomic_load_explicit(&pool->cancelled, memory_order_acquire))
+            return false;
+    } else {
+        affine_part_fn(&s, 0, 0, 1);
+    }
+    affine_part_t total = parts[0];
+    for (uint32_t i = 1; i < nt; i++) {
+        total.sum += parts[i].sum;
+        if (parts[i].lo < total.lo) total.lo = parts[i].lo;
+        if (parts[i].hi > total.hi) total.hi = parts[i].hi;
+    }
+    ce->sum_i = (int64_t)total.sum;
+    ce->lo = total.lo;
+    ce->hi = total.hi;
+    return true;
+}
+
 static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
     *handled = 0;
     if (!expr || expr->type != RAY_LIST || ray_len(expr) != 3)
@@ -595,23 +646,19 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
         ce.len = vec->len;
         ce.type = vec->type;
         ce.attrs = vec->attrs;
-        bool need_bounds = vec->type >= RAY_BOOL && vec->type <= RAY_I64 &&
-                           !ray_idx_int_bounds(vec, &ce.lo, &ce.hi);
-        if (vec->type == RAY_I64 && need_bounds) {
-            /* No nulls or index extrema: sum the slice and find its bounds
-             * in one pass. Unsigned addition gives the modular I64 sum. */
-            const int64_t* data = ce.data;
-            uint64_t total = 0;
-            int64_t lo = INT64_MAX, hi = INT64_MIN;
-            for (int64_t i = 0; i < vec->len; i++) {
-                int64_t x = data[i];
-                total += (uint64_t)x;
-                if (x < lo) lo = x;
-                if (x > hi) hi = x;
+        /* Literal-independent conservative bounds: only scan actual rows
+         * for a generated null if its preimage fits the input type. */
+        switch (vec->type) {
+        case RAY_BOOL:
+        case RAY_U8:  ce.lo = 0;         ce.hi = UINT8_MAX; break;
+        case RAY_I16: ce.lo = INT16_MIN; ce.hi = INT16_MAX; break;
+        case RAY_I32: ce.lo = INT32_MIN; ce.hi = INT32_MAX; break;
+        }
+        if (vec->type == RAY_I64 && !ray_idx_int_bounds(vec, &ce.lo, &ce.hi)) {
+            if (!affine_i64_scan(&ce)) {
+                ray_release(vec);
+                return ray_error("cancel", "interrupted");
             }
-            ce.sum_i = (int64_t)total;
-            ce.lo = lo;
-            ce.hi = hi;
         } else {
             ray_t* sum = ray_sum_fn(vec);
             if (!sum || RAY_IS_ERR(sum)) {
@@ -627,15 +674,6 @@ static ray_t* try_sum_affine_expr(ray_t* expr, int* handled) {
             if (ce.is_f64) ce.sum_f = as_f64(sum);
             else           ce.sum_i = numeric_atom_i64(sum);
             ray_release(sum);
-            if (need_bounds) {
-                ce.lo = INT64_MAX;
-                ce.hi = INT64_MIN;
-                for (int64_t i = 0; i < vec->len; i++) {
-                    int64_t x = ray_vec_get_i64(vec, i);
-                    if (x < ce.lo) ce.lo = x;
-                    if (x > ce.hi) ce.hi = x;
-                }
-            }
         }
         affine_sum_cache_store(vec, &ce);
     }

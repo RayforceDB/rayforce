@@ -509,6 +509,7 @@ static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
             switch (col->type) {
             case RAY_U8:  *out = (np_iv_t){ ((const uint8_t*)d)[0], ((const uint8_t*)d)[col->len - 1] }; return true;
             case RAY_I16: *out = (np_iv_t){ ((const int16_t*)d)[0], ((const int16_t*)d)[col->len - 1] }; return true;
+            case RAY_I64: *out = (np_iv_t){ ((const int64_t*)d)[0], ((const int64_t*)d)[col->len - 1] }; return true;
             case RAY_I32: *out = (np_iv_t){ ((const int32_t*)d)[0], ((const int32_t*)d)[col->len - 1] }; return true;
             default: break;
             }
@@ -537,7 +538,10 @@ typedef struct {
     np_iv_t           glob[AGG_LINEAR_MAX_TERMS];   /* the bounds of a term not scanned */
     const void*       data[AGG_LINEAR_MAX_TERMS];   /* a scanned term's rows (NULL: not scanned) */
     bool              nulls[AGG_LINEAR_MAX_TERMS];  /* skip the type's null sentinel */
-    int64_t           total_rows;                   /* check an I64 root total when nonzero */
+    const linear_expr_i64_t* wide;   /* AVG: recover an exact total for each proved slice */
+    int64_t coeff[AGG_LINEAR_MAX_TERMS];
+    _Atomic(uint64_t) low, high;
+    bool collect;
     _Atomic(bool)     wide_total;                   /* a slice exceeded the per-row budget */
     bool              wrap;                         /* sum a slice that fails row by row */
     _Atomic(bool)     fail;
@@ -668,13 +672,24 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
         atomic_store_explicit(&x->fail, true, memory_order_relaxed);
         return;
     }
-    /* The AVG kernel needs the exact signed total, not merely its low word.
-     * Budget against the full row count, independently of dispatch slices. */
-    if (x->total_rows && (root.lo < INT64_MIN / x->total_rows ||
-                          root.hi > INT64_MAX / x->total_rows))
-        atomic_store_explicit(&x->wide_total, true, memory_order_relaxed);
+    if (x->wide) {
+        /* Lift the modular slice total relative to its proven lower bound.
+         * If the interval spans a full modulus there is no unique lift:
+         * leave the total to the ordinary wide AVG kernel. */
+        if ((root.hi - root.lo) * n > UINT64_MAX) {
+            atomic_store_explicit(&x->wide_total, true, memory_order_relaxed);
+        } else {
+            uint64_t lo = (uint64_t)x->wide->bias_i64 * n;
+            for (uint8_t t = 0; t < x->prog->n_terms; t++)
+                lo += (uint64_t)sums[t] * x->coeff[t];
+            __int128 lower = root.lo * n;
+            __int128 exact = lower + (uint64_t)(lo - (uint64_t)lower);
+            uint64_t old = atomic_fetch_add_explicit(&x->low, lo, memory_order_relaxed);
+            atomic_fetch_add_explicit(&x->high, (uint64_t)(exact >> 64) + (old > UINT64_MAX - lo), memory_order_relaxed);
+        }
+    }
     for (uint8_t t = 0; t < x->prog->n_terms; t++)
-        if (x->data[t])
+        if (x->collect && !x->wide && x->data[t])
             atomic_fetch_add_explicit(&x->sum[t], (uint64_t)sums[t], memory_order_relaxed);
     atomic_fetch_add_explicit(&x->pass_rows, n, memory_order_relaxed);
     atomic_fetch_add_explicit(&x->rows, n, memory_order_relaxed);
@@ -684,6 +699,8 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
 /* The pass's totals (np_prove): sums[t] keyed by p->syms over pass_rows
  * proved rows, wsum the per-row total of the rest. */
 typedef struct {
+    int64_t hi, low;
+    bool lifted;
     bool    summed;       /* every term was read: the totals below hold */
     bool    partial;      /* some rows were summed per row: only the total holds */
     int64_t sums[AGG_LINEAR_MAX_TERMS];
@@ -701,7 +718,7 @@ typedef enum { NP_NO, NP_PROVED, NP_NEED_SCAN } np_res_t;
  * is summed per row instead of failing the pass (the caller then takes the
  * total and nothing else).  A failed bind: NP_NO with *err. */
 static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nrows, bool scan,
-                         np_prog_t* p, np_total_t* tot, ray_t** err) {
+                         np_prog_t* p, np_total_t* tot, const linear_expr_i64_t* wide, ray_t** err) {
     bool want_partial = tot && tot->partial;
     if (tot) memset(tot, 0, sizeof(*tot));
     memset(p, 0, sizeof(*p));
@@ -766,7 +783,13 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
     }
     /* the root narrow and every row's value in its width: below 2^32 rows
      * the total cannot leave int64 */
-    if (tot && all && op_base_type(root) == RAY_I64) x.total_rows = nrows;
+    x.collect = tot && all;
+    if (wide && x.collect && op_base_type(root) == RAY_I64) {
+        x.wide = wide;
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            for (uint8_t k = 0; k < wide->n_terms; k++)
+                if (wide->syms[k] == p->syms[t]) x.coeff[t] = wide->coeff_i64[k];
+    }
     x.wrap = want_partial && all && op_narrow_int(root) && p->max_depth <= NP_MAX_DEPTH &&
              nrows <= ((int64_t)1 << 32);
     /* slices of 64K rows: the per-slice proof and its atomics stay off the
@@ -787,6 +810,9 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
             tot->sums[t] = (int64_t)atomic_load_explicit(&x.sum[t], memory_order_relaxed);
         tot->pass_rows = atomic_load_explicit(&x.pass_rows, memory_order_relaxed);
         tot->wsum = (int64_t)atomic_load_explicit(&x.wsum, memory_order_relaxed);
+        tot->lifted = x.wide != NULL;
+        tot->hi = atomic_load_explicit(&x.high, memory_order_relaxed);
+        tot->low = atomic_load_explicit(&x.low, memory_order_relaxed);
         tot->summed = true;
         tot->partial = partial;
     }
@@ -875,7 +901,7 @@ static bool linear_reads_nullable(ray_graph_t* g, ray_t* tbl, ray_op_t* op, int 
 
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.
  * Example: (v1 + 1) * 2, v1 + v2 + 1 */
-bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone,
+bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op, bool lone, bool avg,
                                         agg_linear_t* out_plan, ray_t** err) {
     *err = NULL;
     if (!g || !tbl || !input_op || !out_plan) return false;
@@ -911,7 +937,7 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     int64_t nrows = ray_table_nrows(tbl);
     np_prog_t np;
     np_total_t tot = { .partial = lone };
-    if (np_prove(g, tbl, input_op, nrows, true, &np, &tot, err) != NP_PROVED) return false;
+    if (np_prove(g, tbl, input_op, nrows, true, &np, lone ? &tot : NULL, avg ? &lin : NULL, err) != NP_PROVED) return false;
     for (uint8_t i = 0; i < lin.n_terms; i++) {
         ray_t* col = NULL;
         *err = ray_col_src_plain(srcs[i], &col);   /* ready-only */
@@ -933,6 +959,8 @@ bool try_linear_sumavg_input_i64(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
             if (k == np.n_terms) { ok = false; break; }
             s = wrap_add_i64(s, wrap_mul_i64(lin.coeff_i64[i], tot.sums[k]));
         }
+        if (tot.lifted) s = tot.low;
+        out_plan->pre_hi = tot.lifted ? tot.hi : s >> 63;
         if (ok) { out_plan->pre = true; out_plan->pre_sum = s; out_plan->pre_only = tot.partial; }
     }
     if (tot.partial && !out_plan->pre_only) return false;   /* the rows' plan does not hold */
@@ -1081,7 +1109,7 @@ bool try_affine_sumavg_input(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
     {
         np_prog_t np;
         bool defer = defer_scan && !base_src->may_null && ray_col_src_base(base_src);
-        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, err);
+        np_res_t pr = np_prove(g, tbl, input_op, base_src->len, !defer, &np, NULL, NULL, err);
         if (pr != NP_PROVED) return false;
     }
 

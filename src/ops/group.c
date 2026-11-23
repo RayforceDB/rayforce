@@ -10423,7 +10423,7 @@ static void scalar_sum_linear_pre_fn(void* ctx, uint32_t worker_id, int64_t star
     da_accum_t* acc = c->acc;
     if (start == 0) {
         int64_t s = c->agg_linear[0].pre_sum;
-        if (acc->sum_hi) ray_i128_add(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, s);
+        if (acc->sum_hi) ray_i128_add128(&acc->sum_hi[0], (uint64_t*)&acc->sum[0].i, c->agg_linear[0].pre_hi, (uint64_t)s);
         else acc->sum[0].i = wrap_add_i64(acc->sum[0].i, s);
     }
     acc->count[0] += end - start;
@@ -16391,7 +16391,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
          * without materializing the expression vector. */
         if (n_keys == 0 && nrows > 0 &&
             (agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_linear_sumavg_input_i64(g, tbl, agg_input_op, sc_lone, &agg_linear[a], &rerr)) {
+            try_linear_sumavg_input_i64(g, tbl, agg_input_op, sc_lone, agg_kind == OP_AVG, &agg_linear[a], &rerr)) {
             continue;
         }
         if (rerr) goto resolve_fail;
