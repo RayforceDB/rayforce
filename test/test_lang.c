@@ -3105,6 +3105,27 @@ static test_result_t test_eval_select_global_scalar(void) {
     PASS();
 }
 
+/* pivot's first / last of a value column that may hold a null run as one
+ * OP_PIVOT over row numbers (#1420), not per cell on the generic route: the
+ * same answers, ~40x faster at 200k rows.  Pinned by the route's counter. */
+static test_result_t test_eval_pivot_edge_by_row(void) {
+    static const char* const q[] = {
+        "(pivot t 'k 'p 'v first)", "(pivot t 'k 'p 'v last)", "(pivot t 'k 'p 's first)", "(pivot t 'k 'p 'f last)", NULL };
+    ray_t* setup = ray_eval_str("(set t (table [k p v s f] (list (% (til 200000) 100) (at [x y] (% (til 200000) 2)) "
+                                "(concat [0Nl] (til 199999)) (at (as 'SYM [\"a\" \"\"]) (% (til 200000) 3)) "
+                                "(concat (as 'F64 (til 199999)) [0Nf]))))");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    for (int i = 0; q[i]; i++) {
+        int64_t before = ray_pivot_test_by_row();
+        ray_t* r = ray_eval_str(q[i]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE);
+        TEST_ASSERT_FMT(ray_pivot_test_by_row() == before + 1, "%s did not run over row numbers", q[i]);
+        ray_release(r);
+    }
+    PASS();
+}
+
 /* Multi-index pivot with mixed-type composite key: (sym, i64) index,
  * sym pivot col, i64 value col.  Regression against an older bug where
  * composite-key grouping dropped or duplicated rows.  Verify each
@@ -13846,6 +13867,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where_in_sym_vs_atom_mismatch", test_eval_select_where_in_sym_vs_atom_mismatch, lang_setup, lang_teardown },
     { "lang/eval/select_where_eq_null_literal", test_eval_select_where_eq_null_literal, lang_setup, lang_teardown },
     { "lang/eval/pivot_multi_index", test_eval_pivot_multi_index, lang_setup, lang_teardown },
+    { "lang/eval/pivot_edge_by_row", test_eval_pivot_edge_by_row, lang_setup, lang_teardown },
     { "lang/eval/select_named_lambda", test_eval_select_named_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_recursive_self_lambda", test_eval_select_recursive_self_lambda, lang_setup, lang_teardown },
     { "lang/eval/select_global_scalar", test_eval_select_global_scalar, lang_setup, lang_teardown },

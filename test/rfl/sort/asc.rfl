@@ -24,11 +24,11 @@ N -- (sum (<= (at S (til N)) (at S (+ 1 (til N)))))
 (asc (asc V)) -- (asc V)
 
 ;; OP_ASC vector-input guard: a lazy chain whose previous op is an
-;; aggregator (FIRST) yields a scalar when materialised; the
+;; aggregator (SUM, MAX) yields a scalar when materialised; the
 ;; subsequent OP_ASC executor must reject the non-vec input rather
 ;; than dispatching to asc_vec_eager.  Covers exec.c L1061.
-(asc (first [1 2 3 4])) !- type
-(asc (last [1 2 3 4])) !- type
+(asc (sum [1 2 3 4])) !- type
+(asc (max [1 2 3 4])) !- type
 
 ;; ──────────────────────────────────────────────────────────────────
 ;; Float / negatives / mixed
