@@ -1981,57 +1981,145 @@ bool ray_query_rowwise_builtin(int64_t id) {
 /* Compile a Rayfall AST expression into a DAG node */
 static bool builtin_named(const ray_t* b, const char* const* names, size_t n);
 
-/* The set of `(in col set)` over a string column, when it is a list of
- * strings — a literal (list "a" "b"), or a name bound to such a list — as
- * the string vector it spells, so the membership compiles and probes one
- * hash set instead of declining to the per-row evaluator.  Elements that are
- * not strings are dropped: no string row equals them.  NULL when `set` is
- * not such a list: a call, an element computed at run time, `list` rebound,
- * or a name that is a column, a formal or something other than a list. */
-static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
-    if (!set) return NULL;
+/* The atoms of the set of `(in col set)` when it is a list of literal
+ * atoms — a literal (list "a" "b"), or a name bound to such a list — in
+ * *e_out[*from_out .. *n_out).  False when `set` is not such a list: a call,
+ * an element computed at run time, `list` rebound, or a name that is a
+ * column, a formal or something other than a list. */
+/* The value a set spelled as a bare name is bound to — a local, or a
+ * global no column shadows — borrowed; NULL when `set` is not a name, or
+ * names a formal, an alias or a column. */
+static ray_t* in_set_bound_value(ray_graph_t* g, ray_t* set) {
+    if (!set || set->type != -RAY_SYM || (set->attrs & ATTR_QUOTED)) return NULL;
+    int64_t id = set->i64;
+    if (cexpr_env_lookup(g, id) || sel_alias_lookup(g, id)) return NULL;
+    ray_t* v = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(id)
+                                         : ray_env_get_lexical_local(id);
+    if (!v) {
+        if (g->table && g->table->type == RAY_TABLE && ray_table_has_col(g->table, id))
+            return NULL;
+        v = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(id) : ray_env_get(id);
+    }
+    return v;
+}
+
+static bool in_list_set_atoms(ray_graph_t* g, ray_t* set, ray_t*** e_out,
+                               int64_t* from_out, int64_t* n_out) {
+    if (!set) return false;
     ray_t** e;
     int64_t from, n;
     if (set->type == -RAY_SYM && !(set->attrs & ATTR_QUOTED)) {
-        int64_t id = set->i64;
-        if (cexpr_env_lookup(g, id) || sel_alias_lookup(g, id)) return NULL;
-        ray_t* v = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(id)
-                                             : ray_env_get_lexical_local(id);
-        if (!v) {
-            if (g->table && g->table->type == RAY_TABLE && ray_table_has_col(g->table, id))
-                return NULL;
-            v = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(id) : ray_env_get(id);
-        }
-        if (!v || v->type != RAY_LIST) return NULL;
+        ray_t* v = in_set_bound_value(g, set);
+        if (!v || v->type != RAY_LIST) return false;
         e = (ray_t**)ray_data(v);
         from = 0;
         n = ray_len(v);
         for (int64_t i = 0; i < n; i++)
-            if (!e[i] || !ray_is_atom(e[i])) return NULL;
+            if (!e[i] || !ray_is_atom(e[i])) return false;
     } else {
-        if (set->type != RAY_LIST || ray_len(set) < 2) return NULL;
+        if (set->type != RAY_LIST || ray_len(set) < 2) return false;
         e = (ray_t**)ray_data(set);
         ray_t* head = e[0];
-        if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return NULL;
-        if (cexpr_env_lookup(g, head->i64)) return NULL;
+        if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return false;
+        if (cexpr_env_lookup(g, head->i64)) return false;
         ray_t* b = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(head->i64)
                                              : ray_env_get_lexical_local(head->i64);
         if (!b) b = ray_env_get(head->i64);
         static const char* const list_fn[] = { "list" };
-        if (!builtin_named(b, list_fn, 1)) return NULL;
+        if (!builtin_named(b, list_fn, 1)) return false;
         from = 1;
         n = ray_len(set);
         for (int64_t i = 1; i < n; i++) {
             ray_t* a = e[i];
-            if (!a || !ray_is_atom(a)) return NULL;
-            if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) return NULL;  /* a name */
+            if (!a || !ray_is_atom(a)) return false;
+            if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) return false;  /* a name */
         }
     }
+    *e_out = e;
+    *from_out = from;
+    *n_out = n;
+    return true;
+}
+
+/* The set of `(in col set)` over a string column, when in_list_set_atoms
+ * accepts it, as the string vector it spells, so the membership compiles
+ * and probes one hash set instead of declining to the per-row evaluator.
+ * Elements that are not strings are dropped: no string row equals them. */
+static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
+    ray_t** e;
+    int64_t from, n;
+    if (!in_list_set_atoms(g, set, &e, &from, &n)) return NULL;
     ray_t* v = ray_vec_new(RAY_STR, n - from);
     for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++)
         if (e[i]->type == -RAY_STR)
             v = ray_str_vec_append(v, ray_str_ptr(e[i]), ray_str_len(e[i]));
     return v ? v : ray_error("oom", NULL);
+}
+
+/* The set of `(in col set)` over a SYM operand when it holds strings — a
+ * string atom, a string vector ["a" "b"], or a list of atoms
+ * in_list_set_atoms accepts with at least one string, literal or through a
+ * bound name — as the string vector of its texts: a string as written, a
+ * quoted symbol by its name; an atom of another type matches no row and is
+ * dropped.  The membership kernel reads a string set against a SYM operand
+ * as the symbols it spells, each looked up in the operand's own domain
+ * (in_build_ctx_core), so a string reads as `==` reads it in a query, and
+ * nothing is interned: a string no symbol of the column spells matches no
+ * row.  "" (the null symbol's text) is left out and reported in *has_empty:
+ * the caller adds `(== col "")` so it selects what `==` selects.  NULL when
+ * `set` holds no string: the set compiles as before. */
+static ray_t* in_sym_set_const(ray_graph_t* g, ray_t* set, bool* has_empty) {
+    *has_empty = false;
+    if (!set || (set->attrs & ATTR_QUOTED)) return NULL;
+    /* a name bound to a string vector or a string atom: its value */
+    ray_t* bv = in_set_bound_value(g, set);
+    if (bv && (bv->type == RAY_STR || bv->type == -RAY_STR)) set = bv;
+    ray_t** e = NULL;
+    int64_t from = 0, n = 1;
+    if (set->type == RAY_STR) {
+        n = ray_len(set);
+    } else if (set->type != -RAY_STR) {
+        if (!in_list_set_atoms(g, set, &e, &from, &n)) return NULL;
+        bool any_str = false;
+        for (int64_t i = from; i < n; i++)
+            if (e[i]->type == -RAY_STR) { any_str = true; break; }
+        if (!any_str) return NULL;
+    }
+    ray_t* v = ray_vec_new(RAY_STR, n - from);
+    for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++) {
+        const char* p = NULL;
+        size_t len = 0;
+        if (set->type == RAY_STR) {
+            p = ray_str_vec_get(set, i, &len);
+        } else if (set->type == -RAY_STR) {
+            p = ray_str_ptr(set); len = ray_str_len(set);
+        } else if (e[i]->type == -RAY_STR) {
+            p = ray_str_ptr(e[i]); len = ray_str_len(e[i]);
+        } else if (e[i]->type == -RAY_SYM) {
+            ray_t* t = ray_sym_str(e[i]->i64);
+            if (t) { p = ray_str_ptr(t); len = ray_str_len(t); }
+        }
+        if (!p) continue;
+        if (len == 0) { *has_empty = true; continue; }
+        v = ray_str_vec_append(v, p, len);
+    }
+    return v ? v : ray_error("oom", NULL);
+}
+
+/* A GUID column against a set holding strings: `==` refuses a string
+ * against a GUID (type), and `in` over the same values refuses it too
+ * rather than answering no row. */
+static bool in_guid_set_has_str(ray_graph_t* g, ray_t* set) {
+    if (!set || (set->attrs & ATTR_QUOTED)) return false;
+    ray_t* bv = in_set_bound_value(g, set);
+    if (bv && (bv->type == RAY_STR || bv->type == -RAY_STR)) return true;
+    if (set->type == RAY_STR || set->type == -RAY_STR) return true;
+    ray_t** e;
+    int64_t from, n;
+    if (!in_list_set_atoms(g, set, &e, &from, &n)) return false;
+    for (int64_t i = from; i < n; i++)
+        if (e[i]->type == -RAY_STR) return true;
+    return false;
 }
 
 /* Is `set` a name that reaches a global value no const node can hold (a
@@ -2930,8 +3018,51 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                 if (!left) return NULL;
                 uint32_t left_id = left->id;
                 ray_op_t* right = NULL;
+                int8_t lt = left->out_type;
+                if (RAY_IS_PARTED(lt)) lt = (int8_t)RAY_PARTED_BASETYPE(lt);
                 if ((ctor == ray_in || ctor == ray_not_in) &&
-                    left->opcode != OP_CONST && left->out_type == RAY_STR) {
+                    left->opcode != OP_CONST && lt == RAY_GUID &&
+                    in_guid_set_has_str(g, elems[2])) {
+                    /* Inside an if / cond arm the pair is not raised here
+                     * (the arm may never be selected): the evaluator takes
+                     * the expression, as for a bad comparison pair. */
+                    if (g->if_arm_depth > 0) return NULL;
+                    graph_compile_failure(g, ray_error("type",
+                        "in: a guid column against a string, got guid and str"));
+                    return NULL;
+                }
+                if ((ctor == ray_in || ctor == ray_not_in) &&
+                    left->opcode != OP_CONST && lt == RAY_SYM) {
+                    bool has_empty = false;
+                    ray_t* sv = in_sym_set_const(g, elems[2], &has_empty);
+                    if (sv && RAY_IS_ERR(sv)) {
+                        graph_compile_failure(g, sv);
+                        return NULL;
+                    }
+                    if (sv) {
+                        right = ray_const_vec(g, sv);
+                        ray_release(sv);
+                        if (!right) return NULL;
+                        ray_op_t* m = ctor(g, &g->nodes[left_id], right);
+                        if (!m || !has_empty) return m;
+                        /* "" selects what (== col "") selects (the null
+                         * symbol's rows), which membership masks out */
+                        uint32_t m_id = m->id;
+                        ray_t* es = ray_str("", 0);
+                        if (!es || RAY_IS_ERR(es)) return NULL;
+                        ray_op_t* c = ray_const_atom(g, es);
+                        ray_release(es);
+                        if (!c) return NULL;
+                        bool in = ctor == ray_in;
+                        ray_op_t* q = in ? ray_eq(g, &g->nodes[left_id], c)
+                                         : ray_ne(g, &g->nodes[left_id], c);
+                        if (!q) return NULL;
+                        return in ? ray_or(g, &g->nodes[m_id], q)
+                                  : ray_and(g, &g->nodes[m_id], q);
+                    }
+                }
+                if ((ctor == ray_in || ctor == ray_not_in) &&
+                    left->opcode != OP_CONST && lt == RAY_STR) {
                     ray_t* sv = in_str_set_const(g, elems[2]);
                     if (sv && RAY_IS_ERR(sv)) {
                         graph_compile_failure(g, sv);

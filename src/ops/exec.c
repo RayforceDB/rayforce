@@ -27,6 +27,7 @@
 #include "ops/cdfuse.h"     /* ray_cd_bounded_all: count distinct of an encoded scan */
 #include "lang/internal.h"  /* sym_domain_rep (sym-domain Phase 2) */
 #include "lang/format.h"    /* ray_type_name (error context) */
+#include "lang/env.h"       /* ray_env_query_scope_above: in over strings */
 #include "ops/rowsel.h"
 #include "store/enccol.h"
 #include "store/enceval.h"
@@ -989,7 +990,12 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
 
-    if (ct == RAY_STR || st == RAY_STR) return IN_CTX_UNSUPPORTED;
+    /* A string set against a SYM column (or atom) reads as the symbols its
+     * strings spell, each looked up in the column's own domain below: what
+     * `==` does with a string in a query (#1493).  Nothing is interned, and
+     * a string the domain does not hold matches no row. */
+    bool sym_of_str = (ct == RAY_SYM && st == RAY_STR && !ray_is_atom(set));
+    if ((ct == RAY_STR || st == RAY_STR) && !sym_of_str) return IN_CTX_UNSUPPORTED;
     /* GUID cells are 16-byte blobs; the typed kernel's READ_I64/IN_READ_I64
      * loops have no guid case and read them at the wrong width (every cell
      * decodes to 0, so membership silently matched everything).  Bail so the
@@ -1003,7 +1009,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
          ((t) == RAY_F32 || (t) == RAY_F64) ? 1 : 0)
 
     int col_class = CLASSIFY(ct);
-    int set_class = CLASSIFY(st);
+    int set_class = sym_of_str ? 2 : CLASSIFY(st);
 
     /* A TIMESPAN meets a TIME or a TIMESTAMP as a duration (atom_eq's
      * span_eval: milliseconds as nanoseconds, a TIMESTAMP by its time of
@@ -1096,7 +1102,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
      * case) keep the raw copy: byte-identical fast path. */
     struct ray_sym_domain_s* in_col_dom = NULL;  /* non-NULL ⇒ translate */
     struct ray_sym_domain_s* in_set_dom = NULL;
-    if (col_class == 2 && set_class == 2 && set_len > 0) {
+    if (col_class == 2 && set_class == 2 && set_len > 0 && !sym_of_str) {
         ray_t* set_rep = ray_is_atom(set) ? NULL : sym_domain_rep(set);
         struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
         struct ray_sym_domain_s* sd =
@@ -1119,6 +1125,16 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 READ_F64(svf[sv_len], set, st, i);
                 sv_len++;
             }
+        }
+    } else if (sym_of_str) {
+        struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
+        for (int64_t i = 0; i < set_len; i++) {
+            size_t l = 0;
+            const char* p = ray_str_vec_get(set, i, &l);
+            if (!p || l == 0) continue;            /* "": the null symbol, masked */
+            int64_t xid = ray_sym_domain_find(cd, p, l);
+            if (xid < 0) continue;                 /* absent: matches nothing */
+            svi[sv_len++] = xid;
         }
     } else {
         if (set_len > 0 && ray_is_atom(set)) {
@@ -1279,6 +1295,13 @@ static in_ctx_status_t in_build_worker_ctx_meta(int8_t ct, uint8_t attrs, bool m
  * instead of a serial per-row hashset probe.  Returns NULL when the shape
  * is unsupported (STR etc.) — caller falls back. */
 ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
+    /* A string set reads as symbols against a SYM column inside a query
+     * only (in_build_ctx_core); the bare `in` compares a symbol with a
+     * string as different values and answers no match: its own path. */
+    if (set && !RAY_IS_ERR(set) && !ray_is_atom(set) && set->type == RAY_STR &&
+        col && (ray_is_atom(col) ? col->type == -RAY_SYM : col->type == RAY_SYM) &&
+        !ray_env_query_scope_above(0))
+        return NULL;
     int64_t col_len = ray_is_atom(col) ? 1 : col->len;
     if (col_len == 0) {
         ray_t* out = ray_vec_new(RAY_BOOL, 0);
