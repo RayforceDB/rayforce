@@ -14980,19 +14980,32 @@ static bool grp_xbar_key(ray_graph_t* g, ray_op_t* kn, uint32_t* x_id, int64_t* 
 }
 
 /* The key column of an xbar key grouped on its quotient: q * b in type t,
- * a null quotient a null.  An owned vector or error. */
+ * a null quotient a null.  An owned vector or error; NULL when a bucket
+ * q * b does not land strictly inside t's range.  Then x - (x mod b) is
+ * the type's null sentinel (b a power of two, x within b of the minimum)
+ * or wraps, and the written-out key groups such rows with the nulls or
+ * elsewhere: the caller groups the key as written instead.  It sees every
+ * group, since the quotient is used only for a full emit. */
 static ray_t* grp_xbar_emit(ray_t* q, int64_t b, int8_t t) {
     int64_t n = q->len;
+    uint8_t esz = ray_elem_size(t);
+    int64_t tmin = esz == 8 ? INT64_MIN : esz == 4 ? (int64_t)INT32_MIN : (int64_t)INT16_MIN;
+    int64_t tmax = esz == 8 ? INT64_MAX : esz == 4 ? (int64_t)INT32_MAX : (int64_t)INT16_MAX;
+    const void* qd = ray_data(q);
+    bool nulls = ray_vec_may_have_nulls(q);
+    for (int64_t i = 0; i < n; i++) {
+        if (nulls && ray_vec_is_null(q, i)) continue;
+        int64_t v;
+        if (__builtin_mul_overflow(agg_read_key_i64(q, qd, i), b, &v) || v <= tmin || v > tmax)
+            return NULL;
+    }
     ray_t* out = ray_vec_new(t, n > 0 ? n : 1);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
-    uint8_t esz = ray_elem_size(t);
-    const void* qd = ray_data(q);
     void* od = ray_data(out);
-    bool nulls = ray_vec_may_have_nulls(q);
     for (int64_t i = 0; i < n; i++) {
         if (nulls && ray_vec_is_null(q, i)) { ray_vec_set_null(out, i, true); continue; }
-        int64_t v = agg_read_key_i64(q, qd, i) * b;
+        int64_t v = agg_read_key_i64(q, qd, i) * b;   /* checked above */
         if (esz == 8) ((int64_t*)od)[i] = v;
         else if (esz == 4) ((int32_t*)od)[i] = (int32_t)v;
         else ((int16_t*)od)[i] = (int16_t)v;
@@ -15017,8 +15030,24 @@ static bool grp_has_computed_key(ray_graph_t* g, ray_op_t* op) {
  * site in exec_group_run.  Returns the v2 result (or an error), or NULL when
  * the shape is ineligible and the caller should continue on the legacy
  * path. */
+static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                      int64_t group_limit, bool xbar_q, bool* xbar_bad);
 static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                   int64_t group_limit) {
+    /* An xbar key groups on its quotient only for a full emit (no group
+     * limit, no top-N filter): grp_xbar_emit then sees every group and can
+     * send a key whose buckets leave the type back to be grouped as
+     * written. */
+    bool bad = false;
+    bool xq = group_limit == 0 && !ray_group_emit_filter_active().enabled;
+    ray_t* r = exec_group_v2_exprs_run(g, op, tbl, group_limit, xq, &bad);
+    if (bad) r = exec_group_v2_exprs_run(g, op, tbl, group_limit, false, &bad);
+    return r;
+}
+
+static ray_t* exec_group_v2_exprs_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                      int64_t group_limit, bool xbar_q, bool* xbar_bad) {
+    *xbar_bad = false;
     if (!tbl || tbl->type != RAY_TABLE) return NULL;
     ray_op_ext_t* ext = find_ext(g, op->id);
     /* Own gate: this v2-expression shadow path serves any key/agg count
@@ -15080,7 +15109,13 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             kt[k] = kn->opcode == OP_SCAN ? 0 : kn->out_type;
             fp |= kt[k] == RAY_F64 || kt[k] == RAY_F32;
         }
-        if (fp && agg_v2_parallel_wide(g, op, tbl, kt)) return NULL;
+        int8_t it[na];
+        for (uint32_t a = 0; a < na; a++) {
+            ray_op_t* in = op_node(g, ext->agg_ins[a]);
+            it[a] = !in || in->opcode == OP_SCAN ? 0 : in->out_type;
+            if (RAY_IS_PARTED(it[a])) it[a] = (int8_t)RAY_PARTED_BASETYPE(it[a]);
+        }
+        if (fp && agg_v2_parallel_wide(g, op, tbl, kt, it)) return NULL;
     }
     bool ok = true;
     for (uint32_t k = 0; k < nkk && ok; k++) {
@@ -15090,7 +15125,7 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         uint32_t x_id;
         int64_t xb;
         int8_t xt;
-        if (grp_xbar_key(g, kn, &x_id, &xb, &xt)) {
+        if (xbar_q && grp_xbar_key(g, kn, &x_id, &xb, &xt)) {
             /* the quotient: (div x b), x cast to its integer lane first
              * when temporal.  Any failure evaluates the key as written. */
             int8_t ktype = kn->out_type;
@@ -15203,6 +15238,9 @@ static ray_t* exec_group_v2_exprs(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         for (int64_t c = 0; c < nc && ci < 0; c++) if (ray_table_col_name(result, c) == ks) ci = c;
         ray_t* qc = ci >= 0 ? ray_table_col_idx(result, ci) : NULL;
         ray_t* kc = qc && !RAY_IS_ERR(qc) && agg_key_i64_type(qc->type) ? grp_xbar_emit(qc, kxb[k], kxt[k]) : NULL;
+        if (!kc && qc && !RAY_IS_ERR(qc) && agg_key_i64_type(qc->type)) {
+            ray_release(result); result = NULL; *xbar_bad = true; break;    /* group the key as written */
+        }
         if (!kc) { ray_release(result); result = ray_error("domain", "group: xbar key column not found"); break; }
         if (RAY_IS_ERR(kc)) { ray_release(result); result = kc; break; }
         ray_t* rebuilt = ray_table_new(nc);

@@ -108,6 +108,20 @@
 (at (xasc (select {s: (sum v) from: T by: (xbar d 7)}) 'd) 's)    -- (at (xasc (select {s: (sum v) from: T by: {kk: (xbar d 7)}}) 'kk) 's)
 (K0 (select {s: (sum v) from: T by: (xbar v 1000) take: 5}))      -- (take (FS Kx) 5)
 
+;; a bucket that would reach the type's minimum: x - (x mod b) lands on the
+;; null sentinel (b a power of two) or wraps (b = 3 at the I64 minimum); the
+;; quotient path declines and the key is grouped as written, as its by-dict
+;; spelling is
+(set XB (table [h i x v] (list (as 'I16 (concat [-32767 0N] (% (til 1998) 100))) (as 'I32 (concat [-2147483647 0N] (% (til 1998) 100))) (concat [-9223372036854775807 0Nl] (til 1998)) (til 2000))))
+(set XD (fn [q c] (list (count q) (at (xasc q c) c) (at (xasc q c) 'n))))
+(XD (select {n: (count v) from: XB by: (xbar h 2h)}) 'h)          -- (XD (select {n: (count v) from: XB by: {kk: (xbar h 2h)}}) 'kk)
+(take (at (xasc (select {n: (count v) from: XB by: (xbar h 2h)}) 'h) 'n) 2)  -- [2 40]
+(take (at (xasc (select {n: (count v) from: XB by: (xbar h 2h)}) 'h) 'h) 2)  -- (as 'I16 [0N 0])
+(XD (select {n: (count v) from: XB by: (xbar i 2i)}) 'i)          -- (XD (select {n: (count v) from: XB by: {kk: (xbar i 2i)}}) 'kk)
+(XD (select {n: (count v) from: XB by: (xbar x 2)}) 'x)           -- (XD (select {n: (count v) from: XB by: {kk: (xbar x 2)}}) 'kk)
+(XD (select {n: (count v) from: XB by: (xbar x 4611686018427387904)}) 'x)  -- (XD (select {n: (count v) from: XB by: {kk: (xbar x 4611686018427387904)}}) 'kk)
+(count (select {n: (count v) from: XB by: (xbar x 3)}))           -- (count (select {n: (count v) from: XB by: {kk: (xbar x 3)}}))
+
 ;; ── a column named like the bridge's hidden ones ───────────────────────────
 (set H (table [k v _k0 _e0 __k0] (list [2 1 0 2 1 0 2 1] [10 4 3 5 6 7 8 9] [9 9 9 9 1 1 1 1] [9 9 9 9 1 1 1 1] [7 7 7 7 7 7 7 7])))
 (K0 (select {s: (sum v) from: H by: (% v 3) take: 2}))            -- [1 0]
