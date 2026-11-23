@@ -1,0 +1,65 @@
+;; @also-unfused
+;; window's first / last keep the value's type (#1443): a SYM column gave raw
+;; ids, STR and GUID 0, and the narrow and temporal types came back I64 or F64.
+;; The cell is the frame's first (last) row, a null included.  The oracle is
+;; the same window over the null-free row numbers i, read back from v by `at`.
+
+(set n 7)
+(set K [a a a b b c c])
+(set I (til n))
+(set G (as 'GUID (list "00000001-1111-1111-1111-111111111111" "00000002-1111-1111-1111-111111111111" "00000003-1111-1111-1111-111111111111" "00000004-1111-1111-1111-111111111111" "00000005-1111-1111-1111-111111111111" "00000006-1111-1111-1111-111111111111" "00000007-1111-1111-1111-111111111111")))
+(set VS (list [0Nl 1 2 3 4 5 0Nl] [0Nf 1.0 2.0 3.0 4.0 5.0 0Nf] (as 'F32 [0Nf 1.0 2.0 3.0 4.0 5.0 0Nf]) (as 'I32 [0Nl 1 2 3 4 5 0Nl]) (as 'I16 [0Nl 1 2 3 4 5 0Nl]) (as 'U8 [0 1 2 3 4 5 6]) [true false true false true false true] (as 'DATE [0Nl 1 2 3 4 5 0Nl]) (as 'TIME [0Nl 1 2 3 4 5 0Nl]) (as 'TIMESTAMP [0Nl 1 2 3 4 5 0Nl]) (as 'TIMESPAN [0Nl 1 2 3 4 5 0Nl]) (as 'SYM ["" "b" "c" "d" "e" "f" ""]) (as 'STR (list "" "b" "c" "d" "e" "f" "")) G (as 'I32 [1 2 3 4 5 6 7]) (as 'SYM ["a" "b" "c" "d" "e" "f" "g"])))
+(set WFwhole (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 'whole funcs: {x: (first v)}}) 'x)))
+(set RFwhole (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 'whole funcs: {x: (first i)}}) 'x))
+(all (map (fn [v] (identical (WFwhole v) (at v RFwhole))) VS)) -- true
+(set WLwhole (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 'whole funcs: {x: (last v)}}) 'x)))
+(set RLwhole (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 'whole funcs: {x: (last i)}}) 'x))
+(all (map (fn [v] (identical (WLwhole v) (at v RLwhole))) VS)) -- true
+(set WFrunning (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 'running funcs: {x: (first v)}}) 'x)))
+(set RFrunning (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 'running funcs: {x: (first i)}}) 'x))
+(all (map (fn [v] (identical (WFrunning v) (at v RFrunning))) VS)) -- true
+(set WLrunning (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 'running funcs: {x: (last v)}}) 'x)))
+(set RLrunning (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 'running funcs: {x: (last i)}}) 'x))
+(all (map (fn [v] (identical (WLrunning v) (at v RLrunning))) VS)) -- true
+(set WFtrail (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 2 funcs: {x: (first v)}}) 'x)))
+(set RFtrail (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 2 funcs: {x: (first i)}}) 'x))
+(all (map (fn [v] (identical (WFtrail v) (at v RFtrail))) VS)) -- true
+(set WLtrail (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 2 funcs: {x: (last v)}}) 'x)))
+(set RLtrail (at (window {from: (table [k i] (list K I)) part: [k] order: [i] frame: 2 funcs: {x: (last i)}}) 'x))
+(all (map (fn [v] (identical (WLtrail v) (at v RLtrail))) VS)) -- true
+(all (map (fn [v] (== (type (WFwhole v)) (type v))) VS)) -- true
+
+;; the issue's repro, and the other value types it names
+(WFwhole (as 'SYM ["" "b" "c" "d" "e" "f" ""])) -- (as 'SYM ["" "" "" "d" "d" "f" "f"])
+(WLwhole (as 'SYM ["" "b" "c" "d" "e" "f" ""])) -- (as 'SYM ["c" "c" "c" "e" "e" "" ""])
+(WLwhole (as 'STR (list "" "b" "c" "d" "e" "f" ""))) -- (as 'STR (list "c" "c" "c" "e" "e" "" ""))
+(WFwhole G) -- (at G [0 0 0 3 3 5 5])
+(WFwhole (as 'F32 [0Nf 1.0 2.0 3.0 4.0 5.0 0Nf])) -- (as 'F32 [0Nf 0Nf 0Nf 3.0 3.0 5.0 5.0])
+(WLwhole (as 'DATE [0Nl 1 2 3 4 5 0Nl])) -- (as 'DATE [2 2 2 4 4 0Nl 0Nl])
+
+;; a STR or GUID null at a row other than 0 is that type's null
+(set G2 (as 'GUID (list "00000001-1111-1111-1111-111111111111" "00000002-1111-1111-1111-111111111111" "00000003-1111-1111-1111-111111111111" "00000004-1111-1111-1111-111111111111" "00000005-1111-1111-1111-111111111111" "00000006-1111-1111-1111-111111111111" "")))
+(WLwhole (as 'STR (list "x" "bb" "cc" "dd" "ee" "ff" ""))) -- (as 'STR (list "cc" "cc" "cc" "ee" "ee" "" ""))
+(nil? (WLwhole G2)) -- [false false false false false true true]
+(WLwhole G2) -- (at G2 [2 2 2 4 4 6 6])
+;; SYM results are as wide as their largest id: past 65535 ids, four bytes
+(set many (as 'SYM (map (fn [j] (format "w1443_%" j)) (til 70000))))
+(set wide (concat (at many [0 1 2 69999 69998 5]) (as 'SYM [""])))
+(WFwhole wide) -- (at wide [0 0 0 3 3 5 5])
+(WLwhole wide) -- (at wide [2 2 2 4 4 6 6])
+
+;; a LIST column gives its cells, gathered by row number
+(set TL (table [k o v] (list [a a b] [2 1 0] (list [1 2] "x" 's))))
+(at (window {from: TL part: [k] order: [o] funcs: {x: (first v)}}) 'x) -- (list "x" "x" 's)
+(at (window {from: TL part: [k] order: [o] funcs: {x: (last v)}}) 'x) -- (list [1 2] [1 2] 's)
+(at (window {from: TL part: [k] order: [o] frame: 'running funcs: {x: (last v)}}) 'x) -- (list [1 2] "x" 's)
+
+;; a parted table is flattened, then answers as the flat one
+(.sys.exec "rm -rf /tmp/rfl_window_first_last_types") -- 0
+(set T (table [k i s d] (list K I (as 'SYM ["" "b" "c" "d" "e" "f" ""]) (as 'DATE [0Nl 1 2 3 4 5 0Nl]))))
+(.db.splayed.set "/tmp/rfl_window_first_last_types/2024.01.01/t/" (take T 3) "/tmp/rfl_window_first_last_types/.sym")
+(.db.splayed.set "/tmp/rfl_window_first_last_types/2024.01.02/t/" (drop T 3) "/tmp/rfl_window_first_last_types/.sym")
+(set P (.db.parted.get "/tmp/rfl_window_first_last_types" 't))
+(at (window {from: P part: [k] order: [i] funcs: {f: (first s)}}) 'f) -- (as 'SYM ["" "" "" "d" "d" "f" "f"])
+(at (window {from: P part: [k] order: [i] funcs: {l: (last d)}}) 'l) -- (as 'DATE [2 2 2 4 4 0Nl 0Nl])
+(.sys.exec "rm -rf /tmp/rfl_window_first_last_types") -- 0
