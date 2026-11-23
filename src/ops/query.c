@@ -29075,9 +29075,11 @@ ray_t* ray_xbar_fn(ray_t* col, ray_t* bucket) {
         double fq = floor(c / b);
         return make_f64(fq * b);
     }
-    /* Temporal xbar: col is temporal, bucket is integer or temporal (not float) */
+    /* Temporal xbar: col is temporal, bucket is integer or temporal (not
+     * float: an F32 bucket raises as an F64 one does, #1409) */
     if (is_temporal(col) && (is_temporal(bucket) ||
-        (is_numeric(bucket) && bucket->type != -RAY_F64))) {
+        (is_numeric(bucket) && bucket->type != -RAY_F64 &&
+         bucket->type != -RAY_F32))) {
         /* DATE / TIME atoms are 32-bit: their typed null writes only the
          * low word, so col->i64 of 0Nd read 2^31 (5881610.07.10). */
         int64_t a = col->type == -RAY_TIMESTAMP ? col->i64 : (int64_t)col->i32, b;
