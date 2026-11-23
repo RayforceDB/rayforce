@@ -56,6 +56,7 @@
 #include "ops/internal.h"
 #include "ops/ops.h"
 #include "ops/temporal.h"
+#include "ops/idxop.h"
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -2311,6 +2312,57 @@ static test_result_t test_eval_temporal_int_slice(void) {
 }
 
 #ifdef DEBUG
+/* #1474: a fused I16 / I32 + - * step drops its null-producing wrap only
+ * when column bounds prove it stays inside the type's non-null range.
+ * ray_expr_bounded_narrows moves once per such step; the answers are held
+ * against the eager ones by test/rfl/expr/narrow_bounded_defer.rfl. */
+static test_result_t test_eval_narrow_bounded_route(void) {
+    ray_t* setup = ray_eval_str(
+        "(do (set a (.idx.zone [100h -100h 0h])) (set b (.idx.zone [32767h 0h 1h]))"
+        "    (set c [100h -100h 0h]) (set d (.idx.zone [7i -7i 0i]))"
+        "    (set x (.idx.zone [100i 1i 0i]))"
+        "    (set T (table [a b c d x] (list a b c d x))) 0)");
+    TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup));
+    ray_release(setup);
+    static const struct { const char* q; bool proved; } cases[] = {
+        { "(select {z: (- (+ (* a 3h) a) 7h) from: T})", true },
+        { "(select {z: (> (+ (* d 3i) d) 5i) from: T})", true },
+        { "(select {z: (- (+ b 0h) 0h) from: T})", true },     /* at the limit, exact */
+        { "(select {z: (- (+ b 1h) 1h) from: T})", false },    /* 32767 + 1: unproved */
+        { "(select {z: (- (+ c 1h) 1h) from: T})", false },    /* no bounds */
+        { "(select {z: (- (as 'I16 x) 1h) from: T})", false }, /* an explicit cast */
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        uint64_t before = atomic_load_explicit(&ray_expr_bounded_narrows, memory_order_relaxed);
+        ray_t* r = ray_eval_str(cases[k].q);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s: error", cases[k].q);
+        ray_release(r);
+        bool hit = atomic_load_explicit(&ray_expr_bounded_narrows, memory_order_relaxed) != before;
+        TEST_ASSERT_FMT(hit == cases[k].proved, "%s: proved = %d", cases[k].q, hit);
+    }
+
+    /* A stale zone (built for fewer rows than the column holds) is no
+     * bound: its [1, 3] would prove (+ s 1h) for a row that holds 32767. */
+    ray_t* v = ray_eval_str("[1h 2h 3h 32767h]");
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v) && v->type == RAY_I16);
+    v->len = 3;
+    v = ray_index_attach_zone(&v);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    v->len = 4;
+    TEST_ASSERT_EQ_I(ray_env_set(ray_sym_intern("s", 1), v), RAY_OK);
+    ray_release(v);
+    uint64_t before = atomic_load_explicit(&ray_expr_bounded_narrows, memory_order_relaxed);
+    ray_t* z = ray_eval_str("(nil? (at (select {z: (- (+ s 1h) 1h) from: (table [s] (list s))}) 'z))");
+    TEST_ASSERT_TRUE(z && !RAY_IS_ERR(z) && z->type == RAY_BOOL && z->len == 4);
+    const uint8_t* zb = (const uint8_t*)ray_data(z);
+    TEST_ASSERT_FMT(!zb[0] && !zb[1] && !zb[2] && zb[3], "stale zone: nil? = [%d %d %d %d]",
+                    zb[0], zb[1], zb[2], zb[3]);
+    ray_release(z);
+    TEST_ASSERT_FMT(atomic_load_explicit(&ray_expr_bounded_narrows, memory_order_relaxed) == before,
+                    "stale zone proved a step");
+    PASS();
+}
+
 static test_result_t test_eval_narrow_left_route(void) {
     static const struct { const char* src; int8_t type; bool typed; } cases[] = {
         { "(- 5i [1i 8i])", RAY_I32, true }, { "(- 5h [1h 8h])", RAY_I16, true },
@@ -14336,6 +14388,7 @@ const test_entry_t lang_entries[] = {
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
 #ifdef DEBUG
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
+    { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
 #endif
     { "lang/query/narrow_sum_bound_routes", test_narrow_sum_bound_routes, lang_setup, lang_teardown },
     { "lang/query/narrow_sum_bound_cancel", test_narrow_sum_bound_cancel, lang_setup, lang_teardown },

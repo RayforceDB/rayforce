@@ -158,7 +158,7 @@ Five things that bite first-time users.
 
 | Kind | Build cost | Space | Query cost | Used by today |
 |---|---|---|---|---|
-| `.idx.zone` | O(n) one pass | O(1) — min/max/null-count | O(1) range check | filter comparisons (EQ/NE/LT/LE/GT/GE, int + float) |
+| `.idx.zone` | O(n) one pass | O(1) — min/max/null-count | O(1) range check | filter comparisons (EQ/NE/LT/LE/GT/GE, int + float); bounds that let an i16 / i32 arithmetic chain in a query narrow once |
 | `.idx.hash` | O(n) one pass | O(n) — table + chain | O(matches) average; chain-walk on collisions | filter EQ (integer, null-free), filter IN, find |
 | `.idx.sort` | O(n log n) | O(n) — row-id permutation | O(log n) binary search | filter range (EQ/LT/LE/GT/GE, selectivity guard), ORDER BY (single ASC key), distinct |
 | `.idx.bloom` | O(n · k), k = 3 | O(m) bits, m default 64 | O(k) probe with false-positive rate | filter EQ definite-absent (integer-family only) |

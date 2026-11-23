@@ -1333,6 +1333,10 @@ bool try_affine_sumavg_pair(ray_graph_t* g, ray_t* tbl, ray_op_t* input_op,
 uint64_t ray_expr_bail_counts[EXPR_BAIL__N];
 uint64_t ray_expr_compile_ok;
 bool     ray_expr_disable; /* test knob: force the fallback path */
+#ifdef DEBUG
+/* #1474: narrow + - * nodes the compiler proved from column bounds */
+_Atomic(uint64_t) ray_expr_bounded_narrows;
+#endif
 
 #define EXPR_BAIL(reason) do {                          \
     ray_expr_bail_counts[(reason)]++;                   \
@@ -1653,6 +1657,17 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
      * never wraps and never reaches the INT64_MIN null sentinel. */
     uint8_t nbits[nc];
     memset(nbits, 63, nc * sizeof(uint8_t));
+    /* #1474: per node, the values its lane can hold when not null, where
+     * column metadata proves them (np_meta_bounds: a fresh zone index,
+     * sorted order, or encoded directory statistics; never a scan).  A
+     * narrow + - * whose interval stays inside its type's non-null range
+     * cannot wrap or land on the null, so it needs no null-producing wrap
+     * and may defer its narrowing.  Unknown (iv_ok 0) whenever a bound is
+     * missing or stale, or for any other operator. */
+    uint32_t niv = nc <= 512 ? nc : 0;
+    np_iv_t  iv[niv ? niv : 1];
+    uint8_t  iv_ok[niv ? niv : 1];
+    memset(iv_ok, 0, sizeof iv_ok);
     /* One widening CAST per narrow register, shared by all its readers
      * (registers are written once, so a widened copy stays valid). */
     uint8_t wide_i64[EXPR_MAX_REGS], wide_f64[EXPR_MAX_REGS];
@@ -1827,6 +1842,9 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 bool enc = !src->parted && !ready;
                 bool enc_parted = src->parted && !ready;
                 if (node->id < nc) nbits[node->id] = expr_type_bits(elem);
+                if (node->id < niv && (elem == RAY_BOOL || elem == RAY_U8 || elem == RAY_I16 ||
+                                       elem == RAY_I32 || elem == RAY_I64))
+                    iv_ok[node->id] = np_meta_bounds(src, &iv[node->id]);
                 out->regs[r].kind = REG_SCAN;
                 out->regs[r].src = src;
                 out->regs[r].enc = enc;
@@ -1908,6 +1926,12 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                 if (node->id < nc) {
                     int8_t ct = node->out_type;
                     nbits[node->id] = expr_type_bits(RAY_IS_PARTED(ct) ? (int8_t)RAY_PARTED_BASETYPE(ct) : ct);
+                }
+                int8_t lt = ext->literal->type;
+                if (node->id < niv && !is_f64 && !const_unres[r] && !RAY_ATOM_IS_NULL(ext->literal) &&
+                    (lt == -RAY_BOOL || lt == -RAY_U8 || lt == -RAY_I16 || lt == -RAY_I32 || lt == -RAY_I64)) {
+                    iv[node->id] = (np_iv_t){ ci, ci };
+                    iv_ok[node->id] = 1;
                 }
                 out->regs[r].kind = REG_CONST;
                 out->regs[r].type = is_f64 ? RAY_F64 : RAY_I64;
@@ -2138,9 +2162,41 @@ bool expr_compile(ray_graph_t* g, ray_t* tbl, ray_op_t* root, ray_expr_t* out, r
                     if (RAY_IS_PARTED(pt)) pt = (int8_t)RAY_PARTED_BASETYPE(pt);
                     /* Signed +, -, * can land on the lane's null even with
                      * real inputs. Materialize the wrap before any consumer:
-                     * modular arithmetic cannot propagate an intermediate null. */
+                     * modular arithmetic cannot propagate an intermediate null.
+                     * Unless the operands' bounds prove every non-null result
+                     * inside the type's non-null range (#1474): then the
+                     * I64 lane already holds the exact narrow value. */
+                    bool proven = false;
+                    if (node->id < niv && !gen_null &&
+                        (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_NEG) &&
+                        node->in_id[0] < niv && iv_ok[node->in_id[0]] &&
+                        (op == OP_NEG || (node->arity >= 2 && node->in_id[1] < niv &&
+                                          iv_ok[node->in_id[1]]))) {
+                        np_iv_t a = iv[node->in_id[0]], res;
+                        if (op == OP_NEG) res = (np_iv_t){ -a.hi, -a.lo };
+                        else {
+                            np_iv_t b = iv[node->in_id[1]];
+                            if (op == OP_ADD)      res = (np_iv_t){ a.lo + b.lo, a.hi + b.hi };
+                            else if (op == OP_SUB) res = (np_iv_t){ a.lo - b.hi, a.hi - b.lo };
+                            else {
+                                __int128 c1 = a.lo * b.lo, c2 = a.lo * b.hi, c3 = a.hi * b.lo, c4 = a.hi * b.hi;
+                                res.lo = c1 < c2 ? c1 : c2; if (c3 < res.lo) res.lo = c3; if (c4 < res.lo) res.lo = c4;
+                                res.hi = c1 > c2 ? c1 : c2; if (c3 > res.hi) res.hi = c3; if (c4 > res.hi) res.hi = c4;
+                            }
+                        }
+                        int64_t slo, shi;
+                        if (np_safe_range(pt, &slo, &shi) && res.lo >= slo && res.hi <= shi) {
+                            proven = true;
+                            iv[node->id] = res;
+                            iv_ok[node->id] = 1;
+                        }
+                    }
                     wrap_null = (pt == RAY_I16 || pt == RAY_I32) &&
-                                (op == OP_ADD || op == OP_SUB || op == OP_MUL);
+                                (op == OP_ADD || op == OP_SUB || op == OP_MUL) && !proven;
+#ifdef DEBUG
+                    if (proven && (pt == RAY_I16 || pt == RAY_I32) && op != OP_NEG)
+                        atomic_fetch_add_explicit(&ray_expr_bounded_narrows, 1, memory_order_relaxed);
+#endif
                     bool narrow = pt == RAY_BOOL || pt == RAY_U8 || pt == RAY_I16 || pt == RAY_I32;
                     if (narrow && node->id < nc) {
                         uint8_t b1 = nbits[node->in_id[0]];
