@@ -1270,6 +1270,20 @@ static bool quantile_keyless_prob(ray_t* prob_expr, ray_t* tbl,
     return quantile_literal_prob(ray_env_get(prob_expr->i64), percentile, out_q);
 }
 
+/* The first row a where: selection keeps, or -1 when it keeps none. */
+static int64_t rowsel_first_row(ray_t* sel) {
+    ray_rowsel_t* m = ray_rowsel_meta(sel);
+    const uint8_t* flags = ray_rowsel_flags(sel);
+    const uint32_t* offs = ray_rowsel_offsets(sel);
+    const uint16_t* idx = ray_rowsel_idx(sel);
+    for (uint32_t seg = 0; seg < m->n_segs; seg++) {
+        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+        if (flags[seg] == RAY_SEL_ALL) return base;
+        if (flags[seg] == RAY_SEL_MIX && offs[seg + 1] > offs[seg]) return base + idx[offs[seg]];
+    }
+    return -1;
+}
+
 /* True unless every GROUP BY key names a column of `tbl`.  A take is pushed
  * into the DAG only for keys it resolves; the group then keeps the first N
  * groups in first-seen order, a BOOL column key included (#1247). */
@@ -27530,9 +27544,11 @@ by_dict_done:
     }
 
     /* Post-process: reorder GROUP BY BOOL results to match first-occurrence
-     * order in the original table (exec.c radix sort puts false before true).
-     * A take pushed into the group already kept its groups in first-seen
-     * order, of the rows the where: keeps (#1247). */
+     * order among the rows the where: keeps (exec.c radix sort puts false
+     * before true): the first row of a fused where:'s selection, row 0 of a
+     * table the where: compacted or of one without a where: (#1247).  A
+     * take pushed into the group already kept its groups in first-seen
+     * order. */
     if (by_expr && !group_head_pushed && result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {
@@ -27556,10 +27572,16 @@ by_dict_done:
                     orig_key = ray_table_col(tbl, by_sym);
                 if (orig_key && RAY_IS_ERR(orig_key)) key_col = orig_key;
             }
+            int64_t first_row = 0;
+            if (orig_key && !RAY_IS_ERR(orig_key) && saved_selection) {
+                first_row = ray_rowsel_meta(saved_selection)->nrows == orig_key->len
+                          ? rowsel_first_row(saved_selection) : -1;
+                if (first_row < 0) orig_key = NULL;   /* no kept row: nothing to order by */
+            }
             if (key_col && RAY_IS_ERR(key_col)) { ray_release(result); result = key_col; }
             else if (key_col) {
                 if (orig_key) {
-                    bool first_val = ((bool*)ray_data(orig_key))[0];
+                    bool first_val = ((bool*)ray_data(orig_key))[first_row];
                     bool result_first = ((bool*)ray_data(key_col))[0];
                     if (first_val != result_first) {
                         /* Swap rows: reverse row order in all columns */

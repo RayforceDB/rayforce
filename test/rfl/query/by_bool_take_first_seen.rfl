@@ -4,7 +4,8 @@
 ;; was kept out of the group for a BOOL column key and the groups were put
 ;; back into first-occurrence order afterwards from the table's first row,
 ;; which a where: may drop; a composite key holding a BOOL was not reordered
-;; at all.  Under a where: the first groups are those of the kept rows.
+;; at all.  Under a where: the first groups are those of the kept rows, and
+;; so is the order of a select with no take: or a negative one.
 
 (set K0 (fn [q] (at q (at (key q) 0))))
 (set K01 (fn [q] (list (at q (at (key q) 0)) (at q (at (key q) 1)))))
@@ -40,3 +41,18 @@
 (K01 (select {u: (count x) from: T where: (> x 0) by: [kl kb] take: 3}))  -- (K01 (select {u: (count x) from: (select {from: T where: (> x 0)}) by: [kl kb] take: 3}))
 ;; a range take from the front keeps the same groups
 (K0 (select {u: (count x) from: T where: (> x 0) by: kb take: [0 2]}))    -- [true false]
+
+;; ── no take:, or a negative one: first-occurrence among the kept rows ────────
+(set N (table [kb kl x] (list [true false true] [5 6 5] [1 2 3])))
+(K0 (select {u: (count x) from: N where: (> x 1) by: kb}))               -- [false true]
+(K0 (select {u: (count x) from: N where: (> x 1) by: kb take: -1}))      -- [true]
+(K0 (select {u: (count x) from: N by: kb}))                              -- [true false]
+(K0 (select {u: (count x) from: N where: (> x 5) by: kb}))               -- []
+(K0 (select {u: (count x) from: T where: (> x 0) by: kb}))               -- [true false]
+(K0 (select {u: (count x) from: T where: (> x 0) by: kb take: -1}))      -- [false]
+(at (select {u: (count x) from: T where: (> x 0) by: kb take: -1}) 'u)   -- [133332]
+(K0 (select {u: (count x) from: T where: (> x 0) by: kb}))               -- (K0 (select {u: (count x) from: (select {from: T where: (> x 0)}) by: kb}))
+;; the first kept row past the first morsel, in a partly kept one
+(K0 (select {u: (count x) from: T where: (and (> x 3000) (== (% x 2) 1)) by: kb}))  -- [true false]
+(K0 (select {u: (count x) from: T where: (and (> x 3000) (== (% x 2) 0)) by: kb}))  -- [false true]
+(K0 (select {u: (count x) from: S where: (> x 0) by: kb}))               -- [true false]
