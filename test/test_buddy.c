@@ -468,7 +468,7 @@ static test_result_t test_heap_pending_merge(void) {
 /* ---- Swap path resolution -------------------------------------------------
  *
  * These two tests verify the wiring for the file-backed-mmap fallback's
- * swap directory.  RAY_HEAP_SWAP overrides the default ("./"), and either
+ * swap directory.  RAY_HEAP_SWAP overrides TMPDIR, then "/tmp/", and either
  * way the resolved path always carries a trailing slash so heap_add_pool
  * can concatenate `<swap_path><filename>` directly.  The end-to-end
  * behaviour (anon mmap fails -> tempfile created -> pool usable -> file
@@ -497,7 +497,11 @@ static test_result_t test_swap_path_default(void) {
     /* Manage runtime explicitly: with neither RAY_HEAP_SWAP nor TMPDIR set,
      * the default "/tmp/" must apply (not the working directory).  This test
      * owns its own heap lifecycle (entries registered with NULL setup/
-     * teardown). */
+     * teardown).  An earlier test in this worker may have left the thread's
+     * heap up (any ray_alloc without a setup creates one lazily), and
+     * ray_heap_init on a live heap keeps its swap path: drop it first so
+     * this init resolves the directory under the environment set here. */
+    ray_heap_destroy();
     unsetenv("RAY_HEAP_SWAP");
     unsetenv("TMPDIR");
     ray_heap_init();
@@ -509,7 +513,9 @@ static test_result_t test_swap_path_default(void) {
 }
 
 static test_result_t test_swap_path_tmpdir(void) {
-    /* With RAY_HEAP_SWAP unset, TMPDIR is the fallback before /tmp. */
+    /* With RAY_HEAP_SWAP unset, TMPDIR is the fallback before /tmp.  Drop a
+     * heap an earlier test left up, as swap_path_default does. */
+    ray_heap_destroy();
     unsetenv("RAY_HEAP_SWAP");
     setenv("TMPDIR", "/tmp/rayforce_tmpdir_test", 1);
     ray_heap_init();
@@ -519,6 +525,23 @@ static test_result_t test_swap_path_tmpdir(void) {
     unsetenv("TMPDIR");
     ray_heap_destroy();
     PASS();
+}
+
+/* #1201: the two tests above, after an allocation with no setup has brought
+ * the thread's heap up lazily (as any earlier test in the worker may). */
+static test_result_t test_swap_path_after_lazy_heap(void) {
+    ray_t* v = ray_alloc(16);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_free(v);
+    test_result_t r = test_swap_path_tmpdir();
+    if (r.status != TEST_PASS) return r;
+    v = ray_alloc(16);
+    TEST_ASSERT_NOT_NULL(v);
+    ray_free(v);
+    setenv("TMPDIR", "/tmp/rayforce_tmpdir_test", 1);
+    ray_heap_destroy();
+    ray_heap_init();               /* the heap a test run under TMPDIR leaves */
+    return test_swap_path_default();
 }
 
 static test_result_t test_warm_first_local_free(void) {
@@ -606,6 +629,7 @@ const test_entry_t buddy_entries[] = {
     { "buddy/swap_path_env", test_swap_path_env, buddy_setup, buddy_teardown },
     { "buddy/swap_path_default", test_swap_path_default, NULL, NULL },
     { "buddy/swap_path_tmpdir", test_swap_path_tmpdir, NULL, NULL },
+    { "buddy/swap_path_after_lazy_heap", test_swap_path_after_lazy_heap, NULL, NULL },
     { "buddy/warm_first_free", test_warm_first_local_free, buddy_setup, buddy_teardown },
     { NULL, NULL, NULL, NULL },
 };
