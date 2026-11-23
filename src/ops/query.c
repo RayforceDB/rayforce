@@ -29175,8 +29175,8 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F64: {
-        if (at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
-        double v = (at == -RAY_F64) ? atom->f64 : (double)as_i64(atom);
+        if (at != -RAY_F32 && at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
+        double v = is_int ? (double)as_i64(atom) : atom->f64;
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F32: {
@@ -33563,7 +33563,7 @@ static ray_t* upsert_cell_fits(int8_t ct, ray_t* cell) {
     case RAY_BOOL:      ok = (at == -RAY_BOOL); break;
     case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
                         ok = is_int; break;
-    case RAY_F64:       ok = (at == -RAY_F64 || is_int); break;
+    case RAY_F64:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_F32:       ok = (at == -RAY_F32 || at == -RAY_F64 || is_int); break;
     case RAY_DATE:      ok = (at == -RAY_DATE); break;
     case RAY_TIME:      ok = (at == -RAY_TIME); break;

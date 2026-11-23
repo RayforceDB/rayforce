@@ -1,0 +1,22 @@
+;; Widen the F32 row cell into the existing F64 column, not vice versa.
+(set t (table [v] (list [1.0000000001])))
+(insert 't (list -2.25e)) -- 't
+(type (get t 'v)) -- 'F64
+(get t 'v) -- [1.0000000001 -2.25]
+
+;; The functional form appends a typed null without changing the input.
+(set u (insert t (list 0Ne)))
+(count t) -- 2
+(count u) -- 3
+(type (get u 'v)) -- 'F64
+(nil? (at (get u 'v) 2)) -- true
+
+;; Row upsert widens through the same writer for new and matched keys.
+(set t (table [k v] (list [1] [1.0000000001])))
+(set u (upsert t 1 (list 2 1.25e)))
+(get u 'v) -- [1.0000000001 1.25]
+(set w (upsert u 1 (list 1 -2.5e)))
+(get w 'v) -- [-2.5 1.25]
+(type (get w 'v)) -- 'F64
+(set z (upsert w 1 (list 2 0Ne)))
+(nil? (get z 'v)) -- [false true]
