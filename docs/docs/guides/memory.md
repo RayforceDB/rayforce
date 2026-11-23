@@ -29,6 +29,7 @@ Call `(.sys.mem)` to get a snapshot of the current heap's allocation statistics.
 | `anon-committed` | i64 | Anonymous RAM the heap has committed (pools, direct and sys blocks; spill excluded) |
 | `anon-peak` | i64 | High-water mark of `anon-committed` |
 | `anon-watermark` | i64 | Spill threshold: set by `-m SIZE`, see [section 8](#8-total-ram-and-out-of-core-spill) |
+| `decode-cache-bytes` | i64 | Decoded copies of compressed table columns kept from one statement to the next (a string column's pool and a parted column's segments included); trimmed to a quarter of `anon-watermark` at statement boundaries |
 
 It also returns diagnostic `*-perpart-runs` counters and the symbol-table size;
 the [`.sys.mem` reference](../namespaces/sys.md#sys-mem) documents every key.
