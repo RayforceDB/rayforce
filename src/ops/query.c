@@ -4547,6 +4547,64 @@ static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
                    (ray_unary_fn)(uintptr_t)fn->i64 == native);
 }
 
+/* A JSON read's argument that is the same for every row: a dict, a string
+ * or a quoted symbol written in place, or a name that is not a column
+ * holding a string, a symbol or a dict, or (`path`: the path position) a
+ * string or symbol vector, one path per row as a column of paths is. */
+static bool json_const_arg(ray_t* a, ray_t* tbl, bool path) {
+    if (!a) return false;
+    if (a->type == RAY_DICT || a->type == -RAY_STR) return true;
+    if (a->type != -RAY_SYM) return false;
+    if (a->attrs & ATTR_QUOTED) return true;
+    if (expr_refs_row_column(a, tbl)) return false;
+    ray_t* v = ray_env_get(a->i64);
+    return v && !RAY_IS_ERR(v) && (v->type == -RAY_STR || v->type == -RAY_SYM || v->type == RAY_DICT ||
+                                   (path && (v->type == RAY_STR || v->type == RAY_SYM)));
+}
+
+/* The JSON readers take a whole string column and type the result from
+ * every row's value (a missing field is that type's null); one cell at a
+ * time each row would come back untyped, and an element-wise call around
+ * it would meet an untyped null.  Their value at a row is the row's alone,
+ * so a tree of element-wise builtins (RAY_FN_ATOMIC) over columns, literals
+ * and JSON reads of a column has, over the whole column, its per-row
+ * answer.  1: such a tree with a JSON read of a column in it; 0: an
+ * element-wise tree without one; -1: anything else (a free name, a lambda,
+ * an order-dependent or aggregate call, a JSON read of constants, which
+ * keeps its per-row, broadcast answer).  A dotted name cannot be rebound. */
+static int json_rowwise(ray_t* e, ray_t* tbl) {
+    if (!e || RAY_IS_ERR(e)) return -1;
+    if (e->type == -RAY_SYM)
+        return (e->attrs & ATTR_QUOTED) || expr_refs_row_column(e, tbl) ? 0 : -1;
+    if (e->type < 0) return 0;
+    if (e->type != RAY_LIST || ray_len(e) < 2) return -1;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* head = el[0];
+    if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return -1;
+    ray_t* hs = ray_sym_str(head->i64);
+    size_t hl = hs ? ray_str_len(hs) : 0;
+    const char* hp = hs ? ray_str_ptr(hs) : "";
+    bool json = (hl == 9 && memcmp(hp, ".json.get", 9) == 0) ||
+                (hl == 11 && memcmp(hp, ".json.parse", 11) == 0);
+    if (json && !expr_refs_row_column(el[1], tbl)) return -1;
+    if (!json) {
+        ray_t* fn = ray_env_get(head->i64);
+        if (!fn || RAY_IS_ERR(fn) || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY) ||
+            !(fn->attrs & RAY_FN_ATOMIC)) return -1;
+    }
+    int r = json ? 1 : 0;
+    for (int64_t i = 1; i < ray_len(e); i++) {
+        /* a JSON read's path and limits: a column, a literal, or a name
+         * holding a string, a symbol or a dict (a global, a parameter, a
+         * let), which is one value for every row */
+        if (json && i >= 2 && json_const_arg(el[i], tbl, i == 2)) continue;
+        int k = json_rowwise(el[i], tbl);
+        if (k < 0) return -1;
+        if (k > r) r = k;
+    }
+    return r;
+}
+
 /* True when a projection's TOP-LEVEL call is a "whole-column verb": a
  * collection builtin (distinct, asc, desc, iasc, idesc, rank, reverse, where, enlist) that
  * consumes an entire column vector and returns a vector.  The DAG compiler
@@ -4581,6 +4639,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!s) return 0;
     size_t l = ray_str_len(s);
     const char* p = ray_str_ptr(s);
+    if (json_rowwise(expr, tbl) == 1) return 1;
     if (l == 6 && memcmp(p, "concat", 6) == 0) {
         /* Preserve row-wise text concatenation when another projection
          * forces fallback, but evaluate collection concat once. Compilation
@@ -18704,10 +18763,14 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
              * a repeated run would repeat the effect. */
             key_bind_t pure_binds[KEY_PURE_MAX_BIND];
             key_pure_ctx_t pure_ctx = { NULL, pure_binds, 0, 0 };
-            bool pure = key_expr_pure(by_expr, 0, &pure_ctx);
+            /* A JSON read of a column, under element-wise builtins only, is
+             * read whole as a projection is (json_rowwise): it holds no
+             * conditional, and its error is the query's. */
+            bool json_whole = json_rowwise(by_expr, base) == 1;
+            bool pure = json_whole || key_expr_pure(by_expr, 0, &pure_ctx);
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
-            else if (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec)) {
+            else if (!json_whole && (__VM->rows_cond != conds || !keyvec || RAY_IS_ERR(keyvec))) {
                 /* Also when the whole-column run failed: a body written for
                  * one row may not accept a column at all.  The failure is
                  * swallowed whole: its `raise` payload and trace go with it,

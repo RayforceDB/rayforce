@@ -33,6 +33,7 @@
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
+#include "io/json.h"
 #include "ops/linkop.h"
 #include "table/sym.h"
 #include "vec/vec.h"
@@ -5413,6 +5414,9 @@ static void ray_register_builtins(void) {
     register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
+    register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
+    register_vary(".json.get", RAY_FN_NONE, ray_json_get_fn);
+    register_unary(".json.format", RAY_FN_NONE, ray_json_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
@@ -6201,7 +6205,16 @@ ray_t* ray_eval(ray_t* obj) {
             }
             int8_t any_rows = 0;
             for (int64_t i = 0; i < argc; i++) {
-                args[i] = ray_eval(elems[i + 1]);
+                /* .json.get's type, a quoted symbol after the path, names a
+                 * type, never a column a query would read it as */
+                ray_t* ai = elems[i + 1];
+                if (i == 2 && fn == ray_json_get_fn && ai && ai->type == -RAY_SYM &&
+                    (ai->attrs & ATTR_QUOTED)) {
+                    ray_retain(ai);
+                    args[i] = ai;
+                    continue;
+                }
+                args[i] = ray_eval(ai);
                 any_rows = rows_join(any_rows, g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];

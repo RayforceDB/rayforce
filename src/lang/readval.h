@@ -36,4 +36,9 @@ ray_read_limits_t ray_read_limits_default(void);
  * symbols behind.  A NULL `limits` means the defaults. */
 ray_t* ray_read_value(const char* text, size_t len, const ray_read_limits_t* limits);
 
+/* Overrides `*lim` from the limits dict `d` (symbol names as read-limits
+ * lists them, non-negative integer values).  NULL on success, else an owned
+ * error naming `who`.  Defined with read-value (ops/builtins.c). */
+ray_t* ray_read_limits_apply(const char* who, ray_t* d, ray_read_limits_t* lim);
+
 #endif /* RAY_READVAL_H */

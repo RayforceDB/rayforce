@@ -379,32 +379,37 @@ ray_t* ray_read_limits_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
+ray_t* ray_read_limits_apply(const char* who, ray_t* d, ray_read_limits_t* lim) {
+    if (!d || d->type != RAY_DICT) return ray_error("type", "%s: limits must be a dict, got %s", who, d ? ray_type_name(d->type) : "null");
+    ray_t* keys = ray_dict_keys(d);
+    ray_t* vals = ray_dict_vals(d);
+    /* The language's {} has LIST keys: an empty dict overrides nothing. */
+    if (keys->len > 0 && keys->type != RAY_SYM) return ray_error("type", "%s: limit names must be symbols", who);
+    for (int64_t i = 0; i < keys->len; i++) {
+        ray_t* kn = ray_sym_vec_cell(keys, i);
+        size_t found = READ_LIMIT_COUNT;
+        for (size_t j = 0; j < READ_LIMIT_COUNT; j++)
+            if (kn && strlen(read_limit_names[j].name) == ray_str_len(kn) &&
+                memcmp(read_limit_names[j].name, ray_str_ptr(kn), ray_str_len(kn)) == 0) found = j;
+        if (found == READ_LIMIT_COUNT) return ray_error("domain", "%s: unknown limit '%.*s'", who, kn ? (int)ray_str_len(kn) : 0, kn ? ray_str_ptr(kn) : "");
+        int64_t v;
+        if (vals->type == RAY_I64) v = ((int64_t*)ray_data(vals))[i];
+        else if (vals->type == RAY_LIST && ((ray_t**)ray_data(vals))[i]->type == -RAY_I64) v = ((ray_t**)ray_data(vals))[i]->i64;
+        else return ray_error("type", "%s: limits must be integers", who);
+        if (v < 0 || v == INT64_MIN) return ray_error("domain", "%s: limits must not be negative", who);
+        *(size_t*)((char*)lim + read_limit_names[found].off) = (size_t)v;
+    }
+    return NULL;
+}
+
 ray_t* ray_read_value_fn(ray_t** args, int64_t n) {
     if (n < 1 || n > 2) return ray_error("arity", "read-value: expects text and optional limits, got %lld arguments", (long long)n);
     if (!args[0] || args[0]->type != -RAY_STR)
         return ray_error("type", "read-value: text must be a string, got %s", args[0] ? ray_type_name(args[0]->type) : "null");
     ray_read_limits_t lim = ray_read_limits_default();
     if (n == 2) {
-        ray_t* d = args[1];
-        if (!d || d->type != RAY_DICT) return ray_error("type", "read-value: limits must be a dict, got %s", d ? ray_type_name(d->type) : "null");
-        ray_t* keys = ray_dict_keys(d);
-        ray_t* vals = ray_dict_vals(d);
-        /* The language's {} has LIST keys: an empty dict overrides nothing. */
-        if (keys->len > 0 && keys->type != RAY_SYM) return ray_error("type", "read-value: limit names must be symbols");
-        for (int64_t i = 0; i < keys->len; i++) {
-            ray_t* kn = ray_sym_vec_cell(keys, i);
-            size_t found = READ_LIMIT_COUNT;
-            for (size_t j = 0; j < READ_LIMIT_COUNT; j++)
-                if (kn && strlen(read_limit_names[j].name) == ray_str_len(kn) &&
-                    memcmp(read_limit_names[j].name, ray_str_ptr(kn), ray_str_len(kn)) == 0) found = j;
-            if (found == READ_LIMIT_COUNT) return ray_error("domain", "read-value: unknown limit '%.*s'", kn ? (int)ray_str_len(kn) : 0, kn ? ray_str_ptr(kn) : "");
-            int64_t v;
-            if (vals->type == RAY_I64) v = ((int64_t*)ray_data(vals))[i];
-            else if (vals->type == RAY_LIST && ((ray_t**)ray_data(vals))[i]->type == -RAY_I64) v = ((ray_t**)ray_data(vals))[i]->i64;
-            else return ray_error("type", "read-value: limits must be integers");
-            if (v < 0 || v == INT64_MIN) return ray_error("domain", "read-value: limits must not be negative");
-            *(size_t*)((char*)&lim + read_limit_names[found].off) = (size_t)v;
-        }
+        ray_t* err = ray_read_limits_apply("read-value", args[1], &lim);
+        if (err) return err;
     }
     return ray_read_value(ray_str_ptr(args[0]), ray_str_len(args[0]), &lim);
 }
