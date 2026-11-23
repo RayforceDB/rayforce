@@ -873,8 +873,9 @@ static test_result_t test_cross_heap_cycle_bounds_pools(void) {
  * ray_free resolves the owning heap through ray_heap_registry and pushes the
  * block onto it WITHOUT a lock.  That is only sound while a registered heap
  * outlives every block it owns, so a thread that exits abandons its heap —
- * still registered, pools intact — instead of unregistering and munmapping
- * it underneath a lookup already in flight.  The next thread up adopts it. */
+ * still registered, keeping every pool that holds a live block — instead of
+ * unregistering and munmapping it underneath a lookup already in flight.
+ * The next thread up adopts it. */
 
 static test_result_t test_heap_abandon_is_adopted(void) {
     ray_heap_t* heap_a = ray_tl_heap;
@@ -4354,9 +4355,12 @@ static test_result_t test_relieve_spill_not_room(void) {
     PASS();
 }
 
-/* A heap whose thread leaves it (ray_heap_abandon) is visited by no boundary,
- * so its empty spill pools could never age: they go then.  Its anonymous
- * pools stay for the thread that adopts it. */
+/* A heap whose thread leaves it (ray_heap_abandon) is visited by no boundary
+ * — not the idle decay, a relief or .sys.gc — until a thread adopts it, so
+ * what it holds then it would hold for as long as it stays idle: its empty
+ * spill pools could never age, and its empty anonymous pools would stay
+ * committed against the anonymous watermark (#1461).  Every empty pool goes,
+ * spill and anonymous, the last one too; a pool holding a live block stays. */
 static test_result_t test_relieve_abandon_spill(void) {
 #if defined(_WIN32)
     SKIP("file-backed spill is POSIX-only");
@@ -4365,18 +4369,57 @@ static test_result_t test_relieve_abandon_spill(void) {
     relieve_env_begin(&e);
     ray_heap_t* h = relieve_heap_new(&e);
     if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+    ray_t* live = ray_alloc(64);                 /* the first pool's cascade */
     const char* probe = NULL;
-    if (!relieve_spill_layout(h, &probe, NULL)) {
+    if (!live || !relieve_spill_layout(h, &probe, NULL)) {
+        if (live) ray_free(live);
         relieve_env_end(&e, h, NULL);
         SKIP("blocks or spill file unavailable");
     }
+    int64_t held = ray_heap_anon_committed();
     ray_heap_abandon();
-    bool gone = h->pool_count == 2 && relieve_backed_pools(h) == 0;
+    bool kept = h->pool_count == 1 && relieve_backed_pools(h) == 0
+             && heap_find_pool(h, live) == 0;
+    int64_t dropped = held - ray_heap_anon_committed();
+    ray_tl_heap = e.base;
+    ray_free(live);                              /* to the idle heap's foreign list */
+    ray_tl_heap = NULL;
     ray_heap_init();                             /* adopts it back */
     bool back = ray_tl_heap == h;
     relieve_env_end(&e, back ? h : NULL, NULL);
     if (!back) FAIL("the abandoned heap was not adopted back");
-    TEST_ASSERT(gone, "the empty spill pools went, the anonymous ones stayed");
+    TEST_ASSERT(kept, "the empty pools went, the one with a live block stayed");
+    TEST_ASSERT_EQ_I(dropped, RELIEVE_POOL);     /* the empty anonymous pool */
+    PASS();
+}
+
+/* An abandoned heap with no live block keeps no pool, and its committed
+ * bytes leave the anonymous watermark's count with it: the thread that
+ * adopts it maps a pool as a new heap does. */
+static test_result_t test_heap_abandon_unmaps_empty(void) {
+    relieve_env_t e;
+    relieve_env_begin(&e);
+    ray_heap_t* h = relieve_heap_new(&e);
+    if (!h) { relieve_env_end(&e, NULL, NULL); SKIP("no fresh heap"); }
+    int64_t before = ray_heap_anon_committed();
+    ray_t* b = ray_alloc(4096);
+    bool mapped = b && h->pool_count == 1
+               && ray_heap_anon_committed() - before == RELIEVE_POOL;
+    if (b) ray_free(b);
+    ray_heap_abandon();
+    bool empty = h->pool_count == 0;
+    int64_t after = ray_heap_anon_committed();
+    ray_heap_init();                             /* adopts it back */
+    bool back = ray_tl_heap == h;
+    ray_t* c = back ? ray_alloc(4096) : NULL;    /* and it allocates again */
+    bool serves = c && h->pool_count == 1;
+    if (c) ray_free(c);
+    relieve_env_end(&e, back ? h : NULL, NULL);
+    if (!back) FAIL("the abandoned heap was not adopted back");
+    TEST_ASSERT(mapped, "the block mapped one anonymous pool");
+    TEST_ASSERT(empty, "the abandoned heap kept no pool");
+    TEST_ASSERT_EQ_I(after, before);
+    TEST_ASSERT(serves, "the adopter mapped a pool for its block");
     PASS();
 }
 
@@ -6718,6 +6761,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_not_room",   test_relieve_spill_not_room,      heap_setup, heap_teardown },
     { "heap/relieve_spill_not_room_unmap", test_relieve_spill_not_room_unmap, heap_setup, heap_teardown },
     { "heap/relieve_abandon_spill",    test_relieve_abandon_spill,       heap_setup, heap_teardown },
+    { "heap/abandon_unmaps_empty",     test_heap_abandon_unmaps_empty,   heap_setup, heap_teardown },
     { "heap/relieve_spill_last_pool",  test_relieve_spill_last_pool,     heap_setup, heap_teardown },
     { "heap/relieve_spill_last_pool_unmap", test_relieve_spill_last_pool_unmap, heap_setup, heap_teardown },
     { "heap/relieve_no_spill_file",    test_relieve_no_spill_file,       heap_setup, heap_teardown },
