@@ -1,0 +1,327 @@
+;; @also-unfused
+;; An `if` with one temporal arm (DATE, TIME, TIMESTAMP, TIMESPAN) and one
+;; numeric arm (BOOL, U8, I16, I32, I64, F32, F64) raises `type` in a query
+;; (#1485), as two different temporal arms do (#1337).  The fill wrote the
+;; temporal arm's raw count (days, ms, ns) beside the numbers, and a computed
+;; arm boxed the cells into a LIST.  A temporal arm beside a null literal keeps
+;; its type; `as` gives the raw count when it is wanted.  Outside a query `if`
+;; is control flow and is unchanged.
+
+(set T (table [g k d t p s b u h i e f x] (list [0 1 1] [a a b] (+ 2024.01.01 (til 3)) (as 'TIME [3600000 7200000 10800000]) (+ 2024.01.01D01:00:00.000000000 (* 3600000000000 (til 3))) (as 'TIMESPAN [3600000000000 7200000000000 10800000000000]) [true false true] (as 'U8 [1 2 3]) (as 'I16 [1 2 3]) (as 'I32 [10 20 30]) [10 20 30] (as 'F32 [1.5 2.5 3.5]) [1.5 2.5 3.5])))
+(set R (fn [x] (at x 'r)))
+(try (at (select {from: T r: (if (> g 0) d i)}) 'r) (fn [e] (at e 'msg))) -- "if: branches mix DATE and I32"
+(try (at (select {from: T r: (if (> g 0) x p)}) 'r) (fn [e] (at e 'msg))) -- "if: branches mix F64 and TIMESTAMP"
+
+;; ── DATE and BOOL ──
+(select {from: T r: (if (> g 0) d b)}) !- type
+(select {from: T r: (if (> g 0) b d)}) !- type
+(select {from: T r: (if (> g 0) d true)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 b)}) !- type
+(select {from: T r: (if (> g 0) d b) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d b) by: k}) !- type
+(update {from: T r: (if (> g 0) b d)}) !- type
+;; ── DATE and U8 ──
+(select {from: T r: (if (> g 0) d u)}) !- type
+(select {from: T r: (if (> g 0) u d)}) !- type
+(select {from: T r: (if (> g 0) d 0x05)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 u)}) !- type
+(select {from: T r: (if (> g 0) d u) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d u) by: k}) !- type
+(update {from: T r: (if (> g 0) u d)}) !- type
+;; ── DATE and I16 ──
+(select {from: T r: (if (> g 0) d h)}) !- type
+(select {from: T r: (if (> g 0) h d)}) !- type
+(select {from: T r: (if (> g 0) d 5h)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 h)}) !- type
+(select {from: T r: (if (> g 0) d h) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d h) by: k}) !- type
+(update {from: T r: (if (> g 0) h d)}) !- type
+;; ── DATE and I32 ──
+(select {from: T r: (if (> g 0) d i)}) !- type
+(select {from: T r: (if (> g 0) i d)}) !- type
+(select {from: T r: (if (> g 0) d 5i)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 i)}) !- type
+(select {from: T r: (if (> g 0) d i) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d i) by: k}) !- type
+(update {from: T r: (if (> g 0) i d)}) !- type
+;; ── DATE and I64 ──
+(select {from: T r: (if (> g 0) d e)}) !- type
+(select {from: T r: (if (> g 0) e d)}) !- type
+(select {from: T r: (if (> g 0) d 5)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 e)}) !- type
+(select {from: T r: (if (> g 0) d e) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d e) by: k}) !- type
+(update {from: T r: (if (> g 0) e d)}) !- type
+;; ── DATE and F32 ──
+(select {from: T r: (if (> g 0) d f)}) !- type
+(select {from: T r: (if (> g 0) f d)}) !- type
+(select {from: T r: (if (> g 0) d 5.5e)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 f)}) !- type
+(select {from: T r: (if (> g 0) d f) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d f) by: k}) !- type
+(update {from: T r: (if (> g 0) f d)}) !- type
+;; ── DATE and F64 ──
+(select {from: T r: (if (> g 0) d x)}) !- type
+(select {from: T r: (if (> g 0) x d)}) !- type
+(select {from: T r: (if (> g 0) d 5.5)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01 x)}) !- type
+(select {from: T r: (if (> g 0) d x) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) d x) by: k}) !- type
+(update {from: T r: (if (> g 0) x d)}) !- type
+;; ── TIME and BOOL ──
+(select {from: T r: (if (> g 0) t b)}) !- type
+(select {from: T r: (if (> g 0) b t)}) !- type
+(select {from: T r: (if (> g 0) t true)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 b)}) !- type
+(select {from: T r: (if (> g 0) t b) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t b) by: k}) !- type
+(update {from: T r: (if (> g 0) b t)}) !- type
+;; ── TIME and U8 ──
+(select {from: T r: (if (> g 0) t u)}) !- type
+(select {from: T r: (if (> g 0) u t)}) !- type
+(select {from: T r: (if (> g 0) t 0x05)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 u)}) !- type
+(select {from: T r: (if (> g 0) t u) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t u) by: k}) !- type
+(update {from: T r: (if (> g 0) u t)}) !- type
+;; ── TIME and I16 ──
+(select {from: T r: (if (> g 0) t h)}) !- type
+(select {from: T r: (if (> g 0) h t)}) !- type
+(select {from: T r: (if (> g 0) t 5h)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 h)}) !- type
+(select {from: T r: (if (> g 0) t h) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t h) by: k}) !- type
+(update {from: T r: (if (> g 0) h t)}) !- type
+;; ── TIME and I32 ──
+(select {from: T r: (if (> g 0) t i)}) !- type
+(select {from: T r: (if (> g 0) i t)}) !- type
+(select {from: T r: (if (> g 0) t 5i)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 i)}) !- type
+(select {from: T r: (if (> g 0) t i) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t i) by: k}) !- type
+(update {from: T r: (if (> g 0) i t)}) !- type
+;; ── TIME and I64 ──
+(select {from: T r: (if (> g 0) t e)}) !- type
+(select {from: T r: (if (> g 0) e t)}) !- type
+(select {from: T r: (if (> g 0) t 5)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 e)}) !- type
+(select {from: T r: (if (> g 0) t e) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t e) by: k}) !- type
+(update {from: T r: (if (> g 0) e t)}) !- type
+;; ── TIME and F32 ──
+(select {from: T r: (if (> g 0) t f)}) !- type
+(select {from: T r: (if (> g 0) f t)}) !- type
+(select {from: T r: (if (> g 0) t 5.5e)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 f)}) !- type
+(select {from: T r: (if (> g 0) t f) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t f) by: k}) !- type
+(update {from: T r: (if (> g 0) f t)}) !- type
+;; ── TIME and F64 ──
+(select {from: T r: (if (> g 0) t x)}) !- type
+(select {from: T r: (if (> g 0) x t)}) !- type
+(select {from: T r: (if (> g 0) t 5.5)}) !- type
+(select {from: T r: (if (> g 0) 10:00:00.000 x)}) !- type
+(select {from: T r: (if (> g 0) t x) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) t x) by: k}) !- type
+(update {from: T r: (if (> g 0) x t)}) !- type
+;; ── TIMESTAMP and BOOL ──
+(select {from: T r: (if (> g 0) p b)}) !- type
+(select {from: T r: (if (> g 0) b p)}) !- type
+(select {from: T r: (if (> g 0) p true)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 b)}) !- type
+(select {from: T r: (if (> g 0) p b) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p b) by: k}) !- type
+(update {from: T r: (if (> g 0) b p)}) !- type
+;; ── TIMESTAMP and U8 ──
+(select {from: T r: (if (> g 0) p u)}) !- type
+(select {from: T r: (if (> g 0) u p)}) !- type
+(select {from: T r: (if (> g 0) p 0x05)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 u)}) !- type
+(select {from: T r: (if (> g 0) p u) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p u) by: k}) !- type
+(update {from: T r: (if (> g 0) u p)}) !- type
+;; ── TIMESTAMP and I16 ──
+(select {from: T r: (if (> g 0) p h)}) !- type
+(select {from: T r: (if (> g 0) h p)}) !- type
+(select {from: T r: (if (> g 0) p 5h)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 h)}) !- type
+(select {from: T r: (if (> g 0) p h) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p h) by: k}) !- type
+(update {from: T r: (if (> g 0) h p)}) !- type
+;; ── TIMESTAMP and I32 ──
+(select {from: T r: (if (> g 0) p i)}) !- type
+(select {from: T r: (if (> g 0) i p)}) !- type
+(select {from: T r: (if (> g 0) p 5i)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 i)}) !- type
+(select {from: T r: (if (> g 0) p i) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p i) by: k}) !- type
+(update {from: T r: (if (> g 0) i p)}) !- type
+;; ── TIMESTAMP and I64 ──
+(select {from: T r: (if (> g 0) p e)}) !- type
+(select {from: T r: (if (> g 0) e p)}) !- type
+(select {from: T r: (if (> g 0) p 5)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 e)}) !- type
+(select {from: T r: (if (> g 0) p e) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p e) by: k}) !- type
+(update {from: T r: (if (> g 0) e p)}) !- type
+;; ── TIMESTAMP and F32 ──
+(select {from: T r: (if (> g 0) p f)}) !- type
+(select {from: T r: (if (> g 0) f p)}) !- type
+(select {from: T r: (if (> g 0) p 5.5e)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 f)}) !- type
+(select {from: T r: (if (> g 0) p f) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p f) by: k}) !- type
+(update {from: T r: (if (> g 0) f p)}) !- type
+;; ── TIMESTAMP and F64 ──
+(select {from: T r: (if (> g 0) p x)}) !- type
+(select {from: T r: (if (> g 0) x p)}) !- type
+(select {from: T r: (if (> g 0) p 5.5)}) !- type
+(select {from: T r: (if (> g 0) 2020.01.01D10:00:00.000000000 x)}) !- type
+(select {from: T r: (if (> g 0) p x) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) p x) by: k}) !- type
+(update {from: T r: (if (> g 0) x p)}) !- type
+;; ── TIMESPAN and BOOL ──
+(select {from: T r: (if (> g 0) s b)}) !- type
+(select {from: T r: (if (> g 0) b s)}) !- type
+(select {from: T r: (if (> g 0) s true)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 b)}) !- type
+(select {from: T r: (if (> g 0) s b) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s b) by: k}) !- type
+(update {from: T r: (if (> g 0) b s)}) !- type
+;; ── TIMESPAN and U8 ──
+(select {from: T r: (if (> g 0) s u)}) !- type
+(select {from: T r: (if (> g 0) u s)}) !- type
+(select {from: T r: (if (> g 0) s 0x05)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 u)}) !- type
+(select {from: T r: (if (> g 0) s u) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s u) by: k}) !- type
+(update {from: T r: (if (> g 0) u s)}) !- type
+;; ── TIMESPAN and I16 ──
+(select {from: T r: (if (> g 0) s h)}) !- type
+(select {from: T r: (if (> g 0) h s)}) !- type
+(select {from: T r: (if (> g 0) s 5h)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 h)}) !- type
+(select {from: T r: (if (> g 0) s h) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s h) by: k}) !- type
+(update {from: T r: (if (> g 0) h s)}) !- type
+;; ── TIMESPAN and I32 ──
+(select {from: T r: (if (> g 0) s i)}) !- type
+(select {from: T r: (if (> g 0) i s)}) !- type
+(select {from: T r: (if (> g 0) s 5i)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 i)}) !- type
+(select {from: T r: (if (> g 0) s i) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s i) by: k}) !- type
+(update {from: T r: (if (> g 0) i s)}) !- type
+;; ── TIMESPAN and I64 ──
+(select {from: T r: (if (> g 0) s e)}) !- type
+(select {from: T r: (if (> g 0) e s)}) !- type
+(select {from: T r: (if (> g 0) s 5)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 e)}) !- type
+(select {from: T r: (if (> g 0) s e) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s e) by: k}) !- type
+(update {from: T r: (if (> g 0) e s)}) !- type
+;; ── TIMESPAN and F32 ──
+(select {from: T r: (if (> g 0) s f)}) !- type
+(select {from: T r: (if (> g 0) f s)}) !- type
+(select {from: T r: (if (> g 0) s 5.5e)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 f)}) !- type
+(select {from: T r: (if (> g 0) s f) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s f) by: k}) !- type
+(update {from: T r: (if (> g 0) f s)}) !- type
+;; ── TIMESPAN and F64 ──
+(select {from: T r: (if (> g 0) s x)}) !- type
+(select {from: T r: (if (> g 0) x s)}) !- type
+(select {from: T r: (if (> g 0) s 5.5)}) !- type
+(select {from: T r: (if (> g 0) 0D01:00:00.000000000 x)}) !- type
+(select {from: T r: (if (> g 0) s x) where: (> e 15)}) !- type
+(select {from: T r: (if (> g 0) s x) by: k}) !- type
+(update {from: T r: (if (> g 0) x s)}) !- type
+
+;; ── computed arms, atom condition, nesting, cond, a call around the if ──
+(select {from: T r: (if (> g 0) (+ d 1) i)}) !- type
+(select {from: T r: (if (> g 0) e (+ p 1))}) !- type
+(select {from: T r: (if true d e)}) !- type
+(select {from: T r: (if (> g 0) (if (> e 15) d d) e)}) !- type
+(select {from: T r: (cond ((> g 0) d) (else e))}) !- type
+(select {from: T r: (+ 1 (if (> g 0) s e))}) !- type
+;; keyless and per-group aggregates, a by: key, a where: predicate
+(select {from: T r: (max (if (> g 0) d i))}) !- type
+(select {from: T r: (count (if (> g 0) d i))}) !- type
+(select {from: T r: (first (if (> g 0) d i)) by: k}) !- type
+(select {from: T r: (count e) by: (if (> g 0) d e)}) !- type
+(select {from: T r: e where: (> (if (> g 0) d e) 0)}) !- type
+;; update with where: and by:, and overwriting the column
+(update {from: T r: (if (> g 0) d e) where: (> e 15)}) !- type
+(update {from: T r: (if (> g 0) d e) by: k}) !- type
+(update {from: T d: (if (> g 0) d e)}) !- type
+
+;; ── arms the planner does not compile run per row or per group; their
+;; cells must not box into a LIST either ──
+(set V [1 2 3])
+(select {from: T r: (if (> g 0) d (at V 0))}) !- type
+(select {from: T r: (if (> g 0) d (count (distinct k)))}) !- type
+(update {from: T r: (if (> g 0) d (at V 0))}) !- type
+(select {from: T r: (if (> g 0) d (at [2024.01.01D00:00:00.000000000] 0))}) !- type
+(select {from: T r: (if (> g 0) d (at [0N] 0))}) !- type
+(R (select {from: T r: (if (> g 0) (at V 0) (at V 1))})) -- [2 1 1]
+;; only the `if` itself is judged: an `if` that picks an index inside a call
+;; does not own the call's values, whose cells stay as they were
+(set DV [2024.05.05])
+(R (select {from: T r: (at (enlist (at DV 0) 7) (if (> g 0) 0 1))})) -- (list 7 2024.05.05 2024.05.05)
+;; an `if` under a call is judged on its own cells, in select and update
+(select {from: T r: (+ 0 (if (> g 0) (at DV 0) i))}) !- type
+(update {from: T r: (+ 0 (if (> g 0) (at DV 0) i))}) !- type
+(select {from: T r: (+ 1 (if (> g 0) (at DV 0) (at [0Nl] 0)))}) !- type
+(select {from: T r: (+ 0 (if (> g 0) (at DV 0) (at [2024.01.01D00:00:00.000000000] 0)))}) !- type
+(R (select {from: T r: (+ 1 (if (> g 0) (at [5] 0) i))})) -- [11 6 6]
+;; a computed null is its arm's type, not a null literal: I64 beside DATE
+(select {from: T r: (if (> g 0) (at DV 0) (at [0Nl] 0))}) !- type
+(select {from: T r: (if (> g 0) (at DV 0) (> e 5) 5 (at DV 0))}) !- type
+;; null literals in a chain and in a nested `if` still take the DATE type
+(R (select {from: T r: (if (> g 0) (at DV 0) (> e 25) 0N (at DV 0))})) -- [2024.05.05 2024.05.05 2024.05.05]
+(R (select {from: T r: (if (> g 0) (if (> e 25) (at DV 0) 0N) 0Nd)})) -- [0Nd 0Nd 2024.05.05]
+;; a TIMESPAN computed from two times or timestamps is a temporal arm too
+(select {from: T r: (if (> g 0) (- p p) 5)}) !- type
+(select {from: T r: (if (> g 0) (- t t) e)}) !- type
+;; an if over aggregates under by: (group a takes one arm, group b the other).
+;; These routes run one arm per group, so the check reads the values the
+;; groups produced: a mix raises, one kind alone stands.
+(select {from: T by: k r: (if (> (count e) 1) (max d) 5)}) !- type
+(select {from: T by: k r: (if (> (count e) 1) 5 (max d))}) !- type
+(R (select {from: T by: k r: (if (> (count e) 1) (max d) 0N)})) -- [2024.01.02 0Nd]
+(R (select {from: T by: k r: (if (> (count e) 1) 0N (max p))})) -- [0Np 2024.01.01D03:00:00.000000000]
+
+;; ── unchanged: a null literal keeps the temporal type, either order ──
+(R (select {from: T r: (if (> g 0) d 0N)})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) 0N p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
+(R (select {from: T r: (if (> g 0) s 0Ni)})) -- [0Nn 0D02:00:00.000000000 0D03:00:00.000000000]
+(type (R (select {from: T r: (if (> g 0) t 0Nf)}))) -- 'TIME
+;; two numbers still promote, and the raw count is one cast away
+(R (select {from: T r: (if (> g 0) i 1.5)})) -- [1.5 20.0 30.0]
+(R (select {from: T r: (if (> g 0) (as 'I64 d) e)})) -- [10 8767 8768]
+(R (select {from: T r: (if (> g 0) (as 'I64 s) e)})) -- [10 7200000000000 10800000000000]
+
+;; ── a parted table ──
+(.sys.exec "rm -rf /tmp/rfl_if_temporal_numeric") -- 0
+(.db.splayed.set "/tmp/rfl_if_temporal_numeric/2024.01.01/t/" (table [g d e] (list [0 1] (+ 2024.01.01 (til 2)) [10 20])) "/tmp/rfl_if_temporal_numeric/.sym")
+(.db.splayed.set "/tmp/rfl_if_temporal_numeric/2024.01.02/t/" (table [g d e] (list [1 0] (+ 2024.01.05 (til 2)) [30 40])) "/tmp/rfl_if_temporal_numeric/.sym")
+(set P (.db.parted.get "/tmp/rfl_if_temporal_numeric" 't))
+(select {from: P r: (if (> g 0) d e)}) !- type
+(select {from: P r: (if true d e)}) !- type
+(select {from: P r: (if (> g 0) d (at [7] 0))}) !- type
+(select {from: P by: g r: (if (> (max e) 35) (max d) 5)}) !- type
+(R (select {from: P r: (if (> g 0) d 0N)})) -- [0Nd 2024.01.02 2024.01.05 0Nd]
+(.sys.exec "rm -rf /tmp/rfl_if_temporal_numeric") -- 0
+
+;; ── outside a query `if` is control flow: one arm is evaluated ──
+(if true 2024.01.01 5) -- 2024.01.01
+(if false 2024.01.01 5) -- 5
+
+
+;; ── per group, an `if` hoisted out of a call whose values come back as a
+;; LIST: the cells are judged against the query's own expression and table,
+;; not the hoisted copies, which are gone by then.  The `if` here is not the
+;; expression itself, so dev's LIST stays ──
+(set H (table ['g 'c 'i 'd] (list ['a 'a 'a 'b 'b 'b] [9 0 9 0 9 9] [1 2 3 4 5 6] (+ 2024.01.01 (til 6)))))
+(at (select {from: H by: g q: (at (list (max d) (sum i)) (at (if (> c 4) 0 1) 0))}) 'q) -- (list 2024.01.03 15)
+(at (select {from: H by: g q: (at (if (> c 4) d (+ d 1)) 0)}) 'q) -- [2024.01.01 2024.01.05]

@@ -226,8 +226,9 @@
 (R (select {from: T r: (if (> g 1) d (> g 0) d 0Np)})) -- [0Nd 2024.01.02 2024.01.03]
 (R (select {from: T r: (cond ((> g 0) p) (else p))})) -- [2024.01.01D01:00:00.000000000 2024.01.01D02:00:00.000000000 2024.01.01D03:00:00.000000000]
 
-;; ── a temporal beside a number still promotes, as before ────────────────────
-(R (select {from: T r: (if (> g 0) d i)})) -- [10 8767 8768]
+;; ── a temporal beside a number has no common type either (#1485) ────────────
+(select {from: T r: (if (> g 0) d i)}) !- type
+(R (select {from: T r: (if (> g 0) (as 'I64 d) i)})) -- [10 8767 8768]
 (R (select {from: T r: (if (> g 0) i 1.5)})) -- [1.5 20.0 30.0]
 
 ;; ── outside a query `if` is control flow: one arm is evaluated ──────────────

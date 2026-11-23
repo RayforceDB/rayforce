@@ -220,7 +220,9 @@
 ;; cells per row)
 (select {r: (if (> c 4) (+ d 1) t) from: Q}) !- type
 (try (select {r: (cond ((> c 4) (+ d 1)) (else d)) from: Q}) (fn [e] (at e 'msg))) -- "'cond' undefined"
-(repr (at (select {r: (if (> c 4) (+ t 1000) 0Nd) from: Q}) 'r)) -- "(list 0Nd 00:00:01.001 00:00:00.999 0Nd -596:31:22.647 0Nd 24:00:00.999)"
+;; a null literal beside a TIME arm is a TIME null, on this per-row route too
+;; (#1485; it boxed the cells with a DATE null)
+(repr (at (select {r: (if (> c 4) (+ t 1000) 0Nd) from: Q}) 'r)) -- "[0Nt 00:00:01.001 00:00:00.999 0Nt -596:31:22.647 0Nt 24:00:00.999]"
 (repr (at (select {r: (+ d 1) from: Q asc: r}) 'r)) -- "[0Nd 0Nd -5877611.06.24 2000.01.01 2000.01.02 2000.01.03 2024.01.02]"
 (at (update {r: (first (+ d 1)) from: Q by: g}) 'r) -- [2000.01.02 2000.01.03 2000.01.01 2000.01.02 2000.01.03 2000.01.01 2000.01.02]
 
