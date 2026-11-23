@@ -274,10 +274,12 @@ static test_result_t large_values(void) {
     /* a long vector, a long string, and an escape-heavy string whose decoded
      * form is a fraction of its text */
     size_t n = 200000;
-    char* t = malloc(n * 8 + 64);
-    size_t o = (size_t)sprintf(t, "[");
-    for (size_t i = 0; i < n; i++) o += (size_t)sprintf(t + o, "%zu ", i);
-    o += (size_t)sprintf(t + o, "]");
+    size_t cap = n * 8 + 64;
+    char* t = malloc(cap);
+    size_t o = (size_t)snprintf(t, cap, "[");
+    for (size_t i = 0; i < n; i++) o += (size_t)snprintf(t + o, cap - o, "%zu ", i);
+    o += (size_t)snprintf(t + o, cap - o, "]");
+    TEST_ASSERT_TRUE(o < cap);
     ray_t* r = ray_read_value(t, o, NULL);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->len, (int64_t)n);
