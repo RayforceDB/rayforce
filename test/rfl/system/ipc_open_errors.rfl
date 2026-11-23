@@ -10,31 +10,36 @@
 ;; port that fails instantly.
 ;;
 ;; Server lifecycle is shell-driven like ipc_diff.rfl (by pid, so no pattern
-;; can match the shell that runs it): a second rayforce
-;; on port 19976 whose script sleeps, so the listener is up (-p binds
-;; before the script runs) and nobody serves the handshake.  The sleep it
-;; shells out to inherits the listening socket, so the teardown kills the
-;; server's children (and theirs) before the server, or the port would
-;; stay open until the sleep ends.
-(.sys.exec "[ -f /tmp/rfl_ipc_deaf.pid ] && kill $(cat /tmp/rfl_ipc_deaf.pid) 2>/dev/null; rm -f /tmp/rfl_ipc_deaf.pid; true")
-(.sys.exec "printf '(.sys.exec \"sleep 6\")\n' > /tmp/rfl_ipc_deaf.rfl")
-(.sys.exec "./rayforce -p 19976 /tmp/rfl_ipc_deaf.rfl </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_ipc_deaf.pid")
+;; can match the shell that runs it, or another suite's): a second rayforce
+;; on a free port of its own (test/serve.sh --listen, #1140) whose script
+;; reads a FIFO nobody writes, so the listener is up (-p binds before the
+;; script runs) and nobody serves the handshake until the teardown kills the
+;; server.  The block is in the server itself, not in a timed child: a sleep
+;; ends on its own clock, and once readiness detection took longer than the
+;; sleep (lsof on macOS counted the sleep, which inherits the listening
+;; socket, as a second listener) the server was answering before the first
+;; open.  The refused connect goes to a port nothing listens on (serve.sh
+;; --port).
+(.sys.exec "rm -rf /tmp/rfl_ipc_deaf; mkdir -p /tmp/rfl_ipc_deaf; mkfifo /tmp/rfl_ipc_deaf/block; printf '(read \"/tmp/rfl_ipc_deaf/block\")\n' > /tmp/rfl_ipc_deaf.rfl") -- 0
 ;; the kernel accepts into the backlog even though nobody answers
-(.sys.exec "for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --listen /tmp/rfl_ipc_deaf/srv /tmp/rfl_ipc_deaf.rfl") -- 0
+(.sys.exec "test/serve.sh --port > /tmp/rfl_ipc_deaf/free") -- 0
+(set deaf (format "127.0.0.1:%" (trim (read "/tmp/rfl_ipc_deaf/srv/port"))))
+(set dead (format "127.0.0.1:%" (trim (read "/tmp/rfl_ipc_deaf/free"))))
 
-(.sys.exec "printf '(println (.ipc.open \"127.0.0.1:19976\" 300))\n' > /tmp/rfl_ipc_c1.rfl")
-(.sys.exec "printf '(println (.ipc.open \"127.0.0.1:19975\" 300))\n' > /tmp/rfl_ipc_c2.rfl")
-(.sys.exec "printf '(println (.ipc.open \"no-such-host.invalid:19975\" 300))\n' > /tmp/rfl_ipc_c3.rfl")
+(.sys.exec "D=/tmp/rfl_ipc_deaf; printf '(println (.ipc.open \"127.0.0.1:%s\" 300))\n' $(cat $D/srv/port) > /tmp/rfl_ipc_c1.rfl")
+(.sys.exec "D=/tmp/rfl_ipc_deaf; printf '(println (.ipc.open \"127.0.0.1:%s\" 300))\n' $(cat $D/free) > /tmp/rfl_ipc_c2.rfl")
+(.sys.exec "D=/tmp/rfl_ipc_deaf; printf '(println (.ipc.open \"no-such-host.invalid:%s\" 300))\n' $(cat $D/free) > /tmp/rfl_ipc_c3.rfl")
 
 ;; listening but not answering: the budget expires, and the line says so
-(.ipc.open "127.0.0.1:19976" 300) !- io
-(.sys.exec "./rayforce /tmp/rfl_ipc_c1.rfl </dev/null 2>&1 | grep -q 'error: io: connection timed out: 127.0.0.1:19976'") -- 0
+(.ipc.open deaf 300) !- io
+(.sys.exec "D=/tmp/rfl_ipc_deaf; ./rayforce /tmp/rfl_ipc_c1.rfl </dev/null 2>&1 | grep -q \"error: io: connection timed out: 127.0.0.1:$(cat $D/srv/port)\"") -- 0
 
 ;; nothing bound: refused, and instantly
-(.ipc.open "127.0.0.1:19975" 300) !- io
-(.sys.exec "./rayforce /tmp/rfl_ipc_c2.rfl </dev/null 2>&1 | grep -q 'error: io: connection refused: 127.0.0.1:19975'") -- 0
+(.ipc.open dead 300) !- io
+(.sys.exec "D=/tmp/rfl_ipc_deaf; ./rayforce /tmp/rfl_ipc_c2.rfl </dev/null 2>&1 | grep -q \"error: io: connection refused: 127.0.0.1:$(cat $D/free)\"") -- 0
 
 ;; a host that does not resolve is neither
-(.sys.exec "./rayforce /tmp/rfl_ipc_c3.rfl </dev/null 2>&1 | grep -q 'error: io: connect failed: no-such-host.invalid:19975: '") -- 0
+(.sys.exec "D=/tmp/rfl_ipc_deaf; ./rayforce /tmp/rfl_ipc_c3.rfl </dev/null 2>&1 | grep -q \"error: io: connect failed: no-such-host.invalid:$(cat $D/free): \"") -- 0
 
-(.sys.exec "p=$(cat /tmp/rfl_ipc_deaf.pid); for c in $(pgrep -P $p); do pkill -KILL -P $c; kill -KILL $c; done 2>/dev/null; kill $p 2>/dev/null; for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19976) 2>/dev/null' || break; sleep 0.1; done; rm -f /tmp/rfl_ipc_deaf.pid /tmp/rfl_ipc_deaf.rfl /tmp/rfl_ipc_c1.rfl /tmp/rfl_ipc_c2.rfl /tmp/rfl_ipc_c3.rfl; true")
+(.sys.exec "D=/tmp/rfl_ipc_deaf; test/serve.sh --stop $D/srv KILL; rm -rf $D /tmp/rfl_ipc_deaf.rfl /tmp/rfl_ipc_c1.rfl /tmp/rfl_ipc_c2.rfl /tmp/rfl_ipc_c3.rfl; true")

@@ -7,12 +7,11 @@
 ;; .qdb, and that a corrupted .log triggers the badtail exit (rc=2)
 ;; with a recoverable hint.
 ;;
-;; Port: 19990 (fixed, picked to avoid collision with ipc_diff at
-;; 19999 — `make test` is sequential so two server processes cannot
-;; coexist on the same port anyway).
+;; Servers: each start takes a free port of its own and is stopped by its
+;; pid (test/serve.sh), so suites running at once never meet (#1140).
 ;;
-;; Readiness probe: each restart waits for the server by COMPLETING AN IPC
-;; HANDSHAKE (send the 2-byte version frame, read a response byte), not by a
+;; Readiness probe (test/serve.sh): each restart waits for the server by
+;; COMPLETING AN IPC HANDSHAKE (send the 2-byte version frame, read a response byte), not by a
 ;; bare TCP connect.  A bare `echo > /dev/tcp` only proves listen(2) succeeded,
 ;; which is reached before the server is actually accepting+handshaking; on the
 ;; slow macOS-debug runner that gap let the probe report "ready" while the very
@@ -35,14 +34,13 @@
 ;; operators do anyway: kill -TERM <pid>, not a chat-loop shutdown.
 
 ;; ── pre-flight: kill any stragglers, clear log files ────────────────
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_journal' 2>/dev/null; true")
 (.sys.exec "sleep 0.2; rm -f /tmp/rftest_journal*")
 
 ;; ── phase 1: spawn server with -l, send mutations, kill ─────────────
-(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jsrv/s1 -l /tmp/rftest_journal") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jsrv/s1/port"))))
 
-(set h (.ipc.open "127.0.0.1:19990"))
+(set h (.ipc.open addr))
 (>= h 0) -- true
 
 ;; Plain user globals — assert each set returns the bound value.
@@ -57,10 +55,9 @@
 (.ipc.close h)
 ;; SIGTERM the server externally.  We don't .ipc.send "(exit 0)"
 ;; because that message itself would be journaled and re-run on
-;; replay, killing server 2.  Wait for the process to actually exit
-;; (`pgrep -f` returns rc=1 when nothing matches) before continuing.
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+;; replay, killing server 2.  `serve.sh --stop` waits for the process
+;; to actually exit before continuing.
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jsrv/s1 TERM") -- 0
 
 ;; The log file must contain the four entries we sent.  We don't pin
 ;; an exact byte count (depends on serde encoding) — just assert
@@ -69,10 +66,10 @@
 (.sys.exec "test -s /tmp/rftest_journal.log") -- 0
 
 ;; ── phase 2: restart, assert replay restored a/b/c/d ────────────────
-(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jsrv/s2 -l /tmp/rftest_journal") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jsrv/s2/port"))))
 
-(set h2 (.ipc.open "127.0.0.1:19990"))
+(set h2 (.ipc.open addr))
 (>= h2 0) -- true
 
 ;; All four user globals must be restored from the replayed log.
@@ -106,20 +103,18 @@
 (>= (first v) 1) -- true
 
 (.ipc.close h2)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jsrv/s2 TERM") -- 0
 
 ;; ── phase 3: restart, assert state survived via .qdb (not .log) ─────
-(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19990 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jsrv/s3 -l /tmp/rftest_journal") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jsrv/s3/port"))))
 
-(set h3 (.ipc.open "127.0.0.1:19990"))
+(set h3 (.ipc.open addr))
 (.ipc.send h3 "a") -- 100
 (.ipc.send h3 "d") -- 101
 
 (.ipc.close h3)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_journal -p 19990' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -l /tmp/rftest_journal -p 19990' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jsrv/s3 TERM") -- 0
 
 ;; ── phase 4: corruption is fatal (rc=2 with badtail message) ────────
 ;; The post-snapshot fresh log holds at least one frame from phase 2.5
@@ -128,11 +123,10 @@
 ;; must exit with rc=2 — main.c special-cases badtail with that code
 ;; so a supervisor can distinguish it from any other startup failure.
 (.sys.exec "truncate -s -4 /tmp/rftest_journal.log")
-(.sys.exec "./rayforce -l /tmp/rftest_journal -p 19990 </dev/null >/dev/null 2>&1; test $? -eq 2") -- 0
+(.sys.exec "./rayforce -l /tmp/rftest_journal -p $(test/serve.sh --port) </dev/null >/dev/null 2>&1; test $? -eq 2") -- 0
 
 ;; ── teardown ────────────────────────────────────────────────────────
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_journal' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_journal*")
+(.sys.exec "rm -f /tmp/rftest_journal*; rm -rf /tmp/rfl_jsrv")
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; In-process verb coverage — drive the .log.* wrappers in

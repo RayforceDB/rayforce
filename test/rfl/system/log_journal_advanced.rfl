@@ -13,6 +13,9 @@
 ;; Phase E: closure-bearing functions saved in a snapshot survive restart
 
 ;; ── IPC connect with handshake-level retry ──────────────────────────
+;; Servers take a free port of their own and are stopped by their pid
+;; (test/serve.sh, which also waits for a handshake), so suites running at
+;; once never meet (#1140).  The retry below stays as a second guard.
 ;; A /dev/tcp probe reports ready the instant the server calls listen(),
 ;; but a server restarted on a journal base is still replaying when the
 ;; port first accepts SYNs — an .ipc.open landing in that window gets
@@ -31,30 +34,28 @@
 ;; current test suite would not notice.  Use kill -9 (no clean
 ;; shutdown, no fclose, no fflush) so only the on-disk bytes count.
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_jdura' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jdura*")
-(.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s1 -L /tmp/rftest_jdura") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s1/port"))))
 
-(set hA (wait_ipc "127.0.0.1:19991" 50))
+(set hA (wait_ipc addr 50))
 (.ipc.send hA "(set durable_a 7)") -- 7
 (.ipc.send hA "(set durable_b \"survived\")") -- "survived"
 (.ipc.close hA)
 
 ;; SIGKILL — no atexit, no fclose, no fflush.  Only the bytes the
 ;; SYNC fsync put on disk count.
-(.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_jdura -p 19991' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -L /tmp/rftest_jdura -p 19991' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s1 KILL") -- 0
 
 ;; Restart with -L on the same base.  Both bindings must come back.
-(.sys.exec "./rayforce -L /tmp/rftest_jdura -p 19991 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19991) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s2 -L /tmp/rftest_jdura") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s2/port"))))
 
-(set hA2 (wait_ipc "127.0.0.1:19991" 50))
+(set hA2 (wait_ipc addr 50))
 (.ipc.send hA2 "durable_a") -- 7
 (.ipc.send hA2 "durable_b") -- "survived"
 (.ipc.close hA2)
-(.sys.exec "pkill -KILL -f '[r]ayforce -L /tmp/rftest_jdura' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s2 KILL") -- 0
 (.sys.exec "rm -f /tmp/rftest_jdura*")
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -67,12 +68,11 @@
 ;; log_journal test only writes fresh user globals (a/b/c/d) and
 ;; would miss the regression silently.
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jovr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jovr*")
-(.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s3 -l /tmp/rftest_jovr") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s3/port"))))
 
-(set hB (wait_ipc "127.0.0.1:19992" 50))
+(set hB (wait_ipc addr 50))
 ;; Override the `+` builtin with a sentinel integer, then snapshot.
 ;; The snapshot's .qdb must contain `+` -> 42 so phase-B-restart can
 ;; load it from .qdb (not from log replay, which is also rolled).
@@ -80,17 +80,16 @@
 (.ipc.send hB "+") -- 42
 (.ipc.send hB "(.log.snapshot)")
 (.ipc.close hB)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jovr -p 19992' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jovr -p 19992' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s3 TERM") -- 0
 
-(.sys.exec "./rayforce -l /tmp/rftest_jovr -p 19992 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19992) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s4 -l /tmp/rftest_jovr") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s4/port"))))
 
-(set hB2 (wait_ipc "127.0.0.1:19992" 50))
+(set hB2 (wait_ipc addr 50))
 ;; The override must have survived the .qdb roundtrip.
 (.ipc.send hB2 "+") -- 42
 (.ipc.close hB2)
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jovr' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s4 KILL") -- 0
 (.sys.exec "rm -f /tmp/rftest_jovr*")
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -102,12 +101,11 @@
 ;; third.  Without the documented hybrid policy the whole replay
 ;; would abort and surviving server would not have c1 / c3 set.
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jerr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jerr*")
-(.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s5 -l /tmp/rftest_jerr") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s5/port"))))
 
-(set hC (wait_ipc "127.0.0.1:19993" 50))
+(set hC (wait_ipc addr 50))
 (.ipc.send hC "(set c1 100)") -- 100
 ;; This one errors on the server (undefined `not_a_thing`) — the
 ;; .ipc.send returns an error response, but the inbound message was
@@ -115,20 +113,19 @@
 (try (.ipc.send hC "(set c2 not_a_thing)") (fn [e] 0))
 (.ipc.send hC "(set c3 300)") -- 300
 (.ipc.close hC)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jerr -p 19993' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jerr -p 19993' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s5 TERM") -- 0
 
-(.sys.exec "./rayforce -l /tmp/rftest_jerr -p 19993 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19993) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s6 -l /tmp/rftest_jerr") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s6/port"))))
 
-(set hC2 (wait_ipc "127.0.0.1:19993" 50))
+(set hC2 (wait_ipc addr 50))
 (.ipc.send hC2 "c1") -- 100
 ;; c2 is expected to be undefined (the bad replay entry was warn-
 ;; skipped, not applied).  Use try to catch the undefined-name error.
 (try (.ipc.send hC2 "c2") (fn [e] "missing")) -- "missing"
 (.ipc.send hC2 "c3") -- 300
 (.ipc.close hC2)
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jerr' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s6 KILL") -- 0
 (.sys.exec "rm -f /tmp/rftest_jerr*")
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -138,17 +135,14 @@
 ;; Letting the payload call .log.write as well would persist nested
 ;; writes in addition to the already-logged outer request.
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jwr*")
-(.sys.exec "./rayforce -l /tmp/rftest_jwr -p 19994 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19994) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s7 -l /tmp/rftest_jwr") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s7/port"))))
 
-(set hD (wait_ipc "127.0.0.1:19994" 50))
+(set hD (wait_ipc addr 50))
 (.ipc.send hD "(.log.write \"(set d1 999)\")") !- domain
 (.ipc.close hD)
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jwr -p 19994' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jwr' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s7 TERM") -- 0
 (.sys.exec "rm -f /tmp/rftest_jwr*")
 
 ;; ════════════════════════════════════════════════════════════════════
@@ -158,26 +152,24 @@
 ;; The binding should be callable after the .qdb restore, before any
 ;; post-snapshot log tail can recreate it.
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jsnapfn' 2>/dev/null; true")
 (.sys.exec "rm -f /tmp/rftest_jsnapfn*")
-(.sys.exec "./rayforce -l /tmp/rftest_jsnapfn -p 19995 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s8 -l /tmp/rftest_jsnapfn") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s8/port"))))
 
-(set hE (wait_ipc "127.0.0.1:19995" 50))
+(set hE (wait_ipc addr 50))
 (.ipc.send hE "(set snapshot_inc ((fn [offset] (fn [x] (+ x offset))) 1))")
 (.ipc.send hE "(snapshot_inc 41)") -- 42
 (.ipc.send hE "(.log.snapshot)")
 (.ipc.close hE)
 (.sys.exec "test -s /tmp/rftest_jsnapfn.qdb") -- 0
-(.sys.exec "pkill -TERM -f '[r]ayforce -l /tmp/rftest_jsnapfn -p 19995' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 150); do pgrep -f '[r]ayforce -l /tmp/rftest_jsnapfn -p 19995' >/dev/null || exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s8 TERM") -- 0
 (.sys.exec "rm -f /tmp/rftest_jsnapfn.log") -- 0
 
-(.sys.exec "./rayforce -l /tmp/rftest_jsnapfn -p 19995 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 150); do bash -c '(echo > /dev/tcp/127.0.0.1/19995) 2>/dev/null' && exit 0; sleep 0.02; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rfl_jasrv/s9 -l /tmp/rftest_jsnapfn") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rfl_jasrv/s9/port"))))
 
-(set hE2 (wait_ipc "127.0.0.1:19995" 50))
+(set hE2 (wait_ipc addr 50))
 (.ipc.send hE2 "(snapshot_inc 41)") -- 42
 (.ipc.close hE2)
-(.sys.exec "pkill -KILL -f '[r]ayforce -l /tmp/rftest_jsnapfn' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_jsnapfn*")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_jasrv/s9 KILL") -- 0
+(.sys.exec "rm -f /tmp/rftest_jsnapfn*; rm -rf /tmp/rfl_jasrv")

@@ -7,17 +7,14 @@
 ;; asserts the rows were captured with correct stats.  Mirrors the spawn /
 ;; handshake-probe / teardown pattern of log_journal.rfl.
 ;;
-;; Port 19988 (fixed; `make test` is sequential so no coexisting server).
-
-;; ── pre-flight: kill any stragglers ─────────────────────────────────
-(.sys.exec "pkill -KILL -f '[r]ayforce -Q 1 -p 19988' 2>/dev/null; true")
-(.sys.exec "sleep 0.2; true")
+;; The server takes a free port of its own and is stopped by its pid
+;; (test/serve.sh), so suites running at once never meet (#1140).
 
 ;; ── spawn server with query logging on ──────────────────────────────
-(.sys.exec "./rayforce -Q 1 -p 19988 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19988 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "rm -rf /tmp/rfl_qlog_ipc")
+(.sys.exec "test/serve.sh /tmp/rfl_qlog_ipc -Q 1") -- 0
 
-(set h (.ipc.open "127.0.0.1:19988"))
+(set h (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_qlog_ipc/port")))))
 (>= h 0) -- true
 
 ;; ── drive some traffic: a scalar, a many-row result, and an error ───
@@ -50,5 +47,5 @@
 (.ipc.close h)
 
 ;; ── teardown: SIGTERM the server, wait for exit ─────────────────────
-(.sys.exec "pkill -TERM -f '[r]ayforce -Q 1 -p 19988' 2>/dev/null; true")
-(.sys.exec "for i in $(seq 30); do pgrep -f '[r]ayforce -Q 1 -p 19988' >/dev/null || exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rfl_qlog_ipc") -- 0
+(.sys.exec "rm -rf /tmp/rfl_qlog_ipc")

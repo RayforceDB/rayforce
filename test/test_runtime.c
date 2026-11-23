@@ -1500,8 +1500,18 @@ static test_result_t test_syscov_hopen_domain_errors(void) {
 /* hopen with user:password parts (lines 799-807 of system.c) */
 static test_result_t test_syscov_hopen_with_credentials(void) {
     /* connection to non-existent server; covers the user/password extraction
-     * branch (lines 799-807) even though the connect attempt fails with io */
-    TEST_ASSERT_TRUE(eval_err("(.ipc.open \"127.0.0.1:19974:user:pass\")", "io"));
+     * branch (lines 799-807) even though the connect attempt fails with io.
+     * The port is one the kernel just handed out and took back, not a fixed
+     * one another suite's server could hold (#1140). */
+    ray_sock_t srv = ray_sock_listen(0);
+    if (srv == RAY_INVALID_SOCK) SKIP("could not open listen socket");
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    getsockname((int)srv, (struct sockaddr*)&addr, &alen);
+    ray_sock_close(srv);
+    char q[96];
+    snprintf(q, sizeof q, "(.ipc.open \"127.0.0.1:%u:user:pass\")", (unsigned)ntohs(addr.sin_port));
+    TEST_ASSERT_TRUE(eval_err(q, "io"));
     PASS();
 }
 

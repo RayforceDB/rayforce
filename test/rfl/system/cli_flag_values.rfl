@@ -34,7 +34,7 @@
 (.sys.exec "./rayforce -u -s3cret -t -1 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; grep -q 'script ran' /tmp/rfl_cfv.out") -- 0
 
 ;; ---- the -Q that #600 was reached through still works, and still binds ----
-(.sys.exec "./rayforce -Q 1 -p 19965 /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv2.out 2>&1 & p=$!; for i in $(seq 50); do grep -q 'script ran' /tmp/rfl_cfv2.out && break; sleep 0.1; done; bash -c '(echo > /dev/tcp/127.0.0.1/19965) 2>/dev/null'; rc=$?; kill $p 2>/dev/null; [ $rc -eq 0 ]") -- 0
+(.sys.exec "P=$(test/serve.sh --port); ./rayforce -Q 1 -p $P /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv2.out 2>&1 & p=$!; for i in $(seq 50); do grep -q 'script ran' /tmp/rfl_cfv2.out && break; sleep 0.1; done; bash -c \"(echo > /dev/tcp/127.0.0.1/$P) 2>/dev/null\"; rc=$?; kill $p 2>/dev/null; [ $rc -eq 0 ]") -- 0
 
 ;; the app-args terminator is not a value either
 (.sys.exec "./rayforce -Q -- /tmp/rfl_cfv.rfl </dev/null >/tmp/rfl_cfv.out 2>&1; rc=$?; grep -q \"\\-Q expects a value, got flag '--'\" /tmp/rfl_cfv.out || exit 98; [ $rc -eq 2 ]") -- 0
