@@ -325,25 +325,6 @@ static inline ray_t* collection_elem(ray_t* coll, int64_t i, int *allocated) {
     }
 }
 
-/* True when a value of type vt is stored into a vector or column of type ct
- * without loss: the same type, or a widening.  The widenings: BOOL and U8
- * into any wider integer or float, I16 into I32 / I64 / F32 / F64, I32 into
- * I64 / F64, I64 into F64 (an integer literal into a float vector), F32 into
- * F64.  Both types are positive (vector types).  update and alter set share
- * this rule (#1458, #1513). */
-static inline bool ray_type_widens(int8_t ct, int8_t vt) {
-    if (vt == ct) return true;
-    switch (vt) {
-    case RAY_BOOL: return ct == RAY_U8 || ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_U8:   return ct == RAY_I16 || ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_I16:  return ct == RAY_I32 || ct == RAY_I64 || ct == RAY_F32 || ct == RAY_F64;
-    case RAY_I32:  return ct == RAY_I64 || ct == RAY_F64;
-    case RAY_I64:  return ct == RAY_F64;
-    case RAY_F32:  return ct == RAY_F64;
-    default:       return false;
-    }
-}
-
 /* Extract a value from an atom for storage, handling cross-type casting.
  * Returns the value as int64_t (for integer/temporal types). */
 static inline int64_t elem_as_i64(ray_t* elem) {
