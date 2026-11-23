@@ -5604,11 +5604,17 @@ static test_result_t test_anon_watermark_spill(void) {
     SKIP("file-backed spill is POSIX-only");
 #endif
     size_t sz = 40 * 1024 * 1024 - 128;   /* order 26 → direct path */
-    /* Start from an empty reuse cache: leftover cached blocks from earlier
-     * tests would (a) inflate the baseline and (b) be drained by the
-     * second alloc's pressure path, freeing enough headroom for it to stay
-     * anonymous instead of spilling. */
-    ray_heap_direct_cache_drain();
+    /* Start from nothing the second alloc's crossing could give back.  A
+     * block about to cross the watermark first makes room (heap_make_room):
+     * it drains the direct-block cache, then unmaps the empty anonymous
+     * pools of this thread's heap, then those of the parked pool workers'.
+     * Whatever earlier tests in this process left there would (a) be counted
+     * in the baseline and gone after the frees, and (b) free enough headroom
+     * for the second alloc to stay anonymous instead of spilling (#1164, #1555).
+     * Cross a watermark of one byte once here, with a block that spills: no
+     * step makes it fit, so every step runs before the baseline is read. */
+    ray_heap_set_anon_watermark(1);
+    ray_sys_free(ray_sys_alloc((size_t)1 << 20));   /* RAY_SYS_SPILL_MIN */
     int64_t base = ray_heap_anon_committed();
     /* Each direct map is 41.94 MiB including its header and page rounding.
      * Base 42 MiB: above the first allocation alone, below two of them.
@@ -5664,6 +5670,18 @@ static test_result_t test_anon_watermark_spill(void) {
     /* Counter returns to baseline once both are freed. */
     TEST_ASSERT_EQ_I(ray_heap_anon_committed(), base);
     PASS();
+}
+
+/* The same on a heap an earlier test left with empty pools: the second
+ * block's crossing makes room (heap_make_room), and the pools it unmaps
+ * must not read as a shortfall against the base. */
+static test_result_t test_anon_watermark_spill_after_empty_pools(void) {
+    ray_t* b[3];
+    for (int i = 0; i < 3; i++) b[i] = ray_alloc(RELIEVE_HALF);   /* a pool each */
+    bool mapped = b[0] && b[1] && b[2];
+    for (int i = 0; i < 3; i++) if (b[i]) ray_free(b[i]);
+    TEST_ASSERT(mapped, "three pools mapped");
+    return test_anon_watermark_spill();
 }
 
 /* ---- Locking the heap against swap (heap_lock) ------------------------- *
@@ -6849,6 +6867,7 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
+    { "heap/anon_watermark_spill_after_empty_pools", test_anon_watermark_spill_after_empty_pools, heap_setup, heap_teardown },
     { "heap/lock_pool_under_watermark", test_lock_pool_under_watermark, heap_setup, heap_teardown },
     { "heap/lock_not_past_watermark",  test_lock_not_past_watermark,      heap_setup, heap_teardown },
     { "heap/lock_release_pages",       test_lock_release_pages,           heap_setup, heap_teardown },
