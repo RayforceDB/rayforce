@@ -1725,6 +1725,27 @@ ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
     return cow_result ? cow_result : ray_error("oom", NULL);
 }
 
+/* A FILE-domain SYM vector re-expressed in the runtime domain: a new W64
+ * vector of runtime ids (they do not fit a narrow file width), nulls kept.
+ * The file's vocabulary is interned on the first request for its lookup
+ * table; the file itself is never written.  Borrows `v`. */
+static ray_t* alter_sym_to_runtime(ray_t* v) {
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(v);
+    const int64_t* lut = ray_sym_domain_runtime_lut(dom);
+    if (!lut) return ray_error("oom", NULL);
+    int64_t cnt = ray_sym_domain_count(dom);
+    ray_t* nv = ray_sym_vec_new(RAY_SYM_W64, v->len);
+    if (!nv || RAY_IS_ERR(nv)) return nv;
+    nv->len = v->len;
+    int64_t* out = (int64_t*)ray_data(nv);
+    for (int64_t r = 0; r < v->len; r++) {
+        int64_t p = ray_read_sym(ray_data(v), r, RAY_SYM, v->attrs);
+        out[r] = (p >= 0 && p < cnt) ? lut[p] : 0;
+    }
+    if (v->attrs & RAY_ATTR_HAS_NULLS) nv->attrs |= RAY_ATTR_HAS_NULLS;
+    return nv;
+}
+
 /* Store one cell for `alter ... set`.  A STR vector holds pool-backed cells
  * that store_typed_elem cannot write (it returns -1, which the caller used to
  * drop, so the write was a silent no-op); route it through ray_str_vec_set,
@@ -1745,8 +1766,25 @@ ray_t* ray_alter_set_cow_fail(ray_t* original_var, ray_t* cow_result,
  * to release exactly once. */
 static ray_t* alter_store_cell(ray_t* var, int64_t i, ray_t* elem) {
     if (var->type != RAY_STR) {
-        store_typed_elem(var, i, elem);
-        return var;
+        if (store_typed_elem(var, i, elem) == 0) return var;
+        /* store_typed_elem declines a symbol that a FILE-domain SYM vector's
+         * file does not hold (or whose position does not fit the vector's
+         * width); dropping that -1 lost the write without an error (#1494).
+         * Move the vector to the runtime domain, as a dict upsert does for
+         * its keys, and write the symbol there. */
+        if (var->type == RAY_SYM && elem && elem->type == -RAY_SYM &&
+            ray_sym_vec_domain(var) != ray_sym_runtime_domain()) {
+            ray_t* rv = alter_sym_to_runtime(var);
+            ray_release(var);
+            if (!rv || RAY_IS_ERR(rv)) return rv ? rv : ray_error("oom", NULL);
+            if (store_typed_elem(rv, i, elem) == 0) return rv;
+            var = rv;
+        }
+        const char* vn = ray_type_name(var->type);
+        const char* tn = elem ? ray_type_name(elem->type) : "null";
+        ray_t* err = ray_error("type", "alter set: cannot store %s in a %s vector", tn, vn);
+        ray_release(var);
+        return err;
     }
     if (!elem || elem->type != -RAY_STR) {
         const char* tn = elem ? ray_type_name(elem->type) : "null";
