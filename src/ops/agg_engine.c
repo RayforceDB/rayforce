@@ -11387,19 +11387,6 @@ static void agg_index_vectors_run(void* raw, uint32_t wid, int64_t start, int64_
         c->values[g] = value;
     }
 }
-/* Only direct LIST group opts in, with the same eligibility as serial group. */
-static int agg_group_list_hash_mode(ray_t* source) {
-    ray_t* const* cells = ray_data(source);
-    for (int64_t i = 0; i < source->len; i++) {
-        ray_t* cell = cells[i];
-        if (!cell) continue;
-        if (cell->type < 0) {
-            if (cell->type == -RAY_F32 || cell->type == -RAY_F64 || cell->type == -RAY_TIMESPAN) return 0;
-        } else if (ray_key_spans(cell) || !ray_key_float_free(cell)) return 0;
-    }
-    return RAY_KEY_EXACT_INT;
-}
-
 ray_t* agg_group_indices(ray_t* source) {
     ray_pool_t* pool = ray_pool_get();
     int64_t n = source->len;
@@ -11416,7 +11403,7 @@ ray_t* agg_group_indices(ray_t* source) {
     bool dense = agg_dense_plan(&source, 1, NULL, 0, n, &plan);
     int rc = dense ? agg_group_keys_dense(&source, n, &plan, &groups)
                    : agg_group_keys_mode(&source, 1, n,
-                                         source->type == RAY_LIST ? agg_group_list_hash_mode(source) : 0,
+                                         source->type == RAY_LIST ? RAY_KEY_EXACT_INT : 0,
                                          &groups);
     if (rc) return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
     int64_t ng = groups.ngroups;
@@ -13825,14 +13812,25 @@ static int agg_group_keys_parallel(ray_t** keys, uint32_t nkeys, int64_t rows,
     uint64_t init_bytes = ((uintptr_t)c.first & (AGG_DIRECTORY_INIT_BYTES - 1)) + (uint64_t)cap * entry_size;
     c.init_pages = (init_bytes + AGG_DIRECTORY_INIT_BYTES - 1) / AGG_DIRECTORY_INIT_BYTES;
     c.init_tasks = c.init_pages < tasks ? (uint32_t)c.init_pages : tasks;
+retry_insert:
     if (c.init_tasks == 1) agg_key_directory_init(&c, 0, 0, 1);
     else ray_pool_dispatch_n(pool, agg_key_directory_init, &c, c.init_tasks);
     ray_profile_tick("directory: initialized");
     ray_pool_dispatch(pool, agg_key_directory_insert, &c, rows);
     ray_profile_tick("directory: inserted keys");
     if (agg_cancelled()) goto done;
-    if (atomic_load(&c.spanned) ||
-        atomic_load(&c.inexact) == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) { rc = AGG_KEYS_SERIAL; goto done; }
+    uint8_t inexact = atomic_load(&c.inexact);
+    if (atomic_load(&c.spanned) || inexact == (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) {
+        rc = AGG_KEYS_SERIAL;
+        goto done;
+    }
+    if (c.hash_mode == RAY_KEY_EXACT_INT && (inexact & RAY_KEY_FLOAT)) {
+        /* Reinitialize the slots; insert overwrites every row's slot,
+         * and group counts have not been computed yet. */
+        c.hash_mode = 0;
+        atomic_store_explicit(&c.inexact, 0, memory_order_relaxed);
+        goto retry_insert;
+    }
     ray_pool_dispatch_n(pool, agg_key_directory_count, &c, tasks);
     ray_profile_tick("directory: counted groups");
     if (agg_cancelled()) goto done;
