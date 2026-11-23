@@ -13601,16 +13601,22 @@ static void agg_distinct_indexed_run(void* raw, uint32_t wid, int64_t start, int
             int64_t n = c->counts[g];
             uint64_t size = 16;
             while (size < (uint64_t)n * 2) size *= 2;
-            int spans = 0;
-            bool seen = false;
+            int mode = RAY_KEY_EXACT_INT;
             int64_t distinct;
         rehash:
             memset(entries, 0, (size_t)size * sizeof(int64_t));
             distinct = 0;
             for (int64_t i = 0; i < n; i++) {
                 ray_t* x = cells[rows[i]];
-                uint64_t h = ray_key_hash_view(x, spans, &c->symbols, spans ? NULL : &seen, NULL), slot = h & (size - 1);
-                if (RAY_UNLIKELY(seen)) { seen = false; spans = agg_list_spans(cells, rows, n); goto rehash; }
+                bool seen = false;
+                uint8_t inexact = 0;
+                uint64_t h = ray_key_hash_view(x, mode, &c->symbols,
+                    mode & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC) ? NULL : &seen,
+                    mode == RAY_KEY_EXACT_INT ? &inexact : NULL);
+                /* Restart this group from row zero, not just its survivors. */
+                if (RAY_UNLIKELY(seen)) { mode = agg_list_spans(cells, rows, n); goto rehash; }
+                if (RAY_UNLIKELY(inexact & RAY_KEY_FLOAT)) { mode = 0; goto rehash; }
+                uint64_t slot = h & (size - 1);
                 while (entries[slot] && (hashes[slot] != h || !agg_cell_eq(cells[entries[slot] - 1], x)))
                     slot = (slot + 1) & (size - 1);
                 if (!entries[slot]) { entries[slot] = rows[i] + 1; hashes[slot] = h; distinct++; }
