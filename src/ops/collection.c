@@ -3319,7 +3319,8 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
     return result;
 }
 
-/* (union vec1 vec2) — elements in vec1 + elements in vec2 not already in vec1 */
+/* (union vec1 vec2) — a set: the distinct elements of vec1, then those of vec2 that
+ * vec1 lacks, each once, in order of first appearance. */
 ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     if (ray_is_lazy(vec1)) vec1 = ray_lazy_materialize(vec1);
     if (ray_is_lazy(vec2)) vec2 = ray_lazy_materialize(vec2);
@@ -3347,10 +3348,60 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
-        for (int64_t j = 0; j < k1->len; j++) hashset_insert(&hs, j);
+        /* A union is a set: the rows of vec1 that are not an earlier row's duplicate
+         * come first, in their order, then the rows of vec2 that vec1 lacks, once each.
+         * idx1 is only built when vec1 holds a duplicate. */
+        int64_t* idx1 = NULL;
+        int64_t kept1 = 0;
+        /* The rows of vec1 are told apart by their own cells.  Its keys (a span/point
+         * pair) are what vec2 is compared with and can make two points of vec1 collide
+         * (two timestamps a day apart have one time of day), so they only serve the
+         * probes below; without keys hs is that set and the pass below builds it.
+         * Two equal cells have equal keys: when no two keys collide vec1 holds no
+         * duplicate, and the second set is not built. */
+        hashset_t hs_own;
+        hashset_t* self = &hs;
+        bool own_ready = false;
+        bool exact_pass = true;
+        if (keys) {
+            bool key_dup = false;
+            for (int64_t j = 0; j < k1->len; j++)
+                if (!hashset_insert(&hs, j)) key_dup = true;
+            exact_pass = key_dup;
+            kept1 = vec1->len;
+            if (key_dup) {
+                kept1 = 0;
+                if (!hashset_init(&hs_own, vec1, vec1->len)) {
+                    hashset_destroy(&hs);
+                    ray_release(keys);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
+                own_ready = true;
+                self = &hs_own;
+            }
+        }
+        for (int64_t j = 0; exact_pass && j < vec1->len; j++) {
+            if (hashset_insert(self, j)) {
+                if (idx1) idx1[kept1] = j;
+                kept1++;
+            } else if (!idx1) {
+                idx1 = (int64_t*)ray_alloc_raw((size_t)vec1->len * sizeof(int64_t));
+                if (!idx1) {
+                    if (own_ready) hashset_destroy(&hs_own);
+                    hashset_destroy(&hs);
+                    if (keys) ray_release(keys);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("oom", NULL);
+                }
+                for (int64_t r = 0; r < kept1; r++) idx1[r] = r;   /* the rows before the first duplicate are all kept */
+                /* j itself is the duplicate: not kept */
+            }
+        }
+        if (own_ready) hashset_destroy(&hs_own);
         /* hs contains only k1 row indices.  Track accepted k2 rows in a
          * separate set so repeated new RHS cells are appended just once,
-         * in their first-occurrence order, without changing k1 duplicates. */
+         * in their first-occurrence order. */
         hashset_t added;
         bool added_ready = false;
         int8_t v2_type = k2->type;
@@ -3363,6 +3414,7 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (!added_ready) {
                 if (!hashset_init(&added, k2, len2)) {
                     hashset_destroy(&hs);
+                    if (idx1) ray_free_raw(idx1);
                     if (keys) ray_release(keys);
                     if (idx != idx_stack) ray_free_raw(idx);
                     return ray_error("oom", NULL);
@@ -3376,8 +3428,15 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
         if (keys) ray_release(keys);
         ray_t* part2 = gather_by_idx(vec2, idx, extra);
         if (idx != idx_stack) ray_free_raw(idx);
-        if (RAY_IS_ERR(part2)) return part2;
-        ray_t* result = ray_concat_fn(vec1, part2);
+        if (RAY_IS_ERR(part2)) { if (idx1) ray_free_raw(idx1); return part2; }
+        ray_t* part1 = vec1;
+        if (idx1) {
+            part1 = gather_by_idx(vec1, idx1, kept1);
+            ray_free_raw(idx1);
+            if (RAY_IS_ERR(part1)) { ray_release(part2); return part1; }
+        }
+        ray_t* result = ray_concat_fn(part1, part2);
+        if (idx1) ray_release(part1);
         ray_release(part2);
         return result;
     }
@@ -3398,11 +3457,9 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
     result->type = RAY_LIST;
     ray_t** out = (ray_t**)ray_data(result);
     int64_t count = 0;
-    for (int64_t i = 0; i < len1; i++) { ray_retain(e1[i]); out[count++] = e1[i]; }
-    if ((len1 + len2) * len2 >= 2 * LIST_SET_MIN_PAIRS) {
-        /* A cell of vec2 is added when no cell kept so far (all of vec1,
-         * then vec2's added cells) equals it.  The scan meets up to
-         * len1 + len2 cells per probe, half that on average. */
+    /* A union is a set: a cell of vec1, then of vec2, is added when no cell kept so
+     * far equals it, so the duplicates of vec1 go too. */
+    if ((len1 + len2) * (len1 + len2) >= 2 * LIST_SET_MIN_PAIRS) {
         list_set_t s;
         if (!list_set_init(&s, out, len1 + len2, ray_key_spans(vec1) | ray_key_spans(vec2))) {
             result->len = count;
@@ -3411,21 +3468,28 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
             if (_bx2) ray_release(_bx2);
             return ray_error("oom", NULL);
         }
-        for (int64_t i = 0; i < len1; i++) list_set_add(&s, i, ray_key_hash(e1[i], s.spans));
-        for (int64_t i = 0; i < len2; i++) {
-            uint64_t h = ray_key_hash(e2[i], s.spans);
-            if (list_set_has(&s, e2[i], h, false)) continue;
-            ray_retain(e2[i]);
-            out[count] = e2[i];
-            list_set_add(&s, count++, h);
+        for (int pass = 0; pass < 2; pass++) {
+            ray_t** src = pass ? e2 : e1;
+            int64_t n = pass ? len2 : len1;
+            for (int64_t i = 0; i < n; i++) {
+                uint64_t h = ray_key_hash(src[i], s.spans);
+                if (list_set_has(&s, src[i], h, false)) continue;
+                ray_retain(src[i]);
+                out[count] = src[i];
+                list_set_add(&s, count++, h);
+            }
         }
         list_set_destroy(&s);
     } else {
-        for (int64_t i = 0; i < len2; i++) {
-            int found = 0;
-            for (int64_t j = 0; j < count; j++)
-                if (atom_eq(out[j], e2[i])) { found = 1; break; }
-            if (!found) { ray_retain(e2[i]); out[count++] = e2[i]; }
+        for (int pass = 0; pass < 2; pass++) {
+            ray_t** src = pass ? e2 : e1;
+            int64_t n = pass ? len2 : len1;
+            for (int64_t i = 0; i < n; i++) {
+                int found = 0;
+                for (int64_t j = 0; j < count; j++)
+                    if (atom_eq(out[j], src[i])) { found = 1; break; }
+                if (!found) { ray_retain(src[i]); out[count++] = src[i]; }
+            }
         }
     }
     result->len = count;
