@@ -1,0 +1,126 @@
+;; take, drop, rotate and filter: a wrong argument is reported with the
+;; expected call shape and the argument that is wrong (#1189).
+
+;; count given before the collection
+(at (try (take 3 [1 2 3]) (fn [e] e)) 'msg) -- "take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)"
+(at (try (take 3 [1 2]) (fn [e] e)) 'msg) -- "take: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (take <collection> <count>)"
+(at (try (take 3 [1 2]) (fn [e] e)) 'code) -- 'type
+(take [1 2 3 4] [1 2]) -- [2 3]
+(at (try (drop 3 [1 2 3]) (fn [e] e)) 'msg) -- "drop: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (drop <collection> <count>)"
+(at (try (rotate 1 [1 2 3]) (fn [e] e)) 'msg) -- "rotate: the collection comes first and the count second, but the first argument is the count (i64) and the second is I64; write (rotate <collection> <count>)"
+
+;; a count of the wrong type
+(at (try (drop [1 2 3] "a") (fn [e] e)) 'msg) -- "drop: expected (drop collection count) where count is an integer atom; got collection I64 and count str"
+(at (try (take [1 2 3] 1.5) (fn [e] e)) 'msg) -- "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection I64 and count f64"
+
+;; a mask that is a single value
+(at (try (filter [1 2 3] true) (fn [e] e)) 'msg) -- "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got vec I64 and mask b8 (a single value, not a vector)"
+
+;; the calls that work still work
+(take [1 2 3] 2) -- [1 2]
+(drop [1 2 3] 1) -- [2 3]
+(filter [1 2 3] [true false true]) -- [1 3]
+
+;; ── every builtin names its usage: argument names, types and order ──
+;; (a builtin that fails on a bad call gives the call shape in a field of its own, `usage`,
+;; next to code and msg: msg is what the builtin wrote, so nobody matches on a suffix)
+
+;; the argument count
+(at (try (top [1 2 3]) (fn [e] e)) 'msg) -- "top: takes 2 arguments, got 1"
+(at (try (top [1 2 3]) (fn [e] e)) 'usage) -- "(top <x: vector> <n: int>)"
+(at (try (xrank [1 2]) (fn [e] e)) 'msg) -- "xrank: takes 2 arguments, got 1"
+(at (try (xrank [1 2]) (fn [e] e)) 'usage) -- "(xrank <buckets: int> <x: numeric vector>)"
+(at (try (strlen) (fn [e] e)) 'msg) -- "strlen: takes 1 argument, got 0"
+(at (try (strlen) (fn [e] e)) 'usage) -- "(strlen <x: str or sym>)"
+(at (try (+ 1) (fn [e] e)) 'msg) -- "+: takes 2 arguments, got 1"
+(at (try (+ 1) (fn [e] e)) 'usage) -- "(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(at (try (and) (fn [e] e)) 'msg) -- "and: expected at least 1 arg, got 0"
+(at (try (and) (fn [e] e)) 'usage) -- "(and <a: bool or num> <b: bool or num> ...)"
+
+;; an argument of the wrong type, the order being the one that counts
+(at (try (bin 1 [1 2]) (fn [e] e)) 'msg) -- "bin: sorted arg must be an i64 vector, got i64"
+(at (try (bin 1 [1 2]) (fn [e] e)) 'usage) -- "(bin <sorted: I64 vector> <value: i64 atom or I64 vector>)"
+(at (try (mavg [1 2] 3) (fn [e] e)) 'msg) -- "mavg window must be an integer atom"
+(at (try (mavg [1 2] 3) (fn [e] e)) 'usage) -- "(mavg <window: int> <x: numeric vector>)"
+(at (try (wavg 1 2) (fn [e] e)) 'msg) -- "wavg expects two numeric vectors, got i64 and i64"
+(at (try (wavg 1 2) (fn [e] e)) 'usage) -- "(wavg <weights: numeric vector> <values: numeric vector>)"
+(at (try (fold + 1) (fn [e] e)) 'msg) -- "fold: vec arg must be a list, got i64"
+(at (try (fold + 1) (fn [e] e)) 'usage) -- "(fold <fn: fn> <init: any> <x: vector or list>) or (fold <fn: fn> <x: vector or list>)"
+(at (try (.db.parted.get 1 2) (fn [e] e)) 'msg) -- ".db.parted.get expects a string db root path, got i64"
+(at (try (.db.parted.get 1 2) (fn [e] e)) 'usage) -- "(.db.parted.get <root: str> <table: sym>)"
+
+;; an applied non-function is reported with the usage of the caller
+(at (try (map 1 [1 2]) (fn [e] e)) 'msg) -- "call: expected a callable function, got i64"
+(at (try (map 1 [1 2]) (fn [e] e)) 'usage) -- "(map <fn: fn> <x: vector or list>) or (map <fn: fn> <val: any> <x: vector or list>)"
+
+;; an error that comes from code a builtin runs is not that builtin's: it
+;; keeps the usage of the builtin that failed, and gets no second one
+(at (try (map (fn [x] (+ x 'a)) [1]) (fn [e] e)) 'msg) -- "cannot add i64 and sym"
+(at (try (map (fn [x] (+ x 'a)) [1]) (fn [e] e)) 'usage) -- "(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+(at (try (eval (list '+ 1 'a)) (fn [e] e)) 'msg) -- "cannot add i64 and sym"
+(at (try (eval (list '+ 1 'a)) (fn [e] e)) 'usage) -- "(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"
+
+;; an error that is not about the call is left as it is
+(at (try (quantile [1 2 3] 5.0) (fn [e] e)) 'msg) -- "quantile: probability out of range"
+(key (try (quantile [1 2 3] 5.0) (fn [e] e))) -- [code msg]
+
+;; an error from the argument of count or sum is the argument's, not the call's
+(set T (table [s k] (list [a b b] [1 2 3000])))
+(at (try (count (select {from: T where: (== s true)})) (fn [e] e)) 'msg) -- "=: incomparable operand types, got sym and b8"
+(key (try (count (select {from: T where: (== s true)})) (fn [e] e))) -- [code msg]
+
+;; a usage line describes calls that work
+(scan + [1 2 3]) -- [1 3 6]
+(at (try (scan + 0 [1 2]) (fn [e] e)) 'msg) -- "scan: vec arg must be a list, got i64"
+(at (try (scan + 0 [1 2]) (fn [e] e)) 'usage) -- "(scan <fn: fn> <x: vector or list>)"
+(at (try (rand 3 [7 8 9]) (fn [e] e)) 'msg) -- "rand: count and max must be atoms, got i64 and I64"
+(at (try (rand 3 [7 8 9]) (fn [e] e)) 'usage) -- "(rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)"
+(min 1 2) -- 1
+(at (try (til 3h) (fn [e] e)) 'msg) -- "til: argument must be an i64 atom, got i16"
+(at (try (til 3h) (fn [e] e)) 'usage) -- "(til <n: i64 atom>)"
+
+;; a registered name is cut at 13 characters: two builtins that share the cut
+;; name are told apart by their message (see below)
+(at (try (.sys.profile.enable 1 2 3) (fn [e] e)) 'msg) -- ".sys.profile.enable takes 0 or 1 arguments"
+(at (try (.sys.profile.enable 1 2 3) (fn [e] e)) 'usage) -- "(.sys.profile.enable [<on: i64, 0 or 1>])"
+
+;; the builtins that register with a space before the parenthesis (graph, index,
+;; attribute, link, string, vector-search and system ones) have usage lines too
+(at (try (.graph.pagerank 1) (fn [e] e)) 'msg) -- "graph.pagerank: expects a graph handle, got i64"
+(at (try (.graph.pagerank 1) (fn [e] e)) 'usage) -- "(.graph.pagerank <graph: graph handle> [<iterations: int>] [<damping: f64>])"
+(at (try (.graph.dijkstra) (fn [e] e)) 'code) -- 'rank
+(at (try (lower 5) (fn [e] e)) 'msg) -- "string transform: expected string or symbol, got i64"
+(at (try (lower 5) (fn [e] e)) 'usage) -- "(lower <x: str or sym, atom or vector>)"
+(at (try (substr "abc" 'a 1) (fn [e] e)) 'msg) -- "substr: start must be an integer atom or I64/I32 vector"
+(at (try (substr "abc" 'a 1) (fn [e] e)) 'usage) -- "(substr <text: str or sym> <start: int, or I64/I32 vector> <length: int, or I64/I32 vector>)"
+(at (try (flip 'a) (fn [e] e)) 'msg) -- "flip: expects a numeric vector or a non-empty list of numeric rows"
+(at (try (flip 'a) (fn [e] e)) 'usage) -- "(flip <x: numeric vector or non-empty list of numeric rows>)"
+(at (try (.attr.get) (fn [e] e)) 'msg) -- ".attr.get: takes 1 argument, got 0"
+(at (try (.attr.get) (fn [e] e)) 'usage) -- "(.attr.get <x: vector>)"
+(at (try (knn 1 2) (fn [e] e)) 'code) -- 'rank
+
+;; two builtins whose names share the first 13 characters are told apart by the
+;; message, each of which begins with its own name
+(at (try (.sys.querylog.enable 1 2) (fn [e] e)) 'msg) -- ".sys.querylog.enable takes 0 or 1 arguments"
+(at (try (.sys.querylog.enable 1 2) (fn [e] e)) 'usage) -- "(.sys.querylog.enable [<on: i64, 0 or 1>])"
+(at (try (.sys.querylog 1) (fn [e] e)) 'msg) -- ".sys.querylog takes no arguments"
+(at (try (.sys.querylog 1) (fn [e] e)) 'usage) -- "(.sys.querylog)"
+(at (try (.sys.profile.enable 'a) (fn [e] e)) 'msg) -- ".sys.profile.enable: flag must be i64, got sym"
+(at (try (.sys.profile.enable 'a) (fn [e] e)) 'usage) -- "(.sys.profile.enable [<on: i64, 0 or 1>])"
+(at (try (.sys.profile.reset 1) (fn [e] e)) 'msg) -- ".sys.profile.reset takes no arguments"
+(at (try (.sys.profile.reset 1) (fn [e] e)) 'usage) -- "(.sys.profile.reset)"
+
+;; a function is no collection: no internal message comes out of take
+(at (try (take (fn [x] x) 1) (fn [e] e)) 'msg) -- "take: expected (take collection count) where collection is a vector, list, string, dict or table; got collection LAMBDA and count i64"
+(at (try (take + 2) (fn [e] e)) 'msg) -- "take: expected (take collection count) where collection is a vector, list, string, dict or table; got collection BINARY and count i64"
+
+
+;; the dict a handler receives: code, msg and, for a bad call of a builtin, usage
+(key (try (take 1 2 3) (fn [e] e))) -- [code msg usage]
+(key (try (+ 1 'a) (fn [e] e))) -- [code msg usage]
+(at (try (take 1 2 3) (fn [e] e)) 'code) -- 'arity
+;; a call that does not fail carries no error, and the next error does not inherit the
+;; usage of an earlier one
+(try (take [1 2 3] 2) (fn [e] e)) -- [1 2]
+(try (take 1 2 3) (fn [e] 0))
+(key (try (quantile [1 2 3] 5.0) (fn [e] e))) -- [code msg]

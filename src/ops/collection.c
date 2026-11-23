@@ -1524,12 +1524,23 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
     }
 
     /* Fallback: boxed list path */
+    const char* vec_type_name = ray_type_name(vec->type);   /* as the caller passed them,  */
+    const char* mask_type_name = ray_type_name(mask->type); /* before the unboxing below */
     ray_t *_bx1 = NULL, *_bx2 = NULL;
     vec = unbox_vec_arg(vec, &_bx1);
     if (RAY_IS_ERR(vec)) return vec;
     mask = unbox_vec_arg(mask, &_bx2);
     if (RAY_IS_ERR(mask)) { if (_bx1) ray_release(_bx1); return mask; }
-    if (!is_list(vec) || !is_list(mask)) { if (_bx1) ray_release(_bx1); if (_bx2) ray_release(_bx2); return ray_error("type", "filter: vec and mask must be lists, got %s and %s", ray_type_name(vec->type), ray_type_name(mask->type)); }
+    if (!is_list(vec) || !is_list(mask)) {
+        ray_t* err = !is_list(mask)
+            ? ray_error("type", "filter: expected (filter vec mask) where mask is a B8 vector with one boolean per element of vec; got vec %s and mask %s%s",
+                        vec_type_name, mask_type_name, ray_is_atom(mask) ? " (a single value, not a vector)" : "")
+            : ray_error("type", "filter: expected (filter vec mask) where vec is a vector, list, string or table; got vec %s and mask %s",
+                        vec_type_name, mask_type_name);
+        if (_bx1) ray_release(_bx1);
+        if (_bx2) ray_release(_bx2);
+        return err;
+    }
     int64_t len = ray_len(vec);
     int64_t mlen = ray_len(mask);
     if (len != mlen) {
@@ -3717,6 +3728,32 @@ static ray_t* take_table_col(ray_t* tbl, ray_t* col, ray_t* n_obj) {
     return out;
 }
 
+/* Error for a bad (take|drop|rotate collection count) call.  Says which
+ * argument is wrong and what the call should look like; when the count was
+ * given first and the collection second (the usual slip) it says so. */
+static ray_t* count_arg_error(const char* fn, ray_t* vec, ray_t* n_obj, const char* count_kind) {
+    const char* vt = vec ? ray_type_name(vec->type) : "null";
+    const char* nt = n_obj ? ray_type_name(n_obj->type) : "null";
+    bool vec_is_int_atom = vec && ray_is_atom(vec) &&
+        (vec->type == -RAY_I64 || vec->type == -RAY_I32 ||
+         vec->type == -RAY_I16 || vec->type == -RAY_U8);
+    if (vec_is_int_atom && n_obj && !ray_is_atom(n_obj))
+        return ray_error("type",
+            "%s: the collection comes first and the count second, but the first argument is the "
+            "count (%s) and the second is %s; write (%s <collection> <count>)",
+            fn, vt, nt, fn);
+    bool is_function = vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
+                               vec->type == RAY_BINARY || vec->type == RAY_VARY);
+    bool vec_ok = vec && !is_function && (!ray_is_atom(vec) || vec->type == -RAY_STR);
+    if (!vec_ok)
+        return ray_error("type",
+            "%s: expected (%s collection count) where collection is a vector, list, string, dict or table; got collection %s and count %s",
+            fn, fn, vt, nt);
+    return ray_error("type",
+        "%s: expected (%s collection count) where count is %s; got collection %s and count %s",
+        fn, fn, count_kind, vt, nt);
+}
+
 /* (take vec n) — first n elements (positive) or last |n| elements (negative) */
 ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
@@ -3725,7 +3762,18 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
      * e.g. (take 1.0 2.0) to attempt a 4.6-quintillion-element allocation
      * and surface as "oom" — misleading for what is really a type error. */
     if (ray_is_atom(n_obj) && (n_obj->type == -RAY_F64 || n_obj->type == -RAY_F32))
-        return ray_error("type", "take: count must be an integer, got %s", ray_type_name(n_obj->type));
+        return ray_error("type", "take: expected (take collection count) where count is an integer atom, or a [start amount] range; got collection %s and count %s", ray_type_name(vec->type), ray_type_name(n_obj->type));
+    /* A function value has a positive type but holds no elements. */
+    if (vec && (vec->type == RAY_LAMBDA || vec->type == RAY_UNARY ||
+                vec->type == RAY_BINARY || vec->type == RAY_VARY))
+        return count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
+    /* A count given first and a vector second, (take 3 [1 2]): the usual slip, told before
+     * the range branch below, which would take [1 2] for a [start amount] range of an
+     * integer atom and answer "range take unsupported". */
+    if (vec && ray_is_atom(vec) &&
+        (vec->type == -RAY_I64 || vec->type == -RAY_I32 || vec->type == -RAY_I16 || vec->type == -RAY_U8) &&
+        n_obj && !ray_is_atom(n_obj))
+        return count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
     /* Range take: (take collection [start amount]) — slice from start for amount elements */
     if (ray_is_vec(n_obj) && n_obj->type == RAY_I64 && ray_len(n_obj) == 2) {
         int64_t* idx = (int64_t*)ray_data(n_obj);
@@ -4038,8 +4086,11 @@ ray_t* ray_take_fn(ray_t* vec, ray_t* n_obj) {
     ray_t* _bx = NULL;
     vec = unbox_vec_arg(vec, &_bx);
     if (RAY_IS_ERR(vec)) return vec;
-    if (!is_list(vec) || !is_numeric(n_obj))
-        { if (_bx) ray_release(_bx); return ray_error("type", "take: requires a list and a numeric count, got %s and %s", ray_type_name(vec->type), ray_type_name(n_obj->type)); }
+    if (!is_list(vec) || !is_numeric(n_obj)) {
+        ray_t* err = count_arg_error("take", vec, n_obj, "an integer atom, or a [start amount] range");
+        if (_bx) ray_release(_bx);
+        return err;
+    }
     int64_t len = ray_len(vec);
     int64_t n = as_i64(n_obj);
     ray_t** elems = (ray_t**)ray_data(vec);
@@ -4122,7 +4173,7 @@ ray_t* ray_drop_fn(ray_t* vec, ray_t* n_obj) {
     if (!n_obj || !ray_is_atom(n_obj) ||
         (n_obj->type != -RAY_I64 && n_obj->type != -RAY_I32 &&
          n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
-        return ray_error("type", "drop: count must be an integer atom");
+        return count_arg_error("drop", vec, n_obj, "an integer atom");
 
     int64_t len = 0;
     if (!collection_count(vec, &len))
@@ -4151,7 +4202,7 @@ ray_t* ray_rotate_fn(ray_t* vec, ray_t* n_obj) {
     if (!n_obj || !ray_is_atom(n_obj) ||
         (n_obj->type != -RAY_I64 && n_obj->type != -RAY_I32 &&
          n_obj->type != -RAY_I16 && n_obj->type != -RAY_U8))
-        return ray_error("type", "rotate: count must be an integer atom");
+        return count_arg_error("rotate", vec, n_obj, "an integer atom");
 
     int64_t len = 0;
     if (!collection_count(vec, &len))

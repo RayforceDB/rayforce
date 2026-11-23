@@ -404,7 +404,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass (at the top level a global, refused for a restricted caller); returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
-| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
+| `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call) | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
 | `raise` | unary | — | Throw an error with message | `(raise "bad input")` |
 | `return` | unary | — | Early return from function body | `(return 42)` |
 | `quote` | variadic | special | Return argument unevaluated; a bare name yields a literal symbol (`(quote x)` ≡ `'x`) | `(quote (+ 1 2))` → `(+ 1 2)` |

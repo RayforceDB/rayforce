@@ -1,0 +1,53 @@
+/*
+ *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
+#ifndef RAY_SIG_H
+#define RAY_SIG_H
+
+#include <rayforce.h>
+#include "core/platform.h"
+
+/* Usage line of a builtin: its call shape with each argument's name, type
+ * and position, e.g. "(take <collection: ...> <count: ...>)".  NULL for a
+ * builtin without an entry. */
+const char* ray_sig_usage(const char* name);
+
+/* An error a builtin returned for a bad call gets the builtin's usage line in the
+ * thread's error usage (ray_error_usage), a field of its own next to the message:
+ * the caller sees which arguments are expected, of which types and in which order, and
+ * the message is left as the builtin wrote it.  Only type, length, rank and arity errors
+ * (and a domain error about the argument list) are noted; any other result goes by, and
+ * an error that already has a usage keeps it.  `result` is returned. */
+ray_t* ray_sig_note_err(const char* name, ray_t* result);
+
+/* The test the success path pays: a call that did not fail goes by. */
+static inline ray_t* ray_sig_note(const char* name, ray_t* result) {
+    if (RAY_UNLIKELY(result && RAY_IS_ERR(result))) return ray_sig_note_err(name, result);
+    return result;
+}
+
+/* The arity error of builtin `name` called with `got` arguments where `want`
+ * (a count, or a range such as "2 to 4") are taken; its usage is the builtin's. */
+ray_t* ray_sig_arity(const char* name, const char* want, int got);
+
+#endif
