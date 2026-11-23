@@ -28,6 +28,7 @@
 #include "store/csr.h"
 #include "table/table.h"   /* ray_table_col_meta */
 #include "store/hnsw.h"
+#include "lang/format.h"     /* ray_type_name */
 #include <string.h>
 
 /* --------------------------------------------------------------------------
@@ -492,17 +493,23 @@ static int8_t arith_promote(int8_t a, int8_t b) {
 }
 
 static bool type_is_temporal(int8_t t) {
-    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
 }
+
+/* No common type for an `if`'s two arms: ray_if raises `type`. */
+#define IF_TYPE_MIX (-2)
 
 /* GUID has no numeric promotion: two GUID branches keep the type, and a
  * GUID beside anything else has no column type.  promote() used to fall
  * through to BOOL for it, and the fill then read the 16-byte cells as
  * bytes (#691).  -1 for the mixed case so ray_if declines the node and
- * the projection falls back to the interpreter. */
+ * the projection falls back to the interpreter.  Two temporal arms keep
+ * their type; two different ones have none (#1337): promote() folded
+ * them into one integer lane and the fill blended days, ms and ns as
+ * raw counts. */
 static int8_t promote_if_type(int8_t a, int8_t b) {
     if (a == RAY_GUID || b == RAY_GUID) return a == b ? RAY_GUID : -1;
-    if (a == b && type_is_temporal(a)) return a;
+    if (type_is_temporal(a) && type_is_temporal(b)) return a == b ? a : IF_TYPE_MIX;
     return promote(a, b);
 }
 
@@ -744,6 +751,12 @@ ray_op_t* ray_if(ray_graph_t* g, ray_op_t* cond, ray_op_t* then_val, ray_op_t* e
     else if (type_is_temporal(et) && tt != et && tt != RAY_STR && tt != RAY_SYM &&
              tt != RAY_GUID && if_const_null_atom(g, then_id))
         out_type = et;
+    if (out_type == IF_TYPE_MIX) {
+        g->if_refused = true;
+        graph_compile_failure(g, ray_error("type", "if: branches mix %s and %s",
+                                           ray_type_name(tt), ray_type_name(et)));
+        return NULL;
+    }
     if (out_type < 0) return NULL;
     /* A LIST column scans as the untyped node (out_type 0), which promote()
      * also folds to BOOL and the fill then reads the cell pointers as bytes.
