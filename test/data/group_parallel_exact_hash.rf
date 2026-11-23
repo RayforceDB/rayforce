@@ -1,0 +1,12 @@
+;; Direct LIST group above the parallel routing floor. A symbol prevents packing.
+(set offsets (% (til 200000) 5000))
+(set small (concat (as 'LIST offsets) (list 'tail)))
+(set B 4611686018427387904)
+(set wide (concat (as 'LIST (+ B offsets)) (list 'tail)))
+(set g (group wide))
+(set expected (concat (as 'LIST (+ B (til 5000))) (list 'tail)))
+(set best (fn [f] (min (map (fn [i] (f)) (til 3)))))
+(set ordered (and (identical (key g) expected) (identical (value g) (value (group small)))))
+(set ms (best (fn [] (timeit (group small)))))
+(set mw (best (fn [] (timeit (group wide)))))
+(println (if (and ordered (< mw (* 8 (+ 1.0 ms)))) "ok" (list ordered ms mw)))

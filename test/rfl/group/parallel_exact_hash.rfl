@@ -1,0 +1,4 @@
+;; @requires: posix  (the test starts a CLI with eight workers)
+;; #1333: the parallel directory must not hash wide integer neighbours by double
+;; when the LIST has no float atoms or TIMESPAN, even with a symbol outlier.
+(.sys.exec "o=$(env -u RAYFORCE_CORES ./rayforce -c 8 -f test/data/group_parallel_exact_hash.rf 2>&1 | tail -1); [ \"$o\" = ok ] || { echo \"$o\" >&2; exit 1; }") -- 0
