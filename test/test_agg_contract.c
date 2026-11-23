@@ -184,44 +184,63 @@ static test_result_t test_f32_extrema_routes(void) {
     PASS();
 }
 
-/* The legacy direct-array single-key loop under a where: prefetches only
- * rows the selection keeps (#1482).  The key range is taken over the kept
- * rows, so a dropped row's key can lie below it: here every dropped row has
- * key 0 and every kept one 50000 or more.  Prefetching such a row formed a
- * slot pointer below the count array (UBSan: pointer overflow).  Route 1
- * forces the legacy route; its groups match the default route's. */
-static test_result_t test_dense_single_key_prefetch_where(void) {
+/* The legacy direct-array loops under a where: prefetch the slot of a row
+ * ahead, which may be a row the selection drops (#1482).  The key range is
+ * planned over the kept rows only, so a dropped row's slot can lie outside
+ * it: the prefetch formed a pointer outside the slot arrays (UBSan: pointer
+ * overflow), and a dropped key far from the range overflowed the composite
+ * slot arithmetic (UBSan: signed overflow).  The slot is now computed
+ * modulo 2^64 and prefetched only when in range; the skipped prefetches are
+ * counted (agg_route_stats().da_prefetch_skipped), so a build without
+ * sanitizers checks it too.  Every dropped row's key lies outside the
+ * range: 0 in the single-key table (kept keys are 50000 or more), and
+ * -9e18 in the two-key one.  Route 1 forces the legacy route; its groups
+ * match the default route's. */
+static test_result_t test_dense_key_prefetch_where(void) {
     ray_t* init = ray_eval_str(
         "(set pfw (% (til 2000) 51)) "
+        "(set pfd (* (<= pfw 5) -9000000000000000000)) "
         "(set pft (table [v k w] (list (til 2000) "
-        "(* (> pfw 5) (+ 50000 (% (* (til 2000) 7919) 60000))) pfw)))");
+        "(* (> pfw 5) (+ 50000 (% (* (til 2000) 7919) 60000))) pfw))) "
+        "(set pfm (table [v k k2 w] (list (til 2000) "
+        "(+ pfd (* (> pfw 5) (+ 50000 (% (* (til 2000) 7919) 3000)))) "
+        "(+ pfd (* (> pfw 5) (+ 100 (% (til 2000) 7)))) pfw)))");
     TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
-    const char* q = "(select {s: (sum v) from: pft by: k where: (> w 5)})";
-    ray_group_test_route(1);
-    agg_route_reset();
-    ray_t* got = ray_eval_str(q);
-    agg_route_stats_t st = agg_route_stats();
-    ray_group_test_route(0);
-    TEST_ASSERT_TRUE(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE);
-    TEST_ASSERT_TRUE(st.routes[AGG_ROUTE_LEGACY] >= 1);
-    ray_t* want = ray_eval_str(q);
-    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want) && want->type == RAY_TABLE);
-    TEST_ASSERT_EQ_I(ray_table_nrows(got), 1760);
-    TEST_ASSERT_EQ_I(ray_table_nrows(want), 1760);
-    int64_t gs = 0, ws = 0, gk = 0, wk = 0;
-    const int64_t* gkd = ray_data(ray_table_get_col_idx(got, 0));
-    const int64_t* gsd = ray_data(ray_table_get_col_idx(got, 1));
-    const int64_t* wkd = ray_data(ray_table_get_col_idx(want, 0));
-    const int64_t* wsd = ray_data(ray_table_get_col_idx(want, 1));
-    for (int64_t i = 0; i < 1760; i++) {
-        gs += gsd[i]; ws += wsd[i];
-        gk += gkd[i] * gsd[i]; wk += wkd[i] * wsd[i];
-        TEST_ASSERT_TRUE(gkd[i] >= 50000);
+    static const struct { const char* q; int nk; int64_t groups; } cases[] = {
+        { "(select {s: (sum v) from: pft by: k where: (> w 5)})", 1, 1760 },
+        { "(select {s: (sum v) from: pfm by: [k k2] where: (> w 5)})", 2, 1760 },
+    };
+    for (size_t t = 0; t < sizeof(cases) / sizeof(cases[0]); t++) {
+        ray_group_test_route(1);
+        agg_route_reset();
+        ray_t* got = ray_eval_str(cases[t].q);
+        agg_route_stats_t st = agg_route_stats();
+        ray_group_test_route(0);
+        TEST_ASSERT_FMT(got && !RAY_IS_ERR(got) && got->type == RAY_TABLE, "%s: error", cases[t].q);
+        TEST_ASSERT_FMT(st.routes[AGG_ROUTE_LEGACY] >= 1, "%s: legacy route did not run", cases[t].q);
+        TEST_ASSERT_FMT(st.da_prefetch_skipped > 0, "%s: no out-of-range prefetch skipped", cases[t].q);
+        ray_t* want = ray_eval_str(cases[t].q);
+        TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want) && want->type == RAY_TABLE);
+        TEST_ASSERT_EQ_I(ray_table_nrows(got), cases[t].groups);
+        TEST_ASSERT_EQ_I(ray_table_nrows(want), cases[t].groups);
+        /* the same groups: the sums, and the sums weighted by each key */
+        int64_t gs = 0, ws = 0, gk[2] = { 0, 0 }, wk[2] = { 0, 0 };
+        const int64_t* gsd = ray_data(ray_table_get_col_idx(got, cases[t].nk));
+        const int64_t* wsd = ray_data(ray_table_get_col_idx(want, cases[t].nk));
+        for (int k = 0; k < cases[t].nk; k++) {
+            const int64_t* gkd = ray_data(ray_table_get_col_idx(got, k));
+            const int64_t* wkd = ray_data(ray_table_get_col_idx(want, k));
+            for (int64_t i = 0; i < cases[t].groups; i++) {
+                TEST_ASSERT_TRUE(gkd[i] >= 100);
+                gk[k] += gkd[i] * gsd[i]; wk[k] += wkd[i] * wsd[i];
+            }
+            TEST_ASSERT_EQ_I(gk[k], wk[k]);
+        }
+        for (int64_t i = 0; i < cases[t].groups; i++) { gs += gsd[i]; ws += wsd[i]; }
+        TEST_ASSERT_EQ_I(gs, ws);
+        ray_release(got); ray_release(want);
     }
-    TEST_ASSERT_EQ_I(gs, ws);
-    TEST_ASSERT_EQ_I(gk, wk);
-    ray_release(got); ray_release(want);
-    ray_release(ray_eval_str("(set pft 0) (set pfw 0)"));
+    ray_release(ray_eval_str("(set pft 0) (set pfm 0) (set pfw 0) (set pfd 0)"));
     PASS();
 }
 
@@ -6490,7 +6509,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/native_streaming_output", test_native_streaming_output, contract_setup, contract_teardown },
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
-    { "agg_contract/dense_single_key_prefetch_where", test_dense_single_key_prefetch_where, contract_setup, contract_teardown },
+    { "agg_contract/dense_key_prefetch_where", test_dense_key_prefetch_where, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_unflagged_nan", test_f32_extrema_unflagged_nan, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },

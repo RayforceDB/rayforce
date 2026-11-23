@@ -9078,6 +9078,10 @@ typedef struct {
      * share accums[0], so it is set with a relaxed atomic store (always
      * true) and read after the join. */
     bool   prod_overflow;
+    /* Prefetches skipped because the slot of the row ahead was out of
+     * range (a row a where: drops, #1482).  Written only by its own task,
+     * on that rare branch: a register count costs the row loop. */
+    uint64_t pf_skipped;
 } da_accum_t;
 
 #define DA_LZ_SHIFT 6
@@ -9722,29 +9726,31 @@ static inline int da_key_is_unsigned(int8_t t) {
 
 /* Composite GID from multi-key. Planning bounds total_slots to INT32_MAX. */
 /* `r` is the row within the key pieces (r - row_base; the absolute row for
- * a plain context). */
+ * a plain context).  Computed modulo 2^64: a row a where: drops (read only
+ * by the prefetch) may hold a key outside the planned range, and its slot
+ * is then out of range, never an overflow (#1482). */
 static inline int32_t da_composite_gid(da_ctx_t* c, int64_t r) {
-    int32_t gid = 0;
+    uint64_t gid = 0;
     for (uint32_t k = 0; k < c->n_keys; k++) {
         int64_t val = read_signed_by_esz(c->key_ptrs[k], r, c->key_esz[k],
                                          da_key_is_unsigned(c->key_types[k]));
         if (c->key_types[k] == RAY_SYM && val == 0) val = c->key_mins[k];
-        gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]);
+        gid += ((uint64_t)val - (uint64_t)c->key_mins[k]) * (uint64_t)c->key_strides[k];
     }
-    return gid;
+    return (int32_t)(uint32_t)gid;
 }
 
 /* Typed composite GID: eliminates per-element switch when all keys share
  * width AND signedness (see da_key_is_unsigned above). */
 #define DEFINE_DA_COMPOSITE_GID_TYPED(SUFFIX, KTYPE) \
 static inline int32_t da_composite_gid_##SUFFIX(da_ctx_t* c, int64_t r) { \
-    int32_t gid = 0; \
+    uint64_t gid = 0; \
     for (uint32_t k = 0; k < c->n_keys; k++) { \
         int64_t val = (int64_t)((const KTYPE*)c->key_ptrs[k])[r]; \
         if (c->key_types[k] == RAY_SYM && val == 0) val = c->key_mins[k]; \
-        gid += (int32_t)((val - c->key_mins[k]) * c->key_strides[k]); \
+        gid += ((uint64_t)val - (uint64_t)c->key_mins[k]) * (uint64_t)c->key_strides[k]; \
     } \
-    return gid; \
+    return (int32_t)(uint32_t)gid; \
 }
 DEFINE_DA_COMPOSITE_GID_TYPED(u8,  uint8_t)
 DEFINE_DA_COMPOSITE_GID_TYPED(u16, uint16_t)
@@ -11619,9 +11625,10 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
      * Templated by key element size: the entire loop is stamped out per width
      * so the compiler generates direct movzbl/movzwl/movl/movq — zero dispatch. */
     #define DA_PF_DIST 8
-    /* The prefetch row stays below `end`, the piece end when staged, and is
-     * one the selection keeps: the key range covers the kept rows only, so
-     * a dropped row's key may lie below kmin (#1482). */
+    /* The prefetch row stays below `end`, the piece end when staged.  Under
+     * a where: it may be a row the selection drops, whose key can lie
+     * outside the range planned from the kept rows: its slot is computed
+     * modulo 2^64 and prefetched only when in range (#1482). */
     #define DA_SINGLE_KEY_LOOP(KTYPE, KCAST) \
     do { \
         const KTYPE* kp = (const KTYPE*)c->key_ptrs[0]; \
@@ -11630,14 +11637,15 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
         for (int64_t i = start; i < end; i++) { \
             int64_t r = match_idx ? match_idx[i] : i; \
             if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
-            if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end) && (match_idx || !c->rowsel || \
-                    group_rowsel_pass(c->rowsel, i + DA_PF_DIST))) { \
+            if (da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
                 int64_t pfk = (int64_t)KCAST kp[pf_r - rb]; \
                 if (c->key_types[0] == RAY_SYM && pfk == 0) pfk = kmin; \
-                __builtin_prefetch(&acc->count[(int32_t)(pfk - kmin)], 1, 1); \
-                if (acc->sum) __builtin_prefetch( \
-                    &acc->sum[(size_t)(int32_t)(pfk - kmin) * n_aggs], 1, 1); \
+                uint64_t pf_s = (uint64_t)pfk - (uint64_t)kmin; \
+                if (RAY_LIKELY(pf_s < c->n_slots)) { \
+                    __builtin_prefetch(&acc->count[pf_s], 1, 1); \
+                    if (acc->sum) __builtin_prefetch(&acc->sum[pf_s * n_aggs], 1, 1); \
+                } else acc->pf_skipped++; \
             } \
             int64_t kv = (int64_t)KCAST kp[r - rb]; \
             if (c->key_types[0] == RAY_SYM && kv == 0) kv = kmin; \
@@ -11678,9 +11686,11 @@ RAY_INLINE void da_accum_body(da_ctx_t* c, uint32_t worker_id, int64_t start, in
             if (!match_idx && c->rowsel && !group_rowsel_pass(c->rowsel, r)) continue; \
             if (_da_pf && RAY_LIKELY(i + DA_PF_DIST < end)) { \
                 int64_t pf_r = match_idx ? match_idx[i + DA_PF_DIST] : (i + DA_PF_DIST); \
-                int32_t pf_gid = GID_FN(pf_r - rb); \
-                __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
-                if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
+                uint32_t pf_gid = (uint32_t)GID_FN(pf_r - rb); \
+                if (RAY_LIKELY(pf_gid < c->n_slots)) { \
+                    __builtin_prefetch(&acc->count[pf_gid], 1, 1); \
+                    if (acc->sum) __builtin_prefetch(&acc->sum[(size_t)pf_gid * n_aggs], 1, 1); \
+                } else acc->pf_skipped++; \
             } \
             da_accum_row(c, acc, GID_FN(r - rb), r, r - rb, staged); \
         } \
@@ -18430,6 +18440,11 @@ da_path:;
                 ray_pool_dispatch(da_pool, da_accum_fn, &da_ctx, n_scan);
             else
                 da_accum_fn(&da_ctx, 0, 0, n_scan);
+            {
+                uint64_t pf_skipped = 0;
+                for (uint32_t w = 0; w < da_n_workers; w++) pf_skipped += accums[w].pf_skipped;
+                agg_route_note_da_prefetch_skipped(pf_skipped);
+            }
             if (agg_raw_hdr) scratch_free(agg_raw_hdr);
             /* R-FAIL: a range error (or a cancelled staged dispatch) is the
              * answer; the partial accumulators are discarded. */
