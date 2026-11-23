@@ -1,0 +1,13 @@
+;; filter boxes a typed vector into a list of atoms when its mask is a list.  The
+;; return for a mask of the wrong length left both boxes behind: a vector of 1000
+;; elements left about 72 KB per failing call (200 calls: 14 MB).
+
+(set bigv (til 1000))
+(set mism (list true false))
+(try (filter bigv mism) 0)
+(set mem0 (at (.sys.mem) 'bytes-allocated))
+(times 200 (try (filter bigv mism) 0))
+(< (- (at (.sys.mem) 'bytes-allocated) mem0) 100000) -- true
+
+(at (try (filter bigv mism) (fn [e] e)) 'code) -- 'length
+(filter [1 2 3] [true false true]) -- [1 3]

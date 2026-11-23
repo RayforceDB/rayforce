@@ -545,8 +545,11 @@ static inline uint64_t guid_rng_next(void) {
 /* (guid n) -> generate n random GUIDs as GUID vector.
  * v4 UUID format: 122 random bits + 4 version-bits (0100) + 2 variant-bits (10). */
 ray_t* ray_guid_fn(ray_t* n_arg) {
-    if (!n_arg || !is_numeric(n_arg))
-        return ray_error("type", "guid expects a numeric count, got %s", ray_type_name(n_arg->type));
+    if (!n_arg || !ray_is_atom(n_arg) ||
+        (n_arg->type != -RAY_I64 && n_arg->type != -RAY_I32 &&
+         n_arg->type != -RAY_I16 && n_arg->type != -RAY_U8))
+        return ray_error("type", "guid expects an integer count, got %s",
+                         n_arg ? ray_type_name(n_arg->type) : "null");
     int64_t n = as_i64(n_arg);
     if (n < 0) return ray_error("domain", "guid count must be non-negative, got %lld", (long long)n);
     ray_t* result = ray_vec_new(RAY_GUID, n);
