@@ -11315,6 +11315,8 @@ static ray_t* nonagg_first_last_hidden(ray_t* e, ray_t* tbl, idx_feeder_fn feede
     return out ? out : ray_error("oom", NULL);
 }
 
+static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res);
+
 static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -11362,7 +11364,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     if (hs.out) ray_release(hs.out);
     for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
     g_query_dependencies = prev;
-    return result;
+    return rw_if_cells_check(expr, tbl, result);
 }
 
 /* idx_feeder for the eval-fallback's LIST `groups` layout. */
@@ -11549,6 +11551,52 @@ ray_t* ray_active_query_literal(int64_t sym) {
     if (!cell || RAY_IS_ERR(cell)) return cell;
     if (!allocated) ray_retain(cell);
     return cell;
+}
+
+/* A per-row or per-group pass runs an `if` as control flow, one arm a row,
+ * so arms with no common type come back as a LIST of their cells where the
+ * planned routes raise (#1337, #1485): a temporal arm beside a numeric or
+ * another temporal one.  For `expr` holding an `if`, such a LIST of atoms
+ * raises the planner's error; one temporal type beside null cells only (a
+ * null literal arm) is that type's column, as ray_if makes it.  `res` is
+ * consumed; anything else is returned as it is. */
+static bool rw_cell_temporal(int8_t t) {
+    return t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+}
+static bool rw_cell_numeric(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
+           t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
+}
+static ray_t* rw_if_cells_check(ray_t* expr, ray_t* tbl, ray_t* res) {
+    if (!res || RAY_IS_ERR(res) || res->type != RAY_LIST || res->len == 0 || !tbl ||
+        tbl->type != RAY_TABLE || !rw_has_if(expr, tbl, 0)) return res;
+    ray_t** cells = (ray_t**)ray_data(res);
+    int8_t tt = 0, other = 0;
+    for (int64_t i = 0; i < res->len; i++) {
+        ray_t* c = cells[i];
+        if (!c || !ray_is_atom(c)) return res;
+        int8_t t = (int8_t)-c->type;
+        if (!rw_cell_temporal(t) && !rw_cell_numeric(t)) return res;
+        if (RAY_ATOM_IS_NULL(c)) continue;
+        if (rw_cell_temporal(t)) {
+            if (tt == 0) tt = t;
+            else if (t != tt) { other = t; break; }
+        } else if (!other) other = t;
+    }
+    if (!tt) return res;                          /* numbers only: as before */
+    if (other) {
+        ray_release(res);
+        return ray_error("type", "if: branches mix %s and %s", ray_type_name(tt), ray_type_name(other));
+    }
+    ray_t* out = ray_vec_new(tt, res->len);
+    if (!out || RAY_IS_ERR(out)) { ray_release(res); return out ? out : ray_error("oom", NULL); }
+    out->len = res->len;
+    for (int64_t i = 0; i < res->len; i++) {
+        if (RAY_ATOM_IS_NULL(cells[i])) ray_vec_set_null(out, i, true);
+        else store_typed_elem(out, i, cells[i]);
+    }
+    ray_release(res);
+    return out;
 }
 
 static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
@@ -11756,7 +11804,7 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
         result->type = RAY_LIST;
         result->len = 0;
     }
-    return result;
+    return rw_if_cells_check(expr, tbl, result);
 }
 
 static ray_t* eval_expr_per_row(ray_t* expr, ray_t* tbl, int64_t nrows) {

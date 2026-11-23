@@ -255,6 +255,26 @@
 (update {from: T r: (if (> g 0) d e) by: k}) !- type
 (update {from: T d: (if (> g 0) d e)}) !- type
 
+;; ── arms the planner does not compile run per row or per group; their
+;; cells must not box into a LIST either ──
+(set V [1 2 3])
+(select {from: T r: (if (> g 0) d (at V 0))}) !- type
+(select {from: T r: (if (> g 0) d (count (distinct k)))}) !- type
+(update {from: T r: (if (> g 0) d (at V 0))}) !- type
+(select {from: T r: (if (> g 0) d (at [2024.01.01D00:00:00.000000000] 0))}) !- type
+(R (select {from: T r: (if (> g 0) d (at [0N] 0))})) -- [0Nd 2024.01.02 2024.01.03]
+(R (select {from: T r: (if (> g 0) (at V 0) (at V 1))})) -- [2 1 1]
+;; a TIMESPAN computed from two times or timestamps is a temporal arm too
+(select {from: T r: (if (> g 0) (- p p) 5)}) !- type
+(select {from: T r: (if (> g 0) (- t t) e)}) !- type
+;; an if over aggregates under by: (group a takes one arm, group b the other).
+;; These routes run one arm per group, so the check reads the values the
+;; groups produced: a mix raises, one kind alone stands.
+(select {from: T by: k r: (if (> (count e) 1) (max d) 5)}) !- type
+(select {from: T by: k r: (if (> (count e) 1) 5 (max d))}) !- type
+(R (select {from: T by: k r: (if (> (count e) 1) (max d) 0N)})) -- [2024.01.02 0Nd]
+(R (select {from: T by: k r: (if (> (count e) 1) 0N (max p))})) -- [0Np 2024.01.01D03:00:00.000000000]
+
 ;; ── unchanged: a null literal keeps the temporal type, either order ──
 (R (select {from: T r: (if (> g 0) d 0N)})) -- [0Nd 2024.01.02 2024.01.03]
 (R (select {from: T r: (if (> g 0) 0N p)})) -- [2024.01.01D01:00:00.000000000 0Np 0Np]
@@ -272,6 +292,8 @@
 (set P (.db.parted.get "/tmp/rfl_if_temporal_numeric" 't))
 (select {from: P r: (if (> g 0) d e)}) !- type
 (select {from: P r: (if true d e)}) !- type
+(select {from: P r: (if (> g 0) d (at [7] 0))}) !- type
+(select {from: P by: g r: (if (> (max e) 35) (max d) 5)}) !- type
 (R (select {from: P r: (if (> g 0) d 0N)})) -- [0Nd 2024.01.02 2024.01.05 0Nd]
 (.sys.exec "rm -rf /tmp/rfl_if_temporal_numeric") -- 0
 
