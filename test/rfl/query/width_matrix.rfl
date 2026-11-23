@@ -1000,18 +1000,9 @@
 ;;
 ;; Shared fixture, single I64 key, two groups (k=1 rows 0-1, k=2 rows
 ;; 2-3):
-;;   wm5_va (I32, no nulls): row0 is 2147483647i + 1i, which WRAPS to
-;;     -2147483648 (INT32_MIN) — a real, non-null data value per the
-;;     documented I16/I32 wraparound exception (src/vec/validate.c
-;;     null handling: narrow-int sentinels are NOT reserved because
-;;     modulo arithmetic legitimately produces them; see also
-;;     test/rfl/expr/narrow_binary.rfl's `(+ [2147483647i] [1i]) --
-;;     [-2147483648]`).  It is chosen because it exactly equals
-;;     NULL_I32 — the value da_ctx_t's int-null sentinel check compares
-;;     against — so if agg 0's mask bit is ever wrongly turned on by an
-;;     unrelated agg's alias, this row is wrongly dropped from the sum.
-;;     Row1 = 100 (untainted control value); rows2-3 = 10, 20 for the
-;;     second group (no wraparound there, plain control values).
+;;   wm5_va (I32, no nulls): an explicit narrowing cast supplies a raw
+;;     INT32_MIN with HAS_NULLS clear. An aliased null-mask bit drops
+;;     this row incorrectly. Arithmetic now flags this sentinel.
 ;;   wm5_vf (I32, no nulls): filler agg input, DISTINCT per group
 ;;     (7,7 / 3,3) so any cross-group corruption is visible too.
 ;;   wm5_vn (I32, WITH a genuine null): 0Ni at the first row of each
@@ -1032,16 +1023,7 @@
 ;;   Filler sum = 3+3 = 6.  wm5_vn sum = 8.  wm5_vd sum = 10.5+20.5=31.0.
 ;; ══════════════════════════════════════════════════════════════════
 
-(set wm5_va (+ [2147483647i 99i 10i 20i] [1i 1i 0i 0i]))
-;; The vector itself carries no HAS_NULLS (the wraparound row is a real
-;; value, not a null) even though extracting it as a bare scalar via
-;; `at` renders as `0Ni` — nil?/format on an ATOM re-derives nullness
-;; from the sentinel bit pattern alone (an atom has no attrs byte to
-;; carry HAS_NULLS), so that quirk is scalar-context-only and does NOT
-;; reflect how the vector's own consumers (sum, the DA accumulator)
-;; treat it: they gate on the VECTOR's HAS_NULLS attribute first, which
-;; is correctly unset here.
-;; (element-wise since #485: no element is null)
+(set wm5_va (as 'I32 [-2147483648 100 10 20]))
 (nil? wm5_va) -- [false false false false]
 (sum wm5_va) -- -2147483518
 (at wm5_va 1) -- 100

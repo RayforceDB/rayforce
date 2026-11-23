@@ -1,0 +1,25 @@
+;; Running sums and products widen before arithmetic. The narrow minima
+;; at row 1 are numbers in I64; only the I64 minimum is null.
+(set h [-32767 -1 0Nh 32767 32767 1 2 1h])
+(set i [-2147483647 -1 0Ni 2147483647 2147483647 1 2 1i])
+(set hp [-16384 2 4096 4096 4096 4096 0Nh 2h])
+(set ip [-1073741824 2 65536 65536 1 1 0Ni 2i])
+(set T (table [h i hp ip] (list h i hp ip)))
+(set R (select {from: T sh: (sums h) si: (sums i) ph: (prds hp) pi: (prds ip)}))
+
+;; Include both the vector mask and scalar nil? after indexing every row.
+(set inspect (fn [v] (list (type v) v (nil? v) (map (fn [k] (nil? (at v k))) (til (count v))))))
+(set sh (inspect [-32767 -32768 -32768 -1 32766 32767 32769 32770]))
+(set si (inspect [-2147483647 -2147483648 -2147483648 -1 2147483646 2147483647 2147483649 2147483650]))
+;; The skipped input at row 6 repeats a true I64 sentinel, then *2 wraps to 0.
+(set ph (inspect [-16384 -32768 -134217728 -549755813888 -2251799813685248 0Nl 0Nl 0]))
+(set pi (inspect [-1073741824 -2147483648 -140737488355328 0Nl 0Nl 0Nl 0Nl 0]))
+
+(inspect (sums h)) -- sh
+(inspect (sums i)) -- si
+(inspect (prds hp)) -- ph
+(inspect (prds ip)) -- pi
+(inspect (at R 'sh)) -- sh
+(inspect (at R 'si)) -- si
+(inspect (at R 'ph)) -- ph
+(inspect (at R 'pi)) -- pi
