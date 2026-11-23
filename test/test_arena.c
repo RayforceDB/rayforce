@@ -27,8 +27,11 @@
 #include "mem/heap.h"
 #include "mem/arena.h"
 #include "mem/sys.h"
+#include "core/pool.h"
+#include "core/runtime.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 static test_result_t test_arena_release_noop(void) {
     ray_heap_init();
@@ -431,20 +434,21 @@ static test_result_t test_arena_total_used_multi_chunk(void) {
  * watermark only 4 MiB above the current footprint, it must not hold that in
  * anonymous RAM: its chunks grow until they are large enough to be mapped
  * over spill files.  Every string still reads back. */
-static test_result_t test_arena_spills_past_watermark(void) {
-#if defined(_WIN32)
-    SKIP("file-backed spill is POSIX-only");
-#endif
-    ray_heap_init();
+/* One run on the calling thread's heap, which the caller brought up. */
+typedef struct { bool readable, bounded, back; } arena_spill_t;
+
+static arena_spill_t arena_spill_run(void) {
     int64_t previous = ray_heap_anon_watermark();
     /* A block about to cross the watermark first makes room
-     * (heap_make_room): it drains the direct-block cache and unmaps the empty
-     * anonymous pools of this thread's heap and of the parked pool workers'.
-     * Whatever earlier tests in this process left there would leave with the
-     * arena's first spilled chunk and read as a shortfall after the destroy
-     * (#1293).  Cross the watermark once here, with a block that spills, so
-     * the footprint measured below is one the arena's growth cannot reduce. */
-    ray_heap_set_anon_watermark(ray_heap_anon_committed());
+     * (heap_make_room): it drains the direct-block cache, then unmaps the
+     * empty anonymous pools of this thread's heap, then those of the parked
+     * pool workers' one heap after another, and stops as soon as the block
+     * fits.  Whatever earlier tests in this process left there would leave
+     * with the arena's spilled chunks and read as a shortfall after the
+     * destroy (#1293).  Cross a watermark of one byte here, with a block that
+     * spills: no step makes it fit, so every step runs, and the footprint
+     * measured below is one the arena's growth cannot reduce. */
+    ray_heap_set_anon_watermark(1);
     void* probe = ray_sys_alloc((size_t)1 << 20);   /* RAY_SYS_SPILL_MIN */
     ray_sys_free(probe);
     int64_t base = ray_heap_anon_committed();
@@ -465,19 +469,29 @@ static test_result_t test_arena_spills_past_watermark(void) {
         if (i == 0) first = a;
         last = a;
     }
+    arena_spill_t r;
     int64_t grown = ray_heap_anon_committed() - base;
-    bool bounded = grown < INT64_C(8) * 1024 * 1024;
-    bool readable = ok && first && last &&
-                    memcmp(ray_str_ptr(first), "0x", 2) == 0 &&
-                    memcmp(ray_str_ptr(last), "299999x", 7) == 0 &&
-                    ray_str_len(last) == sizeof(buf);
+    r.bounded = grown < INT64_C(8) * 1024 * 1024;
+    r.readable = ok && first && last &&
+                 memcmp(ray_str_ptr(first), "0x", 2) == 0 &&
+                 memcmp(ray_str_ptr(last), "299999x", 7) == 0 &&
+                 ray_str_len(last) == sizeof(buf);
     ray_arena_destroy(arena);
-    bool back = ray_heap_anon_committed() == base;
+    r.back = ray_heap_anon_committed() == base;
     ray_heap_set_anon_watermark(previous);
+    return r;
+}
+
+static test_result_t test_arena_spills_past_watermark(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    ray_heap_init();
+    arena_spill_t r = arena_spill_run();
     ray_heap_destroy();
-    TEST_ASSERT_TRUE(ok && readable);
-    TEST_ASSERT_TRUE(bounded);
-    TEST_ASSERT_TRUE(back);
+    TEST_ASSERT_TRUE(r.readable);
+    TEST_ASSERT_TRUE(r.bounded);
+    TEST_ASSERT_TRUE(r.back);
     PASS();
 }
 
@@ -491,6 +505,58 @@ static test_result_t test_arena_spills_after_empty_pools(void) {
     for (int i = 0; i < 3; i++) if (b[i]) ray_free(b[i]);
     TEST_ASSERT_TRUE(mapped);
     return test_arena_spills_past_watermark();
+}
+
+/* The same, with a large block in the direct-block cache beside the empty
+ * pools: the cache alone could make room for a first crossing. */
+static test_result_t test_arena_spills_after_cache_and_pools(void) {
+    ray_heap_init();
+    int64_t wm = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(INT64_C(4) << 30);
+    ray_t* b[3];
+    for (int i = 0; i < 3; i++) b[i] = ray_alloc((16u << 20) - 4096);   /* a pool each */
+    bool mapped = b[0] && b[1] && b[2];
+    for (int i = 0; i < 3; i++) if (b[i]) ray_free(b[i]);
+    ray_t* d = ray_alloc((size_t)64 << 20);                          /* to the cache when freed */
+    if (d) ray_free(d);
+    ray_heap_set_anon_watermark(wm);
+    TEST_ASSERT_TRUE(mapped && d);
+    return test_arena_spills_past_watermark();
+}
+
+/* The same while the pool workers hold empty pools: the room is made from
+ * their heaps too, one after another, after the caller's.  Each task maps
+ * three pools on the heap of the worker that runs it and frees their blocks,
+ * on that heap, so they stay mapped and empty. */
+static void arena_worker_pools_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id; (void)start; (void)end;
+    ray_t* b[3];
+    for (int i = 0; i < 3; i++) b[i] = ray_alloc((16u << 20) - 4096);   /* a pool each */
+    bool ok = b[0] && b[1] && b[2];
+    for (int i = 0; i < 3; i++) if (b[i]) ray_free(b[i]);
+    if (!ok) atomic_store_explicit((_Atomic(bool)*)ctx, false, memory_order_relaxed);
+}
+
+static test_result_t test_arena_spills_after_worker_pools(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    uint32_t cores = ray_pool_total_workers(ray_pool_get());
+    ray_pool_destroy();
+    bool pool = ray_pool_init_total(4) == RAY_OK;
+    _Atomic(bool) mapped = true;
+    if (pool) ray_pool_dispatch_n(ray_pool_get(), arena_worker_pools_fn, (void*)&mapped, 64);
+    arena_spill_t r = pool ? arena_spill_run() : (arena_spill_t){0};
+    ray_runtime_destroy(rt);
+    ray_pool_destroy();
+    ray_pool_init_total(cores);
+    TEST_ASSERT_TRUE(pool && atomic_load(&mapped));
+    TEST_ASSERT_TRUE(r.readable);
+    TEST_ASSERT_TRUE(r.bounded);
+    TEST_ASSERT_TRUE(r.back);
+    PASS();
 }
 
 /* ---- ray_arena_reset NULL arena guard ----------------------------------- */
@@ -523,6 +589,8 @@ const test_entry_t arena_entries[] = {
     { "arena/reset_null",               test_arena_reset_null,               NULL, NULL },
     { "arena/spills_past_watermark",    test_arena_spills_past_watermark,    NULL, NULL },
     { "arena/spills_after_empty_pools", test_arena_spills_after_empty_pools, NULL, NULL },
+    { "arena/spills_after_cache_and_pools", test_arena_spills_after_cache_and_pools, NULL, NULL },
+    { "arena/spills_after_worker_pools", test_arena_spills_after_worker_pools, NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
 
