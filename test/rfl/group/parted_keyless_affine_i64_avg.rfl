@@ -1,0 +1,31 @@
+;; Combine exact I64 totals across the eight-partition batch boundary.
+(.sys.exec "rm -rf /tmp/rfl_parted_keyless_affine_avg")
+(set mk (fn [n v] (table [k x] (list (concat (* 0 (til n)) [1 1]) (concat (+ v (* 0 (til n))) [0N 0N])))))
+(set Z (mk 70000 0))
+(set H (mk 70000 9223372036854775807))
+(set L (mk 70000 -9223372036854775807))
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/1/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/2/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/3/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/4/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/5/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/6/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/7/hits/" Z "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/8/hits/" H "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(.db.splayed.set "/tmp/rfl_parted_keyless_affine_avg/9/hits/" L "/tmp/rfl_parted_keyless_affine_avg/.sym" {compress: false})
+(set P (.db.parted.get "/tmp/rfl_parted_keyless_affine_avg/" 'hits))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z Z) Z) Z) Z) Z) Z) H) L))
+(set A (fn [t] (select {mean: (avg (+ x 1)) from: t})))
+(set B (fn [t] (select {mean: (avg (- x 1)) from: t})))
+(set runs (fn [] (at (.sys.mem) 'group-perpart-runs)))
+(set before (runs))
+(set ap (A P))
+(== (- (runs) before) 1) -- true
+(set af (A F))
+(== (at (at ap 'mean) 0) (at (at af 'mean) 0)) -- true
+(== (type (at ap 'mean)) (type (at af 'mean))) -- true
+(set before (runs))
+(set bp (B P))
+(== (- (runs) before) 1) -- true
+(== (at (at bp 'mean) 0) (at (at (B F) 'mean) 0)) -- true
+(.sys.exec "rm -rf /tmp/rfl_parted_keyless_affine_avg")
