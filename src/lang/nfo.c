@@ -22,7 +22,6 @@
  */
 
 #include "nfo.h"
-#include "mem/heap.h"   /* ray_block_data_bytes */
 #include <stdint.h>
 
 ray_t* ray_nfo_create(const char* filename, size_t fname_len,
@@ -102,21 +101,4 @@ ray_span_t ray_nfo_get(ray_t* nfo, ray_t* node) {
     }
 
     return none;
-}
-
-static int64_t nfo_block_bytes(ray_t* v) {
-    if (!v || RAY_IS_ERR(v)) return 0;
-    int64_t b = (int64_t)(sizeof(ray_t) + ray_block_data_bytes(v));
-    /* A long string's characters live in a block of their own. */
-    if (v->type == -RAY_STR && !((v->slen >= 1 && v->slen <= 7) || (v->slen == 0 && !v->obj)) && v->obj)
-        b += nfo_block_bytes(v->obj);
-    return b;
-}
-
-int64_t ray_nfo_bytes(ray_t* nfo) {
-    if (!nfo || RAY_IS_ERR(nfo)) return 0;
-    int64_t b = nfo_block_bytes(nfo);
-    ray_t** elems = (ray_t**)ray_data(nfo);
-    for (int64_t i = 0; i < nfo->len; i++) b += nfo_block_bytes(elems[i]);
-    return b;
 }

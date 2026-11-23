@@ -70,8 +70,4 @@ void ray_nfo_insert(ray_t* nfo, ray_t* node, ray_span_t span);
  * Returns a span with id==0 if not found. */
 ray_span_t ray_nfo_get(ray_t* nfo, ray_t* node);
 
-/* The bytes the nfo's blocks hold: the list, its filename and source text,
- * and the span records at their allocated capacity. */
-int64_t ray_nfo_bytes(ray_t* nfo);
-
 #endif /* RAY_NFO_H */

@@ -752,19 +752,41 @@ static test_result_t test_closure_heavy_literal_captures(void) {
     PASS();
 }
 
-/* ---- Test: the closure template table holds no more than its budget ----
+/* ---- Test: the closure template table drops entries no text can hit ----
  * A lambda made under ray_eval_str retains the request's nfo: its whole
  * source text and a span record per parsed node.  The template table's
- * entry for the literal pins that nfo through the template, so the nfo
- * counts toward the table's 1 MiB budget.  Each request below carries
- * ~49 KB of text (~330 KB with its spans); before the nfo counted, 256 of
- * them stayed live per thread, ~84 MB.  A definition (nothing captured,
- * its entry made on the first call) and a closure (captures `k`, its entry
- * made when the literal is evaluated) both pin it. */
+ * entry for the literal pins that nfo through its template.  Once the
+ * request is over, its literals can never be evaluated again, so their
+ * entries go; before, 256 of them stayed live per thread, ~84 MB for the
+ * ~49 KB requests below.  A definition (nothing captured, its entry made
+ * on the first call) and a closure (captures `k`, its entry made when the
+ * literal is evaluated) both pin it. */
 static size_t tmpl_mem(void) {
     ray_mem_stats_t m;
     ray_mem_stats(&m);
     return m.bytes_allocated + m.direct_bytes;
+}
+
+/* `head` followed by `n` integers and "]))" */
+static char* tmpl_src(const char* head, int n) {
+    size_t cap = strlen(head) + (size_t)n * 7 + 16;
+    char* s = malloc(cap);
+    if (!s) return NULL;
+    size_t at = (size_t)snprintf(s, cap, "%s", head);
+    for (int i = 0; i < n; i++) at += (size_t)snprintf(s + at, cap - at, "%d ", i);
+    snprintf(s + at, cap - at, "]))");
+    return s;
+}
+
+/* Every lambda in the list `name` runs the same bytecode. */
+static bool tmpl_all_share(const char* name, int64_t want) {
+    ray_t* r = ray_eval_str(name);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == RAY_LIST && r->len == want;
+    ray_t** el = ok ? (ray_t**)ray_data(r) : NULL;
+    for (int64_t i = 0; ok && i < want; i++)
+        ok = el[i]->type == RAY_LAMBDA && LAMBDA_IS_COMPILED(el[i]) && LAMBDA_BC(el[i]) == LAMBDA_BC(el[0]);
+    if (r) ray_release(r);
+    return ok;
 }
 
 static test_result_t test_closure_tmpl_request_nfo_budget(void) {
@@ -772,19 +794,69 @@ static test_result_t test_closure_tmpl_request_nfo_budget(void) {
         "(do ((fn [x] x) 1) (count [",
         "(do (set mkTn (fn [k] (if false (set 1 2)) (fn [x] (+ x k)))) ((mkTn 1) 2) (count [",
     };
-    static char src[10000 * 6 + 256];
     for (size_t h = 0; h < sizeof heads / sizeof heads[0]; h++) {
-        size_t n = (size_t)snprintf(src, sizeof src, "%s", heads[h]);
-        for (int i = 0; i < 10000; i++) n += (size_t)snprintf(src + n, sizeof src - n, "%d ", i);
-        snprintf(src + n, sizeof src - n, "]))");
+        char* src = tmpl_src(heads[h], 10000);
+        TEST_ASSERT_NOT_NULL(src);
         ray_t* r = ray_eval_str(src);
         TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 10000);
         ray_release(r);
         size_t m0 = tmpl_mem();
         for (int i = 0; i < 400; i++) ray_release(ray_eval_str(src));
         size_t grew = tmpl_mem() - m0;
-        TEST_ASSERT_FMT(grew < 2u * 1024 * 1024, "case %zu: 400 requests kept %zu bytes", h, grew);
+        free(src);
+        TEST_ASSERT_FMT(grew < 64u * 1024, "case %zu: 400 requests kept %zu bytes", h, grew);
     }
+    PASS();
+}
+
+/* ---- Test: a large source's literals still share one template ----
+ * Within a request (here ~230 KB, ~40,000 parsed nodes) its literals are
+ * live, and every closure or definition made from one literal shares its
+ * entry's bytecode rather than compiling its own. */
+static test_result_t test_closure_tmpl_large_source_shares(void) {
+    static const char* heads[] = {
+        /* closures: one template per capture set */
+        "(do (set mkTl (fn [k] (if false (set 1 2)) (fn [x] (+ x k)))) (set rTl (map mkTl (til 2000))) (count [",
+        /* definitions: compiled on their first call, then shared */
+        "(do (set mkTd (fn [i] (if false (set 1 2)) (let f (fn [x] (+ x 1))) (f i) f)) (set rTl (map mkTd (til 2000))) (count [",
+    };
+    for (size_t h = 0; h < sizeof heads / sizeof heads[0]; h++) {
+        char* src = tmpl_src(heads[h], 40000);
+        TEST_ASSERT_NOT_NULL(src);
+        ray_t* r = ray_eval_str(src);
+        free(src);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 40000);
+        ray_release(r);
+        TEST_ASSERT_FMT(tmpl_all_share("rTl", 2000), "case %zu: the lambdas do not share one template", h);
+    }
+    ray_release(ray_eval_str("(set rTl 0)"));
+    PASS();
+}
+
+/* ---- Test: an entry whose literal is still live survives its request ----
+ * mkTs is defined by one request; each later request makes a closure from
+ * the literal in its body and drops it.  Only mkTs keeps the literal
+ * alive, so the entry stays and every closure reuses the first one's
+ * bytecode.  (The test holds that bytecode itself: were the entry
+ * dropped, the next closure would compile into a new block.) */
+static test_result_t test_closure_tmpl_live_entry_survives(void) {
+    ray_release(ray_eval_str("(set mkTs (fn [k] (if false (set 1 2)) (fn [x] (+ x k))))"));
+    ray_t* c = ray_eval_str("(mkTs 1)");
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_LAMBDA && LAMBDA_IS_COMPILED(c));
+    ray_t* bc = LAMBDA_BC(c);
+    ray_retain(bc);
+    ray_release(c);
+    for (int i = 2; i < 6; i++) {
+        char q[32];
+        snprintf(q, sizeof q, "(mkTs %d)", i);
+        c = ray_eval_str(q);
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_LAMBDA);
+        bool same = LAMBDA_BC(c) == bc;
+        ray_release(c);
+        TEST_ASSERT_FMT(same, "request %d compiled its closure afresh", i);
+    }
+    ray_release(bc);
+    ray_release(ray_eval_str("(set mkTs 0)"));
     PASS();
 }
 
@@ -14357,6 +14429,8 @@ const test_entry_t lang_entries[] = {
     { "lang/lambda_compile_failure_mark", test_lambda_compile_failure_mark, lang_setup, lang_teardown },
     { "lang/closure_heavy_literal_captures", test_closure_heavy_literal_captures, lang_setup, lang_teardown },
     { "lang/closure_tmpl_request_nfo_budget", test_closure_tmpl_request_nfo_budget, lang_setup, lang_teardown },
+    { "lang/closure_tmpl_large_source_shares", test_closure_tmpl_large_source_shares, lang_setup, lang_teardown },
+    { "lang/closure_tmpl_live_entry_survives", test_closure_tmpl_live_entry_survives, lang_setup, lang_teardown },
     { "lang/clock_local_follows_tz", test_clock_local_follows_tz, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
