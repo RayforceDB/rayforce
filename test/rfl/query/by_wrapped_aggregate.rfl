@@ -110,7 +110,7 @@
 (Sk (select {s: (+ 0 (last (at NV i))) from: T by: k}) 'k)    -- [475 100 800]
 
 ;; ── conditional, lambda and take: wrappers ─────────────────────────────────
-(Sk (select {s: (if (> (first (at V i)) 300) 1 0) from: T by: k}) 'k)   -- (Gk (fn [x] (if (> (first (at V x)) 300) 1 0)))
+(Sk (select {s: (if (> (first (at V i)) 550) 1 0) from: T by: k}) 'k)   -- (Gk (fn [x] (if (> (first (at V x)) 550) 1 0)))
 (Sk (select {s: ((fn [z] (+ z 1)) (first (at V i))) from: T by: k}) 'k)  -- (Gk (fn [x] ((fn [z] (+ z 1)) (first (at V x)))))
 (count (select {s: (+ 0 (first (at V i))) from: T by: k take: 1}))       -- 1
 (S (select {s: (+ 0 (first (at V i))) from: T by: k take: 1}))           -- [600]
