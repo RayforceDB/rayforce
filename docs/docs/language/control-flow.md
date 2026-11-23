@@ -211,12 +211,14 @@ Recursive lambdas use `self` to refer to the enclosing function:
 "caught"
 ```
 
-An error the engine raises itself reaches the handler as a dict of its code and message:
+An error the engine raises itself reaches the handler as a dict of its code and message, and, when it is about a builtin called with the wrong arguments, the call shape as `usage`:
 
 ```lisp
 ‣ (try (+ 1 "hello") (fn [e] e))
-{code:type msg:"cannot add i64 and str"}
+{code:type msg:"cannot add i64 and str" usage:"(+ <left: num, date, time, timestamp or timespan> <right: the same kinds>)"}
 ```
+
+Match on `code`, the class of the error; `msg` is for people, and `usage` shows the call shape (see [Error Handling](../guides/errors.md#usage-lines)). An error that is not about a call, such as a bad value, has only `code` and `msg`.
 
 If no error is raised, `try` returns the result of the body expression normally. Works inside lambdas compiled to bytecode.
 

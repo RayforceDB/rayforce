@@ -47,7 +47,9 @@
 
 ;; a script that fails reports it and fails the process
 (.sys.exec "printf '(println 1)\\n(+ 1 (quote a))\\n' | ./rayforce - > /tmp/rfl_script_pipe/g.out 2>&1") -- 1
-(read "/tmp/rfl_script_pipe/g.out") -- "1\nerror: type: cannot add i64 and sym\n"
+;; (the REPL adds the call shape after the message, "; usage: ...", so the line is matched by its start)
+(.sys.exec "[ \"$(head -n 1 /tmp/rfl_script_pipe/g.out)\" = 1 ] && tail -n 1 /tmp/rfl_script_pipe/g.out | grep -q '^error: type: cannot add i64 and sym'") -- 0
+(count (split (read "/tmp/rfl_script_pipe/g.out") "\n")) -- 3
 
 ;; a regular file is read as before
 (.sys.exec "printf '(println 3)\\n' > /tmp/rfl_script_pipe/h.rfl; ./rayforce /tmp/rfl_script_pipe/h.rfl > /tmp/rfl_script_pipe/h.out 2>&1") -- 0

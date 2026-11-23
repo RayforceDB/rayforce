@@ -524,6 +524,7 @@ static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_co
         if (fi == 0) {
             fprintf(fp, "%s", err_code);
             if (detail) fprintf(fp, ": %s", detail);
+            if (ray_error_usage()) fprintf(fp, "; usage: %s", ray_error_usage());
         }
         if (use_color) fprintf(fp, "\033[0m");
         fprintf(fp, "\n");
@@ -566,6 +567,7 @@ static void repl_print_result(FILE* fp, ray_t* val, bool use_color) {
             char raised[512];
             const char* detail = repl_error_detail(raised, sizeof(raised));
             if (detail) fprintf(fp, ": %s", detail);
+            if (ray_error_usage()) fprintf(fp, "; usage: %s", ray_error_usage());
             if (use_color) fprintf(fp, "\033[0m");
             fprintf(fp, "\n");
         }

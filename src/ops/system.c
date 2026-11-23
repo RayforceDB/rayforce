@@ -1587,7 +1587,7 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     if (n == 0) {
         on = !ray_qlog_enabled();
     } else if (n == 1) {
-        if (args[0]->type != -RAY_I64) return ray_error("type", "flag must be i64");
+        if (args[0]->type != -RAY_I64) return ray_error("type", ".sys.querylog.enable: flag must be i64, got %s", ray_type_name(args[0]->type));
         on = args[0]->i64 != 0;
     } else {
         return ray_error("domain", ".sys.querylog.enable takes 0 or 1 arguments");
@@ -1648,7 +1648,7 @@ ray_t* ray_callprof_enable_fn(ray_t** args, int64_t n) {
     if (n == 0) {
         on = !ray_callprof_on();
     } else if (n == 1) {
-        if (args[0]->type != -RAY_I64) return ray_error("type", "flag must be i64");
+        if (args[0]->type != -RAY_I64) return ray_error("type", ".sys.profile.enable: flag must be i64, got %s", ray_type_name(args[0]->type));
         on = args[0]->i64 != 0;
     } else {
         return ray_error("domain", ".sys.profile.enable takes 0 or 1 arguments");
