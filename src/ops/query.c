@@ -11134,14 +11134,14 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 
 static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl);
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth);
-static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget);
+static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget, bool verbs);
 
 /* Does `e` read only its own row: no aggregate and no whole-column verb
  * (`distinct`, `reverse`, ...) here or in a helper it calls?  Then its
  * value over the rows, split by group, is its value per group. */
 static bool expr_reads_own_row(ray_t* e, ray_t* tbl) {
     int budget = 4096;
-    return !query_code_needs_group(e, tbl, false, 0, &budget);
+    return !query_code_needs_group(e, tbl, false, 0, &budget, true);
 }
 
 static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth);
@@ -19035,7 +19035,7 @@ static const void* const query_whole_col_verbs[] = {
     (void*)ray_group_indices_fn, (void*)ray_take_fn, (void*)ray_drop_fn,
 };
 
-static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget);
+static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget, bool verbs);
 
 /* Does the expression `e` call a whole-column verb (query_whole_col_verbs)
  * by a name still bound to it?  Its code only: a quoted form is data, and
@@ -19085,7 +19085,7 @@ static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
     if (query_value_is_code(e)) {               /* a function value, named or written in place */
         if (e->type == RAY_LAMBDA) return true;
         int budget = 1;
-        return query_code_needs_group_v(e, NULL, 0, &budget);   /* a builtin: the verb table */
+        return query_code_needs_group_v(e, NULL, 0, &budget, true);   /* a builtin: the verb table */
     }
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
     if (is_agg_expr(e)) return true;
@@ -19108,8 +19108,9 @@ static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
  * globals.  `head` is set for a call's
  * head, whose arity is_agg_expr has judged.  `*budget` bounds the walk,
  * and a walk that exhausts it says yes, which only keeps the helper per
- * group. */
-static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget) {
+ * group.  Without `verbs` only an aggregate counts (update under where:,
+ * #1435). */
+static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget, bool verbs) {
     if (!e) return false;
     if (--*budget < 0 || depth > 16) return true;
     if (e->type == -RAY_SYM) {
@@ -19125,20 +19126,21 @@ static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, i
         ray_t* v = local ? ray_env_get(e->i64) : ray_env_get_global(e->i64);
         if (!v && ray_sym_is_dotted(e->i64)) v = ray_env_get(e->i64);
         /* code only: data a name holds is not walked */
-        return query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget);
+        return query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget, verbs);
     }
-    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return query_code_needs_group_v(e, tbl, depth, budget);
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return query_code_needs_group_v(e, tbl, depth, budget, verbs);
     if (is_agg_expr(e)) return true;
     ray_t** es = (ray_t**)ray_data(e);
     for (int64_t i = 0; i < e->len; i++)
-        if (query_code_needs_group(es[i], tbl, i == 0, depth + 1, budget)) return true;
+        if (query_code_needs_group(es[i], tbl, i == 0, depth + 1, budget, verbs)) return true;
     return false;
 }
 
 /* query_code_needs_group for a value: a builtin, by the C function behind
  * it, a lambda, by its body and the code it captures. */
-static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget) {
+static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budget, bool verbs) {
     if (e->type == RAY_UNARY || e->type == RAY_BINARY || e->type == RAY_VARY) {
+        if (!verbs) return false;
         const void* fp = (const void*)(uintptr_t)e->i64;
         for (size_t i = 0; i < sizeof query_whole_col_verbs / sizeof *query_whole_col_verbs; i++)
             if (query_whole_col_verbs[i] == fp) return true;
@@ -19149,10 +19151,10 @@ static bool query_code_needs_group_v(ray_t* e, ray_t* tbl, int depth, int* budge
         ray_t* cv = c ? ray_dict_vals(c) : NULL;
         for (int64_t i = 0; cv && cv->type == RAY_LIST && i < cv->len; i++) {
             ray_t* v = ((ray_t**)ray_data(cv))[i];
-            if (query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget)) return true;
+            if (query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget, verbs)) return true;
         }
         ray_t* body = LAMBDA_BODY(e);
-        return body && query_code_needs_group(body, NULL, false, depth + 1, budget);
+        return body && query_code_needs_group(body, NULL, false, depth + 1, budget, verbs);
     }
     return false;
 }
@@ -19180,9 +19182,9 @@ static bool query_helper_call_hoists(ray_t* e, ray_t* tbl, ray_t* f) {
     int budget = 4096;
     for (int64_t i = 1; i < e->len; i++)
         if ((es[i]->type == -RAY_SYM || key_literal_is_fn(es[i])) &&
-            query_code_needs_group(es[i], tbl, false, 0, &budget)) return false;
-    return f->type == RAY_LAMBDA ? !query_code_needs_group_v(f, NULL, 0, &budget)
-                                 : !query_code_needs_group(f, NULL, false, 0, &budget);
+            query_code_needs_group(es[i], tbl, false, 0, &budget, true)) return false;
+    return f->type == RAY_LAMBDA ? !query_code_needs_group_v(f, NULL, 0, &budget, true)
+                                 : !query_code_needs_group(f, NULL, false, 0, &budget, true);
 }
 
 /* What the call `e` is to the hoist: 1 a running call, 0 a call whose
@@ -29256,10 +29258,11 @@ static ray_t* append_boxed_table_col(ray_t* orig_col, ray_t* payload,
  * rows into a sub-table, evaluates the update expressions there, and
  * scatters the results into the live columns in place.
  *
- * Only elementwise expressions take this path (see
- * update_expr_elementwise); anything else, and a predicate matching no
- * row, keeps the legacy arm.  Every result is type-checked before
- * anything is written,
+ * Only elementwise expressions (see update_expr_elementwise) and
+ * aggregating ones (update_expr_aggregates, evaluated by
+ * update_eval_kept over the same rows) take this path; anything else, and
+ * a predicate matching no row, keeps the legacy arm.  Every result is
+ * type-checked before anything is written,
  * so a mistyped or wrong-length value leaves the table untouched; only
  * an allocation failure inside a STR write can interrupt the scatter. */
 
@@ -29611,6 +29614,166 @@ static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
     return update_eval_on_impl(tbl, expr, true, NULL, ok ? mask : NULL);
 }
 
+/* ---- Aggregates under update's where: (#1435) ----
+ * An aggregate in a keyless update with where: sees the kept rows, as in a
+ * select with the same where:; a running call keeps its whole-table value
+ * (#1280) and an elementwise expression its row's. */
+
+/* Does the update expression `e` aggregate the rows of `tbl`: an aggregate
+ * over a column, inline or in a helper the planner inlines, or an aggregate
+ * anywhere in the code of a helper it cannot open (query_code_needs_group,
+ * aggregates only)? */
+static bool update_expr_aggregates(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST) return false;
+    if (expr_contains_agg_over_column(e, tbl)) return true;
+    if (!query_expr_has_helper(e)) return false;
+    ray_t* x = query_inline_helpers(e, tbl);
+    if (!x || RAY_IS_ERR(x)) { if (x) ray_error_free(x); return false; }
+    bool agg = expr_contains_agg_over_column(x, tbl);
+    if (!agg && query_expr_has_helper(x)) {
+        int budget = 4096;
+        agg = query_code_needs_group(x, tbl, false, 0, &budget, false);
+    }
+    ray_release(x);
+    return agg;
+}
+
+/* The aggregating expression `expr` over the kept rows `kept` (I64 row
+ * indices) of `tbl`, as the select's evaluator path takes it: its running
+ * calls run over the whole table into hidden columns first
+ * (select_plan_running_where), then the expression over the kept rows of
+ * the table and those columns.  Owned: an atom or one value per kept row. */
+static ray_t* update_eval_kept(ray_t* tbl, ray_t* expr, ray_t* kept) {
+    int64_t name = ray_sym_intern("#upd", 4);
+    ray_t* keys = ray_vec_new(RAY_SYM, 1);
+    ray_t* vals = ray_list_new(1);
+    if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    ((int64_t*)ray_data(keys))[keys->len++] = name;
+    vals = ray_list_append(vals, expr);
+    ray_t* d = ray_dict_new(keys, vals);
+    if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+    ray_t* plan = select_plan_running_where(d, tbl, false);
+    ray_release(d);
+    if (plan && RAY_IS_ERR(plan)) return plan;
+    ray_t* src = tbl;
+    ray_t* x = expr;
+    if (plan) {
+        ray_t* pk = ray_dict_keys(plan);
+        ray_t* pv = ray_dict_vals(plan);
+        int64_t from = ray_sym_intern("from", 4);
+        for (int64_t i = 0; pk && pv && pv->type == RAY_LIST && i < pk->len; i++) {
+            int64_t s = sym_cell_runtime_id(pk, i);
+            if (s == from) src = ((ray_t**)ray_data(pv))[i];
+            else if (s == name) x = ((ray_t**)ray_data(pv))[i];
+        }
+    }
+    /* Gather only the columns the expression names when it can reach no
+     * other (a helper the planner cannot open may read any). */
+    ray_t* narrow = NULL;
+    int64_t nc = ray_table_ncols(src);
+    if (nc > 1 && expr_reads_named_columns_only(x, src)) {
+        ray_t* refs_hdr = NULL;
+        int64_t* refs = (int64_t*)scratch_alloc(&refs_hdr, (size_t)nc * sizeof(int64_t));
+        int n = refs ? collect_col_refs_set(x, src, refs, (int)nc, 0) : 0;
+        if (n > 0 && n < nc) narrow = project_table_cols(src, refs, n);
+        if (refs_hdr) scratch_free(refs_hdr);
+        if (narrow && RAY_IS_ERR(narrow)) { if (plan) ray_release(plan); return narrow; }
+        if (narrow) src = narrow;
+    }
+    ray_t* sub = ray_at_fn(src, kept);
+    ray_t* v = !sub ? ray_error("oom", NULL) : RAY_IS_ERR(sub) ? sub : update_eval_on(sub, x);
+    if (sub && !RAY_IS_ERR(sub)) ray_release(sub);
+    if (narrow) ray_release(narrow);
+    if (plan) ray_release(plan);
+    return v;
+}
+
+/* The cell width of a fixed-width numeric or temporal vector type, whose
+ * nulls are payload sentinels gated by HAS_NULLS, for the where: word
+ * loops below; 0 for any other type. */
+static size_t update_fixed_esz(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESTAMP: case RAY_TIMESPAN: {
+        size_t esz = ray_elem_size(t);
+        return esz == 1 || esz == 2 || esz == 4 || esz == 8 ? esz : 0;
+    }
+    default: return 0;
+    }
+}
+
+/* `v` (one value per kept row of `m`) spread to `nrows` rows: a kept row
+ * gets its value, a dropped one zero bytes (fixed width) or null, which
+ * the merge never reads.  Owned. */
+static ray_t* update_spread_kept(ray_t* v, const uint8_t* m, int64_t nrows) {
+    int8_t t = v->type;
+    size_t esz = update_fixed_esz(t);
+    if (esz) {
+        ray_t* out = ray_vec_new(t, nrows);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = nrows;
+        /* nulls are sentinels in the payload; HAS_NULLS is their gate */
+        out->attrs |= (uint8_t)(v->attrs & RAY_ATTR_HAS_NULLS);
+        const void* s = ray_data(v);
+        void* d = ray_data(out);
+        int64_t k = 0;
+        #define SPREAD_KEPT(T) do { const T* ss = (const T*)s; T* dd = (T*)d;  \
+            for (int64_t r = 0; r < nrows; r++) dd[r] = m[r] ? ss[k++] : (T)0; } while (0)
+        switch (esz) {
+        case 8:  SPREAD_KEPT(uint64_t); break;
+        case 4:  SPREAD_KEPT(uint32_t); break;
+        case 2:  SPREAD_KEPT(uint16_t); break;
+        default: SPREAD_KEPT(uint8_t);  break;
+        }
+        #undef SPREAD_KEPT
+        return out;
+    }
+    /* any other type: a gather by each row's position among the kept rows,
+     * -1 (null) for a dropped row */
+    ray_t* pos = ray_vec_new(RAY_I64, nrows);
+    if (!pos || RAY_IS_ERR(pos)) return pos ? pos : ray_error("oom", NULL);
+    int64_t* p = (int64_t*)ray_data(pos);
+    int64_t k = 0;
+    for (int64_t r = 0; r < nrows; r++) p[r] = m[r] ? k++ : -1;
+    pos->len = nrows;
+    ray_t* out = ray_at_fn(v, pos);
+    ray_release(pos);
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* An update value under where: as the general path merges it, one value
+ * per row of `tbl` (or an atom): update_eval_where, except for an
+ * aggregating expression, evaluated over the kept rows (update_eval_kept)
+ * and spread back to them (update_spread_kept). */
+static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    if (update_expr_elementwise(expr, tbl, false) || !update_expr_aggregates(expr, tbl))
+        return update_eval_where(tbl, expr, mask);
+    ray_t* kept = ray_where_fn(mask);
+    if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
+    int64_t k = kept->len;
+    /* No kept row: nothing is written, and the expression is evaluated
+     * over the table as before, so its errors still surface (over no row
+     * `(max (+ w 'x))` would raise nothing). */
+    if (k == 0) { ray_release(kept); return update_eval_where(tbl, expr, mask); }
+    ray_t* v = update_eval_kept(tbl, expr, kept);
+    ray_release(kept);
+    if (!v || RAY_IS_ERR(v) || ray_is_atom(v)) return v;
+    if (ray_len(v) != k) {
+        int64_t got = ray_len(v);
+        ray_release(v);
+        return ray_error("length", "update: expression yields %lld values for %lld matched rows",
+                         (long long)got, (long long)k);
+    }
+    ray_t* out = update_spread_kept(v, (const uint8_t*)ray_data(mask), mask->len);
+    ray_release(v);
+    return out;
+}
+
 static bool update_numeric_promo(int8_t ct, int8_t et) {
     return (ct == RAY_I64 || ct == RAY_I32 || ct == RAY_F64) &&
            (et == RAY_I64 || et == RAY_I32 || et == RAY_F64);
@@ -29758,7 +29921,7 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
 
     /* One update per target column, first dict entry wins (legacy order). */
     ray_t* ucol_hdr = NULL; ray_t* uexpr_hdr = NULL; ray_t* uval_hdr = NULL;
-    int64_t* ucol = (int64_t*)scratch_alloc(&ucol_hdr, (size_t)ncols * sizeof(int64_t));
+    int64_t* ucol = (int64_t*)scratch_alloc(&ucol_hdr, (size_t)ncols * (sizeof(int64_t) + 1));
     ray_t** uexpr = (ray_t**)scratch_alloc(&uexpr_hdr, (size_t)ncols * sizeof(ray_t*));
     ray_t** uval = (ray_t**)scratch_alloc(&uval_hdr, (size_t)ncols * sizeof(ray_t*));
     if (!ucol || !uexpr || !uval) {
@@ -29767,16 +29930,22 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
         if (uval_hdr) scratch_free(uval_hdr);
         DICT_VIEW_CLOSE(updf); *handled = true; return ray_error("oom", NULL);
     }
+    /* uagg[u]: the expression aggregates, so it reads the kept rows of the
+     * table and of its whole-table running calls (update_eval_kept) */
+    uint8_t* uagg = (uint8_t*)(ucol + ncols);
     int64_t nu = 0;
-    bool rowwise = true;
+    bool rowwise = true, any_rowwise = false;
     for (int64_t c = 0; c < ncols; c++) {
         int64_t cn = ray_table_col_name(tbl, c);
         for (int64_t d = 0; d + 1 < updf_n; d += 2) {
             int64_t kid = updf[d]->i64;
             if (kid == from_id || kid == where_id || kid == by_id) continue;
             if (kid != cn) continue;
-            ucol[nu] = c; uexpr[nu] = updf[d + 1]; uval[nu] = NULL; nu++;
-            if (!update_expr_elementwise(updf[d + 1], tbl, false)) rowwise = false;
+            ucol[nu] = c; uexpr[nu] = updf[d + 1]; uval[nu] = NULL; uagg[nu] = 0;
+            if (update_expr_elementwise(updf[d + 1], tbl, false)) any_rowwise = true;
+            else if (update_expr_aggregates(updf[d + 1], tbl)) uagg[nu] = 1;
+            else rowwise = false;
+            nu++;
             break;
         }
     }
@@ -29853,13 +30022,13 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
             ray_t* r2 = ray_vec_append_raw(idxv, rows, k);
             if (RAY_IS_ERR(r2)) { err = r2; } else idxv = r2;
         }
-        if (!err) {
+        if (!err && any_rowwise) {
             sub = ray_at_fn(tbl, idxv);
             if (!sub || RAY_IS_ERR(sub)) { err = sub ? sub : ray_error("oom", NULL); sub = NULL; }
         }
     }
     for (int64_t u = 0; u < nu && !err; u++) {
-        ray_t* v = update_eval_on(sub, uexpr[u]);
+        ray_t* v = uagg[u] ? update_eval_kept(tbl, uexpr[u], idxv) : update_eval_on(sub, uexpr[u]);
         if (RAY_IS_ERR(v)) { err = v; break; }
         uval[u] = v;
         err = update_value_check(slots[ucol[u]], v, k);
@@ -30340,7 +30509,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
-                ray_t* expr_vec = update_eval_where(tbl, update_expr, mask_vec);
+                ray_t* expr_vec = update_where_value(tbl, update_expr, mask_vec);
                 if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
                 if (expr_vec->type >= 0 && ray_len(expr_vec) != nrows) {
                     int64_t got = ray_len(expr_vec);
@@ -30449,7 +30618,21 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                          * 8-byte buffer and write the wrong source for GUID. */
                         uint8_t elem[16];
                         update_atom_cell(expr_vec, ct, ray_elem_size(ct), elem);
-                        for (int64_t r = 0; r < nrows; r++) {
+                        size_t fesz = update_fixed_esz(ct);
+                        if (fesz) {
+                            /* one cell written nrows times, without the
+                             * per-row append */
+                            #define BCAST_FILL(T) do { T c_; memcpy(&c_, elem, sizeof c_); T* d_ = (T*)ray_data(bcast); \
+                                for (int64_t r = 0; r < nrows; r++) d_[r] = c_; } while (0)
+                            switch (fesz) {
+                            case 8:  BCAST_FILL(uint64_t); break;
+                            case 4:  BCAST_FILL(uint32_t); break;
+                            case 2:  BCAST_FILL(uint16_t); break;
+                            default: BCAST_FILL(uint8_t);  break;
+                            }
+                            #undef BCAST_FILL
+                            bcast->len = nrows;
+                        } else for (int64_t r = 0; r < nrows; r++) {
                             bcast = ray_vec_append(bcast, elem);
                             if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
                         }
@@ -30557,7 +30740,28 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                     size_t elem_sz = ray_elem_size(ct);
                     uint8_t* orig_data = (uint8_t*)ray_data(orig_col);
                     uint8_t* expr_data = (uint8_t*)ray_data(expr_vec);
-                    for (int64_t r = 0; r < nrows; r++) {
+                    size_t fesz = update_fixed_esz(ct);
+                    if (fesz && !(orig_col->attrs & RAY_ATTR_SLICE) && !(expr_vec->attrs & RAY_ATTR_SLICE)) {
+                        /* Fixed width: one pass over the rows, no per-row
+                         * append.  Nulls are payload sentinels, so the
+                         * cells carry them; HAS_NULLS is set when a
+                         * written cell is one. */
+                        #define MERGE_FILL(T) do { const T* o_ = (const T*)orig_data; const T* e_ = (const T*)expr_data; \
+                            T* d_ = (T*)ray_data(new_col);                                                  \
+                            for (int64_t r = 0; r < nrows; r++) d_[r] = mask[r] ? e_[r] : o_[r]; } while (0)
+                        switch (fesz) {
+                        case 8:  MERGE_FILL(uint64_t); break;
+                        case 4:  MERGE_FILL(uint32_t); break;
+                        case 2:  MERGE_FILL(uint16_t); break;
+                        default: MERGE_FILL(uint8_t);  break;
+                        }
+                        #undef MERGE_FILL
+                        new_col->len = nrows;
+                        if ((orig_col->attrs | expr_vec->attrs) & RAY_ATTR_HAS_NULLS) {
+                            new_col->attrs |= RAY_ATTR_HAS_NULLS;
+                            if (!ray_vec_has_nulls(new_col)) new_col->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+                        }
+                    } else for (int64_t r = 0; r < nrows; r++) {
                         ray_t* src_vec = mask[r] ? expr_vec : orig_col;
                         uint8_t* base  = mask[r] ? expr_data : orig_data;
                         new_col = ray_vec_append(new_col, base + r * elem_sz);
@@ -30589,7 +30793,7 @@ ray_t* ray_update(ray_t** args, int64_t n) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_eval_where(tbl, dict_elems[d + 1], mask_vec);
+            ray_t* v = update_where_value(tbl, dict_elems[d + 1], mask_vec);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {
@@ -30618,10 +30822,40 @@ ray_t* ray_update(ray_t** args, int64_t n) {
                 ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw);
                 return v ? v : ray_error("oom", NULL);
             }
-            ray_t* nul = ray_typed_null((int8_t)-v->type);
-            for (int64_t r = 0; r < nrows && nul && !RAY_IS_ERR(nul); r++)
-                if (!mask[r]) store_typed_elem(v, r, nul);
-            if (nul && !RAY_IS_ERR(nul)) ray_release(nul);
+            size_t fesz = update_fixed_esz(v->type);
+            if (fesz && !(v->attrs & RAY_ATTR_SLICE)) {
+                /* Fixed width: the null cell (a sentinel; zero for BOOL and
+                 * U8) written into every dropped row in one pass. */
+                uint8_t cell[8] = {0};
+                switch (v->type) {
+                case RAY_F64: { double x = NULL_F64; memcpy(cell, &x, sizeof x); break; }
+                case RAY_F32: { float x = NULL_F32; memcpy(cell, &x, sizeof x); break; }
+                case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: { int64_t x = NULL_I64; memcpy(cell, &x, sizeof x); break; }
+                case RAY_I32: case RAY_DATE: case RAY_TIME: { int32_t x = NULL_I32; memcpy(cell, &x, sizeof x); break; }
+                case RAY_I16: { int16_t x = NULL_I16; memcpy(cell, &x, sizeof x); break; }
+                default: break;
+                }
+                /* a payload write invalidates an attached index */
+                ray_index_drop(&v);
+                if (!v || RAY_IS_ERR(v)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return v ? v : ray_error("oom", NULL); }
+                bool any = false;
+                #define NULL_FILL(T) do { T c_; memcpy(&c_, cell, sizeof c_); T* d_ = (T*)ray_data(v); \
+                    for (int64_t r = 0; r < nrows; r++) if (!mask[r]) { d_[r] = c_; any = true; } } while (0)
+                switch (fesz) {
+                case 8:  NULL_FILL(uint64_t); break;
+                case 4:  NULL_FILL(uint32_t); break;
+                case 2:  NULL_FILL(uint16_t); break;
+                default: NULL_FILL(uint8_t);  break;
+                }
+                #undef NULL_FILL
+                if (any && v->type != RAY_BOOL && v->type != RAY_U8)
+                    v->attrs |= RAY_ATTR_HAS_NULLS;
+            } else {
+                ray_t* nul = ray_typed_null((int8_t)-v->type);
+                for (int64_t r = 0; r < nrows && nul && !RAY_IS_ERR(nul); r++)
+                    if (!mask[r]) store_typed_elem(v, r, nul);
+                if (nul && !RAY_IS_ERR(nul)) ray_release(nul);
+            }
             result = ray_table_add_col(result, kid, v);
             ray_release(v);
             if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
