@@ -1798,6 +1798,38 @@ static ray_t* col_validate_mapped(const char* path, col_mapped_t* out) {
     return NULL;  /* success */
 }
 
+ray_err_t ray_col_set_index_order(const char* path, int64_t code) {
+    col_mapped_t cm;
+    memset(&cm, 0, sizeof cm);
+    ray_t* verr = col_validate_mapped(path, &cm);
+    if (verr) { ray_error_free(verr); return RAY_ERR_DOMAIN; }
+    bool ok = !cm.gen2 && cm.has_index;
+    size_t at = 0;
+    if (ok) {
+        const ray_t* blk = (const ray_t*)((const char*)cm.mapped + cm.index_offset);
+        ray_index_t ix;
+        memcpy(&ix, (const char*)blk + 32, sizeof ix);
+        ok = blk->type == RAY_INDEX && blk->len == (int64_t)sizeof(ray_index_t) &&
+             (ix.kind == RAY_IDX_HASH || ix.kind == RAY_IDX_PART);
+        if (ok) at = cm.index_offset + 32 +
+                     (ix.kind == RAY_IDX_HASH ? offsetof(ray_index_t, u.hash.order_sym)
+                                              : offsetof(ray_index_t, u.part.order_sym));
+    }
+    ray_vm_unmap_file(cm.mapped, cm.mapped_size);
+    if (!ok) return RAY_ERR_DOMAIN;
+    FILE* f = fopen(path, "r+b");
+    if (!f) return RAY_ERR_IO;
+    ray_err_t err = RAY_OK;
+#ifdef RAY_OS_WINDOWS
+    if (_fseeki64(f, (int64_t)at, SEEK_SET) != 0) err = RAY_ERR_IO;
+#else
+    if (fseeko(f, (off_t)at, SEEK_SET) != 0) err = RAY_ERR_IO;
+#endif
+    if (err == RAY_OK && fwrite(&code, sizeof code, 1, f) != 1) err = RAY_ERR_IO;
+    if (fclose(f) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    return err;
+}
+
 /* --------------------------------------------------------------------------
  * ray_col_load -- load a column file via mmap (zero deserialization)
  * -------------------------------------------------------------------------- */

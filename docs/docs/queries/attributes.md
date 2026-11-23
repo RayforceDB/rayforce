@@ -152,9 +152,9 @@ Equality keys are now **optional**.  A single time key runs an un-partitioned as
 (.attr.get (at Ls 'Time))                                        ; ⇒ ['sorted]
 ```
 
-### Partitioned: a `parted` numeric key
+### Partitioned: a `parted` key
 
-For a partitioned join `(asof-join [Key Time] L R)`, if the single numeric equality key is `parted` and its time column is non-descending within each part, that side's sort is skipped.  Note `parted` is **numeric-only** — the equality key here is a numeric ID, not a symbol:
+For a partitioned join `(asof-join [Key Time] L R)`, if the single equality key is `parted` and its time column is non-descending within each part, that side's sort is skipped.  `parted` accepts a numeric or a `SYM` key; the example uses a numeric ID:
 
 ```lisp
 (set Lgp (table [ID Time Price]
@@ -187,7 +187,7 @@ A duplicated value answers its first position, and a missing value answers `0Nl`
 ## Caveats and Limits
 
 - **Type support.** `sorted` accepts numeric types; `parted` numeric and `SYM`. `unique` and `grouped` accept numeric, `SYM` and `STR` — a `STR` hash is keyed on a 64-bit hash of the bytes with the payload compared on every hit, so a content-keyed column (a digest) carries an index like any other.  A `STR` `grouped` column persists its hash through a splayed save in place of the automatic string dictionary (one index per column).
-- **Splayed saves.**  A `grouped` or `parted` column keeps its index and its `unique` marker through `.db.splayed.set` and `.db.splayed.get`, in both generations; a `SYM` column's index is rebuilt over the symbol file's ids.  The note that rows inside each group or part are also ordered by another column (what `xasc` on several columns records, and what lets `asof-join` skip its order check) is kept only by a compressed save, which stores that column's name.  A generation-0 file has no place for the name, so the reloaded column has no such note and `asof-join` checks the order itself.
+- **Splayed saves.**  A `grouped` or `parted` column keeps its index and its `unique` marker through `.db.splayed.set` and `.db.splayed.get`, in both generations; a `SYM` column's index is rebuilt over the symbol file's ids.  The note that rows inside each group or part are also ordered by another column (what `xasc` on several columns records, and what lets `asof-join` skip its order check) is kept too: a compressed file stores that column's name, an uncompressed one its position in the table, and `.db.splayed.get` and `.db.parted.get` turn it back into the column.  A column file read on its own, outside its table, has no such note, and `asof-join` then checks the order itself.
 - **Strict verify, no silent stamping.**  `.attr.set` errors on violation rather than recording a property it cannot confirm; this is what lets consumers trust the stamp unconditionally.
 - **Conservative propagation.**  Only copy / rebind preserve attributes; every transform drops them, except an append of new keys onto a `grouped` vector (see above).  Re-assert with `.attr.set` after any other transform.
 - **One backing index per column.**  `grouped` and `parted` share the [accelerator-index](indexes.md) slot, so a column carries at most one of them at a time; the markers are separate and free.

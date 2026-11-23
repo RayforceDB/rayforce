@@ -1668,12 +1668,21 @@ static uint8_t idx_format_of(const ray_index_t* ix) {
 /* What a region may not carry from a heap root (#838).  order_sym is a
  * runtime symbol id and a region has no name to resolve it by: read in
  * another process the id can name another column, and the as-of route
- * would trust an unsorted one as ordered (generation 2 stores the name).
+ * would trust an unsorted one as ordered (generation 2 stores the name; a
+ * splayed save then stores the column's position, splay_note_orders).
  * A SYM child's header holds this process's domain pointer at bytes 8-15;
  * the column file's symfile is the keys' domain on load, so none is kept. */
 static void idx_region_head_scrub(ray_index_t* on) {
     if (on->kind == RAY_IDX_HASH) on->u.hash.order_sym = -1;
     else if (on->kind == RAY_IDX_PART) on->u.part.order_sym = -1;
+}
+/* On map: a symbol id goes (older files wrote one); a table position a
+ * splayed save stored (RAY_IDX_ORDER_POS, store/col.h: below -1) stays for
+ * the table reader to resolve. */
+static void idx_region_map_scrub(ray_index_t* ix) {
+    int64_t* o = ix->kind == RAY_IDX_HASH ? &ix->u.hash.order_sym
+               : ix->kind == RAY_IDX_PART ? &ix->u.part.order_sym : NULL;
+    if (o && *o >= -1) *o = -1;
 }
 static void idx_region_child_scrub(ray_t* chdr) {
     if (chdr->type == RAY_SYM) chdr->sym_domain = NULL;
@@ -1837,7 +1846,7 @@ ray_t* ray_index_inline_map(uint8_t* region, int64_t region_size) {
          (ix->u.part.lens && ix->u.part.lens->type != RAY_I64)))
         return NULL;
     /* Regions written before idx_region_head_scrub may hold either. */
-    idx_region_head_scrub(ix);
+    idx_region_map_scrub(ix);
     for (int i = 0; i < nch; i++)
         if (*slots[i]) idx_region_child_scrub(*slots[i]);
     ix->markers |= RAY_MARK_MMAP;

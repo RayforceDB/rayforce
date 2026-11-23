@@ -4,7 +4,7 @@
 ;; rebuilt over those positions; before the fix it was not written at all
 ;; and the reloaded column came back with no index.  The global symbol
 ;; domain is polluted first so file-local and runtime ids differ.
-(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl")
+(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl /tmp/rfl_sym_part_persist_o.rfl")
 (set junk ['z0 'z1 'z2 'z3 'z4 'z5 'z6 'z7 'z8 'z9 'p 'q 'r 's 't 'u 'w 'x 'y])
 
 (set P (.attr.set 'parted (asc (take ['a 'b 'c] 600))))
@@ -54,18 +54,22 @@
 (.db.splayed.set "/tmp/rfl_sym_part_persist/d/" T {compress: true})
 (.attr.get (at (.db.splayed.get "/tmp/rfl_sym_part_persist/d/") 'p)) -- '[parted]
 
-;; Generation 0 also drops order_sym, for every column type.  An index
-;; region stored it as a runtime symbol id, with no name to resolve it by.
-;; Reloaded in another process, where the same id names another column, it
-;; told as-of that the PART on kq was ordered by that column, and as-of
-;; then binary-searched an unsorted one.  Two child processes: the writer
-;; interns kq tq vq, the reader kq vq tq, so the reader's vq has the id the
-;; writer's tq had.  xasc twice stamps PART on kq ordered by tq
-;; (compress_index.rfl).  The reader compares with the same rows in a
-;; fresh table that has no index; both must give [2502 2401].
+;; The column a PART or HASH is ordered by (order_sym).  A generation-0
+;; index region stored it as a runtime symbol id.  Reloaded in another
+;; process, where the same id names another column, it told as-of that the
+;; PART on kq was ordered by that column, and as-of then binary-searched an
+;; unsorted one.  A splayed save now stores the column's position in the
+;; table instead, and the table reader turns it back into the name.  Two
+;; child processes: the writer interns kq tq vq, the readers kq vq tq, so
+;; the reader's vq has the id the writer's tq had.  xasc twice stamps PART
+;; on kq ordered by tq (compress_index.rfl).  The first reader compares with
+;; the same rows in a fresh table that has no index; both must give
+;; [2502 2401].  The second takes the ordered as-of route on tq.
 (.sys.exec "printf '%s\n' '(set Q (xasc (xasc (table [kq tq vq] (list (% (til 3000) 3) (til 3000) (- 5000 (til 3000)))) (list (quote kq) (quote tq))) (list (quote kq) (quote tq))))' '(.db.splayed.set \"/tmp/rfl_sym_part_persist/q/\" Q {compress: false})' '(println (at (.idx.info (at Q (quote kq))) (quote kind)))' > /tmp/rfl_sym_part_persist_w.rfl") -- 0
 (.sys.exec "printf '%s\n' '(set T0 (table [kq vq tq] (list [0] [0] [0])))' '(set Q0 (.db.splayed.get \"/tmp/rfl_sym_part_persist/q/\"))' '(set P0 (table [kq tq vq] (list (+ 0 (at Q0 (quote kq))) (+ 0 (at Q0 (quote tq))) (+ 0 (at Q0 (quote vq))))))' '(set L (table [kq vq] (list [0 1] [2500 2600])))' '(println (at (asof-join [kq vq] L Q0) (quote tq)) (at (asof-join [kq vq] L P0) (quote tq)))' > /tmp/rfl_sym_part_persist_r.rfl") -- 0
 (.sys.exec "./rayforce -f /tmp/rfl_sym_part_persist_w.rfl 2>/dev/null | tail -1 | grep -qx \"'part\"") -- 0
+(.sys.exec "printf '%s\n' '(set T0 (table [kq vq tq] (list [0] [0] [0])))' '(set Q0 (.db.splayed.get \"/tmp/rfl_sym_part_persist/q/\"))' '(println (count (asof-join [kq tq] (table [kq tq] (list [0 1 2] [100 200 2999])) Q0)))' > /tmp/rfl_sym_part_persist_o.rfl") -- 0
+(.sys.exec "RAY_IDX_STATS=1 ./rayforce -f /tmp/rfl_sym_part_persist_o.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
 (.sys.exec "./rayforce -f /tmp/rfl_sym_part_persist_r.rfl 2>/dev/null | tail -1 | grep -qxF '[2502 2401] [2502 2401]'") -- 0
 
-(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl") -- 0
+(.sys.exec "rm -rf /tmp/rfl_sym_part_persist /tmp/rfl_sym_part_persist_w.rfl /tmp/rfl_sym_part_persist_r.rfl /tmp/rfl_sym_part_persist_o.rfl") -- 0
