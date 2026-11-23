@@ -5725,6 +5725,33 @@ static test_result_t test_eval_part_skip_xbar_by(void) {
     return part_skip_run("xbar_by", cases, sizeof cases / sizeof cases[0]);
 }
 
+/* An `or` or a `not` as the whole where: skips the partitions every
+ * branch rules out (#1502): a `not` narrows as the complementary
+ * comparison (nulls rank lowest), an `or` by the union of its operands,
+ * an operand that cannot narrow keeps every partition. */
+static test_result_t test_eval_part_skip_or_not(void) {
+    static const part_skip_t cases[] = {
+        { "(select {from: %s where: (or (>= ts 2026.01.07D00:00:00.000) (< ts 2026.01.05D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (not (< ts 2026.01.06D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (not (>= ts 2026.01.06D00:00:00.000))})", false, 2 },
+        { "(select {from: %s where: (or (== date 2026.01.07) (== date 2026.01.08))})", false, 2 },
+        { "(select {from: %s where: (not (< date 2026.01.07))})", false, 2 },
+        { "(select {from: %s where: (not (or (< ts 2026.01.07D00:00:00.000) (> ts 2026.01.08D03:30:00.000)))})", false, 2 },
+        { "(select {from: %s where: (not (and (>= ts 2026.01.06D00:00:00.000) (<= ts 2026.01.07D05:00:00.000)))})", false, 1 },
+        { "(select {from: %s where: (or (>= ts 2026.01.08D00:00:00.000) (in v [1 2]))})", false, 2 },
+        { "(select {from: %s where: (or (>= ts 2026.01.08D00:00:00.000) (> (* v 2) 100))})", false, 0 },
+        { "(select {from: %s where: (not (!= ts 2026.01.07D01:00:00.000))})", false, 3 },
+        { "(select {from: %s where: (not (in v [1 2]))})", false, 0 },
+        { "(select {from: %s where: (and (or (< ts 2026.01.06D00:00:00.000) (>= ts 2026.01.08D00:00:00.000)) (> v 1))})", false, 1 },
+        { "(select {from: %s where: (or (not (> ts 2026.01.05D01:30:00.000)) (== v 7))})", false, 1 },
+        { "(select {c: (count v) from: %s where: (or (>= ts 2026.01.07D00:00:00.000) (< ts 2026.01.05D00:00:00.000))})", false, 1 },
+        { "(select {from: %s where: (or (>= part 2026.01.07D00:00:00.000) (< part 2026.01.04D00:00:00.000))})", true, 2 },
+        { "(select {from: %s where: (not (< part 2026.01.07D00:00:00.000))})", true, 2 },
+        { "(select {from: %s where: (not (== part 2026.01.07D00:00:00.000))})", true, 1 },
+    };
+    return part_skip_run("or_not", cases, sizeof cases / sizeof cases[0]);
+}
+
 /* ---- Test: an if answers the same with and without pool workers -------- */
 
 /* With no workers the selected arm of OP_IF (compact each branch's rows,
@@ -14312,6 +14339,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/part_skip_count_select", test_eval_part_skip_count_select, lang_setup, lang_teardown },
     { "lang/eval/part_skip_date_literal", test_eval_part_skip_date_literal, lang_setup, lang_teardown },
     { "lang/eval/part_skip_xbar_by", test_eval_part_skip_xbar_by, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_or_not", test_eval_part_skip_or_not, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

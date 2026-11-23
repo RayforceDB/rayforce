@@ -276,6 +276,8 @@ A date literal compared with a timestamp column or a timestamp partition key nar
 
 A `by:` of `(xbar column bucket)` with a constant atom bucket, written or bound to a name, keeps the narrowing the `where:` gives, as a `by:` of a plain column does; so does such an `xbar` as an output.
 
+A top-level `or` narrows to the partitions any of its operands keeps; an operand that cannot narrow keeps every partition. A `not` of a comparison narrows as the complementary comparison, a null being the lowest value: `(not (< time t))` reads what `(>= time t)` reads, and `not` over `and`/`or` follows the same rule through each operand.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.

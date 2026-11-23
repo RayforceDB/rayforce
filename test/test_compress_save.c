@@ -4466,10 +4466,11 @@ static const char* const sp_preds[] = {
 };
 
 /* The query of shape i over predicate p; `unpruned` wraps the predicate in
- * an `or` the pruner does not read, so the whole table is scanned. */
+ * an `or` with a `false` operand, which narrows no partition, so the whole
+ * table is scanned. */
 static ray_t* sp_eval(int i, const char* p, bool unpruned) {
     char pred[160], q[400];
-    if (unpruned) snprintf(pred, sizeof pred, "(or %s %s)", p, p);
+    if (unpruned) snprintf(pred, sizeof pred, "(or false %s %s)", p, p);
     else snprintf(pred, sizeof pred, "%s", p);
     snprintf(q, sizeof q, sp_shapes[i], pred);
     return ray_eval_str(q);
@@ -4528,7 +4529,8 @@ static test_result_t test_select_parted_prunes_fetch(void) {
 
 /* Row-local additions must really create the narrowed source, not just
  * return equal answers through the old full scan. The top-level OR used by
- * the reference cannot derive a necessary mask (unlike an OR below AND).
+ * the reference cannot derive a necessary mask: its `false` operand narrows
+ * no partition, so neither does the union.
  * No timing assertion, encoded-materialization count or physical-I/O claim. */
 static test_result_t test_select_parted_prunes_local_shapes(void) {
     static const struct { const char* output; const char* pred; int64_t rows; bool pruned; } qs[] = {
@@ -4565,7 +4567,7 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
             char q[512], ref[768];
             snprintf(q, sizeof q, "(select {from: t where: %s %s})", qs[i].pred, qs[i].output);
-            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) %s})",
+            snprintf(ref, sizeof ref, "(select {from: t where: (or false %s %s) %s})",
                      qs[i].pred, qs[i].pred, qs[i].output);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
@@ -4615,7 +4617,7 @@ static test_result_t test_select_parted_prunes_ordinary_uncapped(void) {
             const char* expr = kind ? deep : "a";
             char q[12288], ref[16384];
             snprintf(q, sizeof q, "(select {from: t where: %s q: %s})", pred, expr);
-            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) q: %s})", pred, pred, expr);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or false %s %s) q: %s})", pred, pred, expr);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
 #endif
@@ -4744,7 +4746,7 @@ static test_result_t test_select_parted_prunes_if_limits(void) {
                 TEST_ASSERT_TRUE(written != SIZE_MAX);
             }
             snprintf(q, sizeof q, "(select {from:t where:(== date 2024.01.02) q:%s})", expr);
-            snprintf(ref, sizeof ref, "(select {from:t where:(or (== date 2024.01.02) (== date 2024.01.02)) q:%s})", expr);
+            snprintf(ref, sizeof ref, "(select {from:t where:(or false (== date 2024.01.02) (== date 2024.01.02)) q:%s})", expr);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
 #endif
@@ -4833,7 +4835,7 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
             const char* pred = cases[i].pred ? cases[i].pred : "(== date 2024.01.02)";
             snprintf(q, sizeof q, "(xasc (select {from: t where: %s %s}) (key (select {from: t where: %s %s})))",
                      pred, cases[i].output, pred, cases[i].output);
-            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or %s %s) %s}) (key (select {from: t where: (or %s %s) %s})))",
+            snprintf(ref, sizeof ref, "(xasc (select {from: t where: (or false %s %s) %s}) (key (select {from: t where: (or false %s %s) %s})))",
                      pred, pred, cases[i].output, pred, pred, cases[i].output);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
@@ -4883,7 +4885,7 @@ static test_result_t test_select_parted_prunes_if_symbols(void) {
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             char q[768], ref[1024];
             snprintf(q, sizeof q, "(select {from: t where: (== date 2024.01.02) q: (if %s 1 0)})", cases[i].cond);
-            snprintf(ref, sizeof ref, "(select {from: t where: (or (== date 2024.01.02) (== date 2024.01.02)) q: (if %s 1 0)})", cases[i].cond);
+            snprintf(ref, sizeof ref, "(select {from: t where: (or false (== date 2024.01.02) (== date 2024.01.02)) q: (if %s 1 0)})", cases[i].cond);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
 #endif
@@ -4950,7 +4952,7 @@ static test_result_t test_select_parted_prunes_group_limits(void) {
                                           cases[i].refs_edge ? "b" : "0");
             }
             snprintf(q, sizeof q, "(select {from:t where:(== date 2024.01.02) by:g%s})", outs);
-            snprintf(ref, sizeof ref, "(select {from:t where:(or (== date 2024.01.02) (== date 2024.01.02)) by:g%s})", outs);
+            snprintf(ref, sizeof ref, "(select {from:t where:(or false (== date 2024.01.02) (== date 2024.01.02)) by:g%s})", outs);
 #ifdef DEBUG
             (void)ray_query_test_parted_pruned_sources(true);
 #endif
@@ -5040,7 +5042,7 @@ static test_result_t test_select_parted_prunes_grouped_if(void) {
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
             char q[1024], ref[1536];
             int n = snprintf(q, sizeof q, "(select {from:_prune_grouped_source where:%s by:g %s})", cases[i].pred, cases[i].outputs);
-            int m = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or %s %s) by:g %s})",
+            int m = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or false %s %s) by:g %s})",
                 cases[i].pred, cases[i].pred, cases[i].outputs);
             if (n < 0 || (size_t)n >= sizeof q || m < 0 || (size_t)m >= sizeof ref) {
                 pdb_grouped_if_bind(NULL); ray_release(t); FAIL("grouped IF query buffer");
@@ -5175,7 +5177,7 @@ static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
             char q[1024], ref[1536], flat[1536], spl[1536], want[64];
             int n0 = snprintf(q, sizeof q, "(select {from:_pm_p where:%s by:%s %s})",
                               cases[i].pred, cases[i].by, cases[i].outputs);
-            int n1 = snprintf(ref, sizeof ref, "(select {from:_pm_p where:(or %s %s) by:%s %s})",
+            int n1 = snprintf(ref, sizeof ref, "(select {from:_pm_p where:(or false %s %s) by:%s %s})",
                               cases[i].pred, cases[i].pred, cases[i].by, cases[i].outputs);
             int n2 = snprintf(flat, sizeof flat, "(xasc (select {from:_pm_f where:%s by:%s %s}) %s)",
                               cases[i].pred, cases[i].by, cases[i].outputs, key);
@@ -5250,7 +5252,7 @@ static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
             const char* pred = "(== date 2024.01.02)";
             const char* output = "by:g s:(sum (if (not (== x 0)) a b)) t:(sum (if (not (== x 0)) b a))";
             int a = snprintf(q, sizeof q, "(select {from:_prune_grouped_source where:%s %s})", pred, output);
-            int b = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or %s %s) %s})", pred, pred, output);
+            int b = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or false %s %s) %s})", pred, pred, output);
             int c, d;
             if (heads[i].local) {
                 c = snprintf(actual, sizeof actual, "((fn [%s] %s) %s)", heads[i].local, q, heads[i].local);
@@ -5290,7 +5292,7 @@ static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
         const char* outputs = "by:g Accepted:(sum (if (== act 'New) qty 0)) s:(sum (if (== act 'Accepted) qty 0)) t:(sum (if (!= act 'Accepted) qty 0))";
         char q[1024], ref[1536];
         int a = snprintf(q, sizeof q, "(select {from:_prune_grouped_source where:(== date 2024.01.02) %s})", outputs);
-        int b = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or (== date 2024.01.02) (== date 2024.01.02)) %s})", outputs);
+        int b = snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or false (== date 2024.01.02) (== date 2024.01.02)) %s})", outputs);
         if (a < 0 || (size_t)a >= sizeof q || b < 0 || (size_t)b >= sizeof ref) {
             pdb_grouped_if_bind(NULL); ray_release(t); FAIL("grouped alias query buffer");
         }
@@ -5343,7 +5345,7 @@ static test_result_t test_select_parted_prunes_head_bindings(void) {
             char q[1024], ref[1536];
             snprintf(q, sizeof q, "((fn [%s] (select {from: t where: %s %s})) %s)",
                      qs[i].names, qs[i].pred, qs[i].output, qs[i].args);
-            snprintf(ref, sizeof ref, "((fn [%s] (select {from: t where: (or %s %s) %s})) %s)",
+            snprintf(ref, sizeof ref, "((fn [%s] (select {from: t where: (or false %s %s) %s})) %s)",
                      qs[i].names, qs[i].pred, qs[i].pred, qs[i].output, qs[i].args);
             drop_out(ray_eval_str("(set _prune_hits 0)"));
 #ifdef DEBUG
@@ -5495,7 +5497,7 @@ static test_result_t test_select_parted_prunes_table_heads(void) {
         for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
             char q[512], ref[768];
             snprintf(q, sizeof q, "(select {from: t where: %s %s})", qs[i].pred, qs[i].output);
-            snprintf(ref, sizeof ref, "(select {from: t where: (or %s %s) %s})",
+            snprintf(ref, sizeof ref, "(select {from: t where: (or false %s %s) %s})",
                      qs[i].pred, qs[i].pred, qs[i].output);
             uint64_t created = 0, reference = 0;
 #ifdef DEBUG
@@ -5578,7 +5580,7 @@ static test_result_t test_select_parted_prunes_dictionary_key_widths(void) {
                 const char* name = alias ? "a" : "q";
                 char actual[256], reference[320];
                 snprintf(actual, sizeof(actual), "{%s:(if (< a 8) a 0) from:t where:(== date 2024.01.02)}", name);
-                snprintf(reference, sizeof(reference), "{%s:(if (< a 8) a 0) from:t where:(or (== date 2024.01.02) (== date 2024.01.02))}", name);
+                snprintf(reference, sizeof(reference), "{%s:(if (< a 8) a 0) from:t where:(or false (== date 2024.01.02) (== date 2024.01.02))}", name);
 #ifdef DEBUG
                 ray_query_test_parted_pruned_sources(true);
 #endif
@@ -5630,7 +5632,7 @@ static test_result_t test_select_parted_prunes_take_head_effects(void) {
             snprintf(restore, sizeof(restore), "(set %s _prune_saved_head)", head);
             snprintf(effect, sizeof(effect), "(do (set _prune_take_hits (+ _prune_take_hits 1)) (set %s %s) 1)", head, replacement);
             snprintf(actual, sizeof(actual), "(select {q:%s from:t where:%s%s take:%s})", output, where, by, effect);
-            snprintf(reference, sizeof(reference), "(select {q:%s from:t where:(or %s %s)%s take:%s})", output, where, where, by, effect);
+            snprintf(reference, sizeof(reference), "(select {q:%s from:t where:(or false %s %s)%s take:%s})", output, where, where, by, effect);
             ray_t* init = ray_eval_str(setup);
             bool ready = init && !RAY_IS_ERR(init);
             drop_out(init);
