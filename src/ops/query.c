@@ -10616,6 +10616,64 @@ static ray_t* typed_vec_to_list(ray_t* tv, int64_t fill, int64_t n_groups) {
  * Returns either a typed vec (homogeneous scalars) or a LIST col. */
 typedef ray_t* (*idx_feeder_fn)(int64_t gi, void* state);
 
+static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last);
+
+/* first / last inside a select skip the nulls of a typed vector (#1368);
+ * the builtin outside a query is positional (#1420).  The per-group
+ * fallback evaluates by: outputs with the builtin, so every first / last
+ * call in them whose argument reads a column is pointed at these instead,
+ * wherever it sits (`(if c (first v) 0)`, `(do (last v))`). */
+static ray_t* edge_skip(ray_t* x, bool last) {
+    ray_t* v = x;
+    if (ray_is_lazy(x)) {
+        ray_retain(x);                                 /* materialize consumes one reference */
+        v = ray_lazy_materialize(x);
+        if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    } else ray_retain(v);
+    ray_t* r = scalar_edge_skip_nulls(v, last);
+    if (!r) r = last ? ray_last_fn(v) : ray_first_fn(v);
+    ray_release(v);
+    return r;
+}
+static ray_t* first_skip_fn(ray_t* x) { return edge_skip(x, false); }
+static ray_t* last_skip_fn(ray_t* x)  { return edge_skip(x, true); }
+
+/* `e` with each such call's head replaced by `fsk` / `lsk`; `e` itself
+ * (retained) when none is.  A lambda, a quoted form or a nested query keeps
+ * its own rule and is not entered. */
+static ray_t* edge_skip_walk(ray_t* e, ray_t* tbl, ray_t* fsk, ray_t* lsk) {
+    if (!e || e->type != RAY_LIST || e->len == 0 || (e->attrs & ATTR_QUOTED)) { ray_retain(e); return e; }
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    bool head_sym = h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED);
+    if (head_sym && (h->i64 == ray_sym_intern("fn", 2) || h->i64 == ray_sym_intern("quote", 5) ||
+                     h->i64 == ray_sym_intern("select", 6) || h->i64 == ray_sym_intern("update", 6) ||
+                     h->i64 == ray_sym_intern("exec", 4))) { ray_retain(e); return e; }
+    ray_t* swap = NULL;
+    if (head_sym && e->len == 2 && !ray_env_has_lexical_local(h->i64) && !tbl_has_col(tbl, h->i64)) {
+        ray_t* fn = ray_env_get(h->i64);
+        if (fn && fn->type == RAY_UNARY && !expr_reads_no_column(es[1], tbl)) {
+            void* fp = (void*)(uintptr_t)fn->i64;
+            if (fp == (void*)ray_first_fn) swap = fsk;
+            else if (fp == (void*)ray_last_fn) swap = lsk;
+        }
+    }
+    ray_t* out = ray_list_new(e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** os = (ray_t**)ray_data(out);
+    bool changed = swap != NULL;
+    for (int64_t k = 0; k < e->len; k++) {
+        ray_t* c = k == 0 && swap ? (ray_retain(swap), swap) : edge_skip_walk(es[k], tbl, fsk, lsk);
+        if (!c || RAY_IS_ERR(c)) { out->len = k; ray_release(out); return c ? c : ray_error("oom", NULL); }
+        if (c != es[k]) changed = true;
+        os[k] = c;
+    }
+    out->len = e->len;
+    out->attrs = e->attrs;
+    if (!changed) { ray_release(out); ray_retain(e); return e; }
+    return out;
+}
+
 static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -11037,8 +11095,25 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     query_dependency_cache_t* prev = g_query_dependencies;
     g_query_dependencies = &cache;
     ray_t* expanded = query_inline_helpers(expr, tbl);
-    ray_t* result = nonagg_eval_per_group_impl(expanded, tbl, feeder, fstate, n_groups);
-    ray_release(expanded);
+    ray_t* fsk = ray_fn_unary("first", RAY_FN_NONE, first_skip_fn);
+    ray_t* lsk = ray_fn_unary("last", RAY_FN_NONE, last_skip_fn);
+    ray_t* edged = expanded;
+    if (fsk && !RAY_IS_ERR(fsk) && lsk && !RAY_IS_ERR(lsk)) {
+        edged = edge_skip_walk(expanded, tbl, fsk, lsk);
+        if (!edged || RAY_IS_ERR(edged)) {
+            ray_release(fsk); ray_release(lsk); ray_release(expanded);
+            if (hoisted) ray_release(hoisted);
+            if (hs.out) ray_release(hs.out);
+            for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
+            g_query_dependencies = prev;
+            return edged ? edged : ray_error("oom", NULL);
+        }
+        ray_release(expanded);
+    }
+    if (fsk && !RAY_IS_ERR(fsk)) ray_release(fsk); else if (fsk) ray_error_free(fsk);
+    if (lsk && !RAY_IS_ERR(lsk)) ray_release(lsk); else if (lsk) ray_error_free(lsk);
+    ray_t* result = nonagg_eval_per_group_impl(edged, tbl, feeder, fstate, n_groups);
+    ray_release(edged);
     if (hoisted) ray_release(hoisted);
     if (hs.out) ray_release(hs.out);
     for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);

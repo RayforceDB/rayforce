@@ -26,8 +26,8 @@ N -- (sum (>= (at S (til N)) (at S (+ 1 (til N)))))
 ;; OP_DESC vector-input guard: lazy chain whose previous op is an
 ;; aggregator yields a scalar at materialisation; OP_DESC must
 ;; reject the non-vec input.  Covers exec.c L1073.
-(desc (first [1 2 3 4])) !- type
-(desc (last [1 2 3 4])) !- type
+(desc (sum [1 2 3 4])) !- type
+(desc (max [1 2 3 4])) !- type
 
 ;; ---- RAY_IS_ERR propagation: desc(erroring arg) ----
 (desc (round "x"))     !- type
