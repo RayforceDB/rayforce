@@ -2501,7 +2501,11 @@ ray_t* ray_distinct_fn(ray_t* x) {
     if (len * len >= LIST_SET_MIN_PAIRS) {
         /* A cell is new when no cell kept so far equals it. */
         list_set_t s;
-        if (!list_set_init(&s, out, len, ray_key_spans(x))) {
+        int mode = ray_key_spans(x);
+        /* Choose before keeping any representatives: with floats, equality
+         * can be non-transitive and rehashing survivors cannot undo a merge. */
+        if (mode == 0 && ray_key_float_free(x)) mode = RAY_KEY_EXACT_INT;
+        if (!list_set_init(&s, out, len, mode)) {
             result->len = 0;
             ray_release(result);
             if (_bx) ray_release(_bx);
