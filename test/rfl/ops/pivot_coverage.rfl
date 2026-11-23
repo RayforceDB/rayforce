@@ -728,8 +728,11 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 ;; serially and I64/F64 under workers.  Both branches are trivial here, so
 ;; the eager arm could handle them: the answer must be its answer.
 (set TAT (table [x ts d] (list [true true true] (as 'TIMESTAMP [100 200 300]) (as 'DATE [1 2 3]))))
-(type (at (select {r: (if x ts 5) from: TAT}) 'r)) -- 'I64
-(type (at (select {r: (if x ts 5.5) from: TAT}) 'r)) -- 'F64
+;; a temporal beside a number has no common type (#1485); a null literal keeps it
+(select {r: (if x ts 5) from: TAT}) !- type
+(select {r: (if x ts 5.5) from: TAT}) !- type
+(type (at (select {r: (if x ts 0N) from: TAT}) 'r)) -- 'TIMESTAMP
+(type (at (select {r: (if x (as 'I64 ts) 5) from: TAT}) 'r)) -- 'I64
 ;; DATE beside TIMESTAMP has no common type (#1337)
 (select {r: (if x d ts) from: TAT}) !- type
 
@@ -755,10 +758,14 @@ RTimedead -- [09:30:00.000 11:00:00.000]
 ;; one.
 (set TT (table [x ts] (list [true true true] (as 'TIMESTAMP [100 200 300]))))
 (set TFa (table [x ts] (list [false false false] (as 'TIMESTAMP [100 200 300]))))
-(type (at (select {r: (if x ts 5) from: TT}) 'r)) -- 'I64
-(type (at (select {r: (if x 5 ts) from: TFa}) 'r)) -- 'I64
-(type (at (select {r: (if x ts 5.5) from: TT}) 'r)) -- 'F64
-(type (at (select {r: (if x 5.5 ts) from: TFa}) 'r)) -- 'F64
+;; a temporal beside a number has no common type (#1485), whichever branch
+;; is empty; beside a null literal the temporal type stands
+(select {r: (if x ts 5) from: TT}) !- type
+(select {r: (if x 5 ts) from: TFa}) !- type
+(select {r: (if x ts 5.5) from: TT}) !- type
+(select {r: (if x 5.5 ts) from: TFa}) !- type
+(type (at (select {r: (if x ts 0N) from: TT}) 'r)) -- 'TIMESTAMP
+(type (at (select {r: (if x 0N ts) from: TFa}) 'r)) -- 'TIMESTAMP
 
 ;; ── a column of a parted table carries a wrapped type ──────────────────
 ;; graph.c's promotion ladder knows nothing about the wrapper, so a wrapped

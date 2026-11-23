@@ -393,7 +393,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) raise `type` | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type` | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass (at the top level a global, refused for a restricted caller); returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |

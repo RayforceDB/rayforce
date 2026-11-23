@@ -506,10 +506,20 @@ static bool type_is_temporal(int8_t t) {
  * the projection falls back to the interpreter.  Two temporal arms keep
  * their type; two different ones have none (#1337): promote() folded
  * them into one integer lane and the fill blended days, ms and ns as
- * raw counts. */
+ * raw counts.  Nor does a temporal arm beside a numeric one (#1485). */
+static bool type_is_if_numeric(int8_t t) {
+    return t == RAY_BOOL || t == RAY_U8 || t == RAY_I16 || t == RAY_I32 ||
+           t == RAY_I64 || t == RAY_F32 || t == RAY_F64;
+}
+
 static int8_t promote_if_type(int8_t a, int8_t b) {
     if (a == RAY_GUID || b == RAY_GUID) return a == b ? RAY_GUID : -1;
     if (type_is_temporal(a) && type_is_temporal(b)) return a == b ? a : IF_TYPE_MIX;
+    /* a temporal arm beside a numeric one has no common type either (#1485):
+     * the fill wrote the temporal arm's raw count (days, ms, ns) beside the
+     * numbers.  A null literal arm is excepted by ray_if before this. */
+    if ((type_is_temporal(a) && type_is_if_numeric(b)) ||
+        (type_is_temporal(b) && type_is_if_numeric(a))) return IF_TYPE_MIX;
     return promote(a, b);
 }
 

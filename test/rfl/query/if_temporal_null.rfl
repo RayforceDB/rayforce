@@ -53,9 +53,9 @@
 (type (at (select {k: (if (> x 1) (if (> x 2) d 0N) 0Nf) from: TD}) 'k)) -- 'DATE
 (at (select {k: (if (> x 1) (if (> x 2) d 0N) 0Nf) from: TD}) 'k) -- [0Nd 0Nd 0Nd 2000.01.05]
 
-;; ── unchanged: a non-null number beside a temporal still promotes ───────────
-(type (at (select {k: (if (> x 1) d 5) from: TD}) 'k)) -- 'I64
-(at (select {k: (if (> x 1) d 5) from: TD}) 'k) -- [5 5 3 4]
+;; ── a non-null number beside a temporal has no common type (#1485) ──────────
+(select {k: (if (> x 1) d 5) from: TD}) !- type
+(at (select {k: (if (> x 1) (as 'I64 d) 5) from: TD}) 'k) -- [5 5 3 4]
 ;; a null literal of another temporal type is a null of the branch's type
 (type (at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k)) -- 'DATE
 (at (select {k: (if (> x 1) d 0Nt) from: TD}) 'k) -- [0Nd 0Nd 2000.01.04 2000.01.05]

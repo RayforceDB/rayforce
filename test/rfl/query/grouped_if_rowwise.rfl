@@ -115,7 +115,9 @@
 (set U (table ['g 'c 'i 'd] (list ['a 'a 'a 'b 'b 'b] [9 0 9 0 9 9] [1 2 3 4 5 6] (+ 2024.01.01 (til 6)))))
 (at (select {from: U where: (> i 1) by: g q: (sums i)}) 'q) -- (list [3 6] [10 15 21])
 (at (select {from: U where: (> i 1) by: g q: (if (> c 4) (sums i) i)}) 'q) -- (list [2 6] [4 15 21])
-(at (select {from: U where: (> i 1) by: g q: (avg (if (> c 4) (sums i) (+ d 1)))}) 'q) -- [4387.0 2935.33]
+;; an I64 arm beside a DATE arm has no common type (#1485)
+(select {from: U where: (> i 1) by: g q: (avg (if (> c 4) (sums i) (+ d 1)))}) !- type
+(at (select {from: U where: (> i 1) by: g q: (avg (if (> c 4) (sums i) (as 'I64 (+ d 1))))}) 'q) -- [4387.0 2935.33]
 (at (select {from: U by: g q: (if (> c 4) (sums i) i)}) 'q) -- (list [1 2 6] [4 15 21])
 (at (select {from: U where: (> i 1) q: (if (> c 4) (sums i) i)}) 'q) -- [2 6 4 15 21]
 (Q (select {from: F by: g q: (count (distinct (if (> c 4) d (+ d 1))))}) 'g) -- (Q (select {from: F by: g q: (count (distinct m1))}) 'g)

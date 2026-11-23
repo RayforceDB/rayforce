@@ -39,13 +39,18 @@ over an i64 column is f64). Two temporal arms of one type keep it, and a
 temporal arm beside a null literal (`0N`, `0Nd`, `0Np`, ...) keeps its own
 type, the null becoming its null. Arms of two different temporal types (any
 two of DATE, TIME, TIMESTAMP and TIMESPAN) have no common type and raise a
-`type` error, as a text arm beside a number does:
+`type` error, as a text arm beside a number does. So does a temporal arm
+beside a numeric one (BOOL, U8, I16, I32, I64, F32, F64): the temporal arm's
+raw count (days, ms or ns) is not a number of the other arm's kind:
 
 ```lisp
 ‣ (set t (table [g d p] (list [0 1] [2024.01.01 2024.01.02] [2024.01.01D00:00:00.000000000 2024.01.02D00:00:00.000000000])))
 ‣ (select {from: t r: (if (> g 0) d p)})
 error: type: if: branches mix DATE and TIMESTAMP
 ‣ (select {from: t r: (if (> g 0) d (as 'DATE p))})   ; convert one arm first
+‣ (select {from: t r: (if (> g 0) d 0)})
+error: type: if: branches mix DATE and I64
+‣ (select {from: t r: (if (> g 0) (as 'I64 d) 0)})     ; the raw day count
 ```
 
 Outside a query `if` evaluates one arm only, so its arms are never typed
