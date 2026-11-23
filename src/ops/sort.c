@@ -4714,6 +4714,14 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
         return tbl;
     }
 
+    /* The result is the source's columns with the key re-stamped.  Its
+     * notes hold when the source's did, or when no other column has one. */
+    int64_t key_at = -1;
+    for (int64_t c = 0; c < ray_table_ncols(tbl) && key_at < 0; c++)
+        if (ray_table_col_name(tbl, c) == key_id) key_at = c;
+    bool notes_hold = ray_table_order_notes_hold(tbl) ||
+                      ray_table_order_notes_absent(tbl, key_at);
+
     ray_t* stamped = key_col;
     ray_retain(stamped);
     ray_t* r = ray_index_attach_part(&stamped);
@@ -4744,6 +4752,7 @@ static ray_t* sort_stamp_ordered_table(ray_t* tbl, int64_t key_id,
         }
     }
     ray_release(stamped);
+    if (notes_hold) ray_table_mark_order_notes(out);
     return out;
 }
 
@@ -5077,11 +5086,17 @@ ray_t* sort_table_by_keys(ray_t* tbl, ray_t* keys, uint8_t descending) {
         ray_release(idx);
         return result ? result : ray_error("oom", NULL);
     }
+    int64_t stamped_at = -1;
     for (int64_t c = 0; c < ncols; c++) {
         if (!new_cols[c]) continue;
+        if (stamped_at < 0 && col_names[c] == key_ids[0]) stamped_at = ray_table_ncols(result);
         result = ray_table_add_col(result, col_names[c], new_cols[c]);
         ray_release(new_cols[c]);
     }
+    /* every column is a fresh gather in the new order: the key's note (if
+     * stamped above) holds, and so does the table when no other has one */
+    if (result && !RAY_IS_ERR(result) && ray_table_order_notes_absent(result, stamped_at))
+        ray_table_mark_order_notes(result);
 
     scratch_free(nc_hdr);
     scratch_free(cn_hdr);

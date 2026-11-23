@@ -1261,6 +1261,10 @@ ray_t* ray_xcol_fn(ray_t* tbl, ray_t* names) {
         if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     }
     ray_free_raw(syms);
+    /* An order note names its column by symbol: after a rename it would name
+     * whatever column now has that name, so the result keeps the source's
+     * mark only when no name moved (ray_table_carry_order_notes). */
+    ray_table_carry_order_notes(out, tbl);
     return out;
 }
 
@@ -1287,6 +1291,7 @@ ray_t* ray_xcols_fn(ray_t* tbl, ray_t* cols) {
         if (!out || RAY_IS_ERR(out)) { ray_free_raw(syms); return out ? out : ray_error("oom", NULL); }
     }
     ray_free_raw(syms);
+    ray_table_carry_order_notes(out, tbl);   /* same columns, same names */
     return out;
 }
 

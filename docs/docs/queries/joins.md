@@ -221,6 +221,7 @@ The as-of executor normally sorts both inputs by `(equality-keys, time)` on ever
 
 - **Un-partitioned** — if both input time columns carry the `sorted` attribute, both per-join sorts are skipped (O(n+m) instead of O(n log n)).
 - **Partitioned** — if a single numeric equality key carries the `parted` attribute and its time column is non-descending within each part, that side's sort is skipped.
+  When `xasc` by the key and then the time column produced that side, it records the order and the check is skipped too. The record names the time column, so it holds for that table and for what `select`, `update`, `left-join`, `xcols` and `xcol` make of it while the key column and the column named by the record pass through unchanged: a projection or reorder of columns, an update of other columns, a rename of other columns. After a rename that moves the time column's name, once the time column is replaced (even by the same values), or when the key column is placed in a table built by hand, the order is checked again; a splayed save of such a table writes no record.
 
 These are pure opt-in acceleration: when the attribute is absent the executor falls back to the usual sort-merge, so results are identical either way.
 

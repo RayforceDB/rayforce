@@ -4312,7 +4312,9 @@ static ray_t* exec_window_join_flat(ray_graph_t* g, ray_op_t* op,
                               lt_time, rt_time, lt_null, rt_null,
                               left_n, right_n,
                               ray_attr_is_sorted(rt_time_vec), rt_no_nulls,
-                              time_sym,
+                              /* the key's order note names time_sym; it
+                               * holds only for a table vouching for it */
+                              ray_table_order_notes_hold(right_table) ? time_sym : -1,
                               match_orig))
         goto build_output;
 

@@ -1,0 +1,123 @@
+;; A parted or grouped index may note that the rows of each part are ordered
+;; by another column, which it names by symbol, and asof-join trusts that
+;; note instead of checking the order (#1544).  The note travels with the key
+;; column, so it holds only for the table it was made for: a rename, a swap,
+;; a replaced time column or a new table built from the column must not be
+;; answered from it.  Each answer below is the one the same rows give in a
+;; fresh table that carries no index.
+(.sys.exec "rm -rf /tmp/rf_test_1544") -- 0
+(set Q (xasc (xasc (table [k t u] (list [0 0 0 1 1 1] [1 2 3 1 2 3] [30 20 10 30 20 10])) ['k 't]) ['k 't]))
+(set L (table [k t] (list [0 1] [15 25])))
+(at (.idx.info (at Q 'k)) 'kind) -- 'part
+(at (asof-join [k t] L Q) 'u) -- [10 10]
+
+;; xcol swaps t and u: the t of X is the u of Q, not ordered within k
+(set X (xcol Q [k u t]))
+(at (asof-join [k t] L X) 'u) -- [3 2]
+(at (asof-join [k t] L (table [k u t] (list [0 0 0 1 1 1] [1 2 3 1 2 3] [30 20 10 30 20 10]))) 'u) -- [3 2]
+
+;; renamed through select: the answer of the same rows in a fresh table
+(set S (select {k: k t: u u: t from: Q}))
+(at (asof-join [k t] L S) 'u) -- (at (asof-join [k t] L (table [k t u] (list (+ 0 (at S 'k)) (+ 0 (at S 't)) (+ 0 (at S 'u))))) 'u)
+
+;; a replaced time column, by a new table and in place
+(set F (table [k t u] (list [0 0 0 1 1 1] [3 2 1 3 2 1] [30 20 10 30 20 10])))
+(at (asof-join [k t] L F) 'u) -- [30 30]
+(at (asof-join [k t] L (update {t: (reverse t) from: Q})) 'u) -- [30 30]
+(at (asof-join [k t] L (table [k t u] (list (at Q 'k) [3 2 1 3 2 1] (at Q 'u)))) 'u) -- [30 30]
+(set G Q)
+(update {from: 'G t: (reverse t)})
+(at (asof-join [k t] L G) 'u) -- [30 30]
+(set H Q)
+(update {from: 'H t: u u: t})
+(at (asof-join [k t] L H) 'u) -- [3 2]
+
+;; renames that leave every noted name in place, and a projection
+(at (asof-join [k t] L (xcol Q [k t v])) 'v) -- [10 10]
+(at (asof-join [k t] L (xcols Q [u t k])) 'u) -- [10 10]
+;; Q itself still answers right
+(at (asof-join [k t] L Q) 'u) -- [10 10]
+
+;; saved and read back, both generations: a table whose notes do not hold
+;; is written without them
+(.db.splayed.set "/tmp/rf_test_1544/x2/" X {compress: true})
+(.db.splayed.set "/tmp/rf_test_1544/x0/" X {compress: false})
+(.db.splayed.set "/tmp/rf_test_1544/q2/" Q {compress: true})
+(at (asof-join [k t] L (.db.splayed.get "/tmp/rf_test_1544/x2/")) 'u) -- [3 2]
+(at (asof-join [k t] L (.db.splayed.get "/tmp/rf_test_1544/x0/")) 'u) -- [3 2]
+(at (asof-join [k t] L (.db.splayed.get "/tmp/rf_test_1544/q2/")) 'u) -- [10 10]
+(at (.idx.info (.db.splayed.get "/tmp/rf_test_1544/x2/") 'k) 'index) -- 'part
+;; a table read back from a compressed save holds its notes; a swap of it
+;; does not, and its own save writes none
+(set Q2 (.db.splayed.get "/tmp/rf_test_1544/q2/"))
+(set X3 (xcol Q2 [k u t]))
+(at (asof-join [k t] L X3) 'u) -- [3 2]
+(.db.splayed.set "/tmp/rf_test_1544/x3/" X3)
+(.db.splayed.set "/tmp/rf_test_1544/x3c/" X3 {compress: true})
+(at (asof-join [k t] L (.db.splayed.get "/tmp/rf_test_1544/x3/")) 'u) -- [3 2]
+(at (asof-join [k t] L (.db.splayed.get "/tmp/rf_test_1544/x3c/")) 'u) -- [3 2]
+(at (asof-join [k t] L (xcol Q2 [k t v])) 'v) -- [10 10]
+;; in another process
+(.sys.exec "printf '%s\n' '(set L (table [k t] (list [0 1] [15 25])))' '(println (at (asof-join [k t] L (.db.splayed.get \"/tmp/rf_test_1544/x2/\")) (quote u)))' '(println (at (asof-join [k t] L (.db.splayed.get \"/tmp/rf_test_1544/x0/\")) (quote u)))' > /tmp/rf_test_1544/child.rfl") -- 0
+(.sys.exec "test \"$(./rayforce -f /tmp/rf_test_1544/child.rfl 2>/dev/null | tr -d ' \n')\" = '[32][32]'") -- 0
+
+;; the ordered route: taken where the notes hold, not after the swap
+(.sys.exec "printf '%s\n' '(set Q (xasc (xasc (table [k t u] (list [0 0 0 1 1 1] [1 2 3 1 2 3] [30 20 10 30 20 10])) (list (quote k) (quote t))) (list (quote k) (quote t))))' '(set L (table [k t] (list [0 1] [15 25])))' '(asof-join [k t] L Q)' '(asof-join [k t] L (xcol Q [k t v]))' > /tmp/rf_test_1544/route.rfl") -- 0
+(.sys.exec "RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/route.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=2 '") -- 0
+(.sys.exec "printf '%s\n' '(set Q (xasc (xasc (table [k t u] (list [0 0 0 1 1 1] [1 2 3 1 2 3] [30 20 10 30 20 10])) (list (quote k) (quote t))) (list (quote k) (quote t))))' '(set L (table [k t] (list [0 1] [15 25])))' '(asof-join [k t] L (xcol Q [k u t]))' > /tmp/rf_test_1544/swap.rfl") -- 0
+(.sys.exec "RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/swap.rfl 2>&1 | grep -q 'idx_route asof-ordered'") -- 1
+
+;; Operations that pass the key column and the column its note names
+;; through as the same objects keep the route (ray_table_carry_order_notes);
+;; one that replaces either does not.  Each answer is the fresh table's, and
+;; each route is read in its own process (RAY_IDX_STATS).
+(set fresh (fn [P] (table [k t u] (list (+ 0 (at P 'k)) (+ 0 (at P 't)) (+ 0 (at P 'u))))))
+(set L3 (table [k t] (list [0 1 0] [15 25 2])))
+(.sys.exec "printf '%s\n' '(set Q (xasc (xasc (table [k t u] (list [0 0 0 1 1 1] [1 2 3 1 2 3] [30 20 10 30 20 10])) (list (quote k) (quote t))) (list (quote k) (quote t))))' '(set L (table [k t] (list [0 1 0] [15 25 2])))' > /tmp/rf_test_1544/pre.rfl") -- 0
+;; select projection: route kept
+(set R (select {k: k t: t u: u from: Q}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (select {k: k t: t u: u from: Q}))') > /tmp/rf_test_1544/c0.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c0.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; update of another column: route kept
+(set R (update {u: (+ u 1) from: Q}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {u: (+ u 1) from: Q}))') > /tmp/rf_test_1544/c2.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c2.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; update adding a column: route kept
+(set R (update {w: (+ u 1) from: Q}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {w: (+ u 1) from: Q}))') > /tmp/rf_test_1544/c3.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c3.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; masked update of another column: route kept
+(set R (update {u: 0 from: Q where: (> t 1)}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {u: 0 from: Q where: (> t 1)}))') > /tmp/rf_test_1544/c4.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c4.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; grouped update of another column: route kept
+(set R (update {u: (sum u) from: Q by: k}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {u: (sum u) from: Q by: k}))') > /tmp/rf_test_1544/c5.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c5.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; left-join: route kept
+(set R (left-join [k] Q (table [k w] (list [0 1] [7 8]))))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (left-join [k] Q (table [k w] (list [0 1] [7 8]))))') > /tmp/rf_test_1544/c6.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c6.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; left-join whose right side has a t: route kept
+(set R (left-join [k] Q (table [k t] (list [0 1] [9 0]))))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (left-join [k] Q (table [k t] (list [0 1] [9 0]))))') > /tmp/rf_test_1544/c7.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c7.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+;; update of the time column: no route
+(set R (update {t: (- 0 t) from: Q}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {t: (- 0 t) from: Q}))') > /tmp/rf_test_1544/c8.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c8.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 1
+;; masked update of the time column: no route
+(set R (update {t: 0 from: Q where: (> u 15)}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (update {t: 0 from: Q where: (> u 15)}))') > /tmp/rf_test_1544/c9.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c9.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 1
+;; select that swaps names: no route
+(set R (select {k: k t: u u: t from: Q}))
+(at (asof-join [k t] L3 R) 'u) -- (at (asof-join [k t] L3 (fresh R)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; echo '(asof-join [k t] L (select {k: k t: u u: t from: Q}))') > /tmp/rf_test_1544/c10.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/c10.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 1
+;; in-place update of another column of a named table
+(set G Q)
+(update {from: 'G u: (+ u 1)})
+(at (asof-join [k t] L3 G) 'u) -- (at (asof-join [k t] L3 (fresh G)) 'u)
+(.sys.exec "(cat /tmp/rf_test_1544/pre.rfl; printf '%s\n' '(set G Q)' '(update {from: (quote G) u: (+ u 1)})' '(asof-join [k t] L G)') > /tmp/rf_test_1544/cg.rfl && RAY_IDX_STATS=1 ./rayforce -f /tmp/rf_test_1544/cg.rfl 2>&1 | grep -q 'idx_route asof-ordered consults=1 '") -- 0
+
+(.sys.exec "rm -rf /tmp/rf_test_1544") -- 0

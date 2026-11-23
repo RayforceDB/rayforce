@@ -93,6 +93,21 @@
  * answers it as one value, as it answers a string element of a collection,
  * not character by character as it answers a lone string literal. */
 #define RAY_ATTR_STR_CELL     0x01
+
+/* RAY_ATTR_ORDER_NOTES (RAY_TABLE): the order notes this table's columns
+ * carry hold for this table.  A HASH or PART index may note that the rows
+ * of each group are ordered by another column, named by symbol
+ * (idxop.h order_sym); the note travels with the column vector, and a
+ * column moves freely between tables, so it is only true of the table it
+ * was made for.  The sort that writes a note marks its result, a splayed
+ * load marks the table it returns, and xcol, xcols, select, update and
+ * left-join carry the mark from the table they read when each noted column
+ * and the column its note names are the same objects there
+ * (ray_table_carry_order_notes).  Any other table lacks it, an in-place
+ * column edit clears it, and asof-join trusts a note only on a right table
+ * that has it.  A save of a table without it writes no note.
+ * Never on the wire (RAY_SERDE_ATTR_WIRE_MASK). */
+#define RAY_ATTR_ORDER_NOTES  0x01
 #define RAY_ATTR_GRAPH        0x02
 
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
