@@ -71,6 +71,21 @@ void ray_test_hooks_off(void);
  * heap memory (mmod 0) after a generation-2 one: residency asserts take the
  * generation into account so the rest of the test still runs in both. */
 bool ray_test_equiv_pass(void);
+
+/* HAS_NULLS against the payload (#1167).  A sentinel-typed vector's null
+ * flag is the gate every reader checks before it looks at a cell, so it has
+ * to agree with a scan for the type's NULL sentinel: clear means no sentinel
+ * anywhere, set means at least one.  A slice reads its parent's flag, which
+ * may cover nulls outside the window, so for a slice only the first half is
+ * required.  Types without a sentinel (BOOL, U8, SYM, STR, lists) always
+ * agree.  On a mismatch, writes the reason to why[0..cap) and returns false. */
+union ray_t;
+bool ray_test_nulls_agree(union ray_t* v, char* why, size_t cap);
+#define TEST_ASSERT_NULLS_AGREE(v, label) do {                         \
+    char _why[192];                                                    \
+    if (!ray_test_nulls_agree((v), _why, sizeof _why))                 \
+        FAILF("%s: %s", (label), _why);                                \
+} while (0)
 #define TEST_ASSERT_LOADED_MMOD(v, gen0_mmod) \
     TEST_ASSERT_EQ_U((v)->mmod, ray_test_equiv_pass() ? 0u : (unsigned)(gen0_mmod))
 

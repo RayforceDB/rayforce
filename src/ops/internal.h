@@ -2459,8 +2459,9 @@ ray_t* exec_node(ray_graph_t* g, ray_op_t* op);
  *
  * BOOL/U8 are non-nullable (rejected at the producer surface).  SYM/STR/GUID
  * don't appear in parallel aggregation/window output columns and are no-ops
- * here. */
-static inline void par_set_null(ray_t* vec, int64_t idx) {
+ * here.  Returns whether a sentinel was written, so a producer that tracks
+ * the nulls it emits never counts one it could not write. */
+static inline bool par_set_null(ray_t* vec, int64_t idx) {
     void* p = ray_data(vec);
     switch (vec->type) {
         case RAY_F64:                          ((double*)p)[idx] = NULL_F64; break;
@@ -2468,8 +2469,9 @@ static inline void par_set_null(ray_t* vec, int64_t idx) {
         case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:      ((int64_t*)p)[idx] = NULL_I64; break;
         case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)p)[idx] = NULL_I32; break;
         case RAY_I16:                          ((int16_t*)p)[idx] = NULL_I16; break;
-        default: return;
+        default: return false;
     }
+    return true;
 }
 
 /* After workers join, derive RAY_ATTR_HAS_NULLS from type-correct NULL_*

@@ -5811,35 +5811,45 @@ static void ts_run_combine(ts_run_state_t* dst, const ts_run_state_t* src,
     }
 }
 
-static void ts_run_write(ray_t* out, int64_t row, const ts_run_state_t* s,
+/* Write one running result; true when the cell written is a null.  Runs on
+ * pool workers, so a null goes into the payload only (par_set_null) and the
+ * caller publishes HAS_NULLS after the join.  An F64 total or product that
+ * overflows is mapped to 0Nf, and an I64/TIMESPAN one that wraps onto
+ * INT64_MIN is the null sentinel: both are nulls produced from non-null
+ * inputs (#1167). */
+static bool ts_run_write(ray_t* out, int64_t row, const ts_run_state_t* s,
                          uint16_t opcode, bool is_float) {
     void* d = ray_data(out);
     switch (opcode) {
         case OP_SUMS:
-            if (out->type == RAY_F64) ((double*)d)[row] = ray_f64_fin(s->acc_f);
-            else ((int64_t*)d)[row] = (int64_t)s->acc_i;
-            return;
         case OP_PRDS:
-            if (out->type == RAY_F64) ((double*)d)[row] = ray_f64_fin(s->acc_f);
-            else ((int64_t*)d)[row] = (int64_t)s->acc_i;
-            return;
-        case OP_AVGS:
-            if (s->count <= 0) ray_vec_set_null(out, row, true);
-            else ((double*)d)[row] = ray_f64_fin(s->acc_f / (double)s->count);
-            return;
+            if (out->type == RAY_F64) {
+                double v = ray_f64_fin(s->acc_f);
+                ((double*)d)[row] = v;
+                return v != v;
+            }
+            ((int64_t*)d)[row] = (int64_t)s->acc_i;
+            return s->acc_i == (uint64_t)NULL_I64;
+        case OP_AVGS: {
+            if (s->count <= 0) return par_set_null(out, row);
+            double v = ray_f64_fin(s->acc_f / (double)s->count);
+            ((double*)d)[row] = v;
+            return v != v;
+        }
         case OP_MINS:
-            if (!s->seen) { ray_vec_set_null(out, row, true); return; }
+            if (!s->seen) return par_set_null(out, row);
             if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->min_f) ? (float)s->min_f : NULL_F32;
             else if (is_float) ((double*)d)[row] = ray_f64_fin(s->min_f);
             else write_col_i64(d, row, s->min_i, out->type, out->attrs);
-            return;
+            return false;
         case OP_MAXS:
-            if (!s->seen) { ray_vec_set_null(out, row, true); return; }
+            if (!s->seen) return par_set_null(out, row);
             if (out->type == RAY_F32) ((float*)d)[row] = isfinite(s->max_f) ? (float)s->max_f : NULL_F32;
             else if (is_float) ((double*)d)[row] = ray_f64_fin(s->max_f);
             else write_col_i64(d, row, s->max_i, out->type, out->attrs);
-            return;
+            return false;
     }
+    return false;
 }
 
 static void ts_running_summary_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
@@ -5902,10 +5912,9 @@ static void ts_running_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (!(c->has_nulls && ray_vec_is_null(c->src, r)))
                 ts_run_update(&s, c->src, r, c->opcode, c->is_float);
-            ts_run_write(c->dst, r, &s, c->opcode, c->is_float);
-            if (c->track_i64_nulls) emitted_null |= s.acc_i == (uint64_t)NULL_I64;
+            emitted_null |= ts_run_write(c->dst, r, &s, c->opcode, c->is_float);
         }
-        if (c->track_i64_nulls) c->summary[b].emitted_null = emitted_null;
+        c->summary[b].emitted_null = emitted_null;
     }
 }
 
@@ -5978,12 +5987,10 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
         return ray_error("cancel", "interrupted");
     }
     /* Only the joining thread publishes the vector-wide null hint. */
-    if (ctx.track_i64_nulls) {
-        for (int64_t b = 0; b < nblocks; b++) {
-            if (summary[b].emitted_null) {
-                out->attrs |= RAY_ATTR_HAS_NULLS;
-                break;
-            }
+    for (int64_t b = 0; b < nblocks; b++) {
+        if (summary[b].emitted_null) {
+            out->attrs |= RAY_ATTR_HAS_NULLS;
+            break;
         }
     }
     scratch_free(summary_hdr);
@@ -6092,6 +6099,7 @@ typedef struct {
     uint16_t opcode;
     bool has_nulls;
     int64_t window;
+    _Atomic(bool) emitted_null;  /* a task wrote a null; published after the join */
 } ts_mprefix_ctx_t;
 
 static const char* ts_moving_name(uint16_t opcode) {
@@ -6199,8 +6207,9 @@ static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
     (void)worker_id;
     ts_mprefix_ctx_t* c = (ts_mprefix_ctx_t*)vctx;
     void* out = ray_data(c->dst);
+    bool emitted_null = false;
     for (int64_t r = start; r < end; r++) {
-        if (ts_morsel_checkpoint(c->pool, r - start)) return;
+        if (ts_morsel_checkpoint(c->pool, r - start)) break;
         int64_t lo = (r >= c->window - 1) ? (r - c->window + 1) : 0;
         int64_t hi = r + 1;
         switch (c->opcode) {
@@ -6208,22 +6217,32 @@ static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
                 ((int64_t*)out)[r] = c->prefix_count[hi] - c->prefix_count[lo];
                 break;
             case OP_MSUM:
-                if (c->prefix_f)
-                    ((double*)out)[r] = ray_f64_fin(c->prefix_f[hi] - c->prefix_f[lo]);
-                else
-                    ((int64_t*)out)[r] = (int64_t)(c->prefix_i[hi] - c->prefix_i[lo]);
+                if (c->prefix_f) {
+                    double v = ray_f64_fin(c->prefix_f[hi] - c->prefix_f[lo]);
+                    ((double*)out)[r] = v;
+                    emitted_null |= v != v;
+                } else {
+                    /* An I64/TIMESPAN window total that wraps onto
+                     * INT64_MIN is null, as for + and sums. */
+                    uint64_t v = c->prefix_i[hi] - c->prefix_i[lo];
+                    ((int64_t*)out)[r] = (int64_t)v;
+                    emitted_null |= v == (uint64_t)NULL_I64;
+                }
                 break;
             case OP_MAVG: {
                 int64_t cnt = c->prefix_count[hi] - c->prefix_count[lo];
                 if (cnt <= 0) {
-                    ray_vec_set_null(c->dst, r, true);
+                    emitted_null |= par_set_null(c->dst, r);
                 } else {
-                    ((double*)out)[r] = ray_f64_fin((c->prefix_f[hi] - c->prefix_f[lo]) / (double)cnt);
+                    double v = ray_f64_fin((c->prefix_f[hi] - c->prefix_f[lo]) / (double)cnt);
+                    ((double*)out)[r] = v;
+                    emitted_null |= v != v;
                 }
                 break;
             }
         }
     }
+    if (emitted_null) atomic_store_explicit(&c->emitted_null, true, memory_order_relaxed);
 }
 
 static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window, int8_t out_type) {
@@ -6288,6 +6307,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .has_nulls = has_nulls,
         .window = window
     };
+    atomic_store_explicit(&ctx.emitted_null, false, memory_order_relaxed);
 
     ray_pool_dispatch(pool, ts_mprefix_scan_fn, &ctx, nblocks);
     if (pool_cancelled(pool)) goto cancelled;
@@ -6305,6 +6325,8 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     if (pool_cancelled(pool)) goto cancelled;
     ray_pool_dispatch(pool, ts_mprefix_emit_fn, &ctx, n);
     if (pool_cancelled(pool)) goto cancelled;
+    if (atomic_load_explicit(&ctx.emitted_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
 
     if (pi_hdr) scratch_free(pi_hdr);
     if (pf_hdr) scratch_free(pf_hdr);
@@ -6333,6 +6355,7 @@ typedef struct {
     int64_t window;
     int64_t ntasks;
     _Atomic(int) oom;
+    _Atomic(bool) emitted_null;  /* a task wrote a null; published after the join */
 } ts_mminmax_ctx_t;
 
 static inline int64_t ts_task_lo(int64_t n, int64_t task, int64_t ntasks) {
@@ -6362,6 +6385,7 @@ typedef struct {
     int64_t window;
     int64_t ntasks;
     _Atomic(int) oom;
+    _Atomic(bool) emitted_null;  /* a task wrote a null; published after the join */
 } ts_mvar_ctx_t;
 
 /* Merge two adjacent Welford summaries without forming x*x.  The factor is
@@ -6400,6 +6424,7 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
 
     int64_t n = c->src->len;
+    bool emitted_null = false;
     for (int64_t task = start; task < end; task++) {
         int64_t lo = ts_task_lo(n, task, c->ntasks);
         int64_t hi = ts_task_lo(n, task + 1, c->ntasks);
@@ -6468,19 +6493,23 @@ static void ts_mvar_task_fn(void* vctx, uint32_t worker_id, int64_t start, int64
                 if (out_len > 0) state = items[cap - out_len].aggregate;
                 if (in_len > 0) state = ts_mvar_merge(state, items[in_len - 1].aggregate);
                 if (state.count == 0) {
-                    ray_vec_set_null(c->dst, r, true);
+                    emitted_null |= par_set_null(c->dst, r);
                 } else if (state.count == 1) {
                     ((double*)ray_data(c->dst))[r] = 0.0;
                 } else {
                     double variance = state.m2 / (double)state.count;
                     if (variance < 0.0) variance = 0.0;
-                    ((double*)ray_data(c->dst))[r] = ray_f64_fin(
+                    /* A variance past DBL_MAX is mapped to 0Nf (#1167). */
+                    double v = ray_f64_fin(
                         c->opcode == OP_MDEV ? sqrt(variance) : variance);
+                    ((double*)ray_data(c->dst))[r] = v;
+                    emitted_null |= v != v;
                 }
             }
         }
         scratch_free(queue_hdr);
     }
+    if (emitted_null) atomic_store_explicit(&c->emitted_null, true, memory_order_relaxed);
 }
 
 static ray_t* moving_variance_vec_eager(ray_t* x, uint16_t opcode,
@@ -6508,6 +6537,7 @@ static ray_t* moving_variance_vec_eager(ray_t* x, uint16_t opcode,
         .ntasks = (int64_t)ntasks
     };
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx.emitted_null, false, memory_order_relaxed);
 
     if (ntasks == 1) ts_mvar_task_fn(&ctx, 0, 0, 1);
     else             ray_pool_dispatch_n(pool, ts_mvar_task_fn, &ctx, ntasks);
@@ -6520,6 +6550,8 @@ static ray_t* moving_variance_vec_eager(ray_t* x, uint16_t opcode,
         ray_release(out);
         return ray_error("cancel", "interrupted");
     }
+    if (atomic_load_explicit(&ctx.emitted_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
 }
 
@@ -6547,6 +6579,7 @@ static void ts_mminmax_task_fn(void* vctx, uint32_t worker_id, int64_t start, in
     if (atomic_load_explicit(&c->oom, memory_order_relaxed)) return;
 
     int64_t n = c->src->len;
+    bool emitted_null = false;
     for (int64_t task = start; task < end; task++) {
         int64_t lo = ts_task_lo(n, task, c->ntasks);
         int64_t hi = ts_task_lo(n, task + 1, c->ntasks);
@@ -6589,12 +6622,13 @@ static void ts_mminmax_task_fn(void* vctx, uint32_t worker_id, int64_t start, in
             }
 
             if (r >= lo) {
-                if (len == 0) ray_vec_set_null(c->dst, r, true);
+                if (len == 0) emitted_null |= par_set_null(c->dst, r);
                 else          ts_mminmax_write(c, r, dq[head]);
             }
         }
         scratch_free(dq_hdr);
     }
+    if (emitted_null) atomic_store_explicit(&c->emitted_null, true, memory_order_relaxed);
 }
 
 static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window, int8_t out_type) {
@@ -6622,6 +6656,7 @@ static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         .ntasks = (int64_t)ntasks
     };
     atomic_store_explicit(&ctx.oom, 0, memory_order_relaxed);
+    atomic_store_explicit(&ctx.emitted_null, false, memory_order_relaxed);
 
     if (ntasks == 1) ts_mminmax_task_fn(&ctx, 0, 0, 1);
     else             ray_pool_dispatch_n(pool, ts_mminmax_task_fn, &ctx, ntasks);
@@ -6634,6 +6669,8 @@ static ray_t* moving_minmax_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         ray_release(out);
         return ray_error("cancel", "interrupted");
     }
+    if (atomic_load_explicit(&ctx.emitted_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
 }
 
