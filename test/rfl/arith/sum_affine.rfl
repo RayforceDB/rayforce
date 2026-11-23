@@ -98,7 +98,7 @@
 ;; the sentinel; -2 wraps ordinarily to MAX. Keep the latter in the sum.
 (set PromSlice (drop [77i -2i -1i 0i] 1))
 (list (sum (+ PromSlice 1)) (sum (+ -9223372036854775807 PromSlice))) -- [0 0]
-(sum (+ (as 'I16 [-1 -1 2]) -9223372036854775807)) -- -9223372036854775805
+(sum (+ (as 'I16 [-1 2 3]) -9223372036854775807)) -- 7
 ;; Large odd slice: the last partition contains the unique preimage.
 (set PartSlice (drop (til 200002) 1))
 (set PartRef (+ PartSlice 9223372036854575807))

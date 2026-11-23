@@ -346,8 +346,8 @@ static test_result_t test_narrow_sum_bound_routes(void) {
                "(sum (- (+ (+ xc (* 3 yc)) 5) (* yc 3)))"), 0 },
         /* a narrow constant subtree that wraps: refused, per row */
         { NS_Q("(select {s: (sum (* -12038h 0x7f)) from: _nt100})", "-2149800"), REF },
-        /* I64 addition can generate null; safe bounds permit the rewrite. */
-        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), SCAN | PRE },
+        /* Plain I64 pair SUM accounts for sentinel hits directly, without a bounds scan. */
+        { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), PRE },
         { NULL, 0 },
     };
     test_result_t r = narrow_sum_run_cases(cases);
@@ -369,7 +369,8 @@ static test_result_t test_narrow_sum_bound_cancel(void) {
         "(set i (as 'I32 (- (% _cI 200001) 100000)))",
         "(set j (as 'I32 (% (* _cI 7) 99991)))",
         "(set hw (concat (take h 500001) (concat (enlist 30000h) (drop h 500002))))",
-        "(set _cT (table [h k i j hw] (list h k i j hw)))",
+        "(set z (- (% _cI 100003) 50001))",
+        "(set _cT (table [h k i j hw z] (list h k i j hw z)))",
         NULL,
     };
     int bad = 0;
@@ -379,10 +380,11 @@ static test_result_t test_narrow_sum_bound_cancel(void) {
         "(select {s: (avg (+ i j)) from: _cT})",
         "(select {s: (sum (+ h 1h)) from: _cT})",
         "(select {s: (sum (+ hw hw)) from: _cT})",
+        "(select {s: (sum (* z 2)) from: _cT})",
         NULL,
     };
     static const char* const ex[] = {
-        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))",
+        "(enlist (sum (+ h k)))", "(enlist (avg (+ i j)))", "(enlist (sum (+ h 1h)))", "(enlist (sum (+ hw hw)))", "(enlist (sum (* z 2)))",
     };
     int cancelled = 0, answered = 0;
     for (int qi = 0; qs[qi] && !bad; qi++)

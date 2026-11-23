@@ -16354,6 +16354,10 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
      * (agg_linear_t.pre_only, #1287). */
     bool sc_lone = n_keys == 0 && nrows > 0 && n_aggs == 1 && !match_idx && !rowsel;
 
+    affine_bounds_t bounds = {0};
+    bool pair = sc_route && !match_idx && !rowsel && n_aggs == 2 &&
+                ((ext->agg_ops[0] == OP_SUM && ext->agg_ops[1] == OP_AVG) ||
+                 (ext->agg_ops[0] == OP_AVG && ext->agg_ops[1] == OP_SUM));
     ray_t* rerr = NULL;     /* a failed column bind in the planners below */
     for (uint32_t a = 0; a < n_aggs; a++) {
         ray_op_t* agg_input_op = op_node(g, ext->agg_ins[a]);
@@ -16362,7 +16366,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         /* SUM/AVG(scan +/- const): aggregate base scan and apply bias at emit. */
         uint16_t agg_kind = ext->agg_ops[a];
         if ((agg_kind == OP_SUM || agg_kind == OP_AVG) &&
-            try_affine_sumavg_input(g, tbl, agg_input_op, sc_route, sc_lone,
+            try_affine_sumavg_pair(g, tbl, agg_input_op, sc_route, sc_lone,
+                                   pair ? &bounds : NULL,
                                     &agg_vecs[a], &agg_affine[a], &rerr)) {
             if (agg_vecs[a] && agg_vecs[a]->type == RAY_ENCCOL) {   /* staged base */
                 rerr = ray_col_src_bind(agg_vecs[a], &agg_own_src[a]);

@@ -14,3 +14,11 @@
 (set T (table [b] (list b)))
 (set rows (+ b 1))
 (at (at (select {from: T s: (sum (+ b 1))}) 's) 0) -- (sum rows)
+;; Exercise the lone SUM path above its 64K threshold, across both
+;; multiplication preimages and an odd addition hit in the final slice.
+(set pv (concat (til 199999) [4611686018427387904 -4611686018427387904 9223372036854775807]))
+(set PT (table [pv] (list pv)))
+(set pd (* pv 2))
+(set pa (+ pv 1))
+(== (first (at (select {from: PT s: (sum (* pv 2))}) 's)) (sum pd)) -- true
+(== (first (at (select {from: PT s: (sum (+ pv 1))}) 's)) (sum pa)) -- true
