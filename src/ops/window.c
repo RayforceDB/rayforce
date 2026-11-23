@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include <stdatomic.h>
 #include "ops/internal.h"
 #include "lang/internal.h"  /* sym_cell_runtime_id (sym-domain Phase 2) */
 
@@ -839,18 +840,62 @@ static int win_sym_ent_cmp(const void* a, const void* b) {
     int c = memcmp(x->p, y->p, m);
     return c ? c : (x->l < y->l ? -1 : x->l > y->l);
 }
+/* The column's distinct cell ids, each to a slot: a dense table indexed by
+ * the id while that stays small next to the column (1- and 2-byte cells, or
+ * ids up to 4 per row), else an open-addressing hash of the ids present, so
+ * the scratch is bounded by the column, not by every symbol in the process. */
+typedef struct { bool dense; int64_t* val; int64_t* key; int64_t cap; ray_t* hdr; } win_idmap_t;
+static _Atomic(int64_t) g_win_rank_slots;   /* test hook: slots of the last rank map */
+int64_t ray_window_test_rank_slots(void) { return atomic_load_explicit(&g_win_rank_slots, memory_order_relaxed); }
+
+static inline int64_t win_idmap_hash(const win_idmap_t* m, int64_t c) {
+    return (int64_t)(((uint64_t)c * 0x9E3779B97F4A7C15ull) >> 1) & (m->cap - 1);
+}
+static int64_t* win_idmap_slot(win_idmap_t* m, int64_t c) {
+    if (m->dense) return &m->val[c];
+    int64_t h = win_idmap_hash(m, c);
+    while (m->key[h] != 0 && m->key[h] != c) h = (h + 1) & (m->cap - 1);
+    return &m->val[h];
+}
+static bool win_idmap_alloc(win_idmap_t* m, int64_t cap) {
+    ray_t* hdr = NULL;
+    int64_t* mem = (int64_t*)scratch_alloc(&hdr, (size_t)cap * (m->dense ? 1 : 2) * sizeof(int64_t));
+    if (!mem) return false;
+    m->hdr = hdr; m->cap = cap; m->val = mem; m->key = m->dense ? NULL : mem + cap;
+    for (int64_t k = 0; k < cap; k++) mem[k] = -1;
+    if (!m->dense) memset(m->key, 0, (size_t)cap * sizeof(int64_t));
+    atomic_store_explicit(&g_win_rank_slots, cap, memory_order_relaxed);
+    return true;
+}
+/* Mark id c (non-zero) present; false on oom.  *added counts new ids. */
+static bool win_idmap_add(win_idmap_t* m, int64_t c, int64_t* added) {
+    if (m->dense) { if (m->val[c] < 0) { m->val[c] = 0; (*added)++; } return true; }
+    int64_t h = win_idmap_hash(m, c);
+    while (m->key[h] != 0 && m->key[h] != c) h = (h + 1) & (m->cap - 1);
+    if (m->key[h] == c) return true;
+    m->key[h] = c; m->val[h] = 0; (*added)++;
+    if (2 * *added > m->cap) {                      /* grow at half full */
+        win_idmap_t o = *m;
+        if (!win_idmap_alloc(m, o.cap * 2)) { *m = o; return false; }
+        for (int64_t k = 0; k < o.cap; k++)
+            if (o.key[k] != 0) { int64_t* sl = win_idmap_slot(m, o.key[k]); m->key[sl - m->val] = o.key[k]; *sl = 0; }
+        scratch_free(o.hdr);
+    }
+    return true;
+}
+
 static ray_t* win_sym_ranks(ray_t* v, int64_t n, ray_t** ids) {
     uint8_t w = v->attrs & RAY_SYM_W_MASK;
     int64_t maxc = 0;
     if (w == RAY_SYM_W8) maxc = 255;
     else if (w == RAY_SYM_W16) maxc = 65535;
     else WIN_SYM_CELLS(v, n, if (c > maxc) maxc = c);
-    ray_t* lut_hdr = NULL;
-    int64_t* lut = (int64_t*)scratch_alloc(&lut_hdr, (size_t)(maxc + 1) * sizeof(int64_t));
-    if (!lut) return ray_error("oom", NULL);
-    for (int64_t c = 0; c <= maxc; c++) lut[c] = -1;
+    win_idmap_t m = { .dense = maxc <= 65535 || maxc + 1 <= 4 * n };
+    if (!win_idmap_alloc(&m, m.dense ? maxc + 1 : 1024)) return ray_error("oom", NULL);
     int64_t nd = 0;
-    WIN_SYM_CELLS(v, n, if (c != 0 && lut[c] < 0) { lut[c] = 0; nd++; });
+    bool ok = true;
+    WIN_SYM_CELLS(v, n, if (ok && c != 0) ok = win_idmap_add(&m, c, &nd));
+    if (!ok) { scratch_free(m.hdr); return ray_error("oom", NULL); }
     ray_t* ent_hdr = NULL;
     win_sym_ent_t* ent = (win_sym_ent_t*)scratch_alloc(&ent_hdr, (size_t)(nd ? nd : 1) * sizeof(win_sym_ent_t));
     ray_t* idv = ray_vec_new(RAY_I64, nd ? nd : 1);
@@ -859,14 +904,14 @@ static ray_t* win_sym_ranks(ray_t* v, int64_t n, ray_t** ids) {
         if (idv && !RAY_IS_ERR(idv)) ray_release(idv);
         if (r && !RAY_IS_ERR(r)) ray_release(r);
         if (ent) scratch_free(ent_hdr);
-        scratch_free(lut_hdr);
+        scratch_free(m.hdr);
         return ray_error("oom", NULL);
     }
     int64_t k = 0;
-    for (int64_t c = 1; c <= maxc; c++) {
-        if (lut[c] < 0) continue;
-        int64_t rid = sym_id_runtime(v, c);
-        ray_t* str = ray_sym_str(rid);
+    for (int64_t q = 0; q < m.cap; q++) {
+        int64_t c = m.dense ? q : m.key[q];
+        if (c == 0 || m.val[q] < 0) continue;
+        ray_t* str = ray_sym_str(sym_id_runtime(v, c));
         ent[k].id = c;
         ent[k].p = str ? ray_str_ptr(str) : "";
         ent[k].l = str ? ray_str_len(str) : 0;
@@ -875,14 +920,15 @@ static ray_t* win_sym_ranks(ray_t* v, int64_t n, ray_t** ids) {
     qsort(ent, (size_t)nd, sizeof(win_sym_ent_t), win_sym_ent_cmp);
     int64_t* idd = (int64_t*)ray_data(idv);
     idv->len = nd;
-    for (int64_t q = 0; q < nd; q++) { lut[ent[q].id] = q; idd[q] = sym_id_runtime(v, ent[q].id); }
+    for (int64_t q = 0; q < nd; q++) { *win_idmap_slot(&m, ent[q].id) = q; idd[q] = sym_id_runtime(v, ent[q].id); }
     r->len = n;
     int64_t* rd = (int64_t*)ray_data(r);
     bool any = false;
-    WIN_SYM_CELLS(v, n, if (c == 0) { rd[i] = NULL_I64; any = true; } else rd[i] = lut[c]);
+    if (m.dense) WIN_SYM_CELLS(v, n, if (c == 0) { rd[i] = NULL_I64; any = true; } else rd[i] = m.val[c]);
+    else WIN_SYM_CELLS(v, n, if (c == 0) { rd[i] = NULL_I64; any = true; } else rd[i] = *win_idmap_slot(&m, c));
     if (any) r->attrs |= RAY_ATTR_HAS_NULLS;
     scratch_free(ent_hdr);
-    scratch_free(lut_hdr);
+    scratch_free(m.hdr);
     *ids = idv;
     return r;
 }
