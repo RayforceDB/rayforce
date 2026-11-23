@@ -60,9 +60,10 @@
 (at FT 'mn) -- [1.5 1.5 10.0 2.5 10.0]
 (at FT 'mx) -- [1.5 2.5 10.0 3.5 20.0]
 (set FV (window {from: F part: [k] order: [o] funcs: {f: (first v) l: (last v)}}))
-(type (at FV 'f)) -- 'F64
-(at FV 'f) -- [1.5 1.5 10.0 1.5 10.0]
-(at FV 'l) -- [3.5 3.5 20.0 3.5 20.0]
+;; first / last keep the value's type, F32 included (#1443)
+(type (at FV 'f)) -- 'F32
+(at FV 'f) -- (as 'F32 [1.5 1.5 10.0 1.5 10.0])
+(at FV 'l) -- (as 'F32 [3.5 3.5 20.0 3.5 20.0])
 (.sys.exec "rm -f /tmp/rfl_window_f32.csv")
 
 ;; ── composite radix prescan over full-span, nullable or F64 keys ────────────
