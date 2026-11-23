@@ -597,7 +597,11 @@ An updated column keeps its type, with or without `where:` and `by:`. A value of
 - `I64` widens into `F64`;
 - `F32` widens into `F64`.
 
-So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every row. Any other type is a `type` error: an `F64` value into an `I64` column, an `I64` value into an `I32` column, or an integer into a `DATE` column. Cast explicitly to store it, for example `(update {salary: (as 'I64 (* salary 1.1)) from: 't})`. A `LIST` column takes any value. A new column takes the value's type.
+So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every row. Any other type is a `type` error: an `F64` value into an `I64` column, an `I64` value into an `I32` column, or an integer into a `DATE` column. Cast explicitly to store it, for example `(update {salary: (as 'I64 (* salary 1.1)) from: 't})`.
+
+Integer arithmetic yields `I64`, so to update an `I32`, `I16` or `U8` column, write the literal in the column's type, as in `(update {qty: (+ qty 1i) from: 't})`, or cast the result.
+
+A `LIST` value into a typed column is a `type` error. A `LIST` column takes a `LIST` value. A new column takes the value's type.
 
 ### Update with Group-by
 

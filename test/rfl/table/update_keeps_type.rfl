@@ -67,3 +67,10 @@
 (at (update {v: 7 from: P where: (== k 'a)}) 'v) -- [7.0 2.5 7.0 4.5]
 (update {v: (as 'I64 v) from: P by: k}) -- (update {v: (as 'F64 (as 'I64 v)) from: P by: k})
 (.sys.exec "rm -rf /tmp/rfl_update_keeps_type") -- 0
+
+;; a LIST value into a typed column: a type error on every route
+(update {v: (list 1 2 3) from: t}) !- type
+(update {v: (list 1 2 3) from: t where: (== k 'a)}) !- type
+(update {v: (list 1 2) from: t by: k}) !- type
+;; a LIST column still takes a LIST
+(at (update {c: (list 1 2 3) from: (table [k c] (list ['a 'b 'a] (list [1 2] "x" 'y)))}) 'c) -- (list 1 2 3)
