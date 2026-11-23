@@ -1,0 +1,53 @@
+;; avg over a parted I64 input merges an exact total across partitions
+;; (#1440).  Each partition's partial SUM of a 64-bit input is its total
+;; modulo 2^64; merging those wrapped, so a group whose total leaves int64
+;; averaged a wrapped sum.  Every route (by:, where:, beside a second
+;; aggregate, an expression input with generated nulls) must answer what the
+;; flat table answers, and that is the builtin avg of the same rows.
+;; Nine partitions cross the eight-partition merge batch.
+(.sys.exec "rm -rf /tmp/rfl_parted_wide_i64_avg")
+(set H 4611686018427387904)
+(set mk (fn [n v] (table [k x] (list (% (til n) 2) (+ v (* 0 (til n)))))))
+(set Z (mk 70000 3))
+(set W (mk 70002 H))
+(set N (table [k x] (list [0 1 0 1] [0N 0N 5 7])))
+(set root "/tmp/rfl_parted_wide_i64_avg/")
+(set save (fn [p t] (.db.splayed.set (concat root (concat (as 'STR p) "/t/")) t (concat root ".sym") {compress: false})))
+(save 1 Z)
+(save 2 W)
+(save 3 N)
+(save 4 W)
+(save 5 Z)
+(save 6 W)
+(save 7 Z)
+(save 8 W)
+(save 9 W)
+(set P (.db.parted.get root 't))
+(set F (concat (concat (concat (concat (concat (concat (concat (concat Z W) N) W) Z) W) Z) W) W))
+(set xs (at F 'x))
+(set ks (at F 'k))
+(set runs (fn [] (at (.sys.mem) 'group-perpart-runs)))
+;; served per partition, equal to the flat table, bit for bit
+(set same (fn [q c] (set n0 (runs)) (set p (at (q P) c)) (set f (at (q F) c)) (list (- (runs) n0) (== (count p) (count f)) (all (== p f)))))
+(same (fn [t] (select {a: (avg x) from: t by: k asc: k})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg x) c: (count x) from: t})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg x) s: (sum x) from: t})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg x) from: t where: (> x 4)})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg x) from: t where: (> x 4) by: k asc: k})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg x) m: (max x) from: t by: k asc: k})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg (+ x 1)) from: t by: k asc: k})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg (- x H)) b: (avg x) from: t by: k asc: k})) 'b) -- (list 1 true true)
+;; x + MAX wraps every wide row and turns x = 1 into the null
+(set MX 9223372036854775807)
+(same (fn [t] (select {a: (avg (+ x MX)) from: t by: k asc: k})) 'a) -- (list 1 true true)
+(same (fn [t] (select {a: (avg (+ x MX)) c: (count x) from: t})) 'a) -- (list 1 true true)
+;; the answers are the builtin avg of the rows, compared exactly
+(set g (at (select {a: (avg x) from: P by: k asc: k}) 'a))
+(list (== (at g 0) (avg (at xs (where (== ks 0))))) (== (at g 1) (avg (at xs (where (== ks 1)))))) -- (list true true)
+(== (first (at (select {a: (avg x) c: (count x) from: P}) 'a)) (avg xs)) -- true
+(== (first (at (select {a: (avg x) from: P where: (> x 4)}) 'a)) (avg (at xs (where (> xs 4))))) -- true
+(== (first (at (select {a: (avg (+ x MX)) c: (count x) from: P}) 'a)) (avg (+ xs MX))) -- true
+;; the SUM beside the AVG keeps its wrapped total
+(== (first (at (select {a: (avg x) s: (sum x) from: P}) 's)) (sum xs)) -- true
+(set P 0)
+(.sys.exec "rm -rf /tmp/rfl_parted_wide_i64_avg")
