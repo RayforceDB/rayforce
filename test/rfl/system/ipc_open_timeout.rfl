@@ -12,29 +12,31 @@
 ;; SO_*TIMEO, so without this a dead/filtered peer would hang for the OS
 ;; default (~minutes).
 ;;
-;; Port 19998 is fixed and unprivileged; distinct from ipc_diff.rfl's
-;; 19999 so the two never collide.  `make test` is sequential anyway.
+;; The server takes a free port of its own and is stopped by its pid, and
+;; the refused connect goes to a port nothing listens on (test/serve.sh), so
+;; suites running at once never meet (#1140).
 
 ;; ── argument validation (no server needed) ─────────────────────────
 ;; The harness `!-` operator matches the error tag (ray_fmt(err, 0)),
 ;; so assert on the tag; the human-readable detail is exercised by the
 ;; REPL.  Wrong arity → rank.
-(.ipc.open "127.0.0.1:19998" 1 2) !- rank
+(set dead (format "127.0.0.1:%" (trim (at (.sys.exec "test/serve.sh --port" 'out) 'out))))
+(.ipc.open dead 1 2) !- rank
 ;; Non-integer timeout → type.
-(.ipc.open "127.0.0.1:19998" "soon") !- type
+(.ipc.open dead "soon") !- type
 ;; Negative timeout → domain.
-(.ipc.open "127.0.0.1:19998" -5) !- domain
-;; A refused peer reports an error promptly rather than hanging — port
-;; 19997 has no listener, so the connect is refused (RST) → io.
-(.ipc.open "127.0.0.1:19997" 500) !- io
+(.ipc.open dead -5) !- domain
+;; A refused peer reports an error promptly rather than hanging — nothing
+;; listens on `dead`, so the connect is refused (RST) → io.
+(.ipc.open dead 500) !- io
 
 ;; ── lifecycle: spawn server ────────────────────────────────────────
-(.sys.exec "pkill -TERM -f 'rayforce -p 19998' 2>/dev/null; true")
-(.sys.exec "./rayforce -p 19998 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19998) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "rm -rf /tmp/rfl_ipc_ot")
+(.sys.exec "test/serve.sh /tmp/rfl_ipc_ot") -- 0
+(set port (trim (read "/tmp/rfl_ipc_ot/port")))
 
 ;; ── happy path: timeout arg does not break a real connect ──────────
-(set h (.ipc.open "127.0.0.1:19998" 2000))
+(set h (.ipc.open (format "127.0.0.1:%" port) 2000))
 (>= h 0) -- true
 ;; Round-trip over the wire to prove the handshake completed normally.
 (+ 3 4)           -- (.ipc.send h "(+ 3 4)")
@@ -42,7 +44,7 @@
 (.ipc.close h)
 
 ;; ── backward compatibility: 1-arg form still works ────────────────
-(set h2 (.ipc.open "127.0.0.1:19998"))
+(set h2 (.ipc.open (format "127.0.0.1:%" port)))
 (>= h2 0) -- true
 (* 6 7) -- (.ipc.send h2 "(* 6 7)")
 (.ipc.close h2)
@@ -50,11 +52,11 @@
 ;; ── "localhost" must connect even though the server is IPv4-only ──
 ;; localhost often resolves to ::1 (IPv6) first; ray_sock_connect now tries
 ;; every resolved address, so it falls through to 127.0.0.1.
-(set h3 (.ipc.open "localhost:19998"))
+(set h3 (.ipc.open (format "localhost:%" port)))
 (>= h3 0) -- true
 (- 9 4) -- (.ipc.send h3 "(- 9 4)")
 
 ;; ── teardown ───────────────────────────────────────────────────────
 (try (.ipc.send h3 "(exit 0)") (fn [e] 0))
 (.ipc.close h3)
-(.sys.exec "sleep 0.1; pkill -KILL -f 'rayforce -p 19998' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_ipc_ot KILL; rm -rf /tmp/rfl_ipc_ot") -- 0

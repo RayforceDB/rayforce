@@ -1231,8 +1231,6 @@ static const char* const quick_skip[] = {
 static const char* const exclusive_tests[] = {
     "heap/relieve_",               /* which worker heap keeps which empty pool */
     "heap/raw_discard",            /* process-wide anon / direct byte counts */
-    "rfl/system/ipc_diff",         /* fixed server port 19999, shared with ... */
-    "equiv/rfl/system/ipc_diff",   /* ... its equivalence-pass twin */
     "rfl/query/grouped_grade_per_group",        /* in-run route-cost comparisons ... */
     "equiv/rfl/query/grouped_grade_per_group",  /* ... that a saturated machine skews */
     NULL,

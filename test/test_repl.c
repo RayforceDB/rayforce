@@ -547,6 +547,17 @@ static test_result_t test_repl_create_inherits_profile(void) {
  * ray_repl_t* has term==NULL and ray_repl_run picks the run_piped
  * branch.  This is the only seam through which piped semantics are
  * unit-testable without a child process. */
+/* A port nothing listens on right now: one the kernel hands out and is
+ * given back.  A fixed one could be held by a suite running at the same
+ * time (#1140).  0 when no socket could be had. */
+static uint16_t repl_free_port(void) {
+    ray_sock_t s = ray_sock_listen(0);
+    if (s == RAY_INVALID_SOCK) return 0;
+    uint16_t port = ray_test_listen_port(s);
+    ray_sock_close(s);
+    return port;
+}
+
 static int run_piped_with_input(const char* script) {
     int p[2];
     if (pipe(p) != 0) return -1;
@@ -1787,10 +1798,12 @@ static test_result_t test_repl_run_piped_lazy_result(void) {
  * :listen with a valid ephemeral port returns a listener handle.  We
  * close it immediately so it doesn't linger between tests. */
 static test_result_t test_repl_run_piped_listen_ok(void) {
-    /* Use a high ephemeral port — kernel picks a free one if 0 isn't
-     * valid here.  If it fails (port occupied) the test still passes
-     * because the loop continues and the main assertion is rc == 0. */
-    int rc = run_piped_with_input(":listen 19873\n");
+    /* A port of its own (repl_free_port).  If it fails (port occupied)
+     * the test still passes because the loop continues and the main
+     * assertion is rc == 0. */
+    char cmd[32];
+    snprintf(cmd, sizeof cmd, ":listen %u\n", (unsigned)repl_free_port());
+    int rc = run_piped_with_input(cmd);
     TEST_ASSERT_EQ_I(rc, 0);
     PASS();
 }
@@ -1811,6 +1824,8 @@ static test_result_t test_repl_run_piped_listen_ok(void) {
 #ifndef RAY_OS_WINDOWS
 static int run_piped_with_poll_listen(void)
 {
+    uint16_t port = repl_free_port();
+    if (!port) return -1;
     int pfd[2];
     if (pipe(pfd) != 0) return -1;
 
@@ -1856,12 +1871,13 @@ static int run_piped_with_poll_listen(void)
     }
 
     /* Parent: write ":listen PORT\n" then close write end to signal EOF.
-     * The port is this test's own (19876 is the port system_branch_cov2.rfl
-     * expects nothing to listen on); all we need is n_sels > 0 when stdin
-     * EOF fires. */
+     * The port is this test's own (repl_free_port), so the probe below
+     * never reaches another suite's listener; all we need is n_sels > 0
+     * when stdin EOF fires. */
     close(pfd[0]);
     usleep(50 * 1000);  /* let child start up */
-    const char* cmd = ":listen 19864\n";
+    char cmd[32];
+    snprintf(cmd, sizeof cmd, ":listen %u\n", (unsigned)port);
     if (write(pfd[1], cmd, strlen(cmd)) < 0) { /* tolerate error */ }
     close(pfd[1]);  /* EOF triggers fgets null → stdin done */
 
@@ -1874,7 +1890,7 @@ static int run_piped_with_poll_listen(void)
         pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) goto done_piped_poll;
         if (!signalled) {
-            ray_sock_t s = ray_sock_connect("127.0.0.1", 19864, 100);
+            ray_sock_t s = ray_sock_connect("127.0.0.1", port, 100);
             if (s != RAY_INVALID_SOCK) {
                 struct timeval tv = { 0, 100 * 1000 };
                 setsockopt((int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -2298,7 +2314,9 @@ static test_result_t test_repl_pty_listen_ok(void) {
 #ifndef RAY_OS_WINDOWS
     /* :listen with valid port + poll attached → h_listen returns
      * ray_i64(id), hitting lines 800-801 in handle_command. */
-    int rc = run_pty_listen_with_poll(":listen 19874\n:q\n");
+    char in[40];
+    snprintf(in, sizeof in, ":listen %u\n:q\n", (unsigned)repl_free_port());
+    int rc = run_pty_listen_with_poll(in);
     TEST_ASSERT_FMT(rc == 0 || rc == -1, "unexpected child exit: %d", rc);
 #endif
     PASS();

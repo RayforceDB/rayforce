@@ -7,20 +7,20 @@
 ;; listener).  A supervisor that asked for a server got a process that
 ;; was not one, with a zero exit code.
 ;;
-;; A first rayforce holds port 19978 (server-only, started by pid so the
-;; cleanup cannot match any shell); a second one asked for the same port
-;; must exit non-zero without running its script.
-(.sys.exec "[ -f /tmp/rfl_lf.pid ] && kill $(cat /tmp/rfl_lf.pid) 2>/dev/null; rm -f /tmp/rfl_lf.pid; true")
-(.sys.exec "./rayforce -p 19978 </dev/null >/dev/null 2>&1 & echo $! > /tmp/rfl_lf.pid")
-(.sys.exec "for i in $(seq 50); do bash -c '(echo > /dev/tcp/127.0.0.1/19978) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+;; A first rayforce holds a free port of its own (test/serve.sh: stopped by
+;; its pid, so no cleanup can match any shell or another suite's server,
+;; #1140); a second one asked for the same port must exit non-zero without
+;; running its script.
+(.sys.exec "rm -rf /tmp/rfl_lf")
+(.sys.exec "test/serve.sh /tmp/rfl_lf") -- 0
 (.sys.exec "printf '(println \"script ran\")\n' > /tmp/rfl_lf_plain.rfl")
 
 ;; the second process must exit 1 with the diagnostic and without running
 ;; its script (.sys.exec returns the raw wait status, so fold to 0/1 here)
-(.sys.exec "./rayforce -p 19978 /tmp/rfl_lf_plain.rfl </dev/null >/tmp/rfl_lf.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_lf.out && exit 99; grep -q 'failed to listen on \\*:19978' /tmp/rfl_lf.out || exit 98; [ $rc -eq 1 ]") -- 0
+(.sys.exec "P=$(cat /tmp/rfl_lf/port); ./rayforce -p $P /tmp/rfl_lf_plain.rfl </dev/null >/tmp/rfl_lf.out 2>&1; rc=$?; grep -q 'script ran' /tmp/rfl_lf.out && exit 99; grep -q \"failed to listen on \\*:$P\" /tmp/rfl_lf.out || exit 98; [ $rc -eq 1 ]") -- 0
 
 ;; the same script on a free port still runs (the process then serves, so
 ;; it is started in the background and killed by pid once the marker shows)
-(.sys.exec "./rayforce -p 19977 /tmp/rfl_lf_plain.rfl </dev/null >/tmp/rfl_lf2.out 2>&1 & p=$!; for i in $(seq 50); do grep -q 'script ran' /tmp/rfl_lf2.out && break; sleep 0.1; done; kill $p; grep -q 'script ran' /tmp/rfl_lf2.out") -- 0
+(.sys.exec "./rayforce -p $(test/serve.sh --port) /tmp/rfl_lf_plain.rfl </dev/null >/tmp/rfl_lf2.out 2>&1 & p=$!; for i in $(seq 50); do grep -q 'script ran' /tmp/rfl_lf2.out && break; sleep 0.1; done; kill $p; grep -q 'script ran' /tmp/rfl_lf2.out") -- 0
 
-(.sys.exec "kill $(cat /tmp/rfl_lf.pid) 2>/dev/null; rm -f /tmp/rfl_lf.pid /tmp/rfl_lf_plain.rfl /tmp/rfl_lf.out /tmp/rfl_lf2.out; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_lf; rm -rf /tmp/rfl_lf /tmp/rfl_lf_plain.rfl /tmp/rfl_lf.out /tmp/rfl_lf2.out; true")

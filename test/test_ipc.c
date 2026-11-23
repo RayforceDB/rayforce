@@ -3441,17 +3441,26 @@ static void oob_later_fn(void* arg) {
     if (o->hold) ray_ipc_hold_cancel_for_test(false);
 }
 
-static pid_t spawn_server(uint16_t port) {
-    char portstr[8];
-    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
-    pid_t pid = fork();
-    if (pid == 0) {
-        int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
-        execl("./rayforce", "./rayforce", "-p", portstr, (char*)NULL);
-        _exit(127);
-    }
-    return pid;
+/* A ./rayforce server on a free port of its own, through test/serve.sh (as
+ * the .rfl tests start theirs, #1140): `dir` (a "/tmp/..." path, moved under
+ * this process's root) receives its port and pid, and its watchdog stops it
+ * if this process ends first.  The port, or 0 when it did not come up. */
+static uint16_t serve_server(const char* dir) {
+    char cmd[512], path[512];
+    snprintf(cmd, sizeof cmd, "rm -rf %s; test/serve.sh %s", dir, dir);
+    if (system(ray_test_tmp(cmd)) != 0) return 0;
+    snprintf(path, sizeof path, "%s/port", dir);
+    FILE* f = fopen(ray_test_tmp(path), "r");
+    unsigned port = 0;
+    if (f) { if (fscanf(f, "%u", &port) != 1) port = 0; fclose(f); }
+    return (uint16_t)port;
+}
+
+/* Stop the server serve_server started in `dir`, by its pid, and wait. */
+static void serve_stop(const char* dir) {
+    char cmd[512];
+    snprintf(cmd, sizeof cmd, "test/serve.sh --stop %s; rm -rf %s", dir, dir);
+    if (system(ray_test_tmp(cmd)) != 0) { /* gone either way: --stop failing leaves it to the watchdog */ }
 }
 
 static int64_t connect_retry(uint16_t port) {
@@ -3482,30 +3491,22 @@ static void drop(ray_t* r) {
 /* refuse_first: send one message that cannot be framed before the long
  * query.  It is refused with nothing written, so it must not use up a
  * request number: the cancel that follows still names the long query. */
-static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_first) {
+static test_result_t cancel_mid_query_moved_link(const char* dir, bool refuse_first) {
 #if defined(__linux__)
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
-    char portstr[8];
-    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
-    pid_t pid = fork();
-    TEST_ASSERT((pid) >= (0), "fork");
-    if (pid == 0) {
-        int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); }
-        execl("./rayforce", "./rayforce", "-p", portstr, (char*)NULL);
-        _exit(127);
-    }
-    int64_t h = -1;
-    for (int i = 0; i < 100 && h < 0; i++) {
-        h = ray_ipc_connect("127.0.0.1", port, NULL, NULL, 1000);
-        if (h < 0) sleep_ms(50);
-    }
-    if (h < 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+    /* A server on a port of its own (test/serve.sh, #1140): on a fixed one,
+     * a suite running at the same time held it, and this test connected to
+     * and cancelled on that suite's server instead. */
+    uint16_t port = serve_server(dir);
+    if (!port) serve_stop(dir);
+    TEST_ASSERT(port, "server started");
+    int64_t h = connect_retry(port);
+    if (h < 0) serve_stop(dir);
     TEST_ASSERT((h) >= (0), "connected to the spawned server");
     ray_selector_t* sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
     if (!sel || !sel->xport) {
         ray_ipc_close(h);
-        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        serve_stop(dir);
         SKIP("the connection did not move to shared memory here");
     }
     if (refuse_first) {
@@ -3520,7 +3521,7 @@ static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_firs
         sel = ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), h);
         if (!refused || !sel || !sel->xport) {
             if (sel) ray_ipc_close(h);
-            kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            serve_stop(dir);
         }
         TEST_ASSERT(refused, "a message that cannot be framed is refused");
         TEST_ASSERT(sel && sel->xport, "the refusal leaves the link open and moved");
@@ -3543,8 +3544,7 @@ static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_firs
     ray_t* r2 = ray_ipc_send(h, msg);
     ray_release(msg);
     ray_ipc_close(h);
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    serve_stop(dir);
     TEST_ASSERT_NOT_NULL(r1);
     TEST_ASSERT(RAY_IS_ERR(r1), "the query is cancelled");
     TEST_ASSERT_STR_EQ(ray_err_code(r1), "cancel");
@@ -3556,19 +3556,17 @@ static test_result_t cancel_mid_query_moved_link(uint16_t port, bool refuse_firs
     ray_release(r2);
     PASS();
 #else
-    (void)port; (void)refuse_first;
+    (void)dir; (void)refuse_first;
     SKIP("moved connections are Linux-only");
 #endif
 }
 
 static test_result_t test_ipc_cancel_byte_mid_query_moved_link(void) {
-    /* 19866: its own port (19986 is rfl/io/ipc_transport.rfl's server,
-     * which may run at the same time). */
-    return cancel_mid_query_moved_link(19866, false);
+    return cancel_mid_query_moved_link("/tmp/ipc_cancel_mid", false);
 }
 
 static test_result_t test_ipc_cancel_after_refused_send_moved_link(void) {
-    return cancel_mid_query_moved_link(19985, true);
+    return cancel_mid_query_moved_link("/tmp/ipc_cancel_refused", true);
 }
 
 /* ---- a cancel taken while the request closes its own connection ------- */
@@ -3628,10 +3626,13 @@ static test_result_t test_ipc_cancel_seen_on_self_closed_moved_link(void) {
 static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
 #if defined(__linux__)
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
-    const uint16_t port_s = 19984, port_p = 19983;
-    pid_t ps = spawn_server(port_s);
-    pid_t pp = spawn_server(port_p);
-    TEST_ASSERT(ps > 0 && pp > 0, "fork");
+    const uint16_t port_s = serve_server("/tmp/ipc_nested_s");
+    const uint16_t port_p = serve_server("/tmp/ipc_nested_p");
+    if (!port_s || !port_p) {
+        serve_stop("/tmp/ipc_nested_s");
+        serve_stop("/tmp/ipc_nested_p");
+        TEST_ASSERT(port_s && port_p, "servers started");
+    }
     int64_t hs = connect_retry(port_s);
     int64_t hp = connect_retry(port_p);
     ray_selector_t* sel = hs >= 0 ? ray_poll_get((ray_poll_t*)ray_runtime_get_poll(), hs) : NULL;
@@ -3639,8 +3640,10 @@ static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
     ray_t* d1 = NULL; ray_t* d2 = NULL; ray_t* d3 = NULL;
     if (moved) {
         d1 = send_str(hs, "(set spin (fn [] (do (set k 0) (while (< k 1000000000) (set k (+ k 1))) k)))");
-        d2 = send_str(hp, "(do (set hps (.ipc.open \"127.0.0.1:19984\")) "
-                          "(.ipc.send hps \"(set hb (.ipc.handle))\"))");
+        char q[160];
+        snprintf(q, sizeof q, "(do (set hps (.ipc.open \"127.0.0.1:%u\")) "
+                              "(.ipc.send hps \"(set hb (.ipc.handle))\"))", (unsigned)port_s);
+        d2 = send_str(hp, q);
         d3 = send_str(hp, "(set g (fn [] (.ipc.send hps \"(spin)\" 300)))");
     }
     bool setup = moved && d1 && !RAY_IS_ERR(d1) && d2 && !RAY_IS_ERR(d2) &&
@@ -3649,8 +3652,8 @@ static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
     if (!setup) {
         if (hs >= 0) ray_ipc_close(hs);
         if (hp >= 0) ray_ipc_close(hp);
-        kill(ps, SIGTERM); kill(pp, SIGTERM);
-        waitpid(ps, NULL, 0); waitpid(pp, NULL, 0);
+        serve_stop("/tmp/ipc_nested_s");
+        serve_stop("/tmp/ipc_nested_p");
         if (!moved) SKIP("the connection did not move to shared memory here");
         TEST_ASSERT(setup, "servers set up");
     }
@@ -3668,8 +3671,8 @@ static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
     drop(ra);
     ray_ipc_close(hs);
     ray_ipc_close(hp);
-    kill(ps, SIGTERM); kill(pp, SIGTERM);
-    waitpid(ps, NULL, 0); waitpid(pp, NULL, 0);
+    serve_stop("/tmp/ipc_nested_s");
+    serve_stop("/tmp/ipc_nested_p");
     TEST_ASSERT_NOT_NULL(ra);
     TEST_ASSERT((took) < (10000), "P's cancel stopped the nested request");
     TEST_ASSERT((unconfirmed) >= (0), "the held cancel for A is still unconfirmed");

@@ -8,48 +8,51 @@
 ;; built-in 2000.  `keepalive` is a dead-peer budget in ms (#589): 0N
 ;; turns detection off, absent keeps it on at the 60s default.
 ;;
-;; Nothing is bound on 19974, so a well-formed call reaches connect and
-;; fails with `io`; a malformed one is rejected before that, with `type`
-;; or `domain`.  The two error classes are what distinguish "the option
-;; parsed" from "the option was accepted silently".
+;; Nothing is bound on `dead` (port 1: privileged, so no test suite's
+;; server listens there, as one could on a fixed high port, #1140), so a
+;; well-formed call reaches connect and fails with `io`; a malformed one is
+;; rejected before that, with `type` or `domain`.  The two error classes are
+;; what distinguish "the option parsed" from "the option was accepted
+;; silently".
+(set dead "127.0.0.1:1")
 
 ;; the existing integer form still means timeout
-(.ipc.open "127.0.0.1:19974" 200) !- io
+(.ipc.open dead 200) !- io
 
 ;; options dict: each accepted key reaches connect
-(.ipc.open "127.0.0.1:19974" (dict [timeout] [200])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [compress] [0N])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [compress] [0])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [compress] [5000])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [timeout compress] [200 0N])) !- io
+(.ipc.open dead (dict [timeout] [200])) !- io
+(.ipc.open dead (dict [compress] [0N])) !- io
+(.ipc.open dead (dict [compress] [0])) !- io
+(.ipc.open dead (dict [compress] [5000])) !- io
+(.ipc.open dead (dict [timeout compress] [200 0N])) !- io
 ;; keepalive (#589): a dead-peer budget in ms, 0N = off
-(.ipc.open "127.0.0.1:19974" (dict [keepalive] [30000])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [keepalive] [0N])) !- io
-(.ipc.open "127.0.0.1:19974" (dict [timeout keepalive] [200 5000])) !- io
+(.ipc.open dead (dict [keepalive] [30000])) !- io
+(.ipc.open dead (dict [keepalive] [0N])) !- io
+(.ipc.open dead (dict [timeout keepalive] [200 5000])) !- io
 
 ;; an empty dict is valid — everything defaults
-(.ipc.open "127.0.0.1:19974" (dict [] [])) !- io
+(.ipc.open dead (dict [] [])) !- io
 
 ;; a typo must not silently mean "default"
-(.ipc.open "127.0.0.1:19974" (dict [compres] [0N])) !- domain
-(.ipc.open "127.0.0.1:19974" (dict [timeuot] [200])) !- domain
+(.ipc.open dead (dict [compres] [0N])) !- domain
+(.ipc.open dead (dict [timeuot] [200])) !- domain
 
 ;; wrong value types and out-of-range values are rejected up front
-(.ipc.open "127.0.0.1:19974" (dict [compress] ["lots"])) !- type
-(.ipc.open "127.0.0.1:19974" (dict [compress] [-5])) !- domain
-(.ipc.open "127.0.0.1:19974" (dict [timeout] [-1])) !- domain
+(.ipc.open dead (dict [compress] ["lots"])) !- type
+(.ipc.open dead (dict [compress] [-5])) !- domain
+(.ipc.open dead (dict [timeout] [-1])) !- domain
 ;; 0 could mean "off" or "immediately"; neither is guessed
-(.ipc.open "127.0.0.1:19974" (dict [keepalive] [0])) !- domain
-(.ipc.open "127.0.0.1:19974" (dict [keepalive] [-1])) !- domain
-(.ipc.open "127.0.0.1:19974" (dict [keepalive] ["1m"])) !- type
-(.ipc.open "127.0.0.1:19974" (dict [keepalve] [1000])) !- domain
+(.ipc.open dead (dict [keepalive] [0])) !- domain
+(.ipc.open dead (dict [keepalive] [-1])) !- domain
+(.ipc.open dead (dict [keepalive] ["1m"])) !- type
+(.ipc.open dead (dict [keepalve] [1000])) !- domain
 
 ;; a second argument that is neither an integer nor a dict
-(.ipc.open "127.0.0.1:19974" "soon") !- type
+(.ipc.open dead "soon") !- type
 
 ;; string keys are NOT symbols: dict lookups would miss and every option
 ;; would silently default, so the whole dict is refused up front.
-(.ipc.open "127.0.0.1:19974" (dict ["compress"] [0N])) !- type
-(.ipc.open "127.0.0.1:19974" (dict ["timeout"] [200])) !- type
+(.ipc.open dead (dict ["compress"] [0N])) !- type
+(.ipc.open dead (dict ["timeout"] [200])) !- type
 ;; ...including a typo that would otherwise be swallowed with them
-(.ipc.open "127.0.0.1:19974" (dict ["compres"] [0N])) !- type
+(.ipc.open dead (dict ["compres"] [0N])) !- type

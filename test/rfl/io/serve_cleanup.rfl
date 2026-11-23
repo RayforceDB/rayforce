@@ -27,5 +27,10 @@
 (.sys.exec "kill $(cat /tmp/rfl_serve_cleanup/b/pid)") -- 0
 (.sys.exec "D=/tmp/rfl_serve_cleanup/b; for i in $(seq 100); do [ -e $D/pid ] || [ -e $D/port ] || exit 0; sleep 0.1; done; exit 1") -- 0
 
+;; a pid file naming a process that started at another time (its pid reused
+;; since): --stop leaves that process alone, as the watchdog does
+(.sys.exec "D=/tmp/rfl_serve_cleanup/c; mkdir -p $D; sleep 120 </dev/null >/dev/null 2>&1 & echo $! > $D/pid; echo 'Thu Jan  1 00:00:00 1970' > $D/start; test/serve.sh --stop $D KILL && kill -0 $(cat $D/pid)") -- 0
+(.sys.exec "D=/tmp/rfl_serve_cleanup/c; P=$(cat $D/pid); ps -o lstart= -p $P > $D/start; test/serve.sh --stop $D KILL && ! kill -0 $P 2>/dev/null") -- 0
+
 ;; owner2 is the one process still running (the others were waited for above)
 (.sys.exec "D=/tmp/rfl_serve_cleanup; kill $(cat $D/owner2) 2>/dev/null; rm -rf $D; exit 0") -- 0

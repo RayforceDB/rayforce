@@ -15,14 +15,14 @@
 ;; dropping an unserializable reply (so a future unserializable value
 ;; surfaces as a clean client-side error instead of a hang).
 ;;
-;; Port 19996 is fixed and unprivileged; distinct from the other IPC tests.
+;; The server takes a free port of its own and is stopped by its pid
+;; (test/serve.sh), so suites running at once never meet (#1140).
 
 ;; ── lifecycle: spawn server ────────────────────────────────────────
-(.sys.exec "pkill -TERM -f 'rayforce -p 19996' 2>/dev/null; true")
-(.sys.exec "./rayforce -p 19996 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 30); do bash -c '(echo > /dev/tcp/127.0.0.1/19996) 2>/dev/null' && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "rm -rf /tmp/rfl_ipc_fl")
+(.sys.exec "test/serve.sh /tmp/rfl_ipc_fl") -- 0
 
-(set h (.ipc.open "127.0.0.1:19996"))
+(set h (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_ipc_fl/port")))))
 (>= h 0) -- true
 
 ;; ── expression-list payload returning first/last — the hang repro ──
@@ -52,4 +52,4 @@
 ;; ── teardown ───────────────────────────────────────────────────────
 (try (.ipc.send h "(exit 0)") (fn [e] 0))
 (.ipc.close h)
-(.sys.exec "sleep 0.1; pkill -KILL -f 'rayforce -p 19996' 2>/dev/null; true")
+(.sys.exec "test/serve.sh --stop /tmp/rfl_ipc_fl KILL; rm -rf /tmp/rfl_ipc_fl") -- 0

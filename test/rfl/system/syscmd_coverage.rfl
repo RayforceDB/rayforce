@@ -132,18 +132,21 @@
 ;; same as the real binary — so valid ports actually bind and the
 ;; "nyi: no main event loop attached" branch is unreachable here.
 ;; Out-of-range ports fail with `domain` (range check); non-numeric
-;; arg fails earliest with `type`.  Fixed high port follows the
-;; ipc_diff.rfl precedent (19999).
+;; arg fails earliest with `type`.  The port is a free one from
+;; test/serve.sh --port: a fixed one was taken by a second suite running at
+;; once, and the bind failed with io (#1140).
 (.sys.listen 0)       !- domain
 (.sys.listen -1)      !- domain
 (.sys.listen 65536)   !- domain
 (.sys.listen 99999)   !- domain
 ;; Success path: binds and returns the listener's selector id.  The
 ;; listener stays open until rfl_teardown destroys the poll.
-(set listen-id (.sys.listen 38471))
+(.sys.exec "test/serve.sh --port > /tmp/rfl_syscmd_cov_port") -- 0
+(set lport (as 'i64 (trim (read "/tmp/rfl_syscmd_cov_port"))))
+(set listen-id (.sys.listen lport))
 (>= listen-id 0)      -- true
 ;; Same port again — already bound by us → io.
-(.sys.listen 38471)   !- io
+(.sys.listen lport)   !- io
 ;; String coerces through arg_as_i64; numeric string takes the same
 ;; path as the number (out-of-range here → domain), junk → type.
 (.sys.listen "99999") !- domain
@@ -152,7 +155,7 @@
 ;; Same surface via .sys.cmd string dispatch — exercises the dispatcher
 ;; path through to h_listen, which is a separate code path from the
 ;; direct ray_sys_listen_fn entry above.
-(.sys.cmd "listen 38471") !- io
+(.sys.cmd (format "listen %" lport)) !- io
 (.sys.cmd "listen -1")    !- domain
 (.sys.cmd "listen 65536") !- domain
 

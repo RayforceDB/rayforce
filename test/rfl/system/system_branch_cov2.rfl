@@ -141,10 +141,14 @@
 ;; numeric prefix ("1abc" -> 1).  strtol requires the whole field to be digits,
 ;; so these are a domain error at parse time — never a connection attempt.
 (.ipc.open "localhost:1abc") !- domain
+;; the io cases connect to port 1, which nothing listens on: privileged, so
+;; no test suite's server is there, as one could be on a fixed high port
+;; (#1140)
+(set dead "1")
 (.ipc.open "localhost:19876x") !- domain
-(.ipc.open "127.0.0.1:19876") !- io
-(.ipc.open "127.0.0.1:19876:user:pass") !- io
-(.ipc.open "127.0.0.1:19876:extra") !- io
+(.ipc.open (format "127.0.0.1:%" dead)) !- io
+(.ipc.open (format "127.0.0.1:%:user:pass" dead)) !- io
+(.ipc.open (format "127.0.0.1:%:extra" dead)) !- io
 
 ;; ══════════════════════════════════════════════════════════════════════
 ;; ray_hclose_fn  (lines 828-834)
