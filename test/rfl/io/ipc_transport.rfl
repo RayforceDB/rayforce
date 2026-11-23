@@ -4,8 +4,9 @@
 ;; from TCP to shared-memory rings once both sides agree (core/ipc.c,
 ;; core/shm.c); the frames stay the same, only the bytes' road changes.
 ;;
-;; Spawns a server on port 19986 (fixed; `make test` is sequential, so it
-;; cannot collide with another suite's server) and asserts:
+;; Spawns a server (test/serve.sh: a free port of its own, stopped by its
+;; pid, so suites running at once on one host never meet, #1140) and
+;; asserts:
 ;;   - a plain .ipc.open on a loopback address lands on `shm`, and the
 ;;     server sees the same connection as `shm` from its side;
 ;;   - sync, async and nested round trips cross the rings, including
@@ -20,14 +21,14 @@
 ;;
 ;; Readiness probe: completes a real handshake (see log_journal.rfl).
 
-(.sys.exec "pkill -KILL -f '[r]ayforce -p 19986' 2>/dev/null; true")
-(.sys.exec "rm -f /tmp/rftest_xport_policy.rfl")
+(.sys.exec "rm -rf /tmp/rftest_xport_srv /tmp/rftest_xport_policy.rfl")
 
-(.sys.exec "./rayforce -p 19986 </dev/null >/dev/null 2>&1 &")
-(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/19986 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
+(.sys.exec "test/serve.sh /tmp/rftest_xport_srv") -- 0
+(set addr (format "127.0.0.1:%" (trim (read "/tmp/rftest_xport_srv/port"))))
+(.sys.exec "for i in $(seq 50); do bash -c 'exec 3<>/dev/tcp/127.0.0.1/$(cat /tmp/rftest_xport_srv/port) 2>/dev/null && printf \"\\004\\000\" >&3 && read -t2 -n1 -u3 _' 2>/dev/null && exit 0; sleep 0.1; done; exit 1") -- 0
 
 ;; ── the default lands on shared memory ──────────────────────────────
-(set h (.ipc.open "127.0.0.1:19986"))
+(set h (.ipc.open addr))
 (>= h 0) -- true
 (get (.ipc.handle h) 'transport) -- 'shm
 (get (.ipc.handle h) 'inbound) -- false
@@ -55,31 +56,31 @@
 n -- 2001000
 
 ;; ── explicit transport choices ──────────────────────────────────────
-(set t (.ipc.open "127.0.0.1:19986" (dict ['transport] ['tcp])))
+(set t (.ipc.open addr (dict ['transport] ['tcp])))
 (get (.ipc.handle t) 'transport) -- 'tcp
 (.ipc.send t "(+ 2 2)") -- 4
 (.ipc.close t)
-(set t (.ipc.open "127.0.0.1:19986" (dict ['transport] ['shm])))
+(set t (.ipc.open addr (dict ['transport] ['shm])))
 (get (.ipc.handle t) 'transport) -- 'shm
 (.ipc.close t)
-(.ipc.open "127.0.0.1:19986" (dict ['transport] ['rdma])) !- io
-(.ipc.open "127.0.0.1:19986" (dict ['transport] ['bogus])) !- domain
-(.ipc.open "127.0.0.1:19986" (dict ['transport] [1])) !- domain
+(.ipc.open addr (dict ['transport] ['rdma])) !- io
+(.ipc.open addr (dict ['transport] ['bogus])) !- domain
+(.ipc.open addr (dict ['transport] [1])) !- domain
 
 ;; ── the process policy ──────────────────────────────────────────────
 (.ipc.transport) -- 'auto
 (.ipc.transport 'tcp) -- 'tcp
-(set t (.ipc.open "127.0.0.1:19986"))
+(set t (.ipc.open addr))
 (get (.ipc.handle t) 'transport) -- 'tcp
 (.ipc.close t)
 (.ipc.transport 'auto) -- 'auto
 (.ipc.transport 'nope) !- domain
 ;; a server that refuses: its policy says tcp
 (.ipc.send h "(.ipc.transport 'tcp)") -- 'tcp
-(set t (.ipc.open "127.0.0.1:19986"))
+(set t (.ipc.open addr))
 (get (.ipc.handle t) 'transport) -- 'tcp
 (.ipc.close t)
-(.ipc.open "127.0.0.1:19986" (dict ['transport] ['shm])) !- io
+(.ipc.open addr (dict ['transport] ['shm])) !- io
 (.ipc.send h "(.ipc.transport 'auto)") -- 'auto
 ;; and the earlier connection stayed where it was
 (get (.ipc.handle h) 'transport) -- 'shm
@@ -87,7 +88,7 @@ n -- 2001000
 ;; ── the peer's going is noticed through the socket ──────────────────
 (set closed 0)
 (set .ipc.on.close (fn [x] (set closed (+ closed 1))))
-(set t (.ipc.open "127.0.0.1:19986"))
+(set t (.ipc.open addr))
 (get (.ipc.handle t) 'transport) -- 'shm
 ;; the server kicks the connection from its side
 (.ipc.send h (list '.ipc.close (.ipc.send t "(.ipc.handle)")))
@@ -99,4 +100,5 @@ closed -- 1
 (.ipc.close h)
 
 ;; ── teardown ────────────────────────────────────────────────────────
-(.sys.exec "pkill -TERM -f '[r]ayforce -p 19986' 2>/dev/null; for i in $(seq 50); do pgrep -f '[r]ayforce -p 19986' >/dev/null || exit 0; sleep 0.1; done; pkill -KILL -f '[r]ayforce -p 19986'; true")
+(.sys.exec "[ -f /tmp/rftest_xport_srv/pid ] || exit 0; P=$(cat /tmp/rftest_xport_srv/pid); kill -TERM $P 2>/dev/null; for i in $(seq 50); do kill -0 $P 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $P; true")
+(.sys.exec "rm -rf /tmp/rftest_xport_srv")
