@@ -22617,8 +22617,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                 }
             }
 
-            /* Null propagation: propagate HAS_NULLS from copied sources. */
-            flat->attrs |= src_nulls;
+            /* I64 SUM partials already excluded null input rows. A partial
+             * can legitimately equal NULL_I64, even after a batch merge. */
+            if (part_ops[a] == OP_SUM && flat->type == RAY_I64)
+                flat->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+            else
+                flat->attrs |= src_nulls;
             merge_tbl = ray_table_add_col(merge_tbl, mcol_names[n_keys + a], flat);
             ray_release(flat);
             if (!merge_tbl || RAY_IS_ERR(merge_tbl)) goto merge_add_fail;
