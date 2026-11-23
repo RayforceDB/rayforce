@@ -3265,6 +3265,25 @@ static void closure_tmpl_forget(void) {
     g_closure_tmpl_bytes = 0;
 }
 
+/* An entry is dead once the table alone holds its literal's parameter
+ * node (the entry and its template each hold one): the text the literal
+ * was read from is gone, a finished ray_eval_str request or a function
+ * since rebound, so the literal cannot be evaluated again and the entry
+ * cannot be hit.  It would still pin its template, and through it the
+ * nfo of that text: a request's whole source and a span record per node,
+ * which the entry's bytes do not count.  Dead entries go before a new
+ * entry is made and when a ray_eval_str request ends, so they never
+ * pile up behind live ones. */
+static void closure_tmpl_sweep(void) {
+    if (g_closure_tmpl_epoch != ray_sym_epoch()) return;   /* not this runtime's */
+    for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
+        closure_tmpl_t* e = &g_closure_tmpl[i];
+        if (!e->params) continue;
+        uint32_t held = 1 + (e->tmpl && LAMBDA_PARAMS(e->tmpl) == e->params);
+        if (ray_atomic_load(&e->params->rc) <= held) closure_tmpl_drop(e);
+    }
+}
+
 /* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
  * spell the entry's names?  Walks the dict keys once, allocating nothing. */
 static bool closure_entry_names_match(const closure_tmpl_t* e, ray_t* closure) {
@@ -3359,6 +3378,7 @@ static void closure_share_template(ray_t* lambda) {
         tmpl = NULL;
         LAMBDA_NLOCALS(lambda) = -1;
     }
+    closure_tmpl_sweep();
     closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
     closure_tmpl_drop(e);
     /* Make room within the budget, oldest entries first. */
@@ -3423,6 +3443,7 @@ static void definition_compile(ray_t* lambda) {
     }
     ray_t* deps = NULL;
     if (!ray_compile_definition(lambda, &deps)) { ray_release(mentioned); return; }
+    closure_tmpl_sweep();
     closure_tmpl_t* e = &g_closure_tmpl[g_closure_tmpl_next++ % CLOSURE_TMPL_SLOTS];
     closure_tmpl_drop(e);
     for (uint32_t k = 0; k < CLOSURE_TMPL_SLOTS && g_closure_tmpl_bytes + weight > CLOSURE_TMPL_BUDGET; k++)
@@ -6339,6 +6360,7 @@ ray_t* ray_eval_str(const char* source) {
 
     ray_release(parsed);
     ray_release(nfo);
+    closure_tmpl_sweep();   /* the request's literals are gone with its text */
     /* ray_eval_str is the public top-level boundary — materialise any lazy
      * chain before returning to callers who expect a concrete value. */
     if (ray_is_lazy(result))
