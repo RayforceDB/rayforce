@@ -2699,6 +2699,11 @@ ray_t* ray_list_fn(ray_t** args, int64_t n) {
     return result;
 }
 
+/* BOOL and U8 are not part of numeric widening in the table constructor. */
+static bool table_widens_atom(int8_t t) {
+    return t <= -RAY_I16 && t >= -RAY_F64;
+}
+
 /* (table [col_names] (list col1 col2 ...)) — build a RAY_TABLE */
 ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
     ray_t *_bxn = NULL, *_bxc = NULL;
@@ -2802,29 +2807,25 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
             continue;
         }
 
-        /* Determine column type from elements (scan for mixed I64/F64 → F64) */
-        int8_t col_type = RAY_I64;
-        if (nrows > 0) {
-            if (row_elems[0]->type == -RAY_F64) col_type = RAY_F64;
-            else if (row_elems[0]->type == -RAY_BOOL) col_type = RAY_BOOL;
-            else if (row_elems[0]->type == -RAY_SYM) col_type = RAY_SYM;
-            else if (row_elems[0]->type == -RAY_STR) col_type = RAY_STR;
-            else if (row_elems[0]->type == -RAY_GUID) col_type = RAY_GUID;
-            else if (row_elems[0]->type == -RAY_TIMESTAMP) col_type = RAY_TIMESTAMP;
-            else if (row_elems[0]->type == -RAY_DATE) col_type = RAY_DATE;
-            else if (row_elems[0]->type == -RAY_TIME) col_type = RAY_TIME;
-            /* RAY_CHAR removed — char atoms are now -RAY_STR */
-        }
-        /* Promote I64 → F64 if any element is F64 */
-        if (col_type == RAY_I64) {
-            for (int64_t j = 0; j < nrows; j++) {
-                if (row_elems[j]->type == -RAY_F64) { col_type = RAY_F64; break; }
+        int8_t first = row_elems[0]->type;
+        bool numeric = table_widens_atom(first);
+        int8_t col_type = -first;
+        if (numeric) {
+            for (int64_t j = 1; j < nrows; j++) {
+                int8_t t = row_elems[j]->type;
+                if (table_widens_atom(t)) col_type = ray_num_type(col_type, -t);
             }
+        } else if (col_type != RAY_BOOL && col_type != RAY_SYM && col_type != RAY_STR &&
+                   col_type != RAY_GUID && col_type != RAY_TIMESTAMP && col_type != RAY_DATE &&
+                   col_type != RAY_TIME && col_type != RAY_TIMESPAN) {
+            col_type = RAY_I64; /* unsupported first atom: report element mismatch below */
         }
 
         ray_t* col_vec = ray_vec_new(col_type, nrows);
         if (RAY_IS_ERR(col_vec))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
+
+        if (numeric) col_vec->len = nrows; /* fixed-width cells are written in place */
 
         /* ray_vec_append copies the atom payload raw and never sets HAS_NULLS,
          * so track typed null atoms and flip the column flag after the loop. */
@@ -2856,26 +2857,22 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 }
                 col_vec = ray_vec_append(col_vec, ray_data(row_elems[j]->obj));
             } else {
-                /* Validate each element matches the column type (allow I64→F64 promotion) */
-                int type_ok = (row_elems[j]->type == -col_type);
-                if (!type_ok && col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) type_ok = 1;
-                if (!type_ok) {
+                ray_t* cell = row_elems[j];
+                if (numeric ? !table_widens_atom(cell->type) : cell->type != -col_type) {
                     int8_t et = row_elems[j]->type;
                     ray_release(col_vec); ray_release(tbl);
                     if (_bxn) ray_release(_bxn);
                     if (_bxc) ray_release(_bxc);
                     return ray_error("type", "table: %s column element type mismatch, got %s", ray_type_name(col_type), ray_type_name(et));
                 }
-                void* val_ptr;
-                double promoted;
-                if (col_type == RAY_F64 && row_elems[j]->type == -RAY_I64) {
-                    promoted = cell_is_null ? NULL_F64 : (double)row_elems[j]->i64;
-                    val_ptr = &promoted;
-                } else if (col_type == RAY_I64) val_ptr = &row_elems[j]->i64;
-                else if (col_type == RAY_F64) val_ptr = &row_elems[j]->f64;
-                else if (col_type == RAY_BOOL) val_ptr = &row_elems[j]->b8;
-                else val_ptr = &row_elems[j]->i64; /* SYM/TIMESTAMP/DATE/TIME stored as i64 */
-                col_vec = ray_vec_append(col_vec, val_ptr);
+                if (numeric) {
+                    if (cell_is_null) ray_vec_set_null(col_vec, j, true);
+                    else if (col_type == RAY_F64) ((double*)ray_data(col_vec))[j] = as_f64(cell);
+                    else store_typed_elem(col_vec, j, cell);
+                } else {
+                    const void* payload = col_type == RAY_BOOL ? (void*)&cell->b8 : (void*)&cell->i64;
+                    col_vec = ray_vec_append(col_vec, payload);
+                }
             }
             if (RAY_IS_ERR(col_vec))
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }

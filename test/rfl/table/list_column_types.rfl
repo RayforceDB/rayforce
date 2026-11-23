@@ -1,0 +1,28 @@
+;; #1457: infer typed columns from boxed atoms, not just typed vectors.
+;; @also-unfused
+(set _col (fn [xs] (at (table [v] (list xs)) 'v)))
+(set _h (_col (list (as 'I16 -3) (as 'I16 0Nl))))
+(type _h) -- 'I16
+_h -- (as 'I16 [-3 0Nl])
+(set _i (_col (list (as 'I32 0Nl) (as 'I32 -70000))))
+(type _i) -- 'I32
+_i -- (as 'I32 [0Nl -70000])
+(set _f (_col (list (as 'F32 -1.25) (as 'F32 0Nl))))
+(type _f) -- 'F32
+_f -- (as 'F32 [-1.25 0Nf])
+(set _s (_col (list (as 'TIMESPAN 42) (as 'TIMESPAN 0Nl))))
+(type _s) -- 'TIMESPAN
+_s -- (as 'TIMESPAN [42 0Nl])
+(nil? _s) -- [false true]
+(set _ints (list (as 'I16 -7) 1234567890123 (as 'I32 0Nl)))
+(type (_col _ints)) -- 'I64
+(_col _ints) -- (as 'I64 _ints)
+(set _floats (list 0Nf (as 'F32 -2.75) (as 'I32 -70000) (as 'F32 0Nl)))
+(type (_col _floats)) -- 'F64
+(_col _floats) -- (as 'F64 _floats)
+(nil? (_col _floats)) -- [true false false true]
+(_col (list (as 'I16 0Nl) 1.5)) -- [0Nf 1.5]
+(type (_col (list (as 'I16 1) (as 'I32 2)))) -- 'I32
+(type (_col (list (as 'F32 1.5) 2))) -- 'F64
+(at (try (_col (list (as 'TIMESPAN 1) 2)) (fn [e] e)) 'code) -- 'type
+(at (try (_col (list 1 true)) (fn [e] e)) 'code) -- 'type

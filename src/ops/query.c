@@ -29148,8 +29148,8 @@ static ray_t* append_atom_to_col(ray_t* col_vec, ray_t* atom) {
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F64: {
-        if (at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
-        double v = (at == -RAY_F64) ? atom->f64 : (double)as_i64(atom);
+        if (at != -RAY_F32 && at != -RAY_F64 && !is_int) return ray_error("type", "insert: f64 column requires a numeric value, got %s", ray_type_name(at));
+        double v = is_int ? (double)as_i64(atom) : atom->f64;
         return ray_vec_append(col_vec, &v);
     }
     case RAY_F32: {

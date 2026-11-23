@@ -1,0 +1,12 @@
+;; Widen the F32 row cell into the existing F64 column, not vice versa.
+(set t (table [v] (list [1.0000000001])))
+(insert 't (list -2.25e)) -- 't
+(type (get t 'v)) -- 'F64
+(get t 'v) -- [1.0000000001 -2.25]
+
+;; The functional form appends a typed null without changing the input.
+(set u (insert t (list 0Ne)))
+(count t) -- 2
+(count u) -- 3
+(type (get u 'v)) -- 'F64
+(nil? (at (get u 'v) 2)) -- true
