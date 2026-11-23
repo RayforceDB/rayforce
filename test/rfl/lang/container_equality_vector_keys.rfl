@@ -15,9 +15,10 @@
 ;; Vector cells compare by type: I64 never matches I32 or F64 cells.
 (count (key (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3i 4i] [1i 2i]) [2 1])))) -- 4
 (value (== (kt (list [1 2] [3 4]) [1 2]) (kt (list [3 4] [1.0 2.0]) [2 1]))) -- (list false {v: true} false)
-;; Nulls and NaN match themselves; -0.0 and 0.0 cells differ (bytes compare).
+;; Nulls and NaN match themselves; -0.0 and 0.0 cells are one key (#1361:
+;; they compared by bytes).
 (value (== (kt (list [1.0 0Nf] [-0.0]) [1 2]) (kt (list [-0.0] [1.0 0Nf]) [2 1]))) -- (list {v: true} {v: true})
-(value (== (kt (list [-0.0] [1.0]) [1 2]) (kt (list [1.0] [0.0]) [2 1]))) -- (list false {v: true} false)
+(value (== (kt (list [-0.0] [1.0]) [1 2]) (kt (list [1.0] [0.0]) [2 1]))) -- (list {v: true} {v: true})
 (value (== (kt (list [0Nl 1] [2]) [1 2]) (kt (list [2] [0Nl 1]) [2 1]))) -- (list {v: true} {v: true})
 ;; SYM and STR vectors, short and pooled strings.
 (value (== (kt (list ['a 'b] ['c]) [1 2]) (kt (list ['c] ['a 'b]) [2 1]))) -- (list {v: true} {v: true})

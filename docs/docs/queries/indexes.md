@@ -54,7 +54,7 @@ Match the shape of your *query*, not the shape of the data.
 |---|---|---|
 | Constant predicate may fall outside the column's value range | `.idx.zone` | Yes — O(1) all/none short-circuit at the filter site |
 | Repeated `==` / `in` / `find` | `.idx.hash` | Yes — O(matches) hash probe at filter EQ, filter IN, and find sites |
-| Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY and distinct |
+| Range queries, sorted output | `.idx.sort` | Yes — binary search at filter range site; permutation reuse at ORDER BY; distinct walks the permutation instead of hashing |
 | Cheap probabilistic membership rejection | `.idx.bloom` | Yes — definite-absent proof at filter EQ site (integer-family only) |
 
 ## Why Per-Column Indexes
@@ -65,7 +65,7 @@ An **accelerator index** is a precomputed data structure attached to the column 
 
 - `zone` — min/max plus null count (~32 bytes per column).  Prunes whole-column filter work when a constant predicate falls outside the range.
 - `hash` — chained open-addressing table.  O(1) eq / in / find; stays useful for non-unique columns via the chain.
-- `sort` — ascending row-id permutation.  Binary search for range predicates; pre-sorted ORDER BY and distinct.
+- `sort` — ascending row-id permutation.  Binary search for range predicates; pre-sorted ORDER BY; distinct without a hash table.
 - `bloom` — m-bit probabilistic membership filter (k=3 hashes).  Cheap, small, no false negatives — EQ definite-absent rejection at the filter site.
 
 ## Observability

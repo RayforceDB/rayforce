@@ -21,7 +21,7 @@
 (first (reverse (as 'DATE [3 4 0Nl]))) -- 0Nd
 (first (asc [3 0Nl 4])) -- 0Nl
 (last (desc [3 0Nl 4])) -- 0Nl
-(first (distinct [3 4 0Nl])) -- 0Nl
+(first (distinct [0Nl 3 4])) -- 0Nl
 (first (reverse (reverse [0Nl 3]))) -- 0Nl
 ;; with no null the chain keeps its idiom: first of asc is the min
 (first (asc [3 1 4])) -- 1

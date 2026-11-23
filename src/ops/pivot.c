@@ -298,7 +298,7 @@ static inline int64_t if_f64_to_i64(double x) {
 
 static int64_t if_atom_i64(ray_t* v) {
     switch (-v->type) {
-    case RAY_I64: case RAY_TIMESTAMP: return v->i64;
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: return v->i64;
     case RAY_I32: case RAY_DATE: case RAY_TIME: return v->i32;
     case RAY_I16: return v->i16;
     case RAY_BOOL: case RAY_U8: return v->b8;
@@ -348,7 +348,7 @@ static double if_vec_f64(ray_t* v, int64_t idx) {
 /* The null of an integer-celled output type, or 0 when it has none. */
 static inline int64_t if_int_null(int8_t out_type) {
     switch (out_type) {
-    case RAY_I64: case RAY_TIMESTAMP: return NULL_I64;
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: return NULL_I64;
     case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
     case RAY_I16: return NULL_I16;
     default: return 0;
@@ -487,7 +487,8 @@ static bool if_scatter_numeric(ray_t* result, ray_t* value, int64_t* ids,
             double x = ray_is_atom(value) ? if_atom_f64(value)
                      : if_vec_f64(value, src);
             ((double*)ray_data(result))[dst] = x;
-        } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP) {
+        } else if (out_type == RAY_I64 || out_type == RAY_TIMESTAMP ||
+                   out_type == RAY_TIMESPAN) {
             int64_t x = ray_is_atom(value) ? if_scalar_int_as(value, out_type)
                       : if_vec_int_as(value, src, out_type);
             ((int64_t*)ray_data(result))[dst] = x;
@@ -863,8 +864,8 @@ static bool if_lazy_supported_type(int8_t out_type) {
     return out_type == RAY_F64 || out_type == RAY_I64 ||
            out_type == RAY_I32 || out_type == RAY_I16 ||
            out_type == RAY_BOOL || out_type == RAY_U8 ||
-           out_type == RAY_TIMESTAMP || out_type == RAY_TIME ||
-           out_type == RAY_DATE || out_type == RAY_STR ||
+           out_type == RAY_TIMESTAMP || out_type == RAY_TIMESPAN ||
+           out_type == RAY_TIME || out_type == RAY_DATE || out_type == RAY_STR ||
            out_type == RAY_SYM;
 }
 
@@ -944,7 +945,8 @@ static bool if_type_eager_ok(int8_t bt, int8_t out) {
          * it to an unwritten result buffer). */
         case RAY_F64: case RAY_I64: case RAY_I32: case RAY_I16:
         case RAY_U8: case RAY_BOOL:
-        case RAY_TIMESTAMP: case RAY_TIME: case RAY_DATE: case RAY_GUID:
+        case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_TIME: case RAY_DATE:
+        case RAY_GUID:
             return true;
         default: return false;
     }
@@ -1211,7 +1213,7 @@ static void if_fill_range(const if_fill_ctx_t* c, int64_t i0, int64_t i1) {
             dst[i] = cond_p[i] ? tv : ev;
         }
         break; }
-    case RAY_I64: case RAY_TIMESTAMP: {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: {
         if (if_side_i64_cells(c->then_v, c->then_scalar) &&
             if_side_i64_cells(c->else_v, c->else_scalar)) {
             IF_FILL_SAME(int64_t, c->t_i64, c->e_i64);
