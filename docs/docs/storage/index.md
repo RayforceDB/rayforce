@@ -278,6 +278,8 @@ A `by:` of `(xbar column bucket)` with a constant atom bucket, written or bound 
 
 A top-level `or` narrows to the partitions any of its operands keeps; an operand that cannot narrow keeps every partition. A `not` of a comparison narrows as the complementary comparison, a null being the lowest value: `(not (< time t))` reads what `(>= time t)` reads, and `not` over `and`/`or` follows the same rule through each operand.
 
+`(within c [lo hi])` narrows as `(and (>= c lo) (<= c hi))` does, on the key and on a data column, when the range is a typed two-element vector, written or bound to a name. A null bound narrows nothing; the other bound still narrows. Under `not`, `within` narrows as `(or (< c lo) (> c hi))` does, and only when both bounds are usable.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.

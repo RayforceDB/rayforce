@@ -5752,6 +5752,89 @@ static test_result_t test_eval_part_skip_or_not(void) {
     return part_skip_run("or_not", cases, sizeof cases / sizeof cases[0]);
 }
 
+/* within on a parted column or the key skips what the two comparisons it
+ * stands for skip (#1500): written, bound to a name, on partition edges,
+ * with a null bound (that side narrows nothing), inside an `and`. */
+static test_result_t test_eval_part_skip_within(void) {
+    ray_t* w = ray_eval_str("(set R [2026.01.06D01:00:00.000 2026.01.06D05:00:00.000])");
+    TEST_ASSERT_NOT_NULL(w);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    ray_release(w);
+    static const part_skip_t cases[] = {
+        { "(select {from: %s where: (within ts [2026.01.06D01:00:00.000 2026.01.06D05:00:00.000])})", false, 3 },
+        { "(select {from: %s where: (within ts [2026.01.05D02:00:00.000 2026.01.07D01:00:00.000])})", false, 1 },
+        { "(select {from: %s where: (within ts [2026.01.06D02:00:00.000 2026.01.06D04:00:00.000])})", false, 3 },
+        { "(select {from: %s where: (within ts R)})", false, 3 },
+        { "(select {from: %s where: (within ts [0Np 2026.01.06D01:00:00.000])})", false, 2 },
+        { "(select {from: %s where: (within ts [2026.01.07D00:00:00.000 2026.01.05D00:00:00.000])})", false, 4 },
+        { "(select {from: %s where: (within v [3 5])})", false, 3 },
+        { "(select {from: %s where: (and (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]) (> v 1))})", false, 2 },
+        { "(select {from: %s where: (within date [2026.01.07 2026.01.08])})", false, 2 },
+        { "(select {from: %s where: (within part [2026.01.07D00:00:00.000 2026.01.08D00:00:00.000])})", true, 2 },
+        { "(select {from: %s where: (within ts [2026.01.06D01:00:00.000 2026.01.06D05:00:00.000])})", true, 3 },
+        { "(select {c: (count v) from: %s where: (within ts [2026.01.06D01:00:00.000 2026.01.07D01:00:00.000])})", false, 2 },
+    };
+    return part_skip_run("within", cases, sizeof cases / sizeof cases[0]);
+}
+
+/* Shapes that exist only with several of the series together (#1500 with
+ * #1502, #1499, #1501, #1503, #1498): within under not and or (a negated
+ * within narrows as (or (< c lo) (> c hi))), within beside a by: xbar, a
+ * date range in a within against a timestamp column or key, count written
+ * around each, a keyless table under within.  Each case counts the
+ * partitions dropped and compares the answer with the flat copy. */
+static test_result_t test_eval_part_skip_combo(void) {
+    char root[512];
+    int n = snprintf(root, sizeof(root), "/tmp/rayforce_lang_part_skip_combo_%ld", (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(root))
+        return (test_result_t){ TEST_FAIL, "parted fixture path overflow" };
+    lang_parted_insert_rm_rf(root);
+    test_result_t r = part_skip_fixture(root);
+    ray_t* w = r.status == TEST_PASS ? ray_eval_str(
+        "(do (set B 3600000000000) (set ud (xcols pd (drop (cols pd) 1))) (set fud (xcols fd (drop (cols fd) 1))) 0)") : NULL;
+    if (w && RAY_IS_ERR(w)) { ray_error_free(w); r = (test_result_t){ TEST_FAIL, "combo setup" }; }
+    else if (w) ray_release(w);
+#define XS(sel) "(do (set R " sel ") (xasc R (key R)))"
+    static const struct { const char* q; const char* p; const char* f; uint64_t pruned; } cases[] = {
+        /* within under not / or */
+        { "(select {from: %s where: (not (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]))})", "pd", "fd", 1 },
+        { "(select {from: %s where: (not (within date [2026.01.06 2026.01.07]))})", "pd", "fd", 2 },
+        { "(select {from: %s where: (or (within ts [2026.01.05D01:00:00.000 2026.01.05D02:00:00.000]) (within ts [2026.01.08D03:00:00.000 2026.01.08D04:00:00.000]))})", "pd", "fd", 1 },   /* the null keeps 06: it passes <= hi, its rows >= lo */
+        { "(select {from: %s where: (or (within v [1 2]) (>= ts 2026.01.08D00:00:00.000))})", "pd", "fd", 2 },
+        { "(select {from: %s where: (not (or (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]) (< v 7)))})", "pd", "fd", 3 },
+        { "(select {from: %s where: (not (within ts [0Np 2026.01.06D01:00:00.000]))})", "pd", "fd", 0 },
+        { "(select {from: %s where: (not (within ts [2026.01.07D00:00:00.000 2026.01.05D00:00:00.000]))})", "pd", "fd", 0 },
+        { "(select {from: %s where: (not (within part [2026.01.07D00:00:00.000 2026.01.08D00:00:00.000]))})", "pt", "ft", 2 },
+        /* within with a by: xbar */
+        { XS("(select {c: (count v) by: (xbar ts 3600000000000) from: %s where: (within ts [2026.01.06D01:00:00.000 2026.01.07D01:00:00.000])})"), "pd", "fd", 2 },
+        { XS("(select {c: (count v) by: (xbar v 2) from: %s where: (not (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]))})"), "pd", "fd", 1 },
+        { XS("(select {c: (count v) by: (xbar ts B) from: %s where: (or (< ts 2026.01.05D01:30:00.000) (>= ts 2026.01.08D00:00:00.000))})"), "pd", "fd", 1 },
+        /* a date range in a within, against a timestamp column or key */
+        { "(select {from: %s where: (within ts [2026.01.06 2026.01.07])})", "pd", "fd", 3 },
+        { "(select {from: %s where: (not (within ts [2026.01.05 2026.01.07]))})", "pd", "fd", 1 },
+        { "(select {from: %s where: (within part [2026.01.06 2026.01.07])})", "pt", "ft", 2 },
+        { "(select {from: %s where: (or (< ts 2026.01.05) (>= ts 2026.01.08))})", "pd", "fd", 2 },
+        /* count around a select of each shape */
+        { "(count (select {from: %s where: (within ts [2026.01.05D02:00:00.000 2026.01.07D01:00:00.000])}))", "pd", "fd", 1 },
+        { "(count (select {from: %s where: (not (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]))}))", "pd", "fd", 1 },
+        { "(count (select {from: %s where: (or (>= ts 2026.01.08D00:00:00.000) (< ts 2026.01.05D01:30:00.000))}))", "pd", "fd", 1 },
+        { "(count (select {from: %s where: (not (< ts 2026.01.07))}))", "pd", "fd", 2 },
+        { "(count (select {from: %s where: (within ts [2026.01.06 2026.01.07])}))", "pd", "fd", 3 },
+        { "(count (select {c: (count v) by: (xbar ts B) from: %s where: (>= ts 2026.01.07D00:00:00.000)}))", "pd", "fd", 2 },
+        /* a keyless table under within, not, or, a date literal, count */
+        { "(select {from: %s where: (within ts [2026.01.06D01:00:00.000 2026.01.06D05:00:00.000])})", "ud", "fud", 3 },
+        { "(select {from: %s where: (not (within ts [2026.01.05D01:00:00.000 2026.01.06D05:00:00.000]))})", "ud", "fud", 1 },
+        { "(select {from: %s where: (or (< ts 2026.01.05D01:30:00.000) (>= ts 2026.01.08))})", "ud", "fud", 1 },
+        { "(count (select {from: %s where: (>= ts 2026.01.07)}))", "ud", "fud", 2 },
+        { XS("(select {c: (count v) by: (xbar ts B) from: %s where: (within ts [2026.01.06 2026.01.08])})"), "ud", "fud", 2 },
+    };
+#undef XS
+    for (size_t i = 0; r.status == TEST_PASS && i < sizeof cases / sizeof cases[0]; i++)
+        r = part_skip_case(cases[i].q, cases[i].p, cases[i].f, cases[i].pruned);
+    lang_parted_insert_rm_rf(root);
+    return r;
+}
+
 /* ---- Test: an if answers the same with and without pool workers -------- */
 
 /* With no workers the selected arm of OP_IF (compact each branch's rows,
@@ -14340,6 +14423,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/part_skip_date_literal", test_eval_part_skip_date_literal, lang_setup, lang_teardown },
     { "lang/eval/part_skip_xbar_by", test_eval_part_skip_xbar_by, lang_setup, lang_teardown },
     { "lang/eval/part_skip_or_not", test_eval_part_skip_or_not, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_within", test_eval_part_skip_within, lang_setup, lang_teardown },
+    { "lang/eval/part_skip_combo", test_eval_part_skip_combo, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_rollover", test_eval_insert_parted_rollover, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_errors", test_eval_insert_parted_errors, lang_setup, lang_teardown },
     { "lang/eval/insert_parted_key_types", test_eval_insert_parted_key_types, lang_setup, lang_teardown },

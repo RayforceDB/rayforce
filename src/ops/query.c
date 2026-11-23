@@ -20222,6 +20222,24 @@ static uint16_t prune_cmp_negate(uint16_t op) {
     }
 }
 
+/* Is `head` the native `within`, unshadowed (fn from prune_head_fn)? */
+static bool prune_within_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_within_fn && prune_head_named(head, "within");
+}
+
+/* The [lo hi] range of a `within`: a typed two-element vector, written or
+ * bound to a name.  Borrowed; NULL for anything else. */
+static ray_t* prune_within_range(ray_t* x, ray_t* tbl) {
+    ray_t* v = x && x->type == -RAY_SYM ? prune_bound_const(x, tbl, true) : x;
+    if (!v || RAY_IS_ERR(v) || !ray_is_vec(v) || v->type == RAY_LIST || v->type == RAY_SYM ||
+        (v->attrs & ATTR_QUOTED) || v->len != 2) return NULL;
+    return v;
+}
+
+static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                           uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc);
+
 /* Bounds the and/or/not nesting the mask walks (deeper keeps every
  * partition, which is always correct). */
 #define PRUNE_MASK_MAX_DEPTH 16
@@ -20262,15 +20280,60 @@ static void prune_where_mask_at(ray_t* e, bool neg, int depth, ray_t* tbl, int64
         ray_free_raw(u);
         return;
     }
+    /* (within c [lo hi]) passes the rows (and (>= c lo) (<= c hi)) passes:
+     * the select compiles it to exactly that, and the builtin compares the
+     * raw values, a null lowest, as the statistics do (#1500).  Negated it
+     * passes the rows (or (< c lo) (> c hi)) passes, by the same total
+     * order: the union of those two masks, and nothing narrowed unless
+     * both bounds are usable. */
+    if (n == 3 && prune_within_head(x[0], fn)) {
+        ray_t* rng = prune_within_range(x[2], tbl);
+        if (!rng) return;
+        ray_t* b[2] = { NULL, NULL };
+        for (int64_t i = 0; i < 2; i++) {
+            ray_t* idx = ray_i64(i);
+            b[i] = idx && !RAY_IS_ERR(idx) ? ray_at_fn(rng, idx) : NULL;
+            if (idx && !RAY_IS_ERR(idx)) ray_release(idx);
+            if (b[i] && RAY_IS_ERR(b[i])) { ray_error_free(b[i]); b[i] = NULL; }
+            if (b[i] && b[i]->type >= 0) { ray_release(b[i]); b[i] = NULL; }
+        }
+        if (!neg) {
+            /* a missing bound: the other side keeps what it narrowed */
+            if (b[0]) prune_cmp_mask(OP_GE, x[1], b[0], tbl, key_id, kv, acc, tmp, n_words, sc);
+            if (b[1]) prune_cmp_mask(OP_LE, x[1], b[1], tbl, key_id, kv, acc, tmp, n_words, sc);
+        } else if (b[0] && b[1]) {
+            uint64_t* u = (uint64_t*)ray_alloc_raw((size_t)n_words * 2 * sizeof(uint64_t));
+            if (u) {
+                uint64_t* part = u + n_words;
+                memset(u, 0, (size_t)n_words * sizeof(uint64_t));
+                for (int64_t i = 0; i < 2; i++) {
+                    for (int64_t w = 0; w < n_words; w++) part[w] = ~0ULL;
+                    prune_cmp_mask(i ? OP_GT : OP_LT, x[1], b[i], tbl, key_id, kv, part, tmp, n_words, sc);
+                    for (int64_t w = 0; w < n_words; w++) u[w] |= part[w];
+                }
+                for (int64_t w = 0; w < n_words; w++) acc[w] &= u[w];
+                ray_free_raw(u);
+            }
+        }
+        if (b[0]) ray_release(b[0]);
+        if (b[1]) ray_release(b[1]);
+        return;
+    }
     uint16_t op = prune_cmp_op(x[0], fn);
     if (neg) op = prune_cmp_negate(op);
     if (!op || n != 3) return;
+    prune_cmp_mask(op, x[1], x[2], tbl, key_id, kv, acc, tmp, n_words, sc);
+}
+
+/* AND into `acc` the partitions `x1 op x2` can pass (prune_where_mask). */
+static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                           uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
     /* a name bound to a constant compares as that constant (a symbol it
      * holds is left to the filter: it reads here as a name would) */
-    ray_t* lb = prune_bound_const(x[1], tbl, op == OP_IN);
-    ray_t* rb = prune_bound_const(x[2], tbl, op == OP_IN);
-    ray_t* l = lb && lb->type != -RAY_SYM ? lb : x[1];
-    ray_t* r = rb && rb->type != -RAY_SYM ? rb : x[2];
+    ray_t* lb = prune_bound_const(x1, tbl, op == OP_IN);
+    ray_t* rb = prune_bound_const(x2, tbl, op == OP_IN);
+    ray_t* l = lb && lb->type != -RAY_SYM ? lb : x1;
+    ray_t* r = rb && rb->type != -RAY_SYM ? rb : x2;
     int64_t l_col = prune_col_name(l), r_col = prune_col_name(r);
     bool l_key = key_id >= 0 && l_col == key_id, r_key = key_id >= 0 && r_col == key_id;
     if (l_key == r_key) {
@@ -20532,8 +20595,10 @@ static bool prune_where_not_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
         return true;
     }
     uint16_t op = prune_cmp_op(el[0], fn);
-    if (!op || op == OP_IN || ray_len(e) != 3) return false;
-    for (int i = 1; i <= 2; i++) {
+    bool within = ray_len(e) == 3 && prune_within_head(el[0], fn);   /* a BOOL per row as a comparison (#1500) */
+    if (within && !prune_within_range(el[2], tbl)) return false;
+    if (!within && (!op || op == OP_IN || ray_len(e) != 3)) return false;
+    for (int i = 1; i <= (within ? 1 : 2); i++) {
         ray_t* a = el[i];
         if (!a || a->type >= 0 || (a->type == -RAY_SYM && (a->attrs & ATTR_QUOTED))) return false;
         if (a->type == -RAY_SYM) {
@@ -20587,6 +20652,9 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type < 0 && el[2]->type != -RAY_SYM) ||
                 (el[2]->type == -RAY_SYM && prune_bound_const(el[2], tbl, false)));
+    /* within: a row's answer reads only that row and a constant range (#1500) */
+    if (n == 3 && prune_within_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, sub) && prune_within_range(el[2], tbl);
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
