@@ -1,0 +1,72 @@
+;; @also-unfused
+;; window's min / max keep the value's type (#1447): a SYM column gave raw ids
+;; compared in intern order, STR and GUID 0, and the narrow and temporal types
+;; came back I64 or F64.  SYM and STR order by text and GUID by bytes, as asc
+;; and the builtin min / max do; nulls are skipped, an all-null frame is null.
+
+(set K [a a a b b c c])
+(set I (til 7))
+(set WN (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] funcs: {x: (min v)}}) 'x)))
+(set WX (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] funcs: {x: (max v)}}) 'x)))
+(set WR (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 'running funcs: {x: (min v)}}) 'x)))
+(set WT (fn [v] (at (window {from: (table [k i v] (list K I v)) part: [k] order: [i] frame: 2 funcs: {x: (max v)}}) 'x)))
+(WN (as 'I32 [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'I32 [1 1 1 4 4 0Nl 0Nl])
+(WX (as 'I16 [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'I16 [3 3 3 5 5 0Nl 0Nl])
+(WR (as 'F32 [3.0 0Nf 1.0 4.0 5.0 0Nf 0Nf])) -- (as 'F32 [3.0 3.0 1.0 4.0 4.0 0Nf 0Nf])
+(WN (as 'DATE [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'DATE [1 1 1 4 4 0Nl 0Nl])
+(WX (as 'TIME [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'TIME [3 3 3 5 5 0Nl 0Nl])
+(WN (as 'TIMESTAMP [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'TIMESTAMP [1 1 1 4 4 0Nl 0Nl])
+(WX (as 'TIMESPAN [3 0Nl 1 4 5 0Nl 0Nl])) -- (as 'TIMESPAN [3 3 3 5 5 0Nl 0Nl])
+(WN (as 'U8 [3 2 1 4 5 6 7])) -- (as 'U8 [1 1 1 4 4 6 6])
+(WX [false false true false true false false]) -- [true true true true true false false]
+(WN (as 'SYM ["zz" "" "ab" "m" "b" "" ""])) -- (as 'SYM ["ab" "ab" "ab" "b" "b" "" ""])
+(WX (as 'SYM ["zz" "" "ab" "m" "b" "" ""])) -- (as 'SYM ["zz" "zz" "zz" "m" "m" "" ""])
+(WR (as 'SYM ["zz" "" "ab" "m" "b" "" ""])) -- (as 'SYM ["zz" "zz" "ab" "m" "b" "" ""])
+(WT (as 'SYM ["ab" "zz" "m" "b" "c" "" ""])) -- (as 'SYM ["ab" "zz" "zz" "b" "c" "" ""])
+(WN (as 'STR (list "zz" "" "ab" "m" "b" "" ""))) -- (as 'STR (list "ab" "ab" "ab" "b" "b" "" ""))
+(WX (as 'STR (list "zz" "" "ab" "m" "b" "" ""))) -- (as 'STR (list "zz" "zz" "zz" "m" "m" "" ""))
+(set G (as 'GUID (list "00000009-1111-1111-1111-111111111111" "00000002-1111-1111-1111-111111111111" "00000003-1111-1111-1111-111111111111" "00000004-1111-1111-1111-111111111111" "00000001-1111-1111-1111-111111111111" "00000006-1111-1111-1111-111111111111" "00000007-1111-1111-1111-111111111111")))
+(WN G) -- (at G [1 1 1 4 4 5 5])
+(WX G) -- (at G [0 0 0 3 3 6 6])
+(type (WN (as 'SYM ["zz" "" "ab" "m" "b" "" ""]))) -- 'SYM
+
+;; a LIST column has no order here: a type error, not cells read as numbers
+(set TL (table [k o v] (list [a a b] [2 1 0] (list [1 2] "x" 's))))
+(window {from: TL part: [k] order: [o] funcs: {x: (min v)}}) !- type
+
+;; many partitions (the pooled path), nulls included: the same as by:'s min / max
+(set n 60000)
+(set P 997)
+(set KK (% (til n) P))
+(set II (til n))
+(set base (% (* 7919 (til n)) 100003))
+(set chk (fn [v] (and (identical (at (window {from: (table [k i v] (list KK II v)) part: [k] order: [i] funcs: {x: (min v)}}) 'x) (at (at (select {m: (min v) from: (table [k v] (list KK v)) by: k asc: k}) 'm) KK)) (identical (at (window {from: (table [k i v] (list KK II v)) part: [k] order: [i] funcs: {x: (max v)}}) 'x) (at (at (select {m: (max v) from: (table [k v] (list KK v)) by: k asc: k}) 'm) KK)))))
+(chk (as 'I32 base)) -- true
+(chk (as 'I16 (% base 30000))) -- true
+(chk (as 'F32 base)) -- true
+(chk (as 'DATE base)) -- true
+(chk (as 'TIMESTAMP base)) -- true
+(chk (as 'SYM (map (fn [j] (format "s%" j)) (% base 5000)))) -- true
+(chk (as 'STR (map (fn [j] (format "s%" j)) (% base 5000)))) -- true
+(chk (as 'I32 (concat [0Nl] (drop base 1)))) -- true
+(chk (concat (as 'SYM [""]) (as 'SYM (map (fn [j] (format "s%" j)) (% (drop base 1) 5000))))) -- true
+
+;; a parted table is flattened, then answers as the flat one
+(.sys.exec "rm -rf /tmp/rfl_window_min_max_types") -- 0
+(set T (table [k i s d] (list K I (as 'SYM ["zz" "" "ab" "m" "b" "" ""]) (as 'DATE [3 0Nl 1 4 5 0Nl 0Nl]))))
+(.db.splayed.set "/tmp/rfl_window_min_max_types/2024.01.01/t/" (take T 3) "/tmp/rfl_window_min_max_types/.sym")
+(.db.splayed.set "/tmp/rfl_window_min_max_types/2024.01.02/t/" (drop T 3) "/tmp/rfl_window_min_max_types/.sym")
+(set PT (.db.parted.get "/tmp/rfl_window_min_max_types" 't))
+(at (window {from: PT part: [k] order: [i] funcs: {x: (min s)}}) 'x) -- (as 'SYM ["ab" "ab" "ab" "b" "b" "" ""])
+(at (window {from: PT part: [k] order: [i] funcs: {x: (max d)}}) 'x) -- (as 'DATE [3 3 3 5 5 0Nl 0Nl])
+(.sys.exec "rm -rf /tmp/rfl_window_min_max_types") -- 0
+
+;; a SYM column read over its own .sym in a process that interned other symbols
+;; first: file-domain cell ids differ from runtime ids, and the text order must
+;; still be the builtin's (checked against by:, in a second process)
+(.sys.exec "rm -rf /tmp/rfl_window_min_max_fd /tmp/rfl_window_min_max_fd.rfl") -- 0
+(set FS (as 'SYM (map (fn [j] (format "s%" j)) (% (* 7919 (til 6000)) 500))))
+(.db.splayed.set "/tmp/rfl_window_min_max_fd/t/" (table [k i s] (list (% (til 6000) 97) (til 6000) (concat (as 'SYM [""]) (drop FS 1)))) "/tmp/rfl_window_min_max_fd/.sym")
+(.sys.exec "printf '%s\n' '(set junk (map (fn [j] (as (quote SYM) (format \"zq%\" j))) (til 300)))' '(set T (.db.splayed.get \"/tmp/rfl_window_min_max_fd/t/\" \"/tmp/rfl_window_min_max_fd/.sym\"))' '(set a (window {from: T part: [k] order: [i] funcs: {x: (min s) y: (max s)}}))' '(set g (select {m: (min s) M: (max s) from: T by: k asc: k}))' '(println (and (identical (at a (quote x)) (at (at g (quote m)) (at T (quote k)))) (identical (at a (quote y)) (at (at g (quote M)) (at T (quote k))))))' > /tmp/rfl_window_min_max_fd.rfl") -- 0
+(.sys.exec "./rayforce /tmp/rfl_window_min_max_fd.rfl </dev/null | grep -qx true") -- 0
+(.sys.exec "rm -rf /tmp/rfl_window_min_max_fd /tmp/rfl_window_min_max_fd.rfl") -- 0
