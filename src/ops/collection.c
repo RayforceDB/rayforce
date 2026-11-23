@@ -5448,6 +5448,7 @@ ray_t* fills_vec_eager(ray_t* x) {
 
 typedef struct {
     uint8_t seen;
+    bool emitted_null;  /* summary slot reused after carry calculation */
     int64_t count;
     uint64_t acc_i;
     double acc_f;
@@ -5467,6 +5468,7 @@ typedef struct {
     bool is_float;
     bool has_nulls;
     int64_t nblocks;
+    bool track_i64_nulls;
 } ts_run_ctx_t;
 
 static bool ts_numeric_type(int8_t t) {
@@ -5658,6 +5660,24 @@ static void ts_running_summary_fn(void* vctx, uint32_t worker_id, int64_t start,
     }
 }
 
+/* One morsel, starting with its global carry. ray_data resolves slice offsets;
+ * has_nulls is the hint from the underlying vector. */
+static inline bool ts_emit_i64_prefix(ts_run_ctx_t* c, int64_t lo, int64_t hi,
+                                      uint64_t acc, bool product) {
+    const int64_t* src = ray_data(c->src);
+    int64_t* dst = ray_data(c->dst);
+    bool has_nulls = c->has_nulls;
+    bool emitted_null = false;
+    for (int64_t r = lo; r < hi; r++) {
+        int64_t v = src[r];
+        if (!has_nulls || v != NULL_I64)
+            acc = product ? acc * (uint64_t)v : acc + (uint64_t)v;
+        dst[r] = (int64_t)acc;
+        emitted_null |= acc == (uint64_t)NULL_I64;
+    }
+    return emitted_null;
+}
+
 static void ts_running_emit_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
     (void)worker_id;
     ts_run_ctx_t* c = (ts_run_ctx_t*)vctx;
@@ -5666,13 +5686,25 @@ static void ts_running_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
         int64_t hi = lo + RAY_MORSEL_ELEMS;
         if (hi > c->src->len) hi = c->src->len;
 
+        if (c->track_i64_nulls && c->src->type == RAY_I64) {
+            /* Exactly one morsel: the only row checkpoint is at lo. */
+            if (ts_morsel_checkpoint(c->pool, 0)) return;
+            uint64_t acc = c->carry[b].acc_i;
+            c->summary[b].emitted_null = c->opcode == OP_PRDS
+                ? ts_emit_i64_prefix(c, lo, hi, acc, true)
+                : ts_emit_i64_prefix(c, lo, hi, acc, false);
+            continue;
+        }
         ts_run_state_t s = c->carry[b];
+        bool emitted_null = false;
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (!(c->has_nulls && ray_vec_is_null(c->src, r)))
                 ts_run_update(&s, c->src, r, c->opcode, c->is_float);
             ts_run_write(c->dst, r, &s, c->opcode, c->is_float);
+            if (c->track_i64_nulls) emitted_null |= s.acc_i == (uint64_t)NULL_I64;
         }
+        if (c->track_i64_nulls) c->summary[b].emitted_null = emitted_null;
     }
 }
 
@@ -5716,6 +5748,7 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
         .src = x, .dst = out, .pool = pool,
         .summary = summary, .carry = carry,
         .opcode = opcode,
+        .track_i64_nulls = out_type == RAY_I64 && (opcode == OP_SUMS || opcode == OP_PRDS),
         .is_float = (x->type == RAY_F64 || x->type == RAY_F32),
         .has_nulls = ray_vec_may_have_nulls(x),
         .nblocks = nblocks
@@ -5742,6 +5775,15 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
     if (pool_cancelled(pool)) {
         scratch_free(summary_hdr); scratch_free(carry_hdr); ray_release(out);
         return ray_error("cancel", "interrupted");
+    }
+    /* Only the joining thread publishes the vector-wide null hint. */
+    if (ctx.track_i64_nulls) {
+        for (int64_t b = 0; b < nblocks; b++) {
+            if (summary[b].emitted_null) {
+                out->attrs |= RAY_ATTR_HAS_NULLS;
+                break;
+            }
+        }
     }
     scratch_free(summary_hdr);
     scratch_free(carry_hdr);

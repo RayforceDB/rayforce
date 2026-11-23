@@ -189,69 +189,20 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
                 ray_retain(a);
                 a = a_owned = ray_lazy_materialize(a);
             }
-            int tlen = 0;
-            if (!a || RAY_IS_ERR(a)) {
-                tlen = snprintf(tmp, sizeof(tmp), "error");
-            } else if (a->type != -RAY_STR && a->type != -RAY_SYM &&
-                       RAY_ATOM_IS_NULL(a)) {
-                tlen = snprintf(tmp, sizeof(tmp), "%s", ray_fmt_null_literal(-a->type));
-            } else if (a->type == -RAY_I64) {
-                tlen = snprintf(tmp, sizeof(tmp), "%" PRId64, a->i64);
-            } else if (a->type == -RAY_F64) {
-                double fv = a->f64;
-                fv = clear_neg_zero(fv);
-                tlen = snprintf(tmp, sizeof(tmp), "%g", fv);
-            } else if (a->type == -RAY_BOOL) {
-                tlen = snprintf(tmp, sizeof(tmp), "%s", a->b8 ? "true" : "false");
-            } else if (a->type == -RAY_STR) {
-                const char* sp = ray_str_ptr(a);
-                size_t sl = ray_str_len(a);
-                while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                memcpy(buf + pos, sp, sl);
-                pos += sl;
+            const char* sp = NULL;
+            size_t sl = 0;
+            ray_t* own = ray_fmt_pct(a, tmp, sizeof(tmp), &sp, &sl);
+            if (own && RAY_IS_ERR(own)) {
                 if (a_owned) ray_release(a_owned);
-                continue;
-            } else if (a->type == -RAY_SYM) {
-                ray_t* ss = ray_sym_str(a->i64);
-                if (ss) {
-                    const char* sp = ray_str_ptr(ss);
-                    size_t sl = ray_str_len(ss);
-                    /* sym 0 resolves to "" — the empty symbol shows as ' */
-                    if (sl == 0) { sp = "'"; sl = 1; }
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                    memcpy(buf + pos, sp, sl);
-                    pos += sl;
-                    ray_release(ss);
-                    if (a_owned) ray_release(a_owned);
-                    continue;
-                }
-                tlen = snprintf(tmp, sizeof(tmp), "'?");
-            } else {
-                /* Fall back to ray_fmt */
-                ray_t* formatted = ray_fmt(a, RAY_FMT_COMPACT);
-                if (formatted && !RAY_IS_ERR(formatted)) {
-                    const char* sp = ray_str_ptr(formatted);
-                    size_t sl = ray_str_len(formatted);
-                    while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-                    memcpy(buf + pos, sp, sl);
-                    pos += sl;
-                    ray_release(formatted);
-                    if (a_owned) ray_release(a_owned);
-                    continue;
-                }
-                if (formatted && RAY_IS_ERR(formatted)) {
-                    if (a_owned) ray_release(a_owned);
-                    ray_free_raw(buf);
-                    *err = formatted;
-                    return NULL;
-                }
-                if (formatted) ray_release(formatted);
-                tlen = snprintf(tmp, sizeof(tmp), "<type:%d>", a->type);
+                ray_free_raw(buf);
+                *err = own;
+                return NULL;
             }
+            while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            memcpy(buf + pos, sp, sl);
+            pos += sl;
+            if (own) ray_release(own);
             if (a_owned && !RAY_IS_ERR(a_owned)) ray_release(a_owned);
-            while (pos + (size_t)tlen + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
-            memcpy(buf + pos, tmp, (size_t)tlen);
-            pos += (size_t)tlen;
         } else {
             if (pos + 2 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
             buf[pos++] = fmt[i];

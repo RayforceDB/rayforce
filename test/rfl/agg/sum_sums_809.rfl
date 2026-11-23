@@ -1,0 +1,17 @@
+;; Only a wrap onto the reserved I64 payload is null. Intermediate totals
+;; continue modulo 2^64; input nulls are skipped, not added as INT64_MIN.
+(nil? (sum [9223372036854775807 1])) -- true
+(sum [9223372036854775807 9223372036854775807]) -- -2
+(sum [9223372036854775807 1 0Nl 1]) -- -9223372036854775807
+
+(set p (sums [9223372036854775807 1 0Nl 1]))
+(nil? (at p 1)) -- true
+(nil? p) -- [false true true false]
+(at p 3) -- -9223372036854775807
+(sum p) -- 0
+(sums [9223372036854775807 9223372036854775807]) -- [9223372036854775807 -2]
+
+;; The second morsel hits the sentinel using the carry from the first.
+(set q (sums (raze (list [9223372036854775807] (take [0] 1023) [1 1]))))
+(sum (nil? q)) -- 1
+(at q 1025) -- -9223372036854775807

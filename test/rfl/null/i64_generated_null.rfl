@@ -1,0 +1,17 @@
+;; @also-unfused
+;; Only a result equal to INT64_MIN is null; other overflows still wrap.
+(set av (+ [1 9223372036854775807] 1))
+(sum (nil? av)) -- 1
+(nil? (at av 1)) -- true
+(set sv (- [-9223372036854775807 2] [1 1]))
+(sum (nil? sv)) -- 1
+(set mv (* [1 4611686018427387904] 2))
+(sum (nil? mv)) -- 1
+(sum (nil? (as 'F64 mv))) -- 1
+(+ 9223372036854775807 2) -- -9223372036854775807
+(* 9223372036854775807 2) -- -2
+(set v809 (take [1 4611686018427387904] 8192))
+(set t809 (table [a] (list v809)))
+(set oracle809 (sum (map (fn [v] (nil? (* (* v 2) 1.0))) v809)))
+oracle809 -- 4096
+(sum (nil? (at (select {from: t809 r: (* (* a 2) 1.0)}) 'r))) -- oracle809

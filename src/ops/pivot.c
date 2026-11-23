@@ -2205,7 +2205,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
      * index keys + 1 pivot key, followed by the ceil(n_keys/64) key-null
      * mask words written by group_rows_range (ly.null_words; Task 3). */
 
-    /* SQL PIVOT treats a null pivot key as "no column" — drop those groups.
+    /* A null pivot key is one more pivot value: its rows make one column,
+     * named by the type's null (pivot_col_names), as the generic route
+     * gives it.  pv_null is its position, UINT32_MAX until a group has it.
      * The pivot key is the LAST of the n_keys keys, at bit position n_idx —
      * word-indexed per the Task-3/4 convention (word k>>6, bit k&63; the
      * unsigned-shift idiom sidesteps UB at bit 63) since n_idx can now
@@ -2234,18 +2236,24 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!pv_vals) { scratch_free(pv_first_hdr); pivot_ingest_free(&pg); ght_layout_free(&ly); scratch_free(key_hdr); return ray_error("oom", NULL); }
 
     const char* pvt_base = pvt_wide ? (const char*)key_data[n_idx] : NULL;
+    uint32_t pv_null = UINT32_MAX;
     for (uint32_t _p = 0; _p < pg.n_parts; _p++) {
         group_ht_t* ph = &pg.part_hts[_p];
         uint32_t pcount = ph->grp_count;
         for (uint32_t gi_local = 0; gi_local < pcount; gi_local++) {
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* rkeys = (const int64_t*)(row + 8);
-            if (rkeys[n_keys + pvt_null_word] & pvt_null_bit) continue;
+            bool pnull = (rkeys[n_keys + pvt_null_word] & pvt_null_bit) != 0;
             int64_t pval = rkeys[n_idx];
             int64_t gfirst;
             memcpy(&gfirst, row + ly.off_group_first, 8);
             bool found = false;
-            for (uint32_t p = 0; p < pv_count; p++) {
+            if (pnull && pv_null != UINT32_MAX) {
+                found = true;
+                if (gfirst < pv_first[pv_null]) pv_first[pv_null] = gfirst;
+            }
+            for (uint32_t p = 0; p < pv_count && !pnull; p++) {
+                if (p == pv_null) continue;
                 if (pvt_wide) {
                     if (memcmp(pvt_base + (size_t)pv_vals[p] * 16,
                                pvt_base + (size_t)pval * 16, 16) == 0) { found = true; if (gfirst < pv_first[p]) pv_first[p] = gfirst; break; }
@@ -2264,6 +2272,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
                     pv_vals = new_pv; pv_first = new_pf;
                     pv_cap = new_cap; pv_first_cap = new_cap;
                 }
+                if (pnull) pv_null = pv_count;
                 pv_first[pv_count] = gfirst;
                 pv_vals[pv_count++] = pval;
             }
@@ -2304,9 +2313,13 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     memset(ix_ht, 0xFF, ix_ht_cap * sizeof(uint32_t));
     uint32_t ix_ht_mask = ix_ht_cap - 1;
 
-    /* Map: group_id -> (ix_row, pv_idx) for result cell placement */
+    /* Map: group_id -> (ix_row, pv_idx) for result cell placement, after
+     * nw_tmp: a null pivot key's group's index null words (8-byte words
+     * first, so both stay aligned). */
     ray_t* map_hdr = NULL;
-    uint32_t* grp_ix  = (uint32_t*)scratch_alloc(&map_hdr, grp_count * 2 * sizeof(uint32_t));
+    int64_t* nw_tmp = (int64_t*)scratch_alloc(&map_hdr,
+        (size_t)null_words * sizeof(int64_t) + (size_t)grp_count * 2 * sizeof(uint32_t));
+    uint32_t* grp_ix  = nw_tmp ? (uint32_t*)(nw_tmp + null_words) : NULL;
     if (!grp_ix) {
         scratch_free(ix_ht_hdr); scratch_free(ix_hdr); scratch_free(pv_hdr);
         pivot_ingest_free(&pg); ght_layout_free(&ly);
@@ -2327,19 +2340,19 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
             uint32_t gi = gi_base + gi_local;
             const char* row = ph->rows + (size_t)gi_local * pg.row_stride;
             const int64_t* keys = (const int64_t*)(row + 8);
-            if (keys[n_keys + pvt_null_word] & pvt_null_bit) {
-                grp_ix[gi] = UINT32_MAX;
-                grp_pv[gi] = UINT32_MAX;
-                continue;
-            }
+            bool pnull = (keys[n_keys + pvt_null_word] & pvt_null_bit) != 0;
             int64_t gfirst;
             memcpy(&gfirst, row + ly.off_group_first, 8);
-        /* Index-key null words: keys[n_keys .. n_keys+null_words) as-is.
-         * The pivot key's own null bit (position n_idx, word pvt_null_word)
-         * is guaranteed 0 here — the check just above already `continue`d
-         * on it being set — so these words already carry exactly the
-         * index-key null flags with no separate masking needed. */
+        /* Index-key null words: keys[n_keys .. n_keys+null_words), with the
+         * pivot key's own null bit (position n_idx, word pvt_null_word)
+         * cleared when it is set, so a row with a null pivot value finds
+         * the index row of its index keys.  Per group, not per row. */
         const int64_t* idx_nwords = keys + n_keys;
+        if (pnull) {
+            memcpy(nw_tmp, idx_nwords, (size_t)null_words * 8);
+            nw_tmp[pvt_null_word] &= ~pvt_null_bit;
+            idx_nwords = nw_tmp;
+        }
 
         /* Hash index keys only (exclude pivot key) + null words.
          * Wide keys (GUID) resolve actual bytes via key_data[k]. */
@@ -2424,8 +2437,9 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
          * are source row indices — resolve to actual bytes for compare,
          * otherwise duplicate GUID pivot values map to the wrong column. */
         int64_t pval = keys[n_idx];
-        uint32_t pv_idx = UINT32_MAX;
-        for (uint32_t p = 0; p < pv_count; p++) {
+        uint32_t pv_idx = pnull ? pv_null : UINT32_MAX;
+        for (uint32_t p = 0; p < pv_count && !pnull; p++) {
+            if (p == pv_null) continue;
             if (pvt_wide) {
                 if (memcmp(pvt_base + (size_t)pv_vals[p] * 16,
                            pvt_base + (size_t)pval * 16, 16) == 0) { pv_idx = p; break; }
@@ -2467,6 +2481,10 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         }
         for (uint32_t r = 0; r < pv_count; r++) pv_tmp[r] = pv_vals[pv_rank[r]];
         memcpy(pv_vals, pv_tmp, (size_t)pv_count * sizeof(int64_t));
+        /* pv_first in rank order too: each column's first source row, the
+         * row its name is read from */
+        for (uint32_t r = 0; r < pv_count; r++) pv_tmp[r] = pv_first[pv_rank[r]];
+        memcpy(pv_first, pv_tmp, (size_t)pv_count * sizeof(int64_t));
         for (uint32_t r = 0; r < pv_count; r++) pv_tmp[pv_rank[r]] = r;   /* invert: old -> new */
         for (uint32_t p = 0; p < pv_count; p++) pv_rank[p] = (uint32_t)pv_tmp[p];
         /* index rows */
@@ -2536,7 +2554,6 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         scratch_free(rank_hdr);
     }
     scratch_free(ix_first_hdr);
-    scratch_free(pv_first_hdr);
     ray_progress_update("pivot", "scatter", 0, (uint64_t)pv_count);
     /* The group accumulators hold F32 and F64 values alike in F64 lanes;
      * min / max / first / last of an F32 column are F32 cells. */
@@ -2553,6 +2570,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
     int64_t out_ncols = (int64_t)n_idx + (int64_t)pv_count;
+    ray_t* names = NULL;
     ray_t* result = ray_table_new(out_ncols);
     if (!result || RAY_IS_ERR(result)) goto pivot_cleanup;
 
@@ -2612,6 +2630,15 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         result = ray_table_add_col(result, ie->sym, new_col);
         ray_release(new_col);
         if (RAY_IS_ERR(result)) goto pivot_cleanup;
+    }
+
+    /* Value column names: read from each column's first source row by the
+     * code the generic route names its columns with. */
+    names = pivot_col_names(pcol, pv_first, (int64_t)pv_count, result);
+    if (!names || RAY_IS_ERR(names)) {
+        ray_release(result); result = names ? names : ray_error("oom", NULL);
+        names = NULL;
+        goto pivot_cleanup;
     }
 
     /* Value columns — one per distinct pivot value */
@@ -2756,55 +2783,7 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         if (new_col->type == RAY_SYM)
             ray_sym_vec_adopt_domain(new_col, vcol);
 
-        /* Column name from pivot value — match pivot_val_to_sym semantics */
-        int64_t pval = pv_vals[p];
-        int64_t col_sym;
-        if (pcol->type == RAY_SYM) {
-            /* pivot value (cell-data) becomes a column NAME — names live
-             * in the runtime table, so re-express the id there. */
-            col_sym = sym_id_runtime(pcol, pval);
-        } else if (pvt_wide) {
-            /* GUID: format 16 bytes as xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
-             * pval is a source row index into pvt_base. */
-            static const char hex[] = "0123456789abcdef";
-            static const int groups[] = {4, 2, 2, 2, 6};
-            char buf[37];
-            const uint8_t* bytes = (const uint8_t*)pvt_base + (size_t)pval * 16;
-            int pos = 0, bpos = 0;
-            for (int g = 0; g < 5; g++) {
-                if (g > 0) buf[bpos++] = '-';
-                for (int j = 0; j < groups[g]; j++) {
-                    buf[bpos++] = hex[bytes[pos] >> 4];
-                    buf[bpos++] = hex[bytes[pos] & 0x0F];
-                    pos++;
-                }
-            }
-            col_sym = ray_sym_intern(buf, (size_t)bpos);
-        } else {
-            char buf[128];
-            int len = 0;
-            int8_t pt = key_types[n_idx];
-            if (pt == RAY_F64) {
-                double fv;
-                memcpy(&fv, &pval, 8);
-                fv = clear_neg_zero(fv);
-                len = snprintf(buf, sizeof(buf), "%g", fv);
-            } else if (pt == RAY_F32) {
-                /* the key holds the float's bits */
-                uint32_t bits = (uint32_t)pval;
-                float f;
-                memcpy(&f, &bits, 4);
-                len = snprintf(buf, sizeof(buf), "%g", clear_neg_zero((double)f));
-            } else if (pt == RAY_BOOL) {
-                len = snprintf(buf, sizeof(buf), "%s", pval ? "true" : "false");
-            } else if (pt == RAY_I64 || pt == RAY_I32 || pt == RAY_I16 ||
-                       pt == RAY_DATE || pt == RAY_TIME || pt == RAY_TIMESTAMP) {
-                len = snprintf(buf, sizeof(buf), "%" PRId64, pval);
-            } else {
-                len = snprintf(buf, sizeof(buf), "col%" PRId64, pval);
-            }
-            col_sym = ray_sym_intern(buf, (size_t)len);
-        }
+        int64_t col_sym = ((const int64_t*)ray_data(names))[p];
 
         /* Flip HAS_NULLS if any pivot cell carries the type-correct NULL
          * sentinel — either a missing cell (no source row) left as null by
@@ -2819,6 +2798,8 @@ ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     }
 
 pivot_cleanup:
+    if (names) ray_release(names);
+    scratch_free(pv_first_hdr);
     ght_layout_free(&ly);   /* no-op when inline (n_keys <= 8); frees the
                              * owned spill block otherwise (see above) */
     scratch_free(map_hdr);
