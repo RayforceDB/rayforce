@@ -318,7 +318,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `mvar` | binary | lazy/DAG | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `mdev` | binary | lazy/DAG | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
-| `concat` | binary | — | Concatenate two vectors or strings | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
+| `concat` | binary | — | Concatenate vectors, strings, dictionaries, or tables. For table operands, `concat` matches columns by name, keeps the left column order, and ignores right-only columns. Like `union-all`, it reads parted operands into memory and returns a plain table with the partition key as a column. | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |

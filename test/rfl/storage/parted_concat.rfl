@@ -76,8 +76,25 @@
 (at (try (union-all PT (table [date a b s z] (list [2024.01.01] [1] [1.0] ['x] ["p"]))) (fn [e] e)) 'code) -- 'type
 (at (try (union-all PT 5) (fn [e] e)) 'code) -- 'type
 
-;; ────────────── concat of parted tables is still refused (the owner is deciding) ──────────────
-;; the code only: what concat should do with parted tables is not settled here
-(at (try (concat PT PT) (fn [e] e)) 'code) -- 'type
+;; concat flattens table operands but still matches columns by name.
+(set C (concat PT CT))
+(key C) -- (key PT)
+(at C 'date) -- (at U 'date)
+(at C 's) -- (at U 's)
+(at C 't) -- (at U 't)
+(at (concat CT MT) 'a) -- (at U 'a)
+(at (concat MT CT) 'a) -- (at U 'a)
+(sum (nil? (at (concat NT NT) 'a))) -- 4
+(count (concat BT BT)) -- 280000
+(set Right (table [extra t s b a date] (list [7] ["last"] ['last] [5.0] [9] [2024.01.03])))
+(set CR (concat CT Right))
+(key CR) -- (key CT)
+(at CR 'a) -- [1 2 3 1 2 3 9]
+(at CR 'date) -- [2024.01.01 2024.01.01 2024.01.01 2024.01.02 2024.01.02 2024.01.02 2024.01.03]
+(set Left (table [a date] (list [9] [2024.01.03])))
+(key (concat Left CT)) -- [a date]
+(at (concat Left CT) 'a) -- [9 1 2 3 1 2 3]
+(at (try (concat CT Left) (fn [e] e)) 'code) -- 'value
+(at (try (concat (table [a] (list [1.0])) CT) (fn [e] e)) 'code) -- 'type
 
 (.sys.exec (format "rm -rf %" d))

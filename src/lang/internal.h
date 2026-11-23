@@ -579,6 +579,7 @@ ray_t* ray_alter_fn(ray_t** args, int64_t n);
 bool ray_fn_is_local_mutator(const ray_t* fn);
 ray_t* ray_del_fn(ray_t** args, int64_t n);
 ray_t* ray_row_fn(ray_t* tbl, ray_t* idx);
+ray_t* ray_table_binary_flat(ray_t* t1, ray_t* t2, ray_t* (*op)(ray_t*, ray_t*));
 ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2);
 ray_t* ray_table_distinct_fn(ray_t* tbl);
 ray_t* ray_cols_fn(ray_t* tbl);

@@ -2257,7 +2257,6 @@ ray_t* ray_row_fn(ray_t* tbl, ray_t* idx) {
  * union-all
  * ══════════════════════════════════════════ */
 
-/* (union-all t1 t2) — concatenate two tables row-wise (same schema) */
 /* A table read with .db.parted.get keeps one segment per partition in each column and
  * has a virtual partition column: none of them can be concatenated as vectors. */
 static bool table_is_parted(ray_t* t) {
@@ -2291,15 +2290,8 @@ static ray_t* table_materialise(ray_t* t) {
     return out;
 }
 
-static ray_t* union_all_flat(ray_t* t1, ray_t* t2);
-
-/* (union-all t1 t2): the rows of t1 then those of t2.  A parted table is read into
- * memory first, as a table of its own columns, and the result is a plain table. */
-ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
-    if (t1->type != RAY_TABLE)
-        return ray_error("type", "union-all: first arg must be a table, got %s", ray_type_name(t1->type));
-    if (t2->type != RAY_TABLE)
-        return ray_error("type", "union-all: second arg must be a table, got %s", ray_type_name(t2->type));
+/* Apply a binary table operation to flat operands, borrowing plain inputs. */
+ray_t* ray_table_binary_flat(ray_t* t1, ray_t* t2, ray_t* (*op)(ray_t*, ray_t*)) {
     ray_t* m1 = NULL;
     ray_t* m2 = NULL;
     if (table_is_parted(t1)) {
@@ -2312,10 +2304,22 @@ ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
         if (!m2 || RAY_IS_ERR(m2)) { if (m1) ray_release(m1); return m2 ? m2 : ray_error("oom", NULL); }
         t2 = m2;
     }
-    ray_t* r = union_all_flat(t1, t2);
+    ray_t* r = op(t1, t2);
     if (m1) ray_release(m1);
     if (m2) ray_release(m2);
     return r;
+}
+
+static ray_t* union_all_flat(ray_t* t1, ray_t* t2);
+
+/* (union-all t1 t2): the rows of t1 then those of t2.  A parted table is read into
+ * memory first, as a table of its own columns, and the result is a plain table. */
+ray_t* ray_union_all_fn(ray_t* t1, ray_t* t2) {
+    if (t1->type != RAY_TABLE)
+        return ray_error("type", "union-all: first arg must be a table, got %s", ray_type_name(t1->type));
+    if (t2->type != RAY_TABLE)
+        return ray_error("type", "union-all: second arg must be a table, got %s", ray_type_name(t2->type));
+    return ray_table_binary_flat(t1, t2, union_all_flat);
 }
 
 static ray_t* union_all_flat(ray_t* t1, ray_t* t2) {

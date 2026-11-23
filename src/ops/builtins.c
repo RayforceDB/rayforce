@@ -3968,6 +3968,47 @@ static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
     return out;
 }
 
+/* Append table rows, matching right columns to the left schema by name. */
+static ray_t* concat_tables_flat(ray_t* a, ray_t* b) {
+    int64_t ncols_a = ray_table_ncols(a);
+    int64_t ncols_b = ray_table_ncols(b);
+    /* Match columns of a in b by name */
+    ray_t* result = ray_table_new((int32_t)ncols_a);
+    if (RAY_IS_ERR(result)) return result;
+    for (int64_t c = 0; c < ncols_a; c++) {
+        int64_t col_name_a = ray_table_col_name(a, c);
+        ray_t* acol = ray_table_col_idx(a, c);
+        if (acol && RAY_IS_ERR(acol)) { ray_release(result); return acol; }
+        /* Find matching column in b by name */
+        ray_t* bcol = NULL;
+        for (int64_t j = 0; j < ncols_b; j++) {
+            if (ray_table_col_name(b, j) == col_name_a) {
+                bcol = ray_table_col_idx(b, j);
+                if (bcol && RAY_IS_ERR(bcol)) { ray_release(result); return bcol; }
+                break;
+            }
+        }
+        if (!bcol) {
+            /* Column not present in b — schema mismatch is a "value"
+             * error (the table values have incompatible columns), not
+             * a "domain" error (which semantically means out-of-range). */
+            ray_release(result);
+            return ray_error("value", NULL);
+        }
+        /* Type check: columns must have the same type */
+        if (acol->type != bcol->type) {
+            ray_release(result);
+            return ray_error("type", "concat: column type mismatch, got %s and %s", ray_type_name(acol->type), ray_type_name(bcol->type));
+        }
+        ray_t* col = ray_concat_fn(acol, bcol);
+        if (RAY_IS_ERR(col)) { ray_release(result); return col; }
+        result = ray_table_add_col(result, col_name_a, col);
+        ray_release(col);
+        if (RAY_IS_ERR(result)) return result;
+    }
+    return result;
+}
+
 /* (concat a b) -> concatenate vectors/strings/dicts/tables */
 ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Helper: get string content from atom (STR or CHAR), stripping trailing nulls */
@@ -4260,46 +4301,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         }
         return out;
     }
-    /* Table concat: append rows */
-    if (a->type == RAY_TABLE && b->type == RAY_TABLE) {
-        int64_t ncols_a = ray_table_ncols(a);
-        int64_t ncols_b = ray_table_ncols(b);
-        /* Match columns of a in b by name */
-        ray_t* result = ray_table_new((int32_t)ncols_a);
-        if (RAY_IS_ERR(result)) return result;
-        for (int64_t c = 0; c < ncols_a; c++) {
-            int64_t col_name_a = ray_table_col_name(a, c);
-            ray_t* acol = ray_table_col_idx(a, c);
-            if (acol && RAY_IS_ERR(acol)) { ray_release(result); return acol; }
-            /* Find matching column in b by name */
-            ray_t* bcol = NULL;
-            for (int64_t j = 0; j < ncols_b; j++) {
-                if (ray_table_col_name(b, j) == col_name_a) {
-                    bcol = ray_table_col_idx(b, j);
-                    if (bcol && RAY_IS_ERR(bcol)) { ray_release(result); return bcol; }
-                    break;
-                }
-            }
-            if (!bcol) {
-                /* Column not present in b — schema mismatch is a "value"
-                 * error (the table values have incompatible columns), not
-                 * a "domain" error (which semantically means out-of-range). */
-                ray_release(result);
-                return ray_error("value", NULL);
-            }
-            /* Type check: columns must have the same type */
-            if (acol->type != bcol->type) {
-                ray_release(result);
-                return ray_error("type", "concat: column type mismatch, got %s and %s", ray_type_name(acol->type), ray_type_name(bcol->type));
-            }
-            ray_t* col = ray_concat_fn(acol, bcol);
-            if (RAY_IS_ERR(col)) { ray_release(result); return col; }
-            result = ray_table_add_col(result, col_name_a, col);
-            ray_release(col);
-            if (RAY_IS_ERR(result)) return result;
-        }
-        return result;
-    }
+    if (a->type == RAY_TABLE && b->type == RAY_TABLE)
+        return ray_table_binary_flat(a, b, concat_tables_flat);
     /* Atom + boxed list -> prepend atom to list */
     if (ray_is_atom(a) && b->type == RAY_LIST && b->type != RAY_DICT) {
         int64_t nb = b->len;

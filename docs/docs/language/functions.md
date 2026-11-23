@@ -647,6 +647,8 @@ Built-in support for triple stores. The EAV table has three columns: `e` (entity
 | `distinct` | unary | Remove duplicate rows from a table | `(distinct t)` |
 | `anti-join` | variadic | Anti-semi-join: rows in left not in right | `(anti-join [x] t1 t2)` |
 
+For table operands, `concat` matches columns by name, keeps the left column order, and ignores right-only columns. Like `union-all`, it reads parted operands into memory and returns a plain table with the partition key as a column.
+
 ```lisp
 ; Table concatenation and deduplication
 (set t1 (table [x] (list [1 2])))
