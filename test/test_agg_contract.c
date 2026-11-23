@@ -3593,7 +3593,9 @@ static test_result_t test_first_n_take_running_input(void) {
  * the language runs over the whole table: running, moving and shift
  * functions over row-local expressions (#916).  An aggregate is not one: on
  * its own, in an inlined lambda, it sees the rows the where: keeps (#1234
- * review: `(sum (f i))` with f = `(- x (first x))` answered [6 8] for [2 4]).
+ * review: `(sum (f i))` with f = `(- x (first x))` answered [6 8]), and of
+ * those the group's, as written inline or in a helper the planner does not
+ * inline (#1452): [2 2], not the [2 4] of every kept row.
  * An aggregate nested in a running function sees the whole table (select.md
  * "Running functions under where:").  Small fixed answers, then the same
  * shapes at 200K rows against the materialized where: (an aggregate on its
@@ -3613,11 +3615,11 @@ static test_result_t test_group_bridge_lambda_aggregate(void) {
     TEST_ASSERT_TRUE(setup && !RAY_IS_ERR(setup)); ray_release(setup);
     static const struct { const char* q; const char* want; } small[] = {
         { "(select {from:la_t where:(> i 2) s:(la_f i)})", "[0 1 2 3]" },
-        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_f i))})", "[2 4]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_f i))})", "[2 2]" },
         { "(select {from:la_t where:(> i 2) s:(sum (la_c i))})", "[72]" },
-        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_c i))})", "[32 40]" },
-        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_a i))})", "[-1.0 1.0]" },
-        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_s i))})", "[144 180]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_c i))})", "[16 20]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_a i))})", "[0.0 0.0]" },
+        { "(select {from:la_t where:(> i 2) by:k s:(sum (la_s i))})", "[64 100]" },
         /* nested in a running function: the whole table */
         { "(select {from:la_t where:(> i 2) s:(la_g i)})", "[3 6 10 15]" },
         { "(select {from:la_t where:(> i 2) by:k s:(max (la_g i))})", "[10 15]" },

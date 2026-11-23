@@ -24,6 +24,9 @@
 (set R (fn [t K f] (map (fn [x] (f (at t (where (== K x))))) (asc (distinct K)))))
 ;; f over each group's column c
 (set Rc (fn [t K c f] (R t K (fn [r] (f (at r c))))))
+;; the message of a select that aggregates only aggregates of the group
+(set Re (fn [e] (at e 'msg)))
+(set Refold "select by: output `s` aggregates an aggregate of the group")
 
 ;; ── the issue's forms ───────────────────────────────────────────────────────
 (Sk (select {s: (first (at V i)) from: T by: (% v 2)}) 'v)           -- [500 600]
@@ -108,6 +111,59 @@
 (Sk (select {s: (sum (- v (min v))) from: T by: [k j]}) [k j])         -- (Rc T KJ 'v (fn [x] (sum (- x (min x)))))
 (Sk (select {s: (max (+ v (count v))) from: T by: {kk: (+ (* 10 k) j)}}) 'kk)  -- (Rc T KJ 'v (fn [x] (max (+ x (count x)))))
 
+;; ── the spelling does not change the answer ────────────────────────────────
+;; a helper the planner inlines nests as the written-out form does: the inner
+;; count is the group's, never the table's
+(set h (fn [x] (+ x (count x))))
+(set hm (fn [x] (let y x) (+ y (count y))))
+(set hs (fn [x] (sum x)))
+(Sk (select {s: (max (h v)) from: T by: k}) 'k)                -- (Sk (select {s: (max (+ v (count v))) from: T by: k}) 'k)
+(Sk (select {s: (max (h v)) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (max (h x))))
+(Sk (select {s: (max (hm v)) from: T by: k}) 'k)               -- (Rc T Kk 'v (fn [x] (max (hm x))))
+(Sk (select {s: (+ 1 (max (h v))) from: T by: k}) 'k)          -- (Rc T Kk 'v (fn [x] (+ 1 (max (h x)))))
+(Sk (select {s: (sum (h v)) from: T by: k}) 'k)                -- (Rc T Kk 'v (fn [x] (sum (h x))))
+(Sk (select {s: (max (h v)) from: T by: (% v 2)}) 'v)          -- (Rc T K2 'v (fn [x] (max (h x))))
+(Sk (select {s: (max (h v)) from: T where: (> v 2) by: k}) 'k) -- (Rc W (at W 'k) 'v (fn [x] (max (h x))))
+;; and a helper that refolds refolds
+(try (select {s: (max (hs v)) from: T by: k}) Re)             -- Refold
+(try (select {s: (+ 1 (max (hs v))) from: T by: (% v 2)}) Re) -- Refold
+
+;; ── a global vector as long as the table ────────────────────────────────────
+;; read elementwise it is sliced by the group, as the DAG slices it in
+;; (max (+ WV 0)); read through `at` it is the whole vector
+(set WV [10 20 30 40 50 60 70 80])
+(set TM (take true (count T)))
+(set Rw (fn [K M f] (map (fn [x] ((fn [ix] (f (at WV ix) (at T ix))) (where (and M (== K x))))) (asc (distinct (at K (where M)))))))
+(Sk (select {s: (max (+ WV 0)) from: T by: k}) 'k)                         -- (Rw Kk TM (fn [w r] (max w)))
+(Sk (select {s: (max (+ WV (count v))) from: T by: k}) 'k)                 -- (Rw Kk TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (+ 1 (max (+ WV (count v)))) from: T by: k}) 'k)          -- (Rw Kk TM (fn [w r] (+ 1 (max (+ w (count (at r 'v)))))))
+(Sk (select {s: (max (- WV (min WV))) from: T by: k}) 'k)                  -- (Rw Kk TM (fn [w r] (max (- w (min w)))))
+(Sk (select {s: (sum (* WV (count (+ v WV)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (sum (* w (count (+ (at r 'v) w))))))
+(Sk (select {s: (max (+ (+ WV (at V i)) (count v))) from: T by: k}) 'k)  -- (Rw Kk TM (fn [w r] (max (+ (+ w (at V (at r 'i))) (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T where: (> v 2) by: k}) 'k) -- (Rw Kk (> (at T 'v) 2) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T by: (% v 3)}) 'v)          -- (Rw (% (at T 'v) 3) TM (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WV (count v))) from: T by: [k j]}) [k j])          -- (Rw KJ TM (fn [w r] (max (+ w (count (at r 'v))))))
+(set Q (select {a: (max WV) s: (max (+ WV (count v))) b: (first (at V i)) from: T by: k}))
+(at (xasc Q 'k) 'a)                                                        -- (Rw Kk TM (fn [w r] (max w)))
+(at (xasc Q 'k) 'b)                                                        -- (Rc T Kk 'i (fn [x] (first (at V x))))
+;; a vector of another length is no column: the aggregate refolds
+(set V3 [1 2 3])
+(try (select {s: (max (+ V3 (count v))) from: T by: k}) Re)               -- Refold
+;; under `at` it is the whole vector, never sliced
+(Sk (select {s: (max (+ v (at WV (count v)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (at WV (count (at r 'v)))))))
+
+;; ── the shapes dev answered keep their route ────────────────────────────────
+;; an aggregate the DAG declines for temporal arithmetic, under a bare key,
+;; keeps the grouping it had: keys in order, take: the first groups
+(set TD (table [k v d] (list [0 1 2 0 1 2 0 0] [1 2 3 4 5 6 7 8] (+ 2024.01.01 [5 3 1 7 2 9 4 6]))))
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 'v)                 -- [0 1 2]
+(at (select {s: (first (+ d 1)) from: TD by: (% v 3)}) 's)                 -- [2024.01.03 2024.01.07 2024.01.05]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'v)  -- [0 1]
+(at (select {s: (first (+ d 1)) a: (sum v) from: TD by: (% v 3) take: 2}) 'a)  -- [9 12]
+(at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 'v)               -- [0 5]
+(at (select {s: (last (+ d 1)) from: TD by: (xbar v 5)}) 's)               -- [2024.01.09 2024.01.08]
+(at (select {s: (first (+ d 1)) from: TD by: (+ k 0)}) 's)                 -- [2024.01.07 2024.01.05 2024.01.03]
+
 ;; ── errors still stand ──────────────────────────────────────────────────────
 ;; a misspelt column is schema, as in the keyless select
 (try (select {s: (max (+ zz (count v))) from: T by: k}) (fn [e] (at e 'code)))          -- 'schema
@@ -127,8 +183,6 @@
 (try (select {s: (sum (+ v "x")) from: T where: (> v 100) by: (% v 2)}) (fn [e] (at e 'code)))     -- 'type
 ;; an aggregate that folds only aggregates of the group has no rows left to
 ;; fold, written out or through an alias, under any key
-(set Re (fn [e] (at e 'msg)))
-(set Refold "select by: output `s` aggregates an aggregate of the group")
 (try (select {s: (max (sum v)) from: T by: k}) Re)                       -- Refold
 (try (select {s: (max (+ (sum v) 1)) from: T by: k}) Re)                 -- Refold
 (try (select {s: (+ 1 (min (sum v))) from: T by: k}) Re)                 -- Refold
@@ -154,6 +208,11 @@
 (Sk (select {s: (max (+ v (count v))) from: P by: (% v 2)}) 'v)             -- (Rc F (% (at F 'v) 2) 'v (fn [x] (max (+ x (count x)))))
 (try (select {s: (max (+ v (count zz))) from: P by: k}) (fn [e] (at e 'code)))  -- 'schema
 (try (select {s: (max (sum v)) from: P by: k}) Re)                          -- Refold
+(set WF (* 10 (at F 'v)))
+(set PW (fn [K M f] (map (fn [x] ((fn [ix] (f (at WF ix) (at F ix))) (where (and M (== K x))))) (asc (distinct (at K (where M)))))))
+(Sk (select {s: (max (+ WF (count v))) from: P by: k}) 'k)                  -- (PW (at F 'k) (take true (count F)) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (+ WF (count v))) from: P where: (> v 2) by: k}) 'k)   -- (PW (at F 'k) (> (at F 'v) 2) (fn [w r] (max (+ w (count (at r 'v))))))
+(Sk (select {s: (max (h v)) from: P by: k}) 'k)                             -- (Rc F (at F 'k) 'v (fn [x] (max (h x))))
 ;; the mapped table goes first, so the unfused pass can write the fixture again
 (set P 0)
 (set F 0)

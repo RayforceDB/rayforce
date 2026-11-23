@@ -4663,6 +4663,30 @@ static bool expr_is_constant_collection(ray_t* expr, ray_t* tbl, bool* lowered) 
     return collection;
 }
 
+/* grouped_output_nested_agg over `expr` as the planner reads it: with its
+ * inlinable helpers expanded, so (max (h v)) with h (fn [x] (+ x (count x)))
+ * nests as (max (+ v (count v))) does.  A helper the planner cannot expand
+ * runs per group already. */
+static ray_t* grouped_nested_agg_inlined(ray_t* expr, ray_t* tbl, bool inside_agg,
+                                         ray_t** out_expanded) {
+    *out_expanded = NULL;
+    ray_t* hit = grouped_output_nested_agg(expr, inside_agg);
+    if (hit || !tbl || tbl->type != RAY_TABLE || !query_expr_has_helper(expr)) return hit;
+    ray_t* x = query_inline_helpers(expr, tbl);
+    if (!x || RAY_IS_ERR(x)) return NULL;
+    if (x == expr) { ray_release(x); return NULL; }
+    hit = grouped_output_nested_agg(x, inside_agg);
+    if (hit) *out_expanded = x; else ray_release(x);
+    return hit;
+}
+
+static bool expr_nests_agg(ray_t* expr, ray_t* tbl, bool inside_agg) {
+    ray_t* x = NULL;
+    bool hit = grouped_nested_agg_inlined(expr, tbl, inside_agg, &x) != NULL;
+    if (x) ray_release(x);
+    return hit;
+}
+
 /* True when an aggregate's input must be evaluated per group rather than
  * lowered as a row-aligned input: a constant collection (its length is
  * independent of the source rows; `collections` says the caller cares), or
@@ -4674,7 +4698,7 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
     /* An aggregate inside the argument, (+ v (count v)), reduces the
      * group's rows, not the table's: the argument is evaluated per group
      * (#1452). */
-    if (grouped_output_nested_agg(arg, true)) return true;
+    if (expr_nests_agg(arg, tbl, true)) return true;
     if (tbl && tbl->type == RAY_TABLE) {
         if (arg->type == -RAY_SYM) {
             bool local = !(arg->attrs & ATTR_QUOTED) && ray_env_has_lexical_local(arg->i64);
@@ -4723,7 +4747,7 @@ static int is_group_dag_agg_expr(ray_t* expr, ray_t* tbl) {
     /* An aggregate inside an argument, (max (+ v (count v))), is one value
      * per group: the DAG would fold it over the whole table.  The output
      * is evaluated per group instead (#1452). */
-    if (grouped_output_nested_agg(expr, false)) return 0;
+    if (expr_nests_agg(expr, tbl, false)) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
     uint16_t op = resolve_agg_opcode(elems[0]->i64);
     if (expr_contains_call_named(elems[1], "distinct", 8)) return 0;
@@ -4864,6 +4888,25 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_e
         if (*out_err || !supported) return 0;
     }
     return 1;
+}
+
+/* Whether the argument of the DAG-shaped aggregate `expr` has no DAG node,
+ * (first (at V i)): the lowering declines without an error.  The test
+ * is_group_dag_agg_expr_dag_safe ends with. */
+static bool group_agg_arg_has_no_node(ray_t* expr, ray_t* tbl) {
+    ray_t** el = (ray_t**)ray_data(expr);
+    ray_t* arg = el[1];
+    uint16_t op;
+    ray_t* sarg;
+    if (simplify_agg_idiom(expr, tbl, &op, &sarg)) arg = sarg;
+    if (!arg || arg->type != RAY_LIST) return false;
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return false;
+    bool none = !compile_expr_dag(g, arg);
+    ray_t* err = graph_take_compile_err(g);
+    ray_graph_free(g);
+    if (err) { ray_error_free(err); return false; }
+    return none;
 }
 
 static int is_single_group_key_projection(ray_t* by_expr, int64_t output_id, ray_t* val_expr) {
@@ -16835,20 +16878,27 @@ static ray_t* grouped_output_nested_agg(ray_t* expr, bool inside_agg) {
 }
 
 /* Whether `e` names a source column outside every aggregate in it: the
- * rows an enclosing aggregate folds.  An unbound name counts, so its own
+ * rows an enclosing aggregate folds, or a global vector as long as the
+ * table read elementwise (sym_is_row_global, which select_plan_row_globals
+ * makes a column).  An unbound name counts, so its own
  * error (schema, name) is the one reported.  A lambda or let body is its
  * own scope and is not descended. */
-static bool expr_reads_rows_outside_agg(ray_t* e, ray_t* tbl) {
+static bool sym_is_row_global(int64_t s, ray_t* tbl);         /* defined below */
+static bool head_reads_rows_elementwise(ray_t* e);
+
+static bool expr_reads_rows_outside_agg(ray_t* e, ray_t* tbl, bool elementwise) {
     if (!e) return false;
     if (e->type == -RAY_SYM)
         return !(e->attrs & ATTR_QUOTED) &&
                (ray_sym_is_dotted(e->i64) || tbl_has_col(tbl, e->i64) ||
-                !(ray_env_get_lexical_local(e->i64) || ray_env_get(e->i64)));
+                !(ray_env_get_lexical_local(e->i64) || ray_env_get(e->i64)) ||
+                (elementwise && sym_is_row_global(e->i64, tbl)));
     if (e->type != RAY_LIST || e->len < 1) return false;
     ray_t** el = (ray_t**)ray_data(e);
     if (select_alias_skip_form(el[0]) || is_agg_expr(e)) return false;
+    bool ew = head_reads_rows_elementwise(e);
     for (int64_t i = 1; i < e->len; i++)
-        if (expr_reads_rows_outside_agg(el[i], tbl)) return true;
+        if (expr_reads_rows_outside_agg(el[i], tbl, ew)) return true;
     return false;
 }
 
@@ -16863,7 +16913,7 @@ static ray_t* grouped_output_refolds_agg(ray_t* expr, ray_t* tbl) {
     if (is_agg_expr(expr) && grouped_output_nested_agg(expr, false)) {
         bool rows = false;
         for (int64_t i = 1; i < expr->len && !rows; i++)
-            rows = expr_reads_rows_outside_agg(el[i], tbl);
+            rows = expr_reads_rows_outside_agg(el[i], tbl, true);
         if (!rows) return expr;
     }
     for (int64_t i = 1; i < expr->len; i++) {
@@ -18368,6 +18418,170 @@ static ray_t* parted_flatten_read_cols(ray_t* dict, ray_t* tbl, bool keep_unread
     return out ? out : ray_error("oom", NULL);
 }
 
+/* A global vector as long as the table, read where a column would be: an
+ * operand of an atomic builtin or an aggregate's argument, as the DAG
+ * reads it ((max (+ W 0)) slices W by the group).  Not under a call that
+ * indexes it, (at W i), where the whole vector is meant. */
+static bool sym_is_row_global(int64_t s, ray_t* tbl) {
+    if (tbl_has_col(tbl, s) || ray_sym_is_dotted(s) || ray_env_has_lexical_local(s)) return false;
+    ray_t* b = ray_env_get(s);
+    int64_t nr = ray_table_nrows(tbl);
+    return b && ray_is_vec(b) && nr > 1 && ray_len(b) == nr;
+}
+
+static bool head_reads_rows_elementwise(ray_t* e) {
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    if (is_agg_expr(e)) return true;
+    ray_t* fn = ray_env_get(h->i64);
+    return fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY) &&
+           (fn->attrs & RAY_FN_ATOMIC);
+}
+
+/* Collects into elem[] the row globals `e` reads elementwise, into other[]
+ * those it reads any other way.  A lambda or let body is not descended. */
+static void row_globals_walk(ray_t* e, ray_t* tbl, bool elementwise,
+                             int64_t* elem, int* ne, int64_t* other, int* no, int cap) {
+    if (!e) return;
+    if (e->type == -RAY_SYM) {
+        if ((e->attrs & ATTR_QUOTED) || !sym_is_row_global(e->i64, tbl)) return;
+        int64_t* set = elementwise ? elem : other;
+        int* n = elementwise ? ne : no;
+        for (int i = 0; i < *n; i++) if (set[i] == e->i64) return;
+        if (*n < cap) set[(*n)++] = e->i64;
+        return;
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_alias_skip_form(el[0])) return;
+    bool ew = head_reads_rows_elementwise(e);
+    for (int64_t i = 1; i < e->len; i++)
+        row_globals_walk(el[i], tbl, ew, elem, ne, other, no, cap);
+}
+
+/* The row globals `e` reads only elementwise, into out[0..cap). */
+static int row_globals_of(ray_t* e, ray_t* tbl, int64_t* out, int cap) {
+    int64_t other[16];
+    int ne = 0, no = 0;
+    row_globals_walk(e, tbl, false, out, &ne, other, &no, cap < 16 ? cap : 16);
+    int n = 0;
+    for (int i = 0; i < ne; i++) {
+        bool clash = false;
+        for (int j = 0; j < no; j++) clash |= other[j] == out[i];
+        if (!clash) out[n++] = out[i];
+    }
+    return n;
+}
+
+/* Each name in syms[0..n) replaced by the hidden column names[i], outside
+ * lambda and let bodies.  A new reference. */
+static ray_t* row_globals_subst(ray_t* e, const int64_t* syms, const int64_t* names, int n) {
+    if (e && e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        for (int i = 0; i < n; i++) if (syms[i] == e->i64) return ray_sym(names[i]);
+    }
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 ||
+        select_alias_skip_form(((ray_t**)ray_data(e))[0])) { if (e) ray_retain(e); return e; }
+    ray_t* out = ray_list_new(e->len);
+    ray_t** el = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len && out && !RAY_IS_ERR(out); i++) {
+        ray_t* c = i == 0 ? (ray_retain(el[0]), el[0]) : row_globals_subst(el[i], syms, names, n);
+        if (!c || RAY_IS_ERR(c)) { ray_release(out); return c ? c : ray_error("oom", NULL); }
+        out = ray_list_append(out, c);
+        ray_release(c);
+    }
+    if (out && !RAY_IS_ERR(out)) out->attrs = e->attrs;
+    return out ? out : ray_error("oom", NULL);
+}
+
+static const int64_t* select_clause_ids(void);   /* defined below */
+static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+
+/* The error for a grouped output that aggregates only aggregates of the
+ * group, written out or through a helper, on any route; NULL if none. */
+static ray_t* select_refold_error(ray_t* dict, ray_t* tbl) {
+    if (!dict_get(dict, "by")) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    const int64_t* rid = select_clause_ids();
+    for (int64_t i = 0; i < ray_dict_len(dict); i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (select_clause_key(rid, kid)) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        ray_t* x = NULL;
+        if (!v || v->type != RAY_LIST || !grouped_nested_agg_inlined(v, tbl, false, &x)) continue;
+        bool refold = grouped_output_refolds_agg(x ? x : v, tbl) != NULL;
+        if (x) ray_release(x);
+        if (!refold) continue;
+        ray_t* nm = ray_sym_str(kid);
+        return ray_error("domain", "select by: output `%.*s` aggregates an aggregate of the group",
+                         nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+    }
+    return NULL;
+}
+
+/* A grouped output with an aggregate in an aggregate's argument is evaluated
+ * per group (#1452).  A global vector as long as the table that it reads
+ * elementwise, (max (+ W (count v))), stands for a column there, as it does
+ * for the DAG ((max (+ W 0)) slices W by the group).  So that is the query
+ * this plans: the vector added to the table as a hidden column, which the
+ * where: filters and the group slices, and the output reading that column.
+ * NULL when no output needs it. */
+static ray_t* select_plan_row_globals(ray_t* dict, ray_t* tbl) {
+    if (!dict_get(dict, "by")) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    const int64_t* rid = select_clause_ids();
+    int64_t nd = ray_dict_len(dict);
+    int64_t syms[8], names[8];
+    int ns = 0;
+    for (int64_t i = 0; i < nd; i++) {
+        if (select_clause_key(rid, sym_cell_runtime_id(keys, i))) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (!v || v->type != RAY_LIST || !grouped_output_nested_agg(v, false)) continue;
+        int64_t rg[8];
+        int n = row_globals_of(v, tbl, rg, 8);
+        for (int j = 0; j < n && ns < 8; j++) {
+            bool seen = false;
+            for (int k = 0; k < ns; k++) seen |= syms[k] == rg[j];
+            if (!seen) syms[ns++] = rg[j];
+        }
+    }
+    if (ns == 0) return NULL;
+    ray_t* base = table_has_parted_columns(tbl) ? query_materialize_parted_table(tbl)
+                                                : (ray_retain(tbl), tbl);
+    if (!base || RAY_IS_ERR(base)) return base ? base : ray_error("oom", NULL);
+    for (int i = 0; i < ns && base && !RAY_IS_ERR(base); i++) {
+        char buf[24];
+        int bn = snprintf(buf, sizeof buf, "__rg%d", i);
+        names[i] = ray_sym_intern(buf, (size_t)bn);
+        if (tbl_has_col(base, names[i])) { ray_release(base); return NULL; }
+        base = ray_table_add_col(base, names[i], ray_env_get(syms[i]));
+    }
+    if (!base || RAY_IS_ERR(base)) return base ? base : ray_error("oom", NULL);
+    ray_t* engine = dict;
+    ray_retain(engine);
+    for (int64_t i = 0; i < nd && engine && !RAY_IS_ERR(engine); i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (select_clause_key(rid, kid)) continue;
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (!v || v->type != RAY_LIST || !grouped_output_nested_agg(v, false)) continue;
+        ray_t* nv = row_globals_subst(v, syms, names, ns);
+        if (!nv || RAY_IS_ERR(nv)) { ray_release(engine); engine = nv; break; }
+        ray_t* k = ray_sym(kid);
+        engine = k && !RAY_IS_ERR(k) ? ray_dict_upsert(engine, k, nv) : engine;
+        if (k) ray_release(k);
+        ray_release(nv);
+    }
+    ray_t* k_from = ray_sym(rid[0]);
+    if (engine && !RAY_IS_ERR(engine) && k_from && !RAY_IS_ERR(k_from))
+        engine = ray_dict_upsert(engine, k_from, base);
+    if (k_from) ray_release(k_from);
+    ray_release(base);
+    return engine ? engine : ray_error("oom", NULL);
+}
+
 /* A bare computed by: key (`by: (% v 3)`) groups on the DAG path only beside
  * plain aggregates.  Any other output (a `distinct` aggregate, a row
  * expression) would send it to the eval-level grouping, which is slower
@@ -18504,11 +18718,9 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
         if (is_single_group_key_projection(by_expr, kid, v)) continue;
         /* An aggregate whose argument has no DAG node, (first (at V i)),
          * is evaluated per group: it needs the by-dict form too (#1452).
-         * A lowering that raises keeps the DAG route, which reports it. */
-        ray_t* cerr = NULL;
-        int dag = is_group_dag_agg_expr_dag_safe(v, tbl, &cerr);
-        if (cerr) { ray_error_free(cerr); continue; }
-        if (dag) continue;
+         * The aggregates the DAG declines for another reason (temporal
+         * arithmetic, a LIST column) keep the bare key they answer on. */
+        if (is_group_dag_agg_expr(v, tbl) && !group_agg_arg_has_no_node(v, tbl)) continue;
         if (is_decomposable_agg_compound(v, tbl)) continue;
         needs_eval = true;
     }
@@ -21424,6 +21636,19 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
             ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_ALIASES_RESOLVED);
             if (aplan.n_derived > 0) r = select_apply_derived(r, dict, &aplan, tbl);
             select_alias_plan_free(&aplan);
+            ray_release(engine);
+            ray_release(tbl);
+            return r;
+        }
+    }
+
+    {
+        ray_t* err = select_refold_error(dict, tbl);
+        if (err) { ray_release(tbl); return err; }
+        ray_t* engine = select_plan_row_globals(dict, tbl);
+        if (engine && RAY_IS_ERR(engine)) { ray_release(tbl); return engine; }
+        if (engine) {
+            ray_t* r = ray_select_impl(&engine, 1, plan | SELECT_ALIASES_RESOLVED);
             ray_release(engine);
             ray_release(tbl);
             return r;
@@ -24905,18 +25130,11 @@ by_dict_done:
                 ray_t* expr = dict_elems[i + 1];
                 if (is_single_group_key_projection(by_expr, kid, expr))
                     continue;
-                if (grouped_output_refolds_agg(expr, tbl)) {
-                    ray_t* nm = ray_sym_str(kid);
-                    for (int ci = 0; ci < n_compound; ci++)
-                        ray_release(compound_rw[ci]);
-                    ray_graph_free(g); ray_release(tbl);
-                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
-                    return ray_error("domain",
-                        "select by: output `%.*s` aggregates an aggregate of the group",
-                        nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
-                }
-                ray_t* classifier_err = grouped_output_nested_agg(expr, false)
-                                        ? nested_agg_compile_err(expr, tbl) : NULL;
+                ray_t* nx = NULL;
+                bool nested = grouped_nested_agg_inlined(expr, tbl, false, &nx) != NULL;
+                ray_t* cx = nx ? nx : expr;
+                ray_t* classifier_err = nested ? nested_agg_compile_err(cx, tbl) : NULL;
+                if (nx) ray_release(nx);
                 int dag_safe = classifier_err ? 0
                              : is_group_dag_agg_expr_dag_safe(expr, tbl, &classifier_err);
                 if (classifier_err) {
