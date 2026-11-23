@@ -13,6 +13,14 @@ on:
   pull_request:
     branches: [master, dev]
 
+# A new push to a PR supersedes its older run, so cancel that run instead of
+# letting it hold runners (macOS slots especially).  Keyed per PR; any other
+# event gets a group of its own (ref + sha) and never cancels, so a commit
+# that lands on a branch is not left untested.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Test tiers.  A PR into dev runs `make test`: the dev-loop suite (DEBUG
 # checks, no sanitizers, no equivalence pass or stress soak, all tests in
 # parallel).  A release PR into master runs `make test-full`: every test
