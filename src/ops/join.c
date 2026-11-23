@@ -1336,7 +1336,26 @@ typedef struct {
     const join_pf_col_t* pf;
     uint32_t     n_pf;
     uint8_t         nullfree;  /* #597: no key column can hold a null */
+    /* One null-free 8-byte integer key on both sides: its cells, read in
+     * place of hash_row_keys / join_keys_eq (NULL otherwise). */
+    const int64_t* l64;
+    const int64_t* r64;
 } join_probe_ctx_t;
+
+static inline bool join_i64_key_type(int8_t t) {
+    return t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_TIMESPAN;
+}
+
+/* hash_row_keys of left row l, as one integer key hashes there. */
+static inline uint64_t join_probe_hash(const join_probe_ctx_t* c, int64_t l) {
+    return c->l64 ? ray_hash_i64(c->l64[l])
+                  : hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+}
+
+static inline bool join_probe_eq(const join_probe_ctx_t* c, int64_t l, int64_t r) {
+    return c->l64 ? c->l64[l] == c->r64[r]
+                  : join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, r, c->nullfree);
+}
 
 /* Pass 2a: count matches per morsel */
 RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64) {
@@ -1366,14 +1385,14 @@ RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int
         }
 
         if (prefetch_heads && l + 8 < row_end) {
-            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
+            uint64_t pf_h = join_probe_hash(c, l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
-        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+        uint64_t h = join_probe_hash(c, l);
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
         for (uint32_t r = c->ht_heads[slot]; r != JHT_EMPTY; r = c->ht_next[r]) {
-            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree)) {
+            if (join_probe_eq(c, l, (int64_t)r)) {
                 count++;
                 matched = true;
             }
@@ -1433,14 +1452,14 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
         }
 
         if (prefetch_heads && l + 8 < row_end) {
-            uint64_t pf_h = hash_row_keys(c->l_key_vecs, c->n_keys, l + 8, c->nullfree);
+            uint64_t pf_h = join_probe_hash(c, l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
-        uint64_t h = hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree);
+        uint64_t h = join_probe_hash(c, l);
         uint32_t slot = (uint32_t)(h & ht_mask);
         bool matched = false;
         for (uint32_t r = c->ht_heads[slot]; r != JHT_EMPTY; r = c->ht_next[r]) {
-            if (join_keys_eq(c->l_key_vecs, c->r_key_vecs, c->n_keys, l, (int64_t)r, c->nullfree)) {
+            if (join_probe_eq(c, l, (int64_t)r)) {
                 li[off] = l;
                 ri[off] = (int64_t)r;
                 off++;
@@ -1998,6 +2017,12 @@ chained_ht_fallback:;
         .n_pf        = n_pf,
         .nullfree    = keys_kf,
     };
+    if (n_keys == 1 && keys_nullfree && l_key_vecs[0] && r_key_vecs[0] &&
+        !ray_is_atom(l_key_vecs[0]) && !ray_is_atom(r_key_vecs[0]) &&
+        join_i64_key_type(l_key_vecs[0]->type) && join_i64_key_type(r_key_vecs[0]->type)) {
+        probe_ctx.l64 = (const int64_t*)ray_data(l_key_vecs[0]);
+        probe_ctx.r64 = (const int64_t*)ray_data(r_key_vecs[0]);
+    }
 
     /* Minimum heads occupy only 1 KiB: choose no-lookahead callbacks here.
      * Bodies share their implementation; constant modes remove the row-loop
@@ -2284,7 +2309,8 @@ join_gather:;
             ray_t* col = l_src_cols[si];
             if (l_out_cols[si] == col) continue;  /* retained, metadata intact */
             col_propagate_str_pool(l_out_cols[si], col);
-            if (col->type != RAY_LIST)
+            /* a left row index is -1 only in a full join's right-only rows */
+            if (col->type != RAY_LIST && (join_type == 2 || ray_vec_may_have_nulls(col)))
                 col_propagate_nulls_gather(l_out_cols[si], col, l_idx, pair_count);
             if (l_out_cols[si]->type == RAY_SYM)
                 ray_sym_vec_adopt_domain(l_out_cols[si], col);
@@ -2319,7 +2345,9 @@ join_gather:;
     }
     for (int64_t i = 0; i < r_out_count; i++) {
         col_propagate_str_pool(r_out_cols[i], r_src_cols[i]);
-        if (r_src_cols[i]->type != RAY_LIST)
+        /* a right row index is -1 only in a left or full join */
+        if (r_src_cols[i]->type != RAY_LIST &&
+            (join_type >= 1 || ray_vec_may_have_nulls(r_src_cols[i])))
             col_propagate_nulls_gather(r_out_cols[i], r_src_cols[i], r_idx, pair_count);
         if (r_out_cols[i]->type == RAY_SYM)
             ray_sym_vec_adopt_domain(r_out_cols[i], r_src_cols[i]);
