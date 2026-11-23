@@ -20185,6 +20185,16 @@ static int64_t prune_stats_col(ray_t* tbl, int64_t name) {
 #define PRUNE_STAT_COLS 8
 typedef struct { int64_t col[PRUNE_STAT_COLS]; int n; } prune_stat_cols_t;
 
+/* A DATE literal against a TIMESTAMP column or key compares as the start
+ * of its day: the plan rewrites it to that timestamp (cmp_temporal_rewrite,
+ * graph.c) and the builtin compares the two as nanoseconds (temporal_as_ns),
+ * both saturating past the TIMESTAMP range, so the literal prunes as that
+ * timestamp does (#1501).  Owned, or NULL when `lit` is no such literal. */
+static ray_t* prune_date_lit_as_ts(ray_t* lit, int8_t ct) {
+    if (ct != RAY_TIMESTAMP || !lit || lit->type != -RAY_DATE || RAY_ATOM_IS_NULL(lit)) return NULL;
+    return ray_timestamp(temporal_as_ns(lit));
+}
+
 /* AND into `acc` the partitions the where expression `e` can pass, for
  * every recognised comparison of the key column `key_id` (values `kv`)
  * with a literal of the key's exact type, or of a parted data column with
@@ -20223,14 +20233,31 @@ static void prune_where_mask(ray_t* e, ray_t* tbl, int64_t key_id, ray_t* kv,
         ray_t* slot = ray_table_get_col_enc_idx(tbl, c);
         if (!slot) slot = ray_table_col_idx(tbl, c);                 /* plain wrapper: no decode */
         if (!slot || RAY_IS_ERR(slot)) return;
+        ray_col_meta_t cm;
+        ray_t* ts = ray_table_col_meta_idx(tbl, c, &cm)
+                  ? prune_date_lit_as_ts(lit, (int8_t)RAY_PARTED_BASETYPE(cm.type)) : NULL;
+        if (ts && RAY_IS_ERR(ts)) { ray_error_free(ts); return; }
         memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
-        if (!ray_part_prune_stats_mask(slot, op, r_col >= 0, lit, tmp)) return;
+        bool narrowed = ray_part_prune_stats_mask(slot, op, r_col >= 0, ts ? ts : lit, tmp);
+        if (ts) ray_release(ts);
+        if (!narrowed) return;
         for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
         if (k == sc->n) sc->col[sc->n++] = c;
         return;
     }
     ray_t* lit = l_key ? r : l;
     if (!lit) return;
+    if (op != OP_IN && kv->type == RAY_TIMESTAMP && lit->type == -RAY_DATE) {
+        ray_t* ts = prune_date_lit_as_ts(lit, kv->type);
+        if (!ts) return;
+        if (RAY_IS_ERR(ts)) { ray_error_free(ts); return; }
+        memset(tmp, 0, (size_t)n_words * sizeof(uint64_t));
+        bool narrowed = ray_part_prune_mask(kv, op, r_key, ts, tmp);
+        ray_release(ts);
+        if (!narrowed) return;
+        for (int64_t w = 0; w < n_words; w++) acc[w] &= tmp[w];
+        return;
+    }
     if (op == OP_IN) {
         if (lit->type != kv->type) return;            /* a typed vector literal */
         if (ray_sym_elem_size(lit->type, lit->attrs) != ray_sym_elem_size(kv->type, kv->attrs)) return;

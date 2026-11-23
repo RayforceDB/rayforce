@@ -272,6 +272,8 @@ A parted table whose partition-key column was dropped, as `(xcols P (drop (cols 
 
 `count` written directly around a select over a parted table, `(count (select {from: P where: ...}))`, reads the same partitions as that select alone.
 
+A date literal compared with a timestamp column or a timestamp partition key narrows as the timestamp at the start of its day does, the instant the filter compares it as: `(>= time 2024.01.16)` reads what `(>= time 2024.01.16D00:00:00.000)` reads.
+
 ## Symbol Table Persistence
 
 The global symbol intern table maps strings to integer IDs. When saving data to disk, the symbol table must be persisted so that symbol vectors can be correctly interpreted when reloaded.
