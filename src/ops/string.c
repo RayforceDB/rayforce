@@ -430,11 +430,121 @@ static ray_t* exec_like_input(ray_graph_t* g, ray_op_t* input_op) {
     return exec_node(g, input_op);
 }
 
+/* A text cursor over a STR or SYM vector, flat or parted (a parted one's
+ * missing segments hold no rows), or a STR/SYM atom repeated: row by row,
+ * the text of each cell (a SYM cell through its vector's domain). */
+typedef struct {
+    ray_t*  atom;                /* a STR or SYM atom, the same text every row */
+    ray_t*  held;                /* a SYM atom's text, owned */
+    ray_t** segs;                /* the vectors: one, or a parted column's segments */
+    int64_t n_segs, seg, row;
+    const ray_str_t* elems;      /* the current STR segment */
+    const char* pool;
+} like_text_cur_t;
+
+static bool like_text_kind(ray_t* v, bool atom_ok) {
+    if (!v) return false;
+    if (v->type == -RAY_STR || v->type == -RAY_SYM) return atom_ok;
+    int8_t t = RAY_IS_PARTED(v->type) ? (int8_t)RAY_PARTED_BASETYPE(v->type) : v->type;
+    return t == RAY_STR || RAY_IS_SYM(t);
+}
+
+static int64_t like_text_rows(ray_t* v) {
+    if (v->type < 0) return -1;
+    return RAY_IS_PARTED(v->type) ? parted_row_count(v) : v->len;
+}
+
+static void like_text_open(like_text_cur_t* c, ray_t** one) {
+    ray_t* v = *one;
+    memset(c, 0, sizeof *c);
+    if (v->type < 0) { c->atom = v; return; }
+    if (RAY_IS_PARTED(v->type)) { c->segs = (ray_t**)ray_data(v); c->n_segs = v->len; }
+    else { c->segs = one; c->n_segs = 1; }
+}
+
+static void like_text_close(like_text_cur_t* c) {
+    if (c->held) ray_release(c->held);
+    c->held = NULL;
+}
+
+/* The text of the next row; false past the last. */
+static bool like_text_next(like_text_cur_t* c, const char** sp, size_t* sl) {
+    if (c->atom) {
+        if (c->atom->type == -RAY_SYM) {
+            if (!c->held) c->held = ray_sym_str(c->atom->i64);   /* released by like_text_close */
+            *sp = c->held ? ray_str_ptr(c->held) : ""; *sl = c->held ? ray_str_len(c->held) : 0;
+        } else {
+            *sp = ray_str_ptr(c->atom); *sl = ray_str_len(c->atom);
+        }
+        return true;
+    }
+    while (c->seg < c->n_segs && (!c->segs[c->seg] || c->row >= c->segs[c->seg]->len)) {
+        c->seg++; c->row = 0; c->elems = NULL;
+    }
+    if (c->seg >= c->n_segs) return false;
+    ray_t* seg = c->segs[c->seg];
+    if (seg->type == RAY_STR) {
+        if (!c->elems) str_resolve(seg, &c->elems, &c->pool);
+        *sp = ray_str_t_ptr(&c->elems[c->row], c->pool);
+        *sl = c->elems[c->row].len;
+    } else {
+        ray_t* t = ray_sym_vec_cell(seg, c->row);              /* borrowed */
+        *sp = t ? ray_str_ptr(t) : ""; *sl = t ? ray_str_len(t) : 0;
+    }
+    c->row++;
+    return true;
+}
+
+/* (like x p) with p a STR vector (a column): row i of x matched against
+ * pattern i, x a STR or SYM vector of as many rows (flat or parted) or a
+ * STR/SYM atom matched against every pattern (#1615).  `ci`: ilike.
+ * Borrows both; returns an owned BOOL vector or an error. */
+ray_t* ray_like_rows(ray_t* x, ray_t* pat, bool ci) {
+    const char* fn = ci ? "ilike" : "like";
+    if (!like_text_kind(x, true))
+        return ray_error("type", "%s: expected a string or symbol, or a vector of them, got %s",
+                         fn, ray_type_name(x->type));
+    int64_t n = like_text_rows(pat);
+    int64_t xn = like_text_rows(x);
+    if (xn >= 0 && xn != n)
+        return ray_error("length", "%s: %lld values against %lld patterns", fn, (long long)xn, (long long)n);
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    uint8_t* dst = (uint8_t*)ray_data(out);
+    like_text_cur_t cx, cp;
+    ray_t* xs[1] = { x };
+    ray_t* ps[1] = { pat };
+    like_text_open(&cx, xs);
+    like_text_open(&cp, ps);
+    for (int64_t i = 0; i < n; i++) {
+        const char *s = "", *p = "";
+        size_t sl = 0, pl = 0;
+        if (!like_text_next(&cx, &s, &sl) || !like_text_next(&cp, &p, &pl)) {
+            like_text_close(&cx);
+            ray_release(out);
+            return ray_error("length", "%s: the values and the patterns have different lengths", fn);
+        }
+        dst[i] = (ci ? ray_glob_match_ci(s, sl, p, pl) : ray_glob_match(s, sl, p, pl)) ? 1 : 0;
+    }
+    like_text_close(&cx);
+    return out;
+}
+
+/* Is `pat` a pattern column: a STR vector, flat or parted? */
+bool ray_like_pat_rows(ray_t* pat) {
+    if (!pat || pat->type < 0) return false;
+    int8_t t = RAY_IS_PARTED(pat->type) ? (int8_t)RAY_PARTED_BASETYPE(pat->type) : pat->type;
+    return t == RAY_STR;
+}
+
 /* LIKE over a whole STR / SYM column (flat or parted): the parallel kernel
  * shared by the DAG executor (exec_like) and the direct builtin (ray_like_fn),
  * so `(like col pat)` and `where: (like col pat)` run the same code — one
  * pattern resolve per distinct symbol, the row passes spread over the worker
  * pool.  `selection` is the executor's rowsel, or NULL for every row.
+ * `pat_v` is a string atom (both callers check it; a string column takes
+ * ray_like_rows, #1615).
  * Borrows `input` and `pat_v`; returns an owned BOOL vector. */
 ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
     int8_t in_type = input->type;
@@ -584,6 +694,21 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
     ray_t* pat_v = exec_node(g, op_child(g, op, 1));
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
+    /* A query compiles any expression into the pattern slot.  A string
+     * column is matched row by row; a string atom takes the kernels below;
+     * anything else (a symbol, a number, a SYM column) is the builtin's
+     * type error.  Reading it as a string crashed or matched nothing
+     * (#1615). */
+    if (ray_like_pat_rows(pat_v)) {
+        ray_t* r = ray_like_rows(input, pat_v, false);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+    if (pat_v->type != -RAY_STR) {
+        int8_t pt = pat_v->type;
+        ray_release(input); ray_release(pat_v);
+        return ray_error("type", "like: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pt));
+    }
 
     int8_t in_type = input->type;
     bool in_parted = RAY_IS_PARTED(in_type);
@@ -666,6 +791,17 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
     ray_t* pat_v = exec_node(g, op_child(g, op, 1));
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
+    /* As for like (#1615): a string column row by row, else a string atom. */
+    if (ray_like_pat_rows(pat_v)) {
+        ray_t* r = ray_like_rows(input, pat_v, true);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+    if (pat_v->type != -RAY_STR) {
+        int8_t pt = pat_v->type;
+        ray_release(input); ray_release(pat_v);
+        return ray_error("type", "ilike: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pt));
+    }
 
     const char* pat_str = ray_str_ptr(pat_v);
     size_t pat_len = ray_str_len(pat_v);

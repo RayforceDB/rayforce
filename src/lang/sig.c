@@ -184,7 +184,7 @@ static const ray_sig_entry_t sigs[] = {
     {"xcol", "(xcol <t: table> <names: sym vector, one per column>)"},
     {"xcols", "(xcols <t: table> <columns: sym vector>)"},
     {"split", "(split <text: str or sym> <delimiter: str>)"},
-    {"like", "(like <text: str, sym or a vector of them> <pattern: str with * and ?>)"},
+    {"like", "(like <text: str, sym or a vector of them> <pattern: str with * and ?, or a str vector row by row>)"},
     {"str-find", "(str-find <text: str, sym or a vector of them> <pattern: str or sym>)"},
     {"str-join", "(str-join <items: str or sym atom, vector or list> <delimiter: str or sym>)"},
     {"strlen", "(strlen <x: str or sym>)"},

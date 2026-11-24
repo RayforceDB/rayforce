@@ -432,7 +432,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
 | `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | Replace all occurrences; lazy/DAG for vectors. An empty `to` deletes each match, an empty `from` matches nothing | `(replace "a-b" "-" "_")` → `"a_b"` |
-| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
+| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class. The pattern is a string atom, or a string column matched row by row; a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and in a query: `(concat "" "a")` is `"a"` | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 

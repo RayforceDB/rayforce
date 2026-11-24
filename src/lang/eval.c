@@ -363,8 +363,8 @@ static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
  * are not registered atomic (they do not auto-map over lists): the argument
  * positions that are row-shaped (bit i: argument i+1; these builtins take
  * at most three).  An argument a builtin consumes whole -- in's set,
- * like's pattern, within's bounds, bin's breaks, at's source -- is not
- * listed.  The conformance test (lang/builtin_row_shape) measures every
+ * within's bounds, bin's breaks, at's source -- is not listed.  like's
+ * pattern is row-shaped: a string column matches row by row (#1615).  The conformance test (lang/builtin_row_shape) measures every
  * entry, and every pure builtin's undeclared positions. */
 static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
     { (void*)ray_not_fn,             1, 1 }, { (void*)ray_nil_fn,             1, 1 },
@@ -379,7 +379,7 @@ static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
     { (void*)ray_sym_name_fn,        1, 1 }, { (void*)ray_strlen_fn,          1, 1 },
     { (void*)ray_cast_fn,            2, 2 }, { (void*)ray_xbar_fn,            2, 3 },
     { (void*)ray_in_eval_fn,         2, 1 }, { (void*)ray_not_in_fn,          2, 1 },
-    { (void*)ray_like_fn,            2, 1 }, { (void*)ray_str_find_fn,        2, 1 },
+    { (void*)ray_like_fn,            2, 3 }, { (void*)ray_str_find_fn,        2, 1 },
     { (void*)ray_within_fn,          2, 1 },
     { (void*)ray_upper_fn,           1, 1 }, { (void*)ray_lower_fn,           1, 1 },
     { (void*)ray_trim_fn,            1, 1 }, { (void*)ray_substr_fn,          3, 1 },

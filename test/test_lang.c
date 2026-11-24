@@ -917,6 +917,54 @@ static test_result_t test_closure_tmpl_live_entry_own_nfo(void) {
     PASS();
 }
 
+/* ---- #1615: a like pattern's dropped plan-time error leaves no trace ----
+ * A pattern computed from no column is evaluated once when the query is
+ * planned; when that raises, the error is dropped and the pattern keeps its
+ * deferred route.  A select that keeps no row then answers no rows, and the
+ * thread's last-error message and usage, the VM's trace and its pending
+ * raise are what they were before the select. */
+static test_result_t test_like_pattern_probe_leaves_no_trace(void) {
+    ray_t* r = ray_eval_str("(set T1615 (table [t v] (list (as 'STR (list \"ab\" \"cd\")) [0 1])))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    static const char* const qs[] = {
+        "(select {k: (like t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (ilike t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (sum (like t (take \"a*\" \"bad\"))) by: v from: T1615 where: (< v 0)})",
+        "(select {k: (if (> v 5) (like t (take \"a*\" \"bad\")) false) from: T1615 where: (< v 0)})",
+    };
+    for (int before = 0; before < 2; before++) {
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            ray_error_clear();
+            const char* prior = NULL;
+            if (before) {          /* an earlier error's message stays the last one */
+                r = ray_eval_str("(+ 1 'a)");
+                TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+                ray_error_free(r);
+                prior = ray_error_msg();
+                TEST_ASSERT_NOT_NULL(prior);
+            }
+            char saved[256] = "";
+            if (prior) snprintf(saved, sizeof saved, "%s", prior);
+            const char* usage0 = ray_error_usage();
+            ray_t* trace0 = __VM->trace;
+            ray_t* raise0 = __VM->raise_val;
+            r = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 0,
+                            "query %zu: not an empty table", i);
+            ray_release(r);
+            const char* now = ray_error_msg();
+            TEST_ASSERT_FMT(before ? (now && strcmp(now, saved) == 0) : now == NULL,
+                            "query %zu: last message %s", i, now ? now : "<none>");
+            TEST_ASSERT_FMT(ray_error_usage() == usage0, "query %zu: usage changed", i);
+            TEST_ASSERT_FMT(__VM->trace == trace0, "query %zu: trace changed", i);
+            TEST_ASSERT_FMT(__VM->raise_val == raise0, "query %zu: pending raise changed", i);
+        }
+    }
+    ray_error_clear();
+    PASS();
+}
+
 /* ---- Test: a script file's request sweeps the entries it made (#1539) ----
  * A file run as a request (ray_repl_run_file, as the command line runs it)
  * ends with its text released, as a ray_eval_str request does, and the
@@ -15085,6 +15133,7 @@ static test_result_t test_sym_private_range(void) {
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/query/like_pattern_probe_leaves_no_trace", test_like_pattern_probe_leaves_no_trace, lang_setup, lang_teardown },
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },

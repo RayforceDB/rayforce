@@ -589,7 +589,7 @@ String functions are available as direct builtins. The transform functions are l
 | `trim` | unary | lazy/DAG | Strip leading/trailing whitespace | `(trim "  abc  ")` → `"abc"` |
 | `substr` | variadic | lazy/DAG | Substring by 1-based start and length; 0 clamps to start | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | lazy/DAG | Replace all occurrences of a string/symbol atom. An empty `to` deletes each match; an empty `from` matches nothing and returns the input | `(replace "a-b" "-" "_")` → `"a_b"` |
-| `like` | binary | — | Glob-style pattern match (* and ? wildcards) | `(like "hello" "hel*")` → `true` |
+| `like` | binary | — | Glob-style pattern match (* and ? wildcards). The pattern is a string atom, or a string column matched row by row (`(like t pat)`); a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `sym-name` | unary | — | Resolve integer sym IDs to symbols (passthrough for sym atoms) | `(sym-name 0)` → sym at ID 0 |
 
 ```lisp
