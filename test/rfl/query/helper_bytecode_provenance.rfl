@@ -151,9 +151,9 @@ CNT -- 3
 (set ht (fn [v] (try (+ v 's) (fn [e] v))))
 (at (update {r: (concat (ht s) "!") from: T}) 'r) -- ['a! 'b! 'c!]
 (at (select {from: T where: (in (concat (ht s) "!") ['a! 'c!])}) 'x) -- [1 3]
-;; A null operand follows the kernel's null rule row by row too.
+;; A null operand is empty text row by row too (#1584).
 (set T4 (table [x s] (list [1 2 3 4] (as 'SYM ["a" "" "c" "d"]))))
-(at (select {r: (concat s "") e: (reverse x) from: T4}) 'r) -- (as 'SYM ["" "" "" ""])
+(at (select {r: (concat s "") e: (reverse x) from: T4}) 'r) -- (as 'SYM ["a" "" "c" "d"])
 ;; An opaque by: key sees the rows where: keeps, is named like a planned
 ;; key, and a body with a condition over one value runs row by row.
 (set TB (table [v g] (list [1 2 3 10 20 30] ['a 'a 'b 'b 'c 'c])))
@@ -234,11 +234,11 @@ OUT4 -- ['p 'q 'r 'a 'b 'c]
 (set hifl (fn [v] (let m (if (> (count v) 0) (min v) 0)) (- v m)))
 (at (select {n: (count v) by: (hifl v) from: TB}) 'v) -- [0 1 2 9 19 29]
 (at (select {n: (count v) by: ((fn [v] (let m (min v)) (- v m)) v) from: TB}) 'v) -- [0 1 2 9 19 29]
-;; A null STR literal nulls the row on both paths; a null cell in a compiled
-;; helper is empty text; return ends the lambda with its value (so the
+;; A null STR literal is empty text on both paths, as a null cell in a
+;; compiled helper is (#1584); return ends the lambda with its value (so the
 ;; concat around it never runs) and passes the value's provenance through.
 (set TS2 (table [x t] (list [1 2] (list "a" "b"))))
-(at (select {r: (concat t "") e: (reverse x) from: TS2}) 'r) -- (as 'STR ["" ""])
+(at (select {r: (concat t "") e: (reverse x) from: TS2}) 'r) -- (as 'STR ["a" "b"])
 (set hz (fn [v] 1 (concat v 'zz)))
 (at (select {r: (hz s) e: (reverse x) from: T4}) 'r) -- ['azz 'zz 'czz 'dzz]
 (at (select {r: ((fn [v] 1 (concat (return v) "!")) s) e: (reverse x) from: T}) 'r) -- ['a 'b 'c]

@@ -1774,12 +1774,11 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
 
 /* Shared text kernel. Consumes one reference to each argument.  A STR
  * vector makes the result STR; `str_out` says a STR atom does too (a cell
- * of a STR column read row by row). */
-/* `cells[a]` (one flag per argument, or NULL for none): argument a is a
- * cell of the query's rows (a column's element, or a text column reduced to
- * one value by first/last/min/max), so a null there is empty text, as the
- * vector kernel reads a null element; a null literal operand nulls the row. */
-static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out, const uint8_t* cells) {
+ * of a STR column read row by row).  The STR null "" and the SYM null are
+ * empty text wherever they come from (a column's cell, a reduced cell or a
+ * literal), as the eager (concat "" "a") is "a" (#1584): no operand nulls
+ * the row. */
+static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
     /* Only atoms broadcast. A one-row vector is still a vector, and an
      * empty vector must never be indexed as if it contained row zero. */
     int64_t nrows = 1;
@@ -1803,24 +1802,6 @@ static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out, const u
     int64_t* dst = out_str ? NULL : (int64_t*)ray_data(result);
 
     for (int64_t r = 0; r < nrows; r++) {
-        /* Check if any arg is null at this row */
-        bool any_null = false;
-        for (int a = 0; a < n_args; a++) {
-            /* SYM atoms can be null (sym 0); STR/SYM vecs cannot.  A null
-             * cell (cells[a]) reads as empty text below. */
-            if (!(cells && cells[a]) && ray_is_atom(args[a]) && RAY_ATOM_IS_NULL(args[a])) { any_null = true; break; }
-        }
-        if (any_null) {
-            if (out_str) {
-                result = ray_str_vec_append(result, "", 0);
-                if (RAY_IS_ERR(result)) break;
-                ray_vec_set_null(result, result->len - 1, true);
-            } else {
-                dst[r] = 0;
-                ray_vec_set_null(result, r, true);
-            }
-            continue;
-        }
         /* Pre-scan to compute total concat length for this row */
         size_t total = 0;
         for (int a = 0; a < n_args; a++) {
@@ -1934,38 +1915,32 @@ ray_t* exec_concat(ray_graph_t* g, ray_op_t* op) {
     }
 
     /* An operand that reduces a text column to one value (first, last, min,
-     * max) is a cell of the rows: a null there is empty text, and a cell of
-     * a STR column makes the result STR, as a STR column itself does.  One
-     * flag per operand, at every position (up to 255 of them). */
-    uint8_t cells[256] = { 0 };
+     * max) is a cell of the rows: a cell of a STR column makes the result
+     * STR, as a STR column itself does, at every operand position. */
     bool str_out = false;
     for (int i = 0; i < n_args; i++) {
         ray_op_t* child = i < 2 ? op_child(g, op, i) : &g->nodes[trail[i - 2]];
         if (child && (child->opcode == OP_FIRST || child->opcode == OP_LAST ||
-                      child->opcode == OP_MIN || child->opcode == OP_MAX)) {
-            cells[i] = 1;
-            if (child->out_type == RAY_STR) str_out = true;
-        }
+                      child->opcode == OP_MIN || child->opcode == OP_MAX) &&
+            child->out_type == RAY_STR)
+            str_out = true;
     }
-    ray_t* result = concat_text_values(args, n_args, str_out, cells);
+    ray_t* result = concat_text_values(args, n_args, str_out);
     scratch_free(args_hdr);
     return result;
 }
 
 /* Query fallback uses the same text kernel after checking argument syntax.
  * Ordinary builtin calls retain collection semantics. */
-ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
+ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out) {
     bool atoms = ray_is_atom(a) && ray_is_atom(b);
-    /* A null cell of a column is empty text, as the vector kernel reads a
-     * null element; a null literal operand follows the kernel's null rule. */
+    /* A null operand, cell or literal, is empty text (#1584). */
     bool a_null = RAY_ATOM_IS_NULL(a), b_null = RAY_ATOM_IS_NULL(b);
-    /* Two STR literals join as strings, as the planner folds them; a STR
-     * cell beside a null literal follows the kernel's null rule. */
-    if (a->type == -RAY_STR && b->type == -RAY_STR && (rows_mask == 0 || (!a_null && !b_null)))
+    /* Two STR atoms join as strings, as the planner folds them. */
+    if (a->type == -RAY_STR && b->type == -RAY_STR)
         return ray_concat_fn(a, b);
     if (atoms && (a->type == -RAY_SYM || a->type == -RAY_STR) &&
-        (b->type == -RAY_SYM || b->type == -RAY_STR) &&
-        (!a_null || (rows_mask & 1)) && (!b_null || (rows_mask & 2))) {
+        (b->type == -RAY_SYM || b->type == -RAY_STR)) {
         /* Two cells, the row-by-row case: build the atom directly rather
          * than a one-row vector that is unpacked again. */
         ray_t* sa = a->type == -RAY_SYM && !a_null ? ray_sym_str(a->i64) : NULL;
@@ -1995,10 +1970,9 @@ ray_t* ray_concat_text_fn(ray_t* a, ray_t* b, bool str_out, uint8_t rows_mask) {
         return out;
     }
     ray_t* args[2] = { a, b };
-    uint8_t cells[2] = { (uint8_t)(rows_mask & 1), (uint8_t)((rows_mask >> 1) & 1) };
     ray_retain(a);
     ray_retain(b);
-    ray_t* result = concat_text_values(args, 2, str_out, cells);
+    ray_t* result = concat_text_values(args, 2, str_out);
     if (!atoms || !result || RAY_IS_ERR(result)) return result;
     int allocated = 0;
     ray_t* atom = collection_elem(result, 0, &allocated);
