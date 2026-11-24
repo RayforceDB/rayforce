@@ -15523,6 +15523,121 @@ static inline int64_t rgid_mk_cell(const rgid_probe_mk_ctx_t* x, int k, int64_t 
         return (int64_t)ray_str_t_hash(&x->sdesc[k][r], x->spool[k]);
     return key_read_i64(x->key_data[k], r, x->key_type[k], x->key_attrs[k]);
 }
+
+/* ── parallel build of the group → gid table ──────────────────────────
+ * The result's groups were hashed into the gid table one at a time: at
+ * 2M composite groups the serial loop, random writes over a 64 MB table,
+ * took longer than the grouping itself (156 ms against 43 at 24 workers).
+ * The groups' key tuples are laid out in gk[] first (rgid_gk_fill_fn for
+ * the composite key); then each task inserts a range of groups, claiming
+ * a slot by CAS on its gid word.  A taken slot is compared through gk,
+ * complete before the dispatch, so no slot waits on another writer, and
+ * the single-key probe's key array is written by the claimant alone.  Two
+ * groups with one tuple (a grouping result has none) keep the lowest gid,
+ * as the serial loop kept the first.  A cancel leaves groups uninserted:
+ * the callers check pool_cancelled after the probe that follows. */
+#define RGID_PAR_GROUPS 65536   /* fewer groups: one task */
+
+typedef struct {
+    const int64_t* gk;        /* [n_groups * nk] key tuples */
+    int            nk;
+    uint64_t       mask;
+    int32_t*       gid32;     /* one of these: gid + 1, 0 = empty */
+    int64_t*       gid64;
+    int64_t*       keys;      /* single key: the slot's key, read by the probe (NULL: composite) */
+    const int8_t*  ktype;     /* composite: [nk] key types (NULL: no STR key) */
+    const ray_str_t* const* gdesc;   /* [nk] a STR key's group descriptors */
+    const char* const*      gpool;   /* [nk] and their pools */
+} rgid_insert_ctx_t;
+
+typedef struct {
+    ray_t* const*  grp;       /* [nk] result key columns */
+    int            nk;
+    int64_t*       gk;
+    const int8_t*  ktype;     /* [nk]: a STR key's tuple cell is its hash */
+    const ray_str_t* const* gdesc;
+    const char* const*      gpool;
+} rgid_gk_fill_ctx_t;
+
+static void rgid_gk_fill_fn(void* ctx_, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const rgid_gk_fill_ctx_t* c = (const rgid_gk_fill_ctx_t*)ctx_;
+    for (int64_t gi = start; gi < end; gi++)
+        for (int k = 0; k < c->nk; k++)
+            c->gk[gi * c->nk + k] = c->ktype && c->ktype[k] == RAY_STR
+                ? (int64_t)ray_str_t_hash(&c->gdesc[k][gi], c->gpool[k])
+                : key_read_i64(ray_data(c->grp[k]), gi, c->grp[k]->type, c->grp[k]->attrs);
+}
+
+/* the hash the matching probe computes: rgid_probe_fn's for one key,
+ * rgid_mk_probe_row's for a tuple */
+static inline uint64_t rgid_insert_hash(const int64_t* t, int nk) {
+    if (nk == 1) {
+        uint64_t h = (uint64_t)t[0] * 0x9E3779B97F4A7C15ULL;
+        return h ^ (h >> 33);
+    }
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (int k = 0; k < nk; k++) h = rgid_mk_hash_step(h, t[k]);
+    return h;
+}
+
+static inline int64_t rgid_slot_load(const rgid_insert_ctx_t* c, uint64_t s) {
+    return c->gid64 ? __atomic_load_n(&c->gid64[s], __ATOMIC_ACQUIRE)
+                    : (int64_t)__atomic_load_n(&c->gid32[s], __ATOMIC_ACQUIRE);
+}
+
+/* CAS the slot from *cur to v; on failure *cur is the slot's value */
+static inline bool rgid_slot_cas(const rgid_insert_ctx_t* c, uint64_t s, int64_t* cur, int64_t v) {
+    if (c->gid64)
+        return __atomic_compare_exchange_n(&c->gid64[s], cur, v, false,
+                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    int32_t c32 = (int32_t)*cur;
+    bool ok = __atomic_compare_exchange_n(&c->gid32[s], &c32, (int32_t)v, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    *cur = c32;
+    return ok;
+}
+
+static void rgid_insert_fn(void* ctx_, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const rgid_insert_ctx_t* c = (const rgid_insert_ctx_t*)ctx_;
+    int nk = c->nk;
+    for (int64_t gi = start; gi < end; gi++) {
+        const int64_t* t = c->gk + gi * nk;
+        uint64_t s = rgid_insert_hash(t, nk) & c->mask;
+        int64_t mine = gi + 1;
+        for (;;) {
+            int64_t cur = rgid_slot_load(c, s);
+            if (cur == 0 && rgid_slot_cas(c, s, &cur, mine)) {
+                if (c->keys) c->keys[s] = t[0];
+                break;
+            }
+            const int64_t* u = c->gk + (cur - 1) * nk;
+            int k = 0;
+            for (; k < nk; k++) {
+                if (u[k] != t[k]) break;
+                /* a STR key's cell is its hash: equal hashes compare bytes */
+                if (c->ktype && c->ktype[k] == RAY_STR &&
+                    !ray_str_t_eq(&c->gdesc[k][cur - 1], c->gpool[k], &c->gdesc[k][gi], c->gpool[k])) break;
+            }
+            if (k == nk) {
+                while (cur > mine && !rgid_slot_cas(c, s, &cur, mine)) {}
+                break;
+            }
+            s = (s + 1) & c->mask;
+        }
+    }
+}
+
+/* insert n_groups tuples, on the pool when there are enough of them */
+static void rgid_insert_all(rgid_insert_ctx_t* c, int64_t n_groups) {
+    ray_pool_t* pool = ray_pool_get();
+    if (pool && ray_pool_par_dispatch_ok(pool, n_groups, RGID_PAR_GROUPS))
+        ray_pool_dispatch(pool, rgid_insert_fn, c, n_groups);
+    else
+        rgid_insert_fn(c, 0, 0, n_groups);
+}
+
 static inline int64_t rgid_mk_probe_row(const rgid_probe_mk_ctx_t* x, int64_t r) {
     uint64_t h = 0x9E3779B97F4A7C15ULL;
     for (int k = 0; k < x->nk; k++) h = rgid_mk_hash_step(h, rgid_mk_cell(x, k, r));
@@ -15721,30 +15836,21 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
         }
     }
     if (!err) {
-        for (int64_t gi = 0; gi < n_groups; gi++)
-            for (int k = 0; k < nk; k++)
-                gk[gi * nk + k] = ktype[k] == RAY_STR
-                    ? (int64_t)ray_str_t_hash(&gdesc[k][gi], gpool[k])
-                    : key_read_i64(ray_data(grp[k]), gi, grp[k]->type, grp[k]->attrs);
-        for (int64_t gi = 0; gi < n_groups; gi++) {
-            const int64_t* t = gk + gi * nk;
-            uint64_t h = 0x9E3779B97F4A7C15ULL;
-            for (int k = 0; k < nk; k++) h = rgid_mk_hash_step(h, t[k]);
-            uint64_t s = h & mask;
-            for (;;) {
-                int64_t cur = slot[s];
-                if (cur == 0) { slot[s] = gi + 1; break; }
-                const int64_t* u = gk + (cur - 1) * nk;
-                int k = 0;
-                for (; k < nk; k++) {
-                    if (u[k] != t[k]) break;
-                    if (ktype[k] == RAY_STR &&
-                        !ray_str_t_eq(&gdesc[k][cur - 1], gpool[k], &gdesc[k][gi], gpool[k])) break;
-                }
-                if (k == nk) break;   /* duplicate tuple — keep the first */
-                s = (s + 1) & mask;
-            }
-        }
+        /* the tuples, then the table, each on the pool when there are
+         * enough groups (rgid_gk_fill_fn, rgid_insert_fn) */
+        rgid_gk_fill_ctx_t fctx = { .grp = grp, .nk = nk, .gk = gk,
+                                     .ktype = ktype, .gdesc = gdesc, .gpool = gpool };
+        ray_pool_t* fpool = ray_pool_get();
+        if (fpool && ray_pool_par_dispatch_ok(fpool, n_groups, RGID_PAR_GROUPS))
+            ray_pool_dispatch(fpool, rgid_gk_fill_fn, &fctx, n_groups);
+        else
+            rgid_gk_fill_fn(&fctx, 0, 0, n_groups);
+        rgid_insert_ctx_t ictx = {
+            .gk = gk, .nk = nk, .mask = mask,
+            .gid32 = NULL, .gid64 = slot, .keys = NULL,
+            .ktype = ktype, .gdesc = gdesc, .gpool = gpool,
+        };
+        rgid_insert_all(&ictx, n_groups);
         rgid_probe_mk_ctx_t ctx = {
             .nk = nk, .key_data = kdata, .key_type = ktype, .key_attrs = kattr,
             .sdesc = sdesc, .spool = spool, .gdesc = gdesc, .gpool = gpool,
@@ -30864,8 +30970,9 @@ by_dict_done:
                 int64_t* pos     = (int64_t*)ray_data(pos_hdr);
 
                 /* Copy group key values from the (possibly sliced) result.
-                 * STR keys resolve via descriptors+pool below, not gk[]. */
-                if (okt != RAY_STR)
+                 * STR keys resolve via descriptors+pool below, not gk[];
+                 * a composite key lays its tuples out in rgid_build_multikey. */
+                if (okt != RAY_STR && mk_nk <= 1)
                     for (int64_t gi = 0; gi < n_groups; gi++)
                         KEY_READ(gk[gi], grp_key, gkt, gi);
 
@@ -31057,24 +31164,16 @@ by_dict_done:
                         }
                     }
 
-                    /* Insert (gk[gi] -> gi) into the hash. */
-                    for (int64_t gi = 0; gi < n_groups; gi++) {
-                        int64_t k = gk[gi];
-                        uint64_t h = (uint64_t)k * 0x9E3779B97F4A7C15ULL;
-                        h ^= h >> 33;
-                        uint64_t s = h & mask;
-                        for (;;) {
-                            int64_t cur_p1 = use_i64_gid ? hk_gid64[s]
-                                                         : (int64_t)hk_gid_p1[s];
-                            if (cur_p1 == 0) {
-                                if (use_i64_gid) hk_gid64[s] = gi + 1;
-                                else hk_gid_p1[s] = (int32_t)(gi + 1);
-                                hk_keys[s] = k;
-                                break;
-                            }
-                            if (hk_keys[s] == k) break; /* dup gk — keep first */
-                            s = (s + 1) & mask;
-                        }
+                    /* Insert (gk[gi] -> gi) into the hash, on the pool
+                     * above RGID_PAR_GROUPS groups (rgid_insert_fn). */
+                    {
+                        rgid_insert_ctx_t ictx = {
+                            .gk = gk, .nk = 1, .mask = mask,
+                            .gid32 = use_i64_gid ? NULL : hk_gid_p1,
+                            .gid64 = use_i64_gid ? hk_gid64 : NULL,
+                            .keys = hk_keys,
+                        };
+                        rgid_insert_all(&ictx, n_groups);
                     }
 
                     /* Probe each row to assign its gid.  Parallelise when

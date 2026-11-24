@@ -54,3 +54,71 @@
 (min [1 2] [1 2 3]) !- length
 (min 1 'a) !- type
 (max [1 2] [1 2 3]) !- length
+
+;; ── typed vectors run the one-pass kernel (fastmap_minmax) ──────────
+;; The LIST forms map cell by cell through the scalar builtins and are the
+;; oracle: a vector operand must answer exactly as its boxed twin.
+(min [3 0Nl 1 7] 2) -- (min (list 3 0Nl 1 7) 2)
+(max [3 0Nl 1 7] 2) -- (max (list 3 0Nl 1 7) 2)
+(min 2 [3 0Nl 1 7]) -- (min 2 (list 3 0Nl 1 7))
+(max 2 [3 0Nl 1 7]) -- (max 2 (list 3 0Nl 1 7))
+(min [3 0Nl 1 7] 2) -- [2 0Nl 1 2]
+(max [3 0Nl 1 7] 2) -- [3 2 2 7]
+;; a null atom: min is null everywhere, max is the vector
+(min [3 0Nl 1] 0Nl) -- (min (list 3 0Nl 1) 0Nl)
+(max [3 0Nl 1] 0Nl) -- (max (list 3 0Nl 1) 0Nl)
+(max [3 0Nl 1] 0Nl) -- [3 0Nl 1]
+;; two vectors
+(min [3 0Nl 1] [2 5 0Nl]) -- (min (list 3 0Nl 1) (list 2 5 0Nl))
+(max [3 0Nl 1] [2 5 0Nl]) -- (max (list 3 0Nl 1) (list 2 5 0Nl))
+(max [0Nl 0Nl] [0Nl 1]) -- [0Nl 1]
+(min [3 0Nl 1] [2 5 0Nl]) -- [2 0Nl 0Nl]
+;; widths promote as the atoms do, null included
+(min (as 'I32 [3 0N 1]) 2) -- (min (list (as 'I32 3) (as 'I32 0N) (as 'I32 1)) 2)
+(type (min (as 'I32 [3 0N 1]) 2)) -- 'I64
+(min (as 'I32 [3 0N 1]) 2) -- [2 0Nl 1]
+(max (as 'I16 [3 0N 1]) (as 'I32 [2 2 2])) -- (as 'I32 [3 2 2])
+(type (max (as 'I16 [3 0N 1]) (as 'I32 [2 2 2]))) -- 'I32
+(min (as 'I32 [3 0N 1]) (as 'I32 [2 5 0N])) -- (as 'I32 [2 0N 0N])
+(type (min (as 'I32 [3 1]) (as 'I32 [2 5]))) -- 'I32
+(max (as 'I16 [3 0N 1]) (as 'I16 2)) -- (as 'I16 [3 2 2])
+;; floats: a null (NaN) orders lowest; an integer side promotes to F64
+(min [1.5 0Nf 2.5] 2.0) -- (min (list 1.5 0Nf 2.5) 2.0)
+(max [1.5 0Nf 2.5] 2.0) -- (max (list 1.5 0Nf 2.5) 2.0)
+(min [1.5 0Nf 2.5] 2.0) -- [1.5 0Nf 2.0]
+(max [1.5 0Nf 2.5] 2.0) -- [2.0 2.0 2.5]
+(max [0Nf 0Nf] [0Nf 1.0]) -- [0Nf 1.0]
+(min [1.5 0Nf 2.5] 2) -- [1.5 0Nf 2.0]
+(max [1 0Nl 3] 2.5) -- (max (list 1 0Nl 3) 2.5)
+(max [1 0Nl 3] 2.5) -- [2.5 2.5 3.0]
+(min [1 0Nl 3] [0.5 2.5 0Nf]) -- (min (list 1 0Nl 3) (list 0.5 2.5 0Nf))
+(min [1 0Nl 3] [0.5 2.5 0Nf]) -- [0.5 0Nf 0Nf]
+;; temporals of one type
+(min (as 'DATE [8770 0N 8766]) (as 'DATE 8768)) -- (min (list (as 'DATE 8770) (as 'DATE 0N) (as 'DATE 8766)) (as 'DATE 8768))
+(max (as 'DATE [8770 0N 8766]) (as 'DATE 8768)) -- (as 'DATE [8770 8768 8768])
+(min (as 'DATE [8770 0N 8766]) (as 'DATE 8768)) -- (as 'DATE [8768 0N 8766])
+(max (as 'TIME [3723000 0N 10]) (as 'TIME 500)) -- (as 'TIME [3723000 500 500])
+(min (as 'TIMESTAMP [2024.01.02D09:30:00.000000000 0Np]) 2024.01.01D00:00:00.000000000) -- (enlist 2024.01.01D00:00:00.000000000 0Np)
+;; dates past the TIMESTAMP range order as their saturating atoms do
+;; (temporal_as_ns): every such date orders alike, so the left operand wins
+(min (as 'DATE [200000 300000]) (as 'DATE 300000)) -- (min (list (as 'DATE 200000) (as 'DATE 300000)) (as 'DATE 300000))
+(min (as 'DATE 300000) (as 'DATE [200000 300000])) -- (min (as 'DATE 300000) (list (as 'DATE 200000) (as 'DATE 300000)))
+(min (as 'DATE 300000) (as 'DATE [200000 300000])) -- (as 'DATE [300000 300000])
+;; the cell is null by its payload, whatever the vector's null flag says
+(min (til 3) 0Nl) -- [0Nl 0Nl 0Nl]
+(max (til 3) 0Nl) -- [0 1 2]
+;; an empty vector takes the promoted type, as before
+(type (min (as 'I32 []) 2)) -- 'I64
+;; a date against another type keeps the boxed route, and its error
+(min (as 'DATE [8770]) 5) !- type
+;; a 100 000-cell vector: the kernel's answer is the oracle's
+(set V (% (* (til 100000) 7919) 1000))
+(set W (- 500 V))
+(min V 300) -- (min (map (fn [x] x) V) 300)
+(max V W) -- (max (map (fn [x] x) V) (map (fn [x] x) W))
+;; the kernel runs well under the boxed map's time (one atom a cell)
+(set best (fn [f] (min (map (fn [i] (f)) (til 3)))))
+(set BIG (% (* (til 500000) 7919) 100000))
+(set BIGL (as 'LIST BIG))
+(< (* 4 (best (fn [] (timeit (min BIG 5))))) (best (fn [] (timeit (min BIGL 5))))) -- true
+(< (* 4 (best (fn [] (timeit (max BIG (- 100000 BIG)))))) (best (fn [] (timeit (max BIGL (- 100000 BIG)))))) -- true
