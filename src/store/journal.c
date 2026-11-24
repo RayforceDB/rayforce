@@ -588,6 +588,12 @@ static ray_err_t journal_replay_from(const char*           path,
         if (restricted)
             ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
                                 note ? note->len - 2 : 0);
+        /* A SYNC frame is an IPC request journaled as it arrived: its
+         * arguments get the literal-fallback mark the live request gave them
+         * (ray_ipc_mark_request_args), so a data list whose head names a
+         * global that is not a function is data on replay as it was live.
+         * A .log.write entry is an ASYNC frame, evaluated as written. */
+        if (hdr.msgtype == RAY_IPC_MSG_SYNC) ray_ipc_mark_request_args(msg);
         ray_restrict_save_t prev_restricted;
         ray_eval_restrict_enter(restricted, &prev_restricted);
         ray_t* result = eval_one(msg);

@@ -1356,6 +1356,120 @@ static test_result_t test_ipc_journal_path(void) {
     PASS();
 }
 
+/* ---- #1006: replay evaluates a journaled request as the live one did ----
+ * A live request's argument lists carry the literal-fallback mark: a list
+ * whose head does not resolve, or names a global that is not a function,
+ * arrives as data; a head naming a builtin is called.  Replaying the journal
+ * marks the arguments the same way, so it rebuilds the live state. */
+static ray_t* j1006_state(void) {
+    return ray_eval_str("(repr __j1006_state)");
+}
+
+/* With j1006_hook set, the boot also installs a `.ipc.on.sync` hook that
+ * counts its calls in __j1006_hits and evaluates the message. */
+static bool j1006_hook;
+
+static void j1006_boot(void) {
+    ray_t* b = ray_eval_str("(do (set __j1006_a 42) (set __j1006_state (list)) (set __j1006_hits 0)"
+                            " (set __j1006_upd (fn [m] (set __j1006_state (concat __j1006_state (list m)))"
+                            " (count __j1006_state))) 0)");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+    if (!j1006_hook) return;
+    b = ray_eval_str("(set .ipc.on.sync (fn [m] (set __j1006_hits (+ __j1006_hits 1)) (eval m)))");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+}
+
+static int64_t j1006_hits(void) {
+    ray_t* v = ray_eval_str("__j1006_hits");
+    int64_t n = v && !RAY_IS_ERR(v) && v->type == -RAY_I64 ? v->i64 : -1;
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+    return n;
+}
+
+static test_result_t j1006_run(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1006");
+    ipc_rm_journal(jbase);
+    j1006_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    /* a head bound to a global that is not a function, an unbound head, a
+     * head naming a builtin (called live: `in` gives false) */
+    static const char* const reqs[] = {
+        "(list '__j1006_upd (list '__j1006_a 1 \"s\"))",
+        "(list '__j1006_upd (list '__j1006_unbound 1 2))",
+        "(list '__j1006_upd (list 'in 1 2))",
+    };
+    bool sent = true;
+    for (int i = 0; i < 3; i++) {
+        ray_t* m = ray_eval_str(reqs[i]);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        ray_t* r = ray_ipc_send(h, m);
+        ray_release(m);
+        sent &= r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == i + 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    }
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1006_state();
+    int64_t live_hits = j1006_hits();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(sent);
+    TEST_ASSERT_EQ_I(live_hits, j1006_hook ? 3 : 0);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"__j1006_a\") 1 \"s\") (list (as 'SYM \"__j1006_unbound\") 1 2) false)");
+
+    /* recovery (-l): opening the journal replays it into a fresh state */
+    j1006_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* rec = j1006_state();
+    int64_t rec_hits = j1006_hits();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* .log.replay of the same file */
+    j1006_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay \"%s.log\")", jbase);
+    ray_t* rr = ray_eval_str(q);
+    if (rr && RAY_IS_ERR(rr)) ray_error_free(rr); else if (rr) ray_release(rr);
+    ray_t* rep = j1006_state();
+    int64_t rep_hits = j1006_hits();
+
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+    /* replay evaluates each journaled message directly: an installed
+     * `.ipc.on.sync` hook is not run, on either route */
+    TEST_ASSERT_EQ_I(rec_hits, 0);
+    TEST_ASSERT_EQ_I(rep_hits, 0);
+    TEST_ASSERT_TRUE(rec && !RAY_IS_ERR(rec) && rec->type == -RAY_STR);
+    TEST_ASSERT_TRUE(rep && !RAY_IS_ERR(rep) && rep->type == -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rec), ray_str_ptr(live));
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rep), ray_str_ptr(live));
+    ray_release(live);
+    ray_release(rec);
+    ray_release(rep);
+    PASS();
+}
+
+static test_result_t test_ipc_journal_replay_literal_args(void) {
+    j1006_hook = false;
+    return j1006_run();
+}
+
+/* With a `.ipc.on.sync` hook installed, live requests run through it and
+ * replay does not: the journaled message is evaluated directly, with the
+ * same argument marking, so a hook that evaluates its message rebuilds the
+ * same state, and the hook's own side effects are not replayed. */
+static test_result_t test_ipc_journal_replay_skips_sync_hook(void) {
+    j1006_hook = true;
+    test_result_t r = j1006_run();
+    j1006_hook = false;
+    return r;
+}
+
 /* ---- test_ipc_decompress_literal_overrun -------------------------------- */
 /*
  * Exercise the literal-block overrun guard in ray_ipc_decompress
@@ -3901,6 +4015,8 @@ const test_entry_t ipc_entries[] = {
     { "ipc/poll_handshake_version_mismatch", test_ipc_poll_handshake_version_mismatch, ipc_setup, ipc_teardown },
     { "ipc/send_large_compressible",    test_ipc_send_large_compressible,        ipc_setup, ipc_teardown },
     { "ipc/journal_path",               test_ipc_journal_path,                   ipc_setup, ipc_teardown },
+    { "ipc/journal_replay_literal_args", test_ipc_journal_replay_literal_args, ipc_setup, ipc_teardown },
+    { "ipc/journal_replay_skips_sync_hook", test_ipc_journal_replay_skips_sync_hook, ipc_setup, ipc_teardown },
     { "ipc/decompress_literal_overrun", test_ipc_decompress_literal_overrun,     ipc_setup, ipc_teardown },
     { "ipc/compress_small",             test_ipc_compress_small,                 ipc_setup, ipc_teardown },
     { "ipc/compress_incompressible",    test_ipc_compress_incompressible,        ipc_setup, ipc_teardown },
