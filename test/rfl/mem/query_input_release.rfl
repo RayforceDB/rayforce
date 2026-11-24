@@ -261,3 +261,34 @@
 (map (fn [p] (select {from: T2 where: (> rid 3) by: instrument n: (count (distinct v))})) (til 50))
 (count T2) -- 786
 (sum (at (select {from: T2 where: (> rid 3) by: instrument n: (count (distinct v))}) 'n)) -- 784
+
+;; A grouped aggregate over an expression decodes the columns the
+;; expression reads, not the table: over a compressed splayed table the
+;; column no clause names stays encoded ((.idx.info T 'z) 'materialized).
+;; Binding every column decoded the whole table for an aggregate that read
+;; one column of it.  The decodes kept for the next statement ((.sys.mem)
+;; 'decode-cache-bytes) count a STR decode with its pool, which .idx.info's
+;; raw_bytes also holds: slots and pool.
+(.sys.exec "rm -rf /tmp/rfl_deccache")
+(set Ndc 70000)
+(set Tdc (table [k d z s] (list (% (til Ndc) 977) (+ 2013.07.01 (% (til Ndc) 31)) (til Ndc) (concat "past the inline slot: " (as 'STR (% (* (til Ndc) 7919) 100003))))))
+(.db.splayed.set "/tmp/rfl_deccache/t/" Tdc {compress: true})
+(set Fdc (.db.splayed.get "/tmp/rfl_deccache/t/"))
+(at (.idx.info Fdc 'z) 'materialized) -- false
+(set rdc (select {from: Fdc by: k f: (min (dd d))}))
+(count rdc) -- 977
+(at rdc 'f) -- (at (select {from: Tdc by: k f: (min (dd d))}) 'f)
+(at (.idx.info Fdc 'z) 'materialized) -- false
+(at (.idx.info Fdc 's) 'materialized) -- false
+;; the STR decode is kept with its pool (texts past the 12-byte inline slot):
+;; the cache grows by at least raw_bytes, which is the slots and the pool
+(set cbdc (at (.sys.mem) 'decode-cache-bytes))
+(set rdc (select {from: Fdc by: k l: (max (strlen s))}))
+(at rdc 'l) -- (at (select {from: Tdc by: k l: (max (strlen s))}) 'l)
+(at (.idx.info Fdc 's) 'materialized) -- true
+(> (at (.idx.info Fdc 's) 'raw_bytes) (* 16 Ndc)) -- true
+(>= (- (at (.sys.mem) 'decode-cache-bytes) cbdc) (at (.idx.info Fdc 's) 'raw_bytes)) -- true
+(at (.idx.info Fdc 'z) 'materialized) -- false
+(set Fdc 0)
+(set rdc 0)
+(.sys.exec "rm -rf /tmp/rfl_deccache")

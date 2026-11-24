@@ -71,10 +71,29 @@ static void dec_unlink(ray_enccol_t* e) {   /* under the lock */
     atomic_store_explicit(&e->dec_listed, false, memory_order_release);
 }
 
-/* Bytes a kept decode frees when dropped: none while something else holds it. */
-static int64_t dec_bytes(ray_t* d) {
+/* Bytes a kept decode holds: none while something else holds it.  A STR
+ * decode's pool (allocated with the vector, freed with it) counts with its
+ * slots: a 100 M-row URL column is 1.6 GB of slots over 10 GB of pool.  A
+ * parted decode is a vector of its segments' plain columns, each held by
+ * its own segment's cache and by this vector: the segments count here while
+ * the parted decode holds them (rc 2), and under their own entries once it
+ * is dropped (rc 1), so each is counted once whichever holds it. */
+static int64_t dec_bytes(const ray_enccol_t* e) {
+    ray_t* d = e->decoded;
     if (!d || ray_atomic_load(&d->rc) > 1) return 0;
-    return (int64_t)ray_block_size(d);
+    int64_t b = (int64_t)ray_block_size(d);
+    if (e->kind == RAY_ENCCOL_PARTED) {
+        ray_t** segs = (ray_t**)ray_data(d);
+        ray_t** in = e->wrapper ? (ray_t**)ray_data(e->wrapper) : NULL;
+        for (int64_t i = 0; in && i < d->len; i++) {
+            if (!segs[i] || !in[i] || in[i]->type != RAY_ENCCOL) continue;   /* a plain segment is table data */
+            if (ray_atomic_load(&segs[i]->rc) == 2) b += (int64_t)ray_enccol_plain_bytes(segs[i]) + 32;
+        }
+        return b;
+    }
+    if (d->type == RAY_STR && d->str_pool && ray_atomic_load(&d->str_pool->rc) == 1)
+        b += (int64_t)ray_block_size(d->str_pool);
+    return b;
 }
 
 static void dec_note(ray_enccol_t* e) {
@@ -92,10 +111,15 @@ static void dec_note(ray_enccol_t* e) {
     dec_unlock();
 }
 
-int64_t ray_enccol_cache_bytes(void) {
+static int64_t dec_total_locked(void) {
     int64_t total = 0;
+    for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) total += dec_bytes(e);
+    return total;
+}
+
+int64_t ray_enccol_cache_bytes(void) {
     dec_lock();
-    for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) total += dec_bytes(e->decoded);
+    int64_t total = dec_total_locked();
     dec_unlock();
     return total;
 }
@@ -108,28 +132,43 @@ void ray_enccol_cache_trim(void) {
     if (atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) != 0) return;
     int64_t cap = wm / 4;
     dec_lock();
-    int64_t total = 0;
-    for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) total += dec_bytes(e->decoded);
+    int64_t total = dec_total_locked();
     while (total > cap) {
         ray_enccol_t* v = NULL;
         uint64_t vu = 0; int64_t vb = 0;
         for (ray_enccol_t* e = g_dec_head; e; e = e->dec_next) {
-            int64_t  b = dec_bytes(e->decoded);
+            int64_t  b = dec_bytes(e);
             if (b == 0) continue;
             uint64_t u = atomic_load_explicit(&e->dec_used, memory_order_relaxed);
             if (!v || u < vu || (u == vu && b > vb)) { v = e; vu = u; vb = b; }
         }
         if (!v) break;
         ray_t* d = v->decoded;
+        bool parted = v->kind == RAY_ENCCOL_PARTED;
         v->decoded = NULL;
         ray_enc_once_init(&v->once);          /* the next read decodes again */
         dec_unlink(v);
         ray_idx_lazy_forget(d);               /* a lazy hash goes with its object */
         ray_release(d);
-        total -= vb;
+        /* Releasing a parted decode moves its segments' bytes to their own
+         * entries: sum again then; otherwise the drop's bytes come off. */
+        total = parted ? dec_total_locked() : total - vb;
     }
     dec_unlock();
     (void)stmt;
+}
+
+void ray_enccol_test_cache_drop_all(void) {
+    dec_lock();
+    while (g_dec_head) {
+        ray_enccol_t* v = g_dec_head;
+        ray_t* d = v->decoded;
+        v->decoded = NULL;
+        ray_enc_once_init(&v->once);
+        dec_unlink(v);
+        if (d) { ray_idx_lazy_forget(d); ray_release(d); }
+    }
+    dec_unlock();
 }
 
 static void enccol_free(ray_enccol_t* e) {
@@ -2649,6 +2688,26 @@ void ray_enccol_test_kept_limit(int64_t bytes) {
     atomic_store_explicit(&g_kept_limit_test, bytes > 0 ? bytes : 0, memory_order_relaxed);
 }
 
+/* Generation-0 bytes a whole decode of the column occupies, from metadata:
+ * its elements and, for STR, the pool the decode allocates
+ * (hdr.str_pool_bytes: each STR_DICT entry once, spec "STR pool"); a parted
+ * column sums its segments (a plain segment as it is). */
+static double enc_decode_bytes(ray_t* encv) {
+    ray_enccol_t* e = ray_enccol_of(encv);
+    if (!e) return 0;
+    if (e->kind == RAY_ENCCOL_PARTED) {
+        double b = 0;
+        for (int64_t i = 0, ns = e->wrapper ? e->wrapper->len : 0; i < ns; i++) {
+            ray_t* s = ray_enccol_seg(encv, i);
+            if (s) b += s->type == RAY_ENCCOL ? enc_decode_bytes(s) : (double)ray_enccol_plain_bytes(s);
+        }
+        return b;
+    }
+    double b = (double)e->len * (double)ray_enccol_esz(e);
+    if (e->type == RAY_STR && !e->synthetic) b += (double)e->hdr.str_pool_bytes;
+    return b;
+}
+
 bool ray_enccol_decode_kept(ray_t* encv) {
     ray_enccol_t* e = ray_enccol_of(encv);
     if (!e) return true;
@@ -2658,7 +2717,7 @@ bool ray_enccol_decode_kept(ray_t* encv) {
         if (wm <= 0) return true;             /* no watermark keeps everything */
         cap = wm / 4;                         /* ray_enccol_cache_trim's budget */
     }
-    return (double)e->len * (double)ray_enccol_esz(e) <= (double)cap;
+    return enc_decode_bytes(encv) <= (double)cap;
 }
 
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv) {

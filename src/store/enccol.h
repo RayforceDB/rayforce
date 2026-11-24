@@ -265,7 +265,8 @@ ray_t* ray_enccol_materialize(ray_t* encv);
 ray_t* ray_enccol_decoded_peek(ray_t* encv);
 
 /* Whether a whole decode of the column would stay cached from one
- * statement to the next: its generation-0 bytes fit the budget
+ * statement to the next: its generation-0 bytes (a STR column's pool with
+ * its slots; a parted column's segments summed) fit the budget
  * ray_enccol_cache_trim keeps (a quarter of the anonymous watermark; no
  * watermark keeps everything).  A consumer that can read the column by
  * range does so when it would not: such a decode takes the column's whole
@@ -275,16 +276,21 @@ bool   ray_enccol_decode_kept(ray_t* encv);
 /* Test hook: a positive budget replaces the quarter of the watermark in
  * ray_enccol_decode_kept until reset to 0. */
 void   ray_enccol_test_kept_limit(int64_t bytes);
+/* Test hook: drop every kept decode, whatever holds it, before a test
+ * teardown destroys the heap: a column a failed test leaked stays listed,
+ * and its decode must not point into a destroyed heap. */
+void   ray_enccol_test_cache_drop_all(void);
 
 /* At a statement boundary: drop the whole-column decodes, least recently
  * asked for first, until those still kept fit a quarter of the anonymous
- * watermark.  A decode something else retains is neither counted nor
- * dropped (dropping it would free nothing and the next read would decode a
- * second copy).  Does nothing while an evaluation is on this thread's stack
+ * watermark.  A decode counts with what it holds: a STR decode's pool, a
+ * parted decode's segments.  A decode something else retains is neither
+ * counted nor dropped (dropping it would free nothing and the next read
+ * would decode a second copy).  Does nothing while an evaluation is on this thread's stack
  * (a request served from inside a statement's sync send) or a dispatch is in
  * flight, and without a watermark. */
 void   ray_enccol_cache_trim(void);
-/* Bytes of the whole-column decodes currently kept (test hook). */
+/* Bytes of the whole-column decodes currently kept ((.sys.mem) 'decode-cache-bytes). */
 int64_t ray_enccol_cache_bytes(void);
 
 /* Counters (spec "Instrumentation"); reset by tests.  decoded_bytes is
