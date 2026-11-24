@@ -949,14 +949,49 @@ static void heap_coalesce(ray_heap_t* h, ray_t* blk,
  * heap_add_pool implementation
  * -------------------------------------------------------------------------- */
 
-static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
-    if (h->pool_count >= RAY_MAX_POOLS) return false;
+/* The pools of a heap grow with it.  A heap holds at most RAY_MAX_POOLS
+ * pools, and with every pool the standard 32 MB that count was a ceiling of
+ * 16 GB of small blocks per heap, whatever RAM and disk had left: a query
+ * whose small blocks outgrew it (a boxed cell per row over 100M rows)
+ * spilled pool after pool and then failed a 16-byte allocation at the
+ * count, an `oom` with the disk half empty.  Now the first
+ * HEAP_POOL_GROW_EVERY pools are standard, the next that many twice the
+ * size, and so on for HEAP_POOL_GROW_MAX doublings (512 MB): the count then
+ * holds ~158 GB.  The doublings stop there because ray_pool_of finds a
+ * block's pool by walking 32 MB strides down to the header — up to 16 for
+ * a 512 MB pool, a fast path for the standard pool only — and because a
+ * pool past the watermark is a spill file of its size, preallocated.
+ * Nothing on the allocation or free path changes: the orders are read when
+ * a pool is added.  The test seam sets the count and the growth. */
+#define HEAP_POOL_GROW_EVERY 64u
+#define HEAP_POOL_GROW_MAX   4u
+static _Atomic(uint32_t) g_pool_max        = RAY_MAX_POOLS;
+static _Atomic(uint32_t) g_pool_grow_every = HEAP_POOL_GROW_EVERY;
+static _Atomic(uint32_t) g_pool_grow_max   = HEAP_POOL_GROW_MAX;
+#ifdef DEBUG
+void ray_heap_test_pool_growth(uint32_t max_pools, uint32_t grow_every, uint32_t grow_max) {
+    atomic_store_explicit(&g_pool_max, max_pools ? max_pools : RAY_MAX_POOLS, memory_order_relaxed);
+    atomic_store_explicit(&g_pool_grow_every, grow_every ? grow_every : HEAP_POOL_GROW_EVERY, memory_order_relaxed);
+    atomic_store_explicit(&g_pool_grow_max, grow_max == UINT32_MAX ? HEAP_POOL_GROW_MAX : grow_max, memory_order_relaxed);
+}
+#endif
+/* The order of the pool a heap of pool_count pools adds for a block of
+ * `order`: a block of a pool's own order or more takes a pool one order
+ * larger (its header and the block), a smaller one a standard pool grown by
+ * the heap's doublings so far. */
+static uint8_t heap_pool_order_for(const ray_heap_t* h, uint8_t order) {
+    if (order >= RAY_HEAP_POOL_ORDER) return (uint8_t)(order + 1);
+    uint32_t every = atomic_load_explicit(&g_pool_grow_every, memory_order_relaxed);
+    uint32_t k = h->pool_count / (every ? every : 1);
+    uint32_t cap = atomic_load_explicit(&g_pool_grow_max, memory_order_relaxed);
+    if (k > cap) k = cap;
+    return (uint8_t)(RAY_HEAP_POOL_ORDER + k);
+}
 
-    uint8_t pool_order;
-    if (order >= RAY_HEAP_POOL_ORDER)
-        pool_order = order + 1;  /* need one order larger for header + block */
-    else
-        pool_order = RAY_HEAP_POOL_ORDER;
+static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
+    if (h->pool_count >= atomic_load_explicit(&g_pool_max, memory_order_relaxed)) return false;
+
+    uint8_t pool_order = heap_pool_order_for(h, order);
 
     if (pool_order > RAY_HEAP_MAX_ORDER) return false;
     size_t pool_size = BSIZEOF(pool_order);

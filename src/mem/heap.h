@@ -194,6 +194,11 @@ ray_t*    ray_cow(ray_t* v);
 /* Test seam: ray_alloc on this thread returns NULL for `count` calls,
  * starting with the nth from now; nth 0 disarms. */
 void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+/* Test seam: the pools a heap may hold (0: RAY_MAX_POOLS), how many pools
+ * share a size before the next ones double (0: the default), and the most
+ * doublings (UINT32_MAX: the default; 0: standard pools only, the old
+ * ceiling).  See heap_add_pool. */
+void ray_heap_test_pool_growth(uint32_t max_pools, uint32_t grow_every, uint32_t grow_max);
 #endif
 
 /* ===== Memory Statistics ===== */
