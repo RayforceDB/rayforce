@@ -758,11 +758,12 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
 
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in the IPC model) before evaluation, so a crash mid-handler
-     * still leaves the message on disk for replay.  We write the raw
-     * inbound bytes — header + payload — verbatim, no decompression
-     * round-trip.  Async messages and responses are not logged, so
-     * background pings and result frames don't pollute the log.
-     * No-op when no journal is open or during in-progress replay.
+     * still leaves the message on disk for replay.  Async messages are
+     * logged too when the posts switch is on (--log-posts, .log.posts),
+     * and are left out by default.  We write the raw inbound bytes —
+     * header + payload — verbatim, no decompression round-trip.  Responses
+     * never reach here.  No-op when no journal is open or during
+     * in-progress replay.
      *
      * RAY_IPC_FLAG_RESTRICTED is captured into a LOCAL header copy:
      * we mark the persisted frame with the connection's restricted
@@ -781,9 +782,17 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     bool auto_journaled = false;
     bool have_pos = false;
     int64_t req_gen = 0, req_off = 0;
-    if (ray_journal_is_open() && hdr->msgtype == RAY_IPC_MSG_SYNC) {
+    if (ray_journal_is_open() &&
+        (hdr->msgtype == RAY_IPC_MSG_SYNC || ray_journal_posts())) {
         have_pos = ray_journal_position(&req_gen, &req_off);
+        /* With the posts switch on, an async request is journaled like a
+         * sync one (#1608): both are logged as a request frame (SYNC), which
+         * replay evaluates as the live request was; an ASYNC frame in the
+         * log stays a .log.write entry.  One frame per request, written
+         * before it is evaluated, so the log holds the requests in the
+         * order the server ran them. */
         ray_ipc_header_t log_hdr = *hdr;
+        log_hdr.msgtype = RAY_IPC_MSG_SYNC;
         if (ray_eval_get_restricted())
             log_hdr.flags |= RAY_IPC_FLAG_RESTRICTED;
         ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);

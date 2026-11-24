@@ -34,9 +34,11 @@
  *   3. Open <base>.log for append.
  *
  * After open, the IPC dispatch hook (eval_payload in core/ipc.c) calls
- * ray_journal_write_bytes() for every inbound sync message before
- * evaluating it.  Async messages and responses are not journaled,
- * journaling only the .z.ps stream.
+ * ray_journal_write_bytes() for every inbound sync request before
+ * evaluating it, and for every async request too when the posts switch is
+ * on (ray_journal_set_posts: --log-posts, .log.posts).  Both are written as
+ * a request frame (SYNC).  Responses are not journaled.  An ASYNC frame in
+ * the log is a .log.write entry.
  *
  * Replay is single-threaded by construction (it runs from main, before
  * the poll loop starts) so the module is intentionally not thread-safe;
@@ -90,6 +92,13 @@ bool ray_journal_is_open(void);
  * .log.replay): a builtin whose only effect is to take time (.time.sleep)
  * returns at once then, so a logged wait neither delays nor blocks it. */
 bool ray_journal_in_replay(void);
+
+/* The posts switch (#1608): when on, an open journal also records inbound
+ * async IPC requests (.ipc.post), as request frames replay evaluates like
+ * sync ones.  Off by default.  A process setting: opening, closing, rolling
+ * or purging a journal does not change it, and replay does not read it. */
+bool ray_journal_posts(void);
+void ray_journal_set_posts(bool on);
 
 /* Snapshot of the journal state, for introspection.  `open` is the same
  * answer as ray_journal_is_open(): a handle is present, not proof that the

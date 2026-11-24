@@ -1653,7 +1653,9 @@ ray_t* ray_qlog_fn(ray_t** args, int64_t n) {
 
 /* (.sys.querylog.enable [flag]) — toggle query-statistics logging.  No arg
  * flips the current state; 0 disables; non-zero enables.  Returns the new
- * state as i64 (0/1).  Restricted: it changes server-wide behaviour. */
+ * state as i64 (0/1).  Restricted: it changes server-wide behaviour.  A
+ * journaled call is a no-op during replay: replay must not change the live
+ * setting (-Q). */
 ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     bool on;
     if (n == 0) {
@@ -1664,6 +1666,7 @@ ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n) {
     } else {
         return ray_error("domain", ".sys.querylog.enable takes 0 or 1 arguments");
     }
+    if (ray_journal_in_replay()) on = ray_qlog_enabled();
     ray_qlog_set_enabled(on);
     return make_i64(on ? 1 : 0);
 }
@@ -1887,6 +1890,8 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-U") == 0 && i + 1 < argc) i++;   /* skip secret */
         else if ((strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "-L") == 0) && i + 1 < argc)
             log = argv[++i];
+        else if (strcmp(argv[i], "--log-posts") == 0 && i + 1 < argc)
+            i++;   /* journal setting: read it with (.log.status) */
         else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) && i + 1 < argc)
             i++;   /* RAM budget is configured by the launcher, not exposed here */
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { /* ignore */ }

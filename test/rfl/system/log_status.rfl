@@ -1,11 +1,22 @@
 ;; (.log.status) at top level, no journal open: the dict is returned, never
 ;; an error.
 (type (.log.status)) -- 'DICT
-(count (.log.status)) -- 6
-(key (.log.status)) -- [open opened_ok path mode bytes auto]
+(count (.log.status)) -- 7
+(key (.log.status)) -- [open opened_ok path mode bytes auto posts]
 (get (.log.status) 'open) -- false
 (get (.log.status) 'bytes) -- 0
 (get (.log.status) 'auto) -- false
+;; the posts switch (#1608): off by default, set with .log.posts, which
+;; reads it with no argument
+(get (.log.status) 'posts) -- false
+(.log.posts) -- 0
+(.log.posts 1) -- 1
+(get (.log.status) 'posts) -- true
+(.log.posts) -- 1
+(.log.posts 0) -- 0
+(get (.log.status) 'posts) -- false
+(.log.posts "1") !- type
+(.log.posts 1 2) !- domain
 ;; opened_ok, path and mode describe the last successful open; the test
 ;; runner shares one process with the journal tests, so they are not pinned
 ;; here (test_journal.c covers the never-opened, failed-open and opened
