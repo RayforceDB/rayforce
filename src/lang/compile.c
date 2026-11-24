@@ -28,6 +28,7 @@
 #include "table/sym.h"   /* ray_read_sym — capture names */
 #include "table/dict.h"  /* ray_dict_probe_sym_borrowed — captured heads */
 #include "core/block.h"  /* ray_block_size — a literal's weight */
+#include "core/platform.h"  /* ray_thread_stack_bounds — the depth guard */
 #include <stdbool.h>
 #include <string.h>
 
@@ -932,7 +933,8 @@ static bool compile_dotted_local(compiler_t *c, ray_t *ast) {
  * every local of every arm: a single compile_list took 4.7 KB per level
  * under ASan, so an if chain nested within the 2048-level depth guard
  * overflowed an 8 MB stack.  Split, each nesting level carries only the
- * frame of the arm it passes through. */
+ * frame of the arm it passes through, and the guard in compile_expr also
+ * stops short of the end of the thread's stack, whatever a level costs. */
 static void compile_list(compiler_t *c, ray_t *ast) {
     if (c->error) return;
     EMIT_DBG(c, ast);
@@ -970,10 +972,53 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 }
 
 /* ── Compile expression ── */
+/* The compiler recurses once per nesting level, and what a level costs in
+ * C stack is the build's choice, not ours: about 160 B optimized, over 4 KB
+ * in an unoptimized sanitizer build, where 2048 levels need more than an
+ * 8 MB main stack.  A thread may also run on a stack far smaller than the
+ * main thread's (an IPC hook's, an embedder's).  So the guard is two
+ * bounds: at most 2048 levels, and never closer to the end of this
+ * thread's stack than its reserve (a sixteenth of it, between 64 KB and
+ * 512 KB), which leaves the leaf calls below a level, and the tree walker
+ * that then runs the body, their room.  The bound is read once per thread.
+ * A body past either is left to the tree walker. */
+#define COMPILE_MAX_DEPTH 2048
+static _Thread_local uintptr_t g_compile_stack_floor;   /* 0: no bound known */
+static _Thread_local bool      g_compile_stack_read;
+static uintptr_t compile_stack_floor(void) {
+    if (RAY_LIKELY(g_compile_stack_read)) return g_compile_stack_floor;
+    g_compile_stack_read = true;
+    uintptr_t lo, hi;
+    if (!ray_thread_stack_bounds(&lo, &hi)) return 0;
+    uintptr_t size = hi - lo, reserve = size / 16;
+    if (reserve < ((uintptr_t)64 << 10)) reserve = (uintptr_t)64 << 10;
+    if (reserve > ((uintptr_t)512 << 10)) reserve = (uintptr_t)512 << 10;
+    if (reserve > size / 4) reserve = size / 4;
+    g_compile_stack_floor = lo + reserve;
+    return g_compile_stack_floor;
+}
+static inline uintptr_t compile_stack_pos(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    /* The frame itself: a local's address may lie on a sanitizer's fake
+     * stack, which is not the thread's. */
+    return (uintptr_t)__builtin_frame_address(0);
+#else
+    volatile char here = 0;
+    return (uintptr_t)&here;
+#endif
+}
+/* True once this thread's stack is down to its reserve.  The capture walk
+ * (ast_collect_syms_at) recurses per level too and gives up here as well. */
+static bool compile_stack_short(void) {
+    uintptr_t floor = compile_stack_floor();
+    return floor && compile_stack_pos() < floor;
+}
 static void compile_expr_at(compiler_t *c, ray_t *ast);
 static void compile_expr(compiler_t *c, ray_t *ast) {
     if (c->error) return;
-    if (++c->depth > 2048) { c->error = true; c->depth--; return; }
+    if (++c->depth > COMPILE_MAX_DEPTH || compile_stack_short()) {
+        c->error = true; c->depth--; return;
+    }
     compile_expr_at(c, ast);
     c->depth--;
 }
@@ -1147,14 +1192,15 @@ static int64_t ast_node_bytes(ray_t *v, int64_t cap) {
 
 /* `weight` accumulates the bytes the text holds (ast_node_bytes of every
  * node), so a literal built around a large constant, a long string
- * included, is not kept in a template table; nesting past 1024 levels is
- * given up on (the literal then has no template and compiles when called). */
+ * included, is not kept in a template table; nesting past 1024 levels, or
+ * past what the thread's stack has left (compile_stack_short), is given up
+ * on (the literal then has no template and compiles when called). */
 /* `stop`: the walk serves only the template table, which will not keep a
  * literal past its bound, so it gives up (false) once the weight passes it. */
 static bool ast_collect_syms_at(ray_t *ast, ray_t **out, bool *dynamic, int depth, int64_t *weight,
                                 bool stop, int64_t *nodes) {
     if (!ast || !*out) return false;
-    if (depth > 1024) return false;
+    if (depth > 1024 || compile_stack_short()) return false;
     if (nodes && --*nodes < 0) return false;
     /* Past the template bound the exact weight does not matter. */
     *weight += ast_node_bytes(ast, RAY_CLOSURE_TMPL_MAX_BYTES - *weight);

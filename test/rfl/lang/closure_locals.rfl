@@ -438,8 +438,10 @@ r6 -- [6 3]
 ;; nested if's shows which engine ran: the compiled body runs it as jumps and
 ;; returns the parameter, the tree walker recurses per level and stops at its
 ;; depth limit (512). 2500 is past the guard yet within the bytecode jump
-;; range, so the shape pins the guard; the depths stay well within what
-;; every platform's sanitizer build builds and releases
+;; range, so the shape pins the guard. the guard also stops short of the end
+;; of the thread's stack, which an unoptimized sanitizer build reaches before
+;; 2048 levels (over 4 KB a level), so the depths that must compile stay at
+;; 1500 or below, which every platform's sanitizer build compiles
 (set wrapI (fn [inner] (concat (take (parse "(if true 0)") 2) (enlist inner))))
 (set buildI (fn [n] (let a (parse "x")) (times n (let a (wrapI a))) a))
 (set mkI (fn [n] (eval (concat (take (parse "(fn [x] 0)") 2) (enlist (buildI n))))))
@@ -456,7 +458,7 @@ r6 -- [6 3]
 (set kd 5000)
 (((mkK 600) 100) 1) -- 101
 (((mkK 1100) 100) 1) -- 101
-(((mkK 2000) 100) 1) -- 101
+(((mkK 1500) 100) 1) -- 101
 (((mkK 2500) 100) 1) !- limit
 ;; closures made from one literal match by capture set in either order
 (set mkd2 (fn [flag k] (if false (set 1 2)) (if flag (let extra2 1)) (fn [] (list k (try extra2 'none)))))
