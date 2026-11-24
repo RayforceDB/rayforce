@@ -15,50 +15,115 @@
 ;; members of the same class: a pipe cannot be seeked, so it must be read
 ;; to EOF on every platform.
 ;;
-;; Paths carry the pid: this suite may run concurrently with another copy
-;; of itself on a shared runner, and a shared FIFO is worse than a shared
-;; file — `read` blocks in fopen until a writer appears, so a collision
-;; would hang rather than fail.
+;; Fixtures live outside the runner's per-worker /tmp root, in a fresh
+;; directory "${TMPDIR:-/tmp}/rf_read_eof.<pid>.XXXXXX" holding an owner
+;; file ".rf_read_eof.owner" with the line "read_until_eof <pid>".  Two
+;; copies of the suite never share one.  A worker the runner killed can
+;; leave its directory behind, so each run first removes a directory only
+;; when it carries that owner file, its pid matches the name, and `ps`
+;; finds no such process.  Anything else is left alone.
+;;
+;; A FIFO reader blocks in fopen until a writer opens the other end, so a
+;; writer that never opens it would hold the read until the runner's 600 s
+;; kill (issue #1643, seen once on a macOS CI leg).  Each FIFO case is
+;; bounded and owns its helpers:
+;;
+;;  - the writer leaves a marker before it opens the FIFO, and the test
+;;    waits up to 10 s for it, so a writer that never started is named;
+;;  - a watchdog polls once a second.  If the test process is gone it kills
+;;    the writer and removes the whole directory.  After 20 s it holds the
+;;    FIFO open read-write for a second, which releases a reader stuck in
+;;    fopen with EOF, then removes the FIFO;
+;;  - both pids are recorded, and the test kills both with their children
+;;    as soon as the read returns.
+;;
+;; Recorded pids can outlive their process.  The helpers cannot stay
+;; children of the test (`.sys.exec` waits for its shell, so they are
+;; detached and reparented), so a parent check is not available.  Instead
+;; a recorded pid is signalled only while `ps` shows it running the launch
+;; command, whose text holds this run's unique directory: the helpers are
+;; subshells of that command and keep its arguments.  The pid is stopped,
+;; checked again, and only then killed with its children; a pid that has
+;; been reused by any other process fails the check and is not touched.
+;;
+;; Every result is collected first.  One cleanup step then reaps the
+;; helpers and removes the directory, and only after it do the assertions
+;; run, so a failing assertion anywhere leaves no process or file behind.
 
 ;; ────────────── pre-flight ──────────────
-(set d (format "/tmp/rf_read_eof_%" (get (.sys.info) 'pid)))
-(.sys.exec (format "rm -rf % && mkdir -p %" d d))
-(.sys.exec (format "printf 'hello world\\n' > %/ordinary.txt" d))
-(.sys.exec (format "printf '' > %/empty.txt" d))
-(.sys.exec (format "dd if=/dev/zero of=%/big.txt bs=1000 count=300 2>/dev/null" d))
+(set o (get (.sys.info) 'pid))
+(set sweep (.sys.exec "ps -p $$ >/dev/null 2>&1 || exit 1; for x in \"${TMPDIR:-/tmp}\"/rf_read_eof.*; do [ -d \"$x\" ] && [ -f \"$x/.rf_read_eof.owner\" ] || continue; read tag p < \"$x/.rf_read_eof.owner\"; [ \"$tag\" = read_until_eof ] || continue; case \"$p\" in ''|*[!0-9]*) continue;; esac; [ \"$(basename \"$x\" | cut -d. -f2)\" = \"$p\" ] || continue; ps -p \"$p\" >/dev/null 2>&1 && continue; rm -rf \"$x\"; done; true"))
+(set d (trim (at (.sys.exec (format "mktemp -d \"${TMPDIR:-/tmp}/rf_read_eof.%.XXXXXX\"" o) 'out) 'out)))
+(set mk (.sys.exec (format "[ -d % ] && echo 'read_until_eof %' > %/.rf_read_eof.owner && printf 'hello world\\n' > %/ordinary.txt && printf '' > %/empty.txt && dd if=/dev/zero of=%/big.txt bs=1000 count=300 2>/dev/null" d o d d d d)))
 
 ;; ────────────── ordinary files still behave ──────────────
-(read (format "%/ordinary.txt" d))                 -- "hello world\n"
-(count (read-bytes (format "%/ordinary.txt" d)))   -- 12
-
+(set r_ord   (try (read (format "%/ordinary.txt" d)) (fn [e] 'io-rejected)))
+(set n_ord   (try (count (read-bytes (format "%/ordinary.txt" d))) (fn [e] -1)))
 ;; A genuinely empty file is still "" — the fix must not turn absence of
 ;; content into an error.
-(read (format "%/empty.txt" d))                    -- ""
-(count (read-bytes (format "%/empty.txt" d)))      -- 0
-
+(set r_empty (try (read (format "%/empty.txt" d)) (fn [e] 'io-rejected)))
+(set n_empty (try (count (read-bytes (format "%/empty.txt" d))) (fn [e] -1)))
 ;; Sized file, larger than the unhinted starting buffer.  This takes the
 ;; single-allocation hinted path.
-(count (read (format "%/big.txt" d)))              -- 300000
-(count (read-bytes (format "%/big.txt" d)))        -- 300000
+(set n_big   (try (count (read (format "%/big.txt" d))) (fn [e] -1)))
+(set n_bigb  (try (count (read-bytes (format "%/big.txt" d))) (fn [e] -1)))
+
+;; ────────────── errors stay loud ──────────────
+(set e_read  (try (read (format "%/does-not-exist" d)) (fn [e] 'io-rejected)))
+(set e_bytes (try (read-bytes (format "%/does-not-exist" d)) (fn [e] 'io-rejected)))
+;; A directory is not readable as a file.
+(set e_dir   (try (read d) (fn [e] 'io-rejected)))
+
+;; ────────────── FIFO helpers ──────────────
+;; launch F W: make FIFO F, start the watchdog and the writer W, and
+;; record their pids in F.wd and F.wr.  Each helper ends in `exit 0`, so
+;; the shell keeps it a subshell instead of exec'ing its last command.
+(set launch (fn [f w] (.sys.exec (format "rm -f % %.started %.wd %.wr && mkfifo % && ((i=0; while [ $i -lt 20 ]; do ps -p % >/dev/null 2>&1 || { w=$(cat %.wr); ps -ww -o args= -p $w 2>/dev/null | grep -qF -- '%' && { pkill -P $w; kill -KILL $w; }; rm -rf %; exit 0; }; sleep 1; i=$((i+1)); done; sleep 1 1<>%; rm -f %; exit 0) >/dev/null 2>&1 & echo $! > %.wd) && ((touch %.started; %; exit 0) >/dev/null 2>&1 & echo $! > %.wr)" f f f f f o f d d f f f f w f))))
+;; started F: wait up to 10 s for the writer's marker F.started.
+(set started (fn [f] (.sys.exec (format "i=0; while [ ! -e %.started ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; [ -e %.started ]" f f))))
+;; reap F: for each recorded helper still running this run's launch
+;; command, stop it, check again, kill its children and then it.  Remove F
+;; with its bookkeeping files.
+(set reap (fn [f] (.sys.exec (format "own() { ps -ww -o args= -p $1 2>/dev/null | grep -qF -- '%'; }; for p in $(cat %.wd %.wr 2>/dev/null); do own $p || continue; kill -STOP $p; if own $p; then pkill -P $p; kill -KILL $p; else kill -CONT $p; fi; done 2>/dev/null; rm -f % %.started %.wd %.wr" d f f f f f f))))
 
 ;; ────────────── unsized streams: the growth loop ──────────────
 ;; A FIFO has no size, so it starts at 4096 and doubles.  120000 bytes
 ;; forces five doublings, exercising the grow/memcpy/release path that the
 ;; sized cases above never touch.
-(.sys.exec (format "rm -f %/fifo_big && mkfifo %/fifo_big" d d))
-(.sys.exec (format "(dd if=/dev/zero bs=1000 count=120 2>/dev/null > %/fifo_big &) ; sleep 0" d))
-(count (read-bytes (format "%/fifo_big" d)))       -- 120000
+(set fb (format "%/fifo_big" d))
+(set fb_launch (launch fb (format "dd if=/dev/zero bs=1000 count=120 2>/dev/null > %" fb)))
+(set fb_started (started fb))
+(set fb_n (try (count (read-bytes fb)) (fn [e] -1)))
+(set fb_reap (reap fb))
 
 ;; And the small case, asserting content rather than just length.
-(.sys.exec (format "rm -f %/fifo && mkfifo %/fifo" d d))
-(.sys.exec (format "(printf 'from-a-fifo\\n' > %/fifo &) ; sleep 0" d))
-(read (format "%/fifo" d))                         -- "from-a-fifo\n"
+(set fs (format "%/fifo" d))
+(set fs_launch (launch fs (format "printf 'from-a-fifo\\n' > %" fs)))
+(set fs_started (started fs))
+(set fs_s (try (read fs) (fn [e] 'io-rejected)))
+(set fs_reap (reap fs))
 
-;; ────────────── errors stay loud ──────────────
-(try (read (format "%/does-not-exist" d)) (fn [e] 'io-rejected))        -- 'io-rejected
-(try (read-bytes (format "%/does-not-exist" d)) (fn [e] 'io-rejected))  -- 'io-rejected
-;; A directory is not readable as a file.
-(try (read d) (fn [e] 'io-rejected))                                    -- 'io-rejected
+;; ────────────── cleanup: the one exit for every result ──────────────
+(set rm_d (.sys.exec (format "rm -rf %" d)))
 
-;; ────────────── cleanup ──────────────
-(.sys.exec (format "rm -rf %" d))
+;; ────────────── assertions ──────────────
+sweep                                              -- 0
+mk                                                 -- 0
+r_ord                                              -- "hello world\n"
+n_ord                                              -- 12
+r_empty                                            -- ""
+n_empty                                            -- 0
+n_big                                              -- 300000
+n_bigb                                             -- 300000
+e_read                                             -- 'io-rejected
+e_bytes                                            -- 'io-rejected
+e_dir                                              -- 'io-rejected
+fb_launch                                          -- 0
+fb_started                                         -- 0
+fb_n                                               -- 120000
+fb_reap                                            -- 0
+fs_launch                                          -- 0
+fs_started                                         -- 0
+fs_s                                               -- "from-a-fifo\n"
+fs_reap                                            -- 0
+rm_d                                               -- 0
