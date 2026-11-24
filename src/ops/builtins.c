@@ -2318,8 +2318,10 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_U8) { ray_retain(val); return val; }
         if (val->type == -RAY_BOOL) return ray_u8(val->b8 ? 1 : 0);
         if (val->type == -RAY_I16) return ray_u8((uint8_t)val->i16);
-        if (val->type == -RAY_I32) return ray_u8((uint8_t)val->i32);
-        if (val->type == -RAY_I64) return ray_u8((uint8_t)val->i64);
+        /* A temporal atom is its integer, as in the vector cast (#1589). */
+        if (val->type == -RAY_I32 || val->type == -RAY_DATE || val->type == -RAY_TIME)
+            return ray_u8((uint8_t)val->i32);
+        if (val->type == -RAY_I64 || val->type == -RAY_TIMESTAMP) return ray_u8((uint8_t)val->i64);
         if (val->type == -RAY_F64 || val->type == -RAY_F32) return ray_u8(ray_cast_f64_to_u8_null(val->f64));
         if (val->type == -RAY_STR) {
             const char* sp = ray_str_ptr(val);

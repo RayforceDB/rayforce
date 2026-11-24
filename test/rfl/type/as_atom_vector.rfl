@@ -1,0 +1,19 @@
+;; #1589: an atom casts as a vector of its type does.  A DATE, TIME or
+;; TIMESTAMP atom to U8 raised type where the vector cast gives the low
+;; byte of its integer, and the docs (guides/types.md, null semantics) cast
+;; a temporal null to 0x00 for atoms and vectors alike.
+(as 'U8 2024.01.02) -- 0x3f
+(as 'U8 2024.01.02) -- (at (as 'U8 [2024.01.02]) 0)
+(as 'U8 0Nd) -- 0x00
+(as 'U8 (as 'TIME 1000)) -- 0xe8
+(as 'U8 (as 'TIMESTAMP 1000)) -- 0xe8
+(as 'U8 (as 'DATE -1)) -- (at (as 'U8 (as 'DATE [-1])) 0)
+(as 'U8 (as 'TIMESTAMP -257)) -- (at (as 'U8 (as 'TIMESTAMP [-257])) 0)
+(as 'u8 (as 'TIME 86399999)) -- (at (as 'U8 (as 'TIME [86399999])) 0)
+;; every input type to every target: the vector cast equals its atoms' casts
+;; (the value, the null or the error code)
+(set V (list [true false] (as 'U8 [1 0]) (as 'I16 [1 0Nl]) (as 'I32 [-1 0Nl]) [300 0Nl] (as 'F32 [1.5 0Nl]) [-2.5 0Nf] (as 'DATE [300 0Nl]) (as 'TIME [1000 0Nl]) (as 'TIMESTAMP [-257 0Nl]) (guid 2) (as 'SYM ["a" ""]) ["1" ""] (as 'TIMESPAN [1 0Nl])))
+(set X (concat (map type V) ['BOOL]))
+(set R (fn [f] (try (f) (fn [e] (at e 'code)))))
+(set Split (fn [v] (sum (map (fn [x] (as 'I64 (not (identical (R (fn [] (as x v))) (R (fn [] (map (fn [a] (as x a)) v))))))) X))))
+(map Split V) -- [0 0 0 0 0 0 0 0 0 0 0 0 0 0]
