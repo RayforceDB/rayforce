@@ -181,6 +181,15 @@
 (map (fn [i] s1m) (til 1100)) !- limit
 (count (map (fn [i] s1m) (til 100))) -- 100
 (raze (take (list s1m) 1100)) !- limit
+;; and a vector or list held by several items (#1657): 300 references to
+;; an 8 MB vector would copy 2.4 GB again, with or without nulls, or as a
+;; list's cells; 10 are copied
+(set v8 (til 1000000))
+(raze (take (list v8) 300)) !- limit
+(raze (take (list (concat v8 0N)) 300)) !- limit
+(raze (take (list (as 'LIST (til 100000))) 3000)) !- limit
+(count (raze (take (list v8) 10))) -- 10000000
+(count (raze (list v8 v8 [1 2] 3 (list 4)))) -- 2000004
 (count (raze (take (list s1m) 100))) -- 100000000
 (in ["x" "c"] (take (list s1m) 100000)) -- [false false]
 (raze (list "ab\000" "c" "")) -- "abc"
