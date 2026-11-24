@@ -128,3 +128,15 @@ n -- 0
 (sum (deepV [true false true] 40)) -- 2
 (sum (deepV [true false true] 100)) !- limit
 (deepV true 150) -- 1
+
+;; ── where: predicates the planner leaves to the evaluator choose per row ────
+;; (the evaluator's if used to give every row the first arm: #1610, #1611, #1629)
+(set gw 0)
+(set effw (fn [c] (set gw (+ gw 1)) c))
+(at (select {from: T3 where: (== a (if (effw (== act 'New)) 'x 'y))}) 'i) -- [0 1 5]
+(set helpw (fn [c] (let r (if c 'x 'y)) r))
+(at (select {from: T3 where: (== a (helpw (== act 'New)))}) 'i) -- [0 1 5]
+(set recw (fn [c d] (if (== d 0) (if c 'x 'y) (recw c (- d 1)))))
+(at (select {from: T3 where: (== a (recw (== act 'New) 2))}) 'i) -- [0 1 5]
+(set U3 (table [k] (list ['x])))
+(at (select {from: T3 where: (== a (if (== act 'New) (first (at (select {k: k from: U3}) 'k)) 'y))}) 'i) -- [0 1 5]

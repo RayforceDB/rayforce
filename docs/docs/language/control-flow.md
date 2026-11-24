@@ -33,23 +33,9 @@ other result, are never evaluated:
 
 Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form; a chain without a fallback is left to the evaluator. This holds wherever the `if` sits in the expression: in an argument of a builtin call (`(== a (if c 'x 'y))`, `(not ...)`), of `and` and `or`, of `do`, in the value of a `let`, in the expression of a `try`, and in the body of a helper the planner inlines (a pure one-statement lambda). So `(and (> p 0) (== a (if c 'x 'y)))` compares each row with its own arm. These forms keep their own rules: `and` and `or` stop on a scalar that decides them, `do` evaluates in turn, and `try` hands an error raised anywhere in its expression, a mix of arm types included, to its handler for the whole column. Arguments are evaluated left to right, as outside a query, so a `let` in one binds for the arguments after it only: `(== a (let a (if c 'x 'y)))` compares the column with the new value, and `(== (let a (if c 'x 'y)) a)` compares the new value with itself.
 
-A few shapes leave the choice to the evaluator's own `if`, which cannot choose per row: it tests a condition vector whole. Inside a query, when such an `if` gets a condition over the query's rows (or a group's rows) that is true on some and false on others, it raises a `nyi` error rather than give every row its first arm:
+A `where:` predicate or a `by:` output that the planner leaves to the evaluator chooses per row as well, because the evaluator's `if` chooses per row for a boolean-vector condition (below). That covers a side effect in the expression (a lambda that sets a global, `set`, a `try` handler that raises), an `if` inside a helper the planner does not inline (several statements, a closure, recursion), a nested query in an arm or beside the `if` such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and a `by:` output where a `let` in one aggregate's argument binds a name the rest of the output also reads: that output is evaluated per group as written, and each group's `if` chooses per row within the group. A side effect in an arm runs once per evaluation, whatever the condition holds, since both arms are evaluated.
 
-```lisp
-‣ (select {from: t where: (H a act)})     ; H: a helper of two statements
-error: nyi: if: its condition differs between the query's rows, and on this route it is tested whole, not row by row; see Conditionals: if in language/control-flow.md
-```
-
-A condition true on every row takes the first arm, and one false on every row the fallback, as each row would. A vector that does not come from the rows (a global, a literal) is tested whole, as outside a query. The shapes are:
-
-- a side effect anywhere in a `where:` predicate: a lambda that sets a global, `set`, or a `try` handler that raises ([#1610](https://github.com/RayforceDB/rayforce/issues/1610));
-- an `if` inside a helper the planner does not inline: several statements, a closure, or recursion ([#1611](https://github.com/RayforceDB/rayforce/issues/1611));
-- a nested query anywhere in a `where:` predicate, in an arm or beside the `if`, such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and such an output under `by:` ([#1629](https://github.com/RayforceDB/rayforce/issues/1629));
-- under `by:`, an output where a `let` in one aggregate's argument binds a name that the rest of the output also reads, such as `(+ (sum (== a (let a (if c 'x 'y)))) (sum (== a 'x)))`, which is evaluated per group as written ([#1617](https://github.com/RayforceDB/rayforce/issues/1617)). With one aggregate, `(sum (== a (let a (if c 'x 'y))))`, the output answers per row.
-
-A name a `let` binds in a `where:` and a later argument of the same `do` reads raises `schema` before any `if` is reached ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)).
-
-Projections answer per row in these shapes. An opaque `by:` key (a helper the planner does not inline) that raises this error over the whole column is evaluated again row by row, as it is when its whole-column run fails for any reason. A `try` in the query catches the error as it does any other.
+One case still raises: a name a `let` binds and a later argument of the same `do` reads raises `schema` in a `where:` predicate ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)).
 
 ### A boolean vector as the condition
 
