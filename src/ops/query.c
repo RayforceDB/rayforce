@@ -5088,6 +5088,25 @@ static bool expr_nests_agg(ray_t* expr, ray_t* tbl, bool inside_agg) {
 }
 static bool expr_calls_whole_col_verb(ray_t* e);
 
+/* Does the expression `e` call a set verb -- except, sect, union -- by a
+ * name still bound to it?  Its result keeps no row's position. */
+static bool expr_calls_set_verb(ray_t* e) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
+        ray_t* fn = ray_env_get(es[0]->i64);
+        if (fn && fn->type == RAY_BINARY) {
+            const void* fp = (const void*)(uintptr_t)fn->i64;
+            if (fp == (const void*)ray_except_fn || fp == (const void*)ray_sect_fn ||
+                fp == (const void*)ray_union_fn)
+                return true;
+        }
+    }
+    for (int64_t i = 0; i < e->len; i++)
+        if (expr_calls_set_verb(es[i])) return true;
+    return false;
+}
+
 /* True when an aggregate's input must be evaluated per group rather than
  * lowered as a row-aligned input: a constant collection (its length is
  * independent of the source rows; `collections` says the caller cares), or
@@ -5112,10 +5131,13 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
              * result is no row-aligned input, so aggregate what it returns
              * within each group. */
             return true;
-        } else if (expr_calls_whole_col_verb(arg)) {
+        } else if (expr_calls_whole_col_verb(arg) || expr_calls_set_verb(arg)) {
             /* `(rank v)`, `(asc v)`: a whole-column verb over the whole
              * table, sliced by group, ranks or orders across the groups;
-             * written in a grouped aggregate it sees its group's rows. */
+             * written in a grouped aggregate it sees its group's rows.  So
+             * does a set verb, `(except s 'aa)`: its result is no value per
+             * row, and sliced by the group's rows it read the cells of
+             * other groups, and count counted the group (#1404). */
             return true;
         } else if (!expr_contains_call_named(arg, "concat", 6) && !query_expr_has_helper(arg)) {
             if (expr_refs_row_column(arg, tbl)) return false;

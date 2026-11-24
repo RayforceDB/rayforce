@@ -376,7 +376,10 @@ key meets the rows the filter keeps):
 
 What an aggregate reads depends on what its argument is. A column, or an
 expression over columns, gives one value per row, and each group aggregates
-its own rows. An argument that reads no column follows one of two rules,
+its own rows. A set verb over a column, `except`, `sect` or `union`, gives
+no value per row; under `by:` it is applied to each group's rows, so
+`(count (except s 'b))` counts each group's cells other than `b` and
+`(sum (except v 10))` sums each group's values other than 10. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
 
 A keyless select gives every aggregate the argument `by:` gives its one
