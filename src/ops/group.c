@@ -2674,7 +2674,7 @@ static ray_t* count_distinct_per_group_parallel(
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
         cancelled = pool_cancelled(pool);
     }
-    if (ctx.by_val && !cancelled)
+    if (ctx.by_val && !cancelled && !atomic_load_explicit(&ctx.oom, memory_order_relaxed))
         for (uint64_t p = 0; p < P; p++)
             for (int64_t g = 0; g < n_groups; g++) ctx.odata[g] += ctx.pcnt[p * n_groups + g];
 
