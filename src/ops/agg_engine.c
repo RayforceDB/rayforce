@@ -9006,7 +9006,7 @@ RAY_INLINE void agg_run_collect_body(agg_run_ctx_t* c, uint32_t wid, int64_t sta
         if (lo >= hi) { memset(off, 0, (size_t)(P + 1) * sizeof(uint32_t)); continue; }
         int64_t n_runs = 0;
         bool have = false, failed = false;
-        uint64_t cur[AGG_RUN_MAX_KEYS], kv[AGG_RUN_MAX_KEYS];
+        uint64_t cur[AGG_RUN_MAX_KEYS] = {0}, kv[AGG_RUN_MAX_KEYS];
         int64_t first = lo;
         uint64_t w = 0;
         ray_col_scratch_t scr[AGG_RUN_MAX_KEYS];

@@ -2937,7 +2937,9 @@ static ray_t* sort_indices_ex(ray_t** cols, uint8_t* descs, uint8_t* nulls_first
                                 .keys = keys, .indices = indices,
                                 .n_keys = n_cols, .vecs = cols,
                             };
-                            for (uint32_t k = 0; k < n_cols; k++) {
+                            /* n_cols <= 16 here; the bound repeats it for gcc 12,
+                             * which loses it once the function is split */
+                            for (uint32_t k = 0; k < n_cols && k < 16; k++) {
                                 enc.mins[k] = mins[k];
                                 enc.ranges[k] = (int64_t)((uint64_t)maxs[k] - (uint64_t)mins[k]);
                                 enc.bit_shifts[k] = bit_shifts[k];
