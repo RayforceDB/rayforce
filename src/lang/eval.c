@@ -5903,12 +5903,12 @@ static void ray_register_builtins(void) {
     register_unary ("flip",        RAY_FN_NONE, ray_flip_mat_fn);
     register_unary ("gram",        RAY_FN_NONE, ray_gram_fn);
     register_vary  (".emb.knn",         RAY_FN_NONE, ray_knn_fn);
-    register_vary  (".emb.hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
+    register_vary  (".emb.hnsw.build",  RAY_FN_NONE, ray_hnsw_build_fn);
     register_vary  (".emb.ann",         RAY_FN_NONE, ray_ann_fn);
-    register_unary (".emb.hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
-    register_binary(".emb.hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
-    register_unary (".emb.hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
-    register_unary (".emb.hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
+    register_unary (".emb.hnsw.free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
+    register_binary(".emb.hnsw.set",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
+    register_unary (".emb.hnsw.get",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
+    register_unary (".emb.hnsw.info",   RAY_FN_NONE, ray_hnsw_info_fn);
 
     /* Per-vector accelerator indices (see src/ops/idxop.h) */
     register_unary (".idx.zone",   RAY_FN_NONE, ray_idx_zone_fn);

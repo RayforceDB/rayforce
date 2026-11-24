@@ -166,9 +166,9 @@ FV1 -- [1.5 2.5 3.5]
 ;; Build an index, alias it via set, free it — exercises retain on
 ;; the alias and release on scope exit.
 (set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.5 0.5 0.0]))
-(set IDX (.emb.hnsw-build V 'l2 8 100))
-(at (.emb.hnsw-info IDX) 'nrows) -- 4
-(.emb.hnsw-free IDX)
+(set IDX (.emb.hnsw.build V 'l2 8 100))
+(at (.emb.hnsw.info IDX) 'nrows) -- 4
+(.emb.hnsw.free IDX)
 
 ;; INDEX block via .idx.* — retain_owned_refs RAY_INDEX path
 ;; (heap.c:543-548, 645-650), ray_index_release_payload (heap.c:734-744).

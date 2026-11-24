@@ -485,7 +485,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n);
 ray_t* ray_hnsw_build_fn(ray_t** args, int64_t n);
 ray_t* ray_ann_fn(ray_t** args, int64_t n);
 ray_t* ray_hnsw_free_fn(ray_t* h);
-ray_t* ray_hnsw_save_fn(ray_t* h, ray_t* path);
+ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h);
 ray_t* ray_hnsw_load_fn(ray_t* path);
 ray_t* ray_hnsw_info_fn(ray_t* h);
 

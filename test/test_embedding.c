@@ -24,7 +24,7 @@
 /*
  * Tests for Rayfall embedding / vector-similarity / HNSW builtins.
  * Names: .emb.cos-dist, .emb.l2-dist, .emb.inner-prod, plus norm, knn,
- * .emb.hnsw-build, ann, .emb.hnsw-save, .emb.hnsw-load, .emb.hnsw-info, .emb.hnsw-free.
+ * .emb.hnsw.build, ann, .emb.hnsw.set, .emb.hnsw.get, .emb.hnsw.info, .emb.hnsw.free.
  */
 
 #include "test.h"
@@ -248,41 +248,41 @@ static test_result_t test_knn_ip(void) {
 /* ============ HNSW lifecycle ============ */
 
 static test_result_t test_hnsw_info_and_metric(void) {
-    /* Build with 'l2 and verify .emb.hnsw-info reports dim, metric, n-nodes. */
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'l2 4 50))");
-    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'dim)"), 3);
-    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'nrows)"), 5);
-    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'M)"), 4);
-    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'efc)"), 50);
+    /* Build with 'l2 and verify .emb.hnsw.info reports dim, metric, n-nodes. */
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'l2 4 50))");
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw.info __idx) 'dim)"), 3);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw.info __idx) 'nrows)"), 5);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw.info __idx) 'M)"), 4);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw.info __idx) 'efc)"), 50);
     /* metric is a SYM atom; verify via equality with 'l2. */
-    ray_t* r = ray_eval_str("(== (at (.emb.hnsw-info __idx) 'metric) 'l2)");
+    ray_t* r = ray_eval_str("(== (at (.emb.hnsw.info __idx) 'metric) 'l2)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     PASS();
 }
 
 static test_result_t test_ann_topk(void) {
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 8 100))");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'cosine 8 100))");
     /* Row 0 must be the closest (identity). */
     TEST_ASSERT_EQ_I(eval_i64("(at (at (.emb.ann __idx [1.0 0.0 0.0] 1) '_rowid) 0)"), 0);
     TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     PASS();
 }
 
 /* Build two indexes with the same data, one per metric (l2, cosine), verify
  * that the row-0-self query gives distance 0 in both. */
 static test_result_t test_ann_each_metric(void) {
-    ray_eval_str("(set __idx_l2 (.emb.hnsw-build " FIVE_VECS " 'l2 8 100))");
-    ray_eval_str("(set __idx_co (.emb.hnsw-build " FIVE_VECS " 'cosine 8 100))");
+    ray_eval_str("(set __idx_l2 (.emb.hnsw.build " FIVE_VECS " 'l2 8 100))");
+    ray_eval_str("(set __idx_co (.emb.hnsw.build " FIVE_VECS " 'cosine 8 100))");
     TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx_l2 [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
     TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx_co [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
-    ray_eval_str("(.emb.hnsw-free __idx_l2)");
-    ray_eval_str("(.emb.hnsw-free __idx_co)");
+    ray_eval_str("(.emb.hnsw.free __idx_l2)");
+    ray_eval_str("(.emb.hnsw.free __idx_co)");
     PASS();
 }
 
@@ -310,7 +310,7 @@ static test_result_t test_ann_recall(void) {
     TEST_ASSERT_EQ_I(ray_env_set(sym, list), RAY_OK);
     ray_release(list);
 
-    ray_eval_str("(set __recall_idx (.emb.hnsw-build __recall_list 'l2 16 100))");
+    ray_eval_str("(set __recall_idx (.emb.hnsw.build __recall_list 'l2 16 100))");
 
     int hits = 0, total = 0;
     for (int q = 0; q < QUERIES; q++) {
@@ -327,7 +327,7 @@ static test_result_t test_ann_recall(void) {
         if (top_ann == top_exact) hits++;
         total++;
     }
-    ray_eval_str("(.emb.hnsw-free __recall_idx)");
+    ray_eval_str("(.emb.hnsw.free __recall_idx)");
     /* Self-query: every top-1 must be the row itself. */
     TEST_ASSERT_EQ_I(hits, total);
     PASS();
@@ -368,7 +368,7 @@ static test_result_t test_ann_recall_saturated(void) {
      * so self-queries resolve to the node itself with high recall.  Before
      * the fix, saturated lists silently dropped every back-link, fragmenting
      * the graph and degrading recall@1. */
-    ray_eval_str("(set __sat_idx (.emb.hnsw-build __sat_list 'l2 4 80))");
+    ray_eval_str("(set __sat_idx (.emb.hnsw.build __sat_list 'l2 4 80))");
 
     int hits = 0, total = 0;
     for (int q = 0; q < QUERIES; q++) {
@@ -379,7 +379,7 @@ static test_result_t test_ann_recall_saturated(void) {
         if (top_ann == q) hits++;
         total++;
     }
-    ray_eval_str("(.emb.hnsw-free __sat_idx)");
+    ray_eval_str("(.emb.hnsw.free __sat_idx)");
     /* Self-query recall@1: the fix keeps this high even at M=4.  Assert a
      * conservative floor (90%) that the fixed connectivity comfortably meets
      * but the silent-drop regression would fall below. */
@@ -392,19 +392,19 @@ static test_result_t test_ann_recall_saturated(void) {
 static test_result_t test_hnsw_save_load(void) {
     const char* dir = ray_test_tmp("/tmp/ray_hnsw_test_idx");
     /* Build and save in 'ip metric. */
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'ip 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'ip 4 50))");
     char expr[512];
-    snprintf(expr, sizeof(expr), "(.emb.hnsw-save __idx \"%s\")", dir);
+    snprintf(expr, sizeof(expr), "(.emb.hnsw.set \"%s\" __idx)", dir);
     ray_t* saved = ray_eval_str(expr);
     TEST_ASSERT_FALSE(RAY_IS_ERR(saved));
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw.free __idx)");
 
     /* Load from disk, confirm metric still 'ip, then query. */
-    snprintf(expr, sizeof(expr), "(set __idx2 (.emb.hnsw-load \"%s\"))", dir);
+    snprintf(expr, sizeof(expr), "(set __idx2 (.emb.hnsw.get \"%s\"))", dir);
     ray_t* loaded = ray_eval_str(expr);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
-    ray_t* metric_eq = ray_eval_str("(== (at (.emb.hnsw-info __idx2) 'metric) 'ip)");
+    ray_t* metric_eq = ray_eval_str("(== (at (.emb.hnsw.info __idx2) 'metric) 'ip)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(metric_eq));
     TEST_ASSERT_EQ_I(metric_eq->type, -RAY_BOOL);
     TEST_ASSERT_EQ_U(metric_eq->b8, 1);
@@ -418,18 +418,18 @@ static test_result_t test_hnsw_save_load(void) {
      * the HNSW saturation/back-link fix legitimately perturbs.) */
     int64_t ip_top = eval_i64("(at (at (.emb.ann __idx2 [1.0 0.0 0.0] 1) '_rowid) 0)");
     TEST_ASSERT_TRUE(ip_top == 0 || ip_top == 3 || ip_top == 4);
-    ray_eval_str("(.emb.hnsw-free __idx2)");
+    ray_eval_str("(.emb.hnsw.free __idx2)");
     PASS();
 }
 
 /* ============ Handle lifecycle — double-free returns type error ============ */
 
 static test_result_t test_hnsw_free_twice(void) {
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
-    ray_t* r1 = ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'cosine 4 50))");
+    ray_t* r1 = ray_eval_str("(.emb.hnsw.free __idx)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     /* Second free: handle attr is cleared, so unwrap fails → type error. */
-    ray_t* r2 = ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_t* r2 = ray_eval_str("(.emb.hnsw.free __idx)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
     PASS();
 }
@@ -437,12 +437,12 @@ static test_result_t test_hnsw_free_twice(void) {
 /* Rebinding a handle variable must not leak the previously-bound index.
  * ASan would report the leak on runtime teardown if rc→0 cleanup missed it. */
 static test_result_t test_hnsw_rebind_no_leak(void) {
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'cosine 4 50))");
     /* Rebind: the old handle's rc hits zero, ray_free runs, the rc-cleanup
      * hook in src/mem/heap.c frees the underlying ray_hnsw_t. */
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'l2 4 50))");
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'ip 4 50))");
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'l2 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'ip 4 50))");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     PASS();
 }
 
@@ -450,7 +450,7 @@ static test_result_t test_hnsw_rebind_no_leak(void) {
  * expression completes. */
 static test_result_t test_hnsw_inline_no_leak(void) {
     ray_t* r = ray_eval_str(
-        "(at (at (.emb.ann (.emb.hnsw-build " FIVE_VECS " 'l2 4 50) [1.0 0.0 0.0] 1) '_rowid) 0)");
+        "(at (at (.emb.ann (.emb.hnsw.build " FIVE_VECS " 'l2 4 50) [1.0 0.0 0.0] 1) '_rowid) 0)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
@@ -460,7 +460,7 @@ static test_result_t test_hnsw_inline_no_leak(void) {
 /* Handle left bound to a variable at runtime teardown must not leak.
  * ASan reports any leaked ray_hnsw_t at process exit. */
 static test_result_t test_hnsw_teardown_no_leak(void) {
-    ray_eval_str("(set __leak_idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __leak_idx (.emb.hnsw.build " FIVE_VECS " 'cosine 4 50))");
     PASS();
 }
 
@@ -468,7 +468,7 @@ static test_result_t test_hnsw_teardown_no_leak(void) {
  * the underlying ray_hnsw_t so the copy is a full, independent owner with
  * the same index contents — and freeing either does not disturb the other. */
 static test_result_t test_hnsw_handle_cow(void) {
-    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw.build " FIVE_VECS " 'cosine 4 50))");
     ray_t* h = ray_env_get(ray_sym_intern("__idx", 5));
     TEST_ASSERT_NOT_NULL(h);
     TEST_ASSERT_EQ_I(h->type, -RAY_I64);
@@ -504,9 +504,9 @@ static test_result_t test_hnsw_handle_cow(void) {
     ray_release(copy);
     TEST_ASSERT_TRUE(h->attrs & RAY_ATTR_HNSW);
     TEST_ASSERT_EQ_I(h->i64, orig_ptr);
-    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'nrows)"), 5);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw.info __idx) 'nrows)"), 5);
 
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     PASS();
 }
 
@@ -540,14 +540,14 @@ static test_result_t test_select_nearest_knn(void) {
 
 static test_result_t test_select_nearest_ann(void) {
     build_docs();
-    ray_eval_str("(set __idx (.emb.hnsw-build (at __docs 'emb) 'cosine))");
+    ray_eval_str("(set __idx (.emb.hnsw.build (at __docs 'emb) 'cosine))");
     /* Top-1 must be exact match (row 0, id=0, dist=0). */
     TEST_ASSERT_EQ_I(eval_i64(
         "(at (at (select {from: __docs nearest: (.emb.ann __idx [1.0 0.0 0.0]) take: 1}) 'id) 0)"), 0);
     TEST_ASSERT_EQ_F(eval_f64(
         "(at (at (select {id: id d: _dist from: __docs "
         "                 nearest: (.emb.ann __idx [1.0 0.0 0.0]) take: 1}) 'd) 0)"), 0.0, 1e-6);
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     PASS();
 }
 
@@ -707,12 +707,12 @@ static test_result_t test_select_nearest_empty_source(void) {
  * alive through ray_execute. */
 static test_result_t test_select_nearest_ann_inline_handle(void) {
     build_docs();
-    /* `(.emb.hnsw-build ...)` is evaluated inline and never bound to a var —
+    /* `(.emb.hnsw.build ...)` is evaluated inline and never bound to a var —
      * its rc is 1 at the moment `select` sees it.  Previously this
      * freed the index mid-DAG; the fix retains the handle through exec. */
     ray_t* r = ray_eval_str(
         "(select {id: id d: _dist from: __docs "
-        "         nearest: (.emb.ann (.emb.hnsw-build (at __docs 'emb) 'cosine) "
+        "         nearest: (.emb.ann (.emb.hnsw.build (at __docs 'emb) 'cosine) "
         "                       [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
@@ -728,12 +728,12 @@ static test_result_t test_select_nearest_ann_inline_handle(void) {
 }
 
 /* Invalid handle payload: attr set but pointer zeroed (e.g. after
- * .emb.hnsw-free).  Must return a clean type error rather than dereferencing
+ * .emb.hnsw.free).  Must return a clean type error rather than dereferencing
  * NULL. */
 static test_result_t test_select_nearest_ann_freed_handle(void) {
     build_docs();
-    ray_eval_str("(set __idx (.emb.hnsw-build (at __docs 'emb)))");
-    ray_eval_str("(.emb.hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw.build (at __docs 'emb)))");
+    ray_eval_str("(.emb.hnsw.free __idx)");
     /* __idx now has attr cleared AND i64=0.  The attr-cleared state is
      * caught by the handle-type check; ensure a hypothetical attr-still-set
      * but i64=0 state also errors cleanly.  We hit the same error path via
@@ -749,14 +749,14 @@ static test_result_t test_select_nearest_ann_freed_handle(void) {
  * or the owned query buffer.  ASan catches leaks/UAF at runtime teardown. */
 static test_result_t test_select_nearest_ann_projection_error(void) {
     build_docs();
-    /* `(.emb.hnsw-build (at __docs 'emb))` is inline and rc=1.  The projection
+    /* `(.emb.hnsw.build (at __docs 'emb))` is inline and rc=1.  The projection
      * uses an unknown function name that compile_expr_dag cannot lower —
      * the error path must release the nearest handle and free the query
      * buffer before returning. */
     ray_t* r = ray_eval_str(
         "(select {bad: (no-such-function id) "
         "         from: __docs "
-        "         nearest: (.emb.ann (.emb.hnsw-build (at __docs 'emb) 'cosine) "
+        "         nearest: (.emb.ann (.emb.hnsw.build (at __docs 'emb) 'cosine) "
         "                       [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
@@ -816,7 +816,7 @@ static test_result_t test_select_nearest_iterative_selective(void) {
     ray_eval_str(
         "(set __it_tbl (table [id score emb] "
         "  (list (til 300) __it_scores __it_list)))");
-    ray_eval_str("(set __it_idx (.emb.hnsw-build __it_list 'l2 16 100))");
+    ray_eval_str("(set __it_idx (.emb.hnsw.build __it_list 'l2 16 100))");
 
     ray_t* r = ray_eval_str(
         "(select {id: id score: score d: _dist from: __it_tbl "
@@ -845,7 +845,7 @@ static test_result_t test_select_nearest_iterative_selective(void) {
         TEST_ASSERT_TRUE(dd[i] >= dd[i - 1]);
 
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __it_idx)");
+    ray_eval_str("(.emb.hnsw.free __it_idx)");
     PASS();
 }
 
@@ -872,7 +872,7 @@ static test_result_t test_select_nearest_recall(void) {
     ray_eval_str(
         "(set __rv (table [id emb] "
         "  (list (til 200) __rv_list)))");
-    ray_eval_str("(set __rv_idx (.emb.hnsw-build __rv_list 'l2 16 100))");
+    ray_eval_str("(set __rv_idx (.emb.hnsw.build __rv_list 'l2 16 100))");
 
     int hits = 0;
     for (int q = 0; q < 20; q++) {
@@ -890,7 +890,7 @@ static test_result_t test_select_nearest_recall(void) {
         int64_t knn_id = eval_i64(expr);
         if (ann_id == knn_id && ann_id == q) hits++;
     }
-    ray_eval_str("(.emb.hnsw-free __rv_idx)");
+    ray_eval_str("(.emb.hnsw.free __rv_idx)");
     TEST_ASSERT_EQ_I(hits, 20);
     PASS();
 }
@@ -1280,7 +1280,7 @@ static test_result_t test_knn_i64_source_vecs(void) {
 static test_result_t test_ann_rerank_empty_source(void) {
     /* Build an index from a small non-empty list so the index is valid,
      * then create a 0-row table (matching dim=3) for the select. */
-    ray_eval_str("(set __ann_idx (.emb.hnsw-build "
+    ray_eval_str("(set __ann_idx (.emb.hnsw.build "
                  "(list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'cosine 4 50))");
 
     /* Empty source: 0-row table with emb LIST column. */
@@ -1298,7 +1298,7 @@ static test_result_t test_ann_rerank_empty_source(void) {
     /* Source has 2 cols (id, emb); _dist not projected → schema unchanged. */
     TEST_ASSERT_EQ_I(ray_table_ncols(r), 2);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __ann_idx)");
+    ray_eval_str("(.emb.hnsw.free __ann_idx)");
     PASS();
 }
 
@@ -1309,7 +1309,7 @@ static test_result_t test_ann_rerank_filter_rejects_all(void) {
         "  (list [0 1 2] "
         "        [0.1 0.2 0.3] "
         "        (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))))");
-    ray_eval_str("(set __af_idx (.emb.hnsw-build (at __afdocs 'emb) 'cosine 4 50))");
+    ray_eval_str("(set __af_idx (.emb.hnsw.build (at __afdocs 'emb) 'cosine 4 50))");
 
     /* Filter rejects every row (score > 100) → accepted_count = 0. */
     ray_t* r = ray_eval_str(
@@ -1323,7 +1323,7 @@ static test_result_t test_ann_rerank_filter_rejects_all(void) {
     /* Source has 3 cols (id, score, emb); _dist not projected. */
     TEST_ASSERT_EQ_I(ray_table_ncols(r), 3);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __af_idx)");
+    ray_eval_str("(.emb.hnsw.free __af_idx)");
     PASS();
 }
 
@@ -1755,12 +1755,12 @@ static test_result_t test_hnsw_free_type_errors(void) {
 static test_result_t test_hnsw_save_type_errors(void) {
     /* NULL handle → type error. */
     ray_t* path = ray_eval_str("\"some_path\"");
-    ray_t* r = ray_hnsw_save_fn(NULL, path);
+    ray_t* r = ray_hnsw_save_fn(path, NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
 
     /* Non-handle → type error. */
     ray_t* scalar = make_i64(42);
-    r = ray_hnsw_save_fn(scalar, path);
+    r = ray_hnsw_save_fn(path, scalar);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
 
     /* Valid handle, NULL path → type error. */
@@ -1772,11 +1772,11 @@ static test_result_t test_hnsw_save_type_errors(void) {
     ray_t* handle = ray_hnsw_build_fn(build_args, 1);
     TEST_ASSERT_FALSE(RAY_IS_ERR(handle));
 
-    r = ray_hnsw_save_fn(handle, NULL);
+    r = ray_hnsw_save_fn(NULL, handle);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
 
     /* Valid handle, non-string path → type error. */
-    r = ray_hnsw_save_fn(handle, scalar);
+    r = ray_hnsw_save_fn(scalar, handle);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
 
     ray_hnsw_free_fn(handle);
@@ -1833,7 +1833,7 @@ static test_result_t test_knn_k_i32_i16(void) {
     PASS();
 }
 
-/* .emb.hnsw-build with I32/I64/F64 source vecs (rayvec_to_floats non-F32 path). */
+/* .emb.hnsw.build with I32/I64/F64 source vecs (rayvec_to_floats non-F32 path). */
 static test_result_t test_hnsw_build_non_f32_source(void) {
     /* F64 vectors → rayvec_to_floats takes the loop path. */
     double f64_vecs[3][3] = {{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}};
@@ -1885,7 +1885,7 @@ static test_result_t test_hnsw_build_non_f32_source(void) {
     PASS();
 }
 
-/* .emb.hnsw-build M out-of-range defaults: M=0 and M=999. */
+/* .emb.hnsw.build M out-of-range defaults: M=0 and M=999. */
 static test_result_t test_hnsw_build_m_out_of_range(void) {
     float vecs[3 * 3] = {
         1.0f, 0.0f, 0.0f,
@@ -1931,7 +1931,7 @@ static test_result_t test_hnsw_build_m_out_of_range(void) {
     PASS();
 }
 
-/* .emb.hnsw-build ef_c out-of-range defaults: ef_c=0 and ef_c=9999. */
+/* .emb.hnsw.build ef_c out-of-range defaults: ef_c=0 and ef_c=9999. */
 static test_result_t test_hnsw_build_efc_out_of_range(void) {
     float vecs[3 * 3] = {
         1.0f, 0.0f, 0.0f,
@@ -1987,8 +1987,8 @@ static test_result_t test_list_validate_dim_mismatch(void) {
     /* Same for knn. */
     r = ray_eval_str("(.emb.knn (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0] 1)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    /* Same for .emb.hnsw-build. */
-    r = ray_eval_str("(.emb.hnsw-build (list [1.0 0.0 0.0] [1.0 0.0]))");
+    /* Same for .emb.hnsw.build. */
+    r = ray_eval_str("(.emb.hnsw.build (list [1.0 0.0 0.0] [1.0 0.0]))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
@@ -2040,9 +2040,9 @@ static test_result_t test_metric_scalar_empty_vec(void) {
     PASS();
 }
 
-/* .emb.hnsw-build on empty list → dim <= 0 → length error. */
+/* .emb.hnsw.build on empty list → dim <= 0 → length error. */
 static test_result_t test_hnsw_build_empty_list(void) {
-    ray_t* r = ray_eval_str("(.emb.hnsw-build (list))");
+    ray_t* r = ray_eval_str("(.emb.hnsw.build (list))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
@@ -2061,7 +2061,7 @@ static test_result_t test_knn_k_clamp_and_sort(void) {
 
 /* ann: ef_s out-of-range keeps computed ef. */
 static test_result_t test_ann_efs_out_of_range(void) {
-    ray_eval_str("(set __efs_idx (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))");
+    ray_eval_str("(set __efs_idx (.emb.hnsw.build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))");
     /* ef_s=0 → keeps default. */
     TEST_ASSERT_EQ_I(eval_i64("(count (.emb.ann __efs_idx [1.0 0.0 0.0] 2 0))"), 2);
     /* ef_s=9999 → v > 4096, keeps computed ef. */
@@ -2069,35 +2069,35 @@ static test_result_t test_ann_efs_out_of_range(void) {
     /* ef_s as non-int → type error. */
     ray_t* r = ray_eval_str("(.emb.ann __efs_idx [1.0 0.0 0.0] 2 1.5)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    ray_eval_str("(.emb.hnsw-free __efs_idx)");
+    ray_eval_str("(.emb.hnsw.free __efs_idx)");
     PASS();
 }
 
-/* .emb.hnsw-info for each metric to cover the switch. */
+/* .emb.hnsw.info for each metric to cover the switch. */
 static test_result_t test_hnsw_info_all_metrics(void) {
     /* Cosine → "cosine" */
-    ray_eval_str("(set __info_cos (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'cosine))");
-    ray_t* r = ray_eval_str("(== (at (.emb.hnsw-info __info_cos) 'metric) 'cosine)");
+    ray_eval_str("(set __info_cos (.emb.hnsw.build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'cosine))");
+    ray_t* r = ray_eval_str("(== (at (.emb.hnsw.info __info_cos) 'metric) 'cosine)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __info_cos)");
+    ray_eval_str("(.emb.hnsw.free __info_cos)");
 
     /* L2 → "l2" */
-    ray_eval_str("(set __info_l2 (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'l2))");
-    r = ray_eval_str("(== (at (.emb.hnsw-info __info_l2) 'metric) 'l2)");
+    ray_eval_str("(set __info_l2 (.emb.hnsw.build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'l2))");
+    r = ray_eval_str("(== (at (.emb.hnsw.info __info_l2) 'metric) 'l2)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __info_l2)");
+    ray_eval_str("(.emb.hnsw.free __info_l2)");
 
     /* IP → "ip" */
-    ray_eval_str("(set __info_ip (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'ip))");
-    r = ray_eval_str("(== (at (.emb.hnsw-info __info_ip) 'metric) 'ip)");
+    ray_eval_str("(set __info_ip (.emb.hnsw.build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'ip))");
+    r = ray_eval_str("(== (at (.emb.hnsw.info __info_ip) 'metric) 'ip)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(.emb.hnsw-free __info_ip)");
+    ray_eval_str("(.emb.hnsw.free __info_ip)");
     PASS();
 }
 
