@@ -153,7 +153,7 @@ static const ray_sig_entry_t sigs[] = {
     {"sect", "(sect <a: vector or list> <b: vector or list>)"},
     {"union", "(union <a: vector or list> <b: vector or list>)"},
     {"cross", "(cross <a: vector or list> <b: vector or list>)"},
-    {"concat", "(concat <left: vector, list or str> <right: vector, list or str of the same kind>)"},
+    {"concat", "(concat <left: atom, vector, list, dict or table> <right: any two atoms, vectors or lists, but an atom and a vector only of the atom's type (a str and a STR vector join cell by cell); a dict with a dict; a table with a table that has each of its columns, of the same types>)"},
     {"fill", "(fill <replacement: atom> <x: vector>)"},
     {"xbar", "(xbar <x: numeric or temporal vector> <bucket: non-zero num>)"},
     {"rand", "(rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)"},
