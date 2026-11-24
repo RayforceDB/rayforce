@@ -1,0 +1,54 @@
+;; @also-unfused
+;; The empty string is the STR null, and first and last skip it in a query
+;; the way they skip 0Nl (#1430): inside select ... by:, and as the aggregate
+;; of a keyless select output, they are aggregates and take the first or last
+;; non-null cell of the group.  A direct call outside a query is positional
+;; and returns "" when it sits there.  A group of nulls only gives the null.
+
+;; the case in #1430
+(set t (table [g s] (list ['a 'a 'b 'b] ["x" "" "y" ""])))
+(at (select {from: t by: g l: (last s)}) 'l) -- ["x" "y"]
+(last ["x" ""]) -- ""
+(last (at t 's)) -- ""
+(nil? (last ["x" ""])) -- true
+
+;; first, the mirror
+(set u (table [g s] (list ['a 'a 'b 'b] ["" "x" "" "y"])))
+(at (select {from: u by: g f: (first s)}) 'f) -- ["x" "y"]
+(first ["" "x"]) -- ""
+
+;; keyless select outputs are aggregates too
+(at (select {from: t l: (last s)}) 'l) -- ["y"]
+(at (select {from: u f: (first s)}) 'f) -- ["x"]
+
+;; a computed STR argument that reads a column skips as well
+(at (select {from: t by: g l: (last (trim s))}) 'l) -- ["x" "y"]
+(at (select {from: t by: g l: (last (upper s))}) 'l) -- ["X" "Y"]
+
+;; a group whose cells are all "" gives ""
+(set w (table [g s] (list ['a 'a 'b] ["" "" "y"])))
+(at (select {from: w by: g l: (last s) f: (first s)}) 'l) -- ["" "y"]
+(at (select {from: w by: g l: (last s) f: (first s)}) 'f) -- ["" "y"]
+
+;; the same rule as the other nulls: SYM's ' and I64's 0Nl
+(at (select {from: (table [g v] (list ['a 'a 'b 'b] ['x ' 'y '])) by: g l: (last v)}) 'l) -- ['x 'y]
+(last ['x ']) -- '
+(at (select {from: (table [g v] (list ['a 'a 'b 'b] [1 0Nl 2 0Nl])) by: g l: (last v)}) 'l) -- [1 2]
+(last [1 0Nl]) -- 0Nl
+
+;; many groups over a parallel-sized table.  Row i is in group (% i 1000)
+;; and holds "" when it is in the first or last thousand rows (so every
+;; group starts and ends on ""), when i is a multiple of 7 (so some groups
+;; have "" next to the first or last non-empty cell), or when its group is
+;; 999 (a group of "" only); every other row holds the text of i.
+(set n 200000)
+(set B (table [g s] (list (% (til n) 1000) (map (fn [i] (if (or (or (< i 1000) (>= i 199000)) (or (== 0 (% i 7)) (== 999 (% i 1000)))) "" (as 'STR i))) (til n)))))
+(take (at (select {from: B by: g f: (first s) asc: g}) 'f) 3) -- ["1000" "2001" "1002"]
+(take (at (select {from: B by: g l: (last s) asc: g}) 'l) 3) -- ["198000" "198001" "197002"]
+(last (at (select {from: B by: g f: (first s) l: (last s) asc: g}) 'f)) -- ""
+(last (at (select {from: B by: g f: (first s) l: (last s) asc: g}) 'l)) -- ""
+(at (select {from: B f: (first s) l: (last s)}) 'f) -- ["1000"]
+(at (select {from: B f: (first s) l: (last s)}) 'l) -- ["198998"]
+
+;; indexing the group keeps the positional answer
+(at (select {from: t by: g l: (at s (- (count s) 1))}) 'l) -- ["" ""]

@@ -346,7 +346,8 @@ clamps to the minimum plus one. A string that parses to the minimum raises
     `SYM` has no `0N` literal (`0Ns` does not parse): its null is the empty
     symbol, written `'`. `(nil? ')` is `true`, and it prints as `'`, so a
     printed vector such as `[a ' b]` reads back as the same value. `STR`'s null
-    is the empty string `""`.
+    is the empty string `""`, so a query's `first` and `last` skip `""` cells
+    as they skip `0Nl` (see [Nulls in a query](../language/math.md#first-last-nulls)).
 
     Use `nil?` to test for null values: `(nil? 0Ni)` returns `true`.
 

@@ -574,19 +574,54 @@ Unary numeric reducers skip nulls where applicable. Binary reducers skip a row w
 
 ### `(first x)` — aggregate
 
-First element of a vector.
+First element of a vector. A direct call is positional: it returns the
+element at the front, a null included, for every type. In a query, inside
+`select … by:` or as the aggregate of a keyless `select` output, `first` is
+an aggregate and skips nulls like the other aggregates, so it returns the
+first non-null cell, or the null when every cell is null. See
+[Nulls in a query](#first-last-nulls) below.
 
 ```lisp
 (first [10 20 30])  ; 10
+(first [0Nl 1])     ; 0Nl
+(first ["" "x"])    ; ""   the STR null, by position
 ```
 
 ### `(last x)` — aggregate
 
-Last element of a vector.
+Last element of a vector, with the same split as `first`: positional in a
+direct call, the last non-null cell in a query.
 
 ```lisp
 (last [10 20 30])  ; 30
+(last [1 2 0Nl])   ; 0Nl
+(last ["x" ""])    ; ""
 ```
+
+#### Nulls in a query { #first-last-nulls }
+
+The empty string is the STR null, as `'` is the SYM null and `0Nl` the I64
+one, so a grouped or keyless-select `first` or `last` skips `""` cells the way
+it skips `0Nl`:
+
+```lisp
+(set t (table [g s] (list ['a 'a 'b 'b] ["x" "" "y" ""])))
+(at (select {from: t by: g l: (last s)}) 'l)   ; ["x" "y"]   "" skipped
+(at (select {from: t l: (last s)}) 'l)         ; ["y"]
+(last ["x" ""])                                ; ""          positional
+```
+
+The two forms answer different questions. A direct `(last v)` is an
+accessor, the same as `(at v (- (count v) 1))`, so it returns whatever sits
+there. In a query, `first` and `last` are aggregates like `sum`, `min` and
+`max`, which all skip nulls, so a group's `last` is its last known value. A
+group whose cells are all `""` gives `""`. To get the positional answer in
+a `by:` select, index the group instead: `(at s (- (count s) 1))` gives
+`["" ""]` above.
+
+The skip applies wherever `first` or `last` aggregates a group's rows.
+Which arguments a query reads as rows is set out in
+[Aggregate sources](../queries/select.md#aggregate-sources).
 
 ### `(distinct x)` — aggregate
 
