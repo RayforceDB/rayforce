@@ -1295,6 +1295,29 @@ static void ipc_sigurg_handler(int sig)
 }
 #endif
 
+/* Let SIGURG reach the thread about to run a request.  Its mask cannot be
+ * taken as found.  A process starts with the mask of the thread that
+ * spawned it, and on macOS one sigprocmask(2) call sets the caller's mask
+ * on every thread of the process.  Threads from ray_thread_create block
+ * SIGURG (src/core/platform.c), and libc calls sigprocmask inside tmpfile
+ * (a verbose request's capture), system and popen: one such call on a
+ * server thread blocked SIGURG on the main thread too, and so in every
+ * process spawned from it after.  A server in that state never got its
+ * SIGURG, so a cancel byte arriving mid-request was not seen and the
+ * client waited out its deadline (#1637).  Done before every request,
+ * since the mask can change while the server runs.  A SIGURG left pending
+ * is delivered here, before the request is published: the handler leaves
+ * its byte, and the look after the publish takes it. */
+static void ipc_oob_cancel_unblock(void)
+{
+#ifndef RAY_OS_WINDOWS
+    sigset_t urg;
+    sigemptyset(&urg);
+    sigaddset(&urg, SIGURG);
+    pthread_sigmask(SIG_UNBLOCK, &urg, NULL);
+#endif
+}
+
 static void ipc_install_oob_cancel(void)
 {
     static int installed = 0;
@@ -1599,6 +1622,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         int prev_kind  = g_ipc_active_kind;
         g_ipc_active_kind = (int)hdr.msgtype;
         g_ipc_active_fd  = -1;
+        ipc_oob_cancel_unblock();
         g_ipc_oob_taken  = 0;
         g_ipc_active_seq = cancel_seq;
         g_ipc_active_fd  = (int)sel->fd;
