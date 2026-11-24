@@ -1,0 +1,31 @@
+;; @also-unfused
+;; #1406: in a select, as over a LIST column casts the list as a whole, as
+;; the eager cast does (#1400) and as update and by: already did: a typed
+;; vector of its cells.  The compiled route refused the list ("unary op
+;; expects a vector") or cast cell by cell, giving a LIST of casts.
+(set T (table [c k] (list (list [1] () 3) [1 1 2])))
+(at (select {r: (as 'F64 c) from: T}) 'r) -- (as 'F64 (at T 'c))
+(at (select {r: (as 'F64 c) from: T}) 'r) -- [1.0 0Nf 3.0]
+(at (select {r: (as 'I64 c) from: T}) 'r) -- (as 'I64 (at T 'c))
+(at (select {r: (as 'I32 c) from: T}) 'r) -- (as 'I32 (at T 'c))
+(at (select {r: (as 'I16 c) from: T}) 'r) -- (as 'I16 (at T 'c))
+(at (select {r: (as 'U8 c) from: T}) 'r) -- (as 'U8 (at T 'c))
+(at (select {r: (as 'BOOL c) from: T}) 'r) -- (as 'BOOL (at T 'c))
+(at (select {r: (as 'F32 c) from: T}) 'r) -- (as 'F32 (at T 'c))
+(at (select {r: (as 'DATE c) from: T}) 'r) -- (as 'DATE (at T 'c))
+(at (select {r: (as 'TIME c) from: T}) 'r) -- (as 'TIME (at T 'c))
+(at (select {r: (as 'TIMESTAMP c) from: T}) 'r) -- (as 'TIMESTAMP (at T 'c))
+(at (select {r: (as 'SYM c) from: T}) 'r) -- (as 'SYM (at T 'c))
+(at (select {r: (as 'STR c) from: T}) 'r) -- (as 'STR (at T 'c))
+(at (select {r: (as 'LIST c) from: T}) 'r) -- (as 'LIST (at T 'c))
+(type (at (select {r: (as 'F64 c) from: T}) 'r)) -- 'F64
+(select {r: (as 'GUID c) from: T}) !- type
+;; the same as update
+(at (select {r: (as 'F64 c) from: T}) 'r) -- (at (update {r: (as 'F64 c) from: T}) 'r)
+(at (select {r: (as 'SYM c) from: T}) 'r) -- (at (update {r: (as 'SYM c) from: T}) 'r)
+;; under where:, of the rows it keeps
+(at (select {r: (as 'F64 c) from: T where: (> k 1)}) 'r) -- [3.0]
+(at (select {r: (as 'I64 c) from: T where: (< k 2)}) 'r) -- [1 0Nl]
+;; beside another column, and under by:
+(at (select {r: (as 'F64 c) s: k from: T}) 'r) -- [1.0 0Nf 3.0]
+(at (select {r: (first (as 'F64 c)) from: T by: k}) 'r) -- [1.0 3.0]

@@ -2790,6 +2790,10 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             /* SYM lanes store intern IDs, not numeric values. Let eager as
              * decide the cast instead of exposing the storage representation. */
             if (col->out_type == RAY_SYM) return NULL;
+            /* Nor is a LIST a lane of values: eager as casts the list as a
+             * whole, a typed vector of its cells (#1400), where the DAG cast
+             * refused it or mapped over the cells (#1406). */
+            if (col->out_type == RAY_LIST) return NULL;
             if (quoted_call) {
                 int8_t it = col->out_type;
                 if (it != RAY_BOOL && it != RAY_U8 && it != RAY_I16 && it != RAY_I32 &&
@@ -4888,6 +4892,12 @@ static int head_is_builtin_unary(ray_t* fn, ray_unary_fn native) {
                    (ray_unary_fn)(uintptr_t)fn->i64 == native);
 }
 
+/* head_is_builtin_unary for a binary builtin, such as `as`, whose binding
+ * must be the native and never missing. */
+static int head_is_builtin_binary(ray_t* fn, ray_binary_fn native) {
+    return fn && fn->type == RAY_BINARY && (ray_binary_fn)(uintptr_t)fn->i64 == native;
+}
+
 /* A JSON read's argument that is the same for every row: a dict, a string
  * or a quoted symbol written in place, or a name that is not a column
  * holding a string, a symbol or a dict, or (`path`: the path position) a
@@ -4961,6 +4971,8 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
  * (see eval_expr_whole_column).  Matched on the top-level head only —
  * a whole-column verb nested under an element-wise op has ambiguous length
  * semantics and is left to the per-row path. */
+static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth);
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -5002,6 +5014,13 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         }
         ray_graph_free(g);
         return whole;
+    }
+    if (l == 2 && memcmp(p, "as", 2) == 0 && ray_len(expr) == 3 &&
+        head_is_builtin_binary(fn, ray_cast_fn)) {
+        /* A cast of a LIST column casts the list as a whole, as eager as
+         * does (#1400): a typed vector of its cells, not one cast per cell
+         * (#1406).  It keeps the column's length. */
+        return expr_reads_list_col(((ray_t**)ray_data(expr))[2], tbl, 0);   /* not-a-table */
     }
     if (l == 6 && memcmp(p, "enlist", 6) == 0) {
         /* Only a single scalar value can stand for a broadcast column.

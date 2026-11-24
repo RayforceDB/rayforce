@@ -780,14 +780,15 @@
 (type (at (as 'LIST ASF) 1)) -- 'sym
 (at (as 'LIST ASF) 1) -- 'y
 (.sys.exec "rm -rf /tmp/rfl_as_list_fdom/") -- 0
-;; the query form: `as` is applied per row, so a column of vector cells
-;; (a LIST column) yields a LIST per row, and a column of atoms is
-;; rejected with the same type error as the builtin
+;; the query form: a cast of a LIST column is the eager cast of the whole
+;; column (#1406), so `as 'LIST` returns the LIST column unchanged, its
+;; cells as they are; a column of atoms is applied per row and rejected
+;; with the same type error as the builtin
 (set ASQ (table [c] (list (list [1 2] [3 4 5]))))
 (set ASQR (at (select {r: (as 'LIST c) from: ASQ}) 'r))
-(type (at ASQR 1)) -- 'LIST
-(count (at ASQR 1)) -- 3
-(type (at (at ASQR 1) 0)) -- 'i64
+ASQR -- (as 'LIST (at ASQ 'c))
+(type ASQR) -- 'LIST
+(at ASQR 1) -- [3 4 5]
 (select {r: (as 'LIST v) from: (table [v] (list [1 2 3]))}) !- type
 ;; the verb decides the evaluation strategy. select evaluates per row, so a
 ;; column of atoms is rejected (above); update evaluates the whole column, so
