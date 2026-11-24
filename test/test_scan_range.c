@@ -3186,6 +3186,46 @@ static test_result_t test_scalar_route_f64_combine(void) {
     PASS();
 }
 
+#ifdef DEBUG
+/* #1628: a keyless sum, min, max, prod, first or last over a plain numeric
+ * column runs a typed loop, one per column type: no row of it goes through
+ * the scalar route's generic per-row path (scalar_accum_agg, which read
+ * every row through a type switch and dispatched the aggregate per row at
+ * 100 to 140 instructions a row).  The control, a prod over an integer
+ * column with a null, still takes that path, so the counter is live. */
+static test_result_t test_scalar_route_typed_loops(void) {
+    sr_eval_ok("(set KT (table [v fv h i32 i16 u8 ts] (list (- (% (* (til 100000) 7919) 1000003) 500000)"
+               " (/ (as 'F64 (% (* (til 100000) 7919) 1000003)) 7.0)"
+               " (as 'F32 (/ (as 'F64 (% (til 100000) 1000)) 4.0))"
+               " (as 'I32 (% (til 100000) 1000)) (as 'I16 (% (til 100000) 300)) (as 'U8 (% (til 100000) 200))"
+               " (as 'TIMESTAMP (til 100000)))))");
+    sr_eval_ok("(set KN (update {fv: 0Nf from: KT where: (== (% (til 100000) 97) 0)}))");
+    static const char* const cols[] = { "v", "fv", "h", "i32", "i16", "u8", "ts" };
+    static const char* const ops[] = { "sum", "min", "max", "prod", "first", "last" };
+    char q[256];
+    for (size_t c = 0; c < sizeof cols / sizeof cols[0]; c++)
+        for (size_t o = 0; o < sizeof ops / sizeof ops[0]; o++) {
+            if (!strcmp(cols[c], "ts") && (!strcmp(ops[o], "sum") || !strcmp(ops[o], "prod"))) continue;
+            for (int t = 0; t < 2; t++) {
+                if (t && strcmp(cols[c], "fv")) continue;      /* KN: the F64 column with nulls */
+                snprintf(q, sizeof q, "(select {s: (%s %s) from: %s})", ops[o], cols[c], t ? "KN" : "KT");
+                int64_t before = ray_group_test_scalar_generic_rows();
+                ray_t* r = ray_eval_str(q);
+                TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s failed", q);
+                ray_release(r);
+                int64_t rows = ray_group_test_scalar_generic_rows() - before;
+                TEST_ASSERT_FMT(rows == 0, "%s: %lld rows through the generic per-row path", q, (long long)rows);
+            }
+        }
+    sr_eval_ok("(set KI (update {v: 0Nl from: KT where: (== (% (til 100000) 97) 0)}))");
+    int64_t before = ray_group_test_scalar_generic_rows();
+    sr_eval_ok("(select {s: (prod v) from: KI})");
+    TEST_ASSERT_FMT(ray_group_test_scalar_generic_rows() - before >= 100000,
+                    "control: %lld rows", (long long)(ray_group_test_scalar_generic_rows() - before));
+    PASS();
+}
+#endif
+
 /* Fix round 2: a piece starting at a row not a multiple of 32 realigns
  * through the head loop; the cut sum equals the whole block's and the lane
  * reference, on lane-weighted data where any lane mix-up changes the bits.
@@ -6631,6 +6671,9 @@ const test_entry_t scanrange_entries[] = {
     { "scanrange/scalar_route_mixed", test_scalar_route_mixed, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_combine", test_scalar_route_f64_combine, srr_setup, srr_teardown },
     { "scanrange/scalar_route_f64_unaligned", test_scalar_route_f64_unaligned, srr_setup, srr_teardown },
+#ifdef DEBUG
+    { "scanrange/scalar_route_typed_loops", test_scalar_route_typed_loops, sr_rt_setup, sr_rt_teardown },
+#endif
     { "scanrange/eager_select_float_bits", test_eager_select_float_bits, srr_setup, srr_teardown },
     { "scanrange/da_route",           test_da_route,           srr_setup, srr_teardown },
     { "scanrange/da_route_shapes",    test_da_route_shapes,    srr_setup, srr_teardown },

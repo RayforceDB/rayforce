@@ -97,9 +97,9 @@
 (at (select {m: (sum (== (let a (if (== act 'New) (as 'sym "x") 'y)) a)) from: T by: act}) 'm) -- [4 4 4]
 (at (select {m: (first (== a (let a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [true true false]
 (at (select {m: (sum (and (== a (let k (if (== act 'New) (as 'sym "x") 'y))) (== k a))) from: T by: act}) 'm) -- [1 1 1]
-;; a side effect keeps the evaluator's route, so its order (the rows it
-;; keeps are #1610's)
+;; a side effect keeps the evaluator's route and its order: `A` runs, then
+;; the `if`, whose condition differs between the rows, raises (#1610, #1630)
 (set log1603 ['S])
 (set tr1603 (fn [t v] (do (set log1603 (concat log1603 t)) v)))
-(set r1603 (select {from: T where: (and (>= (tr1603 'A i) 0) (== a (tr1603 'B (if (== act 'New) (as 'sym "x") 'y))) (tr1603 'C true))}))
-log1603 -- ['S 'A 'B 'C]
+(select {from: T where: (and (>= (tr1603 'A i) 0) (== a (tr1603 'B (if (== act 'New) (as 'sym "x") 'y))) (tr1603 'C true))}) !- nyi
+log1603 -- ['S 'A]

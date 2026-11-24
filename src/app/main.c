@@ -90,7 +90,7 @@ static int64_t parse_size_arg(const char* s) {
 static const char* const k_known_flags[] = {
     "-i", "--interactive", "-p", "--port", "-c", "--cores",
     "-t", "--timeit", "-Q", "--querylog", "-f", "--file",
-    "-u", "-U", "-l", "-L", "-m", "--mem", "-h", "--help",
+    "-u", "-U", "-l", "-L", "--log-posts", "-m", "--mem", "-h", "--help",
     "--",   /* the app-args terminator is not a value either */
     NULL
 };
@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
     bool auth_restricted = false;
     const char* log_base = NULL;
     ray_journal_mode_t log_mode = RAY_JOURNAL_OFF;
+    int log_posts = -1;    /* --log-posts N: journal async requests too; -1 unset */
 
     /* Parse args. Supported flags:
      *   -f FILE          run script file
@@ -154,6 +155,8 @@ int main(int argc, char** argv) {
      *   -i               interactive
      * Plus rayforce-specific:
      *   -u PW / -U PW    auth password (plain / restricted)
+     *   -l BASE / -L BASE  journal (append / fsync per write)
+     *   --log-posts N    journal async requests too (N != 0 turns on)
      *   -h               help
      */
     for (int i = 1; i < argc; i++) {
@@ -239,6 +242,18 @@ int main(int argc, char** argv) {
             log_base = flag_value(argc, argv, &i, argv[i]);
             if (!log_base) { ray_runtime_destroy(rt); return 2; }
         }
+        else if (strcmp(argv[i], "--log-posts") == 0) {
+            const char* flag = argv[i];
+            const char* v = flag_value(argc, argv, &i, flag);
+            if (!v) { ray_runtime_destroy(rt); return 2; }
+            int64_t parsed;
+            if (!parse_sys_int_arg(v, false, false, &parsed)) {
+                fprintf(stderr, "error: %s expects an integer, got '%s'\n", flag, v);
+                ray_runtime_destroy(rt);
+                return 2;
+            }
+            log_posts = (parsed != 0);
+        }
         else if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mem") == 0) {
             const char* mv = flag_value(argc, argv, &i, argv[i]);
             if (!mv) { ray_runtime_destroy(rt); return 2; }
@@ -253,7 +268,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stdout,
                 "usage: %s [-f file] [-p port] [-c cores] [-t 0|1] [-Q 0|1] [-i]"
-                " [-u PW | -U PW] [-l BASE | -L BASE] [-m SIZE] [file.rfl] [-- app args]\n"
+                " [-u PW | -U PW] [-l BASE | -L BASE] [--log-posts N] [-m SIZE] [file.rfl] [-- app args]\n"
                 "  -f, --file FILE     run script file (or pass as a positional arg);\n"
                 "                      FILE may be a pipe or FIFO, and - is stdin\n"
                 "  -p, --port PORT     listen for IPC clients on PORT (all interfaces)\n"
@@ -267,6 +282,8 @@ int main(int argc, char** argv) {
                 "  -U PW               set restricted auth password\n"
                 "  -l BASE             enable journal logging (BASE.log + BASE.qdb)\n"
                 "  -L BASE             enable journal logging with fsync per write\n"
+                "      --log-posts N   journal async requests (.ipc.post) too (N != 0);\n"
+                "                      off by default, see (.log.posts)\n"
                 "  -m, --mem SIZE      RAM budget (e.g. 4G, 512M); allocations past it\n"
                 "                      spill to disk instead of OOM (default: RAM or the\n"
                 "                      cgroup limit, less a quarter: 3G to half of it)\n"
@@ -367,6 +384,13 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+
+    /* --log-posts: the journal records async requests too (#1608).  Set
+     * after the replay above, so the flag is what the server runs with,
+     * whatever a replayed entry did.  (.log.posts is a no-op during replay
+     * as well, so without the flag the default, off, stands.) */
+    if (log_posts >= 0)
+        ray_journal_set_posts(log_posts != 0);
 
     /* Start IPC server if port specified */
     if (port > 0) {
