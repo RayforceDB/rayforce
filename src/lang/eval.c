@@ -2790,6 +2790,114 @@ static void gbi_want(gbi_ctx_t* gc, ray_t* vec, const int64_t* idx, int64_t n, b
     ray_col_want_rows(vec, idx, n);
 }
 
+/* STR gather in two parallel passes.  A STR cell is a 16-byte descriptor
+ * (inline up to 12 bytes, else an offset into the vector's immutable pool),
+ * so the tasks first count the pooled bytes of their rows, a prefix sum over
+ * the tasks places each task's region of the output pool, then every task
+ * copies its descriptors and pooled bytes into disjoint ranges.  The
+ * per-cell ray_str_vec_set it replaces (a copy-on-write check and a pool
+ * growth per cell, serial) was the whole cost of compacting a STR key over
+ * millions of rows.  NULL when the pooled bytes pass the u32 offsets, the
+ * per-cell path then reports it. */
+typedef struct {
+    const ray_str_t* src;
+    const char*      spool;
+    const int64_t*   idx;
+    ray_str_t*       dst;
+    char*            dpool;
+    int64_t          n;
+    uint32_t         tasks;
+    uint64_t*        bytes;     /* [tasks + 1]: pooled bytes per task, then their prefix */
+    _Atomic(bool)    empty;     /* a zero-length cell: the output is marked HAS_NULLS */
+} gbi_str_ctx_t;
+
+static void gbi_str_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gbi_str_ctx_t* c = (gbi_str_ctx_t*)ctxp;
+    bool empty = false;
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = c->n * t / c->tasks, hi = c->n * (t + 1) / c->tasks;
+        uint64_t b = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            uint32_t l = c->src[c->idx[i]].len;
+            if (l > RAY_STR_INLINE_MAX) b += l;
+            else if (l == 0) empty = true;
+        }
+        c->bytes[t] = b;
+    }
+    if (empty) atomic_store_explicit(&c->empty, true, memory_order_relaxed);
+}
+
+static void gbi_str_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const gbi_str_ctx_t* c = (const gbi_str_ctx_t*)ctxp;
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = c->n * t / c->tasks, hi = c->n * (t + 1) / c->tasks;
+        uint64_t off = c->bytes[t];
+        for (int64_t i = lo; i < hi; i++) {
+            const ray_str_t* s = &c->src[c->idx[i]];
+            ray_str_t* d = &c->dst[i];
+            if (ray_str_is_inline(s)) { *d = *s; continue; }
+            memcpy(c->dpool + off, c->spool + s->pool_off, s->len);
+            *d = *s;                      /* len, prefix and the content hash */
+            d->pool_off = (uint32_t)off;
+            off += s->len;
+        }
+    }
+}
+
+static ray_t* gbi_str(ray_t* vec, const int64_t* idx, int64_t n) {
+    ray_t* owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
+    int64_t base = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_offset : 0;
+    gbi_str_ctx_t c;
+    memset(&c, 0, sizeof c);
+    c.src = (const ray_str_t*)ray_data(owner) + base;
+    c.spool = owner->str_pool ? (const char*)ray_data(owner->str_pool) : NULL;
+    c.idx = idx;
+    c.n = n;
+    atomic_store_explicit(&c.empty, false, memory_order_relaxed);
+    ray_pool_t* gpool = ray_pool_get();
+    bool par = n > 0 && gbi_par_ok(gpool, n);
+    /* tasks of at least a morsel: the prefix sum below is over them */
+    c.tasks = par ? ray_pool_total_workers(gpool) * 4 : 1;
+    if (c.tasks > RAY_POOL_INIT_TASKS) c.tasks = RAY_POOL_INIT_TASKS;
+    while (c.tasks > 1 && n / c.tasks < RAY_MORSEL_ELEMS) c.tasks /= 2;
+    ray_t* bytes_hdr = ray_alloc(((size_t)c.tasks + 1) * sizeof(uint64_t));
+    if (!bytes_hdr || RAY_IS_ERR(bytes_hdr)) return bytes_hdr ? bytes_hdr : ray_error("oom", NULL);
+    c.bytes = (uint64_t*)ray_data(bytes_hdr);
+    ray_t* result = ray_vec_new(RAY_STR, n);
+    if (!result || RAY_IS_ERR(result)) { ray_free(bytes_hdr); return result ? result : ray_error("oom", NULL); }
+    result->len = n;
+    if (n > 0) {
+        if (c.tasks > 1) ray_pool_dispatch_n(gpool, gbi_str_count_fn, &c, c.tasks);
+        else gbi_str_count_fn(&c, 0, 0, 1);
+        uint64_t total = 0;
+        for (uint32_t t = 0; t < c.tasks; t++) { uint64_t b = c.bytes[t]; c.bytes[t] = total; total += b; }
+        c.bytes[c.tasks] = total;
+        if (total > UINT32_MAX) { ray_release(result); ray_free(bytes_hdr); return NULL; }
+        if (total > 0) {
+            ray_t* sp = ray_alloc((size_t)total);
+            if (!sp || RAY_IS_ERR(sp)) { ray_release(result); ray_free(bytes_hdr); return ray_error("oom", NULL); }
+            sp->type = RAY_U8;
+            sp->len = (int64_t)total;
+            result->str_pool = sp;
+            c.dpool = (char*)ray_data(sp);
+        }
+        c.dst = (ray_str_t*)ray_data(result);
+        if (c.tasks > 1) ray_pool_dispatch_n(gpool, gbi_str_fill_fn, &c, c.tasks);
+        else gbi_str_fill_fn(&c, 0, 0, 1);
+        /* the pool skips the tasks of a cancelled query: their cells are unwritten */
+        if (c.tasks > 1 && (ray_interrupted() ||
+                            atomic_load_explicit(&gpool->cancelled, memory_order_acquire))) {
+            ray_release(result); ray_free(bytes_hdr);
+            return ray_error("cancel", NULL);
+        }
+        if (atomic_load_explicit(&c.empty, memory_order_relaxed)) result->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_free(bytes_hdr);
+    return result;
+}
+
 /* Reorder vector elements by an index array */
 ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     int8_t type = vec->type;
@@ -2798,7 +2906,10 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     bool has_nulls = ray_vec_may_have_nulls(vec);
 
     if (type == RAY_STR) {
-        ray_t* result = ray_vec_new(type, n);
+        ray_t* result = gbi_str(vec, idx, n);
+        if (result) return result;
+        /* the pooled bytes pass UINT32_MAX: the per-cell path's error */
+        result = ray_vec_new(type, n);
         if (RAY_IS_ERR(result)) return result;
         result->len = n;
         for (int64_t i = 0; i < n; i++) {

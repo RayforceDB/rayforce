@@ -481,3 +481,39 @@
 (at (select {u: (count (distinct x)) from: Tff by: [k k2] take: 4}) 'k) -- [0 39 38 37]
 (at (select {u: (count (distinct x)) from: Tff by: [k k2] take: 4}) 'k2) -- [0 1 2 3]
 (at (select {u: (count (distinct x)) from: Tff where: (> i 600) by: k take: 100}) 'k) -- (at (xasc (select {f: (first nf) from: (update {from: Tff nf: nf}) where: (> i 600) by: k}) 'f) 'k)
+
+;; ── few groups over many rows: the row-map kernel, partitioned by value ──
+;; Under 4096 groups and from 200000 rows the per-group count(distinct)
+;; runs over the row→group map (ray_count_distinct_per_group) partitioned
+;; by the (group, value) hash, so one large group spreads over the workers
+;; instead of the per-group slices (one serial dedup per group).  A second
+;; output beside the count(distinct) keeps the select off the two-pass
+;; rewrite.  Oracle: each group's rows deduplicated by the plain distinct.
+(set nq (til 300000))
+(set xq (at (select {from: (table [i] (list nq)) x: (if (== (% i 97) 0) 0N (% (* i 7919) 50021))}) 'x))
+(set fq (at (select {from: (table [i] (list nq)) f: (if (== (% i 89) 0) 0Nf (as 'F64 (% (* i 13) 20011)))}) 'f))
+(set sq (as 'SYMBOL (concat "s" (as 'STR (% (* nq 31) 3001)))))
+(set Tq (table [k3 k40 x f s i] (list (% nq 3) (% (* nq 7) 40) xq fq sq nq)))
+(set Rq3 (select {from: Tq by: {g: k3} c: (count x) u: (count (distinct x)) uf: (count (distinct f)) us: (count (distinct s))}))
+(count Rq3) -- 3
+(at Rq3 'g) -- [0 1 2]
+(at Rq3 'c) -- [100000 100000 100000]
+(at Rq3 'u) -- (map (fn [g] (count (distinct (at xq (where (== (% nq 3) g)))))) [0 1 2])
+(at Rq3 'uf) -- (map (fn [g] (count (distinct (at fq (where (== (% nq 3) g)))))) [0 1 2])
+(at Rq3 'us) -- (map (fn [g] (count (distinct (at sq (where (== (% nq 3) g)))))) [0 1 2])
+;; 40 groups, a where, a computed key: the same oracle over the kept rows
+;; (an integer key's groups come out in the order of its route: compared sorted)
+(set Rq40 (xasc (select {from: Tq by: {g: (+ k40 1)} c: (count x) u: (count (distinct x)) where: (> i 1000)}) 'g))
+(count Rq40) -- 40
+(at Rq40 'g) -- (+ 1 (til 40))
+(at Rq40 'u) -- (map (fn [g] (count (distinct (at xq (where (and (== (% (* nq 7) 40) (- g 1)) (> nq 1000))))))) (at Rq40 'g))
+(sum (at Rq40 'c)) -- 298999
+;; 256 groups: the kernel runs here with 2 to 15 workers; the 3 and 40 group
+;; cases above run it from 4 workers (3 groups also from 16), and the gate sends the
+;; rest to the per-group slices (same results either way).
+(set Rq256 (xasc (select {from: Tq by: {g: (% (* nq 7) 256)} c: (count x) u: (count (distinct x))}) 'g))
+(count Rq256) -- 256
+(at Rq256 'u) -- (map (fn [g] (count (distinct (at xq (where (== (% (* nq 7) 256) g)))))) (til 256))
+;; the null is one value of the column: groups whose rows hold it count it
+(set xh (at (select {from: (table [i] (list nq)) x: (if (== (% i 2) 0) 0N (% i 5))}) 'x))
+(at (select {from: (table [k x] (list (% nq 2) xh)) by: {g: k} c: (count x) u: (count (distinct x))}) 'u) -- [1 5]

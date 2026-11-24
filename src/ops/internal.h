@@ -1809,6 +1809,12 @@ ray_t* distinct_radix_first_ids(ray_t* input);
  * n_groups, or NULL if `src->type` isn't a supported scalar/SYM type
  * (caller falls back to per-group exec_count_distinct).  Errors are
  * returned as RAY_IS_ERR ray_t*. */
+/* Up to this many groups, ray_count_distinct_per_group partitions the rows
+ * by (group, value), so few large groups spread over the workers; the
+ * select routes such shapes to it (ray_cd_few_groups_kernel_ok: workers to
+ * spread over, room for its buffers) instead of the per-group slices. */
+#define CDPG_FEW_GROUPS 4096
+bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups);
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups);
 

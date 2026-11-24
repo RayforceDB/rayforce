@@ -494,6 +494,17 @@ ray_t* ray_hnsw_free_fn(ray_t* h);
 ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h);
 ray_t* ray_hnsw_load_fn(ray_t* path);
 ray_t* ray_hnsw_info_fn(ray_t* h);
+/* The exact nearest-neighbour search (ops/embedding.c), shared by .emb.knn
+ * and by the query's nearest: operator: the k nearest of the rows of `col`
+ * (all, or the n listed in `only`) to `query`, into ids and dists, nearest
+ * first, lower being closer (an inner product comes negated).  Returns how
+ * many, or a code below; on RAY_EMB_KNN_BAD_ROW *bad_row is the row that is
+ * no numeric vector of length dim.  `metric` is a ray_hnsw_metric_t. */
+#define RAY_EMB_KNN_OOM       (-1)
+#define RAY_EMB_KNN_BAD_ROW   (-2)
+#define RAY_EMB_KNN_CANCELLED (-3)
+int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float* query, int32_t dim,
+                         int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row);
 ray_t* ray_emb_model_get_fn(ray_t* path);
 ray_t* ray_emb_model_info_fn(ray_t* h);
 ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x);
