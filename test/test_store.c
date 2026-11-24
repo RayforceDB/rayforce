@@ -1476,46 +1476,82 @@ static test_result_t test_file_rename_op(void) {
     PASS();
 }
 
+#ifdef RAY_OS_LINUX
+/* RLIMIT_FSIZE at `bytes`, SIGXFSZ ignored: a write past it fails EFBIG.
+ * For a test's child (test_child_spawn), right before the call it tests. */
+static bool store_child_fsize(rlim_t bytes) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_FSIZE, &limit)) return false;
+    limit.rlim_cur = bytes;
+    return signal(SIGXFSZ, SIG_IGN) != SIG_ERR && setrlimit(RLIMIT_FSIZE, &limit) == 0;
+}
+
+/* test_col_close_failure's value of kind `type` (0..4): an I64 vector, a
+ * STR vector, a list of a string, a list of a vector, a table. */
+static ray_t* close_failure_value(int type) {
+    int64_t data[] = {1,2,3,4};
+    ray_t* i64 = ray_vec_from_raw(RAY_I64,data,4);
+    if (!i64 || RAY_IS_ERR(i64)) return i64;
+    ray_t* v = NULL;
+    switch (type) {
+    case 0: return i64;
+    case 1:
+        v = ray_vec_new(RAY_STR,0);
+        v = ray_str_vec_append(v,"a buffered string payload",25);
+        break;
+    case 2: {
+        v = ray_list_new(0);
+        ray_t* text = ray_str("a buffered string payload",25);
+        v = ray_list_append(v,text); ray_release(text);
+        break;
+    }
+    case 3:
+        v = ray_list_new(0);
+        v = ray_list_append(v,i64);
+        break;
+    default:
+        v = ray_table_new(0);
+        v = ray_table_add_col(v,ray_sym_intern("v",1),i64);
+        break;
+    }
+    ray_release(i64);
+    return v;
+}
+
+/* Child: save value `type` to `path` (durably or in bulk) past a 33-byte
+ * file limit; 0 when the save says io. */
+int store_child_col_close_failure(int argc, char** argv) {
+    if (argc != 3) return 2;
+    store_setup();
+    ray_t* v = close_failure_value(atoi(argv[0]));
+    if (!v || RAY_IS_ERR(v)) return 2;
+    if (!store_child_fsize(33)) return 2;
+    ray_err_t err = atoi(argv[1]) ? ray_col_save(v,argv[2]) : ray_col_save_bulk(v,argv[2]);
+    return err == RAY_ERR_IO ? 0 : 1;
+}
+#endif
+
 static test_result_t test_col_close_failure(void) {
 #ifdef RAY_OS_LINUX
-    int64_t data[] = {1,2,3,4};
-    ray_t* values[5];
-    values[0] = ray_vec_from_raw(RAY_I64,data,4);
-    values[1] = ray_vec_new(RAY_STR,0);
-    values[1] = ray_str_vec_append(values[1],"a buffered string payload",25);
-    values[2] = ray_list_new(0);
-    ray_t* text = ray_str("a buffered string payload",25);
-    values[2] = ray_list_append(values[2],text); ray_release(text);
-    values[3] = ray_list_new(0);
-    values[3] = ray_list_append(values[3],values[0]);
-    values[4] = ray_table_new(0);
-    values[4] = ray_table_add_col(values[4],ray_sym_intern("v",1),values[0]);
     char path[160], temp[180];
     snprintf(path,sizeof(path),"/tmp/rayforce-close-failure-%d",(int)getpid());
     snprintf(temp,sizeof(temp),"%s.tmp",path);
     for (int type = 0; type < 5; type++) for (int durable = 0; durable < 2; durable++) {
-        TEST_ASSERT_NOT_NULL(values[type]); TEST_ASSERT_FALSE(RAY_IS_ERR(values[type]));
+        ray_t* v = close_failure_value(type);
+        TEST_ASSERT_NOT_NULL(v); TEST_ASSERT_FALSE(RAY_IS_ERR(v));
+        ray_release(v);
         FILE* f = fopen(path,"wb"); TEST_ASSERT_NOT_NULL(f);
         TEST_ASSERT_EQ_I(fwrite("original",1,8,f),8); TEST_ASSERT_EQ_I(fclose(f),0);
-        pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-        if (!pid) {
-            struct rlimit limit;
-            if (getrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
-            limit.rlim_cur = 33;
-            if (signal(SIGXFSZ,SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE,&limit)) _exit(2);
-            ray_err_t err = durable ? ray_col_save(values[type],path) : ray_col_save_bulk(values[type],path);
-            _exit(err == RAY_ERR_IO ? 0 : 1);
-        }
-        int status;
-        TEST_ASSERT_EQ_I(waitpid(pid,&status,0),pid);
-        TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status),0);
+        char ts[8], ds[8];
+        snprintf(ts,sizeof ts,"%d",type); snprintf(ds,sizeof ds,"%d",durable);
+        const char* args[] = { ts, ds, path, NULL };
+        TEST_ASSERT_EQ_I(test_child_run("store/col_close_failure", args), 0);
         f = fopen(path,"rb"); TEST_ASSERT_NOT_NULL(f);
         char bytes[16]; size_t n = fread(bytes,1,sizeof(bytes),f); fclose(f);
         TEST_ASSERT_EQ_I(n,8); TEST_ASSERT_TRUE(!memcmp(bytes,"original",8));
         TEST_ASSERT_TRUE(access(temp,F_OK) != 0);
     }
     unlink(path);
-    for (int i = 4; i >= 0; i--) ray_release(values[i]);
     PASS();
 #else
     SKIP("requires Linux RLIMIT_FSIZE fault injection");
@@ -1525,13 +1561,39 @@ static test_result_t test_col_close_failure(void) {
 /* A failed index append must leave the column loadable: without the index
  * marker the loader requires the exact payload length, so a partial region
  * would turn a best-effort accelerator into an unreadable column. */
+#ifdef RAY_OS_LINUX
+/* test_col_append_index_rollback's column: n rows of i * 3. */
+static ray_t* append_rollback_col(int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I64, n);
+    if (!v || RAY_IS_ERR(v)) return v;
+    v->len = n;
+    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i * 3;
+    return v;
+}
+
+/* Child: append the zone index of n rows of i * 3 to `path`, whose payload
+ * is `payload` bytes, past a limit the pad fits and the region does not;
+ * 0 when the append fails. */
+int store_child_col_append_index_rollback(int argc, char** argv) {
+    if (argc != 3) return 2;
+    store_setup();
+    int64_t n = atoll(argv[1]);
+    ray_t* v = append_rollback_col(n);
+    if (!v || RAY_IS_ERR(v)) return 2;
+    ray_t* r = ray_index_attach_zone(&v);
+    if (!r || RAY_IS_ERR(r)) return 2;
+    const ray_index_t* ix = ray_index_payload(v->index);
+    if (!ix) return 2;
+    if (!store_child_fsize((rlim_t)atoll(argv[2]) + 40)) return 2;   /* pad fits, region doesn't */
+    return ray_col_append_index(argv[0], ix, n, RAY_I64) != RAY_OK ? 0 : 1;
+}
+#endif
+
 static test_result_t test_col_append_index_rollback(void) {
 #ifdef RAY_OS_LINUX
     int64_t n = 100000;
-    ray_t* v = ray_vec_new(RAY_I64, n);
+    ray_t* v = append_rollback_col(n);
     TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
-    v->len = n;
-    for (int64_t i = 0; i < n; i++) ((int64_t*)ray_data(v))[i] = i * 3;
     char path[160];
     snprintf(path, sizeof(path), "/tmp/rayforce-append-rollback-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_col_save(v, path), RAY_OK);
@@ -1545,17 +1607,13 @@ static test_result_t test_col_append_index_rollback(void) {
     const ray_index_t* ix = ray_index_payload(w->index);
     TEST_ASSERT_NOT_NULL(ix);
 
-    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        struct rlimit limit;
-        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        limit.rlim_cur = (rlim_t)payload + 40;     /* pad fits, region doesn't */
-        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        _exit(ray_col_append_index(path, ix, n, RAY_I64) != RAY_OK ? 0 : 1);
+    {
+        char ns[32], ps[32];
+        snprintf(ns, sizeof ns, "%lld", (long long)n);
+        snprintf(ps, sizeof ps, "%lld", (long long)payload);
+        const char* args[] = { path, ns, ps, NULL };
+        TEST_ASSERT_EQ_I(test_child_run("store/col_append_index_rollback", args), 0);
     }
-    int status;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
 
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
     TEST_ASSERT_EQ_I((int64_t)st.st_size, (int64_t)payload);
@@ -2255,34 +2313,52 @@ static test_result_t test_stream_sym_lut_stale(void) {
 
 /* An index region that cannot be written (ENOSPC/EFBIG) is dropped: close
  * cuts the file back to the payload and publishes the column without the
- * index.  Everything runs in the forked child so no FILE* state is shared
- * with the parent; the child exits 0 only if close returned RAY_OK. */
+ * index.  Everything runs in a child process of its own (test_child_spawn)
+ * so no FILE* state is shared with the parent; the child exits 0 only if
+ * close returned RAY_OK. */
+#ifdef RAY_OS_LINUX
+/* test_stream_index_write_failure_drops_index's column: n rows of i * 3,
+ * clustered, no nulls. */
+static ray_t* stream_enospc_col(int64_t n) {
+    ray_t* v = zone_test_col(n, 0, 0);
+    if (!v) return NULL;
+    int64_t* d = (int64_t*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) d[i] = i * 3;
+    v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
+    return v;
+}
+
+/* Child: stream that column into `dir` with its index, and close it past a
+ * file limit the payload fits and the index region does not; 0 when the
+ * close says ok. */
+int store_child_stream_index_write_failure(int argc, char** argv) {
+    if (argc != 2) return 2;
+    store_setup();
+    int64_t n = atoll(argv[1]);
+    ray_t* v = stream_enospc_col(n);
+    if (!v) return 2;
+    ray_col_stream_t w;
+    if (ray_col_stream_open(&w, argv[0], ray_sym_intern("c", 1), RAY_I64, NULL, 0) != RAY_OK) return 2;
+    if (ray_col_stream_index_begin(&w, 0) != RAY_OK) return 2;
+    if (ray_col_stream_append(&w, v) != RAY_OK) return 2;
+    if (!store_child_fsize((rlim_t)(32 + n * 8 + 40))) return 2;
+    return ray_col_stream_close(&w, false) == RAY_OK ? 0 : 1;
+}
+#endif
+
 static test_result_t test_stream_index_write_failure_drops_index(void) {
 #ifdef RAY_OS_LINUX
     char dir[160]; snprintf(dir, sizeof(dir), "/tmp/rayforce-stream-enospc-%d", (int)getpid());
     TEST_ASSERT_EQ_I(ray_test_mkdir_p(dir), 0);
     int64_t n = 70000;
-    ray_t* v = zone_test_col(n, 0, 0);
+    ray_t* v = stream_enospc_col(n);
     TEST_ASSERT_NOT_NULL(v);
-    int64_t* d = (int64_t*)ray_data(v);
-    for (int64_t i = 0; i < n; i++) d[i] = i * 3;     /* clustered, no nulls */
-    v->attrs &= (uint8_t)~RAY_ATTR_HAS_NULLS;
     char path[200]; snprintf(path, sizeof(path), "%s/c", dir);
-    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        ray_col_stream_t w;
-        if (ray_col_stream_open(&w, dir, ray_sym_intern("c", 1), RAY_I64, NULL, 0) != RAY_OK) _exit(2);
-        if (ray_col_stream_index_begin(&w, 0) != RAY_OK) _exit(2);
-        if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
-        struct rlimit limit;
-        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        limit.rlim_cur = (rlim_t)(32 + n * 8 + 40);
-        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        _exit(ray_col_stream_close(&w, false) == RAY_OK ? 0 : 1);
+    {
+        char ns[32]; snprintf(ns, sizeof ns, "%lld", (long long)n);
+        const char* args[] = { dir, ns, NULL };
+        TEST_ASSERT_EQ_I(test_child_run("store/stream_index_write_failure", args), 0);
     }
-    int status;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
     struct stat st;
     TEST_ASSERT_EQ_I(stat(path, &st), 0);
     TEST_ASSERT_EQ_I((int64_t)st.st_size, 32 + n * 8);
@@ -2961,6 +3037,29 @@ static test_result_t test_splay_save_cancel_leaks(void) {
 #endif
 }
 
+#ifdef RAY_OS_LINUX
+/* Child: build `path`'s hash index in place with the injection that ends
+ * the process after the region is written and before the marker (exit 86
+ * from inside; 3 if it returns). */
+int store_child_hash_index_marker_last(int argc, char** argv) {
+    if (argc != 1) return 2;
+    store_setup();
+    if (setenv("RAY_HASH_INJECT", "premarker", 1)) return 2;
+    (void)store_hash_build(argv[0]);
+    return 3;                                      /* not reached: it ends inside */
+}
+
+/* Child: build `path`'s hash index in place past a file limit the pad of
+ * its `payload`-byte file fits and the region does not; 0 when the build
+ * says nyi (the caller builds in memory). */
+int store_child_hash_index_rollback(int argc, char** argv) {
+    if (argc != 2) return 2;
+    store_setup();
+    if (!store_child_fsize((rlim_t)atoll(argv[1]) + 40)) return 2;   /* the pad fits, the region doesn't */
+    return store_hash_build(argv[0]) == RAY_ERR_NYI ? 0 : 1;
+}
+#endif
+
 /* The marker goes on last: a process that ends with the whole region
  * written but before the marker (debug builds end it right there, in a
  * child) leaves a file that does not claim an index: it loads as the plain
@@ -2979,15 +3078,10 @@ static test_result_t test_col_build_hash_index_marker_last(void) {
     TEST_ASSERT_EQ_I(ray_col_save_bulk(v, r), RAY_OK);
     int64_t payload = store_file_size(p);
     TEST_ASSERT_EQ_I(store_hash_build(r), RAY_OK);
-    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        if (setenv("RAY_HASH_INJECT", "premarker", 1)) _exit(2);
-        (void)store_hash_build(p);
-        _exit(3);                                  /* not reached: it ends inside */
+    {
+        const char* args[] = { p, NULL };
+        TEST_ASSERT_EQ_I(test_child_run("store/hash_index_marker_last", args), 86);
     }
-    int status;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 86);
     /* the whole region is there, the header claims nothing */
     TEST_ASSERT_EQ_I(store_file_size(p), store_file_size(r));
     TEST_ASSERT_TRUE(store_file_size(p) > payload);
@@ -3027,17 +3121,11 @@ static test_result_t test_col_build_hash_index_rollback(void) {
     ray_t* v = store_hash_col(RAY_I64, n, 997, 0);
     TEST_ASSERT_EQ_I(ray_col_save_bulk(v, p), RAY_OK);
     int64_t payload = store_file_size(p);
-    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        struct rlimit limit;
-        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        limit.rlim_cur = (rlim_t)payload + 40;     /* the pad fits, the region doesn't */
-        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        _exit(store_hash_build(p) == RAY_ERR_NYI ? 0 : 1);
+    {
+        char ps[32]; snprintf(ps, sizeof ps, "%lld", (long long)payload);
+        const char* args[] = { p, ps, NULL };
+        TEST_ASSERT_EQ_I(test_child_run("store/hash_index_rollback", args), 0);
     }
-    int status;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
     TEST_ASSERT_EQ_I(store_file_size(p), payload);
     ray_t* back = ray_col_mmap(p);
     TEST_ASSERT_TRUE(back && !RAY_IS_ERR(back));
@@ -8471,6 +8559,16 @@ static test_result_t test_col_save_nyi_type(void) {
     unlink(ray_test_tmp(TMP_COL_PATH));
     PASS();
 }
+
+/* The children above need Linux (RLIMIT_FSIZE injection); elsewhere they
+ * are not spawned, and test/main.c's table still names them. */
+#if !defined(_WIN32) && !defined(RAY_OS_LINUX)
+int store_child_col_close_failure(int argc, char** argv) { (void)argc; (void)argv; return 125; }
+int store_child_col_append_index_rollback(int argc, char** argv) { (void)argc; (void)argv; return 125; }
+int store_child_stream_index_write_failure(int argc, char** argv) { (void)argc; (void)argv; return 125; }
+int store_child_hash_index_marker_last(int argc, char** argv) { (void)argc; (void)argv; return 125; }
+int store_child_hash_index_rollback(int argc, char** argv) { (void)argc; (void)argv; return 125; }
+#endif
 
 const test_entry_t store_entries[] = {
     { "store/col_mmap_i64", test_col_mmap_i64, store_setup, store_teardown },

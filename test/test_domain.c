@@ -2748,6 +2748,13 @@ static int dom_app_failed_child(const char* p, const char* q, long size0, int64_
     ray_sym_domain_release(d);
     return 0;
 }
+
+/* Child (test_child_spawn): dom_app_failed_child in a fresh process. */
+int dom_child_append_failed(int argc, char** argv) {
+    if (argc != 4) return 2;
+    domain_setup();
+    return dom_app_failed_child(argv[0], argv[1], atol(argv[2]), (int64_t)atoll(argv[3]));
+}
 #endif
 
 /* An append that fails partway (here a write past RLIMIT_FSIZE, in a child
@@ -2773,13 +2780,11 @@ static test_result_t test_domain_append_failed(void) {
     ray_sym_domain_release(d);
     struct stat st;
     TEST_ASSERT_EQ_I(stat(p, &st), 0);
-    int rc = -1;
-    pid_t pid = fork();
-    if (pid == 0) _exit(dom_app_failed_child(p, q, (long)st.st_size, n0));
-    TEST_ASSERT_TRUE(pid > 0);
-    int ws = 0;
-    TEST_ASSERT_EQ_I(waitpid(pid, &ws, 0), pid);
-    if (WIFEXITED(ws)) rc = WEXITSTATUS(ws);
+    char ss[32], ns[32];
+    snprintf(ss, sizeof ss, "%ld", (long)st.st_size);
+    snprintf(ns, sizeof ns, "%lld", (long long)n0);
+    const char* args[] = { p, q, ss, ns, NULL };
+    int rc = test_child_run("domain/append_failed", args);
     dom_app_clean(p); dom_app_clean(q);
     TEST_ASSERT_EQ_I(rc, 0);
     PASS();
