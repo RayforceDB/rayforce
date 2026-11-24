@@ -1,0 +1,71 @@
+;; @also-unfused
+;; #1468: an update of a LIST column under where: or by: keeps the column a
+;; boxed list, as the keyless update does (#1458): the kept rows take their
+;; cell of the value (an atom boxed into each), the others keep theirs.
+;; Both routes allocated the column as a typed vector and failed with
+;; "vec_new: ... got LIST"; by: failed so for any LIST column of the table,
+;; even when another column was updated.
+(set L (table [k l v] (list [1 1 2] (list [1 2] "x" 'y) [10 20 30])))
+;; keyless, as before
+(at (update {l: (list 7 'a 9) from: L}) 'l) -- (list 7 'a 9)
+(at (update {l: 7 from: L}) 'l) -- (list 7 7 7)
+;; where:
+(at (update {l: 7 from: L where: (== k 1)}) 'l) -- (list 7 7 'y)
+(at (update {l: (list 7 'a 9) from: L where: (== k 1)}) 'l) -- (list 7 'a 'y)
+(at (update {l: 'a from: L where: (== k 1)}) 'l) -- (list 'a 'a 'y)
+(at (update {l: "s" from: L where: (== k 2)}) 'l) -- (list [1 2] "x" "s")
+(at (update {l: (* v 2) from: L where: (> v 15)}) 'l) -- (list [1 2] 40 60)
+(at (update {l: 7 from: L where: (== k 9)}) 'l) -- (at L 'l)
+(type (at (update {l: 7 from: L where: (== k 1)}) 'l)) -- 'LIST
+(update {l: [5 6] from: L where: (== k 1)}) !- length
+;; by:
+(at (update {l: 'a from: L by: k}) 'l) -- (list 'a 'a 'a)
+(type (at (update {l: 'a from: L by: k}) 'l)) -- 'LIST
+(at (update {l: (count l) from: L by: k}) 'l) -- (list 2 2 1)
+(at (update {l: (reverse l) from: L by: k}) 'l) -- (list "x" [1 2] 'y)
+(at (update {l: (* v 2) from: L by: k}) 'l) -- (list 20 40 60)
+(at (update {l: (* k 10) from: L by: k}) 'l) -- (list 10 10 20)
+(update {l: [1 2 3] from: L by: k}) !- length
+;; another column under by:, beside a LIST column
+(at (update {v: (sum v) from: L by: k}) 'v) -- [30 30 30]
+(at (update {v: (count l) from: L by: k}) 'v) -- [2 2 1]
+(at (update {v: (sum v) from: L by: k}) 'l) -- (at L 'l)
+;; in place, by name
+(set M L)
+(update {l: 7 from: 'M where: (== k 1)})
+(at M 'l) -- (list 7 7 'y)
+(set M L)
+(update {l: 'a from: 'M by: k})
+(at M 'l) -- (list 'a 'a 'a)
+;; first and last of a LIST column are one cell per group (or for the
+;; rows), as select gives them: every row of the group holds that cell,
+;; a one-element cell and one as long as the group included.  The oracle
+;; is select by: with each row taking its group's cell.
+(set U (table [g v l] (list ['a 'a 'a 'b 'b] [1 2 3 4 5] (list [1 2] [3] [7] [8 9 10] [4]))))
+(at (select {f: (last l) from: U by: g}) 'f) -- (list [7] [4])
+(at (update {l: (last l) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
+(at (select {f: (first l) from: U by: g}) 'f) -- (list [1 2] [8 9 10])
+(at (update {l: (first l) from: U by: g}) 'l) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(at (update {l: (first (reverse l)) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
+(at (update {w: (first l) from: U by: g}) 'w) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(set T2 (table [g v l] (list ['a 'a 'b 'b] [1 2 3 4] (list [1 2] [3] (as 'I64 []) [4 5 6]))))
+(at (update {l: (first l) from: T2 by: g}) 'l) -- (list [1 2] [1 2] (as 'I64 []) (as 'I64 []))
+;; keyless and under where:, of the rows it keeps
+(at (update {l: (first l) from: T2}) 'l) -- (list [1 2] [1 2] [1 2] [1 2])
+(at (update {l: (last l) from: U}) 'l) -- (list [4] [4] [4] [4] [4])
+(at (update {w: (first l) from: U}) 'w) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(at (update {l: (first l) from: T2 where: (> v 2)}) 'l) -- (list [1 2] [3] (as 'I64 []) (as 'I64 []))
+(at (update {l: (last l) from: U where: (> v 3)}) 'l) -- (list [1 2] [3] [7] [4] [4])
+;; in place
+(set M2 T2)
+(update {l: (first l) from: 'M2 where: (> v 2)})
+(at M2 'l) -- (list [1 2] [3] (as 'I64 []) (as 'I64 []))
+(set M2 T2)
+(update {l: (first l) from: 'M2 by: g})
+(at M2 'l) -- (list [1 2] [1 2] (as 'I64 []) (as 'I64 []))
+;; a cell into a typed column is a type error, as a LIST value is
+(update {v: (first l) from: U by: g}) !- type
+(update {v: (first l) from: U}) !- type
+;; other aggregates and per-row values are unchanged
+(at (update {l: (count l) from: U by: g}) 'l) -- (list 3 3 3 2 2)
+(at (update {v: (last v) from: U by: g}) 'v) -- [3 3 3 5 5]

@@ -1,0 +1,197 @@
+;; @also-unfused
+;; #1468: the rule for an update over a LIST column, written once.
+;; - first and last of a LIST column (also of an expression over one) give
+;;   one cell per group (by:) or for the rows (keyless, where:), as select
+;;   gives it, and every row of the group, or every kept row, holds that
+;;   cell; a where: that keeps no row leaves the column unchanged.
+;; - a row-wise expression (the column itself, reverse, at with a column
+;;   index) gives each row its own cell; under by: an index counts within
+;;   the group, as a typed column's update does.
+;; - an aggregate that gives an atom (count) fills the rows with it.
+;; - a value of another length raises length, as documented, a constant
+;;   list included.
+;; - at with a constant index over a LIST column under by: raises: whether
+;;   the index counts within each group is #1429's open question, and every
+;;   update by: of a LIST column raised on dev.  Keyless and under where:
+;;   it keeps dev's answer.
+;; - a new column under where: from first/last of a LIST column keeps dev's
+;;   legacy answer: a one-element cell collapses to its value, any other
+;;   fails as on dev (the open design question #1574).
+;; Every form is crossed with by:, keyless, where: keeping all, some and no
+;; rows, a copy, in place, and a new column.
+(set U (table [g v i l] (list ['a 'a 'a 'b 'b] [1 2 3 4 5] [1 0 2 1 0] (list [1 2] [3] [7] [8 9 10] [4]))))
+;; the oracle for the cell forms: select, each group's (or the kept rows')
+;; cell written back to its rows
+(set J (fn [S] (map (fn [x] (at (at S 'f) (first (where (== (at S 'g) x))))) (at U 'g))))
+(at (update {l: (first l) from: U by: g}) 'l) -- (J (select {f: (first l) from: U by: g}))
+(at (update {l: (last l) from: U by: g}) 'l) -- (J (select {f: (last l) from: U by: g}))
+(at (update {l: (first (reverse l)) from: U by: g}) 'l) -- (J (select {f: (first (reverse l)) from: U by: g}))
+(at (update {l: (count l) from: U by: g}) 'l) -- (J (select {f: (count l) from: U by: g}))
+(at (update {l: (first l) from: U}) 'l) -- (take (at (select {f: (first l) from: U}) 'f) 5)
+(at (update {l: (last l) from: U where: (> v 2)}) 'l) -- (concat (take (at U 'l) 2) (take (at (select {f: (last l) from: U where: (> v 2)}) 'f) 3))
+;; the matrix
+(at (update {l: (first l) from: U by: g}) 'l) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(do (set M U) (update {l: (first l) from: 'M by: g}) (at M 'l)) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(at (update {l: (first l) from: U }) 'l) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(do (set M U) (update {l: (first l) from: 'M }) (at M 'l)) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(at (update {l: (first l) from: U where: (> v 0)}) 'l) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(do (set M U) (update {l: (first l) from: 'M where: (> v 0)}) (at M 'l)) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(at (update {l: (first l) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [7] [7] [7])
+(do (set M U) (update {l: (first l) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [7] [7] [7])
+(at (update {l: (first l) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (first l) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (first l) from: U by: g}) 'w) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(at (update {w: (first l) from: U }) 'w) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+(at (update {w: (first l) from: U where: (> v 0)}) 'w) !- length
+(at (update {w: (first l) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 7 7 7]
+(at (update {w: (first l) from: U where: (> v 9)}) 'w) !- length
+(at (update {l: (last l) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
+(do (set M U) (update {l: (last l) from: 'M by: g}) (at M 'l)) -- (list [7] [7] [7] [4] [4])
+(at (update {l: (last l) from: U }) 'l) -- (list [4] [4] [4] [4] [4])
+(do (set M U) (update {l: (last l) from: 'M }) (at M 'l)) -- (list [4] [4] [4] [4] [4])
+(at (update {l: (last l) from: U where: (> v 0)}) 'l) -- (list [4] [4] [4] [4] [4])
+(do (set M U) (update {l: (last l) from: 'M where: (> v 0)}) (at M 'l)) -- (list [4] [4] [4] [4] [4])
+(at (update {l: (last l) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [4] [4] [4])
+(do (set M U) (update {l: (last l) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [4] [4] [4])
+(at (update {l: (last l) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (last l) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (last l) from: U by: g}) 'w) -- (list [7] [7] [7] [4] [4])
+(at (update {w: (last l) from: U }) 'w) -- (list [4] [4] [4] [4] [4])
+(at (update {w: (last l) from: U where: (> v 0)}) 'w) -- [4 4 4 4 4]
+(at (update {w: (last l) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 4 4 4]
+(at (update {w: (last l) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {l: (first (reverse l)) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
+(do (set M U) (update {l: (first (reverse l)) from: 'M by: g}) (at M 'l)) -- (list [7] [7] [7] [4] [4])
+(at (update {l: (first (reverse l)) from: U }) 'l) -- (list [4] [4] [4] [4] [4])
+(do (set M U) (update {l: (first (reverse l)) from: 'M }) (at M 'l)) -- (list [4] [4] [4] [4] [4])
+(at (update {l: (first (reverse l)) from: U where: (> v 0)}) 'l) -- (list [4] [4] [4] [4] [4])
+(do (set M U) (update {l: (first (reverse l)) from: 'M where: (> v 0)}) (at M 'l)) -- (list [4] [4] [4] [4] [4])
+(at (update {l: (first (reverse l)) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [4] [4] [4])
+(do (set M U) (update {l: (first (reverse l)) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [4] [4] [4])
+(at (update {l: (first (reverse l)) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (first (reverse l)) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (first (reverse l)) from: U by: g}) 'w) -- (list [7] [7] [7] [4] [4])
+(at (update {w: (first (reverse l)) from: U }) 'w) -- (list [4] [4] [4] [4] [4])
+(at (update {w: (first (reverse l)) from: U where: (> v 0)}) 'w) -- [4 4 4 4 4]
+(at (update {w: (first (reverse l)) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 4 4 4]
+(at (update {w: (first (reverse l)) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {l: (at l 0) from: U by: g}) 'l) !- nyi
+(do (set M U) (update {l: (at l 0) from: 'M by: g}) (at M 'l)) !- nyi
+(at (update {l: (at l 0) from: U }) 'l) !- length
+(do (set M U) (update {l: (at l 0) from: 'M }) (at M 'l)) !- length
+(at (update {l: (at l 0) from: U where: (> v 0)}) 'l) !- length
+(do (set M U) (update {l: (at l 0) from: 'M where: (> v 0)}) (at M 'l)) !- length
+(at (update {l: (at l 0) from: U where: (> v 2)}) 'l) !- length
+(do (set M U) (update {l: (at l 0) from: 'M where: (> v 2)}) (at M 'l)) !- length
+(at (update {l: (at l 0) from: U where: (> v 9)}) 'l) !- length
+(do (set M U) (update {l: (at l 0) from: 'M where: (> v 9)}) (at M 'l)) !- length
+(at (update {w: (at l 0) from: U by: g}) 'w) !- nyi
+(at (update {w: (at l 0) from: U }) 'w) !- length
+(at (update {w: (at l 0) from: U where: (> v 0)}) 'w) !- length
+(at (update {w: (at l 0) from: U where: (> v 2)}) 'w) !- length
+(at (update {w: (at l 0) from: U where: (> v 9)}) 'w) !- length
+(at (update {l: (at l 1) from: U by: g}) 'l) !- nyi
+(do (set M U) (update {l: (at l 1) from: 'M by: g}) (at M 'l)) !- nyi
+(at (update {l: (at l 1) from: U }) 'l) -- [3 3 3 3 3]
+(do (set M U) (update {l: (at l 1) from: 'M }) (at M 'l)) -- [3 3 3 3 3]
+(at (update {l: (at l 1) from: U where: (> v 0)}) 'l) -- [3 3 3 3 3]
+(do (set M U) (update {l: (at l 1) from: 'M where: (> v 0)}) (at M 'l)) -- [3 3 3 3 3]
+(at (update {l: (at l 1) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] 3 3 3)
+(do (set M U) (update {l: (at l 1) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] 3 3 3)
+(at (update {l: (at l 1) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (at l 1) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (at l 1) from: U by: g}) 'w) !- nyi
+(at (update {w: (at l 1) from: U }) 'w) -- [3 3 3 3 3]
+(at (update {w: (at l 1) from: U where: (> v 0)}) 'w) -- [3 3 3 3 3]
+(at (update {w: (at l 1) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 3 3 3]
+(at (update {w: (at l 1) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {l: (at l i) from: U by: g}) 'l) -- (list [3] [1 2] [7] [4] [8 9 10])
+(do (set M U) (update {l: (at l i) from: 'M by: g}) (at M 'l)) -- (list [3] [1 2] [7] [4] [8 9 10])
+(at (update {l: (at l i) from: U }) 'l) -- (list [3] [1 2] [7] [3] [1 2])
+(do (set M U) (update {l: (at l i) from: 'M }) (at M 'l)) -- (list [3] [1 2] [7] [3] [1 2])
+(at (update {l: (at l i) from: U where: (> v 0)}) 'l) -- (list [3] [1 2] [7] [3] [1 2])
+(do (set M U) (update {l: (at l i) from: 'M where: (> v 0)}) (at M 'l)) -- (list [3] [1 2] [7] [3] [1 2])
+(at (update {l: (at l i) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [7] [3] [1 2])
+(do (set M U) (update {l: (at l i) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [7] [3] [1 2])
+(at (update {l: (at l i) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (at l i) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (at l i) from: U by: g}) 'w) !- type
+(at (update {w: (at l i) from: U }) 'w) -- (list [3] [1 2] [7] [3] [1 2])
+(at (update {w: (at l i) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (at l i) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (at l i) from: U where: (> v 9)}) 'w) !- type
+(at (update {l: (count l) from: U by: g}) 'l) -- [3 3 3 2 2]
+(do (set M U) (update {l: (count l) from: 'M by: g}) (at M 'l)) -- [3 3 3 2 2]
+(at (update {l: (count l) from: U }) 'l) -- [5 5 5 5 5]
+(do (set M U) (update {l: (count l) from: 'M }) (at M 'l)) -- [5 5 5 5 5]
+(at (update {l: (count l) from: U where: (> v 0)}) 'l) -- [5 5 5 5 5]
+(do (set M U) (update {l: (count l) from: 'M where: (> v 0)}) (at M 'l)) -- [5 5 5 5 5]
+(at (update {l: (count l) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] 3 3 3)
+(do (set M U) (update {l: (count l) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] 3 3 3)
+(at (update {l: (count l) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (count l) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (count l) from: U by: g}) 'w) -- [3 3 3 2 2]
+(at (update {w: (count l) from: U }) 'w) -- [5 5 5 5 5]
+(at (update {w: (count l) from: U where: (> v 0)}) 'w) -- [5 5 5 5 5]
+(at (update {w: (count l) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 3 3 3]
+(at (update {w: (count l) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {l: (list 7 8) from: U by: g}) 'l) !- length
+(do (set M U) (update {l: (list 7 8) from: 'M by: g}) (at M 'l)) !- length
+(at (update {l: (list 7 8) from: U }) 'l) !- length
+(do (set M U) (update {l: (list 7 8) from: 'M }) (at M 'l)) !- length
+(at (update {l: (list 7 8) from: U where: (> v 0)}) 'l) !- length
+(do (set M U) (update {l: (list 7 8) from: 'M where: (> v 0)}) (at M 'l)) !- length
+(at (update {l: (list 7 8) from: U where: (> v 2)}) 'l) !- length
+(do (set M U) (update {l: (list 7 8) from: 'M where: (> v 2)}) (at M 'l)) !- length
+(at (update {l: (list 7 8) from: U where: (> v 9)}) 'l) !- length
+(do (set M U) (update {l: (list 7 8) from: 'M where: (> v 9)}) (at M 'l)) !- length
+(at (update {w: (list 7 8) from: U by: g}) 'w) !- type
+(at (update {w: (list 7 8) from: U }) 'w) !- length
+(at (update {w: (list 7 8) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (list 7 8) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (list 7 8) from: U where: (> v 9)}) 'w) !- type
+(at (update {l: (list 7 8 9 10 11) from: U by: g}) 'l) !- length
+(do (set M U) (update {l: (list 7 8 9 10 11) from: 'M by: g}) (at M 'l)) !- length
+(at (update {l: (list 7 8 9 10 11) from: U }) 'l) -- [7 8 9 10 11]
+(do (set M U) (update {l: (list 7 8 9 10 11) from: 'M }) (at M 'l)) -- [7 8 9 10 11]
+(at (update {l: (list 7 8 9 10 11) from: U where: (> v 0)}) 'l) -- [7 8 9 10 11]
+(do (set M U) (update {l: (list 7 8 9 10 11) from: 'M where: (> v 0)}) (at M 'l)) -- [7 8 9 10 11]
+(at (update {l: (list 7 8 9 10 11) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] 9 10 11)
+(do (set M U) (update {l: (list 7 8 9 10 11) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] 9 10 11)
+(at (update {l: (list 7 8 9 10 11) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (list 7 8 9 10 11) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (list 7 8 9 10 11) from: U by: g}) 'w) !- type
+(at (update {w: (list 7 8 9 10 11) from: U }) 'w) -- [7 8 9 10 11]
+(at (update {w: (list 7 8 9 10 11) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (list 7 8 9 10 11) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (list 7 8 9 10 11) from: U where: (> v 9)}) 'w) !- type
+(at (update {l: l from: U by: g}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: l from: 'M by: g}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {l: l from: U }) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: l from: 'M }) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {l: l from: U where: (> v 0)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: l from: 'M where: (> v 0)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {l: l from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: l from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {l: l from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: l from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: l from: U by: g}) 'w) !- type
+(at (update {w: l from: U }) 'w) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: l from: U where: (> v 0)}) 'w) !- type
+(at (update {w: l from: U where: (> v 2)}) 'w) !- type
+(at (update {w: l from: U where: (> v 9)}) 'w) !- type
+(at (update {l: (reverse l) from: U by: g}) 'l) -- (list [7] [3] [1 2] [4] [8 9 10])
+(do (set M U) (update {l: (reverse l) from: 'M by: g}) (at M 'l)) -- (list [7] [3] [1 2] [4] [8 9 10])
+(at (update {l: (reverse l) from: U }) 'l) -- (list [4] [8 9 10] [7] [3] [1 2])
+(do (set M U) (update {l: (reverse l) from: 'M }) (at M 'l)) -- (list [4] [8 9 10] [7] [3] [1 2])
+(at (update {l: (reverse l) from: U where: (> v 0)}) 'l) -- (list [4] [8 9 10] [7] [3] [1 2])
+(do (set M U) (update {l: (reverse l) from: 'M where: (> v 0)}) (at M 'l)) -- (list [4] [8 9 10] [7] [3] [1 2])
+(at (update {l: (reverse l) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [7] [3] [1 2])
+(do (set M U) (update {l: (reverse l) from: 'M where: (> v 2)}) (at M 'l)) -- (list [1 2] [3] [7] [3] [1 2])
+(at (update {l: (reverse l) from: U where: (> v 9)}) 'l) -- (list [1 2] [3] [7] [8 9 10] [4])
+(do (set M U) (update {l: (reverse l) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
+(at (update {w: (reverse l) from: U by: g}) 'w) !- type
+(at (update {w: (reverse l) from: U }) 'w) -- (list [4] [8 9 10] [7] [3] [1 2])
+(at (update {w: (reverse l) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (reverse l) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (reverse l) from: U where: (> v 9)}) 'w) !- type
