@@ -432,7 +432,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
 | `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | Replace all occurrences; lazy/DAG for vectors. An empty `to` deletes each match, an empty `from` matches nothing | `(replace "a-b" "-" "_")` → `"a_b"` |
-| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
+| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class. The pattern is a string atom, or a string column matched row by row; a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and in a query: `(concat "" "a")` is `"a"` | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 
@@ -568,7 +568,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional: condition/result pairs, optional final else. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type`; where the query leaves it to the evaluator, a condition that differs between the rows raises `nyi` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call) | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |

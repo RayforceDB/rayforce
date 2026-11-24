@@ -213,6 +213,10 @@ FAST_CFLAGS = -fPIC $(WARNS) -std=$(STD) -g -O1 -march=$(RAY_MARCH) -DDEBUG \
 STRICT_FP_CFLAGS := -fno-fast-math -fno-unsafe-math-optimizations -fno-associative-math \
   -fno-reciprocal-math -fsigned-zeros -ffp-contract=off
 FP_STRICT_src/store/enc_alp := $(STRICT_FP_CFLAGS)
+# The scalar aggregate route's floating-point products (src/ops/aggseq.c):
+# a product's bits depend on its order, so it multiplies row by row in every
+# profile, as the generic per-row path does (#1628).
+FP_STRICT_src/ops/aggseq := $(STRICT_FP_CFLAGS)
 
 CFLAGS  = $(DEBUG_CFLAGS)
 LDFLAGS = $(DEBUG_LDFLAGS)
@@ -620,6 +624,17 @@ fuzz-smoke:
 
 .PHONY: fuzz-smoke
 
+# Instruction-count bounds for the keyless aggregates of a plain column
+# (#1628): each runs a typed loop per column type.  Counts with callgrind
+# (exact, no hardware counters), so it needs valgrind; built for AVX2, which
+# valgrind executes (it has no AVX-512).  The nightly workflow runs it with
+# gcc 12, the compiler CI builds with.
+bench-keyless-agg:
+	$(MAKE) clean
+	$(MAKE) release RAY_MARCH=x86-64-v3
+	sh bench/keyless_agg/check.sh ./rayforce
+.PHONY: bench-keyless-agg
+
 # ─── Static analysis ────────────────────────────────────────────────
 # clang-tidy runs OUTSIDE the build: it never touches the real compiler
 # warnings or -Werror.  Flags are uniform across every translation unit,
@@ -693,7 +708,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib shared dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck tzdata clean
+.PHONY: check-wasm32-layout default debug release lib shared dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke bench-keyless-agg tidy cppcheck tzdata clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

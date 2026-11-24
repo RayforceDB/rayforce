@@ -107,6 +107,13 @@ ray_t*  ray_de(ray_t* bytes);
 const char* ray_serde_fail_code(void);
 void ray_serde_fail_clear(void);              /* call before ray_serde_size */
 
+/* True when obj, or anything the serializer would walk inside it (list
+ * items, dict keys and values, table columns, ...), is a process-local
+ * handle: a graph, a vector index or a Datalog program.  Such a value has
+ * no wire form, so ray_ser refuses it; the journal snapshot uses this to
+ * leave the binding out instead of failing as a whole. */
+bool ray_serde_holds_handle(ray_t* obj);
+
 /* Whether the server-internal marks are written and read, on this thread:
  * a lambda's .sys.trust mark, and a list's literal-fallback mark (a request
  * argument a handler stored, which evaluates to itself).  Off by default, so

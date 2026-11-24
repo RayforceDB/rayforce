@@ -46,3 +46,12 @@
 (.sys.exec "./rayforce --help 2>&1 | grep -q -- '-Q, --querylog'") -- 0
 
 (.sys.exec "rm -f /tmp/rfl_cfv.rfl /tmp/rfl_cfv.out /tmp/rfl_cfv2.out; true")
+
+;; ---- --log-posts N sets the journal's posts switch (#1608) ----
+(.sys.exec "printf '(println (get (.log.status) (quote posts)))\n' > /tmp/rfl_cfv_lp.rfl; ./rayforce --log-posts 1 /tmp/rfl_cfv_lp.rfl </dev/null 2>&1 | grep -qx true || exit 97; ./rayforce --log-posts 0 /tmp/rfl_cfv_lp.rfl </dev/null 2>&1 | grep -qx false || exit 96; ./rayforce /tmp/rfl_cfv_lp.rfl </dev/null 2>&1 | grep -qx false") -- 0
+
+;; ---- replay does not change the switch; the flag wins (#1608) ----
+;; a journal that turns posts off, started with --log-posts 1: on
+(.sys.exec "rm -f /tmp/rfl_cfv_lpa.*; printf '(do (.log.open (quote async) \"/tmp/rfl_cfv_lpa\") (.log.write (quote (.log.posts 0))) (.log.write (quote (set zz 7))) (.log.close))\n' > /tmp/rfl_cfv_lpw.rfl; ./rayforce /tmp/rfl_cfv_lpw.rfl </dev/null >/dev/null 2>&1; printf '(println (list zz (get (.log.status) (quote posts))))\n' > /tmp/rfl_cfv_lpc.rfl; ./rayforce --log-posts 1 -l /tmp/rfl_cfv_lpa /tmp/rfl_cfv_lpc.rfl </dev/null 2>&1 | grep -qxF '[7 true]'; rc=$?; rm -f /tmp/rfl_cfv_lpa.*; [ $rc -eq 0 ]") -- 0
+;; a journal that turns posts on, started without the flag: off
+(.sys.exec "rm -f /tmp/rfl_cfv_lpb.*; printf '(do (.log.open (quote async) \"/tmp/rfl_cfv_lpb\") (.log.write (quote (.log.posts 1))) (.log.write (quote (set zz 7))) (.log.close))\n' > /tmp/rfl_cfv_lpw.rfl; ./rayforce /tmp/rfl_cfv_lpw.rfl </dev/null >/dev/null 2>&1; printf '(println (list zz (get (.log.status) (quote posts))))\n' > /tmp/rfl_cfv_lpc.rfl; ./rayforce -l /tmp/rfl_cfv_lpb /tmp/rfl_cfv_lpc.rfl </dev/null 2>&1 | grep -qxF '[7 false]'; rc=$?; rm -f /tmp/rfl_cfv_lpb.*; [ $rc -eq 0 ]") -- 0

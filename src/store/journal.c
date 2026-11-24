@@ -400,6 +400,13 @@ static ray_t* eval_one(ray_t* msg) {
 
 bool ray_journal_is_open(void) { return g_journal.fp != NULL; }
 
+/* Whether async IPC requests are journaled (#1608).  A process setting, not
+ * part of a journal: it survives .log.close, .log.roll and .log.purge. */
+static bool g_journal_posts = false;
+
+bool ray_journal_posts(void) { return g_journal_posts; }
+void ray_journal_set_posts(bool on) { g_journal_posts = on; }
+
 void ray_journal_info(ray_journal_info_t* out) {
     out->open      = g_journal.fp != NULL;
     out->opened_ok = g_journal.opened_ok;
@@ -590,11 +597,12 @@ static ray_err_t journal_replay_from(const char*           path,
         if (restricted)
             ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
                                 note ? note->len - 2 : 0);
-        /* A SYNC frame is an IPC request journaled as it arrived: its
-         * arguments get the literal-fallback mark the live request gave them
-         * (ray_ipc_mark_request_args), so a data list whose head names a
-         * global that is not a function is data on replay as it was live.
-         * A .log.write entry is an ASYNC frame, evaluated as written. */
+        /* A SYNC frame is an IPC request, sync or async (#1608), journaled
+         * as it arrived: its arguments get the literal-fallback mark the
+         * live request gave them (ray_ipc_mark_request_args), so a data list
+         * whose head names a global that is not a function is data on replay
+         * as it was live.  A .log.write entry is an ASYNC frame, evaluated
+         * as written. */
         if (hdr.msgtype == RAY_IPC_MSG_SYNC) ray_ipc_mark_request_args(msg);
         ray_restrict_save_t prev_restricted;
         ray_eval_restrict_enter(restricted, &prev_restricted);
@@ -1176,7 +1184,32 @@ ray_err_t ray_journal_snapshot(void) {
         if (vals_buf) ray_sys_free(vals_buf);
         return RAY_ERR_OOM;
     }
-    int32_t kept = ray_env_list_user(sym_ids, vals_buf, cap);
+    int32_t listed = ray_env_list_user(sym_ids, vals_buf, cap);
+
+    /* #802: a binding that holds a process-local handle (any kind in
+     * RAY_HANDLE_ATTRS, alone or anywhere inside a list, dict or table)
+     * has no wire form: its pointer means nothing to the next
+     * process.  Leave that binding out with one warning per name and save
+     * the rest, so a bound handle never blocks the snapshot or the roll.
+     * The probe runs with the marks kept, as the save below does. */
+    int32_t kept = 0;
+    bool probe_marks = ray_serde_keep_marks(true);
+    for (int32_t i = 0; i < listed; i++) {
+        if (ray_serde_holds_handle(vals_buf[i])) {
+            ray_t* ks = ray_sym_str(sym_ids[i]);   /* borrowed */
+            bool named = ks && !RAY_IS_ERR(ks);
+            fprintf(stderr,
+                    "log: WARN  snapshot skips '%.*s': it holds a process-local "
+                    "handle (graph, vector index, embedding model or Datalog program)\n",
+                    named ? (int)ray_str_len(ks) : 1,
+                    named ? ray_str_ptr(ks) : "?");
+            continue;
+        }
+        sym_ids[kept]  = sym_ids[i];
+        vals_buf[kept] = vals_buf[i];
+        kept++;
+    }
+    ray_serde_keep_marks(probe_marks);
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, kept);
     if (!keys || RAY_IS_ERR(keys)) {

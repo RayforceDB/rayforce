@@ -1,0 +1,113 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1615: like and ilike with a column as the pattern.  A STR column is
+;; matched row by row, each row's text against that row's pattern, in a
+;; query as in a direct call; a string atom matches every row as before.
+;; Any other pattern (a symbol, a SYM column, a number, a vector literal of
+;; another length) is a clean error.  In a query a column pattern crashed
+;; the process (a parted table), matched nothing (a plain one), and a
+;; number matched nothing.  Checked on an in-memory table, a splayed one
+;; and a parted one, plain and compressed, over STR and SYM subjects, in
+;; where: and in an output, against like applied to each row's pair.
+
+(set R (format "/tmp/rfl_like_pattern_type_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %" R R)) -- 0
+(set mk (fn [k] (table [t s p q v] (list (at (as 'STR (list "ab" "cd" "a*" "" "Ab")) (% (til 10) 5)) (at ['ab 'cd 'x 'a 'AB] (% (til 10) 5)) (at (as 'STR (list "a*" "c?" "*" "" "a?" "?d")) (% (til 10) 6)) (at ['a* 'c? '* 'b] (% (til 10) 4)) (+ k (til 10))))))
+(set M (mk 0))
+(.db.splayed.set (format "%/u/2024.01.01/t/" R) (mk 0) (format "%/u/.sym" R) {compress: false})
+(.db.splayed.set (format "%/u/2024.01.02/t/" R) (mk 10) (format "%/u/.sym" R) {compress: false})
+(.db.splayed.set (format "%/c/2024.01.01/t/" R) (mk 0) (format "%/c/.sym" R) {compress: true})
+(.db.splayed.set (format "%/c/2024.01.02/t/" R) (mk 10) (format "%/c/.sym" R) {compress: true})
+(.db.splayed.set (format "%/s/t/" R) (mk 0) (format "%/s/.sym" R) {compress: true})
+(set U (.db.parted.get (format "%/u/" R) 't))
+(set C (.db.parted.get (format "%/c/" R) 't))
+(set Sp (.db.splayed.get (format "%/s/t/" R) (format "%/s/.sym" R)))
+;; the oracle: like on each row's text and pattern
+(set rows (fn [X P] (map (fn [i] (like (at X i) (at P i))) (til (count X)))))
+(set rowsi (fn [X P] (map (fn [i] (like (lower (at X i)) (lower (at P i)))) (til (count X)))))
+
+;; the reviewer's plain table: the rows that match, [1 2] (it gave [])
+(set T4 (table [t pat v] (list (as 'STR (list "ab" "cd" "ef" "ab")) (as 'STR (list "a*" "c*" "a*" "c*")) [1 2 3 4])))
+(at (select {from: T4 where: (like t pat)}) 'v) -- [1 2]
+(like (at T4 't) (at T4 'pat)) -- [true true false false]
+
+;; a STR column pattern, row by row, on each kind of table
+(at (select {k: (like t p) from: M}) 'k) -- (rows (at M 't) (at M 'p))
+(at (select {k: (like s p) from: M}) 'k) -- (rows (at M 's) (at M 'p))
+(at (select {k: (ilike t p) from: M}) 'k) -- (rowsi (at M 't) (at M 'p))
+(at (select {c: (count v) from: M where: (like t p)}) 'c) -- (enlist (sum (rows (at M 't) (at M 'p))))
+(at (select {k: (like t p) from: Sp}) 'k) -- (rows (at Sp 't) (at Sp 'p))
+(at (select {k: (like s p) from: Sp}) 'k) -- (rows (at Sp 's) (at Sp 'p))
+(at (select {k: (like t p) from: U}) 'k) -- (rows (at U 't) (at U 'p))
+(at (select {k: (like s p) from: U}) 'k) -- (rows (at U 's) (at U 'p))
+(at (select {k: (ilike s p) from: U}) 'k) -- (rowsi (at U 's) (at U 'p))
+(at (select {v: v from: U where: (like t p)}) 'v) -- (at (at U 'v) (where (rows (at U 't) (at U 'p))))
+(at (select {k: (like t p) from: C}) 'k) -- (rows (at C 't) (at C 'p))
+(at (select {k: (like s p) from: C}) 'k) -- (rows (at C 's) (at C 'p))
+(at (select {c: (count v) from: C where: (and (> v 3) (like s p))}) 'c) -- (at (select {c: (count v) from: (select {from: C where: (> v 3)}) where: (like s p)}) 'c)
+(at (select {c: (count v) by: s from: C where: (like t p)}) 'c) -- (at (select {c: (count v) by: s from: (select {from: C where: (like t p)})}) 'c)
+(like (at U 't) (at U 'p)) -- (rows (at U 't) (at U 'p))
+(like 'ab (as 'STR (list "a*" "b*"))) -- [true false]
+
+;; a global vector of the table's length is a pattern column too: sliced
+;; with the rows a where: keeps and by group under by:
+(set T5 (table [t v g] (list (as 'STR (list "ab" "cd" "ef" "ab" "cd")) [1 2 3 4 5] ['a 'a 'b 'b 'b])))
+(set FP (as 'STR (list "a*" "c*" "x*" "z*" "c?")))
+(at (select {k: (like t FP) from: T5}) 'k) -- [true true false false true]
+(at (select {k: (like t FP) from: T5 where: (> v 1)}) 'k) -- [true false false true]
+(at (select {c: (sum (like t FP)) by: g from: T5}) 'c) -- [2 1]
+(at (select {v: v from: T5 where: (like t FP)}) 'v) -- [1 2 5]
+
+;; a string atom, written or computed, still matches every row
+(at (select {k: (like t "a*") from: M}) 'k) -- (like (at M 't) "a*")
+(at (select {k: (like t (first p)) from: U}) 'k) -- (like (at U 't) "a*")
+(at (select {c: (count v) from: C where: (ilike t (first p))}) 'c) -- (enlist (sum (like (lower (at C 't)) "a*")))
+
+;; a pattern computed from no column ((as 'STR (list ..)), (take ..)) is read
+;; as a literal is: row by row at the table's length, a length error at any
+;; other, for like and ilike on every route (it met each row's text whole,
+;; and ilike was not found outside the planner)
+(set T6 (table [t v] (list (as 'STR (list "ab" "cd" "a*" "")) [1 2 3 4])))
+(at (select {k: (like t (as 'STR (list "a*" "c?" "*" "x"))) from: T6}) 'k) -- [true true true false]
+(at (select {k: (like t (take ["a*" "c?" "*" "x" "y"] 4)) from: T6}) 'k) -- [true true true false]
+(at (select {k: (ilike t (as 'STR (list "A*" "C?" "*" "x"))) from: T6}) 'k) -- [true true true false]
+(at (select {from: T6 where: (ilike t (as 'STR (list "A*" "C?" "*" "x")))}) 'v) -- [1 2 3]
+(at (update {k: (ilike t (as 'STR (list "A*" "c?" "*" "x"))) from: T6}) 'k) -- [true true true false]
+(select {k: (like t ["a*" "c?" "*"]) from: T6}) !- length
+(select {k: (like t (as 'STR (list "a*" "c?" "*"))) from: T6}) !- length
+(select {k: (like t (take ["a*" "c?" "*" "x"] 3)) from: T6}) !- length
+(select {k: (ilike t (as 'STR (list "a*" "c?" "*"))) from: T6}) !- length
+(select {k: (ilike t ["a*" "c?" "*"]) from: T6}) !- length
+(select {c: (count v) by: v from: T6 where: (ilike t (as 'STR (list "A*" "c?" "*")))}) !- length
+(update {k: (like t (as 'STR (list "a*" "c?" "*"))) from: T6 where: (> v 1)}) !- length
+(update {k: (ilike t ["a*" "c?" "*"]) from: T6}) !- length
+(at (try (update {k: (ilike t ["a*" "c?" "*"]) from: T6}) (fn [e] e)) 'msg) -- "ilike: 4 values against 3 patterns"
+(at (try (select {k: (ilike t (as 'STR (list "a*" "c?" "*"))) from: T6}) (fn [e] e)) 'msg) -- "ilike: 4 values against 3 patterns"
+
+;; a pattern whose evaluation raises keeps the deferred route: a select that
+;; keeps no row answers no rows, as before; one that needs the pattern
+;; raises the evaluation's own error
+(set T7 (table [t v] (list (as 'STR (list "ab" "cd")) [0 1])))
+(count (select {k: (like t (take "a*" "bad")) from: T7 where: (< v 0)})) -- 0
+(key (select {k: (like t (take "a*" "bad")) from: T7 where: (< v 0)})) -- ['k]
+(count (select {k: (ilike t (take "a*" "bad")) from: T7 where: (< v 0)})) -- 0
+(count (select {k: (sum (like t (take "a*" "bad"))) by: v from: T7 where: (< v 0)})) -- 0
+(count (select {k: (like t (take "a*" "bad")) from: U where: (< v 0)})) -- 0
+(count (select {k: (like t (take "a*" "bad")) from: C where: (< v 0)})) -- 0
+(select {k: (like t (take "a*" "bad")) from: T7}) !- type
+(select {k: (sum (like t (take "a*" "bad"))) by: v from: T7}) !- type
+
+;; any other pattern is an error, never a crash
+(select {from: M where: (like t q)}) !- type
+(select {k: (like s 'a*) from: U}) !- type
+(select {k: (ilike t 7) from: C}) !- type
+(select {k: (like t 7) from: Sp}) !- type
+(select {from: M where: (like s ["a*" "c?"])}) !- length
+(like (at M 't) (at M 'q)) !- type
+(like (at M 't) 'a*) !- type
+(like (as 'STR (list "ab" "cd" "x")) (as 'STR (list "a*" "b*"))) !- length
+(like [1 2] (as 'STR (list "a*" "b*"))) !- type
+;; the error says what a pattern may be: a list of strings is not a STR vector
+(at (try (like (as 'STR (list "ab" "cd")) (list "a*" "c*")) (fn [e] e)) 'msg) -- "like: pattern must be a STR atom or a STR vector, got LIST"
+(at (try (select {from: M where: (like t q)}) (fn [e] e)) 'msg) -- "like: pattern must be a STR atom or a STR vector, got SYM"
+
+(.sys.exec (format "rm -rf %" R)) -- 0
