@@ -71,6 +71,12 @@ int        ray_sock_take_oob(ray_sock_t s);
 /* The pending urgent byte on `s`, left pending: 0-255, or -1 when there
  * is none.  Async-signal-safe (recv). */
 int        ray_sock_peek_oob(ray_sock_t s);
+/* Whether the peer of the connected socket `s` has closed its end (or only
+ * shut down its sending side: from here the two read the same) or the
+ * connection has failed, consuming nothing: 1 gone, 0 open or not known.
+ * Without POLLRDHUP (anywhere but Linux) a close that follows bytes not
+ * yet read is seen only once those bytes are read, so it reads as open. */
+int        ray_sock_peer_closed(ray_sock_t s);
 void       ray_sock_close(ray_sock_t s);
 ray_err_t  ray_sock_set_nonblocking(ray_sock_t s);
 /* Dead-peer detection for an established TCP connection (#589).

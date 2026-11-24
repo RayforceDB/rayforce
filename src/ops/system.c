@@ -46,10 +46,12 @@
 #include "store/splay.h"
 #include "store/col.h"     /* ray_col_limit_msg: why a save refused */
 #include "store/part.h"
+#include "store/journal.h"   /* ray_journal_in_replay -- (.time.sleep) */
 #include "core/ipc.h"
 #include "core/mcast.h"
 #include "core/poll.h"
 #include "core/timer.h"
+#include "core/platform.h"   /* ray_sleep_ms -- (.time.sleep) */
 #include "core/pool.h"      /* ray_pool_get — the pool size in .sys.info */
 
 /* Forward decls: keep this TU decoupled from core/runtime.h — only
@@ -1309,6 +1311,66 @@ ray_t* ray_time_timer_del_fn(ray_t* id) {
     ray_poll_t* poll = (ray_poll_t*)ray_runtime_get_poll();
     if (!poll || !poll->timers) return RAY_NULL_OBJ;
     ray_timers_del((ray_timers_t*)poll->timers, id->i64);
+    return RAY_NULL_OBJ;
+}
+
+/* Longest single wait of .time.sleep: a cancel is noticed within this. */
+#define TIME_SLEEP_SLICE_MS 10
+
+/* (.time.sleep ms) -- block the calling thread for ms milliseconds (an
+ * integer atom of any width) or for a TIMESPAN (rounded up to the next
+ * millisecond); returns null.  Never wakes early: the deadline is kept in
+ * nanoseconds of the monotonic clock.  The wait is cut into slices of at most
+ * TIME_SLEEP_SLICE_MS, and after each it checks
+ *   - the interrupt flag a Ctrl-C or an IPC cancel sets (ray_interrupted, as
+ *     every long-running builtin polls it): a "cancel" error;
+ *   - on a server running a SYNC request, whether its client has hung up:
+ *     a "cancel" error nobody receives, since nobody waits for the answer.
+ * An ASYNC message's sleep runs its full time even after its sender has
+ * gone: the sender may have queued work behind it that relies on the delay,
+ * and only a server-side interrupt ends it.  Nothing on the client side
+ * could end one that would never finish, so that one is a domain error.
+ * Under a journal replay it returns at once: a sleep changes no state, and
+ * a logged one must neither delay a restart nor, unbounded, stop it.
+ * It holds no lock, but a server evaluates one request at a time, so its
+ * other connections wait until the sleep ends, as behind any long query. */
+ray_t* ray_time_sleep_fn(ray_t* x) {
+    int64_t ms;
+    switch (x ? x->type : 0) {
+    case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+        if (RAY_ATOM_IS_NULL(x))
+            return ray_error("domain", ".time.sleep: a null duration");
+        ms = x->type == -RAY_U8  ? (int64_t)x->u8
+           : x->type == -RAY_I16 ? (int64_t)x->i16
+           : x->type == -RAY_I32 ? (int64_t)x->i32 : x->i64;
+        break;
+    case -RAY_TIMESPAN:
+        if (RAY_ATOM_IS_NULL(x))
+            return ray_error("domain", ".time.sleep: a null duration");
+        /* whole milliseconds, a part of one counting as one */
+        ms = x->i64 / 1000000 + (x->i64 % 1000000 > 0);
+        break;
+    default:
+        return ray_error("type", ".time.sleep expects milliseconds as an integer, or a timespan");
+    }
+    if (ms < 0) return ray_error("domain", ".time.sleep: a negative duration");
+    if (ray_interrupted()) return ray_error("cancel", "interrupted");
+    if (ms == 0 || ray_journal_in_replay()) return RAY_NULL_OBJ;
+
+    int64_t now = ray_time_now_ns();
+    /* a deadline past the clock's range is a wait only a cancel ends */
+    bool endless = ms > (INT64_MAX - now) / 1000000;
+    if (endless && ray_ipc_request_kind() == RAY_IPC_MSG_ASYNC)
+        return ray_error("domain", ".time.sleep: an async message may not sleep forever");
+    int64_t end = endless ? INT64_MAX : now + ms * 1000000;
+    while (now < end) {
+        int64_t left_ms = (end - now + 999999) / 1000000;
+        ray_sleep_ms(left_ms < TIME_SLEEP_SLICE_MS ? (int)left_ms : TIME_SLEEP_SLICE_MS);
+        if (ray_interrupted()) return ray_error("cancel", "interrupted");
+        if (ray_ipc_request_peer_gone())
+            return ray_error("cancel", "the client of this request hung up");
+        now = ray_time_now_ns();
+    }
     return RAY_NULL_OBJ;
 }
 

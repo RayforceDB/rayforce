@@ -86,6 +86,11 @@ ray_err_t ray_journal_open_append(const char* base, ray_journal_mode_t mode);
 /* True iff a journal is currently open for append. */
 bool ray_journal_is_open(void);
 
+/* True while a log or snapshot is being replayed (at -l/-L startup, or by
+ * .log.replay): a builtin whose only effect is to take time (.time.sleep)
+ * returns at once then, so a logged wait neither delays nor blocks it. */
+bool ray_journal_in_replay(void);
+
 /* Snapshot of the journal state, for introspection.  `open` is the same
  * answer as ray_journal_is_open(): a handle is present, not proof that the
  * last append reached the disk.  `opened_ok` is true once a journal was

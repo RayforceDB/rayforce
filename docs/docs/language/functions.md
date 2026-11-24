@@ -593,6 +593,7 @@ spills exactly as it did before.
 | `.time.now` | variadic | Current monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic, restricted | Schedule a callback every `ms` milliseconds, `num` times (0 = forever). Returns timer id. | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary, restricted | Cancel a scheduled timer by id. Returns null. | `(.time.timer.del 0)` |
+| `.time.sleep` | unary, restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan. Returns null. A REPL Ctrl-C, an IPC cancel, a server-side `kill -INT`, or the client of a sync request hanging up ends it with `cancel`; an async one runs its full time; a journal replay skips it. Stalls a server's other connections while it waits. | `(.time.sleep 500)` |
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
