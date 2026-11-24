@@ -1187,91 +1187,13 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
 /* ============================================================================
  * String functions: UPPER, LOWER, TRIM, STRLEN, SUBSTR, REPLACE, CONCAT
  *
- * These functions call ray_sym_intern() per output row, which is
- * O(n * sym_table_lookup) per string op.  Acceptable for current workloads;
- * could be optimized with batch interning if profiling shows a bottleneck.
+ * Over a SYM column, UPPER / LOWER / TRIM (sym_unary_by_code) and SUBSTR at
+ * scalar bounds (substr_sym_by_code) run once per distinct code; REPLACE and
+ * CONCAT still call ray_sym_intern() per output row.
  * ============================================================================ */
 
-/* UPPER / LOWER / TRIM — unary SYM/STR → SYM/STR */
-ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
-    ray_t* input = exec_node(g, op_child(g, op, 0));
-    if (!input || RAY_IS_ERR(input)) return input;
-    /* A literal (`(trim " ab")`) arrives as an atom, whose len field
-     * aliases its payload: the loop below read that many rows past it.
-     * The builtin answers an atom as one value. */
-    if (input->type < 0) {
-        ray_t* r = op->opcode == OP_UPPER ? ray_upper_fn(input)
-                 : op->opcode == OP_LOWER ? ray_lower_fn(input)
-                 :                          ray_trim_fn(input);
-        ray_release(input);
-        return r;
-    }
-
-    int64_t len = input->len;
-    bool is_str = (input->type == RAY_STR);
-
-    ray_t* result;
-    if (is_str) {
-        result = ray_vec_new(RAY_STR, len);
-    } else {
-        result = ray_vec_new(RAY_SYM, len);
-    }
-    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
-    if (!is_str) result->len = len;
-    int64_t* sym_dst = is_str ? NULL : (int64_t*)ray_data(result);
-
-    const ray_str_t* str_elems = NULL;
-    const char* str_pool = NULL;
-    if (is_str) str_resolve(input, &str_elems, &str_pool);
-
-    uint16_t opc = op->opcode;
-    /* STR/SYM have no null — every row is a value. */
-    for (int64_t i = 0; i < len; i++) {
-        const char* sp; size_t sl;
-        if (is_str) {
-            sp = ray_str_t_ptr(&str_elems[i], str_pool);
-            sl = str_elems[i].len;
-        } else {
-            sym_elem(input, i, &sp, &sl);
-        }
-
-        char sbuf[8192];
-        char* buf = sbuf;
-        ray_t* dyn_hdr = NULL;
-        if (sl >= sizeof(sbuf)) {
-            buf = (char*)scratch_alloc(&dyn_hdr, sl + 1);
-            if (!buf) {
-                ray_release(result);
-                ray_release(input);
-                return ray_error("oom", NULL);
-            }
-        }
-        size_t out_len = sl;
-        if (opc == OP_UPPER) {
-            for (size_t j = 0; j < out_len; j++) buf[j] = (char)toupper((unsigned char)sp[j]);
-        } else if (opc == OP_LOWER) {
-            for (size_t j = 0; j < out_len; j++) buf[j] = (char)tolower((unsigned char)sp[j]);
-        } else { /* OP_TRIM */
-            size_t start = 0, end = sl;
-            while (start < sl && isspace((unsigned char)sp[start])) start++;
-            while (end > start && isspace((unsigned char)sp[end - 1])) end--;
-            out_len = end - start;
-            memcpy(buf, sp + start, out_len);
-        }
-
-        if (is_str) {
-            ray_t* prev = result;
-            result = ray_str_vec_append(result, buf, out_len);
-            if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
-        } else {
-            buf[out_len] = '\0';
-            sym_dst[i] = ray_sym_intern(buf, out_len);
-        }
-        scratch_free(dyn_hdr);
-    }
-    ray_release(input);
-    return result;
-}
+/* UPPER / LOWER / TRIM: exec_string_unary, after the SYM reader it uses
+ * (sym_reader_t, below). */
 
 /* LENGTH — SYM → I64 */
 typedef struct {
@@ -1441,6 +1363,396 @@ static void sym_reader_at(const sym_reader_t* r, int64_t pos,
     if (!atom) { *sp = ""; *sl = 0; return; }
     *sp = ray_str_ptr(atom);
     *sl = ray_str_len(atom);
+}
+
+/* ---- UPPER / LOWER / TRIM over a SYM vector, once per distinct code ----
+ * The transform is a function of the string alone, so the rows only say
+ * WHICH entries of the input's domain take part: a parallel pass marks the
+ * codes the rows name (a bit per domain position), the marked entries are
+ * transformed in rank order (parallel, in chunks of bounded bytes) and
+ * interned as a batch into a domain of the result's own
+ * (ray_sym_domain_new; the batch dedupes, so entries that fold to one string
+ * — "ABC" and "abc" — share one position), and a last parallel pass maps
+ * each row through rank → position.  The global table never grows by a
+ * derived value (the derived-key path of group-by, query.c, keeps its keys
+ * the same way), and the transform runs K times for K distinct codes, not
+ * once per row.  Width: the narrowest that holds the result's dictionary.
+ * A few distinct results (SYM_UNARY_GLOBAL_MAX: a country or language
+ * column) are interned into the global table instead, as the row loop did,
+ * and the result stays in the runtime domain: the growth is bounded by the
+ * constant, and what reads the result next — a compare with another such
+ * column, a group — takes its same-domain path.
+ * 1 when served, 0 when not (a code outside the domain, no memory: the
+ * caller runs its row loop, as before), -1 cancelled. */
+#define SYM_UNARY_MIN_ROWS   4096                    /* below: the row loop (bounded interns, no bitmap of the domain) */
+#define SYM_UNARY_GLOBAL_MAX 256                     /* distinct results interned globally, not into a domain of their own */
+#define SYM_UNARY_CHUNK      ((int64_t)1 << 20)      /* ranks per intern batch */
+#define SYM_UNARY_CHUNK_BYTES ((int64_t)64 << 20)    /* output bytes per intern batch */
+typedef struct {
+    sym_reader_t   rd;
+    uint64_t*      bm;        /* codes present, a bit per domain position */
+    int64_t        words;
+    int64_t        dn;
+    ray_pool_t*    pool;
+    _Atomic(int)   bad;       /* a code outside the domain */
+    uint16_t       opc;
+    const int32_t* base;      /* rank of each word's first set bit */
+    uint32_t*      ilen;      /* [K] the input entry's length, by rank */
+    /* the chunk of ranks [r0, r0 + n) over words [w0, w1) */
+    int64_t        w0, r0;
+    const uint64_t* off;      /* [n + 1] byte offset of each rank's output in `bytes` */
+    char*          bytes;
+    const char**   strs;
+    size_t*        lens;
+    uint32_t*      hashes;
+    const int32_t* ids;       /* result position by rank */
+    void*          dst;
+    uint8_t        dst_attrs;
+} sym_unary_ctx_t;
+
+static void sym_unary_mark(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    const void* base = ray_data(c->rd.v);
+    uint8_t attrs = c->rd.v->attrs;
+    for (int64_t i = lo; i < hi; i++) {
+        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(c->pool)) return;
+        int64_t pos = ray_read_sym(base, i, RAY_SYM, attrs);
+        if (pos < 0 || pos >= c->dn) { atomic_store_explicit(&c->bad, 1, memory_order_relaxed); return; }
+        uint64_t bit = (uint64_t)1 << (pos & 63);
+        if (!(__atomic_load_n(&c->bm[pos >> 6], __ATOMIC_RELAXED) & bit))
+            __atomic_fetch_or(&c->bm[pos >> 6], bit, __ATOMIC_RELAXED);
+    }
+}
+
+/* The marked entries' lengths, by rank: a file's from its index (no string
+ * read), any other from its atom. */
+static void sym_unary_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    for (int64_t w = lo; w < hi; w++) {
+        if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
+        uint64_t bits = c->bm[w];
+        if (!bits) continue;
+        int64_t k = c->base[w];
+        int64_t ids[64]; const char* sp[64]; size_t sl[64];
+        int n = 0;
+        while (bits) { ids[n++] = w * 64 + __builtin_ctzll(bits); bits &= bits - 1; }
+        if (c->rd.raw_ok && ids[n - 1] < c->rd.raw.count) {
+            for (int j = 0; j < n; j++, k++) {
+                int64_t l = ray_sym_domain_raw_len(&c->rd.raw, ids[j]);
+                c->ilen[k] = l < 0 ? 0 : (l > UINT32_MAX ? UINT32_MAX : (uint32_t)l);
+            }
+            continue;
+        }
+        if (c->rd.runtime) {
+            // cppcheck-suppress uninitvar // bits is nonzero here, so the loop above fills ids[0, n)
+            sym_reader_block(&c->rd, ids, n, sp, sl);
+        } else {
+            for (int j = 0; j < n; j++) sym_reader_at(&c->rd, ids[j], &sp[j], &sl[j]);
+        }
+        for (int j = 0; j < n; j++, k++) c->ilen[k] = sl[j] > UINT32_MAX ? UINT32_MAX : (uint32_t)sl[j];
+    }
+}
+
+static inline size_t sym_unary_apply(uint16_t opc, const char* sp, size_t sl, char* out) {
+    if (opc == OP_UPPER) {
+        for (size_t j = 0; j < sl; j++) out[j] = (char)toupper((unsigned char)sp[j]);
+        return sl;
+    }
+    if (opc == OP_LOWER) {
+        for (size_t j = 0; j < sl; j++) out[j] = (char)tolower((unsigned char)sp[j]);
+        return sl;
+    }
+    size_t start = 0, end = sl;
+    while (start < sl && isspace((unsigned char)sp[start])) start++;
+    while (end > start && isspace((unsigned char)sp[end - 1])) end--;
+    memcpy(out, sp + start, end - start);
+    return end - start;
+}
+
+/* The chunk's entries transformed into `bytes` at their offsets (the input
+ * length bounds the output's), with the batch's pointers, lengths and
+ * hashes.  A compressed file's entries are decoded one at a time (the
+ * thread's ring holds few), any other's read in blocks. */
+static void sym_unary_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    bool one_at_a_time = c->rd.raw_ok && c->rd.raw.z;
+    for (int64_t w = c->w0 + lo; w < c->w0 + hi; w++) {
+        if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
+        uint64_t bits = c->bm[w];
+        if (!bits) continue;
+        int64_t k = (int64_t)c->base[w] - c->r0;
+        int64_t ids[64]; const char* sp[64]; size_t sl[64];
+        int n = 0;
+        while (bits) { ids[n++] = w * 64 + __builtin_ctzll(bits); bits &= bits - 1; }
+        if (!one_at_a_time) {
+            // cppcheck-suppress uninitvar // bits is nonzero here, so the loop above fills ids[0, n)
+            sym_reader_block(&c->rd, ids, n, sp, sl);
+        }
+        for (int j = 0; j < n; j++, k++) {
+            if (one_at_a_time) sym_reader_at(&c->rd, ids[j], &sp[j], &sl[j]);
+            char* out = c->bytes + c->off[k];
+            size_t room = (size_t)(c->off[k + 1] - c->off[k]);
+            size_t l = sl[j] < room ? sl[j] : room;     /* the length pass bounded the room */
+            size_t ol = sym_unary_apply(c->opc, sp[j], l, out);
+            c->strs[k] = out;
+            c->lens[k] = ol;
+            c->hashes[k] = (uint32_t)ray_hash_bytes(out, ol);
+        }
+    }
+}
+
+static void sym_unary_fill(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    const void* base = ray_data(c->rd.v);
+    uint8_t attrs = c->rd.v->attrs;
+    const uint64_t* bm = c->bm;
+    const int32_t* rank0 = c->base;
+    const int32_t* ids = c->ids;
+    uint8_t w = (uint8_t)(c->dst_attrs & RAY_SYM_W_MASK);
+#define SYM_UNARY_FILL_LOOP(T)                                                        \
+    do {                                                                              \
+        T* d = (T*)c->dst;                                                            \
+        for (int64_t i = lo; i < hi; i++) {                                           \
+            if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(c->pool)) return; \
+            int64_t pos = ray_read_sym(base, i, RAY_SYM, attrs);                      \
+            int64_t wd = pos >> 6;                                                    \
+            uint64_t below = bm[wd] & (((uint64_t)1 << (pos & 63)) - 1);              \
+            d[i] = (T)ids[rank0[wd] + __builtin_popcountll(below)];                   \
+        }                                                                             \
+    } while (0)
+    if (w == RAY_SYM_W8)       SYM_UNARY_FILL_LOOP(uint8_t);
+    else if (w == RAY_SYM_W16) SYM_UNARY_FILL_LOOP(uint16_t);
+    else if (w == RAY_SYM_W32) SYM_UNARY_FILL_LOOP(uint32_t);
+    else                       SYM_UNARY_FILL_LOOP(int64_t);
+#undef SYM_UNARY_FILL_LOOP
+}
+
+static void sym_unary_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
+                          sym_unary_ctx_t* c, int64_t n) {
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, fn, c, n);
+    else                                                           fn(c, 0, 0, n);
+}
+
+static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
+    int64_t nrows = input->len;
+    ray_pool_t* pool = ray_pool_get();
+    sym_unary_ctx_t c;
+    memset(&c, 0, sizeof c);
+    sym_reader_init(&c.rd, input);
+    int rc = 0;
+    ray_t *bm_hdr = NULL, *base_hdr = NULL, *ilen_hdr = NULL, *ids_hdr = NULL,
+          *chunk_hdr = NULL, *off_hdr = NULL, *bytes_hdr = NULL;
+    struct ray_sym_domain_s* kdom = NULL;
+    c.dn = ray_sym_domain_count(c.rd.dom);
+    if (c.dn <= 0 || c.dn > ((int64_t)1 << 31)) goto out;
+    c.words = (c.dn + 63) >> 6;
+    c.pool  = pool;
+    c.opc   = opc;
+    c.bm = (uint64_t*)scratch_calloc(&bm_hdr, (size_t)c.words * sizeof(uint64_t));
+    if (!c.bm) goto out;
+    atomic_init(&c.bad, 0);
+    sym_unary_run(pool, sym_unary_mark, &c, nrows);
+    if (pool_cancelled(pool)) { rc = -1; goto out; }
+    if (atomic_load_explicit(&c.bad, memory_order_relaxed)) goto out;
+    int32_t* base = (int32_t*)scratch_alloc(&base_hdr, (size_t)c.words * sizeof(int32_t));
+    if (!base) goto out;
+    int64_t K = 0;
+    for (int64_t w = 0; w < c.words; w++) { base[w] = (int32_t)K; K += __builtin_popcountll(c.bm[w]); }
+    if (K <= 0 || K > INT32_MAX) goto out;
+    bool global = K <= SYM_UNARY_GLOBAL_MAX;
+    c.base = base;
+    c.ilen = (uint32_t*)scratch_alloc(&ilen_hdr, (size_t)K * sizeof(uint32_t));
+    if (!c.ilen) goto out;
+    sym_unary_run(pool, sym_unary_len, &c, c.words);
+    if (pool_cancelled(pool)) { rc = -1; goto out; }
+    int32_t* ids = (int32_t*)scratch_alloc(&ids_hdr, (size_t)K * sizeof(int32_t));
+    if (!ids) goto out;
+    int64_t cap = K < SYM_UNARY_CHUNK ? K : SYM_UNARY_CHUNK;    /* ranks a chunk holds at most */
+    size_t per = sizeof(const char*) + sizeof(size_t) + sizeof(uint32_t) + sizeof(int64_t);
+    char* chunk = (char*)scratch_alloc(&chunk_hdr, (size_t)cap * per);
+    if (!chunk) goto out;
+    c.strs   = (const char**)chunk;
+    c.lens   = (size_t*)(c.strs + cap);
+    c.hashes = (uint32_t*)(c.lens + cap);
+    int64_t* pos = (int64_t*)(c.hashes + cap);
+    uint64_t* off = (uint64_t*)scratch_alloc(&off_hdr, (size_t)(cap + 1) * sizeof(uint64_t));
+    if (!off) goto out;
+    c.off = off;
+    if (!global) {
+        kdom = ray_sym_domain_new();
+        if (!kdom) goto out;
+    }
+    /* chunks of whole words: at most SYM_UNARY_CHUNK ranks and about
+     * SYM_UNARY_CHUNK_BYTES of output each (one word may exceed either) */
+    int64_t w0 = 0;
+    size_t bytes_cap = 0;
+    while (w0 < c.words) {
+        int64_t r0 = base[w0], w1 = w0;
+        uint64_t nb = 0;
+        int64_t n = 0;
+        for (;;) {
+            int64_t r1 = w1 + 1 < c.words ? (int64_t)base[w1 + 1] : K;
+            uint64_t wb = 0;
+            for (int64_t r = (w1 < c.words ? (int64_t)base[w1] : K); r < r1; r++) wb += c.ilen[r];
+            if (w1 > w0 && (r1 - r0 > SYM_UNARY_CHUNK || nb + wb > (uint64_t)SYM_UNARY_CHUNK_BYTES)) break;
+            nb += wb; n = r1 - r0; w1++;
+            if (w1 >= c.words || n >= SYM_UNARY_CHUNK || nb >= (uint64_t)SYM_UNARY_CHUNK_BYTES) break;
+        }
+        if (n > 0) {
+            if (nb + 1 > bytes_cap) {
+                if (bytes_hdr) scratch_free(bytes_hdr);
+                bytes_hdr = NULL;
+                bytes_cap = (size_t)nb + 1;
+                c.bytes = (char*)scratch_alloc(&bytes_hdr, bytes_cap);
+                if (!c.bytes) goto out;
+            }
+            off[0] = 0;
+            for (int64_t r = 0; r < n; r++) off[r + 1] = off[r] + c.ilen[r0 + r];
+            c.w0 = w0; c.r0 = r0;
+            sym_unary_run(pool, sym_unary_cut, &c, w1 - w0);
+            if (pool_cancelled(pool)) { rc = -1; goto out; }
+            if (global) {
+                if (ray_sym_intern_batch(c.hashes, c.strs, c.lens, n, pos) < 0) goto out;
+            } else if (!ray_sym_domain_intern_batch(kdom, n, c.strs, c.lens, c.hashes, pos)) {
+                rc = pool_cancelled(pool) ? -1 : 0;
+                goto out;
+            }
+            for (int64_t j = 0; j < n; j++) {
+                if (pos[j] < 0 || pos[j] > INT32_MAX) goto out;
+                ids[r0 + j] = (int32_t)pos[j];
+            }
+        }
+        w0 = w1;
+    }
+    c.ids = ids;
+    {
+        /* runtime ids as the row loop wrote them (W64); a domain of the
+         * result's own at the narrowest width that holds it */
+        uint8_t w = global ? RAY_SYM_W64 : ray_sym_dict_width(ray_sym_domain_count(kdom));
+        ray_t* res = ray_sym_vec_new(w, nrows);
+        if (!res || RAY_IS_ERR(res)) { if (res) ray_error_free(res); goto out; }
+        res->len = nrows;
+        if (!global) {
+            /* the result owns the dictionary (the ref ray_sym_domain_new gave) */
+            ray_sym_domain_release(res->sym_domain);
+            res->sym_domain = kdom;
+            kdom = NULL;
+        }
+        c.dst = ray_data(res);
+        c.dst_attrs = res->attrs;
+        sym_unary_run(pool, sym_unary_fill, &c, nrows);
+        if (pool_cancelled(pool)) { ray_release(res); rc = -1; goto out; }
+        *out = res;
+        rc = 1;
+    }
+out:
+    if (kdom) ray_sym_domain_release(kdom);
+    sym_reader_done(&c.rd);
+    if (bytes_hdr) scratch_free(bytes_hdr);
+    if (off_hdr) scratch_free(off_hdr);
+    if (chunk_hdr) scratch_free(chunk_hdr);
+    if (ids_hdr) scratch_free(ids_hdr);
+    if (ilen_hdr) scratch_free(ilen_hdr);
+    if (base_hdr) scratch_free(base_hdr);
+    if (bm_hdr) scratch_free(bm_hdr);
+    return rc;
+}
+
+/* UPPER / LOWER / TRIM — unary SYM/STR → SYM/STR */
+ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
+    ray_t* input = exec_node(g, op_child(g, op, 0));
+    if (!input || RAY_IS_ERR(input)) return input;
+    /* A literal (`(trim " ab")`) arrives as an atom, whose len field
+     * aliases its payload: the loop below read that many rows past it.
+     * The builtin answers an atom as one value. */
+    if (input->type < 0) {
+        ray_t* r = op->opcode == OP_UPPER ? ray_upper_fn(input)
+                 : op->opcode == OP_LOWER ? ray_lower_fn(input)
+                 :                          ray_trim_fn(input);
+        ray_release(input);
+        return r;
+    }
+
+    int64_t len = input->len;
+    bool is_str = (input->type == RAY_STR);
+
+    /* A SYM column: once per distinct code, into the result's own domain
+     * (above).  A small one keeps the row loop: its interns are few, and
+     * the bitmap of the domain is not paid. */
+    if (!is_str && len >= SYM_UNARY_MIN_ROWS) {
+        ray_t* res = NULL;
+        int rc = sym_unary_by_code(input, op->opcode, &res);
+        if (rc != 0) {
+            ray_release(input);
+            return rc < 0 ? ray_error("cancel", NULL) : res;
+        }
+    }
+
+    ray_t* result;
+    if (is_str) {
+        result = ray_vec_new(RAY_STR, len);
+    } else {
+        result = ray_vec_new(RAY_SYM, len);
+    }
+    if (!result || RAY_IS_ERR(result)) { ray_release(input); return result; }
+    if (!is_str) result->len = len;
+    int64_t* sym_dst = is_str ? NULL : (int64_t*)ray_data(result);
+
+    const ray_str_t* str_elems = NULL;
+    const char* str_pool = NULL;
+    if (is_str) str_resolve(input, &str_elems, &str_pool);
+
+    uint16_t opc = op->opcode;
+    /* STR/SYM have no null — every row is a value. */
+    for (int64_t i = 0; i < len; i++) {
+        const char* sp; size_t sl;
+        if (is_str) {
+            sp = ray_str_t_ptr(&str_elems[i], str_pool);
+            sl = str_elems[i].len;
+        } else {
+            sym_elem(input, i, &sp, &sl);
+        }
+
+        char sbuf[8192];
+        char* buf = sbuf;
+        ray_t* dyn_hdr = NULL;
+        if (sl >= sizeof(sbuf)) {
+            buf = (char*)scratch_alloc(&dyn_hdr, sl + 1);
+            if (!buf) {
+                ray_release(result);
+                ray_release(input);
+                return ray_error("oom", NULL);
+            }
+        }
+        size_t out_len = sl;
+        if (opc == OP_UPPER) {
+            for (size_t j = 0; j < out_len; j++) buf[j] = (char)toupper((unsigned char)sp[j]);
+        } else if (opc == OP_LOWER) {
+            for (size_t j = 0; j < out_len; j++) buf[j] = (char)tolower((unsigned char)sp[j]);
+        } else { /* OP_TRIM */
+            size_t start = 0, end = sl;
+            while (start < sl && isspace((unsigned char)sp[start])) start++;
+            while (end > start && isspace((unsigned char)sp[end - 1])) end--;
+            out_len = end - start;
+            memcpy(buf, sp + start, out_len);
+        }
+
+        if (is_str) {
+            ray_t* prev = result;
+            result = ray_str_vec_append(result, buf, out_len);
+            if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
+        } else {
+            buf[out_len] = '\0';
+            sym_dst[i] = ray_sym_intern(buf, out_len);
+        }
+        scratch_free(dyn_hdr);
+    }
+    ray_release(input);
+    return result;
 }
 
 typedef struct {

@@ -1,0 +1,160 @@
+;; @requires: posix (fixtures under /tmp via .sys.exec)
+;; UPPER / LOWER / TRIM over a SYM column run once per distinct symbol
+;; (exec_string_unary → sym_unary_by_code, src/ops/string.c): the rows mark
+;; the codes they name, the marked strings are transformed and interned as
+;; a batch into a dictionary of the result's own, and the rows map through
+;; it.  The global symbol table does not grow by the derived values; a few
+;; distinct results (256 or fewer) are interned globally, as the row loop
+;; did, so a compare of two such columns stays a same-domain compare.
+;; Oracle: the STR path of the same op, per row, over the same strings.
+;; The per-distinct path takes columns of 4096 rows or more.
+(set N 6000)
+(set i (til N))
+(set ORA (fn [f col] (as 'SYM (f (as 'STR col)))))
+(set symc (fn [] (at (.sys.mem) 'sym-count)))
+;; .sys.mem interns the names of its own rows the first time, and a line's
+;; names are interned as it is read: neither is what the measurements below
+;; are about, so both happen first
+(> (symc) 0) -- true
+(count ['R 'lu 'eq 'ne 'RT 'tt 'RW 'lw 'SR 'PR]) -- 10
+;; 1000 distinct mixed-case URLs over 6000 rows; the vocabulary is interned
+;; in reverse first, so the column's ids are not in row order
+(set pre (as 'SYM (map (fn [k] (format "HTTP://Site%.COM/Page%" (% (- 999 k) 37) (- 999 k))) (til 1000))))
+(set pg (fn [k] (% (* 7 k) 1000)))
+(set u (as 'SYM (map (fn [k] (format "HTTP://Site%.COM/Page%" (% (pg k) 37) (pg k))) i)))
+(set T (table [u v] (list u i)))
+;; the names the queries below intern, and what a first large select interns
+;; once, warmed by a query whose derived strings are not the ones measured
+(set W (select {from: T uu: (upper u) tu: (trim u) v: v}))
+(count W) -- 6000
+
+;; ── values, and no growth of the global table ──
+(set s0 (symc))
+(set R (select {from: T lu: (lower u) uu: (upper u) v: v}))
+(- (symc) s0) -- 0
+(type (at R 'lu)) -- 'SYM
+(count (at R 'lu)) -- 6000
+(all (== (at R 'lu) (ORA lower u))) -- true
+(all (== (at R 'uu) (ORA upper u))) -- true
+(count (distinct (at R 'lu))) -- 1000
+(count (distinct (at R 'uu))) -- 1000
+(== (at (at R 'lu) 0) (as 'SYM "http://site0.com/page0")) -- true
+(== (at (at R 'uu) 1) (as 'SYM "HTTP://SITE7.COM/PAGE7")) -- true
+;; the same column transformed twice compares equal row for row (two
+;; dictionaries of the same strings), and the table does not grow for it
+(set s0 (symc))
+(all (at (select {from: T eq: (== (lower u) (lower (upper u)))}) 'eq)) -- true
+(any (at (select {from: T eq: (== (lower u) (upper u))}) 'eq)) -- false
+(all (at (select {from: T ne: (!= (lower u) (upper u))}) 'ne)) -- true
+(- (symc) s0) -- 0
+
+;; ── what reads the result: like, ==, in, except, group, distinct, join ──
+(set lu (at R 'lu))
+(sum (like lu "http://site7.com/*")) -- 162
+(sum (like lu "*/page7")) -- 6
+(count (select {from: R where: (ilike lu "HTTP://SITE7.COM/*")})) -- 162
+(sum (== lu (as 'SYM "http://site7.com/page7"))) -- 6
+(count (select {from: R where: (== lu "http://site7.com/page7")})) -- 6
+(count (select {from: R where: (!= lu "http://site7.com/page7")})) -- 5994
+(count (select {from: R where: (in lu ["http://site7.com/page7" "http://site0.com/page0"])})) -- 12
+(sum (in lu (as 'SYM ["http://site7.com/page7" "http://site0.com/page0"]))) -- 12
+(count (except lu (as 'SYM ["http://site7.com/page7" "http://site0.com/page0"]))) -- 5988
+(set G (select {from: R by: lu c: (count v) s: (sum v)}))
+(set TO (table [lu v] (list (ORA lower u) i)))
+(set GO (select {from: TO by: lu c: (count v) s: (sum v)}))
+(count G) -- 1000
+(all (== (at G 'lu) (at GO 'lu))) -- true
+(all (== (at G 'c) (at GO 'c))) -- true
+(all (== (at G 's) (at GO 's))) -- true
+;; the key derived in by: emits the groups in the order the plain key does
+(set GB (select {from: T by: (lower u) c: (count v) s: (sum v)}))
+(all (== (at GB 'u) (at GO 'lu))) -- true
+(all (== (at GB 's) (at GO 's))) -- true
+(all (== (distinct lu) (distinct (at TO 'lu)))) -- true
+(set J (table [lu w] (list (as 'SYM ["http://site7.com/page7" "http://site0.com/page0"]) [70 0])))
+(set IJ (inner-join [lu] R J))
+(count IJ) -- 12
+(sum (at IJ 'w)) -- 420
+(set LJ (left-join [lu] R J))
+(count LJ) -- 6000
+(sum (at LJ 'w)) -- 420
+
+;; ── strings that fold to one: one position for all of them ──
+(set m (as 'SYM (map (fn [k] (format (at ["KEY%" "key%" "Key%"] (% (div k 300) 3)) (% k 300))) i)))
+(set TM (table [m v] (list m i)))
+(count (distinct m)) -- 900
+(set RM (select {from: TM lm: (lower m) um: (upper m) v: v}))
+(count (distinct (at RM 'lm))) -- 300
+(count (distinct (at RM 'um))) -- 300
+(all (== (at RM 'lm) (ORA lower m))) -- true
+(all (== (at RM 'um) (ORA upper m))) -- true
+(count (select {from: RM where: (== lm "key7")})) -- 20
+(count (select {from: TM by: (lower m) c: (count v)})) -- 300
+
+;; ── trim: padding, interior spaces, and values that trim to nothing ──
+(set t (as 'SYM (map (fn [k] (at (list (format "  Key %  " (% k 400)) (format "Key % " (% k 400)) "   " "") (% (div k 400) 4))) i)))
+(set TT (table [t v] (list t i)))
+(set s0 (symc))
+(set RT (select {from: TT tt: (trim t) v: v}))
+(- (symc) s0) -- 0
+(all (== (at RT 'tt) (ORA trim t))) -- true
+(count (distinct (at RT 'tt))) -- 401
+(count (select {from: RT where: (== tt "")})) -- 2800
+(count (select {from: RT where: (== tt "Key 7")})) -- 8
+
+;; ── a few distinct results stay runtime symbols (the row loop's answer) ──
+(set w (as 'SYM (map (fn [k] (format "Code%" (% (* 7 k) 100))) i)))
+(set TW (table [w v] (list w i)))
+(set s0 (symc))
+(set RW (select {from: TW lw: (lower w) v: v}))
+(- (symc) s0) -- 100
+(all (== (at RW 'lw) (ORA lower w))) -- true
+(count (distinct (at RW 'lw))) -- 100
+;; and once interned they are found, not added
+(set s0 (symc))
+(count (select {from: TW lw: (lower w) v: v})) -- 6000
+(- (symc) s0) -- 0
+;; one value everywhere
+(set one (as 'SYM (map (fn [k] "SAME") i)))
+(set RO (select {from: (table [one v] (list one i)) lo: (lower one)}))
+(count (distinct (at RO 'lo))) -- 1
+(at (at RO 'lo) 5999) -- 'same
+;; no rows
+(set E (select {from: (take T 0) lu: (lower u)}))
+(count E) -- 0
+(type (at E 'lu)) -- 'SYM
+;; the builtin over a vector (a slice of the column)
+(all (== (lower (take u 5000)) (ORA lower (take u 5000)))) -- true
+(all (== (upper (take u -5000)) (ORA upper (take u -5000)))) -- true
+
+;; ── FILE domains: a splayed table, the result stored and read back, a parted table ──
+(.sys.exec "rm -rf /tmp/rfl_string_unary_sym_domain") -- 0
+(.db.splayed.set "/tmp/rfl_string_unary_sym_domain/s/T" T)
+(set ST (.db.splayed.get "/tmp/rfl_string_unary_sym_domain/s/T"))
+(set s0 (symc))
+(set SR (select {from: ST lu: (lower u) v: v where: (!= u "")}))
+(- (symc) s0) -- 0
+(all (== (at SR 'lu) (ORA lower u))) -- true
+(count (select {from: ST where: (== (lower u) "http://site7.com/page7")})) -- 6
+(count (select {from: ST by: (lower u) c: (count v)})) -- 1000
+(set s0 (symc))
+(.db.splayed.set "/tmp/rfl_string_unary_sym_domain/s/R" SR)
+(- (symc) s0) -- 0
+(set RR (.db.splayed.get "/tmp/rfl_string_unary_sym_domain/s/R"))
+(all (== (at RR 'lu) (ORA lower u))) -- true
+(count (distinct (at RR 'lu))) -- 1000
+(count (select {from: RR where: (== lu "http://site7.com/page7")})) -- 6
+(.db.splayed.set "/tmp/rfl_string_unary_sym_domain/p/2024.01.01/t/" (take T 4500) "/tmp/rfl_string_unary_sym_domain/p/.sym")
+(.db.splayed.set "/tmp/rfl_string_unary_sym_domain/p/2024.01.02/t/" (take T -1500) "/tmp/rfl_string_unary_sym_domain/p/.sym")
+(set PT (.db.parted.get "/tmp/rfl_string_unary_sym_domain/p/" 't))
+(count PT) -- 6000
+(set s0 (symc))
+(set PR (select {from: PT lu: (lower u) v: v}))
+(- (symc) s0) -- 0
+(all (== (at PR 'lu) (ORA lower u))) -- true
+(set PRW (select {from: PT lu: (lower u) v: v where: (> v 2999)}))
+(all (== (at PRW 'lu) (ORA lower (take u -3000)))) -- true
+(set PG (select {from: PT by: (lower u) c: (count v)}))
+(count PG) -- 1000
+(all (== (at PG 'u) (at GO 'lu))) -- true
+(.sys.exec "rm -rf /tmp/rfl_string_unary_sym_domain") -- 0
