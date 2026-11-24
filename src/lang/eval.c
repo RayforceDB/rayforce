@@ -1182,9 +1182,11 @@ static inline void fastmap_write_i64(void* d, int8_t t, int64_t i, int64_t v, bo
 
 /* DATE days as temporal_as_ns orders them: saturated past +-106751 days */
 #define FASTMAP_DATE_SAT 106751
+/* Past +-106751 days temporal_as_ns saturates: all such days compare equal,
+ * and strictly beyond every day inside the range — one step out, not on it. */
 static inline int64_t fastmap_date_key(int64_t days) {
-    return days > FASTMAP_DATE_SAT ? FASTMAP_DATE_SAT
-         : days < -FASTMAP_DATE_SAT ? -FASTMAP_DATE_SAT : days;
+    return days > FASTMAP_DATE_SAT ? FASTMAP_DATE_SAT + 1
+         : days < -FASTMAP_DATE_SAT ? -FASTMAP_DATE_SAT - 1 : days;
 }
 
 static ray_t* fastmap_fill(ray_t* r, ray_t* v) {

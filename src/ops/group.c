@@ -2391,6 +2391,7 @@ typedef struct {
     int64_t*        vals_out;
     /* Pass 3 outputs */
     int64_t*        odata;           /* n_groups, atomic per-group distinct count */
+    _Atomic bool    oom;             /* a partition could not get its table */
 } cdpg_ctx_t;
 
 /* Read column row r as int64.  Width-typed fast path; F64 bitcasts. */
@@ -2465,7 +2466,7 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
         if (cap < 32) cap = 32;
         uint64_t c = 1;
         while (c && c < cap) c <<= 1;
-        if (!c) continue;
+        if (!c) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
         cap = c;
         uint64_t mask = cap - 1;
 
@@ -2474,7 +2475,8 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
         ray_t* s_hdr = NULL;
         cdpg_slot_t* slots = (cdpg_slot_t*)scratch_calloc(&s_hdr,
                                                           (size_t)cap * sizeof(cdpg_slot_t));
-        if (!slots) continue;
+        /* a partition left uncounted would undercount its groups */
+        if (!slots) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
 
         const int64_t* gids = x->gids_out + off;
         const int64_t* vals = x->vals_out + off;
@@ -2621,7 +2623,8 @@ static ray_t* count_distinct_per_group_parallel(
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
     scratch_free(hist_hdr);
-    return cancelled ? ray_error("cancel", NULL) : out;
+    if (cancelled) return ray_error("cancel", NULL);
+    return atomic_load_explicit(&ctx.oom, memory_order_relaxed) ? ray_error("oom", NULL) : out;
 }
 
 /* Approximate per-group count(distinct) via HyperLogLog with sparse
@@ -2765,7 +2768,7 @@ ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
     if (n_rows >= 200000) {
         ray_t* par = count_distinct_per_group_parallel(src, row_gid,
                                                         n_rows, n_groups, out);
-        if (par && RAY_IS_ERR(par)) ray_release(out);   /* a cancel */
+        if (par && RAY_IS_ERR(par)) ray_release(out);   /* a cancel, or a partition short of memory */
         if (par) return par;
         /* par == NULL → no pool / OOM in scratch alloc → fall through to
          * serial path with the already-allocated `out` (still zeroed). */
