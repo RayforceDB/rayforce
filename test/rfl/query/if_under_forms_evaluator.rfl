@@ -1,0 +1,105 @@
+;; @also-unfused
+;; An `if` under `and`, `or`, `do`, `try` or `let` chooses its arm per row on
+;; the routes the planner leaves to the evaluator (#1603).  An arm the
+;; planner does not compile, such as `(as 'sym "x")`, sends the whole
+;; predicate to the evaluator, and so does a `try` or `do`.  Its per-row
+;; pass for an `if` (#1488) entered builtin calls only, and these are special
+;; forms, so an `if` under them went to the evaluator's `if`.  That tests the
+;; condition vector whole, so every row took the first arm.  Each case is
+;; checked against the same expression with literal arms, which the planner
+;; compiles, or against the rows worked out by hand.
+
+(set n 12)
+(set T (table [a act i d] (list (at ['x 'y 'z 'w] (% (til n) 4)) (at ['New 'Accepted 'Rejected] (% (til n) 3)) (til n) (+ 2024.01.01 (til n)))))
+
+;; ── 1. where: alone and in an `and`, either or both arms cast ──
+(at (select {from: T where: (== a (if (== act 'New) 'x 'y))}) 'i) -- [0 1 5]
+(at (select {from: T where: (== a (if (== act 'New) (as 'sym "x") 'y))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) 'x 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) 'x (as 'sym "y"))))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") (as 'sym "y"))))}) 'i) -- [0 1 5]
+;; the `if` first, the operands of `==` swapped, a single-argument `and`
+(at (select {from: T where: (and (== a (if (== act 'New) (as 'sym "x") 'y)) (>= i 0))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (== (if (== act 'New) (as 'sym "x") 'y) a))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 2) (< i 9) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [5]
+
+;; ── 2. or, not, nesting, an `if` chain ──
+(at (select {from: T where: (or (< i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (or (> i 5) (and (< i 3) (== a (if (== act 'New) (as 'sym "x") 'y))))}) 'i) -- [0 1 6 7 8 9 10 11]
+(at (select {from: T where: (and (>= i 0) (not (== a (if (== act 'New) (as 'sym "x") 'y))))}) 'i) -- [2 3 4 6 7 8 9 10 11]
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) 'x (if (== act 'Accepted) (as 'sym "y") 'z))))}) 'i) -- [0 1 2]
+;; `in` takes the whole vector: membership in the per-row arms
+(at (select {from: T where: (and (>= i 0) (in a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 4 5 8 9]
+
+;; ── 3. other types ──
+(at (select {from: T where: (and (>= i 0) (== i (if (== act 'New) 1 4)))}) 'i) -- [4]
+(at (select {from: T where: (and (>= i 0) (== i (if (== act 'New) (as 'i64 1.0) 4)))}) 'i) -- [4]
+(at (select {from: T where: (and (>= i 0) (== d (if (== act 'New) 2024.01.01 2024.01.02)))}) 'i) -- [0 1]
+(at (select {from: T where: (and (>= i 0) (== d (if (== act 'New) (as 'date "2024.01.01") 2024.01.02)))}) 'i) -- [0 1]
+
+;; ── 4. grouped, update, projections ──
+(at (select {from: T where: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y))) by: act r: (count i)}) 'r) -- [1 1 1]
+(at (update {m: 1 from: T where: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'm) -- [1 1 0Nl 0Nl 0Nl 1 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {m: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y))) from: T}) 'm) -- [true true false false false true false false false false false false]
+(at (update {m: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y))) from: T}) 'm) -- [true true false false false true false false false false false false]
+(at (select {m: (sum (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [1 1 1]
+(at (select {m: (first (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [true true false]
+(at (select {m: (first (and (>= i 0) (== a (if (== act 'New) 'x 'y)))) from: T by: act}) 'm) -- [true true false]
+(at (select {m: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y))) from: T by: act}) 'm) -- (list [true false false false] [true false false false] [false true false false])
+
+;; ── 5. arms with no common type still raise, inside `and` / `or` too ──
+(select {from: T where: (and (>= i 0) (> (if (== act 'New) 2024.05.05 i) 2))}) !- type
+(select {from: T where: (or (< i 0) (> (if (== act 'New) 2024.05.05 i) 2))}) !- type
+
+;; ── 6. do, try and let ──
+(at (select {from: T where: (do (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (do (== a (if (== act 'New) (as 'sym "x") 'y))))}) 'i) -- [0 1 5]
+(at (select {from: T where: (do (if (== act 'New) 1 2) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (do (while false 1) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (try (== a (if (== act 'New) 'x 'y)) (fn [e] false))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (>= i 0) (try (== a (if (== act 'New) (as 'sym "x") 'y)) (fn [e] false)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (== a (let k (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (do (== a (if (== act 'New) (as 'sym "x") 'y))) by: act r: (count i)}) 'r) -- [1 1 1]
+(at (update {m: 1 from: T where: (try (== a (if (== act 'New) 'x 'y)) (fn [e] false))}) 'm) -- [1 1 0Nl 0Nl 0Nl 1 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (delete {from: T where: (do (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [2 3 4 6 7 8 9 10 11]
+(at (select {m: (first (try (== a (if (== act 'New) (as 'sym "x") 'y)) (fn [e] false))) from: T by: act}) 'm) -- [true true false]
+(at (select {m: (first (do (== a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [true true false]
+(at (select {m: (first (let k (if (== act 'New) (as 'sym "x") 'y))) from: T by: act}) 'm) -- [x y y]
+;; try keeps its rules: an error anywhere in its expression, a raise in an
+;; arm or arms of no common type, goes to the handler for the whole column;
+;; a handler that is a value is that value; one that raises raises
+(at (select {from: T where: (try (== a (if (== act 'New) (raise 7) 'y)) (fn [e] (== e 7)))}) 'i) -- (til 12)
+(at (select {from: T where: (try (== a (if (== act 'New) (raise 7) 'y)) false)}) 'i) -- (til 0)
+(at (select {from: T where: (try (> (if (== act 'New) 2024.05.05 i) 2) (fn [e] false))}) 'i) -- (til 0)
+(at (select {from: T where: (and (>= i 0) (try (> (if (== act 'New) 2024.05.05 i) 2) (fn [e] false)))}) 'i) -- (til 0)
+(try (select {from: T where: (try (== a (if (== act 'New) (raise 7) 'y)) (fn [e] (raise 8)))}) (fn [e] e)) -- 8
+(at (select {m: (try (if (== act 'New) (raise 7) 'y) (fn [e] 'q)) from: T}) 'm) -- [q y y q y y q y y q y y]
+
+;; ── 7. arguments in the evaluator's order ──
+;; A `let` in an argument binds when the evaluator reaches it, left to right:
+;; a name read before it is still the column, one read after it the new
+;; value.  Evaluating the `if` arguments first read `a` after the `let` had
+;; rebound it, so `(== a (let a ...))` compared the value with itself and
+;; kept every row.  The projection evaluates the same order.
+(at (select {from: T where: (== a (let a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (== a (let a (if (== act 'New) 'x 'y)))}) 'i) -- [0 1 5]
+(at (select {from: T where: (== (let a (if (== act 'New) (as 'sym "x") 'y)) a)}) 'i) -- (til 12)
+(at (select {from: T where: (== (let a (if (== act 'New) 'x 'y)) a)}) 'i) -- (til 12)
+(at (select {m: (== a (let a (if (== act 'New) (as 'sym "x") 'y))) from: T}) 'm) -- [true true false false false true false false false false false false]
+(at (select {m: (== (let a (if (== act 'New) (as 'sym "x") 'y)) a) from: T}) 'm) -- [true true true true true true true true true true true true]
+;; a name a `let` binds in one conjunct is read by the next
+(at (select {from: T where: (and (== a (let k (if (== act 'New) (as 'sym "x") 'y))) (== k a))}) 'i) -- [0 1 5]
+(at (select {from: T where: (and (== a (let a (if (== act 'New) (as 'sym "x") 'y))) (== a 'x))}) 'i) -- [0]
+;; an aggregate over such a call: hoisted whole, its order kept
+(at (select {m: (sum (== a (let a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [1 1 1]
+(at (select {m: (sum (== (let a (if (== act 'New) (as 'sym "x") 'y)) a)) from: T by: act}) 'm) -- [4 4 4]
+(at (select {m: (first (== a (let a (if (== act 'New) (as 'sym "x") 'y)))) from: T by: act}) 'm) -- [true true false]
+(at (select {m: (sum (and (== a (let k (if (== act 'New) (as 'sym "x") 'y))) (== k a))) from: T by: act}) 'm) -- [1 1 1]
+;; a side effect keeps the evaluator's route, so its order (the rows it
+;; keeps are #1610's)
+(set log1603 ['S])
+(set tr1603 (fn [t v] (do (set log1603 (concat log1603 t)) v)))
+(set r1603 (select {from: T where: (and (>= (tr1603 'A i) 0) (== a (tr1603 'B (if (== act 'New) (as 'sym "x") 'y))) (tr1603 'C true))}))
+log1603 -- ['S 'A 'B 'C]
