@@ -3416,7 +3416,7 @@ static bool key_impure_builtin(ray_t* fn, int64_t id) {
     static const char* const impure[] = {
         "println", "show", "print", "rand", "guid", "eval", "parse", "resolve", "env", "get",
         "remove", "timeit", "exit", "ser", "de", "datoms", "assert-fact", "retract-fact",
-        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", "hnsw-save", "rc", "meta",
+        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", ".emb.hnsw.set", "rc", "meta",
     };
     enum { NIMPURE = sizeof impure / sizeof *impure };
     static _Thread_local int64_t ids[NIMPURE];
@@ -4736,6 +4736,16 @@ static ray_t* agg_arith_rewrite(ray_t* expr, ray_t* tbl,
     if (n > 0 && el[0] && el[0]->type == -RAY_SYM &&
         !(el[0]->attrs & ATTR_QUOTED) && agg_arith_head_is_control(el[0]->i64))
         { *ok = 0; return NULL; }
+    /* Over the group result each hidden aggregate is a column of per-group
+     * values, so only an elementwise head reads it as each group's own:
+     * (til (count v)) is each group's til (#1429), not til of the column
+     * of counts. */
+    if (n > 0 && el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED) &&
+        !tbl_has_col(tbl, el[0]->i64) && !ray_query_rowwise_builtin(el[0]->i64)) {
+        ray_t* hf = ray_env_get(el[0]->i64);
+        if (hf && hf->type >= RAY_UNARY && hf->type <= RAY_VARY && !(hf->attrs & RAY_FN_ATOMIC))
+            { *ok = 0; return NULL; }
+    }
     ray_t* out = ray_list_new(0);
     if (!out || RAY_IS_ERR(out)) { *ok = 0; return out && RAY_IS_ERR(out) ? NULL : NULL; }
     for (int64_t i = 0; i < n && *ok; i++) {
@@ -4881,7 +4891,7 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
         if (!arg) return 0;
         if (arg->type == -RAY_I64) {
             /* Opaque tagged handles are not ordinary numeric literals. */
-            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)) return 0;
+            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL)) return 0;
             continue;
         }
         if (arg->type != -RAY_SYM || (arg->attrs & ATTR_QUOTED) ||
@@ -4988,9 +4998,16 @@ static int json_rowwise(ray_t* e, ray_t* tbl) {
  * semantics and is left to the per-row path. */
 static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth);
 
+static bool expr_reads_group_whole(ray_t* e, ray_t* tbl);
+static bool helper_reads_group_whole(ray_t* e, ray_t* tbl);
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
+    /* fold over a column, at of a column: the column whole, the rows a
+     * where: keeps (#1429) */
+    if (!expr_contains_agg(expr) &&
+        (expr_reads_group_whole(expr, tbl) || helper_reads_group_whole(expr, tbl))) return 1;
     ray_t* head = ((ray_t**)ray_data(expr))[0];
     if (!head) return 0;
     /* ((quote as) 'T c) is the cast (as 'T c) is (#1585). */
@@ -5170,7 +5187,8 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
              * result is no row-aligned input, so aggregate what it returns
              * within each group. */
             return true;
-        } else if (expr_calls_whole_col_verb(arg) || expr_calls_set_verb(arg)) {
+        } else if (expr_calls_whole_col_verb(arg) || expr_calls_set_verb(arg) ||
+                   expr_reads_group_whole(arg, tbl)) {
             /* `(rank v)`, `(asc v)`: a whole-column verb over the whole
              * table, sliced by group, ranks or orders across the groups;
              * written in a grouped aggregate it sees its group's rows.  So
@@ -5203,7 +5221,8 @@ static bool agg_input_needs_group_eval(ray_t* arg, ray_t* tbl, bool collections)
     if (tbl && tbl->type == RAY_TABLE && query_expr_has_helper(arg)) {
         ray_t* expanded = query_inline_helpers(arg, tbl);
         bool opaque = query_expr_has_helper(expanded) ||
-                      expr_calls_whole_col_verb(expanded);
+                      expr_calls_whole_col_verb(expanded) ||
+                      expr_reads_group_whole(expanded, tbl);
         ray_release(expanded);
         if (opaque) return true;
     }
@@ -11523,6 +11542,9 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 
 static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl);
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth);
+/* The calls the walk for a query's `if` enters (rw_call_kind). */
+enum { RW_CALL_NONE, RW_CALL_BUILTIN, RW_CALL_LOGIC, RW_CALL_DO, RW_CALL_TRY, RW_CALL_LET };
+static int rw_call_kind(ray_t* e, ray_t* tbl);
 static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget, bool verbs);
 
 /* Does `e` read only its own row: no aggregate and no whole-column verb
@@ -11586,24 +11608,95 @@ static bool rw_pure(ray_t* e, ray_t* tbl, int depth);
 
 typedef struct {
     ray_t*  tbl;        /* the groups' table */
+    ray_t*  root;       /* the whole expression the walk started from */
     ray_t*  out;        /* it with the hidden columns, once one is added */
     int64_t next;
 } if_hoist_t;
+
+/* How often the plain name `sym` occurs in `e` (a `let`'s name included),
+ * past no quote or lambda literal. */
+static int64_t rw_name_count(ray_t* e, int64_t sym, int depth) {
+    if (!e || (e->attrs & ATTR_QUOTED) || depth > 64) return 0;
+    if (e->type == -RAY_SYM) return e->i64 == sym ? 1 : 0;
+    if (e->type != RAY_LIST || e->len < 1) return 0;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0]->type == -RAY_SYM &&
+        (es[0]->i64 == ray_sym_intern("fn", 2) || es[0]->i64 == ray_sym_intern("quote", 5)))
+        return 0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < e->len; i++) n += rw_name_count(es[i], sym, depth + 1);
+    return n;
+}
+
+/* The names the `let`s in `e` bind (rw_call_kind), added to names[n..cap):
+ * the new count.  Not past a `do`, which keeps its bindings to itself, a
+ * quote or a lambda literal. */
+static int rw_let_names(ray_t* e, ray_t* tbl, int64_t* names, int n, int cap, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 64)
+        return n;
+    ray_t** es = (ray_t**)ray_data(e);
+    int kind = rw_call_kind(e, tbl);
+    if (kind == RW_CALL_DO) return n;
+    if (es[0]->type == -RAY_SYM &&
+        (es[0]->i64 == ray_sym_intern("fn", 2) || es[0]->i64 == ray_sym_intern("quote", 5)))
+        return n;
+    if (kind == RW_CALL_LET && n < cap) names[n++] = es[1]->i64;
+    for (int64_t i = 1; i < e->len; i++) n = rw_let_names(es[i], tbl, names, n, cap, depth + 1);
+    return n;
+}
+
+static bool rw_holds_let(ray_t* e, ray_t* tbl) {
+    int64_t one[1];
+    return rw_let_names(e, tbl, one, 0, 1, 0) > 0;
+}
+
+/* Would hoisting `u` out of h->root change what a name reads?  A name some
+ * `let` in the root binds that occurs both in `u` and outside it: hoisted,
+ * `u` is evaluated before the rest, so a read on one side would no longer
+ * see a binding made on the other in the evaluator's order.  More such
+ * names than are counted is answered yes. */
+static bool rw_hoist_let_conflict(ray_t* u, if_hoist_t* h) {
+    int64_t names[17];   /* a 17th means more than are counted */
+    int n = rw_let_names(h->root, h->tbl, names, 0, 17, 0);
+    if (n > 16) return true;
+    for (int i = 0; i < n; i++) {
+        int64_t in = rw_name_count(u, names[i], 0);
+        if (in > 0 && rw_name_count(h->root, names[i], 0) > in) return true;
+    }
+    return false;
+}
 
 /* `e` with each outermost `if` that reads only its own row (no aggregate,
  * no helper that reads the group, no effect) replaced by a hidden column
  * holding its value over the rows (query_eval_rowwise_if), added to h->out.
  * Evaluated per group, an aggregate around it, `(first (if c d (+ d 1)))`,
  * then reads the group's rows of that column instead of an `if` that tests
- * the group's condition vector whole.  The walk enters builtin calls only.
+ * the group's condition vector whole.  The walk enters builtin calls and
+ * `and` / `or`; a `do`, `try` or `let` holding such an `if` is hoisted whole
+ * (rw_call_kind).
  * Owned; an error is the query's. */
 static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32) {
         ray_retain(e); return e;
     }
     ray_t** es = (ray_t**)ray_data(e);
-    if (rw_if_kind(e, h->tbl)) {
-        if (!expr_reads_own_row(e, h->tbl) || !expr_refs_row_column(e, h->tbl) ||
+    int kind = rw_call_kind(e, h->tbl);
+    /* A `do`, `try` or `let` holding such an `if` is hoisted whole: its
+     * `if` may read a name the form binds first, and an error under a `try`
+     * is its handler's.  So is a builtin call or an `and` / `or` holding a
+     * `let` as well, when it reads its own row: its arguments keep their
+     * order (rw_eval_call).  A `let` hoisted binds its name in the scope of
+     * that evaluation only, so nothing is hoisted that shares a name a
+     * `let` binds with the rest of the expression (rw_hoist_let_conflict):
+     * such an expression is evaluated per group as written. */
+    bool held_let = (kind == RW_CALL_BUILTIN || kind == RW_CALL_LOGIC) &&
+                    rw_has_if(e, h->tbl, 0) && rw_holds_let(e, h->tbl) &&
+                    expr_reads_own_row(e, h->tbl);
+    if (rw_if_kind(e, h->tbl) || held_let ||
+        ((kind == RW_CALL_DO || kind == RW_CALL_TRY || kind == RW_CALL_LET) &&
+         rw_has_if(e, h->tbl, 0))) {
+        if (rw_hoist_let_conflict(e, h) ||
+            !expr_reads_own_row(e, h->tbl) || !expr_refs_row_column(e, h->tbl) ||
             !rw_pure(e, h->tbl, 0)) { ray_retain(e); return e; }
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err = NULL;
@@ -11633,13 +11726,9 @@ static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
         }
         return ray_sym(sym);
     }
-    ray_t* hd = es[0];
-    if (!hd || hd->type != -RAY_SYM || (hd->attrs & ATTR_QUOTED) ||
-        tbl_has_col(h->tbl, hd->i64) || ray_env_has_lexical_local(hd->i64)) { ray_retain(e); return e; }
-    ray_t* fn = ray_env_get(hd->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM)) {
-        ray_retain(e); return e;
-    }
+    /* into a builtin call, and an `and` or `or`: its `if` is hoisted even
+     * behind a scalar that decides the fold, as the planned route computes it */
+    if (kind != RW_CALL_BUILTIN && kind != RW_CALL_LOGIC) { ray_retain(e); return e; }
     ray_t* out = NULL;
     for (int64_t i = 1; i < e->len; i++) {
         ray_t* a = nonagg_hoist_if(es[i], h, depth + 1);
@@ -11718,7 +11807,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     ray_t* expr0 = expr;
     ray_t* tbl0 = tbl;
     /* an `if` beside or under an aggregate: its column over the rows */
-    if_hoist_t hs = { .tbl = tbl };
+    if_hoist_t hs = { .tbl = tbl, .root = expr };
     ray_t* hoisted = NULL;
     if (rw_has_if(expr, tbl, 0)) {
         hoisted = nonagg_hoist_if(expr, &hs, 0);
@@ -12097,13 +12186,10 @@ static ray_t* rw_inner_ifs_check(ray_t* e, ray_t* tbl, int64_t nrows, int depth)
         if (v) ray_release(v);
         return NULL;
     }
+    /* not into a `try`: an error under it is its handler's to answer */
+    int kind = rw_call_kind(e, tbl);
+    if (kind == RW_CALL_NONE || kind == RW_CALL_TRY) return NULL;
     ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return NULL;
-    ray_t* fn = ray_env_get(h->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
-        return NULL;
     for (int64_t i = 1; i < e->len; i++) {
         ray_t* err = rw_inner_ifs_check(es[i], tbl, nrows, depth + 1);
         if (err) return err;
@@ -12463,19 +12549,43 @@ static int rw_if_kind(ray_t* e, ray_t* tbl) {
            (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn ? 1 : 0;
 }
 
+/* The calls the walk enters (rw_has_if): a builtin call, and the special
+ * forms whose arguments are whole values as a builtin's are: `and` / `or`
+ * (stopping early on a scalar, rw_eval_logic), `do` (in turn, the last one
+ * its value, rw_eval_do), `try` (its expression, the handler on an error,
+ * rw_eval_try) and `let` (its value, rw_eval_let).  RW_CALL_NONE for
+ * anything else: a lambda (inlined first where it is pure), another special
+ * form, a quoted list, a head a column, a local or a rebinding shadows.
+ * Not entering a form left an `if` under it to the evaluator's `if`, which
+ * tests the condition vector whole: every row took the `then` arm (#1603). */
+static int rw_call_kind(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2) return RW_CALL_NONE;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return RW_CALL_NONE;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return RW_CALL_NONE;
+    if (!(fn->attrs & RAY_FN_SPECIAL_FORM)) return RW_CALL_BUILTIN;
+    void* f = (void*)(uintptr_t)fn->i64;
+    if (fn->type == RAY_VARY && (f == (void*)ray_and_vary_fn || f == (void*)ray_or_vary_fn))
+        return RW_CALL_LOGIC;
+    if (fn->type == RAY_VARY && f == (void*)ray_do_fn) return RW_CALL_DO;
+    if (fn->type == RAY_BINARY && e->len == 3 && f == (void*)ray_try_fn) return RW_CALL_TRY;
+    if (fn->type == RAY_BINARY && e->len == 3 && f == (void*)ray_let_fn &&
+        es[1]->type == -RAY_SYM) return RW_CALL_LET;
+    return RW_CALL_NONE;
+}
+
 /* Does `e` hold such an `if` where the walk reaches: itself, or an argument
- * of a builtin call (no special form, lambda or quoted list is entered). */
+ * of a call rw_call_kind enters (no other special form, lambda or quoted
+ * list is entered). */
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32)
         return false;
     if (rw_if_kind(e, tbl)) return true;
+    if (!rw_call_kind(e, tbl)) return false;
     ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
-    ray_t* fn = ray_env_get(h->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
-        return false;
     for (int64_t i = 1; i < e->len; i++)
         if (rw_has_if(es[i], tbl, depth + 1)) return true;
     return false;
@@ -12722,26 +12832,49 @@ static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, i
     return out;
 }
 
-/* `e`, a builtin call with such an `if` in an argument: the argument is
- * evaluated by rw_value and bound under a hidden name (`#` names no parsed
- * symbol), and the call evaluated over it once. */
+/* `e`, a builtin call with such an `if` in an argument: the arguments are
+ * evaluated in the evaluator's order, left to right, those up to the last
+ * such one here, each bound under a hidden name (`#` names no parsed
+ * symbol), and the call evaluated over them once.  An argument with such an
+ * `if` is evaluated by rw_value, and its value marked as the rows'; one
+ * before it that reads a name or calls something by the evaluator, keeping
+ * the provenance it gives.  Evaluating the `if` ones first read a name
+ * after a `let` in a later argument had rebound it: `(== a (let a (if c x
+ * y)))` compared the new `a` with itself and kept every row (#1603).
+ * Literals, and the arguments after the last such one, are left for the
+ * call, which reaches them in the same order.  The hidden names, and what a
+ * `let` in an argument binds, go to the innermost scope, as a `let` there
+ * binds (query_eval_rowwise_if pushes one for the expression). */
 static ray_t* rw_eval_call(ray_t* e, rw_ctx_t* c, int depth) {
     ray_t** es = (ray_t**)ray_data(e);
+    int64_t last = 0;
+    for (int64_t i = 1; i < e->len; i++)
+        if (rw_has_if(es[i], c->tbl, depth + 1)) last = i;
     ray_t* x = ray_list_new((int32_t)e->len);
     if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
-    if (ray_env_push_query_scope() != RAY_OK) { ray_release(x); return ray_error("oom", NULL); }
     ray_t* out = NULL;
     for (int64_t i = 0; i < e->len && !out; i++) {
         ray_t* a = es[i];
         ray_t* hid = NULL;
-        if (i > 0 && rw_has_if(a, c->tbl, depth + 1)) {
-            ray_t* v = rw_value(a, c, depth + 1);
+        bool has_if = i > 0 && i <= last && rw_has_if(a, c->tbl, depth + 1);
+        bool reads = i > 0 && i < last && !(a->attrs & ATTR_QUOTED) &&
+                     (a->type == -RAY_SYM || a->type == RAY_LIST);
+        if (has_if || reads) {
+            uint8_t rows = 1;
+            ray_t* v;
+            if (has_if) v = rw_value(a, c, depth + 1);
+            else {
+                v = ray_eval(a);
+                rows = ray_eval_last_rows();
+                v = rw_force(v);
+            }
             if (RAY_IS_ERR(v)) { out = v; break; }
             char nm[32];
             int ln = snprintf(nm, sizeof nm, "#if%lld", (long long)c->next++);
             int64_t s = ray_sym_intern(nm, (size_t)ln);
-            ray_env_set_query_local(s, v);
+            ray_err_t berr = ray_env_set_local_rows(s, v, rows);
             ray_release(v);
+            if (berr != RAY_OK) { out = ray_error(ray_err_code_str(berr), NULL); break; }
             hid = ray_sym(s);
             if (!hid || RAY_IS_ERR(hid)) { out = hid ? hid : ray_error("oom", NULL); break; }
             a = hid;
@@ -12755,9 +12888,88 @@ static ray_t* rw_eval_call(ray_t* e, rw_ctx_t* c, int depth) {
         x->attrs = e->attrs;
         out = rw_force(ray_eval(x));
     }
-    ray_env_pop_scope();
     ray_release(x);
     return out;
+}
+
+/* One argument of a special form the walk enters: by rw_value when it holds
+ * such an `if`, else by the evaluator as the form itself would. */
+static ray_t* rw_eval_arg(ray_t* a, rw_ctx_t* c, int depth) {
+    return rw_has_if(a, c->tbl, depth + 1) ? rw_value(a, c, depth + 1) : rw_force(ray_eval(a));
+}
+
+/* `e`, an `and` or `or` with such an `if` in an argument: the arguments in
+ * turn, each by rw_value when it holds one and by the evaluator otherwise,
+ * folded as ray_and_vary_fn / ray_or_vary_fn fold them, stopping where they
+ * stop (a scalar that decides), so an argument they never reach is not
+ * evaluated here either. */
+static ray_t* rw_eval_logic(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* fn = ray_env_get(es[0]->i64);
+    bool is_and = (ray_vary_fn)(uintptr_t)fn->i64 == ray_and_vary_fn;
+    ray_t* acc = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* v = rw_eval_arg(es[i], c, depth);
+        if (RAY_IS_ERR(v)) { if (acc) ray_release(acc); return v; }
+        if (!acc) {
+            acc = v;
+            if (e->len == 2) return acc;   /* (and x) is x */
+        } else {
+            ray_t* next = is_and ? ray_and_fn(acc, v) : ray_or_fn(acc, v);
+            ray_release(acc);
+            ray_release(v);
+            if (!next || RAY_IS_ERR(next)) return next ? next : ray_error("oom", NULL);
+            acc = next;
+        }
+        if (ray_is_atom(acc) && (is_truthy(acc) ? 1 : 0) != (is_and ? 1 : 0)) {
+            if (acc->type == -RAY_BOOL) return acc;
+            ray_release(acc);
+            return ray_bool(!is_and);
+        }
+    }
+    return acc;
+}
+
+/* `(do e1 ... en)` with such an `if` in an argument: the arguments in turn
+ * in a scope of their own, as ray_do_fn evaluates them, the last one the
+ * value; an error stops it. */
+static ray_t* rw_eval_do(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* v = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        if (v) ray_release(v);
+        v = rw_eval_arg(es[i], c, depth);
+        if (RAY_IS_ERR(v)) break;
+    }
+    ray_env_pop_scope();
+    return v;
+}
+
+/* `(try x handler)` with such an `if` in `x`: `x` by rw_value, then what
+ * ray_try_fn does with its value (ray_try_finish): an error, an `if`'s
+ * refusal of its arms included, goes to the handler.  The handler is
+ * evaluated as written. */
+static ray_t* rw_eval_try(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* v = rw_eval_arg(es[1], c, depth);
+    return rw_force(ray_try_finish(v, es[2]));
+}
+
+/* `(let name x)` with such an `if` in `x`: its value by rw_value, bound as
+ * ray_let_fn binds it, in the innermost scope, marked as derived from the
+ * rows as every query local is (ray_env_set_query_local). */
+static ray_t* rw_eval_let(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* v = rw_eval_arg(es[2], c, depth);
+    if (RAY_IS_ERR(v)) return v;
+    ray_err_t err = ray_env_set_local_rows(es[1]->i64, v, 1);
+    if (err != RAY_OK) {
+        ray_release(v);
+        return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
+                                     : ray_error(ray_err_code_str(err), NULL);
+    }
+    return v;
 }
 
 /* `e` over c->tbl, an `if` in it choosing per row: the whole expression on
@@ -12779,7 +12991,14 @@ static ray_t* rw_value(ray_t* e, rw_ctx_t* c, int depth) {
     ray_graph_free(g);
     if (out) return out;
     if (depth <= 32 && rw_if_kind(e, c->tbl)) return rw_chain(e, 1, NULL, c, depth);
-    if (depth <= 32 && rw_has_if(e, c->tbl, depth)) return rw_eval_call(e, c, depth);
+    if (depth <= 32 && rw_has_if(e, c->tbl, depth))
+        switch (rw_call_kind(e, c->tbl)) {
+        case RW_CALL_LOGIC: return rw_eval_logic(e, c, depth);
+        case RW_CALL_DO:    return rw_eval_do(e, c, depth);
+        case RW_CALL_TRY:   return rw_eval_try(e, c, depth);
+        case RW_CALL_LET:   return rw_eval_let(e, c, depth);
+        default:            return rw_eval_call(e, c, depth);
+        }
     return rw_force(ray_eval(e));
 }
 
@@ -12823,7 +13042,11 @@ static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE || !rw_has_if(e, tbl, 0) || !rw_pure(e, tbl, 0))
         return NULL;
     rw_ctx_t c = { .tbl = tbl, .nrows = ray_table_nrows(tbl) };
-    return rw_value(e, &c, 0);
+    /* the scope of the hidden names and of a `let` in `e` (rw_eval_call) */
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* v = rw_value(e, &c, 0);
+    ray_env_pop_scope();
+    return v;
 }
 
 /* ray_eval of a query expression with its columns bound: an `if` over a
@@ -15490,37 +15713,6 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
     return true;
 }
 
-/* Does `e` read a column whole the way #1429 asks about: a call of fold,
- * or of at with a constant index -- one written in place, or, under a
- * where: (`filtered`), any index that reads no column?  Lambda and quoted
- * bodies are not entered. */
-static bool src_reads_whole_1429(ray_t* e, ray_t* tbl, bool filtered, int depth) {
-    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 32) return false;
-    ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && !tbl_has_col(tbl, h->i64) &&
-        !ray_env_has_lexical_local(h->i64)) {
-        ray_t* fn = ray_env_get(h->i64);
-        bool builtin = fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY;
-        ray_t* hs = ray_sym_str(h->i64);
-        size_t hl = hs ? ray_str_len(hs) : 0;
-        const char* hp = hs ? ray_str_ptr(hs) : "";
-        if (builtin && hl == 4 && memcmp(hp, "fold", 4) == 0) return true;
-        if (builtin && hl == 2 && memcmp(hp, "at", 2) == 0 && e->len == 3) {
-            ray_t* ix = es[2];
-            bool literal = ix && ((ix->type < 0 && ix->type != -RAY_SYM) ||
-                                  (ix->type > 0 && ix->type != RAY_LIST));
-            if (literal || (filtered && ix && expr_reads_no_column(ix, tbl))) return true;
-        }
-        if (h->i64 == ray_sym_intern("fn", 2)) return false;   /* a lambda's body */
-    }
-    /* the arguments, of a lambda written in place too (its head is not
-     * entered) */
-    for (int64_t i = 1; i < e->len; i++)
-        if (src_reads_whole_1429(es[i], tbl, filtered, depth + 1)) return true;
-    return false;
-}
-
 /* first/last's argument over the rows in one pass, where the answer is the
  * one the compiled route or `by:` gives.  An elementwise argument is the
  * column the compiled route computes, so its error is the query's (an `if`
@@ -15655,6 +15847,62 @@ static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
     return x ? x : ray_error("oom", NULL);
 }
 
+/* A data argument of a two-argument aggregate over `nrows` rows, read as
+ * the planned route reads it: a column (or an expression over columns) as
+ * it is; a vector that reads no column under the free-vector rule (#1462):
+ * over no rows nothing of it is read, and one element is spread as an atom
+ * over the rows. */
+static ray_t* scalar_binary_agg_arg(ray_t* e, ray_t* tbl, int64_t nrows) {
+    ray_t* v = eval_expr_whole_column_impl(e, tbl);
+    if (!v || RAY_IS_ERR(v) || ray_is_atom(v) || !expr_reads_no_column(e, tbl)) {
+        if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) return scalar_atom_rows(v, nrows);
+        return v;
+    }
+    if (nrows == 0 || v->len == 1) {
+        if (v->len == 0) return v;
+        int alloc = 0;
+        ray_t* x = collection_elem(v, 0, &alloc);
+        if (x && !RAY_IS_ERR(x) && !alloc) ray_retain(x);
+        ray_release(v);
+        if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
+        return scalar_atom_rows(x, nrows);
+    }
+    return v;
+}
+
+/* `(fn x y)` for an aggregate of two arguments over the rows of `tbl`: the
+ * binary aggregates read both as data, top/bot/quantile/percentile the
+ * first (the second, k or the probability, is evaluated once as it is). */
+static ray_t* scalar_binary_agg_eval(ray_t* call, ray_t* tbl, int64_t nrows) {
+    ray_t** es = (ray_t**)ray_data(call);
+    ray_t* fn = ray_len(call) == 3 ? ray_env_get(es[0]->i64) : NULL;
+    if (!fn || fn->type != RAY_BINARY) return eval_expr_whole_column_impl(call, tbl);
+    uint16_t op = resolve_agg_opcode(es[0]->i64);
+    bool both = agg_is_binary_agg(op);
+    ray_t* x = scalar_binary_agg_arg(es[1], tbl, nrows);
+    if (!x || RAY_IS_ERR(x)) return x;
+    ray_t* y;
+    if (op == OP_QUANTILE && nrows == 0) {
+        /* Over no rows the probability is not checked, as the planned
+         * route reads it (#981): one that reads no column is evaluated
+         * for its own errors only, and the answer is the builtin's over
+         * no values at a valid probability. */
+        bool pct = agg_name_is_percentile(es[0]->i64);
+        double q = 0.5;
+        ray_t* perr = quantile_select_prob(es[2], tbl, NULL, NULL, pct, &q);
+        if (perr) { ray_release(x); return perr; }
+        y = ray_f64(pct ? q * 100.0 : q);
+    } else {
+        y = both ? scalar_binary_agg_arg(es[2], tbl, nrows) : eval_expr_whole_column_impl(es[2], tbl);
+    }
+    if (!y || RAY_IS_ERR(y)) { ray_release(x); return y; }
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    ray_t* r = ray_sig_note(ray_fn_name(fn), bf(x, y));
+    ray_release(x);
+    ray_release(y);
+    return r;
+}
+
 /* `tbl` holds the rows where: keeps; `src_tbl` and `sel`, when where: ran
  * over a flat table, the rows before it and the selection that keeps them
  * (NULL otherwise). */
@@ -15682,12 +15930,25 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         }
 
         ray_t** agg_elems = (ray_t**)ray_data(val_expr);
+        ray_t* agg_value = NULL;
         if (ray_len(val_expr) != 2) {
-            ray_release(result);
-            return ray_error("domain", "select: scalar aggregate fallback only supports unary aggregates");
+            /* An aggregate of two arguments (cov, wsum, quantile, top,
+             * ...) is the builtin's call over the kept rows, the answer
+             * the planned route gives (#1620). */
+            agg_value = scalar_binary_agg_eval(val_expr, tbl, nrows);
+            if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
+                agg_value = ray_lazy_materialize(agg_value);
+            if (!agg_value || RAY_IS_ERR(agg_value)) {
+                ray_release(result);
+                return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
+            }
+            goto emit;
         }
 
         ray_t* fn_obj = ray_env_get(agg_elems[0]->i64);
+        /* `median` is the planner's name for med; it has no builtin */
+        if (!fn_obj && resolve_agg_opcode(agg_elems[0]->i64) == OP_MEDIAN)
+            fn_obj = ray_env_get(ray_sym_intern("med", 3));
         if (!fn_obj || fn_obj->type != RAY_UNARY) {
             ray_release(result);
             return ray_error("type", "select: aggregate must be a unary function, got %s",
@@ -15706,10 +15967,17 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         bool column_free = false;
         ray_unary_fn uf = (ray_unary_fn)(uintptr_t)fn_obj->i64;
         bool edge = uf == ray_first_fn || uf == ray_last_fn;
-        if (is_whole_column_projection(agg_src_expr, tbl) ||
-            expr_is_constant_collection(agg_src_expr, tbl, NULL))
+        bool empty_group_whole = nrows == 0 && !edge &&
+            (expr_reads_group_whole(agg_src_expr, tbl) || helper_reads_group_whole(agg_src_expr, tbl));
+        if (!empty_group_whole && (is_whole_column_projection(agg_src_expr, tbl) ||
+                                   expr_is_constant_collection(agg_src_expr, tbl, NULL))) {
             src = eval_expr_whole_column_impl(agg_src_expr, tbl);
-        else if (expr_reads_no_column(agg_src_expr, tbl)) {
+            /* (first (at v 0)) over no row: the null of its type, as a
+             * scalar edge source gives it (scalar_edge_src_whole) */
+            if (edge && src && !RAY_IS_ERR(src) && ray_is_atom(src) && nrows == 0 &&
+                expr_reads_group_whole(agg_src_expr, tbl))
+                src = scalar_atom_rows(src, nrows);
+        } else if (expr_reads_no_column(agg_src_expr, tbl)) {
             column_free = true;
             /* A source that reads no column (`(til 5)`, which the planner
              * does not lower) has one value whatever the row: a collection
@@ -15733,26 +16001,28 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
              * is evaluated over the rows before the where:, which then
              * keeps its rows (expr_vconst_on_rows).  Over a parted table it
              * runs per row, as before. */
-            /* fold, and at with a constant index, read the whole column
-             * under by:; whether they read the rows a where: keeps is the
-             * open question of #1429.  Such a source keeps the path it had
-             * before #1401 (first/last over the column, any other aggregate
-             * per row), so no answer of it moves until that is decided.  A
-             * computed index without a where: reads every row on either
-             * reading: (sum (at c (til 4))) is #1402's. */
-            bool open1429 = !edge && src_reads_whole_1429(agg_src_expr, tbl, sel != NULL, 0);
-            bool vconst = (edge || !open1429) && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
+            /* A scalar the source gives stands for every row, as 1 does in
+             * (sum 1), as on the planned route: (sum (count v)) over 4 rows
+             * is 16 (#1571).  A non-inlined helper's scalar is folded once,
+             * as every route gives it ((sum (hq v)) is the count; whether
+             * that should spread too is #1576). */
+            bool spread = edge || expr_contains_agg(agg_src_expr);
+            /* over no row, fold or at of a column reads as on dev, per row
+             * (nothing): (sum (fold + v)) is 0, not fold's empty error */
+            bool empty_whole = nrows == 0 && (expr_reads_group_whole(agg_src_expr, tbl) ||
+                                              helper_reads_group_whole(agg_src_expr, tbl));
+            bool vconst = sel && expr_holds_vector_const(agg_src_expr, tbl) &&
                           expr_vconst_on_rows(agg_src_expr, tbl, true, 0);
             if (vconst) {
                 if (src_tbl) {
                     int64_t sn = ray_table_nrows(src_tbl);
-                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn, edge);
+                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn, spread);
                     if (src) src = scalar_edge_keep_rows(src, sn, sel);
                 }
-            } else if (edge || (!open1429 && !expr_contains_call_named(agg_src_expr, "enlist", 6))) {
+            } else if (!empty_whole && (edge || !expr_contains_call_named(agg_src_expr, "enlist", 6))) {
                 /* enlist stays the per-row constructor it is in a query,
                  * under by: too: (count (enlist x)) counts the rows */
-                src = scalar_edge_src_whole(agg_src_expr, tbl, nrows, edge);
+                src = scalar_edge_src_whole(agg_src_expr, tbl, nrows, spread);
             }
             if (!src) src = rw_if_mix_err(agg_src_expr, tbl);
             if (!src) {
@@ -15767,7 +16037,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
         }
 
-        ray_t* agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
+        agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
         if (!agg_value) agg_value = ray_sig_note(ray_fn_name(fn_obj), uf(src));
         ray_release(src);
         if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
@@ -15780,6 +16050,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         /* An aggregate is one value, a collection too (`(first l)` over a
          * LIST column of lists): boxed as one cell, as the compiled route
          * and each group under by: take it. */
+    emit:
         if (!ray_is_atom(agg_value)) {
             ray_t* box = ray_list_new(1);
             if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
@@ -15877,9 +16148,12 @@ static uint8_t win_kind_from_name(const char* s, size_t len) {
  * row.
  * `funcs:` is a nested RAY_DICT whose values are list expressions (fn col).
  */
+static ray_t* query_too_deep(ray_t** args, int64_t n, const char* verb);
 ray_t* ray_window_fn(ray_t** args, int64_t n) {
     if (n < 1)
         return ray_error("arity", "window: expects a query dict, got %lld args", (long long)n);
+    ray_t* deep = query_too_deep(args, n, "window");
+    if (deep) return deep;
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
         return ray_error("type", "window: argument must be a dict, got %s",
@@ -17011,9 +17285,70 @@ static int col_refs_add(int64_t* out_syms, int max_out, int n, int64_t want) {
  * entries) up to `max_out`; returns the new count.  Used to determine
  * the subset of input columns the rest of a (select ...) clause actually
  * touches, so a prefilter materialise can skip everything else. */
+/* Nested selects the column walk is inside, innermost last (#1567,
+ * #1568).  A nested select binds its own table's columns, and its outputs
+ * as aliases, after the outer query's, so at run time a name it holds of
+ * either kind is the inner one, whatever the outer table holds; any other
+ * name falls through to what the select itself sees, the outer columns
+ * included (a correlated reference).  The walk follows that: only a
+ * nested select whose from: is a global table is entered with its scope;
+ * one whose table the planner cannot see is walked as before. */
+static const int64_t* select_clause_ids(void);
+static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+typedef struct { ray_t* dict; ray_t* table; bool aliases; } nested_scope_t;
+static _Thread_local nested_scope_t g_nested_scope[8];
+static _Thread_local int g_nested_scope_n;
+
+static bool nested_scope_shadows(int64_t sym) {
+    for (int i = g_nested_scope_n - 1; i >= 0; i--) {
+        if (tbl_has_col(g_nested_scope[i].table, sym)) return true;
+        /* its outputs are aliases only within its outputs: where:, by: and
+         * from: do not see them, so a name there is a correlated one */
+        if (!g_nested_scope[i].aliases) continue;
+        ray_t* keys = ray_dict_keys(g_nested_scope[i].dict);
+        if (keys && keys->type == RAY_SYM)
+            for (int64_t k = 0; k < keys->len; k++)
+                if (sym_cell_runtime_id(keys, k) == sym && !select_clause_key(select_clause_ids(), sym))
+                    return true;
+    }
+    return false;
+}
+
+static bool query_inline_pure(ray_t* expr, int depth);
+static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
+                                 int max_out, int n, bool sym_vecs_data);
+
+/* The table a nested select (select D) reads, when the planner can tell it
+ * without running user code: from: names a table (a global, a parameter or
+ * a let; not a column of the outer table `tbl`), or is an expression of
+ * pure builtins over such names that reads no column of `tbl`, evaluated
+ * here to learn its columns.  A new reference, or NULL. */
+static ray_t* nested_select_table(ray_t* d, ray_t* tbl) {
+    ray_t* from = dict_get(d, "from");
+    if (!from) return NULL;
+    if (from->type == -RAY_SYM) {
+        if ((from->attrs & ATTR_QUOTED) || nested_scope_shadows(from->i64) ||
+            (!ray_env_has_lexical_local(from->i64) && tbl_has_col(tbl, from->i64))) return NULL;
+        ray_t* v = ray_env_get(from->i64);
+        if (!v || v->type != RAY_TABLE) return NULL;
+        ray_retain(v);
+        return v;
+    }
+    if (from->type != RAY_LIST || (from->attrs & ATTR_QUOTED) || !query_inline_pure(from, 0)) return NULL;
+    int64_t ref;
+    if (collect_col_refs_walk(from, tbl, &ref, 1, 0, true) != 0) return NULL;
+    ray_t* v = ray_eval(from);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    if (v->type != RAY_TABLE) { ray_release(v); return NULL; }
+    return v;
+}
+
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
                                  int max_out, int n, bool sym_vecs_data) {
     if (!expr || n >= max_out) return n;
+    if (expr->type == -RAY_SYM && g_nested_scope_n > 0 && nested_scope_shadows(expr->i64))
+        return n;                              /* the nested select's own name */
     if (expr->type == -RAY_SYM) {
         if (expr->attrs & ATTR_QUOTED)
             return tbl_has_col(tbl, expr->i64)
@@ -17035,6 +17370,40 @@ static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
             !(elems[0]->attrs & ATTR_QUOTED) &&
             elems[0]->i64 == ray_sym_intern("quote", 5))
             return n;
+        /* (select D) with a table the planner sees: D's clauses in its
+         * scope, from: in the enclosing one */
+        if (cnt == 2 && elems[0] && elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED) &&
+            elems[1] && elems[1]->type == RAY_DICT && g_nested_scope_n < 8 &&
+            !tbl_has_col(tbl, elems[0]->i64) && !ray_env_has_lexical_local(elems[0]->i64)) {
+            ray_t* hs = ray_sym_str(elems[0]->i64);
+            ray_t* fn = ray_env_get(elems[0]->i64);
+            ray_t* inner = hs && ray_str_len(hs) == 6 && memcmp(ray_str_ptr(hs), "select", 6) == 0 &&
+                           fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY
+                         ? nested_select_table(elems[1], tbl) : NULL;
+            if (inner) {
+                ray_t* d = elems[1];
+                ray_t* keys = ray_dict_keys(d);
+                ray_t* vals = ray_dict_vals(d);
+                int64_t from_id = select_clause_ids()[0];
+                n = collect_col_refs_walk(dict_get(d, "from"), tbl, out_syms, max_out, n, sym_vecs_data);
+                int top = g_nested_scope_n;
+                g_nested_scope[top].dict = d;
+                g_nested_scope[top].table = inner;
+                g_nested_scope_n++;
+                const int64_t* rid = select_clause_ids();
+                if (keys && keys->type == RAY_SYM && vals && vals->type == RAY_LIST)
+                    for (int64_t i = 0; i < ray_dict_len(d) && n < max_out; i++) {
+                        int64_t kid = sym_cell_runtime_id(keys, i);
+                        if (kid == from_id) continue;
+                        g_nested_scope[top].aliases = !select_clause_key(rid, kid);
+                        n = collect_col_refs_walk(((ray_t**)ray_data(vals))[i], tbl, out_syms,   /* not-a-table */
+                                                  max_out, n, sym_vecs_data);
+                    }
+                g_nested_scope_n--;
+                ray_release(inner);
+                return n;
+            }
+        }
         for (int64_t i = 0; i < cnt && n < max_out; i++)
             n = collect_col_refs_walk(elems[i], tbl, out_syms, max_out, n, sym_vecs_data);
         return n;
@@ -17666,6 +18035,14 @@ static ray_t* select_fallback_broadcast(ray_t* v, int64_t n) {
                                   ray_type_name(v->type));
         ray_release(v);
         return out;
+    }
+    if (v->type == RAY_LIST && v->len == 1 && n != 1) {
+        /* one cell (a fold's collection, #1429): the same cell in every row */
+        ray_t* cell = ((ray_t**)ray_data(v))[0];
+        ray_t* out = ray_list_new((int32_t)n);
+        for (int64_t r = 0; r < n && out && !RAY_IS_ERR(out); r++) out = ray_list_append(out, cell);
+        ray_release(v);
+        return out ? out : ray_error("oom", NULL);
     }
     if (v->type <= 0 || !ray_is_vec(v) || v->len != 1 || n == 1) return v;
     ray_t* n_obj = make_i64(n);
@@ -19287,7 +19664,22 @@ static ray_t* select_check_key_named_outputs(ray_t* dict) {
     return NULL;
 }
 
+/* The planner walks a query's expressions with recursion per level and
+ * no error path, and an expression can be built at run time nested
+ * arbitrarily deep (a dict passed to `select` through `eval`): a query
+ * nested deeper than text can be (the parser's 1024 levels) is refused,
+ * so no walk ever meets one (#1591). */
+#define QUERY_MAX_NEST 1024
+static ray_t* query_too_deep(ray_t** args, int64_t n, const char* verb) {
+    for (int64_t i = 0; i < n; i++)
+        if (ray_nests_deeper_than(args[i], QUERY_MAX_NEST))
+            return ray_error("limit", "%s: query nested deeper than %d levels", verb, QUERY_MAX_NEST);
+    return NULL;
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
+    ray_t* deep = query_too_deep(args, n, "select");
+    if (deep) return deep;
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
@@ -19635,7 +20027,18 @@ static ray_t* fv_head_builtin(ray_t* e, ray_t* tbl) {
  * (ray_fn_row_arg: atomic builtins, (min W 30), (as 'F64 W), if, ...);
  * and `distinct` its source, as (count (distinct v)) counts each group's
  * values. */
+static bool call_is_fold_or_at(ray_t* e);
+
+/* This is the one list of positions where a free vector as long as the
+ * table is read as rows.  fold reduces its vector as an aggregate reduces
+ * its source, so its values are read as rows too: (fold + W) by: folds
+ * each group's slice of W, as (sum W) sums it (the owner's decision of
+ * 2026-11-24, where #1429 and #1492 meet).  at is not: its source and its
+ * index over a free vector are a lookup, read whole. */
 static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows) {
+    if (i >= 2 && call_is_fold_or_at(e) && fv_head_builtin(e, tbl) &&
+        fv_head_builtin(e, tbl)->type == RAY_VARY)
+        return true;                                   /* fold's values */
     if (is_agg_expr(e)) {
         if (i == 1) return true;
         uint16_t op = resolve_agg_opcode(((ray_t**)ray_data(e))[0]->i64);
@@ -20207,7 +20610,6 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                     if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
                     if (__VM->return_val) { ray_release(__VM->return_val); __VM->return_val = NULL; }
                     ray_clear_error_trace();
-                    __VM->err.msg[0] = '\0';
                 }
                 else if (keyvec) ray_release(keyvec);
                 keyvec = eval_expr_per_row(by_expr, base, nrows);
@@ -20390,6 +20792,186 @@ static bool query_value_is_code(const ray_t* v) {
     return v && (v->type == RAY_LAMBDA || (v->type >= RAY_UNARY && v->type <= RAY_VARY));
 }
 
+/* #1429 (the owner's decision of 2026-11-24): fold over a column and at of
+ * a column, whatever the index, see the group's rows under by:, the rows a
+ * where: keeps keyless, as every other expression of an output does.  Is
+ * the call `e` such a read: fold with an argument that reads a row column
+ * of `tbl`, or at whose source reads one?  A source that reads no column
+ * (a global vector, a nested select) is a lookup and reads whole, as
+ * #1492 has it; a free vector as long as the table is a column there. */
+/* The fold family, spelled any way: fold, fold-left, fold-right,
+ * fold-while all reduce what they are given whole (#1429). */
+static bool fn_is_fold(const void* fp) {
+    return fp == (const void*)ray_fold_fn || fp == (const void*)ray_fold_left_fn ||
+           fp == (const void*)ray_fold_right_fn || fp == (const void*)ray_fold_while_fn;
+}
+
+static int expr_refs_row_column(ray_t* expr, ray_t* tbl);
+/* Is `e` a column's values row by row: a column, or atomic builtins over
+ * columns and atoms?  (list a b), (map f ...) and other constructors are
+ * a value per row of another shape, not a column at indexes. */
+static bool src_is_column_shaped(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM) return !(e->attrs & ATTR_QUOTED);
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (!es[0] || es[0]->type != -RAY_SYM || (es[0]->attrs & ATTR_QUOTED) ||
+        tbl_has_col(tbl, es[0]->i64) || ray_env_has_lexical_local(es[0]->i64)) return false;
+    ray_t* fn = ray_env_get(es[0]->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || !(fn->attrs & RAY_FN_ATOMIC)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (!src_is_column_shaped(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* Does the index `e` read a name holding a vector that is no column but as
+ * long as the table (a free vector, #1492)?  Such an index is a row
+ * position per row, a lookup as on dev, not an index into the group
+ * (#1429).  A vector written in place is a constant index instead. */
+static bool index_reads_free_vector(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    int64_t nr = ray_table_nrows(tbl);
+    if (e->type == -RAY_SYM) {
+        if ((e->attrs & ATTR_QUOTED) || (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)))
+            return false;
+        ray_t* v = ray_env_get(e->i64);
+        /* at least as long as the rows: under a where: the rows are the
+         * kept ones, and the vector is as long as the table */
+        return v && ray_is_vec(v) && v->type != RAY_LIST && v->len >= nr && v->len > 1;
+    }
+    /* a vector written in place is a constant index, which sees the group */
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    for (int64_t i = 1; i < e->len; i++)
+        if (index_reads_free_vector(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+static bool call_reads_group_whole(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 3 || !tbl) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64) ||
+        ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn) return false;
+    if (fn->type == RAY_BINARY && (ray_binary_fn)(uintptr_t)fn->i64 == ray_at_fn)
+        return e->len == 3 && expr_refs_row_column(es[1], tbl) && src_is_column_shaped(es[1], tbl, 0) &&
+               !index_reads_free_vector(es[2], tbl, 0);
+    if (fn->type == RAY_VARY && fn_is_fold((const void*)(uintptr_t)fn->i64)) {
+        for (int64_t i = 1; i < e->len; i++)
+            if (expr_refs_row_column(es[i], tbl)) return true;
+    }
+    return false;
+}
+
+/* Is `e` a call of the builtin fold or at (by a name still bound to it)? */
+static bool call_is_fold_or_at(ray_t* e) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 3) return false;
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn) return false;
+    return (fn->type == RAY_BINARY && (ray_binary_fn)(uintptr_t)fn->i64 == ray_at_fn) ||
+           (fn->type == RAY_VARY && fn_is_fold((const void*)(uintptr_t)fn->i64));
+}
+
+/* Is `e` itself such a call giving one value: fold, or at at an index that
+ * is an atom written in place or reads no row column outside an aggregate,
+ * ((at v (- (count v) 1)))? */
+static bool expr_group_scalar(ray_t* e, ray_t* tbl) {
+    if (!call_reads_group_whole(e, tbl)) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* fn = ray_env_get(es[0]->i64);
+    if (fn->type == RAY_VARY) return true;                         /* fold */
+    ray_t* ix = es[2];
+    if (ix->type < 0) return ix->type != -RAY_SYM || (ix->attrs & ATTR_QUOTED) ? true : false;
+    return ix->type == RAY_LIST && expr_contains_agg(ix) && !expr_refs_row_column(ix, tbl);
+}
+
+static bool helper_reads_group_whole(ray_t* e, ray_t* tbl);
+static bool lambda_body_folds(ray_t* e, int depth);
+
+/* Is `e` one value of the (kept) rows, as an aggregate is: an aggregate, a
+ * fold, at at a one-value index, a constant, a name that is no column, a
+ * helper that folds, or elementwise calls of such values -- (+ (fold + v)
+ * 1), (at v (- (count v) 1)) (#1429)?  An expression built from aggregates
+ * is an aggregate. */
+static bool expr_one_value(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        if (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)) return false;
+        ray_t* v = ray_env_get(e->i64);
+        return v && ray_is_atom(v);
+    }
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    if (is_agg_expr(e)) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64) ||
+        ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn) return false;
+    if (fn->type == RAY_LAMBDA) {
+        ray_t* x = query_inline_helpers(e, tbl);
+        if (!x || RAY_IS_ERR(x)) { if (x && RAY_IS_ERR(x)) ray_error_free(x); return false; }
+        /* not inlined (the same call back): the helper's body says */
+        bool same = x->type == RAY_LIST && x->len > 0 && ((ray_t**)ray_data(x))[0] &&
+                    ((ray_t**)ray_data(x))[0]->type == -RAY_SYM && ((ray_t**)ray_data(x))[0]->i64 == h->i64;
+        bool r = !same ? expr_one_value(x, tbl, depth + 1) : lambda_body_folds(LAMBDA_BODY(fn), 0);
+        ray_release(x);
+        return r;
+    }
+    if (fn->type == RAY_VARY && fn_is_fold((const void*)(uintptr_t)fn->i64)) return true;
+    if (fn->type == RAY_BINARY && (ray_binary_fn)(uintptr_t)fn->i64 == ray_at_fn && e->len == 3)
+        return expr_one_value(es[2], tbl, depth + 1);
+    if (fn->type < RAY_UNARY || fn->type > RAY_VARY || !(fn->attrs & RAY_FN_ATOMIC)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (!expr_one_value(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* call_reads_group_whole anywhere in `e`: its calls' arguments, not a
+ * quoted form or a lambda's body. */
+static bool expr_reads_group_whole(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0 || !tbl) return false;
+    if (call_reads_group_whole(e, tbl)) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == -RAY_SYM && es[0]->i64 == ray_sym_intern("fn", 2)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (expr_reads_group_whole(es[i], tbl)) return true;
+    return false;
+}
+
+/* Does `e` call a helper -- inlined, or by its body when it cannot be --
+ * that folds or indexes with at a value given it from a column: a helper
+ * folding its argument folds the (kept) column, as inline (#1429). */
+static bool lambda_body_folds(ray_t* e, int depth) {
+    if (!e || depth > 16 || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    if (call_is_fold_or_at(e)) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0] && es[0]->type == -RAY_SYM && !(es[0]->attrs & ATTR_QUOTED)) {
+        ray_t* fn = ray_env_get_global(es[0]->i64);
+        if (fn && fn->type == RAY_LAMBDA && lambda_body_folds(LAMBDA_BODY(fn), depth + 1)) return true;
+    }
+    for (int64_t i = 0; i < e->len; i++)
+        if (lambda_body_folds(es[i], depth + 1)) return true;
+    return false;
+}
+
+static bool helper_reads_group_whole(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || !tbl || !query_expr_has_helper(e) || !expr_refs_row_column(e, tbl)) return false;
+    ray_t* x = query_inline_helpers(e, tbl);
+    if (!x || RAY_IS_ERR(x)) { if (x && RAY_IS_ERR(x)) ray_error_free(x); return false; }
+    bool hit = !expr_contains_agg(x) &&
+               (expr_reads_group_whole(x, tbl) || (query_expr_has_helper(x) && lambda_body_folds(x, 0)));
+    ray_release(x);
+    return hit;
+}
+
 /* Does the text of `e` name an aggregate (called, or passed as a value), a
  * whole-column verb, or a helper (a lambda by name or written in place)?
  * A walk of the expression alone, no budget and no helper bodies: when it
@@ -20417,7 +20999,7 @@ static bool expr_names_group_code(ray_t* e, ray_t* tbl, bool head, int depth) {
         return query_code_needs_group_v(e, NULL, 0, &budget, true);   /* a builtin: the verb table */
     }
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
-    if (is_agg_expr(e)) return true;
+    if (is_agg_expr(e) || call_reads_group_whole(e, tbl)) return true;
     ray_t** es = (ray_t**)ray_data(e);
     if (es[0] && es[0]->type == RAY_LIST) return true;       /* ((fn ...) args) */
     for (int64_t i = 0; i < e->len; i++)
@@ -20458,7 +21040,12 @@ static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, i
         return query_value_is_code(v) && query_code_needs_group_v(v, NULL, depth + 1, budget, verbs);
     }
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return query_code_needs_group_v(e, tbl, depth, budget, verbs);
-    if (is_agg_expr(e)) return true;
+    if (is_agg_expr(e) || call_reads_group_whole(e, tbl)) return true;
+    /* in a helper's body (no table: its names are its parameters), fold
+     * and at read what they are given whole, so a helper using either is
+     * called with the group's rows, as one using a whole-column verb is
+     * (#1429) */
+    if (!tbl && call_is_fold_or_at(e)) return true;
     ray_t** es = (ray_t**)ray_data(e);
     for (int64_t i = 0; i < e->len; i++)
         if (query_code_needs_group(es[i], tbl, i == 0, depth + 1, budget, verbs)) return true;
@@ -21906,6 +22493,73 @@ static bool prune_where_not_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     return true;
 }
 
+/* Row-local spellings that carry no ATOMIC flag (#1604).  Each is checked
+ * against its native builtin, so a rebound spelling stays declined. */
+
+/* (quote <sym>): the symbol itself, never a column, whatever the source
+ * holds: the spelling a query uses for a symbol named like a column. */
+static bool prune_quote_sym(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 2) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    return fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_vary_fn)(uintptr_t)fn->i64 == ray_quote_fn && prune_head_named(el[0], "quote") &&
+           el[1] && el[1]->type == -RAY_SYM && !(el[1]->attrs & ATTR_QUOTED);
+}
+
+/* A literal value: an atom that is not a name (a quoted symbol naming no
+ * column of `tbl`, which would read that column), or with `vec` a typed
+ * vector literal or (list <such atoms>). */
+static bool prune_literal(ray_t* x, ray_t* tbl, bool vec) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (x->type == -RAY_SYM)
+        return (x->attrs & ATTR_QUOTED) && !ray_table_slot(tbl, x->i64);
+    if (x->type < 0) return true;
+    if (!vec || (x->attrs & ATTR_QUOTED)) return false;
+    if (x->type != RAY_LIST) return x->type != RAY_SYM && ray_is_vec(x);   /* a SYM vector may hold names */
+    ray_t** el = (ray_t**)ray_data(x);
+    int64_t n = ray_len(x);
+    ray_t* fn = n >= 2 ? prune_head_fn(el[0], tbl) : NULL;
+    if (!fn || fn->type != RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM) ||
+        (ray_vary_fn)(uintptr_t)fn->i64 != ray_list_fn || !prune_head_named(el[0], "list")) return false;
+    for (int64_t i = 1; i < n; i++)
+        if (!el[i] || el[i]->type >= 0 || !prune_literal(el[i], tbl, false)) return false;
+    return true;
+}
+
+/* (as 'T <literal>): one constant whatever the source, so an operand reads
+ * it as it reads a literal: (as 'GUID "…") beside a GUID column.  `vec`: the
+ * literal may be a vector, for the set of an `in`; elsewhere a vector's
+ * length would meet the row count.  The type name must name no column
+ * either, or the cast would read it. */
+static bool prune_const_cast(ray_t* e, ray_t* tbl, bool vec) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 3) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_cast_fn && prune_head_named(el[0], "as") &&
+           el[1] && el[1]->type == -RAY_SYM && (el[1]->attrs & ATTR_QUOTED) &&
+           !ray_table_slot(tbl, el[1]->i64) && prune_literal(el[2], tbl, vec);
+}
+
+/* (nil? x): a BOOL per row of x. */
+static bool prune_nil_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_UNARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_unary_fn)(uintptr_t)fn->i64 == ray_nil_fn && prune_head_named(head, "nil?");
+}
+
+/* (like x pattern) with a constant pattern string: a BOOL per row of x. */
+static bool prune_like_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_like_fn && prune_head_named(head, "like");
+}
+
+static bool prune_like_pattern(ray_t* x, ray_t* tbl) {
+    if (x && x->type == -RAY_STR) return true;
+    ray_t* b = prune_bound_const(x, tbl, false);
+    return b && b->type == -RAY_STR;
+}
+
 /* `mode`: 0 outside where:; 1 in where:, at a conjunct; 2 in where:, an
  * operand of a call. */
 static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
@@ -21918,6 +22572,8 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return c && !RAY_IS_ERR(c);
     }
     if (e->type < 0) return true;
+    /* a symbol or a cast constant written as a call (#1604) */
+    if (prune_quote_sym(e, tbl) || prune_const_cast(e, tbl, false)) return true;
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) < 2) return false;
     ray_t** el = (ray_t**)ray_data(e);
     int64_t n = ray_len(e);
@@ -21926,8 +22582,23 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         int budget = PRUNE_IF_MAX_VISITS;
         if (prune_if_cond(el[1], tbl, &budget, 0)) return true;
         budget = PRUNE_IF_MAX_VISITS;
-        return mode && prune_where_not_cond(el[1], tbl, &budget, 0);
+        if (mode && prune_where_not_cond(el[1], tbl, &budget, 0)) return true;
+        /* in where:, a `not` over an `in` or a `nil?` this walk admits: a
+         * BOOL per row, so the `not` reads only that row (#1604) */
+        ray_t* in = el[1];
+        if (!mode || !in || in->type != RAY_LIST || (in->attrs & ATTR_QUOTED) || ray_len(in) < 2) return false;
+        ray_t** il = (ray_t**)ray_data(in);
+        ray_t* ifn = prune_head_fn(il[0], tbl);
+        if ((ray_len(in) == 3 && prune_cmp_op(il[0], ifn) == OP_IN) ||
+            (ray_len(in) == 2 && prune_nil_head(il[0], ifn)))
+            return prune_where_elementwise_impl(in, tbl, 2);
+        return false;
     }
+    /* nil? and like (a constant pattern) answer a BOOL per row (#1604) */
+    if (n == 2 && prune_nil_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, mode ? 2 : 0);
+    if (n == 3 && prune_like_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, mode ? 2 : 0) && prune_like_pattern(el[2], tbl);
     /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
      * value per row, never a necessary partition constraint (the mask reads
      * no comparison below it). The route (compiled per row or interpreted)
@@ -21953,7 +22624,8 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
-                prune_bound_const(el[2], tbl, true));        /* a set: a typed vector, written or bound */
+                prune_bound_const(el[2], tbl, true) ||       /* a set: a typed vector, written or bound */
+                prune_const_cast(el[2], tbl, true));         /* or cast from literals (#1604) */
     if (prune_logic_head(el[0], fn)) {
         sub = mode ? 1 : 0;              /* a logic operand is a condition, not an IF */
     } else {
@@ -22135,7 +22807,8 @@ static int8_t prune_group_leaf(ray_t* e, ray_t* tbl, prune_group_proof_t* p, boo
 /* Every comparison is column-dependent, so no scalar condition or BOOL
  * literal can enter this grammar. Binary AND/OR avoids the lowering limit of
  * 64 arguments; NOT only wraps another proved BOOL expression. WHERE also
- * permits same-type DATE comparisons, notably the literal partition bound.
+ * permits same-type DATE and TIMESTAMP comparisons, notably the literal
+ * partition bound and a bound on a timestamp column (#1604).
  * The caller's existing mask proves a necessary literal key constraint and
  * that some partition is excluded; constraints under OR/NOT do not mask. */
 /* A quoted SYM is constant only if it names no source column. Record its
@@ -22179,7 +22852,7 @@ static bool prune_group_cond(ray_t* e, ray_t* tbl, prune_group_proof_t* p,
     if (l != r || (!lc && !rc)) return false;
     if (l == RAY_SYM)
         return (op == OP_EQ || op == OP_NE) && lc != rc;
-    return l == RAY_I64 || l == RAY_F64 || (where && l == RAY_DATE);
+    return l == RAY_I64 || l == RAY_F64 || (where && (l == RAY_DATE || l == RAY_TIMESTAMP));
 }
 
 static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
@@ -24856,7 +25529,7 @@ by_dict_done:
     ray_t* nearest_handle_owned = NULL;  /* HNSW handle kept alive for the
                                           * DAG's lifetime; released after
                                           * ray_execute.  Without this, an
-                                          * inline `(ann (hnsw-build ...) ...)`
+                                          * inline `(.emb.ann (.emb.hnsw.build ...) ...)`
                                           * drops the handle's rc to 0 before
                                           * exec runs — the rc→0 hook frees
                                           * the index and the ext's stored
@@ -24865,7 +25538,7 @@ by_dict_done:
         if (nearest_expr->type != RAY_LIST || ray_len(nearest_expr) < 3) {
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: expected (ann <handle> <query> [ef]) or (knn <col> <query> [metric])");
+                "nearest: expected (.emb.ann <handle> <query> [ef]) or (.emb.knn <col> <query> [metric])");
         }
         int64_t nlen = ray_len(nearest_expr);
         ray_t** nlist = (ray_t**)ray_data(nearest_expr);
@@ -24873,10 +25546,10 @@ by_dict_done:
         if (head->type != -RAY_SYM) {
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: first element must be the symbol `ann` or `knn`");
+                "nearest: first element must be the symbol `.emb.ann` or `.emb.knn`");
         }
-        int64_t ann_sym_id = ray_sym_intern("ann", 3);
-        int64_t knn_sym_id = ray_sym_intern("knn", 3);
+        int64_t ann_sym_id = ray_sym_intern(".emb.ann", 8);
+        int64_t knn_sym_id = ray_sym_intern(".emb.knn", 8);
 
         /* Resolve k from take (default 10). */
         int64_t k_req = 10;
@@ -24955,13 +25628,13 @@ by_dict_done:
             if (!hobj || RAY_IS_ERR(hobj)) {
                 ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
-                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (ann): failed to evaluate HNSW handle");
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (.emb.ann): failed to evaluate HNSW handle");
             }
             if (hobj->type != -RAY_I64 || !(hobj->attrs & RAY_ATTR_HNSW)) {
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (ann): first arg must be an HNSW handle (from hnsw-build)");
+                    "nearest (.emb.ann): first arg must be an HNSW handle (from .emb.hnsw.build)");
             }
             ray_hnsw_t* idx = (ray_hnsw_t*)(uintptr_t)hobj->i64;
             if (!idx) {
@@ -24969,13 +25642,13 @@ by_dict_done:
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (ann): HNSW handle has been freed");
+                    "nearest (.emb.ann): HNSW handle has been freed");
             }
             if (idx->dim != dim) {
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length",
-                    "nearest (ann): query dim does not match index dim");
+                    "nearest (.emb.ann): query dim does not match index dim");
             }
             int32_t ef = HNSW_DEFAULT_EF_S;
             if (nlen >= 4) {
@@ -24984,7 +25657,7 @@ by_dict_done:
                     ray_release(hobj); ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ev ? ev : ray_error("domain",
-                        "nearest (ann): ef expression failed to evaluate");
+                        "nearest (.emb.ann): ef expression failed to evaluate");
                 }
                 if (ev->type == -RAY_I64)      ef = (int32_t)ev->i64;
                 else if (ev->type == -RAY_I32) ef = ev->i32;
@@ -24993,7 +25666,7 @@ by_dict_done:
                     ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                        "nearest (ann): ef must be an integer atom");
+                        "nearest (.emb.ann): ef must be an integer atom");
                 }
                 ray_release(ev);
             }
@@ -25009,7 +25682,7 @@ by_dict_done:
                 ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (knn): first arg must be an unquoted column name");
+                    "nearest (.emb.knn): first arg must be an unquoted column name");
             }
             int64_t col_sym = col_expr->i64;
             ray_hnsw_metric_t metric = RAY_HNSW_COSINE;
@@ -25024,7 +25697,7 @@ by_dict_done:
                         ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                            "nearest (knn): metric must be 'cosine, 'l2, or 'ip");
+                            "nearest (.emb.knn): metric must be 'cosine, 'l2, or 'ip");
                     }
                 }
             }
@@ -25033,7 +25706,7 @@ by_dict_done:
             ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: expected `ann` or `knn` as the first element");
+                "nearest: expected `.emb.ann` or `.emb.knn` as the first element");
         }
         if (!root) {
             if (nearest_handle_owned) ray_release(nearest_handle_owned);
@@ -28280,6 +28953,9 @@ by_dict_done:
             int        s_has_binary = 0;
             int        s_has_param = 0;
             int        s_use_eval_fallback = 0;
+            /* No row to aggregate: the table is empty or the where: keeps none */
+            bool s_no_rows = ray_table_nrows(tbl) == 0 ||
+                (g->selection && ray_rowsel_meta(g->selection)->total_pass == 0);
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
@@ -28287,6 +28963,13 @@ by_dict_done:
                 ray_t*  val_expr  = dict_elems[i + 1];
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
+                /* The keyless group emits top/bot as one integer cell, and a
+                 * binary aggregate over no row as no row; the evaluator gives
+                 * the builtin's answer, as by: gives each group's (#1620). */
+                if (op == OP_TOP_N || op == OP_BOT_N || (agg_is_binary_agg(op) && s_no_rows)) {
+                    s_use_eval_fallback = 1;
+                    break;
+                }
                 /* Reuse the outer exact-sized collectors: aggs_max bounds
                  * all output slots, and their storage outlives this GROUP.
                  * Presence, not nonzero bits, distinguishes q=0 from no q. */
@@ -28696,8 +29379,15 @@ by_dict_done:
                         kid == nearest_id) continue;
                     ray_t* e = dict_elems[i + 1];
                     int has_agg = select_fallback_has_agg(e);
-                    any_agg |= has_agg;
-                    any_row_proj = has_agg ? expr_refs_row_column(e, tbl)
+                    /* fold over a column, at of one at a one-value index:
+                     * one value of the (kept) column, as an aggregate is
+                     * (#1429) */
+                    bool group_scalar = ray_table_nrows(tbl) > 0 &&
+                        (expr_reads_group_whole(e, tbl) || helper_reads_group_whole(e, tbl)) &&
+                        expr_one_value(e, tbl, 0);
+                    any_agg |= has_agg || group_scalar;
+                    any_row_proj = group_scalar ? 0
+                                 : has_agg ? expr_refs_row_column(e, tbl)
                                            : !select_fallback_scalar_proj(e, scalars, n_scalars);
                     if (!any_row_proj) scalars[n_scalars++] = kid;
                 }
@@ -28725,7 +29415,9 @@ by_dict_done:
                      * per row.  A bare column name is the column itself. */
                     ray_t* expr = dict_elems[i + 1];
                     int whole_verb = select_fallback_bulk_minmax(expr, tbl, nrows) ||
-                                     is_whole_column_projection(expr, tbl);
+                                     (!(nrows == 0 && (expr_reads_group_whole(expr, tbl) ||
+                                                       helper_reads_group_whole(expr, tbl))) &&
+                                      is_whole_column_projection(expr, tbl));
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
                                      (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)) ||
@@ -28769,7 +29461,12 @@ by_dict_done:
                             col = eval_tbl ? eval_tbl : ray_error("oom", NULL);
                             scope.owned = false;
                         } else {
-                            if (!whole_verb) whole_verb = is_whole_column_projection(expr, eval_tbl);
+                            /* fold or at of a column over no row: as on dev,
+                             * per row, so nothing (#1429 leaves empty
+                             * inputs as they were) */
+                            if (!whole_verb && !(nrows == 0 && (expr_reads_group_whole(expr, eval_tbl) ||
+                                                                helper_reads_group_whole(expr, eval_tbl))))
+                                whole_verb = is_whole_column_projection(expr, eval_tbl);
                             col = select_fallback_passthrough_col(expr, eval_tbl, nrows);
                             if (!col) {
                                 /* An expression over earlier one-value outputs
@@ -28787,8 +29484,28 @@ by_dict_done:
                                     : eval_expr_per_row_impl(expr, eval_tbl, nrows);
                                 bool enlist_scalar = whole_verb && expr->type == RAY_LIST &&
                                     ((ray_t**)ray_data(expr))[0]->i64 == ray_sym_intern("enlist", 6);
-                                scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar) &&
-                                    (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1));
+                                /* fold over a column, (at v 0): one value of
+                                 * the whole (kept) column, as an aggregate
+                                 * gives one (#1429) */
+                                /* a top-level fold, or at at a one-value
+                                 * index: one value, a collection one
+                                 * boxed as a cell, never read as rows */
+                                bool gwhole = expr_reads_group_whole(expr, eval_tbl) ||
+                                              helper_reads_group_whole(expr, eval_tbl);
+                                if (whole_verb && gwhole && col && !RAY_IS_ERR(col) && !ray_is_atom(col) &&
+                                    expr_one_value(expr, eval_tbl, 0)) {
+                                    ray_t* cell = ray_list_new(1);
+                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append(cell, col);
+                                    ray_release(col);
+                                    col = cell ? cell : ray_error("oom", NULL);
+                                }
+                                bool whole_atom = whole_verb && gwhole && col && !RAY_IS_ERR(col) &&
+                                    (ray_is_atom(col) || (col->type == RAY_LIST && col->len == 1 &&
+                                                          expr_one_value(expr, eval_tbl, 0)));
+                                if (whole_atom) one_value = 1;
+                                scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar || whole_atom) &&
+                                    (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1) ||
+                                     (whole_atom && col->type == RAY_LIST && col->len == 1));
                                 if (scalar_col) col = select_fallback_broadcast(col, 1);
                             }
                         }
@@ -31152,6 +31869,32 @@ static bool update_dag_err_final(ray_t* out, ray_t* cerr, bool if_refused) {
  * so the groups after the first skip the graph and go to the evaluator
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
+static bool update_agg_is_cell(ray_t* expr, ray_t* tbl);
+static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n);
+
+/* A new column under where: from first/last of a LIST column keeps dev's
+ * legacy reading (#1468): a one-element cell is collapsed to its value, so
+ * w: (last l) over cells [4] gives 4 in each kept row; any other cell is
+ * left as it is and fails as on dev (a new column under where: must be a
+ * typed vector).  This is inconsistent with the cell an existing LIST
+ * column or by: takes (#1574 asks which rule a new column under where:
+ * should follow); it only keeps the answers dev gave. */
+static ray_t* update_cell_collapse(ray_t* expr, ray_t* tbl, ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || ray_is_atom(v) || !update_agg_is_cell(expr, tbl)) return v;
+    if (ray_len(v) != 1) {
+        /* a cell of several values is never spread over the kept rows,
+         * even when its length matches theirs: the documented error */
+        ray_release(v);
+        return ray_error("type", "update: a new column under where: must be a typed vector, got LIST");
+    }
+    int alloc = 0;
+    ray_t* a = collection_elem(v, 0, &alloc);
+    if (!a || RAY_IS_ERR(a)) return v;
+    if (!alloc) ray_retain(a);
+    ray_release(v);
+    return a;
+}
+
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
                                   ray_t* mask) {
     ray_t* out = NULL;
@@ -31233,6 +31976,9 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
     if (!out) return ray_error("type", "update: failed to evaluate column update expression");
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    /* first/last of a LIST column is one cell, a one-element one too: [7]
+     * stays [7] (#1468) */
+    if (!ray_is_atom(out) && update_agg_is_cell(expr, sub)) return out;
     return update_scalar_vec(out, ray_table_nrows(sub));
 }
 
@@ -31259,7 +32005,8 @@ static ray_t* update_eval_where(ray_t* tbl, ray_t* expr, ray_t* mask) {
  * aggregates only)? */
 static bool update_expr_aggregates(ray_t* e, ray_t* tbl) {
     if (!e || e->type != RAY_LIST) return false;
-    if (expr_contains_agg_over_column(e, tbl)) return true;
+    /* fold over a column, at of one: the kept rows, as in a select (#1429) */
+    if (expr_contains_agg_over_column(e, tbl) || expr_reads_group_whole(e, tbl)) return true;
     if (!query_expr_has_helper(e)) return false;
     ray_t* x = query_inline_helpers(e, tbl);
     if (!x || RAY_IS_ERR(x)) { if (x) ray_error_free(x); return false; }
@@ -31384,7 +32131,7 @@ static ray_t* update_spread_kept(ray_t* v, const uint8_t* m, int64_t nrows) {
  * per row of `tbl` (or an atom): update_eval_where, except for an
  * aggregating expression, evaluated over the kept rows (update_eval_kept)
  * and spread back to them (update_spread_kept). */
-static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
+static ray_t* update_where_value_c(ray_t* tbl, ray_t* expr, ray_t* mask, bool cells) {
     if (update_expr_elementwise(expr, tbl, false) || !update_expr_aggregates(expr, tbl))
         return update_eval_where(tbl, expr, mask);
     ray_t* kept = ray_where_fn(mask);
@@ -31393,10 +32140,19 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     /* No kept row: nothing is written, and the expression is evaluated
      * over the table as before, so its errors still surface (over no row
      * `(max (+ w 'x))` would raise nothing). */
-    if (k == 0) { ray_release(kept); return update_eval_where(tbl, expr, mask); }
+    if (k == 0) {
+        ray_release(kept);
+        /* first/last of a LIST column is one cell, which no row takes */
+        ray_t* w = update_eval_where(tbl, expr, mask);
+        return cells ? update_cell_rows(expr, tbl, w, ray_table_nrows(tbl)) : update_cell_collapse(expr, tbl, w);
+    }
     ray_t* v = update_eval_kept(tbl, expr, kept);
     ray_release(kept);
     if (!v || RAY_IS_ERR(v) || ray_is_atom(v)) return v;
+    /* first/last of a LIST column: one cell, held by every kept row */
+    v = cells ? update_cell_rows(expr, tbl, v, k) : update_cell_collapse(expr, tbl, v);
+    if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     if (ray_len(v) != k) {
         int64_t got = ray_len(v);
         ray_release(v);
@@ -31406,6 +32162,39 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     ray_t* out = update_spread_kept(v, (const uint8_t*)ray_data(mask), mask->len);
     ray_release(v);
     return out;
+}
+
+static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    return update_where_value_c(tbl, expr, mask, true);
+}
+
+static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth);
+static bool expr_group_scalar(ray_t* e, ray_t* tbl);
+
+/* Does the update output `expr` aggregate a LIST column with first or last:
+ * one value per group (or for the rows), a cell of the column, as select
+ * gives it?  Its value is that cell even when it is a vector (#1468). */
+static bool update_agg_is_cell(ray_t* expr, ray_t* tbl) {
+    /* (at l k) of a LIST column at a one-value index is one cell of the
+     * group, as select by: gives it (#1429) */
+    if (expr && expr->type == RAY_LIST && ray_len(expr) == 3 && expr_group_scalar(expr, tbl) &&
+        expr_reads_list_col(((ray_t**)ray_data(expr))[1], tbl, 0))   /* not-a-table */
+        return true;
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2 || !is_agg_expr(expr)) return false;
+    ray_t** e = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    if ((op == OP_FIRST || op == OP_LAST) && expr_reads_list_col(e[1], tbl, 0)) return true;
+    return false;
+}
+
+/* `val` (owned), the value of such an output, as a column of `n` rows that
+ * each hold it: a boxed list.  Any other value is returned as it is. */
+static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n) {
+    if (!val || RAY_IS_ERR(val) || ray_is_atom(val) || !update_agg_is_cell(expr, tbl)) return val;
+    ray_t* l = ray_list_new((int32_t)n);
+    for (int64_t r = 0; r < n && l && !RAY_IS_ERR(l); r++) l = ray_list_append(l, val);
+    ray_release(val);
+    return l ? l : ray_error("oom", NULL);
 }
 
 /* An updated column keeps its type on every route (#1458): a value of the
@@ -31710,6 +32499,8 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     }
     for (int64_t u = 0; u < nu && !err; u++) {
         ray_t* v = uagg[u] ? update_eval_kept(tbl, uexpr[u], idxv) : update_eval_on(sub, uexpr[u]);
+        /* first/last of a LIST column: one cell, for every kept row */
+        v = update_cell_rows(uexpr[u], tbl, v, k);
         if (RAY_IS_ERR(v)) { err = v; break; }
         err = update_value_check(slots[ucol[u]], v, k);
         if (!err) {                       /* a widening is stored at the column's type */
@@ -31739,6 +32530,8 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n);
 static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym);
 
 ray_t* ray_update(ray_t** args, int64_t n) {
+    ray_t* deep = query_too_deep(args, n, "update");
+    if (deep) return deep;
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
@@ -31922,9 +32715,17 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             int8_t out_type = RAY_I64;
             ray_col_meta_t tm;
             if (ngroups == 0 && ray_table_col_meta(tbl, kid, &tm)) out_type = tm.type;
-            ray_t* out_col = ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
+            /* A LIST column keeps its type (#1458): every group's result is
+             * boxed into its rows, whatever it holds (#1468). */
+            ray_col_meta_t lm;
+            /* first/last of a LIST column gives each group one cell, which
+             * every row of the group holds, a new column's too */
+            bool agg_cell = update_agg_is_cell(agg_expr, tbl);
+            bool target_list = agg_cell || (ray_table_col_meta(tbl, kid, &lm) && lm.type == RAY_LIST);
+            ray_t* out_col = target_list ? ray_list_new(0)
+                                         : ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
             if (RAY_IS_ERR(out_col)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
-            if (ngroups == 0) {
+            if (ngroups == 0 && !target_list) {
                 out_col->len = nrows2;
                 /* Match the per-group path's zero-fill so an unwritten buffer
                  * never carries allocator garbage (unreachable with rows today
@@ -31949,6 +32750,20 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                         return full_col ? full_col : ray_error("oom", NULL);
                     }
                     int8_t ct = full_col->type;
+                    /* A LIST column: the group's cells, retained into a
+                     * boxed list (a typed allocation refused it, #1468). */
+                    if (ct == RAY_LIST) {
+                        ray_t* sub_list = ray_list_new((int32_t)gsize);
+                        ray_t** cells = (ray_t**)ray_data(full_col);
+                        int64_t* lidx = (int64_t*)ray_data(idx_vec);
+                        for (int64_t r = 0; r < gsize && !RAY_IS_ERR(sub_list); r++)
+                            sub_list = ray_list_append(sub_list, cells[lidx[r]]);
+                        if (RAY_IS_ERR(sub_list)) { ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_list; }
+                        sub_tbl = ray_table_add_col(sub_tbl, cn, sub_list);
+                        ray_release(sub_list);
+                        if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
+                        continue;
+                    }
                     /* Create sub_col with the SOURCE column's width. For a SYM
                      * column that dictionary-index width is adaptive
                      * (W8/W16/W32/W64); the raw cell-id gather below must use it
@@ -32015,7 +32830,38 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
                 /* A one-element result is the group's scalar, broadcast like
                  * an atom; it failed the length check on groups of 2+ rows. */
-                agg_result = update_scalar_vec(agg_result, gsize);
+                if (!agg_cell) agg_result = update_scalar_vec(agg_result, gsize);
+
+                if (target_list) {
+                    if (first_group) {
+                        ray_release(out_col);
+                        out_col = ray_list_new((int32_t)nrows2);
+                        if (RAY_IS_ERR(out_col)) { ray_release(agg_result); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
+                        ray_t** d0 = (ray_t**)ray_data(out_col);
+                        for (int64_t r = 0; r < nrows2; r++) { ray_retain(RAY_NULL_OBJ); d0[r] = RAY_NULL_OBJ; }
+                        out_col->len = nrows2;
+                        first_group = 0;
+                    }
+                    bool atom = agg_cell || ray_is_atom(agg_result);
+                    if (!atom && !((ray_is_vec(agg_result) || agg_result->type == RAY_LIST) &&
+                                   ray_len(agg_result) == gsize)) {
+                        int64_t got = ray_is_vec(agg_result) || agg_result->type == RAY_LIST ? ray_len(agg_result) : -1;
+                        ray_release(agg_result); ray_release(out_col);
+                        UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                        return ray_error("length", "update by: expression result length %lld does not match group size %lld", (long long)got, (long long)gsize);
+                    }
+                    ray_t** d = (ray_t**)ray_data(out_col);
+                    int64_t* lidxs = (int64_t*)ray_data(idx_vec);
+                    for (int64_t r = 0; r < gsize; r++) {
+                        int alloc = 0;
+                        ray_t* cell = atom ? agg_result : collection_elem(agg_result, r, &alloc);
+                        if (!alloc) ray_retain(cell);
+                        ray_release(d[lidxs[r]]);
+                        d[lidxs[r]] = cell;
+                    }
+                    ray_release(agg_result);
+                    continue;
+                }
 
                 /* Determine output type from first group */
                 if (first_group) {
@@ -32253,7 +33099,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             } else {
                 /* Evaluate the expression for each row and apply to matching rows */
                 int8_t ct = orig_col->type;
-                ray_t* new_col = ray_vec_new(ct, nrows);
+                /* a LIST column is rebuilt below as a boxed list (#1468) */
+                ray_t* new_col = ct == RAY_LIST ? ray_list_new(0) : ray_vec_new(ct, nrows);
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
@@ -32269,36 +33116,38 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                 expr_vec = update_conform(expr_vec, ct);
                 if (RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec; }
 
+                /* A LIST column: a boxed list, each kept row taking its cell
+                 * of the value (an atom boxed into every one of them), the
+                 * others keeping theirs, as the keyless update boxes
+                 * (#1458).  Allocating it as a typed vector failed (#1468). */
+                if (ct == RAY_LIST) {
+                    ray_release(new_col);
+                    ray_t* new_list = ray_list_new((int32_t)nrows);
+                    if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
+                    ray_t** orig_elems = (ray_t**)ray_data(orig_col);
+                    bool atom = expr_vec->type < 0;
+                    ray_t** vals = atom ? NULL : (ray_t**)ray_data(expr_vec);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        ray_t* elem = !mask[r] ? orig_elems[r] : atom ? expr_vec : vals[r];
+                        new_list = ray_list_append(new_list, elem);
+                        if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
+                    }
+                    ray_release(expr_vec);
+                    result = ray_table_add_col(result, col_name, new_list);
+                    ray_release(new_list);
+                    if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
+                    continue;
+                }
 
                 /* Broadcast scalar atom to full column vector if needed */
                 if (expr_vec->type < 0) {
                     /* Type check atom against column type BEFORE broadcast */
                     int ok = (expr_vec->type == -ct);
-                    if (!ok && ct == RAY_LIST && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok && ct == RAY_SYM && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok) {
                         int8_t ev_t = expr_vec->type;            /* capture BEFORE free */
                         ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
                         DICT_VIEW_CLOSE(updw); return ray_error("type", "update: cannot assign %s value to %s column", ray_type_name(ev_t), ray_type_name(ct));
-                    }
-                    /* SYM atom to LIST column: build boxed list, merge with mask */
-                    if (ct == RAY_LIST && expr_vec->type == -RAY_SYM) {
-                        ray_free(new_col);
-                        ray_t* new_list = ray_list_new((int32_t)nrows);
-                        if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
-                        ray_t** orig_elems = (ray_t**)ray_data(orig_col);
-                        for (int64_t r = 0; r < nrows; r++) {
-                            ray_t* elem = mask[r] ? expr_vec : orig_elems[r];
-                            ray_retain(elem);
-                            new_list = ray_list_append(new_list, elem);
-                            ray_release(elem);
-                            if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
-                        }
-                        ray_release(expr_vec);
-                        result = ray_table_add_col(result, col_name, new_list);
-                        ray_release(new_list);
-                        if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
-                        continue;
                     }
                     ray_t* bcast = ray_vec_new(ct, nrows);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
@@ -32468,7 +33317,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_where_value(tbl, dict_elems[d + 1], mask_vec);
+            /* a new column: dev's legacy reading of a LIST cell (#1468) */
+            ray_t* v = update_where_value_c(tbl, dict_elems[d + 1], mask_vec, false);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {
@@ -32587,6 +33437,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             int8_t oct = om.type;
             /* DAG first, then the interpreter (update_eval_on). */
             ray_t* expr_vec = update_eval_on(tbl, update_expr);
+            /* first/last of a LIST column: one cell, for every row */
+            expr_vec = update_cell_rows(update_expr, tbl, expr_vec, ray_table_nrows(tbl));
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
             if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
                 /* A column of another length has no row-aligned meaning; it
@@ -32729,6 +33581,7 @@ no_where_add_col:
          * existing-column update but not as a new column. */
         ray_t* update_expr = dict_elems[d + 1];
         ray_t* expr_vec = update_eval_on(tbl, update_expr);
+        expr_vec = update_cell_rows(update_expr, tbl, expr_vec, ray_table_nrows(tbl));
         if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate new column expression"); }
         if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
             /* A column of another length has no row-aligned meaning; it
@@ -34955,9 +35808,68 @@ static int64_t upsert_atom_int(ray_t* a) {
     return a->type == -RAY_BOOL ? (int64_t)a->b8 : elem_as_i64(a);
 }
 
+/* Key matching (#1152).  A key atom is compared with what the key column
+ * would store for it: a null of any type is the column's null, so it
+ * matches a null-keyed row of every key type, and an integer is compared
+ * at the column's width.  upsert_key_check refuses a value the column
+ * cannot hold, which would otherwise miss on the widened compare and then
+ * be narrowed on append into a duplicate key. */
+
+/* Integer-family key atom as the column of type `ct` stores it, widened to
+ * int64 the way upsert_int_cell widens the cell.  BOOL and U8 are not
+ * nullable: a null lands as 0 there, so it matches 0. */
+static int64_t upsert_atom_key(int8_t ct, ray_t* a) {
+    if (RAY_ATOM_IS_NULL(a)) {
+        switch (ct) {
+        case RAY_BOOL: case RAY_U8:                 return 0;
+        case RAY_I16:                               return NULL_I16;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
+        default:                                    return NULL_I64;
+        }
+    }
+    switch (a->type) {
+    case -RAY_I32: case -RAY_DATE: case -RAY_TIME: return (int64_t)a->i32;
+    default:                                       return upsert_atom_int(a);
+    }
+}
+
+/* Float key atom as a double; a null of any type is NaN. */
+static double upsert_atom_f64(ray_t* a) {
+    return RAY_ATOM_IS_NULL(a) ? NULL_F64 : as_f64(a);
+}
+
+/* Float key equality: by value, except that a null (NaN) equals a null. */
+static inline bool upsert_f64_eq(double x, double y) {
+    return x == y || (x != x && y != y);
+}
+
+/* Hash of a float key: every NaN is the one null, so it hashes as one. */
+static inline uint64_t upsert_hash_f64(double v) {
+    return ray_hash_f64(v != v ? NULL_F64 : v);
+}
+
+/* NULL when the non-null integer key atom `a` fits a key column of type
+ * `ct`, a domain error otherwise.  The narrow types' null sentinel is not
+ * a value, so it is out of range too. */
+static ray_t* upsert_key_check(int8_t ct, ray_t* a) {
+    if (!a || RAY_IS_NULL(a) || !ray_is_atom(a) || RAY_ATOM_IS_NULL(a)) return NULL;
+    if (a->type != -RAY_I64 && a->type != -RAY_I32 &&
+        a->type != -RAY_I16 && a->type != -RAY_U8) return NULL;
+    int64_t v = upsert_atom_int(a), lo, hi;
+    switch (ct) {
+    case RAY_U8:  lo = 0;              hi = UINT8_MAX; break;
+    case RAY_I16: lo = -INT16_MAX;     hi = INT16_MAX; break;
+    case RAY_I32: lo = -INT32_MAX;     hi = INT32_MAX; break;
+    default:      return NULL;
+    }
+    if (v >= lo && v <= hi) return NULL;
+    return ray_error("domain", "upsert: key value %lld is out of range for a %s key column",
+                     (long long)v, ray_type_name(ct));
+}
+
 static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
     switch (col->type) {
-    case RAY_F64: return ray_hash_f64(((const double*)ray_data(col))[r]);
+    case RAY_F64: return upsert_hash_f64(((const double*)ray_data(col))[r]);
     case RAY_SYM: return ray_hash_i64(ray_read_sym(ray_data(col), r, col->type, col->attrs));
     case RAY_STR: {
         size_t n = 0;
@@ -34972,24 +35884,23 @@ static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* co
 static uint64_t upsert_hash_atom(int8_t ct, ray_t* a) {
     static const uint8_t zero_guid[16] = {0};
     switch (ct) {
-    case RAY_F64: return ray_hash_f64(as_f64(a));
+    case RAY_F64: return upsert_hash_f64(upsert_atom_f64(a));
     case RAY_SYM: return ray_hash_i64(a->i64);
     case RAY_STR: {
         const char* s = ray_str_ptr(a);
         return ray_hash_bytes(s ? s : "", ray_str_len(a));
     }
     case RAY_GUID: return ray_hash_bytes(a->obj ? ray_data(a->obj) : zero_guid, 16);
-    default:       return ray_hash_i64(upsert_atom_int(a));
+    default:       return ray_hash_i64(upsert_atom_key(ct, a));
     }
 }
 
-/* Cell-vs-atom equality with the legacy scan's semantics: F64 by value
- * (NaN never matches, so a null F64 key always appends), SYM by raw id,
- * STR by bytes, integers widened. */
+/* Cell-vs-atom equality: F64 by value with a null matching a null, SYM by
+ * raw id, STR by bytes, integers at the column's width (upsert_atom_key). */
 static bool upsert_cell_eq_atom(ray_t* col, int64_t r, ray_t* a) {
     static const uint8_t zero_guid[16] = {0};
     switch (col->type) {
-    case RAY_F64: return ((const double*)ray_data(col))[r] == as_f64(a);
+    case RAY_F64: return upsert_f64_eq(((const double*)ray_data(col))[r], upsert_atom_f64(a));
     case RAY_SYM: return ray_read_sym(ray_data(col), r, col->type, col->attrs) == a->i64;
     case RAY_STR: {
         size_t n = 0;
@@ -35001,7 +35912,7 @@ static bool upsert_cell_eq_atom(ray_t* col, int64_t r, ray_t* a) {
     case RAY_GUID:
         return memcmp((const uint8_t*)ray_data(col) + r * 16,
                       a->obj ? ray_data(a->obj) : zero_guid, 16) == 0;
-    default: return upsert_int_cell(col, r) == upsert_atom_int(a);
+    default: return upsert_int_cell(col, r) == upsert_atom_key(col->type, a);
     }
 }
 
@@ -35191,8 +36102,9 @@ static int64_t upsert_find_row(ray_t** slots, const int64_t* kci, int64_t nk,
         ray_t* a = cells[kci[0]];
         int8_t t = col->type;
         if (t == RAY_SYM || (t != RAY_F64 && t != RAY_STR && t != RAY_GUID)) {
-            int64_t key = (t == RAY_SYM) ? a->i64 : upsert_atom_int(a);
-            int64_t hit = ray_index_find_row(col, key);
+            int64_t key = (t == RAY_SYM) ? a->i64 : upsert_atom_key(t, a);
+            /* the index answers values; a null key is the scan's */
+            int64_t hit = RAY_ATOM_IS_NULL(a) ? -2 : ray_index_find_row(col, key);
             if (hit >= -1) return hit;
             if (t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_SYM) {
                 const int64_t* d = (const int64_t*)ray_data(col);
@@ -35352,12 +36264,13 @@ static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, i
 }
 
 /* Cell-vs-cell equality for two columns of one type, with the semantics of
- * upsert_cell_eq_atom: F64 by value, SYM by runtime id, integers widened. */
+ * upsert_cell_eq_atom: F64 by value with a null matching a null, SYM by
+ * runtime id, integers widened. */
 static inline __attribute__((always_inline)) bool
 upsert_cell_eq_cell(ray_t* a, int64_t ra, ray_t* b, int64_t rb) {
     switch (a->type) {
     case RAY_F64:
-        return ((const double*)ray_data(a))[ra] == ((const double*)ray_data(b))[rb];
+        return upsert_f64_eq(((const double*)ray_data(a))[ra], ((const double*)ray_data(b))[rb]);
     case RAY_SYM:
         return ray_read_sym(ray_data(a), ra, RAY_SYM, a->attrs) ==
                ray_read_sym(ray_data(b), rb, RAY_SYM, b->attrs);
@@ -35746,6 +36659,8 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 err = ray_error("type", "upsert: key column is str but key value is %s", ray_type_name(a->type));
             } else if (km.type == RAY_SYM && a->type != -RAY_SYM) {
                 err = ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(a->type));
+            } else {
+                err = upsert_key_check(km.type, a);
             }
         }
         for (int64_t c = 0; c < ncols && !err; c++) {
@@ -36314,6 +37229,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is guid but key value is %s", ray_type_name(ka_t));
         }
+        ray_t* range_err = upsert_key_check(kt, key_atom);
+        if (range_err) {
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return range_err;
+        }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {
             if (ray_sym_vec_domain(key_col) == ray_sym_runtime_domain()) {
@@ -36337,8 +37258,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_t* key_atom = row_elems[kci];
             int8_t kt = key_col->type;
             if (kt == RAY_F64) {
-                double needle = (key_atom->type == -RAY_F64) ? key_atom->f64 : (double)key_atom->i64;
-                if (((double*)ray_data(key_col))[r] != needle) match = 0;
+                if (!upsert_f64_eq(((double*)ray_data(key_col))[r], upsert_atom_f64(key_atom))) match = 0;
             } else if (kt == RAY_SYM) {
                 /* raw index compare against the domain-resolved want id */
                 if (ray_read_sym(ray_data(key_col), r, key_col->type, key_col->attrs) != key_sym_want[k]) match = 0;
@@ -36349,16 +37269,16 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 const char* rs = ray_str_vec_get(key_col, r, &rl);
                 if (rl != nl || (nl > 0 && (!rs || !ns || memcmp(rs, ns, nl) != 0))) match = 0;
             } else if (kt == RAY_F32) {
-                /* by value, the atom narrowed as the payload is; NaN (a null
-                 * key) never matches, like an F64 key */
-                float needle = (float)as_f64(key_atom);
-                if (((const float*)ray_data(key_col))[r] != needle) match = 0;
+                /* by value, the atom narrowed as the payload is; a null
+                 * key (NaN) matches a null, like an F64 key */
+                float needle = (float)upsert_atom_f64(key_atom);
+                if (!upsert_f64_eq(((const float*)ray_data(key_col))[r], needle)) match = 0;
             } else if (kt == RAY_GUID) {
                 if (!upsert_cell_eq_atom(key_col, r, key_atom)) match = 0;
             } else {
                 /* integer family through its storage width: a 1/2/4-byte
                  * cell read as int64 would match its neighbours' bytes */
-                if (upsert_int_cell(key_col, r) != upsert_atom_int(key_atom)) match = 0;
+                if (upsert_int_cell(key_col, r) != upsert_atom_key(kt, key_atom)) match = 0;
             }
         }
         if (match) { match_row = r; break; }
@@ -39188,6 +40108,8 @@ ray_t* ray_delete_fn(ray_t** args, int64_t n) {
  * would be a second expression to keep in step with this one. */
 ray_t* ray_delete(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "delete: expects a query dict, got %lld args", (long long)n);
+    ray_t* deep = query_too_deep(args, n, "delete");
+    if (deep) return deep;
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
         return ray_error("type", "delete: query must be a dict, got %s", dict ? ray_type_name(dict->type) : "null");

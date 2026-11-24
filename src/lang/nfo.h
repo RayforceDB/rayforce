@@ -70,4 +70,13 @@ void ray_nfo_insert(ray_t* nfo, ray_t* node, ray_span_t span);
  * Returns a span with id==0 if not found. */
 ray_span_t ray_nfo_get(ray_t* nfo, ray_t* node);
 
+/* Append an error trace frame at `span` of the text `nfo` describes, named
+ * `name` (the REPL prints "in <name>"; NULL prints as a lambda's).  The
+ * parser adds one for a failed parse (lang/eval.c).  `offset` >= 0 is the
+ * byte offset of the failing position in the source, kept as the frame's
+ * fifth element: the renderer locates the frame by it, which also holds
+ * where the span's 16-bit line and column cannot (a line past 65535 bytes,
+ * a source past 65535 lines).  -1 adds no offset. */
+void ray_error_frame_add(ray_t* nfo, ray_span_t span, const char* name, int64_t offset);
+
 #endif /* RAY_NFO_H */

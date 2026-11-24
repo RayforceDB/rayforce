@@ -112,7 +112,14 @@ the table has a column named `null`: `(if (> v 1) v null)` keeps each row's
 `v` above 1 and is null elsewhere, and `by: (if (> v 2) g null)` groups the
 rows at or below 2 under a null key. A name that is neither an alias nor a
 column and holds a table or a dict reads that global: `(count W)` with `W` a
-table or a dict counts it.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
+table or a dict counts it. Inside a nested select, a column of its own table, and
+within its outputs its own outputs, are its own, even when the outer table
+has a column of that name (its table given by name, as a parameter or a
+`let`, or as an expression of builtins): in `(count (at (select {from: u by: k x: (sum v)}) 'x))` over a table
+that also has a `v`, the nested `v` is `u`'s, and the count is of the nested
+result, the same in every group. A name only the outer table has is the
+outer column there, and so is a name in its `where:` that only one of its
+outputs has.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
 error inside a select, as it is outside.
 
 Equality (`==`) and inequality (`!=`) between a non-null symbol and a
@@ -251,6 +258,34 @@ The [whole-column verbs](#whole-column-projections) (`distinct`, `asc`,
 `where`) are different: they see the surviving rows only, and under `by:` each
 group's surviving rows.
 
+So does every other expression of an output that reads a column whole:
+`fold` over a column (`fold-left`, `fold-right` and `fold-while` too, and a
+helper that folds), `at` of a column at any index (a constant, a vector or
+a column of indexes), and an aggregate inside a call such as
+`(til (count v))`. What "the rows" are depends on the route:
+
+- under `by:`, the group's rows: `(- v (fold + v))` subtracts each group's
+  own total, `(- v (at v 0))` each group's first value, `(at v i)` indexes
+  within the group, and `(til (count v))` counts each group;
+- keyless, every row the `where:` keeps (all rows without one):
+  `(fold + v)` is the sum of the kept rows, one value as an aggregate is,
+  and so is an expression built from such values, `(+ (fold + v) 1)`;
+  over no rows the output has no rows, as before;
+- `update` with `by:`, the group, its answer written back to its rows;
+  `update` with `where:`, the kept rows, written back to them.
+
+Each answers what the same expression gives outside the query on those rows'
+values, save that a query's `first` and `last` skip nulls, and that an
+aggregate of an aggregate of the group is still refused (`(count (til
+(count v)))` by `g` raises `domain`). `at` over a vector that is no column
+is a lookup and reads that vector whole, its index the group's rows:
+`(sum (at W i))` reads `W` at the group's `i` (#1492); so is `at` of a
+column at an index read from such a vector, `(at v (- (div W 100) 1))`,
+which picks rows of the whole column by position. A
+`fold` over such a vector as long as the table folds the group's slice of it,
+as `sum` sums it: `(fold + W)` by `g` is `(sum W)` by `g` (see Aggregate
+sources).
+
 The same holds under `by:`. A running function in a grouped select runs over
 the whole table, not over each group, and the groups then take their rows of
 what it gave: an aggregate over it aggregates them, and a running output on
@@ -388,6 +423,17 @@ key meets the rows the filter keeps):
 (select {s: (sum x) by: K3 from: t})                       ; error: length
 ```
 
+A keyless `prod` whose rows are all null is the empty product, `1` (`1.0`
+for a float input), as the builtin `(prod [0Nl 0Nl])` is, with or without
+`where:`. Under `by:` a group whose rows are all null keeps the null
+(`0Nl`, `0Nf`) for `prod`, as for `min`, `max`, `first`, `last` and `avg`:
+
+```lisp
+(set t (table [k c] (list [0 0 1 1] [2 3 0Nl 0Nl])))
+(select {p: (prod c) from: t where: (== k 1)})              ; p [1]
+(select {p: (prod c) from: t by: k})                        ; k [0 1], p [6 0Nl]
+```
+
 ### Aggregate sources
 
 What an aggregate reads depends on what its argument is. A column, or an
@@ -397,6 +443,21 @@ no value per row; under `by:` it is applied to each group's rows, so
 `(count (except s 'b))` counts each group's cells other than `b` and
 `(sum (except v 10))` sums each group's values other than 10. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
+
+A keyless select of aggregates answers one row whatever rows it reads.
+Over a table with no rows, with or without `where:`, and over a `where:`
+that keeps no row, each aggregate gives its answer over no values:
+`count` `0`, `sum` `0`, `prod` `1`, `all` `true`, `any` `false`, and the
+null of its type for `min`, `max`, `avg`, `first`, `last`, `med` and the
+deviations, the same row on a plain or a parted table (a parted table
+whose partitions are all empty included). A select with `by:` over
+no rows has no groups and gives no row:
+
+```lisp
+(set e (take (table [g v] (list [a b] [1 2])) 0))
+(select {s: (sum v) n: (count v) m: (min v) from: e})   ; s [0], n [0], m [0Nl]
+(select {s: (sum v) by: g from: e})                     ; no row
+```
 
 A keyless select gives every aggregate the argument `by:` gives its one
 group, whichever route evaluates it: builtin calls over the columns, such as
@@ -408,20 +469,21 @@ and DATE arms raises `if: branches mix SYM and DATE`); over an empty
 lambda, `0x00` for U8, and `0Nl` for `first` or `last` of a LIST column, as
 `(first (list))` is; and an answer that is a collection, such as the cell
 of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
-`(list (list 1))`. Not yet settled: `fold`, and `at` with a constant index (one
-written in place, or under a `where:` any index that reads no column), read
-the whole column under `by:`, and whether they read the rows a `where:` keeps
-is an open question (#1429). Keyless, aggregates other than `first` and
-`last` of such an argument are evaluated as before: `(sum (at c [3 2 1 0]))`
-is a `type` error there.
+`(list (list 1))`. `fold` and `at` of a column read the kept rows, as
+[Running functions under `where:`](#running-functions-under-where) says:
+`(sum (at c [3 2 1 0]))` is the sum of the kept rows at those indexes. A scalar the argument gives stands for every row on
+every keyless route, as `1` does in `(sum 1)`: `(sum (count v))` over four rows
+is `16` whether or not another output is declined, and over a `where:` that
+keeps no row `(max (count v))` is `0Nl`, the empty column's. A scalar a
+helper with several statements returns is folded once (#1576).
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a
 `let`, which hides a column of its name — stands for a column wherever an
 aggregate reads its rows: as the aggregate's argument (both arguments of
 `wavg`, `wsum`, `cov`, `scov` and `pearson_corr`), through every call in it
-that maps that argument element by element, and as the source of
-`distinct`. A call maps an argument element by element when, as the
+that maps that argument element by element, as the source of
+`distinct`, and as the vector `fold` folds. A call maps an argument element by element when, as the
 builtin is applied there, each element gives one result from itself alone:
 arithmetic and comparisons, `if`, `and`, `or`, `not`, `nil?`, binary
 `(min W 30)` and `(max W 30)` (the one-argument forms are aggregates), a
@@ -521,8 +583,8 @@ the builtin's `type` error, as a vector is; a null, or a value outside
 `0..1` (`0..100` for `percentile`), is its `domain` error. None of them
 answers the median instead. Over no rows (an empty table, or a `where:`
 that keeps none) there is no row for the probability to be wrong about:
-the select answers as for a valid probability, `[]` over an empty table
-and `[0Nf]` under such a `where:`, and `by:` gives no groups.
+the select answers as for a valid probability, `[0Nf]` over an empty
+table and under such a `where:` alike, and `by:` gives no groups.
 
 ```lisp
 (set q (table [s t] (list [0.0 8.0 16.0 24.0] [0.1 0.2 0.3 0.4])))
@@ -530,6 +592,19 @@ and `[0Nf]` under such a `where:`, and `by:` gives no groups.
 (select {v: (quantile s (first t)) from: q where: (> s 5)}) ; v [11.2]
 (select {v: (quantile s t) from: q})      ; error: type
 (select {v: (quantile s 1.25) from: q})   ; error: domain
+```
+
+A keyless aggregate of two arguments, `cov`, `scov`, `wsum`, `wavg`,
+`pearson_corr`, `top`, `bot`, `quantile` or `percentile`, answers the
+builtin's value over the rows, whatever else the select asks for. `top`
+and `bot` give one cell, the list the builtin returns. Over no rows `cov`,
+`scov`, `wavg` and `pearson_corr` give `0Nf`, `wsum` gives `0.0`, and
+`top` and `bot` give an empty list:
+
+```lisp
+(set w (table [c f v] (list [1 5 3] [1.5 2.0 4.0] [10 20 30])))
+(select {k: (top c 2) from: w})                    ; k (list [5 3])
+(select {r: (cov c f) from: w where: (> v 99)})    ; r [0Nf]
 ```
 
 ### Filter + Group-by
@@ -705,7 +780,7 @@ So `(update {v: 7 from: t by: k})` over an `F64` column `v` gives `7.0` in every
 
 Integer arithmetic yields `I64`, so to update an `I32`, `I16` or `U8` column, write the literal in the column's type, as in `(update {qty: (+ qty 1i) from: 't})`, or cast the result.
 
-A `LIST` value into a typed column is a `type` error. A `LIST` column keeps its type too: a `LIST` value is stored as it is, and an atom or a typed vector is boxed into it cell by cell, so `(update {l: [1 2 3] from: t})` gives a `LIST` of three `i64` atoms. An update of a `LIST` column with `where:` or `by:` is not supported yet (#1468). A new column takes the value's type.
+A `LIST` value into a typed column is a `type` error. A `LIST` column keeps its type too: a `LIST` value is stored as it is, and an atom or a typed vector is boxed into it cell by cell, so `(update {l: [1 2 3] from: t})` gives a `LIST` of three `i64` atoms. The same holds with `where:` and `by:`: under `where:` the kept rows take their cell of the value (an atom is boxed into each) and the others keep theirs, so `(update {l: 7 from: t where: (== k 1)})` boxes `7` into the rows of `k` 1; under `by:` each group's result is boxed into its rows, whatever its type. `first` or `last` of a `LIST` column is one cell for the group (or for the rows), as in a select, so every row of the group holds that cell, a vector included: with `U: (table [g l] (list ['a 'a 'b] (list [1 2] [3] [4])))`, `(update {l: (first l) from: U by: g})` gives `(list [1 2] [1 2] [4])`; a `where:` that keeps no row leaves the column as it is. A row-wise value, such as `(at l i)` with `i` a column, gives each row its own cell, its index counting within the group under `by:`. `(at l 0)`, a `LIST` column at a one-value index, is one cell of the group (under `by:`) or of the kept rows, as `first` is, held by every one of those rows. A new column under `where:` from `first` or `last` of a `LIST` column keeps an older reading (#1574): a one-element cell becomes its value, and a longer one is an error. A new column takes the value's type.
 
 ### Update with Group-by
 
@@ -806,6 +881,26 @@ Like `insert`, columns can be in any order:
 ```lisp
 (upsert 't 1 (dict [Value Name ID] (list 170.0 'Quinn 17)))
 ```
+
+### Key Matching
+
+A key matches by value, and **a null key matches a null key** for every key type (integers, floats, temporals, `SYM`, `STR`, `GUID`), in memory and splayed, for single and compound keys. Upserting a null key twice therefore appends one row and then updates it. For `F32` and `F64` keys only the null matches the null; other values compare by value.
+
+```lisp
+(set t (table [d v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list 0Nd 9))
+(at t 'v)                          ; [1 9] — the null-keyed row is updated
+```
+
+A key value that does not fit the key column is a `domain` error and nothing is written, rather than being narrowed into a duplicate key:
+
+```lisp
+(set t (table [k v] (list (as 'I16 [1 2]) [1 2])))
+(upsert 't 1 (list 65537 9))       ; error: domain
+(upsert 't 1 (list [3 65537] [8 9])) ; error: domain — the 3 is not written either
+```
+
+See [Query Operations](../language/functions.md#query-operations) for the full list of key types.
 
 ## Delete Rows
 

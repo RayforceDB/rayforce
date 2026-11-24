@@ -43,7 +43,8 @@
 (count fk) -- 3
 (upsert 'fk 1 (list 1.5e 9)) -- 'fk
 (at fk 'v) -- [9 7 8]
-;; a null F32 key never matches (like an F64 key): it appends
+;; a null F32 key appends once, then matches the null-keyed row (#1152)
 (upsert 'fk 1 (list 0Ne 1)) -- 'fk
 (upsert 'fk 1 (list 0Ne 2)) -- 'fk
-(count fk) -- 5
+(count fk) -- 4
+(at fk 'v) -- [9 7 8 2]

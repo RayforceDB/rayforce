@@ -122,7 +122,12 @@ Limits:
 - A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer.
 - A binary that predates notes reads each one as an extra log entry: the note evaluates to its vector of integers, changes nothing and is counted among the replayed entries. Such a binary also loads the snapshot's lambdas unmarked.
 
-Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
+Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it.
+
+A list that arrived as an IPC request argument evaluates to itself when its head does not resolve or names a global that is not a function (see [`.log.replay`](#log-replay)). A handler that stores such a list stores that behaviour with it, and the snapshot keeps it too. With `a` bound to `42`, a handler that appends its argument to `S`, and a request `(keep (a 1 2))`, `(eval (first S))` gives `(a 1 2)` live, after recovery from the log, and after recovery from a snapshot. Like the trust mark, it is written only into the snapshot: `ser`, `de`, IPC and journal entries never carry it.
+
+!!! note "Snapshots written by an earlier build"
+    Earlier builds did not write this mark, so recovering from a snapshot evaluated such a stored list as a call: `(eval (first S))` raised `type` (`head is not callable, got i64`). A snapshot written by an earlier build still recovers that way, because it never held the mark. Take a new snapshot to keep it. An earlier build reading a snapshot written by this build ignores the mark and recovers as it did before. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
 
 Errors: `domain` (no journal open), `io`.
 
@@ -137,6 +142,11 @@ Errors: `domain` (no journal open), `io`.
 Signature: `(.log.replay "path")`. Reads each frame in the file, deserialises the payload, and `eval`s the result. Returns the number of **processed entries**, including entries whose evaluation returned an error. Such errors produce a warning and replay continues with the next entry; the integer is **not** a count of successful evaluations.
 
 This legacy integer result is unchanged. Use [`.log.replay_report`](#log-replay-report) **instead of** `.log.replay` when the caller needs the evaluation-error count; the reporting verb performs its own replay, not an inspection of a previous call. Neither verb rolls back an entry's partial effects or an already-applied prefix. After an error, retry only from an appropriate known state rather than blindly applying the same log again.
+
+A frame an IPC request wrote is evaluated directly, with the same argument marking the live request had: each argument list whose head does not resolve, or names a global that is not a function, is data. So `(upd (a 1 "s"))` with `a` bound to `42` passes the list `(a 1 "s")` to `upd` on replay, as it did live. A head naming a function is called, live and on replay. An installed `.ipc.on.sync` hook is **not** run on replay: the journaled message is evaluated as if no hook were installed, so a hook's own side effects are not replayed, and a hook that does more than evaluate its message rebuilds a different state. An entry written by `.log.write` is evaluated as written. The `-l`/`-L` startup replay works the same way.
+
+!!! note "A journal written by an earlier build now recovers to the live state"
+    The journal format did not change, but earlier builds replayed a request without the argument marking: a data list whose head named a bound global was called during replay. A journal written by an older build therefore recovers to a different state with this build, the state the live server had. With `a` bound to `42` and `upd` appending its argument to `state`, the requests `(upd (zz 1 2))`, `(upd (a 1 "s"))` and `(upd (in 1 2))` left the live `state` at `((zz 1 2) (a 1 "s") false)`. An older build replays them to `(false)`, raising `name` and `type` on the first two, and this build replays them to the live state. A server already recovered with an older build holds the older result until it is recovered again.
 
 Errors are precise enough to distinguish recovery strategies:
 

@@ -2381,7 +2381,7 @@ static ray_t* enc_attach_index(ray_enccol_t* e, ray_t** vp) {
             /* the parse names no path: keep its code, add the column's */
             char code[8], msg[200];
             snprintf(code, sizeof code, "%s", ray_err_code(perr) ? ray_err_code(perr) : "error");
-            const char* m = ray_error_msg();
+            const char* m = ray_err_msg(perr);
             snprintf(msg, sizeof msg, "%s", m ? m : "index parse");
             ray_error_free(perr);
             return ray_error(code, "column %s: %s", e->path, msg);

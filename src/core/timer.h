@@ -84,6 +84,9 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t);
 /* Current monotonic time in milliseconds. */
 int64_t ray_time_now_ms(void);
 
+/* The same clock in nanoseconds, for waits that must not end early. */
+int64_t ray_time_now_ns(void);
+
 /* TEST-ONLY: pump the timer heap for up to `budget_ms` milliseconds.
  * Sleeps in small slices and calls ray_timers_fire_expired between
  * slices.  Not intended for production code — ray_poll_run is the

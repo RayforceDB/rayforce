@@ -458,6 +458,36 @@ int ray_sock_take_oob(ray_sock_t s)
 #endif
 }
 
+int ray_sock_peer_closed(ray_sock_t s)
+{
+    struct pollfd pfd = { .fd = s, .events = POLLIN };
+#ifdef POLLRDHUP
+    pfd.events |= POLLRDHUP;
+#endif
+#ifdef RAY_OS_WINDOWS
+    int n = WSAPoll(&pfd, 1, 0);
+#else
+    int n = poll(&pfd, 1, 0);
+#endif
+    if (n <= 0) return 0;
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return 1;
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP) return 1;
+#endif
+    if (!(pfd.revents & POLLIN)) return 0;
+    /* Readable: an orderly close reads as end of stream, a reset as an
+     * error.  Bytes waiting mean the peer was there when it sent them. */
+    char b;
+#ifdef RAY_OS_WINDOWS
+    int r = recv(s, &b, 1, MSG_PEEK);
+    if (r == SOCKET_ERROR) return WSAGetLastError() == WSAEWOULDBLOCK ? 0 : 1;
+#else
+    ssize_t r = recv((int)s, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : 1;
+#endif
+    return r == 0 ? 1 : 0;
+}
+
 void ray_sock_close(ray_sock_t s)
 {
     if (s == RAY_INVALID_SOCK) return;

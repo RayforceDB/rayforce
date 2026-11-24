@@ -100,7 +100,7 @@ const char* ray_git_commit(void);
 #define RAY_UNARY     101   /* Unary builtin: ray_t* (*)(ray_t*) */
 #define RAY_BINARY    102   /* Binary builtin: ray_t* (*)(ray_t*, ray_t*) */
 #define RAY_VARY      103   /* Variadic builtin: ray_t* (*)(ray_t**, int64_t) */
-#define RAY_ERROR     127   /* Error object: 8-byte packed ASCII code in sdata */
+#define RAY_ERROR     127   /* Error object: code in sdata, its own message in data[] */
 #define RAY_NULL      126   /* Null / void — singleton static object */
 
 /* ===== Error Handling ===== */
@@ -190,6 +190,11 @@ typedef union ray_t {
              * lives in.  Typed rather than reached by offset, so it moves
              * with the union if the layout is ever reshuffled. */
             struct { uint8_t _aux_map_lo[8];     struct ray_file_map_s* file_map; };
+            /* RAY_ERROR: the length of the error's own message, which is
+             * stored NUL-terminated in data[] right after the header; 0 is
+             * no message (the block then has no data).  Read it with
+             * ray_err_msg. */
+            struct { uint16_t err_msg_len;       uint8_t _err_aux[14]; };
         };
         /* Bytes 16-31: metadata + value */
         /* Where this block's memory came from, and who ends it:
@@ -258,23 +263,29 @@ extern ray_t __ray_null;
 extern ray_t __ray_oom;
 #define RAY_OOM_OBJ   (&__ray_oom)
 
-/* Error object creation (defined in core/runtime.c). With fmt == NULL,
- * "fpenv" supplies a default explanatory message; other codes clear it. */
+/* Error object creation (defined in core/runtime.c).  The error owns its
+ * message: the formatted text (at most 255 bytes) is copied into the
+ * object's own block, so it lives and is freed with the error, on whichever
+ * thread frees it.  With fmt == NULL the error has no message, except that
+ * "fpenv" supplies a default explanatory one.  The message is also left as
+ * the thread's last message (ray_error_msg). */
 ray_t* ray_error(const char* code, const char* fmt, ...);
 const char* ray_err_code_str(ray_err_t e);
 ray_err_t ray_err_from_obj(ray_t* err);
 const char* ray_err_code(ray_t* err);
+/* The message `err` was raised with, NUL-terminated, owned by `err` and valid
+ * while it is; NULL when it has none, when `err` is not an error, and for
+ * RAY_OOM_OBJ (made when there was no memory for a message). */
+const char* ray_err_msg(ray_t* err);
 /* Free a RAY_ERROR object.  ray_release() is a deliberate no-op for
  * error ray_t* (see src/mem/cow.c), so callers that hold the sole
  * reference and want the block reclaimed must use this helper instead —
  * otherwise the error leaks until heap teardown. */
 void ray_error_free(ray_t* err);
 /* Thread-local message of the last error made on this thread (NULL when
- * empty), and clearing it. */
+ * empty), and clearing it.  For an error object at hand, ray_err_msg(err)
+ * is its own message, whatever was raised since. */
 const char* ray_error_msg(void);
-/* Replace the message of the error just raised, in place: the error object
- * holds only its code, so this allocates nothing. */
-void ray_error_msg_set(const char* fmt, ...);
 /* The call shape of the builtin the thread's last error was raised against, NULL when
  * it was not a bad call of a builtin.  A separate field of the error, next to the message:
  * the message is not changed to carry it.  Set by the caller that knows the builtin,

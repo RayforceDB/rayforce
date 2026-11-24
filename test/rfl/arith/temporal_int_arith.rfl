@@ -237,7 +237,10 @@
 (try (at (select {d: (+ d 1) u: (nil? d) from: A}) 'u) (fn [e] (at e 'msg))) -- [false false true true false]
 (try (at (select {r: (+ d 1) s: r u: (nil? s) from: A}) 'u) (fn [e] (at e 'msg))) -- [false false true true false]
 (try (at (select {r: (+ d 1) s: (nil? r) from: A where: (> c 1)}) 's) (fn [e] (at e 'msg))) -- [false true true false]
-(try (at (update {r: (+ d 1) s: (nil? r) from: A}) 's) (fn [e] (at e 'msg))) -- "'r' undefined"
+;; an update output does not see a sibling output: the schema error's own
+;; message, as select gives for a name no column has (#1214: the message was
+;; a later name error's, beside the schema code)
+(try (at (update {r: (+ d 1) s: (nil? r) from: A}) 's) (fn [e] (at e 'msg))) -- "column 'r' not found"
 (repr (try (at (select {r: (+ d 1) s: (if (> c 4) r d) from: A}) 's) (fn [e] (at e 'msg)))) -- "[2024.01.01 2024.01.03 0Nd 5881610.07.11 2024.01.06]"
 (try (at (select {r: (+ d 1) s: (+ r 1) from: A}) 's) (fn [e] (at e 'msg))) -- [2024.01.03 2024.01.04 0Nd 0Nd 2024.01.07]
 (try (at (select {r: (+ t 1) s: (lag r) from: A}) 's) (fn [e] (at e 'msg))) -- "lag expects a vector input, got time"

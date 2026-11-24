@@ -97,9 +97,10 @@ static const ray_sig_entry_t sigs[] = {
     {"wsum", "(wsum <weights: numeric vector> <values: numeric vector>)"},
     {"percentile", "(percentile <x: numeric vector> <p: num in 0..100>)"},
     {"quantile", "(quantile <x: numeric vector> <p: num in 0..1>)"},
-    {"cos-dist", "(cos-dist <a: numeric vector> <b: numeric vector>)"},
-    {"l2-dist", "(l2-dist <a: numeric vector> <b: numeric vector>)"},
-    {"inner-prod", "(inner-prod <a: numeric vector> <b: numeric vector>)"},
+    {".emb.cos-dist", "(.emb.cos-dist <a: numeric vector> <b: numeric vector>)"},
+    {".emb.tokens", "(.emb.tokens <model: model handle> <text: str or vector of str>)"},
+    {".emb.l2-dist", "(.emb.l2-dist <a: numeric vector> <b: numeric vector>)"},
+    {".emb.inner-prod", "(.emb.inner-prod <a: numeric vector> <b: numeric vector>)"},
     {"mmu", "(mmu <a: numeric vector or list of rows> <b: numeric vector or list of rows>)"},
     {"lsq", "(lsq <b: numeric vector or list of rows> <a: square matrix as a list of rows>)"},
     /* windows: the window comes first */
@@ -248,9 +249,13 @@ static const ray_sig_entry_t sigs[] = {
     {"lower", "(lower <x: str or sym, atom or vector>)"},
     {"upper", "(upper <x: str or sym, atom or vector>)"},
     {"trim", "(trim <x: str or sym, atom or vector>)"},
-    {"hnsw-free", "(hnsw-free <index: hnsw index handle>)"},
-    {"hnsw-info", "(hnsw-info <index: hnsw index handle>)"},
-    {"hnsw-load", "(hnsw-load <path: str>)"},
+    {".emb.hnsw.free", "(.emb.hnsw.free <index: hnsw index handle>)"},
+    {".emb.hnsw.info", "(.emb.hnsw.info <index: hnsw index handle>)"},
+    {".emb.hnsw.get", "(.emb.hnsw.get <path: str>)"},
+    {".emb.model.get", "(.emb.model.get <dir: str>)"},
+    {".emb.model.info", "(.emb.model.info <model: model handle>)"},
+    /* clock */
+    {".time.sleep", "(.time.sleep <ms: int or timespan>)"},
 };
 
 /* Builtins that run other code (callbacks, expressions, queries) or take a
@@ -325,7 +330,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {"format", "(format <template: str, each % marks a value> <value: any>...)"},
     {"delete", "(delete <query: dict with from: and where:>)"},
     {"del", "(del <name: quoted sym or dotted path>)"},
-    {"hnsw-save", "(hnsw-save <index: hnsw index handle> <path: str>)"},
+    {".emb.hnsw.set", "(.emb.hnsw.set <path: str> <index: hnsw index handle>)"},
     {".ipc.post", "(.ipc.post <handle: i32 or i64> <message: any>)"},
     {".log.open", "(.log.open <mode: sym, `async or `sync> <base: str>)"},
     {".log.close", "(.log.close)"},
@@ -354,9 +359,10 @@ static const ray_sig_entry_t own_sigs[] = {
     {".graph.expand", "(.graph.expand <graph: graph handle> <src: int> [<direction: sym>])"},
     {".graph.var-expand", "(.graph.var-expand <graph: graph handle> <src: int> <min-depth: int> <max-depth: int> [<direction: sym>] [<track-path: bool>])"},
     {".idx.info", "(.idx.info <col: vector>) or (.idx.info <t: table> <column: sym>)"},
-    {"hnsw-build", "(hnsw-build <col: list of numeric vectors> [<metric>] [<M: int>] [<ef_c: int>])"},
-    {"knn", "(knn <col: list of numeric vectors> <query: numeric vector> <k: int> [<metric>])"},
-    {"ann", "(ann <index: hnsw index handle> <query: numeric vector> <k: int> [<ef_s: int>])"},
+    {".emb.hnsw.build", "(.emb.hnsw.build <col: list of numeric vectors> [<metric>] [<M: int>] [<ef_c: int>])"},
+    {".emb.encode", "(.emb.encode <model: model handle> <text: str or vector of str> [<max-tokens: int>])"},
+    {".emb.knn", "(.emb.knn <col: list of numeric vectors> <query: numeric vector> <k: int> [<metric>])"},
+    {".emb.ann", "(.emb.ann <index: hnsw index handle> <query: numeric vector> <k: int> [<ef_s: int>])"},
     {"replace", "(replace <text: str or sym> <from: str or sym> <to: str or sym>)"},
     {"substr", "(substr <text: str or sym> <start: int, or I64/I32 vector> <length: int, or I64/I32 vector>)"},
     {".mem.ts", "(.mem.ts <expr>)"},
@@ -583,7 +589,7 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
                 (cn == 5 && !memcmp(c, "arity", 5)) || (cn == 6 && !memcmp(c, "length", 6));
     if (!call) return result;
     bool own;
-    const char* old = ray_error_msg();
+    const char* old = ray_err_msg(result);
     /* A domain error is a bad value, not a bad call, unless it is about the
      * argument list: told from the message before any table is read. */
     if (domain && (!old || !strstr(old, " arg"))) return result;

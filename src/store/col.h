@@ -196,6 +196,9 @@ void ray_col_gen2_index_meta(ray_t* col, uint8_t* index_kind, uint8_t* col_flags
  * opening or modifying a file.  Splayed saves use this before mutating a
  * symfile or any already-committed column generation. */
 ray_err_t ray_col_save_preflight(ray_t* vec);
+/* Why the last save on this thread refused with RAY_ERR_LIMIT (a list column
+ * nested too deep), or NULL; reading it clears it. */
+const char* ray_col_limit_msg(void);
 ray_t*    ray_col_load(const char* path);
 ray_t*    ray_col_mmap(const char* path);
 

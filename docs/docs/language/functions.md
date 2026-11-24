@@ -79,7 +79,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `sum` | unary, aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
-| `prod` | unary, aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `prod` | unary, aggr | Product of all non-null numeric elements; empty/all-null returns `1` | `(prod [2 3 4])` → `24` |
 | `all` | unary, aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
 | `any` | unary, aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary, aggr | Count of elements | `(count [1 2 3])` → `3` |
@@ -135,7 +135,7 @@ A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 row
 | `flip` | unary | Transpose of a matrix; rows of one type keep it, mixed rows widen to F64 | `(flip (list [1 2 3] [4 5 6]))` → `[[1 4] [2 5] [3 6]]` |
 | `gram` | unary | `x mmu flip x` without forming the transpose | `(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[14.0 32.0] [32.0 77.0]]` |
 
-The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
+The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). `mmu` and `gram` compute in the operands' own precision: F32 rows multiply and sum in single precision, F64 rows in double. `inv` and `lsq` always solve in double. A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
 
 ## Higher-Order Functions
 
@@ -160,8 +160,8 @@ Functions that take other functions as arguments.
 `map`, `pmap` and `apply` return a typed vector when every result is an atom of
 exactly the same vector-supported type, including strings, symbols and
 representable typed nulls. Native boolean/byte null atoms remain boxed
-because those vector types are non-nullable. Opaque graph, HNSW index and
-Datalog program handles also remain boxed: their integer payload alone cannot
+because those vector types are non-nullable. Opaque graph, HNSW index,
+embedding model and Datalog program handles also remain boxed: their integer payload alone cannot
 represent the handle's resource ownership. Mixed atom types (including
 integers mixed with floats), nested results and untyped `null` results
 remain a `LIST`. Empty input returns an empty `LIST`, since there is no
@@ -343,7 +343,7 @@ A same-key insert through a quoted symbol appends to the active segment in place
 
 `upsert` into a named flat table (`(upsert 'book 'px row)`) writes matched rows in place and appends new keys, so its cost is proportional to the payload rather than to the rows already present. A multi-row payload (a table, or a list of column vectors) is applied in one pass; a key repeated inside the payload resolves to its last row. A single-row `upsert` locates its row through a `.idx.hash` index on the key column when one is attached and fresh, and by one scan of the key column otherwise. A payload with a mistyped value is rejected before anything is written.
 
-The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID`; a key is matched by value, and the same key updates on a flat in-memory table and on a splayed or mapped one. A `SYM` or `GUID` key column needs a `SYM` or `GUID` key value, and a `STR` key column a `STR` one (otherwise a `type` error). A null `F32`, `F64`, `DATE` or `TIME` key never matches, so it always appends a row; a null `I16`, `I32`, `I64`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID` key matches an existing null key. `F32` keys are compared by a scan of the key column rather than through the hashed fast path.
+The key column may be `BOOL`, `U8`, `I16`, `I32`, `I64`, `F32`, `F64`, `DATE`, `TIME`, `TIMESTAMP`, `TIMESPAN`, `SYM`, `STR` or `GUID`; a key is matched by value, and the same key updates on a flat in-memory table and on a splayed or mapped one. A `SYM` or `GUID` key column needs a `SYM` or `GUID` key value, and a `STR` key column a `STR` one (otherwise a `type` error). A null key matches an existing null-keyed row for every key type, in memory and splayed, for a single and a compound key, so a second upsert of a null key updates the row the first one appended. A null of another type counts as the key column's null (`0Nl` against a `DATE` key matches `0Nd`); `BOOL` and `U8` cannot hold a null, so a null there is stored and matched as `0`. For `F32` and `F64` keys only the null matches the null: other values compare by value as before. A key value the key column cannot hold is a `domain` error, not narrowed: `65537` against an `I16` key, `257` or `-1` against a `U8` key, `4294967297` against an `I32` key, and the `I16` or `I32` null bit pattern written as a plain number (`-32768`, `-2147483648`). A batch with one such key changes nothing. `F32` keys are compared by a scan of the key column rather than through the hashed fast path.
 
 Payload values are narrowed into the column they land in: an `F32` column accepts `F32`, `F64` and integer atoms (a null stays null), and an `F64` column accepts `F32`, `F64` and integer atoms. A `BOOL` value into a float column is a `type` error, and the table is left unchanged.
 
@@ -593,6 +593,7 @@ spills exactly as it did before.
 | `.time.now` | variadic | Current monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic, restricted | Schedule a callback every `ms` milliseconds, `num` times (0 = forever). Returns timer id. | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary, restricted | Cancel a scheduled timer by id. Returns null. | `(.time.timer.del 0)` |
+| `.time.sleep` | unary, restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan. Returns null. A REPL Ctrl-C, an IPC cancel, a server-side `kill -INT`, or the client of a sync request hanging up ends it with `cancel`; an async one runs its full time; a journal replay skips it. Stalls a server's other connections while it waits. | `(.time.sleep 500)` |
 | `.sys.args` | nullary | Application arguments as a typed dict (`user` subdict for post-`--` args) | `(.sys.args)` |
 | `env` | unary | List all global environment bindings | `(env 0)` |
 | `.sys.build` | nullary | Build metadata: `version` + `build-date` | `(.sys.build)` |
@@ -603,7 +604,7 @@ spills exactly as it did before.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
+| `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`) | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |

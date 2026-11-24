@@ -25,6 +25,7 @@
 #include "ops/ops.h"   /* RAY_LAZY, ray_is_lazy, ray_lazy_materialize */
 #include "ops/internal.h" /* ray_table_col_value */
 #include "lang/format.h"   /* ray_type_name (error context) */
+#include "core/platform.h" /* ray_stack_short: the depth guard */
 
 #include <assert.h>
 #include "ops/hash.h"
@@ -645,6 +646,9 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
 
 /* Unary */
 ray_t* ray_not_fn(ray_t* x) {
+    /* A list's cells go through here again: one frame per level (#1591). */
+    if (x && !RAY_IS_ERR(x) && x->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "not: value nested too deep for this thread's stack");
     /* Element-wise for bool vectors */
     if (ray_is_vec(x) && x->type == RAY_BOOL) {
         int64_t n = x->len;
@@ -716,6 +720,12 @@ ray_t* ray_not_fn(ray_t* x) {
 /* Whole-value equality deliberately does not use numeric promotion. */
 ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
     if (!a || !b) return ray_error("type", "identical: missing value");
+    /* A list, dict or table compares its parts through here again: one
+     * frame per level of nesting, and a value can be nested arbitrarily
+     * deep (#1591).  Stop at the thread's stack reserve. */
+    if ((a->type == RAY_LIST || a->type == RAY_DICT || a->type == RAY_TABLE) &&
+        RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "identical: value nested too deep for this thread's stack");
     if (RAY_IS_ERR(a)) { ray_retain(a); return a; }
     if (RAY_IS_ERR(b)) { ray_retain(b); return b; }
     if (ray_is_lazy(a) || ray_is_lazy(b)) {

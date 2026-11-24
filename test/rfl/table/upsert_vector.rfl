@@ -88,10 +88,11 @@ A -- B
 (set A (table [k v w] (list [1 0Nl 3] [1 2 3] [1.0 2.0 3.0])))
 (upsert 'A 'k (table [k v w] (list [0Nl 4 0Nl] [22 44 222] [2.2 4.4 22.2])))
 (at A 'v) -- [1 222 3 44]
-;; a NaN f64 key never matches, so each one appends
+;; a null f64 key matches the null already in the target, as an i64 one
+;; does (#1152)
 (set A (table [k v] (list [1.0 0Nf] [1 2])))
 (upsert 'A 'k (table [k v] (list [0Nf 1.0 0Nf] [3 11 4])))
-(at A 'v) -- [11 2 3 4]
+(at A 'v) -- [11 4]
 
 ;; ── a table past the prefetch threshold resolves through the look-ahead
 ;;    pass (hashes first, probes loaded ahead); the result must not move.

@@ -416,6 +416,8 @@ void ray_journal_info(ray_journal_info_t* out) {
     }
 }
 
+bool ray_journal_in_replay(void) { return g_journal.in_replay; }
+
 /* Where the next frame will be appended: the live log's generation and
  * byte offset.  False when nothing would be written (no journal, or a
  * replay in progress). */
@@ -588,6 +590,12 @@ static ray_err_t journal_replay_from(const char*           path,
         if (restricted)
             ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
                                 note ? note->len - 2 : 0);
+        /* A SYNC frame is an IPC request journaled as it arrived: its
+         * arguments get the literal-fallback mark the live request gave them
+         * (ray_ipc_mark_request_args), so a data list whose head names a
+         * global that is not a function is data on replay as it was live.
+         * A .log.write entry is an ASYNC frame, evaluated as written. */
+        if (hdr.msgtype == RAY_IPC_MSG_SYNC) ray_ipc_mark_request_args(msg);
         ray_restrict_save_t prev_restricted;
         ray_eval_restrict_enter(restricted, &prev_restricted);
         ray_t* result = eval_one(msg);
@@ -758,10 +766,12 @@ ray_err_t ray_journal_recover(const char* base) {
         g_journal.in_replay = true;
         /* The snapshot is the server's own data: its lambdas keep their
          * .sys.trust marks, so a logged request that called a trusted
-         * verb replays as it ran (see ray_serde_keep_trust). */
-        bool prev_trust = ray_serde_keep_trust(true);
+         * verb replays as it ran, and a stored request argument keeps its
+         * literal-fallback mark, so it evaluates as it did live and as
+         * log recovery gives it (see ray_serde_keep_marks). */
+        bool prev_marks = ray_serde_keep_marks(true);
         ray_t* snap = ray_obj_load(qdb_path);
-        ray_serde_keep_trust(prev_trust);
+        ray_serde_keep_marks(prev_marks);
         g_journal.in_replay = prev_in_replay;
 
         if (!snap || RAY_IS_ERR(snap)) {
@@ -1264,10 +1274,11 @@ ray_err_t ray_journal_snapshot(void) {
     }
 
     /* ray_obj_save writes prefix-headered bytes (same wire framing).  The
-     * lambdas keep their .sys.trust marks, which recovery restores. */
-    bool prev_trust = ray_serde_keep_trust(true);
+     * lambdas keep their .sys.trust marks and stored request arguments
+     * their literal-fallback marks, which recovery restores. */
+    bool prev_marks = ray_serde_keep_marks(true);
     ray_err_t e = ray_obj_save(snap, qdb_tmp);
-    ray_serde_keep_trust(prev_trust);
+    ray_serde_keep_marks(prev_marks);
     ray_release(snap);
     if (e != RAY_OK) {
         /* Don't leave a half-written .qdb.tmp behind to confuse the

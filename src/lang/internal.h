@@ -426,6 +426,11 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
  * a test counter, as ray_narrow_sum_routes. */
 extern _Atomic(uint64_t) ray_tempint_routes;
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg);
+/* Whether x nests lists and dicts more than `limit` levels deep, measured
+ * without recursion (a table, a vector or an atom is one level).  For a
+ * walk that recurses per level and has no error path of its own: its
+ * caller refuses an input deeper than the walk is known to handle. */
+bool   ray_nests_deeper_than(ray_t* x, int64_t limit);
 ray_t* to_boxed_list(ray_t* x);
 ray_t* unbox_vec_arg(ray_t* x, ray_t** _bx);
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc);
@@ -674,6 +679,7 @@ ray_t* ray_remove_fn(ray_t* dict, ray_t* key);
 ray_t* ray_time_now_fn       (ray_t** args, int64_t n);
 ray_t* ray_time_timer_set_fn (ray_t** args, int64_t n);
 ray_t* ray_time_timer_del_fn (ray_t*  id);
+ray_t* ray_time_sleep_fn     (ray_t*  x);
 ray_t* ray_env_fn(ray_t* x);
 ray_t* ray_internals_fn(ray_t** args, int64_t n);
 ray_t* ray_memstat_fn(ray_t** args, int64_t n);

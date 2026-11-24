@@ -48,8 +48,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.sys.trust`, `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
-`.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
-`norm`, `inv`, `flip`, `gram`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
+`.log.validate`, `rc`, `diverse`, `.time.timer.del`, `.time.sleep`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
+`norm`, `inv`, `flip`, `gram`, `.emb.hnsw.free`, `.emb.hnsw.get`, `.emb.hnsw.info`, `.emb.model.get`, `.emb.model.info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
 `.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`
 
@@ -59,7 +59,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
-`unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `mmu`, `lsq`, `hnsw-save`, `.attr.set`,
+`unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `.emb.cos-dist`, `.emb.inner-prod`, `.emb.l2-dist`, `.emb.tokens`, `mmu`, `lsq`, `.emb.hnsw.set`, `.attr.set`,
 `.col.link`
 
 ### Variadic / Special
@@ -73,7 +73,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
-`retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
+`retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `.emb.knn`, `.emb.hnsw.build`, `.emb.ann`, `.emb.encode`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
@@ -170,7 +170,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
-| `prod` | unary | aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `prod` | unary | aggr | Product of all non-null numeric elements; empty/all-null returns `1` | `(prod [2 3 4])` → `24` |
 | `all` | unary | aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
@@ -213,7 +213,7 @@ Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a ro
 
 ## Linear Algebra { #linalg }
 
-A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); sums accumulate in double either way, and a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); `mmu` and `gram` compute in the operands' own precision, F32 rows in single and F64 rows in double, while `inv` and `lsq` always solve in double; a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
 
 | Function | Type | Attr | Description | Example |
 |---|---|---|---|---|
@@ -495,7 +495,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count. `first` and `last` give the frame's first or last row, a null included, in the value column's type; `min` and `max` skip nulls and keep the value column's type too, ordering SYM and STR by text and GUID by bytes, as `min` and `max` do outside a window | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
 | `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
-| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
+| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row); a null key matches a null-keyed row for every key type, and a key value the key column cannot hold is a `domain` error | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
 ; Select with filter and projection
@@ -706,6 +706,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
+| `.time.sleep` | unary | restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null; a cancel, or a sync request's client hanging up, ends it; a replay skips it | `(.time.sleep 500)` |
 | `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | nullary | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
 | `.sys.prof` | nullary | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
@@ -738,7 +739,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
+| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
 | `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |

@@ -2589,7 +2589,9 @@ static test_result_t test_domain_flush_append(void) {
  * new, durable or not, writes and syncs nothing: it succeeds on a file
  * made read-only. */
 static void dom_app_clean(const char* p) {
-    char b[256];
+    /* room for a 256-byte path (callers build theirs in char[256]) plus
+     * the suffix: a smaller buffer truncates the name it unlinks */
+    char b[256 + sizeof ".lk"];
     unlink(p);
     snprintf(b, sizeof(b), "%s.lk", p); unlink(b);
     snprintf(b, sizeof(b), "%s.ix", p); unlink(b);

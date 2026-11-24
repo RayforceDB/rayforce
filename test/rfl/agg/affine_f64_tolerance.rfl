@@ -1,0 +1,86 @@
+;; A query's sum / avg of an F64 column plus a constant is computed from the
+;; column total, so it may differ from summing the rows x + c by rounding
+;; (#1178).  docs/docs/language/math.md#affine-sum-avg states, while no
+;; intermediate overflows, with T = sum |x| + n * |c|: the sums differ by at
+;; most (n + 1) * 2^-51 * T, the averages by at most that over n plus
+;; 2^-1074.  These checks assert that tolerance, never bit equality.  Past
+;; an intermediate overflow no bound holds.  An integer column is exact.
+
+;; The issue's two rows: (2^53 + 1) rounds to 2^53 row by row.
+(set v [9007199254740992.0 -9007199254740992.0])
+(set T (table [x] (list v)))
+(set q (select {from: T s: (sum (+ x 1.0)) a: (avg (+ x 1.0))}))
+(set rs (sum (do (+ v 1.0))))
+(set ra (avg (do (+ v 1.0))))
+rs -- 1.0
+(set bound (* (* 3.0 (pow 2.0 -51.0)) (+ (sum (abs v)) 2.0)))
+(<= (abs (- (at (at q 's) 0) rs)) bound) -- true
+(<= (abs (- (at (at q 'a) 0) ra)) (+ (/ bound 2.0) 5e-324)) -- true
+;; the same with the constant first, subtracted, under where: and beside count
+(<= (abs (- (at (at (select {from: T s: (sum (+ 1.0 x))}) 's) 0) rs)) bound) -- true
+(<= (abs (- (at (at (select {from: T s: (sum (- x -1.0))}) 's) 0) rs)) bound) -- true
+(<= (abs (- (at (at (select {from: T where: (> x -1e300) s: (sum (+ x 1.0))}) 's) 0) rs)) bound) -- true
+(<= (abs (- (at (at (select {from: T s: (sum (+ x 1.0)) c: (count x)}) 's) 0) rs)) bound) -- true
+
+;; Many rows of mixed sign and magnitude.
+(set n 100000)
+(set w (- (* (% (* (til n) 7919) 10007) 1.37) 6000.0))
+(set W (table [x] (list w)))
+(set c 0.123456789)
+(set qw (select {from: W s: (sum (+ x c)) a: (avg (+ x c))}))
+(set bw (* (* (+ n 1) (pow 2.0 -51.0)) (+ (sum (abs w)) (* n (abs c)))))
+(<= (abs (- (at (at qw 's) 0) (sum (do (+ w c))))) bw) -- true
+(<= (abs (- (at (at qw 'a) 0) (avg (do (+ w c))))) (+ (/ bw n) 5e-324)) -- true
+
+;; Subnormals: the sums agree (a subnormal addition is exact), the means
+;; differ by 2^-1074 because the query's mean of x, 2^-1075, rounds to 0.0
+;; before c is added.  The 2^-1074 term of the average bound covers it.
+(set u [5e-324 0.0])
+(set U (table [x] (list u)))
+(set qu (select {from: U s: (sum (+ x 5e-324)) a: (avg (+ x 5e-324))}))
+(== (at (at qu 'a) 0) 5e-324) -- true
+(== (avg (do (+ u 5e-324))) (* 2.0 5e-324)) -- true
+(== (at (at qu 's) 0) (sum (do (+ u 5e-324)))) -- true
+(set bu (* (* 3.0 (pow 2.0 -51.0)) (+ (sum (abs u)) (* 2.0 5e-324))))
+(<= (abs (- (at (at qu 's) 0) (sum (do (+ u 5e-324))))) bu) -- true
+(<= (abs (- (at (at qu 'a) 0) (avg (do (+ u 5e-324))))) (+ (/ bu 2.0) 5e-324)) -- true
+(> (abs (- (at (at qu 'a) 0) (avg (do (+ u 5e-324))))) (/ bu 2.0)) -- true
+
+;; Overflow: a sum that overflows is 0Nf on either route.
+(set B (table [x] (list [1e308 1e308])))
+(at (select {from: B s: (sum (+ x 1.0))}) 's) -- [0Nf]
+(sum (do (+ [1e308 1e308] 1.0))) -- 0Nf
+;; Near the limit the routes may disagree: the column total overflows while
+;; the rows x + c sum to the largest finite F64.
+(set M 1.7976931348623157e308)
+(set o (concat M (pow 2.0 970.0)))
+(set O (table [x] (list o)))
+(set h (neg (pow 2.0 969.0)))
+(at (select {from: O s: (sum (+ x h))}) 's) -- [0Nf]
+(== (sum (do (+ o h))) M) -- true
+;; An intermediate overflow with cancellation: the exact total is -2^969,
+;; far from the limit, yet the query's column total overflows on
+;; M + 2^970 and answers 0Nf while the rows cancel to 0.0.  No bound holds.
+(set k (concat (concat M (pow 2.0 970.0)) (neg M)))
+(set K (table [x] (list k)))
+(set qk (select {from: K s: (sum (+ x h)) a: (avg (+ x h))}))
+(at qk 's) -- [0Nf]
+(at qk 'a) -- [0Nf]
+(sum (do (+ k h))) -- 0.0
+(avg (do (+ k h))) -- 0.0
+;; A constant of magnitude 2^970 or more is applied row by row.
+(at (select {from: B s: (sum (+ x -1e308)) a: (avg (+ x -1e308))}) 's) -- [0.0]
+(at (select {from: B s: (sum (- x 1e308))}) 's) -- [0.0]
+
+;; An I64 column plus an integer constant is exact: rows alternate 2^62+1
+;; and -2^62+3, so every pair totals 4.
+(set d (til 1000))
+(set iw (+ (* (% d 2) -9223372036854775806) 1))
+(set I (table [d w] (list d iw)))
+(set C 4611686018427387904)
+(set qi (select {from: I s: (sum (+ w C)) a: (avg (+ w C))}))
+(at qi 's) -- [2000]
+(at qi 'a) -- [2.0]
+(at qi 's) -- (enlist (sum (+ iw C)))
+(at qi 'a) -- (enlist (avg (+ iw C)))
+(at (select {from: I where: (> d 1) a: (avg (+ w C)) c: (count w)}) 'a) -- [2.0]

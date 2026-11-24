@@ -297,12 +297,13 @@ ticks -- 1
 (at (select {c: (sum V2) by: {m: (+ k 1)} from: T3 where: (> a 500)}) 'm) -- [1 2 3]
 (at (select {c: (sum (+ a V2)) by: {m: (+ k 1)} from: T3 where: (> a 500) take: 2}) 'c) -- [375750 373251]
 ;; Over an empty table nothing of the vector is read: the sum of no
-;; values, as `(sum (til 3))` over it (an empty table grouped, none keyless).
+;; values, as `(sum (til 3))` over it: an empty table grouped gives no
+;; row, keyless one row (#1614).
 (set T7 (table [a k] (list (til 10) (% (til 10) 3))))
 (key (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- [k f]
 (count (select {f: (sum [1 2]) by: k from: (take T7 0)})) -- 0
 (key (select {f: (sum [1 2]) from: (take T7 0)})) -- [f]
-(count (select {f: (sum [1 2]) from: (take T7 0)})) -- 0
+(count (select {f: (sum [1 2]) from: (take T7 0)})) -- 1
 (select {f: (sum [1 2]) by: k from: T7 where: (> a 100)}) !- length
 ;; A collection-valued aggregate of a column-free source is one cell
 ;; without by: too, as each group takes it (it raised `length`).
