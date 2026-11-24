@@ -6352,8 +6352,12 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * have the same row-wise semantics as projections, and eval-level `if`
  * tests whole-vector truthiness and would choose one branch for every
  * input row. */
-static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
-static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
+static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms);
+static ray_t* group_key_eval_x(ray_t* v, ray_t* tbl, bool text_syms);
+static ray_t* group_key_eval(ray_t* v, ray_t* tbl) { return group_key_eval_x(v, tbl, false); }
+/* `text_syms`: a STR key over the distinct values is kept as positions of a
+ * text domain (derived_key_over_values_x). */
+static ray_t* group_key_eval_x(ray_t* v, ray_t* tbl, bool text_syms) {
     /* Exact-size carve: collect_col_refs dedups against real table
      * columns, so ray_table_ncols(tbl) is a hard upper bound. */
     int64_t ncols_max = ray_table_ncols(tbl);
@@ -6382,7 +6386,7 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
     }
     /* a key over one SYM or STR column of few distinct values: once per value */
     if (!col_vec)
-        col_vec = derived_key_over_values(v, tbl, n_refs == 1 ? materialized_refs[0] : NULL, NULL);
+        col_vec = derived_key_over_values_x(v, tbl, n_refs == 1 ? materialized_refs[0] : NULL, NULL, text_syms);
     if (!col_vec) {
         ray_graph_t* key_graph = ray_graph_new(tbl);
         if (!key_graph) col_vec = ray_error("oom", NULL);
@@ -6687,11 +6691,14 @@ static ray_t* bydict_enc_rename(ray_t* v, ray_t* tbl) {
  * (bind_referenced_columns) only when the key is evaluated whole: by
  * range when key_eval_by_range takes it, else bound and evaluated.  The
  * caller has pushed the query scope. */
-static ray_t* group_key_eval_bound(ray_t* v, ray_t* tbl) {
+static ray_t* group_key_eval_bound_x(ray_t* v, ray_t* tbl, bool text_syms) {
     ray_t* r = key_eval_by_range(v, tbl);
     if (r) return r;
     r = bind_referenced_columns(tbl, &v, 1);
-    return r ? r : group_key_eval(v, tbl);
+    return r ? r : group_key_eval_x(v, tbl, text_syms);
+}
+static ray_t* group_key_eval_bound(ray_t* v, ray_t* tbl) {
+    return group_key_eval_bound_x(v, tbl, false);
 }
 
 /* ---- The top groups by count, exactly, in two passes --------------------
@@ -11114,6 +11121,60 @@ vfail:
  * which distinct symbols are evaluated — the grouping that consumes the key
  * honours the same selection, so a symbol that occurs in no selected row
  * is never evaluated (nor its key interned). */
+/* The du distinct STR values of `strs` as a SYM vector over a new text
+ * domain (ray_sym_domain_set_text): the strings interned once, equal ones
+ * one position.  NULL on OOM. */
+static ray_t* dk_str_values_as_text_syms(ray_t* strs) {
+    int64_t du = strs->len;
+    const ray_str_t* d; const char* pool;
+    str_resolve(strs, &d, &pool);
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)(du > 0 ? du : 1) * (sizeof(const char*) + sizeof(size_t) + sizeof(int64_t) + sizeof(uint32_t)));
+    if (!mem) return NULL;
+    const char** sp = (const char**)mem;
+    size_t*  sl = (size_t*)(sp + du);
+    int64_t* pos = (int64_t*)(sl + du);
+    uint32_t* h = (uint32_t*)(pos + du);
+    for (int64_t i = 0; i < du; i++) {
+        sp[i] = ray_str_t_ptr(&d[i], pool);
+        sl[i] = d[i].len;
+        h[i] = (uint32_t)ray_hash_bytes(sp[i], sl[i]);
+    }
+    struct ray_sym_domain_s* dom = ray_sym_domain_new();
+    ray_t* out = NULL;
+    if (dom && ray_sym_domain_intern_batch(dom, du, sp, sl, h, pos)) {
+        out = ray_sym_vec_new(RAY_SYM_W64, du);
+        if (out && !RAY_IS_ERR(out)) {
+            out->len = du;
+            memcpy(ray_data(out), pos, (size_t)du * sizeof(int64_t));
+            ray_sym_domain_set_text(dom);
+            ray_sym_domain_release(out->sym_domain);
+            out->sym_domain = dom;      /* the vector takes the ref */
+            dom = NULL;
+        } else { if (out) ray_error_free(out); out = NULL; }
+    }
+    if (dom) ray_sym_domain_release(dom);
+    scratch_free(hdr);
+    return out;
+}
+
+/* A SYM vector re-packed at the narrowest width that holds its domain. */
+static ray_t* sym_vec_narrow(ray_t* v) {
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(v);
+    uint8_t w = ray_sym_dict_width(ray_sym_domain_count(dom));
+    if (w == (v->attrs & RAY_SYM_W_MASK)) return v;
+    ray_t* out = ray_sym_vec_new(w, v->len);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return v; }
+    out->len = v->len;
+    ray_sym_vec_adopt_domain(out, v);
+    const void* src = ray_data(v);
+    void* dst = ray_data(out);
+    for (int64_t i = 0; i < v->len; i++)
+        ray_write_sym(dst, i, (uint64_t)ray_read_sym(src, i, RAY_SYM, v->attrs), RAY_SYM, out->attrs);
+    ray_release(v);
+    return out;
+}
+
 static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
 static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel) {
     return derived_key_over_values(by_expr, tbl, NULL, sel);
@@ -11418,7 +11479,15 @@ static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_
  * rows (NULL: every row) — only the selected rows are grouped and
  * evaluated (a value only the dropped rows hold is never seen), the key
  * vector is still one of nrows. */
+/* `text_syms`: a STR result over the distinct values is kept as positions
+ * of a text domain (dk_str_values_as_text_syms) at the narrowest width,
+ * instead of a 16-byte descriptor a row; the query gives the column back
+ * as STR when it answers (sym_text_columns_to_str). */
+static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms);
 static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel) {
+    return derived_key_over_values_x(by_expr, tbl, col, sel, false);
+}
+static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
@@ -11609,6 +11678,17 @@ evaluated:
     }
     ray_profile_tick("derived key: values evaluated");
 
+    /* A STR key as positions of a text domain, at the width that holds
+     * its values (a byte a row for a few), while the query has outputs to
+     * group; the spread copies that width. */
+    bool narrow = false;
+    if (text_syms && key_dom->type == RAY_STR && ray_len(key_dom) <= 255 && !ray_vec_text_has_nulls(key_dom)) {
+        /* (a few values — a byte a row; not with "" among them: as the null
+         * symbol it would head the groups, where the STR key keeps it in
+         * its first-seen place) */
+        ray_t* syms = dk_str_values_as_text_syms(key_dom);
+        if (syms) { ray_release(key_dom); key_dom = sym_vec_narrow(syms); narrow = true; }
+    }
     /* Each row takes the key of its value (dks_spread; a kind of cell it
      * does not copy goes through the generic gather by int64 index). */
     const int32_t* code = (const int32_t*)ray_data(ids);
@@ -11628,6 +11708,7 @@ evaluated:
     if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
     ray_profile_tick("derived key: keys spread");
     agg_route_note_key_domain();
+    if (narrow && spread->type == RAY_SYM) agg_route_note_key_text();
     return spread;
 }
 
@@ -24575,9 +24656,51 @@ done:
     return r;
 }
 
+/* The column's strings, from its text domain, as a STR vector. */
+static ray_t* sym_text_col_to_str(ray_t* col) {
+    int64_t n = col->len;
+    struct ray_sym_domain_s* dom = ray_sym_vec_domain(col);
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)(n > 0 ? n : 1) * (sizeof(const char*) + sizeof(uint32_t)));
+    if (!mem) return ray_error("oom", NULL);
+    const char** ptrs = (const char**)mem;
+    uint32_t* lens = (uint32_t*)(ptrs + n);
+    const void* d = ray_data(col);
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* str = ray_sym_domain_str(dom, ray_read_sym(d, i, RAY_SYM, col->attrs));
+        ptrs[i] = str ? ray_str_ptr(str) : NULL;
+        lens[i] = str ? (uint32_t)ray_str_len(str) : 0;
+    }
+    ray_t* out = ray_str_vec_from_parts(ptrs, lens, NULL, n);
+    scratch_free(hdr);
+    return out;
+}
+
+/* A query's result holds the columns it kept as positions of a text domain
+ * (dk_str_values_as_text_syms) as the STR columns they stand for — unless
+ * the select is the immediate from: of another select (the pushdown hint,
+ * select_pushdown_active, not a join's), which groups and sorts over the
+ * positions and converts when it answers. */
+static ray_t* sym_text_columns_to_str(ray_t* r) {
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE) return r;
+    if (select_pushdown_active() && !__VM->proj_dict) return r;
+    int64_t nc = ray_table_ncols(r);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = ray_table_col_idx(r, c);
+        if (!col || RAY_IS_ERR(col) || col->type != RAY_SYM || !ray_is_vec(col)) continue;
+        if (!ray_sym_domain_is_text(ray_sym_vec_domain(col))) continue;
+        ray_t* str = sym_text_col_to_str(col);
+        if (!str || RAY_IS_ERR(str)) { ray_release(r); return str ? str : ray_error("oom", NULL); }
+        ray_table_set_col_idx(r, c, str);
+        ray_release(str);
+    }
+    return r;
+}
+
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan) {
     select_owned_t own = {0};
     ray_t* r = ray_select_body(args, n, plan, &own);
+    r = sym_text_columns_to_str(r);
     if (own.selection) ray_release(own.selection);
     if (own.by_syms) ray_release(own.by_syms);
     /* A dispatch a cancel landed before ran none of its tasks: a stage that
@@ -25745,10 +25868,16 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
              * as a bare by: key with one does (#1661): evaluated whole, the
              * effect ran once.  Any other value is read whole, as before:
              * planner-only names (hour, minute) and builtins such as resolve
-             * keep the answer the whole column gives. */
+             * keep the answer the whole column gives.  A key over one SYM or
+             * STR column alone is evaluated once per distinct value
+             * (derived_key_over_values, through group_key_eval) — and a STR
+             * key as positions of a text domain while the query has outputs
+             * to group (the key comes back as STR when the query answers); a
+             * select of keys alone (the distinct) keeps the STR column,
+             * whose values are what it returns. */
             bool per_row = query_expr_has_helper(v) && !query_expr_effect_free(v);
             ray_t* col_vec = per_row ? eval_expr_per_row(v, tbl, ray_table_nrows(tbl))
-                                     : group_key_eval_bound(v, tbl);
+                                     : group_key_eval_bound_x(v, tbl, n_out > 0);
             if (col_vec && !RAY_IS_ERR(col_vec) && ray_is_lazy(col_vec)) col_vec = ray_lazy_materialize(col_vec);
             if (!col_vec || RAY_IS_ERR(col_vec)) {
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");

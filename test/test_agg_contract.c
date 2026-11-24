@@ -514,6 +514,30 @@ static test_result_t test_derived_key_per_symbol_route(void) {
         TEST_ASSERT_FMT(agg_route_stats().key_domain_evals == cases[c].evals, "%s: %llu per-value evaluations",
                         cases[c].q, (unsigned long long)agg_route_stats().key_domain_evals);
     }
+    /* The per-symbol STR key is the row-wise key: same type, same groups. */
+    agg_route_reset();
+    r = ray_eval_str("(set DK (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2)} c: (count v) d: (count (distinct v)) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(set RW (select {from: (select {from: T k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) v: v}) by: [k m] c: (count v) d: (count (distinct v)) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (type (at DK 'k)) 'STR) (== (type (at DK 'm)) 'SYM) (all (== (ser (map (fn [c] (as 'STR (at DK c))) (cols DK))) (ser (map (fn [c] (as 'STR (at RW c))) (cols RW))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict keys evaluated per symbol give the row-wise result");
+    ray_release(r);
+    /* the distinct counts, exactly: the distinct (k, m, v) tuples counted per
+     * (k, m) — a grouping with no outputs, not the count-distinct kernel —
+     * and by hand: 10 groups (h1 and h10..h15 share the key (one, h1)), v
+     * the 7 residues of i mod 7, every group sees them all */
+    /* the STR key was kept as positions of a text domain while the query
+     * grouped and sorted (agg_route_stats().key_text_syms), and came back
+     * as the STR column checked above */
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(set OD (select {from: (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) vv: v}}) by: [k m] d: (count vv) asc: [k m]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (count DK) 10) (== (count OD) 10) (all (== (at DK 'd) (at OD 'd))) (all (== (at DK 'd) 7)) (all (== (at DK 'k) (at OD 'k))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the per-symbol keys' distinct counts are the oracle's: seven in each of the 10 groups");
+    ray_release(r);
     /* A user lambda shadowing `substr` is what the compiled key would call. */
     r = ray_eval_str("(set substr (fn [x a b] x))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
@@ -815,20 +839,25 @@ static test_result_t test_derived_key_per_str_value_route(void) {
         "(set TU2 (table [s v] (list (concat \"u\" (as 'STR j)) (% j 5))))";
     ray_t* r = ray_eval_str(setup);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
-    const struct { const char* q; uint64_t evals; uint64_t indexed; } cases[] = {
-        { "(select {from: T by: (upper (trim s)) c: (count v)})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1 },
-        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 1 },
+    /* `text`: a by-dict's STR key over the distinct values is kept as
+     * positions of a text domain while the query groups (key_text_syms) and
+     * takes the dense route; a lone by: expression, a key with "" among its
+     * values (T's where: drops those rows) and a row-wise key stay STR on
+     * the indexed route. */
+    const struct { const char* q; uint64_t evals; uint64_t indexed; uint64_t text; } cases[] = {
+        { "(select {from: T by: (upper (trim s)) c: (count v)})", 1, 1, 0 },
+        { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 0, 1 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1, 0 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 0, 1 },
         /* a selection within the probe's 65536 rows: per value whatever the
          * distinct share (TU: ~4000 unique values); a sparse but large
          * near-unique selection (TU2: 80000 unique values) keeps the row key */
-        { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
-        { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
-        { "(select {from: TU2 by: (upper (trim s)) c: (count v) where: (== v 0)})", 0, 1 },
-        { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1 },
-        { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1 },
-        { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1 },
+        { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1, 0 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1, 0 },
+        { "(select {from: TU2 by: (upper (trim s)) c: (count v) where: (== v 0)})", 0, 1, 0 },
+        { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1, 0 },
+        { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1, 0 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1, 0 },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         agg_route_reset();
@@ -840,6 +869,10 @@ static test_result_t test_derived_key_per_str_value_route(void) {
                         cases[c].q, (unsigned long long)st.key_domain_evals);
         TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_INDEXED] == cases[c].indexed, "%s: indexed route %llu",
                         cases[c].q, (unsigned long long)st.routes[AGG_ROUTE_V2_INDEXED]);
+        TEST_ASSERT_FMT(st.key_text_syms == cases[c].text, "%s: %llu text keys",
+                        cases[c].q, (unsigned long long)st.key_text_syms);
+        TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_DENSE] == cases[c].text, "%s: dense route %llu",
+                        cases[c].q, (unsigned long long)st.routes[AGG_ROUTE_V2_DENSE]);
     }
     /* A user lambda shadowing `trim` is what the compiled key would call. */
     r = ray_eval_str("(set trim (fn [x] x))");

@@ -53,6 +53,7 @@ static _Thread_local agg_route_stats_t route_stats;
 void agg_route_reset(void) { memset(&route_stats, 0, sizeof(route_stats)); }
 agg_route_stats_t agg_route_stats(void) { return route_stats; }
 void agg_route_note_key_domain(void) { route_stats.key_domain_evals++; }
+void agg_route_note_key_text(void) { route_stats.key_text_syms++; }
 void agg_route_note_key_where_deferred(void) { route_stats.key_where_deferred++; }
 void agg_route_note_vocab_order(void) { route_stats.key_vocab_order++; }
 void agg_route_note_da_lazy(uint64_t skipped_chunks) {
