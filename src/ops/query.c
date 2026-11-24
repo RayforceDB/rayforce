@@ -18116,6 +18116,16 @@ static int collect_syms(ray_t* e, int64_t* out, int max, int n) {
             int64_t len = ray_len(vals);
             for (int64_t i = 0; i < len && n < max; i++) n = collect_syms(v[i], out, max, n);
         }
+    } else if (e->type == RAY_SYM && ray_is_vec(e) && !(e->attrs & ATTR_QUOTED)) {
+        /* a vector of names: by: [k1 k2], asc: [a b] — the columns they
+         * name are read (an inner select's pushdown keeps them) */
+        int64_t len = ray_len(e);
+        for (int64_t i = 0; i < len && n < max; i++) {
+            int64_t id = sym_cell_runtime_id(e, i);
+            int j = 0;
+            for (; j < n; j++) if (out[j] == id) break;
+            if (j == n) out[n++] = id;
+        }
     }
     return n;
 }
@@ -18128,6 +18138,7 @@ static int collect_syms(ray_t* e, int64_t* out, int max, int n) {
  * cannot saturate. */
 static int64_t count_syms(ray_t* e) {
     if (!e) return 0;
+    if (e->type == RAY_SYM && ray_is_vec(e)) return ray_len(e);   /* a vector of names */
     if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) ? 0 : 1;
     if (e->type == RAY_LIST) {
         ray_t** el = (ray_t**)ray_data(e);
@@ -18158,6 +18169,22 @@ static int64_t count_syms(ray_t* e) {
  * declined.  Sizing to exactly B would re-trip the guard whenever a query has
  * no duplicate refs (n == B == max), which is precisely the q11 shape.  Floor
  * keeps it ≥ 1 slot. */
+/* The projection pushdown of the select above this one, as the inner select
+ * sees it: whether a keep-set is published for the from: being evaluated
+ * (an explicitly projected select whose clauses read columns by name,
+ * proj_compute_keep), and whether it names `kid` — an output the inner
+ * select then emits; one it does not name is compiled for its alias and
+ * not emitted. */
+static bool select_pushdown_active(void) {
+    ray_vm_t* vm = __VM;
+    return vm && vm->proj_active && vm->proj_keep && vm->eval_depth == vm->proj_depth + 1;
+}
+static bool select_pushdown_keeps(int64_t kid) {
+    ray_vm_t* vm = __VM;
+    for (int j = 0; j < vm->proj_keep_n; j++) if (vm->proj_keep[j] == kid) return true;
+    return false;
+}
+
 static int64_t proj_keep_bound(ray_t* dict) {
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -24748,6 +24775,9 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
 
     /* Check for asc/desc presence */
     bool has_sort = false;
+    /* an ungrouped select whose outputs were pruned to the ones the select
+     * above names (select_pushdown_keeps): the rename below skips the rest */
+    bool proj_pruned = false;
     for (int64_t i = 0; i + 1 < dict_n; i += 2) {
         int64_t kid = dict_elems[i]->i64;
         if (kid == asc_id || kid == desc_id) { has_sort = true; break; }
@@ -29793,23 +29823,40 @@ by_dict_done:
             g->sel_alias_syms = alias_syms;
             g->sel_alias_ids  = alias_ids;
             g->sel_alias_n    = 0;
+            /* Projection pushdown into this select: as the immediate from: of
+             * a select with explicit outputs, whose clauses read columns only
+             * by naming them (the published keep-set, proj_compute_keep), an
+             * output no clause of that select names is compiled — a later
+             * projection may read it by its alias — but not emitted: the
+             * rows of a column nobody reads are not built or gathered
+             * (`lu: (lower URL) kind: (if (like lu ...) ...)` read by a
+             * grouping over kind alone keeps lu an intermediate).  A select
+             * that sorts keeps every output: a sort key may name one. */
+            bool pk = !has_sort && select_pushdown_active();
+            int na = 0;   /* aliases published: every output, emitted or not */
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
-                col_ops[nc] = compile_expr_dag(g, dict_elems[i + 1]);
+                ray_op_t* cop = compile_expr_dag(g, dict_elems[i + 1]);
                 /* A sort key that names an output, not a source column, is
                  * sorted by the evaluator alone: a lowered temporal +/-
                  * integer (#1302) keeps the evaluator, as before it lowered. */
-                if (!col_ops[nc] ||
-                    (has_sort && (col_ops[nc]->flags & OP_FLAG_TEMPORAL_INT))) {
+                if (!cop || (has_sort && (cop->flags & OP_FLAG_TEMPORAL_INT))) {
                     use_eval_fallback = 1;
                     break;
                 }
-                alias_syms[nc] = kid;
-                alias_ids[nc]  = col_ops[nc]->id;
-                nc++;
-                g->sel_alias_n = (int)nc;
+                alias_syms[na] = kid;
+                alias_ids[na]  = cop->id;
+                na++;
+                g->sel_alias_n = na;
+                if (!pk || select_pushdown_keeps(kid)) col_ops[nc++] = cop;
             }
+            /* no output read by the select above: emit them all, as before */
+            if (!use_eval_fallback && pk && nc == 0) {
+                for (int j = 0; j < na; j++) col_ops[j] = &g->nodes[alias_ids[j]];
+                nc = na;
+            }
+            proj_pruned = !use_eval_fallback && pk && nc < na;
             g->sel_alias_syms = NULL;
             g->sel_alias_ids  = NULL;
             g->sel_alias_n    = 0;
@@ -30608,6 +30655,7 @@ by_dict_done:
                     if (kid == from_id || kid == where_id || kid == by_id ||
                         kid == take_id || kid == asc_id || kid == desc_id ||
                         kid == nearest_id) continue;
+                    if (proj_pruned && !select_pushdown_keeps(kid)) continue;   /* not emitted */
                     if (n_key_cols + j < ncols)
                         ray_table_set_col_name(result, n_key_cols + j, kid);
                     j++;

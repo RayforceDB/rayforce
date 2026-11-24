@@ -1,0 +1,54 @@
+;; Projection pushdown into an inner select: as the immediate from: of a
+;; select whose clauses read columns only by name, the inner select builds
+;; only the outputs the outer one names.  An output nobody reads is still
+;; compiled — a later output may read it by its alias — but no column of
+;; it is built.  Observed through (.sys.mem)'s sym-map-runs: `(lower URL)`
+;; over a SYM column of 4096 rows or more runs the per-code path once per
+;; evaluation that builds its rows.  Values against the same query without
+;; the unread output, and the inner select alone.
+(set N 6000)
+(set i (til N))
+(set hosts ["Example.COM" "news.Site.org" "Shop.Market.NET" "Blog.Daily.com"])
+(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) "http://www.%/p/%.html" "https://www.%/p/%.php") (at hosts (% k 4)) (% k 997))) i)))
+(set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2))))
+(set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
+(>= (runs) 0) -- true
+(set FP (fn [t] (ser (map (fn [c] (as 'STR (at t c))) (cols t)))))
+;; the inner select alone builds both lower-cased columns: two runs
+(set m0 (runs))
+(set I (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
+(- (runs) m0) -- 2
+(cols I) -- ['lu 'x 'kind 'w 'v]
+;; under an outer grouping that names kind, w and v: lu is built as the
+;; input of kind, x not at all — one run; the result is the same
+(set m0 (runs))
+(set G (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(- (runs) m0) -- 1
+(count G) -- 4
+(set G2 (select {from: (select {from: T kind: (if (like (lower URL) "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
+(all (== (FP G) (FP G2))) -- true
+;; the distinct counts, exactly: the distinct (kind, w, v) tuples per (kind, w)
+(set O (select {from: (select {from: I by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}))
+(all (== (at G 'd) (at O 'd))) -- true
+(sum (at G 'c)) -- 6000
+;; by hand: the html rows are k = 0 mod 3, w = k mod 2: v = 7919 k mod 2003 over k = 0 mod 6
+(count (distinct (at (select {from: T where: (and (== 0 (% i 3)) (== w 0))}) 'v))) -- 1000
+(at (at (select {from: G where: (and (== kind "html") (== w 0))}) 'd) 0) -- 1000
+;; an outer clause that names x keeps it: the aggregate over x answers
+(set Gx (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) mx: (max x) asc: [kind w]}))
+(all (== (at Gx 'c) (at G 'c))) -- true
+(== (as 'STR (at (at Gx 'mx) 0)) (max (upper (as 'STR (at (select {from: T where: (and (like (lower URL) "*.html") (== w 0))}) 'URL))))) -- true
+;; an inner select that sorts keeps every output (a sort key may name one)
+(set Gs (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v asc: x}) by: [kind w] c: (count v) asc: [kind w]}))
+(all (== (at Gs 'c) (at G 'c))) -- true
+(cols (select {from: T lu: (lower URL) x: (upper URL) w: w asc: x})) -- ['lu 'x 'w]
+;; an outer select with no outputs of its own reads every column: all are built
+(set m0 (runs))
+(set Ga (select {from: (select {from: T lu: (lower URL) x: (upper URL) w: w})}))
+(- (runs) m0) -- 2
+(cols Ga) -- ['lu 'x 'w]
+;; an outer select that names one output gets that one
+(set m0 (runs))
+(set Gb (select {from: (select {from: T lu: (lower URL) x: (upper URL) w: w}) n: (count w)}))
+(- (runs) m0) -- 0
+(at (at Gb 'n) 0) -- 6000
