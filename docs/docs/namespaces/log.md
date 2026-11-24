@@ -81,7 +81,7 @@ The getter only reports. Whether a request is acknowledged while the journal is 
 
 Signature: `(.log.write expr)`. Serialises `expr` and appends a frame to the open journal.
 
-Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
+Errors: `limit` (`expr` nested deeper than 512 levels, or one that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output: a frame writes it out in full), `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
 
 Every inbound sync request is auto-journaled, and so is every async request while the [posts switch](#log-posts) is on; `.log.write` raises `domain` inside any of them. With the switch off, the default, an async request is not journaled and `.log.write` works inside it. Inside an auto-journaled IPC request the request itself is the journal entry and is re-evaluated on replay, so an extra frame would apply the change twice. Code shared between journaled request handlers and other paths tests `(.ipc.auto_journal_eval)` and skips its own write there:
 
@@ -135,6 +135,8 @@ log: WARN  snapshot skips 'G': it holds a process-local handle (graph, vector in
 ```
 
 The other globals are saved and the log rolls as usual. After a restart the skipped names are unbound, so rebuild them from saved data (for example in the boot script) before using them. Outside the snapshot nothing changes: a direct `(ser G)` fails with `domain`, and an IPC reply that holds a handle reaches the client as a `type` error ("result of type i64 is not serializable over IPC").
+
+The snapshot is the server's own data and writes every kept global in full: a value bound under several names is saved once per name, whatever its size, outside the [budget of repeated output](../data-types/collections.md#values-that-repeat-their-parts) that `ser` and `.log.write` keep. A global the serializer cannot write (one nested deeper than 512 levels) fails the snapshot with that error's own code and message, `limit` for the depth; nothing is written and the log does not roll.
 
 A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
 

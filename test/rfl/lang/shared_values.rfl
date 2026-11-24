@@ -1,0 +1,158 @@
+;; Values that hold one part at several positions on every level (#1627).
+;; Each level below holds the one before it twice, so a value of 60 levels
+;; is 61 lists with 2^60 paths through them.  A walk that descends into
+;; every element did work exponential in the depth and never finished; the
+;; walks whose answer is per part (hashing and its flags, equality,
+;; element-wise ops, in, not, and, or) now keep a shared part's answer and
+;; run in time linear in the parts, and the walks that write a value out in
+;; full (ser, json, format, show, print, a list column's save) may write
+;; shared parts out again for up to 1 GiB of extra output, and refuse a
+;; value that needs more with a limit error before they start.  Writing a
+;; part the first time is never counted, so a value without sharing is
+;; written whatever its size.
+
+(set S (list 1))
+(times 60 (set S (list S S)))
+(set S2 (list 1))
+(times 60 (set S2 (list S2 S2)))
+(set S3 (list 2))
+(times 60 (set S3 (list S3 S3)))
+(set bottom (fn [x] (let y x) (times 60 (let y (first y))) y))
+
+;; hashing, and the set verbs through it
+(count (distinct (list S S2 S3))) -- 2
+(count (group (list S S2 S3))) -- 2
+(count (except (list S S3) (list S2))) -- 1
+(count (union (list S) (list S2 S3))) -- 2
+(count (sect (list S S3) (list S2))) -- 1
+(bottom (first (in (list S S3) (list S2)))) -- [false]
+(count (select {c: (count v) from: (table [v] (list (list S S2 S3))) by: v})) -- 2
+
+;; equality
+(identical S S2) -- true
+(identical S S3) -- false
+
+;; element-wise ops: the answer shares as the operand does
+(bottom (== S S2)) -- [true]
+(bottom (== S S3)) -- [false]
+(bottom (+ S 1)) -- [2]
+(bottom (neg S)) -- [-1]
+(bottom (not S)) -- [false]
+(bottom (in S (list S2))) -- [false]
+(bottom (not-in S (list S2))) -- [true]
+(bottom (and S S2)) -- [true]
+(bottom (or S 0)) -- [true]
+
+;; dicts and tables that hold their part twice, and lists and dicts alternating
+(set M (dict [a b] (list 1 2)))
+(times 60 (set M (dict [a b] (list M M))))
+(set M2 (dict [a b] (list 1 2)))
+(times 60 (set M2 (dict [a b] (list M2 M2))))
+(count (distinct (list M M2))) -- 1
+(identical M M2) -- true
+(type (== M M2)) -- 'DICT
+(set T (table [a] (list (list 1))))
+(times 40 (set T (table [a b] (list (list T) (list T)))))
+(set T2 (table [a] (list (list 1))))
+(times 40 (set T2 (table [a b] (list (list T2) (list T2)))))
+(count (group (list T T2))) -- 1
+(identical T T2) -- true
+(set X (list 1))
+(times 30 (set X (dict [a b] (list (list X X) (list X X)))))
+(set X2 (list 1))
+(times 30 (set X2 (dict [a b] (list (list X2 X2) (list X2 X2)))))
+(count (distinct (list X X2))) -- 1
+(in (list X) (list X2)) -- [true]
+
+;; on pool threads
+(pmap (fn [x] (count (distinct (list x S2)))) (list S S3)) -- [1 2]
+(pmap (fn [x] (identical x S2)) (list S S3)) -- [true false]
+
+;; writing it out in full: refused.  ser's size pass counts what it would
+;; write again and refuses before writing; a text writer, at the first
+;; repeat it meets, takes a lower bound of the text it would write again
+;; and refuses there when that already passes 1 GiB, with the exact count
+;; as it writes behind it (the B8 case below)
+(ser S) !- limit
+(de (ser (list 1 S))) !- limit
+(repr S) !- limit
+(format "%" S) !- limit
+(.json.format S) !- limit
+(show S) !- limit
+(println S) !- limit
+(ser M) !- limit
+(ser X) !- limit
+(.json.format X) !- limit
+
+;; the journal refuses with the serializer's limit, and writes nothing
+(.sys.exec "rm -f /tmp/rfl_shared_values_log.*") -- 0
+(.log.open 'async "/tmp/rfl_shared_values_log")
+(.log.write S) !- limit
+(.log.close)
+(.sys.exec "rm -f /tmp/rfl_shared_values_log.* /tmp/rfl_shared_values_log") -- 0
+
+;; a list column's save: refused, with its reason
+(.sys.exec "rm -rf /tmp/rfl_shared_values_save") -- 0
+(try (.db.splayed.set "/tmp/rfl_shared_values_save/t/" (table [a] (list (list S S2)))) (fn [e] (get e 'msg))) -- "save: list column repeats shared parts beyond 1 GiB of extra output"
+(.sys.exec "rm -rf /tmp/rfl_shared_values_save") -- 0
+
+;; writing a shared part out again is budgeted: up to 1 GiB of extra output
+;; per operation.  A part written the first time is never counted.
+(set D (dict [a b] (list 1 2)))
+(count (de (ser (list D D D D)))) -- 4
+(.json.format (list D D)) -- "[{\"a\":1,\"b\":2},{\"a\":1,\"b\":2}]"
+(set l (list 1 2))
+(set A (map (fn [i] l) (til 1000000)))
+(count (de (ser A))) -- 1000000
+(set B (map (fn [i] D) (til 1000000)))
+(count (ser B)) -- 46000026
+(count (.json.format B)) -- 14000001
+(count (format "%" B)) -- 10000006
+(set C (map (fn [i] "abc") (til 1000000)))
+(count (de (ser C))) -- 1000000
+(.sys.exec "rm -rf /tmp/rfl_shared_values_wide") -- 0
+(count (.db.splayed.set "/tmp/rfl_shared_values_wide/t/" (table [c] (list B)))) -- 1000000
+(count (.db.splayed.get "/tmp/rfl_shared_values_wide/t/")) -- 1000000
+;; one level of sharing of a record of 30 small records: 20,000 rows are
+;; about 28 MB written out, inside the budget
+(set R (map (fn [i] (list i "ab" 'c 1.5)) (til 30)))
+(set W (map (fn [i] R) (til 20000)))
+(count (ser W)) -- 27800026
+(count (format "%" W)) -- 12540006
+(count (.db.splayed.set "/tmp/rfl_shared_values_wide/w/" (table [c] (list W)))) -- 20000
+(.sys.exec "rm -rf /tmp/rfl_shared_values_wide") -- 0
+;; ten thousand references to one 100,000-cell vector would write 8 GB out
+;; again: refused once the repeats pass 1 GiB, before anything is written
+(set v (til 100000))
+(set V (map (fn [i] v) (til 10000)))
+(ser V) !- limit
+;; what is charged is what is written: a symbol's text, a string's bytes,
+;; a string atom, all at their real length (a cell's width undercounted
+;; them).  About 1.1 GB written again in each, refused before writing.
+(set s1k (take "a" 1000))
+(set sv (as 'SYM (map (fn [i] s1k) (til 1000))))
+(ser (map (fn [i] sv) (til 1100))) !- limit
+(.sys.exec "rm -rf /tmp/rfl_shared_values_sym") -- 0
+(try (.db.splayed.set "/tmp/rfl_shared_values_sym/t/" (table [c] (list (map (fn [i] sv) (til 1100))))) (fn [e] (get e 'msg))) -- "save: list column repeats shared parts beyond 1 GiB of extra output"
+(.sys.exec "rm -rf /tmp/rfl_shared_values_sym") -- 0
+(set tv (as 'STR (map (fn [i] (take "b" 100000)) (til 100))))
+(ser (map (fn [i] tv) (til 120))) !- limit
+(set s1m (take "c" 1000000))
+(ser (take (list s1m) 1100)) !- limit
+(count (ser (take (list s1m) 100))) -- 100001026
+;; a table's string column copies each cell's text: 1,100 cells of one
+;; 1 MB string would copy it again for 1.1 GB, refused; 100 are built
+(table [c] (list (take (list s1m) 1100))) !- limit
+(count (at (table [c] (list (take (list s1m) 100))) 'c)) -- 100
+;; the text writers count the text they write: a 100,000-cell B8 vector is
+;; 100 KB in memory and 550 KB of text, so 2,000 references write 1.1 GB
+;; again (refused) and 1,000 write 550 MB (written)
+(set bv (as 'B8 (map (fn [i] (> i 50000)) (til 100000))))
+(format "%" (map (fn [i] bv) (til 2000))) !- limit
+(.json.format (map (fn [i] bv) (til 2000))) !- limit
+(count (format "%" (map (fn [i] bv) (til 1000)))) -- 550003006
+(.sys.exec "rm -rf /tmp/rfl_shared_values_vec") -- 0
+(try (.db.splayed.set "/tmp/rfl_shared_values_vec/t/" (table [c] (list V))) (fn [e] (get e 'msg))) -- "save: list column repeats shared parts beyond 1 GiB of extra output"
+(.sys.exec "rm -rf /tmp/rfl_shared_values_vec") -- 0
+;; sharing repeated level after level is refused
+(count (ser (list S S))) !- limit

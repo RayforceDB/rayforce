@@ -438,7 +438,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `list` | variadic | — | Create a list from vectors (column data for tables) | `(list [1 2] ['a 'b])` |
-| `table` | binary | — | Create table from column names and list of vectors | `(table [x y] (list [1 2] ['a 'b]))` |
+| `table` | binary | — | Create table from column names and list of vectors; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(table [x y] (list [1 2] ['a 'b]))` |
 | `dict` | binary | — | Create dictionary from evaluated keys and values vectors | `(dict ['a 'b] [1 2])` |
 | `key` | unary | — | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | — | Get table column names | `(cols trades)` → `[sym price size time date]` |
@@ -666,10 +666,10 @@ Printing, file I/O, CSV loading, and script execution.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `println` | variadic | — | Print values with newline | `(println "hello" 42)` |
-| `print` | unary | — | Print value without newline | `(print "hello")` |
-| `show` | variadic | — | Pretty-print a value (tables formatted) | `(show trades)` |
-| `format` | variadic | — | Format value to string (% as placeholder) | `(format "val=%" 42)` → `"val=42"` |
+| `println` | variadic | — | Print values with newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(println "hello" 42)` |
+| `print` | unary | — | Print value without newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(print "hello")` |
+| `show` | variadic | — | Pretty-print a value (tables formatted); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(show trades)` |
+| `format` | variadic | — | Format value to string (% as placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | `read` | unary | restricted | Read file contents as string, to EOF | `(read "/proc/self/cmdline")` |
@@ -748,9 +748,9 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads | `(ser [1 2 3])` |
+| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
-| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
+| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
 | `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | — | JSON text to a value (object to dict with string keys, array to a vector or list); element-wise over a string vector; strict, the limits of `read-value`. See [`.json.*`](../namespaces/json.md) | `(.json.parse "{\"a\":[1,2]}")` → `(dict ["a"] (list [1 2]))` |

@@ -123,8 +123,18 @@ bool ray_serde_holds_handle(ray_t* obj);
  * the log recovers.  Returns the previous setting. */
 bool ray_serde_keep_marks(bool on);
 
+/* Whether the size pass charges a value's repeated parts to the budget of
+ * repeated output (#1627), on this thread.  On by default.  The trusted
+ * local writers that write the whole environment (the journal snapshot,
+ * and its handle probe) turn it off: a value bound under several names is
+ * saved as it is, whatever its size.  Returns the previous setting. */
+bool ray_serde_charge_repeats(bool on);
+
 /* File I/O: save/load any object in binary format */
 ray_err_t ray_obj_save(ray_t* obj, const char* path);
+/* ray_obj_save; when the serializer refuses obj, *err (if non-NULL)
+ * receives its error (its code and message), owned by the caller. */
+ray_err_t ray_obj_save_ex(ray_t* obj, const char* path, ray_t** err);
 ray_t*    ray_obj_load(const char* path);
 
 #endif /* RAY_SERDE_H */

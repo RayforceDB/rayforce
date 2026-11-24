@@ -32,6 +32,9 @@
 #include "core/types.h"
 #include "mem/heap.h"
 #include "core/platform.h"   /* ray_stack_short: the depth guard */
+#include "ops/walkmemo.h"    /* RAY_DUP_BUDGET */
+
+static int64_t ser_size(ray_t* obj);   /* the size pass, below */
 #include "table/table.h"
 #include "vec/str.h"
 #include "vec/vec.h"
@@ -511,7 +514,7 @@ static int64_t serde_parted_col_size(const serde_parted_t* x, ray_t* col) {
         else if (type == RAY_LIST) {
             ray_t** elems = (ray_t**)ray_data(seg);
             for (int64_t i = 0; i < seg->len; i++) {
-                int64_t child = ray_serde_size(elems[i]);
+                int64_t child = ser_size(elems[i]);
                 if (child <= 0) return child;
                 size += child;
             }
@@ -642,7 +645,7 @@ static int64_t serde_parted_cols_size(ray_t* tbl) {
     for (int64_t c = 0; c < x.ncols; c++) {
         ray_t* col = serde_pcol(&x, c);
         int64_t child = serde_col_is_parted(col) ? serde_parted_col_size(&x, col)
-                                                 : ray_serde_size(col);
+                                                 : ser_size(col);
         if (child <= 0) return child;
         size += child;
     }
@@ -688,9 +691,21 @@ static int64_t ser_note_handle(void) {
     return 0;
 }
 
+/* The probe is a size pass of its own (ray_serde_size: its own memo, its
+ * own budget), in probe mode: a shared part met again is not charged, so
+ * the budget never stops the walk before a handle, and nothing carries
+ * over to the next probe or the next size pass (#1627). */
+static _Thread_local bool g_ser_uncharged;
+bool ray_serde_charge_repeats(bool on) {
+    bool was = !g_ser_uncharged;
+    g_ser_uncharged = !on;
+    return was;
+}
 bool ray_serde_holds_handle(ray_t* obj) {
     g_ser_handle_hit = false;
+    bool was = ray_serde_charge_repeats(false);
     (void)ray_serde_size(obj);
+    (void)ray_serde_charge_repeats(was);
     bool hit = g_ser_handle_hit;
     g_ser_handle_hit = false;
     g_ser_fail_code[0] = '\0';
@@ -713,7 +728,7 @@ static int64_t ser_table_cols_size(ray_t* tbl, ray_t* cols_list) {
     for (int64_t c = 0; c < nc; c++) {
         ray_t* col = ray_table_col_idx(tbl, c);
         if (col && RAY_IS_ERR(col)) return ser_note_col_failure(col);
-        int64_t child = ray_serde_size(col);
+        int64_t child = ser_size(col);
         if (child <= 0) return child;
         size += child;
     }
@@ -772,13 +787,56 @@ static bool ser_too_deep(const ray_t* obj) {
     return true;
 }
 
-int64_t ray_serde_size(ray_t* obj) {
+static int64_t ser_size_body(ray_t* obj) {
     if (!ser_container(obj)) return serde_size_impl(obj);
     if (!ser_depth_fine(obj) && ser_too_deep(obj)) return -1;
     g_ser_depth++;
     int64_t r = serde_size_impl(obj);
     g_ser_depth--;
     return r;
+}
+
+/* The wire format writes a value out in full, a shared part again each
+ * time it is met (#1627, ops/walkmemo.h).  The size pass, which is exact,
+ * keeps each shared part's size the first time; a later visit is charged
+ * that size, the bytes the write pass will write for it again, and is not
+ * walked again, so the size pass stays linear in the distinct parts.  Past
+ * RAY_DUP_BUDGET of such bytes the value is refused before any is written. */
+static _Thread_local ray_walk_memo_t g_ser_memo;
+static _Thread_local uint64_t g_ser_dup;
+__attribute__((noinline)) static int64_t ser_size_shared(ray_t* obj) {
+    /* only inside a size pass that ray_serde_size opened */
+    RAY_WM_ASSERT(g_ser_memo.active && "ser_size outside ray_serde_size");
+    uint64_t v;
+    if (ray_wm_get(&g_ser_memo, obj, NULL, 0, &v)) {
+        if (g_ser_uncharged) return (int64_t)v;   /* the probe, or a trusted save */
+        g_ser_dup = g_ser_dup > UINT64_MAX - v ? UINT64_MAX : g_ser_dup + v;
+        if (g_ser_dup > RAY_DUP_BUDGET)
+            return ser_note_col_failure(ray_error("limit",
+                "serialize: value repeats shared parts beyond 1 GiB of extra output"));
+        return (int64_t)v;
+    }
+    int64_t r = ser_size_body(obj);
+    if (r > 0) ray_wm_put(&g_ser_memo, obj, NULL, 0, (uint64_t)r);
+    return r;
+}
+
+static int64_t ser_size(ray_t* obj) {
+    if (obj && RAY_UNLIKELY(obj->rc != 1) && !RAY_IS_ERR(obj) &&
+        (obj->type >= 0 ? obj->type < RAY_LAMBDA : obj->type == -RAY_STR))
+        return ser_size_shared(obj);
+    return ser_size_body(obj);
+}
+
+int64_t ray_serde_size(ray_t* obj) {
+    if (RAY_UNLIKELY(!g_ser_memo.active)) {   /* the outermost size pass */
+        ray_wm_begin(&g_ser_memo);
+        g_ser_dup = 0;
+        int64_t r = ser_size(obj);
+        ray_wm_end(&g_ser_memo);
+        return r;
+    }
+    return ser_size(obj);   /* inside a size pass (the size of a part): the same walk */
 }
 
 int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
@@ -860,7 +918,7 @@ static int64_t serde_size_impl(ray_t* obj) {
         int64_t size = 1 + 1 + 8;
         ray_t** elems = (ray_t**)ray_data(obj);
         for (int64_t i = 0; i < obj->len; i++) {
-            int64_t child = ray_serde_size(elems[i]);
+            int64_t child = ser_size(elems[i]);
             if (child <= 0) return child;
             size += child;
         }
@@ -879,21 +937,21 @@ static int64_t serde_size_impl(ray_t* obj) {
     case RAY_DICT: {
         /* type + attrs + keys(recursive) + vals(recursive) */
         ray_t** slots = (ray_t**)ray_data(obj);
-        int64_t keys = ray_serde_size(slots[0]);
+        int64_t keys = ser_size(slots[0]);
         if (keys <= 0) return keys;
-        int64_t vals = ray_serde_size(slots[1]);   /* not-a-table */
+        int64_t vals = ser_size(slots[1]);   /* not-a-table */
         if (vals <= 0) return vals;
         return 1 + 1 + keys + vals;
     }
     case RAY_LAMBDA: {
         ray_t** slots = (ray_t**)ray_data(obj);
-        int64_t params = ray_serde_size(slots[0]);
+        int64_t params = ser_size(slots[0]);
         if (params <= 0) return params;
-        int64_t body = ray_serde_size(slots[1]);   /* not-a-table */
+        int64_t body = ser_size(slots[1]);   /* not-a-table */
         if (body <= 0) return body;
         int64_t size = 1 + 1 + params + body;
         if (LAMBDA_CLOSURE(obj)) {
-            int64_t closure = ray_serde_size(LAMBDA_CLOSURE(obj));
+            int64_t closure = ser_size(LAMBDA_CLOSURE(obj));
             if (closure <= 0) return closure;
             size += closure;
         }
@@ -1888,6 +1946,11 @@ ray_t* ray_de(ray_t* bytes) {
  * -------------------------------------------------------------------------- */
 
 ray_err_t ray_obj_save(ray_t* obj, const char* path) {
+    return ray_obj_save_ex(obj, path, NULL);
+}
+
+ray_err_t ray_obj_save_ex(ray_t* obj, const char* path, ray_t** err) {
+    if (err) *err = NULL;
     bool owned = false;
     if (ray_is_lazy(obj)) {
         ray_retain(obj);
@@ -1902,9 +1965,15 @@ ray_err_t ray_obj_save(ray_t* obj, const char* path) {
 
     ray_t* bytes = ray_ser(obj);
     if (!bytes || RAY_IS_ERR(bytes)) {
-        if (bytes && RAY_IS_ERR(bytes)) ray_error_free(bytes);
+        ray_err_t code = RAY_ERR_DOMAIN;
+        if (bytes && RAY_IS_ERR(bytes)) {
+            code = ray_err_from_obj(bytes);
+            if (code == RAY_OK) code = RAY_ERR_DOMAIN;
+            if (err) *err = bytes;   /* its code and message, to the caller */
+            else ray_error_free(bytes);
+        }
         if (owned) ray_release(obj);
-        return RAY_ERR_DOMAIN;
+        return code;
     }
 
     FILE* f = fopen(path, "wb");
