@@ -3222,12 +3222,11 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
-/* A vector condition of the evaluator's `if` inside a query, over its rows
- * (#1630).  This `if` cannot choose per row: tested whole, any non-empty
- * vector is true, so every row took the first arm.  The query's planned
- * routes and its per-row pass choose per row; what reaches this `if` with
- * such a vector is a shape neither covers (language/control-flow.md names
- * them).  A condition true on some rows and false on others is an error.
+/* A vector condition tested whole by a bytecode jump inside a query, over its
+ * rows (#1630): the condition of a jump other than `if`'s (`if` chooses per
+ * row for a boolean vector, ray_cond_rows).  Tested whole, any non-empty
+ * vector is true, so such a condition ran on the first row's say.  A condition
+ * true on some rows and false on others is an error.
  * One true on every row, or false on every row, has one arm for all of them:
  * *truth is set to 1 or 0, the arm each row takes.  A vector of another
  * length, or one not derived from the rows (`rows` 0: a global, a literal),
@@ -3261,10 +3260,10 @@ static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows
     return NULL;
 }
 
-/* The bytecode `if`'s test of a vector condition (op_jmpf), as ray_cond_fn
- * tests one: counted toward rows_cond, and inside a query a condition over
- * its rows goes through cond_rows_test.  Consumes `cond`; an error goes to
- * *err. */
+/* The bytecode jump's test of a vector condition (op_jmpf, the jumps other than
+ * `if`'s, which takes OP_JMPFV): counted toward rows_cond, and inside a query a
+ * condition over its rows goes through cond_rows_test.  Consumes `cond`; an
+ * error goes to *err. */
 static __attribute__((noinline)) int vm_cond_test(ray_t* cond, uint8_t rows, ray_t** err) {
     __VM->rows_cond++;   /* a vector tested whole */
     int truth = -1;
