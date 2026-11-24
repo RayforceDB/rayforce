@@ -1471,6 +1471,79 @@ static test_result_t test_ipc_journal_replay_skips_sync_hook(void) {
     return r;
 }
 
+/* ---- #1609: a snapshot keeps a stored argument's literal-fallback mark ----
+ * A handler stores the argument lists of two requests.  They carry the mark,
+ * so evaluating one later gives the list back as data, live and after the
+ * log replays.  A snapshot must keep the mark too: recovering from it gives
+ * the live answer, not `type` ("head is not callable"). */
+static void j1609_boot(void) {
+    ray_t* b = ray_eval_str("(do (set __j1609_a 42) (set __j1609_S (list))"
+                            " (set __j1609_keep (fn [m] (set __j1609_S (concat __j1609_S (list m)))"
+                            " (count __j1609_S))) 0)");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+}
+
+/* What evaluating the stored lists gives, and the stored lists themselves. */
+static ray_t* j1609_state(void) {
+    return ray_eval_str("(repr (list (try (eval (first __j1609_S)) (fn [e] (at e 'msg)))"
+                        " (try (eval (last __j1609_S)) (fn [e] (at e 'msg))) __j1609_S))");
+}
+
+static test_result_t test_ipc_journal_snapshot_literal_args(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1609");
+    ipc_rm_journal(jbase);
+    j1609_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    /* a head bound to a global that is not a function, flat and nested */
+    static const char* const reqs[] = {
+        "(list '__j1609_keep (list '__j1609_a 1 2))",
+        "(list '__j1609_keep (list '__j1609_a (list '__j1609_a 3) 2))",
+    };
+    bool sent = true;
+    for (int i = 0; i < 2; i++) {
+        ray_t* m = ray_eval_str(reqs[i]);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        ray_t* r = ray_ipc_send(h, m);
+        ray_release(m);
+        sent &= r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == i + 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    }
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1609_state();
+    ray_err_t snap = ray_journal_snapshot();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* recovery (-l) from the snapshot: the log was rolled, so the state is
+     * the snapshot's alone */
+    j1609_boot();
+    ray_err_t reopened = ray_journal_open(jbase, RAY_JOURNAL_ASYNC);
+    ray_t* rec = j1609_state();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_TRUE(sent);
+    TEST_ASSERT_EQ_I(snap, RAY_OK);
+    TEST_ASSERT_EQ_I(reopened, RAY_OK);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_TRUE(rec && !RAY_IS_ERR(rec) && rec->type == -RAY_STR);
+    /* evaluating a stored argument gives it back as data */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"__j1609_a\") 1 2)"
+                       " (list (as 'SYM \"__j1609_a\") (list (as 'SYM \"__j1609_a\") 3) 2)"
+                       " (list (list (as 'SYM \"__j1609_a\") 1 2)"
+                       " (list (as 'SYM \"__j1609_a\") (list (as 'SYM \"__j1609_a\") 3) 2)))");
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rec), ray_str_ptr(live));
+    ray_release(live);
+    ray_release(rec);
+    PASS();
+}
+
 /* ---- test_ipc_decompress_literal_overrun -------------------------------- */
 /*
  * Exercise the literal-block overrun guard in ray_ipc_decompress
@@ -4082,6 +4155,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/journal_path",               test_ipc_journal_path,                   ipc_setup, ipc_teardown },
     { "ipc/journal_replay_literal_args", test_ipc_journal_replay_literal_args, ipc_setup, ipc_teardown },
     { "ipc/journal_replay_skips_sync_hook", test_ipc_journal_replay_skips_sync_hook, ipc_setup, ipc_teardown },
+    { "ipc/journal_snapshot_literal_args", test_ipc_journal_snapshot_literal_args, ipc_setup, ipc_teardown },
     { "ipc/decompress_literal_overrun", test_ipc_decompress_literal_overrun,     ipc_setup, ipc_teardown },
     { "ipc/compress_small",             test_ipc_compress_small,                 ipc_setup, ipc_teardown },
     { "ipc/compress_incompressible",    test_ipc_compress_incompressible,        ipc_setup, ipc_teardown },

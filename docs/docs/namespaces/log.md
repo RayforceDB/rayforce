@@ -122,7 +122,12 @@ Limits:
 - A crash after a request's trusted calls ran but before its note was written replays that request with no lifted call; its client got no answer.
 - A binary that predates notes reads each one as an extra log entry: the note evaluates to its vector of integers, changes nothing and is counted among the replayed entries. Such a binary also loads the snapshot's lambdas unmarked.
 
-Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
+Recovery runs before the boot script, so a verb the boot script defines exists during replay only through a snapshot that holds it. The mark is kept only in the snapshot; `ser`, `de` and IPC never carry it.
+
+A list that arrived as an IPC request argument evaluates to itself when its head does not resolve or names a global that is not a function (see [`.log.replay`](#log-replay)). A handler that stores such a list stores that behaviour with it, and the snapshot keeps it too. With `a` bound to `42`, a handler that appends its argument to `S`, and a request `(keep (a 1 2))`, `(eval (first S))` gives `(a 1 2)` live, after recovery from the log, and after recovery from a snapshot. Like the trust mark, it is written only into the snapshot: `ser`, `de`, IPC and journal entries never carry it.
+
+!!! note "Snapshots written by an earlier build"
+    Earlier builds did not write this mark, so recovering from a snapshot evaluated such a stored list as a call: `(eval (first S))` raised `type` (`head is not callable, got i64`). A snapshot written by an earlier build still recovers that way, because it never held the mark. Take a new snapshot to keep it. An earlier build reading a snapshot written by this build ignores the mark and recovers as it did before. A note is written only by the server's own journal, and a frame of that type arriving on a connection closes it.
 
 Errors: `domain` (no journal open), `io`.
 

@@ -267,7 +267,7 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
     ray_t* parts[3] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda), LAMBDA_CLOSURE(lambda) };
     /* Without the snapshot's trust bits, whoever asks: a captured trusted
      * lambda hashes the same live and while a snapshot loads. */
-    bool keep = ray_serde_keep_trust(false);
+    bool keep = ray_serde_keep_marks(false);
     bool ok = true;
     for (int i = 0; i < 3 && ok; i++) {
         ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
@@ -280,7 +280,7 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
         }
         h = trust_hash(h, &i, sizeof i);   /* the part ends here */
     }
-    ray_serde_keep_trust(keep);
+    ray_serde_keep_marks(keep);
     if (!ok) return 0;
     /* Never 0, which means untrusted; bit 0 is "trusted by name". */
     return (h << 2) | 2 | (name >= 0 ? 1 : 0);
@@ -757,7 +757,7 @@ static ray_t* head_not_callable_error(int8_t type) {
  * the caller's scope frames and query (lambda_lifts).
  * The builtin is restricted itself, so only unrestricted code, a boot
  * script, can mark.  The mark lives on the lambda object: ser/de and IPC
- * do not carry it (a journal snapshot does, ray_serde_keep_trust), a
+ * do not carry it (a journal snapshot does, ray_serde_keep_marks), a
  * closure the body makes does not get it, and a lambda a request builds
  * has none.  A name means the global bound to it, as at
  * the top level, never a local of the caller, and is not dotted; each
