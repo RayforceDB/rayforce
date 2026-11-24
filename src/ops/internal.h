@@ -1865,6 +1865,9 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Runs of the per-distinct-code string path (ops/string.c, sym_map_by_code)
+ * that served since process start: (.sys.mem)'s sym-map-runs. */
+int64_t ray_string_sym_map_runs(void);
 /* Serial grouping invocations that used exact boxed-I64 hashing. */
 int64_t ray_group_boxed_i64_runs(void);
 /* Monotonic count of exec_group_per_partition runs that returned their

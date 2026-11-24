@@ -1502,13 +1502,31 @@ static inline uint32_t sym_map_olen(const sym_map_op_t* m, uint64_t sl) {
     return b > UINT32_MAX ? UINT32_MAX : (uint32_t)b;
 }
 
+/* The passes over the marked entries are dispatched in UNITS of eight
+ * positions (a byte of the bitmap), so a vocabulary of a million codes
+ * splits into tasks of RAY_MORSEL_ELEMS units (8192 entries), not two
+ * tasks of half the words each.  A task's range is a whole number of
+ * grains, each a multiple of eight units (ray_pool_dispatch_grain's
+ * contract), and the unit count a multiple of eight: the words a range
+ * covers are whole, [lo / 8, hi / 8). */
+#define SYM_MAP_UNIT_LOG 3
+
+static void sym_map_run_units(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
+                              sym_map_ctx_t* c, int64_t n_units) {
+    if (ray_pool_par_dispatch_ok(pool, n_units << SYM_MAP_UNIT_LOG, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch_grain(pool, fn, c, n_units, RAY_MORSEL_ELEMS);
+    else
+        fn(c, 0, 0, n_units);
+}
+
 /* The bound on each marked entry's output, by rank: a file's lengths from
- * its index (no string read), any other's from its atom. */
+ * its index (no string read), any other's from its atom.  Over units. */
 static void sym_map_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
     sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
-    for (int64_t w = lo; w < hi; w++) {
-        if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
+    int64_t w0 = lo >> SYM_MAP_UNIT_LOG, w1 = (hi + 7) >> SYM_MAP_UNIT_LOG;
+    for (int64_t w = w0; w < w1; w++) {
+        if (((w - w0) & 63) == 0 && pool_cancelled(c->pool)) return;
         uint64_t bits = c->bm[w];
         if (!bits) continue;
         int64_t k = c->base[w];
@@ -1536,13 +1554,15 @@ static void sym_map_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
  * batch's pointers, lengths and hashes.  A compressed file's entries are
  * decoded one at a time (the thread's ring holds few), any other's read in
  * blocks.  An entry whose output would not fit its bound (the bound is
- * exact or larger; only a 4 GB string is clipped) is cut at the bound. */
+ * exact or larger; only a 4 GB string is clipped) is cut at the bound.
+ * Over the chunk's units, from the chunk's first word. */
 static void sym_map_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
     sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
     bool one_at_a_time = c->rd.raw_ok && c->rd.raw.z;
-    for (int64_t w = c->w0 + lo; w < c->w0 + hi; w++) {
-        if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
+    int64_t w0 = c->w0 + (lo >> SYM_MAP_UNIT_LOG), w1 = c->w0 + ((hi + 7) >> SYM_MAP_UNIT_LOG);
+    for (int64_t w = w0; w < w1; w++) {
+        if (((w - w0) & 63) == 0 && pool_cancelled(c->pool)) return;
         uint64_t bits = c->bm[w];
         if (!bits) continue;
         int64_t k = (int64_t)c->base[w] - c->r0;
@@ -1600,6 +1620,13 @@ static void sym_map_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, i
     else                                                           fn(c, 0, 0, n);
 }
 
+/* Runs of the per-code path that served (O(1)); (.sys.mem)'s sym-map-runs,
+ * so a test can assert how many times a query transformed a column. */
+static _Atomic(int64_t) ray_string_sym_map_runs_ctr = 0;
+int64_t ray_string_sym_map_runs(void) {
+    return atomic_load_explicit(&ray_string_sym_map_runs_ctr, memory_order_relaxed);
+}
+
 static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
     int64_t nrows = input->len;
     ray_pool_t* pool = ray_pool_get();
@@ -1619,6 +1646,7 @@ static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
     if (!c.bm) goto out;
     atomic_init(&c.bad, 0);
     sym_map_run(pool, sym_map_mark, &c, nrows);
+    ray_profile_tick("sym map: codes marked");
     if (pool_cancelled(pool)) { rc = -1; goto out; }
     if (atomic_load_explicit(&c.bad, memory_order_relaxed)) goto out;
     int32_t* base = (int32_t*)scratch_alloc(&base_hdr, (size_t)c.words * sizeof(int32_t));
@@ -1629,7 +1657,8 @@ static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
     c.base = base;
     c.olen = (uint32_t*)scratch_alloc(&olen_hdr, (size_t)K * sizeof(uint32_t));
     if (!c.olen) goto out;
-    sym_map_run(pool, sym_map_len, &c, c.words);
+    sym_map_run_units(pool, sym_map_len, &c, c.words << SYM_MAP_UNIT_LOG);
+    ray_profile_tick("sym map: lengths read");
     if (pool_cancelled(pool)) { rc = -1; goto out; }
     int32_t* ids = (int32_t*)scratch_alloc(&ids_hdr, (size_t)K * sizeof(int32_t));
     if (!ids) goto out;
@@ -1674,12 +1703,14 @@ static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
             off[0] = 0;
             for (int64_t r = 0; r < n; r++) off[r + 1] = off[r] + c.olen[r0 + r];
             c.w0 = w0; c.r0 = r0;
-            sym_map_run(pool, sym_map_cut, &c, w1 - w0);
+            sym_map_run_units(pool, sym_map_cut, &c, (w1 - w0) << SYM_MAP_UNIT_LOG);
+            ray_profile_tick("sym map: chunk transformed");
             if (pool_cancelled(pool)) { rc = -1; goto out; }
             if (!ray_sym_domain_intern_batch(kdom, n, c.strs, c.lens, c.hashes, pos)) {
                 rc = pool_cancelled(pool) ? -1 : 0;
                 goto out;
             }
+            ray_profile_tick("sym map: chunk interned");
             for (int64_t j = 0; j < n; j++) {
                 if (pos[j] < 0 || pos[j] > INT32_MAX) goto out;
                 ids[r0 + j] = (int32_t)pos[j];
@@ -1718,7 +1749,9 @@ static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
         c.dst = ray_data(res);
         c.dst_attrs = res->attrs;
         sym_map_run(pool, sym_map_fill, &c, nrows);
+        ray_profile_tick("sym map: rows filled");
         if (pool_cancelled(pool)) { ray_release(res); rc = -1; goto out; }
+        atomic_fetch_add_explicit(&ray_string_sym_map_runs_ctr, 1, memory_order_relaxed);
         *out = res;
         rc = 1;
     }
