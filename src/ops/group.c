@@ -9217,6 +9217,15 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
              * AVG/VAR/STDDEV) must surface a typed null instead of leaking
              * the accumulator seed (DBL_MAX / -DBL_MAX / 0). */
             int64_t nn = nn_counts ? nn_counts[idx] : counts[gi];
+            /* A keyless prod over no non-null row is the empty product, as
+             * the builtin and the evaluator give it (#1613).  A by: group
+             * whose rows are all null keeps its null. */
+            if (agg_op == OP_PROD && nn == 0 && ext->n_keys == 0) {
+                if (out_type == RAY_F64) ((double*)ray_data(new_col))[gi] = 1.0;
+                else topk_write_i64(ray_data(new_col), gi, 1,
+                                    ray_sym_elem_size(out_type, new_col->attrs));
+                continue;
+            }
             if (out_type == RAY_F64 || out_type == RAY_F32) {
                 double v;
                 switch (agg_op) {

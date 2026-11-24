@@ -423,6 +423,17 @@ key meets the rows the filter keeps):
 (select {s: (sum x) by: K3 from: t})                       ; error: length
 ```
 
+A keyless `prod` whose rows are all null is the empty product, `1` (`1.0`
+for a float input), as the builtin `(prod [0Nl 0Nl])` is, with or without
+`where:`. Under `by:` a group whose rows are all null keeps the null
+(`0Nl`, `0Nf`) for `prod`, as for `min`, `max`, `first`, `last` and `avg`:
+
+```lisp
+(set t (table [k c] (list [0 0 1 1] [2 3 0Nl 0Nl])))
+(select {p: (prod c) from: t where: (== k 1)})              ; p [1]
+(select {p: (prod c) from: t by: k})                        ; k [0 1], p [6 0Nl]
+```
+
 ### Aggregate sources
 
 What an aggregate reads depends on what its argument is. A column, or an
