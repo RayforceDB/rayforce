@@ -155,6 +155,12 @@ LIST is read as follows:
 Casting to `STR` produces a flat string vector by the same rule:
 `(as 'STR (list [1] 'a))` is `["1" "a"]`.
 
+A cast of a LIST column in a query is this cast of the whole column, on
+every route: a select projection, under `where:` (of the rows it keeps),
+`update` and `by:`. With `T: (table [c] (list (list [1] () 3)))`,
+`(select {r: (as 'F64 c) from: T})` gives `r` `[1.0 0Nf 3.0]`, as
+`(as 'F64 (at T 'c))` does.
+
 ```lisp
 ; Cast an integer vector to float
 (as 'f64 [1 2 3])     ; [1.0 2.0 3.0]
