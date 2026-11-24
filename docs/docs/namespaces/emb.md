@@ -80,7 +80,7 @@ Signature: `(.emb.hnsw.free handle)`. Releases the index now. Optional: a handle
 
 ## Text into vectors
 
-A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernels `mmu` and `gram` have. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
+A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernel `mmu` has. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
 
 ```lisp
 (set m (.emb.model.get "models/my-encoder"))

@@ -251,72 +251,129 @@ static __attribute__((noinline)) T dot_##SUF(const T* a, const T* b, int64_t n) 
 DEF_DOT(f64, double)
 DEF_DOT(f32, float)
 
-#define DEF_GEMM(SUF, T)                                                      \
-/* C[i0:i1, :] += A[i0:i1, :] * B, a tile of columns at a time. */            \
-static void gemm_tiled_##SUF(const lin_t* A, const lin_t* B, T* C,            \
-                             int64_t k, int64_t c, int64_t i0, int64_t i1) {  \
-    for (int64_t j0 = 0; j0 < c; j0 += LIN_JTILE) {                           \
-        int64_t j1 = j0 + LIN_JTILE < c ? j0 + LIN_JTILE : c;                 \
-        int64_t i = i0;                                                       \
-        /* Four rows of A against four of B: each row of B is read once for   \
-         * sixteen products, where a row of A at a time reads it for four. */ \
-        for (; i + 4 <= i1; i += 4) {                                         \
-            T* restrict C0 = C + i * c;                                       \
-            T* restrict C1 = C + (i + 1) * c;                                          \
-            T* restrict C2 = C + (i + 2) * c;                                          \
-            T* restrict C3 = C + (i + 3) * c;                                          \
-            const T* A0 = (const T*)A->rp[i];                                 \
-            const T* A1 = (const T*)A->rp[i + 1];                             \
-            const T* A2 = (const T*)A->rp[i + 2];                             \
-            const T* A3 = (const T*)A->rp[i + 3];                             \
-            int64_t l = 0;                                                    \
-            for (; l + 4 <= k; l += 4) {                                      \
-                const T* B0 = (const T*)B->rp[l];                             \
-                const T* B1 = (const T*)B->rp[l + 1];                         \
-                const T* B2 = (const T*)B->rp[l + 2];                         \
-                const T* B3 = (const T*)B->rp[l + 3];                         \
-                T a00 = A0[l], a01 = A0[l + 1], a02 = A0[l + 2], a03 = A0[l + 3];\
-                T a10 = A1[l], a11 = A1[l + 1], a12 = A1[l + 2], a13 = A1[l + 3];\
-                T a20 = A2[l], a21 = A2[l + 1], a22 = A2[l + 2], a23 = A2[l + 3];\
-                T a30 = A3[l], a31 = A3[l + 1], a32 = A3[l + 2], a33 = A3[l + 3];\
-                for (int64_t j = j0; j < j1; j++) {                           \
-                    T b0 = B0[j], b1 = B1[j], b2 = B2[j], b3 = B3[j];         \
-                    C0[j] += a00 * b0 + a01 * b1 + a02 * b2 + a03 * b3;       \
-                    C1[j] += a10 * b0 + a11 * b1 + a12 * b2 + a13 * b3;       \
-                    C2[j] += a20 * b0 + a21 * b1 + a22 * b2 + a23 * b3;       \
-                    C3[j] += a30 * b0 + a31 * b1 + a32 * b2 + a33 * b3;       \
-                }                                                             \
-            }                                                                 \
-            for (; l < k; l++) {                                              \
-                const T* Bl = (const T*)B->rp[l];                             \
-                T a0 = A0[l], a1 = A1[l], a2 = A2[l], a3 = A3[l];             \
-                for (int64_t j = j0; j < j1; j++) {                           \
-                    T b = Bl[j];                                              \
-                    C0[j] += a0 * b; C1[j] += a1 * b; C2[j] += a2 * b; C3[j] += a3 * b;\
-                }                                                             \
-            }                                                                 \
+/* Vector types of the rows' own width (four doubles, or eight floats), for
+ * the kernels the autovectoriser does not find the shape of. */
+typedef double lin_v4d __attribute__((vector_size(32), aligned(8)));
+typedef float  lin_v8f __attribute__((vector_size(32), aligned(4)));
+/* Macros, not functions: a 32-byte vector passed or returned by value changes
+ * the ABI without AVX (-Wpsabi, an error under -Werror on baseline x86-64). */
+#define ld_f64(p) (*(const lin_v4d*)(p))
+#define ld_f32(p) (*(const lin_v8f*)(p))
+
+/* ---- the product's kernel -------------------------------------------------
+ *
+ * C += A * B with a block of C held in registers: four rows by three vectors
+ * (24 floats, or 12 doubles).  For each step along the shared dimension the
+ * block takes one number from each of its four rows of A and three vectors
+ * of B: twelve multiply-adds for three loads, and nothing of C is loaded or
+ * stored inside the loop.  Twelve sums, three vectors of B and one of A are
+ * the sixteen registers AVX2 has.
+ *
+ * B is not read where it lies.  The strip of it under the block's columns is
+ * packed first, LIN_KC steps of the shared dimension at a time, into a block
+ * of its own that stays in L1 while every row of A passes over it; the copy
+ * is one pass for a strip that is then used once for each four rows.  Packing
+ * is also what lets B lie either way: as rows [k x n], or on its side as
+ * [n x k], which is how a model's file holds a layer's weights. */
+#define LIN_KC 256
+
+#define DEF_MICRO(SUF, T, V, W)                                               \
+static inline __attribute__((always_inline)) void                             \
+micro_##SUF(const T* const* a, const int rows, const T* restrict p,           \
+            const int nv, int64_t kb, T* c, int64_t cs) {                     \
+    V acc[4][3];                                                              \
+    for (int x = 0; x < rows; x++)                                            \
+        for (int y = 0; y < nv; y++) acc[x][y] = ld_##SUF(c + x * cs + y * W); \
+    for (int64_t l = 0; l < kb; l++) {                                        \
+        V b[3];                                                               \
+        for (int y = 0; y < nv; y++) b[y] = ld_##SUF(p + l * nv * W + y * W); \
+        for (int x = 0; x < rows; x++) {                                      \
+            V s = (V){0} + a[x][l];                                           \
+            for (int y = 0; y < nv; y++) acc[x][y] += s * b[y];               \
         }                                                                     \
-        for (; i < i1; i++) {                                                 \
-            T* restrict Ci = C + i * c;                                       \
-            const T* Ai = (const T*)A->rp[i];                                 \
-            int64_t l = 0;                                                    \
-            for (; l + 4 <= k; l += 4) {                                      \
-                T a0 = Ai[l], a1 = Ai[l + 1], a2 = Ai[l + 2], a3 = Ai[l + 3]; \
-                const T* B0 = (const T*)B->rp[l];                             \
-                const T* B1 = (const T*)B->rp[l + 1];                         \
-                const T* B2 = (const T*)B->rp[l + 2];                         \
-                const T* B3 = (const T*)B->rp[l + 3];                         \
-                for (int64_t j = j0; j < j1; j++)                             \
-                    Ci[j] += a0 * B0[j] + a1 * B1[j] + a2 * B2[j] + a3 * B3[j]; \
+    }                                                                         \
+    for (int x = 0; x < rows; x++)                                            \
+        for (int y = 0; y < nv; y++) *(V*)(c + x * cs + y * W) = acc[x][y];   \
+}                                                                             \
+/* Out of line, one for each shape, so that each is compiled for its own. */  \
+static __attribute__((noinline)) void micro43_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 4, p, 3, kb, c, cs); } \
+static __attribute__((noinline)) void micro42_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 4, p, 2, kb, c, cs); } \
+static __attribute__((noinline)) void micro41_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 4, p, 1, kb, c, cs); } \
+static __attribute__((noinline)) void micro13_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 1, p, 3, kb, c, cs); } \
+static __attribute__((noinline)) void micro12_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 1, p, 2, kb, c, cs); } \
+static __attribute__((noinline)) void micro11_##SUF(const T* const* a, const T* p, int64_t kb, T* c, int64_t cs) { micro_##SUF(a, 1, p, 1, kb, c, cs); } \
+/* Columns [j0, j1) of C[m x n] += A[m x k] * B.  A is m rows, by pointer     \
+ * (ap) or `as` apart from a; C's rows are cs apart.  B is k rows of n, or    \
+ * with `side` n rows of k; by pointer (bp) or `bs` apart from b.  Blocks     \
+ * are laid from j0 and from the first row, so a caller that splits the       \
+ * columns among workers splits at multiples of three vectors, and one that   \
+ * splits the rows at multiples of four, to have each number computed one     \
+ * way whatever the split. */                                                 \
+static void lin_mul_##SUF(const T* const* ap, const T* a, int64_t as, int64_t m, int64_t k, \
+                          const T* const* bp, const T* b, int64_t bs, bool side, \
+                          T* c, int64_t cs, int64_t j0, int64_t j1) {         \
+    T pack[LIN_KC * 3 * W];                                                   \
+    int64_t jv = j0 + (j1 - j0) / W * W;                                      \
+    for (int64_t l0 = 0; l0 < k; l0 += LIN_KC) {                              \
+        int64_t kb = l0 + LIN_KC < k ? LIN_KC : k - l0;                       \
+        for (int64_t j = j0; j < jv;) {                                       \
+            int nv = (jv - j) / W >= 3 ? 3 : (int)((jv - j) / W);             \
+            int64_t sw = (int64_t)nv * W;                                     \
+            if (side) {                                                       \
+                for (int64_t jj = 0; jj < sw; jj++) {                         \
+                    const T* wr = (bp ? bp[j + jj] : b + (j + jj) * bs) + l0; \
+                    for (int64_t l = 0; l < kb; l++) pack[l * sw + jj] = wr[l]; \
+                }                                                             \
+            } else {                                                          \
+                for (int64_t l = 0; l < kb; l++)                              \
+                    memcpy(pack + l * sw, (bp ? bp[l0 + l] : b + (l0 + l) * bs) + j, (size_t)sw * sizeof(T)); \
             }                                                                 \
-            for (; l < k; l++) {                                              \
-                T a = Ai[l];                                                  \
-                const T* Bl = (const T*)B->rp[l];                             \
-                for (int64_t j = j0; j < j1; j++) Ci[j] += a * Bl[j];         \
+            int64_t i = 0;                                                    \
+            for (; i + 4 <= m; i += 4) {                                      \
+                const T* r4[4];                                               \
+                for (int x = 0; x < 4; x++) r4[x] = (ap ? ap[i + x] : a + (i + x) * as) + l0; \
+                T* ci = c + i * cs + j;                                       \
+                if (nv == 3) micro43_##SUF(r4, pack, kb, ci, cs);             \
+                else if (nv == 2) micro42_##SUF(r4, pack, kb, ci, cs);        \
+                else micro41_##SUF(r4, pack, kb, ci, cs);                     \
+            }                                                                 \
+            for (; i < m; i++) {                                              \
+                const T* r1 = (ap ? ap[i] : a + i * as) + l0;                 \
+                T* ci = c + i * cs + j;                                       \
+                if (nv == 3) micro13_##SUF(&r1, pack, kb, ci, cs);            \
+                else if (nv == 2) micro12_##SUF(&r1, pack, kb, ci, cs);       \
+                else micro11_##SUF(&r1, pack, kb, ci, cs);                    \
+            }                                                                 \
+            j += sw;                                                          \
+        }                                                                     \
+        /* the columns past the last whole vector, one number at a time */    \
+        for (int64_t j = jv; j < j1; j++) {                                   \
+            if (side) {                                                       \
+                const T* wr = (bp ? bp[j] : b + j * bs) + l0;                 \
+                for (int64_t i = 0; i < m; i++)                               \
+                    c[i * cs + j] += dot_##SUF((ap ? ap[i] : a + i * as) + l0, wr, kb); \
+            } else {                                                          \
+                for (int64_t l = 0; l < kb; l++) pack[l] = (bp ? bp[l0 + l] : b + (l0 + l) * bs)[j]; \
+                for (int64_t i = 0; i < m; i++)                               \
+                    c[i * cs + j] += dot_##SUF((ap ? ap[i] : a + i * as) + l0, pack, kb); \
             }                                                                 \
         }                                                                     \
     }                                                                         \
-}                                                                             \
+}
+DEF_MICRO(f64, double, lin_v4d, 4)
+DEF_MICRO(f32, float,  lin_v8f, 8)
+
+/* The same for callers outside that hold F32 matrices as blocks: columns
+ * [j0, j1) of c[m rows, cs apart] += a[m x k, rows `as` apart] * b, b being k
+ * rows of n, or with `sideways` n rows of k, `bs` apart.  One thread; split
+ * the columns at multiples of RAY_LIN_STRIP_F32. */
+void ray_lin_mul_acc_f32(const float* a, int64_t as, int64_t m, int64_t k,
+                         const float* b, int64_t bs, bool sideways,
+                         float* c, int64_t cs, int64_t j0, int64_t j1) {
+    lin_mul_f32(NULL, a, as, m, k, NULL, b, bs, sideways, c, cs, j0, j1);
+}
+
+#define DEF_GEMM(SUF, T)                                                      \
 static void gemm_k_##SUF(const lin_t* A, const lin_t* B, T* C,                \
                          int64_t r, int64_t c, int64_t k0, int64_t k1) {      \
     if (B->is_vec) {                                                          \
@@ -345,18 +402,6 @@ static void gemm_k_##SUF(const lin_t* A, const lin_t* B, T* C,                \
 DEF_GEMM(f64, double)
 DEF_GEMM(f32, float)
 
-/* The tiled F32 kernel for callers that hold their matrices as rows already:
- * C[r x cols] += A[r x k] * B[k x cols], each of a and b an array of row
- * pointers, c one block.  It adds into c, so a caller that wants a bias under
- * the product writes the bias there first.  The rows of b should lie in one
- * block (see lin_gemm for why); those of a may lie anywhere.  One thread. */
-void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
-                          int64_t r, int64_t k, int64_t cols) {
-    lin_t A = { .r = r, .c = k,    .rp = (const void**)a, .buf = NULL, .is_vec = false, .f32 = true };
-    lin_t B = { .r = k, .c = cols, .rp = (const void**)b, .buf = NULL, .is_vec = false, .f32 = true };
-    gemm_tiled_f32(&A, &B, c, k, cols, 0, r);
-}
-
 typedef struct {
     const lin_t *A, *B;
     void* C;                   /* r x c result (row-split), float or double as A is */
@@ -377,8 +422,10 @@ static void gemm_task(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         } else {
             int64_t i0 = t * g->rchunk, i1 = i0 + g->rchunk;
             if (i1 > g->r) i1 = g->r;
-            if (g->f32) gemm_tiled_f32(g->A, g->B, (float*)g->C, g->k, g->c, i0, i1);
-            else        gemm_tiled_f64(g->A, g->B, (double*)g->C, g->k, g->c, i0, i1);
+            if (g->f32) lin_mul_f32((const float* const*)g->A->rp + i0, NULL, 0, i1 - i0, g->k, (const float* const*)g->B->rp, NULL, 0, false,
+                                    (float*)g->C + i0 * g->c, g->c, 0, g->c);
+            else        lin_mul_f64((const double* const*)g->A->rp + i0, NULL, 0, i1 - i0, g->k, (const double* const*)g->B->rp, NULL, 0, false,
+                                    (double*)g->C + i0 * g->c, g->c, 0, g->c);
         }
     }
 }
@@ -396,36 +443,9 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, void* C,
                      int64_t r, int64_t k, int64_t c) {
     size_t esz = A->f32 ? sizeof(float) : sizeof(double);
     memset(C, 0, (size_t)r * (size_t)c * esz);
-    /* The tiled kernel reads four rows of B at once, and every row of B once
-     * for each row of A.  Rows are vectors of their own, each where the
-     * allocator put it: rows of one size start at the same offset in their
-     * blocks, so they fall on the same cache sets and push each other out.
-     * B is copied into one block first; the copy costs a small part of one
-     * pass and the product then runs at the speed the kernel has on a flat
-     * matrix (measured: 128x1536 by 1536x384, F32, 7.4 ms on the rows as they
-     * lie against 4.4 ms with the copy included). */
-    lin_t packed;
-    void* flat = NULL;
-    if (!B->is_vec && r * c > LIN_SMALL_C) {
-        flat = ray_calloc_raw((size_t)k * (size_t)c * esz + 8);
-        const void** rp = flat ? (const void**)ray_calloc_raw((size_t)k * sizeof(void*)) : NULL;
-        if (flat && rp) {
-            for (int64_t l = 0; l < k; l++) {
-                rp[l] = (const char*)flat + (size_t)l * (size_t)c * esz;
-                memcpy((void*)rp[l], B->rp[l], (size_t)c * esz);
-            }
-            packed = *B;
-            packed.rp = rp;
-            B = &packed;
-        } else {
-            /* no room for the copy: the rows are used where they lie */
-            if (flat) ray_free_raw(flat);
-            flat = NULL;
-        }
-    }
-    bool ok = lin_gemm_run(A, B, C, r, k, c, esz);
-    if (flat) { ray_free_raw((void*)packed.rp); ray_free_raw(flat); }
-    return ok;
+    /* The kernel packs the strip of B it works on, so the rows are read
+     * where they lie, wherever the allocator put each. */
+    return lin_gemm_run(A, B, C, r, k, c, esz);
 }
 
 static bool lin_gemm_run(const lin_t* A, const lin_t* B, void* C,
@@ -481,10 +501,10 @@ static bool lin_gemm_run(const lin_t* A, const lin_t* B, void* C,
     }
     if (A->f32) {
         if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f32(A, B, (float*)C, r, c, 0, k);
-        else gemm_tiled_f32(A, B, (float*)C, k, c, 0, r);
+        else lin_mul_f32((const float* const*)A->rp, NULL, 0, r, k, (const float* const*)B->rp, NULL, 0, false, (float*)C, c, 0, c);
     } else {
         if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f64(A, B, (double*)C, r, c, 0, k);
-        else gemm_tiled_f64(A, B, (double*)C, k, c, 0, r);
+        else lin_mul_f64((const double* const*)A->rp, NULL, 0, r, k, (const double* const*)B->rp, NULL, 0, false, (double*)C, c, 0, c);
     }
     return true;
 }
@@ -538,12 +558,6 @@ ray_t* ray_mmu_fn(ray_t* a, ray_t* b) {
  * (four doubles, or eight floats), so each step costs 8 loads for 16
  * multiply-adds instead of 2 loads per multiply-add.  Written with vector
  * extensions: the autovectoriser does not find this shape. */
-typedef double lin_v4d __attribute__((vector_size(32), aligned(8)));
-typedef float  lin_v8f __attribute__((vector_size(32), aligned(4)));
-/* Macros, not functions: a 32-byte vector passed or returned by value changes
- * the ABI without AVX (-Wpsabi, an error under -Werror on baseline x86-64). */
-#define ld_f64(p) (*(const lin_v4d*)(p))
-#define ld_f32(p) (*(const lin_v8f*)(p))
 
 #define DEF_TILE(SUF, T, V, W)                                                \
 static __attribute__((noinline)) void tile4_##SUF(const T* const* a, const T* const* b, \
@@ -566,62 +580,6 @@ static __attribute__((noinline)) void tile4_##SUF(const T* const* a, const T* co
 }
 DEF_TILE(f64, double, lin_v4d, 4)
 DEF_TILE(f32, float,  lin_v8f, 8)
-
-/* Two rows against four, F32: eight sums, which with the six rows read fit
- * the sixteen registers AVX2 has; the tile of four by four above keeps
- * sixteen sums and spills there. */
-static __attribute__((noinline)) void tile24_f32(const float* a0, const float* a1, const float* const* b,
-                                                 int64_t n, float out[8]) {
-    lin_v8f s00 = {0}, s01 = {0}, s02 = {0}, s03 = {0}, s10 = {0}, s11 = {0}, s12 = {0}, s13 = {0};
-    const float *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
-    int64_t l = 0;
-    for (; l + 8 <= n; l += 8) {
-        lin_v8f x0 = ld_f32(a0 + l), x1 = ld_f32(a1 + l);
-        lin_v8f y0 = ld_f32(b0 + l), y1 = ld_f32(b1 + l), y2 = ld_f32(b2 + l), y3 = ld_f32(b3 + l);
-        s00 += x0 * y0; s01 += x0 * y1; s02 += x0 * y2; s03 += x0 * y3;
-        s10 += x1 * y0; s11 += x1 * y1; s12 += x1 * y2; s13 += x1 * y3;
-    }
-    lin_v8f s[8] = { s00, s01, s02, s03, s10, s11, s12, s13 };
-    for (int x = 0; x < 2; x++) for (int y = 0; y < 4; y++) {
-        lin_v8f v = s[x * 4 + y];
-        float t = 0;
-        for (int q = 0; q < 8; q++) t += v[q];
-        const float* ar = x ? a1 : a0;
-        for (int64_t q = l; q < n; q++) t += ar[q] * b[y][q];
-        out[x * 4 + y] = t;
-    }
-}
-
-/* Rows against rows, F32: c[i * cols + o] += a_i . b_o for r rows of a and
- * cols rows of b, each n long and laid `as` and `bs` apart.  It is a product
- * with the right matrix lying on its side, [cols x n], which is how a model's
- * file holds a layer's weights: so they are computed where they are mapped.
- * Adds into c; one thread.  Rows are taken two at a time from the first, so
- * a caller that splits rows among workers splits at even rows to have each
- * row computed one way. */
-void ray_lin_rowdot_acc_f32(const float* a, int64_t as, const float* b, int64_t bs,
-                            float* c, int64_t r, int64_t n, int64_t cols) {
-    int64_t r2 = r & ~(int64_t)1, c4 = cols & ~(int64_t)3;
-    for (int64_t b0 = 0; b0 < n; b0 += LIN_DOT_BLOCK) {
-        int64_t nb = b0 + LIN_DOT_BLOCK < n ? LIN_DOT_BLOCK : n - b0;
-        /* four rows of b stay in L1 while every row of a passes over them */
-        for (int64_t o = 0; o < c4; o += 4) {
-            const float* rb[4];
-            for (int y = 0; y < 4; y++) rb[y] = b + (o + y) * bs + b0;
-            for (int64_t i = 0; i < r2; i += 2) {
-                float t[8];
-                tile24_f32(a + i * as + b0, a + (i + 1) * as + b0, rb, nb, t);
-                float* c0 = c + i * cols + o;
-                float* c1 = c0 + cols;
-                for (int y = 0; y < 4; y++) { c0[y] += t[y]; c1[y] += t[4 + y]; }
-            }
-            for (int64_t i = r2; i < r; i++)
-                for (int y = 0; y < 4; y++) c[i * cols + o + y] += dot_f32(a + i * as + b0, rb[y], nb);
-        }
-        for (int64_t o = c4; o < cols; o++)
-            for (int64_t i = 0; i < r; i++) c[i * cols + o] += dot_f32(a + i * as + b0, b + o * bs + b0, nb);
-    }
-}
 
 #define DEF_GRAM(SUF, T)                                                      \
 static void gram_k_##SUF(const lin_t* A, T* G, int64_t p,                     \

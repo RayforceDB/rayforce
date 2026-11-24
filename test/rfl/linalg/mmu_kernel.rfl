@@ -1,0 +1,32 @@
+;; The product's kernel: a block of the result in registers, four rows by
+;; three vectors, over a packed strip of the right-hand matrix.  Every shape
+;; the blocks and their leftovers take is compared with the product written
+;; out as sums.  The numbers are small whole ones, so both are exact and the
+;; comparison is equality, in F32 as in F64.
+
+(set mk (fn [r c] (map (fn [i] (as 'F64 (- (rand c 17) 8))) (til r))))
+(set plain (fn [A B] (do (set Bt (flip B)) (map (fn [row] (map (fn [col] (sum (* row col))) Bt)) A))))
+(set f32 (fn [M] (map (fn [r] (as 'F32 r)) M)))
+(set same (fn [X Y] (== 0.0 (max (map (fn [i] (max (abs (- (as 'F64 (at X i)) (as 'F64 (at Y i)))))) (til (count X)))))))
+(set both (fn [r k c] (do (set A (mk r k)) (set B (mk k c)) (set P (plain A B)) (and (same (mmu A B) P) (same (mmu (f32 A) (f32 B)) P)))))
+
+;; ────────────── whole blocks ──────────────
+(both 64 256 72) -- true
+;; ────────────── rows left over from fours ──────────────
+(both 65 256 72) -- true
+(both 67 256 72) -- true
+;; ────────────── one and two vectors left over from threes ──────────────
+(both 64 128 80) -- true
+(both 64 128 88) -- true
+;; ────────────── columns left over from whole vectors ──────────────
+(both 64 128 75) -- true
+(both 67 131 101) -- true
+;; ────────────── a shared dimension longer than one packed block, and not a multiple of it ──────────────
+(both 70 600 67) -- true
+(both 131 1030 49) -- true
+;; ────────────── large enough to be shared out among the workers ──────────────
+(both 301 300 133) -- true
+
+;; The type of the rows is kept.
+(type (at (mmu (f32 (mk 64 64)) (f32 (mk 64 72))) 0)) -- 'F32
+(type (at (mmu (mk 64 64) (mk 64 72)) 0)) -- 'F64
