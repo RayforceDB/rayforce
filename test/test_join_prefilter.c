@@ -645,6 +645,8 @@ static ray_t* jsd_eval_rows(const char* src, int64_t* rows) {
 
 #define JSD_NV   1000     /* vocabulary of each symfile */
 #define JSD_BIG  70000    /* rows of the big table: above RAY_PARALLEL_THRESHOLD */
+#define JSD_NV3  2500     /* vocabulary of the third symfile */
+#define JSD_BIG3 60000    /* rows of the table over it: fewer than BIG */
 
 static test_result_t test_jp_sym_domains(void) {
     _Static_assert(JSD_BIG > RAY_PARALLEL_THRESHOLD, "the big side must take the radix path");
@@ -699,13 +701,18 @@ static test_result_t test_jp_sym_domains(void) {
     t = jsd_eval_rows("(left-join [k] SML BIG)", &rows);
     TEST_ASSERT_EQ_I(rows, 9 * 70 + 1);
     ray_release(t);
-    /* two symfiles: jsd990..jsd999 are in d1, jsd1000..jsd1009 are not */
+    /* two symfiles: jsd990..jsd999 are in d1, jsd1000..jsd1009 are not.
+     * TWO (20 rows) is the side translated into d1: its 20 distinct ids are
+     * looked up by string once; the pair's cache answers the repeat. */
+    uint64_t finds0 = ray_join_test_sym_finds();
     t = jsd_eval_rows("(inner-join [k] TWO BIG)", &rows);
     TEST_ASSERT_EQ_I(rows, 10 * 70);
     ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 20);
     t = jsd_eval_rows("(left-join [k] TWO BIG)", &rows);
     TEST_ASSERT_EQ_I(rows, 10 * 70 + 10);
     ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 20);
     t = jsd_eval_rows("(inner-join [k] BIG TWO)", &rows);
     TEST_ASSERT_EQ_I(rows, 10 * 70);
     ray_release(t);
@@ -756,6 +763,54 @@ static test_result_t test_jp_sym_domains(void) {
     ray_release(t);
     TEST_ASSERT_EQ_I(ray_sym_count(), c0 + 8);
     TEST_ASSERT_EQ_I(ray_sym_find("jsd1", 4), -1);
+
+    /* Releasing a domain drops what was translated against it.  TWO's
+     * table was the last holder of d2; a fresh symfile takes its place
+     * under TWO, holding jsd0..jsd2499 at REVERSED positions (what a stale
+     * cache for d2's address, were it reused, would mistranslate: TWO's
+     * ids then name jsd1009..jsd990), and the joins over the new pair are
+     * right.  BIG3 over it has fewer rows than BIG, so BIG3 is the side
+     * translated: its 1500 distinct ids carry the pair's cache past its
+     * first 1024 slots. */
+    jp_bind("TWO", ray_table_new(0));
+    ray_sym_domain_t* d3 = ray_sym_domain_open_or_create(ray_test_tmp(JP_TMP "/d3.sym"));
+    TEST_ASSERT(d3, "a third symfile domain");
+    static int64_t p3[JSD_NV3];
+    for (int64_t i = JSD_NV3 - 1; i >= 0; i--) {
+        int n = snprintf(buf, sizeof buf, "jsd%lld", (long long)i);
+        p3[i] = ray_sym_domain_intern(d3, buf, (size_t)n);
+        TEST_ASSERT(p3[i] > 0, "appended to the symfile");
+    }
+    for (int64_t j = 0; j < 20; j++) pos[j] = p3[JSD_NV - 10 + j];           /* jsd990..jsd1009 */
+    jp_bind("TWO", jsd_table(d3, pos, 20, "u"));
+    for (int64_t r = 0; r < JSD_BIG3; r++) pos[r] = p3[JSD_NV - 10 + r % 1500];  /* jsd990..jsd2489 */
+    jp_bind("BIG3", jsd_table(d3, pos, JSD_BIG3, "y"));
+    ray_sym_domain_release(d3);
+    uint32_t c1 = ray_sym_count();                  /* the binds named BIG3 and y */
+    finds0 = ray_join_test_sym_finds();
+    t = jsd_eval_rows("(inner-join [k] TWO BIG)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10 * 70);
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 20);
+    /* the matched TWO rows are jsd990..jsd999: u = 0..9, 70 times each */
+    t = ray_eval_str("(sum (at (inner-join [k] TWO BIG) 'u))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "sum");
+    TEST_ASSERT_EQ_I(t->i64, 70 * 45);
+    ray_release(t);
+    t = jsd_eval_rows("(anti-join [k] TWO BIG)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10);
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 20);
+    /* (TWO's 20 ids are among BIG3's 1500 and already in the pair's cache) */
+    t = jsd_eval_rows("(inner-join [k] BIG BIG3)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500);
+    t = jsd_eval_rows("(inner-join [k] BIG3 BIG)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500);
+    TEST_ASSERT_EQ_I(ray_sym_count(), c1);
     PASS();
 }
 

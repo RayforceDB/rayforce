@@ -25,7 +25,7 @@
 #include "ops/hash.h"
 #include "ops/idxop.h"
 #include "lang/internal.h"  /* collection_elem, store_typed_elem */
-#include "table/domain.h"   /* raw symfile snapshot for join_sym_xlat */
+#include "table/domain.h"   /* ray_sym_domain_xlat: join_sym_xlat */
 
 /* Test knob: force the legacy build-on-right behavior so the differential
  * harness can compare swap vs no-swap in one binary. */
@@ -298,74 +298,43 @@ static uint64_t hash_row_keys(ray_t** key_vecs, uint32_t n_keys, int64_t row,
  * column (join_keys_orig): output cells, such as the full-join key fill,
  * are always taken from the latter so results keep their cells and domain.
  *
- * Translating a side costs one lookup per distinct id, plus — when the
- * target is a FILE domain — its reverse index, built on the first find
- * over that symfile (the cost `(= col "x")` pays) and kept by the domain.
- * So a FILE side against a runtime side is translated into the runtime
- * table unless it has far more rows than the other side has rows plus
- * the symfile has entries (measured on 2M-row columns: translating the
- * rows beat indexing the vocabulary up to about 1:1). */
+ * Translating a side costs one lookup per distinct id the pair has not
+ * met before (the source domain keeps what each translation into a target
+ * found: ray_sym_domain_xlat), plus — when the target is a FILE domain —
+ * its reverse index, built on the first find over that symfile (the cost
+ * `(= col "x")` pays) and kept by the domain.  So a FILE side against a
+ * runtime side is translated into the runtime table unless it has far
+ * more rows than the other side has rows plus the symfile has entries
+ * (measured on 2M-row columns: translating the rows beat indexing the
+ * vocabulary up to about 1:1).  A repeat of the same join is then a hash
+ * lookup per distinct id and no string find. */
 #define JOIN_KEYS_ARRAYS 4
 
 static inline ray_t** join_keys_orig(ray_t** key_vecs, size_t key_slots, int side) {
     return key_vecs + (size_t)(2 + side) * key_slots;
 }
 
-/* The lookups of one translation: open addressing on the source id, so a
- * side with many rows over few distinct symbols looks each one up once. */
-typedef struct { int64_t id; int64_t pos; } join_sym_memo_t;
+/* Test hook: ids the SYM key translations resolved by string lookup (the
+ * misses of the per-pair cache) since process start. */
+static _Atomic(uint64_t) g_join_sym_finds;
+uint64_t ray_join_test_sym_finds(void) { return atomic_load(&g_join_sym_finds); }
 
 /* `src`'s cells as positions in `dst`'s domain (W64, adopting that domain).
  * An absent string becomes -1: it equals no cell of `dst`, whose ids are
  * >= 0.  The null is id 0 in every domain and stays 0, so null == null
  * keeps holding across the pair. */
 static ray_t* join_sym_xlat(ray_t* src, ray_t* dst) {
-    struct ray_sym_domain_s* sd = ray_sym_vec_domain(src);
-    struct ray_sym_domain_s* dd = ray_sym_vec_domain(dst);
     int64_t n = src->len;
     ray_t* out = ray_sym_vec_new(RAY_SYM_W64, n);
     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     out->len = n;
     int64_t* o = (int64_t*)ray_data(out);
-
-    uint64_t cap = 64;
-    int64_t distinct_max = ray_sym_domain_count(sd);
-    if (distinct_max > n) distinct_max = n;
-    while (cap < (uint64_t)distinct_max * 2) cap <<= 1;
-    ray_t* memo_hdr = NULL;
-    join_sym_memo_t* memo = (join_sym_memo_t*)scratch_alloc(&memo_hdr, cap * sizeof *memo);
-    if (!memo) { ray_release(out); return ray_error("oom", NULL); }
-    for (uint64_t i = 0; i < cap; i++) memo[i].id = -1;
-
-    /* A symfile's strings are read where they lie (no atom per entry: 2M
-     * distinct ids materialized 260 bytes each the other way). */
-    ray_sym_domain_raw_t raw;
-    bool raw_ok = ray_sym_domain_raw_pin(sd, &raw);
-
     const void* sdata = ray_data(src);
-    for (int64_t r = 0; r < n; r++) {
-        int64_t id = ray_read_sym(sdata, r, RAY_SYM, src->attrs);
-        if (id == 0) { o[r] = 0; continue; }
-        uint64_t slot = ray_hash_i64(id) & (cap - 1);
-        while (memo[slot].id != -1 && memo[slot].id != id) slot = (slot + 1) & (cap - 1);
-        if (memo[slot].id == -1) {
-            const char* p = NULL;
-            size_t l = 0;
-            /* the pinned snapshot covers the file prefix only; entries
-             * appended in this session resolve through the domain */
-            if (raw_ok && id < raw.count) {
-                p = ray_sym_domain_raw_str(&raw, id, &l);
-            } else {
-                ray_t* s = ray_sym_domain_str(sd, id);
-                if (s) { p = ray_str_ptr(s); l = ray_str_len(s); }
-            }
-            memo[slot].id  = id;
-            memo[slot].pos = p ? ray_sym_domain_find(dd, p, l) : -1;
-        }
-        o[r] = memo[slot].pos;
-    }
-    if (raw_ok) ray_sym_domain_raw_unpin(sd);
-    scratch_free(memo_hdr);
+    for (int64_t r = 0; r < n; r++) o[r] = ray_read_sym(sdata, r, RAY_SYM, src->attrs);
+    /* in place: the pair's cache answers every repeat of an id */
+    int64_t finds = ray_sym_domain_xlat(ray_sym_vec_domain(src), ray_sym_vec_domain(dst), o, n, o);
+    if (finds < 0) { ray_release(out); return ray_error("oom", NULL); }
+    atomic_fetch_add_explicit(&g_join_sym_finds, (uint64_t)finds, memory_order_relaxed);
     ray_sym_vec_adopt_domain(out, dst);
     return out;
 }

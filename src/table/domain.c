@@ -385,6 +385,22 @@ ray_sym_domain_t* ray_sym_runtime_domain(void) {
 
 static ray_sym_domain_t* g_domains = NULL;
 
+/* The translation cache of one (src, dst) pair (ray_sym_domain_xlat): open
+ * addressing on the source id, pos -1 = string absent from dst, slot id -1
+ * = empty.  One list for every pair, so releasing a domain finds the
+ * caches that name it on either side; guarded by g_dom_lock. */
+typedef struct { int64_t id; int64_t pos; } dom_xlat_ent_t;
+typedef struct dom_xlat_s {
+    ray_sym_domain_t* src;
+    ray_sym_domain_t* dst;
+    int64_t   dst_count;    /* dst's entry count the -1 entries hold for */
+    uint64_t  cap;          /* power of two, n <= cap / 2 */
+    uint64_t  n;
+    dom_xlat_ent_t* ents;
+    struct dom_xlat_s* next;
+} dom_xlat_t;
+static dom_xlat_t* g_xlat = NULL;
+
 #if defined(RAY_OS_WINDOWS)
 static SRWLOCK g_dom_lock = SRWLOCK_INIT;
 static inline void dom_lock(void) {
@@ -1903,7 +1919,27 @@ void ray_sym_domain_release(ray_sym_domain_t* dom) {
     ray_sym_domain_t** pp = &g_domains;
     while (*pp && *pp != dom) pp = &(*pp)->next;
     if (*pp) *pp = dom->next;
+    /* The translation caches it takes part in go with it, on either side:
+     * a cache is keyed by the domain pointer, which the next open may
+     * hand out again. */
+    dom_xlat_t* dead = NULL;
+    for (dom_xlat_t** xp = &g_xlat; *xp;) {
+        dom_xlat_t* x = *xp;
+        if (x->src == dom || x->dst == dom) {
+            *xp = x->next;
+            x->next = dead;
+            dead = x;
+        } else {
+            xp = &x->next;
+        }
+    }
     dom_unlock();
+    for (dom_xlat_t* x = dead; x;) {
+        dom_xlat_t* nxt = x->next;
+        ray_sys_free(x->ents);
+        ray_sys_free(x);
+        x = nxt;
+    }
     dom_destroy(dom);
 }
 
@@ -2136,6 +2172,121 @@ int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len) 
     int64_t found = dom_probe_locked(dom, h, str, len);
     dom_unlock();
     return found;
+}
+
+/* ---- translation cache (ray_sym_domain_xlat) ------------------------------ */
+
+/* The pair's cache, made on first use with dst_count = `dst_count`.  Under
+ * g_dom_lock.  NULL on OOM. */
+static dom_xlat_t* dom_xlat_get_locked(ray_sym_domain_t* src, ray_sym_domain_t* dst,
+                                       int64_t dst_count) {
+    for (dom_xlat_t* x = g_xlat; x; x = x->next)
+        if (x->src == src && x->dst == dst) return x;
+    dom_xlat_t* x = (dom_xlat_t*)ray_sys_alloc(sizeof *x);
+    if (!x) return NULL;
+    x->cap = 1024;
+    x->ents = (dom_xlat_ent_t*)ray_sys_alloc((size_t)x->cap * sizeof *x->ents);
+    if (!x->ents) { ray_sys_free(x); return NULL; }
+    for (uint64_t i = 0; i < x->cap; i++) x->ents[i].id = -1;
+    x->src = src;
+    x->dst = dst;
+    x->dst_count = dst_count;
+    x->n = 0;
+    x->next = g_xlat;
+    g_xlat = x;
+    return x;
+}
+
+static inline dom_xlat_ent_t* dom_xlat_slot(dom_xlat_t* x, int64_t id) {
+    uint64_t mask = x->cap - 1;
+    uint64_t s = ray_hash_i64(id) & mask;
+    while (x->ents[s].id != -1 && x->ents[s].id != id) s = (s + 1) & mask;
+    return &x->ents[s];
+}
+
+/* Re-slots the entries into `cap` slots (growth), dropping the absent
+ * (-1) ones unless `keep_absent` (dst grew: the strings may be there
+ * now).  Under g_dom_lock.  False on OOM, the cache unchanged. */
+static bool dom_xlat_rebuild_locked(dom_xlat_t* x, uint64_t cap, bool keep_absent) {
+    dom_xlat_ent_t* ents = (dom_xlat_ent_t*)ray_sys_alloc((size_t)cap * sizeof *ents);
+    if (!ents) return false;
+    for (uint64_t i = 0; i < cap; i++) ents[i].id = -1;
+    uint64_t mask = cap - 1, n = 0;
+    for (uint64_t i = 0; i < x->cap; i++) {
+        dom_xlat_ent_t e = x->ents[i];
+        if (e.id == -1 || (e.pos == -1 && !keep_absent)) continue;
+        uint64_t s = ray_hash_i64(e.id) & mask;
+        while (ents[s].id != -1) s = (s + 1) & mask;
+        ents[s] = e;
+        n++;
+    }
+    ray_sys_free(x->ents);
+    x->ents = ents;
+    x->cap = cap;
+    x->n = n;
+    return true;
+}
+
+/* Position in `dst` of the string `src` holds at `id` (-1: unresolvable
+ * or absent); a FILE dst gets its reverse index on first use, as in
+ * ray_sym_domain_find.  Under g_dom_lock, src != dst (a compressed
+ * domain's decode buffer serves one lookup at a time). */
+static int64_t dom_xlat_find_locked(ray_sym_domain_t* src, ray_sym_domain_t* dst, int64_t id) {
+    const char* p;
+    size_t l;
+    if (src->kind == DOM_RUNTIME) {
+        ray_t* s = ray_sym_str(id);
+        if (!s) return -1;
+        p = ray_str_ptr(s);
+        l = ray_str_len(s);
+    } else {
+        p = dom_bytes_locked(src, id, &l);
+        if (!p) return -1;
+    }
+    if (dst->kind == DOM_RUNTIME) return ray_sym_find(p, l);
+    if (dst->kind == DOM_IMPORT) return -1;
+    if (atomic_load_explicit(&dst->count, memory_order_relaxed) == 0) return -1;
+    if (!dst->buckets && !dom_build_index_locked(dst, 0)) return -1;
+    return dom_probe_locked(dst, (uint32_t)ray_hash_bytes(p, l), p, l);
+}
+
+/* Ids per lock hold: a chunk of misses is a few thousand string finds. */
+#define DOM_XLAT_CHUNK 4096
+
+int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
+                            const int64_t* ids, int64_t n, int64_t* pos) {
+    int64_t misses = 0;
+    for (int64_t at = 0; at < n; at += DOM_XLAT_CHUNK) {
+        int64_t end = at + DOM_XLAT_CHUNK < n ? at + DOM_XLAT_CHUNK : n;
+        dom_lock();
+        /* dst's count (the runtime table's through its own lock, the order
+         * ray_sym_domain_runtime_lut's intern takes too) */
+        int64_t dst_count = ray_sym_domain_count(dst);
+        dom_xlat_t* x = dom_xlat_get_locked(src, dst, dst_count);
+        if (!x) { dom_unlock(); return -1; }
+        if (x->dst_count != dst_count) {
+            /* dst gained strings: an absent verdict may no longer hold */
+            if (!dom_xlat_rebuild_locked(x, x->cap, false)) { dom_unlock(); return -1; }
+            x->dst_count = dst_count;
+        }
+        for (int64_t i = at; i < end; i++) {
+            if (ids[i] == 0) { pos[i] = 0; continue; }
+            dom_xlat_ent_t* e = dom_xlat_slot(x, ids[i]);
+            if (e->id == -1) {
+                if (x->n * 2 >= x->cap) {
+                    if (!dom_xlat_rebuild_locked(x, x->cap * 2, true)) { dom_unlock(); return -1; }
+                    e = dom_xlat_slot(x, ids[i]);
+                }
+                e->id = ids[i];
+                e->pos = dom_xlat_find_locked(src, dst, ids[i]);
+                x->n++;
+                misses++;
+            }
+            pos[i] = e->pos;
+        }
+        dom_unlock();
+    }
+    return misses;
 }
 
 /* Append one symbol.  Called under the lock with buckets built and NOT

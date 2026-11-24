@@ -273,6 +273,20 @@ void ray_sym_domain_index_remove(const char* path);
  * FILE: builds the reverse index on first call (O(|vocabulary|)). */
 int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len);
 
+/* Positions in `dst` of the strings that ids[0..n) name in `src` (two
+ * DIFFERENT domains): pos[i] = ray_sym_domain_find(dst, string of ids[i]),
+ * -1 when `dst` lacks the string or `src` cannot resolve the id; id 0, the
+ * null in every domain, stays 0 without a lookup.  Nothing is interned.
+ * What one call finds is kept in a per-pair cache (id → position, bounded
+ * by the distinct ids ever asked) that lives until either domain is
+ * released, so a repeated id, in one call or the next, is a hash lookup;
+ * a -1 is dropped once `dst` has grown, since the string may have arrived.
+ * Returns the number of ids resolved by string lookup (the cache misses),
+ * or -1 on OOM.  `pos` may be `ids` itself.  Sequential: callers run it in
+ * setup, never in a worker. */
+int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
+                            const int64_t* ids, int64_t n, int64_t* pos);
+
 /* Position → runtime-intern-id translation table.
  *
  *   RUNTIME: NULL — ids ARE runtime ids, callers use them as-is.
