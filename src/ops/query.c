@@ -11355,6 +11355,62 @@ static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, in
 /* One task: the morsels [n_segs*t/T, n_segs*(t+1)/T) coded by local
  * first-seen id; a row the selection drops gets -1 (its key is never read:
  * the grouping honours the same selection). */
+/* ---- the slot coding of a SYM column whose domain bounds the key
+ * (derived_key_over_values_al, vocab_small): per task, the ids its rows
+ * show first, in row order. */
+typedef struct {
+    ray_t*   ids_hdr;
+    int32_t* ids;        /* the task's first-seen ids, in row order */
+    int64_t  n;
+    ray_t*   seen_hdr;
+    uint8_t* seen;       /* a bit per id of the domain */
+    bool     fail;       /* OOM, or an id past the domain (a foreign one) */
+} dkv_task_t;
+typedef struct {
+    const void*    cd;
+    uint8_t        cattrs;
+    int64_t        dn, n;
+    uint32_t       tasks;
+    int64_t        n_segs;
+    dkv_task_t*    tk;
+    const int32_t* pos;   /* after the merge: the slot of each id */
+    int32_t*       code;  /* [n] */
+} dkv_ctx_t;
+static void dkv_rows_of(const dkv_ctx_t* c, int64_t ti, int64_t* lo, int64_t* hi) {
+    *lo = c->n_segs * ti / c->tasks * RAY_MORSEL_ELEMS;
+    *hi = c->n_segs * (ti + 1) / c->tasks * RAY_MORSEL_ELEMS;
+    if (*hi > c->n) *hi = c->n;
+}
+static void dkv_list_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dkv_ctx_t* c = (const dkv_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        dkv_task_t* t = &c->tk[ti];
+        int64_t lo, hi;
+        dkv_rows_of(c, ti, &lo, &hi);
+        int64_t cap = hi - lo < c->dn ? hi - lo : c->dn;
+        t->seen = (uint8_t*)scratch_calloc(&t->seen_hdr, (size_t)((c->dn + 7) / 8));
+        t->ids  = cap > 0 ? (int32_t*)scratch_alloc(&t->ids_hdr, (size_t)cap * sizeof(int32_t)) : NULL;
+        if (!t->seen || (cap > 0 && !t->ids)) { t->fail = true; continue; }
+        for (int64_t r = lo; r < hi; r++) {
+            int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
+            if (id < 0 || id >= c->dn) { t->fail = true; break; }
+            uint8_t* b = &t->seen[id >> 3];
+            uint8_t m = (uint8_t)(1u << (id & 7));
+            if (!(*b & m)) { *b |= m; t->ids[t->n++] = (int32_t)id; }
+        }
+    }
+}
+static void dkv_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dkv_ctx_t* c = (const dkv_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        int64_t lo, hi;
+        dkv_rows_of(c, ti, &lo, &hi);
+        for (int64_t r = lo; r < hi; r++)
+            c->code[r] = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->cattrs)];
+    }
+}
 static void dks_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     dks_ctx_t* c = (dks_ctx_t*)vctx;
@@ -11650,30 +11706,48 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     bool ok = true;
     dks_task_t g; memset(&g, 0, sizeof g);
     if (vocab_small) {
-        /* The vocabulary bounds the key: one slot per symbol id (4 bytes
-         * each: 72 MB for 18M URLs), filled in one pass over the rows in
-         * first-seen order — the hash tables per task would hold every
-         * value of the task's rows (the values of such a column can all
-         * differ within a task while they repeat across tasks), 1.7 GB and
-         * 480 ms over 5M rows of 1M URLs against 15 ms here. */
+        /* The vocabulary bounds the key: the rows are coded through one
+         * int32 slot per symbol id (72 MB for 18M URLs) — the hash tables
+         * per task would hold every value of the task's rows (the values of
+         * such a column can all differ within a task while they repeat
+         * across tasks), 1.7 GB and 480 ms over 5M rows of 1M URLs.  Each
+         * task lists the ids its rows show first (a bitmap of the domain
+         * per task), the lists are merged in task order — the tasks hold
+         * row ranges in order, so the slots come out in first-seen row
+         * order, as the hashed values do — and the rows take their slots
+         * in parallel. */
         ray_t* pos_hdr = NULL;
         int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
         g.hash  = (uint64_t*)ray_alloc_raw((size_t)dn * sizeof(uint64_t));
         g.first = (int64_t*)ray_alloc_raw((size_t)dn * sizeof(int64_t));
-        if (!pos || !g.hash || !g.first) {
-            if (pos_hdr) scratch_free(pos_hdr); dks_task_free(&g); ray_release(ids); scratch_free(tk_hdr); return NULL;
+        ray_t* vt_hdr = NULL;
+        dkv_task_t* vt = (dkv_task_t*)scratch_calloc(&vt_hdr, (size_t)tasks * sizeof(dkv_task_t));
+        if (!pos || !g.hash || !g.first || !vt) {
+            if (pos_hdr) scratch_free(pos_hdr);
+            if (vt_hdr) scratch_free(vt_hdr);
+            dks_task_free(&g);
+            ray_release(ids);
+            scratch_free(tk_hdr);
+            return NULL;
         }
         memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
-        int32_t* code = (int32_t*)ray_data(ids);
-        for (int64_t r = 0; r < n; r++) {
-            int64_t id = ray_read_sym(kind.cd, r, RAY_SYM, kind.cattrs);
-            if (id < 0 || id >= dn) { ok = false; break; }
-            int32_t sl = pos[id];
-            if (sl < 0) {
-                sl = (int32_t)g.du; pos[id] = sl;
-                g.hash[g.du] = (uint64_t)id; g.first[g.du] = r; g.du++;
+        dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .tasks = tasks,
+                         .n_segs = c.n_segs, .tk = vt, .pos = pos, .code = (int32_t*)ray_data(ids) };
+        if (tasks > 1) ray_pool_dispatch_n(rpool, dkv_list_fn, &vc, tasks);
+        else dkv_list_fn(&vc, 0, 0, 1);
+        ok = !pool_cancelled(rpool);
+        for (uint32_t t = 0; t < tasks && ok; t++) ok = !vt[t].fail;
+        for (uint32_t t = 0; t < tasks && ok; t++)
+            for (int64_t l = 0; l < vt[t].n; l++) {
+                int64_t id = vt[t].ids[l];
+                if (pos[id] < 0) { pos[id] = (int32_t)g.du; g.hash[g.du] = (uint64_t)id; g.first[g.du] = 0; g.du++; }
             }
-            code[r] = sl;
+        for (uint32_t t = 0; t < tasks; t++) { if (vt[t].ids_hdr) scratch_free(vt[t].ids_hdr); if (vt[t].seen_hdr) scratch_free(vt[t].seen_hdr); }
+        scratch_free(vt_hdr);
+        if (ok && g.du > 0) {
+            if (tasks > 1) ray_pool_dispatch_n(rpool, dkv_code_fn, &vc, tasks);
+            else dkv_code_fn(&vc, 0, 0, 1);
+            ok = !pool_cancelled(rpool);
         }
         scratch_free(pos_hdr);
         scratch_free(tk_hdr); tk_hdr = NULL;

@@ -611,6 +611,25 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict key answers the same groups row-wise");
     ray_release(r);
+    /* The groups of an unsorted outer select come out in the first-seen
+     * order of the texts, as the materialized inner select's do: a kind
+     * the second half of the rows alone shows comes last, whatever task
+     * coded its rows. */
+    r = ray_eval_str("(do (set u3 (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" (< k 120000) \"https://b/%.php\" \"https://c/%.jpg\") (% k 25000))) j))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t3\" (table [u v] (list u3 (% j 7)))) "
+                     "(set TF3 (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t3\")) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(set G3 (select {from: (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}) by: [k] c: (count v) d: (count (distinct v))}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(set M3 (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (count G3) 3) (all (== (as 'STR (at G3 'k)) [\"html\" \"php\" \"jpg\"])) (all (== (at G3 'c) [120000 60000 60000])) (all (== (at G3 'd) [7 7 7])) (all (== (ser (map (fn [c] (as 'STR (at G3 c))) (cols G3))) (ser (map (fn [c] (as 'STR (at (select {from: M3 by: [k] c: (count v) d: (count (distinct v))}) c))) (cols G3))))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the groups come out html, php, jpg — first-seen over the rows — with the materialized select's counts");
+    ray_release(r);
     r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\")");
     if (r) ray_release(r);
 #endif
