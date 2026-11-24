@@ -337,6 +337,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {".log.roll", "(.log.roll)"},
     {".log.snapshot", "(.log.snapshot)"},
     {".log.sync", "(.log.sync)"},
+    {".log.posts", "(.log.posts [<on: i64, 0 or 1>])"},
     {".log.purge", "(.log.purge)"},
     {".sys.prof", "(.sys.prof)"},
     {".sys.profile", "(.sys.profile)"},

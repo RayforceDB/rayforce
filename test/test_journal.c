@@ -37,6 +37,7 @@
 #include "mem/heap.h"
 #include "core/ipc.h"
 #include "ops/journal.h"
+#include "core/qlog.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3027,6 +3028,64 @@ int jrn_child_lost_roll(int argc, char** argv) {
 }
 #endif
 
+/* Replay must not change the live settings (#1608): a journaled
+ * (.log.posts ...) or (.sys.querylog.enable ...) is a no-op while a log
+ * replays, in both directions, while the log's other entries still apply. */
+static bool jsw_replay(const char* base, int to, int64_t* seen) {
+    char src[1400];
+    ray_t* r;
+    bool ok = true;
+    snprintf(src, sizeof src,
+             "(do (.log.open 'async \"%s\") (.log.write (quote (.log.posts %d)))"
+             " (.log.write (quote (.sys.querylog.enable %d)))"
+             " (.log.write (quote (set __jsw_seen (.log.posts)))) (.log.close))",
+             base, to, to);
+    r = ray_eval_str(src);
+    ok = ok && r && !RAY_IS_ERR(r);
+    if (r) ray_release(r);
+    snprintf(src, sizeof src, "(.log.replay \"%s.log\")", base);
+    r = ray_eval_str(src);
+    ok = ok && r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 3;
+    if (r) ray_release(r);
+    r = ray_eval_str("__jsw_seen");
+    *seen = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 ? r->i64 : -1;
+    if (r) ray_release(r);
+    ray_journal_purge();
+    cleanup_base(base);
+    return ok;
+}
+
+static test_result_t test_replay_keeps_live_switches(void) {
+    char base[256];
+    if (ray_journal_is_open()) ray_journal_close();
+    /* live off, the log turns them on */
+    ray_journal_set_posts(false);
+    ray_qlog_set_enabled(false);
+    make_base(base, sizeof(base), "sw_on");
+    int64_t seen_on = 0;
+    bool ok_on = jsw_replay(base, 1, &seen_on);
+    bool posts_a = ray_journal_posts(), qlog_a = ray_qlog_enabled();
+    /* live on, the log turns them off */
+    ray_journal_set_posts(true);
+    ray_qlog_set_enabled(true);
+    make_base(base, sizeof(base), "sw_off");
+    int64_t seen_off = 0;
+    bool ok_off = jsw_replay(base, 0, &seen_off);
+    bool posts_b = ray_journal_posts(), qlog_b = ray_qlog_enabled();
+    ray_journal_set_posts(false);
+    ray_qlog_set_enabled(false);
+
+    TEST_ASSERT_TRUE(ok_on);
+    TEST_ASSERT_TRUE(ok_off);
+    TEST_ASSERT_FALSE(posts_a);
+    TEST_ASSERT_FALSE(qlog_a);
+    TEST_ASSERT_EQ_I(seen_on, 0);   /* read the live setting during replay */
+    TEST_ASSERT_TRUE(posts_b);
+    TEST_ASSERT_TRUE(qlog_b);
+    TEST_ASSERT_EQ_I(seen_off, 1);
+    PASS();
+}
+
 static test_result_t test_ops_log_status(void) {
     char base[256]; make_base(base, sizeof(base), "ops_status");
     char want[300]; snprintf(want, sizeof(want), "%s.log", base);
@@ -3044,7 +3103,7 @@ static test_result_t test_ops_log_status(void) {
     ray_journal_purge();
 
     ray_t* s0 = ray_eval_str("(.log.status)");
-    bool s0_shape = s0 && !RAY_IS_ERR(s0) && s0->type == RAY_DICT && ray_dict_len(s0) == 6;
+    bool s0_shape = s0 && !RAY_IS_ERR(s0) && s0->type == RAY_DICT && ray_dict_len(s0) == 7;
     bool s0_closed = !status_open(s0) && !status_opened_ok(s0) && status_bytes(s0) == 0
                      && status_is_null(s0, "path") && status_is_null(s0, "mode");
     status_free(s0);
@@ -3876,6 +3935,7 @@ const test_entry_t journal_entries[] = {
     { "journal/ops_write_auto_journal_eval", test_ops_write_rejects_auto_journal_eval, jrn_setup, jrn_teardown },
     { "journal/ops_auto_journal_eval_predicate", test_ops_auto_journal_eval_predicate, jrn_setup, jrn_teardown },
     { "journal/ops_log_status", test_ops_log_status, jrn_setup, jrn_teardown },
+    { "journal/replay_keeps_live_switches", test_replay_keeps_live_switches, jrn_setup, jrn_teardown },
     { "journal/ops_log_status_open_stage", test_ops_log_status_open_stage, jrn_setup, jrn_teardown },
     { "journal/ops_write_auto_journal_eval_scope", test_ops_write_auto_journal_eval_scope, jrn_setup, jrn_teardown },
     { "journal/ops_write_serde_size_zero", test_ops_write_serde_size_zero,        jrn_setup, jrn_teardown },

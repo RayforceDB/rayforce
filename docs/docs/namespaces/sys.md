@@ -362,6 +362,10 @@ server-wide behaviour.
 
 The `-Q` startup flag is the equivalent for enabling logging from launch.
 
+While a journal replays (`.log.replay`, or the `-l`/`-L` startup replay), a
+journaled `.sys.querylog.enable` changes nothing and returns the current state,
+so recovering a log never turns logging on or off behind `-Q`.
+
 ## `.sys.join.par.min` { #sys-join-par-min }
 
 Signature: `(.sys.join.par.min [rows])`. Reads or sets the probe-side row count

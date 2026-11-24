@@ -400,6 +400,13 @@ static ray_t* eval_one(ray_t* msg) {
 
 bool ray_journal_is_open(void) { return g_journal.fp != NULL; }
 
+/* Whether async IPC requests are journaled (#1608).  A process setting, not
+ * part of a journal: it survives .log.close, .log.roll and .log.purge. */
+static bool g_journal_posts = false;
+
+bool ray_journal_posts(void) { return g_journal_posts; }
+void ray_journal_set_posts(bool on) { g_journal_posts = on; }
+
 void ray_journal_info(ray_journal_info_t* out) {
     out->open      = g_journal.fp != NULL;
     out->opened_ok = g_journal.opened_ok;
@@ -590,11 +597,12 @@ static ray_err_t journal_replay_from(const char*           path,
         if (restricted)
             ray_eval_lift_check(&lifts, note ? (const int64_t*)ray_data(note) + 2 : NULL,
                                 note ? note->len - 2 : 0);
-        /* A SYNC frame is an IPC request journaled as it arrived: its
-         * arguments get the literal-fallback mark the live request gave them
-         * (ray_ipc_mark_request_args), so a data list whose head names a
-         * global that is not a function is data on replay as it was live.
-         * A .log.write entry is an ASYNC frame, evaluated as written. */
+        /* A SYNC frame is an IPC request, sync or async (#1608), journaled
+         * as it arrived: its arguments get the literal-fallback mark the
+         * live request gave them (ray_ipc_mark_request_args), so a data list
+         * whose head names a global that is not a function is data on replay
+         * as it was live.  A .log.write entry is an ASYNC frame, evaluated
+         * as written. */
         if (hdr.msgtype == RAY_IPC_MSG_SYNC) ray_ipc_mark_request_args(msg);
         ray_restrict_save_t prev_restricted;
         ray_eval_restrict_enter(restricted, &prev_restricted);

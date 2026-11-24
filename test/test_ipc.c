@@ -1544,6 +1544,234 @@ static test_result_t test_ipc_journal_snapshot_literal_args(void) {
     PASS();
 }
 
+/* ---- #1608: async requests are journaled like sync ones ----
+ * Every request a server evaluates, sync or async, is written to the journal
+ * once, before it runs, so replay rebuilds the effects of `.ipc.post`
+ * requests too, in the order the server ran them across connections. */
+static ray_t* j1608_eval(const char* q) {
+    return ray_eval_str(q);
+}
+
+static void j1608_drop(ray_t* r) {
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+}
+
+static void j1608_boot(void) {
+    j1608_drop(j1608_eval("(do (set __j1608_a 42) (set __j1608_seq (list)) (set __j1608_hits 0)"
+                          " (set __j1608_upd (fn [m] (set __j1608_seq (concat __j1608_seq (list m)))"
+                          " (count __j1608_seq))) 0)"));
+    j1608_drop(j1608_eval("(set .ipc.on.async (fn [m] (set __j1608_hits (+ __j1608_hits 1))"
+                          " (if (== (type m) 'str) (eval (parse m)) (eval m))))"));
+}
+
+static ray_t* j1608_state(void) {
+    return j1608_eval("(repr (list __j1608_seq __j1608_hits))");
+}
+
+static bool j1608_post(int64_t h, const char* q, bool list) {
+    ray_t* m = list ? ray_eval_str(q) : ray_str(q, strlen(q));
+    if (!m || RAY_IS_ERR(m)) { j1608_drop(m); return false; }
+    ray_err_t e = ray_ipc_send_async(h, m);
+    ray_release(m);
+    return e == RAY_OK;
+}
+
+static bool j1608_send(int64_t h, const char* q) {
+    ray_t* m = ray_eval_str(q);
+    if (!m || RAY_IS_ERR(m)) { j1608_drop(m); return false; }
+    ray_t* r = ray_ipc_send(h, m);
+    ray_release(m);
+    bool ok = r && !RAY_IS_ERR(r);
+    j1608_drop(r);
+    return ok;
+}
+
+/* (.log.posts on): true when the verb and (.log.status) agree on it */
+static bool j1608_posts(int on) {
+    char q[96];
+    snprintf(q, sizeof q, "(.log.posts %d)", on);
+    ray_t* r = j1608_eval(q);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == on;
+    j1608_drop(r);
+    r = j1608_eval("(get (.log.status) 'posts)");
+    ok = ok && r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && (r->b8 != 0) == (on != 0);
+    j1608_drop(r);
+    return ok;
+}
+
+/* A1, the data list of A2, S1, S2, A4, S3, S4: A3 does not parse */
+#define J1608_SEQ "(list (as 'SYM \"A1\") (list (as 'SYM \"__j1608_a\") (as 'SYM \"A2\")) (as 'SYM \"S1\") (as 'SYM \"S2\") (as 'SYM \"A4\") (as 'SYM \"S3\") (as 'SYM \"S4\"))"
+
+static test_result_t test_ipc_journal_async_requests(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608");
+    ipc_rm_journal(jbase);
+    j1608_boot();
+    TEST_ASSERT_TRUE(j1608_posts(1));
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h1 = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0) && (h2) >= (0), "connected");
+    /* Interleaved across two connections; a sync request on a connection
+     * returns after every request posted before it on that connection ran.
+     * A1 is a string, A2 a list whose argument is a data list (its head is
+     * a global that is not a function), A3 a string that does not parse. */
+    bool ok = true;
+    ok &= j1608_post(h1, "(__j1608_upd 'A1)", false);
+    ok &= j1608_post(h1, "(list '__j1608_upd (list '__j1608_a 'A2))", true);
+    ok &= j1608_send(h1, "(list '__j1608_upd (list 'quote 'S1))");
+    ok &= j1608_send(h2, "(list '__j1608_upd (list 'quote 'S2))");
+    ok &= j1608_post(h2, "(__j1608_upd 'A3", false);
+    ok &= j1608_post(h2, "(__j1608_upd 'A4)", false);
+    ok &= j1608_send(h2, "(list '__j1608_upd (list 'quote 'S3))");
+    ok &= j1608_send(h1, "(list '__j1608_upd (list 'quote 'S4))");
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1608_state();
+    bool off = j1608_posts(0);   /* replay does not read the switch */
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(off);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    /* the async hook ran for the four posts, the unparsable one included */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list " J1608_SEQ " 4)");
+
+    /* .log.replay_report: one entry per request, eight, of which the
+     * unparsable post is the one evaluation error, as it was live */
+    j1608_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    TEST_ASSERT_TRUE(rep && !RAY_IS_ERR(rep));
+    ray_t* ent = ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7)));
+    ray_t* errs = ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11)));
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    ray_t* replayed = j1608_state();
+
+    /* -l recovery of the same journal */
+    j1608_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* recovered = j1608_state();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_EQ_I(n_ent, 8);
+    TEST_ASSERT_EQ_I(n_err, 1);
+    TEST_ASSERT_TRUE(replayed && !RAY_IS_ERR(replayed) && replayed->type == -RAY_STR);
+    TEST_ASSERT_TRUE(recovered && !RAY_IS_ERR(recovered) && recovered->type == -RAY_STR);
+    /* the same sequence; the async hook is not run on replay, as the sync
+     * hook is not: its count stays 0 */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(replayed),
+                       "(list " J1608_SEQ " 0)");
+    TEST_ASSERT_STR_EQ(ray_str_ptr(recovered), ray_str_ptr(replayed));
+    ray_release(live);
+    ray_release(replayed);
+    ray_release(recovered);
+    PASS();
+}
+
+/* The posts switch is off by default (#1608): an open journal records the
+ * sync requests only, as it always did, and .log.write inside an async
+ * request writes its own entry, which replay evaluates. */
+static test_result_t test_ipc_journal_async_off(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608o");
+    ipc_rm_journal(jbase);
+    j1608_boot();
+    ray_t* st = j1608_eval("(list (.log.posts) (get (.log.status) 'posts))");
+    bool dflt = st && !RAY_IS_ERR(st) && st->type == RAY_LIST && st->len == 2 &&
+                ray_list_get(st, 0)->i64 == 0 && ray_list_get(st, 1)->b8 == 0;
+    j1608_drop(st);
+    TEST_ASSERT_TRUE(dflt);
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "connected");
+    bool ok = j1608_post(h, "(__j1608_upd 'A1)", false);
+    ok &= j1608_post(h, "(set __j1608_w (type (.log.write (quote (__j1608_upd 'W)))))", false);
+    ok &= j1608_send(h, "(list '__j1608_upd (list 'quote 'S1))");
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1608_state();
+    ray_t* w = j1608_eval("(repr __j1608_w)");
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    j1608_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    ray_t* ent = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7))) : NULL;
+    ray_t* errs = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11))) : NULL;
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    ray_t* replayed = j1608_state();
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && w->type == -RAY_STR);
+    TEST_ASSERT_TRUE(replayed && !RAY_IS_ERR(replayed) && replayed->type == -RAY_STR);
+    /* live: both posts ran, and .log.write returned instead of raising */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"A1\") (as 'SYM \"S1\")) 2)");
+    /* the log: the .log.write entry and S1; the posts are not in it */
+    TEST_ASSERT_EQ_I(n_ent, 2);
+    TEST_ASSERT_EQ_I(n_err, 0);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(replayed),
+                       "(list (list (as 'SYM \"W\") (as 'SYM \"S1\")) 0)");
+    ray_release(live);
+    ray_release(w);
+    ray_release(replayed);
+    PASS();
+}
+
+/* A restricted connection's async request the server refused live is
+ * refused on replay too: it is journaled with the restricted mark. */
+static test_result_t test_ipc_journal_async_restricted(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608r");
+    ipc_rm_journal(jbase);
+    (void)unsetenv("RF_J1608");
+    TEST_ASSERT_TRUE(j1608_posts(1));
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "connected");
+    bool ok = j1608_post(h, "(.os.setenv \"RF_J1608\" \"1\")", false);
+    ok &= j1608_send(h, "(+ 1 2)");          /* the post ran before this answer */
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    const char* live = getenv("RF_J1608");
+    bool off = j1608_posts(0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(off);
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    ray_t* ent = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7))) : NULL;
+    ray_t* errs = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11))) : NULL;
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    const char* replayed = getenv("RF_J1608");
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(live == NULL);
+    TEST_ASSERT_EQ_I(n_ent, 2);
+    TEST_ASSERT_EQ_I(n_err, 1);       /* refused again: access */
+    TEST_ASSERT_TRUE(replayed == NULL);
+    PASS();
+}
+
 /* ---- test_ipc_decompress_literal_overrun -------------------------------- */
 /*
  * Exercise the literal-block overrun guard in ray_ipc_decompress
@@ -4241,6 +4469,9 @@ const test_entry_t ipc_entries[] = {
     { "ipc/journal_path",               test_ipc_journal_path,                   ipc_setup, ipc_teardown },
     { "ipc/journal_replay_literal_args", test_ipc_journal_replay_literal_args, ipc_setup, ipc_teardown },
     { "ipc/journal_replay_skips_sync_hook", test_ipc_journal_replay_skips_sync_hook, ipc_setup, ipc_teardown },
+    { "ipc/journal_async_requests",     test_ipc_journal_async_requests,         ipc_setup, ipc_teardown },
+    { "ipc/journal_async_restricted",   test_ipc_journal_async_restricted,       ipc_setup, ipc_teardown },
+    { "ipc/journal_async_off",          test_ipc_journal_async_off,              ipc_setup, ipc_teardown },
     { "ipc/journal_snapshot_literal_args", test_ipc_journal_snapshot_literal_args, ipc_setup, ipc_teardown },
     { "ipc/decompress_literal_overrun", test_ipc_decompress_literal_overrun,     ipc_setup, ipc_teardown },
     { "ipc/compress_small",             test_ipc_compress_small,                 ipc_setup, ipc_teardown },
