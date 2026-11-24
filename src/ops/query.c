@@ -23058,9 +23058,9 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
      * value per row, never a necessary partition constraint (the mask reads
      * no comparison below it). The route (compiled per row or interpreted)
-     * is chosen from the AST and the schema; interpreted whole, any non-null
-     * vector condition is truthy (is_truthy), so ray_cond_fn takes THEN on
-     * the pruned source as on the full one. */
+     * is chosen from the AST and the schema; interpreted, a BOOL vector
+     * condition chooses per row (#1605), on the pruned source as on the
+     * full one. */
     if (mode == 2 && n == 4 && fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
         (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn && prune_head_named(el[0], "if")) {
         int budget = PRUNE_IF_MAX_VISITS;
@@ -23143,9 +23143,9 @@ static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
  * I64, F64 or SYM (0: declined). Compiled IF is per-row; its
  * aggregate-free fallback scatters per-row after WHERE too. A SYM branch
  * reads as text: OP_IF re-expresses every side in the runtime domain.
- * Also an operand in where: (prune_where_elementwise_impl). Mixed branch
- * types (an I64 null read as an F64), aggregate inputs, BY IF and aliases
- * stay declined. */
+ * Also an operand in where: (prune_where_elementwise_impl) and a by: key
+ * (prune_by_key_ok). Mixed branch types (an I64 null read as an F64),
+ * aggregate inputs and aliases stay declined. */
 static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
     if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return 0;
     int8_t t = prune_if_leaf_type(e, tbl);
@@ -23197,6 +23197,18 @@ static bool prune_output_ok(ray_t* e, ray_t* tbl, bool grouped) {
 }
 
 /* A by: clause of column names or elementwise expressions. */
+/* A by: key reads only its row: elementwise, or an if of the bounded
+ * ungrouped grammar (prune_if_projection: branches of one type, I64, F64
+ * or SYM, conditions comparisons of a column with a constant).  The key is
+ * computed over the rows the where keeps, compiled per row or by the
+ * evaluator, whose if chooses per row for a BOOL vector condition (#1605),
+ * so the stand-in row of a skipped partition never forms a group (#1604). */
+static bool prune_by_key_ok(ray_t* e, ray_t* tbl) {
+    if (prune_where_elementwise(e, tbl)) return true;
+    int budget = PRUNE_IF_MAX_VISITS;
+    return prune_if_projection(e, tbl, &budget, 0) != 0;
+}
+
 static bool prune_by_ok(ray_t* by, ray_t* tbl) {
     if (!by) return true;
     if (by->type == RAY_SYM) {                                 /* [k m] */
@@ -23211,10 +23223,10 @@ static bool prune_by_ok(ray_t* by, ray_t* tbl) {
         ray_t* vals = ray_dict_vals(by);
         if (!vals || vals->type != RAY_LIST) return false;
         for (int64_t i = 0; i < vals->len; i++)
-            if (!prune_where_elementwise(((ray_t**)ray_data(vals))[i], tbl)) return false;
+            if (!prune_by_key_ok(((ray_t**)ray_data(vals))[i], tbl)) return false;
         return true;
     }
-    return prune_where_elementwise(by, tbl);
+    return prune_by_key_ok(by, tbl);
 }
 
 /* Separate group-only proof. Do not broaden the ordinary ATOMIC contract or
