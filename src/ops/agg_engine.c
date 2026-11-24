@@ -13796,6 +13796,9 @@ static void agg_key_directory_insert(void* raw, uint32_t wid, int64_t start, int
                     atomic_fetch_or_explicit(&c->inexact, RAY_KEY_FLOAT, memory_order_relaxed); \
                     break; \
                 } \
+                hash ^= hash >> 33; hash *= UINT64_C(0xff51afd7ed558ccd); \
+                hash ^= hash >> 33; hash *= UINT64_C(0xc4ceb9fe1a85ec53); \
+                hash ^= hash >> 33; \
                 slot = hash & (c->capacity - 1); \
             } \
             for (;;) { \
@@ -14005,6 +14008,9 @@ rescan:
             goto rescan;
         }
         if (RAY_UNLIKELY(spanned && !spans)) goto rescan;
+        h ^= h >> 33; h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
         uint64_t slot = h & mask;
         for (;;) {
             int32_t gptr = ht_gid[slot];

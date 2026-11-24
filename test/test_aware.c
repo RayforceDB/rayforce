@@ -5894,6 +5894,49 @@ static test_result_t test_parted_strlen_avg(void) {
     PASS();
 }
 
+/* The temporal accessor builtins in a projection, (dd d) as d.dd, compile
+ * to the DAG extract over the whole column, with the builtin's per-row
+ * answer (nulls included), instead of the per-row eval fallback. */
+static test_result_t test_temporal_accessor_dag(void) {
+    aw_save("ta", "(table [d ts t] (list "
+                  "(at (concat (+ 2013.07.01 (til 400)) (as 'DATE [0N])) (% (til 70000) 401)) "
+                  "(as 'TIMESTAMP (at (concat (* (til 997) 3700000000123) [0N]) (% (til 70000) 998))) "
+                  "(as 'TIME (* (% (til 70000) 86400) 1000))))", -1);
+    static const char* const ac[][2] = {
+        {"yyyy", "d"}, {"mm", "d"}, {"dd", "d"}, {"dow", "d"}, {"doy", "d"},
+        {"yyyy", "ts"}, {"mm", "ts"}, {"dd", "ts"}, {"hh", "ts"}, {"minute", "ts"},
+        {"ss", "ts"}, {"dow", "ts"}, {"doy", "ts"}, {"hh", "t"}, {"minute", "t"}, {"ss", "t"},
+    };
+    for (size_t i = 0; i < sizeof ac / sizeof *ac; i++) {
+        char q[512];
+        snprintf(q, sizeof q,
+                 "(do (set R (at (select {v: (%s %s) from: T}) 'v)) (set E (%s (at T '%s))) "
+                 "(and (== (count R) 70000) (all (== (nil? R) (nil? E))) (all (== (fill 0 R) (fill 0 E)))))",
+                 ac[i][0], ac[i][1], ac[i][0], ac[i][1]);
+        uint64_t x0 = ray_temporal_test_dag_extracts();
+        AW_EXPECT("ta", q, "true");
+        TEST_ASSERT_FMT(ray_temporal_test_dag_extracts() >= x0 + 2, "(%s %s): not the DAG extract", ac[i][0], ac[i][1]);
+    }
+    /* an accessor under a grouped aggregate: one extract over the column,
+     * not an evaluation per group */
+    uint64_t g0 = ray_temporal_test_dag_extracts();
+    AW_EXPECT("ta", "(do (set G (select {from: (table [k d] (list (% (til 70000) 5003) (at T 'd))) by: k a: (min (dd d))})) "
+                    "(set O (select {from: (table [k x] (list (% (til 70000) 5003) (dd (at T 'd)))) by: k a: (min x)})) "
+                    "(set A (at (select {from: G asc: k}) 'a)) (set B (at (select {from: O asc: k}) 'a)) "
+                    "(and (== (count G) 5003) (all (== (nil? A) (nil? B))) (all (== (fill 0 A) (fill 0 B)))))", "true");
+    TEST_ASSERT_FMT(ray_temporal_test_dag_extracts() >= g0 + 1 && ray_temporal_test_dag_extracts() < g0 + 100,
+                    "(min (dd d)) by k: %llu extracts, want the column's own",
+                    (unsigned long long)(ray_temporal_test_dag_extracts() - g0));
+    aw_eval_ok("(set G 0)");
+    aw_eval_ok("(set A 0)");
+    aw_eval_ok("(set B 0)");
+    aw_eval_ok("(set O 0)");
+    aw_eval_ok("(set R 0)");
+    aw_eval_ok("(set E 0)");
+    aw_eval_ok("(set T 0)");
+    PASS();
+}
+
 const test_entry_t aware_entries[] = {
     { "aware/vview_encodings", test_vview_encodings, aw_setup, aw_teardown },
     { "aware/vview_near_top",  test_vview_near_top,  aw_setup, aw_teardown },
@@ -5989,6 +6032,7 @@ const test_entry_t aware_entries[] = {
     { "aware/parted_in",            test_parted_in,            aw_setup, aw_teardown },
     { "aware/splayed_in_later",     test_splayed_in_later,     aw_setup, aw_teardown },
     { "aware/parted_strlen_avg",    test_parted_strlen_avg,    aw_setup, aw_teardown },
+    { "aware/temporal_accessor_dag", test_temporal_accessor_dag, aw_setup, aw_teardown },
     { "aware/signed_zeros",      test_signed_zeros,      aw_setup, aw_teardown },
     { "aware/symbol_order",      test_symbol_order,      aw_setup, aw_teardown },
     { "aware/agg_admission",     test_agg_admission,     aw_setup, aw_teardown },
