@@ -213,7 +213,7 @@ Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a ro
 
 ## Linear Algebra { #linalg }
 
-A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); sums accumulate in double either way, and a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); `mmu` and `gram` compute in the operands' own precision, F32 rows in single and F64 rows in double, while `inv` and `lsq` always solve in double; a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
 
 | Function | Type | Attr | Description | Example |
 |---|---|---|---|---|
