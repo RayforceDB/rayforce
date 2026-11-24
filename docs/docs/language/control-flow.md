@@ -31,7 +31,18 @@ other result, are never evaluated:
 0
 ```
 
-Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form; a chain without a fallback is left to the evaluator.
+Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form; a chain without a fallback is left to the evaluator. This holds wherever the `if` sits in the expression: in an argument of a builtin call (`(== a (if c 'x 'y))`, `(not ...)`), of `and` and `or`, of `do`, in the value of a `let`, in the expression of a `try`, and in the body of a helper the planner inlines (a pure one-statement lambda). So `(and (> p 0) (== a (if c 'x 'y)))` compares each row with its own arm. These forms keep their own rules: `and` and `or` stop on a scalar that decides them, `do` evaluates in turn, and `try` hands an error raised anywhere in its expression, a mix of arm types included, to its handler for the whole column. Arguments are evaluated left to right, as outside a query, so a `let` in one binds for the arguments after it only: `(== a (let a (if c 'x 'y)))` compares the column with the new value, and `(== (let a (if c 'x 'y)) a)` compares the new value with itself.
+
+A `where:` predicate leaves the choice to the evaluator, which tests the condition vector whole and so gives every row the first arm, in four cases:
+
+- a side effect anywhere in it: a lambda that sets a global, `set`, or a `try` handler that raises ([#1610](https://github.com/RayforceDB/rayforce/issues/1610));
+- an `if` inside a helper the planner does not inline: several statements, a closure, or recursion ([#1611](https://github.com/RayforceDB/rayforce/issues/1611));
+- a name a `let` binds and a later argument of the same `do` reads: this raises `schema` ([#1612](https://github.com/RayforceDB/rayforce/issues/1612));
+- a nested query anywhere in it, in an arm or beside the `if`, such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`; the same holds for such an output under `by:` ([#1629](https://github.com/RayforceDB/rayforce/issues/1629)).
+
+Projections answer per row in all four.
+
+Under `by:`, an output where a `let` in one aggregate's argument binds a name that the rest of the output also reads, such as `(+ (sum (== a (let a (if c 'x 'y)))) (sum (== a 'x)))`, is evaluated per group as written. Its `if` then tests each group's condition vector whole ([#1617](https://github.com/RayforceDB/rayforce/issues/1617)). With one aggregate, `(sum (== a (let a (if c 'x 'y))))`, the output answers per row.
 
 A query's `if` gives one column, so its arms must have a common type. Two
 numeric arms take the [promotion table](math.md#result-types) (`(if c i 1.5)`

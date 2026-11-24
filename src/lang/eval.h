@@ -526,6 +526,8 @@ bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
+ray_t* ray_try_finish(ray_t* result, ray_t* handler_expr);
+uint8_t ray_eval_last_rows(void);
 bool   ray_try_handler_is_value(ray_t* handler_expr);
 
 

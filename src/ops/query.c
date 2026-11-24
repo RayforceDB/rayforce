@@ -11515,6 +11515,9 @@ static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
 
 static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl);
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth);
+/* The calls the walk for a query's `if` enters (rw_call_kind). */
+enum { RW_CALL_NONE, RW_CALL_BUILTIN, RW_CALL_LOGIC, RW_CALL_DO, RW_CALL_TRY, RW_CALL_LET };
+static int rw_call_kind(ray_t* e, ray_t* tbl);
 static bool query_code_needs_group(ray_t* e, ray_t* tbl, bool head, int depth, int* budget, bool verbs);
 
 /* Does `e` read only its own row: no aggregate and no whole-column verb
@@ -11578,24 +11581,95 @@ static bool rw_pure(ray_t* e, ray_t* tbl, int depth);
 
 typedef struct {
     ray_t*  tbl;        /* the groups' table */
+    ray_t*  root;       /* the whole expression the walk started from */
     ray_t*  out;        /* it with the hidden columns, once one is added */
     int64_t next;
 } if_hoist_t;
+
+/* How often the plain name `sym` occurs in `e` (a `let`'s name included),
+ * past no quote or lambda literal. */
+static int64_t rw_name_count(ray_t* e, int64_t sym, int depth) {
+    if (!e || (e->attrs & ATTR_QUOTED) || depth > 64) return 0;
+    if (e->type == -RAY_SYM) return e->i64 == sym ? 1 : 0;
+    if (e->type != RAY_LIST || e->len < 1) return 0;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (es[0]->type == -RAY_SYM &&
+        (es[0]->i64 == ray_sym_intern("fn", 2) || es[0]->i64 == ray_sym_intern("quote", 5)))
+        return 0;
+    int64_t n = 0;
+    for (int64_t i = 0; i < e->len; i++) n += rw_name_count(es[i], sym, depth + 1);
+    return n;
+}
+
+/* The names the `let`s in `e` bind (rw_call_kind), added to names[n..cap):
+ * the new count.  Not past a `do`, which keeps its bindings to itself, a
+ * quote or a lambda literal. */
+static int rw_let_names(ray_t* e, ray_t* tbl, int64_t* names, int n, int cap, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 64)
+        return n;
+    ray_t** es = (ray_t**)ray_data(e);
+    int kind = rw_call_kind(e, tbl);
+    if (kind == RW_CALL_DO) return n;
+    if (es[0]->type == -RAY_SYM &&
+        (es[0]->i64 == ray_sym_intern("fn", 2) || es[0]->i64 == ray_sym_intern("quote", 5)))
+        return n;
+    if (kind == RW_CALL_LET && n < cap) names[n++] = es[1]->i64;
+    for (int64_t i = 1; i < e->len; i++) n = rw_let_names(es[i], tbl, names, n, cap, depth + 1);
+    return n;
+}
+
+static bool rw_holds_let(ray_t* e, ray_t* tbl) {
+    int64_t one[1];
+    return rw_let_names(e, tbl, one, 0, 1, 0) > 0;
+}
+
+/* Would hoisting `u` out of h->root change what a name reads?  A name some
+ * `let` in the root binds that occurs both in `u` and outside it: hoisted,
+ * `u` is evaluated before the rest, so a read on one side would no longer
+ * see a binding made on the other in the evaluator's order.  More such
+ * names than are counted is answered yes. */
+static bool rw_hoist_let_conflict(ray_t* u, if_hoist_t* h) {
+    int64_t names[17];   /* a 17th means more than are counted */
+    int n = rw_let_names(h->root, h->tbl, names, 0, 17, 0);
+    if (n > 16) return true;
+    for (int i = 0; i < n; i++) {
+        int64_t in = rw_name_count(u, names[i], 0);
+        if (in > 0 && rw_name_count(h->root, names[i], 0) > in) return true;
+    }
+    return false;
+}
 
 /* `e` with each outermost `if` that reads only its own row (no aggregate,
  * no helper that reads the group, no effect) replaced by a hidden column
  * holding its value over the rows (query_eval_rowwise_if), added to h->out.
  * Evaluated per group, an aggregate around it, `(first (if c d (+ d 1)))`,
  * then reads the group's rows of that column instead of an `if` that tests
- * the group's condition vector whole.  The walk enters builtin calls only.
+ * the group's condition vector whole.  The walk enters builtin calls and
+ * `and` / `or`; a `do`, `try` or `let` holding such an `if` is hoisted whole
+ * (rw_call_kind).
  * Owned; an error is the query's. */
 static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32) {
         ray_retain(e); return e;
     }
     ray_t** es = (ray_t**)ray_data(e);
-    if (rw_if_kind(e, h->tbl)) {
-        if (!expr_reads_own_row(e, h->tbl) || !expr_refs_row_column(e, h->tbl) ||
+    int kind = rw_call_kind(e, h->tbl);
+    /* A `do`, `try` or `let` holding such an `if` is hoisted whole: its
+     * `if` may read a name the form binds first, and an error under a `try`
+     * is its handler's.  So is a builtin call or an `and` / `or` holding a
+     * `let` as well, when it reads its own row: its arguments keep their
+     * order (rw_eval_call).  A `let` hoisted binds its name in the scope of
+     * that evaluation only, so nothing is hoisted that shares a name a
+     * `let` binds with the rest of the expression (rw_hoist_let_conflict):
+     * such an expression is evaluated per group as written. */
+    bool held_let = (kind == RW_CALL_BUILTIN || kind == RW_CALL_LOGIC) &&
+                    rw_has_if(e, h->tbl, 0) && rw_holds_let(e, h->tbl) &&
+                    expr_reads_own_row(e, h->tbl);
+    if (rw_if_kind(e, h->tbl) || held_let ||
+        ((kind == RW_CALL_DO || kind == RW_CALL_TRY || kind == RW_CALL_LET) &&
+         rw_has_if(e, h->tbl, 0))) {
+        if (rw_hoist_let_conflict(e, h) ||
+            !expr_reads_own_row(e, h->tbl) || !expr_refs_row_column(e, h->tbl) ||
             !rw_pure(e, h->tbl, 0)) { ray_retain(e); return e; }
         if (ray_env_push_query_scope() != RAY_OK) return ray_error("oom", NULL);
         ray_t* bind_err = NULL;
@@ -11625,13 +11699,9 @@ static ray_t* nonagg_hoist_if(ray_t* e, if_hoist_t* h, int depth) {
         }
         return ray_sym(sym);
     }
-    ray_t* hd = es[0];
-    if (!hd || hd->type != -RAY_SYM || (hd->attrs & ATTR_QUOTED) ||
-        tbl_has_col(h->tbl, hd->i64) || ray_env_has_lexical_local(hd->i64)) { ray_retain(e); return e; }
-    ray_t* fn = ray_env_get(hd->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM)) {
-        ray_retain(e); return e;
-    }
+    /* into a builtin call, and an `and` or `or`: its `if` is hoisted even
+     * behind a scalar that decides the fold, as the planned route computes it */
+    if (kind != RW_CALL_BUILTIN && kind != RW_CALL_LOGIC) { ray_retain(e); return e; }
     ray_t* out = NULL;
     for (int64_t i = 1; i < e->len; i++) {
         ray_t* a = nonagg_hoist_if(es[i], h, depth + 1);
@@ -11710,7 +11780,7 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     ray_t* expr0 = expr;
     ray_t* tbl0 = tbl;
     /* an `if` beside or under an aggregate: its column over the rows */
-    if_hoist_t hs = { .tbl = tbl };
+    if_hoist_t hs = { .tbl = tbl, .root = expr };
     ray_t* hoisted = NULL;
     if (rw_has_if(expr, tbl, 0)) {
         hoisted = nonagg_hoist_if(expr, &hs, 0);
@@ -12089,13 +12159,10 @@ static ray_t* rw_inner_ifs_check(ray_t* e, ray_t* tbl, int64_t nrows, int depth)
         if (v) ray_release(v);
         return NULL;
     }
+    /* not into a `try`: an error under it is its handler's to answer */
+    int kind = rw_call_kind(e, tbl);
+    if (kind == RW_CALL_NONE || kind == RW_CALL_TRY) return NULL;
     ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return NULL;
-    ray_t* fn = ray_env_get(h->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
-        return NULL;
     for (int64_t i = 1; i < e->len; i++) {
         ray_t* err = rw_inner_ifs_check(es[i], tbl, nrows, depth + 1);
         if (err) return err;
@@ -12455,19 +12522,43 @@ static int rw_if_kind(ray_t* e, ray_t* tbl) {
            (ray_vary_fn)(uintptr_t)fn->i64 == ray_cond_fn ? 1 : 0;
 }
 
+/* The calls the walk enters (rw_has_if): a builtin call, and the special
+ * forms whose arguments are whole values as a builtin's are: `and` / `or`
+ * (stopping early on a scalar, rw_eval_logic), `do` (in turn, the last one
+ * its value, rw_eval_do), `try` (its expression, the handler on an error,
+ * rw_eval_try) and `let` (its value, rw_eval_let).  RW_CALL_NONE for
+ * anything else: a lambda (inlined first where it is pure), another special
+ * form, a quoted list, a head a column, a local or a rebinding shadows.
+ * Not entering a form left an `if` under it to the evaluator's `if`, which
+ * tests the condition vector whole: every row took the `then` arm (#1603). */
+static int rw_call_kind(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2) return RW_CALL_NONE;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return RW_CALL_NONE;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return RW_CALL_NONE;
+    if (!(fn->attrs & RAY_FN_SPECIAL_FORM)) return RW_CALL_BUILTIN;
+    void* f = (void*)(uintptr_t)fn->i64;
+    if (fn->type == RAY_VARY && (f == (void*)ray_and_vary_fn || f == (void*)ray_or_vary_fn))
+        return RW_CALL_LOGIC;
+    if (fn->type == RAY_VARY && f == (void*)ray_do_fn) return RW_CALL_DO;
+    if (fn->type == RAY_BINARY && e->len == 3 && f == (void*)ray_try_fn) return RW_CALL_TRY;
+    if (fn->type == RAY_BINARY && e->len == 3 && f == (void*)ray_let_fn &&
+        es[1]->type == -RAY_SYM) return RW_CALL_LET;
+    return RW_CALL_NONE;
+}
+
 /* Does `e` hold such an `if` where the walk reaches: itself, or an argument
- * of a builtin call (no special form, lambda or quoted list is entered). */
+ * of a call rw_call_kind enters (no other special form, lambda or quoted
+ * list is entered). */
 static bool rw_has_if(ray_t* e, ray_t* tbl, int depth) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 32)
         return false;
     if (rw_if_kind(e, tbl)) return true;
+    if (!rw_call_kind(e, tbl)) return false;
     ray_t** es = (ray_t**)ray_data(e);
-    ray_t* h = es[0];
-    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
-        tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
-    ray_t* fn = ray_env_get(h->i64);
-    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM))
-        return false;
     for (int64_t i = 1; i < e->len; i++)
         if (rw_has_if(es[i], tbl, depth + 1)) return true;
     return false;
@@ -12714,26 +12805,49 @@ static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, i
     return out;
 }
 
-/* `e`, a builtin call with such an `if` in an argument: the argument is
- * evaluated by rw_value and bound under a hidden name (`#` names no parsed
- * symbol), and the call evaluated over it once. */
+/* `e`, a builtin call with such an `if` in an argument: the arguments are
+ * evaluated in the evaluator's order, left to right, those up to the last
+ * such one here, each bound under a hidden name (`#` names no parsed
+ * symbol), and the call evaluated over them once.  An argument with such an
+ * `if` is evaluated by rw_value, and its value marked as the rows'; one
+ * before it that reads a name or calls something by the evaluator, keeping
+ * the provenance it gives.  Evaluating the `if` ones first read a name
+ * after a `let` in a later argument had rebound it: `(== a (let a (if c x
+ * y)))` compared the new `a` with itself and kept every row (#1603).
+ * Literals, and the arguments after the last such one, are left for the
+ * call, which reaches them in the same order.  The hidden names, and what a
+ * `let` in an argument binds, go to the innermost scope, as a `let` there
+ * binds (query_eval_rowwise_if pushes one for the expression). */
 static ray_t* rw_eval_call(ray_t* e, rw_ctx_t* c, int depth) {
     ray_t** es = (ray_t**)ray_data(e);
+    int64_t last = 0;
+    for (int64_t i = 1; i < e->len; i++)
+        if (rw_has_if(es[i], c->tbl, depth + 1)) last = i;
     ray_t* x = ray_list_new((int32_t)e->len);
     if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
-    if (ray_env_push_query_scope() != RAY_OK) { ray_release(x); return ray_error("oom", NULL); }
     ray_t* out = NULL;
     for (int64_t i = 0; i < e->len && !out; i++) {
         ray_t* a = es[i];
         ray_t* hid = NULL;
-        if (i > 0 && rw_has_if(a, c->tbl, depth + 1)) {
-            ray_t* v = rw_value(a, c, depth + 1);
+        bool has_if = i > 0 && i <= last && rw_has_if(a, c->tbl, depth + 1);
+        bool reads = i > 0 && i < last && !(a->attrs & ATTR_QUOTED) &&
+                     (a->type == -RAY_SYM || a->type == RAY_LIST);
+        if (has_if || reads) {
+            uint8_t rows = 1;
+            ray_t* v;
+            if (has_if) v = rw_value(a, c, depth + 1);
+            else {
+                v = ray_eval(a);
+                rows = ray_eval_last_rows();
+                v = rw_force(v);
+            }
             if (RAY_IS_ERR(v)) { out = v; break; }
             char nm[32];
             int ln = snprintf(nm, sizeof nm, "#if%lld", (long long)c->next++);
             int64_t s = ray_sym_intern(nm, (size_t)ln);
-            ray_env_set_query_local(s, v);
+            ray_err_t berr = ray_env_set_local_rows(s, v, rows);
             ray_release(v);
+            if (berr != RAY_OK) { out = ray_error(ray_err_code_str(berr), NULL); break; }
             hid = ray_sym(s);
             if (!hid || RAY_IS_ERR(hid)) { out = hid ? hid : ray_error("oom", NULL); break; }
             a = hid;
@@ -12747,9 +12861,88 @@ static ray_t* rw_eval_call(ray_t* e, rw_ctx_t* c, int depth) {
         x->attrs = e->attrs;
         out = rw_force(ray_eval(x));
     }
-    ray_env_pop_scope();
     ray_release(x);
     return out;
+}
+
+/* One argument of a special form the walk enters: by rw_value when it holds
+ * such an `if`, else by the evaluator as the form itself would. */
+static ray_t* rw_eval_arg(ray_t* a, rw_ctx_t* c, int depth) {
+    return rw_has_if(a, c->tbl, depth + 1) ? rw_value(a, c, depth + 1) : rw_force(ray_eval(a));
+}
+
+/* `e`, an `and` or `or` with such an `if` in an argument: the arguments in
+ * turn, each by rw_value when it holds one and by the evaluator otherwise,
+ * folded as ray_and_vary_fn / ray_or_vary_fn fold them, stopping where they
+ * stop (a scalar that decides), so an argument they never reach is not
+ * evaluated here either. */
+static ray_t* rw_eval_logic(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* fn = ray_env_get(es[0]->i64);
+    bool is_and = (ray_vary_fn)(uintptr_t)fn->i64 == ray_and_vary_fn;
+    ray_t* acc = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* v = rw_eval_arg(es[i], c, depth);
+        if (RAY_IS_ERR(v)) { if (acc) ray_release(acc); return v; }
+        if (!acc) {
+            acc = v;
+            if (e->len == 2) return acc;   /* (and x) is x */
+        } else {
+            ray_t* next = is_and ? ray_and_fn(acc, v) : ray_or_fn(acc, v);
+            ray_release(acc);
+            ray_release(v);
+            if (!next || RAY_IS_ERR(next)) return next ? next : ray_error("oom", NULL);
+            acc = next;
+        }
+        if (ray_is_atom(acc) && (is_truthy(acc) ? 1 : 0) != (is_and ? 1 : 0)) {
+            if (acc->type == -RAY_BOOL) return acc;
+            ray_release(acc);
+            return ray_bool(!is_and);
+        }
+    }
+    return acc;
+}
+
+/* `(do e1 ... en)` with such an `if` in an argument: the arguments in turn
+ * in a scope of their own, as ray_do_fn evaluates them, the last one the
+ * value; an error stops it. */
+static ray_t* rw_eval_do(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* v = NULL;
+    for (int64_t i = 1; i < e->len; i++) {
+        if (v) ray_release(v);
+        v = rw_eval_arg(es[i], c, depth);
+        if (RAY_IS_ERR(v)) break;
+    }
+    ray_env_pop_scope();
+    return v;
+}
+
+/* `(try x handler)` with such an `if` in `x`: `x` by rw_value, then what
+ * ray_try_fn does with its value (ray_try_finish): an error, an `if`'s
+ * refusal of its arms included, goes to the handler.  The handler is
+ * evaluated as written. */
+static ray_t* rw_eval_try(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* v = rw_eval_arg(es[1], c, depth);
+    return rw_force(ray_try_finish(v, es[2]));
+}
+
+/* `(let name x)` with such an `if` in `x`: its value by rw_value, bound as
+ * ray_let_fn binds it, in the innermost scope, marked as derived from the
+ * rows as every query local is (ray_env_set_query_local). */
+static ray_t* rw_eval_let(ray_t* e, rw_ctx_t* c, int depth) {
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* v = rw_eval_arg(es[2], c, depth);
+    if (RAY_IS_ERR(v)) return v;
+    ray_err_t err = ray_env_set_local_rows(es[1]->i64, v, 1);
+    if (err != RAY_OK) {
+        ray_release(v);
+        return err == RAY_ERR_ACCESS ? ray_error("access", "restricted")
+                                     : ray_error(ray_err_code_str(err), NULL);
+    }
+    return v;
 }
 
 /* `e` over c->tbl, an `if` in it choosing per row: the whole expression on
@@ -12771,7 +12964,14 @@ static ray_t* rw_value(ray_t* e, rw_ctx_t* c, int depth) {
     ray_graph_free(g);
     if (out) return out;
     if (depth <= 32 && rw_if_kind(e, c->tbl)) return rw_chain(e, 1, NULL, c, depth);
-    if (depth <= 32 && rw_has_if(e, c->tbl, depth)) return rw_eval_call(e, c, depth);
+    if (depth <= 32 && rw_has_if(e, c->tbl, depth))
+        switch (rw_call_kind(e, c->tbl)) {
+        case RW_CALL_LOGIC: return rw_eval_logic(e, c, depth);
+        case RW_CALL_DO:    return rw_eval_do(e, c, depth);
+        case RW_CALL_TRY:   return rw_eval_try(e, c, depth);
+        case RW_CALL_LET:   return rw_eval_let(e, c, depth);
+        default:            return rw_eval_call(e, c, depth);
+        }
     return rw_force(ray_eval(e));
 }
 
@@ -12815,7 +13015,11 @@ static ray_t* query_eval_rowwise_if(ray_t* e, ray_t* tbl) {
     if (!tbl || tbl->type != RAY_TABLE || !rw_has_if(e, tbl, 0) || !rw_pure(e, tbl, 0))
         return NULL;
     rw_ctx_t c = { .tbl = tbl, .nrows = ray_table_nrows(tbl) };
-    return rw_value(e, &c, 0);
+    /* the scope of the hidden names and of a `let` in `e` (rw_eval_call) */
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    ray_t* v = rw_value(e, &c, 0);
+    ray_env_pop_scope();
+    return v;
 }
 
 /* ray_eval of a query expression with its columns bound: an `if` over a

@@ -83,6 +83,12 @@ static inline uint8_t vrows_join(uint8_t a, uint8_t b) {
 static inline uint8_t vrows_from(int8_t r) { return r < 0 ? 2 : (uint8_t)r; }
 static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
 
+/* The provenance of the value the last ray_eval returned, in the VM's
+ * encoding (0 no, 1 rows, 2 unknown): what a local bound to it keeps, as
+ * `let` keeps it.  For a caller that evaluates a query's arguments itself
+ * (query.c rw_eval_call). */
+uint8_t ray_eval_last_rows(void) { return vrows_from(g_eval_rows); }
+
 #include <math.h>
 #include <signal.h>
 #include <time.h>
@@ -975,7 +981,14 @@ static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_ro
  * otherwise returned as a fallback value).
  * Special form: receives unevaluated args. */
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
-    ray_t* result = ray_eval(expr);
+    return ray_try_finish(ray_eval(expr), handler_expr);
+}
+
+/* The rest of `(try expr handler)` once `expr` has been evaluated to
+ * `result`: the value itself, or the handler's answer to its error.  A
+ * query's per-row pass evaluates `expr` its own way and finishes here, so
+ * the two agree on what is caught and how (query.c rw_eval_try). */
+ray_t* ray_try_finish(ray_t* result, ray_t* handler_expr) {
     if (!RAY_IS_ERR(result)) return result;
     if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
