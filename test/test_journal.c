@@ -1638,10 +1638,10 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     ray_t* fn = ray_env_get_global(ray_sym_intern("jrn_tr_put", 10));
     TEST_ASSERT_TRUE(fn && fn->type == RAY_LAMBDA && LAMBDA_TRUSTED(fn));
     ray_t* plain_bytes = ray_ser(fn);
-    bool prev = ray_serde_keep_trust(true);
+    bool prev = ray_serde_keep_marks(true);
     ray_t* marked_bytes = ray_ser(fn);
     ray_t* from_plain = ray_de(plain_bytes);
-    ray_serde_keep_trust(prev);
+    ray_serde_keep_marks(prev);
     ray_t* from_marked = ray_de(marked_bytes);
     bool plain_unmarked = from_plain && !RAY_IS_ERR(from_plain) &&
                           from_plain->type == RAY_LAMBDA && !LAMBDA_TRUSTED(from_plain);
@@ -1654,6 +1654,47 @@ static test_result_t test_journal_snapshot_keeps_trust(void) {
     }
     TEST_ASSERT_TRUE(plain_unmarked);
     TEST_ASSERT_TRUE(marked_unmarked);
+    PASS();
+}
+
+/* 7f2. #1609: a list's literal-fallback mark (a stored request argument)
+ * is written and read only while the marks are kept, as for a snapshot.
+ * Plain ser/de, IPC and journal entries drop it, and a frame carrying the
+ * bit read with the marks off marks nothing. */
+static bool jrn_lit_marked(ray_t* v) {
+    return v && !RAY_IS_ERR(v) && v->type == RAY_LIST && (v->attrs & RAY_EVAL_LITERAL_FALLBACK);
+}
+static test_result_t test_journal_serde_keeps_literal_mark(void) {
+    ray_t* l = ray_eval_str("(list 'jrn_lit_a (list 'jrn_lit_a 3) 2)");
+    TEST_ASSERT_TRUE(l && !RAY_IS_ERR(l) && l->type == RAY_LIST);
+    ray_t** cells = (ray_t**)ray_data(l);
+    l->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+    cells[1]->attrs |= RAY_EVAL_LITERAL_FALLBACK;
+
+    ray_t* plain_bytes = ray_ser(l);
+    bool prev = ray_serde_keep_marks(true);
+    ray_t* marked_bytes = ray_ser(l);
+    ray_t* kept = ray_de(marked_bytes);        /* written and read with the marks */
+    ray_t* from_plain = ray_de(plain_bytes);   /* written without them */
+    ray_serde_keep_marks(prev);
+    ray_t* dropped = ray_de(marked_bytes);     /* read without them */
+
+    bool kept_ok = jrn_lit_marked(kept) && jrn_lit_marked(((ray_t**)ray_data(kept))[1]);
+    bool plain_ok = from_plain && !RAY_IS_ERR(from_plain) && !jrn_lit_marked(from_plain) &&
+                    !jrn_lit_marked(((ray_t**)ray_data(from_plain))[1]);
+    bool dropped_ok = dropped && !RAY_IS_ERR(dropped) && !jrn_lit_marked(dropped) &&
+                      !jrn_lit_marked(((ray_t**)ray_data(dropped))[1]);
+    /* The bytes differ only in the two list attr bytes. */
+    bool same_len = plain_bytes && marked_bytes && plain_bytes->len == marked_bytes->len;
+    ray_t* objs[] = { l, plain_bytes, marked_bytes, kept, from_plain, dropped };
+    for (int i = 0; i < 6; i++) {
+        if (objs[i] && RAY_IS_ERR(objs[i])) ray_error_free(objs[i]);
+        else if (objs[i]) ray_release(objs[i]);
+    }
+    TEST_ASSERT_TRUE(kept_ok);
+    TEST_ASSERT_TRUE(plain_ok);
+    TEST_ASSERT_TRUE(dropped_ok);
+    TEST_ASSERT_TRUE(same_len);
     PASS();
 }
 
@@ -3637,6 +3678,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },
+    { "journal/serde_keeps_literal_mark",  test_journal_serde_keeps_literal_mark,  jrn_setup, jrn_teardown },
     { "journal/lift_note_not_an_entry",    test_journal_lift_note_not_an_entry,    jrn_setup, jrn_teardown },
     { "journal/lift_notes_any_order",      test_journal_lift_notes_any_order,      jrn_setup, jrn_teardown },
     { "journal/lift_notes_v3_frames",      test_journal_lift_notes_v3_frames,      jrn_setup, jrn_teardown },

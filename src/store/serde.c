@@ -96,18 +96,26 @@
  * compiled metadata must be stripped and rebuilt by the receiving runtime. */
 #define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
 /* The lambda is trusted (.sys.trust).  Written and read only while
- * ray_serde_keep_trust is on; a reader that predates it ignores the bit. */
+ * ray_serde_keep_marks is on; a reader that predates it ignores the bit. */
 #define RAY_SERDE_LAMBDA_TRUSTED     ((uint8_t)0x02)
 /* ... and was trusted by name: its identity includes the global name it
  * is bound to, which the journal supplies when it binds the snapshot. */
 #define RAY_SERDE_LAMBDA_TRUSTED_NAMED ((uint8_t)0x04)
 #define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
+/* A LIST's attr byte carries the literal-fallback mark (the same bit as in
+ * memory, RAY_EVAL_LITERAL_FALLBACK) only while ray_serde_keep_marks is on:
+ * a stored request argument keeps evaluating to itself after a snapshot
+ * loads.  Outside RAY_SERDE_ATTR_WIRE_MASK, so a reader that predates it, and
+ * any frame read with the marks off, drops the bit. */
+#define RAY_SERDE_LIST_LITERAL ((uint8_t)RAY_EVAL_LITERAL_FALLBACK)
+_Static_assert((RAY_SERDE_LIST_LITERAL & RAY_SERDE_ATTR_WIRE_MASK) == 0,
+               "the literal mark must not overlap a wire attr bit");
 
-static _Thread_local bool g_serde_keep_trust;
+static _Thread_local bool g_serde_keep_marks;
 
-bool ray_serde_keep_trust(bool on) {
-    bool prev = g_serde_keep_trust;
-    g_serde_keep_trust = on;
+bool ray_serde_keep_marks(bool on) {
+    bool prev = g_serde_keep_marks;
+    g_serde_keep_marks = on;
     return prev;
 }
 
@@ -1070,7 +1078,8 @@ static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LIST: {
-        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        buf[0] = (obj->attrs & RAY_SERDE_ATTR_WIRE_MASK) |
+                 (g_serde_keep_marks ? (obj->attrs & RAY_SERDE_LIST_LITERAL) : 0);
         buf++;
         memcpy(buf, &obj->len, 8);
         buf += 8;
@@ -1130,8 +1139,8 @@ static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
 
     case RAY_LAMBDA: {
         buf[0] = (LAMBDA_CLOSURE(obj) ? RAY_SERDE_LAMBDA_HAS_CLOSURE : 0) |
-                 (g_serde_keep_trust && LAMBDA_TRUSTED(obj) ? RAY_SERDE_LAMBDA_TRUSTED : 0) |
-                 (g_serde_keep_trust && (LAMBDA_TRUSTED(obj) & 1) ? RAY_SERDE_LAMBDA_TRUSTED_NAMED : 0);
+                 (g_serde_keep_marks && LAMBDA_TRUSTED(obj) ? RAY_SERDE_LAMBDA_TRUSTED : 0) |
+                 (g_serde_keep_marks && (LAMBDA_TRUSTED(obj) & 1) ? RAY_SERDE_LAMBDA_TRUSTED_NAMED : 0);
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
@@ -1497,7 +1506,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ray_t* list = ray_alloc(l * sizeof(ray_t*));
         if (!list || RAY_IS_ERR(list)) return list;
         list->type = RAY_LIST;
-        list->attrs = list_attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        list->attrs = (list_attrs & RAY_SERDE_ATTR_WIRE_MASK) |
+                      (g_serde_keep_marks ? (list_attrs & RAY_SERDE_LIST_LITERAL) : 0);
         list->len = l;
         ray_t** elems = (ray_t**)ray_data(list);
 
@@ -1702,7 +1712,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ((ray_t**)ray_data(lambda))[0] = params;
         ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
-        if (g_serde_keep_trust && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED)) {
+        if (g_serde_keep_marks && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED)) {
             if (ray_eval_lambda_trust(lambda, -1) && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED_NAMED))
                 LAMBDA_TRUSTED(lambda) |= 1;
         }
