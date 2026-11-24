@@ -1988,8 +1988,27 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
 
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
 
+/* The RAY_EXTRACT_* field of a name bound to one of the temporal accessor
+ * builtins (yyyy mm dd hh minute ss dow doy), -1 otherwise.  Matched on the
+ * binding, not the spelling: a rebound `dd` is the user's function. */
+static int temporal_extract_builtin_field(int64_t id) {
+    ray_t* fn = ray_env_get(id);
+    if (!fn || RAY_IS_ERR(fn) || fn->type != RAY_UNARY) return -1;
+    ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
+    if (f == ray_extract_yyyy_fn)   return RAY_EXTRACT_YEAR;
+    if (f == ray_extract_mm_fn)     return RAY_EXTRACT_MONTH;
+    if (f == ray_extract_dd_fn)     return RAY_EXTRACT_DAY;
+    if (f == ray_extract_hh_fn)     return RAY_EXTRACT_HOUR;
+    if (f == ray_extract_minute_fn) return RAY_EXTRACT_MINUTE;
+    if (f == ray_extract_ss_fn)     return RAY_EXTRACT_SECOND;
+    if (f == ray_extract_dow_fn)    return RAY_EXTRACT_DOW;
+    if (f == ray_extract_doy_fn)    return RAY_EXTRACT_DOY;
+    return -1;
+}
+
 bool ray_query_rowwise_builtin(int64_t id) {
     if (resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id)) return true;
+    if (temporal_extract_builtin_field(id) >= 0) return true;
     /* Forms compile_expr_dag lowers by name rather than through a table. */
     /* reverse/asc/desc reorder a column but keep every row of it. */
     static const char* const names[] = {
@@ -2959,6 +2978,14 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             else if (fname_len == 6 && memcmp(fname, "second",6) == 0) field = RAY_EXTRACT_SECOND;
             else if (fname_len == 9 && memcmp(fname, "dayofweek",9) == 0) field = RAY_EXTRACT_DOW;
             else if (fname_len == 9 && memcmp(fname, "dayofyear",9) == 0) field = RAY_EXTRACT_DOY;
+            /* the accessor builtins themselves: (dd col) is col.dd, unless
+             * a column of that name shadows the builtin (as in eval) */
+            else {
+                ray_col_meta_t shadow;
+                if (!(g->table && g->table->type == RAY_TABLE &&
+                      ray_table_col_meta(g->table, fn_sym, &shadow)))
+                    field = temporal_extract_builtin_field(fn_sym);
+            }
             if (field >= 0) {
                 ray_op_t* col = compile_expr_dag(g, elems[1]);
                 if (!col) return NULL;

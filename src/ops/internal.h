@@ -1558,6 +1558,9 @@ uint64_t ray_query_test_parted_pruned_sources(bool reset);
 /* exec.c test hook: later `in` conjuncts over a single-file generation-2
  * column answered by range (in_sel_single_within) since process start. */
 uint64_t ray_exec_test_in_single_within(void);
+/* temporal.c test hook: extract ops (exec_extract) the DAG executor ran
+ * since process start. */
+uint64_t ray_temporal_test_dag_extracts(void);
 /* query.c test hook: counts the (count (select ... where <compare>)) fast
  * path answered since process start. */
 uint64_t ray_query_test_count_fast(void);
