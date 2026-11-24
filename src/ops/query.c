@@ -2192,6 +2192,15 @@ static ray_op_t* compile_if_chain_dag(ray_graph_t* g, ray_t** a, int64_t nargs) 
 
 static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr);
 
+/* The symbol X of a call (quote X), or -1 for anything else. */
+static int64_t quote_call_sym(ray_t* e) {
+    if (!e || e->type != RAY_LIST || ray_len(e) != 2 || (e->attrs & ATTR_QUOTED)) return -1;
+    ray_t** q = (ray_t**)ray_data(e);   /* not-a-table */
+    if (!q[0] || q[0]->type != -RAY_SYM || (q[0]->attrs & ATTR_QUOTED) ||
+        q[0]->i64 != ray_sym_intern("quote", 5) || !q[1] || q[1]->type != -RAY_SYM) return -1;
+    return q[1]->i64;
+}
+
 /* An aggregate's argument for the planner's DAG aggregate: a lowered
  * temporal +/- integer at its root declines, as it did before #1302, and
  * the aggregate keeps the builtin's answer (its type error, its float
@@ -2425,8 +2434,9 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
          * (which reads the env via cexpr_env_lookup when it hits
          * a name reference), then pop.  Sub-expression sharing is
          * automatic: multiple uses of a formal all resolve to the
-         * single compiled actual op. */
-        if (head->type == RAY_LIST) {
+         * single compiled actual op.  A (quote X) head is not a lambda;
+         * it is resolved below. */
+        if (head->type == RAY_LIST && quote_call_sym(head) < 0) {
             int64_t hn = ray_len(head);
             if (hn != 3) return NULL;
             ray_t** hel = (ray_t**)ray_data(head);
@@ -2536,9 +2546,13 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             }
         }
 
-        /* Head must be a name referencing a builtin */
-        if (head->type != -RAY_SYM) return NULL;
-        int64_t fn_sym = head->i64;
+        /* Head must be a name referencing a builtin.  ((quote as) 'T x)
+         * calls the cast that (as 'T x) calls, and lowers as it does
+         * (#1586). */
+        int64_t fn_sym;
+        if (head->type == -RAY_SYM) fn_sym = head->i64;
+        else if (quote_call_sym(head) == ray_sym_intern("as", 2)) fn_sym = quote_call_sym(head);
+        else return NULL;
 
         /* Check for xbar */
         ray_t* fn_name_str = ray_sym_str(fn_sym);
@@ -2753,26 +2767,18 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
         }
 
         /* (as 'TYPE col) — cast.  The type is a sym literal like 'I64 / 'F64,
-         * or the same spelled (quote I64) (#1243).  The quote spelling is
-         * lowered only from a numeric input: the DAG cast of a symbol or a
-         * temporal value differs from the eager `as` (which the quote
-         * spelling always took), so those keep it. */
+         * or the same spelled (quote I64) (#1243).  Both spellings lower from
+         * the same inputs: the quote spelling, once kept to numeric inputs,
+         * refused a temporal one to U8 on the per-row path where the eager
+         * cast answers (#1586). */
         if (fname_len == 2 && memcmp(fname, "as", 2) == 0) {
             if (n != 3) return NULL;
             ray_t* type_expr = elems[1];
-            bool quoted_call = false;
-            if (type_expr->type == RAY_LIST && type_expr->len == 2 &&
-                !(type_expr->attrs & ATTR_QUOTED)) {
-                ray_t** qe = (ray_t**)ray_data(type_expr);
-                if (qe[0]->type == -RAY_SYM && !(qe[0]->attrs & ATTR_QUOTED) &&
-                    qe[0]->i64 == ray_sym_intern("quote", 5) && qe[1]->type == -RAY_SYM) {
-                    type_expr = qe[1];
-                    quoted_call = true;
-                }
-            }
-            if (type_expr->type != -RAY_SYM) return NULL;
+            int64_t type_sym = type_expr->type == -RAY_SYM ? type_expr->i64
+                             : quote_call_sym(type_expr);
+            if (type_sym < 0) return NULL;
             int8_t tgt = -1;
-            ray_t* ts = ray_sym_str(type_expr->i64);
+            ray_t* ts = ray_sym_str(type_sym);
             if (ts) {
                 const char* tn = ray_str_ptr(ts);
                 size_t tl = ray_str_len(ts);
@@ -2799,11 +2805,6 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                 break;
             default:
                 return NULL;
-            }
-            if (quoted_call) {
-                int8_t it = col->out_type;
-                if (it != RAY_BOOL && it != RAY_U8 && it != RAY_I16 && it != RAY_I32 &&
-                    it != RAY_I64 && it != RAY_F32 && it != RAY_F64) return NULL;
             }
             ray_op_t* cast = ray_cast(g, col, tgt);
             if (cast && (tgt == RAY_I16 || tgt == RAY_I32)) cast->flags |= OP_FLAG_NARROW_AS;
