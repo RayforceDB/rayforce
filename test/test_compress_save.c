@@ -1631,34 +1631,42 @@ static bool cs_dir_has_stream_tmp(const char* dir) {
     return system(cmd) == 0;
 }
 #endif
-static test_result_t test_stream_gen2_transcode_failure(void) {
+/* Child (test_child_spawn): stream n incompressible rows into dir at
+ * generation 2 past a file limit the raw staging file fits exactly; 0 when
+ * the close says io. */
+int cs_child_stream_gen2_transcode_failure(int argc, char** argv) {
 #ifdef RAY_OS_LINUX
-    int64_t n = 140000;
+    if (argc != 2) return 2;
+    ray_heap_init(); (void)ray_sym_init();
+    int64_t n = atoll(argv[1]);
     ray_t* v = ray_vec_new(RAY_I64, n); v->len = n;
     uint64_t x = 0x9E3779B97F4A7C15ull;
     for (int64_t i = 0; i < n; i++) {                 /* incompressible: RAW vectors */
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
         ((int64_t*)ray_data(v))[i] = (int64_t)(x & 0x7FFFFFFFFFFFFFFFull);
     }
-    pid_t pid = fork(); TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        ray_col_stream_t w;
-        struct rlimit limit;
-        if (getrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        limit.rlim_cur = (rlim_t)(32 + n * 8);          /* the raw staging file fits exactly */
-        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) _exit(2);
-        if (ray_col_stream_open(&w, ray_test_tmp(CS_TMP), ray_sym_intern("tf", 2), RAY_I64, NULL, 2) != RAY_OK) _exit(2);
-        if (ray_col_stream_append(&w, v) != RAY_OK) _exit(2);
-        ray_err_t e = ray_col_stream_close(&w, false);
-        ray_col_stream_abort(&w);
-        _exit(e == RAY_ERR_IO ? 0 : 1);
-    }
-    int status;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    TEST_ASSERT_TRUE(WIFEXITED(status)); TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    ray_col_stream_t w;
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_FSIZE, &limit)) return 2;
+    limit.rlim_cur = (rlim_t)(32 + n * 8);              /* the raw staging file fits exactly */
+    if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR || setrlimit(RLIMIT_FSIZE, &limit)) return 2;
+    if (ray_col_stream_open(&w, argv[0], ray_sym_intern("tf", 2), RAY_I64, NULL, 2) != RAY_OK) return 2;
+    if (ray_col_stream_append(&w, v) != RAY_OK) return 2;
+    ray_err_t e = ray_col_stream_close(&w, false);
+    ray_col_stream_abort(&w);
+    return e == RAY_ERR_IO ? 0 : 1;
+#else
+    (void)argc; (void)argv;
+    return 125;
+#endif
+}
+
+static test_result_t test_stream_gen2_transcode_failure(void) {
+#ifdef RAY_OS_LINUX
+    const char* args[] = { ray_test_tmp(CS_TMP), "140000", NULL };
+    TEST_ASSERT_EQ_I(test_child_run("compress/stream_gen2_transcode_failure", args), 0);
     TEST_ASSERT_TRUE(access(ray_test_tmp(CS_TMP "/tf"), F_OK) != 0);
     TEST_ASSERT_FALSE(cs_dir_has_stream_tmp(ray_test_tmp(CS_TMP)));
-    ray_release(v);
     PASS();
 #else
     SKIP("requires Linux RLIMIT_FSIZE fault injection");

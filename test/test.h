@@ -59,6 +59,22 @@ const char* ray_test_tmp(const char* s);
 /* Immutable startup snapshot; later fixture environment changes do not move it. */
 const char* ray_test_tmp_root(void);
 
+/* A test's child process (#1560).  The runtime's rule is that a forked
+ * child execs before it runs rayforce code: a forked copy keeps the
+ * parent's heaps, and spilled memory is not inherited at all (#1138).  A
+ * test that needs its code to run in a process of its own (under a
+ * resource limit, say) spawns this binary as `--child NAME ARG...`: a fresh
+ * process that runs the child NAME registered in test/main.c with the
+ * arguments, and _exits with what it returns.  The child does its own
+ * setup and takes every path it needs, resolved, from its arguments (it has
+ * no ray_test_tmp root).  args ends with NULL.  The pid, or -1.  POSIX. */
+typedef int (*test_child_fn)(int argc, char** argv);
+int test_child_spawn(const char* name, const char* const* args);
+/* Spawn, wait, and return the child's exit status: 0..255 when it exited,
+ * 128 + the signal when a signal ended it, -1 when it could not run. */
+int test_child_run(const char* name, const char* const* args);
+const char* test_self_exe(void);
+
 /* Disarm every global store / decode / bind test hook and clear a pending
  * interrupt request.  Teardowns of suites that arm hooks call it, so a test
  * that fails between arming and disarming never leaks the hook into the

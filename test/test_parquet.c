@@ -4745,9 +4745,40 @@ static test_result_t test_pq_sk_codec_message(void) {
 /* A footer whose total_uncompressed_size is out of all proportion (INT64_MAX
  * - 4096) on a PLAIN symbol column, next to a dictionary column, imported
  * with memory that makes the import grouped: the dictionary column direct
- * and seeded, the PLAIN one grouped, every row right.  Run in a child (no
- * pool workers: fork-safe) whose exit says whether the import got through
- * the bound's arithmetic and the decision. */
+ * and seeded, the PLAIN one grouped, every row right.  Run in a child
+ * process of its own (test_child_spawn, a pool of no workers) whose exit
+ * says whether the import got through the bound's arithmetic and the
+ * decision. */
+/* Child (test_child_spawn) of test_pq_sk_huge_raw: import `src` into `dir`
+ * with a pool of no worker threads, grouped by the memory assumed (run 0)
+ * or forced direct (run 1, the reference), and check every row; 0 when
+ * both held. */
+int pq_child_sk_huge_raw(int argc, char** argv) {
+#if !defined(DEBUG) || defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
+    (void)argc; (void)argv;
+    return 125;
+#else
+    if (argc != 3) return 2;
+    pq_setup();
+    pq_sym_env_clear();
+    if (pq_pool(1) != RAY_OK) return 2;   /* no worker threads */
+    const char* nm[3] = {"p","q","u"};
+    pq_synth_fn fns[3] = {pqx_lowcard, pqx_highcard, pqx_unique};
+    int64_t tids[4] = {ray_sym_intern("I32", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3), ray_sym_intern("SYM", 3)};
+    ray_t* types = ray_vec_from_raw(RAY_SYM, tids, 4);
+    int run = atoi(argv[2]);
+    if (run) pq_set_symmode("direct"); else pq_set_env("RAY_PQ_SYM_RAM", "1073741824");
+    ray_t* res = ray_parquet_splayed_typed(argv[0], argv[1], types);
+    bool ok = res && !RAY_IS_ERR(res);
+    const char* msg = ray_error_msg();
+    fprintf(stderr, "  sk huge raw (%s, child): %s%s%s\n", run ? "direct" : "auto, 1 GB", ok ? "imported" : "failed: ",
+            ok ? "" : (res ? ray_err_code(res) : "null"), ok ? "" : (msg ? msg : ""));
+    if (ok) ok = pqx_check(argv[1], 20000, 3, nm, fns, "sk huge raw", NULL);
+    fflush(stderr);
+    return ok ? 0 : 1;
+#endif
+}
+
 static test_result_t test_pq_sk_huge_raw(void) {
 #if !defined(DEBUG) || defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
     SKIP("the memory the decision assumes is a debug-build knob; fork");
@@ -4766,30 +4797,14 @@ static test_result_t test_pq_sk_huge_raw(void) {
     /* five row groups: an odd count of wrapped per-chunk bounds sums negative */
     const int64_t rows = 20000;
     TEST_ASSERT_TRUE(pqx_synth(src, rows, 5, 3, nm, fns, fl));
-    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);   /* no worker threads */
     int bad = 0;
     for (int run = 0; run < 2; run++) {
         /* 0: grouped by the memory assumed (seeding, the direct caps);
          * 1: forced direct, the reference */
-        fflush(stderr);
-        pid_t pid = fork();
-        TEST_ASSERT_TRUE(pid >= 0);
-        if (!pid) {
-            if (run) pq_set_symmode("direct"); else pq_set_env("RAY_PQ_SYM_RAM", "1073741824");
-            ray_t* res = ray_parquet_splayed_typed(src, dir, types);
-            bool ok = res && !RAY_IS_ERR(res);
-            const char* msg = ray_error_msg();
-            fprintf(stderr, "  sk huge raw (%s, child): %s%s%s\n", run ? "direct" : "auto, 1 GB", ok ? "imported" : "failed: ",
-                    ok ? "" : (res ? ray_err_code(res) : "null"), ok ? "" : (msg ? msg : ""));
-            if (ok) ok = pqx_check(dir, rows, 3, nm, fns, "sk huge raw", NULL);
-            fflush(stderr);
-            _exit(ok ? 0 : 1);
-        }
-        int status = 0;
-        TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-        bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-        fprintf(stderr, "  sk huge raw %s: child %s %d\n", run ? "direct" : "auto", WIFEXITED(status) ? "exit" : "signal",
-                WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+        const char* args[] = { src, dir, run ? "1" : "0", NULL };
+        int rc = test_child_run("parquet/sk_huge_raw", args);
+        bool clean = rc == 0;
+        fprintf(stderr, "  sk huge raw %s: child status %d\n", run ? "direct" : "auto", rc);
         if (!clean) bad++;
         (void)ray_test_rm_rf(partial); (void)ray_test_rm_rf(dir);
         (void)fnames;

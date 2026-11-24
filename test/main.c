@@ -1719,6 +1719,69 @@ const char* test_self_exe(void) {
     return g_argv0;
 }
 int repl_child_main(const char* variant);   /* test_repl.c */
+
+/* The children test_child_spawn can run (test.h), each defined beside its test. */
+#if !defined(_WIN32)
+int store_child_col_close_failure(int argc, char** argv);
+int store_child_col_append_index_rollback(int argc, char** argv);
+int store_child_stream_index_write_failure(int argc, char** argv);
+int store_child_hash_index_marker_last(int argc, char** argv);
+int store_child_hash_index_rollback(int argc, char** argv);
+int cs_child_stream_gen2_transcode_failure(int argc, char** argv);
+int dom_child_append_failed(int argc, char** argv);
+int jrn_child_lost_roll(int argc, char** argv);
+int jrn_child_open_stage(int argc, char** argv);
+int pq_child_sk_huge_raw(int argc, char** argv);
+int pool_child_spawn_fails(int argc, char** argv);
+static const struct { const char* name; test_child_fn fn; } g_children[] = {
+    { "store/col_close_failure",         store_child_col_close_failure },
+    { "store/col_append_index_rollback", store_child_col_append_index_rollback },
+    { "store/stream_index_write_failure", store_child_stream_index_write_failure },
+    { "store/hash_index_marker_last",    store_child_hash_index_marker_last },
+    { "store/hash_index_rollback",       store_child_hash_index_rollback },
+    { "compress/stream_gen2_transcode_failure", cs_child_stream_gen2_transcode_failure },
+    { "domain/append_failed",            dom_child_append_failed },
+    { "journal/lost_roll",               jrn_child_lost_roll },
+    { "journal/open_stage",              jrn_child_open_stage },
+    { "parquet/sk_huge_raw",             pq_child_sk_huge_raw },
+    { "pool/spawn_fails",                pool_child_spawn_fails },
+};
+
+int test_child_spawn(const char* name, const char* const* args) {
+    const char* argv[16];
+    int n = 0;
+    argv[n++] = test_self_exe();
+    argv[n++] = "--child";
+    argv[n++] = name;
+    for (int i = 0; args && args[i] && n < 15; i++) argv[n++] = args[i];
+    argv[n] = NULL;
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execv(argv[0], (char* const*)argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+int test_child_run(const char* name, const char* const* args) {
+    int pid = test_child_spawn(name, args);
+    if (pid < 0) return -1;
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) return -1;
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return -1;
+}
+
+static int child_main(int argc, char** argv) {
+    for (size_t i = 0; i < sizeof g_children / sizeof g_children[0]; i++)
+        if (strcmp(argv[0], g_children[i].name) == 0)
+            _exit(g_children[i].fn(argc - 1, argv + 1));
+    fprintf(stderr, "--child: no child %s\n", argv[0]);
+    _exit(126);
+}
+#endif
 static void replay_note(const worker_t* me, int job) {
     static int seq;
     char path[128];
@@ -1842,6 +1905,9 @@ int main(int argc, char** argv) {
     /* A REPL test's child: a fresh process running one REPL (test_repl.c). */
     if (argc == 3 && strcmp(argv[1], "--repl-child") == 0)
         return repl_child_main(argv[2]);
+    /* A test's child (test_child_spawn): a fresh process. */
+    if (argc >= 3 && strcmp(argv[1], "--child") == 0)
+        return child_main(argc - 2, argv + 2);
 #endif
 #if defined(_WIN32)
     (void)_mkdir("/tmp");   /* tests use "/tmp/..." paths (see test.h) */

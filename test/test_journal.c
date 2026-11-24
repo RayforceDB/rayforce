@@ -2748,8 +2748,9 @@ static test_result_t test_ops_auto_journal_eval_predicate(void) {
  * not replace the remembered one, a close, and a roll that loses its handle
  * past the close (open=false, opened_ok=true, path = last successful).  The
  * last one needs a 1-byte RLIMIT_FSIZE so the new log's preamble cannot be
- * written; that, and the SIGXFSZ it raises, are confined to a forked child
- * so the shared test process never changes its limit or signal disposition. */
+ * written; that, and the SIGXFSZ it raises, are confined to a child process
+ * of its own (test_child_spawn), which opens a journal of its own, so the
+ * shared test process never changes its limit or signal disposition. */
 static ray_t* status_field(ray_t* d, const char* name) {
     if (!d || RAY_IS_ERR(d) || d->type != RAY_DICT) return NULL;
     return ray_dict_probe_sym_borrowed(d, ray_sym_intern(name, strlen(name)));
@@ -2815,6 +2816,23 @@ static int status_lost_roll_child(const char* want, const char* bad_src) {
     status_free(s);
     return kept ? 0 : 8;
 }
+
+/* Child (test_child_spawn) of test_ops_log_status: a fresh process opens
+ * its own journal at `base` (async), then fails a roll of it as
+ * status_lost_roll_child does.  (The parent's journal is held by the
+ * parent's lock, so the child takes one of its own.) */
+int jrn_child_lost_roll(int argc, char** argv) {
+    if (argc != 2) return 20;
+    jrn_setup();
+    char src[400], want[320];
+    snprintf(src, sizeof(src), "(.log.open 'async \"%s\")", argv[0]);
+    snprintf(want, sizeof(want), "%s.log", argv[0]);
+    ray_t* o = ray_eval_str(src);
+    bool open_ok = o && !RAY_IS_ERR(o);
+    status_free(o);
+    if (!open_ok) return 21;
+    return status_lost_roll_child(want, argv[1]);
+}
 #endif
 
 static test_result_t test_ops_log_status(void) {
@@ -2864,17 +2882,19 @@ static test_result_t test_ops_log_status(void) {
     bool s2_open = status_open(s2) && status_path_is(s2, want);
     status_free(s2);
 
-    /* Failed roll past the close, in a child process. */
+    /* Failed roll past the close, in a child process with a journal of its
+     * own (this one's lock is held here). */
     bool forked = false, child_ok = false;
     int child_rc = -1;
 #ifndef _WIN32
-    pid_t pid = fork();
-    if (pid == 0) _exit(status_lost_roll_child(want, bad_src));
-    if (pid > 0) {
-        int st = 0;
-        forked = waitpid(pid, &st, 0) == pid;
-        if (forked && WIFEXITED(st)) { child_rc = WEXITSTATUS(st); child_ok = child_rc == 0; }
+    char cbase[256]; make_base(cbase, sizeof(cbase), "ops_status_child");
+    {
+        const char* args[] = { cbase, bad_src, NULL };
+        child_rc = test_child_run("journal/lost_roll", args);
+        forked = child_rc >= 0;
+        child_ok = child_rc == 0;
     }
+    cleanup_base(cbase);
 #else
     forked = child_ok = true;   /* RLIMIT_FSIZE injection is POSIX only */
 #endif
@@ -2965,20 +2985,25 @@ static int status_open_stage_child(const char* keep, const char* bad) {
     return good ? 0 : 8;
 }
 
+/* Child (test_child_spawn): status_open_stage_child in a fresh process;
+ * keep "-" for none. */
+int jrn_child_open_stage(int argc, char** argv) {
+    if (argc != 2) return 20;
+    jrn_setup();
+    return status_open_stage_child(strcmp(argv[0], "-") ? argv[0] : NULL, argv[1]);
+}
+
 static int status_open_stage_run(const char* keep, const char* bad) {
-    pid_t pid = fork();
-    if (pid == 0) _exit(status_open_stage_child(keep, bad));
-    if (pid < 0) return -1;
-    int st = 0;
-    if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return -2;
-    return WEXITSTATUS(st);
+    const char* args[] = { keep ? keep : "-", bad, NULL };
+    int rc = test_child_run("journal/open_stage", args);
+    return rc < 0 ? -1 : rc >= 128 ? -2 : rc;
 }
 #endif
 
 /* .log.status identity when the open fails AFTER the lock is taken, at the
  * open/preamble stage (the shared-process test above only covers a lock
- * stage failure).  Both cases run in forked children (RLIMIT_FSIZE 1 byte,
- * SIGXFSZ ignored there only). */
+ * stage failure).  Both cases run in child processes of their own
+ * (test_child_spawn; RLIMIT_FSIZE 1 byte, SIGXFSZ ignored there only). */
 static test_result_t test_ops_log_status_open_stage(void) {
     char a[256], b[256], c[256];
     make_base(a, sizeof(a), "ops_stage_a");

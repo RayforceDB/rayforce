@@ -315,7 +315,10 @@ static test_result_t test_file_writeback_errors(void) {
 
 /* A fork while the background thread serves a request: the child closes
  * that request's descriptor as well as the queued ones (the parent's to
- * serve), and the parent's are all closed once they are served. */
+ * serve), and the parent's are all closed once they are served.  The child
+ * has to be a forked copy (no exec): what is tested is the fork child
+ * handler (wb_fork_child, core/platform.c).  It only counts its open
+ * descriptors with libc and runs no rayforce code. */
 static test_result_t test_file_writeback_fork(void) {
 #if defined(RAY_OS_LINUX) && defined(DEBUG)
     char dir[64], path[128];

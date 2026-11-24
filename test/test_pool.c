@@ -920,40 +920,37 @@ static test_result_t test_pool_workers_started(void) {
  * (RLIMIT_NPROC below the user's thread count, in a child) fails to come
  * up and returns — the creator's wait for the workers' start is not
  * reached for threads that never ran — and a pool of one thread still
- * comes up after it. */
+ * comes up after it.  The child is a fresh process (it used to be a forked
+ * copy of this multi-threaded one, which ThreadSanitizer refuses to start
+ * threads in). */
+/* Child (test_child_spawn): RLIMIT_NPROC at 1, then a pool of 16 workers,
+ * and one of 1; 0 when both came back, 12 when the limit was not enforced. */
+int pool_child_spawn_fails(int argc, char** argv) {
+    (void)argc; (void)argv;
+    ray_heap_init();
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NPROC, &rl) != 0) return 10;
+    rl.rlim_cur = 1;
+    if (setrlimit(RLIMIT_NPROC, &rl) != 0) return 11;
+    ray_pool_t pool;
+    ray_err_t e = ray_pool_create(&pool, 16);
+    if (e == RAY_OK) { ray_pool_free(&pool); return 12; }   /* not limited (root?) */
+    ray_pool_t one;
+    if (ray_pool_create(&one, 1) != RAY_OK) return 0;        /* still refused: fine */
+    ray_pool_free(&one);
+    return 0;
+}
+
 static test_result_t test_pool_sk_spawn_fails(void) {
-    /* The child starts pool threads after forking a multi-threaded
-     * process, which ThreadSanitizer refuses. */
-#if defined(__SANITIZE_THREAD__)
-    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
-#elif defined(__has_feature)
-#  if __has_feature(thread_sanitizer)
-    SKIP("ThreadSanitizer cannot start threads after a multi-threaded fork");
-#  endif
-#endif
-    fflush(stderr);
-    pid_t pid = fork();
-    TEST_ASSERT_TRUE(pid >= 0);
-    if (!pid) {
-        struct rlimit rl;
-        if (getrlimit(RLIMIT_NPROC, &rl) != 0) _exit(10);
-        rl.rlim_cur = 1;
-        if (setrlimit(RLIMIT_NPROC, &rl) != 0) _exit(11);
-        ray_pool_t pool;
-        ray_err_t e = ray_pool_create(&pool, 16);
-        if (e == RAY_OK) { ray_pool_free(&pool); _exit(12); }   /* not limited (root?) */
-        ray_pool_t one;
-        if (ray_pool_create(&one, 1) != RAY_OK) _exit(0);        /* still refused: fine */
-        ray_pool_free(&one);
-        _exit(0);
-    }
-    int status = 0;
-    TEST_ASSERT_EQ_I(waitpid(pid, &status, 0), pid);
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 12) SKIP("RLIMIT_NPROC not enforced here");
-    TEST_ASSERT_TRUE(WIFEXITED(status));
-    TEST_ASSERT_EQ_I(WEXITSTATUS(status), 0);
+    /* A child process of its own (test_child_spawn): the limit dies with it. */
+    int rc = test_child_run("pool/spawn_fails", NULL);
+    if (rc == 12) SKIP("RLIMIT_NPROC not enforced here");
+    TEST_ASSERT_EQ_I(rc, 0);
     PASS();
 }
+#endif
+#if !defined(_WIN32) && !defined(__linux__)
+int pool_child_spawn_fails(int argc, char** argv) { (void)argc; (void)argv; return 125; }
 #endif
 
 /* --------------------------------------------------------------------------
