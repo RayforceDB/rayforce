@@ -60,6 +60,9 @@ bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t
 #if defined(DEBUG)
 void    ray_parquet_test_cert_interrupt_after(int64_t nth);
 int64_t ray_parquet_test_cert_levels(void);
+void    ray_parquet_test_delta_interrupt_after(int64_t nth);
+int64_t ray_parquet_test_delta_values(void);
+void    ray_parquet_test_import_seam(int64_t col, int64_t* mode, int64_t* encoding, int64_t* grouped);
 #endif
 
 /* Returns NULL for a non-Parquet source; otherwise an owned table/error.
