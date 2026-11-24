@@ -28,7 +28,10 @@ def compile_zones(archive: Path, work: Path) -> tuple[str, dict[str, bytes]]:
     src.mkdir()
     with tarfile.open(archive) as tar:
         for name in SOURCES + ["version"]:
-            member = tar.extractfile(name)
+            try:
+                member = tar.extractfile(name)
+            except KeyError:   # extractfile raises for a missing name; None is a non-file member
+                member = None
             if member is None:
                 sys.exit(f"{archive}: no file {name}")
             (src / name).write_bytes(member.read())
@@ -64,6 +67,9 @@ def render(version: str, zones: dict[str, bytes], header: str) -> str:
         "const ray_tzdata_zone_t ray_tzdata_zones[] = {",
         *rows,
         "};",
+        "",
+        "_Static_assert(sizeof(ray_tzdata_zones) / sizeof(ray_tzdata_zones[0]) <= RAY_TZDATA_MAX,",
+        '               "more zones than RAY_TZDATA_MAX: raise it in core/tz.h");',
         "",
         "const uint8_t ray_tzdata_blob[] = {",
         *lines,

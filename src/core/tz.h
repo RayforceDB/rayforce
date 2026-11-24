@@ -53,8 +53,11 @@ typedef struct ray_tz {
 bool ray_tz_name_ok(const char* name, size_t len);
 
 /* The table of the TZif file in buf[0..len), NULL when it is malformed, has
- * no 64-bit block, or counts leap seconds.  Free with ray_tz_free. */
+ * no 64-bit block, or counts leap seconds.  Free with ray_tz_free.
+ * ray_tz_parse_why also says which NULL it was: *oom is true when the file
+ * was sound and memory ran out, false when the file was refused. */
 ray_tz_t* ray_tz_parse(const uint8_t* buf, size_t len);
+ray_tz_t* ray_tz_parse_why(const uint8_t* buf, size_t len, bool* oom);
 void      ray_tz_free(ray_tz_t* z);
 
 /* The index into z->off of the offset in force at `ts`. */
@@ -74,13 +77,17 @@ typedef struct {
     uint32_t    at, len;   /* the zone's TZif file is ray_tzdata_blob[at .. at + len) */
 } ray_tzdata_zone_t;
 
+/* More names than the database will hold, so a table with a slot per zone
+ * can be a fixed array; tzdata.c asserts its index fits. */
+#define RAY_TZDATA_MAX 1024
+
 extern const char              ray_tzdata_version[];   /* the IANA release, "2026f" */
 extern const int32_t           ray_tzdata_count;
 extern const ray_tzdata_zone_t ray_tzdata_zones[];     /* sorted by name, strcmp order */
 extern const uint8_t           ray_tzdata_blob[];
 
-/* The built-in TZif file of zone `name` and its length, NULL when the
- * database has no zone of that name. */
-const uint8_t* ray_tzdata_find(const char* name, size_t len, size_t* out_len);
+/* The index in ray_tzdata_zones of zone `name`, -1 when the database has no
+ * zone of that name. */
+int32_t ray_tzdata_index(const char* name, size_t len);
 
 #endif /* RAY_CORE_TZ_H */

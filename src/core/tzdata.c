@@ -631,6 +631,9 @@ const ray_tzdata_zone_t ray_tzdata_zones[] = {
     {"Zulu", 170499, 111},
 };
 
+_Static_assert(sizeof(ray_tzdata_zones) / sizeof(ray_tzdata_zones[0]) <= RAY_TZDATA_MAX,
+               "more zones than RAY_TZDATA_MAX: raise it in core/tz.h");
+
 const uint8_t ray_tzdata_blob[] = {
 84,90,105,102,50,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,

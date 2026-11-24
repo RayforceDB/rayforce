@@ -213,6 +213,39 @@ static test_result_t test_tz_julian_rules(void) {
     PASS();
 }
 
+/* DST all year round is written as a rule whose DST ends each year at the
+ * instant the next year's starts (RFC 8536 3.3.1).  The zone is on DST at
+ * every instant, the shared one included. */
+static test_result_t test_tz_dst_all_year(void) {
+    static const int32_t utoff[] = {-18000};
+    uint8_t buf[256];
+    size_t n = tzif(buf, '3', 0, NULL, NULL, 0, utoff, 1, "EST5EDT,0/0,J365/25");
+    ray_tz_t* z = ray_tz_parse(buf, n);
+    TEST_ASSERT_NOT_NULL(z);
+    for (int32_t i = 0; i <= z->n; i++) TEST_ASSERT_FMT(z->off[i] == -14400LL * 1000000000LL, "offset %d is not DST", i);
+    TEST_ASSERT_EQ_I(off_at(z, 0, 0), -14400);            /* 2000.01.01 */
+    TEST_ASSERT_EQ_I(off_at(z, 18000, -1), -14400);       /* 2000.01.01D05:00, where one year's DST meets the next */
+    TEST_ASSERT_EQ_I(off_at(z, 18000, 0), -14400);
+    TEST_ASSERT_EQ_I(off_at(z, 773107200, 0), -14400);    /* 2024.07.01 */
+    TEST_ASSERT_EQ_I(off_at(z, -3155673600LL, 0), -14400);   /* 1900.01.01 */
+    for (int32_t i = 1; i < z->n; i++) TEST_ASSERT_TRUE(z->at[i - 1] < z->at[i]);
+    ray_tz_free(z);
+
+    /* a listed change at the instant a rule's change falls on keeps one entry */
+    static const int64_t at[] = {1173596400};   /* 2007.03.11D07:00, the rule's own start that year */
+    static const uint8_t idx[] = {1};
+    static const int32_t two[] = {-18000, -14400};
+    n = tzif(buf, '2', 0, at, idx, 1, two, 2, "EST5EDT,M3.2.0,M11.1.0");
+    z = ray_tz_parse(buf, n);
+    TEST_ASSERT_NOT_NULL(z);
+    TEST_ASSERT_EQ_I(off_at(z, 1173596400 - U2000, -1), -18000);
+    TEST_ASSERT_EQ_I(off_at(z, 1173596400 - U2000, 0), -14400);
+    TEST_ASSERT_EQ_I(off_at(z, 763369200, 0), -14400);    /* 2024.03.10D07:00 */
+    for (int32_t i = 1; i < z->n; i++) TEST_ASSERT_TRUE(z->at[i - 1] < z->at[i]);
+    ray_tz_free(z);
+    PASS();
+}
+
 /* A change outside the TIMESTAMP range is folded into what holds before the
  * table, or dropped past its end. */
 static test_result_t test_tz_out_of_range_changes(void) {
@@ -290,9 +323,8 @@ static test_result_t test_tz_malformed(void) {
 /* ---- The database built in ------------------------------------------------- */
 
 static ray_tz_t* builtin(const char* name) {
-    size_t n = 0;
-    const uint8_t* p = ray_tzdata_find(name, strlen(name), &n);
-    return p ? ray_tz_parse(p, n) : NULL;
+    int32_t i = ray_tzdata_index(name, strlen(name));
+    return i < 0 ? NULL : ray_tz_parse(ray_tzdata_blob + ray_tzdata_zones[i].at, ray_tzdata_zones[i].len);
 }
 
 /* Every zone of the index is found by its name, parses, and the index is in
@@ -303,11 +335,8 @@ static test_result_t test_tzdata_every_zone_parses(void) {
     for (int32_t i = 0; i < ray_tzdata_count; i++) {
         const char* name = ray_tzdata_zones[i].name;
         if (i) TEST_ASSERT_FMT(strcmp(ray_tzdata_zones[i - 1].name, name) < 0, "%s is out of order", name);
-        size_t n = 0;
-        const uint8_t* p = ray_tzdata_find(name, strlen(name), &n);
-        TEST_ASSERT_FMT(p == ray_tzdata_blob + ray_tzdata_zones[i].at && n == ray_tzdata_zones[i].len,
-                        "%s is not found by its name", name);
-        ray_tz_t* z = ray_tz_parse(p, n);
+        TEST_ASSERT_FMT(ray_tzdata_index(name, strlen(name)) == i, "%s is not found by its name", name);
+        ray_tz_t* z = ray_tz_parse(ray_tzdata_blob + ray_tzdata_zones[i].at, ray_tzdata_zones[i].len);
         TEST_ASSERT_FMT(z != NULL, "%s does not parse", name);
         for (int32_t k = 1; k < z->n; k++)
             TEST_ASSERT_FMT(z->at[k - 1] < z->at[k], "%s: changes out of order", name);
@@ -317,17 +346,17 @@ static test_result_t test_tzdata_every_zone_parses(void) {
 }
 
 static test_result_t test_tzdata_lookup(void) {
-    size_t n = 0, m = 0;
-    TEST_ASSERT_NULL(ray_tzdata_find("Mars/Olympus_Mons", 17, &n));
-    TEST_ASSERT_NULL(ray_tzdata_find("America/New_Yor", 15, &n));
-    TEST_ASSERT_NULL(ray_tzdata_find("America/New_York1", 17, &n));
-    TEST_ASSERT_NULL(ray_tzdata_find("../etc/passwd", 13, &n));
-    TEST_ASSERT_NULL(ray_tzdata_find("", 0, &n));
+    TEST_ASSERT_TRUE(ray_tzdata_count <= RAY_TZDATA_MAX);
+    TEST_ASSERT_EQ_I(ray_tzdata_index("Mars/Olympus_Mons", 17), -1);
+    TEST_ASSERT_EQ_I(ray_tzdata_index("America/New_Yor", 15), -1);
+    TEST_ASSERT_EQ_I(ray_tzdata_index("America/New_York1", 17), -1);
+    TEST_ASSERT_EQ_I(ray_tzdata_index("../etc/passwd", 13), -1);
+    TEST_ASSERT_EQ_I(ray_tzdata_index("", 0), -1);
     /* an old name is the same file as the zone it links to */
-    const uint8_t* a = ray_tzdata_find("America/New_York", 16, &n);
-    const uint8_t* b = ray_tzdata_find("US/Eastern", 10, &m);
-    TEST_ASSERT_NOT_NULL(a);
-    TEST_ASSERT_TRUE(a == b && n == m);
+    int32_t a = ray_tzdata_index("America/New_York", 16);
+    int32_t b = ray_tzdata_index("US/Eastern", 10);
+    TEST_ASSERT_TRUE(a >= 0 && b >= 0 && a != b);
+    TEST_ASSERT_TRUE(ray_tzdata_zones[a].at == ray_tzdata_zones[b].at && ray_tzdata_zones[a].len == ray_tzdata_zones[b].len);
     PASS();
 }
 
@@ -373,6 +402,7 @@ const test_entry_t tz_entries[] = {
     { "tz/southern_rule",        test_tz_southern_rule,        tz_setup, tz_teardown },
     { "tz/fixed_offset",         test_tz_fixed_offset,         tz_setup, tz_teardown },
     { "tz/julian_rules",         test_tz_julian_rules,         tz_setup, tz_teardown },
+    { "tz/dst_all_year",         test_tz_dst_all_year,         tz_setup, tz_teardown },
     { "tz/out_of_range_changes", test_tz_out_of_range_changes, tz_setup, tz_teardown },
     { "tz/malformed",            test_tz_malformed,            tz_setup, tz_teardown },
     { "tz/data/every_zone_parses", test_tzdata_every_zone_parses, tz_setup, tz_teardown },

@@ -959,58 +959,75 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
  * twice in autumn), and is not offered here.
  * ========================================================================== */
 
-/* The zones looked up so far, each parsed once from the database built in.
- * Filled on the evaluating thread before a kernel fans out, so workers only
- * read a table; emptied by ray_temporal_tz_reset when the language shuts
- * down, which is also when the symbol ids it is keyed by die. */
-typedef struct { int64_t sym; ray_tz_t* z; } rte_zone_t;
-static rte_zone_t* g_zones;
-static int32_t     g_zone_count, g_zone_cap;
+static const char* rte_tz_name(bool want_offset) { return want_offset ? ".time.tz.offset" : ".time.tz.local"; }
+
+/* A slot per zone of the database, in the index's order: the zone's table
+ * once some thread has parsed it, NULL until then.  More than one thread
+ * may evaluate, each with a VM of its own, so a slot is published by
+ * compare-and-swap, as ray_strtod_c publishes its locale, and never changes
+ * afterwards; a thread that loses the race frees its copy.  A reader loads
+ * the pointer and takes no lock.  Keyed by the database's index, not by a
+ * symbol id, so the slots outlive nothing they point into.
+ * ray_temporal_tz_reset empties them when the language shuts down. */
+static ray_tz_t* g_zone_tables[RAY_TZDATA_MAX];
 
 void ray_temporal_tz_reset(void) {
-    for (int32_t i = 0; i < g_zone_count; i++) ray_tz_free(g_zones[i].z);
-    ray_sys_free(g_zones);
-    g_zones = NULL;
-    g_zone_count = g_zone_cap = 0;
+    for (int32_t i = 0; i < RAY_TZDATA_MAX; i++)
+        ray_tz_free(__atomic_exchange_n(&g_zone_tables[i], NULL, __ATOMIC_ACQ_REL));
 }
 
-/* The table already loaded for a zone's symbol, NULL when there is none.
- * Reads only, so a worker may call it. */
-static const ray_tz_t* rte_zone_loaded(int64_t sym) {
-    for (int32_t i = 0; i < g_zone_count; i++)
-        if (g_zones[i].sym == sym) return g_zones[i].z;
-    return NULL;
+/* The table of the database's zone `idx`, parsed on first use.  NULL with
+ * *oom saying which failure: memory, or a built-in file the parser refuses. */
+static const ray_tz_t* rte_zone_at(int32_t idx, bool* oom) {
+    ray_tz_t* z = __atomic_load_n(&g_zone_tables[idx], __ATOMIC_ACQUIRE);
+    if (z) return z;
+    const ray_tzdata_zone_t* e = &ray_tzdata_zones[idx];
+    z = ray_tz_parse_why(ray_tzdata_blob + e->at, e->len, oom);
+    if (!z) return NULL;
+    ray_tz_t* seen = NULL;
+    if (!__atomic_compare_exchange_n(&g_zone_tables[idx], &seen, z, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        ray_tz_free(z);
+        z = seen;
+    }
+    return z;
+}
+
+/* The database's index of the zone a symbol id names, -1 when it has none. */
+static int32_t rte_zone_index(int64_t sym) {
+    ray_t* name = ray_sym_str(sym);
+    const char* p = name ? ray_str_ptr(name) : NULL;
+    return p ? ray_tzdata_index(p, ray_str_len(name)) : -1;
+}
+
+int32_t ray_temporal_tz_index(int64_t zone_sym) {
+    bool oom = false;
+    int32_t idx = rte_zone_index(zone_sym);
+    return idx >= 0 && rte_zone_at(idx, &oom) ? idx : -1;
 }
 
 /* The table of the zone `zone` names, borrowed; NULL with *err an owned
  * error. */
-static const ray_tz_t* rte_zone(ray_t* zone, const char* fn, ray_t** err) {
+static const ray_tz_t* rte_zone(ray_t* zone, bool want_offset, ray_t** err) {
+    const char* fn = rte_tz_name(want_offset);
     if (!zone || zone->type != -RAY_SYM) {
         *err = ray_error("type", "%s: the zone must be a symbol", fn);
         return NULL;
     }
-    const ray_tz_t* loaded = rte_zone_loaded(zone->i64);
-    if (loaded) return loaded;
-
-    ray_t* name = ray_sym_str(zone->i64);
-    const char* p = name ? ray_str_ptr(name) : NULL;
-    size_t n = p ? ray_str_len(name) : 0, len = 0;
-    const uint8_t* file = p ? ray_tzdata_find(p, n, &len) : NULL;
-    if (!file) {
+    int32_t idx = rte_zone_index(zone->i64);
+    if (idx < 0) {
+        ray_t* name = ray_sym_str(zone->i64);
+        const char* p = name ? ray_str_ptr(name) : NULL;
+        size_t n = p ? ray_str_len(name) : 0;
         *err = ray_error("domain", "%s: no time zone '%.*s in the database (%s)", fn,
                          (int)(n > 64 ? 64 : n), p ? p : "", ray_tzdata_version);
         return NULL;
     }
-    if (g_zone_count == g_zone_cap) {
-        int32_t cap = g_zone_cap ? g_zone_cap * 2 : 16;
-        rte_zone_t* grown = ray_sys_realloc(g_zones, (size_t)cap * sizeof(rte_zone_t));
-        if (!grown) { *err = ray_error("oom", NULL); return NULL; }
-        g_zones = grown;
-        g_zone_cap = cap;
-    }
-    ray_tz_t* z = ray_tz_parse(file, len);
-    if (!z) { *err = ray_error("oom", NULL); return NULL; }   /* a built-in file always parses */
-    g_zones[g_zone_count++] = (rte_zone_t){ zone->i64, z };
+    bool oom = false;
+    const ray_tz_t* z = rte_zone_at(idx, &oom);
+    if (!z)
+        *err = oom ? ray_error("oom", NULL)
+                   : ray_error("corrupt", "%s: time zone '%s of the built-in database (%s) does not parse", fn,
+                               ray_tzdata_zones[idx].name, ray_tzdata_version);
     return z;
 }
 
@@ -1053,15 +1070,16 @@ static void rte_tz_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end)
     if (nulled) atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
 }
 
-static const char* rte_tz_name(bool want_offset) { return want_offset ? ".time.tz.offset" : ".time.tz.local"; }
-
-/* `x` on zone z: its wall clock, or with want_offset its offset.  `x` is
- * borrowed. */
-static ray_t* rte_tz_run(const ray_tz_t* z, ray_t* x, bool want_offset) {
+/* NULL when `x` is a TIMESTAMP atom or vector, otherwise the type error. */
+static ray_t* rte_tz_type_err(ray_t* x, bool want_offset) {
     int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
-    if (t != RAY_TIMESTAMP)
-        return ray_error("type", "%s: expected timestamp, got %s", rte_tz_name(want_offset),
-                         ray_type_name(x->type));
+    if (t == RAY_TIMESTAMP) return NULL;
+    return ray_error("type", "%s: expected timestamp, got %s", rte_tz_name(want_offset), ray_type_name(x->type));
+}
+
+/* `x`, a TIMESTAMP (rte_tz_type_err), on zone z: its wall clock, or with
+ * want_offset its offset.  `x` is borrowed. */
+static ray_t* rte_tz_run(const ray_tz_t* z, ray_t* x, bool want_offset) {
     int8_t out_t = want_offset ? RAY_TIMESPAN : RAY_TIMESTAMP;
 
     if (x->type < 0) {
@@ -1097,33 +1115,27 @@ static ray_t* rte_tz_run(const ray_tz_t* z, ray_t* x, bool want_offset) {
 /* The type of `x` is checked before the zone, as the node checks it. */
 static ray_t* rte_tz_apply(ray_t* zone, ray_t* x, bool want_offset) {
     if (!x || RAY_IS_ERR(x)) return x;
-    int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
-    if (t != RAY_TIMESTAMP) return rte_tz_run(NULL, x, want_offset);
-    ray_t* err = NULL;
-    const ray_tz_t* z = rte_zone(zone, rte_tz_name(want_offset), &err);
+    ray_t* err = rte_tz_type_err(x, want_offset);
+    if (err) return err;
+    const ray_tz_t* z = rte_zone(zone, want_offset, &err);
     return z ? rte_tz_run(z, x, want_offset) : err;
 }
 
 ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x)  { return rte_tz_apply(zone, x, false); }
 ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x) { return rte_tz_apply(zone, x, true); }
 
-bool ray_temporal_tz_load(int64_t zone_sym) {
-    ray_t* err = NULL;
-    ray_t* zone = ray_sym(zone_sym);
-    const ray_tz_t* z = rte_zone(zone, "", &err);
-    ray_release(zone);
-    if (err) ray_error_free(err);
-    return z != NULL;
-}
-
-/* OP_TZ_SHIFT.  The compiler loaded the zone (ray_temporal_tz_load), so this
- * only reads the table, whichever thread runs the node. */
+/* OP_TZ_SHIFT.  The compiler loaded the zone (ray_temporal_tz_index) and
+ * left its index in the node, so this only reads the slot, whichever thread
+ * runs the node. */
 ray_t* exec_tz_shift(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     if (!input || RAY_IS_ERR(input)) return input;
+    bool want_offset = (op->flags & OP_FLAG_TZ_OFFSET) != 0;
     ray_op_ext_t* ext = find_ext(g, op->id);
-    const ray_tz_t* z = ext ? rte_zone_loaded(ext->sym) : NULL;
-    ray_t* result = z ? rte_tz_run(z, input, op->out_type == RAY_TIMESPAN) : ray_error("nyi", NULL);
+    const ray_tz_t* z = ext && ext->sym >= 0 && ext->sym < ray_tzdata_count
+                            ? __atomic_load_n(&g_zone_tables[ext->sym], __ATOMIC_ACQUIRE) : NULL;
+    ray_t* result = rte_tz_type_err(input, want_offset);
+    if (!result) result = z ? rte_tz_run(z, input, want_offset) : ray_error("nyi", NULL);
     ray_release(input);
     return result;
 }

@@ -22,6 +22,7 @@
  */
 
 #include "core/tz.h"
+#include "lang/cal.h"   /* the civil calendar: ymd_to_date, date_to_ymd, MONTHDAYS */
 #include "mem/sys.h"
 
 #include <string.h>
@@ -60,27 +61,10 @@ bool ray_tz_name_ok(const char* p, size_t n) {
     return !seg_start;
 }
 
-/* ---- The calendar, in days since 1970.01.01 ------------------------------ */
-
-static int64_t tz_days_from_civil(int64_t y, int64_t m, int64_t d) {
-    y -= m <= 2;
-    int64_t era = (y >= 0 ? y : y - 399) / 400;
-    int64_t yoe = y - era * 400;
-    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
+/* Days from 1970.01.01 to a civil date. */
+static int64_t tz_days_from_civil(int64_t y, int m, int d) {
+    return (int64_t)ymd_to_date((int)y, m, d) + RAY_DATE_EPOCH_UNIX_DAYS;
 }
-
-static int64_t tz_year_of_days(int64_t days) {
-    days += 719468;
-    int64_t era = (days >= 0 ? days : days - 146096) / 146097;
-    int64_t doe = days - era * 146097;
-    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    return yoe + era * 400 + (doy >= 306);   /* March-based year: Jan, Feb are the next */
-}
-
-static bool tz_leap(int64_t y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
 
 /* ---- The POSIX TZ string a file ends with -------------------------------- */
 
@@ -191,15 +175,15 @@ static bool tz_posix_parse(const char* s, const char* e, tz_posix_t* out) {
 static int64_t tz_rule_local(const tz_rule_t* r, int64_t y) {
     int64_t days;
     if (r->kind == 'M') {
-        static const int mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        const uint32_t* cum = MONTHDAYS[date_leap_year((int)y)];
         int64_t first = tz_days_from_civil(y, r->m, 1);
         int     dow = (int)(((first % 7) + 11) % 7);   /* 1970.01.01 was a Thursday */
-        int     len = mdays[r->m - 1] + (r->m == 2 && tz_leap(y));
+        int     len = (int)(cum[r->m] - cum[r->m - 1]);
         int     day = 1 + (r->d - dow + 7) % 7 + (r->w - 1) * 7;
         if (day > len) day -= 7;
         days = first + day - 1;
     } else if (r->kind == 'J') {
-        days = tz_days_from_civil(y, 1, 1) + r->n - 1 + (tz_leap(y) && r->n >= 60);
+        days = tz_days_from_civil(y, 1, 1) + r->n - 1 + (date_leap_year((int)y) && r->n >= 60);
     } else {
         days = tz_days_from_civil(y, 1, 1) + r->n;
     }
@@ -238,14 +222,21 @@ typedef struct {
 } tz_build_t;
 
 /* Unroll the rule from the year of the file's last change (the range's first
- * year when the file lists none), keeping what comes after that change. */
+ * year when the file lists none), keeping what comes after that change.
+ *
+ * A rule's change may fall on the very instant of the change before it: the
+ * footer for DST all year round, "EST5EDT,0/0,J365/25", ends each year's DST
+ * at the instant the next year's starts.  The later of the two is what holds
+ * from then on, so it replaces the offset of the entry already there. */
 static void tz_unroll(tz_build_t* b, const tz_posix_t* px) {
     int64_t last = b->n ? b->at[b->n - 1] : INT64_MIN;
     int64_t y0 = TZ_YEAR_FIRST;
-    if (last > -TZ_SEC_MAX) {   /* an earlier change is before the range, and -last could overflow */
+    if (last > TZ_SEC_MAX + TZ_EPOCH_2000) return;   /* the file's changes already pass the range */
+    if (last > -TZ_SEC_MAX) {   /* an earlier change is before the range; in it, the day fits cal.h's 32 bits */
         int64_t days = last >= 0 ? last / 86400 : -((-last + 86399) / 86400);
-        y0 = tz_year_of_days(days);
-        if (y0 < TZ_YEAR_FIRST) y0 = TZ_YEAR_FIRST;
+        int y, m, d;
+        date_to_ymd((int32_t)(days - RAY_DATE_EPOCH_UNIX_DAYS), &y, &m, &d);
+        if (y > y0) y0 = y;
     }
     for (int64_t y = y0; y <= TZ_YEAR_LAST; y++) {
         int64_t s = tz_rule_local(&px->start, y) - px->std_off;
@@ -257,7 +248,8 @@ static void tz_unroll(tz_build_t* b, const tz_posix_t* px) {
             at[1] = s; off[1] = px->dst_off;
         }
         for (int k = 0; k < 2; k++) {
-            if (at[k] <= last) continue;
+            if (at[k] < last) continue;
+            if (at[k] == last && b->n) { b->off[b->n - 1] = off[k]; continue; }
             b->at[b->n] = at[k];
             b->off[b->n] = off[k];
             b->n++;
@@ -288,8 +280,11 @@ static ray_tz_t* tz_finish(const tz_build_t* b, int32_t off0) {
     return z;
 }
 
-ray_tz_t* ray_tz_parse(const uint8_t* buf, size_t len) {
+ray_tz_t* ray_tz_parse(const uint8_t* buf, size_t len) { return ray_tz_parse_why(buf, len, NULL); }
+
+ray_tz_t* ray_tz_parse_why(const uint8_t* buf, size_t len, bool* oom) {
     tz_counts_t c;
+    if (oom) *oom = false;
     if (!buf || !tz_header(buf, len, &c) || buf[4] < '2') return NULL;
     size_t skip = TZ_HDR + tz_block(&c, 4);   /* the 32-bit block, unread */
     if (skip > len || !tz_header(buf + skip, len - skip, &c) || c.leap != 0) return NULL;
@@ -315,7 +310,7 @@ ray_tz_t* ray_tz_parse(const uint8_t* buf, size_t len) {
     size_t cap = (size_t)c.time + 2 * (TZ_YEAR_LAST - TZ_YEAR_FIRST + 1);
     tz_build_t b = {0};
     b.at = ray_sys_alloc(cap * (sizeof(int64_t) + sizeof(int32_t)));
-    if (!b.at) return NULL;
+    if (!b.at) { if (oom) *oom = true; return NULL; }
     b.off = (int32_t*)(b.at + cap);
 
     ray_tz_t* z = NULL;
@@ -332,6 +327,7 @@ ray_tz_t* ray_tz_parse(const uint8_t* buf, size_t len) {
     b.n = (int32_t)c.time;
     if (px.has_dst) tz_unroll(&b, &px);
     z = tz_finish(&b, off0);
+    if (!z && oom) *oom = true;
 done:
     ray_sys_free(b.at);
     return z;
@@ -339,20 +335,17 @@ done:
 
 void ray_tz_free(ray_tz_t* z) { ray_sys_free(z); }
 
-const uint8_t* ray_tzdata_find(const char* name, size_t len, size_t* out_len) {
+int32_t ray_tzdata_index(const char* name, size_t len) {
     char key[65];
-    if (!ray_tz_name_ok(name, len)) return NULL;   /* which also bounds len to the key */
+    if (!ray_tz_name_ok(name, len)) return -1;   /* which also bounds len to the key */
     memcpy(key, name, len);
     key[len] = '\0';
     int32_t lo = 0, hi = ray_tzdata_count;
     while (lo < hi) {
         int32_t mid = lo + (hi - lo) / 2;
         int c = strcmp(key, ray_tzdata_zones[mid].name);
-        if (c == 0) {
-            *out_len = ray_tzdata_zones[mid].len;
-            return ray_tzdata_blob + ray_tzdata_zones[mid].at;
-        }
+        if (c == 0) return mid;
         if (c < 0) hi = mid; else lo = mid + 1;
     }
-    return NULL;
+    return -1;
 }
