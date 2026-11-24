@@ -98,6 +98,7 @@ static const ray_sig_entry_t sigs[] = {
     {"percentile", "(percentile <x: numeric vector> <p: num in 0..100>)"},
     {"quantile", "(quantile <x: numeric vector> <p: num in 0..1>)"},
     {".emb.cos-dist", "(.emb.cos-dist <a: numeric vector> <b: numeric vector>)"},
+    {".emb.tokens", "(.emb.tokens <model: model handle> <text: str or vector of str>)"},
     {".emb.l2-dist", "(.emb.l2-dist <a: numeric vector> <b: numeric vector>)"},
     {".emb.inner-prod", "(.emb.inner-prod <a: numeric vector> <b: numeric vector>)"},
     {"mmu", "(mmu <a: numeric vector or list of rows> <b: numeric vector or list of rows>)"},
@@ -251,6 +252,8 @@ static const ray_sig_entry_t sigs[] = {
     {".emb.hnsw.free", "(.emb.hnsw.free <index: hnsw index handle>)"},
     {".emb.hnsw.info", "(.emb.hnsw.info <index: hnsw index handle>)"},
     {".emb.hnsw.get", "(.emb.hnsw.get <path: str>)"},
+    {".emb.model.get", "(.emb.model.get <dir: str>)"},
+    {".emb.model.info", "(.emb.model.info <model: model handle>)"},
 };
 
 /* Builtins that run other code (callbacks, expressions, queries) or take a
@@ -355,6 +358,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {".graph.var-expand", "(.graph.var-expand <graph: graph handle> <src: int> <min-depth: int> <max-depth: int> [<direction: sym>] [<track-path: bool>])"},
     {".idx.info", "(.idx.info <col: vector>) or (.idx.info <t: table> <column: sym>)"},
     {".emb.hnsw.build", "(.emb.hnsw.build <col: list of numeric vectors> [<metric>] [<M: int>] [<ef_c: int>])"},
+    {".emb.encode", "(.emb.encode <model: model handle> <text: str or vector of str> [<max-tokens: int>])"},
     {".emb.knn", "(.emb.knn <col: list of numeric vectors> <query: numeric vector> <k: int> [<metric>])"},
     {".emb.ann", "(.emb.ann <index: hnsw index handle> <query: numeric vector> <k: int> [<ef_s: int>])"},
     {"replace", "(replace <text: str or sym> <from: str or sym> <to: str or sym>)"},

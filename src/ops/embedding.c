@@ -24,6 +24,9 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "mem/sys.h"
+#include "store/embmodel.h"
+#include "core/pool.h"
+#include <stdatomic.h>
 
 /* ==========================================================================
  *  Rayfall builtins — direct metrics, exact KNN, HNSW lifecycle/query
@@ -612,4 +615,210 @@ ray_t* ray_hnsw_info_fn(ray_t* h) {
         ray_release(rows[i].val);
     }
     return ray_dict_new(keys, vals);
+}
+
+/* ---------- embedding models ---------- */
+
+static ray_embmodel_t* embmodel_unwrap(ray_t* h) {
+    if (!h || h->type != -RAY_I64 || !(h->attrs & RAY_ATTR_EMBMODEL)) return NULL;
+    return (ray_embmodel_t*)(uintptr_t)h->i64;
+}
+
+/* (.emb.model.get dir) → I64 handle (RAY_ATTR_EMBMODEL).  The directory is a
+ * model as its publisher ships it: config.json, tokenizer.json and
+ * model.safetensors. */
+ray_t* ray_emb_model_get_fn(ray_t* path) {
+    if (!path || path->type != -RAY_STR)
+        return ray_error("type", ".emb.model.get: path must be a string, got %s", ray_type_name(path ? path->type : 0));
+    const char* p = ray_str_ptr(path);
+    size_t len = ray_str_len(path);
+    if (!p || len == 0 || len >= 1023)
+        return ray_error("domain", ".emb.model.get: path length must be 1 to 1022 bytes, got %lld", (long long)len);
+    char buf[1024];
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    ray_t* err = NULL;
+    ray_embmodel_t* m = ray_embmodel_open(buf, &err);
+    if (!m) return err ? err : ray_error("io", ".emb.model.get: the model could not be opened");
+    ray_t* h = ray_alloc(0);
+    if (!h || RAY_IS_ERR(h)) { ray_embmodel_release(m); return h ? h : ray_error("oom", NULL); }
+    h->type  = -RAY_I64;
+    h->attrs |= RAY_ATTR_EMBMODEL;
+    h->i64   = (int64_t)(uintptr_t)m;
+    return h;
+}
+
+/* (.emb.model.info handle) → dict { kind, tokenizer, vocab, dim, layers, heads, inner, tokens } */
+ray_t* ray_emb_model_info_fn(ray_t* h) {
+    ray_embmodel_t* m = embmodel_unwrap(h);
+    if (!m) return ray_error("type", ".emb.model.info: expects a model handle, got %s", ray_type_name(h ? h->type : 0));
+    ray_embmodel_info_t in;
+    ray_embmodel_info(m, &in);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(8);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    struct { const char* name; ray_t* val; } rows[] = {
+        { "kind",      ray_sym(sym_intern_safe(in.kind, strlen(in.kind))) },
+        { "tokenizer", ray_sym(sym_intern_safe(in.tokenizer, strlen(in.tokenizer))) },
+        { "vocab",     make_i64(in.vocab) },
+        { "dim",       make_i64(in.dim) },
+        { "layers",    make_i64(in.layers) },
+        { "heads",     make_i64(in.heads) },
+        { "inner",     make_i64(in.inner) },
+        { "tokens",    make_i64(in.max_tokens) },
+    };
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
+        int64_t s = sym_intern_safe(rows[i].name, strlen(rows[i].name));
+        keys = ray_vec_append(keys, &s);
+        vals = ray_list_append(vals, rows[i].val);
+        ray_release(rows[i].val);
+    }
+    return ray_dict_new(keys, vals);
+}
+
+static ray_t* emb_ids_vec(const int32_t* ids, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I32, n);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = n;
+    if (n > 0) memcpy(ray_data(v), ids, (size_t)n * sizeof(int32_t));
+    return v;
+}
+
+/* (.emb.tokens handle text) → the ids the model's tokenizer cuts the text
+ * into, an I32 vector; a vector of strings gives a list of them. */
+ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x) {
+    ray_embmodel_t* m = embmodel_unwrap(h);
+    if (!m) return ray_error("type", ".emb.tokens: expects a model handle, got %s", ray_type_name(h ? h->type : 0));
+    if (!x || (x->type != -RAY_STR && x->type != RAY_STR))
+        return ray_error("type", ".emb.tokens: expects a string or a vector of strings, got %s", ray_type_name(x ? x->type : 0));
+    ray_embwork_t* w = ray_embwork_new(m);
+    if (!w) return ray_error("oom", NULL);
+    ray_t* out;
+    const int32_t* ids;
+    if (x->type == -RAY_STR) {
+        int64_t n = ray_embmodel_tokens(m, w, ray_str_ptr(x), ray_str_len(x), &ids);
+        out = n < 0 ? ray_error("oom", NULL) : emb_ids_vec(ids, n);
+    } else {
+        out = ray_list_new(x->len);
+        for (int64_t i = 0; i < x->len && out && !RAY_IS_ERR(out); i++) {
+            size_t len = 0;
+            const char* s = ray_str_vec_get(x, i, &len);
+            int64_t n = ray_embmodel_tokens(m, w, s ? s : "", s ? len : 0, &ids);
+            ray_t* row = n < 0 ? ray_error("oom", NULL) : emb_ids_vec(ids, n);
+            if (RAY_IS_ERR(row)) { ray_release(out); out = row; break; }
+            out = ray_list_append(out, row);
+            ray_release(row);
+        }
+        if (!out) out = ray_error("oom", NULL);
+    }
+    ray_embwork_free(w);
+    return out;
+}
+
+/* One task of .emb.encode: a run of texts, each into the vector made for it. */
+typedef struct {
+    const ray_embmodel_t* m;
+    ray_t* texts;            /* RAY_STR vector */
+    ray_t** rows;            /* the F32 vectors, made before the dispatch */
+    ray_embwork_t** work;    /* one per worker, made by the worker that first needs it */
+    ray_pool_t* inner;       /* set when the texts go one after another, each over all the workers */
+    int64_t n, per, max_tokens;
+    _Atomic(int) failed;     /* 1 out of memory */
+} emb_encode_ctx_t;
+
+static void emb_encode_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
+    emb_encode_ctx_t* c = (emb_encode_ctx_t*)vctx;
+    (void)end;
+    if (atomic_load_explicit(&c->failed, memory_order_relaxed)) return;
+    ray_embwork_t* w = c->work[worker];
+    if (!w) { w = c->work[worker] = ray_embwork_new(c->m); if (!w) { atomic_store(&c->failed, 1); return; } }
+    int64_t lo = start * c->per, hi = lo + c->per < c->n ? lo + c->per : c->n;
+    for (int64_t i = lo; i < hi; i++) {
+        if (ray_interrupted()) return;   /* the caller sees it after the dispatch */
+        size_t len = 0;
+        const char* s = ray_str_vec_get(c->texts, i, &len);
+        if (ray_embmodel_encode(c->m, w, c->inner, s ? s : "", s ? len : 0, c->max_tokens, (float*)ray_data(c->rows[i])) < 0) {
+            atomic_store(&c->failed, 1);
+            return;
+        }
+    }
+}
+
+/* (.emb.encode handle text [max-tokens]) → the text's vector, F32, of length
+ * one; a vector of strings gives a list of them, computed on the pool. */
+ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 3) return ray_error("rank", ".emb.encode: expects 2 or 3 args (model text [max-tokens]), got %lld", (long long)n);
+    ray_embmodel_t* m = embmodel_unwrap(args[0]);
+    if (!m) return ray_error("type", ".emb.encode: expects a model handle, got %s", ray_type_name(args[0] ? args[0]->type : 0));
+    ray_t* x = args[1];
+    if (!x || (x->type != -RAY_STR && x->type != RAY_STR))
+        return ray_error("type", ".emb.encode: expects a string or a vector of strings, got %s", ray_type_name(x ? x->type : 0));
+    int64_t max_tokens = 0;
+    if (n == 3) {
+        if (!args[2] || args[2]->type != -RAY_I64 || args[2]->attrs != 0 || args[2]->i64 < 2)
+            return ray_error("domain", ".emb.encode: max-tokens must be an integer of 2 or more");
+        max_tokens = args[2]->i64;
+    }
+    ray_embmodel_info_t in;
+    ray_embmodel_info(m, &in);
+    if (x->type == -RAY_STR) {
+        ray_embwork_t* w = ray_embwork_new(m);
+        if (!w) return ray_error("oom", NULL);
+        ray_t* v = ray_vec_new(RAY_F32, in.dim);
+        if (v && !RAY_IS_ERR(v)) {
+            v->len = in.dim;
+            /* One text has the whole pool: the rows of its products and its heads go to the workers. */
+            ray_pool_t* pool = ray_pool_get();
+            if (!ray_pool_par_dispatch_ok(pool, 1, 1)) pool = NULL;
+            if (ray_embmodel_encode(m, w, pool, ray_str_ptr(x), ray_str_len(x), max_tokens, (float*)ray_data(v)) < 0) {
+                ray_release(v);
+                v = ray_error("oom", NULL);
+            } else if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed))) {
+                ray_release(v);
+                v = ray_error("cancel", "interrupted");
+            }
+        }
+        ray_embwork_free(w);
+        return v ? v : ray_error("oom", NULL);
+    }
+    int64_t cnt = x->len;
+    ray_t* out = ray_list_new(cnt);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < cnt; i++) {
+        ray_t* v = ray_vec_new(RAY_F32, in.dim);
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
+        v->len = in.dim;
+        out = ray_list_append(out, v);
+        ray_release(v);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (cnt == 0) return out;
+    ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, 1, 1)) pool = NULL;
+    uint32_t workers = pool ? ray_pool_total_workers(pool) : 1;
+    emb_encode_ctx_t c = { .m = m, .texts = x, .rows = (ray_t**)ray_data(out), .n = cnt, .max_tokens = max_tokens };
+    c.work = (ray_embwork_t**)ray_sys_alloc((size_t)workers * sizeof(ray_embwork_t*));
+    if (!c.work) { ray_release(out); return ray_error("oom", NULL); }
+    /* Texts differ in length, so the runs are short: a worker that drew long ones does not hold the rest up. */
+    c.per = cnt / ((int64_t)workers * 16) + 1;
+    int64_t tasks = (cnt + c.per - 1) / c.per;
+    /* Texts enough to keep every worker busy go to the workers whole.  Fewer
+     * go one after another, each over all the workers, so that a handful of
+     * long texts does not leave most of the pool idle. */
+    if (pool && cnt >= (int64_t)workers) ray_pool_dispatch_n(pool, emb_encode_task, &c, (uint32_t)tasks);
+    else {
+        c.inner = pool;
+        for (int64_t t = 0; t < tasks; t++) emb_encode_task(&c, 0, t, t + 1);
+    }
+    for (uint32_t i = 0; i < workers; i++) ray_embwork_free(c.work[i]);
+    ray_sys_free(c.work);
+    if (atomic_load(&c.failed)) { ray_release(out); return ray_error("oom", NULL); }
+    /* A cancelled dispatch skips the tasks it had not started: the vectors
+     * of those texts were never computed. */
+    if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed))) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    return out;
 }

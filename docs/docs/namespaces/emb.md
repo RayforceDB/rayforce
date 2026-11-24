@@ -1,6 +1,6 @@
 # `.emb.*` — embeddings and vector search
 
-Distances between numeric vectors, exact nearest neighbours, and the HNSW index for approximate ones. An embedding column is a list whose entries are numeric vectors of one length; see [Vector Search & HNSW](../graph/vector-search.md) for the worked reference, persistence and the `nearest:` clause of `select`.
+Distances between numeric vectors, exact nearest neighbours, the HNSW index for approximate ones, and the model that turns text into vectors in the first place. An embedding column is a list whose entries are numeric vectors of one length; see [Vector Search & HNSW](../graph/vector-search.md) for the worked reference, persistence and the `nearest:` clause of `select`.
 
 These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before they were gathered here. The old names are gone. The index has a sub-namespace of its own, `.emb.hnsw.*`, and is read from and written to disk with `get` and `set`, the path first, as tables are with `.db.splayed.get` and `.db.splayed.set`. `norm` is linear algebra and stays a global name, beside `mmu`, `inv` and the rest.
 
@@ -18,6 +18,10 @@ These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before 
 | [`.emb.hnsw.set`](#emb-hnsw-set) | binary | restricted | Persist an index to a directory. |
 | [`.emb.hnsw.get`](#emb-hnsw-get) | unary | restricted | Load an index from a directory. |
 | [`.emb.hnsw.free`](#emb-hnsw-free) | unary | restricted | Release an index early. |
+| [`.emb.model.get`](#emb-model-get) | unary | restricted | Open a text-embedding model from a directory. |
+| [`.emb.model.info`](#emb-model-info) | unary | — | Dict describing a model. |
+| [`.emb.tokens`](#emb-tokens) | binary | — | The token ids a model cuts a text into. |
+| [`.emb.encode`](#emb-encode) | variadic | — | The vector of a text, or of each of many. |
 
 ## `.emb.cos-dist` { #emb-cos-dist }
 
@@ -71,3 +75,42 @@ Signature: `(.emb.hnsw.get path)`. Returns a handle to the index saved at `path`
 ## `.emb.hnsw.free` { #emb-hnsw-free }
 
 Signature: `(.emb.hnsw.free handle)`. Releases the index now. Optional: a handle is reference-counted and is released when the last binding to it goes.
+
+## Text into vectors
+
+A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernels `mmu` and `gram` have. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
+
+```lisp
+(set m (.emb.model.get "models/my-encoder"))
+(set docs ["how to restart the service" "the quarterly numbers" "restarting after a crash"])
+(set t (table [text vec] (list docs (.emb.encode m docs))))
+(select {from: t nearest: (.emb.knn vec (.emb.encode m "restart")) take: 2})
+```
+
+What is read: encoders of the BERT family (`"model_type": "bert"` in `config.json`: absolute positions, GELU, layer norm after each sublayer) with a Unigram tokenizer and F32 weights. The vector of a text is the last layer averaged over its tokens and scaled to length one, so cosine distance and inner product order results alike. A model of another family is refused by name rather than computed wrongly.
+
+Models differ in what they expect around a text; many are trained with a prefix such as `"query: "` or `"passage: "`, and that is the caller's to add. The text is tokenized exactly as given: leading and trailing whitespace is part of it, so `trim` a text first where the wrapper you compare against does.
+
+## `.emb.model.get` { #emb-model-get }
+
+Signature: `(.emb.model.get dir)`. Opens the model in `dir` and returns a handle. Opened the way other disk data is: with `get`, the path first. The handle is reference-counted and the model never changes, so binding it to another name shares the one model; it is released when the last binding goes, and there is no function to free it.
+
+## `.emb.model.info` { #emb-model-info }
+
+Signature: `(.emb.model.info handle)`. A dict: `{kind tokenizer vocab dim layers heads inner tokens}`: the family, how text is cut, the size of the vocabulary, the length of a vector, the encoder's shape, and the most tokens a text may have.
+
+## `.emb.tokens` { #emb-tokens }
+
+Signature: `(.emb.tokens handle text)`. The ids the model's tokenizer cuts `text` into, an I32 vector with the begin and end marks; a vector of strings gives a list of them. Use it to count what a text costs, or to see where a long one will be cut.
+
+```lisp
+(count (.emb.tokens m "how to restart the service"))
+```
+
+## `.emb.encode` { #emb-encode }
+
+Signature: `(.emb.encode handle text [max-tokens])`. The vector of `text`: F32, of the model's `dim`, of length one. A vector of strings gives a list of vectors, one for each; that list is an embedding column as `.emb.knn` and `.emb.hnsw.build` take it.
+
+Either way the worker pool is used. Many texts go to the workers whole, a text to each. One text, or fewer texts than there are workers, is computed by all the workers together: the rows of each matrix product and the heads of attention are shared out, so a single long text does not wait on one core.
+
+A text of more tokens than the model allows (`tokens` in `.emb.model.info`), or than `max-tokens` when that is given and smaller, is cut to its beginning. The cost of a text grows faster than its length, so a smaller `max-tokens` is the way to trade the tail of long texts for speed.
