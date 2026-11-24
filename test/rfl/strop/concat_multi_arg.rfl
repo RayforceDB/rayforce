@@ -1,0 +1,135 @@
+;; @also-unfused
+;; A query's concat takes several operands on every route (#1592): a by:
+;; projection, keyless, where:, update (with where: and by:), inside an
+;; aggregate's argument, and through a helper, inlined or run as bytecode.
+;; Each answer is the eager row-by-row call written as nested binary
+;; concats: (concat a b c) is (concat (concat a b) c).  Before #1592 the
+;; by: projection and a helper run as bytecode raised arity.
+
+(set s ["x" "" "y" "w"])
+(set u ["a" "b" "" "c"])
+(set t (table [g k s u] (list ['p 'p 'q 'q] [0 1 2 3] s u)))
+
+;; (concat s u "-")
+(map (fn [i] (concat (concat (at s i) (at u i)) "-")) (til 4)) -- ["xa-" "b-" "y-" "wc-"]
+(at (select {from: t v: (concat s u "-")}) 'v) -- ["xa-" "b-" "y-" "wc-"]
+(at (select {from: t by: g v: (concat s u "-")}) 'v) -- (list ["xa-" "b-"] ["y-" "wc-"])
+(at (select {from: t where: (> k 0) by: g v: (concat s u "-")}) 'v) -- (list ["b-"] ["y-" "wc-"])
+(at (select {from: t where: (== (concat s u "-") "wc-")}) 'k) -- [3]
+(at (update {v: (concat s u "-") from: t}) 'v) -- ["xa-" "b-" "y-" "wc-"]
+(at (update {v: (concat s u "-") from: t where: (> k 0)}) 'v) -- ["" "b-" "y-" "wc-"]
+(at (update {v: (concat s u "-") from: t by: g}) 'v) -- ["xa-" "b-" "y-" "wc-"]
+(at (select {from: t by: g f: (first (concat s u "-")) l: (last (concat s u "-"))}) 'l) -- ["b-" "wc-"]
+(at (select {from: t by: g f: (first (concat s u "-")) l: (last (concat s u "-"))}) 'f) -- ["xa-" "y-"]
+(at (select {from: t l: (last (concat s u "-"))}) 'l) -- ["wc-"]
+
+;; (concat s "-" u)
+(map (fn [i] (concat (concat (at s i) "-") (at u i))) (til 4)) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t v: (concat s "-" u)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g v: (concat s "-" u)}) 'v) -- (list ["x-a" "-b"] ["y-" "w-c"])
+(at (select {from: t where: (> k 0) by: g v: (concat s "-" u)}) 'v) -- (list ["-b"] ["y-" "w-c"])
+(at (select {from: t where: (== (concat s "-" u) "w-c")}) 'k) -- [3]
+(at (update {v: (concat s "-" u) from: t}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (update {v: (concat s "-" u) from: t where: (> k 0)}) 'v) -- ["" "-b" "y-" "w-c"]
+(at (update {v: (concat s "-" u) from: t by: g}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g f: (first (concat s "-" u)) l: (last (concat s "-" u))}) 'l) -- ["-b" "w-c"]
+(at (select {from: t by: g f: (first (concat s "-" u)) l: (last (concat s "-" u))}) 'f) -- ["x-a" "y-"]
+(at (select {from: t l: (last (concat s "-" u))}) 'l) -- ["w-c"]
+
+;; (concat "-" s u)
+(map (fn [i] (concat (concat "-" (at s i)) (at u i))) (til 4)) -- ["-xa" "-b" "-y" "-wc"]
+(at (select {from: t v: (concat "-" s u)}) 'v) -- ["-xa" "-b" "-y" "-wc"]
+(at (select {from: t by: g v: (concat "-" s u)}) 'v) -- (list ["-xa" "-b"] ["-y" "-wc"])
+(at (select {from: t where: (> k 0) by: g v: (concat "-" s u)}) 'v) -- (list ["-b"] ["-y" "-wc"])
+(at (select {from: t where: (== (concat "-" s u) "-wc")}) 'k) -- [3]
+(at (update {v: (concat "-" s u) from: t}) 'v) -- ["-xa" "-b" "-y" "-wc"]
+(at (update {v: (concat "-" s u) from: t where: (> k 0)}) 'v) -- ["" "-b" "-y" "-wc"]
+(at (update {v: (concat "-" s u) from: t by: g}) 'v) -- ["-xa" "-b" "-y" "-wc"]
+(at (select {from: t by: g f: (first (concat "-" s u)) l: (last (concat "-" s u))}) 'l) -- ["-b" "-wc"]
+(at (select {from: t by: g f: (first (concat "-" s u)) l: (last (concat "-" s u))}) 'f) -- ["-xa" "-y"]
+(at (select {from: t l: (last (concat "-" s u))}) 'l) -- ["-wc"]
+
+;; (concat s "" u)
+(map (fn [i] (concat (concat (at s i) "") (at u i))) (til 4)) -- ["xa" "b" "y" "wc"]
+(at (select {from: t v: (concat s "" u)}) 'v) -- ["xa" "b" "y" "wc"]
+(at (select {from: t by: g v: (concat s "" u)}) 'v) -- (list ["xa" "b"] ["y" "wc"])
+(at (select {from: t where: (> k 0) by: g v: (concat s "" u)}) 'v) -- (list ["b"] ["y" "wc"])
+(at (select {from: t where: (== (concat s "" u) "wc")}) 'k) -- [3]
+(at (update {v: (concat s "" u) from: t}) 'v) -- ["xa" "b" "y" "wc"]
+(at (update {v: (concat s "" u) from: t where: (> k 0)}) 'v) -- ["" "b" "y" "wc"]
+(at (update {v: (concat s "" u) from: t by: g}) 'v) -- ["xa" "b" "y" "wc"]
+(at (select {from: t by: g f: (first (concat s "" u)) l: (last (concat s "" u))}) 'l) -- ["b" "wc"]
+(at (select {from: t by: g f: (first (concat s "" u)) l: (last (concat s "" u))}) 'f) -- ["xa" "y"]
+(at (select {from: t l: (last (concat s "" u))}) 'l) -- ["wc"]
+
+;; (concat (trim s) "-" (upper u))
+(map (fn [i] (concat (concat (trim (at s i)) "-") (upper (at u i)))) (til 4)) -- ["x-A" "-B" "y-" "w-C"]
+(at (select {from: t v: (concat (trim s) "-" (upper u))}) 'v) -- ["x-A" "-B" "y-" "w-C"]
+(at (select {from: t by: g v: (concat (trim s) "-" (upper u))}) 'v) -- (list ["x-A" "-B"] ["y-" "w-C"])
+(at (select {from: t where: (> k 0) by: g v: (concat (trim s) "-" (upper u))}) 'v) -- (list ["-B"] ["y-" "w-C"])
+(at (select {from: t where: (== (concat (trim s) "-" (upper u)) "w-C")}) 'k) -- [3]
+(at (update {v: (concat (trim s) "-" (upper u)) from: t}) 'v) -- ["x-A" "-B" "y-" "w-C"]
+(at (update {v: (concat (trim s) "-" (upper u)) from: t where: (> k 0)}) 'v) -- ["" "-B" "y-" "w-C"]
+(at (update {v: (concat (trim s) "-" (upper u)) from: t by: g}) 'v) -- ["x-A" "-B" "y-" "w-C"]
+(at (select {from: t by: g f: (first (concat (trim s) "-" (upper u))) l: (last (concat (trim s) "-" (upper u)))}) 'l) -- ["-B" "w-C"]
+(at (select {from: t by: g f: (first (concat (trim s) "-" (upper u))) l: (last (concat (trim s) "-" (upper u)))}) 'f) -- ["x-A" "y-"]
+(at (select {from: t l: (last (concat (trim s) "-" (upper u)))}) 'l) -- ["w-C"]
+
+;; (concat s "-" u "-" s)
+(map (fn [i] (concat (concat (concat (concat (at s i) "-") (at u i)) "-") (at s i))) (til 4)) -- ["x-a-x" "-b-" "y--y" "w-c-w"]
+(at (select {from: t v: (concat s "-" u "-" s)}) 'v) -- ["x-a-x" "-b-" "y--y" "w-c-w"]
+(at (select {from: t by: g v: (concat s "-" u "-" s)}) 'v) -- (list ["x-a-x" "-b-"] ["y--y" "w-c-w"])
+(at (select {from: t where: (> k 0) by: g v: (concat s "-" u "-" s)}) 'v) -- (list ["-b-"] ["y--y" "w-c-w"])
+(at (select {from: t where: (== (concat s "-" u "-" s) "w-c-w")}) 'k) -- [3]
+(at (update {v: (concat s "-" u "-" s) from: t}) 'v) -- ["x-a-x" "-b-" "y--y" "w-c-w"]
+(at (update {v: (concat s "-" u "-" s) from: t where: (> k 0)}) 'v) -- ["" "-b-" "y--y" "w-c-w"]
+(at (update {v: (concat s "-" u "-" s) from: t by: g}) 'v) -- ["x-a-x" "-b-" "y--y" "w-c-w"]
+(at (select {from: t by: g f: (first (concat s "-" u "-" s)) l: (last (concat s "-" u "-" s))}) 'l) -- ["-b-" "w-c-w"]
+(at (select {from: t by: g f: (first (concat s "-" u "-" s)) l: (last (concat s "-" u "-" s))}) 'f) -- ["x-a-x" "y--y"]
+(at (select {from: t l: (last (concat s "-" u "-" s))}) 'l) -- ["w-c-w"]
+
+;; (concat "" s "" u)
+(map (fn [i] (concat (concat (concat "" (at s i)) "") (at u i))) (til 4)) -- ["xa" "b" "y" "wc"]
+(at (select {from: t v: (concat "" s "" u)}) 'v) -- ["xa" "b" "y" "wc"]
+(at (select {from: t by: g v: (concat "" s "" u)}) 'v) -- (list ["xa" "b"] ["y" "wc"])
+(at (select {from: t where: (> k 0) by: g v: (concat "" s "" u)}) 'v) -- (list ["b"] ["y" "wc"])
+(at (select {from: t where: (== (concat "" s "" u) "wc")}) 'k) -- [3]
+(at (update {v: (concat "" s "" u) from: t}) 'v) -- ["xa" "b" "y" "wc"]
+(at (update {v: (concat "" s "" u) from: t where: (> k 0)}) 'v) -- ["" "b" "y" "wc"]
+(at (update {v: (concat "" s "" u) from: t by: g}) 'v) -- ["xa" "b" "y" "wc"]
+(at (select {from: t by: g f: (first (concat "" s "" u)) l: (last (concat "" s "" u))}) 'l) -- ["b" "wc"]
+(at (select {from: t by: g f: (first (concat "" s "" u)) l: (last (concat "" s "" u))}) 'f) -- ["xa" "y"]
+(at (select {from: t l: (last (concat "" s "" u))}) 'l) -- ["wc"]
+
+;; (concat u u u u)
+(map (fn [i] (concat (concat (concat (at u i) (at u i)) (at u i)) (at u i))) (til 4)) -- ["aaaa" "bbbb" "" "cccc"]
+(at (select {from: t v: (concat u u u u)}) 'v) -- ["aaaa" "bbbb" "" "cccc"]
+(at (select {from: t by: g v: (concat u u u u)}) 'v) -- (list ["aaaa" "bbbb"] ["" "cccc"])
+(at (select {from: t where: (> k 0) by: g v: (concat u u u u)}) 'v) -- (list ["bbbb"] ["" "cccc"])
+(at (select {from: t where: (== (concat u u u u) "cccc")}) 'k) -- [3]
+(at (update {v: (concat u u u u) from: t}) 'v) -- ["aaaa" "bbbb" "" "cccc"]
+(at (update {v: (concat u u u u) from: t where: (> k 0)}) 'v) -- ["" "bbbb" "" "cccc"]
+(at (update {v: (concat u u u u) from: t by: g}) 'v) -- ["aaaa" "bbbb" "" "cccc"]
+(at (select {from: t by: g f: (first (concat u u u u)) l: (last (concat u u u u))}) 'l) -- ["bbbb" "cccc"]
+(at (select {from: t by: g f: (first (concat u u u u)) l: (last (concat u u u u))}) 'f) -- ["aaaa" "cccc"]
+(at (select {from: t l: (last (concat u u u u))}) 'l) -- ["cccc"]
+
+;; through a helper: a single expression is inlined, a body of several
+;; statements runs as bytecode
+(set h1 (fn [a b] (concat a "-" b)))
+(set h2 (fn [a b] 1 (concat a "-" b)))
+(at (select {from: t v: (h1 s u)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g v: (h1 s u)}) 'v) -- (list ["x-a" "-b"] ["y-" "w-c"])
+(at (select {from: t v: (h2 s u)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g v: (h2 s u)}) 'v) -- (list ["x-a" "-b"] ["y-" "w-c"])
+(at (update {v: (h2 s u) from: t}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g v: (last (h2 s u))}) 'v) -- ["-b" "w-c"]
+(at (select {from: t v: ((fn [a b] 1 (concat a "-" b)) s u)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+
+;; outside a query concat is binary, as before
+(concat "a" "-" "b") !- arity
+(h2 "a" "b") !- arity
+
+;; up to 255 operands in a by: projection, as on the other routes
+(at (select {from: t by: g v: (concat s "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z")}) 'v) -- (list ["xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] ["yzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" "wzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"])
+(count (at (select {from: t by: g v: (concat s "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z" "z")}) 'v)) !- arity
