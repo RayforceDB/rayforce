@@ -668,6 +668,10 @@ typedef struct {
     bool           ht_has_min;
     bool           col_has_nulls;
     bool           col_atom_null;
+    /* The verdict a null row emits: 0 (null rows fail both in and not-in),
+     * or 1 for `in` over a string set holding "" against a SYM column,
+     * where "" names the null symbol, as `(== s "")` reads it. */
+    uint8_t        null_out;
     bool           col_is_atom;
     bool           use_double;
     bool           negate;
@@ -874,10 +878,10 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
     if (c->use_double) {
         if (c->col_atom_null) {
             /* All elements are null — fill zeros */
-            for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
+            for (int64_t i = start; i < end; i++) ob[i - ob_base] = c->null_out;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (IN_IS_NULL(i)) { ob[i - ob_base] = 0; continue; }
+                if (IN_IS_NULL(i)) { ob[i - ob_base] = c->null_out; continue; }
                 double cv;
                 if (c->col_is_atom) cv = (ct == RAY_F64) ? col->f64 : (double)col->i64;
                 else IN_READ_F64(cv, i);
@@ -893,10 +897,10 @@ RAY_INLINE void exec_in_body(const in_worker_ctx_t* c, int64_t start, int64_t en
         }
     } else {
         if (c->col_atom_null) {
-            for (int64_t i = start; i < end; i++) ob[i - ob_base] = 0;
+            for (int64_t i = start; i < end; i++) ob[i - ob_base] = c->null_out;
         } else if (vec_has_nulls) {
             for (int64_t i = start; i < end; i++) {
-                if (IN_IS_NULL(i)) { ob[i - ob_base] = 0; continue; }
+                if (IN_IS_NULL(i)) { ob[i - ob_base] = c->null_out; continue; }
                 int64_t cv;
                 if (c->col_is_atom) cv = col->i64;
                 else IN_READ_I64(cv, i);
@@ -990,11 +994,15 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     int8_t st = ray_is_atom(set) ? (int8_t)(-set->type) : set->type;
     if (RAY_IS_PARTED(st)) st = (int8_t)RAY_PARTED_BASETYPE(st);
 
-    /* A string set against a SYM column (or atom) reads as the symbols its
-     * strings spell, each looked up in the column's own domain below: what
-     * `==` does with a string in a query (#1493).  Nothing is interned, and
-     * a string the domain does not hold matches no row. */
-    bool sym_of_str = (ct == RAY_SYM && st == RAY_STR && !ray_is_atom(set));
+    /* A string set (a vector or one string) against a SYM column (or atom)
+     * reads as the symbols its strings spell, each looked up in the
+     * column's own domain below: what `==` does with a string in a query
+     * (#1493).  Nothing is interned, and a string the domain does not hold
+     * matches no row.  "" is the null symbol's text: it selects the null
+     * rows, as `(== s "")` does (#1543).  A literal or bound set had that
+     * rewritten at compile time; a set computed at run time arrives here. */
+    bool sym_of_str = (ct == RAY_SYM && st == RAY_STR);
+    bool null_in = false;
     if ((ct == RAY_STR || st == RAY_STR) && !sym_of_str) return IN_CTX_UNSUPPORTED;
     /* GUID cells are 16-byte blobs; the typed kernel's READ_I64/IN_READ_I64
      * loops have no guid case and read them at the wrong width (every cell
@@ -1130,8 +1138,15 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
         for (int64_t i = 0; i < set_len; i++) {
             size_t l = 0;
-            const char* p = ray_str_vec_get(set, i, &l);
-            if (!p || l == 0) continue;            /* "": the null symbol, masked */
+            const char* p;
+            if (ray_is_atom(set)) { p = ray_str_ptr(set); l = ray_str_len(set); }
+            else p = ray_str_vec_get(set, i, &l);
+            if (!p) continue;
+            if (l == 0) {                          /* "": the null symbol */
+                if (!null_in) svi[sv_len++] = 0;   /* raw id 0, for the LUT */
+                null_in = true;
+                continue;
+            }
             int64_t xid = ray_sym_domain_find(cd, p, l);
             if (xid < 0) continue;                 /* absent: matches nothing */
             svi[sv_len++] = xid;
@@ -1184,9 +1199,10 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 memset(lut, 0, (size_t)d);
                 for (int64_t j = 0; j < sv_len; j++)
                     if (svi[j] >= 0 && svi[j] < d) lut[svi[j]] = 1;
-                /* Null rows fail both in and not-in. The worker XORs every
-                 * entry with negate, so preadjust ID 0 to keep it false. */
-                lut[0] = (uint8_t)negate;
+                /* Null rows fail both in and not-in, unless the set holds ""
+                 * (then they pass in).  The worker XORs every entry with
+                 * negate, so preadjust ID 0 to keep it false under not-in. */
+                lut[0] = (uint8_t)(negate | null_in);
                 *lut_hdr_out = lh;
                 symlut = lut;
             }
@@ -1242,6 +1258,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
         .ob = NULL, .ob_base = 0, .ct = ct,
         .col_has_nulls = col_has_nulls,
         .col_atom_null = col_atom_null,
+        .null_out = (uint8_t)(null_in && !negate),
         .col_is_atom = atom != NULL,
         .use_double = use_double,
         .negate = negate,
@@ -1298,7 +1315,7 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     /* A string set reads as symbols against a SYM column inside a query
      * only (in_build_ctx_core); the bare `in` compares a symbol with a
      * string as different values and answers no match: its own path. */
-    if (set && !RAY_IS_ERR(set) && !ray_is_atom(set) && set->type == RAY_STR &&
+    if (set && !RAY_IS_ERR(set) && (set->type == RAY_STR || set->type == -RAY_STR) &&
         col && (ray_is_atom(col) ? col->type == -RAY_SYM : col->type == RAY_SYM) &&
         !ray_env_query_scope_above(0))
         return NULL;
@@ -1336,6 +1353,38 @@ ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate) {
     if (sv_hdr) ray_free(sv_hdr);
     if (lut_hdr) ray_free(lut_hdr);
     return out;
+}
+
+/* A LIST set against a SYM operand inside a query, computed at run time:
+ * when its elements are atoms and one is a string, the string vector of
+ * their texts (a string as written, a symbol by its name; an atom of
+ * another type matches no row and is dropped), which the kernel reads as
+ * the symbols it spells.  The compile-time in_sym_set_const reads a
+ * literal or bound list the same way (#1543).  NULL when the list holds
+ * no string, or a non-atom: the set is answered as before. */
+ray_t* ray_in_sym_list_as_str(ray_t* set) {
+    if (!set || RAY_IS_ERR(set) || set->type != RAY_LIST) return NULL;
+    int64_t n = ray_len(set);
+    ray_t** e = (ray_t**)ray_data(set);
+    bool any_str = false;
+    for (int64_t i = 0; i < n; i++) {
+        if (!e[i] || !ray_is_atom(e[i])) return NULL;
+        if (e[i]->type == -RAY_STR) any_str = true;
+    }
+    if (!any_str) return NULL;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    for (int64_t i = 0; i < n && v && !RAY_IS_ERR(v); i++) {
+        const char* p = NULL;
+        size_t len = 0;
+        if (e[i]->type == -RAY_STR) {
+            p = ray_str_ptr(e[i]); len = ray_str_len(e[i]);
+        } else if (e[i]->type == -RAY_SYM) {
+            ray_t* t = ray_sym_str(e[i]->i64);
+            if (t) { p = ray_str_ptr(t); len = ray_str_len(t); }
+        }
+        if (p) v = ray_str_vec_append(v, p, len);
+    }
+    return v ? v : ray_error("oom", NULL);
 }
 
 static ray_t* flatten_parted_col(ray_t* col, ray_t* tbl);
@@ -1476,6 +1525,19 @@ static ray_t* exec_in(ray_graph_t* g, ray_op_t* op, ray_t* col, ray_t* set) {
      * Even for an empty probe, the main loop still needs to check
      * each col row's null flag so null rows never leak through as
      * true for `not-in` (the old memset bypass did exactly that). */
+
+    /* A computed list of strings against a SYM column: its string vector */
+    int8_t cbt = ray_is_atom(col) ? (int8_t)(-col->type) : col->type;
+    if (RAY_IS_PARTED(cbt)) cbt = (int8_t)RAY_PARTED_BASETYPE(cbt);
+    if (cbt == RAY_SYM && set->type == RAY_LIST) {
+        ray_t* sv = ray_in_sym_list_as_str(set);
+        if (sv && RAY_IS_ERR(sv)) return sv;
+        if (sv) {
+            ray_t* r = exec_in(g, op, col, sv);
+            ray_release(sv);
+            return r;
+        }
+    }
 
     double  svf_stack[32];
     int64_t svi_stack[32];

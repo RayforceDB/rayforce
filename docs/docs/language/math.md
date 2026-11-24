@@ -241,7 +241,8 @@ compares a `SYM` column with the symbol `AAPL`, and `in` reads a set of
 strings the same way: `(in sym (list "AAPL" "MSFT"))` and
 `(in sym ["AAPL" "MSFT"])` keep the rows holding either symbol. Each string
 is looked up in the column's own symbols, so a string no row holds matches
-nothing, and `""` selects the null rows, as `(== sym "")` does. A `GUID`
+nothing, and `""` selects the null rows, as `(== sym "")` does. A set
+computed while the query runs reads the same way as a written one. A `GUID`
 column against a string is a `type` error, for `==` and for `in` alike.
 
 ### `(== a b)` — atomic

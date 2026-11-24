@@ -3153,6 +3153,24 @@ static ray_t* eval_membership(ray_t* val, ray_t* vec, bool negate) {
         ray_release(flat);
         return r;
     }
+    /* A string set against a SYM subject reads as the symbols it spells,
+     * "" as the null symbol (#1493, #1543): the kernel answers a string
+     * vector or atom, and a computed list holding strings as the string
+     * vector of its texts.  A SYM atom subject answers one bool. */
+    if (query && (val->type == RAY_SYM || val->type == -RAY_SYM)) {
+        ray_t* sv = vec->type == RAY_LIST ? ray_in_sym_list_as_str(vec) : NULL;
+        if (sv && RAY_IS_ERR(sv)) return sv;
+        ray_t* set = sv ? sv : vec;
+        ray_t* fast = (set->type == RAY_STR || set->type == -RAY_STR)
+                    ? ray_in_vec_exec(val, set, negate) : NULL;
+        if (sv) ray_release(sv);
+        if (fast && !RAY_IS_ERR(fast) && ray_is_atom(val)) {
+            bool b = fast->len > 0 && ((uint8_t*)ray_data(fast))[0];
+            ray_release(fast);
+            return make_bool(b);
+        }
+        if (fast) return fast;
+    }
     /* The typed kernel already excludes null rows and parallelizes both
      * membership and negation. LIST probes need the general comparator. */
     if (query && ray_is_vec(val) && (ray_is_vec(vec) || ray_is_atom(vec))) {
