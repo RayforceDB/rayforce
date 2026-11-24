@@ -1,6 +1,6 @@
 # Reader-visible expected values for the DELTA fixtures.
-# Oracle values recorded from DuckDB 1.5.6 and pyarrow 26.0.1 during
-# fixture development; manifest.txt records the writer and encoding
+# Oracle values recorded from independent readers during fixture
+# development; manifest.txt records the writer and encoding
 # metadata. Values apply the reader's null policy: a stored value
 # equal to the native sentinel (INT32_MIN, INT64_MIN, any NaN) or an
 # empty BYTE_ARRAY value is a native null. "N" is the null token; "-"
@@ -280,34 +280,5 @@ values
 5 abc
 6 N
 7 N
-
-fixture duckdb-deflevel.parquet
-rows 1000
-nulls 334
-minlen 2
-maxlen 4
-totallen 2592
-distinct 666
-digest 8e7cb75063493f5e801ad03e5340f426
-anchors first v1 v2 v4 v5 v7 v8 v10 v11
-anchors last v994 v995 v997 v998
-
-fixture duckdb-v2-mixed.parquet
-rows 21000
-nulls 0
-min 0
-max 20999
-sum 220489500
-distinct 21000
-digest bdde8255fc3f61313ebcc40c83965b0a
-anchors first 0 1 2 3 4 5 6 7
-anchors last 20996 20997 20998 20999
-name_minlen 7
-name_maxlen 9
-name_totallen 186690
-name_distinct 1000
-name_digest bce109f694c49b77bf2e59539a2b5064
-name_anchors first track_0 track_1 track_2 track_3 track_4 track_5 track_6 track_7
-name_anchors last track_996 track_997 track_998 track_999
 
 fixture unsupported-bss.parquet

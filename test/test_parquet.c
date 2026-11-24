@@ -6226,7 +6226,6 @@ static test_result_t test_pq_delta_binary_packed(void) {
         {"dbp-i64-2page.parquet", RAY_I64},
         {"dbp-i64-multirg.parquet", RAY_I64},
         {"dbp-i64-snappy.parquet", RAY_I64},
-        {"duckdb-v2-mixed.parquet", RAY_I64},
     };
     int64_t batches[] = {3, 4096, 65536};
     for (size_t i = 0; i < sizeof(fixtures)/sizeof(fixtures[0]); i++)
@@ -6235,11 +6234,6 @@ static test_result_t test_pq_delta_binary_packed(void) {
     /* A one-row batch crosses page and row-group boundaries repeatedly. */
     TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-2page.parquet", RAY_I64, 1));
     TEST_ASSERT_TRUE(pq_delta_check("dbp-i64-multirg.parquet", RAY_I64, 1));
-    /* The mixed fixture's `name` column (BYTE_ARRAY RLE_DICTIONARY) is a
-     * pre-existing Stage 1 encoding; its recorded name_* oracle is compared
-     * at the same batch sizes as the DELTA id column. */
-    for (size_t b = 0; b < sizeof(batches)/sizeof(batches[0]); b++)
-        TEST_ASSERT_TRUE(pq_delta_string_check("duckdb-v2-mixed.parquet", 1, "name", batches[b]));
 #if defined(DEBUG)
     /* A certifying PLAIN read primes the seam; the DELTA page must not run
      * the certification prepass or its counter would move. */
@@ -6256,11 +6250,11 @@ static test_result_t test_pq_delta_binary_packed(void) {
     ray_t* idcols = ray_vec_from_raw(RAY_SYM, &id, 1);
     ray_error_clear();
     ray_parquet_t* dr = NULL;
-    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "duckdb-v2-mixed.parquet", idcols, 65536, &dr));
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "dbp-i64-v1.parquet", idcols, 65536, &dr));
     ray_t* dt = ray_parquet_next(dr);
     TEST_ASSERT_TRUE(dt && !RAY_IS_ERR(dt));
     TEST_ASSERT_EQ_I(ray_parquet_test_cert_levels(), 20000);
-    TEST_ASSERT_EQ_I(ray_table_nrows(dt), 21000);
+    TEST_ASSERT_EQ_I(ray_table_nrows(dt), 10000);
     ray_release(dt); ray_parquet_close(dr); ray_release(idcols);
 #endif
     /* Strict mode refuses the first native sentinel (row 0). */
@@ -6276,12 +6270,12 @@ static test_result_t test_pq_delta_binary_packed(void) {
     ray_error_free(se);
 #if defined(DEBUG)
     /* The value phase is interruptible between coarse checkpoints; the seam
-     * fires at its THIRD checkpoint inside the 21,000-row DELTA page, so the
+     * fires at its THIRD checkpoint inside the 10,000-row DELTA page, so the
      * recorded count proves the 4,096-value cadence ran (a reader that checked
      * once at page start records 0 and fails this bound). */
     ray_clear_interrupt();
     ray_parquet_t* cr = NULL;
-    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "duckdb-v2-mixed.parquet", NULL, 65536, &cr));
+    TEST_ASSERT_NULL(ray_parquet_open(DELTA_FIX "dbp-i64-v1.parquet", NULL, 65536, &cr));
     ray_parquet_test_delta_interrupt_after(3);
     ray_t* ct = ray_parquet_next(cr);
     ray_clear_interrupt();
@@ -6808,7 +6802,7 @@ static test_result_t test_pq_delta_strings(void) {
     static const char* fixtures[] = {
         "dlba-v1.parquet", "dlba-v2page.parquet", "dba-v1.parquet",
         "dba-v2page.parquet", "dba-nulls-v2.parquet", "dba-empty.parquet",
-        "dba-prefix-long.parquet", "duckdb-deflevel.parquet",
+        "dba-prefix-long.parquet",
     };
     int64_t batches[] = {3, 4096, 65536};
     for (size_t i = 0; i < sizeof(fixtures)/sizeof(fixtures[0]); i++)
@@ -6847,77 +6841,6 @@ static test_result_t test_pq_delta_strings(void) {
     ray_error_free(ct);
     ray_parquet_close(cr);
 #endif
-    PASS();
-}
-#if defined(DEBUG)
-/* PQ_DEF_STRICT restores the strict definition-level end rule, refusing the
- * DuckDB fixture's over-declared final run. The clean read after clearing the
- * variable proves the tolerance branch is taken otherwise. */
-static test_result_t test_pq_delta_def_strict(void) {
-    ray_error_clear();
-    pq_set_env("PQ_DEF_STRICT", "1");
-    ray_t* se = ray_parquet_read(DELTA_FIX "duckdb-deflevel.parquet", NULL);
-    pq_set_env("PQ_DEF_STRICT", NULL);
-    TEST_ASSERT_TRUE(se && RAY_IS_ERR(se));
-    TEST_ASSERT_TRUE(ray_err_code(se) && !strcmp(ray_err_code(se), "parquet"));
-    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "excess definition levels (column name)"));
-    ray_error_free(se);
-    ray_error_clear();
-    ray_t* t = ray_parquet_read(DELTA_FIX "duckdb-deflevel.parquet", NULL);
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    ray_release(t);
-    PASS();
-}
-#endif
-/* The DuckDB writer over-declares the final bit-packed run of its hybrid
- * streams, so a file whose created_by names DuckDB loads through the
- * tolerance while the same bytes under another writer's name keep the strict
- * rule. Copies src to dst with created_by's first six bytes replaced by `tag`
- * (six bytes). */
-static bool pq_copy_with_created_by(const char* src, const char* dst, const char* tag) {
-    FILE* in = fopen(src, "rb");
-    if (!in || strlen(tag) != 6) { if (in) fclose(in); return false; }
-    bool ok = !fseek(in, 0, SEEK_END);
-    long n = ok ? ftell(in) : -1;
-    ok = ok && n > 0 && !fseek(in, 0, SEEK_SET);
-    uint8_t* buf = ok ? (uint8_t*)ray_sys_alloc((size_t)n) : NULL;
-    ok = buf && fread(buf, 1, (size_t)n, in) == (size_t)n;
-    fclose(in);
-    size_t at = (size_t)-1;
-    for (long i = 0; ok && i + 6 <= n; i++)
-        if (!memcmp(buf + i, "DuckDB", 6)) {
-            if (at != (size_t)-1) { ok = false; break; }   /* one writer name only */
-            at = (size_t)i;
-        }
-    ok = ok && at != (size_t)-1;
-    if (ok) {
-        memcpy(buf + at, tag, 6);
-        FILE* out = fopen(dst, "wb");
-        ok = out && fwrite(buf, 1, (size_t)n, out) == (size_t)n;
-        if (out && fclose(out)) ok = false;
-    }
-    ray_sys_free(buf);
-    return ok;
-}
-/* The tolerance covers the dictionary-id stream, not only the definition
- * levels: duckdb-v2-mixed's id stream over-declares its final bit-packed run,
- * and this copy changes nothing but created_by. */
-static test_result_t test_pq_duckdb_dict_tolerance(void) {
-    char path[160];
-    snprintf(path, sizeof(path), "/tmp/rayforce-pq-duckdb-ids-%d.parquet", (int)getpid());
-    TEST_ASSERT_TRUE(pq_copy_with_created_by(DELTA_FIX "duckdb-v2-mixed.parquet", path, "duckdb"));
-    ray_error_clear();
-    ray_t* e = ray_parquet_read(path, NULL);
-    TEST_ASSERT_TRUE(e && RAY_IS_ERR(e));
-    TEST_ASSERT_TRUE(ray_err_code(e) && !strcmp(ray_err_code(e), "parquet"));
-    TEST_ASSERT_TRUE(ray_error_msg() && strstr(ray_error_msg(), "excess dictionary indices (column name)"));
-    ray_error_free(e);
-    ray_error_clear();
-    ray_t* t = ray_parquet_read(DELTA_FIX "duckdb-v2-mixed.parquet", NULL);
-    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
-    TEST_ASSERT_EQ_I(ray_table_nrows(t), 21000);
-    ray_release(t);
-    unlink(path);
     PASS();
 }
 /* The symbol import's decision for a DELTA string column: DELTA_BYTE_ARRAY is
@@ -7390,9 +7313,9 @@ static test_result_t test_pq_delta_skip(void) {
 }
 /* A 2,000-value DELTA_BYTE_ARRAY page whose values share a 40,960-byte
  * prefix plus a ten-byte suffix: one collected batch reconstructs 81,940,000
- * bytes from a ~90 KB encoded page (prefix expansion).  Valid per DuckDB
- * (2,000 rows, length 40,970); the native SYM scan must not refuse it at the
- * 64 MiB page bound. */
+ * bytes from a ~90 KB encoded page (prefix expansion).  A valid page per the
+ * format (2,000 rows, length 40,970); the native SYM scan must not refuse it at
+ * the 64 MiB page bound. */
 static bool pq_write_bigprefix(const char* path, int64_t rows, int64_t P) {
     pq_buf f = {0}; pb_bytes(&f, "PAR1", 4);
     int64_t data_off = (int64_t)f.n;
@@ -7681,9 +7604,6 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_binary_packed",test_pq_delta_binary_packed,pq_setup,pq_teardown},
     {"parquet/delta_dpb_width",test_pq_delta_dpb_width,pq_setup,pq_teardown},
     {"parquet/delta_strings",test_pq_delta_strings,pq_setup,pq_teardown},
-#if defined(DEBUG)
-    {"parquet/delta_def_strict",test_pq_delta_def_strict,pq_setup,pq_teardown},
-#endif
     {"parquet/delta_transitions",test_pq_delta_transitions,pq_setup,pq_teardown},
     {"parquet/delta_symbol_import",test_pq_delta_symbol_import,pq_setup,pq_teardown},
     {"parquet/delta_skip",test_pq_delta_skip,pq_setup,pq_teardown},
@@ -7696,7 +7616,6 @@ const test_entry_t parquet_entries[] = {
     {"parquet/delta_symbol_repeat",test_pq_delta_symbol_repeat,pq_setup,pq_teardown},
     {"parquet/delta_i32_wide",test_pq_delta_i32_wide,pq_setup,pq_teardown},
     {"parquet/delta_decimal",test_pq_delta_decimal,pq_setup,pq_teardown},
-    {"parquet/duckdb_dict_tolerance",test_pq_duckdb_dict_tolerance,pq_setup,pq_teardown},
     {"parquet/delta_refusal",test_pq_delta_refusal,pq_setup,pq_teardown},
     {"parquet/sk4_grouped_message",test_pq_sk4_grouped_message,pq_setup,pq_teardown},
     {"parquet/worker_messages",test_pq_worker_messages,pq_lang_setup,pq_lang_teardown},

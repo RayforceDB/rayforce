@@ -367,17 +367,7 @@ static bool pq_rle_next(pq_rle* r, uint32_t* out) {
     r->left--; return true;
 }
 static bool pq_rle_done(const pq_rle* r) {
-    /* Bit-packed groups are 8-aligned, so a page count that is not a multiple
-     * of 8 leaves fewer than 8 padded values in the final group: one padded
-     * group, never more. */
     return !r->c.bad && r->c.p == r->c.end && (!r->left || (r->packed && r->left < 8));
-}
-/* The writer-tolerance form: some writers pad a final bit-packed run to the
- * whole run rather than to 8 values (DuckDB does on its hybrid streams), and
- * the page's row count bounds decoding, so values left in that run are
- * padding. Used only for streams the file's writer emits (pq_hybrid_done). */
-static bool pq_rle_done_padded(const pq_rle* r) {
-    return !r->c.bad && r->c.p == r->c.end && (!r->left || r->packed);
 }
 #if defined(DEBUG)
 /* Test seams for the certification phase: the nth coarse checkpoint from now
@@ -474,8 +464,6 @@ typedef struct {
     bool lz4_multichunk;   /* the last page failed to unpack and looks like a multi-chunk LZ4 frame */
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
-    bool pad_final_run;  /* the writer over-declares a hybrid stream's final bit-packed run */
-    bool def_strict;     /* debug builds: PQ_DEF_STRICT was set when the reader opened */
     uint64_t arena_limit; /* the DELTA_BYTE_ARRAY collection arena's ceiling (pq_arena_limit) */
     pq_delta delta;
     /* DELTA_LENGTH_BYTE_ARRAY and DELTA_BYTE_ARRAY state, reset at every data
@@ -497,24 +485,6 @@ typedef struct {
     bool last_aoff_valid;
     int str_delta;       /* 0, or the page's DELTA byte-array code (6, 7) */
 } pq_column;
-/* End-of-page check for a hybrid (bit-packed / RLE) stream. The strict rule
- * holds for every writer that pads to one group of 8; only a file whose
- * created_by names the padding writer gets the looser final-run tolerance. */
-static bool pq_hybrid_done(const pq_column* c, const pq_rle* r) {
-    return c->pad_final_run ? pq_rle_done_padded(r) : pq_rle_done(r);
-}
-/* The end-of-page rule for a definition-level stream is the dictionary-id
- * stream's (pq_hybrid_done): both accept the over-declared final bit-packed
- * run that a writer-tolerant file permits.  PQ_DEF_STRICT (debug builds)
- * restores the strict rule, for a read that must reject such a file; the
- * reader reads the variable once at open (pq_cursor_budget), not at every
- * page end. */
-static bool pq_def_done(const pq_column* c, const pq_rle* r) {
-#if defined(DEBUG)
-    if (c->def_strict) return pq_rle_done(r);
-#endif
-    return pq_hybrid_done(c,r);
-}
 
 #define PQ_DELTA_SUPPORTED "unsupported value encoding (supported: plain, dictionary, RLE booleans, delta binary packed, delta length byte array, delta byte array)"
 /* Read one value from the page's DELTA_BINARY_PACKED stream, reconstructing
@@ -754,13 +724,9 @@ static pq_symbol_scratch* pq_symbols(pq_column* c) {
     return c->symbols;
 }
 /* A cursor's budget-derived state, set when the reader (or a forked reader)
- * is created: the DELTA_BYTE_ARRAY arena's ceiling, and in debug builds the
- * PQ_DEF_STRICT override - read once per reader, not at every page end. */
+ * is created: the DELTA_BYTE_ARRAY arena's ceiling. */
 static void pq_cursor_budget(pq_column* c) {
     c->arena_limit = pq_arena_limit();
-#if defined(DEBUG)
-    c->def_strict = getenv("PQ_DEF_STRICT") != NULL;
-#endif
 }
 typedef struct { int64_t lo, hi; } pq_interval;
 struct ray_parquet {
@@ -779,7 +745,6 @@ struct ray_parquet {
     pq_interval* excluded;
     int64_t nexcluded, exclude_pos, group_rows, bloom_skipped, parallel_batches;
     bool failed, emitted, borrowed, filter_nulls;
-    bool duckdb_writer;   /* created_by names DuckDB: its hybrid streams pad to the whole final run */
     uint8_t compress;     /* the import's compress option (ray_compress_t; 0 = absent) */
     bool symcol;          /* the import's symfile 'column option: a symbol file per column */
 };
@@ -975,12 +940,6 @@ static ray_t* pq_open_impl(const char* path, ray_t* columns, int64_t batch_rows,
     pq_span f[10];
     if (!pq_fields((pq_span){r->map+r->data_end,r->map+r->size-8,12}, f, 10) ||
         pq_get(f[1], -1) < 1 || !pq_num(f[3], &r->rows) || r->rows < 0 || f[2].type != 9 || f[4].type != 9 || f[8].type || f[9].type) goto fail;
-    /* FileMetaData field 6, created_by: it gates the one writer tolerance.
-     * DuckDB pads a hybrid stream's final bit-packed run to the whole run;
-     * every other stream keeps the strict one-padded-group rule. */
-    { const uint8_t* created = NULL; size_t created_n = 0;
-      r->duckdb_writer = pq_binary(f[6],&created,&created_n) && created_n >= 6 &&
-                         !memcmp(created,"DuckDB",6); }
     pq_cur sc = {f[2].p,f[2].end,false}; uint8_t st;
     uint64_t ns = pq_list(&sc, &st);
     if (sc.bad || st != 12 || ns < 2 || ns > 8*PQ_MAX_COLS) goto fail;
@@ -1344,7 +1303,7 @@ static const char* pq_start_group(ray_parquet_t* r, int64_t* bad) {
         c->chunk = (pq_cur){r->map+offset,r->map+offset+bytes,false};
         c->codec = (int)codec; c->page_left = 0; c->chunk_left = r->group_left;
         c->have_dict = false; c->dict_count = 0; c->optional = r->schema[r->selected[i]].optional;
-        c->delta.active = false; c->pad_final_run = r->duckdb_writer;
+        c->delta.active = false;
         c->str_delta = 0; c->rebuild_len = 0; c->rebuild_total = 0; c->sym_arena_len = 0;
         c->last_aoff_valid = false;
         c->payload_start = NULL; c->suffix_start = NULL;
@@ -1811,11 +1770,11 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
         c->last_aoff_valid = false;
         at += n; c->page_left -= n; c->chunk_left -= n;
         if (!c->page_left) {
-            if (c->optional && !pq_def_done(c,&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->str_delta) { const char* derr = pq_str_delta_done(c); if (derr) return derr; }
             else if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }
@@ -1961,11 +1920,11 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
         }
         c->page_left--; c->chunk_left--;
         if (!c->page_left) {
-            if (c->optional && !pq_def_done(c,&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->str_delta) { const char* derr = pq_str_delta_done(c); if (derr) return derr; }
             else if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->bool_rle) { if (!pq_rle_done(&c->ids)) return "excess RLE boolean data"; }
             else if (s->physical == 0) { if ((c->bool_bit+7)/8 != (uint64_t)(c->values.end-c->values.p)) return "excess boolean data"; }
             else if (c->values.p != c->values.end) return "excess plain data";
@@ -2228,7 +2187,6 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->filter_nulls = parent->filter_nulls;
     r->compress = parent->compress;
     r->symcol = parent->symcol;
-    r->duckdb_writer = parent->duckdb_writer;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -3891,11 +3849,11 @@ static const char* pq_g_walk(pq_column* c, pq_schema* s, int64_t rows, pq_gtask*
         }
         at += n; c->page_left -= n; c->chunk_left -= n;
         if (!c->page_left) {
-            if (c->optional && !pq_def_done(c,&c->defs)) return "excess definition levels";
+            if (c->optional && !pq_rle_done(&c->defs)) return "excess definition levels";
             if (c->expected_nulls >= 0 && c->page_nulls != c->expected_nulls) return "v2 null count mismatch";
             if (c->str_delta) { const char* derr = pq_str_delta_done(c); if (derr) return derr; }
             else if (c->delta.active) { const char* derr = pq_delta_done(c); if (derr) return derr; }
-            else if (c->encoding) { if (!pq_hybrid_done(c,&c->ids)) return "excess dictionary indices"; }
+            else if (c->encoding) { if (!pq_rle_done(&c->ids)) return "excess dictionary indices"; }
             else if (c->values.p != c->values.end) return "excess string values";
             if (!c->chunk_left && c->chunk.p != c->chunk.end) return "excess column pages";
         }

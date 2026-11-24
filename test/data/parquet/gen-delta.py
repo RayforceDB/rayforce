@@ -2,8 +2,7 @@
 """Regenerate the DELTA encoding fixtures in test/data/parquet/delta/.
 Dev-only: make test never invokes this.
 
-Writer pins: pyarrow 26.0.1 for every DELTA fixture and BYTE_STREAM_SPLIT
-fixture; DuckDB 1.5.6 for duckdb-v2-mixed.parquet. Run:
+Fixtures are written by the external writer library imported below. Run:
 
     python3 test/data/parquet/gen-delta.py test/data/parquet/delta
 
@@ -22,12 +21,6 @@ Value formulas (10,000 rows unless stated):
   dba-prefix-long (512 rows)                         s = "P"*65536 + "%04d" % i
   dba-empty (8 rows)                                 ["", "a", "", "ab", "", "abc", "", ""]
   unsupported-bss (8 rows)                           id = 0..7, BYTE_STREAM_SPLIT
-  duckdb-v2-mixed (21,000 rows)                      the DuckDB COPY at the end of main()
-      (just past the reader's 4,096-value interrupt checkpoint and the
-      16,384-row level-count threshold)
-  duckdb-deflevel (1,000 rows)                       id = 0..999, name = 'v' || id, null when
-      range % 3 == 0; DuckDB-written, definition-level stream over-declared
-      (with PQ_DEF_STRICT set, the read fails with 'excess definition levels')
 
 Page layouts: data_page_version 1.0 except the *-v2page and dbp-i32-nulls-v2,
 dbp-i32-overflow and dba-nulls-v2 files (2.0); use_dictionary=False;
@@ -38,7 +31,6 @@ directory records the oracle values these fixtures must reproduce.
 """
 import datetime
 import os
-import subprocess
 import sys
 
 import pyarrow as pa
@@ -155,26 +147,6 @@ def main():
     write("unsupported-bss.parquet", pa.table({"id": ints(8, pa.int32())}),
           encoding={"id": BYTE_STREAM_SPLIT})
 
-    # DuckDB 1.5.6 mixed file: INT64 DELTA_BINARY_PACKED plus a
-    # RLE_DICTIONARY BYTE_ARRAY column, DATA_PAGE v1 headers.  21,000 rows:
-    # just past the reader's 4,096-value interrupt checkpoint (the value
-    # phase's third checkpoint fires) and its 16,384-row level-count
-    # threshold, and well inside one 65,536-row batch.
-    sql = ("COPY (SELECT range::BIGINT AS id, 'track_' || (range % 1000) AS name "
-           "FROM range(21000)) TO '" + os.path.join(OUT, "duckdb-v2-mixed.parquet") +
-           "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
-    subprocess.run(["duckdb", "-c", sql], check=True)
-
-    # DuckDB's definition-level streams over-declare the final bit-packed run.
-    # The probe: DuckDB 1.5.6 writes DELTA_LENGTH_BYTE_ARRAY, not
-    # DELTA_BYTE_ARRAY, for a unique-string column (parquet_metadata), so the
-    # DBA fixtures above stay pyarrow-written.  This file exercises the
-    # definition-level tolerance (with PQ_DEF_STRICT set the read fails).
-    sql = ("COPY (SELECT CASE WHEN range % 3 = 0 THEN NULL "
-           "ELSE 'v' || range::VARCHAR END AS name, range::BIGINT AS id FROM range(1000)) TO '"
-           + os.path.join(OUT, "duckdb-deflevel.parquet") +
-           "' (FORMAT parquet, COMPRESSION uncompressed, PARQUET_VERSION V2);")
-    subprocess.run(["duckdb", "-c", sql], check=True)
 
 
 if __name__ == "__main__":
