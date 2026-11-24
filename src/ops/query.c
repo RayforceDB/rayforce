@@ -4918,7 +4918,7 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
         if (!arg) return 0;
         if (arg->type == -RAY_I64) {
             /* Opaque tagged handles are not ordinary numeric literals. */
-            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL)) return 0;
+            if (arg->attrs & RAY_HANDLE_ATTRS) return 0;
             continue;
         }
         if (arg->type != -RAY_SYM || (arg->attrs & ATTR_QUOTED) ||

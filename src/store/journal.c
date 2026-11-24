@@ -1176,7 +1176,32 @@ ray_err_t ray_journal_snapshot(void) {
         if (vals_buf) ray_sys_free(vals_buf);
         return RAY_ERR_OOM;
     }
-    int32_t kept = ray_env_list_user(sym_ids, vals_buf, cap);
+    int32_t listed = ray_env_list_user(sym_ids, vals_buf, cap);
+
+    /* #802: a binding that holds a process-local handle (any kind in
+     * RAY_HANDLE_ATTRS, alone or anywhere inside a list, dict or table)
+     * has no wire form: its pointer means nothing to the next
+     * process.  Leave that binding out with one warning per name and save
+     * the rest, so a bound handle never blocks the snapshot or the roll.
+     * The probe runs with the marks kept, as the save below does. */
+    int32_t kept = 0;
+    bool probe_marks = ray_serde_keep_marks(true);
+    for (int32_t i = 0; i < listed; i++) {
+        if (ray_serde_holds_handle(vals_buf[i])) {
+            ray_t* ks = ray_sym_str(sym_ids[i]);   /* borrowed */
+            bool named = ks && !RAY_IS_ERR(ks);
+            fprintf(stderr,
+                    "log: WARN  snapshot skips '%.*s': it holds a process-local "
+                    "handle (graph, vector index, embedding model or Datalog program)\n",
+                    named ? (int)ray_str_len(ks) : 1,
+                    named ? ray_str_ptr(ks) : "?");
+            continue;
+        }
+        sym_ids[kept]  = sym_ids[i];
+        vals_buf[kept] = vals_buf[i];
+        kept++;
+    }
+    ray_serde_keep_marks(probe_marks);
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, kept);
     if (!keys || RAY_IS_ERR(keys)) {
