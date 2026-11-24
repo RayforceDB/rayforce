@@ -56,7 +56,8 @@
 (set t (.ipc.send h "(.ipc.conns)"))
 (count t) -- 1
 (first (at t 'inbound))   -- true
-(first (at t 'transport)) -- 'tcp
+;; Two processes on one Linux machine move to shared memory after the greeting.
+(or (== (first (at t 'transport)) 'tcp) (== (first (at t 'transport)) 'shm)) -- true
 (first (at t 'handle))    -- (get a 'handle)
 (like (first (at t 'peer)) "127.0.0.1:*") -- true
 (> (first (at t 'requests)) 5)            -- true
