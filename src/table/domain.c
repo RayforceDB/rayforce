@@ -385,6 +385,27 @@ ray_sym_domain_t* ray_sym_runtime_domain(void) {
 
 static ray_sym_domain_t* g_domains = NULL;
 
+/* The translation cache of one (src, dst) pair (ray_sym_domain_xlat): open
+ * addressing on the source id, 8-byte entries (an id or position past
+ * INT32_MAX is answered but not kept), slot id -1 = empty, pos -1 = string
+ * absent from dst.  One list for every pair, so releasing a domain finds
+ * the caches that name it on either side; the entry arrays of all of them
+ * together stay under dom_xlat_bound().  Guarded by g_dom_lock. */
+typedef struct { int32_t id; int32_t pos; } dom_xlat_ent_t;
+typedef struct dom_xlat_s {
+    ray_sym_domain_t* src;
+    ray_sym_domain_t* dst;
+    int64_t   dst_count;    /* dst's entry count the -1 entries hold for */
+    uint64_t  cap;          /* power of two, n <= cap / 2; 0 = no table yet */
+    uint64_t  n;
+    uint64_t  neg;          /* entries with pos -1 */
+    dom_xlat_ent_t* ents;
+    struct dom_xlat_s* next;
+} dom_xlat_t;
+static dom_xlat_t* g_xlat = NULL;
+static size_t g_xlat_bytes = 0;         /* the entry arrays of every cache */
+static size_t g_xlat_bound_override = 0; /* ray_sym_domain_test_xlat_bound */
+
 #if defined(RAY_OS_WINDOWS)
 static SRWLOCK g_dom_lock = SRWLOCK_INIT;
 static inline void dom_lock(void) {
@@ -1903,7 +1924,28 @@ void ray_sym_domain_release(ray_sym_domain_t* dom) {
     ray_sym_domain_t** pp = &g_domains;
     while (*pp && *pp != dom) pp = &(*pp)->next;
     if (*pp) *pp = dom->next;
+    /* The translation caches it takes part in go with it, on either side:
+     * a cache is keyed by the domain pointer, which the next open may
+     * hand out again. */
+    dom_xlat_t* dead = NULL;
+    for (dom_xlat_t** xp = &g_xlat; *xp;) {
+        dom_xlat_t* x = *xp;
+        if (x->src == dom || x->dst == dom) {
+            *xp = x->next;
+            g_xlat_bytes -= (size_t)x->cap * sizeof *x->ents;
+            x->next = dead;
+            dead = x;
+        } else {
+            xp = &x->next;
+        }
+    }
     dom_unlock();
+    for (dom_xlat_t* x = dead; x;) {
+        dom_xlat_t* nxt = x->next;
+        ray_sys_free(x->ents);
+        ray_sys_free(x);
+        x = nxt;
+    }
     dom_destroy(dom);
 }
 
@@ -2136,6 +2178,194 @@ int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len) 
     int64_t found = dom_probe_locked(dom, h, str, len);
     dom_unlock();
     return found;
+}
+
+/* ---- translation cache (ray_sym_domain_xlat) ------------------------------ */
+
+/* Bytes every translation cache together may hold: a sixteenth of the anon
+ * watermark, the RAM the heap keeps under (64 MB on a 2 GB box, 3 GB at
+ * 64 GB), 256 MB where RAM is unknown.  A cache that cannot grow within it
+ * keeps answering for what it holds; the rest of a call is memoized in a
+ * table of its own, freed with the call. */
+static size_t dom_xlat_bound(void) {
+    if (g_xlat_bound_override) return g_xlat_bound_override;
+    int64_t wm = ray_heap_anon_watermark();
+    return wm > 0 ? (size_t)(wm / 16) : (size_t)256 << 20;
+}
+
+void ray_sym_domain_test_xlat_bound(size_t bytes) { g_xlat_bound_override = bytes; }
+size_t ray_sym_domain_test_xlat_bytes(void) { return g_xlat_bytes; }
+
+static inline dom_xlat_ent_t* dom_xlat_slot(dom_xlat_t* x, int64_t id) {
+    uint64_t mask = x->cap - 1;
+    uint64_t s = ray_hash_i64(id) & mask;
+    while (x->ents[s].id != -1 && x->ents[s].id != (int32_t)id) s = (s + 1) & mask;
+    return &x->ents[s];
+}
+
+/* Doubles x's table (1024 slots from none), re-slotting every entry; a
+ * shared cache (`bound` > 0) only while all of them stay under `bound`.
+ * Under g_dom_lock.  False, the cache unchanged, when it may not or OOM. */
+static bool dom_xlat_grow_locked(dom_xlat_t* x, size_t bound) {
+    uint64_t cap = x->cap ? x->cap * 2 : 1024;
+    size_t bytes = (size_t)cap * sizeof(dom_xlat_ent_t);
+    if (bound && g_xlat_bytes + bytes > bound) return false;
+    dom_xlat_ent_t* ents = (dom_xlat_ent_t*)ray_sys_alloc(bytes);
+    if (!ents) return false;
+    for (uint64_t i = 0; i < cap; i++) ents[i].id = -1;
+    uint64_t mask = cap - 1;
+    for (uint64_t i = 0; i < x->cap; i++) {
+        dom_xlat_ent_t e = x->ents[i];
+        if (e.id == -1) continue;
+        uint64_t s = ray_hash_i64(e.id) & mask;
+        while (ents[s].id != -1) s = (s + 1) & mask;
+        ents[s] = e;
+    }
+    if (bound) g_xlat_bytes += bytes - (size_t)x->cap * sizeof *ents;
+    ray_sys_free(x->ents);
+    x->ents = ents;
+    x->cap = cap;
+    return true;
+}
+
+/* Keeps id -> p (both within int32) in x if there is room under the load
+ * bound.  Under g_dom_lock.  False when not. */
+static bool dom_xlat_keep_locked(dom_xlat_t* x, int64_t id, int64_t p, size_t bound) {
+    if (x->n * 2 >= x->cap && !dom_xlat_grow_locked(x, bound)) return false;
+    dom_xlat_ent_t* e = dom_xlat_slot(x, id);
+    e->id = (int32_t)id;
+    e->pos = (int32_t)p;
+    x->n++;
+    if (p == -1) x->neg++;
+    return true;
+}
+
+/* Drops the absent (-1) entries in place -- dst grew, the strings may be
+ * there now: each removal shifts the rest of its probe run back (nothing
+ * allocated, nothing copied out).  Under g_dom_lock. */
+static void dom_xlat_drop_absent_locked(dom_xlat_t* x) {
+    if (!x->neg) return;
+    uint64_t mask = x->cap - 1;
+    for (uint64_t i = 0; i < x->cap;) {
+        if (x->ents[i].id == -1 || x->ents[i].pos != -1) { i++; continue; }
+        /* backward-shift deletion: an entry whose home slot lies in
+         * (hole, slot] stays, the first that does not fills the hole */
+        uint64_t hole = i;
+        for (uint64_t j = (i + 1) & mask; x->ents[j].id != -1; j = (j + 1) & mask) {
+            uint64_t home = ray_hash_i64(x->ents[j].id) & mask;
+            bool stays = hole <= j ? (hole < home && home <= j) : (hole < home || home <= j);
+            if (stays) continue;
+            x->ents[hole] = x->ents[j];
+            hole = j;
+        }
+        x->ents[hole].id = -1;
+        x->n--;
+        /* slot i holds a moved entry now (or is empty): look at it again */
+    }
+    x->neg = 0;
+}
+
+/* The pair's cache, made on first use with dst_count = `dst_count` and no
+ * table (the first keep makes one).  Under g_dom_lock.  NULL on OOM. */
+static dom_xlat_t* dom_xlat_get_locked(ray_sym_domain_t* src, ray_sym_domain_t* dst,
+                                       int64_t dst_count) {
+    for (dom_xlat_t* x = g_xlat; x; x = x->next)
+        if (x->src == src && x->dst == dst) return x;
+    dom_xlat_t* x = (dom_xlat_t*)ray_sys_alloc(sizeof *x);
+    if (!x) return NULL;
+    memset(x, 0, sizeof *x);
+    x->src = src;
+    x->dst = dst;
+    x->dst_count = dst_count;
+    x->next = g_xlat;
+    g_xlat = x;
+    return x;
+}
+
+/* Position in `dst` of the string `src` holds at `id` (-1: unresolvable
+ * or absent); a FILE dst gets its reverse index on first use, as in
+ * ray_sym_domain_find.  Under g_dom_lock, src != dst (a compressed
+ * domain's decode buffer serves one lookup at a time). */
+static int64_t dom_xlat_find_locked(ray_sym_domain_t* src, ray_sym_domain_t* dst, int64_t id) {
+    const char* p;
+    size_t l;
+    if (src->kind == DOM_RUNTIME) {
+        ray_t* s = ray_sym_str(id);
+        if (!s) return -1;
+        p = ray_str_ptr(s);
+        l = ray_str_len(s);
+    } else {
+        p = dom_bytes_locked(src, id, &l);
+        if (!p) return -1;
+    }
+    if (dst->kind == DOM_RUNTIME) return ray_sym_find(p, l);
+    if (dst->kind == DOM_IMPORT) return -1;
+    if (atomic_load_explicit(&dst->count, memory_order_relaxed) == 0) return -1;
+    /* no index and no memory for one: -2, not an absent verdict */
+    if (!dst->buckets && !dom_build_index_locked(dst, 0)) return -2;
+    return dom_probe_locked(dst, (uint32_t)ray_hash_bytes(p, l), p, l);
+}
+
+/* Ids per lock hold: a chunk of misses is a few thousand string finds. */
+#define DOM_XLAT_CHUNK 4096
+
+int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
+                            const int64_t* ids, int64_t n, int64_t* pos) {
+    int64_t misses = 0;
+    dom_xlat_t tmp = { 0 };      /* this call's memo for what the cache cannot keep */
+    size_t bound = dom_xlat_bound();
+    bool full = false;           /* the cache may not grow this call */
+    dom_lock();
+    /* dst's count (the runtime table's through its own lock, the order
+     * ray_sym_domain_runtime_lut's intern takes too), read once: an absent
+     * verdict recorded against a smaller dst may no longer hold */
+    int64_t dst_count = ray_sym_domain_count(dst);
+    dom_xlat_t* x = dom_xlat_get_locked(src, dst, dst_count);
+    if (x && x->dst_count != dst_count) {
+        dom_xlat_drop_absent_locked(x);
+        x->dst_count = dst_count;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (i && (i & (DOM_XLAT_CHUNK - 1)) == 0) { dom_unlock(); dom_lock(); }
+        int64_t id = ids[i];
+        /* the null stays the null; a negative id names nothing */
+        if (id <= 0) { pos[i] = id == 0 ? 0 : -1; continue; }
+        dom_xlat_ent_t* e;
+        if (id <= INT32_MAX) {
+            if (x && x->cap && (e = dom_xlat_slot(x, id))->id != -1) { pos[i] = e->pos; continue; }
+            if (tmp.cap && (e = dom_xlat_slot(&tmp, id))->id != -1) { pos[i] = e->pos; continue; }
+        }
+        int64_t p = dom_xlat_find_locked(src, dst, id);
+        if (p == -2) { misses = -1; break; }   /* out of memory: no verdict */
+        misses++;
+        pos[i] = p;
+        if (id > INT32_MAX || p > INT32_MAX) continue;   /* not an 8-byte entry */
+        if (x && !full) {
+            if (dom_xlat_keep_locked(x, id, p, bound)) continue;
+            full = true;   /* the cache took what it could this call */
+        }
+        (void)dom_xlat_keep_locked(&tmp, id, p, 0);
+    }
+    dom_unlock();
+    ray_sys_free(tmp.ents);
+    return misses;
+}
+
+/* Every translation cache goes: the runtime table is about to be rebuilt
+ * (ray_sym_destroy), and a FILE domain a holder keeps across that would
+ * otherwise answer with the old table's ids. */
+void ray_sym_domain_xlat_reset(void) {
+    dom_lock();
+    dom_xlat_t* dead = g_xlat;
+    g_xlat = NULL;
+    g_xlat_bytes = 0;
+    dom_unlock();
+    for (dom_xlat_t* x = dead; x;) {
+        dom_xlat_t* nxt = x->next;
+        ray_sys_free(x->ents);
+        ray_sys_free(x);
+        x = nxt;
+    }
 }
 
 /* Append one symbol.  Called under the lock with buckets built and NOT

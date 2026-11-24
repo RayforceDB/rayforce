@@ -1539,6 +1539,10 @@ int64_t ray_expr_test_leaf_runs(void);
 /* exec.c test hook: membership tests the sparse filter refinement took
  * (refine_in_keep) since process start. */
 uint64_t ray_exec_test_refine_in(void);
+/* join.c test hook: ids the SYM key translations (join_sym_xlat) resolved
+ * by string lookup, the misses of the per-domain-pair cache, since
+ * process start. */
+uint64_t ray_join_test_sym_finds(void);
 /* exec.c test hook: filter chains pruned from their conjuncts' chunk
  * statistics before running (exec_filter_chain_prune), and the selection
  * segments (vectors) they dropped, since process start. */
