@@ -135,6 +135,7 @@ ray> (as 'DATE "2024.01.15")
 | STR | GUID | The form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex digits of either case; the empty string is `0Ng`, any other text a `domain` error. A STR vector casts each string as the atom cast does |
 | SYM | STR | Resolves interned string |
 | STR | SYM | Interns the string |
+| DATE, TIME, TIMESTAMP | Any numeric | The integer it holds (days, milliseconds, nanoseconds), narrowed as an integer is; an atom casts as a vector does |
 | DATE | TIMESTAMP | Midnight on that date |
 | TIMESTAMP | DATE | Truncates to day |
 | Any typed vector | LIST | Boxes each cell into an atom (`(as 'LIST [1 2])` is a two-item `LIST` of `i64` atoms); null cells stay typed null atoms. A `LIST` is returned unchanged; an atom, dict or table is a `type` error. In a query `select` applies it per row (an atom column is a `type` error), `select ... by:` per group, `update` to the whole column (`update ... where:` is a `type` error); see the [casting guide](../guides/types.md#as-function) |
