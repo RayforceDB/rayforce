@@ -467,6 +467,9 @@ ray_t* ray_wsum_fn(ray_t* x, ray_t* y);
 ray_t* ray_wavg_fn(ray_t* x, ray_t* y);
 ray_t* ray_min2_fn(ray_t* a, ray_t* b);
 ray_t* ray_max2_fn(ray_t* a, ray_t* b);
+/* (min a b) / (max a b) of a TIMESPAN and a number (atoms or vectors):
+ * answered by ray_timespan_binary as a TIMESPAN. */
+bool ray_minmax_span_number(ray_t* a, ray_t* b);
 
 /* In-place median (quickselect).  Caller owns the buffer; we permute
  * elements.  Returns NaN if n <= 0.  Used by aggr_med_per_group_buf in

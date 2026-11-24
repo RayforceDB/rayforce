@@ -2742,7 +2742,8 @@
 ;; temporal result types are not this table's
 (type (- [2024.01.03] 2024.01.01)) -- 'I32
 (type (- [2024.01.03] [2024.01.01])) -- 'I32
-(type (min (enlist (as 'TIMESPAN 5000000000)) 5i)) -- 'I64
+(type (min (enlist (as 'TIMESPAN 5000000000)) 5i)) -- 'TIMESPAN
+(min (enlist (as 'TIMESPAN 5000000000)) 5i) -- (as 'TIMESPAN [5])
 ;; a narrow neg / abs that runs in the typed executor (the fused program is
 ;; out of registers below it) is computed, not left unwritten
 (set RT (table [a b] (list [1h 0Nh 3h 4h] [10h 20h 30h 40h])))

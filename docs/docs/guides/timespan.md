@@ -59,6 +59,7 @@ extracts its time of day; casting a timespan to I64 exposes its raw count.
 | `avg spans`, `med spans`, `quantile spans p` | TIMESPAN, rounded to the nanosecond (half away from zero); skip nulls |
 | `dev`, `stddev`, `stddev_pop`, `mdev` | TIMESPAN; a variance is a squared duration and stays F64 |
 | `min`, `max`, `first`, `last` | Preserve TIMESPAN |
+| `min span number`, `max span number`, either order, any numeric type | TIMESPAN: the number counts nanoseconds, a float rounded first (see below) |
 | `sums`, `mins`, `maxs`, `msum`, `mmin`, `mmax`, `deltas` | TIMESPAN |
 | `avgs`, `mavg` | TIMESPAN, rounded to the nanosecond |
 | `ratios` | F64 |
@@ -101,6 +102,32 @@ Scalar, vector and query column expressions use the same duration arithmetic.
 Ordinary, encoded and partitioned storage preserve duration types and nulls.
 Explicit CSV schemas accept TIMESPAN and CSV writes use its literal syntax.
 Parquet duration and clock-time annotations are not remapped by this change.
+
+### `min` and `max` with a number { #min-and-max-with-a-number }
+
+The two-argument `min` and `max` of a TIMESPAN and a number, in either
+order and over atoms, vectors or query columns, are a TIMESPAN whichever
+operand wins. The number is converted to a duration first and the two
+durations are compared:
+
+- an integer or boolean is a count of nanoseconds;
+- an F64 or F32 is rounded to the nearest count, half away from zero, as
+  `(as 'TIMESPAN x)` and a float `div` divisor are: `(min 0D00:00:00.000000010 2.5)`
+  is three nanoseconds;
+- a value beyond the duration range saturates to `0Wn` or `-0Wn`;
+- a null of either side is the lowest value, as for every other type:
+  `min` with a null is `0Nn`, `max` with a null is the other operand.
+
+```lisp
+(max 0D00:00:00.000000010 2.5)         ; 0D00:00:00.000000010
+(min 2.5 0D00:00:00.000000010)         ; 0D00:00:00.000000003
+(max [0D00:00:00.000000001] [3.5])     ; [0D00:00:00.000000004]
+(max 0D00:00:00.000000010 0Nf)         ; 0D00:00:00.000000010
+```
+
+This differs from `+`, `-`, `*` and `%`, where a float operand makes the
+result an F64 count: `min` and `max` pick one of their operands, so the
+answer stays a duration.
 
 ## Migrating timestamp and time differences
 

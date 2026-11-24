@@ -1,0 +1,125 @@
+;; @also-unfused
+;; (min a b) / (max a b) of a TIMESPAN and a number is a TIMESPAN on every
+;; route, whichever operand wins and in either order (#1410).  The number is
+;; a count of nanoseconds: a float rounds half away from zero, as
+;; (as 'TIMESPAN x) does; a null of either side is the lowest value (min
+;; answers 0Nn, max the other operand); a value beyond the I64 lane
+;; saturates to 0Wn or -0Wn.  The two are compared as durations, after the
+;; conversion.
+
+;; ── eager atoms ──────────────────────────────────────────────────────
+(min 0D00:00:00.000000010 2.5) -- 0D00:00:00.000000003
+(max 0D00:00:00.000000010 2.5) -- 0D00:00:00.000000010
+(min 2.5 0D00:00:00.000000010) -- 0D00:00:00.000000003
+(max 25.5 0D00:00:00.000000010) -- 0D00:00:00.000000026
+(min 0D00:00:00.000000010 (as 'F32 2.5)) -- 0D00:00:00.000000003
+(max (as 'F32 2.5) 0D00:00:00.000000010) -- 0D00:00:00.000000010
+(max 0D00:00:00.000000010 30) -- 0D00:00:00.000000030
+(min 30 0D00:00:00.000000010) -- 0D00:00:00.000000010
+(max 0D00:00:00.000000010 (as 'I32 30)) -- 0D00:00:00.000000030
+(max (as 'I16 30) 0D00:00:00.000000010) -- 0D00:00:00.000000030
+(max 0D00:00:00.000000010 (as 'U8 30)) -- 0D00:00:00.000000030
+(min true 0D00:00:00.000000010) -- 0D00:00:00.000000001
+(max 0D00:00:00.000000000 true) -- 0D00:00:00.000000001
+(type (min 0D00:00:00.000000010 2.5)) -- 'timespan
+(type (max 0D00:00:00.000000010 2.5)) -- 'timespan
+(type (max 2.5 0D00:00:00.000000010)) -- 'timespan
+(type (min (as 'F32 2.5) 0D00:00:00.000000010)) -- 'timespan
+(type (max 0D00:00:00.000000010 1)) -- 'timespan
+(type (min 1 0D00:00:00.000000010)) -- 'timespan
+;; rounding: half away from zero, either sign
+(max -0D00:00:00.000000010 -2.5) -- -0D00:00:00.000000003
+(min 0D00:00:00.000000010 3.4) -- 0D00:00:00.000000003
+(min 0D00:00:00.000000010 3.5) -- 0D00:00:00.000000004
+;; compared after the conversion: 2.6 is 3ns, equal to 3ns
+(max 0D00:00:00.000000003 2.6) -- 0D00:00:00.000000003
+(min 0D00:00:00.000000003 2.6) -- 0D00:00:00.000000003
+;; nulls are lowest
+(min 0D00:00:00.000000010 0Nf) -- 0Nn
+(max 0D00:00:00.000000010 0Nf) -- 0D00:00:00.000000010
+(max 0Nf 0D00:00:00.000000010) -- 0D00:00:00.000000010
+(min 0Nn 2.5) -- 0Nn
+(max 0Nn 2.5) -- 0D00:00:00.000000003
+(max 2.5 0Nn) -- 0D00:00:00.000000003
+(max 0Nn 0Nl) -- 0Nn
+(min 0Nl 0Nn) -- 0Nn
+(type (max 0Nn 0Nf)) -- 'timespan
+;; beyond the lane: saturated
+(max 0D00:00:00.000000010 1e30) -- 0Wn
+(min 0D00:00:00.000000010 -1e30) -- -0Wn
+(max 0D00:00:00.000000010 (as 'F32 3e38)) -- 0Wn
+;; beyond 2^53 a float is compared as the duration it converts to
+(min (as 'TIMESPAN 9007199254740993) 9007199254740992.0) -- (as 'TIMESPAN 9007199254740992)
+(max 9007199254740992.0 (as 'TIMESPAN 9007199254740993)) -- (as 'TIMESPAN 9007199254740993)
+
+;; ── eager vectors ────────────────────────────────────────────────────
+(max (as 'TIMESPAN [10 1]) (as 'F32 [2.5 3.5])) -- (as 'TIMESPAN [10 4])
+(max (as 'TIMESPAN [10 1]) [2.5 3.5]) -- (as 'TIMESPAN [10 4])
+(min [2.5 3.5] (as 'TIMESPAN [10 1])) -- (as 'TIMESPAN [3 1])
+(min (as 'TIMESPAN [10 1]) 2.5) -- (as 'TIMESPAN [3 1])
+(max 2.5 (as 'TIMESPAN [10 1])) -- (as 'TIMESPAN [10 3])
+(max 0D00:00:00.000000005 [2.5 7.5 0Nf]) -- (as 'TIMESPAN [5 8 5])
+(min [2.5 7.5 0Nf] 0D00:00:00.000000005) -- (as 'TIMESPAN [3 5 0Nl])
+(max (as 'TIMESPAN [10 1]) [1e30 -1e30]) -- (concat 0Wn 0D00:00:00.000000001)
+(min (as 'TIMESPAN [10 1]) [1e30 -1e30]) -- (concat 0D00:00:00.000000010 -0Wn)
+(max (as 'TIMESPAN [10 1]) [2 30]) -- (as 'TIMESPAN [10 30])
+(type (max (as 'TIMESPAN [10 1]) [2.5 3.5])) -- 'TIMESPAN
+(type (min (as 'F32 [2.5 3.5]) (as 'TIMESPAN [10 1]))) -- 'TIMESPAN
+(type (max (as 'TIMESPAN [10 1]) (as 'I16 [2 3]))) -- 'TIMESPAN
+(min (as 'TIMESPAN [10 1]) [1 2 3]) !- length
+
+;; ── every query route against the eager answer ──────────────────────
+;; For each numeric type: a keyless select, where:, by: (aggregated), the
+;; elementwise result used inside a larger expression and inside where:,
+;; update, and a column against an atom, in both operand orders.
+(set S (as 'TIMESPAN [10 1 0Nl -7 9007199254740993 3]))
+(set F [2.5 3.5 7.0 0Nf 9007199254740992.0 -2.5])
+(set W [1 2 4 5])
+(set A [0 1 2])
+(set B [3 4 5])
+
+;; the routes of (op s x) and (op x s) over table T, op being min then max
+(set routes (fn [T] (list (at (select {m: (max s x) from: T}) 'm) (at (select {m: (max x s) from: T}) 'm) (at (select {m: (min s x) from: T}) 'm) (at (select {m: (min x s) from: T}) 'm) (at (select {m: (max s x) from: T where: (in k W)}) 'm) (at (select {m: (min x s) from: T where: (in k W)}) 'm) (at (select {hi: (max (max s x)) lo: (min (min x s)) from: T by: g asc: g}) 'hi) (at (select {hi: (max (max s x)) lo: (min (min x s)) from: T by: g asc: g}) 'lo) (at (select {m: (+ (max s x) 1) from: T}) 'm) (at (select {m: (- (min x s) 1) from: T}) 'm) (at (select {from: T where: (> (max s x) 0D00:00:00.000000004)}) 'k) (at (select {from: T where: (< (min x s) 0D00:00:00.000000003)}) 'k) (at (update {m: (max s x) from: T}) 'm) (at (update {m: (min x s) from: T}) 'm) (at (select {m: (max s (at X 0)) from: T}) 'm) (at (select {m: (min (at X 1) s) from: T}) 'm))))
+
+;; the same, eagerly over the columns' vectors
+(set eager (fn [X] (list (max S X) (max X S) (min S X) (min X S) (at (max S X) W) (at (min X S) W) (concat (max (at (max S X) A)) (max (at (max S X) B))) (concat (min (at (min X S) A)) (min (at (min X S) B))) (+ (max S X) 1) (- (min X S) 1) (at (til 6) (where (> (max S X) 0D00:00:00.000000004))) (at (til 6) (where (< (min X S) 0D00:00:00.000000003))) (max S X) (min X S) (max S (at X 0)) (min (at X 1) S))))
+
+(set table_of (fn [X] (table [g k s x] (list [a a a b b b] (til 6) S X))))
+
+(set X F)
+(routes (table_of X)) -- (eager X)
+(set X (as 'F32 F))
+(routes (table_of X)) -- (eager X)
+(set X [2 30 4 0Nl 5 -4])
+(routes (table_of X)) -- (eager X)
+(set X (as 'I32 [2 30 4 0Nl 5 -4]))
+(routes (table_of X)) -- (eager X)
+(set X (as 'I16 [2 30 4 0Nl 5 -4]))
+(routes (table_of X)) -- (eager X)
+(set X (as 'U8 [2 30 4 0 5 9]))
+(routes (table_of X)) -- (eager X)
+(set X [true false true false true true])
+(routes (table_of X)) -- (eager X)
+
+;; the eager answers the routes were held to are TIMESPAN
+(set X F)
+(max S X) -- (as 'TIMESPAN [10 4 7 -7 9007199254740993 3])
+(min X S) -- (as 'TIMESPAN [3 1 0Nl 0Nl 9007199254740992 -3])
+(type (max S (as 'F32 F))) -- 'TIMESPAN
+(type (min [2 30 4 0Nl 5 -4] S)) -- 'TIMESPAN
+(type (max (as 'U8 [2 30 4 0 5 9]) S)) -- 'TIMESPAN
+(type (min S [true false true false true true])) -- 'TIMESPAN
+(type (at (select {m: (max s x) from: (table_of F)}) 'm)) -- 'TIMESPAN
+(type (at (select {m: (min x s) from: (table_of (as 'F32 F))}) 'm)) -- 'TIMESPAN
+(type (at (update {m: (max x s) from: (table_of F)}) 'm)) -- 'TIMESPAN
+
+;; many rows: the morsel-parallel routes agree with the eager answer
+(set n 200000)
+(set BS (as 'TIMESPAN (- (% (* (til n) 7919) 1000) 500)))
+(set BF (- (/ (as 'F64 (% (* (til n) 104729) 2001)) 2.0) 500.0))
+(set BT (table [g s x] (list (% (til n) 5) BS BF)))
+(at (select {m: (max s x) from: BT}) 'm) -- (max BS BF)
+(at (select {m: (min x s) from: BT}) 'm) -- (min BF BS)
+(at (update {m: (max x s) from: BT}) 'm) -- (max BF BS)
+(at (select {m: (sum (max s x)) from: BT by: g asc: g}) 'm) -- (at (select {m: (sum m) from: (table [g m] (list (% (til n) 5) (max BS BF))) by: g asc: g}) 'm)
+(count (select {from: BT where: (> (min s x) 0D00:00:00.000000100)})) -- (sum (> (min BS BF) 0D00:00:00.000000100))

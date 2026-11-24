@@ -72,8 +72,18 @@ int8_t ray_timespan_binary_type(uint16_t op, int8_t left, int8_t right) {
     if ((op == OP_MUL || op == OP_MOD) && an != bn &&
         (an ? span_number(b) : span_number(a)))
         return a == RAY_F64 || b == RAY_F64 || a == RAY_F32 || b == RAY_F32 ? RAY_F64 : RAY_TIMESPAN;
-    if ((op == OP_MIN2 || op == OP_MAX2) && an && bn) return RAY_TIMESPAN;
+    /* min / max of a duration and a number is a duration, whichever one
+     * wins: the number counts nanoseconds (ray_timespan_from_number). */
+    if ((op == OP_MIN2 || op == OP_MAX2) &&
+        ((an && bn) || (an && span_number(b)) || (bn && span_number(a))))
+        return RAY_TIMESPAN;
     return -1;
+}
+
+int64_t ray_timespan_from_number(ray_t* x) {
+    if (x->type == -RAY_F32 || x->type == -RAY_F64) return ray_cast_f64_to_i64_null(round(x->f64));
+    if (x->type == -RAY_BOOL) return x->b8 != 0;
+    return as_i64(x);
 }
 
 static int64_t span_value(ray_t* x, uint16_t op) {
@@ -82,8 +92,7 @@ static int64_t span_value(ray_t* x, uint16_t op) {
     }
     if (x->type == -RAY_DATE) return wrap_mul_i64(x->i32, INT64_C(86400000000000));
     if (x->type == -RAY_TIME) return (int64_t)x->i32 * INT64_C(1000000);
-    if (x->type == -RAY_F32 || x->type == -RAY_F64) return ray_cast_f64_to_i64_null(round(x->f64));
-    return as_i64(x);
+    return ray_timespan_from_number(x);
 }
 
 static ray_binary_fn span_fn(uint16_t op) {
