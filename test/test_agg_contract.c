@@ -518,8 +518,16 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     agg_route_reset();
     r = ray_eval_str("(set DK (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2)} c: (count v) d: (count (distinct v)) asc: [k m]}))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    /* the STR key was kept as positions of a text domain while the query
+     * grouped and sorted (agg_route_stats().key_text_syms), and came back
+     * as the STR column checked below */
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    /* the row-wise oracle: an inner select's text projection, which the
+     * outer reads as a key — evaluated per symbol too (one text key) */
+    agg_route_reset();
     r = ray_eval_str("(set RW (select {from: (select {from: T k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) v: v}) by: [k m] c: (count v) d: (count (distinct v)) asc: [k m]}))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
     r = ray_eval_str("(and (== (type (at DK 'k)) 'STR) (== (type (at DK 'm)) 'SYM) (all (== (ser (map (fn [c] (as 'STR (at DK c))) (cols DK))) (ser (map (fn [c] (as 'STR (at RW c))) (cols RW))))))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict keys evaluated per symbol give the row-wise result");
@@ -528,16 +536,84 @@ static test_result_t test_derived_key_per_symbol_route(void) {
      * (k, m) — a grouping with no outputs, not the count-distinct kernel —
      * and by hand: 10 groups (h1 and h10..h15 share the key (one, h1)), v
      * the 7 residues of i mod 7, every group sees them all */
-    /* the STR key was kept as positions of a text domain while the query
-     * grouped and sorted (agg_route_stats().key_text_syms), and came back
-     * as the STR column checked above */
-    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
     r = ray_eval_str("(set OD (select {from: (select {from: T by: {k: (if (like s \"h1*\") \"one\" \"rest\") m: (substr s 0 2) vv: v}}) by: [k m] d: (count vv) asc: [k m]}))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     r = ray_eval_str("(and (== (count DK) 10) (== (count OD) 10) (all (== (at DK 'd) (at OD 'd))) (all (== (at DK 'd) 7)) (all (== (at DK 'k) (at OD 'k))))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the per-symbol keys' distinct counts are the oracle's: seven in each of the 10 groups");
     ray_release(r);
+    /* An inner select's text projection that is a function of one SYM column
+     * through its aliases (`kind` over `lu` over `s`), read by the outer
+     * select as a group key with a count distinct: evaluated once per symbol
+     * into a text domain (key_domain_evals, key_text_syms), the outer result
+     * STR, its groups and exact distinct counts those of the row-wise query
+     * and of the distinct-tuple oracle.  The inner select alone, an outer
+     * that transforms the output (concat), and an alias naming an input
+     * column take the row-wise projection. */
+    agg_route_reset();
+    r = ray_eval_str("(set P2 (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(set P2R (select {from: (select {from: T kind: (if (like (lower s) \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(set P2O (select {from: (select {from: (select {from: T kind: (if (like (lower s) \"h1*\") \"one\" \"rest\") w: (as 'I64 (% v 2)) v: v}) by: [kind w v]}) by: [kind w] d: (count v) asc: [kind w]}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    r = ray_eval_str("(and (== (type (at P2 'kind)) 'STR) (== (count P2) 4) (all (== (ser (map (fn [c] (as 'STR (at P2 c))) (cols P2))) (ser (map (fn [c] (as 'STR (at P2R c))) (cols P2R))))) (all (== (at P2 'd) (at P2O 'd))) (all (== (at P2 'd) [4 3 4 3])) (== (sum (at P2 'c)) 8192))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the per-symbol text projection groups as the row-wise one: STR key, 4 groups, the even and odd residues of v");
+    ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(set P2A (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") v: v}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 0);
+    r = ray_eval_str("(== (type (at P2A 'kind)) 'STR)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the inner select alone keeps its STR projection");
+    ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(set P2C (select {from: (select {from: T lu: (lower s) kind: (if (like lu \"h1*\") \"one\" \"rest\") v: v}) by: (concat kind \"!\") c: (count v) asc: kind}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 0);
+    r = ray_eval_str("(and (== (count P2C) 2) (== (type (at P2C 'kind)) 'STR) (== (as 'STR (at (at P2C 'kind) 0)) \"one!\"))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "an outer select that transforms the output reads the row-wise STR projection");
+    ray_release(r);
+#ifndef RAY_OS_WINDOWS
+    /* A FILE-domain column whose first 65536 rows read as near-unique (the
+     * 50000 distinct values come first) over 240000 rows: the vocabulary is
+     * under a quarter of the rows, so an inner select's text projection is
+     * evaluated per symbol without the probe — a URL column of 18M values
+     * over 100M rows is this shape. */
+    r = ray_eval_str("(do (.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\") "
+                     "(set j (til 240000)) "
+                     "(set uu (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" \"https://b/%.php\") (% k 50000))) j))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t\" (table [u v] (list uu (% j 7)))) "
+                     "(set TF (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t\")) 0)");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(set GF (select {from: (select {from: TF k: (if (like u \"*.html\") \"html\" \"php\") v: v}) by: [k] c: (count v) d: (count (distinct v)) asc: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(and (== (count GF) 2) (== (type (at GF 'k)) 'STR) (all (== (at GF 'c) [120000 120000])) (all (== (at GF 'd) [7 7])) (all (== (at GF 'd) (at (select {from: (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\") vv: v}}) by: [k] d: (count vv) asc: k}) 'd))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the FILE-domain text projection groups exactly: two groups of 120000 rows, seven distinct values each");
+    ray_release(r);
+    /* The same key as a by-dict keeps the probe — `like` over SYM is
+     * already per distinct symbol row-wise — and reads the first rows as
+     * near-unique: row-wise. */
+    agg_route_reset();
+    r = ray_eval_str("(set GB (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) d: (count (distinct v)) asc: k}))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    r = ray_eval_str("(and (all (== (at GB 'c) (at GF 'c))) (all (== (at GB 'd) (at GF 'd))) (all (== (as 'STR (at GB 'k)) (as 'STR (at GF 'k)))))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict key answers the same groups row-wise");
+    ray_release(r);
+    r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\")");
+    if (r) ray_release(r);
+#endif
     /* A user lambda shadowing `substr` is what the compiled key would call. */
     r = ray_eval_str("(set substr (fn [x a b] x))");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);

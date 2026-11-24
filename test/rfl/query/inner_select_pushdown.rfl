@@ -9,7 +9,7 @@
 (set N 6000)
 (set i (til N))
 (set hosts ["Example.COM" "news.Site.org" "Shop.Market.NET" "Blog.Daily.com"])
-(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) "http://www.%/p/%.html" "https://www.%/p/%.php") (at hosts (% k 4)) (% k 997))) i)))
+(set U (as 'SYM (map (fn [k] (format (if (== 0 (% k 3)) "http://www.%/p/%.html" "https://www.%/p/%.php") (at hosts (% k 4)) (% k 97))) i)))
 (set T (table [URL v w] (list U (% (* 7919 i) 2003) (% i 2))))
 (set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
 (>= (runs) 0) -- true
@@ -19,11 +19,13 @@
 (set I (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}))
 (- (runs) m0) -- 2
 (cols I) -- ['lu 'x 'kind 'w 'v]
-;; under an outer grouping that names kind, w and v: lu is built as the
-;; input of kind, x not at all — one run; the result is the same
+;; under an outer grouping that names kind, w and v: x is not built at all,
+;; and kind — a function of URL through lu — is evaluated once per symbol
+;; over the vocabulary (no row-wise lower: no run); the result is the same
 (set m0 (runs))
 (set G (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
-(- (runs) m0) -- 1
+(- (runs) m0) -- 0
+(type (at G 'kind)) -- 'STR
 (count G) -- 4
 (set G2 (select {from: (select {from: T kind: (if (like (lower URL) "*.html") "html" "php") w: w v: v}) by: [kind w] c: (count v) d: (count (distinct v)) asc: [kind w]}))
 (all (== (FP G) (FP G2))) -- true
@@ -52,3 +54,33 @@
 (set Gb (select {from: (select {from: T lu: (lower URL) x: (upper URL) w: w}) n: (count w)}))
 (- (runs) m0) -- 0
 (at (at Gb 'n) 0) -- 6000
+;; the bare name as the one group or sort key is a key use too
+(set m0 (runs))
+(set Gk (select {from: (select {from: T lu: (lower URL) x: (upper URL) kind: (if (like lu "*.html") "html" "php") w: w v: v}) by: kind c: (count v) asc: kind}))
+(- (runs) m0) -- 0
+(type (at Gk 'kind)) -- 'STR
+(all (== (at Gk 'c) (at (select {from: G by: kind c: (sum c) asc: kind}) 'c))) -- true
+(sum (at Gk 'c)) -- 6000
+;; an alias the kept output reads through several arms is evaluated once
+;; over the vocabulary, not once per arm: 20000 distinct URLs, five rows
+;; each, three arms reading lu — one run of (lower URL) (each arm sees
+;; 4096 symbols or more, so a run per arm would count)
+(set N2 100000)
+(set i2 (til N2))
+(set U2 (as 'SYM (map (fn [j] (format (if (== 0 (% j 3)) "http://www.%/p/%.html" (== 1 (% j 3)) "https://www.%/p/%.php" "https://img.%/p/%.jpg") (at hosts (% j 4)) j)) (% i2 20000))))
+(count (distinct U2)) -- 20000
+(set T2 (table [URL v] (list U2 (% i2 7))))
+(set m0 (runs))
+(set G3 (select {from: (select {from: T2 lu: (lower URL) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" (like lu "*.jpg") "jpg" "other") v: v}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))
+(- (runs) m0) -- 1
+(type (at G3 'kind)) -- 'STR
+(as 'STR (at G3 'kind)) -- ["html" "jpg" "php"]
+;; by hand: of j = 0..19999, 6667 are 0 mod 3, 6667 are 1 mod 3, 6666 are 2
+;; mod 3, five rows each; v = k mod 7 takes all seven values in each class
+(at G3 'c) -- [33335 33330 33335]
+(at G3 'd) -- [7 7 7]
+;; and against the row-wise evaluation and the tuple-distinct oracle
+(set G3R (select {from: (select {from: T2 kind: (if (like (lower URL) "*.html") "html" (like (lower URL) "*.php") "php" (like (lower URL) "*.jpg") "jpg" "other") v: v}) by: [kind] c: (count v) d: (count (distinct v)) asc: kind}))
+(all (== (FP G3) (FP G3R))) -- true
+(set O3 (select {from: (select {from: (select {from: T2 lu: (lower URL) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" (like lu "*.jpg") "jpg" "other") v: v}) by: [kind v]}) by: [kind] d: (count v) asc: kind}))
+(all (== (at G3 'd) (at O3 'd))) -- true

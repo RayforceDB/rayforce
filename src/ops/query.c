@@ -11175,6 +11175,69 @@ static ray_t* sym_vec_narrow(ray_t* v) {
     return out;
 }
 
+/* The projection as written, with the earlier output aliases of its select
+ * (names[i] -> exprs[i]), for the per-symbol evaluation: each alias the
+ * projection reads — transitively — that is itself a function of the same
+ * column is evaluated once over the distinct symbols and bound under its
+ * name, so `lu: (lower URL)` runs once however many arms of `kind: (if
+ * (like lu ...) ...)` read `lu`.  The alias-free form of the projection
+ * (select_inline_aliases) is what the checks see. */
+typedef struct {
+    ray_t*         expr;
+    const int64_t* names;
+    ray_t**        exprs;
+    int            n;
+} dk_aliases_t;
+static ray_t* select_inline_aliases(ray_t* e, const int64_t* names, ray_t** exprs, int n, int depth);
+static bool dk_expr_names(ray_t* e, int64_t name, int depth) {
+    if (!e || depth > 64) return false;
+    if (e->type == -RAY_SYM) return !(e->attrs & ATTR_QUOTED) && e->i64 == name;
+    if (e->type != RAY_LIST) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    for (int64_t i = 0; i < e->len; i++) if (dk_expr_names(el[i], name, depth + 1)) return true;
+    return false;
+}
+/* Bind the aliases al->expr reads to `*mini` (the one-column table of the
+ * du distinct symbols under `col`), each evaluated over the columns bound
+ * before it.  False — with *mini still a table — when one of them is not a
+ * function of the column alone or does not evaluate to du values: the
+ * caller then evaluates the alias-free form. */
+static bool dk_bind_aliases(ray_t** mini, const dk_aliases_t* al, ray_t* tbl, int64_t col, int64_t du) {
+    bool used[32];
+    if (al->n > 32) return false;
+    for (int i = 0; i < al->n; i++) used[i] = dk_expr_names(al->expr, al->names[i], 0);
+    for (int i = al->n - 1; i >= 0; i--)
+        if (used[i])
+            for (int j = 0; j < i; j++)
+                if (!used[j] && dk_expr_names(al->exprs[i], al->names[j], 0)) used[j] = true;
+    for (int i = 0; i < al->n; i++) {
+        if (!used[i]) continue;
+        ray_t* inl = select_inline_aliases(al->exprs[i], al->names, al->exprs, i, 0);
+        if (!inl || RAY_IS_ERR(inl)) { if (inl) ray_error_free(inl); return false; }
+        int64_t refs[2], bound[32];
+        bool ok = inl->type == RAY_LIST && collect_col_refs(inl, tbl, refs, 2, 0) == 1 && refs[0] == col &&
+                  derived_key_expr_ok(inl, tbl, col, bound, 0);
+        ray_release(inl);
+        if (!ok) return false;
+        ray_t* v = NULL;
+        ray_graph_t* g = ray_graph_new(*mini);
+        if (g) {
+            ray_op_t* op = compile_expr_dag(g, al->exprs[i]);
+            if (op) op = ray_optimize(g, op);
+            if (op) v = ray_execute(g, op);
+            ray_graph_free(g);
+        }
+        if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+        if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return false; }
+        if (!ray_is_vec(v) || v->len != du) { ray_release(v); return false; }
+        ray_t* nt = ray_table_add_col(*mini, al->names[i], v);
+        ray_release(v);
+        if (!nt || RAY_IS_ERR(nt)) { if (nt) ray_error_free(nt); return false; }
+        *mini = nt;
+    }
+    return true;
+}
+
 static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
 static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel) {
     return derived_key_over_values(by_expr, tbl, NULL, sel);
@@ -11482,12 +11545,18 @@ static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_
 /* `text_syms`: a STR result over the distinct values is kept as positions
  * of a text domain (dk_str_values_as_text_syms) at the narrowest width,
  * instead of a 16-byte descriptor a row; the query gives the column back
- * as STR when it answers (sym_text_columns_to_str). */
-static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms);
-static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel) {
-    return derived_key_over_values_x(by_expr, tbl, col, sel, false);
-}
+ * as STR when it answers (sym_text_columns_to_str).  `al`: an inner
+ * select's projection with its select's aliases (dk_aliases_t), or NULL. */
+static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms,
+                                         const dk_aliases_t* al);
 static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms) {
+    return derived_key_over_values_al(by_expr, tbl, col, sel, text_syms, NULL);
+}
+static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel) {
+    return derived_key_over_values_al(by_expr, tbl, col, sel, false, NULL);
+}
+static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel, bool text_syms,
+                                         const dk_aliases_t* al) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
@@ -11523,8 +11592,16 @@ static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, 
 
     /* The first block decides cheaply: a distinct share above 3/4 over the
      * first 65536 selected rows is a near-unique column, for which the
-     * per-value evaluation cannot win. */
-    if (sel_rows > DKS_PROBE_ROWS) {
+     * per-value evaluation cannot win.  An inner select's text projection
+     * (`al`) over a SYM column skips it when the domain itself is small
+     * against the rows (a FILE domain is the column's vocabulary: 18M URLs
+     * over 100M rows): the first rows of such a column read as near-unique
+     * all the same, and the column cannot be.  A by-dict key keeps the
+     * probe: `like` over SYM is already evaluated per distinct symbol
+     * row-wise, so the per-value key would only trade time for the smaller
+     * key column. */
+    const bool vocab_small = al && sym && dn * 4 <= sel_rows;
+    if (!vocab_small && sel_rows > DKS_PROBE_ROWS) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
         dks_ctx_t pc = kind;
         pc.n = n; pc.tasks = 1; pc.tk = &pt;
@@ -11557,8 +11634,11 @@ static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, 
     dks_task_t* tk = (dks_task_t*)scratch_calloc(&tk_hdr, (size_t)tasks * (sizeof(dks_task_t) + sizeof(int64_t*)));
     if (!tk) { ray_release(ids); return NULL; }
     int64_t** remap = (int64_t**)(tk + tasks);
+    /* a task's table holds at most half its rows' values (a near-unique
+     * stretch refuses) — or the whole vocabulary when that is what bounds
+     * the key (vocab_small: the values may cluster in the first rows) */
     for (uint32_t t = 0; t < tasks; t++)
-        tk[t].du_cap = sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
+        tk[t].du_cap = vocab_small ? dn : sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
     dks_ctx_t c = kind;
     c.n = n; c.tasks = tasks; c.code = (int32_t*)ray_data(ids); c.tk = tk; c.remap = remap;
     c.n_segs = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
@@ -11577,9 +11657,12 @@ static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, 
      * (the earliest row), and inside a task the local ids follow the rows,
      * so the global ids are in first-seen row order over the table. */
     dks_task_t g; memset(&g, 0, sizeof g);
-    g.du_cap = sparse ? sel_rows : sel_rows / 2;
     int64_t sum = 0;
     for (uint32_t t = 0; t < tasks && ok; t++) sum += tk[t].du;
+    /* (vocab_small: the tasks' lists are merged whatever they add up to —
+     * a task's rows can all differ while the column repeats across tasks —
+     * the merged table holds at most the vocabulary) */
+    g.du_cap = vocab_small ? sum : sparse ? sel_rows : sel_rows / 2;
     if (ok) ok = sum <= g.du_cap;
     if (ok) {
         while (ok && g.cap < (uint64_t)sum * 2) ok = dks_grow(&g);
@@ -11661,9 +11744,11 @@ static ray_t* derived_key_over_values_x(ray_t* by_expr, ray_t* tbl, ray_t* col, 
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
         ray_release(dom_vec);
         if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); return NULL; }
+        ray_t* ev = by_expr;
+        if (al && al->expr && dk_bind_aliases(&mini, al, tbl, ref_syms[0], du)) ev = al->expr;
         ray_graph_t* g2 = ray_graph_new(mini);
         if (g2) {
-            ray_op_t* kop = compile_expr_dag(g2, by_expr);
+            ray_op_t* kop = compile_expr_dag(g2, ev);
             if (kop) kop = ray_optimize(g2, kop);
             if (kop) key_dom = ray_execute(g2, kop);
             ray_graph_free(g2);
@@ -11682,12 +11767,14 @@ evaluated:
      * its values (a byte a row for a few), while the query has outputs to
      * group; the spread copies that width. */
     bool narrow = false;
-    if (text_syms && key_dom->type == RAY_STR && ray_len(key_dom) <= 255 && !ray_vec_text_has_nulls(key_dom)) {
-        /* (a few values — a byte a row; not with "" among them: as the null
-         * symbol it would head the groups, where the STR key keeps it in
-         * its first-seen place) */
+    if (text_syms && key_dom->type == RAY_STR && !ray_vec_text_has_nulls(key_dom)) {
+        /* (a few distinct texts — a byte a row; not with "" among them: as
+         * the null symbol it would head the groups, where the STR key keeps
+         * it in its first-seen place) */
         ray_t* syms = dk_str_values_as_text_syms(key_dom);
-        if (syms) { ray_release(key_dom); key_dom = sym_vec_narrow(syms); narrow = true; }
+        if (syms && ray_sym_dict_width(ray_sym_domain_count(ray_sym_vec_domain(syms))) == RAY_SYM_W8) {
+            ray_release(key_dom); key_dom = sym_vec_narrow(syms); narrow = true;
+        } else if (syms) ray_release(syms);
     }
     /* Each row takes the key of its value (dks_spread; a kind of cell it
      * does not copy goes through the generic gather by int64 index). */
@@ -18250,6 +18337,114 @@ static int64_t count_syms(ray_t* e) {
  * declined.  Sizing to exactly B would re-trip the guard whenever a query has
  * no duplicate refs (n == B == max), which is precisely the q11 shape.  Floor
  * keeps it ≥ 1 slot. */
+/* Does `e` use the name `kid` only in ways that read it as a group key or
+ * a predicate operand — ways a text column kept as symbol positions of a
+ * text domain serves exactly as the STR column would: never as a value an
+ * output copies or transforms (`(concat kid "x")`, `(first kid)`, an `if`
+ * arm), which would give the output the positions' type.  Allowed: the
+ * argument of count / count distinct, and the operands of comparisons,
+ * like / ilike, in, and / or / not, nil?, strlen.  `*any_use` notes a use. */
+static bool text_use_ok(ray_t* e, int64_t kid, bool* any_use, int depth) {
+    if (!e || depth > 64) return true;
+    if (e->type == -RAY_SYM) {
+        if (e->i64 == kid && !(e->attrs & ATTR_QUOTED)) { *any_use = true; return false; }
+        return true;
+    }
+    if (e->type == RAY_SYM && ray_is_vec(e)) {   /* a vector of names: by: / sort keys */
+        for (int64_t i = 0; i < e->len; i++)
+            if (sym_cell_runtime_id(e, i) == kid) *any_use = true;
+        return true;
+    }
+    if (e->type == RAY_DICT) {   /* a by-dict: its values */
+        ray_t* vals = ray_dict_vals(e);
+        if (!vals || vals->type != RAY_LIST) return true;
+        ray_t** v = (ray_t**)ray_data(vals);
+        for (int64_t i = 0; i < vals->len; i++) if (!text_use_ok(v[i], kid, any_use, depth + 1)) return false;
+        return true;
+    }
+    if (e->type != RAY_LIST || e->len < 1) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* head = el[0];
+    if (head && head->type == -RAY_SYM) {
+        static const char* const bare_ok[] = { "count", "==", "!=", "<", "<=", ">", ">=", "like", "ilike", "in",
+                                               "and", "or", "not", "nil?", "strlen", "distinct" };
+        ray_t* hn = ray_sym_str(head->i64);
+        bool ok_head = false;
+        if (hn && !RAY_IS_ERR(hn))
+            for (size_t k = 0; k < sizeof(bare_ok) / sizeof(bare_ok[0]) && !ok_head; k++)
+                ok_head = strlen(bare_ok[k]) == ray_str_len(hn) && memcmp(bare_ok[k], ray_str_ptr(hn), ray_str_len(hn)) == 0;
+        if (ok_head) {
+            /* `(distinct kid)` only as the argument of count */
+            bool is_distinct = ray_str_len(hn) == 8 && memcmp(ray_str_ptr(hn), "distinct", 8) == 0;
+            for (int64_t i = 1; i < e->len; i++) {
+                ray_t* a = el[i];
+                if (a && a->type == -RAY_SYM && a->i64 == kid && !(a->attrs & ATTR_QUOTED)) {
+                    if (is_distinct && depth == 0) return false;
+                    *any_use = true;
+                    continue;
+                }
+                if (!text_use_ok(a, kid, any_use, depth + 1)) return false;
+            }
+            return true;
+        }
+    }
+    for (int64_t i = 0; i < e->len; i++) if (!text_use_ok(el[i], kid, any_use, depth + 1)) return false;
+    return true;
+}
+
+/* Whether the select consuming this one (the published hint's dict) uses the
+ * output `kid` only as text_use_ok allows, in every clause but from:. */
+static bool select_text_projection_ok(int64_t kid) {
+    ray_vm_t* vm = __VM;
+    if (!vm || !vm->proj_query || vm->proj_dict) return false;   /* a join reads values */
+    ray_t* dict = vm->proj_query;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return false;
+    int64_t from_id = dict_key_id(dict, "from");
+    int64_t by_id = dict_key_id(dict, "by"), asc_id = dict_key_id(dict, "asc"), desc_id = dict_key_id(dict, "desc");
+    ray_t** v = (ray_t**)ray_data(vals);
+    bool any = false;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t ck = sym_cell_runtime_id(keys, i);
+        if (ck == from_id) continue;
+        ray_t* x = v[i];
+        /* `by: kid` / `asc: kid` / `desc: kid`: the bare name as the one key */
+        if (x && x->type == -RAY_SYM && !(x->attrs & ATTR_QUOTED) && x->i64 == kid &&
+            (ck == by_id || ck == asc_id || ck == desc_id)) { any = true; continue; }
+        if (!text_use_ok(x, kid, &any, 0)) return false;
+    }
+    return any;
+}
+
+static bool select_sym_is(ray_t* e, const char* name, size_t len);
+static bool select_lambda_form(ray_t* e);
+/* `e` with every earlier output alias of this select replaced by its
+ * expression (names[i] -> exprs[i]), outside let / quote / fn forms; owned.
+ * For the per-symbol evaluation of a projection that reads an alias
+ * (`kind: (if (like lu ...) ...)` over `lu: (lower URL)`). */
+static ray_t* select_inline_aliases(ray_t* e, const int64_t* names, ray_t** exprs, int n, int depth) {
+    if (!e || depth > 64) { if (e) ray_retain(e); return e; }
+    if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        for (int i = n - 1; i >= 0; i--)
+            if (names[i] == e->i64) return select_inline_aliases(exprs[i], names, exprs, i, depth + 1);
+        ray_retain(e); return e;
+    }
+    if (e->type != RAY_LIST || e->len < 1) { ray_retain(e); return e; }
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_sym_is(el[0], "let", 3) || select_sym_is(el[0], "quote", 5) || select_lambda_form(e)) { ray_retain(e); return e; }
+    ray_t* out = ray_list_new(e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < e->len; i++) {
+        ray_t* x = select_inline_aliases(el[i], names, exprs, n, depth + 1);
+        if (!x || RAY_IS_ERR(x)) { ray_release(out); return x ? x : ray_error("oom", NULL); }
+        out = ray_list_append(out, x);
+        ray_release(x);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    return out;
+}
+
 /* The projection pushdown of the select above this one, as the inner select
  * sees it: whether a keep-set is published for the from: being evaluated
  * (an explicitly projected select whose clauses read columns by name,
@@ -24757,15 +24952,17 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     int            pj_n = pvm ? pvm->proj_keep_n  : 0;
     bool           pj_a = pvm ? pvm->proj_active  : false;
     ray_t*         pj_q = pvm ? pvm->proj_dict    : NULL;
+    ray_t*         pj_y = pvm ? pvm->proj_query   : NULL;
     if (pvm && proj_buf && proj_compute_keep(dict, proj_buf, (int)proj_hdr_keys, &proj_n)) {
         pvm->proj_keep = proj_buf; pvm->proj_keep_n = proj_n;
         pvm->proj_depth = pvm->eval_depth; pvm->proj_active = true;
         pvm->proj_dict = select_from_is_join(from_expr) ? dict : NULL;
+        pvm->proj_query = dict;
     }
     ray_t* tbl = ray_eval(from_expr);
     if (pvm) { pvm->proj_keep = pj_k; pvm->proj_keep_n = pj_n;
                pvm->proj_depth = pj_d; pvm->proj_active = pj_a;
-               pvm->proj_dict = pj_q; }
+               pvm->proj_dict = pj_q; pvm->proj_query = pj_y; }
     scratch_free(proj_hdr);   /* proj_buf dead past the from: eval + restore */
     if (emit_filter_set)
         ray_group_emit_filter_set(prev_emit_filter);
@@ -25970,6 +26167,53 @@ by_dict_done:
             }
             tbl = keyed;
             by_key_carried = true;
+        }
+    }
+
+    /* An ungrouped select read by another select as its from:, whose output
+     * is a function of one SYM column — through its aliases: `kind: (if (like
+     * lu ...) ...)` over `lu: (lower URL)` — and which that select uses only
+     * as a group or sort key, a predicate operand or a count's argument
+     * (select_text_projection_ok): the output is evaluated once per distinct
+     * symbol and kept as positions of a text domain (a byte a row for a
+     * few values, derived_key_over_values_al), bound to the table under
+     * its name, and the projection scans it; the consuming select gives
+     * it back as STR when it answers (sym_text_columns_to_str).  Row by
+     * row, the string ops ran over every row and the output was a 16-byte
+     * descriptor a row.  An alias that names an input column, or one the
+     * outer select names but transforms, stays a row-wise projection. */
+    int64_t text_proj[32];
+    int     n_text_proj = 0;
+    if (!by_expr && n_out > 0 && select_pushdown_active() && !has_sort &&
+        ray_table_nrows(tbl) >= 4096) {
+        int64_t  al_names[32];
+        ray_t*   al_exprs[32];
+        int      n_al = 0;
+        for (int64_t i = 0; i + 1 < dict_n && n_al < 32; i += 2) {
+            int64_t kid = dict_elems[i]->i64;
+            if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+                kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+            ray_t* v = dict_elems[i + 1];
+            bool candidate = v && v->type == RAY_LIST && !tbl_has_col(tbl, kid) &&
+                             select_pushdown_keeps(kid) && select_text_projection_ok(kid);
+            if (candidate) {
+                ray_t* e2 = select_inline_aliases(v, al_names, al_exprs, n_al, 0);
+                if (e2 && !RAY_IS_ERR(e2)) {
+                    dk_aliases_t al = { .expr = v, .names = al_names, .exprs = al_exprs, .n = n_al };
+                    ray_t* col = derived_key_over_values_al(e2, tbl, NULL, NULL, true, &al);
+                    if (col && !RAY_IS_ERR(col) && col->type == RAY_SYM &&
+                        ray_sym_domain_is_text(ray_sym_vec_domain(col))) {
+                        ray_t* nt = ray_table_add_col(tbl, kid, col);
+                        if (nt && !RAY_IS_ERR(nt)) { tbl = nt; text_proj[n_text_proj++] = kid; }
+                        else if (nt) ray_error_free(nt);
+                    }
+                    if (col && !RAY_IS_ERR(col)) ray_release(col);
+                    else if (col) ray_error_free(col);
+                }
+                if (e2 && !RAY_IS_ERR(e2)) ray_release(e2);
+                else if (e2) ray_error_free(e2);
+            }
+            al_names[n_al] = kid; al_exprs[n_al] = v; n_al++;
         }
     }
 
@@ -29966,7 +30210,10 @@ by_dict_done:
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id || kid == take_id || kid == asc_id || kid == desc_id || kid == nearest_id) continue;
-                ray_op_t* cop = compile_expr_dag(g, dict_elems[i + 1]);
+                bool is_text_proj = false;
+                for (int t = 0; t < n_text_proj && !is_text_proj; t++) is_text_proj = text_proj[t] == kid;
+                ray_op_t* cop = is_text_proj ? ray_scan_sym(g, kid)   /* evaluated per symbol above */
+                                             : compile_expr_dag(g, dict_elems[i + 1]);
                 /* A sort key that names an output, not a source column, is
                  * sorted by the evaluator alone: a lowered temporal +/-
                  * integer (#1302) keeps the evaluator, as before it lowered. */
