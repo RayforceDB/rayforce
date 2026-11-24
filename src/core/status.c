@@ -198,7 +198,7 @@ void ray_status_conn_closed(bool inbound)
 
 void ray_status_read(ray_status_snap_t* out)
 {
-    uint64_t w[QUERY_WORDS];
+    uint64_t w[QUERY_WORDS] = {0};
     uint64_t busy = 0, idle = 0;
     int64_t  phase = 0;
     uint32_t waiting = 0;
@@ -206,7 +206,6 @@ void ray_status_read(ray_status_snap_t* out)
      * last copy is used as it is, each field still a whole value. */
     for (int tries = 0; tries < 100; tries++) {
         uint32_t s1 = atomic_load(&g_st.seq);
-        if (s1 & 1) continue;
         out->kind       = LD(g_st.kind);
         out->handle     = LD(g_st.handle);
         out->since_ts   = LD(g_st.since_ts);
@@ -219,7 +218,7 @@ void ray_status_read(ray_status_snap_t* out)
         phase   = LD(g_st.phase_mono);
         busy    = LD(g_st.busy_ns);
         idle    = LD(g_st.idle_ns);
-        if (atomic_load(&g_st.seq) == s1) break;
+        if (!(s1 & 1) && atomic_load(&g_st.seq) == s1) break;
     }
     if (out->kind == RAY_WORK_IDLE) { out->handle = -1; out->since_ts = 0; out->query_len = 0; }
     memcpy(out->query, w, out->query_len);
