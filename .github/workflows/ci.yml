@@ -122,6 +122,23 @@ jobs:
           path: /tmp/rayforce_replay.*
           if-no-files-found: ignore
 
+  # Build with gcc 12, the Debian 12 compiler.  Its flow analysis raises
+  # -Werror false positives that the gcc and clang on the legs above do not
+  # (#1531: maybe-uninitialized, stringop-overflow), so a change can be green
+  # there and still not build with it.  Build only: the suite runs above.
+  # Pinned to ubuntu-24.04, whose archive ships gcc-12; a later ubuntu-latest
+  # may not.
+  gcc-12:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcc 12
+        run: sudo apt-get update && sudo apt-get install -y gcc-12
+      - name: Build release with gcc 12
+        run: make release CC=gcc-12
+      - name: Build shared library with gcc 12
+        run: make shared CC=gcc-12
+
   # The suite with every assert() compiled out (-DNDEBUG).  Our own builds keep
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
   # work placed inside an assert then silently vanishes (#652: an NDEBUG build
@@ -234,7 +251,7 @@ jobs:
   # skipped required check can be treated as passed, silently opening the gate.
   # static-analysis is intentionally NOT in `needs` — it is advisory only.
   ci-success:
-    needs: [build-and-test, clang-current, ndebug, fuzz-smoke, tsan]
+    needs: [build-and-test, clang-current, gcc-12, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -242,8 +259,9 @@ jobs:
         run: |
           bt='${{ needs.build-and-test.result }}'
           cl='${{ needs.clang-current.result }}'
+          g12='${{ needs.gcc-12.result }}'
           nd='${{ needs.ndebug.result }}'   # skipped on PRs into dev (release-PR only)
           fz='${{ needs.fuzz-smoke.result }}'
           ts='${{ needs.tsan.result }}'
-          echo "build-and-test: $bt   clang-current: $cl   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$cl" = "success" ] && { [ "$nd" = "success" ] || [ "$nd" = "skipped" ]; } && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          echo "build-and-test: $bt   clang-current: $cl   gcc-12: $g12   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
+          [ "$bt" = "success" ] && [ "$cl" = "success" ] && [ "$g12" = "success" ] && { [ "$nd" = "success" ] || [ "$nd" = "skipped" ]; } && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
