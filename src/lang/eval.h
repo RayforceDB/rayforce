@@ -129,6 +129,21 @@ enum {
                        * a name error when it is undefined */
     OP_TRAPV,         /* OP_TRAP for a handler that is a plain value: the
                        * trap pushes no error value, which it never reads */
+    OP_JMPFV,         /* OP_JMPF for an `if` condition (two 2-byte signed
+                       * offsets: false, vector).  A boolean vector stays on
+                       * the stack and jumps by the second offset (the form
+                       * chooses per row); any other value is popped and
+                       * tested as OP_JMPF does */
+    OP_IFTREE,        /* operands: 2-byte site index k, 1-byte start, 2-byte
+                       * signed jump.  The last constant of the lambda is a
+                       * list whose entries 2k and 2k+1 are the `if` form's
+                       * AST and the I64 vector of locals to bind; `start` is
+                       * the element of the AST where the chain (condition
+                       * included) begins.  Pop the evaluated condition (a
+                       * boolean vector), run the tree walker's `if` on it
+                       * and the rest of the chain with the locals bound as
+                       * an OP_SCOPE_EVAL window does, push the result and
+                       * jump past the chain */
     OP__COUNT
 };
 
@@ -518,6 +533,9 @@ ray_t* ray_type_fn(ray_t* val);
 ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_cond_fn(ray_t** args, int64_t n);
+/* The elementwise `if`: the boolean vector `mask` picks per row between two
+ * evaluated, materialized arms; none is consumed. */
+ray_t* ray_cond_rows(ray_t* mask, ray_t* then_v, ray_t* else_v);
 
 /* Does the builtin `fn`, called with `nargs` arguments as the evaluator
  * dispatches it, map argument `pos` (from 1, any position) element by

@@ -3333,12 +3333,11 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
-/* A vector condition of the evaluator's `if` inside a query, over its rows
- * (#1630).  This `if` cannot choose per row: tested whole, any non-empty
- * vector is true, so every row took the first arm.  The query's planned
- * routes and its per-row pass choose per row; what reaches this `if` with
- * such a vector is a shape neither covers (language/control-flow.md names
- * them).  A condition true on some rows and false on others is an error.
+/* A vector condition tested whole by a bytecode jump inside a query, over its
+ * rows (#1630): the condition of a jump other than `if`'s (`if` chooses per
+ * row for a boolean vector, ray_cond_rows).  Tested whole, any non-empty
+ * vector is true, so such a condition ran on the first row's say.  A condition
+ * true on some rows and false on others is an error.
  * One true on every row, or false on every row, has one arm for all of them:
  * *truth is set to 1 or 0, the arm each row takes.  A vector of another
  * length, or one not derived from the rows (`rows` 0: a global, a literal),
@@ -3372,10 +3371,10 @@ static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows
     return NULL;
 }
 
-/* The bytecode `if`'s test of a vector condition (op_jmpf), as ray_cond_fn
- * tests one: counted toward rows_cond, and inside a query a condition over
- * its rows goes through cond_rows_test.  Consumes `cond`; an error goes to
- * *err. */
+/* The bytecode jump's test of a vector condition (op_jmpf, the jumps other than
+ * `if`'s, which takes OP_JMPFV): counted toward rows_cond, and inside a query a
+ * condition over its rows goes through cond_rows_test.  Consumes `cond`; an
+ * error goes to *err. */
 static __attribute__((noinline)) int vm_cond_test(ray_t* cond, uint8_t rows, ray_t** err) {
     __VM->rows_cond++;   /* a vector tested whole */
     int truth = -1;
@@ -3390,33 +3389,80 @@ static __attribute__((noinline)) int vm_cond_test(ray_t* cond, uint8_t rows, ray
  * args.  Conditions are tried in order and the result paired with the
  * first truthy one is evaluated; an odd trailing arg is the fallback.  No
  * fallback: return 0. */
+/* Elementwise choice for a boolean-vector condition: `mask` picks per row
+ * between `then_v` and `else_v`, both already evaluated and materialized,
+ * none consumed.  The arms are vectors of the mask's length or atoms that
+ * broadcast.  The result type follows the promotion `if` has inside a
+ * query, because the choice runs through the same OP_IF kernel. */
+ray_t* ray_cond_rows(ray_t* mask, ray_t* then_v, ray_t* else_v) {
+    int64_t len = mask->len;
+    ray_t* arms[2] = { then_v, else_v };
+    for (int k = 0; k < 2; k++) {
+        ray_t* a = arms[k];
+        if (ray_is_atom(a)) continue;
+        if (!ray_is_vec(a))
+            return ray_error("type", "if: an arm of a vector condition must be a vector or an atom, got %s",
+                             ray_type_name(a->type));
+        if (a->len != len)
+            return ray_error("length", "if: condition has %lld rows, %s arm has %lld",
+                             (long long)len, k ? "else" : "then", (long long)a->len);
+    }
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* ops[3] = { ray_const_vec(g, mask), NULL, NULL };
+    for (int k = 0; k < 2 && ops[0]; k++)
+        ops[k + 1] = ray_is_atom(arms[k]) ? ray_const_atom(g, arms[k])
+                                          : ray_const_vec(g, arms[k]);
+    ray_op_t* root = (ops[0] && ops[1] && ops[2]) ? ray_if(g, ops[0], ops[1], ops[2]) : NULL;
+    if (!root) {
+        ray_t* e = g->compile_err;
+        g->compile_err = NULL;
+        ray_graph_free(g);
+        return e ? e : ray_error("type", "if: cannot choose between %s and %s rows",
+                                 ray_type_name(then_v->type), ray_type_name(else_v->type));
+    }
+    ray_t* r = ray_execute(g, root);
+    ray_graph_free(g);
+    return r ? r : ray_error("oom", NULL);
+}
+
 ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     int64_t i = 0;
     for (; i + 1 < n; i += 2) {
         ray_t* cond = ray_eval(args[i]);
         if (RAY_IS_ERR(cond)) return cond;
-        /* (a lazy handle counts as an atom to ray_is_atom) */
-        if (!ray_is_atom(cond) || ray_is_lazy(cond)) {
-            uint8_t cond_rows = vrows_from(g_eval_rows);
-            /* A vector condition tested whole: the expression may have
-             * needed row-by-row evaluation (see the opaque by: key). */
-            if (!ray_is_atom(cond)) __VM->rows_cond++;
-            /* Materialize lazy handles before testing truthiness */
-            if (ray_is_lazy(cond))
-                cond = ray_lazy_materialize(cond);
-            if (RAY_IS_ERR(cond)) return cond;
-            int truth = -1;   /* the arm a condition over a query's rows gives every row */
-            if (!ray_is_atom(cond)) {
-                ray_t* mixed = cond_rows_test(cond, cond_rows, &truth);
-                if (mixed) { ray_release(cond); return mixed; }
-            }
-            if (truth >= 0) {
+        /* Materialize lazy handles before testing truthiness */
+        if (ray_is_lazy(cond))
+            cond = ray_lazy_materialize(cond);
+        if (RAY_IS_ERR(cond)) return cond;
+        if (cond->type == RAY_BOOL) {
+            /* A boolean vector chooses per row, so both the then arm and
+             * the rest of the chain are evaluated, then merged.  It still
+             * counts as a vector condition for the opaque by: key, whose
+             * row-by-row route is unchanged. */
+            __VM->rows_cond++;
+            if (i + 2 >= n) {
                 ray_release(cond);
-                if (truth) return ray_eval(args[i + 1]);
-                continue;
+                return ray_error("domain", "if: a boolean-vector condition needs an else arm");
             }
+            ray_t* tv = ray_eval(args[i + 1]);
+            if (tv && !RAY_IS_ERR(tv) && ray_is_lazy(tv)) tv = ray_lazy_materialize(tv);
+            if (!tv || RAY_IS_ERR(tv)) { ray_release(cond); return tv ? tv : ray_error("oom", NULL); }
+            ray_t* ev = (n - i - 2 == 1) ? ray_eval(args[i + 2])
+                                            : ray_cond_fn(args + i + 2, n - i - 2);
+            if (ev && !RAY_IS_ERR(ev) && ray_is_lazy(ev)) ev = ray_lazy_materialize(ev);
+            ray_t* out = (!ev || RAY_IS_ERR(ev)) ? (ev ? ev : ray_error("oom", NULL))
+                                                 : ray_cond_rows(cond, tv, ev);
+            ray_release(cond);
+            ray_release(tv);
+            if (ev && !RAY_IS_ERR(ev)) ray_release(ev);
+            return out;
         }
+        /* A non-boolean vector condition is still tested whole: the
+         * expression may have needed row-by-row evaluation (see the
+         * opaque by: key). */
+        if (!ray_is_atom(cond)) __VM->rows_cond++;
         int truthy = is_truthy(cond);
         ray_release(cond);
         if (truthy) return ray_eval(args[i + 1]);
@@ -4532,6 +4578,8 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
         [OP_PATHGET]       = &&op_pathget,
+        [OP_JMPFV]         = &&op_jmpfv,
+        [OP_IFTREE]        = &&op_iftree,
     };
 
     /* Arity check before allocating VM state */
@@ -4751,6 +4799,67 @@ op_jmp: {
     ip += 2;
     ip += offset;
     if (offset < 0 && EVAL_INTERRUPTED()) goto vm_error_cancel;
+    DISPATCH();
+}
+
+op_jmpfv: {
+    /* An `if` condition: a boolean vector chooses per row (OP_IFTREE, the
+     * second offset) and stays on the stack; anything else is OP_JMPF. */
+    int16_t off_false = (int16_t)((code[ip] << 8) | code[ip + 1]);
+    int16_t off_vec = (int16_t)((code[ip + 2] << 8) | code[ip + 3]);
+    ip += 4;
+    ray_t *cond = PEEK();
+    if (cond && cond->type == RAY_BOOL) { ip += off_vec; DISPATCH(); }
+    cond = POP();
+    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
+    int truthy = is_truthy(cond);
+    ray_release(cond);
+    if (!truthy) ip += off_false;
+    DISPATCH();
+}
+
+op_iftree: {
+    uint16_t site = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    uint8_t start = code[ip + 2];
+    int16_t offset = (int16_t)((code[ip + 3] << 8) | code[ip + 4]);
+    ip += 5;
+    ray_t *pool = LAMBDA_CONSTS(vm.fn);
+    ray_t *table = ((ray_t **)ray_data(pool))[pool->len - 1];
+    ray_t **te = (ray_t **)ray_data(table);
+    ray_t *form = te[2 * (size_t)site];
+    ray_t *syms = te[2 * (size_t)site + 1];
+    ray_t **fe = (ray_t **)ray_data(form);
+    int64_t nargs = form->len - start;   /* the chain: its condition and the rest */
+    ray_t *targs_stack[64];
+    ray_t **targs = targs_stack;
+    ray_t *targs_obj = NULL;
+    if (nargs > 64) {
+        targs_obj = ray_alloc((size_t)nargs * sizeof(ray_t *));
+        if (!targs_obj || RAY_IS_ERR(targs_obj)) { vm_err_obj = ray_error("oom", NULL); goto vm_error; }
+        targs = (ray_t **)ray_data(targs_obj);
+    }
+    ray_t *cond = POP();
+    targs[0] = cond;
+    for (int64_t i = 1; i < nargs; i++) targs[i] = fe[start + i];
+    /* The window binds the locals for the arms, as OP_SCOPE_EVAL does. */
+    if (ray_env_scope_bind((const int64_t*)ray_data(syms), (int32_t)syms->len,
+                           &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn) != RAY_OK) {
+        ray_release(cond);
+        if (targs_obj) ray_release(targs_obj);
+        goto vm_error_limit;
+    }
+    ray_env_mark_eval_window();
+    ray_t *res = ray_cond_fn(targs, nargs);
+    ray_release(cond);
+    if (targs_obj) ray_release(targs_obj);
+    if (!res || RAY_IS_ERR(res)) { vm_err_obj = res ? res : ray_error("oom", NULL); goto vm_error; }
+    ray_t *before[256];
+    int64_t nsync = syms->len < 256 ? syms->len : 256;
+    for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
+    ray_env_scope_sync((const int64_t*)ray_data(syms), (int32_t)syms->len, &vm.ps[vm.fp]);
+    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 2;
+    PUSHR(res, 0);
+    ip += offset;
     DISPATCH();
 }
 
