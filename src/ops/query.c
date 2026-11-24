@@ -13043,6 +13043,19 @@ static ray_t* aggr_med_per_group_buf(ray_t* expr, ray_t* tbl,
         g_active_query_table = _aqt;
         ray_env_pop_scope();
         if (!src || RAY_IS_ERR(src)) return src ? src : ray_error("domain", "select by: failed to evaluate median source column");
+        /* The kernel reads src at each group's row ids.  A source evaluated
+         * over the whole table need not have a value at each row, such as
+         * (at c (til 2)): reading it there read past its end (#1572).  The
+         * generic path gathers the rows with `at`, which reads such a row
+         * as null, as for every other aggregate. */
+        if (src->type > 0) {
+            for (int64_t gi = 0; gi < n_groups; gi++)
+                for (int64_t i = 0; i < grp_cnt[gi]; i++)
+                    if (idx_buf[offsets[gi] + i] >= src->len) {
+                        ray_release(src);
+                        return NULL;
+                    }
+        }
     }
 
     ray_t* out = ray_median_per_group_buf(src, idx_buf, offsets, grp_cnt, n_groups);
