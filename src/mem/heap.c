@@ -723,6 +723,9 @@ int64_t ray_heap_anon_peak(void) {
 int64_t ray_heap_anon_watermark(void) {
     return heap_anon_watermark();
 }
+int64_t ray_heap_anon_watermark_explicit(void) {
+    return atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
+}
 int64_t ray_heap_mem_budget(void) {
     int64_t wm = atomic_load_explicit(&g_anon_watermark, memory_order_relaxed);
     return wm > 0 ? wm : ray_sys_ram_limit();

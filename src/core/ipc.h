@@ -89,6 +89,24 @@ size_t ray_ipc_decompress(const uint8_t* src, size_t clen,
  * payload is an I64 vector of those lambdas' identities, in call order;
  * replay pairs it with the frame right before it (ray_lift_log_t). */
 #define RAY_IPC_MSG_JNOTE   4
+/* A status frame.  From a client, once greeted (and authenticated where
+ * that is required): "send me this server's status"; its payload is 4
+ * bytes, a little-endian u32, the interval in milliseconds it asks for
+ * (brought into 100..=10000).  The server then takes the connection out
+ * of its poll loop, running `.ipc.on.close` for it as for a connection
+ * that closed, and from a thread of its own writes one frame of this
+ * type on it every interval, whatever the main thread is doing: flags 0,
+ * the payload laid out as core/status.h describes.  The connection
+ * carries nothing else from then on, either way; it ends when the client
+ * closes it, or is closed here once it cannot take a frame without
+ * waiting.  Read-only, so a restricted (-U) connection may ask.  Refused,
+ * by closing the connection, when it is not one a listener accepted, has
+ * moved off TCP, has frames queued to it, or the payload is not 4 bytes.
+ *
+ * The number is the one RAY_IPC_MSG_JNOTE has in a journal file.  The two
+ * never meet: a note is never sent and a status frame is never journaled,
+ * so the value means a status frame on a connection and a note in a log. */
+#define RAY_IPC_MSG_STATUS  4
 
 /* ===== Transports =====
  *

@@ -72,6 +72,7 @@
 #include "core/runtime.h"
 #include "core/poll.h"
 #include "core/timer.h"
+#include "core/status.h"
 #include "store/serde.h"
 #include "mem/sys.h"
 #include "store/journal.h"
@@ -3786,6 +3787,329 @@ static test_result_t test_ipc_mcast_local_not_compressed(void) {
     PASS();
 }
 
+/* ---- the status stream -------------------------------------------------- */
+/*
+ * A client asks for the stream with one RAY_IPC_MSG_STATUS frame; from then
+ * on a thread of the server's writes a status frame on that socket every
+ * interval, whatever the server's main thread is doing (core/status.h).
+ */
+#ifndef RAY_OS_WINDOWS
+/* The request: `size` bytes of payload, the first four the interval. */
+static int status_request(ray_sock_t s, uint32_t interval_ms, int64_t size) {
+    uint8_t buf[sizeof(ray_ipc_header_t) + 16] = {0};
+    ray_ipc_header_t hdr = {
+        .prefix  = RAY_SERDE_PREFIX,
+        .version = RAY_SERDE_WIRE_VERSION,
+        .endian  = RAY_SERDE_ENDIAN,
+        .msgtype = RAY_IPC_MSG_STATUS,
+        .size    = size,
+    };
+    memcpy(buf, &hdr, sizeof hdr);
+    for (int i = 0; i < 4; i++) buf[sizeof hdr + i] = (uint8_t)(interval_ms >> (8 * i));
+    return ray_sock_send(s, buf, sizeof hdr + (size_t)size) < 0 ? -1 : 0;
+}
+
+/* One frame of the stream: 0, -1 when the socket gave none, -2 when what
+ * came is not a status frame. */
+static int status_recv(ray_sock_t s, ray_status_frame_t* f) {
+    ray_ipc_header_t hdr;
+    if (wire_recv_exact(s, &hdr, sizeof hdr) < 0) return -1;
+    if (hdr.prefix != RAY_SERDE_PREFIX || hdr.version != RAY_SERDE_WIRE_VERSION ||
+        hdr.endian != RAY_SERDE_ENDIAN || hdr.msgtype != RAY_IPC_MSG_STATUS ||
+        hdr.flags != 0 || hdr.size < RAY_STATUS_FRAME_FIXED || hdr.size > RAY_STATUS_FRAME_MAX)
+        return -2;
+    uint8_t body[RAY_STATUS_FRAME_MAX];
+    if (wire_recv_exact(s, body, (size_t)hdr.size) < 0) return -1;
+    return ray_status_frame_decode(body, (size_t)hdr.size, f) ? 0 : -2;
+}
+
+/* The reply to a sync request already sent: its integer (INT64_MIN when it
+ * is not one) and its header's flags. */
+static int64_t wire_reply_i64(ray_sock_t s, uint8_t* flags) {
+    ray_ipc_header_t hdr;
+    if (wire_recv_exact(s, &hdr, sizeof hdr) < 0 || hdr.msgtype != RAY_IPC_MSG_RESP ||
+        hdr.size <= 0 || hdr.size > 4096) return INT64_MIN;
+    uint8_t body[4096];
+    if (wire_recv_exact(s, body, (size_t)hdr.size) < 0) return INT64_MIN;
+    if (flags) *flags = hdr.flags;
+    int64_t len = hdr.size;
+    ray_t* v = ray_de_raw(body, &len);
+    if (!v) return INT64_MIN;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return INT64_MIN; }
+    int64_t out = v->type == -RAY_I64 ? v->i64 : INT64_MIN;
+    ray_release(v);
+    return out;
+}
+
+static int64_t wire_ask_i64(ray_sock_t s, const char* src, uint8_t* flags) {
+    ray_t* q = ray_str(src, strlen(src));
+    int rc = wire_send(s, RAY_IPC_MSG_SYNC, q);
+    ray_release(q);
+    return rc < 0 ? INT64_MIN : wire_reply_i64(s, flags);
+}
+#endif
+
+/* Frames keep coming while a request runs on another connection, and say
+ * so: state 1, the request's text, since when.  Then idle again.  The
+ * connection that asked left the poll loop as a closed one does:
+ * .ipc.on.close ran for it once, at the handover, and not again. */
+static test_result_t test_ipc_status_stream(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("no status stream on Windows");
+#else
+    ray_t* hook = ray_eval_str("(do (set _st_closed 0)"
+                               " (set .ipc.on.close (fn [h] (set _st_closed (+ _st_closed 1)))) null)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(hook));
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t t_start = ray_timestamp_now_ns() + RAY_STATUS_EPOCH_UNIX_NS;
+
+    ray_sock_t s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_I(status_request(s, 100, 4), 0);
+
+    /* The first frame comes at once: nothing runs. */
+    ray_status_frame_t f;
+    TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+    TEST_ASSERT_EQ_I(f.state, RAY_STATUS_IDLE);
+    TEST_ASSERT_EQ_I(f.busy_since_ns, 0);
+    TEST_ASSERT_EQ_I(f.query_len, 0);
+    TEST_ASSERT_EQ_I(f.pid, (int64_t)getpid());
+    TEST_ASSERT_EQ_I(f.conns, 0);               /* the stream is not a connection any more */
+    TEST_ASSERT_TRUE(f.workers >= 1);
+    TEST_ASSERT_TRUE(f.cores >= 1);
+    TEST_ASSERT_TRUE(f.now_ns >= t_start && f.now_ns < t_start + 5000000000LL);
+    TEST_ASSERT_TRUE(f.loop_total_ns > 0);
+    TEST_ASSERT_TRUE(f.loop_busy_ns <= f.loop_total_ns);
+
+    ray_sock_t q = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(q != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_I(wire_ask_i64(q, "_st_closed", NULL), 1);
+
+    /* A request that takes 600 ms, not waited for. */
+    const char* src = "(do (.time.sleep 600) 7)";
+    ray_t* req = ray_str(src, strlen(src));
+    TEST_ASSERT_EQ_I(wire_send(q, RAY_IPC_MSG_SYNC, req), 0);
+    ray_release(req);
+
+    int busy = 0;
+    bool idle_after = false;
+    int64_t since = 0;
+    uint64_t busy_first = 0, busy_last = 0;
+    for (int i = 0; i < 30 && !idle_after; i++) {
+        TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+        if (f.state == RAY_STATUS_IPC) {
+            TEST_ASSERT_EQ_I(f.query_len, (int64_t)strlen(src));
+            TEST_ASSERT_TRUE(memcmp(f.query, src, strlen(src)) == 0);
+            TEST_ASSERT_TRUE(f.busy_since_ns >= t_start && f.busy_since_ns <= f.now_ns);
+            TEST_ASSERT_TRUE(f.now_ns - f.busy_since_ns < 5000000000LL);
+            if (!busy) { since = f.busy_since_ns; busy_first = f.loop_busy_ns; }
+            TEST_ASSERT_EQ_I(f.busy_since_ns, since);   /* one request, one start */
+            TEST_ASSERT_TRUE(f.loop_busy_ns >= busy_last);
+            TEST_ASSERT_EQ_I(f.conns, 1);
+            busy_last = f.loop_busy_ns;
+            busy++;
+        } else {
+            TEST_ASSERT_EQ_I(f.state, RAY_STATUS_IDLE);
+            TEST_ASSERT_EQ_I(f.busy_since_ns, 0);
+            TEST_ASSERT_EQ_I(f.query_len, 0);
+            if (busy) idle_after = true;
+        }
+    }
+    /* 600 ms at a frame every 100: the frames came during the request, not after. */
+    TEST_ASSERT((busy) >= (3), "frames arrive while the request runs");
+    TEST_ASSERT_TRUE(idle_after);
+    /* The loop's busy time grows while the request runs, not only at its end. */
+    TEST_ASSERT_TRUE(busy_last > busy_first);
+
+    TEST_ASSERT_EQ_I(wire_reply_i64(q, NULL), 7);
+
+    /* The reader goes: the stream ends, and no hook runs for it again. */
+    ray_sock_close(s);
+    sleep_ms(300);
+    TEST_ASSERT_EQ_I(wire_ask_i64(q, "(get (.sys.loop) 'streams)", NULL), 0);
+    TEST_ASSERT_EQ_I(wire_ask_i64(q, "_st_closed", NULL), 1);
+
+    ray_sock_close(q);
+    ray_test_server_stop(&srv);
+    ray_t* cleanup = ray_eval_str("(do (set .ipc.on.close null) null)");
+    TEST_ASSERT_FALSE(RAY_IS_ERR(cleanup));
+    PASS();
+#endif
+}
+
+/* A reader that stops reading is dropped once its socket takes no more,
+ * and the server answers its other clients all the while. */
+static test_result_t test_ipc_status_slow_reader_dropped(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("no status stream on Windows");
+#else
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    ray_status_stream_for_test(1024, 1);    /* small buffer, a frame a millisecond */
+
+    /* A small receive buffer, set before the connect so the window the
+     * server is told of is small from the start. */
+    ray_sock_t s = (ray_sock_t)socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    int rcvbuf = 1024;
+    setsockopt((int)s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(srv.port) };
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    TEST_ASSERT_EQ_I(connect((int)s, (struct sockaddr*)&addr, sizeof addr), 0);
+    struct timeval tv = { .tv_sec = 2 };
+    setsockopt((int)s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    uint8_t hs[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+    TEST_ASSERT_TRUE(ray_sock_send(s, hs, 2) >= 0);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, hs, 2), 0);
+    TEST_ASSERT_EQ_I(status_request(s, 1, 4), 0);
+
+    ray_sock_t q = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(q != RAY_INVALID_SOCK);
+    bool served = false, dropped = false;
+    for (int i = 0; i < 600 && !dropped; i++) {
+        int64_t t0 = ray_time_now_ms();
+        int64_t n = wire_ask_i64(q, "(get (.sys.loop) 'streams)", NULL);
+        TEST_ASSERT((ray_time_now_ms() - t0) < (1000), "the server keeps answering");
+        TEST_ASSERT_TRUE(n == 0 || n == 1);
+        if (n == 1) served = true;
+        else if (served) dropped = true;
+        sleep_ms(100);
+    }
+    ray_status_stream_for_test(0, 0);
+    TEST_ASSERT_TRUE(served);
+    TEST_ASSERT((dropped), "a reader that does not read is dropped");
+
+    /* What was sent before the drop is still whole frames, then the end. */
+    ray_status_frame_t f;
+    int rc, frames = 0;
+    while ((rc = status_recv(s, &f)) == 0) frames++;
+    TEST_ASSERT_EQ_I(rc, -1);
+    TEST_ASSERT_TRUE(frames > 0);
+
+    ray_sock_close(s);
+    ray_sock_close(q);
+    ray_test_server_stop(&srv);
+    PASS();
+#endif
+}
+
+/* On a server that asks for credentials the request is refused like any
+ * frame sent in their place; with them, a restricted connection gets the
+ * stream: it only reads. */
+static test_result_t test_ipc_status_auth(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("no status stream on Windows");
+#else
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, "pw", true);
+
+    /* No credentials: the frame's first byte is read as their length (250),
+     * and the rest, padded to that, as credentials.  They are wrong. */
+    ray_sock_t s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_I(status_request(s, 100, 4), 0);
+    uint8_t pad[231] = {0};
+    TEST_ASSERT_TRUE(ray_sock_send(s, pad, sizeof pad) >= 0);
+    uint8_t byte = 0;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &byte, 1), 0);
+    TEST_ASSERT_EQ_I(byte, 0x01);                          /* refused */
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &byte, 1), -1);    /* and closed: no frame */
+    ray_sock_close(s);
+
+    s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    const uint8_t creds[5] = { 4, 'u', ':', 'p', 'w' };
+    TEST_ASSERT_TRUE(ray_sock_send(s, creds, sizeof creds) >= 0);
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &byte, 1), 0);
+    TEST_ASSERT_EQ_I(byte, 0x00);
+    TEST_ASSERT_EQ_I(status_request(s, 100, 4), 0);
+    ray_status_frame_t f;
+    TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+    TEST_ASSERT_EQ_I(f.state, RAY_STATUS_IDLE);
+    TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+    ray_sock_close(s);
+
+    ray_test_server_stop(&srv);
+    PASS();
+#endif
+}
+
+/* A request whose payload is not the four bytes of an interval closes the
+ * connection; an interval out of range is brought into it. */
+static test_result_t test_ipc_status_request_shape(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("no status stream on Windows");
+#else
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+
+    ray_sock_t s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_I(status_request(s, 100, 8), 0);
+    uint8_t byte;
+    TEST_ASSERT_EQ_I(wire_recv_exact(s, &byte, 1), -1);
+    ray_sock_close(s);
+
+    /* 1 ms asked: frames come 100 ms apart, not a thousand a second. */
+    s = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(s != RAY_INVALID_SOCK);
+    TEST_ASSERT_EQ_I(status_request(s, 1, 4), 0);
+    ray_status_frame_t f;
+    TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+    int64_t first = f.now_ns;
+    for (int i = 0; i < 3; i++) TEST_ASSERT_EQ_I(status_recv(s, &f), 0);
+    TEST_ASSERT((f.now_ns - first) >= (250000000LL), "the interval is at least 100 ms");
+    ray_sock_close(s);
+
+    ray_test_server_stop(&srv);
+    PASS();
+#endif
+}
+
+/* The frame's layout, byte for byte: what a reader in another language
+ * is written against. */
+static test_result_t test_ipc_status_frame_layout(void) {
+    ray_status_frame_t f = {
+        .state = RAY_STATUS_IPC, .query_len = 3, .pid = 0x01020304,
+        .now_ns = 0x1112131415161718LL, .busy_since_ns = 0x2122232425262728LL,
+        .loop_busy_ns = 0x31, .loop_total_ns = 0x41, .cpu_user_ns = 0x51, .cpu_sys_ns = 0x61,
+        .rss_bytes = 0x71, .heap_bytes = 0x81, .mem_limit_bytes = 0x91,
+        .conns = 0xA1, .workers = 0xB1, .cores = 0xC1, .query = "abc",
+    };
+    uint8_t b[RAY_STATUS_FRAME_MAX];
+    TEST_ASSERT_EQ_U(ray_status_frame_encode(&f, b), 99);
+    static const uint8_t want[99] = {
+        1, 1, 3, 0, 4, 3, 2, 1,
+        0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+        0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+        0x31, 0, 0, 0, 0, 0, 0, 0,  0x41, 0, 0, 0, 0, 0, 0, 0,
+        0x51, 0, 0, 0, 0, 0, 0, 0,  0x61, 0, 0, 0, 0, 0, 0, 0,
+        0x71, 0, 0, 0, 0, 0, 0, 0,  0x81, 0, 0, 0, 0, 0, 0, 0,
+        0x91, 0, 0, 0, 0, 0, 0, 0,
+        0xA1, 0, 0, 0,  0xB1, 0, 0, 0,  0xC1, 0, 0, 0,  0, 0, 0, 0,
+        'a', 'b', 'c',
+    };
+    TEST_ASSERT_TRUE(memcmp(b, want, sizeof want) == 0);
+
+    ray_status_frame_t g;
+    TEST_ASSERT_TRUE(ray_status_frame_decode(b, 99, &g));
+    TEST_ASSERT_EQ_I(g.state, RAY_STATUS_IPC);
+    TEST_ASSERT_EQ_I(g.pid, 0x01020304);
+    TEST_ASSERT_EQ_I(g.now_ns, 0x1112131415161718LL);
+    TEST_ASSERT_EQ_I(g.busy_since_ns, 0x2122232425262728LL);
+    TEST_ASSERT_EQ_U(g.mem_limit_bytes, 0x91);
+    TEST_ASSERT_EQ_I(g.cores, 0xC1);
+    TEST_ASSERT_EQ_I(g.query_len, 3);
+    TEST_ASSERT_TRUE(memcmp(g.query, "abc", 3) == 0);
+    /* Not one whole frame of this version: refused. */
+    TEST_ASSERT_FALSE(ray_status_frame_decode(b, 98, &g));
+    TEST_ASSERT_FALSE(ray_status_frame_decode(b, 95, &g));
+    b[0] = 2;
+    TEST_ASSERT_FALSE(ray_status_frame_decode(b, 99, &g));
+    PASS();
+}
+
 /* ---- a late cancel byte on a moved connection -------------------------- */
 /*
  * Ctrl-C (or a sync timeout) sends one urgent byte on the TCP socket.  On
@@ -4675,6 +4999,13 @@ const test_entry_t ipc_entries[] = {
     { "ipc/wire/version_mismatch_drops",   test_ipc_wire_version_mismatch_drops,    ipc_setup, ipc_teardown },
     { "ipc/wire/unknown_msgtype_evaluated",test_ipc_wire_unknown_msgtype_is_evaluated, ipc_setup, ipc_teardown },
     { "ipc/wire/journal_note_rejected", test_ipc_wire_journal_note_rejected,     ipc_setup, ipc_teardown },
+
+    /* the status stream */
+    { "ipc/status/stream",                 test_ipc_status_stream,                  ipc_setup, ipc_teardown },
+    { "ipc/status/slow_reader_dropped",    test_ipc_status_slow_reader_dropped,     ipc_setup, ipc_teardown },
+    { "ipc/status/auth",                   test_ipc_status_auth,                    ipc_setup, ipc_teardown },
+    { "ipc/status/request_shape",          test_ipc_status_request_shape,           ipc_setup, ipc_teardown },
+    { "ipc/status/frame_layout",           test_ipc_status_frame_layout,            ipc_setup, ipc_teardown },
 
     { NULL, NULL, NULL, NULL },
 };

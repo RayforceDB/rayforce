@@ -104,7 +104,7 @@ void ray_status_set_text(const char* text, size_t len);
 void ray_status_wait_begin(void);
 void ray_status_wait_end(void);
 
-/* Someone outside is reading the block as it changes (a status stream).
+/* Someone outside is reading: a status stream is open (core/status_stream.c).
  * Text that costs something to make is made only then. */
 extern _Atomic(uint32_t) ray_status_streams;
 static inline bool ray_status_watched(void) {
@@ -117,6 +117,77 @@ void ray_status_conn_closed(bool inbound);
 /* Share of the last `window_ns` the loop spent working, 0..1.  A process
  * whose loop is younger than the window answers for the time it has. */
 double ray_status_utilisation(int64_t window_ns);
+
+/* ---- the status stream (core/status_stream.c) ---- */
+
+/* One frame of the stream: the payload of a RAY_IPC_MSG_STATUS frame the
+ * server sends.  On the wire it is this, little-endian, then the text:
+ *
+ *   offset 0  u8   layout version, RAY_STATUS_FRAME_VERSION
+ *   offset 1  u8   state, RAY_STATUS_*
+ *   offset 2  u16  query_len: bytes of text after the fixed part, 0..=256
+ *   offset 4  u32  pid
+ *   offset 8  i64  now: nanoseconds since the Unix epoch
+ *   offset 16 i64  busy_since: when the running work started, same clock; 0 when idle
+ *   offset 24 u64  loop_busy_ns: time the main loop has spent working
+ *   offset 32 u64  loop_total_ns: working and waiting together
+ *   offset 40 u64  cpu_user_ns
+ *   offset 48 u64  cpu_sys_ns
+ *   offset 56 u64  rss_bytes
+ *   offset 64 u64  heap_bytes: anonymous memory the allocator has committed
+ *                  (`anon-committed` of .sys.mem)
+ *   offset 72 u64  mem_limit_bytes: the -m budget; 0 when none was given
+ *   offset 80 u32  conns: live IPC connections, inbound and outbound
+ *   offset 84 u32  workers: threads of the execution pool, main included
+ *   offset 88 u32  cores: CPUs this process may run on
+ *   offset 92 u32  reserved, 0
+ *   offset 96      the text, query_len bytes, not NUL-terminated */
+#define RAY_STATUS_FRAME_VERSION 1
+#define RAY_STATUS_FRAME_FIXED   96
+#define RAY_STATUS_FRAME_MAX     (RAY_STATUS_FRAME_FIXED + RAY_STATUS_QUERY_MAX)
+
+#define RAY_STATUS_IDLE  0   /* the loop waits, or is between two pieces of work */
+#define RAY_STATUS_IPC   1   /* a request from a connection */
+#define RAY_STATUS_OTHER 2   /* a REPL line, a timer callback, a connection hook */
+
+/* The interval a client asks for is brought into this range. */
+#define RAY_STATUS_INTERVAL_MIN_MS 100u
+#define RAY_STATUS_INTERVAL_MAX_MS 10000u
+/* Streams served at once; one asked for past this is refused. */
+#define RAY_STATUS_STREAMS_MAX 64
+
+typedef struct {
+    uint8_t  state;
+    uint16_t query_len;
+    uint32_t pid;
+    int64_t  now_ns;
+    int64_t  busy_since_ns;
+    uint64_t loop_busy_ns;
+    uint64_t loop_total_ns;
+    uint64_t cpu_user_ns;
+    uint64_t cpu_sys_ns;
+    uint64_t rss_bytes;
+    uint64_t heap_bytes;
+    uint64_t mem_limit_bytes;
+    uint32_t conns;
+    uint32_t workers;
+    uint32_t cores;
+    char     query[RAY_STATUS_QUERY_MAX];
+} ray_status_frame_t;
+
+/* Writes the payload to `out` (RAY_STATUS_FRAME_MAX bytes of room) and
+ * returns its length. */
+size_t ray_status_frame_encode(const ray_status_frame_t* f, uint8_t* out);
+/* False for a payload that is not one whole frame of this version. */
+bool   ray_status_frame_decode(const uint8_t* p, size_t len, ray_status_frame_t* f);
+
+/* Hand a connected socket, already out of the poll loop, to the stream's
+ * thread (started on first use), which owns it from here: a frame every
+ * `interval_ms` (brought into range) until the peer closes or stops
+ * reading.  Main thread only.  False when it could not be taken, on a
+ * platform without the stream included; the socket is closed then. */
+bool ray_status_stream_add(int64_t fd, uint32_t interval_ms);
+void ray_status_stream_for_test(int sndbuf, uint32_t min_interval_ms);
 
 /* core/progress.c: the progress of the running query, when it is tracked. */
 bool ray_progress_current(ray_progress_t* out);

@@ -15,6 +15,7 @@ runtime).
 | `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |
 | `fuzz_journal`  | `ray_journal_validate` / `ray_journal_replay` | journal framing walk + replay |
 | `fuzz_parquet`  | `ray_parquet_open` / `ray_parquet_next` | footer, page, encoding and optional index parsers |
+| `fuzz_status`   | `ray_status_frame_decode` | status-stream frame decoder (pure, no runtime); accepted frames must encode back to the same bytes |
 | `fuzz_select_merge` | nested `select` vs materialized `select` | two/three-layer queries, nullable numeric/SYM/STR columns, serialized results and errors |
 
 The journal log is a sequence of IPC frames verbatim, so the `de` corpus also

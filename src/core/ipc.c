@@ -1116,6 +1116,9 @@ typedef struct {
     int64_t          requests;
     int64_t          bytes_in;
     int64_t          bytes_out;
+    /* Set as the connection is handed to the status stream: its teardown
+     * leaves the socket open. */
+    bool             keep_sock;
 } ray_ipc_conn_data_t;
 
 /* The connection is established: greeted, and authenticated if it had to be. */
@@ -1535,8 +1538,12 @@ static ray_t* ipc_read_header(ray_poll_t* poll, ray_selector_t* sel)
     if (cd->hdr.prefix != RAY_SERDE_PREFIX ||
         cd->hdr.version != RAY_SERDE_WIRE_VERSION ||
         cd->hdr.endian != RAY_SERDE_ENDIAN ||
-        /* A journal note exists only in a log the server wrote. */
-        cd->hdr.msgtype == RAY_IPC_MSG_JNOTE ||
+        /* A request for the status stream, well formed, on a connection
+         * that can be handed over.  Anything else of this type is refused:
+         * the number is a journal note's too (RAY_IPC_MSG_STATUS), and a
+         * note exists only in a log the server wrote. */
+        (cd->hdr.msgtype == RAY_IPC_MSG_STATUS &&
+         (cd->hdr.size != 4 || cd->listener_id < 0 || sel->xport || sel->tx.buf)) ||
         !ray_ipc_body_size_ok(cd->hdr.size)) {
         ray_poll_deregister(poll, sel->id);
         return NULL;
@@ -1573,6 +1580,21 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     int64_t now_ts = ray_timestamp_now_ns();
     cd->last_ts   = now_ts;
     cd->bytes_in += (int64_t)sizeof(hdr) + hdr.size;
+
+    /* A request for the status stream (ipc_read_header let only a well
+     * formed one through).  The connection leaves the poll loop here as
+     * one that closed does, `.ipc.on.close` included, except that its
+     * socket stays open and goes to the stream's thread. */
+    if (hdr.msgtype == RAY_IPC_MSG_STATUS) {
+        uint32_t interval_ms = (uint32_t)payload->data[0] | (uint32_t)payload->data[1] << 8 |
+                               (uint32_t)payload->data[2] << 16 | (uint32_t)payload->data[3] << 24;
+        int64_t fd = sel->fd;
+        ray_poll_buf_free(payload);
+        cd->keep_sock = true;
+        ray_poll_deregister(poll, id);
+        ray_status_stream_add(fd, interval_ms);
+        return NULL;
+    }
 
     /* An upgrade record: the answer a client of ours waits for, or a
      * client's ask that we answer.  Never evaluated, never journaled. */
@@ -1734,6 +1756,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
 
 static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
 {
+    bool keep_sock = false;
     ray_mcast_on_close(poll, sel ? sel->id : -1);
     /* Fire `.ipc.on.close` BEFORE tearing the per-conn state down so a
      * hook reading `.ipc.handle` still sees this connection's id, and
@@ -1781,10 +1804,11 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
 #ifdef RAY_IPC_XPORT
         shm_offers_drop_conn(poll, sel->id, cd);
 #endif
+        keep_sock = cd->keep_sock;
         ray_sys_free(sel->data);
         sel->data = NULL;
     }
-    ray_sock_close((ray_sock_t)sel->fd);
+    if (!keep_sock) ray_sock_close((ray_sock_t)sel->fd);
 }
 
 

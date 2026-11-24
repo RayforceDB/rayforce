@@ -483,6 +483,9 @@ int64_t ray_heap_lock_skipped(void);
  * watermark it does not leave the page-cache room, which decides where new
  * memory goes, not how much a query may hold. */
 int64_t ray_heap_mem_budget(void);
+/* The watermark as it was set (-m, ray_heap_set_anon_watermark); 0 when
+ * none was, and the default applies. */
+int64_t ray_heap_anon_watermark_explicit(void);
 /* Committed anonymous bytes the calling thread's heap can reuse without
  * committing more (free blocks in its anonymous pools, the direct-block
  * cache): what a working-set planner adds back to the watermark's room. */
