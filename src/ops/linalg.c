@@ -34,9 +34,12 @@
  *  place; I32/I64 rows are widened to double, their nulls becoming NaN (the
  *  F64 null), so integer rows behave like F64 rows.
  *
- *  Result type: F32 when every operand is F32, else F64.  All arithmetic
- *  accumulates in double, so F32 only halves the memory traffic and the
- *  result size; it does not cost accuracy in the sums.
+ *  Result type: F32 when every operand is F32, else F64.  The products mmu
+ *  and gram are computed in the operands' own precision: F32 rows multiply
+ *  and sum in float, eight to a register where F64 has four, and F64 rows in
+ *  double.  Whoever passes F32 has chosen single precision.  The solvers inv
+ *  and lsq always work in double, whatever they are given: elimination loses
+ *  digits to conditioning that a product does not.
  * ========================================================================== */
 
 typedef struct {
@@ -180,6 +183,32 @@ static ray_t* lin_vec_out(const double* d, int64_t n, bool f32) {
     return v;
 }
 
+/* An F32 vector from float results; a value that is not finite is a null. */
+static ray_t* lin_vec_out_f32(const float* d, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_F32, n);
+    if (!v || RAY_IS_ERR(v)) return ray_error("oom", NULL);
+    v->len = n;
+    float* o = (float*)ray_data(v);
+    for (int64_t i = 0; i < n; i++) {
+        if (__builtin_fabsf(d[i]) <= FLT_MAX) o[i] = d[i];
+        else { o[i] = NULL_F32; v->attrs |= RAY_ATTR_HAS_NULLS; }
+    }
+    return v;
+}
+
+static ray_t* lin_out_f32(const float* d, int64_t r, int64_t c) {
+    ray_t* L = ray_list_new(r);
+    if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
+    for (int64_t i = 0; i < r; i++) {
+        ray_t* row = lin_vec_out_f32(d + i * c, c);
+        if (RAY_IS_ERR(row)) { ray_release(L); return row; }
+        L = ray_list_append(L, row);
+        ray_release(row);
+        if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
+    }
+    return L;
+}
+
 static ray_t* lin_out(const double* d, int64_t r, int64_t c, bool f32) {
     ray_t* L = ray_list_new(r);
     if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
@@ -195,12 +224,17 @@ static ray_t* lin_out(const double* d, int64_t r, int64_t c, bool f32) {
 
 /* ---- matrix product kernels, one instantiation per element type ----------
  *
- * C (r x c, double) += A[:, k0:k1] * B[k0:k1, :].  Three shapes:
+ * C (r x c, of the operands' type) += A[:, k0:k1] * B[k0:k1, :].  Three shapes:
  *   B a vector      row dot products
  *   r*c small       shared dimension outermost: A and B stream once and the
  *                   accumulator stays in L1 (the X'X case)
- *   otherwise       ikj, B and C accessed along rows
+ *   otherwise       ikj over a tile of columns: LIN_JTILE entries of a row
+ *                   of C stay in L1 while four rows of B at a time are added
+ *                   into it, so C is loaded and stored once for four
+ *                   multiply-adds instead of once for each
  * dot2 and the small case share one rule: the k loop is the long one. */
+
+#define LIN_JTILE 256
 
 #define LIN_SMALL_C 4096
 #define LIN_DOT_BLOCK 2048
@@ -209,16 +243,42 @@ static ray_t* lin_out(const double* d, int64_t r, int64_t c, bool f32) {
  * vectoriser ran across the rows instead, gathering from the row pointers
  * (several times slower).  A plain loop is what it turns into SIMD best. */
 #define DEF_DOT(SUF, T)                                                       \
-static __attribute__((noinline)) double dot_##SUF(const T* a, const T* b, int64_t n) { \
-    double s = 0.0;                                                           \
-    for (int64_t l = 0; l < n; l++) s += (double)a[l] * (double)b[l];         \
+static __attribute__((noinline)) T dot_##SUF(const T* a, const T* b, int64_t n) { \
+    T s = 0;                                                                  \
+    for (int64_t l = 0; l < n; l++) s += a[l] * b[l];                         \
     return s;                                                                 \
 }
 DEF_DOT(f64, double)
 DEF_DOT(f32, float)
 
 #define DEF_GEMM(SUF, T)                                                      \
-static void gemm_k_##SUF(const lin_t* A, const lin_t* B, double* C,           \
+/* C[i0:i1, :] += A[i0:i1, :] * B, a tile of columns at a time. */            \
+static void gemm_tiled_##SUF(const lin_t* A, const lin_t* B, T* C,            \
+                             int64_t k, int64_t c, int64_t i0, int64_t i1) {  \
+    for (int64_t j0 = 0; j0 < c; j0 += LIN_JTILE) {                           \
+        int64_t j1 = j0 + LIN_JTILE < c ? j0 + LIN_JTILE : c;                 \
+        for (int64_t i = i0; i < i1; i++) {                                   \
+            T* restrict Ci = C + i * c;                                       \
+            const T* Ai = (const T*)A->rp[i];                                 \
+            int64_t l = 0;                                                    \
+            for (; l + 4 <= k; l += 4) {                                      \
+                T a0 = Ai[l], a1 = Ai[l + 1], a2 = Ai[l + 2], a3 = Ai[l + 3]; \
+                const T* B0 = (const T*)B->rp[l];                             \
+                const T* B1 = (const T*)B->rp[l + 1];                         \
+                const T* B2 = (const T*)B->rp[l + 2];                         \
+                const T* B3 = (const T*)B->rp[l + 3];                         \
+                for (int64_t j = j0; j < j1; j++)                             \
+                    Ci[j] += a0 * B0[j] + a1 * B1[j] + a2 * B2[j] + a3 * B3[j]; \
+            }                                                                 \
+            for (; l < k; l++) {                                              \
+                T a = Ai[l];                                                  \
+                const T* Bl = (const T*)B->rp[l];                             \
+                for (int64_t j = j0; j < j1; j++) Ci[j] += a * Bl[j];         \
+            }                                                                 \
+        }                                                                     \
+    }                                                                         \
+}                                                                             \
+static void gemm_k_##SUF(const lin_t* A, const lin_t* B, T* C,                \
                          int64_t r, int64_t c, int64_t k0, int64_t k1) {      \
     if (B->is_vec) {                                                          \
         const T* v = (const T*)B->rp[0];                                      \
@@ -231,34 +291,14 @@ static void gemm_k_##SUF(const lin_t* A, const lin_t* B, double* C,           \
                 C[i] += dot_##SUF(Ai + b0, v + b0, b1 - b0);                   \
             }                                                                 \
         }                                                                     \
-    } else if (r * c <= LIN_SMALL_C) {                                        \
+    } else {                                                                  \
         for (int64_t l = k0; l < k1; l++) {                                   \
             const T* Bl = (const T*)B->rp[l];                                 \
             for (int64_t i = 0; i < r; i++) {                                 \
-                double a = (double)((const T*)A->rp[i])[l];                   \
-                double* Ci = C + i * c;                                       \
-                for (int64_t j = 0; j < c; j++) Ci[j] += a * (double)Bl[j];   \
+                T a = ((const T*)A->rp[i])[l];                                \
+                T* Ci = C + i * c;                                            \
+                for (int64_t j = 0; j < c; j++) Ci[j] += a * Bl[j];           \
             }                                                                 \
-        }                                                                     \
-    } else {                                                                  \
-        for (int64_t i = 0; i < r; i++) {                                     \
-            double* Ci = C + i * c;                                           \
-            for (int64_t l = k0; l < k1; l++) {                               \
-                double a = (double)((const T*)A->rp[i])[l];                   \
-                const T* Bl = (const T*)B->rp[l];                             \
-                for (int64_t j = 0; j < c; j++) Ci[j] += a * (double)Bl[j];   \
-            }                                                                 \
-        }                                                                     \
-    }                                                                         \
-}                                                                             \
-static void gemm_rows_##SUF(const lin_t* A, const lin_t* B, double* C,        \
-                            int64_t k, int64_t c, int64_t i0, int64_t i1) {   \
-    for (int64_t i = i0; i < i1; i++) {                                       \
-        double* Ci = C + i * c;                                               \
-        for (int64_t l = 0; l < k; l++) {                                     \
-            double a = (double)((const T*)A->rp[i])[l];                       \
-            const T* Bl = (const T*)B->rp[l];                                 \
-            for (int64_t j = 0; j < c; j++) Ci[j] += a * (double)Bl[j];       \
         }                                                                     \
     }                                                                         \
 }
@@ -268,8 +308,8 @@ DEF_GEMM(f32, float)
 
 typedef struct {
     const lin_t *A, *B;
-    double* C;                 /* r x c result (row-split) */
-    double* part;              /* kn partial results, r*c each (k-split) */
+    void* C;                   /* r x c result (row-split), float or double as A is */
+    void* part;                /* kn partial results, r*c each (k-split) */
     int64_t r, k, c, kchunk, rchunk;
     bool    f32, ksplit;
 } gemm_ctx_t;
@@ -281,14 +321,13 @@ static void gemm_task(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         if (g->ksplit) {
             int64_t k0 = t * g->kchunk, k1 = k0 + g->kchunk;
             if (k1 > g->k) k1 = g->k;
-            double* P = g->part + t * g->r * g->c;
-            if (g->f32) gemm_k_f32(g->A, g->B, P, g->r, g->c, k0, k1);
-            else        gemm_k_f64(g->A, g->B, P, g->r, g->c, k0, k1);
+            if (g->f32) gemm_k_f32(g->A, g->B, (float*)g->part + t * g->r * g->c, g->r, g->c, k0, k1);
+            else        gemm_k_f64(g->A, g->B, (double*)g->part + t * g->r * g->c, g->r, g->c, k0, k1);
         } else {
             int64_t i0 = t * g->rchunk, i1 = i0 + g->rchunk;
             if (i1 > g->r) i1 = g->r;
-            if (g->f32) gemm_rows_f32(g->A, g->B, g->C, g->k, g->c, i0, i1);
-            else        gemm_rows_f64(g->A, g->B, g->C, g->k, g->c, i0, i1);
+            if (g->f32) gemm_tiled_f32(g->A, g->B, (float*)g->C, g->k, g->c, i0, i1);
+            else        gemm_tiled_f64(g->A, g->B, (double*)g->C, g->k, g->c, i0, i1);
         }
     }
 }
@@ -297,10 +336,49 @@ static void gemm_task(void* vctx, uint32_t wid, int64_t start, int64_t end) {
 #define LIN_KCHUNK_MIN  2048
 #define LIN_MAX_TASKS   256
 
-/* C[r x c] = A[r x k] * B[k x c], C zeroed here.  Returns false on oom. */
-static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
+static bool lin_gemm_run(const lin_t* A, const lin_t* B, void* C,
+                         int64_t r, int64_t k, int64_t c, size_t esz);
+
+/* C[r x c] = A[r x k] * B[k x c], C zeroed here: an array of float when A
+ * (and so B) is bound as F32, of double otherwise.  Returns false on oom. */
+static bool lin_gemm(const lin_t* A, const lin_t* B, void* C,
                      int64_t r, int64_t k, int64_t c) {
-    memset(C, 0, (size_t)r * (size_t)c * sizeof(double));
+    size_t esz = A->f32 ? sizeof(float) : sizeof(double);
+    memset(C, 0, (size_t)r * (size_t)c * esz);
+    /* The tiled kernel reads four rows of B at once, and every row of B once
+     * for each row of A.  Rows are vectors of their own, each where the
+     * allocator put it: rows of one size start at the same offset in their
+     * blocks, so they fall on the same cache sets and push each other out.
+     * B is copied into one block first; the copy costs a small part of one
+     * pass and the product then runs at the speed the kernel has on a flat
+     * matrix (measured: 128x1536 by 1536x384, F32, 7.4 ms on the rows as they
+     * lie against 4.4 ms with the copy included). */
+    lin_t packed;
+    void* flat = NULL;
+    if (!B->is_vec && r * c > LIN_SMALL_C) {
+        flat = ray_calloc_raw((size_t)k * (size_t)c * esz + 8);
+        const void** rp = flat ? (const void**)ray_calloc_raw((size_t)k * sizeof(void*)) : NULL;
+        if (flat && rp) {
+            for (int64_t l = 0; l < k; l++) {
+                rp[l] = (const char*)flat + (size_t)l * (size_t)c * esz;
+                memcpy((void*)rp[l], B->rp[l], (size_t)c * esz);
+            }
+            packed = *B;
+            packed.rp = rp;
+            B = &packed;
+        } else {
+            /* no room for the copy: the rows are used where they lie */
+            if (flat) ray_free_raw(flat);
+            flat = NULL;
+        }
+    }
+    bool ok = lin_gemm_run(A, B, C, r, k, c, esz);
+    if (flat) { ray_free_raw((void*)packed.rp); ray_free_raw(flat); }
+    return ok;
+}
+
+static bool lin_gemm_run(const lin_t* A, const lin_t* B, void* C,
+                         int64_t r, int64_t k, int64_t c, size_t esz) {
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, k, 1) && r * c * k >= LIN_PAR_FLOPS;
     if (par) {
@@ -316,7 +394,7 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
             else {
                 g.kchunk = (k + nt - 1) / nt;
                 nt = (k + g.kchunk - 1) / g.kchunk;
-                g.part = (double*)ray_calloc_raw((size_t)nt * (size_t)(r * c) * sizeof(double));
+                g.part = ray_calloc_raw((size_t)nt * (size_t)(r * c) * esz);
                 if (!g.part) par = false;
             }
         } else {
@@ -328,8 +406,15 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
             ray_pool_dispatch_n(pool, gemm_task, &g, (uint32_t)nt);
             if (g.ksplit) {
                 for (int64_t t = 0; t < nt; t++) {
-                    const double* P = g.part + t * r * c;
-                    for (int64_t i = 0; i < r * c; i++) C[i] += P[i];
+                    if (A->f32) {
+                        const float* P = (const float*)g.part + t * r * c;
+                        float* Cf = (float*)C;
+                        for (int64_t i = 0; i < r * c; i++) Cf[i] += P[i];
+                    } else {
+                        const double* P = (const double*)g.part + t * r * c;
+                        double* Cd = (double*)C;
+                        for (int64_t i = 0; i < r * c; i++) Cd[i] += P[i];
+                    }
                 }
                 ray_free_raw(g.part);
             }
@@ -337,11 +422,11 @@ static bool lin_gemm(const lin_t* A, const lin_t* B, double* C,
         }
     }
     if (A->f32) {
-        if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f32(A, B, C, r, c, 0, k);
-        else gemm_rows_f32(A, B, C, k, c, 0, r);
+        if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f32(A, B, (float*)C, r, c, 0, k);
+        else gemm_tiled_f32(A, B, (float*)C, k, c, 0, r);
     } else {
-        if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f64(A, B, C, r, c, 0, k);
-        else gemm_rows_f64(A, B, C, k, c, 0, r);
+        if (B->is_vec || r * c <= LIN_SMALL_C) gemm_k_f64(A, B, (double*)C, r, c, 0, k);
+        else gemm_tiled_f64(A, B, (double*)C, k, c, 0, r);
     }
     return true;
 }
@@ -362,14 +447,23 @@ ray_t* ray_mmu_fn(ray_t* a, ray_t* b) {
         out = ray_error("length", "mmu: shape mismatch, %lld columns vs %lld rows",
                         (long long)ac, (long long)br);
     } else {
-        double* C = (double*)ray_calloc_raw((size_t)ar * (size_t)bc * sizeof(double) + 8);
+        void* C = ray_calloc_raw((size_t)ar * (size_t)bc * (f32 ? sizeof(float) : sizeof(double)) + 8);
         if (!C) {
             out = ray_error("oom", NULL);
         } else {
             lin_gemm(&A, &B, C, ar, ac, bc);
-            if (A.is_vec && B.is_vec) out = make_f64(ray_f64_fin(C[0]));
-            else if (A.is_vec || B.is_vec) out = lin_vec_out(C, A.is_vec ? bc : ar, f32);
-            else out = lin_out(C, ar, bc, f32);
+            int64_t n = A.is_vec ? bc : ar;
+            if (f32) {
+                const float* Cf = (const float*)C;
+                if (A.is_vec && B.is_vec) out = make_f64(ray_f64_fin((double)Cf[0]));
+                else if (A.is_vec || B.is_vec) out = lin_vec_out_f32(Cf, n);
+                else out = lin_out_f32(Cf, ar, bc);
+            } else {
+                const double* Cd = (const double*)C;
+                if (A.is_vec && B.is_vec) out = make_f64(ray_f64_fin(Cd[0]));
+                else if (A.is_vec || B.is_vec) out = lin_vec_out(Cd, n, false);
+                else out = lin_out(Cd, ar, bc, false);
+            }
             ray_free_raw(C);
         }
     }
@@ -382,39 +476,41 @@ ray_t* ray_mmu_fn(ray_t* a, ray_t* b) {
  * so that all rows' current block stays in cache while the pairs are formed. */
 
 /* 4x4 tile of dot products: G[i0..i0+3][j0..j0+3] over one block of columns.
- * The 16 running sums live in registers (4-lane vectors), so each step costs
- * 8 loads for 16 multiply-adds instead of 2 loads per multiply-add.  Written
- * with vector extensions: the autovectoriser does not find this shape. */
+ * The 16 running sums live in registers, a vector of the rows' own type each
+ * (four doubles, or eight floats), so each step costs 8 loads for 16
+ * multiply-adds instead of 2 loads per multiply-add.  Written with vector
+ * extensions: the autovectoriser does not find this shape. */
 typedef double lin_v4d __attribute__((vector_size(32), aligned(8)));
-typedef float  lin_v4f __attribute__((vector_size(16), aligned(4)));
+typedef float  lin_v8f __attribute__((vector_size(32), aligned(4)));
 /* Macros, not functions: a 32-byte vector passed or returned by value changes
  * the ABI without AVX (-Wpsabi, an error under -Werror on baseline x86-64). */
-#define ld4_f64(p) (*(const lin_v4d*)(p))
-#define ld4_f32(p) __builtin_convertvector(*(const lin_v4f*)(p), lin_v4d)
+#define ld_f64(p) (*(const lin_v4d*)(p))
+#define ld_f32(p) (*(const lin_v8f*)(p))
 
-#define DEF_TILE(SUF, T)                                                      \
+#define DEF_TILE(SUF, T, V, W)                                                \
 static __attribute__((noinline)) void tile4_##SUF(const T* const* a, const T* const* b, \
-                                                  int64_t n, double out[16]) { \
-    lin_v4d s[4][4];                                                          \
-    for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) s[x][y] = (lin_v4d){0, 0, 0, 0}; \
+                                                  int64_t n, T out[16]) {     \
+    V s[4][4];                                                                \
+    for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) s[x][y] = (V){0}; \
     int64_t l = 0;                                                            \
-    for (; l + 4 <= n; l += 4) {                                              \
-        lin_v4d av[4], bv[4];                                                 \
-        for (int x = 0; x < 4; x++) { av[x] = ld4_##SUF(a[x] + l); bv[x] = ld4_##SUF(b[x] + l); } \
+    for (; l + W <= n; l += W) {                                              \
+        V av[4], bv[4];                                                       \
+        for (int x = 0; x < 4; x++) { av[x] = ld_##SUF(a[x] + l); bv[x] = ld_##SUF(b[x] + l); } \
         for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) s[x][y] += av[x] * bv[y]; \
     }                                                                         \
     for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) {                 \
-        lin_v4d v = s[x][y];                                                  \
-        double t = (v[0] + v[1]) + (v[2] + v[3]);                             \
-        for (int64_t q = l; q < n; q++) t += (double)a[x][q] * (double)b[y][q]; \
+        V v = s[x][y];                                                        \
+        T t = 0;                                                              \
+        for (int q = 0; q < W; q++) t += v[q];                                \
+        for (int64_t q = l; q < n; q++) t += a[x][q] * b[y][q];               \
         out[x * 4 + y] = t;                                                   \
     }                                                                         \
 }
-DEF_TILE(f64, double)
-DEF_TILE(f32, float)
+DEF_TILE(f64, double, lin_v4d, 4)
+DEF_TILE(f32, float,  lin_v8f, 8)
 
 #define DEF_GRAM(SUF, T)                                                      \
-static void gram_k_##SUF(const lin_t* A, double* G, int64_t p,                \
+static void gram_k_##SUF(const lin_t* A, T* G, int64_t p,                     \
                          int64_t k0, int64_t k1) {                            \
     int64_t p4 = p & ~(int64_t)3;                                             \
     for (int64_t b0 = k0; b0 < k1; b0 += LIN_DOT_BLOCK) {                     \
@@ -426,7 +522,7 @@ static void gram_k_##SUF(const lin_t* A, double* G, int64_t p,                \
             for (int64_t j = i; j < p4; j += 4) {                             \
                 const T* rb[4];                                               \
                 for (int x = 0; x < 4; x++) rb[x] = (const T*)A->rp[j + x] + b0; \
-                double t[16];                                                 \
+                T t[16];                                                      \
                 tile4_##SUF(ra, rb, n, t);                                    \
                 for (int x = 0; x < 4; x++)                                   \
                     for (int y = 0; y < 4; y++)                               \
@@ -449,7 +545,7 @@ DEF_GRAM(f32, float)
 
 typedef struct {
     const lin_t* A;
-    double* part;                 /* nt partial p x p results */
+    void* part;                   /* nt partial p x p results, float or double as A is */
     int64_t p, k, kchunk;
 } gram_ctx_t;
 
@@ -459,15 +555,16 @@ static void gram_task(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     for (int64_t t = start; t < end; t++) {
         int64_t k0 = t * g->kchunk, k1 = k0 + g->kchunk;
         if (k1 > g->k) k1 = g->k;
-        double* P = g->part + t * g->p * g->p;
-        if (g->A->f32) gram_k_f32(g->A, P, g->p, k0, k1);
-        else           gram_k_f64(g->A, P, g->p, k0, k1);
+        if (g->A->f32) gram_k_f32(g->A, (float*)g->part + t * g->p * g->p, g->p, k0, k1);
+        else           gram_k_f64(g->A, (double*)g->part + t * g->p * g->p, g->p, k0, k1);
     }
 }
 
-/* G[p x p] (zeroed here, upper triangle then mirrored) from A (p rows of k). */
-static void lin_gram(const lin_t* A, double* G, int64_t p, int64_t k) {
-    memset(G, 0, (size_t)p * (size_t)p * sizeof(double));
+/* G[p x p] (zeroed here, upper triangle then mirrored) from A (p rows of k):
+ * an array of float when A is bound as F32, of double otherwise. */
+static void lin_gram(const lin_t* A, void* G, int64_t p, int64_t k) {
+    size_t esz = A->f32 ? sizeof(float) : sizeof(double);
+    memset(G, 0, (size_t)p * (size_t)p * esz);
     ray_pool_t* pool = ray_pool_get();
     bool par = ray_pool_par_dispatch_ok(pool, k, 1) && p * p * k >= LIN_PAR_FLOPS;
     int64_t nt = 0;
@@ -483,21 +580,35 @@ static void lin_gram(const lin_t* A, double* G, int64_t p, int64_t k) {
         else {
             g.kchunk = (k + nt - 1) / nt;
             nt = (k + g.kchunk - 1) / g.kchunk;
-            g.part = (double*)ray_calloc_raw((size_t)nt * (size_t)(p * p) * sizeof(double));
+            g.part = ray_calloc_raw((size_t)nt * (size_t)(p * p) * esz);
             if (!g.part) par = false;
         }
     }
     if (par) {
         ray_pool_dispatch_n(pool, gram_task, &g, (uint32_t)nt);
         for (int64_t t = 0; t < nt; t++) {
-            const double* P = g.part + t * p * p;
-            for (int64_t i = 0; i < p * p; i++) G[i] += P[i];
+            if (A->f32) {
+                const float* P = (const float*)g.part + t * p * p;
+                float* Gf = (float*)G;
+                for (int64_t i = 0; i < p * p; i++) Gf[i] += P[i];
+            } else {
+                const double* P = (const double*)g.part + t * p * p;
+                double* Gd = (double*)G;
+                for (int64_t i = 0; i < p * p; i++) Gd[i] += P[i];
+            }
         }
         ray_free_raw(g.part);
-    } else if (A->f32) gram_k_f32(A, G, p, 0, k);
-    else               gram_k_f64(A, G, p, 0, k);
-    for (int64_t i = 0; i < p; i++)
-        for (int64_t j = 0; j < i; j++) G[i * p + j] = G[j * p + i];
+    } else if (A->f32) gram_k_f32(A, (float*)G, p, 0, k);
+    else               gram_k_f64(A, (double*)G, p, 0, k);
+    if (A->f32) {
+        float* Gf = (float*)G;
+        for (int64_t i = 0; i < p; i++)
+            for (int64_t j = 0; j < i; j++) Gf[i * p + j] = Gf[j * p + i];
+    } else {
+        double* Gd = (double*)G;
+        for (int64_t i = 0; i < p; i++)
+            for (int64_t j = 0; j < i; j++) Gd[i * p + j] = Gd[j * p + i];
+    }
 }
 
 /* (gram x): x mmu flip x, for x a matrix (list of rows). */
@@ -508,11 +619,11 @@ ray_t* ray_gram_fn(ray_t* x) {
     if ((e = lin_load("gram", x, &A, f32))) return e;
     if (A.is_vec) { lin_free(&A); return ray_error("type", "gram: expects a matrix (list of numeric rows)"); }
     ray_t* out;
-    double* G = (double*)ray_calloc_raw((size_t)A.r * (size_t)A.r * sizeof(double));
+    void* G = ray_calloc_raw((size_t)A.r * (size_t)A.r * (f32 ? sizeof(float) : sizeof(double)));
     if (!G) out = ray_error("oom", NULL);
     else {
         lin_gram(&A, G, A.r, A.c);
-        out = lin_out(G, A.r, A.r, f32);
+        out = f32 ? lin_out_f32((const float*)G, A.r, A.r) : lin_out((const double*)G, A.r, A.r, false);
         ray_free_raw(G);
     }
     lin_free(&A);

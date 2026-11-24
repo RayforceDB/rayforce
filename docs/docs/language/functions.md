@@ -135,7 +135,7 @@ A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 row
 | `flip` | unary | Transpose of a matrix; rows of one type keep it, mixed rows widen to F64 | `(flip (list [1 2 3] [4 5 6]))` → `[[1 4] [2 5] [3 6]]` |
 | `gram` | unary | `x mmu flip x` without forming the transpose | `(gram (list [1.0 2.0 3.0] [4.0 5.0 6.0]))` → `[[14.0 32.0] [32.0 77.0]]` |
 
-The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
+The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom). `mmu` and `gram` compute in the operands' own precision: F32 rows multiply and sum in single precision, F64 rows in double. `inv` and `lsq` always solve in double. A result outside the range of its type is null. See the [analytics cookbook](../guides/analytics.md#linear-regression) for a regression with `lsq` and `gram`.
 
 ## Higher-Order Functions
 
