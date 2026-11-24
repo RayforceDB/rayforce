@@ -47,6 +47,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #ifndef RAY_OS_WINDOWS
 #include <pthread.h>   /* pthread_kill -- the .time.sleep cancel test */
 #include <signal.h>
@@ -9945,6 +9946,71 @@ static test_result_t test_time_sleep_cancel(void) {
     PASS();
 }
 
+/* ---- #1623: the interrupt flag is one atomic, shared by every thread ----
+ * A take consumes exactly one pending interrupt: a request is seen once,
+ * and a take with nothing pending finds nothing.  Single-threaded. */
+static test_result_t test_interrupt_take(void) {
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_interrupted());
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* requests do not stack: two before a take are one interrupt */
+    ray_request_interrupt();
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* a clear drops a pending one */
+    ray_request_interrupt();
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    PASS();
+}
+
+/* Threads that request, clear, look at and take the interrupt at once, as
+ * an in-process IPC server (a clear per request) and client threads (a look
+ * before each wait, a take to forward a Ctrl-C) do.  Under ThreadSanitizer
+ * the flag being a plain volatile reported a data race on every pair; as an
+ * atomic it reports none.  The count of takes that found an interrupt can
+ * never exceed the requests made (a take consumes one, nothing invents
+ * one).  Named for the TSan job's `parallel` filter. */
+#define IFLAG_THREADS 3
+#define IFLAG_ITERS   20000
+static _Atomic int64_t g_iflag_requests, g_iflag_taken;
+static void iflag_worker(void* arg) {
+    int role = (int)(intptr_t)arg;
+    for (int i = 0; i < IFLAG_ITERS; i++) {
+        switch ((role + i) % 4) {
+        case 0: ray_request_interrupt(); atomic_fetch_add(&g_iflag_requests, 1); break;
+        case 1: ray_clear_interrupt(); break;
+        case 2: (void)ray_interrupted(); break;
+        default: if (ray_take_interrupt()) atomic_fetch_add(&g_iflag_taken, 1); break;
+        }
+    }
+}
+
+static test_result_t test_interrupt_flag_threads(void) {
+    ray_clear_interrupt();
+    atomic_store(&g_iflag_requests, 0);
+    atomic_store(&g_iflag_taken, 0);
+    ray_thread_t tid[IFLAG_THREADS];
+    for (int t = 0; t < IFLAG_THREADS; t++)
+        TEST_ASSERT_EQ_I(ray_thread_create(&tid[t], iflag_worker, (void*)(intptr_t)t), RAY_OK);
+    iflag_worker((void*)(intptr_t)IFLAG_THREADS);
+    for (int t = 0; t < IFLAG_THREADS; t++) ray_thread_join(tid[t]);
+    int64_t taken = atomic_load(&g_iflag_taken), asked = atomic_load(&g_iflag_requests);
+    ray_clear_interrupt();
+    TEST_ASSERT_FMT(taken <= asked, "%lld takes found an interrupt, %lld were requested",
+                    (long long)taken, (long long)asked);
+    /* the flag is usable afterwards, as it was */
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    PASS();
+}
+
 /* Under -U a sleep is refused: it would stop the single-threaded server
  * for every connection, as .sys.exec "sleep" would, and that is restricted. */
 static test_result_t test_time_sleep_restricted(void) {
@@ -15479,6 +15545,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
     { "lang/time_sleep_cancel", test_time_sleep_cancel, lang_setup, lang_teardown },
     { "lang/time_sleep_restricted", test_time_sleep_restricted, lang_setup, lang_teardown },
+    { "lang/interrupt_take", test_interrupt_take, lang_setup, lang_teardown },
+    { "lang/parallel_interrupt_flag", test_interrupt_flag_threads, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },

@@ -80,6 +80,10 @@ int64_t ray_timespan_from_number(ray_t* x);
 /* ===== Cancel API ===== */
 
 void     ray_cancel(void);
+/* Consume a pending interrupt (ray_request_interrupt): true, and cleared,
+ * when one was set.  Atomic, so a second request is never swallowed by the
+ * clearing of the first (src/lang/eval.c). */
+bool     ray_take_interrupt(void);
 void     ray_cancel_reset(void);
 
 /* ===== Parted Types ===== */

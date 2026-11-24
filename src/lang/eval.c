@@ -56,6 +56,7 @@
 /* ray_error() is declared in <rayforce.h> (included via eval.h) */
 
 #include <string.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,8 +131,20 @@ static void affine_sum_cache_clear(void) {
  * VM — __VM->nfo / __VM->trace — so they survive across bytecode
  * invocations and stay one-per-thread, per the runtime/VM state model. */
 
-/* Interrupt flag — set by REPL signal handler, checked by eval/VM loops */
-static volatile sig_atomic_t g_eval_interrupted = 0;
+/* Interrupt flag: set by the SIGINT and SIGURG handlers (and by
+ * ray_request_interrupt from any thread), checked by the eval/VM loops and
+ * long-running builtins, reset per request.  It is shared by every thread of
+ * the process: an in-process IPC server and the client threads waiting on
+ * replies all read and write it, so it is a C11 atomic, not a
+ * volatile sig_atomic_t (which orders nothing between threads).  It must be
+ * lock-free: a signal handler writes it (#1623). */
+static _Atomic int g_eval_interrupted = 0;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "the interrupt flag is set from signal handlers: it must be lock-free");
+/* The hot-path read: a plain load on every target, ordering nothing; a
+ * checkpoint only needs to see the flag eventually. */
+#define EVAL_INTERRUPTED() \
+    (atomic_load_explicit(&g_eval_interrupted, memory_order_relaxed) != 0)
 
 /* A cancel request must reach BOTH the main-thread eval/VM loops (this flag)
  * and any in-flight parallel workers (the pool's cancel flag, via ray_cancel).
@@ -140,9 +153,28 @@ static volatile sig_atomic_t g_eval_interrupted = 0;
  * ray_cancel/ray_cancel_reset are async-signal-safe, so this stays callable
  * from the signal handler.  Zero hot-path cost: only runs when a cancel is
  * actually requested. */
-void ray_request_interrupt(void)      { g_eval_interrupted = 1; ray_cancel(); }
-void ray_clear_interrupt(void)        { g_eval_interrupted = 0; ray_cancel_reset(); }
-bool ray_interrupted(void)            { return g_eval_interrupted != 0; }
+void ray_request_interrupt(void) {
+    atomic_store_explicit(&g_eval_interrupted, 1, memory_order_release);
+    ray_cancel();
+}
+void ray_clear_interrupt(void) {
+    atomic_store_explicit(&g_eval_interrupted, 0, memory_order_release);
+    ray_cancel_reset();
+}
+bool ray_interrupted(void) {
+    return atomic_load_explicit(&g_eval_interrupted, memory_order_acquire) != 0;
+}
+/* Consume a pending interrupt: true, and the flag cleared, when one was
+ * set; false otherwise.  One exchange, so a second request that lands
+ * between a look and a clear is not swallowed with the first: it stays set
+ * for the next take.  The one place a request's cancel is consumed (the IPC
+ * client forwarding a Ctrl-C to its server). */
+bool ray_take_interrupt(void) {
+    if (!atomic_exchange_explicit(&g_eval_interrupted, 0, memory_order_acq_rel))
+        return false;
+    ray_cancel_reset();
+    return true;
+}
 
 /* Legacy internal names — thin wrappers kept for existing callers. */
 void ray_eval_request_interrupt(void) { ray_request_interrupt(); }
@@ -2282,7 +2314,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         ray_release(e0);
 
         for (int64_t i = 1; i < len; i++) {
-            if ((i & 0xFFFF) == 0 && g_eval_interrupted) { ray_release(vec); return ray_error("cancel", "interrupted"); }
+            if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) { ray_release(vec); return ray_error("cancel", "interrupted"); }
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
@@ -2331,7 +2363,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     out[0] = e0;  /* first element already computed */
 
     for (int64_t i = 1; i < len; i++) {
-        if ((i & 0xFFFF) == 0 && g_eval_interrupted) {
+        if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) {
             result->len = i;                 /* the filled prefix only */
             ray_release(result);
             return ray_error("cancel", "interrupted");
@@ -4540,7 +4572,7 @@ op_jmp: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ip += offset;
-    if (offset < 0 && g_eval_interrupted) goto vm_error_cancel;
+    if (offset < 0 && EVAL_INTERRUPTED()) goto vm_error_cancel;
     DISPATCH();
 }
 
@@ -4763,7 +4795,7 @@ op_callf: {
                 ray_release(fn_args[i]);  /* excess args */
 
             /* Check for Ctrl-C interrupt on each compiled call */
-            if (g_eval_interrupted) goto vm_error_cancel;
+            if (EVAL_INTERRUPTED()) goto vm_error_cancel;
 
             /* Switch to callee bytecode */
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
@@ -6209,7 +6241,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
-    if (g_eval_interrupted) return ray_error("cancel", "interrupted");
+    if (EVAL_INTERRUPTED()) return ray_error("cancel", "interrupted");
 
     /* The stack is read every fourth level: four levels are far below
      * the reserve in any build, and the hot path skips the read. */
