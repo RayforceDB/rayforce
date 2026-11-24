@@ -50,12 +50,10 @@ extern void      ray_lang_destroy(void);
 ray_runtime_t *__RUNTIME = NULL;
 _Thread_local ray_vm_t *__VM = NULL;
 
-/* Persistent error message buffer.
- *
- * `__VM->err.msg` is the canonical per-thread slot now that the VM is
- * stable for the thread's lifetime, but FFI callers can hit errors on
- * threads that never bound a VM — this thread-local shadow keeps
- * ray_error_msg() answerable there too. */
+/* The message of the last error made on this thread (ray_error_msg).  An
+ * error object holds its own copy (ray_err_msg); this one answers for the
+ * thread, including after a raise that had no memory for an object, and is
+ * the buffer every message is formatted into first. */
 static _Thread_local char ray_last_err_msg[256] = {0};
 /* The call shape the thread's last error was raised against, when a builtin was
  * called with the wrong arguments: "(take <collection: ...> <count: ...>)".  Kept next
@@ -153,28 +151,23 @@ ray_err_t ray_err_from_obj(ray_t* err) {
 
 /* ===== Error API ===== */
 
-static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
-    /* Populate / clear the persistent message buffer FIRST.  On the
-     * deep-OOM path below we return the static __ray_oom sentinel, but
-     * that path still has to leave ray_error_msg() consistent with this
-     * call.  The buffer is thread-local storage, so this does not depend
-     * on the heap and stays valid even when ray_alloc below fails. */
-    ray_last_err_usage = NULL;
-    if (fmt) {
-        va_list copy;
-        va_copy(copy, ap);
-        vsnprintf(ray_last_err_msg, sizeof(ray_last_err_msg), fmt, copy);
-        va_end(copy);
-        if (__VM)
-            memcpy(__VM->err.msg, ray_last_err_msg, sizeof(__VM->err.msg));
+/* Make the error object: `code` (at most 7 bytes) in sdata and, when
+ * msg_len > 0, a copy of ray_last_err_msg in its own block.  A block too big
+ * for the heap falls back to an error without a message, and that one to
+ * the static sentinel. */
+static ray_t* error_obj(const char* code, size_t msg_len) {
+    ray_t* err = msg_len ? ray_alloc((int64_t)msg_len + 1) : NULL;
+    if (err) {
+        memcpy(err->data, ray_last_err_msg, msg_len);
+        err->data[msg_len] = '\0';
     } else {
-        ray_last_err_msg[0] = '\0';
-        if (__VM) __VM->err.msg[0] = '\0';
+        msg_len = 0;
+        err = ray_alloc(0);
+        if (!err) return &__ray_oom;  /* sentinel — see __ray_oom comment */
     }
-
-    ray_t* err = ray_alloc(0);
-    if (!err) return &__ray_oom;  /* sentinel — see __ray_oom comment */
     err->type = RAY_ERROR;
+    memset(err->aux, 0, sizeof err->aux);
+    err->err_msg_len = (uint16_t)msg_len;
     err->slen = 0;
     memset(err->sdata, 0, 7);
     if (code) {
@@ -184,6 +177,18 @@ static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
         err->slen = (uint8_t)len;
     }
     return err;
+}
+
+static ray_t* ray_verror(const char* code, const char* fmt, va_list ap) {
+    /* Format into the thread's buffer first: it is the thread's last message
+     * (ray_error_msg) even when no object can be made below, and the object
+     * copies its own message from it. */
+    ray_last_err_usage = NULL;
+    int n = vsnprintf(ray_last_err_msg, sizeof(ray_last_err_msg), fmt, ap);
+    size_t len = n < 0 ? 0 : (size_t)n;
+    if (len >= sizeof(ray_last_err_msg)) len = sizeof(ray_last_err_msg) - 1;
+    if (n < 0) ray_last_err_msg[0] = '\0';
+    return error_obj(code, len);
 }
 
 ray_t* ray_error(const char* code, const char* fmt, ...) {
@@ -201,24 +206,12 @@ ray_t* ray_error(const char* code, const char* fmt, ...) {
         va_end(ap);
         return err;
     }
-    /* No format string — skip va_list entirely for portability.  Clear
-     * the persistent message buffer FIRST so the deep-OOM sentinel path
-     * doesn't leave stale text from an earlier error visible. */
+    /* No format string — skip va_list entirely for portability.  No message:
+     * the thread's last message is cleared too, so no stale text from an
+     * earlier error reads as this one's. */
     ray_last_err_msg[0] = '\0';
     ray_last_err_usage = NULL;
-    if (__VM) __VM->err.msg[0] = '\0';
-    ray_t* err = ray_alloc(0);
-    if (!err) return &__ray_oom;  /* sentinel — see __ray_oom comment */
-    err->type = RAY_ERROR;
-    err->slen = 0;
-    memset(err->sdata, 0, 7);
-    if (code) {
-        size_t len = strlen(code);
-        if (len > 7) len = 7;
-        memcpy(err->sdata, code, len);
-        err->slen = (uint8_t)len;
-    }
-    return err;
+    return error_obj(code, 0);
 }
 
 void ray_error_free(ray_t* err) {
@@ -253,13 +246,9 @@ const char* ray_error_msg(void) {
     return ray_last_err_msg;
 }
 
-void ray_error_msg_set(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(ray_last_err_msg, sizeof(ray_last_err_msg), fmt, ap);
-    va_end(ap);
-    if (__VM)
-        memcpy(__VM->err.msg, ray_last_err_msg, sizeof(__VM->err.msg));
+const char* ray_err_msg(ray_t* err) {
+    if (!err || !RAY_IS_ERR(err) || err == RAY_OOM_OBJ || !err->err_msg_len) return NULL;
+    return (const char*)err->data;
 }
 
 const char* ray_error_usage(void) {
@@ -273,7 +262,6 @@ void ray_error_usage_set(const char* usage) {
 void ray_error_clear(void) {
     ray_last_err_usage = NULL;
     ray_last_err_msg[0] = '\0';
-    if (__VM) __VM->err.msg[0] = '\0';
 }
 
 /* ===== Lifecycle ===== */

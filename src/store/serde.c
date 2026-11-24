@@ -693,35 +693,15 @@ static int64_t ser_table_cols_size(ray_t* tbl, ray_t* cols_list) {
     return size;
 }
 
-/* The message an error record carries: the held copy while a
- * ray_serde_msg_hold is active, else the thread's last error message.
- * At most UINT8_MAX bytes (the record's length byte). */
-static _Thread_local int    g_ser_msg_hold = 0;
-static _Thread_local size_t g_ser_msg_len  = 0;
-static _Thread_local char   g_ser_msg[UINT8_MAX];
-
-static size_t ser_error_msg(const char** out) {
-    if (g_ser_msg_hold > 0) {
-        *out = g_ser_msg;
-        return g_ser_msg_len;
-    }
-    const char* msg = ray_error_msg();
+/* The message an error record carries: the error's own (ray_err_msg), at
+ * most UINT8_MAX bytes (the record's length byte).  It is fixed when the
+ * error is made, so the size pass and the write pass read the same text
+ * whatever is raised between them. */
+static size_t ser_error_msg(ray_t* err, const char** out) {
+    const char* msg = ray_err_msg(err);
     size_t len = msg ? strlen(msg) : 0;
     *out = msg;
     return len > UINT8_MAX ? UINT8_MAX : len;
-}
-
-void ray_serde_msg_hold(void) {
-    if (g_ser_msg_hold++ > 0) return;
-    const char* msg = ray_error_msg();
-    size_t len = msg ? strlen(msg) : 0;
-    if (len > UINT8_MAX) len = UINT8_MAX;
-    if (len) memcpy(g_ser_msg, msg, len);
-    g_ser_msg_len = len;
-}
-
-void ray_serde_msg_release(void) {
-    if (g_ser_msg_hold > 0) g_ser_msg_hold--;
 }
 
 /* What ser writes, de reads (#1591): ray_de_raw counts one level per
@@ -787,7 +767,7 @@ static int64_t serde_size_impl(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
     if (RAY_IS_ERR(obj)) {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         return 1 + 8 + 1 + (int64_t)msg_len;
     }
     if (RAY_IS_NULL(obj)) return 1; /* just the null type byte */
@@ -905,7 +885,7 @@ static int64_t serde_size_impl(ray_t* obj) {
     }
     case RAY_ERROR: {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         return 1 + 8 + 1 + (int64_t)msg_len; /* type + sdata + message */
     }
     default:
@@ -924,7 +904,7 @@ static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
     }
     if (RAY_IS_ERR(obj)) {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         buf[0] = (uint8_t)RAY_ERROR;
         memcpy(buf + 1, obj->sdata, 7);
         buf[8] = 0;
@@ -1183,7 +1163,7 @@ static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
 
     case RAY_ERROR: {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         memcpy(buf, obj->sdata, 7);
         buf[7] = 0;
         buf[8] = (uint8_t)msg_len;
@@ -1781,16 +1761,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
  * ray_ser — top-level: serialize with IPC header
  * -------------------------------------------------------------------------- */
 
-static ray_t* ser_held(ray_t* obj);
-
 ray_t* ray_ser(ray_t* obj) {
-    ray_serde_msg_hold();
-    ray_t* r = ser_held(obj);
-    ray_serde_msg_release();
-    return r;
-}
-
-static ray_t* ser_held(ray_t* obj) {
     bool owned = false;
     if (ray_is_lazy(obj)) {
         ray_retain(obj);

@@ -1332,7 +1332,7 @@ static ray_t* fmt_col_idx(fmt_buf_t* b, ray_t* tbl, int64_t ci) {
     ray_t* c = ray_table_col_idx(tbl, ci);
     if (c && RAY_IS_ERR(c)) {
         const char* code = ray_err_code(c);
-        const char* msg  = ray_error_msg();
+        const char* msg  = ray_err_msg(c);
         snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
         snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
         ray_error_free(c);
@@ -1361,7 +1361,7 @@ static ray_t* fmt_enc_window(fmt_buf_t* b, ray_t* tbl, int64_t ci, int64_t nrows
     ray_t* err = ray_col_gather_enc(enc, NULL, true, ids, height, &out);
     if (err) {
         const char* code = ray_err_code(err);
-        const char* msg  = ray_error_msg();
+        const char* msg  = ray_err_msg(err);
         snprintf(b->cause_code, sizeof b->cause_code, "%s", code ? code : "format");
         snprintf(b->cause_msg, sizeof b->cause_msg, "%s", msg ? msg : "");
         ray_error_free(err);

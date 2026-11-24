@@ -324,7 +324,7 @@ static bool scan_lit(rd_t* rd, ray_scalar_lit_t* l) {
     const char* pos = rd->p;
     ray_t* err = ray_parse_scalar_literal(&pos, l);
     if (err) {
-        const char* m = ray_error_msg();
+        const char* m = ray_err_msg(err);
         const char* c = ray_err_code(err);
         char msg[128];
         snprintf(msg, sizeof msg, "%s", m && *m ? m : "invalid literal");

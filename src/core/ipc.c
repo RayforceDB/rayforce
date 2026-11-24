@@ -583,9 +583,6 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
     ray_serde_fail_clear();
-    /* Each size/write pair below holds the error text across both passes
-     * (ray_serde_msg_hold); a fallback error takes a new hold of its own. */
-    ray_serde_msg_hold();
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -596,7 +593,6 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
     if (!ray_ipc_body_size_ok(ser_size)) {
-        ray_serde_msg_release();
         if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
             fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
@@ -613,10 +609,8 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         }
         if (!fallback) return;
         result   = fallback;
-        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
         if (!ray_ipc_body_size_ok(ser_size)) {
-            ray_serde_msg_release();
             ray_error_free(fallback);
             return;
         }
@@ -624,12 +618,10 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) {
-        ray_serde_msg_release();
         if (fallback) ray_error_free(fallback);
         return;
     }
     int64_t  wrote    = ray_ser_raw(payload, result);
-    ray_serde_msg_release();
     if (wrote != ser_size) {
         /* The write phase disagrees with the size phase (an encoded column
          * failed to decode): never send the frame, answer with an error. */
@@ -637,11 +629,9 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         if (fallback) { ray_error_free(fallback); return; }
         fallback = ray_error("io", "result could not be serialized over IPC");
         result   = fallback;
-        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
         payload  = ray_ipc_body_size_ok(ser_size) ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
         bool ok  = payload && ray_ser_raw(payload, result) == ser_size;
-        ray_serde_msg_release();
         if (!ok) {
             if (payload) ray_free_raw(payload);
             ray_error_free(fallback);
@@ -917,17 +907,20 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         }
     }
 
-    /* `raise x` deliberately keeps x as a pending value instead of eagerly
-     * formatting it into ray_error_msg().  Capture it before the outer
-     * verbose wrapper turns the error into a child of [captured, result];
-     * send_response can no longer recognize a top-level error after that. */
-    if (result && RAY_IS_ERR(result) && !ray_error_msg()) {
+    /* `raise x` deliberately keeps x as a pending value: its error has no
+     * message.  The reply carries the error's own message, so the error is
+     * made again with x rendered as its message, before the outer verbose
+     * wrapper turns it into a child of [captured, result]. */
+    if (result && RAY_IS_ERR(result) && result != RAY_OOM_OBJ && !ray_err_msg(result)) {
         char raised[256];
         if (ray_raise_render(raised, sizeof raised)) {
             char code[8];
             snprintf(code, sizeof code, "%s", ray_err_code(result));
-            ray_t* marker = ray_error(code, "%s", raised);
-            if (marker) ray_error_free(marker);
+            ray_t* again = ray_error(code, "%s", raised);
+            if (again && again != RAY_OOM_OBJ) {
+                ray_error_free(result);
+                result = again;
+            }
         }
     }
 
@@ -2523,23 +2516,9 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
  * counted frame (rc = 1 to the caller).  Built once per message however
  * many connections it goes to: ray_mcast_pub shares one frame across
  * every subscriber's queue (#487). */
-static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
-                                             uint8_t extra_flags, size_t threshold,
-                                             ray_err_t* err_out);
-
 static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
                                         uint8_t extra_flags, size_t threshold,
                                         ray_err_t* err_out)
-{
-    ray_serde_msg_hold();
-    ray_poll_frame_t* f = conn_frame_msg_held(msg, msgtype, extra_flags, threshold, err_out);
-    ray_serde_msg_release();
-    return f;
-}
-
-static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
-                                             uint8_t extra_flags, size_t threshold,
-                                             ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);

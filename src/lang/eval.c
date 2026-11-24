@@ -985,7 +985,7 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     __VM->raise_val = NULL;
     if (!err_val)
         err_val = ray_try_handler_is_value(handler_expr) ? RAY_NULL_OBJ
-                : try_error_value(ray_err_code(result), ray_error_msg(), ray_error_usage());
+                : try_error_value(ray_err_code(result), ray_err_msg(result), ray_error_usage());
     /* The caught error itself goes no further: errors are not refcounted,
      * so ray_release would leave it allocated.  Nor does the trace its
      * unwind recorded. */
@@ -5282,7 +5282,7 @@ vm_error_cleanup: {
             err_val = NULL;
         } else if (!err_val)
             err_val = vm_err_obj && RAY_IS_ERR(vm_err_obj)
-                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg(), ray_error_usage())
+                ? try_error_value(ray_err_code(vm_err_obj), ray_err_msg(vm_err_obj), ray_error_usage())
                 : try_error_value(vm_err_str, vm_err_detail, NULL);
         if (vm_err_obj) {
             if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);

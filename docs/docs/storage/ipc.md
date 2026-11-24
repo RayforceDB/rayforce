@@ -314,7 +314,8 @@ typedef struct ray_ipc_header_t {
 The header is exactly 16 bytes, enforced by a compile-time static assertion.
 
 Version 4 extends an error payload from its eight-byte category field to
-`category[8]`, a one-byte message length, and up to 255 message bytes. Version
+`category[8]`, a one-byte message length, and up to 255 message bytes: the
+error's own message, the text it was raised with. Version
 3 error records remain readable as category-only errors so persisted objects
 and journals survive the upgrade.
 
@@ -352,7 +353,7 @@ payload allocation. These per-message limits are not a process-memory budget.
 
 - **v2** — atoms serialized as `type(1) + value-bytes`. Typed-null atoms (`0Nl`, `0Nf`, …) lost their null bit on round-trip.
 - **v3** — atoms serialized as `type(1) + flags(1) + value-bytes`. Bit 0 of `flags` carries the typed-null marker; `(de (ser 0Nl))` now returns `0Nl`. The [handshake byte](#handshake) advertises the same version so peers speaking different wire versions are closed before any payload is exchanged.
-- **v4** (current) — error records carry `category[8]`, a one-byte message length and up to 255 message bytes, so an error sent over IPC or written to a journal keeps its message. v4 reads v3 objects and journals; live peers must both be v4.
+- **v4** (current) — error records carry `category[8]`, a one-byte message length and up to 255 message bytes, so an error sent over IPC or written to a journal keeps its message. Each record carries its own error's message, so a list of several errors writes each one's text. v4 reads v3 objects and journals; live peers must both be v4.
 
 Because the version field is checked symmetrically on send and receive, a v3 peer will refuse to connect to a v2 peer (and vice versa) rather than silently mis-parsing.
 

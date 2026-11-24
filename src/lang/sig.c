@@ -587,7 +587,7 @@ ray_t* ray_sig_note_err(const char* name, ray_t* result) {
                 (cn == 5 && !memcmp(c, "arity", 5)) || (cn == 6 && !memcmp(c, "length", 6));
     if (!call) return result;
     bool own;
-    const char* old = ray_error_msg();
+    const char* old = ray_err_msg(result);
     /* A domain error is a bad value, not a bad call, unless it is about the
      * argument list: told from the message before any table is read. */
     if (domain && (!old || !strstr(old, " arg"))) return result;

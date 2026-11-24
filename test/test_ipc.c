@@ -94,6 +94,7 @@ extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 #include <errno.h>
 #include <stdlib.h>
 #include <time.h>
+#include "err_list.h"
 
 /* ---- Runtime test plumbing ---------------------------------------------- */
 
@@ -2982,6 +2983,70 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     TEST_ASSERT_EQ_I(peer.saw_eof, 1);
     PASS();
 }
+
+/* A peer that completes the handshake and records the bytes it is sent until
+ * the client closes, so a test can read the client's frame as it left. */
+typedef struct {
+    ray_sock_t   lfd;
+    uint16_t     port;
+    uint8_t      buf[4096];
+    int64_t      n;
+    ray_thread_t tid;
+} record_peer_t;
+
+static void record_peer_thread(void* arg) {
+    record_peer_t* p = (record_peer_t*)arg;
+    ray_sock_t c = ray_sock_accept(p->lfd);
+    if (c == RAY_INVALID_SOCK) return;
+    ray_sock_set_blocking(c);
+    struct timeval tv = { 5, 0 };
+    setsockopt((int)c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint8_t hs[2];
+    if (recv((int)c, hs, 2, MSG_WAITALL) == 2) {
+        uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+        send((int)c, resp, 2, 0);
+        while (p->n < (int64_t)sizeof(p->buf)) {
+            ssize_t n = recv((int)c, p->buf + p->n, sizeof(p->buf) - (size_t)p->n, 0);
+            if (n <= 0) break;
+            p->n += n;
+        }
+    }
+    ray_sock_close(c);
+}
+
+/* Over IPC every error record of a list carries its own error's message
+ * (#1214): the client used to write the thread's last message, the third
+ * one raised, into all three. */
+static test_result_t test_ipc_error_list_own_messages(void) {
+    record_peer_t* peer = (record_peer_t*)calloc(1, sizeof(record_peer_t));
+    TEST_ASSERT_NOT_NULL(peer);
+    peer->lfd = ray_sock_listen(0);
+    TEST_ASSERT(peer->lfd != RAY_INVALID_SOCK, "listen");
+    peer->port = ray_test_listen_port(peer->lfd);
+    ray_thread_create(&peer->tid, record_peer_thread, peer);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", peer->port, NULL, NULL, 2000);
+    ray_t* l = err_list_new();
+    ray_err_t sent = h >= 0 ? ray_ipc_send_async(h, l) : RAY_ERR_IO;
+    err_list_free(l);
+    if (h >= 0) ray_ipc_close(h);
+    ray_thread_join(peer->tid);
+    ray_sock_close(peer->lfd);
+
+    int64_t n = peer->n;
+    ray_ipc_header_t hdr;
+    if (n >= (int64_t)sizeof hdr) memcpy(&hdr, peer->buf, sizeof hdr);
+    int bad = n > (int64_t)sizeof hdr
+        ? err_list_check(peer->buf + sizeof hdr, n - (int64_t)sizeof hdr) : -3;
+    bool compressed = n >= (int64_t)sizeof hdr && (hdr.flags & RAY_IPC_FLAG_COMPRESSED);
+    free(peer);
+
+    TEST_ASSERT((h) >= (0), "connect");
+    TEST_ASSERT_EQ_I(sent, RAY_OK);
+    TEST_ASSERT_FALSE(compressed);
+    TEST_ASSERT_FMT(bad == -1, "error record %d of the IPC frame is not its own", bad);
+    PASS();
+}
 #endif
 
 /* A reply inside the deadline is returned as usual, and the handle stays
@@ -4077,6 +4142,7 @@ const test_entry_t ipc_entries[] = {
 #ifndef RAY_OS_WINDOWS
     { "ipc/send_deadline/expires",         test_ipc_send_deadline_expires,          ipc_setup, ipc_teardown },
     { "ipc/send_deadline/covers_write",    test_ipc_send_deadline_covers_write,     ipc_setup, ipc_teardown },
+    { "ipc/error_list_own_messages",       test_ipc_error_list_own_messages,        ipc_setup, ipc_teardown },
 #endif
     { "ipc/send_deadline/met",             test_ipc_send_deadline_met,              ipc_setup, ipc_teardown },
 
