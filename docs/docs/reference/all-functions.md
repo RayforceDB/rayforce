@@ -49,7 +49,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.sys.trust`, `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
-`.emb.norm`, `inv`, `flip`, `gram`, `.emb.hnsw-free`, `.emb.hnsw-load`, `.emb.hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
+`norm`, `inv`, `flip`, `gram`, `.emb.hnsw-free`, `.emb.hnsw-load`, `.emb.hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
 `.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`
 

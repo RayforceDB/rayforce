@@ -25,13 +25,13 @@ Four direct builtins. All accept either *two vectors* (returning a scalar) or *a
 | `(.emb.cos-dist a b)` | cosine distance `1 − cos(a, b)` | `[0, 2]` — lower = closer |
 | `(.emb.l2-dist a b)` | euclidean distance `||a − b||₂` | `[0, ∞)` — lower = closer |
 | `(.emb.inner-prod a b)` | dot product `∑ aᵢ·bᵢ` | any real |
-| `(.emb.norm x)` | L2 norm `||x||₂` | `[0, ∞)` |
+| `(norm x)` | L2 norm `||x||₂` | `[0, ∞)` |
 
 ```lisp
 (.emb.cos-dist [1.0 0.0] [0.0 1.0])         ; → 1.0 (orthogonal)
 (.emb.l2-dist  [0.0 0.0] [3.0 4.0])         ; → 5.0
 (.emb.inner-prod [1.0 2.0] [3.0 4.0])      ; → 11.0
-(.emb.norm    [3.0 4.0])                 ; → 5.0
+(norm    [3.0 4.0])                 ; → 5.0
 ```
 
 ## Brute-force K-Nearest-Neighbours
@@ -135,7 +135,7 @@ Accepted by `.emb.hnsw-build`, `.emb.knn`, and the `nearest` clause:
 | `.emb.cos-dist` | 2 | `(.emb.cos-dist a b)` — cosine distance; vec×vec → atom, LIST×vec → vector |
 | `.emb.l2-dist` | 2 | `(.emb.l2-dist a b)` — euclidean distance |
 | `.emb.inner-prod` | 2 | `(.emb.inner-prod a b)` — positive dot product |
-| `.emb.norm` | 1 | `(.emb.norm x)` — L2 norm; scalar if vec, per-row vector if LIST |
+| `norm` | 1 | `(norm x)` — L2 norm; scalar if vec, per-row vector if LIST |
 | `.emb.knn` | 3–4 | `(.emb.knn col query k [metric])` — brute-force top-K |
 | `.emb.hnsw-build` | 1–4 | `(.emb.hnsw-build col [metric] [M] [ef_c])` — build index |
 | `.emb.ann` | 3–4 | `(.emb.ann handle query k [ef_s])` — approximate top-K via HNSW |

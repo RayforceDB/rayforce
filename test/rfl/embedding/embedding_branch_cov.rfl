@@ -240,17 +240,17 @@
 ;; 14. norm on single-element vectors
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.norm [5.0]) -- 5.0
-(.emb.norm (as 'I64 [5])) -- 5.0
-(.emb.norm (as 'I32 [5])) -- 5.0
+(norm [5.0]) -- 5.0
+(norm (as 'I64 [5])) -- 5.0
+(norm (as 'I32 [5])) -- 5.0
 
 ;; norm on a LIST of I64 vectors
-(at (.emb.norm (list [5 0] [0 12])) 0) -- 5.0
-(at (.emb.norm (list [5 0] [0 12])) 1) -- 12.0
+(at (norm (list [5 0] [0 12])) 0) -- 5.0
+(at (norm (list [5 0] [0 12])) 1) -- 12.0
 
 ;; norm on a LIST of I32 vectors
-(at (.emb.norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 0) -- 5.0
-(at (.emb.norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 1) -- 13.0
+(at (norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 0) -- 5.0
+(at (norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 1) -- 13.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 15. .emb.cos-dist/l2-dist/inner-prod with F64 source vectors (scalar)

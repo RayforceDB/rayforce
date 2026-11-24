@@ -14566,7 +14566,7 @@ static const char* const k_rs_pure[] = {
     "concat", "raze", "within", "div", "bin", "binr", "split", "str-find", "str-join",
     "upper", "lower", "trim", "substr", "replace", "ser", "de", "like", "ss", "hh",
     "minute", "yyyy", "mm", "dd", "dow", "doy", "sym-name", "strlen", "diverse",
-    "remove", "row", ".emb.cos-dist", ".emb.inner-prod", ".emb.l2-dist", ".emb.norm", "mmu", "lsq", "inv",
+    "remove", "row", ".emb.cos-dist", ".emb.inner-prod", ".emb.l2-dist", "norm", "mmu", "lsq", "inv",
     "flip", "gram", NULL
 };
 static const char* const k_rs_skip[] = {

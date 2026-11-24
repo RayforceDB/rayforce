@@ -345,7 +345,7 @@ ray_op_t* mst = ray_mst(g, rel, "weight");
 
 Vector similarity and nearest-neighbour search are documented separately, in
 [Vector Search](vector-search.md). They are exposed as Rayfall builtins —
-`.emb.cos-dist` / `.emb.l2-dist` / `.emb.inner-prod` / `.emb.norm` for direct distances, `.emb.knn` for
+`.emb.cos-dist` / `.emb.l2-dist` / `.emb.inner-prod` / `norm` for direct distances, `.emb.knn` for
 brute-force top-K, and `.emb.hnsw-build` / `.emb.ann` for HNSW-accelerated approximate
 search — and as the `select … nearest:` clause for filter-aware retrieval.
 Internally the filtered top-K paths lower to `OP_ANN_RERANK (102)` and

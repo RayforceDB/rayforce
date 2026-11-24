@@ -206,14 +206,14 @@ ray_t* ray_cos_dist_fn   (ray_t* a, ray_t* b) { return vec_binary_metric(MET_COS
 ray_t* ray_inner_prod_fn (ray_t* a, ray_t* b) { return vec_binary_metric(MET_INNER_PROD, a, b); }
 ray_t* ray_l2_dist_fn    (ray_t* a, ray_t* b) { return vec_binary_metric(MET_L2_DIST,    a, b); }
 
-/* (.emb.norm x): x is numeric vec → F64 scalar; x is LIST of numeric vecs → F64 vector. */
+/* (norm x): x is numeric vec → F64 scalar; x is LIST of numeric vecs → F64 vector. */
 ray_t* ray_norm_fn(ray_t* x) {
     /* x is NULL here, so no type name available. */
-    if (!x) return ray_error("type", ".emb.norm: missing operand");
+    if (!x) return ray_error("type", "norm: missing operand");
     if (x->type == RAY_LIST) {
         int32_t dim;
         if (list_vec_validate(x, &dim) != 0)
-            return ray_error("type", ".emb.norm: list must contain equal-length numeric vectors (f32, f64, i32 or i64)");
+            return ray_error("type", "norm: list must contain equal-length numeric vectors (f32, f64, i32 or i64)");
         int64_t n = x->len;
         ray_t* result = ray_vec_new(RAY_F64, n);
         if (!result || RAY_IS_ERR(result)) return ray_error("oom", NULL);
@@ -232,7 +232,7 @@ ray_t* ray_norm_fn(ray_t* x) {
         return result;
     }
     if (!rayvec_is_numeric(x))
-        return ray_error("type", ".emb.norm: expects a numeric vector (f32, f64, i32 or i64) or list thereof, got %s",
+        return ray_error("type", "norm: expects a numeric vector (f32, f64, i32 or i64) or list thereof, got %s",
                          ray_type_name(x->type));
     double s = 0.0;
     for (int64_t i = 0; i < x->len; i++) {

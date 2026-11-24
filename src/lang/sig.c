@@ -244,7 +244,7 @@ static const ray_sig_entry_t sigs[] = {
     {"flip", "(flip <x: numeric vector or non-empty list of numeric rows>)"},
     {"gram", "(gram <x: numeric vector or non-empty list of numeric rows>)"},
     {"inv", "(inv <x: numeric vector or non-empty list of numeric rows>)"},
-    {".emb.norm", "(.emb.norm <x: numeric vector (f32, f64, i32 or i64), or a list of them>)"},
+    {"norm", "(norm <x: numeric vector (f32, f64, i32 or i64), or a list of them>)"},
     {"lower", "(lower <x: str or sym, atom or vector>)"},
     {"upper", "(upper <x: str or sym, atom or vector>)"},
     {"trim", "(trim <x: str or sym, atom or vector>)"},

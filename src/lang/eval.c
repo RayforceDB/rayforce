@@ -5896,7 +5896,7 @@ static void ray_register_builtins(void) {
     register_binary(".emb.cos-dist",    RAY_FN_NONE, ray_cos_dist_fn);
     register_binary(".emb.inner-prod",  RAY_FN_NONE, ray_inner_prod_fn);
     register_binary(".emb.l2-dist",     RAY_FN_NONE, ray_l2_dist_fn);
-    register_unary (".emb.norm",        RAY_FN_NONE, ray_norm_fn);
+    register_unary ("norm",        RAY_FN_NONE, ray_norm_fn);
     register_binary("mmu",         RAY_FN_NONE, ray_mmu_fn);
     register_binary("lsq",         RAY_FN_NONE, ray_lsq_fn);
     register_unary ("inv",         RAY_FN_NONE, ray_inv_fn);

@@ -2,7 +2,7 @@
 
 Distances between numeric vectors, exact nearest neighbours, and the HNSW index for approximate ones. An embedding column is a list whose entries are numeric vectors of one length; see [Vector Search & HNSW](../graph/vector-search.md) for the worked reference, persistence and the `nearest:` clause of `select`.
 
-These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before they were gathered here. The old names are gone.
+These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before they were gathered here. The old names are gone. `norm` is linear algebra and stays a global name, beside `mmu`, `inv` and the rest.
 
 ## Reference
 
@@ -11,7 +11,6 @@ These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before 
 | [`.emb.cos-dist`](#emb-cos-dist) | binary | — | Cosine distance between two vectors. |
 | [`.emb.inner-prod`](#emb-inner-prod) | binary | — | Inner product of two vectors. |
 | [`.emb.l2-dist`](#emb-l2-dist) | binary | — | Euclidean distance between two vectors. |
-| [`.emb.norm`](#emb-norm) | unary | — | L2 norm of a vector, or of each vector of a list. |
 | [`.emb.knn`](#emb-knn) | variadic | — | Exact k nearest neighbours by brute force. |
 | [`.emb.hnsw-build`](#emb-hnsw-build) | variadic | — | Build an HNSW index over an embedding column. |
 | [`.emb.ann`](#emb-ann) | variadic | — | Approximate k nearest neighbours through an HNSW index. |
@@ -35,10 +34,6 @@ Signature: `(.emb.inner-prod a b)`. The inner product: higher is closer.
 ## `.emb.l2-dist` { #emb-l2-dist }
 
 Signature: `(.emb.l2-dist a b)`. Euclidean distance: lower is closer.
-
-## `.emb.norm` { #emb-norm }
-
-Signature: `(.emb.norm x)`. The L2 norm of a numeric vector (f32, f64, i32 or i64); given a list of equal-length vectors, the norm of each.
 
 ## `.emb.knn` { #emb-knn }
 

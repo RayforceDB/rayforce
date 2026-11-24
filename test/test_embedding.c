@@ -140,9 +140,9 @@ static test_result_t test_inner_prod_scalar(void) {
 }
 
 static test_result_t test_norm_scalar(void) {
-    TEST_ASSERT_EQ_F(eval_f64("(.emb.norm [3.0 4.0])"), 5.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(.emb.norm [0.0 0.0])"), 0.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(.emb.norm [1.0 2.0 2.0])"), 3.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(norm [3.0 4.0])"), 5.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(norm [0.0 0.0])"), 0.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(norm [1.0 2.0 2.0])"), 3.0, 1e-6);
     PASS();
 }
 
@@ -197,9 +197,9 @@ static test_result_t test_inner_prod_list(void) {
 }
 
 static test_result_t test_norm_list(void) {
-    double d0 = eval_f64("(at (.emb.norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 0)");
-    double d1 = eval_f64("(at (.emb.norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 1)");
-    double d2 = eval_f64("(at (.emb.norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 2)");
+    double d0 = eval_f64("(at (norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 0)");
+    double d1 = eval_f64("(at (norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 1)");
+    double d2 = eval_f64("(at (norm (list [3.0 4.0] [5.0 12.0] [8.0 15.0])) 2)");
     TEST_ASSERT_EQ_F(d0, 5.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, 13.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 17.0, 1e-6);
@@ -1998,7 +1998,7 @@ static test_result_t test_list_validate_first_bad(void) {
     ray_t* r = ray_eval_str("(.emb.cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0])");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     /* norm on list with bad first element. */
-    r = ray_eval_str("(.emb.norm (list (as 'BOOL [true false]) [1.0 0.0]))");
+    r = ray_eval_str("(norm (list (as 'BOOL [true false]) [1.0 0.0]))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
