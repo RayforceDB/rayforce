@@ -235,7 +235,7 @@ A server can fan one stream of updates out to many connected clients with the `.
 
 `.mc.sub` and `.mc.unsub` act on the connection that sent the request, so they are called over IPC, from the client's side of an `.ipc.send`; called outside a connection they raise `domain`.
 
-A subscriber receives each publication as an asynchronous call of a function it defines, named `upd`: `(upd topic seq payload)`, where `topic` is a string, `seq` an `i64` and `payload` the published value. Sequence numbers start at `1` for each topic and rise by one for every publication that had at least one subscriber, so a subscriber detects a gap by comparing `seq` with the previous value plus one.
+A subscriber receives each publication as an asynchronous call of a function it defines, named `upd`: `(upd topic seq payload)`, where `topic` is a string, `seq` an `i64` and `payload` the published value. Sequence numbers start at `1` for each topic and rise by one for every publication that had at least one subscriber, so a subscriber detects a gap by comparing `seq` with the previous value plus one. A topic whose last subscriber leaves is forgotten, so its numbering starts again at `1` with the next subscription.
 
 ```lisp
 ;; publisher process (port 5000)

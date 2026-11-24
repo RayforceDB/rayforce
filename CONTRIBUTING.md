@@ -91,7 +91,9 @@ make docs-check     # python3 scripts/check-builtin-docs.py
 ```
 
 It fails when a registered builtin is missing from the surface list, or when
-the list names something that is no longer registered. It checks names only;
+the list names something that is no longer registered, and when a name is
+listed under a different arity than its registration call (`register_unary`,
+`register_binary`, `register_vary`). It checks names and arities only;
 whether a description is right is for the author and the reviewer.
 
 ## Local build notes
