@@ -275,6 +275,9 @@ void    ray_os_raise_memlock(void);
 ray_err_t ray_thread_create(ray_thread_t* t, ray_thread_fn fn, void* arg);
 ray_err_t ray_thread_join(ray_thread_t t);
 uint32_t ray_thread_count(void);
+/* The calling thread's stack as [*lo, *hi) (the stack grows down from hi).
+ * False when the platform does not say; the caller then has no bound. */
+bool     ray_thread_stack_bounds(uintptr_t* lo, uintptr_t* hi);
 /* The CPUs this process may run on: the affinity mask on Linux (taskset, a
  * cpuset or docker --cpuset-cpus narrow it), ray_thread_count elsewhere. */
 uint32_t ray_cpu_set_count(void);

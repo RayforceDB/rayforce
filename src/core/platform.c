@@ -777,6 +777,30 @@ ray_err_t ray_thread_join(ray_thread_t t) {
     return (rc == 0) ? RAY_OK : RAY_ERR_IO;
 }
 
+bool ray_thread_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
+#if defined(RAY_OS_MACOS)
+    pthread_t self = pthread_self();
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+    size_t size = pthread_get_stacksize_np(self);
+    if (!top || !size || size > top) return false;
+    *lo = top - size;
+    *hi = top;
+    return true;
+#else
+    /* The main thread's size is its RLIMIT_STACK, as the kernel grows it. */
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) return false;
+    void* addr = NULL;
+    size_t size = 0;
+    int rc = pthread_attr_getstack(&attr, &addr, &size);
+    pthread_attr_destroy(&attr);
+    if (rc != 0 || !addr || !size) return false;
+    *lo = (uintptr_t)addr;
+    *hi = (uintptr_t)addr + size;
+    return true;
+#endif
+}
+
 uint32_t ray_thread_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return (n > 0) ? (uint32_t)n : 1;
@@ -1577,6 +1601,15 @@ ray_err_t ray_thread_join(ray_thread_t t) {
     return (rc == WAIT_OBJECT_0) ? RAY_OK : RAY_ERR_IO;
 }
 
+bool ray_thread_stack_bounds(uintptr_t* lo, uintptr_t* hi) {
+    ULONG_PTR l = 0, h = 0;
+    GetCurrentThreadStackLimits(&l, &h);
+    if (!l || h <= l) return false;
+    *lo = (uintptr_t)l;
+    *hi = (uintptr_t)h;
+    return true;
+}
+
 uint32_t ray_thread_count(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -1811,6 +1844,7 @@ ray_err_t ray_thread_join(ray_thread_t t) {
 }
 
 uint32_t ray_thread_count(void) { return 1; }
+bool ray_thread_stack_bounds(uintptr_t* lo, uintptr_t* hi) { (void)lo; (void)hi; return false; }
 uint32_t ray_cpu_set_count(void) { return ray_thread_count(); }
 void     ray_cpu_set_test_min_bytes(size_t n) { (void)n; }
 int64_t ray_os_cgroup_mem_limit(void) { return 0; }

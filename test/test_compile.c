@@ -34,9 +34,13 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "lang/parse.h"
+#include "core/runtime.h"   /* __VM, ray_vm_init: a VM for the small-stack thread */
 #include "ops/ops.h"
 #include <stdlib.h>
 #include <string.h>
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+#include <pthread.h>
+#endif
 
 /* __RUNTIME is internal test plumbing; runtime API declarations come from
  * <rayforce.h>. */
@@ -1129,6 +1133,55 @@ static test_result_t test_compile_default_switch_case(void) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * 29. the depth guard holds on a thread with a small stack (#1546)
+ *     A body nested 2000 levels deep is within the 2048-level count, but
+ *     at 160 B a level in an optimized build it needs about 320 KB of C
+ *     stack to compile, and over 4 KB a level in a sanitizer build.  Called
+ *     first on a 256 KB thread (the VM an IPC hook binds), the compiler
+ *     must stop at the end of that thread's stack and leave the body to the
+ *     tree walker, which skips the deep branch and returns the parameter.
+ *     Before the guard read the stack, the compile overflowed it.
+ * ════════════════════════════════════════════════════════════════════ */
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+static void* compile_small_stack_worker(void* out) {
+    ray_vm_t vm;
+    ray_vm_init(&vm, -1);
+    __VM = &vm;
+    ray_t *r = ray_eval_str("(deepf 7)");
+    *(int64_t*)out = (r && !RAY_IS_ERR(r) && r->type == -RAY_I64) ? r->i64 : -1;
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    if (vm.raise_val) ray_release(vm.raise_val);
+    if (vm.return_val) ray_release(vm.return_val);
+    if (vm.trace) ray_release(vm.trace);
+    __VM = NULL;
+    return NULL;
+}
+#endif
+
+static test_result_t test_compile_depth_guard_small_stack(void) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    EVAL_OK("(set wrapD (fn [inner] (concat (take (parse \"(if true 0)\") 2) (enlist inner))))");
+    EVAL_OK("(set buildD (fn [n] (let a (parse \"x\")) (times n (let a (wrapD a))) a))");
+    EVAL_OK("(set deepB (buildD 2000))");
+    EVAL_OK("(set deepf (eval (concat (take (parse \"(fn [x] 0)\") 2) "
+              "(enlist (concat (take (parse \"(if false 0)\") 2) (list deepB (parse \"x\")))))))");
+    pthread_attr_t attr; pthread_t worker; int64_t got = -2;
+    TEST_ASSERT_EQ_I(pthread_attr_init(&attr), 0);
+    int rc = pthread_attr_setstacksize(&attr, 256 * 1024);
+    if (!rc) rc = pthread_create(&worker, &attr, compile_small_stack_worker, &got);
+    pthread_attr_destroy(&attr);
+    TEST_ASSERT_EQ_I(rc, 0);
+    TEST_ASSERT_EQ_I(pthread_join(worker, NULL), 0);
+    TEST_ASSERT_EQ_I(got, 7);
+    /* and the main thread, which reuses what the worker decided, agrees */
+    EVAL_I64("(deepf 9)", 9);
+    PASS();
+#else
+    SKIP("requires POSIX thread stack attributes");
+#endif
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Entry table
  * ════════════════════════════════════════════════════════════════════ */
 const test_entry_t compile_entries[] = {
@@ -1224,5 +1277,6 @@ const test_entry_t compile_entries[] = {
     { "compile/head_is_lambda",      test_compile_head_is_lambda_literal, compile_setup, compile_teardown },
     { "compile/self_zero_args",      test_compile_self_zero_args,      compile_setup, compile_teardown },
     { "compile/default_switch_case", test_compile_default_switch_case, compile_setup, compile_teardown },
+    { "compile/depth_guard_small_stack", test_compile_depth_guard_small_stack, compile_setup, compile_teardown },
     { NULL, NULL, NULL, NULL },
 };
