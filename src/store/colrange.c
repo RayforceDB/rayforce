@@ -38,6 +38,9 @@
 /* Fixed scratch: one vector of the widest element (GUID, 16 bytes). */
 #define SCRATCH_FIXED_BYTES ((size_t)RAY_ENC_VEC * 16)
 _Static_assert(SCRATCH_FIXED_BYTES == RAY_COL_FIXED_BYTES, "a lent fixed vector holds one vector");
+/* A stack local of it must not ask more than gcc 11/12's ASan fake stack
+ * gives (32 bytes), nor more than the heap's fixed vector has (#1652). */
+_Static_assert(_Alignof(ray_col_fixed_t) <= 32, "a lent fixed vector is at most 32-byte aligned");
 
 void ray_col_scratch_init(ray_col_scratch_t* s) { memset(s, 0, sizeof *s); }
 
