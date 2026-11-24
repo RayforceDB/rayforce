@@ -112,7 +112,14 @@ the table has a column named `null`: `(if (> v 1) v null)` keeps each row's
 `v` above 1 and is null elsewhere, and `by: (if (> v 2) g null)` groups the
 rows at or below 2 under a null key. A name that is neither an alias nor a
 column and holds a table or a dict reads that global: `(count W)` with `W` a
-table or a dict counts it.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
+table or a dict counts it. Inside a nested select, a column of its own table, and
+within its outputs its own outputs, are its own, even when the outer table
+has a column of that name (its table given by name, as a parameter or a
+`let`, or as an expression of builtins): in `(count (at (select {from: u by: k x: (sum v)}) 'x))` over a table
+that also has a `v`, the nested `v` is `u`'s, and the count is of the nested
+result, the same in every group. A name only the outer table has is the
+outer column there, and so is a name in its `where:` that only one of its
+outputs has.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
 error inside a select, as it is outside.
 
 Equality (`==`) and inequality (`!=`) between a non-null symbol and a

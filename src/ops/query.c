@@ -16990,9 +16990,70 @@ static int col_refs_add(int64_t* out_syms, int max_out, int n, int64_t want) {
  * entries) up to `max_out`; returns the new count.  Used to determine
  * the subset of input columns the rest of a (select ...) clause actually
  * touches, so a prefilter materialise can skip everything else. */
+/* Nested selects the column walk is inside, innermost last (#1567,
+ * #1568).  A nested select binds its own table's columns, and its outputs
+ * as aliases, after the outer query's, so at run time a name it holds of
+ * either kind is the inner one, whatever the outer table holds; any other
+ * name falls through to what the select itself sees, the outer columns
+ * included (a correlated reference).  The walk follows that: only a
+ * nested select whose from: is a global table is entered with its scope;
+ * one whose table the planner cannot see is walked as before. */
+static const int64_t* select_clause_ids(void);
+static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+typedef struct { ray_t* dict; ray_t* table; bool aliases; } nested_scope_t;
+static _Thread_local nested_scope_t g_nested_scope[8];
+static _Thread_local int g_nested_scope_n;
+
+static bool nested_scope_shadows(int64_t sym) {
+    for (int i = g_nested_scope_n - 1; i >= 0; i--) {
+        if (tbl_has_col(g_nested_scope[i].table, sym)) return true;
+        /* its outputs are aliases only within its outputs: where:, by: and
+         * from: do not see them, so a name there is a correlated one */
+        if (!g_nested_scope[i].aliases) continue;
+        ray_t* keys = ray_dict_keys(g_nested_scope[i].dict);
+        if (keys && keys->type == RAY_SYM)
+            for (int64_t k = 0; k < keys->len; k++)
+                if (sym_cell_runtime_id(keys, k) == sym && !select_clause_key(select_clause_ids(), sym))
+                    return true;
+    }
+    return false;
+}
+
+static bool query_inline_pure(ray_t* expr, int depth);
+static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
+                                 int max_out, int n, bool sym_vecs_data);
+
+/* The table a nested select (select D) reads, when the planner can tell it
+ * without running user code: from: names a table (a global, a parameter or
+ * a let; not a column of the outer table `tbl`), or is an expression of
+ * pure builtins over such names that reads no column of `tbl`, evaluated
+ * here to learn its columns.  A new reference, or NULL. */
+static ray_t* nested_select_table(ray_t* d, ray_t* tbl) {
+    ray_t* from = dict_get(d, "from");
+    if (!from) return NULL;
+    if (from->type == -RAY_SYM) {
+        if ((from->attrs & ATTR_QUOTED) || nested_scope_shadows(from->i64) ||
+            (!ray_env_has_lexical_local(from->i64) && tbl_has_col(tbl, from->i64))) return NULL;
+        ray_t* v = ray_env_get(from->i64);
+        if (!v || v->type != RAY_TABLE) return NULL;
+        ray_retain(v);
+        return v;
+    }
+    if (from->type != RAY_LIST || (from->attrs & ATTR_QUOTED) || !query_inline_pure(from, 0)) return NULL;
+    int64_t ref;
+    if (collect_col_refs_walk(from, tbl, &ref, 1, 0, true) != 0) return NULL;
+    ray_t* v = ray_eval(from);
+    if (!v) return NULL;
+    if (RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    if (v->type != RAY_TABLE) { ray_release(v); return NULL; }
+    return v;
+}
+
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
                                  int max_out, int n, bool sym_vecs_data) {
     if (!expr || n >= max_out) return n;
+    if (expr->type == -RAY_SYM && g_nested_scope_n > 0 && nested_scope_shadows(expr->i64))
+        return n;                              /* the nested select's own name */
     if (expr->type == -RAY_SYM) {
         if (expr->attrs & ATTR_QUOTED)
             return tbl_has_col(tbl, expr->i64)
@@ -17014,6 +17075,40 @@ static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
             !(elems[0]->attrs & ATTR_QUOTED) &&
             elems[0]->i64 == ray_sym_intern("quote", 5))
             return n;
+        /* (select D) with a table the planner sees: D's clauses in its
+         * scope, from: in the enclosing one */
+        if (cnt == 2 && elems[0] && elems[0]->type == -RAY_SYM && !(elems[0]->attrs & ATTR_QUOTED) &&
+            elems[1] && elems[1]->type == RAY_DICT && g_nested_scope_n < 8 &&
+            !tbl_has_col(tbl, elems[0]->i64) && !ray_env_has_lexical_local(elems[0]->i64)) {
+            ray_t* hs = ray_sym_str(elems[0]->i64);
+            ray_t* fn = ray_env_get(elems[0]->i64);
+            ray_t* inner = hs && ray_str_len(hs) == 6 && memcmp(ray_str_ptr(hs), "select", 6) == 0 &&
+                           fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY
+                         ? nested_select_table(elems[1], tbl) : NULL;
+            if (inner) {
+                ray_t* d = elems[1];
+                ray_t* keys = ray_dict_keys(d);
+                ray_t* vals = ray_dict_vals(d);
+                int64_t from_id = select_clause_ids()[0];
+                n = collect_col_refs_walk(dict_get(d, "from"), tbl, out_syms, max_out, n, sym_vecs_data);
+                int top = g_nested_scope_n;
+                g_nested_scope[top].dict = d;
+                g_nested_scope[top].table = inner;
+                g_nested_scope_n++;
+                const int64_t* rid = select_clause_ids();
+                if (keys && keys->type == RAY_SYM && vals && vals->type == RAY_LIST)
+                    for (int64_t i = 0; i < ray_dict_len(d) && n < max_out; i++) {
+                        int64_t kid = sym_cell_runtime_id(keys, i);
+                        if (kid == from_id) continue;
+                        g_nested_scope[top].aliases = !select_clause_key(rid, kid);
+                        n = collect_col_refs_walk(((ray_t**)ray_data(vals))[i], tbl, out_syms,   /* not-a-table */
+                                                  max_out, n, sym_vecs_data);
+                    }
+                g_nested_scope_n--;
+                ray_release(inner);
+                return n;
+            }
+        }
         for (int64_t i = 0; i < cnt && n < max_out; i++)
             n = collect_col_refs_walk(elems[i], tbl, out_syms, max_out, n, sym_vecs_data);
         return n;
