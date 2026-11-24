@@ -8,12 +8,27 @@ Arithmetic operations work on scalars and auto-map element-wise over vectors. Nu
 
 ### Result types { #result-types }
 
-`+`, `-`, `*`, `div`, `%` and the two-argument `min` and `max` take their result type from one promotion table. It depends only on the two operand types, so swapping the operands, or passing atoms, vectors or `select` / `update` columns, gives the same type:
+`+`, `-`, `*`, `div`, `%` and the two-argument `min` and `max` take their result type from one promotion table. It depends only on the two operand types, so swapping the operands gives the same type, and so does every way of evaluating the call: atoms, vectors, an atom beside a vector, and columns in `select`, `select` with `where:`, `select` with `by:` (each group's vector), `update` and `update` with `by:`.
 
-- the order is b8 < u8 < i16 < i32 < i64 < f32 < f64, and the wider type wins;
-- two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and both vector and indexed reads report it as null even if neither input contains a null (see the types guide);
-- f32 with any other type is f64;
-- two b8 operands give i64 for `+ - * div %` and b8 for `min` and `max`.
+| left \ right | b8 | u8 | i16 | i32 | i64 | f32 | f64 |
+|---|---|---|---|---|---|---|---|
+| **b8**  | i64 | u8  | i16 | i32 | i64 | f64 | f64 |
+| **u8**  | u8  | u8  | i16 | i32 | i64 | f64 | f64 |
+| **i16** | i16 | i16 | i16 | i32 | i64 | f64 | f64 |
+| **i32** | i32 | i32 | i32 | i32 | i64 | f64 | f64 |
+| **i64** | i64 | i64 | i64 | i64 | i64 | f64 | f64 |
+| **f32** | f64 | f64 | f64 | f64 | f64 | f32 | f64 |
+| **f64** | f64 | f64 | f64 | f64 | f64 | f64 | f64 |
+
+Atoms report the lowercase name (`'i32`), vectors and columns the uppercase one (`'I32`). Read it as three rules:
+
+- among the integers, b8 < u8 < i16 < i32 < i64 and the wider type wins;
+- f32 stays f32 only beside another f32. f32 with any other type, an integer of any width included, is f64: `(+ (as 'F32 [1 2]) 1)` is an `F64` vector, so an integer operand is never rounded to f32 precision. f64 with anything is f64;
+- two b8 operands give i64 for `+ - * div %` (the cell above) and b8 for `min` and `max`; every other cell is the same for all seven verbs.
+
+Two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and both vector and indexed reads report it as null even if neither input contains a null (see the [types guide](../guides/types.md#implicit-coercion)).
+
+Because `update` keeps a column's type, the f64 that f32 with an integer gives does not go back into an f32 column: `(update {f: (+ f 1) from: t})` over an `F32` column `f` is a `type` error. Add an f32 literal, `(+ f 1e)`, or cast the result with `as 'F32` (see [Column types](../queries/select.md#column-types)).
 
 `/`, `pow` and the math functions below always return f64.
 
@@ -23,6 +38,8 @@ Arithmetic operations work on scalars and auto-map element-wise over vectors. Nu
 (type (min 2h 3i))            ; 'i32
 (type (div [7i] [2h]))        ; 'I32
 (type (+ (as 'F32 2.5) 1))    ; 'f64
+(type (+ (as 'F32 [1 2]) 1))  ; 'F64
+(type (+ 1e 2e))              ; 'f32
 (+ true true)                 ; 2
 ```
 
