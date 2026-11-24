@@ -4809,12 +4809,15 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
         { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))", 5 },
         { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))", 2 },
         { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
-        /* not an operand: a bare conjunct, under a logic head, in by: */
+        /* not an operand: a bare conjunct, under a logic head */
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) qty 0))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) act side))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
-        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
+        /* a by: key computing an if reads only its row (#1604, after #1605);
+         * one whose branches have two types stays declined */
+        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", true, NULL, 2 },
+        { "by: {k: (if (> px 1.0) 1 0.5)} n: (count qty)", false, NULL, 2 },
     };
     for (int gen = 0; gen < 2; gen++) {
         char root[256], sym_path[512];
