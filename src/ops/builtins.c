@@ -2610,6 +2610,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     ray_release(parsed);
     ray_release(nfo);
     ray_free_raw(buf);
+    ray_eval_request_end();   /* a no-op when loaded from a running request */
     return result;
 #else
     /* Every failure names the file and the OS cause: a bare `io` from a
@@ -2652,6 +2653,7 @@ ray_t* ray_load_file_fn(ray_t* path_obj) {
     ray_release(parsed);
     ray_release(nfo);
     ray_free_raw(buf);
+    ray_eval_request_end();   /* a no-op when loaded from a running request */
     return result;
 #endif
 }

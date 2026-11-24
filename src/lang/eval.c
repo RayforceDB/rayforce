@@ -3346,6 +3346,8 @@ static _Thread_local closure_tmpl_t g_closure_tmpl[CLOSURE_TMPL_SLOTS];
 static _Thread_local uint32_t g_closure_tmpl_next;
 static _Thread_local uint64_t g_closure_tmpl_epoch;
 static _Thread_local int64_t g_closure_tmpl_bytes;   /* sum of the entries' bytes */
+static _Thread_local uint32_t g_closure_tmpl_made;   /* entries made since the last
+                                                      * request-end sweep */
 
 static void closure_tmpl_drop(closure_tmpl_t* e) {
     g_closure_tmpl_bytes -= e->bytes;
@@ -3365,6 +3367,7 @@ static void closure_tmpl_reset(void) {
     g_closure_tmpl_next = 0;
     g_closure_tmpl_epoch = 0;
     g_closure_tmpl_bytes = 0;
+    g_closure_tmpl_made = 0;
 }
 
 /* Another thread's table after the runtime it filled it under was
@@ -3374,6 +3377,7 @@ static void closure_tmpl_forget(void) {
     memset(g_closure_tmpl, 0, sizeof g_closure_tmpl);
     g_closure_tmpl_next = 0;
     g_closure_tmpl_bytes = 0;
+    g_closure_tmpl_made = 0;
 }
 
 /* An entry is dead once the table alone holds its literal's parameter
@@ -3383,8 +3387,8 @@ static void closure_tmpl_forget(void) {
  * cannot be hit.  It would still pin its template, and through it the
  * nfo of that text: a request's whole source and a span record per node,
  * which the entry's bytes do not count.  Dead entries go before a new
- * entry is made and when a ray_eval_str request ends, so they never
- * pile up behind live ones. */
+ * entry is made and when a top-level request ends (ray_eval_request_end),
+ * so they never pile up behind live ones. */
 static void closure_tmpl_sweep(void) {
     if (g_closure_tmpl_epoch != ray_sym_epoch()) return;   /* not this runtime's */
     for (int i = 0; i < CLOSURE_TMPL_SLOTS; i++) {
@@ -3393,6 +3397,57 @@ static void closure_tmpl_sweep(void) {
         uint32_t held = 1 + (e->tmpl && LAMBDA_PARAMS(e->tmpl) == e->params);
         if (ray_atomic_load(&e->params->rc) <= held) closure_tmpl_drop(e);
     }
+}
+
+/* A top-level request (a ray_eval_str string, a REPL line, a script file,
+ * an IPC message) has ended and released its text: the entries its
+ * literals made are dead unless a function that outlives it holds them.
+ * A request that made no entry leaves nothing to sweep, so it pays for
+ * no scan of the table.  An entry another request's rebinding left dead
+ * goes at the next sweep, which the next new entry makes in any case.
+ * Inside an evaluation (a nested load or string eval) the enclosing
+ * request still holds its text, and its own end sweeps. */
+void ray_eval_request_end(void) {
+    if (!__VM || __VM->eval_depth > 0 || !g_closure_tmpl_made) return;
+    g_closure_tmpl_made = 0;
+    closure_tmpl_sweep();
+}
+
+/* Is any of a literal's body nodes recorded in `nfo`? */
+static bool nfo_records_literal(ray_t* nfo, ray_t* body) {
+    if (!nfo) return false;
+    ray_t** bn = (ray_t**)ray_data(body);
+    for (int64_t k = 0; k < body->len; k++)
+        if (ray_nfo_get(nfo, bn[k]).id) return true;
+    return false;
+}
+
+/* The nfo a literal's nodes were recorded in, for an entry that outlives
+ * the request evaluating it: that request's when it parsed them (the
+ * lambda's own nfo), else the function the tree walker is running the
+ * literal in (bound as `self`), else none.  A long-lived function's inner
+ * literal first evaluated by a large request would otherwise pin that
+ * request's source and span records for as long as the entry lives,
+ * though they record none of its nodes.  Looked up once per new entry,
+ * next to a compile that looks up every node. */
+static ray_t* literal_nfo(ray_t* lambda) {
+    ray_t* body = LAMBDA_BODY(lambda);
+    ray_t* own = LAMBDA_NFO(lambda);
+    if (nfo_records_literal(own, body)) return own;
+    if (g_call_self_sym < 0) g_call_self_sym = ray_sym_intern("self", 4);
+    ray_t* self = ray_env_get_local(g_call_self_sym);
+    if (self && self != lambda && self->type == RAY_LAMBDA && LAMBDA_NFO(self) != own &&
+        nfo_records_literal(LAMBDA_NFO(self), body))
+        return LAMBDA_NFO(self);
+    return NULL;
+}
+
+/* Give `lambda` the nfo `nfo` (NULL for none) in place of its own. */
+static void lambda_set_nfo(ray_t* lambda, ray_t* nfo) {
+    if (LAMBDA_NFO(lambda) == nfo) return;
+    if (nfo) ray_retain(nfo);
+    if (LAMBDA_NFO(lambda)) ray_release(LAMBDA_NFO(lambda));
+    LAMBDA_NFO(lambda) = nfo;
 }
 
 /* Does `closure`'s capture set, filtered by the entry's mentioned symbols,
@@ -3421,6 +3476,10 @@ static void closure_share_from(ray_t* lambda, ray_t* tmpl) {
     if (LAMBDA_BC(tmpl))     { ray_retain(LAMBDA_BC(tmpl));     LAMBDA_BC(lambda)     = LAMBDA_BC(tmpl); }
     if (LAMBDA_CONSTS(tmpl)) { ray_retain(LAMBDA_CONSTS(tmpl)); LAMBDA_CONSTS(lambda) = LAMBDA_CONSTS(tmpl); }
     if (LAMBDA_DBG(tmpl))    { ray_retain(LAMBDA_DBG(tmpl));    LAMBDA_DBG(lambda)    = LAMBDA_DBG(tmpl); }
+    /* The spans in the shared debug table are the template's nfo's: an
+     * error in this lambda reports them against that text, and the lambda
+     * does not hold the text of whichever request evaluated it. */
+    lambda_set_nfo(lambda, LAMBDA_NFO(tmpl));
     LAMBDA_NLOCALS(lambda) = LAMBDA_NLOCALS(tmpl);
     lambda->attrs |= RAY_FN_COMPILED;
 }
@@ -3476,7 +3535,8 @@ static void closure_share_template(ray_t* lambda) {
     memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*));
     ray_retain(params); LAMBDA_PARAMS(tmpl) = params;
     ray_retain(body);   LAMBDA_BODY(tmpl) = body;
-    if (LAMBDA_NFO(lambda)) { ray_retain(LAMBDA_NFO(lambda)); LAMBDA_NFO(tmpl) = LAMBDA_NFO(lambda); }
+    ray_t* nfo = literal_nfo(lambda);
+    if (nfo) { ray_retain(nfo); LAMBDA_NFO(tmpl) = nfo; }
     /* A closure body: its free names resolve when it runs, as the tree
      * walker resolves them, so one template serves every closure of the
      * literal whatever is rebound in between. */
@@ -3505,6 +3565,7 @@ static void closure_share_template(ray_t* lambda) {
     g_closure_tmpl_bytes += weight;
     e->names = names;   /* owned, may be NULL */
     e->tmpl = tmpl;     /* owned, NULL when failed */
+    g_closure_tmpl_made++;
     if (compiled) closure_share_from(lambda, tmpl);
 }
 
@@ -3552,6 +3613,8 @@ static void definition_compile(ray_t* lambda) {
         ray_compile(lambda);
         return;
     }
+    /* The entry keeps this lambda as its template, nfo and all. */
+    lambda_set_nfo(lambda, literal_nfo(lambda));
     ray_t* deps = NULL;
     if (!ray_compile_definition(lambda, &deps)) { ray_release(mentioned); return; }
     closure_tmpl_sweep();
@@ -3567,6 +3630,7 @@ static void definition_compile(ray_t* lambda) {
     g_closure_tmpl_bytes += weight;
     ray_retain(lambda); e->tmpl = lambda;   /* its bytecode is the template's */
     e->deps = deps;             /* owned */
+    g_closure_tmpl_made++;
 }
 
 /* Compile a lambda on its first call (see lambda_wants_compile). */
@@ -6495,7 +6559,7 @@ ray_t* ray_eval_str(const char* source) {
 
     ray_release(parsed);
     ray_release(nfo);
-    closure_tmpl_sweep();   /* the request's literals are gone with its text */
+    ray_eval_request_end();   /* the request's literals are gone with its text */
     /* ray_eval_str is the public top-level boundary — materialise any lazy
      * chain before returning to callers who expect a concrete value. */
     if (ray_is_lazy(result))

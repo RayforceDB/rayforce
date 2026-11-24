@@ -274,6 +274,11 @@ int  ray_eval_is_interrupted(void);
 int  ray_eval_depth(void);
 
 /* Return the current eval context's nfo (source location) object, or NULL. */
+/* A top-level request has ended and released its parsed text: sweep the
+ * closure templates its literals made (a no-op inside an evaluation, or
+ * when the request made none).  Every entry point that parses and
+ * evaluates text, or evaluates a received object, calls it. */
+void   ray_eval_request_end(void);
 ray_t* ray_eval_get_nfo(void);
 void   ray_eval_set_nfo(ray_t* nfo);
 
