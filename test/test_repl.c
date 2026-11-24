@@ -50,6 +50,10 @@
 #include "core/platform.h"
 #include "core/pool.h"      /* ray_pool_default_total: the -c warning test */
 #include "core/runtime.h"
+#include "lang/eval.h"     /* ray_get_error_trace: the parse error frame */
+#include "lang/nfo.h"      /* ray_span_t */
+#include "lang/parse.h"    /* ray_parse: the parse error frame out of memory */
+#include "mem/heap.h"       /* ray_alloc_fail_set_for_test: frame building out of memory */
 #include "store/serde.h"   /* RAY_SERDE_WIRE_VERSION: the listen probe */
 #include "mem/sys.h"
 
@@ -313,6 +317,208 @@ static int run_file_capture_stderr(char* out, size_t cap) {
     out[n] = '\0';
     unlink(path);
     return rc;
+}
+
+/* A parse error is reported where it is, with the source snippet an
+ * evaluation error has (#1563): a script file, a file it loads, text given
+ * to ray_eval_str and the `parse` builtin.  The error kind and message are
+ * the parser's own. */
+static bool parse_frame_at(int line, int col) {
+    ray_t* tr = ray_get_error_trace();
+    if (!tr || ray_len(tr) < 1) return false;
+    ray_t* fr = ((ray_t**)ray_data(tr))[0];
+    if (!fr || fr->type != RAY_LIST || ray_len(fr) < 4) return false;
+    ray_t** fe = (ray_t**)ray_data(fr);
+    ray_span_t span;
+    span.id = fe[0] ? fe[0]->i64 : 0;
+    return span.start_line == line && span.start_col == col &&
+           fe[2] && ray_str_len(fe[2]) == 5 && memcmp(ray_str_ptr(fe[2]), "parse", 5) == 0;
+}
+
+static test_result_t test_repl_run_file_parse_error_location(void) {
+    char out[8192];
+    const char* body = "(set a 1)\n(set b 2)\n(set c [a 20])\n(set d 4)\n";
+
+    /* a script file: file, line and column of the literal */
+    TEST_ASSERT_EQ_I(write_rfl(body), 0);
+    int rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    char want[200];
+    snprintf(want, sizeof want, "%s:3:8]", tmp_rfl_path());
+    TEST_ASSERT_FMT(strstr(out, want) != NULL, "no %s in: %.300s", want, out);
+    TEST_ASSERT_NOT_NULL(strstr(out, "3 \xe2\x94\x82 (set c [a 20])"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "domain: parse: vector literal mixes incompatible element types"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "in parse"));
+
+    /* a file loaded from a script: the loaded file's position */
+    char inner[96], outer[200];
+    snprintf(inner, sizeof inner, "/tmp/ray_test_repl_inner_%d.rfl", (int)getpid());
+    FILE* f = fopen(inner, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs(body, f);
+    fclose(f);
+    snprintf(outer, sizeof outer, "(load \"%s\")\n", inner);
+    TEST_ASSERT_EQ_I(write_rfl(outer), 0);
+    rc = run_file_capture_stderr(out, sizeof out);
+    unlink(inner);
+    unlink_rfl();
+    TEST_ASSERT_EQ_I(rc, 1);
+    snprintf(want, sizeof want, "%s:3:8]", inner);
+    TEST_ASSERT_FMT(strstr(out, want) != NULL, "no %s in: %.300s", want, out);
+
+    /* text with no file (ray_eval_str, which the REPL's API and IPC use):
+     * line 1 column 8 of that text */
+    ray_clear_error_trace();
+    ray_t* r = ray_eval_str("(set c [a 20])");
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(strcmp(ray_err_code(r), "domain"), 0);
+    ray_error_free(r);
+    TEST_ASSERT_TRUE(parse_frame_at(0, 7));
+    ray_clear_error_trace();
+
+    /* the parse builtin: the position within the text it was given */
+    r = ray_eval_str("(parse \"(set a 1)\\n(set c [a 20])\")");
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    TEST_ASSERT_TRUE(parse_frame_at(1, 7));
+    ray_clear_error_trace();
+    PASS();
+}
+
+/* The marker sits under the failing character, whatever comes before it
+ * on its line (#1563): the header counts characters (a tab is one), and
+ * the marker line echoes the line's tabs and pads every other character by
+ * the cells it takes, so tabs and wide characters keep it aligned.  The
+ * renderer is shared, so an evaluation error lines up the same way. */
+static test_result_t test_repl_run_file_error_caret_alignment(void) {
+    static const struct { const char* body; const char* where; const char* marker; } cases[] = {
+        /* a two-byte character before the literal: column 11, not 12 */
+        { "(list \"\xc3\xa9\" [a 20])\n", ":1:11]",
+          "\xe2\x94\x82           \xe2\x96\xb2" },
+        /* a leading tab: echoed, so the marker meets the `[` at any tab width */
+        { "\t(set c [a 20])\n", ":1:9]",
+          "\xe2\x94\x82 \t       \xe2\x96\xb2" },
+        /* two wide characters, two cells each */
+        { "(list \"\xe6\x97\xa5\xe6\x9c\xac\" [a 20])\n", ":1:12]",
+          "\xe2\x94\x82              \xe2\x96\xb2" },
+        /* a wide emoji (U+1F680): two cells */
+        { "(list \"\xf0\x9f\x9a\x80\" [a 20])\n", ":1:11]",
+          "\xe2\x94\x82            \xe2\x96\xb2" },
+        /* a combining mark (U+0483 after U+0430): a character, no cell */
+        { "(list \"\xd0\xb0\xd2\x83\" [a 20])\n", ":1:12]",
+          "\xe2\x94\x82           \xe2\x96\xb2" },
+        /* an accent by combining (e, U+0301): the same */
+        { "(list \"e\xcc\x81\" [a 20])\n", ":1:12]",
+          "\xe2\x94\x82           \xe2\x96\xb2" },
+        /* an evaluation error after the emoji, and after the combining mark */
+        { "(set f (fn [x] (+ x 'a)))\n(list \"\xf0\x9f\x9a\x80\" (f 1))\n", ":2:11]",
+          "\xe2\x94\x82            \xe2\x96\xb2" },
+        { "(set f (fn [x] (+ x 'a)))\n(list \"\xd0\xb0\xd2\x83\" (f 1))\n", ":2:12]",
+          "\xe2\x94\x82           \xe2\x96\xb2" },
+        /* an evaluation error, a tab and wide characters before the call */
+        { "(set f (fn [x] (+ x 'a)))\n\t(list \"\xe6\x97\xa5\xe6\x9c\xac\" (f 1))\n", ":2:13]",
+          "\xe2\x94\x82 \t             \xe2\x96\xb2" },
+    };
+    char out[8192], want[200];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST_ASSERT_EQ_I(write_rfl(cases[i].body), 0);
+        int rc = run_file_capture_stderr(out, sizeof out);
+        TEST_ASSERT_EQ_I(rc, 1);
+        snprintf(want, sizeof want, "%s%s", tmp_rfl_path(), cases[i].where);
+        TEST_ASSERT_FMT(strstr(out, want) != NULL, "case %d: no %s in: %.600s", (int)i, want, out);
+        TEST_ASSERT_FMT(strstr(out, cases[i].marker) != NULL, "case %d: marker misplaced in: %.600s",
+                        (int)i, out);
+    }
+    unlink_rfl();
+    PASS();
+}
+
+/* A position past what the span's 16-bit fields hold keeps its location
+ * (#1563): the parse frame carries the failing byte's offset.  A line of
+ * 70000 spaces before the literal reports column 70001, with a window of
+ * the line around it; a literal on line 70001 reports that line. */
+static test_result_t test_repl_run_file_parse_error_long_source(void) {
+    size_t n = 70000;
+    char* body = malloc(n + 16);
+    TEST_ASSERT_NOT_NULL(body);
+    char out[8192], want[200];
+
+    memset(body, ' ', n);
+    strcpy(body + n, "[a 20]\n");
+    TEST_ASSERT_EQ_I(write_rfl(body), 0);
+    int rc = run_file_capture_stderr(out, sizeof out);
+    TEST_ASSERT_EQ_I(rc, 1);
+    snprintf(want, sizeof want, "%s:1:70001]", tmp_rfl_path());
+    TEST_ASSERT_FMT(strstr(out, want) != NULL, "no %s in: %.600s", want, out);
+    TEST_ASSERT_NOT_NULL(strstr(out, "1 \xe2\x94\x82 ...      "));
+    TEST_ASSERT_NOT_NULL(strstr(out, "  [a 20]\n"));
+    TEST_ASSERT_NOT_NULL(strstr(out, "domain: parse: vector literal mixes incompatible element types"));
+    TEST_ASSERT_TRUE(strlen(out) < 2000);   /* a window of the line, not all of it */
+
+    memset(body, '\n', n);
+    strcpy(body + n, "(set c [a 20])\n");
+    TEST_ASSERT_EQ_I(write_rfl(body), 0);
+    rc = run_file_capture_stderr(out, sizeof out);
+    free(body);
+    unlink_rfl();
+    TEST_ASSERT_EQ_I(rc, 1);
+    snprintf(want, sizeof want, "%s:70001:8]", tmp_rfl_path());
+    TEST_ASSERT_FMT(strstr(out, want) != NULL, "no %s in: %.600s", want, out);
+    TEST_ASSERT_NOT_NULL(strstr(out, "70001 \xe2\x94\x82 (set c [a 20])"));
+    PASS();
+}
+
+/* Out of memory while the parse frame is built (#1563): the frame is best
+ * effort.  Every allocation after the parse error is failed in turn, from
+ * the text's own nfo (the `parse` path has none) to the frame and the
+ * trace: the parse error comes back with its own kind and message
+ * (ray_err_msg: the error owns it, #1214), any allocation error is freed,
+ * and nothing is left allocated. */
+static size_t repl_heap_bytes(void) {
+    ray_mem_stats_t s;
+    ray_mem_stats(&s);
+    return s.bytes_allocated;
+}
+
+static test_result_t test_repl_parse_error_frame_oom(void) {
+#ifndef DEBUG
+    SKIP("needs the DEBUG allocation-failure seam");
+#else
+    const char* src = "(set c [a 20])";
+    ray_clear_error_trace();
+    ray_t* r = ray_parse(src);   /* interns the symbols, and the reference message */
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    char msg[256];
+    TEST_ASSERT_NOT_NULL(ray_err_msg(r));
+    snprintf(msg, sizeof msg, "%s", ray_err_msg(r));
+    ray_error_free(r);
+    ray_clear_error_trace();
+
+    int dropped = 0, built = 0;
+    for (int64_t nth = 1; nth < 1000 && !built; nth++) {
+        ray_error_clear();
+        size_t before = repl_heap_bytes();
+        ray_alloc_fail_set_for_test(nth, 1 << 20);
+        r = ray_parse(src);
+        ray_alloc_fail_set_for_test(0, 0);
+        TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+        if (strcmp(ray_err_code(r), "domain") == 0) {
+            TEST_ASSERT_FMT(ray_err_msg(r) && strcmp(ray_err_msg(r), msg) == 0,
+                            "nth %d: message %s", (int)nth,
+                            ray_err_msg(r) ? ray_err_msg(r) : "(none)");
+            ray_t* tr = ray_get_error_trace();
+            if (tr && ray_len(tr) > 0) built = 1;
+            else dropped++;
+        }
+        ray_error_free(r);
+        ray_clear_error_trace();
+        TEST_ASSERT_FMT(repl_heap_bytes() == before, "nth %d: %d bytes left", (int)nth,
+                        (int)(repl_heap_bytes() - before));
+    }
+    TEST_ASSERT_TRUE(built);
+    TEST_ASSERT_TRUE(dropped > 0);
+    PASS();
+#endif
 }
 
 /* An uncaught (raise x) prints x after the error code, on the plain path
@@ -3187,6 +3393,10 @@ const test_entry_t repl_entries[] = {
     { "repl/run_file/happy",            test_repl_run_file_happy,            repl_setup, repl_teardown },
     { "repl/run_file/multi_form",       test_repl_run_file_multi_form,       repl_setup, repl_teardown },
     { "repl/run_file/parse_error",      test_repl_run_file_parse_error,      repl_setup, repl_teardown },
+    { "repl/run_file/parse_error_location", test_repl_run_file_parse_error_location, repl_setup, repl_teardown },
+    { "repl/run_file/error_caret_alignment", test_repl_run_file_error_caret_alignment, repl_setup, repl_teardown },
+    { "repl/run_file/parse_error_long_source", test_repl_run_file_parse_error_long_source, repl_setup, repl_teardown },
+    { "repl/parse_error_frame_oom", test_repl_parse_error_frame_oom, repl_setup, repl_teardown },
     { "repl/run_file/eval_error",       test_repl_run_file_eval_error,       repl_setup, repl_teardown },
     { "repl/run_file/raise_prints_value", test_repl_run_file_raise_prints_value, repl_setup, repl_teardown },
     { "repl/run_file/empty",            test_repl_run_file_empty,            repl_setup, repl_teardown },
