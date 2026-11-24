@@ -65,6 +65,10 @@ typedef struct {
     int32_t  trap_depth;  /* open OP_TRAP frames in current lambda */
     int32_t  depth;       /* expression nesting; past the guard the lambda is
                            * left to the tree walker rather than the C stack */
+    ray_t   *if_sites;    /* RAY_LIST of (if AST, locals vector) pairs, one per `if` site,
+                           * appended to the pool last (OP_IFTREE) */
+    ray_t   *if_syms;     /* the locals vector the last site used: shared by the sites
+                           * that see the same locals */
     ray_t   *deps;        /* when set (an I64 vector): every call head looked
                            * up at compile time and the builtin it named (0
                            * for anything else), the bindings the bytecode
@@ -98,6 +102,8 @@ static void compiler_destroy(compiler_t *c) {
     for (int32_t i = 0; i < c->n_consts; i++)
         if (c->consts[i]) ray_release(c->consts[i]);
     ray_release(c->consts_obj);
+    if (c->if_sites) ray_release(c->if_sites);
+    if (c->if_syms) ray_release(c->if_syms);
     if (c->cindex_obj) ray_release(c->cindex_obj);
     ray_release(c->code_obj);
     if (c->deps) { ray_release(c->deps); c->deps = NULL; }
@@ -290,6 +296,16 @@ static void write_jump_offset(compiler_t *c, int32_t pos, int32_t target) {
     c->code[pos + 1] = (uint8_t)(offset & 0xFF);
 }
 
+/* The same for an operand whose displacement counts from `base`, the end of
+ * its instruction (OP_JMPFV carries two offsets). */
+static void write_jump_offset_from(compiler_t *c, int32_t pos, int32_t base, int32_t target) {
+    int32_t raw = target - base;
+    if (raw > 32767 || raw < -32768) { c->error = true; return; }
+    int16_t offset = (int16_t)raw;
+    c->code[pos]     = (uint8_t)((uint16_t)offset >> 8);
+    c->code[pos + 1] = (uint8_t)(offset & 0xFF);
+}
+
 /* Resolve a forward jump emitted earlier, now that its target is here. */
 static void patch_jump(compiler_t *c, int32_t pos) {
     write_jump_offset(c, pos, c->code_len);
@@ -379,7 +395,7 @@ static bool ast_refs_locals(compiler_t *c, ray_t *ast) {
  * jumps to the end of the chain.  Recursing per pair keeps every end jump
  * local to its own frame.  No fallback: the chain yields 0, matching
  * ray_cond_fn. */
-static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
+static void compile_if_chain(compiler_t *c, ray_t *ast, ray_t **args, int64_t nargs) {
     if (nargs == 1) { compile_expr(c, args[0]); return; }
     if (nargs == 0) {
         ray_t *zero = ray_alloc(0);
@@ -396,48 +412,55 @@ static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
     emit(c, OP_FORCE);
     /* A boolean-vector condition chooses per row, which needs every arm
      * evaluated.  It leaves for the tree walker's `if` (OP_IFTREE) with the
-     * chain's remaining forms, so both engines share one implementation and
-     * no arm is compiled twice.  Any other condition takes the lazy jumps. */
-    int32_t jmpvec_pos = -1, forms_idx = -1;
-    if (nargs <= 63) {
-        /* The window binds every local: the path runs only for a vector
-         * condition, and asking which locals the forms mention would walk
-         * their whole subtree at every nesting level. */
-        int32_t nsyms = c->n_locals;
-        ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+     * chain as the AST holds it, so both engines share one implementation
+     * and no arm is compiled twice.  Any other condition takes the lazy
+     * jumps.  The site records the AST node and the locals to bind; both
+     * are shared or already at hand, so the scalar path pays one jump. */
+    int64_t start = args - (ray_t **)ray_data(ast);
+    if (start > 255) { c->error = true; return; }
+    int64_t k = c->if_sites ? c->if_sites->len / 2 : 0;
+    if (k > 0xFFFF) { c->error = true; return; }
+    int32_t nsyms = c->n_locals;
+    ray_t *syms = c->if_syms;
+    bool same = syms && syms->len == nsyms;
+    for (int32_t i = 0; same && i < nsyms; i++)
+        same = ((int64_t *)ray_data(syms))[i] == c->locals[i].sym_id;
+    if (!same) {
+        syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
         if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
         syms->type = RAY_I64;
         syms->len = nsyms;
-        int64_t *ids = (int64_t*)ray_data(syms);
-        for (int32_t i = 0; i < nsyms; i++) ids[i] = c->locals[i].sym_id;
-        ray_t *forms = ray_list_new(nargs);
-        if (forms && !RAY_IS_ERR(forms)) forms = ray_list_append(forms, syms);
-        ray_release(syms);
-        for (int64_t i = 1; forms && !RAY_IS_ERR(forms) && i < nargs; i++)
-            forms = ray_list_append(forms, args[i]);
-        if (!forms || RAY_IS_ERR(forms)) { c->error = true; return; }
-        forms_idx = add_constant(c, forms);
-        ray_release(forms);
-        if (c->error) return;
-        jmpvec_pos = emit_jump(c, OP_JMPVEC);
+        for (int32_t i = 0; i < nsyms; i++)
+            ((int64_t *)ray_data(syms))[i] = c->locals[i].sym_id;
+        if (c->if_syms) ray_release(c->if_syms);
+        c->if_syms = syms;   /* the compiler's reference; the table retains its own */
     }
-    int32_t jmpf_pos = emit_jump(c, OP_JMPF);
+    if (!c->if_sites) {
+        c->if_sites = ray_list_new(8);
+        if (!c->if_sites || RAY_IS_ERR(c->if_sites)) { c->if_sites = NULL; c->error = true; return; }
+    }
+    ray_t *grown = ray_list_append(c->if_sites, ast);
+    if (grown && !RAY_IS_ERR(grown)) { c->if_sites = grown; grown = ray_list_append(c->if_sites, syms); }
+    if (!grown || RAY_IS_ERR(grown)) { c->error = true; return; }
+    c->if_sites = grown;
+
+    emit(c, OP_JMPFV);
+    int32_t jmpf_pos = c->code_len;
+    emit(c, 0); emit(c, 0); emit(c, 0); emit(c, 0);
     compile_expr(c, args[1]);
     int32_t jmp_pos = emit_jump(c, OP_JMP);
-    int32_t iftree_pos = -1;
-    if (jmpvec_pos >= 0) {
-        patch_jump(c, jmpvec_pos);
-        emit(c, OP_IFTREE);
-        emit(c, (uint8_t)((forms_idx >> 8) & 0xFF));
-        emit(c, (uint8_t)(forms_idx & 0xFF));
-        iftree_pos = c->code_len;
-        emit(c, 0);
-        emit(c, 0);
-    }
-    patch_jump(c, jmpf_pos);
-    compile_if_chain(c, args + 2, nargs - 2);
+    write_jump_offset_from(c, jmpf_pos + 2, jmpf_pos + 4, c->code_len);   /* the vector branch is next */
+    emit(c, OP_IFTREE);
+    emit(c, (uint8_t)((k >> 8) & 0xFF));
+    emit(c, (uint8_t)(k & 0xFF));
+    emit(c, (uint8_t)start);
+    int32_t iftree_pos = c->code_len;
+    emit(c, 0);
+    emit(c, 0);
+    write_jump_offset_from(c, jmpf_pos, jmpf_pos + 4, c->code_len);       /* false: the rest of the chain */
+    compile_if_chain(c, ast, args + 2, nargs - 2);
     patch_jump(c, jmp_pos);
-    if (iftree_pos >= 0) write_jump_offset(c, iftree_pos, c->code_len);
+    write_jump_offset(c, iftree_pos, c->code_len);
 }
 
 /* (set name value) — bind in the global env.  Compile the value
@@ -997,7 +1020,7 @@ static void compile_list(compiler_t *c, ray_t *ast) {
 
         if (sym_id == sf_set && n == 3) { compile_sf_set(c, ast, elems, n); return; }
         if (sym_id == sf_let && n == 3) { compile_sf_let(c, ast, elems, n); return; }
-        if (sym_id == sf_if && n >= 3) { compile_if_chain(c, elems + 1, n - 1); return; }
+        if (sym_id == sf_if && n >= 3) { compile_if_chain(c, ast, elems + 1, n - 1); return; }
         if (sym_id == sf_do && n >= 2) { compile_sf_do(c, ast, elems, n); return; }
         if (sym_id == sf_while && n >= 2) { compile_sf_while(c, ast, elems, n); return; }
         if (sym_id == sf_times && n >= 2) { compile_sf_times(c, ast, elems, n); return; }
@@ -1573,6 +1596,12 @@ static bool compile_lambda_deps(ray_t *lambda, ray_t *capnames, bool dynamic_glo
         if (c.dbg_obj) ray_release(c.dbg_obj);
         compiler_destroy(&c);
         return false;
+    }
+
+    /* The `if` sites table is the lambda's last constant (OP_IFTREE). */
+    if (c.if_sites) {
+        add_constant(&c, c.if_sites);
+        if (c.error) { if (c.dbg_obj) ray_release(c.dbg_obj); compiler_destroy(&c); return false; }
     }
 
     /* Build bytecode vector */

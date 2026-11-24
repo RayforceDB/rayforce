@@ -4468,7 +4468,7 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
         [OP_PATHGET]       = &&op_pathget,
-        [OP_JMPVEC]        = &&op_jmpvec,
+        [OP_JMPFV]         = &&op_jmpfv,
         [OP_IFTREE]        = &&op_iftree,
     };
 
@@ -4692,39 +4692,56 @@ op_jmp: {
     DISPATCH();
 }
 
-op_jmpvec: {
-    /* A boolean-vector `if` condition chooses per row: take the branch that
-     * hands the chain to the tree walker (OP_IFTREE).  The condition stays
-     * on the stack for either path. */
-    int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
-    ip += 2;
+op_jmpfv: {
+    /* An `if` condition: a boolean vector chooses per row (OP_IFTREE, the
+     * second offset) and stays on the stack; anything else is OP_JMPF. */
+    int16_t off_false = (int16_t)((code[ip] << 8) | code[ip + 1]);
+    int16_t off_vec = (int16_t)((code[ip + 2] << 8) | code[ip + 3]);
+    ip += 4;
     ray_t *cond = PEEK();
-    if (cond && cond->type == RAY_BOOL) ip += offset;
+    if (cond && cond->type == RAY_BOOL) { ip += off_vec; DISPATCH(); }
+    cond = POP();
+    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
+    int truthy = is_truthy(cond);
+    ray_release(cond);
+    if (!truthy) ip += off_false;
     DISPATCH();
 }
 
 op_iftree: {
-    uint16_t idx = (uint16_t)((code[ip] << 8) | code[ip + 1]);
-    int16_t offset = (int16_t)((code[ip + 2] << 8) | code[ip + 3]);
-    ip += 4;
-    ray_t *forms = cpool[idx];
-    ray_t **fe = (ray_t **)ray_data(forms);
-    ray_t *syms = fe[0];
-    int64_t nf = forms->len - 1;
-    if (nf > 63) goto vm_error;
+    uint16_t site = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    uint8_t start = code[ip + 2];
+    int16_t offset = (int16_t)((code[ip + 3] << 8) | code[ip + 4]);
+    ip += 5;
+    ray_t *pool = LAMBDA_CONSTS(vm.fn);
+    ray_t *table = ((ray_t **)ray_data(pool))[pool->len - 1];
+    ray_t **te = (ray_t **)ray_data(table);
+    ray_t *form = te[2 * (size_t)site];
+    ray_t *syms = te[2 * (size_t)site + 1];
+    ray_t **fe = (ray_t **)ray_data(form);
+    int64_t nargs = form->len - start;   /* the chain: its condition and the rest */
+    ray_t *targs_stack[64];
+    ray_t **targs = targs_stack;
+    ray_t *targs_obj = NULL;
+    if (nargs > 64) {
+        targs_obj = ray_alloc((size_t)nargs * sizeof(ray_t *));
+        if (!targs_obj || RAY_IS_ERR(targs_obj)) { vm_err_obj = ray_error("oom", NULL); goto vm_error; }
+        targs = (ray_t **)ray_data(targs_obj);
+    }
     ray_t *cond = POP();
-    ray_t *targs[64];
     targs[0] = cond;
-    for (int64_t i = 0; i < nf; i++) targs[i + 1] = fe[i + 1];
+    for (int64_t i = 1; i < nargs; i++) targs[i] = fe[start + i];
     /* The window binds the locals for the arms, as OP_SCOPE_EVAL does. */
     if (ray_env_scope_bind((const int64_t*)ray_data(syms), (int32_t)syms->len,
                            &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn) != RAY_OK) {
         ray_release(cond);
+        if (targs_obj) ray_release(targs_obj);
         goto vm_error_limit;
     }
     ray_env_mark_eval_window();
-    ray_t *res = ray_cond_fn(targs, nf + 1);
+    ray_t *res = ray_cond_fn(targs, nargs);
     ray_release(cond);
+    if (targs_obj) ray_release(targs_obj);
     if (!res || RAY_IS_ERR(res)) { vm_err_obj = res ? res : ray_error("oom", NULL); goto vm_error; }
     ray_t *before[256];
     int64_t nsync = syms->len < 256 ? syms->len : 256;

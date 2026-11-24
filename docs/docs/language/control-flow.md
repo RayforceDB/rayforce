@@ -64,6 +64,8 @@ When the condition is a boolean vector, `if` chooses per row, outside a query as
 [0 1 1]
 ```
 
+Both arms are always evaluated, whatever the condition holds, so their side effects happen and an arm that raises raises: `(if (< v 100) v (raise 7))` raises as soon as `v` is a vector, even if no cell is `>= 100`. A boolean vector of length one gives a vector of length one, not an atom: `(if [true] 1 2)` is `[1]`. An empty one gives an empty vector.
+
 The result type follows the promotion `if` has in a query: numbers promote, a temporal beside a number or another temporal type raises `type`. An arm of the wrong length raises `length`, and an arm that is neither a vector nor an atom raises `type`. A vector choice needs its fallback, so `(if [true false] 1)` raises `domain`.
 
 In a chain, a boolean-vector condition chooses per row between its result and the rest of the chain, which is evaluated whole; a later condition that is a single value picks a whole result, as it does alone:
@@ -72,6 +74,8 @@ In a chain, a boolean-vector condition chooses per row between its result and th
 ‣ (if [true false false] [1 2 3] [false true false] [10 20 30] 0)
 [1 20 0]
 ```
+
+Inside a compiled lambda the per-row path runs on the tree walker, so it shares the tree walker's depth limit: about five hundred `if`s nested through their then arms, each with a vector condition, raise `limit`. The same chain with scalar conditions is not affected.
 
 A condition that is a single value, or a vector of another type, is unchanged: it is tested as one truth value and only the arm it takes is evaluated.
 

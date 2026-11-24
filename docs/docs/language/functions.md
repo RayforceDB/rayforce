@@ -568,7 +568,7 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional: condition/result pairs, optional final else. A boolean-vector condition chooses per row between the arms (both are evaluated). In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")`, `(if [true false] [1 2] [3 4])` → `[1 4]` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else. A boolean-vector condition chooses per row between the arms: both are always evaluated (side effects happen, a raising arm raises), and a length-1 vector gives a 1-element vector. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")`, `(if [true false] [1 2] [3 4])` → `[1 4]` |
 | `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call) | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |

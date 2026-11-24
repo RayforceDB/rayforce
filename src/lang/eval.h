@@ -129,15 +129,21 @@ enum {
                        * a name error when it is undefined */
     OP_TRAPV,         /* OP_TRAP for a handler that is a plain value: the
                        * trap pushes no error value, which it never reads */
-    OP_JMPVEC,        /* jump (2-byte signed offset) if TOS is a boolean
-                       * vector; TOS stays either way (the `if` condition) */
-    OP_IFTREE,        /* 2-byte constant index, 2-byte signed jump offset.
-                       * cpool[idx] is a list: element 0 the I64 vector of
-                       * locals to bind, the rest the `if` chain's forms after
-                       * its first condition.  Pop the evaluated condition (a
+    OP_JMPFV,         /* OP_JMPF for an `if` condition (two 2-byte signed
+                       * offsets: false, vector).  A boolean vector stays on
+                       * the stack and jumps by the second offset (the form
+                       * chooses per row); any other value is popped and
+                       * tested as OP_JMPF does */
+    OP_IFTREE,        /* operands: 2-byte site index k, 1-byte start, 2-byte
+                       * signed jump.  The last constant of the lambda is a
+                       * list whose entries 2k and 2k+1 are the `if` form's
+                       * AST and the I64 vector of locals to bind; `start` is
+                       * the element of the AST where the chain (condition
+                       * included) begins.  Pop the evaluated condition (a
                        * boolean vector), run the tree walker's `if` on it
-                       * with the locals bound as an OP_SCOPE_EVAL window
-                       * does, push the result and jump past the chain */
+                       * and the rest of the chain with the locals bound as
+                       * an OP_SCOPE_EVAL window does, push the result and
+                       * jump past the chain */
     OP__COUNT
 };
 
