@@ -1,0 +1,24 @@
+;; DATE -> TIMESTAMP: the null date is the null timestamp, and a date whose
+;; nanoseconds do not fit int64 saturates instead of overflowing (#1597).
+;; Both multiplied days by ns-per-day unchecked: undefined behaviour that
+;; the sanitized suites (test-ndebug, test-full) report.
+
+;; vector: the null carries over as 0Np, the other cells are days * ns
+(as 'TIMESTAMP [2000.01.02 0Nd]) -- [2000.01.02D00:00:00.000000000 0Np]
+(as 'I64 (as 'TIMESTAMP [2000.01.02 0Nd])) -- [86400000000000 0Nl]
+(nil? (as 'TIMESTAMP [0Nd 2000.01.01])) -- [true false]
+
+;; out of the TIMESTAMP range: saturates to the extremes, never the null
+(as 'I64 (as 'TIMESTAMP (as 'DATE [200000 -200000 0Nl 1]))) -- [9223372036854775807 -9223372036854775807 0Nl 86400000000000]
+
+;; atom: the same values as the vector cast
+(as 'TIMESTAMP 0Nd) -- 0Np
+(as 'I64 (as 'TIMESTAMP (as 'DATE 200000))) -- 9223372036854775807
+(as 'I64 (as 'TIMESTAMP (as 'DATE -200000))) -- -9223372036854775807
+(as 'TIMESTAMP 2000.01.02) -- 2000.01.02D00:00:00.000000000
+
+;; a vector long enough for the parallel cast keeps its one null
+(set D (concat (as 'DATE (til 1000000)) [0Nd]))
+(sum (nil? (as 'TIMESTAMP D))) -- 1
+(last (as 'TIMESTAMP D)) -- 0Np
+(set D 0)

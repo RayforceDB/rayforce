@@ -1007,7 +1007,7 @@ static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
  *
  * Temporal cross-unit pairs (matched between the per-atom slow path
  * and the fast path):
- *   DATE → TIMESTAMP : days * NS_PER_DAY
+ *   DATE → TIMESTAMP : days * NS_PER_DAY (null → null, saturating)
  *   TIMESTAMP → DATE : floor-div by NS_PER_DAY (so ns=-1 → -1 day,
  *                       i.e. 1999-12-31, not 2000-01-01).
  *   TIMESTAMP → TIME : floor-mod by NS_PER_DAY then /1_000_000
@@ -1022,6 +1022,16 @@ static inline int64_t ts_days_floor(int64_t ns) {
     int64_t r = ns - q * NS_PER_DAY;
     if (r < 0) q -= 1;
     return q;
+}
+/* DATE days → TIMESTAMP ns.  The null date is the null timestamp, and a
+ * date whose ns do not fit int64 (past ~292 years from 2000) saturates as
+ * temporal_as_ns does, never overflowing and never landing on the null. */
+static inline int64_t date_to_ts_ns(int32_t days) {
+    if (days == NULL_I32) return NULL_I64;
+    int64_t ns;
+    if (__builtin_mul_overflow((int64_t)days, NS_PER_DAY, &ns))
+        return days < 0 ? INT64_MIN + 1 : INT64_MAX;
+    return ns;
 }
 static inline int64_t ts_ns_in_day(int64_t ns) {
     int64_t r = ns % NS_PER_DAY;
@@ -1038,7 +1048,7 @@ static bool cast_range_worker(const void* _src_p, void* _dst_p,
                               int8_t in_type, int8_t out_type) {
     /* Temporal unit conversions. */
     if (in_type == RAY_DATE && out_type == RAY_TIMESTAMP) {
-        CAST_LOOP_RANGE(int32_t, int64_t, (int64_t)_v * NS_PER_DAY, lo, hi);
+        CAST_LOOP_RANGE(int32_t, int64_t, date_to_ts_ns(_v), lo, hi);
         return true;
     }
     if (in_type == RAY_TIMESTAMP && out_type == RAY_DATE) {
@@ -2088,10 +2098,7 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         if (val->type == -RAY_I64) return ray_timestamp(val->i64);
         if (val->type == -RAY_F64 || val->type == -RAY_F32) return ray_timestamp(ray_cast_f64_to_i64_null(val->f64));
         if (val->type == -RAY_TIME) return ray_timestamp((int64_t)val->i32);
-        if (val->type == -RAY_DATE) {
-            int64_t days = val->i32;
-            return ray_timestamp(days * 24LL * 60 * 60 * 1000000000LL);
-        }
+        if (val->type == -RAY_DATE) return ray_timestamp(date_to_ts_ns(val->i32));
         /* ISO string -> timestamp.  Parse the whole value with a bounded
          * cursor and require it to reach the end of the string.  A partial
          * or trailing-garbage match must be REJECTED — otherwise malformed
