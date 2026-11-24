@@ -11600,7 +11600,7 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
      * probe: `like` over SYM is already evaluated per distinct symbol
      * row-wise, so the per-value key would only trade time for the smaller
      * key column. */
-    const bool vocab_small = al && sym && dn * 4 <= sel_rows;
+    const bool vocab_small = al && sym && !sel && dn * 4 <= n;
     if (!vocab_small && sel_rows > DKS_PROBE_ROWS) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
         dks_ctx_t pc = kind;
@@ -11635,10 +11635,9 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     if (!tk) { ray_release(ids); return NULL; }
     int64_t** remap = (int64_t**)(tk + tasks);
     /* a task's table holds at most half its rows' values (a near-unique
-     * stretch refuses) — or the whole vocabulary when that is what bounds
-     * the key (vocab_small: the values may cluster in the first rows) */
+     * stretch refuses) */
     for (uint32_t t = 0; t < tasks; t++)
-        tk[t].du_cap = vocab_small ? dn : sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
+        tk[t].du_cap = sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
     dks_ctx_t c = kind;
     c.n = n; c.tasks = tasks; c.code = (int32_t*)ray_data(ids); c.tk = tk; c.remap = remap;
     c.n_segs = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
@@ -11648,21 +11647,50 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
         c.offs = ray_rowsel_offsets(sel);
         c.idx = ray_rowsel_idx(sel);
     }
+    bool ok = true;
+    dks_task_t g; memset(&g, 0, sizeof g);
+    if (vocab_small) {
+        /* The vocabulary bounds the key: one slot per symbol id (4 bytes
+         * each: 72 MB for 18M URLs), filled in one pass over the rows in
+         * first-seen order — the hash tables per task would hold every
+         * value of the task's rows (the values of such a column can all
+         * differ within a task while they repeat across tasks), 1.7 GB and
+         * 480 ms over 5M rows of 1M URLs against 15 ms here. */
+        ray_t* pos_hdr = NULL;
+        int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
+        g.hash  = (uint64_t*)ray_alloc_raw((size_t)dn * sizeof(uint64_t));
+        g.first = (int64_t*)ray_alloc_raw((size_t)dn * sizeof(int64_t));
+        if (!pos || !g.hash || !g.first) {
+            if (pos_hdr) scratch_free(pos_hdr); dks_task_free(&g); ray_release(ids); scratch_free(tk_hdr); return NULL;
+        }
+        memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
+        int32_t* code = (int32_t*)ray_data(ids);
+        for (int64_t r = 0; r < n; r++) {
+            int64_t id = ray_read_sym(kind.cd, r, RAY_SYM, kind.cattrs);
+            if (id < 0 || id >= dn) { ok = false; break; }
+            int32_t sl = pos[id];
+            if (sl < 0) {
+                sl = (int32_t)g.du; pos[id] = sl;
+                g.hash[g.du] = (uint64_t)id; g.first[g.du] = r; g.du++;
+            }
+            code[r] = sl;
+        }
+        scratch_free(pos_hdr);
+        scratch_free(tk_hdr); tk_hdr = NULL;
+        if (!ok || g.du == 0) { dks_task_free(&g); ray_release(ids); return NULL; }
+        goto grouped;
+    }
     if (tasks > 1) ray_pool_dispatch_n(rpool, dks_code_fn, &c, tasks);
     else dks_code_fn(&c, 0, 0, 1);
-    bool ok = !pool_cancelled(rpool);
+    ok = !pool_cancelled(rpool);
     for (uint32_t t = 0; t < tasks && ok; t++) ok = !tk[t].fail;
 
     /* Merge in task order: a value's global id is given by its first task
      * (the earliest row), and inside a task the local ids follow the rows,
      * so the global ids are in first-seen row order over the table. */
-    dks_task_t g; memset(&g, 0, sizeof g);
     int64_t sum = 0;
     for (uint32_t t = 0; t < tasks && ok; t++) sum += tk[t].du;
-    /* (vocab_small: the tasks' lists are merged whatever they add up to —
-     * a task's rows can all differ while the column repeats across tasks —
-     * the merged table holds at most the vocabulary) */
-    g.du_cap = vocab_small ? sum : sparse ? sel_rows : sel_rows / 2;
+    g.du_cap = sparse ? sel_rows : sel_rows / 2;
     if (ok) ok = sum <= g.du_cap;
     if (ok) {
         while (ok && g.cap < (uint64_t)sum * 2) ok = dks_grow(&g);
@@ -11703,6 +11731,7 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     if (rm_hdr) scratch_free(rm_hdr);
     scratch_free(tk_hdr);
     if (!ok || g.du == 0) { dks_task_free(&g); ray_release(ids); return NULL; }
+grouped:
     ray_profile_tick("derived key: values grouped");
 
     /* The du distinct values as a column under the referenced name: a SYM
