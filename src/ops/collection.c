@@ -2215,8 +2215,10 @@ static inline uint8_t key_inexact_bits_c(ray_t* x, int depth) {
  * row order gives `group`'s answer. */
 static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
                            uint8_t* inexact, int depth);
+static inline uint64_t key_hash_body(ray_t* x, int spans, const ray_group_sym_view_t* view,
+                                     bool* seen, uint8_t* inexact, int depth);
 static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
-    return key_hash_d(x, spans, view, seen, inexact, 0);
+    return key_hash_body(x, spans, view, seen, inexact, 0);
 }
 /* A list's or a table's hash (key_hash_d's container cases). */
 static inline uint64_t key_hash_container(ray_t* x, int spans, const ray_group_sym_view_t* view,
@@ -2277,8 +2279,13 @@ static uint64_t key_hash_shared(ray_t* x, int spans, const ray_group_sym_view_t*
     return h;
 }
 
-static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
-                           uint8_t* inexact, int depth) {
+/* One body for the walk (inlined into each caller below): key_hash_d for
+ * the cells, which carries the depth, and the entry points, which start
+ * at depth 0, where the depth test folds away and the key's own level
+ * costs what it did before the bound (#1626). */
+static inline __attribute__((always_inline))
+uint64_t key_hash_body(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
+                       uint8_t* inexact, int depth) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
     if (!x) return 0;
     if (RAY_ATOM_IS_NULL(x)) {
@@ -2378,6 +2385,11 @@ static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view
     return 0;
 }
 
+static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
+                           uint8_t* inexact, int depth) {
+    return key_hash_body(x, spans, view, seen, inexact, depth);
+}
+
 uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NULL, NULL); }
 
 /* No F64 or F32 atom anywhere in x (a key set, or one cell), nested lists,
@@ -2464,18 +2476,10 @@ uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
 enum { KEY_SPAN_WALK_FLOAT = 8 };
 static int key_span_flags_d(ray_t* x, bool track_float, int depth);
+static inline int key_span_flags_body(ray_t* x, bool track_float, int depth);
+/* The entry starts at depth 0 with the body inlined (as key_hash's). */
+static int key_span_flags(ray_t* x, bool track_float) { return key_span_flags_body(x, track_float, 0); }
 static inline int key_span_flags_c(ray_t* x, bool track_float, int depth);
-/* The entry is depth 0: no depth bound to test, and its own value cannot
- * recur inside itself, so no memo test either. */
-static int key_span_flags(ray_t* x, bool track_float) {
-    if (!x) return 0;
-    if (x->type < 0) {
-        if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
-        return track_float && (x->type == -RAY_F64 || x->type == -RAY_F32) ? KEY_SPAN_WALK_FLOAT : 0;
-    }
-    if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
-    return key_span_flags_c(x, track_float, 0);
-}
 static _Thread_local ray_walk_memo_t g_span_memo;
 static inline int key_span_flags_c(ray_t* x, bool track_float, int depth);
 __attribute__((noinline)) static int key_span_flags_shared(ray_t* x, bool track_float, int depth) {
@@ -2501,7 +2505,8 @@ static inline int key_span_part(ray_t* p, int depth) {
         return ray_has_timespan(p) ? RAY_KEY_SPAN_VEC : 0;
     return key_span_flags_d(p, false, depth + 1);
 }
-static int key_span_flags_d(ray_t* x, bool track_float, int depth) {
+static inline __attribute__((always_inline))
+int key_span_flags_body(ray_t* x, bool track_float, int depth) {
     if (!x) return 0;
     if (x->type < 0) {
         if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
@@ -2593,6 +2598,9 @@ static inline int key_span_flags_c(ray_t* x, bool track_float, int depth) {
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     }
     return spans;
+}
+static int key_span_flags_d(ray_t* x, bool track_float, int depth) {
+    return key_span_flags_body(x, track_float, depth);
 }
 
 int ray_key_spans(ray_t* x) { return key_span_flags(x, false); }
