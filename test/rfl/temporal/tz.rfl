@@ -1,0 +1,111 @@
+;; `(.time.tz.local 'Zone ts)` answers the zone's wall clock at each UTC
+;; instant, as a TIMESTAMP that carries no zone.  `(.time.tz.offset 'Zone ts)`
+;; answers the zone's offset from UTC at the instant, as a TIMESPAN, east
+;; positive.  The zones come from the IANA database built into the binary.
+
+;; ── New York, on either side of UTC's noon ───────────────────────────
+(.time.tz.local 'America/New_York 2024.07.01D12:00:00.000000000) -- 2024.07.01D08:00:00.000000000
+(.time.tz.local 'America/New_York 2024.01.01D12:00:00.000000000) -- 2024.01.01D07:00:00.000000000
+(.time.tz.offset 'America/New_York 2024.07.01D12:00:00.000000000) -- -0D04:00:00
+(.time.tz.offset 'America/New_York 2024.01.01D12:00:00.000000000) -- -0D05:00:00
+(type (.time.tz.local 'America/New_York 2024.07.01D12:00:00.000000000)) -- 'timestamp
+(type (.time.tz.offset 'America/New_York 2024.07.01D12:00:00.000000000)) -- 'timespan
+
+;; the evening is the day before in UTC's terms
+(.time.tz.local 'America/New_York 2024.07.02D01:30:00.000000000) -- 2024.07.01D21:30:00.000000000
+
+;; ── the clock changes of 2024 ────────────────────────────────────────
+;; spring, 10 March at 07:00 UTC: the wall clock skips 02:00 to 03:00
+(.time.tz.local 'America/New_York 2024.03.10D06:59:59.999999999) -- 2024.03.10D01:59:59.999999999
+(.time.tz.local 'America/New_York 2024.03.10D07:00:00.000000000) -- 2024.03.10D03:00:00.000000000
+;; autumn, 3 November at 06:00 UTC: the wall clock runs 01:00 to 02:00 twice,
+;; and the offset tells the two apart
+(.time.tz.local 'America/New_York 2024.11.03D05:30:00.000000000) -- 2024.11.03D01:30:00.000000000
+(.time.tz.local 'America/New_York 2024.11.03D06:30:00.000000000) -- 2024.11.03D01:30:00.000000000
+(.time.tz.offset 'America/New_York 2024.11.03D05:30:00.000000000) -- -0D04:00:00
+(.time.tz.offset 'America/New_York 2024.11.03D06:30:00.000000000) -- -0D05:00:00
+
+;; ── other shapes of zone ─────────────────────────────────────────────
+(.time.tz.offset 'UTC 2024.07.01D12:00:00.000000000) -- 0D00:00:00
+(.time.tz.offset 'Etc/GMT+5 2024.07.01D12:00:00.000000000) -- -0D05:00:00
+(.time.tz.offset 'Asia/Kolkata 2024.07.01D12:00:00.000000000) -- 0D05:30:00
+(.time.tz.offset 'Asia/Kathmandu 2024.07.01D12:00:00.000000000) -- 0D05:45:00
+;; DST of half an hour
+(.time.tz.offset 'Australia/Lord_Howe 2024.01.01D12:00:00.000000000) -- 0D11:00:00
+(.time.tz.offset 'Australia/Lord_Howe 2024.07.01D12:00:00.000000000) -- 0D10:30:00
+;; the southern summer runs over the new year
+(.time.tz.offset 'Australia/Sydney 2024.01.01D12:00:00.000000000) -- 0D11:00:00
+(.time.tz.offset 'Australia/Sydney 2024.07.01D12:00:00.000000000) -- 0D10:00:00
+;; an old name is the zone it links to
+(.time.tz.local 'US/Eastern 2024.07.01D12:00:00.000000000) -- 2024.07.01D08:00:00.000000000
+
+;; ── far from today ───────────────────────────────────────────────────
+;; local mean time before the railways' standard time of 1883
+(.time.tz.offset 'America/New_York 1850.01.01D00:00:00.000000000) -- -0D04:56:02
+(.time.tz.offset 'America/New_York 1900.01.01D00:00:00.000000000) -- -0D05:00:00
+;; the rule the zone ends with, long past the changes the database lists
+(.time.tz.local 'America/New_York 2100.03.14D06:59:59.999999999) -- 2100.03.14D01:59:59.999999999
+(.time.tz.local 'America/New_York 2100.03.14D07:00:00.000000000) -- 2100.03.14D03:00:00.000000000
+(.time.tz.offset 'America/New_York 2250.07.01D12:00:00.000000000) -- -0D04:00:00
+
+;; ── vectors and nulls ────────────────────────────────────────────────
+(set V [2024.01.01D12:00:00.000000000 2024.07.01D12:00:00.000000000 2024.11.03D06:30:00.000000000])
+(.time.tz.local 'America/New_York V) -- [2024.01.01D07:00:00.000000000 2024.07.01D08:00:00.000000000 2024.11.03D01:30:00.000000000]
+(.time.tz.offset 'America/New_York V) -- [-0D05:00:00 -0D04:00:00 -0D05:00:00]
+(type (.time.tz.local 'America/New_York V)) -- 'TIMESTAMP
+(type (.time.tz.offset 'America/New_York V)) -- 'TIMESPAN
+(count (.time.tz.local 'America/New_York (take V 0))) -- 0
+(nil? (.time.tz.local 'America/New_York 0Np)) -- true
+(nil? (.time.tz.offset 'America/New_York 0Np)) -- true
+(type (.time.tz.offset 'America/New_York 0Np)) -- 'timespan
+(set N [2024.01.01D12:00:00.000000000 0Np 2024.07.01D12:00:00.000000000])
+(nil? (.time.tz.local 'America/New_York N)) -- [false true false]
+(nil? (.time.tz.offset 'America/New_York N)) -- [false true false]
+;; local is the instant plus the offset
+(== (.time.tz.local 'America/New_York V) (+ V (.time.tz.offset 'America/New_York V))) -- [true true true]
+
+;; ── buckets on the wall clock ────────────────────────────────────────
+;; 01:30 UTC on 2 July is still 1 July in New York
+(trunc 'day (.time.tz.local 'America/New_York 2024.07.02D01:30:00.000000000)) -- 2024.07.01D00:00:00.000000000
+(date (.time.tz.local 'America/New_York 2024.07.02D01:30:00.000000000)) -- 2024.07.01
+(hh (.time.tz.local 'America/New_York 2024.07.02D01:30:00.000000000)) -- 21
+
+;; ── a long column: workers, and rows in no order ─────────────────────
+;; 600 000 instants a prime number of minutes apart, 2015 to 2030
+(set B (+ 2015.01.01D00:00:00.000000000 (* 0D00:13:00 (til 600000))))
+(set L (.time.tz.local 'America/New_York B))
+(set O (.time.tz.offset 'America/New_York B))
+(asc (distinct O)) -- [-0D05:00:00 -0D04:00:00]
+(sum (== L (+ B O))) -- 600000
+;; the same rows shuffled answer the same values, row for row
+(set P (iasc (% (* (til 600000) 7919) 600011)))
+(sum (== (.time.tz.local 'America/New_York (at B P)) (at L P))) -- 600000
+(sum (== (.time.tz.offset 'America/New_York (at B P)) (at O P))) -- 600000
+;; a short piece is answered on one thread, and agrees
+(sum (== (.time.tz.local 'America/New_York (take B 1000)) (take L 1000))) -- 1000
+
+;; ── in a query ───────────────────────────────────────────────────────
+(set T (table [ts px] (list [2024.07.01D12:00:00.000000000 2024.07.02D01:30:00.000000000 2024.07.02D12:00:00.000000000] [1.0 3.0 10.0])))
+(at (select {from: T d: (date (.time.tz.local 'America/New_York ts))}) 'd) -- [2024.07.01 2024.07.01 2024.07.02]
+(set G (select {from: (select {from: T d: (date (.time.tz.local 'America/New_York ts)) px: px}) by: d a: (avg px) n: (count px)}))
+(at G 'd) -- [2024.07.01 2024.07.02]
+(at G 'a) -- [2.0 10.0]
+(at G 'n) -- [2 1]
+
+;; ── refusals ─────────────────────────────────────────────────────────
+(.time.tz.local 'Mars/Olympus_Mons 2024.07.01D12:00:00.000000000) !- domain
+(.time.tz.local 'America/New_Yor 2024.07.01D12:00:00.000000000) !- domain
+(.time.tz.local (as 'sym "../etc/passwd") 2024.07.01D12:00:00.000000000) !- domain
+(.time.tz.local (as 'sym "") 2024.07.01D12:00:00.000000000) !- domain
+(.time.tz.local "America/New_York" 2024.07.01D12:00:00.000000000) !- type
+(.time.tz.local 5 2024.07.01D12:00:00.000000000) !- type
+(.time.tz.local 'America/New_York 2024.07.01) !- type
+(.time.tz.local 'America/New_York 12:00:00.000) !- type
+(.time.tz.local 'America/New_York 5) !- type
+(.time.tz.offset 'America/New_York 0D01:00:00) !- type
+(.time.tz.offset 'Mars/Olympus_Mons V) !- domain
+
+;; ── the database ─────────────────────────────────────────────────────
+(type (.time.tz.version)) -- 'str
+(>= (count (.time.tz.version)) 5) -- true
+(.time.tz.version 1) !- domain

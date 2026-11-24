@@ -26,6 +26,8 @@
 #include "ops/temporal.h"
 #include "lang/format.h"  /* ray_type_name (error context) */
 #include "core/pool.h"    /* ray_pool_dispatch — parallel extract/truncate */
+#include "core/tz.h"      /* zone tables, the database built in */
+#include "mem/sys.h"
 #include <time.h>
 #if defined(RAY_OS_WINDOWS)
 #include <windows.h>
@@ -943,4 +945,169 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     lt.tm_isdst = 0;
     int64_t secs = (int64_t)timegm(&lt) - ray_epoch_offset();
     return ray_timestamp(secs * 1000000000LL + sub_ns);
+}
+
+/* ============================================================================
+ * Time zones: (.time.tz.local 'Zone ts) and (.time.tz.offset 'Zone ts)
+ *
+ * A TIMESTAMP is an instant in UTC.  `local` answers the wall clock of the
+ * zone at that instant, as a TIMESTAMP that carries no zone, so trunc, the
+ * dotted segments and xbar bucket it by local days and hours.  `offset`
+ * answers how far the zone is from UTC at the instant, as a TIMESPAN.
+ * Instant to wall clock is a function: every instant has one offset.  The
+ * other direction is not (a wall-clock hour is skipped in spring and runs
+ * twice in autumn), and is not offered here.
+ * ========================================================================== */
+
+/* The zones looked up so far, each parsed once from the database built in.
+ * Filled on the evaluating thread before a kernel fans out, so workers only
+ * read a table; emptied by ray_temporal_tz_reset when the language shuts
+ * down, which is also when the symbol ids it is keyed by die. */
+typedef struct { int64_t sym; ray_tz_t* z; } rte_zone_t;
+static rte_zone_t* g_zones;
+static int32_t     g_zone_count, g_zone_cap;
+
+void ray_temporal_tz_reset(void) {
+    for (int32_t i = 0; i < g_zone_count; i++) ray_tz_free(g_zones[i].z);
+    ray_sys_free(g_zones);
+    g_zones = NULL;
+    g_zone_count = g_zone_cap = 0;
+}
+
+/* The table already loaded for a zone's symbol, NULL when there is none.
+ * Reads only, so a worker may call it. */
+static const ray_tz_t* rte_zone_loaded(int64_t sym) {
+    for (int32_t i = 0; i < g_zone_count; i++)
+        if (g_zones[i].sym == sym) return g_zones[i].z;
+    return NULL;
+}
+
+/* The table of the zone `zone` names, borrowed; NULL with *err an owned
+ * error. */
+static const ray_tz_t* rte_zone(ray_t* zone, const char* fn, ray_t** err) {
+    if (!zone || zone->type != -RAY_SYM) {
+        *err = ray_error("type", "%s: the zone must be a symbol", fn);
+        return NULL;
+    }
+    const ray_tz_t* loaded = rte_zone_loaded(zone->i64);
+    if (loaded) return loaded;
+
+    ray_t* name = ray_sym_str(zone->i64);
+    const char* p = name ? ray_str_ptr(name) : NULL;
+    size_t n = p ? ray_str_len(name) : 0, len = 0;
+    const uint8_t* file = p ? ray_tzdata_find(p, n, &len) : NULL;
+    if (!file) {
+        *err = ray_error("domain", "%s: no time zone '%.*s in the database (%s)", fn,
+                         (int)(n > 64 ? 64 : n), p ? p : "", ray_tzdata_version);
+        return NULL;
+    }
+    if (g_zone_count == g_zone_cap) {
+        int32_t cap = g_zone_cap ? g_zone_cap * 2 : 16;
+        rte_zone_t* grown = ray_sys_realloc(g_zones, (size_t)cap * sizeof(rte_zone_t));
+        if (!grown) { *err = ray_error("oom", NULL); return NULL; }
+        g_zones = grown;
+        g_zone_cap = cap;
+    }
+    ray_tz_t* z = ray_tz_parse(file, len);
+    if (!z) { *err = ray_error("oom", NULL); return NULL; }   /* a built-in file always parses */
+    g_zones[g_zone_count++] = (rte_zone_t){ zone->i64, z };
+    return z;
+}
+
+/* One instant.  *k is the index of the offset the row before used: rows of a
+ * time-ordered column sit between the same two changes for long runs, so the
+ * search runs only when a row leaves that span.  False when the wall clock is
+ * not a TIMESTAMP (past the type's range, or its null). */
+static inline bool rte_tz_elem(const ray_tz_t* z, int64_t ts, bool want_offset, int32_t* k, int64_t* out) {
+    int32_t i = *k;
+    if (!((i == 0 || z->at[i - 1] <= ts) && (i == z->n || ts < z->at[i]))) *k = i = ray_tz_find(z, ts);
+    int64_t off = z->off[i];
+    if (want_offset) { *out = off; return true; }
+    if (off > 0 ? ts > INT64_MAX - off : ts <= INT64_MIN - off) return false;
+    *out = ts + off;
+    return true;
+}
+
+typedef struct {
+    ray_t*            input;
+    const int64_t*    base;
+    int64_t*          out;
+    const ray_tz_t*   z;
+    bool              want_offset;
+    bool              src_has_nulls;
+    _Atomic(uint32_t) any_null;
+} rte_tz_ctx_t;
+
+static void rte_tz_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    rte_tz_ctx_t* c = (rte_tz_ctx_t*)ctx;
+    int32_t k = 0;
+    bool nulled = false;
+    for (int64_t i = start; i < end; i++) {
+        int64_t v = 0;
+        bool ok = !(c->src_has_nulls && ray_vec_is_null(c->input, i)) &&
+                  rte_tz_elem(c->z, c->base[i], c->want_offset, &k, &v);
+        c->out[i] = ok ? v : NULL_I64;
+        if (!ok) nulled = true;
+    }
+    if (nulled) atomic_store_explicit(&c->any_null, 1, memory_order_relaxed);
+}
+
+static const char* rte_tz_name(bool want_offset) { return want_offset ? ".time.tz.offset" : ".time.tz.local"; }
+
+/* `x` on zone z: its wall clock, or with want_offset its offset.  `x` is
+ * borrowed. */
+static ray_t* rte_tz_run(const ray_tz_t* z, ray_t* x, bool want_offset) {
+    int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
+    if (t != RAY_TIMESTAMP)
+        return ray_error("type", "%s: expected timestamp, got %s", rte_tz_name(want_offset),
+                         ray_type_name(x->type));
+    int8_t out_t = want_offset ? RAY_TIMESPAN : RAY_TIMESTAMP;
+
+    if (x->type < 0) {
+        int32_t k = 0;
+        int64_t v;
+        if (RAY_ATOM_IS_NULL(x) || !rte_tz_elem(z, x->i64, want_offset, &k, &v)) return ray_typed_null(-out_t);
+        return want_offset ? ray_timespan(v) : ray_timestamp(v);
+    }
+
+    int64_t len = x->len;
+    ray_t* result = ray_vec_new(out_t, len);
+    if (!result || RAY_IS_ERR(result)) return result;
+    result->len = len;
+    rte_tz_ctx_t c = {
+        .input = x,
+        .base = (const int64_t*)ray_data(x),
+        .out = (int64_t*)ray_data(result),
+        .z = z,
+        .want_offset = want_offset,
+        .src_has_nulls = ray_vec_may_have_nulls(x),
+        .any_null = 0,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, len, RAY_PARALLEL_THRESHOLD))
+        ray_pool_dispatch(pool, rte_tz_fn, &c, len);
+    else
+        rte_tz_fn(&c, 0, 0, len);
+    if (atomic_load_explicit(&c.any_null, memory_order_relaxed))
+        result->attrs |= RAY_ATTR_HAS_NULLS;
+    return result;
+}
+
+/* The type of `x` is checked before the zone. */
+static ray_t* rte_tz_apply(ray_t* zone, ray_t* x, bool want_offset) {
+    if (!x || RAY_IS_ERR(x)) return x;
+    int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
+    if (t != RAY_TIMESTAMP) return rte_tz_run(NULL, x, want_offset);
+    ray_t* err = NULL;
+    const ray_tz_t* z = rte_zone(zone, rte_tz_name(want_offset), &err);
+    return z ? rte_tz_run(z, x, want_offset) : err;
+}
+
+ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x)  { return rte_tz_apply(zone, x, false); }
+ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x) { return rte_tz_apply(zone, x, true); }
+ray_t* ray_tz_version_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".time.tz.version takes no arguments");
+    return ray_str(ray_tzdata_version, strlen(ray_tzdata_version));
 }

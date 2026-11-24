@@ -76,6 +76,18 @@ int ray_temporal_unit_from_name(const char* name, size_t len);
 /* (trunc 'unit x): see ray_temporal_truncate.  `unit` is a symbol atom. */
 ray_t* ray_trunc_fn(ray_t* unit, ray_t* x);
 
+/* (.time.tz.local 'Zone ts): the zone's wall clock at each UTC instant, as a
+ * TIMESTAMP that carries no zone.  (.time.tz.offset 'Zone ts): the zone's
+ * offset from UTC at each instant, as a TIMESPAN, east positive.  `Zone` is
+ * an IANA name, 'America/New_York; `ts` a TIMESTAMP atom or vector.  A null
+ * stays null, and so does a wall clock past the TIMESTAMP range. */
+ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x);
+ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x);
+/* (.time.tz.version): the IANA release of the database built in, "2026f". */
+ray_t* ray_tz_version_fn(ray_t** args, int64_t n);
+/* Drop every zone table looked up so far; the language's shutdown calls it. */
+void ray_temporal_tz_reset(void);
+
 /* The DATE / TIME (`want` = RAY_DATE / RAY_TIME) of a temporal atom or
  * vector; see the definition.  `x` is borrowed, the result caller-owned. */
 ray_t* ray_temporal_to(int8_t want, ray_t* x);

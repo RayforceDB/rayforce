@@ -5841,6 +5841,10 @@ static void ray_register_builtins(void) {
     register_vary (".time.now",       RAY_FN_NONE,       ray_time_now_fn);
     register_vary (".time.timer.set", RAY_FN_RESTRICTED, ray_time_timer_set_fn);
     register_unary(".time.timer.del", RAY_FN_RESTRICTED, ray_time_timer_del_fn);
+    /* .time.tz.* — a UTC instant on a zone's wall clock */
+    register_binary(".time.tz.local",   RAY_FN_NONE, ray_tz_local_fn);
+    register_binary(".time.tz.offset",  RAY_FN_NONE, ray_tz_offset_fn);
+    register_vary  (".time.tz.version", RAY_FN_NONE, ray_tz_version_fn);
 
     /* env — list all global environment bindings */
     register_unary("env",        RAY_FN_NONE, ray_env_fn);
@@ -5977,6 +5981,7 @@ void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
     closure_tmpl_reset();
     ray_callprof_destroy();
+    ray_temporal_tz_reset();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();
