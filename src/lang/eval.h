@@ -470,7 +470,7 @@ ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
 ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
 
 /* Vector similarity / embeddings / HNSW.
- * cos-dist and l2-dist return distance (lower = closer); inner-prod is
+ * .emb.cos-dist and .emb.l2-dist return distance (lower = closer); .emb.inner-prod is
  * the raw mathematical dot product. */
 ray_t* ray_cos_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_inner_prod_fn(ray_t* a, ray_t* b);

@@ -100,7 +100,7 @@ The most common use of `.idx.hash`. You have a column that gets queried many tim
 
 ## 4. Workflow: ANN over embeddings { #workflow-ann }
 
-HNSW is the vector-search index — built and consulted at query time via `(ann)`. For cosine-similarity nearest-neighbor over a list of float vectors:
+HNSW is the vector-search index — built and consulted at query time via `(.emb.ann)`. For cosine-similarity nearest-neighbor over a list of float vectors:
 
 ```lisp
 ; A list of three 4-dimensional embeddings.
@@ -110,20 +110,20 @@ HNSW is the vector-search index — built and consulted at query time via `(ann)
   [0.5 0.5 0.5 0.5]))
 
 ; Build the index.  metric ∈ {cosine, l2, ip}.
-(set h (hnsw-build vecs 'cosine 16 200))
+(set h (.emb.hnsw-build vecs 'cosine 16 200))
 
 ; Query: top-2 nearest neighbors of [0.1 0.2 0.3 0.4].
-(ann h [0.1 0.2 0.3 0.4] 2 50)
+(.emb.ann h [0.1 0.2 0.3 0.4] 2 50)
 ; ⇒ table { _rowid: I64, _dist: F64 } sorted ascending by _dist
 
 ; Optional: release early if you want the memory back before scope exit.
 ; Otherwise, the handle auto-frees when refcounting drops it.
-(hnsw-free h)
+(.emb.hnsw-free h)
 ```
 
-For one-off queries, brute-force `(knn vecs query k)` needs no index and is fine on small vector sets. Switch to HNSW once you have many queries against the same vector set.
+For one-off queries, brute-force `(.emb.knn vecs query k)` needs no index and is fine on small vector sets. Switch to HNSW once you have many queries against the same vector set.
 
-See [Vector Search & HNSW](../graph/vector-search.md) for the full reference, including persistence (`hnsw-save` / `hnsw-load`) and metric trade-offs.
+See [Vector Search & HNSW](../graph/vector-search.md) for the full reference, including persistence (`.emb.hnsw-save` / `.emb.hnsw-load`) and metric trade-offs.
 
 ## 5. Workflow: cross-table reference via linked columns { #workflow-link }
 
@@ -151,7 +151,7 @@ Five things that bite first-time users.
 - **A write drops the index; an append extends a hash.** `(alter 'v set i val)` mutates `v` in place and invalidates the attached structure — there's no error, just a silently un-indexed column afterward; rebuild explicitly after the write. An append — `(insert 'v x)` of one value, `(insert 't rows)` on a table's indexed column, `concat`, `(alter 'v concat vals)` — keeps a hash index and extends it over the new rows in time proportional to the rows appended (other kinds are dropped). `(insert 'v vals)` of several values into a plain vector builds a fresh vector without the index; `(alter 'v concat vals)` appends them and keeps it. An appended key the hash already holds leaves it first-row-only (`.idx.info` shows `first_only: true`): `find`, `in`, dict lookups and `distinct` still use it, filters, joins and grouping read the column, and a save writes a complete hash; `.idx.hash` rebuilds a complete one in memory. The non-quoted form `(insert v val)` returns a fresh value and leaves the original untouched.
 - **Slices can't carry an index.** Internally, slicing a column produces a fresh slice header without `RAY_ATTR_HAS_INDEX`; `(.idx.*)` attach refuses to operate on a slice ("cannot index a slice; materialize first"). The Rayfall surface for slices today is C-API-only — this is mostly relevant when calling Rayforce from your own C code.
 - **One slot per column, one kind at a time.** Calling `.idx.hash` on a column that already has `.idx.zone` drops the zone first. Multiple coexisting kinds per column is a v2 feature.
-- **Persistence is explicit.** A splayed save (`.db.splayed.set`) persists the hash, sort and bloom indexes you built with `.idx.hash`, `.idx.sort` and `.idx.bloom`, the index behind a `grouped` or `parted` attribute (a `SYM` column's rebuilt over the symbol file's ids, with the column it is ordered by, see [Attributes](../queries/attributes.md)), and writes each numeric column's chunk zone and each string column's dictionary (`{index: false}` builds neither, for a table never queried by value; a chunk zone a loaded column already carries is still written). A generation-2 (compressed) save persists the same indexes, so nothing needs rebuilding after a load, except a string column's dictionary when it would make the file larger than the uncompressed one (mostly distinct strings; `{index: true}` keeps it, see [Storage](../storage/index.md)); a GUID column's hash in generation 2 needs a reader with GUID index support (see [GUID hash index compatibility](../storage/index.md#guid-hash-index-compatibility)). The CSV and Parquet converters add no hash index of their own. HNSW handles can be persisted explicitly with `hnsw-save` / `hnsw-load`.
+- **Persistence is explicit.** A splayed save (`.db.splayed.set`) persists the hash, sort and bloom indexes you built with `.idx.hash`, `.idx.sort` and `.idx.bloom`, the index behind a `grouped` or `parted` attribute (a `SYM` column's rebuilt over the symbol file's ids, with the column it is ordered by, see [Attributes](../queries/attributes.md)), and writes each numeric column's chunk zone and each string column's dictionary (`{index: false}` builds neither, for a table never queried by value; a chunk zone a loaded column already carries is still written). A generation-2 (compressed) save persists the same indexes, so nothing needs rebuilding after a load, except a string column's dictionary when it would make the file larger than the uncompressed one (mostly distinct strings; `{index: true}` keeps it, see [Storage](../storage/index.md)); a GUID column's hash in generation 2 needs a reader with GUID index support (see [GUID hash index compatibility](../storage/index.md#guid-hash-index-compatibility)). The CSV and Parquet converters add no hash index of their own. HNSW handles can be persisted explicitly with `.emb.hnsw-save` / `.emb.hnsw-load`.
 - **Type support.** `.idx.hash` accepts numeric/boolean columns, **`RAY_SYM`** (it indexes the symbol domain ids), and **`RAY_STR` and `RAY_GUID`** (it indexes a hash of each row's bytes and compares the bytes on every hit). A `STR` hash answers `==` and `in` in a `where:` as well as `find`, so a table keyed by a string id gets an O(matches) point lookup without interning the ids as symbols; `(== s "")` and a set holding `""` scan, since the index leaves out the null rows. A `GUID` hash answers `==` and `in` in a `where:` as well as `find`; a null guid needle scans. `.idx.zone`, `.idx.sort`, and `.idx.bloom` are numeric/boolean only — an unsupported column is rejected with `error: nyi: <kind>: only numeric/temporal vectors supported (got type N)`.
 
 ## 8. Performance characteristics { #perf }
@@ -162,7 +162,7 @@ Five things that bite first-time users.
 | `.idx.hash` | O(n) one pass | O(n) — table + chain | O(matches) average; chain-walk on collisions | filter EQ (integer, null-free), filter IN, find |
 | `.idx.sort` | O(n log n) | O(n) — row-id permutation | O(log n) binary search | filter range (EQ/LT/LE/GT/GE, selectivity guard), ORDER BY (single ASC key), distinct |
 | `.idx.bloom` | O(n · k), k = 3 | O(m) bits, m default 64 | O(k) probe with false-positive rate | filter EQ definite-absent (integer-family only) |
-| HNSW | O(n log n) typical | O(n · M) graph edges | O(log n) approximate | **Consulted directly** by `(ann)` |
+| HNSW | O(n log n) typical | O(n · M) graph edges | O(log n) approximate | **Consulted directly** by `(.emb.ann)` |
 | Linked column | O(n) one-time bind | O(n) row-id vector | O(1) deref | **Consulted directly** on column dereference |
 | Partition pruning | None — layout-driven | None | O(p) partition count | **Optimizer pass** rewrites filters to skip non-matching partitions |
 

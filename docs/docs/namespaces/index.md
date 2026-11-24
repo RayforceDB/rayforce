@@ -10,6 +10,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.col.*`](col.md) | Foreign-key style column-to-table linking and dotted dereference. |
 | [`.csv.*`](csv.md) | CSV import/export — in-memory, splayed-on-disk, and partitioned variants. |
 | [`.db.*`](db.md) | On-disk table I/O: splayed and partitioned `get` / `set`. |
+| [`.emb.*`](emb.md) | Embeddings and vector search: distances, exact `knn`, the HNSW index and `ann`. |
 | [`.fs.*`](fs.md) | Filesystem metadata: `size`, `list`. |
 | [`.graph.*`](graph.md) | Graph builders and algorithms (PageRank, Louvain, Dijkstra, MST, BFS/DFS, expand, …). |
 | [`.idx.*`](idx.md) | Accelerator indexes: bloom, hash, sort, zone. |

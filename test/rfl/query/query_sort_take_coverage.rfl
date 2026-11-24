@@ -914,9 +914,9 @@
 (select {x: x from: Qlc where: (not-in x (- (/ y 5) 2)) asc: x}) -- (select {x: x from: Ulc where: (not-in x (- (/ y 5) 2)) asc: x})
 (select {x: x from: Qlc where: (> (bin y y) 2) asc: x take: 2}) -- (select {x: x from: Ulc where: (> (bin y y) 2) asc: x take: 2})
 (select {x: x from: Qlc where: (in x (concat (- (/ y 5) 2) [9])) asc: x}) -- (select {x: x from: Ulc where: (in x (concat (- (/ y 5) 2) [9])) asc: x})
-(select {x: x from: Qlc where: (> (* 5 y) (inner-prod x x)) asc: x}) -- (select {x: x from: Ulc where: (> (* 5 y) (inner-prod x x)) asc: x})
-(select {x: x from: Qlc where: (> (* 0.01 y) (cos-dist x y)) asc: x}) -- (select {x: x from: Ulc where: (> (* 0.01 y) (cos-dist x y)) asc: x})
-(select {x: x from: Qlc where: (> (* 3 y) (l2-dist x (* 0 x))) asc: x}) -- (select {x: x from: Ulc where: (> (* 3 y) (l2-dist x (* 0 x))) asc: x})
+(select {x: x from: Qlc where: (> (* 5 y) (.emb.inner-prod x x)) asc: x}) -- (select {x: x from: Ulc where: (> (* 5 y) (.emb.inner-prod x x)) asc: x})
+(select {x: x from: Qlc where: (> (* 0.01 y) (.emb.cos-dist x y)) asc: x}) -- (select {x: x from: Ulc where: (> (* 0.01 y) (.emb.cos-dist x y)) asc: x})
+(select {x: x from: Qlc where: (> (* 3 y) (.emb.l2-dist x (* 0 x))) asc: x}) -- (select {x: x from: Ulc where: (> (* 3 y) (.emb.l2-dist x (* 0 x))) asc: x})
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 ;; a lookup into a value by a column and a membership in a subquery's
 ;; result (its table as long as a partition) are no forms the DAG

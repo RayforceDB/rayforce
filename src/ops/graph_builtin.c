@@ -306,7 +306,7 @@ ray_t* ray_graph_free_fn(ray_t* h) {
 }
 
 /* (.graph.info h) → dict { n_nodes, n_edges, sorted, has_weights }.
- * Mirrors hnsw-info — keys are interned syms with no hyphens so the
+ * Mirrors .emb.hnsw-info — keys are interned syms with no hyphens so the
  * 'foo lookup syntax works. */
 ray_t* ray_graph_info_fn(ray_t* h) {
     ray_rel_t* rel = graph_unwrap(h);

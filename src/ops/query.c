@@ -3389,7 +3389,7 @@ static bool key_impure_builtin(ray_t* fn, int64_t id) {
     static const char* const impure[] = {
         "println", "show", "print", "rand", "guid", "eval", "parse", "resolve", "env", "get",
         "remove", "timeit", "exit", "ser", "de", "datoms", "assert-fact", "retract-fact",
-        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", "hnsw-save", "rc", "meta",
+        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", ".emb.hnsw-save", "rc", "meta",
     };
     enum { NIMPURE = sizeof impure / sizeof *impure };
     static _Thread_local int64_t ids[NIMPURE];
@@ -25125,7 +25125,7 @@ by_dict_done:
     ray_t* nearest_handle_owned = NULL;  /* HNSW handle kept alive for the
                                           * DAG's lifetime; released after
                                           * ray_execute.  Without this, an
-                                          * inline `(ann (hnsw-build ...) ...)`
+                                          * inline `(.emb.ann (.emb.hnsw-build ...) ...)`
                                           * drops the handle's rc to 0 before
                                           * exec runs — the rc→0 hook frees
                                           * the index and the ext's stored
@@ -25134,7 +25134,7 @@ by_dict_done:
         if (nearest_expr->type != RAY_LIST || ray_len(nearest_expr) < 3) {
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: expected (ann <handle> <query> [ef]) or (knn <col> <query> [metric])");
+                "nearest: expected (.emb.ann <handle> <query> [ef]) or (.emb.knn <col> <query> [metric])");
         }
         int64_t nlen = ray_len(nearest_expr);
         ray_t** nlist = (ray_t**)ray_data(nearest_expr);
@@ -25142,10 +25142,10 @@ by_dict_done:
         if (head->type != -RAY_SYM) {
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: first element must be the symbol `ann` or `knn`");
+                "nearest: first element must be the symbol `.emb.ann` or `.emb.knn`");
         }
-        int64_t ann_sym_id = ray_sym_intern("ann", 3);
-        int64_t knn_sym_id = ray_sym_intern("knn", 3);
+        int64_t ann_sym_id = ray_sym_intern(".emb.ann", 8);
+        int64_t knn_sym_id = ray_sym_intern(".emb.knn", 8);
 
         /* Resolve k from take (default 10). */
         int64_t k_req = 10;
@@ -25224,13 +25224,13 @@ by_dict_done:
             if (!hobj || RAY_IS_ERR(hobj)) {
                 ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
-                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (ann): failed to evaluate HNSW handle");
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return hobj ? hobj : ray_error("domain", "nearest (.emb.ann): failed to evaluate HNSW handle");
             }
             if (hobj->type != -RAY_I64 || !(hobj->attrs & RAY_ATTR_HNSW)) {
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (ann): first arg must be an HNSW handle (from hnsw-build)");
+                    "nearest (.emb.ann): first arg must be an HNSW handle (from .emb.hnsw-build)");
             }
             ray_hnsw_t* idx = (ray_hnsw_t*)(uintptr_t)hobj->i64;
             if (!idx) {
@@ -25238,13 +25238,13 @@ by_dict_done:
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (ann): HNSW handle has been freed");
+                    "nearest (.emb.ann): HNSW handle has been freed");
             }
             if (idx->dim != dim) {
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("length",
-                    "nearest (ann): query dim does not match index dim");
+                    "nearest (.emb.ann): query dim does not match index dim");
             }
             int32_t ef = HNSW_DEFAULT_EF_S;
             if (nlen >= 4) {
@@ -25253,7 +25253,7 @@ by_dict_done:
                     ray_release(hobj); ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ev ? ev : ray_error("domain",
-                        "nearest (ann): ef expression failed to evaluate");
+                        "nearest (.emb.ann): ef expression failed to evaluate");
                 }
                 if (ev->type == -RAY_I64)      ef = (int32_t)ev->i64;
                 else if (ev->type == -RAY_I32) ef = ev->i32;
@@ -25262,7 +25262,7 @@ by_dict_done:
                     ray_free_raw(nearest_query_owned);
                     ray_graph_free(g); ray_release(tbl);
                     scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                        "nearest (ann): ef must be an integer atom");
+                        "nearest (.emb.ann): ef must be an integer atom");
                 }
                 ray_release(ev);
             }
@@ -25278,7 +25278,7 @@ by_dict_done:
                 ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (knn): first arg must be an unquoted column name");
+                    "nearest (.emb.knn): first arg must be an unquoted column name");
             }
             int64_t col_sym = col_expr->i64;
             ray_hnsw_metric_t metric = RAY_HNSW_COSINE;
@@ -25293,7 +25293,7 @@ by_dict_done:
                         ray_free_raw(nearest_query_owned);
                         ray_graph_free(g); ray_release(tbl);
                         scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                            "nearest (knn): metric must be 'cosine, 'l2, or 'ip");
+                            "nearest (.emb.knn): metric must be 'cosine, 'l2, or 'ip");
                     }
                 }
             }
@@ -25302,7 +25302,7 @@ by_dict_done:
             ray_free_raw(nearest_query_owned);
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain",
-                "nearest: expected `ann` or `knn` as the first element");
+                "nearest: expected `.emb.ann` or `.emb.knn` as the first element");
         }
         if (!root) {
             if (nearest_handle_owned) ray_release(nearest_handle_owned);

@@ -23,8 +23,8 @@
 
 /*
  * Tests for Rayfall embedding / vector-similarity / HNSW builtins.
- * Names: cos-dist, l2-dist, inner-prod, plus norm, knn,
- * hnsw-build, ann, hnsw-save, hnsw-load, hnsw-info, hnsw-free.
+ * Names: .emb.cos-dist, .emb.l2-dist, .emb.inner-prod, plus norm, knn,
+ * .emb.hnsw-build, ann, .emb.hnsw-save, .emb.hnsw-load, .emb.hnsw-info, .emb.hnsw-free.
  */
 
 #include "test.h"
@@ -114,28 +114,28 @@ static int64_t eval_i64(const char* expr) {
 
 static test_result_t test_cos_dist_scalar(void) {
     /* Orthogonal vectors: cos(90°) = 0 → distance 1. */
-    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [1.0 0.0] [0.0 1.0])"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.cos-dist [1.0 0.0] [0.0 1.0])"), 1.0, 1e-6);
     /* Parallel identical: cos(0°) = 1 → distance 0. */
-    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [1.0 1.0] [1.0 1.0])"), 0.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.cos-dist [1.0 1.0] [1.0 1.0])"), 0.0, 1e-6);
     /* Opposite: cos(180°) = -1 → distance 2. */
-    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [1.0 0.0] [-1.0 0.0])"), 2.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.cos-dist [1.0 0.0] [-1.0 0.0])"), 2.0, 1e-6);
     /* 45°: cos = √2/2 → distance 1 - √2/2 ≈ 0.2929. */
-    double v = eval_f64("(cos-dist [1.0 0.0] [1.0 1.0])");
+    double v = eval_f64("(.emb.cos-dist [1.0 0.0] [1.0 1.0])");
     TEST_ASSERT_EQ_F(v, 1.0 - 1.0/sqrt(2.0), 1e-6);
     PASS();
 }
 
 static test_result_t test_l2_dist_scalar(void) {
-    TEST_ASSERT_EQ_F(eval_f64("(l2-dist [0.0 0.0] [3.0 4.0])"), 5.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(l2-dist [1.0 1.0] [1.0 1.0])"), 0.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(l2-dist [0.0 0.0 0.0] [1.0 2.0 2.0])"), 3.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.l2-dist [0.0 0.0] [3.0 4.0])"), 5.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.l2-dist [1.0 1.0] [1.0 1.0])"), 0.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.l2-dist [0.0 0.0 0.0] [1.0 2.0 2.0])"), 3.0, 1e-6);
     PASS();
 }
 
 static test_result_t test_inner_prod_scalar(void) {
-    TEST_ASSERT_EQ_F(eval_f64("(inner-prod [1.0 2.0 3.0] [4.0 5.0 6.0])"), 32.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(inner-prod [1.0 0.0] [0.0 1.0])"), 0.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(inner-prod [2.0 3.0] [-1.0 -1.0])"), -5.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.inner-prod [1.0 2.0 3.0] [4.0 5.0 6.0])"), 32.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.inner-prod [1.0 0.0] [0.0 1.0])"), 0.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.inner-prod [2.0 3.0] [-1.0 -1.0])"), -5.0, 1e-6);
     PASS();
 }
 
@@ -149,7 +149,7 @@ static test_result_t test_norm_scalar(void) {
 /* ============ Errors on malformed inputs ============ */
 
 static test_result_t test_metric_length_mismatch(void) {
-    ray_t* r = ray_eval_str("(cos-dist [1.0 2.0 3.0] [1.0 2.0])");
+    ray_t* r = ray_eval_str("(.emb.cos-dist [1.0 2.0 3.0] [1.0 2.0])");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
@@ -157,7 +157,7 @@ static test_result_t test_metric_length_mismatch(void) {
 
 static test_result_t test_metric_type_error(void) {
     /* String isn't a numeric vec. */
-    ray_t* r = ray_eval_str("(l2-dist \"hello\" [1.0 2.0])");
+    ray_t* r = ray_eval_str("(.emb.l2-dist \"hello\" [1.0 2.0])");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
@@ -167,9 +167,9 @@ static test_result_t test_metric_type_error(void) {
 
 static test_result_t test_cos_dist_list(void) {
     /* Query [1,0,0] against rows [1,0,0], [0,1,0], [1,1,0]: distances 0, 1, 1-1/√2. */
-    double d0 = eval_f64("(at (cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 0)");
-    double d1 = eval_f64("(at (cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 1)");
-    double d2 = eval_f64("(at (cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 2)");
+    double d0 = eval_f64("(at (.emb.cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 0)");
+    double d1 = eval_f64("(at (.emb.cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 1)");
+    double d2 = eval_f64("(at (.emb.cos-dist (list [1.0 0.0 0.0] [0.0 1.0 0.0] [1.0 1.0 0.0]) [1.0 0.0 0.0]) 2)");
     TEST_ASSERT_EQ_F(d0, 0.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, 1.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 1.0 - 1.0/sqrt(2.0), 1e-6);
@@ -177,9 +177,9 @@ static test_result_t test_cos_dist_list(void) {
 }
 
 static test_result_t test_l2_dist_list(void) {
-    double d0 = eval_f64("(at (l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 0)");
-    double d1 = eval_f64("(at (l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 1)");
-    double d2 = eval_f64("(at (l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 2)");
+    double d0 = eval_f64("(at (.emb.l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 0)");
+    double d1 = eval_f64("(at (.emb.l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 1)");
+    double d2 = eval_f64("(at (.emb.l2-dist (list [0.0 0.0] [3.0 4.0] [6.0 8.0]) [0.0 0.0]) 2)");
     TEST_ASSERT_EQ_F(d0, 0.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, 5.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 10.0, 1e-6);
@@ -187,9 +187,9 @@ static test_result_t test_l2_dist_list(void) {
 }
 
 static test_result_t test_inner_prod_list(void) {
-    double d0 = eval_f64("(at (inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 0)");
-    double d1 = eval_f64("(at (inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 1)");
-    double d2 = eval_f64("(at (inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 2)");
+    double d0 = eval_f64("(at (.emb.inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 0)");
+    double d1 = eval_f64("(at (.emb.inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 1)");
+    double d2 = eval_f64("(at (.emb.inner-prod (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 2.0]) 2)");
     TEST_ASSERT_EQ_F(d0, 1.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, 2.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 3.0, 1e-6);
@@ -213,21 +213,21 @@ static test_result_t test_norm_list(void) {
 
 static test_result_t test_knn_cosine(void) {
     /* Top-3 nearest to [1,0,0] by cosine distance: row 0 (dist 0), then rows 3 and 4 (both 1-1/√2). */
-    TEST_ASSERT_EQ_I(eval_i64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_rowid) 0)"), 0);
-    double d0 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 0)");
+    TEST_ASSERT_EQ_I(eval_i64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_rowid) 0)"), 0);
+    double d0 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 0)");
     TEST_ASSERT_EQ_F(d0, 0.0, 1e-6);
-    double d1 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 1)");
+    double d1 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 1)");
     TEST_ASSERT_EQ_F(d1, 1.0 - 1.0/sqrt(2.0), 1e-6);
-    double d2 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 2)");
+    double d2 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'cosine) '_dist) 2)");
     TEST_ASSERT_EQ_F(d2, 1.0 - 1.0/sqrt(2.0), 1e-6);
     PASS();
 }
 
 static test_result_t test_knn_l2(void) {
-    TEST_ASSERT_EQ_I(eval_i64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_rowid) 0)"), 0);
-    double d0 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 0)");
-    double d1 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 1)");
-    double d2 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 2)");
+    TEST_ASSERT_EQ_I(eval_i64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_rowid) 0)"), 0);
+    double d0 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 0)");
+    double d1 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 1)");
+    double d2 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'l2) '_dist) 2)");
     TEST_ASSERT_EQ_F(d0, 0.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, 1.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 1.0, 1e-6);
@@ -236,9 +236,9 @@ static test_result_t test_knn_l2(void) {
 
 static test_result_t test_knn_ip(void) {
     /* Inner-product metric sorts by -dot; all vecs that match with dot=1 tie at -1. */
-    double d0 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 0)");
-    double d1 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 1)");
-    double d2 = eval_f64("(at (at (knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 2)");
+    double d0 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 0)");
+    double d1 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 1)");
+    double d2 = eval_f64("(at (at (.emb.knn " FIVE_VECS " [1.0 0.0 0.0] 3 'ip) '_dist) 2)");
     TEST_ASSERT_EQ_F(d0, -1.0, 1e-6);
     TEST_ASSERT_EQ_F(d1, -1.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, -1.0, 1e-6);
@@ -248,41 +248,41 @@ static test_result_t test_knn_ip(void) {
 /* ============ HNSW lifecycle ============ */
 
 static test_result_t test_hnsw_info_and_metric(void) {
-    /* Build with 'l2 and verify hnsw-info reports dim, metric, n-nodes. */
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'l2 4 50))");
-    TEST_ASSERT_EQ_I(eval_i64("(at (hnsw-info __idx) 'dim)"), 3);
-    TEST_ASSERT_EQ_I(eval_i64("(at (hnsw-info __idx) 'nrows)"), 5);
-    TEST_ASSERT_EQ_I(eval_i64("(at (hnsw-info __idx) 'M)"), 4);
-    TEST_ASSERT_EQ_I(eval_i64("(at (hnsw-info __idx) 'efc)"), 50);
+    /* Build with 'l2 and verify .emb.hnsw-info reports dim, metric, n-nodes. */
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'l2 4 50))");
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'dim)"), 3);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'nrows)"), 5);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'M)"), 4);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'efc)"), 50);
     /* metric is a SYM atom; verify via equality with 'l2. */
-    ray_t* r = ray_eval_str("(== (at (hnsw-info __idx) 'metric) 'l2)");
+    ray_t* r = ray_eval_str("(== (at (.emb.hnsw-info __idx) 'metric) 'l2)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, -RAY_BOOL);
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw-free __idx)");
     PASS();
 }
 
 static test_result_t test_ann_topk(void) {
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'cosine 8 100))");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 8 100))");
     /* Row 0 must be the closest (identity). */
-    TEST_ASSERT_EQ_I(eval_i64("(at (at (ann __idx [1.0 0.0 0.0] 1) '_rowid) 0)"), 0);
-    TEST_ASSERT_EQ_F(eval_f64("(at (at (ann __idx [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
-    ray_eval_str("(hnsw-free __idx)");
+    TEST_ASSERT_EQ_I(eval_i64("(at (at (.emb.ann __idx [1.0 0.0 0.0] 1) '_rowid) 0)"), 0);
+    TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
+    ray_eval_str("(.emb.hnsw-free __idx)");
     PASS();
 }
 
 /* Build two indexes with the same data, one per metric (l2, cosine), verify
  * that the row-0-self query gives distance 0 in both. */
 static test_result_t test_ann_each_metric(void) {
-    ray_eval_str("(set __idx_l2 (hnsw-build " FIVE_VECS " 'l2 8 100))");
-    ray_eval_str("(set __idx_co (hnsw-build " FIVE_VECS " 'cosine 8 100))");
-    TEST_ASSERT_EQ_F(eval_f64("(at (at (ann __idx_l2 [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(at (at (ann __idx_co [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
-    ray_eval_str("(hnsw-free __idx_l2)");
-    ray_eval_str("(hnsw-free __idx_co)");
+    ray_eval_str("(set __idx_l2 (.emb.hnsw-build " FIVE_VECS " 'l2 8 100))");
+    ray_eval_str("(set __idx_co (.emb.hnsw-build " FIVE_VECS " 'cosine 8 100))");
+    TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx_l2 [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(at (at (.emb.ann __idx_co [1.0 0.0 0.0] 1) '_dist) 0)"), 0.0, 1e-6);
+    ray_eval_str("(.emb.hnsw-free __idx_l2)");
+    ray_eval_str("(.emb.hnsw-free __idx_co)");
     PASS();
 }
 
@@ -310,24 +310,24 @@ static test_result_t test_ann_recall(void) {
     TEST_ASSERT_EQ_I(ray_env_set(sym, list), RAY_OK);
     ray_release(list);
 
-    ray_eval_str("(set __recall_idx (hnsw-build __recall_list 'l2 16 100))");
+    ray_eval_str("(set __recall_idx (.emb.hnsw-build __recall_list 'l2 16 100))");
 
     int hits = 0, total = 0;
     for (int q = 0; q < QUERIES; q++) {
         /* Pick row q as the query (so exact match is guaranteed at position 0). */
         char expr[256];
         snprintf(expr, sizeof(expr),
-                 "(at (at (ann __recall_idx (at __recall_list %d) %d) '_rowid) 0)", q, K);
+                 "(at (at (.emb.ann __recall_idx (at __recall_list %d) %d) '_rowid) 0)", q, K);
         int64_t top_ann = eval_i64(expr);
 
         snprintf(expr, sizeof(expr),
-                 "(at (at (knn __recall_list (at __recall_list %d) %d 'l2) '_rowid) 0)", q, K);
+                 "(at (at (.emb.knn __recall_list (at __recall_list %d) %d 'l2) '_rowid) 0)", q, K);
         int64_t top_exact = eval_i64(expr);
 
         if (top_ann == top_exact) hits++;
         total++;
     }
-    ray_eval_str("(hnsw-free __recall_idx)");
+    ray_eval_str("(.emb.hnsw-free __recall_idx)");
     /* Self-query: every top-1 must be the row itself. */
     TEST_ASSERT_EQ_I(hits, total);
     PASS();
@@ -368,18 +368,18 @@ static test_result_t test_ann_recall_saturated(void) {
      * so self-queries resolve to the node itself with high recall.  Before
      * the fix, saturated lists silently dropped every back-link, fragmenting
      * the graph and degrading recall@1. */
-    ray_eval_str("(set __sat_idx (hnsw-build __sat_list 'l2 4 80))");
+    ray_eval_str("(set __sat_idx (.emb.hnsw-build __sat_list 'l2 4 80))");
 
     int hits = 0, total = 0;
     for (int q = 0; q < QUERIES; q++) {
         char expr[256];
         snprintf(expr, sizeof(expr),
-                 "(at (at (ann __sat_idx (at __sat_list %d) %d) '_rowid) 0)", q, K);
+                 "(at (at (.emb.ann __sat_idx (at __sat_list %d) %d) '_rowid) 0)", q, K);
         int64_t top_ann = eval_i64(expr);
         if (top_ann == q) hits++;
         total++;
     }
-    ray_eval_str("(hnsw-free __sat_idx)");
+    ray_eval_str("(.emb.hnsw-free __sat_idx)");
     /* Self-query recall@1: the fix keeps this high even at M=4.  Assert a
      * conservative floor (90%) that the fixed connectivity comfortably meets
      * but the silent-drop regression would fall below. */
@@ -392,19 +392,19 @@ static test_result_t test_ann_recall_saturated(void) {
 static test_result_t test_hnsw_save_load(void) {
     const char* dir = ray_test_tmp("/tmp/ray_hnsw_test_idx");
     /* Build and save in 'ip metric. */
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'ip 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'ip 4 50))");
     char expr[512];
-    snprintf(expr, sizeof(expr), "(hnsw-save __idx \"%s\")", dir);
+    snprintf(expr, sizeof(expr), "(.emb.hnsw-save __idx \"%s\")", dir);
     ray_t* saved = ray_eval_str(expr);
     TEST_ASSERT_FALSE(RAY_IS_ERR(saved));
-    ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw-free __idx)");
 
     /* Load from disk, confirm metric still 'ip, then query. */
-    snprintf(expr, sizeof(expr), "(set __idx2 (hnsw-load \"%s\"))", dir);
+    snprintf(expr, sizeof(expr), "(set __idx2 (.emb.hnsw-load \"%s\"))", dir);
     ray_t* loaded = ray_eval_str(expr);
     TEST_ASSERT_FALSE(RAY_IS_ERR(loaded));
 
-    ray_t* metric_eq = ray_eval_str("(== (at (hnsw-info __idx2) 'metric) 'ip)");
+    ray_t* metric_eq = ray_eval_str("(== (at (.emb.hnsw-info __idx2) 'metric) 'ip)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(metric_eq));
     TEST_ASSERT_EQ_I(metric_eq->type, -RAY_BOOL);
     TEST_ASSERT_EQ_U(metric_eq->b8, 1);
@@ -416,20 +416,20 @@ static test_result_t test_hnsw_save_load(void) {
      * graph connectivity — assert membership, not a specific (unstable) row.
      * (Re-baselined from a hard-coded 0, which pinned a build-order tie that
      * the HNSW saturation/back-link fix legitimately perturbs.) */
-    int64_t ip_top = eval_i64("(at (at (ann __idx2 [1.0 0.0 0.0] 1) '_rowid) 0)");
+    int64_t ip_top = eval_i64("(at (at (.emb.ann __idx2 [1.0 0.0 0.0] 1) '_rowid) 0)");
     TEST_ASSERT_TRUE(ip_top == 0 || ip_top == 3 || ip_top == 4);
-    ray_eval_str("(hnsw-free __idx2)");
+    ray_eval_str("(.emb.hnsw-free __idx2)");
     PASS();
 }
 
 /* ============ Handle lifecycle — double-free returns type error ============ */
 
 static test_result_t test_hnsw_free_twice(void) {
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'cosine 4 50))");
-    ray_t* r1 = ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_t* r1 = ray_eval_str("(.emb.hnsw-free __idx)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     /* Second free: handle attr is cleared, so unwrap fails → type error. */
-    ray_t* r2 = ray_eval_str("(hnsw-free __idx)");
+    ray_t* r2 = ray_eval_str("(.emb.hnsw-free __idx)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r2));
     PASS();
 }
@@ -437,12 +437,12 @@ static test_result_t test_hnsw_free_twice(void) {
 /* Rebinding a handle variable must not leak the previously-bound index.
  * ASan would report the leak on runtime teardown if rc→0 cleanup missed it. */
 static test_result_t test_hnsw_rebind_no_leak(void) {
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
     /* Rebind: the old handle's rc hits zero, ray_free runs, the rc-cleanup
      * hook in src/mem/heap.c frees the underlying ray_hnsw_t. */
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'l2 4 50))");
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'ip 4 50))");
-    ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'l2 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'ip 4 50))");
+    ray_eval_str("(.emb.hnsw-free __idx)");
     PASS();
 }
 
@@ -450,7 +450,7 @@ static test_result_t test_hnsw_rebind_no_leak(void) {
  * expression completes. */
 static test_result_t test_hnsw_inline_no_leak(void) {
     ray_t* r = ray_eval_str(
-        "(at (at (ann (hnsw-build " FIVE_VECS " 'l2 4 50) [1.0 0.0 0.0] 1) '_rowid) 0)");
+        "(at (at (.emb.ann (.emb.hnsw-build " FIVE_VECS " 'l2 4 50) [1.0 0.0 0.0] 1) '_rowid) 0)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     ray_release(r);
@@ -460,7 +460,7 @@ static test_result_t test_hnsw_inline_no_leak(void) {
 /* Handle left bound to a variable at runtime teardown must not leak.
  * ASan reports any leaked ray_hnsw_t at process exit. */
 static test_result_t test_hnsw_teardown_no_leak(void) {
-    ray_eval_str("(set __leak_idx (hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __leak_idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
     PASS();
 }
 
@@ -468,7 +468,7 @@ static test_result_t test_hnsw_teardown_no_leak(void) {
  * the underlying ray_hnsw_t so the copy is a full, independent owner with
  * the same index contents — and freeing either does not disturb the other. */
 static test_result_t test_hnsw_handle_cow(void) {
-    ray_eval_str("(set __idx (hnsw-build " FIVE_VECS " 'cosine 4 50))");
+    ray_eval_str("(set __idx (.emb.hnsw-build " FIVE_VECS " 'cosine 4 50))");
     ray_t* h = ray_env_get(ray_sym_intern("__idx", 5));
     TEST_ASSERT_NOT_NULL(h);
     TEST_ASSERT_EQ_I(h->type, -RAY_I64);
@@ -504,9 +504,9 @@ static test_result_t test_hnsw_handle_cow(void) {
     ray_release(copy);
     TEST_ASSERT_TRUE(h->attrs & RAY_ATTR_HNSW);
     TEST_ASSERT_EQ_I(h->i64, orig_ptr);
-    TEST_ASSERT_EQ_I(eval_i64("(at (hnsw-info __idx) 'nrows)"), 5);
+    TEST_ASSERT_EQ_I(eval_i64("(at (.emb.hnsw-info __idx) 'nrows)"), 5);
 
-    ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(.emb.hnsw-free __idx)");
     PASS();
 }
 
@@ -530,24 +530,24 @@ static test_result_t test_select_nearest_knn(void) {
      * first (exact match, dist 0).  `select ... nearest` returns source
      * columns projected at the matching rowids; use the user's id column. */
     TEST_ASSERT_EQ_I(eval_i64(
-        "(at (at (select {from: __docs nearest: (knn emb [1.0 0.0 0.0]) take: 3}) 'id) 0)"), 0);
+        "(at (at (select {from: __docs nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 3}) 'id) 0)"), 0);
     /* `_dist` is only in the output when the user projects it explicitly. */
     TEST_ASSERT_EQ_F(eval_f64(
         "(at (at (select {id: id d: _dist from: __docs "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 3}) 'd) 0)"), 0.0, 1e-6);
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 3}) 'd) 0)"), 0.0, 1e-6);
     PASS();
 }
 
 static test_result_t test_select_nearest_ann(void) {
     build_docs();
-    ray_eval_str("(set __idx (hnsw-build (at __docs 'emb) 'cosine))");
+    ray_eval_str("(set __idx (.emb.hnsw-build (at __docs 'emb) 'cosine))");
     /* Top-1 must be exact match (row 0, id=0, dist=0). */
     TEST_ASSERT_EQ_I(eval_i64(
-        "(at (at (select {from: __docs nearest: (ann __idx [1.0 0.0 0.0]) take: 1}) 'id) 0)"), 0);
+        "(at (at (select {from: __docs nearest: (.emb.ann __idx [1.0 0.0 0.0]) take: 1}) 'id) 0)"), 0);
     TEST_ASSERT_EQ_F(eval_f64(
         "(at (at (select {id: id d: _dist from: __docs "
-        "                 nearest: (ann __idx [1.0 0.0 0.0]) take: 1}) 'd) 0)"), 0.0, 1e-6);
-    ray_eval_str("(hnsw-free __idx)");
+        "                 nearest: (.emb.ann __idx [1.0 0.0 0.0]) take: 1}) 'd) 0)"), 0.0, 1e-6);
+    ray_eval_str("(.emb.hnsw-free __idx)");
     PASS();
 }
 
@@ -558,7 +558,7 @@ static test_result_t test_select_nearest_filter(void) {
      * excluded because its score=0.1. */
     ray_t* r = ray_eval_str(
         "(select {from: __docs where: (> score 0.5) "
-        "         nearest: (knn emb [1.0 0.0 0.0]) take: 2})");
+        "         nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 2})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -567,10 +567,10 @@ static test_result_t test_select_nearest_filter(void) {
 
     TEST_ASSERT_EQ_I(eval_i64(
         "(at (at (select {from: __docs where: (> score 0.5) "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 2}) 'id) 0)"), 0);
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 2}) 'id) 0)"), 0);
     TEST_ASSERT_EQ_I(eval_i64(
         "(at (at (select {from: __docs where: (> score 0.5) "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 2}) 'id) 1)"), 4);
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 2}) 'id) 1)"), 4);
     PASS();
 }
 
@@ -579,7 +579,7 @@ static test_result_t test_select_nearest_empty_filter(void) {
     /* Filter rejects every row (score > 100) → empty result with schema. */
     ray_t* r = ray_eval_str(
         "(select {from: __docs where: (> score 100.0) "
-        "         nearest: (knn emb [1.0 0.0 0.0]) take: 3})");
+        "         nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -595,7 +595,7 @@ static test_result_t test_select_nearest_take_default(void) {
     build_docs();
     /* No take: default k=10, but table only has 5 rows → 5 results. */
     ray_t* r = ray_eval_str(
-        "(select {from: __docs nearest: (knn emb [1.0 0.0 0.0])})");
+        "(select {from: __docs nearest: (.emb.knn emb [1.0 0.0 0.0])})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -610,7 +610,7 @@ static test_result_t test_select_nearest_asc_rejected(void) {
      * mutually exclusive. */
     ray_t* r = ray_eval_str(
         "(select {from: __docs "
-        "         nearest: (knn emb [1.0 0.0 0.0]) "
+        "         nearest: (.emb.knn emb [1.0 0.0 0.0]) "
         "         asc: score take: 2})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
@@ -623,7 +623,7 @@ static test_result_t test_select_nearest_asc_rejected(void) {
 static test_result_t test_select_nearest_implicit_no_dist(void) {
     build_docs();
     ray_t* r = ray_eval_str(
-        "(select {from: __docs nearest: (knn emb [1.0 0.0 0.0]) take: 3})");
+        "(select {from: __docs nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -648,7 +648,7 @@ static test_result_t test_select_nearest_str_col(void) {
     /* Top-1 by cosine to [1,0,0] is row 0 ("alpha"). */
     ray_t* r = ray_eval_str(
         "(at (at (select {id: id title: title from: __tdocs "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 1}) 'title) 0)");
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 1}) 'title) 0)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     /* STR atom. */
@@ -673,7 +673,7 @@ static test_result_t test_select_nearest_sym_col(void) {
     /* Top-1 cosine to [1,0,0] → row 0 → tag `alpha`. */
     ray_t* r = ray_eval_str(
         "(at (at (select {id: id tag: tag from: __sdocs "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 1}) 'tag) 0)");
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 1}) 'tag) 0)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, -RAY_SYM);
@@ -690,7 +690,7 @@ static test_result_t test_select_nearest_empty_source(void) {
     ray_eval_str(
         "(set __empty (table [id emb] (list [] (list))))");
     ray_t* r = ray_eval_str(
-        "(select {from: __empty nearest: (knn emb [1.0 0.0 0.0]) take: 5})");
+        "(select {from: __empty nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 5})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -700,19 +700,19 @@ static test_result_t test_select_nearest_empty_source(void) {
     PASS();
 }
 
-/* Inline HNSW handle in `nearest (ann ...)`: the handle has rc=1 at eval
+/* Inline HNSW handle in `nearest (.emb.ann ...)`: the handle has rc=1 at eval
  * time.  If the select parser releases it before ray_execute, the rc→0
  * hook frees the underlying index and the DAG exec uses a dangling
  * pointer — a use-after-free that ASan catches.  The handle must be kept
  * alive through ray_execute. */
 static test_result_t test_select_nearest_ann_inline_handle(void) {
     build_docs();
-    /* `(hnsw-build ...)` is evaluated inline and never bound to a var —
+    /* `(.emb.hnsw-build ...)` is evaluated inline and never bound to a var —
      * its rc is 1 at the moment `select` sees it.  Previously this
      * freed the index mid-DAG; the fix retains the handle through exec. */
     ray_t* r = ray_eval_str(
         "(select {id: id d: _dist from: __docs "
-        "         nearest: (ann (hnsw-build (at __docs 'emb) 'cosine) "
+        "         nearest: (.emb.ann (.emb.hnsw-build (at __docs 'emb) 'cosine) "
         "                       [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
@@ -728,18 +728,18 @@ static test_result_t test_select_nearest_ann_inline_handle(void) {
 }
 
 /* Invalid handle payload: attr set but pointer zeroed (e.g. after
- * hnsw-free).  Must return a clean type error rather than dereferencing
+ * .emb.hnsw-free).  Must return a clean type error rather than dereferencing
  * NULL. */
 static test_result_t test_select_nearest_ann_freed_handle(void) {
     build_docs();
-    ray_eval_str("(set __idx (hnsw-build (at __docs 'emb)))");
-    ray_eval_str("(hnsw-free __idx)");
+    ray_eval_str("(set __idx (.emb.hnsw-build (at __docs 'emb)))");
+    ray_eval_str("(.emb.hnsw-free __idx)");
     /* __idx now has attr cleared AND i64=0.  The attr-cleared state is
      * caught by the handle-type check; ensure a hypothetical attr-still-set
      * but i64=0 state also errors cleanly.  We hit the same error path via
      * the type check — just assert the query errors rather than crashes. */
     ray_t* r = ray_eval_str(
-        "(select {from: __docs nearest: (ann __idx [1.0 0.0 0.0]) take: 1})");
+        "(select {from: __docs nearest: (.emb.ann __idx [1.0 0.0 0.0]) take: 1})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
@@ -749,14 +749,14 @@ static test_result_t test_select_nearest_ann_freed_handle(void) {
  * or the owned query buffer.  ASan catches leaks/UAF at runtime teardown. */
 static test_result_t test_select_nearest_ann_projection_error(void) {
     build_docs();
-    /* `(hnsw-build (at __docs 'emb))` is inline and rc=1.  The projection
+    /* `(.emb.hnsw-build (at __docs 'emb))` is inline and rc=1.  The projection
      * uses an unknown function name that compile_expr_dag cannot lower —
      * the error path must release the nearest handle and free the query
      * buffer before returning. */
     ray_t* r = ray_eval_str(
         "(select {bad: (no-such-function id) "
         "         from: __docs "
-        "         nearest: (ann (hnsw-build (at __docs 'emb) 'cosine) "
+        "         nearest: (.emb.ann (.emb.hnsw-build (at __docs 'emb) 'cosine) "
         "                       [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
@@ -765,7 +765,7 @@ static test_result_t test_select_nearest_ann_projection_error(void) {
      * worked.  A subsequent ordinary query must still run fine. */
     TEST_ASSERT_EQ_I(eval_i64(
         "(at (at (select {id: id from: __docs "
-        "                 nearest: (knn emb [1.0 0.0 0.0]) take: 1}) 'id) 0)"), 0);
+        "                 nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 1}) 'id) 0)"), 0);
     PASS();
 }
 
@@ -816,12 +816,12 @@ static test_result_t test_select_nearest_iterative_selective(void) {
     ray_eval_str(
         "(set __it_tbl (table [id score emb] "
         "  (list (til 300) __it_scores __it_list)))");
-    ray_eval_str("(set __it_idx (hnsw-build __it_list 'l2 16 100))");
+    ray_eval_str("(set __it_idx (.emb.hnsw-build __it_list 'l2 16 100))");
 
     ray_t* r = ray_eval_str(
         "(select {id: id score: score d: _dist from: __it_tbl "
         "         where: (> score 0.5) "
-        "         nearest: (ann __it_idx (at __it_list 0)) "
+        "         nearest: (.emb.ann __it_idx (at __it_list 0)) "
         "         take: 10})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -845,7 +845,7 @@ static test_result_t test_select_nearest_iterative_selective(void) {
         TEST_ASSERT_TRUE(dd[i] >= dd[i - 1]);
 
     ray_release(r);
-    ray_eval_str("(hnsw-free __it_idx)");
+    ray_eval_str("(.emb.hnsw-free __it_idx)");
     PASS();
 }
 
@@ -872,25 +872,25 @@ static test_result_t test_select_nearest_recall(void) {
     ray_eval_str(
         "(set __rv (table [id emb] "
         "  (list (til 200) __rv_list)))");
-    ray_eval_str("(set __rv_idx (hnsw-build __rv_list 'l2 16 100))");
+    ray_eval_str("(set __rv_idx (.emb.hnsw-build __rv_list 'l2 16 100))");
 
     int hits = 0;
     for (int q = 0; q < 20; q++) {
         char expr[512];
         snprintf(expr, sizeof(expr),
             "(at (at (select {from: __rv "
-            "                 nearest: (ann __rv_idx (at __rv_list %d)) "
+            "                 nearest: (.emb.ann __rv_idx (at __rv_list %d)) "
             "                 take: 1}) 'id) 0)", q);
         int64_t ann_id = eval_i64(expr);
 
         snprintf(expr, sizeof(expr),
             "(at (at (select {from: __rv "
-            "                 nearest: (knn emb (at __rv_list %d) 'l2) "
+            "                 nearest: (.emb.knn emb (at __rv_list %d) 'l2) "
             "                 take: 1}) 'id) 0)", q);
         int64_t knn_id = eval_i64(expr);
         if (ann_id == knn_id && ann_id == q) hits++;
     }
-    ray_eval_str("(hnsw-free __rv_idx)");
+    ray_eval_str("(.emb.hnsw-free __rv_idx)");
     TEST_ASSERT_EQ_I(hits, 20);
     PASS();
 }
@@ -1228,7 +1228,7 @@ static test_result_t test_knn_i32_source_vecs(void) {
 
     /* KNN over I32 vecs — rr_at_f64 RAY_I32 arm fires for each element. */
     ray_t* r = ray_eval_str(
-        "(select {from: __i32docs nearest: (knn emb [1.0 0.0 0.0] 'l2) take: 2})");
+        "(select {from: __i32docs nearest: (.emb.knn emb [1.0 0.0 0.0] 'l2) take: 2})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1262,7 +1262,7 @@ static test_result_t test_knn_i64_source_vecs(void) {
 
     /* Query with a float [1,0,0]: row 0 ([2,0,0]) is closest by L2. */
     ray_t* r = ray_eval_str(
-        "(select {from: __i64docs nearest: (knn emb [1.0 0.0 0.0] 'l2) take: 1})");
+        "(select {from: __i64docs nearest: (.emb.knn emb [1.0 0.0 0.0] 'l2) take: 1})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1280,7 +1280,7 @@ static test_result_t test_knn_i64_source_vecs(void) {
 static test_result_t test_ann_rerank_empty_source(void) {
     /* Build an index from a small non-empty list so the index is valid,
      * then create a 0-row table (matching dim=3) for the select. */
-    ray_eval_str("(set __ann_idx (hnsw-build "
+    ray_eval_str("(set __ann_idx (.emb.hnsw-build "
                  "(list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'cosine 4 50))");
 
     /* Empty source: 0-row table with emb LIST column. */
@@ -1289,7 +1289,7 @@ static test_result_t test_ann_rerank_empty_source(void) {
 
     ray_t* r = ray_eval_str(
         "(select {from: __ann_empty "
-        "         nearest: (ann __ann_idx [1.0 0.0 0.0]) "
+        "         nearest: (.emb.ann __ann_idx [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -1298,7 +1298,7 @@ static test_result_t test_ann_rerank_empty_source(void) {
     /* Source has 2 cols (id, emb); _dist not projected → schema unchanged. */
     TEST_ASSERT_EQ_I(ray_table_ncols(r), 2);
     ray_release(r);
-    ray_eval_str("(hnsw-free __ann_idx)");
+    ray_eval_str("(.emb.hnsw-free __ann_idx)");
     PASS();
 }
 
@@ -1309,12 +1309,12 @@ static test_result_t test_ann_rerank_filter_rejects_all(void) {
         "  (list [0 1 2] "
         "        [0.1 0.2 0.3] "
         "        (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))))");
-    ray_eval_str("(set __af_idx (hnsw-build (at __afdocs 'emb) 'cosine 4 50))");
+    ray_eval_str("(set __af_idx (.emb.hnsw-build (at __afdocs 'emb) 'cosine 4 50))");
 
     /* Filter rejects every row (score > 100) → accepted_count = 0. */
     ray_t* r = ray_eval_str(
         "(select {from: __afdocs where: (> score 100.0) "
-        "         nearest: (ann __af_idx [1.0 0.0 0.0]) "
+        "         nearest: (.emb.ann __af_idx [1.0 0.0 0.0]) "
         "         take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
@@ -1323,7 +1323,7 @@ static test_result_t test_ann_rerank_filter_rejects_all(void) {
     /* Source has 3 cols (id, score, emb); _dist not projected. */
     TEST_ASSERT_EQ_I(ray_table_ncols(r), 3);
     ray_release(r);
-    ray_eval_str("(hnsw-free __af_idx)");
+    ray_eval_str("(.emb.hnsw-free __af_idx)");
     PASS();
 }
 
@@ -1355,7 +1355,7 @@ static test_result_t test_knn_rerank_identity_scan_bad_row(void) {
 
     /* Identity scan (no where clause) — should hit the type error in the else branch. */
     ray_t* r = ray_eval_str(
-        "(select {from: __baddocs nearest: (knn emb [1.0 0.0 0.0]) take: 3})");
+        "(select {from: __baddocs nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
@@ -1389,7 +1389,7 @@ static test_result_t test_knn_rerank_filtered_scan_bad_row(void) {
     /* Filter keeps row 0 (score > 0.5); row 0's emb is a BOOL vec → type error. */
     ray_t* r = ray_eval_str(
         "(select {from: __baddocs2 where: (> score 0.5) "
-        "         nearest: (knn emb [1.0 0.0 0.0]) take: 2})");
+        "         nearest: (.emb.knn emb [1.0 0.0 0.0]) take: 2})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
@@ -1417,7 +1417,7 @@ static test_result_t test_knn_rerank_nullable_col_gather(void) {
     /* KNN query toward [0,1,0] (row 1 — the null row) — it must be selected.
      * This forces ray_vec_set_null to be called in gather_rows_with_dist. */
     ray_t* r = ray_eval_str(
-        "(select {from: __nulldocs nearest: (knn emb [0.0 1.0 0.0] 'l2) take: 3})");
+        "(select {from: __nulldocs nearest: (.emb.knn emb [0.0 1.0 0.0] 'l2) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1441,7 +1441,7 @@ static test_result_t test_knn_rerank_zero_query_cosine(void) {
     build_docs();
     /* Zero query vector: q_norm=0 → denom=0 in cosine distance → sim=0. */
     ray_t* r = ray_eval_str(
-        "(select {from: __docs nearest: (knn emb [0.0 0.0 0.0] 'cosine) take: 3})");
+        "(select {from: __docs nearest: (.emb.knn emb [0.0 0.0 0.0] 'cosine) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1464,7 +1464,7 @@ static test_result_t test_knn_rerank_heap_right_child(void) {
 
     /* Take top-3 nearest to [0,0] by L2 → heap fill order triggers right-child win. */
     ray_t* r = ray_eval_str(
-        "(select {from: __heapdocs nearest: (knn emb [0.0 0.0] 'l2) take: 3})");
+        "(select {from: __heapdocs nearest: (.emb.knn emb [0.0 0.0] 'l2) take: 3})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1497,7 +1497,7 @@ static test_result_t test_knn_f64_source_vecs(void) {
         "  (list [0 1 2] __f64vlist)))");
 
     ray_t* r = ray_eval_str(
-        "(select {from: __f64docs nearest: (knn emb [1.0 0.0 0.0] 'cosine) take: 1})");
+        "(select {from: __f64docs nearest: (.emb.knn emb [1.0 0.0 0.0] 'cosine) take: 1})");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, RAY_TABLE);
@@ -1528,7 +1528,7 @@ static test_result_t test_cos_dist_null_args(void) {
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     ray_release(v);
 
-    /* Same for l2-dist and inner-prod. */
+    /* Same for .emb.l2-dist and .emb.inner-prod. */
     r = ray_l2_dist_fn(NULL, NULL);
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     r = ray_inner_prod_fn(NULL, NULL);
@@ -1827,13 +1827,13 @@ static test_result_t test_knn_k_i32_i16(void) {
     /* Build col via eval. */
     ray_eval_str("(set __k_test_col (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))");
     /* k as I32 (1i suffix). */
-    TEST_ASSERT_EQ_I(eval_i64("(first (at (knn __k_test_col [1.0 0.0 0.0] 1i 'l2) '_rowid))"), 0);
+    TEST_ASSERT_EQ_I(eval_i64("(first (at (.emb.knn __k_test_col [1.0 0.0 0.0] 1i 'l2) '_rowid))"), 0);
     /* k as I16 (1h suffix). */
-    TEST_ASSERT_EQ_I(eval_i64("(first (at (knn __k_test_col [1.0 0.0 0.0] 1h 'l2) '_rowid))"), 0);
+    TEST_ASSERT_EQ_I(eval_i64("(first (at (.emb.knn __k_test_col [1.0 0.0 0.0] 1h 'l2) '_rowid))"), 0);
     PASS();
 }
 
-/* hnsw-build with I32/I64/F64 source vecs (rayvec_to_floats non-F32 path). */
+/* .emb.hnsw-build with I32/I64/F64 source vecs (rayvec_to_floats non-F32 path). */
 static test_result_t test_hnsw_build_non_f32_source(void) {
     /* F64 vectors → rayvec_to_floats takes the loop path. */
     double f64_vecs[3][3] = {{1.0,0.0,0.0},{0.0,1.0,0.0},{0.0,0.0,1.0}};
@@ -1885,7 +1885,7 @@ static test_result_t test_hnsw_build_non_f32_source(void) {
     PASS();
 }
 
-/* hnsw-build M out-of-range defaults: M=0 and M=999. */
+/* .emb.hnsw-build M out-of-range defaults: M=0 and M=999. */
 static test_result_t test_hnsw_build_m_out_of_range(void) {
     float vecs[3 * 3] = {
         1.0f, 0.0f, 0.0f,
@@ -1931,7 +1931,7 @@ static test_result_t test_hnsw_build_m_out_of_range(void) {
     PASS();
 }
 
-/* hnsw-build ef_c out-of-range defaults: ef_c=0 and ef_c=9999. */
+/* .emb.hnsw-build ef_c out-of-range defaults: ef_c=0 and ef_c=9999. */
 static test_result_t test_hnsw_build_efc_out_of_range(void) {
     float vecs[3 * 3] = {
         1.0f, 0.0f, 0.0f,
@@ -1982,20 +1982,20 @@ static test_result_t test_hnsw_build_efc_out_of_range(void) {
 /* list_vec_validate return 3: mixed-dimension vectors in LIST. */
 static test_result_t test_list_validate_dim_mismatch(void) {
     /* Build LIST with dim-mismatch: [1,0,0] and [1,0]. */
-    ray_t* r = ray_eval_str("(cos-dist (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0])");
+    ray_t* r = ray_eval_str("(.emb.cos-dist (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0])");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     /* Same for knn. */
-    r = ray_eval_str("(knn (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0] 1)");
+    r = ray_eval_str("(.emb.knn (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0] 1)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    /* Same for hnsw-build. */
-    r = ray_eval_str("(hnsw-build (list [1.0 0.0 0.0] [1.0 0.0]))");
+    /* Same for .emb.hnsw-build. */
+    r = ray_eval_str("(.emb.hnsw-build (list [1.0 0.0 0.0] [1.0 0.0]))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
 
 /* list_vec_validate return 2: first element non-numeric. */
 static test_result_t test_list_validate_first_bad(void) {
-    ray_t* r = ray_eval_str("(cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0])");
+    ray_t* r = ray_eval_str("(.emb.cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0])");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     /* norm on list with bad first element. */
     r = ray_eval_str("(norm (list (as 'BOOL [true false]) [1.0 0.0]))");
@@ -2005,44 +2005,44 @@ static test_result_t test_list_validate_first_bad(void) {
 
 /* knn empty column with zero-dim query → empty result table. */
 static test_result_t test_knn_empty_column(void) {
-    ray_t* r = ray_eval_str("(count (knn (list) (as 'F64 []) 1))");
+    ray_t* r = ray_eval_str("(count (.emb.knn (list) (as 'F64 []) 1))");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     PASS();
 }
 
-/* cos-dist with zero-denom: zero row vector → denom == 0, sim=0, dist=1. */
+/* .emb.cos-dist with zero-denom: zero row vector → denom == 0, sim=0, dist=1. */
 static test_result_t test_cos_dist_zero_denom(void) {
     /* Zero row vector. */
-    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [0.0 0.0] [1.0 0.0])"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.cos-dist [0.0 0.0] [1.0 0.0])"), 1.0, 1e-6);
     /* Both zero vectors. */
-    TEST_ASSERT_EQ_F(eval_f64("(cos-dist [0.0 0.0] [0.0 0.0])"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(.emb.cos-dist [0.0 0.0] [0.0 0.0])"), 1.0, 1e-6);
     /* LIST with zero row. */
-    TEST_ASSERT_EQ_F(eval_f64("(at (cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 0)"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(at (.emb.cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 0)"), 1.0, 1e-6);
     PASS();
 }
 
 /* knn with IP metric: row_score dispatches through RAY_HNSW_IP → negated dot. */
 static test_result_t test_knn_ip_negated_distance(void) {
-    double d = eval_f64("(first (at (knn (list [1.0 0.0 0.0] [0.0 1.0 0.0]) [1.0 0.0 0.0] 1 'ip) '_dist))");
+    double d = eval_f64("(first (at (.emb.knn (list [1.0 0.0 0.0] [0.0 1.0 0.0]) [1.0 0.0 0.0] 1 'ip) '_dist))");
     TEST_ASSERT_EQ_F(d, -1.0, 1e-6);
     PASS();
 }
 
 /* vec_binary_metric scalar path: a->len <= 0 → length error. */
 static test_result_t test_metric_scalar_empty_vec(void) {
-    ray_t* r = ray_eval_str("(cos-dist (as 'F32 []) (as 'F32 []))");
+    ray_t* r = ray_eval_str("(.emb.cos-dist (as 'F32 []) (as 'F32 []))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    r = ray_eval_str("(l2-dist (as 'F32 []) (as 'F32 []))");
+    r = ray_eval_str("(.emb.l2-dist (as 'F32 []) (as 'F32 []))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    r = ray_eval_str("(inner-prod (as 'F32 []) (as 'F32 []))");
+    r = ray_eval_str("(.emb.inner-prod (as 'F32 []) (as 'F32 []))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
 
-/* hnsw-build on empty list → dim <= 0 → length error. */
+/* .emb.hnsw-build on empty list → dim <= 0 → length error. */
 static test_result_t test_hnsw_build_empty_list(void) {
-    ray_t* r = ray_eval_str("(hnsw-build (list))");
+    ray_t* r = ray_eval_str("(.emb.hnsw-build (list))");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
     PASS();
 }
@@ -2050,10 +2050,10 @@ static test_result_t test_hnsw_build_empty_list(void) {
 /* knn: k > nrows clamping and insertion sort on ascending output. */
 static test_result_t test_knn_k_clamp_and_sort(void) {
     /* 3 rows, k=100 → clamped to 3. */
-    TEST_ASSERT_EQ_I(eval_i64("(count (knn (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 0.0] 100 'l2))"), 3);
+    TEST_ASSERT_EQ_I(eval_i64("(count (.emb.knn (list [1.0 0.0] [0.0 1.0] [1.0 1.0]) [1.0 0.0] 100 'l2))"), 3);
     /* Verify ascending sort. */
-    double d0 = eval_f64("(first (at (knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
-    double d2 = eval_f64("(last (at (knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
+    double d0 = eval_f64("(first (at (.emb.knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
+    double d2 = eval_f64("(last (at (.emb.knn (list [5.0 0.0] [3.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))");
     TEST_ASSERT_EQ_F(d0, 1.0, 1e-6);
     TEST_ASSERT_EQ_F(d2, 5.0, 1e-6);
     PASS();
@@ -2061,43 +2061,43 @@ static test_result_t test_knn_k_clamp_and_sort(void) {
 
 /* ann: ef_s out-of-range keeps computed ef. */
 static test_result_t test_ann_efs_out_of_range(void) {
-    ray_eval_str("(set __efs_idx (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))");
+    ray_eval_str("(set __efs_idx (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))");
     /* ef_s=0 → keeps default. */
-    TEST_ASSERT_EQ_I(eval_i64("(count (ann __efs_idx [1.0 0.0 0.0] 2 0))"), 2);
+    TEST_ASSERT_EQ_I(eval_i64("(count (.emb.ann __efs_idx [1.0 0.0 0.0] 2 0))"), 2);
     /* ef_s=9999 → v > 4096, keeps computed ef. */
-    TEST_ASSERT_EQ_I(eval_i64("(count (ann __efs_idx [1.0 0.0 0.0] 2 9999))"), 2);
+    TEST_ASSERT_EQ_I(eval_i64("(count (.emb.ann __efs_idx [1.0 0.0 0.0] 2 9999))"), 2);
     /* ef_s as non-int → type error. */
-    ray_t* r = ray_eval_str("(ann __efs_idx [1.0 0.0 0.0] 2 1.5)");
+    ray_t* r = ray_eval_str("(.emb.ann __efs_idx [1.0 0.0 0.0] 2 1.5)");
     TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    ray_eval_str("(hnsw-free __efs_idx)");
+    ray_eval_str("(.emb.hnsw-free __efs_idx)");
     PASS();
 }
 
-/* hnsw-info for each metric to cover the switch. */
+/* .emb.hnsw-info for each metric to cover the switch. */
 static test_result_t test_hnsw_info_all_metrics(void) {
     /* Cosine → "cosine" */
-    ray_eval_str("(set __info_cos (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'cosine))");
-    ray_t* r = ray_eval_str("(== (at (hnsw-info __info_cos) 'metric) 'cosine)");
+    ray_eval_str("(set __info_cos (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'cosine))");
+    ray_t* r = ray_eval_str("(== (at (.emb.hnsw-info __info_cos) 'metric) 'cosine)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(hnsw-free __info_cos)");
+    ray_eval_str("(.emb.hnsw-free __info_cos)");
 
     /* L2 → "l2" */
-    ray_eval_str("(set __info_l2 (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'l2))");
-    r = ray_eval_str("(== (at (hnsw-info __info_l2) 'metric) 'l2)");
+    ray_eval_str("(set __info_l2 (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'l2))");
+    r = ray_eval_str("(== (at (.emb.hnsw-info __info_l2) 'metric) 'l2)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(hnsw-free __info_l2)");
+    ray_eval_str("(.emb.hnsw-free __info_l2)");
 
     /* IP → "ip" */
-    ray_eval_str("(set __info_ip (hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'ip))");
-    r = ray_eval_str("(== (at (hnsw-info __info_ip) 'metric) 'ip)");
+    ray_eval_str("(set __info_ip (.emb.hnsw-build (list [1.0 0.0 0.0] [0.0 1.0 0.0]) 'ip))");
+    r = ray_eval_str("(== (at (.emb.hnsw-info __info_ip) 'metric) 'ip)");
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_U(r->b8, 1);
     ray_release(r);
-    ray_eval_str("(hnsw-free __info_ip)");
+    ray_eval_str("(.emb.hnsw-free __info_ip)");
     PASS();
 }
 
@@ -2110,15 +2110,15 @@ static test_result_t test_knn_heap_patterns(void) {
      * Row 4 (d=2): 2 < 5 (new root after sift) → replace, sift-down.
      * Row 5 (d=1): 1 < 4 (new root) → replace, sift-down.
      * Final sorted: 1,2,3. */
-    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 1.0, 1e-6);
-    TEST_ASSERT_EQ_F(eval_f64("(last  (at (knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 3.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (.emb.knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(last  (at (.emb.knn (list [6.0 0.0] [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]) [0.0 0.0] 3 'l2) '_dist))"), 3.0, 1e-6);
 
     /* k=1: first entry fills, subsequent replacements exercise sift-down
      * in the degenerate single-element heap (best == j, breaks immediately). */
-    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [6.0 0.0] [5.0 0.0] [1.0 0.0]) [0.0 0.0] 1 'l2) '_dist))"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (.emb.knn (list [6.0 0.0] [5.0 0.0] [1.0 0.0]) [0.0 0.0] 1 'l2) '_dist))"), 1.0, 1e-6);
 
     /* All ties: heap fills but no replacements needed (d >= heap[0].d fails). */
-    TEST_ASSERT_EQ_F(eval_f64("(first (at (knn (list [1.0 0.0] [0.0 1.0] [-1.0 0.0] [0.0 -1.0]) [0.0 0.0] 4 'l2) '_dist))"), 1.0, 1e-6);
+    TEST_ASSERT_EQ_F(eval_f64("(first (at (.emb.knn (list [1.0 0.0] [0.0 1.0] [-1.0 0.0] [0.0 -1.0]) [0.0 0.0] 4 'l2) '_dist))"), 1.0, 1e-6);
     PASS();
 }
 
