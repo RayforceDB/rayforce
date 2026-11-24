@@ -1,4 +1,4 @@
-# `.time.*` — clock and timers
+# `.time.*` — clock, timers and time zones
 
 Monotonic clock access plus a recurring-callback scheduler. Timers integrate into the runtime's poll loop — they only fire when control is back in the loop, i.e. between REPL inputs (interactive or piped: both read stdin through the loop), between IPC requests, or while idling in server-only mode. A long-running synchronous evaluation will defer pending timers until it returns. A script, or a piped session that reached end of input, stays alive until its pending timers are spent, so a one-shot timer set by a script fires before the process exits; a periodic timer keeps it running until the script ends the process itself. An open client handle does not keep a script alive.
 
@@ -14,6 +14,9 @@ The clock is the same `CLOCK_MONOTONIC` source the scheduler uses for its deadli
 | [`.time.now`](#time-now) | variadic | — | Current monotonic time in milliseconds. |
 | [`.time.timer.set`](#time-timer-set) | variadic | restricted | Schedule a callback; return its timer id. |
 | [`.time.timer.del`](#time-timer-del) | unary | restricted | Cancel a scheduled timer (idempotent). |
+| [`.time.tz.local`](#time-tz-local) | binary | — | A UTC timestamp on a time zone's wall clock. |
+| [`.time.tz.offset`](#time-tz-offset) | binary | — | A time zone's offset from UTC at a timestamp. |
+| [`.time.tz.version`](#time-tz-version) | variadic | — | The release of the time zone database built in. |
 
 ## `.time.now` { #time-now }
 
@@ -69,6 +72,55 @@ Errors: `type` if `id` isn't an `i64`.
 (.time.timer.del id)        ;; second call: null, not an error
 (.time.timer.del 999999)    ;; unknown id: null
 ```
+
+## `.time.tz.local` { #time-tz-local }
+
+Signature: `(.time.tz.local 'Zone ts)`. Reads `ts`, a `timestamp` atom or vector holding instants in UTC, on the wall clock of `Zone`, and returns a `timestamp` of the same shape. `Zone` is a symbol naming an [IANA time zone](https://www.iana.org/time-zones), such as `'America/New_York` or `'Asia/Kolkata`. The result carries no zone: it is the date and time a clock on the wall in that zone showed, so `trunc`, `date`, `hh` and `xbar` bucket it by local days and hours.
+
+A null stays null. A wall clock past the `timestamp` range is null.
+
+Errors: `type` if `Zone` is not a symbol or `ts` is not a timestamp; `domain` if the database has no zone of that name.
+
+```lisp
+(.time.tz.local 'America/New_York 2024.07.02D01:30:00.000000000)
+;; 2024.07.01D21:30:00.000000000 — still 1 July in New York
+
+;; average price per New York calendar day
+(select {from: trades
+         by: {day: (trunc 'day (.time.tz.local 'America/New_York ts))}
+         px: (avg price)})
+
+;; per local hour of the day, over many days
+(select {from: trades
+         by: {hour: (hh (.time.tz.local 'America/New_York ts))}
+         n: (count price)})
+```
+
+Inside a `select` the call compiles to an operator of its own, so on a partitioned table a `by:` key built from it is computed partition by partition, and the table is not copied into memory first.
+
+## `.time.tz.offset` { #time-tz-offset }
+
+Signature: `(.time.tz.offset 'Zone ts)`. Returns how far `Zone` is from UTC at each instant of `ts`, as a `timespan` of the same shape, positive east of UTC. `(.time.tz.local z ts)` is `(+ ts (.time.tz.offset z ts))`.
+
+Nulls and errors are as for `.time.tz.local`.
+
+```lisp
+(.time.tz.offset 'America/New_York 2024.01.01D12:00:00.000000000)   ;; -0D05:00:00
+(.time.tz.offset 'America/New_York 2024.07.01D12:00:00.000000000)   ;; -0D04:00:00
+(.time.tz.offset 'Asia/Kolkata     2024.07.01D12:00:00.000000000)   ;;  0D05:30:00
+```
+
+## `.time.tz.version` { #time-tz-version }
+
+Signature: `(.time.tz.version)`. Returns the release of the IANA database built into this binary, as a string such as `"2026f"`.
+
+## Notes on time zones
+
+- **The database is built in.** Every zone and old alias of the IANA database is compiled into the binary, about 230 KB, so the functions answer the same on every platform and need no files on the host. A zone's rules are those of the release `.time.tz.version` names. The database is refreshed with each Rayforce release (see `RELEASE.md`), so a rule a country changes takes effect here from the next release.
+- **UTC to wall clock only.** Every instant has exactly one wall-clock reading, so this direction is a function. The reverse is not: where clocks go forward a wall-clock hour never happens, and where they go back an hour happens twice. No function converts a wall clock to an instant.
+- **Days are not all 24 hours.** A local day on which the clocks change holds 23 or 25 hours of rows. Averages per day are unaffected; sums and counts on that day are not comparable with its neighbours.
+- **Hours across a clock change.** `(trunc 'hour (.time.tz.local z ts))` puts the two passes through a repeated hour into one bucket. To keep every bucket one real hour, bucket the instant, `(trunc 'hour ts)`, and show `.time.tz.local` of the bucket as its label; `.time.tz.offset` tells the two same-labelled buckets apart.
+- **A table of changes per zone.** A zone is parsed once, on first use, into the list of instants its offset changes at, through to the end of the `timestamp` range. A lookup is a binary search in that list, skipped while consecutive rows fall between the same two changes, which is nearly always in a time-ordered column.
 
 ## Notes on the scheduler
 
