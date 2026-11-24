@@ -34,6 +34,7 @@
 #include "core/pool.h"
 #include "core/poll.h"
 #include "core/platform.h"
+#include "page_cache.h"   /* ray_test_file_refaults: the fault budget */
 #include "core/timer.h"
 #include "core/profile.h"   /* ray_profile_now_ns: bounded waits */
 #include "mem/heap.h"
@@ -2563,12 +2564,19 @@ static test_result_t test_scan_read_ahead_queries(void) {
                          : (test_result_t){ TEST_FAIL, "open" };
             goto out;
         }
+        int64_t refaults = ray_test_file_refaults();
         long before = pq_majflt();
         if (!pq_ok(q[i].query)) { res = (test_result_t){ TEST_FAIL, q[i].query }; goto out; }
         long faults = pq_majflt() - before;
-        if (faults > (long)(n / 4096 / 4)) {
-            snprintf(msg, sizeof(msg), "%s: %ld major faults over %zu pages of %s",
-                     q[i].pass, faults, n / 4096, q[i].col);
+        /* the budget is raised by the reclaimed file pages read back over
+         * the query (page_cache.h) and no more: reclaim may drop pages asked
+         * for ahead (#1579), and refaults not the test's own cost slack,
+         * not the check */
+        int64_t r = ray_test_file_refaults();
+        long excused = (refaults >= 0 && r > refaults) ? (long)(r - refaults) : 0;
+        if (faults - excused > (long)(n / 4096 / 4)) {
+            snprintf(msg, sizeof(msg), "%s: %ld major faults (%ld excused as refaults) over %zu pages of %s",
+                     q[i].pass, faults, excused, n / 4096, q[i].col);
             res = (test_result_t){ TEST_FAIL, msg };
             goto out;
         }
