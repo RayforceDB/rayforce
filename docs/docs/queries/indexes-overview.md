@@ -26,9 +26,9 @@ Attach one of four kinds to a numeric vector (`.idx.hash` also to a symbol, stri
 
 ### 2. Vector ANN index — HNSW
 
-Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics — cosine, L2, inner product. Built once with `hnsw-build`, queried with `ann`, optionally persisted to a directory with `hnsw-save` / `hnsw-load`.
+Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics — cosine, L2, inner product. Built once with `.emb.hnsw.build`, queried with `.emb.ann`, optionally persisted to a directory with `.emb.hnsw.set` / `.emb.hnsw.get`.
 
-**Surface:** `(hnsw-build col [metric] [M] [ef_c])`, `(ann handle query k [ef_search])`, `(knn col query k [metric])`, `(hnsw-save handle dir)`, `(hnsw-load dir)`, `(hnsw-free handle)`, `(hnsw-info handle)`. Brute-force `knn` needs no index and exists alongside.
+**Surface:** `(.emb.hnsw.build col [metric] [M] [ef_c])`, `(.emb.ann handle query k [ef_search])`, `(.emb.knn col query k [metric])`, `(.emb.hnsw.set dir handle)`, `(.emb.hnsw.get dir)`, `(.emb.hnsw.free handle)`, `(.emb.hnsw.info handle)`. Brute-force `.emb.knn` needs no index and exists alongside.
 
 **See:** [Vector Search & HNSW](../graph/vector-search.md) · [Indexes Guide: ANN workflow](../guides/indexes.md#workflow-ann).
 
@@ -68,7 +68,7 @@ Match the shape of your query to the structure that fits it.
 | Make repeated `=` / `in` / `find` over a numeric, symbol, string or guid column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites (symbol, string and guid columns included) |
 | Binary-search a numeric column for range predicates or reuse the permutation for ORDER BY / distinct | `.idx.sort` — ascending row-id permutation | Yes — filter range (EQ/LT/LE/GT/GE), single-key ASC ORDER BY, distinct |
 | Cheaply reject "definitely not in this set" probes for integer EQ filters | `.idx.bloom` — m-bit probabilistic filter | Yes — definite-absent proof at the filter EQ site (integer-family only) |
-| Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(hnsw-build)` + `(ann)` | Yes — `(ann)` consults the index |
+| Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(.emb.hnsw.build)` + `(.emb.ann)` | Yes — `(.emb.ann)` consults the index |
 | Resolve a cross-table reference at query time without a materialized join | Linked column — `(.col.link)` | Yes — column dereference resolves through the link |
 | Skip whole sub-tables in a parted dataset based on the partition discriminator | Partition pruning — date / int / sym partitioning | Yes — optimizer pass rewrites filters |
 | Traverse a graph — BFS, shortest path, betweenness, MST | CSR — transparent under graph opcodes | Yes — every graph opcode reads CSR directly |
@@ -78,7 +78,7 @@ Match the shape of your query to the structure that fits it.
 Rayforce is honest about phasing. The structures above all *build* correctly; integration depth varies by kind.
 
 - **Per-column accelerators** — build kernels, the `(.idx.*)` surface, and executor routing are all shipped and tested. The executor consults indexes at six sites (filter comparisons, filter IN, ORDER BY, distinct, find); every fast path falls back to the scan on any miss and returns identical results. See [Routing Table](indexes.md#routing-table) for the full matrix and eligibility conditions. Set `RAY_IDX_STATS=1` to observe consult/hit counts at exit.
-- **HNSW** — fully wired. `(ann)` consults the index immediately.
+- **HNSW** — fully wired. `(.emb.ann)` consults the index immediately.
 - **Linked columns** — fully wired. Dereference resolves through the link at query time.
 - **Partition pruning** — the optimizer's pruning pass skips partitions whose discriminator falls outside a filter predicate's range. See [Pipeline & Optimizer](../architecture/pipeline.md).
 - **CSR** — fully wired and used by every graph opcode.

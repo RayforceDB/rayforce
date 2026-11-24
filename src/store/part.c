@@ -1362,7 +1362,7 @@ ray_t* ray_parted_fill(const char* db_root) {
                 ray_t* full = ray_read_splayed(tdir, sym_path);
                 if (!full || RAY_IS_ERR(full)) {
                     err = full ? ray_err_from_obj(full) : RAY_ERR_OOM;
-                    const char* detail = ray_error_msg();
+                    const char* detail = ray_err_msg(full);
                     snprintf(cause, sizeof(cause), "table %s (partition %s): %s",
                              tname, part_dirs[templ],
                              detail && *detail ? detail : "template read failed");
@@ -1373,7 +1373,7 @@ ray_t* ray_parted_fill(const char* db_root) {
                 ray_release(full);
                 if (!empty_tbl || RAY_IS_ERR(empty_tbl)) {
                     err = empty_tbl ? ray_err_from_obj(empty_tbl) : RAY_ERR_OOM;
-                    const char* detail = ray_error_msg();
+                    const char* detail = ray_err_msg(empty_tbl);
                     snprintf(cause, sizeof(cause), "table %s: %s", tname,
                              detail && *detail ? detail : "empty table construction failed");
                     if (empty_tbl) ray_error_free(empty_tbl);

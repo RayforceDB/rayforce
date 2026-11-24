@@ -81,7 +81,7 @@ included, and joins them left to right: `(concat s "-" u)`.
 
 **`(like str pattern)`** — binary · element-wise
 
-Case-sensitive glob pattern matching. Returns a boolean (or boolean vector for vector input). Supports `*` (match any sequence of characters) and `?` (match any single character). Works on both RAY_SYM and RAY_STR columns.
+Case-sensitive glob pattern matching. Returns a boolean (or boolean vector for vector input). Supports `*` (match any sequence of characters) and `?` (match any single character). Works on both RAY_SYM and RAY_STR columns. The pattern is a string atom, written or computed (`(like name (first p))`), matched against every row; or a string column or vector, matched row by row, each row's text against that row's pattern (`(like name pat)` with `pat` a STR column), with a `length` error when the two have different lengths. Any other pattern, a symbol, a SYM column or a number, is a `type` error, in a query as in a direct call. A query's `ilike` takes its pattern the same way.
 
 ```lisp
 (like "hello world" "*world")

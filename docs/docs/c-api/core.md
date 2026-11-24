@@ -549,7 +549,9 @@ Rayforce uses two error mechanisms: `ray_err_t` enum return codes for non-pointe
 
 ### ray_error
 
-Creates an error object with an 8-byte packed ASCII code and a formatted message. The error object is a `ray_t` with `type == RAY_ERROR`. Use `RAY_IS_ERR()` to test return values.
+Creates an error object with a code of at most 7 ASCII bytes and a formatted message. The error object is a `ray_t` with `type == RAY_ERROR`. Use `RAY_IS_ERR()` to test return values.
+
+The error owns its message. The formatted text, at most 255 bytes, is copied into the error's own block, so it lives as long as the error and is freed with it by `ray_error_free`, on whichever thread frees it. Errors raised later, on this thread or another, do not change it. With `fmt == NULL` the error has no message, except that `fpenv` supplies a default explanation. The message is also left as the thread's last message, `ray_error_msg()`.
 
 ```c
 ray_t* ray_error(const char* code, const char* fmt, ...);
@@ -557,6 +559,17 @@ ray_t* ray_error(const char* code, const char* fmt, ...);
 /* Create a type error */
 return ray_error("type", "expected I64, got F64");
 ```
+
+### ray_err_code / ray_err_msg
+
+`ray_err_code(err)` is the error's code. `ray_err_msg(err)` is the message the error was raised with: NUL-terminated, owned by `err` and valid while `err` is. It is `NULL` when the error has none, when `err` is not an error, and for `RAY_OOM_OBJ`, the static error returned when there was no memory to make one.
+
+```c
+const char* ray_err_code(ray_t* err);
+const char* ray_err_msg(ray_t* err);
+```
+
+Serialization (`ray_ser`, IPC, the journal) writes each error's own message, so a list holding several errors writes each one's text. `ray_error_msg()` is the message of the last error made on the calling thread; for an error object at hand, use `ray_err_msg(err)`.
 
 ### RAY_IS_ERR(p)
 

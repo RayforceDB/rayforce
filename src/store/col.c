@@ -202,7 +202,42 @@ static bool is_serializable_type(int8_t t) {
  * structural rather than size-estimating: the save path can still report I/O
  * or OOM later, but deterministic unsupported/corrupt object graphs are
  * rejected before a splayed overwrite replaces any live column. */
+/* The nested-list writer, its preflight and its reader recurse once per
+ * level of nesting, and a value can be nested arbitrarily deep at run time
+ * (#1591): the writer and its preflight stop past COL_MAX_NEST levels, the
+ * depth ser and de take, or at the thread's stack reserve, with a limit
+ * error; the reader stops at the stack reserve. */
+#define COL_MAX_NEST 512
+static _Thread_local int g_col_nest;
+static _Thread_local const char* g_col_limit_msg;   /* why a save refused (ray_col_limit_msg) */
+static bool col_nest_enter(void) {
+    if (g_col_nest >= COL_MAX_NEST) {
+        g_col_limit_msg = "save: list column nested deeper than 512 levels";
+        return false;
+    }
+    if (ray_stack_short()) {
+        g_col_limit_msg = "save: list column nested too deep for this thread's stack";
+        return false;
+    }
+    g_col_nest++;
+    return true;
+}
+
+const char* ray_col_limit_msg(void) {
+    const char* m = g_col_limit_msg;
+    g_col_limit_msg = NULL;
+    return m;
+}
+static inline void col_nest_leave(void) { g_col_nest--; }
+
+static ray_err_t col_preflight_rec(ray_t* obj);
 static ray_err_t col_preflight_recursive(ray_t* obj) {
+    if (!col_nest_enter()) return RAY_ERR_LIMIT;
+    ray_err_t e = col_preflight_rec(obj);
+    col_nest_leave();
+    return e;
+}
+static ray_err_t col_preflight_rec(ray_t* obj) {
     if (!obj || RAY_IS_ERR(obj)) return RAY_ERR_TYPE;
     int8_t type = obj->type;
     if (type == RAY_ENCCOL) return RAY_OK;
@@ -362,9 +397,15 @@ static ray_t* col_load_str_vec(const uint8_t* ptr, size_t remaining) {
  * global table, so nested SYM data is always runtime-domain.  Tables
  * with ONLY nested sym data therefore need no symfile at all. */
 
-static ray_err_t col_write_recursive(ray_t* obj, FILE* f);
-
+static ray_err_t col_write_rec(ray_t* obj, FILE* f);
 static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
+    if (!col_nest_enter()) return RAY_ERR_LIMIT;
+    ray_err_t e = col_write_rec(obj, f);
+    col_nest_leave();
+    return e;
+}
+
+static ray_err_t col_write_rec(ray_t* obj, FILE* f) {
     if (!obj || RAY_IS_ERR(obj)) return RAY_ERR_TYPE;
 
     int8_t type = obj->type;
@@ -481,9 +522,15 @@ static ray_err_t col_write_recursive(ray_t* obj, FILE* f) {
 }
 
 /* Read recursive element from mapped buffer */
-static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining);
-
+static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining);
+/* The reader takes the file as written (an earlier writer had no depth
+ * bound): only the stack stops it. */
 static ray_t* col_read_recursive(const uint8_t** pp, size_t* remaining) {
+    if (ray_stack_short()) return ray_error("limit", "column: nesting too deep for this thread's stack");
+    return col_read_rec(pp, remaining);
+}
+
+static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
     if (*remaining < 1) return ray_error("corrupt", NULL);
     int8_t type;
     memcpy(&type, *pp, 1);

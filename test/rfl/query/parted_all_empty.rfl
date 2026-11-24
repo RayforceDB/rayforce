@@ -1,0 +1,87 @@
+;; @requires: posix
+;; A parted table whose partitions are all empty answers as an empty plain
+;; table of the same columns: a keyless select of aggregates gives one row
+;; of the aggregates over no values (#1614), a by: gives no row.  Every
+;; aggregating or grouping select raised nyi (#1621).
+(set T (table [c f v s] (list [1 5] [1.5 2.0] [10 20] [a b])))
+(set E (take T 0))
+(.sys.exec "rm -rf /tmp/rf_parted_all_empty")
+(.db.splayed.set "/tmp/rf_parted_all_empty/2024.01.01/t/" E)
+(.db.splayed.set "/tmp/rf_parted_all_empty/2024.01.02/t/" E)
+(set P (.db.parted.get "/tmp/rf_parted_all_empty/" 't))
+(count P) -- 0
+
+(select {from: P a: (sum c)}) -- (select {from: E a: (sum c)})
+(select {from: P a: (sum c) where: (> v 0)}) -- (select {from: E a: (sum c) where: (> v 0)})
+(select {from: P a: (count c)}) -- (select {from: E a: (count c)})
+(select {from: P a: (count c) where: (> v 0)}) -- (select {from: E a: (count c) where: (> v 0)})
+(select {from: P a: (min c)}) -- (select {from: E a: (min c)})
+(select {from: P a: (min c) where: (> v 0)}) -- (select {from: E a: (min c) where: (> v 0)})
+(select {from: P a: (max c)}) -- (select {from: E a: (max c)})
+(select {from: P a: (max c) where: (> v 0)}) -- (select {from: E a: (max c) where: (> v 0)})
+(select {from: P a: (avg c)}) -- (select {from: E a: (avg c)})
+(select {from: P a: (avg c) where: (> v 0)}) -- (select {from: E a: (avg c) where: (> v 0)})
+(select {from: P a: (first c)}) -- (select {from: E a: (first c)})
+(select {from: P a: (first c) where: (> v 0)}) -- (select {from: E a: (first c) where: (> v 0)})
+(select {from: P a: (last c)}) -- (select {from: E a: (last c)})
+(select {from: P a: (last c) where: (> v 0)}) -- (select {from: E a: (last c) where: (> v 0)})
+(select {from: P a: (prod c)}) -- (select {from: E a: (prod c)})
+(select {from: P a: (prod c) where: (> v 0)}) -- (select {from: E a: (prod c) where: (> v 0)})
+(select {from: P a: (all c)}) -- (select {from: E a: (all c)})
+(select {from: P a: (all c) where: (> v 0)}) -- (select {from: E a: (all c) where: (> v 0)})
+(select {from: P a: (any c)}) -- (select {from: E a: (any c)})
+(select {from: P a: (any c) where: (> v 0)}) -- (select {from: E a: (any c) where: (> v 0)})
+(select {from: P a: (med c)}) -- (select {from: E a: (med c)})
+(select {from: P a: (med c) where: (> v 0)}) -- (select {from: E a: (med c) where: (> v 0)})
+(select {from: P a: (dev c)}) -- (select {from: E a: (dev c)})
+(select {from: P a: (dev c) where: (> v 0)}) -- (select {from: E a: (dev c) where: (> v 0)})
+(select {from: P a: (var c)}) -- (select {from: E a: (var c)})
+(select {from: P a: (var c) where: (> v 0)}) -- (select {from: E a: (var c) where: (> v 0)})
+(select {from: P a: (stddev c)}) -- (select {from: E a: (stddev c)})
+(select {from: P a: (stddev c) where: (> v 0)}) -- (select {from: E a: (stddev c) where: (> v 0)})
+(select {from: P a: (dev_pop c)}) -- (select {from: E a: (dev_pop c)})
+(select {from: P a: (dev_pop c) where: (> v 0)}) -- (select {from: E a: (dev_pop c) where: (> v 0)})
+(select {from: P a: (var_pop c)}) -- (select {from: E a: (var_pop c)})
+(select {from: P a: (var_pop c) where: (> v 0)}) -- (select {from: E a: (var_pop c) where: (> v 0)})
+(select {from: P a: (stddev_pop c)}) -- (select {from: E a: (stddev_pop c)})
+(select {from: P a: (stddev_pop c) where: (> v 0)}) -- (select {from: E a: (stddev_pop c) where: (> v 0)})
+(select {from: P a: (mode c)}) -- (select {from: E a: (mode c)})
+(select {from: P a: (mode c) where: (> v 0)}) -- (select {from: E a: (mode c) where: (> v 0)})
+(select {from: P a: (quantile f 0.5)}) -- (select {from: E a: (quantile f 0.5)})
+(select {from: P a: (quantile f 0.5) where: (> v 0)}) -- (select {from: E a: (quantile f 0.5) where: (> v 0)})
+(select {from: P a: (sum f)}) -- (select {from: E a: (sum f)})
+(select {from: P a: (sum f) where: (> v 0)}) -- (select {from: E a: (sum f) where: (> v 0)})
+(select {from: P a: (min f)}) -- (select {from: E a: (min f)})
+(select {from: P a: (min f) where: (> v 0)}) -- (select {from: E a: (min f) where: (> v 0)})
+(select {from: P a: (first s)}) -- (select {from: E a: (first s)})
+(select {from: P a: (first s) where: (> v 0)}) -- (select {from: E a: (first s) where: (> v 0)})
+(select {from: P a: (count s)}) -- (select {from: E a: (count s)})
+(select {from: P a: (count s) where: (> v 0)}) -- (select {from: E a: (count s) where: (> v 0)})
+(select {from: P a: (sum (+ c 1))}) -- (select {from: E a: (sum (+ c 1))})
+(select {from: P a: (sum (+ c 1)) where: (> v 0)}) -- (select {from: E a: (sum (+ c 1)) where: (> v 0)})
+
+;; the identities, several outputs at once
+(set R (select {from: P a: (sum c) b: (count c) m: (min f) p: (prod c) l: (last s)}))
+(count R) -- 1
+(at R 'a) -- [0]
+(at R 'b) -- [0]
+(at R 'm) -- [0Nf]
+(at R 'p) -- [1]
+(at R 'l) -- [']
+(set R 0)
+
+;; by: gives no row, on a column and on the partition key
+(count (select {from: P a: (sum c) by: s})) -- 0
+(count (select {from: P a: (sum c) by: s where: (> v 0)})) -- 0
+(count (select {from: P a: (count c) by: date})) -- 0
+(key (select {from: P a: (count c) by: date})) -- [date a]
+
+;; a where: on the partition key
+(at (select {from: P a: (count c) where: (== date 2024.01.01)}) 'a) -- [0]
+
+;; the plain and projecting selects are unchanged
+(count (select {from: P})) -- 0
+(count (select {from: P c: c})) -- 0
+
+(set P 0)
+(.sys.exec "rm -rf /tmp/rf_parted_all_empty")

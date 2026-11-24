@@ -62,10 +62,11 @@
 ;; ----- Scalar AVG over all-null returns typed null -----
 (nil? (at (at (select {a: (avg v) from: (table [v] (list [0N 0N 0N]))}) 'a) 0)) -- true
 
-;; ----- Scalar MIN/MAX/PROD on all-null return typed null -----
+;; ----- Scalar MIN/MAX on all-null return typed null -----
 (nil? (at (at (select {m: (min v) from: (table [v] (list [0N 0N]))}) 'm) 0)) -- true
 (nil? (at (at (select {m: (max v) from: (table [v] (list [0N 0N]))}) 'm) 0)) -- true
-(nil? (at (at (select {p: (prod v) from: (table [v] (list [0N 0N]))}) 'p) 0)) -- true
+;; ----- Scalar PROD on all-null is the empty product, as the builtin (#1613) -----
+(at (at (select {p: (prod v) from: (table [v] (list [0N 0N]))}) 'p) 0) -- 1
 
 ;; ----- STDDEV/VAR on a group with insufficient non-null rows is null -----
 ;; Population variance needs ≥1 non-null; sample variance needs ≥2.

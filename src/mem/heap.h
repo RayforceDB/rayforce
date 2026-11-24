@@ -56,6 +56,7 @@
  *   Bit  0x02       -RAY_I64 atoms:  RAY_ATTR_GRAPH (ray_rel_t* CSR handle in .i64)
  *   Bit  0x04       -RAY_I64 atoms:  RAY_ATTR_HNSW (HNSW handle in .i64)
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
+ *   Bit  0x08       -RAY_I64 atoms:  RAY_ATTR_EMBMODEL (embedding model handle in .i64)
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
  *   Bit  0x20       -RAY_I64 atoms:  RAY_ATTR_DLPROG (Datalog program handle in .i64)
@@ -111,8 +112,16 @@
 #define RAY_ATTR_GRAPH        0x02
 
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
- * Checked by HNSW builtins before dereferencing.  User must (hnsw-free h). */
+ * Checked by HNSW builtins before dereferencing.  User must (.emb.hnsw.free h). */
 #define RAY_ATTR_HNSW         0x04
+
+/* I64 atom carries a counted reference to a ray_embmodel_t (an embedding
+ * model: its tokenizer and weights) in its .i64 slot.  A model never changes
+ * once opened, so every handle shares the one object: a copy of the atom
+ * takes a reference of its own and the last release frees the model.
+ * Reuses 0x08 (RAY_ATTR_HAS_INDEX on vectors); the -RAY_I64 type tag
+ * disambiguates. */
+#define RAY_ATTR_EMBMODEL     0x08
 
 /* I64 atom carries an owning dl_program_t* (a Datalog program) in its .i64
  * slot.  Checked by the dl-* builtins before dereferencing, so a forged/plain
@@ -122,6 +131,22 @@
  * -RAY_I64 type tag disambiguates.  The heap finalizer frees the program when
  * its owning atom is released; users may call (dl-free h) for early release. */
 #define RAY_ATTR_DLPROG       0x20
+
+/* The attrs that mark an I64 atom as a process-local handle (a graph, a
+ * vector index, an embedding model or a Datalog program): its .i64 slot is
+ * a pointer into this process.  Such an atom has no wire form and must
+ * never be copied into a plain I64 cell, where it would read as an
+ * ordinary integer.
+ *
+ * This mask is the one list of handle kinds.  A new kind of handle is
+ * added here and nowhere else: the serializer, the journal snapshot, the
+ * table builder, the vector builders and the query planner all test this
+ * mask (or ray_is_handle_atom), never the bits one by one. */
+#define RAY_HANDLE_ATTRS (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_EMBMODEL | RAY_ATTR_DLPROG)
+
+static inline bool ray_is_handle_atom(const ray_t* x) {
+    return x && x->type == -RAY_I64 && (x->attrs & RAY_HANDLE_ATTRS);
+}
 
 /* Vector is a linked column.  The 8 bytes of the aux union at offset
  * 8 (i.e. parent->_idx_pad / parent->slice_offset / parent->str_pool

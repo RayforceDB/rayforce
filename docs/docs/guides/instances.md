@@ -63,7 +63,7 @@ Instances that read the same tables share the operating system's page cache, so 
 (.sys.exec "mv /db/.stage/2026.10.02 /db/2026.10.02")
 ```
 
-**Files.** Never change table files in place: no `cp` over them, no `rsync --inplace`, no `truncate`, no editors. Instances that have the table open see the change at once, its stored statistics no longer match the data, and a shortened file crashes them with `SIGBUS`. Replace tables with `.db.splayed.set`, or write a new file and rename it over the old one. The same applies to files written with `write`, `write-bytes` and `hnsw-save`, which rewrite their target in place.
+**Files.** Never change table files in place: no `cp` over them, no `rsync --inplace`, no `truncate`, no editors. Instances that have the table open see the change at once, its stored statistics no longer match the data, and a shortened file crashes them with `SIGBUS`. Replace tables with `.db.splayed.set`, or write a new file and rename it over the old one. The same applies to files written with `write`, `write-bytes` and `.emb.hnsw.set`, which rewrite their target in place.
 
 **Versions.** All instances that share a database must run the same rayforce version; upgrade them together.
 

@@ -459,6 +459,9 @@ difference of two dates is a date again (`d0 + (d - d0)` is `d`).
 ```lisp
 ; Date to timestamp (midnight)
 (as 'timestamp 2024.01.15)  ; 2024.01.15D00:00:00.000000000
+(as 'timestamp 0Nd)         ; 0Np: a null date is a null timestamp
+; a date outside the timestamp range (about 1708 to 2292) saturates to the
+; largest or smallest timestamp
 
 ; Timestamp to date (strips time) — note the `D` separator in the literal
 (as 'date 2024.01.15D12:30:00.000)  ; 2024.01.15

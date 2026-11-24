@@ -48,8 +48,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
 `minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
 `.sys.trust`, `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
-`.log.validate`, `rc`, `diverse`, `.time.timer.del`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
-`norm`, `inv`, `flip`, `gram`, `hnsw-free`, `hnsw-load`, `hnsw-info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
+`.log.validate`, `rc`, `diverse`, `.time.timer.del`, `.time.sleep`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
+`norm`, `inv`, `flip`, `gram`, `.emb.hnsw.free`, `.emb.hnsw.get`, `.emb.hnsw.info`, `.emb.model.get`, `.emb.model.info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
 `.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`
 
@@ -59,7 +59,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
 `rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
-`unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `cos-dist`, `inner-prod`, `l2-dist`, `mmu`, `lsq`, `hnsw-save`, `.attr.set`,
+`unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `.emb.cos-dist`, `.emb.inner-prod`, `.emb.l2-dist`, `.emb.tokens`, `mmu`, `lsq`, `.emb.hnsw.set`, `.attr.set`,
 `.col.link`
 
 ### Variadic / Special
@@ -70,10 +70,10 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
-`.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
+`.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
-`retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `knn`, `hnsw-build`, `ann`,
+`retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `.emb.knn`, `.emb.hnsw.build`, `.emb.ann`, `.emb.encode`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
@@ -170,7 +170,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
-| `prod` | unary | aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `prod` | unary | aggr | Product of all non-null numeric elements; empty/all-null returns `1` | `(prod [2 3 4])` → `24` |
 | `all` | unary | aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
@@ -213,7 +213,7 @@ Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a ro
 
 ## Linear Algebra { #linalg }
 
-A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); sums accumulate in double either way, and a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
+A matrix is a list of equal-length numeric vectors, one per row. F64 and F32 rows are used in place; I32 and I64 rows are widened to F64, their nulls becoming `0Nf` as in an F64 row. The result is F32 when every operand is F32, otherwise F64 (the dot product of two vectors is always an F64 atom); `mmu` and `gram` compute in the operands' own precision, F32 rows in single and F64 rows in double, while `inv` and `lsq` always solve in double; a result outside the range of its type is null. `inv` and `lsq` raise `domain` for an input that holds a null, for a singular matrix (a pivot at or below `n·ε` times the largest element) and for a rank-deficient `a`; shape mismatches raise `length`, and a vector where a matrix is required raises `type`.
 
 | Function | Type | Attr | Description | Example |
 |---|---|---|---|---|
@@ -399,7 +399,7 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type` | `(if (> x 0) "pos" "neg")` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type`; where the query leaves it to the evaluator, a condition that differs between the rows raises `nyi` | `(if (> x 0) "pos" "neg")` |
 | `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
 | `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass (at the top level a global, refused for a restricted caller); returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
@@ -495,7 +495,7 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count. `first` and `last` give the frame's first or last row, a null included, in the value column's type; `min` and `max` skip nulls and keep the value column's type too, ordering SYM and STR by text and GUID by bytes, as `min` and `max` do outside a window | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
 | `update` | variadic | special, restricted | Add or modify columns in a table (mutates in-place) | `(update {from: t b: (* a 2)})` |
 | `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
-| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row) | `(upsert t 'x {x: 10 y: 20})` |
+| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row); a null key matches a null-keyed row for every key type, and a key value the key column cannot hold is a `domain` error | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
 ; Select with filter and projection
@@ -589,7 +589,7 @@ String functions are available as direct builtins. The transform functions are l
 | `trim` | unary | lazy/DAG | Strip leading/trailing whitespace | `(trim "  abc  ")` → `"abc"` |
 | `substr` | variadic | lazy/DAG | Substring by 1-based start and length; 0 clamps to start | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | lazy/DAG | Replace all occurrences of a string/symbol atom. An empty `to` deletes each match; an empty `from` matches nothing and returns the input | `(replace "a-b" "-" "_")` → `"a_b"` |
-| `like` | binary | — | Glob-style pattern match (* and ? wildcards) | `(like "hello" "hel*")` → `true` |
+| `like` | binary | — | Glob-style pattern match (* and ? wildcards). The pattern is a string atom, or a string column matched row by row (`(like t pat)`); a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `sym-name` | unary | — | Resolve integer sym IDs to symbols (passthrough for sym atoms) | `(sym-name 0)` → sym at ID 0 |
 
 ```lisp
@@ -706,6 +706,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.now` | variadic | — | Monotonic time in milliseconds | `(.time.now)` |
 | `.time.timer.set` | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id | `(.time.timer.set 1000 0 (fn [t] (println t)))` |
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
+| `.time.sleep` | unary | restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null; a cancel, or a sync request's client hanging up, ends it; a replay skips it | `(.time.sleep 500)` |
 | `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | nullary | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |
 | `.sys.prof` | nullary | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) | `(.sys.prof)` |
@@ -738,7 +739,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
+| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
 | `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
@@ -837,7 +838,8 @@ Built-in Entity-Attribute-Value store. The EAV table has three columns: `e` (ent
 |---|---|---|---|---|
 | `.log.replay` | unary | restricted | Replay and return processed entries, **including** evaluation errors; warns and continues, no rollback | `(.log.replay "journal.log")` |
 | `.log.replay_report` | unary | restricted | Replay **once** and return I64 `entries` / `eval_errors` on a clean tail; terminal errors still raise and may leave an applied prefix. Not a previous-call status getter, fail-fast mode, or invariant/rollback guarantee | `(.log.replay_report "journal.log")` |
-| `.log.status` | variadic | — | Journal state as a dict of six fields: `open` (handle present), `opened_ok` (a journal was opened successfully at least once), `path`, `mode` (`sync`/`async`; both null if never opened successfully), `bytes` (nullable: null if the size probe failed), `auto` (inside an auto-journaled request); raises only on allocation/intern failure | `(if (get (.log.status) 'open) null (exit 1))` |
+| `.log.status` | variadic | — | Journal state as a dict of seven fields: `open` (handle present), `opened_ok` (a journal was opened successfully at least once), `path`, `mode` (`sync`/`async`; both null if never opened successfully), `bytes` (nullable: null if the size probe failed), `auto` (inside an auto-journaled request), `posts` (async requests are journaled too); raises only on allocation/intern failure | `(if (get (.log.status) 'open) null (exit 1))` |
+| `.log.posts` | variadic | restricted | Read (no argument) or set (`0`/`1`) whether an open journal also records async requests; off by default, `--log-posts N` at startup; returns the state as `i64` | `(.log.posts 1)` |
 
 ## Datalog
 

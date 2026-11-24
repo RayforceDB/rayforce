@@ -536,6 +536,7 @@ static bool np_meta_bounds(ray_col_src_t* src, np_iv_t* out) {
 
 typedef struct {
     bool capture;
+    bool coarse;          /* a null-free I64 term may take np_scan_i64_hi's bounds */
     _Atomic(int64_t) min, max;
     const np_prog_t*  prog;
     np_iv_t           glob[AGG_LINEAR_MAX_TERMS];   /* the bounds of a term not scanned */
@@ -646,6 +647,31 @@ static bool np_wrap_slice(const np_scan_ctx_t* x, int64_t start, int64_t end, in
     iv[t] = (np_iv_t){ mn, mx }; sums[t] = s;                                  \
 } while (0)
 
+/* A null-free I64 term's bounds from the high 32 bits of its rows: every
+ * row lies in [hmin * 2^32, hmax * 2^32 + 2^32 - 1], up to 2^32 wider than
+ * the rows' min and max.  The scan is a 32-bit min and max per four rows
+ * where exact 64-bit extremes take a compare and a select per two; on one
+ * core that is what an affine I64 SUM / AVG pays over a plain sum.  A slice
+ * the wider interval cannot prove or lift (a row within 2^32 of a wrap or
+ * of the null, rows across a 2^32 boundary) is scanned again exactly
+ * (np_scan_fn); np_prove keeps a capture, whose bounds stay with the
+ * column, and an AVG whose coefficients no such interval can lift, on the
+ * exact scan alone. */
+static void np_scan_i64_hi(const int64_t* restrict d, int64_t n, np_iv_t* iv, int64_t* sum) {
+    int32_t mn = INT32_MAX, mx = INT32_MIN;
+    uint64_t s = 0;
+    for (int64_t r = 0; r < n; r++) {
+        int64_t v = d[r];
+        int32_t h = (int32_t)(v >> 32);
+        mn = h < mn ? h : mn;
+        mx = h > mx ? h : mx;
+        s += (uint64_t)v;
+    }
+    *iv = (np_iv_t){ (__int128)mn * ((__int128)1 << 32),
+                     (__int128)mx * ((__int128)1 << 32) + (((__int128)1 << 32) - 1) };
+    *sum = (int64_t)s;
+}
+
 static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     np_scan_ctx_t* x = (np_scan_ctx_t*)ctx;
@@ -654,17 +680,33 @@ static void np_scan_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
     if (n <= 0) return;
     np_iv_t iv[AGG_LINEAR_MAX_TERMS] = {{0}};
     int64_t sums[AGG_LINEAR_MAX_TERMS];
-    for (uint8_t t = 0; t < x->prog->n_terms; t++) {
-        if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
-        switch (x->prog->types[t]) {
-        case RAY_I64: NP_SCAN(int64_t, NULL_I64, uint64_t); break;
-        case RAY_I16: NP_SCAN(int16_t, NULL_I16, int32_t); break;
-        case RAY_I32: NP_SCAN(int32_t, NULL_I32, int64_t); break;
-        default:      NP_SCAN(uint8_t, (uint8_t)0, int32_t); break;   /* U8: never nulls[] */
-        }
-    }
     np_iv_t root;
-    if (!np_eval(x->prog, iv, &root)) {
+    bool ok = false;
+    /* First the high-word bounds where allowed; a slice they cannot prove
+     * (or, for an AVG, lift) is scanned again for its exact extremes, so
+     * it ends on the route the exact scan alone would take. */
+    for (int exact = !x->coarse; exact < 2; exact++) {
+        bool coarse = false;
+        for (uint8_t t = 0; t < x->prog->n_terms; t++) {
+            if (!x->data[t]) { iv[t] = x->glob[t]; continue; }
+            switch (x->prog->types[t]) {
+            case RAY_I64:
+                if (!exact && !x->nulls[t]) {
+                    np_scan_i64_hi((const int64_t*)x->data[t] + start, n, &iv[t], &sums[t]);
+                    coarse = true;
+                } else {
+                    NP_SCAN(int64_t, NULL_I64, uint64_t);
+                }
+                break;
+            case RAY_I16: NP_SCAN(int16_t, NULL_I16, int32_t); break;
+            case RAY_I32: NP_SCAN(int32_t, NULL_I32, int64_t); break;
+            default:      NP_SCAN(uint8_t, (uint8_t)0, int32_t); break;   /* U8: never nulls[] */
+            }
+        }
+        ok = np_eval(x->prog, iv, &root);
+        if (!coarse || (ok && !(x->wide && (root.hi - root.lo) * n > UINT64_MAX))) break;
+    }
+    if (!ok) {
         int64_t w;
         if (x->wrap && np_wrap_slice(x, start, end, &w)) {   /* the rows are cache-hot */
             atomic_fetch_add_explicit(&x->wsum, (uint64_t)w, memory_order_relaxed);
@@ -816,6 +858,23 @@ static np_res_t np_prove(ray_graph_t* g, ray_t* tbl, ray_op_t* root, int64_t nro
             for (uint8_t k = 0; k < wide->n_terms; k++)
                 if (wide->syms[k] == p->syms[t]) x.coeff[t] = wide->coeff_i64[k];
     }
+#if defined(__aarch64__)
+    /* High-word bounds are at least 2^32 wide: an AVG lift with
+     * coefficients past 2^64 / (2^32 * NP_SLICE) in total would refuse every
+     * slice they bound, so those take the exact scan from the start. */
+    x.coarse = !x.capture;
+    if (x.wide) {
+        __int128 w = 0;
+        for (uint8_t t = 0; t < p->n_terms; t++)
+            w += x.coeff[t] < 0 ? -(__int128)x.coeff[t] : (__int128)x.coeff[t];
+        if (w * ((__int128)1 << 32) * NP_SLICE > (__int128)UINT64_MAX) x.coarse = false;
+    }
+#else
+    /* The high-word bounds are arm64 only, as parity_sum_slice's bound
+     * pass: on AVX2 the high words cost a cross-lane shuffle per vector,
+     * and the exact scan runs fewer instructions (#1463). */
+    x.coarse = false;
+#endif
     x.wrap = want_partial && all && op_narrow_int(root) && p->max_depth <= NP_MAX_DEPTH &&
              nrows <= ((int64_t)1 << 32);
     /* slices of 64K rows: the per-slice proof and its atomics stay off the
@@ -934,6 +993,7 @@ typedef struct {
     bool nested;
     ray_pool_t* pool;
     _Atomic(uint64_t) total, rows;
+    _Atomic(bool) count;   /* a slice's bounds held a hit: count from now on */
 } parity_sum_ctx_t;
 
 static bool parity_literal(ray_graph_t* g, ray_op_t* op, uint64_t* out) {
@@ -983,42 +1043,106 @@ static bool parity_shape(ray_graph_t* g, ray_op_t* root, parity_sum_ctx_t* q) {
                    ((target >> shift) * inv) & q->mask;
     return true;
 }
+#if defined(__aarch64__)
+/* Can a row in b have (v & m) == t?  m + 1 is a power of two M, and v & m
+ * is v mod M: the least such v at or above b.lo is b.lo + (t - b.lo) mod M. */
+static bool parity_may_hit(np_iv_t b, uint64_t m, uint64_t t) {
+    if (t > m) return false;
+    __int128 M = (__int128)m + 1, r = ((__int128)t - b.lo) % M;
+    if (r < 0) r += M;
+    return b.lo + r <= b.hi;
+}
+#endif
 static void parity_sum_slice(void* ctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
     parity_sum_ctx_t* q = ctx;
     if (ray_interrupted() || (q->pool && atomic_load_explicit(&q->pool->cancelled, memory_order_acquire))) return;
-    /* Skipping INT64_MIN toggles bit 63 once per odd number of hits. */
-    uint64_t s = 0, p = 0;
+    /* Skipping INT64_MIN toggles bit 63 once per odd number of hits.  On
+     * one core the pass is compute-bound, so it keeps the vector steps
+     * per row few: a slice whose high-word bounds hold no input that can
+     * hit is summed with no compare at all; otherwise the hits are counted
+     * (a compare's all-ones lane subtracts straight into the counter,
+     * where a parity bit costs a mask as well), and an odd k, whose mask
+     * is all ones, skips the mask. */
+    uint64_t s = 0, hits = 0;
     const uint64_t h = UINT64_C(1) << 63;
+    const uint64_t* restrict x = q->x;
     if (q->y) {
+        const uint64_t* restrict y = q->y;
         for (int64_t i = lo; i < hi; i++) {
-            uint64_t row = q->x[i] + q->y[i];
+            uint64_t row = x[i] + y[i];
             s += row;
-            p ^= row == h;
+            hits += row == h;
         }
     } else if (!q->k) {
         s = (uint64_t)(hi-lo) * q->c;
     } else {
+        const uint64_t m = q->mask, f = q->final_hit, mh = q->mul_hit;
         uint64_t skipped = 0;
-        if (q->nested) {
+        /* First the rows' high-word bounds and their sum: when no input
+         * in the bounds can make a hit, that is the slice's whole pass.
+         * Otherwise the slice is counted row by row below (cache-hot), and
+         * so is every slice after it: rows whose bounds hold a hit once
+         * likely do again, and then the bound pass is pure cost. */
+        bool counted = true;
+#if defined(__aarch64__)
+        /* arm64 only: NEON takes the high words with a narrowing shift, so
+         * the bound pass is cheaper than counting.  On AVX2 the high words
+         * cost a cross-lane shuffle per vector, and the pass ran 11% more
+         * instructions than counting the rows straight away (#1463). */
+        if (!atomic_load_explicit(&q->count, memory_order_relaxed)) {
+            np_iv_t b;
+            int64_t bs;
+            np_scan_i64_hi((const int64_t*)x + lo, hi - lo, &b, &bs);
+            if (!parity_may_hit(b, m, f) && !(q->nested && parity_may_hit(b, m, mh))) {
+                s = (uint64_t)bs;
+                counted = false;
+            } else {
+                atomic_store_explicit(&q->count, true, memory_order_relaxed);
+            }
+        }
+#endif
+        if (counted && q->nested) {
             /* c != 0: the two hit sets are disjoint. The raw affine sum
              * includes h+c for each generated multiply null; remove all
              * of it, not just bit 63. */
-            for (int64_t i = lo; i < hi; i++) {
-                uint64_t v = q->x[i], bits = v & q->mask;
-                s += v;
-                skipped += bits == q->mul_hit;
-                p ^= bits == q->final_hit;
+            if (m == UINT64_MAX) {
+                for (int64_t i = lo; i < hi; i++) {
+                    uint64_t v = x[i];
+                    s += v;
+                    skipped += v == mh;
+                    hits += v == f;
+                }
+            } else if (f > m) {
+                for (int64_t i = lo; i < hi; i++) {
+                    uint64_t v = x[i];
+                    s += v;
+                    skipped += (v & m) == mh;
+                }
+            } else {
+                for (int64_t i = lo; i < hi; i++) {
+                    uint64_t v = x[i], bits = v & m;
+                    s += v;
+                    skipped += bits == mh;
+                    hits += bits == f;
+                }
             }
-        } else {
+        } else if (counted && m == UINT64_MAX) {
             for (int64_t i = lo; i < hi; i++) {
-                uint64_t v = q->x[i];
+                uint64_t v = x[i];
                 s += v;
-                p ^= (v & q->mask) == q->final_hit;
+                hits += v == f;
+            }
+        } else if (counted) {
+            for (int64_t i = lo; i < hi; i++) {
+                uint64_t v = x[i];
+                s += v;
+                hits += (v & m) == f;
             }
         }
         s = s*q->k + (uint64_t)(hi-lo)*q->c - skipped*(h+q->c);
     }
-    atomic_fetch_add_explicit(&q->total, s ^ (p << 63), memory_order_relaxed);
+    atomic_fetch_add_explicit(&q->total, s ^ ((hits & 1) << 63), memory_order_relaxed);
     atomic_fetch_add_explicit(&q->rows, (uint64_t)(hi-lo), memory_order_relaxed);
 }
 /* Detect SUM/AVG integer-linear inputs for scalar aggregate fast path.

@@ -1018,8 +1018,11 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
  * Implementation lives in src/ops/glob.[ch]; same matcher is used by
  * the DAG executor (string.c::exec_like) for select-where contexts. */
 ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
-    /* Pattern must be a string atom */
-    if (pattern->type != -RAY_STR) return ray_error("type", "like: pattern must be a string");
+    /* A string column matches row by row, as in a query (#1615); otherwise
+     * the pattern is a string atom. */
+    if (ray_like_pat_rows(pattern)) return ray_like_rows(x, pattern, false);
+    if (pattern->type != -RAY_STR)
+        return ray_error("type", "like: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pattern->type));
     const char* pat = ray_str_ptr(pattern);
     size_t pat_len = ray_str_len(pattern);
 

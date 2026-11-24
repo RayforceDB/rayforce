@@ -97,7 +97,12 @@
 ;; Without row data among the operands, concat inside any function keeps
 ;; collection semantics, whatever called it.
 (set cc (fn [acc y] (concat acc y)))
-(at (select {v: (fold cc ['p 'q 'r]) from: T}) 'v) -- (list ['p 'q 'r] ['p 'q 'r] ['p 'q 'r])
+;; (the literal is as long as T, so fold folds it as a column, one value
+;; for the rows, as sum would: #1429)
+(at (select {v: (fold cc ['p 'q 'r]) from: T}) 'v) -- (list ['p 'q 'r])
+(at (select {v: (fold cc ['p 'q 'r]) w: x from: T}) 'v) -- (list ['p 'q 'r] ['p 'q 'r] ['p 'q 'r])
+;; and one of another length is a length error, as for an aggregate source
+(select {v: (fold cc ['p 'q]) from: T}) !- length
 (set two (fn [] 1 (concat 'a 'b)))
 (at (update {n: (+ x (count (two))) from: T}) 'n) -- [3 4 5]
 (set gx (fn [a] (concat a 'x)))

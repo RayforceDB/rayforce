@@ -61,7 +61,7 @@
 (gram W) -- (mmu W (flip W))
 
 ;; gram on shapes that are not a multiple of the 4x4 tile
-(set gdiff (fn [g m] (sum (map (fn [d] (inner-prod d d)) (- g m)))))
+(set gdiff (fn [g m] (sum (map (fn [d] (.emb.inner-prod d d)) (- g m)))))
 (set V (map (fn [i] (+ (* 0.5 (as 'F64 (til 5000))) (* 1.0 i))) (til 7)))
 (< (gdiff (gram V) (mmu V (flip V))) 1.0) -- true
 (count (gram V)) -- 7
@@ -130,3 +130,27 @@
 (type (at (flip (list [1.0 2.0] [3.0 4.0])) 0)) -- 'F64
 (type (at (flip (list [1 2] [3.0 4.0])) 0)) -- 'F64
 (flip (list [1 2] [3.0 4.0])) -- (list [1.0 3.0] [2.0 4.0])
+
+;; the tiled product, on shapes that are no multiple of its tile of columns or of its four rows
+(set mkm (fn [r c] (map (fn [i] (/ (as 'F64 (- (* (+ i 3) (+ 7 (til c))) (* 101 (div (* (+ i 3) (+ 7 (til c))) 101)))) 50.0)) (til r))))
+(set A64 (mkm 37 131))
+(set B64 (mkm 131 301))
+(set to32 (fn [m] (map (fn [row] (as 'F32 row)) m)))
+(set mdiff (fn [a b] (max (map (fn [i] (max (abs (- (as 'F64 (at a i)) (as 'F64 (at b i)))))) (til (count a))))))
+;; each row of the product is that row times the matrix, which takes the other kernel
+(set P64 (mmu A64 B64))
+(< (mdiff P64 (map (fn [i] (mmu (at A64 i) B64)) (til 37))) 0.000000001) -- true
+(count P64) -- 37
+(count (at P64 0)) -- 301
+;; F32 operands multiply and sum in float: an F32 result, equal to the product in double as far as single precision goes
+(set P32 (mmu (to32 A64) (to32 B64)))
+(type (at P32 36)) -- 'F32
+(< (mdiff P32 P64) 0.01) -- true
+(< (mdiff P32 (map (fn [i] (mmu (at (to32 A64) i) (to32 B64))) (til 37))) 0.01) -- true
+;; and so does gram
+(< (mdiff (gram (to32 B64)) (gram B64)) 0.05) -- true
+(< (mdiff (gram (to32 B64)) (mmu (to32 B64) (flip (to32 B64)))) 0.05) -- true
+;; a product with more rows than the right operand has columns
+(< (mdiff (mmu (flip B64) (flip A64)) (flip P64)) 0.000000001) -- true
+;; nulls in F32 rows come through as nulls
+(nil? (at (at (mmu (list (as 'F32 [1.0 0Nf]) (as 'F32 [3.0 4.0])) (list (as 'F32 [1.0 0.0]) (as 'F32 [0.0 1.0]))) 0) 1)) -- true

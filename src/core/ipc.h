@@ -172,6 +172,13 @@ bool ray_ipc_auto_journal_eval(void);
  * IPC listener) saves it, sets true, evaluates, and restores the saved value,
  * exactly as eval_payload does for a native SYNC frame.  Thread-local. */
 bool ray_ipc_set_auto_journal_eval(bool enabled);
+
+/* Mark the arguments of a request list `(f arg ...)` with
+ * RAY_EVAL_LITERAL_FALLBACK, recursively: an argument list whose head does
+ * not resolve, or resolves to a value that is not callable, evaluates to
+ * itself.  A live request is evaluated so, and journal replay marks a
+ * journaled request the same way, so it rebuilds the same state (#1006). */
+void ray_ipc_mark_request_args(ray_t* msg);
 #define RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL 1
 #ifdef DEBUG
 void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
@@ -267,6 +274,15 @@ int       ray_ipc_cancel_unconfirmed_for_test(int64_t handle);
  * process breaks it, and their save/restore of this state can interleave
  * and leave a stale descriptor behind for the next test (#1265). */
 void      ray_ipc_cancel_state_reset_for_test(void);
+/* The message type of the IPC request being evaluated on this server:
+ * RAY_IPC_MSG_SYNC or RAY_IPC_MSG_ASYNC, or -1 when none is running. */
+int       ray_ipc_request_kind(void);
+/* Whether the client of the SYNC request being evaluated on this server has
+ * hung up, or shut down its sending side, which reads the same (false for an
+ * async message, and when no request is running).  A builtin that only waits
+ * (.time.sleep) checks it: nobody is left to receive the answer.  An async
+ * message has no answer to wait for, so its sender leaving changes nothing. */
+bool      ray_ipc_request_peer_gone(void);
 /* As ray_ipc_send, bounded: timeout_ms > 0 caps the whole round trip.
  * On expiry the connection is closed (on.close fires) and an `io` error
  * is returned; timeout_ms <= 0 waits indefinitely, like ray_ipc_send. */

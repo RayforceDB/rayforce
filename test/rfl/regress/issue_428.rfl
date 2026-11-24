@@ -34,10 +34,10 @@
 ;; ── 2. `_dist` where a rerank does produce it — still resolves, still
 ;;    correct.  The nearest row is id 1 at distance 0. ───────────────────
 (set _TN (table [id Vec] (list [1 2 3 4] (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5]))))
-(at (select {i: id d: _dist from: _TN nearest: (knn Vec [1.0 0.0]) take: 2}) 'i) -- [1 3]
-(at (select {i: id d: _dist from: _TN nearest: (knn Vec [1.0 0.0]) take: 2}) 'd) -- [0.0 0.29]
+(at (select {i: id d: _dist from: _TN nearest: (.emb.knn Vec [1.0 0.0]) take: 2}) 'i) -- [1 3]
+(at (select {i: id d: _dist from: _TN nearest: (.emb.knn Vec [1.0 0.0]) take: 2}) 'd) -- [0.0 0.29]
 
 ;; ── 3. the same query with nearest: written BEFORE the outputs.  Same
 ;;    columns, same names — the keyword must not take one of the slots. ──
-(at (select {from: _TN nearest: (knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'i) -- [1 3]
-(at (select {from: _TN nearest: (knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'd) -- [0.0 0.29]
+(at (select {from: _TN nearest: (.emb.knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'i) -- [1 3]
+(at (select {from: _TN nearest: (.emb.knn Vec [1.0 0.0]) i: id d: _dist take: 2}) 'd) -- [0.0 0.29]

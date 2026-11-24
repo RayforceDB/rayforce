@@ -1202,7 +1202,10 @@ static bool pq_synth_optional(const char* path, int64_t rows, int64_t groups, in
 /* The columns s and t of an import as strings: true when every row is
  * fn's (a null and "" both the empty symbol). */
 static bool pq_synth_check(const char* dir, int64_t rows, pq_synth_fn fn) {
-    char sym[200]; snprintf(sym, sizeof(sym), "%s/.sym", dir);
+    char sym[200];
+    /* a dir too long for the buffer cannot be checked: fail, never read a
+     * truncated path */
+    if (snprintf(sym, sizeof(sym), "%s/.sym", dir) >= (int)sizeof(sym)) return false;
     ray_t* t = ray_read_splayed(dir, sym);
     if (!t || RAY_IS_ERR(t)) { if (t) ray_error_free(t); return false; }
     bool ok = ray_table_nrows(t) == rows;

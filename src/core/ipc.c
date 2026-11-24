@@ -86,6 +86,13 @@ static void mark_ipc_literal_fallbacks(ray_t* obj) {
         mark_ipc_literal_fallbacks(elems[i]);
 }
 
+void ray_ipc_mark_request_args(ray_t* msg) {
+    if (!msg || RAY_IS_ERR(msg) || msg->type != RAY_LIST) return;
+    ray_t** elems = (ray_t**)ray_data(msg);
+    for (int64_t i = 1; i < ray_len(msg); i++)
+        mark_ipc_literal_fallbacks(elems[i]);
+}
+
 /* ===== Compression (delta + RLE) ===== */
 
 size_t ray_ipc_compress(const uint8_t* src, size_t len,
@@ -576,9 +583,6 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
     ray_serde_fail_clear();
-    /* Each size/write pair below holds the error text across both passes
-     * (ray_serde_msg_hold); a fallback error takes a new hold of its own. */
-    ray_serde_msg_hold();
     int64_t ser_size = ray_serde_size(result);
 
     /* A result we cannot serialize must never leave the client waiting on
@@ -589,7 +593,6 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
      * can put on the wire and we drop as before. */
     ray_t* fallback = NULL;
     if (!ray_ipc_body_size_ok(ser_size)) {
-        ray_serde_msg_release();
         if (ser_size > RAY_IPC_BODY_MAX_BYTES) {
             fallback = ray_error("io", "IPC result exceeds the 256 MiB decoded payload limit");
         } else {
@@ -606,10 +609,8 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         }
         if (!fallback) return;
         result   = fallback;
-        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
         if (!ray_ipc_body_size_ok(ser_size)) {
-            ray_serde_msg_release();
             ray_error_free(fallback);
             return;
         }
@@ -617,12 +618,10 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
 
     uint8_t* payload = (uint8_t*)ray_alloc_raw((size_t)ser_size);
     if (!payload) {
-        ray_serde_msg_release();
         if (fallback) ray_error_free(fallback);
         return;
     }
     int64_t  wrote    = ray_ser_raw(payload, result);
-    ray_serde_msg_release();
     if (wrote != ser_size) {
         /* The write phase disagrees with the size phase (an encoded column
          * failed to decode): never send the frame, answer with an error. */
@@ -630,11 +629,9 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
         if (fallback) { ray_error_free(fallback); return; }
         fallback = ray_error("io", "result could not be serialized over IPC");
         result   = fallback;
-        ray_serde_msg_hold();
         ser_size = ray_serde_size(result);
         payload  = ray_ipc_body_size_ok(ser_size) ? (uint8_t*)ray_alloc_raw((size_t)ser_size) : NULL;
         bool ok  = payload && ray_ser_raw(payload, result) == ser_size;
-        ray_serde_msg_release();
         if (!ok) {
             if (payload) ray_free_raw(payload);
             ray_error_free(fallback);
@@ -761,11 +758,12 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
 
     /* Journal hook: log every inbound SYNC message (state-mutation
      * channel in the IPC model) before evaluation, so a crash mid-handler
-     * still leaves the message on disk for replay.  We write the raw
-     * inbound bytes — header + payload — verbatim, no decompression
-     * round-trip.  Async messages and responses are not logged, so
-     * background pings and result frames don't pollute the log.
-     * No-op when no journal is open or during in-progress replay.
+     * still leaves the message on disk for replay.  Async messages are
+     * logged too when the posts switch is on (--log-posts, .log.posts),
+     * and are left out by default.  We write the raw inbound bytes —
+     * header + payload — verbatim, no decompression round-trip.  Responses
+     * never reach here.  No-op when no journal is open or during
+     * in-progress replay.
      *
      * RAY_IPC_FLAG_RESTRICTED is captured into a LOCAL header copy:
      * we mark the persisted frame with the connection's restricted
@@ -784,9 +782,17 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     bool auto_journaled = false;
     bool have_pos = false;
     int64_t req_gen = 0, req_off = 0;
-    if (ray_journal_is_open() && hdr->msgtype == RAY_IPC_MSG_SYNC) {
+    if (ray_journal_is_open() &&
+        (hdr->msgtype == RAY_IPC_MSG_SYNC || ray_journal_posts())) {
         have_pos = ray_journal_position(&req_gen, &req_off);
+        /* With the posts switch on, an async request is journaled like a
+         * sync one (#1608): both are logged as a request frame (SYNC), which
+         * replay evaluates as the live request was; an ASYNC frame in the
+         * log stays a .log.write entry.  One frame per request, written
+         * before it is evaluated, so the log holds the requests in the
+         * order the server ran them. */
         ray_ipc_header_t log_hdr = *hdr;
+        log_hdr.msgtype = RAY_IPC_MSG_SYNC;
         if (ray_eval_get_restricted())
             log_hdr.flags |= RAY_IPC_FLAG_RESTRICTED;
         ray_err_t je = ray_journal_write_bytes(&log_hdr, payload, (int64_t)payload_len);
@@ -838,11 +844,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
     ray_t* result = NULL;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
     if (msg && !RAY_IS_ERR(msg)) {
-        if (msg->type == RAY_LIST) {
-            ray_t** elems = (ray_t**)ray_data(msg);
-            for (int64_t i = 1; i < ray_len(msg); i++)
-                mark_ipc_literal_fallbacks(elems[i]);
-        }
+        ray_ipc_mark_request_args(msg);
 
         /* Dispatch through `.ipc.on.sync` / `.ipc.on.async` hook if
          * installed; otherwise fall back to v1's inline-eval default.
@@ -914,17 +916,20 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         }
     }
 
-    /* `raise x` deliberately keeps x as a pending value instead of eagerly
-     * formatting it into ray_error_msg().  Capture it before the outer
-     * verbose wrapper turns the error into a child of [captured, result];
-     * send_response can no longer recognize a top-level error after that. */
-    if (result && RAY_IS_ERR(result) && !ray_error_msg()) {
+    /* `raise x` deliberately keeps x as a pending value: its error has no
+     * message.  The reply carries the error's own message, so the error is
+     * made again with x rendered as its message, before the outer verbose
+     * wrapper turns it into a child of [captured, result]. */
+    if (result && RAY_IS_ERR(result) && result != RAY_OOM_OBJ && !ray_err_msg(result)) {
         char raised[256];
         if (ray_raise_render(raised, sizeof raised)) {
             char code[8];
             snprintf(code, sizeof code, "%s", ray_err_code(result));
-            ray_t* marker = ray_error(code, "%s", raised);
-            if (marker) ray_error_free(marker);
+            ray_t* again = ray_error(code, "%s", raised);
+            if (again && again != RAY_OOM_OBJ) {
+                ray_error_free(result);
+                result = again;
+            }
         }
     }
 
@@ -1239,6 +1244,20 @@ static volatile sig_atomic_t g_ipc_active_seq = CANCEL_ANY;
 /* Set by the SIGURG handler when it takes a numbered byte off the running
  * request's socket, so the reply can confirm it. */
 static volatile sig_atomic_t g_ipc_oob_taken = 0;
+
+/* The message type (RAY_IPC_MSG_SYNC or _ASYNC) of the request being
+ * evaluated, -1 when none is.  Main thread only, so a plain int; saved and
+ * given back around a nested request with the cancel context. */
+static int g_ipc_active_kind = -1;
+
+int ray_ipc_request_kind(void) { return g_ipc_active_kind; }
+
+bool ray_ipc_request_peer_gone(void)
+{
+    int fd = g_ipc_active_fd;
+    return g_ipc_active_kind == RAY_IPC_MSG_SYNC && fd >= 0 &&
+           ray_sock_peer_closed((ray_sock_t)fd) == 1;
+}
 
 void ray_ipc_cancel_state_reset_for_test(void)
 {
@@ -1577,16 +1596,24 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         int prev_fd    = g_ipc_active_fd;
         int prev_seq   = g_ipc_active_seq;
         int prev_taken = g_ipc_oob_taken;
+        int prev_kind  = g_ipc_active_kind;
+        g_ipc_active_kind = (int)hdr.msgtype;
         g_ipc_active_fd  = -1;
         g_ipc_oob_taken  = 0;
         g_ipc_active_seq = cancel_seq;
         g_ipc_active_fd  = (int)sel->fd;
+        /* A byte that came after the look above but before the fd was
+         * published raised its SIGURG with no request to cancel: the
+         * handler left it pending.  Look again now the handler would act. */
+        if (oob_cancel_for((int)sel->fd, cancel_seq, &g_ipc_oob_taken))
+            ray_request_interrupt();
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
         g_ipc_active_fd  = -1;
         if (g_ipc_oob_taken) taken = 1;
         g_ipc_oob_taken  = prev_taken;
         g_ipc_active_seq = prev_seq;
         g_ipc_active_fd  = prev_fd;
+        g_ipc_active_kind = prev_kind;
         /* A byte for the outer request that came while the nested one ran
          * raised its SIGURG then, against the nested connection: look again. */
         if (prev_fd >= 0 && oob_cancel_for(prev_fd, prev_seq, &g_ipc_oob_taken))
@@ -2520,23 +2547,9 @@ static int conn_pump(ray_poll_t* poll, int64_t id)
  * counted frame (rc = 1 to the caller).  Built once per message however
  * many connections it goes to: ray_mcast_pub shares one frame across
  * every subscriber's queue (#487). */
-static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
-                                             uint8_t extra_flags, size_t threshold,
-                                             ray_err_t* err_out);
-
 static ray_poll_frame_t* conn_frame_msg(ray_t* msg, uint8_t msgtype,
                                         uint8_t extra_flags, size_t threshold,
                                         ray_err_t* err_out)
-{
-    ray_serde_msg_hold();
-    ray_poll_frame_t* f = conn_frame_msg_held(msg, msgtype, extra_flags, threshold, err_out);
-    ray_serde_msg_release();
-    return f;
-}
-
-static ray_poll_frame_t* conn_frame_msg_held(ray_t* msg, uint8_t msgtype,
-                                             uint8_t extra_flags, size_t threshold,
-                                             ray_err_t* err_out)
 {
     if (err_out) *err_out = RAY_OK;
     int64_t ser_size = ray_serde_size(msg);
@@ -2934,6 +2947,10 @@ static ray_t* sync_expire(ray_poll_t* poll, int64_t id, int64_t timeout_ms)
                      (long long)timeout_ms);
 }
 
+/* Longest single wait of a sync send for its reply: a cancel requested
+ * just before a wait is forwarded within this (see the loop below). */
+#define SYNC_WAIT_SLICE_MS 50
+
 static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
                         int64_t timeout_ms)
 {
@@ -3036,13 +3053,21 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
         }
         /* The deadline is checked after the pump, so a reply that is
          * already here when it expires is still delivered. */
-        int wait_ms = -1;
+        int wait_ms = SYNC_WAIT_SLICE_MS;
         if (deadline >= 0) {
             int64_t left = deadline - ray_time_now_ms();
             if (left <= 0) return sync_expire(poll, id, timeout_ms);
-            wait_ms = left > INT_MAX ? INT_MAX : (int)left;
+            if (left < wait_ms) wait_ms = (int)left;
         }
-        int w = conn_wait_readable(sel, wait_ms);
+        /* A cancel must be honoured whenever it comes once the request has
+         * started.  A signal wakes the wait below only while it blocks: one
+         * that landed while the request was being sent or the pump ran set
+         * the interrupt flag and woke nothing, so the flag is looked at
+         * before each wait (and handled as a wake-up by a signal).  One
+         * that lands between this look and the wait starting cannot wake
+         * it either; the wait is cut into slices so the next look finds it
+         * within SYNC_WAIT_SLICE_MS. */
+        int w = ray_interrupted() ? -2 : conn_wait_readable(sel, wait_ms);
         if (w == -3) {
             /* The socket of an upgraded connection spoke: the peer is
              * gone.  Deregistering frees cd; nothing of it is touched. */
@@ -3056,9 +3081,8 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
              * there and cancels the running query.  Then keep awaiting its
              * cancel reply.  Best-effort: a server without OOB-cancel support
              * ignores the byte and the query completes as before. */
-            if (ray_interrupted()) {
+            if (ray_take_interrupt()) {  /* consume: never resent, never cancels locally */
                 bool sent = send_cancel(sel);
-                ray_clear_interrupt();  /* consume; do not resend or cancel locally */
                 if (!sent) {
                     /* An earlier request's cancel is still unconfirmed, so
                      * this one cannot be named safely: close instead. */

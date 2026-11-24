@@ -129,6 +129,7 @@ nav:
           - .col — Column linking: docs/namespaces/col.md
           - .csv — CSV I/O: docs/namespaces/csv.md
           - .db — Tables on disk: docs/namespaces/db.md
+          - .emb — Embeddings & vector search: docs/namespaces/emb.md
           - .fs — Filesystem: docs/namespaces/fs.md
           - .graph — Graph algorithms: docs/namespaces/graph.md
           - .idx — Indexes: docs/namespaces/idx.md

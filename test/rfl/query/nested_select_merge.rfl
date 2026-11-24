@@ -3,8 +3,9 @@
 (at (select {from:(select {from:T752 x:x q:(- x (avg x))}) where:(> x 1) q:q}) 'q) -- [0.0 1.0]
 (at (select {from:T752 where:(> x 1) q:(- x (avg x))}) 'q) -- [-0.5 0.5]
 
-;; Empty inner source vs nonempty source filtered to zero have distinct behavior.
-(count (select {from:(select {from:T752 where:(> x 9) x:x}) where:(> x 1) s:(sum x)})) -- 0
+;; An empty inner source and a nonempty one filtered to zero rows both
+;; answer one keyless row of identities (#1614).
+(count (select {from:(select {from:T752 where:(> x 9) x:x}) where:(> x 1) s:(sum x)})) -- 1
 (count (select {from:(select {from:T752 where:(> x 1) x:x}) where:(> x 9) s:(sum x)})) -- 1
 
 ;; Alias substitution, including earlier inner aliases, preserves values.
@@ -34,8 +35,8 @@
 (ser (select {from:(select {from:L752 where:(> x 20000)}) by:y x:x})) -- (ser (select {from:(do (select {from:L752 where:(> x 20000)})) by:y x:x}))
 
 ;; A lambda source shadows the global table: its rows and types govern planning.
-((fn [L752] (count (select {from:(select {from:L752 where:(> x 5)}) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
-((fn [L752] (count (select {from:(do (select {from:L752 where:(> x 5)})) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 0
+((fn [L752] (count (select {from:(select {from:L752 where:(> x 5)}) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 1
+((fn [L752] (count (select {from:(do (select {from:L752 where:(> x 5)})) where:(> x 0) s:(sum x)}))) (table [x] (list [1 2 3]))) -- 1
 (set F752 (take (table [x] (list [1.0 2.0 3.0])) 10000))
 (set Int752 (take (table [x] (list [9223372036854775807 1 2])) 10000))
 ((fn [F752] (ser (select {from:(select {from:F752 q:(* x 2)}) total:(sum q)}))) Int752) -- ((fn [F752] (ser (select {from:(do (select {from:F752 q:(* x 2)})) total:(sum q)}))) Int752)

@@ -28,6 +28,7 @@
 #include "lang/env.h"
 #include "core/types.h"
 #include "core/pool.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "ops/hash.h"
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
@@ -1013,9 +1014,7 @@ static bool map_vector_atom(ray_t* value) {
     if (value->type >= 0 || !ray_is_vector_type(-value->type)) return false;
     /* These I64 atoms own opaque resources. A raw integer cell cannot
      * carry their tags or finalizers, including after a typed prefix. */
-    if (value->type == -RAY_I64 &&
-        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
-        return false;
+    if (ray_is_handle_atom(value)) return false;
     return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
              RAY_ATOM_IS_NULL(value));
 }
@@ -1731,8 +1730,110 @@ static int float_vec_eq(ray_t* a, ray_t* b) {
     return 1;
 }
 
-/* Helper: compare two atoms for equality (value-based) */
-int atom_eq(ray_t* a, ray_t* b) {
+/* Two lists, tables or dicts of the same type, compared on an explicit
+ * stack rather than the C one: a value can be nested arbitrarily deep at
+ * run time, through lists, dicts and tables alike, and recursing per level
+ * crashed distinct, group, in and the set verbs on one (#1591).  A pair of
+ * containers pushes its parts (a list frame walks its cells; a table pushes
+ * its column pairs and a dict its key and value pairs, compared as cells as
+ * atom_eq_cell_col compares them); any other pair goes to atom_eq, which
+ * then does not recurse.  The answer is the recursive compare's at any
+ * depth; a stack that cannot grow (out of memory) compares unequal. */
+enum { CEQ_PAIR, CEQ_CELL, CEQ_LIST };
+typedef struct { ray_t* x; ray_t* y; int64_t i; uint8_t kind; } ceq_frame_t;
+static inline bool ceq_container(int8_t t) {
+    return t == RAY_LIST || t == RAY_TABLE || t == RAY_DICT;
+}
+static int container_eq(ray_t* a, ray_t* b) {
+    ceq_frame_t local[32];
+    ceq_frame_t* st = local;
+    int64_t cap = 32, top = 0;
+    int res = 1;
+#define CEQ_PUSH(X, Y, K) do {                                                    \
+        if (top == cap) {                                                       \
+            ceq_frame_t* grown_ = (ceq_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown_); \
+            if (!grown_) { res = 0; goto done; }                                \
+            memcpy(grown_, st, (size_t)top * sizeof *grown_);                   \
+            if (st != local) ray_free_raw(st);                                  \
+            st = grown_;                                                        \
+            cap *= 2;                                                           \
+        }                                                                       \
+        st[top++] = (ceq_frame_t){ (X), (Y), 0, (K) };                          \
+    } while (0)
+    CEQ_PUSH(a, b, CEQ_PAIR);
+    while (top > 0) {
+        ceq_frame_t* f = &st[top - 1];
+        if (f->kind == CEQ_LIST) {
+            if (f->i >= f->x->len) { top--; continue; }
+            ray_t* x = ((ray_t**)ray_data(f->x))[f->i];
+            ray_t* y = ((ray_t**)ray_data(f->y))[f->i];
+            f->i++;
+            if (!x || !y) {
+                if (x != y) { res = 0; goto done; }
+                continue;
+            }
+            CEQ_PUSH(x, y, CEQ_PAIR);
+            continue;
+        }
+        ray_t* x = f->x;
+        ray_t* y = f->y;
+        uint8_t kind = f->kind;
+        top--;
+        if (kind == CEQ_CELL && x->type == y->type && x->len == y->len &&
+            (x->type == RAY_SYM || x->type == RAY_STR)) {
+            if (!atom_eq_cell_col(x, y)) { res = 0; goto done; }   /* by text; recurses nowhere */
+            continue;
+        }
+        if (x->type != y->type || !ceq_container(x->type)) {
+            if (!atom_eq(x, y)) { res = 0; goto done; }         /* not two containers: a leaf */
+            continue;
+        }
+        if (x->type == RAY_LIST) {
+            if (x->len != y->len) { res = 0; goto done; }
+            CEQ_PUSH(x, y, CEQ_LIST);
+        } else if (x->type == RAY_TABLE) {
+            /* Same column names in order and equal columns.  The vector
+             * branch of atom_eq compares len * elem_size bytes, zero for a
+             * table, so every pair of same-length tables compared equal. */
+            int64_t nc = ray_table_ncols(x);
+            if (nc != ray_table_ncols(y) || ray_table_nrows(x) != ray_table_nrows(y)) { res = 0; goto done; }
+            for (int64_t c = 0; c < nc; c++) {
+                if (ray_table_col_name(x, c) != ray_table_col_name(y, c)) { res = 0; goto done; }
+                ray_t* ca = ray_table_col_idx(x, c);
+                ray_t* cb = ray_table_col_idx(y, c);
+                bool ea = ca && RAY_IS_ERR(ca), eb = cb && RAY_IS_ERR(cb);
+                if (ea) ray_error_free(ca);
+                if (eb) ray_error_free(cb);
+                if (ea || eb) { res = 0; goto done; }   /* a column that cannot be read compares unequal */
+                if (!ca || !cb) { if (ca != cb) { res = 0; goto done; } continue; }
+                CEQ_PUSH(ca, cb, CEQ_CELL);
+            }
+        } else {
+            /* Equal keys and equal values, position by position. */
+            ray_t* ka = ray_dict_keys(x); ray_t* kb = ray_dict_keys(y);
+            ray_t* va = ray_dict_vals(x); ray_t* vb = ray_dict_vals(y);
+            if (!ka || !kb || !va || !vb) {
+                if (!(ka == kb && va == vb)) { res = 0; goto done; }
+                continue;
+            }
+            CEQ_PUSH(ka, kb, CEQ_CELL);
+            CEQ_PUSH(va, vb, CEQ_CELL);
+        }
+    }
+#undef CEQ_PUSH
+done:
+    if (st != local) ray_free_raw(st);
+    return res;
+}
+
+/* Helper: compare two atoms for equality (value-based).  One body, two
+ * instances: atom_eq, whose list, table and dict cases compare flat
+ * values in place, and atom_eq_nested for a list's cells, whose container
+ * cases go to container_eq's explicit stack (#1591).  The cell's own type
+ * switch routes it, so a flat cell costs what it did before the stack, and
+ * the C stack holds at most a few frames however deep the value is. */
+static int atom_eq_nested(ray_t* a, ray_t* b);
+static inline __attribute__((always_inline)) int atom_eq_body(ray_t* a, ray_t* b, bool nested) {
     if (ray_has_timespan(a) || ray_has_timespan(b)) {
         if (ray_timespan_binary_type(OP_EQ, a->type, b->type) <= 0) return 0;
         /* An atom never equals a vector, and two vectors are equal when
@@ -1794,8 +1895,13 @@ int atom_eq(ray_t* a, ray_t* b) {
          * identical lists with different element pointers compared via
          * the default branch's memcmp on ray_t** — i.e. pointer
          * identity, never structurally equal — which broke (group LIST)
-         * (every row its own bucket) and dict/distinct fallbacks. */
+         * (every row its own bucket) and dict/distinct fallbacks.
+         *
+         * Flat cells are compared here, as group, distinct and by: keys
+         * mostly are, each by atom_eq_nested: a cell that is itself a
+         * list, table or dict goes from there to container_eq. */
         if (a->len != b->len) return 0;
+        if (nested) return container_eq(a, b);
         ray_t** ea = (ray_t**)ray_data(a);
         ray_t** eb = (ray_t**)ray_data(b);
         for (int64_t i = 0; i < a->len; i++) {
@@ -1803,14 +1909,18 @@ int atom_eq(ray_t* a, ray_t* b) {
                 if (ea[i] != eb[i]) return 0;
                 continue;
             }
-            if (!atom_eq(ea[i], eb[i])) return 0;
+            if (!atom_eq_nested(ea[i], eb[i])) return 0;
         }
         return 1;
     }
     case RAY_TABLE: {
         /* Same column names in order and equal columns.  The vector branch
          * below compares len * elem_size bytes, zero for a table, so every
-         * pair of same-length tables compared equal (one group for all). */
+         * pair of same-length tables compared equal (one group for all).
+         * A column is a vector or a list (whose cells take the list case
+         * above); one that is a table or a dict sends the whole compare to
+         * container_eq, so this never recurses more than a level (#1591). */
+        if (nested) return container_eq(a, b);
         int64_t nc = ray_table_ncols(a);
         if (nc != ray_table_ncols(b) || ray_table_nrows(a) != ray_table_nrows(b))
             return 0;
@@ -1823,16 +1933,25 @@ int atom_eq(ray_t* a, ray_t* b) {
             if (eb) ray_error_free(cb);
             if (ea || eb) return 0;            /* a column that cannot be read compares unequal */
             if (!ca || !cb) { if (ca != cb) return 0; continue; }
+            if (RAY_UNLIKELY((uint8_t)(ca->type - RAY_TABLE) <= 1))   /* RAY_TABLE, RAY_DICT */
+                return container_eq(a, b);
             if (!atom_eq_cell_col(ca, cb)) return 0;
         }
         return 1;
     }
     case RAY_DICT: {
         /* Equal keys and equal values, position by position (the vector
-         * branch saw every pair of same-length dicts as equal too). */
+         * branch saw every pair of same-length dicts as equal too).  Keys
+         * and values are vectors or lists, compared here; a part that is a
+         * table or a dict (a keyed table's) sends the whole compare to
+         * container_eq, as a table's column does. */
+        if (nested) return container_eq(a, b);
         ray_t* ka = ray_dict_keys(a); ray_t* kb = ray_dict_keys(b);
         ray_t* va = ray_dict_vals(a); ray_t* vb = ray_dict_vals(b);
         if (!ka || !kb || !va || !vb) return ka == kb && va == vb;
+        if (RAY_UNLIKELY((uint8_t)(ka->type - RAY_TABLE) <= 1 ||   /* RAY_TABLE, RAY_DICT */
+                         (uint8_t)(va->type - RAY_TABLE) <= 1))
+            return container_eq(a, b);
         return atom_eq_cell_col(ka, kb) && atom_eq_cell_col(va, vb);
     }
     case RAY_SYM:
@@ -1852,6 +1971,9 @@ int atom_eq(ray_t* a, ray_t* b) {
         return 0;
     }
 }
+
+int atom_eq(ray_t* a, ray_t* b) { return atom_eq_body(a, b, false); }
+static int atom_eq_nested(ray_t* a, ray_t* b) { return atom_eq_body(a, b, true); }
 
 /* A hash for atom_eq: two cells atom_eq calls equal hash equal.  Hash sets
  * over key cells (keyed-table ==, xkey's duplicate check) probe with it,
@@ -1989,22 +2111,33 @@ static inline bool i64_inexact(int64_t v) {
  * cell, or something inside one): atom_eq compares dict values and table
  * columns element by element, so their atoms meet as top-level atoms do.
  * Typed vectors compare by type and bytes, so only atoms count. */
-static uint8_t key_inexact_bits(ray_t* x) {
+/* The key walks below (key_inexact_bits, key_hash, key_span_flags) recurse
+ * once per level of nesting and have no error path, and a value can be
+ * nested arbitrarily deep at run time (#1591).  Past KEY_WALK_DEPTH levels
+ * each stops descending and gives its conservative answer: every flag
+ * set, a hash of the list's length alone.  The depth, not the stack, is
+ * the bound, so equal values still hash alike wherever they are hashed;
+ * atom_eq, which decides, compares lists without recursing on depth. */
+#define KEY_WALK_DEPTH 128
+static uint8_t key_inexact_bits_d(ray_t* x, int depth);
+static uint8_t key_inexact_bits(ray_t* x) { return key_inexact_bits_d(x, 0); }
+static uint8_t key_inexact_bits_d(ray_t* x, int depth) {
     if (!x || RAY_IS_ERR(x)) return 0;
+    if (depth >= KEY_WALK_DEPTH && x->type >= 0) return RAY_KEY_BIG_I64 | RAY_KEY_FLOAT;
     if (x->type == -RAY_I64) return i64_inexact(x->i64) ? RAY_KEY_BIG_I64 : 0;
     if (x->type == -RAY_F64 || x->type == -RAY_F32) return RAY_KEY_FLOAT;
     uint8_t bits = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len && bits != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT); i++)
-            bits |= key_inexact_bits(cells[i]);
+            bits |= key_inexact_bits_d(cells[i], depth + 1);
     } else if (x->type == RAY_DICT) {
-        bits = key_inexact_bits(ray_dict_keys(x)) | key_inexact_bits(ray_dict_vals(x));
+        bits = key_inexact_bits_d(ray_dict_keys(x), depth + 1) | key_inexact_bits_d(ray_dict_vals(x), depth + 1);
     } else if (x->type == RAY_TABLE) {
         for (int64_t c = 0; c < ray_table_ncols(x); c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            bits |= key_inexact_bits(col);
+            bits |= key_inexact_bits_d(col, depth + 1);
         }
     }
     return bits;
@@ -2017,7 +2150,13 @@ static uint8_t key_inexact_bits(ray_t* x) {
  * F32 atom).  A caller that sees both over its keys knows atom_eq is not
  * transitive there (#1330): the hash is right as it is, but only a scan in
  * row order gives `group`'s answer. */
+static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
+                           uint8_t* inexact, int depth);
 static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
+    return key_hash_d(x, spans, view, seen, inexact, 0);
+}
+static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
+                           uint8_t* inexact, int depth) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
     if (!x) return 0;
     if (RAY_ATOM_IS_NULL(x)) {
@@ -2064,9 +2203,14 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
     case -RAY_STR: return ray_hash_bytes(ray_str_ptr(x), ray_str_len(x));
     case RAY_LIST: {
         uint64_t h = ray_hash_i64(x->len);
+        if (depth >= KEY_WALK_DEPTH) {        /* too deep to walk: say what may be inside */
+            if (seen) *seen = true;
+            if (inexact) *inexact |= RAY_KEY_BIG_I64 | RAY_KEY_FLOAT;
+            return h;
+        }
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len; i++)
-            h = ray_hash_i64((int64_t)(h ^ key_hash(cells[i], spans, view, seen, inexact)));
+            h = ray_hash_i64((int64_t)(h ^ key_hash_d(cells[i], spans, view, seen, inexact, depth + 1)));
         return h;
     }
     case RAY_TABLE: {
@@ -2083,7 +2227,7 @@ static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, 
             h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(x, c)));
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
-            h = ray_hash_combine(h, key_hash(col, 0, view, NULL, NULL));
+            h = ray_hash_combine(h, key_hash_d(col, 0, view, NULL, NULL, depth + 1));
         }
         return h;
     }
@@ -2142,20 +2286,38 @@ uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NUL
  * dict and table cells included: with ray_key_spans(x) == 0 too, integer
  * atoms may hash exactly (RAY_KEY_EXACT_INT).  Typed vector cells compare
  * by type and bytes, so a float vector never meets an integer one. */
-bool ray_key_float_free(ray_t* x) {
+static bool key_float_free_d(ray_t* x, int depth);
+bool ray_key_float_free(ray_t* x) { return key_float_free_d(x, 0); }
+/* A dict's keys or values, or a table's column, at depth + 1: a typed
+ * vector holds no float atom, decided here without a call. */
+static inline bool key_float_free_part(ray_t* p, int depth) {
+    if (p && p->type > 0 && p->type != RAY_LIST && p->type != RAY_TABLE && p->type != RAY_DICT &&
+        !RAY_IS_ERR(p))
+        return true;
+    return key_float_free_d(p, depth + 1);
+}
+static bool key_float_free_d(ray_t* x, int depth) {
     if (!x || RAY_IS_ERR(x)) return true;
+    if (depth >= KEY_WALK_DEPTH && x->type >= 0) return false;   /* too deep to walk: may hold one */
     if (x->type == -RAY_F64 || x->type == -RAY_F32) return false;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len; i++) if (!ray_key_float_free(cells[i])) return false;
+        for (int64_t i = 0; i < x->len; i++) {
+            ray_t* c = cells[i];
+            if (c && c->type < 0) {   /* an atom: decided here, without a call */
+                if (c->type == -RAY_F64 || c->type == -RAY_F32) return false;
+                continue;
+            }
+            if (!key_float_free_d(c, depth + 1)) return false;
+        }
         return true;
     }
-    if (x->type == RAY_DICT) return ray_key_float_free(ray_dict_keys(x)) && ray_key_float_free(ray_dict_vals(x));
+    if (x->type == RAY_DICT) return key_float_free_part(ray_dict_keys(x), depth) && key_float_free_part(ray_dict_vals(x), depth);
     if (x->type == RAY_TABLE) {
         for (int64_t c = 0; c < ray_table_ncols(x); c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            if (!ray_key_float_free(col)) return false;
+            if (!key_float_free_part(col, depth)) return false;
         }
     }
     return true;
@@ -2171,12 +2333,23 @@ uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view
 
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
 enum { KEY_SPAN_WALK_FLOAT = 8 };
-static int key_span_flags(ray_t* x, bool track_float) {
+static int key_span_flags_d(ray_t* x, bool track_float, int depth);
+static int key_span_flags(ray_t* x, bool track_float) { return key_span_flags_d(x, track_float, 0); }
+/* A dict's keys or values, or a table's column, at depth + 1: a typed
+ * vector (the usual part) is decided here, without a call. */
+static inline int key_span_part(ray_t* p, int depth) {
+    if (p && p->type > 0 && p->type != RAY_LIST && p->type != RAY_TABLE && p->type != RAY_DICT)
+        return ray_has_timespan(p) ? RAY_KEY_SPAN_VEC : 0;
+    return key_span_flags_d(p, false, depth + 1);
+}
+static int key_span_flags_d(ray_t* x, bool track_float, int depth) {
     if (!x) return 0;
     if (x->type < 0) {
         if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
         return track_float && (x->type == -RAY_F64 || x->type == -RAY_F32) ? KEY_SPAN_WALK_FLOAT : 0;
     }
+    if (RAY_UNLIKELY(depth >= KEY_WALK_DEPTH))   /* too deep to walk (key_inexact_bits) */
+        return RAY_KEY_SPAN_ATOM | (track_float ? KEY_SPAN_WALK_FLOAT : 0);
     if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
     int spans = 0;
     if (x->type == RAY_LIST) {
@@ -2187,7 +2360,7 @@ static int key_span_flags(ray_t* x, bool track_float) {
                 int type = c->type;
                 if (type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
                 else if (track_float && (type == -RAY_F64 || type == -RAY_F32)) spans |= KEY_SPAN_WALK_FLOAT;
-            } else spans |= key_span_flags(c, track_float);
+            } else spans |= key_span_flags_d(c, track_float, depth + 1);
         }
     } else if (x->type == RAY_TABLE) {
         /* atom_eq compares a table's columns (a dict's keys and values)
@@ -2198,11 +2371,11 @@ static int key_span_flags(ray_t* x, bool track_float) {
         for (int64_t c = 0; c < ray_table_ncols(x) && !spans; c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            spans |= key_span_flags(col, false);
+            spans |= key_span_part(col, depth);
         }
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     } else if (x->type == RAY_DICT) {
-        spans = key_span_flags(ray_dict_keys(x), false) | key_span_flags(ray_dict_vals(x), false);
+        spans = key_span_part(ray_dict_keys(x), depth) | key_span_part(ray_dict_vals(x), depth);
         if (spans) spans = RAY_KEY_SPAN_ATOM;
     }
     return spans;
@@ -2677,6 +2850,10 @@ static int in_probe_spans(ray_t* x) {
  * a leaf; a list or non-string vector recurses, as ray_in_fn does; any
  * other element takes in_row. */
 static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
+    /* A list's rows that are lists go through here again: one frame per
+     * level of nesting, and a value can be nested arbitrarily deep (#1591). */
+    if (RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "in: value nested too deep for this thread's stack");
     int64_t vlen = ray_len(val);
     ray_t* result = ray_vec_new(RAY_BOOL, vlen);
     if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
@@ -2821,6 +2998,10 @@ static __attribute__((noinline, cold)) ray_t* in_span_pair(ray_t* val, ray_t* ve
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
+    /* A list's cells go through here again: one frame per level of
+     * nesting, and a value can be nested arbitrarily deep (#1591). */
+    if (val && !RAY_IS_ERR(val) && val->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "in: value nested too deep for this thread's stack");
     /* Parted columns store segment pointers where vector paths expect flat
      * cells.  Flatten both operands before membership; distinct uses the same
      * helper, while except/sect still reject parted input. */

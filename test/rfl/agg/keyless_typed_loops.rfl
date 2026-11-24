@@ -1,0 +1,61 @@
+;; #1628: a keyless sum, min, max, prod, first and last over a plain column
+;; run typed loops, one per column type, instead of reading every row
+;; through a type switch or the generic per-row aggregate.  The answers are
+;; the ones the per-row path gave: a NaN or a typed null is skipped, a
+;; null in the first row does not stop first or prod, integer prod wraps,
+;; and min of zeros of both signs is the first zero in row order.
+(set Z (table [i f z h i32 i16 u8 a] (list (til 6) [0Nf 2.0 0.5 4.0 0Nf 8.0] [3.0 0.0 -0.0 0.0 5.0 -0.0] (as 'F32 [0Nf 1.5 -2.0 0.25 4.0 0Nf]) (as 'I32 [3 -2 5 7 -9 1]) (as 'I16 [2 3 -4 1 1 2]) (as 'U8 [5 3 200 1 2 9]) [4 -3 2 0Nl 5 1])))
+
+;; F64 with nulls, F32 with nulls, a null in the first row
+(repr (select {p: (prod f) fi: (first f) la: (last f) mn: (min f) mx: (max f) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [32.0] [2.0] [8.0] [0.5] [8.0]))"
+(repr (select {p: (prod h) fi: (first h) la: (last h) mn: (min h) mx: (max h) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [-3.0] [1.5e] [4e] [-2e] [4e]))"
+(repr (select {s: (prod f) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [32.0]))"
+(repr (select {s: (first f) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [2.0]))"
+(repr (select {s: (last h) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [4e]))"
+
+;; zeros of both signs: the first zero in row order, as the row fold keeps
+(repr (select {mn: (min z) mx: (max z) fi: (first z) la: (last z) from: Z})) -- "(table (as 'SYM (list \"mn\" \"mx\" \"fi\" \"la\")) (list [0.0] [5.0] [3.0] [-0.0]))"
+(repr (at (select {s: (min z) from: Z}) 's)) -- "[0.0]"
+(repr (at (select {s: (max z) from: Z}) 's)) -- "[5.0]"
+(set Z2 (table [z2] (list [3.0 -0.0 0.0 0.0 5.0 -0.0])))
+(repr (at (select {s: (min z2) from: Z2}) 's)) -- "[-0.0]"
+(repr (at (select {s: (max (* -1.0 z2)) from: Z2}) 's)) -- "[0.0]"
+
+;; integer widths, no nulls: prod wraps, first and last read one row
+(repr (select {p: (prod i32) fi: (first i32) la: (last i32) mn: (min i32) mx: (max i32) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [1890] [3i] [1i] [-9i] [7i]))"
+(repr (select {p: (prod i16) fi: (first i16) la: (last i16) mn: (min i16) mx: (max i16) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [-48] [2h] [2h] [-4h] [3h]))"
+(repr (select {p: (prod u8) fi: (first u8) la: (last u8) mn: (min u8) mx: (max u8) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [54000] [0x05] [0x09] [0x01] [0xc8]))"
+(repr (select {s: (prod i32) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [1890]))"
+(repr (select {s: (first i32) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [3i]))"
+(repr (select {s: (last u8) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [0x09]))"
+(repr (select {s: (sum i16) from: Z})) -- "(table (as 'SYM (list \"s\")) (list [5]))"
+
+;; an I64 column with a null keeps the per-row path, same answers
+(repr (select {p: (prod a) fi: (first a) la: (last a) mn: (min a) mx: (max a) from: Z})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [-120] [4] [1] [-3] [5]))"
+
+;; every row null: prod is the empty product (#1613), the rest null
+(set N (table [n] (list [0Nf 0Nf 0Nf])))
+(repr (select {p: (prod n) fi: (first n) la: (last n) mn: (min n) mx: (max n) from: N})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [1.0] [0Nf] [0Nf] [0Nf] [0Nf]))"
+
+;; many tasks: a null first row, then a product that overflows to a null
+(set L (table [x] (list (concat [0Nf] (as 'F64 (+ 1 (% (til 100000) 2)))))))
+(repr (select {p: (prod x) fi: (first x) la: (last x) mn: (min x) mx: (max x) from: L})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [0Nf] [1.0] [2.0] [1.0] [2.0]))"
+(set W (table [x] (list (* 3 (+ 1 (% (til 100000) 7))))))
+(repr (select {p: (prod x) fi: (first x) la: (last x) mn: (min x) mx: (max x) from: W})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\" \"mn\" \"mx\")) (list [0] [3] [15] [3] [21]))"
+
+;; the same answers under a selection, which keeps the per-row path
+(repr (select {p: (prod f) fi: (first f) la: (last f) from: Z where: (>= i 0)})) -- "(table (as 'SYM (list \"p\" \"fi\" \"la\")) (list [32.0] [2.0] [8.0]))"
+(repr (at (select {s: (min z2) from: Z2 where: (> z2 -1.0)}) 's)) -- "[-0.0]"
+
+;; the sign of a zero extreme is the input's, F32 and F64, keyless and under
+;; a selection: a release build's -fno-signed-zeros let gcc fold the
+;; extreme's sign away (#1628 review), so the extremes run in strict IEEE
+;; (src/ops/aggseq.c).  Checked in release flags by `make test-release`.
+(set Z3 (table [x y i] (list (as 'F32 [-0.0]) [-0.0] [0])))
+(set Z4 (table [x y i] (list (as 'F32 [1.0 -0.0]) [1.0 -0.0] [0 1])))
+(set Z5 (table [x y i] (list (as 'F32 [-0.0 0.0 2.0]) [-0.0 0.0 2.0] [0 1 2])))
+(repr (select {a: (min x) b: (max x) c: (min y) d: (max y) from: Z3})) -- "(table (as 'SYM (list \"a\" \"b\" \"c\" \"d\")) (list [-0e] [-0e] [-0.0] [-0.0]))"
+(repr (select {a: (min x) b: (max x) c: (min y) d: (max y) from: Z4})) -- "(table (as 'SYM (list \"a\" \"b\" \"c\" \"d\")) (list [-0e] [1e] [-0.0] [1.0]))"
+(repr (select {a: (min x) c: (min y) from: Z5 where: (> x -1.0)})) -- "(table (as 'SYM (list \"a\" \"c\")) (list [-0e] [-0.0]))"
+(repr (select {a: (min x) c: (min y) from: Z5 where: (> i 0)})) -- "(table (as 'SYM (list \"a\" \"c\")) (list [0e] [0.0]))"
+(repr (at (select {s: (max x) from: (table [x] (list (as 'F32 [-0.0 -0.0])))}) 's)) -- "[-0e]"

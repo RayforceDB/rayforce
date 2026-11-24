@@ -82,15 +82,9 @@ int64_t ray_serde_size(ray_t* obj);
  * Buffer must have at least ray_serde_size(obj) bytes. */
 int64_t ray_ser_raw(uint8_t* buf, ray_t* obj);
 
-/* An error record carries the thread's last error message (ray_error_msg).
- * A new error raised between the size pass and the write pass of one
- * serialization (an encoded column that fails to decode, ...) would change
- * that text, and the write pass would then write a different length than
- * the size pass reserved.  ray_serde_msg_hold takes the text once; until
- * the matching ray_serde_msg_release both passes write that copy.  Holds
- * nest: the outermost one takes the text. */
-void    ray_serde_msg_hold(void);
-void    ray_serde_msg_release(void);
+/* An error record carries the error's own message (ray_err_msg), fixed
+ * when the error was made: the size pass and the write pass agree on it
+ * whatever is raised between them. */
 
 /* Deserialize object from buffer. Returns reconstructed ray_t*.
  * *len is updated to reflect bytes consumed. */
@@ -113,12 +107,21 @@ ray_t*  ray_de(ray_t* bytes);
 const char* ray_serde_fail_code(void);
 void ray_serde_fail_clear(void);              /* call before ray_serde_size */
 
-/* Whether a lambda's .sys.trust mark is written and read, on this thread.
- * Off by default, so ser/de, IPC and journal entries never carry it: a
- * frame from anywhere else cannot mark a lambda.  The journal turns it on
- * around writing and loading its snapshot, the server's own data.
- * Returns the previous setting. */
-bool ray_serde_keep_trust(bool on);
+/* True when obj, or anything the serializer would walk inside it (list
+ * items, dict keys and values, table columns, ...), is a process-local
+ * handle: a graph, a vector index or a Datalog program.  Such a value has
+ * no wire form, so ray_ser refuses it; the journal snapshot uses this to
+ * leave the binding out instead of failing as a whole. */
+bool ray_serde_holds_handle(ray_t* obj);
+
+/* Whether the server-internal marks are written and read, on this thread:
+ * a lambda's .sys.trust mark, and a list's literal-fallback mark (a request
+ * argument a handler stored, which evaluates to itself).  Off by default, so
+ * ser/de, IPC and journal entries never carry them: a frame from anywhere
+ * else cannot mark a value.  The journal turns it on around writing and
+ * loading its snapshot, the server's own data, so a snapshot recovers what
+ * the log recovers.  Returns the previous setting. */
+bool ray_serde_keep_marks(bool on);
 
 /* File I/O: save/load any object in binary format */
 ray_err_t ray_obj_save(ray_t* obj, const char* path);
