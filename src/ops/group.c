@@ -2450,6 +2450,8 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
 
 /* Per-partition dedup: open-addressing hash sized for the partition, then
  * atomic fetch-add into odata[gid] for each new distinct (gid, val). */
+typedef struct { int64_t gid_p1; int64_t val; } cdpg_slot_t;   /* 0 = empty */
+
 static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                           int64_t start, int64_t end) {
     (void)worker_id;
@@ -2467,17 +2469,12 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
         cap = c;
         uint64_t mask = cap - 1;
 
-        ray_t* k_hdr = NULL;
-        ray_t* v_hdr = NULL;
-        int64_t* slot_gid = (int64_t*)scratch_calloc(&k_hdr,
-                                                     (size_t)cap * sizeof(int64_t));
-        int64_t* slot_val = (int64_t*)scratch_alloc(&v_hdr,
-                                                    (size_t)cap * sizeof(int64_t));
-        if (!slot_gid || !slot_val) {
-            if (k_hdr) scratch_free(k_hdr);
-            if (v_hdr) scratch_free(v_hdr);
-            continue;
-        }
+        /* gid and value side by side: one cache line per probe, where
+         * two arrays cost a miss each */
+        ray_t* s_hdr = NULL;
+        cdpg_slot_t* slots = (cdpg_slot_t*)scratch_calloc(&s_hdr,
+                                                          (size_t)cap * sizeof(cdpg_slot_t));
+        if (!slots) continue;
 
         const int64_t* gids = x->gids_out + off;
         const int64_t* vals = x->vals_out + off;
@@ -2487,22 +2484,21 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
             uint64_t h = CDPG_HASH(gid_p1, val);
             uint64_t slot = h & mask;
             for (;;) {
-                int64_t cur = slot_gid[slot];
-                if (cur == 0) {
-                    slot_gid[slot] = gid_p1;
-                    slot_val[slot] = val;
+                cdpg_slot_t* sl = &slots[slot];
+                if (sl->gid_p1 == 0) {
+                    sl->gid_p1 = gid_p1;
+                    sl->val = val;
                     /* Partition is keyed on gid (CDPG_PART_HASH), so
                      * each gid is owned by exactly one task — drop the
                      * atomic. */
                     x->odata[gid_p1 - 1]++;
                     break;
                 }
-                if (cur == gid_p1 && slot_val[slot] == val) break;
+                if (sl->gid_p1 == gid_p1 && sl->val == val) break;
                 slot = (slot + 1) & mask;
             }
         }
-        scratch_free(k_hdr);
-        scratch_free(v_hdr);
+        scratch_free(s_hdr);
     }
 }
 
@@ -2522,6 +2518,11 @@ static ray_t* count_distinct_per_group_parallel(
      * room for skew; per-partition dedup data ~2 × (n_rows/64) × 16 B
      * which is well inside L2 even on 1 M-row inputs. */
     uint8_t p_bits = 6;
+    /* Above 1M rows, one more bit per doubling up to 256 partitions: the
+     * dedup table of a partition (2-4 slots a pair, 16 B a slot) then stays
+     * within about 1 MB, an L2 instead of an L3 working set (the 64
+     * partitions of 5M rows took 4 MB tables and 37 ms; 256 take 10). */
+    while (p_bits < 8 && (n_rows >> p_bits) > (int64_t)1 << 14) p_bits++;
     uint64_t P = (uint64_t)1 << p_bits;
     uint64_t p_mask = P - 1;
 

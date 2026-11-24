@@ -1127,6 +1127,215 @@ static ray_t* atomic_collapse_wide(ray_t* list) {
     return vec;
 }
 
+/* ── fill / dyadic min / max over a fixed-width vector ─────────────────
+ *
+ * (fill r v), (min a b) and (max a b) have no DAG opcode, so the mapper
+ * below built one atom per cell: an allocation, a scalar call and a
+ * release each, ~50 ns a row (1.2 s over a 24M-row column, as long as the
+ * join that produced it).  These kernels answer the shapes the mapper's
+ * probe types the same way it would, cell by cell in the result's width,
+ * and decline (NULL) every other shape, which keeps its boxed route:
+ *
+ *   fill   an int-family or F64 vector with a non-null int-family or
+ *          float replacement, when the first cell is not null or the
+ *          replacement has the vector's type (the probe types the result
+ *          from its first cell);
+ *   min/max  int-family cells (I64 I32 I16 DATE TIME TIMESTAMP) against
+ *          int-family cells of the same or a promotable type, or F64
+ *          against F64 / an integer, as a vector against an atom or two
+ *          vectors of one length.
+ *
+ * Null is the payload sentinel, as the atom predicates read it
+ * (ray_atom_is_null_fn), whatever the vector's HAS_NULLS flag says; a null
+ * written to the result sets that flag, as store_typed_elem did.  min/max
+ * order null lowest (ray_lte_fn / ray_gte_fn): min of a null and a value
+ * is the null, max is the value.  DATE cells compare as their saturating
+ * nanosecond conversion does (temporal_as_ns): days beyond the TIMESTAMP
+ * range all order alike. */
+static inline bool fastmap_int_type(int8_t t) {
+    return t == RAY_I64 || t == RAY_I32 || t == RAY_I16 ||
+           t == RAY_DATE || t == RAY_TIME || t == RAY_TIMESTAMP;
+}
+
+/* cell i as int64 with its null state */
+static inline int64_t fastmap_read_i64(const void* d, int8_t t, int64_t i, bool* null) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: {
+        int64_t v = ((const int64_t*)d)[i]; *null = v == NULL_I64; return v;
+    }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: {
+        int32_t v = ((const int32_t*)d)[i]; *null = v == NULL_I32; return v;
+    }
+    default: {
+        int16_t v = ((const int16_t*)d)[i]; *null = v == NULL_I16; return v;
+    }
+    }
+}
+
+static inline void fastmap_write_i64(void* d, int8_t t, int64_t i, int64_t v, bool null) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: ((int64_t*)d)[i] = null ? NULL_I64 : v; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: ((int32_t*)d)[i] = null ? NULL_I32 : (int32_t)v; break;
+    default: ((int16_t*)d)[i] = null ? NULL_I16 : (int16_t)v; break;
+    }
+}
+
+/* DATE days as temporal_as_ns orders them: saturated past +-106751 days */
+#define FASTMAP_DATE_SAT 106751
+static inline int64_t fastmap_date_key(int64_t days) {
+    return days > FASTMAP_DATE_SAT ? FASTMAP_DATE_SAT
+         : days < -FASTMAP_DATE_SAT ? -FASTMAP_DATE_SAT : days;
+}
+
+static ray_t* fastmap_fill(ray_t* r, ray_t* v) {
+    if (!r || !v || r->type >= 0 || !ray_is_vec(v) || v->len == 0) return NULL;
+    if (RAY_ATOM_IS_NULL(r)) return NULL;
+    int8_t vt = v->type, rt = (int8_t)-r->type;
+    int64_t n = v->len;
+    const void* src = ray_data(v);
+    bool first_null;
+    if (fastmap_int_type(vt)) {
+        if (!fastmap_int_type(rt)) return NULL;
+        (void)fastmap_read_i64(src, vt, 0, &first_null);
+        if (first_null && rt != vt) return NULL;   /* the result takes r's type */
+        int64_t rv = elem_as_i64(r);
+        ray_t* out = ray_vec_new(vt, n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = n;
+        void* dst = ray_data(out);
+        switch (vt) {
+        case RAY_I64: case RAY_TIMESTAMP: {
+            const int64_t* s = (const int64_t*)src; int64_t* d = (int64_t*)dst;
+            for (int64_t i = 0; i < n; i++) d[i] = s[i] == NULL_I64 ? rv : s[i];
+            break;
+        }
+        case RAY_I32: case RAY_DATE: case RAY_TIME: {
+            const int32_t* s = (const int32_t*)src; int32_t* d = (int32_t*)dst;
+            int32_t r32 = (int32_t)rv;
+            for (int64_t i = 0; i < n; i++) d[i] = s[i] == NULL_I32 ? r32 : s[i];
+            break;
+        }
+        default: {
+            const int16_t* s = (const int16_t*)src; int16_t* d = (int16_t*)dst;
+            int16_t r16 = (int16_t)rv;
+            for (int64_t i = 0; i < n; i++) d[i] = s[i] == NULL_I16 ? r16 : s[i];
+            break;
+        }
+        }
+        return out;
+    }
+    if (vt == RAY_F64) {
+        bool r_float = rt == RAY_F64 || rt == RAY_F32;
+        if (!r_float && rt != RAY_I64 && rt != RAY_I32 && rt != RAY_I16) return NULL;
+        const double* s = (const double*)src;
+        if (s[0] != s[0] && rt != RAY_F64) return NULL;
+        double rv = r_float ? r->f64 : (double)elem_as_i64(r);
+        ray_t* out = ray_vec_new(RAY_F64, n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = n;
+        double* d = (double*)ray_data(out);
+        for (int64_t i = 0; i < n; i++) d[i] = s[i] != s[i] ? rv : s[i];
+        return out;
+    }
+    return NULL;
+}
+
+/* one operand of min/max: a vector's cells or an atom broadcast */
+typedef struct {
+    const void* data;      /* vector cells, or NULL for an atom */
+    int8_t      type;      /* cell / atom type (positive) */
+    int64_t     ai;        /* the atom as int64 (int family) */
+    double      af;        /* the atom as double (F64 result) */
+    bool        anull;
+} fastmap_side_t;
+
+static bool fastmap_side(ray_t* x, fastmap_side_t* s) {
+    if (!x) return false;
+    if (x->type < 0) {
+        s->type = (int8_t)-x->type;
+        s->data = NULL;
+        s->anull = RAY_ATOM_IS_NULL(x);
+        if (fastmap_int_type(s->type)) { s->ai = elem_as_i64(x); s->af = (double)s->ai; }
+        else if (s->type == RAY_F64) { s->af = x->f64; s->ai = 0; }
+        else return false;
+        return true;
+    }
+    if (!ray_is_vec(x)) return false;
+    s->type = x->type;
+    if (!fastmap_int_type(s->type) && s->type != RAY_F64) return false;
+    s->data = ray_data(x);
+    s->ai = 0; s->af = 0; s->anull = false;
+    return true;
+}
+
+static inline int64_t fastmap_side_i64(const fastmap_side_t* s, int64_t i, bool* null) {
+    if (!s->data) { *null = s->anull; return s->ai; }
+    return fastmap_read_i64(s->data, s->type, i, null);
+}
+
+static inline double fastmap_side_f64(const fastmap_side_t* s, int64_t i, bool* null) {
+    if (!s->data) { *null = s->anull; return s->af; }
+    if (s->type == RAY_F64) { double v = ((const double*)s->data)[i]; *null = v != v; return v; }
+    int64_t v = fastmap_read_i64(s->data, s->type, i, null);
+    return (double)v;
+}
+
+static ray_t* fastmap_minmax(bool is_min, ray_t* a, ray_t* b) {
+    fastmap_side_t sa, sb;
+    if (!fastmap_side(a, &sa) || !fastmap_side(b, &sb)) return NULL;
+    if (!sa.data && !sb.data) return NULL;
+    if (sa.data && sb.data && a->len != b->len) return NULL;
+    int64_t n = sa.data ? a->len : b->len;
+    if (n == 0) return NULL;
+    bool any_null = false;
+    if (fastmap_int_type(sa.type) && fastmap_int_type(sb.type)) {
+        int8_t ot = sa.type;
+        if (sa.type != sb.type) {
+            ot = ray_num_type(sa.type, sb.type);   /* 0 for a temporal against another type */
+            if (!ot) return NULL;
+        }
+        bool date = ot == RAY_DATE;
+        ray_t* out = ray_vec_new(ot, n);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        out->len = n;
+        void* dst = ray_data(out);
+        for (int64_t i = 0; i < n; i++) {
+            bool na, nb;
+            int64_t x = fastmap_side_i64(&sa, i, &na);
+            int64_t y = fastmap_side_i64(&sb, i, &nb);
+            /* null orders lowest; a saturated date orders like its bound */
+            int64_t kx = na ? INT64_MIN : date ? fastmap_date_key(x) : x;
+            int64_t ky = nb ? INT64_MIN : date ? fastmap_date_key(y) : y;
+            bool pick_a = is_min ? kx <= ky : kx >= ky;
+            bool nv = pick_a ? na : nb;
+            fastmap_write_i64(dst, ot, i, pick_a ? x : y, nv);
+            any_null |= nv;
+        }
+        if (any_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+    /* F64 against F64 or an integer (I64 I32 I16): an F64 result */
+    bool a_ok = sa.type == RAY_F64 || sa.type == RAY_I64 || sa.type == RAY_I32 || sa.type == RAY_I16;
+    bool b_ok = sb.type == RAY_F64 || sb.type == RAY_I64 || sb.type == RAY_I32 || sb.type == RAY_I16;
+    if (!a_ok || !b_ok) return NULL;
+    ray_t* out = ray_vec_new(RAY_F64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    double* d = (double*)ray_data(out);
+    for (int64_t i = 0; i < n; i++) {
+        bool na, nb;
+        double x = fastmap_side_f64(&sa, i, &na);
+        double y = fastmap_side_f64(&sb, i, &nb);
+        bool pick_a, nv;
+        if (is_min) { pick_a = na || (!nb && x <= y); nv = na || nb; }
+        else        { pick_a = !na && (nb || x >= y); nv = na && nb; }
+        d[i] = nv ? NULL_F64 : pick_a ? x : y;
+        any_null |= nv;
+    }
+    if (any_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 /* Map a binary function element-wise over collections.
  * Both args can be collections (zip-map) or one scalar (broadcast).
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise. */
@@ -1679,6 +1888,14 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     if ((left && !RAY_IS_ERR(left) && RAY_IS_PARTED(left->type)) ||
         (right && !RAY_IS_ERR(right) && RAY_IS_PARTED(right->type)))
         return atomic_map_binary_parted(fn, dag_opcode, left, right);
+
+    /* fill / dyadic min / max over a fixed-width vector: one typed pass
+     * (fastmap_fill, fastmap_minmax); NULL keeps the shape on the mapper */
+    if (fn == ray_fill_fn || fn == ray_min2_fn || fn == ray_max2_fn) {
+        ray_t* r = fn == ray_fill_fn ? fastmap_fill(left, right)
+                                     : fastmap_minmax(fn == ray_min2_fn, left, right);
+        if (r) return r;
+    }
 
     bool duration_binary = fn == ray_add_fn || fn == ray_sub_fn || fn == ray_mul_fn ||
         fn == ray_div_fn || fn == ray_idiv_fn || fn == ray_mod_fn || fn == ray_xbar_fn ||
