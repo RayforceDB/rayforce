@@ -495,6 +495,27 @@ The two rules answer differently for equal values: over the ten rows above,
 `(sum (til 3))` is `3` while `(sum [0 1 2])` raises `length`, and
 `(sum (take [7 8] 1))` is `7` while `(sum [7])` is `70`.
 
+The probability of `quantile` and `percentile` is not a source: it is one
+value for the whole aggregate, as the builtin's second argument is. It is
+evaluated once over the rows the aggregate reads, each group's under `by:`
+and the rows `where:` keeps in a keyless select, and checked as the builtin
+checks it. A literal, a bound name, `(+ P 0)`, a helper call and
+`(first t)` each give one probability. A column gives one per row and is
+the builtin's `type` error, as a vector is; a null, or a value outside
+`0..1` (`0..100` for `percentile`), is its `domain` error. None of them
+answers the median instead. Over no rows (an empty table, or a `where:`
+that keeps none) there is no row for the probability to be wrong about:
+the select answers as for a valid probability, `[]` over an empty table
+and `[0Nf]` under such a `where:`, and `by:` gives no groups.
+
+```lisp
+(set q (table [s t] (list [0.0 8.0 16.0 24.0] [0.1 0.2 0.3 0.4])))
+(select {v: (quantile s (first t)) from: q})                ; v [2.4]
+(select {v: (quantile s (first t)) from: q where: (> s 5)}) ; v [11.2]
+(select {v: (quantile s t) from: q})      ; error: type
+(select {v: (quantile s 1.25) from: q})   ; error: domain
+```
+
 ### Filter + Group-by
 
 Filter first, then group by. Chain two `select` calls for correct results:
