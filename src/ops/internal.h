@@ -1483,6 +1483,9 @@ ray_t* ray_where_mask_coerce(ray_t* pred, int64_t tn, const char* label);
 /* Typed membership kernel (verdict-LUT / SIMD / pool-parallel); NULL when
  * the col/set shape is unsupported — caller falls back to its own path. */
 ray_t* ray_in_vec_exec(ray_t* col, ray_t* set, bool negate);
+/* A computed LIST set holding strings, read against a SYM operand: the
+ * string vector of its texts (symbols by name); NULL when not that shape. */
+ray_t* ray_in_sym_list_as_str(ray_t* set);
 ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                    const int64_t* keep_syms, int keep_n);
 
