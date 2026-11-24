@@ -89,6 +89,20 @@ jobs:
             oom-*
           if-no-files-found: ignore
 
+  keyless-agg-instructions:
+    # The keyless aggregates of a plain column run a typed loop per column
+    # type (#1628); a per-row type dispatch or the generic per-row path
+    # coming back costs 10 to 140 times the instructions.  Counted by
+    # callgrind, so the bound does not depend on the runner's load.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Install gcc 12 and valgrind
+        run: sudo apt-get update && sudo apt-get install -y gcc-12 valgrind
+      - name: Instruction-count bounds (gcc 12 release)
+        run: make bench-keyless-agg CC=gcc-12
+
   soak-server:
     runs-on: ubuntu-latest
     steps:
