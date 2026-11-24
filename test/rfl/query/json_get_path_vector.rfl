@@ -1,0 +1,54 @@
+;; @also-unfused
+;; #1437: a vector of paths given to .json.get of a column is a column of
+;; paths: as long as the table, filtered by where: and grouped by by: with
+;; the documents, in every clause; and a vector written in place is the same
+;; vector held by a name.  The select projection and by: read a named vector
+;; whole against the rows where: kept, and a literal one per row.
+(set T (table [line x] (list ["{\"k\":1,\"n\":2}" "{\"k\":3,\"n\":4}" "{\"k\":5,\"n\":6}"] [1 2 3])))
+(set PV ["k" "n" "k"])
+(set PV2 ["k" "n"])
+;; the oracle: the same paths as a column
+(set TP (table [line x p] (list (at T 'line) [1 2 3] PV)))
+(at (select {v: (.json.get line p 'I64) from: TP where: (> x 1)}) 'v) -- [4 5]
+;; select projection, keyless and under where:
+(at (select {v: (.json.get line PV 'I64) from: T}) 'v) -- [1 4 5]
+(at (select {v: (.json.get line PV 'I64) from: T where: (> x 1)}) 'v) -- [4 5]
+(at (select {v: (.json.get line PV 'I64) from: T where: (> x 1)}) 'v) -- (at (select {v: (.json.get line p 'I64) from: TP where: (> x 1)}) 'v)
+;; by:, with where:
+(at (select {v: (first (.json.get line PV 'I64)) from: T by: x where: (> x 1)}) 'v) -- [4 5]
+(at (select {v: (.json.get line PV 'I64) from: T by: x}) 'v) -- (list [1] [4] [5])
+;; the where: clause itself, and update, as before
+(at (select {v: x from: T where: (> (.json.get line PV 'I64) 2)}) 'v) -- [2 3]
+(at (update {v: (.json.get line PV 'I64) from: T where: (> x 1)}) 'v) -- [0Nl 4 5]
+;; a lambda parameter is the same
+(at ((fn [q] (select {v: (.json.get line q 'I64) from: T where: (> x 1)})) PV) 'v) -- [4 5]
+;; another length is a `length` error in every clause
+(select {v: (.json.get line PV2 'I64) from: T where: (> x 1)}) !- length
+(select {v: (first (.json.get line PV2 'I64)) from: T by: x}) !- length
+(update {v: (.json.get line PV2 'I64) from: T where: (> x 1)}) !- length
+(select {v: x from: T where: (> (.json.get line PV2 'I64) 2)}) !- length
+;; a vector written in place is the vector held by a name
+(at (select {v: (.json.get line ["k" "n" "k"] 'I64) from: T}) 'v) -- (at (select {v: (.json.get line PV 'I64) from: T}) 'v)
+(at (select {v: (.json.get line ["k" "n" "k"] 'I64) from: T where: (> x 1)}) 'v) -- [4 5]
+(at (update {v: (.json.get line ["k" "n" "k"] 'I64) from: T}) 'v) -- [1 4 5]
+;; one path is one value for every row, as before
+(at (select {v: (.json.get line "k" 'I64) from: T where: (> x 1)}) 'v) -- [3 5]
+;; a one-path vector is a vector of paths, as eager: written in place as
+;; held by a name, its length is .json.get's own error
+(set P1 ["k"])
+(.json.get (at T 'line) ["k"] 'I64) !- length
+(select {v: (.json.get line P1 'I64) from: T where: (> x 1)}) !- length
+(select {v: (.json.get line ["k"] 'I64) from: T where: (> x 1)}) !- length
+;; over an empty table nothing of a vector of paths is read, as before (the
+;; #1492 rule): a vector written in place gives an empty column; one held by
+;; a name, or under update, keeps .json.get's own length error, as before
+(set E (table [line x] (list (as 'STR []) (as 'I64 []))))
+(set PE ["k" "n"])
+(count (at (select {v: (.json.get line ["k" "n"] 'I64) from: E}) 'v)) -- 0
+(count (at (select {v: (.json.get line ["k" "n"] 'I64) from: E where: (> x 1)}) 'v)) -- 0
+(select {v: (.json.get line PE 'I64) from: E}) !- length
+(update {v: (.json.get line ["k" "n"] 'I64) from: E}) !- length
+(count (at (select {v: (first (.json.get line PE 'I64)) from: E by: x}) 'v)) -- 0
+;; a where: that keeps no row of a non-empty table reads no path either
+(count (at (select {v: (.json.get line PV 'I64) from: T where: (> x 9)}) 'v)) -- 0
+(count (at (select {v: (.json.get line ["k" "n" "k"] 'I64) from: T where: (> x 9)}) 'v)) -- 0

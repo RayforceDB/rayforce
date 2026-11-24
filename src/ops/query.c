@@ -4905,6 +4905,11 @@ static int head_is_builtin_binary(ray_t* fn, ray_binary_fn native) {
 static bool json_const_arg(ray_t* a, ray_t* tbl, bool path) {
     if (!a) return false;
     if (a->type == RAY_DICT || a->type == -RAY_STR) return true;
+    /* a vector of paths written in place is the same vector held by a
+     * name (#1437); over an empty table it is read as before, per row, so
+     * nothing of it is read (the #1492 rule) */
+    if (path && (a->type == RAY_STR || a->type == RAY_SYM) && !(a->attrs & ATTR_QUOTED))
+        return tbl && tbl->type == RAY_TABLE && ray_table_nrows(tbl) > 0;
     if (a->type != -RAY_SYM) return false;
     if (a->attrs & ATTR_QUOTED) return true;
     if (expr_refs_row_column(a, tbl)) return false;
@@ -19535,6 +19540,20 @@ static bool fv_arg_rows(ray_t* e, int64_t i, ray_t* tbl, bool rows) {
     return i == 1 && e->len == 2 && ((ray_t**)ray_data(e))[0]->i64 == distinct_id;
 }
 
+/* Is `e` a JSON read, .json.get or .json.parse, of a column: its path is
+ * then paired with the rows, one path per document (#1437). */
+static bool fv_json_read_of_rows(ray_t* e, ray_t* tbl) {
+    if (e->len < 3) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (!el[0] || el[0]->type != -RAY_SYM || (el[0]->attrs & ATTR_QUOTED)) return false;
+    ray_t* hs = ray_sym_str(el[0]->i64);
+    size_t hl = hs ? ray_str_len(hs) : 0;
+    const char* hp = hs ? ray_str_ptr(hs) : "";
+    bool json = (hl == 9 && memcmp(hp, ".json.get", 9) == 0) ||
+                (hl == 11 && memcmp(hp, ".json.parse", 11) == 0);
+    return json && expr_refs_row_column(el[1], tbl);
+}
+
 /* `e` with each free vector it reads as rows (`rows`: `e` itself is read
  * so) replaced by the private id of a column holding it, registered in
  * `fc`; a free vector there of neither one value nor the table's length is
@@ -19588,8 +19607,21 @@ static ray_t* fv_subst(ray_t* e, ray_t* tbl, bool rows, fv_cols_t* fc) {
         select_alias_skip_form(((ray_t**)ray_data(e))[0])) { ray_retain(e); return e; }
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* out = NULL;
+    /* A vector of paths of a JSON read of a column is a column of paths, as
+     * long as the table and filtered and grouped with it, wherever the
+     * read is (#1437). */
+    bool json_path = fv_json_read_of_rows(e, tbl);
+    if (json_path) {
+        ray_t* pv = fv_value(el[2], tbl, fc);
+        int64_t nr = ray_table_nrows(tbl);
+        if (pv && (pv->type == RAY_STR || pv->type == RAY_SYM) && pv->len != 1 && nr != 0 &&
+            pv->len != nr)
+            return ray_error("length", ".json.get: %lld paths for %lld rows",
+                             (long long)pv->len, (long long)nr);
+    }
     for (int64_t i = 1; i < e->len; i++) {
-        ray_t* c = fv_subst(el[i], tbl, fv_arg_rows(e, i, tbl, rows), fc);
+        bool r = fv_arg_rows(e, i, tbl, rows) || (json_path && i == 2);
+        ray_t* c = fv_subst(el[i], tbl, r, fc);
         if (!c || RAY_IS_ERR(c)) { if (out) ray_release(out); return c ? c : ray_error("oom", NULL); }
         if (!out && c == el[i]) { ray_release(c); continue; }
         if (!out) {
