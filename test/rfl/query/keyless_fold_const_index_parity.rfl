@@ -1,0 +1,760 @@
+;; @also-unfused
+;; #1429 asks whether fold, and at with a constant index, read the whole
+;; column or the rows a where: keeps, under by: and keyless.  Until the
+;; owner decides, #1401's keyless change leaves every such answer as it was
+;; before it.  These are its parent's (ec0630a0) answers, every one, keyless
+;; and under by:, with and without where:, alone and beside a declined
+;; output: a constant index written in place, fold, and under a where: an
+;; index computed from no column.  Without a where: a computed index reads
+;; every row either way, (sum (at c (til 4))) is #1402's and keyless_agg_
+;; source_whole pins it.  med is left out: under by: its answer over such a
+;; source reads memory it did not write and differs run to run, on the
+;; parent too (#1572).
+(set T (table [k c d s v] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] [aa bb cc aa] [10 20 30 40])))
+(set G (table [g c d s v] (list [a a b b] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] [aa bb cc aa] [10 20 30 40])))
+(at (select {from: T s: (sum (at c [3 2 1 0]))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [3 2 1 0]))}) 's) -- [14]
+(at (select {from: G by: g s: (sum (at c [3 2 1 0]))}) 's) -- [8 6]
+(at (select {from: T s: (sum (at c [3 2 1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [3 2 1 0])) where: (> v 15)}) 's) -- [8]
+(at (select {from: G by: g s: (sum (at c [3 2 1 0])) where: (> v 15)}) 's) -- [0 8]
+(at (select {from: T s: (sum (at c [3 2 1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: G by: g s: (sum (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [8 6]
+(at (select {from: T s: (sum (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [8]
+(at (select {from: G by: g s: (sum (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0 8]
+(at (select {from: T s: (sum (at c [0]))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [0]))}) 's) -- [1]
+(at (select {from: G by: g s: (sum (at c [0]))}) 's) -- [1 0]
+(at (select {from: T s: (sum (at c [0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (sum (at c [0])) where: (> v 15)}) 's) -- [5 0]
+(at (select {from: T s: (sum (at c [0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (sum (at c [0])) z: (first (+ d 0))}) 's) -- [1 0]
+(at (select {from: T s: (sum (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (sum (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 0]
+(at (select {from: T s: (sum (at c 1))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c 1))}) 's) !- type
+(at (select {from: G by: g s: (sum (at c 1))}) 's) !- type
+(at (select {from: T s: (sum (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (sum (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (sum (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (at s [1 0]))}) 's) !- type
+(at (select {from: T by: k s: (sum (at s [1 0]))}) 's) !- type
+(at (select {from: G by: g s: (sum (at s [1 0]))}) 's) !- type
+(at (select {from: T s: (sum (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (sum (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (sum (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (+ 1 (at c [3 2 1 0])))}) 's) !- type
+(at (select {from: T by: k s: (sum (+ 1 (at c [3 2 1 0])))}) 's) -- [18]
+(at (select {from: G by: g s: (sum (+ 1 (at c [3 2 1 0])))}) 's) -- [10 8]
+(at (select {from: T s: (sum (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [10]
+(at (select {from: G by: g s: (sum (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [0 10]
+(at (select {from: T s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [18]
+(at (select {from: G by: g s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [10 8]
+(at (select {from: T s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [10]
+(at (select {from: G by: g s: (sum (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0 10]
+(at (select {from: T s: (sum (fold + c))}) 's) !- type
+(at (select {from: T by: k s: (sum (fold + c))}) 's) !- type
+(at (select {from: G by: g s: (sum (fold + c))}) 's) !- type
+(at (select {from: T s: (sum (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (sum (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (sum (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (sum (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (sum (+ v (fold + c)))}) 's) !- type
+(at (select {from: T by: k s: (sum (+ v (fold + c)))}) 's) -- [156]
+(at (select {from: G by: g s: (sum (+ v (fold + c)))}) 's) -- [58 98]
+(at (select {from: T s: (sum (+ v (fold + c))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (+ v (fold + c))) where: (> v 15)}) 's) -- [129]
+(at (select {from: G by: g s: (sum (+ v (fold + c))) where: (> v 15)}) 's) -- [33 96]
+(at (select {from: T s: (sum (+ v (fold + c))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [156]
+(at (select {from: G by: g s: (sum (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [58 98]
+(at (select {from: T s: (sum (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [129]
+(at (select {from: G by: g s: (sum (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [33 96]
+(at (select {from: T s: (sum (at c (til 4))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c (til 4))) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (sum (at c (til 4))) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (sum (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (sum (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (sum ((fn [y] (at y [1 0])) c))}) 's) !- type
+(at (select {from: T by: k s: (sum ((fn [y] (at y [1 0])) c))}) 's) -- [6]
+(at (select {from: G by: g s: (sum ((fn [y] (at y [1 0])) c))}) 's) -- [6 0]
+(at (select {from: T s: (sum ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [11]
+(at (select {from: G by: g s: (sum ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6 5]
+(at (select {from: T s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [6]
+(at (select {from: G by: g s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [6 0]
+(at (select {from: T s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [11]
+(at (select {from: G by: g s: (sum ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6 5]
+(at (select {from: T s: (count (at c [3 2 1 0]))}) 's) !- type
+(at (select {from: T by: k s: (count (at c [3 2 1 0]))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at c [3 2 1 0]))}) 's) -- [2 2]
+(at (select {from: T s: (count (at c [3 2 1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c [3 2 1 0])) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c [3 2 1 0])) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c [3 2 1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c [0]))}) 's) !- type
+(at (select {from: T by: k s: (count (at c [0]))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at c [0]))}) 's) -- [2 2]
+(at (select {from: T s: (count (at c [0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c [0])) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c [0])) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c [0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (at c [0])) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at c [0])) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c 1))}) 's) !- type
+(at (select {from: T by: k s: (count (at c 1))}) 's) !- type
+(at (select {from: G by: g s: (count (at c 1))}) 's) !- type
+(at (select {from: T s: (count (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (count (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (count (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (count (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (count (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (count (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (count (at s [1 0]))}) 's) !- type
+(at (select {from: T by: k s: (count (at s [1 0]))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at s [1 0]))}) 's) -- [2 2]
+(at (select {from: T s: (count (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at s [1 0])) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at s [1 0])) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (at s [1 0])) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count (at s [1 0])) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (+ 1 (at c [3 2 1 0])))}) 's) !- type
+(at (select {from: T by: k s: (count (+ 1 (at c [3 2 1 0])))}) 's) -- [4]
+(at (select {from: G by: g s: (count (+ 1 (at c [3 2 1 0])))}) 's) -- [2 2]
+(at (select {from: T s: (count (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (fold + c))}) 's) !- type
+(at (select {from: T by: k s: (count (fold + c))}) 's) !- type
+(at (select {from: G by: g s: (count (fold + c))}) 's) !- type
+(at (select {from: T s: (count (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (count (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (count (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (count (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (count (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (count (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (count (+ v (fold + c)))}) 's) !- type
+(at (select {from: T by: k s: (count (+ v (fold + c)))}) 's) -- [4]
+(at (select {from: G by: g s: (count (+ v (fold + c)))}) 's) -- [2 2]
+(at (select {from: T s: (count (+ v (fold + c))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (+ v (fold + c))) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (+ v (fold + c))) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (+ v (fold + c))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c (til 4))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c (til 4))) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c (til 4))) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count ((fn [y] (at y [1 0])) c))}) 's) !- type
+(at (select {from: T by: k s: (count ((fn [y] (at y [1 0])) c))}) 's) -- [4]
+(at (select {from: G by: g s: (count ((fn [y] (at y [1 0])) c))}) 's) -- [2 2]
+(at (select {from: T s: (count ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: G by: g s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [2 2]
+(at (select {from: T s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (count ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1 2]
+(at (select {from: T s: (max (at c [3 2 1 0]))}) 's) !- type
+(at (select {from: T by: k s: (max (at c [3 2 1 0]))}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c [3 2 1 0]))}) 's) -- [6 5]
+(at (select {from: T s: (max (at c [3 2 1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c [3 2 1 0])) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c [3 2 1 0])) where: (> v 15)}) 's) -- [0Nl 6]
+(at (select {from: T s: (max (at c [3 2 1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [6 5]
+(at (select {from: T s: (max (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nl 6]
+(at (select {from: T s: (max (at c [0]))}) 's) !- type
+(at (select {from: T by: k s: (max (at c [0]))}) 's) -- [1]
+(at (select {from: G by: g s: (max (at c [0]))}) 's) -- [1 0Nl]
+(at (select {from: T s: (max (at c [0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (max (at c [0])) where: (> v 15)}) 's) -- [5 0Nl]
+(at (select {from: T s: (max (at c [0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (max (at c [0])) z: (first (+ d 0))}) 's) -- [1 0Nl]
+(at (select {from: T s: (max (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (max (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 0Nl]
+(at (select {from: T s: (max (at c 1))}) 's) !- type
+(at (select {from: T by: k s: (max (at c 1))}) 's) !- type
+(at (select {from: G by: g s: (max (at c 1))}) 's) !- type
+(at (select {from: T s: (max (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (max (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (max (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (max (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (max (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (max (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (max (at s [1 0]))}) 's) !- type
+(at (select {from: T by: k s: (max (at s [1 0]))}) 's) -- [bb]
+(at (select {from: G by: g s: (max (at s [1 0]))}) 's) -- [bb ']
+(at (select {from: T s: (max (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at s [1 0])) where: (> v 15)}) 's) -- [cc]
+(at (select {from: G by: g s: (max (at s [1 0])) where: (> v 15)}) 's) -- [cc bb]
+(at (select {from: T s: (max (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (at s [1 0])) z: (first (+ d 0))}) 's) -- [bb]
+(at (select {from: G by: g s: (max (at s [1 0])) z: (first (+ d 0))}) 's) -- [bb ']
+(at (select {from: T s: (max (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [cc]
+(at (select {from: G by: g s: (max (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [cc bb]
+(at (select {from: T s: (max (+ 1 (at c [3 2 1 0])))}) 's) !- type
+(at (select {from: T by: k s: (max (+ 1 (at c [3 2 1 0])))}) 's) -- [7]
+(at (select {from: G by: g s: (max (+ 1 (at c [3 2 1 0])))}) 's) -- [7 6]
+(at (select {from: T s: (max (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [7]
+(at (select {from: G by: g s: (max (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [0Nl 7]
+(at (select {from: T s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [7]
+(at (select {from: G by: g s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [7 6]
+(at (select {from: T s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [7]
+(at (select {from: G by: g s: (max (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nl 7]
+(at (select {from: T s: (max (fold + c))}) 's) !- type
+(at (select {from: T by: k s: (max (fold + c))}) 's) !- type
+(at (select {from: G by: g s: (max (fold + c))}) 's) !- type
+(at (select {from: T s: (max (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (max (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (max (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (max (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (max (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (max (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (max (+ v (fold + c)))}) 's) !- type
+(at (select {from: T by: k s: (max (+ v (fold + c)))}) 's) -- [54]
+(at (select {from: G by: g s: (max (+ v (fold + c)))}) 's) -- [34 54]
+(at (select {from: T s: (max (+ v (fold + c))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (+ v (fold + c))) where: (> v 15)}) 's) -- [53]
+(at (select {from: G by: g s: (max (+ v (fold + c))) where: (> v 15)}) 's) -- [33 53]
+(at (select {from: T s: (max (+ v (fold + c))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [54]
+(at (select {from: G by: g s: (max (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [34 54]
+(at (select {from: T s: (max (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [53]
+(at (select {from: G by: g s: (max (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [33 53]
+(at (select {from: T s: (max (at c (til 4))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c (til 4))) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c (til 4))) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (max (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (max ((fn [y] (at y [1 0])) c))}) 's) !- type
+(at (select {from: T by: k s: (max ((fn [y] (at y [1 0])) c))}) 's) -- [5]
+(at (select {from: G by: g s: (max ((fn [y] (at y [1 0])) c))}) 's) -- [5 0Nl]
+(at (select {from: T s: (max ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6 5]
+(at (select {from: T s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: G by: g s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [5 0Nl]
+(at (select {from: T s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (max ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6 5]
+(at (select {from: T s: (first (at c [3 2 1 0]))}) 's) -- [2]
+(at (select {from: T by: k s: (first (at c [3 2 1 0]))}) 's) -- [2]
+(at (select {from: G by: g s: (first (at c [3 2 1 0]))}) 's) -- [5 2]
+(at (select {from: T s: (first (at c [3 2 1 0])) where: (> v 15)}) 's) -- [2]
+(at (select {from: T by: k s: (first (at c [3 2 1 0])) where: (> v 15)}) 's) -- [2]
+(at (select {from: G by: g s: (first (at c [3 2 1 0])) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (first (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [2]
+(at (select {from: T by: k s: (first (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [2]
+(at (select {from: G by: g s: (first (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [5 2]
+(at (select {from: T s: (first (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [2]
+(at (select {from: T by: k s: (first (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [2]
+(at (select {from: G by: g s: (first (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (first (at c [0]))}) 's) -- [1]
+(at (select {from: T by: k s: (first (at c [0]))}) 's) -- [1]
+(at (select {from: G by: g s: (first (at c [0]))}) 's) -- [1 6]
+(at (select {from: T s: (first (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c [0])) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (first (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: T by: k s: (first (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (first (at c [0])) z: (first (+ d 0))}) 's) -- [1 6]
+(at (select {from: T s: (first (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (first (at c 1))}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c 1))}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c 1))}) 's) -- [5 2]
+(at (select {from: T s: (first (at c 1)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (first (at c 1)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (first (at c 1)) where: (> v 15)}) 's) -- [0Nl 2]
+(at (select {from: T s: (first (at c 1)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c 1)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c 1)) z: (first (+ d 0))}) 's) -- [5 2]
+(at (select {from: T s: (first (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (first (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (first (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nl 2]
+(at (select {from: T s: (first (at s [1 0]))}) 's) -- [bb]
+(at (select {from: T by: k s: (first (at s [1 0]))}) 's) -- [bb]
+(at (select {from: G by: g s: (first (at s [1 0]))}) 's) -- [bb aa]
+(at (select {from: T s: (first (at s [1 0])) where: (> v 15)}) 's) -- [cc]
+(at (select {from: T by: k s: (first (at s [1 0])) where: (> v 15)}) 's) -- [cc]
+(at (select {from: G by: g s: (first (at s [1 0])) where: (> v 15)}) 's) -- [bb aa]
+(at (select {from: T s: (first (at s [1 0])) z: (first (+ d 0))}) 's) -- [bb]
+(at (select {from: T by: k s: (first (at s [1 0])) z: (first (+ d 0))}) 's) -- [bb]
+(at (select {from: G by: g s: (first (at s [1 0])) z: (first (+ d 0))}) 's) -- [bb aa]
+(at (select {from: T s: (first (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [cc]
+(at (select {from: T by: k s: (first (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [cc]
+(at (select {from: G by: g s: (first (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [bb aa]
+(at (select {from: T s: (first (+ 1 (at c [3 2 1 0])))}) 's) -- [3]
+(at (select {from: T by: k s: (first (+ 1 (at c [3 2 1 0])))}) 's) -- [3]
+(at (select {from: G by: g s: (first (+ 1 (at c [3 2 1 0])))}) 's) -- [6 3]
+(at (select {from: T s: (first (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [3]
+(at (select {from: T by: k s: (first (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (first (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [6 3]
+(at (select {from: T s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [3]
+(at (select {from: T by: k s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [3]
+(at (select {from: G by: g s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [6 3]
+(at (select {from: T s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: T by: k s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: G by: g s: (first (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6 3]
+(at (select {from: T s: (first (fold + c))}) 's) -- [14]
+(at (select {from: T by: k s: (first (fold + c))}) 's) -- [14]
+(at (select {from: G by: g s: (first (fold + c))}) 's) -- [6 8]
+(at (select {from: T s: (first (fold + c)) where: (> v 15)}) 's) -- [13]
+(at (select {from: T by: k s: (first (fold + c)) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (first (fold + c)) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (first (fold + c)) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: T by: k s: (first (fold + c)) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: G by: g s: (first (fold + c)) z: (first (+ d 0))}) 's) -- [6 8]
+(at (select {from: T s: (first (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [13]
+(at (select {from: T by: k s: (first (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (first (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (first (+ v (fold + c)))}) 's) -- [24]
+(at (select {from: T by: k s: (first (+ v (fold + c)))}) 's) -- [24]
+(at (select {from: G by: g s: (first (+ v (fold + c)))}) 's) -- [16 38]
+(at (select {from: T s: (first (+ v (fold + c))) where: (> v 15)}) 's) -- [33]
+(at (select {from: T by: k s: (first (+ v (fold + c))) where: (> v 15)}) 's) -- [33]
+(at (select {from: G by: g s: (first (+ v (fold + c))) where: (> v 15)}) 's) -- [25 38]
+(at (select {from: T s: (first (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [24]
+(at (select {from: T by: k s: (first (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [24]
+(at (select {from: G by: g s: (first (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [16 38]
+(at (select {from: T s: (first (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [33]
+(at (select {from: T by: k s: (first (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [33]
+(at (select {from: G by: g s: (first (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [25 38]
+(at (select {from: T s: (first (at c (til 4))) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c (til 4))) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c (til 4))) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (first (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (first (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (first (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (first ((fn [y] (at y [1 0])) c))}) 's) -- [5]
+(at (select {from: T by: k s: (first ((fn [y] (at y [1 0])) c))}) 's) -- [5]
+(at (select {from: G by: g s: (first ((fn [y] (at y [1 0])) c))}) 's) -- [5 2]
+(at (select {from: T s: (first ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (first ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (first ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: T by: k s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: G by: g s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [5 2]
+(at (select {from: T s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (first ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (last (at c [3 2 1 0]))}) 's) -- [1]
+(at (select {from: T by: k s: (last (at c [3 2 1 0]))}) 's) -- [1]
+(at (select {from: G by: g s: (last (at c [3 2 1 0]))}) 's) -- [1 6]
+(at (select {from: T s: (last (at c [3 2 1 0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c [3 2 1 0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c [3 2 1 0])) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (last (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: T by: k s: (last (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (last (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [1 6]
+(at (select {from: T s: (last (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (last (at c [0]))}) 's) -- [1]
+(at (select {from: T by: k s: (last (at c [0]))}) 's) -- [1]
+(at (select {from: G by: g s: (last (at c [0]))}) 's) -- [1 6]
+(at (select {from: T s: (last (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c [0])) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c [0])) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (last (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: T by: k s: (last (at c [0])) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (last (at c [0])) z: (first (+ d 0))}) 's) -- [1 6]
+(at (select {from: T s: (last (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (last (at c 1))}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c 1))}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c 1))}) 's) -- [5 2]
+(at (select {from: T s: (last (at c 1)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (last (at c 1)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (last (at c 1)) where: (> v 15)}) 's) -- [0Nl 2]
+(at (select {from: T s: (last (at c 1)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: T by: k s: (last (at c 1)) z: (first (+ d 0))}) 's) -- [5]
+(at (select {from: G by: g s: (last (at c 1)) z: (first (+ d 0))}) 's) -- [5 2]
+(at (select {from: T s: (last (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (last (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (last (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nl 2]
+(at (select {from: T s: (last (at s [1 0]))}) 's) -- [aa]
+(at (select {from: T by: k s: (last (at s [1 0]))}) 's) -- [aa]
+(at (select {from: G by: g s: (last (at s [1 0]))}) 's) -- [aa cc]
+(at (select {from: T s: (last (at s [1 0])) where: (> v 15)}) 's) -- [bb]
+(at (select {from: T by: k s: (last (at s [1 0])) where: (> v 15)}) 's) -- [bb]
+(at (select {from: G by: g s: (last (at s [1 0])) where: (> v 15)}) 's) -- [bb cc]
+(at (select {from: T s: (last (at s [1 0])) z: (first (+ d 0))}) 's) -- [aa]
+(at (select {from: T by: k s: (last (at s [1 0])) z: (first (+ d 0))}) 's) -- [aa]
+(at (select {from: G by: g s: (last (at s [1 0])) z: (first (+ d 0))}) 's) -- [aa cc]
+(at (select {from: T s: (last (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [bb]
+(at (select {from: T by: k s: (last (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [bb]
+(at (select {from: G by: g s: (last (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [bb cc]
+(at (select {from: T s: (last (+ 1 (at c [3 2 1 0])))}) 's) -- [2]
+(at (select {from: T by: k s: (last (+ 1 (at c [3 2 1 0])))}) 's) -- [2]
+(at (select {from: G by: g s: (last (+ 1 (at c [3 2 1 0])))}) 's) -- [2 7]
+(at (select {from: T s: (last (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (last (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (last (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [6 7]
+(at (select {from: T s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [2]
+(at (select {from: T by: k s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [2]
+(at (select {from: G by: g s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [2 7]
+(at (select {from: T s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: T by: k s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6]
+(at (select {from: G by: g s: (last (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6 7]
+(at (select {from: T s: (last (fold + c))}) 's) -- [14]
+(at (select {from: T by: k s: (last (fold + c))}) 's) -- [14]
+(at (select {from: G by: g s: (last (fold + c))}) 's) -- [6 8]
+(at (select {from: T s: (last (fold + c)) where: (> v 15)}) 's) -- [13]
+(at (select {from: T by: k s: (last (fold + c)) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (last (fold + c)) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (last (fold + c)) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: T by: k s: (last (fold + c)) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: G by: g s: (last (fold + c)) z: (first (+ d 0))}) 's) -- [6 8]
+(at (select {from: T s: (last (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [13]
+(at (select {from: T by: k s: (last (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [13]
+(at (select {from: G by: g s: (last (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 8]
+(at (select {from: T s: (last (+ v (fold + c)))}) 's) -- [54]
+(at (select {from: T by: k s: (last (+ v (fold + c)))}) 's) -- [54]
+(at (select {from: G by: g s: (last (+ v (fold + c)))}) 's) -- [26 48]
+(at (select {from: T s: (last (+ v (fold + c))) where: (> v 15)}) 's) -- [53]
+(at (select {from: T by: k s: (last (+ v (fold + c))) where: (> v 15)}) 's) -- [53]
+(at (select {from: G by: g s: (last (+ v (fold + c))) where: (> v 15)}) 's) -- [25 48]
+(at (select {from: T s: (last (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [54]
+(at (select {from: T by: k s: (last (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [54]
+(at (select {from: G by: g s: (last (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [26 48]
+(at (select {from: T s: (last (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [53]
+(at (select {from: T by: k s: (last (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [53]
+(at (select {from: G by: g s: (last (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [25 48]
+(at (select {from: T s: (last (at c (til 4))) where: (> v 15)}) 's) -- [2]
+(at (select {from: T by: k s: (last (at c (til 4))) where: (> v 15)}) 's) -- [2]
+(at (select {from: G by: g s: (last (at c (til 4))) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (last (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [2]
+(at (select {from: T by: k s: (last (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [2]
+(at (select {from: G by: g s: (last (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 2]
+(at (select {from: T s: (last ((fn [y] (at y [1 0])) c))}) 's) -- [1]
+(at (select {from: T by: k s: (last ((fn [y] (at y [1 0])) c))}) 's) -- [1]
+(at (select {from: G by: g s: (last ((fn [y] (at y [1 0])) c))}) 's) -- [1 6]
+(at (select {from: T s: (last ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: T by: k s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [1]
+(at (select {from: G by: g s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [1 6]
+(at (select {from: T s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: T by: k s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5]
+(at (select {from: G by: g s: (last ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5 6]
+(at (select {from: T s: (avg (at c [3 2 1 0]))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [3 2 1 0]))}) 's) -- [3.5]
+(at (select {from: G by: g s: (avg (at c [3 2 1 0]))}) 's) -- [4.0 3.0]
+(at (select {from: T s: (avg (at c [3 2 1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [3 2 1 0])) where: (> v 15)}) 's) -- [4.0]
+(at (select {from: G by: g s: (avg (at c [3 2 1 0])) where: (> v 15)}) 's) -- [0Nf 4.0]
+(at (select {from: T s: (avg (at c [3 2 1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [3.5]
+(at (select {from: G by: g s: (avg (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [4.0 3.0]
+(at (select {from: T s: (avg (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [4.0]
+(at (select {from: G by: g s: (avg (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nf 4.0]
+(at (select {from: T s: (avg (at c [0]))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [0]))}) 's) -- [1.0]
+(at (select {from: G by: g s: (avg (at c [0]))}) 's) -- [1.0 0Nf]
+(at (select {from: T s: (avg (at c [0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [0])) where: (> v 15)}) 's) -- [5.0]
+(at (select {from: G by: g s: (avg (at c [0])) where: (> v 15)}) 's) -- [5.0 0Nf]
+(at (select {from: T s: (avg (at c [0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [0])) z: (first (+ d 0))}) 's) -- [1.0]
+(at (select {from: G by: g s: (avg (at c [0])) z: (first (+ d 0))}) 's) -- [1.0 0Nf]
+(at (select {from: T s: (avg (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5.0]
+(at (select {from: G by: g s: (avg (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5.0 0Nf]
+(at (select {from: T s: (avg (at c 1))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c 1))}) 's) !- type
+(at (select {from: G by: g s: (avg (at c 1))}) 's) !- type
+(at (select {from: T s: (avg (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (avg (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (avg (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (at s [1 0]))}) 's) !- type
+(at (select {from: T by: k s: (avg (at s [1 0]))}) 's) !- type
+(at (select {from: G by: g s: (avg (at s [1 0]))}) 's) !- type
+(at (select {from: T s: (avg (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (avg (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (avg (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (+ 1 (at c [3 2 1 0])))}) 's) !- type
+(at (select {from: T by: k s: (avg (+ 1 (at c [3 2 1 0])))}) 's) -- [4.5]
+(at (select {from: G by: g s: (avg (+ 1 (at c [3 2 1 0])))}) 's) -- [5.0 4.0]
+(at (select {from: T s: (avg (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [5.0]
+(at (select {from: G by: g s: (avg (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [0Nf 5.0]
+(at (select {from: T s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [4.5]
+(at (select {from: G by: g s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [5.0 4.0]
+(at (select {from: T s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5.0]
+(at (select {from: G by: g s: (avg (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [0Nf 5.0]
+(at (select {from: T s: (avg (fold + c))}) 's) !- type
+(at (select {from: T by: k s: (avg (fold + c))}) 's) !- type
+(at (select {from: G by: g s: (avg (fold + c))}) 's) !- type
+(at (select {from: T s: (avg (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (avg (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (avg (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (avg (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (avg (+ v (fold + c)))}) 's) !- type
+(at (select {from: T by: k s: (avg (+ v (fold + c)))}) 's) -- [39.0]
+(at (select {from: G by: g s: (avg (+ v (fold + c)))}) 's) -- [29.0 49.0]
+(at (select {from: T s: (avg (+ v (fold + c))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (+ v (fold + c))) where: (> v 15)}) 's) -- [43.0]
+(at (select {from: G by: g s: (avg (+ v (fold + c))) where: (> v 15)}) 's) -- [33.0 48.0]
+(at (select {from: T s: (avg (+ v (fold + c))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [39.0]
+(at (select {from: G by: g s: (avg (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [29.0 49.0]
+(at (select {from: T s: (avg (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [43.0]
+(at (select {from: G by: g s: (avg (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [33.0 48.0]
+(at (select {from: T s: (avg (at c (til 4))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c (til 4))) where: (> v 15)}) 's) -- [4.33]
+(at (select {from: G by: g s: (avg (at c (til 4))) where: (> v 15)}) 's) -- [5.0 4.0]
+(at (select {from: T s: (avg (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [4.33]
+(at (select {from: G by: g s: (avg (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5.0 4.0]
+(at (select {from: T s: (avg ((fn [y] (at y [1 0])) c))}) 's) !- type
+(at (select {from: T by: k s: (avg ((fn [y] (at y [1 0])) c))}) 's) -- [3.0]
+(at (select {from: G by: g s: (avg ((fn [y] (at y [1 0])) c))}) 's) -- [3.0 0Nf]
+(at (select {from: T s: (avg ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [5.5]
+(at (select {from: G by: g s: (avg ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [6.0 5.0]
+(at (select {from: T s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [3.0]
+(at (select {from: G by: g s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [3.0 0Nf]
+(at (select {from: T s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [5.5]
+(at (select {from: G by: g s: (avg ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [6.0 5.0]
+(at (select {from: T s: (all (at c [3 2 1 0]))}) 's) !- type
+(at (select {from: T by: k s: (all (at c [3 2 1 0]))}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [3 2 1 0]))}) 's) -- [true true]
+(at (select {from: T s: (all (at c [3 2 1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c [3 2 1 0])) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [3 2 1 0])) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c [3 2 1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [3 2 1 0])) z: (first (+ d 0))}) 's) -- [true true]
+(at (select {from: T s: (all (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [3 2 1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c [0]))}) 's) !- type
+(at (select {from: T by: k s: (all (at c [0]))}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [0]))}) 's) -- [true true]
+(at (select {from: T s: (all (at c [0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c [0])) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [0])) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c [0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (at c [0])) z: (first (+ d 0))}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [0])) z: (first (+ d 0))}) 's) -- [true true]
+(at (select {from: T s: (all (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c 1))}) 's) !- type
+(at (select {from: T by: k s: (all (at c 1))}) 's) !- type
+(at (select {from: G by: g s: (all (at c 1))}) 's) !- type
+(at (select {from: T s: (all (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (at c 1)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (all (at c 1)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (all (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (at c 1)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (at s [1 0]))}) 's) !- type
+(at (select {from: T by: k s: (all (at s [1 0]))}) 's) !- type
+(at (select {from: G by: g s: (all (at s [1 0]))}) 's) !- type
+(at (select {from: T s: (all (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (at s [1 0])) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (all (at s [1 0])) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (all (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (at s [1 0])) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (+ 1 (at c [3 2 1 0])))}) 's) !- type
+(at (select {from: T by: k s: (all (+ 1 (at c [3 2 1 0])))}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ 1 (at c [3 2 1 0])))}) 's) -- [true true]
+(at (select {from: T s: (all (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ 1 (at c [3 2 1 0]))) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0))}) 's) -- [true true]
+(at (select {from: T s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ 1 (at c [3 2 1 0]))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (fold + c))}) 's) !- type
+(at (select {from: T by: k s: (all (fold + c))}) 's) !- type
+(at (select {from: G by: g s: (all (fold + c))}) 's) !- type
+(at (select {from: T s: (all (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (fold + c)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: G by: g s: (all (fold + c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T s: (all (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: G by: g s: (all (fold + c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T s: (all (+ v (fold + c)))}) 's) !- type
+(at (select {from: T by: k s: (all (+ v (fold + c)))}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ v (fold + c)))}) 's) -- [true true]
+(at (select {from: T s: (all (+ v (fold + c))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (+ v (fold + c))) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ v (fold + c))) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (+ v (fold + c))) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ v (fold + c))) z: (first (+ d 0))}) 's) -- [true true]
+(at (select {from: T s: (all (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (+ v (fold + c))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c (til 4))) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c (til 4))) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c (til 4))) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all (at c (til 4))) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all ((fn [y] (at y [1 0])) c))}) 's) !- type
+(at (select {from: T by: k s: (all ((fn [y] (at y [1 0])) c))}) 's) -- [true]
+(at (select {from: G by: g s: (all ((fn [y] (at y [1 0])) c))}) 's) -- [true true]
+(at (select {from: T s: (all ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all ((fn [y] (at y [1 0])) c)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) !- type
+(at (select {from: T by: k s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [true]
+(at (select {from: G by: g s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))}) 's) -- [true true]
+(at (select {from: T s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) !- type
+(at (select {from: T by: k s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true]
+(at (select {from: G by: g s: (all ((fn [y] (at y [1 0])) c)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [true true]
+(at (select {from: T r: (- v (fold + v))}) 'r) !- type
+(at (select {from: G by: g r: (- v (fold + v))}) 'r) -- (list [-90 -80] [-70 -60])
+(at (select {from: T r: (- v (fold + v)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- v (fold + v)) where: (> v 15)}) 'r) -- (list [-70] [-60 -50])
+(at (select {from: T r: (- v (fold + v)) z: (first (+ d 0))}) 'r) !- type
+(at (select {from: G by: g r: (- v (fold + v)) z: (first (+ d 0))}) 'r) -- (list [-90 -80] [-70 -60])
+(at (select {from: T r: (- v (fold + v)) z: (first (+ d 0)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- v (fold + v)) z: (first (+ d 0)) where: (> v 15)}) 'r) -- (list [-70] [-60 -50])
+(at (select {from: T r: (- v (at v 0))}) 'r) !- type
+(at (select {from: G by: g r: (- v (at v 0))}) 'r) -- (list [0 10] [20 30])
+(at (select {from: T r: (- v (at v 0)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- v (at v 0)) where: (> v 15)}) 'r) -- (list [0] [10 20])
+(at (select {from: T r: (- v (at v 0)) z: (first (+ d 0))}) 'r) !- type
+(at (select {from: G by: g r: (- v (at v 0)) z: (first (+ d 0))}) 'r) -- (list [0 10] [20 30])
+(at (select {from: T r: (- v (at v 0)) z: (first (+ d 0)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- v (at v 0)) z: (first (+ d 0)) where: (> v 15)}) 'r) -- (list [0] [10 20])
+(at (select {from: T r: (at v [1 0])}) 'r) !- type
+(at (select {from: G by: g r: (at v [1 0])}) 'r) -- (list [20 10] [40 30])
+(at (select {from: T r: (at v [1 0]) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (at v [1 0]) where: (> v 15)}) 'r) -- (list [0Nl 20] [40 30])
+(at (select {from: T r: (at v [1 0]) z: (first (+ d 0))}) 'r) !- type
+(at (select {from: G by: g r: (at v [1 0]) z: (first (+ d 0))}) 'r) -- (list [20 10] [40 30])
+(at (select {from: T r: (at v [1 0]) z: (first (+ d 0)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (at v [1 0]) z: (first (+ d 0)) where: (> v 15)}) 'r) -- (list [0Nl 20] [40 30])
+(at (select {from: T r: (- c (at c [0]))}) 'r) !- type
+(at (select {from: G by: g r: (- c (at c [0]))}) 'r) !- length
+(at (select {from: T r: (- c (at c [0])) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- c (at c [0])) where: (> v 15)}) 'r) !- length
+(at (select {from: T r: (- c (at c [0])) z: (first (+ d 0))}) 'r) !- type
+(at (select {from: G by: g r: (- c (at c [0])) z: (first (+ d 0))}) 'r) !- length
+(at (select {from: T r: (- c (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 'r) !- type
+(at (select {from: G by: g r: (- c (at c [0])) z: (first (+ d 0)) where: (> v 15)}) 'r) !- length

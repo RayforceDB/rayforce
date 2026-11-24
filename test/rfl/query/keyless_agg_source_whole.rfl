@@ -1,0 +1,34 @@
+;; @also-unfused
+;; A keyless select whose outputs go to the evaluator fallback evaluates an
+;; aggregate's argument once over the rows, as by: evaluates it over each
+;; group's, for every aggregate, not only first and last (#1401, #1402): a
+;; lambda the planner does not inline gets the column, and a call that is
+;; not elementwise is not fed one cell at a time.  The oracle is by: with
+;; one group.
+(set T (table [k c d s v m] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] ['aa 'bb 'cc 'aa] [10 20 30 40] (list [1 2] [3] [4 5] [6]))))
+(set hq (fn [y] (let q (count y)) q))
+;; #1401: a non-inlined lambda over the column
+(at (select {from: T s: (first ((fn [y] (let q (count y)) q) v))}) 's) -- [4]
+(at (select {from: T s: (first ((fn [y] (let q (count y)) q) v)) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: T s: (first (hq v))}) 's) -- (at (select {from: T by: k s: (first (hq v))}) 's)
+(at (select {from: T s: (sum (hq v))}) 's) -- (at (select {from: T by: k s: (sum (hq v))}) 's)
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+(at (select {from: T s: (sum ((fn [y] (* y 2)) v)) z: (first (+ d 0))}) 's) -- [200]
+(at (select {from: T s: (max ((fn [y] (* y 2)) v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [80]
+;; #1402: a call that is not elementwise, for every aggregate
+(at (select {from: T s: (sum (at c (til 4)))}) 's) -- [14]
+(at (select {from: T s: (sum (at c (til 4))) z: (first (+ d 0))}) 's) -- [14]
+(at (select {from: T s: (sum (at c (til 4)))}) 's) -- (at (select {from: T by: k s: (sum (at c (til 4)))}) 's)
+(at (select {from: T s: (avg (reverse c)) z: (first (+ d 0))}) 's) -- (at (select {from: T by: k s: (avg (reverse c))}) 's)
+(at (select {from: T s: (count (distinct c)) z: (first (+ d 0))}) 's) -- [4]
+(at (select {from: T s: (max (deltas v)) z: (first (+ d 0))}) 's) -- (at (select {from: T by: k s: (max (deltas v))}) 's)
+(at (select {from: T s: (count (except s 'aa)) z: (first (+ d 0))}) 's) -- [2]
+(at (select {from: T s: (count (except s 'aa))}) 's) -- [2]
+(at (select {from: T s: (sum (reverse c)) where: (> v 15) z: (first (+ d 0))}) 's) -- (at (select {from: T by: k s: (sum (reverse c)) where: (> v 15)}) 's)
+;; first and last still take each row's value of a scalar
+(at (select {from: T s: (first (hq v)) z: (first (+ d 0)) where: (> v 100)}) 's) -- [0Nl]
+;; enlist stays the per-row constructor it is in a query, as under by:
+(set E (table [k x] (list [0 0 0] [1 2 3])))
+(at (select {n: (count (enlist x)) z: (first (+ x 0)) from: E}) 'n) -- [3]
+(at (select {n: (count (enlist x)) z: (first (+ x 0)) from: E}) 'n) -- (at (select {n: (count (enlist x)) by: k from: E}) 'n)
