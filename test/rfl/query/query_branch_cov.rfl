@@ -274,10 +274,10 @@
 (count (select {from: TN nearest: (.emb.knn Vec [1 0]) take: 2})) -- 2
 
 ;; ====================================================================
-;; §13  ANN form with .emb.hnsw-build index — query.c:5961-6013
+;; §13  ANN form with .emb.hnsw.build index — query.c:5961-6013
 ;; ====================================================================
 (set TANN (table [id Vec] (list [1 2 3 4 5] (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.7 0.7 0.0] [0.5 0.5 0.5]))))
-(set IdxA (.emb.hnsw-build (at TANN 'Vec) 'l2 8 100))
+(set IdxA (.emb.hnsw.build (at TANN 'Vec) 'l2 8 100))
 ;; ann default ef.
 (count (select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0]) take: 3})) -- 3
 ;; ann explicit ef.
@@ -290,7 +290,7 @@
 (select {from: TANN nearest: (.emb.ann 99 [1.0 0.0 0.0])}) !- type
 ;; ann ef bad type → type error (6004).
 (select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0] 1.5)}) !- type
-(.emb.hnsw-free IdxA)
+(.emb.hnsw.free IdxA)
 
 ;; ====================================================================
 ;; §14  projection echoing the group key + agg — layout [key, agg]

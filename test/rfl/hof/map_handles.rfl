@@ -25,23 +25,23 @@
 
 ;; hnsw: newly created results, retained aliases, numeric-prefix fallback,
 ;; and a later string mismatch all preserve a usable handle.
-(set hnsw_created958 (map (fn [_] (.emb.hnsw-build V958 'l2 8 100)) [0 1]))
-(at (.emb.hnsw-info (at hnsw_created958 0)) 'nrows) -- 2
-(at (.emb.hnsw-info (at hnsw_created958 1)) 'nrows) -- 2
+(set hnsw_created958 (map (fn [_] (.emb.hnsw.build V958 'l2 8 100)) [0 1]))
+(at (.emb.hnsw.info (at hnsw_created958 0)) 'nrows) -- 2
+(at (.emb.hnsw.info (at hnsw_created958 1)) 'nrows) -- 2
 (type hnsw_created958) -- 'LIST
-(set hnsw_original958 (.emb.hnsw-build V958 'l2 8 100))
+(set hnsw_original958 (.emb.hnsw.build V958 'l2 8 100))
 (set hnsw_alias958 (map (fn [h] h) (list hnsw_original958 hnsw_original958)))
-(at (.emb.hnsw-info (at hnsw_alias958 0)) 'nrows) -- 2
-(at (.emb.hnsw-info hnsw_original958) 'nrows) -- 2
+(at (.emb.hnsw.info (at hnsw_alias958 0)) 'nrows) -- 2
+(at (.emb.hnsw.info hnsw_original958) 'nrows) -- 2
 (set hnsw_original958 null)
-(at (.emb.hnsw-info (at hnsw_alias958 1)) 'nrows) -- 2
-(set hnsw_late958 (map (fn [i] (if (== i 0) 7 (.emb.hnsw-build V958 'l2 8 100))) [0 1]))
+(at (.emb.hnsw.info (at hnsw_alias958 1)) 'nrows) -- 2
+(set hnsw_late958 (map (fn [i] (if (== i 0) 7 (.emb.hnsw.build V958 'l2 8 100))) [0 1]))
 (at hnsw_late958 0) -- 7
-(at (.emb.hnsw-info (at hnsw_late958 1)) 'nrows) -- 2
+(at (.emb.hnsw.info (at hnsw_late958 1)) 'nrows) -- 2
 (type hnsw_late958) -- 'LIST
-(set hnsw_mixed958 (map (fn [i] (if (== i 2) "tail" (.emb.hnsw-build V958 'l2 8 100))) [0 1 2]))
-(at (.emb.hnsw-info (at hnsw_mixed958 0)) 'nrows) -- 2
-(at (.emb.hnsw-info (at hnsw_mixed958 1)) 'nrows) -- 2
+(set hnsw_mixed958 (map (fn [i] (if (== i 2) "tail" (.emb.hnsw.build V958 'l2 8 100))) [0 1 2]))
+(at (.emb.hnsw.info (at hnsw_mixed958 0)) 'nrows) -- 2
+(at (.emb.hnsw.info (at hnsw_mixed958 1)) 'nrows) -- 2
 (at hnsw_mixed958 2) -- "tail"
 
 ;; program: newly created results, retained aliases, numeric-prefix fallback,

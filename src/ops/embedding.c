@@ -412,36 +412,36 @@ static ray_t* hnsw_wrap(ray_hnsw_t* idx) {
     return h;
 }
 
-/* (.emb.hnsw-build col [metric] [M] [ef_c]) → I64 handle (RAY_ATTR_HNSW) */
+/* (.emb.hnsw.build col [metric] [M] [ef_c]) → I64 handle (RAY_ATTR_HNSW) */
 ray_t* ray_hnsw_build_fn(ray_t** args, int64_t n) {
-    if (n < 1 || n > 4) return ray_error("rank", ".emb.hnsw-build: expects 1 to 4 args (col [metric] [M] [ef_c]), got %lld", (long long)n);
+    if (n < 1 || n > 4) return ray_error("rank", ".emb.hnsw.build: expects 1 to 4 args (col [metric] [M] [ef_c]), got %lld", (long long)n);
     ray_t* col = args[0];
     if (!col || col->type != RAY_LIST)
-        return ray_error("type", ".emb.hnsw-build: col must be a list of numeric vectors, got %s", ray_type_name(col ? col->type : 0));
+        return ray_error("type", ".emb.hnsw.build: col must be a list of numeric vectors, got %s", ray_type_name(col ? col->type : 0));
 
     ray_hnsw_metric_t metric = RAY_HNSW_COSINE;
     if (n >= 2 && !parse_metric_sym(args[1], &metric))
-        return ray_error("domain", ".emb.hnsw-build: metric must be 'cosine, 'l2 or 'ip");
+        return ray_error("domain", ".emb.hnsw.build: metric must be 'cosine, 'l2 or 'ip");
 
     int32_t M = HNSW_DEFAULT_M;
     if (n >= 3) {
         if (!atom_is_int(args[2]))
-            return ray_error("type", ".emb.hnsw-build: M must be an integer atom, got %s", ray_type_name(args[2] ? args[2]->type : 0));
+            return ray_error("type", ".emb.hnsw.build: M must be an integer atom, got %s", ray_type_name(args[2] ? args[2]->type : 0));
         int64_t v = atom_to_i64(args[2]);
         if (v > 0 && v <= 512) M = (int32_t)v;
     }
     int32_t ef_c = HNSW_DEFAULT_EF_C;
     if (n >= 4) {
         if (!atom_is_int(args[3]))
-            return ray_error("type", ".emb.hnsw-build: ef_c must be an integer atom, got %s", ray_type_name(args[3] ? args[3]->type : 0));
+            return ray_error("type", ".emb.hnsw.build: ef_c must be an integer atom, got %s", ray_type_name(args[3] ? args[3]->type : 0));
         int64_t v = atom_to_i64(args[3]);
         if (v > 0 && v <= 4096) ef_c = (int32_t)v;
     }
 
     int32_t dim;
     if (list_vec_validate(col, &dim) != 0)
-        return ray_error("type", ".emb.hnsw-build: col must contain equal-length numeric vectors (f32, f64, i32 or i64)");
-    if (dim <= 0) return ray_error("length", ".emb.hnsw-build: vector dim must be positive, got %lld", (long long)dim);
+        return ray_error("type", ".emb.hnsw.build: col must contain equal-length numeric vectors (f32, f64, i32 or i64)");
+    if (dim <= 0) return ray_error("length", ".emb.hnsw.build: vector dim must be positive, got %lld", (long long)dim);
 
     int64_t n_rows;
     float* flat = list_flatten_floats(col, dim, &n_rows);
@@ -528,27 +528,28 @@ ray_t* ray_ann_fn(ray_t** args, int64_t n) {
     return tbl;
 }
 
-/* (.emb.hnsw-free handle) → null.  Idempotent: clearing the ATTR on success
+/* (.emb.hnsw.free handle) → null.  Idempotent: clearing the ATTR on success
  * means a second call returns a type error rather than double-freeing. */
 ray_t* ray_hnsw_free_fn(ray_t* h) {
     ray_hnsw_t* idx = hnsw_unwrap(h);
-    if (!idx) return ray_error("type", ".emb.hnsw-free: expects an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
+    if (!idx) return ray_error("type", ".emb.hnsw.free: expects an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
     ray_hnsw_free(idx);
     h->i64 = 0;
     h->attrs &= ~RAY_ATTR_HNSW;
     return RAY_NULL_OBJ;
 }
 
-/* (.emb.hnsw-save handle path) → null */
-ray_t* ray_hnsw_save_fn(ray_t* h, ray_t* path) {
+/* (.emb.hnsw.set path handle) → null.  The path comes first, as in
+ * (.db.splayed.set dir table). */
+ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h) {
     ray_hnsw_t* idx = hnsw_unwrap(h);
-    if (!idx) return ray_error("type", ".emb.hnsw-save: handle must be an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
+    if (!idx) return ray_error("type", ".emb.hnsw.set: handle must be an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
     if (!path || path->type != -RAY_STR)
-        return ray_error("type", ".emb.hnsw-save: path must be a string, got %s", ray_type_name(path ? path->type : 0));
+        return ray_error("type", ".emb.hnsw.set: path must be a string, got %s", ray_type_name(path ? path->type : 0));
     const char* p = ray_str_ptr(path);
     size_t len = ray_str_len(path);
     if (!p || len == 0 || len >= 1023)
-        return ray_error("domain", ".emb.hnsw-save: path length must be 1 to 1022 bytes, got %lld", (long long)len);
+        return ray_error("domain", ".emb.hnsw.set: path length must be 1 to 1022 bytes, got %lld", (long long)len);
     char buf[1024];
     memcpy(buf, p, len);
     buf[len] = '\0';
@@ -557,20 +558,20 @@ ray_t* ray_hnsw_save_fn(ray_t* h, ray_t* path) {
     return RAY_NULL_OBJ;
 }
 
-/* (.emb.hnsw-load path) → I64 handle */
+/* (.emb.hnsw.get path) → I64 handle */
 ray_t* ray_hnsw_load_fn(ray_t* path) {
     if (!path || path->type != -RAY_STR)
-        return ray_error("type", ".emb.hnsw-load: path must be a string, got %s", ray_type_name(path ? path->type : 0));
+        return ray_error("type", ".emb.hnsw.get: path must be a string, got %s", ray_type_name(path ? path->type : 0));
     const char* p = ray_str_ptr(path);
     size_t len = ray_str_len(path);
     if (!p || len == 0 || len >= 1023)
-        return ray_error("domain", ".emb.hnsw-load: path length must be 1 to 1022 bytes, got %lld", (long long)len);
+        return ray_error("domain", ".emb.hnsw.get: path length must be 1 to 1022 bytes, got %lld", (long long)len);
     char buf[1024];
     memcpy(buf, p, len);
     buf[len] = '\0';
     ray_hnsw_t* idx = ray_hnsw_load(buf);
     if (!idx)
-        return ray_error("io", ".emb.hnsw-load: index '%s' is invalid or incomplete; "
+        return ray_error("io", ".emb.hnsw.get: index '%s' is invalid or incomplete; "
                                "restore a compatible copy or rebuild it",
                          buf);
     ray_t* h = hnsw_wrap(idx);
@@ -578,11 +579,11 @@ ray_t* ray_hnsw_load_fn(ray_t* path) {
     return h;
 }
 
-/* (.emb.hnsw-info handle) → dict { nrows, dim, metric, nlayers, M, efc }.
+/* (.emb.hnsw.info handle) → dict { nrows, dim, metric, nlayers, M, efc }.
  * Keys avoid hyphens so the 'quote-tick' syntax works: 'nrows, 'dim, etc. */
 ray_t* ray_hnsw_info_fn(ray_t* h) {
     ray_hnsw_t* idx = hnsw_unwrap(h);
-    if (!idx) return ray_error("type", ".emb.hnsw-info: expects an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
+    if (!idx) return ray_error("type", ".emb.hnsw.info: expects an hnsw index handle, got %s", ray_type_name(h ? h->type : 0));
 
     const char* mname = "cosine";
     switch ((ray_hnsw_metric_t)idx->metric) {

@@ -1,17 +1,17 @@
-;; Invariants for `.emb.hnsw-build` / `.emb.ann` / `.emb.hnsw-info` / `.emb.hnsw-free`.
+;; Invariants for `.emb.hnsw.build` / `.emb.ann` / `.emb.hnsw.info` / `.emb.hnsw.free`.
 ;; HNSW approximate nearest-neighbour index over a list of float vectors.
 ;; The index is opaque; queries return a table with `_rowid` and `_dist`.
 
 ;; Five vectors, exact-match query at row 0.
 (set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
-(set Idx (.emb.hnsw-build V 'l2 8 100))
+(set Idx (.emb.hnsw.build V 'l2 8 100))
 
-;; ────────────── .emb.hnsw-info exposes build parameters ──────────────
-(at (.emb.hnsw-info Idx) 'nrows)  -- 5
-(at (.emb.hnsw-info Idx) 'dim)    -- 3
-(at (.emb.hnsw-info Idx) 'metric) -- 'l2
-(at (.emb.hnsw-info Idx) 'M)      -- 8
-(at (.emb.hnsw-info Idx) 'efc)    -- 100
+;; ────────────── .emb.hnsw.info exposes build parameters ──────────────
+(at (.emb.hnsw.info Idx) 'nrows)  -- 5
+(at (.emb.hnsw.info Idx) 'dim)    -- 3
+(at (.emb.hnsw.info Idx) 'metric) -- 'l2
+(at (.emb.hnsw.info Idx) 'M)      -- 8
+(at (.emb.hnsw.info Idx) 'efc)    -- 100
 
 ;; ────────────── exact-match top-1 ──────────────
 ;; Querying with the same vector as row 0 must return row 0 with dist 0.
@@ -45,4 +45,4 @@
 ;; Ascending order by distance.
 (<= (first (at hits3 '_dist)) (last (at hits3 '_dist))) -- true
 
-(.emb.hnsw-free Idx)
+(.emb.hnsw.free Idx)

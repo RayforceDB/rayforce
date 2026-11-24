@@ -57,8 +57,8 @@ Build a hierarchical navigable small-world graph over an embedding column for su
 ### Building
 
 ```lisp
-; (.emb.hnsw-build col [metric] [M] [ef_construction])
-(set idx (.emb.hnsw-build (at docs 'emb) 'cosine 16 100))
+; (.emb.hnsw.build col [metric] [M] [ef_construction])
+(set idx (.emb.hnsw.build (at docs 'emb) 'cosine 16 100))
 ```
 
 Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle is an atom tagged `RAY_ATTR_HNSW`; the underlying `ray_hnsw_t*` is rc-managed — rebinding, scope exit, and process teardown all release the index automatically.
@@ -80,10 +80,10 @@ Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle i
 ### Persistence & Lifecycle
 
 ```lisp
-(.emb.hnsw-save idx "/tmp/rayforce-docs-hnsw")
-(set idx2 (.emb.hnsw-load "/tmp/rayforce-docs-hnsw"))
-(.emb.hnsw-info idx2)     ; dict: {nrows dim metric nlayers M efc}
-(.emb.hnsw-free idx2)     ; optional — rc-managed, will free on scope exit too
+(.emb.hnsw.set "/tmp/rayforce-docs-hnsw" idx)
+(set idx2 (.emb.hnsw.get "/tmp/rayforce-docs-hnsw"))
+(.emb.hnsw.info idx2)     ; dict: {nrows dim metric nlayers M efc}
+(.emb.hnsw.free idx2)     ; optional — rc-managed, will free on scope exit too
 ```
 
 ## Filter-Aware ANN via `select … nearest`
@@ -122,7 +122,7 @@ The rerank step emits a synthetic `_dist` column, but it is **not** included in 
 
 ### Metric Symbols
 
-Accepted by `.emb.hnsw-build`, `.emb.knn`, and the `nearest` clause:
+Accepted by `.emb.hnsw.build`, `.emb.knn`, and the `nearest` clause:
 
 - `'cosine` — `1 − cos(a, b)`, lower = closer (default)
 - `'l2` — euclidean distance, lower = closer
@@ -137,16 +137,16 @@ Accepted by `.emb.hnsw-build`, `.emb.knn`, and the `nearest` clause:
 | `.emb.inner-prod` | 2 | `(.emb.inner-prod a b)` — positive dot product |
 | `norm` | 1 | `(norm x)` — L2 norm; scalar if vec, per-row vector if LIST |
 | `.emb.knn` | 3–4 | `(.emb.knn col query k [metric])` — brute-force top-K |
-| `.emb.hnsw-build` | 1–4 | `(.emb.hnsw-build col [metric] [M] [ef_c])` — build index |
+| `.emb.hnsw.build` | 1–4 | `(.emb.hnsw.build col [metric] [M] [ef_c])` — build index |
 | `.emb.ann` | 3–4 | `(.emb.ann handle query k [ef_s])` — approximate top-K via HNSW |
-| `.emb.hnsw-save` | 2 | `(.emb.hnsw-save handle path)` — persist index to directory |
-| `.emb.hnsw-load` | 1 | `(.emb.hnsw-load path)` — restore index from directory |
-| `.emb.hnsw-free` | 1 | `(.emb.hnsw-free handle)` — explicit release (rc-managed, optional) |
-| `.emb.hnsw-info` | 1 | `(.emb.hnsw-info handle)` — dict of `{nrows dim metric nlayers M efc}` |
+| `.emb.hnsw.set` | 2 | `(.emb.hnsw.set path handle)` — persist index to directory |
+| `.emb.hnsw.get` | 1 | `(.emb.hnsw.get path)` — restore index from directory |
+| `.emb.hnsw.free` | 1 | `(.emb.hnsw.free handle)` — explicit release (rc-managed, optional) |
+| `.emb.hnsw.info` | 1 | `(.emb.hnsw.info handle)` — dict of `{nrows dim metric nlayers M efc}` |
 
 ## Design Notes
 
 - **Distance convention.** All metrics encode as "lower = closer" for consistent sort ordering. Direct math builtins (`cos-sim`-style semantics) aren't provided separately — compute `(- 1.0 (.emb.cos-dist a b))` if needed.
-- **Handle lifecycle.** HNSW handles are rc-managed through Rayforce's ownership semantics: a deep clone is produced on `ray_cow`, ownership transfers via detach on realloc, and the underlying index is freed when the last reference drops. `(.emb.hnsw-free h)` is idempotent and not required for correctness.
+- **Handle lifecycle.** HNSW handles are rc-managed through Rayforce's ownership semantics: a deep clone is produced on `ray_cow`, ownership transfers via detach on realloc, and the underlying index is freed when the last reference drops. `(.emb.hnsw.free h)` is idempotent and not required for correctness.
 - **Iterative scan bounds.** Filter-aware ANN pushes the predicate into the beam but remains locality-bounded by HNSW's graph reachability from the query's entry point. For pathologically selective filters on clustered data, results may be fewer than K; multi-entry restart is future work.
 - **Allocation-failure contract.** All HNSW search entry points return a distinct sentinel (`-1`) on allocation failure — every caller surfaces this as `ray_error("oom", …)` rather than a silently-empty result.

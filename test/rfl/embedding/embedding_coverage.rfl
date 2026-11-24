@@ -7,10 +7,10 @@
 ;;   - LIST branch of norm
 ;;   - the entire ray_knn_fn (cosine / l2 / ip metrics, error paths,
 ;;     empty-column shortcut)
-;;   - .emb.hnsw-build / ann / .emb.hnsw-info / .emb.hnsw-free under cosine and ip
+;;   - .emb.hnsw.build / ann / .emb.hnsw.info / .emb.hnsw.free under cosine and ip
 ;;     metrics (existing test only exercises l2)
-;;   - .emb.hnsw-save / .emb.hnsw-load round trip
-;;   - .emb.hnsw-free idempotency (second call must error, not double-free)
+;;   - .emb.hnsw.set / .emb.hnsw.get round trip
+;;   - .emb.hnsw.free idempotency (second call must error, not double-free)
 ;;   - rayvec_at_f64 RAY_I32 / RAY_I64 branches (lines 357-358)
 ;;   - atom_to_i64 -RAY_I32 / -RAY_I16 branches (lines 541-542)
 ;;   - empty-list shortcut in ray_knn_fn (lines 574-581)
@@ -92,23 +92,23 @@
 (.emb.knn V [1.0 0.0 0.0] 0)                !- domain
 (.emb.knn V [1.0 0.0 0.0] -3)               !- domain
 
-;; ────────────── .emb.hnsw-build under cosine and ip ──────────────
+;; ────────────── .emb.hnsw.build under cosine and ip ──────────────
 ;; Existing hnsw.rfl only exercises 'l2.  Cover the other two metric
 ;; branches in parse_metric_sym + the cosine path in ray_hnsw_search.
-(set IdxCos (.emb.hnsw-build V 'cosine))
-(at (.emb.hnsw-info IdxCos) 'metric) -- 'cosine
-(at (.emb.hnsw-info IdxCos) 'nrows)  -- 5
-(at (.emb.hnsw-info IdxCos) 'dim)    -- 3
+(set IdxCos (.emb.hnsw.build V 'cosine))
+(at (.emb.hnsw.info IdxCos) 'metric) -- 'cosine
+(at (.emb.hnsw.info IdxCos) 'nrows)  -- 5
+(at (.emb.hnsw.info IdxCos) 'dim)    -- 3
 (first (at (.emb.ann IdxCos [1.0 0.0 0.0] 1) '_rowid)) -- 0
 ;; Opaque index pointers must never cross the serde boundary as plain I64s.
 (ser IdxCos) !- domain
 (ser (list IdxCos)) !- domain
-(.emb.hnsw-free IdxCos)
+(.emb.hnsw.free IdxCos)
 
-(set IdxIp (.emb.hnsw-build V 'ip 16 64))
-(at (.emb.hnsw-info IdxIp) 'metric) -- 'ip
-(at (.emb.hnsw-info IdxIp) 'M)      -- 16
-(at (.emb.hnsw-info IdxIp) 'efc)    -- 64
+(set IdxIp (.emb.hnsw.build V 'ip 16 64))
+(at (.emb.hnsw.info IdxIp) 'metric) -- 'ip
+(at (.emb.hnsw.info IdxIp) 'M)      -- 16
+(at (.emb.hnsw.info IdxIp) 'efc)    -- 64
 ;; Top-2 IP search for [1,0,0] must include row 0 (dot=1 → IP distance -1).
 (set ipHits2 (.emb.ann IdxIp [1.0 0.0 0.0] 2))
 (count ipHits2) -- 2
@@ -130,46 +130,46 @@
 (.emb.ann IdxIp [1.0 0.0]    1)        !- length
 (.emb.ann IdxIp [1.0 0.0 0.0] 0)       !- domain
 
-;; .emb.hnsw-build error paths.
-(.emb.hnsw-build)                  !- rank
-(.emb.hnsw-build 5)                !- type
-(.emb.hnsw-build V 'bogus)         !- domain
-(.emb.hnsw-build V 'l2 1.0)        !- type
-(.emb.hnsw-build V 'l2 8 "no")     !- type
+;; .emb.hnsw.build error paths.
+(.emb.hnsw.build)                  !- rank
+(.emb.hnsw.build 5)                !- type
+(.emb.hnsw.build V 'bogus)         !- domain
+(.emb.hnsw.build V 'l2 1.0)        !- type
+(.emb.hnsw.build V 'l2 8 "no")     !- type
 
-;; ────────────── .emb.hnsw-save / .emb.hnsw-load round trip ──────────────
+;; ────────────── .emb.hnsw.set / .emb.hnsw.get round trip ──────────────
 ;; Persists the IP-metric index, frees the in-memory copy, reloads,
 ;; and confirms metadata + a query still resolve.  Drives ray_hnsw_save_fn
 ;; (lines 806-819) and ray_hnsw_load_fn (lines 822-835).
 (.sys.exec "mkdir -p /tmp/rfl_embcov_idx")
-(.emb.hnsw-save IdxIp "/tmp/rfl_embcov_idx")
-(.emb.hnsw-free IdxIp)
+(.emb.hnsw.set "/tmp/rfl_embcov_idx" IdxIp)
+(.emb.hnsw.free IdxIp)
 
-(set Loaded (.emb.hnsw-load "/tmp/rfl_embcov_idx"))
-(at (.emb.hnsw-info Loaded) 'metric) -- 'ip
-(at (.emb.hnsw-info Loaded) 'nrows)  -- 5
-(at (.emb.hnsw-info Loaded) 'dim)    -- 3
+(set Loaded (.emb.hnsw.get "/tmp/rfl_embcov_idx"))
+(at (.emb.hnsw.info Loaded) 'metric) -- 'ip
+(at (.emb.hnsw.info Loaded) 'nrows)  -- 5
+(at (.emb.hnsw.info Loaded) 'dim)    -- 3
 ;; Round-trip preserved the index — top-1 for [1,0,0] under IP is still row 0.
 (set loadedHits (.emb.ann Loaded [1.0 0.0 0.0] 3))
 (count loadedHits) -- 3
 (at (at loadedHits '_rowid) 0) -- 0
 (<= (at (at loadedHits '_dist) 0) -0.99) -- true
 
-;; .emb.hnsw-save / .emb.hnsw-load argument validation.
-(.emb.hnsw-save 5 "/tmp/rfl_embcov_idx") !- type
-(.emb.hnsw-save Loaded 5)                !- type
-(.emb.hnsw-save Loaded "")               !- domain
-(.emb.hnsw-load 5)                       !- type
-(.emb.hnsw-load "")                      !- domain
-(.emb.hnsw-load "/tmp/rfl_embcov_idx_does_not_exist") !- io
+;; .emb.hnsw.set / .emb.hnsw.get argument validation.
+(.emb.hnsw.set "/tmp/rfl_embcov_idx" 5) !- type
+(.emb.hnsw.set 5 Loaded)                !- type
+(.emb.hnsw.set "" Loaded)               !- domain
+(.emb.hnsw.get 5)                       !- type
+(.emb.hnsw.get "")                      !- domain
+(.emb.hnsw.get "/tmp/rfl_embcov_idx_does_not_exist") !- io
 
-;; ────────────── .emb.hnsw-free idempotency contract ──────────────
+;; ────────────── .emb.hnsw.free idempotency contract ──────────────
 ;; First free clears RAY_ATTR_HNSW; the second call must see a plain
 ;; I64, fail hnsw_unwrap, and surface a type error rather than
 ;; double-freeing the underlying index.
-(.emb.hnsw-free Loaded)
-(.emb.hnsw-free Loaded) !- type
-(.emb.hnsw-free 5)      !- type
+(.emb.hnsw.free Loaded)
+(.emb.hnsw.free Loaded) !- type
+(.emb.hnsw.free 5)      !- type
 
 ;; ────────────── rayvec_at_f64: RAY_I32 / RAY_I64 element branches ──────────────
 ;; rayvec_at_f64 (lines 352-361) switches on element type.  Existing
@@ -212,7 +212,7 @@
 ;; atom_to_i64 (lines 537-545) extracts an int atom into int64_t.
 ;; The -RAY_I64 case is already exercised by every plain literal k.
 ;; -RAY_I32 needs a 1i-style suffix; -RAY_I16 needs 1h-style.
-;; knn's k argument and .emb.hnsw-build's M / ef_c arguments all funnel
+;; knn's k argument and .emb.hnsw.build's M / ef_c arguments all funnel
 ;; through atom_to_i64.
 
 ;; knn k as I32 atom (1i) → atom_to_i64 hits case -RAY_I32 (L541).
@@ -223,16 +223,16 @@
 (first (at (.emb.knn V [1.0 0.0 0.0] 1h 'l2) '_rowid)) -- 0
 (count (.emb.knn V [1.0 0.0 0.0] 3h)) -- 3
 
-;; .emb.hnsw-build with M and ef_c as I16/I32 atoms also funnels through
+;; .emb.hnsw.build with M and ef_c as I16/I32 atoms also funnels through
 ;; atom_to_i64, providing redundant coverage of the same branches.
-(set IdxI16 (.emb.hnsw-build V 'l2 8h 64h))   ;; M, ef_c both I16 → L542
-(at (.emb.hnsw-info IdxI16) 'M)   -- 8
-(at (.emb.hnsw-info IdxI16) 'efc) -- 64
-(.emb.hnsw-free IdxI16)
+(set IdxI16 (.emb.hnsw.build V 'l2 8h 64h))   ;; M, ef_c both I16 → L542
+(at (.emb.hnsw.info IdxI16) 'M)   -- 8
+(at (.emb.hnsw.info IdxI16) 'efc) -- 64
+(.emb.hnsw.free IdxI16)
 
-(set IdxI32 (.emb.hnsw-build V 'l2 16i 128i)) ;; M, ef_c both I32 → L541
-(at (.emb.hnsw-info IdxI32) 'M)   -- 16
-(at (.emb.hnsw-info IdxI32) 'efc) -- 128
+(set IdxI32 (.emb.hnsw.build V 'l2 16i 128i)) ;; M, ef_c both I32 → L541
+(at (.emb.hnsw.info IdxI32) 'M)   -- 16
+(at (.emb.hnsw.info IdxI32) 'efc) -- 128
 
 ;; ann ef_s as I32/I16 atom hits atom_to_i64 again.
 (count (.emb.ann IdxI32 [1.0 0.0 0.0] 2 50i)) -- 2   ;; ef_s I32 → L541
@@ -242,7 +242,7 @@
 (count (.emb.ann IdxI32 [1.0 0.0 0.0] 2i)) -- 2
 (count (.emb.ann IdxI32 [1.0 0.0 0.0] 2h)) -- 2
 
-(.emb.hnsw-free IdxI32)
+(.emb.hnsw.free IdxI32)
 
 ;; ────────────── empty-list shortcut in ray_knn_fn ──────────────
 ;; Lines 572-581: when the column is an empty list and the query is a

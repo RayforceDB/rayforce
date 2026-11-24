@@ -286,8 +286,8 @@ fit L2. Thread pool dispatches morsels in parallel.
 **Vector search**
 - Multi-metric HNSW index (cosine / L2 / inner-product) with save/load
 - Rayfall builtins: `.emb.cos-dist` / `.emb.l2-dist` / `.emb.inner-prod` / `norm` / `.emb.knn`
-  and the HNSW lifecycle `.emb.hnsw-build` / `.emb.ann` / `.emb.hnsw-save` / `.emb.hnsw-load` /
-  `.emb.hnsw-free` / `.emb.hnsw-info`
+  and the HNSW lifecycle `.emb.hnsw.build` / `.emb.ann` / `.emb.hnsw.set` / `.emb.hnsw.get` /
+  `.emb.hnsw.free` / `.emb.hnsw.info`
 - Filter-aware ANN via `select ... where ... nearest (.emb.ann handle query) take k`
 - Iterative streaming scan: the `where` predicate is pushed into HNSW's
   beam loop so rejected candidates don't consume result slots

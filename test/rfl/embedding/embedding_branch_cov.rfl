@@ -4,13 +4,13 @@
 ;; Covers:
 ;;   - vec_binary_metric NULL-arg guards (!a, !b)
 ;;   - list_vec_validate returns 2 (first elem bad) and 3 (dim mismatch)
-;;   - rayvec_to_floats non-F32 (F64/I32/I64) via .emb.hnsw-build+ann
-;;   - list_flatten_floats n==0 (via .emb.hnsw-build on empty-valid scenario)
-;;   - .emb.hnsw-save/hnsw-load long path (len >= 1023) → domain error
-;;   - .emb.hnsw-build M/ef_c out-of-range clamping
+;;   - rayvec_to_floats non-F32 (F64/I32/I64) via .emb.hnsw.build+ann
+;;   - list_flatten_floats n==0 (via .emb.hnsw.build on empty-valid scenario)
+;;   - .emb.hnsw.set/.emb.hnsw.get long path (len >= 1023) → domain error
+;;   - .emb.hnsw.build M/ef_c out-of-range clamping
 ;;   - ann ef_s clamping to HNSW_DEFAULT_EF_S
 ;;   - knn heap sift-up break (parent >= child), right-child sift-down
-;;   - .emb.hnsw-info for cosine metric display
+;;   - .emb.hnsw.info for cosine metric display
 ;;   - vec_binary_metric a->len <= 0 scalar path
 ;;   - parse_metric_sym NULL/non-SYM fallthrough
 ;;   - atom_to_i64 default branch (non-int atom)
@@ -48,65 +48,65 @@
 (.emb.knn 42 [1.0 0.0 0.0] 1) !- type
 
 ;; ════════════════════════════════════════════════════════════════
-;; 2. rayvec_to_floats non-F32 path via .emb.hnsw-build + ann
+;; 2. rayvec_to_floats non-F32 path via .emb.hnsw.build + ann
 ;;    (list_flatten_floats calls rayvec_to_floats for each row)
 ;; ════════════════════════════════════════════════════════════════
 
 ;; F64 source vectors → rayvec_to_floats takes the loop path (not memcpy)
 (set VF64 (list (as 'F64 [1.0 0.0 0.0]) (as 'F64 [0.0 1.0 0.0]) (as 'F64 [0.0 0.0 1.0])))
-(set IdxF64 (.emb.hnsw-build VF64 'l2))
+(set IdxF64 (.emb.hnsw.build VF64 'l2))
 (first (at (.emb.ann IdxF64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
 (first (at (.emb.ann IdxF64 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
-(.emb.hnsw-free IdxF64)
+(.emb.hnsw.free IdxF64)
 
 ;; I32 source vectors → rayvec_to_floats loops through rayvec_at_f64 I32
 (set VI32 (list (as 'I32 [1 0 0]) (as 'I32 [0 1 0]) (as 'I32 [0 0 1])))
-(set IdxI32 (.emb.hnsw-build VI32 'l2))
+(set IdxI32 (.emb.hnsw.build VI32 'l2))
 (first (at (.emb.ann IdxI32 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(.emb.hnsw-free IdxI32)
+(.emb.hnsw.free IdxI32)
 
 ;; I64 source vectors → rayvec_to_floats loops through rayvec_at_f64 I64
 (set VI64 (list [1 0 0] [0 1 0] [0 0 1]))
-(set IdxI64 (.emb.hnsw-build VI64 'l2))
+(set IdxI64 (.emb.hnsw.build VI64 'l2))
 (first (at (.emb.ann IdxI64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(.emb.hnsw-free IdxI64)
+(.emb.hnsw.free IdxI64)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 3. .emb.hnsw-build M/ef_c out-of-range (uses defaults)
+;; 3. .emb.hnsw.build M/ef_c out-of-range (uses defaults)
 ;; ════════════════════════════════════════════════════════════════
 
 ;; M=0 → out of range (v > 0 is false), keeps HNSW_DEFAULT_M
 (set V3 (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))
-(set IdxDefM (.emb.hnsw-build V3 'l2 0 50))
-(at (.emb.hnsw-info IdxDefM) 'nrows) -- 3
-(.emb.hnsw-free IdxDefM)
+(set IdxDefM (.emb.hnsw.build V3 'l2 0 50))
+(at (.emb.hnsw.info IdxDefM) 'nrows) -- 3
+(.emb.hnsw.free IdxDefM)
 
 ;; M=999 → out of range (v > 512 is true), keeps HNSW_DEFAULT_M
-(set IdxBigM (.emb.hnsw-build V3 'l2 999 50))
-(at (.emb.hnsw-info IdxBigM) 'nrows) -- 3
-(.emb.hnsw-free IdxBigM)
+(set IdxBigM (.emb.hnsw.build V3 'l2 999 50))
+(at (.emb.hnsw.info IdxBigM) 'nrows) -- 3
+(.emb.hnsw.free IdxBigM)
 
 ;; ef_c=0 → out of range, keeps HNSW_DEFAULT_EF_C
-(set IdxDefEf (.emb.hnsw-build V3 'l2 8 0))
-(at (.emb.hnsw-info IdxDefEf) 'nrows) -- 3
-(.emb.hnsw-free IdxDefEf)
+(set IdxDefEf (.emb.hnsw.build V3 'l2 8 0))
+(at (.emb.hnsw.info IdxDefEf) 'nrows) -- 3
+(.emb.hnsw.free IdxDefEf)
 
 ;; ef_c=9999 → out of range (v > 4096), keeps HNSW_DEFAULT_EF_C
-(set IdxBigEf (.emb.hnsw-build V3 'l2 8 9999))
-(at (.emb.hnsw-info IdxBigEf) 'nrows) -- 3
-(.emb.hnsw-free IdxBigEf)
+(set IdxBigEf (.emb.hnsw.build V3 'l2 8 9999))
+(at (.emb.hnsw.info IdxBigEf) 'nrows) -- 3
+(.emb.hnsw.free IdxBigEf)
 
 ;; Negative M → out of range (v > 0 is false)
-(set IdxNegM (.emb.hnsw-build V3 'l2 -1 50))
-(at (.emb.hnsw-info IdxNegM) 'nrows) -- 3
-(.emb.hnsw-free IdxNegM)
+(set IdxNegM (.emb.hnsw.build V3 'l2 -1 50))
+(at (.emb.hnsw.info IdxNegM) 'nrows) -- 3
+(.emb.hnsw.free IdxNegM)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 4. ann ef_s clamping and out-of-range
 ;; ════════════════════════════════════════════════════════════════
 
 (set V5 (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
-(set Idx5 (.emb.hnsw-build V5 'l2 8 100))
+(set Idx5 (.emb.hnsw.build V5 'l2 8 100))
 
 ;; ef_s=0 → v > 0 is false, keeps computed ef (max(k, default)).
 ;; Top-2 result must contain the exact match row 0 with dist 0.
@@ -135,28 +135,28 @@
 ;; ann with non-int ef_s → type error
 (.emb.ann Idx5 [1.0 0.0 0.0] 2 1.5) !- type
 
-(.emb.hnsw-free Idx5)
+(.emb.hnsw.free Idx5)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 5. .emb.hnsw-save/hnsw-load domain: long path (>= 1023 chars)
+;; 5. .emb.hnsw.set/.emb.hnsw.get domain: long path (>= 1023 chars)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx3 (.emb.hnsw-build V3 'l2))
+(set Idx3 (.emb.hnsw.build V3 'l2))
 
 ;; Path exactly 1023 chars → domain error (len >= 1023)
 ;; Generate a long path string by repeating 'A' 1030 times.
-(.emb.hnsw-save Idx3 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
-(.emb.hnsw-load "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
+(.emb.hnsw.set "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" Idx3) !- domain
+(.emb.hnsw.get "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
 
-(.emb.hnsw-free Idx3)
+(.emb.hnsw.free Idx3)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 6. .emb.hnsw-info cosine metric display (line 540: default branch)
+;; 6. .emb.hnsw.info cosine metric display (line 540: default branch)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Icos (.emb.hnsw-build V3 'cosine))
-(at (.emb.hnsw-info Icos) 'metric) -- 'cosine
-(.emb.hnsw-free Icos)
+(set Icos (.emb.hnsw.build V3 'cosine))
+(at (.emb.hnsw.info Icos) 'metric) -- 'cosine
+(.emb.hnsw.free Icos)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 7. knn k==nrows exactly (no clamping, heap fills exactly)
@@ -224,10 +224,10 @@
 (at (.emb.cos-dist Vhd [1.0 0.0 0.0 0.0]) 0) -- (.emb.cos-dist [1.0 2.0 3.0 4.0] [1.0 0.0 0.0 0.0])
 
 ;; ════════════════════════════════════════════════════════════════
-;; 12. .emb.hnsw-build on empty list → dim <= 0 error
+;; 12. .emb.hnsw.build on empty list → dim <= 0 error
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.hnsw-build (list)) !- length
+(.emb.hnsw.build (list)) !- length
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 13. knn default metric (no 4th arg) is cosine
@@ -292,31 +292,31 @@
 (at (.emb.l2-dist (list [0 0] [3 4]) [0.0 0.0]) 1) -- 5.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 19. .emb.hnsw-build rank errors
+;; 19. .emb.hnsw.build rank errors
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.hnsw-build V3 'l2 8 50 99) !- rank
+(.emb.hnsw.build V3 'l2 8 50 99) !- rank
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 20. ann rank error (too few / too many args)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx20 (.emb.hnsw-build V3 'l2))
+(set Idx20 (.emb.hnsw.build V3 'l2))
 (.emb.ann Idx20 [1.0 0.0 0.0] 1 50 99) !- rank
 (.emb.ann Idx20 [1.0 0.0 0.0])         !- rank
-(.emb.hnsw-free Idx20)
+(.emb.hnsw.free Idx20)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 21. .emb.hnsw-info on non-handle → type error
+;; 21. .emb.hnsw.info on non-handle → type error
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.hnsw-info 5) !- type
+(.emb.hnsw.info 5) !- type
 
 ;; ════════════════════════════════════════════════════════════════
-;; 22. .emb.hnsw-build with list containing non-numeric first elem
+;; 22. .emb.hnsw.build with list containing non-numeric first elem
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.hnsw-build (list (as 'BOOL [true false]) [1.0 0.0])) !- type
+(.emb.hnsw.build (list (as 'BOOL [true false]) [1.0 0.0])) !- type
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 23. Mixed-type vectors in list for knn
@@ -337,16 +337,16 @@
 (first (at (.emb.knn Vip [1.0 0.0 0.0] 3 'ip) '_dist)) -- -1.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 25. .emb.hnsw-build with valid 2nd arg but non-sym type → domain error
+;; 25. .emb.hnsw.build with valid 2nd arg but non-sym type → domain error
 ;; ════════════════════════════════════════════════════════════════
 
-(.emb.hnsw-build V3 42) !- domain
+(.emb.hnsw.build V3 42) !- domain
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 26. ann with k that exceeds index rows → should return min(k, n_nodes)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx26 (.emb.hnsw-build V3 'l2))
+(set Idx26 (.emb.hnsw.build V3 'l2))
 ;; ann with k=100 on a 3-row index returns at most 3 rows.  Row 0 [1,0,0]
 ;; is the exact match — must come first with dist 0; rows 1 and 2 are
 ;; orthogonal so both fall back at the same large distance.
@@ -355,7 +355,7 @@
 (at (at hits26 '_rowid) 0) -- 0
 (at (at hits26 '_dist)  0) -- 0.0
 (asc (at hits26 '_rowid)) -- [0 1 2]
-(.emb.hnsw-free Idx26)
+(.emb.hnsw.free Idx26)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 27. zero-vector in .emb.cos-dist (denom == 0 false branch)
@@ -372,46 +372,46 @@
 (at (.emb.cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 1) -- 0.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 28. .emb.hnsw-save to a valid short path then load
+;; 28. .emb.hnsw.set to a valid short path then load
 ;;     (just reinforcing io error for bad load path)
 ;; ════════════════════════════════════════════════════════════════
 
 (.sys.exec "mkdir -p /tmp/rfl_emb_branch_cov")
-(set Idx28 (.emb.hnsw-build V3 'l2))
-(.emb.hnsw-save Idx28 "/tmp/rfl_emb_branch_cov")
-(.emb.hnsw-free Idx28)
+(set Idx28 (.emb.hnsw.build V3 'l2))
+(.emb.hnsw.set "/tmp/rfl_emb_branch_cov" Idx28)
+(.emb.hnsw.free Idx28)
 
-(set Idx28b (.emb.hnsw-load "/tmp/rfl_emb_branch_cov"))
-(at (.emb.hnsw-info Idx28b) 'nrows) -- 3
-(.emb.hnsw-free Idx28b)
+(set Idx28b (.emb.hnsw.get "/tmp/rfl_emb_branch_cov"))
+(at (.emb.hnsw.info Idx28b) 'nrows) -- 3
+(.emb.hnsw.free Idx28b)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 29. .emb.hnsw-info ip metric display
+;; 29. .emb.hnsw.info ip metric display
 ;; ════════════════════════════════════════════════════════════════
 
-(set Iip (.emb.hnsw-build V3 'ip))
-(at (.emb.hnsw-info Iip) 'metric) -- 'ip
-(.emb.hnsw-free Iip)
+(set Iip (.emb.hnsw.build V3 'ip))
+(at (.emb.hnsw.info Iip) 'metric) -- 'ip
+(.emb.hnsw.free Iip)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 30. ann with ip metric → verifies ray_hnsw_search with ip
 ;; ════════════════════════════════════════════════════════════════
 
-(set Iip2 (.emb.hnsw-build V3 'ip))
+(set Iip2 (.emb.hnsw.build V3 'ip))
 (first (at (.emb.ann Iip2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(.emb.hnsw-free Iip2)
+(.emb.hnsw.free Iip2)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 31. .emb.hnsw-build with single vector (edge case for graph construction)
+;; 31. .emb.hnsw.build with single vector (edge case for graph construction)
 ;; ════════════════════════════════════════════════════════════════
 
 (set V31 (list [1.0 2.0 3.0]))
-(set Idx31 (.emb.hnsw-build V31 'l2))
-(at (.emb.hnsw-info Idx31) 'nrows) -- 1
-(at (.emb.hnsw-info Idx31) 'dim)   -- 3
+(set Idx31 (.emb.hnsw.build V31 'l2))
+(at (.emb.hnsw.info Idx31) 'nrows) -- 1
+(at (.emb.hnsw.info Idx31) 'dim)   -- 3
 (first (at (.emb.ann Idx31 [1.0 2.0 3.0] 1) '_rowid)) -- 0
 (first (at (.emb.ann Idx31 [1.0 2.0 3.0] 1) '_dist))  -- 0.0
-(.emb.hnsw-free Idx31)
+(.emb.hnsw.free Idx31)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 32. knn with large k (k >> nrows) clamps to nrows
@@ -439,11 +439,11 @@
 ;; 33. ann with cosine metric build
 ;; ════════════════════════════════════════════════════════════════
 
-(set Icos2 (.emb.hnsw-build V3 'cosine 4 50))
+(set Icos2 (.emb.hnsw.build V3 'cosine 4 50))
 (first (at (.emb.ann Icos2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
 (first (at (.emb.ann Icos2 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
 (count (.emb.ann Icos2 [1.0 0.0 0.0] 3)) -- 3
-(.emb.hnsw-free Icos2)
+(.emb.hnsw.free Icos2)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; teardown

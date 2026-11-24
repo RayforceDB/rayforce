@@ -230,7 +230,7 @@
 
 ;; ====================================================================
 ;; nearest: KNN clause — query.c:1597-1832 with knn-rerank.
-;; ANN with .emb.hnsw-build → ann form covered too.
+;; ANN with .emb.hnsw.build → ann form covered too.
 ;; ====================================================================
 
 ;; Build a small embedding table; column `Vec` is a LIST of float vecs.
@@ -262,13 +262,13 @@
 ;; switch arm needs an F32-producing call site we don't have at
 ;; rfl level today.
 
-;; ANN form — query.c:1686-1738.  .emb.hnsw-build returns an HNSW handle;
+;; ANN form — query.c:1686-1738.  .emb.hnsw.build returns an HNSW handle;
 ;; nearest: (.emb.ann Idx q [ef]) reranks via the index.  Default ef path
 ;; at 1713; explicit ef path at 1714-1732.
-(set Idx (.emb.hnsw-build (at TE 'Vec) 'l2 8 100))
+(set Idx (.emb.hnsw.build (at TE 'Vec) 'l2 8 100))
 (count (select {from: TE nearest: (.emb.ann Idx [1.0 0.0 0.0]) take: 3})) -- 3
 (count (select {from: TE nearest: (.emb.ann Idx [1.0 0.0 0.0] 50) take: 3})) -- 3
-(.emb.hnsw-free Idx)
+(.emb.hnsw.free Idx)
 
 ;; ====================================================================
 ;; collect_col_refs dotted path — query.c:1049-1058.  Used by the
@@ -709,9 +709,9 @@
 ;; ====================================================================
 
 (set TE2 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
-(set Idx2 (.emb.hnsw-build (at TE2 'Vec) 'l2 4 50))
+(set Idx2 (.emb.hnsw.build (at TE2 'Vec) 'l2 4 50))
 (select {from: TE2 nearest: (.emb.ann Idx2 [1.0 0.0]) by: id}) !- domain
-(.emb.hnsw-free Idx2)
+(.emb.hnsw.free Idx2)
 
 ;; ====================================================================
 ;; Eval-level group-by: empty groups with n_out=0 (query.c 2116-2140).
@@ -764,7 +764,7 @@
 ;; ====================================================================
 
 (set TE3 (table [id Vec] (list [0 1 2] (list [1.0 0.0] [0.0 1.0] [0.5 0.5]))))
-(set Idx3 (.emb.hnsw-build (at TE3 'Vec) 'l2 4 50))
+(set Idx3 (.emb.hnsw.build (at TE3 'Vec) 'l2 4 50))
 ;; I32 take atom (line 1623)
 (count (select {from: TE3 nearest: (.emb.ann Idx3 [1.0 0.0]) take: (as 'I32 2)})) -- 2
 ;; F64 take atom → type error (line 1624-1628)
@@ -773,7 +773,7 @@
 (select {from: TE3 nearest: (.emb.ann Idx3 [1.0 0.0]) take: 0}) !- domain
 ;; I32 query vector (line 1673-1677)
 (count (select {from: TE3 nearest: (.emb.ann Idx3 (as 'I32 [1 0]))})) -- 3
-(.emb.hnsw-free Idx3)
+(.emb.hnsw.free Idx3)
 
 ;; ====================================================================
 ;; knn: unrecognized metric → domain error (query.c:1756-1761).

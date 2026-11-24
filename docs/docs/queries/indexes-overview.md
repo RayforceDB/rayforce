@@ -26,9 +26,9 @@ Attach one of four kinds to a numeric vector (`.idx.hash` also to a symbol, stri
 
 ### 2. Vector ANN index — HNSW
 
-Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics — cosine, L2, inner product. Built once with `.emb.hnsw-build`, queried with `.emb.ann`, optionally persisted to a directory with `.emb.hnsw-save` / `.emb.hnsw-load`.
+Hierarchical Navigable Small World multi-layer proximity graph for approximate nearest neighbor search over float embedding vectors. Three distance metrics — cosine, L2, inner product. Built once with `.emb.hnsw.build`, queried with `.emb.ann`, optionally persisted to a directory with `.emb.hnsw.set` / `.emb.hnsw.get`.
 
-**Surface:** `(.emb.hnsw-build col [metric] [M] [ef_c])`, `(.emb.ann handle query k [ef_search])`, `(.emb.knn col query k [metric])`, `(.emb.hnsw-save handle dir)`, `(.emb.hnsw-load dir)`, `(.emb.hnsw-free handle)`, `(.emb.hnsw-info handle)`. Brute-force `.emb.knn` needs no index and exists alongside.
+**Surface:** `(.emb.hnsw.build col [metric] [M] [ef_c])`, `(.emb.ann handle query k [ef_search])`, `(.emb.knn col query k [metric])`, `(.emb.hnsw.set dir handle)`, `(.emb.hnsw.get dir)`, `(.emb.hnsw.free handle)`, `(.emb.hnsw.info handle)`. Brute-force `.emb.knn` needs no index and exists alongside.
 
 **See:** [Vector Search & HNSW](../graph/vector-search.md) · [Indexes Guide: ANN workflow](../guides/indexes.md#workflow-ann).
 
@@ -68,7 +68,7 @@ Match the shape of your query to the structure that fits it.
 | Make repeated `=` / `in` / `find` over a numeric, symbol, string or guid column O(matches) instead of O(n) | `.idx.hash` — chained open-addressing table | Yes — hash probe at filter EQ, filter IN, and find sites (symbol, string and guid columns included) |
 | Binary-search a numeric column for range predicates or reuse the permutation for ORDER BY / distinct | `.idx.sort` — ascending row-id permutation | Yes — filter range (EQ/LT/LE/GT/GE), single-key ASC ORDER BY, distinct |
 | Cheaply reject "definitely not in this set" probes for integer EQ filters | `.idx.bloom` — m-bit probabilistic filter | Yes — definite-absent proof at the filter EQ site (integer-family only) |
-| Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(.emb.hnsw-build)` + `(.emb.ann)` | Yes — `(.emb.ann)` consults the index |
+| Find the k nearest neighbors of an embedding vector by cosine, L2, or inner product | HNSW — `(.emb.hnsw.build)` + `(.emb.ann)` | Yes — `(.emb.ann)` consults the index |
 | Resolve a cross-table reference at query time without a materialized join | Linked column — `(.col.link)` | Yes — column dereference resolves through the link |
 | Skip whole sub-tables in a parted dataset based on the partition discriminator | Partition pruning — date / int / sym partitioning | Yes — optimizer pass rewrites filters |
 | Traverse a graph — BFS, shortest path, betweenness, MST | CSR — transparent under graph opcodes | Yes — every graph opcode reads CSR directly |

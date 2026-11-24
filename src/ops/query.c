@@ -3389,7 +3389,7 @@ static bool key_impure_builtin(ray_t* fn, int64_t id) {
     static const char* const impure[] = {
         "println", "show", "print", "rand", "guid", "eval", "parse", "resolve", "env", "get",
         "remove", "timeit", "exit", "ser", "de", "datoms", "assert-fact", "retract-fact",
-        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", ".emb.hnsw-save", "rc", "meta",
+        "scan-eav", "pull", "dl-program", "dl-query", "dl-provenance", ".emb.hnsw.set", "rc", "meta",
     };
     enum { NIMPURE = sizeof impure / sizeof *impure };
     static _Thread_local int64_t ids[NIMPURE];
@@ -25125,7 +25125,7 @@ by_dict_done:
     ray_t* nearest_handle_owned = NULL;  /* HNSW handle kept alive for the
                                           * DAG's lifetime; released after
                                           * ray_execute.  Without this, an
-                                          * inline `(.emb.ann (.emb.hnsw-build ...) ...)`
+                                          * inline `(.emb.ann (.emb.hnsw.build ...) ...)`
                                           * drops the handle's rc to 0 before
                                           * exec runs — the rc→0 hook frees
                                           * the index and the ext's stored
@@ -25230,7 +25230,7 @@ by_dict_done:
                 ray_release(hobj); ray_free_raw(nearest_query_owned);
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("type",
-                    "nearest (.emb.ann): first arg must be an HNSW handle (from .emb.hnsw-build)");
+                    "nearest (.emb.ann): first arg must be an HNSW handle (from .emb.hnsw.build)");
             }
             ray_hnsw_t* idx = (ray_hnsw_t*)(uintptr_t)hobj->i64;
             if (!idx) {
