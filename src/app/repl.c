@@ -438,6 +438,100 @@ static const char* repl_error_detail(ray_t* err, char* buf, size_t cap) {
     return ray_raise_render(buf, cap) ? buf : NULL;
 }
 
+/* Snippet rendering for error traces.  SNIPPET_CONTEXT bytes is the most
+ * of a line shown on either side of the failing position before it is cut
+ * with "...". */
+#define SNIPPET_CONTEXT 160
+
+/* Byte length of the UTF-8 character at `c`, never past `end`; a malformed
+ * byte counts as one character of its own. */
+static size_t snippet_char_len(const char* c, const char* end) {
+    unsigned char b = (unsigned char)*c;
+    size_t n = b < 0x80 ? 1 : b >= 0xF0 && b < 0xF8 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+    if ((size_t)(end - c) < n) return 1;
+    for (size_t i = 1; i < n; i++)
+        if (((unsigned char)c[i] & 0xC0) != 0x80) return 1;
+    return n;
+}
+
+/* Code point ranges a terminal shows in no cell (combining marks: the
+ * main nonspacing and enclosing ranges, variation selectors, zero-width
+ * space, joiners and marks) and in two (East Asian Wide and Fullwidth,
+ * the emoji blocks U+1F300 to U+1FAFF and the other usual wide symbols).
+ * Sorted and disjoint, for snippet_cp_in.  The marker under an error
+ * aligns by this table, one character at a time: grapheme clusters,
+ * emoji sequences and a terminal's own choices are not modelled. */
+typedef struct { uint32_t lo, hi; } snippet_range_t;
+static const snippet_range_t snippet_zero_width[] = {
+    {0x300, 0x36F}, {0x483, 0x489}, {0x591, 0x5BD}, {0x5BF, 0x5BF}, {0x5C1, 0x5C2}, {0x5C4, 0x5C5},
+    {0x5C7, 0x5C7}, {0x610, 0x61A}, {0x64B, 0x65F}, {0x670, 0x670}, {0x6D6, 0x6DC}, {0x6DF, 0x6E4},
+    {0x6E7, 0x6E8}, {0x6EA, 0x6ED}, {0x711, 0x711}, {0x730, 0x74A}, {0x7A6, 0x7B0}, {0x7EB, 0x7F3},
+    {0x816, 0x819}, {0x81B, 0x823}, {0x825, 0x827}, {0x829, 0x82D}, {0x859, 0x85B}, {0x8D3, 0x8E1},
+    {0x8E3, 0x902}, {0x93A, 0x93A}, {0x93C, 0x93C}, {0x941, 0x948}, {0x94D, 0x94D}, {0x951, 0x957},
+    {0x962, 0x963}, {0x981, 0x981}, {0x9BC, 0x9BC}, {0x9C1, 0x9C4}, {0x9CD, 0x9CD}, {0x9E2, 0x9E3},
+    {0xA01, 0xA02}, {0xA3C, 0xA3C}, {0xA41, 0xA42}, {0xA47, 0xA48}, {0xA4B, 0xA4D}, {0xA70, 0xA71},
+    {0xA75, 0xA75}, {0xA81, 0xA82}, {0xABC, 0xABC}, {0xAC1, 0xAC5}, {0xAC7, 0xAC8}, {0xACD, 0xACD},
+    {0xB01, 0xB01}, {0xB3C, 0xB3C}, {0xB3F, 0xB3F}, {0xB41, 0xB44}, {0xB4D, 0xB4D}, {0xBC0, 0xBC0},
+    {0xBCD, 0xBCD}, {0xC3E, 0xC40}, {0xC46, 0xC48}, {0xC4A, 0xC4D}, {0xCBC, 0xCBC}, {0xCCC, 0xCCD},
+    {0xD41, 0xD44}, {0xD4D, 0xD4D}, {0xDCA, 0xDCA}, {0xDD2, 0xDD4}, {0xDD6, 0xDD6}, {0xE31, 0xE31},
+    {0xE34, 0xE3A}, {0xE47, 0xE4E}, {0xEB1, 0xEB1}, {0xEB4, 0xEBC}, {0xEC8, 0xECD}, {0xF18, 0xF19},
+    {0xF35, 0xF35}, {0xF37, 0xF37}, {0xF39, 0xF39}, {0xF71, 0xF7E}, {0xF80, 0xF84}, {0xF86, 0xF87},
+    {0xF8D, 0xFBC}, {0xFC6, 0xFC6}, {0x102D, 0x1030}, {0x1032, 0x1037}, {0x1039, 0x103A}, {0x1058, 0x1059},
+    {0x1160, 0x11FF}, {0x135D, 0x135F}, {0x1712, 0x1714}, {0x1732, 0x1734}, {0x1752, 0x1753}, {0x1772, 0x1773},
+    {0x17B4, 0x17B5}, {0x17B7, 0x17BD}, {0x17C6, 0x17C6}, {0x17C9, 0x17D3}, {0x17DD, 0x17DD}, {0x180B, 0x180F},
+    {0x18A9, 0x18A9}, {0x1920, 0x1922}, {0x1927, 0x1928}, {0x1932, 0x1932}, {0x1939, 0x193B}, {0x1A17, 0x1A18},
+    {0x1AB0, 0x1AFF}, {0x1B00, 0x1B03}, {0x1B34, 0x1B34}, {0x1B36, 0x1B3A}, {0x1B3C, 0x1B3C}, {0x1B42, 0x1B42},
+    {0x1B6B, 0x1B73}, {0x1DC0, 0x1DFF}, {0x200B, 0x200F}, {0x2028, 0x202E}, {0x2060, 0x2064}, {0x20D0, 0x20FF},
+    {0x2CEF, 0x2CF1}, {0x2DE0, 0x2DFF}, {0x302A, 0x302D}, {0x3099, 0x309A}, {0xA66F, 0xA672}, {0xA674, 0xA67D},
+    {0xA69E, 0xA69F}, {0xA6F0, 0xA6F1}, {0xA802, 0xA802}, {0xA806, 0xA806}, {0xA80B, 0xA80B}, {0xA825, 0xA826},
+    {0xA8C4, 0xA8C5}, {0xA8E0, 0xA8F1}, {0xFB1E, 0xFB1E}, {0xFE00, 0xFE0F}, {0xFE20, 0xFE2F}, {0xFEFF, 0xFEFF},
+    {0x101FD, 0x101FD}, {0x10A01, 0x10A0F}, {0x10A38, 0x10A3F}, {0x1D167, 0x1D169}, {0x1D17B, 0x1D182}, {0x1D185, 0x1D18B},
+    {0x1D1AA, 0x1D1AD}, {0x1E8D0, 0x1E8D6}, {0x1E944, 0x1E94A}, {0xE0001, 0xE0001}, {0xE0020, 0xE007F}, {0xE0100, 0xE01EF},
+};
+static const snippet_range_t snippet_wide[] = {
+    {0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F0}, {0x23F3, 0x23F3},
+    {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F}, {0x2693, 0x2693}, {0x26A1, 0x26A1},
+    {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5}, {0x26CE, 0x26CE}, {0x26D4, 0x26D4}, {0x26EA, 0x26EA},
+    {0x26F2, 0x26F3}, {0x26F5, 0x26F5}, {0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B},
+    {0x2728, 0x2728}, {0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755}, {0x2757, 0x2757}, {0x2795, 0x2797},
+    {0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55}, {0x2E80, 0x303E},
+    {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF}, {0xA960, 0xA97F}, {0xAC00, 0xD7A3},
+    {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x16FE0, 0x16FE4},
+    {0x17000, 0x18CFF}, {0x1B000, 0x1B2FF}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E}, {0x1F191, 0x1F19A},
+    {0x1F200, 0x1F251}, {0x1F300, 0x1FAFF}, {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD},
+};
+
+static bool snippet_cp_in(uint32_t cp, const snippet_range_t* r, size_t n) {
+    if (n == 0 || cp < r[0].lo || cp > r[n - 1].hi) return false;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp < r[mid].lo) hi = mid;
+        else if (cp > r[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+/* Terminal cells the n-byte UTF-8 character at `c` takes: 0 or 2 by the
+ * tables above, 1 otherwise. */
+static int snippet_char_width(const char* c, size_t n) {
+    const unsigned char* u = (const unsigned char*)c;
+    uint32_t cp;
+    switch (n) {
+    case 2: cp = (uint32_t)(u[0] & 0x1F) << 6 | (u[1] & 0x3F); break;
+    case 3: cp = (uint32_t)(u[0] & 0x0F) << 12 | (uint32_t)(u[1] & 0x3F) << 6 | (u[2] & 0x3F); break;
+    case 4: cp = (uint32_t)(u[0] & 0x07) << 18 | (uint32_t)(u[1] & 0x3F) << 12 |
+                 (uint32_t)(u[2] & 0x3F) << 6 | (u[3] & 0x3F); break;
+    default: return 1;
+    }
+    if (snippet_cp_in(cp, snippet_zero_width, sizeof snippet_zero_width / sizeof snippet_zero_width[0]))
+        return 0;
+    if (snippet_cp_in(cp, snippet_wide, sizeof snippet_wide / sizeof snippet_wide[0]))
+        return 2;
+    return 1;
+}
+
 /* Format a rich error message with source snippet, carets, and stack trace. */
 static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_color) {
     char err_code[8] = {0};
@@ -477,20 +571,50 @@ static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_co
             src_len = ray_str_len(felems[3]);
         }
 
-        int line_num = span.start_line;
+        /* Locate the failing position: by the frame's byte offset when it
+         * has one (a parse frame; the span's 16-bit fields saturate on
+         * very long lines and sources), else by the span. */
+        const char* src_end = source + src_len;
         const char* line_start = source;
-        int current_line = 0;
-        while (current_line < line_num && line_start < source + src_len) {
-            if (*line_start == '\n') current_line++;
-            line_start++;
+        const char* at;
+        int64_t line_num = 0;
+        if (ray_len(frame) >= 5 && felems[4] && felems[4]->type == -RAY_I64 &&
+            felems[4]->i64 >= 0 && (size_t)felems[4]->i64 <= src_len) {
+            at = source + felems[4]->i64;
+            for (const char* c = source; c < at; c++)
+                if (*c == '\n') { line_num++; line_start = c + 1; }
+        } else {
+            line_num = span.start_line;
+            int64_t current_line = 0;
+            while (current_line < line_num && line_start < src_end) {
+                if (*line_start == '\n') current_line++;
+                line_start++;
+            }
+            at = line_start;
+            for (int i = 0; i < span.start_col && at < src_end && *at != '\n'; i++) at++;
         }
-        const char* line_end = line_start;
-        while (line_end < source + src_len && *line_end != '\n') line_end++;
-        int line_len = (int)(line_end - line_start);
+        const char* line_end = at;
+        while (line_end < src_end && *line_end != '\n') line_end++;
 
-        int display_line = line_num + 1;
+        /* The header's column counts characters (a tab is one); the
+         * snippet shows a window of a very long line. */
+        int64_t char_col = 0;
+        for (const char* c = line_start; c < at; c += snippet_char_len(c, at)) char_col++;
+        const char* win_start = line_start;
+        if (at - line_start > SNIPPET_CONTEXT) {
+            win_start = at - SNIPPET_CONTEXT / 2;
+            while (win_start < at && ((unsigned char)*win_start & 0xC0) == 0x80) win_start++;
+        }
+        const char* win_end = line_end;
+        if (line_end - at > SNIPPET_CONTEXT) {
+            win_end = at + SNIPPET_CONTEXT / 2;
+            while (win_end > at && ((unsigned char)*win_end & 0xC0) == 0x80) win_end--;
+        }
+        bool cut_left = win_start > line_start, cut_right = win_end < line_end;
+
+        int64_t display_line = line_num + 1;
         int gutter = 1;
-        { int tmp = display_line; while (tmp >= 10) { gutter++; tmp /= 10; } }
+        { int64_t tmp = display_line; while (tmp >= 10) { gutter++; tmp /= 10; } }
 
         fprintf(fp, "\n");
         if (use_color) fprintf(fp, "\033[90m");
@@ -498,26 +622,35 @@ static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_co
         if (use_color) fprintf(fp, "\033[36m");
         fprintf(fp, "%.*s", (int)fname_len, fname);
         if (use_color) fprintf(fp, "\033[33m");
-        fprintf(fp, ":%d:%d", display_line, span.start_col + 1);
+        fprintf(fp, ":%" PRId64 ":%" PRId64, display_line, char_col + 1);
         if (use_color) fprintf(fp, "\033[90m");
         fprintf(fp, "]\n");
 
         if (use_color) fprintf(fp, "\033[36m");
-        fprintf(fp, " %*d", gutter, display_line);
+        fprintf(fp, " %*" PRId64, gutter, display_line);
         if (use_color) fprintf(fp, "\033[90m");
         fprintf(fp, " \xe2\x94\x82 ");
         if (use_color) fprintf(fp, "\033[0m");
-        fprintf(fp, "%.*s\n", line_len, line_start);
+        fprintf(fp, "%s%.*s%s\n", cut_left ? "..." : "", (int)(win_end - win_start),
+                win_start, cut_right ? "..." : "");
 
-        if (use_color) fprintf(fp, "\033[90m");
-        fprintf(fp, " %*s \xe2\x94\x82 ", gutter, "");
-        for (int i = 0; i < span.start_col; i++) fputc(' ', fp);
-        if (use_color) fprintf(fp, "\033[35m");
-        fprintf(fp, "\xe2\x96\xb2\n");
-
-        if (use_color) fprintf(fp, "\033[90m");
-        fprintf(fp, " %*s \xe2\x94\x82 ", gutter, "");
-        for (int i = 0; i < span.start_col; i++) fputc(' ', fp);
+        /* The marker sits under the failing character: the text before it
+         * is echoed as its tabs and, for everything else, as many spaces
+         * as cells it takes on a terminal. */
+        for (int row = 0; row < 2; row++) {
+            if (use_color) fprintf(fp, "\033[90m");
+            fprintf(fp, " %*s \xe2\x94\x82 ", gutter, "");
+            if (cut_left) fputs("   ", fp);
+            for (const char* c = win_start; c < at; ) {
+                size_t n = snippet_char_len(c, at);
+                if (*c == '\t') fputc('\t', fp);
+                else for (int w = snippet_char_width(c, n); w > 0; w--) fputc(' ', fp);
+                c += n;
+            }
+            if (row == 1) break;
+            if (use_color) fprintf(fp, "\033[35m");
+            fprintf(fp, "\xe2\x96\xb2\n");
+        }
         if (use_color) fprintf(fp, "\033[35m");
         fprintf(fp, "\xe2\x95\xb0\xe2\x94\x80 ");
         if (use_color) fprintf(fp, "\033[1;31m");

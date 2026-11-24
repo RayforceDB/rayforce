@@ -3805,42 +3805,81 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
     return lambda;
 }
 
-/* Build a [span_i64, filename, fn_name, source] frame from a resolved span
- * and append it to __VM->trace.  Shared by the bytecode and eval paths. */
-static void append_error_frame(ray_t* nfo, ray_span_t span) {
-    if (span.id == 0) return;
+/* A frame element that failed to allocate is left out (NULL), and its
+ * error object freed: frames are released as ordinary lists, and a release
+ * does not free an error object. */
+static ray_t* frame_elem(ray_t* v) {
+    if (v && RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    return v;
+}
 
-    ray_t* frame = ray_alloc(4 * sizeof(ray_t*));
-    if (!frame || RAY_IS_ERR(frame)) return;
+/* Build a [span_i64, filename, fn_name, source] frame from a resolved span
+ * and append it to __VM->trace.  Shared by the bytecode and eval paths, and
+ * by the parser (ray_error_frame_add), which names its frame and adds the
+ * failing byte's offset as a fifth element (see ray_error_frame_add).
+ * Best effort: a frame that cannot be built is dropped.  The error being
+ * traced owns its kind and message, which nothing here can change; the
+ * thread's usage hint, which an allocation failure here would clear, is
+ * put back. */
+static void append_error_frame_named(ray_t* nfo, ray_span_t span, const char* name,
+                                     int64_t offset) {
+    if (span.id == 0 || !__VM) return;
+
+    const char* saved_usage = ray_error_usage();
+
+    int64_t n = offset >= 0 ? 5 : 4;
+    ray_t* frame = ray_alloc((size_t)n * sizeof(ray_t*));
+    if (!frame || RAY_IS_ERR(frame)) goto restore;
     frame->type = RAY_LIST;
-    frame->len = 4;
+    frame->len = n;
     ray_t** fe = (ray_t**)ray_data(frame);
 
-    fe[0] = ray_i64(span.id);
+    fe[0] = frame_elem(ray_i64(span.id));
     if (nfo && NFO_FILENAME(nfo)) {
         fe[1] = NFO_FILENAME(nfo);
         ray_retain(fe[1]);
     } else {
-        fe[1] = ray_str("<unknown>", 9);
+        fe[1] = frame_elem(ray_str("<unknown>", 9));
     }
-    fe[2] = NULL;
+    fe[2] = name ? frame_elem(ray_str(name, strlen(name))) : NULL;
     if (nfo && NFO_SOURCE(nfo)) {
         fe[3] = NFO_SOURCE(nfo);
         ray_retain(fe[3]);
     } else {
-        fe[3] = ray_str("", 0);
+        fe[3] = frame_elem(ray_str("", 0));
     }
+    if (n == 5) fe[4] = frame_elem(ray_i64(offset));
+    if (!fe[0]) { ray_release(frame); goto restore; }
 
     if (!__VM->trace) {
         __VM->trace = ray_alloc(sizeof(ray_t*));
-        if (!__VM->trace) { ray_release(frame); return; }
+        if (!__VM->trace || RAY_IS_ERR(__VM->trace)) {
+            __VM->trace = NULL;
+            ray_release(frame);
+            goto restore;
+        }
         __VM->trace->type = RAY_LIST;
         __VM->trace->len = 1;
         ((ray_t**)ray_data(__VM->trace))[0] = frame;
     } else {
-        __VM->trace = ray_list_append(__VM->trace, frame);
+        /* The trace is the VM's own (never shared), so a failed append
+         * leaves it as it was. */
+        ray_t* t = ray_list_append(__VM->trace, frame);
+        if (t && !RAY_IS_ERR(t)) __VM->trace = t;
+        else ray_error_free(t);
         ray_release(frame);
     }
+
+restore:
+    ray_error_usage_set(saved_usage);
+}
+
+static void append_error_frame(ray_t* nfo, ray_span_t span) {
+    append_error_frame_named(nfo, span, NULL, -1);
+}
+
+void ray_error_frame_add(ray_t* nfo, ray_span_t span, const char* name, int64_t offset) {
+    append_error_frame_named(nfo, span, name, offset);
 }
 
 /* Build a single error trace frame from a lambda's debug/nfo info at the given

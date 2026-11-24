@@ -93,6 +93,10 @@ typedef struct {
     int32_t col;
     ray_t  *nfo;
     int32_t depth;   /* recursion depth guard (see RAY_PARSE_MAX_DEPTH) */
+    bool    err_set; /* err_* hold where the innermost failing expression began */
+    int32_t err_line;
+    int32_t err_col;
+    const char *err_pos;
     uint8_t nul_l;   /* NUL_L / NUL_MIN parsed since parse_vector cleared it */
 } ray_parser_t;
 
@@ -1097,9 +1101,26 @@ static ray_t* parse_expr_inner(ray_parser_t *p);
  * enough where a level costs more (an unoptimized sanitizer build) or the
  * thread's stack is small, so the parse also stops at the thread's stack
  * reserve (ray_stack_short). */
+/* Where a failed parse is reported (#1563): the start of the innermost
+ * expression that failed, e.g. the `[` of a vector literal whose elements
+ * do not mix.  Set once, by the deepest failure; the expressions around it
+ * fail after it and leave it. */
+static void parse_note_error_at(ray_parser_t *p, int32_t line, int32_t col,
+                                const char *pos) {
+    if (p->err_set) return;
+    p->err_set = true;
+    p->err_line = line;
+    p->err_col = col;
+    p->err_pos = pos;
+}
+
 static ray_t* parse_expr(ray_parser_t *p) {
+    skip_ws_and_comments(p);
+    int32_t sl = p->line, sc = p->col;
+    const char *sp = p->pos;
     if (++p->depth > RAY_PARSE_MAX_DEPTH) {
         p->depth--;
+        parse_note_error_at(p, sl, sc, sp);
         return ray_error("parse", "nesting too deep, limit %d", RAY_PARSE_MAX_DEPTH);
     }
     if (RAY_UNLIKELY((p->depth & 3) == 0 && ray_stack_short())) {   /* every fourth level */
@@ -1108,6 +1129,7 @@ static ray_t* parse_expr(ray_parser_t *p) {
     }
     ray_t* r = parse_expr_inner(p);
     p->depth--;
+    if (RAY_IS_ERR(r)) parse_note_error_at(p, sl, sc, sp);
     return r;
 }
 
@@ -1245,6 +1267,44 @@ ray_t* ray_parse(const char* source) {
     return ray_parse_with_nfo(source, NULL);
 }
 
+/* A failed parse leaves one error trace frame at the position
+ * parse_note_error_at kept (or where the parser stopped), named "parse",
+ * so the REPL, a script file and load print it with the source snippet an
+ * evaluation error has (#1563).  The text carries no nfo when it came from
+ * the `parse` builtin: the frame then names it as ray_eval_str does.
+ *
+ * The frame carries the failing byte's offset, which the renderer locates
+ * it by: the span's 16-bit fields saturate on a line longer than 65535
+ * bytes or a source longer than 65535 lines, the offset does not.  Best
+ * effort: if the frame cannot be built the parse error is returned as it
+ * is; it owns its kind and message, and the thread's usage hint is put
+ * back. */
+static void parse_error_frame(ray_parser_t *p, const char* source, ray_t* nfo) {
+    int32_t line = p->err_set ? p->err_line : p->line;
+    int32_t col  = p->err_set ? p->err_col  : p->col;
+    const char *at = p->err_set ? p->err_pos : p->pos;
+    if (line < 0) line = 0;
+    if (col < 0) col = 0;
+    ray_span_t span;
+    span.start_line = (uint16_t)(line > UINT16_MAX ? UINT16_MAX : line);
+    span.start_col  = (uint16_t)(col >= UINT16_MAX ? UINT16_MAX - 1 : col);
+    span.end_line   = span.start_line;
+    span.end_col    = (uint16_t)(span.start_col + 1);   /* never id 0, which means "no span" */
+    ray_t* own = NULL;
+    if (!nfo) {
+        const char* saved_usage = ray_error_usage();
+        own = ray_nfo_create(RAY_NFO_REPL_NAME, strlen(RAY_NFO_REPL_NAME), source, strlen(source));
+        if (!own || RAY_IS_ERR(own)) {
+            ray_error_free(own);
+            ray_error_usage_set(saved_usage);
+            return;
+        }
+        nfo = own;
+    }
+    ray_error_frame_add(nfo, span, "parse", (int64_t)(at - source));
+    if (own) ray_release(own);
+}
+
 ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo) {
     if (!source) return ray_error("parse", NULL);
     ray_parser_t p = {
@@ -1254,5 +1314,7 @@ ray_t* ray_parse_with_nfo(const char* source, ray_t* nfo) {
         .col  = 0,
         .nfo  = nfo
     };
-    return parse_source(&p);
+    ray_t* r = parse_source(&p);
+    if (RAY_IS_ERR(r)) parse_error_frame(&p, source, nfo);
+    return r;
 }
