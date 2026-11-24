@@ -132,6 +132,11 @@ typedef struct {
     const int64_t   *proj_keep;
     int              proj_keep_n;
     int32_t          proj_depth;  /* eval_depth at publish; consumed only at +1 */
+    /* Compiled bodies running on this stack, each a vm_exec_rows frame on the
+     * C stack (a builtin that calls a lambda back re-enters it): capped at
+     * RAY_VM_REENTRY_MAX, a backstop to the stack reserve where the
+     * platform gives no bound (ulimit -s unlimited). */
+    int32_t          vm_reentry;
     bool             proj_active;
     ray_t           *proj_dict;   /* the publisher's query dict (borrowed): a join
                                    * judges its clauses against the joined columns */

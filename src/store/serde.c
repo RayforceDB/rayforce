@@ -31,6 +31,7 @@
 #include "store/enccol.h"   /* ray_enccol_is_parted */
 #include "core/types.h"
 #include "mem/heap.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "table/table.h"
 #include "vec/str.h"
 #include "vec/vec.h"
@@ -1142,8 +1143,9 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
 /* Bound the recursion depth so a corrupted record encoding pathologically
  * deep nesting returns an error instead of overflowing the C stack.  Mirrors
- * the eval-depth ceiling (RAY_EVAL_MAX_DEPTH).  Thread-local: ray_de_raw may
- * run on worker-pool threads. */
+ * the eval-depth ceiling (RAY_EVAL_MAX_DEPTH), and stops as it does at the
+ * thread's stack reserve (ray_stack_short), whatever a level costs in this
+ * build.  Thread-local: ray_de_raw may run on worker-pool threads. */
 #define RAY_DE_MAX_DEPTH 512
 static _Thread_local int g_de_depth = 0;
 static _Thread_local uint8_t g_de_wire_version = RAY_SERDE_WIRE_VERSION;
@@ -1153,6 +1155,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len);
 ray_t* ray_de_raw(uint8_t* buf, int64_t* len) {
     if (g_de_depth >= RAY_DE_MAX_DEPTH)
         return ray_error("domain", "deserialize: nesting exceeds max depth %lld", (long long)RAY_DE_MAX_DEPTH);
+    if (ray_stack_short())
+        return ray_error("domain", "deserialize: nesting too deep for this thread's stack");
     g_de_depth++;
     ray_t* r = de_raw_inner(buf, len);
     g_de_depth--;

@@ -23,6 +23,7 @@
 
 #include "lang/eval.h"
 #include "core/runtime.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "lang/internal.h"
 #include "app/repl.h"
 #include "lang/env.h"
@@ -87,7 +88,11 @@ static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
 #include <time.h>
 
 /* Maximum recursion depth for ray_eval() to prevent stack overflow.
- * The depth counter lives on the per-thread VM (__VM->eval_depth). */
+ * The depth counter lives on the per-thread VM (__VM->eval_depth).  The
+ * evaluation also stops, with the same error, once the thread's stack is
+ * down to its reserve (ray_stack_short, read every fourth level): what a
+ * level costs depends on the build (over 11 KB a frame under ASan at -O0),
+ * and a secondary thread's stack can be far smaller than the main one's. */
 #define RAY_EVAL_MAX_DEPTH 512
 
 typedef struct {
@@ -3800,6 +3805,8 @@ static void add_eval_error_frame(ray_t* nfo, ray_t* node) {
 
 /* Execute compiled bytecode for a lambda. */
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
+static ray_t* vm_exec_counted(ray_t* lambda, ray_t** call_args, int64_t argc,
+                              uint64_t row_args, uint8_t* out_rows);
 static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
                            uint64_t row_args, uint8_t* out_rows);
 
@@ -3864,7 +3871,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         if (ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
             return ray_error("oom", NULL);
         uint8_t result_rows = 0;
-        ray_t* result = vm_exec_rows(lambda, call_args, argc, row_args, &result_rows);
+        ray_t* result = vm_exec_counted(lambda, call_args, argc, row_args, &result_rows);
         ray_env_pop_scope();
         if (out_rows) *out_rows = vrows_to(result_rows);
         return result;
@@ -3975,8 +3982,26 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
 /* __VM (per-thread VM) comes from core/runtime.h — the executor below
  * allocates a private ray_exec_t per invocation and leaves __VM alone. */
 
+/* A backstop count of compiled bodies open on this stack (vm_reentry):
+ * ray_stack_short stops a body recursing through a builtin's callback at
+ * the thread's stack reserve, but where the platform gives no bound (the
+ * main thread under `ulimit -s unlimited`, whose reported stack runs to
+ * the next mapping) nothing would, until memory ran out.  An optimized
+ * build reaches about 1,700 levels on an 8 MB stack, so the count never
+ * binds first there. */
+#define RAY_VM_REENTRY_MAX 10000
+static ray_t* vm_exec_counted(ray_t* lambda, ray_t** call_args, int64_t argc,
+                              uint64_t row_args, uint8_t* out_rows) {
+    if (RAY_UNLIKELY(__VM->vm_reentry >= RAY_VM_REENTRY_MAX))
+        return ray_error("limit", "stack overflow");
+    __VM->vm_reentry++;
+    ray_t* r = vm_exec_rows(lambda, call_args, argc, row_args, out_rows);
+    __VM->vm_reentry--;
+    return r;
+}
+
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    return vm_exec_rows(lambda, call_args, argc, 0, NULL);
+    return vm_exec_counted(lambda, call_args, argc, 0, NULL);
 }
 
 /* Whether a builtin keeps row provenance: the planner lowers it row by
@@ -4184,6 +4209,14 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
 
     if (RAY_UNLIKELY(!__VM))
         return ray_error("state", "no VM bound to this thread");
+
+    /* Calls between compiled bodies stay on this frame (the VM's own
+     * return stack, bounded by VM_STACK_SIZE), but a builtin that calls a
+     * lambda back (map, fold, a sort key...) re-enters here on the C stack,
+     * a frame per level with no count of its own: a body recursing through
+     * one stops at the thread's stack reserve, as the evaluator does. */
+    if (RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "stack overflow");
 
     /* Scope-stack baseline: OP_SCOPE_BEGIN windows that error out before
      * their OP_SCOPE_END leave materialized frames behind — the error
@@ -6051,7 +6084,11 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
     if (g_eval_interrupted) return ray_error("cancel", "interrupted");
 
-    if (++__VM->eval_depth > RAY_EVAL_MAX_DEPTH) {
+    /* The stack is read every fourth level: four levels are far below
+     * the reserve in any build, and the hot path skips the read. */
+    int32_t depth_now = ++__VM->eval_depth;
+    if (RAY_UNLIKELY(depth_now > RAY_EVAL_MAX_DEPTH ||
+                     ((depth_now & 3) == 0 && ray_stack_short()))) {
         __VM->eval_depth--;
         return ray_error("limit", "eval depth exceeded");
     }
