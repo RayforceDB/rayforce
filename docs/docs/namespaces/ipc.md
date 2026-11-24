@@ -17,6 +17,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages. A c
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
 | [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. Given a live handle, that connection's view, transport included. |
+| [`.ipc.conns`](#ipc-conns) | nullary | — | Every live connection, one row each: peer, direction, transport, age, traffic. |
 | [`.ipc.transport`](#ipc-transport) | variadic | restricted | Read or set the process's transport policy: `auto`, `tcp`, `shm` or `rdma`. |
 
 ## `.ipc.open` { #ipc-open }
@@ -152,6 +153,34 @@ This is the only way to read the handle inside `on.sync` / `on.async` / `on.auth
 (.ipc.handle)
 ;; => -1
 ```
+
+## `.ipc.conns` { #ipc-conns }
+
+Signature: `(.ipc.conns)`. A table with one row for each live IPC connection of this process, in both directions: the clients a listener accepted and the connections `.ipc.open` made. Read-only, so a `-U` peer may call it.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `handle` | i64 | The connection's handle: what `.ipc.send`, `.ipc.close` and the hooks use. |
+| `peer` | str | The other end, `"host:port"` (`"[host]:port"` for IPv6). |
+| `inbound` | bool | Accepted here (`true`) or opened by `.ipc.open` (`false`). |
+| `transport` | sym | Where its bytes go: `tcp`, `shm` or `rdma`. |
+| `since` | timestamp | When it was established (greeted, and authenticated where that is required). |
+| `requests` | i64 | Requests the peer sent that were evaluated here, sync and async. |
+| `bytes_in`, `bytes_out` | i64 | Bytes of the frames received, and of those sent or queued: header and payload, as they went on the wire (compressed where they were). The greeting and a transport upgrade's records are not counted. |
+| `queued_bytes` | i64 | Its transmit backlog now (see [`.ipc.txlimit`](../storage/ipc.md#ipctxlimit)). |
+| `last_active` | timestamp | When a frame last went either way. |
+
+```lisp
+(.ipc.conns)
+;; handle peer              inbound transport since                         requests bytes_in bytes_out queued_bytes last_active
+;; 1      "127.0.0.1:53211" true    tcp       2026.11.24D20:09:44.270000000 12       1834     20992     0            2026.11.24D20:10:02.113000000
+;; 2      "10.0.0.7:5010"   false   tcp       2026.11.24D20:09:50.001000000 0        96       61        0            2026.11.24D20:09:50.004000000
+
+;; clients silent for a minute
+(select {from: (.ipc.conns) where: (and inbound (< last_active (- (timestamp 'global) 0D00:01:00)))})
+```
+
+Connections still in their greeting are not listed, nor is one that asked for the [status stream](../storage/ipc.md#status-stream): it has left the set.
 
 ## `.ipc.transport` { #ipc-transport }
 

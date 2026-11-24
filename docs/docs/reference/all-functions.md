@@ -70,10 +70,10 @@ Listed from `src/lang/eval.c` in this checkout. The categorized reference below 
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.ts`, `.sys.timeit`,
-`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.conns`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
-`.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
+`.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `.sys.loop`, `.sys.activity`, `.sys.cpu`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `.emb.knn`, `.emb.hnsw.build`, `.emb.ann`, `.emb.encode`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
@@ -724,6 +724,9 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
 | `.sys.join.par.min` | variadic | restricted | Read or set the probe-side rows from which a hash join's probe goes parallel; returns the value in effect | `(.sys.join.par.min 65536)` |
 | `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
+| `.sys.loop` | nullary | — | Poll-loop time: working vs waiting, utilisation over 1/10/60 s, the longest unit of work. See [`.sys.loop`](../namespaces/sys.md#sys-loop) | `(get (.sys.loop) 'util-10s)` → `0.35` |
+| `.sys.activity` | nullary | — | What the main thread is running: state, connection, since when, source text. See [`.sys.activity`](../namespaces/sys.md#sys-activity) | `(get (.sys.activity) 'state)` → `'repl` |
+| `.sys.cpu` | nullary | — | Process CPU time, resident and peak memory, threads, cores, cgroup CPU quota. See [`.sys.cpu`](../namespaces/sys.md#sys-cpu) | `(get (.sys.cpu) 'rss-bytes)` |
 | `.idx.uses` | unary | — | Per-column count of index hits since the previous call; the first call arms the counter. See [`.idx.uses`](../namespaces/idx.md#idx-uses) | `(.idx.uses t)` → `{a:1}` |
 | `.repl.complete` | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix. See [`.repl.complete`](../namespaces/repl.md#repl-complete) | `(.repl.complete "xas")` → `[xasc]` |
 
@@ -808,6 +811,7 @@ IPC for connecting to remote Rayforce instances. Uses binary serialization on th
 | `.ipc.send` | variadic | restricted | Send a value over an IPC handle (sync request); optional third argument is a deadline in ms | `(.ipc.send h "(sum (til 100))")`, `(.ipc.send h "(sum (til 100))" 2000)` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's view (`inbound`, `transport`, `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
 | `.ipc.auto_journal_eval` | variadic | — | `true` while evaluating inside an auto-journaled IPC request (the request itself is the journal entry and `.log.write` refuses), `false` otherwise | `(if (.ipc.auto_journal_eval) null (.log.write x))` |
+| `.ipc.conns` | nullary | — | Table of live connections: `handle`, `peer`, `inbound`, `transport`, `since`, `requests`, `bytes_in`, `bytes_out`, `queued_bytes`, `last_active`. See [`.ipc.conns`](../namespaces/ipc.md#ipc-conns) | `(count (.ipc.conns))` |
 | `.ipc.txlimit` | variadic | restricted | Transmit backlog policy: `()` reads the process default, `(bytes [frames])` sets it, `(h bytes frames)` overrides one connection; a frame that would exceed a connection's limit is refused and a multicast subscriber is dropped and closed | `(.ipc.txlimit 8388608 64)` |
 | `.ipc.transport` | variadic | restricted | Transport policy: `()` reads it, `('auto|'tcp|'shm|'rdma)` sets what this process offers as a server and asks for as a client (`auto`: shared memory on one host, RDMA across hosts, else TCP) | `(.ipc.transport 'tcp)` |
 | `.mc.sub` | variadic | — | Subscribe the calling connection to a multicast topic (symbol or string); the filter argument must be null. Returns the sequence number the next publication will carry. See [Multicast topics](../storage/ipc.md#multicast) | `(.ipc.send h (list '.mc.sub "depth" null))` |

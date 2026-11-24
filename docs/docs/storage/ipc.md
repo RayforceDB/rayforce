@@ -260,6 +260,65 @@ A publication is serialized once for each distinct compression policy among the 
 | `tx_limit_bytes`, `tx_limit_frames` | The backlog policy in force. |
 | `tx_hwm_bytes` | The largest backlog any connection has held. |
 
+## Status stream { #status-stream }
+
+A server evaluates one request at a time and reads no socket while it does, so it cannot be asked what it is doing while it is busy: the question waits behind the request. The status stream is the way around that. A client asks once; from then on a separate thread of the server writes a small status frame on that connection at a fixed interval, whatever the main thread is doing. It is meant for a pooler or a monitor that has to see, from outside, which of several instances is busy, with what, and since when.
+
+**Asking.** After the normal [handshake](#handshake) (and credentials, where the server requires them) the client sends one frame: the standard 16-byte header with `msgtype` 4 and `flags` 0, and a 4-byte payload, a little-endian `u32`: the interval it wants, in milliseconds. The server brings it into 100 to 10000.
+
+**What happens to the connection.** It stops being an IPC connection. The server takes it out of its poll loop: it reads nothing more from it, evaluates nothing sent on it, and no longer lists it in [`.ipc.conns`](../namespaces/ipc.md#ipc-conns). `.ipc.on.close` runs for it once, at that moment, as for a connection that closed (so a server that counts connections in `on.open`/`on.close` stays right), and not again when the stream ends. Use a connection of its own for the stream and others for requests.
+
+**Frames.** The first comes at once, then one every interval. Each is the standard header (`msgtype` 4, `flags` 0, never compressed) and this payload, little-endian:
+
+| Offset | Type | Field | Meaning |
+|---|---|---|---|
+| 0 | u8 | version | Layout version, `1`. |
+| 1 | u8 | state | `0` idle; `1` running a request from a connection; `2` running other work (a REPL line, a timer callback, a connection hook). |
+| 2 | u16 | query_len | Bytes of text after the fixed part, 0 to 256. |
+| 4 | u32 | pid | The server's process id. |
+| 8 | i64 | now | When the frame was made: nanoseconds since the Unix epoch. |
+| 16 | i64 | busy_since | When the running work started, same clock; `0` when idle. It does not change while one piece of work runs, so it also tells two requests apart. |
+| 24 | u64 | loop_busy_ns | Time the main loop has spent working, cumulative, the work in progress included. |
+| 32 | u64 | loop_total_ns | Working and waiting together. Both count from the loop's first wait. Utilisation between two frames is the ratio of the two differences. |
+| 40 | u64 | cpu_user_ns | CPU time of the process in user mode. |
+| 48 | u64 | cpu_sys_ns | And in kernel mode. |
+| 56 | u64 | rss_bytes | Resident memory. |
+| 64 | u64 | heap_bytes | Anonymous memory the engine's allocator has committed: `anon-committed` of [`.sys.mem`](../namespaces/sys.md#sys-mem), the figure the budget below is compared with. |
+| 72 | u64 | mem_limit_bytes | The `-m` budget; `0` when none was given. |
+| 80 | u32 | conns | Live IPC connections, inbound and outbound together. |
+| 84 | u32 | workers | Threads of the execution pool, main included. |
+| 88 | u32 | cores | CPUs the process may run on. |
+| 92 | u32 | reserved | `0`. |
+| 96 | bytes | query | The text of what runs, `query_len` bytes, not NUL-terminated: the request's source cut at 256 bytes (an expression is rendered as the [query log](../namespaces/sys.md#sys-querylog) renders it), `timer <id>` for a timer callback, the hook's name for a hook. |
+
+So a frame is 112 to 368 bytes. `workers`, `cores` and `mem_limit_bytes` are read when a stream is opened; the rest is read for each frame.
+
+**Ending.** The client closes the connection; the server notices at its next frame. The server never waits for a reader: a connection whose socket cannot take a whole frame at once (a reader that stopped reading, or is slower than its interval for long enough to fill the socket's buffer) is closed. What the client sends after its request is discarded. A server serves at most 64 streams; one asked for past that is closed.
+
+**Refusals.** The connection is closed, with no reply, when the request's payload is not 4 bytes, when the connection has moved off TCP (see [Transports](#transports)), when frames are still queued to it, or on Windows, where the stream is not implemented. On a server that requires credentials, a request sent before them is not a frame at all: its bytes are read as credentials and refused as such.
+
+**Restricted servers.** A `-U` connection may ask: the stream only reads.
+
+**Cost.** With no stream open the server pays for none of this beyond the clock reads of [`.sys.loop`](../namespaces/sys.md#sys-loop). With one open, each request sent as an expression rather than as a string is rendered to text when it starts.
+
+```python
+import socket, struct
+s = socket.create_connection(("127.0.0.1", 5000))
+s.sendall(bytes([4, 0])); s.recv(2)                           # handshake, wire version 4
+s.sendall(struct.pack("<IBBBBq", 0xcefadefa, 4, 0, 0, 4, 4)   # header: msgtype 4, 4-byte payload
+          + struct.pack("<I", 500))                           # a frame every 500 ms
+# then, repeatedly: 16 bytes of header, then `size` bytes:
+# struct.unpack("<BBHIqqQQQQQQQIIII", payload[:96]); text = payload[96:96 + query_len]
+```
+
+## Pinned connections { #pinned }
+
+A pooler that lends one server connection to several clients in turn must not do so with a connection the server holds state for. The server says which those are: every **response** frame to such a connection has bit 4 (`0x10`, `RAY_IPC_FLAG_PINNED`) set in the header's `flags`.
+
+Today one thing pins a connection: a [multicast](#multicast) subscription. From the response to the `.mc.sub` itself until the response to the `.mc.unsub` that removes its last subscription, every response on that connection carries the bit; publications reach it as async frames, which would otherwise go to whichever client held the connection. The bit follows the state: once clear, the connection may be shared again. Only responses carry it; async frames and status frames do not.
+
+Clients that do not pool need not look at it: the engine's own client ignores every flag bit it does not test.
+
 ## Connection Hooks
 
 The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `(.ipc.auto_journal_eval)` answers `true` while the current evaluation runs inside an auto-journaled request (a sync one, or an async one while the [posts switch](../namespaces/log.md#log-posts) is on), where the request is already the journal entry and handlers must not `.log.write` frames of their own. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
@@ -331,9 +390,9 @@ Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, follow
 |---|---|---|---|
 | 0 | 4 bytes | `prefix` | Magic bytes `0xcefadefa` — identifies Rayforce binary data |
 | 4 | 1 byte | `version` | Wire-format version (`RAY_SERDE_WIRE_VERSION`, currently `4`). Decoupled from `RAY_VERSION_MAJOR`. Readers accept version 3 for existing serialized objects and journals; live IPC peers still require an exact handshake match before exchanging frames. |
-| 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). |
+| 5 | 1 byte | `flags` | Bit 0 (`0x01`): compressed (0 = no, 1 = yes). Bit 1 (`0x02`, `RAY_IPC_FLAG_RESTRICTED`): journal-only — records that a persisted frame arrived on a `-U` restricted connection so replay re-imposes the restriction; ignored on the live wire. Bit 2 (`0x04`, `RAY_IPC_FLAG_VERBOSE`): request that the server capture the eval's stdout/stderr and return `[captured_str, result]` (used by the remote-REPL wrapper). Bit 3 (`0x08`, `RAY_IPC_FLAG_CANCEL_SEEN`): on a reply over a shared-memory or RDMA connection, the server has taken a cancel byte since its last reply (see the transports above). Bit 4 (`0x10`, `RAY_IPC_FLAG_PINNED`): set by a server on a response to a connection that holds state a pooler must not share; see [Pinned connections](#pinned). A reader ignores the bits it does not know. |
 | 6 | 1 byte | `endian` | Endianness: `0` = little-endian |
-| 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)) |
+| 7 | 1 byte | `msgtype` | Message type: `0` = async, `1` = sync, `2` = response, `3` = upgrade (a transport record, never evaluated or journaled; see [Transports](#transports)), `4` = status (the request for, and the frames of, the [status stream](#status-stream); in a journal file the same number marks a journal note, which is never sent) |
 | 8 | 8 bytes | `size` | Payload size in bytes (`int64`) |
 
 The corresponding C struct:
@@ -342,9 +401,10 @@ The corresponding C struct:
 typedef struct ray_ipc_header_t {
     uint32_t prefix;     /* RAY_SERDE_PREFIX (0xcefadefa) */
     uint8_t  version;    /* RAY_SERDE_WIRE_VERSION (currently 4) */
-    uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose */
+    uint8_t  flags;      /* bit0 compressed, bit1 restricted (journal), bit2 verbose,
+                            bit3 cancel seen, bit4 pinned */
     uint8_t  endian;     /* 0 = little-endian */
-    uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response, 3 = upgrade */
+    uint8_t  msgtype;    /* 0 = async, 1 = sync, 2 = response, 3 = upgrade, 4 = status */
     int64_t  size;       /* payload size in bytes */
 } ray_ipc_header_t;
 ```

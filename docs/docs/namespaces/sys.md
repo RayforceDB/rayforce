@@ -13,6 +13,9 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.build`](#sys-build) | nullary | — | Version + build date as a dict. |
 | [`.sys.info`](#sys-info) | nullary | — | Host and process facts: cores, page size, total memory, pool size, pid, hostname. |
 | [`.sys.mem`](#sys-mem) | nullary | — | Allocator statistics. |
+| [`.sys.loop`](#sys-loop) | nullary | — | How the poll loop spends its time: working or waiting, utilisation over recent windows. |
+| [`.sys.activity`](#sys-activity) | nullary | — | What the main thread is running, since when, and for whom. |
+| [`.sys.cpu`](#sys-cpu) | nullary | — | The process as the OS counts it: CPU time, resident memory, threads, CPU quota. |
 | [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
 | [`.sys.profile`](#sys-profile) | nullary | — | Per-call-site profile of Rayfall code (file, line, function) as a table. |
 | [`.sys.profile.enable`](#sys-profile-enable) | variadic | restricted | Toggle the call profiler. |
@@ -169,6 +172,77 @@ symbol table where it found it.
 ;;     window-perpart-runs: 0, join-perpart-runs: 0,
 ;;     sym-count: 424, sym-bytes: 30336}
 ```
+
+## `.sys.loop` { #sys-loop }
+
+Signature: `(.sys.loop)`. A server does everything on one thread: it waits for a request, a timer or a line of input, does the work, and waits again. `.sys.loop` says how that thread's time divides between the two. Returns a dict:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `busy-ns` | i64 | Time spent working (reading requests, evaluating them, firing timers), cumulative. |
+| `idle-ns` | i64 | Time spent waiting for something to do, cumulative. |
+| `total-ns` | i64 | `busy-ns + idle-ns`. The clock starts when the loop first waits, not at process start: a start-up script is not in it. |
+| `util` | f64 | `busy-ns / total-ns`, 0 to 1. |
+| `util-1s`, `util-10s`, `util-60s` | f64 | The same over the last 1, 10 and 60 seconds (over the loop's age while it is younger than the window). Accurate to about 50 ms of work per window. |
+| `iterations` | i64 | Times the loop has waited. |
+| `work-count` | i64 | Units of work finished: requests, REPL lines, timer callbacks, connection hooks run outside a request. |
+| `work-max-ns` | i64 | The longest of them. On a server this is the longest any client has had to wait behind one request. |
+| `streams` | i64 | [Status streams](../storage/ipc.md#status-stream) being served. |
+
+```lisp
+(.sys.loop)
+;; => {busy-ns: 809431000, idle-ns: 1512978000, total-ns: 2322409000,
+;;     util: 0.35, util-1s: 0.81, util-10s: 0.35, util-60s: 0.35,
+;;     iterations: 8, work-count: 2, work-max-ns: 705383000, streams: 1}
+```
+
+A `util-60s` near 1 means the server has no time left between requests: clients queue behind each other. Time a request spends waiting inside its own evaluation (a `.ipc.send` to another process, `.time.sleep`) counts as work: the loop serves nobody else meanwhile.
+
+The counters cost a clock read before and after each wait and are always on. Because the server answers `.sys.loop` only between requests, it cannot be asked while a long request runs; for that, see the [status stream](../storage/ipc.md#status-stream).
+
+## `.sys.activity` { #sys-activity }
+
+Signature: `(.sys.activity)`. What the main thread is running. Returns a dict:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `state` | sym | `idle`; `ipc`, a request from a connection; `repl`, a line typed or piped in; `timer`, a timer callback; `hook`, `.ipc.on.open` / `.ipc.on.close` / `.ipc.on.auth` run outside a request. |
+| `handle` | i64 | The connection (`ipc`, `hook`) or the timer's id (`timer`); `-1` otherwise. |
+| `since` | timestamp | When it started; null when idle. |
+| `elapsed-ms` | f64 | For how long it has run. |
+| `query` | str | Its source text, cut at 256 bytes. A request sent as a string has its text here always. One sent as an expression (a list) has it only while the [query log](#sys-querylog) is on or a [status stream](../storage/ipc.md#status-stream) is open (rendering it costs an allocation per request, paid only for a reader), and is otherwise `""`. |
+| `conns-in`, `conns-out` | i64 | Live IPC connections accepted by this process, and opened from it. |
+| `op`, `phase`, `rows-done`, `rows-total` | str, str, i64, i64 | What the running query last reported as progress. Progress is tracked where there is a terminal to show it (the REPL); on a server these are `""` and `0`. |
+
+```lisp
+(.ipc.send h "(.sys.activity)")
+;; => {state: ipc, handle: 1, since: 2026.11.24D20:09:44.276383000,
+;;     elapsed-ms: 0.029, query: "(.sys.activity)", conns-in: 1, conns-out: 0,
+;;     op: "", phase: "", rows-done: 0, rows-total: 0}
+```
+
+Called in a request it describes that request, so its use from a client is limited to "what does the server think I am". It is the same record a [status stream](../storage/ipc.md#status-stream) carries to a reader outside while the request runs, which is where "what is the server doing now" is answered. Work started inside other work is not shown; the outermost is: a request the server evaluates while one of its own `.ipc.send` calls waits for a reply leaves the record naming the first. A script run with `-f` before the loop starts is not tracked: `state` is `idle` there.
+
+## `.sys.cpu` { #sys-cpu }
+
+Signature: `(.sys.cpu)`. The process as the operating system counts it. Returns a dict:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `user-ns`, `system-ns` | i64 | CPU time used in user and in kernel mode, all threads, since the process started. |
+| `rss-bytes` | i64 | Resident memory now. |
+| `rss-peak-bytes` | i64 | The most it has been. |
+| `threads` | i64 | Threads of the process. |
+| `cores` | i64 | CPUs it may run on, as [`.sys.info`](#sys-info). |
+| `cpu-quota` | i64 | Its cgroup CPU quota in millicpus (`docker --cpus 1.5` is `1500`); `0` when none is set. |
+
+```lisp
+(.sys.cpu)
+;; => {user-ns: 3024000, system-ns: 3377000, rss-bytes: 4603904,
+;;     rss-peak-bytes: 4603904, threads: 10, cores: 10, cpu-quota: 0}
+```
+
+CPU use over an interval is the difference of two readings: `(user-ns + system-ns)` grew by 2 s in 1 s of wall time means two cores were busy. On Windows `rss-bytes`, `rss-peak-bytes` and `threads` read `0`.
 
 ## `.sys.prof` { #sys-prof }
 

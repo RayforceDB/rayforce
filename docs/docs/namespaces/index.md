@@ -22,7 +22,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
 | [`.parquet.*`](parquet.md) | Parquet metadata, reads, lazy queries, callbacks, and native imports. |
 | [`.repl.*`](repl.md) | Interactive REPL control — attach the local REPL to a remote server. |
-| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, profile, querylog, gc, exec, listen, timeit, env, cmd. |
+| [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, loop, activity, cpu, prof, profile, querylog, gc, exec, listen, timeit, env, cmd. |
 | [`.time.*`](time.md) | Monotonic clock, timer scheduler and sleep. |
 
 ## Restricted-mode summary
