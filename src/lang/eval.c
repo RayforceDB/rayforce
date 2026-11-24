@@ -32,6 +32,7 @@
 #include "lang/parse.h"
 #include "core/types.h"
 #include "ops/ops.h"
+#include "ops/walkmemo.h"
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
@@ -1728,7 +1729,42 @@ static ray_t* tempint_arith(uint16_t dag_opcode, ray_t* left, ray_t* right,
     return out;
 }
 
+/* An element-wise op over a value that holds one list at several positions
+ * maps that list once (#1627): the result for a shared list (and the
+ * other operand, and the op) is kept for the rest of the outermost map and
+ * reused, so the result shares as the operand does and the work is linear
+ * in the distinct lists, not in the paths through them.  The memo holds a
+ * reference to each kept result and drops it when the outermost map ends. */
+static _Thread_local ray_walk_memo_t g_map_memo;
+static inline bool map_memo_wanted(const ray_t* x) {
+    return x && RAY_UNLIKELY(ray_wm_reused(x)) && !RAY_IS_ERR(x) &&
+           (x->type == RAY_LIST || x->type == RAY_DICT || x->type == RAY_TABLE);
+}
+typedef struct { ray_binary_fn fn2; ray_unary_fn fn1; uint16_t op; ray_t* l; ray_t* r; } map_ctx_t;
+
+static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right);
+static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary_fn fn, ray_t* arg);
+static ray_t* map_binary_run(void* p) {
+    map_ctx_t* c = p;
+    return atomic_map_binary_op_c(c->fn2, c->op, c->l, c->r);
+}
+static ray_t* map_unary_run(void* p) {
+    map_ctx_t* c = p;
+    return atomic_map_unary_c(c->fn1, c->l);
+}
+__attribute__((noinline))
+static ray_t* atomic_map_binary_op_memo(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    /* user-space pointers are below 2^48: the opcode fits above fn */
+    uint64_t tag = (uint64_t)(uintptr_t)fn ^ ((uint64_t)dag_opcode << 48);
+    map_ctx_t c = { fn, NULL, dag_opcode, left, right };
+    return ray_wm_result(&g_map_memo, left, right, tag, map_binary_run, &c);
+}
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    if (RAY_UNLIKELY(map_memo_wanted(left) || map_memo_wanted(right)))
+        return atomic_map_binary_op_memo(fn, dag_opcode, left, right);
+    return atomic_map_binary_op_c(fn, dag_opcode, left, right);
+}
+static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
         (left->type == RAY_DICT || right->type == RAY_DICT ||
                             left->type == RAY_TABLE || right->type == RAY_TABLE))
@@ -2435,7 +2471,10 @@ static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
  * a nested collection maps to a collection of the same shape. */
 typedef struct { ray_t* x; int64_t i; } nest_frame_t;
+static _Thread_local ray_walk_memo_t g_nest_memo;
 bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
+    ray_walk_memo_t* m = NULL;   /* the thread-local memo's address only when wanted */
+    bool own = false;
     if (!x || RAY_IS_ERR(x) || (x->type != RAY_LIST && x->type != RAY_DICT)) return limit < 1;
     nest_frame_t local[64];
     nest_frame_t* st = local;
@@ -2458,6 +2497,15 @@ bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
             continue;
         }
         if (top + 1 > limit) { deeper = true; break; }
+        /* A shared container already walked from this depth or deeper
+         * holds nothing deeper from here (#1627): not walked again. */
+        if (RAY_UNLIKELY(ray_wm_reused(c))) {
+            if (!m) m = &g_nest_memo;
+            if (!m->active) own = ray_wm_begin(m);
+            uint64_t at;
+            if (m->active && ray_wm_get(m, c, NULL, 0, &at) && at >= (uint64_t)(top + 1)) continue;
+            if (m->active) ray_wm_put(m, c, NULL, 0, (uint64_t)(top + 1));
+        }
         if (top == cap) {
             nest_frame_t* grown = (nest_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown);
             if (!grown) { deeper = true; break; }   /* cannot measure it: refuse */
@@ -2469,10 +2517,20 @@ bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
         st[top++] = (nest_frame_t){ c, 0 };
     }
     if (st != local) ray_free_raw(st);
+    if (own) ray_wm_end(m);
     return deeper;
 }
 
+__attribute__((noinline)) static ray_t* atomic_map_unary_memo(ray_unary_fn fn, ray_t* arg) {
+    uint64_t tag = (uint64_t)(uintptr_t)fn | (UINT64_C(1) << 63);   /* apart from a binary op's */
+    map_ctx_t c = { NULL, fn, 0, arg, NULL };
+    return ray_wm_result(&g_map_memo, arg, NULL, tag, map_unary_run, &c);
+}
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
+    if (RAY_UNLIKELY(map_memo_wanted(arg))) return atomic_map_unary_memo(fn, arg);
+    return atomic_map_unary_c(fn, arg);
+}
+static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
     /* A list's cells are mapped through here again: one C frame per level
      * of nesting, and a value can be nested arbitrarily deep at run time
@@ -3027,6 +3085,29 @@ static bool table_widens_atom(int8_t t) {
 }
 
 /* (table [col_names] (list col1 col2 ...)) — build a RAY_TABLE */
+/* Do the string atoms of a would-be string column, some held by several
+ * cells, copy more than RAY_DUP_BUDGET bytes of text again (#1627)? */
+static bool table_str_repeats(ray_t** cells, int64_t n) {
+    ray_walk_memo_t m;
+    memset(&m, 0, sizeof m);
+    m.active = true;
+    uint64_t dup = 0;
+    bool over = false;
+    for (int64_t j = 0; j < n && !over; j++) {
+        ray_t* c = cells[j];
+        if (!c || c->type != -RAY_STR || c->rc == 1) continue;
+        uint64_t seen;
+        if (ray_wm_get(&m, c, NULL, 0, &seen)) {
+            dup += ray_str_len(c);
+            over = dup > RAY_DUP_BUDGET;
+        } else {
+            ray_wm_put(&m, c, NULL, 0, 1);
+        }
+    }
+    ray_wm_end(&m);
+    return over;
+}
+
 ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
     ray_t *_bxn = NULL, *_bxc = NULL;
     names = unbox_vec_arg(names, &_bxn);
@@ -3162,6 +3243,13 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                    col_type != RAY_TIME && col_type != RAY_TIMESPAN) {
             col_type = RAY_I64; /* unsupported first atom: report element mismatch below */
         }
+
+        /* A string column copies each cell's text: a string atom held by
+         * many cells is written out again for each (#1627).  Up to 1 GiB of
+         * such copies, as for every writer that writes a value out in full. */
+        if (col_type == RAY_STR && table_str_repeats(row_elems, nrows))
+            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc);
+              return ray_error("limit", "table: a string column repeats shared strings beyond 1 GiB of extra data"); }
 
         ray_t* col_vec = ray_vec_new(col_type, nrows);
         if (RAY_IS_ERR(col_vec))

@@ -6,7 +6,7 @@
 ;; key comparison and hashing (distinct, group, except, union) are exact at
 ;; any depth; ser refuses past 512 levels, the depth de reads.
 (set ok (fn [f] (try (do (f) 'value) (fn [e] (get e 'code)))))
-(set walks (fn [] (list (ok (fn [] (count (format "%" L)))) (ok (fn [] (count (repr L)))) (ok (fn [] (== L L2))) (ok (fn [] (!= L L2))) (ok (fn [] (< L L2))) (ok (fn [] (+ L 1))) (ok (fn [] (neg L))) (ok (fn [] (not L))) (ok (fn [] (in L (list L2)))) (ok (fn [] (as 'I64 L))))))
+(set walks (fn [] (list (ok (fn [] (count (format "%" L)))) (ok (fn [] (count (repr L)))) (ok (fn [] (== L L2))) (ok (fn [] (!= L L2))) (ok (fn [] (< L L2))) (ok (fn [] (+ L 1))) (ok (fn [] (neg L))) (ok (fn [] (not L))) (ok (fn [] (and L L2))) (ok (fn [] (or L 0))) (ok (fn [] (in L (list L2)))) (ok (fn [] (as 'I64 L))))))
 (set safe (fn [rs] (all (map (fn [r] (in r [value limit])) rs))))
 
 ;; 60,000 levels
@@ -80,6 +80,9 @@
 (in (ok (fn [] (identical D D2))) [value limit]) -- true
 (in (ok (fn [] (identical T T2))) [value limit]) -- true
 (all (map (fn [r] (in r [value limit])) (pmap (fn [p] (ok (fn [] (identical (first p) (last p))))) (list (list L L2) (list D D2))))) -- true
+;; and / or map a list's cells through themselves too (#1627)
+(all (map (fn [r] (in r [value limit])) (pmap (fn [p] (ok (fn [] (and (first p) (last p))))) (list (list L L2) (list L2 L))))) -- true
+(all (map (fn [r] (in r [value limit])) (pmap (fn [x] (ok (fn [] (or x 0)))) (list L L2)))) -- true
 (set L 0)
 (set L2 0)
 (set D 0)

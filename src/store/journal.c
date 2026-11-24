@@ -971,6 +971,8 @@ ray_err_t ray_journal_open(const char* base, ray_journal_mode_t mode) {
 static ray_err_t journal_close_fp(void);
 
 ray_err_t ray_journal_close(void) {
+    ray_t* why = ray_journal_take_error();   /* a snapshot error nobody took */
+    if (why) ray_error_free(why);
     ray_err_t r = journal_close_fp();
     journal_unlock();
     return r;
@@ -1167,7 +1169,17 @@ ray_err_t ray_journal_roll(void) {
     return open_log_for_append();
 }
 
+/* Why the last snapshot failed, when the serializer gave a reason (its
+ * code and message): .log.snapshot reports it instead of a bare code. */
+static ray_t* g_snap_err;
+ray_t* ray_journal_take_error(void) {
+    ray_t* e = g_snap_err;
+    g_snap_err = NULL;
+    return e;
+}
+
 ray_err_t ray_journal_snapshot(void) {
+    if (g_snap_err) { ray_error_free(g_snap_err); g_snap_err = NULL; }
     if (!g_journal.fp) return RAY_ERR_DOMAIN;
 
     /* Enumerate ONLY user-defined globals (slots last written via
@@ -1194,6 +1206,11 @@ ray_err_t ray_journal_snapshot(void) {
      * The probe runs with the marks kept, as the save below does. */
     int32_t kept = 0;
     bool probe_marks = ray_serde_keep_marks(true);
+    /* The snapshot is the server's own data, written whole: a value bound
+     * under several names is written once per name, as it always was, and
+     * not charged to the budget of repeated output (#1627); the probe walks
+     * it the same way. */
+    bool charge = ray_serde_charge_repeats(false);
     for (int32_t i = 0; i < listed; i++) {
         if (ray_serde_holds_handle(vals_buf[i])) {
             ray_t* ks = ray_sym_str(sym_ids[i]);   /* borrowed */
@@ -1210,6 +1227,7 @@ ray_err_t ray_journal_snapshot(void) {
         kept++;
     }
     ray_serde_keep_marks(probe_marks);
+    (void)ray_serde_charge_repeats(charge);
 
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, kept);
     if (!keys || RAY_IS_ERR(keys)) {
@@ -1310,7 +1328,9 @@ ray_err_t ray_journal_snapshot(void) {
      * lambdas keep their .sys.trust marks and stored request arguments
      * their literal-fallback marks, which recovery restores. */
     bool prev_marks = ray_serde_keep_marks(true);
-    ray_err_t e = ray_obj_save(snap, qdb_tmp);
+    bool prev_charge = ray_serde_charge_repeats(false);
+    ray_err_t e = ray_obj_save_ex(snap, qdb_tmp, &g_snap_err);
+    (void)ray_serde_charge_repeats(prev_charge);
     ray_serde_keep_marks(prev_marks);
     ray_release(snap);
     if (e != RAY_OK) {

@@ -288,6 +288,8 @@ The result is always a `U8` byte vector containing the IPC header followed by th
 
 A value nested deeper than 512 levels (a list inside a list, 513 times) is not serialized: `ser` fails with `limit`, because 512 is the nesting `de` reads. A server whose reply is such a value answers with that error, and the connection stays open.
 
+The wire format writes a value out in full, so each repeat of a shared part is written again. A value may repeat shared parts up to 1 GiB of extra output: past that, `ser` fails with `limit` before writing anything, and a reply that is such a value is that error (see [Values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)).
+
 ## Deserialization with `de`
 
 The `de` builtin reconstructs a value from its binary representation. Compose it with `ser` for a perfect round-trip:
@@ -444,6 +446,7 @@ The serialization functions are declared in `src/store/serde.h`:
 
 - **No streaming** — the entire object is serialized at once; there is no chunked or incremental mode
 - **Nesting depth** — a value nested deeper than 512 levels cannot be sent or received (`limit` when sending, `domain` when reading one)
+- **Repeated parts** — a value whose repeated shared parts would add more than 1 GiB of output cannot be sent (`limit`)
 - **Single-threaded server** — the server processes queries sequentially on the main thread. Long-running queries block other clients.
 - **Plaintext transport** — data travels unencrypted over TCP. Use on trusted networks or tunnel through SSH for security.
 - **Shared secret only** — authentication uses a single password for all clients (`-u`/`-U`). There is no per-user access control.

@@ -48,7 +48,7 @@ Compressed F32/F64 writes and whole-column materialization require default FP co
 
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 
-Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / too long; a parted column built through the C API whose segments come to a different row count than the table's, which Rayfall cannot produce), `nyi` (a parted column of a type without a streamed form, such as a list column; nothing is written), and any `io`/`oom`/`corrupt` error code surfaced by the splayed writer.
+Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / too long; a parted column built through the C API whose segments come to a different row count than the table's, which Rayfall cannot produce), `nyi` (a parted column of a type without a streamed form, such as a list column; nothing is written), `limit` (a list column nested deeper than 512 levels, or one that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output; nothing is written), and any `io`/`oom`/`corrupt` error code surfaced by the splayed writer.
 
 ```lisp
 (set t (table [city temp rain]

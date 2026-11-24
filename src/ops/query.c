@@ -62,6 +62,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <assert.h>
+#include "ops/walkmemo.h"
 
 /* Debug builds check at every query's exit that its result holds no
  * private id (#1462; fv_holds_private, below). */
@@ -20626,8 +20627,36 @@ static ray_t* fv_strip_private(ray_t* tbl) {
  * column name or cell, a dict key or value, a list element, a lambda's
  * code, constants or captures (recursively, `depth` bounded)?  A lazy
  * value's graph is not walked: this check does not cover one. */
+static inline bool fv_holds_private_c(ray_t* v, int depth);
+/* A shared container met again at the same depth was found clean there
+ * (a hit ends the walk), and is not walked twice (#1627). */
+static _Thread_local ray_walk_memo_t g_private_memo;
+__attribute__((noinline)) static bool fv_holds_private_memo(ray_t* v, int depth) {
+    ray_walk_memo_t* m = &g_private_memo;
+    const void* skip = m->skip;
+    bool hit = false;
+    m->skip = v;   /* fv_holds_private takes it into its own body */
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        hit = fv_holds_private(v, depth);
+        ray_wm_end(m);
+    } else {
+        uint64_t met;
+        if (!ray_wm_get(m, v, NULL, (uint64_t)depth, &met)) {
+            ray_wm_put(m, v, NULL, (uint64_t)depth, 1);
+            hit = fv_holds_private(v, depth);
+        }
+    }
+    m->skip = skip;
+    return hit;
+}
 static bool fv_holds_private(ray_t* v, int depth) {
     if (!v || RAY_IS_ERR(v) || depth > 64) return false;
+    if (RAY_UNLIKELY(v->type >= 0 && ray_wm_reused(v)) && v != g_private_memo.skip)
+        return fv_holds_private_memo(v, depth);
+    return fv_holds_private_c(v, depth);
+}
+static inline bool fv_holds_private_c(ray_t* v, int depth) {
     if (v->type == -RAY_SYM) return ray_sym_is_private(v->i64);
     if (v->type == RAY_SYM) {
         for (int64_t i = 0; i < v->len; i++)
@@ -20652,8 +20681,14 @@ static bool fv_holds_private(ray_t* v, int depth) {
                fv_holds_private(LAMBDA_CONSTS(v), depth + 1) ||
                fv_holds_private(LAMBDA_CLOSURE(v), depth + 1);
     if (v->type == RAY_LIST)
-        for (int64_t i = 0; i < v->len; i++)
-            if (fv_holds_private(((ray_t**)ray_data(v))[i], depth + 1)) return true;
+        for (int64_t i = 0; i < v->len; i++) {
+            ray_t* c = ((ray_t**)ray_data(v))[i];
+            if (c && c->type < 0) {   /* an atom: decided here, without a call */
+                if (c->type == -RAY_SYM && ray_sym_is_private(c->i64)) return true;
+                continue;
+            }
+            if (fv_holds_private(c, depth + 1)) return true;
+        }
     return false;
 }
 #endif

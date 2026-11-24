@@ -45,6 +45,7 @@
  */
 #include "io/json.h"
 #include "lang/internal.h"
+#include "ops/walkmemo.h"       /* ray_dup_t */
 #include "lang/readval.h"      /* ray_read_limits_t, ray_read_limits_apply */
 #include "lang/format.h"       /* ray_type_name, ray_fmt */
 #include "ops/internal.h"      /* pool_cancelled, RAY_IS_PARTED */
@@ -1397,6 +1398,7 @@ typedef struct {
     size_t len, cap;
     ray_t* err;
     size_t depth;
+    ray_dup_t dup;   /* what is written again for shared parts (#1627) */
 } jw_t;
 
 static bool jw_put(jw_t* w, const char* s, size_t n) {
@@ -1606,7 +1608,9 @@ static bool jw_key(jw_t* w, ray_t* keys, int64_t i) {
                            k ? jw_type_name(k->type) : "null");
         return false;
     }
-    jw_t sub = { NULL, 0, 0, NULL, w->depth };
+    jw_t sub;   /* the key's text, untracked (a zeroed tracker) */
+    memset(&sub, 0, sizeof sub);
+    sub.depth = w->depth;
     bool ok = k ? jw_value(&sub, k) : jw_cell(&sub, keys, i);
     if (!ok) { w->err = sub.err; if (sub.p) ray_free_raw(sub.p); return false; }
     if (sub.len == 4 && memcmp(sub.p, "null", 4) == 0) ok = JW_LIT(w, "\"\"");
@@ -1698,7 +1702,31 @@ static bool jw_rows(jw_t* w, ray_t* t, ray_t* vt) {
     return ok;
 }
 
+static bool jw_value_c(jw_t* w, ray_t* v);
+/* JSON writes a value out in full, a shared part again each time it is
+ * met: the bytes written again are counted as they are written, and past
+ * RAY_DUP_BUDGET the write stops with limit (#1627, ops/walkmemo.h). */
+__attribute__((noinline)) static bool jw_value_watched(jw_t* w, ray_t* v);
 static bool jw_value(jw_t* w, ray_t* v) {
+    if (RAY_LIKELY(!ray_dup_watch(&w->dup, v))) return jw_value_c(w, v);
+    return jw_value_watched(w, v);
+}
+__attribute__((noinline)) static bool jw_value_watched(jw_t* w, ray_t* v) {
+    bool opened = ray_dup_enter(&w->dup, v, w->len);
+    if (RAY_UNLIKELY(ray_dup_over(&w->dup, w->len))) {   /* the lower bound refused it */
+        ray_dup_leave(&w->dup, opened, w->len);
+        w->err = ray_error("limit", ".json.format: value repeats shared parts beyond 1 GiB of extra output");
+        return false;
+    }
+    bool ok = jw_value_c(w, v);
+    ray_dup_leave(&w->dup, opened, w->len);
+    if (ok && RAY_UNLIKELY(ray_dup_over(&w->dup, w->len))) {
+        w->err = ray_error("limit", ".json.format: value repeats shared parts beyond 1 GiB of extra output");
+        return false;
+    }
+    return ok;
+}
+static bool jw_value_c(jw_t* w, ray_t* v) {
     if (w->err) return false;
     if (!v || RAY_IS_NULL(v)) return JW_LIT(w, "null");
     if (RAY_IS_ERR(v)) { w->err = ray_error("type", ".json.format: cannot write an error value"); return false; }
@@ -1773,8 +1801,12 @@ static bool jw_value(jw_t* w, ray_t* v) {
 ray_t* ray_json_format_fn(ray_t* v) {
     ray_t* x = jp_input(v);
     if (x && RAY_IS_ERR(x)) return x;
-    jw_t w = { NULL, 0, 0, NULL, 0 };
+    jw_t w;
+    memset(&w, 0, sizeof w);
+    ray_dup_begin(&w.dup);
+    ray_dup_root(&w.dup, x, false);
     bool ok = jw_value(&w, x);
+    ray_dup_end(&w.dup);
     ray_t* out = ok ? ray_str(w.p ? w.p : "", w.len) : (w.err ? w.err : ray_error("oom", NULL));
     if (ok && w.err) ray_release(w.err);
     if (w.p) ray_free_raw(w.p);

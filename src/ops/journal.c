@@ -201,9 +201,20 @@ ray_t* ray_log_write_fn(ray_t* expr) {
         owned = true;
     }
 
+    ray_serde_fail_clear();
     int64_t pay_size = ray_serde_size(expr);
     if (pay_size <= 0) {
         if (owned) ray_release(expr);
+        /* the serializer's own refusal (limit: nested too deep, or shared
+         * parts repeated beyond the budget; a column that cannot be read)
+         * passes through with its code and message */
+        const char* fcode = ray_serde_fail_code();
+        if (pay_size < 0 && fcode) {
+            char code[8], msg[256];
+            snprintf(code, sizeof code, "%s", fcode);
+            snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+            return ray_error(code, ".log.write: %s", msg);
+        }
         return ray_error("domain", ".log.write: serde size 0");
     }
 
@@ -354,7 +365,10 @@ ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
     if (n != 0) return ray_error("arity", ".log.snapshot takes no arguments");
     if (!ray_journal_is_open())
         return ray_error("domain", ".log.snapshot: no journal open");
-    return err_to_ray(ray_journal_snapshot(), "io");
+    ray_err_t e = ray_journal_snapshot();
+    ray_t* why = e != RAY_OK ? ray_journal_take_error() : NULL;
+    if (why) return why;   /* the serializer's own code and message */
+    return err_to_ray(e, "io");
 }
 
 /* (.log.posts [flag]) — the posts switch (#1608).  No argument reads it;

@@ -30,6 +30,7 @@
 #include "core/pool.h"
 #include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "ops/hash.h"
+#include "ops/walkmemo.h"
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
 #include "ops/ops.h"
@@ -1744,11 +1745,14 @@ typedef struct { ray_t* x; ray_t* y; int64_t i; uint8_t kind; } ceq_frame_t;
 static inline bool ceq_container(int8_t t) {
     return t == RAY_LIST || t == RAY_TABLE || t == RAY_DICT;
 }
+static _Thread_local ray_walk_memo_t g_ceq_memo;
 static int container_eq(ray_t* a, ray_t* b) {
     ceq_frame_t local[32];
     ceq_frame_t* st = local;
     int64_t cap = 32, top = 0;
     int res = 1;
+    ray_walk_memo_t* m = NULL;   /* the thread-local memo's address only when wanted */
+    bool own = false;
 #define CEQ_PUSH(X, Y, K) do {                                                    \
         if (top == cap) {                                                       \
             ceq_frame_t* grown_ = (ceq_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown_); \
@@ -1788,6 +1792,16 @@ static int container_eq(ray_t* a, ray_t* b) {
             if (!atom_eq(x, y)) { res = 0; goto done; }         /* not two containers: a leaf */
             continue;
         }
+        /* A pair of shared containers can be reached again (#1627): the
+         * walk stops at the first difference, so a pair met before is
+         * equal or still being compared, and is not walked twice. */
+        if (RAY_UNLIKELY(ray_wm_reused(x) || ray_wm_reused(y))) {
+            if (!m) m = &g_ceq_memo;
+            if (!m->active) own = ray_wm_begin(m);
+            uint64_t seen_before;
+            if (m->active && ray_wm_get(m, x, y, 0, &seen_before)) continue;
+            if (m->active) ray_wm_put(m, x, y, 0, 1);
+        }
         if (x->type == RAY_LIST) {
             if (x->len != y->len) { res = 0; goto done; }
             CEQ_PUSH(x, y, CEQ_LIST);
@@ -1823,6 +1837,7 @@ static int container_eq(ray_t* a, ray_t* b) {
 #undef CEQ_PUSH
 done:
     if (st != local) ray_free_raw(st);
+    if (own) ray_wm_end(m);
     return res;
 }
 
@@ -2120,24 +2135,72 @@ static inline bool i64_inexact(int64_t v) {
  * atom_eq, which decides, compares lists without recursing on depth. */
 #define KEY_WALK_DEPTH 128
 static uint8_t key_inexact_bits_d(ray_t* x, int depth);
-static uint8_t key_inexact_bits(ray_t* x) { return key_inexact_bits_d(x, 0); }
+static inline uint8_t key_inexact_bits_c(ray_t* x, int depth);
+static inline uint8_t key_inexact_atom(const ray_t* c);
+/* The entry is depth 0: no depth bound to test, and its own value cannot
+ * recur inside itself, so no memo test either. */
+static uint8_t key_inexact_bits(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return 0;
+    if (x->type < 0) return key_inexact_atom(x);
+    return key_inexact_bits_c(x, 0);
+}
+/* A shared container's answer is kept per depth (#1627, ops/walkmemo.h). */
+static _Thread_local ray_walk_memo_t g_inexact_memo;
+static inline uint8_t key_inexact_bits_c(ray_t* x, int depth);
+__attribute__((noinline)) static uint8_t key_inexact_bits_shared(ray_t* x, int depth) {
+    ray_walk_memo_t* m = &g_inexact_memo;
+    const void* skip = m->skip;
+    m->skip = x;
+    uint64_t v;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        v = key_inexact_bits_d(x, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, x, NULL, (uint64_t)depth, &v)) {
+        v = key_inexact_bits_d(x, depth);
+        ray_wm_put(m, x, NULL, (uint64_t)depth, v);
+    }
+    m->skip = skip;
+    return (uint8_t)v;
+}
 static uint8_t key_inexact_bits_d(ray_t* x, int depth) {
     if (!x || RAY_IS_ERR(x)) return 0;
     if (depth >= KEY_WALK_DEPTH && x->type >= 0) return RAY_KEY_BIG_I64 | RAY_KEY_FLOAT;
     if (x->type == -RAY_I64) return i64_inexact(x->i64) ? RAY_KEY_BIG_I64 : 0;
     if (x->type == -RAY_F64 || x->type == -RAY_F32) return RAY_KEY_FLOAT;
+    if (depth > 0 && RAY_UNLIKELY(ray_wm_reused(x)) &&
+        (x->type == RAY_LIST || x->type == RAY_DICT || x->type == RAY_TABLE) &&
+        x != g_inexact_memo.skip)
+        return key_inexact_bits_shared(x, depth);
+    return key_inexact_bits_c(x, depth);
+}
+static inline uint8_t key_inexact_atom(const ray_t* c) {
+    if (c->type == -RAY_I64) return i64_inexact(c->i64) ? RAY_KEY_BIG_I64 : 0;
+    return (c->type == -RAY_F64 || c->type == -RAY_F32) ? RAY_KEY_FLOAT : 0;
+}
+/* A part of x at depth + 1: an atom or a typed vector (which adds nothing:
+ * vectors compare by type and bytes) is decided here, without the walk's
+ * call; a list, dict or table, or a part past the depth bound, takes it. */
+static inline uint8_t key_inexact_part(ray_t* p, int depth) {
+    if (p && depth + 1 < KEY_WALK_DEPTH && !RAY_IS_ERR(p)) {
+        if (p->type < 0) return key_inexact_atom(p);
+        if (p->type != RAY_LIST && p->type != RAY_DICT && p->type != RAY_TABLE) return 0;
+    }
+    return key_inexact_bits_d(p, depth + 1);
+}
+static inline uint8_t key_inexact_bits_c(ray_t* x, int depth) {
     uint8_t bits = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len && bits != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT); i++)
-            bits |= key_inexact_bits_d(cells[i], depth + 1);
+            bits |= key_inexact_part(cells[i], depth);
     } else if (x->type == RAY_DICT) {
-        bits = key_inexact_bits_d(ray_dict_keys(x), depth + 1) | key_inexact_bits_d(ray_dict_vals(x), depth + 1);
+        bits = key_inexact_part(ray_dict_keys(x), depth) | key_inexact_part(ray_dict_vals(x), depth);
     } else if (x->type == RAY_TABLE) {
         for (int64_t c = 0; c < ray_table_ncols(x); c++) {
             ray_t* col = ray_table_col_idx(x, c);
             if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }
-            bits |= key_inexact_bits_d(col, depth + 1);
+            bits |= key_inexact_part(col, depth);
         }
     }
     return bits;
@@ -2155,6 +2218,65 @@ static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view
 static uint64_t key_hash(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen, uint8_t* inexact) {
     return key_hash_d(x, spans, view, seen, inexact, 0);
 }
+/* A list's or a table's hash (key_hash_d's container cases). */
+static inline uint64_t key_hash_container(ray_t* x, int spans, const ray_group_sym_view_t* view,
+                                   bool* seen, uint8_t* inexact, int depth) {
+    if (x->type == RAY_LIST) {
+        uint64_t h = ray_hash_i64(x->len);
+        if (depth >= KEY_WALK_DEPTH) {        /* too deep to walk: say what may be inside */
+            if (seen) *seen = true;
+            if (inexact) *inexact |= RAY_KEY_BIG_I64 | RAY_KEY_FLOAT;
+            return h;
+        }
+        ray_t** cells = ray_data(x);
+        for (int64_t i = 0; i < x->len; i++)
+            h = ray_hash_i64((int64_t)(h ^ key_hash_d(cells[i], spans, view, seen, inexact, depth + 1)));
+        return h;
+    }
+    /* RAY_KEY_EXACT_INT is not a span bit: only the span bits matter here */
+    int sb = spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
+    if (seen && !sb && ray_key_spans(x)) *seen = true;
+    if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
+    /* With spans, a column can equal a vector of a different type.
+     * Keep the conservative hash for every table in that key set. */
+    if (sb) return 0;
+    int64_t nc = ray_table_ncols(x);
+    uint64_t h = ray_hash_i64(nc);
+    for (int64_t c = 0; c < nc; c++) {
+        h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(x, c)));
+        ray_t* col = ray_table_col_idx(x, c);
+        if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
+        h = ray_hash_combine(h, key_hash_d(col, 0, view, NULL, NULL, depth + 1));
+    }
+    return h;
+}
+
+/* A shared list or table, which a walk can reach more than once (#1627):
+ * its hash is kept per depth (past KEY_WALK_DEPTH the answer depends on
+ * where the walk is), with the hash's flags, and what a later visit would
+ * add to `seen` and `inexact` was added by the first. */
+static _Thread_local ray_walk_memo_t g_key_hash_memo;
+__attribute__((noinline))
+static uint64_t key_hash_shared(ray_t* x, int spans, const ray_group_sym_view_t* view,
+                                bool* seen, uint8_t* inexact, int depth) {
+    ray_walk_memo_t* m = &g_key_hash_memo;
+    const void* skip = m->skip;
+    m->skip = x;
+    uint64_t tag = (uint64_t)(uint32_t)spans | (uint64_t)(seen != NULL) << 32 |
+                   (uint64_t)(inexact != NULL) << 33 | (uint64_t)depth << 34;
+    uint64_t h;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        h = key_hash_d(x, spans, view, seen, inexact, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, x, view, tag, &h)) {
+        h = key_hash_d(x, spans, view, seen, inexact, depth);
+        ray_wm_put(m, x, view, tag, h);
+    }
+    m->skip = skip;
+    return h;
+}
+
 static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view, bool* seen,
                            uint8_t* inexact, int depth) {
     bool durations = spans & RAY_KEY_SPAN_ATOM;
@@ -2201,36 +2323,12 @@ static uint64_t key_hash_d(ray_t* x, int spans, const ray_group_sym_view_t* view
     case -RAY_GUID:
         return ray_hash_bytes(x->obj ? ray_data(x->obj) : ray_data(x), 16);
     case -RAY_STR: return ray_hash_bytes(ray_str_ptr(x), ray_str_len(x));
-    case RAY_LIST: {
-        uint64_t h = ray_hash_i64(x->len);
-        if (depth >= KEY_WALK_DEPTH) {        /* too deep to walk: say what may be inside */
-            if (seen) *seen = true;
-            if (inexact) *inexact |= RAY_KEY_BIG_I64 | RAY_KEY_FLOAT;
-            return h;
-        }
-        ray_t** cells = ray_data(x);
-        for (int64_t i = 0; i < x->len; i++)
-            h = ray_hash_i64((int64_t)(h ^ key_hash_d(cells[i], spans, view, seen, inexact, depth + 1)));
-        return h;
-    }
-    case RAY_TABLE: {
-        /* RAY_KEY_EXACT_INT is not a span bit: only the span bits matter here */
-        int sb = spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
-        if (seen && !sb && ray_key_spans(x)) *seen = true;
-        if (inexact && *inexact != (RAY_KEY_BIG_I64 | RAY_KEY_FLOAT)) *inexact |= key_inexact_bits(x);
-        /* With spans, a column can equal a vector of a different type.
-         * Keep the conservative hash for every table in that key set. */
-        if (sb) return 0;
-        int64_t nc = ray_table_ncols(x);
-        uint64_t h = ray_hash_i64(nc);
-        for (int64_t c = 0; c < nc; c++) {
-            h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(x, c)));
-            ray_t* col = ray_table_col_idx(x, c);
-            if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }
-            h = ray_hash_combine(h, key_hash_d(col, 0, view, NULL, NULL, depth + 1));
-        }
-        return h;
-    }
+    case RAY_LIST:
+    case RAY_TABLE:
+        /* depth 0 is a walk's own key, which cannot recur inside itself */
+        if (depth > 0 && RAY_UNLIKELY(ray_wm_reused(x)) && x != g_key_hash_memo.skip)
+            return key_hash_shared(x, spans, view, seen, inexact, depth);
+        return key_hash_container(x, spans, view, seen, inexact, depth);
     case RAY_DICT: {
         int sb = spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC);
         if (seen && !sb && ray_key_spans(x)) *seen = true;
@@ -2287,7 +2385,14 @@ uint64_t ray_key_hash(ray_t* x, int spans) { return key_hash(x, spans, NULL, NUL
  * atoms may hash exactly (RAY_KEY_EXACT_INT).  Typed vector cells compare
  * by type and bytes, so a float vector never meets an integer one. */
 static bool key_float_free_d(ray_t* x, int depth);
-bool ray_key_float_free(ray_t* x) { return key_float_free_d(x, 0); }
+static inline bool key_float_free_c(ray_t* x, int depth);
+/* The entry is depth 0: no depth bound to test, and its own value cannot
+ * recur inside itself, so no memo test either. */
+bool ray_key_float_free(ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return true;
+    if (x->type == -RAY_F64 || x->type == -RAY_F32) return false;
+    return key_float_free_c(x, 0);
+}
 /* A dict's keys or values, or a table's column, at depth + 1: a typed
  * vector holds no float atom, decided here without a call. */
 static inline bool key_float_free_part(ray_t* p, int depth) {
@@ -2296,10 +2401,35 @@ static inline bool key_float_free_part(ray_t* p, int depth) {
         return true;
     return key_float_free_d(p, depth + 1);
 }
+static _Thread_local ray_walk_memo_t g_float_free_memo;
+static inline bool key_float_free_c(ray_t* x, int depth);
+__attribute__((noinline)) static bool key_float_free_shared(ray_t* x, int depth) {
+    ray_walk_memo_t* m = &g_float_free_memo;
+    const void* skip = m->skip;
+    m->skip = x;
+    uint64_t v;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        v = key_float_free_d(x, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, x, NULL, (uint64_t)depth, &v)) {
+        v = key_float_free_d(x, depth);
+        ray_wm_put(m, x, NULL, (uint64_t)depth, v);
+    }
+    m->skip = skip;
+    return v != 0;
+}
 static bool key_float_free_d(ray_t* x, int depth) {
     if (!x || RAY_IS_ERR(x)) return true;
     if (depth >= KEY_WALK_DEPTH && x->type >= 0) return false;   /* too deep to walk: may hold one */
     if (x->type == -RAY_F64 || x->type == -RAY_F32) return false;
+    if (depth > 0 && RAY_UNLIKELY(ray_wm_reused(x)) &&
+        (x->type == RAY_LIST || x->type == RAY_DICT || x->type == RAY_TABLE) &&
+        x != g_float_free_memo.skip)
+        return key_float_free_shared(x, depth);
+    return key_float_free_c(x, depth);
+}
+static inline bool key_float_free_c(ray_t* x, int depth) {
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len; i++) {
@@ -2334,7 +2464,36 @@ uint64_t ray_key_hash_view(ray_t* x, int spans, const ray_group_sym_view_t* view
 /* RAY_KEY_SPAN_* bits for the cells of `x` (a key set, or one cell). */
 enum { KEY_SPAN_WALK_FLOAT = 8 };
 static int key_span_flags_d(ray_t* x, bool track_float, int depth);
-static int key_span_flags(ray_t* x, bool track_float) { return key_span_flags_d(x, track_float, 0); }
+static inline int key_span_flags_c(ray_t* x, bool track_float, int depth);
+/* The entry is depth 0: no depth bound to test, and its own value cannot
+ * recur inside itself, so no memo test either. */
+static int key_span_flags(ray_t* x, bool track_float) {
+    if (!x) return 0;
+    if (x->type < 0) {
+        if (x->type == -RAY_TIMESPAN) return RAY_KEY_SPAN_ATOM;
+        return track_float && (x->type == -RAY_F64 || x->type == -RAY_F32) ? KEY_SPAN_WALK_FLOAT : 0;
+    }
+    if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
+    return key_span_flags_c(x, track_float, 0);
+}
+static _Thread_local ray_walk_memo_t g_span_memo;
+static inline int key_span_flags_c(ray_t* x, bool track_float, int depth);
+__attribute__((noinline)) static int key_span_flags_shared(ray_t* x, bool track_float, int depth) {
+    ray_walk_memo_t* m = &g_span_memo;
+    const void* skip = m->skip;
+    m->skip = x;
+    uint64_t tag = (uint64_t)depth << 1 | track_float, v;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        v = (uint64_t)(uint32_t)key_span_flags_d(x, track_float, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, x, NULL, tag, &v)) {
+        v = (uint64_t)(uint32_t)key_span_flags_d(x, track_float, depth);
+        ray_wm_put(m, x, NULL, tag, v);
+    }
+    m->skip = skip;
+    return (int)(uint32_t)v;
+}
 /* A dict's keys or values, or a table's column, at depth + 1: a typed
  * vector (the usual part) is decided here, without a call. */
 static inline int key_span_part(ray_t* p, int depth) {
@@ -2351,15 +2510,70 @@ static int key_span_flags_d(ray_t* x, bool track_float, int depth) {
     if (RAY_UNLIKELY(depth >= KEY_WALK_DEPTH))   /* too deep to walk (key_inexact_bits) */
         return RAY_KEY_SPAN_ATOM | (track_float ? KEY_SPAN_WALK_FLOAT : 0);
     if (x->type > 0 && ray_has_timespan(x)) return RAY_KEY_SPAN_VEC;
+    if (depth > 0 && RAY_UNLIKELY(ray_wm_reused(x)) &&
+        (x->type == RAY_LIST || x->type == RAY_DICT || x->type == RAY_TABLE) &&
+        x != g_span_memo.skip)
+        return key_span_flags_shared(x, track_float, depth);
+    return key_span_flags_c(x, track_float, depth);
+}
+/* A list cell whose own cells are atoms and vectors: its flags in one
+ * pass, as key_span_flags_d would give them, with no call and no memo
+ * test (#1627: a flat list costs no more to walk again than it holds).
+ * False, with nothing computed, at its first list, dict or table cell. */
+static inline bool key_span_flat_list(ray_t* l, bool track_float, int* out) {
+    int spans = 0;
+    ray_t** cells = ray_data(l);
+    for (int64_t i = 0; i < l->len; i++) {
+        ray_t* c = cells[i];
+        if (!c) continue;
+        int type = c->type;
+        if (type < 0) {
+            if (type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
+            else if (track_float && (type == -RAY_F64 || type == -RAY_F32)) spans |= KEY_SPAN_WALK_FLOAT;
+        } else if (type == RAY_LIST || type == RAY_DICT || type == RAY_TABLE) {
+            return false;
+        } else if (ray_has_timespan(c)) {
+            spans |= RAY_KEY_SPAN_VEC;
+        }
+    }
+    *out = spans;
+    return true;
+}
+/* A dict cell whose keys and values are vectors or flat lists: its flags in
+ * one pass, as key_span_flags_d gives them (a dict's parts take no float
+ * tracking, and any span bit is RAY_KEY_SPAN_ATOM). */
+static inline bool key_span_flat_part(ray_t* p, int* out) {
+    if (!p) { *out = 0; return true; }
+    if (p->type == RAY_LIST) return key_span_flat_list(p, false, out);
+    if (p->type == RAY_DICT || p->type == RAY_TABLE) return false;
+    *out = p->type > 0 && ray_has_timespan(p) ? RAY_KEY_SPAN_VEC
+         : p->type == -RAY_TIMESPAN ? RAY_KEY_SPAN_ATOM : 0;
+    return true;
+}
+static inline bool key_span_flat_dict(ray_t* d, int* out) {
+    int k, v;
+    if (!key_span_flat_part(ray_dict_keys(d), &k) || !key_span_flat_part(ray_dict_vals(d), &v))
+        return false;
+    *out = (k | v) ? RAY_KEY_SPAN_ATOM : 0;
+    return true;
+}
+static inline int key_span_flags_c(ray_t* x, bool track_float, int depth) {
     int spans = 0;
     if (x->type == RAY_LIST) {
         ray_t** cells = ray_data(x);
         for (int64_t i = 0; i < x->len && (spans & (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC)) != (RAY_KEY_SPAN_ATOM | RAY_KEY_SPAN_VEC); i++) {
             ray_t* c = cells[i];
+            int flat;
             if (c && c->type < 0) {
                 int type = c->type;
                 if (type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
                 else if (track_float && (type == -RAY_F64 || type == -RAY_F32)) spans |= KEY_SPAN_WALK_FLOAT;
+            } else if (c && c->type == RAY_LIST && depth + 1 < KEY_WALK_DEPTH &&
+                       key_span_flat_list(c, track_float, &flat)) {
+                spans |= flat;
+            } else if (c && c->type == RAY_DICT && depth + 2 < KEY_WALK_DEPTH &&
+                       key_span_flat_dict(c, &flat)) {
+                spans |= flat;
             } else spans |= key_span_flags_d(c, track_float, depth + 1);
         }
     } else if (x->type == RAY_TABLE) {
@@ -2832,15 +3046,43 @@ static ray_t* in_row(ray_t* elem, ray_t* vec) {
 
 /* in's probes are the left operand's leaves: a TIMESPAN anywhere there is
  * a TIMESPAN atom probing the set, which rounds the numbers it meets. */
+/* A shared list holding lists is walked once per probe walk (#1627,
+ * ops/walkmemo.h); the memo is kept apart from the walk, so a walk over
+ * unshared probes runs the code it always ran. */
+static _Thread_local ray_walk_memo_t g_in_spans_memo;
+static int in_probe_spans(ray_t* x);
+static int in_probe_spans_list(ray_t* x) {
+    int spans = 0;
+    ray_t** cells = ray_data(x);
+    for (int64_t i = 0; i < x->len && !(spans & RAY_KEY_SPAN_ATOM); i++) {
+        ray_t* c = cells[i];
+        if (c && c->type < 0) {   /* an atom: a TIMESPAN probes as one, nothing else counts */
+            if (c->type == -RAY_TIMESPAN) spans |= RAY_KEY_SPAN_ATOM;
+            continue;
+        }
+        spans |= in_probe_spans(c);
+    }
+    return spans;
+}
+__attribute__((noinline)) static int in_probe_spans_shared(ray_t* x) {
+    ray_walk_memo_t* m = &g_in_spans_memo;
+    uint64_t v;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        v = (uint64_t)in_probe_spans_list(x);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, x, NULL, 0, &v)) {
+        v = (uint64_t)in_probe_spans_list(x);
+        ray_wm_put(m, x, NULL, 0, v);
+    }
+    return (int)v;
+}
 static int in_probe_spans(ray_t* x) {
     if (!x) return 0;
     if (ray_has_timespan(x)) return RAY_KEY_SPAN_ATOM;
     if (x->type != RAY_LIST) return ray_key_spans(x);
-    int spans = 0;
-    ray_t** cells = ray_data(x);
-    for (int64_t i = 0; i < x->len && !(spans & RAY_KEY_SPAN_ATOM); i++)
-        spans |= in_probe_spans(cells[i]);
-    return spans;
+    if (RAY_UNLIKELY(ray_wm_reused(x))) return in_probe_spans_shared(x);
+    return in_probe_spans_list(x);
 }
 
 /* ray_in_fn's per-element walk of a collection `val` against the LIST
@@ -2849,6 +3091,21 @@ static int in_probe_spans(ray_t* x) {
  * one probe per leaf instead of a scan.  An atom, table or dict element is
  * a leaf; a list or non-string vector recurses, as ray_in_fn does; any
  * other element takes in_row. */
+static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s);
+/* A shared row list is answered once per `in` (#1627): its answer is kept
+ * (the memo holds a reference) and reused wherever the list recurs. */
+static _Thread_local ray_walk_memo_t g_in_rows_memo;
+typedef struct { ray_t* val; ray_t* vec; const list_set_t* s; } in_rows_ctx_t;
+static ray_t* in_rows_run(void* p) {
+    in_rows_ctx_t* c = p;
+    return in_list_rows(c->val, c->vec, c->s);
+}
+static ray_t* in_list_rows_shared(ray_t* val, ray_t* vec, const list_set_t* s) {
+    if (RAY_LIKELY(val->type != RAY_LIST || !ray_wm_reused(val))) return in_list_rows(val, vec, s);
+    in_rows_ctx_t c = { val, vec, s };
+    /* keyed on the set's value and its span rule, not the set's address */
+    return ray_wm_result(&g_in_rows_memo, val, vec, (uint64_t)(uint32_t)s->spans, in_rows_run, &c);
+}
 static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
     /* A list's rows that are lists go through here again: one frame per
      * level of nesting, and a value can be nested arbitrarily deep (#1591). */
@@ -2873,7 +3130,7 @@ static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
             r = make_bool(hit);
         } else {
             if (t == RAY_LIST || (ray_is_vector_type(t) && t != RAY_STR))
-                r = ray_len(elem) ? in_list_rows(elem, vec, s) : ray_vec_new(RAY_BOOL, 0);
+                r = ray_len(elem) ? in_list_rows_shared(elem, vec, s) : ray_vec_new(RAY_BOOL, 0);
             else
                 r = in_row(elem, vec);
             if (alloc) ray_release(elem);
@@ -2995,7 +3252,21 @@ static __attribute__((noinline, cold)) ray_t* in_span_pair(ray_t* val, ray_t* ve
     return r;
 }
 
+/* `in` maps a list's cells through here again: a shared list's answer
+ * against one set is kept for the outermost call and reused (#1627). */
+static ray_t* in_fn_c(ray_t* val, ray_t* vec);
+static _Thread_local ray_walk_memo_t g_in_memo;
+static ray_t* in_fn_run(void* p) {
+    in_rows_ctx_t* c = p;
+    return in_fn_c(c->val, c->vec);
+}
 ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
+    if (RAY_LIKELY(!val || RAY_IS_ERR(val) || val->type != RAY_LIST || !ray_wm_reused(val)))
+        return in_fn_c(val, vec);
+    in_rows_ctx_t c = { val, vec, NULL };
+    return ray_wm_result(&g_in_memo, val, vec, 0, in_fn_run, &c);
+}
+static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
     if (ray_is_lazy(val)) val = ray_lazy_materialize(val);
     if (ray_is_lazy(vec)) vec = ray_lazy_materialize(vec);
     /* A list's cells go through here again: one frame per level of
@@ -3194,7 +3465,7 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
             list_set_t s;
             if (!list_set_of(&s, vec, ray_key_spans(vec) | in_probe_spans(val)))
                 return ray_error("oom", NULL);
-            ray_t* r = in_list_rows(val, vec, &s);
+            ray_t* r = in_list_rows_shared(val, vec, &s);
             list_set_destroy(&s);
             return r;
         }
@@ -3302,7 +3573,17 @@ ray_t* ray_in_fn(ray_t* val, ray_t* vec) {
 /* Interpreter membership inside queries follows the plan's null-row rule.
  * Keep ray_in_fn itself context-free: collection operations and the GUID
  * plan fallback call it directly and apply their own semantics. */
+/* `not-in` negates `in`'s answer, which shares its parts when the probe
+ * does: a shared part is negated once per call (#1627). */
+static ray_t* membership_not_c(ray_t* r);
+static _Thread_local ray_walk_memo_t g_mnot_memo;
+static ray_t* membership_not_run(void* p) { return membership_not_c((ray_t*)p); }
 static ray_t* membership_not(ray_t* r) {
+    if (RAY_UNLIKELY(ray_wm_reused(r)))
+        return ray_wm_result(&g_mnot_memo, r, NULL, 0, membership_not_run, r);
+    return membership_not_c(r);
+}
+static ray_t* membership_not_c(ray_t* r) {
     if (r->type != RAY_LIST) return ray_not_fn(r);
     ray_t* out = ray_list_new(r->len);
     if (!out || RAY_IS_ERR(out)) return out;

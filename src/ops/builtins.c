@@ -51,6 +51,7 @@ static inline double clear_neg_zero(double v) {
     return v;
 }
 #include "ops/hash.h"
+#include "ops/walkmemo.h"
 #include "store/col.h"
 #include "store/part.h"
 #include "store/splay.h"
@@ -79,72 +80,92 @@ static inline double clear_neg_zero(double v) {
  * ══════════════════════════════════════════ */
 
 /* Helper: print a ray_t value to a file handle */
-void ray_lang_print(FILE* fp, ray_t* val) {
-    if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
-    if (RAY_IS_NULL(val)) { fprintf(fp, "null"); return; }
+/* print and println write a value out in full, a shared part again each
+ * time it is met: the bytes written again are counted as they are written,
+ * and past RAY_DUP_BUDGET printing stops (#1627, ops/walkmemo.h). */
+typedef struct { ray_dup_t dup; uint64_t out; bool over; } lang_print_t;
+#define LP_OUT(p, n) do { int n_ = (n); if (n_ > 0) (p)->out += (uint64_t)n_; } while (0)
+static void lang_print(FILE* fp, ray_t* val, lang_print_t* p);
+static void lang_print_part(FILE* fp, ray_t* val, lang_print_t* p) {
+    if (RAY_LIKELY(!ray_dup_watch(&p->dup, val))) { lang_print(fp, val, p); return; }
+    bool opened = ray_dup_enter(&p->dup, val, p->out);
+    if (RAY_UNLIKELY(ray_dup_over(&p->dup, p->out))) {   /* the lower bound refused it */
+        ray_dup_leave(&p->dup, opened, p->out);
+        p->over = true;
+        return;
+    }
+    lang_print(fp, val, p);
+    ray_dup_leave(&p->dup, opened, p->out);
+    if (RAY_UNLIKELY(ray_dup_over(&p->dup, p->out))) p->over = true;
+}
+static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
+    if (p->over) return;
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, fprintf(fp, "error")); return; }
+    if (RAY_IS_NULL(val)) { LP_OUT(p, fprintf(fp, "null")); return; }
     /* Materialize lazy handles before printing.  val is BORROWED and
      * ray_lazy_materialize consumes its input, so give it its own ref;
      * print the owned concrete result and release it before returning. */
     if (ray_is_lazy(val)) {
         ray_retain(val);
         ray_t* mat = ray_lazy_materialize(val);
-        ray_lang_print(fp, mat);
+        lang_print(fp, mat, p);
         if (mat && !RAY_IS_ERR(mat)) ray_release(mat);
         return;
     }
-    if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, fprintf(fp, "error")); return; }
     /* A list prints its cells through here again: one frame per level of
      * nesting, and a value can be nested arbitrarily deep (#1591).  This
      * writes to a stream and has no error to give, so past the thread's
      * stack reserve the rest of the value prints as "...". */
-    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { fputs("...", fp); return; }
+    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { LP_OUT(p, fprintf(fp, "...")); return; }
     /* STR/SYM use their empty literals as canonical null spellings. */
     if (val->type != -RAY_STR && val->type != -RAY_SYM &&
         RAY_ATOM_IS_NULL(val)) {
-        fprintf(fp, "%s", ray_fmt_null_literal(-val->type));
+        LP_OUT(p, fprintf(fp, "%s", ray_fmt_null_literal(-val->type)));
         return;
     }
     switch (val->type) {
-    case -RAY_I64:  fprintf(fp, "%" PRId64, val->i64); break;
+    case -RAY_I64:  LP_OUT(p, fprintf(fp, "%" PRId64, val->i64)); break;
     case -RAY_F64: {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
         char buf[32];
         int n = ray_snprintf_c(buf, sizeof(buf), "%g", fv);
-        if (n > 0 && (size_t)n < sizeof(buf)) fputs(buf, fp);
+        if (n > 0 && (size_t)n < sizeof(buf)) LP_OUT(p, fprintf(fp, "%s", buf));
         break;
     }
-    case -RAY_BOOL: fprintf(fp, "%s", val->b8 ? "true" : "false"); break;
+    case -RAY_BOOL: LP_OUT(p, fprintf(fp, "%s", val->b8 ? "true" : "false")); break;
     case -RAY_SYM: {
         ray_t* s = ray_sym_str(val->i64);
-        if (s) fprintf(fp, "'%.*s", (int)ray_str_len(s), ray_str_ptr(s));
-        else fprintf(fp, "'?");
+        if (s) LP_OUT(p, fprintf(fp, "'%.*s", (int)ray_str_len(s), ray_str_ptr(s)));
+        else LP_OUT(p, fprintf(fp, "'?"));
         break;
     }
     case -RAY_STR: {
         const char* s = ray_str_ptr(val);
         size_t slen = ray_str_len(val);
-        fprintf(fp, "%.*s", (int)slen, s);
+        LP_OUT(p, fprintf(fp, "%.*s", (int)slen, s));
         break;
     }
     case RAY_LIST: {
-        fprintf(fp, "[");
+        LP_OUT(p, fprintf(fp, "["));
         int64_t len = ray_len(val);
         ray_t** elems = (ray_t**)ray_data(val);
         for (int64_t i = 0; i < len; i++) {
-            if (i > 0) fprintf(fp, " ");
-            ray_lang_print(fp, elems[i]);
+            if (i > 0) LP_OUT(p, fprintf(fp, " "));
+            lang_print_part(fp, elems[i], p);
+            if (p->over) return;
         }
-        fprintf(fp, "]");
+        LP_OUT(p, fprintf(fp, "]"));
         break;
     }
     case RAY_TABLE:
-        fprintf(fp, "<table %" PRId64 "x%" PRId64 ">",
-                ray_table_nrows(val), ray_table_ncols(val));
+        LP_OUT(p, fprintf(fp, "<table %" PRId64 "x%" PRId64 ">",
+                ray_table_nrows(val), ray_table_ncols(val)));
         break;
     case RAY_UNARY: case RAY_BINARY: case RAY_VARY: {
         const char* name = ray_fn_name(val);
-        fprintf(fp, "%s", name[0] ? name : "builtin");
+        LP_OUT(p, fprintf(fp, "%s", name[0] ? name : "builtin"));
         break;
     }
     default: {
@@ -154,15 +175,32 @@ void ray_lang_print(FILE* fp, ray_t* val) {
          * debug placeholder, not the value. */
         ray_t* s = ray_fmt(val, RAY_FMT_COMPACT);
         if (s && !RAY_IS_ERR(s)) {
-            fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
+            LP_OUT(p, fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s)));
             ray_release(s);
         } else {
-            fprintf(fp, "<type:%d>", val->type);
+            LP_OUT(p, fprintf(fp, "<type:%d>", val->type));
             if (s) ray_release(s);
         }
         break;
     }
     }
+}
+
+/* Print val to fp; false when it stopped at the budget of repeated output. */
+static bool lang_print_top(FILE* fp, ray_t* val) {
+    lang_print_t p;
+    memset(&p, 0, sizeof p);
+    ray_dup_begin(&p.dup);
+    ray_dup_root(&p.dup, val, true);   /* print writes a table as one line */
+    lang_print_part(fp, val, &p);
+    ray_dup_end(&p.dup);
+    return !p.over;
+}
+
+/* A caller with no error to give (the REPL's echo): past the budget the
+ * rest prints as "...". */
+void ray_lang_print(FILE* fp, ray_t* val) {
+    if (!lang_print_top(fp, val)) fputs("...", fp);
 }
 
 /* Helper: format string with % placeholders, substituting args.
@@ -226,6 +264,7 @@ static ray_t* print_end(FILE* out) {
     return RAY_NULL_OBJ;
 }
 
+
 /* (println val1 val2 ...) — print values to stdout, newline at end.
  * If first arg is a string with % placeholders, substitutes remaining args. */
 ray_t* ray_println_fn(ray_t** args, int64_t n) {
@@ -254,7 +293,11 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
     FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
         if (i > 0) fputc(' ', out);
-        ray_lang_print(out, args[i]);
+        if (!lang_print_top(out, args[i])) {
+            fputc('\n', out);
+            fflush(out);
+            return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
+        }
     }
     fputc('\n', out);
     return print_end(out);
@@ -283,7 +326,11 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
     FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
         if (i > 0) fputc(' ', out);
-        ray_lang_print(out, args[i]);
+        if (!lang_print_top(out, args[i])) {
+            fputc('\n', out);
+            fflush(out);
+            return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
+        }
     }
     return print_end(out);
 }
@@ -3277,7 +3324,58 @@ static inline uint64_t atom_hash_part(ray_t* p, int depth) {
         return ray_hash_i64(((int64_t)p->type << 32) ^ (int64_t)p->len);
     return atom_hash_d(p, depth + 1);
 }
+/* A shared list, table or dict can be reached more than once in one hash
+ * (#1627): its hash is kept per depth (past ATOM_HASH_DEPTH the answer
+ * depends on where the walk is). */
+static _Thread_local ray_walk_memo_t g_atom_hash_memo;
+static inline uint64_t atom_hash_c(ray_t* a, int depth);
+__attribute__((noinline)) static uint64_t atom_hash_shared(ray_t* a, int depth) {
+    ray_walk_memo_t* m = &g_atom_hash_memo;
+    const void* skip = m->skip;
+    uint64_t h;
+    m->skip = a;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        h = atom_hash_d(a, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, a, NULL, (uint64_t)depth, &h)) {
+        h = atom_hash_d(a, depth);
+        ray_wm_put(m, a, NULL, (uint64_t)depth, h);
+    }
+    m->skip = skip;
+    return h;
+}
 static uint64_t atom_hash_d(ray_t* a, int depth) {
+    if (depth > 0 && a && RAY_UNLIKELY(ray_wm_reused(a)) &&
+        (a->type == RAY_LIST || a->type == RAY_TABLE || a->type == RAY_DICT) &&
+        a != g_atom_hash_memo.skip)
+        return atom_hash_shared(a, depth);
+    return atom_hash_c(a, depth);
+}
+/* An atom's hash: atom_hash_c's atom arms, for a list's atom cells, which
+ * take it here without the walk's call (and its memo test). */
+static inline uint64_t atom_hash_atom(ray_t* a) {
+    if (RAY_ATOM_IS_NULL(a)) return 0;
+    if (is_numeric(a)) return ray_hash_f64(as_f64(a));
+    switch (a->type) {
+        case -RAY_SYM:       return ray_hash_i64(a->i64);
+        case -RAY_DATE:
+        case -RAY_TIME:      return ray_hash_i64((int64_t)a->i32);
+        case -RAY_TIMESPAN:
+        case -RAY_TIMESTAMP: return ray_hash_i64(a->i64);
+        case -RAY_GUID: {
+            const uint8_t* g = a->obj
+                ? (const uint8_t*)ray_data(a->obj)
+                : (const uint8_t*)ray_data((ray_t*)a);
+            return ray_hash_bytes(g, 16);
+        }
+        case -RAY_STR:
+            return ray_hash_bytes(ray_str_ptr(a), ray_str_len(a));
+        default:
+            return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
+    }
+}
+static inline uint64_t atom_hash_c(ray_t* a, int depth) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -3303,8 +3401,10 @@ static uint64_t atom_hash_d(ray_t* a, int depth) {
             ray_t** elems = (ray_t**)ray_data(a);
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
-            for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, atom_hash_d(elems[i], depth + 1));
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* e = elems[i];
+                h = ray_hash_combine(h, e && e->type < 0 ? atom_hash_atom(e) : atom_hash_d(e, depth + 1));
+            }
             return h;
         }
         case RAY_TABLE: {
