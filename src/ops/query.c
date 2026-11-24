@@ -31125,6 +31125,26 @@ static bool update_dag_err_final(ray_t* out, ray_t* cerr, bool if_refused) {
  * so the groups after the first skip the graph and go to the evaluator
  * directly.  The ungrouped callers pass NULL and always try the planner,
  * whose error (a misspelt column) is the one reported. */
+static bool update_agg_is_cell(ray_t* expr, ray_t* tbl);
+static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n);
+
+/* A new column under where: from first/last of a LIST column keeps dev's
+ * legacy reading (#1468): a one-element cell is collapsed to its value, so
+ * w: (last l) over cells [4] gives 4 in each kept row; any other cell is
+ * left as it is and fails as on dev (a new column under where: must be a
+ * typed vector).  This is inconsistent with the cell an existing LIST
+ * column or by: takes (#1574 asks which rule a new column under where:
+ * should follow); it only keeps the answers dev gave. */
+static ray_t* update_cell_collapse(ray_t* expr, ray_t* tbl, ray_t* v) {
+    if (!v || RAY_IS_ERR(v) || ray_is_atom(v) || !update_agg_is_cell(expr, tbl) || ray_len(v) != 1) return v;
+    int alloc = 0;
+    ray_t* a = collection_elem(v, 0, &alloc);
+    if (!a || RAY_IS_ERR(a)) return v;
+    if (!alloc) ray_retain(a);
+    ray_release(v);
+    return a;
+}
+
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
                                   ray_t* mask) {
     ray_t* out = NULL;
@@ -31206,6 +31226,9 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
     if (!out) return ray_error("type", "update: failed to evaluate column update expression");
     if (RAY_IS_ERR(out)) return out;
     if (ray_is_lazy(out)) out = ray_lazy_materialize(out);
+    /* first/last of a LIST column is one cell, a one-element one too: [7]
+     * stays [7] (#1468) */
+    if (!ray_is_atom(out) && update_agg_is_cell(expr, sub)) return out;
     return update_scalar_vec(out, ray_table_nrows(sub));
 }
 
@@ -31357,7 +31380,7 @@ static ray_t* update_spread_kept(ray_t* v, const uint8_t* m, int64_t nrows) {
  * per row of `tbl` (or an atom): update_eval_where, except for an
  * aggregating expression, evaluated over the kept rows (update_eval_kept)
  * and spread back to them (update_spread_kept). */
-static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
+static ray_t* update_where_value_c(ray_t* tbl, ray_t* expr, ray_t* mask, bool cells) {
     if (update_expr_elementwise(expr, tbl, false) || !update_expr_aggregates(expr, tbl))
         return update_eval_where(tbl, expr, mask);
     ray_t* kept = ray_where_fn(mask);
@@ -31366,10 +31389,19 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     /* No kept row: nothing is written, and the expression is evaluated
      * over the table as before, so its errors still surface (over no row
      * `(max (+ w 'x))` would raise nothing). */
-    if (k == 0) { ray_release(kept); return update_eval_where(tbl, expr, mask); }
+    if (k == 0) {
+        ray_release(kept);
+        /* first/last of a LIST column is one cell, which no row takes */
+        ray_t* w = update_eval_where(tbl, expr, mask);
+        return cells ? update_cell_rows(expr, tbl, w, ray_table_nrows(tbl)) : update_cell_collapse(expr, tbl, w);
+    }
     ray_t* v = update_eval_kept(tbl, expr, kept);
     ray_release(kept);
     if (!v || RAY_IS_ERR(v) || ray_is_atom(v)) return v;
+    /* first/last of a LIST column: one cell, held by every kept row */
+    v = cells ? update_cell_rows(expr, tbl, v, k) : update_cell_collapse(expr, tbl, v);
+    if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     if (ray_len(v) != k) {
         int64_t got = ray_len(v);
         ray_release(v);
@@ -31379,6 +31411,46 @@ static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
     ray_t* out = update_spread_kept(v, (const uint8_t*)ray_data(mask), mask->len);
     ray_release(v);
     return out;
+}
+
+static ray_t* update_where_value(ray_t* tbl, ray_t* expr, ray_t* mask) {
+    return update_where_value_c(tbl, expr, mask, true);
+}
+
+static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth);
+
+/* Does the update output `expr` aggregate a LIST column with first or last:
+ * one value per group (or for the rows), a cell of the column, as select
+ * gives it?  Its value is that cell even when it is a vector (#1468). */
+static bool update_agg_is_cell(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST || ray_len(expr) != 2 || !is_agg_expr(expr)) return false;
+    ray_t** e = (ray_t**)ray_data(expr);
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    return (op == OP_FIRST || op == OP_LAST) && expr_reads_list_col(e[1], tbl, 0);
+}
+
+/* Is `expr` (at X k) with X reading a LIST column and k an index that
+ * reads no column (#1429's constant index)? */
+static bool update_at_const_list(ray_t* expr, ray_t* tbl) {
+    if (!expr || expr->type != RAY_LIST || (expr->attrs & ATTR_QUOTED) || ray_len(expr) != 3) return false;
+    ray_t** e = (ray_t**)ray_data(expr);
+    if (!e[0] || e[0]->type != -RAY_SYM || (e[0]->attrs & ATTR_QUOTED) || tbl_has_col(tbl, e[0]->i64) ||
+        ray_env_has_lexical_local(e[0]->i64)) return false;
+    ray_t* hs = ray_sym_str(e[0]->i64);
+    if (!hs || ray_str_len(hs) != 2 || memcmp(ray_str_ptr(hs), "at", 2) != 0) return false;
+    ray_t* fn = ray_env_get(e[0]->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    return expr_reads_list_col(e[1], tbl, 0) && expr_reads_no_column(e[2], tbl);
+}
+
+/* `val` (owned), the value of such an output, as a column of `n` rows that
+ * each hold it: a boxed list.  Any other value is returned as it is. */
+static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n) {
+    if (!val || RAY_IS_ERR(val) || ray_is_atom(val) || !update_agg_is_cell(expr, tbl)) return val;
+    ray_t* l = ray_list_new((int32_t)n);
+    for (int64_t r = 0; r < n && l && !RAY_IS_ERR(l); r++) l = ray_list_append(l, val);
+    ray_release(val);
+    return l ? l : ray_error("oom", NULL);
 }
 
 /* An updated column keeps its type on every route (#1458): a value of the
@@ -31683,6 +31755,8 @@ static ray_t* update_where_inplace(ray_t* tbl, int64_t inplace_sym, ray_t* dict,
     }
     for (int64_t u = 0; u < nu && !err; u++) {
         ray_t* v = uagg[u] ? update_eval_kept(tbl, uexpr[u], idxv) : update_eval_on(sub, uexpr[u]);
+        /* first/last of a LIST column: one cell, for every kept row */
+        v = update_cell_rows(uexpr[u], tbl, v, k);
         if (RAY_IS_ERR(v)) { err = v; break; }
         err = update_value_check(slots[ucol[u]], v, k);
         if (!err) {                       /* a widening is stored at the column's type */
@@ -31895,9 +31969,28 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             int8_t out_type = RAY_I64;
             ray_col_meta_t tm;
             if (ngroups == 0 && ray_table_col_meta(tbl, kid, &tm)) out_type = tm.type;
-            ray_t* out_col = ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
+            /* A LIST column keeps its type (#1458): every group's result is
+             * boxed into its rows, whatever it holds (#1468). */
+            ray_col_meta_t lm;
+            /* first/last of a LIST column gives each group one cell, which
+             * every row of the group holds, a new column's too */
+            bool agg_cell = update_agg_is_cell(agg_expr, tbl);
+            /* (at l k), a LIST column at a constant index: whether k counts
+             * within each group or over the whole table is the open
+             * question of #1429.  Every update by: of a LIST column raised
+             * on dev; this one keeps raising, naming why, rather than
+             * answer before that is decided. */
+            if (update_at_const_list(agg_expr, tbl)) {
+                if (prepared_expr) ray_release(prepared_expr);
+                UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                return ray_error("nyi", "update by: (at <LIST column> <constant index>) is not supported: "
+                                 "whether the index counts within each group is undecided (#1429)");
+            }
+            bool target_list = agg_cell || (ray_table_col_meta(tbl, kid, &lm) && lm.type == RAY_LIST);
+            ray_t* out_col = target_list ? ray_list_new(0)
+                                         : ray_vec_new(out_type, nrows2); /* resized to expression type on first group */
             if (RAY_IS_ERR(out_col)) { UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
-            if (ngroups == 0) {
+            if (ngroups == 0 && !target_list) {
                 out_col->len = nrows2;
                 /* Match the per-group path's zero-fill so an unwritten buffer
                  * never carries allocator garbage (unreachable with rows today
@@ -31922,6 +32015,20 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                         return full_col ? full_col : ray_error("oom", NULL);
                     }
                     int8_t ct = full_col->type;
+                    /* A LIST column: the group's cells, retained into a
+                     * boxed list (a typed allocation refused it, #1468). */
+                    if (ct == RAY_LIST) {
+                        ray_t* sub_list = ray_list_new((int32_t)gsize);
+                        ray_t** cells = (ray_t**)ray_data(full_col);
+                        int64_t* lidx = (int64_t*)ray_data(idx_vec);
+                        for (int64_t r = 0; r < gsize && !RAY_IS_ERR(sub_list); r++)
+                            sub_list = ray_list_append(sub_list, cells[lidx[r]]);
+                        if (RAY_IS_ERR(sub_list)) { ray_release(sub_tbl); ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_list; }
+                        sub_tbl = ray_table_add_col(sub_tbl, cn, sub_list);
+                        ray_release(sub_list);
+                        if (RAY_IS_ERR(sub_tbl)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return sub_tbl; }
+                        continue;
+                    }
                     /* Create sub_col with the SOURCE column's width. For a SYM
                      * column that dictionary-index width is adaptive
                      * (W8/W16/W32/W64); the raw cell-id gather below must use it
@@ -31988,7 +32095,38 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                 if (RAY_IS_ERR(agg_result)) { ray_release(out_col); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return agg_result; }
                 /* A one-element result is the group's scalar, broadcast like
                  * an atom; it failed the length check on groups of 2+ rows. */
-                agg_result = update_scalar_vec(agg_result, gsize);
+                if (!agg_cell) agg_result = update_scalar_vec(agg_result, gsize);
+
+                if (target_list) {
+                    if (first_group) {
+                        ray_release(out_col);
+                        out_col = ray_list_new((int32_t)nrows2);
+                        if (RAY_IS_ERR(out_col)) { ray_release(agg_result); UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv); return out_col; }
+                        ray_t** d0 = (ray_t**)ray_data(out_col);
+                        for (int64_t r = 0; r < nrows2; r++) { ray_retain(RAY_NULL_OBJ); d0[r] = RAY_NULL_OBJ; }
+                        out_col->len = nrows2;
+                        first_group = 0;
+                    }
+                    bool atom = agg_cell || ray_is_atom(agg_result);
+                    if (!atom && !((ray_is_vec(agg_result) || agg_result->type == RAY_LIST) &&
+                                   ray_len(agg_result) == gsize)) {
+                        int64_t got = ray_is_vec(agg_result) || agg_result->type == RAY_LIST ? ray_len(agg_result) : -1;
+                        ray_release(agg_result); ray_release(out_col);
+                        UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                        return ray_error("length", "update by: expression result length %lld does not match group size %lld", (long long)got, (long long)gsize);
+                    }
+                    ray_t** d = (ray_t**)ray_data(out_col);
+                    int64_t* lidxs = (int64_t*)ray_data(idx_vec);
+                    for (int64_t r = 0; r < gsize; r++) {
+                        int alloc = 0;
+                        ray_t* cell = atom ? agg_result : collection_elem(agg_result, r, &alloc);
+                        if (!alloc) ray_retain(cell);
+                        ray_release(d[lidxs[r]]);
+                        d[lidxs[r]] = cell;
+                    }
+                    ray_release(agg_result);
+                    continue;
+                }
 
                 /* Determine output type from first group */
                 if (first_group) {
@@ -32226,7 +32364,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             } else {
                 /* Evaluate the expression for each row and apply to matching rows */
                 int8_t ct = orig_col->type;
-                ray_t* new_col = ray_vec_new(ct, nrows);
+                /* a LIST column is rebuilt below as a boxed list (#1468) */
+                ray_t* new_col = ct == RAY_LIST ? ray_list_new(0) : ray_vec_new(ct, nrows);
                 if (RAY_IS_ERR(new_col)) { ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_col; }
 
                 /* DAG first, then the interpreter (update_eval_on). */
@@ -32242,36 +32381,38 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                 expr_vec = update_conform(expr_vec, ct);
                 if (RAY_IS_ERR(expr_vec)) { ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return expr_vec; }
 
+                /* A LIST column: a boxed list, each kept row taking its cell
+                 * of the value (an atom boxed into every one of them), the
+                 * others keeping theirs, as the keyless update boxes
+                 * (#1458).  Allocating it as a typed vector failed (#1468). */
+                if (ct == RAY_LIST) {
+                    ray_release(new_col);
+                    ray_t* new_list = ray_list_new((int32_t)nrows);
+                    if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
+                    ray_t** orig_elems = (ray_t**)ray_data(orig_col);
+                    bool atom = expr_vec->type < 0;
+                    ray_t** vals = atom ? NULL : (ray_t**)ray_data(expr_vec);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        ray_t* elem = !mask[r] ? orig_elems[r] : atom ? expr_vec : vals[r];
+                        new_list = ray_list_append(new_list, elem);
+                        if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
+                    }
+                    ray_release(expr_vec);
+                    result = ray_table_add_col(result, col_name, new_list);
+                    ray_release(new_list);
+                    if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
+                    continue;
+                }
 
                 /* Broadcast scalar atom to full column vector if needed */
                 if (expr_vec->type < 0) {
                     /* Type check atom against column type BEFORE broadcast */
                     int ok = (expr_vec->type == -ct);
-                    if (!ok && ct == RAY_LIST && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok && ct == RAY_SYM && expr_vec->type == -RAY_SYM) ok = 1;
                     if (!ok) {
                         int8_t ev_t = expr_vec->type;            /* capture BEFORE free */
                         ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl);
                         DICT_VIEW_CLOSE(updw); return ray_error("type", "update: cannot assign %s value to %s column", ray_type_name(ev_t), ray_type_name(ct));
-                    }
-                    /* SYM atom to LIST column: build boxed list, merge with mask */
-                    if (ct == RAY_LIST && expr_vec->type == -RAY_SYM) {
-                        ray_free(new_col);
-                        ray_t* new_list = ray_list_new((int32_t)nrows);
-                        if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
-                        ray_t** orig_elems = (ray_t**)ray_data(orig_col);
-                        for (int64_t r = 0; r < nrows; r++) {
-                            ray_t* elem = mask[r] ? expr_vec : orig_elems[r];
-                            ray_retain(elem);
-                            new_list = ray_list_append(new_list, elem);
-                            ray_release(elem);
-                            if (RAY_IS_ERR(new_list)) { ray_release(expr_vec); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return new_list; }
-                        }
-                        ray_release(expr_vec);
-                        result = ray_table_add_col(result, col_name, new_list);
-                        ray_release(new_list);
-                        if (RAY_IS_ERR(result)) { ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return result; }
-                        continue;
                     }
                     ray_t* bcast = ray_vec_new(ct, nrows);
                     if (RAY_IS_ERR(bcast)) { ray_release(expr_vec); ray_release(new_col); ray_release(result); ray_release(mask_vec); ray_release(tbl); DICT_VIEW_CLOSE(updw); return bcast; }
@@ -32441,7 +32582,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            ray_t* v = update_where_value(tbl, dict_elems[d + 1], mask_vec);
+            /* a new column: dev's legacy reading of a LIST cell (#1468) */
+            ray_t* v = update_where_value_c(tbl, dict_elems[d + 1], mask_vec, false);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;
                 if (v->type == -RAY_STR) {
@@ -32560,6 +32702,8 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             int8_t oct = om.type;
             /* DAG first, then the interpreter (update_eval_on). */
             ray_t* expr_vec = update_eval_on(tbl, update_expr);
+            /* first/last of a LIST column: one cell, for every row */
+            expr_vec = update_cell_rows(update_expr, tbl, expr_vec, ray_table_nrows(tbl));
             if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate column update expression"); }
             if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
                 /* A column of another length has no row-aligned meaning; it
@@ -32702,6 +32846,7 @@ no_where_add_col:
          * existing-column update but not as a new column. */
         ray_t* update_expr = dict_elems[d + 1];
         ray_t* expr_vec = update_eval_on(tbl, update_expr);
+        expr_vec = update_cell_rows(update_expr, tbl, expr_vec, ray_table_nrows(tbl));
         if (!expr_vec || RAY_IS_ERR(expr_vec)) { ray_release(result); ray_release(tbl); DICT_VIEW_CLOSE(upda); return expr_vec ? expr_vec : ray_error("type", "update: failed to evaluate new column expression"); }
         if (expr_vec->type >= 0 && ray_len(expr_vec) != ray_table_nrows(tbl)) {
             /* A column of another length has no row-aligned meaning; it
