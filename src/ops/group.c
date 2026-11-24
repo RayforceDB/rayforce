@@ -2371,6 +2371,12 @@ typedef struct {
     int64_t         n_rows;
     int64_t         n_groups;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
+    /* Few groups (n_groups <= CDPG_FEW_GROUPS): partition by the (gid,
+     * val) hash instead, so the rows of one large group spread over every
+     * partition rather than one serial dedup; each partition then counts
+     * into its own pcnt[p * n_groups + gid], summed into odata at the end. */
+    bool            by_val;
+    int64_t*        pcnt;            /* [P * n_groups] when by_val */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
      * so there's no atomic contention.  task_id is start / grain, both
@@ -2415,12 +2421,14 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
      * we wrote here.  No atomics: each task owns its row. */
     int64_t task_id = start / x->grain;
     int64_t* my_hist = &x->hist[task_id * (int64_t)(p_mask + 1)];
+    uint8_t esz = ray_sym_elem_size(x->in_type, x->in_attrs);
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
         /* Partition by gid (not gid×val) so the dedup pass can write to
-         * odata[gid] without atomics. */
-        uint64_t h = CDPG_PART_HASH(gid + 1);
+         * odata[gid] without atomics; by (gid, val) under few groups. */
+        uint64_t h = x->by_val ? CDPG_HASH(gid + 1, cdpg_read(x->base, r, x->in_type, esz))
+                               : CDPG_PART_HASH(gid + 1);
         my_hist[h & p_mask]++;
     }
 }
@@ -2441,7 +2449,7 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
         if (gid < 0 || gid >= x->n_groups) continue;
         int64_t val = cdpg_read(x->base, r, x->in_type, esz);
         int64_t gid_p1 = gid + 1;
-        uint64_t h = CDPG_PART_HASH(gid_p1);
+        uint64_t h = x->by_val ? CDPG_HASH(gid_p1, val) : CDPG_PART_HASH(gid_p1);
         int64_t pos = my_cur[h & p_mask]++;
         x->gids_out[pos] = gid_p1;
         x->vals_out[pos] = val;
@@ -2481,6 +2489,7 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
 
         const int64_t* gids = x->gids_out + off;
         const int64_t* vals = x->vals_out + off;
+        int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
         for (int64_t i = 0; i < cnt; i++) {
             int64_t gid_p1 = gids[i];
             int64_t val    = vals[i];
@@ -2493,8 +2502,8 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                     slot_val[slot] = val;
                     /* Partition is keyed on gid (CDPG_PART_HASH), so
                      * each gid is owned by exactly one task — drop the
-                     * atomic. */
-                    x->odata[gid_p1 - 1]++;
+                     * atomic; by (gid, val), the partition's own counts. */
+                    cnt_out[gid_p1 - 1]++;
                     break;
                 }
                 if (cur == gid_p1 && slot_val[slot] == val) break;
@@ -2534,9 +2543,15 @@ static ray_t* count_distinct_per_group_parallel(
         .n_groups = n_groups,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
+        .by_val = n_groups <= CDPG_FEW_GROUPS,
     };
 
     if (P > 256) return NULL;
+    ray_t* pcnt_hdr = NULL;
+    if (ctx.by_val) {
+        ctx.pcnt = (int64_t*)scratch_calloc(&pcnt_hdr, (size_t)P * (size_t)n_groups * sizeof(int64_t));
+        if (!ctx.pcnt) return NULL;
+    }
 
     /* Counters per dispatch task, sized from the geometry the pool takes
      * (its clamp included), computed once: both passes dispatch at that
@@ -2554,13 +2569,16 @@ static ray_t* count_distinct_per_group_parallel(
     ray_t* hist_hdr = NULL;
     ctx.hist = (int64_t*)scratch_calloc(&hist_hdr,
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
-    if (!ctx.hist) { return NULL; }
+    if (!ctx.hist) { if (pcnt_hdr) scratch_free(pcnt_hdr); return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
     /* Each pass reads the one before it: the histogram sizes and places the
      * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
      * their part unwritten (a short histogram would send the scatter past
      * its partitions). */
-    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
+    if (pool_cancelled(pool)) {
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2574,7 +2592,7 @@ static ray_t* count_distinct_per_group_parallel(
     if (!ctx.part_off || !ctx.cursor) {
         if (off_hdr) scratch_free(off_hdr);
         if (cur_hdr) scratch_free(cur_hdr);
-        scratch_free(hist_hdr);
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     /* Two-step prefix: per-partition global offset, then per-(task,
@@ -2603,6 +2621,7 @@ static ray_t* count_distinct_per_group_parallel(
         if (gids_hdr) scratch_free(gids_hdr);
         if (vals_hdr) scratch_free(vals_hdr);
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     if (total > 0)
@@ -2616,10 +2635,13 @@ static ray_t* count_distinct_per_group_parallel(
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
         cancelled = pool_cancelled(pool);
     }
+    if (ctx.by_val && !cancelled)
+        for (uint64_t p = 0; p < P; p++)
+            for (int64_t g = 0; g < n_groups; g++) ctx.odata[g] += ctx.pcnt[p * n_groups + g];
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
-    scratch_free(hist_hdr);
+    scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
     return cancelled ? ray_error("cancel", NULL) : out;
 }
 

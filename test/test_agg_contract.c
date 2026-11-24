@@ -786,6 +786,55 @@ static test_result_t test_count_runs_cancel_at_dispatch(void) {
  * blocks filled with garbage (ray_heap_test_scribble): each run is `cancel`
  * or the answer, never one built from unwritten buffers (a prefix over
  * garbage lengths overflows under UBSan).  The plain retry answers. */
+/* A key over one STR column of few distinct strings is evaluated once per
+ * distinct string (agg_route_stats().key_domain_evals, the counter the
+ * per-symbol route shares), whether it is the by: itself or a by-dict
+ * value beside a second computed key; a two-column expression, a table
+ * below the row gate, a near-unique column and a shadowed builtin take the
+ * row-wise key.  A derived STR key beside an I64 one with a count(distinct)
+ * output stays on the DAG grouping (the indexed route, its row map probed
+ * through the composite key) instead of the eval-level grouping over boxed
+ * LIST cells, which records no route. */
+static test_result_t test_derived_key_per_str_value_route(void) {
+    static const char* const setup =
+        "(set i (til 100000)) "
+        "(set s (at [\"utf-8\" \"UTF-8\" \" koi8-r\" \"\" \"windows-1252 \" \"x-mac-cyrillic\"] (% (* i 5) 6))) "
+        "(set v (% (* i 31) 977)) "
+        "(set T (table [s v] (list s v))) "
+        "(set T3 (take T 3000)) "
+        "(set TU (table [s v] (list (concat \"u\" (as 'STR i)) v)))";
+    ray_t* r = ray_eval_str(setup);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    const struct { const char* q; uint64_t evals; uint64_t indexed; } cases[] = {
+        { "(select {from: T by: (upper (trim s)) c: (count v)})", 1, 1 },
+        { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 1 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1 },
+        { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 1 },
+        { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1 },
+        { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1 },
+    };
+    for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
+        agg_route_reset();
+        ray_t* out = ray_eval_str(cases[c].q);
+        TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
+        ray_release(out);
+        agg_route_stats_t st = agg_route_stats();
+        TEST_ASSERT_FMT(st.key_domain_evals == cases[c].evals, "%s: %llu per-value evaluations",
+                        cases[c].q, (unsigned long long)st.key_domain_evals);
+        TEST_ASSERT_FMT(st.routes[AGG_ROUTE_V2_INDEXED] == cases[c].indexed, "%s: indexed route %llu",
+                        cases[c].q, (unsigned long long)st.routes[AGG_ROUTE_V2_INDEXED]);
+    }
+    /* A user lambda shadowing `trim` is what the compiled key would call. */
+    r = ray_eval_str("(set trim (fn [x] x))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    agg_route_reset();
+    r = ray_eval_str("(select {from: T by: (upper (trim s)) c: (count v)})");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
+    PASS();
+}
+
 static test_result_t test_derived_key_cancel_at_dispatch(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -6571,6 +6620,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/registry_admission", test_registry_admission_contracts, contract_setup, contract_teardown },
     { "agg_contract/routes_bool_outputs", test_group_routes_and_bool_outputs, contract_setup, contract_teardown },
     { "agg_contract/derived_key_per_symbol_route", test_derived_key_per_symbol_route, contract_setup, contract_teardown },
+    { "agg_contract/derived_key_per_str_value_route", test_derived_key_per_str_value_route, contract_setup, contract_teardown },
     { "agg_contract/derived_key_cancel_at_dispatch", test_derived_key_cancel_at_dispatch, contract_setup, contract_teardown },
     { "agg_contract/dense_array_lazy_merge_route", test_dense_array_lazy_merge_route, contract_setup, contract_teardown },
     { "agg_contract/sym_distinct_cancel_at_dispatch", test_sym_distinct_cancel_at_dispatch, contract_setup, contract_teardown },
