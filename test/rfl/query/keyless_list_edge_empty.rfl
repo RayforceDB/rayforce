@@ -1,0 +1,21 @@
+;; @also-unfused
+;; #1405: a keyless first or last of a LIST column under a where: that keeps
+;; no row is the null that first of an empty list gives, 0Nl, held as the
+;; result's one cell.  The compiled route set a null bit on the list, which
+;; has none, and left the cell empty: it printed as an error and crashed a
+;; read of its type.
+(set T (table [k c d s v m] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] [aa bb cc aa] [10 20 30 40] (list [1 2] [3] [4 5] [6]))))
+(set E (select {from: T where: (> c 100)}))
+(first (at E 'm)) -- 0Nl
+(at (select {from: T where: (> c 100) s: (first m)}) 's) -- (list (first (at E 'm)))
+(at (select {from: T where: (> c 100) s: (last m)}) 's) -- (list (last (at E 'm)))
+(type (first (at (select {from: T where: (> c 100) s: (first m)}) 's))) -- 'i64
+(at (select {from: T where: (> c 100) s: (first m) t: (sum v)}) 's) -- (list 0Nl)
+(at (select {from: T where: (> c 100) s: (first m) t: (sum v)}) 't) -- [0]
+(at (select {from: T where: (> c 100) s: (count m)}) 's) -- [0]
+;; the rows a where: keeps, and no where:, as before
+(at (select {from: T where: (> c 1) s: (first m)}) 's) -- (list [3])
+(at (select {from: T where: (> c 1) s: (last m)}) 's) -- (list [6])
+(at (select {from: T s: (first m)}) 's) -- (list [1 2])
+;; under by:, no group
+(count (select {from: T where: (> c 100) s: (first m) by: k})) -- 0
