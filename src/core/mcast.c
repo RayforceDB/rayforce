@@ -452,6 +452,15 @@ ray_t* ray_mcast_stats(ray_poll_t* poll) {
     return ray_dict_new(keys, vals);
 }
 
+bool ray_mcast_subscribed(ray_poll_t* poll, int64_t handle) {
+    ray_mcast_t* mc = (ray_mcast_t*)(poll ? poll->mcast : NULL);
+    if (!mc) return false;
+    for (int32_t i = 0; i < mc->n_topics; i++)
+        for (int32_t j = 0; j < mc->topics[i].n_subs; j++)
+            if (mc->topics[i].subs[j].handle == handle) return true;
+    return false;
+}
+
 void ray_mcast_on_close(ray_poll_t* poll, int64_t handle) {
     ray_mcast_t* mc = (ray_mcast_t*)(poll ? poll->mcast : NULL);
     if (!mc || handle < 0) return;

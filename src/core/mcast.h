@@ -19,5 +19,7 @@ ray_t* ray_mcast_unsub(ray_poll_t* poll, int64_t handle, ray_t* topic);
 ray_t* ray_mcast_pub(ray_poll_t* poll, ray_t* topic, ray_t* payload);
 ray_t* ray_mcast_stats(ray_poll_t* poll);
 void   ray_mcast_on_close(ray_poll_t* poll, int64_t handle);
+/* Whether `handle` is subscribed to any topic. */
+bool   ray_mcast_subscribed(ray_poll_t* poll, int64_t handle);
 
 #endif /* RAY_MCAST_H */

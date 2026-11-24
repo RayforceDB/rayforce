@@ -1733,6 +1733,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
                 /* `cd` may have been freed by the eval (it can close its own
                  * connection), so only the revalidated one is touched. */
                 uint8_t ack = (taken && cur->xport) ? RAY_IPC_FLAG_CANCEL_SEEN : 0;
+                if (ray_mcast_subscribed(poll, id)) ack |= RAY_IPC_FLAG_PINNED;
                 send_response(cur, result,
                               rcd ? rcd->compress_threshold
                                   : ray_ipc_link_threshold((ray_sock_t)cur->fd),

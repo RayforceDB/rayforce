@@ -4110,6 +4110,59 @@ static test_result_t test_ipc_status_frame_layout(void) {
     PASS();
 }
 
+/* A reply carries RAY_IPC_FLAG_PINNED while the connection it answers
+ * holds a multicast subscription, and only then: from the reply to the
+ * .mc.sub itself to the reply to the last .mc.unsub, on that connection
+ * and no other. */
+static test_result_t test_ipc_pinned_flag(void) {
+#ifdef RAY_OS_WINDOWS
+    SKIP("raw-socket helpers are POSIX-only here");
+#else
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    ray_sock_t a = wire_connect(srv.port), b = wire_connect(srv.port);
+    TEST_ASSERT_TRUE(a != RAY_INVALID_SOCK && b != RAY_INVALID_SOCK);
+    uint8_t fl = 0xff;
+
+    TEST_ASSERT_EQ_I(wire_ask_i64(a, "(+ 1 2)", &fl), 3);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, 0);
+
+    TEST_ASSERT_TRUE(wire_ask_i64(a, "(.mc.sub 'pin1 null)", &fl) != INT64_MIN);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, RAY_IPC_FLAG_PINNED);
+    TEST_ASSERT_TRUE(wire_ask_i64(a, "(.mc.sub 'pin2 null)", &fl) != INT64_MIN);
+    TEST_ASSERT_EQ_I(wire_ask_i64(a, "(+ 1 2)", &fl), 3);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, RAY_IPC_FLAG_PINNED);
+    /* Another connection is not pinned by it. */
+    TEST_ASSERT_EQ_I(wire_ask_i64(b, "(+ 1 2)", &fl), 3);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, 0);
+
+    /* One subscription left: still pinned.  None: not any more. */
+    TEST_ASSERT_EQ_I(wire_ask_i64(a, "(do (.mc.unsub 'pin1) 5)", &fl), 5);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, RAY_IPC_FLAG_PINNED);
+    TEST_ASSERT_EQ_I(wire_ask_i64(a, "(do (.mc.unsub 'pin2) 6)", &fl), 6);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, 0);
+    TEST_ASSERT_EQ_I(wire_ask_i64(a, "(+ 1 2)", &fl), 3);
+    TEST_ASSERT_EQ_I(fl & RAY_IPC_FLAG_PINNED, 0);
+
+    /* The engine's own client reads a pinned reply as any other. */
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "client handle");
+    ray_t* m = ray_str("(do (.mc.sub 'pin3 null) 42)", 28);
+    ray_t* r = ray_ipc_send(h, m);
+    ray_release(m);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 42);
+    ray_release(r);
+    ray_ipc_close(h);
+
+    ray_sock_close(a);
+    ray_sock_close(b);
+    ray_test_server_stop(&srv);
+    PASS();
+#endif
+}
+
 /* ---- a late cancel byte on a moved connection -------------------------- */
 /*
  * Ctrl-C (or a sync timeout) sends one urgent byte on the TCP socket.  On
@@ -5006,6 +5059,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/status/auth",                   test_ipc_status_auth,                    ipc_setup, ipc_teardown },
     { "ipc/status/request_shape",          test_ipc_status_request_shape,           ipc_setup, ipc_teardown },
     { "ipc/status/frame_layout",           test_ipc_status_frame_layout,            ipc_setup, ipc_teardown },
+    { "ipc/pinned_flag",                   test_ipc_pinned_flag,                    ipc_setup, ipc_teardown },
 
     { NULL, NULL, NULL, NULL },
 };
