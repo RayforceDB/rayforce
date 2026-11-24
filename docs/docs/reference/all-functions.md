@@ -70,7 +70,7 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
 `.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
-`.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`, `.time.tz.version`,
+`.log.snapshot`, `.log.status`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`, `.time.tz.utc`, `.time.tz.version`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `.emb.knn`, `.emb.hnsw.build`, `.emb.ann`, `.emb.encode`,
@@ -708,6 +708,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.time.timer.del` | unary | restricted | Cancel a scheduled timer by id; returns null | `(.time.timer.del 0)` |
 | `.time.tz.local` | binary | — | A UTC timestamp on a time zone's wall clock, as a timestamp | `(.time.tz.local 'America/New_York ts)` |
 | `.time.tz.offset` | binary | — | A time zone's offset from UTC at a timestamp, as a timespan | `(.time.tz.offset 'America/New_York ts)` |
+| `.time.tz.utc` | variadic (3) | — | The UTC timestamp at which a time zone's wall clock read `wall`; `'earlier` or `'later` picks between the two candidates of a repeated or skipped hour | `(.time.tz.utc 'America/New_York 'earlier wall)` |
 | `.time.tz.version` | nullary | — | Release of the IANA time zone database built in | `(.time.tz.version)` → `"2026f"` |
 | `.sys.build` | nullary | — | Build metadata dict with `version` + `build-date` | `(.sys.build)` |
 | `.sys.mem` | nullary | — | Memory allocator statistics (alloc / peak / slab hits) | `(.sys.mem)` |

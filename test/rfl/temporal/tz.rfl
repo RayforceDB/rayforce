@@ -131,6 +131,59 @@
 (.time.tz.offset 'America/New_York 0D01:00:00) !- type
 (.time.tz.offset 'Mars/Olympus_Mons V) !- domain
 
+;; ── the other direction: a wall clock to its instant ─────────────────
+;; `(.time.tz.utc 'Zone 'earlier|'later wall)`.  Most wall times were read
+;; once, and the choice changes nothing.
+(.time.tz.utc 'America/New_York 'earlier 2024.07.01D08:00:00.000000000) -- 2024.07.01D12:00:00.000000000
+(.time.tz.utc 'America/New_York 'later 2024.07.01D08:00:00.000000000) -- 2024.07.01D12:00:00.000000000
+(type (.time.tz.utc 'America/New_York 'earlier 2024.07.01D08:00:00.000000000)) -- 'timestamp
+;; autumn: 01:30 on 3 November 2024 was read twice, an hour apart
+(.time.tz.utc 'America/New_York 'earlier 2024.11.03D01:30:00.000000000) -- 2024.11.03D05:30:00.000000000
+(.time.tz.utc 'America/New_York 'later 2024.11.03D01:30:00.000000000) -- 2024.11.03D06:30:00.000000000
+;; the hour on each side of it was read once
+(.time.tz.utc 'America/New_York 'later 2024.11.03D00:59:59.999999999) -- 2024.11.03D04:59:59.999999999
+(.time.tz.utc 'America/New_York 'earlier 2024.11.03D02:00:00.000000000) -- 2024.11.03D07:00:00.000000000
+;; spring: 02:30 on 10 March 2024 was never read.  The two candidates are
+;; that wall time with the offset on each side of the change.
+(.time.tz.utc 'America/New_York 'earlier 2024.03.10D02:30:00.000000000) -- 2024.03.10D06:30:00.000000000
+(.time.tz.utc 'America/New_York 'later 2024.03.10D02:30:00.000000000) -- 2024.03.10D07:30:00.000000000
+;; neither instant reads 02:30: that is how a skipped wall time is told
+(.time.tz.local 'America/New_York (.time.tz.utc 'America/New_York 'earlier 2024.03.10D02:30:00.000000000)) -- 2024.03.10D01:30:00.000000000
+(.time.tz.local 'America/New_York (.time.tz.utc 'America/New_York 'later 2024.03.10D02:30:00.000000000)) -- 2024.03.10D03:30:00.000000000
+(.time.tz.utc 'America/New_York 'earlier 2024.03.10D01:59:59.999999999) -- 2024.03.10D06:59:59.999999999
+(.time.tz.utc 'America/New_York 'earlier 2024.03.10D03:00:00.000000000) -- 2024.03.10D07:00:00.000000000
+;; a change of half an hour repeats half an hour
+(.time.tz.utc 'Australia/Lord_Howe 'earlier 2024.04.07D01:45:00.000000000) -- 2024.04.06D14:45:00.000000000
+(.time.tz.utc 'Australia/Lord_Howe 'later 2024.04.07D01:45:00.000000000) -- 2024.04.06D15:15:00.000000000
+(.time.tz.utc 'Asia/Kolkata 'earlier 2024.07.01D17:30:00.000000000) -- 2024.07.01D12:00:00.000000000
+;; vectors and nulls
+(.time.tz.utc 'America/New_York 'earlier [2024.07.01D08:00:00.000000000 2024.11.03D01:30:00.000000000 2024.03.10D02:30:00.000000000]) -- [2024.07.01D12:00:00.000000000 2024.11.03D05:30:00.000000000 2024.03.10D06:30:00.000000000]
+(.time.tz.utc 'America/New_York 'later [2024.07.01D08:00:00.000000000 2024.11.03D01:30:00.000000000 2024.03.10D02:30:00.000000000]) -- [2024.07.01D12:00:00.000000000 2024.11.03D06:30:00.000000000 2024.03.10D07:30:00.000000000]
+(nil? (.time.tz.utc 'America/New_York 'earlier 0Np)) -- true
+(nil? (.time.tz.utc 'America/New_York 'later N)) -- [false true false]
+;; every instant of the long column comes back from its own wall clock,
+;; under one choice or the other
+(set UE (.time.tz.utc 'America/New_York 'earlier L))
+(set UL (.time.tz.utc 'America/New_York 'later L))
+(sum (or (== B UE) (== B UL))) -- 600000
+(sum (<= UE UL)) -- 600000
+;; the two differ only in a repeated hour: 01:00 to 02:00 on the wall
+(set D (where (!= UE UL)))
+(> (count D) 0) -- true
+(distinct (hh (at L D))) -- [1]
+;; read as wall times, the same values hold skipped hours, all 02:00 to 03:00
+(set SK (where (!= B (.time.tz.local 'America/New_York (.time.tz.utc 'America/New_York 'earlier B)))))
+(> (count SK) 0) -- true
+(distinct (hh (at B SK))) -- [2]
+;; in a query
+(at (select {from: T u: (.time.tz.utc 'America/New_York 'earlier (.time.tz.local 'America/New_York ts))}) 'u) -- (at T 'ts)
+;; refusals: the choice is required and is one of two symbols
+(.time.tz.utc 'America/New_York 2024.07.01D08:00:00.000000000) !- arity
+(.time.tz.utc 'America/New_York 'sooner 2024.07.01D08:00:00.000000000) !- domain
+(.time.tz.utc 'America/New_York "earlier" 2024.07.01D08:00:00.000000000) !- type
+(.time.tz.utc 'Mars/Olympus_Mons 'earlier 2024.07.01D08:00:00.000000000) !- domain
+(.time.tz.utc "America/New_York" 'earlier 2024.07.01D08:00:00.000000000) !- type
+(.time.tz.utc 'America/New_York 'earlier 2024.07.01) !- type
 ;; a wrong count of arguments names the whole function
 (.time.tz.local 'Asia/Tokyo) !- arity
 (.time.tz.offset 'Asia/Tokyo) !- arity

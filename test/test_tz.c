@@ -246,6 +246,81 @@ static test_result_t test_tz_dst_all_year(void) {
     PASS();
 }
 
+/* The instant of a wall-clock time.  Around New York's two changes of 2024
+ * a wall time has two candidate instants, an hour apart; anywhere else one. */
+static int64_t instant(const ray_tz_t* z, int64_t wall_sec, bool later) {
+    int32_t k = 0;
+    int64_t out = 0;
+    return ray_tz_instant(z, wall_sec * 1000000000LL, later, &k, &out) ? out / 1000000000LL : INT64_MIN;
+}
+
+static test_result_t test_tz_instant(void) {
+    ray_tz_t* z = new_york();
+    TEST_ASSERT_NOT_NULL(z);
+    /* 2024.07.01D08:00 on the wall is 12:00 UTC, whichever is asked for */
+    TEST_ASSERT_EQ_I(instant(z, 773107200 - 14400, false), 773107200);
+    TEST_ASSERT_EQ_I(instant(z, 773107200 - 14400, true), 773107200);
+
+    /* autumn: 2024.11.03D01:30 was read twice, at 05:30 and at 06:30 UTC */
+    int64_t fall = 783928800;                       /* 06:00 UTC, the change */
+    int64_t w = fall - 14400 - 1800;                /* 01:30 on the wall */
+    TEST_ASSERT_EQ_I(instant(z, w, false), fall - 1800);
+    TEST_ASSERT_EQ_I(instant(z, w, true), fall + 1800);
+    /* the repeated hour is [01:00, 02:00): its ends are read once */
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400 - 3600 - 1, false), fall - 3600 - 1);
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400 - 3600 - 1, true), fall - 3600 - 1);
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400 - 3600, false), fall - 3600);
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400 - 3600, true), fall);
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400, false), fall + 3600);   /* 02:00, standard time only */
+    TEST_ASSERT_EQ_I(instant(z, fall - 14400, true), fall + 3600);
+
+    /* spring: 2024.03.10D02:30 was never read.  Earlier is the reading with
+     * the offset after the change, 06:30 UTC; later the one before, 07:30. */
+    int64_t spring = 763369200;                     /* 07:00 UTC, the change */
+    w = spring - 18000 + 1800;                      /* 02:30 on the wall */
+    TEST_ASSERT_EQ_I(instant(z, w, false), spring - 1800);
+    TEST_ASSERT_EQ_I(instant(z, w, true), spring + 1800);
+    /* the skipped hour is [02:00, 03:00) */
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000 - 1, false), spring - 1);
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000 - 1, true), spring - 1);
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000, false), spring - 3600);
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000, true), spring);
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000 + 3600, false), spring);   /* 03:00, daylight time */
+    TEST_ASSERT_EQ_I(instant(z, spring - 18000 + 3600, true), spring);
+
+    /* every instant comes back from its own wall clock under one choice or
+     * the other, and a hint carried from row to row changes no answer */
+    int32_t k = 0;
+    for (int64_t t = spring - 4 * 86400; t < fall + 4 * 86400; t += 977) {
+        int64_t ts = t * 1000000000LL, a = 0, b = 0;
+        int64_t wall = ts + z->off[ray_tz_find(z, ts)];
+        TEST_ASSERT_TRUE(ray_tz_instant(z, wall, false, &k, &a) && ray_tz_instant(z, wall, true, &k, &b));
+        TEST_ASSERT_FMT(a == ts || b == ts, "instant %lld is neither reading of its wall clock", (long long)t);
+        TEST_ASSERT_FMT(a <= b, "at %lld the earlier reading is the later", (long long)t);
+        int32_t fresh = 0;
+        int64_t c = 0;
+        TEST_ASSERT_TRUE(ray_tz_instant(z, wall, false, &fresh, &c) && c == a);
+    }
+
+    /* the ends of the range are not instants */
+    int64_t out = 0;
+    k = 0;
+    TEST_ASSERT_FALSE(ray_tz_instant(z, INT64_MIN, false, &k, &out));
+    TEST_ASSERT_FALSE(ray_tz_instant(z, INT64_MAX, true, &k, &out));
+    ray_tz_free(z);
+
+    /* a zone with no change has one reading everywhere */
+    static const int32_t utoff[] = {19800};
+    uint8_t buf[256];
+    size_t n = tzif(buf, '2', 0, NULL, NULL, 0, utoff, 1, "IST-5:30");
+    z = ray_tz_parse(buf, n);
+    TEST_ASSERT_NOT_NULL(z);
+    TEST_ASSERT_EQ_I(instant(z, 773107200 + 19800, false), 773107200);
+    TEST_ASSERT_EQ_I(instant(z, 773107200 + 19800, true), 773107200);
+    ray_tz_free(z);
+    PASS();
+}
+
 /* A change outside the TIMESTAMP range is folded into what holds before the
  * table, or dropped past its end. */
 static test_result_t test_tz_out_of_range_changes(void) {
@@ -403,6 +478,7 @@ const test_entry_t tz_entries[] = {
     { "tz/fixed_offset",         test_tz_fixed_offset,         tz_setup, tz_teardown },
     { "tz/julian_rules",         test_tz_julian_rules,         tz_setup, tz_teardown },
     { "tz/dst_all_year",         test_tz_dst_all_year,         tz_setup, tz_teardown },
+    { "tz/instant",              test_tz_instant,              tz_setup, tz_teardown },
     { "tz/out_of_range_changes", test_tz_out_of_range_changes, tz_setup, tz_teardown },
     { "tz/malformed",            test_tz_malformed,            tz_setup, tz_teardown },
     { "tz/data/every_zone_parses", test_tzdata_every_zone_parses, tz_setup, tz_teardown },

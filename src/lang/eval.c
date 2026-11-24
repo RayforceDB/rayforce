@@ -5844,6 +5844,7 @@ static void ray_register_builtins(void) {
     /* .time.tz.* — a UTC instant on a zone's wall clock */
     register_binary(".time.tz.local",   RAY_FN_NONE, ray_tz_local_fn);
     register_binary(".time.tz.offset",  RAY_FN_NONE, ray_tz_offset_fn);
+    register_vary  (".time.tz.utc",     RAY_FN_NONE, ray_tz_utc_fn);
     register_vary  (".time.tz.version", RAY_FN_NONE, ray_tz_version_fn);
 
     /* env — list all global environment bindings */

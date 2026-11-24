@@ -378,6 +378,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {".time.now", "(.time.now)"},
     {".time.tz.local", "(.time.tz.local <zone: sym, an IANA name> <x: timestamp>)"},
     {".time.tz.offset", "(.time.tz.offset <zone: sym, an IANA name> <x: timestamp>)"},
+    {".time.tz.utc", "(.time.tz.utc <zone: sym, an IANA name> <choice: sym, earlier or later> <wall: timestamp>)"},
     {".time.tz.version", "(.time.tz.version)"},
     {"datoms", "(datoms)"},
     {"assert-fact", "(assert-fact <db: datoms table> <entity> <attr: sym> <value>)"},

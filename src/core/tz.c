@@ -335,6 +335,47 @@ done:
 
 void ray_tz_free(ray_tz_t* z) { ray_sys_free(z); }
 
+bool ray_tz_instant(const ray_tz_t* z, int64_t wall, bool later, int32_t* k, int64_t* out) {
+    /* No offset is further than this from UTC, so the instant is within it of `wall`. */
+    const int64_t m = (int64_t)TZ_OFF_MAX * 1000000000LL;
+    if (wall < INT64_MIN + 2 * m || wall > INT64_MAX - 2 * m) return false;
+
+    /* No change within reach on either side: one offset, one reading. */
+    int32_t i = *k;
+    if ((i == 0 || z->at[i - 1] <= wall - m) && (i == z->n || wall + m < z->at[i])) {
+        *out = wall - z->off[i];
+        return true;
+    }
+    int32_t lo = ray_tz_find(z, wall - m), hi = ray_tz_find(z, wall + m);
+    if (lo == hi) {
+        *k = lo;
+        *out = wall - z->off[lo];
+        return true;
+    }
+
+    /* The readings that fall inside the span their offset holds for. */
+    bool found = false;
+    int64_t best = 0;
+    for (i = lo; i <= hi; i++) {
+        int64_t u = wall - z->off[i];
+        if ((i == 0 || z->at[i - 1] <= u) && (i == z->n || u < z->at[i])) {
+            if (!found || (later ? u > best : u < best)) best = u;
+            found = true;
+        }
+    }
+    /* None: the clock skipped `wall` at a change c.  Read with the offset
+     * before c it lands at or past c, and with the one after, short of it. */
+    for (int32_t c = lo; !found && c < hi; c++) {
+        int64_t before = wall - z->off[c], after = wall - z->off[c + 1];
+        if (before >= z->at[c] && after < z->at[c]) {
+            best = later == (before > after) ? before : after;
+            found = true;
+        }
+    }
+    if (found) *out = best;
+    return found;
+}
+
 int32_t ray_tzdata_index(const char* name, size_t len) {
     char key[65];
     if (!ray_tz_name_ok(name, len)) return -1;   /* which also bounds len to the key */

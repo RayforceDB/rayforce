@@ -83,6 +83,11 @@ ray_t* ray_trunc_fn(ray_t* unit, ray_t* x);
  * stays null, and so does a wall clock past the TIMESTAMP range. */
 ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x);
 ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x);
+/* (.time.tz.utc 'Zone 'earlier|'later wall): the instant at which the zone's
+ * wall clock read `wall`, a TIMESTAMP that carries no zone.  The choice says
+ * which of two candidate instants to take for an hour the clock repeated or
+ * skipped (ray_tz_instant); elsewhere both are the same instant. */
+ray_t* ray_tz_utc_fn(ray_t** args, int64_t n);
 /* (.time.tz.version): the IANA release of the database built in, "2026f". */
 ray_t* ray_tz_version_fn(ray_t** args, int64_t n);
 /* The database's index of the zone `zone_sym` names, with its table loaded;

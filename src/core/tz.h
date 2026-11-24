@@ -70,6 +70,15 @@ static inline int32_t ray_tz_find(const ray_tz_t* z, int64_t ts) {
     return lo;
 }
 
+/* The instant at which the zone's wall clock read `wall`, in *out.  Most wall
+ * times were read once.  Near a change of offset one has two candidates, the
+ * instant with the offset before the change and the instant with the offset
+ * after it: both happened where the clock went back (the hour is repeated),
+ * neither where it went forward (the hour is skipped).  `later` picks the
+ * later of the two, otherwise the earlier.  *k is the caller's hint, an index
+ * into z->off, 0 to start with.  False when the instant is not a TIMESTAMP. */
+bool ray_tz_instant(const ray_tz_t* z, int64_t wall, bool later, int32_t* k, int64_t* out);
+
 /* ---- The database built in (src/core/tzdata.c, generated) ----------------- */
 
 typedef struct {
