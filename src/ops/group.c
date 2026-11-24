@@ -2753,6 +2753,15 @@ bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups) {
     if (n_groups <= 0 || n_groups > CDPG_FEW_GROUPS || n_rows < 200000) return false;
     ray_pool_t* pool = ray_pool_live();
     if (!pool || ray_pool_total_workers(pool) < 2) return false;
+    /* The partitioned kernel is three passes over the rows (count, scatter,
+     * dedup) and stops scaling near 8 workers; the slices do less total work
+     * and keep scaling with the groups.  Measured on 5M rows: with 2-3
+     * workers the slices win below ~64 groups (the kernel's fixed work is
+     * ~2x theirs); from 16 workers on they win from ~64 groups up, so the
+     * kernel keeps only the few-group and skewed shapes there. */
+    int64_t workers = ray_pool_total_workers(pool);
+    if (workers < 4 && n_groups < 64) return false;
+    if (workers >= 16 && n_groups > 32) return false;
     int64_t wm = ray_heap_anon_watermark();
     if (wm > 0) {
         int64_t room = wm - ray_heap_anon_committed();

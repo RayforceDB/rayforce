@@ -508,6 +508,12 @@
 (at Rq40 'g) -- (+ 1 (til 40))
 (at Rq40 'u) -- (map (fn [g] (count (distinct (at xq (where (and (== (% (* nq 7) 40) (- g 1)) (> nq 1000))))))) (at Rq40 'g))
 (sum (at Rq40 'c)) -- 298999
+;; 256 groups: the kernel runs here with 2 to 15 workers; the 3 and 40 group
+;; cases above run it from 4 workers (3 groups also from 16), and the gate sends the
+;; rest to the per-group slices (same results either way).
+(set Rq256 (xasc (select {from: Tq by: {g: (% (* nq 7) 256)} c: (count x) u: (count (distinct x))}) 'g))
+(count Rq256) -- 256
+(at Rq256 'u) -- (map (fn [g] (count (distinct (at xq (where (== (% (* nq 7) 256) g)))))) (til 256))
 ;; the null is one value of the column: groups whose rows hold it count it
 (set xh (at (select {from: (table [i] (list nq)) x: (if (== (% i 2) 0) 0N (% i 5))}) 'x))
 (at (select {from: (table [k x] (list (% nq 2) xh)) by: {g: k} c: (count x) u: (count (distinct x))}) 'u) -- [1 5]
