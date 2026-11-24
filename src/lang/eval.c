@@ -3334,12 +3334,13 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
 }
 
 /* A vector condition tested whole by a bytecode jump inside a query, over its
- * rows (#1630): the condition of a jump other than `if`'s (`if` chooses per
- * row for a boolean vector, ray_cond_rows).  Tested whole, any non-empty
- * vector is true, so such a condition ran on the first row's say.  A condition
- * true on some rows and false on others is an error.
- * One true on every row, or false on every row, has one arm for all of them:
- * *truth is set to 1 or 0, the arm each row takes.  A vector of another
+ * rows (#1630): the condition of a jump other than `if`'s, which chooses per
+ * row for a boolean vector (ray_cond_rows).  The one such jump a vector
+ * reaches is a compiled `while`'s (a `times` count is normalized to an atom
+ * first).  Tested whole, any non-empty vector is true, so a loop over the
+ * rows ran on the first row's say.  A condition true on some rows and false
+ * on others is an error.  One true on every row, or false on every row, is
+ * that truth for all of them: *truth is set to 1 or 0.  A vector of another
  * length, or one not derived from the rows (`rows` 0: a global, a literal),
  * leaves *truth at -1, tested whole as outside a query.  NULL unless an
  * error. */
@@ -3364,9 +3365,9 @@ static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows
     }
     for (; k < len && !mixed; k++) mixed = (b[k] != 0) != first;
     if (mixed)
-        return ray_error("nyi", "if: its condition differs between the query's rows, "
-                         "and on this route it is tested whole, not row by row; "
-                         "see Conditionals: if in language/control-flow.md");
+        return ray_error("nyi", "while: its condition differs between the query's rows, "
+                         "and a loop tests it whole, not row by row; "
+                         "see Iteration: while in language/control-flow.md");
     *truth = first ? 1 : 0;
     return NULL;
 }

@@ -57,22 +57,23 @@ cnt -- 1
 (at (select {from: T where: (try (== a (if (== act 'New) 'x 'y)) (fn [e] false))}) 'i) -- [0 1 5 12 13 17]
 (at (select {m: (H a act) from: T}) 'm) -- [true true false false false true false false false false false false true true false false false true false false]
 (at (select {m: (sum (== a (if (== act 'New) (bump 'x) 'y))) from: T by: g}) 'm) -- [2 4]
-;; an opaque by: key whose whole-column run raises is run row by row
+;; an opaque by: key: a helper the planner does not inline, per row
 (at (select {c: (count i) from: T by: (H a act)}) 'c) -- [6 14]
 
 ;; ── 3. a condition the same on every row takes that row's arm ──
-;; True on every row: the first arm, as before.  False on every row: the
-;; fallback; tested whole, the non-empty vector was true and every row took
-;; the first arm.
+;; True on every row: the first arm.  False on every row: the fallback (a
+;; vector tested whole as one truth value, as before #1630 and #1605, gave
+;; every row the first arm).
 (at (select {from: T where: (== a (if (>= i 0) (bump (as 'sym "x")) 'y))}) 'i) -- [0 4 8 12 16]
 (at (select {from: T where: (== a (if (< i 0) (bump (as 'sym "x")) 'y))}) 'i) -- [1 5 9 13 17]
 ;; each group's own condition: by the key the condition follows
 (at (select {m: (sum (== a (if (== act 'New) (bump (as 'sym "x")) 'y))) from: T by: act}) 'm) -- [2 2 2]
-;; a one-row table
+;; the same in a helper the planner does not inline, run as bytecode
 (set H1 (fn [v w] (let k 1) (== v (if (>= w 0) 'x 'y))))
 (set H0 (fn [v w] (let k 1) (== v (if (< w 0) 'x 'y))))
 (at (select {from: T where: (H1 a i)}) 'i) -- [0 4 8 12 16]
 (at (select {from: T where: (H0 a i)}) 'i) -- [1 5 9 13 17]
+;; a one-row table
 (set T1 (table [a act i] (list ['x] ['New] [0])))
 (at (select {from: T1 where: (== a (if (== act 'New) (bump (as 'sym "x")) 'y))}) 'i) -- [0]
 
