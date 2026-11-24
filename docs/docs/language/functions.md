@@ -250,7 +250,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `list` | variadic | Create a list from vectors | `(list [1 2] [A B])` |
-| `table` | binary | Create a table from column names and columns. A LIST of numeric atoms of one type keeps that type; mixed numeric atoms use the wider type (BOOL < U8 < I16 < I32 < I64 < F32 < F64), except F32 mixed with another numeric type gives F64. Typed nulls stay null except in BOOL and U8 columns, which store false and zero respectively. | `(table [x y] (list [1 2] [A B]))` |
+| `table` | binary | Create a table from column names and columns. A LIST of numeric atoms of one type keeps that type; mixed numeric atoms use the wider type (BOOL < U8 < I16 < I32 < I64 < F64); F32 atoms alone give F32, and F32 mixed with any other numeric type gives F64. Typed nulls stay null except in BOOL and U8 columns, which store false and zero respectively. | `(table [x y] (list [1 2] [A B]))` |
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
