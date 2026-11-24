@@ -47,6 +47,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #ifndef RAY_OS_WINDOWS
 #include <pthread.h>   /* pthread_kill -- the .time.sleep cancel test */
 #include <signal.h>
@@ -914,6 +915,54 @@ static test_result_t test_closure_tmpl_live_entry_own_nfo(void) {
         ray_release(c);
         TEST_ASSERT_FMT(own, "case %zu: the closure does not carry its definition's text", d);
     }
+    PASS();
+}
+
+/* ---- #1615: a like pattern's dropped plan-time error leaves no trace ----
+ * A pattern computed from no column is evaluated once when the query is
+ * planned; when that raises, the error is dropped and the pattern keeps its
+ * deferred route.  A select that keeps no row then answers no rows, and the
+ * thread's last-error message and usage, the VM's trace and its pending
+ * raise are what they were before the select. */
+static test_result_t test_like_pattern_probe_leaves_no_trace(void) {
+    ray_t* r = ray_eval_str("(set T1615 (table [t v] (list (as 'STR (list \"ab\" \"cd\")) [0 1])))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    static const char* const qs[] = {
+        "(select {k: (like t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (ilike t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (sum (like t (take \"a*\" \"bad\"))) by: v from: T1615 where: (< v 0)})",
+        "(select {k: (if (> v 5) (like t (take \"a*\" \"bad\")) false) from: T1615 where: (< v 0)})",
+    };
+    for (int before = 0; before < 2; before++) {
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            ray_error_clear();
+            const char* prior = NULL;
+            if (before) {          /* an earlier error's message stays the last one */
+                r = ray_eval_str("(+ 1 'a)");
+                TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+                ray_error_free(r);
+                prior = ray_error_msg();
+                TEST_ASSERT_NOT_NULL(prior);
+            }
+            char saved[256] = "";
+            if (prior) snprintf(saved, sizeof saved, "%s", prior);
+            const char* usage0 = ray_error_usage();
+            ray_t* trace0 = __VM->trace;
+            ray_t* raise0 = __VM->raise_val;
+            r = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 0,
+                            "query %zu: not an empty table", i);
+            ray_release(r);
+            const char* now = ray_error_msg();
+            TEST_ASSERT_FMT(before ? (now && strcmp(now, saved) == 0) : now == NULL,
+                            "query %zu: last message %s", i, now ? now : "<none>");
+            TEST_ASSERT_FMT(ray_error_usage() == usage0, "query %zu: usage changed", i);
+            TEST_ASSERT_FMT(__VM->trace == trace0, "query %zu: trace changed", i);
+            TEST_ASSERT_FMT(__VM->raise_val == raise0, "query %zu: pending raise changed", i);
+        }
+    }
+    ray_error_clear();
     PASS();
 }
 
@@ -9897,6 +9946,71 @@ static test_result_t test_time_sleep_cancel(void) {
     PASS();
 }
 
+/* ---- #1623: the interrupt flag is one atomic, shared by every thread ----
+ * A take consumes exactly one pending interrupt: a request is seen once,
+ * and a take with nothing pending finds nothing.  Single-threaded. */
+static test_result_t test_interrupt_take(void) {
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_interrupted());
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* requests do not stack: two before a take are one interrupt */
+    ray_request_interrupt();
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* a clear drops a pending one */
+    ray_request_interrupt();
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    PASS();
+}
+
+/* Threads that request, clear, look at and take the interrupt at once, as
+ * an in-process IPC server (a clear per request) and client threads (a look
+ * before each wait, a take to forward a Ctrl-C) do.  Under ThreadSanitizer
+ * the flag being a plain volatile reported a data race on every pair; as an
+ * atomic it reports none.  The count of takes that found an interrupt can
+ * never exceed the requests made (a take consumes one, nothing invents
+ * one).  Named for the TSan job's `parallel` filter. */
+#define IFLAG_THREADS 3
+#define IFLAG_ITERS   20000
+static _Atomic int64_t g_iflag_requests, g_iflag_taken;
+static void iflag_worker(void* arg) {
+    int role = (int)(intptr_t)arg;
+    for (int i = 0; i < IFLAG_ITERS; i++) {
+        switch ((role + i) % 4) {
+        case 0: ray_request_interrupt(); atomic_fetch_add(&g_iflag_requests, 1); break;
+        case 1: ray_clear_interrupt(); break;
+        case 2: (void)ray_interrupted(); break;
+        default: if (ray_take_interrupt()) atomic_fetch_add(&g_iflag_taken, 1); break;
+        }
+    }
+}
+
+static test_result_t test_interrupt_flag_threads(void) {
+    ray_clear_interrupt();
+    atomic_store(&g_iflag_requests, 0);
+    atomic_store(&g_iflag_taken, 0);
+    ray_thread_t tid[IFLAG_THREADS];
+    for (int t = 0; t < IFLAG_THREADS; t++)
+        TEST_ASSERT_EQ_I(ray_thread_create(&tid[t], iflag_worker, (void*)(intptr_t)t), RAY_OK);
+    iflag_worker((void*)(intptr_t)IFLAG_THREADS);
+    for (int t = 0; t < IFLAG_THREADS; t++) ray_thread_join(tid[t]);
+    int64_t taken = atomic_load(&g_iflag_taken), asked = atomic_load(&g_iflag_requests);
+    ray_clear_interrupt();
+    TEST_ASSERT_FMT(taken <= asked, "%lld takes found an interrupt, %lld were requested",
+                    (long long)taken, (long long)asked);
+    /* the flag is usable afterwards, as it was */
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    PASS();
+}
+
 /* Under -U a sleep is refused: it would stop the single-threaded server
  * for every connection, as .sys.exec "sleep" would, and that is restricted. */
 static test_result_t test_time_sleep_restricted(void) {
@@ -15085,6 +15199,7 @@ static test_result_t test_sym_private_range(void) {
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/query/like_pattern_probe_leaves_no_trace", test_like_pattern_probe_leaves_no_trace, lang_setup, lang_teardown },
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
@@ -15430,6 +15545,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
     { "lang/time_sleep_cancel", test_time_sleep_cancel, lang_setup, lang_teardown },
     { "lang/time_sleep_restricted", test_time_sleep_restricted, lang_setup, lang_teardown },
+    { "lang/interrupt_take", test_interrupt_take, lang_setup, lang_teardown },
+    { "lang/parallel_interrupt_flag", test_interrupt_flag_threads, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },

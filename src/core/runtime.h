@@ -219,4 +219,11 @@ const char* ray_err_code(ray_t* err);
 
 /* ray_error_msg / ray_error_clear: public, include/rayforce.h */
 
+/* The thread's last-error state (ray_error_msg, ray_error_usage): saved
+ * before an evaluation whose error the caller may drop, and restored when
+ * it does, so the dropped error leaves no trace in it. */
+typedef struct { char msg[256]; const char* usage; } ray_error_state_t;
+void ray_error_state_save(ray_error_state_t* s);
+void ray_error_state_restore(const ray_error_state_t* s);
+
 #endif /* RAY_RUNTIME_H */

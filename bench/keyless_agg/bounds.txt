@@ -1,0 +1,19 @@
+# <aggregate, then optionally where:>|<max instructions per table row>,
+# keyless, over 1M rows (check.sh runs (select {s: <this> from: T})).
+# Measured with a gcc 12 release build: see the #1628 commit for the table.
+(sum v)|1.5
+(avg v)|1.5
+(min v)|2.5
+(max v)|2.5
+(prod v)|5
+(first v)|0.5
+(last v)|0.5
+(sum fv)|1.0
+(avg fv)|1.0
+(min fv)|8
+(max fv)|8
+(prod fv)|12
+(first fv)|0.5
+(last fv)|0.5
+(sum v) where: (> w 2)|25
+(min fv) where: (> w 2)|30

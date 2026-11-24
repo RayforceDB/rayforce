@@ -1988,8 +1988,27 @@ static ray_op_t* compile_const_str_expr(ray_graph_t* g, ray_t* expr) {
 
 static int expr_contains_call_named(ray_t* expr, const char* name, size_t name_len);
 
+/* The RAY_EXTRACT_* field of a name bound to one of the temporal accessor
+ * builtins (yyyy mm dd hh minute ss dow doy), -1 otherwise.  Matched on the
+ * binding, not the spelling: a rebound `dd` is the user's function. */
+static int temporal_extract_builtin_field(int64_t id) {
+    ray_t* fn = ray_env_get(id);
+    if (!fn || RAY_IS_ERR(fn) || fn->type != RAY_UNARY) return -1;
+    ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
+    if (f == ray_extract_yyyy_fn)   return RAY_EXTRACT_YEAR;
+    if (f == ray_extract_mm_fn)     return RAY_EXTRACT_MONTH;
+    if (f == ray_extract_dd_fn)     return RAY_EXTRACT_DAY;
+    if (f == ray_extract_hh_fn)     return RAY_EXTRACT_HOUR;
+    if (f == ray_extract_minute_fn) return RAY_EXTRACT_MINUTE;
+    if (f == ray_extract_ss_fn)     return RAY_EXTRACT_SECOND;
+    if (f == ray_extract_dow_fn)    return RAY_EXTRACT_DOW;
+    if (f == ray_extract_doy_fn)    return RAY_EXTRACT_DOY;
+    return -1;
+}
+
 bool ray_query_rowwise_builtin(int64_t id) {
     if (resolve_unary_dag(id) || resolve_binary_dag(id) || resolve_agg_opcode(id)) return true;
+    if (temporal_extract_builtin_field(id) >= 0) return true;
     /* Forms compile_expr_dag lowers by name rather than through a table. */
     /* reverse/asc/desc reorder a column but keep every row of it. */
     static const char* const names[] = {
@@ -2212,6 +2231,58 @@ static ray_op_t* compile_agg_arg_dag(ray_graph_t* g, ray_t* expr) {
 
 /* compile_expr_dag_node, with the readers of a lowered temporal +/- integer
  * held to dag_temporal_int_readers_ok at each level. */
+static bool query_inline_pure(ray_t* expr, int depth);
+static bool expr_reads_no_column(ray_t* expr, ray_t* tbl);
+
+/* The pattern of like / ilike written as a call that reads no column and
+ * has no effect ((as 'STR (list "a*" "c?")), (take P 3)) is one value
+ * whatever the rows: evaluated once here and given to the kernel as a
+ * constant, it is matched row by row, or raises the length error, as a
+ * literal is.  Left to the evaluator it met each row's text whole, and
+ * ilike, which only the planner knows, was not found (#1615).  NULL when
+ * the pattern is not such a call (it compiles as before), or when its
+ * evaluation raises: the error is dropped here and the expression keeps
+ * its deferred route, which raises it only when a row needs the pattern,
+ * so a select that keeps no row still answers with no rows. */
+static ray_op_t* like_pattern_const(ray_graph_t* g, ray_t* pat) {
+    if (!g->table || !pat || pat->type != RAY_LIST || (pat->attrs & ATTR_QUOTED) || ray_len(pat) < 2)
+        return NULL;
+    if (!query_inline_pure(pat, 0) || !expr_reads_no_column(pat, g->table)) return NULL;
+    /* The evaluation is speculative: when it fails, its error is dropped
+     * and must leave no trace.  Keep the thread's last-error state and the
+     * VM's trace and pending raise to put back (the old trace is held, so a
+     * frame appended meanwhile goes to a copy). */
+    ray_error_state_t es;
+    ray_error_state_save(&es);
+    ray_t* trace0 = __VM ? __VM->trace : NULL;
+    ray_t* raise0 = __VM ? __VM->raise_val : NULL;
+    if (trace0) ray_retain(trace0);
+    if (raise0) ray_retain(raise0);
+    ray_t* v = ray_eval(pat);
+    if (v && !RAY_IS_ERR(v) && ray_is_lazy(v)) v = ray_lazy_materialize(v);
+    bool failed = !v || RAY_IS_ERR(v);
+    if (failed) {
+        if (v) ray_error_free(v);
+        ray_error_state_restore(&es);
+        if (__VM && __VM->trace != trace0) {
+            if (__VM->trace) ray_release(__VM->trace);
+            __VM->trace = trace0;             /* takes the hold */
+            trace0 = NULL;
+        }
+        if (__VM && __VM->raise_val != raise0) {
+            if (__VM->raise_val) ray_release(__VM->raise_val);
+            __VM->raise_val = raise0;         /* takes the hold */
+            raise0 = NULL;
+        }
+    }
+    if (trace0) ray_release(trace0);
+    if (raise0) ray_release(raise0);
+    if (failed) return NULL;
+    ray_op_t* op = v->type < 0 ? ray_const_atom(g, v) : ray_const_vec(g, v);
+    ray_release(v);
+    return op;
+}
+
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     uint32_t base = g->node_count;
     ray_op_t* r = compile_expr_dag_node(g, expr);
@@ -2907,6 +2978,14 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             else if (fname_len == 6 && memcmp(fname, "second",6) == 0) field = RAY_EXTRACT_SECOND;
             else if (fname_len == 9 && memcmp(fname, "dayofweek",9) == 0) field = RAY_EXTRACT_DOW;
             else if (fname_len == 9 && memcmp(fname, "dayofyear",9) == 0) field = RAY_EXTRACT_DOY;
+            /* the accessor builtins themselves: (dd col) is col.dd, unless
+             * a column of that name shadows the builtin (as in eval) */
+            else {
+                ray_col_meta_t shadow;
+                if (!(g->table && g->table->type == RAY_TABLE &&
+                      ray_table_col_meta(g->table, fn_sym, &shadow)))
+                    field = temporal_extract_builtin_field(fn_sym);
+            }
             if (field >= 0) {
                 ray_op_t* col = compile_expr_dag(g, elems[1]);
                 if (!col) return NULL;
@@ -3137,6 +3216,8 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
                 if (!right && (ctor == ray_in || ctor == ray_not_in) &&
                     in_set_names_global_value(g, elems[2]))
                     return NULL;
+                if (!right && (ctor == ray_like || ctor == ray_ilike))
+                    right = like_pattern_const(g, elems[2]);
                 if (!right) right = compile_expr_dag(g, elems[2]);
                 if (!right) return NULL;
                 left = &g->nodes[left_id];
@@ -4864,7 +4945,7 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
         if (!arg) return 0;
         if (arg->type == -RAY_I64) {
             /* Opaque tagged handles are not ordinary numeric literals. */
-            if (arg->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL)) return 0;
+            if (arg->attrs & RAY_HANDLE_ATTRS) return 0;
             continue;
         }
         if (arg->type != -RAY_SYM || (arg->attrs & ATTR_QUOTED) ||
@@ -11988,6 +12069,16 @@ ray_t* ray_query_helper_value(int64_t sym) {
     if (!cell || RAY_IS_ERR(cell)) return cell;
     if (!allocated) ray_retain(cell);
     return cell;
+}
+
+int64_t ray_query_rows_len(void) {
+    ray_t* qt = g_active_query_table;
+    if (!qt || qt->type != RAY_TABLE) return -1;
+    if (query_group_idx_applies(qt)) return ray_len(g_active_query_group_idx);
+    if (g_active_query_row >= 0 && qt == g_active_query_row_tbl &&
+        !ray_env_query_scope_above(g_active_query_row_depth))
+        return -1;
+    return ray_table_nrows(qt);
 }
 
 ray_t* ray_active_query_literal(int64_t sym) {
@@ -31896,7 +31987,12 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
         if_refused = g->if_refused;
         ray_graph_free(g);
     }
-    if (update_dag_err_final(out, cerr, if_refused)) {
+    /* ilike is known to the planner alone: the interpreter's retry could
+     * only fail with a name error, which also took over the message of the
+     * planner's error (#1615).  The planner's error stands. */
+    bool dag_failed = (out && RAY_IS_ERR(out)) || (!out && cerr);
+    if (update_dag_err_final(out, cerr, if_refused) ||
+        (dag_failed && expr_contains_call_named(expr, "ilike", 5))) {
         if (!out) return cerr;
         if (cerr) ray_error_free(cerr);
         return out;

@@ -31,7 +31,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.csv.read`, `.csv.write`, `.csv.splayed`, `.csv.parted`
 - `.db.splayed.set`, `.db.parted.fill`
 - `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`, `.ipc.txlimit`, `.ipc.transport`
-- `.log.open`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
+- `.log.open`, `.log.posts`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`

@@ -725,6 +725,7 @@ ray_t* ray_log_validate_fn(ray_t* path);
 ray_t* ray_log_roll_fn(ray_t** args, int64_t n);
 ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n);
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n);
+ray_t* ray_log_posts_fn(ray_t** args, int64_t n);
 ray_t* ray_log_close_fn(ray_t** args, int64_t n);
 ray_t* ray_log_purge_fn(ray_t** args, int64_t n);
 

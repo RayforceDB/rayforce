@@ -678,6 +678,25 @@ static _Thread_local char g_ser_fail_code[8];
 void ray_serde_fail_clear(void) { g_ser_fail_code[0] = '\0'; }
 const char* ray_serde_fail_code(void) { return g_ser_fail_code[0] ? g_ser_fail_code : NULL; }
 
+/* Set when the size pass meets a process-local handle (an I64 atom with
+ * any of RAY_HANDLE_ATTRS): its .i64 slot is a pointer into this process,
+ * so it has no wire form. */
+static _Thread_local bool g_ser_handle_hit = false;
+
+static int64_t ser_note_handle(void) {
+    g_ser_handle_hit = true;
+    return 0;
+}
+
+bool ray_serde_holds_handle(ray_t* obj) {
+    g_ser_handle_hit = false;
+    (void)ray_serde_size(obj);
+    bool hit = g_ser_handle_hit;
+    g_ser_handle_hit = false;
+    g_ser_fail_code[0] = '\0';
+    return hit;
+}
+
 static int64_t ser_note_col_failure(ray_t* err) {
     const char* code = ray_err_code(err);
     snprintf(g_ser_fail_code, sizeof g_ser_fail_code, "%s", code ? code : "domain");
@@ -797,7 +816,7 @@ static int64_t serde_size_impl(ray_t* obj) {
         case RAY_TIME:
         case RAY_F32:       return 1 + 1 + 4;
         case RAY_I64:
-            if (obj->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL)) return 0;
+            if (obj->attrs & RAY_HANDLE_ATTRS) return ser_note_handle();
             return 1 + 1 + 8;
         case RAY_TIMESPAN: case RAY_TIMESTAMP:
         case RAY_F64:       return 1 + 1 + 8;
@@ -937,8 +956,7 @@ static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
      * carries the typed-null marker (aux[0] & 1 on the source atom)
      * so (de (ser 0Nl)) roundtrips instead of decoding as plain 0. */
     if (type < 0) {
-        if (type == -RAY_I64 &&
-            (obj->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL))) return 0;
+        if (ray_is_handle_atom(obj)) return 0;
         buf[0] = (uint8_t)type;
         buf++;
         uint8_t aflags = (uint8_t)(obj->aux[0] & 1);

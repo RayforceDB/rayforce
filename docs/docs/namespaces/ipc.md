@@ -110,6 +110,8 @@ Signature: `(.ipc.post h msg)`. Sends `msg` asynchronously — fire-and-forget. 
 
 Because no response is returned, the only failures the caller can observe are **local** ones. A remote evaluation error is logged on the receiving side and dropped — it never reaches the sender.
 
+A server with a journal open (`-l`/`-L` or [`.log.open`](log.md#log-open)) does not journal a posted message by default, so its effects are not rebuilt on recovery. With the posts switch on (`--log-posts 1` or [`(.log.posts 1)`](log.md#log-posts)) the message is journaled before it is evaluated, like a request sent with `.ipc.send`, and replay rebuilds its effects, without running the `.ipc.on.async` hook. Read [`.log.posts`](log.md#log-posts) before turning it on: under `-L` each post costs an `fsync`, about 5 ms on x86 with an NVMe disk, and the functions a post names must exist when the journal is replayed.
+
 Returns the null object on a successful local send. Errors: `type` (`h` not an `i64`/`i32`, or `msg` not serialisable), `io` (handle invalid / connection closed / socket write failed).
 
 ```text
