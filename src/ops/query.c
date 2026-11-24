@@ -4965,8 +4965,13 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
     ray_t* head = ((ray_t**)ray_data(expr))[0];
-    if (!head || head->type != -RAY_SYM) return 0;
-    ray_t* fn = ray_env_get(head->i64);
+    if (!head) return 0;
+    /* ((quote as) 'T c) is the cast (as 'T c) is (#1585). */
+    int64_t as_sym = ray_sym_intern("as", 2);
+    int64_t head_sym = head->type == -RAY_SYM ? head->i64
+                     : quote_call_sym(head) == as_sym ? as_sym : -1;
+    if (head_sym < 0) return 0;
+    ray_t* fn = ray_env_get(head_sym);
     if (fn && fn->type == RAY_LAMBDA) {
         ray_graph_t* g = ray_graph_new(tbl);
         if (!g) return 0;
@@ -4976,7 +4981,7 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         ray_graph_free(g);
         return whole;
     }
-    ray_t* s = ray_sym_str(head->i64);
+    ray_t* s = ray_sym_str(head_sym);
     if (!s) return 0;
     size_t l = ray_str_len(s);
     const char* p = ray_str_ptr(s);

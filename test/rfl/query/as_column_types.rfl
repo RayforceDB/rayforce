@@ -32,13 +32,46 @@
 ;; #1586: the quoted spellings ((quote as) 'T c) and (as (quote T) c)
 ;; cast as (as 'T c) does.  A DATE, TIME or TIMESTAMP column to U8 was
 ;; refused by both, cast one cell at a time, where the eager cast answers.
-;; Every input but LIST (the last column, #1585).
 (set QQ (fn [x c] (list (R (format "(as '% (at P '%))" x c)) (R (format "(at (select {r: ((quote as) '% %) from: P}) 'r)" x c)) (R (format "(at (select {r: (as (quote %) %) from: P}) 'r)" x c)) (R (format "(at (update {r: ((quote as) '% %) from: P}) 'r)" x c)) (R (format "(as '% (at (at P '%) [1 2 3]))" x c)) (R (format "(at (select {r: ((quote as) '% %) from: P where: (> k 0)}) 'r)" x c)) (R (format "(at (select {r: (as (quote %) %) from: P where: (> k 0)}) 'r)" x c)))))
 (set BadQ (fn [x c] (let q (QQ x c)) (or (not (identical (at q 0) (at q 1))) (not (identical (at q 0) (at q 2))) (not (identical (at q 0) (at q 3))) (not (identical (at q 4) (at q 5))) (not (identical (at q 4) (at q 6))))))
 (set FailsQ (fn [c] (sum (map (fn [x] (as 'I64 (BadQ x c))) X))))
-(map FailsQ (at C (til 14))) -- [0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+(map FailsQ C) -- [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
 (set D (table [d t p] (list [2024.01.02 0Nd 2024.03.04] (as 'TIME [1000 0Nl 3000]) (as 'TIMESTAMP [1000 0Nl 3000]))))
 (at (select {r: ((quote as) 'U8 d) from: D}) 'r) -- [0x3f 0x00 0x7d]
 (at (select {r: ((quote as) 'U8 t) from: D}) 'r) -- [0xe8 0x00 0xb8]
 (at (select {r: ((quote as) 'U8 p) from: D}) 'r) -- [0xe8 0x00 0xb8]
 (at (select {r: (as (quote U8) d) from: D}) 'r) -- (as 'U8 (at D 'd))
+;; #1585: a quoted cast of a LIST column casts the column as a whole, as
+;; the plain spelling and the eager cast do (#1406), where it cast each
+;; cell on its own.
+(set L (table [c v] (list (list [1] 2 "a" (list)) [1 2 3 4])))
+(at (select {r: ((quote as) 'STR c) from: L}) 'r) -- ["1" "2" "a" ""]
+(at (select {r: ((quote as) 'SYM c) from: L}) 'r) -- (as 'SYM (at L 'c))
+(at (select {r: ((quote as) 'BOOL c) from: L}) 'r) -- [true true true false]
+(at (select {r: ((quote as) 'B8 c) from: L}) 'r) -- [true true true false]
+(at (select {r: ((quote as) 'LIST c) from: L}) 'r) -- (at L 'c)
+(at (select {r: ((quote as) 'STR c) from: L where: (> v 1)}) 'r) -- ["2" "a" ""]
+(at (select {r: ((quote as) 'STR c) s: v from: L}) 'r) -- ["1" "2" "a" ""]
+;; The whole matrix: every input column type, every target, every route,
+;; fused and unfused, against the eager cast.  The targets are the column
+;; types themselves (and BOOL, the spelling the compiled cast matches), so
+;; a type added to the matrix is a target too; srccheck/as_matrix_types
+;; fails when the engine has a vector type the matrix has no column of.
+(set M (table [k g cb cu ch ci cl ce cf cd ct cp cg cy cs cn cx] (list [0 1 2 3] [0 0 1 1] [true false false true] (as 'U8 [1 0 0 3]) (as 'I16 [1 0 0Nl 3]) (as 'I32 [1 0 0Nl 3]) [1 0 0Nl 3] (as 'F32 [1 0 0Nl 3]) [1.0 0.0 0Nf 3.0] (as 'DATE [1 0 0Nl 3]) (as 'TIME [1 0 0Nl 3]) (as 'TIMESTAMP [1 0 0Nl 3]) (guid 4) [a b c d] ["1" "0" "" "3"] (as 'TIMESPAN [1 0 0Nl 3]) (list [1] () 0Nl "a"))))
+(set MC ['cb 'cu 'ch 'ci 'cl 'ce 'cf 'cd 'ct 'cp 'cg 'cy 'cs 'cn 'cx])
+(asc (map (fn [c] (type (at M c))) MC)) -- [B8 DATE F32 F64 GUID I16 I32 I64 LIST STR SYM TIME TIMESPAN TIMESTAMP U8]
+(set MX (concat (map (fn [c] (type (at M c))) MC) ['BOOL]))
+;; each route: the eager form, then the query form
+(set MR (list (list "(as '% (at M '%))" "(at (select {r: (as '% %) from: M}) 'r)") (list "(as '% (at M '%))" "(at (select {r: ((quote as) '% %) from: M}) 'r)") (list "(as '% (at M '%))" "(at (update {r: (as '% %) from: M}) 'r)") (list "(as '% (at M '%))" "(at (update {r: ((quote as) '% %) from: M}) 'r)") (list "(as '% (at (at M '%) [1 2 3]))" "(at (select {r: (as '% %) from: M where: (> k 0)}) 'r)") (list "(as '% (at (at M '%) [1 2 3]))" "(at (select {r: ((quote as) '% %) from: M where: (> k 0)}) 'r)") (list "(at (at M 'k) (where (nil? (as '% (at M '%)))))" "(at (select {k: k from: M where: (nil? (as '% %))}) 'k)") (list "(enlist (first (as '% (at M '%))))" "(at (select {r: (first (as '% %)) from: M}) 'r)") (list "(map (fn [i] (as '% (at (at M '%) (enlist i)))) (til 4))" "(at (select {r: (as '% %) from: M by: k}) 'r)") (list "(map (fn [i] (as '% (at (at M '%) i))) (list [0 1] [2 3]))" "(at (select {r: (as '% %) from: M by: g}) 'r)") (list "(map (fn [i] (as '% (at (at M '%) i))) (list [0 1] [2 3]))" "(at (select {r: ((quote as) '% %) from: M by: g}) 'r)")))
+(set MOff (fn [ri x c] (let rt (at MR ri)) (not (identical (R (format (at rt 0) x c)) (R (format (at rt 1) x c))))))
+;; the probes whose route differs from eager, as "route target column"
+(set MBad (raze (map (fn [ri] (raze (map (fn [c] (raze (map (fn [x] (if (MOff ri x c) (enlist (format "% % %" ri x c)) (list))) MX))) MC))) (til (count MR)))))
+;; Two cases still differ, each kept as it is documented or as eager has it:
+;; #1582, a select of (as 'LIST c) over a column of atoms is cast per row and
+;; refused (docs: guides/types.md, data-types), where eager boxes the column;
+;; #1583, a select of a STR column to GUID parses each string, as the atom
+;; cast does, where the eager vector cast refuses.  Both on the select
+;; projection, plain and quoted, with and without where: (routes 0 1 4 5).
+(set MExp (raze (map (fn [ri] (concat (map (fn [c] (format "% LIST %" ri c)) (at MC (til 14))) (enlist (format "% GUID cs" ri)))) [0 1 4 5])))
+(asc (as 'SYM MBad)) -- (asc (as 'SYM MExp))
+(count MBad) -- 60

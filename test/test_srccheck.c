@@ -25,6 +25,7 @@
 #include "test.h"
 #include "table/table.h"
 #include "vec/vec.h"
+#include "lang/format.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -520,6 +521,37 @@ static test_result_t test_encidx_float_bits(void) {
     PASS();
 }
 
+/* test/rfl/query/as_column_types.rfl checks `as` in a query against the
+ * eager cast over a matrix whose inputs and targets are its columns' types,
+ * and pins those types on one line.  Every vector type the engine names must
+ * be on that line, so a new type cannot go untested (#1573). */
+static test_result_t test_as_matrix_types(void) {
+    static const char* const lead = "(asc (map (fn [c] (type (at M c))) MC)) -- [";
+    struct stat st;
+    const char* root = stat("src/table/table.c", &st) == 0 ? "." : "..";
+    char path[128]; snprintf(path, sizeof path, "%s/test/rfl/query/as_column_types.rfl", root);
+    FILE* f = fopen(path, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    char line[1024]; char types[1024] = "";
+    while (fgets(line, sizeof line, f))
+        if (strncmp(line, lead, strlen(lead)) == 0) { snprintf(types, sizeof types, " %s", line + strlen(lead)); break; }
+    fclose(f);
+    TEST_ASSERT_FMT(types[0] != 0, "%s has no type line", path);
+    char* close = strchr(types, ']');
+    TEST_ASSERT_NOT_NULL(close);
+    close[0] = ' '; close[1] = 0;
+    int ntypes = 0;
+    for (int t = 0; t < RAY_PARTED_BASE; t++) {   /* plain vector types */
+        const char* name = ray_type_name((int8_t)t);
+        if (strcmp(name, "?") == 0) continue;
+        char tok[40]; snprintf(tok, sizeof tok, " %s ", name);
+        TEST_ASSERT_FMT(strstr(types, tok) != NULL, "%s has no %s column", path, name);
+        ntypes++;
+    }
+    TEST_ASSERT_EQ_I(ntypes, 15);
+    PASS();
+}
+
 const test_entry_t srccheck_entries[] = {
     { "srccheck/no_legacy_getters", test_no_legacy_getters, NULL, NULL },
     { "srccheck/no_raw_column_list",  test_no_raw_column_list,  NULL, NULL },
@@ -532,5 +564,6 @@ const test_entry_t srccheck_entries[] = {
     { "srccheck/firstn_reads_by_range",      test_firstn_reads_by_range,      NULL, NULL },
     { "srccheck/no_p3_markers",              test_no_p3_markers,              NULL, NULL },
     { "srccheck/encidx_float_bits",          test_encidx_float_bits,          NULL, NULL },
+    { "srccheck/as_matrix_types",            test_as_matrix_types,            NULL, NULL },
     { NULL, NULL, NULL, NULL },
 };
