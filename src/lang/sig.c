@@ -98,6 +98,7 @@ static const ray_sig_entry_t sigs[] = {
     {"percentile", "(percentile <x: numeric vector> <p: num in 0..100>)"},
     {"quantile", "(quantile <x: numeric vector> <p: num in 0..1>)"},
     {".emb.cos-dist", "(.emb.cos-dist <a: numeric vector> <b: numeric vector>)"},
+    {".emb.tokens", "(.emb.tokens <model: model handle> <text: str or vector of str>)"},
     {".emb.l2-dist", "(.emb.l2-dist <a: numeric vector> <b: numeric vector>)"},
     {".emb.inner-prod", "(.emb.inner-prod <a: numeric vector> <b: numeric vector>)"},
     {"mmu", "(mmu <a: numeric vector or list of rows> <b: numeric vector or list of rows>)"},
@@ -251,6 +252,8 @@ static const ray_sig_entry_t sigs[] = {
     {".emb.hnsw.free", "(.emb.hnsw.free <index: hnsw index handle>)"},
     {".emb.hnsw.info", "(.emb.hnsw.info <index: hnsw index handle>)"},
     {".emb.hnsw.get", "(.emb.hnsw.get <path: str>)"},
+    {".emb.model.get", "(.emb.model.get <dir: str>)"},
+    {".emb.model.info", "(.emb.model.info <model: model handle>)"},
 };
 
 /* Builtins that run other code (callbacks, expressions, queries) or take a

@@ -1,0 +1,64 @@
+/*
+ *   Copyright (c) 2025-2026 Anton Kundenko <singaraiona@gmail.com>
+ *   All rights reserved.
+
+ *   Permission is hereby granted, free of charge, to any person obtaining a copy
+ *   of this software and associated documentation files (the "Software"), to deal
+ *   in the Software without restriction, including without limitation the rights
+ *   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *   copies of the Software, and to permit persons to whom the Software is
+ *   furnished to do so, subject to the following conditions:
+
+ *   The above copyright notice and this permission notice shall be included in all
+ *   copies or substantial portions of the Software.
+
+ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *   SOFTWARE.
+ */
+
+#ifndef RAY_EMBMODEL_H
+#define RAY_EMBMODEL_H
+
+/*
+ * embmodel.h -- a text-embedding model held by the engine: its tokenizer and,
+ * in time, its weights (docs/docs/namespaces/emb.md).
+ *
+ * A model is opened from a directory as its publisher ships it (config.json,
+ * tokenizer.json, model.safetensors) and never changes afterwards, so every
+ * handle to it shares the one object by count.
+ */
+#include <rayforce.h>
+#include <stdbool.h>
+
+typedef struct ray_embmodel ray_embmodel_t;
+
+/* Opens the model in `dir`.  NULL on failure, with the reason in *err (an
+ * error object the caller returns). */
+ray_embmodel_t* ray_embmodel_open(const char* dir, ray_t** err);
+void ray_embmodel_retain(ray_embmodel_t* m);
+void ray_embmodel_release(ray_embmodel_t* m);
+
+/* What .emb.model.info gives. */
+typedef struct {
+    int64_t vocab, dim, layers, heads, inner, max_tokens;
+    const char* kind;       /* the model's family, as its config names it */
+    const char* tokenizer;  /* how it cuts text */
+} ray_embmodel_info_t;
+void ray_embmodel_info(const ray_embmodel_t* m, ray_embmodel_info_t* out);
+
+/* What one worker needs while it cuts texts; made once, used for many. */
+typedef struct ray_embwork ray_embwork_t;
+ray_embwork_t* ray_embwork_new(const ray_embmodel_t* m);
+void ray_embwork_free(ray_embwork_t* w);
+
+/* The ids of `text`; *ids points into `w` and holds until its next use.
+ * Returns how many, or -1 when memory runs out. */
+int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
+                            const char* text, size_t len, const int32_t** ids);
+
+#endif /* RAY_EMBMODEL_H */

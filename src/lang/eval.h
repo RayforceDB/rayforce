@@ -488,6 +488,9 @@ ray_t* ray_hnsw_free_fn(ray_t* h);
 ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h);
 ray_t* ray_hnsw_load_fn(ray_t* path);
 ray_t* ray_hnsw_info_fn(ray_t* h);
+ray_t* ray_emb_model_get_fn(ray_t* path);
+ray_t* ray_emb_model_info_fn(ray_t* h);
+ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x);
 
 /* Cast and type */
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);

@@ -24,6 +24,7 @@
 #include "ops/internal.h"
 #include "lang/internal.h"
 #include "mem/sys.h"
+#include "store/embmodel.h"
 
 /* ==========================================================================
  *  Rayfall builtins — direct metrics, exact KNN, HNSW lifecycle/query
@@ -612,4 +613,102 @@ ray_t* ray_hnsw_info_fn(ray_t* h) {
         ray_release(rows[i].val);
     }
     return ray_dict_new(keys, vals);
+}
+
+/* ---------- embedding models ---------- */
+
+static ray_embmodel_t* embmodel_unwrap(ray_t* h) {
+    if (!h || h->type != -RAY_I64 || !(h->attrs & RAY_ATTR_EMBMODEL)) return NULL;
+    return (ray_embmodel_t*)(uintptr_t)h->i64;
+}
+
+/* (.emb.model.get dir) → I64 handle (RAY_ATTR_EMBMODEL).  The directory is a
+ * model as its publisher ships it: config.json and tokenizer.json. */
+ray_t* ray_emb_model_get_fn(ray_t* path) {
+    if (!path || path->type != -RAY_STR)
+        return ray_error("type", ".emb.model.get: path must be a string, got %s", ray_type_name(path ? path->type : 0));
+    const char* p = ray_str_ptr(path);
+    size_t len = ray_str_len(path);
+    if (!p || len == 0 || len >= 1023)
+        return ray_error("domain", ".emb.model.get: path length must be 1 to 1022 bytes, got %lld", (long long)len);
+    char buf[1024];
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    ray_t* err = NULL;
+    ray_embmodel_t* m = ray_embmodel_open(buf, &err);
+    if (!m) return err ? err : ray_error("io", ".emb.model.get: the model could not be opened");
+    ray_t* h = ray_alloc(0);
+    if (!h || RAY_IS_ERR(h)) { ray_embmodel_release(m); return h ? h : ray_error("oom", NULL); }
+    h->type  = -RAY_I64;
+    h->attrs |= RAY_ATTR_EMBMODEL;
+    h->i64   = (int64_t)(uintptr_t)m;
+    return h;
+}
+
+/* (.emb.model.info handle) → dict { kind, tokenizer, vocab, dim, layers, heads, inner, tokens } */
+ray_t* ray_emb_model_info_fn(ray_t* h) {
+    ray_embmodel_t* m = embmodel_unwrap(h);
+    if (!m) return ray_error("type", ".emb.model.info: expects a model handle, got %s", ray_type_name(h ? h->type : 0));
+    ray_embmodel_info_t in;
+    ray_embmodel_info(m, &in);
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 8);
+    if (RAY_IS_ERR(keys)) return keys;
+    ray_t* vals = ray_list_new(8);
+    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
+    struct { const char* name; ray_t* val; } rows[] = {
+        { "kind",      ray_sym(sym_intern_safe(in.kind, strlen(in.kind))) },
+        { "tokenizer", ray_sym(sym_intern_safe(in.tokenizer, strlen(in.tokenizer))) },
+        { "vocab",     make_i64(in.vocab) },
+        { "dim",       make_i64(in.dim) },
+        { "layers",    make_i64(in.layers) },
+        { "heads",     make_i64(in.heads) },
+        { "inner",     make_i64(in.inner) },
+        { "tokens",    make_i64(in.max_tokens) },
+    };
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
+        int64_t s = sym_intern_safe(rows[i].name, strlen(rows[i].name));
+        keys = ray_vec_append(keys, &s);
+        vals = ray_list_append(vals, rows[i].val);
+        ray_release(rows[i].val);
+    }
+    return ray_dict_new(keys, vals);
+}
+
+static ray_t* emb_ids_vec(const int32_t* ids, int64_t n) {
+    ray_t* v = ray_vec_new(RAY_I32, n);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
+    v->len = n;
+    if (n > 0) memcpy(ray_data(v), ids, (size_t)n * sizeof(int32_t));
+    return v;
+}
+
+/* (.emb.tokens handle text) → the ids the model's tokenizer cuts the text
+ * into, an I32 vector; a vector of strings gives a list of them. */
+ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x) {
+    ray_embmodel_t* m = embmodel_unwrap(h);
+    if (!m) return ray_error("type", ".emb.tokens: expects a model handle, got %s", ray_type_name(h ? h->type : 0));
+    if (!x || (x->type != -RAY_STR && x->type != RAY_STR))
+        return ray_error("type", ".emb.tokens: expects a string or a vector of strings, got %s", ray_type_name(x ? x->type : 0));
+    ray_embwork_t* w = ray_embwork_new(m);
+    if (!w) return ray_error("oom", NULL);
+    ray_t* out;
+    const int32_t* ids;
+    if (x->type == -RAY_STR) {
+        int64_t n = ray_embmodel_tokens(m, w, ray_str_ptr(x), ray_str_len(x), &ids);
+        out = n < 0 ? ray_error("oom", NULL) : emb_ids_vec(ids, n);
+    } else {
+        out = ray_list_new(x->len);
+        for (int64_t i = 0; i < x->len && out && !RAY_IS_ERR(out); i++) {
+            size_t len = 0;
+            const char* s = ray_str_vec_get(x, i, &len);
+            int64_t n = ray_embmodel_tokens(m, w, s ? s : "", s ? len : 0, &ids);
+            ray_t* row = n < 0 ? ray_error("oom", NULL) : emb_ids_vec(ids, n);
+            if (RAY_IS_ERR(row)) { ray_release(out); out = row; break; }
+            out = ray_list_append(out, row);
+            ray_release(row);
+        }
+        if (!out) out = ray_error("oom", NULL);
+    }
+    ray_embwork_free(w);
+    return out;
 }

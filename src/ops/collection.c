@@ -1014,7 +1014,7 @@ static bool map_vector_atom(ray_t* value) {
     /* These I64 atoms own opaque resources. A raw integer cell cannot
      * carry their tags or finalizers, including after a typed prefix. */
     if (value->type == -RAY_I64 &&
-        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG)))
+        (value->attrs & (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_DLPROG | RAY_ATTR_EMBMODEL)))
         return false;
     return !((value->type == -RAY_BOOL || value->type == -RAY_U8) &&
              RAY_ATOM_IS_NULL(value));
