@@ -130,6 +130,7 @@ extern const test_entry_t embedding_entries[];
 extern const test_entry_t exec_entries[];
 extern const test_entry_t expr_null_entries[];
 extern const test_entry_t null_flag_entries[];
+extern const test_entry_t window_sum_entries[];
 extern const test_entry_t f64_nullmodel_entries[];
 extern const test_entry_t format_entries[];
 extern const test_entry_t fvec_entries[];
@@ -216,6 +217,7 @@ static const test_entry_t* const compiled_groups[] = {
     dump_entries,
     embedding_entries, exec_entries,   expr_null_entries,
     null_flag_entries,
+    window_sum_entries,
     f64_nullmodel_entries,
     format_entries,   fvec_entries,     graph_entries,    graph_builtin_entries,
     agg_registry_entries,
