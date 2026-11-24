@@ -559,6 +559,8 @@ ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
 ray_t* ray_try_finish(ray_t* result, ray_t* handler_expr);
 uint8_t ray_eval_last_rows(void);
+int8_t ray_eval_rows(void);
+void ray_eval_set_rows(int8_t rows);
 bool   ray_try_handler_is_value(ray_t* handler_expr);
 
 

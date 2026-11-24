@@ -1075,8 +1075,8 @@ ray_t* ray_query_helper_table(void);
 /* The length a value over the rows of the query being evaluated has here:
  * the group's row count while a group is evaluated, else the active
  * table's.  -1 outside a query, and while it is evaluated one row at a
- * time (its columns are cells then).  For a compiled `while`, whose
- * condition is tested whole (eval.c cond_rows_test). */
+ * time (its columns are cells then).  For `while`, whose condition is
+ * tested whole (eval.c cond_rows_test). */
 int64_t ray_query_rows_len(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */
