@@ -9849,7 +9849,7 @@ static test_result_t test_eval_restricted_server_state_ops(void) {
     /* #46: free a server graph handle. */
     TEST_ASSERT_TRUE(restricted_expr_returns_access("(.graph.free 0)"));
     /* #47: free a server HNSW index handle. */
-    TEST_ASSERT_TRUE(restricted_expr_returns_access("(hnsw-free 0)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.emb.hnsw-free 0)"));
     /* #41: persist WAL work that would replay outside restricted mode. */
     TEST_ASSERT_TRUE(restricted_expr_returns_access(
         "(.log.write (list 'set '__rf_restr_wal 1))"));
@@ -14566,7 +14566,7 @@ static const char* const k_rs_pure[] = {
     "concat", "raze", "within", "div", "bin", "binr", "split", "str-find", "str-join",
     "upper", "lower", "trim", "substr", "replace", "ser", "de", "like", "ss", "hh",
     "minute", "yyyy", "mm", "dd", "dow", "doy", "sym-name", "strlen", "diverse",
-    "remove", "row", "cos-dist", "inner-prod", "l2-dist", "norm", "mmu", "lsq", "inv",
+    "remove", "row", ".emb.cos-dist", ".emb.inner-prod", ".emb.l2-dist", "norm", "mmu", "lsq", "inv",
     "flip", "gram", NULL
 };
 static const char* const k_rs_skip[] = {
@@ -14582,7 +14582,7 @@ static const char* const k_rs_skip[] = {
     "print", "read", "write", "read-bytes", "write-bytes", "load", "exit", "read-csv",
     "write-csv", "read-value", "read-limits", "eval", "parse", "resolve", "timeit",
     "env", "get", "del", "rc", "rand", "guid", "date", "time", "timestamp",
-    "hnsw-build", "hnsw-free", "hnsw-save", "hnsw-load", "hnsw-info", "knn", "ann",
+    ".emb.hnsw-build", ".emb.hnsw-free", ".emb.hnsw-save", ".emb.hnsw-load", ".emb.hnsw-info", ".emb.knn", ".emb.ann",
     "meta", NULL
 };
 /* namespaces of system, storage and I/O builtins: never called */

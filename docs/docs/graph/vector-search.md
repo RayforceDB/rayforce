@@ -22,24 +22,24 @@ Four direct builtins. All accept either *two vectors* (returning a scalar) or *a
 
 | Function | Returns | Range |
 |---|---|---|
-| `(cos-dist a b)` | cosine distance `1 − cos(a, b)` | `[0, 2]` — lower = closer |
-| `(l2-dist a b)` | euclidean distance `||a − b||₂` | `[0, ∞)` — lower = closer |
-| `(inner-prod a b)` | dot product `∑ aᵢ·bᵢ` | any real |
+| `(.emb.cos-dist a b)` | cosine distance `1 − cos(a, b)` | `[0, 2]` — lower = closer |
+| `(.emb.l2-dist a b)` | euclidean distance `||a − b||₂` | `[0, ∞)` — lower = closer |
+| `(.emb.inner-prod a b)` | dot product `∑ aᵢ·bᵢ` | any real |
 | `(norm x)` | L2 norm `||x||₂` | `[0, ∞)` |
 
 ```lisp
-(cos-dist [1.0 0.0] [0.0 1.0])         ; → 1.0 (orthogonal)
-(l2-dist  [0.0 0.0] [3.0 4.0])         ; → 5.0
-(inner-prod [1.0 2.0] [3.0 4.0])      ; → 11.0
+(.emb.cos-dist [1.0 0.0] [0.0 1.0])         ; → 1.0 (orthogonal)
+(.emb.l2-dist  [0.0 0.0] [3.0 4.0])         ; → 5.0
+(.emb.inner-prod [1.0 2.0] [3.0 4.0])      ; → 11.0
 (norm    [3.0 4.0])                 ; → 5.0
 ```
 
 ## Brute-force K-Nearest-Neighbours
 
-`(knn col query k [metric])` scans a full LIST column and returns the top-K rows as a table with `_rowid` and `_dist` columns (ascending by distance). The metric defaults to `'cosine`; also supports `'l2` and `'ip` (inner-product, sorted by `−dot` so lower = closer matches the other metrics).
+`(.emb.knn col query k [metric])` scans a full LIST column and returns the top-K rows as a table with `_rowid` and `_dist` columns (ascending by distance). The metric defaults to `'cosine`; also supports `'l2` and `'ip` (inner-product, sorted by `−dot` so lower = closer matches the other metrics).
 
 ```lisp
-(knn (at docs 'emb) [1.0 0.0 0.0] 3 'cosine)
+(.emb.knn (at docs 'emb) [1.0 0.0 0.0] 3 'cosine)
 ; ┌────────┬───────┐
 ; │ _rowid │ _dist │
 ; │  I64   │  F64  │
@@ -57,8 +57,8 @@ Build a hierarchical navigable small-world graph over an embedding column for su
 ### Building
 
 ```lisp
-; (hnsw-build col [metric] [M] [ef_construction])
-(set idx (hnsw-build (at docs 'emb) 'cosine 16 100))
+; (.emb.hnsw-build col [metric] [M] [ef_construction])
+(set idx (.emb.hnsw-build (at docs 'emb) 'cosine 16 100))
 ```
 
 Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle is an atom tagged `RAY_ATTR_HNSW`; the underlying `ray_hnsw_t*` is rc-managed — rebinding, scope exit, and process teardown all release the index automatically.
@@ -66,8 +66,8 @@ Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle i
 ### Querying
 
 ```lisp
-; (ann handle query k [ef_search])
-(ann idx [1.0 0.0 0.0] 3)
+; (.emb.ann handle query k [ef_search])
+(.emb.ann idx [1.0 0.0 0.0] 3)
 ; ┌────────┬───────┐
 ; │ _rowid │ _dist │
 ; ├────────┼───────┤
@@ -80,10 +80,10 @@ Defaults: `metric='cosine`, `M=16`, `ef_construction=200`. The returned handle i
 ### Persistence & Lifecycle
 
 ```lisp
-(hnsw-save idx "/tmp/rayforce-docs-hnsw")
-(set idx2 (hnsw-load "/tmp/rayforce-docs-hnsw"))
-(hnsw-info idx2)     ; dict: {nrows dim metric nlayers M efc}
-(hnsw-free idx2)     ; optional — rc-managed, will free on scope exit too
+(.emb.hnsw-save idx "/tmp/rayforce-docs-hnsw")
+(set idx2 (.emb.hnsw-load "/tmp/rayforce-docs-hnsw"))
+(.emb.hnsw-info idx2)     ; dict: {nrows dim metric nlayers M efc}
+(.emb.hnsw-free idx2)     ; optional — rc-managed, will free on scope exit too
 ```
 
 ## Filter-Aware ANN via `select … nearest`
@@ -93,7 +93,7 @@ The `select` form accepts a `nearest:` clause that composes WHERE filtering with
 ```lisp
 (select {from: docs
          where: (> score 0.5)
-         nearest: (ann idx [1.0 0.0 0.0])
+         nearest: (.emb.ann idx [1.0 0.0 0.0])
          take: 10})
 ; Returns top-10 rows of `docs` whose score > 0.5, ordered by cosine
 ; distance to the query.  The implicit projection returns source
@@ -104,7 +104,7 @@ Brute-force variant on a column reference (no pre-built index needed):
 
 ```lisp
 (select {from: docs
-         nearest: (knn emb [1.0 0.0 0.0])
+         nearest: (.emb.knn emb [1.0 0.0 0.0])
          take: 3})
 ```
 
@@ -116,13 +116,13 @@ The rerank step emits a synthetic `_dist` column, but it is **not** included in 
 (select {id: id title: title d: _dist
          from: docs
          where: (> score 0.5)
-         nearest: (ann idx [1.0 0.0 0.0])
+         nearest: (.emb.ann idx [1.0 0.0 0.0])
          take: 5})
 ```
 
 ### Metric Symbols
 
-Accepted by `hnsw-build`, `knn`, and the `nearest` clause:
+Accepted by `.emb.hnsw-build`, `.emb.knn`, and the `nearest` clause:
 
 - `'cosine` — `1 − cos(a, b)`, lower = closer (default)
 - `'l2` — euclidean distance, lower = closer
@@ -132,21 +132,21 @@ Accepted by `hnsw-build`, `knn`, and the `nearest` clause:
 
 | Name | Arity | Signature |
 |---|---|---|
-| `cos-dist` | 2 | `(cos-dist a b)` — cosine distance; vec×vec → atom, LIST×vec → vector |
-| `l2-dist` | 2 | `(l2-dist a b)` — euclidean distance |
-| `inner-prod` | 2 | `(inner-prod a b)` — positive dot product |
+| `.emb.cos-dist` | 2 | `(.emb.cos-dist a b)` — cosine distance; vec×vec → atom, LIST×vec → vector |
+| `.emb.l2-dist` | 2 | `(.emb.l2-dist a b)` — euclidean distance |
+| `.emb.inner-prod` | 2 | `(.emb.inner-prod a b)` — positive dot product |
 | `norm` | 1 | `(norm x)` — L2 norm; scalar if vec, per-row vector if LIST |
-| `knn` | 3–4 | `(knn col query k [metric])` — brute-force top-K |
-| `hnsw-build` | 1–4 | `(hnsw-build col [metric] [M] [ef_c])` — build index |
-| `ann` | 3–4 | `(ann handle query k [ef_s])` — approximate top-K via HNSW |
-| `hnsw-save` | 2 | `(hnsw-save handle path)` — persist index to directory |
-| `hnsw-load` | 1 | `(hnsw-load path)` — restore index from directory |
-| `hnsw-free` | 1 | `(hnsw-free handle)` — explicit release (rc-managed, optional) |
-| `hnsw-info` | 1 | `(hnsw-info handle)` — dict of `{nrows dim metric nlayers M efc}` |
+| `.emb.knn` | 3–4 | `(.emb.knn col query k [metric])` — brute-force top-K |
+| `.emb.hnsw-build` | 1–4 | `(.emb.hnsw-build col [metric] [M] [ef_c])` — build index |
+| `.emb.ann` | 3–4 | `(.emb.ann handle query k [ef_s])` — approximate top-K via HNSW |
+| `.emb.hnsw-save` | 2 | `(.emb.hnsw-save handle path)` — persist index to directory |
+| `.emb.hnsw-load` | 1 | `(.emb.hnsw-load path)` — restore index from directory |
+| `.emb.hnsw-free` | 1 | `(.emb.hnsw-free handle)` — explicit release (rc-managed, optional) |
+| `.emb.hnsw-info` | 1 | `(.emb.hnsw-info handle)` — dict of `{nrows dim metric nlayers M efc}` |
 
 ## Design Notes
 
-- **Distance convention.** All metrics encode as "lower = closer" for consistent sort ordering. Direct math builtins (`cos-sim`-style semantics) aren't provided separately — compute `(- 1.0 (cos-dist a b))` if needed.
-- **Handle lifecycle.** HNSW handles are rc-managed through Rayforce's ownership semantics: a deep clone is produced on `ray_cow`, ownership transfers via detach on realloc, and the underlying index is freed when the last reference drops. `(hnsw-free h)` is idempotent and not required for correctness.
+- **Distance convention.** All metrics encode as "lower = closer" for consistent sort ordering. Direct math builtins (`cos-sim`-style semantics) aren't provided separately — compute `(- 1.0 (.emb.cos-dist a b))` if needed.
+- **Handle lifecycle.** HNSW handles are rc-managed through Rayforce's ownership semantics: a deep clone is produced on `ray_cow`, ownership transfers via detach on realloc, and the underlying index is freed when the last reference drops. `(.emb.hnsw-free h)` is idempotent and not required for correctness.
 - **Iterative scan bounds.** Filter-aware ANN pushes the predicate into the beam but remains locality-bounded by HNSW's graph reachability from the query's entry point. For pathologically selective filters on clustered data, results may be fewer than K; multi-entry restart is future work.
 - **Allocation-failure contract.** All HNSW search entry points return a distinct sentinel (`-1`) on allocation failure — every caller surfaces this as `ray_error("oom", …)` rather than a silently-empty result.

@@ -3,14 +3,14 @@
 ;; norm.rfl, hnsw.rfl) leave untouched.
 ;;
 ;; Specifically:
-;;   - LIST x query branch of cos-dist / l2-dist / inner-prod (vec_binary_metric)
+;;   - LIST x query branch of .emb.cos-dist / .emb.l2-dist / .emb.inner-prod (vec_binary_metric)
 ;;   - LIST branch of norm
 ;;   - the entire ray_knn_fn (cosine / l2 / ip metrics, error paths,
 ;;     empty-column shortcut)
-;;   - hnsw-build / ann / hnsw-info / hnsw-free under cosine and ip
+;;   - .emb.hnsw-build / ann / .emb.hnsw-info / .emb.hnsw-free under cosine and ip
 ;;     metrics (existing test only exercises l2)
-;;   - hnsw-save / hnsw-load round trip
-;;   - hnsw-free idempotency (second call must error, not double-free)
+;;   - .emb.hnsw-save / .emb.hnsw-load round trip
+;;   - .emb.hnsw-free idempotency (second call must error, not double-free)
 ;;   - rayvec_at_f64 RAY_I32 / RAY_I64 branches (lines 357-358)
 ;;   - atom_to_i64 -RAY_I32 / -RAY_I16 branches (lines 541-542)
 ;;   - empty-list shortcut in ray_knn_fn (lines 574-581)
@@ -24,28 +24,28 @@
 ;; and per-row row_score dispatch for all three metric kinds.
 (set Col (list [1.0 0.0 0.0] [0.0 1.0 0.0] [-1.0 0.0 0.0]))
 
-;; cos-dist: identical → 0, orthogonal → 1, opposite → 2.
-(at (cos-dist Col [1.0 0.0 0.0]) 0)  -- 0.0
-(at (cos-dist Col [1.0 0.0 0.0]) 1)  -- 1.0
-(at (cos-dist Col [1.0 0.0 0.0]) 2)  -- 2.0
-(count (cos-dist Col [1.0 0.0 0.0])) -- 3
+;; .emb.cos-dist: identical → 0, orthogonal → 1, opposite → 2.
+(at (.emb.cos-dist Col [1.0 0.0 0.0]) 0)  -- 0.0
+(at (.emb.cos-dist Col [1.0 0.0 0.0]) 1)  -- 1.0
+(at (.emb.cos-dist Col [1.0 0.0 0.0]) 2)  -- 2.0
+(count (.emb.cos-dist Col [1.0 0.0 0.0])) -- 3
 
 ;; query x LIST symmetry — exercises the (b is LIST) swap branch.
-(at (cos-dist [1.0 0.0 0.0] Col) 0)  -- 0.0
-(at (cos-dist [1.0 0.0 0.0] Col) 2)  -- 2.0
+(at (.emb.cos-dist [1.0 0.0 0.0] Col) 0)  -- 0.0
+(at (.emb.cos-dist [1.0 0.0 0.0] Col) 2)  -- 2.0
 
-;; l2-dist over LIST — distances 0, sqrt(2), 2.
-(at (l2-dist Col [1.0 0.0 0.0]) 0)   -- 0.0
-(at (l2-dist Col [1.0 0.0 0.0]) 2)   -- 2.0
-1 -- (as 'I64 (< (abs (- (at (l2-dist Col [1.0 0.0 0.0]) 1) 1.41421356)) 0.0001))
+;; .emb.l2-dist over LIST — distances 0, sqrt(2), 2.
+(at (.emb.l2-dist Col [1.0 0.0 0.0]) 0)   -- 0.0
+(at (.emb.l2-dist Col [1.0 0.0 0.0]) 2)   -- 2.0
+1 -- (as 'I64 (< (abs (- (at (.emb.l2-dist Col [1.0 0.0 0.0]) 1) 1.41421356)) 0.0001))
 
-;; inner-prod over LIST — 1, 0, -1.
-(at (inner-prod Col [1.0 0.0 0.0]) 0) -- 1.0
-(at (inner-prod Col [1.0 0.0 0.0]) 1) -- 0.0
-(at (inner-prod Col [1.0 0.0 0.0]) 2) -- -1.0
+;; .emb.inner-prod over LIST — 1, 0, -1.
+(at (.emb.inner-prod Col [1.0 0.0 0.0]) 0) -- 1.0
+(at (.emb.inner-prod Col [1.0 0.0 0.0]) 1) -- 0.0
+(at (.emb.inner-prod Col [1.0 0.0 0.0]) 2) -- -1.0
 
 ;; LIST x query length mismatch flagged.
-(cos-dist Col [1.0 0.0]) !- length
+(.emb.cos-dist Col [1.0 0.0]) !- length
 
 ;; ────────────── norm over LIST ──────────────
 ;; Drives the LIST branch of ray_norm_fn (lines ~498-516).
@@ -60,57 +60,57 @@
 ;; ────────────── ray_knn_fn — exact KNN via brute force ──────────────
 ;; Default metric is cosine.  Row 0 should win against [1.0 0.0 0.0].
 (set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
-(first (at (knn V [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(first (at (knn V [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1) '_dist))  -- 0.0
 
 ;; k > nrows is clamped, not an error.  V has 5 rows so result is all 5.
 ;; Row 0 is the exact match, and the result enumerates all 5 row ids.
-(set hits99 (knn V [1.0 0.0 0.0] 99))
+(set hits99 (.emb.knn V [1.0 0.0 0.0] 99))
 (count hits99) -- 5
 (at (at hits99 '_rowid) 0) -- 0
 (at (at hits99 '_dist)  0) -- 0.0
 (asc (at hits99 '_rowid)) -- [0 1 2 3 4]
 
 ;; Result is sorted ascending by distance.
-(<= (first (at (knn V [1.0 0.0 0.0] 3) '_dist)) (last (at (knn V [1.0 0.0 0.0] 3) '_dist))) -- true
+(<= (first (at (.emb.knn V [1.0 0.0 0.0] 3) '_dist)) (last (at (.emb.knn V [1.0 0.0 0.0] 3) '_dist))) -- true
 
 ;; Explicit metric symbols hit each switch arm.
-(first (at (knn V [1.0 0.0 0.0] 1 'cosine) '_rowid)) -- 0
-(first (at (knn V [1.0 0.0 0.0] 1 'l2)     '_rowid)) -- 0
-(first (at (knn V [1.0 0.0 0.0] 1 'ip)     '_rowid)) -- 0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1 'cosine) '_rowid)) -- 0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1 'l2)     '_rowid)) -- 0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1 'ip)     '_rowid)) -- 0
 
 ;; L2: identical → distance 0.
-(first (at (knn V [1.0 0.0 0.0] 1 'l2) '_dist)) -- 0.0
+(first (at (.emb.knn V [1.0 0.0 0.0] 1 'l2) '_dist)) -- 0.0
 
 ;; Error paths in ray_knn_fn.
-(knn V [1.0 0.0 0.0])                  !- rank
-(knn 5 [1.0 0.0 0.0] 1)                !- type
-(knn V 5 1)                            !- type
-(knn V [1.0 0.0 0.0] 1.0)              !- type
-(knn V [1.0 0.0 0.0] 1 'bogus)         !- domain
-(knn V [1.0 0.0] 1)                    !- length
-(knn V [1.0 0.0 0.0] 0)                !- domain
-(knn V [1.0 0.0 0.0] -3)               !- domain
+(.emb.knn V [1.0 0.0 0.0])                  !- rank
+(.emb.knn 5 [1.0 0.0 0.0] 1)                !- type
+(.emb.knn V 5 1)                            !- type
+(.emb.knn V [1.0 0.0 0.0] 1.0)              !- type
+(.emb.knn V [1.0 0.0 0.0] 1 'bogus)         !- domain
+(.emb.knn V [1.0 0.0] 1)                    !- length
+(.emb.knn V [1.0 0.0 0.0] 0)                !- domain
+(.emb.knn V [1.0 0.0 0.0] -3)               !- domain
 
-;; ────────────── hnsw-build under cosine and ip ──────────────
+;; ────────────── .emb.hnsw-build under cosine and ip ──────────────
 ;; Existing hnsw.rfl only exercises 'l2.  Cover the other two metric
 ;; branches in parse_metric_sym + the cosine path in ray_hnsw_search.
-(set IdxCos (hnsw-build V 'cosine))
-(at (hnsw-info IdxCos) 'metric) -- 'cosine
-(at (hnsw-info IdxCos) 'nrows)  -- 5
-(at (hnsw-info IdxCos) 'dim)    -- 3
-(first (at (ann IdxCos [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(set IdxCos (.emb.hnsw-build V 'cosine))
+(at (.emb.hnsw-info IdxCos) 'metric) -- 'cosine
+(at (.emb.hnsw-info IdxCos) 'nrows)  -- 5
+(at (.emb.hnsw-info IdxCos) 'dim)    -- 3
+(first (at (.emb.ann IdxCos [1.0 0.0 0.0] 1) '_rowid)) -- 0
 ;; Opaque index pointers must never cross the serde boundary as plain I64s.
 (ser IdxCos) !- domain
 (ser (list IdxCos)) !- domain
-(hnsw-free IdxCos)
+(.emb.hnsw-free IdxCos)
 
-(set IdxIp (hnsw-build V 'ip 16 64))
-(at (hnsw-info IdxIp) 'metric) -- 'ip
-(at (hnsw-info IdxIp) 'M)      -- 16
-(at (hnsw-info IdxIp) 'efc)    -- 64
+(set IdxIp (.emb.hnsw-build V 'ip 16 64))
+(at (.emb.hnsw-info IdxIp) 'metric) -- 'ip
+(at (.emb.hnsw-info IdxIp) 'M)      -- 16
+(at (.emb.hnsw-info IdxIp) 'efc)    -- 64
 ;; Top-2 IP search for [1,0,0] must include row 0 (dot=1 → IP distance -1).
-(set ipHits2 (ann IdxIp [1.0 0.0 0.0] 2))
+(set ipHits2 (.emb.ann IdxIp [1.0 0.0 0.0] 2))
 (count ipHits2) -- 2
 (at (at ipHits2 '_rowid) 0) -- 0
 (<= (at (at ipHits2 '_dist) 0) -0.99) -- true
@@ -118,90 +118,90 @@
 (<= (first (at ipHits2 '_dist)) (last (at ipHits2 '_dist))) -- true
 
 ;; ann with explicit ef_s argument exercises the n == 4 branch.
-(set ipHits2e (ann IdxIp [1.0 0.0 0.0] 2 100))
+(set ipHits2e (.emb.ann IdxIp [1.0 0.0 0.0] 2 100))
 (count ipHits2e) -- 2
 (at (at ipHits2e '_rowid) 0) -- 0
 
 ;; ann argument validation.
-(ann IdxIp [1.0 0.0 0.0])         !- rank
-(ann 5    [1.0 0.0 0.0] 1)        !- type
-(ann IdxIp 5            1)        !- type
-(ann IdxIp [1.0 0.0 0.0] 1.0)     !- type
-(ann IdxIp [1.0 0.0]    1)        !- length
-(ann IdxIp [1.0 0.0 0.0] 0)       !- domain
+(.emb.ann IdxIp [1.0 0.0 0.0])         !- rank
+(.emb.ann 5    [1.0 0.0 0.0] 1)        !- type
+(.emb.ann IdxIp 5            1)        !- type
+(.emb.ann IdxIp [1.0 0.0 0.0] 1.0)     !- type
+(.emb.ann IdxIp [1.0 0.0]    1)        !- length
+(.emb.ann IdxIp [1.0 0.0 0.0] 0)       !- domain
 
-;; hnsw-build error paths.
-(hnsw-build)                  !- rank
-(hnsw-build 5)                !- type
-(hnsw-build V 'bogus)         !- domain
-(hnsw-build V 'l2 1.0)        !- type
-(hnsw-build V 'l2 8 "no")     !- type
+;; .emb.hnsw-build error paths.
+(.emb.hnsw-build)                  !- rank
+(.emb.hnsw-build 5)                !- type
+(.emb.hnsw-build V 'bogus)         !- domain
+(.emb.hnsw-build V 'l2 1.0)        !- type
+(.emb.hnsw-build V 'l2 8 "no")     !- type
 
-;; ────────────── hnsw-save / hnsw-load round trip ──────────────
+;; ────────────── .emb.hnsw-save / .emb.hnsw-load round trip ──────────────
 ;; Persists the IP-metric index, frees the in-memory copy, reloads,
 ;; and confirms metadata + a query still resolve.  Drives ray_hnsw_save_fn
 ;; (lines 806-819) and ray_hnsw_load_fn (lines 822-835).
 (.sys.exec "mkdir -p /tmp/rfl_embcov_idx")
-(hnsw-save IdxIp "/tmp/rfl_embcov_idx")
-(hnsw-free IdxIp)
+(.emb.hnsw-save IdxIp "/tmp/rfl_embcov_idx")
+(.emb.hnsw-free IdxIp)
 
-(set Loaded (hnsw-load "/tmp/rfl_embcov_idx"))
-(at (hnsw-info Loaded) 'metric) -- 'ip
-(at (hnsw-info Loaded) 'nrows)  -- 5
-(at (hnsw-info Loaded) 'dim)    -- 3
+(set Loaded (.emb.hnsw-load "/tmp/rfl_embcov_idx"))
+(at (.emb.hnsw-info Loaded) 'metric) -- 'ip
+(at (.emb.hnsw-info Loaded) 'nrows)  -- 5
+(at (.emb.hnsw-info Loaded) 'dim)    -- 3
 ;; Round-trip preserved the index — top-1 for [1,0,0] under IP is still row 0.
-(set loadedHits (ann Loaded [1.0 0.0 0.0] 3))
+(set loadedHits (.emb.ann Loaded [1.0 0.0 0.0] 3))
 (count loadedHits) -- 3
 (at (at loadedHits '_rowid) 0) -- 0
 (<= (at (at loadedHits '_dist) 0) -0.99) -- true
 
-;; hnsw-save / hnsw-load argument validation.
-(hnsw-save 5 "/tmp/rfl_embcov_idx") !- type
-(hnsw-save Loaded 5)                !- type
-(hnsw-save Loaded "")               !- domain
-(hnsw-load 5)                       !- type
-(hnsw-load "")                      !- domain
-(hnsw-load "/tmp/rfl_embcov_idx_does_not_exist") !- io
+;; .emb.hnsw-save / .emb.hnsw-load argument validation.
+(.emb.hnsw-save 5 "/tmp/rfl_embcov_idx") !- type
+(.emb.hnsw-save Loaded 5)                !- type
+(.emb.hnsw-save Loaded "")               !- domain
+(.emb.hnsw-load 5)                       !- type
+(.emb.hnsw-load "")                      !- domain
+(.emb.hnsw-load "/tmp/rfl_embcov_idx_does_not_exist") !- io
 
-;; ────────────── hnsw-free idempotency contract ──────────────
+;; ────────────── .emb.hnsw-free idempotency contract ──────────────
 ;; First free clears RAY_ATTR_HNSW; the second call must see a plain
 ;; I64, fail hnsw_unwrap, and surface a type error rather than
 ;; double-freeing the underlying index.
-(hnsw-free Loaded)
-(hnsw-free Loaded) !- type
-(hnsw-free 5)      !- type
+(.emb.hnsw-free Loaded)
+(.emb.hnsw-free Loaded) !- type
+(.emb.hnsw-free 5)      !- type
 
 ;; ────────────── rayvec_at_f64: RAY_I32 / RAY_I64 element branches ──────────────
 ;; rayvec_at_f64 (lines 352-361) switches on element type.  Existing
 ;; tests only ever pass F64 vectors, leaving the I32/I64 cases dark.
 ;; Both query_to_doubles (line 438) and per-row row_score (lines 415,
-;; 421) dispatch through it, so passing an integer query into cos-dist
-;; / l2-dist / inner-prod hits both arms.
+;; 421) dispatch through it, so passing an integer query into .emb.cos-dist
+;; / .emb.l2-dist / .emb.inner-prod hits both arms.
 
 ;; Integer query vectors → query_to_doubles walks the I32/I64 cases.
-;; cos-dist of [1.0 0.0] with itself ≈ 0; the integer-query result
+;; .emb.cos-dist of [1.0 0.0] with itself ≈ 0; the integer-query result
 ;; should match within fp tolerance.
-(cos-dist [1.0 0.0] (as 'I64 [1 0]))   -- 0.0   ;; L358 RAY_I64
-(cos-dist [1.0 0.0] (as 'I32 [1 0]))   -- 0.0   ;; L357 RAY_I32
+(.emb.cos-dist [1.0 0.0] (as 'I64 [1 0]))   -- 0.0   ;; L358 RAY_I64
+(.emb.cos-dist [1.0 0.0] (as 'I32 [1 0]))   -- 0.0   ;; L357 RAY_I32
 
-;; l2-dist with integer query — sanity that the I32/I64 path produces
+;; .emb.l2-dist with integer query — sanity that the I32/I64 path produces
 ;; the same numeric answer as the F64 form.
-(l2-dist [0.0 0.0] (as 'I32 [3 4]))    -- 5.0   ;; L357 RAY_I32
-(l2-dist [0.0 0.0] (as 'I64 [3 4]))    -- 5.0   ;; L358 RAY_I64
+(.emb.l2-dist [0.0 0.0] (as 'I32 [3 4]))    -- 5.0   ;; L357 RAY_I32
+(.emb.l2-dist [0.0 0.0] (as 'I64 [3 4]))    -- 5.0   ;; L358 RAY_I64
 
-;; inner-prod with integer query.
-(inner-prod [1.0 2.0 3.0] (as 'I32 [4 5 6])) -- 32.0   ;; L357
-(inner-prod [1.0 2.0 3.0] (as 'I64 [4 5 6])) -- 32.0   ;; L358
+;; .emb.inner-prod with integer query.
+(.emb.inner-prod [1.0 2.0 3.0] (as 'I32 [4 5 6])) -- 32.0   ;; L357
+(.emb.inner-prod [1.0 2.0 3.0] (as 'I64 [4 5 6])) -- 32.0   ;; L358
 
 ;; LIST element with integer type — knn iterates rayvec_at_f64 over
 ;; each list row, hitting the I32/I64 cases on row data as well.
 (set Vi32 (list (as 'I32 [1 0 0]) (as 'I32 [0 1 0]) (as 'I32 [0 0 1])))
-(first (at (knn Vi32 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L357 row branch
-(first (at (knn Vi32 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
+(first (at (.emb.knn Vi32 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L357 row branch
+(first (at (.emb.knn Vi32 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
 
 (set Vi64 (list [1 0 0] [0 1 0] [0 0 1]))
-(first (at (knn Vi64 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L358 row branch
-(first (at (knn Vi64 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
+(first (at (.emb.knn Vi64 [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0   ;; L358 row branch
+(first (at (.emb.knn Vi64 [1.0 0.0 0.0] 1 'l2) '_dist))  -- 0.0
 
 ;; norm over a LIST of integer vectors also exercises rayvec_at_f64's
 ;; I32/I64 arms via the ray_norm_fn LIST loop (line 510).
@@ -212,53 +212,53 @@
 ;; atom_to_i64 (lines 537-545) extracts an int atom into int64_t.
 ;; The -RAY_I64 case is already exercised by every plain literal k.
 ;; -RAY_I32 needs a 1i-style suffix; -RAY_I16 needs 1h-style.
-;; knn's k argument and hnsw-build's M / ef_c arguments all funnel
+;; knn's k argument and .emb.hnsw-build's M / ef_c arguments all funnel
 ;; through atom_to_i64.
 
 ;; knn k as I32 atom (1i) → atom_to_i64 hits case -RAY_I32 (L541).
-(first (at (knn V [1.0 0.0 0.0] 1i 'l2) '_rowid)) -- 0
-(count (knn V [1.0 0.0 0.0] 3i)) -- 3
+(first (at (.emb.knn V [1.0 0.0 0.0] 1i 'l2) '_rowid)) -- 0
+(count (.emb.knn V [1.0 0.0 0.0] 3i)) -- 3
 
 ;; knn k as I16 atom (1h) → atom_to_i64 hits case -RAY_I16 (L542).
-(first (at (knn V [1.0 0.0 0.0] 1h 'l2) '_rowid)) -- 0
-(count (knn V [1.0 0.0 0.0] 3h)) -- 3
+(first (at (.emb.knn V [1.0 0.0 0.0] 1h 'l2) '_rowid)) -- 0
+(count (.emb.knn V [1.0 0.0 0.0] 3h)) -- 3
 
-;; hnsw-build with M and ef_c as I16/I32 atoms also funnels through
+;; .emb.hnsw-build with M and ef_c as I16/I32 atoms also funnels through
 ;; atom_to_i64, providing redundant coverage of the same branches.
-(set IdxI16 (hnsw-build V 'l2 8h 64h))   ;; M, ef_c both I16 → L542
-(at (hnsw-info IdxI16) 'M)   -- 8
-(at (hnsw-info IdxI16) 'efc) -- 64
-(hnsw-free IdxI16)
+(set IdxI16 (.emb.hnsw-build V 'l2 8h 64h))   ;; M, ef_c both I16 → L542
+(at (.emb.hnsw-info IdxI16) 'M)   -- 8
+(at (.emb.hnsw-info IdxI16) 'efc) -- 64
+(.emb.hnsw-free IdxI16)
 
-(set IdxI32 (hnsw-build V 'l2 16i 128i)) ;; M, ef_c both I32 → L541
-(at (hnsw-info IdxI32) 'M)   -- 16
-(at (hnsw-info IdxI32) 'efc) -- 128
+(set IdxI32 (.emb.hnsw-build V 'l2 16i 128i)) ;; M, ef_c both I32 → L541
+(at (.emb.hnsw-info IdxI32) 'M)   -- 16
+(at (.emb.hnsw-info IdxI32) 'efc) -- 128
 
 ;; ann ef_s as I32/I16 atom hits atom_to_i64 again.
-(count (ann IdxI32 [1.0 0.0 0.0] 2 50i)) -- 2   ;; ef_s I32 → L541
-(count (ann IdxI32 [1.0 0.0 0.0] 2 50h)) -- 2   ;; ef_s I16 → L542
+(count (.emb.ann IdxI32 [1.0 0.0 0.0] 2 50i)) -- 2   ;; ef_s I32 → L541
+(count (.emb.ann IdxI32 [1.0 0.0 0.0] 2 50h)) -- 2   ;; ef_s I16 → L542
 
 ;; ann k as I32/I16 atom — same atom_to_i64 path.
-(count (ann IdxI32 [1.0 0.0 0.0] 2i)) -- 2
-(count (ann IdxI32 [1.0 0.0 0.0] 2h)) -- 2
+(count (.emb.ann IdxI32 [1.0 0.0 0.0] 2i)) -- 2
+(count (.emb.ann IdxI32 [1.0 0.0 0.0] 2h)) -- 2
 
-(hnsw-free IdxI32)
+(.emb.hnsw-free IdxI32)
 
 ;; ────────────── empty-list shortcut in ray_knn_fn ──────────────
 ;; Lines 572-581: when the column is an empty list and the query is a
 ;; zero-length numeric vector (so query->len == dim == 0), ray_knn_fn
 ;; returns a 2-column table {_rowid: I64, _dist: F64} with both columns
 ;; empty.  Reachable only via this combination.
-(count (knn (list) (as 'F64 []) 1))            -- 0
-(count (at (knn (list) (as 'F64 []) 1) '_rowid)) -- 0
-(count (at (knn (list) (as 'F64 []) 1) '_dist))  -- 0
-(type (at (knn (list) (as 'F64 []) 1) '_rowid)) -- 'I64
-(type (at (knn (list) (as 'F64 []) 1) '_dist))  -- 'F64
+(count (.emb.knn (list) (as 'F64 []) 1))            -- 0
+(count (at (.emb.knn (list) (as 'F64 []) 1) '_rowid)) -- 0
+(count (at (.emb.knn (list) (as 'F64 []) 1) '_dist))  -- 0
+(type (at (.emb.knn (list) (as 'F64 []) 1) '_rowid)) -- 'I64
+(type (at (.emb.knn (list) (as 'F64 []) 1) '_dist))  -- 'F64
 
 ;; Same shortcut still triggers when an explicit metric is passed.
-(count (knn (list) (as 'F64 []) 5 'l2))     -- 0
-(count (knn (list) (as 'F64 []) 5 'cosine)) -- 0
-(count (knn (list) (as 'F64 []) 5 'ip))     -- 0
+(count (.emb.knn (list) (as 'F64 []) 5 'l2))     -- 0
+(count (.emb.knn (list) (as 'F64 []) 5 'cosine)) -- 0
+(count (.emb.knn (list) (as 'F64 []) 5 'ip))     -- 0
 
 ;; ────────────── teardown ──────────────
 (.sys.exec "rm -rf /tmp/rfl_embcov_idx /tmp/rfl_embcov_idx_*")
