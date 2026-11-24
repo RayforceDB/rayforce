@@ -1,0 +1,31 @@
+;; @also-unfused
+;; #1573: a numeric as in a query lowers to the compiled cast only for an
+;; input whose lanes it reads (fixed-width numeric and temporal); any other
+;; input takes the eager cast.  A GUID column read as lanes gave garbage
+;; that changed from run to run, where eager as raises type.  For each
+;; column type, each compiled target and each route must give the eager
+;; answer, or the eager error's code.  Each column holds a zero and a
+;; null where its type has one.
+(set P (table [k cb cu ch ci cl ce cf cd ct cp cg cy cs cn cx] (list [0 1 2 3] [true false false true] (as 'U8 [1 0 0 3]) (as 'I16 [1 0 0Nl 3]) (as 'I32 [1 0 0Nl 3]) [1 0 0Nl 3] (as 'F32 [1 0 0Nl 3]) [1.0 0.0 0Nf 3.0] (as 'DATE [1 0 0Nl 3]) (as 'TIME [1 0 0Nl 3]) (as 'TIMESTAMP [1 0 0Nl 3]) (guid 4) [a b c d] ["1" "0" "" "3"] (as 'TIMESPAN [1 0 0Nl 3]) (list [1] () 0Nl 3))))
+(set C ['cb 'cu 'ch 'ci 'cl 'ce 'cf 'cd 'ct 'cp 'cg 'cy 'cs 'cn 'cx])
+;; every column type there is: BOOL, U8, I16, I32, I64, F32, F64, DATE,
+;; TIME, TIMESTAMP, GUID, SYM, STR, TIMESPAN and LIST
+(count (distinct (map (fn [c] (type (at P c))) C))) -- 15
+(set X ['I64 'F64 'I32 'I16 'F32 'U8 'BOOL])
+(set R (fn [s] (try (eval (parse s)) (fn [e] (at e 'code)))))
+;; per target x and column c: eager, select, update; eager of the kept rows
+;; and select under where:; the rows eager keeps and a where: predicate
+(set Q (fn [x c] (list (R (format "(as '% (at P '%))" x c)) (R (format "(at (select {r: (as '% %) from: P}) 'r)" x c)) (R (format "(at (update {r: (as '% %) from: P}) 'r)" x c)) (R (format "(at (as '% (at P '%)) [1 2 3])" x c)) (R (format "(at (select {r: (as '% %) from: P where: (> k 0)}) 'r)" x c)) (R (format "(at (at P 'k) (where (> (as '% (at P '%)) 0)))" x c)) (R (format "(at (select {k: k from: P where: (> (as '% %) 0)}) 'k)" x c)))))
+(set Bad (fn [x c] (let q (Q x c)) (or (not (identical (at q 0) (at q 1))) (not (identical (at q 0) (at q 2))) (not (identical (at q 3) (at q 4))) (not (identical (at q 5) (at q 6))))))
+;; the number of targets on which some route disagrees with eager
+(set Fails (fn [c] (sum (map (fn [x] (as 'I64 (Bad x c))) X))))
+(map Fails C) -- [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+(Fails 'cg) -- 0
+(Fails 'cs) -- 0
+(Fails 'cx) -- 0
+(Fails 'cy) -- 0
+(Fails 'cn) -- 0
+(at (Q 'I64 'cg) 1) -- 'type
+(at (Q 'I64 'cg) 2) -- 'type
+(at (Q 'I64 'cs) 1) -- [1 0 0Nl 3]
+(at (Q 'F64 'cp) 1) -- [1.0 0.0 0Nf 3.0]
