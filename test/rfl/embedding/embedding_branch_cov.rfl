@@ -4,18 +4,18 @@
 ;; Covers:
 ;;   - vec_binary_metric NULL-arg guards (!a, !b)
 ;;   - list_vec_validate returns 2 (first elem bad) and 3 (dim mismatch)
-;;   - rayvec_to_floats non-F32 (F64/I32/I64) via hnsw-build+ann
-;;   - list_flatten_floats n==0 (via hnsw-build on empty-valid scenario)
-;;   - hnsw-save/hnsw-load long path (len >= 1023) → domain error
-;;   - hnsw-build M/ef_c out-of-range clamping
+;;   - rayvec_to_floats non-F32 (F64/I32/I64) via .emb.hnsw-build+ann
+;;   - list_flatten_floats n==0 (via .emb.hnsw-build on empty-valid scenario)
+;;   - .emb.hnsw-save/hnsw-load long path (len >= 1023) → domain error
+;;   - .emb.hnsw-build M/ef_c out-of-range clamping
 ;;   - ann ef_s clamping to HNSW_DEFAULT_EF_S
 ;;   - knn heap sift-up break (parent >= child), right-child sift-down
-;;   - hnsw-info for cosine metric display
+;;   - .emb.hnsw-info for cosine metric display
 ;;   - vec_binary_metric a->len <= 0 scalar path
 ;;   - parse_metric_sym NULL/non-SYM fallthrough
 ;;   - atom_to_i64 default branch (non-int atom)
 ;;   - atom_is_int false branches
-;;   - row_score denom > 0 true branch (normal cos-dist)
+;;   - row_score denom > 0 true branch (normal .emb.cos-dist)
 ;;   - norm with empty vec
 ;;   - knn with exactly k==nrows (no clamping needed)
 
@@ -27,7 +27,7 @@
 ;; ════════════════════════════════════════════════════════════════
 
 ;; return 2: first element non-numeric (BOOL vector)
-(cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0]) !- type
+(.emb.cos-dist (list (as 'BOOL [true false]) [1.0 0.0]) [1.0 0.0]) !- type
 
 ;; return 2: first element length 0 (empty F32 vector)
 ;; Note: (as 'F32 []) may yield a domain error upstream; test via
@@ -35,139 +35,139 @@
 ;; The len <= 0 branch of list_vec_validate is exercised via the
 ;; empty-list + empty-query path in knn (embedding_coverage.rfl).
 ;; Here we target the "first is non-vec scalar" case.
-(l2-dist (list 42 [1.0 0.0]) [1.0 0.0]) !- type
+(.emb.l2-dist (list 42 [1.0 0.0]) [1.0 0.0]) !- type
 
 ;; return 3: dimension mismatch within the list
-(inner-prod (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0]) !- type
+(.emb.inner-prod (list [1.0 0.0 0.0] [1.0 0.0]) [1.0 0.0 0.0]) !- type
 
 ;; list_vec_validate with a non-list first arg
 ;; (dispatch falls to scalar path, both args non-numeric → type error)
-(cos-dist 42 [1.0 0.0]) !- type
+(.emb.cos-dist 42 [1.0 0.0]) !- type
 
 ;; list_vec_validate return 1: NULL or non-LIST; called from knn col arg
-(knn 42 [1.0 0.0 0.0] 1) !- type
+(.emb.knn 42 [1.0 0.0 0.0] 1) !- type
 
 ;; ════════════════════════════════════════════════════════════════
-;; 2. rayvec_to_floats non-F32 path via hnsw-build + ann
+;; 2. rayvec_to_floats non-F32 path via .emb.hnsw-build + ann
 ;;    (list_flatten_floats calls rayvec_to_floats for each row)
 ;; ════════════════════════════════════════════════════════════════
 
 ;; F64 source vectors → rayvec_to_floats takes the loop path (not memcpy)
 (set VF64 (list (as 'F64 [1.0 0.0 0.0]) (as 'F64 [0.0 1.0 0.0]) (as 'F64 [0.0 0.0 1.0])))
-(set IdxF64 (hnsw-build VF64 'l2))
-(first (at (ann IdxF64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(first (at (ann IdxF64 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
-(hnsw-free IdxF64)
+(set IdxF64 (.emb.hnsw-build VF64 'l2))
+(first (at (.emb.ann IdxF64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (.emb.ann IdxF64 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+(.emb.hnsw-free IdxF64)
 
 ;; I32 source vectors → rayvec_to_floats loops through rayvec_at_f64 I32
 (set VI32 (list (as 'I32 [1 0 0]) (as 'I32 [0 1 0]) (as 'I32 [0 0 1])))
-(set IdxI32 (hnsw-build VI32 'l2))
-(first (at (ann IdxI32 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(hnsw-free IdxI32)
+(set IdxI32 (.emb.hnsw-build VI32 'l2))
+(first (at (.emb.ann IdxI32 [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(.emb.hnsw-free IdxI32)
 
 ;; I64 source vectors → rayvec_to_floats loops through rayvec_at_f64 I64
 (set VI64 (list [1 0 0] [0 1 0] [0 0 1]))
-(set IdxI64 (hnsw-build VI64 'l2))
-(first (at (ann IdxI64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(hnsw-free IdxI64)
+(set IdxI64 (.emb.hnsw-build VI64 'l2))
+(first (at (.emb.ann IdxI64 [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(.emb.hnsw-free IdxI64)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 3. hnsw-build M/ef_c out-of-range (uses defaults)
+;; 3. .emb.hnsw-build M/ef_c out-of-range (uses defaults)
 ;; ════════════════════════════════════════════════════════════════
 
 ;; M=0 → out of range (v > 0 is false), keeps HNSW_DEFAULT_M
 (set V3 (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))
-(set IdxDefM (hnsw-build V3 'l2 0 50))
-(at (hnsw-info IdxDefM) 'nrows) -- 3
-(hnsw-free IdxDefM)
+(set IdxDefM (.emb.hnsw-build V3 'l2 0 50))
+(at (.emb.hnsw-info IdxDefM) 'nrows) -- 3
+(.emb.hnsw-free IdxDefM)
 
 ;; M=999 → out of range (v > 512 is true), keeps HNSW_DEFAULT_M
-(set IdxBigM (hnsw-build V3 'l2 999 50))
-(at (hnsw-info IdxBigM) 'nrows) -- 3
-(hnsw-free IdxBigM)
+(set IdxBigM (.emb.hnsw-build V3 'l2 999 50))
+(at (.emb.hnsw-info IdxBigM) 'nrows) -- 3
+(.emb.hnsw-free IdxBigM)
 
 ;; ef_c=0 → out of range, keeps HNSW_DEFAULT_EF_C
-(set IdxDefEf (hnsw-build V3 'l2 8 0))
-(at (hnsw-info IdxDefEf) 'nrows) -- 3
-(hnsw-free IdxDefEf)
+(set IdxDefEf (.emb.hnsw-build V3 'l2 8 0))
+(at (.emb.hnsw-info IdxDefEf) 'nrows) -- 3
+(.emb.hnsw-free IdxDefEf)
 
 ;; ef_c=9999 → out of range (v > 4096), keeps HNSW_DEFAULT_EF_C
-(set IdxBigEf (hnsw-build V3 'l2 8 9999))
-(at (hnsw-info IdxBigEf) 'nrows) -- 3
-(hnsw-free IdxBigEf)
+(set IdxBigEf (.emb.hnsw-build V3 'l2 8 9999))
+(at (.emb.hnsw-info IdxBigEf) 'nrows) -- 3
+(.emb.hnsw-free IdxBigEf)
 
 ;; Negative M → out of range (v > 0 is false)
-(set IdxNegM (hnsw-build V3 'l2 -1 50))
-(at (hnsw-info IdxNegM) 'nrows) -- 3
-(hnsw-free IdxNegM)
+(set IdxNegM (.emb.hnsw-build V3 'l2 -1 50))
+(at (.emb.hnsw-info IdxNegM) 'nrows) -- 3
+(.emb.hnsw-free IdxNegM)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 4. ann ef_s clamping and out-of-range
 ;; ════════════════════════════════════════════════════════════════
 
 (set V5 (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
-(set Idx5 (hnsw-build V5 'l2 8 100))
+(set Idx5 (.emb.hnsw-build V5 'l2 8 100))
 
 ;; ef_s=0 → v > 0 is false, keeps computed ef (max(k, default)).
 ;; Top-2 result must contain the exact match row 0 with dist 0.
-(set qe0 (ann Idx5 [1.0 0.0 0.0] 2 0))
+(set qe0 (.emb.ann Idx5 [1.0 0.0 0.0] 2 0))
 (count qe0) -- 2
 (at (at qe0 '_rowid) 0) -- 0
 (at (at qe0 '_dist) 0)  -- 0.0
 
 ;; ef_s=9999 → v > 4096, keeps computed ef.
-(set qe9 (ann Idx5 [1.0 0.0 0.0] 2 9999))
+(set qe9 (.emb.ann Idx5 [1.0 0.0 0.0] 2 9999))
 (count qe9) -- 2
 (at (at qe9 '_rowid) 0) -- 0
 
 ;; ef_s=-1 → v > 0 is false, keeps default.
-(set qen (ann Idx5 [1.0 0.0 0.0] 2 -1))
+(set qen (.emb.ann Idx5 [1.0 0.0 0.0] 2 -1))
 (count qen) -- 2
 (at (at qen '_rowid) 0) -- 0
 
 ;; k=1 with very small ef_s: ef is clamped to HNSW_DEFAULT_EF_S.
 ;; Top-1 for the exact-match query is row 0.
-(set qe1 (ann Idx5 [1.0 0.0 0.0] 1 1))
+(set qe1 (.emb.ann Idx5 [1.0 0.0 0.0] 1 1))
 (count qe1) -- 1
 (at (at qe1 '_rowid) 0) -- 0
 (at (at qe1 '_dist) 0)  -- 0.0
 
 ;; ann with non-int ef_s → type error
-(ann Idx5 [1.0 0.0 0.0] 2 1.5) !- type
+(.emb.ann Idx5 [1.0 0.0 0.0] 2 1.5) !- type
 
-(hnsw-free Idx5)
+(.emb.hnsw-free Idx5)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 5. hnsw-save/hnsw-load domain: long path (>= 1023 chars)
+;; 5. .emb.hnsw-save/hnsw-load domain: long path (>= 1023 chars)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx3 (hnsw-build V3 'l2))
+(set Idx3 (.emb.hnsw-build V3 'l2))
 
 ;; Path exactly 1023 chars → domain error (len >= 1023)
 ;; Generate a long path string by repeating 'A' 1030 times.
-(hnsw-save Idx3 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
-(hnsw-load "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
+(.emb.hnsw-save Idx3 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
+(.emb.hnsw-load "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") !- domain
 
-(hnsw-free Idx3)
+(.emb.hnsw-free Idx3)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 6. hnsw-info cosine metric display (line 540: default branch)
+;; 6. .emb.hnsw-info cosine metric display (line 540: default branch)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Icos (hnsw-build V3 'cosine))
-(at (hnsw-info Icos) 'metric) -- 'cosine
-(hnsw-free Icos)
+(set Icos (.emb.hnsw-build V3 'cosine))
+(at (.emb.hnsw-info Icos) 'metric) -- 'cosine
+(.emb.hnsw-free Icos)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 7. knn k==nrows exactly (no clamping, heap fills exactly)
 ;; V3 is (list [1,0,0] [0,1,0] [0,0,1]) — 3 orthonormal vectors.
-;; cos-dist from [1,0,0]: row 0 → 0, rows 1,2 → 1 (orthogonal).
+;; .emb.cos-dist from [1,0,0]: row 0 → 0, rows 1,2 → 1 (orthogonal).
 ;; The returned k=3 must enumerate all three rows in any order, with row 0 first.
 ;; ════════════════════════════════════════════════════════════════
 
-(set hit3v (knn V3 [1.0 0.0 0.0] 3))
+(set hit3v (.emb.knn V3 [1.0 0.0 0.0] 3))
 (count hit3v) -- 3
-;; Row 0 wins (cos-dist 0).
+;; Row 0 wins (.emb.cos-dist 0).
 (at (at hit3v '_rowid) 0) -- 0
 (at (at hit3v '_dist)  0) -- 0.0
 ;; All three rows enumerated.
@@ -178,8 +178,8 @@
 
 ;; knn with k=1 and single-element list
 (set V1 (list [1.0 0.0 0.0]))
-(count (knn V1 [1.0 0.0 0.0] 1)) -- 1
-(first (at (knn V1 [1.0 0.0 0.0] 1) '_dist)) -- 0.0
+(count (.emb.knn V1 [1.0 0.0 0.0] 1)) -- 1
+(first (at (.emb.knn V1 [1.0 0.0 0.0] 1) '_dist)) -- 0.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 8. knn heap right-child sift-down more thoroughly
@@ -189,13 +189,13 @@
 ;; ════════════════════════════════════════════════════════════════
 
 (set Vheap (list [5.0 0.0] [4.0 0.0] [3.0 0.0] [2.0 0.0] [1.0 0.0]))
-(first (at (knn Vheap [0.0 0.0] 3 'l2) '_rowid))  -- 4
-(first (at (knn Vheap [0.0 0.0] 3 'l2) '_dist))   -- 1.0
-(last  (at (knn Vheap [0.0 0.0] 3 'l2) '_dist))   -- 3.0
+(first (at (.emb.knn Vheap [0.0 0.0] 3 'l2) '_rowid))  -- 4
+(first (at (.emb.knn Vheap [0.0 0.0] 3 'l2) '_dist))   -- 1.0
+(last  (at (.emb.knn Vheap [0.0 0.0] 3 'l2) '_dist))   -- 3.0
 
 ;; k=2 to hit a different sift pattern
-(first (at (knn Vheap [0.0 0.0] 2 'l2) '_rowid)) -- 4
-(last  (at (knn Vheap [0.0 0.0] 2 'l2) '_dist))  -- 2.0
+(first (at (.emb.knn Vheap [0.0 0.0] 2 'l2) '_rowid)) -- 4
+(last  (at (.emb.knn Vheap [0.0 0.0] 2 'l2) '_dist))  -- 2.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 9. knn sort stability: ensure ascending order with many ties
@@ -203,17 +203,17 @@
 
 ;; All at same distance from origin → insertion sort touches all entries
 (set Vties (list [1.0 0.0] [0.0 1.0] [-1.0 0.0] [0.0 -1.0]))
-(<= (first (at (knn Vties [0.0 0.0] 4 'l2) '_dist)) (last (at (knn Vties [0.0 0.0] 4 'l2) '_dist))) -- true
+(<= (first (at (.emb.knn Vties [0.0 0.0] 4 'l2) '_dist)) (last (at (.emb.knn Vties [0.0 0.0] 4 'l2) '_dist))) -- true
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 10. vec_binary_metric: b is LIST (swap branch) for each metric
 ;; ════════════════════════════════════════════════════════════════
 
-;; l2-dist with query first, list second
-(at (l2-dist [1.0 0.0 0.0] (list [1.0 0.0 0.0] [0.0 1.0 0.0])) 0) -- 0.0
+;; .emb.l2-dist with query first, list second
+(at (.emb.l2-dist [1.0 0.0 0.0] (list [1.0 0.0 0.0] [0.0 1.0 0.0])) 0) -- 0.0
 
-;; inner-prod with query first, list second
-(at (inner-prod [1.0 0.0 0.0] (list [1.0 0.0 0.0] [0.0 1.0 0.0])) 0) -- 1.0
+;; .emb.inner-prod with query first, list second
+(at (.emb.inner-prod [1.0 0.0 0.0] (list [1.0 0.0 0.0] [0.0 1.0 0.0])) 0) -- 1.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 11. row_score: denom > 0 true branch (normal cosine, non-zero vecs)
@@ -221,102 +221,102 @@
 
 ;; Already partly covered; reinforce with high-dim vectors
 (set Vhd (list [1.0 2.0 3.0 4.0] [4.0 3.0 2.0 1.0]))
-(at (cos-dist Vhd [1.0 0.0 0.0 0.0]) 0) -- (cos-dist [1.0 2.0 3.0 4.0] [1.0 0.0 0.0 0.0])
+(at (.emb.cos-dist Vhd [1.0 0.0 0.0 0.0]) 0) -- (.emb.cos-dist [1.0 2.0 3.0 4.0] [1.0 0.0 0.0 0.0])
 
 ;; ════════════════════════════════════════════════════════════════
-;; 12. hnsw-build on empty list → dim <= 0 error
+;; 12. .emb.hnsw-build on empty list → dim <= 0 error
 ;; ════════════════════════════════════════════════════════════════
 
-(hnsw-build (list)) !- length
+(.emb.hnsw-build (list)) !- length
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 13. knn default metric (no 4th arg) is cosine
 ;; ════════════════════════════════════════════════════════════════
 
 ;; Exercise the n < 4 path (no metric arg) — default cosine
-(first (at (knn V3 [1.0 0.0 0.0] 1) '_dist)) -- 0.0
+(first (at (.emb.knn V3 [1.0 0.0 0.0] 1) '_dist)) -- 0.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 14. norm on single-element vectors
 ;; ════════════════════════════════════════════════════════════════
 
-(norm [5.0]) -- 5.0
-(norm (as 'I64 [5])) -- 5.0
-(norm (as 'I32 [5])) -- 5.0
+(.emb.norm [5.0]) -- 5.0
+(.emb.norm (as 'I64 [5])) -- 5.0
+(.emb.norm (as 'I32 [5])) -- 5.0
 
 ;; norm on a LIST of I64 vectors
-(at (norm (list [5 0] [0 12])) 0) -- 5.0
-(at (norm (list [5 0] [0 12])) 1) -- 12.0
+(at (.emb.norm (list [5 0] [0 12])) 0) -- 5.0
+(at (.emb.norm (list [5 0] [0 12])) 1) -- 12.0
 
 ;; norm on a LIST of I32 vectors
-(at (norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 0) -- 5.0
-(at (norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 1) -- 13.0
+(at (.emb.norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 0) -- 5.0
+(at (.emb.norm (list (as 'I32 [3 4]) (as 'I32 [5 12]))) 1) -- 13.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 15. cos-dist/l2-dist/inner-prod with F64 source vectors (scalar)
+;; 15. .emb.cos-dist/l2-dist/inner-prod with F64 source vectors (scalar)
 ;; ════════════════════════════════════════════════════════════════
 
-(cos-dist (as 'F64 [1.0 0.0]) (as 'F64 [0.0 1.0])) -- 1.0
-(l2-dist (as 'F64 [0.0 0.0]) (as 'F64 [3.0 4.0]))  -- 5.0
-(inner-prod (as 'F64 [1.0 2.0]) (as 'F64 [3.0 4.0])) -- 11.0
+(.emb.cos-dist (as 'F64 [1.0 0.0]) (as 'F64 [0.0 1.0])) -- 1.0
+(.emb.l2-dist (as 'F64 [0.0 0.0]) (as 'F64 [3.0 4.0]))  -- 5.0
+(.emb.inner-prod (as 'F64 [1.0 2.0]) (as 'F64 [3.0 4.0])) -- 11.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 16. cos-dist/l2-dist/inner-prod with I32 source vectors (scalar)
+;; 16. .emb.cos-dist/l2-dist/inner-prod with I32 source vectors (scalar)
 ;; ════════════════════════════════════════════════════════════════
 
-(cos-dist (as 'I32 [1 0]) (as 'I32 [0 1])) -- 1.0
-(l2-dist (as 'I32 [0 0]) (as 'I32 [3 4]))  -- 5.0
-(inner-prod (as 'I32 [1 2]) (as 'I32 [3 4])) -- 11.0
+(.emb.cos-dist (as 'I32 [1 0]) (as 'I32 [0 1])) -- 1.0
+(.emb.l2-dist (as 'I32 [0 0]) (as 'I32 [3 4]))  -- 5.0
+(.emb.inner-prod (as 'I32 [1 2]) (as 'I32 [3 4])) -- 11.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 17. cos-dist/l2-dist/inner-prod with I64 source vectors (scalar)
+;; 17. .emb.cos-dist/l2-dist/inner-prod with I64 source vectors (scalar)
 ;; ════════════════════════════════════════════════════════════════
 
-(cos-dist [1 0] [0 1]) -- 1.0
-(l2-dist [0 0] [3 4])  -- 5.0
-(inner-prod [1 2] [3 4]) -- 11.0
+(.emb.cos-dist [1 0] [0 1]) -- 1.0
+(.emb.l2-dist [0 0] [3 4])  -- 5.0
+(.emb.inner-prod [1 2] [3 4]) -- 11.0
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 18. LIST metrics with non-F32 row vectors
 ;; ════════════════════════════════════════════════════════════════
 
 ;; F64 rows in list
-(at (cos-dist (list (as 'F64 [1.0 0.0]) (as 'F64 [0.0 1.0])) [1.0 0.0]) 0) -- 0.0
-(at (l2-dist (list (as 'F64 [0.0 0.0]) (as 'F64 [3.0 4.0])) [0.0 0.0]) 1) -- 5.0
-(at (inner-prod (list (as 'F64 [1.0 2.0]) (as 'F64 [3.0 4.0])) [1.0 0.0]) 0) -- 1.0
+(at (.emb.cos-dist (list (as 'F64 [1.0 0.0]) (as 'F64 [0.0 1.0])) [1.0 0.0]) 0) -- 0.0
+(at (.emb.l2-dist (list (as 'F64 [0.0 0.0]) (as 'F64 [3.0 4.0])) [0.0 0.0]) 1) -- 5.0
+(at (.emb.inner-prod (list (as 'F64 [1.0 2.0]) (as 'F64 [3.0 4.0])) [1.0 0.0]) 0) -- 1.0
 
 ;; I32 rows in list
-(at (l2-dist (list (as 'I32 [0 0]) (as 'I32 [3 4])) [0.0 0.0]) 1) -- 5.0
+(at (.emb.l2-dist (list (as 'I32 [0 0]) (as 'I32 [3 4])) [0.0 0.0]) 1) -- 5.0
 
 ;; I64 rows in list
-(at (l2-dist (list [0 0] [3 4]) [0.0 0.0]) 1) -- 5.0
+(at (.emb.l2-dist (list [0 0] [3 4]) [0.0 0.0]) 1) -- 5.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 19. hnsw-build rank errors
+;; 19. .emb.hnsw-build rank errors
 ;; ════════════════════════════════════════════════════════════════
 
-(hnsw-build V3 'l2 8 50 99) !- rank
+(.emb.hnsw-build V3 'l2 8 50 99) !- rank
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 20. ann rank error (too few / too many args)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx20 (hnsw-build V3 'l2))
-(ann Idx20 [1.0 0.0 0.0] 1 50 99) !- rank
-(ann Idx20 [1.0 0.0 0.0])         !- rank
-(hnsw-free Idx20)
+(set Idx20 (.emb.hnsw-build V3 'l2))
+(.emb.ann Idx20 [1.0 0.0 0.0] 1 50 99) !- rank
+(.emb.ann Idx20 [1.0 0.0 0.0])         !- rank
+(.emb.hnsw-free Idx20)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 21. hnsw-info on non-handle → type error
+;; 21. .emb.hnsw-info on non-handle → type error
 ;; ════════════════════════════════════════════════════════════════
 
-(hnsw-info 5) !- type
+(.emb.hnsw-info 5) !- type
 
 ;; ════════════════════════════════════════════════════════════════
-;; 22. hnsw-build with list containing non-numeric first elem
+;; 22. .emb.hnsw-build with list containing non-numeric first elem
 ;; ════════════════════════════════════════════════════════════════
 
-(hnsw-build (list (as 'BOOL [true false]) [1.0 0.0])) !- type
+(.emb.hnsw-build (list (as 'BOOL [true false]) [1.0 0.0])) !- type
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 23. Mixed-type vectors in list for knn
@@ -324,112 +324,112 @@
 
 ;; I32 and I64 mixed → validate passes if same dim, rayvec_at_f64 hits both
 (set Vmix (list (as 'I32 [1 0 0]) [0 1 0] [0 0 1]))
-(first (at (knn Vmix [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0
+(first (at (.emb.knn Vmix [1.0 0.0 0.0] 1 'l2) '_rowid)) -- 0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 24. knn inner-prod metric: verify negated distance ordering
+;; 24. knn .emb.inner-prod metric: verify negated distance ordering
 ;; ════════════════════════════════════════════════════════════════
 
 ;; IP metric in knn negates the dot product so lower = closer.
 ;; [1,0,0] dot [1,0,0] = 1 → stored dist = -1.
 ;; [0,0,1] dot [1,0,0] = 0 → stored dist = 0.
 (set Vip (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]))
-(first (at (knn Vip [1.0 0.0 0.0] 3 'ip) '_dist)) -- -1.0
+(first (at (.emb.knn Vip [1.0 0.0 0.0] 3 'ip) '_dist)) -- -1.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 25. hnsw-build with valid 2nd arg but non-sym type → domain error
+;; 25. .emb.hnsw-build with valid 2nd arg but non-sym type → domain error
 ;; ════════════════════════════════════════════════════════════════
 
-(hnsw-build V3 42) !- domain
+(.emb.hnsw-build V3 42) !- domain
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 26. ann with k that exceeds index rows → should return min(k, n_nodes)
 ;; ════════════════════════════════════════════════════════════════
 
-(set Idx26 (hnsw-build V3 'l2))
+(set Idx26 (.emb.hnsw-build V3 'l2))
 ;; ann with k=100 on a 3-row index returns at most 3 rows.  Row 0 [1,0,0]
 ;; is the exact match — must come first with dist 0; rows 1 and 2 are
 ;; orthogonal so both fall back at the same large distance.
-(set hits26 (ann Idx26 [1.0 0.0 0.0] 100))
+(set hits26 (.emb.ann Idx26 [1.0 0.0 0.0] 100))
 (count hits26) -- 3
 (at (at hits26 '_rowid) 0) -- 0
 (at (at hits26 '_dist)  0) -- 0.0
 (asc (at hits26 '_rowid)) -- [0 1 2]
-(hnsw-free Idx26)
+(.emb.hnsw-free Idx26)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 27. zero-vector in cos-dist (denom == 0 false branch)
+;; 27. zero-vector in .emb.cos-dist (denom == 0 false branch)
 ;; ════════════════════════════════════════════════════════════════
 
 ;; Zero row vector: row_norm_sq = 0, denom = q_norm * 0 = 0 → sim=0 → dist=1
-(cos-dist [0.0 0.0] [1.0 0.0]) -- 1.0
+(.emb.cos-dist [0.0 0.0] [1.0 0.0]) -- 1.0
 
 ;; Both zero: q_norm=0, denom=0 → sim=0 → dist=1
-(cos-dist [0.0 0.0] [0.0 0.0]) -- 1.0
+(.emb.cos-dist [0.0 0.0] [0.0 0.0]) -- 1.0
 
 ;; LIST with a zero row
-(at (cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 0) -- 1.0
-(at (cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 1) -- 0.0
+(at (.emb.cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 0) -- 1.0
+(at (.emb.cos-dist (list [0.0 0.0] [1.0 0.0]) [1.0 0.0]) 1) -- 0.0
 
 ;; ════════════════════════════════════════════════════════════════
-;; 28. hnsw-save to a valid short path then load
+;; 28. .emb.hnsw-save to a valid short path then load
 ;;     (just reinforcing io error for bad load path)
 ;; ════════════════════════════════════════════════════════════════
 
 (.sys.exec "mkdir -p /tmp/rfl_emb_branch_cov")
-(set Idx28 (hnsw-build V3 'l2))
-(hnsw-save Idx28 "/tmp/rfl_emb_branch_cov")
-(hnsw-free Idx28)
+(set Idx28 (.emb.hnsw-build V3 'l2))
+(.emb.hnsw-save Idx28 "/tmp/rfl_emb_branch_cov")
+(.emb.hnsw-free Idx28)
 
-(set Idx28b (hnsw-load "/tmp/rfl_emb_branch_cov"))
-(at (hnsw-info Idx28b) 'nrows) -- 3
-(hnsw-free Idx28b)
+(set Idx28b (.emb.hnsw-load "/tmp/rfl_emb_branch_cov"))
+(at (.emb.hnsw-info Idx28b) 'nrows) -- 3
+(.emb.hnsw-free Idx28b)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 29. hnsw-info ip metric display
+;; 29. .emb.hnsw-info ip metric display
 ;; ════════════════════════════════════════════════════════════════
 
-(set Iip (hnsw-build V3 'ip))
-(at (hnsw-info Iip) 'metric) -- 'ip
-(hnsw-free Iip)
+(set Iip (.emb.hnsw-build V3 'ip))
+(at (.emb.hnsw-info Iip) 'metric) -- 'ip
+(.emb.hnsw-free Iip)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 30. ann with ip metric → verifies ray_hnsw_search with ip
 ;; ════════════════════════════════════════════════════════════════
 
-(set Iip2 (hnsw-build V3 'ip))
-(first (at (ann Iip2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(hnsw-free Iip2)
+(set Iip2 (.emb.hnsw-build V3 'ip))
+(first (at (.emb.ann Iip2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(.emb.hnsw-free Iip2)
 
 ;; ════════════════════════════════════════════════════════════════
-;; 31. hnsw-build with single vector (edge case for graph construction)
+;; 31. .emb.hnsw-build with single vector (edge case for graph construction)
 ;; ════════════════════════════════════════════════════════════════
 
 (set V31 (list [1.0 2.0 3.0]))
-(set Idx31 (hnsw-build V31 'l2))
-(at (hnsw-info Idx31) 'nrows) -- 1
-(at (hnsw-info Idx31) 'dim)   -- 3
-(first (at (ann Idx31 [1.0 2.0 3.0] 1) '_rowid)) -- 0
-(first (at (ann Idx31 [1.0 2.0 3.0] 1) '_dist))  -- 0.0
-(hnsw-free Idx31)
+(set Idx31 (.emb.hnsw-build V31 'l2))
+(at (.emb.hnsw-info Idx31) 'nrows) -- 1
+(at (.emb.hnsw-info Idx31) 'dim)   -- 3
+(first (at (.emb.ann Idx31 [1.0 2.0 3.0] 1) '_rowid)) -- 0
+(first (at (.emb.ann Idx31 [1.0 2.0 3.0] 1) '_dist))  -- 0.0
+(.emb.hnsw-free Idx31)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; 32. knn with large k (k >> nrows) clamps to nrows
 ;; ════════════════════════════════════════════════════════════════
 
 ;; All three metrics return all 3 rows; row 0 [1,0,0] is the exact match.
-(set q32cos (knn V3 [1.0 0.0 0.0] 1000 'cosine))
+(set q32cos (.emb.knn V3 [1.0 0.0 0.0] 1000 'cosine))
 (count q32cos) -- 3
 (at (at q32cos '_rowid) 0) -- 0
 (at (at q32cos '_dist) 0)  -- 0.0
 (asc (at q32cos '_rowid)) -- [0 1 2]
-(set q32l2 (knn V3 [1.0 0.0 0.0] 1000 'l2))
+(set q32l2 (.emb.knn V3 [1.0 0.0 0.0] 1000 'l2))
 (count q32l2) -- 3
 (at (at q32l2 '_rowid) 0) -- 0
 (at (at q32l2 '_dist) 0)  -- 0.0
 (asc (at q32l2 '_rowid)) -- [0 1 2]
 ;; IP metric stores negated inner product so [1,0,0] dot [1,0,0]=1 → dist=-1.
-(set q32ip (knn V3 [1.0 0.0 0.0] 1000 'ip))
+(set q32ip (.emb.knn V3 [1.0 0.0 0.0] 1000 'ip))
 (count q32ip) -- 3
 (at (at q32ip '_rowid) 0) -- 0
 (at (at q32ip '_dist) 0)  -- -1.0
@@ -439,11 +439,11 @@
 ;; 33. ann with cosine metric build
 ;; ════════════════════════════════════════════════════════════════
 
-(set Icos2 (hnsw-build V3 'cosine 4 50))
-(first (at (ann Icos2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(first (at (ann Icos2 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
-(count (ann Icos2 [1.0 0.0 0.0] 3)) -- 3
-(hnsw-free Icos2)
+(set Icos2 (.emb.hnsw-build V3 'cosine 4 50))
+(first (at (.emb.ann Icos2 [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (.emb.ann Icos2 [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+(count (.emb.ann Icos2 [1.0 0.0 0.0] 3)) -- 3
+(.emb.hnsw-free Icos2)
 
 ;; ════════════════════════════════════════════════════════════════
 ;; teardown

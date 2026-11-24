@@ -61,7 +61,7 @@
 (gram W) -- (mmu W (flip W))
 
 ;; gram on shapes that are not a multiple of the 4x4 tile
-(set gdiff (fn [g m] (sum (map (fn [d] (inner-prod d d)) (- g m)))))
+(set gdiff (fn [g m] (sum (map (fn [d] (.emb.inner-prod d d)) (- g m)))))
 (set V (map (fn [i] (+ (* 0.5 (as 'F64 (til 5000))) (* 1.0 i))) (til 7)))
 (< (gdiff (gram V) (mmu V (flip V))) 1.0) -- true
 (count (gram V)) -- 7

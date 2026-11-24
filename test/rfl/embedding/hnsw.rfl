@@ -1,22 +1,22 @@
-;; Invariants for `hnsw-build` / `ann` / `hnsw-info` / `hnsw-free`.
+;; Invariants for `.emb.hnsw-build` / `.emb.ann` / `.emb.hnsw-info` / `.emb.hnsw-free`.
 ;; HNSW approximate nearest-neighbour index over a list of float vectors.
 ;; The index is opaque; queries return a table with `_rowid` and `_dist`.
 
 ;; Five vectors, exact-match query at row 0.
 (set V (list [1.0 0.0 0.0] [0.9 0.1 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.5 0.5 0.0]))
-(set Idx (hnsw-build V 'l2 8 100))
+(set Idx (.emb.hnsw-build V 'l2 8 100))
 
-;; ────────────── hnsw-info exposes build parameters ──────────────
-(at (hnsw-info Idx) 'nrows)  -- 5
-(at (hnsw-info Idx) 'dim)    -- 3
-(at (hnsw-info Idx) 'metric) -- 'l2
-(at (hnsw-info Idx) 'M)      -- 8
-(at (hnsw-info Idx) 'efc)    -- 100
+;; ────────────── .emb.hnsw-info exposes build parameters ──────────────
+(at (.emb.hnsw-info Idx) 'nrows)  -- 5
+(at (.emb.hnsw-info Idx) 'dim)    -- 3
+(at (.emb.hnsw-info Idx) 'metric) -- 'l2
+(at (.emb.hnsw-info Idx) 'M)      -- 8
+(at (.emb.hnsw-info Idx) 'efc)    -- 100
 
 ;; ────────────── exact-match top-1 ──────────────
 ;; Querying with the same vector as row 0 must return row 0 with dist 0.
-(first (at (ann Idx [1.0 0.0 0.0] 1) '_rowid)) -- 0
-(first (at (ann Idx [1.0 0.0 0.0] 1) '_dist))  -- 0.0
+(first (at (.emb.ann Idx [1.0 0.0 0.0] 1) '_rowid)) -- 0
+(first (at (.emb.ann Idx [1.0 0.0 0.0] 1) '_dist))  -- 0.0
 
 ;; ────────────── top-k respects requested count and orders by distance ──────────────
 ;; For query [1,0,0] under L2 (hnswlib reports squared L2):
@@ -28,7 +28,7 @@
 ;; The k=3 result must start at row 0 with dist 0, and be sorted ascending.
 ;; Top-3 is row 0 (exact) plus two of the remaining; row 1 (closest non-exact)
 ;; must be included, so dist[1] must be ~0.02.
-(set hits3 (ann Idx [1.0 0.0 0.0] 3))
+(set hits3 (.emb.ann Idx [1.0 0.0 0.0] 3))
 (count hits3) -- 3
 (at (at hits3 '_rowid) 0) -- 0
 (at (at hits3 '_dist)  0) -- 0.0
@@ -45,4 +45,4 @@
 ;; Ascending order by distance.
 (<= (first (at hits3 '_dist)) (last (at hits3 '_dist))) -- true
 
-(hnsw-free Idx)
+(.emb.hnsw-free Idx)

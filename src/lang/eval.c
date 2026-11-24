@@ -5893,22 +5893,22 @@ static void ray_register_builtins(void) {
     register_unary("dl-free",      RAY_FN_RESTRICTED, ray_dl_free_fn);
 
     /* Vector similarity / embeddings / HNSW */
-    register_binary("cos-dist",    RAY_FN_NONE, ray_cos_dist_fn);
-    register_binary("inner-prod",  RAY_FN_NONE, ray_inner_prod_fn);
-    register_binary("l2-dist",     RAY_FN_NONE, ray_l2_dist_fn);
-    register_unary ("norm",        RAY_FN_NONE, ray_norm_fn);
+    register_binary(".emb.cos-dist",    RAY_FN_NONE, ray_cos_dist_fn);
+    register_binary(".emb.inner-prod",  RAY_FN_NONE, ray_inner_prod_fn);
+    register_binary(".emb.l2-dist",     RAY_FN_NONE, ray_l2_dist_fn);
+    register_unary (".emb.norm",        RAY_FN_NONE, ray_norm_fn);
     register_binary("mmu",         RAY_FN_NONE, ray_mmu_fn);
     register_binary("lsq",         RAY_FN_NONE, ray_lsq_fn);
     register_unary ("inv",         RAY_FN_NONE, ray_inv_fn);
     register_unary ("flip",        RAY_FN_NONE, ray_flip_mat_fn);
     register_unary ("gram",        RAY_FN_NONE, ray_gram_fn);
-    register_vary  ("knn",         RAY_FN_NONE, ray_knn_fn);
-    register_vary  ("hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
-    register_vary  ("ann",         RAY_FN_NONE, ray_ann_fn);
-    register_unary ("hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
-    register_binary("hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
-    register_unary ("hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
-    register_unary ("hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
+    register_vary  (".emb.knn",         RAY_FN_NONE, ray_knn_fn);
+    register_vary  (".emb.hnsw-build",  RAY_FN_NONE, ray_hnsw_build_fn);
+    register_vary  (".emb.ann",         RAY_FN_NONE, ray_ann_fn);
+    register_unary (".emb.hnsw-free",   RAY_FN_RESTRICTED, ray_hnsw_free_fn);
+    register_binary(".emb.hnsw-save",   RAY_FN_RESTRICTED, ray_hnsw_save_fn);
+    register_unary (".emb.hnsw-load",   RAY_FN_RESTRICTED, ray_hnsw_load_fn);
+    register_unary (".emb.hnsw-info",   RAY_FN_NONE, ray_hnsw_info_fn);
 
     /* Per-vector accelerator indices (see src/ops/idxop.h) */
     register_unary (".idx.zone",   RAY_FN_NONE, ray_idx_zone_fn);

@@ -234,33 +234,33 @@
 ;; ====================================================================
 (set TN (table [id Vec] (list [1 2 3 4] (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5]))))
 ;; nearest + asc → domain (mutually exclusive).
-(select {from: TN nearest: (knn Vec [1.0 0.0]) asc: id}) !- domain
+(select {from: TN nearest: (.emb.knn Vec [1.0 0.0]) asc: id}) !- domain
 ;; nearest + by → domain.
-(select {from: TN nearest: (knn Vec [1.0 0.0]) by: id}) !- domain
+(select {from: TN nearest: (.emb.knn Vec [1.0 0.0]) by: id}) !- domain
 ;; nearest take not an integer → type error (5902).
-(select {from: TN nearest: (knn Vec [1.0 0.0]) take: 1.5}) !- type
+(select {from: TN nearest: (.emb.knn Vec [1.0 0.0]) take: 1.5}) !- type
 ;; nearest take <= 0 → domain (5907).
-(select {from: TN nearest: (knn Vec [1.0 0.0]) take: 0}) !- domain
+(select {from: TN nearest: (.emb.knn Vec [1.0 0.0]) take: 0}) !- domain
 ;; nearest query empty vector → length error (5928).  Use an explicitly
 ;; typed empty F64 vec so it passes the numeric-vec type gate and trips
 ;; the dim<=0 length guard rather than the type guard.
-(select {from: TN nearest: (knn Vec (as 'F64 []))}) !- length
+(select {from: TN nearest: (.emb.knn Vec (as 'F64 []))}) !- length
 ;; nearest query non-numeric → type error (5922).
-(select {from: TN nearest: (knn Vec ["a" "b"])}) !- type
+(select {from: TN nearest: (.emb.knn Vec ["a" "b"])}) !- type
 ;; knn with default take (10) clamps to nrows.
-(count (select {from: TN nearest: (knn Vec [1.0 0.0])})) -- 4
+(count (select {from: TN nearest: (.emb.knn Vec [1.0 0.0])})) -- 4
 ;; knn explicit metric arms.
-(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'l2) take: 2})) -- 2
-(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'ip) take: 2})) -- 2
-(count (select {from: TN nearest: (knn Vec [1.0 0.0] 'cosine) take: 2})) -- 2
+(count (select {from: TN nearest: (.emb.knn Vec [1.0 0.0] 'l2) take: 2})) -- 2
+(count (select {from: TN nearest: (.emb.knn Vec [1.0 0.0] 'ip) take: 2})) -- 2
+(count (select {from: TN nearest: (.emb.knn Vec [1.0 0.0] 'cosine) take: 2})) -- 2
 ;; knn bad metric → domain (6035).
-(select {from: TN nearest: (knn Vec [1.0 0.0] 'bogus)}) !- domain
+(select {from: TN nearest: (.emb.knn Vec [1.0 0.0] 'bogus)}) !- domain
 ;; knn first arg not an unquoted column name → type (6019).
-(select {from: TN nearest: (knn 5 [1.0 0.0])}) !- type
+(select {from: TN nearest: (.emb.knn 5 [1.0 0.0])}) !- type
 ;; nearest non-list → domain (5875).
 (select {from: TN nearest: 'foo}) !- domain
 ;; nearest list too short (<3) → domain (5875).
-(select {from: TN nearest: (list 'knn)}) !- domain
+(select {from: TN nearest: (list '.emb.knn)}) !- domain
 ;; nearest head not a symbol → error (the head `5` fails the symbol gate;
 ;; the planner surfaces this as a type error before the domain guard).
 (select {from: TN nearest: (list 5 'Vec [1.0 0.0])}) !- type
@@ -269,28 +269,28 @@
 ;; nearest list with an unrecognised head surfaces as a type error.
 (select {from: TN nearest: (list 'zzz 'Vec [1.0 0.0])}) !- type
 ;; knn with I32 query vector (int→float conversion arm 5949).
-(count (select {from: TN nearest: (knn Vec (as 'I32 [1 0])) take: 2})) -- 2
+(count (select {from: TN nearest: (.emb.knn Vec (as 'I32 [1 0])) take: 2})) -- 2
 ;; knn with I64 query vector (arm 5953).
-(count (select {from: TN nearest: (knn Vec [1 0]) take: 2})) -- 2
+(count (select {from: TN nearest: (.emb.knn Vec [1 0]) take: 2})) -- 2
 
 ;; ====================================================================
-;; §13  ANN form with hnsw-build index — query.c:5961-6013
+;; §13  ANN form with .emb.hnsw-build index — query.c:5961-6013
 ;; ====================================================================
 (set TANN (table [id Vec] (list [1 2 3 4 5] (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0] [0.7 0.7 0.0] [0.5 0.5 0.5]))))
-(set IdxA (hnsw-build (at TANN 'Vec) 'l2 8 100))
+(set IdxA (.emb.hnsw-build (at TANN 'Vec) 'l2 8 100))
 ;; ann default ef.
-(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0]) take: 3})) -- 3
+(count (select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0]) take: 3})) -- 3
 ;; ann explicit ef.
-(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] 50) take: 3})) -- 3
+(count (select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0] 50) take: 3})) -- 3
 ;; ann ef as I32 atom.
-(count (select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] (as 'I32 40)) take: 2})) -- 2
+(count (select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0] (as 'I32 40)) take: 2})) -- 2
 ;; ann query dim mismatch → length error (5986).
-(select {from: TANN nearest: (ann IdxA [1.0 0.0])}) !- length
+(select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0])}) !- length
 ;; ann first arg not an HNSW handle → type error (5972).
-(select {from: TANN nearest: (ann 99 [1.0 0.0 0.0])}) !- type
+(select {from: TANN nearest: (.emb.ann 99 [1.0 0.0 0.0])}) !- type
 ;; ann ef bad type → type error (6004).
-(select {from: TANN nearest: (ann IdxA [1.0 0.0 0.0] 1.5)}) !- type
-(hnsw-free IdxA)
+(select {from: TANN nearest: (.emb.ann IdxA [1.0 0.0 0.0] 1.5)}) !- type
+(.emb.hnsw-free IdxA)
 
 ;; ====================================================================
 ;; §14  projection echoing the group key + agg — layout [key, agg]
@@ -739,10 +739,10 @@
 ;; ====================================================================
 (set TNn (table [id Vec] (list [1 2 3 4 5] (list [1.0 0.0] [0.0 1.0] [1.0 1.0] [0.5 0.5] [2.0 2.0]))))
 ;; nearest + desc → domain (mutually exclusive with sort).
-(select {from: TNn nearest: (knn Vec [1.0 0.0]) desc: id}) !- domain
+(select {from: TNn nearest: (.emb.knn Vec [1.0 0.0]) desc: id}) !- domain
 ;; nearest + where: WHERE is applied first, then KNN runs on the filtered
 ;; subset — valid combination (not mutually exclusive like asc/by).
-(count (select {from: TNn nearest: (knn Vec [1.0 0.0]) where: (> id 0)})) -- 5
+(count (select {from: TNn nearest: (.emb.knn Vec [1.0 0.0]) where: (> id 0)})) -- 5
 
 ;; ====================================================================
 ;; §31  Group-by with multiple non-agg expressions in one select.

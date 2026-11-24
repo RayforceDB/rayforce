@@ -111,7 +111,7 @@
 #define RAY_ATTR_GRAPH        0x02
 
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
- * Checked by HNSW builtins before dereferencing.  User must (hnsw-free h). */
+ * Checked by HNSW builtins before dereferencing.  User must (.emb.hnsw-free h). */
 #define RAY_ATTR_HNSW         0x04
 
 /* I64 atom carries an owning dl_program_t* (a Datalog program) in its .i64
