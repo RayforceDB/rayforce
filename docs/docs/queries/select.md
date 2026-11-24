@@ -413,7 +413,11 @@ written in place, or under a `where:` any index that reads no column), read
 the whole column under `by:`, and whether they read the rows a `where:` keeps
 is an open question (#1429). Keyless, aggregates other than `first` and
 `last` of such an argument are evaluated as before: `(sum (at c [3 2 1 0]))`
-is a `type` error there.
+is a `type` error there. A scalar the argument gives stands for every row on
+every keyless route, as `1` does in `(sum 1)`: `(sum (count v))` over four rows
+is `16` whether or not another output is declined, and over a `where:` that
+keeps no row `(max (count v))` is `0Nl`, the empty column's. A scalar a
+helper with several statements returns is folded once (#1576).
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a
