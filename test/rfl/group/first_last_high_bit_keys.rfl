@@ -1,0 +1,19 @@
+;; by: over I64 keys that differ only in their high bits, as ids packed
+;; hi<<32|lo with a small lo do.  agg_group_keys, serial (every aggregate
+;; below the parallel route's 65536-row floor) and parallel (first, last, med,
+;; mode), takes its slot from a finished hash, so such keys no longer start at
+;; one slot and probe each other one by one.
+(set mk (fn [n mul] (table [k v] (list (* (+ 1 (% (til (* 2 n)) n)) mul) (til (* 2 n))))))
+;; every key is one group of two rows, its first row's and its last row's
+(set r (select {f: (first v) l: (last v) from: (mk 40000 4294967296) by: k}))
+(count r) -- 40000
+(sum (at r 'f)) -- (sum (til 40000))
+(all (== (at r 'l) (+ 40000 (at r 'f)))) -- true
+;; the time: about what keys spread over their low bits take, on the serial
+;; route (40k rows) and on the parallel one (80k rows).  Unfinished, the hash
+;; put every such key in one slot (1000x slower); a factor of 20 leaves a wide
+;; margin.
+(set best (fn [f] (min (map (fn [i] (f)) (til 3)))))
+(set ms (fn [n mul] (do (set x (mk n mul)) (best (fn [] (timeit (select {l: (last v) from: x by: k})))))))
+(< (ms 20000 4294967296) (* 20 (+ 1.0 (ms 20000 1000003)))) -- true
+(< (ms 40000 4294967296) (* 20 (+ 1.0 (ms 40000 1000003)))) -- true
