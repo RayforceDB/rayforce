@@ -1135,7 +1135,9 @@ ray_t* exec_tz_shift(ray_graph_t* g, ray_op_t* op) {
     const ray_tz_t* z = ext && ext->sym >= 0 && ext->sym < ray_tzdata_count
                             ? __atomic_load_n(&g_zone_tables[ext->sym], __ATOMIC_ACQUIRE) : NULL;
     ray_t* result = rte_tz_type_err(input, want_offset);
-    if (!result) result = z ? rte_tz_run(z, input, want_offset) : ray_error("nyi", NULL);
+    /* No table: the compiler loaded it, so the tables were reset since or the
+     * node was built by hand; answer as the direct call would on a failed load. */
+    if (!result) result = z ? rte_tz_run(z, input, want_offset) : ray_error("oom", NULL);
     ray_release(input);
     return result;
 }

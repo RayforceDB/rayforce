@@ -131,6 +131,10 @@
 (.time.tz.offset 'America/New_York 0D01:00:00) !- type
 (.time.tz.offset 'Mars/Olympus_Mons V) !- domain
 
+;; a wrong count of arguments names the whole function
+(.time.tz.local 'Asia/Tokyo) !- arity
+(.time.tz.offset 'Asia/Tokyo) !- arity
+
 ;; ── the database ─────────────────────────────────────────────────────
 (type (.time.tz.version)) -- 'str
 (>= (count (.time.tz.version)) 5) -- true
