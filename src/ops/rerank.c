@@ -31,6 +31,7 @@
 #include "table/table.h"
 #include "ops/rowsel.h"
 #include "lang/format.h"
+#include "lang/eval.h"
 #include "store/hnsw.h"
 #include <math.h>
 #include <string.h>
@@ -39,55 +40,10 @@
  *  Helpers
  * ========================================================================== */
 
-/* Element access into a numeric ray_t vector (F32 / F64 / I32 / I64) → double. */
-static double rr_at_f64(ray_t* v, int64_t i) {
-    void* d = ray_data(v);
-    switch (v->type) {
-        case RAY_F32: return (double)((float*)d)[i];
-        case RAY_F64: return ((double*)d)[i];
-        case RAY_I32: return (double)((int32_t*)d)[i];
-        case RAY_I64: return (double)((int64_t*)d)[i];
-        default:      return 0.0;
-    }
-}
-
 static bool rr_is_numeric(ray_t* v) {
     if (!v || !ray_is_vec(v)) return false;
     return v->type == RAY_F32 || v->type == RAY_F64
         || v->type == RAY_I32 || v->type == RAY_I64;
-}
-
-/* Distance metrics — mirror row_score in src/ops/embedding.c. */
-typedef enum { RR_COS_DIST, RR_IP_NEG, RR_L2_DIST } rr_metric_t;
-
-static rr_metric_t rr_metric_from_hnsw(int32_t m) {
-    switch ((ray_hnsw_metric_t)m) {
-        case RAY_HNSW_L2: return RR_L2_DIST;
-        case RAY_HNSW_IP: return RR_IP_NEG;
-        case RAY_HNSW_COSINE:
-        default:          return RR_COS_DIST;
-    }
-}
-
-static double rr_row_dist(rr_metric_t m, ray_t* row,
-                           const double* q, double q_norm, int32_t dim) {
-    double acc = 0.0, r_norm_sq = 0.0;
-    if (m == RR_L2_DIST) {
-        for (int32_t j = 0; j < dim; j++) {
-            double d = rr_at_f64(row, j) - q[j];
-            acc += d * d;
-        }
-        return sqrt(acc);
-    }
-    for (int32_t j = 0; j < dim; j++) {
-        double a = rr_at_f64(row, j);
-        acc += a * q[j];
-        if (m == RR_COS_DIST) r_norm_sq += a * a;
-    }
-    if (m == RR_IP_NEG) return -acc;
-    double denom = q_norm * sqrt(r_norm_sq);
-    double sim = (denom > 0.0) ? acc / denom : 0.0;
-    return 1.0 - sim;
 }
 
 /* Build an empty-rows clone of the source schema plus a trailing _dist
@@ -270,48 +226,6 @@ static int64_t* accepted_rowids(ray_graph_t* g, int64_t nrows, int64_t* count) {
     return dense;
 }
 
-/* Max-heap top-K by distance (lower=closer).  Mirrors the heap in
- * src/ops/embedding.c:ray_knn_fn. */
-typedef struct { double d; int64_t id; } rr_ent_t;
-
-static void rr_heap_insert(rr_ent_t* heap, int64_t k, int64_t* size,
-                            double d, int64_t id) {
-    if (*size < k) {
-        int64_t j = (*size)++;
-        heap[j] = (rr_ent_t){ d, id };
-        while (j > 0) {
-            int64_t p = (j - 1) / 2;
-            if (heap[p].d >= heap[j].d) break;
-            rr_ent_t t = heap[p]; heap[p] = heap[j]; heap[j] = t;
-            j = p;
-        }
-    } else if (d < heap[0].d) {
-        heap[0] = (rr_ent_t){ d, id };
-        int64_t j = 0;
-        for (;;) {
-            int64_t l = 2*j+1, r = 2*j+2, best = j;
-            if (l < *size && heap[l].d > heap[best].d) best = l;
-            if (r < *size && heap[r].d > heap[best].d) best = r;
-            if (best == j) break;
-            rr_ent_t t = heap[j]; heap[j] = heap[best]; heap[best] = t;
-            j = best;
-        }
-    }
-}
-
-static void rr_heap_sort(rr_ent_t* heap, int64_t size) {
-    /* Insertion sort ascending by distance — size is small. */
-    for (int64_t i = 1; i < size; i++) {
-        rr_ent_t key = heap[i];
-        int64_t j = i - 1;
-        while (j >= 0 && heap[j].d > key.d) {
-            heap[j + 1] = heap[j];
-            j--;
-        }
-        heap[j + 1] = key;
-    }
-}
-
 /* ==========================================================================
  *  exec_ann_rerank — index-backed, filter-aware iterative scan.
  *
@@ -437,7 +351,6 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     const float* query   = ext->rerank.query_vec;
     int32_t      dim     = ext->rerank.dim;
     int64_t      k       = ext->rerank.k;
-    rr_metric_t  metric  = rr_metric_from_hnsw(ext->rerank.metric);
     if (col_sym <= 0 || !query || dim <= 0 || k <= 0) return ray_error("schema", NULL);
 
     /* Special-case empty source: return a well-shaped empty result rather
@@ -468,76 +381,35 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
         return r ? r : ray_error("oom", NULL);
     }
 
-    /* Convert query float* → double[] + norm. */
-    double* q_buf = (double*)ray_calloc_raw((size_t)dim * sizeof(double));
-    if (!q_buf) { if (accepted) ray_free_raw(accepted); return ray_error("oom", NULL); }
-    double q_norm_sq = 0.0;
-    for (int32_t j = 0; j < dim; j++) {
-        q_buf[j] = (double)query[j];
-        q_norm_sq += q_buf[j] * q_buf[j];
-    }
-    double q_norm = sqrt(q_norm_sq);
-
     int64_t k_eff = k;
     if (k_eff > accepted_count) k_eff = accepted_count;
 
-    rr_ent_t* heap = (rr_ent_t*)ray_calloc_raw((size_t)k_eff * sizeof(rr_ent_t));
-    if (!heap) {
-        ray_free_raw(q_buf); if (accepted) ray_free_raw(accepted);
-        return ray_error("oom", NULL);
-    }
-    int64_t heap_size = 0;
-
-    /* Walk accepted rows — identity scan if no filter, dense rowid list otherwise. */
-    if (accepted) {
-        for (int64_t ai = 0; ai < accepted_count; ai++) {
-            int64_t i = accepted[ai];
-            if (i < 0 || i >= nrows) continue;
-            ray_t* row = ray_list_get(col, i);
-            if (!rr_is_numeric(row) || row->len != dim) {
-                int8_t  rt = row ? row->type : RAY_NULL;
-                int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
-                ray_free_raw(heap); ray_free_raw(q_buf); ray_free_raw(accepted);
-                if (rl >= 0)
-                    return ray_error("type", "knn rerank: each row vector must have length %lld, got %lld", (long long)dim, (long long)rl);
-                return ray_error("type", "knn rerank: each row must be a numeric vector (f32/f64/i32/i64), got %s", ray_type_name(rt));
-            }
-            double d = rr_row_dist(metric, row, q_buf, q_norm, dim);
-            rr_heap_insert(heap, k_eff, &heap_size, d, i);
-        }
-    } else {
-        for (int64_t i = 0; i < nrows; i++) {
-            ray_t* row = ray_list_get(col, i);
-            if (!rr_is_numeric(row) || row->len != dim) {
-                int8_t  rt = row ? row->type : RAY_NULL;
-                int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
-                ray_free_raw(heap); ray_free_raw(q_buf);
-                if (rl >= 0)
-                    return ray_error("type", "knn rerank: each row vector must have length %lld, got %lld", (long long)dim, (long long)rl);
-                return ray_error("type", "knn rerank: each row must be a numeric vector (f32/f64/i32/i64), got %s", ray_type_name(rt));
-            }
-            double d = rr_row_dist(metric, row, q_buf, q_norm, dim);
-            rr_heap_insert(heap, k_eff, &heap_size, d, i);
-        }
-    }
-    ray_free_raw(q_buf);
-    if (accepted) ray_free_raw(accepted);
-
-    rr_heap_sort(heap, heap_size);
-
-    int64_t* out_ids = (int64_t*)ray_calloc_raw((size_t)heap_size * sizeof(int64_t));
-    double*  out_ds  = (double*)ray_calloc_raw((size_t)heap_size * sizeof(double));
-    if ((!out_ids || !out_ds) && heap_size > 0) {
+    int64_t* out_ids = (int64_t*)ray_calloc_raw((size_t)k_eff * sizeof(int64_t));
+    double*  out_ds  = (double*)ray_calloc_raw((size_t)k_eff * sizeof(double));
+    if (!out_ids || !out_ds) {
         if (out_ids) ray_free_raw(out_ids);
         if (out_ds)  ray_free_raw(out_ds);
-        ray_free_raw(heap);
+        if (accepted) ray_free_raw(accepted);
         return ray_error("oom", NULL);
     }
-    for (int64_t i = 0; i < heap_size; i++) {
-        out_ids[i] = heap[i].id;
-        out_ds[i]  = heap[i].d;
+    /* The accepted rows (all of them when there is no filter) go through the
+     * one exact search .emb.knn has. */
+    int64_t bad_row = -1;
+    int64_t heap_size = ray_emb_knn_scan(col, accepted, accepted_count, query, dim,
+                                         ext->rerank.metric, k_eff, out_ids, out_ds, &bad_row);
+    if (accepted) ray_free_raw(accepted);
+    if (heap_size < 0) {
+        ray_free_raw(out_ids); ray_free_raw(out_ds);
+        if (heap_size == RAY_EMB_KNN_BAD_ROW) {
+            ray_t*  row = bad_row >= 0 && bad_row < nrows ? ray_list_get(col, bad_row) : NULL;
+            int8_t  rt = row ? row->type : RAY_NULL;
+            int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
+            if (rl >= 0)
+                return ray_error("type", "knn rerank: each row vector must have length %lld, got %lld", (long long)dim, (long long)rl);
+            return ray_error("type", "knn rerank: each row must be a numeric vector (f32/f64/i32/i64), got %s", ray_type_name(rt));
+        }
+        return heap_size == RAY_EMB_KNN_CANCELLED ? ray_error("cancel", "interrupted") : ray_error("oom", NULL);
     }
-    ray_free_raw(heap);
 
     ray_t* result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
     if (out_ids) ray_free_raw(out_ids);
