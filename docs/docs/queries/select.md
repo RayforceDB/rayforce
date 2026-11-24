@@ -449,7 +449,8 @@ Over a table with no rows, with or without `where:`, and over a `where:`
 that keeps no row, each aggregate gives its answer over no values:
 `count` `0`, `sum` `0`, `prod` `1`, `all` `true`, `any` `false`, and the
 null of its type for `min`, `max`, `avg`, `first`, `last`, `med` and the
-deviations, the same row on a plain or a parted table. A select with `by:` over
+deviations, the same row on a plain or a parted table (a parted table
+whose partitions are all empty included). A select with `by:` over
 no rows has no groups and gives no row:
 
 ```lisp
