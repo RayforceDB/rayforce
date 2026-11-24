@@ -2563,11 +2563,17 @@ static ray_t* count_distinct_per_group_parallel(
      * room for skew; per-partition dedup data ~2 × (n_rows/64) × 16 B
      * which is well inside L2 even on 1 M-row inputs. */
     uint8_t p_bits = 6;
-    /* Above 1M rows, one more bit per doubling up to 256 partitions: the
-     * dedup table of a partition (2-4 slots a pair, 16 B a slot) then stays
-     * within about 1 MB, an L2 instead of an L3 working set (the 64
-     * partitions of 5M rows took 4 MB tables and 37 ms; 256 take 10). */
-    while (p_bits < 8 && (n_rows >> p_bits) > (int64_t)1 << 14) p_bits++;
+    bool by_val = n_groups <= CDPG_FEW_GROUPS;
+    /* Per group (many groups), above 1M rows, one more bit per doubling up
+     * to 256 partitions: the dedup table of a partition (2-4 slots a pair,
+     * 16 B a slot) then stays within about 1 MB, an L2 instead of an L3
+     * working set (the 64 partitions of 5M rows took 4 MB tables and 37 ms;
+     * 256 take 10).  Per value (few groups) stays at 64: each partition
+     * also carries n_groups counters, and four times the scatter streams
+     * cost more than the smaller tables save (5M rows, 256 groups, 4
+     * workers: 10-65% slower at 256 partitions). */
+    if (!by_val)
+        while (p_bits < 8 && (n_rows >> p_bits) > (int64_t)1 << 14) p_bits++;
     uint64_t P = (uint64_t)1 << p_bits;
     uint64_t p_mask = P - 1;
 
@@ -2580,7 +2586,7 @@ static ray_t* count_distinct_per_group_parallel(
         .n_groups = n_groups,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
-        .by_val = n_groups <= CDPG_FEW_GROUPS,
+        .by_val = by_val,
     };
 
     if (P > 256) return NULL;
