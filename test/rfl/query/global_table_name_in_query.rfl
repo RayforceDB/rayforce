@@ -1,0 +1,31 @@
+;; Inside a query, a name that is no column reads its global when it holds
+;; a table or a dict, as it does an atom or a vector, not a missing column
+;; (#1496).  A name holding a list is left as it was: select still reports
+;; it as a missing column (how a list reads is the open question #1570).
+(set T (table [v] (list (til 100))))
+(set W (table [x] (list (til 50))))
+(set Z (til 50))
+(set D (dict [a b] (list 1 2)))
+(set L (list 1 2 3))
+(count (select {from: T where: (>= v (- (count Z) 10)) v: v})) -- 60
+(count (select {from: T where: (>= v (- (count W) 10)) v: v})) -- 60
+(count (select {from: T where: (>= v (- (count T) 10)) v: v})) -- 10
+(count (select {from: T where: (>= v (- (count D) 10)) v: v})) -- 100
+(select {from: T where: (>= v (+ (count L) 95)) v: v}) !- schema
+(select {from: T r: (count L)}) !- schema
+;; projection and keyless aggregate
+(at (select {from: T r: (count W)}) 'r) -- [50]
+(at (select {from: T r: (+ (count W) (count v))}) 'r) -- [150]
+(at (select {from: T r: (count D) where: (< v 3)}) 'r) -- [2]
+;; under by:, alone and beside the group's aggregate, on every key shape
+(set G (table [k v] (list (% (til 100) 2) (til 100))))
+(at (select {from: G by: k r: (count W)}) 'r) -- [50 50]
+(at (select {from: G by: k r: (+ (count W) (count v))}) 'r) -- [100 100]
+(at (select {from: T by: (% v 2) r: (+ (count W) (count v))}) 'r) -- [100 100]
+(at (select {from: G by: k r: (+ (count W) (count v)) where: (< v 10)}) 'r) -- [55 55]
+;; update as select
+(at (update {from: G by: k r: (+ (count W) (count v))}) 'r) -- (take 100 100)
+(count (update {from: T where: (>= v (- (count W) 10)) v: 0})) -- 100
+;; a column of the name is still the column
+(set C (table [W] (list [1 2 3])))
+(at (select {from: C r: (count W)}) 'r) -- [3]
