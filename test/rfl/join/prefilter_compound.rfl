@@ -62,3 +62,96 @@
 (sum (at (inner-join [venue instrument] PF PR) 'px)) -- 4125153
 (sum (fill 0 (at (left-join [venue instrument sid] PF PR) 'w))) -- 12500
 (.sys.exec "rm -rf /tmp/rfl_join_prefilter")
+
+;; ── SYM key domains: a join interns no vocabulary ─────────────────────────
+;; A splayed column's ids are positions in its symfile.  The join compares a
+;; same-domain key pair by raw id and translates only the ROWS of a
+;; cross-domain pair, by string lookup (join_align_sym_keys), so the runtime
+;; symbol table ((.sys.mem) 'sym-count) does not grow by a file's vocabulary
+;; -- the old canonicalization to runtime ids interned the whole symfile on
+;; the first join over it, however small the joined tables.  The vocabularies
+;; come from CSV imports, which intern into the symfile alone, so every key
+;; string is foreign to the runtime table until a line of this file names it;
+;; the runtime-side tables are set up BEFORE the snapshots, and a snapshot is
+;; taken inside one expression (a line interns its own names when it is
+;; parsed), after a first call of (.sys.mem) and of nogrow.
+(.sys.exec "rm -rf /tmp/rfl_join_symdom; mkdir -p /tmp/rfl_join_symdom") -- 0
+(.sys.exec "printf 'k,v\\nsda,1\\nsdb,2\\n,3\\nsdc,4\\nsdd,5\\nsda,6\\nsde,7\\n' > /tmp/rfl_join_symdom/a.csv") -- 0
+(.sys.exec "printf 'k,w\\nsdc,10\\n,20\\nsdz,30\\nsda,40\\n' > /tmp/rfl_join_symdom/b.csv") -- 0
+(set SDT (.csv.splayed "/tmp/rfl_join_symdom/a.csv" "/tmp/rfl_join_symdom/a/"))
+(set SDU (.csv.splayed "/tmp/rfl_join_symdom/b.csv" "/tmp/rfl_join_symdom/b/"))
+(set SDA (.db.splayed.get "/tmp/rfl_join_symdom/a/"))
+(set SDB (.db.splayed.get "/tmp/rfl_join_symdom/b/"))
+(type (at SDA 'k)) -- 'SYM
+;; same symfile: rows 4..7 of SDA, renamed
+(set SDS (xcol (select {from: SDA where: (> v 3)}) [k u]))
+;; runtime literals: sdq is in no file, sdy is only here; sde and sdz stay foreign
+(set SDR (table [k x] (list (as 'SYM ["sdc" "" "sdq" "sda"]) [10 20 30 40])))
+(set SDR2 (table [k w] (list (as 'SYM ["sdc" ""]) [10 20])))
+;; a 70000-row runtime side: the right side above 65536 rows takes the radix path
+(set SDBIG (table [k w] (list (as 'SYM (concat ["sda" "sdb" "sdc" "sdd"] (map (fn [i] (format "sdy%" i)) (til 69996)))) (til 70000))))
+(set nogrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (- (at (.sys.mem) 'sym-count) s0) r))))
+(set SDW (nogrow (fn [] (count (.sys.mem)))))
+;; two symfiles: null equals null across them, sdz matches nothing on the left
+(nogrow (fn [] (at (left-join [k] SDA SDB) 'w))) -- (list 0 [40 0Nl 20 10 0Nl 40 0Nl])
+(nogrow (fn [] (at (inner-join [k] SDA SDB) 'v))) -- (list 0 [1 3 4 6])
+(nogrow (fn [] (at (anti-join [k] SDA SDB) 'v))) -- (list 0 [2 5 7])
+(nogrow (fn [] (semi-mask [k] SDA SDB))) -- (list 0 [true false true true false true false])
+;; a repeat answers from what the first translation of the pair found
+(nogrow (fn [] (at (left-join [k] SDA SDB) 'w))) -- (list 0 [40 0Nl 20 10 0Nl 40 0Nl])
+(nogrow (fn [] (at (inner-join [k] SDB SDA) 'v))) -- (list 0 [4 3 6 1])
+;; the same symfile on both sides
+(nogrow (fn [] (at (left-join [k] SDA SDS) 'u))) -- (list 0 [6 0Nl 0Nl 4 5 6 7])
+(nogrow (fn [] (at (inner-join [k] SDS SDA) 'v))) -- (list 0 [4 5 6 1 7])
+;; a symfile against runtime literals, either side; an absent string matches nothing
+(nogrow (fn [] (at (left-join [k] SDA SDR) 'x))) -- (list 0 [40 0Nl 20 10 0Nl 40 0Nl])
+(nogrow (fn [] (at (inner-join [k] SDR SDA) 'v))) -- (list 0 [4 3 6 1])
+(nogrow (fn [] (at (anti-join [k] SDR SDA) 'x))) -- (list 0 [30])
+;; sde was in no runtime table when SDA was translated into it above, and
+;; that absence was recorded; a runtime table that names it now matches it
+(set SDR4 (table [k x] (list (as 'SYM ["sde" "sdc" "sdq" "sdq2" "sdq3"]) [99 10 1 2 3])))
+(nogrow (fn [] (at (left-join [k] SDA SDR4) 'x))) -- (list 0 [0Nl 0Nl 0Nl 10 0Nl 0Nl 99])
+;; (the radix path emits left rows in partition order: pin sums)
+(nogrow (fn [] (sum (fill 0 (at (left-join [k] SDA SDBIG) 'w))))) -- (list 0 6)
+(nogrow (fn [] (count (select {from: (left-join [k] SDA SDBIG) where: (nil? w)})))) -- (list 0 2)
+(nogrow (fn [] (count (inner-join [k] SDBIG SDA)))) -- (list 0 5)
+(nogrow (fn [] (count (anti-join [k] SDBIG SDA)))) -- (list 0 69996)
+;; full join: a right-only key is written into the left key column from its
+;; string, so a runtime left interns exactly the right-only strings (sdz)...
+(nogrow (fn [] (at (full-join [k] SDR SDB) 'w))) -- (list 1 [10 20 0Nl 40 30])
+(as 'STR (at (full-join [k] SDR SDB) 'k)) -- ["sdc" "" "sdq" "sda" "sdz"]
+;; ...and a file-domain left keeps its domain: a right-only key it holds is
+;; stored by position
+(nogrow (fn [] (at (full-join [k] (select {from: SDA where: (< v 5)}) SDS) 'u))) -- (list 0 [6 0Nl 0Nl 4 5 7])
+(as 'STR (at (full-join [k] (select {from: SDA where: (< v 5)}) SDS) 'k)) -- ["sda" "sdb" "" "sdc" "sdd" "sde"]
+;; the key columns of a join result are the inputs' cells
+(as 'STR (at (left-join [k] SDA SDR2) 'k)) -- ["sda" "sdb" "" "sdc" "sdd" "sda" "sde"]
+(as 'STR (at (inner-join [k] SDR SDA) 'k)) -- ["sdc" "" "sda" "sda"]
+;; entries appended to an open symfile lie past its mapped prefix: the
+;; translated side still finds them
+(.sys.exec "printf 'k,v\\nsda,1\\nsdb,2\\nsdc,3\\n' > /tmp/rfl_join_symdom/c.csv") -- 0
+(set SDCT (.csv.splayed "/tmp/rfl_join_symdom/c.csv" "/tmp/rfl_join_symdom/c/"))
+(set SDC0 (.db.splayed.get "/tmp/rfl_join_symdom/c/"))
+(set SDCW (.db.splayed.set "/tmp/rfl_join_symdom/c/" (table [k v] (list (as 'SYM ["sda" "sdnew" "sdother"]) [1 2 3]))))
+(set SDC (.db.splayed.get "/tmp/rfl_join_symdom/c/"))
+(set SDR3 (table [k x] (list (as 'SYM ["sdnew" "sda" "sdq" "sdother"]) [1 2 3 4])))
+(at (inner-join [k] SDC SDR3) 'x) -- [2 1 4]
+(at (inner-join [k] SDR3 SDC) 'x) -- [1 2 4]
+(at (left-join [k] SDR3 SDC) 'v) -- [2 1 0Nl 3]
+;; a runtime side translated into a symfile records the strings it lacks;
+;; once the symfile has grown (a rewrite of the table under it) the recorded
+;; absence is dropped and the new entry matches
+(.sys.exec "printf 'k,v\\nsda,1\\nsdb,2\\nsdc,3\\nsdd,4\\nsda,5\\nsdb,6\\nsdc,7\\n' > /tmp/rfl_join_symdom/d.csv") -- 0
+(set SDDT (.csv.splayed "/tmp/rfl_join_symdom/d.csv" "/tmp/rfl_join_symdom/d/"))
+(set SDD0 (.db.splayed.get "/tmp/rfl_join_symdom/d/"))
+(set SDR5 (table [k x] (list (as 'SYM ["sdnew5" "sdc"]) [1 2])))
+(asc (at (inner-join [k] SDR5 SDD0) 'v)) -- [3 7]
+(set SDDW (.db.splayed.set "/tmp/rfl_join_symdom/d/" (table [k v] (list (as 'SYM ["sda" "sdnew5" "sdb" "sdc" "sdd" "sdnew5" "sda"]) [1 2 3 4 5 6 7]))))
+(set SDD (.db.splayed.get "/tmp/rfl_join_symdom/d/"))
+(asc (at (inner-join [k] SDR5 SDD) 'v)) -- [2 4 6]
+;; dropping every holder of b's symfile frees its domain, and with it what
+;; was translated against it; a reopen starts afresh
+(set SDB 0)
+(set SDB (.db.splayed.get "/tmp/rfl_join_symdom/b/"))
+(nogrow (fn [] (at (left-join [k] SDA SDB) 'w))) -- (list 0 [40 0Nl 20 10 0Nl 40 0Nl])
+(.sys.exec "rm -rf /tmp/rfl_join_symdom") -- 0
