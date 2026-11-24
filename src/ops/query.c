@@ -26239,7 +26239,23 @@ by_dict_done:
         int64_t  al_names[32];
         ray_t*   al_exprs[32];
         int      n_al = 0;
-        for (int64_t i = 0; i + 1 < dict_n && n_al < 32; i += 2) {
+        /* An output named as an input column (`URL: (lower URL)`; not the
+         * column itself, `w: w`), or twice: a later output reading that
+         * name reads the output row-wise, where
+         * the per-value evaluation would read the column (the table of
+         * distinct values holds the column under its name).  Every
+         * projection stays row-wise then. */
+        bool shadowed = false;
+        for (int64_t i = 0; i + 1 < dict_n && !shadowed; i += 2) {
+            int64_t kid = dict_elems[i]->i64;
+            if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
+                kid == asc_id || kid == desc_id || kid == nearest_id) continue;
+            ray_t* v = dict_elems[i + 1];
+            bool self = v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED) && v->i64 == kid;   /* `w: w` */
+            if (tbl_has_col(tbl, kid) && !self) shadowed = true;
+            for (int64_t j = 0; j < i && !shadowed; j += 2) shadowed = dict_elems[j]->i64 == kid;
+        }
+        for (int64_t i = 0; i + 1 < dict_n && n_al < 32 && !shadowed; i += 2) {
             int64_t kid = dict_elems[i]->i64;
             if (kid == from_id || kid == where_id || kid == by_id || kid == take_id ||
                 kid == asc_id || kid == desc_id || kid == nearest_id) continue;

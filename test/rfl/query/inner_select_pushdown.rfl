@@ -107,3 +107,30 @@
 (- (runs) m0) -- 0
 (at (at Cl 'c) 0) -- (sum (== (at Ms 'kind) "html"))
 (at (at Cl 'c) 0) -- 2000
+;; an inner output named as an input column, or named twice, is read by the
+;; later outputs as the row-wise select binds it: every projection stays
+;; row-wise, and the groups are the materialized inner select's
+(set Ns 30000)
+(set is (til Ns))
+(set Us (as 'SYM (map (fn [k] (format "Http://X/%.Html" (% k 50))) is)))
+(set TSh (table [URL v] (list Us (% is 7))))
+(set FG (fn [r] (ser (xasc (table [k c] (list (as 'STR (at r 'kind)) (at r 'c))) 'k))))
+(set MSh (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}))
+(set m0 (runs))
+(set GSh (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}) by: kind c: (count v)}))
+(- (runs) m0) -- 1
+(count GSh) -- 2
+(all (== (FG GSh) (FG (select {from: MSh by: kind c: (count v)})))) -- true
+(at (select {from: GSh where: (== kind "a")}) 'c) -- [3000]
+(set MDu (select {from: TSh lu: (lower URL) lu: (upper URL) kind: (if (like lu "*7.HTML") "a" "b") v: v}))
+(set GDu (select {from: (select {from: TSh lu: (lower URL) lu: (upper URL) kind: (if (like lu "*7.HTML") "a" "b") v: v}) by: kind c: (count v)}))
+(all (== (FG GDu) (FG (select {from: MDu by: kind c: (count v)})))) -- true
+(count GDu) -- (count (distinct (at MDu 'kind)))
+;; under a where, with count distinct and a sort key
+(set GW2 (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v where: (> v 2)}) by: kind c: (count v) d: (count (distinct v)) asc: kind}))
+(set OW2 (select {from: (select {from: MSh where: (> v 2)}) by: kind c: (count v) d: (count (distinct v)) asc: kind}))
+(all (== (ser (map (fn [c] (as 'STR (at GW2 c))) (cols GW2))) (ser (map (fn [c] (as 'STR (at OW2 c))) (cols OW2))))) -- true
+(at (at GW2 'c) 0) -- (count (where (and (> (at TSh 'v) 2) (like (lower (at TSh 'URL)) "*7.html"))))
+(at (at GW2 'c) 1) -- (count (where (and (> (at TSh 'v) 2) (not (like (lower (at TSh 'URL)) "*7.html")))))
+(at GW2 'd) -- [4 4]
+(at (select {from: (select {from: TSh URL: (lower URL) kind: (if (like URL "*7.html") "a" "b") v: v}) dk: (count (distinct kind))}) 'dk) -- [2]
