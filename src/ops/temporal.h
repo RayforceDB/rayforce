@@ -85,6 +85,10 @@ ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x);
 ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x);
 /* (.time.tz.version): the IANA release of the database built in, "2026f". */
 ray_t* ray_tz_version_fn(ray_t** args, int64_t n);
+/* Whether `zone_sym` names a zone of the database, loading its table if this
+ * is the first use.  The query compiler asks before it builds an OP_TZ_SHIFT,
+ * on the evaluating thread, so that executing the node only reads. */
+bool ray_temporal_tz_load(int64_t zone_sym);
 /* Drop every zone table looked up so far; the language's shutdown calls it. */
 void ray_temporal_tz_reset(void);
 

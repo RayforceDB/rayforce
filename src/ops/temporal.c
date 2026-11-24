@@ -1094,7 +1094,7 @@ static ray_t* rte_tz_run(const ray_tz_t* z, ray_t* x, bool want_offset) {
     return result;
 }
 
-/* The type of `x` is checked before the zone. */
+/* The type of `x` is checked before the zone, as the node checks it. */
 static ray_t* rte_tz_apply(ray_t* zone, ray_t* x, bool want_offset) {
     if (!x || RAY_IS_ERR(x)) return x;
     int8_t t = x->type < 0 ? (int8_t)-x->type : x->type;
@@ -1106,6 +1106,28 @@ static ray_t* rte_tz_apply(ray_t* zone, ray_t* x, bool want_offset) {
 
 ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x)  { return rte_tz_apply(zone, x, false); }
 ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x) { return rte_tz_apply(zone, x, true); }
+
+bool ray_temporal_tz_load(int64_t zone_sym) {
+    ray_t* err = NULL;
+    ray_t* zone = ray_sym(zone_sym);
+    const ray_tz_t* z = rte_zone(zone, "", &err);
+    ray_release(zone);
+    if (err) ray_error_free(err);
+    return z != NULL;
+}
+
+/* OP_TZ_SHIFT.  The compiler loaded the zone (ray_temporal_tz_load), so this
+ * only reads the table, whichever thread runs the node. */
+ray_t* exec_tz_shift(ray_graph_t* g, ray_op_t* op) {
+    ray_t* input = exec_node(g, op_child(g, op, 0));
+    if (!input || RAY_IS_ERR(input)) return input;
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    const ray_tz_t* z = ext ? rte_zone_loaded(ext->sym) : NULL;
+    ray_t* result = z ? rte_tz_run(z, input, op->out_type == RAY_TIMESPAN) : ray_error("nyi", NULL);
+    ray_release(input);
+    return result;
+}
+
 ray_t* ray_tz_version_fn(ray_t** args, int64_t n) {
     (void)args;
     if (n != 0) return ray_error("domain", ".time.tz.version takes no arguments");

@@ -92,6 +92,32 @@
 (at G 'a) -- [2.0 10.0]
 (at G 'n) -- [2 1]
 
+;; a query compiles the call to an operator of its own; these go through it
+(at (select {from: T l: (.time.tz.local 'America/New_York ts)}) 'l) -- [2024.07.01D08:00:00.000000000 2024.07.01D21:30:00.000000000 2024.07.02D08:00:00.000000000]
+(at (select {from: T o: (.time.tz.offset 'America/New_York ts)}) 'o) -- [-0D04:00:00 -0D04:00:00 -0D04:00:00]
+(at (select {from: T l: (.time.tz.local (quote America/New_York) ts)}) 'l) -- [2024.07.01D08:00:00.000000000 2024.07.01D21:30:00.000000000 2024.07.02D08:00:00.000000000]
+(at (select {from: T h: (hh (.time.tz.local 'America/New_York ts))}) 'h) -- [8 21 8]
+(at (select {from: T px: px where: (== 2024.07.01 (date (.time.tz.local 'America/New_York ts)))}) 'px) -- [1.0 3.0]
+(set G2 (select {from: T by: {d: (trunc 'day (.time.tz.local 'America/New_York ts))} a: (avg px) n: (count px)}))
+(at G2 'd) -- [2024.07.01D00:00:00.000000000 2024.07.02D00:00:00.000000000]
+(at G2 'a) -- [2.0 10.0]
+(at G2 'n) -- [2 1]
+;; a zone held in a variable is not compiled, and answers the same
+(set Z 'America/New_York)
+(at (select {from: T l: (.time.tz.local Z ts)}) 'l) -- [2024.07.01D08:00:00.000000000 2024.07.01D21:30:00.000000000 2024.07.02D08:00:00.000000000]
+;; a null row stays null
+(set TN (table [ts px] (list N [1.0 2.0 3.0])))
+(nil? (at (select {from: TN l: (.time.tz.local 'America/New_York ts)}) 'l)) -- [false true false]
+(nil? (at (select {from: TN o: (.time.tz.offset 'America/New_York ts)}) 'o)) -- [false true false]
+;; the long column in a query agrees with the call, row for row
+(set TB (table [ts] (list B)))
+(sum (== (at (select {from: TB l: (.time.tz.local 'America/New_York ts)}) 'l) L)) -- 600000
+(sum (== (at (select {from: TB o: (.time.tz.offset 'America/New_York ts)}) 'o) O)) -- 600000
+;; the same refusals as outside a query
+(select {from: T l: (.time.tz.local 'Mars/Olympus_Mons ts)}) !- domain
+(select {from: T l: (.time.tz.local 'America/New_York px)}) !- type
+(select {from: T l: (.time.tz.offset "America/New_York" ts)}) !- type
+
 ;; ── refusals ─────────────────────────────────────────────────────────
 (.time.tz.local 'Mars/Olympus_Mons 2024.07.01D12:00:00.000000000) !- domain
 (.time.tz.local 'America/New_Yor 2024.07.01D12:00:00.000000000) !- domain

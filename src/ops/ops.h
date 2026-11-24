@@ -207,6 +207,7 @@ static inline bool ray_has_timespan(const ray_t* x) {
 #define OP_RECIPROCAL   143  /* unary: reciprocal -> F64 */
 #define OP_SIGNUM       144  /* unary: signum -> I64 */
 #define OP_STR_FIND     146  /* binary: string search pattern -> I64 */
+#define OP_TZ_SHIFT     148  /* unary: a UTC instant on a zone's wall clock, or its offset */
 
 /* EXTRACT / DATE_TRUNC field identifiers */
 #define RAY_EXTRACT_YEAR    0
@@ -843,6 +844,9 @@ ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern);
 /* Date/time extraction and truncation */
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field);
 ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field);
+/* (.time.tz.local 'Zone col), or with want_offset (.time.tz.offset 'Zone col).
+ * `zone_sym` names a zone ray_temporal_tz_load has already answered true for. */
+ray_op_t* ray_tz_shift(ray_graph_t* g, ray_op_t* col, int64_t zone_sym, bool want_offset);
 
 /* Reduction ops */
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a);

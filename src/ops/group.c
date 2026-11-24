@@ -12487,7 +12487,8 @@ static ray_t* exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl,
  * graph.  A -1 result means "decline per-partition streaming for this key". */
 static inline bool group_expr_rowlocal_opcode(uint16_t opcode) {
     return (opcode >= OP_ROUND && opcode <= OP_IDIV) ||
-           (opcode >= OP_SIN && opcode <= OP_SIGNUM);
+           (opcode >= OP_SIN && opcode <= OP_SIGNUM) ||
+           opcode == OP_TZ_SHIFT;   /* one zone table for every partition */
 }
 
 static int group_expr_src_syms(ray_graph_t* g, uint32_t root_id,

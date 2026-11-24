@@ -119,7 +119,7 @@ static test_result_t test_dump_opcode_name_all(void) {
         { OP_UPPER,"UPPER"}, { OP_LOWER,"LOWER"}, { OP_STRLEN,"STRLEN"},
         { OP_SUBSTR,"SUBSTR"}, { OP_REPLACE,"REPLACE"}, { OP_TRIM,"TRIM"},
         { OP_CONCAT,"CONCAT"}, { OP_EXTRACT,"EXTRACT"},
-        { OP_DATE_TRUNC,"DATE_TRUNC"},
+        { OP_DATE_TRUNC,"DATE_TRUNC"}, { OP_TZ_SHIFT,"TZ_SHIFT"},
         { OP_SUM,"SUM"}, { OP_PROD,"PROD"}, { OP_MIN,"MIN"}, { OP_MAX,"MAX"},
         { OP_COUNT,"COUNT"}, { OP_AVG,"AVG"},
         { OP_FIRST,"FIRST"}, { OP_LAST,"LAST"},

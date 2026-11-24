@@ -1586,6 +1586,28 @@ ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field) {
     return &g->nodes[ext->base.id];
 }
 
+/* The node's out_type says which of the two it is: a TIMESTAMP for the wall
+ * clock, a TIMESPAN for the offset.  A column that is not a TIMESTAMP is
+ * built anyway and fails at execution with the type error. */
+ray_op_t* ray_tz_shift(ray_graph_t* g, ray_op_t* col, int64_t zone_sym, bool want_offset) {
+    uint32_t col_id = col->id;
+    uint32_t est = col->est_rows;
+
+    ray_op_ext_t* ext = graph_alloc_ext_node(g);
+    if (!ext) return NULL;
+    col = &g->nodes[col_id];  /* re-resolve after potential realloc */
+
+    ext->base.opcode = OP_TZ_SHIFT;
+    ext->base.arity = 1;
+    ext->base.in_id[0] = col->id;
+    ext->base.out_type = want_offset ? RAY_TIMESPAN : RAY_TIMESTAMP;
+    ext->base.est_rows = est;
+    ext->sym = zone_sym;
+
+    g->nodes[ext->base.id] = ext->base;
+    return &g->nodes[ext->base.id];
+}
+
 /* --------------------------------------------------------------------------
  * Multi-table support
  * -------------------------------------------------------------------------- */

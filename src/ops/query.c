@@ -2219,6 +2219,20 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     return dag_temporal_int_readers_ok(g, base) ? &g->nodes[r->id] : NULL;
 }
 
+/* The symbol a quoted-symbol argument names, 'month or (quote month);
+ * NULL for anything else.  Borrowed. */
+static ray_t* dag_quoted_sym(ray_t* u) {
+    if (u && u->type == -RAY_SYM && (u->attrs & ATTR_QUOTED)) return u;
+    if (u && u->type == RAY_LIST && u->len == 2) {
+        ray_t** ue = (ray_t**)ray_data(u);
+        ray_t* qs = (ue[0] && ue[0]->type == -RAY_SYM) ? ray_sym_str(ue[0]->i64) : NULL;
+        if (qs && ray_str_len(qs) == 5 && memcmp(ray_str_ptr(qs), "quote", 5) == 0 &&
+            ue[1] && ue[1]->type == -RAY_SYM)
+            return ue[1];
+    }
+    return NULL;
+}
+
 static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
@@ -2644,23 +2658,28 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             return ray_cast(g, r, temporal);
         }
 
+        /* (.time.tz.local 'Zone x), (.time.tz.offset 'Zone x) — a UTC instant
+         * on a zone's wall clock, or the zone's offset at it.  The zone is a
+         * quoted symbol; a zone the database lacks declines the compile so
+         * the evaluator raises the error. */
+        if ((fname_len == 14 && memcmp(fname, ".time.tz.local", 14) == 0) ||
+            (fname_len == 15 && memcmp(fname, ".time.tz.offset", 15) == 0)) {
+            if (n != 3) return NULL;
+            ray_t* u = dag_quoted_sym(elems[1]);
+            if (!u || !ray_temporal_tz_load(u->i64)) return NULL;
+            ray_op_t* col = compile_expr_dag(g, elems[2]);
+            if (!col) return NULL;
+            return ray_tz_shift(g, col, u->i64, fname_len == 15);
+        }
+
         /* (trunc 'unit x) — calendar / clock truncation, in x's own type.
          * The unit is a quoted symbol, 'month or (quote month); an unknown
          * unit, or a column whose type the unit does not fit, declines the
          * compile so the evaluator raises the error. */
         if (fname_len == 5 && memcmp(fname, "trunc", 5) == 0) {
             if (n != 3) return NULL;
-            ray_t* u = elems[1];
-            bool quoted = u && u->type == -RAY_SYM && (u->attrs & ATTR_QUOTED);
-            if (!quoted && u && u->type == RAY_LIST && u->len == 2) {
-                ray_t** ue = (ray_t**)ray_data(u);
-                ray_t* qs = (ue[0] && ue[0]->type == -RAY_SYM) ? ray_sym_str(ue[0]->i64) : NULL;
-                if (qs && ray_str_len(qs) == 5 && memcmp(ray_str_ptr(qs), "quote", 5) == 0) {
-                    u = ue[1];
-                    quoted = u && u->type == -RAY_SYM;
-                }
-            }
-            if (!quoted) return NULL;
+            ray_t* u = dag_quoted_sym(elems[1]);
+            if (!u) return NULL;
             ray_t* us = ray_sym_str(u->i64);
             int unit = us ? ray_temporal_unit_from_name(ray_str_ptr(us), ray_str_len(us)) : -1;
             if (unit < 0) return NULL;
@@ -6302,7 +6321,7 @@ static bool key_range_op_rowwise(uint16_t opc) {
     case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
     case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
     case OP_CONCAT: case OP_STR_FIND:
-    case OP_EXTRACT: case OP_DATE_TRUNC:
+    case OP_EXTRACT: case OP_DATE_TRUNC: case OP_TZ_SHIFT:
         return true;
     default:
         return false;
