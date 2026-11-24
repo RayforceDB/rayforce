@@ -83,3 +83,13 @@
 (set Rws (select {from: (select {from: TN sk: (as 'SYM sk) nk: nk v: v}) by: [sk nk] c: (count v) d: (count (distinct v)) where: (> v 1000) asc: [sk nk]}))
 (all (== (FP Rw) (FP Rws))) -- true
 (sum (at Rw 'c)) -- 35017
+
+;; ── more than 16 keys keep their route (the probe holds 16): the composite
+;; grouping still answers, with the counts of the plain count query ──
+(set K17 (table [a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 v] (list (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 2) (% i 3) (% i 5) IP)))
+(set R17 (select {from: K17 by: [a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17] c: (count v) d: (count (distinct v))}))
+(count R17) -- 30
+(sum (at R17 'c)) -- 70000
+(all (<= (at R17 'd) (at R17 'c))) -- true
+(set R17c (select {from: K17 by: [a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17] c: (count v)}))
+(== (sum (at R17c 'c)) (sum (at R17 'c))) -- true
