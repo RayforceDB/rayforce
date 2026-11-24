@@ -2477,6 +2477,24 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
  * atomic fetch-add into odata[gid] for each new distinct (gid, val). */
 typedef struct { int64_t gid_p1; int64_t val; } cdpg_slot_t;   /* 0 = empty */
 
+#ifdef DEBUG
+static _Atomic(int64_t) g_cdpg_test_fail_at;   /* fail the nth slot table */
+void ray_cdpg_test_fail_slots(int64_t nth) { atomic_store(&g_cdpg_test_fail_at, nth); }
+#endif
+
+/* A partition's slot table; zeroed, NULL if it can't be had. */
+static cdpg_slot_t* cdpg_slots_alloc(ray_t** hdr, uint64_t cap) {
+#ifdef DEBUG
+    int64_t v = atomic_load(&g_cdpg_test_fail_at);
+    while (v > 0)
+        if (atomic_compare_exchange_weak(&g_cdpg_test_fail_at, &v, v - 1)) {
+            if (v == 1) { *hdr = NULL; return NULL; }
+            break;
+        }
+#endif
+    return (cdpg_slot_t*)scratch_calloc(hdr, (size_t)cap * sizeof(cdpg_slot_t));
+}
+
 static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                           int64_t start, int64_t end) {
     (void)worker_id;
@@ -2497,8 +2515,7 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
         /* gid and value side by side: one cache line per probe, where
          * two arrays cost a miss each */
         ray_t* s_hdr = NULL;
-        cdpg_slot_t* slots = (cdpg_slot_t*)scratch_calloc(&s_hdr,
-                                                          (size_t)cap * sizeof(cdpg_slot_t));
+        cdpg_slot_t* slots = cdpg_slots_alloc(&s_hdr, cap);
         /* a partition left uncounted would undercount its groups */
         if (!slots) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
 
