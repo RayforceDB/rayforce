@@ -51,6 +51,30 @@ A name a `let` binds in a `where:` and a later argument of the same `do` reads r
 
 Projections answer per row in these shapes. An opaque `by:` key (a helper the planner does not inline) that raises this error over the whole column is evaluated again row by row, as it is when its whole-column run fails for any reason. A `try` in the query catches the error as it does any other.
 
+### A boolean vector as the condition
+
+When the condition is a boolean vector, `if` chooses per row, outside a query as inside one. Both arms are evaluated, because every row needs one of them; each arm is a vector of the condition's length or an atom that broadcasts:
+
+```lisp
+‣ (if [true false true] [1 2 3] [10 20 30])
+[1 20 3]
+‣ (if [true false] "x" "y")
+["x" "y"]
+‣ (if (> [3 8 5] 4) 1 0)
+[0 1 1]
+```
+
+The result type follows the promotion `if` has in a query: numbers promote, a temporal beside a number or another temporal type raises `type`. An arm of the wrong length raises `length`, and an arm that is neither a vector nor an atom raises `type`. A vector choice needs its fallback, so `(if [true false] 1)` raises `domain`.
+
+In a chain, a boolean-vector condition chooses per row between its result and the rest of the chain, which is evaluated whole; a later condition that is a single value picks a whole result, as it does alone:
+
+```lisp
+‣ (if [true false false] [1 2 3] [false true false] [10 20 30] 0)
+[1 20 0]
+```
+
+A condition that is a single value, or a vector of another type, is unchanged: it is tested as one truth value and only the arm it takes is evaluated.
+
 A query's `if` gives one column, so its arms must have a common type. Two
 numeric arms take the [promotion table](math.md#result-types) (`(if c i 1.5)`
 over an i64 column is f64). Two temporal arms of one type keep it, and a

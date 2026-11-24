@@ -1,0 +1,81 @@
+;; (if mask a b) with a boolean-vector condition chooses per row, outside a
+;; query as inside one.  Both arms are evaluated; an arm is a vector of the
+;; mask's length or an atom that broadcasts.  A scalar condition is unchanged
+;; and still evaluates only the arm it takes.
+
+;; ── tree-walking evaluator (top level) ──────────────────────────────────────
+(if [true false] [1 2] [3 4]) -- [1 4]
+(if [true false true] 10 [1 2 3]) -- [10 2 10]
+(if [true false true] [1 2 3] 0) -- [1 0 3]
+(if [true false] 1 2) -- [1 2]
+(if [true false] 1.5 2) -- [1.5 2.0]
+(if [true false] 'a 'b) -- ['a 'b]
+(if [true false] "x" "y") -- ["x" "y"]
+(if [true false] 2024.01.01 2024.06.01) -- [2024.01.01 2024.06.01]
+(if (> [1 5 9] 4) [1 2 3] [10 20 30]) -- [10 2 3]
+(if [] [] []) -- []
+(if [true false] (+ 1 2) (+ 3 4)) -- [3 7]
+
+;; a chain: a boolean vector picks per row between its arm and the rest of
+;; the chain; a later scalar condition picks a whole arm, as it does alone
+(if [true false false] [1 2 3] [false true false] [10 20 30] 0) -- [1 20 0]
+(if [true false] 1 true 2 3) -- [1 2]
+(if [true false] 1 false 2 3) -- [1 3]
+(if [true false] 1 [false true] 2 3) -- [1 2]
+
+;; arms of a scalar condition are still lazy
+(set n 0)
+(if true 1 (set n 5)) -- 1
+n -- 0
+(if false (set n 5) 2) -- 2
+n -- 0
+
+;; errors
+(if [true false] [1 2 3] 0) !- length
+(if [true false] 0 [1 2 3]) !- length
+(if [true false] 1) !- domain
+(if [true false] 1 [false true] 2) !- domain
+(if [true false] 1 'a) !- type
+(if [true false] 2024.01.01 5) !- type
+(if [true false] (list 1 2) 3) !- type
+
+;; ── bytecode compiler (inside a lambda) agrees ──────────────────────────────
+(set fv (fn [m a b] (if m a b)))
+(fv [true false] [1 2] [3 4]) -- [1 4]
+(fv [true false] 1 2) -- [1 2]
+(fv true 1 2) -- 1
+(fv false 1 2) -- 2
+(fv [true false] 'a 'b) -- ['a 'b]
+(fv [true false] [1 2 3] 0) !- length
+(fv [true false] 1 'a) !- type
+
+;; locals are visible to the arms of the per-row path
+(set fl (fn [m a] (let k 7) (if m a k)))
+(fl [true false] [1 2]) -- [1 7]
+(fl true 3) -- 3
+(set fp (fn [m a] (if m (+ a 1) (* a 2))))
+(fp [true false] [10 20]) -- [11 40]
+
+;; a chain, and no else arm
+(set fc (fn [m n] (if m 1 n 2 3)))
+(fc [true false false] [false true false]) -- [1 2 3]
+(fc false true) -- 2
+(fc false false) -- 3
+(set fn1 (fn [m a] (if m a)))
+(fn1 true 5) -- 5
+(fn1 false 5) -- 0
+(fn1 [true false] [1 2]) !- domain
+
+;; the compiled and interpreted spellings agree on the same operands
+(set Mv [true false true false])
+(set Av [1 2 3 4])
+(set Bv [10 20 30 40])
+(fv Mv Av Bv) -- (if Mv Av Bv)
+
+;; ── the same choice as inside a query ───────────────────────────────────────
+(set T (table [m a b] (list Mv Av Bv)))
+(at (select {r: (if m a b) from: T}) 'r) -- (if Mv Av Bv)
+(set Ts (table [m a b] (list Mv ['x 'y 'z 'w] ['p 'q 'r 's])))
+(at (select {r: (if m a b) from: Ts}) 'r) -- (if Mv ['x 'y 'z 'w] ['p 'q 'r 's])
+(set Td (table [m a b] (list Mv [2024.01.01 2024.01.02 2024.01.03 2024.01.04] [2025.01.01 2025.01.02 2025.01.03 2025.01.04])))
+(at (select {r: (if m a b) from: Td}) 'r) -- (if Mv [2024.01.01 2024.01.02 2024.01.03 2024.01.04] [2025.01.01 2025.01.02 2025.01.03 2025.01.04])

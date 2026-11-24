@@ -394,12 +394,50 @@ static void compile_if_chain(compiler_t *c, ray_t **args, int64_t nargs) {
     /* Match ray_cond_fn: truthiness belongs to the materialized value,
      * not to the non-NULL lazy handle that happens to contain it. */
     emit(c, OP_FORCE);
+    /* A boolean-vector condition chooses per row, which needs every arm
+     * evaluated.  It leaves for the tree walker's `if` (OP_IFTREE) with the
+     * chain's remaining forms, so both engines share one implementation and
+     * no arm is compiled twice.  Any other condition takes the lazy jumps. */
+    int32_t jmpvec_pos = -1, forms_idx = -1;
+    if (nargs <= 63) {
+        /* The window binds every local: the path runs only for a vector
+         * condition, and asking which locals the forms mention would walk
+         * their whole subtree at every nesting level. */
+        int32_t nsyms = c->n_locals;
+        ray_t *syms = ray_alloc((size_t)(nsyms > 0 ? nsyms : 1) * sizeof(int64_t));
+        if (!syms || RAY_IS_ERR(syms)) { c->error = true; return; }
+        syms->type = RAY_I64;
+        syms->len = nsyms;
+        int64_t *ids = (int64_t*)ray_data(syms);
+        for (int32_t i = 0; i < nsyms; i++) ids[i] = c->locals[i].sym_id;
+        ray_t *forms = ray_list_new(nargs);
+        if (forms && !RAY_IS_ERR(forms)) forms = ray_list_append(forms, syms);
+        ray_release(syms);
+        for (int64_t i = 1; forms && !RAY_IS_ERR(forms) && i < nargs; i++)
+            forms = ray_list_append(forms, args[i]);
+        if (!forms || RAY_IS_ERR(forms)) { c->error = true; return; }
+        forms_idx = add_constant(c, forms);
+        ray_release(forms);
+        if (c->error) return;
+        jmpvec_pos = emit_jump(c, OP_JMPVEC);
+    }
     int32_t jmpf_pos = emit_jump(c, OP_JMPF);
     compile_expr(c, args[1]);
     int32_t jmp_pos = emit_jump(c, OP_JMP);
+    int32_t iftree_pos = -1;
+    if (jmpvec_pos >= 0) {
+        patch_jump(c, jmpvec_pos);
+        emit(c, OP_IFTREE);
+        emit(c, (uint8_t)((forms_idx >> 8) & 0xFF));
+        emit(c, (uint8_t)(forms_idx & 0xFF));
+        iftree_pos = c->code_len;
+        emit(c, 0);
+        emit(c, 0);
+    }
     patch_jump(c, jmpf_pos);
     compile_if_chain(c, args + 2, nargs - 2);
     patch_jump(c, jmp_pos);
+    if (iftree_pos >= 0) write_jump_offset(c, iftree_pos, c->code_len);
 }
 
 /* (set name value) — bind in the global env.  Compile the value
