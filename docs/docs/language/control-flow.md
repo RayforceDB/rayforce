@@ -189,18 +189,32 @@ out of one at the REPL.
 
 Unlike `if`, `while` tests a vector condition as one truth value: a non-empty
 vector is true, so a loop over a vector whose cells all turn false still runs.
-Inside a query, a `while` in a helper the planner does not inline (it runs as
-bytecode) that is called with a column gets a boolean-vector condition over the
-query's rows, or a group's rows. When that condition is read from the column or
-computed from it with builtins, such as `(> v 15)` or `(not (<= v 15))`, a
-condition true on every row is true and one false on every row is false, so
-such a loop stops; one that is true on some rows and false on others raises
-`nyi`, since a loop cannot take a different number of passes for each row. A
-condition built with `and` or `or`, such as `(and (> v 15) true)`, is tested
-whole, as outside a query, so such a loop may not end
-([#1647](https://github.com/RayforceDB/rayforce/issues/1647)). Write the loop
-over one row's value and call the helper from a projection, where it runs once
-per row, or replace it with a vector expression.
+
+Inside a query, a `while` condition that is a vector (or a list) whose length is
+the number of rows being evaluated (the query's rows, or the group's rows under
+`by:`) is tested as a whole, so that a loop over the rows cannot run forever.
+It does not matter what computes the vector: `(> v 15)` in a helper or a lambda
+called with a column, `(and (> v 15) true)`, `(if (> v 15) true false)`, but
+also a global, a constant or another table's column that happens to have that
+length.
+
+- A boolean vector true on every row is true.
+- A boolean vector false on every row, or an empty one when there are no rows,
+  is false, so the loop stops.
+- A boolean vector true on some rows and false on others, or a vector of any
+  other type, raises `nyi`: a loop cannot take a different number of passes
+  for each row.
+
+A vector of any other length, a single value, a `while` outside a query, and a
+projection evaluated one row at a time are tested as before. Compared with
+testing the vector as one truth value, which every query did before, three
+cases now differ: a vector false on every row ends the loop where it used to
+run it, a mixed boolean vector or a vector of another type raises `nyi` where
+it used to count as true, and an empty vector in a query with no rows ends the
+loop where it used to run it. A loop that only needs to know whether any or
+every cell holds should test `(any c)` or `(all c)`, which are single values.
+Write a loop over one row's value and call the helper from a projection,
+where it runs once per row, or replace the loop with a vector expression.
 
 ## Bounded Iteration: times
 

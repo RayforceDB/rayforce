@@ -90,6 +90,13 @@ static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
  * (query.c rw_eval_call). */
 uint8_t ray_eval_last_rows(void) { return vrows_from(g_eval_rows); }
 
+/* The same in the tree walker's encoding (1 rows, 0 not, -1 unknown), and
+ * its setter: for a special form that builds its value from several of its
+ * operands, so the value's provenance is theirs joined, not the last one's
+ * (cmp.c `and` / `or`). */
+int8_t ray_eval_rows(void) { return g_eval_rows; }
+void ray_eval_set_rows(int8_t rows) { g_eval_rows = rows; }
+
 #include <math.h>
 #include <signal.h>
 #include <time.h>
@@ -3333,22 +3340,38 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
-/* A vector condition tested whole by a bytecode jump inside a query, over its
- * rows (#1630): the condition of a jump other than `if`'s, which chooses per
- * row for a boolean vector (ray_cond_rows).  The one such jump a vector
- * reaches is a compiled `while`'s (a `times` count is normalized to an atom
- * first).  Tested whole, any non-empty vector is true, so a loop over the
- * rows ran on the first row's say.  A condition true on some rows and false
- * on others is an error.  One true on every row, or false on every row, is
- * that truth for all of them: *truth is set to 1 or 0.  A vector of another
- * length, or one not derived from the rows (`rows` 0: a global, a literal),
- * leaves *truth at -1, tested whole as outside a query.  NULL unless an
- * error. */
-static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows, int* truth) {
+/* A `while` condition inside a query that is a vector as long as the rows
+ * being evaluated (the group's under a per-group evaluation, the active
+ * table's otherwise; ray_query_rows_len) (#1630, #1647).  This is the
+ * condition of a compiled `while`'s jump (vm_cond_test; a `times` count is
+ * normalized to an atom first, and `if` chooses per row for a boolean
+ * vector, ray_cond_rows) or of the tree walker's (ray_while_fn).  Tested
+ * whole, any non-empty vector is true, so a loop over the rows ran on the
+ * first row's say, and one false on every row never ended: a server could
+ * be held by one query.
+ *
+ * Every such vector is tested, whatever computed it.  Row provenance is not
+ * consulted: a value computed from the rows is reported as such only where
+ * each route that builds one says so (an `if`'s result took its arms'
+ * provenance, `and`'s its last operand's), and one route that does not
+ * would loop forever.  A BOOL vector true on every row is true and one
+ * false on every row false (no rows: false, there being no row to loop
+ * for); one true on some rows and false on others, or a vector of another
+ * type, is an error, since a loop cannot take a different number of passes
+ * for each row.  *truth is set to 1 or 0; a vector of another length, or
+ * an atom, leaves it at -1, tested whole as outside a query.  NULL unless
+ * an error. */
+static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, int* truth) {
     *truth = -1;
-    if (rows == 0 || cond->type != RAY_BOOL || cond->len < 1) return NULL;
+    if (!(ray_is_vec(cond) || cond->type == RAY_LIST)) return NULL;
     int64_t len = ray_query_rows_len();
-    if (len != cond->len) return NULL;
+    if (len < 0 || len != ray_len(cond)) return NULL;
+    if (len == 0) { *truth = 0; return NULL; }
+    if (cond->type != RAY_BOOL)
+        return ray_error("nyi", "while: its condition is a vector of %s over the query's rows, "
+                         "and a loop tests it whole, not row by row; "
+                         "see Iteration: while in language/control-flow.md",
+                         ray_type_name(cond->type));
     const uint8_t* b = (const uint8_t*)ray_data(cond);
     bool first = b[0] != 0;
     /* Eight cells a word: a BOOL cell is 0 or 1, so a word of cells all
@@ -3376,10 +3399,10 @@ static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows
  * `if`'s, which takes OP_JMPFV): counted toward rows_cond, and inside a query a
  * condition over its rows goes through cond_rows_test.  Consumes `cond`; an
  * error goes to *err. */
-static __attribute__((noinline)) int vm_cond_test(ray_t* cond, uint8_t rows, ray_t** err) {
+static __attribute__((noinline)) int vm_cond_test(ray_t* cond, ray_t** err) {
     __VM->rows_cond++;   /* a vector tested whole */
     int truth = -1;
-    ray_t* mixed = cond_rows_test(cond, rows, &truth);
+    ray_t* mixed = cond_rows_test(cond, &truth);
     if (mixed) { ray_release(cond); *err = mixed; return 0; }
     int t = truth >= 0 ? truth : is_truthy(cond);
     ray_release(cond);
@@ -3522,7 +3545,16 @@ ray_t* ray_while_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(cond))
             cond = ray_lazy_materialize(cond);
         if (RAY_IS_ERR(cond)) return cond;
-        int truthy = is_truthy(cond);
+        /* Inside a query a condition over its rows is tested as the
+         * compiled `while`'s is (cond_rows_test): tested whole, a
+         * non-empty vector false on every row stayed true and the loop
+         * never ended (#1647). */
+        int truth = -1;
+        if (!ray_is_atom(cond)) {
+            ray_t* mixed = cond_rows_test(cond, &truth);
+            if (mixed) { ray_release(cond); return mixed; }
+        }
+        int truthy = truth >= 0 ? truth : is_truthy(cond);
         ray_release(cond);
         if (!truthy) return RAY_NULL_OBJ;
         for (int64_t i = 1; i < n; i++) {
@@ -4872,7 +4904,7 @@ op_jmpf: {
         /* a vector tested whole, or a condition over a query's rows
          * (vm_cond_test, out of line) */
         ray_t* err = NULL;
-        int t = vm_cond_test(cond, POPPED_ROWS(), &err);   /* consumes cond */
+        int t = vm_cond_test(cond, &err);   /* consumes cond */
         if (err) { vm_err_obj = err; goto vm_error; }
         if (!t) ip += offset;
         DISPATCH();

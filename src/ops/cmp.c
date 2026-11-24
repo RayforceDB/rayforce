@@ -582,16 +582,50 @@ ray_t* ray_or_fn(ray_t* a, ray_t* b) {
  * If the accumulator is a vector we cannot short-circuit (subsequent
  * args may be vectors that still need element-wise combination), so we
  * fall through to ray_and_fn / ray_or_fn for that step. */
-static ray_t* eval_and_short(ray_t* arg) {
+/* The row provenance of a value (lang/eval.c g_eval_rows: 1 rows, 0 not,
+ * -1 unknown) joined: one operand derived from the rows makes the result
+ * so; otherwise an unknown one makes it unknown. */
+static inline int8_t logic_rows_join(int8_t a, int8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a < 0 || b < 0) return -1;
+    return 0;
+}
+
+static ray_t* eval_and_short(ray_t* arg, int8_t* rows) {
     ray_t* v = ray_eval(arg);
+    *rows = logic_rows_join(*rows, ray_eval_rows());
     if (!v || RAY_IS_ERR(v)) return v;
     if (ray_is_lazy(v)) v = ray_lazy_materialize(v);
     return v;
 }
 
+/* `and` / `or` combine their operands into a new value (ray_and_fn,
+ * ray_or_fn), so its provenance is every evaluated operand's joined, not
+ * the last one's: `(and (> v 15) true)` over a column is a value over the
+ * rows.  Whoever reads provenance after it (a `let` binding, a helper's
+ * result, the per-row pass's hidden locals, query.c ray_eval_last_rows)
+ * sees that.  A `while`'s test inside a query does not depend on it: it
+ * tests every vector as long as the rows (cond_rows_test, #1647). */
+static ray_t* and_vary_impl(ray_t** args, int64_t n, int8_t* rows);
+static ray_t* or_vary_impl(ray_t** args, int64_t n, int8_t* rows);
+
 ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
+    int8_t rows = 0;
+    ray_t* r = and_vary_impl(args, n, &rows);
+    ray_eval_set_rows(rows);
+    return r;
+}
+
+ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
+    int8_t rows = 0;
+    ray_t* r = or_vary_impl(args, n, &rows);
+    ray_eval_set_rows(rows);
+    return r;
+}
+
+static ray_t* and_vary_impl(ray_t** args, int64_t n, int8_t* rows) {
     if (n < 1) return ray_error("arity", "and: expected at least 1 arg, got %lld", (long long)n);
-    ray_t* acc = eval_and_short(args[0]);
+    ray_t* acc = eval_and_short(args[0], rows);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity: (and X) == X, (or X) == X — monoid identity
      * rule (Scheme/Haskell).  Enables programmatic AST construction like
@@ -607,7 +641,7 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
         return make_bool(0);
     }
     for (int64_t i = 1; i < n; i++) {
-        ray_t* v = eval_and_short(args[i]);
+        ray_t* v = eval_and_short(args[i], rows);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
         ray_t* next = ray_and_fn(acc, v);
         ray_release(acc);
@@ -619,9 +653,9 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
     return acc;
 }
 
-ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
+static ray_t* or_vary_impl(ray_t** args, int64_t n, int8_t* rows) {
     if (n < 1) return ray_error("arity", "or: expected at least 1 arg, got %lld", (long long)n);
-    ray_t* acc = eval_and_short(args[0]);
+    ray_t* acc = eval_and_short(args[0], rows);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity — see ray_and_vary_fn for rationale. */
     if (n == 1) return acc;
@@ -632,7 +666,7 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
         return make_bool(1);
     }
     for (int64_t i = 1; i < n; i++) {
-        ray_t* v = eval_and_short(args[i]);
+        ray_t* v = eval_and_short(args[i], rows);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
         ray_t* next = ray_or_fn(acc, v);
         ray_release(acc);
