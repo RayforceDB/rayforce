@@ -999,18 +999,29 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     void* mem = NULL;
     int   swap_fd  = -1;
     char* swap_path = NULL;
-
+    /* A grown pool that neither RAM nor a spill file can hold is tried
+     * once more at the standard size: a block that fits a 32 MB pool is not
+     * refused for the 512 MB one the heap's growth asked for. */
+    bool grown = order < RAY_HEAP_POOL_ORDER && pool_order > RAY_HEAP_POOL_ORDER;
+    bool over;
+retry:
     /* Proactively back this pool with a disk spill file if an anon mapping
      * would push our RAM footprint past the watermark — a file-backed pool
      * can't be OOM-killed.  Otherwise take the fast anon path (and still fall
      * back to a spill file below if the kernel refuses the mapping). */
-    bool over = heap_anon_would_exceed(pool_size);
+    over = heap_anon_would_exceed(pool_size);
     if (!over)
         mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
 #if !RAY_HEAP_FILE_SPILL
     /* No spill files here: past the watermark the pool comes from RAM. */
     if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
+    if (!mem && grown) {
+        grown = false;
+        pool_order = RAY_HEAP_POOL_ORDER;
+        pool_size = BSIZEOF(pool_order);
+        goto retry;
+    }
     if (!mem) return false;
 #else
     if (!mem) do {
@@ -1121,6 +1132,12 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     /* No spill file (no writable spill directory, disk full): RAM past the
      * watermark rather than failing the allocation. */
     if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
+    if (!mem && grown) {
+        grown = false;
+        pool_order = RAY_HEAP_POOL_ORDER;
+        pool_size = BSIZEOF(pool_order);
+        goto retry;
+    }
     if (!mem) return false;
 #endif /* RAY_HEAP_FILE_SPILL */
 
@@ -1140,11 +1157,13 @@ static bool heap_add_pool(ray_heap_t* h, uint8_t order) {
     memset(hdr_block, 0, BSIZEOF(RAY_ORDER_MIN));
     hdr_block->mmod  = 0;
     hdr_block->order = RAY_ORDER_MIN;
+    hdr_block->len   = RAY_POOL_HDR_LEN;  /* the signature's length (ray_pool_hdr_valid) */
     ray_atomic_store(&hdr_block->rc, 1);  /* sentinel: never free */
 
     ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)hdr_block;  /* overlay on aux */
     hdr->heap_id    = h->id;
     hdr->pool_order = pool_order;
+    hdr->magic      = RAY_POOL_HDR_MAGIC;
     hdr->vm_base    = mem;  /* on POSIX, same as aligned base */
 
     /* --- Cascading split: split from pool_order down to RAY_ORDER_MIN.
@@ -3612,15 +3631,17 @@ void ray_heap_gc(void) {
          * order, and the collection runs far more often than the caches
          * are worth reclaiming. */
 
-        /* Pass 4: Reclaim OVERSIZED empty pools.
+        /* Pass 4: Reclaim empty pools larger than the standard size.
          * Standard pools (pool_order == RAY_HEAP_POOL_ORDER) are never
          * munmapped — physical pages released via madvise (phase 5)
          * re-fault cheaply on next query.  (On THP-backed pools, phase 5
          * only releases the 2MB-aligned interior of a free block, so
          * sub-2MB free blocks keep their pages resident — the deliberate
          * no-shatter tradeoff; disable per-deployment with RAY_HEAP_HUGEPAGE=0.)
-         * Only oversized pools (pool_order > RAY_HEAP_POOL_ORDER) are
-         * candidates — these are one-off large allocations.
+         * Only larger pools (pool_order > RAY_HEAP_POOL_ORDER) are
+         * candidates: the one-off pool of an oversized block, and the grown
+         * pools of a heap past its first 64 (heap_add_pool) — a peak of
+         * small blocks that has passed gives its pools back here.
          *
          * Emptiness is computed from the owning heap's freelists (see
          * heap_reclaim_empty_pools).  This avoids atomic live_count
