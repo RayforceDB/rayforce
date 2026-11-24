@@ -7,23 +7,29 @@
 # with the RLE definition-level encoding listed explicitly (the writer
 # records the value encodings it chose; the level encoding comes from the
 # page layout).
+# Footer metadata: gen-delta.py rewrites the writer's own created_by
+# stamp and renames the writer's optional schema entry to `schema:bytes`,
+# both in place at the same byte length, so offsets and sizes are
+# unchanged. The rename is deliberate: the reader ignores footer
+# key-value metadata, and regeneration with a writer that adds more
+# footer keys fails loudly in gen-delta.py.
 # fixture rows row_groups physical converted encodings page_kind writer sha256 size
-dba-empty.parquet 8 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer edf21f0a8760da273e2d0f2e9bf39334e5a0d00dd58fea87ddb3e3705d66dd91 419
-dba-nulls-v2.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 6 external-writer 704f40f327e7219e908f247ccbe5114dc05deed63532149761e8c0aaf4eea9b3 18890
-dba-prefix-long.parquet 512 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer 14a063121f741c39c6ca2f3cbef7b79ec7c08030a31460de7eccf04743050c09 67135
-dba-v1.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer 4ff31051bed406a4edb08e5bb82d44b64eec641772f7d192879e2134b9617f64 18177
-dba-v2page.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 6 external-writer 3db22c269382d044bf9cf1e2023f3a5264fe08159a3f48085d6a558eacb0c4f6 18180
-dbp-allnull.parquet 64 1 INT32 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 4a6def0e6e726fa92552b9a660fb10e657240fe94b559a98ef544adda1ab3fa5 372
-dbp-i32-date.parquet 10000 1 INT32 DATE RLE,DELTA_BINARY_PACKED 0 external-writer 1f1f4d9c8afea44bbc4adc4f5c36ade819d09cf39188eb2a0981bebbe1c8fd2d 3117
-dbp-i32-nulls-v2.parquet 10000 1 INT32 NONE RLE,DELTA_BINARY_PACKED 6 external-writer b565e9b8c62ffa7ec4f63f1c841f5d133ca434aab5395782df471fcef07ceedb 3116
-dbp-i32-overflow.parquet 4096 1 INT32 NONE RLE,DELTA_BINARY_PACKED 6 external-writer 74e3f345dbcdfd806d019df605231bcbb4ab34483164619e2f793ab16ea1001b 17113
-dbp-i32-v1.parquet 10000 1 INT32 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 6c042364c7c271aba4dfffc7cb97ac0dcdc739dc20c86d4b6f173fbac34253c8 830
-dbp-i64-2page.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 775f6a4be630ebcac9425ef3335b466909db99564065362af7ab0599aa21fcc4 745
-dbp-i64-multirg.parquet 10000 4 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer b4160a1b5acf1759989084e9731ade50e1d35732d8ca5690d5b6090900d38bf3 1227
-dbp-i64-required.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer ea8ebadefb2b8db411854c6419d37a63daa7c0206d7fa23d154b32899a34b9f3 649
-dbp-i64-snappy.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer e054bc2ed4393cd74ca7269fc38ece52ff6d8cafcfeb279fbca146c65eb09867 484
-dbp-i64-v1.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 9178a896f14cc0826d841fa6aeb5e22607022199abcd43b47518a13d2b3c7b8b 667
-dbp-i64-v2page.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 6 external-writer a88480c2b58491328658e886d24b86f759fe6f273ea0947fb6ea7ae56e94cf1d 670
-dlba-v1.parquet 1000 1 BYTE_ARRAY UTF8 RLE,DELTA_LENGTH_BYTE_ARRAY 0 external-writer 225cee54f0d73c01033b288cef0a29e1443436225dd6b260864880a44291a19e 9473
-dlba-v2page.parquet 1000 1 BYTE_ARRAY UTF8 RLE,DELTA_LENGTH_BYTE_ARRAY 6 external-writer df27d9d339fe93884ba23cbecc4168d0e2488a3c485c425e620f34dbcb3e5193 9475
-unsupported-bss.parquet 8 1 INT32 NONE RLE,BYTE_STREAM_SPLIT 0 external-writer 83076a2c466cc2d8c1dc314ae56a118f0398c765af55df8ba6a7321297afdbbe 447
+dba-empty.parquet 8 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer afa0236f5a2c28b061099003b16b8fa190e1efa18cbd34b0c24a9338ba3dc96f 419
+dba-nulls-v2.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 6 external-writer 13a553042d68f8e39f13a4dbf4e2526c254763334a64c61c70ce4be054d6b1fd 18890
+dba-prefix-long.parquet 512 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer 160ff5171a53956eaac51fe27c0d301802411952984df95dba1c7ebc909c0028 67135
+dba-v1.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 0 external-writer 7f7bd6c77b7453eb997ae677b331e32c77fcb6d62a820deee827027e10d6dc75 18177
+dba-v2page.parquet 10000 1 BYTE_ARRAY UTF8 RLE,DELTA_BYTE_ARRAY 6 external-writer d5258fd46779123d51a6086e65f78acb5e0a64cbf436579c9399b16ff45a0b63 18180
+dbp-allnull.parquet 64 1 INT32 NONE RLE,DELTA_BINARY_PACKED 0 external-writer bb6ab0bd846ed9d8922866582502e3ea27b985934e15bd6783f99e73127d956f 372
+dbp-i32-date.parquet 10000 1 INT32 DATE RLE,DELTA_BINARY_PACKED 0 external-writer f168c848af2a4c449fb58891d63651d2a475b613ac736ae41cac3a66b53d351b 3117
+dbp-i32-nulls-v2.parquet 10000 1 INT32 NONE RLE,DELTA_BINARY_PACKED 6 external-writer f0a26f8a47de03ee3bd5014608a0a8b52c9da68d9a1e229cef9f9d34cf5a5838 3116
+dbp-i32-overflow.parquet 4096 1 INT32 NONE RLE,DELTA_BINARY_PACKED 6 external-writer f6f39fbf365ca319ef4fb8912bbbda905efad48fbd7997cd17659b1b57bd27d5 17113
+dbp-i32-v1.parquet 10000 1 INT32 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 37c89ebd8b8cad40d8bf1495faeeeac3f3a34361d9e86b8096d76406e2efa0bf 830
+dbp-i64-2page.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 344e4e80108726ac59a4d1839cae21275645c6e55849b0e446bb5c1c99b76400 745
+dbp-i64-multirg.parquet 10000 4 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 5f16c6d6d5d73f0b2ad4abcacdaf5e87b742c8a65f37050838e9e7d59cee9a81 1227
+dbp-i64-required.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 57ce80e28644f81ed32fa0b999b4551e51b25c75000a23c1a7080bf4de84b8f0 649
+dbp-i64-snappy.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 3ec100fb4760659e1f1097201be05c0beac25c7ea467250616bd0b86b80a144d 484
+dbp-i64-v1.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 0 external-writer 93d609b171b300b6cc3b1814d1754a1b1939d61fdd9f6d7783cb0580552d9a98 667
+dbp-i64-v2page.parquet 10000 1 INT64 NONE RLE,DELTA_BINARY_PACKED 6 external-writer df1669cd9cd91cf1b078d0e3de377619ad650f7f04011f2aeb95604bb8c5d9ea 670
+dlba-v1.parquet 1000 1 BYTE_ARRAY UTF8 RLE,DELTA_LENGTH_BYTE_ARRAY 0 external-writer d53df4c5b5d540303f9768be79632d587f1ed91b826af69cc7fce5b885617d78 9473
+dlba-v2page.parquet 1000 1 BYTE_ARRAY UTF8 RLE,DELTA_LENGTH_BYTE_ARRAY 6 external-writer a308aa984ba7f2d83ae8bb980c5b49226763aacb5bb0dc297b5913eba50191a0 9475
+unsupported-bss.parquet 8 1 INT32 NONE RLE,BYTE_STREAM_SPLIT 0 external-writer db7635d8d7a22491d049cf7fbac04fd72451fb21ac471989d66911539980e14f 447

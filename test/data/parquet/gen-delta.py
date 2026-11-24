@@ -44,6 +44,35 @@ DELTA_BYTE_ARRAY = "DELTA_BYTE_ARRAY"
 BYTE_STREAM_SPLIT = "BYTE_STREAM_SPLIT"
 
 
+NEUTRAL_WRITER = b"external-writer"
+NEUTRAL_SCHEMA_KEY = b"schema:bytes"
+
+
+def neutralise(path):
+    """Rewrite the writer's footer stamps to the neutral forms.
+
+    The writer names itself in `created_by` and stores one optional schema
+    entry under a key of its own. Fixtures here describe format behaviour and
+    do not name other products, so both strings are replaced in place with
+    the forms recorded in manifest.txt. Each replacement keeps the byte
+    length, so no offset, length field, checksum or file size moves.
+    """
+    written = pq.ParquetFile(path).metadata
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    stamp = written.created_by.encode()
+    neutral = NEUTRAL_WRITER + b" (" + stamp.split(b" ", 1)[1] + b")"
+    keys = list((written.metadata or {}).keys())
+    if len(keys) != 1 or len(keys[0]) != len(NEUTRAL_SCHEMA_KEY):
+        raise ValueError("%s: unexpected footer metadata keys %r" % (path, keys))
+    for old, new in ((stamp, neutral), (keys[0], NEUTRAL_SCHEMA_KEY)):
+        if len(old) != len(new) or blob.count(old) != 1:
+            raise ValueError("%s: cannot neutralise %r in place" % (path, old))
+        blob = blob.replace(old, new)
+    with open(path, "wb") as handle:
+        handle.write(blob)
+
+
 def write(path, table, *, version="1.0", compression="none", encoding=None,
           row_group_size=None, data_page_size=None, write_batch_size=None):
     kw = dict(use_dictionary=False, compression=compression,
@@ -54,7 +83,9 @@ def write(path, table, *, version="1.0", compression="none", encoding=None,
         kw["data_page_size"] = data_page_size
     if write_batch_size is not None:
         kw["write_batch_size"] = write_batch_size
-    pq.write_table(table, os.path.join(OUT, path), **kw)
+    target = os.path.join(OUT, path)
+    pq.write_table(table, target, **kw)
+    neutralise(target)
 
 
 def ints(n, dtype):
