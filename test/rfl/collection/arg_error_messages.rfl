@@ -78,6 +78,42 @@
 (min 1 2) -- 1
 (at (try (til 3h) (fn [e] e)) 'msg) -- "til: argument must be an i64 atom, got i16"
 (at (try (til 3h) (fn [e] e)) 'usage) -- "(til <n: i64 atom>)"
+;; concat (#1581): any two atoms, vectors or lists; an atom and a vector only
+;; of the atom's type, a str and a STR vector cell by cell; a dict with a dict;
+;; a table with a table that has each of its columns, of the same types.  Its
+;; usage says exactly that, and each refusal says what is wrong.
+(set U1581 "(concat <left: atom, vector, list, dict or table> <right: any two atoms, vectors or lists, but an atom and a vector only of the atom's type (a str and a STR vector join cell by cell); a dict with a dict; a table with a table that has each of its columns, of the same types>)")
+(concat 1 2) -- [1 2]
+(concat 1 2.0) -- (list 1 2.0)
+(concat 1 [2 3]) -- [1 2 3]
+(concat [1 2] [3.0]) -- (list 1 2 3.0)
+(concat 1 (list 2.0)) -- (list 1 2.0)
+(concat "ab" "cd") -- "abcd"
+(concat "ab" 1) -- (list "ab" 1)
+(concat "ab" ["c" "d"]) -- ["abc" "abd"]
+(concat ["a"] "b") -- ["ab"]
+(concat ["a"] ["b" "c"]) -- ["a" "b" "c"]
+(concat {a: 1 b: 2} {b: 3}) -- {a: 1 b: 3}
+(count (concat (table [x] (list [1 2])) (table [x] (list [3])))) -- 3
+(count (concat (table [x y] (list [1] [2])) (table [y x] (list [3] [4])))) -- 2
+;; an atom with a vector of another type, a str with a typed vector
+(at (try (concat 1 [2.0]) (fn [e] e)) 'msg) -- "concat: cannot concatenate i64 and F64"
+(at (try (concat 1 [2.0]) (fn [e] e)) 'usage) -- U1581
+(at (try (concat "ab" [1 2]) (fn [e] e)) 'msg) -- "concat: cannot concatenate str and I64"
+(at (try (concat "ab" [1 2]) (fn [e] e)) 'usage) -- U1581
+(at (try (concat [1 2] "ab") (fn [e] e)) 'msg) -- "concat: cannot concatenate I64 and str"
+(at (try (concat ['a] "ab") (fn [e] e)) 'msg) -- "concat: cannot concatenate SYM and str"
+;; a dict or a table with anything else
+(at (try (concat {a: 1} [1 2]) (fn [e] e)) 'msg) -- "concat: cannot concatenate DICT and I64"
+(at (try (concat {a: 1} [1 2]) (fn [e] e)) 'usage) -- U1581
+(at (try (concat (table [x] (list [1])) {x: 1}) (fn [e] e)) 'msg) -- "concat: cannot concatenate TABLE and DICT"
+(at (try (concat (table [x] (list [1])) {x: 1}) (fn [e] e)) 'usage) -- U1581
+;; tables whose columns do not match
+(at (try (concat (table [x y] (list [1] [2])) (table [x z] (list [1] [2]))) (fn [e] e)) 'code) -- 'value
+(at (try (concat (table [x y] (list [1] [2])) (table [x z] (list [1] [2]))) (fn [e] e)) 'msg) -- "concat: the right table has no column y"
+(at (try (concat (table [x y] (list [1] [2])) (table [x] (list [1]))) (fn [e] e)) 'msg) -- "concat: the right table has no column y"
+(at (try (concat (table [x] (list [1])) (table [x] (list [1.0]))) (fn [e] e)) 'msg) -- "concat: column type mismatch, got I64 and F64"
+(at (try (concat (table [x] (list [1])) (table [x] (list [1.0]))) (fn [e] e)) 'usage) -- U1581
 
 ;; a registered name is cut at 13 characters: two builtins that share the cut
 ;; name are told apart by their message (see below)

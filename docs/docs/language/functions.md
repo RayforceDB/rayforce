@@ -220,7 +220,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `mvar` | binary | Moving population variance over trailing N rows and non-null values | `(mvar 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
-| `concat` | binary | Concatenate two vectors | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
+| `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`) | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
 | `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | Group indices by value | `(group [A B A])` → dict of groups |
@@ -433,7 +433,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | Replace all occurrences; lazy/DAG for vectors | `(replace "a-b" "-" "_")` → `"a_b"` |
 | `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
-| `concat` | binary | Concatenate two strings or vectors | `(concat "hello" " world")` → `"hello world"` |
+| `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`) | `(concat "hello" " world")` → `"hello world"` |
 | `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"

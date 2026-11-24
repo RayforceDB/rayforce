@@ -79,5 +79,11 @@
 ;; ────────────── concat of parted tables is still refused (the owner is deciding) ──────────────
 ;; the code only: what concat should do with parted tables is not settled here
 (at (try (concat PT PT) (fn [e] e)) 'code) -- 'type
+;; and says so in user terms (#1581), with a flat table on either side too
+(at (try (concat PT PT) (fn [e] e)) 'msg) -- "concat: a parted table is refused; union-all combines parted tables"
+(set F1581 (table [a b s t] (list [1] [1.0] ['x] ["p"])))
+(at (try (concat PT F1581) (fn [e] e)) 'msg) -- "concat: a parted table is refused; union-all combines parted tables"
+(at (try (concat F1581 PT) (fn [e] e)) 'msg) -- "concat: a parted table is refused; union-all combines parted tables"
+(at (try (concat (select {from: PT}) (select {from: PT})) (fn [e] e)) 'msg) -- "concat: a parted table is refused; union-all combines parted tables"
 
 (.sys.exec (format "rm -rf %" d))

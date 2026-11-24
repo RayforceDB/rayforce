@@ -3970,6 +3970,19 @@ static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
     return out;
 }
 
+/* Does table `t` hold a parted or partition-key column (a parted table,
+ * or a select over one that keeps them)? */
+static bool concat_table_parted(ray_t* t) {
+    int64_t n = ray_table_ncols(t);
+    for (int64_t c = 0; c < n; c++) {
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(t, c, &m) &&
+            (m.type == RAY_MAPCOMMON || RAY_IS_PARTED(m.type)))
+            return true;
+    }
+    return false;
+}
+
 /* (concat a b) -> concatenate vectors/strings/dicts/tables */
 ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Helper: get string content from atom (STR or CHAR), stripping trailing nulls */
@@ -4264,6 +4277,10 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     }
     /* Table concat: append rows */
     if (a->type == RAY_TABLE && b->type == RAY_TABLE) {
+        /* concat over parted tables stays refused; union-all reads them
+         * into memory and combines them. */
+        if (concat_table_parted(a) || concat_table_parted(b))
+            return ray_error("type", "concat: a parted table is refused; union-all combines parted tables");
         int64_t ncols_a = ray_table_ncols(a);
         int64_t ncols_b = ray_table_ncols(b);
         /* Match columns of a in b by name */
@@ -4287,7 +4304,9 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
                  * error (the table values have incompatible columns), not
                  * a "domain" error (which semantically means out-of-range). */
                 ray_release(result);
-                return ray_error("value", NULL);
+                ray_t* nm = ray_sym_str(col_name_a);
+                return ray_error("value", "concat: the right table has no column %.*s",
+                                 nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
             }
             /* Type check: columns must have the same type */
             if (acol->type != bcol->type) {
