@@ -843,6 +843,26 @@ Like `insert`, columns can be in any order:
 (upsert 't 1 (dict [Value Name ID] (list 170.0 'Quinn 17)))
 ```
 
+### Key Matching
+
+A key matches by value, and **a null key matches a null key** for every key type (integers, floats, temporals, `SYM`, `STR`, `GUID`), in memory and splayed, for single and compound keys. Upserting a null key twice therefore appends one row and then updates it. For `F32` and `F64` keys only the null matches the null; other values compare by value.
+
+```lisp
+(set t (table [d v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list 0Nd 9))
+(at t 'v)                          ; [1 9] — the null-keyed row is updated
+```
+
+A key value that does not fit the key column is a `domain` error and nothing is written, rather than being narrowed into a duplicate key:
+
+```lisp
+(set t (table [k v] (list (as 'I16 [1 2]) [1 2])))
+(upsert 't 1 (list 65537 9))       ; error: domain
+(upsert 't 1 (list [3 65537] [8 9])) ; error: domain — the 3 is not written either
+```
+
+See [Query Operations](../language/functions.md#query-operations) for the full list of key types.
+
 ## Delete Rows
 
 To remove rows matching a predicate, use `select` with the inverse condition:

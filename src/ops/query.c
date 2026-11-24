@@ -35392,9 +35392,68 @@ static int64_t upsert_atom_int(ray_t* a) {
     return a->type == -RAY_BOOL ? (int64_t)a->b8 : elem_as_i64(a);
 }
 
+/* Key matching (#1152).  A key atom is compared with what the key column
+ * would store for it: a null of any type is the column's null, so it
+ * matches a null-keyed row of every key type, and an integer is compared
+ * at the column's width.  upsert_key_check refuses a value the column
+ * cannot hold, which would otherwise miss on the widened compare and then
+ * be narrowed on append into a duplicate key. */
+
+/* Integer-family key atom as the column of type `ct` stores it, widened to
+ * int64 the way upsert_int_cell widens the cell.  BOOL and U8 are not
+ * nullable: a null lands as 0 there, so it matches 0. */
+static int64_t upsert_atom_key(int8_t ct, ray_t* a) {
+    if (RAY_ATOM_IS_NULL(a)) {
+        switch (ct) {
+        case RAY_BOOL: case RAY_U8:                 return 0;
+        case RAY_I16:                               return NULL_I16;
+        case RAY_I32: case RAY_DATE: case RAY_TIME: return NULL_I32;
+        default:                                    return NULL_I64;
+        }
+    }
+    switch (a->type) {
+    case -RAY_I32: case -RAY_DATE: case -RAY_TIME: return (int64_t)a->i32;
+    default:                                       return upsert_atom_int(a);
+    }
+}
+
+/* Float key atom as a double; a null of any type is NaN. */
+static double upsert_atom_f64(ray_t* a) {
+    return RAY_ATOM_IS_NULL(a) ? NULL_F64 : as_f64(a);
+}
+
+/* Float key equality: by value, except that a null (NaN) equals a null. */
+static inline bool upsert_f64_eq(double x, double y) {
+    return x == y || (x != x && y != y);
+}
+
+/* Hash of a float key: every NaN is the one null, so it hashes as one. */
+static inline uint64_t upsert_hash_f64(double v) {
+    return ray_hash_f64(v != v ? NULL_F64 : v);
+}
+
+/* NULL when the non-null integer key atom `a` fits a key column of type
+ * `ct`, a domain error otherwise.  The narrow types' null sentinel is not
+ * a value, so it is out of range too. */
+static ray_t* upsert_key_check(int8_t ct, ray_t* a) {
+    if (!a || RAY_IS_NULL(a) || !ray_is_atom(a) || RAY_ATOM_IS_NULL(a)) return NULL;
+    if (a->type != -RAY_I64 && a->type != -RAY_I32 &&
+        a->type != -RAY_I16 && a->type != -RAY_U8) return NULL;
+    int64_t v = upsert_atom_int(a), lo, hi;
+    switch (ct) {
+    case RAY_U8:  lo = 0;              hi = UINT8_MAX; break;
+    case RAY_I16: lo = -INT16_MAX;     hi = INT16_MAX; break;
+    case RAY_I32: lo = -INT32_MAX;     hi = INT32_MAX; break;
+    default:      return NULL;
+    }
+    if (v >= lo && v <= hi) return NULL;
+    return ray_error("domain", "upsert: key value %lld is out of range for a %s key column",
+                     (long long)v, ray_type_name(ct));
+}
+
 static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* col, int64_t r) {
     switch (col->type) {
-    case RAY_F64: return ray_hash_f64(((const double*)ray_data(col))[r]);
+    case RAY_F64: return upsert_hash_f64(((const double*)ray_data(col))[r]);
     case RAY_SYM: return ray_hash_i64(ray_read_sym(ray_data(col), r, col->type, col->attrs));
     case RAY_STR: {
         size_t n = 0;
@@ -35409,24 +35468,23 @@ static inline __attribute__((always_inline)) uint64_t upsert_hash_cell(ray_t* co
 static uint64_t upsert_hash_atom(int8_t ct, ray_t* a) {
     static const uint8_t zero_guid[16] = {0};
     switch (ct) {
-    case RAY_F64: return ray_hash_f64(as_f64(a));
+    case RAY_F64: return upsert_hash_f64(upsert_atom_f64(a));
     case RAY_SYM: return ray_hash_i64(a->i64);
     case RAY_STR: {
         const char* s = ray_str_ptr(a);
         return ray_hash_bytes(s ? s : "", ray_str_len(a));
     }
     case RAY_GUID: return ray_hash_bytes(a->obj ? ray_data(a->obj) : zero_guid, 16);
-    default:       return ray_hash_i64(upsert_atom_int(a));
+    default:       return ray_hash_i64(upsert_atom_key(ct, a));
     }
 }
 
-/* Cell-vs-atom equality with the legacy scan's semantics: F64 by value
- * (NaN never matches, so a null F64 key always appends), SYM by raw id,
- * STR by bytes, integers widened. */
+/* Cell-vs-atom equality: F64 by value with a null matching a null, SYM by
+ * raw id, STR by bytes, integers at the column's width (upsert_atom_key). */
 static bool upsert_cell_eq_atom(ray_t* col, int64_t r, ray_t* a) {
     static const uint8_t zero_guid[16] = {0};
     switch (col->type) {
-    case RAY_F64: return ((const double*)ray_data(col))[r] == as_f64(a);
+    case RAY_F64: return upsert_f64_eq(((const double*)ray_data(col))[r], upsert_atom_f64(a));
     case RAY_SYM: return ray_read_sym(ray_data(col), r, col->type, col->attrs) == a->i64;
     case RAY_STR: {
         size_t n = 0;
@@ -35438,7 +35496,7 @@ static bool upsert_cell_eq_atom(ray_t* col, int64_t r, ray_t* a) {
     case RAY_GUID:
         return memcmp((const uint8_t*)ray_data(col) + r * 16,
                       a->obj ? ray_data(a->obj) : zero_guid, 16) == 0;
-    default: return upsert_int_cell(col, r) == upsert_atom_int(a);
+    default: return upsert_int_cell(col, r) == upsert_atom_key(col->type, a);
     }
 }
 
@@ -35628,8 +35686,9 @@ static int64_t upsert_find_row(ray_t** slots, const int64_t* kci, int64_t nk,
         ray_t* a = cells[kci[0]];
         int8_t t = col->type;
         if (t == RAY_SYM || (t != RAY_F64 && t != RAY_STR && t != RAY_GUID)) {
-            int64_t key = (t == RAY_SYM) ? a->i64 : upsert_atom_int(a);
-            int64_t hit = ray_index_find_row(col, key);
+            int64_t key = (t == RAY_SYM) ? a->i64 : upsert_atom_key(t, a);
+            /* the index answers values; a null key is the scan's */
+            int64_t hit = RAY_ATOM_IS_NULL(a) ? -2 : ray_index_find_row(col, key);
             if (hit >= -1) return hit;
             if (t == RAY_I64 || t == RAY_TIMESTAMP || t == RAY_SYM) {
                 const int64_t* d = (const int64_t*)ray_data(col);
@@ -35789,12 +35848,13 @@ static bool upsert_vec_payload_ok(ray_t* tbl, ray_t** src_cols, int64_t ncols, i
 }
 
 /* Cell-vs-cell equality for two columns of one type, with the semantics of
- * upsert_cell_eq_atom: F64 by value, SYM by runtime id, integers widened. */
+ * upsert_cell_eq_atom: F64 by value with a null matching a null, SYM by
+ * runtime id, integers widened. */
 static inline __attribute__((always_inline)) bool
 upsert_cell_eq_cell(ray_t* a, int64_t ra, ray_t* b, int64_t rb) {
     switch (a->type) {
     case RAY_F64:
-        return ((const double*)ray_data(a))[ra] == ((const double*)ray_data(b))[rb];
+        return upsert_f64_eq(((const double*)ray_data(a))[ra], ((const double*)ray_data(b))[rb]);
     case RAY_SYM:
         return ray_read_sym(ray_data(a), ra, RAY_SYM, a->attrs) ==
                ray_read_sym(ray_data(b), rb, RAY_SYM, b->attrs);
@@ -36183,6 +36243,8 @@ static ray_t* upsert_apply(ray_t* tbl, int64_t inplace_sym,
                 err = ray_error("type", "upsert: key column is str but key value is %s", ray_type_name(a->type));
             } else if (km.type == RAY_SYM && a->type != -RAY_SYM) {
                 err = ray_error("type", "upsert: key column is sym but key value is %s", ray_type_name(a->type));
+            } else {
+                err = upsert_key_check(km.type, a);
             }
         }
         for (int64_t c = 0; c < ncols && !err; c++) {
@@ -36751,6 +36813,12 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_release(tbl); ray_release(key_sym); ray_release(row);
             return ray_error("type", "upsert: key column is guid but key value is %s", ray_type_name(ka_t));
         }
+        ray_t* range_err = upsert_key_check(kt, key_atom);
+        if (range_err) {
+            scratch_free(kw_hdr); scratch_free(kci_hdr);
+            ray_release(tbl); ray_release(key_sym); ray_release(row);
+            return range_err;
+        }
         key_sym_want[k] = -1;
         if (kt == RAY_SYM) {
             if (ray_sym_vec_domain(key_col) == ray_sym_runtime_domain()) {
@@ -36774,8 +36842,7 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             ray_t* key_atom = row_elems[kci];
             int8_t kt = key_col->type;
             if (kt == RAY_F64) {
-                double needle = (key_atom->type == -RAY_F64) ? key_atom->f64 : (double)key_atom->i64;
-                if (((double*)ray_data(key_col))[r] != needle) match = 0;
+                if (!upsert_f64_eq(((double*)ray_data(key_col))[r], upsert_atom_f64(key_atom))) match = 0;
             } else if (kt == RAY_SYM) {
                 /* raw index compare against the domain-resolved want id */
                 if (ray_read_sym(ray_data(key_col), r, key_col->type, key_col->attrs) != key_sym_want[k]) match = 0;
@@ -36786,16 +36853,16 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 const char* rs = ray_str_vec_get(key_col, r, &rl);
                 if (rl != nl || (nl > 0 && (!rs || !ns || memcmp(rs, ns, nl) != 0))) match = 0;
             } else if (kt == RAY_F32) {
-                /* by value, the atom narrowed as the payload is; NaN (a null
-                 * key) never matches, like an F64 key */
-                float needle = (float)as_f64(key_atom);
-                if (((const float*)ray_data(key_col))[r] != needle) match = 0;
+                /* by value, the atom narrowed as the payload is; a null
+                 * key (NaN) matches a null, like an F64 key */
+                float needle = (float)upsert_atom_f64(key_atom);
+                if (!upsert_f64_eq(((const float*)ray_data(key_col))[r], needle)) match = 0;
             } else if (kt == RAY_GUID) {
                 if (!upsert_cell_eq_atom(key_col, r, key_atom)) match = 0;
             } else {
                 /* integer family through its storage width: a 1/2/4-byte
                  * cell read as int64 would match its neighbours' bytes */
-                if (upsert_int_cell(key_col, r) != upsert_atom_int(key_atom)) match = 0;
+                if (upsert_int_cell(key_col, r) != upsert_atom_key(kt, key_atom)) match = 0;
             }
         }
         if (match) { match_row = r; break; }
