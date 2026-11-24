@@ -1040,7 +1040,15 @@ static ray_t* map_box_prefix(ray_t* prefix, int64_t capacity) {
  * atoms of one vector type, a boxed list from the first one that is not.  The
  * result takes `value` in every case.  Returns NULL, or an error with *pres
  * released and cleared. */
-static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len) {
+__attribute__((noinline, cold)) static ray_t* map_limit(ray_t** pres, ray_t* value, ray_t* result) {
+    ray_release(value);
+    ray_release(result);
+    *pres = NULL;
+    return ray_error("limit", "map: a string vector repeats shared strings beyond 1 GiB of extra data");
+}
+
+static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len,
+                          ray_dup_copy_t* dup) {
     ray_t* result = *pres;
     /* Once heterogeneous, stay boxed without rechecking atom types. */
     if (result && result->type == RAY_LIST) {
@@ -1062,7 +1070,11 @@ static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len) {
     if (result->type == RAY_LIST) {
         ((ray_t**)ray_data(result))[result->len++] = value; /* transfer */
     } else if (result->type == RAY_STR) {
-        ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), ray_str_len(value));
+        /* A result held elsewhere too is copied again each time (#1648). */
+        size_t sl = ray_str_len(value);
+        if (RAY_UNLIKELY(ray_dup_copy(dup, value, sl)))
+            return map_limit(pres, value, result);
+        ray_t* next = ray_str_vec_append(result, ray_str_ptr(value), sl);
         ray_release(value);
         if (RAY_IS_ERR(next)) { ray_release(result); *pres = NULL; return next; }
         result = next;
@@ -1113,6 +1125,8 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     int64_t len = ray_len(coll);
     if (len == 0) return ray_list_new(0);  /* no callback result to infer */
     ray_t* result = NULL;
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
     for (int64_t i = 0; i < len; i++) {
         int owned = 0;
         ray_t* elem = iter_elem(coll, i, &owned);
@@ -1124,11 +1138,12 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
         /* Force each result before choosing its representation, as the
          * previous list collector did for lazy callback results. */
         if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
-        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
+        if (RAY_IS_ERR(value)) { ray_dup_copy_end(&dup); ray_release(result); return value; }
 
-        ray_t* bad = map_collect(&result, value, i, len);
-        if (bad) return bad;
+        ray_t* bad = map_collect(&result, value, i, len, &dup);
+        if (bad) { ray_dup_copy_end(&dup); return bad; }
     }
+    ray_dup_copy_end(&dup);
     return result;
 }
 
@@ -1610,6 +1625,8 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
     if (len == 0) return ray_list_new(0);   /* no callback result to infer */
 
     ray_t* result = NULL;
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
     for (int64_t i = 0; i < len; i++) {
         int owned_a = 0, owned_b = 0;
         ray_t* ea = iter_elem(a, i, &owned_a);
@@ -1618,10 +1635,11 @@ ray_t* ray_apply_fn(ray_t** args, int64_t n) {
         if (owned_a) ray_release(ea);
         if (owned_b) ray_release(eb);
         if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
-        if (RAY_IS_ERR(value)) { ray_release(result); return value; }
-        ray_t* bad = map_collect(&result, value, i, len);
-        if (bad) return bad;
+        if (RAY_IS_ERR(value)) { ray_dup_copy_end(&dup); ray_release(result); return value; }
+        ray_t* bad = map_collect(&result, value, i, len, &dup);
+        if (bad) { ray_dup_copy_end(&dup); return bad; }
     }
+    ray_dup_copy_end(&dup);
     return result;
 }
 
@@ -3358,9 +3376,14 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
             } else {
                 ray_t** el = (ray_t**)ray_data(vec);
                 sv = ray_vec_new(RAY_STR, ray_len(vec));
+                /* A set needs each string once: a cell holding a string
+                 * already copied is skipped, not copied again (#1648). */
+                ray_dup_copy_t seen;
+                ray_dup_copy_begin(&seen);
                 for (int64_t j = 0; j < ray_len(vec) && sv && !RAY_IS_ERR(sv); j++)
-                    if (el[j] && el[j]->type == -RAY_STR)
+                    if (el[j] && el[j]->type == -RAY_STR && !ray_dup_copy_seen(&seen, el[j], ray_str_len(el[j])))
                         sv = ray_str_vec_append(sv, ray_str_ptr(el[j]), ray_str_len(el[j]));
+                ray_dup_copy_end(&seen);
             }
             if (!sv || RAY_IS_ERR(sv)) return sv ? sv : ray_error("oom", NULL);
             ray_t* r = ray_in_fn(val, sv);

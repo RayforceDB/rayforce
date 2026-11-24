@@ -63,6 +63,7 @@ static inline double clear_neg_zero(double v) {
 #include <string.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
@@ -82,10 +83,85 @@ static inline double clear_neg_zero(double v) {
 /* Helper: print a ray_t value to a file handle */
 /* print and println write a value out in full, a shared part again each
  * time it is met: the bytes written again are counted as they are written,
- * and past RAY_DUP_BUDGET printing stops (#1627, ops/walkmemo.h). */
-typedef struct { ray_dup_t dup; uint64_t out; bool over; } lang_print_t;
+ * and past RAY_DUP_BUDGET printing stops (#1627, ops/walkmemo.h).  One
+ * tracker serves all the values of one call (#1648). */
+typedef struct {
+    ray_dup_t dup;
+    uint64_t  out;
+    bool      over;
+    FILE*     fp;
+    bool      held;    /* output is held in buf, not yet written to fp */
+    char*     buf;     /* small, then the heap */
+    size_t    len, cap;
+    char      small[256];
+} lang_print_t;
 #define LP_OUT(p, n) do { int n_ = (n); if (n_ > 0) (p)->out += (uint64_t)n_; } while (0)
+
+/* Output reaching fp cannot be taken back, so print holds it until the
+ * value can no longer be refused before it is printed: until the lower
+ * bound of its repeats has run and passed (at the first repeat, as for
+ * every text writer), or up to LP_HOLD bytes, past which the bound is
+ * taken at once when the values hold a shared part (ray_dup_bound_now).
+ * A refusal while output is held prints nothing (#1648). */
+#define LP_HOLD ((size_t)64 << 20)
+static void lp_drop(lang_print_t* p) {
+    if (p->buf != p->small) ray_free_raw(p->buf);
+    p->buf = NULL;
+    p->len = p->cap = 0;
+    p->held = false;
+}
+static void lp_release(lang_print_t* p) {
+    if (p->len) fwrite(p->buf, 1, p->len, p->fp);
+    lp_drop(p);
+}
+__attribute__((noinline)) static void lp_hold_full(lang_print_t* p) {
+    if (ray_dup_bound_now(&p->dup)) { p->over = true; return; }   /* the caller drops it */
+    p->dup.lb_done = true;   /* bounded, or nothing in it can repeat */
+    lp_release(p);
+}
+/* Room for n more held bytes; false (output released to fp) if none. */
+__attribute__((noinline)) static bool lp_grow(lang_print_t* p, size_t n) {
+    size_t cap = p->cap * 2;
+    while (cap - p->len < n) cap *= 2;
+    char* nb = ray_alloc_raw(cap);
+    if (!nb) { lp_release(p); return false; }
+    memcpy(nb, p->buf, p->len);
+    if (p->buf != p->small) ray_free_raw(p->buf);
+    p->buf = nb;
+    p->cap = cap;
+    return true;
+}
+static int lp_write(lang_print_t* p, const char* s, size_t n) {
+    if (!p->held) return fwrite(s, 1, n, p->fp) == n ? (int)n : -1;
+    if (RAY_UNLIKELY(p->cap - p->len < n) && !lp_grow(p, n))
+        return fwrite(s, 1, n, p->fp) == n ? (int)n : -1;
+    memcpy(p->buf + p->len, s, n);
+    p->len += n;
+    if (RAY_UNLIKELY(p->len > LP_HOLD)) lp_hold_full(p);
+    return (int)n;
+}
+static inline int lp_str(lang_print_t* p, const char* s) { return lp_write(p, s, strlen(s)); }
+static int lp_i64(lang_print_t* p, int64_t v) {
+    char tmp[24];
+    char* e = tmp + sizeof tmp;
+    char* q = e;
+    uint64_t u = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+    do { *--q = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) *--q = '-';
+    return lp_write(p, q, (size_t)(e - q));
+}
+__attribute__((format(printf, 2, 3)))
+static int lp_printf(lang_print_t* p, const char* fmt, ...) {
+    char tmp[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0) return n;
+    return lp_write(p, tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+}
 static void lang_print(FILE* fp, ray_t* val, lang_print_t* p);
+static void lp_bounded(lang_print_t* p) { if (p->held && p->dup.lb_done && !p->over) lp_release(p); }
 static void lang_print_part(FILE* fp, ray_t* val, lang_print_t* p) {
     if (RAY_LIKELY(!ray_dup_watch(&p->dup, val))) { lang_print(fp, val, p); return; }
     bool opened = ray_dup_enter(&p->dup, val, p->out);
@@ -97,11 +173,12 @@ static void lang_print_part(FILE* fp, ray_t* val, lang_print_t* p) {
     lang_print(fp, val, p);
     ray_dup_leave(&p->dup, opened, p->out);
     if (RAY_UNLIKELY(ray_dup_over(&p->dup, p->out))) p->over = true;
+    lp_bounded(p);   /* the bound ran at a repeat and passed: print what is held */
 }
 static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
     if (p->over) return;
-    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, fprintf(fp, "error")); return; }
-    if (RAY_IS_NULL(val)) { LP_OUT(p, fprintf(fp, "null")); return; }
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, lp_write(p, "error", 5)); return; }
+    if (RAY_IS_NULL(val)) { LP_OUT(p, lp_write(p, "null", 4)); return; }
     /* Materialize lazy handles before printing.  val is BORROWED and
      * ray_lazy_materialize consumes its input, so give it its own ref;
      * print the owned concrete result and release it before returning. */
@@ -112,60 +189,63 @@ static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
         if (mat && !RAY_IS_ERR(mat)) ray_release(mat);
         return;
     }
-    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, fprintf(fp, "error")); return; }
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, lp_write(p, "error", 5)); return; }
     /* A list prints its cells through here again: one frame per level of
      * nesting, and a value can be nested arbitrarily deep (#1591).  This
      * writes to a stream and has no error to give, so past the thread's
      * stack reserve the rest of the value prints as "...". */
-    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { LP_OUT(p, fprintf(fp, "...")); return; }
+    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { LP_OUT(p, lp_write(p, "...", 3)); return; }
     /* STR/SYM use their empty literals as canonical null spellings. */
     if (val->type != -RAY_STR && val->type != -RAY_SYM &&
         RAY_ATOM_IS_NULL(val)) {
-        LP_OUT(p, fprintf(fp, "%s", ray_fmt_null_literal(-val->type)));
+        LP_OUT(p, lp_str(p, ray_fmt_null_literal(-val->type)));
         return;
     }
     switch (val->type) {
-    case -RAY_I64:  LP_OUT(p, fprintf(fp, "%" PRId64, val->i64)); break;
+    case -RAY_I64:  LP_OUT(p, lp_i64(p, val->i64)); break;
     case -RAY_F64: {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
         char buf[32];
         int n = ray_snprintf_c(buf, sizeof(buf), "%g", fv);
-        if (n > 0 && (size_t)n < sizeof(buf)) LP_OUT(p, fprintf(fp, "%s", buf));
+        if (n > 0 && (size_t)n < sizeof(buf)) LP_OUT(p, lp_write(p, buf, (size_t)n));
         break;
     }
-    case -RAY_BOOL: LP_OUT(p, fprintf(fp, "%s", val->b8 ? "true" : "false")); break;
+    case -RAY_BOOL: LP_OUT(p, (val->b8 ? lp_write(p, "true", 4) : lp_write(p, "false", 5))); break;
     case -RAY_SYM: {
         ray_t* s = ray_sym_str(val->i64);
-        if (s) LP_OUT(p, fprintf(fp, "'%.*s", (int)ray_str_len(s), ray_str_ptr(s)));
-        else LP_OUT(p, fprintf(fp, "'?"));
+        if (s) { LP_OUT(p, lp_write(p, "'", 1)); LP_OUT(p, lp_write(p, ray_str_ptr(s), ray_str_len(s))); }
+        else LP_OUT(p, lp_write(p, "'?", 2));
         break;
     }
     case -RAY_STR: {
         const char* s = ray_str_ptr(val);
         size_t slen = ray_str_len(val);
-        LP_OUT(p, fprintf(fp, "%.*s", (int)slen, s));
+        LP_OUT(p, lp_write(p, s, slen));
         break;
     }
     case RAY_LIST: {
-        LP_OUT(p, fprintf(fp, "["));
+        LP_OUT(p, lp_write(p, "[", 1));
         int64_t len = ray_len(val);
         ray_t** elems = (ray_t**)ray_data(val);
         for (int64_t i = 0; i < len; i++) {
-            if (i > 0) LP_OUT(p, fprintf(fp, " "));
+            if (i > 0) LP_OUT(p, lp_write(p, " ", 1));
             lang_print_part(fp, elems[i], p);
             if (p->over) return;
         }
-        LP_OUT(p, fprintf(fp, "]"));
+        LP_OUT(p, lp_write(p, "]", 1));
         break;
     }
     case RAY_TABLE:
-        LP_OUT(p, fprintf(fp, "<table %" PRId64 "x%" PRId64 ">",
-                ray_table_nrows(val), ray_table_ncols(val)));
+        LP_OUT(p, lp_write(p, "<table ", 7));
+        LP_OUT(p, lp_i64(p, ray_table_nrows(val)));
+        LP_OUT(p, lp_write(p, "x", 1));
+        LP_OUT(p, lp_i64(p, ray_table_ncols(val)));
+        LP_OUT(p, lp_write(p, ">", 1));
         break;
     case RAY_UNARY: case RAY_BINARY: case RAY_VARY: {
         const char* name = ray_fn_name(val);
-        LP_OUT(p, fprintf(fp, "%s", name[0] ? name : "builtin"));
+        LP_OUT(p, lp_str(p, name[0] ? name : "builtin"));
         break;
     }
     default: {
@@ -173,12 +253,15 @@ static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
          * vector types (I16/I32/F64/SYM/...), DICT, GUID, temporal, etc.
          * Without this println on (println 5i) printed "<type:-4>" — a
          * debug placeholder, not the value. */
-        ray_t* s = ray_fmt(val, RAY_FMT_COMPACT);
+        ray_t* s = ray_fmt_dup(val, RAY_FMT_COMPACT, &p->dup, p->out);
         if (s && !RAY_IS_ERR(s)) {
-            LP_OUT(p, fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s)));
+            LP_OUT(p, lp_write(p, ray_str_ptr(s), ray_str_len(s)));
             ray_release(s);
+        } else if (s && strcmp(ray_err_code(s), "limit") == 0) {   /* the budget */
+            ray_error_free(s);
+            p->over = true;
         } else {
-            LP_OUT(p, fprintf(fp, "<type:%d>", val->type));
+            LP_OUT(p, lp_printf(p, "<type:%d>", val->type));
             if (s) ray_release(s);
         }
         break;
@@ -186,21 +269,35 @@ static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
     }
 }
 
-/* Print val to fp; false when it stopped at the budget of repeated output. */
-static bool lang_print_top(FILE* fp, ray_t* val) {
+/* Print vals to fp, separated by spaces, under one budget (#1648); output
+ * is held until it can no longer be refused (lp_printf).  LP_DONE:
+ * printed; LP_REFUSED: refused with nothing printed; LP_STOPPED: stopped
+ * at the budget after printing some. */
+enum { LP_DONE, LP_REFUSED, LP_STOPPED };
+static int lang_print_vals(FILE* fp, ray_t* const* vals, int64_t n) {
     lang_print_t p;
-    memset(&p, 0, sizeof p);
+    memset(&p, 0, offsetof(lang_print_t, small));   /* the bytes of small are written before read */
+    p.fp = fp;
+    p.held = true;
+    p.buf = p.small;
+    p.cap = sizeof p.small;
     ray_dup_begin(&p.dup);
-    ray_dup_root(&p.dup, val, true);   /* print writes a table as one line */
-    lang_print_part(fp, val, &p);
+    ray_dup_roots(&p.dup, vals, n, true);   /* print writes a table as one line */
+    for (int64_t i = 0; i < n && !p.over; i++) {
+        if (i > 0) LP_OUT(&p, lp_write(&p, " ", 1));
+        lang_print_part(fp, vals[i], &p);
+    }
+    int r = LP_DONE;
+    if (p.over) r = p.held ? LP_REFUSED : LP_STOPPED;
+    if (p.held) { if (p.over) lp_drop(&p); else lp_release(&p); }
     ray_dup_end(&p.dup);
-    return !p.over;
+    return r;
 }
 
 /* A caller with no error to give (the REPL's echo): past the budget the
  * rest prints as "...". */
 void ray_lang_print(FILE* fp, ray_t* val) {
-    if (!lang_print_top(fp, val)) fputs("...", fp);
+    if (lang_print_vals(fp, &val, 1) != LP_DONE) fputs("...", fp);
 }
 
 /* Helper: format string with % placeholders, substituting args.
@@ -208,6 +305,76 @@ void ray_lang_print(FILE* fp, ray_t* val) {
  * If fmt has no %, returns NULL (caller falls back to plain print).  When an
  * argument fails to format (a table column that fails to load), returns NULL
  * with *err set to the owned error object; otherwise *err stays NULL. */
+/* fmt_interpolate for a call with an argument that can repeat
+ * (ray_dup_call_tracks): one budget of repeated output, one memo and one
+ * lower bound for every argument the call writes (#1648).  Kept apart so
+ * a call over numbers and symbols runs the plain loop below unchanged. */
+__attribute__((noinline))
+static char* fmt_interpolate_tracked(const char* fmt, size_t flen, ray_t** args, int64_t nargs,
+                                     int64_t arg_start, size_t* out_len, ray_t** err) {
+    int64_t npct = 0;
+    for (size_t i = 0; i < flen; i++) if (fmt[i] == '%') npct++;
+    int64_t nused = nargs - arg_start < npct ? nargs - arg_start : npct;   /* the args written */
+    ray_dup_t dup;
+    ray_dup_begin(&dup);
+    ray_dup_roots(&dup, args + arg_start, nused, false);
+
+    size_t cap = flen + 256;
+    char* buf = ray_calloc_raw(cap);
+    if (!buf) { ray_dup_end(&dup); return NULL; }
+    size_t pos = 0;
+    int64_t ai = arg_start;
+    for (size_t i = 0; i < flen; i++) {
+        if (fmt[i] == '%' && ai < nargs) {
+            char tmp[256];
+            ray_t* a = args[ai++];
+            ray_t* a_owned = NULL;
+            if (a && ray_is_lazy(a)) {   /* a private ref: a is borrowed */
+                ray_retain(a);
+                a = a_owned = ray_lazy_materialize(a);
+            }
+            const char* sp = NULL;
+            size_t sl = 0;
+            bool tracked = ray_dup_call_tracks(a), opened = false;
+            ray_t* own;
+            if (!tracked) {
+                own = ray_fmt_pct(a, tmp, sizeof(tmp), &sp, &sl);
+            } else {
+                opened = ray_dup_enter(&dup, a, pos);
+                own = ray_dup_over(&dup, pos)   /* the lower bound refused it */
+                    ? ray_error("limit", "format: value repeats shared parts beyond 1 GiB of extra output")
+                    : ray_fmt_pct_dup(a, tmp, sizeof(tmp), &sp, &sl, &dup, pos);
+            }
+            if (own && RAY_IS_ERR(own)) {
+                if (a_owned) ray_release(a_owned);
+                ray_free_raw(buf);
+                ray_dup_end(&dup);
+                *err = own;
+                return NULL;
+            }
+            while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            memcpy(buf + pos, sp, sl);
+            pos += sl;
+            if (own) ray_release(own);
+            if (a_owned && !RAY_IS_ERR(a_owned)) ray_release(a_owned);
+            if (tracked) ray_dup_leave(&dup, opened, pos);
+            if (tracked && ray_dup_over(&dup, pos)) {
+                ray_free_raw(buf);
+                ray_dup_end(&dup);
+                *err = ray_error("limit", "format: value repeats shared parts beyond 1 GiB of extra output");
+                return NULL;
+            }
+        } else {
+            if (pos + 2 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            buf[pos++] = fmt[i];
+        }
+    }
+    ray_dup_end(&dup);
+    buf[pos] = '\0';
+    *out_len = pos;
+    return buf;
+}
+
 static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t nargs, int64_t arg_start, size_t* out_len, ray_t** err) {
     *err = NULL;
     /* Quick scan: any % in fmt? */
@@ -234,6 +401,14 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
             if (a && ray_is_lazy(a)) {
                 ray_retain(a);
                 a = a_owned = ray_lazy_materialize(a);
+            }
+            if (RAY_UNLIKELY(ray_dup_call_tracks(a))) {
+                /* an argument that can repeat: the call is written again
+                 * under one budget (#1648); the arguments before it were
+                 * numbers, symbols or strings held once */
+                if (a_owned) ray_release(a_owned);
+                ray_free_raw(buf);
+                return fmt_interpolate_tracked(fmt, flen, args, nargs, arg_start, out_len, err);
             }
             const char* sp = NULL;
             size_t sl = 0;
@@ -291,13 +466,10 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
     }
 
     FILE* out = stdout;
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', out);
-        if (!lang_print_top(out, args[i])) {
-            fputc('\n', out);
-            fflush(out);
-            return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
-        }
+    int r = lang_print_vals(out, args, n);
+    if (r != LP_DONE) {
+        if (r == LP_STOPPED) { fputc('\n', out); fflush(out); }
+        return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
     }
     fputc('\n', out);
     return print_end(out);
@@ -324,22 +496,59 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
     }
 
     FILE* out = stdout;
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', out);
-        if (!lang_print_top(out, args[i])) {
-            fputc('\n', out);
-            fflush(out);
-            return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
-        }
+    int r = lang_print_vals(out, args, n);
+    if (r != LP_DONE) {
+        if (r == LP_STOPPED) { fputc('\n', out); fflush(out); }
+        return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
     }
     return print_end(out);
 }
 
 /* (show val1 val2 ...) — print values to stdout using ray_fmt, newline at end */
+/* show from args[from], the first value that can repeat
+ * (ray_dup_call_tracks), to the end: one budget of repeated output for all
+ * of them (#1648); the values before it cannot repeat.  Kept apart so a
+ * call over numbers and symbols runs the plain loop below unchanged. */
+__attribute__((noinline)) static ray_t* show_tracked(ray_t** args, int64_t n, int64_t from) {
+    /* args are pre-materialized by eval — see ray_println_fn. */
+    FILE* out = stdout;
+    ray_dup_t dup;   /* one budget of repeated output for the rest of the call (#1648) */
+    ray_dup_begin(&dup);
+    ray_dup_roots(&dup, args + from, n - from, false);
+    for (int64_t i = from; i < n; i++) {
+        if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
+        /* show prints the whole value, streamed; the display limits belong
+         * to the REPL and to print. */
+        ray_t* cause;
+        ray_err_t e = ray_fmt_write_dup(out, args[i], &cause, &dup);
+        if (cause) {   /* a column failed to load: report it, output already written stays */
+            ray_dup_end(&dup);
+            ray_t* r = print_end(out);
+            if (r && RAY_IS_ERR(r)) { ray_error_free(cause); return r; }
+            return cause;
+        }
+        if (e == RAY_OK || e == RAY_ERR_IO) continue;   /* written, partly written, or stdout failed */
+        /* out of memory before any output: fall back to the bounded REPL display */
+        ray_t* formatted = ray_fmt(args[i], 1);
+        if (formatted && !RAY_IS_ERR(formatted)) {
+            const char* sp = ray_str_ptr(formatted);
+            size_t sl = ray_str_len(formatted);
+            fwrite(sp, 1, sl, out);
+            ray_release(formatted);
+        } else {
+            if (formatted) ray_error_free(formatted);
+            ray_lang_print(out, args[i]);
+        }
+    }
+    ray_dup_end(&dup);
+    fputc('\n', out);
+    return print_end(out);
+}
 ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
     FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY(ray_dup_call_tracks(args[i]))) return show_tracked(args, n, i);
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
         /* show prints the whole value, streamed; the display limits belong
          * to the REPL and to print. */
@@ -1617,12 +1826,22 @@ ray_t* cast_str_atom(ray_t* val) {
     return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
 }
 
+__attribute__((noinline, cold)) static ray_t* cast_str_limit(ray_t* cast, ray_t* vec) {
+    ray_release(cast);
+    ray_release(vec);
+    return ray_error("limit", "as: a string vector repeats shared strings beyond 1 GiB of extra data");
+}
+
 /* Choose the collection contract once. A boxed flat-vector element can
  * only produce a string atom on success; LIST children may recurse to vectors.
  * Keep the collection loop outside scalar dispatch's register frame. */
 static inline __attribute__((always_inline))
 ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
     int64_t n2 = val->len;
+    /* A list's cell held by several cells is copied again each time
+     * (#1648): once the copy passes RAY_DUP_COPY_SCAN bytes, the list's
+     * repeats are counted once, and the cast refused past the budget. */
+    uint64_t copied = 0, scan_at = may_nest ? RAY_DUP_COPY_SCAN : UINT64_MAX;
     ray_t* vec = ray_vec_new(RAY_STR, n2);
     if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);
     for (int64_t i = 0; i < n2; i++) {
@@ -1650,6 +1869,12 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         }
         const char* sp = ray_str_ptr(cast);
         size_t slen = ray_str_len(cast);
+        copied += slen;
+        if (RAY_UNLIKELY(copied > scan_at)) {
+            if (ray_str_cells_repeat_over((ray_t* const*)ray_data(val), n2))
+                return cast_str_limit(cast, vec);
+            scan_at = UINT64_MAX;   /* the whole list is counted */
+        }
         vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
         ray_release(cast);
         if (RAY_IS_ERR(vec)) return vec;
@@ -4531,6 +4756,70 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
 }
 
 /* (raze list-of-vecs) -> flattened vector */
+/* raze of n >= 2 items that are all string atoms (one string atom, each
+ * without its trailing NUL bytes, as concat joins them) or all string
+ * vectors (one string vector); NULL when they are not. */
+static ray_t* raze_strings(ray_t** items, int64_t n) {
+    int8_t t = items[0]->type;
+    uint64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!items[i] || items[i]->type != t) return NULL;
+        total += t == RAY_STR ? (uint64_t)items[i]->len : ray_str_len(items[i]);
+    }
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    bool over = false;
+    for (int64_t i = 0; i < n && !over; i++) {
+        ray_t* it = items[i];
+        if (it->rc == 1) continue;
+        uint64_t bytes = 0;
+        if (t == -RAY_STR) bytes = ray_str_len(it);
+        else for (int64_t j = 0; j < it->len; j++) { size_t l = 0; ray_str_vec_get(it, j, &l); bytes += l; }
+        over = ray_dup_copy(&dup, it, bytes);
+    }
+    ray_dup_copy_end(&dup);
+    if (over) return ray_error("limit", "raze: the result repeats shared strings beyond 1 GiB of extra data");
+    if (t == -RAY_STR) {
+        size_t len = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const char* p = ray_str_ptr(items[i]);
+            size_t l = ray_str_len(items[i]);
+            while (l > 0 && p[l - 1] == '\0') l--;
+            len += l;
+        }
+        if (len > (size_t)INT64_MAX) return ray_error("oom", NULL);
+        char* buf = (char*)ray_alloc_raw(len ? len : 1);
+        if (!buf) return ray_error("oom", NULL);
+        size_t pos = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const char* p = ray_str_ptr(items[i]);
+            size_t l = ray_str_len(items[i]);
+            while (l > 0 && p[l - 1] == '\0') l--;
+            memcpy(buf + pos, p, l);
+            pos += l;
+        }
+        ray_t* r = ray_str(buf, len);
+        ray_free_raw(buf);
+        return r;
+    }
+    if (total > (uint64_t)INT64_MAX) return ray_error("oom", NULL);
+    ray_t* out = ray_vec_new(RAY_STR, (int64_t)total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    bool nulls = false;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* it = items[i];
+        nulls |= ray_vec_text_has_nulls(it);
+        for (int64_t j = 0; j < it->len; j++) {
+            size_t l = 0;
+            const char* p = ray_str_vec_get(it, j, &l);
+            out = ray_str_vec_append(out, p ? p : "", p ? l : 0);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+    }
+    if (nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* ray_raze_fn(ray_t* x) {
     /* Scalar passthrough */
     if (ray_is_atom(x)) { ray_retain(x); return x; }
@@ -4574,6 +4863,15 @@ ray_t* ray_raze_fn(ray_t* x) {
             }
             return out;
         }
+    }
+
+    /* Strings: copied once each, in one pass, instead of the pairwise
+     * concat below, which copies the result again at every item; a string
+     * held by several items is charged its bytes again each time (#1648). */
+    if (n >= 2 && items[0] && (items[0]->type == -RAY_STR ||
+                               (items[0]->type == RAY_STR && !ray_index_has(items[0])))) {
+        ray_t* r = raze_strings(items, n);
+        if (r) return r;   /* NULL: not all strings of one kind */
     }
 
     /* Slow path: pairwise concat — used for mixed types, null-bearing

@@ -156,3 +156,35 @@
 (.sys.exec "rm -rf /tmp/rfl_shared_values_vec") -- 0
 ;; sharing repeated level after level is refused
 (count (ser (list S S))) !- limit
+
+;; one budget per call (#1648): each of three lists of 4,300 references to
+;; one 100,000-cell vector writes 860 MB again, inside the budget alone;
+;; one format, print, println or show of all three is refused at once
+(set z (take [0] 100000))
+(set za (map (fn [i] z) (til 4300)))
+(set zb (map (fn [i] z) (til 4300)))
+(set zc (map (fn [i] z) (til 4300)))
+(format "% % %" za zb zc) !- limit
+(println za zb zc) !- limit
+(print za zb zc) !- limit
+(show za zb zc) !- limit
+;; the arguments a format string does not write are not counted
+(set zs (map (fn [i] z) (til 2)))
+(count (format "% x" zs za zb zc)) -- 400012
+
+;; string atoms copied cell by cell into a string, a string vector or a
+;; set: a shared one is charged at each copy past the first (as 'STR, map,
+;; raze), or copied once (a set for in); raze copies each string
+;; once instead of the result again at every item
+(as 'STR (take (list s1m) 1100)) !- limit
+(count (as 'STR (take (list s1m) 100))) -- 100
+(map (fn [i] s1m) (til 1100)) !- limit
+(count (map (fn [i] s1m) (til 100))) -- 100
+(raze (take (list s1m) 1100)) !- limit
+(count (raze (take (list s1m) 100))) -- 100000000
+(in ["x" "c"] (take (list s1m) 100000)) -- [false false]
+(raze (list "ab\000" "c" "")) -- "abc"
+(raze (list ["a" "b"] ["c"] ["d" ""])) -- ["a" "b" "c" "d" ""]
+(count (raze (take (list "ab") 1000000))) -- 2000000
+(set w (as 'STR (map (fn [i] "abcdefghijklmnop") (til 1000))))
+(count (raze (map (fn [i] w) (til 4000)))) -- 4000000

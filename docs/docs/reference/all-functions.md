@@ -235,7 +235,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. String results that repeat shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fail with `limit`. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
 | `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -325,7 +325,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `mdev` | binary | lazy/DAG | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | — | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and on every query route: `(concat "" "a")` is `"a"`, and `(concat s "")` in a select keeps each cell of `s` | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
-| `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
+| `raze` | unary | — | Flatten a list of vectors into one vector; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |
 | `diverse` | unary | — | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
@@ -640,7 +640,7 @@ Type checking, casting, null testing, and object inspection.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` | `(type 42)` → `i64` |
-| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms | `(as 'i64 "42")` → `42` |
+| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |

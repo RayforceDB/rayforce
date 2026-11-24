@@ -2101,9 +2101,14 @@ static ray_t* in_str_set_const(ray_graph_t* g, ray_t* set) {
     int64_t from, n;
     if (!in_list_set_atoms(g, set, &e, &from, &n)) return NULL;
     ray_t* v = ray_vec_new(RAY_STR, n - from);
+    /* A set needs each string once: a cell holding a string already copied
+     * is skipped, not copied again (#1648). */
+    ray_dup_copy_t seen;
+    ray_dup_copy_begin(&seen);
     for (int64_t i = from; i < n && v && !RAY_IS_ERR(v); i++)
-        if (e[i]->type == -RAY_STR)
+        if (e[i]->type == -RAY_STR && !ray_dup_copy_seen(&seen, e[i], ray_str_len(e[i])))
             v = ray_str_vec_append(v, ray_str_ptr(e[i]), ray_str_len(e[i]));
+    ray_dup_copy_end(&seen);
     return v ? v : ray_error("oom", NULL);
 }
 
