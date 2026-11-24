@@ -76,6 +76,28 @@ int ray_temporal_unit_from_name(const char* name, size_t len);
 /* (trunc 'unit x): see ray_temporal_truncate.  `unit` is a symbol atom. */
 ray_t* ray_trunc_fn(ray_t* unit, ray_t* x);
 
+/* (.time.tz.local 'Zone ts): the zone's wall clock at each UTC instant, as a
+ * TIMESTAMP that carries no zone.  (.time.tz.offset 'Zone ts): the zone's
+ * offset from UTC at each instant, as a TIMESPAN, east positive.  `Zone` is
+ * an IANA name, 'America/New_York; `ts` a TIMESTAMP atom or vector.  A null
+ * stays null, and so does a wall clock past the TIMESTAMP range. */
+ray_t* ray_tz_local_fn(ray_t* zone, ray_t* x);
+ray_t* ray_tz_offset_fn(ray_t* zone, ray_t* x);
+/* (.time.tz.utc 'Zone 'earlier|'later wall): the instant at which the zone's
+ * wall clock read `wall`, a TIMESTAMP that carries no zone.  The choice says
+ * which of two candidate instants to take for an hour the clock repeated or
+ * skipped (ray_tz_instant); elsewhere both are the same instant. */
+ray_t* ray_tz_utc_fn(ray_t** args, int64_t n);
+/* (.time.tz.version): the IANA release of the database built in, "2026f". */
+ray_t* ray_tz_version_fn(ray_t** args, int64_t n);
+/* The database's index of the zone `zone_sym` names, with its table loaded;
+ * -1 when the database has no such zone.  The query compiler asks before it
+ * builds an OP_TZ_SHIFT and leaves the index in the node, so that executing
+ * the node only reads. */
+int32_t ray_temporal_tz_index(int64_t zone_sym);
+/* Drop every zone table looked up so far; the language's shutdown calls it. */
+void ray_temporal_tz_reset(void);
+
 /* The DATE / TIME (`want` = RAY_DATE / RAY_TIME) of a temporal atom or
  * vector; see the definition.  `x` is borrowed, the result caller-owned. */
 ray_t* ray_temporal_to(int8_t want, ray_t* x);

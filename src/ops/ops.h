@@ -211,6 +211,7 @@ static inline bool ray_has_timespan(const ray_t* x) {
 #define OP_RECIPROCAL   143  /* unary: reciprocal -> F64 */
 #define OP_SIGNUM       144  /* unary: signum -> I64 */
 #define OP_STR_FIND     146  /* binary: string search pattern -> I64 */
+#define OP_TZ_SHIFT     148  /* unary: a UTC instant on a zone's wall clock, or its offset */
 
 /* EXTRACT / DATE_TRUNC field identifiers */
 #define RAY_EXTRACT_YEAR    0
@@ -438,6 +439,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 #define OP_FLAG_TEMPORAL_INT 0x08  /* temporal +/- integer lowered by the query compiler (#1302) */
 #define OP_FLAG_XBAR         0x10  /* OP_MOD of an xbar: a zero or null divisor raises domain (#1355) */
 #define OP_FLAG_NARROW_AS    0x20  /* explicit as to I16/I32 can produce a null sentinel */
+#define OP_FLAG_TZ_OFFSET    0x40  /* OP_TZ_SHIFT answers the zone's offset, not its wall clock */
 
 /* ray_xbar_fn's error for a zero or null bucket */
 #define RAY_XBAR_BUCKET_ERR "xbar: bucket size must be non-zero and non-null"
@@ -847,6 +849,10 @@ ray_op_t* ray_str_find_op(ray_graph_t* g, ray_op_t* input, ray_op_t* pattern);
 /* Date/time extraction and truncation */
 ray_op_t* ray_extract(ray_graph_t* g, ray_op_t* col, int64_t field);
 ray_op_t* ray_date_trunc(ray_graph_t* g, ray_op_t* col, int64_t field);
+/* (.time.tz.local 'Zone col), or with want_offset (.time.tz.offset 'Zone col).
+ * `zone` is the zone's index in the database, as ray_temporal_tz_index
+ * answered it. */
+ray_op_t* ray_tz_shift(ray_graph_t* g, ray_op_t* col, int32_t zone, bool want_offset);
 
 /* Reduction ops */
 ray_op_t* ray_sum(ray_graph_t* g, ray_op_t* a);

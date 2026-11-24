@@ -3959,6 +3959,7 @@ static inline bool op_memoizable(uint16_t o) {
         case OP_IF: case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
         case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
         case OP_CONCAT: case OP_STR_FIND: case OP_EXTRACT: case OP_DATE_TRUNC:
+        case OP_TZ_SHIFT:
         case OP_IN: case OP_NOT_IN:
             return true;
         default:
@@ -6303,6 +6304,10 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
             return exec_date_trunc(g, op);
         }
 
+        case OP_TZ_SHIFT: {
+            return exec_tz_shift(g, op);
+        }
+
         case OP_ALIAS: {
             return exec_node(g, op_child(g, op, 0));
         }
@@ -6877,7 +6882,7 @@ static unsigned pointwise_layout(uint16_t opc) {
         case OP_TAN: case OP_ATAN: case OP_RECIPROCAL: case OP_SIGNUM:
         case OP_ISNULL: case OP_CAST:
         case OP_UPPER: case OP_LOWER: case OP_STRLEN: case OP_TRIM:
-        case OP_EXTRACT: case OP_DATE_TRUNC:
+        case OP_EXTRACT: case OP_DATE_TRUNC: case OP_TZ_SHIFT:
             return EXPR_UNARY;
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_IDIV: case OP_MOD:
         case OP_POW: case OP_EQ: case OP_NE: case OP_LT: case OP_LE:
@@ -7008,7 +7013,8 @@ static uint8_t subset_visit(subset_proof_t* p, uint32_t id, unsigned depth) {
         if (shape == 1 && !op_is_elementwise(n->opcode) &&
             n->opcode != OP_UPPER && n->opcode != OP_LOWER &&
             n->opcode != OP_TRIM && n->opcode != OP_STRLEN &&
-            n->opcode != OP_EXTRACT && n->opcode != OP_DATE_TRUNC) return 0;
+            n->opcode != OP_EXTRACT && n->opcode != OP_DATE_TRUNC &&
+            n->opcode != OP_TZ_SHIFT) return 0;
     }
     p->state[id] = 2;
     return p->shape[id] = shape;

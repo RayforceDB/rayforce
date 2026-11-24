@@ -142,7 +142,7 @@ nav:
           - .parquet — Parquet input: docs/namespaces/parquet.md
           - .repl — REPL control: docs/namespaces/repl.md
           - .sys — System info: docs/namespaces/sys.md
-          - .time — Clock & timers: docs/namespaces/time.md
+          - .time — Clock, timers & time zones: docs/namespaces/time.md
       - Data & Types:
           - Data Types: docs/data-types/index.md
           - Collections: docs/data-types/collections.md

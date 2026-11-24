@@ -97,6 +97,7 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_STR_FIND:      return "STR_FIND";
         case OP_EXTRACT:       return "EXTRACT";
         case OP_DATE_TRUNC:    return "DATE_TRUNC";
+        case OP_TZ_SHIFT:      return "TZ_SHIFT";
         case OP_SUM:           return "SUM";
         case OP_PROD:          return "PROD";
         case OP_ALL:           return "ALL";

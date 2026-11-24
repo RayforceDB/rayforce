@@ -6109,6 +6109,11 @@ static void ray_register_builtins(void) {
     /* Restricted: a sleep stops the whole single-threaded server, and a
      * restricted peer may not occupy it at will (as with .sys.exec). */
     register_unary(".time.sleep",     RAY_FN_RESTRICTED, ray_time_sleep_fn);
+    /* .time.tz.* — a UTC instant on a zone's wall clock */
+    register_binary(".time.tz.local",   RAY_FN_NONE, ray_tz_local_fn);
+    register_binary(".time.tz.offset",  RAY_FN_NONE, ray_tz_offset_fn);
+    register_vary  (".time.tz.utc",     RAY_FN_NONE, ray_tz_utc_fn);
+    register_vary  (".time.tz.version", RAY_FN_NONE, ray_tz_version_fn);
 
     /* env — list all global environment bindings */
     register_unary("env",        RAY_FN_NONE, ray_env_fn);
@@ -6249,6 +6254,7 @@ void ray_lang_destroy(void) {
     if (__VM && __VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
     closure_tmpl_reset();
     ray_callprof_destroy();
+    ray_temporal_tz_reset();
     /* Reset global Datalog rule storage */
     ray_dl_reset_rules();
     ray_env_destroy();

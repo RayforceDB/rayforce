@@ -1,0 +1,40 @@
+;; @requires: posix  (the fixture is removed through .sys.exec)
+;; Grouping a partitioned table by a zone's wall clock answers what the same
+;; rows answer in memory.  The key is computed per partition, so no partition
+;; is copied into one table first.  Three days around New York's spring
+;; change of 2024, 5 000 rows a day, one every 17.28 s.
+
+(.sys.exec "rm -rf /tmp/rfl_tz_part")
+(set n 5000)
+(set day (fn [d] (table [ts px] (list (+ (+ 2024.03.09D00:00:00.000000000 (* 1D d)) (* 0D00:00:17.28 (til n))) (as 'F64 (% (* (+ (til n) (* d n)) 7919) 1000))))))
+(.db.splayed.set "/tmp/rfl_tz_part/2024.03.09/T/" (day 0))
+(.db.splayed.set "/tmp/rfl_tz_part/2024.03.10/T/" (day 1))
+(.db.splayed.set "/tmp/rfl_tz_part/2024.03.11/T/" (day 2))
+(set P (.db.parted.get "/tmp/rfl_tz_part/" 'T))
+(set M (table [ts px] (list (concat (concat (at (day 0) 'ts) (at (day 1) 'ts)) (at (day 2) 'ts)) (concat (concat (at (day 0) 'px) (at (day 1) 'px)) (at (day 2) 'px)))))
+(count P) -- 15000
+
+;; local days: the evening of 8 March in New York holds the first 5 UTC hours
+(set GP (select {from: P by: {d: (trunc 'day (.time.tz.local 'America/New_York ts))} a: (avg px) n: (count px)}))
+(set GM (select {from: M by: {d: (trunc 'day (.time.tz.local 'America/New_York ts))} a: (avg px) n: (count px)}))
+(at GP 'd) -- [2024.03.08D00:00:00.000000000 2024.03.09D00:00:00.000000000 2024.03.10D00:00:00.000000000 2024.03.11D00:00:00.000000000]
+(at GP 'n) -- (at GM 'n)
+(at GP 'a) -- (at GM 'a)
+(sum (at GP 'n)) -- 15000
+;; 10 March is 23 hours long there
+(at (at GP 'n) 2) -- 4792
+
+;; local hours over the change: 02:00 on 10 March does not exist
+(set HP (select {from: P by: {h: (trunc 'hour (.time.tz.local 'America/New_York ts))} n: (count px)}))
+(set HM (select {from: M by: {h: (trunc 'hour (.time.tz.local 'America/New_York ts))} n: (count px)}))
+(count HP) -- 72
+(at HP 'h) -- (at HM 'h)
+(at HP 'n) -- (at HM 'n)
+(sum (== (at HP 'h) 2024.03.10D02:00:00.000000000)) -- 0
+
+;; projected and filtered
+(sum (== (at (select {from: P l: (.time.tz.local 'America/New_York ts)}) 'l) (at (select {from: M l: (.time.tz.local 'America/New_York ts)}) 'l))) -- 15000
+;; (`date` names the partition column of P, so the day is cut with trunc)
+(at (select {from: P n: (count px) where: (== 2024.03.10D00:00:00.000000000 (trunc 'day (.time.tz.local 'America/New_York ts)))}) 'n) -- [4792]
+
+(.sys.exec "rm -rf /tmp/rfl_tz_part")

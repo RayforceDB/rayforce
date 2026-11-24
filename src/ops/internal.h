@@ -2441,6 +2441,7 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
 /* ── temporal_exec.c ── */
 ray_t* exec_extract(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op);
+ray_t* exec_tz_shift(ray_graph_t* g, ray_op_t* op);
 
 /* ── string_exec.c ── */
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op);

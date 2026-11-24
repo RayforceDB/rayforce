@@ -14,6 +14,18 @@ truth for the version** — no version literal is ever hand-edited in source.
 
 ## Cutting a release
 
+Before step 1, check whether IANA has published a newer
+[time zone database](https://www.iana.org/time-zones) than the one built in
+(`(.time.tz.version)`). If it has, download `tzdataYYYYx.tar.gz`, check it
+against its published signature, and land a normal PR on `dev` with the result
+of:
+
+```sh
+make tzdata TZDATA=path/to/tzdataYYYYx.tar.gz   # needs python3 and a recent zic
+```
+
+That rewrites `src/core/tzdata.c`; `make test` then parses every zone in it.
+
 1. Make sure `dev` is green and ready.
 2. Open a pull request **`dev` → `master`** with the title set to the new
    version: **`vX.Y.Z`** (e.g. `v2.1.3`).

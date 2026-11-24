@@ -10,6 +10,7 @@ runtime).
 |---|---|---|
 | `fuzz_parse`    | `ray_parse`            | Rayfall source parser / lexer |
 | `fuzz_numparse` | `ray_parse_i64/f64/u64_hex` | numeric-literal scanners (pure, no runtime) |
+| `fuzz_tz`       | `ray_tz_parse`         | TZif time zone file parser, with the POSIX TZ rule a file ends with |
 | `fuzz_de`       | `ray_de` / `ray_de_raw` | binary wire-frame / journal-entry decoder |
 | `fuzz_eval`     | `ray_eval_str`         | full parse → eval pipeline (sandboxed) |
 | `fuzz_csv`      | `ray_read_csv*`        | CSV reader (input via memfd) |

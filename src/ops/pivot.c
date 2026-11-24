@@ -104,7 +104,7 @@ static bool if_op_rowwise(uint16_t opc) {
     case OP_LIKE: case OP_ILIKE: case OP_UPPER: case OP_LOWER:
     case OP_STRLEN: case OP_SUBSTR: case OP_REPLACE: case OP_TRIM:
     case OP_CONCAT: case OP_STR_FIND:
-    case OP_EXTRACT: case OP_DATE_TRUNC:
+    case OP_EXTRACT: case OP_DATE_TRUNC: case OP_TZ_SHIFT:
         return true;
     default:
         return false;
