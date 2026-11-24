@@ -573,3 +573,21 @@
 (count Mn) -- 300007
 (all (== (at Mn 'k) (at Un 'k))) -- true
 (all (== (at Mn 'u) (at Un 'u))) -- true
+;; a composite key with a STR column above RGID_PAR_GROUPS groups: the
+;; tuples carry the string's hash and the parallel insert compares the bytes
+;; of equal hashes.  Oracle: the distinct (key, value) rows counted per key,
+;; which no count(distinct) kernel answers.
+(set ri (til 400000))
+(set Tsk (table [s k2 v w] (list (as 'STR (% (* ri 7) 100003)) (% ri 2) (% ri 5) (% ri 3))))
+(set Msk (xasc (select {from: Tsk by: [s k2] u: (count (distinct v)) n: (count v)}) [s k2]))
+(set Osk (xasc (select {from: (distinct (select {from: Tsk s: s k2: k2 v: v})) by: [s k2] u: (count v)}) [s k2]))
+(count Msk) -- 200006
+(count Msk) -- (count Osk)
+(all (== (at Msk 's) (at Osk 's))) -- true
+(all (== (at Msk 'k2) (at Osk 'k2))) -- true
+(all (== (at Msk 'u) (at Osk 'u))) -- true
+(sum (at Msk 'n)) -- 400000
+(set Wsk (xasc (select {from: Tsk by: [s k2] u: (count (distinct v)) n: (count v) where: (!= w 0)}) [s k2]))
+(set Vsk (xasc (select {from: (distinct (select {from: Tsk s: s k2: k2 v: v where: (!= w 0)})) by: [s k2] u: (count v)}) [s k2]))
+(count Wsk) -- (count Vsk)
+(all (== (at Wsk 'u) (at Vsk 'u))) -- true
