@@ -187,6 +187,21 @@ does push a scope:
 A loop whose condition never goes false runs until interrupted; Ctrl-C breaks
 out of one at the REPL.
 
+Unlike `if`, `while` tests a vector condition as one truth value: a non-empty
+vector is true, so a loop over a vector whose cells all turn false still runs.
+Inside a query, a `while` in a helper the planner does not inline (it runs as
+bytecode) that is called with a column gets a boolean-vector condition over the
+query's rows, or a group's rows. When that condition is read from the column or
+computed from it with builtins, such as `(> v 15)` or `(not (<= v 15))`, a
+condition true on every row is true and one false on every row is false, so
+such a loop stops; one that is true on some rows and false on others raises
+`nyi`, since a loop cannot take a different number of passes for each row. A
+condition built with `and` or `or`, such as `(and (> v 15) true)`, is tested
+whole, as outside a query, so such a loop may not end
+([#1647](https://github.com/RayforceDB/rayforce/issues/1647)). Write the loop
+over one row's value and call the helper from a projection, where it runs once
+per row, or replace it with a vector expression.
+
 ## Bounded Iteration: times
 
 `times` runs the body a fixed number of times and returns null.
