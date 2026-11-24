@@ -1,0 +1,68 @@
+;; A select's output read by a later projection through its alias, and an
+;; `if` chain whose conditions all read that alias, compute the aliased
+;; expression ONCE: the shared node is held by the executor's memo
+;; (exec_memo_begin counts a select's projections; if_eval_branch seeds an
+;; arm's memo with the outer value's rows).  Observed through (.sys.mem)'s
+;; sym-map-runs, the runs of the per-distinct-code string path that served
+;; (src/ops/string.c), which a column of 4096 rows or more takes.  Values
+;; against the STR row loop, and against the same chain with numeric arms.
+(set N 70000)
+(set i (til N))
+(set u (as 'SYM (map (fn [k] (format "HTTP://Site%.COM/Page%" (% (* 7 k) 37) k)) i)))
+(set T (table [u v] (list u i)))
+(set US (as 'STR u))
+(set LU (lower US))
+(set TO (table [lu v] (list LU i)))
+(set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
+(> (count (select {from: (take T 10) lu: (lower u)})) 0) -- true
+(count ['R 'C 'CI 'D 'h 'lu 'pt 'x 'ix]) -- 9
+
+;; ── the alias read by one later projection: one run, not two ──
+(set m0 (runs))
+(set R (select {from: T lu: (lower u) h: (like lu "*site7.com/*") v: v}))
+(- (runs) m0) -- 1
+(all (== (at R 'lu) (as 'SYM LU))) -- true
+(all (== (at R 'h) (like LU "*site7.com/*"))) -- true
+(sum (at R 'h)) -- 1892
+;; under a where, and with the alias read twice
+(set m0 (runs))
+(set R (select {from: T lu: (lower u) h: (like lu "*site7.com/*") x: (strlen lu) v: v where: (> v 999)}))
+(- (runs) m0) -- 1
+(count R) -- 69000
+(all (== (at R 'h) (take (like LU "*site7.com/*") -69000))) -- true
+(all (== (at R 'x) (take (strlen LU) -69000))) -- true
+
+;; ── an if chain over the alias: one run for the column, not one per arm ──
+(set m0 (runs))
+(set C (select {from: T lu: (lower u) pt: (if (like lu "*site7.com/*") "seven" (like lu "*site1?.com/*") "teens" (or (like lu "*page1*") (like lu "*page2*")) "low-pages" (like u "*Site3*") "three" "other-kind-of-page") v: v where: (!= u "")}))
+(- (runs) m0) -- 1
+(type (at C 'pt)) -- 'STR
+;; the same chain with numeric arms picks the texts by index: the fixed-width fill, no text build
+(set CI (select {from: T lu: (lower u) ix: (if (like lu "*site7.com/*") 0 (like lu "*site1?.com/*") 1 (or (like lu "*page1*") (like lu "*page2*")) 2 (like u "*Site3*") 3 4) v: v where: (!= u "")}))
+(set EXP (at ["seven" "teens" "low-pages" "three" "other-kind-of-page"] (at CI 'ix)))
+(all (== (at C 'pt) EXP)) -- true
+(count (distinct (at C 'pt))) -- 5
+;; and against the STR row loop over the lower-cased strings
+(set D (select {from: TO ix: (if (like lu "*site7.com/*") 0 (like lu "*site1?.com/*") 1 (or (like lu "*page1*") (like lu "*page2*")) 2 (like (upper lu) "*SITE3*") 3 4) v: v}))
+(all (== (at CI 'ix) (at D 'ix))) -- true
+(set G (select {from: C by: pt c: (count v)}))
+(count G) -- 5
+(sum (at G 'c)) -- 70000
+
+;; ── a sparse where: the arms run over a quarter of the rows ──
+(set m0 (runs))
+(set CS (select {from: T lu: (lower u) pt: (if (like lu "*site7.com/*") "seven" (like lu "*page1*") "ones" "rest") v: v where: (< (% v 7) 2)}))
+(- (runs) m0) -- 1
+(count CS) -- 20000
+(set CSI (select {from: T lu: (lower u) ix: (if (like lu "*site7.com/*") 0 (like lu "*page1*") 1 2) v: v where: (< (% v 7) 2)}))
+(all (== (at CS 'pt) (at ["seven" "ones" "rest"] (at CSI 'ix)))) -- true
+(all (== (at CS 'v) (at CSI 'v))) -- true
+
+;; ── literal arms: short (inline) and long (pooled) texts, SYM beside STR ──
+(set L (select {from: T a: (if (like u "*Site7.*") "a-very-long-literal-text" "s") b: (if (like u "*Site7.*") 'sym "a string literal here") c: (if (like u "*Site7.*") "" "x") v: v}))
+(set LI (select {from: T ix: (if (like u "*Site7.*") 0 1) v: v}))
+(all (== (at L 'a) (at ["a-very-long-literal-text" "s"] (at LI 'ix)))) -- true
+(all (== (as 'STR (at L 'b)) (at ["sym" "a string literal here"] (at LI 'ix)))) -- true
+(all (== (at L 'c) (at ["" "x"] (at LI 'ix)))) -- true
+(sum (== (at L 'c) "")) -- 1892
+(count (select {from: L where: (== a "a-very-long-literal-text")})) -- 1892

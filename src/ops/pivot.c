@@ -259,6 +259,10 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
      * outer memo (values of the full table) is set aside meanwhile. */
     ray_exec_memo_save_t memo_save;
     ray_exec_memo_push(g, branch, &memo_save);
+    /* ... seeded with the outer values' rows the arm runs over, so a shared
+     * node (a lower-cased column every condition of a chain reads) is
+     * computed once, not once per arm. */
+    ray_exec_memo_seed(g, &memo_save, branch, ids, count, nrows);
     ray_t* value = exec_node(g, branch);
     ray_exec_memo_pop(g, &memo_save);
     if (g->selection) {

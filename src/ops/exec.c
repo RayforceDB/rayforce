@@ -4005,6 +4005,15 @@ static bool exec_memo_begin(ray_graph_t* g, ray_op_t* root) {
                 for (int a = 2; a < n_args; a++)
                     if (trail[a - 2] < nc) uses[trail[a - 2]]++;
             }
+        } else if (n->opcode == OP_SELECT) {
+            /* The projections of a select: an output a later projection
+             * reads by its alias (`lu: (lower URL) h: (like lu "*a*")`) is
+             * one node with two consumers, the select and the reader; left
+             * uncounted, the reader computed it again. */
+            ray_op_ext_t* e = find_ext(g, n->id);
+            if (e)
+                for (uint32_t c = 0; c < e->sort.n_cols; c++)
+                    if (e->sort.columns[c] < nc) uses[e->sort.columns[c]]++;
         }
     }
     if (root && root->id < nc) uses[root->id]++;
@@ -4015,6 +4024,112 @@ static bool exec_memo_begin(ray_graph_t* g, ray_op_t* root) {
     g->memo_vals = vals; g->memo_uses = uses; g->memo_n = nc; g->memo_hdr = hdr;
     g->memo_table = g->table;
     return true;
+}
+
+/* ---- seeding a branch's memo from the outer one ---------------------------
+ * An `if` arm runs over the rows its condition selected, on a sub-table of
+ * the columns it scans, under a memo of its own (if_eval_branch, pivot.c):
+ * a shared node the outer memo already holds — `lu: (lower URL)` read by
+ * every condition of a page-type chain — was computed again over the arm's
+ * rows, once per arm.  The arm's memo is seeded instead with the outer
+ * value's rows: the nodes the arm reads are walked, and each one the outer
+ * memo holds a value for (a fixed-width vector of the outer table's rows)
+ * gets that value gathered at the arm's row ids, or the value itself when
+ * the arm runs over every row.  A STR value is left to be recomputed. */
+typedef struct {
+    const ray_t*   v;
+    ray_t*         out;
+    const int64_t* ids;
+    uint8_t        esz;
+} memo_gather_ctx_t;
+
+static void memo_gather_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const memo_gather_ctx_t* c = (const memo_gather_ctx_t*)vctx;
+    const char* src = (const char*)ray_data((ray_t*)c->v);
+    char* dst = (char*)ray_data(c->out);
+    const int64_t* ids = c->ids;
+    switch (c->esz) {
+        case 1: for (int64_t i = lo; i < hi; i++) ((uint8_t*)dst)[i] = ((const uint8_t*)src)[ids[i]]; break;
+        case 2: for (int64_t i = lo; i < hi; i++) ((uint16_t*)dst)[i] = ((const uint16_t*)src)[ids[i]]; break;
+        case 4: for (int64_t i = lo; i < hi; i++) ((uint32_t*)dst)[i] = ((const uint32_t*)src)[ids[i]]; break;
+        case 8: for (int64_t i = lo; i < hi; i++) ((uint64_t*)dst)[i] = ((const uint64_t*)src)[ids[i]]; break;
+        default: for (int64_t i = lo; i < hi; i++) memcpy(dst + (size_t)i * c->esz, src + (size_t)ids[i] * c->esz, c->esz); break;
+    }
+}
+
+/* Rows ids[0..count) of the fixed-width vector `v`, as a new vector of its
+ * type and width (a SYM one over the same domain).  NULL for a value this
+ * does not gather (STR, LIST, an atom) or on OOM. */
+static ray_t* memo_gather_rows(ray_t* v, const int64_t* ids, int64_t count) {
+    if (!ray_is_vec(v) || v->type == RAY_STR || v->type == RAY_LIST) return NULL;
+    uint8_t esz = ray_sym_elem_size(v->type, v->attrs);
+    if (esz == 0) return NULL;
+    ray_t* out = v->type == RAY_SYM ? ray_sym_vec_new(v->attrs & RAY_SYM_W_MASK, count)
+                                    : ray_vec_new(v->type, count);
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return NULL; }
+    out->len = count;
+    if (v->type == RAY_SYM) ray_sym_vec_adopt_domain(out, v);
+    out->attrs |= (uint8_t)(v->attrs & RAY_ATTR_HAS_NULLS);
+    memo_gather_ctx_t c = { .v = v, .out = out, .ids = ids, .esz = esz };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, count, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, memo_gather_fn, &c, count);
+    else                                                              memo_gather_fn(&c, 0, 0, count);
+    if (pool_cancelled(pool)) { ray_release(out); return NULL; }
+    return out;
+}
+
+/* The nodes `op` reads, transitively, marked in `visited`. */
+static void memo_walk(ray_graph_t* g, ray_op_t* op, uint64_t* visited) {
+    if (!op || op->id >= g->node_count) return;
+    uint64_t bit = (uint64_t)1 << (op->id & 63);
+    if (visited[op->id >> 6] & bit) return;
+    visited[op->id >> 6] |= bit;
+    for (uint8_t k = 0; k < op->arity && k < 2; k++)
+        if (op->in_id[k] != RAY_OP_NONE) memo_walk(g, op_child(g, op, k), visited);
+    ray_op_ext_t* e = find_ext(g, op->id);
+    if (!e) return;
+    if (op->opcode == OP_IF || op->opcode == OP_SUBSTR || op->opcode == OP_REPLACE) {
+        if (e->third_in != RAY_OP_NONE) memo_walk(g, op_node(g, e->third_in), visited);
+    } else if (op->opcode == OP_CONCAT) {
+        int n_args = (int)e->sym;
+        const uint32_t* trail = (const uint32_t*)((const char*)(e + 1));
+        for (int a = 2; a < n_args; a++) memo_walk(g, op_node(g, trail[a - 2]), visited);
+    } else if (op->opcode == OP_SELECT) {
+        for (uint32_t c = 0; c < e->sort.n_cols; c++) memo_walk(g, op_node(g, e->sort.columns[c]), visited);
+    }
+}
+
+void ray_exec_memo_seed(ray_graph_t* g, const ray_exec_memo_save_t* outer, ray_op_t* branch,
+                        const int64_t* ids, int64_t count, int64_t nrows) {
+    if (!g || !outer || !outer->vals || !branch || count <= 0 || g->node_count == 0) return;
+    uint32_t nc = g->node_count;
+    if (outer->n < nc) return;
+    ray_t* vhdr = NULL;
+    uint64_t* visited = (uint64_t*)scratch_calloc(&vhdr, (((size_t)nc + 63) >> 6) * sizeof(uint64_t));
+    if (!visited) return;
+    memo_walk(g, branch, visited);
+    for (uint32_t i = 0; i < nc; i++) {
+        ray_t* v = outer->vals[i];
+        if (!v || !(visited[i >> 6] & ((uint64_t)1 << (i & 63)))) continue;
+        if (!ray_is_vec(v) || v->len != nrows || !op_memoizable(g->nodes[i].opcode)) continue;
+        if (g->memo_uses && (i >= g->memo_n || g->memo_vals[i])) continue;
+        ray_t* rows = NULL;
+        if (count == nrows) { rows = v; ray_retain(rows); }
+        else rows = memo_gather_rows(v, ids, count);
+        if (!rows) continue;
+        if (!g->memo_uses) {
+            /* the arm shares no node of its own: a memo for the seeds alone */
+            ray_t* hdr = NULL;
+            char* mem = (char*)scratch_calloc(&hdr, (size_t)nc * (sizeof(ray_t*) + sizeof(uint32_t)));
+            if (!mem) { ray_release(rows); break; }
+            g->memo_vals = (ray_t**)mem;
+            g->memo_uses = (uint32_t*)(mem + (size_t)nc * sizeof(ray_t*));
+            g->memo_n = nc; g->memo_hdr = hdr; g->memo_table = g->table;
+        }
+        g->memo_vals[i] = rows;
+    }
+    scratch_free(vhdr);
 }
 
 static void exec_memo_end(ray_graph_t* g) {
