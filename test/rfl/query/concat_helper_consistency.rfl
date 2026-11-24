@@ -175,13 +175,12 @@ G -- 700
 (count (select {r: (concat (count s) 'zz) from: TC})) -- 2
 ;; a STR cell reduced from a STR column keeps STR output, ungrouped as grouped
 (at (select {r: (concat (first s) "zz") from: TS}) 'r) -- ["azz"]
-;; the cell flags cover every operand position, and a query concat joins up
-;; to 255 operands in one step: with 65 operands a null literal at position
-;; 64 still nulls the row (a 64-bit mask shifted by 64 is undefined; on x86
-;; it read position 0's flag), a cell at position 64 is still a cell (an
-;; empty cell is empty text, the rows where: keeps included), and a STR cell
-;; there still makes the result STR
-(at (select {r: (concat (first s) 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z ') from: TC}) 'r) -- [']
+;; every operand position is read, and a query concat joins up to 255
+;; operands in one step: with 65 operands a null literal at position 64 is
+;; empty text, as every null operand is (#1584), a cell at position 64 is
+;; still a cell (an empty cell is empty text, the rows where: keeps
+;; included), and a STR cell there still makes the result STR
+(at (select {r: (concat (first s) 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z ') from: TC}) 'r) -- [azzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz]
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: TC}) 'r) -- [zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzza]
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: (select {from: TC where: (== x 2)})}) 'r) -- [zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz]
 (at (select {r: (concat 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z 'z (first s)) from: TS}) 'r) -- ["zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzza"]

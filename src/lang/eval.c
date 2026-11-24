@@ -4061,8 +4061,7 @@ static ray_t* vm_call_binary_raw(ray_t* fn_obj, ray_t* left, ray_t* right,
          * collection semantics; a bound vector never has row provenance. */
         result = ray_concat_text_fn(left, right,
                                     (left->type == -RAY_STR && left_rows == 1) ||
-                                    (right->type == -RAY_STR && right_rows == 1),
-                                    (uint8_t)((left_rows == 1 ? 1 : 0) | (right_rows == 1 ? 2 : 0)));
+                                    (right->type == -RAY_STR && right_rows == 1));
         *out_rows = 1;
     /* Fast path: atoms have negative type — skip collection check entirely.
      * Only call is_collection when at least one arg has type >= 0 (vector/list). */
@@ -6383,8 +6382,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 if (scalar_ok && (ray_is_atom(left) || lr) && (ray_is_atom(right) || rr)) {
                     result = ray_concat_text_fn(left, right,
                                                 (left->type == -RAY_STR && lr) ||
-                                                (right->type == -RAY_STR && rr),
-                                                (uint8_t)((lr ? 1 : 0) | (rr ? 2 : 0)));
+                                                (right->type == -RAY_STR && rr));
                     rows = lr || rr;
                 } else {
                     result = fn(left, right);

@@ -43,16 +43,16 @@ Rayforce provides two distinct string column representations, each optimized for
 
 ## Null Propagation
 
-All string operations in Rayforce follow strict null propagation semantics:
+String operations in Rayforce follow these null semantics:
 
 - **Null input produces null output** — if any required input row is null, the output row is null
-- **CONCAT is null if any argument is null**
+- **`concat` is the exception: the null is empty text.** `""` (and the SYM null `'`) joins as no characters, wherever it comes from: a literal, a column's cell or an expression. `(concat "" "a")` is `"a"`, and in a query `(concat s "!")` over `["x" ""]` is `["x!" "!"]` and `(concat s "")` is `["x" ""]`. A row is `""` only when every operand is empty
 - Null propagation applies uniformly to both RAY_SYM and RAY_STR columns
 - Null state is carried through the execution pipeline per morsel (1024 elements)
 
 `""` is the STR/SYM null: `strlen` maps it to a null length, `sum` and `avg` skip it, and the `avg` of an all-empty group is null.
 
-In the C API DAG, null propagation is handled automatically per morsel. String transformation opcodes (STRLEN, UPPER/LOWER/TRIM, SUBSTR, REPLACE, CONCAT) propagate nulls: null input rows produce null output rows. CONCAT is null if any argument is null.
+In the C API DAG, null propagation is handled automatically per morsel. String transformation opcodes (STRLEN, UPPER/LOWER/TRIM, SUBSTR, REPLACE) propagate nulls: null input rows produce null output rows. CONCAT reads a null operand as empty text, as the `concat` builtin does.
 
 ## String Functions
 
@@ -63,9 +63,15 @@ Rayfall exposes the common string transforms as direct builtins. On vector input
 **`(concat a b)`** — binary
 
 Concatenates two string arguments. Works on string atoms and vectors element-wise.
+The STR null `""` is empty text here, not a null that nulls the result, the
+same in a direct call and on every query route (projection, `where:`, `by:`,
+`update`):
 
 ```lisp
-(concat "hello" " world")
+(concat "hello" " world")   ; "hello world"
+(concat "" "a")             ; "a"
+(concat ["x" ""] "!")       ; ["x!" "!"]
+(concat ["x" ""] "")        ; ["x" ""]
 ```
 
 ### like
