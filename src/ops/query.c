@@ -11154,6 +11154,7 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
  * apply, or the column is near-unique (a probe of the first rows, then a
  * cap of nrows/2 distinct on the way): the caller evaluates the key
  * row-wise as before. */
+#define DKS_PROBE_ROWS 65536
 typedef struct { uint64_t hash; int64_t id; } dks_slot_t;       /* id -1: empty */
 typedef struct {
     dks_slot_t* slots;
@@ -11434,16 +11435,20 @@ static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col
     str_resolve(C, &el, &pool);
     /* A selection of a quarter of the rows or less: the per-value path
      * wins whatever the distinct count (the row-wise key ran every string
-     * op over every row of the table, selected or not). */
+     * op over every row of the table, selected or not), so its tables may
+     * hold every selected value — once the probe below has excluded a large
+     * near-unique selection (its tables would hold 20M values for 20M
+     * selected rows).  A selection within the probe's size is evaluated per
+     * value whatever it holds: that many values cost nothing. */
     const bool sparse = sel_rows * 4 <= n;
 
     /* The first block decides cheaply: a distinct share above 3/4 over the
      * first 65536 selected rows is a near-unique column, for which the
      * per-value evaluation cannot win. */
-    if (!sparse) {
+    if (sel_rows > DKS_PROBE_ROWS) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
         dks_ctx_t pc = { .el = el, .pool = pool, .n = n, .tasks = 1, .tk = &pt };
-        const int64_t probe_rows = sel_rows < 65536 ? sel_rows : 65536;
+        const int64_t probe_rows = DKS_PROBE_ROWS;
         pt.du_cap = probe_rows * 3 / 4;
         if (!dks_grow(&pt)) return NULL;
         dk_sel_it_t it;

@@ -802,7 +802,11 @@ static test_result_t test_derived_key_per_str_value_route(void) {
         "(set v (% (* i 31) 977)) "
         "(set T (table [s v] (list s v))) "
         "(set T3 (take T 3000)) "
-        "(set TU (table [s v] (list (concat \"u\" (as 'STR i)) v)))";
+        "(set TU (table [s v] (list (concat \"u\" (as 'STR i)) v))) "
+        /* a near-unique column of 400000 rows: a where: keeping a fifth of
+         * them selects 80000 unique values, more than the probe reads */
+        "(set j (til 400000)) "
+        "(set TU2 (table [s v] (list (concat \"u\" (as 'STR j)) (% j 5))))";
     ray_t* r = ray_eval_str(setup);
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     const struct { const char* q; uint64_t evals; uint64_t indexed; } cases[] = {
@@ -810,10 +814,12 @@ static test_result_t test_derived_key_per_str_value_route(void) {
         { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 1 },
         { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1 },
         { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 1 },
-        /* a selection of a quarter of the rows or less: per value whatever
-         * the distinct share */
+        /* a selection within the probe's 65536 rows: per value whatever the
+         * distinct share (TU: ~4000 unique values); a sparse but large
+         * near-unique selection (TU2: 80000 unique values) keeps the row key */
         { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
         { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
+        { "(select {from: TU2 by: (upper (trim s)) c: (count v) where: (== v 0)})", 0, 1 },
         { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1 },
         { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1 },
         { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1 },
