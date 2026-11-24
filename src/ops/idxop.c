@@ -123,10 +123,27 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
         const void* own = (col && (col->attrs & RAY_ATTR_HAS_INDEX)) ? (const void*)col->index : NULL;
         const void* lazy = lazy_use_key(enc ? enc : col);
         const void* dir = enc ? (const void*)ray_enccol_of(enc) : NULL;   /* ray_idx_note_use_enc */
-        if (!own && !lazy && !dir) continue;
+        /* a parted column: the uses of its segments' own indexes (#1422) */
+        ray_t* pw = NULL;
+        if (col && RAY_IS_PARTED(col->type)) pw = col;
+        else if (enc && ray_enccol_of(enc)->kind != RAY_ENCCOL_SINGLE) pw = ray_enccol_of(enc)->wrapper;
+        if (!own && !lazy && !dir && !pw) continue;
         int64_t cnt = 0;
         for (uint32_t s = 0; s < ns; s++)
             if (snap[s].key == own || snap[s].key == lazy || snap[s].key == dir) cnt += (int64_t)snap[s].n;
+        if (pw) {
+            ray_t** segs = (ray_t**)ray_data(pw);
+            for (int64_t i = 0; i < pw->len; i++) {
+                ray_t* sg = segs[i];
+                if (!sg || RAY_IS_ERR(sg)) continue;
+                ray_t* sv = sg->type == RAY_ENCCOL ? ray_enccol_decoded_peek(sg) : sg;
+                const void* sown = (sv && (sv->attrs & RAY_ATTR_HAS_INDEX)) ? (const void*)sv->index : NULL;
+                const void* sdir = sg->type == RAY_ENCCOL ? (const void*)ray_enccol_of(sg) : NULL;
+                if (!sown && !sdir) continue;
+                for (uint32_t s = 0; s < ns; s++)
+                    if (snap[s].key == sown || snap[s].key == sdir) cnt += (int64_t)snap[s].n;
+            }
+        }
         if (cnt == 0) continue;
         int64_t name = ray_table_col_name(tbl, c);
         keys = ray_vec_append(keys, &name);
