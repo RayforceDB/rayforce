@@ -1,0 +1,85 @@
+;; A composite by: with a STR key — a by-dict's computed text key (an `if`
+;; with string-literal arms) or a STR column of an inner select — beside a
+;; count(distinct) output maps its rows to groups through the composite
+;; probe (rgid_build_multikey, STR keys by the hash of their bytes), not the
+;; eval-level grouping that boxed every cell of every row (~185 bytes a row:
+;; a 100M-row query ran out of pools).  Oracle: the same grouping over SYM
+;; copies of the keys (the int64 probe), and manual per-group counts.
+;; Rows: 70000, so the parallel probes run.
+(set N 70000)
+(set i (til N))
+(set hosts ["Example.COM" "news.Site.org" "Shop.Market.NET" "Blog.Daily.com"])
+(set U (as 'SYM (map (fn [k] (if (== 0 (% k 23)) "" (format (if (== 0 (% k 3)) "http://www.%/p/%" "https://www.%/p/%") (at hosts (% k 4)) (% k 997)))) i)))
+(set Rf (as 'SYM (map (fn [k] (if (< (% k 10) 3) "" (if (< (% k 10) 4) (format "ftp://x%" k) (format (if (== 0 (% k 5)) "http://ref%/" "https://ref%/") (% k 331))))) i)))
+(set IP (% (* 7919 i) 2003))
+(set Maj (+ 1 (% (* 31 i) 9)))
+(set Minor (as 'SYM (map (fn [k] (at (list "" (format "%.%" (% k 7) (% k 13)) (format "% %" (% k 5) (% k 11)) (format "tok%" (% k 17))) (% (div k 3) 4))) i)))
+(set T (table [URL Referer IPNetworkID UserAgentMajor UserAgentMinor] (list U Rf IP Maj Minor)))
+(set allocs (fn [] (at (.sys.mem) 'alloc-count)))
+(> (allocs) 0) -- true
+(set FP (fn [t] (ser (map (fn [c] (as 'STR (at t c))) (cols t)))))
+
+;; ── q044 shape: two computed STR keys, count and count distinct, sorted ──
+(set q44 (fn [t] (select {from: t by: {ref_scheme: (if (like Referer "https://*") "https" (like Referer "http://*") "http" (== Referer "") "none" "other") url_scheme: (if (like URL "https://*") "https" (like URL "http://*") "http" "other")} hits: (count IPNetworkID) nets: (count (distinct IPNetworkID)) desc: hits asc: [ref_scheme url_scheme]})))
+(set q44s (fn [t] (select {from: t by: {ref_scheme: (as 'SYM (if (like Referer "https://*") "https" (like Referer "http://*") "http" (== Referer "") "none" "other")) url_scheme: (as 'SYM (if (like URL "https://*") "https" (like URL "http://*") "http" "other"))} hits: (count IPNetworkID) nets: (count (distinct IPNetworkID)) desc: hits asc: [ref_scheme url_scheme]})))
+(set a0 (allocs))
+(set R44 (q44 T))
+(< (- (allocs) a0) 20000) -- true
+(type (at R44 'ref_scheme)) -- 'STR
+(type (at R44 'url_scheme)) -- 'STR
+(count R44) -- 12
+(all (== (FP R44) (FP (q44s T)))) -- true
+(sum (at R44 'hits)) -- 70000
+;; a group by hand
+(count (distinct (at (select {from: T where: (and (like Referer "https://*") (like URL "http://*"))}) 'IPNetworkID))) -- 2003
+(at (at (select {from: R44 where: (and (== ref_scheme "https") (== url_scheme "http"))}) 'nets) 0) -- 2003
+
+;; ── q088 shape: an int column beside a computed STR key, take with sort ──
+(set q88 (fn [t] (select {from: t by: {UserAgentMajor: UserAgentMajor minor_shape: (if (== UserAgentMinor "") "empty" (like UserAgentMinor "*.*") "dotted" (like UserAgentMinor "* *") "spaced" "token")} hits_total: (count UserAgentMajor) minor_variants: (count (distinct UserAgentMinor)) desc: hits_total asc: [UserAgentMajor minor_shape] take: 25})))
+(set q88s (fn [t] (select {from: t by: {UserAgentMajor: UserAgentMajor minor_shape: (as 'SYM (if (== UserAgentMinor "") "empty" (like UserAgentMinor "*.*") "dotted" (like UserAgentMinor "* *") "spaced" "token"))} hits_total: (count UserAgentMajor) minor_variants: (count (distinct UserAgentMinor)) desc: hits_total asc: [UserAgentMajor minor_shape] take: 25})))
+(set a0 (allocs))
+(set R88 (q88 T))
+(< (- (allocs) a0) 20000) -- true
+(count R88) -- 25
+(all (== (FP R88) (FP (q88s T)))) -- true
+(all (> (at R88 'minor_variants) 0)) -- true
+
+;; ── q034 shape: by: [STR int] names over an inner select ──
+(set q34 (fn [t] (select {from: (select {from: t lu: (lower URL) kind: (if (like lu "*/p/1*") "ones" (like lu "*/p/2*") "twos" (or (like lu "*/p/3*") (like lu "*/p/4*")) "few" "other") IsDownload: (% IPNetworkID 2) UserID: IPNetworkID where: (!= URL "")}) by: [kind IsDownload] c: (count UserID) users: (count (distinct UserID)) asc: [kind IsDownload]})))
+(set q34s (fn [t] (select {from: (select {from: t lu: (lower URL) kind: (as 'SYM (if (like lu "*/p/1*") "ones" (like lu "*/p/2*") "twos" (or (like lu "*/p/3*") (like lu "*/p/4*")) "few" "other")) IsDownload: (% IPNetworkID 2) UserID: IPNetworkID where: (!= URL "")}) by: [kind IsDownload] c: (count UserID) users: (count (distinct UserID)) asc: [kind IsDownload]})))
+(set a0 (allocs))
+(set R34 (q34 T))
+(< (- (allocs) a0) 20000) -- true
+(type (at R34 'kind)) -- 'STR
+(count R34) -- 8
+(all (== (FP R34) (FP (q34s T)))) -- true
+(sum (at R34 'c)) -- 66956
+
+;; ── q039 shape: STR key beside a computed int bucket ──
+(set q39 (fn [t] (select {from: (select {from: t lu: (lower URL) proto: (if (like lu "https://*") "https" (like lu "http://*") "http" "other") len_bucket: (if (>= (strlen URL) 40) 10 (div (strlen URL) 5)) UserID: IPNetworkID where: (!= URL "")}) by: [proto len_bucket] c: (count UserID) users: (count (distinct UserID)) asc: [proto len_bucket]})))
+(set q39s (fn [t] (select {from: (select {from: t lu: (lower URL) proto: (as 'SYM (if (like lu "https://*") "https" (like lu "http://*") "http" "other")) len_bucket: (if (>= (strlen URL) 40) 10 (div (strlen URL) 5)) UserID: IPNetworkID where: (!= URL "")}) by: [proto len_bucket] c: (count UserID) users: (count (distinct UserID)) asc: [proto len_bucket]})))
+(set a0 (allocs))
+(set R39 (q39 T))
+(< (- (allocs) a0) 20000) -- true
+(all (== (FP R39) (FP (q39s T)))) -- true
+(sum (at R39 'c)) -- 66956
+
+;; ── nulls in the keys: a STR key with nulls and an int key with nulls ──
+(set SK (as 'STR (map (fn [k] (at (list "a" "" "bb" "a") (% k 4))) i)))
+(set NK (map (fn [k] (if (== 0 (% k 5)) 0N (% k 3))) i))
+(set TN (table [sk nk v] (list SK NK IP)))
+(set Rn (select {from: TN by: [sk nk] c: (count v) d: (count (distinct v)) asc: [sk nk]}))
+(set Rns (select {from: (select {from: TN sk: (as 'SYM sk) nk: nk v: v}) by: [sk nk] c: (count v) d: (count (distinct v)) asc: [sk nk]}))
+(count Rn) -- 12
+(all (== (FP Rn) (FP Rns))) -- true
+(sum (at Rn 'c)) -- 70000
+;; an unsorted take picks the first groups seen
+(set Rt (select {from: TN by: [sk nk] c: (count v) d: (count (distinct v)) take: 3}))
+(count Rt) -- 3
+(set Rt2 (select {from: TN by: [sk nk] c: (count v) d: (count (distinct v))}))
+(all (== (FP Rt) (FP (take Rt2 3)))) -- true
+;; a where: beside the composite STR key
+(set Rw (select {from: TN by: [sk nk] c: (count v) d: (count (distinct v)) where: (> v 1000) asc: [sk nk]}))
+(set Rws (select {from: (select {from: TN sk: (as 'SYM sk) nk: nk v: v}) by: [sk nk] c: (count v) d: (count (distinct v)) where: (> v 1000) asc: [sk nk]}))
+(all (== (FP Rw) (FP Rws))) -- true
+(sum (at Rw 'c)) -- 35017
