@@ -219,8 +219,29 @@ static ray_t* minmax_pick(ray_t* a, ray_t* b, ray_t* cmp) {
     return out;
 }
 
-ray_t* ray_min2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_lte_fn(a, b)); }
-ray_t* ray_max2_fn(ray_t* a, ray_t* b) { return minmax_pick(a, b, ray_gte_fn(a, b)); }
+/* A TIMESPAN against a number, each an atom or a vector, is a TIMESPAN
+ * whichever wins, on every route: the number is read as nanoseconds first
+ * (ray_timespan_from_number) and the two durations compared, as the query
+ * kernels do (ray_timespan_binary). */
+static bool minmax_number_type(int8_t t) {
+    if (t < 0) t = (int8_t)-t;
+    return t >= RAY_BOOL && t <= RAY_F64;
+}
+
+bool ray_minmax_span_number(ray_t* a, ray_t* b) {
+    bool as = a->type == RAY_TIMESPAN || a->type == -RAY_TIMESPAN;
+    bool bs = b->type == RAY_TIMESPAN || b->type == -RAY_TIMESPAN;
+    return (as && minmax_number_type(b->type)) || (bs && minmax_number_type(a->type));
+}
+
+ray_t* ray_min2_fn(ray_t* a, ray_t* b) {
+    if (ray_minmax_span_number(a, b)) return ray_timespan_binary(OP_MIN2, a, b);
+    return minmax_pick(a, b, ray_lte_fn(a, b));
+}
+ray_t* ray_max2_fn(ray_t* a, ray_t* b) {
+    if (ray_minmax_span_number(a, b)) return ray_timespan_binary(OP_MAX2, a, b);
+    return minmax_pick(a, b, ray_gte_fn(a, b));
+}
 
 
 /* Use the language column accessor: stored PARTED and MAPCOMMON columns

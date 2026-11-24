@@ -470,6 +470,8 @@ static ray_t* minmax_map(ray_binary_fn f2, ray_t* a, ray_t* b) {
         return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
                          f2 == ray_min2_fn ? "min" : "max",
                          (long long)ray_len(a), (long long)ray_len(b));
+    /* a TIMESPAN against numbers: one vector kernel, one TIMESPAN result */
+    if (ray_minmax_span_number(a, b)) return f2(a, b);
     return list_collapse_uniform(atomic_map_binary(f2, a, b));
 }
 

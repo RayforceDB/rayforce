@@ -26,6 +26,8 @@ Atoms report the lowercase name (`'i32`), vectors and columns the uppercase one 
 - f32 stays f32 only beside another f32. f32 with any other type, an integer of any width included, is f64: `(+ (as 'F32 [1 2]) 1)` is an `F64` vector, so an integer operand is never rounded to f32 precision. f64 with anything is f64;
 - two b8 operands give i64 for `+ - * div %` (the cell above) and b8 for `min` and `max`; every other cell is the same for all seven verbs.
 
+`min` and `max` of a TIMESPAN and a number are a TIMESPAN, whichever wins: the number counts nanoseconds (see the [timespan guide](../guides/timespan.md#min-and-max-with-a-number)).
+
 Two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and both vector and indexed reads report it as null even if neither input contains a null (see the [types guide](../guides/types.md#implicit-coercion)).
 
 Because `update` keeps a column's type, the f64 that f32 with an integer gives does not go back into an f32 column: `(update {f: (+ f 1) from: t})` over an `F32` column `f` is a `type` error. Add an f32 literal, `(+ f 1e)`, or cast the result with `as 'F32` (see [Column types](../queries/select.md#column-types)).

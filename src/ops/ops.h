@@ -71,6 +71,11 @@ static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
 int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
 ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
+/* A non-null numeric atom as a TIMESPAN: its value is a count of
+ * nanoseconds.  A float rounds half away from zero, NaN is the null and a
+ * value beyond the I64 lane (an infinity included) saturates to 0Wn or
+ * -0Wn; a boolean counts 0 or 1. */
+int64_t ray_timespan_from_number(ray_t* x);
 
 /* ===== Cancel API ===== */
 
