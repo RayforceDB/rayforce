@@ -422,6 +422,10 @@ Sum of all elements.
 (sum [1 2 3 4])  ; 10
 ```
 
+In a query, the sum of a column plus a constant may be computed from the
+column's total; see [A column plus a constant in a query](#affine-sum-avg)
+for how an F64 answer can differ from the row-by-row one.
+
 ### `(prod x)` — aggregate
 
 Product of all non-null numeric elements.
@@ -471,6 +475,73 @@ A TIMESPAN vector is also accepted by `sums`, `mins`, `maxs`, `msum`, `mmin`,
 ```lisp
 (avg [2 4 6])  ; 4.0
 ```
+
+#### A column plus a constant in a query { #affine-sum-avg }
+
+In a `select` or `update`, `sum` and `avg` of a column plus or minus a
+constant, `(+ x c)`, `(+ c x)` or `(- x c)`, may be computed from the
+column's own total: the query sums `x` once and adds `n * c` (or, for
+`avg`, `c`) at the end, without forming the `n` rows of `x + c`. The answer
+can differ from summing the rows `x + c` one by one.
+
+For an I64 or other integer column with an integer constant the result is
+exact: the total of `x` and the term `n * c` are added in 128 bits and
+divided once, so the query answers what `sum` and `avg` answer over the
+materialized rows, on every route (with `where:`, beside other aggregates,
+grouped, and on parted tables).
+
+For an F64 column the result is not bit-identical to the row-by-row one.
+Each row `x + c` rounds on its own and the query skips that rounding; the
+two routes also add in different orders, and `avg` divides at a different
+point. Two rows show it:
+
+```lisp
+(set t (table [x] (list [9007199254740992.0 -9007199254740992.0])))
+(select {from: t s: (sum (+ x 1.0)) a: (avg (+ x 1.0))})
+; s 2.0, a 1.0: (2^53 + 1) + (-2^53 + 1) without row rounding
+(sum (do (+ (at t 'x) 1.0)))
+; 1.0: the row 2^53 + 1 rounds to 2^53 first
+```
+
+The bound below holds under two conditions: the rows counted are the `n`
+non-null values of `x` (null rows are skipped by both routes), and no
+intermediate overflows, that is, every row `x + c`, the product `n * c`, and
+every partial total that either route forms in its order of addition stays
+finite. A sufficient check for the second condition is
+`sum |x| + n * |c| <= 2^1023` (about `8.99e307`). With `T = sum |x| + n * |c|`:
+
+- the two sums differ by at most `(n + 1) * 2^-51 * T`;
+- the two averages differ by at most `(n + 1) * 2^-51 * T / n + 2^-1074`.
+
+The sum bound holds for subnormal values as well, because an F64 addition
+whose result is subnormal is exact. Each route's division by `n` can
+underflow, though, and an underflowing division loses up to half of the
+smallest subnormal `2^-1074`, which a relative bound does not cover; the
+term `2^-1074` in the average bound accounts for those two divisions. Two
+subnormal rows show it:
+
+```lisp
+(set t (table [x] (list [5e-324 0.0])))
+(select {from: t a: (avg (+ x 5e-324))})
+; 5e-324 (2^-1074): the mean of x, 2^-1075, rounds to 0.0 before c is added
+(avg (do (+ (at t 'x) 5e-324)))
+; 1e-323 (2 * 2^-1074): the rows sum exactly to 3 * 2^-1074, and half
+; of that rounds to 2 * 2^-1074
+```
+
+When an intermediate overflows, no bound is guaranteed. An overflowing F64
+total is `0Nf`, and each route answers `0Nf` or a finite value depending on
+whether one of its own partial totals overflowed, which depends on the
+values, the constant and the order of the additions; how far the exact
+total lies from the F64 limit does not decide it. With rows
+`1.7976931348623157e308`, `2^970` and `-1.7976931348623157e308` and
+`c = -2^969`, the exact total is `-2^969`: in the query's column total
+`1.7976931348623157e308 + 2^970` overflows and the query answers `0Nf`, while the rows `x + c`
+cancel and sum to `0.0`.
+
+The query computes from the column total only while `|c|` is below
+`2^970`; a larger constant is added row by row, so the answer is the
+row-by-row one, and `(sum (+ x -1e308))` over rows `1e308` is `0.0`.
 
 ### `(min x)` — aggregate
 
