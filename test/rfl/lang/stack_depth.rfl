@@ -1,0 +1,13 @@
+;; a compiled body that recurses through a builtin calling it back (map
+;; here) re-enters the bytecode VM on the C stack at every level, which no
+;; level count covers: it stops at the thread's stack reserve with the clean
+;; limit error rather than overflowing the stack (#1590). an optimized build
+;; crashed at 5000 levels on the 8 MB main stack.
+(set fD (fn [n] (if (== n 0) 0 (+ 1 (first (map (fn [i] (fD (- n 1))) [0]))))))
+(fD 50) -- 50
+(fD 100000) !- limit
+;; the same body is usable again after the error
+(fD 60) -- 60
+;; direct recursion stays on the VM's own stack and its own limit
+(set gD (fn [n] (if (== n 0) 0 (+ 1 (gD (- n 1))))))
+(gD 100000) !- limit

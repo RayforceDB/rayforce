@@ -1,0 +1,36 @@
+;; Lone keyless affine I64 SUM / AVG above the 64K-row slice: each slice is
+;; first bounded from its rows' high 32 bits, and only a slice whose bounds
+;; can hold a null-making input is compared row by row.  Rows near a hit
+;; (inside the bounds' 2^32 slack) and real hits must both match the
+;; materialized rows, in any slice.
+(set n 300003)
+(set M 9223372036854775807)
+(set H 4611686018427387904)
+(set chk (fn [v] (and (== (first (at (select {s: (sum (+ v 1)) from: (table [v] (list v))}) 's)) (sum (+ v 1))) (== (first (at (select {s: (sum (- 1 v)) from: (table [v] (list v))}) 's)) (sum (- 1 v))) (== (first (at (select {s: (sum (* v 2)) from: (table [v] (list v))}) 's)) (sum (* v 2))) (== (first (at (select {s: (sum (* v -6)) from: (table [v] (list v))}) 's)) (sum (* v -6))) (== (first (at (select {s: (sum (+ (* v 3) 7)) from: (table [v] (list v))}) 's)) (sum (+ (* v 3) 7))) (== (first (at (select {s: (sum (+ (* v 2) 2)) from: (table [v] (list v))}) 's)) (sum (+ (* v 2) 2))) (== (first (at (select {s: (avg (+ v 1)) from: (table [v] (list v))}) 's)) (avg (+ v 1))) (== (first (at (select {s: (avg (+ v -2)) from: (table [v] (list v))}) 's)) (avg (+ v -2))) (== (first (at (select {s: (avg (* v 2)) from: (table [v] (list v))}) 's)) (avg (* v 2))))))
+(set near (fn [base] (+ base (% (* (til n) 7919) 1000))))
+;; no hit: small values, epoch values, full-range values
+(chk (- (til n) 150000)) -- true
+(chk (+ (til n) 1700000000000000000)) -- true
+(chk (* (til n) 6364136223846793005)) -- true
+;; within 2^32 of MAX, of 2^62 and of -2^62, no row a hit
+(chk (near (- M 4000000000))) -- true
+(chk (near (- H 500))) -- true
+(chk (near (- (- 0 H) 500))) -- true
+;; hits in the last slice only, after hit-free slices close to them
+(chk (concat (til 150000) (concat (near (- H 4000000000)) [4611686018427387904 5]))) -- true
+(chk (concat (til 200000) (concat (- M (til 100000)) [9223372036854775807 1 2]))) -- true
+;; hits in a middle slice, at both multiply residues and at -MAX
+(chk (concat (- 0 (til 150000)) (concat [4611686018427387904 -4611686018427387904 9223372036854775806 -9223372036854775807] (til 149999)))) -- true
+;; every slice near the limits
+(chk (take [9223372036854775807 9223372036854775806 10 9223372036854775806 -50000] n)) -- true
+(chk (take [-9223372036854775807 -9223372036854775806 7 -11] n)) -- true
+;; AVG with a multiplier past 65536: the exact scan from the start
+(set u (% (til n) 1000))
+(set U (table [u] (list u)))
+(== (first (at (select {s: (avg (* u 1000000)) from: U}) 's)) (avg (* u 1000000))) -- true
+(== (first (at (select {s: (avg (+ (* u 100000000) 1000000000000000)) from: U}) 's)) (avg (+ (* u 100000000) 1000000000000000))) -- true
+;; rows across a 2^32 boundary: high-word bounds too wide to lift, rescanned exactly
+(set u (+ 4294967296 (- (% (* (til n) 7919) 2001) 1000)))
+(set U (table [u] (list u)))
+(== (first (at (select {s: (avg (* u 1000)) from: U}) 's)) (avg (* u 1000))) -- true
+(== (first (at (select {s: (avg (+ u 7)) from: U}) 's)) (avg (+ u 7))) -- true

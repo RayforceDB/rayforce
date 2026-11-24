@@ -1,0 +1,80 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1604: a where: comparing a timestamp column skips the partitions its
+;; statistics rule out beside these row-local spellings too, which carry no
+;; ATOMIC flag: like with a constant pattern, nil?, a not over in or nil?,
+;; (quote x), and a cast of literals (as 'GUID "…").  Each answers a value
+;; per row, so the stand-in row a skipped partition leaves fails the where
+;; by the timestamp comparison, and the answer is the one without pruning.
+;;
+;; A skip is made visible without a clock: two date partitions of 70 000
+;; uncompressed rows (enough for the ts column to carry statistics), and
+;; the second partition's ts values copied over the first partition's ts
+;; data in place, keeping its header and statistics.  A select that skips
+;; the first partition by its statistics counts the second's rows alone; one
+;; that reads it counts them twice.  A second, untouched root checks every
+;; answer against the same select with pruning off: the where written as
+;; (or false p p), which narrows no partition.
+
+(set R (format "/tmp/rfl_part_rowlocal_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %/stale %/clean" R R R)) -- 0
+(set n 70000)
+(set G (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000002" "0a5c0a5c-0000-4000-8000-000000000003")))
+(set mk (fn [d] (table [ts s t g v] (list (+ d (* 1000000 (til n))) (at ['x 'y 'z] (% (til n) 3)) (at (as 'STR (list "ab" "cd" "ef")) (% (til n) 3)) (at G (% (til n) 3)) (at [1 0Nl 3 4 5] (% (til n) 5))))))
+(.db.splayed.set (format "%/stale/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/stale/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.sys.exec (format "dd if=%/stale/2026.01.06/t/ts of=%/stale/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null" R R)) -- 0
+(set P (.db.parted.get (format "%/stale/" R) 't))
+(set C (.db.parted.get (format "%/clean/" R) 't))
+
+;; the control: the comparison alone skips the first partition
+(at (select {c: (count v) from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c) -- [70000]
+
+;; like with a constant pattern, in where: and in a column
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (like t "a*"))}) 'c) -- [23334]
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (like t "a*")})) -- 70000
+(set pat "c*")
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (like t pat))}) 'c) -- [23333]
+;; a cast of literals: ==, !=, in (an atom or a list) and an or of ==
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")))}) 'c) -- [23334]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (!= g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")))}) 'c) -- [46666]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000003"))))}) 'c) -- [46667]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (or (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002"))))}) 'c) -- [46667]
+;; a not over in or nil?, and nil? alone
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (not (in s ['y])))}) 'c) -- [46667]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v)))}) 'c) -- [56000]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (nil? v))}) 'c) -- [14000]
+(at (select {c: (count ts) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (nil? v))}) 'c) -- [14000]
+;; (quote x), the spelling for a symbol named like a column: in where: and in a column
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== s (quote x)))}) 'c) -- [23334]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== s (quote v)))}) 'c) -- [0]
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (== s (quote x))})) -- 70000
+
+;; still read whole: a cast of a column, and a not over an in whose set is
+;; not a constant
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== (as 'SYM t) 'ab))}) 'c) -- [46668]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (not (in s (distinct s))))}) 'c) -- [0]
+
+;; every answer equals the one without pruning, on the untouched root: the
+;; where written (or false p p), which narrows no partition
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (like t "a*"))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (like t "a*")) (and (>= ts 2026.01.06D00:00:00.000) (like t "a*")))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (like t pat))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (like t pat)) (and (>= ts 2026.01.06D00:00:00.000) (like t pat)))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (like s "x*"))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (like s "x*")) (and (>= ts 2026.01.06D00:00:00.000) (like s "x*")))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001"))) (and (>= ts 2026.01.06D00:00:00.000) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001"))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (!= g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002")))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (!= g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002"))) (and (>= ts 2026.01.06D00:00:00.000) (!= g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002"))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000003"))))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000003")))) (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID (list "0a5c0a5c-0000-4000-8000-000000000001" "0a5c0a5c-0000-4000-8000-000000000003")))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000003")))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000003"))) (and (>= ts 2026.01.06D00:00:00.000) (in g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000003"))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (or (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002"))))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (or (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002")))) (and (>= ts 2026.01.06D00:00:00.000) (or (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000001")) (== g (as 'GUID "0a5c0a5c-0000-4000-8000-000000000002")))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (not (in s ['y])))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (not (in s ['y]))) (and (>= ts 2026.01.06D00:00:00.000) (not (in s ['y]))))})
+(select {c: (count ts) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v)))}) -- (select {c: (count ts) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v))) (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v))))})
+(select {c: (count ts) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (nil? v))}) -- (select {c: (count ts) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (nil? v)) (and (>= ts 2026.01.06D00:00:00.000) (nil? v)))})
+(select {c: (sum v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (not (nil? t)))}) -- (select {c: (sum v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (not (nil? t))) (and (>= ts 2026.01.06D00:00:00.000) (not (nil? t))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== s (quote x)))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== s (quote x))) (and (>= ts 2026.01.06D00:00:00.000) (== s (quote x))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== s (quote v)))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== s (quote v))) (and (>= ts 2026.01.06D00:00:00.000) (== s (quote v))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (not (in v [1 3])))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (not (in v [1 3]))) (and (>= ts 2026.01.06D00:00:00.000) (not (in v [1 3]))))})
+(select {k: (like t "a*") n: (nil? v) q: (== s (quote z)) v: v from: C where: (and (>= ts 2026.01.06D00:00:00.000) (< v 5))}) -- (select {k: (like t "a*") n: (nil? v) q: (== s (quote z)) v: v from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (< v 5)) (and (>= ts 2026.01.06D00:00:00.000) (< v 5)))})
+(select {by: s c: (count v) m: (max v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v)))}) -- (select {by: s c: (count v) m: (max v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v))) (and (>= ts 2026.01.06D00:00:00.000) (not (nil? v))))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== (as 'SYM t) 'ab))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== (as 'SYM t) 'ab)) (and (>= ts 2026.01.06D00:00:00.000) (== (as 'SYM t) 'ab)))})
+
+(.sys.exec (format "rm -rf %" R)) -- 0

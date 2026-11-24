@@ -93,13 +93,13 @@ void ray_enc_snap_set(ray_enc_snap_t* s, const char* code, const char* fmt, ...)
     s->is_transient = ray_enc_code_transient(s->code);
 }
 
-/* Must run on the thread that created `err`: the message is that thread's
- * thread-local ray_last_err_msg (src/core/runtime.c). */
+/* The snapshot takes `err`'s own message (ray_err_msg), so it may run on any
+ * thread. */
 void ray_enc_snap_take(ray_enc_snap_t* s, ray_t* err) {
     memset(s, 0, sizeof *s);
     const char* code = (err && RAY_IS_ERR(err)) ? ray_err_code(err) : "error";
     snprintf(s->code, sizeof s->code, "%s", code ? code : "error");
-    const char* m = ray_error_msg();
+    const char* m = ray_err_msg(err);
     if (m) snprintf(s->msg, sizeof s->msg, "%s", m);
     s->is_transient = ray_enc_code_transient(s->code);
     ray_error_free(err);    /* a no-op on the static OOM sentinel */

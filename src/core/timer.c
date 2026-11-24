@@ -57,6 +57,21 @@ int64_t ray_time_now_ms(void) {
 #endif
 }
 
+int64_t ray_time_now_ns(void) {
+#if defined(RAY_OS_WINDOWS)
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    int64_t sec = cnt.QuadPart / freq.QuadPart;
+    int64_t rem = cnt.QuadPart % freq.QuadPart;
+    return sec * 1000000000LL + (rem * 1000000000LL) / freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
 ray_timers_t* ray_timers_create(int64_t initial_cap) {
     if (initial_cap < 1) initial_cap = 1;
     ray_timers_t* t = (ray_timers_t*)ray_sys_alloc(sizeof(ray_timers_t));
@@ -221,7 +236,7 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
                 char code[8] = {0};
                 char raised[512];
                 memcpy(code, result->sdata, result->slen < 7 ? result->slen : 7);
-                const char* detail = ray_error_msg();
+                const char* detail = ray_err_msg(result);
                 if (!detail && ray_raise_render(raised, sizeof raised)) detail = raised;
                 fprintf(stderr, "timer %lld: error: %s%s%s\n",
                         (long long)timer->id, code,

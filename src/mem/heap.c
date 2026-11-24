@@ -4621,58 +4621,88 @@ static bool ptrset_add(ptrset_t* s, const ray_t* p) {
     return true;
 }
 
-static size_t retained_walk(const ray_t* v, ptrset_t* seen) {
-    if (!v || RAY_IS_ERR(v)) return 0;
-    if (!ptrset_add(seen, v)) return 0;
-    size_t n = block_own_bytes(v);
+/* The values still to visit: a sum does not depend on the order, so the
+ * walk keeps them on a stack of its own instead of recursing per level (a
+ * value can be nested arbitrarily deep at run time, #1591).  Over
+ * ray_sys_alloc, as the set; a push that cannot grow skips that child,
+ * the walk then under-counts rather than fails. */
+typedef struct { const ray_t** v; size_t n, cap; const ray_t* local[64]; } rwstack_t;
+static void rw_push(rwstack_t* st, const ray_t* x) {
+    if (!x || RAY_IS_ERR(x)) return;
+    if (st->n == st->cap) {
+        size_t ncap = st->cap * 2;
+        const ray_t** g = (const ray_t**)ray_sys_alloc(ncap * sizeof *g);
+        if (!g) return;
+        memcpy(g, st->v, st->n * sizeof *g);
+        if (st->v != st->local) ray_sys_free((void*)st->v);
+        st->v = g;
+        st->cap = ncap;
+    }
+    st->v[st->n++] = x;
+}
 
-    if (ray_is_atom(v)) {
-        if (v->type == RAY_LAMBDA) {
-            ray_t*  lam   = (ray_t*)v;
-            ray_t** slots = (ray_t**)ray_data(lam);
-            for (int i = 0; i < 4; i++) n += retained_walk(slots[i], seen);
-            n += retained_walk(LAMBDA_NFO(lam), seen);
-            n += retained_walk(LAMBDA_DBG(lam), seen);
-            n += retained_walk(LAMBDA_CLOSURE(lam), seen);
-            n += retained_walk(LAMBDA_CAPROWS(lam), seen);
-            return n;
+static size_t retained_walk(const ray_t* root, ptrset_t* seen) {
+    rwstack_t st;
+    st.v = st.local; st.n = 0; st.cap = sizeof st.local / sizeof st.local[0];
+    size_t n = 0;
+    rw_push(&st, root);
+    while (st.n > 0) {
+        const ray_t* v = st.v[--st.n];
+        if (!ptrset_add(seen, v)) continue;
+        size_t own = block_own_bytes(v);
+
+        if (ray_is_atom(v)) {
+            n += own;
+            if (v->type == RAY_LAMBDA) {
+                ray_t*  lam   = (ray_t*)v;
+                ray_t** slots = (ray_t**)ray_data(lam);
+                for (int i = 0; i < 4; i++) rw_push(&st, slots[i]);
+                rw_push(&st, LAMBDA_NFO(lam));
+                rw_push(&st, LAMBDA_DBG(lam));
+                rw_push(&st, LAMBDA_CLOSURE(lam));
+                rw_push(&st, LAMBDA_CAPROWS(lam));
+                continue;
+            }
+            if (ray_atom_owns_obj(v)) rw_push(&st, v->obj);
+            continue;
         }
-        if (ray_atom_owns_obj(v)) n += retained_walk(v->obj, seen);
-        return n;
+        if (v->attrs & RAY_ATTR_SLICE) { n += own; rw_push(&st, v->slice_parent); continue; }
+        if (v->type == RAY_INDEX) {
+            ray_index_t* ix = ray_index_payload((ray_t*)v);
+            if (v->mmod == 1 || (ix->markers & RAY_MARK_MMAP)) continue;   /* a mapped index: none of it */
+            n += own;
+            ray_t* kids[4];
+            int k = ray_index_child_blocks(ix, kids, 4);
+            for (int i = 0; i < k; i++) rw_push(&st, kids[i]);
+            continue;
+        }
+        n += own;
+        if (v->type == RAY_ENCCOL) {
+            ray_t* kids[2];
+            int nk = ray_enccol_children((ray_t*)v, kids);
+            for (int i = 0; i < nk; i++) rw_push(&st, kids[i]);
+            continue;
+        }
+        if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index) &&
+            v->index->mmod != 1)
+            rw_push(&st, v->index);
+        if (v->type == RAY_STR) {
+            if (v->str_pool && !RAY_IS_ERR(v->str_pool)) rw_push(&st, v->str_pool);
+            continue;
+        }
+        if (v->type == RAY_SYM) continue;   /* the domain is not a ray_t */
+        if (RAY_IS_PARTED(v->type) || v->type == RAY_LIST) {
+            ray_t** ptrs = (ray_t**)ray_data((ray_t*)v);
+            for (int64_t i = 0; i < v->len; i++) rw_push(&st, ptrs[i]);
+            continue;
+        }
+        if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
+            ray_t** slots = (ray_t**)ray_data((ray_t*)v);
+            rw_push(&st, slots[0]);
+            rw_push(&st, slots[1]);   /* plain-table */
+        }
     }
-    if (v->attrs & RAY_ATTR_SLICE) return n + retained_walk(v->slice_parent, seen);
-    if (v->type == RAY_INDEX) {
-        ray_index_t* ix = ray_index_payload((ray_t*)v);
-        if (v->mmod == 1 || (ix->markers & RAY_MARK_MMAP)) return 0;
-        ray_t* kids[4];
-        int k = ray_index_child_blocks(ix, kids, 4);
-        for (int i = 0; i < k; i++) n += retained_walk(kids[i], seen);
-        return n;
-    }
-    if (v->type == RAY_ENCCOL) {
-        ray_t* kids[2];
-        int nk = ray_enccol_children((ray_t*)v, kids);
-        for (int i = 0; i < nk; i++) n += retained_walk(kids[i], seen);
-        return n;
-    }
-    if ((v->attrs & RAY_ATTR_HAS_INDEX) && v->index && !RAY_IS_ERR(v->index) &&
-        v->index->mmod != 1)
-        n += retained_walk(v->index, seen);
-    if (v->type == RAY_STR) {
-        if (v->str_pool && !RAY_IS_ERR(v->str_pool)) n += retained_walk(v->str_pool, seen);
-        return n;
-    }
-    if (v->type == RAY_SYM) return n;   /* the domain is not a ray_t */
-    if (RAY_IS_PARTED(v->type) || v->type == RAY_LIST) {
-        ray_t** ptrs = (ray_t**)ray_data((ray_t*)v);
-        for (int64_t i = 0; i < v->len; i++) n += retained_walk(ptrs[i], seen);
-        return n;
-    }
-    if (v->type == RAY_MAPCOMMON || v->type == RAY_TABLE || v->type == RAY_DICT) {
-        ray_t** slots = (ray_t**)ray_data((ray_t*)v);
-        n += retained_walk(slots[0], seen);
-        n += retained_walk(slots[1], seen);   /* plain-table */
-    }
+    if (st.v != st.local) ray_sys_free((void*)st.v);
     return n;
 }
 

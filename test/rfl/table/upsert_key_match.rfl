@@ -1,0 +1,215 @@
+;; upsert key matching (#1152): one rule for every key type, in memory and
+;; splayed, single and compound keys.
+;;
+;; 1. A null key matches an existing null-keyed row.  DATE, TIME, F32 and F64
+;;    null keys never matched and appended a row per upsert, while I16, I32,
+;;    I64, TIMESTAMP, TIMESPAN, GUID and STR nulls matched.  A null of another
+;;    type is the key column's null too.  For F32 / F64 only the null matches
+;;    the null: ordinary values still compare by value.
+;; 2. A key value the key column cannot hold (65537 against I16, 257 against
+;;    U8) is a domain error.  It missed on the widened compare, was narrowed
+;;    on append, and left two rows with one key.  A batch with one bad key
+;;    changes nothing.
+(.sys.exec "rm -rf /tmp/rfl_ups_keymatch/") -- 0
+
+;; ─── null keys, in memory: in place (keyed map), by value (scan) ─────────
+(set t (table [k v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list 0Nd 9)) -- 't
+(count t) -- 2
+(at t 'v) -- [1 9]
+(count (upsert t 1 (list 0Nd 7))) -- 2
+(at (upsert t 1 (list 0Nd 7)) 'v) -- [1 7]
+
+(set t (table [k v] (list (as 'TIME [10:00:00.000 0Nt]) [1 2])))
+(upsert 't 1 (list 0Nt 9)) -- 't
+(at t 'v) -- [1 9]
+(at (upsert t 1 (list 0Nt 7)) 'v) -- [1 7]
+
+(set t (table [k v] (list [1.5 0Nf] [1 2])))
+(upsert 't 1 (list 0Nf 9)) -- 't
+(at t 'v) -- [1 9]
+(at (upsert t 1 (list 0Nf 7)) 'v) -- [1 7]
+
+(set t (table [k v] (list (as 'F32 [1.5 0Ne]) [1 2])))
+(upsert 't 1 (list 0Ne 9)) -- 't
+(at t 'v) -- [1 9]
+(at (upsert t 1 (list 0Ne 7)) 'v) -- [1 7]
+
+;; the types that already matched keep matching
+(set t (table [k v] (list (as 'I16 [1 0Nh]) [1 2])))
+(upsert 't 1 (list 0Nh 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (as 'I32 [1 0Ni]) [1 2])))
+(upsert 't 1 (list 0Ni 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list [1 0Nl] [1 2])))
+(upsert 't 1 (list 0Nl 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (as 'TIMESTAMP [2024.01.01D00:00:00.000000000 0Np]) [1 2])))
+(upsert 't 1 (list 0Np 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (as 'TIMESPAN [1 0Nl]) [1 2])))
+(upsert 't 1 (list 0Nn 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (list "a" "") [1 2])))
+(upsert 't 1 (list "" 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (concat (guid 1) 0Ng) [1 2])))
+(upsert 't 1 (list 0Ng 9)) -- 't
+(at t 'v) -- [1 9]
+
+;; a null of another type is the key column's null
+(set t (table [k v] (list [1 0Nl] [1 2])))
+(upsert 't 1 (list 0Nh 8)) -- 't
+(upsert 't 1 (list 0Ni 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list 0Nl 9)) -- 't
+(at t 'v) -- [1 9]
+(set t (table [k v] (list [1.5 0Nf] [1 2])))
+(upsert 't 1 (list 0Nl 9)) -- 't
+(at t 'v) -- [1 9]
+
+;; BOOL and U8 are not nullable: a null lands as 0, so it matches the 0 row
+(set t (table [k v] (list (as 'U8 [0 2]) [1 2])))
+(upsert 't 1 (list 0Nl 9)) -- 't
+(count t) -- 2
+(at t 'v) -- [9 2]
+
+;; a null key against a table without one appends once, then matches
+(set t (table [k v] (list (as 'DATE [2024.01.01]) [1])))
+(upsert 't 1 (list 0Nd 2)) -- 't
+(upsert 't 1 (list 0Nd 3)) -- 't
+(count t) -- 2
+(at t 'v) -- [1 3]
+
+;; floats: ordinary values still compare by value
+(set t (table [k v] (list [1.5 2.5] [1 2])))
+(upsert 't 1 (list 2.5 9)) -- 't
+(upsert 't 1 (list 3.5 7)) -- 't
+(at t 'v) -- [1 9 7]
+
+;; batches: a typed key vector (column-wise path) and a boxed one, with a
+;; null repeated inside the batch landing once
+(set t (table [k v] (list [1.5 0Nf] [1 2])))
+(upsert 't 1 (list [0Nf 3.5 0Nf] [7 8 9])) -- 't
+(at t 'v) -- [1 9 8]
+(set t (table [k v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list (as 'DATE [0Nd 2024.01.02 0Nd]) [7 8 9])) -- 't
+(at t 'v) -- [1 9 8]
+(set t (table [k v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list (list 0Nd 2024.01.02 0Nd) [7 8 9])) -- 't
+(at t 'v) -- [1 9 8]
+(set t (table [k v] (list (as 'F32 [1.5 0Ne]) [1 2])))
+(upsert 't 1 (list (as 'F32 [0Ne 3.5 0Ne]) [7 8 9])) -- 't
+(at t 'v) -- [1 9 8]
+
+;; compound keys
+(set t (table [a b v] (list [1 2] (as 'DATE [0Nd 2024.01.01]) [1 2])))
+(upsert 't 2 (list 1 0Nd 9)) -- 't
+(upsert 't 2 (list 2 0Nd 8)) -- 't
+(count t) -- 3
+(at t 'v) -- [9 2 8]
+(set t (table [a b v] (list [1.5 0Nf] (as 'TIME [0Nt 10:00:00.000]) [1 2])))
+(upsert 't 2 (list 1.5 0Nt 9)) -- 't
+(upsert 't 2 (list 0Nf 10:00:00.000 8)) -- 't
+(count t) -- 2
+(at t 'v) -- [9 8]
+
+;; ─── null keys, splayed (the match scan) ─────────────────────────────────
+(set t (table [k v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/date/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/date/"))
+(upsert 's 1 (list 0Nd 9)) -- 's
+(count s) -- 2
+(at s 'v) -- [1 9]
+
+(set t (table [k v] (list (as 'TIME [10:00:00.000 0Nt]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/time/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/time/"))
+(upsert 's 1 (list 0Nt 9)) -- 's
+(at s 'v) -- [1 9]
+
+(set t (table [k v] (list [1.5 0Nf] [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/f64/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/f64/"))
+(upsert 's 1 (list 0Nf 9)) -- 's
+(at s 'v) -- [1 9]
+
+(set t (table [k v] (list (as 'F32 [1.5 0Ne]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/f32/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/f32/"))
+(upsert 's 1 (list 0Ne 9)) -- 's
+(at s 'v) -- [1 9]
+
+(set t (table [k v] (list (as 'I16 [1 0Nh]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/i16/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/i16/"))
+(upsert 's 1 (list 0Nh 9)) -- 's
+(at s 'v) -- [1 9]
+
+;; an F32 key atom against an F64 key compares by value
+(set t (table [k v] (list [1.5 2.5] [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/f64v/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/f64v/"))
+(upsert 's 1 (list 1.5e 9)) -- 's
+(count s) -- 2
+(at s 'v) -- [9 2]
+
+(set t (table [a b v] (list [1 2] (as 'DATE [0Nd 2024.01.01]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/cmp/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/cmp/"))
+(upsert 's 2 (list 1 0Nd 9)) -- 's
+(count s) -- 2
+(at s 'v) -- [9 2]
+
+;; ─── out-of-range keys: a domain error, nothing changed ──────────────────
+(set t (table [k v] (list (as 'I16 [1 2]) [1 2])))
+(upsert 't 1 (list 65537 9)) !- domain
+(upsert 't 1 (list -32768 9)) !- domain
+(upsert t 1 (list 65537 9)) !- domain
+(upsert 't 1 (list [3 65537] [8 9])) !- domain
+(upsert 't 1 (list (list 3 65537) [8 9])) !- domain
+(upsert 't 'k (table [k v] (list [3 65537] [8 9]))) !- domain
+(count t) -- 2
+(at t 'k) -- (as 'I16 [1 2])
+(upsert 't 1 (list 32767 9)) -- 't
+(upsert 't 1 (list -32767 8)) -- 't
+(count t) -- 4
+
+(set t (table [k v] (list (as 'U8 [1 2]) [1 2])))
+(upsert 't 1 (list 257 9)) !- domain
+(upsert 't 1 (list -1 9)) !- domain
+(upsert 't 1 (list [3 257] [8 9])) !- domain
+(count t) -- 2
+(upsert 't 1 (list 255 9)) -- 't
+(count t) -- 3
+
+(set t (table [k v] (list (as 'I32 [1 2]) [1 2])))
+(upsert 't 1 (list 4294967297 9)) !- domain
+(upsert 't 1 (list -2147483648 9)) !- domain
+(upsert 't 1 (list [3 4294967297] [8 9])) !- domain
+(count t) -- 2
+
+;; compound key: the narrow component is checked too
+(set t (table [a b v] (list [1 2] (as 'I16 [1 2]) [1 2])))
+(upsert 't 2 (list 1 65537 9)) !- domain
+(upsert 't 2 (list [1 3] [1 65537] [8 9])) !- domain
+(count t) -- 2
+(at t 'v) -- [1 2]
+
+;; splayed (the match scan)
+(set t (table [k v] (list (as 'I16 [1 2]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/i16r/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/i16r/"))
+(upsert 's 1 (list 65537 9)) !- domain
+(upsert 's 1 (list [3 65537] [8 9])) !- domain
+(count s) -- 2
+(set t (table [k v] (list (as 'U8 [1 2]) [1 2])))
+(.db.splayed.set "/tmp/rfl_ups_keymatch/u8r/" t)
+(set s (.db.splayed.get "/tmp/rfl_ups_keymatch/u8r/"))
+(upsert 's 1 (list 257 9)) !- domain
+(count s) -- 2
+(at s 'k) -- (as 'U8 [1 2])
+
+(.sys.exec "rm -rf /tmp/rfl_ups_keymatch/") -- 0

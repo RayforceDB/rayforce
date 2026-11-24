@@ -108,18 +108,18 @@
 (at (try (select {q: (quantile s PN981) from: Q2981}) (fn [e] e)) 'msg) -- "quantile: probability must be non-null"
 ;; No rows, an empty table or a where: that keeps none: no row for the
 ;; probability to be wrong about, so the answer is dev's, as for a literal
-;; ([] and [0Nf]), and by: gives no groups.  A probability that reads no
+;; (one row, [0Nf], #1614), and by: gives no groups.  A probability that reads no
 ;; column is still evaluated: an error in evaluating it is the select's.
 (set E981 (select {from: Q2981 where: (> s 99)}))
-(at (select {q: (quantile s 0.25) from: E981}) 'q) -- (as 'F64 [])
-(at (select {q: (quantile s (first t)) from: E981}) 'q) -- (as 'F64 [])
-(at (select {q: (quantile s t) from: E981}) 'q) -- (as 'F64 [])
-(at (select {q: (quantile s 1.25) from: E981}) 'q) -- (as 'F64 [])
-(at (select {q: (quantile s 0Nf) from: E981}) 'q) -- (as 'F64 [])
-(at (select {q: (quantile s (HV981 5)) from: E981}) 'q) -- (as 'F64 [])
-(at (select {p: (percentile s 125) from: E981}) 'p) -- (as 'F64 [])
-((fn [t] (at (select {q: (quantile s t) from: E981}) 'q)) 1.5) -- (as 'F64 [])
-(at (select {q: (quantile s (first t)) c: (count s) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s 0.25) from: E981}) 'q) -- [0Nf]
+(at (select {q: (quantile s (first t)) from: E981}) 'q) -- [0Nf]
+(at (select {q: (quantile s t) from: E981}) 'q) -- [0Nf]
+(at (select {q: (quantile s 1.25) from: E981}) 'q) -- [0Nf]
+(at (select {q: (quantile s 0Nf) from: E981}) 'q) -- [0Nf]
+(at (select {q: (quantile s (HV981 5)) from: E981}) 'q) -- [0Nf]
+(at (select {p: (percentile s 125) from: E981}) 'p) -- [0Nf]
+((fn [t] (at (select {q: (quantile s t) from: E981}) 'q)) 1.5) -- [0Nf]
+(at (select {q: (quantile s (first t)) c: (count s) from: E981}) 'q) -- [0Nf]
 (count (select {q: (quantile s t) from: E981 by: t})) -- 0
 (count (select {q: (quantile s 1.25) from: E981 by: t})) -- 0
 (at (select {q: (quantile s (+ P981 'a)) from: E981}) 'q) !- type

@@ -23,6 +23,7 @@
 
 #include "lang/eval.h"
 #include "core/runtime.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "lang/internal.h"
 #include "app/repl.h"
 #include "lang/env.h"
@@ -82,12 +83,22 @@ static inline uint8_t vrows_join(uint8_t a, uint8_t b) {
 static inline uint8_t vrows_from(int8_t r) { return r < 0 ? 2 : (uint8_t)r; }
 static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
 
+/* The provenance of the value the last ray_eval returned, in the VM's
+ * encoding (0 no, 1 rows, 2 unknown): what a local bound to it keeps, as
+ * `let` keeps it.  For a caller that evaluates a query's arguments itself
+ * (query.c rw_eval_call). */
+uint8_t ray_eval_last_rows(void) { return vrows_from(g_eval_rows); }
+
 #include <math.h>
 #include <signal.h>
 #include <time.h>
 
 /* Maximum recursion depth for ray_eval() to prevent stack overflow.
- * The depth counter lives on the per-thread VM (__VM->eval_depth). */
+ * The depth counter lives on the per-thread VM (__VM->eval_depth).  The
+ * evaluation also stops, with the same error, once the thread's stack is
+ * down to its reserve (ray_stack_short, read every fourth level): what a
+ * level costs depends on the build (over 11 KB a frame under ASan at -O0),
+ * and a secondary thread's stack can be far smaller than the main one's. */
 #define RAY_EVAL_MAX_DEPTH 512
 
 typedef struct {
@@ -262,7 +273,7 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
     ray_t* parts[3] = { LAMBDA_PARAMS(lambda), LAMBDA_BODY(lambda), LAMBDA_CLOSURE(lambda) };
     /* Without the snapshot's trust bits, whoever asks: a captured trusted
      * lambda hashes the same live and while a snapshot loads. */
-    bool keep = ray_serde_keep_trust(false);
+    bool keep = ray_serde_keep_marks(false);
     bool ok = true;
     for (int i = 0; i < 3 && ok; i++) {
         ray_t* bytes = parts[i] ? ray_ser(parts[i]) : NULL;
@@ -275,7 +286,7 @@ static uint64_t trust_identity(ray_t* lambda, int64_t name) {
         }
         h = trust_hash(h, &i, sizeof i);   /* the part ends here */
     }
-    ray_serde_keep_trust(keep);
+    ray_serde_keep_marks(keep);
     if (!ok) return 0;
     /* Never 0, which means untrusted; bit 0 is "trusted by name". */
     return (h << 2) | 2 | (name >= 0 ? 1 : 0);
@@ -752,7 +763,7 @@ static ray_t* head_not_callable_error(int8_t type) {
  * the caller's scope frames and query (lambda_lifts).
  * The builtin is restricted itself, so only unrestricted code, a boot
  * script, can mark.  The mark lives on the lambda object: ser/de and IPC
- * do not carry it (a journal snapshot does, ray_serde_keep_trust), a
+ * do not carry it (a journal snapshot does, ray_serde_keep_marks), a
  * closure the body makes does not get it, and a lambda a request builds
  * has none.  A name means the global bound to it, as at
  * the top level, never a local of the caller, and is not dotted; each
@@ -970,7 +981,14 @@ static ray_t* try_handle_rows(ray_t* handler, ray_t* err_val, int8_t fallback_ro
  * otherwise returned as a fallback value).
  * Special form: receives unevaluated args. */
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
-    ray_t* result = ray_eval(expr);
+    return ray_try_finish(ray_eval(expr), handler_expr);
+}
+
+/* The rest of `(try expr handler)` once `expr` has been evaluated to
+ * `result`: the value itself, or the handler's answer to its error.  A
+ * query's per-row pass evaluates `expr` its own way and finishes here, so
+ * the two agree on what is caught and how (query.c rw_eval_try). */
+ray_t* ray_try_finish(ray_t* result, ray_t* handler_expr) {
     if (!RAY_IS_ERR(result)) return result;
     if (is_return_marker(result)) return result;   /* a `return` is not an error */
 
@@ -980,7 +998,7 @@ ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr) {
     __VM->raise_val = NULL;
     if (!err_val)
         err_val = ray_try_handler_is_value(handler_expr) ? RAY_NULL_OBJ
-                : try_error_value(ray_err_code(result), ray_error_msg(), ray_error_usage());
+                : try_error_value(ray_err_code(result), ray_err_msg(result), ray_error_usage());
     /* The caught error itself goes no further: errors are not refcounted,
      * so ray_release would leave it allocated.  Nor does the trace its
      * unwind recorded. */
@@ -1693,6 +1711,9 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     int right_coll = is_collection(right);
 
     if (!left_coll && !right_coll) return fn(left, right);
+    /* A list's cells are mapped through here again (atomic_map_unary). */
+    if ((left->type == RAY_LIST || right->type == RAY_LIST) && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "value nested too deep for this thread's stack");
 
     int64_t len;
     if (left_coll && right_coll) {
@@ -2374,8 +2395,51 @@ static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
 /* Map a unary function element-wise over a collection.
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
  * a nested collection maps to a collection of the same shape. */
+typedef struct { ray_t* x; int64_t i; } nest_frame_t;
+bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
+    if (!x || RAY_IS_ERR(x) || (x->type != RAY_LIST && x->type != RAY_DICT)) return limit < 1;
+    nest_frame_t local[64];
+    nest_frame_t* st = local;
+    int64_t cap = 64, top = 0;
+    bool deeper = false;
+    st[top++] = (nest_frame_t){ x, 0 };
+    while (top > 0 && !deeper) {
+        nest_frame_t* f = &st[top - 1];
+        ray_t* c;
+        if (f->x->type == RAY_DICT) {               /* its keys, then its values */
+            if (f->i >= 2) { top--; continue; }
+            c = f->i == 0 ? ray_dict_keys(f->x) : ray_dict_vals(f->x);
+        } else {
+            if (f->i >= f->x->len) { top--; continue; }
+            c = ((ray_t**)ray_data(f->x))[f->i];
+        }
+        f->i++;
+        if (!c || RAY_IS_ERR(c) || (c->type != RAY_LIST && c->type != RAY_DICT)) {
+            if (top + 1 > limit) deeper = true;
+            continue;
+        }
+        if (top + 1 > limit) { deeper = true; break; }
+        if (top == cap) {
+            nest_frame_t* grown = (nest_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown);
+            if (!grown) { deeper = true; break; }   /* cannot measure it: refuse */
+            memcpy(grown, st, (size_t)top * sizeof *grown);
+            if (st != local) ray_free_raw(st);
+            st = grown;
+            cap *= 2;
+        }
+        st[top++] = (nest_frame_t){ c, 0 };
+    }
+    if (st != local) ray_free_raw(st);
+    return deeper;
+}
+
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
+    /* A list's cells are mapped through here again: one C frame per level
+     * of nesting, and a value can be nested arbitrarily deep at run time
+     * (#1591).  Stop at the thread's stack reserve, as the evaluator does. */
+    if (arg->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "value nested too deep for this thread's stack");
 
     int64_t len = ray_len(arg);
 
@@ -3741,42 +3805,81 @@ ray_t* ray_fn(ray_t** args, int64_t n) {
     return lambda;
 }
 
-/* Build a [span_i64, filename, fn_name, source] frame from a resolved span
- * and append it to __VM->trace.  Shared by the bytecode and eval paths. */
-static void append_error_frame(ray_t* nfo, ray_span_t span) {
-    if (span.id == 0) return;
+/* A frame element that failed to allocate is left out (NULL), and its
+ * error object freed: frames are released as ordinary lists, and a release
+ * does not free an error object. */
+static ray_t* frame_elem(ray_t* v) {
+    if (v && RAY_IS_ERR(v)) { ray_error_free(v); return NULL; }
+    return v;
+}
 
-    ray_t* frame = ray_alloc(4 * sizeof(ray_t*));
-    if (!frame || RAY_IS_ERR(frame)) return;
+/* Build a [span_i64, filename, fn_name, source] frame from a resolved span
+ * and append it to __VM->trace.  Shared by the bytecode and eval paths, and
+ * by the parser (ray_error_frame_add), which names its frame and adds the
+ * failing byte's offset as a fifth element (see ray_error_frame_add).
+ * Best effort: a frame that cannot be built is dropped.  The error being
+ * traced owns its kind and message, which nothing here can change; the
+ * thread's usage hint, which an allocation failure here would clear, is
+ * put back. */
+static void append_error_frame_named(ray_t* nfo, ray_span_t span, const char* name,
+                                     int64_t offset) {
+    if (span.id == 0 || !__VM) return;
+
+    const char* saved_usage = ray_error_usage();
+
+    int64_t n = offset >= 0 ? 5 : 4;
+    ray_t* frame = ray_alloc((size_t)n * sizeof(ray_t*));
+    if (!frame || RAY_IS_ERR(frame)) goto restore;
     frame->type = RAY_LIST;
-    frame->len = 4;
+    frame->len = n;
     ray_t** fe = (ray_t**)ray_data(frame);
 
-    fe[0] = ray_i64(span.id);
+    fe[0] = frame_elem(ray_i64(span.id));
     if (nfo && NFO_FILENAME(nfo)) {
         fe[1] = NFO_FILENAME(nfo);
         ray_retain(fe[1]);
     } else {
-        fe[1] = ray_str("<unknown>", 9);
+        fe[1] = frame_elem(ray_str("<unknown>", 9));
     }
-    fe[2] = NULL;
+    fe[2] = name ? frame_elem(ray_str(name, strlen(name))) : NULL;
     if (nfo && NFO_SOURCE(nfo)) {
         fe[3] = NFO_SOURCE(nfo);
         ray_retain(fe[3]);
     } else {
-        fe[3] = ray_str("", 0);
+        fe[3] = frame_elem(ray_str("", 0));
     }
+    if (n == 5) fe[4] = frame_elem(ray_i64(offset));
+    if (!fe[0]) { ray_release(frame); goto restore; }
 
     if (!__VM->trace) {
         __VM->trace = ray_alloc(sizeof(ray_t*));
-        if (!__VM->trace) { ray_release(frame); return; }
+        if (!__VM->trace || RAY_IS_ERR(__VM->trace)) {
+            __VM->trace = NULL;
+            ray_release(frame);
+            goto restore;
+        }
         __VM->trace->type = RAY_LIST;
         __VM->trace->len = 1;
         ((ray_t**)ray_data(__VM->trace))[0] = frame;
     } else {
-        __VM->trace = ray_list_append(__VM->trace, frame);
+        /* The trace is the VM's own (never shared), so a failed append
+         * leaves it as it was. */
+        ray_t* t = ray_list_append(__VM->trace, frame);
+        if (t && !RAY_IS_ERR(t)) __VM->trace = t;
+        else ray_error_free(t);
         ray_release(frame);
     }
+
+restore:
+    ray_error_usage_set(saved_usage);
+}
+
+static void append_error_frame(ray_t* nfo, ray_span_t span) {
+    append_error_frame_named(nfo, span, NULL, -1);
+}
+
+void ray_error_frame_add(ray_t* nfo, ray_span_t span, const char* name, int64_t offset) {
+    append_error_frame_named(nfo, span, name, offset);
 }
 
 /* Build a single error trace frame from a lambda's debug/nfo info at the given
@@ -3800,6 +3903,8 @@ static void add_eval_error_frame(ray_t* nfo, ray_t* node) {
 
 /* Execute compiled bytecode for a lambda. */
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc);
+static ray_t* vm_exec_counted(ray_t* lambda, ray_t** call_args, int64_t argc,
+                              uint64_t row_args, uint8_t* out_rows);
 static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
                            uint64_t row_args, uint8_t* out_rows);
 
@@ -3864,7 +3969,7 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
         if (ray_env_push_call_scope(ray_query_helper_table(), named) != RAY_OK)
             return ray_error("oom", NULL);
         uint8_t result_rows = 0;
-        ray_t* result = vm_exec_rows(lambda, call_args, argc, row_args, &result_rows);
+        ray_t* result = vm_exec_counted(lambda, call_args, argc, row_args, &result_rows);
         ray_env_pop_scope();
         if (out_rows) *out_rows = vrows_to(result_rows);
         return result;
@@ -3975,8 +4080,26 @@ ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
 /* __VM (per-thread VM) comes from core/runtime.h — the executor below
  * allocates a private ray_exec_t per invocation and leaves __VM alone. */
 
+/* A backstop count of compiled bodies open on this stack (vm_reentry):
+ * ray_stack_short stops a body recursing through a builtin's callback at
+ * the thread's stack reserve, but where the platform gives no bound (the
+ * main thread under `ulimit -s unlimited`, whose reported stack runs to
+ * the next mapping) nothing would, until memory ran out.  An optimized
+ * build reaches about 1,700 levels on an 8 MB stack, so the count never
+ * binds first there. */
+#define RAY_VM_REENTRY_MAX 10000
+static ray_t* vm_exec_counted(ray_t* lambda, ray_t** call_args, int64_t argc,
+                              uint64_t row_args, uint8_t* out_rows) {
+    if (RAY_UNLIKELY(__VM->vm_reentry >= RAY_VM_REENTRY_MAX))
+        return ray_error("limit", "stack overflow");
+    __VM->vm_reentry++;
+    ray_t* r = vm_exec_rows(lambda, call_args, argc, row_args, out_rows);
+    __VM->vm_reentry--;
+    return r;
+}
+
 static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
-    return vm_exec_rows(lambda, call_args, argc, 0, NULL);
+    return vm_exec_counted(lambda, call_args, argc, 0, NULL);
 }
 
 /* Whether a builtin keeps row provenance: the planner lowers it row by
@@ -4184,6 +4307,14 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
 
     if (RAY_UNLIKELY(!__VM))
         return ray_error("state", "no VM bound to this thread");
+
+    /* Calls between compiled bodies stay on this frame (the VM's own
+     * return stack, bounded by VM_STACK_SIZE), but a builtin that calls a
+     * lambda back (map, fold, a sort key...) re-enters here on the C stack,
+     * a frame per level with no count of its own: a body recursing through
+     * one stops at the thread's stack reserve, as the evaluator does. */
+    if (RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "stack overflow");
 
     /* Scope-stack baseline: OP_SCOPE_BEGIN windows that error out before
      * their OP_SCOPE_END leave materialized frames behind — the error
@@ -5203,7 +5334,7 @@ vm_error_cleanup: {
             err_val = NULL;
         } else if (!err_val)
             err_val = vm_err_obj && RAY_IS_ERR(vm_err_obj)
-                ? try_error_value(ray_err_code(vm_err_obj), ray_error_msg(), ray_error_usage())
+                ? try_error_value(ray_err_code(vm_err_obj), ray_err_msg(vm_err_obj), ray_error_usage())
                 : try_error_value(vm_err_str, vm_err_detail, NULL);
         if (vm_err_obj) {
             if (RAY_IS_ERR(vm_err_obj)) ray_error_free(vm_err_obj);
@@ -5837,10 +5968,13 @@ static void ray_register_builtins(void) {
     /* row — single row from table */
     register_binary("row",       RAY_FN_NONE, ray_row_fn);
 
-    /* .time.* — monotonic clock and scheduled timers */
+    /* .time.* — monotonic clock, scheduled timers and sleep */
     register_vary (".time.now",       RAY_FN_NONE,       ray_time_now_fn);
     register_vary (".time.timer.set", RAY_FN_RESTRICTED, ray_time_timer_set_fn);
     register_unary(".time.timer.del", RAY_FN_RESTRICTED, ray_time_timer_del_fn);
+    /* Restricted: a sleep stops the whole single-threaded server, and a
+     * restricted peer may not occupy it at will (as with .sys.exec). */
+    register_unary(".time.sleep",     RAY_FN_RESTRICTED, ray_time_sleep_fn);
     /* .time.tz.* — a UTC instant on a zone's wall clock */
     register_binary(".time.tz.local",   RAY_FN_NONE, ray_tz_local_fn);
     register_binary(".time.tz.offset",  RAY_FN_NONE, ray_tz_offset_fn);
@@ -6057,7 +6191,11 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
     if (g_eval_interrupted) return ray_error("cancel", "interrupted");
 
-    if (++__VM->eval_depth > RAY_EVAL_MAX_DEPTH) {
+    /* The stack is read every fourth level: four levels are far below
+     * the reserve in any build, and the hot path skips the read. */
+    int32_t depth_now = ++__VM->eval_depth;
+    if (RAY_UNLIKELY(depth_now > RAY_EVAL_MAX_DEPTH ||
+                     ((depth_now & 3) == 0 && ray_stack_short()))) {
         __VM->eval_depth--;
         return ray_error("limit", "eval depth exceeded");
     }

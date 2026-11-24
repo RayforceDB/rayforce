@@ -9662,15 +9662,13 @@ static test_result_t test_exec_depth_guard_limit(void) {
     PASS();
 }
 
-/* ---- FILTER(GROUP) where GROUP fails — exec.c L1023.
+/* ---- FILTER(GROUP) over a parted table with zero total rows.
  *
- * FILTER(GROUP(…)) is the HAVING fusion path.  When the GROUP child
- * itself returns an error (here: exec_group_parted rejects a parted
- * table with zero total rows at L2052), the error path at L1023 fires:
- * the FILTER returns the group_result error directly.
- *
- * Strategy: parted table with one empty segment (len==0) → n_parts=1
- * but total_rows=0 → exec_group_parted returns "nyi" error.           */
+ * FILTER(GROUP(…)) is the HAVING fusion path.  A parted table with one
+ * empty segment (len==0) has n_parts=1 but total_rows=0; exec_group_parted
+ * rejected it with "nyi" until #1621.  It now groups the empty plain table
+ * of the same columns: a by: over no rows gives no group, so the FILTER
+ * answers a 0-row table, not an error.                                 */
 static test_result_t test_exec_filter_group_parted_empty(void) {
     ray_heap_init();
     (void)ray_sym_init();
@@ -9691,8 +9689,7 @@ static test_result_t test_exec_filter_group_parted_empty(void) {
     ray_t* tbl = ray_table_new(1);
     tbl = ray_table_add_col(tbl, col_a, pcol);
 
-    /* GROUP by a, COUNT(*) — the group will call exec_group_parted
-     * which fails because total_rows==0 (L2052 of group.c).          */
+    /* GROUP by a, COUNT(*) — exec_group_parted over total_rows==0.  */
     ray_graph_t* g = ray_graph_new(tbl);
     ray_op_t* scan_a  = ray_scan(g, "a");
     ray_op_t* key_arr[1] = { scan_a };
@@ -9700,18 +9697,18 @@ static test_result_t test_exec_filter_group_parted_empty(void) {
     uint16_t  agg_ops[1] = { OP_COUNT };
     ray_op_t* grp = ray_group(g, key_arr, 1, agg_ops, &agg_in, 1);
 
-    /* Wrap GROUP in FILTER: HAVING fusion path (exec.c L1020).
-     * const_true is an atom (scalar bool) — not a column vector.
-     * The FILTER's eager path runs because pred is not RAY_BOOL
-     * (it's an atom), but that only matters after GROUP; since GROUP
-     * fails, line 1023 fires before pred is ever evaluated.            */
+    /* Wrap GROUP in FILTER: HAVING fusion path.  const_true is an atom
+     * (scalar bool), not a column vector.                               */
     ray_op_t* const_true = ray_const_bool(g, true);
     ray_op_t* flt = ray_filter(g, grp, const_true);
 
     ray_t* result = ray_execute(g, flt);
     TEST_ASSERT_NOT_NULL(result);
-    /* Must be an error (exec_group_parted rejected the empty table) */
-    TEST_ASSERT_TRUE(RAY_IS_ERR(result));
+    /* No group over no rows: a 0-row table, not an error (#1621) */
+    TEST_ASSERT_FALSE(RAY_IS_ERR(result));
+    TEST_ASSERT_EQ_I(result->type, RAY_TABLE);
+    TEST_ASSERT_EQ_I(ray_table_nrows(result), 0);
+    ray_release(result);
 
     ray_graph_free(g);
     ray_release(tbl);

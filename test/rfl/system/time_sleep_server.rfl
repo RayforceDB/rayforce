@@ -1,0 +1,92 @@
+;; @requires: posix  (servers and clients run as processes through a POSIX shell via .sys.exec)
+;; (.time.sleep) on a server (#1489): who can end a sleep, and a journal
+;; replay that does not wait one out.
+;;
+;; A server evaluates one request at a time, so a sleeping request holds up
+;; every other connection.  The rules:
+;;   - a SYNC request's sleep ends when its client hangs up: nobody waits
+;;     for the answer any more, and a killed client cannot send a cancel.
+;;   - an ASYNC message's sleep runs its full time even after its sender has
+;;     gone: work posted behind it relies on the delay.  Only a server-side
+;;     interrupt ends it, so one that would never finish is a domain error.
+;;   - the journal (-l/-L) logs a sync request before running it, so a logged
+;;     sleep came back on every replay: a restart waited it out, and an
+;;     endless one never got to listen.  A sleep changes no state; under
+;;     replay it returns at once.
+;;
+;; Clients are ./rayforce scripts.  One that is to be killed mid-sleep is
+;; started in the background and, once a marker file says it is about to
+;; send and 0.3 s more have passed, a probe from another process must find
+;; the server busy (so the sleep really is running) before it is killed with
+;; -9.  Servers take free ports of their own through test/serve.sh (#1140).
+;; Every wait is bounded: a server that stays wedged fails `.ipc.send`'s
+;; deadline instead of hanging the test.
+
+(.sys.exec "rm -rf /tmp/rfl_tss* /tmp/rftest_tss*")
+(.sys.exec "test/serve.sh /tmp/rfl_tss/s1 -l /tmp/rftest_tss1") -- 0
+(set port (trim (read "/tmp/rfl_tss/s1/port")))
+(set h (.ipc.open (format "127.0.0.1:%" port)))
+(.ipc.send h "(set tss_a 41)") -- 41
+
+;; run the sync request `req` from a client process that is killed while the
+;; server runs it: 0 when a probe found the server busy just before the kill
+(set client (fn [req] (do (write "/tmp/rfl_tss_c.rfl" (format "(set h (.ipc.open \"127.0.0.1:%\"))\n(.sys.exec \"touch /tmp/rfl_tss_mark\")\n(.ipc.send h \"%\")\n" port req)) (write "/tmp/rfl_tss_p.rfl" (format "(println (try (.ipc.send (.ipc.open \"127.0.0.1:%\" 1000) \"1\" 300) (fn [e] \"busy\")))\n(exit 0)\n" port)) (.sys.exec "rm -f /tmp/rfl_tss_mark; ./rayforce /tmp/rfl_tss_c.rfl </dev/null >/dev/null 2>&1 & p=$!; for i in $(seq 100); do [ -f /tmp/rfl_tss_mark ] && break; sleep 0.05; done; sleep 0.3; ./rayforce /tmp/rfl_tss_p.rfl </dev/null 2>/dev/null | grep -qx busy; busy=$?; kill -9 $p; wait $p 2>/dev/null; exit $busy"))))
+;; run `src` as a client script that ends by itself
+(set run_client (fn [src] (do (write "/tmp/rfl_tss_c.rfl" (format "(set h (.ipc.open \"127.0.0.1:%\"))\n%\n(exit 0)\n" port src)) (.sys.exec "./rayforce /tmp/rfl_tss_c.rfl </dev/null >/dev/null 2>&1"))))
+
+;; wait, up to about 5 s, until the server has bound global `name`: requests
+;; on different connections are served in no fixed order, so one sent over
+;; `h` right after a client exits may run before the posts that client left
+;; behind.  true once it is bound
+(set bound_soon (fn [name] (do (set k 0) (while (and (< k 100) (== 0 (.ipc.send h (format "(try (do % 1) (fn [e] 0))" name) 3000))) (do (.time.sleep 50) (set k (+ k 1)))) (< k 100))))
+
+;; another client is answered promptly once the sleeping one is gone
+(set answered_soon (fn [] (do (set t0 (.time.now)) (set r (.ipc.send h "(+ 1 2)" 3000)) (and (== r 3) (< (- (.time.now) t0) 2500)))))
+
+;; a sync sleep of 5 s whose client dies (it stays in the log)
+(client "(.time.sleep 5000)") -- 0
+(answered_soon) -- true
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rfl_tss/s1") -- 0
+
+;; replaying that log restores tss_a here without waiting the 5 s out
+(set t0 (.time.now))
+(.log.replay "/tmp/rftest_tss1.log")
+(< (- (.time.now) t0) 2500) -- true
+tss_a -- 41
+
+;; an endless sync sleep on a second server and log: no cancel can reach it
+;; once the client is dead, but the hang-up ends it
+(.sys.exec "test/serve.sh /tmp/rfl_tss/s2 -l /tmp/rftest_tss2") -- 0
+(set port (trim (read "/tmp/rfl_tss/s2/port")))
+(set h (.ipc.open (format "127.0.0.1:%" port)))
+(.ipc.send h "(set tss_b 42)") -- 42
+(client "(.time.sleep 0Wn)") -- 0
+(answered_soon) -- true
+
+;; async: a client posts a stamp, a 1.5 s sleep and a second stamp, then
+;; exits at once.  The sleep runs its full time after the client is gone,
+;; so the second stamp is at least 1.5 s after the first.
+(run_client "(.ipc.post h \"(set tss_t0 (.time.now))\")\n(.ipc.post h \"(.time.sleep 1500)\")\n(.ipc.post h \"(set tss_t1 (.time.now))\")") -- 0
+(bound_soon "tss_t1") -- true
+(>= (.ipc.send h "(- tss_t1 tss_t0)" 5000) 1500) -- true
+
+;; an async sleep that would never finish is refused (nothing on the client
+;; side could end it), and the work posted behind it runs at once
+(run_client "(.ipc.post h \"(set tss_e (try (.time.sleep 0Wn) (fn [e] 1)))\")\n(.ipc.post h \"(set tss_f (try (.time.sleep 9223372036854775807) (fn [e] 1)))\")") -- 0
+(set t0 (.time.now))
+(bound_soon "tss_f") -- true
+(.ipc.send h "(+ tss_e tss_f)" 3000) -- 2
+(< (- (.time.now) t0) 2500) -- true
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rfl_tss/s2") -- 0
+
+;; a restart on the log with the endless sleep replays it before listening:
+;; it comes up, with its state, instead of sleeping forever
+(.sys.exec "test/serve.sh /tmp/rfl_tss/s3 -l /tmp/rftest_tss2") -- 0
+(set h (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_tss/s3/port")))))
+(.ipc.send h "tss_b" 3000) -- 42
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rfl_tss/s3") -- 0
+
+(.sys.exec "rm -rf /tmp/rfl_tss* /tmp/rftest_tss*")

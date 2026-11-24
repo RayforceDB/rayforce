@@ -41,6 +41,9 @@
 #include "store/stream.h"
 #include "store/part.h"
 #include "store/serde.h"
+#include "store/journal.h"
+#include "ops/journal.h"
+#include "err_list.h"
 #include "core/ipc.h"
 #include "core/sock.h"
 #include "core/platform.h"
@@ -5356,32 +5359,26 @@ static test_result_t test_serde_builtin_name_roundtrip(void) {
 /* ---- serde coverage: ERROR object roundtrip ------------------------------ */
 
 /* An error raised between the size pass and the write pass changes the
- * thread's last error message.  Held, both passes write the same text and
- * length; unheld, the write pass would write the new, longer text into a
- * buffer sized for the old one. */
+ * thread's last error message, but not the message an error record carries:
+ * that is the error's own, so both passes write the same text and length. */
 static test_result_t test_serde_error_msg_held(void) {
     ray_t* e = ray_error("domain", "short");
     TEST_ASSERT_NOT_NULL(e); TEST_ASSERT_TRUE(RAY_IS_ERR(e));
 
-    ray_serde_msg_hold();
     int64_t size = ray_serde_size(e);
     ray_t* later = ray_error("type", "a much longer message raised after the size pass");
     uint8_t buf[512];
     TEST_ASSERT_TRUE(size > 0 && size <= (int64_t)sizeof buf);
+    TEST_ASSERT_EQ_I(ray_serde_size(e), size);
     int64_t wrote = ray_ser_raw(buf, e);
-    ray_serde_msg_release();
     TEST_ASSERT_EQ_I(wrote, size);
     int64_t len = wrote;
     ray_t* back = ray_de_raw(buf, &len);
     TEST_ASSERT_NOT_NULL(back); TEST_ASSERT_TRUE(RAY_IS_ERR(back));
     TEST_ASSERT_EQ_I(len, 0);
+    TEST_ASSERT_STR_EQ(ray_err_msg(back), "short");
     TEST_ASSERT_STR_EQ(ray_error_msg(), "short");
     ray_error_free(back);
-
-    /* Unheld, the size follows whatever error was raised last. */
-    ray_error_free(later);
-    later = ray_error("type", "a much longer message raised after the size pass");
-    TEST_ASSERT_TRUE(ray_serde_size(e) > size);
 
     ray_error_free(later);
     ray_error_free(e);
@@ -5420,6 +5417,136 @@ static test_result_t test_serde_error_roundtrip(void) {
     TEST_ASSERT_STR_EQ(ray_err_code(b), "domain");
     TEST_ASSERT_NULL(ray_error_msg());
     ray_error_free(b); ray_release(w); ray_error_free(e);
+    PASS();
+}
+
+/* ---- serde coverage: each error carries its own message (#1214) --------- */
+
+/* ser/de: every record of a list of errors carries its own error's message,
+ * and decoding the list (which stops at its first error cell and answers
+ * with it) gives back the first error with the first message. */
+static test_result_t test_serde_error_list_own_messages(void) {
+    ray_t* l = err_list_new();
+    TEST_ASSERT_NOT_NULL(l); TEST_ASSERT_FALSE(RAY_IS_ERR(l));
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_STR_EQ(ray_err_msg(((ray_t**)ray_data(l))[i]), ERR_LIST[i][1]);
+
+    ray_t* w = ray_ser(l);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    const uint8_t* p = (const uint8_t*)ray_data(w) + sizeof(ray_ipc_header_t);
+    int64_t n = w->len - (int64_t)sizeof(ray_ipc_header_t);
+    int bad = err_list_check(p, n);
+    TEST_ASSERT_FMT(bad == -1, "error record %d of the serialized list is not its own", bad);
+    TEST_ASSERT_EQ_I(ray_serde_size(l), n);
+
+    ray_t* b = ray_de(w);
+    TEST_ASSERT_NOT_NULL(b); TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_code(b), "type");
+    TEST_ASSERT_STR_EQ(ray_err_msg(b), ERR_LIST[0][1]);
+    TEST_ASSERT_STR_EQ(ray_error_msg(), ERR_LIST[0][1]);
+    ray_error_free(b);
+    ray_release(w);
+
+    /* An error made before another keeps its own message, and serializes it. */
+    ray_t* a = ray_error("io", "kept: %d", 1);
+    ray_t* later = ray_error("nyi", "raised later");
+    TEST_ASSERT_STR_EQ(ray_err_msg(a), "kept: 1");
+    TEST_ASSERT_STR_EQ(ray_error_msg(), "raised later");
+    w = ray_ser(a);
+    TEST_ASSERT_NOT_NULL(w); TEST_ASSERT_FALSE(RAY_IS_ERR(w));
+    b = ray_de(w);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(b));
+    TEST_ASSERT_STR_EQ(ray_err_msg(b), "kept: 1");
+    ray_error_free(b); ray_release(w);
+    ray_error_free(later); ray_error_free(a);
+
+    /* No message: NULL, and an empty message on the wire. */
+    a = ray_error("type", NULL);
+    TEST_ASSERT_NULL(ray_err_msg(a));
+    TEST_ASSERT_EQ_I(ray_serde_size(a), 1 + 8 + 1);
+    ray_error_free(a);
+    TEST_ASSERT_NULL(ray_err_msg(RAY_OOM_OBJ));
+    TEST_ASSERT_NULL(ray_err_msg(NULL));
+
+    err_list_free(l);
+    PASS();
+}
+
+/* Journal: .log.write frames the list into the log, and every error record
+ * of the frame carries its own message. */
+static test_result_t test_journal_error_list_own_messages(void) {
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    char base[128], path[160];
+    snprintf(base, sizeof base, "%s/jrn_err_list", ray_test_tmp_root());
+    snprintf(path, sizeof path, "%s.log", base);
+    unlink(path);
+    ray_err_t opened = ray_journal_open(base, RAY_JOURNAL_SYNC);
+    ray_t* l = err_list_new();
+    ray_t* r = opened == RAY_OK ? ray_log_write_fn(l) : NULL;
+    bool wrote = r && !RAY_IS_ERR(r);
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    err_list_free(l);
+    ray_journal_close();
+
+    uint8_t buf[512];
+    int64_t n = 0;
+    FILE* f = fopen(path, "rb");
+    if (f) { n = (int64_t)fread(buf, 1, sizeof buf, f); fclose(f); }
+    unlink(path);
+    snprintf(path, sizeof path, "%s.lk", base);
+    unlink(path);
+    ray_runtime_destroy(rt);
+
+    TEST_ASSERT_EQ_I(opened, RAY_OK);
+    TEST_ASSERT_TRUE(wrote);
+    /* A new log starts with its 16-byte generation preamble ("RAYJLG1"). */
+    int64_t at = (n >= 16 && memcmp(buf, "RAYJLG1", 8) == 0) ? 16 : 0;
+    at += (int64_t)sizeof(ray_ipc_header_t);
+    TEST_ASSERT_TRUE(n > at);
+    int bad = err_list_check(buf + at, n - at);
+    TEST_ASSERT_FMT(bad == -1, "error record %d of the journal frame is not its own", bad);
+    PASS();
+}
+
+/* Errors raised on worker threads keep their own message on the thread that
+ * reads them, and free there (blocks of the workers' heaps). */
+#define WORKER_ERRS 16
+typedef struct { ray_t* err[WORKER_ERRS]; } worker_errs_t;
+static void worker_errs_task(void* ctx, uint32_t worker_id, int64_t start, int64_t end) {
+    worker_errs_t* w = (worker_errs_t*)ctx;
+    for (int64_t i = start; i < end; i++)
+        w->err[i] = ray_error(i % 2 ? "domain" : "type", "task %lld on worker %u",
+                              (long long)i, worker_id);
+}
+static test_result_t test_worker_error_own_messages(void) {
+    ray_runtime_t* rt = ray_runtime_create(0, NULL);
+    TEST_ASSERT_NOT_NULL(rt);
+    worker_errs_t w;
+    memset(&w, 0, sizeof w);
+    ray_pool_dispatch_n(ray_pool_get(), worker_errs_task, &w, WORKER_ERRS);
+    ray_t* mine = ray_error("io", "raised on the reading thread");
+    int bad = -1;
+    char got[128] = "";
+    for (int i = 0; i < WORKER_ERRS && bad < 0; i++) {
+        ray_t* e = w.err[i];
+        if (!e || !RAY_IS_ERR(e) || e == RAY_OOM_OBJ) { bad = i; break; }
+        char want[32];
+        snprintf(want, sizeof want, "task %d on worker ", i);
+        /* Serialized on this thread, the record carries the worker's text. */
+        ray_t* s = ray_ser(e);
+        ray_t* b = (s && !RAY_IS_ERR(s)) ? ray_de(s) : NULL;
+        const char* m = b && RAY_IS_ERR(b) ? ray_err_msg(b) : NULL;
+        snprintf(got, sizeof got, "%s", m ? m : "(null)");
+        if (!m || strncmp(m, want, strlen(want)) != 0 ||
+            !ray_err_msg(e) || strcmp(ray_err_msg(e), m) != 0) bad = i;
+        if (b) ray_error_free(b);
+        if (s && !RAY_IS_ERR(s)) ray_release(s);
+    }
+    for (int i = 0; i < WORKER_ERRS; i++) ray_error_free(w.err[i]);
+    ray_error_free(mine);
+    ray_runtime_destroy(rt);
+    TEST_ASSERT_FMT(bad < 0, "worker error %d reads \"%s\"", bad, got);
     PASS();
 }
 
@@ -8723,6 +8850,9 @@ const test_entry_t store_entries[] = {
     { "store/serde_builtin_name_roundtrip", test_serde_builtin_name_roundtrip, NULL,     NULL           },
     { "store/serde_error_roundtrip",      test_serde_error_roundtrip,      store_setup, store_teardown },
     { "store/serde_error_msg_held",      test_serde_error_msg_held,      store_setup, store_teardown },
+    { "store/serde_error_list_own_messages", test_serde_error_list_own_messages, store_setup, store_teardown },
+    { "store/journal_error_list_own_messages", test_journal_error_list_own_messages, NULL, NULL },
+    { "store/worker_error_own_messages", test_worker_error_own_messages, NULL, NULL },
     { "store/serde_large_null_vec",       test_serde_large_null_vec,       store_setup, store_teardown },
     { "store/serde_f32_atom",             test_serde_f32_atom_and_edge_cases, store_setup, store_teardown },
     { "store/serde_lambda_roundtrip",     test_serde_lambda_roundtrip,     store_setup, store_teardown },

@@ -18,6 +18,7 @@
 #include "lang/parse.h"
 #include "lang/eval.h"          /* ATTR_QUOTED */
 #include "table/sym.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "vec/str.h"
 #include "mem/heap.h"   /* RAY_ATTR_HAS_NULLS */
 #include "lang/format.h"        /* ray_type_name, ray_fmt_null_literal */
@@ -323,7 +324,7 @@ static bool scan_lit(rd_t* rd, ray_scalar_lit_t* l) {
     const char* pos = rd->p;
     ray_t* err = ray_parse_scalar_literal(&pos, l);
     if (err) {
-        const char* m = ray_error_msg();
+        const char* m = ray_err_msg(err);
         const char* c = ray_err_code(err);
         char msg[128];
         snprintf(msg, sizeof msg, "%s", m && *m ? m : "invalid literal");
@@ -967,6 +968,7 @@ static ray_t* read_value(rd_t* rd) {
     if (at_end(rd)) return fail_at(rd, "expected a value");
     if (!GRAM(rd, 1)) return NULL;
     if (++rd->depth > rd->lim.max_depth) return fail(rd, "limit", "read-value: nesting depth limit of %zu exceeded", rd->lim.max_depth);
+    if (ray_stack_short()) return fail(rd, "limit", "read-value: nesting too deep for this thread's stack");
     ray_t* out = NULL;
     char c = *rd->p;
     if (c == '(') {

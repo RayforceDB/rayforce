@@ -94,6 +94,7 @@ extern ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 #include <errno.h>
 #include <stdlib.h>
 #include <time.h>
+#include "err_list.h"
 
 /* ---- Runtime test plumbing ---------------------------------------------- */
 
@@ -1353,6 +1354,193 @@ static test_result_t test_ipc_journal_path(void) {
 
     ray_journal_close();
     ipc_rm_journal(jbase); /* cleanup */
+    PASS();
+}
+
+/* ---- #1006: replay evaluates a journaled request as the live one did ----
+ * A live request's argument lists carry the literal-fallback mark: a list
+ * whose head does not resolve, or names a global that is not a function,
+ * arrives as data; a head naming a builtin is called.  Replaying the journal
+ * marks the arguments the same way, so it rebuilds the live state. */
+static ray_t* j1006_state(void) {
+    return ray_eval_str("(repr __j1006_state)");
+}
+
+/* With j1006_hook set, the boot also installs a `.ipc.on.sync` hook that
+ * counts its calls in __j1006_hits and evaluates the message. */
+static bool j1006_hook;
+
+static void j1006_boot(void) {
+    ray_t* b = ray_eval_str("(do (set __j1006_a 42) (set __j1006_state (list)) (set __j1006_hits 0)"
+                            " (set __j1006_upd (fn [m] (set __j1006_state (concat __j1006_state (list m)))"
+                            " (count __j1006_state))) 0)");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+    if (!j1006_hook) return;
+    b = ray_eval_str("(set .ipc.on.sync (fn [m] (set __j1006_hits (+ __j1006_hits 1)) (eval m)))");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+}
+
+static int64_t j1006_hits(void) {
+    ray_t* v = ray_eval_str("__j1006_hits");
+    int64_t n = v && !RAY_IS_ERR(v) && v->type == -RAY_I64 ? v->i64 : -1;
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+    return n;
+}
+
+static test_result_t j1006_run(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1006");
+    ipc_rm_journal(jbase);
+    j1006_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    /* a head bound to a global that is not a function, an unbound head, a
+     * head naming a builtin (called live: `in` gives false) */
+    static const char* const reqs[] = {
+        "(list '__j1006_upd (list '__j1006_a 1 \"s\"))",
+        "(list '__j1006_upd (list '__j1006_unbound 1 2))",
+        "(list '__j1006_upd (list 'in 1 2))",
+    };
+    bool sent = true;
+    for (int i = 0; i < 3; i++) {
+        ray_t* m = ray_eval_str(reqs[i]);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        ray_t* r = ray_ipc_send(h, m);
+        ray_release(m);
+        sent &= r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == i + 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    }
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1006_state();
+    int64_t live_hits = j1006_hits();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(sent);
+    TEST_ASSERT_EQ_I(live_hits, j1006_hook ? 3 : 0);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"__j1006_a\") 1 \"s\") (list (as 'SYM \"__j1006_unbound\") 1 2) false)");
+
+    /* recovery (-l): opening the journal replays it into a fresh state */
+    j1006_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* rec = j1006_state();
+    int64_t rec_hits = j1006_hits();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* .log.replay of the same file */
+    j1006_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay \"%s.log\")", jbase);
+    ray_t* rr = ray_eval_str(q);
+    if (rr && RAY_IS_ERR(rr)) ray_error_free(rr); else if (rr) ray_release(rr);
+    ray_t* rep = j1006_state();
+    int64_t rep_hits = j1006_hits();
+
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+    /* replay evaluates each journaled message directly: an installed
+     * `.ipc.on.sync` hook is not run, on either route */
+    TEST_ASSERT_EQ_I(rec_hits, 0);
+    TEST_ASSERT_EQ_I(rep_hits, 0);
+    TEST_ASSERT_TRUE(rec && !RAY_IS_ERR(rec) && rec->type == -RAY_STR);
+    TEST_ASSERT_TRUE(rep && !RAY_IS_ERR(rep) && rep->type == -RAY_STR);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rec), ray_str_ptr(live));
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rep), ray_str_ptr(live));
+    ray_release(live);
+    ray_release(rec);
+    ray_release(rep);
+    PASS();
+}
+
+static test_result_t test_ipc_journal_replay_literal_args(void) {
+    j1006_hook = false;
+    return j1006_run();
+}
+
+/* With a `.ipc.on.sync` hook installed, live requests run through it and
+ * replay does not: the journaled message is evaluated directly, with the
+ * same argument marking, so a hook that evaluates its message rebuilds the
+ * same state, and the hook's own side effects are not replayed. */
+static test_result_t test_ipc_journal_replay_skips_sync_hook(void) {
+    j1006_hook = true;
+    test_result_t r = j1006_run();
+    j1006_hook = false;
+    return r;
+}
+
+/* ---- #1609: a snapshot keeps a stored argument's literal-fallback mark ----
+ * A handler stores the argument lists of two requests.  They carry the mark,
+ * so evaluating one later gives the list back as data, live and after the
+ * log replays.  A snapshot must keep the mark too: recovering from it gives
+ * the live answer, not `type` ("head is not callable"). */
+static void j1609_boot(void) {
+    ray_t* b = ray_eval_str("(do (set __j1609_a 42) (set __j1609_S (list))"
+                            " (set __j1609_keep (fn [m] (set __j1609_S (concat __j1609_S (list m)))"
+                            " (count __j1609_S))) 0)");
+    if (b && !RAY_IS_ERR(b)) ray_release(b); else if (b) ray_error_free(b);
+}
+
+/* What evaluating the stored lists gives, and the stored lists themselves. */
+static ray_t* j1609_state(void) {
+    return ray_eval_str("(repr (list (try (eval (first __j1609_S)) (fn [e] (at e 'msg)))"
+                        " (try (eval (last __j1609_S)) (fn [e] (at e 'msg))) __j1609_S))");
+}
+
+static test_result_t test_ipc_journal_snapshot_literal_args(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1609");
+    ipc_rm_journal(jbase);
+    j1609_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "h >= 0");
+    /* a head bound to a global that is not a function, flat and nested */
+    static const char* const reqs[] = {
+        "(list '__j1609_keep (list '__j1609_a 1 2))",
+        "(list '__j1609_keep (list '__j1609_a (list '__j1609_a 3) 2))",
+    };
+    bool sent = true;
+    for (int i = 0; i < 2; i++) {
+        ray_t* m = ray_eval_str(reqs[i]);
+        TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+        ray_t* r = ray_ipc_send(h, m);
+        ray_release(m);
+        sent &= r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == i + 1;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    }
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1609_state();
+    ray_err_t snap = ray_journal_snapshot();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* recovery (-l) from the snapshot: the log was rolled, so the state is
+     * the snapshot's alone */
+    j1609_boot();
+    ray_err_t reopened = ray_journal_open(jbase, RAY_JOURNAL_ASYNC);
+    ray_t* rec = j1609_state();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_TRUE(sent);
+    TEST_ASSERT_EQ_I(snap, RAY_OK);
+    TEST_ASSERT_EQ_I(reopened, RAY_OK);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_TRUE(rec && !RAY_IS_ERR(rec) && rec->type == -RAY_STR);
+    /* evaluating a stored argument gives it back as data */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"__j1609_a\") 1 2)"
+                       " (list (as 'SYM \"__j1609_a\") (list (as 'SYM \"__j1609_a\") 3) 2)"
+                       " (list (list (as 'SYM \"__j1609_a\") 1 2)"
+                       " (list (as 'SYM \"__j1609_a\") (list (as 'SYM \"__j1609_a\") 3) 2)))");
+    TEST_ASSERT_STR_EQ(ray_str_ptr(rec), ray_str_ptr(live));
+    ray_release(live);
+    ray_release(rec);
     PASS();
 }
 
@@ -2868,6 +3056,70 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     TEST_ASSERT_EQ_I(peer.saw_eof, 1);
     PASS();
 }
+
+/* A peer that completes the handshake and records the bytes it is sent until
+ * the client closes, so a test can read the client's frame as it left. */
+typedef struct {
+    ray_sock_t   lfd;
+    uint16_t     port;
+    uint8_t      buf[4096];
+    int64_t      n;
+    ray_thread_t tid;
+} record_peer_t;
+
+static void record_peer_thread(void* arg) {
+    record_peer_t* p = (record_peer_t*)arg;
+    ray_sock_t c = ray_sock_accept(p->lfd);
+    if (c == RAY_INVALID_SOCK) return;
+    ray_sock_set_blocking(c);
+    struct timeval tv = { 5, 0 };
+    setsockopt((int)c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    uint8_t hs[2];
+    if (recv((int)c, hs, 2, MSG_WAITALL) == 2) {
+        uint8_t resp[2] = { RAY_SERDE_WIRE_VERSION, 0x00 };
+        send((int)c, resp, 2, 0);
+        while (p->n < (int64_t)sizeof(p->buf)) {
+            ssize_t n = recv((int)c, p->buf + p->n, sizeof(p->buf) - (size_t)p->n, 0);
+            if (n <= 0) break;
+            p->n += n;
+        }
+    }
+    ray_sock_close(c);
+}
+
+/* Over IPC every error record of a list carries its own error's message
+ * (#1214): the client used to write the thread's last message, the third
+ * one raised, into all three. */
+static test_result_t test_ipc_error_list_own_messages(void) {
+    record_peer_t* peer = (record_peer_t*)calloc(1, sizeof(record_peer_t));
+    TEST_ASSERT_NOT_NULL(peer);
+    peer->lfd = ray_sock_listen(0);
+    TEST_ASSERT(peer->lfd != RAY_INVALID_SOCK, "listen");
+    peer->port = ray_test_listen_port(peer->lfd);
+    ray_thread_create(&peer->tid, record_peer_thread, peer);
+
+    int64_t h = ray_ipc_connect("127.0.0.1", peer->port, NULL, NULL, 2000);
+    ray_t* l = err_list_new();
+    ray_err_t sent = h >= 0 ? ray_ipc_send_async(h, l) : RAY_ERR_IO;
+    err_list_free(l);
+    if (h >= 0) ray_ipc_close(h);
+    ray_thread_join(peer->tid);
+    ray_sock_close(peer->lfd);
+
+    int64_t n = peer->n;
+    ray_ipc_header_t hdr;
+    if (n >= (int64_t)sizeof hdr) memcpy(&hdr, peer->buf, sizeof hdr);
+    int bad = n > (int64_t)sizeof hdr
+        ? err_list_check(peer->buf + sizeof hdr, n - (int64_t)sizeof hdr) : -3;
+    bool compressed = n >= (int64_t)sizeof hdr && (hdr.flags & RAY_IPC_FLAG_COMPRESSED);
+    free(peer);
+
+    TEST_ASSERT((h) >= (0), "connect");
+    TEST_ASSERT_EQ_I(sent, RAY_OK);
+    TEST_ASSERT_FALSE(compressed);
+    TEST_ASSERT_FMT(bad == -1, "error record %d of the IPC frame is not its own", bad);
+    PASS();
+}
 #endif
 
 /* A reply inside the deadline is returned as usual, and the handle stays
@@ -3428,10 +3680,14 @@ static test_result_t test_ipc_cancel_unconfirmed_moved_link(void) {
 #endif
 }
 
-#if defined(__linux__)
+/* POSIX, not Linux alone: the .time.sleep cancel test below runs on any
+ * platform with SIGURG. */
+#if !defined(RAY_OS_WINDOWS)
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <pthread.h>
+#if defined(__linux__)
 typedef struct { int64_t h; long after_ms; bool hold; } oob_later_t;
 static void oob_later_fn(void* arg) {
     oob_later_t* o = (oob_later_t*)arg;
@@ -3439,6 +3695,19 @@ static void oob_later_fn(void* arg) {
     if (o->hold) ray_ipc_hold_cancel_for_test(true);
     (void)ray_ipc_send_cancel(o->h);
     if (o->hold) ray_ipc_hold_cancel_for_test(false);
+}
+#endif
+
+/* Ctrl-C as the client gets it: a signal on the thread waiting for the
+ * reply, whose handler raises the interrupt.  The wait wakes on it and
+ * sends the server the cancel byte itself. */
+static void ctrl_c_handler(int sig) { (void)sig; ray_request_interrupt(); }
+typedef struct { pthread_t to; long after_ms; } ctrl_c_later_t;
+static void* ctrl_c_later_fn(void* arg) {
+    ctrl_c_later_t* c = (ctrl_c_later_t*)arg;
+    sleep_ms(c->after_ms);
+    pthread_kill(c->to, SIGUSR2);
+    return NULL;
 }
 
 /* A ./rayforce server on a free port of its own, through test/serve.sh (as
@@ -3483,6 +3752,69 @@ static void drop(ray_t* r) {
     if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
 }
 #endif
+
+/* ---- #1489: a client's cancel ends a (.time.sleep) on the server -------
+ * A sleep is one long request on a single-threaded server: the client's
+ * cancel (the out-of-band byte its Ctrl-C sends) must end it promptly with
+ * "cancel", and the connection answers the next request.  The Ctrl-C is a
+ * signal to this thread, as a terminal's would be, so the client sends the
+ * byte itself, with no second thread touching the handle.  It comes at
+ * once (so it lands while the request is still being sent, before the
+ * client waits: a cancel there was lost until the deadline, the client
+ * looking at the flag only when a signal broke its wait), then 200 ms in,
+ * while the client waits.  The sleep asked for is the longest there is
+ * (its deadline past the clock's range: only a cancel ends it); the
+ * client's wait is bounded at 20 s, so a lost cancel fails the test
+ * instead of hanging it. */
+static test_result_t test_ipc_time_sleep_cancel(void) {
+#if !defined(RAY_OS_WINDOWS)
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    const char* dir = "/tmp/ipc_time_sleep";
+    uint16_t port = serve_server(dir);
+    if (!port) serve_stop(dir);
+    TEST_ASSERT(port, "server started");
+    int64_t h = connect_retry(port);
+    if (h < 0) serve_stop(dir);
+    TEST_ASSERT((h) >= (0), "connected to the spawned server");
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = ctrl_c_handler;   /* no SA_RESTART: the wait must wake */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, &old);
+    static const long delays[] = { 0, 200 };
+    bool cancelled[2];
+    int64_t took[2];
+    for (int i = 0; i < 2; i++) {
+        static ctrl_c_later_t c;
+        c.to = pthread_self();
+        c.after_ms = delays[i];
+        pthread_t tid;
+        pthread_create(&tid, NULL, ctrl_c_later_fn, &c);
+        int64_t t0 = ray_time_now_ms();
+        ray_t* r1 = send_str(h, "(.time.sleep 9223372036854775807)");
+        took[i] = ray_time_now_ms() - t0;
+        pthread_join(tid, NULL);
+        ray_clear_interrupt();
+        cancelled[i] = r1 && RAY_IS_ERR(r1) && strcmp(ray_err_code(r1), "cancel") == 0;
+        drop(r1);
+    }
+    sigaction(SIGUSR2, &old, NULL);
+    ray_t* r2 = send_str(h, "(+ 1 2)");
+    ray_ipc_close(h);
+    serve_stop(dir);
+    bool answered = r2 && !RAY_IS_ERR(r2) && r2->type == -RAY_I64 && r2->i64 == 3;
+    drop(r2);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_FMT(cancelled[i], "a Ctrl-C %ld ms in ends the sleep with a cancel error", delays[i]);
+        TEST_ASSERT_FMT(took[i] < 5000, "a Ctrl-C %ld ms in took %lld ms to end the sleep",
+                        delays[i], (long long)took[i]);
+    }
+    TEST_ASSERT(answered, "the connection answers the next request");
+    PASS();
+#else
+    SKIP("out-of-band cancel is POSIX-only");
+#endif
+}
 
 /* The same byte mid-query on a moved connection cancels that query (the
  * server's SIGURG takes it), and the link answers the next one.  The
@@ -3879,6 +4211,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_unconfirmed_moved_link", test_ipc_cancel_unconfirmed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_seen_on_self_closed_moved_link", test_ipc_cancel_seen_on_self_closed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_seen_nested_moved_link", test_ipc_cancel_seen_nested_moved_link, ipc_setup, ipc_teardown },
+    { "ipc/time_sleep_cancel",          test_ipc_time_sleep_cancel,              ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
@@ -3901,6 +4234,9 @@ const test_entry_t ipc_entries[] = {
     { "ipc/poll_handshake_version_mismatch", test_ipc_poll_handshake_version_mismatch, ipc_setup, ipc_teardown },
     { "ipc/send_large_compressible",    test_ipc_send_large_compressible,        ipc_setup, ipc_teardown },
     { "ipc/journal_path",               test_ipc_journal_path,                   ipc_setup, ipc_teardown },
+    { "ipc/journal_replay_literal_args", test_ipc_journal_replay_literal_args, ipc_setup, ipc_teardown },
+    { "ipc/journal_replay_skips_sync_hook", test_ipc_journal_replay_skips_sync_hook, ipc_setup, ipc_teardown },
+    { "ipc/journal_snapshot_literal_args", test_ipc_journal_snapshot_literal_args, ipc_setup, ipc_teardown },
     { "ipc/decompress_literal_overrun", test_ipc_decompress_literal_overrun,     ipc_setup, ipc_teardown },
     { "ipc/compress_small",             test_ipc_compress_small,                 ipc_setup, ipc_teardown },
     { "ipc/compress_incompressible",    test_ipc_compress_incompressible,        ipc_setup, ipc_teardown },
@@ -3961,6 +4297,7 @@ const test_entry_t ipc_entries[] = {
 #ifndef RAY_OS_WINDOWS
     { "ipc/send_deadline/expires",         test_ipc_send_deadline_expires,          ipc_setup, ipc_teardown },
     { "ipc/send_deadline/covers_write",    test_ipc_send_deadline_covers_write,     ipc_setup, ipc_teardown },
+    { "ipc/error_list_own_messages",       test_ipc_error_list_own_messages,        ipc_setup, ipc_teardown },
 #endif
     { "ipc/send_deadline/met",             test_ipc_send_deadline_met,              ipc_setup, ipc_teardown },
 

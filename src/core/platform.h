@@ -278,6 +278,22 @@ uint32_t ray_thread_count(void);
 /* The calling thread's stack as [*lo, *hi) (the stack grows down from hi).
  * False when the platform does not say; the caller then has no bound. */
 bool     ray_thread_stack_bounds(uintptr_t* lo, uintptr_t* hi);
+
+/* Recursion that the input's depth drives (the evaluator, the compiler,
+ * the parser, a compiled body re-entered from a builtin, the readers)
+ * checks ray_stack_short() at each level, or every few levels where a
+ * level is cheap, and fails cleanly once it is true:
+ * the thread's stack is then down to its reserve, the room left for the
+ * calls below one level and for the error path.  What a level costs is
+ * the build's choice (an unoptimized sanitizer build's frames are ten to
+ * a hundred times an optimized one's), and a thread may run on a stack
+ * far smaller than the main thread's, so a level count alone holds on
+ * none of them.  The bound is read once per thread; where the platform
+ * does not give it, nothing is ever short.  It is out of line, so a caller
+ * that checks every few levels pays nothing for the thread-local read on
+ * the levels between. */
+bool ray_stack_short(void);
+
 /* The CPUs this process may run on: the affinity mask on Linux (taskset, a
  * cpuset or docker --cpuset-cpus narrow it), ray_thread_count elsewhere. */
 uint32_t ray_cpu_set_count(void);

@@ -1,0 +1,44 @@
+;; @requires: posix
+;; A keyless prod whose selected rows are all null is the empty product,
+;; 1 (1.0 for a float input), on the planned route as on the evaluator
+;; fallback and the builtin (#1613).  The planned route gave the null.  A
+;; by: group whose rows are all null keeps its null.  A second output the
+;; planner declines (first over a date sum) forces the fallback.
+(set T (table [k c f i e h d v] (list [0 0 1 1] [1 0Nl 0Nl 0Nl] [1.5 0Nf 0Nf 0Nf] (as 'I32 [1 0Nl 0Nl 0Nl]) (as 'F32 [1.5 0Nf 0Nf 0Nf]) (as 'I16 [1 0Nh 0Nh 0Nh]) [2024.01.01 2024.01.02 0Nd 2024.01.04] [10 20 30 40])))
+
+(prod [0Nl 0Nl]) -- 1
+(at (select {from: T s: (prod c) where: (> v 15)}) 's) -- [1]
+(at (select {from: T s: (prod c) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1]
+(at (select {from: T s: (prod f) where: (> v 15)}) 's) -- [1.0]
+(at (select {from: T s: (prod f) z: (first (+ d 0)) where: (> v 15)}) 's) -- [1.0]
+(at (select {from: T s: (prod i) where: (> v 15)}) 's) -- [1]
+(at (select {from: T s: (prod e) where: (> v 15)}) 's) -- [1.0]
+(at (select {from: T s: (prod h) where: (> v 15)}) 's) -- [1]
+
+;; no where: every row null
+(set Q (table [c f] (list [0Nl 0Nl] [0Nf 0Nf])))
+(at (select {from: Q s: (prod c) g: (prod f)}) 's) -- [1]
+(at (select {from: Q s: (prod c) g: (prod f)}) 'g) -- [1.0]
+
+;; beside other outputs, each keeps its own answer
+(at (select {from: T s: (prod c) n: (sum c) m: (min c) where: (> v 15)}) 'n) -- [0]
+(at (select {from: T s: (prod c) n: (sum c) m: (min c) where: (> v 15)}) 'm) -- [0Nl]
+(at (select {from: T s: (prod c) where: (> v 5)}) 's) -- [1]
+(at (select {from: T s: (prod c) where: (< v 15)}) 's) -- [1]
+
+;; by: an all-null group keeps the null
+(at (select {from: T s: (prod c) by: k}) 's) -- [1 0Nl]
+(at (select {from: T s: (prod f) by: k}) 's) -- [1.5 0Nf]
+
+;; large enough for the parallel scan, plain and parted
+(set N 300000)
+(set B (table [c v] (list (take [0Nl 0Nl 2] N) (til N))))
+(at (select {from: B s: (prod c) where: (< (% v 3) 2)}) 's) -- [1]
+(.sys.exec "rm -rf /tmp/rf_prod_all_null")
+(.db.splayed.set "/tmp/rf_prod_all_null/2024.01.01/t/" (take B 150000))
+(.db.splayed.set "/tmp/rf_prod_all_null/2024.01.02/t/" (take B -150000))
+(set P (.db.parted.get "/tmp/rf_prod_all_null/" 't))
+(at (select {from: P s: (prod c) where: (< (% v 3) 2)}) 's) -- [1]
+(set P 0)
+(set B 0)
+(.sys.exec "rm -rf /tmp/rf_prod_all_null")

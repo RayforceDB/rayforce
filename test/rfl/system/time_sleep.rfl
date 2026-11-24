@@ -1,0 +1,56 @@
+;; (.time.sleep ms) pauses the calling thread, so a script can wait without
+;; leaving the language (#1489).  The argument is whole milliseconds as an
+;; integer atom, or a TIMESPAN (rounded up to the next millisecond); the
+;; result is null.
+;;
+;; Timing asserts a lower bound (the sleep never wakes early) and an upper
+;; bound wide enough for a loaded machine running debug builds: an upper
+;; bound only catches a sleep that ignores its argument entirely.
+
+;; returns null, after at least the time asked for
+(nil? (.time.sleep 0)) -- true
+(set t0 (.time.now))
+(nil? (.time.sleep 200)) -- true
+(set dt (- (.time.now) t0))
+(>= dt 200) -- true
+(< dt 10000) -- true
+
+;; any integer width counts milliseconds
+(set t0 (.time.now))
+(.time.sleep (as 'I32 50))
+(.time.sleep (as 'I16 50))
+(.time.sleep (as 'U8 50))
+(>= (- (.time.now) t0) 150) -- true
+
+;; a TIMESPAN is a duration: 150 ms here, and 1 ns rounds up to 1 ms
+(set t0 (.time.now))
+(nil? (.time.sleep 0D00:00:00.150000000)) -- true
+(set dt (- (.time.now) t0))
+(>= dt 150) -- true
+(< dt 10000) -- true
+(nil? (.time.sleep 0D00:00:00.000000001)) -- true
+(nil? (.time.sleep 0D00:00:00.000000000)) -- true
+
+;; negative and null durations are domain errors, at every width
+(.time.sleep -1) !- domain
+(.time.sleep -9223372036854775807) !- domain
+(.time.sleep 0Nl) !- domain
+(.time.sleep (as 'I32 -5)) !- domain
+(.time.sleep 0Ni) !- domain
+(.time.sleep 0Nh) !- domain
+(.time.sleep 0Nn) !- domain
+(.time.sleep -0D00:00:00.001000000) !- domain
+
+;; anything that is not one integer or TIMESPAN atom is a type error
+(.time.sleep 1.5) !- type
+(.time.sleep 0Nf) !- type
+(.time.sleep true) !- type
+(.time.sleep "100") !- type
+(.time.sleep '100) !- type
+(.time.sleep [100]) !- type
+(.time.sleep [100 200]) !- type
+(.time.sleep 2024.01.05) !- type
+(.time.sleep 09:30:00.500) !- type
+(.time.sleep 2024.01.05D09:30:00.000000000) !- type
+(.time.sleep (list 100)) !- type
+(.time.sleep {a: 1}) !- type

@@ -31,6 +31,7 @@
 #include "store/enccol.h"   /* ray_enccol_is_parted */
 #include "core/types.h"
 #include "mem/heap.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "table/table.h"
 #include "vec/str.h"
 #include "vec/vec.h"
@@ -95,18 +96,26 @@
  * compiled metadata must be stripped and rebuilt by the receiving runtime. */
 #define RAY_SERDE_LAMBDA_HAS_CLOSURE ((uint8_t)0x01)
 /* The lambda is trusted (.sys.trust).  Written and read only while
- * ray_serde_keep_trust is on; a reader that predates it ignores the bit. */
+ * ray_serde_keep_marks is on; a reader that predates it ignores the bit. */
 #define RAY_SERDE_LAMBDA_TRUSTED     ((uint8_t)0x02)
 /* ... and was trusted by name: its identity includes the global name it
  * is bound to, which the journal supplies when it binds the snapshot. */
 #define RAY_SERDE_LAMBDA_TRUSTED_NAMED ((uint8_t)0x04)
 #define RAY_SERDE_LAMBDA_ATTR_WIRE_MASK RAY_SERDE_LAMBDA_HAS_CLOSURE
+/* A LIST's attr byte carries the literal-fallback mark (the same bit as in
+ * memory, RAY_EVAL_LITERAL_FALLBACK) only while ray_serde_keep_marks is on:
+ * a stored request argument keeps evaluating to itself after a snapshot
+ * loads.  Outside RAY_SERDE_ATTR_WIRE_MASK, so a reader that predates it, and
+ * any frame read with the marks off, drops the bit. */
+#define RAY_SERDE_LIST_LITERAL ((uint8_t)RAY_EVAL_LITERAL_FALLBACK)
+_Static_assert((RAY_SERDE_LIST_LITERAL & RAY_SERDE_ATTR_WIRE_MASK) == 0,
+               "the literal mark must not overlap a wire attr bit");
 
-static _Thread_local bool g_serde_keep_trust;
+static _Thread_local bool g_serde_keep_marks;
 
-bool ray_serde_keep_trust(bool on) {
-    bool prev = g_serde_keep_trust;
-    g_serde_keep_trust = on;
+bool ray_serde_keep_marks(bool on) {
+    bool prev = g_serde_keep_marks;
+    g_serde_keep_marks = on;
     return prev;
 }
 
@@ -692,42 +701,81 @@ static int64_t ser_table_cols_size(ray_t* tbl, ray_t* cols_list) {
     return size;
 }
 
-/* The message an error record carries: the held copy while a
- * ray_serde_msg_hold is active, else the thread's last error message.
- * At most UINT8_MAX bytes (the record's length byte). */
-static _Thread_local int    g_ser_msg_hold = 0;
-static _Thread_local size_t g_ser_msg_len  = 0;
-static _Thread_local char   g_ser_msg[UINT8_MAX];
-
-static size_t ser_error_msg(const char** out) {
-    if (g_ser_msg_hold > 0) {
-        *out = g_ser_msg;
-        return g_ser_msg_len;
-    }
-    const char* msg = ray_error_msg();
+/* The message an error record carries: the error's own (ray_err_msg), at
+ * most UINT8_MAX bytes (the record's length byte).  It is fixed when the
+ * error is made, so the size pass and the write pass read the same text
+ * whatever is raised between them. */
+static size_t ser_error_msg(ray_t* err, const char** out) {
+    const char* msg = ray_err_msg(err);
     size_t len = msg ? strlen(msg) : 0;
     *out = msg;
     return len > UINT8_MAX ? UINT8_MAX : len;
 }
 
-void ray_serde_msg_hold(void) {
-    if (g_ser_msg_hold++ > 0) return;
-    const char* msg = ray_error_msg();
-    size_t len = msg ? strlen(msg) : 0;
-    if (len > UINT8_MAX) len = UINT8_MAX;
-    if (len) memcpy(g_ser_msg, msg, len);
-    g_ser_msg_len = len;
-}
+/* What ser writes, de reads (#1591): ray_de_raw counts one level per
+ * object it reads and refuses past RAY_DE_MAX_DEPTH, so the size and write
+ * phases count the same way and refuse a value nested deeper, with a limit
+ * error, instead of writing a frame no reader takes.  The walk also stops
+ * at the thread's stack reserve, as de does: before this, a value nested
+ * deeply enough at run time crashed every caller of ser, an IPC reply
+ * included. */
+#define RAY_DE_MAX_DEPTH 512
+static _Thread_local int g_ser_depth = 0;
+static int64_t serde_size_impl(ray_t* obj);
+static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj);
+static int64_t ser_note_col_failure(ray_t* err);
 
-void ray_serde_msg_release(void) {
-    if (g_ser_msg_hold > 0) g_ser_msg_hold--;
+/* Only a container recurses, so only a container is counted: de refuses
+ * an object at nesting level 512 or deeper (the root is level 0), so a
+ * container at level d is refused when d >= 512, or when it has children
+ * (at level d + 1) and d >= 511.  An atom or vector costs nothing here.  A
+ * level of ser costs little stack, so the stack is read every eighth. */
+static inline bool ser_container(const ray_t* obj) {
+    return obj && !RAY_IS_ERR(obj) && (obj->type == RAY_LIST || obj->type == RAY_DICT ||
+                                        obj->type == RAY_TABLE || obj->type == RAY_LAMBDA);
+}
+static inline int ser_depth_limit(const ray_t* obj) {
+    return (obj->type == RAY_LIST && obj->len == 0) ? RAY_DE_MAX_DEPTH : RAY_DE_MAX_DEPTH - 1;
+}
+/* The common case, inline: under the count and not a level that reads the stack. */
+static inline bool ser_depth_fine(const ray_t* obj) {
+    int d = g_ser_depth;
+    return RAY_LIKELY(d < RAY_DE_MAX_DEPTH - 1 && (d & 7) != 7) || (d < ser_depth_limit(obj) && (d & 7) != 7);
+}
+static bool ser_too_deep(const ray_t* obj) {
+    int limit = ser_depth_limit(obj);
+    if (g_ser_depth < limit && ((g_ser_depth & 7) != 7 || !ray_stack_short()))
+        return false;
+    ray_t* e = g_ser_depth >= limit
+        ? ray_error("limit", "serialize: value nested deeper than %d levels", RAY_DE_MAX_DEPTH)
+        : ray_error("limit", "serialize: value nested too deep for this thread's stack");
+    (void)ser_note_col_failure(e);
+    return true;
 }
 
 int64_t ray_serde_size(ray_t* obj) {
+    if (!ser_container(obj)) return serde_size_impl(obj);
+    if (!ser_depth_fine(obj) && ser_too_deep(obj)) return -1;
+    g_ser_depth++;
+    int64_t r = serde_size_impl(obj);
+    g_ser_depth--;
+    return r;
+}
+
+int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
+    if (!ser_container(obj)) return ser_raw_impl(buf, obj);
+    if (!ser_depth_fine(obj) && ser_too_deep(obj)) return -1;
+    g_ser_depth++;
+    int64_t r = ser_raw_impl(buf, obj);
+    g_ser_depth--;
+    return r;
+}
+
+static int64_t serde_size_impl(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
     if (RAY_IS_ERR(obj)) {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         return 1 + 8 + 1 + (int64_t)msg_len;
     }
     if (RAY_IS_NULL(obj)) return 1; /* just the null type byte */
@@ -845,7 +893,7 @@ int64_t ray_serde_size(ray_t* obj) {
     }
     case RAY_ERROR: {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         return 1 + 8 + 1 + (int64_t)msg_len; /* type + sdata + message */
     }
     default:
@@ -857,14 +905,14 @@ int64_t ray_serde_size(ray_t* obj) {
  * ray_ser_raw — serialize into buffer, returns bytes written
  * -------------------------------------------------------------------------- */
 
-int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
+static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
     if (!obj) {
         buf[0] = RAY_SERDE_NULL;
         return 1;
     }
     if (RAY_IS_ERR(obj)) {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         buf[0] = (uint8_t)RAY_ERROR;
         memcpy(buf + 1, obj->sdata, 7);
         buf[8] = 0;
@@ -1030,7 +1078,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
     }
 
     case RAY_LIST: {
-        buf[0] = obj->attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        buf[0] = (obj->attrs & RAY_SERDE_ATTR_WIRE_MASK) |
+                 (g_serde_keep_marks ? (obj->attrs & RAY_SERDE_LIST_LITERAL) : 0);
         buf++;
         memcpy(buf, &obj->len, 8);
         buf += 8;
@@ -1090,8 +1139,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
     case RAY_LAMBDA: {
         buf[0] = (LAMBDA_CLOSURE(obj) ? RAY_SERDE_LAMBDA_HAS_CLOSURE : 0) |
-                 (g_serde_keep_trust && LAMBDA_TRUSTED(obj) ? RAY_SERDE_LAMBDA_TRUSTED : 0) |
-                 (g_serde_keep_trust && (LAMBDA_TRUSTED(obj) & 1) ? RAY_SERDE_LAMBDA_TRUSTED_NAMED : 0);
+                 (g_serde_keep_marks && LAMBDA_TRUSTED(obj) ? RAY_SERDE_LAMBDA_TRUSTED : 0) |
+                 (g_serde_keep_marks && (LAMBDA_TRUSTED(obj) & 1) ? RAY_SERDE_LAMBDA_TRUSTED_NAMED : 0);
         buf++;
         ray_t** slots = (ray_t**)ray_data(obj);
         c = ray_ser_raw(buf, slots[0]);     /* params */
@@ -1123,7 +1172,7 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
     case RAY_ERROR: {
         const char* msg = NULL;
-        size_t msg_len = ser_error_msg(&msg);
+        size_t msg_len = ser_error_msg(obj, &msg);
         memcpy(buf, obj->sdata, 7);
         buf[7] = 0;
         buf[8] = (uint8_t)msg_len;
@@ -1142,9 +1191,10 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
 
 /* Bound the recursion depth so a corrupted record encoding pathologically
  * deep nesting returns an error instead of overflowing the C stack.  Mirrors
- * the eval-depth ceiling (RAY_EVAL_MAX_DEPTH).  Thread-local: ray_de_raw may
- * run on worker-pool threads. */
-#define RAY_DE_MAX_DEPTH 512
+ * the eval-depth ceiling (RAY_EVAL_MAX_DEPTH), and stops as it does at the
+ * thread's stack reserve (ray_stack_short), whatever a level costs in this
+ * build.  Thread-local: ray_de_raw may run on worker-pool threads.
+ * (RAY_DE_MAX_DEPTH is defined above, beside ser's matching bound.) */
 static _Thread_local int g_de_depth = 0;
 static _Thread_local uint8_t g_de_wire_version = RAY_SERDE_WIRE_VERSION;
 
@@ -1153,6 +1203,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len);
 ray_t* ray_de_raw(uint8_t* buf, int64_t* len) {
     if (g_de_depth >= RAY_DE_MAX_DEPTH)
         return ray_error("domain", "deserialize: nesting exceeds max depth %lld", (long long)RAY_DE_MAX_DEPTH);
+    if (ray_stack_short())
+        return ray_error("domain", "deserialize: nesting too deep for this thread's stack");
     g_de_depth++;
     ray_t* r = de_raw_inner(buf, len);
     g_de_depth--;
@@ -1454,7 +1506,8 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ray_t* list = ray_alloc(l * sizeof(ray_t*));
         if (!list || RAY_IS_ERR(list)) return list;
         list->type = RAY_LIST;
-        list->attrs = list_attrs & RAY_SERDE_ATTR_WIRE_MASK;
+        list->attrs = (list_attrs & RAY_SERDE_ATTR_WIRE_MASK) |
+                      (g_serde_keep_marks ? (list_attrs & RAY_SERDE_LIST_LITERAL) : 0);
         list->len = l;
         ray_t** elems = (ray_t**)ray_data(list);
 
@@ -1659,7 +1712,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
         ((ray_t**)ray_data(lambda))[0] = params;
         ((ray_t**)ray_data(lambda))[1] = body;   /* not-a-table */
         LAMBDA_CLOSURE(lambda) = closure;
-        if (g_serde_keep_trust && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED)) {
+        if (g_serde_keep_marks && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED)) {
             if (ray_eval_lambda_trust(lambda, -1) && (lam_attrs & RAY_SERDE_LAMBDA_TRUSTED_NAMED))
                 LAMBDA_TRUSTED(lambda) |= 1;
         }
@@ -1718,16 +1771,7 @@ static ray_t* de_raw_inner(uint8_t* buf, int64_t* len) {
  * ray_ser — top-level: serialize with IPC header
  * -------------------------------------------------------------------------- */
 
-static ray_t* ser_held(ray_t* obj);
-
 ray_t* ray_ser(ray_t* obj) {
-    ray_serde_msg_hold();
-    ray_t* r = ser_held(obj);
-    ray_serde_msg_release();
-    return r;
-}
-
-static ray_t* ser_held(ray_t* obj) {
     bool owned = false;
     if (ray_is_lazy(obj)) {
         ray_retain(obj);

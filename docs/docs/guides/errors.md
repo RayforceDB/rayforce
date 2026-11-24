@@ -205,6 +205,22 @@ error: type
 
 Errors are terminal — an unhandled error stops evaluation of the current expression and returns to the REPL prompt.
 
+An error raised inside a function, and any error the parser reports, also prints where it happened: the file (or `repl` for text typed or sent without one), the line and column, the source line, and a marker under the point. For a parse error that point is the start of the expression the parser could not read, here a vector literal whose elements do not mix:
+
+```text
+  × Error: domain
+
+   ╭─[report.rfl:3:8]
+ 3 │ (set c [a 20])
+   │        ▲
+   │        ╰─ domain: parse: vector literal mixes incompatible element types
+   ╰─ in parse
+```
+
+The same applies to a script run with `rayforce file.rfl`, a file read with `load`, and the text given to `parse`. A client that sends text over IPC receives the error's kind and message, as for any other error.
+
+Lines and columns count from 1, and a column counts characters, so a tab or a character such as `é` or `日` is one column. The marker keeps its place under the point whatever comes before it on the line: the line's tabs are repeated, a wide character such as `日` or `🚀` takes two cells, and a combining mark such as the accent in `é` written as `e` and U+0301 takes none. The width of each character comes from a table of the standard wide and zero-width Unicode ranges, one character at a time: a sequence that a terminal draws as one symbol, such as an emoji joined with U+200D, may still shift the marker. A very long line is shown as the part around the point, cut with `...`, and its column is still exact; a parse error has its line and column however long the line or the file.
+
 ## 3. Null Propagation
 
 Missing data is a first-class concept in Rayforce. There are three distinct null forms, each with different behavior.

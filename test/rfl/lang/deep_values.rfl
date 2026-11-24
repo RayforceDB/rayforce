@@ -1,0 +1,106 @@
+;; Values nested arbitrarily deep at run time (#1591).  A list in a list,
+;; n times, is built by code (the parser's limit does not apply), and every
+;; walk over it either answers or stops with a limit error: none crashes.
+;; Walks that recurse on the C stack (formatting, element-wise maps, in, as)
+;; stop at the thread's stack reserve, so how deep they get is the build's;
+;; key comparison and hashing (distinct, group, except, union) are exact at
+;; any depth; ser refuses past 512 levels, the depth de reads.
+(set ok (fn [f] (try (do (f) 'value) (fn [e] (get e 'code)))))
+(set walks (fn [] (list (ok (fn [] (count (format "%" L)))) (ok (fn [] (count (repr L)))) (ok (fn [] (== L L2))) (ok (fn [] (!= L L2))) (ok (fn [] (< L L2))) (ok (fn [] (+ L 1))) (ok (fn [] (neg L))) (ok (fn [] (not L))) (ok (fn [] (in L (list L2)))) (ok (fn [] (as 'I64 L))))))
+(set safe (fn [rs] (all (map (fn [r] (in r [value limit])) rs))))
+
+;; 60,000 levels
+(set L (list 1))
+(times 60000 (set L (list L)))
+(set L2 (list 1))
+(times 60000 (set L2 (list L2)))
+(set L3 (list 2))
+(times 60000 (set L3 (list L3)))
+(safe (walks)) -- true
+(ok (fn [] (ser L))) -- 'limit
+(count (distinct (list L L2 L3))) -- 2
+(count (group (list L L2 L3))) -- 2
+(count (except (list L L3) (list L2))) -- 1
+(count (union (list L) (list L2 L3))) -- 2
+
+;; 1,000,000 levels
+(set L (list 1))
+(times 1000000 (set L (list L)))
+(set L2 (list 1))
+(times 1000000 (set L2 (list L2)))
+(set L3 (list 2))
+(times 1000000 (set L3 (list L3)))
+(safe (walks)) -- true
+(ok (fn [] (ser L))) -- 'limit
+(count (distinct (list L L2 L3))) -- 2
+(count (group (list L L2 L3))) -- 2
+(count (except (list L L3) (list L2))) -- 1
+(count (union (list L) (list L2 L3))) -- 2
+(set L 0)
+(set L2 0)
+(set L3 0)
+
+;; Nesting through dicts and tables, and lists and dicts alternating:
+;; comparison and hashing are exact at any depth (atom_eq walks lists, dicts
+;; and tables on a stack of its own), identical stops with limit, on the
+;; main thread and on pool threads (pmap)
+(set D (dict [a] (list 1)))
+(times 1000000 (set D (dict [a] (list D))))
+(set D2 (dict [a] (list 1)))
+(times 1000000 (set D2 (dict [a] (list D2))))
+(set D3 (dict [a] (list 2)))
+(times 1000000 (set D3 (dict [a] (list D3))))
+(count (distinct (list D D2 D3))) -- 2
+(count (group (list D D2 D3))) -- 2
+(in D (list D2)) -- true
+(count (except (list D D3) (list D2))) -- 1
+(count (union (list D) (list D2 D3))) -- 2
+(find (list D3 D2) D) -- 1
+(pmap (fn [x] (count (distinct (list x D2 D3)))) (list D D2)) -- [2 2]
+(set X (dict [a] (list 1)))
+(times 300000 (set X (dict [a] (list (list X)))))
+(set X2 (dict [a] (list 1)))
+(times 300000 (set X2 (dict [a] (list (list X2)))))
+(in X (list X2)) -- true
+(count (distinct (list X X2))) -- 1
+(count (union (list X) (list X2))) -- 1
+(pmap (fn [x] (in x (list X2))) (list X X2)) -- [true true]
+(set T (table [a] (list (list 1))))
+(times 100000 (set T (table [a] (list (list T)))))
+(set T2 (table [a] (list (list 1))))
+(times 100000 (set T2 (table [a] (list (list T2)))))
+(count (group (list T T2))) -- 1
+(count (distinct (list T T2))) -- 1
+(pmap (fn [x] (count (group (list x T2)))) (list T T2)) -- [1 1]
+(set L (list 1))
+(times 1000000 (set L (list L)))
+(set L2 (list 1))
+(times 1000000 (set L2 (list L2)))
+(in (ok (fn [] (identical L L2))) [value limit]) -- true
+(in (ok (fn [] (identical D D2))) [value limit]) -- true
+(in (ok (fn [] (identical T T2))) [value limit]) -- true
+(all (map (fn [r] (in r [value limit])) (pmap (fn [p] (ok (fn [] (identical (first p) (last p))))) (list (list L L2) (list D D2))))) -- true
+(set L 0)
+(set L2 0)
+(set D 0)
+(set D2 0)
+(set D3 0)
+(set X 0)
+(set X2 0)
+(set T 0)
+(set T2 0)
+
+;; saving a list column nested too deep says why
+(set S (list 1))
+(times 1000 (set S (list S)))
+(.sys.exec "rm -rf /tmp/rfl_deep_values_save") -- 0
+(try (.db.splayed.set "/tmp/rfl_deep_values_save/t/" (table [a] (list (list S S)))) (fn [e] (get e 'msg))) -- "save: list column nested deeper than 512 levels"
+(.sys.exec "rm -rf /tmp/rfl_deep_values_save") -- 0
+
+;; ser and de agree on the depth: 511 lists round-trip, 512 do not
+(set B (list 1))
+(times 510 (set B (list B)))
+(count (distinct (list B (de (ser B))))) -- 1
+(set C (list 1))
+(times 511 (set C (list C)))
+(ok (fn [] (ser C))) -- 'limit

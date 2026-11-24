@@ -1727,7 +1727,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
         ray_t* col = use_mmap ? ray_col_mmap_splayed_dom(path, udom)
                               : ray_col_load_dom(path, udom);
         if (use_mmap && col && RAY_IS_ERR(col) &&
-            strcmp(ray_err_code(col), "nyi") == 0 && ray_error_msg() == NULL) {
+            strcmp(ray_err_code(col), "nyi") == 0 && ray_err_msg(col) == NULL) {
             /* Contract: the generation-0 mmap refusals that the plain loader
              * can still serve (col.c) are message-less "nyi"; a "nyi" with a
              * message is final (a generation-2 file on a big-endian host)
@@ -1749,7 +1749,7 @@ static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
              * the path already and propagate verbatim; only a bare code
              * (e.g. plain "io" from a missing column file) gains the
              * dir + column context here. */
-            if (col && ray_error_msg() != NULL) return col;
+            if (col && ray_err_msg(col) != NULL) return col;
             char codebuf[8];
             snprintf(codebuf, sizeof(codebuf), "%s",
                      col && RAY_IS_ERR(col) ? ray_err_code(col) : "io");

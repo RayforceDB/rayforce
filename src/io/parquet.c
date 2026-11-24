@@ -2431,7 +2431,7 @@ static void pq_name_file(ray_t** err, size_t i, const char* path) {
     if (!*err || !i) return;
     char code[32], msg[512];
     snprintf(code,sizeof code,"%s",ray_err_code(*err));
-    const char* inner = ray_error_msg() ? ray_error_msg() : "";
+    const char* inner = ray_err_msg(*err) ? ray_err_msg(*err) : "";
     if (!strncmp(inner,"parquet: ",9)) inner += 9;   /* the code supplies it */
     snprintf(msg,sizeof msg,"%s",inner);
     ray_error_free(*err);

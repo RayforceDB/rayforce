@@ -423,6 +423,17 @@ key meets the rows the filter keeps):
 (select {s: (sum x) by: K3 from: t})                       ; error: length
 ```
 
+A keyless `prod` whose rows are all null is the empty product, `1` (`1.0`
+for a float input), as the builtin `(prod [0Nl 0Nl])` is, with or without
+`where:`. Under `by:` a group whose rows are all null keeps the null
+(`0Nl`, `0Nf`) for `prod`, as for `min`, `max`, `first`, `last` and `avg`:
+
+```lisp
+(set t (table [k c] (list [0 0 1 1] [2 3 0Nl 0Nl])))
+(select {p: (prod c) from: t where: (== k 1)})              ; p [1]
+(select {p: (prod c) from: t by: k})                        ; k [0 1], p [6 0Nl]
+```
+
 ### Aggregate sources
 
 What an aggregate reads depends on what its argument is. A column, or an
@@ -432,6 +443,21 @@ no value per row; under `by:` it is applied to each group's rows, so
 `(count (except s 'b))` counts each group's cells other than `b` and
 `(sum (except v 10))` sums each group's values other than 10. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
+
+A keyless select of aggregates answers one row whatever rows it reads.
+Over a table with no rows, with or without `where:`, and over a `where:`
+that keeps no row, each aggregate gives its answer over no values:
+`count` `0`, `sum` `0`, `prod` `1`, `all` `true`, `any` `false`, and the
+null of its type for `min`, `max`, `avg`, `first`, `last`, `med` and the
+deviations, the same row on a plain or a parted table (a parted table
+whose partitions are all empty included). A select with `by:` over
+no rows has no groups and gives no row:
+
+```lisp
+(set e (take (table [g v] (list [a b] [1 2])) 0))
+(select {s: (sum v) n: (count v) m: (min v) from: e})   ; s [0], n [0], m [0Nl]
+(select {s: (sum v) by: g from: e})                     ; no row
+```
 
 A keyless select gives every aggregate the argument `by:` gives its one
 group, whichever route evaluates it: builtin calls over the columns, such as
@@ -557,8 +583,8 @@ the builtin's `type` error, as a vector is; a null, or a value outside
 `0..1` (`0..100` for `percentile`), is its `domain` error. None of them
 answers the median instead. Over no rows (an empty table, or a `where:`
 that keeps none) there is no row for the probability to be wrong about:
-the select answers as for a valid probability, `[]` over an empty table
-and `[0Nf]` under such a `where:`, and `by:` gives no groups.
+the select answers as for a valid probability, `[0Nf]` over an empty
+table and under such a `where:` alike, and `by:` gives no groups.
 
 ```lisp
 (set q (table [s t] (list [0.0 8.0 16.0 24.0] [0.1 0.2 0.3 0.4])))
@@ -566,6 +592,19 @@ and `[0Nf]` under such a `where:`, and `by:` gives no groups.
 (select {v: (quantile s (first t)) from: q where: (> s 5)}) ; v [11.2]
 (select {v: (quantile s t) from: q})      ; error: type
 (select {v: (quantile s 1.25) from: q})   ; error: domain
+```
+
+A keyless aggregate of two arguments, `cov`, `scov`, `wsum`, `wavg`,
+`pearson_corr`, `top`, `bot`, `quantile` or `percentile`, answers the
+builtin's value over the rows, whatever else the select asks for. `top`
+and `bot` give one cell, the list the builtin returns. Over no rows `cov`,
+`scov`, `wavg` and `pearson_corr` give `0Nf`, `wsum` gives `0.0`, and
+`top` and `bot` give an empty list:
+
+```lisp
+(set w (table [c f v] (list [1 5 3] [1.5 2.0 4.0] [10 20 30])))
+(select {k: (top c 2) from: w})                    ; k (list [5 3])
+(select {r: (cov c f) from: w where: (> v 99)})    ; r [0Nf]
 ```
 
 ### Filter + Group-by
@@ -842,6 +881,26 @@ Like `insert`, columns can be in any order:
 ```lisp
 (upsert 't 1 (dict [Value Name ID] (list 170.0 'Quinn 17)))
 ```
+
+### Key Matching
+
+A key matches by value, and **a null key matches a null key** for every key type (integers, floats, temporals, `SYM`, `STR`, `GUID`), in memory and splayed, for single and compound keys. Upserting a null key twice therefore appends one row and then updates it. For `F32` and `F64` keys only the null matches the null; other values compare by value.
+
+```lisp
+(set t (table [d v] (list (as 'DATE [2024.01.01 0Nd]) [1 2])))
+(upsert 't 1 (list 0Nd 9))
+(at t 'v)                          ; [1 9] — the null-keyed row is updated
+```
+
+A key value that does not fit the key column is a `domain` error and nothing is written, rather than being narrowed into a duplicate key:
+
+```lisp
+(set t (table [k v] (list (as 'I16 [1 2]) [1 2])))
+(upsert 't 1 (list 65537 9))       ; error: domain
+(upsert 't 1 (list [3 65537] [8 9])) ; error: domain — the 3 is not written either
+```
+
+See [Query Operations](../language/functions.md#query-operations) for the full list of key types.
 
 ## Delete Rows
 
