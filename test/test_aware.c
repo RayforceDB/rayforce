@@ -5917,6 +5917,20 @@ static test_result_t test_temporal_accessor_dag(void) {
         AW_EXPECT("ta", q, "true");
         TEST_ASSERT_FMT(ray_temporal_test_dag_extracts() >= x0 + 2, "(%s %s): not the DAG extract", ac[i][0], ac[i][1]);
     }
+    /* an accessor under a grouped aggregate: one extract over the column,
+     * not an evaluation per group */
+    uint64_t g0 = ray_temporal_test_dag_extracts();
+    AW_EXPECT("ta", "(do (set G (select {from: (table [k d] (list (% (til 70000) 5003) (at T 'd))) by: k a: (min (dd d))})) "
+                    "(set O (select {from: (table [k x] (list (% (til 70000) 5003) (dd (at T 'd)))) by: k a: (min x)})) "
+                    "(set A (at (select {from: G asc: k}) 'a)) (set B (at (select {from: O asc: k}) 'a)) "
+                    "(and (== (count G) 5003) (all (== (nil? A) (nil? B))) (all (== (fill 0 A) (fill 0 B)))))", "true");
+    TEST_ASSERT_FMT(ray_temporal_test_dag_extracts() >= g0 + 1 && ray_temporal_test_dag_extracts() < g0 + 100,
+                    "(min (dd d)) by k: %llu extracts, want the column's own",
+                    (unsigned long long)(ray_temporal_test_dag_extracts() - g0));
+    aw_eval_ok("(set G 0)");
+    aw_eval_ok("(set A 0)");
+    aw_eval_ok("(set B 0)");
+    aw_eval_ok("(set O 0)");
     aw_eval_ok("(set R 0)");
     aw_eval_ok("(set E 0)");
     aw_eval_ok("(set T 0)");
