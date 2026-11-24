@@ -264,6 +264,19 @@ void ray_error_clear(void) {
     ray_last_err_msg[0] = '\0';
 }
 
+/* The thread's last-error state, saved before an evaluation whose error the
+ * caller may drop and put back when it does, so a dropped error leaves no
+ * message or usage behind. */
+void ray_error_state_save(ray_error_state_t* s) {
+    memcpy(s->msg, ray_last_err_msg, sizeof s->msg);
+    s->usage = ray_last_err_usage;
+}
+
+void ray_error_state_restore(const ray_error_state_t* s) {
+    memcpy(ray_last_err_msg, s->msg, sizeof ray_last_err_msg);
+    ray_last_err_usage = s->usage;
+}
+
 /* ===== Lifecycle ===== */
 
 static ray_runtime_t* runtime_create_impl(const char* sym_path,

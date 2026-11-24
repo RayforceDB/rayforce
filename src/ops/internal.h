@@ -2438,6 +2438,9 @@ ray_t* exec_date_trunc(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
 /* Shared LIKE kernel over a STR/SYM column (see string.c); selection may be NULL. */
 ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection);
+/* LIKE / ILIKE with a STR column as the pattern: row i against pattern i (#1615). */
+ray_t* ray_like_rows(ray_t* x, ray_t* pat, bool ci);
+bool   ray_like_pat_rows(ray_t* pat);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_strlen(ray_graph_t* g, ray_op_t* op);
