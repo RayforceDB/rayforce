@@ -13037,6 +13037,32 @@ static bool group_seg_stream_ok(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext,
     return ok;
 }
 
+/* A 0-row plain table with the columns of a parted table: each parted
+ * column as an empty vector of its base type, the partition key as an
+ * empty vector of its value type. */
+static ray_t* parted_empty_flat(ray_t* parted_tbl) {
+    int64_t ncols = ray_table_ncols(parted_tbl);
+    ray_t* tbl = ray_table_new(ncols);
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(parted_tbl, c, &m)) continue;
+        int8_t base = m.type;
+        if (m.type == RAY_MAPCOMMON) {
+            ray_t** mc = (ray_t**)ray_data(ray_table_col_idx(parted_tbl, c));
+            base = mc[0] ? mc[0]->type : RAY_I64;
+        } else if (RAY_IS_PARTED(m.type)) {
+            base = (int8_t)RAY_PARTED_BASETYPE(m.type);
+        }
+        ray_t* col = base == RAY_LIST ? ray_list_new(0) : ray_vec_new(base, 0);
+        if (!col || RAY_IS_ERR(col)) { ray_release(tbl); return col ? col : ray_error("oom", NULL); }
+        tbl = ray_table_add_col(tbl, ray_table_col_name(parted_tbl, c), col);
+        ray_release(col);
+        if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    }
+    return tbl;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
  * -------------------------------------------------------------------------- */
@@ -13062,7 +13088,22 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             break;
         }
     }
-    if (n_parts <= 0 || total_rows <= 0) return ray_error("nyi", NULL);
+    if (n_parts <= 0) return ray_error("nyi", NULL);
+    /* Every partition empty: the answer of an empty plain table of the same
+     * columns (#1621) -- one row of the aggregates over no values keyless,
+     * no group under by:. */
+    if (total_rows <= 0) {
+        ray_t* empty_tbl = parted_empty_flat(parted_tbl);
+        if (!empty_tbl || RAY_IS_ERR(empty_tbl))
+            return empty_tbl ? empty_tbl : ray_error("oom", NULL);
+        ray_t* saved = g->table;
+        g->table = empty_tbl;
+        ray_t* result = exec_group(g, op, empty_tbl, group_limit);
+        g->table = saved;
+        ray_graph_unbind_table(g, empty_tbl);   /* before its address can be reused */
+        ray_release(empty_tbl);
+        return result;
+    }
 
     /* Check eligibility for per-partition exec + merge:
      * - All keys and agg inputs must be simple SCANs
