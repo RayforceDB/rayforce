@@ -1,0 +1,48 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1604: a grouped sum(if) skips the partitions a comparison of a timestamp
+;; column rules out, as (sum v) by the same key does.  The grouped proof
+;; admitted same-type I64, F64 and DATE comparisons in where:, not
+;; TIMESTAMP ones, so the same select read every partition.
+;;
+;; A skip is made visible without a clock: two date partitions of 70 000
+;; uncompressed rows (enough for the ts column to carry statistics), and
+;; the second partition's ts values copied over the first partition's ts
+;; data in place, keeping its header and statistics.  A select that skips
+;; the first partition by its statistics counts the second's rows alone; one
+;; that reads it counts them twice.  A second, untouched root with null
+;; timestamps checks every answer against the same select with pruning off:
+;; the where written as (or false p p), which narrows no partition.
+
+(set R (format "/tmp/rfl_part_prune_grouped_ts_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %/stale %/clean" R R R)) -- 0
+(set n 70000)
+(set mk (fn [d] (table [ts s k v w] (list (+ d (* 1000000 (til n))) (at ['x 'y 'z] (% (til n) 3)) (% (til n) 4) (til n) (* 0.5 (til n))))))
+(.db.splayed.set (format "%/stale/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/stale/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.sys.exec (format "dd if=%/stale/2026.01.06/t/ts of=%/stale/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null" R R)) -- 0
+(set P (.db.parted.get (format "%/stale/" R) 't))
+;; the clean root: three partitions, every seventh ts of the middle one null
+(set nul (fn [d] (update {ts: (if (== (% v 7) 3) 0Np ts) from: (mk d)})))
+(.db.splayed.set (format "%/clean/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(.db.splayed.set (format "%/clean/2026.01.06/t/" R) (nul 2026.01.06D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(.db.splayed.set (format "%/clean/2026.01.07/t/" R) (mk 2026.01.07D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(set C (.db.parted.get (format "%/clean/" R) 't))
+
+;; the controls: (sum v) by the key skips; so does the comparison alone
+(sum (at (select {c: (count v) by: s from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 70000
+;; a grouped sum(if) by a SYM key, by an I64 key, and beside other aggregates
+(sum (at (select {c: (sum (if (== s 'x) 1 0)) by: s from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 23334
+(sum (at (select {c: (sum (if (> v 69990) 1 0)) by: k from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 9
+(sum (at (select {c: (sum (if (== s 'y) 1 0)) n: (count v) m: (max v) by: s from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'n)) -- 70000
+(sum (at (select {c: (sum (if (< w 10.0) w 0.0)) by: s from: P where: (and (>= ts 2026.01.06D00:00:00.000) (!= s 'z))}) 'c)) -- 66.5
+;; every answer equals the one without pruning, on the untouched root
+(select {c: (sum (if (== s 'x) 1 0)) by: s from: C where: (>= ts 2026.01.06D00:00:00.000)}) -- (select {c: (sum (if (== s 'x) 1 0)) by: s from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})
+(select {c: (sum (if (> v 69990) 1 0)) by: k from: C where: (>= ts 2026.01.06D00:00:00.000)}) -- (select {c: (sum (if (> v 69990) 1 0)) by: k from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})
+(select {c: (sum (if (== s 'y) 1 0)) n: (count v) m: (max v) by: s from: C where: (>= ts 2026.01.06D00:00:00.000)}) -- (select {c: (sum (if (== s 'y) 1 0)) n: (count v) m: (max v) by: s from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})
+(select {c: (sum (if (< w 10.0) w 0.0)) by: s from: C where: (and (>= ts 2026.01.06D00:00:00.000) (!= s 'z))}) -- (select {c: (sum (if (< w 10.0) w 0.0)) by: s from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (!= s 'z)) (and (>= ts 2026.01.06D00:00:00.000) (!= s 'z)))})
+(select {c: (sum (if (== s 'x) v 0)) by: k from: C where: (< ts 2026.01.06D12:00:00.000)}) -- (select {c: (sum (if (== s 'x) v 0)) by: k from: C where: (or false (< ts 2026.01.06D12:00:00.000) (< ts 2026.01.06D12:00:00.000))})
+(select {c: (sum (if (== s 'x) v 0)) n: (count ts) by: s from: C where: (> ts 2026.01.06D00:00:00.000)}) -- (select {c: (sum (if (== s 'x) v 0)) n: (count ts) by: s from: C where: (or false (> ts 2026.01.06D00:00:00.000) (> ts 2026.01.06D00:00:00.000))})
+(select {c: (sum (if (!= s 'y) w 0.0)) by: k from: C where: (and (>= ts 2026.01.06D00:00:00.000) (<= ts 2026.01.06D12:00:00.000))}) -- (select {c: (sum (if (!= s 'y) w 0.0)) by: k from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (<= ts 2026.01.06D12:00:00.000)) (and (>= ts 2026.01.06D00:00:00.000) (<= ts 2026.01.06D12:00:00.000)))})
+(select {c: (sum (if (== s 'x) 1 0)) by: s from: C where: (== ts 2026.01.07D00:00:00.000)}) -- (select {c: (sum (if (== s 'x) 1 0)) by: s from: C where: (or false (== ts 2026.01.07D00:00:00.000) (== ts 2026.01.07D00:00:00.000))})
+
+(.sys.exec (format "rm -rf %" R)) -- 0

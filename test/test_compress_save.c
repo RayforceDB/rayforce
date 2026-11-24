@@ -5144,6 +5144,71 @@ static void pdb_mix_unbind(void) {
         ray_env_set(ray_sym_intern(names[i], strlen(names[i])), NULL);
 }
 
+/* A grouped sum(if) over a table partitioned by a TIMESTAMP key (directories
+ * YYYY.MM.DD.HH.MM.SS): a comparison of the key with a timestamp prunes as a
+ * DATE key's does (#1604); a date literal against it stays declined in the
+ * grouped proof.  Every answer equals the one with pruning off. */
+static test_result_t test_select_parted_prunes_grouped_if_ts_key(void) {
+    static const struct { const char* pred; bool pruned; } cases[] = {
+        { "(>= part 2024.01.16D00:00:00.000)", true },
+        { "(== part 2024.01.17D00:00:00.000)", true },
+        { "(< part 2024.01.16D00:00:00.000)", true },
+        { "(and (>= part 2024.01.16D00:00:00.000) (> x -1))", true },
+        { "(>= part 2024.01.16)", false },
+    };
+    static const char* const dirs[] = { "2024.01.15.10.00.00", "2024.01.16.00.00.00", "2024.01.17.00.00.00" };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256], sym_path[512];
+        snprintf(root, sizeof root, "%s/group_if_ts%d", ray_test_tmp(CS_TMP), gen);
+        snprintf(sym_path, sizeof sym_path, "%s/.sym", root);
+        for (int p = 0; p < 3; p++) {
+            char dir[512];
+            snprintf(dir, sizeof dir, "%s/%s/t", root, dirs[p]);
+            ray_t* t = ray_eval_str(
+                "(table [g x a b act qty] (list [7 7 7 7 8 8 8 8] "
+                "[-1 1 0 2 -1 1 0 2] [10 20 0Nl 40 0Nl 2 0Nl 4] "
+                "[100 200 300 0Nl 5 0Nl 7 8] "
+                "(as 'SYM [\"Accepted\" \"\" \"New\" \"Accepted\" \"Accepted\" \"\" \"New\" \"Accepted\"]) "
+                "[10 0Nl 30 40 0Nl 2 0Nl 4]))");
+            TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t) && t->type == RAY_TABLE);
+            ray_err_t err = ray_splay_save_mode(t, dir, sym_path, gen ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF);
+            ray_release(t);
+            TEST_ASSERT_TRUE(err == RAY_OK);
+        }
+        ray_t* t = ray_read_parted(root, "t");
+        TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+        pdb_grouped_if_bind(t);
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[1024], ref[1536];
+            const char* out = "s:(sum (if (> x 0) a b)) t:(sum (if (== act 'Accepted) qty 0))";
+            snprintf(q, sizeof q, "(select {from:_prune_grouped_source where:%s by:g %s})", cases[i].pred, out);
+            snprintf(ref, sizeof ref, "(select {from:_prune_grouped_source where:(or false %s %s) by:g %s})",
+                     cases[i].pred, cases[i].pred, out);
+#ifdef DEBUG
+            (void)ray_query_test_parted_pruned_sources(true);
+#endif
+            ray_t* r = ray_eval_str(q);
+            bool structure = true;
+#ifdef DEBUG
+            structure = ray_query_test_parted_pruned_sources(true) == (cases[i].pruned ? 1u : 0u);
+#endif
+            ray_t* u = ray_eval_str(ref);
+#ifdef DEBUG
+            structure = structure && ray_query_test_parted_pruned_sources(true) == 0;
+#endif
+            bool values = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && sp_same(r, u);
+            drop_out(r); drop_out(u);
+            if (!values || !structure) {
+                pdb_grouped_if_bind(NULL); ray_release(t);
+                TEST_ASSERT_FMT(values && structure, "grouped if ts key gen=%d case=%zu values=%d structure=%d",
+                                gen, i, (int)values, (int)structure);
+            }
+        }
+        pdb_grouped_if_bind(NULL); ray_release(t);
+    }
+    PASS();
+}
+
 /* SUM(IF) beside other aggregates, and grouped by a SYM column. Each answer
  * equals, cell for cell, the unpruned parted answer (in order), and the
  * splayed and in-memory answers sorted by the key; the part-prune counter
@@ -6133,6 +6198,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_ordinary_uncapped", test_select_parted_prunes_ordinary_uncapped, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_head_bindings", test_select_parted_prunes_head_bindings, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if", test_select_parted_prunes_grouped_if, rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_grouped_if_ts_key", test_select_parted_prunes_grouped_if_ts_key, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_grouped_if_mixed", test_select_parted_prunes_grouped_if_mixed, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_group_limits", test_select_parted_prunes_group_limits, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_if_symbols", test_select_parted_prunes_if_symbols, rt_setup, rt_teardown },

@@ -22507,7 +22507,8 @@ static int8_t prune_group_leaf(ray_t* e, ray_t* tbl, prune_group_proof_t* p, boo
 /* Every comparison is column-dependent, so no scalar condition or BOOL
  * literal can enter this grammar. Binary AND/OR avoids the lowering limit of
  * 64 arguments; NOT only wraps another proved BOOL expression. WHERE also
- * permits same-type DATE comparisons, notably the literal partition bound.
+ * permits same-type DATE and TIMESTAMP comparisons, notably the literal
+ * partition bound and a bound on a timestamp column (#1604).
  * The caller's existing mask proves a necessary literal key constraint and
  * that some partition is excluded; constraints under OR/NOT do not mask. */
 /* A quoted SYM is constant only if it names no source column. Record its
@@ -22551,7 +22552,7 @@ static bool prune_group_cond(ray_t* e, ray_t* tbl, prune_group_proof_t* p,
     if (l != r || (!lc && !rc)) return false;
     if (l == RAY_SYM)
         return (op == OP_EQ || op == OP_NE) && lc != rc;
-    return l == RAY_I64 || l == RAY_F64 || (where && l == RAY_DATE);
+    return l == RAY_I64 || l == RAY_F64 || (where && (l == RAY_DATE || l == RAY_TIMESTAMP));
 }
 
 static bool prune_group_sum_if(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
