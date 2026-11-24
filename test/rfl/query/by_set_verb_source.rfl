@@ -1,0 +1,31 @@
+;; @also-unfused
+;; #1404: under by:, an aggregate of a set verb over a column -- except,
+;; sect, union -- aggregates what the verb gives over the group's rows.  It
+;; was evaluated over the whole table and sliced by the group's rows, so
+;; count counted the group and sum or first read other groups' cells.  The
+;; oracle is update, which evaluates each group's sub-table, and the
+;; issue's own count of the plain vector.
+(set T (table [k c d s v] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] [aa bb cc aa] [10 20 30 40])))
+(count (except [aa bb cc aa] 'aa)) -- 2
+(at (select {from: T by: k n: (count (except s 'aa))}) 'n) -- [2]
+(at (select {from: T by: k n: (count (except s 'aa)) x: (sum v)}) 'n) -- [2]
+(at (select {from: T by: c n: (count (except s 'aa))}) 'n) -- [0 1 1 0]
+(set G (table [k s v] (list [0 0 1 1 1] [aa bb aa cc dd] [10 20 30 40 50])))
+(at (select {n: (count (except s 'aa)) from: G by: k}) 'n) -- [1 2]
+(at (select {n: (count (except s 'aa)) from: G by: k}) 'n) -- (distinct (at (update {n: (count (except s 'aa)) from: G by: k}) 'n))
+(at (select {n: (sum (except v 10)) from: G by: k}) 'n) -- [20 120]
+(at (select {n: (sum (except v 10)) from: G by: k}) 'n) -- (distinct (at (update {n: (sum (except v 10)) from: G by: k}) 'n))
+(at (select {n: (first (except v 10)) from: G by: k}) 'n) -- [20 30]
+(at (select {n: (count (except v [10 40])) from: G by: k}) 'n) -- [1 2]
+(at (select {n: (count (sect v [10 30])) from: G by: k}) 'n) -- [1 1]
+(at (select {n: (count (union v [10 99])) from: G by: k}) 'n) -- [3 5]
+(at (select {n: (+ (count (except s 'aa)) (count v)) from: G by: k}) 'n) -- [3 5]
+;; under where:, of the rows it keeps
+(at (select {n: (count (except s 'aa)) from: G by: k where: (> v 10)}) 'n) -- [1 2]
+(at (select {n: (count (except s 'aa)) from: G by: k where: (> v 30)}) 'n) -- [2]
+;; keyless, as by: with one group
+(at (select {n: (count (except s 'aa)) from: G}) 'n) -- [3]
+(at (select {n: (count (except s 'aa)) from: G where: (> v 10)}) 'n) -- [3]
+;; a by-dict key and an expression key take the same route
+(at (select {n: (count (except s 'aa)) from: G by: {kk: k}}) 'n) -- [1 2]
+(at (select {n: (count (except s 'aa)) from: G by: (> v 25)}) 'n) -- [1 2]
