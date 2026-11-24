@@ -283,8 +283,9 @@ int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len);
  * destroyed, so a repeated id, in one call or the next, is a hash lookup;
  * a -1 is dropped once `dst` has grown, since the string may have arrived.
  * Ids the cache cannot keep are memoized for the call.  Returns the number
- * of ids resolved by string lookup (the cache misses); never fails (short
- * of memory it looks up).  `pos` may be `ids` itself.  Sequential: callers
+ * of ids resolved by string lookup (the cache misses), or -1 when `dst`'s
+ * reverse index cannot be built (out of memory: `pos` is then incomplete).
+ * `pos` may be `ids` itself.  Sequential: callers
  * run it in setup, never in a worker. */
 int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
                             const int64_t* ids, int64_t n, int64_t* pos);

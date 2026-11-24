@@ -2301,7 +2301,8 @@ static int64_t dom_xlat_find_locked(ray_sym_domain_t* src, ray_sym_domain_t* dst
     if (dst->kind == DOM_RUNTIME) return ray_sym_find(p, l);
     if (dst->kind == DOM_IMPORT) return -1;
     if (atomic_load_explicit(&dst->count, memory_order_relaxed) == 0) return -1;
-    if (!dst->buckets && !dom_build_index_locked(dst, 0)) return -1;
+    /* no index and no memory for one: -2, not an absent verdict */
+    if (!dst->buckets && !dom_build_index_locked(dst, 0)) return -2;
     return dom_probe_locked(dst, (uint32_t)ray_hash_bytes(p, l), p, l);
 }
 
@@ -2335,6 +2336,7 @@ int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
             if (tmp.cap && (e = dom_xlat_slot(&tmp, id))->id != -1) { pos[i] = e->pos; continue; }
         }
         int64_t p = dom_xlat_find_locked(src, dst, id);
+        if (p == -2) { misses = -1; break; }   /* out of memory: no verdict */
         misses++;
         pos[i] = p;
         if (id > INT32_MAX || p > INT32_MAX) continue;   /* not an 8-byte entry */

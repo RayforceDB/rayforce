@@ -333,6 +333,7 @@ static ray_t* join_sym_xlat(ray_t* src, ray_t* dst) {
     for (int64_t r = 0; r < n; r++) o[r] = ray_read_sym(sdata, r, RAY_SYM, src->attrs);
     /* in place: the pair's cache answers every repeat of an id */
     int64_t finds = ray_sym_domain_xlat(ray_sym_vec_domain(src), ray_sym_vec_domain(dst), o, n, o);
+    if (finds < 0) { ray_release(out); return ray_error("oom", NULL); }
     atomic_fetch_add_explicit(&g_join_sym_finds, (uint64_t)finds, memory_order_relaxed);
     ray_sym_vec_adopt_domain(out, dst);
     return out;
