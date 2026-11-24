@@ -58,7 +58,8 @@
 (upsert 's 1 (list 1 5)) !- type
 (count s) -- 3
 
-;; F32 (matches by value; an F64 atom is narrowed first; null never matches)
+;; F32 (matches by value; an F64 atom is narrowed first; a null key matches
+;; the null-keyed row, #1152)
 (set t (table [k v] (list (as 'F32 [1.5 2.5 3.5]) [10 20 30])))
 (.db.splayed.set "/tmp/rfl_ups_keys/f32/" t)
 (set s (.db.splayed.get "/tmp/rfl_ups_keys/f32/"))
@@ -72,7 +73,8 @@
 (count s) -- 4
 (upsert 's 1 (list 0Ne 6)) -- 's
 (upsert 's 1 (list 0Ne 7)) -- 's
-(count s) -- 6
+(count s) -- 5
+(at s 'v) -- [10 99 88 5 7]
 
 ;; I32 control: the width that already worked
 (set t (table [k v] (list (as 'I32 [1 2 3]) [10 20 30])))
