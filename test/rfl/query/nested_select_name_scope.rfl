@@ -1,0 +1,67 @@
+;; @also-unfused
+;; #1567, #1568: a nested select binds its own table's columns, and its
+;; outputs as aliases, after the outer query's, so at run time a name it
+;; holds of either kind is the inner one.  The planner's column walk read
+;; such a name as the outer table's column when the outer table had one of
+;; that name, and so took the nested select's value as row-aligned: sliced
+;; by group, or spread by row.  It now follows the run time for a nested
+;; select whose table it can tell: a global, a parameter, a let, or an
+;; expression of pure builtins; any other name, a correlated one included,
+;; reads as before.
+;; The oracle is the same value returned by a helper the planner does not
+;; inline (a computed value, aggregated as it stands), or bound first.
+(set t (table [g s v] (list ['a 'a 'a 'b 'b] ["x" "x" "x" "y" "y"] [30 10 20 5 7])))
+(set u (table [k v] (list ['p 'q 'r 'p 'q 'r 'p 'q] [100 200 300 400 500 600 700 800])))
+(set N1 (at (select {from: u by: k x: (sum v)}) 'x))
+(set N2 (at (select {from: (select {from: u by: k x: (sum v)}) y: (max x)}) 'y))
+(set N3 (at (select {from: u by: k x: (sum v) v: (count k) z: (+ x v)}) 'z))
+(set H1 (fn [] (let q N1) q))
+(set H2 (fn [] (let q N2) q))
+(set H3 (fn [] (let q N3) q))
+(set N0 (at (select {from: u x: (sum v)}) 'x))
+;; #1567: a name in both tables, by:
+(at (select {from: t by: g r: (count (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- [3 3]
+(at (select {from: t by: g r: (count (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- (at (select {from: t by: g r: (count (H1))}) 'r)
+(at (select {from: t by: g r: (sum (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- (at (select {from: t by: g r: (sum (H1))}) 'r)
+(at (select {from: t by: g r: (sum (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- [3600 3600]
+(at (select {from: t by: s r: (count (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- [3 3]
+(at (select {from: t by: g r: (count (at (select {from: u x: v}) 'x))}) 'r) -- [8 8]
+;; keyless
+(at (select {from: t r: (sum (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- (at (select {from: t r: (sum (H1))}) 'r)
+(at (select {from: t r: (count (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- [3]
+;; #1568: an aggregate of another query's value, keyless, as bound first
+(set MX (max (at (select {from: u by: k x: (sum v)}) 'x)))
+(at (select {r: (sum (max (at (select {from: u by: k x: (sum v)}) 'x))) from: t}) 'r) -- (at (select {r: (sum MX) from: t}) 'r)
+(at (select {r: (sum (max (at (select {from: u by: k x: (sum v)}) 'x))) from: t}) 'r) -- [7500]
+;; combined with the outer rows, as before
+(at (select {from: t by: g r: (+ v (first (at (select {from: u x: (sum v)}) 'x)))}) 'r) -- (at (select {from: t by: g r: (+ v (first N0))}) 'r)
+;; two levels of nesting
+(at (select {from: t by: g r: (count (at (select {from: (select {from: u by: k x: (sum v)}) y: (max x)}) 'y))}) 'r) -- (at (select {from: t by: g r: (count (H2))}) 'r)
+;; an inner alias named like an outer column
+(at (select {from: t by: g r: (count (at (select {from: u by: k x: (sum v) v: (count k) z: (+ x v)}) 'z))}) 'r) -- (at (select {from: t by: g r: (count (H3))}) 'r)
+;; update, every route
+(at (update {from: t by: g r: (count (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- (at (update {from: t by: g r: (count (H1))}) 'r)
+(at (update {from: t r: (sum (at (select {from: u by: k x: (sum v)}) 'x))}) 'r) -- (at (update {from: t r: (sum (H1))}) 'r)
+(at (update {from: t r: (count (at (select {from: u by: k x: (sum v)}) 'x)) where: (> v 6)}) 'r) -- (at (update {from: t r: (count (H1)) where: (> v 6)}) 'r)
+(at (update {from: t r: (+ v (first (at (select {from: u x: (sum v)}) 'x)))}) 'r) -- [3630 3610 3620 3605 3607]
+;; read as before: a name only the outer table has (a correlated
+;; reference), dev's answers, unchanged
+(set t2 (table [g m v] (list ['a 'a 'a 'b 'b] [1 2 3 4 5] [30 10 20 5 7])))
+(at (select {from: t2 r: (+ m (first (at (select {from: u x: (sum v)}) 'x)))}) 'r) -- [3601 3602 3603 3604 3605]
+(at (select {from: t2 by: g r: (count (at (select {from: u x: k where: (> v (* 100 (first m)))}) 'x))}) 'r) -- [3 2]
+(select {from: t2 by: g r: (first (at (select {from: u x: (+ (sum v) (first m))}) 'x))}) !- schema
+;; a correlated name in the inner where: stays the outer column even when
+;; an inner output has its name: the where: does not see the outputs
+(set t3 (table [g v z] (list ['a 'a 'a 'b 'b] [30 10 20 5 7] [9 8 7 6 5])))
+(at (select {from: t3 by: g r: (count (at (select {from: u y: k z: 1 where: (> v (* 100 (first z)))}) 'y))}) 'r) -- (at (select {from: t3 by: g r: (count (at (select {from: u y: k where: (> v (* 100 (first z)))}) 'y))}) 'r)
+;; a nested select whose table is a parameter, a let, or an expression of
+;; pure builtins: its columns are its own too (#1567's common form, a helper
+;; taking a table), as the same value bound first
+(set N4 (at (select {from: (take u 3) x: v}) 'x))
+(set H4 (fn [] (let q N4) q))
+(at (select {from: t by: g r: (count (at (select {from: (take u 3) x: v}) 'x))}) 'r) -- (at (select {from: t by: g r: (count (H4))}) 'r)
+(at (select {from: t by: g r: (count (at (select {from: (take u 3) x: v}) 'x))}) 'r) -- [3 3]
+(at ((fn [q] (select {from: t by: g r: (count (at (select {from: q by: k x: (sum v)}) 'x))})) u) 'r) -- (at (select {from: t by: g r: (count (H1))}) 'r)
+(at ((fn [q] (select {from: t by: g r: (count (at (select {from: q by: k x: (sum v)}) 'x))})) u) 'r) -- [3 3]
+(at ((fn [] (let q u) (select {from: t by: g r: (count (at (select {from: q by: k x: (sum v)}) 'x))}))) 'r) -- [3 3]
+(at ((fn [q] (select {from: t r: (sum (at (select {from: q by: k x: (sum v)}) 'x))})) u) 'r) -- (at (select {from: t r: (sum (H1))}) 'r)
