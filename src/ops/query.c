@@ -18376,11 +18376,32 @@ static bool text_use_ok(ray_t* e, int64_t kid, bool* any_use, int depth) {
         if (ok_head) {
             /* `(distinct kid)` only as the argument of count */
             bool is_distinct = ray_str_len(hn) == 8 && memcmp(ray_str_ptr(hn), "distinct", 8) == 0;
+            /* A comparison, like or in reading kid: its other operands must
+             * be literals (a string, a number, a vector of them).  Another
+             * column — a genuine STR column, or another text projection,
+             * which has a text domain of its own — cannot compare with the
+             * positions; a computed operand neither. */
+            bool is_cmp = !(ray_str_len(hn) == 5 && memcmp(ray_str_ptr(hn), "count", 5) == 0) &&
+                          !(ray_str_len(hn) == 3 && (memcmp(ray_str_ptr(hn), "and", 3) == 0 ||
+                                                     memcmp(ray_str_ptr(hn), "not", 3) == 0)) &&
+                          !(ray_str_len(hn) == 2 && memcmp(ray_str_ptr(hn), "or", 2) == 0) &&
+                          !(ray_str_len(hn) == 4 && memcmp(ray_str_ptr(hn), "nil?", 4) == 0) &&
+                          !(ray_str_len(hn) == 6 && memcmp(ray_str_ptr(hn), "strlen", 6) == 0) &&
+                          !is_distinct;
+            bool reads_kid = false;
+            for (int64_t i = 1; i < e->len && !reads_kid; i++)
+                reads_kid = el[i] && el[i]->type == -RAY_SYM && el[i]->i64 == kid && !(el[i]->attrs & ATTR_QUOTED);
             for (int64_t i = 1; i < e->len; i++) {
                 ray_t* a = el[i];
                 if (a && a->type == -RAY_SYM && a->i64 == kid && !(a->attrs & ATTR_QUOTED)) {
                     if (is_distinct && depth == 0) return false;
                     *any_use = true;
+                    continue;
+                }
+                if (is_cmp && reads_kid) {
+                    bool literal = a && ((ray_is_atom(a) && !(a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED))) ||
+                                         (ray_is_vec(a) && a->type != RAY_LIST && !(a->attrs & ATTR_QUOTED)));
+                    if (!literal) return false;
                     continue;
                 }
                 if (!text_use_ok(a, kid, any_use, depth + 1)) return false;

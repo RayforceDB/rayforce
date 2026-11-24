@@ -84,3 +84,26 @@
 (all (== (FP G3) (FP G3R))) -- true
 (set O3 (select {from: (select {from: (select {from: T2 lu: (lower URL) kind: (if (like lu "*.html") "html" (like lu "*.php") "php" (like lu "*.jpg") "jpg" "other") v: v}) by: [kind v]}) by: [kind] d: (count v) asc: kind}))
 (all (== (at G3 'd) (at O3 'd))) -- true
+;; an output the outer select compares with a genuine STR column, or with
+;; another output, is built row-wise (STR): the per-symbol positions have
+;; a domain of their own and compare with literals only
+(set s (at ["html" "php" "x"] (% i 3)))
+(set Ts (table [URL s v] (list U s (% (* 7919 i) 2003))))
+(set Ms (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") k2: (if (like lu "*.php") "php" "html") s: s v: v}))
+(set m0 (runs))
+(set Cs (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind s) c: (count v)}))
+(- (runs) m0) -- 1
+(at (at Cs 'c) 0) -- (at (at (select {from: Ms where: (== kind s) c: (count v)}) 'c) 0)
+(at (at Cs 'c) 0) -- (sum (== (at Ms 'kind) (at Ms 's)))
+(set m0 (runs))
+(set Ck (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") k2: (if (like lu "*.php") "php" "html") v: v}) where: (== kind k2) c: (count v) m: (max k2)}))
+(- (runs) m0) -- 1
+(at (at Ck 'c) 0) -- (at (at (select {from: Ms where: (== kind k2) c: (count v) m: (max k2)}) 'c) 0)
+(as 'STR (at (at Ck 'm) 0)) -- (max (at Ms 'k2))
+(at (at Ck 'c) 0) -- 6000
+;; compared with a literal, the output stays per symbol and answers the same
+(set m0 (runs))
+(set Cl (select {from: (select {from: Ts lu: (lower URL) kind: (if (like lu "*.html") "html" "php") s: s v: v}) where: (== kind "html") c: (count v)}))
+(- (runs) m0) -- 0
+(at (at Cl 'c) 0) -- (sum (== (at Ms 'kind) "html"))
+(at (at Cl 'c) 0) -- 2000
