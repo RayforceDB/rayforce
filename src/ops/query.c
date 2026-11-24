@@ -15714,18 +15714,24 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
              * computed index without a where: reads every row on either
              * reading: (sum (at c (til 4))) is #1402's. */
             bool open1429 = !edge && src_reads_whole_1429(agg_src_expr, tbl, sel != NULL, 0);
+            /* A scalar the source gives stands for every row, as 1 does in
+             * (sum 1), as on the planned route: (sum (count v)) over 4 rows
+             * is 16 (#1571).  A non-inlined helper's scalar is folded once,
+             * as every route gives it ((sum (hq v)) is the count; whether
+             * that should spread too is #1576). */
+            bool spread = edge || expr_contains_agg(agg_src_expr);
             bool vconst = (edge || !open1429) && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
                           expr_vconst_on_rows(agg_src_expr, tbl, true, 0);
             if (vconst) {
                 if (src_tbl) {
                     int64_t sn = ray_table_nrows(src_tbl);
-                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn, edge);
+                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn, spread);
                     if (src) src = scalar_edge_keep_rows(src, sn, sel);
                 }
             } else if (edge || (!open1429 && !expr_contains_call_named(agg_src_expr, "enlist", 6))) {
                 /* enlist stays the per-row constructor it is in a query,
                  * under by: too: (count (enlist x)) counts the rows */
-                src = scalar_edge_src_whole(agg_src_expr, tbl, nrows, edge);
+                src = scalar_edge_src_whole(agg_src_expr, tbl, nrows, spread);
             }
             if (!src) src = rw_if_mix_err(agg_src_expr, tbl);
             if (!src) {
