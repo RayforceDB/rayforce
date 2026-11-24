@@ -172,6 +172,13 @@ bool ray_ipc_auto_journal_eval(void);
  * IPC listener) saves it, sets true, evaluates, and restores the saved value,
  * exactly as eval_payload does for a native SYNC frame.  Thread-local. */
 bool ray_ipc_set_auto_journal_eval(bool enabled);
+
+/* Mark the arguments of a request list `(f arg ...)` with
+ * RAY_EVAL_LITERAL_FALLBACK, recursively: an argument list whose head does
+ * not resolve, or resolves to a value that is not callable, evaluates to
+ * itself.  A live request is evaluated so, and journal replay marks a
+ * journaled request the same way, so it rebuilds the same state (#1006). */
+void ray_ipc_mark_request_args(ray_t* msg);
 #define RAY_IPC_HAS_SET_AUTO_JOURNAL_EVAL 1
 #ifdef DEBUG
 void ray_ipc_set_auto_journal_eval_for_test(bool enabled);
