@@ -444,6 +444,20 @@ no value per row; under `by:` it is applied to each group's rows, so
 `(sum (except v 10))` sums each group's values other than 10. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
 
+A keyless select of aggregates answers one row whatever rows it reads.
+Over a table with no rows, with or without `where:`, and over a `where:`
+that keeps no row, each aggregate gives its answer over no values:
+`count` `0`, `sum` `0`, `prod` `1`, `all` `true`, `any` `false`, and the
+null of its type for `min`, `max`, `avg`, `first`, `last`, `med` and the
+deviations, the same row on a plain or a parted table. A select with `by:` over
+no rows has no groups and gives no row:
+
+```lisp
+(set e (take (table [g v] (list [a b] [1 2])) 0))
+(select {s: (sum v) n: (count v) m: (min v) from: e})   ; s [0], n [0], m [0Nl]
+(select {s: (sum v) by: g from: e})                     ; no row
+```
+
 A keyless select gives every aggregate the argument `by:` gives its one
 group, whichever route evaluates it: builtin calls over the columns, such as
 `(first (at s (til 4)))`, `(sum (at c (til 4)))` or `(count (except s 'b))`,
@@ -568,8 +582,8 @@ the builtin's `type` error, as a vector is; a null, or a value outside
 `0..1` (`0..100` for `percentile`), is its `domain` error. None of them
 answers the median instead. Over no rows (an empty table, or a `where:`
 that keeps none) there is no row for the probability to be wrong about:
-the select answers as for a valid probability, `[]` over an empty table
-and `[0Nf]` under such a `where:`, and `by:` gives no groups.
+the select answers as for a valid probability, `[0Nf]` over an empty
+table and under such a `where:` alike, and `by:` gives no groups.
 
 ```lisp
 (set q (table [s t] (list [0.0 8.0 16.0 24.0] [0.1 0.2 0.3 0.4])))
