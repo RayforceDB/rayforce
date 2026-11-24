@@ -305,6 +305,17 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         { NS_Q("(select {from: _odd s: (sum (+ (* a 2) 1))})", "6"), REF },
         { NS_Q("(select {from: _odd where: (< k 2) s: (avg (+ b 1))})", "2.0"), NSR(NARROW_SUM_SELECTED) },
         { NS_Q("(select {from: _odd where: (< k 2) s: (sum (* a 2))})", "2"), NSR(NARROW_SUM_SELECTED) },
+        /* a `-` step takes the selected route too */
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (- b 1))})", "9223372036854775806"), NSR(NARROW_SUM_SELECTED) },
+        /* `1 - b` parses as a negated term: proved by the full-table
+         * min/max scan, then filtered by the selected loop (SCAN, not the
+         * dev fallback). The answer still matches the eager one. */
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (- 1 b))})", "-9223372036854775806"), NSR(NARROW_SUM_SCAN) },
+        /* a five-step chain passes SC_SELECTED_STEPS (4): the selected
+         * planner declines it; the linear proof still covers the narrow
+         * terms by the full-table min/max scan (SCAN), and the filter is
+         * applied over that. The answer matches the eager one. */
+        { NS_Q("(select {from: _odd where: (< k 2) s: (sum (+ (* (+ (+ (* k 2) 1) 1) 2) 3))})", "18"), NSR(NARROW_SUM_SCAN) },
         /* INT64_MAX + 2 wraps to MIN + 1, which is a value, not null. */
         { NS_Q("(select {from: _odd s: (sum (+ b 2))})", "-9223372036854775801"), REF },
         { NS_Q("(select {from: _odd s: (sum (* k 2))})", "6"), SCAN | PRE },
