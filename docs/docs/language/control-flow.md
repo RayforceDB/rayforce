@@ -75,7 +75,10 @@ In a chain, a boolean-vector condition chooses per row between its result and th
 [1 20 0]
 ```
 
-Inside a compiled lambda the per-row path runs on the tree walker, so it shares the tree walker's depth limit: about five hundred `if`s nested through their then arms, each with a vector condition, raise `limit`. The same chain with scalar conditions is not affected.
+Inside a compiled lambda the per-row path runs on the tree walker, which has two limits that a scalar condition does not meet:
+
+- `if`s written inside each other's then arms, each with a vector condition, share the tree walker's depth limit: about five hundred levels raise `limit`.
+- A lambda that calls itself from an arm of an `if` with a vector condition holds one of the runtime's 64 scope frames per level, so about sixty levels of that recursion raise `limit` (`stack overflow`). The same lambda with a scalar condition recurses as far as any other, past two hundred levels. Prefer a loop or a fold over a mask to a recursive helper.
 
 A condition that is a single value, or a vector of another type, is unchanged: it is tested as one truth value and only the arm it takes is evaluated.
 

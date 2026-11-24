@@ -119,3 +119,12 @@ n -- 0
 (at (select {from: T3 where: (== a (if (== act 'New) (as 'sym "x") 'y))}) 'i) -- [0 1 5]
 (at (select {from: T3 where: (and (>= i 0) (== a (if (== act 'New) (as 'sym "x") 'y)))}) 'i) -- [0 1 5]
 (at (select {from: T3 where: (and (>= i 0) (== a (if (== act 'New) 'x (as 'sym "y"))))}) 'i) -- [0 1 5]
+
+;; ── recursion through an arm with a vector condition ───────────────────────
+;; each level holds one of the runtime's 64 scope frames: a depth well inside
+;; the cap answers, one past it raises limit (never a crash).  the same helper
+;; with a scalar condition is not bound by it.
+(set deepV (fn [m d] (if (== d 0) (if m 1 0) (if m (deepV m (- d 1)) 0))))
+(sum (deepV [true false true] 40)) -- 2
+(sum (deepV [true false true] 100)) !- limit
+(deepV true 150) -- 1
