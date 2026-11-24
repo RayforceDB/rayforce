@@ -3,7 +3,9 @@
 ;; spread as an atom, and over an empty table nothing of a vector is read,
 ;; whatever the lengths.  Each answer is the one the rule leaves unchanged
 ;; from before it (an error by its code), save that a keyless select over
-;; an empty table answers one row of identities (#1614).  One case per line.
+;; an empty table answers one row of identities (#1614), and a keyless top,
+;; bot or two-column aggregate the builtin's value, also over no rows
+;; (#1620).  One case per line.
 (set err (fn [e] (at e (quote code))))
 (set t (table [g v] (list (take 'a 0) (til 0))))
 (set W [7])
@@ -115,32 +117,32 @@
 (try (at (update {s: (count (distinct W)) from: t }) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- []
-(try (at (select {s: (cov W v) from: t }) 's) err) -- []
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (cov W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (scov v W) from: t }) 's) err) -- []
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (scov v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t }) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t }) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- 'length
@@ -151,14 +153,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- []
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (top W 2) from: t }) 's) err) -- []
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- []
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- []
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- []
@@ -273,32 +275,32 @@
 (try (at (update {s: (count (distinct W)) from: t }) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- []
-(try (at (select {s: (cov W v) from: t }) 's) err) -- []
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (cov W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (scov v W) from: t }) 's) err) -- []
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (scov v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t }) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t }) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- 'length
@@ -309,14 +311,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- []
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (top W 2) from: t }) 's) err) -- []
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- []
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- []
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- []
@@ -431,32 +433,32 @@
 (try (at (update {s: (count (distinct W)) from: t }) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- []
-(try (at (select {s: (cov W v) from: t }) 's) err) -- []
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (cov W v) from: t }) 's) err) -- []
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (scov v W) from: t }) 's) err) -- []
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (scov v W) from: t }) 's) err) -- []
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t }) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t }) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- []
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
@@ -467,14 +469,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- []
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (top W 2) from: t }) 's) err) -- []
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- []
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- []
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- []
@@ -589,32 +591,32 @@
 (try (at (update {s: (count (distinct W)) from: t }) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- []
-(try (at (select {s: (cov W v) from: t }) 's) err) -- []
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (cov W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (scov v W) from: t }) 's) err) -- []
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (scov v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t }) 's) err) -- []
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t }) 's) err) -- []
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- []
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- []
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- 'length
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- 'length
@@ -625,14 +627,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- []
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- []
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (top W 2) from: t }) 's) err) -- 'length
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- 'length
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- []
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- ()
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- 'length
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- 'length
@@ -748,31 +750,31 @@
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- [0Nl]
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- [1]
 (try (at (select {s: (cov W v) from: t }) 's) err) -- [0.0]
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (update {s: (cov W v) from: t }) 's) err) -- [0.0]
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- [0.0]
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
@@ -783,14 +785,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- [7.0]
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- [7.0]
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [7])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- (list [7])
 (try (at (update {s: (top W 2) from: t }) 's) err) -- [7]
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0Nl]
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- [7]
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [7])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- (list [7])
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- [7]
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0Nl]
@@ -906,31 +908,31 @@
 (try (at (update {s: (count (distinct W)) from: t where: (> v 5)}) 's) err) -- [0Nl]
 (try (at (update {s: (count (distinct W)) from: t by: g}) 's) err) -- [1]
 (try (at (select {s: (cov W v) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (cov W v) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (cov W v) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (cov W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (cov W v) from: t by: g}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (scov v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (scov v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (wavg v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (wavg v W) from: t by: g}) 's) err) -- [0Nf]
 (try (at (select {s: (wsum W v) from: t }) 's) err) -- [0.0]
-(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0.0]
 (try (at (select {s: (wsum W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (update {s: (wsum W v) from: t }) 's) err) -- [0.0]
 (try (at (update {s: (wsum W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (wsum W v) from: t by: g}) 's) err) -- [0.0]
 (try (at (select {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
-(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- []
+(try (at (select {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (select {s: (pearson_corr W v) from: t by: g}) 's) err) -- [0Nf]
 (try (at (update {s: (pearson_corr W v) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (pearson_corr W v) from: t where: (> v 5)}) 's) err) -- [0Nf]
@@ -941,14 +943,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- [0Nf]
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- [0Nf]
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- [0Nf]
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [0Nl])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- (list [])
 (try (at (update {s: (top W 2) from: t }) 's) err) -- [0Nl]
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0Nl]
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- [0Nl]
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [0Nl])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- (list [])
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- [0Nl]
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0Nl]
@@ -1099,14 +1101,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- [7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0]
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 7.0 7.0 7.0 7.0]
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- [7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0 7.0]
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [7 7])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [7 7])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- (list [7 7])
 (try (at (update {s: (top W 2) from: t }) 's) err) -- [7 7 7 7 7 7 7 7 7 7]
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 7 7 7 7]
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- [7 7 7 7 7 7 7 7 7 7]
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [7 7])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [7 7])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- (list [7 7])
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- [7 7 7 7 7 7 7 7 7 7]
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 7 7 7 7]
@@ -1257,14 +1259,14 @@
 (try (at (update {s: (quantile W 0.5) from: t }) 's) err) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
 (try (at (update {s: (quantile W 0.5) from: t where: (> v 5)}) 's) err) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
 (try (at (update {s: (quantile W 0.5) from: t by: g}) 's) err) -- [0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf 0Nf]
-(try (at (select {s: (top W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (top W 2) from: t }) 's) err) -- (list [0Nl 0Nl])
+(try (at (select {s: (top W 2) from: t where: (> v 5)}) 's) err) -- (list [0Nl 0Nl])
 (try (at (select {s: (top W 2) from: t by: g}) 's) err) -- (list [])
 (try (at (update {s: (top W 2) from: t }) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
 (try (at (update {s: (top W 2) from: t where: (> v 5)}) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
 (try (at (update {s: (top W 2) from: t by: g}) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
-(try (at (select {s: (bot W 2) from: t }) 's) err) -- [0]
-(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0]
+(try (at (select {s: (bot W 2) from: t }) 's) err) -- (list [0Nl 0Nl])
+(try (at (select {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- (list [0Nl 0Nl])
 (try (at (select {s: (bot W 2) from: t by: g}) 's) err) -- (list [])
 (try (at (update {s: (bot W 2) from: t }) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
 (try (at (update {s: (bot W 2) from: t where: (> v 5)}) 's) err) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]

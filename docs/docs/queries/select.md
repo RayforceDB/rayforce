@@ -594,6 +594,19 @@ table and under such a `where:` alike, and `by:` gives no groups.
 (select {v: (quantile s 1.25) from: q})   ; error: domain
 ```
 
+A keyless aggregate of two arguments, `cov`, `scov`, `wsum`, `wavg`,
+`pearson_corr`, `top`, `bot`, `quantile` or `percentile`, answers the
+builtin's value over the rows, whatever else the select asks for. `top`
+and `bot` give one cell, the list the builtin returns. Over no rows `cov`,
+`scov`, `wavg` and `pearson_corr` give `0Nf`, `wsum` gives `0.0`, and
+`top` and `bot` give an empty list:
+
+```lisp
+(set w (table [c f v] (list [1 5 3] [1.5 2.0 4.0] [10 20 30])))
+(select {k: (top c 2) from: w})                    ; k (list [5 3])
+(select {r: (cov c f) from: w where: (> v 99)})    ; r [0Nf]
+```
+
 ### Filter + Group-by
 
 Filter first, then group by. Chain two `select` calls for correct results:

@@ -15820,6 +15820,62 @@ static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
     return x ? x : ray_error("oom", NULL);
 }
 
+/* A data argument of a two-argument aggregate over `nrows` rows, read as
+ * the planned route reads it: a column (or an expression over columns) as
+ * it is; a vector that reads no column under the free-vector rule (#1462):
+ * over no rows nothing of it is read, and one element is spread as an atom
+ * over the rows. */
+static ray_t* scalar_binary_agg_arg(ray_t* e, ray_t* tbl, int64_t nrows) {
+    ray_t* v = eval_expr_whole_column_impl(e, tbl);
+    if (!v || RAY_IS_ERR(v) || ray_is_atom(v) || !expr_reads_no_column(e, tbl)) {
+        if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) return scalar_atom_rows(v, nrows);
+        return v;
+    }
+    if (nrows == 0 || v->len == 1) {
+        if (v->len == 0) return v;
+        int alloc = 0;
+        ray_t* x = collection_elem(v, 0, &alloc);
+        if (x && !RAY_IS_ERR(x) && !alloc) ray_retain(x);
+        ray_release(v);
+        if (!x || RAY_IS_ERR(x)) return x ? x : ray_error("oom", NULL);
+        return scalar_atom_rows(x, nrows);
+    }
+    return v;
+}
+
+/* `(fn x y)` for an aggregate of two arguments over the rows of `tbl`: the
+ * binary aggregates read both as data, top/bot/quantile/percentile the
+ * first (the second, k or the probability, is evaluated once as it is). */
+static ray_t* scalar_binary_agg_eval(ray_t* call, ray_t* tbl, int64_t nrows) {
+    ray_t** es = (ray_t**)ray_data(call);
+    ray_t* fn = ray_len(call) == 3 ? ray_env_get(es[0]->i64) : NULL;
+    if (!fn || fn->type != RAY_BINARY) return eval_expr_whole_column_impl(call, tbl);
+    uint16_t op = resolve_agg_opcode(es[0]->i64);
+    bool both = agg_is_binary_agg(op);
+    ray_t* x = scalar_binary_agg_arg(es[1], tbl, nrows);
+    if (!x || RAY_IS_ERR(x)) return x;
+    ray_t* y;
+    if (op == OP_QUANTILE && nrows == 0) {
+        /* Over no rows the probability is not checked, as the planned
+         * route reads it (#981): one that reads no column is evaluated
+         * for its own errors only, and the answer is the builtin's over
+         * no values at a valid probability. */
+        bool pct = agg_name_is_percentile(es[0]->i64);
+        double q = 0.5;
+        ray_t* perr = quantile_select_prob(es[2], tbl, NULL, NULL, pct, &q);
+        if (perr) { ray_release(x); return perr; }
+        y = ray_f64(pct ? q * 100.0 : q);
+    } else {
+        y = both ? scalar_binary_agg_arg(es[2], tbl, nrows) : eval_expr_whole_column_impl(es[2], tbl);
+    }
+    if (!y || RAY_IS_ERR(y)) { ray_release(x); return y; }
+    ray_binary_fn bf = (ray_binary_fn)(uintptr_t)fn->i64;
+    ray_t* r = ray_sig_note(ray_fn_name(fn), bf(x, y));
+    ray_release(x);
+    ray_release(y);
+    return r;
+}
+
 /* `tbl` holds the rows where: keeps; `src_tbl` and `sel`, when where: ran
  * over a flat table, the rows before it and the selection that keeps them
  * (NULL otherwise). */
@@ -15847,12 +15903,25 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         }
 
         ray_t** agg_elems = (ray_t**)ray_data(val_expr);
+        ray_t* agg_value = NULL;
         if (ray_len(val_expr) != 2) {
-            ray_release(result);
-            return ray_error("domain", "select: scalar aggregate fallback only supports unary aggregates");
+            /* An aggregate of two arguments (cov, wsum, quantile, top,
+             * ...) is the builtin's call over the kept rows, the answer
+             * the planned route gives (#1620). */
+            agg_value = scalar_binary_agg_eval(val_expr, tbl, nrows);
+            if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
+                agg_value = ray_lazy_materialize(agg_value);
+            if (!agg_value || RAY_IS_ERR(agg_value)) {
+                ray_release(result);
+                return agg_value ? agg_value : ray_error("domain", "select: scalar aggregate evaluation failed");
+            }
+            goto emit;
         }
 
         ray_t* fn_obj = ray_env_get(agg_elems[0]->i64);
+        /* `median` is the planner's name for med; it has no builtin */
+        if (!fn_obj && resolve_agg_opcode(agg_elems[0]->i64) == OP_MEDIAN)
+            fn_obj = ray_env_get(ray_sym_intern("med", 3));
         if (!fn_obj || fn_obj->type != RAY_UNARY) {
             ray_release(result);
             return ray_error("type", "select: aggregate must be a unary function, got %s",
@@ -15941,7 +16010,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
             return src ? src : ray_error("domain", "select: failed to evaluate aggregation source");
         }
 
-        ray_t* agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
+        agg_value = edge && !column_free ? scalar_edge_skip_nulls(src, uf == ray_last_fn) : NULL;
         if (!agg_value) agg_value = ray_sig_note(ray_fn_name(fn_obj), uf(src));
         ray_release(src);
         if (agg_value && !RAY_IS_ERR(agg_value) && ray_is_lazy(agg_value))
@@ -15954,6 +16023,7 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
         /* An aggregate is one value, a collection too (`(first l)` over a
          * LIST column of lists): boxed as one cell, as the compiled route
          * and each group under by: take it. */
+    emit:
         if (!ray_is_atom(agg_value)) {
             ray_t* box = ray_list_new(1);
             if (box && !RAY_IS_ERR(box)) box = ray_list_append(box, agg_value);
@@ -28856,6 +28926,9 @@ by_dict_done:
             int        s_has_binary = 0;
             int        s_has_param = 0;
             int        s_use_eval_fallback = 0;
+            /* No row to aggregate: the table is empty or the where: keeps none */
+            bool s_no_rows = ray_table_nrows(tbl) == 0 ||
+                (g->selection && ray_rowsel_meta(g->selection)->total_pass == 0);
             for (int64_t i = 0; i + 1 < dict_n; i += 2) {
                 int64_t kid = dict_elems[i]->i64;
                 if (kid == from_id || kid == where_id || kid == by_id ||
@@ -28863,6 +28936,13 @@ by_dict_done:
                 ray_t*  val_expr  = dict_elems[i + 1];
                 ray_t** agg_elems = (ray_t**)ray_data(val_expr);
                 uint16_t op = resolve_agg_opcode(agg_elems[0]->i64);
+                /* The keyless group emits top/bot as one integer cell, and a
+                 * binary aggregate over no row as no row; the evaluator gives
+                 * the builtin's answer, as by: gives each group's (#1620). */
+                if (op == OP_TOP_N || op == OP_BOT_N || (agg_is_binary_agg(op) && s_no_rows)) {
+                    s_use_eval_fallback = 1;
+                    break;
+                }
                 /* Reuse the outer exact-sized collectors: aggs_max bounds
                  * all output slots, and their storage outlives this GROUP.
                  * Presence, not nonzero bits, distinguishes q=0 from no q. */
