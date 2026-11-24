@@ -1028,6 +1028,8 @@ void ray_test_hooks_off(void) {
     ray_enccol_test_hold_decode(false);
     ray_enccol_test_parted_mode(0);
     ray_enccol_test_fail_index_parse(false);
+    ray_enccol_test_kept_limit(0);
+    ray_enccol_test_cache_drop_all();     /* before the teardown's ray_heap_destroy */
     ray_col_test_fail_alloc(0);
     ray_col_test_no_dict(false);
     ray_encw_test_force(-1);

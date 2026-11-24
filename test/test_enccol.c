@@ -2388,6 +2388,125 @@ static test_result_t test_cache_trim_at_boundary(void) {
     PASS();
 }
 
+/* A STR decode is kept with its pool: the cache counts both, the keep
+ * decision takes both, and a budget that holds the slots alone drops it. */
+static test_result_t cache_trim_str_pool_body(ray_t* v, ray_t* c, int64_t n) {
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_ENCCOL);
+    trim_with(1);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    ray_t* m = ray_enccol_materialize(c);
+    TEST_ASSERT_FMT(m && !RAY_IS_ERR(m), "materialize: %s %s", m ? ray_err_code(m) : "null", ray_error_msg() ? ray_error_msg() : "");
+    TEST_ASSERT_FMT(m->type == RAY_STR && m->len == n, "type %d len %lld", (int)m->type, (long long)m->len);
+    TEST_ASSERT_FMT(m->str_pool != NULL, "no pool");
+    TEST_ASSERT_TRUE(ray_atomic_load(&m->str_pool->rc) == 1);
+    const char* mpool = (const char*)ray_data(m->str_pool);
+    const char* vpool = v->str_pool ? (const char*)ray_data(v->str_pool) : NULL;
+    for (int64_t i = 0; i < n; i += 997) {
+        const ray_str_t* a = (const ray_str_t*)ray_data(m) + i;
+        const ray_str_t* b = (const ray_str_t*)ray_data(v) + i;
+        TEST_ASSERT_TRUE(a->len == b->len && memcmp(ray_str_t_ptr(a, mpool), ray_str_t_ptr(b, vpool), a->len) == 0);
+    }
+    int64_t slots = (int64_t)ray_block_size(m), pool = (int64_t)ray_block_size(m->str_pool);
+    TEST_ASSERT_TRUE(pool > 32);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), slots + pool);
+    /* the keep decision: the generation-0 slots and the pool, from metadata */
+    ray_enccol_test_kept_limit(slots + pool - 64);
+    TEST_ASSERT_TRUE(ray_enccol_decode_kept(c));
+    ray_enccol_test_kept_limit(slots + pool - 65);
+    TEST_ASSERT_FALSE(ray_enccol_decode_kept(c));
+    ray_enccol_test_kept_limit(0);
+    /* a budget the slots fit but not the pool drops the decode */
+    trim_with(4 * (slots + 4096));
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(c));
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    ray_t* m2 = ray_enccol_materialize(c);           /* decodes again, kept by a budget both fit */
+    TEST_ASSERT_TRUE(m2 && !RAY_IS_ERR(m2) && m2->len == n);
+    trim_with(4 * (slots + pool + 4096));
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(c), m2);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), slots + pool);
+    PASS();
+}
+/* The column and its source are released on every exit path: a leaked
+ * column would stay listed with a decode into the destroyed heap. */
+static test_result_t test_cache_trim_str_pool(void) {
+    const int64_t n = 70000;
+    ray_t* v = make_col(RAY_STR, n, 2);                 /* texts past the 12-byte inline slot: pooled */
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, ray_test_tmp(ENCCOL_TMP "/ts"), 2), RAY_OK);
+    ray_t* c = ray_col_mmap(ray_test_tmp(ENCCOL_TMP "/ts"));
+    test_result_t r = cache_trim_str_pool_body(v, c, n);
+    if (c && !RAY_IS_ERR(c)) ray_release(c);
+    ray_release(v);
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);      /* a freed column leaves the list */
+    PASS();
+}
+
+/* A parted decode is a vector of its segments' plain columns, each held by
+ * its own segment's cache too.  The cache counts the encoded segments under
+ * the parted decode while it holds them and under their own entries once it
+ * is dropped, the keep decision sums the segments, and one boundary drops
+ * the parted decode and then its segments down to the budget. */
+static test_result_t cache_trim_parted_body(ray_t* t, ray_t* copy, int64_t n) {
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    trim_with(1);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    int64_t a = ray_sym_intern("a", 1);
+    ray_t* enc = ray_table_get_col_enc(t, a);
+    TEST_ASSERT_TRUE(enc && ray_enccol_is_parted(enc));
+    ray_t* s0 = ray_enccol_seg(enc, 0); ray_t* s2 = ray_enccol_seg(enc, 2);
+    TEST_ASSERT_TRUE(s0 && s0->type == RAY_ENCCOL && s2 && s2->type == RAY_ENCCOL);
+    TEST_ASSERT_EQ_I(ray_enccol_seg(enc, 1)->type, RAY_I64);
+    const int64_t seg = n * 8 + 32;                  /* one segment's decode */
+    ray_enccol_test_kept_limit(3 * n * 8);           /* the three segments, the plain one as it is */
+    TEST_ASSERT_TRUE(ray_enccol_decode_kept(enc));
+    ray_enccol_test_kept_limit(3 * n * 8 - 1);
+    TEST_ASSERT_FALSE(ray_enccol_decode_kept(enc));
+    ray_enccol_test_kept_limit(0);
+
+    ray_t* w = ray_table_col(t, a);                  /* decodes both encoded segments */
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && w->type == RAY_PARTED_BASE + RAY_I64 && w->len == 3);
+    ray_t** segs = (ray_t**)ray_data(w);
+    TEST_ASSERT_EQ_PTR(segs[0], ray_enccol_decoded_peek(s0));
+    TEST_ASSERT_EQ_PTR(segs[2], ray_enccol_decoded_peek(s2));
+    int64_t head = (int64_t)ray_block_size(w);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), head + 2 * seg);
+    memcpy(ray_data(copy), ray_data(segs[0]), (size_t)n * 8);
+
+    /* a budget one segment fits: the parted decode goes, then one segment */
+    trim_with(4 * (seg + 4096));
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(enc));
+    TEST_ASSERT_TRUE((ray_enccol_decoded_peek(s0) != NULL) != (ray_enccol_decoded_peek(s2) != NULL));
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), seg);
+    trim_with(1);
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(s0));
+    TEST_ASSERT_NULL(ray_enccol_decoded_peek(s2));
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+
+    ray_t* w2 = ray_table_col(t, a);                 /* decodes again: the same rows */
+    TEST_ASSERT_TRUE(w2 && !RAY_IS_ERR(w2) && w2->len == 3);
+    ray_t** segs2 = (ray_t**)ray_data(w2);
+    TEST_ASSERT_TRUE(segs2[0] && segs2[0]->len == n && memcmp(ray_data(segs2[0]), ray_data(copy), (size_t)n * 8) == 0);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), head + 2 * seg);
+    trim_with(4 * (head + 2 * seg + 4096));          /* a budget all fit keeps all */
+    TEST_ASSERT_EQ_PTR(ray_enccol_decoded_peek(enc), w2);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), head + 2 * seg);
+    PASS();
+}
+/* The table and the copy are released on every exit path (see above). */
+static test_result_t test_cache_trim_parted(void) {
+    const int64_t n = 3000;
+    TEST_ASSERT_EQ_I(write_parted(ray_test_tmp(ENCCOL_TMP "/tp"), 0x5, n), RAY_OK);   /* parts 1 and 3 encoded */
+    ray_t* t = ray_read_parted(ray_test_tmp(ENCCOL_TMP "/tp"), "t");
+    ray_t* copy = ray_vec_new(RAY_I64, n); copy->len = n;
+    test_result_t r = cache_trim_parted_body(t, copy, n);
+    ray_release(copy);
+    if (t && !RAY_IS_ERR(t)) ray_release(t);
+    ray_parted_cache_clear();                        /* the partitions' tables hold the segments */
+    if (r.status != TEST_PASS) return r;
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), 0);
+    PASS();
+}
+
 /* (take tbl n) and the table display read an encoded column's taken or
  * shown rows by range: neither leaves the column decoded whole.  A plain
  * read still does. */
@@ -2581,6 +2700,8 @@ const test_entry_t enccol_entries[] = {
     { "enccol/decode_kept_budget",    test_decode_kept_budget,    enccol_setup, enccol_teardown },
     { "enccol/gather_span_bounded_read_window", test_gather_span_bounded_read_window, enccol_setup, enccol_teardown },
     { "enccol/cache_trim_at_boundary", test_cache_trim_at_boundary, enccol_setup, enccol_teardown },
+    { "enccol/cache_trim_str_pool",   test_cache_trim_str_pool,   enccol_setup, enccol_teardown },
+    { "enccol/cache_trim_parted",     test_cache_trim_parted,     enccol_setup, enccol_teardown },
     { "enccol/point_raw",           test_point_raw,           enccol_setup, enccol_teardown },
     { "enccol/want_points",         test_want_points,         enccol_setup, enccol_teardown },
     { "enccol/open_returns_enccol", test_open_returns_enccol, enccol_setup, enccol_teardown },

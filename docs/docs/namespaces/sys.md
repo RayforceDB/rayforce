@@ -128,6 +128,7 @@ watermark, a few diagnostic counters and the symbol-table size, all `i64`:
 | `anon-committed` | **Anonymous RAM** the heap has committed: buddy pools, direct blocks and sys blocks (off-heap tables such as the symbol arenas). Spill-file mappings are not counted. The figure checked against `anon-watermark`. |
 | `anon-peak` | High-watermark of `anon-committed` since process start — the peak RAM the workload demanded, spill excluded. |
 | `anon-watermark` | **Spill threshold** in bytes: a new pool, direct or sys block that would push `anon-committed` past it is mapped over a disk spill file instead of anonymous RAM. Set by `-m SIZE` / `--mem SIZE`; by default the RAM limit (physical RAM, or the cgroup memory limit when smaller) less a quarter of it, at least 3 GiB and at most half, left to the page cache. |
+| `decode-cache-bytes` | Bytes held by the decoded copies of compressed table columns kept from one statement to the next — a string column's pool and a parted column's segments included. The cache is trimmed to a quarter of `anon-watermark` at statement boundaries (after each IPC request and each REPL line; a script trims at its end). |
 | `locked-bytes` | Bytes of the heap's mappings locked against swap-out (Linux): the mapped size, which is what `RLIMIT_MEMLOCK` counts, not the resident pages — a page is locked when it is first touched. At most the smaller of `anon-watermark` and half the RAM limit. |
 | `lock-failed` | Times the kernel refused a lock, or a page release could not lock its range again, since start. |
 | `lock-skipped` | Bytes, summed since start, that the heap mapped under the watermark but left unlocked: past the bound, past `RLIMIT_MEMLOCK`, or refused. The heap works on, unlocked. |
@@ -162,6 +163,7 @@ symbol table where it found it.
 ;;     peak-bytes: 28672, slab-hits: 354, sys-current: 34836480,
 ;;     sys-mapped: 0, sys-mapped-peak: 0, anon-committed: 34795520,
 ;;     anon-peak: 34799616, anon-watermark: 50178081792,
+;;     decode-cache-bytes: 0,
 ;;     group-perpart-runs: 0, group-boxed-i64-runs: 0, asof-perpart-runs: 0,
 ;;     sort-perpart-runs: 0,
 ;;     window-perpart-runs: 0, join-perpart-runs: 0,
