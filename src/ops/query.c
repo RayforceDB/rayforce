@@ -22193,6 +22193,73 @@ static bool prune_where_not_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     return true;
 }
 
+/* Row-local spellings that carry no ATOMIC flag (#1604).  Each is checked
+ * against its native builtin, so a rebound spelling stays declined. */
+
+/* (quote <sym>): the symbol itself, never a column, whatever the source
+ * holds: the spelling a query uses for a symbol named like a column. */
+static bool prune_quote_sym(ray_t* e, ray_t* tbl) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 2) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    return fn && fn->type == RAY_VARY && (fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_vary_fn)(uintptr_t)fn->i64 == ray_quote_fn && prune_head_named(el[0], "quote") &&
+           el[1] && el[1]->type == -RAY_SYM && !(el[1]->attrs & ATTR_QUOTED);
+}
+
+/* A literal value: an atom that is not a name (a quoted symbol naming no
+ * column of `tbl`, which would read that column), or with `vec` a typed
+ * vector literal or (list <such atoms>). */
+static bool prune_literal(ray_t* x, ray_t* tbl, bool vec) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (x->type == -RAY_SYM)
+        return (x->attrs & ATTR_QUOTED) && !ray_table_slot(tbl, x->i64);
+    if (x->type < 0) return true;
+    if (!vec || (x->attrs & ATTR_QUOTED)) return false;
+    if (x->type != RAY_LIST) return x->type != RAY_SYM && ray_is_vec(x);   /* a SYM vector may hold names */
+    ray_t** el = (ray_t**)ray_data(x);
+    int64_t n = ray_len(x);
+    ray_t* fn = n >= 2 ? prune_head_fn(el[0], tbl) : NULL;
+    if (!fn || fn->type != RAY_VARY || (fn->attrs & RAY_FN_SPECIAL_FORM) ||
+        (ray_vary_fn)(uintptr_t)fn->i64 != ray_list_fn || !prune_head_named(el[0], "list")) return false;
+    for (int64_t i = 1; i < n; i++)
+        if (!el[i] || el[i]->type >= 0 || !prune_literal(el[i], tbl, false)) return false;
+    return true;
+}
+
+/* (as 'T <literal>): one constant whatever the source, so an operand reads
+ * it as it reads a literal: (as 'GUID "…") beside a GUID column.  `vec`: the
+ * literal may be a vector, for the set of an `in`; elsewhere a vector's
+ * length would meet the row count.  The type name must name no column
+ * either, or the cast would read it. */
+static bool prune_const_cast(ray_t* e, ray_t* tbl, bool vec) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 3) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* fn = prune_head_fn(el[0], tbl);
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_cast_fn && prune_head_named(el[0], "as") &&
+           el[1] && el[1]->type == -RAY_SYM && (el[1]->attrs & ATTR_QUOTED) &&
+           !ray_table_slot(tbl, el[1]->i64) && prune_literal(el[2], tbl, vec);
+}
+
+/* (nil? x): a BOOL per row of x. */
+static bool prune_nil_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_UNARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_unary_fn)(uintptr_t)fn->i64 == ray_nil_fn && prune_head_named(head, "nil?");
+}
+
+/* (like x pattern) with a constant pattern string: a BOOL per row of x. */
+static bool prune_like_head(ray_t* head, ray_t* fn) {
+    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
+           (ray_binary_fn)(uintptr_t)fn->i64 == ray_like_fn && prune_head_named(head, "like");
+}
+
+static bool prune_like_pattern(ray_t* x, ray_t* tbl) {
+    if (x && x->type == -RAY_STR) return true;
+    ray_t* b = prune_bound_const(x, tbl, false);
+    return b && b->type == -RAY_STR;
+}
+
 /* `mode`: 0 outside where:; 1 in where:, at a conjunct; 2 in where:, an
  * operand of a call. */
 static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
@@ -22205,6 +22272,8 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         return c && !RAY_IS_ERR(c);
     }
     if (e->type < 0) return true;
+    /* a symbol or a cast constant written as a call (#1604) */
+    if (prune_quote_sym(e, tbl) || prune_const_cast(e, tbl, false)) return true;
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) < 2) return false;
     ray_t** el = (ray_t**)ray_data(e);
     int64_t n = ray_len(e);
@@ -22213,8 +22282,23 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
         int budget = PRUNE_IF_MAX_VISITS;
         if (prune_if_cond(el[1], tbl, &budget, 0)) return true;
         budget = PRUNE_IF_MAX_VISITS;
-        return mode && prune_where_not_cond(el[1], tbl, &budget, 0);
+        if (mode && prune_where_not_cond(el[1], tbl, &budget, 0)) return true;
+        /* in where:, a `not` over an `in` or a `nil?` this walk admits: a
+         * BOOL per row, so the `not` reads only that row (#1604) */
+        ray_t* in = el[1];
+        if (!mode || !in || in->type != RAY_LIST || (in->attrs & ATTR_QUOTED) || ray_len(in) < 2) return false;
+        ray_t** il = (ray_t**)ray_data(in);
+        ray_t* ifn = prune_head_fn(il[0], tbl);
+        if ((ray_len(in) == 3 && prune_cmp_op(il[0], ifn) == OP_IN) ||
+            (ray_len(in) == 2 && prune_nil_head(il[0], ifn)))
+            return prune_where_elementwise_impl(in, tbl, 2);
+        return false;
     }
+    /* nil? and like (a constant pattern) answer a BOOL per row (#1604) */
+    if (n == 2 && prune_nil_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, mode ? 2 : 0);
+    if (n == 3 && prune_like_head(el[0], fn))
+        return prune_where_elementwise_impl(el[1], tbl, mode ? 2 : 0) && prune_like_pattern(el[2], tbl);
     /* An operand IF in where: (#1181), of the bounded ungrouped grammar: a
      * value per row, never a necessary partition constraint (the mask reads
      * no comparison below it). The route (compiled per row or interpreted)
@@ -22240,7 +22324,8 @@ static bool prune_where_elementwise_impl(ray_t* e, ray_t* tbl, int mode) {
     if (prune_cmp_op(el[0], fn) == OP_IN && n == 3)
         return prune_where_elementwise_impl(el[1], tbl, sub) && el[2] &&
                ((el[2]->type > 0 && el[2]->type != RAY_LIST) ||
-                prune_bound_const(el[2], tbl, true));        /* a set: a typed vector, written or bound */
+                prune_bound_const(el[2], tbl, true) ||       /* a set: a typed vector, written or bound */
+                prune_const_cast(el[2], tbl, true));         /* or cast from literals (#1604) */
     if (prune_logic_head(el[0], fn)) {
         sub = mode ? 1 : 0;              /* a logic operand is a condition, not an IF */
     } else {

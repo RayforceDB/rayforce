@@ -253,7 +253,7 @@ A partition may hold fewer columns than the first one, as long as the columns it
 
 The optimizer can derive a necessary partition mask from literal comparisons or literal `in` sets on the virtual `MAPCOMMON` partition column. It applies that mask only when the remaining query shape is safe to evaluate over the retained partitions. The original `where` still runs. This is not a guarantee that every query with a date bound prunes, nor a count of physical file opens or reads.
 
-Ordinary row-local atomic expressions retain their uncapped admission walk. Canonical nested `and`/`or`, restricted `not` conditions, grouped unary `first`/`last`, and output `count(distinct column)` can retain pruning too. Call heads shadowed by lexical bindings or source columns are not assumed to be the corresponding builtin.
+Ordinary row-local atomic expressions retain their uncapped admission walk. Canonical nested `and`/`or`, restricted `not` conditions, grouped unary `first`/`last`, and output `count(distinct column)` can retain pruning too. So do these row-local spellings, in `where:` and in outputs: `like` with a constant pattern string, `nil?`, a symbol written `(quote x)` (always the symbol, even when a column is named `x`), and a cast of literals such as `(as 'GUID "…")`, or `(as 'GUID (list "…" "…"))` as the set of an `in`; in `where:`, a `not` over such an `in` or over `nil?` too. Call heads shadowed by lexical bindings or source columns are not assumed to be the corresponding builtin.
 
 Two additional IF shapes have deliberately bounded proofs:
 
