@@ -20309,7 +20309,6 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                     if (__VM->raise_val) { ray_release(__VM->raise_val); __VM->raise_val = NULL; }
                     if (__VM->return_val) { ray_release(__VM->return_val); __VM->return_val = NULL; }
                     ray_clear_error_trace();
-                    __VM->err.msg[0] = '\0';
                 }
                 else if (keyvec) ray_release(keyvec);
                 keyvec = eval_expr_per_row(by_expr, base, nrows);

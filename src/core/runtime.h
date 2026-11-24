@@ -25,12 +25,6 @@
 
 #include <rayforce.h>
 
-/* ===== Error Info (per-VM, ephemeral) ===== */
-
-typedef struct {
-    char msg[256];
-} ray_err_info_t;
-
 /* ===== Scope Frame ===== */
 
 #define RAY_SCOPE_CAP  64
@@ -164,7 +158,6 @@ typedef struct {
     int32_t          lambda_depth; /* lambda bodies running on this thread
                                     * (tree-walked calls and VM runs); a
                                     * `return` outside any is its value */
-    ray_err_info_t   err;
     /* ── big: lexical scope stack, own cache lines */
     ray_scope_frame_t scope_stack[RAY_SCOPE_CAP];
 } ray_vm_t;
@@ -218,7 +211,7 @@ ray_runtime_t* ray_runtime_create_with_sym(const char* sym_path);
 ray_runtime_t* ray_runtime_create_with_sym_err(const char* sym_path,
                                                ray_err_t* out_sym_err);
 
-/* Error API — allocates ray_t with type=RAY_ERROR, sets __VM->err.msg */
+/* Error API — allocates ray_t with type=RAY_ERROR holding its own message */
 ray_t* ray_error(const char* code, const char* fmt, ...);
 /* Read error code from a RAY_ERROR object (returns pointer to sdata) */
 const char* ray_err_code(ray_t* err);

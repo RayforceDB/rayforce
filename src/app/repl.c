@@ -432,8 +432,8 @@ static void print_banner(void) {
 /* The detail printed after an error code: the error's own message, or else
  * the value of an uncaught (raise x), which carries no message.  `buf`
  * holds the rendering; ray_raise_render bounds it to `cap`. */
-static const char* repl_error_detail(char* buf, size_t cap) {
-    const char* detail = ray_error_msg();
+static const char* repl_error_detail(ray_t* err, char* buf, size_t cap) {
+    const char* detail = ray_err_msg(err);
     if (detail) return detail;
     return ray_raise_render(buf, cap) ? buf : NULL;
 }
@@ -443,7 +443,7 @@ static void fmt_error_with_trace(FILE* fp, ray_t* err, ray_t* trace, bool use_co
     char err_code[8] = {0};
     memcpy(err_code, err->sdata, err->slen < 7 ? err->slen : 7);
     char raised[512];
-    const char* detail = repl_error_detail(raised, sizeof(raised));
+    const char* detail = repl_error_detail(err, raised, sizeof(raised));
 
     fprintf(fp, "\n");
     if (use_color) fprintf(fp, "\033[1;31m");
@@ -565,7 +565,7 @@ static void repl_print_result(FILE* fp, ray_t* val, bool use_color) {
             if (use_color) fprintf(fp, "\033[1;31m");
             fprintf(fp, "error: %s", err_code);
             char raised[512];
-            const char* detail = repl_error_detail(raised, sizeof(raised));
+            const char* detail = repl_error_detail(val, raised, sizeof(raised));
             if (detail) fprintf(fp, ": %s", detail);
             if (ray_error_usage()) fprintf(fp, "; usage: %s", ray_error_usage());
             if (use_color) fprintf(fp, "\033[0m");

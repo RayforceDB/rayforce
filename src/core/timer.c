@@ -221,7 +221,7 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
                 char code[8] = {0};
                 char raised[512];
                 memcpy(code, result->sdata, result->slen < 7 ? result->slen : 7);
-                const char* detail = ray_error_msg();
+                const char* detail = ray_err_msg(result);
                 if (!detail && ray_raise_render(raised, sizeof raised)) detail = raised;
                 fprintf(stderr, "timer %lld: error: %s%s%s\n",
                         (long long)timer->id, code,
