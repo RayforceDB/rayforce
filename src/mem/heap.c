@@ -38,6 +38,7 @@
 #include "table/domain.h"
 #include "lang/eval.h"
 #include "store/hnsw.h"
+#include "store/embmodel.h"
 #include "store/csr.h"
 #include "store/part.h"
 #include "ops/datalog.h"
@@ -1292,6 +1293,13 @@ RAY_INLINE void ray_release_owned_refs(ray_t* v) {
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
             return;
         }
+        /* I64 atom tagged as an embedding model holds one reference to it. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_EMBMODEL)) {
+            ray_embmodel_release((ray_embmodel_t*)(uintptr_t)v->i64);
+            v->i64 = 0;
+            v->attrs &= (uint8_t)~RAY_ATTR_EMBMODEL;
+            return;
+        }
         /* I64 atom tagged as a Datalog program owns the program block.  The
          * explicit dl-free path clears the tag and pointer after early
          * release, so scope cleanup does not free the program a second time. */
@@ -1450,6 +1458,12 @@ bool ray_retain_owned_refs(ray_t* v) {
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
             return true;
         }
+        /* An embedding model is shared by count: the copy is an owner of
+         * its own, of the same model. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_EMBMODEL)) {
+            ray_embmodel_retain((ray_embmodel_t*)(uintptr_t)v->i64);
+            return true;
+        }
         /* Datalog program handles follow the graph handle policy: the
          * shallow block copy is not a second owner, so detach its pointer. */
         if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_DLPROG)) {
@@ -1568,6 +1582,12 @@ static void ray_detach_owned_refs(ray_t* v) {
         if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_GRAPH)) {
             v->i64 = 0;
             v->attrs &= (uint8_t)~RAY_ATTR_GRAPH;
+            return;
+        }
+        /* The reference to an embedding model moved with the memcpy. */
+        if (v->type == -RAY_I64 && (v->attrs & RAY_ATTR_EMBMODEL)) {
+            v->i64 = 0;
+            v->attrs &= (uint8_t)~RAY_ATTR_EMBMODEL;
             return;
         }
         /* Datalog program ownership moved with the memcpy; keep the old

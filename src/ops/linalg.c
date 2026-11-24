@@ -257,7 +257,46 @@ static void gemm_tiled_##SUF(const lin_t* A, const lin_t* B, T* C,            \
                              int64_t k, int64_t c, int64_t i0, int64_t i1) {  \
     for (int64_t j0 = 0; j0 < c; j0 += LIN_JTILE) {                           \
         int64_t j1 = j0 + LIN_JTILE < c ? j0 + LIN_JTILE : c;                 \
-        for (int64_t i = i0; i < i1; i++) {                                   \
+        int64_t i = i0;                                                       \
+        /* Four rows of A against four of B: each row of B is read once for   \
+         * sixteen products, where a row of A at a time reads it for four. */ \
+        for (; i + 4 <= i1; i += 4) {                                         \
+            T* restrict C0 = C + i * c;                                       \
+            T* restrict C1 = C + (i + 1) * c;                                          \
+            T* restrict C2 = C + (i + 2) * c;                                          \
+            T* restrict C3 = C + (i + 3) * c;                                          \
+            const T* A0 = (const T*)A->rp[i];                                 \
+            const T* A1 = (const T*)A->rp[i + 1];                             \
+            const T* A2 = (const T*)A->rp[i + 2];                             \
+            const T* A3 = (const T*)A->rp[i + 3];                             \
+            int64_t l = 0;                                                    \
+            for (; l + 4 <= k; l += 4) {                                      \
+                const T* B0 = (const T*)B->rp[l];                             \
+                const T* B1 = (const T*)B->rp[l + 1];                         \
+                const T* B2 = (const T*)B->rp[l + 2];                         \
+                const T* B3 = (const T*)B->rp[l + 3];                         \
+                T a00 = A0[l], a01 = A0[l + 1], a02 = A0[l + 2], a03 = A0[l + 3];\
+                T a10 = A1[l], a11 = A1[l + 1], a12 = A1[l + 2], a13 = A1[l + 3];\
+                T a20 = A2[l], a21 = A2[l + 1], a22 = A2[l + 2], a23 = A2[l + 3];\
+                T a30 = A3[l], a31 = A3[l + 1], a32 = A3[l + 2], a33 = A3[l + 3];\
+                for (int64_t j = j0; j < j1; j++) {                           \
+                    T b0 = B0[j], b1 = B1[j], b2 = B2[j], b3 = B3[j];         \
+                    C0[j] += a00 * b0 + a01 * b1 + a02 * b2 + a03 * b3;       \
+                    C1[j] += a10 * b0 + a11 * b1 + a12 * b2 + a13 * b3;       \
+                    C2[j] += a20 * b0 + a21 * b1 + a22 * b2 + a23 * b3;       \
+                    C3[j] += a30 * b0 + a31 * b1 + a32 * b2 + a33 * b3;       \
+                }                                                             \
+            }                                                                 \
+            for (; l < k; l++) {                                              \
+                const T* Bl = (const T*)B->rp[l];                             \
+                T a0 = A0[l], a1 = A1[l], a2 = A2[l], a3 = A3[l];             \
+                for (int64_t j = j0; j < j1; j++) {                           \
+                    T b = Bl[j];                                              \
+                    C0[j] += a0 * b; C1[j] += a1 * b; C2[j] += a2 * b; C3[j] += a3 * b;\
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+        for (; i < i1; i++) {                                                 \
             T* restrict Ci = C + i * c;                                       \
             const T* Ai = (const T*)A->rp[i];                                 \
             int64_t l = 0;                                                    \
@@ -305,6 +344,18 @@ static void gemm_k_##SUF(const lin_t* A, const lin_t* B, T* C,                \
 
 DEF_GEMM(f64, double)
 DEF_GEMM(f32, float)
+
+/* The tiled F32 kernel for callers that hold their matrices as rows already:
+ * C[r x cols] += A[r x k] * B[k x cols], each of a and b an array of row
+ * pointers, c one block.  It adds into c, so a caller that wants a bias under
+ * the product writes the bias there first.  The rows of b should lie in one
+ * block (see lin_gemm for why); those of a may lie anywhere.  One thread. */
+void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
+                          int64_t r, int64_t k, int64_t cols) {
+    lin_t A = { .r = r, .c = k,    .rp = (const void**)a, .buf = NULL, .is_vec = false, .f32 = true };
+    lin_t B = { .r = k, .c = cols, .rp = (const void**)b, .buf = NULL, .is_vec = false, .f32 = true };
+    gemm_tiled_f32(&A, &B, c, k, cols, 0, r);
+}
 
 typedef struct {
     const lin_t *A, *B;
@@ -400,7 +451,14 @@ static bool lin_gemm_run(const lin_t* A, const lin_t* B, void* C,
         } else {
             nt = r < nw * 2 ? r : nw * 2;
             if (nt < 2) par = false;
-            else { g.rchunk = (r + nt - 1) / nt; nt = (r + g.rchunk - 1) / g.rchunk; }
+            else {
+                /* A multiple of four: the kernel takes rows four at a time
+                 * from where a task begins, so a row is computed the same
+                 * way whatever the number of workers. */
+                g.rchunk = ((r + nt - 1) / nt + 3) & ~(int64_t)3;
+                nt = (r + g.rchunk - 1) / g.rchunk;
+                if (nt < 2) par = false;
+            }
         }
         if (par) {
             ray_pool_dispatch_n(pool, gemm_task, &g, (uint32_t)nt);
@@ -508,6 +566,62 @@ static __attribute__((noinline)) void tile4_##SUF(const T* const* a, const T* co
 }
 DEF_TILE(f64, double, lin_v4d, 4)
 DEF_TILE(f32, float,  lin_v8f, 8)
+
+/* Two rows against four, F32: eight sums, which with the six rows read fit
+ * the sixteen registers AVX2 has; the tile of four by four above keeps
+ * sixteen sums and spills there. */
+static __attribute__((noinline)) void tile24_f32(const float* a0, const float* a1, const float* const* b,
+                                                 int64_t n, float out[8]) {
+    lin_v8f s00 = {0}, s01 = {0}, s02 = {0}, s03 = {0}, s10 = {0}, s11 = {0}, s12 = {0}, s13 = {0};
+    const float *b0 = b[0], *b1 = b[1], *b2 = b[2], *b3 = b[3];
+    int64_t l = 0;
+    for (; l + 8 <= n; l += 8) {
+        lin_v8f x0 = ld_f32(a0 + l), x1 = ld_f32(a1 + l);
+        lin_v8f y0 = ld_f32(b0 + l), y1 = ld_f32(b1 + l), y2 = ld_f32(b2 + l), y3 = ld_f32(b3 + l);
+        s00 += x0 * y0; s01 += x0 * y1; s02 += x0 * y2; s03 += x0 * y3;
+        s10 += x1 * y0; s11 += x1 * y1; s12 += x1 * y2; s13 += x1 * y3;
+    }
+    lin_v8f s[8] = { s00, s01, s02, s03, s10, s11, s12, s13 };
+    for (int x = 0; x < 2; x++) for (int y = 0; y < 4; y++) {
+        lin_v8f v = s[x * 4 + y];
+        float t = 0;
+        for (int q = 0; q < 8; q++) t += v[q];
+        const float* ar = x ? a1 : a0;
+        for (int64_t q = l; q < n; q++) t += ar[q] * b[y][q];
+        out[x * 4 + y] = t;
+    }
+}
+
+/* Rows against rows, F32: c[i * cols + o] += a_i . b_o for r rows of a and
+ * cols rows of b, each n long and laid `as` and `bs` apart.  It is a product
+ * with the right matrix lying on its side, [cols x n], which is how a model's
+ * file holds a layer's weights: so they are computed where they are mapped.
+ * Adds into c; one thread.  Rows are taken two at a time from the first, so
+ * a caller that splits rows among workers splits at even rows to have each
+ * row computed one way. */
+void ray_lin_rowdot_acc_f32(const float* a, int64_t as, const float* b, int64_t bs,
+                            float* c, int64_t r, int64_t n, int64_t cols) {
+    int64_t r2 = r & ~(int64_t)1, c4 = cols & ~(int64_t)3;
+    for (int64_t b0 = 0; b0 < n; b0 += LIN_DOT_BLOCK) {
+        int64_t nb = b0 + LIN_DOT_BLOCK < n ? LIN_DOT_BLOCK : n - b0;
+        /* four rows of b stay in L1 while every row of a passes over them */
+        for (int64_t o = 0; o < c4; o += 4) {
+            const float* rb[4];
+            for (int y = 0; y < 4; y++) rb[y] = b + (o + y) * bs + b0;
+            for (int64_t i = 0; i < r2; i += 2) {
+                float t[8];
+                tile24_f32(a + i * as + b0, a + (i + 1) * as + b0, rb, nb, t);
+                float* c0 = c + i * cols + o;
+                float* c1 = c0 + cols;
+                for (int y = 0; y < 4; y++) { c0[y] += t[y]; c1[y] += t[4 + y]; }
+            }
+            for (int64_t i = r2; i < r; i++)
+                for (int y = 0; y < 4; y++) c[i * cols + o + y] += dot_f32(a + i * as + b0, rb[y], nb);
+        }
+        for (int64_t o = c4; o < cols; o++)
+            for (int64_t i = 0; i < r; i++) c[i * cols + o] += dot_f32(a + i * as + b0, b + o * bs + b0, nb);
+    }
+}
 
 #define DEF_GRAM(SUF, T)                                                      \
 static void gram_k_##SUF(const lin_t* A, T* G, int64_t p,                     \

@@ -56,6 +56,7 @@
  *   Bit  0x02       -RAY_I64 atoms:  RAY_ATTR_GRAPH (ray_rel_t* CSR handle in .i64)
  *   Bit  0x04       -RAY_I64 atoms:  RAY_ATTR_HNSW (HNSW handle in .i64)
  *   Bit  0x08       vectors:         RAY_ATTR_HAS_INDEX (index ray_t* in aux[0..7])
+ *   Bit  0x08       -RAY_I64 atoms:  RAY_ATTR_EMBMODEL (embedding model handle in .i64)
  *   Bit  0x10       vectors:         RAY_ATTR_SLICE
  *   Bit  0x20       -RAY_SYM:        ATTR_QUOTED (quoted/literal symbol; default = name reference)
  *   Bit  0x20       -RAY_I64 atoms:  RAY_ATTR_DLPROG (Datalog program handle in .i64)
@@ -113,6 +114,14 @@
 /* I64 atom carries an owning ray_hnsw_t* in its .i64 slot.
  * Checked by HNSW builtins before dereferencing.  User must (.emb.hnsw.free h). */
 #define RAY_ATTR_HNSW         0x04
+
+/* I64 atom carries a counted reference to a ray_embmodel_t (an embedding
+ * model: its tokenizer and weights) in its .i64 slot.  A model never changes
+ * once opened, so every handle shares the one object: a copy of the atom
+ * takes a reference of its own and the last release frees the model.
+ * Reuses 0x08 (RAY_ATTR_HAS_INDEX on vectors); the -RAY_I64 type tag
+ * disambiguates. */
+#define RAY_ATTR_EMBMODEL     0x08
 
 /* I64 atom carries an owning dl_program_t* (a Datalog program) in its .i64
  * slot.  Checked by the dl-* builtins before dereferencing, so a forged/plain

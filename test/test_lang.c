@@ -14583,6 +14583,7 @@ static const char* const k_rs_skip[] = {
     "write-csv", "read-value", "read-limits", "eval", "parse", "resolve", "timeit",
     "env", "get", "del", "rc", "rand", "guid", "date", "time", "timestamp",
     ".emb.hnsw.build", ".emb.hnsw.free", ".emb.hnsw.set", ".emb.hnsw.get", ".emb.hnsw.info", ".emb.knn", ".emb.ann",
+    ".emb.model.get", ".emb.model.info", ".emb.tokens", ".emb.encode",
     "meta", NULL
 };
 /* namespaces of system, storage and I/O builtins: never called */
