@@ -4669,6 +4669,27 @@ unary_done:
             }
         case RAY_BINARY:
             if (fn_is_restricted(fn_obj)) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_error("access", "restricted"); break; }
+            if (n > 2 && n <= 64 && (ray_binary_fn)(uintptr_t)fn_obj->i64 == (ray_binary_fn)ray_concat_fn &&
+                ray_active_query_table()) {
+                /* A query's concat takes several operands: compiled code
+                 * joins them left to right with the binary step, as the
+                 * interpreter does (#1592). */
+                ray_t* acc = fn_args[0];
+                uint8_t acc_rows = (uint8_t)(args_bits & 1);
+                fn_args[0] = NULL;
+                for (int32_t i = 1; i < n; i++) {
+                    uint8_t step_rows = 0;
+                    ray_t* next = fn_args[i];
+                    fn_args[i] = NULL;
+                    if (!acc || RAY_IS_ERR(acc)) { ray_release(next); continue; }
+                    acc = vm_call_binary(fn_obj, acc, next, acc_rows,
+                                         (uint8_t)((args_bits >> i) & 1), &step_rows);
+                    acc_rows = step_rows ? 1 : 0;
+                }
+                result = acc;
+                lambda_rows = acc_rows;
+                break;
+            }
             if (n != 2) { for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]); result = ray_sig_arity(ray_fn_name(fn_obj), "2", n); break; }
             /* fn_args[0/1] are owned refs (POPped from VM stack); materialise
              * consumes them — no extra ray_release after each call. */
@@ -6263,6 +6284,36 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             ret = result; goto out;
         }
         case RAY_BINARY: {
+            if (n > 3 && (ray_binary_fn)(uintptr_t)head->i64 == (ray_binary_fn)ray_concat_fn &&
+                !(head->attrs & RAY_FN_SPECIAL_FORM) && ray_active_query_table()) {
+                /* A query's concat takes up to 255 operands (OP_CONCAT).  Where
+                 * the interpreter evaluates it, a by: projection or a fallback,
+                 * join them left to right, each step the binary text concat
+                 * below: (concat a b c) is (concat (concat a b) c) (#1592). */
+                if (n - 1 > 255) {
+                    ray_release(head);
+                    ret = ray_error("arity", "concat: expected 2 to 255 arguments, got %lld", (long long)(n - 1));
+                    goto out;
+                }
+                ray_t* nested = ray_list_new(3);
+                nested = ray_list_append(nested, elems[0]);
+                nested = ray_list_append(nested, elems[1]);
+                nested = ray_list_append(nested, elems[2]);
+                for (int64_t i = 3; i < n && nested && !RAY_IS_ERR(nested); i++) {
+                    ray_t* outer = ray_list_new(3);
+                    outer = ray_list_append(outer, elems[0]);
+                    outer = ray_list_append(outer, nested);
+                    outer = ray_list_append(outer, elems[i]);
+                    ray_release(nested);
+                    nested = outer;
+                }
+                ray_release(head);
+                if (!nested || RAY_IS_ERR(nested)) { ret = nested ? nested : ray_error("oom", NULL); goto out; }
+                ret = ray_eval(nested);
+                rows = g_eval_rows;
+                ray_release(nested);
+                goto out;
+            }
             if (n != 3) {
                 ray_t* arity_err = ray_sig_arity(ray_fn_name(head), "2", (int)(n-1));
                 ray_release(head); ret = arity_err; goto out;

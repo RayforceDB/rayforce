@@ -46,6 +46,7 @@ Rayforce provides two distinct string column representations, each optimized for
 String operations in Rayforce follow these null semantics:
 
 - **Null input produces null output** — if any required input row is null, the output row is null
+- **`replace`'s `from` and `to` are text, not null inputs.** A `""` input row gives `""`, but an empty `to` deletes each match, `(replace "ab" "a" "")` is `"b"`, and an empty `from` matches nothing, `(replace "ab" "" "Q")` is `"ab"`. The same holds in a query, keyless, under `where:` and `by:`, and in `update`
 - **`concat` is the exception: the null is empty text.** `""` (and the SYM null `'`) joins as no characters, wherever it comes from: a literal, a column's cell or an expression. `(concat "" "a")` is `"a"`, and in a query `(concat s "!")` over `["x" ""]` is `["x!" "!"]` and `(concat s "")` is `["x" ""]`. A row is `""` only when every operand is empty
 - Null propagation applies uniformly to both RAY_SYM and RAY_STR columns
 - Null state is carried through the execution pipeline per morsel (1024 elements)
@@ -65,7 +66,9 @@ Rayfall exposes the common string transforms as direct builtins. On vector input
 Concatenates two string arguments. Works on string atoms and vectors element-wise.
 The STR null `""` is empty text here, not a null that nulls the result, the
 same in a direct call and on every query route (projection, `where:`, `by:`,
-`update`):
+`update`). A direct call takes two arguments; inside a query, `concat`
+takes 2 to 255 operands on every route, a `by:` projection and a helper
+included, and joins them left to right: `(concat s "-" u)`.
 
 ```lisp
 (concat "hello" " world")   ; "hello world"
@@ -119,7 +122,7 @@ Extracts a substring using a 1-based start position and a length. Start values b
 
 **`(replace str from to)`** — variadic · atom/vector · lazy-aware
 
-Replaces all occurrences of `from` with `to`. The `from` and `to` arguments must be string or symbol atoms.
+Replaces all occurrences of `from` with `to`. The `from` and `to` arguments must be string or symbol atoms. An empty `to` deletes each occurrence; an empty `from` matches nothing and returns the input unchanged; an empty input gives `""`.
 
 ```lisp
 (replace "banana" "na" "NA")

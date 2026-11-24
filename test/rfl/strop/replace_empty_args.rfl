@@ -1,0 +1,31 @@
+;; @also-unfused
+;; replace with an empty argument, eager and in a query (see string.md, Null
+;; Propagation): a "" input gives "", an empty to deletes each match, an
+;; empty from matches nothing and leaves the input as it is.  Every route
+;; gives the eager answer.
+
+(replace "ab" "a" "Q") -- "Qb"
+(replace "ab" "a" "") -- "b"
+(replace "ab" "" "Q") -- "ab"
+(replace "" "a" "Q") -- ""
+(replace ["ab" "" "ba" "aa"] "a" "") -- ["b" "" "b" ""]
+(replace ["ab" "" "ba" "aa"] "" "Q") -- ["ab" "" "ba" "aa"]
+
+(set t (table [g k s] (list ['p 'p 'q 'q] [0 1 2 3] ["ab" "" "ba" "aa"])))
+;; empty to
+(at (select {from: t v: (replace s "a" "")}) 'v) -- ["b" "" "b" ""]
+(at (select {from: t by: g v: (replace s "a" "")}) 'v) -- (list ["b" ""] ["b" ""])
+(at (select {from: t by: g v: (last (replace s "a" ""))}) 'v) -- ["b" "b"]
+(at (select {from: t v: (first (replace s "a" ""))}) 'v) -- ["b"]
+(at (select {from: t where: (== (replace s "a" "") "b")}) 'k) -- [0 2]
+(at (update {v: (replace s "a" "") from: t}) 'v) -- ["b" "" "b" ""]
+(at (update {v: (replace s "a" "") from: t by: g}) 'v) -- ["b" "" "b" ""]
+;; empty from
+(at (select {from: t v: (replace s "" "Q")}) 'v) -- ["ab" "" "ba" "aa"]
+(at (select {from: t by: g v: (replace s "" "Q")}) 'v) -- (list ["ab" ""] ["ba" "aa"])
+(at (select {from: t where: (== (replace s "" "Q") "ab")}) 'k) -- [0]
+(at (update {v: (replace s "" "Q") from: t}) 'v) -- ["ab" "" "ba" "aa"]
+;; a SYM column the same way
+(set ty (table [y] (list ['ab ' 'ba])))
+(at (select {from: ty v: (replace y "a" "")}) 'v) -- ['b ' 'b]
+(at (select {from: ty v: (replace y "" "Q")}) 'v) -- ['ab ' 'ba]
