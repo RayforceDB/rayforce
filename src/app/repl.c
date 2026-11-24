@@ -863,6 +863,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
         ray_release(parsed);
     }
     ray_release(nfo);
+    ray_eval_request_end();   /* the text's closure templates, unless kept */
 
     /* Clear any pull-based progress state left over from this
      * top-level eval. Some paths (e.g. ray_group_indices_fn invoked from
@@ -1586,6 +1587,7 @@ int ray_repl_run_file(const char* path) {
         ray_release(parsed);
     }
     ray_release(nfo);
+    ray_eval_request_end();   /* the text's closure templates, unless kept */
     ray_release(block);
 
     ray_progress_end();

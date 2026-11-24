@@ -56,6 +56,7 @@
 #include "lang/format.h"
 #include "core/runtime.h"   /* ray_error_msg */
 #include "ops/internal.h"
+#include "app/repl.h"      /* ray_repl_run_file: a script request's sweep */
 #include "ops/ops.h"
 #include "ops/temporal.h"
 #include "ops/idxop.h"
@@ -861,6 +862,79 @@ static test_result_t test_closure_tmpl_live_entry_survives(void) {
     }
     ray_release(bc);
     ray_release(ray_eval_str("(set mkTs 0)"));
+    PASS();
+}
+
+/* ---- Test: a live entry holds its literal's text, not its caller's (#1539) ----
+ * A long-lived function's inner literal is first evaluated by a large
+ * request (~49 KB, one span per parsed node).  The entry stays live, as
+ * the function holds the literal, so its template must hold the text the
+ * literal was read from (the function's small definition), not the large
+ * request's, which records none of its nodes.  Before, each entry pinned
+ * its first caller's whole nfo: ~330 KB for every function here.  Both a
+ * closure's entry (captures k) and a definition's (made on its first
+ * call) are covered, and a closure made from the entry carries the
+ * definition's text, against which its debug spans were recorded. */
+static test_result_t test_closure_tmpl_live_entry_own_nfo(void) {
+    static const char* defs[] = {
+        "(set mkO%d (fn [k] (if false (set 1 2)) (fn [x] (+ x k %d))))",
+        "(set mkO%d (fn [k] (if false (set 1 2)) (let f (fn [x] (+ x %d))) (f k) f))",
+    };
+    char q[160];
+    for (size_t d = 0; d < sizeof defs / sizeof defs[0]; d++) {
+        for (int i = 0; i < 32; i++) {
+            snprintf(q, sizeof q, defs[d], i, i);
+            ray_t* r = ray_eval_str(q);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+            ray_release(r);
+        }
+        size_t m0 = tmpl_mem();
+        for (int i = 0; i < 32; i++) {
+            snprintf(q, sizeof q, "(do (mkO%d 1) (count [", i);
+            char* src = tmpl_src(q, 10000);
+            TEST_ASSERT_NOT_NULL(src);
+            ray_t* r = ray_eval_str(src);
+            free(src);
+            TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == 10000);
+            ray_release(r);
+        }
+        int64_t grew = (int64_t)tmpl_mem() - (int64_t)m0;
+        TEST_ASSERT_FMT(grew < 1024 * 1024, "case %zu: 32 live entries kept %lld bytes", d, (long long)grew);
+        /* a later request's closure shares the entry and its text */
+        ray_t* c = ray_eval_str("(mkO7 2)");
+        TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c) && c->type == RAY_LAMBDA && LAMBDA_IS_COMPILED(c));
+        ray_t* src = LAMBDA_NFO(c) ? NFO_SOURCE(LAMBDA_NFO(c)) : NULL;
+        snprintf(q, sizeof q, defs[d], 7, 7);
+        bool own = src && ray_str_len(src) == strlen(q) && !memcmp(ray_str_ptr(src), q, strlen(q));
+        ray_release(c);
+        TEST_ASSERT_FMT(own, "case %zu: the closure does not carry its definition's text", d);
+    }
+    PASS();
+}
+
+/* ---- Test: a script file's request sweeps the entries it made (#1539) ----
+ * A file run as a request (ray_repl_run_file, as the command line runs it)
+ * ends with its text released, as a ray_eval_str request does, and the
+ * entries its literals made go with it: before, they stayed, holding the
+ * file's nfo, until a later request made an entry. */
+static test_result_t test_closure_tmpl_script_request_sweeps(void) {
+    const char* path = ray_test_tmp("/tmp/rayforce_tmpl_sweep.rfl");
+    char* src = tmpl_src("(do (((fn [k] (if false (set 1 2)) (fn [x] (+ x k))) 1) 2) (count [", 10000);
+    TEST_ASSERT_NOT_NULL(src);
+    FILE* f = fopen(path, "w");
+    TEST_ASSERT_NOT_NULL(f);
+    fputs(src, f);
+    fclose(f);
+    free(src);
+    TEST_ASSERT_EQ_I(ray_repl_run_file(path), 0);   /* the first run's one-off state */
+    ray_release(ray_eval_str("1"));                  /* whatever it left, swept */
+    fflush(stdout);
+    size_t m0 = tmpl_mem();
+    TEST_ASSERT_EQ_I(ray_repl_run_file(path), 0);
+    fflush(stdout);
+    int64_t grew = (int64_t)tmpl_mem() - (int64_t)m0;
+    unlink(path);
+    TEST_ASSERT_FMT(grew < 64 * 1024, "a script run kept %lld bytes", (long long)grew);
     PASS();
 }
 
@@ -15332,6 +15406,8 @@ const test_entry_t lang_entries[] = {
     { "lang/closure_tmpl_request_nfo_budget", test_closure_tmpl_request_nfo_budget, lang_setup, lang_teardown },
     { "lang/closure_tmpl_large_source_shares", test_closure_tmpl_large_source_shares, lang_setup, lang_teardown },
     { "lang/closure_tmpl_live_entry_survives", test_closure_tmpl_live_entry_survives, lang_setup, lang_teardown },
+    { "lang/closure_tmpl_live_entry_own_nfo", test_closure_tmpl_live_entry_own_nfo, lang_setup, lang_teardown },
+    { "lang/closure_tmpl_script_request_sweeps", test_closure_tmpl_script_request_sweeps, lang_setup, lang_teardown },
     { "lang/clock_local_follows_tz", test_clock_local_follows_tz, lang_setup, lang_teardown },
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },

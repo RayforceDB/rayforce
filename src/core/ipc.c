@@ -883,6 +883,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
         } else {
             result = ray_eval(msg);
             ray_release(msg);
+            ray_eval_request_end();   /* the message's closure templates */
         }
     } else if (msg) {
         /* A payload that does not decode comes back as an error object, which is
