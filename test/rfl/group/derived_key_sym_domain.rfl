@@ -463,8 +463,31 @@
 (set TSU (table [pc uid uidn] (list (concat "u" (as 'STR is)) uid uidn)))
 (count (KS TSU)) -- 100000
 (all (== (FS (KS TSU)) (FS (KSO TSU)))) -- true
-;; a compressed splayed table and a parted one answer as the in-memory table
+;; a composite by: [strcol intcol] with count distinct over the column
+;; forms the row map may meet: a compressed splayed STR (its dictionary
+;; codes), a parted STR, a sliced table, an all-"" column, an empty result
+(set C2 (fn [t] (select {from: t by: [sm p] c: (count uid) u: (count (distinct uid))})))
+(set C2O (fn [t] (select {from: (select {from: t sm: sm p: p uid: uid}) by: [sm p] c: (count uid) u: (count (distinct uid))})))
+(set FC (fn [r] (ser (xasc (xasc (table [k p c u] (list (at r 'sm) (at r 'p) (at r 'c) (at r 'u))) 'p) 'k))))
+(set TC (table [sm p uid] (list sm (% uid 2) uid)))
 (.sys.exec "rm -rf /tmp/rfl_dkey_str")
+(.db.splayed.set "/tmp/rfl_dkey_str/c2/" TC {compress: true})
+(set TCS (.db.splayed.get "/tmp/rfl_dkey_str/c2/"))
+(count (C2 TCS)) -- 6000
+(all (== (FC (C2 TCS)) (FC (C2O TC)))) -- true
+(set rootC "/tmp/rfl_dkey_str/c2p/")
+(.db.splayed.set (concat rootC "1/t/") (take TC 70000) (concat rootC ".sym") {compress: false})
+(.db.splayed.set (concat rootC "2/t/") (take TC -30000) (concat rootC ".sym") {compress: false})
+(set TCP (.db.parted.get rootC 't))
+(all (== (FC (C2 TCP)) (FC (C2O TC)))) -- true
+(all (== (FC (C2 (take TC 50000))) (FC (C2O (take TC 50000))))) -- true
+(all (== (FC (C2 (select {from: TC where: (> uid 500)}))) (FC (C2O (select {from: TC where: (> uid 500)}))))) -- true
+(set TE (table [sm p uid] (list (at [""] (* 0 is)) (% uid 2) uid)))
+(at (C2 TE) 'u) -- (at (C2O TE) 'u)
+(count (C2 TE)) -- 2
+(count (select {from: TCS by: [sm p] c: (count uid) u: (count (distinct uid)) where: (> uid 100000)})) -- 0
+(count (select {from: TCP by: [sm p] c: (count uid) u: (count (distinct uid)) where: (> uid 100000)})) -- 0
+;; a compressed splayed table and a parted one answer as the in-memory table
 (.db.splayed.set "/tmp/rfl_dkey_str/flat/" TS2 {compress: true})
 (set TSP (.db.splayed.get "/tmp/rfl_dkey_str/flat/"))
 (all (== (FS (KS TSP)) (FS RS))) -- true
@@ -479,3 +502,34 @@
 (all (== (FS (KS TPP)) (FS RS))) -- true
 (all (== (F2 (K2 TPP)) (F2 R2))) -- true
 (.sys.exec "rm -rf /tmp/rfl_dkey_str") -- 0
+;; a single computed key under a where: that keeps few rows (the key is
+;; evaluated over the selected rows only), and one that keeps most: the
+;; groups of the kept rows, as the projection gives them
+(set FW (fn [r] (ser (xasc (table [k c] (list (at (value r) 0) (at r 'c))) 'k))))
+(set FWO (fn [r] (ser (xasc (table [k c] (list (at r 'k) (at r 'c))) 'k))))
+(set W1 (select {from: TS2 by: (upper (trim pc)) c: (count uid) where: (< uid 30)}))
+(all (== (FW W1) (FWO (select {from: (select {from: TS2 k: (upper (trim pc)) uid: uid where: (< uid 30)}) by: k c: (count uid)})))) -- true
+(count W1) -- (count (distinct (upper (trim (at pc (where (< uid 30)))))))
+(set W2 (select {from: TS2 by: (upper (trim pc)) c: (count uid) where: (> uid 100)}))
+(all (== (FW W2) (FWO (select {from: (select {from: TS2 k: (upper (trim pc)) uid: uid where: (> uid 100)}) by: k c: (count uid)})))) -- true
+(all (== (at (value W2) 0) (distinct (upper (trim (at pc (where (> uid 100)))))))) -- true
+;; a value only the dropped rows hold never becomes a group
+(set pcx (at (select {from: (table [i p] (list is pc)) x: (if (< i 50) "dropped-only" p)}) 'x))
+(set TX (table [pc uid i] (list pcx uid is)))
+(set W3 (select {from: TX by: (upper (trim pc)) c: (count uid) where: (>= i 50)}))
+(count (where (== (at (value W3) 0) "DROPPED-ONLY"))) -- 0
+(all (== (FW W3) (FWO (select {from: (select {from: TX k: (upper (trim pc)) uid: uid where: (>= i 50)}) by: k c: (count uid)})))) -- true
+
+;; ── trim over a SYM column takes the per-symbol path ────────────────────
+(set sy (as 'SYMBOL (at [" a" "a" "b " " b " "" "c"] (% (+ (* 4 (div is 7)) is) 6))))
+(set TY (table [sy uid] (list sy uid)))
+(set RY (select {from: TY by: (trim sy) c: (count uid)}))
+(set OY (select {from: (select {from: TY k: (trim sy) uid: uid}) by: k c: (count uid)}))
+(set FY (fn [r] (ser (xasc (table [k c] (list (as 'STR (at (value r) 0)) (at r 'c))) 'k))))
+(count RY) -- 4
+(all (== (FY RY) (FY OY))) -- true
+(set RYW (select {from: TY by: {k: (trim sy)} c: (count uid) where: (!= sy "")}))
+(set OYW (select {from: (select {from: TY k: (trim sy) uid: uid where: (!= sy "")}) by: k c: (count uid)}))
+(count RYW) -- 3
+(all (== (FY RYW) (FY OYW))) -- true
+(asc (as 'STR (at RYW 'k))) -- (asc (as 'STR (distinct (trim (at sy (where (!= sy "")))))))

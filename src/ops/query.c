@@ -6178,7 +6178,7 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * have the same row-wise semantics as projections, and eval-level `if`
  * tests whole-vector truthiness and would choose one branch for every
  * input row. */
-static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col);
+static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
 static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
     /* Exact-size carve: collect_col_refs dedups against real table
      * columns, so ray_table_ncols(tbl) is a hard upper bound. */
@@ -6208,7 +6208,7 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
     }
     /* a key over one STR column of few distinct strings: once per value */
     if (!col_vec)
-        col_vec = derived_key_over_str_values(v, tbl, n_refs == 1 ? materialized_refs[0] : NULL);
+        col_vec = derived_key_over_str_values(v, tbl, n_refs == 1 ? materialized_refs[0] : NULL, NULL);
     if (!col_vec) {
         ray_graph_t* key_graph = ray_graph_new(tbl);
         if (!key_graph) col_vec = ray_error("oom", NULL);
@@ -11168,9 +11168,14 @@ typedef struct {
     const char*      pool;
     int64_t          n;
     uint32_t         tasks;
-    int32_t*         code;      /* [n]: the row's local id, then its global one */
+    int32_t*         code;      /* [n]: the row's local id, then its global one; -1 unselected */
     dks_task_t*      tk;        /* [tasks] */
     int64_t**        remap;     /* [tasks]: local id -> global id */
+    ray_t*           sel;       /* the selection (NULL: every row), by morsel flags */
+    const uint8_t*   flags;
+    const uint32_t*  offs;
+    const uint16_t*  idx;
+    int64_t          n_segs;    /* morsels of the n rows */
 } dks_ctx_t;
 
 static void dks_task_free(dks_task_t* t) {
@@ -11203,35 +11208,56 @@ static bool dks_grow(dks_task_t* t) {
     t->first = nf; t->hash = nh;
     return true;
 }
-/* One task: the rows [n*t/T, n*(t+1)/T) coded by local first-seen id. */
+/* Row r into task t's table: its local first-seen id in *out. */
+static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, int32_t* out) {
+    const ray_str_t* s = &c->el[r];
+    uint64_t h = ray_str_t_hash(s, c->pool);
+    uint64_t m = t->cap - 1, p = h & m;
+    for (;;) {
+        dks_slot_t* sl = &t->slots[p];
+        if (sl->id < 0) {
+            if (t->du >= t->du_cap) { t->fail = true; return; }
+            sl->hash = h; sl->id = t->du;
+            t->first[t->du] = r; t->hash[t->du] = h;
+            *out = (int32_t)t->du++;
+            if ((uint64_t)t->du * 2 > t->cap && !dks_grow(t)) t->fail = true;
+            return;
+        }
+        if (sl->hash == h && ray_str_t_eq(&c->el[t->first[sl->id]], c->pool, s, c->pool)) {
+            *out = (int32_t)sl->id;
+            return;
+        }
+        p = (p + 1) & m;
+    }
+}
+/* One task: the morsels [n_segs*t/T, n_segs*(t+1)/T) coded by local
+ * first-seen id; a row the selection drops gets -1 (its key is never read:
+ * the grouping honours the same selection). */
 static void dks_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     dks_ctx_t* c = (dks_ctx_t*)vctx;
     for (int64_t ti = start; ti < end; ti++) {
         dks_task_t* t = &c->tk[ti];
-        int64_t lo = c->n * ti / c->tasks, hi = c->n * (ti + 1) / c->tasks;
+        int64_t s0 = c->n_segs * ti / c->tasks, s1 = c->n_segs * (ti + 1) / c->tasks;
         if (!dks_grow(t)) { t->fail = true; continue; }
-        for (int64_t r = lo; r < hi; r++) {
-            const ray_str_t* s = &c->el[r];
-            uint64_t h = ray_str_t_hash(s, c->pool);
-            uint64_t m = t->cap - 1, p = h & m;
-            for (;;) {
-                dks_slot_t* sl = &t->slots[p];
-                if (sl->id < 0) {
-                    if (t->du >= t->du_cap) { t->fail = true; break; }
-                    sl->hash = h; sl->id = t->du;
-                    t->first[t->du] = r; t->hash[t->du] = h;
-                    c->code[r] = (int32_t)t->du++;
-                    if ((uint64_t)t->du * 2 > t->cap && !dks_grow(t)) t->fail = true;
-                    break;
+        for (int64_t seg = s0; seg < s1 && !t->fail; seg++) {
+            int64_t lo = seg * RAY_MORSEL_ELEMS;
+            int64_t hi = lo + RAY_MORSEL_ELEMS < c->n ? lo + RAY_MORSEL_ELEMS : c->n;
+            uint8_t f = c->sel ? c->flags[seg] : RAY_SEL_ALL;
+            if (f == RAY_SEL_NONE) {
+                for (int64_t r = lo; r < hi; r++) c->code[r] = -1;
+            } else if (f == RAY_SEL_ALL) {
+                for (int64_t r = lo; r < hi && !t->fail; r++) dks_code_row(c, t, r, &c->code[r]);
+            } else {
+                uint8_t in_seg[RAY_MORSEL_ELEMS / 8] = {0};
+                for (uint32_t i = c->offs[seg]; i < c->offs[seg + 1]; i++)
+                    in_seg[c->idx[i] >> 3] |= (uint8_t)(1u << (c->idx[i] & 7));
+                for (int64_t r = lo; r < hi && !t->fail; r++) {
+                    uint16_t loc = (uint16_t)(r - lo);
+                    if (in_seg[loc >> 3] & (1u << (loc & 7))) dks_code_row(c, t, r, &c->code[r]);
+                    else c->code[r] = -1;
                 }
-                if (sl->hash == h && ray_str_t_eq(&c->el[t->first[sl->id]], c->pool, s, c->pool)) {
-                    c->code[r] = (int32_t)sl->id;
-                    break;
-                }
-                p = (p + 1) & m;
             }
-            if (t->fail) break;
         }
     }
 }
@@ -11239,9 +11265,12 @@ static void dks_remap_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     const dks_ctx_t* c = (const dks_ctx_t*)vctx;
     for (int64_t ti = start; ti < end; ti++) {
-        int64_t lo = c->n * ti / c->tasks, hi = c->n * (ti + 1) / c->tasks;
+        int64_t lo = c->n_segs * ti / c->tasks * RAY_MORSEL_ELEMS;
+        int64_t hi = c->n_segs * (ti + 1) / c->tasks * RAY_MORSEL_ELEMS;
+        if (hi > c->n) hi = c->n;
         const int64_t* rm = c->remap[ti];
-        for (int64_t r = lo; r < hi; r++) c->code[r] = (int32_t)rm[c->code[r]];
+        /* an unselected row takes cell 0 (never read) */
+        for (int64_t r = lo; r < hi; r++) c->code[r] = c->code[r] >= 0 ? (int32_t)rm[c->code[r]] : 0;
     }
 }
 
@@ -11352,9 +11381,13 @@ static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_
         out = t == RAY_SYM ? ray_sym_vec_new(key_dom->attrs & RAY_SYM_W_MASK, n) : ray_vec_new(t, n);
         if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return NULL; }
         out->len = n;
-        c.src = (const char*)ray_data(key_dom);
-        c.dst = (char*)ray_data(out);
         c.esz = (uint8_t)ray_sym_elem_size(t, key_dom->attrs);
+        {   /* a slice reads its parent's cells from its offset */
+            const ray_t* owner = (key_dom->attrs & RAY_ATTR_SLICE) ? key_dom->slice_parent : key_dom;
+            int64_t base = (key_dom->attrs & RAY_ATTR_SLICE) ? key_dom->slice_offset : 0;
+            c.src = (const char*)ray_data((ray_t*)owner) + base * c.esz;
+        }
+        c.dst = (char*)ray_data(out);
         if (tasks > 1) ray_pool_dispatch_n(pool, dks_spread_fixed_fn, &c, tasks);
         else dks_spread_fixed_fn(&c, 0, 0, 1);
         if (t == RAY_SYM) ray_sym_vec_adopt_domain(out, key_dom);
@@ -11376,8 +11409,11 @@ static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_
 }
 
 /* `col`: the column `by_expr` reads when the caller holds it flattened
- * (NULL: the table's). */
-static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col) {
+ * (NULL: the table's).  `sel`: the where: as a rowsel over the table's
+ * rows (NULL: every row) — only the selected rows are grouped and
+ * evaluated (a value only the dropped rows hold is never seen, as in
+ * derived_key_over_sym_domain), the key vector is still one of nrows. */
+static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
@@ -11387,23 +11423,39 @@ static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col
     ray_t* C = col ? col : tbl_col_or_null(tbl, ref_syms[0]);
     int64_t n = ray_table_nrows(tbl);
     if (!C || C->type != RAY_STR || !ray_is_vec(C) || C->len != n || n < 4096) return NULL;
+    int64_t sel_rows = n;
+    if (sel) {
+        ray_rowsel_t* sm = ray_rowsel_meta(sel);
+        if (!sm || sm->nrows != n) return NULL;
+        sel_rows = sm->total_pass;
+        if (sel_rows <= 0) return NULL;
+    }
     const ray_str_t* el; const char* pool;
     str_resolve(C, &el, &pool);
+    /* A selection of a quarter of the rows or less: the per-value path
+     * wins whatever the distinct count (the row-wise key ran every string
+     * op over every row of the table, selected or not). */
+    const bool sparse = sel_rows * 4 <= n;
 
     /* The first block decides cheaply: a distinct share above 3/4 over the
-     * first 65536 rows is a near-unique column, for which the per-value
-     * evaluation cannot win. */
-    {
+     * first 65536 selected rows is a near-unique column, for which the
+     * per-value evaluation cannot win. */
+    if (!sparse) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
-        dks_ctx_t pc = { .el = el, .pool = pool, .n = n < 65536 ? n : 65536, .tasks = 1, .tk = &pt };
-        pt.du_cap = pc.n * 3 / 4;
-        ray_t* code_hdr = NULL;
-        pc.code = (int32_t*)scratch_alloc(&code_hdr, (size_t)pc.n * sizeof(int32_t));
-        if (!pc.code) return NULL;
-        dks_code_fn(&pc, 0, 0, 1);
+        dks_ctx_t pc = { .el = el, .pool = pool, .n = n, .tasks = 1, .tk = &pt };
+        const int64_t probe_rows = sel_rows < 65536 ? sel_rows : 65536;
+        pt.du_cap = probe_rows * 3 / 4;
+        if (!dks_grow(&pt)) return NULL;
+        dk_sel_it_t it;
+        dk_sel_it_init(&it, sel, n);
+        for (int64_t i = 0; i < probe_rows && !pt.fail; i++) {
+            int64_t r = dk_sel_it_next(&it);
+            if (r < 0) break;
+            int32_t unused;
+            dks_code_row(&pc, &pt, r, &unused);
+        }
         bool unique = pt.fail;
         dks_task_free(&pt);
-        scratch_free(code_hdr);
         if (unique) return NULL;
     }
 
@@ -11420,9 +11472,17 @@ static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col
     dks_task_t* tk = (dks_task_t*)scratch_calloc(&tk_hdr, (size_t)tasks * (sizeof(dks_task_t) + sizeof(int64_t*)));
     if (!tk) { ray_release(ids); return NULL; }
     int64_t** remap = (int64_t**)(tk + tasks);
-    for (uint32_t t = 0; t < tasks; t++) tk[t].du_cap = (int64_t)(n / tasks) / 2 + 4096;
+    for (uint32_t t = 0; t < tasks; t++)
+        tk[t].du_cap = sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
     dks_ctx_t c = { .el = el, .pool = pool, .n = n, .tasks = tasks,
-                    .code = (int32_t*)ray_data(ids), .tk = tk, .remap = remap };
+                    .code = (int32_t*)ray_data(ids), .tk = tk, .remap = remap,
+                    .n_segs = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS };
+    if (sel) {
+        c.sel = sel;
+        c.flags = ray_rowsel_flags(sel);
+        c.offs = ray_rowsel_offsets(sel);
+        c.idx = ray_rowsel_idx(sel);
+    }
     if (tasks > 1) ray_pool_dispatch_n(rpool, dks_code_fn, &c, tasks);
     else dks_code_fn(&c, 0, 0, 1);
     bool ok = !pool_cancelled(rpool);
@@ -11432,7 +11492,7 @@ static ray_t* derived_key_over_str_values(ray_t* by_expr, ray_t* tbl, ray_t* col
      * (the earliest row), and inside a task the local ids follow the rows,
      * so the global ids are in first-seen row order over the table. */
     dks_task_t g; memset(&g, 0, sizeof g);
-    g.du_cap = n / 2;
+    g.du_cap = sparse ? sel_rows : sel_rows / 2;
     int64_t sum = 0;
     for (uint32_t t = 0; t < tasks && ok; t++) sum += tk[t].du;
     if (ok) ok = sum <= g.du_cap;
@@ -27652,7 +27712,7 @@ by_dict_done:
                             : derived_key_over_sym_domain(by_expr, tbl, g->selection);
             /* over one STR column of few distinct strings: once per value */
             if (!dom_key && !by_key_carried && !pool_cancelled(ray_pool_get()))
-                dom_key = derived_key_over_str_values(by_expr, tbl, NULL);
+                dom_key = derived_key_over_str_values(by_expr, tbl, NULL, g->selection);
             if (by_key_carried) {
                 /* This is still a value key, not a source-column key.
                  * Keep its constant-key grouping route, using the values
@@ -28136,7 +28196,7 @@ by_dict_done:
                     computed_key = bind_referenced_columns(filtered_tbl, &by_expr, 1);
                     if (!computed_key) computed_key = derived_key_over_sym_domain(by_expr, filtered_tbl, NULL);
                     if (!computed_key && !pool_cancelled(ray_pool_get()))
-                        computed_key = derived_key_over_str_values(by_expr, filtered_tbl, NULL);
+                        computed_key = derived_key_over_str_values(by_expr, filtered_tbl, NULL, NULL);
                     if (!computed_key && pool_cancelled(ray_pool_get())) computed_key = ray_error("cancel", NULL);
                     if (!computed_key) computed_key = ray_eval(by_expr);
                     if (computed_key && !RAY_IS_ERR(computed_key) && ray_is_lazy(computed_key))
@@ -30502,8 +30562,7 @@ by_dict_done:
                  * largest group is one serial dedup (12 groups over 4M rows:
                  * one of 1.2M rows); the kernel partitions by (group, value)
                  * there, see count_distinct_per_group_parallel. */
-                bool cd_gid_kernel = n_groups > 50000 ||
-                                     (n_groups <= CDPG_FEW_GROUPS && nrows >= 200000);
+                bool cd_gid_kernel = n_groups > 50000 || ray_cd_few_groups_kernel_ok(nrows, n_groups);
                 int needs_slice_idx = 0;
                 for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
                     ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);

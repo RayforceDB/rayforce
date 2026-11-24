@@ -810,6 +810,10 @@ static test_result_t test_derived_key_per_str_value_route(void) {
         { "(select {from: T by: {k: (upper (trim s))} c: (count v) where: (!= s \"\")})", 1, 1 },
         { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v)})", 1, 1 },
         { "(select {from: T by: {k: (upper (trim s)) m: (% v 2)} c: (count v) u: (count (distinct v)) where: (!= s \"\")})", 1, 1 },
+        /* a selection of a quarter of the rows or less: per value whatever
+         * the distinct share */
+        { "(select {from: T by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
+        { "(select {from: TU by: (upper (trim s)) c: (count v) where: (< v 40)})", 1, 1 },
         { "(select {from: T by: (if (> v 3) (upper s) s) c: (count v)})", 0, 1 },
         { "(select {from: T3 by: (upper (trim s)) c: (count v)})", 0, 1 },
         { "(select {from: TU by: (upper (trim s)) c: (count v)})", 0, 1 },

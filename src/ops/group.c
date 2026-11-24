@@ -2377,6 +2377,7 @@ typedef struct {
      * into its own pcnt[p * n_groups + gid], summed into odata at the end. */
     bool            by_val;
     int64_t*        pcnt;            /* [P * n_groups] when by_val */
+    uint16_t*       gids16_out;      /* by_val: the gid + 1 fits 16 bits (2 B a row, not 8) */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
      * so there's no atomic contention.  task_id is start / grain, both
@@ -2451,7 +2452,8 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
         int64_t gid_p1 = gid + 1;
         uint64_t h = x->by_val ? CDPG_HASH(gid_p1, val) : CDPG_PART_HASH(gid_p1);
         int64_t pos = my_cur[h & p_mask]++;
-        x->gids_out[pos] = gid_p1;
+        if (x->by_val) x->gids16_out[pos] = (uint16_t)gid_p1;
+        else x->gids_out[pos] = gid_p1;
         x->vals_out[pos] = val;
     }
 }
@@ -2487,11 +2489,12 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
             continue;
         }
 
-        const int64_t* gids = x->gids_out + off;
+        const int64_t* gids = x->by_val ? NULL : x->gids_out + off;
+        const uint16_t* gids16 = x->by_val ? x->gids16_out + off : NULL;
         const int64_t* vals = x->vals_out + off;
         int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
         for (int64_t i = 0; i < cnt; i++) {
-            int64_t gid_p1 = gids[i];
+            int64_t gid_p1 = gids ? gids[i] : (int64_t)gids16[i];
             int64_t val    = vals[i];
             uint64_t h = CDPG_HASH(gid_p1, val);
             uint64_t slot = h & mask;
@@ -2613,11 +2616,13 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 2: scatter (gid+1, val) pairs into partitioned out_buf. */
     ray_t* gids_hdr = NULL;
     ray_t* vals_hdr = NULL;
-    ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr,
-                                           (size_t)total * sizeof(int64_t));
+    if (ctx.by_val)
+        ctx.gids16_out = (uint16_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(uint16_t));
+    else
+        ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(int64_t));
     ctx.vals_out = (int64_t*)scratch_alloc(&vals_hdr,
                                            (size_t)total * sizeof(int64_t));
-    if (!ctx.gids_out || !ctx.vals_out) {
+    if (!(ctx.gids_out || ctx.gids16_out) || !ctx.vals_out) {
         if (gids_hdr) scratch_free(gids_hdr);
         if (vals_hdr) scratch_free(vals_hdr);
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
@@ -2738,6 +2743,24 @@ __attribute__((unused)) static ray_t* count_distinct_per_group_hll(ray_t* src, c
  * are distinct pairs → load factor 0.5, no rehash needed.  Slot stores
  * gid+1 (so 0 means empty) and the int64-encoded value.  64-bit composite
  * hash mixes both halves so rare-gid collisions don't cluster. */
+/* Few groups over many rows: the kernel above, partitioned by (group,
+ * value), instead of the per-group slices (whose largest group is one
+ * serial dedup).  Only with workers to spread over, and only when its
+ * buffers fit the heap's room: 10 B a row (the values and 16-bit group
+ * ids) beside the row map both routes hold, where the slices hold 8 B a
+ * row (their index) plus a table of twice the largest group's rows. */
+bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups) {
+    if (n_groups <= 0 || n_groups > CDPG_FEW_GROUPS || n_rows < 200000) return false;
+    ray_pool_t* pool = ray_pool_live();
+    if (!pool || ray_pool_total_workers(pool) < 2) return false;
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0) {
+        int64_t room = wm - ray_heap_anon_committed();
+        if ((double)n_rows * 10.0 > (double)room / 2) return false;
+    }
+    return true;
+}
+
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups) {
     if (!src || RAY_IS_ERR(src)) return ray_error("domain", "count distinct per group: invalid source column");
