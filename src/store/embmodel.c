@@ -36,6 +36,7 @@
 #define emb_free(p)  do { void* p_ = (p); if (p_) ray_sys_free(p_); } while (0)
 #include "store/embtok.h"
 #include "core/platform.h"
+#include "core/pool.h"
 #include <math.h>
 
 /* One layer of the encoder.  A dense weight is kept as the kernel wants it:
@@ -63,14 +64,21 @@ struct ray_embmodel {
     void** owned; int64_t n_owned;             /* every block the weights own */
 };
 
+/* What one head of attention needs while it is computed; a worker has one. */
+typedef struct {
+    float *kt, *sc, *ch;
+    const float** rows;   /* the rows of whatever is on the left: t */
+    const float** krows;  /* the rows of the keys turned on their side: dh */
+    const float** vrows;  /* the rows of the values: t */
+} emb_lane_t;
+
 struct ray_embwork {
     emb_scratch_t scratch;
-    /* the forward pass, sized for `cap` tokens */
-    int64_t cap;
-    float *x, *qkv, *kt, *sc, *ch, *ctx, *mid;
-    const float** rows;   /* pointers to the rows of whatever is on the left */
-    const float** krows;  /* and to the rows of the transposed keys of one head */
-    const float** vrows;  /* and to one head's values */
+    /* the forward pass, sized for `cap` tokens and `lanes` workers */
+    int64_t cap, lanes;
+    float *x, *qkv, *ctx, *mid;
+    const float** rows;   /* pointers to the rows of the left side of a dense product */
+    emb_lane_t* lane;
 };
 
 void ray_embmodel_retain(ray_embmodel_t* m) {
@@ -100,11 +108,17 @@ ray_embwork_t* ray_embwork_new(const ray_embmodel_t* m) {
 }
 
 static void emb_work_drop(ray_embwork_t* w) {
-    emb_free(w->x); emb_free(w->qkv); emb_free(w->kt); emb_free(w->sc); emb_free(w->ch);
-    emb_free(w->ctx); emb_free(w->mid); emb_free((void*)w->rows); emb_free((void*)w->krows); emb_free((void*)w->vrows);
-    w->x = w->qkv = w->kt = w->sc = w->ch = w->ctx = w->mid = NULL;
-    w->rows = w->krows = w->vrows = NULL;
-    w->cap = 0;
+    for (int64_t i = 0; w->lane && i < w->lanes; i++) {
+        emb_lane_t* l = &w->lane[i];
+        emb_free(l->kt); emb_free(l->sc); emb_free(l->ch);
+        emb_free((void*)l->rows); emb_free((void*)l->krows); emb_free((void*)l->vrows);
+    }
+    emb_free(w->lane);
+    emb_free(w->x); emb_free(w->qkv); emb_free(w->ctx); emb_free(w->mid); emb_free((void*)w->rows);
+    w->x = w->qkv = w->ctx = w->mid = NULL;
+    w->rows = NULL;
+    w->lane = NULL;
+    w->cap = w->lanes = 0;
 }
 
 void ray_embwork_free(ray_embwork_t* w) {
@@ -114,22 +128,32 @@ void ray_embwork_free(ray_embwork_t* w) {
     ray_sys_free(w);
 }
 
-/* Room for a text of t tokens. */
-static bool emb_work_fit(const ray_embmodel_t* m, ray_embwork_t* w, int64_t t) {
-    if (t <= w->cap) return true;
+/* Room for a text of t tokens, computed by `lanes` workers at once. */
+static bool emb_work_fit(const ray_embmodel_t* m, ray_embwork_t* w, int64_t t, int64_t lanes) {
+    if (t <= w->cap && lanes <= w->lanes) return true;
+    if (t < w->cap) t = w->cap;
+    if (lanes < w->lanes) lanes = w->lanes;
     emb_work_drop(w);
     size_t T = (size_t)t, H = (size_t)m->dim, I = (size_t)m->inner, dh = H / (size_t)m->heads;
     w->x   = (float*)ray_sys_alloc(T * H * sizeof(float));
     w->qkv = (float*)ray_sys_alloc(T * 3 * H * sizeof(float));
-    w->kt  = (float*)ray_sys_alloc(dh * T * sizeof(float));
-    w->sc  = (float*)ray_sys_alloc(T * T * sizeof(float));
-    w->ch  = (float*)ray_sys_alloc(T * dh * sizeof(float));
     w->ctx = (float*)ray_sys_alloc(T * H * sizeof(float));
     w->mid = (float*)ray_sys_alloc(T * I * sizeof(float));
-    w->rows  = (const float**)ray_sys_alloc(T * sizeof(float*));
-    w->krows = (const float**)ray_sys_alloc(dh * sizeof(float*));
-    w->vrows = (const float**)ray_sys_alloc(T * sizeof(float*));
-    if (!w->x || !w->qkv || !w->kt || !w->sc || !w->ch || !w->ctx || !w->mid || !w->rows || !w->krows || !w->vrows) { emb_work_drop(w); return false; }
+    w->rows = (const float**)ray_sys_alloc(T * sizeof(float*));
+    w->lane = (emb_lane_t*)ray_sys_alloc((size_t)lanes * sizeof(emb_lane_t));   /* zero-filled */
+    bool ok = w->x && w->qkv && w->ctx && w->mid && w->rows && w->lane;
+    if (ok) w->lanes = lanes;   /* so that a drop frees what the loop below made */
+    for (int64_t i = 0; ok && i < lanes; i++) {
+        emb_lane_t* l = &w->lane[i];
+        l->kt = (float*)ray_sys_alloc(dh * T * sizeof(float));
+        l->sc = (float*)ray_sys_alloc(T * T * sizeof(float));
+        l->ch = (float*)ray_sys_alloc(T * dh * sizeof(float));
+        l->rows  = (const float**)ray_sys_alloc(T * sizeof(float*));
+        l->krows = (const float**)ray_sys_alloc(dh * sizeof(float*));
+        l->vrows = (const float**)ray_sys_alloc(T * sizeof(float*));
+        ok = l->kt && l->sc && l->ch && l->rows && l->krows && l->vrows;
+    }
+    if (!ok) { emb_work_drop(w); return false; }
     w->cap = t;
     return true;
 }
@@ -140,7 +164,6 @@ int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
     *ids = w->scratch.ids;
     return n;
 }
-
 
 /* ---- the forward pass ---------------------------------------------------- */
 
@@ -190,17 +213,95 @@ static void emb_layer_norm(float* x, int64_t t, int64_t h, const float* w, const
     }
 }
 
-/* c[t x cols] = bias under every row, then += a * b through the kernel the
- * matrix product has (ops/linalg.c). */
-static void emb_dense(const float* a, int64_t t, int64_t k, const float* const* b_rows, const float* bias,
-                      float* c, int64_t cols, const float** rows) {
-    for (int64_t i = 0; i < t; i++) { rows[i] = a + i * k; memcpy(c + i * cols, bias, (size_t)cols * sizeof(float)); }
-    ray_lin_gemm_acc_f32(rows, b_rows, c, t, k, cols);
+/* A dense layer over the rows of a: c[t x cols] = bias under every row, then
+ * += a * b through the kernel the matrix product has (ops/linalg.c), then
+ * gelu where the layer has it.  One task computes a run of rows. */
+typedef struct {
+    const float* const* a;        /* t row pointers, k wide */
+    const float* const* b;        /* k row pointers, cols wide */
+    const float* bias;
+    float* c;
+    int64_t t, k, cols, per;
+    bool gelu;
+} emb_dense_t;
+
+static void emb_dense_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
+    const emb_dense_t* d = (const emb_dense_t*)vctx;
+    (void)worker; (void)end;
+    int64_t lo = start * d->per, hi = lo + d->per < d->t ? lo + d->per : d->t;
+    float* c = d->c + lo * d->cols;
+    for (int64_t i = lo; i < hi; i++) memcpy(d->c + i * d->cols, d->bias, (size_t)d->cols * sizeof(float));
+    ray_lin_gemm_acc_f32(d->a + lo, d->b, c, hi - lo, d->k, d->cols);
+    if (d->gelu) for (int64_t i = 0; i < (hi - lo) * d->cols; i++) c[i] = emb_gelu(c[i]);
+}
+
+/* Rows a worker takes at once: a multiple of four, as the kernel blocks them. */
+#define EMB_ROWS_MIN 4
+
+static void emb_dense(ray_pool_t* pool, const float* a, int64_t t, int64_t k, const float* const* b_rows,
+                      const float* bias, float* c, int64_t cols, const float** rows, bool gelu) {
+    for (int64_t i = 0; i < t; i++) rows[i] = a + i * k;
+    emb_dense_t d = { .a = rows, .b = b_rows, .bias = bias, .c = c, .t = t, .k = k, .cols = cols, .per = t, .gelu = gelu };
+    if (pool) {
+        int64_t nw = (int64_t)ray_pool_total_workers(pool);
+        int64_t per = (t + nw - 1) / nw;
+        per = (per + 3) & ~(int64_t)3;
+        if (per < EMB_ROWS_MIN) per = EMB_ROWS_MIN;
+        int64_t nt = (t + per - 1) / per;
+        if (nt > 1) { d.per = per; ray_pool_dispatch_n(pool, emb_dense_task, &d, (uint32_t)nt); return; }
+    }
+    emb_dense_task(&d, 0, 0, 1);
+}
+
+/* Attention: every head from the query, key and value of every token (qkv,
+ * t rows of 3H) into its own columns of ctx.  One task computes one head. */
+typedef struct {
+    const ray_embwork_t* w;
+    int64_t t, H, dh;
+} emb_heads_t;
+
+static void emb_head_task(void* vctx, uint32_t worker, int64_t h, int64_t end) {
+    const emb_heads_t* a = (const emb_heads_t*)vctx;
+    (void)end;
+    const ray_embwork_t* w = a->w;
+    emb_lane_t* l = &w->lane[worker];
+    const int64_t t = a->t, H = a->H, dh = a->dh;
+    const float scale = 1.0f / __builtin_sqrtf((float)dh);
+    const float* q0 = w->qkv + h * dh;
+    const float* k0 = w->qkv + H + h * dh;
+    const float* v0 = w->qkv + 2 * H + h * dh;
+    /* the keys of this head turned on their side: dh rows of t */
+    for (int64_t d = 0; d < dh; d++) {
+        float* kr = l->kt + d * t;
+        l->krows[d] = kr;
+        for (int64_t i = 0; i < t; i++) kr[i] = k0[i * 3 * H + d] * scale;
+    }
+    for (int64_t i = 0; i < t; i++) l->rows[i] = q0 + i * 3 * H;
+    memset(l->sc, 0, (size_t)t * (size_t)t * sizeof(float));
+    ray_lin_gemm_acc_f32(l->rows, l->krows, l->sc, t, dh, t);
+    for (int64_t i = 0; i < t; i++) {
+        float* r = l->sc + i * t;
+        float mx = r[0];
+        for (int64_t j = 1; j < t; j++) mx = r[j] > mx ? r[j] : mx;
+        float sum = 0.0f;
+        for (int64_t j = 0; j < t; j++) { r[j] = emb_exp(r[j] - mx); sum += r[j]; }
+        float inv = 1.0f / sum;
+        for (int64_t j = 0; j < t; j++) r[j] *= inv;
+    }
+    /* the weighted values: t x dh, then into this head's columns; the
+     * values of a head are rows already, t of them, in qkv */
+    for (int64_t i = 0; i < t; i++) { l->rows[i] = l->sc + i * t; l->vrows[i] = v0 + i * 3 * H; }
+    memset(l->ch, 0, (size_t)t * (size_t)dh * sizeof(float));
+    ray_lin_gemm_acc_f32(l->rows, l->vrows, l->ch, t, t, dh);
+    for (int64_t i = 0; i < t; i++) memcpy(w->ctx + i * H + h * dh, l->ch + i * dh, (size_t)dh * sizeof(float));
 }
 
 /* The vector of the tokens `ids` (t of them, t <= w->cap): the encoder's
- * last layer averaged over the tokens, scaled to length one. */
-static void emb_forward(const ray_embmodel_t* m, ray_embwork_t* w, const int32_t* ids, int64_t t, float* out) {
+ * last layer averaged over the tokens, scaled to length one.  With a pool
+ * the rows of each product and the heads of attention go to its workers;
+ * w then has a lane for every one of them. */
+static void emb_forward(const ray_embmodel_t* m, ray_embwork_t* w, ray_pool_t* pool,
+                        const int32_t* ids, int64_t t, float* out) {
     const int64_t H = m->dim, I = m->inner, nh = m->heads, dh = H / nh;
     float* x = w->x;
     for (int64_t i = 0; i < t; i++) {
@@ -211,49 +312,20 @@ static void emb_forward(const ray_embmodel_t* m, ray_embwork_t* w, const int32_t
         for (int64_t j = 0; j < H; j++) r[j] = e[j] + p[j] + m->type[j];
     }
     emb_layer_norm(x, t, H, m->eln_w, m->eln_b, m->eps);
-    const float scale = 1.0f / __builtin_sqrtf((float)dh);
+    emb_heads_t heads = { .w = w, .t = t, .H = H, .dh = dh };
     for (int64_t l = 0; l < m->layers; l++) {
         const emb_layer_t* L = &m->layer[l];
         /* query, key and value in one product */
-        emb_dense(x, t, H, L->qkv_r, L->qkv_b, w->qkv, 3 * H, w->rows);
-        for (int64_t h = 0; h < nh; h++) {
-            const float* q0 = w->qkv + h * dh;
-            const float* k0 = w->qkv + H + h * dh;
-            const float* v0 = w->qkv + 2 * H + h * dh;
-            /* the keys of this head turned on their side: dh rows of t */
-            for (int64_t d = 0; d < dh; d++) {
-                float* kr = w->kt + d * t;
-                w->krows[d] = kr;
-                for (int64_t i = 0; i < t; i++) kr[i] = k0[i * 3 * H + d] * scale;
-            }
-            for (int64_t i = 0; i < t; i++) w->rows[i] = q0 + i * 3 * H;
-            memset(w->sc, 0, (size_t)t * (size_t)t * sizeof(float));
-            ray_lin_gemm_acc_f32(w->rows, w->krows, w->sc, t, dh, t);
-            for (int64_t i = 0; i < t; i++) {
-                float* r = w->sc + i * t;
-                float mx = r[0];
-                for (int64_t j = 1; j < t; j++) mx = r[j] > mx ? r[j] : mx;
-                float sum = 0.0f;
-                for (int64_t j = 0; j < t; j++) { r[j] = emb_exp(r[j] - mx); sum += r[j]; }
-                float inv = 1.0f / sum;
-                for (int64_t j = 0; j < t; j++) r[j] *= inv;
-            }
-            /* the weighted values: t x dh, then into this head's columns */
-            for (int64_t i = 0; i < t; i++) w->rows[i] = w->sc + i * t;
-            /* the values of this head are rows already, t of them, in qkv */
-            for (int64_t i = 0; i < t; i++) w->vrows[i] = v0 + i * 3 * H;
-            memset(w->ch, 0, (size_t)t * (size_t)dh * sizeof(float));
-            ray_lin_gemm_acc_f32(w->rows, w->vrows, w->ch, t, t, dh);
-            for (int64_t i = 0; i < t; i++) memcpy(w->ctx + i * H + h * dh, w->ch + i * dh, (size_t)dh * sizeof(float));
-        }
+        emb_dense(pool, x, t, H, L->qkv_r, L->qkv_b, w->qkv, 3 * H, w->rows, false);
+        if (pool && nh > 1) ray_pool_dispatch_n(pool, emb_head_task, &heads, (uint32_t)nh);
+        else for (int64_t h = 0; h < nh; h++) emb_head_task(&heads, 0, h, h + 1);
         /* attention's output, added to what came in, normalized */
-        emb_dense(w->ctx, t, H, L->ao_r, L->ao_b, w->qkv, H, w->rows);
+        emb_dense(pool, w->ctx, t, H, L->ao_r, L->ao_b, w->qkv, H, w->rows, false);
         for (int64_t i = 0; i < t * H; i++) x[i] += w->qkv[i];
         emb_layer_norm(x, t, H, L->ln1_w, L->ln1_b, m->eps);
-        /* the wide layer, gelu, back to H, added, normalized */
-        emb_dense(x, t, H, L->in_r, L->in_b, w->mid, I, w->rows);
-        for (int64_t i = 0; i < t * I; i++) w->mid[i] = emb_gelu(w->mid[i]);
-        emb_dense(w->mid, t, I, L->out_r, L->out_b, w->qkv, H, w->rows);
+        /* the wide layer with gelu, back to H, added, normalized */
+        emb_dense(pool, x, t, H, L->in_r, L->in_b, w->mid, I, w->rows, true);
+        emb_dense(pool, w->mid, t, I, L->out_r, L->out_b, w->qkv, H, w->rows, false);
         for (int64_t i = 0; i < t * H; i++) x[i] += w->qkv[i];
         emb_layer_norm(x, t, H, L->ln2_w, L->ln2_b, m->eps);
     }
@@ -265,8 +337,12 @@ static void emb_forward(const ray_embmodel_t* m, ray_embwork_t* w, const int32_t
     for (int64_t j = 0; j < H; j++) out[j] *= inv;
 }
 
-int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, const char* text, size_t len,
-                            int64_t max_tokens, float* out) {
+/* Below this many tokens a text is computed by the one thread that has it:
+ * its products are too small for a dispatch to pay. */
+#define EMB_PAR_TOKENS 8
+
+int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, ray_pool_t* pool,
+                            const char* text, size_t len, int64_t max_tokens, float* out) {
     if (!m->layer) return -2;
     int64_t n = emb_tok_encode(m->tok, &w->scratch, text, len);
     if (n < 0) return -1;
@@ -277,8 +353,9 @@ int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, const cha
         w->scratch.ids[cap - 1] = m->tok->eos;
         n = cap;
     }
-    if (!emb_work_fit(m, w, n)) return -1;
-    emb_forward(m, w, w->scratch.ids, n, out);
+    if (pool && n < EMB_PAR_TOKENS) pool = NULL;
+    if (!emb_work_fit(m, w, n, pool ? (int64_t)ray_pool_total_workers(pool) : 1)) return -1;
+    emb_forward(m, w, pool, w->scratch.ids, n, out);
     return n;
 }
 

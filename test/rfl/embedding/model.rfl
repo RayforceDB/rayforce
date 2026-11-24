@@ -52,7 +52,13 @@
 (set T (map (fn [i] (at ["hello world" "a cat, hello!" "hello ж" "" "a" "cat a cat"] (% i 6))) (til 600)))
 (set V (.emb.encode M T))
 (count V) -- 600
-(sum (map (fn [i] (== 0.0 (max (abs (- (at V i) (.emb.encode M (at T i))))))) (til 600))) -- 600
+(sum (map (fn [i] (> 1e-6 (max (abs (- (at V i) (.emb.encode M (at T i))))))) (til 600))) -- 600
+;; A few texts go one after another, each over all the workers; many go to
+;; the workers whole.  Either way a text gives what it gives alone, to the
+;; last bits a product's order of rows can move.
+(set near0 (fn [a b] (< (max (abs (- a b))) 1e-6)))
+(sum (map (fn [i] (near0 (at (.emb.encode M (take T 3)) i) (at V i))) (til 3))) -- 3
+(near0 (.emb.encode M LONG) (at (.emb.encode M (take (enlist LONG) 600)) 599)) -- true
 (count (.emb.encode M (take ["x"] 0))) -- 0
 ;; The vectors are what the search takes.
 (at (at (.emb.knn (take V 6) (.emb.encode M "hello world") 1) '_rowid) 0) -- 0

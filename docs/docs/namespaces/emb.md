@@ -109,6 +109,8 @@ Signature: `(.emb.tokens handle text)`. The ids the model's tokenizer cuts `text
 
 ## `.emb.encode` { #emb-encode }
 
-Signature: `(.emb.encode handle text [max-tokens])`. The vector of `text`: F32, of the model's `dim`, of length one. A vector of strings gives a list of vectors, one for each, computed in parallel; that list is an embedding column as `.emb.knn` and `.emb.hnsw.build` take it.
+Signature: `(.emb.encode handle text [max-tokens])`. The vector of `text`: F32, of the model's `dim`, of length one. A vector of strings gives a list of vectors, one for each; that list is an embedding column as `.emb.knn` and `.emb.hnsw.build` take it.
+
+Either way the worker pool is used. Many texts go to the workers whole, a text to each. One text, or fewer texts than there are workers, is computed by all the workers together: the rows of each matrix product and the heads of attention are shared out, so a single long text does not wait on one core.
 
 A text of more tokens than the model allows (`tokens` in `.emb.model.info`), or than `max-tokens` when that is given and smaller, is cut to its beginning. The cost of a text grows faster than its length, so a smaller `max-tokens` is the way to trade the tail of long texts for speed.

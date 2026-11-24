@@ -64,9 +64,15 @@ int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
 /* The vector of `text` in out[0 .. dim): the encoder's last layer averaged
  * over the tokens and scaled to length one.  A text longer than the model's
  * limit, or than max_tokens when that is positive and smaller, is cut to its
- * beginning.  Returns the tokens used; -1 when memory runs out, -2 when the
- * model was opened without weights. */
-int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, const char* text, size_t len,
-                            int64_t max_tokens, float* out);
+ * beginning.  With a pool the one text is computed by all its workers, which
+ * the caller may ask for only where a dispatch is allowed
+ * (ray_pool_par_dispatch_ok), and must then check for an interrupt before it
+ * trusts the vector: a cancelled dispatch leaves it unfinished.  With NULL
+ * it is computed by the calling thread, as a task of a dispatch must.
+ * Returns the tokens used; -1 when memory runs out, -2 when the model was
+ * opened without weights. */
+struct ray_pool;
+int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, struct ray_pool* pool,
+                            const char* text, size_t len, int64_t max_tokens, float* out);
 
 #endif /* RAY_EMBMODEL_H */

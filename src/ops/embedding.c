@@ -721,6 +721,7 @@ typedef struct {
     ray_t* texts;            /* RAY_STR vector */
     ray_t** rows;            /* the F32 vectors, made before the dispatch */
     ray_embwork_t** work;    /* one per worker, made by the worker that first needs it */
+    ray_pool_t* inner;       /* set when the texts go one after another, each over all the workers */
     int64_t n, per, max_tokens;
     _Atomic(int) failed;     /* 1 out of memory */
 } emb_encode_ctx_t;
@@ -736,7 +737,7 @@ static void emb_encode_task(void* vctx, uint32_t worker, int64_t start, int64_t 
         if (ray_interrupted()) return;   /* the caller sees it after the dispatch */
         size_t len = 0;
         const char* s = ray_str_vec_get(c->texts, i, &len);
-        if (ray_embmodel_encode(c->m, w, s ? s : "", s ? len : 0, c->max_tokens, (float*)ray_data(c->rows[i])) < 0) {
+        if (ray_embmodel_encode(c->m, w, c->inner, s ? s : "", s ? len : 0, c->max_tokens, (float*)ray_data(c->rows[i])) < 0) {
             atomic_store(&c->failed, 1);
             return;
         }
@@ -766,9 +767,15 @@ ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
         ray_t* v = ray_vec_new(RAY_F32, in.dim);
         if (v && !RAY_IS_ERR(v)) {
             v->len = in.dim;
-            if (ray_embmodel_encode(m, w, ray_str_ptr(x), ray_str_len(x), max_tokens, (float*)ray_data(v)) < 0) {
+            /* One text has the whole pool: the rows of its products and its heads go to the workers. */
+            ray_pool_t* pool = ray_pool_get();
+            if (!ray_pool_par_dispatch_ok(pool, 1, 1)) pool = NULL;
+            if (ray_embmodel_encode(m, w, pool, ray_str_ptr(x), ray_str_len(x), max_tokens, (float*)ray_data(v)) < 0) {
                 ray_release(v);
                 v = ray_error("oom", NULL);
+            } else if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed))) {
+                ray_release(v);
+                v = ray_error("cancel", "interrupted");
             }
         }
         ray_embwork_free(w);
@@ -787,6 +794,7 @@ ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
     }
     if (cnt == 0) return out;
     ray_pool_t* pool = ray_pool_get();
+    if (!ray_pool_par_dispatch_ok(pool, 1, 1)) pool = NULL;
     uint32_t workers = pool ? ray_pool_total_workers(pool) : 1;
     emb_encode_ctx_t c = { .m = m, .texts = x, .rows = (ray_t**)ray_data(out), .n = cnt, .max_tokens = max_tokens };
     c.work = (ray_embwork_t**)ray_sys_alloc((size_t)workers * sizeof(ray_embwork_t*));
@@ -794,8 +802,14 @@ ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
     /* Texts differ in length, so the runs are short: a worker that drew long ones does not hold the rest up. */
     c.per = cnt / ((int64_t)workers * 16) + 1;
     int64_t tasks = (cnt + c.per - 1) / c.per;
-    if (pool && workers > 1 && tasks > 1) ray_pool_dispatch_n(pool, emb_encode_task, &c, (uint32_t)tasks);
-    else for (int64_t t = 0; t < tasks; t++) emb_encode_task(&c, 0, t, t + 1);
+    /* Texts enough to keep every worker busy go to the workers whole.  Fewer
+     * go one after another, each over all the workers, so that a handful of
+     * long texts does not leave most of the pool idle. */
+    if (pool && cnt >= (int64_t)workers) ray_pool_dispatch_n(pool, emb_encode_task, &c, (uint32_t)tasks);
+    else {
+        c.inner = pool;
+        for (int64_t t = 0; t < tasks; t++) emb_encode_task(&c, 0, t, t + 1);
+    }
     for (uint32_t i = 0; i < workers; i++) ray_embwork_free(c.work[i]);
     ray_sys_free(c.work);
     if (atomic_load(&c.failed)) { ray_release(out); return ray_error("oom", NULL); }
