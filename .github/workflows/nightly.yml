@@ -35,8 +35,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: dev }
+      # The release binary as it ships: the pinned Clang and the portable
+      # baseline of the distributable (release.yml).
+      - name: Install the current Clang
+        uses: ./.github/actions/setup-clang-current
       - name: Build server binary (IPC tests spawn ./rayforce)
-        run: make release
+        run: make release CC="$CLANG_CURRENT" RAY_MARCH=x86-64-v3
       - name: Full suite under ThreadSanitizer
         run: |
           # Empty filter = the whole in-process suite; 4 cores for contention.
@@ -90,8 +94,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: dev }
+      # The release binary as it ships: the pinned Clang and the portable
+      # baseline of the distributable (release.yml).
+      - name: Install the current Clang
+        uses: ./.github/actions/setup-clang-current
       - name: Build (release — realistic RSS)
-        run: make release
+        run: make release CC="$CLANG_CURRENT" RAY_MARCH=x86-64-v3
       - name: Server soak (45 min, kill/restart, RSS-slope leak watch)
         run: SOAK_SECONDS=2700 SOAK_CLIENTS=4 bash scripts/soak.sh
       - name: Upload RSS trace

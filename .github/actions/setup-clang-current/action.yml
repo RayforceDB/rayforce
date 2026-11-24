@@ -1,0 +1,28 @@
+name: Install the current Clang
+description: >-
+  Installs the upstream Clang release this repository builds its Linux
+  distributables with and tests against, and exports its command name as
+  CLANG_CURRENT (for example clang-23) for later steps: make ... CC=$CLANG_CURRENT.
+  The version is set here and nowhere else: bump the default below to move
+  ci.yml's clang-current job, the release build and the nightly release builds
+  together.  Linux runners only (apt.llvm.org).
+
+inputs:
+  version:
+    description: Clang major version to install from apt.llvm.org
+    required: false
+    default: "23"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Clang ${{ inputs.version }}
+      shell: bash
+      run: |
+        wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+        sudo bash llvm.sh ${{ inputs.version }}
+    - name: Export CLANG_CURRENT
+      shell: bash
+      run: |
+        clang-${{ inputs.version }} --version
+        echo "CLANG_CURRENT=clang-${{ inputs.version }}" >> "$GITHUB_ENV"

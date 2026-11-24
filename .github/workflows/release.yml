@@ -134,8 +134,18 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
 
+      # The Linux distributable is built with the pinned upstream Clang that
+      # ci.yml's clang-current job tests with, not with whatever Clang the
+      # runner image ships: the release compiler then changes when the action
+      # is bumped, not when ubuntu-latest moves.  macOS keeps Apple Clang.  A
+      # release target that predates the action (a re-run of an older release)
+      # builds with the runner's Clang, as it did.
+      - name: Install the current Clang (Linux)
+        if: runner.os == 'Linux' && hashFiles('.github/actions/setup-clang-current/action.yml') != ''
+        uses: ./.github/actions/setup-clang-current
+
       - name: Build release artifact (portable)
-        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }} RAY_MARCH=${{ matrix.march }}
+        run: make dist RAY_VERSION=${{ needs.prepare.outputs.version }} RAY_MARCH=${{ matrix.march }} ${CLANG_CURRENT:+CC=$CLANG_CURRENT}
 
       - name: Upload artifacts to release
         env:
