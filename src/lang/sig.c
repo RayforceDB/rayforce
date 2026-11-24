@@ -276,7 +276,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {"scan-left", "(scan-left <fn: fn> <x: vector or list>)"},
     {"scan-right", "(scan-right <fn: fn> <x: vector or list>)"},
     {"prior", "(prior <fn: fn> <x: vector or list>)"},
-    {"if", "(if <cond: bool> <then> [<cond> <then> ...] [<else>])"},
+    {"if", "(if <cond: bool or bool vector> <then> [<cond> <then> ...] [<else>])"},
     {"while", "(while <cond: bool> <body>...)"},
     {"times", "(times <n: int> <body>...) or (times [<name: sym> <n: int>] <body>...)"},
     {"fn", "(fn <params: sym vector> <body>...)"},
