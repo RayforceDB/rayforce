@@ -724,7 +724,66 @@ void ray_serde_msg_release(void) {
     if (g_ser_msg_hold > 0) g_ser_msg_hold--;
 }
 
+/* What ser writes, de reads (#1591): ray_de_raw counts one level per
+ * object it reads and refuses past RAY_DE_MAX_DEPTH, so the size and write
+ * phases count the same way and refuse a value nested deeper, with a limit
+ * error, instead of writing a frame no reader takes.  The walk also stops
+ * at the thread's stack reserve, as de does: before this, a value nested
+ * deeply enough at run time crashed every caller of ser, an IPC reply
+ * included. */
+#define RAY_DE_MAX_DEPTH 512
+static _Thread_local int g_ser_depth = 0;
+static int64_t serde_size_impl(ray_t* obj);
+static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj);
+static int64_t ser_note_col_failure(ray_t* err);
+
+/* Only a container recurses, so only a container is counted: de refuses
+ * an object at nesting level 512 or deeper (the root is level 0), so a
+ * container at level d is refused when d >= 512, or when it has children
+ * (at level d + 1) and d >= 511.  An atom or vector costs nothing here.  A
+ * level of ser costs little stack, so the stack is read every eighth. */
+static inline bool ser_container(const ray_t* obj) {
+    return obj && !RAY_IS_ERR(obj) && (obj->type == RAY_LIST || obj->type == RAY_DICT ||
+                                        obj->type == RAY_TABLE || obj->type == RAY_LAMBDA);
+}
+static inline int ser_depth_limit(const ray_t* obj) {
+    return (obj->type == RAY_LIST && obj->len == 0) ? RAY_DE_MAX_DEPTH : RAY_DE_MAX_DEPTH - 1;
+}
+/* The common case, inline: under the count and not a level that reads the stack. */
+static inline bool ser_depth_fine(const ray_t* obj) {
+    int d = g_ser_depth;
+    return RAY_LIKELY(d < RAY_DE_MAX_DEPTH - 1 && (d & 7) != 7) || (d < ser_depth_limit(obj) && (d & 7) != 7);
+}
+static bool ser_too_deep(const ray_t* obj) {
+    int limit = ser_depth_limit(obj);
+    if (g_ser_depth < limit && ((g_ser_depth & 7) != 7 || !ray_stack_short()))
+        return false;
+    ray_t* e = g_ser_depth >= limit
+        ? ray_error("limit", "serialize: value nested deeper than %d levels", RAY_DE_MAX_DEPTH)
+        : ray_error("limit", "serialize: value nested too deep for this thread's stack");
+    (void)ser_note_col_failure(e);
+    return true;
+}
+
 int64_t ray_serde_size(ray_t* obj) {
+    if (!ser_container(obj)) return serde_size_impl(obj);
+    if (!ser_depth_fine(obj) && ser_too_deep(obj)) return -1;
+    g_ser_depth++;
+    int64_t r = serde_size_impl(obj);
+    g_ser_depth--;
+    return r;
+}
+
+int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
+    if (!ser_container(obj)) return ser_raw_impl(buf, obj);
+    if (!ser_depth_fine(obj) && ser_too_deep(obj)) return -1;
+    g_ser_depth++;
+    int64_t r = ser_raw_impl(buf, obj);
+    g_ser_depth--;
+    return r;
+}
+
+static int64_t serde_size_impl(ray_t* obj) {
     if (!obj) return 1; /* RAY_SERDE_NULL marker */
     if (RAY_IS_ERR(obj)) {
         const char* msg = NULL;
@@ -858,7 +917,7 @@ int64_t ray_serde_size(ray_t* obj) {
  * ray_ser_raw — serialize into buffer, returns bytes written
  * -------------------------------------------------------------------------- */
 
-int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
+static int64_t ser_raw_impl(uint8_t* buf, ray_t* obj) {
     if (!obj) {
         buf[0] = RAY_SERDE_NULL;
         return 1;
@@ -1145,8 +1204,8 @@ int64_t ray_ser_raw(uint8_t* buf, ray_t* obj) {
  * deep nesting returns an error instead of overflowing the C stack.  Mirrors
  * the eval-depth ceiling (RAY_EVAL_MAX_DEPTH), and stops as it does at the
  * thread's stack reserve (ray_stack_short), whatever a level costs in this
- * build.  Thread-local: ray_de_raw may run on worker-pool threads. */
-#define RAY_DE_MAX_DEPTH 512
+ * build.  Thread-local: ray_de_raw may run on worker-pool threads.
+ * (RAY_DE_MAX_DEPTH is defined above, beside ser's matching bound.) */
 static _Thread_local int g_de_depth = 0;
 static _Thread_local uint8_t g_de_wire_version = RAY_SERDE_WIRE_VERSION;
 

@@ -603,7 +603,7 @@ spills exactly as it did before.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `ser` | unary | Serialize value to binary format | `(ser [1 2 3])` |
+| `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`) | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |

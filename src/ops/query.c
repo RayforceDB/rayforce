@@ -15847,9 +15847,12 @@ static uint8_t win_kind_from_name(const char* s, size_t len) {
  * row.
  * `funcs:` is a nested RAY_DICT whose values are list expressions (fn col).
  */
+static ray_t* query_too_deep(ray_t** args, int64_t n, const char* verb);
 ray_t* ray_window_fn(ray_t** args, int64_t n) {
     if (n < 1)
         return ray_error("arity", "window: expects a query dict, got %lld args", (long long)n);
+    ray_t* deep = query_too_deep(args, n, "window");
+    if (deep) return deep;
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
         return ray_error("type", "window: argument must be a dict, got %s",
@@ -19360,7 +19363,22 @@ static ray_t* select_check_key_named_outputs(ray_t* dict) {
     return NULL;
 }
 
+/* The planner walks a query's expressions with recursion per level and
+ * no error path, and an expression can be built at run time nested
+ * arbitrarily deep (a dict passed to `select` through `eval`): a query
+ * nested deeper than text can be (the parser's 1024 levels) is refused,
+ * so no walk ever meets one (#1591). */
+#define QUERY_MAX_NEST 1024
+static ray_t* query_too_deep(ray_t** args, int64_t n, const char* verb) {
+    for (int64_t i = 0; i < n; i++)
+        if (ray_nests_deeper_than(args[i], QUERY_MAX_NEST))
+            return ray_error("limit", "%s: query nested deeper than %d levels", verb, QUERY_MAX_NEST);
+    return NULL;
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
+    ray_t* deep = query_too_deep(args, n, "select");
+    if (deep) return deep;
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
@@ -32116,6 +32134,8 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n);
 static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym);
 
 ray_t* ray_update(ray_t** args, int64_t n) {
+    ray_t* deep = query_too_deep(args, n, "update");
+    if (deep) return deep;
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
@@ -39692,6 +39712,8 @@ ray_t* ray_delete_fn(ray_t** args, int64_t n) {
  * would be a second expression to keep in step with this one. */
 ray_t* ray_delete(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "delete: expects a query dict, got %lld args", (long long)n);
+    ray_t* deep = query_too_deep(args, n, "delete");
+    if (deep) return deep;
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
         return ray_error("type", "delete: query must be a dict, got %s", dict ? ray_type_name(dict->type) : "null");

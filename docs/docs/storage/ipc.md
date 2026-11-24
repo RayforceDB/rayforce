@@ -248,6 +248,8 @@ The `ser` builtin converts any value to a binary buffer (a `U8` vector). Pass it
 
 The result is always a `U8` byte vector containing the IPC header followed by the serialized payload.
 
+A value nested deeper than 512 levels (a list inside a list, 513 times) is not serialized: `ser` fails with `limit`, because 512 is the nesting `de` reads. A server whose reply is such a value answers with that error, and the connection stays open.
+
 ## Deserialization with `de`
 
 The `de` builtin reconstructs a value from its binary representation. Compose it with `ser` for a perfect round-trip:
@@ -402,6 +404,7 @@ The serialization functions are declared in `src/store/serde.h`:
 ## Limitations
 
 - **No streaming** — the entire object is serialized at once; there is no chunked or incremental mode
+- **Nesting depth** — a value nested deeper than 512 levels cannot be sent or received (`limit` when sending, `domain` when reading one)
 - **Single-threaded server** — the server processes queries sequentially on the main thread. Long-running queries block other clients.
 - **Plaintext transport** — data travels unencrypted over TCP. Use on trusted networks or tunnel through SSH for security.
 - **Shared secret only** — authentication uses a single password for all clients (`-u`/`-U`). There is no per-user access control.

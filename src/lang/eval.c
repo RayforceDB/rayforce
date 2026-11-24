@@ -1698,6 +1698,9 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     int right_coll = is_collection(right);
 
     if (!left_coll && !right_coll) return fn(left, right);
+    /* A list's cells are mapped through here again (atomic_map_unary). */
+    if ((left->type == RAY_LIST || right->type == RAY_LIST) && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "value nested too deep for this thread's stack");
 
     int64_t len;
     if (left_coll && right_coll) {
@@ -2379,8 +2382,51 @@ static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
 /* Map a unary function element-wise over a collection.
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
  * a nested collection maps to a collection of the same shape. */
+typedef struct { ray_t* x; int64_t i; } nest_frame_t;
+bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
+    if (!x || RAY_IS_ERR(x) || (x->type != RAY_LIST && x->type != RAY_DICT)) return limit < 1;
+    nest_frame_t local[64];
+    nest_frame_t* st = local;
+    int64_t cap = 64, top = 0;
+    bool deeper = false;
+    st[top++] = (nest_frame_t){ x, 0 };
+    while (top > 0 && !deeper) {
+        nest_frame_t* f = &st[top - 1];
+        ray_t* c;
+        if (f->x->type == RAY_DICT) {               /* its keys, then its values */
+            if (f->i >= 2) { top--; continue; }
+            c = f->i == 0 ? ray_dict_keys(f->x) : ray_dict_vals(f->x);
+        } else {
+            if (f->i >= f->x->len) { top--; continue; }
+            c = ((ray_t**)ray_data(f->x))[f->i];
+        }
+        f->i++;
+        if (!c || RAY_IS_ERR(c) || (c->type != RAY_LIST && c->type != RAY_DICT)) {
+            if (top + 1 > limit) deeper = true;
+            continue;
+        }
+        if (top + 1 > limit) { deeper = true; break; }
+        if (top == cap) {
+            nest_frame_t* grown = (nest_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown);
+            if (!grown) { deeper = true; break; }   /* cannot measure it: refuse */
+            memcpy(grown, st, (size_t)top * sizeof *grown);
+            if (st != local) ray_free_raw(st);
+            st = grown;
+            cap *= 2;
+        }
+        st[top++] = (nest_frame_t){ c, 0 };
+    }
+    if (st != local) ray_free_raw(st);
+    return deeper;
+}
+
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
+    /* A list's cells are mapped through here again: one C frame per level
+     * of nesting, and a value can be nested arbitrarily deep at run time
+     * (#1591).  Stop at the thread's stack reserve, as the evaluator does. */
+    if (arg->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "value nested too deep for this thread's stack");
 
     int64_t len = ray_len(arg);
 

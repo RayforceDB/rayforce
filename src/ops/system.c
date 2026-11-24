@@ -44,6 +44,7 @@
 #include "store/serde.h"
 #include "store/enccol.h"
 #include "store/splay.h"
+#include "store/col.h"     /* ray_col_limit_msg: why a save refused */
 #include "store/part.h"
 #include "core/ipc.h"
 #include "core/mcast.h"
@@ -258,7 +259,12 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
                 : ".db.splayed.set: symfile 'column for a partition of a parted table");
     }
 
+    (void)ray_col_limit_msg();   /* a stale reason from an earlier save */
     ray_err_t err = ray_splay_save_layout(tbl, dir, sym_path, mode, layout, index, durable);
+    if (err == RAY_ERR_LIMIT) {
+        const char* why = ray_col_limit_msg();
+        if (why) return ray_error("limit", "%s", why);
+    }
     if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
 
     ray_retain(tbl);
