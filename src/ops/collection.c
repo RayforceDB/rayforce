@@ -5668,6 +5668,7 @@ ray_t* fills_vec_eager(ray_t* x) {
 typedef struct {
     uint8_t seen;
     bool emitted_null;  /* summary slot reused after carry calculation */
+    bool overflowed;    /* avgs: a mean of non-null rows came out null */
     int64_t count;
     uint64_t acc_i;
     double acc_f;
@@ -5688,6 +5689,8 @@ typedef struct {
     bool has_nulls;
     int64_t nblocks;
     bool track_i64_nulls;
+    double scale;       /* avgs rescue: 2^-k applied to every value */
+    double unscale;     /* 2^k */
 } ts_run_ctx_t;
 
 static bool ts_numeric_type(int8_t t) {
@@ -5754,6 +5757,16 @@ static double ts_read_as_f64(ray_t* src, int64_t row) {
 
 static int64_t ts_read_as_i64(ray_t* src, int64_t row) {
     return read_col_i64(ray_data(src), row, src->type, src->attrs);
+}
+
+/* A value scaled by a power of two for an overflow rescue pass (#1548).
+ * The product goes through a volatile: release builds permit reassociation,
+ * and summing x*s as (sum x)*s would bring back the very overflow the scale
+ * avoids.  For the same reason a rescued mean is formed as
+ * (sum / count) * 2^k with the quotient held in a volatile. */
+static inline double ts_scaled(double v, double scale) {
+    volatile double sv = v * scale;
+    return sv;
 }
 
 static void ts_run_update(ts_run_state_t* s, ray_t* src, int64_t row,
@@ -5926,14 +5939,94 @@ static void ts_running_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
         }
         ts_run_state_t s = c->carry[b];
         bool emitted_null = false;
+        bool overflowed = false;
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (!(c->has_nulls && ray_vec_is_null(c->src, r)))
                 ts_run_update(&s, c->src, r, c->opcode, c->is_float);
-            emitted_null |= ts_run_write(c->dst, r, &s, c->opcode, c->is_float);
+            bool null = ts_run_write(c->dst, r, &s, c->opcode, c->is_float);
+            emitted_null |= null;
+            overflowed |= null && c->opcode == OP_AVGS && s.count > 0;
+        }
+        c->summary[b].emitted_null = emitted_null;
+        c->summary[b].overflowed = overflowed;
+    }
+}
+
+/* The avgs rescue (#1548).  A running mean is the running sum over the
+ * count, and once the sum overflows every later mean is lost although the
+ * mean itself is finite: (avgs [1e308 1e308 1.0]) is 1e308 1e308 6.7e307.
+ * When that happens the scan runs again on the values scaled by 2^-k, with
+ * 2^k at least twice the row count, where no sum of the scaled values can
+ * overflow, and rewrites only the means that were lost.  The scaling is a
+ * power of two, so it is exact except in the subnormal range, which cannot
+ * matter next to a sum that overflowed. */
+static void ts_avgs_rescue_summary_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_run_ctx_t* c = (ts_run_ctx_t*)vctx;
+    for (int64_t b = start; b < end; b++) {
+        int64_t lo = b * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS;
+        if (hi > c->src->len) hi = c->src->len;
+        if (pool_cancelled(c->pool)) return;
+        double acc = 0.0;
+        int64_t count = 0;
+        for (int64_t r = lo; r < hi; r++) {
+            if (c->has_nulls && ray_vec_is_null(c->src, r)) continue;
+            acc += ts_scaled(ts_read_as_f64(c->src, r), c->scale);
+            count++;
+        }
+        c->summary[b].acc_f = acc;
+        c->summary[b].count = count;
+    }
+}
+
+static void ts_avgs_rescue_emit_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_run_ctx_t* c = (ts_run_ctx_t*)vctx;
+    double* out = (double*)ray_data(c->dst);
+    for (int64_t b = start; b < end; b++) {
+        int64_t lo = b * RAY_MORSEL_ELEMS;
+        int64_t hi = lo + RAY_MORSEL_ELEMS;
+        if (hi > c->src->len) hi = c->src->len;
+        if (pool_cancelled(c->pool)) return;
+        double acc = c->carry[b].acc_f;
+        int64_t count = c->carry[b].count;
+        bool emitted_null = false;
+        for (int64_t r = lo; r < hi; r++) {
+            if (!(c->has_nulls && ray_vec_is_null(c->src, r))) {
+                acc += ts_scaled(ts_read_as_f64(c->src, r), c->scale);
+                count++;
+            }
+            if (count > 0 && out[r] != out[r]) {
+                /* Divide before unscaling; see ts_scaled. */
+                volatile double scaled_mean = acc / (double)count;
+                out[r] = ray_f64_fin(scaled_mean * c->unscale);
+            }
+            emitted_null |= out[r] != out[r];
         }
         c->summary[b].emitted_null = emitted_null;
     }
+}
+
+/* false if cancelled */
+static bool ts_avgs_rescue(ts_run_ctx_t* c) {
+    int k = 1;
+    while (k < 64 && ((int64_t)1 << (k - 1)) < c->src->len) k++;
+    c->scale = ldexp(1.0, -k);
+    c->unscale = ldexp(1.0, k);
+    ray_pool_dispatch(c->pool, ts_avgs_rescue_summary_fn, c, c->nblocks);
+    if (pool_cancelled(c->pool)) return false;
+    double acc = 0.0;
+    int64_t count = 0;
+    for (int64_t b = 0; b < c->nblocks; b++) {
+        c->carry[b].acc_f = acc;
+        c->carry[b].count = count;
+        acc += c->summary[b].acc_f;
+        count += c->summary[b].count;
+    }
+    ray_pool_dispatch(c->pool, ts_avgs_rescue_emit_fn, c, c->nblocks);
+    return !pool_cancelled(c->pool);
 }
 
 ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
@@ -6003,6 +6096,15 @@ ray_t* running_vec_eager(ray_t* x, uint16_t opcode) {
     if (pool_cancelled(pool)) {
         scratch_free(summary_hdr); scratch_free(carry_hdr); ray_release(out);
         return ray_error("cancel", "interrupted");
+    }
+    if (opcode == OP_AVGS) {
+        bool overflowed = false;
+        for (int64_t b = 0; b < nblocks && !overflowed; b++)
+            overflowed = summary[b].overflowed;
+        if (overflowed && !ts_avgs_rescue(&ctx)) {
+            scratch_free(summary_hdr); scratch_free(carry_hdr); ray_release(out);
+            return ray_error("cancel", "interrupted");
+        }
     }
     /* Only the joining thread publishes the vector-wide null hint. */
     for (int64_t b = 0; b < nblocks; b++) {
@@ -6099,9 +6201,11 @@ ray_t* differ_vec_eager(ray_t* x) {
     return out;
 }
 
+/* The prefix route serves the integer msum and mcount: their prefix sums
+ * are exact (modular for msum), so a window is the difference of two
+ * prefixes.  The F64 msum and mavg take the block route below (#1548). */
 typedef struct {
     uint64_t sum_i;
-    double   sum_f;
     int64_t  count;
 } ts_mprefix_state_t;
 
@@ -6110,7 +6214,6 @@ typedef struct {
     ray_t* dst;
     ray_pool_t* pool;
     uint64_t* prefix_i;
-    double* prefix_f;
     int64_t* prefix_count;
     ts_mprefix_state_t* summary;
     ts_mprefix_state_t* carry;
@@ -6183,23 +6286,18 @@ static void ts_mprefix_scan_fn(void* vctx, uint32_t worker_id, int64_t start, in
         if (hi > c->src->len) hi = c->src->len;
 
         uint64_t sum_i = 0;
-        double sum_f = 0.0;
         int64_t count = 0;
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             bool nn = !(c->has_nulls && ray_vec_is_null(c->src, r));
             if (nn) {
                 if (c->prefix_i) sum_i += (uint64_t)ts_read_as_i64(c->src, r);
-                if (c->prefix_f) sum_f += ts_read_as_f64(c->src, r);
                 count++;
             }
             if (c->prefix_i)      c->prefix_i[r + 1] = sum_i;
-            if (c->prefix_f)      c->prefix_f[r + 1] = sum_f;
             if (c->prefix_count)  c->prefix_count[r + 1] = count;
         }
-        c->summary[b] = (ts_mprefix_state_t){
-            .sum_i = sum_i, .sum_f = sum_f, .count = count
-        };
+        c->summary[b] = (ts_mprefix_state_t){ .sum_i = sum_i, .count = count };
     }
 }
 
@@ -6215,7 +6313,6 @@ static void ts_mprefix_adjust_fn(void* vctx, uint32_t worker_id, int64_t start, 
         for (int64_t r = lo; r < hi; r++) {
             if (ts_morsel_checkpoint(c->pool, r - lo)) return;
             if (c->prefix_i)      c->prefix_i[r + 1] += carry.sum_i;
-            if (c->prefix_f)      c->prefix_f[r + 1] += carry.sum_f;
             if (c->prefix_count)  c->prefix_count[r + 1] += carry.count;
         }
     }
@@ -6234,28 +6331,12 @@ static void ts_mprefix_emit_fn(void* vctx, uint32_t worker_id, int64_t start, in
             case OP_MCOUNT:
                 ((int64_t*)out)[r] = c->prefix_count[hi] - c->prefix_count[lo];
                 break;
-            case OP_MSUM:
-                if (c->prefix_f) {
-                    double v = ray_f64_fin(c->prefix_f[hi] - c->prefix_f[lo]);
-                    ((double*)out)[r] = v;
-                    emitted_null |= v != v;
-                } else {
-                    /* An I64/TIMESPAN window total that wraps onto
-                     * INT64_MIN is null, as for + and sums. */
-                    uint64_t v = c->prefix_i[hi] - c->prefix_i[lo];
-                    ((int64_t*)out)[r] = (int64_t)v;
-                    emitted_null |= v == (uint64_t)NULL_I64;
-                }
-                break;
-            case OP_MAVG: {
-                int64_t cnt = c->prefix_count[hi] - c->prefix_count[lo];
-                if (cnt <= 0) {
-                    emitted_null |= par_set_null(c->dst, r);
-                } else {
-                    double v = ray_f64_fin((c->prefix_f[hi] - c->prefix_f[lo]) / (double)cnt);
-                    ((double*)out)[r] = v;
-                    emitted_null |= v != v;
-                }
+            case OP_MSUM: {
+                /* An I64/TIMESPAN window total that wraps onto
+                 * INT64_MIN is null, as for + and sums. */
+                uint64_t v = c->prefix_i[hi] - c->prefix_i[lo];
+                ((int64_t*)out)[r] = (int64_t)v;
+                emitted_null |= v == (uint64_t)NULL_I64;
                 break;
             }
         }
@@ -6272,32 +6353,21 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
     int64_t nblocks = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     int64_t entries = n + 1;
-    ray_t *pi_hdr = NULL, *pf_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
+    ray_t *pi_hdr = NULL, *pc_hdr = NULL, *sum_hdr = NULL, *carry_hdr = NULL;
     uint64_t* prefix_i = NULL;
-    double* prefix_f = NULL;
     int64_t* prefix_count = NULL;
 
-    bool need_i = (opcode == OP_MSUM && out_type != RAY_F64);
-    bool need_f = (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64));
-    bool need_count = (opcode == OP_MAVG || opcode == OP_MCOUNT);
+    bool need_i = (opcode == OP_MSUM);
+    bool need_count = (opcode == OP_MCOUNT);
     bool has_nulls = ray_vec_may_have_nulls(x);
 
     if (need_i) {
         if (ts_size_overflows(entries, sizeof(uint64_t))) { ray_release(out); return ray_error("oom", NULL); }
         prefix_i = (uint64_t*)scratch_calloc(&pi_hdr, (size_t)entries * sizeof(uint64_t));
     }
-    if (need_f) {
-        if (ts_size_overflows(entries, sizeof(double))) {
-            if (pi_hdr) scratch_free(pi_hdr);
-            ray_release(out);
-            return ray_error("oom", NULL);
-        }
-        prefix_f = (double*)scratch_calloc(&pf_hdr, (size_t)entries * sizeof(double));
-    }
     if (need_count) {
         if (ts_size_overflows(entries, sizeof(int64_t))) {
             if (pi_hdr) scratch_free(pi_hdr);
-            if (pf_hdr) scratch_free(pf_hdr);
             ray_release(out);
             return ray_error("oom", NULL);
         }
@@ -6305,9 +6375,8 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     }
     ts_mprefix_state_t* summary = (ts_mprefix_state_t*)scratch_calloc(&sum_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
     ts_mprefix_state_t* carry = (ts_mprefix_state_t*)scratch_calloc(&carry_hdr, (size_t)nblocks * sizeof(ts_mprefix_state_t));
-    if ((need_i && !prefix_i) || (need_f && !prefix_f) || (need_count && !prefix_count) || !summary || !carry) {
+    if ((need_i && !prefix_i) || (need_count && !prefix_count) || !summary || !carry) {
         if (pi_hdr) scratch_free(pi_hdr);
-        if (pf_hdr) scratch_free(pf_hdr);
         if (pc_hdr) scratch_free(pc_hdr);
         if (sum_hdr) scratch_free(sum_hdr);
         if (carry_hdr) scratch_free(carry_hdr);
@@ -6318,7 +6387,7 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
     ray_pool_t* pool = ray_pool_get();
     ts_mprefix_ctx_t ctx = {
         .src = x, .dst = out, .pool = pool,
-        .prefix_i = prefix_i, .prefix_f = prefix_f,
+        .prefix_i = prefix_i,
         .prefix_count = prefix_count,
         .summary = summary, .carry = carry,
         .opcode = opcode,
@@ -6335,7 +6404,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         if ((b & 1023) == 0 && pool_cancelled(pool)) goto cancelled;
         carry[b] = run;
         run.sum_i += summary[b].sum_i;
-        run.sum_f += summary[b].sum_f;
         run.count += summary[b].count;
     }
 
@@ -6347,7 +6415,6 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
         out->attrs |= RAY_ATTR_HAS_NULLS;
 
     if (pi_hdr) scratch_free(pi_hdr);
-    if (pf_hdr) scratch_free(pf_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
@@ -6355,12 +6422,326 @@ static ray_t* moving_prefix_vec_eager(ray_t* x, uint16_t opcode, int64_t window,
 
 cancelled:
     if (pi_hdr) scratch_free(pi_hdr);
-    if (pf_hdr) scratch_free(pf_hdr);
     if (pc_hdr) scratch_free(pc_hdr);
     scratch_free(sum_hdr);
     scratch_free(carry_hdr);
     ray_release(out);
     return ray_error("cancel", "interrupted");
+}
+
+/* F64 moving sum and mean (#1548).
+ *
+ * A window's result has to depend only on the window's own values.  The
+ * difference of two running prefix sums does not: once the prefix is large
+ * it has lost the low-order bits of every later window (1e300 1e300 1 2
+ * gave a last window of 0, not 3), and once it overflows every later window
+ * is inf - inf.  So the rows are cut into blocks of `window` rows counted
+ * from row 0, and the window ending at row r, [r-w+1, r], meets at most two
+ * of them: a tail of the block before r's and a head of r's own block.
+ *
+ *     total(r) = suffix(r-w+1) + prefix(r)
+ *
+ * prefix(i) sums block(i) from its first row through i, suffix(i) sums
+ * block(i) from i through its last row, and the suffix term is absent when
+ * r-w+1 starts a block or the window is clipped at row 0.  Both terms read
+ * only rows of the window, so the result carries the error of summing the
+ * window directly, and a huge, infinite or NaN value reaches only the
+ * windows that contain it.
+ *
+ * The scans run per morsel in parallel.  A block can cross morsels, so each
+ * morsel reports the sum of its rows in a block that continues into the next
+ * morsel (forward) or the previous one (backward); a short serial pass
+ * chains these into per-morsel carries, and the emit pass adds a carry to
+ * the rows whose block began (forward) or ends (backward) in another morsel.
+ *
+ * A sum can overflow on the way to a finite total ([1e308 1e308 -1e308]
+ * is 1e308), and a mean is the total over the non-null count, so a total
+ * that overflows leaves a finite mean unrepresented ((mavg 2 [1e308 1e308])
+ * is 1e308).  When a non-empty window's result is not finite, the kernel
+ * runs once more on the values scaled by 2^-k, with 2^k at least twice the
+ * window, where no partial sum of a window can overflow, and rewrites only
+ * the results that were lost: a total is null only when it is past DBL_MAX
+ * or the window holds an infinity.  The common case never takes that pass. */
+typedef struct {
+    ray_t* src;
+    double* out;          /* F64 output payload */
+    ray_t* dst;
+    ray_pool_t* pool;
+    double* pre;          /* morsel-local block prefix sums */
+    double* suf;          /* morsel-local block suffix sums; NULL when no window reads one */
+    int64_t* cnt;         /* morsel-local non-null counts; NULL unless a mean over nulls */
+    double* pre_tail;     /* per morsel: sum of its rows after its last block start */
+    double* suf_head;     /* per morsel: sum of its rows before its first block end */
+    int64_t* cnt_tail;    /* per morsel: its non-null rows */
+    double* pre_carry;    /* per morsel: earlier morsels' rows in the block of its first row */
+    double* suf_carry;    /* per morsel: later morsels' rows in the block of its last row */
+    int64_t* suf_from;    /* per morsel: first row whose block ends past the morsel */
+    int64_t* cnt_carry;   /* per morsel: non-null rows before it */
+    double scale;         /* 1, or 2^-k on the rescue pass */
+    double unscale;       /* 1/scale */
+    int64_t window;
+    int64_t n;
+    bool has_nulls;
+    bool mean;            /* mavg: divide by the window's non-null count */
+    bool rescue;          /* rewrite only the results that were not finite */
+    _Atomic(bool) emitted_null;  /* a task wrote a null; published after the join */
+    _Atomic(bool) overflow;      /* a non-empty window's result was not finite */
+} ts_fwin_ctx_t;
+
+static inline int64_t ts_fwin_morsel_end(const ts_fwin_ctx_t* c, int64_t a) {
+    int64_t b = a + RAY_MORSEL_ELEMS;
+    return b < c->n ? b : c->n;
+}
+
+/* One value, scaled on the rescue pass (see ts_scaled). */
+static inline double ts_fwin_read(ray_t* src, int64_t r, double scale) {
+    double v = ts_read_as_f64(src, r);
+    return scale != 1.0 ? ts_scaled(v, scale) : v;
+}
+
+/* Rows [start, end) are whole morsels: ray_pool_dispatch starts every task
+ * on a TASK_GRAIN boundary, a multiple of RAY_MORSEL_ELEMS. */
+static void ts_fwin_scan_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_fwin_ctx_t* c = (ts_fwin_ctx_t*)vctx;
+    const int64_t w = c->window;
+    const double scale = c->scale;
+    for (int64_t a = start; a < end; a += RAY_MORSEL_ELEMS) {
+        if (pool_cancelled(c->pool)) return;
+        int64_t m = a / RAY_MORSEL_ELEMS;
+        int64_t b = ts_fwin_morsel_end(c, a);
+
+        double acc = 0.0;
+        int64_t k = 0;
+        int64_t ph = a % w;  /* position of row r in its block */
+        for (int64_t r = a; r < b; r++) {
+            if (ph == 0) acc = 0.0;
+            if (!(c->has_nulls && ray_vec_is_null(c->src, r))) {
+                acc += ts_fwin_read(c->src, r, scale);
+                k++;
+            }
+            c->pre[r] = acc;
+            if (c->cnt) c->cnt[r] = k;
+            if (++ph == w) ph = 0;
+        }
+        c->pre_tail[m] = acc;
+        c->cnt_tail[m] = k;
+
+        if (!c->suf) continue;
+        acc = 0.0;
+        ph = (b - 1) % w;
+        for (int64_t r = b - 1; r >= a; r--) {
+            if (ph == w - 1) acc = 0.0;
+            if (!(c->has_nulls && ray_vec_is_null(c->src, r)))
+                acc += ts_fwin_read(c->src, r, scale);
+            c->suf[r] = acc;
+            ph = ph ? ph - 1 : w - 1;
+        }
+        c->suf_head[m] = acc;
+    }
+}
+
+static void ts_fwin_emit_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    ts_fwin_ctx_t* c = (ts_fwin_ctx_t*)vctx;
+    const int64_t w = c->window;
+    bool emitted_null = false;
+    bool overflow = false;
+    for (int64_t a = start; a < end; a += RAY_MORSEL_ELEMS) {
+        if (pool_cancelled(c->pool)) break;
+        int64_t m = a / RAY_MORSEL_ELEMS;
+        int64_t b = ts_fwin_morsel_end(c, a);
+        /* Rows before the morsel's first block start continue a block
+         * begun in an earlier morsel. */
+        int64_t pre_to = a + (w - a % w) % w;
+        double pre_carry = c->pre_carry[m];
+        int64_t ph = (a + 1) % w;  /* (r+1) % w == (r-w+1) % w */
+        for (int64_t r = a; r < b; r++) {
+            double total = c->pre[r] + (r < pre_to ? pre_carry : 0.0);
+            int64_t lo = r - w + 1;
+            if (lo > 0 && ph != 0) {
+                int64_t ml = lo / RAY_MORSEL_ELEMS;
+                double head = c->suf[lo] + (lo >= c->suf_from[ml] ? c->suf_carry[ml] : 0.0);
+                total = head + total;
+            }
+            if (++ph == w) ph = 0;
+
+            if (!c->mean) {
+                if (c->rescue) {
+                    if (c->out[r] != c->out[r])
+                        c->out[r] = ray_f64_fin(total * c->unscale);
+                    emitted_null |= c->out[r] != c->out[r];
+                    continue;
+                }
+                double v = ray_f64_fin(total);
+                c->out[r] = v;
+                if (v != v) { emitted_null = true; overflow = true; }
+                continue;
+            }
+            int64_t first = lo > 0 ? lo : 0;
+            int64_t count;
+            if (c->cnt) {
+                int64_t upto = c->cnt[r] + c->cnt_carry[m];
+                int64_t before = 0;
+                if (first > 0) {
+                    int64_t mb = (first - 1) / RAY_MORSEL_ELEMS;
+                    before = c->cnt[first - 1] + c->cnt_carry[mb];
+                }
+                count = upto - before;
+            } else {
+                count = r - first + 1;
+            }
+            if (c->rescue) {
+                if (count > 0 && c->out[r] != c->out[r]) {
+                    /* Divide before unscaling; see ts_scaled. */
+                    volatile double scaled_mean = total / (double)count;
+                    c->out[r] = ray_f64_fin(scaled_mean * c->unscale);
+                }
+                emitted_null |= c->out[r] != c->out[r];
+                continue;
+            }
+            if (count <= 0) {
+                emitted_null |= par_set_null(c->dst, r);
+                continue;
+            }
+            double v = ray_f64_fin(total / (double)count);
+            c->out[r] = v;
+            if (v != v) { emitted_null = true; overflow = true; }
+        }
+    }
+    if (emitted_null) atomic_store_explicit(&c->emitted_null, true, memory_order_relaxed);
+    if (overflow) atomic_store_explicit(&c->overflow, true, memory_order_relaxed);
+}
+
+/* One scan-carry-emit pass over the rows into c->out; false if cancelled. */
+static bool ts_fwin_pass(ts_fwin_ctx_t* c, int64_t nmorsels) {
+    const int64_t w = c->window;
+    const int64_t n = c->n;
+    ray_pool_dispatch(c->pool, ts_fwin_scan_fn, c, n);
+    if (pool_cancelled(c->pool)) return false;
+
+    double pre_carry = 0.0;
+    int64_t cnt_carry = 0;
+    for (int64_t m = 0; m < nmorsels; m++) {
+        c->pre_carry[m] = pre_carry;
+        c->cnt_carry[m] = cnt_carry;
+        int64_t a = m * RAY_MORSEL_ELEMS;
+        int64_t b = ts_fwin_morsel_end(c, a);
+        /* A block starts inside [a, b): the next morsel's open block
+         * begins here; otherwise this whole morsel extends the carried one. */
+        bool starts = (a % w == 0) || ((b - 1) / w > a / w);
+        pre_carry = starts ? c->pre_tail[m] : pre_carry + c->pre_tail[m];
+        cnt_carry += c->cnt_tail[m];
+    }
+    if (c->suf) {
+        double suf_carry = 0.0;
+        for (int64_t m = nmorsels - 1; m >= 0; m--) {
+            int64_t a = m * RAY_MORSEL_ELEMS;
+            int64_t b = ts_fwin_morsel_end(c, a);
+            /* Rows from the block after the morsel's last block end on
+             * belong to a block that ends in a later morsel. */
+            bool ends = b / w > a / w;
+            int64_t from = ends ? (b / w) * w : a;
+            c->suf_carry[m] = suf_carry;
+            c->suf_from[m] = from > a ? from : a;
+            suf_carry = ends ? c->suf_head[m] : suf_carry + c->suf_head[m];
+        }
+    }
+
+    ray_pool_dispatch(c->pool, ts_fwin_emit_fn, c, n);
+    return !pool_cancelled(c->pool);
+}
+
+static ray_t* moving_fsum_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
+    int64_t n = x->len;
+    ray_t* out = ray_vec_new(RAY_F64, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    if (n == 0) return out;
+
+    /* A window of n or more rows is clipped at row 0, so every result is a
+     * prefix of the single block; a window of one row is its own block. */
+    if (window > n) window = n;
+    bool has_nulls = ray_vec_may_have_nulls(x);
+    bool mean = (opcode == OP_MAVG);
+    bool need_suf = window > 1 && window < n;
+    bool need_cnt = mean && has_nulls;
+    int64_t nmorsels = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+
+    ray_t *suf_hdr = NULL, *cnt_hdr = NULL, *meta_hdr = NULL, *dmeta_hdr = NULL, *res_hdr = NULL;
+    double* suf = NULL;
+    int64_t* cnt = NULL;
+    if (ts_size_overflows(n, sizeof(double))) { ray_release(out); return ray_error("oom", NULL); }
+    if (need_suf) suf = (double*)scratch_alloc(&suf_hdr, (size_t)n * sizeof(double));
+    if (need_cnt) cnt = (int64_t*)scratch_alloc(&cnt_hdr, (size_t)n * sizeof(int64_t));
+    /* Per-morsel tails, heads and carries: the sums in a double block, the
+     * counts and positions in an int64_t one, each typed as it is read. */
+    double* dmeta = (double*)scratch_calloc(&dmeta_hdr, (size_t)nmorsels * 4 * sizeof(double));
+    int64_t* meta = (int64_t*)scratch_calloc(&meta_hdr, (size_t)nmorsels * 3 * sizeof(int64_t));
+    if ((need_suf && !suf) || (need_cnt && !cnt) || !dmeta || !meta) {
+        if (suf_hdr) scratch_free(suf_hdr);
+        if (cnt_hdr) scratch_free(cnt_hdr);
+        if (dmeta_hdr) scratch_free(dmeta_hdr);
+        if (meta_hdr) scratch_free(meta_hdr);
+        ray_release(out);
+        return ray_error("oom", NULL);
+    }
+
+    ray_pool_t* pool = ray_pool_get();
+    ts_fwin_ctx_t ctx = {
+        .src = x, .out = (double*)ray_data(out), .dst = out, .pool = pool,
+        .pre = (double*)ray_data(out), .suf = suf, .cnt = cnt,
+        .pre_tail = dmeta,
+        .suf_head = dmeta + nmorsels,
+        .cnt_tail = meta,
+        .pre_carry = dmeta + 2 * nmorsels,
+        .suf_carry = dmeta + 3 * nmorsels,
+        .suf_from = meta + nmorsels,
+        .cnt_carry = meta + 2 * nmorsels,
+        .scale = 1.0, .unscale = 1.0,
+        .window = window, .n = n,
+        .has_nulls = has_nulls, .mean = mean, .rescue = false
+    };
+    atomic_store_explicit(&ctx.emitted_null, false, memory_order_relaxed);
+    atomic_store_explicit(&ctx.overflow, false, memory_order_relaxed);
+
+    bool ok = ts_fwin_pass(&ctx, nmorsels);
+    if (ok && atomic_load_explicit(&ctx.overflow, memory_order_relaxed)) {
+        /* The rescue pass: no partial sum of `window` values scaled by 2^-k
+         * reaches DBL_MAX / 2, and scaling by a power of two is exact
+         * outside the subnormal range, which cannot matter next to a
+         * total that overflowed. */
+        int k = 1;
+        while (k < 64 && ((int64_t)1 << (k - 1)) < window) k++;
+        double* pre = (double*)scratch_alloc(&res_hdr, (size_t)n * sizeof(double));
+        if (!pre) {
+            if (suf_hdr) scratch_free(suf_hdr);
+            if (cnt_hdr) scratch_free(cnt_hdr);
+            scratch_free(dmeta_hdr);
+            scratch_free(meta_hdr);
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        ctx.pre = pre;
+        ctx.scale = ldexp(1.0, -k);
+        ctx.unscale = ldexp(1.0, k);
+        ctx.rescue = true;
+        atomic_store_explicit(&ctx.emitted_null, false, memory_order_relaxed);
+        ok = ts_fwin_pass(&ctx, nmorsels);
+    }
+
+    if (suf_hdr) scratch_free(suf_hdr);
+    if (cnt_hdr) scratch_free(cnt_hdr);
+    if (res_hdr) scratch_free(res_hdr);
+    scratch_free(dmeta_hdr);
+    scratch_free(meta_hdr);
+    if (!ok) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
+    if (atomic_load_explicit(&ctx.emitted_null, memory_order_relaxed))
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
 }
 
 typedef struct {
@@ -6716,6 +7097,8 @@ ray_t* moving_vec_eager(ray_t* x, uint16_t opcode, int64_t window) {
         return moving_minmax_vec_eager(x, opcode, window, out_type);
     ray_t* out = (opcode == OP_MVAR || opcode == OP_MDEV)
         ? moving_variance_vec_eager(x, opcode, window, out_type)
+        : (opcode == OP_MAVG || (opcode == OP_MSUM && out_type == RAY_F64))
+        ? moving_fsum_vec_eager(x, opcode, window)
         : moving_prefix_vec_eager(x, opcode, window, out_type);
     /* the moving mean and deviation of durations are durations */
     if ((opcode == OP_MAVG || opcode == OP_MDEV) && x->type == RAY_TIMESPAN)

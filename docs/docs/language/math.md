@@ -779,6 +779,15 @@ For common time-series scans, prefer the built-in DAG forms. They avoid per-row 
 
 The moving forms take a positive integer window first. Constant windows inside query projections lower to DAG operations; dynamic windows still evaluate as ordinary function calls.
 
+On floats, each `msum` and `mavg` result reads only the rows of its own window, so a huge value earlier in the column does not change the windows after it. A window total past the largest F64 is `0Nf`, and a mean is null only when its window holds no values. `avgs` stays finite when the running total itself would overflow:
+
+```lisp
+(msum 2 [1e300 1e300 1.0 2.0])  ; [1e300 2e300 1e300 3.0]
+(msum 2 [1e308 1e308 1.0 2.0])  ; [1e308 0Nf 1e308 3.0]
+(mavg 2 [1e308 1e308 1.0 2.0])  ; [1e308 1e308 5e307 1.5]
+(avgs [1e308 1e308 1.0 2.0])    ; [1e308 1e308 6.67e307 5e307]
+```
+
 ### `(apply f a b)`
 
 Call the binary function `f` on the elements of two collections taken in step:

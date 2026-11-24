@@ -1,0 +1,43 @@
+;; #1548: an F64 msum, mavg or avgs result depends only on the rows it
+;; covers.  A window's total was the difference of two running prefix sums,
+;; so a large prefix cancelled the low-order bits of every later window and
+;; an overflowed one made every later window null.
+;; The issue's cases: only the window 1e308+1e308 overflows.
+(msum 2 [1e308 1e308 1.0 2.0]) -- (as 'F64 (list 1e308 0Nf 1e308 3.0))
+(mavg 2 [1e308 1e308 1.0 2.0]) -- [1e308 1e308 5e307 1.5]
+(avgs [1e308 1e308 1.0 2.0]) -- [1e308 1e308 6.666666666666667e307 5e307]
+;; Cancellation against a large prefix, with no overflow at all.
+(msum 2 [1e300 1e300 1.0 2.0]) -- [1e300 2e300 1e300 3.0]
+(msum 2 [1e308 -1e308 1e308 1.0 2.0]) -- [1e308 0.0 0.0 1e308 3.0]
+(mavg 3 [1e300 1.0 2.0 3.0 4.0]) -- [1e300 5e299 3.333333333333333e299 2.0 3.0]
+;; Overflow to infinity and back: the windows after it are finite.
+(msum 3 [1e308 1e308 -1e308 -1e308 5.0 6.0 7.0]) -- (as 'F64 (list 1e308 0Nf 1e308 -1e308 0Nf -1e308 18.0))
+(mavg 3 [1e308 1e308 -1e308 -1e308 5.0 6.0 7.0]) -- [1e308 1e308 3.333333333333333e307 -3.333333333333333e307 -6.666666666666667e307 -3.333333333333333e307 6.0]
+(avgs [1e308 1e308 -1e308 -1e308 5.0]) -- [1e308 1e308 3.333333333333333e307 0.0 1.0]
+;; Nulls inside and at the edges are skipped; an all-null window sums to
+;; 0.0 and has no mean.
+(msum 2 [0Nf 1e300 0Nf 0Nf 1.0 2.0 0Nf]) -- [0.0 1e300 1e300 0.0 1.0 3.0 2.0]
+(mavg 2 [0Nf 1e300 0Nf 0Nf 1.0 2.0 0Nf]) -- (as 'F64 (list 0Nf 1e300 1e300 0Nf 1.0 1.5 2.0))
+(avgs [0Nf 1e308 0Nf 1e308 1.0 0Nf]) -- (as 'F64 (list 0Nf 1e308 1e308 1e308 6.666666666666667e307 6.666666666666667e307))
+;; Window sizes 1, 2, n and larger than n.
+(msum 1 [1e300 1.0 2.0]) -- [1e300 1.0 2.0]
+(mavg 1 [1e308 1.0 0Nf]) -- (as 'F64 (list 1e308 1.0 0Nf))
+(msum 4 [1e300 -1e300 1.0 2.0]) -- [1e300 0.0 1.0 3.0]
+(msum 9 [1e300 -1e300 1.0 2.0]) -- [1e300 0.0 1.0 3.0]
+(mavg 9 [1e308 1e308 1.0 2.0]) -- [1e308 1e308 6.666666666666667e307 5e307]
+;; No new null on a clean input, and null flags agree with the cells.
+(sum (nil? (msum 2 [1e300 1e300 1.0 2.0]))) -- 0
+(sum (nil? (mavg 2 [1e308 1e308 1.0 2.0]))) -- 0
+(sum (nil? (avgs [1e308 1e308 1.0 2.0]))) -- 0
+;; The same through a query, on enough rows for the parallel paths: one
+;; huge value at the top, then 1.0 2.0 repeating.
+(set T (table [x] (list (concat [1e300] (take [1.0 2.0] 99999)))))
+(set rs (at (select {r: (msum 2 x) from: T}) 'r))
+(distinct (drop rs 2)) -- [3.0]
+(set ra (at (select {r: (mavg 4 x) from: T}) 'r))
+(distinct (drop ra 4)) -- [1.5]
+(set U (table [x] (list (concat [1e308 1e308] (take [1.0 3.0] 99998)))))
+(set rm (at (update {r: (mavg 2 x) from: U}) 'r))
+(take rm 3) -- [1e308 1e308 5e307]
+(distinct (drop rm 3)) -- [2.0]
+(last (at (select {r: (avgs x) from: U}) 'r)) -- 2e303
