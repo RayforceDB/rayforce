@@ -2321,6 +2321,11 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
         if (gv) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
+            /* A name bound to a table or a dict is that global, as the
+             * evaluator reads it, not a missing column (#1496): no node
+             * here, so the evaluator answers it.  A name bound to a list
+             * keeps the marker below (#1496 leaves lists as they were). */
+            if (gv->type == RAY_TABLE || gv->type == RAY_DICT) return NULL;
         }
         /* `null` naming no column is the null keyword, as the evaluator
          * reads it (#1483): no column, and no node here, so the evaluator
@@ -4640,7 +4645,11 @@ static bool agg_arith_head_is_control(int64_t sym) {
  * lone aggregate gets (#1444).  A lowering that raises (a missing column)
  * still claims the slot, so its compile in the group pass reports it. */
 static bool hidden_agg_arg_declines(ray_t* arg, ray_t* tbl) {
-    if (!arg || arg->type != RAY_LIST) return false;
+    /* a call, or a name that is no column (a global table or dict has no
+     * node, #1496) */
+    if (!arg || (arg->type != RAY_LIST &&
+                 !(arg->type == -RAY_SYM && !(arg->attrs & ATTR_QUOTED) && !tbl_has_col(tbl, arg->i64))))
+        return false;
     ray_graph_t* g = ray_graph_new(tbl);
     if (!g) return false;
     bool declined = !compile_agg_arg_dag(g, arg) && !g->compile_err;
@@ -5271,8 +5280,12 @@ static int is_group_dag_agg_expr_dag_safe(ray_t* expr, ray_t* tbl, ray_t** out_e
     /* An argument the DAG has no node for — (in s (list ...)) — is left to
      * the per-group evaluation instead of failing the whole select with
      * "failed to compile aggregation argument".  Compilation only inspects
-     * types and literals; it runs no user expression. */
-    if (agg_arg && agg_arg->type == RAY_LIST) {
+     * types and literals; it runs no user expression.  So is a name that
+     * is no column but a global the DAG has no node for, a table or a dict
+     * (#1496). */
+    if (agg_arg && (agg_arg->type == RAY_LIST ||
+                    (agg_arg->type == -RAY_SYM && !(agg_arg->attrs & ATTR_QUOTED) &&
+                     !tbl_has_col(tbl, agg_arg->i64)))) {
         ray_graph_t* g = ray_graph_new(tbl);
         if (!g) { *out_err = ray_error("oom", NULL); return 0; }
 #ifdef DEBUG
@@ -20843,6 +20856,13 @@ static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
         ray_t* src = query_inline_helpers(el[1], tbl);
         if (!src || RAY_IS_ERR(src)) { if (engine) ray_release(engine); return src ? src : ray_error("oom", NULL); }
         bool take = src->type == RAY_LIST && !expr_contains_agg(src) && expr_reads_no_column(src, tbl);
+        /* a name holding a table or a dict: one value, as a computed
+         * collection is (#1496) */
+        if (!take && src->type == -RAY_SYM && !(src->attrs & ATTR_QUOTED) &&
+            !tbl_has_col(tbl, src->i64) && !ray_env_has_lexical_local(src->i64)) {
+            ray_t* gv = ray_env_get(src->i64);
+            take = gv && (gv->type == RAY_TABLE || gv->type == RAY_DICT);
+        }
         if (take) {
             ray_graph_t* pg = ray_graph_new(tbl);
             take = pg && compile_expr_dag(pg, src) == NULL;
@@ -27011,7 +27031,17 @@ by_dict_done:
             named_value_key = key_ops[0] != NULL && (by_key_carried || key_ops[0]->opcode == OP_CONST) &&
                               by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED) &&
                               !sym_names_col(tbl, by_expr->i64);
-            if (!key_ops[0]) { ray_t* cerr = graph_take_compile_err(g); ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression"); }
+            if (!key_ops[0]) {
+                ray_t* cerr = graph_take_compile_err(g);
+                /* a key name holding a table or a dict: no column
+                 * and no key, reported as the missing column it was before
+                 * names outside the DAG read their globals (#1496) */
+                ray_t* kn = !cerr && by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED)
+                            ? ray_sym_str(by_expr->i64) : NULL;
+                ray_graph_free(g); ray_release(tbl); scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                if (kn) return ray_error("schema", "column '%.*s' not found", (int)ray_str_len(kn), ray_str_ptr(kn));
+                return cerr ? cerr : ray_error("domain", "select by: failed to compile group key expression");
+            }
             n_keys = 1;
         }
 
