@@ -29,3 +29,16 @@
 (at (Q 'I64 'cg) 2) -- 'type
 (at (Q 'I64 'cs) 1) -- [1 0 0Nl 3]
 (at (Q 'F64 'cp) 1) -- [1.0 0.0 0Nf 3.0]
+;; #1586: the quoted spellings ((quote as) 'T c) and (as (quote T) c)
+;; cast as (as 'T c) does.  A DATE, TIME or TIMESTAMP column to U8 was
+;; refused by both, cast one cell at a time, where the eager cast answers.
+;; Every input but LIST (the last column, #1585).
+(set QQ (fn [x c] (list (R (format "(as '% (at P '%))" x c)) (R (format "(at (select {r: ((quote as) '% %) from: P}) 'r)" x c)) (R (format "(at (select {r: (as (quote %) %) from: P}) 'r)" x c)) (R (format "(at (update {r: ((quote as) '% %) from: P}) 'r)" x c)) (R (format "(as '% (at (at P '%) [1 2 3]))" x c)) (R (format "(at (select {r: ((quote as) '% %) from: P where: (> k 0)}) 'r)" x c)) (R (format "(at (select {r: (as (quote %) %) from: P where: (> k 0)}) 'r)" x c)))))
+(set BadQ (fn [x c] (let q (QQ x c)) (or (not (identical (at q 0) (at q 1))) (not (identical (at q 0) (at q 2))) (not (identical (at q 0) (at q 3))) (not (identical (at q 4) (at q 5))) (not (identical (at q 4) (at q 6))))))
+(set FailsQ (fn [c] (sum (map (fn [x] (as 'I64 (BadQ x c))) X))))
+(map FailsQ (at C (til 14))) -- [0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+(set D (table [d t p] (list [2024.01.02 0Nd 2024.03.04] (as 'TIME [1000 0Nl 3000]) (as 'TIMESTAMP [1000 0Nl 3000]))))
+(at (select {r: ((quote as) 'U8 d) from: D}) 'r) -- [0x3f 0x00 0x7d]
+(at (select {r: ((quote as) 'U8 t) from: D}) 'r) -- [0xe8 0x00 0xb8]
+(at (select {r: ((quote as) 'U8 p) from: D}) 'r) -- [0xe8 0x00 0xb8]
+(at (select {r: (as (quote U8) d) from: D}) 'r) -- (as 'U8 (at D 'd))
