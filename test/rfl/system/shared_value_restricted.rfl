@@ -71,6 +71,13 @@
 (.ipc.send h "(+ 1 2)") -- 3
 (ask "((fn [] (let s (take \"c\" 1000000)) (count (raze (take (list s) 1100)))))") -- 'limit
 (.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (til 1000000)) (count (raze (take (list v) 300)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (concat (til 1000000) 0N)) (count (raze (take (list v) 300)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let l (as 'LIST (til 100000))) (count (raze (take (list l) 3000)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (til 1000)) (count (raze (take (list v) 300)))))") -- 300000
 (ask "((fn [] (let s (take \"c\" 1000000)) (in [\"x\"] (take (list s) 100000))))") -- [false]
 (.ipc.send h "(+ 1 2)") -- 3
 (ask "((fn [] (let s (take \"c\" 1000000)) (count (as 'STR (take (list s) 100)))))") -- 100

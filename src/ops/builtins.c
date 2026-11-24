@@ -4770,6 +4770,30 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
  *   - anything else (strings, slices, symbols of two domains, dicts,
  *     tables, a change of type, an error) is one concat, as before. */
 
+/* raze copies a vector's cells, or a list's cell pointers, again for each
+ * item that holds it: a part held by several items is charged its bytes
+ * again each time against the budget of repeated output, as raze_strings
+ * charges a string (#1657).  Atoms are appended as themselves, not copied.
+ * Run before anything is allocated, and only when the copy could pass the
+ * budget at all: what repeats cannot exceed what is copied. */
+__attribute__((noinline)) static bool raze_parts_repeat_over(ray_t* r, ray_t** items, int64_t n) {
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    bool over = false;
+    for (int64_t i = -1; i < n && !over; i++) {   /* -1: r, the result so far, when given */
+        ray_t* x = i < 0 ? r : items[i];
+        if (!x || RAY_IS_ERR(x) || x->rc == 1 || x->type < 0) continue;
+        uint64_t esz = x->type == RAY_LIST ? sizeof(ray_t*)
+                     : ray_is_vec(x) ? ray_sym_elem_size(x->type, x->attrs) : 0;
+        if (esz) over = ray_dup_copy(&dup, x, (uint64_t)x->len * esz);
+    }
+    ray_dup_copy_end(&dup);
+    return over;
+}
+__attribute__((noinline, cold)) static ray_t* raze_limit(void) {
+    return ray_error("limit", "raze: the result repeats shared parts beyond 1 GiB of extra data");
+}
+
 /* The type of a run, or 0: a fixed-width type concat appends element by
  * element. */
 static int8_t raze_run_type(int8_t t) {
@@ -4837,6 +4861,10 @@ __attribute__((noinline)) static ray_t* raze_typed_run(ray_t* r, ray_t** items, 
         if (t == RAY_SYM && ray_sym_elem_size(RAY_SYM, x->attrs) > ray_sym_elem_size(RAY_SYM, wbits))
             wbits = x->attrs & RAY_SYM_W_MASK;
     }
+    /* a vector held by several items is copied again for each (#1657) */
+    if (RAY_UNLIKELY((uint64_t)total * 16 > RAY_DUP_BUDGET) &&   /* 16: the widest cell */
+        raze_parts_repeat_over(r, items + k, j - k))
+        return raze_limit();
     ray_t* out;
     if (t == RAY_SYM) {
         out = ray_sym_vec_new(any_atom ? RAY_SYM_W64 : wbits, total);
@@ -4970,6 +4998,11 @@ __attribute__((noinline)) static ray_t* raze_list_tail(ray_t* r, ray_t** items, 
     int64_t total = r->len;
     for (int64_t i = k; i < j; i++)
         total += items[i]->type == RAY_LIST || ray_is_vec(items[i]) ? items[i]->len : 1;
+    /* a list or vector held by several items is copied again for each
+     * (#1657); 16 bytes a cell bound what any part copies */
+    if (RAY_UNLIKELY((uint64_t)total * 16 > RAY_DUP_BUDGET) &&
+        raze_parts_repeat_over(r, items + k, j - k))
+        return raze_limit();
     ray_t* out = ray_alloc((size_t)total * sizeof(ray_t*));
     if (!out) return ray_error("oom", NULL);
     out->type = RAY_LIST;
@@ -5127,6 +5160,11 @@ ray_t* ray_raze_fn(ray_t* x) {
             }
         }
         if (fast) {
+            /* a vector held by several items is copied again for each
+             * (#1657); an output of at most the budget cannot repeat more */
+            if (RAY_UNLIKELY((uint64_t)total * ray_elem_size(t) > RAY_DUP_BUDGET) &&
+                raze_parts_repeat_over(NULL, items, n))
+                return raze_limit();
             ray_t* out = ray_vec_new(t, total);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
             out->len = total;
@@ -5158,6 +5196,10 @@ ray_t* ray_raze_fn(ray_t* x) {
      * answer.  A handful of items, and a first item with an index (carried
      * from concat to concat), are folded pairwise as before. */
     if (n <= RAZE_FOLD_MIN || ray_index_has(items[0])) {   /* a handful: folded as it reads */
+        /* a part held by several items is copied again for each (#1657):
+         * a handful copies at most that many times what it holds; a long
+         * list after an indexed first item is checked here */
+        if (n > RAZE_FOLD_MIN && raze_parts_repeat_over(NULL, items, n)) return raze_limit();
         ray_t* result = items[0];
         ray_retain(result);
         for (int64_t i = 1; i < n; i++) {
