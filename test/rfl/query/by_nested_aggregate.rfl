@@ -146,9 +146,10 @@
 (set Q (select {a: (max WV) s: (max (+ WV (count v))) b: (first (at V i)) from: T by: k}))
 (at (xasc Q 'k) 'a)                                                        -- (Rw Kk TM (fn [w r] (max w)))
 (at (xasc Q 'k) 'b)                                                        -- (Rc T Kk 'i (fn [x] (first (at V x))))
-;; a vector of another length is no column: the aggregate refolds
+;; a vector of another length read where a column would be is a length
+;; error, as (sum V3) is (#1462)
 (set V3 [1 2 3])
-(try (select {s: (max (+ V3 (count v))) from: T by: k}) Re)               -- Refold
+(select {s: (max (+ V3 (count v))) from: T by: k}) !- length
 ;; under `at` it is the whole vector, never sliced
 (Sk (select {s: (max (+ v (at WV (count v)))) from: T by: k}) 'k)         -- (Rw Kk TM (fn [w r] (max (+ (at r 'v) (at WV (count (at r 'v)))))))
 ;; read in a helper the planner inlines, as written out

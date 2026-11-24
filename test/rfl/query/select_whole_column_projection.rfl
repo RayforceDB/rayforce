@@ -99,9 +99,13 @@
 (select {x: (first (asc s)) y: (last (asc k)) from: TPW where: (> k 1)}) -- (select {x: (first (asc s)) y: (last (asc k)) from: TFW where: (> k 1)})
 ;; A scalar aggregate whose source reads no column has nothing of the
 ;; table to bind: over a parted table it answers as over a flat one.
-(at (select {x: (count [1 2 3]) from: TPW}) 'x) -- [3]
+(at (select {x: (count (til 3)) from: TPW}) 'x) -- [3]
 (at (select {x: (first (asc [3 1 2])) from: TPW}) 'x) -- [1]
-(select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TPW}) -- (select {x: (count [1 2 3]) y: (first (asc [3 1 2])) from: TFW})
+(select {x: (count (til 3)) y: (first (asc [3 1 2])) from: TPW}) -- (select {x: (count (til 3)) y: (first (asc [3 1 2])) from: TFW})
+;; a written vector of another length than the table's is a length error,
+;; in count as in every aggregate (#1462)
+(select {x: (count [1 2 3]) from: TPW}) !- length
+(select {x: (count [1 2 3]) from: TFW}) !- length
 
 ;; An aggregate source that reads no column and has no DAG node, `(til 5)`,
 ;; is one collection whatever the row: `(count (til 5))` is 5, as outside a
@@ -194,8 +198,8 @@ ticks -- 1
 (select {x: (max L3) from: TPW by: s}) !- length
 (select {x: (first L3) from: TFW by: s}) !- length
 (select {x: (sum [1 2 3 4]) from: TFW where: (> k 2)}) !- length
-(at (select {x: (count L3) from: TFW}) 'x) -- [3]
-(at (select {x: (count L3) from: TPW by: s asc: s}) 'x) -- [3 3 3 3 3]
+(select {x: (count L3) from: TFW}) !- length
+(select {x: (count L3) from: TPW by: s asc: s}) !- length
 
 (set ticks 0)
 (at (select {x: (sum (do (set ticks (+ ticks 1)) (at [1 2 3] 0))) from: TFW}) 'x) -- [6]

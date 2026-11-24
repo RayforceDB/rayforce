@@ -50,6 +50,20 @@
 #define RAY_IS_SYM(t)         ((t) == RAY_SYM)
 #define RAY_SYM_ELEM(attrs)   (1u << ((attrs) & RAY_SYM_W_MASK))  /* 1,2,4,8 */
 
+/* Private ids: names of a query's private columns (the free vectors an
+ * aggregate reads as rows, #1462).  The symbol table never issues one: its
+ * ids stay below RAY_SYM_PRIVATE_LO (the interning paths refuse past it),
+ * so no string a user writes, casts, evals or receives over the wire can
+ * name one, and ray_sym_str has no string for one.  ray_sym_is_private is
+ * the only test for one. */
+#define RAY_SYM_PRIVATE_LO  ((int64_t)0x80000000)
+#define RAY_SYM_PRIVATE_HI  ((int64_t)0xFFFFFFFE)
+static inline bool ray_sym_is_private(int64_t id) {
+    return id >= RAY_SYM_PRIVATE_LO && id <= RAY_SYM_PRIVATE_HI;
+}
+/* The private id of slot k of a query (k from 0). */
+static inline int64_t ray_sym_private(int64_t k) { return RAY_SYM_PRIVATE_HI - k; }
+
 /* Determine optimal SYM width for a given dictionary size */
 static inline uint8_t ray_sym_dict_width(int64_t dict_size) {
     if (dict_size <= 255)        return RAY_SYM_W8;

@@ -1088,8 +1088,12 @@ ray_t* ray_like_fn(ray_t* x, ray_t* pattern) {
 }
 
 ray_t* ray_sym_name_fn(ray_t* x) {
+    /* a query's private id (table/sym.h) is no symbol: refused at this
+     * boundary by the one test for it, which states the rule here; today
+     * ray_sym_str has no string for one either, so the check below it would
+     * refuse it too, but that is the string table's layout, not a promise */
     if (x->type == -RAY_I64) {
-        if (x->i64 < 0 || !ray_sym_str(x->i64))
+        if (x->i64 < 0 || ray_sym_is_private(x->i64) || !ray_sym_str(x->i64))
             return ray_error("domain", "sym-name: invalid sym ID");
         return ray_sym(x->i64);
     }
@@ -1098,7 +1102,7 @@ ray_t* ray_sym_name_fn(ray_t* x) {
         const int64_t* data = (const int64_t*)ray_data(x);
         /* Validate all IDs first */
         for (int64_t i = 0; i < n; i++) {
-            if (data[i] < 0 || !ray_sym_str(data[i]))
+            if (data[i] < 0 || ray_sym_is_private(data[i]) || !ray_sym_str(data[i]))
                 return ray_error("domain", "sym-name: invalid sym ID in vector");
         }
         ray_t* out = ray_vec_new(RAY_SYM, n);

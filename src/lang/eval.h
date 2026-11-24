@@ -490,6 +490,15 @@ ray_t* ray_type_fn(ray_t* val);
 ray_t* ray_set_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr);
 ray_t* ray_cond_fn(ray_t** args, int64_t n);
+
+/* Does the builtin `fn`, called with `nargs` arguments as the evaluator
+ * dispatches it, map argument `pos` (from 1, any position) element by
+ * element: one value per element, element j from element j alone?  The
+ * single source of a query's row shape (#1462). */
+bool ray_fn_row_arg(ray_t* fn, int64_t nargs, int64_t pos);
+/* Does it map argument `pos` element by element although a query reads it
+ * whole by decision (lookups, raze, concat)?  The reason in *why. */
+bool ray_fn_row_arg_whole(ray_t* fn, int64_t nargs, int64_t pos, const char** why);
 ray_t* ray_do_fn(ray_t** args, int64_t n);
 ray_t* ray_while_fn(ray_t** args, int64_t n);
 ray_t* ray_times_fn(ray_t** args, int64_t n);

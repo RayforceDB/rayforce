@@ -768,6 +768,9 @@ void        ray_graph_free(ray_graph_t* g);
 
 /* Source ops */
 ray_op_t* ray_scan(ray_graph_t* g, const char* col_name);
+/* A scan of the column named by the id `sym_id` (no string is interned):
+ * how a query reads its private columns (table/sym.h). */
+ray_op_t* ray_scan_sym(ray_graph_t* g, int64_t sym_id);
 ray_op_t* ray_const_f64(ray_graph_t* g, double val);
 ray_op_t* ray_const_i64(ray_graph_t* g, int64_t val);
 ray_op_t* ray_const_bool(ray_graph_t* g, bool val);

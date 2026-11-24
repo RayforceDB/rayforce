@@ -106,6 +106,9 @@ static struct {
     char pad[64 - sizeof(_Atomic(int))];
 } g_sym_lock_line;
 _Static_assert(sizeof(g_sym_lock_line) == 64, "the symbol lock fills its line");
+/* The string table's capacity bound (UINT32_MAX / 2) keeps every issued id
+ * below the private range; the interning paths also refuse it outright. */
+_Static_assert((int64_t)(UINT32_MAX / 2) < RAY_SYM_PRIVATE_LO, "symbol ids stay below the private range");
 static inline void sym_lock(void) {
     while (atomic_exchange_explicit(&g_sym_lock_line.v, 1, memory_order_acquire)) {
         RAY_CPU_RELAX();
@@ -523,6 +526,8 @@ static int64_t sym_commit_new(uint32_t hash, const char* str, size_t len) {
     }
 
     uint32_t new_id = g_sym.str_count;
+    /* never a private id (sym.h): those name query-private columns */
+    if ((int64_t)new_id >= RAY_SYM_PRIVATE_LO) return -1;
 
     if (new_id >= g_sym.str_cap) {
         if (g_sym.str_cap >= UINT32_MAX / 2) return -1;
@@ -1332,7 +1337,7 @@ ray_err_t ray_sym_load(const char* path) {
 
     int64_t disk_count;
     memcpy(&disk_count, mapped + 4, 8);
-    if (disk_count < 0 || disk_count > UINT32_MAX) {
+    if (disk_count < 0 || disk_count > UINT32_MAX || disk_count >= RAY_SYM_PRIVATE_LO) {
         ray_vm_unmap_file(mapped, mapped_size);
         ray_file_unlock(lock_fd);
         ray_file_close(lock_fd);
@@ -1589,7 +1594,8 @@ bool ray_sym_publish_values(ray_read_budget_t* b,
             uint32_t id = (uint32_t)plan[i].id;
             plan[i].cache = !(g_sym.scanned[id >> 6] & ((uint64_t)1 << (id & 63)));
         } else {
-            if (target_count == UINT32_MAX || target_count >= max_symbols) {
+            if (target_count == UINT32_MAX || target_count >= max_symbols ||
+                (int64_t)target_count >= RAY_SYM_PRIVATE_LO) {
                 b->status = RAY_READ_LIMIT; goto done;
             }
             plan[i].id = target_count++;

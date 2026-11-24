@@ -30,6 +30,8 @@
 #include "mem/heap.h"
 #include "store/part.h"
 #include "store/splay.h"
+#include "store/serde.h"
+#include "store/col.h"
 #include "store/enccol.h"
 #include "store/encfmt.h"
 #include "table/domain.h"
@@ -14380,6 +14382,359 @@ static test_result_t test_group_wide_null_masks(void) {
     PASS();
 }
 
+/* ---- #1462: each builtin's row shape, as declared against as measured ----
+ * A query reads a free vector as rows exactly where ray_fn_row_arg says
+ * the builtin maps it element by element.  Every builtin is classified:
+ * PURE builtins are called here on small vectors of every type, and each
+ * position they map element by element must be declared, each declared
+ * position must map so; SKIP builtins (effects, I/O, clocks, randomness,
+ * special and higher-order forms, query verbs) are never called, and may
+ * declare nothing.  A builtin in neither list fails the test, so a new one
+ * must be classified. */
+static const char* const k_rs_pure[] = {
+    "+", "-", "*", "/", "%", ">", "<", ">=", "<=", "==", "!=", "and", "or", "if", "not",
+    "neg", "round", "floor", "ceil", "abs", "sqrt", "log", "exp", "sin", "asin", "cos",
+    "acos", "tan", "atan", "reciprocal", "signum", "pow", "top", "bot", "pearson_corr",
+    "cov", "scov", "wsum", "wavg", "quantile", "percentile", "sum", "prod", "all",
+    "any", "count", "avg", "min", "max", "first", "last", "med", "mode", "dev",
+    "stddev", "stddev_pop", "dev_pop", "var", "var_pop", "prior", "identical",
+    "distinct", "in", "not-in", "except", "union", "sect", "take", "drop", "rotate",
+    "cut", "cross", "at", "find", "fill", "reverse", "til", "lag", "lead", "deltas",
+    "ratios", "fills", "sums", "avgs", "mins", "maxs", "prds", "differ", "msum", "mavg",
+    "mmin", "mmax", "mcount", "mvar", "mdev", "asc", "desc", "iasc", "idesc", "rank",
+    "xrank", "list", "table", "key", "value", "cols", "union-all", "xbar", "trunc",
+    "format", "repr", "as", "type", "enlist", "dict", "nil?", "where", "group",
+    "concat", "raze", "within", "div", "bin", "binr", "split", "str-find", "str-join",
+    "upper", "lower", "trim", "substr", "replace", "ser", "de", "like", "ss", "hh",
+    "minute", "yyyy", "mm", "dd", "dow", "doy", "sym-name", "strlen", "diverse",
+    "remove", "row", "cos-dist", "inner-prod", "l2-dist", "norm", "mmu", "lsq", "inv",
+    "flip", "gram", NULL
+};
+static const char* const k_rs_skip[] = {
+    "set", "let", "do", "while", "times", "fn", "raise", "try", "quote", "return",
+    "map", "pmap", "fold", "scan", "filter", "apply", "map-left", "map-right",
+    "fold-left", "fold-while", "fold-right", "scan-left", "scan-right", "select",
+    "window", "update", "insert", "upsert", "delete", "alter", "modify", "pivot",
+    "left-join", "inner-join", "full-join", "anti-join", "semi-mask", "anti-mask",
+    "window-join", "window-join1", "asof-join", "xasc", "xdesc", "xkey", "xcol",
+    "xcols", "xgroup", "ungroup", "fkeys", "unify", "datoms", "assert-fact",
+    "retract-fact", "scan-eav", "pull", "rule", "query", "dl-program", "dl-add-edb",
+    "dl-stratify", "dl-eval", "dl-query", "dl-provenance", "dl-free", "println", "show",
+    "print", "read", "write", "read-bytes", "write-bytes", "load", "exit", "read-csv",
+    "write-csv", "read-value", "read-limits", "eval", "parse", "resolve", "timeit",
+    "env", "get", "del", "rc", "rand", "guid", "date", "time", "timestamp",
+    "hnsw-build", "hnsw-free", "hnsw-save", "hnsw-load", "hnsw-info", "knn", "ann",
+    "meta", NULL
+};
+/* namespaces of system, storage and I/O builtins: never called */
+static const char* const k_rs_skip_ns[] = {
+    ".json.", ".csv.", ".parquet.", ".db.", ".sys.", ".mem.", ".os.", ".fs.", ".ipc.",
+    ".mc.", ".repl.", ".log.", ".time.", ".idx.", ".attr.", ".col.", ".graph.", NULL
+};
+
+/* logic forms: their other operands are truth values */
+static const char* const k_rs_bool[] = { "and", "or", "if", NULL };
+/* builtins that take vectors only: element j measured against the call on
+ * the one-element vector of element j */
+static const char* const k_rs_vec_only[] = { "within", NULL };
+
+static bool rs_in(const char* const* list, const char* nm) {
+    for (int i = 0; list[i]; i++) if (strcmp(list[i], nm) == 0) return true;
+    return false;
+}
+static bool rs_in_ns(const char* nm) {
+    for (int i = 0; k_rs_skip_ns[i]; i++)
+        if (strncmp(nm, k_rs_skip_ns[i], strlen(k_rs_skip_ns[i])) == 0) return true;
+    return false;
+}
+
+/* unsorted, with repeats and no symmetry: a sort, a distinct or a reverse
+ * never passes for element by element */
+static const char* const k_rs_vec[] = {
+    "[3 1 2 2]", "[1.5 -2.0 4.0 -2.0]", "['cd 'ab 'ef 'ab]", "[true true false true]",
+    "[2024.03.01D10:00:00.000000000 2024.01.05D09:30:00.000000000 2024.02.07D11:00:00.000000000 2024.01.05D09:30:00.000000000]",
+    "[\"ba\" \"cd\" \"ab\" \"cd\"]", "[2024.03.01 2024.01.05 2024.02.07 2024.01.05]",
+    "[10:00:00.000 09:30:00.500 11:00:00.000 09:30:00.500]", "(as 'I32 [3 1 2 2])",
+    "(as 'F32 [3.5 1.0 2.0 2.0])",
+};
+static const char* const k_rs_atom[] = {
+    "2", "2.0", "'ab", "true", "2024.01.05D09:30:00.000000000", "\"cd\"", "2024.01.05",
+    "09:30:00.500", "(as 'I32 2)", "(as 'F32 2.0)",
+};
+
+/* Does (nm ...) with the vector `vec` at position `pos` of `nargs` and
+ * `other` at every other position map element by element: one result per
+ * element, element j the call on element j alone? */
+static bool rs_maps(const char* nm, int nargs, int pos, const char* vec, const char* other) {
+    char call[1024], mapped[1024], q[3072];
+    int c = snprintf(call, sizeof call, "(%s", nm);
+    int m = snprintf(mapped, sizeof mapped, "(map (fn [rsx] (%s", nm);
+    for (int a = 1; a <= nargs; a++) {
+        c += snprintf(call + c, sizeof call - (size_t)c, " %s", a == pos ? "rsv" : other);
+        m += snprintf(mapped + m, sizeof mapped - (size_t)m, " %s", a == pos ? "rsx" : other);
+    }
+    snprintf(call + c, sizeof call - (size_t)c, ")");
+    snprintf(mapped + m, sizeof mapped - (size_t)m, ")) rsv)");
+    snprintf(q, sizeof q,
+             "(try (do (set rsv %s) (set rsr %s) (set rsm %s) "
+             "(if (== (type rsr) (type rsv)) (if (== (count rsr) (count rsv)) (all (== rsr rsm)) false) "
+             "(if (== (count rsr) (count rsv)) (all (== rsr rsm)) false))) (fn [e] false))",
+             vec, call, mapped);
+    ray_t* r = ray_eval_str(q);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    if (ok || !rs_in(k_rs_vec_only, nm)) return ok;
+    /* a builtin that takes vectors only (within): element j against the
+     * call on the one-element vector of element j */
+    m = snprintf(mapped, sizeof mapped, "(map (fn [rsx] (first (%s", nm);
+    for (int a = 1; a <= nargs; a++)
+        m += snprintf(mapped + m, sizeof mapped - (size_t)m, " %s", a == pos ? "(enlist rsx)" : other);
+    snprintf(mapped + m, sizeof mapped - (size_t)m, "))) rsv)");
+    snprintf(q, sizeof q,
+             "(try (do (set rsv %s) (set rsr %s) (set rsm %s) "
+             "(if (== (count rsr) (count rsv)) (all (== rsr rsm)) false)) (fn [e] false))",
+             vec, call, mapped);
+    r = ray_eval_str(q);
+    ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return ok;
+}
+
+/* The same, measured inside a query: the vector a column `c` of a table,
+ * the call an output (an if picks by a row test only there). */
+static bool rs_maps_query(const char* nm, int nargs, int pos, const char* vec, const char* other) {
+    char call[1024], mapped[1024], q[3072];
+    int c = snprintf(call, sizeof call, "(%s", nm);
+    int m = snprintf(mapped, sizeof mapped, "(map (fn [rsx] (%s", nm);
+    for (int a = 1; a <= nargs; a++) {
+        c += snprintf(call + c, sizeof call - (size_t)c, " %s", a == pos ? "c" : other);
+        m += snprintf(mapped + m, sizeof mapped - (size_t)m, " %s", a == pos ? "rsx" : other);
+    }
+    snprintf(call + c, sizeof call - (size_t)c, ")");
+    snprintf(mapped + m, sizeof mapped - (size_t)m, ")) rsv)");
+    snprintf(q, sizeof q,
+             "(try (do (set rsv %s) (set rst (table [c] (list rsv))) "
+             "(set rsr (at (select {r: %s from: rst}) 'r)) (set rsm %s) "
+             "(if (== (count rsr) (count rsv)) (all (== rsr rsm)) false)) (fn [e] false))",
+             vec, call, mapped);
+    ray_t* r = ray_eval_str(q);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+    return ok;
+}
+
+/* measured inside a query (rs_maps_query): an if picks element by element
+ * by a test that reads rows, which the query rewrites; outside a query a
+ * vector test is one truth value */
+static const char* const k_rs_query[] = { "if", NULL };
+
+static bool rs_pos_maps(const char* nm, int nargs, int pos) {
+    int nt = (int)(sizeof k_rs_vec / sizeof k_rs_vec[0]);
+    bool (*maps)(const char*, int, int, const char*, const char*) =
+        rs_in(k_rs_query, nm) ? rs_maps_query : rs_maps;
+    for (int t = 0; t < nt; t++) {
+        if (maps(nm, nargs, pos, k_rs_vec[t], k_rs_atom[t])) return true;
+        /* other operands: a number, a type, a truth value (and / or / if
+         * pick by it), a pair of bounds or breaks (within, bin) */
+        static const char* const others[] = { "2", "'F64", "[1 3]", "true", "false" };
+        size_t no = rs_in(k_rs_bool, nm) ? 5 : 3;   /* truth values for the logic forms */
+        for (size_t o = 0; nargs > 1 && o < no; o++)
+            if (maps(nm, nargs, pos, k_rs_vec[t], others[o])) return true;
+    }
+    return false;
+}
+
+static test_result_t test_builtin_row_shape(void) {
+    int32_t cap = ray_env_global_count() + 16;
+    int64_t* ids = calloc((size_t)cap, sizeof(int64_t));
+    ray_t** vals = calloc((size_t)cap, sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(ids);
+    TEST_ASSERT_NOT_NULL(vals);
+    int32_t n = ray_env_list(ids, vals, cap);
+    static char bad[8192];
+    size_t bl = 0;
+    bad[0] = 0;
+    for (int32_t i = 0; i < n; i++) {
+        ray_t* fn = vals[i];
+        if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) continue;
+        ray_t* s = ray_sym_str(ids[i]);
+        if (!s) continue;
+        char nm[128];
+        snprintf(nm, sizeof nm, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
+        bool declares = false;
+        for (int na = 1; na <= 3; na++)
+            for (int p = 1; p <= na; p++)
+                declares |= ray_fn_row_arg(fn, na, p) || ray_fn_row_arg_whole(fn, na, p, NULL);
+        if (rs_in(k_rs_skip, nm) || rs_in_ns(nm)) {
+            if (declares)
+                bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s(skipped but declared)", nm);
+            continue;
+        }
+        if (!rs_in(k_rs_pure, nm)) {
+            fprintf(stderr, "        row shape: %s unclassified\n", nm);
+            bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s(unclassified)", nm);
+            if (bl > sizeof bad - 200) bl = sizeof bad - 200;
+            continue;
+        }
+        int lo = fn->type == RAY_UNARY ? 1 : 2;
+        int hi = fn->type == RAY_UNARY ? 2 : fn->type == RAY_BINARY ? 2 : 3;
+        for (int na = lo; na <= hi; na++) {
+            for (int p = 1; p <= na; p++) {
+                bool decl = ray_fn_row_arg(fn, na, p);
+                bool whole = ray_fn_row_arg_whole(fn, na, p, NULL);
+                bool meas = rs_pos_maps(nm, na, p);
+                if (decl && whole)
+                    bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s/%d@%d(declared and read whole)", nm, na, p);
+                else if ((decl || whole) && !meas)
+                    bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s/%d@%d(%s, does not map)", nm, na, p,
+                                           decl ? "declared" : "read whole by decision");
+                else if (!decl && !whole && meas)
+                    bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s/%d@%d(maps, undeclared)", nm, na, p);
+            }
+        }
+        if (bl > sizeof bad - 200) bl = sizeof bad - 200;
+    }
+    free(ids);
+    free(vals);
+    TEST_ASSERT_FMT(bl == 0, "row shape:%.1900s", bad);   /* each offender is on stderr too */
+    PASS();
+}
+
+/* ---- #1462: no number from outside the process becomes a private id ----
+ * A legacy table frame names its columns by raw ids (an I64 schema): one in
+ * the private range is refused, a real one still decodes. */
+static test_result_t test_serde_private_schema_id(void) {
+    uint8_t buf[512];
+    int64_t n = 0;
+    buf[n++] = (uint8_t)RAY_TABLE;
+    buf[n++] = 0;
+    ray_t* sch = ray_vec_new(RAY_I64, 1);
+    TEST_ASSERT_NOT_NULL(sch);
+    sch->len = 1;
+    ((int64_t*)ray_data(sch))[0] = ray_sym_private(0);
+    n += ray_ser_raw(buf + n, sch);
+    ray_t* col = ray_vec_new(RAY_I64, 2);
+    col->len = 2;
+    ((int64_t*)ray_data(col))[0] = 1;
+    ((int64_t*)ray_data(col))[1] = 2;
+    ray_t* cols = ray_list_new(1);
+    cols = ray_list_append(cols, col);
+    int64_t schema_at = 2;
+    n += ray_ser_raw(buf + n, cols);
+    int64_t len = n;
+    ray_t* r = ray_de_raw(buf, &len);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_TRUE(strcmp(ray_err_code(r), "domain") == 0);
+    ray_error_free(r);
+    /* the same frame with a real id decodes into a table */
+    ((int64_t*)ray_data(sch))[0] = ray_sym_intern("x", 1);
+    int64_t m = ray_ser_raw(buf + schema_at, sch);
+    TEST_ASSERT_TRUE(m > 0);
+    len = n;
+    r = ray_de_raw(buf, &len);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE);
+    ray_release(r);
+    ray_release(sch);
+    ray_release(col);
+    ray_release(cols);
+    PASS();
+}
+
+/* A bare column file of symbol cells holds runtime ids: one in the private
+ * range is refused as corrupt on load. */
+static test_result_t test_col_private_sym_cell(void) {
+    ray_t* v = ray_sym_vec_new(RAY_SYM_W64, 2);
+    TEST_ASSERT_NOT_NULL(v);
+    v->len = 2;
+    ray_write_sym(ray_data(v), 0, (uint64_t)ray_sym_intern("a", 1), RAY_SYM, RAY_SYM_W64);
+    ray_write_sym(ray_data(v), 1, (uint64_t)ray_sym_private(0), RAY_SYM, RAY_SYM_W64);
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/rfl_col_private_%d", (int)getpid());
+    ray_err_t err = ray_col_save(v, path);
+    ray_release(v);
+    TEST_ASSERT_TRUE(err == RAY_OK);
+    ray_t* r = ray_col_load(path);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    /* With no symbol count to bound it -- the header records an empty
+     * dictionary and the file is read against an empty symbol file -- the
+     * private cell is still refused (validate_sym_bounds, sym_count 0). */
+    FILE* f = fopen(path, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    uint32_t zero = 0;
+    TEST_ASSERT_TRUE(fseek(f, (long)offsetof(ray_t, rc), SEEK_SET) == 0);
+    TEST_ASSERT_TRUE(fwrite(&zero, sizeof zero, 1, f) == 1);
+    fclose(f);
+    ray_sym_domain_t* dom = ray_sym_domain_new();
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(dom), 0);
+    r = ray_col_load_dom(path, dom);
+    ray_sym_domain_release(dom);
+    unlink(path);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    ray_error_free(r);
+    PASS();
+}
+
+/* A closure made while a query binds a private column captures every
+ * other local but not that one. */
+static test_result_t test_capture_skips_private(void) {
+    TEST_ASSERT_TRUE(ray_env_push_query_scope() == RAY_OK);
+    int64_t pid = ray_sym_private(0);
+    int64_t xid = ray_sym_intern("cap1462x", 8);
+    ray_t* v = ray_vec_new(RAY_I64, 1);
+    v->len = 1;
+    ((int64_t*)ray_data(v))[0] = 7;
+    ray_env_set_query_local(pid, v);
+    ray_env_set_query_local(xid, v);
+    ray_t* cap = ray_env_capture_locals();
+    ray_env_pop_scope();
+    ray_release(v);
+    TEST_ASSERT_TRUE(cap && !RAY_IS_ERR(cap) && cap->type == RAY_DICT);
+    ray_t* keys = ray_dict_keys(cap);
+    bool has_x = false, has_p = false;
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t k = ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs);
+        has_x |= k == xid;
+        has_p |= ray_sym_is_private(k);
+    }
+    ray_release(cap);
+    TEST_ASSERT_TRUE(has_x);
+    TEST_ASSERT_TRUE(!has_p);
+    PASS();
+}
+
+/* Row shape has no position limit: and / or map every operand however
+ * many, an atomic builtin every operand of its arity. */
+static test_result_t test_row_arg_any_position(void) {
+    ray_t* and_fn = ray_env_get(ray_sym_intern("and", 3));
+    ray_t* or_fn = ray_env_get(ray_sym_intern("or", 2));
+    TEST_ASSERT_NOT_NULL(and_fn);
+    TEST_ASSERT_NOT_NULL(or_fn);
+    TEST_ASSERT_TRUE(ray_fn_row_arg(and_fn, 33, 33));
+    TEST_ASSERT_TRUE(ray_fn_row_arg(and_fn, 1000, 1000));
+    TEST_ASSERT_TRUE(ray_fn_row_arg(or_fn, 64, 40));
+    TEST_ASSERT_TRUE(!ray_fn_row_arg(and_fn, 33, 34));
+    PASS();
+}
+
+/* ---- #1462: private ids are the symbol table's to refuse ---- */
+static test_result_t test_sym_private_range(void) {
+    TEST_ASSERT_TRUE(!ray_sym_is_private(RAY_SYM_PRIVATE_LO - 1));
+    TEST_ASSERT_TRUE(ray_sym_is_private(RAY_SYM_PRIVATE_LO));
+    TEST_ASSERT_TRUE(ray_sym_is_private(RAY_SYM_PRIVATE_HI));
+    TEST_ASSERT_TRUE(!ray_sym_is_private(-1));
+    TEST_ASSERT_TRUE(ray_sym_is_private(ray_sym_private(0)));
+    TEST_ASSERT_TRUE(ray_sym_is_private(ray_sym_private(1000000)));
+    /* no string names one, and interning never yields one */
+    TEST_ASSERT_TRUE(ray_sym_str(ray_sym_private(0)) == NULL);
+    TEST_ASSERT_TRUE(!ray_sym_is_dotted(ray_sym_private(0)));
+    int64_t id = ray_sym_intern("#fv0", 4);
+    TEST_ASSERT_TRUE(id >= 0 && !ray_sym_is_private(id));
+    TEST_ASSERT_TRUE((int64_t)ray_sym_count() < RAY_SYM_PRIVATE_LO);
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -14895,6 +15250,12 @@ const test_entry_t lang_entries[] = {
     { "lang/io/read_procfs_zero_size", test_read_procfs_reports_zero_size, lang_setup, lang_teardown },
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },
+    { "lang/builtin_row_shape", test_builtin_row_shape, lang_setup, lang_teardown },
+    { "lang/sym_private_range", test_sym_private_range, lang_setup, lang_teardown },
+    { "lang/serde_private_schema_id", test_serde_private_schema_id, lang_setup, lang_teardown },
+    { "lang/col_private_sym_cell", test_col_private_sym_cell, lang_setup, lang_teardown },
+    { "lang/capture_skips_private", test_capture_skips_private, lang_setup, lang_teardown },
+    { "lang/row_arg_any_position", test_row_arg_any_position, lang_setup, lang_teardown },
 
     { NULL, NULL, NULL, NULL },
 };
