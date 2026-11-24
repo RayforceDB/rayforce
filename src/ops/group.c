@@ -30,6 +30,7 @@
 #include "lang/format.h"    /* ray_type_name */
 #include "table/domain.h"   /* sym-domain resolution (ray_sym_domain_count) */
 #include "ops/agg_engine.h" /* v2 agg engine routing gate (ray_agg_engine_v2) */
+#include "ops/aggseq.h"     /* floating-point products in row order */
 #include "vec/str.h"        /* ray_str_t SSO hash/eq for wide STR group keys */
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "ops/strdom.h"     /* query-wide string domain: generation-2 STR keys */
@@ -259,27 +260,40 @@ typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
 typedef double  sc_vd __attribute__((vector_size(SC_V * 8)));
 typedef float   sc_vf __attribute__((vector_size(SC_V * 4)));
 typedef int64_t sc_vl __attribute__((vector_size(SC_V * 8)));
-#define SC_LANES_BODY(T, VT, NULLS) do { \
-    sc_vd v[SC_F64_LANES / SC_V]; \
-    sc_vl cnt = { 0 }, nz = cnt + (int64_t)INT64_MIN;   /* -0.0's bits */ \
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
-        memcpy(&v[k], &s->l[k * SC_V], sizeof v[k]); \
-        SC_F64_PIN(v[k]);           /* the head's last adds stay folded in */ \
-    } \
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) \
-        for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
-            VT x; \
-            memcpy(&x, d + i + k * SC_V, sizeof x); \
+/* The accumulators are named variables, one per vector (SC_VREP), not an
+ * array: gcc 11 to 13 kept an array of them on the stack, loading and storing
+ * one around every add (about 1 instruction a row against clang's 0.45,
+ * #1628).  Each lane is still one row-order chain: the same bits. */
+#define SC_VREP8(X)  X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
+#define SC_VREP16(X) SC_VREP8(X) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#if SC_F64_LANES / SC_V == 8
+#define SC_VREP SC_VREP8
+#else
+#define SC_VREP SC_VREP16
+#endif
+#define SC_VLOAD(k)  sc_vd v##k; memcpy(&v##k, &s->l[(k) * SC_V], sizeof v##k); \
+                     SC_F64_PIN(v##k);   /* the head's last adds stay folded in */
+#define SC_VSTEP(k)  { \
+            sc_vt_ x; \
+            memcpy(&x, d + i + (k) * SC_V, sizeof x); \
             sc_vd y = __builtin_convertvector(x, sc_vd); \
-            if (NULLS) { \
+            if (sc_nulls_) { \
                 sc_vl m = (sc_vl)(y == y); \
                 y = (sc_vd)(((sc_vl)y & m) | (nz & ~m)); \
                 cnt -= m; \
             } \
-            v[k] += y; \
-            SC_F64_PIN(v[k]); \
-        } \
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) memcpy(&s->l[k * SC_V], &v[k], sizeof v[k]); \
+            v##k += y; \
+            SC_F64_PIN(v##k); \
+        }
+#define SC_VSTORE(k) memcpy(&s->l[(k) * SC_V], &v##k, sizeof v##k);
+#define SC_LANES_BODY(T, VT, NULLS) do { \
+    typedef VT sc_vt_; \
+    enum { sc_nulls_ = (NULLS) }; \
+    sc_vl cnt = { 0 }, nz = cnt + (int64_t)INT64_MIN;   /* -0.0's bits */ \
+    (void)nz; \
+    SC_VREP(SC_VLOAD) \
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) { SC_VREP(SC_VSTEP) } \
+    SC_VREP(SC_VSTORE) \
     if (NULLS) for (int k = 0; k < SC_V; k++) nn += cnt[k]; \
 } while (0)
 #else
@@ -2371,6 +2385,13 @@ typedef struct {
     int64_t         n_rows;
     int64_t         n_groups;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
+    /* Few groups (n_groups <= CDPG_FEW_GROUPS): partition by the (gid,
+     * val) hash instead, so the rows of one large group spread over every
+     * partition rather than one serial dedup; each partition then counts
+     * into its own pcnt[p * n_groups + gid], summed into odata at the end. */
+    bool            by_val;
+    int64_t*        pcnt;            /* [P * n_groups] when by_val */
+    uint16_t*       gids16_out;      /* by_val: the gid + 1 fits 16 bits (2 B a row, not 8) */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
      * so there's no atomic contention.  task_id is start / grain, both
@@ -2415,12 +2436,14 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
      * we wrote here.  No atomics: each task owns its row. */
     int64_t task_id = start / x->grain;
     int64_t* my_hist = &x->hist[task_id * (int64_t)(p_mask + 1)];
+    uint8_t esz = ray_sym_elem_size(x->in_type, x->in_attrs);
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
         /* Partition by gid (not gid×val) so the dedup pass can write to
-         * odata[gid] without atomics. */
-        uint64_t h = CDPG_PART_HASH(gid + 1);
+         * odata[gid] without atomics; by (gid, val) under few groups. */
+        uint64_t h = x->by_val ? CDPG_HASH(gid + 1, cdpg_read(x->base, r, x->in_type, esz))
+                               : CDPG_PART_HASH(gid + 1);
         my_hist[h & p_mask]++;
     }
 }
@@ -2441,9 +2464,10 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
         if (gid < 0 || gid >= x->n_groups) continue;
         int64_t val = cdpg_read(x->base, r, x->in_type, esz);
         int64_t gid_p1 = gid + 1;
-        uint64_t h = CDPG_PART_HASH(gid_p1);
+        uint64_t h = x->by_val ? CDPG_HASH(gid_p1, val) : CDPG_PART_HASH(gid_p1);
         int64_t pos = my_cur[h & p_mask]++;
-        x->gids_out[pos] = gid_p1;
+        if (x->by_val) x->gids16_out[pos] = (uint16_t)gid_p1;
+        else x->gids_out[pos] = gid_p1;
         x->vals_out[pos] = val;
     }
 }
@@ -2479,10 +2503,12 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
             continue;
         }
 
-        const int64_t* gids = x->gids_out + off;
+        const int64_t* gids = x->by_val ? NULL : x->gids_out + off;
+        const uint16_t* gids16 = x->by_val ? x->gids16_out + off : NULL;
         const int64_t* vals = x->vals_out + off;
+        int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
         for (int64_t i = 0; i < cnt; i++) {
-            int64_t gid_p1 = gids[i];
+            int64_t gid_p1 = gids ? gids[i] : (int64_t)gids16[i];
             int64_t val    = vals[i];
             uint64_t h = CDPG_HASH(gid_p1, val);
             uint64_t slot = h & mask;
@@ -2493,8 +2519,8 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                     slot_val[slot] = val;
                     /* Partition is keyed on gid (CDPG_PART_HASH), so
                      * each gid is owned by exactly one task — drop the
-                     * atomic. */
-                    x->odata[gid_p1 - 1]++;
+                     * atomic; by (gid, val), the partition's own counts. */
+                    cnt_out[gid_p1 - 1]++;
                     break;
                 }
                 if (cur == gid_p1 && slot_val[slot] == val) break;
@@ -2534,9 +2560,15 @@ static ray_t* count_distinct_per_group_parallel(
         .n_groups = n_groups,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
+        .by_val = n_groups <= CDPG_FEW_GROUPS,
     };
 
     if (P > 256) return NULL;
+    ray_t* pcnt_hdr = NULL;
+    if (ctx.by_val) {
+        ctx.pcnt = (int64_t*)scratch_calloc(&pcnt_hdr, (size_t)P * (size_t)n_groups * sizeof(int64_t));
+        if (!ctx.pcnt) return NULL;
+    }
 
     /* Counters per dispatch task, sized from the geometry the pool takes
      * (its clamp included), computed once: both passes dispatch at that
@@ -2554,13 +2586,16 @@ static ray_t* count_distinct_per_group_parallel(
     ray_t* hist_hdr = NULL;
     ctx.hist = (int64_t*)scratch_calloc(&hist_hdr,
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
-    if (!ctx.hist) { return NULL; }
+    if (!ctx.hist) { if (pcnt_hdr) scratch_free(pcnt_hdr); return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
     /* Each pass reads the one before it: the histogram sizes and places the
      * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
      * their part unwritten (a short histogram would send the scatter past
      * its partitions). */
-    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
+    if (pool_cancelled(pool)) {
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2574,7 +2609,7 @@ static ray_t* count_distinct_per_group_parallel(
     if (!ctx.part_off || !ctx.cursor) {
         if (off_hdr) scratch_free(off_hdr);
         if (cur_hdr) scratch_free(cur_hdr);
-        scratch_free(hist_hdr);
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     /* Two-step prefix: per-partition global offset, then per-(task,
@@ -2595,14 +2630,17 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 2: scatter (gid+1, val) pairs into partitioned out_buf. */
     ray_t* gids_hdr = NULL;
     ray_t* vals_hdr = NULL;
-    ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr,
-                                           (size_t)total * sizeof(int64_t));
+    if (ctx.by_val)
+        ctx.gids16_out = (uint16_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(uint16_t));
+    else
+        ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(int64_t));
     ctx.vals_out = (int64_t*)scratch_alloc(&vals_hdr,
                                            (size_t)total * sizeof(int64_t));
-    if (!ctx.gids_out || !ctx.vals_out) {
+    if (!(ctx.gids_out || ctx.gids16_out) || !ctx.vals_out) {
         if (gids_hdr) scratch_free(gids_hdr);
         if (vals_hdr) scratch_free(vals_hdr);
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     if (total > 0)
@@ -2616,10 +2654,13 @@ static ray_t* count_distinct_per_group_parallel(
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
         cancelled = pool_cancelled(pool);
     }
+    if (ctx.by_val && !cancelled)
+        for (uint64_t p = 0; p < P; p++)
+            for (int64_t g = 0; g < n_groups; g++) ctx.odata[g] += ctx.pcnt[p * n_groups + g];
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
-    scratch_free(hist_hdr);
+    scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
     return cancelled ? ray_error("cancel", NULL) : out;
 }
 
@@ -2716,6 +2757,33 @@ __attribute__((unused)) static ray_t* count_distinct_per_group_hll(ray_t* src, c
  * are distinct pairs → load factor 0.5, no rehash needed.  Slot stores
  * gid+1 (so 0 means empty) and the int64-encoded value.  64-bit composite
  * hash mixes both halves so rare-gid collisions don't cluster. */
+/* Few groups over many rows: the kernel above, partitioned by (group,
+ * value), instead of the per-group slices (whose largest group is one
+ * serial dedup).  Only with workers to spread over, and only when its
+ * buffers fit the heap's room: 10 B a row (the values and 16-bit group
+ * ids) beside the row map both routes hold, where the slices hold 8 B a
+ * row (their index) plus a table of twice the largest group's rows. */
+bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups) {
+    if (n_groups <= 0 || n_groups > CDPG_FEW_GROUPS || n_rows < 200000) return false;
+    ray_pool_t* pool = ray_pool_live();
+    if (!pool || ray_pool_total_workers(pool) < 2) return false;
+    /* The partitioned kernel is three passes over the rows (count, scatter,
+     * dedup) and stops scaling near 8 workers; the slices do less total work
+     * and keep scaling with the groups.  Measured on 5M rows: with 2-3
+     * workers the slices win below ~64 groups (the kernel's fixed work is
+     * ~2x theirs); from 16 workers on they win from ~64 groups up, so the
+     * kernel keeps only the few-group and skewed shapes there. */
+    int64_t workers = ray_pool_total_workers(pool);
+    if (workers < 4 && n_groups < 64) return false;
+    if (workers >= 16 && n_groups > 32) return false;
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0) {
+        int64_t room = wm - ray_heap_anon_committed();
+        if ((double)n_rows * 10.0 > (double)room / 2) return false;
+    }
+    return true;
+}
+
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups) {
     if (!src || RAY_IS_ERR(src)) return ray_error("domain", "count distinct per group: invalid source column");
@@ -9217,6 +9285,15 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
              * AVG/VAR/STDDEV) must surface a typed null instead of leaking
              * the accumulator seed (DBL_MAX / -DBL_MAX / 0). */
             int64_t nn = nn_counts ? nn_counts[idx] : counts[gi];
+            /* A keyless prod over no non-null row is the empty product, as
+             * the builtin and the evaluator give it (#1613).  A by: group
+             * whose rows are all null keeps its null. */
+            if (agg_op == OP_PROD && nn == 0 && ext->n_keys == 0) {
+                if (out_type == RAY_F64) ((double*)ray_data(new_col))[gi] = 1.0;
+                else topk_write_i64(ray_data(new_col), gi, 1,
+                                    ray_sym_elem_size(out_type, new_col->attrs));
+                continue;
+            }
             if (out_type == RAY_F64 || out_type == RAY_F32) {
                 double v;
                 switch (agg_op) {
@@ -9229,6 +9306,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v += affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
+                        /* no row at all: the empty product, as the builtin
+                         * and the evaluator give it (#1577) */
+                        if (counts[gi] == 0) { v = 1.0; break; }
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
                         break;
@@ -9337,6 +9417,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
+                        if (counts[gi] == 0) { v = 1; break; }   /* the empty product (#1577) */
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = sum_i64[idx]; break;
                     case OP_COUNT: v = counts[gi]; break;
@@ -10230,6 +10311,63 @@ static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
     return read_col_i64(ptr, r, type, 0);  /* attrs=0: agg columns are numeric, never SYM */
 }
 
+/* The wrapping int64 sum of rows [start, end) of a column, each read as
+ * scalar_i64_at reads it.  The type is dispatched once, outside the row
+ * loop, so each width has a plain typed loop: gcc 11 and 12 kept
+ * read_col_i64's switch inside a per-row loop and never vectorized it, about
+ * 11 instructions a row against under 1 here (#1628).  Integer addition
+ * wraps modulo 2^64, so the order of the adds does not change the bits. */
+#define COL_WRAP_SUM_LOOP(T)                                                  \
+    do {                                                                      \
+        const T* restrict d = (const T*)ptr;                                  \
+        for (int64_t r = start; r < end; r++) s += (uint64_t)(int64_t)d[r];  \
+    } while (0)
+static int64_t col_wrap_sum(const void* ptr, int8_t type, int64_t start, int64_t end) {
+    uint64_t s = 0;
+    switch (type) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+    case RAY_SYM:                      /* attrs 0: read as int64 (read_col_i64) */
+        COL_WRAP_SUM_LOOP(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        COL_WRAP_SUM_LOOP(int32_t); break;
+    case RAY_I16:
+        COL_WRAP_SUM_LOOP(int16_t); break;
+    case RAY_BOOL: case RAY_U8:
+        COL_WRAP_SUM_LOOP(uint8_t); break;
+    default:                           /* F32 lanes as bits: the per-row reader */
+        for (int64_t r = start; r < end; r++) s += (uint64_t)scalar_i64_at(ptr, type, r);
+        break;
+    }
+    return (int64_t)s;
+}
+#undef COL_WRAP_SUM_LOOP
+
+/* The same over selected rows start + idx[0 .. n) (a morsel's selection). */
+#define COL_WRAP_SUM_IDX_LOOP(T)                                              \
+    do {                                                                      \
+        const T* restrict d = (const T*)ptr + start;                          \
+        for (int64_t i = 0; i < n; i++) s += (uint64_t)(int64_t)d[idx[i]];    \
+    } while (0)
+static int64_t col_wrap_sum_idx(const void* ptr, int8_t type, int64_t start,
+                                const uint16_t* restrict idx, int64_t n) {
+    uint64_t s = 0;
+    switch (type) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
+        COL_WRAP_SUM_IDX_LOOP(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        COL_WRAP_SUM_IDX_LOOP(int32_t); break;
+    case RAY_I16:
+        COL_WRAP_SUM_IDX_LOOP(int16_t); break;
+    case RAY_BOOL: case RAY_U8:
+        COL_WRAP_SUM_IDX_LOOP(uint8_t); break;
+    default:
+        for (int64_t i = 0; i < n; i++) s += (uint64_t)scalar_i64_at(ptr, type, start + idx[i]);
+        break;
+    }
+    return (int64_t)s;
+}
+#undef COL_WRAP_SUM_IDX_LOOP
+
 /* Exact 128-bit sum of a contiguous int64 run, kept vectorizable.
  * Blocks of 1024 rows, three forms, escalating once for the rest of the
  * run when a block fails a check (a column's values are alike):
@@ -10404,9 +10542,7 @@ static void scalar_linear_sum(da_accum_t* acc, const agg_linear_t* lin, uint32_t
             const int64_t blk = (int64_t)1 << 30;
             for (int64_t b = start; b < end; b += blk) {
                 int64_t e = (end - b > blk) ? b + blk : end;
-                int64_t sum = 0;
-                for (int64_t r = b; r < e; r++)
-                    sum += scalar_i64_at(lin->term_ptrs[0], t0, r);
+                int64_t sum = col_wrap_sum(lin->term_ptrs[0], t0, b, e);
                 ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, sum);
             }
         } else {
@@ -10427,11 +10563,7 @@ static void scalar_linear_sum(da_accum_t* acc, const agg_linear_t* lin, uint32_t
     for (uint8_t t = 0; t < lin->n_terms; t++) {
         int64_t coeff = lin->coeff_i64[t];
         if (coeff == 0) continue;
-        const void* ptr = lin->term_ptrs[t];
-        int8_t type = lin->term_types[t];
-        int64_t term_sum = 0;
-        for (int64_t r = start; r < end; r++)
-            term_sum = wrap_add_i64(term_sum, scalar_i64_at(ptr, type, r));
+        int64_t term_sum = col_wrap_sum(lin->term_ptrs[t], lin->term_types[t], start, end);
         sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
@@ -10552,10 +10684,21 @@ static void scalar_emit_vecs_free(ray_t* hdr, ray_t** ev, ray_t** agg_vecs, uint
     scratch_free(hdr);
 }
 
+#ifdef DEBUG
+/* Rows taken through scalar_accum_agg, every thread (test hook below). */
+static int64_t g_scalar_generic_rows;
+int64_t ray_group_test_scalar_generic_rows(void) {
+    return __atomic_load_n(&g_scalar_generic_rows, __ATOMIC_RELAXED);
+}
+#endif
+
 /* Generic scalar accumulation: handles all ops, all types, mask */
 /* Inner scalar accumulation for a single row */
 /* Row r into aggregate a (acc->count[0] is the caller's). */
 static inline void scalar_accum_agg(scalar_ctx_t* c, da_accum_t* acc, int64_t r, uint32_t a) {
+#ifdef DEBUG
+    __atomic_fetch_add(&g_scalar_generic_rows, 1, __ATOMIC_RELAXED);
+#endif
     /* Per-(group, agg) non-null counters drive AVG/VAR/STDDEV divisors
      * and all-null finalization for MIN/MAX/PROD/FIRST/LAST.  Only
      * allocated when at least one agg can produce a null
@@ -10713,10 +10856,13 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
 /* Can the rows go aggregate by aggregate?  PROD and FIRST without
  * non-null counters take "first value" from count[0] == 1, which only a
  * row-by-row walk keeps. */
+static bool scalar_pick_takes(const scalar_ctx_t* c, uint32_t a);
+
 static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
     if (acc->nn_count) return true;
     for (uint32_t a = 0; a < c->n_aggs; a++)
-        if (c->agg_ops[a] == OP_PROD || c->agg_ops[a] == OP_FIRST) return false;
+        if ((c->agg_ops[a] == OP_PROD || c->agg_ops[a] == OP_FIRST) && !scalar_pick_takes(c, a))
+            return false;
     return true;
 }
 
@@ -10724,12 +10870,51 @@ static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
  * start + idx[0 .. n) (a morsel's selected rows, start its first row). */
 #define SC_ROW(i) (idx ? start + idx[i] : start + (i))
 
+/* Lanes of the elementwise integer MIN / MAX loop below (#1628), measured
+ * over 10M rows: gcc vectorizes the single running extreme itself, and
+ * lanes only add to it, so gcc keeps one lane, the loop it had; clang
+ * leaves that loop a serial chain (about 7.8 instructions a row) and takes
+ * 8 lanes (about 1.5).  Under a selection (idx) every compiler runs the
+ * single running extreme.  Floating-point MIN / MAX run in aggseq.c. */
+#if defined(__clang__)
+#define SC_MM_ILANES 8
+#else
+#define SC_MM_ILANES 1
+#endif
+
 /* SUM/AVG/MIN/MAX of null-free integer rows of input a: one tight loop.
  * Values as read_col_i64 reads them. */
 #define SC_INT_RUN(T)                                                          \
     do {                                                                       \
         const T* restrict d = (const T*)base;   /* row row_base */             \
-        if (op == OP_MIN) {                                                    \
+        if ((op == OP_MIN || op == OP_MAX) && SC_MM_ILANES > 1 && !idx) {      \
+            /* clang: lanes, elementwise (see SC_MM_ILANES); integer       \
+             * extremes are exact in any order. */                          \
+            bool mn = op == OP_MIN;                                            \
+            int64_t m = mn ? acc->min_val[a].i : acc->max_val[a].i;            \
+            const T* restrict x = d + (start - c->row_base);                   \
+            int64_t l[SC_MM_ILANES], i = 0;                                    \
+            for (int j = 0; j < SC_MM_ILANES; j++) l[j] = m;                   \
+            if (mn) {                                                          \
+                for (; i + SC_MM_ILANES <= n; i += SC_MM_ILANES)               \
+                    for (int j = 0; j < SC_MM_ILANES; j++) {                   \
+                        int64_t v = (int64_t)x[i + j];                         \
+                        l[j] = v < l[j] ? v : l[j];                            \
+                    }                                                          \
+                for (; i < n; i++) { int64_t v = (int64_t)x[i]; l[0] = v < l[0] ? v : l[0]; } \
+                for (int j = 0; j < SC_MM_ILANES; j++) m = l[j] < m ? l[j] : m; \
+                acc->min_val[a].i = m;                                         \
+            } else {                                                           \
+                for (; i + SC_MM_ILANES <= n; i += SC_MM_ILANES)               \
+                    for (int j = 0; j < SC_MM_ILANES; j++) {                   \
+                        int64_t v = (int64_t)x[i + j];                         \
+                        l[j] = v > l[j] ? v : l[j];                            \
+                    }                                                          \
+                for (; i < n; i++) { int64_t v = (int64_t)x[i]; l[0] = v > l[0] ? v : l[0]; } \
+                for (int j = 0; j < SC_MM_ILANES; j++) m = l[j] > m ? l[j] : m; \
+                acc->max_val[a].i = m;                                         \
+            }                                                                  \
+        } else if (op == OP_MIN) {                                             \
             int64_t m = acc->min_val[a].i;                                     \
             for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)d[SC_ROW(i) - c->row_base]; m = v < m ? v : m; } \
             acc->min_val[a].i = m;                                             \
@@ -10752,6 +10937,117 @@ static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
         }                                                                      \
     } while (0)
 
+
+/* FIRST / LAST / PROD of a run with no selection, the same as
+ * scalar_accum_agg row by row.  FIRST takes the first non-null row while no
+ * non-null row was taken before (nn_count[a] == 0), or, without per-input
+ * counters, only the accumulator's very first row (count[0] == 1 there:
+ * c0 == 0 and the run's first row); PROD starts from that same row and
+ * multiplies the rest; LAST keeps the last non-null row.  So FIRST and LAST
+ * read one row when the input has no nulls.  Integer PROD wraps (modulo
+ * 2^64, any order); a floating-point product keeps row order
+ * (ray_aggseq_prod_*, strict IEEE).  c0: count[0] before the run. */
+static bool scalar_pick_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
+                            int64_t start, int64_t n, int64_t c0) {
+    uint16_t op = c->agg_ops[a];
+    int8_t t = c->agg_types[a];
+    int64_t* nn = acc->nn_count;
+    if (n <= 0) return true;
+    if (group_fp_type(t)) {
+        const void* p = (const char*)c->agg_ptrs[a] + (size_t)(start - c->row_base) * (t == RAY_F32 ? 4 : 8);
+#define SC_FAT(i) (t == RAY_F64 ? ((const double*)p)[i] : (double)((const float*)p)[i])
+        if (op == OP_LAST) {
+            int64_t i = n - 1;
+            while (i >= 0 && !(SC_FAT(i) == SC_FAT(i))) i--;
+            if (i < 0) return true;              /* no non-null row */
+            acc->sum[a].f = SC_FAT(i);
+            if (nn) {
+                int64_t k = 0;
+                for (int64_t j = 0; j <= i; j++) k += SC_FAT(j) == SC_FAT(j);
+                nn[a] += k;
+            }
+            return true;
+        }
+        if (op == OP_FIRST) {
+            if (!nn) {                           /* only row 0 of the first run */
+                if (c0 == 0 && SC_FAT(0) == SC_FAT(0)) acc->sum[a].f = SC_FAT(0);
+                return true;
+            }
+            int64_t i = 0;
+            while (i < n && !(SC_FAT(i) == SC_FAT(i))) i++;
+            if (i == n) return true;
+            if (nn[a] == 0) acc->sum[a].f = SC_FAT(i);
+            int64_t k = 0;
+            for (int64_t j = i; j < n; j++) k += SC_FAT(j) == SC_FAT(j);
+            nn[a] += k;
+            return true;
+        }
+        /* OP_PROD */
+        int64_t i = 0, k = 0;
+        if (nn ? nn[a] == 0 : c0 == 0) {
+            /* the first factor is set, not multiplied in */
+            if (nn) { while (i < n && !(SC_FAT(i) == SC_FAT(i))) i++; }
+            if (i == n) return true;
+            if (SC_FAT(i) == SC_FAT(i)) { acc->sum[a].f = SC_FAT(i); k = 1; }
+            i++;
+        }
+        acc->sum[a].f = t == RAY_F64
+            ? ray_aggseq_prod_f64(acc->sum[a].f, (const double*)p + i, n - i, &k)
+            : ray_aggseq_prod_f32(acc->sum[a].f, (const float*)p + i, n - i, &k);
+        if (nn) nn[a] += k;
+        return true;
+#undef SC_FAT
+    }
+    /* integers with no null sentinel: every row is non-null */
+    const void* p = c->agg_ptrs[a];
+    int64_t r0 = start - c->row_base;
+#define SC_IAT(i) read_col_i64(p, r0 + (i), t, 0)
+    if (op == OP_LAST) {
+        acc->sum[a].i = SC_IAT(n - 1);
+    } else if (op == OP_FIRST) {
+        if (nn ? nn[a] == 0 : c0 == 0) acc->sum[a].i = SC_IAT(0);
+    } else {                                     /* OP_PROD */
+        int64_t i = 0;
+        uint64_t pr;
+        if (nn ? nn[a] == 0 : c0 == 0) { pr = (uint64_t)SC_IAT(0); i = 1; }
+        else pr = (uint64_t)acc->sum[a].i;
+#define SC_PROD_LOOP(T) do { const T* restrict d = (const T*)p + r0;                  \
+            for (; i < n; i++) pr *= (uint64_t)(int64_t)d[i]; } while (0)
+        switch (t) {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: SC_PROD_LOOP(int64_t); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:         SC_PROD_LOOP(int32_t); break;
+        case RAY_I16:                                       SC_PROD_LOOP(int16_t); break;
+        default:                                            SC_PROD_LOOP(uint8_t); break;
+        }
+#undef SC_PROD_LOOP
+        acc->sum[a].i = (int64_t)pr;
+    }
+#undef SC_IAT
+    if (nn) nn[a] += n;
+    return true;
+}
+
+/* Does scalar_pick_run take input a?  A FIRST / LAST / PROD with no
+ * selection over a plain numeric column (integers only without a null
+ * sentinel).  Under a selection, or for any other input, the rows go
+ * through scalar_accum_agg as before. */
+static bool scalar_pick_takes(const scalar_ctx_t* c, uint32_t a) {
+    uint16_t op = c->agg_ops[a];
+    if (op != OP_FIRST && op != OP_LAST && op != OP_PROD) return false;
+    if (c->rowsel || c->match_idx || !c->agg_ptrs[a]) return false;
+    if ((c->agg_prod && c->agg_prod[a].enabled) || (c->agg_linear && c->agg_linear[a].enabled) ||
+        (c->agg_strlen && c->agg_strlen[a]))
+        return false;
+    switch (c->agg_types[a]) {
+    case RAY_F64: case RAY_F32: return true;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+    case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
+    case RAY_U8: case RAY_BOOL:
+        return !c->agg_int_null_has[a];
+    default: return false;
+    }
+}
+
 /* Input a over the run, if one of the tight loops computes it exactly as
  * scalar_accum_agg would row by row; false leaves it to the caller. */
 static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
@@ -10760,8 +11056,26 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
     if (op == OP_COUNT) return true;            /* count[0] is the caller's */
     if (c->agg_linear && c->agg_linear[a].enabled && (op == OP_SUM || op == OP_AVG)) {
         const agg_linear_t* lin = &c->agg_linear[a];   /* null-free terms */
+        int8_t t0 = lin->term_types[0];
         if (!idx) {
             scalar_linear_sum(acc, lin, a, start, start + n);
+        } else if (!acc->sum_hi) {
+            /* The wrapping total of b + sum(c_t * x_t) over the rows is
+             * n * b + sum(c_t * (the wrapping sum of x_t)) modulo 2^64: a
+             * typed gather sum per term gives the per-row loop's bits. */
+            int64_t sum = wrap_mul_i64(lin->bias_i64, n);
+            for (uint8_t t = 0; t < lin->n_terms; t++) {
+                if (lin->coeff_i64[t] == 0) continue;
+                sum = wrap_add_i64(sum, wrap_mul_i64(lin->coeff_i64[t],
+                        col_wrap_sum_idx(lin->term_ptrs[t], lin->term_types[t], start, idx, n)));
+            }
+            acc->sum[a].i = wrap_add_i64(acc->sum[a].i, sum);
+        } else if (lin->n_terms == 1 && lin->coeff_i64[0] == 1 && lin->bias_i64 == 0 &&
+                   (t0 == RAY_I64 || t0 == RAY_TIMESPAN || t0 == RAY_TIMESTAMP)) {
+            /* a bare 64-bit column: each row's value exactly, into 128 bits */
+            const int64_t* restrict x = (const int64_t*)lin->term_ptrs[0] + start;
+            for (int64_t i = 0; i < n; i++)
+                ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, x[idx[i]]);
         } else {
             for (int64_t i = 0; i < n; i++) {
                 int64_t r = SC_ROW(i), iv = lin->bias_i64;
@@ -10776,6 +11090,22 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
         return true;
     }
     const void* base = c->agg_ptrs[a];
+    if (!idx && scalar_pick_takes(c, a))
+        return scalar_pick_run(c, acc, a, start, n, acc->count[0] - n);
+    if (base && (op == OP_MIN || op == OP_MAX) && group_fp_type(c->agg_types[a]) &&
+        !(c->agg_prod && c->agg_prod[a].enabled) && !(c->agg_strlen && c->agg_strlen[a])) {
+        /* F64 / F32 MIN / MAX in lanes, the row-by-row fold's bits and zero
+         * sign included (ray_aggseq_minmax_*, strict IEEE: the release
+         * profile's -fno-signed-zeros let gcc fold the sign of a zero away
+         * here, #1628 review). */
+        double* slot = op == OP_MIN ? &acc->min_val[a].f : &acc->max_val[a].f;
+        int64_t* nnp = acc->nn_count ? &acc->nn_count[a] : NULL;
+        size_t off = (size_t)(start - c->row_base);
+        *slot = c->agg_types[a] == RAY_F64
+            ? ray_aggseq_minmax_f64(*slot, (const double*)base + off, idx, n, op == OP_MIN, nnp)
+            : ray_aggseq_minmax_f32(*slot, (const float*)base + off, idx, n, op == OP_MIN, nnp);
+        return true;
+    }
     if (!base || (c->agg_prod && c->agg_prod[a].enabled) ||
         (c->agg_strlen && c->agg_strlen[a]) || c->agg_int_null_has[a])
         return false;
@@ -10791,6 +11121,7 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
     return true;
 }
 #undef SC_INT_RUN
+#undef SC_MM_ILANES
 
 /* A run of rows (see SC_ROW), all of them aggregated: input by input. */
 static void scalar_accum_columns(scalar_ctx_t* c, da_accum_t* acc, int64_t start, int64_t n,
@@ -13024,6 +13355,32 @@ static bool group_seg_stream_ok(ray_graph_t* g, ray_op_t* op, ray_op_ext_t* ext,
     return ok;
 }
 
+/* A 0-row plain table with the columns of a parted table: each parted
+ * column as an empty vector of its base type, the partition key as an
+ * empty vector of its value type. */
+static ray_t* parted_empty_flat(ray_t* parted_tbl) {
+    int64_t ncols = ray_table_ncols(parted_tbl);
+    ray_t* tbl = ray_table_new(ncols);
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    for (int64_t c = 0; c < ncols; c++) {
+        ray_col_meta_t m;
+        if (!ray_table_col_meta_idx(parted_tbl, c, &m)) continue;
+        int8_t base = m.type;
+        if (m.type == RAY_MAPCOMMON) {
+            ray_t** mc = (ray_t**)ray_data(ray_table_col_idx(parted_tbl, c));
+            base = mc[0] ? mc[0]->type : RAY_I64;
+        } else if (RAY_IS_PARTED(m.type)) {
+            base = (int8_t)RAY_PARTED_BASETYPE(m.type);
+        }
+        ray_t* col = base == RAY_LIST ? ray_list_new(0) : ray_vec_new(base, 0);
+        if (!col || RAY_IS_ERR(col)) { ray_release(tbl); return col ? col : ray_error("oom", NULL); }
+        tbl = ray_table_add_col(tbl, ray_table_col_name(parted_tbl, c), col);
+        ray_release(col);
+        if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    }
+    return tbl;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
  * -------------------------------------------------------------------------- */
@@ -13049,7 +13406,22 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
             break;
         }
     }
-    if (n_parts <= 0 || total_rows <= 0) return ray_error("nyi", NULL);
+    if (n_parts <= 0) return ray_error("nyi", NULL);
+    /* Every partition empty: the answer of an empty plain table of the same
+     * columns (#1621) -- one row of the aggregates over no values keyless,
+     * no group under by:. */
+    if (total_rows <= 0) {
+        ray_t* empty_tbl = parted_empty_flat(parted_tbl);
+        if (!empty_tbl || RAY_IS_ERR(empty_tbl))
+            return empty_tbl ? empty_tbl : ray_error("oom", NULL);
+        ray_t* saved = g->table;
+        g->table = empty_tbl;
+        ray_t* result = exec_group(g, op, empty_tbl, group_limit);
+        g->table = saved;
+        ray_graph_unbind_table(g, empty_tbl);   /* before its address can be reused */
+        ray_release(empty_tbl);
+        return result;
+    }
 
     /* Check eligibility for per-partition exec + merge:
      * - All keys and agg inputs must be simple SCANs
@@ -16759,7 +17131,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (agg_is_binary_agg(ext->agg_ops[a])) { sc_has_binary = true; break; }
     /* The scalar route is the one that emits a FLOAT affine bias over an
      * integer column as F64 (emit_agg_columns); the others decline it. */
-    bool sc_route = n_keys == 0 && nrows > 0 && !sc_has_binary;
+    bool sc_route = n_keys == 0 && !sc_has_binary;
     /* A lone keyless SUM / AVG over every row: the scalar route's tight
      * kernel, where a narrow linear plan may take its pass's total alone
      * (agg_linear_t.pre_only, #1287). */
@@ -23203,8 +23575,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * has no key and still answers one row (the aggregates of no
              * rows), which the merge would key by this partition: keep
              * its columns, drop the row.  With no key at all that row is
-             * the empty-input answer of a whole-table aggregate: keep it. */
-            if (sel_cnt == 0 && n_part_keys == 0 && n_mc_keys > 0) {
+             * the empty-input answer of a whole-table aggregate: keep it.
+             * A partition holding no rows answers that one row too. */
+            if ((sel_cnt == 0 || part_nrows == 0) && n_part_keys == 0 && n_mc_keys > 0) {
                 ray_t* zero = make_i64(0);
                 ray_t* empty = zero ? ray_take_fn(bp[bi], zero) : NULL;
                 if (zero) ray_release(zero);

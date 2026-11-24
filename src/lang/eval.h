@@ -470,7 +470,7 @@ ray_t* ray_write_file_fn(ray_t* path_obj, ray_t* content);
 ray_t* ray_write_bytes_fn(ray_t* path_obj, ray_t* content);
 
 /* Vector similarity / embeddings / HNSW.
- * cos-dist and l2-dist return distance (lower = closer); inner-prod is
+ * .emb.cos-dist and .emb.l2-dist return distance (lower = closer); .emb.inner-prod is
  * the raw mathematical dot product. */
 ray_t* ray_cos_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_inner_prod_fn(ray_t* a, ray_t* b);
@@ -479,15 +479,36 @@ ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
 ray_t* ray_inv_fn(ray_t* x);
 ray_t* ray_flip_mat_fn(ray_t* x);
 ray_t* ray_gram_fn(ray_t* x);
+/* The matrix product's F32 kernel over rows (ops/linalg.c): c += a * b. */
+/* Rows against rows (ops/linalg.c): c[i * cols + o] += a_i . b_o. */
+void ray_lin_rowdot_acc_f32(const float* a, int64_t as, const float* b, int64_t bs,
+                            float* c, int64_t r, int64_t n, int64_t cols);
+void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
+                          int64_t r, int64_t k, int64_t cols);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);
 ray_t* ray_hnsw_build_fn(ray_t** args, int64_t n);
 ray_t* ray_ann_fn(ray_t** args, int64_t n);
 ray_t* ray_hnsw_free_fn(ray_t* h);
-ray_t* ray_hnsw_save_fn(ray_t* h, ray_t* path);
+ray_t* ray_hnsw_save_fn(ray_t* path, ray_t* h);
 ray_t* ray_hnsw_load_fn(ray_t* path);
 ray_t* ray_hnsw_info_fn(ray_t* h);
+/* The exact nearest-neighbour search (ops/embedding.c), shared by .emb.knn
+ * and by the query's nearest: operator: the k nearest of the rows of `col`
+ * (all, or the n listed in `only`) to `query`, into ids and dists, nearest
+ * first, lower being closer (an inner product comes negated).  Returns how
+ * many, or a code below; on RAY_EMB_KNN_BAD_ROW *bad_row is the row that is
+ * no numeric vector of length dim.  `metric` is a ray_hnsw_metric_t. */
+#define RAY_EMB_KNN_OOM       (-1)
+#define RAY_EMB_KNN_BAD_ROW   (-2)
+#define RAY_EMB_KNN_CANCELLED (-3)
+int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float* query, int32_t dim,
+                         int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row);
+ray_t* ray_emb_model_get_fn(ray_t* path);
+ray_t* ray_emb_model_info_fn(ray_t* h);
+ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x);
+ray_t* ray_emb_encode_fn(ray_t** args, int64_t n);
 
 /* Cast and type */
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);
@@ -516,6 +537,8 @@ bool   ray_times_binding(ray_t* ast, int64_t* name, ray_t** count);
 ray_t* ray_fn(ray_t** args, int64_t n);
 ray_t* ray_raise_fn(ray_t* val);
 ray_t* ray_try_fn(ray_t* expr, ray_t* handler_expr);
+ray_t* ray_try_finish(ray_t* result, ray_t* handler_expr);
+uint8_t ray_eval_last_rows(void);
 bool   ray_try_handler_is_value(ray_t* handler_expr);
 
 

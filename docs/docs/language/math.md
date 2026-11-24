@@ -428,10 +428,11 @@ for how an F64 answer can differ from the row-by-row one.
 
 ### `(prod x)` — aggregate
 
-Product of all non-null numeric elements.
+Product of all non-null numeric elements. An empty input is the empty product, `1`, and so is a query `prod` over a `where:` that keeps no row.
 
 ```lisp
 (prod [2 3 4])  ; 24
+(prod (as 'I64 []))  ; 1
 ```
 
 ### `(all x)` — aggregate

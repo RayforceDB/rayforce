@@ -1,0 +1,134 @@
+;; @requires: posix
+;; A keyless aggregate of two arguments answers the builtin's value on
+;; every route (#1620).  The evaluator fallback, taken when another output
+;; is declined (first over a date sum here), raised for cov, scov, wsum,
+;; wavg, pearson_corr, top, bot, quantile, percentile and median; the
+;; planned route gave top and bot one integer cell, and a two-column
+;; aggregate over no rows no row.
+(set T (table [c f d v] (list [1 5 3] [1.5 2.0 4.0] [2024.01.01 2024.01.02 2024.01.03] [10 20 30])))
+
+;; the builtin's values
+(top [1 5 3] 2) -- [5 3]
+(cov (as 'I64 []) (as 'F64 [])) -- 0Nf
+
+(at (select {from: T s: (cov c f)}) 's) -- (at (select {from: T s: (cov c f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (cov c f) where: (> v 15)}) 's) -- (at (select {from: T s: (cov c f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (cov c f) where: (> v 100)}) 's) -- (at (select {from: T s: (cov c f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (scov c f)}) 's) -- (at (select {from: T s: (scov c f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (scov c f) where: (> v 15)}) 's) -- (at (select {from: T s: (scov c f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (scov c f) where: (> v 100)}) 's) -- (at (select {from: T s: (scov c f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (wsum c f)}) 's) -- (at (select {from: T s: (wsum c f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (wsum c f) where: (> v 15)}) 's) -- (at (select {from: T s: (wsum c f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (wsum c f) where: (> v 100)}) 's) -- (at (select {from: T s: (wsum c f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (wavg c f)}) 's) -- (at (select {from: T s: (wavg c f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (wavg c f) where: (> v 15)}) 's) -- (at (select {from: T s: (wavg c f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (wavg c f) where: (> v 100)}) 's) -- (at (select {from: T s: (wavg c f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (pearson_corr c f)}) 's) -- (at (select {from: T s: (pearson_corr c f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (pearson_corr c f) where: (> v 15)}) 's) -- (at (select {from: T s: (pearson_corr c f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (pearson_corr c f) where: (> v 100)}) 's) -- (at (select {from: T s: (pearson_corr c f) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (top c 2)}) 's) -- (at (select {from: T s: (top c 2) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (top c 2) where: (> v 15)}) 's) -- (at (select {from: T s: (top c 2) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (top c 2) where: (> v 100)}) 's) -- (at (select {from: T s: (top c 2) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (bot c 2)}) 's) -- (at (select {from: T s: (bot c 2) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (bot c 2) where: (> v 15)}) 's) -- (at (select {from: T s: (bot c 2) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (bot c 2) where: (> v 100)}) 's) -- (at (select {from: T s: (bot c 2) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (quantile f 0.5)}) 's) -- (at (select {from: T s: (quantile f 0.5) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (quantile f 0.5) where: (> v 15)}) 's) -- (at (select {from: T s: (quantile f 0.5) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (quantile f 0.5) where: (> v 100)}) 's) -- (at (select {from: T s: (quantile f 0.5) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (percentile f 50)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (percentile f 50) where: (> v 15)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (percentile f 50) where: (> v 100)}) 's) -- (at (select {from: T s: (percentile f 50) z: (first (+ d 0)) where: (> v 100)}) 's)
+(at (select {from: T s: (median f)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0))}) 's)
+(at (select {from: T s: (median f) where: (> v 15)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0)) where: (> v 15)}) 's)
+(at (select {from: T s: (median f) where: (> v 100)}) 's) -- (at (select {from: T s: (median f) z: (first (+ d 0)) where: (> v 100)}) 's)
+
+;; planned = the builtin over the kept rows
+(at (select {from: T s: (cov c f)}) 's) -- (enlist (cov [1 5 3] [1.5 2.0 4.0]))
+(at (select {from: T s: (cov c f) z: (first (+ d 0))}) 's) -- (enlist (cov [1 5 3] [1.5 2.0 4.0]))
+(at (select {from: T s: (top c 2)}) 's) -- (list [5 3])
+(at (select {from: T s: (bot c 2) where: (> v 15)}) 's) -- (list [3 5])
+(at (select {from: T s: (top c 2) z: (first (+ d 0))}) 's) -- (list [5 3])
+(at (select {from: T s: (median f) z: (first (+ d 0))}) 's) -- [2.0]
+(at (select {from: T s: (quantile f 0.5) z: (first (+ d 0))}) 's) -- [2.0]
+
+;; over no rows: the builtin's answer over no values, one row
+(at (select {from: T s: (cov c f) where: (> v 100)}) 's) -- [0Nf]
+(at (select {from: T s: (scov c f) where: (> v 100)}) 's) -- [0Nf]
+(at (select {from: T s: (wavg c f) where: (> v 100)}) 's) -- [0Nf]
+(at (select {from: T s: (pearson_corr c f) where: (> v 100)}) 's) -- [0Nf]
+(at (select {from: T s: (wsum c f) where: (> v 100)}) 's) -- [0.0]
+(at (select {from: T s: (top c 2) where: (> v 100)}) 's) -- (list (as 'I64 []))
+(at (select {from: T s: (cov c f) z: (first (+ d 0)) where: (> v 100)}) 's) -- [0Nf]
+
+;; beside other outputs
+(at (select {from: T s: (cov c f) n: (sum c) where: (> v 100)}) 'n) -- [0]
+(at (select {from: T s: (top c 2) n: (sum c)}) 'n) -- [9]
+
+;; by: is unchanged
+(at (select {from: T s: (top c 2) by: v}) 's) -- (list [1] [5] [3])
+
+;; parted, plain and with a where:
+(.sys.exec "rm -rf /tmp/rf_keyless_binary")
+(.db.splayed.set "/tmp/rf_keyless_binary/2024.01.01/t/" (select {from: T c: c f: f v: v}))
+(.db.splayed.set "/tmp/rf_keyless_binary/2024.01.02/t/" (select {from: T c: c f: f v: v}))
+(set P (.db.parted.get "/tmp/rf_keyless_binary/" 't))
+(at (select {from: P s: (top c 2)}) 's) -- (list [5 5])
+(at (select {from: P s: (cov c f) where: (> v 100)}) 's) -- [0Nf]
+(set P 0)
+(.sys.exec "rm -rf /tmp/rf_keyless_binary")
+
+;; Over no rows the probability of quantile/percentile is not checked, on
+;; either route (#981): an out-of-range, null, column, vector or helper
+;; probability answers as a valid one, [0Nf].  One whose evaluation fails
+;; is still the select's error.
+(set Q (table [s t d v] (list [0.0 8.0 16.0] [0.1 0.2 0.3] [2024.01.01 2024.01.02 2024.01.03] [1 2 3])))
+(set QE (take Q 0))
+(set PB 1.5)
+(set PN 0Nf)
+(set PM -0.5)
+(set HQ (fn [x] 2.0))
+(at (select {from: QE r: (quantile s 1.5)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s 1.5) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s 1.5) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s 1.5) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (percentile s 150)}) 'r) -- [0Nf]
+(at (select {from: QE r: (percentile s 150) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (percentile s 150) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (percentile s 150) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PB)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PB) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PB) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PB) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PN)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PN) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PN) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PN) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PM)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s PM) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PM) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s PM) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s (HQ 5))}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s (HQ 5)) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s (HQ 5)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s (HQ 5)) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s (first t))}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s (first t)) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s (first t)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s (first t)) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s t)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s t) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s t) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s t) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s [0.1 0.2])}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s [0.1 0.2]) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s [0.1 0.2]) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s [0.1 0.2]) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s 0.5)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s 0.5) z: (first (+ d 0))}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s 0.5) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: Q r: (quantile s 0.5) z: (first (+ d 0)) where: (> v 9)}) 'r) -- [0Nf]
+(at (select {from: QE r: (quantile s (+ PB 'a))}) 'r) !- type
+(at (select {from: QE r: (quantile s (+ PB 'a)) z: (first (+ d 0))}) 'r) !- type
+;; with rows the probability is checked on both routes
+(at (select {from: Q r: (quantile s 1.5)}) 'r) !- domain
+(at (select {from: Q r: (quantile s 1.5) z: (first (+ d 0))}) 'r) !- domain

@@ -44,7 +44,7 @@ Between segments, the executor:
 
 ### 4. Result Assembly
 
-After all segments are processed, the merged accumulator is the final result. If all segments were pruned (no partitions match the filter), Rayforce executes the DAG on an empty table to produce a result with the correct schema and zero rows.
+After all segments are processed, the merged accumulator is the final result. If all segments were pruned (no partitions match the filter), Rayforce executes the DAG on an empty table to produce a result with the correct schema: zero rows for a grouped query, and one row of the aggregates' answers over no values (`count` 0, `sum` 0, the null for `min`) for a keyless one.
 
 ## Partition Pruning
 

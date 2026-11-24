@@ -1,0 +1,27 @@
+;; Keyless prod over a where: that keeps no row is the empty product, 1,
+;; on the planned route as on the evaluator fallback and the builtin
+;; (#1577).  The planned route gave the null.  A second output that the
+;; planner declines (first over a date sum) forces the fallback.
+(set T (table [c f i e h d v] (list [1 5 6 2] [1.5 2.0 3.0 4.0] (as 'I32 [1 5 6 2]) (as 'F32 [1.5 2 3 4]) (as 'I16 [1 2 3 4]) [2024.01.01 2024.01.02 0Nd 2024.01.04] [10 20 30 40])))
+
+(prod (as 'I64 [])) -- 1
+(at (select {from: T s: (prod c) where: (> v 100)}) 's) -- [1]
+(at (select {from: T s: (prod c) z: (first (+ d 0)) where: (> v 100)}) 's) -- [1]
+(at (select {from: T s: (prod f) where: (> v 100)}) 's) -- [1.0]
+(at (select {from: T s: (prod f) z: (first (+ d 0)) where: (> v 100)}) 's) -- [1.0]
+(at (select {from: T s: (prod i) where: (> v 100)}) 's) -- [1]
+(at (select {from: T s: (prod e) where: (> v 100)}) 's) -- [1.0]
+(at (select {from: T s: (prod h) where: (> v 100)}) 's) -- [1]
+
+;; beside other outputs, each keeps its own identity
+(at (select {from: T s: (prod c) n: (sum c) m: (min c) where: (> v 100)}) 's) -- [1]
+(at (select {from: T s: (prod c) n: (sum c) m: (min c) where: (> v 100)}) 'n) -- [0]
+(at (select {from: T s: (prod c) n: (sum c) m: (min c) where: (> v 100)}) 'm) -- [0Nl]
+
+;; a where that keeps rows is unchanged
+(at (select {from: T s: (prod c) where: (> v 15)}) 's) -- [60]
+
+;; a source large enough for the parallel selection
+(set B (table [c v] (list (% (til 1000000) 7) (til 1000000))))
+(at (select {from: B s: (prod c) where: (> v 2000000)}) 's) -- [1]
+(set B 0)

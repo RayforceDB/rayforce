@@ -285,10 +285,12 @@ fit L2. Thread pool dispatches morsels in parallel.
 
 **Vector search**
 - Multi-metric HNSW index (cosine / L2 / inner-product) with save/load
-- Rayfall builtins: `cos-dist` / `l2-dist` / `inner-prod` / `norm` / `knn`
-  and the HNSW lifecycle `hnsw-build` / `ann` / `hnsw-save` / `hnsw-load` /
-  `hnsw-free` / `hnsw-info`
-- Filter-aware ANN via `select ... where ... nearest (ann handle query) take k`
+- Rayfall builtins: `.emb.cos-dist` / `.emb.l2-dist` / `.emb.inner-prod` / `norm` / `.emb.knn`
+  and the HNSW lifecycle `.emb.hnsw.build` / `.emb.ann` / `.emb.hnsw.set` / `.emb.hnsw.get` /
+  `.emb.hnsw.free` / `.emb.hnsw.info`
+- Text into vectors inside the engine: `.emb.model.get` opens an encoder as published
+  (`config.json`, `tokenizer.json`, `model.safetensors`), `.emb.encode` computes on the worker pool, on weights mapped from the file and never copied
+- Filter-aware ANN via `select ... where ... nearest (.emb.ann handle query) take k`
 - Iterative streaming scan: the `where` predicate is pushed into HNSW's
   beam loop so rejected candidates don't consume result slots
 

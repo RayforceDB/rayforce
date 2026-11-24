@@ -115,6 +115,15 @@ lst = ray_list_set(lst, 0, new_item);  // replace at index
 
 Lists have `type = RAY_LIST` (0) and store pointers in their `data[]` array. The `len` field tracks the number of elements.
 
+### Deeply nested lists
+
+A list can hold a list, a dict can hold a dict, a table can hold a table in a list cell, and code can nest any of them arbitrarily deep at run time, e.g. `(times n (set L (list L)))`. Every operation stays safe on such a value: none of them crashes the process, however deep the value is or whatever mix of lists, dicts and tables it is nested through.
+
+- **Exact at any depth:** comparing and hashing nested values as keys, through lists, dicts and tables alike (`distinct`, `group`, `find`, `except`, `union`, and `in` against a list of such values), on any thread. Building and freeing a deep value are not limited either.
+- **May stop with a `limit` error:** operations that walk a value level by level stop once the running thread's stack is nearly used up. These are formatting (`format`, `show`, `repr`, the REPL), element-wise arithmetic and comparison (`==`, `+`, `neg`, `not`...), `identical`, `in` over a list's cells, and `as`. `println` has no error to give, so it prints `...` for the part nested too deep. How deep they reach first depends on the build and on the thread's stack: tens of thousands of levels in an optimized build on the main thread.
+- **Fixed limit of 512 levels:** serialisation (`ser`, an IPC message or reply, the journal) and saving a list column refuse a value nested deeper than 512 levels with `limit`. That is the depth `de` reads, so whatever `ser` writes, `de` reads back.
+- **Queries:** a query whose expressions nest deeper than 1024 levels (built at run time and passed to `select`, `window`, `update` or `delete` through `eval`) is refused with `limit`. That is the deepest text the parser reads.
+
 ## Tables
 
 A table is a collection of named column vectors, all the same length. Tables are the primary data structure for analytical queries — the target of `select`, `update`, joins, and aggregations.

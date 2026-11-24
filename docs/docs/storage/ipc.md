@@ -224,7 +224,7 @@ The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of 
 
 ## Connection Hooks
 
-The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `(.ipc.auto_journal_eval)` answers `true` while the current evaluation runs inside an auto-journaled request, where the request is already the journal entry and handlers must not `.log.write` frames of their own. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
+The server side exposes the inbound connection lifecycle to Rayfall code through five user-installable lambdas under `.ipc.on.*` — `open`, `close`, `sync`, `async`, and `auth` — plus the `(.ipc.handle)` accessor that returns the current connection's handle inside any hook. `(.ipc.auto_journal_eval)` answers `true` while the current evaluation runs inside an auto-journaled request (a sync one, or an async one while the [posts switch](../namespaces/log.md#log-posts) is on), where the request is already the journal entry and handlers must not `.log.write` frames of their own. `close` also fires on the client side for a connection opened with `.ipc.open`, so a subscriber sees its publisher go away. See [IPC Connection Hooks](ipc-hooks.md) for the full reference: signatures, install / clear semantics, the reserved-namespace carve-out, per-hook error handling, and the restricted-mode interaction.
 
 ## Serialization with `ser`
 
@@ -247,6 +247,8 @@ The `ser` builtin converts any value to a binary buffer (a `U8` vector). Pass it
 ```
 
 The result is always a `U8` byte vector containing the IPC header followed by the serialized payload.
+
+A value nested deeper than 512 levels (a list inside a list, 513 times) is not serialized: `ser` fails with `limit`, because 512 is the nesting `de` reads. A server whose reply is such a value answers with that error, and the connection stays open.
 
 ## Deserialization with `de`
 
@@ -312,7 +314,8 @@ typedef struct ray_ipc_header_t {
 The header is exactly 16 bytes, enforced by a compile-time static assertion.
 
 Version 4 extends an error payload from its eight-byte category field to
-`category[8]`, a one-byte message length, and up to 255 message bytes. Version
+`category[8]`, a one-byte message length, and up to 255 message bytes: the
+error's own message, the text it was raised with. Version
 3 error records remain readable as category-only errors so persisted objects
 and journals survive the upgrade.
 
@@ -350,7 +353,7 @@ payload allocation. These per-message limits are not a process-memory budget.
 
 - **v2** — atoms serialized as `type(1) + value-bytes`. Typed-null atoms (`0Nl`, `0Nf`, …) lost their null bit on round-trip.
 - **v3** — atoms serialized as `type(1) + flags(1) + value-bytes`. Bit 0 of `flags` carries the typed-null marker; `(de (ser 0Nl))` now returns `0Nl`. The [handshake byte](#handshake) advertises the same version so peers speaking different wire versions are closed before any payload is exchanged.
-- **v4** (current) — error records carry `category[8]`, a one-byte message length and up to 255 message bytes, so an error sent over IPC or written to a journal keeps its message. v4 reads v3 objects and journals; live peers must both be v4.
+- **v4** (current) — error records carry `category[8]`, a one-byte message length and up to 255 message bytes, so an error sent over IPC or written to a journal keeps its message. Each record carries its own error's message, so a list of several errors writes each one's text. v4 reads v3 objects and journals; live peers must both be v4.
 
 Because the version field is checked symmetrically on send and receive, a v3 peer will refuse to connect to a v2 peer (and vice versa) rather than silently mis-parsing.
 
@@ -402,6 +405,7 @@ The serialization functions are declared in `src/store/serde.h`:
 ## Limitations
 
 - **No streaming** — the entire object is serialized at once; there is no chunked or incremental mode
+- **Nesting depth** — a value nested deeper than 512 levels cannot be sent or received (`limit` when sending, `domain` when reading one)
 - **Single-threaded server** — the server processes queries sequentially on the main thread. Long-running queries block other clients.
 - **Plaintext transport** — data travels unencrypted over TCP. Use on trusted networks or tunnel through SSH for security.
 - **Shared secret only** — authentication uses a single password for all clients (`-u`/`-U`). There is no per-user access control.

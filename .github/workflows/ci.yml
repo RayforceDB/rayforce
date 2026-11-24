@@ -106,14 +106,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test release-note source boundaries (offline)
         run: PYTHONDONTWRITEBYTECODE=1 python3 .github/test_release_notes.py -v
-      - name: Install Clang 23
-        run: |
-          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
-          sudo bash llvm.sh 23
+      # The version is set in the action, which the release and nightly
+      # builds use too: one place to bump.
+      - name: Install the current Clang
+        uses: ./.github/actions/setup-clang-current
       - name: Install a comma-decimal locale
         run: sudo locale-gen de_DE.UTF-8
-      - name: Test with Clang 23 (${{ env.TEST_TIER }})
-        run: make ${{ env.TEST_TIER }} CC=clang-23
+      - name: Test with the current Clang (${{ env.TEST_TIER }})
+        run: make ${{ env.TEST_TIER }} CC="$CLANG_CURRENT"
       - name: Upload test replay files
         if: failure()
         uses: actions/upload-artifact@v4

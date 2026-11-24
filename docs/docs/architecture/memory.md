@@ -169,7 +169,7 @@ Rayforce uses **copy-on-write (COW)** semantics to allow safe sharing of data be
 | `ray_cow(v)` | If `rc > 1`, allocate a new block and copy the data, returning the new block (caller owns it). If `rc == 1`, return the same block (caller already has exclusive ownership). Returns `v` unchanged if it is a `RAY_ERROR` object. |
 
 !!! warning "`ray_release` is a no-op on error objects"
-    `ray_retain`, `ray_release`, and `ray_cow` all early-return when handed a `RAY_ERROR` object (`RAY_IS_ERR(v)` is true). This means `ray_release` will **not** reclaim an error — a caller that holds the sole reference and wants the block freed must call `ray_error_free(err)` instead. Releasing an error is silently ignored, so the block leaks until heap teardown.
+    `ray_retain`, `ray_release`, and `ray_cow` all early-return when handed a `RAY_ERROR` object (`RAY_IS_ERR(v)` is true). This means `ray_release` will **not** reclaim an error — a caller that holds the sole reference and wants the block freed must call `ray_error_free(err)` instead. Releasing an error is silently ignored, so the block leaks until heap teardown. An error's message lives in the error's own block (`ray_err_msg`), so `ray_error_free` frees both, and an error made on a worker thread may be freed on another.
 
 ### COW Cleanup Pattern
 

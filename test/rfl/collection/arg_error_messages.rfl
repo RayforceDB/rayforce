@@ -133,7 +133,7 @@
 (at (try (flip 'a) (fn [e] e)) 'usage) -- "(flip <x: numeric vector or non-empty list of numeric rows>)"
 (at (try (.attr.get) (fn [e] e)) 'msg) -- ".attr.get: takes 1 argument, got 0"
 (at (try (.attr.get) (fn [e] e)) 'usage) -- "(.attr.get <x: vector>)"
-(at (try (knn 1 2) (fn [e] e)) 'code) -- 'rank
+(at (try (.emb.knn 1 2) (fn [e] e)) 'code) -- 'rank
 
 ;; two builtins whose names share the first 13 characters are told apart by the
 ;; message, each of which begins with its own name

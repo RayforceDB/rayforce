@@ -2742,16 +2742,12 @@ static test_result_t test_use_materializes_once(void) {
     PASS();
 }
 
-/* Parted (Task 6b minor 5): a parted table consults its per-segment indexes
- * on generation 2 exactly as on generation 0: every site's consults and
- * hits, the answers, and one materialization per segment HASH consult on
- * generation 0 (the consult-set rule), so a segment that is pruned or not
- * consulted is never decoded.  At this HEAD no parted shape reaches a
- * segment's index on generation 0 (the parted select answers by its scan;
- * a bare FILTER graph over a constant table does not stream), so the
- * counters are zero on both and generation 2 materializes nothing; when
- * generation 0 starts consulting a segment, the same assertions require
- * generation 2 to follow. */
+/* Parted (Task 6b minor 5, #1422): a parted table consults its per-segment
+ * indexes on generation 2 exactly as on generation 0: every site's consults
+ * and hits, and the answers.  Each `==` or `in` below is one consult and one
+ * hit of its site, whatever the number of segments probed.  A generation-2
+ * segment's HASH is probed where it is mapped, so no segment is decoded,
+ * pruned or not. */
 static test_result_t test_parted_segment_index(void) {
     for (int gen = 0; gen <= 2; gen += 2)
         for (int d = 1; d <= 3; d++) {
@@ -2789,8 +2785,10 @@ static test_result_t test_parted_segment_index(void) {
         for (int s = 0; s < IDX_SITE__N; s++)
             TEST_ASSERT_FMT(c[0][s] == c[1][s] && h[0][s] == h[1][s], "%s: site %d consults %llu/%llu hits %llu/%llu", qs[i], s,
                             (unsigned long long)c[0][s], (unsigned long long)c[1][s], (unsigned long long)h[0][s], (unsigned long long)h[1][s]);
-        TEST_ASSERT_FMT(mat[0] == 0 && mat[1] == c[0][IDX_SITE_FILTER_HASH], "%s: generation 2 materialized %llu, generation 0 consulted %llu segment HASHes",
-                        qs[i], (unsigned long long)mat[1], (unsigned long long)c[0][IDX_SITE_FILTER_HASH]);
+        TEST_ASSERT_FMT(c[0][IDX_SITE_FILTER_HASH] + c[0][IDX_SITE_IN] == 1 && h[0][IDX_SITE_FILTER_HASH] + h[0][IDX_SITE_IN] == 1,
+                        "%s: segment HASHes consulted %llu/%llu", qs[i],
+                        (unsigned long long)c[0][IDX_SITE_FILTER_HASH], (unsigned long long)c[0][IDX_SITE_IN]);
+        TEST_ASSERT_FMT(mat[0] == 0 && mat[1] == 0, "%s: materialized %llu/%llu", qs[i], (unsigned long long)mat[0], (unsigned long long)mat[1]);
     }
     PASS();
 }

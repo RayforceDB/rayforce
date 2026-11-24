@@ -1,0 +1,39 @@
+;; The exact search over a column large enough to go to the worker pool:
+;; `.emb.knn`, a column of distances, and `nearest:` in a query are one
+;; search, and give what sorting every distance gives.
+
+(set V (map (fn [i] (as 'F32 (/ (as 'F64 (- (rand 32 2001) 1000)) 1000.0))) (til 3000)))
+(set Q (as 'F32 (/ (as 'F64 (- (rand 32 2001) 1000)) 1000.0)))
+(set T (table [id vec] (list (til 3000) V)))
+
+;; ────────────── the nearest are the least of all the distances ──────────────
+(set D (.emb.cos-dist V Q))
+(count D) -- 3000
+(at (.emb.knn V Q 25) '_rowid) -- (take (iasc D) 25)
+(at (.emb.knn V Q 25 'l2) '_rowid) -- (take (iasc (.emb.l2-dist V Q)) 25)
+(at (.emb.knn V Q 25 'ip) '_rowid) -- (take (idesc (.emb.inner-prod V Q)) 25)
+;; A row is nearest to itself, at no distance.
+(at (at (.emb.knn V (at V 1234) 1 'l2) '_rowid) 0) -- 1234
+(at (at (.emb.knn V (at V 1234) 1 'l2) '_dist) 0) -- 0.0
+;; Asked for more than there are: all of them, nearest first.
+(count (.emb.knn V Q 5000)) -- 3000
+(at (.emb.knn V Q 5000) '_rowid) -- (iasc D)
+
+;; ────────────── a column in doubles is searched as doubles ──────────────
+(set V64 (map (fn [r] (as 'F64 r)) V))
+(at (.emb.knn V64 Q 25) '_rowid) -- (take (iasc (.emb.cos-dist V64 Q)) 25)
+
+;; ────────────── the query's operator is the same search ──────────────
+(at (select {from: T nearest: (.emb.knn vec Q) take: 25}) 'id) -- (take (iasc D) 25)
+;; With a filter only the rows it accepts are looked at.
+(set EVEN (where (== 0 (% (til 3000) 2))))
+(at (select {from: T where: (== 0 (% id 2)) nearest: (.emb.knn vec Q) take: 25}) 'id) -- (at EVEN (take (iasc (at D EVEN)) 25))
+
+;; ────────────── of rows as near as each other, the earlier comes first ──────────────
+(set SAME (take (enlist (at V 7)) 2000))
+(at (.emb.knn SAME Q 5) '_rowid) -- [0 1 2 3 4]
+
+;; ────────────── a row that is no vector of the dimension is refused ──────────────
+(set BAD (concat (take V 2500) (enlist [1.0 2.0])))
+(.emb.knn BAD Q 5) !- type
+(.emb.cos-dist BAD Q) !- type

@@ -72,7 +72,7 @@ A byte order mark before the value is not JSON whitespace, and is a `parse` erro
 | Limit | Applies to |
 |---|---|
 | `input` | bytes of one document |
-| `depth` | nesting depth; the default is 128, and it never exceeds 1024 |
+| `depth` | nesting depth; the default is 128, and it never exceeds 1024; a document that would run the thread's stack out first stops earlier, with a `limit` error |
 | `nodes` | values, containers included |
 | `alloc` | bytes of the blocks the reader allocates for the values it builds: atoms, vectors with their string pools, lists with their growth, dicts with their keys and values, and the decoded-string buffer; an array of one kind of scalar is built straight into its typed vector, so it costs that vector with its growth (an array of 780,000 integers is charged about 12.5 MB: `{alloc: 12000000}` refuses it and `{alloc: 12500000}` accepts it), and the atoms an array turns into when it turns out mixed are charged while the typed run still is, each atom by its block (64 bytes for a number or a boolean, a string with its bytes), then the run's charge is returned |
 

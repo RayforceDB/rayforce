@@ -1,0 +1,38 @@
+;; @requires: posix  (the server is started and stopped through a POSIX shell)
+;; A restricted (-U) client builds a value nested 60,000 deep with `let` and
+;; `times`, which a restricted session may use, and has the server reply
+;; with it, format it or compare it (#1591).  Each used to crash the
+;; server; now the reply is a value or a limit error, and the server goes
+;; on answering.  The reply itself cannot be sent (ser refuses a value
+;; nested deeper than 512 levels), so it comes back as that error.
+(.sys.exec "rm -rf /tmp/rftest_deepval; mkdir -p /tmp/rftest_deepval; true") -- 0
+(.sys.exec "test/serve.sh --listen /tmp/rftest_deepval/s -U pw") -- 0
+(set h (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_deepval/s/port")) ":u:pw"))))
+(set ask (fn [src] (try (.ipc.send h src) (fn [e] (get e 'code)))))
+
+;; the 70-byte message (59 characters of text): the reply is the deep value itself
+(count "((fn [] (let L (list 1)) (times 60000 (let L (list L))) L))") -- 59
+(ask "((fn [] (let L (list 1)) (times 60000 (let L (list L))) L))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+;; formatting it, comparing it: a value or a limit error
+(in (type (ask "((fn [] (let L (list 1)) (times 60000 (let L (list L))) (count (format \"%\" L))))")) [i64 sym]) -- true
+(.ipc.send h "(+ 1 2)") -- 3
+(in (type (ask "((fn [] (let L (list 1)) (times 60000 (let L (list L))) (let M (list 1)) (times 60000 (let M (list M))) (== L M)))")) [LIST sym]) -- true
+(.ipc.send h "(+ 1 2)") -- 3
+;; a million levels
+(ask "((fn [] (let L (list 1)) (times 1000000 (let L (list L))) L))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+;; nesting through dicts and tables (the four ways a restricted client
+;; still killed a server): identical of two deep lists, distinct of deep
+;; dicts, in over lists and dicts alternating, group of self-nesting tables
+(in (type (ask "((fn [] (let L (list 1)) (times 1000000 (let L (list L))) (let M (list 1)) (times 1000000 (let M (list M))) (identical L M)))")) [b8 sym]) -- true
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (dict [a] (list 1))) (times 1000000 (let L (dict [a] (list L)))) (count (distinct (list L L)))))") -- 1
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let X (dict [a] (list 1))) (times 300000 (let X (dict [a] (list (list X))))) (let Y (dict [a] (list 1))) (times 300000 (let Y (dict [a] (list (list Y))))) (in X (list Y))))") -- true
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let T (table [a] (list (list 1)))) (times 100000 (let T (table [a] (list (list T))))) (count (group (list T T)))))") -- 1
+(.ipc.send h "(+ 1 2)") -- 3
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rftest_deepval/s") -- 0
+(.sys.exec "rm -rf /tmp/rftest_deepval; true") -- 0

@@ -1,0 +1,104 @@
+;; A where: (== c k) or (in c set) over a parted table probes each
+;; segment's own saved hash (#1422); before, idx_filter_decode and
+;; idx_filter_in_decode skipped parted columns and every segment was
+;; scanned.  Every answer here is compared with the same partitions saved
+;; with no index (the scan), row order and partition column included.
+(set G (guid 40))
+(set C ['id 'i32 'i16 'd 'ts 'sy 's 'g])
+(set mk (fn [o n] (do (set b (% (* (+ o (til n)) 7919) 5003)) (table [id i32 i16 d ts sy s g] (list b (as 'I32 b) (as 'I16 b) (+ 2020.01.01 (as 'I32 b)) (as 'TIMESTAMP b) (as 'SYMBOL (map (fn [x] (format "s%" x)) b)) (map (fn [x] (format "k%" x)) b) (at G (% b 40)))))))
+(set ix (fn [t] (table [id i32 i16 d ts sy s g] (map (fn [c] (.idx.hash (at t c))) C))))
+(set T1 (mk 0 70000))
+(set T2 (take T1 0))
+(set T3 (mk 70000 3000))
+(set T4 (mk 73000 5000))
+(set T5 (mk 78000 66000))
+(set T6 (mk 144000 4000))
+;; indexed: segments of different sizes, an empty one, one saved without
+;; an index, one compressed (its hash recorded in the file), one
+;; compressed without an index (scanned a vector at a time)
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.01/t/" (ix T1) "/tmp/rf_test_1422/i/.sym")
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.02/t/" T2 "/tmp/rf_test_1422/i/.sym")
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.03/t/" T3 "/tmp/rf_test_1422/i/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.04/t/" (ix T4) "/tmp/rf_test_1422/i/.sym")
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.05/t/" (ix T5) "/tmp/rf_test_1422/i/.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_1422/i/2026.01.06/t/" T6 "/tmp/rf_test_1422/i/.sym" {compress: true index: false})
+;; the reference: the same rows, no index anywhere
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.01/t/" T1 "/tmp/rf_test_1422/n/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.02/t/" T2 "/tmp/rf_test_1422/n/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.03/t/" T3 "/tmp/rf_test_1422/n/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.04/t/" T4 "/tmp/rf_test_1422/n/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.05/t/" T5 "/tmp/rf_test_1422/n/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/n/2026.01.06/t/" T6 "/tmp/rf_test_1422/n/.sym" {index: false})
+(set PI (.db.parted.get "/tmp/rf_test_1422/i" 't))
+(set PN (.db.parted.get "/tmp/rf_test_1422/n" 't))
+(count PI) -- 148000
+(at (.idx.info (at (.db.splayed.get "/tmp/rf_test_1422/i/2026.01.04/t/" "/tmp/rf_test_1422/i/.sym") 'id)) 'kind) -- 'hash
+(do (.idx.uses PI) null) -- null
+;; one needle per type, present in every non-empty segment
+(set K 1234)
+(set K32 (as 'I32 1234))
+(set K16 (as 'I16 1234))
+(set KD 2023.05.19)
+(set KT (as 'TIMESTAMP 1234))
+(set KS 's1234)
+(set KG (at G 34))
+(select {from: PI where: (== id K)}) -- (select {from: PN where: (== id K)})
+(at (.idx.uses PI) 'id) -- 3
+(select {from: PI where: (== i32 K32)}) -- (select {from: PN where: (== i32 K32)})
+(select {from: PI where: (== i16 K16)}) -- (select {from: PN where: (== i16 K16)})
+(select {from: PI where: (== d KD)}) -- (select {from: PN where: (== d KD)})
+(select {from: PI where: (== ts KT)}) -- (select {from: PN where: (== ts KT)})
+(select {from: PI where: (== sy KS)}) -- (select {from: PN where: (== sy KS)})
+(at (.idx.uses PI) 'sy) -- 3
+(select {from: PI where: (== s "k1234")}) -- (select {from: PN where: (== s "k1234")})
+(at (.idx.uses PI) 's) -- 3
+(select {from: PI where: (== g KG)}) -- (select {from: PN where: (== g KG)})
+(at (.idx.uses PI) 'g) -- 3
+(count (select {from: PI where: (== id K)})) -- 30
+;; absent needles: no rows
+(count (select {from: PI where: (== id 999999)})) -- 0
+(count (select {from: PI where: (== sy 'nosuch)})) -- 0
+(count (select {from: PI where: (== s "nosuch")})) -- 0
+;; in
+(select {from: PI where: (in id [1234 7 4999 999999])}) -- (select {from: PN where: (in id [1234 7 4999 999999])})
+(select {from: PI where: (in i32 [1234 7 4999])}) -- (select {from: PN where: (in i32 [1234 7 4999])})
+(at (.idx.uses PI) 'i32) -- 3
+(select {from: PI where: (in sy ['s1234 's7 'nosuch])}) -- (select {from: PN where: (in sy ['s1234 's7 'nosuch])})
+(select {from: PI where: (in s ["k1234" "k7" "nosuch"])}) -- (select {from: PN where: (in s ["k1234" "k7" "nosuch"])})
+(select {from: PI where: (in g (take G 3))}) -- (select {from: PN where: (in g (take G 3))})
+;; null needles keep the scan: the same answers
+(select {from: PI where: (== s "")}) -- (select {from: PN where: (== s "")})
+(select {from: PI where: (in s ["k7" ""])}) -- (select {from: PN where: (in s ["k7" ""])})
+;; after partition pruning, and as part of a conjunction
+(select {from: PI where: (and (== date 2026.01.04) (== id K))}) -- (select {from: PN where: (and (== date 2026.01.04) (== id K))})
+(select {from: PI where: (and (== id K) (> i16 100))}) -- (select {from: PN where: (and (== id K) (> i16 100))})
+(select {from: PI where: (and (== s "k1234") (== date 2026.01.01))}) -- (select {from: PN where: (and (== s "k1234") (== date 2026.01.01))})
+;; aggregates over the selection
+(select {from: PI where: (== id K) c: (count i32) by: date}) -- (select {from: PN where: (== id K) c: (count i32) by: date})
+;; no index on any segment: nothing reported
+(do (.idx.uses PN) null) -- null
+(count (select {from: PN where: (== id K)})) -- 30
+(.idx.uses PN) -- {}
+;; null cells in the partitions that are scanned (one plain, one compressed),
+;; and sets long enough to be searched rather than compared one by one
+(set N1 (table [id s] (list (til 1000) (map (fn [x] (format "k%" x)) (til 1000)))))
+(set N2 (table [id s] (list [5 0Nl 7 0Nl 12] ["k5" "" "k7" "" "k12"])))
+(.db.splayed.set "/tmp/rf_test_1422/qi/2026.02.01/t/" (update {from: N1 id: (.idx.hash id) s: (.idx.hash s)}) "/tmp/rf_test_1422/qi/.sym")
+(.db.splayed.set "/tmp/rf_test_1422/qi/2026.02.02/t/" N2 "/tmp/rf_test_1422/qi/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/qi/2026.02.03/t/" N2 "/tmp/rf_test_1422/qi/.sym" {compress: true index: false})
+(.db.splayed.set "/tmp/rf_test_1422/qn/2026.02.01/t/" N1 "/tmp/rf_test_1422/qn/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/qn/2026.02.02/t/" N2 "/tmp/rf_test_1422/qn/.sym" {index: false})
+(.db.splayed.set "/tmp/rf_test_1422/qn/2026.02.03/t/" N2 "/tmp/rf_test_1422/qn/.sym" {index: false})
+(set QI (.db.parted.get "/tmp/rf_test_1422/qi" 't))
+(set QN (.db.parted.get "/tmp/rf_test_1422/qn" 't))
+(do (.idx.uses QI) null) -- null
+(select {from: QI where: (== id 7)}) -- (select {from: QN where: (== id 7)})
+(count (select {from: QI where: (== id 7)})) -- 3
+(at (.idx.uses QI) 'id) -- 1
+(select {from: QI where: (in id [5 7 12 13 14 15 16 17 18 19 20])}) -- (select {from: QN where: (in id [5 7 12 13 14 15 16 17 18 19 20])})
+(at (.idx.uses QI) 'id) -- 1
+(select {from: QI where: (in s ["k5" "k7" "k12"])}) -- (select {from: QN where: (in s ["k5" "k7" "k12"])})
+(select {from: QI where: (== s "k12")}) -- (select {from: QN where: (== s "k12")})
+(at (.idx.uses QI) 's) -- 2
+(select {from: QI where: (== id 0Nl)}) -- (select {from: QN where: (== id 0Nl)})
+(select {from: QI where: (in s ["k5" ""])}) -- (select {from: QN where: (in s ["k5" ""])})

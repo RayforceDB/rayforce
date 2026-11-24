@@ -51,6 +51,7 @@
 #include "ops/hash.h"          /* ray_hash_bytes */
 #include "core/numparse.h"     /* ray_parse_f64, ray_strtod_c, ray_snprintf_c */
 #include "table/sym.h"
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -937,6 +938,7 @@ static ray_t* jp_value(jp_t* jp, bool build) {
     switch (*jp->p) {
     case '{': case '[': {
         if (++jp->depth > jp->max_depth) return jp_fail(jp, "limit", "depth limit of %zu exceeded", jp->max_depth);
+        if (ray_stack_short()) return jp_fail(jp, "limit", "nesting too deep for this thread's stack");
         if (build && !jp_charge(jp, 0)) return NULL;
         ray_t* v = *jp->p == '{' ? jp_object(jp, build) : jp_array(jp, build);
         jp->depth--;
@@ -1164,6 +1166,7 @@ static ray_t* jp_nav(jp_t* jp, const jseg_t* segs, int nseg, int k) {
         return v ? RAY_NULL_OBJ : NULL;
     }
     if (++jp->depth > jp->max_depth) return jp_fail(jp, "limit", "depth limit of %zu exceeded", jp->max_depth);
+    if (ray_stack_short()) return jp_fail(jp, "limit", "nesting too deep for this thread's stack");
     jp->p++;
     ray_t* found = RAY_NULL_OBJ;
     jp_ws(jp);
@@ -1727,6 +1730,10 @@ static bool jw_value(jw_t* w, ray_t* v) {
     }
     if (++w->depth > RAY_READ_DEPTH_CAP) {
         w->err = ray_error("limit", ".json.format: depth limit of %d exceeded", RAY_READ_DEPTH_CAP);
+        return false;
+    }
+    if (ray_stack_short()) {
+        w->err = ray_error("limit", ".json.format: nesting too deep for this thread's stack");
         return false;
     }
     bool ok = true;

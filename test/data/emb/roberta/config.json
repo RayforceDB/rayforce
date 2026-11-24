@@ -1,0 +1,4 @@
+{
+ "model_type": "roberta", "hidden_size": 8, "num_hidden_layers": 2, "num_attention_heads": 2,
+ "intermediate_size": 16, "max_position_embeddings": 16
+}
