@@ -20187,6 +20187,11 @@ static bool fv_holds_private(ray_t* v, int depth) {
     if (!v || RAY_IS_ERR(v) || depth > 64) return false;
     if (v->type == -RAY_SYM) return ray_sym_is_private(v->i64);
     if (v->type == RAY_SYM) {
+        /* A private id is an id of the runtime table.  A cell of another
+         * domain is a position naming one of that domain's strings, which
+         * the table never gives a private id — and translating the cells
+         * would intern the whole vocabulary (ray_sym_domain_runtime_lut). */
+        if (ray_sym_vec_domain(v) != ray_sym_runtime_domain()) return false;
         for (int64_t i = 0; i < v->len; i++)
             if (ray_sym_is_private(sym_cell_runtime_id(v, i))) return true;
         return false;

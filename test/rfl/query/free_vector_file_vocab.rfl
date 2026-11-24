@@ -1,0 +1,15 @@
+;; @requires: posix  (a child process writes a splayed fixture under /tmp)
+;; the check that a query returns no private id reads a column of a file's
+;; symbols as positions of that file: it never interns the file's
+;; vocabulary into the runtime table.  A child process writes the table,
+;; so its 5000 strings are in the file and nowhere in this process.
+(.sys.exec "rm -rf /tmp/rfl_fv_vocab /tmp/rfl_fv_vocab.rfl") -- 0
+(.sys.exec "printf '(.db.splayed.set \"/tmp/rfl_fv_vocab/\" (table [tag v] (list (as (quote SYM) (map (fn [i] (format \"fvvocab%%\" i)) (til 5000))) (%% (til 5000) 7))))\\n(exit 0)\\n' > /tmp/rfl_fv_vocab.rfl && ./rayforce /tmp/rfl_fv_vocab.rfl </dev/null >/dev/null 2>&1") -- 0
+(set FV (.db.splayed.get "/tmp/rfl_fv_vocab/"))
+(at (.sys.mem) 'sym-count)
+(set fvgrow (fn [f] (do (let s0 (at (.sys.mem) 'sym-count)) (let r (f)) (list (< (- (at (.sys.mem) 'sym-count) s0) 100) (count r)))))
+(fvgrow (fn [] (select {from: FV by: v c: (count tag)}))) -- (list true 7)
+(fvgrow (fn [] (select {from: FV tag: tag where: (< v 3)}))) -- (list true 2144)
+(fvgrow (fn [] (select {from: FV by: tag c: (count v)}))) -- (list true 5000)
+(count (distinct (at FV 'tag))) -- 5000
+(.sys.exec "rm -rf /tmp/rfl_fv_vocab /tmp/rfl_fv_vocab.rfl") -- 0
