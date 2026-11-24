@@ -47,8 +47,9 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
-#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
-#include <pthread.h>
+#ifndef RAY_OS_WINDOWS
+#include <pthread.h>   /* pthread_kill -- the .time.sleep cancel test */
+#include <signal.h>
 #endif
 
 /* Forward declarations for lang modules */
@@ -58,6 +59,7 @@
 #include "lang/nfo.h"
 #include "lang/format.h"
 #include "core/runtime.h"   /* ray_error_msg */
+#include "core/timer.h"     /* ray_time_now_ms */
 #include "ops/internal.h"
 #include "app/repl.h"      /* ray_repl_run_file: a script request's sweep */
 #include "ops/ops.h"
@@ -9822,6 +9824,87 @@ static test_result_t test_eval_restricted_let_global(void) {
     PASS();
 }
 
+/* ---- #1489: (.time.sleep ms) ends at a cancel ----
+ * A cancel (the Ctrl-C handler and an IPC cancel both raise it through
+ * ray_request_interrupt) must end a sleep promptly.  As in production the
+ * interrupt is raised by a signal handler on the sleeping thread: another
+ * thread sends SIGUSR2 to it 100 ms into a 30 s sleep (a plain store from
+ * that thread would race with the sleeper's reads).  The bound on the wait
+ * is wide for a loaded machine, and a sleep that ignored the cancel fails
+ * the test at 30 s instead of hanging it.  Windows has no signal to send
+ * a thread; the interrupt is raised from the other thread there. */
+#ifndef RAY_OS_WINDOWS
+static void sleep_interrupt_handler(int sig) { (void)sig; ray_request_interrupt(); }
+static pthread_t g_sleep_main;
+static void* sleep_interrupt_later(void* arg) {
+    (void)arg;
+    ray_sleep_ms(100);
+    pthread_kill(g_sleep_main, SIGUSR2);
+    return NULL;
+}
+#else
+static void sleep_interrupt_later(void* arg) {
+    (void)arg;
+    ray_sleep_ms(100);
+    ray_request_interrupt();
+}
+#endif
+
+static test_result_t test_time_sleep_cancel(void) {
+    ray_clear_interrupt();
+#ifndef RAY_OS_WINDOWS
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sleep_interrupt_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, &old);
+    g_sleep_main = pthread_self();
+    pthread_t tid;
+    TEST_ASSERT_EQ_I(pthread_create(&tid, NULL, sleep_interrupt_later, NULL), 0);
+#else
+    ray_thread_t tid;
+    TEST_ASSERT_EQ_I(ray_thread_create(&tid, sleep_interrupt_later, NULL), RAY_OK);
+#endif
+    int64_t t0 = ray_time_now_ms();
+    ray_t* r = ray_eval_str("(.time.sleep 30000)");
+    int64_t took = ray_time_now_ms() - t0;
+#ifndef RAY_OS_WINDOWS
+    pthread_join(tid, NULL);
+    sigaction(SIGUSR2, &old, NULL);
+#else
+    ray_thread_join(tid);
+#endif
+    ray_clear_interrupt();
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+    TEST_ASSERT_FMT(took < 5000, "the cancel took %lld ms to end the sleep", (long long)took);
+
+    /* a cancel already pending: no wait at all, even for 0 ms */
+    ray_request_interrupt();
+    ray_t* zero = ray_i64(0);
+    r = ray_time_sleep_fn(zero);
+    ray_release(zero);
+    ray_clear_interrupt();
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
+    ray_error_free(r);
+
+    /* the interrupt is cleared: the next sleep runs to its end */
+    r = ray_eval_str("(.time.sleep 1)");
+    TEST_ASSERT_TRUE(r && RAY_IS_NULL(r));
+    PASS();
+}
+
+/* Under -U a sleep is refused: it would stop the single-threaded server
+ * for every connection, as .sys.exec "sleep" would, and that is restricted. */
+static test_result_t test_time_sleep_restricted(void) {
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.time.sleep 0)"));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access("(.time.sleep 100000)"));
+    PASS();
+}
+
 /* A request can be evaluated while server code waits inside a frame (a
  * request a peer pushes back during a sync send).  It binds only in frames
  * it opens itself: a `let` that would land in the waiting code's frame is
@@ -15345,6 +15428,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/table_list_col_f64_promote", test_eval_table_list_col_f64_i64_promote, lang_setup, lang_teardown },
     { "lang/eval/cond_and_branches", test_eval_cond_and_branches, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
+    { "lang/time_sleep_cancel", test_time_sleep_cancel, lang_setup, lang_teardown },
+    { "lang/time_sleep_restricted", test_time_sleep_restricted, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },

@@ -254,6 +254,8 @@ static const ray_sig_entry_t sigs[] = {
     {".emb.hnsw.get", "(.emb.hnsw.get <path: str>)"},
     {".emb.model.get", "(.emb.model.get <dir: str>)"},
     {".emb.model.info", "(.emb.model.info <model: model handle>)"},
+    /* clock */
+    {".time.sleep", "(.time.sleep <ms: int or timespan>)"},
 };
 
 /* Builtins that run other code (callbacks, expressions, queries) or take a

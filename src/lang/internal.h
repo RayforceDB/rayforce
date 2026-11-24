@@ -679,6 +679,7 @@ ray_t* ray_remove_fn(ray_t* dict, ray_t* key);
 ray_t* ray_time_now_fn       (ray_t** args, int64_t n);
 ray_t* ray_time_timer_set_fn (ray_t** args, int64_t n);
 ray_t* ray_time_timer_del_fn (ray_t*  id);
+ray_t* ray_time_sleep_fn     (ray_t*  x);
 ray_t* ray_env_fn(ray_t* x);
 ray_t* ray_internals_fn(ray_t** args, int64_t n);
 ray_t* ray_memstat_fn(ray_t** args, int64_t n);

@@ -5916,10 +5916,13 @@ static void ray_register_builtins(void) {
     /* row — single row from table */
     register_binary("row",       RAY_FN_NONE, ray_row_fn);
 
-    /* .time.* — monotonic clock and scheduled timers */
+    /* .time.* — monotonic clock, scheduled timers and sleep */
     register_vary (".time.now",       RAY_FN_NONE,       ray_time_now_fn);
     register_vary (".time.timer.set", RAY_FN_RESTRICTED, ray_time_timer_set_fn);
     register_unary(".time.timer.del", RAY_FN_RESTRICTED, ray_time_timer_del_fn);
+    /* Restricted: a sleep stops the whole single-threaded server, and a
+     * restricted peer may not occupy it at will (as with .sys.exec). */
+    register_unary(".time.sleep",     RAY_FN_RESTRICTED, ray_time_sleep_fn);
 
     /* env — list all global environment bindings */
     register_unary("env",        RAY_FN_NONE, ray_env_fn);

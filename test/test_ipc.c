@@ -3680,10 +3680,14 @@ static test_result_t test_ipc_cancel_unconfirmed_moved_link(void) {
 #endif
 }
 
-#if defined(__linux__)
+/* POSIX, not Linux alone: the .time.sleep cancel test below runs on any
+ * platform with SIGURG. */
+#if !defined(RAY_OS_WINDOWS)
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <pthread.h>
+#if defined(__linux__)
 typedef struct { int64_t h; long after_ms; bool hold; } oob_later_t;
 static void oob_later_fn(void* arg) {
     oob_later_t* o = (oob_later_t*)arg;
@@ -3691,6 +3695,19 @@ static void oob_later_fn(void* arg) {
     if (o->hold) ray_ipc_hold_cancel_for_test(true);
     (void)ray_ipc_send_cancel(o->h);
     if (o->hold) ray_ipc_hold_cancel_for_test(false);
+}
+#endif
+
+/* Ctrl-C as the client gets it: a signal on the thread waiting for the
+ * reply, whose handler raises the interrupt.  The wait wakes on it and
+ * sends the server the cancel byte itself. */
+static void ctrl_c_handler(int sig) { (void)sig; ray_request_interrupt(); }
+typedef struct { pthread_t to; long after_ms; } ctrl_c_later_t;
+static void* ctrl_c_later_fn(void* arg) {
+    ctrl_c_later_t* c = (ctrl_c_later_t*)arg;
+    sleep_ms(c->after_ms);
+    pthread_kill(c->to, SIGUSR2);
+    return NULL;
 }
 
 /* A ./rayforce server on a free port of its own, through test/serve.sh (as
@@ -3735,6 +3752,69 @@ static void drop(ray_t* r) {
     if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r);
 }
 #endif
+
+/* ---- #1489: a client's cancel ends a (.time.sleep) on the server -------
+ * A sleep is one long request on a single-threaded server: the client's
+ * cancel (the out-of-band byte its Ctrl-C sends) must end it promptly with
+ * "cancel", and the connection answers the next request.  The Ctrl-C is a
+ * signal to this thread, as a terminal's would be, so the client sends the
+ * byte itself, with no second thread touching the handle.  It comes at
+ * once (so it lands while the request is still being sent, before the
+ * client waits: a cancel there was lost until the deadline, the client
+ * looking at the flag only when a signal broke its wait), then 200 ms in,
+ * while the client waits.  The sleep asked for is the longest there is
+ * (its deadline past the clock's range: only a cancel ends it); the
+ * client's wait is bounded at 20 s, so a lost cancel fails the test
+ * instead of hanging it. */
+static test_result_t test_ipc_time_sleep_cancel(void) {
+#if !defined(RAY_OS_WINDOWS)
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    const char* dir = "/tmp/ipc_time_sleep";
+    uint16_t port = serve_server(dir);
+    if (!port) serve_stop(dir);
+    TEST_ASSERT(port, "server started");
+    int64_t h = connect_retry(port);
+    if (h < 0) serve_stop(dir);
+    TEST_ASSERT((h) >= (0), "connected to the spawned server");
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = ctrl_c_handler;   /* no SA_RESTART: the wait must wake */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, &old);
+    static const long delays[] = { 0, 200 };
+    bool cancelled[2];
+    int64_t took[2];
+    for (int i = 0; i < 2; i++) {
+        static ctrl_c_later_t c;
+        c.to = pthread_self();
+        c.after_ms = delays[i];
+        pthread_t tid;
+        pthread_create(&tid, NULL, ctrl_c_later_fn, &c);
+        int64_t t0 = ray_time_now_ms();
+        ray_t* r1 = send_str(h, "(.time.sleep 9223372036854775807)");
+        took[i] = ray_time_now_ms() - t0;
+        pthread_join(tid, NULL);
+        ray_clear_interrupt();
+        cancelled[i] = r1 && RAY_IS_ERR(r1) && strcmp(ray_err_code(r1), "cancel") == 0;
+        drop(r1);
+    }
+    sigaction(SIGUSR2, &old, NULL);
+    ray_t* r2 = send_str(h, "(+ 1 2)");
+    ray_ipc_close(h);
+    serve_stop(dir);
+    bool answered = r2 && !RAY_IS_ERR(r2) && r2->type == -RAY_I64 && r2->i64 == 3;
+    drop(r2);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT_FMT(cancelled[i], "a Ctrl-C %ld ms in ends the sleep with a cancel error", delays[i]);
+        TEST_ASSERT_FMT(took[i] < 5000, "a Ctrl-C %ld ms in took %lld ms to end the sleep",
+                        delays[i], (long long)took[i]);
+    }
+    TEST_ASSERT(answered, "the connection answers the next request");
+    PASS();
+#else
+    SKIP("out-of-band cancel is POSIX-only");
+#endif
+}
 
 /* The same byte mid-query on a moved connection cancels that query (the
  * server's SIGURG takes it), and the link answers the next one.  The
@@ -4131,6 +4211,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_unconfirmed_moved_link", test_ipc_cancel_unconfirmed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_seen_on_self_closed_moved_link", test_ipc_cancel_seen_on_self_closed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_seen_nested_moved_link", test_ipc_cancel_seen_nested_moved_link, ipc_setup, ipc_teardown },
+    { "ipc/time_sleep_cancel",          test_ipc_time_sleep_cancel,              ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },

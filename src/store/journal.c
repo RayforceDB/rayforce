@@ -416,6 +416,8 @@ void ray_journal_info(ray_journal_info_t* out) {
     }
 }
 
+bool ray_journal_in_replay(void) { return g_journal.in_replay; }
+
 /* Where the next frame will be appended: the live log's generation and
  * byte offset.  False when nothing would be written (no journal, or a
  * replay in progress). */

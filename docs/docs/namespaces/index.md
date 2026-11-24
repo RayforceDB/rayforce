@@ -22,7 +22,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.parquet.*`](parquet.md) | Parquet metadata, reads, lazy queries, callbacks, and native imports. |
 | [`.repl.*`](repl.md) | Interactive REPL control — attach the local REPL to a remote server. |
 | [`.sys.*`](sys.md) | System info and shell-style commands: build, info, mem, prof, profile, querylog, gc, exec, listen, timeit, env, cmd. |
-| [`.time.*`](time.md) | Monotonic clock and timer scheduler. |
+| [`.time.*`](time.md) | Monotonic clock, timer scheduler and sleep. |
 
 ## Restricted-mode summary
 
@@ -36,6 +36,6 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`
 - `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset`, `.sys.trust`
-- `.time.timer.set`, `.time.timer.del`
+- `.time.timer.set`, `.time.timer.del`, `.time.sleep`
 
 `.attr.*`, `.col.*`, `.graph.*`, `.idx.*`, `.json.*`, `.mem.*`, and pure read/inspect builtins (`.db.splayed.get`, `.db.parted.get`, `.db.parted.tables`, `.fs.size`, `.fs.list`, `.log.write`, `.log.sync`, `.log.validate`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.profile`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.args`, `.sys.timeit`, `.ipc.handle`, `.time.now`) are always available.
