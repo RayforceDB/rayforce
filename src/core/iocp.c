@@ -36,6 +36,7 @@
 #include "core/poll.h"
 #include "core/mcast.h"
 #include "core/timer.h"
+#include "core/status.h"
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
 
@@ -391,6 +392,7 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
         int64_t wait_end = wait_ms < 0 ? INT64_MAX : ray_time_now_ms() + wait_ms;
         int n = 0;
         bool failed = false;
+        ray_status_wait_begin();
         for (;;) {
             bool std_ready = false;
             for (uint32_t k = 0; k < nstd; k++) {
@@ -427,6 +429,7 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             if (remain == 0) break;              /* deadline reached */
             if (!nstd && slice == remain) break; /* whole wait elapsed */
         }
+        ray_status_wait_end();
 
         if (!failed) {
             for (uint32_t j = 0; j < nfds && n > 0; j++) {

@@ -329,6 +329,11 @@ ray_err_t ray_ipc_tx_limit_set_handle(int64_t handle, int64_t bytes, int64_t fra
 ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out);   /* RAY_ERR_IO: not a live connection */
 int64_t   ray_ipc_tx_hwm_bytes(ray_poll_t* poll);
 
+/* The live IPC connections of the active poll, one row each, for
+ * `.ipc.conns`: handle, peer ("host:port"), inbound, transport, since,
+ * requests, bytes_in, bytes_out, queued_bytes, last_active. */
+ray_t*    ray_ipc_conns_table(void);
+
 /* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE
  * set, returning a 2-element list [captured_str, result] where
  * captured_str is whatever the server's eval wrote to stdout/stderr

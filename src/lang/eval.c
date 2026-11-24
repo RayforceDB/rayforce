@@ -6147,6 +6147,8 @@ static void ray_register_builtins(void) {
     /* Current connection handle inside any `.ipc.on.*` hook, -1 otherwise.
      * Variadic for the `(.ipc.handle)` / `(.ipc.handle 0)` convention. */
     register_vary(  ".ipc.handle", RAY_FN_NONE,       ray_ipc_handle_fn);
+    /* Every live connection, one row each. */
+    register_vary(  ".ipc.conns",  RAY_FN_NONE,       ray_ipc_conns_fn);
     /* True while evaluating inside an auto-journaled IPC request, where
      * the request itself is the journal entry and `.log.write` refuses. */
     register_vary(  ".ipc.auto_journal_eval", RAY_FN_NONE, ray_ipc_auto_journal_eval_fn);
@@ -6247,6 +6249,11 @@ static void ray_register_builtins(void) {
     register_vary("modify",     RAY_FN_RESTRICTED, ray_modify_fn);
     register_vary("pivot",      RAY_FN_NONE, ray_pivot_fn);
     register_vary(".sys.info",  RAY_FN_NONE, ray_sysinfo_fn);
+    /* What the process is doing: read-only views of the status block
+     * (core/status.h) and of the operating system's count of it. */
+    register_vary(".sys.loop",     RAY_FN_NONE, ray_sys_loop_fn);
+    register_vary(".sys.activity", RAY_FN_NONE, ray_sys_activity_fn);
+    register_vary(".sys.cpu",      RAY_FN_NONE, ray_sys_cpu_fn);
     register_unary("sym-name",   RAY_FN_NONE, ray_sym_name_fn);
     register_binary("unify",     RAY_FN_NONE, ray_unify_fn);
     register_binary("xrank",     RAY_FN_NONE, ray_xrank_fn);

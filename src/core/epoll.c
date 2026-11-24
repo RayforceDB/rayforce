@@ -30,6 +30,7 @@
 #include "core/poll.h"
 #include "core/mcast.h"
 #include "core/timer.h"
+#include "core/status.h"
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
 #include <sys/epoll.h>
@@ -357,6 +358,7 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             if (w >= 0 && (wait_ms < 0 || w < wait_ms)) wait_ms = w;
         }
 
+        ray_status_wait_begin();
         int n = epoll_wait((int)poll->fd, events, RAY_POLL_MAX_EVENTS, wait_ms);
         /* errno of the wait, kept across xport_woke: that call makes system calls
          * of its own and leaves its errno behind.  A process stopped and continued
@@ -365,6 +367,7 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
          * server reading its script from a pipe took that for an exit request and
          * ended with status 0. */
         int wait_errno = errno;
+        ray_status_wait_end();
         if (poll->n_xport > 0) xport_woke(poll);
         if (n < 0) {
             if (wait_errno == EINTR) continue;

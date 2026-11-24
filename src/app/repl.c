@@ -46,6 +46,7 @@
 #include "ops/ops.h"
 #include "core/profile.h"
 #include "core/qlog.h"
+#include "core/status.h"
 #include "table/sym.h"
 #include <inttypes.h>
 #include <stdio.h>
@@ -968,6 +969,8 @@ static void eval_and_print(ray_term_t* term, const char* input,
         ray_profile_span_start("top-level");
     }
 
+    ray_status_begin(RAY_WORK_REPL, -1, 0, input, strlen(input));
+
     /* Query-statistics ring: bracket the whole parse+eval+materialize so the
      * logged duration is the time to answer the query.  No-op when disabled. */
     ray_qlog_ctx_t qc;
@@ -1048,6 +1051,7 @@ static void eval_and_print(ray_term_t* term, const char* input,
      * in. */
     ray_heap_decay();
     ray_heap_note_activity();
+    ray_status_end();
 }
 
 /* `type_label` and `cmd_match` were inlined into the previous bespoke

@@ -1,0 +1,104 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; .sys.loop, .sys.activity, .sys.cpu and .ipc.conns read from a live server,
+;; where there is a loop, a request and a connection to describe; and from a
+;; restricted (-U) one, which may read them too.
+
+(.sys.exec "rm -rf /tmp/rfl_introspect")
+(.sys.exec "test/serve.sh /tmp/rfl_introspect") -- 0
+(set h (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_introspect/port")))))
+(>= h 0) -- true
+
+;; ── .sys.activity names the request that asks ───────────────────────
+(set a (.ipc.send h "(.sys.activity)"))
+(get a 'state) -- 'ipc
+(get a 'query) -- "(.sys.activity)"
+(>= (get a 'handle) 0)        -- true
+(nil? (get a 'since))         -- false
+(>= (get a 'elapsed-ms) 0.0)  -- true
+(get a 'conns-in)  -- 1
+(get a 'conns-out) -- 0
+;; Text longer than 256 bytes is cut there.
+(count (get (.ipc.send h (format "(do \"%\" (.sys.activity))" (take "x" 300))) 'query)) -- 256
+;; An expression has no text unless something reads it (the query log, a
+;; status stream): formatting it costs an allocation per request.
+(get (.ipc.send h (list '.sys.activity)) 'state) -- 'ipc
+(get (.ipc.send h (list '.sys.activity)) 'query) -- ""
+(.ipc.send h "(.sys.querylog.enable 1)") -- 1
+(get (.ipc.send h (list '.sys.activity)) 'query) -- "[.sys.activity]"
+(.ipc.send h "(.sys.querylog.enable 0)") -- 0
+
+;; ── .sys.loop: the loop has waited and worked ───────────────────────
+(set l (.ipc.send h "(.sys.loop)"))
+(> (get l 'iterations) 0) -- true
+(> (get l 'busy-ns) 0)    -- true
+(> (get l 'idle-ns) 0)    -- true
+(> (get l 'work-count) 0) -- true
+(> (get l 'work-max-ns) 0) -- true
+(== (get l 'total-ns) (+ (get l 'busy-ns) (get l 'idle-ns))) -- true
+(and (> (get l 'util) 0.0) (< (get l 'util) 1.0)) -- true
+;; A request that takes a while shows as work, and as the longest so far.
+(.ipc.send h "(.time.sleep 300)")
+(set m (.ipc.send h "(.sys.loop)"))
+(>= (- (get m 'busy-ns) (get l 'busy-ns)) 250000000) -- true
+(>= (get m 'work-max-ns) 250000000)                  -- true
+(> (get m 'util-1s) 0.2)                             -- true
+(> (get m 'work-count) (get l 'work-count))          -- true
+
+;; ── .sys.cpu ─────────────────────────────────────────────────────────
+(set c (.ipc.send h "(.sys.cpu)"))
+(> (+ (get c 'user-ns) (get c 'system-ns)) 0) -- true
+(> (get c 'rss-bytes) 0)                      -- true
+(>= (get c 'rss-peak-bytes) 0)                -- true
+(>= (get c 'threads) 1)                       -- true
+(> (get c 'cores) 0)                          -- true
+
+;; ── .ipc.conns: the server's row for this connection ────────────────
+(set t (.ipc.send h "(.ipc.conns)"))
+(count t) -- 1
+(first (at t 'inbound))   -- true
+(first (at t 'transport)) -- 'tcp
+(first (at t 'handle))    -- (get a 'handle)
+(like (first (at t 'peer)) "127.0.0.1:*") -- true
+(> (first (at t 'requests)) 5)            -- true
+(> (first (at t 'bytes_in)) 0)            -- true
+(> (first (at t 'bytes_out)) 0)           -- true
+(first (at t 'queued_bytes))              -- 0
+(>= (first (at t 'last_active)) (first (at t 'since))) -- true
+;; Each request is counted, with the bytes of its frame.
+(set t2 (.ipc.send h "(.ipc.conns)"))
+(- (first (at t2 'requests)) (first (at t 'requests))) -- 1
+;; (16 bytes of header, then the request's 12 characters as a serialized string)
+(> (- (first (at t2 'bytes_in)) (first (at t 'bytes_in))) 28) -- true
+(> (first (at t2 'bytes_out)) (first (at t 'bytes_out))) -- true
+
+;; The client's own row: outbound, nothing asked of it.
+(set mine (select {from: (.ipc.conns) where: (== handle h)}))
+(count mine) -- 1
+(first (at mine 'inbound))  -- false
+(first (at mine 'requests)) -- 0
+(> (first (at mine 'bytes_out)) 0) -- true
+(> (first (at mine 'bytes_in)) 0)  -- true
+(like (first (at mine 'peer)) "127.0.0.1:*") -- true
+
+;; A second connection is a second row, gone when it closes.
+(set h2 (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rfl_introspect/port")))))
+(count (.ipc.send h "(.ipc.conns)")) -- 2
+(get (.ipc.send h "(.sys.activity)") 'conns-in) -- 2
+(.ipc.close h2)
+(.ipc.send h "(.time.sleep 50)")
+(count (.ipc.send h "(.ipc.conns)")) -- 1
+
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rfl_introspect") -- 0
+
+;; ── a restricted server answers all four ────────────────────────────
+(.sys.exec "test/serve.sh --listen /tmp/rfl_introspect/r -U pw") -- 0
+(set r (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rfl_introspect/r/port")) ":u:pw"))))
+(.ipc.send r "(.sys.exec \"true\")") !- access
+(type (.ipc.send r "(.sys.loop)"))  -- 'DICT
+(type (.ipc.send r "(.sys.cpu)"))   -- 'DICT
+(type (.ipc.send r "(.ipc.conns)")) -- 'TABLE
+(get (.ipc.send r "(.sys.activity)") 'state) -- 'ipc
+(.ipc.close r)
+(.sys.exec "test/serve.sh --stop /tmp/rfl_introspect/r") -- 0
+(.sys.exec "rm -rf /tmp/rfl_introspect")

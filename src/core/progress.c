@@ -255,6 +255,20 @@ void ray_progress_span_end(void) {
     g_span_len   = 0;
 }
 
+/* What the running query last reported, for `.sys.activity`.  False when
+ * nothing is tracked: no callback is registered (a server without a
+ * terminal), or the query has reported nothing yet.  Main thread only. */
+bool ray_progress_current(ray_progress_t* out) {
+    if (!g_cb || g_start_ns == 0) return false;
+    *out = (ray_progress_t){
+        .op_name    = g_op_name ? g_op_name : "",
+        .phase      = g_phase ? g_phase : "",
+        .rows_done  = g_rows_done,
+        .rows_total = g_rows_total,
+    };
+    return true;
+}
+
 void ray_progress_end(void) {
     ray_progress_span_end();
     if (!g_cb) {

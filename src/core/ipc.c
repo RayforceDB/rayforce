@@ -50,6 +50,8 @@
 #else
   #include <unistd.h>
   #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>   /* inet_ntop: the peer column of .ipc.conns */
 #endif
 
 #if defined(__linux__)
@@ -72,6 +74,7 @@
 #include "lang/eval.h"
 #include "lang/format.h"   /* ray_fmt — query text for the stats log */
 #include "core/qlog.h"     /* query-statistics ring */
+#include "core/status.h"   /* what the main thread is running, for readers off it */
 #include "lang/env.h"
 #include "lang/internal.h"
 #include "table/sym.h"
@@ -390,10 +393,12 @@ static void hook_call_lifecycle(ray_poll_t* poll, int idx, int64_t handle) {
     int64_t prev = ipc_ctx_handle();
     ray_poll_t* prev_poll = ipc_ctx_poll();
     ipc_ctx_set(handle, poll ? poll : prev_poll);
+    const char* name = (idx == IPC_HOOK_OPEN) ? ".ipc.on.open" : ".ipc.on.close";
+    ray_status_begin(RAY_WORK_HOOK, handle, 0, name, strlen(name));
     ray_t* r = call_fn1(fn, arg);
+    ray_status_end();
     ipc_ctx_set(prev, prev_poll);
     if (r && RAY_IS_ERR(r)) {
-        const char* name = (idx == IPC_HOOK_OPEN) ? ".ipc.on.open" : ".ipc.on.close";
         fprintf(stderr, "ipc: %s hook raised an error (handle=%lld)\n",
                 name, (long long)handle);
     }
@@ -439,7 +444,9 @@ static int hook_call_auth(ray_poll_t* poll, int64_t handle,
     int64_t prev = ipc_ctx_handle();
     ray_poll_t* prev_poll = ipc_ctx_poll();
     ipc_ctx_set(handle, poll ? poll : prev_poll);
+    ray_status_begin(RAY_WORK_HOOK, handle, 0, ".ipc.on.auth", 12);
     ray_t* r = call_fn2(fn, u, p);
+    ray_status_end();
     ipc_ctx_set(prev, prev_poll);
     ray_release(u);
     ray_release(p);
@@ -579,6 +586,8 @@ static int conn_tx_drain_blocking(ray_poll_t* poll, ray_selector_t* sel,
     return 0;
 }
 
+static void conn_sent(ray_selector_t* sel, int64_t bytes);
+
 static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
                           uint8_t extra_flags)
 {
@@ -678,6 +687,7 @@ static void send_response(ray_selector_t* sel, ray_t* result, size_t threshold,
     };
     if (conn_send_all(sel, (const uint8_t*)&hdr, sizeof(hdr), -1) == (int64_t)sizeof(hdr))
         conn_send_all(sel, send_buf, send_len, -1);
+    conn_sent(sel, (int64_t)(sizeof(hdr) + send_len));
 
     ray_free_raw(send_buf);
     if (payload) ray_free_raw(payload);
@@ -825,12 +835,16 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
      * is formatted back to source.  Only when logging is on. */
     char   qsrc[RAY_QLOG_QUERY_MAX];
     size_t qsrc_len = 0;
-    if (qc.measure.active && msg && !RAY_IS_ERR(msg)) {
+    /* The status block takes the same text.  A string is copied whoever
+     * reads; an expression is formatted only for a reader that is there
+     * (the query log, a status stream): formatting allocates. */
+    bool st_text = ray_status_wants_text();
+    if ((qc.measure.active || st_text) && msg && !RAY_IS_ERR(msg)) {
         if (msg->type == -RAY_STR) {
             qsrc_len = ray_str_len(msg);
             if (qsrc_len > sizeof(qsrc)) qsrc_len = sizeof(qsrc);
             memcpy(qsrc, ray_str_ptr(msg), qsrc_len);
-        } else {
+        } else if (qc.measure.active || ray_status_watched()) {
             ray_t* s = ray_fmt(msg, 0);
             if (s && !RAY_IS_ERR(s)) {
                 qsrc_len = ray_str_len(s);
@@ -840,6 +854,7 @@ static ray_t* eval_payload_core(uint8_t* payload, size_t payload_len,
             if (s) ray_release(s);
         }
     }
+    if (st_text) ray_status_set_text(qsrc, qsrc_len);
 
     ray_t* result = NULL;
     bool prev_auto_journal_eval = ray_ipc_set_auto_journal_eval(auto_journaled ? true : g_auto_journal_eval);
@@ -1091,7 +1106,32 @@ typedef struct {
      * and the request number it carries.  At most one is outstanding. */
     bool             cancel_unconfirmed;
     uint8_t          cancel_tag;
+    /* For .ipc.conns: when the connection was established and when a frame
+     * last went either way (RAY_TIMESTAMPs), the requests it sent that
+     * were evaluated here, and the bytes of the frames received and sent
+     * or queued (header and payload; not the greeting, nor an upgrade's
+     * records). */
+    int64_t          since_ts;
+    int64_t          last_ts;
+    int64_t          requests;
+    int64_t          bytes_in;
+    int64_t          bytes_out;
 } ray_ipc_conn_data_t;
+
+/* The connection is established: greeted, and authenticated if it had to be. */
+static void conn_established(ray_ipc_conn_data_t* cd)
+{
+    cd->since_ts = cd->last_ts = ray_timestamp_now_ns();
+    ray_status_conn_opened(cd->listener_id >= 0);
+}
+
+static void conn_sent(ray_selector_t* sel, int64_t bytes)
+{
+    ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
+    if (!cd) return;
+    cd->bytes_out += bytes;
+    cd->last_ts = ray_timestamp_now_ns();
+}
 
 #ifdef RAY_IPC_XPORT
 static void rdma_pending_forget(ray_ipc_conn_data_t* cd);
@@ -1414,6 +1454,7 @@ static ray_t* ipc_read_handshake(ray_poll_t* poll, ray_selector_t* sel)
     }
 
     cd->phase = RAY_IPC_PHASE_HEADER;
+    conn_established(cd);
     sel->rx.read_fn = ipc_read_header;
     ray_poll_rx_request(poll, sel, sizeof(ray_ipc_header_t));
     /* No-auth path: connection is now fully ready for inbound messages.
@@ -1472,6 +1513,7 @@ static ray_t* ipc_read_creds(ray_poll_t* poll, ray_selector_t* sel)
     }
 
     cd->phase = RAY_IPC_PHASE_HEADER;
+    conn_established(cd);
     sel->rx.read_fn = ipc_read_header;
     ray_poll_rx_request(poll, sel, sizeof(ray_ipc_header_t));
     /* Auth path: fully handshaked and authed — connection is now ready
@@ -1528,6 +1570,9 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     cd->phase = RAY_IPC_PHASE_HEADER;
     sel->rx.read_fn = ipc_read_header;
     ray_poll_rx_request(poll, sel, sizeof(ray_ipc_header_t));
+    int64_t now_ts = ray_timestamp_now_ns();
+    cd->last_ts   = now_ts;
+    cd->bytes_in += (int64_t)sizeof(hdr) + hdr.size;
 
     /* An upgrade record: the answer a client of ours waits for, or a
      * client's ask that we answer.  Never evaluated, never journaled. */
@@ -1580,6 +1625,8 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         return NULL;
     }
 
+    cd->requests++;
+    ray_status_begin(RAY_WORK_IPC, id, now_ts, NULL, 0);
     ray_restrict_save_t prev_restricted;
     ray_eval_restrict_enter(cd->restricted, &prev_restricted);
 
@@ -1680,6 +1727,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     ray_heap_note_activity();
     ray_enccol_cache_trim();
     ray_heap_relieve();
+    ray_status_end();
 
     return NULL;
 }
@@ -1706,6 +1754,7 @@ static void ipc_on_close(ray_poll_t* poll, ray_selector_t* sel)
         ray_ipc_conn_data_t* cd = (ray_ipc_conn_data_t*)sel->data;
         if (cd->phase == RAY_IPC_PHASE_HEADER ||
             cd->phase == RAY_IPC_PHASE_PAYLOAD) {
+            ray_status_conn_closed(cd->listener_id >= 0);
             hook_call_lifecycle(poll, IPC_HOOK_CLOSE, sel->id);
         }
         /* A RESP deposited for a sync wait that never consumed it
@@ -2688,6 +2737,7 @@ static int64_t conn_write_msg(ray_selector_t* sel, ray_t* msg, uint8_t msgtype,
     if (!frame) return -1;
     int64_t rc = conn_send_all(sel, frame->data, (size_t)frame->size,
                                deadline_ms);
+    if (rc >= 0) conn_sent(sel, frame->size);
     ray_poll_frame_release(frame);
     return rc < 0 ? -1 : 0;
 }
@@ -2869,6 +2919,7 @@ int64_t ray_ipc_connect_with(const char* host, uint16_t port,
         ray_sys_free(cd);
         return -1;
     }
+    conn_established(cd);
     ray_selector_t* ns = ray_poll_get(poll, id);
     if (ns) ray_poll_rx_request(poll, ns, sizeof(ray_ipc_header_t));
 
@@ -3034,6 +3085,7 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
     int64_t wrc = conn_tx_drain_blocking(poll, sel, deadline);
     if (wrc >= 0)
         wrc = conn_send_all(sel, frame->data, (size_t)frame->size, deadline);
+    if (wrc >= 0) conn_sent(sel, frame->size);
     ray_poll_frame_release(frame);
     if (wrc < 0) {
         int e = errno;
@@ -3281,12 +3333,14 @@ ray_err_t ray_ipc_try_send_frame(int64_t handle, ray_poll_frame_t* frame)
 
     if (rc == 0) {
         ray_poll_buf_free(node);
+        conn_sent(sel, frame->size);
     } else if (rc > 0) {
         if (conn_tx_append(poll, sel, node) < 0) {
             ray_poll_buf_free(node);
             return RAY_ERR_IO;
         }
         ray_poll_tx_request(poll, sel);
+        conn_sent(sel, frame->size);
     } else {
         ray_poll_buf_free(node);
     }
@@ -3506,4 +3560,94 @@ ray_t* ray_ipc_parse_open_opts_full(ray_t* arg, ray_ipc_open_opts_t* o)
         }
     }
     return NULL;
+}
+
+/* ===== .ipc.conns ===== */
+
+/* "host:port" of the peer, or "" when the socket cannot say. */
+static size_t conn_peer_name(ray_sock_t fd, char* out, size_t cap)
+{
+    out[0] = '\0';
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr*)&ss, &sl) != 0) return 0;
+    char host[INET6_ADDRSTRLEN];
+    if (ss.ss_family == AF_INET) {
+        const struct sockaddr_in* a = (const struct sockaddr_in*)&ss;
+        if (!inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host))) return 0;
+        return (size_t)snprintf(out, cap, "%s:%u", host, (unsigned)ntohs(a->sin_port));
+    }
+    if (ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6* a = (const struct sockaddr_in6*)&ss;
+        if (!inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof(host))) return 0;
+        return (size_t)snprintf(out, cap, "[%s]:%u", host, (unsigned)ntohs(a->sin6_port));
+    }
+    return 0;
+}
+
+ray_t* ray_ipc_conns_table(void)
+{
+    enum { C_HANDLE, C_PEER, C_INBOUND, C_XPORT, C_SINCE, C_REQS, C_IN, C_OUT, C_QUEUED, C_LAST, NCOLS };
+    static const char* const names[NCOLS] = {
+        "handle", "peer", "inbound", "transport", "since", "requests",
+        "bytes_in", "bytes_out", "queued_bytes", "last_active" };
+    static const int8_t types[NCOLS] = {
+        RAY_I64, RAY_STR, RAY_BOOL, RAY_SYM, RAY_TIMESTAMP, RAY_I64,
+        RAY_I64, RAY_I64, RAY_I64, RAY_TIMESTAMP };
+
+    ray_poll_t* poll = ray_ipc_active_poll();
+    int64_t n = 0;
+    for (uint32_t i = 0; poll && i < poll->n_sels; i++)
+        if (conn_resolve(NULL, (int64_t)i)) n++;
+
+    ray_t* col[NCOLS];
+    for (int c = 0; c < NCOLS; c++) {
+        col[c] = ray_vec_new(types[c], n);
+        if (!col[c] || RAY_IS_ERR(col[c])) {
+            for (int j = 0; j < c; j++) ray_release(col[j]);
+            return ray_error("oom", ".ipc.conns: column alloc");
+        }
+    }
+    int64_t at = 0;
+    for (uint32_t i = 0; poll && i < poll->n_sels && at < n; i++) {
+        ray_selector_t* sel = conn_resolve(NULL, (int64_t)i);
+        if (!sel) continue;
+        const ray_ipc_conn_data_t* cd = (const ray_ipc_conn_data_t*)sel->data;
+        char peer[80];
+        size_t plen = conn_peer_name((ray_sock_t)sel->fd, peer, sizeof(peer));
+        const char* tn = ray_ipc_xport_kind_name(sel->xport ? sel->xport->kind : RAY_XPORT_TCP);
+        if (!tn) tn = "tcp";
+        ((int64_t*)ray_data(col[C_HANDLE]))[at]  = sel->id;
+        ((uint8_t*)ray_data(col[C_INBOUND]))[at] = cd->listener_id >= 0;
+        ((int64_t*)ray_data(col[C_XPORT]))[at]   = ray_sym_intern(tn, strlen(tn));
+        ((int64_t*)ray_data(col[C_SINCE]))[at]   = cd->since_ts;
+        ((int64_t*)ray_data(col[C_REQS]))[at]    = cd->requests;
+        ((int64_t*)ray_data(col[C_IN]))[at]      = cd->bytes_in;
+        ((int64_t*)ray_data(col[C_OUT]))[at]     = cd->bytes_out;
+        ((int64_t*)ray_data(col[C_QUEUED]))[at]  = conn_tx_pending(sel, NULL);
+        ((int64_t*)ray_data(col[C_LAST]))[at]    = cd->last_ts;
+        col[C_PEER] = ray_str_vec_append(col[C_PEER], peer, plen);
+        if (!col[C_PEER] || RAY_IS_ERR(col[C_PEER])) {
+            for (int j = 0; j < NCOLS; j++) if (j != C_PEER) ray_release(col[j]);
+            return col[C_PEER] ? col[C_PEER] : ray_error("oom", ".ipc.conns: peer column");
+        }
+        at++;
+    }
+    for (int c = 0; c < NCOLS; c++)
+        if (c != C_PEER) col[c]->len = at;
+
+    ray_t* tbl = ray_table_new(NCOLS);
+    if (!tbl || RAY_IS_ERR(tbl)) {
+        for (int c = 0; c < NCOLS; c++) ray_release(col[c]);
+        return tbl ? tbl : ray_error("oom", ".ipc.conns: table");
+    }
+    for (int c = 0; c < NCOLS; c++) {
+        tbl = ray_table_add_col(tbl, ray_sym_intern(names[c], strlen(names[c])), col[c]);
+        ray_release(col[c]);
+        if (RAY_IS_ERR(tbl)) {
+            for (int j = c + 1; j < NCOLS; j++) ray_release(col[j]);
+            return tbl;
+        }
+    }
+    return tbl;
 }

@@ -29,6 +29,7 @@
 #endif
 
 #include "core/timer.h"
+#include "core/status.h"
 #include "core/runtime.h"   /* ray_error_msg */
 #include "lang/internal.h"
 #include "mem/sys.h"
@@ -221,7 +222,9 @@ uint32_t ray_timers_fire_expired(ray_timers_t* t) {
         ray_raise_clear();
         ray_timer_frame_t frame = { timer, false, t->firing };
         t->firing = &frame;
+        ray_status_begin(RAY_WORK_TIMER, timer->id, 0, NULL, 0);
         ray_t* result = call_fn1(timer->fn, arg);
+        ray_status_end();
         /* The callback may have re-entered this function; every nested
          * frame has unwound by now, so t->firing is &frame again. */
         t->firing = frame.prev;

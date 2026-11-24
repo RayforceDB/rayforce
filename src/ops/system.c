@@ -40,6 +40,7 @@
 #include "core/runtime.h"  /* __VM — (return x) parks its value on the VM */
 #include "core/qmeasure.h"  /* shared per-query measurement lifecycle */
 #include "core/qlog.h"      /* g_qlog — (.sys.querylog) */
+#include "core/status.h"    /* (.sys.loop), (.sys.activity), (.sys.cpu) */
 #include "lang/callprof.h"  /* (.sys.profile) */
 #include "store/serde.h"
 #include "store/enccol.h"
@@ -1840,6 +1841,133 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
     return ray_dict_new(keys, vals);
 }
 
+/* A dict from parallel names and values.  Takes the values: each is
+ * released here, on every path. */
+static ray_t* sys_dict(const char* const* names, ray_t** v, int n) {
+    ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, n);
+    ray_t* vals = ray_list_new(n);
+    bool ok = keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals);
+    for (int i = 0; i < n; i++) {
+        if (ok && (!v[i] || RAY_IS_ERR(v[i]))) ok = false;
+        if (ok) {
+            int64_t k = ray_sym_intern(names[i], strlen(names[i]));
+            keys = ray_vec_append(keys, &k);
+            vals = ray_list_append(vals, v[i]);
+            ok = !RAY_IS_ERR(keys) && !RAY_IS_ERR(vals);
+        }
+        if (v[i] && !RAY_IS_ERR(v[i])) ray_release(v[i]);
+    }
+    if (ok) return ray_dict_new(keys, vals);
+    if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+    if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+    return ray_error("oom", NULL);
+}
+
+/* (.sys.loop) -- how the poll loop has spent its time: working (reading
+ * requests, evaluating them, firing timers) or waiting for something to
+ * do.  The clock starts at the loop's first wait.
+ *   busy-ns, idle-ns, total-ns   cumulative, total = busy + idle
+ *   util                         busy / total, 0..1
+ *   util-1s, util-10s, util-60s  the same over the last 1, 10, 60 seconds
+ *   iterations                   waits the loop has made
+ *   work-count                   requests, REPL lines, timer callbacks and
+ *                                connection hooks finished
+ *   work-max-ns                  the longest of them
+ *   streams                      status streams being served */
+ray_t* ray_sys_loop_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.loop takes no arguments");
+    ray_status_snap_t s;
+    ray_status_read(&s);
+    static const char* const names[] = {
+        "busy-ns", "idle-ns", "total-ns", "util", "util-1s", "util-10s", "util-60s",
+        "iterations", "work-count", "work-max-ns", "streams" };
+    ray_t* v[] = {
+        make_i64((int64_t)s.busy_ns),
+        make_i64((int64_t)(s.total_ns - s.busy_ns)),
+        make_i64((int64_t)s.total_ns),
+        ray_f64(s.total_ns ? (double)s.busy_ns / (double)s.total_ns : 0.0),
+        ray_f64(ray_status_utilisation(1000000000LL)),
+        ray_f64(ray_status_utilisation(10000000000LL)),
+        ray_f64(ray_status_utilisation(60000000000LL)),
+        make_i64((int64_t)s.iterations),
+        make_i64((int64_t)s.work_count),
+        make_i64((int64_t)s.work_max_ns),
+        make_i64((int64_t)s.streams),
+    };
+    return sys_dict(names, v, (int)(sizeof(v) / sizeof(v[0])));
+}
+
+/* (.sys.activity) -- what the main thread is running.  Called from a
+ * request it describes that request; it is what a status stream sends to
+ * a reader outside while the request runs.
+ *   state       `idle`, `ipc` (a request from a connection), `repl`,
+ *               `timer` or `hook` (.ipc.on.open/close/auth outside a request)
+ *   handle      the connection (ipc, hook) or the timer's id; -1 otherwise
+ *   since       when it started; null when idle
+ *   elapsed-ms  for how long
+ *   query       its source text, truncated to 256 bytes
+ *   conns-in, conns-out   live IPC connections accepted here, opened from here
+ *   op, phase, rows-done, rows-total   the progress the running query last
+ *               reported, where progress is tracked (a terminal session);
+ *               empty and 0 otherwise
+ * Work started inside other work (a request served while another waits
+ * for a reply) is not shown: the outermost is. */
+ray_t* ray_sys_activity_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.activity takes no arguments");
+    ray_status_snap_t s;
+    ray_status_read(&s);
+    static const char* const states[] = { "idle", "ipc", "repl", "timer", "hook" };
+    const char* st = states[s.kind <= RAY_WORK_HOOK ? s.kind : 0];
+    ray_progress_t pr = { .op_name = "", .phase = "" };
+    (void)ray_progress_current(&pr);
+    static const char* const names[] = {
+        "state", "handle", "since", "elapsed-ms", "query", "conns-in", "conns-out",
+        "op", "phase", "rows-done", "rows-total" };
+    ray_t* v[] = {
+        ray_sym(ray_sym_intern(st, strlen(st))),
+        make_i64(s.handle),
+        s.since_ts ? ray_timestamp(s.since_ts) : ray_typed_null(-RAY_TIMESTAMP),
+        ray_f64(s.since_mono ? (double)(ray_time_now_ns() - s.since_mono) / 1e6 : 0.0),
+        ray_str(s.query, s.query_len),
+        make_i64((int64_t)s.conns_in),
+        make_i64((int64_t)s.conns_out),
+        ray_str(pr.op_name, strlen(pr.op_name)),
+        ray_str(pr.phase, strlen(pr.phase)),
+        make_i64((int64_t)pr.rows_done),
+        make_i64((int64_t)pr.rows_total),
+    };
+    return sys_dict(names, v, (int)(sizeof(v) / sizeof(v[0])));
+}
+
+/* (.sys.cpu) -- the process as the operating system counts it.
+ *   user-ns, system-ns   CPU time used, in user and in kernel mode
+ *   rss-bytes            resident memory now
+ *   rss-peak-bytes       the most it has been
+ *   threads              threads of the process
+ *   cores                CPUs it may run on (as .sys.info)
+ *   cpu-quota            its cgroup CPU quota in millicpus; 0 when none
+ * A figure the platform does not give reads 0. */
+ray_t* ray_sys_cpu_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".sys.cpu takes no arguments");
+    ray_proc_usage_t u;
+    ray_os_proc_usage(&u);
+    static const char* const names[] = {
+        "user-ns", "system-ns", "rss-bytes", "rss-peak-bytes", "threads", "cores", "cpu-quota" };
+    ray_t* v[] = {
+        make_i64((int64_t)u.cpu_user_ns),
+        make_i64((int64_t)u.cpu_sys_ns),
+        make_i64((int64_t)u.rss_bytes),
+        make_i64((int64_t)u.rss_peak_bytes),
+        make_i64((int64_t)u.threads),
+        make_i64((int64_t)ray_cpu_set_count()),
+        make_i64(ray_os_cgroup_cpu_quota()),
+    };
+    return sys_dict(names, v, (int)(sizeof(v) / sizeof(v[0])));
+}
+
 /* Parse argv into the .sys.args dict.  Recognized launcher flags become
  * typed top-level entries (i64 / bool / str); everything after `--` becomes
  * a str->str `user` subdict via `-k v` / `--k v` pairing.  Auth passwords
@@ -2211,6 +2339,15 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
         if (ray_ipc_tx_info(h, &ti) == RAY_OK) return ipc_tx_info_dict(h, &ti);
     }
     return make_i64(ray_ipc_current_handle());
+}
+
+/* (.ipc.conns) -- one row per live IPC connection, inbound and outbound:
+ * handle, peer, inbound, transport, since, requests, bytes_in, bytes_out,
+ * queued_bytes, last_active (ray_ipc_conns_table). */
+ray_t* ray_ipc_conns_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("arity", ".ipc.conns takes no arguments");
+    return ray_ipc_conns_table();
 }
 
 /* `(.ipc.auto_journal_eval)` answers true while the current evaluation

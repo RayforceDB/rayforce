@@ -23,14 +23,15 @@
 (type .fs) -- 'DICT
 (type .ipc) -- 'DICT
 (type .csv) -- 'DICT
-(count .sys) -- 15
-;; gc, exec, build, mem, info, cmd, timeit, listen, trust, env, args, prof, querylog, join, profile
+(count .sys) -- 18
+;; gc, exec, build, mem, info, cmd, timeit, listen, trust, env, args, prof, querylog, join, profile,
+;; loop, activity, cpu
 (count .os) -- 2
 ;; getenv, setenv
 (count .fs) -- 2
 ;; size, list
-(count .ipc) -- 8
-;; open, close, send, post, handle, auto_journal_eval, txlimit, transport
+(count .ipc) -- 9
+;; open, close, send, post, handle, auto_journal_eval, txlimit, transport, conns
 ;; outside an auto-journaled IPC request the scope predicate is false
 (.ipc.auto_journal_eval) -- false
 (count .log) -- 12

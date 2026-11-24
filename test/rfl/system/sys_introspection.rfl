@@ -1,0 +1,59 @@
+;; .sys.loop, .sys.activity, .sys.cpu and .ipc.conns: read-only views of what
+;; the process is doing.  The values are machine- and run-specific, so the
+;; assertions are on shape and on the invariants between the fields.
+;; sys_introspection_ipc.rfl reads them from a live server.
+
+;; ────────────── .sys.loop ──────────────
+(type (.sys.loop)) -- 'DICT
+(key (.sys.loop)) -- ['busy-ns 'idle-ns 'total-ns 'util 'util-1s 'util-10s 'util-60s 'iterations 'work-count 'work-max-ns 'streams]
+(set l (.sys.loop))
+(type (get l 'busy-ns)) -- 'i64
+(type (get l 'util))    -- 'f64
+(== (get l 'total-ns) (+ (get l 'busy-ns) (get l 'idle-ns))) -- true
+(and (>= (get l 'util) 0.0) (<= (get l 'util) 1.0))         -- true
+(and (>= (get l 'util-1s) 0.0) (<= (get l 'util-1s) 1.0))   -- true
+(and (>= (get l 'util-10s) 0.0) (<= (get l 'util-10s) 1.0)) -- true
+(and (>= (get l 'util-60s) 0.0) (<= (get l 'util-60s) 1.0)) -- true
+(>= (get l 'work-max-ns) 0) -- true
+(get l 'streams) -- 0
+;; The counters only grow.
+(>= (get (.sys.loop) 'busy-ns) (get l 'busy-ns))       -- true
+(>= (get (.sys.loop) 'iterations) (get l 'iterations)) -- true
+(.sys.loop 1) !- arity
+
+;; ────────────── .sys.activity ──────────────
+(type (.sys.activity)) -- 'DICT
+(key (.sys.activity)) -- ['state 'handle 'since 'elapsed-ms 'query 'conns-in 'conns-out 'op 'phase 'rows-done 'rows-total]
+(set a (.sys.activity))
+(type (get a 'state))      -- 'sym
+(type (get a 'handle))     -- 'i64
+(type (get a 'since))      -- 'timestamp
+(type (get a 'elapsed-ms)) -- 'f64
+(type (get a 'query))      -- 'str
+(type (get a 'op))         -- 'str
+(>= (get a 'elapsed-ms) 0.0) -- true
+(>= (get a 'conns-in) 0)     -- true
+(>= (get a 'conns-out) 0)    -- true
+;; No request from a connection is running here.
+(in (get a 'state) ['idle 'repl 'timer 'hook]) -- true
+(.sys.activity 1) !- arity
+
+;; ────────────── .sys.cpu ──────────────
+(type (.sys.cpu)) -- 'DICT
+(key (.sys.cpu)) -- ['user-ns 'system-ns 'rss-bytes 'rss-peak-bytes 'threads 'cores 'cpu-quota]
+(set c (.sys.cpu))
+(type (get c 'user-ns)) -- 'i64
+(>= (get c 'user-ns) 0)   -- true
+(>= (get c 'system-ns) 0) -- true
+(>= (get c 'cpu-quota) 0) -- true
+(== (get c 'cores) (get (.sys.info) 'cores)) -- true
+;; CPU time only grows, and work shows in it.
+(count (til 3000000)) -- 3000000
+(>= (+ (get (.sys.cpu) 'user-ns) (get (.sys.cpu) 'system-ns)) (+ (get c 'user-ns) (get c 'system-ns))) -- true
+(.sys.cpu 1) !- arity
+
+;; ────────────── .ipc.conns ──────────────
+(type (.ipc.conns)) -- 'TABLE
+(key (.ipc.conns)) -- ['handle 'peer 'inbound 'transport 'since 'requests 'bytes_in 'bytes_out 'queued_bytes 'last_active]
+(map type (value (.ipc.conns))) -- ['I64 'STR 'B8 'SYM 'TIMESTAMP 'I64 'I64 'I64 'I64 'TIMESTAMP]
+(.ipc.conns 1) !- arity

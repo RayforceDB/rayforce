@@ -26,6 +26,7 @@
 #include "core/poll.h"
 #include "core/mcast.h"
 #include "core/timer.h"
+#include "core/status.h"
 #include "mem/sys.h"
 #include "mem/heap.h"   /* idle decay: bound the wait, sweep after wakeup */
 #include <sys/event.h>
@@ -255,8 +256,12 @@ int64_t ray_poll_run_for(ray_poll_t* poll, int timeout_ms)
             timeout = &ts;
         }
 
+        ray_status_wait_begin();
         int n = kevent((int)poll->fd, NULL, 0, events,
                        RAY_POLL_MAX_EVENTS, timeout);
+        int wait_errno = errno;
+        ray_status_wait_end();
+        errno = wait_errno;
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
