@@ -1017,7 +1017,7 @@
 ;; n_keys > 2 → drops out of TOP_COUNT2_FIXED_LOOP, hits the generic
 ;; multi-key fallback at line 7463-7503.
 (set T26d (table [a b c] (list (as 'I64 (% (til 25000) 30)) (as 'I64 (% (til 25000) 25)) (as 'I64 (% (til 25000) 20)))))
-(set R26d (select {x: (count a) from: (select {c: (count a) from: T26d by: [a b c]}) where: (> c 3)}))
+(set R26d (select {x: (count a) from: (select {n: (count a) from: T26d by: [a b c]}) where: (> n 3)}))
 (> (count R26d) 0) -- true
 
 ;; ════════════════════════════════════════════════════════════════════

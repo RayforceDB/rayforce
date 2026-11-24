@@ -3404,7 +3404,7 @@ static test_result_t test_da_route(void) {
 static test_result_t test_da_route_shapes(void) {
     ray_group_test_route(1);
     /* a SYM key: slots over the domain's ids (never ordered by raw id) */
-    SR_SAME("(select {c: (count k) s: (sum v) from: T by: s})", 0);
+    SR_SAME("(select {c: (count k) sv: (sum v) from: T by: s})", 0);
     /* SYM inputs (domain order, widths per piece), strlen, FIRST / LAST */
     SR_SAME("(select {mn: (min s) mx: (max s) l: (avg (strlen s)) f: (first v) z: (last f) from: T by: g})", 0);
     /* PROD, second moments, ALL / ANY, F32 / DATE / BOOL / U8 inputs */
@@ -3486,8 +3486,8 @@ static test_result_t test_sp_dyn_route(void) {
     static const char* const q2[] = {
         "(select {c: (count k) from: T by: s desc: c take: 3})",                     /* SYM, count only */
         "(select {c: (count k) s: (sum k) a: (avg g) from: T by: u desc: c take: 3})", /* sums, first pass */
-        "(select {c: (count k) s: (sum k) from: T by: s desc: c take: 3})",          /* SYM: the sum pass */
-        "(select {c: (count k) s: (sum h) from: T where: (> g 0) by: s desc: c take: 2})",
+        "(select {c: (count k) sv: (sum k) from: T by: s desc: c take: 3})",          /* SYM: the sum pass */
+        "(select {c: (count k) sv: (sum h) from: T where: (> g 0) by: s desc: c take: 2})",
         NULL };
     ray_group_test_route(2);                       /* skip v2 and the direct array */
     for (int i = 0; q2[i]; i++) SR_SAME(q2[i], 0);
@@ -3531,7 +3531,7 @@ static test_result_t test_radix_route_shapes(void) {
         { "(select {c: (count k) s: (sum h) from: T where: (> k 140000) by: {g: g u: u}})", 0 },
         { "(select {s: (sum h) a: (avg u) from: T where: (> k 50000) by: {d: d b: b}})", 0 },
         /* phase 1: a SYM key under a rowsel, every streaming op, strlen */
-        { "(select {s: (sum v) mx: (max f) mn: (min d) from: T where: (> g 2) by: s})", 0 },
+        { "(select {sv: (sum v) mx: (max f) mn: (min d) from: T where: (> g 2) by: s})", 0 },
         { "(select {f: (first v) l: (last f) vr: (var v) p: (prod b) mn: (min s) mx: (max s) "
           "n: (sum (strlen s)) e: (avg e) sd: (stddev g) from: T by: {g: g b: b}})", 0 },
         { "(select {p: (pearson_corr f k) w: (wavg k f) c: (cov h g) from: T by: {g: g u: u}})", 0 },
@@ -3612,13 +3612,13 @@ static test_result_t test_radix_route_sparse(void) {
         "(select {s: (sum h) a: (avg k) from: T by: h})",
         "(select {s: (sum h) from: T by: u})",
         "(select {c: (count k) s: (sum k) from: T where: (> k 100) by: h})",
-        "(select {c: (count k) s: (sum h) a: (avg u) from: T by: s})",              /* SYM key, by piece width */
+        "(select {c: (count k) sv: (sum h) a: (avg u) from: T by: s})",              /* SYM key, by piece width */
         /* the emit-filter key range under a sparse selection: bounds by a scan */
         "(select {c: (count k) s: (sum h) from: T where: (< k 1000) by: h desc: c take: 3})",
         "(select {c: (count k) s: (sum u) a: (avg h) from: T where: (> k 180000) by: h desc: c take: 3})",
         /* the emit-filter sparse table (a SYM key never takes the key range):
          * the count arm, then the heavy hitters' sums */
-        "(select {c: (count k) s: (sum h) from: T where: (< k 5) by: s desc: c take: 2})",
+        "(select {c: (count k) sv: (sum h) from: T where: (< k 5) by: s desc: c take: 2})",
         NULL };
     ray_group_test_route(2);
     for (int i = 0; qs[i]; i++) {
@@ -3710,9 +3710,9 @@ static test_result_t test_radix_route_serial(void) {
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm0/\" SM {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sm2/\" SM {compress: true})");
     static const struct { const char* q; uint64_t mat; } qs[] = {
-        { "(select {c: (count k) s: (sum v) a: (avg f) from: T by: {g: g s: s}})", 0 },
+        { "(select {c: (count k) sv: (sum v) a: (avg f) from: T by: {g: g s: s}})", 0 },
         { "(select {c: (count k) s: (sum v) from: T where: (> k 100) by: v})", 0 },
-        { "(select {m: (med v) s: (sum f) from: T by: s})", 1 },
+        { "(select {m: (med v) sv: (sum f) from: T by: s})", 1 },
         { "(select {m: (med f) from: T where: (> g 2) by: {g: g s: s}})", 1 },
         { "(select {s: (sum v) c: (count k) from: T by: t})", 0 },       /* STR key: string-domain ids */
         { "(select {m: (med v) a: (avg f) from: T by: {t: t g: g}})", 1 },
@@ -4226,8 +4226,8 @@ static test_result_t test_v2_sel_key_types(void) {
         sr_evalf_ok("(set T (.db.splayed.get \"%s\"))", gen ? SR_TMP "/kt2/" : SR_TMP "/kt0/");
         for (int i = 0; keys[i]; i++) {
             char a[256], b[256];
-            snprintf(a, sizeof a, "(select {c: (count h) s: (sum h) from: T where: (> h 500000) by: %s asc: %s})", keys[i], keys[i]);
-            snprintf(b, sizeof b, "(select {c: (count h) s: (sum h) from: (select {from: T where: (> h 500000)}) by: %s asc: %s})",
+            snprintf(a, sizeof a, "(select {c: (count h) sv: (sum h) from: T where: (> h 500000) by: %s asc: %s})", keys[i], keys[i]);
+            snprintf(b, sizeof b, "(select {c: (count h) sv: (sum h) from: (select {from: T where: (> h 500000)}) by: %s asc: %s})",
                      keys[i], keys[i]);
             agg_route_reset();
             ray_t* ra = sr_eval(a);
@@ -4257,9 +4257,9 @@ static test_result_t test_v2_sym_key_parted(void) {
             sr_evalf_ok("(.db.splayed.set \"" SR_TMP "/sp%d/2024.01.0%d/t/\" "
                         "(table [s v] (list (as 'SYMBOL (map (fn [j] (format \"w%%\" (%% j %d))) (til 70000))) (til 70000))) "
                         "\"" SR_TMP "/sp%d/.sym\" {compress: %s})", gen, p + 1, p ? 300 : 20, gen, gen ? "true" : "false");
-    ray_t* a = sr_eval("(select {c: (count v) s: (sum v) from: (.db.parted.get \"" SR_TMP "/sp0\" 't) by: s})");
+    ray_t* a = sr_eval("(select {c: (count v) sv: (sum v) from: (.db.parted.get \"" SR_TMP "/sp0\" 't) by: s})");
     ray_enc_counters_reset();
-    ray_t* b = sr_eval("(select {c: (count v) s: (sum v) from: (.db.parted.get \"" SR_TMP "/sp2\" 't) by: s})");
+    ray_t* b = sr_eval("(select {c: (count v) sv: (sum v) from: (.db.parted.get \"" SR_TMP "/sp2\" 't) by: s})");
     ray_enc_counters_t k; ray_enc_counters_get(&k);
     TEST_ASSERT_TRUE(a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b));
     ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
@@ -4636,7 +4636,7 @@ static test_result_t test_v2_route_shapes(void) {
         { "(select {p: (pearson_corr f g) c: (count k) from: T by: {h: h g: g}})", R_RADIX },
         { "(select {c: (count k) s: (sum f) from: T by: {c1: c1 c2: c2}})", R_LOCAL },
         { "(select {c: (count k) s: (sum f) mn: (min n) from: T by: nk})", R_LOCAL },
-        { "(select {s: (sum f) v: (var n) from: T where: (> g 2) by: s})", R_LOCAL },
+        { "(select {sv: (sum f) v: (var n) from: T where: (> g 2) by: s})", R_LOCAL },
         { "(select {x: (max f) c: (count k) from: T where: (> k 1000) by: {d: d u: u}})", R_PART },
         { "(select {x: (sum f) p: (pearson_corr f n) from: T by: {d: d u: u}})", R_PART },
         { "(select {c: (count k) a: (avg nk) from: T by: {nk: nk s: s}})", R_LOCAL },
@@ -4679,7 +4679,7 @@ static test_result_t test_v2_route_shapes(void) {
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w50/\" W5 {compress: false})");
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/w52/\" W5 {compress: true})");
     test_result_t r = sr_same_on("(.db.splayed.get \"" SR_TMP "/w50/\")", "(.db.splayed.get \"" SR_TMP "/w52/\")",
-                                 "(select {c: (count k) s: (sum f) from: T by: {g: g s: s}})", UINT64_MAX);
+                                 "(select {c: (count k) sv: (sum f) from: T by: {g: g s: s}})", UINT64_MAX);
     if (r.status != TEST_PASS) return r;
     if ((r = sr_same_on(SR_W0, SR_W2, "(select {m: (med f) c: (count k) from: T by: g})", UINT64_MAX)).status != TEST_PASS) return r;
     if ((r = sr_same_on(SR_W0, SR_W2, "(select {c: (count k) s: (sum n) from: T by: h take: 5})", UINT64_MAX)).status != TEST_PASS) return r;
@@ -4708,7 +4708,7 @@ static test_result_t test_v2_sym_shared_dom(void) {
     sr_eval_ok("(.db.splayed.set \"" SR_TMP "/sd2/\" B \"" SR_TMP "/sd.sym\" {compress: true})");
     ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(3), RAY_OK);   /* dense at any core count */
     static const char* const qs[] = {
-        "(select {c: (count v) s: (sum v) from: T by: s})",
+        "(select {c: (count v) sv: (sum v) from: T by: s})",
         "(select {c: (count v) mx: (max v) from: T where: (> v 1000) by: s})",
         NULL };
     for (int i = 0; qs[i]; i++) {

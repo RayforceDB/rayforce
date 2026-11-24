@@ -1416,7 +1416,7 @@ static test_result_t test_cross_segment_codes(void) {
         { "(select {c: (count v) from: T where: (!= s \"red long value\") by: s})", false },
         { "(select {c: (count v) from: T where: (== s \"blue long value\") by: s})", false },
         { "(select {c: (count v) from: T where: (> v 69990) by: s})", false },
-        { "(select {c: (count v) s: (sum v) from: T where: (and (> v 1000) (!= s \"green\")) by: s})", false },
+        { "(select {c: (count v) sv: (sum v) from: T where: (and (> v 1000) (!= s \"green\")) by: s})", false },
     };
     for (size_t i = 0; i < sizeof qs / sizeof *qs; i++) {
         st_fk_t k;

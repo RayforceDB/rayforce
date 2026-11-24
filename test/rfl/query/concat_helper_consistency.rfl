@@ -10,10 +10,12 @@
 (at (select {v: (hrv s) e: (reverse x) from: T}) 'v) -- ['e 'd 'c 'b 'a]
 (set mrv (fn [v] 1 (reverse v)))
 (count (select {n: (first (mrv (concat s "!"))) from: T})) -- 1
-;; A grouped output named like its key keeps both columns, the key first.
-(key (select {k: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- ['k 'k 'n]
-(value (select {k: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- (list [0 1 2] [1 3 5] [2 2 1])
-(key (select {g: (first x) n: (count (distinct x)) by: {g: k} from: T})) -- ['g 'g 'n]
+;; A grouped output named like its key but holding another value is a
+;; domain error (#1236); under another name it is an ordinary output.
+(select {k: (first x) n: (count (distinct x)) by: k from: T asc: k}) !- domain
+(select {g: (first x) n: (count (distinct x)) by: {g: k} from: T}) !- domain
+(key (select {f: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- ['k 'f 'n]
+(value (select {f: (first x) n: (count (distinct x)) by: k from: T asc: k})) -- (list [0 1 2] [1 3 5] [2 2 1])
 ;; Grouped fallback outputs follow the requested order, as planned outputs do.
 (key (select {n: (+ (count s) (count (distinct x))) m: (sum x) by: k from: T})) -- ['k 'n 'm]
 (key (select {m: (sum x) n: (+ (count s) (count (distinct x))) by: k from: T})) -- ['k 'm 'n]

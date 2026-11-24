@@ -11,7 +11,7 @@
 ;; a column on both sides: the join's own choice of which it keeps
 (select {s: (sum x) from: (left-join [k] jpL jpR)}) -- (select {s: (sum x) from: jpLJ})
 (select {s: (sum x) from: (inner-join [k] jpL jpR)}) -- (select {s: (sum x) from: jpIJ})
-(select {s: (sum w) by: s from: (left-join [k] jpL jpR)}) -- (select {s: (sum w) by: s from: jpLJ})
+(select {sw: (sum w) by: s from: (left-join [k] jpL jpR)}) -- (select {sw: (sum w) by: s from: jpLJ})
 (select {s: (sum w) from: (left-join [k] jpL jpR) where: (> r1 10)}) -- (select {s: (sum w) from: jpLJ where: (> r1 10)})
 (select {m: (max u) from: (left-join [k] jpL jpR) where: (== s 'b)}) -- (select {m: (max u) from: jpLJ where: (== s 'b)})
 (select {a: v b: w from: (inner-join [k k2] jpL jpR) asc: w take: 5}) -- (select {a: v b: w from: jpIJ2 asc: w take: 5})

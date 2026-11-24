@@ -1,0 +1,54 @@
+;; @also-unfused
+;; A grouped select's output named like a by: key must be that key: anything
+;; else under the key's name is a domain error naming the output (#1236).
+(set S (table [a b h] (list (as 'I32 [1 2 1 2 1 3]) (as 'I32 [5 5 5 6 5 5]) [10 20 30 40 50 60])))
+;; a single key: a computed value, an aggregate, another column, a quoted symbol
+(select {a: (* a 2) u: (count h) from: S by: a}) !- domain
+(select {a: (sum h) from: S by: a}) !- domain
+(select {a: b from: S by: a}) !- domain
+(select {a: 'a from: S by: a}) !- domain
+(select {u: (count h) a: (first a) from: S by: a}) !- domain
+(at (try (select {a: (* a 2) u: (count h) from: S by: a}) (fn [e] e)) 'msg) -- "select by: output `a` is named like a by: key but is not that key"
+;; several keys
+(select {b: (sum h) from: S by: [a b]}) !- domain
+(select {a: (* a 2) u: (count h) from: S by: [a b]}) !- domain
+(at (try (select {b: (sum h) from: S by: [a b]}) (fn [e] e)) 'msg) -- "select by: output `b` is named like a by: key but is not that key"
+;; a by-dict: an output named like an alias, of a column or of a computed key
+(select {k: (sum h) from: S by: {k: a}}) !- domain
+(select {k: a from: S by: {k: a}}) !- domain
+(select {k: (sum h) from: S by: {k: (+ a 1)}}) !- domain
+(select {j: (count h) from: S by: {k: a j: b}}) !- domain
+(select {a: (sum h) from: S by: {a: a}}) !- domain
+;; under where:, take:, desc:, a running function, a helper the planner cannot lower
+(select {a: (sum h) from: S by: a where: (> h 10)}) !- domain
+(select {a: (sum h) u: (count h) from: S by: a desc: u take: 2}) !- domain
+(select {a: (sums h) from: S by: a}) !- domain
+(set kno (fn [x] (reverse (reverse x))))
+(select {a: (sum (kno h)) from: S by: a}) !- domain
+(select {a: (count (distinct h)) from: S by: a}) !- domain
+;; still answered: the key under its own name, a renamed key, other names
+(cols (select {a: a u: (count h) from: S by: a})) -- [a u]
+(cols (select {x: a u: (count h) from: S by: a})) -- [a x u]
+(cols (select {a: a b: b u: (count h) from: S by: [a b]})) -- [a b u]
+(cols (select {k: k u: (sum h) from: S by: {k: a}})) -- [k u]
+(cols (select {a: a u: (sum h) from: S by: {a: a}})) -- [a u]
+(cols (select {a: (sum h) from: S by: {k: a}})) -- [k a]
+(cols (select {d: (* a 2) u: (count h) from: S by: a})) -- [a d u]
+(at (select {s: (sum h) from: S by: a}) 's) -- [90 60 60]
+;; a key computed without a name is called key when an output takes its name
+(cols (select {a: (sum h) from: S by: (+ a 1)})) -- [key a]
+;; no by: no key to clash with
+(cols (select {a: (* a 2) from: S})) -- [a]
+;; update writes the key column in place: no second column, not an error
+(at (update {a: (as 'I32 (* a 2)) from: S by: a}) 'a) -- (as 'I32 [2 4 2 4 2 6])
+;; splayed and parted tables
+(.db.splayed.set "/tmp/rfl_key_named_output/2024.01.01/t/" S "/tmp/rfl_key_named_output/.sym")
+(set Sp (.db.splayed.get "/tmp/rfl_key_named_output/2024.01.01/t/" "/tmp/rfl_key_named_output/.sym"))
+(set P (.db.parted.get "/tmp/rfl_key_named_output/" 't))
+(select {a: (sum h) from: Sp by: a}) !- domain
+(select {a: (sum h) from: P by: a}) !- domain
+(select {b: (sum h) from: P by: [a b]}) !- domain
+(select {k: (count h) from: P by: {k: a}}) !- domain
+(cols (select {s: (sum h) from: P by: a})) -- [a s]
+(cols (select {a: a s: (sum h) from: P by: a})) -- [a s]
+(.sys.exec "rm -rf /tmp/rfl_key_named_output") -- 0

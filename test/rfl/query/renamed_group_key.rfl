@@ -15,7 +15,7 @@
 (cols (select {from: T u: (count (distinct h)) x: k by: {k: a}})) -- [k u x]
 (cols (select {from: T u: (count (distinct h)) x: k by: {k: (+ a 1)}})) -- [k u x]
 (cols (select {from: T x: a y: a by: a})) -- [a x y]
-(cols (select {from: T a: (+ a 1) by: a})) -- [a a]
+(select {from: T a: (+ a 1) by: a}) !- domain
 (cols (select {from: T u: (count (distinct h)) x: a by: a where: (> h 10) desc: u take: 2})) -- [a u x]
 (.db.splayed.set "/tmp/rfl_renamed_key/2024.01.01/t/" T "/tmp/rfl_renamed_key/.sym")
 (set Sp (.db.splayed.get "/tmp/rfl_renamed_key/2024.01.01/t/" "/tmp/rfl_renamed_key/.sym"))
