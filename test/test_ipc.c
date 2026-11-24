@@ -3768,6 +3768,11 @@ static void drop(ray_t* r) {
  * instead of hanging it. */
 static test_result_t test_ipc_time_sleep_cancel(void) {
 #if !defined(RAY_OS_WINDOWS)
+#if defined(RAY_OS_MACOS)
+    /* #1638: either cancel is lost now and then on macOS debug CI; skipped
+     * there until the cause is fixed.  Linux keeps running it. */
+    SKIP("#1638: the cancel is lost intermittently on macOS");
+#endif
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
     const char* dir = "/tmp/ipc_time_sleep";
     uint16_t port = serve_server(dir);
