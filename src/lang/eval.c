@@ -3222,6 +3222,59 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
+/* A vector condition of the evaluator's `if` inside a query, over its rows
+ * (#1630).  This `if` cannot choose per row: tested whole, any non-empty
+ * vector is true, so every row took the first arm.  The query's planned
+ * routes and its per-row pass choose per row; what reaches this `if` with
+ * such a vector is a shape neither covers (language/control-flow.md names
+ * them).  A condition true on some rows and false on others is an error.
+ * One true on every row, or false on every row, has one arm for all of them:
+ * *truth is set to 1 or 0, the arm each row takes.  A vector of another
+ * length, or one not derived from the rows (`rows` 0: a global, a literal),
+ * leaves *truth at -1, tested whole as outside a query.  NULL unless an
+ * error. */
+static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, uint8_t rows, int* truth) {
+    *truth = -1;
+    if (rows == 0 || cond->type != RAY_BOOL || cond->len < 1) return NULL;
+    int64_t len = ray_query_rows_len();
+    if (len != cond->len) return NULL;
+    const uint8_t* b = (const uint8_t*)ray_data(cond);
+    bool first = b[0] != 0;
+    /* Eight cells a word: a BOOL cell is 0 or 1, so a word of cells all
+     * like the first is 0 or 0x0101...; any other word is read a cell at a
+     * time, which also accepts a true cell stored as another non-zero. */
+    const uint64_t want = first ? 0x0101010101010101ULL : 0;
+    bool mixed = false;
+    int64_t k = 0;
+    for (; k + 8 <= len && !mixed; k += 8) {
+        uint64_t w;
+        memcpy(&w, b + k, sizeof w);
+        if (w == want) continue;
+        for (int j = 0; j < 8; j++) mixed |= (b[k + j] != 0) != first;
+    }
+    for (; k < len && !mixed; k++) mixed = (b[k] != 0) != first;
+    if (mixed)
+        return ray_error("nyi", "if: its condition differs between the query's rows, "
+                         "and on this route it is tested whole, not row by row; "
+                         "see Conditionals: if in language/control-flow.md");
+    *truth = first ? 1 : 0;
+    return NULL;
+}
+
+/* The bytecode `if`'s test of a vector condition (op_jmpf), as ray_cond_fn
+ * tests one: counted toward rows_cond, and inside a query a condition over
+ * its rows goes through cond_rows_test.  Consumes `cond`; an error goes to
+ * *err. */
+static __attribute__((noinline)) int vm_cond_test(ray_t* cond, uint8_t rows, ray_t** err) {
+    __VM->rows_cond++;   /* a vector tested whole */
+    int truth = -1;
+    ray_t* mixed = cond_rows_test(cond, rows, &truth);
+    if (mixed) { ray_release(cond); *err = mixed; return 0; }
+    int t = truth >= 0 ? truth : is_truthy(cond);
+    ray_release(cond);
+    return t;
+}
+
 /* (if c1 r1 c2 r2 ... else?) — conditional chain.  Receives unevaluated
  * args.  Conditions are tried in order and the result paired with the
  * first truthy one is evaluated; an odd trailing arg is the fallback.  No
@@ -3232,13 +3285,27 @@ ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     for (; i + 1 < n; i += 2) {
         ray_t* cond = ray_eval(args[i]);
         if (RAY_IS_ERR(cond)) return cond;
-        /* A vector condition tested whole: the expression may have needed
-         * row-by-row evaluation (see the opaque by: key). */
-        if (!ray_is_atom(cond)) __VM->rows_cond++;
-        /* Materialize lazy handles before testing truthiness */
-        if (ray_is_lazy(cond))
-            cond = ray_lazy_materialize(cond);
-        if (RAY_IS_ERR(cond)) return cond;
+        /* (a lazy handle counts as an atom to ray_is_atom) */
+        if (!ray_is_atom(cond) || ray_is_lazy(cond)) {
+            uint8_t cond_rows = vrows_from(g_eval_rows);
+            /* A vector condition tested whole: the expression may have
+             * needed row-by-row evaluation (see the opaque by: key). */
+            if (!ray_is_atom(cond)) __VM->rows_cond++;
+            /* Materialize lazy handles before testing truthiness */
+            if (ray_is_lazy(cond))
+                cond = ray_lazy_materialize(cond);
+            if (RAY_IS_ERR(cond)) return cond;
+            int truth = -1;   /* the arm a condition over a query's rows gives every row */
+            if (!ray_is_atom(cond)) {
+                ray_t* mixed = cond_rows_test(cond, cond_rows, &truth);
+                if (mixed) { ray_release(cond); return mixed; }
+            }
+            if (truth >= 0) {
+                ray_release(cond);
+                if (truth) return ray_eval(args[i + 1]);
+                continue;
+            }
+        }
         int truthy = is_truthy(cond);
         ray_release(cond);
         if (truthy) return ray_eval(args[i + 1]);
@@ -4580,7 +4647,15 @@ op_jmpf: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *cond = POP();
-    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
+    if (cond && !ray_is_atom(cond)) {
+        /* a vector tested whole, or a condition over a query's rows
+         * (vm_cond_test, out of line) */
+        ray_t* err = NULL;
+        int t = vm_cond_test(cond, POPPED_ROWS(), &err);   /* consumes cond */
+        if (err) { vm_err_obj = err; goto vm_error; }
+        if (!t) ip += offset;
+        DISPATCH();
+    }
     int truthy = is_truthy(cond);
     ray_release(cond);
     if (!truthy) ip += offset;

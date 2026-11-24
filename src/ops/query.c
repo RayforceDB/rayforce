@@ -12044,6 +12044,16 @@ ray_t* ray_query_helper_value(int64_t sym) {
     return cell;
 }
 
+int64_t ray_query_rows_len(void) {
+    ray_t* qt = g_active_query_table;
+    if (!qt || qt->type != RAY_TABLE) return -1;
+    if (query_group_idx_applies(qt)) return ray_len(g_active_query_group_idx);
+    if (g_active_query_row >= 0 && qt == g_active_query_row_tbl &&
+        !ray_env_query_scope_above(g_active_query_row_depth))
+        return -1;
+    return ray_table_nrows(qt);
+}
+
 ray_t* ray_active_query_literal(int64_t sym) {
     ray_t* qt = g_active_query_table;
     if (!qt || qt->type != RAY_TABLE) return NULL;

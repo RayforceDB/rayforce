@@ -1072,6 +1072,12 @@ ray_t* ray_active_query_table(void);
 /* The table a helper called from a query may read columns from: the
  * source schema while a projection binds aliases, else the active table. */
 ray_t* ray_query_helper_table(void);
+/* The length a value over the rows of the query being evaluated has here:
+ * the group's row count while a group is evaluated, else the active
+ * table's.  -1 outside a query, and while it is evaluated one row at a
+ * time (its columns are cells then).  For the evaluator's `if`, which
+ * cannot choose per row (ray_cond_fn). */
+int64_t ray_query_rows_len(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */
 ray_t* ray_query_helper_value(int64_t sym);
