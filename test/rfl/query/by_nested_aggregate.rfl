@@ -241,3 +241,60 @@
 (set PD 0)
 (set FD 0)
 (.sys.exec "rm -rf /tmp/rfl_by_nested_aggregate/") -- 0
+
+;; An aggregate of another query's value is no aggregate of the group: it
+;; reads no row of the outer table, so an output that folds it beside the
+;; group's own rows is not refused (#1469).  The oracle binds the inner
+;; value to a global first.
+(set T1469 (table [g s v] (list ['a 'a 'a 'b 'b] ["x" "x" "x" "y" "y"] [30 10 20 5 7])))
+(set U1469 (table [k v] (list ['p 'q 'r 'p 'q 'r 'p 'q] [100 200 300 400 500 600 700 800])))
+(set X1469 (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))
+(at (select {from: T1469 by: s r: (+ v (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))}) 'r) -- (at (select {from: T1469 by: s r: (+ v X1469)}) 'r)
+(at (select {from: T1469 by: s r: (+ v (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))}) 'r) -- (list [730 710 720] [705 707])
+(at (select {from: T1469 by: s r: (+ (sum v) (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))}) 'r) -- (at (select {from: T1469 by: s r: (+ (sum v) X1469)}) 'r)
+(at (select {from: T1469 by: g r: (+ (sum v) (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))}) 'r) -- [760 712]
+(at (select {from: T1469 by: s r: (+ (sum v) (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x)))) where: (> v 6)}) 'r) -- (at (select {from: T1469 by: s r: (+ (sum v) X1469) where: (> v 6)}) 'r)
+;; combined with the group under an if, as with the bound value
+(at (select {from: T1469 by: g r: (if (> (sum v) 20) (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))) 0)}) 'r) -- (at (select {from: T1469 by: g r: (if (> (sum v) 20) X1469 0)}) 'r)
+;; but an aggregate of another query's value, not combined with the group,
+;; is still refused, as before #1459: its answer would differ from the
+;; bound value's, which is spread over the group's rows
+(try (select {from: T1469 by: g r: (sum (max (at (select {from: U1469 by: k x: (sum v)}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (sum (first (at (select {from: U1469 by: k x: (sum v)}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (sum (first (at (select {from: U1469 x: (sum v)}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (count (first (at (select {from: U1469 by: k x: (sum v)}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (sum (+ 1 (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (max (first (at (select {from: U1469 by: k x: (sum v)}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+;; beside the group, an aggregate whose whole source is another query's
+;; scalar stays refused, as before #1459, whatever the aggregate: only a
+;; source that is a collection, as in the issue, is lifted
+(try (select {from: T1469 by: g r: (+ (max v) (max (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ (sum v) (avg (max (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ v (first (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ v (first (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x)))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ (sum v) (sum (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ (sum v) (count (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ (sum v) (sum (first (at (select {from: U1469 x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (* (count v) (sum (first (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (+ v (sum (max (at (select {from: U1469 by: k x: (sum v)}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+;; the refusal stays for an inner aggregate that reads the group's rows, or
+;; spreads a scalar over them
+(try (select {s: (max (sum v)) from: T1469 by: g}) Re) -- "select by: output `s` aggregates an aggregate of the group"
+(at (select {s: (max (+ v (first (first (at (select {from: U1469 by: k x: (reverse v)}) 'x))))) from: T1469 by: g}) 's) -- [730 707]
+(try (select {s: (max (sum 1)) from: T1469 by: g}) Re) -- "select by: output `s` aggregates an aggregate of the group"
+;; the refusal is decided from the text and bound values alone: a source
+;; with an effect runs as often as on dev (not at all, for a refused
+;; output), and a source that raises keeps dev's refusal
+(set C1469 0)
+(set Tk1469 (fn [x] (set C1469 (+ C1469 1)) x))
+(set Bm1469 (fn [x] (raise "boom")))
+(try (select {from: T1469 by: g r: (+ v (first (first (at (select {from: U1469 by: k x: (sum (Tk1469 v))}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+C1469 -- 0
+(try (select {from: T1469 by: g r: (+ (sum v) (sum (first (at (select {from: U1469 by: k x: (sum (Tk1469 v))}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+C1469 -- 0
+(try (select {from: T1469 by: g r: (+ v (first (first (at (select {from: U1469 by: k x: (sum (Bm1469 v))}) 'x))))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+(try (select {from: T1469 by: g r: (sum (first (at (select {from: U1469 by: k x: (sum (Bm1469 v))}) 'x)))}) Re) -- "select by: output `r` aggregates an aggregate of the group"
+;; a lifted output runs its nested select once per outer group, as the
+;; per-group evaluation runs any output: 2 groups of 3 inner groups
+(at (select {from: T1469 by: g r: (+ v (first (first (at (select {from: U1469 by: k x: (reverse (Tk1469 v))}) 'x))))}) 'r) -- (list [730 710 720] [705 707])
+C1469 -- 6

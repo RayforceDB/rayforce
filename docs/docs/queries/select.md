@@ -84,7 +84,16 @@ sum. An aggregate cannot be aggregated again, through an alias or written
 out: `s: (sum price) mx: (max s)` and `mx: (max (sum price))` both raise
 `domain`. An aggregate that still folds the group's rows may use one:
 `mx: (max (+ price (count price)))` adds each group's count to its prices
-and takes the largest. And an output may not mix a source column with a reference to an earlier
+and takes the largest. An aggregate of a value that reads no row of the
+group, such as one taken from another query, `(first (first (at (select
+{from: u by: k x: (reverse v)}) 'x)))`, may be combined with the group's
+rows or aggregates, `(+ v …)` or `(+ (sum v) …)`, when that aggregate is
+`first`, `last`, `min`, `max`, `avg`, `med`, `mode`, `all` or `any`, which
+answer the same whether the value is taken once or spread over the rows,
+and when its source is a collection, as the reversed `v` there is.
+`sum`, `count` and the others of such a value, any of them aggregated
+alone, and any aggregate whose source is one value of another query,
+`(first (first N))` with `N` a column of sums, still raise `domain`. And an output may not mix a source column with a reference to an earlier
 per-group alias outside an aggregate: `f: (* price n)` with `n: (count price)` raises
 `domain`; write `(* (sum price) n)` or whichever aggregate is meant.
 

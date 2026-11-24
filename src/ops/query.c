@@ -17605,11 +17605,172 @@ static bool expr_reads_rows_outside_agg(ray_t* e, ray_t* tbl, bool elementwise) 
     return false;
 }
 
-/* The first aggregate in `expr` that folds only aggregates of the group,
- * (max (sum v)) or (max (+ (sum v) 1)), or NULL.  Its argument is one
- * value per group: there are no rows left to fold.  An aggregate that
- * also reads rows, (max (+ v (count v))), is evaluated per group (#1452). */
-static ray_t* grouped_output_refolds_agg(ray_t* expr, ray_t* tbl) {
+/* Is the aggregate call `e` one of the group: does it fold the group's
+ * rows?  Its source reads them (a column, an unbound name, a table-length
+ * global read elementwise), or is a scalar spread over them ((sum 1)), or
+ * folds such an aggregate.  One whose source reads no row of the group,
+ * (first (at (select {..}) 'x)) -- a value of another query, the same in
+ * every group -- is not (#1469).  A nested query's clauses are its own and
+ * are not read: they are a dict, which the walk does not enter. */
+static bool group_agg_inside(ray_t* e, ray_t* tbl, int depth);
+static bool agg_of_group(ray_t* e, ray_t* tbl, int depth) {
+    if (depth > 64) return true;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* src = el[1];
+    if (expr_reads_rows_outside_agg(src, tbl, true)) return true;
+    if (src && src->type < 0 && src->type != -RAY_SYM) return true;   /* a scalar literal */
+    if (src && src->type == -RAY_SYM && !(src->attrs & ATTR_QUOTED)) {
+        ray_t* b = ray_env_get_lexical_local(src->i64);
+        if (!b) b = ray_env_get(src->i64);
+        if (b && ray_is_atom(b)) return true;                         /* a name bound to a scalar */
+    }
+    for (int64_t i = 2; i < e->len; i++)
+        if (expr_reads_rows_outside_agg(el[i], tbl, true)) return true;
+    return group_agg_inside(e, tbl, depth + 1);
+}
+
+/* Does an argument of the call `e` hold an aggregate of the group? */
+static bool group_agg_inside(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || e->len < 1 || depth > 64) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    for (int64_t i = 1; i < e->len; i++) {
+        ray_t* x = el[i];
+        if (!x || x->type != RAY_LIST || (x->attrs & ATTR_QUOTED) || x->len < 1) continue;
+        if (select_alias_skip_form(((ray_t**)ray_data(x))[0])) continue;
+        if (is_agg_expr(x) ? agg_of_group(x, tbl, depth + 1) : group_agg_inside(x, tbl, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* Does `e`, outside the subtree `skip`, read the group: a row of it
+ * outside every aggregate, or an aggregate of the group? */
+static bool reads_group_outside(ray_t* e, ray_t* skip, ray_t* tbl, int depth) {
+    if (!e || e == skip || depth > 64) return false;
+    if (e->type == -RAY_SYM) return expr_reads_rows_outside_agg(e, tbl, true);
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (select_alias_skip_form(el[0])) return false;
+    if (is_agg_expr(e)) return agg_of_group(e, tbl, depth + 1);
+    bool ew = head_reads_rows_elementwise(e);
+    for (int64_t i = 1; i < e->len; i++) {
+        if (el[i] == skip) continue;
+        if (el[i] && el[i]->type == -RAY_SYM ? expr_reads_rows_outside_agg(el[i], tbl, ew)
+                                             : reads_group_outside(el[i], skip, tbl, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* The first aggregate in `expr` (an output, `root`) that folds only
+ * aggregates of the group, (max (sum v)) or (max (+ (sum v) 1)), or NULL.
+ * Its argument is one value per group: there are no rows left to fold.  An
+ * aggregate that also reads rows, (max (+ v (count v))), is evaluated per
+ * group (#1452).  One that folds only aggregates of no group -- of another
+ * query's value, (first (first (at (select {..}) 'x))) -- is refused as
+ * before unless the output combines its value with the group, its rows or
+ * an aggregate of it, and the aggregate answers the same whether that value
+ * is spread over the group's rows, as a bound scalar is, or taken once
+ * (first, last, min, max, avg, med, mode, all, any), and its source is a
+ * collection, not one value: (+ v (first (first ..))) answers (#1469),
+ * (+ (sum v) (sum (first ..))) and (+ v (first (first N))), N a column of
+ * sums, stay refused. */
+static bool agg_spread_invariant(ray_t* e) {
+    switch (resolve_agg_opcode(((ray_t**)ray_data(e))[0]->i64)) {
+    case OP_FIRST: case OP_LAST: case OP_MIN: case OP_MAX: case OP_AVG:
+    case OP_MEDIAN: case OP_MODE: case OP_ALL: case OP_ANY: return true;
+    default: return false;
+    }
+}
+
+/* A lower bound on the nesting of the value `e` gives, decided without
+ * running any code: 0 for one value, 1 for a collection of values, 2 for a
+ * collection of collections; -1 when it cannot be told.  Read are literals,
+ * a name's bound value (data, not code), first and last, which take one
+ * level off, and (at (select {..}) 'x), a nested select's output column:
+ * under by: an aggregate output holds a value per group and one with no
+ * aggregate a collection per group (its group's rows); keyless, an
+ * aggregate output holds one value.  Anything else is -1. */
+static int src_value_rank(ray_t* v, int depth) {
+    if (!v || depth > 16) return -1;
+    if (ray_is_atom(v)) return 0;
+    if (v->type == RAY_LIST) {
+        if (v->len == 0) return 1;
+        int r = src_value_rank(((ray_t**)ray_data(v))[0], depth + 1);   /* not-a-table */
+        return r < 0 ? 1 : r + 1;
+    }
+    return ray_is_vec(v) ? 1 : -1;
+}
+
+static bool src_head_is(ray_t* h, const char* nm, size_t nl) {
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || ray_env_has_lexical_local(h->i64))
+        return false;
+    ray_t* s = ray_sym_str(h->i64);
+    if (!s || ray_str_len(s) != nl || memcmp(ray_str_ptr(s), nm, nl) != 0) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    return fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY;   /* the builtin, not a rebinding */
+}
+
+static int src_rank(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 16) return -1;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return 0;
+        if (!ray_env_has_lexical_local(e->i64) && tbl_has_col(tbl, e->i64)) return -1;
+        ray_t* v = ray_env_get(e->i64);
+        return v && v->type != RAY_LAMBDA && !(v->type >= RAY_UNARY && v->type <= RAY_VARY)
+            ? src_value_rank(v, 0) : -1;
+    }
+    if (e->type != RAY_LIST) return src_value_rank(e, 0);
+    if ((e->attrs & ATTR_QUOTED) || e->len < 2) return -1;
+    ray_t** el = (ray_t**)ray_data(e);
+    if (e->len == 2 && (src_head_is(el[0], "first", 5) || src_head_is(el[0], "last", 4))) {
+        /* a name's value: the element taken, read as data */
+        ray_t* a = el[1];   /* not-a-table */
+        if (a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) &&
+            (ray_env_has_lexical_local(a->i64) || !tbl_has_col(tbl, a->i64))) {
+            ray_t* v = ray_env_get(a->i64);
+            if (v && v->type == RAY_LIST && v->len > 0) {
+                bool first = src_head_is(el[0], "first", 5);
+                return src_value_rank(((ray_t**)ray_data(v))[first ? 0 : v->len - 1], 0);
+            }
+        }
+        int r = src_rank(a, tbl, depth + 1);
+        return r >= 1 ? r - 1 : -1;
+    }
+    if (e->len == 3 && src_head_is(el[0], "at", 2) && el[1] && el[1]->type == RAY_LIST &&
+        el[1]->len == 2 && src_head_is(((ray_t**)ray_data(el[1]))[0], "select", 6)) {
+        ray_t* d = ((ray_t**)ray_data(el[1]))[1];   /* not-a-table */
+        ray_t* name = el[2];
+        if (name && name->type == RAY_LIST && name->len == 2 &&
+            src_head_is(((ray_t**)ray_data(name))[0], "quote", 5))
+            name = ((ray_t**)ray_data(name))[1];   /* not-a-table */
+        if (!d || d->type != RAY_DICT || !name || name->type != -RAY_SYM) return -1;
+        ray_t* ks = ray_dict_keys(d);
+        ray_t* vs = ray_dict_vals(d);
+        if (!ks || ks->type != RAY_SYM || !vs || vs->type != RAY_LIST) return -1;
+        ray_t* out = NULL;
+        for (int64_t i = 0; i < ray_dict_len(d); i++)
+            if (sym_cell_runtime_id(ks, i) == name->i64) out = ((ray_t**)ray_data(vs))[i];
+        if (!out || out->type != RAY_LIST) return -1;
+        bool by = dict_get(d, "by") != NULL;
+        if (is_agg_expr(out)) return 1;
+        return by && !expr_contains_agg(out) ? 2 : -1;
+    }
+    return -1;
+}
+
+/* Is the whole source of the aggregate `e`, which reads no row of the
+ * group, one value -- (first (first N)) with N another query's column of
+ * sums -- or not known to be a collection?  Such an aggregate stays
+ * refused even beside the group (#1469): only a source known to be a
+ * collection, the regression's (first (first (at (select {.. x: (reverse
+ * v)}) 'x))), is lifted.  Decided from the text and bound values alone
+ * (src_rank): no user code runs here. */
+static bool agg_source_is_scalar(ray_t* e, ray_t* tbl) {
+    return src_rank(((ray_t**)ray_data(e))[1], tbl, 0) < 1;   /* not-a-table */
+}
+
+static ray_t* grouped_output_refolds_agg_in(ray_t* expr, ray_t* root, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST || expr->len < 1) return NULL;
     ray_t** el = (ray_t**)ray_data(expr);
     if (select_alias_skip_form(el[0])) return NULL;
@@ -17617,13 +17778,19 @@ static ray_t* grouped_output_refolds_agg(ray_t* expr, ray_t* tbl) {
         bool rows = false;
         for (int64_t i = 1; i < expr->len && !rows; i++)
             rows = expr_reads_rows_outside_agg(el[i], tbl, true);
-        if (!rows) return expr;
+        if (!rows && (group_agg_inside(expr, tbl, 0) || !agg_spread_invariant(expr) ||
+                      !reads_group_outside(root, expr, tbl, 0) || agg_source_is_scalar(expr, tbl)))
+            return expr;
     }
     for (int64_t i = 1; i < expr->len; i++) {
-        ray_t* hit = grouped_output_refolds_agg(el[i], tbl);
+        ray_t* hit = grouped_output_refolds_agg_in(el[i], root, tbl);
         if (hit) return hit;
     }
     return NULL;
+}
+
+static ray_t* grouped_output_refolds_agg(ray_t* expr, ray_t* tbl) {
+    return grouped_output_refolds_agg_in(expr, expr, tbl);
 }
 
 /* ── Grouped alias planning ───────────────────────────────────────────────
