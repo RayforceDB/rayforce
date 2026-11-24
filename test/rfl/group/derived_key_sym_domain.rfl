@@ -569,3 +569,32 @@
 (set Z3O (select {from: (select {from: HZ k: (upper (trim PageCharset)) UserID: UserID where: (!= PageCharset "")}) by: k u: (count (distinct UserID))}))
 (all (== (ser (xasc (table [k u] (list (as 'STR (at Z3 'cn)) (at Z3 'u))) 'k)) (ser (xasc (table [k u] (list (as 'STR (at Z3O 'k)) (at Z3O 'u))) 'k)))) -- true
 (.sys.exec "rm -rf /tmp/rfl_dkey_symfile") -- 0
+
+;; Group order of a derived key over a SYM column against the same texts in
+;; a STR column.  70000 rows (past the size at which the per-symbol route is
+;; used), 9 texts that fold to 5 keys.  Pinned order, lone key: SYM puts the
+;; empty (null) group FIRST then the keys in the order rows first show them;
+;; STR keeps "" at its row position.  Dict key {k p}: SYM lists the p=0
+;; groups then the p=1 groups, each led by "" ; STR lists first-seen pairs.
+(set DB (list "  Alpha " "alpha" "GAMMA  " "beta " "Beta" "" " zeta" "Zeta  " "alpha  "))
+(set DN 70000)
+(set DTX (map (fn [k] (at DB (% k 9))) (til DN)))
+(set DV (til DN))
+(set DTS (table [c v] (list (as 'SYMBOL DTX) DV)))
+(set DTT (table [c v] (list (as 'STR DTX) DV)))
+(.sys.exec "rm -rf /tmp/rfl_dko/") -- 0
+(.db.splayed.set "/tmp/rfl_dko/s/t/" DTS "/tmp/rfl_dko/s/.sym")
+(.db.splayed.set "/tmp/rfl_dko/t/t/" DTT "/tmp/rfl_dko/t/.sym")
+(set DSS (.db.splayed.get "/tmp/rfl_dko/s/t/" "/tmp/rfl_dko/s/.sym"))
+(set DST (.db.splayed.get "/tmp/rfl_dko/t/t/" "/tmp/rfl_dko/t/.sym"))
+(set DQ1 (fn [t] (as 'STR (at (select {n: (count v) from: t by: {k: (upper (trim c))}}) 'k))))
+(set DQ2 (fn [t] (set r (select {n: (count v) from: t by: {k: (upper (trim c)) p: (% v 2)}})) (list (as 'STR (at r 'k)) (at r 'p))))
+(DQ1 DTS) -- ["" "ALPHA" "GAMMA" "BETA" "ZETA"]
+(DQ1 DSS) -- ["" "ALPHA" "GAMMA" "BETA" "ZETA"]
+(DQ1 DTT) -- ["ALPHA" "GAMMA" "BETA" "" "ZETA"]
+(DQ1 DST) -- ["ALPHA" "GAMMA" "BETA" "" "ZETA"]
+(DQ2 DTS) -- (list ["" "ALPHA" "GAMMA" "BETA" "ZETA" "" "ALPHA" "GAMMA" "BETA" "ZETA"] [0 0 0 0 0 1 1 1 1 1])
+(DQ2 DSS) -- (list ["" "ALPHA" "GAMMA" "BETA" "ZETA" "" "ALPHA" "GAMMA" "BETA" "ZETA"] [0 0 0 0 0 1 1 1 1 1])
+(DQ2 DTT) -- (list ["ALPHA" "ALPHA" "GAMMA" "BETA" "BETA" "" "ZETA" "ZETA" "GAMMA" ""] [0 1 0 1 0 1 0 1 1 0])
+(DQ2 DST) -- (list ["ALPHA" "ALPHA" "GAMMA" "BETA" "BETA" "" "ZETA" "ZETA" "GAMMA" ""] [0 1 0 1 0 1 0 1 1 0])
+(.sys.exec "rm -rf /tmp/rfl_dko/") -- 0
