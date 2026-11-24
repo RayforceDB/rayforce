@@ -3,15 +3,16 @@
 ;; constant-index at, read each group's row ids past the source's end and
 ;; gave a different answer on each run.  It now reads those rows as the
 ;; other aggregates do, through at: a row past the end is null, and med
-;; skips it.  What a constant-index at means under by: is #1429; this pins
-;; only that the answer is the same on every run and on every route.
+;; skips it.  Since #1429, at of a column under by: sees the group's rows,
+;; so each group's answer is its own: (med (at c (til 2))) of group b, whose
+;; c is [6 2], is 4.0; the answer is the same on every run and route.
 (set G (table [g c d v] (list [a a b b] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] [10 20 30 40])))
 (set T (table [k c d] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04])))
 (value (select {from: T by: k s: (med (at c (til 2)))})) -- (list [0] [3.0])
 (value (select {from: T by: k s: (med (at c (til 2))) z: (first (+ d 0))})) -- (list [0] [3.0] [2024.01.01])
 (value (select {from: T by: k s: (med ((fn [y] (at y [1 0])) c)) z: (first (+ d 0))})) -- (list [0] [3.0] [2024.01.01])
-(value (select {from: G by: g s: (med (at c (til 2))) z: (first (+ d 0))})) -- (list [a b] [3.0 0Nf] [2024.01.01 2024.01.04])
-(value (select {from: G by: g s: (med (at c [0])) where: (> v 15)})) -- (list [a b] [5.0 0Nf])
+(value (select {from: G by: g s: (med (at c (til 2))) z: (first (+ d 0))})) -- (list [a b] [3.0 4.0] [2024.01.01 2024.01.04])
+(value (select {from: G by: g s: (med (at c [0])) where: (> v 15)})) -- (list [a b] [5.0 6.0])
 ;; the same rows as at reads them, outside the query
 (at (select {from: T by: k s: (med (at c (til 2)))}) 's) -- (enlist (med (at (at (at T 'c) (til 2)) (til 4))))
 ;; and as avg reads them in the same query

@@ -1,0 +1,129 @@
+;; @also-unfused
+;; #1429, decided by the owner on 2026-11-24: every expression in an output
+;; sees the group's rows of each column under by:, keyless the rows a where:
+;; keeps, and update by: the group, written back to its rows: fold over a
+;; column, at of a column at a constant, vector or column index, and
+;; (til (count v)).  The oracle is the same expression evaluated outside the
+;; query on the group's own columns (cg), or on the kept rows' (ck); query
+;; first and last skip nulls (#1368).
+(set t (table [g s v i] (list [a a a b b] ["x" "x" "x" "y" "y"] [30 10 20 5 7] [1 0 2 1 0])))
+(set cg (fn [k c] (at (select {from: t where: (== g k)}) c)))
+(set ck (fn [w c] (if w (at (select {from: t where: (> v 6)}) c) (at t c))))
+;; select by:, plain outputs and aggregates
+(at (select {from: t by: g r: (- v (fold + v))}) 'r) -- (list ((fn [g s v i] (- v (fold + v))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (- v (fold + v))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (fold + v)}) 'r) -- (list ((fn [g s v i] (fold + v)) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (fold + v)) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (- v (at v 0))}) 'r) -- (list ((fn [g s v i] (- v (at v 0))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (- v (at v 0))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (at v 0)}) 'r) -- (list ((fn [g s v i] (at v 0)) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (at v 0)) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (at v [1 0])}) 'r) -- (list ((fn [g s v i] (at v [1 0])) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (at v [1 0])) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (at v i)}) 'r) -- (list ((fn [g s v i] (at v i)) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (at v i)) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (til (count v))}) 'r) -- (list ((fn [g s v i] (til (count v))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (til (count v))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (- v (first (at v [1 0])))}) 'r) -- (list ((fn [g s v i] (- v (first (at v [1 0])))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (- v (first (at v [1 0])))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (+ v (at v (- (count v) 1)))}) 'r) -- (list ((fn [g s v i] (+ v (at v (- (count v) 1)))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (+ v (at v (- (count v) 1)))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (fold max v)}) 'r) -- (list ((fn [g s v i] (fold max v)) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (fold max v)) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i))))
+(at (select {from: t by: g r: (sum (at v [1 0]))}) 'r) -- (raze (list ((fn [g s v i] (sum (at v [1 0]))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (sum (at v [1 0]))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (sum (fold + v))}) 'r) -- (raze (list ((fn [g s v i] (sum (fold + v))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (sum (fold + v))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (first (at v 0))}) 'r) -- (raze (list ((fn [g s v i] (first (at v 0))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (first (at v 0))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (max (- v (at v 0)))}) 'r) -- (raze (list ((fn [g s v i] (max (- v (at v 0)))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (max (- v (at v 0)))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (sum (at v i))}) 'r) -- (raze (list ((fn [g s v i] (sum (at v i))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (sum (at v i))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (sum (- v (fold + v)))}) 'r) -- (raze (list ((fn [g s v i] (sum (- v (fold + v)))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (sum (- v (fold + v)))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+(at (select {from: t by: g r: (count (at v [0]))}) 'r) -- (raze (list ((fn [g s v i] (count (at v [0]))) (cg (quote a) (quote g)) (cg (quote a) (quote s)) (cg (quote a) (quote v)) (cg (quote a) (quote i))) ((fn [g s v i] (count (at v [0]))) (cg (quote b) (quote g)) (cg (quote b) (quote s)) (cg (quote b) (quote v)) (cg (quote b) (quote i)))))
+;; keyless, all rows and the rows a where: keeps
+(at (select {from: t r: (- v (fold + v))}) 'r) -- ((fn [g s v i] (- v (fold + v))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (- v (fold + v)) where: (> v 6)}) 'r) -- ((fn [g s v i] (- v (fold + v))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (fold + v)}) 'r) -- (enlist ((fn [g s v i] (fold + v)) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (fold + v) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (fold + v)) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (- v (at v 0))}) 'r) -- ((fn [g s v i] (- v (at v 0))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (- v (at v 0)) where: (> v 6)}) 'r) -- ((fn [g s v i] (- v (at v 0))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (at v 0)}) 'r) -- (enlist ((fn [g s v i] (at v 0)) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (at v 0) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (at v 0)) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (at v [1 0])}) 'r) -- ((fn [g s v i] (at v [1 0])) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (at v [1 0]) where: (> v 6)}) 'r) -- ((fn [g s v i] (at v [1 0])) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (at v i)}) 'r) -- ((fn [g s v i] (at v i)) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (at v i) where: (> v 6)}) 'r) -- ((fn [g s v i] (at v i)) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (til (count v))}) 'r) -- ((fn [g s v i] (til (count v))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (til (count v)) where: (> v 6)}) 'r) -- ((fn [g s v i] (til (count v))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (- v (first (at v [1 0])))}) 'r) -- ((fn [g s v i] (- v (first (at v [1 0])))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (- v (first (at v [1 0]))) where: (> v 6)}) 'r) -- ((fn [g s v i] (- v (first (at v [1 0])))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (+ v (at v (- (count v) 1)))}) 'r) -- ((fn [g s v i] (+ v (at v (- (count v) 1)))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i)))
+(at (select {from: t r: (+ v (at v (- (count v) 1))) where: (> v 6)}) 'r) -- ((fn [g s v i] (+ v (at v (- (count v) 1)))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i)))
+(at (select {from: t r: (fold max v)}) 'r) -- (enlist ((fn [g s v i] (fold max v)) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (fold max v) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (fold max v)) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (sum (at v [1 0]))}) 'r) -- (enlist ((fn [g s v i] (sum (at v [1 0]))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (sum (at v [1 0])) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (sum (at v [1 0]))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (sum (fold + v))}) 'r) -- (enlist ((fn [g s v i] (sum (fold + v))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (sum (fold + v)) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (sum (fold + v))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (first (at v 0))}) 'r) -- (enlist ((fn [g s v i] (first (at v 0))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (first (at v 0)) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (first (at v 0))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (max (- v (at v 0)))}) 'r) -- (enlist ((fn [g s v i] (max (- v (at v 0)))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (max (- v (at v 0))) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (max (- v (at v 0)))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (sum (at v i))}) 'r) -- (enlist ((fn [g s v i] (sum (at v i))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (sum (at v i)) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (sum (at v i))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (sum (- v (fold + v)))}) 'r) -- (enlist ((fn [g s v i] (sum (- v (fold + v)))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (sum (- v (fold + v))) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (sum (- v (fold + v)))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+(at (select {from: t r: (count (at v [0]))}) 'r) -- (enlist ((fn [g s v i] (count (at v [0]))) (ck false (quote g)) (ck false (quote s)) (ck false (quote v)) (ck false (quote i))))
+(at (select {from: t r: (count (at v [0])) where: (> v 6)}) 'r) -- (enlist ((fn [g s v i] (count (at v [0]))) (ck true (quote g)) (ck true (quote s)) (ck true (quote v)) (ck true (quote i))))
+;; update by: (the group, written back to its rows) and update under where:
+;; (the kept rows), as the select reads them
+(at (update {from: t by: g r: (- v (fold + v))}) 'r) -- [-30 -50 -40 -7 -5]
+(at (update {from: t by: g r: (- v (at v 0))}) 'r) -- [0 -20 -10 0 2]
+(at (update {from: t by: g r: (at v i)}) 'r) -- [10 30 20 7 5]
+(at (update {from: t by: g r: (til (count v))}) 'r) -- [0 1 2 0 1]
+(at (update {from: t r: (fold + v) where: (> v 6)}) 'r) -- [67 67 67 0Nl 67]
+(at (update {from: t r: (- v (fold + v)) where: (> v 6)}) 'r) -- [-37 -57 -47 0Nl -60]
+(at (update {from: t r: (at v i) where: (> v 6)}) 'r) -- [10 30 20 0Nl 30]
+(at (update {from: t r: (- v (at v 0)) where: (> v 6)}) 'r) -- [0 -20 -10 0Nl -23]
+;; an aggregate of an aggregate of the group is still refused (#1469)
+(select {from: t by: g r: (count (til (count v)))}) !- domain
+;; #1492 beside it: at over a vector that is no column is a lookup, read
+;; whole, its index the group's rows: (sum (at W i)) reads W at i
+(set W [100 200 300 400 500])
+(at (select {from: t by: g r: (sum (at W i))}) 'r) -- [600 300]
+(at (select {from: t by: g r: (at W 0)}) 'r) -- [100 100]
+;; fold over a free vector as long as the table folds the group's slice of
+;; it, as sum sums it (the owner's decision of 2026-11-24), on every route
+(at (select {from: t by: g r: (fold + W)}) 'r) -- (at (select {from: t by: g r: (sum W)}) 'r)
+(at (select {from: t by: g r: (fold + W)}) 'r) -- [600 900]
+(at (select {from: t by: g r: (fold + W) where: (> v 6)}) 'r) -- [600 500]
+(at (select {from: t r: (fold + W) where: (> v 6)}) 'r) -- [1100]
+(at (update {from: t by: g r: (fold + W)}) 'r) -- [600 600 600 900 900]
+(at (update {from: t r: (fold + W) where: (> v 6)}) 'r) -- [1100 1100 1100 0Nl 1100]
+(select {from: t by: g r: (fold + [1 2 3])}) !- length
+(at (select {from: t by: g r: (fold + [7])}) 'r) -- [7 7]
+(at (select {from: t by: g r: (fold + (til 3))}) 'r) -- [3 3]
+;; a LIST column: at a one-value index is one cell of the group, as select
+;; by: gives it, written to every row of the group by update (#1468)
+(set U (table [g v l] (list ['a 'a 'a 'b 'b] [1 2 3 4 5] (list [1 2] [3] [7] [8 9 10] [4]))))
+(at (select {f: (at l 1) from: U by: g}) 'f) -- (list [3] [4])
+(at (update {l: (at l 1) from: U by: g}) 'l) -- (list [3] [3] [3] [4] [4])
+(at (update {l: (at l 0) from: U by: g}) 'l) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
+(at (update {l: (at l 0) from: U where: (> v 2)}) 'l) -- (list [1 2] [3] [7] [7] [7])
+;; every spelling of fold follows the rule: fold-left, fold-right, fold-while
+(at (select {r: (- v (fold-left + 0 v)) from: t by: g}) 'r) -- (at (select {r: (- v (fold + v)) from: t by: g}) 'r)
+(at (select {r: (- v (fold-right + 0 v)) from: t by: g}) 'r) -- (list [-30 -50 -40] [-7 -5])
+(at (select {r: (- v (fold-while (fn [a] (< a 1000)) + 0 v)) from: t by: g}) 'r) -- (list [-30 -50 -40] [-7 -5])
+(at (select {r: (sum (- v (fold-left + 0 v))) from: t by: g}) 'r) -- [-120 -12]
+(at (select {r: (fold-left + 0 v) from: t where: (> v 6)}) 'r) -- [67]
+;; a helper that folds, keyless as inline
+(set Hf (fn [x] (fold + x)))
+(set Hl (fn [x] (let q (fold + x)) q))
+(at (select {r: (Hf v) from: t}) 'r) -- [72]
+(at (select {r: (Hf v) from: t where: (> v 6)}) 'r) -- [67]
+(at (select {r: (Hl v) from: t}) 'r) -- [72]
+(at (select {r: (Hf v) from: t by: g}) 'r) -- [60 12]
+;; an expression built from one-value forms is one value, as an aggregate is
+(at (select {r: (+ (fold + v) 1) from: t}) 'r) -- [73]
+(at (select {r: (+ (fold + v) (sum v)) from: t}) 'r) -- [144]
+(at (select {r: (+ (at v 0) 1) from: t}) 'r) -- [31]
+(at (select {r: (at v (- (count v) 1)) from: t}) 'r) -- [7]
+(at (select {r: (+ (fold + v) 1) w: v from: t}) 'r) -- [73 73 73 73 73]
+;; no rows: as on dev
+(count (select {r: (fold + v) from: (take t 0)})) -- 0
+(count (select {r: (fold + v) from: t where: (> v 99)})) -- 0
+(count (select {r: (at v 0) from: t where: (> v 99)})) -- 0
+(at (select {r: (sum (fold + v)) from: t where: (> v 99)}) 'r) -- [0]
+;; at of a column at an index that reads a free vector as long as the table
+;; is a lookup by row position, as on dev (#1492)
+(at (select {r: (at v (- (div W 100) 1)) from: t by: g}) 'r) -- (list [30 10 20] [5 7])
+(at (update {r: (at v (- (div W 100) 1)) from: t where: (> v 6)}) 'r) -- [30 10 20 0Nl 7]
+;; a vector of another length beside a row column is a length error
+(select {r: (at v [1 0]) vv: v from: t}) !- length
