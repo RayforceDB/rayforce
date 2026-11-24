@@ -271,8 +271,9 @@
 (select {from: Th by: {kk: k j: (- k 1) h: (dep_hidden k)} c: (count v) desc: c}) -- (table [kk j h c] (list [1 2] [0 1] [2 3] [2 1]))
 ;; a dropped key's name is no output, input column or other key
 (set Tg (table [k v] (list [1 1 2] [10 20 30])))
-(select {from: Tg by: {kk: k j: (- k 1)} j: (count v)}) -- (table [kk j j] (list [1 2] [0 1] [2 1]))
-(select {from: Tg by: {kk: k j: (- k 1)} c: (count v) kk: (sum v)}) -- (table [kk j c kk] (list [1 2] [0 1] [2 1] [30 30]))
+(select {from: Tg by: {kk: k j: (- k 1)} j: (count v)}) !- domain
+(select {from: Tg by: {kk: k j: (- k 1)} c: (count v) kk: (sum v)}) !- domain
+(select {from: Tg by: {kk: k j: (- k 1)} n: (count v)}) -- (table [kk j n] (list [1 2] [0 1] [2 1]))
 (select {from: Tg by: {kk: k v: (- k 1)} c: (count k)}) !- domain
 (select {from: Tg by: {kk: k j: (- k 1) j: k} c: (count v)}) !- domain
 (select {from: Tg by: {kk: k j: (- k 1) j: (+ k 1)} c: (count v)}) !- domain

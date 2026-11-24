@@ -28,7 +28,7 @@
 ;; a renamed or computed key stays a per-group output
 (cols (select {x: a u: (count h) from: S by: [a b]})) -- [a b x u]
 (type (at (select {x: a u: (count h) from: S by: [a b]}) 'x)) -- 'LIST
-(cols (select {a: (* a 2) u: (count h) from: S by: [a b]})) -- [a b a u]
+(cols (select {d: (* a 2) u: (count h) from: S by: [a b]})) -- [a b d u]
 ;; a key aliased in a by-dict folds under its alias
 (cols (select {x: x y: y u: (count h) from: S by: {x: a y: b}})) -- [x y u]
 (cols (select {a: a u: (count h) from: S by: {x: a y: b}})) -- [x y a u]

@@ -19222,6 +19222,44 @@ static ray_t* select_strip_key_projections(ray_t* dict) {
     return ray_dict_new(ck, cv);
 }
 
+/* An output named like a by: key (a name, a vector of names, or a by-dict
+ * alias) must be that key, `a: a`: anything else would give the result two
+ * columns of one name, the key and the output, and the output could not be
+ * reached by name (#1236).  A domain error naming the output, or NULL. */
+static ray_t* select_check_key_named_outputs(ray_t* dict) {
+    ray_t* by = dict_get(dict, "by");
+    if (!by) return NULL;
+    ray_t* kv = NULL;
+    int64_t k1 = -1, nk;
+    if (by->type == -RAY_SYM) {
+        k1 = by->i64;
+        nk = 1;
+    } else {
+        if (by->type == RAY_SYM) kv = by;
+        else if (by->type == RAY_DICT) kv = ray_dict_keys(by);
+        if (!kv || kv->type != RAY_SYM || kv->len < 1) return NULL;
+        nk = kv->len;
+    }
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    int64_t by_id = ray_sym_intern("by", 2);
+    ray_t** v = (ray_t**)ray_data(vals);
+    for (int64_t i = 0; i < keys->len; i++) {
+        int64_t kid = sym_cell_runtime_id(keys, i);
+        if (kid == by_id) continue;
+        bool is_key = false;
+        for (int64_t j = 0; j < nk && !is_key; j++) is_key = strip_key_id(kv, k1, j) == kid;
+        if (!is_key) continue;
+        if (v[i] && v[i]->type == -RAY_SYM && !(v[i]->attrs & ATTR_QUOTED) && v[i]->i64 == kid)
+            continue;                                      /* `a: a`, the key itself */
+        ray_t* nm = ray_sym_str(kid);
+        return ray_error("domain", "select by: output `%.*s` is named like a by: key but is not that key",
+                         nm ? (int)ray_str_len(nm) : 0, nm ? ray_str_ptr(nm) : "");
+    }
+    return NULL;
+}
+
 ray_t* ray_select(ray_t** args, int64_t n) {
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
@@ -19232,6 +19270,9 @@ ray_t* ray_select(ray_t** args, int64_t n) {
 }
 
 static ray_t* ray_select_lowered(ray_t** args, int64_t n) {
+    ray_t* clash = n == 1 && args[0] && args[0]->type == RAY_DICT
+        ? select_check_key_named_outputs(args[0]) : NULL;
+    if (clash) return clash;
     ray_t* merged = n > 0 ? ray_select_merge_plan(args[0]) : NULL;
     if (merged) args = &merged;
     ray_t* user = n > 0 ? args[0] : NULL;

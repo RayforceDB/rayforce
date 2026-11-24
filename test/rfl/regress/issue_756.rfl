@@ -77,14 +77,13 @@
 (key (select {from: Tb by: {g: k1} n: (count (distinct x))})) -- ['g 'n]
 (at (select {from: Tb by: {g: k1} n: (count (distinct x)) asc: g}) 'n) -- (at (select {from: Tb by: k1 n: (count (distinct x)) asc: k1}) 'n)
 ;; a duplicate alias is the by-dict's error on every route; an alias equal to
-;; the count's name yields the same two columns on every route — the key
-;; under it first, the count second
+;; an output named like a by-dict alias but holding the count is a domain
+;; error on every route (#1236)
 (select {from: Tb by: {g: k1 g: k2} n: (count (distinct x))}) !- domain
 (select {from: Tb by: {g: k1 g: k1} n: (count (distinct x))}) !- domain
-(key (select {from: Tb by: {n: k1} n: (count (distinct x))})) -- ['n 'n]
-(at (value (select {from: Tb by: {n: k1} n: (count (distinct x))})) 1) -- (take [1000] 7)
-(key (select {from: Tb by: {n: k1 h: k2} n: (count (distinct x))})) -- ['n 'h 'n]
-(at (value (select {from: Tb by: {n: k1 h: k2} n: (count (distinct x))})) 2) -- (take [1000] 21)
+(select {from: Tb by: {n: k1} n: (count (distinct x))}) !- domain
+(select {from: Tb by: {n: k1 h: k2} n: (count (distinct x))}) !- domain
+(at (value (select {from: Tb by: {n: k1 h: k2} c: (count (distinct x))})) 2) -- (take [1000] 21)
 ;; an alias naming another input column is rejected the same way on every route
 (select {from: T by: {k2: k1} n: (count (distinct v))}) !- domain
 (select {from: T by: {k2: k1 k1: k2} n: (count (distinct v))}) !- domain

@@ -32,10 +32,10 @@
 (at (select {u: (count h) a: a from: S by: a}) 'a) -- (as 'I32 [1 2 3])
 (at (select {u: (count h) a: a from: S by: a}) 'u) -- [3 2 1]
 ;; a computed key stays a per-group output
-(cols (select {u: (count h) a: (* a 2) from: S by: a})) -- [a u a]
+(cols (select {u: (count h) d: (* a 2) from: S by: a})) -- [a u d]
 ;; a quoted symbol is a constant, not the key
-(cols (select {u: (count h) a: 'a from: S by: a})) -- [a u a]
-(at (value (select {u: (count h) a: 'a from: S by: a})) 2) -- ['a 'a 'a]
+(cols (select {u: (count h) q: 'a from: S by: a})) -- [a u q]
+(at (value (select {u: (count h) q: 'a from: S by: a})) 2) -- ['a 'a 'a]
 
 ;; 300K rows, 100K groups: the projected select is the unprojected one
 (set n 300000)

@@ -342,6 +342,22 @@ is the select with no outputs. A key projected under another name (`x: sym`)
 is an ordinary output containing each group's key values. A computed projection of a key is an
 ordinary output.
 
+An output named like a key must be that key. An output that takes the name of
+a `by:` key (a key column, or an alias of a by-dict such as `k` in
+`by: {k: (+ a 1)}`) but holds anything else, a computed value, an aggregate,
+another column or a quoted symbol, is a `domain` error that names the output:
+the result would otherwise have two columns of that name, and only the key
+could be reached by it. Give the output another name. A key computed without a
+name (`by: (+ a 1)`) does not clash: when an output takes the name it would get,
+the key is called `key`.
+
+```lisp
+(select {from: trades by: sym sym: (count qty)})            ; error: domain, output `sym`
+(select {from: trades by: [sym side] side: (sum qty)})      ; error: domain, output `side`
+(select {from: trades by: {k: sym} k: (sum qty)})           ; error: domain, output `k`
+(select {from: trades by: sym n: (count qty)})              ; columns sym n
+```
+
 ```lisp
 (select {from: trades by: sym total: (sum qty) sym: sym})   ; columns sym total
 (select {from: trades by: [sym side]

@@ -2597,8 +2597,8 @@ static test_result_t test_firstn_parted(void) {
      * hold a share above 1/64), each answered as generation 0 */
     static const char* const ds[] = {
         "(select {c: (count h) from: T by: {h: h s: s} take: 10})",
-        "(select {c: (count h) s: (sum v) from: T by: s take: 200})",
-        "(select {c: (count h) s: (sum v) from: T by: s take: 3})",
+        "(select {c: (count h) sv: (sum v) from: T by: s take: 200})",
+        "(select {c: (count h) sv: (sum v) from: T by: s take: 3})",
         NULL,
     };
     static const char* const roots[] = { "fpm", "fp2", "fp2" };
