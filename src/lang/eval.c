@@ -2902,8 +2902,24 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         /* Convert Rayfall list (or typed vec) to typed column vector */
         ray_t* col_src = col_elems[i];
 
-        /* Single atom → wrap in a 1-element vector */
+        /* Single atom → wrap in a 1-element vector.  A process-local
+         * handle is wrapped in a 1-cell LIST instead: an I64 cell would
+         * keep its pointer as a plain integer and drop what marks it. */
         ray_t* atom_wrap = NULL;
+        if (ray_is_handle_atom(col_src)) {
+            ray_t* one = ray_list_new(1);
+            if (RAY_IS_ERR(one)) { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return one; }
+            ray_t* prev = one;
+            one = ray_list_append(one, col_src);
+            if (RAY_IS_ERR(one)) { ray_release(prev); ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return one; }
+            if (expected_rows < 0) expected_rows = 1;
+            else if (expected_rows != 1)
+                { ray_release(one); ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got 1", (long long)expected_rows); }
+            tbl = ray_table_add_col(tbl, name_id, one);
+            ray_release(one);
+            if (RAY_IS_ERR(tbl)) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return tbl; }
+            continue;
+        }
         if (ray_is_atom(col_src) && col_src->type != -RAY_SYM) {
             int8_t atype = -col_src->type;
             if (atype == RAY_GUID) {
@@ -3006,6 +3022,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         /* ray_vec_append copies the atom payload raw and never sets HAS_NULLS,
          * so track typed null atoms and flip the column flag after the loop. */
         bool col_has_nulls = false;
+        /* A process-local handle met while filling: the column stays the
+         * source LIST, since a typed I64 cell would turn the handle into
+         * its pointer as a plain integer (#802). */
+        bool has_handle = false;
 
         for (int64_t j = 0; j < nrows; j++) {
             /* Promotion preserves logical nulls, not the source sentinel's
@@ -3042,6 +3062,8 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                     return ray_error("type", "table: %s column element type mismatch, got %s", ray_type_name(col_type), ray_type_name(et));
                 }
                 if (numeric) {
+                    if (RAY_UNLIKELY(cell->attrs & RAY_HANDLE_ATTRS) && cell->type == -RAY_I64)
+                        { has_handle = true; break; }
                     if (cell_is_null && (col_type == RAY_BOOL || col_type == RAY_U8))
                         ((uint8_t*)ray_data(col_vec))[j] = 0;
                     else if (cell_is_null) ray_vec_set_null(col_vec, j, true);
@@ -3059,7 +3081,11 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
         }
 
-        if (col_has_nulls && col_vec->type != RAY_SYM)
+        if (RAY_UNLIKELY(has_handle)) {
+            ray_release(col_vec);
+            col_vec = col_src;
+            ray_retain(col_vec);
+        } else if (col_has_nulls && col_vec->type != RAY_SYM)
             col_vec->attrs |= RAY_ATTR_HAS_NULLS;
 
         tbl = ray_table_add_col(tbl, name_id, col_vec);

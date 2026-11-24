@@ -34,6 +34,7 @@
 #include "lang/eval.h"
 #include "lang/env.h"
 #include "mem/sys.h"
+#include "mem/heap.h"
 #include "core/ipc.h"
 #include "ops/journal.h"
 
@@ -1427,6 +1428,156 @@ static test_result_t test_journal_snapshot_basic(void) {
     TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
     cleanup_base(base);
     PASS();
+}
+
+/* #802: a binding that holds a process-local handle (a graph, a vector
+ * index, an embedding model, a Datalog program, alone or inside a list,
+ * dict or table) is left
+ * out of the snapshot with one stderr warning per name; the rest is saved,
+ * the log rolls, and reload plus replay gives the saved state with the
+ * skipped names unbound.  A direct (ser handle) stays a domain error. */
+static const char* const k_handle_names[] = {
+    "jh_graph", "jh_index", "jh_model", "jh_prog", "jh_list", "jh_dict", "jh_table",
+    "jh_mlist"
+};
+enum { K_HANDLE_NAMES = (int)(sizeof k_handle_names / sizeof k_handle_names[0]) };
+
+/* The body of the test below; the wrapper closes the journal and removes
+ * the files whichever assertion returns, so a failure here cannot leave
+ * the journal open for the tests that run after it. */
+static test_result_t snapshot_skips_handles_body(const char* base) {
+    char qpath[270]; qdb_path(qpath, sizeof(qpath), base);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str(
+        "(set jh_a 7)"
+        "(set jh_edges (table [src dst w] (list [0 1] [1 2] [1.0 1.0])))"
+        "(set jh_graph (.graph.build jh_edges 'src 'dst 'w))"
+        "(set jh_index (.emb.hnsw.build (list [1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]) 'l2))"
+        "(set jh_model (.emb.model.get \"test/data/emb/tiny\"))"
+        "(set jh_mlist (list \"text\" jh_model))"
+        "(set jh_prog (dl-program))"
+        "(set jh_list (list 1 jh_graph))"
+        "(set jh_dict (dict ['k] (list jh_index)))"
+        "(set jh_table (table [k h] (list [1] (list jh_prog))))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+
+    /* The table keeps the program as a handle cell, not as its pointer
+     * copied into a plain I64 column. */
+    ray_t* cell = ray_eval_str("(at (at jh_table 'h) 0)");
+    TEST_ASSERT_NOT_NULL(cell);
+    TEST_ASSERT_TRUE(ray_is_handle_atom(cell));
+    ray_release(cell);
+    /* A handle after an ordinary integer is kept too, not narrowed. */
+    cell = ray_eval_str("(at (at (table [h] (list (list 5 jh_prog))) 'h) 1)");
+    TEST_ASSERT_NOT_NULL(cell);
+    TEST_ASSERT_TRUE(ray_is_handle_atom(cell));
+    ray_release(cell);
+
+    /* A direct ser of each handle kind is still refused. */
+    const char* sers[] = { "(ser jh_graph)", "(ser jh_index)", "(ser jh_model)", "(ser jh_prog)" };
+    for (int i = 0; i < 4; i++) {
+        ray_t* e = ray_eval_str(sers[i]);
+        TEST_ASSERT_NOT_NULL(e);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+        TEST_ASSERT_STR_EQ(ray_err_code(e), "domain");
+        ray_error_free(e);
+    }
+
+#ifndef RAY_OS_WINDOWS
+    char warn_path[300];
+    snprintf(warn_path, sizeof(warn_path), "%s.warn", base);
+    int warn_fd = open(warn_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_TRUE(warn_fd >= 0);
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    TEST_ASSERT_TRUE(saved_stderr >= 0);
+    TEST_ASSERT_EQ_I(dup2(warn_fd, STDERR_FILENO), STDERR_FILENO);
+#endif
+    ray_err_t snap = ray_journal_snapshot();
+#ifndef RAY_OS_WINDOWS
+    fflush(stderr);
+    TEST_ASSERT_EQ_I(dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    close(saved_stderr);
+    char warn[2048];
+    ssize_t wn = pread(warn_fd, warn, sizeof(warn) - 1, 0);
+    close(warn_fd);
+    unlink(warn_path);
+    TEST_ASSERT_TRUE(wn > 0);
+    warn[wn] = '\0';
+#endif
+    TEST_ASSERT_EQ_I(snap, RAY_OK);
+    TEST_ASSERT_TRUE(ray_journal_is_open());
+#ifndef RAY_OS_WINDOWS
+    /* One warning line per skipped name, none for the kept ones. */
+    int lines = 0;
+    for (const char* q = warn; (q = strstr(q, "snapshot skips '")); q++) lines++;
+    TEST_ASSERT_EQ_I(lines, K_HANDLE_NAMES);
+    for (int i = 0; i < K_HANDLE_NAMES; i++) {
+        char want[64];
+        snprintf(want, sizeof(want), "snapshot skips '%s'", k_handle_names[i]);
+        TEST_ASSERT_NOT_NULL(strstr(warn, want));
+    }
+    TEST_ASSERT_NULL(strstr(warn, "'jh_a'"));
+    TEST_ASSERT_NULL(strstr(warn, "'jh_edges'"));
+#endif
+
+    /* The .qdb holds the kept bindings and none of the skipped names. */
+    ray_t* saved = ray_obj_load(qpath);
+    TEST_ASSERT_NOT_NULL(saved);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(saved));
+    TEST_ASSERT_EQ_I(saved->type, RAY_DICT);
+    TEST_ASSERT_TRUE(ray_dict_find_sym(saved, ray_sym_intern("jh_a", 4)) >= 0);
+    TEST_ASSERT_TRUE(ray_dict_find_sym(saved, ray_sym_intern("jh_edges", 8)) >= 0);
+    for (int i = 0; i < K_HANDLE_NAMES; i++) {
+        int64_t id = ray_sym_intern(k_handle_names[i], (int64_t)strlen(k_handle_names[i]));
+        TEST_ASSERT_EQ_I(ray_dict_find_sym(saved, id), -1);
+    }
+    ray_release(saved);
+
+    /* One logged mutation after the snapshot: the tail replay applies it. */
+    r = ray_eval_str("(.log.write (quote (set jh_a (+ jh_a 1))))"
+                     "(set jh_a (+ jh_a 1))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* A new process: fresh runtime, then recovery from .qdb plus .log. */
+    ray_runtime_destroy(__RUNTIME);
+    ray_runtime_create(0, NULL);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+
+    ray_t* a = ray_eval_str("jh_a");
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(a));
+    TEST_ASSERT_EQ_I(a->i64, 8);
+    ray_release(a);
+    ray_t* n = ray_eval_str("(count jh_edges)");
+    TEST_ASSERT_NOT_NULL(n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n));
+    TEST_ASSERT_EQ_I(n->i64, 2);
+    ray_release(n);
+    for (int i = 0; i < K_HANDLE_NAMES; i++) {
+        ray_t* v = ray_eval_str(k_handle_names[i]);
+        TEST_ASSERT_NOT_NULL(v);
+        TEST_ASSERT_TRUE(RAY_IS_ERR(v));
+        TEST_ASSERT_STR_EQ(ray_err_code(v), "name");
+        ray_error_free(v);
+    }
+
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    PASS();
+}
+
+static test_result_t test_journal_snapshot_skips_handles(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_handles");
+    test_result_t res = snapshot_skips_handles_body(base);
+    if (ray_journal_is_open()) (void)ray_journal_close();
+    cleanup_base(base);
+    return res;
 }
 
 /* 7c. Open with existing .qdb — snapshot is loaded (covers qdb-load branch). */
@@ -3675,6 +3826,7 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_when_closed",      test_journal_snapshot_when_closed,      jrn_setup, jrn_teardown },
     { "journal/snapshot_basic",            test_journal_snapshot_basic,            jrn_setup, jrn_teardown },
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
+    { "journal/snapshot_skips_handles",    test_journal_snapshot_skips_handles,    jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },

@@ -102,6 +102,14 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
 
+A process-local handle has no saved form: a graph from [`.graph.build`](graph.md#graph-build), a vector index from [`.emb.hnsw.build`](emb.md#emb-hnsw-build), an embedding model from [`.emb.model.get`](emb.md#emb-model-get) and a Datalog program from `dl-program` each point into the running process. The snapshot leaves out every global that holds one, alone or anywhere inside a list, dict or table, and prints one line per name on stderr:
+
+```
+log: WARN  snapshot skips 'G': it holds a process-local handle (graph, vector index, embedding model or Datalog program)
+```
+
+The other globals are saved and the log rolls as usual. After a restart the skipped names are unbound, so rebuild them from saved data (for example in the boot script) before using them. Outside the snapshot nothing changes: a direct `(ser G)` fails with `domain`, and an IPC reply that holds a handle reaches the client as a `type` error ("result of type i64 is not serializable over IPC").
+
 A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
 
 - After a journaled restricted request whose trusted calls ran lifted, the server writes a note. The note names its request by the request's position in the log, so requests logged in between (ones a peer sent back while a trusted body waited on it) do not part the two. It lists the lifted calls in order, each by the verb's identity: a hash of the global name it was trusted under, its parameters, its body and its captures, computed once by `.sys.trust`. A captured lambda counts by its own parameters, body and captures, not by whether it is trusted.
