@@ -1085,7 +1085,11 @@ ray_t* exec_window(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     uint32_t n_funcs = ext->window.n_funcs;
     uint32_t n_sort  = n_part + n_order;
 
-    if (nrows == 0 || n_funcs == 0) {
+    /* An empty input still runs the compute below, which appends one
+     * typed, zero-length column per function (#1562): returning tbl here
+     * left the result without them, and the caller's rename of the last
+     * n_funcs columns then overwrote the input columns' names. */
+    if (n_funcs == 0) {
         ray_retain(tbl);
         return tbl;
     }

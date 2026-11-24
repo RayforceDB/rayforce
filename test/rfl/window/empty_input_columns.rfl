@@ -1,0 +1,24 @@
+;; window over an empty table keeps every input column (#1562): the result had
+;; only the partition and function columns, so beg and v were gone and a
+;; select on v failed with a schema error.
+
+(set t (table [k beg v] (list ['a 'a] [1 2] [10 20])))
+(set e (select {from: t where: (> beg 99)}))
+(set ctypes (fn [T] (map (fn [c] (type (at T c))) (cols T))))
+(set f (fn [x] (window {from: x part: [k] order: [beg] frame: 2 funcs: {prev: (first v) n: (count v)}})))
+(cols (f t)) -- [k beg v prev n]
+(cols (f e)) -- [k beg v prev n]
+(count (f e)) -- 0
+(identical (ctypes (f e)) (ctypes (f t))) -- true
+(count (select {from: (f e) where: (> v 5)})) -- 0
+(set g (fn [x] (window {from: x order: [beg] frame: 'running funcs: {s: (sum v)}})))
+(cols (g e)) -- [k beg v s]
+(identical (ctypes (g e)) (ctypes (g t))) -- true
+;; the input table keeps its own column names
+(cols e) -- [k beg v]
+;; every function kind, on a F64 and a SYM column
+(set u (table [k o x s] (list ['a 'b 'a] [1 2 3] [1.5 2.5 3.5] ['p 'q 'r])))
+(set ue (select {from: u where: (> o 99)}))
+(set h (fn [x] (window {from: x part: [k] order: [o] frame: 'whole funcs: {a: (sum x) b: (avg x) c: (min x) d: (max x) e: (first s) f: (last s) g: (count x) h: (min s)}})))
+(cols (h ue)) -- [k o x s a b c d e f g h]
+(identical (ctypes (h ue)) (ctypes (h u))) -- true
