@@ -3072,9 +3072,8 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
              * there and cancels the running query.  Then keep awaiting its
              * cancel reply.  Best-effort: a server without OOB-cancel support
              * ignores the byte and the query completes as before. */
-            if (ray_interrupted()) {
+            if (ray_take_interrupt()) {  /* consume: never resent, never cancels locally */
                 bool sent = send_cancel(sel);
-                ray_clear_interrupt();  /* consume; do not resend or cancel locally */
                 if (!sent) {
                     /* An earlier request's cancel is still unconfirmed, so
                      * this one cannot be named safely: close instead. */
