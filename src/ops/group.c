@@ -17781,13 +17781,16 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 : col_vec_new(agg_vecs[a], 1);
             if (col && !RAY_IS_ERR(col)) {
                 col->len = 1;
-                if (RAY_ATOM_IS_NULL(atom)) {
-                    ray_vec_set_null(col, 0, true);
-                } else if (agg_vecs[a]->type == RAY_LIST) {
-                    /* agg_wide_reduce returned an owned child reference;
-                     * transfer it directly into the owning output list. */
+                if (agg_vecs[a]->type == RAY_LIST) {
+                    /* agg_wide_reduce returned an owned child reference,
+                     * the 0Nl of no row included (as (first (list)) gives):
+                     * transfer it directly into the owning output list.  A
+                     * list has no null bit, so a null left the cell empty
+                     * (#1405). */
                     ((ray_t**)ray_data(col))[0] = atom;
                     atom = NULL;
+                } else if (RAY_ATOM_IS_NULL(atom)) {
+                    ray_vec_set_null(col, 0, true);
                 } else if (agg_vecs[a]->type == RAY_STR) {
                     ray_t* nv = ray_str_vec_set(col, 0, ray_str_ptr(atom), ray_str_len(atom));
                     if (nv && !RAY_IS_ERR(nv)) col = nv;

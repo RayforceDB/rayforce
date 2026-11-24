@@ -389,7 +389,8 @@ and calls of a lambda the planner does not inline, which gets the column,
 are evaluated over the whole column and their error is the query's (`(last (if c s d))` with SYM
 and DATE arms raises `if: branches mix SYM and DATE`); over an empty
 `where:` the answer is the null of the argument's type, `0Nd` for a DATE
-lambda, `0x00` for U8; and an answer that is a collection, such as the cell
+lambda, `0x00` for U8, and `0Nl` for `first` or `last` of a LIST column, as
+`(first (list))` is; and an answer that is a collection, such as the cell
 of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
 `(list (list 1))`. Not yet settled: `fold`, and `at` with a constant index (one
 written in place, or under a `where:` any index that reads no column), read
