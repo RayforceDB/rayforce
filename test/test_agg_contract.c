@@ -10,6 +10,7 @@
 #include "ops/agg_registry.h"
 #include "core/pool.h"
 #include "core/platform.h"
+#include "page_cache.h"   /* ray_test_file_refaults: the fault budgets */
 #include "mem/heap.h"
 #include "ops/fused_pred.h"
 #include "ops/cdfuse.h"
@@ -4581,11 +4582,42 @@ static test_result_t test_agg_topk_ask_ahead(void) {
  * thousands.  (The faults alone would not tell: the kernel's own
  * read-ahead follows a sweep of pages in order, and most of its faults
  * are then minor.)  A step's columns are its own: pages a step faulted in
- * stay mapped and cannot be evicted for the next. */
+ * stay mapped and cannot be evicted for the next.
+ *
+ * The fault budget holds only while the pages asked for stay in the page
+ * cache until they are read.  Under memory pressure reclaim can drop them
+ * first, and reading them again is a major fault the code did not cause
+ * (#1579: 116 to 471 faults with four suites and a reclaiming load).  Such
+ * a read back of a reclaimed file page is what the kernel counts as a
+ * refault (workingset_refault_file), so a step's budget is raised by the
+ * refaults counted over the step and no more: every step is judged, and
+ * refaults that are not the test's own (the count is its cgroup's, or the
+ * system's) cost the budget that much slack, not the check.  A step that
+ * read what it never asked for faults on most of its pages, hundreds or
+ * thousands, past any such slack.  The bytes asked for are judged always. */
 static long cd_major_faults(void) {
     struct rusage u;
     getrusage(RUSAGE_SELF, &u);
     return u.ru_majflt;
+}
+
+/* A step's major faults and refaults (cd_step_begin, then
+ * cd_step_faults_ok).  The refaults are read outside the faults at both
+ * ends, so the refault window covers the fault window. */
+typedef struct { long faults; int64_t refaults; } cd_step_t;
+static cd_step_t cd_step_begin(void) {
+    int64_t r = ray_test_file_refaults();
+    return (cd_step_t){ cd_major_faults(), r };
+}
+
+/* Whether the step since `s` kept to the fault budget `max`, raised by the
+ * file refaults counted meanwhile (*faults: the step's; *excused: the
+ * refaults, 0 where there is no count). */
+static bool cd_step_faults_ok(cd_step_t s, long max, long* faults, long* excused) {
+    *faults = cd_major_faults() - s.faults;
+    int64_t r = ray_test_file_refaults();
+    *excused = (s.refaults >= 0 && r > s.refaults) ? (long)(r - s.refaults) : 0;
+    return *faults - *excused <= max;
 }
 
 static test_result_t test_cd_gate_read_ahead(void) {
@@ -4620,16 +4652,18 @@ static test_result_t test_cd_gate_read_ahead(void) {
     /* the where: sample — 262,144 rows of w, 64 to a page: every page */
     const int64_t* rows = NULL;
     int64_t nrows = 0, pop = 0;
-    long f0 = cd_major_faults();
+    cd_step_t st = cd_step_begin();
     uint64_t b0 = ray_vm_willneed_bytes();
     ray_t* hdr = query_cd_gate_where_rows(m, pred, N, &rows, &nrows, &pop);
-    long f_where = cd_major_faults() - f0;
+    long f_where;
+    long x_where;
+    bool ok_where = cd_step_faults_ok(st, FAULTS_MAX, &f_where, &x_where);
     uint64_t b_where = ray_vm_willneed_bytes() - b0;
     TEST_ASSERT_NOT_NULL(hdr);
     TEST_ASSERT_FMT(nrows > 24000 && nrows < 30000, "where sample keeps %lld of 262,144", (long long)nrows);
     TEST_ASSERT_FMT(b_where >= (uint64_t)N * 4, "where sample asked for %llu bytes, w is %llu",
                     (unsigned long long)b_where, (unsigned long long)N * 4);
-    TEST_ASSERT_FMT(f_where <= FAULTS_MAX, "where sample: %ld major faults", f_where);
+    TEST_ASSERT_FMT(ok_where, "where sample: %ld major faults (%ld excused as refaults)", f_where, x_where);
 
     /* a slice of the sorted column: the zone gate rules out every chunk
      * but the two (64 K rows each) the window falls in, so the sample is
@@ -4639,10 +4673,12 @@ static test_result_t test_cd_gate_read_ahead(void) {
     TEST_ASSERT_TRUE(pred_t && !RAY_IS_ERR(pred_t) && !pfs_col_resident("t"));
     const int64_t* rows_t = NULL;
     int64_t nrows_t = 0, pop_t = 0;
-    f0 = cd_major_faults();
+    st = cd_step_begin();
     b0 = ray_vm_willneed_bytes();
     ray_t* hdr_t = query_cd_gate_where_rows(m, pred_t, N, &rows_t, &nrows_t, &pop_t);
-    long f_slice = cd_major_faults() - f0;
+    long f_slice;
+    long x_slice;
+    bool ok_slice = cd_step_faults_ok(st, FAULTS_MAX, &f_slice, &x_slice);
     uint64_t b_slice = ray_vm_willneed_bytes() - b0;
     TEST_ASSERT_NOT_NULL(hdr_t);
     TEST_ASSERT_FMT(nrows_t == 40000 && pop_t == 40000, "slice sample keeps %lld for %lld",
@@ -4650,7 +4686,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     TEST_ASSERT_FMT(b_slice >= (uint64_t)40000 * 8 && b_slice <= (uint64_t)N * 8 / 16,
                     "slice sample asked for %llu bytes of t's %llu", (unsigned long long)b_slice,
                     (unsigned long long)N * 8);
-    TEST_ASSERT_FMT(f_slice <= FAULTS_MAX, "slice sample: %ld major faults", f_slice);
+    TEST_ASSERT_FMT(ok_slice, "slice sample: %ld major faults (%ld excused as refaults)", f_slice, x_slice);
     scratch_free(hdr_t);
     ray_release(pred_t);
 
@@ -4675,17 +4711,19 @@ static test_result_t test_cd_gate_read_ahead(void) {
 
     /* the estimate over the survivors: a tenth of the rows, 50 to a page
      * of k and x — the columns are asked for whole */
-    f0 = cd_major_faults();
+    st = cd_step_begin();
     b0 = ray_vm_willneed_bytes();
     TEST_ASSERT_TRUE(agg_group_card_sample(cols, 2, 1, rows, nrows, pop, est, &kp, &kmax, &ka));
-    long f_est = cd_major_faults() - f0;
+    long f_est;
+    long x_est;
+    bool ok_est = cd_step_faults_ok(st, FAULTS_MAX, &f_est, &x_est);
     uint64_t b_est = ray_vm_willneed_bytes() - b0;
     scratch_free(hdr);
     TEST_ASSERT_FMT(est[0] >= 900 && est[0] <= 1100, "k estimate %lld", (long long)est[0]);
     /* the span from the first sampled row to the last: the columns but a few rows */
     TEST_ASSERT_FMT(b_est >= (uint64_t)N * 16 * 15 / 16, "estimate asked for %llu bytes, k and x are %llu",
                     (unsigned long long)b_est, (unsigned long long)N * 16);
-    TEST_ASSERT_FMT(f_est <= FAULTS_MAX, "estimate: %ld major faults", f_est);
+    TEST_ASSERT_FMT(ok_est, "estimate: %ld major faults (%ld excused as refaults)", f_est, x_est);
     ray_release(pred);
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
@@ -4718,10 +4756,12 @@ static test_result_t test_cd_gate_read_ahead(void) {
     int64_t* sel = malloc((size_t)SEL3 * sizeof(int64_t));
     TEST_ASSERT_NOT_NULL(sel);
     for (int64_t i = 0; i < SEL3; i++) sel[i] = i * 1030;
-    f0 = cd_major_faults();
+    st = cd_step_begin();
     b0 = ray_vm_willneed_bytes();
     bool two_pass = ray_cd_two_pass_preferred(&k3, 1, x3, sel, SEL3, 0, 4);
-    long f_gate = cd_major_faults() - f0;
+    long f_gate;
+    long x_gate;
+    bool ok_gate = cd_step_faults_ok(st, FAULTS_MAX, &f_gate, &x_gate);
     uint64_t b_gate = ray_vm_willneed_bytes() - b0;
     free(sel);
     TEST_ASSERT_TRUE(two_pass);
@@ -4731,7 +4771,7 @@ static test_result_t test_cd_gate_read_ahead(void) {
     TEST_ASSERT_FMT(b_gate >= b_need && b_gate < (uint64_t)N3 * 8,
                     "gate asked for %llu bytes, needs %llu, k3 is %llu", (unsigned long long)b_gate,
                     (unsigned long long)b_need, (unsigned long long)N3 * 8);
-    TEST_ASSERT_FMT(f_gate <= FAULTS_MAX, "gate: %ld major faults", f_gate);
+    TEST_ASSERT_FMT(ok_gate, "gate: %ld major faults (%ld excused as refaults)", f_gate, x_gate);
     ray_release(m);
     r = ray_eval_str("(set pfs_m 0)");
     if (r) ray_release(r);
