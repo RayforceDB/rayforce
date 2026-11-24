@@ -9229,6 +9229,9 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v += affine[a].bias_f64 * nn;
                         break;
                     case OP_PROD:
+                        /* no row at all: the empty product, as the builtin
+                         * and the evaluator give it (#1577) */
+                        if (counts[gi] == 0) { v = 1.0; break; }
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
                         break;
@@ -9337,6 +9340,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, nn));
                         break;
                     case OP_PROD:
+                        if (counts[gi] == 0) { v = 1; break; }   /* the empty product (#1577) */
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = sum_i64[idx]; break;
                     case OP_COUNT: v = counts[gi]; break;
