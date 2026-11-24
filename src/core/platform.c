@@ -1913,6 +1913,61 @@ void ray_io_counters(bool thread, ray_io_counters_t* out) {
 #endif
 }
 
+/* ---- The stack floor for recursion guards (platform.h) ------------------- */
+static RAY_TLS uintptr_t ray_stack_floor_tl;   /* 0: not read yet; 1: no bound */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+  #define RAY_STACK_SANITIZED 1
+#elif defined(__has_feature)
+  #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    #define RAY_STACK_SANITIZED 1
+  #endif
+#endif
+/* The reserve is a sixteenth of the stack, between 64 KB and 512 KB.  A
+ * sanitizer build's frames reach 64 KB and more (the bytecode VM's, under
+ * ASan at -O0), so there it is an eighth, between 256 KB and 1 MB: one
+ * level of the deepest recursion must fit between two checks.  Never more
+ * than half the stack. */
+/* Out of line and cold: inlined into ray_stack_short, its locals brought a
+ * frame and a stack-protector canary into every check.  The reserve is
+ * sized on the stack left below this frame: glibc keeps a thread's static
+ * TLS (about 87 KB here) at the top of the block it reports, and a thread
+ * may keep large objects on its stack before the first check. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline, cold))
+#endif
+static uintptr_t ray_stack_floor_read(void) {
+    uintptr_t lo, hi;
+    if (!ray_thread_stack_bounds(&lo, &hi) || hi <= lo) return ray_stack_floor_tl = 1;
+#if defined(__GNUC__) || defined(__clang__)
+    uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+    if (here > lo && here < hi) hi = here;
+#endif
+    uintptr_t size = hi - lo;
+#if defined(RAY_STACK_SANITIZED)
+    uintptr_t reserve = size / 8, rmin = (uintptr_t)256 << 10, rmax = (uintptr_t)1 << 20;
+#else
+    uintptr_t reserve = size / 16, rmin = (uintptr_t)64 << 10, rmax = (uintptr_t)512 << 10;
+#endif
+    if (reserve < rmin) reserve = rmin;
+    if (reserve > rmax) reserve = rmax;
+    if (reserve > size / 2) reserve = size / 2;
+    return ray_stack_floor_tl = lo + reserve;
+}
+
+bool ray_stack_short(void) {
+    uintptr_t floor = ray_stack_floor_tl;
+    if (RAY_UNLIKELY(!floor)) floor = ray_stack_floor_read();
+#if defined(__GNUC__) || defined(__clang__)
+    /* This frame, just below the caller's: a local's address may lie on a
+     * sanitizer's fake stack, which is not the thread's. */
+    uintptr_t pos = (uintptr_t)__builtin_frame_address(0);
+#else
+    volatile char here = 0;
+    uintptr_t pos = (uintptr_t)&here;
+#endif
+    return pos < floor;
+}
+
 bool ray_env_flag(const char* name) {
     const char* v = getenv(name);
     return v && *v && strcmp(v, "0") != 0;

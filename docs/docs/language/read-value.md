@@ -129,7 +129,7 @@ Override any of them with a dictionary: `(read-value s {nodes: 5000 alloc: 10485
 | Name | Default | What it counts |
 |---|---|---|
 | `input` | 8 MiB | encoded bytes of the text, checked before anything is read |
-| `depth` | 128 | nesting depth, the root value being depth 1. Never above 1024, whatever is asked |
+| `depth` | 128 | nesting depth, the root value being depth 1. Never above 1024, whatever is asked; a text that would run the thread's stack out first stops earlier, with a `limit` error |
 | `nodes` | 1,000,000 | data occurrences in the value: every scalar, every vector element, and every container (vector, list, dict, table) |
 | `grammar` | 1,000,000 | syntax nodes: every token, call and type tag |
 | `symbol-bytes` | 1 MiB | decoded bytes of every symbol occurrence, repeated names included |

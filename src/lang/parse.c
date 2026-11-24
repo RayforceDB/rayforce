@@ -1093,11 +1093,18 @@ static ray_t* parse_expr_inner(ray_parser_t *p);
 /* Depth-guarded entry point.  Container literals recurse back here through
  * parse_expr, so a single ceiling check on the way in bounds the whole
  * recursive-descent stack; without it a pathological "[[[[..." input
- * overflows the C stack and crashes the process. */
+ * overflows the C stack and crashes the process.  The count alone is not
+ * enough where a level costs more (an unoptimized sanitizer build) or the
+ * thread's stack is small, so the parse also stops at the thread's stack
+ * reserve (ray_stack_short). */
 static ray_t* parse_expr(ray_parser_t *p) {
     if (++p->depth > RAY_PARSE_MAX_DEPTH) {
         p->depth--;
         return ray_error("parse", "nesting too deep, limit %d", RAY_PARSE_MAX_DEPTH);
+    }
+    if (RAY_UNLIKELY((p->depth & 3) == 0 && ray_stack_short())) {   /* every fourth level */
+        p->depth--;
+        return ray_error("parse", "nesting too deep for this thread's stack");
     }
     ray_t* r = parse_expr_inner(p);
     p->depth--;
