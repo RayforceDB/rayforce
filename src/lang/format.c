@@ -66,7 +66,9 @@ typedef struct {
     int64_t  clip;      /* when non-zero, the buffer stops (err) at its first growth
                          * once len has reached it: a table cell needs no more
                          * than its shown width */
-    ray_dup_t dup;      /* what is written again for shared parts (#1627) */
+    ray_dup_t dup;      /* what is written again for shared parts (#1627); a write
+                         * that is part of a larger one holds that one's tracker
+                         * here while it runs (fmt_dup_in/fmt_dup_out, #1648) */
     const ray_t* skip;  /* the value fmt_obj_watched is writing (its body's turn) */
 } fmt_buf_t;
 
@@ -626,7 +628,9 @@ const char* ray_fmt_null_literal(int8_t type) {
  * (format "%" v) gives.  The text is *txt, *len bytes: in `buf` (cap >= 64)
  * or borrowed from `a`, and NULL is returned; or inside the returned owned
  * STR, which the caller releases; or an error is returned. */
-ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len) {
+static inline __attribute__((always_inline))
+ray_t* fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len,
+               ray_dup_t* t, uint64_t base) {
     int n = 0;
     *txt = buf;
     if (!a || RAY_IS_ERR(a)) {
@@ -656,7 +660,7 @@ ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* le
             return ss;
         }
     } else {
-        ray_t* s = ray_fmt(a, RAY_FMT_COMPACT);
+        ray_t* s = t ? ray_fmt_dup(a, RAY_FMT_COMPACT, t, base) : ray_fmt(a, RAY_FMT_COMPACT);
         if (s && !RAY_IS_ERR(s)) {
             *txt = ray_str_ptr(s);
             *len = ray_str_len(s);
@@ -667,6 +671,17 @@ ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* le
     }
     *len = n > 0 ? (size_t)n : 0;
     return NULL;
+}
+
+ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len) {
+    return fmt_pct(a, buf, cap, txt, len, NULL, 0);
+}
+
+/* ray_fmt_pct for one argument of a call that tracks repeats with t (the
+ * caller has entered a and written `base` bytes, #1648). */
+ray_t* ray_fmt_pct_dup(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len,
+                       ray_dup_t* t, uint64_t base) {
+    return fmt_pct(a, buf, cap, txt, len, t, base);
 }
 
 /* ===== Vector element formatter ===== */
@@ -2027,6 +2042,32 @@ ray_t* ray_fmt(ray_t* obj, int mode) {
     return fmt_to_str(&b);
 }
 
+/* A write that is part of a larger one takes over its tracker while it
+ * runs and hands it back after, so the per-object check reads the buffer's
+ * own field as before; the larger write is suspended meanwhile. */
+static inline void fmt_dup_in(fmt_buf_t* b, ray_dup_t* t) {
+    b->dup = *t;   /* fmt_init's own tracker holds nothing yet */
+}
+static inline void fmt_dup_out(fmt_buf_t* b, ray_dup_t* t) {
+    *t = b->dup;
+    b->dup.m.slots = NULL;   /* t's now: fmt_destroy frees nothing of it */
+}
+
+/* Format obj as part of a write that tracks repeats with t (#1648): the
+ * caller has written `base` bytes and has entered obj itself, and appends
+ * this text next, so obj's text is counted where the caller counts it.
+ * Past the budget the result is a `limit` error. */
+ray_t* ray_fmt_dup(ray_t* obj, int mode, ray_dup_t* t, uint64_t base) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    fmt_dup_in(&b, t);
+    b.base = base;
+    b.skip = obj;
+    fmt_obj(&b, obj, mode);
+    fmt_dup_out(&b, t);
+    return fmt_to_str(&b);
+}
+
 ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes) {
     fmt_buf_t b;
     fmt_init(&b);
@@ -2161,14 +2202,27 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
  * ray_err_t is returned.  Output flushed before the failure stays written
  * (a table's columns are all loaded before its first byte, so only values
  * formatted ahead of it in the same call are affected). */
+static ray_err_t fmt_write(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t);
 ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause) {
+    return fmt_write(fp, obj, cause, NULL);
+}
+
+/* ray_fmt_write as one of several values an operation writes, sharing the
+ * operation's tracker t (show's arguments, #1648); NULL: its own. */
+ray_err_t ray_fmt_write_dup(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t) {
+    return fmt_write(fp, obj, cause, t);
+}
+static inline __attribute__((always_inline))
+ray_err_t fmt_write(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t) {
     if (cause) *cause = NULL;
     fmt_buf_t b;
     fmt_init(&b);
     if (b.err) return RAY_ERR_OOM;
     b.sink = fp;
-    ray_dup_root(&b.dup, obj, false);
+    if (t) fmt_dup_in(&b, t);
+    else ray_dup_root(&b.dup, obj, false);
     fmt_obj(&b, obj, 2);
+    if (t) fmt_dup_out(&b, t);
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
     if (b.err && b.cause_code[0] && cause) {

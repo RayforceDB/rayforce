@@ -143,7 +143,7 @@ Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. String results that repeat shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fail with `limit`. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
 | `pmap` | variadic | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments, else `domain` | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
@@ -221,7 +221,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). Text joins with the STR null `""` as empty text: `(concat ["x" ""] "!")` is `["x!" "!"]` | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
-| `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
+| `raze` | unary | Flatten a list of vectors into one; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | Group indices by value | `(group [A B A])` → dict of groups |
 | `diverse` | unary | Check if all elements are unique | `(diverse [1 2 3])` → `true` |
@@ -498,7 +498,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `type` | unary | Get type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` | `(type 42)` → `i64` |
-| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`) | `(as 'i64 "42")` → `42` |
+| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`); a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |

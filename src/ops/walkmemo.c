@@ -143,7 +143,31 @@ void ray_dup_end(ray_dup_t* t) {
 
 void ray_dup_root(ray_dup_t* t, const ray_t* root, bool tables_opaque) {
     t->root = root;
+    t->nroots = 0;
     t->tables_opaque = tables_opaque;
+}
+
+void ray_dup_roots(ray_dup_t* t, ray_t* const* roots, int64_t n, bool tables_opaque) {
+    if (n <= 1) {   /* none, or one: kept as the one root */
+        t->root = n == 1 ? roots[0] : NULL;
+        t->nroots = 0;
+    } else {
+        t->roots = (const ray_t* const*)roots;
+        t->nroots = (int32_t)n;   /* at most a call's arguments */
+    }
+    t->tables_opaque = tables_opaque;
+}
+
+bool ray_dup_bound_now(ray_dup_t* t) {
+    if (t->lb_done || !t->root) return false;
+    const ray_t* const* xs = t->nroots ? t->roots : &t->root;
+    int64_t n = t->nroots ? t->nroots : 1;
+    if (!ray_values_hold_shared(xs, n, t->tables_opaque)) return false;
+    t->lb_done = true;
+    if (!ray_values_dup_cells_over(xs, n, t->tables_opaque, RAY_DUP_BUDGET))
+        return false;
+    t->dup = UINT64_MAX;
+    return true;
 }
 
 bool ray_dup_enter_slow(ray_dup_t* t, const ray_t* x, uint64_t out) {
@@ -152,9 +176,12 @@ bool ray_dup_enter_slow(ray_dup_t* t, const ray_t* x, uint64_t out) {
     if (ray_wm_get(&t->m, x, NULL, 0, &v)) {   /* written before: a repeat */
         t->in = true;
         t->start = out;
-        if (!t->lb_done && t->root) {   /* the first repeat: bound the whole value once */
+        if (!t->lb_done && t->root) {   /* the first repeat: bound the whole operation once */
             t->lb_done = true;
-            if (ray_value_dup_cells_over(t->root, t->tables_opaque)) t->dup = UINT64_MAX;
+            uint64_t left = t->dup >= RAY_DUP_BUDGET ? 0 : RAY_DUP_BUDGET - t->dup;
+            if (ray_values_dup_cells_over(t->nroots ? t->roots : &t->root,
+                                          t->nroots ? t->nroots : 1, t->tables_opaque, left))
+                t->dup = UINT64_MAX;
         }
         return true;
     }
@@ -164,6 +191,9 @@ bool ray_dup_enter_slow(ray_dup_t* t, const ray_t* x, uint64_t out) {
 
 /* ===== ray_value_dup_cells_over ===== */
 
+static _Thread_local const ray_t* const* lb_roots;
+static _Thread_local int64_t lb_nroots;
+
 static inline bool lb_container(const ray_t* x, bool tables_opaque) {
     return x && !RAY_IS_ERR(x) &&
            (x->type == RAY_LIST || x->type == RAY_DICT || (x->type == RAY_TABLE && !tables_opaque));
@@ -171,6 +201,10 @@ static inline bool lb_container(const ray_t* x, bool tables_opaque) {
 
 static ray_t* lb_part(const ray_t* x, int64_t i, bool* more) {
     *more = true;
+    if (!x) {   /* the operation's roots */
+        if (i >= lb_nroots) { *more = false; return NULL; }
+        return (ray_t*)lb_roots[i];
+    }
     if (x->type == RAY_LIST) {
         if (i >= x->len) { *more = false; return NULL; }
         return ((ray_t**)ray_data((ray_t*)x))[i];
@@ -218,6 +252,14 @@ static inline bool lb_tracked(const ray_t* c) {
 
 bool ray_value_dup_cells_over(const ray_t* x, bool tables_opaque) {
     if (!lb_container(x, tables_opaque)) return false;
+    return ray_values_dup_cells_over(&x, 1, tables_opaque, RAY_DUP_BUDGET);
+}
+
+bool ray_values_dup_cells_over(const ray_t* const* xs, int64_t n, bool tables_opaque,
+                               uint64_t budget) {
+    if (n == 1 && !lb_container(xs[0], tables_opaque)) return false;   /* nothing to repeat */
+    lb_roots = xs;
+    lb_nroots = n;
     ray_walk_memo_t m;
     memset(&m, 0, sizeof m);
     m.active = true;
@@ -226,14 +268,14 @@ bool ray_value_dup_cells_over(const ray_t* x, bool tables_opaque) {
     int64_t cap = 32, top = 0;
     uint64_t lb = 0;
     bool over = false;
-    st[top++] = (lb_frame_t){ x, 0, 1 };
+    st[top++] = (lb_frame_t){ NULL, 0, 0 };   /* the roots: written once each, not tracked */
     while (top > 0 && !over) {
         lb_frame_t* f = &st[top - 1];
         bool more;
         ray_t* c = lb_part(f->x, f->i++, &more);
         if (!more) {
             uint64_t v = f->acc;
-            if (lb_tracked(f->x)) ray_wm_put(&m, f->x, NULL, 0, v);
+            if (f->x && lb_tracked(f->x)) ray_wm_put(&m, f->x, NULL, 0, v);
             top--;
             if (top > 0) st[top - 1].acc = lb_add(st[top - 1].acc, v);
             continue;
@@ -242,7 +284,7 @@ bool ray_value_dup_cells_over(const ray_t* x, bool tables_opaque) {
         if (lb_tracked(c) && ray_wm_get(&m, c, NULL, 0, &v)) {   /* written again */
             lb = lb_add(lb, v);
             f->acc = lb_add(f->acc, v);
-            over = lb > RAY_DUP_BUDGET;
+            over = lb > budget;
             continue;
         }
         if (!lb_container(c, tables_opaque)) {
@@ -263,7 +305,84 @@ bool ray_value_dup_cells_over(const ray_t* x, bool tables_opaque) {
     }
     if (st != local) ray_free_raw(st);
     ray_wm_end(&m);
+    lb_roots = NULL;
     return over;
+}
+
+/* ===== ray_values_hold_shared ===== */
+
+bool ray_values_hold_shared(const ray_t* const* xs, int64_t n, bool tables_opaque) {
+    if (n > 1)
+        for (int64_t i = 0; i < n; i++)
+            if (lb_tracked(xs[i])) return true;
+    lb_roots = xs;
+    lb_nroots = n;
+    lb_frame_t local[32];
+    lb_frame_t* st = local;
+    int64_t cap = 32, top = 0;
+    bool found = false;
+    st[top++] = (lb_frame_t){ NULL, 0, 0 };
+    while (top > 0 && !found) {
+        lb_frame_t* f = &st[top - 1];
+        bool more;
+        ray_t* c = lb_part(f->x, f->i++, &more);
+        if (!more) { top--; continue; }
+        if (f->x && lb_tracked(c)) { found = true; break; }
+        if (!lb_container(c, tables_opaque)) continue;
+        if (top == cap) {
+            lb_frame_t* grown = ray_alloc_raw((size_t)cap * 2 * sizeof *grown);
+            if (!grown) { found = true; break; }   /* cannot tell: assume it may */
+            memcpy(grown, st, (size_t)top * sizeof *grown);
+            if (st != local) ray_free_raw(st);
+            st = grown;
+            cap *= 2;
+        }
+        st[top++] = (lb_frame_t){ c, 0, 0 };
+    }
+    if (st != local) ray_free_raw(st);
+    lb_roots = NULL;
+    return found;
+}
+
+/* ===== ray_dup_copy ===== */
+
+void ray_dup_copy_begin(ray_dup_copy_t* t) {
+    memset(t, 0, sizeof *t);
+    t->m.active = true;
+}
+
+bool ray_dup_copy_seen_slow(ray_dup_copy_t* t, const ray_t* src) {
+    uint64_t v;
+    if (ray_wm_get(&t->m, src, NULL, 0, &v)) return true;
+    ray_wm_put(&t->m, src, NULL, 0, 1);
+    return false;
+}
+
+bool ray_str_cells_repeat_over(ray_t* const* cells, int64_t n) {
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    bool over = false;
+    for (int64_t j = 0; j < n && !over; j++) {
+        ray_t* c = cells[j];
+        if (c && c->type == RAY_LIST && c->len == 1 && c->rc != 1) {   /* charged as itself */
+            ray_t* s = ((ray_t**)ray_data(c))[0];
+            if (s && s->type == -RAY_STR) over = ray_dup_copy(&dup, c, ray_str_len(s));
+        } else if (c && c->type == -RAY_STR) {
+            over = ray_dup_copy(&dup, c, ray_str_len(c));
+        }
+    }
+    ray_dup_copy_end(&dup);
+    return over;
+}
+
+bool ray_dup_copy_slow(ray_dup_copy_t* t, const ray_t* src, uint64_t bytes) {
+    uint64_t v;
+    if (!ray_wm_get(&t->m, src, NULL, 0, &v)) {
+        ray_wm_put(&t->m, src, NULL, 0, 1);
+        return false;
+    }
+    t->dup = t->dup > UINT64_MAX - bytes ? UINT64_MAX : t->dup + bytes;
+    return t->dup > RAY_DUP_BUDGET;
 }
 
 /* ===== ray_wm_result ===== */

@@ -1146,6 +1146,8 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
     }
 }
 
+static bool str_cells_repeat(ray_t* const* cells, int64_t n);
+
 /* The scalar fill/min/max results for wide cells have a common type, but the
  * generic atomic mapper boxes them.  Collapse only homogeneous wide results;
  * mixed-type LIST operands keep their existing boxed shape. */
@@ -1158,6 +1160,10 @@ static ray_t* atomic_collapse_wide(ray_t* list) {
     for (int64_t i = 1; i < list->len; i++)
         if (!cells[i] || cells[i]->type != t) return list;
 
+    if (t == -RAY_STR && str_cells_repeat(cells, list->len)) {
+        ray_release(list);
+        return ray_error("limit", "a string vector repeats shared strings beyond 1 GiB of extra data");
+    }
     ray_t* vec = ray_vec_new((int8_t)-t, t == -RAY_STR ? 0 : list->len);
     if (!vec || RAY_IS_ERR(vec)) {
         ray_release(list);
@@ -3086,26 +3092,11 @@ static bool table_widens_atom(int8_t t) {
 
 /* (table [col_names] (list col1 col2 ...)) — build a RAY_TABLE */
 /* Do the string atoms of a would-be string column, some held by several
- * cells, copy more than RAY_DUP_BUDGET bytes of text again (#1627)? */
-static bool table_str_repeats(ray_t** cells, int64_t n) {
-    ray_walk_memo_t m;
-    memset(&m, 0, sizeof m);
-    m.active = true;
-    uint64_t dup = 0;
-    bool over = false;
-    for (int64_t j = 0; j < n && !over; j++) {
-        ray_t* c = cells[j];
-        if (!c || c->type != -RAY_STR || c->rc == 1) continue;
-        uint64_t seen;
-        if (ray_wm_get(&m, c, NULL, 0, &seen)) {
-            dup += ray_str_len(c);
-            over = dup > RAY_DUP_BUDGET;
-        } else {
-            ray_wm_put(&m, c, NULL, 0, 1);
-        }
-    }
-    ray_wm_end(&m);
-    return over;
+ * cells, copy more than RAY_DUP_BUDGET bytes of text again (#1627)?  A
+ * table's string column and a mapped result collapsed to a string vector
+ * (atomic_collapse_wide) both ask. */
+static bool str_cells_repeat(ray_t* const* cells, int64_t n) {
+    return ray_str_cells_repeat_over(cells, n);
 }
 
 ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
@@ -3247,7 +3238,7 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         /* A string column copies each cell's text: a string atom held by
          * many cells is written out again for each (#1627).  Up to 1 GiB of
          * such copies, as for every writer that writes a value out in full. */
-        if (col_type == RAY_STR && table_str_repeats(row_elems, nrows))
+        if (col_type == RAY_STR && str_cells_repeat(row_elems, nrows))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc);
               return ray_error("limit", "table: a string column repeats shared strings beyond 1 GiB of extra data"); }
 

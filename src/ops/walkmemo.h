@@ -159,14 +159,18 @@ uint64_t ray_dup_budget_set(uint64_t bytes);
 #define RAY_WM_ASSERT(c) ((void)0)
 #endif
 
-typedef struct {
+typedef struct ray_dup_s {
     ray_walk_memo_t m;
     uint64_t        dup;     /* bytes written inside repeats that have closed */
     uint64_t        start;   /* `out` when the open repeat began */
     bool            in;      /* a repeat is open */
     bool            lb_done; /* the lower-bound walk has run */
     bool            tables_opaque;  /* the writer writes a table as one cell (print) */
-    const ray_t*    root;    /* the value being written, for the lower bound */
+    int32_t         nroots;  /* 0: one root, in root; else roots[0..nroots) */
+    union {                  /* the values the operation writes, for the lower bound */
+        const ray_t*        root;
+        const ray_t* const* roots;
+    };
 } ray_dup_t;
 
 void ray_dup_begin(ray_dup_t* t);
@@ -176,6 +180,36 @@ void ray_dup_begin(ray_dup_t* t);
  * before it writes the repeat.  A value without sharing never meets a
  * repeat and never pays for the walk. */
 void ray_dup_root(ray_dup_t* t, const ray_t* root, bool tables_opaque);
+/* The same for an operation that writes several values (the arguments of
+ * one format, print, println or show): one budget, one memo and one lower
+ * bound for all of them, so a part written for one argument and again for
+ * another is a repeat too (#1648).  roots must outlive the tracker. */
+void ray_dup_roots(ray_dup_t* t, ray_t* const* roots, int64_t n, bool tables_opaque);
+/* Does a value an operation writes need the operation's tracker: a list,
+ * dict or table (it may hold shared parts), a vector held elsewhere too,
+ * or a string atom of RAY_DUP_CALL_STR_MIN bytes or more held elsewhere
+ * too (it may be written again)?  The rest cannot repeat, or repeats at
+ * most once per argument (a call has at most 64), and an operation whose
+ * values are all such needs no tracker. */
+#define RAY_DUP_CALL_STR_MIN 4096
+static inline bool ray_dup_call_tracks(const ray_t* a) {
+    if ((uintptr_t)a <= 31) return false;   /* NULL or an error code */
+    int8_t t = a->type;   /* an error object's type is past RAY_LAMBDA */
+    if (t < 0) {
+        if (t != -RAY_STR || a->rc == 1) return false;
+        /* a string atom of 1..7 bytes, or an empty one, is held in the atom
+         * (vec/str.c): short; a longer one is its own vector */
+        if ((a->slen >= 1 && a->slen <= 7) || !a->obj) return false;
+        return (uint64_t)a->obj->len >= RAY_DUP_CALL_STR_MIN;
+    }
+    if (t == RAY_LIST || t == RAY_DICT || t == RAY_TABLE) return true;
+    return t < RAY_LAMBDA && a->rc != 1;
+}
+/* Run the lower bound now, before anything is written (a writer that
+ * cannot take back what it wrote: print and println), when the roots hold
+ * a part that may be written twice (ray_values_hold_shared).  True when
+ * the operation is to be refused. */
+bool ray_dup_bound_now(ray_dup_t* t);
 
 /* A lower bound, in bytes, of what a text writer writes again for x's
  * repeated parts: each list, dict or table one and its parts, each vector
@@ -184,6 +218,48 @@ void ray_dup_root(ray_dup_t* t, const ray_t* root, bool tables_opaque);
  * separator).  With tables_opaque a table counts one.  True when it
  * passes RAY_DUP_BUDGET; linear in the distinct parts, and it stops there. */
 bool ray_value_dup_cells_over(const ray_t* x, bool tables_opaque);
+/* The same over several values written one after another, against
+ * `budget` bytes. */
+bool ray_values_dup_cells_over(const ray_t* const* xs, int64_t n, bool tables_opaque,
+                               uint64_t budget);
+/* May a writer meet one of xs's parts twice: does a list, dict, table,
+ * vector or string atom below the roots have a reference count other than
+ * 1, or is one root (other than a single one) such a part?  Linear in the
+ * containers, and stops at the first one; a vector's cells are not looked at. */
+bool ray_values_hold_shared(const ray_t* const* xs, int64_t n, bool tables_opaque);
+
+/* A conversion that copies a string's bytes once per cell (a list of
+ * string atoms cast to a string vector, made a table's string column, or
+ * razed) copies a shared string again at each cell that holds it.  It is
+ * held to the same budget: ray_dup_copy charges `bytes` when `src` was
+ * copied before by this conversion, and is true once the bytes copied
+ * again pass RAY_DUP_BUDGET (#1648). */
+typedef struct { ray_walk_memo_t m; uint64_t dup; } ray_dup_copy_t;
+/* A string shorter than this is not tracked: each cell that holds it
+ * already costs an 8-byte pointer, so copying it again at every cell
+ * copies at most 8 times what the cells themselves hold. */
+#define RAY_DUP_COPY_MIN 64
+void ray_dup_copy_begin(ray_dup_copy_t* t);
+bool ray_dup_copy_slow(ray_dup_copy_t* t, const ray_t* src, uint64_t bytes);
+static inline bool ray_dup_copy(ray_dup_copy_t* t, const ray_t* src, uint64_t bytes) {
+    if (RAY_LIKELY(bytes < RAY_DUP_COPY_MIN || !src || src->rc == 1)) return false;
+    return ray_dup_copy_slow(t, src, bytes);
+}
+static inline void ray_dup_copy_end(ray_dup_copy_t* t) { ray_wm_end(&t->m); }
+/* Would copying cells[0..n) into a string vector, cell by cell, copy more
+ * than RAY_DUP_BUDGET bytes of shared strings again?  A cell is a string
+ * atom, or a one-cell list that holds one (cast as that string). */
+bool ray_str_cells_repeat_over(ray_t* const* cells, int64_t n);
+/* A copy that checks ray_str_cells_repeat_over only once its output
+ * passes this many bytes: below it, the copy is small whatever repeats. */
+#define RAY_DUP_COPY_SCAN ((uint64_t)64 << 20)
+/* For a copy that needs each value once (a set of strings to look up):
+ * true when src was met before by this copy, which may then skip it. */
+bool ray_dup_copy_seen_slow(ray_dup_copy_t* t, const ray_t* src);
+static inline bool ray_dup_copy_seen(ray_dup_copy_t* t, const ray_t* src, uint64_t bytes) {
+    if (RAY_LIKELY(bytes < RAY_DUP_COPY_MIN || !src || src->rc == 1)) return false;
+    return ray_dup_copy_seen_slow(t, src);
+}
 void ray_dup_end(ray_dup_t* t);
 bool ray_dup_enter_slow(ray_dup_t* t, const ray_t* x, uint64_t out);
 
