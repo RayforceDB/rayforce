@@ -12333,21 +12333,60 @@ static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl) {
     return result;
 }
 
-/* A keyless quantile's computed probability that reads no column and has
- * no effect, (+ P 0): its value, evaluated once, as the builtin's argument
- * is (#981).  NULL for any other probability; else the value or its error. */
-static ray_t* quantile_computed_prob(ray_t* prob_expr, ray_t* tbl) {
-    if (!prob_expr || prob_expr->type != RAY_LIST ||
-        !expr_reads_no_column(prob_expr, tbl) || !query_expr_effect_free(prob_expr))
-        return NULL;
-    return eval_expr_whole_column_impl(prob_expr, tbl);
-}
-
 static ray_t* eval_expr_whole_column(ray_t* expr, ray_t* tbl) {
     ray_t* expanded = query_inline_helpers(expr, tbl);
     ray_t* result = eval_expr_whole_column_impl(expanded, tbl);
     ray_release(expanded);
     return result;
+}
+
+/* A keyless quantile's probability that is not a literal or a name bound
+ * to one (quantile_keyless_prob): the value the builtin's argument has,
+ * evaluated once over the rows `where:` keeps, as by: evaluates it over
+ * each group's rows (#981).  `(+ P 0)`, a helper call and `(first t)`
+ * give their value; a column (one probability per row), a vector, a null
+ * and an out-of-range value give the builtin's error, never the median.
+ * `sel` is the where: selection, or NULL.  NULL with *out_q set, or the
+ * error.
+ *
+ * Over no rows (an empty table, or a where: that keeps none) there is no
+ * row for the probability to be wrong about: the answer is the one dev
+ * gave, [] or [0Nf] as for a literal, as by: gives () over no groups.  A
+ * probability that reads no column is still evaluated, so an error in
+ * evaluating it is the select's, as before; its value is not checked. */
+static ray_t* quantile_select_prob(ray_t* prob_expr, ray_t* tbl, ray_graph_t* g,
+                                   ray_t* sel, bool percentile, double* out_q) {
+    const char* name = percentile ? "percentile" : "quantile";
+    *out_q = 0.5;
+    bool no_rows = sel ? rowsel_first_row(sel) < 0 : ray_table_nrows(tbl) == 0;
+    ray_t* pv = NULL;
+    ray_t* lexical = prob_expr->type == -RAY_SYM && !(prob_expr->attrs & ATTR_QUOTED)
+        ? ray_env_get_lexical_local(prob_expr->i64) : NULL;
+    if (no_rows && (lexical || !expr_reads_no_column(prob_expr, tbl))) return NULL;
+    if (lexical) {
+        /* a lexical binding wins over a same-named column */
+        ray_retain(lexical);
+        pv = lexical;
+    } else if (expr_reads_no_column(prob_expr, tbl)) {
+        pv = eval_expr_whole_column(prob_expr, tbl);
+    } else {
+        ray_t* rows = sel ? sel_compact(g, tbl, sel, NULL, 0)
+                    : table_has_parted_columns(tbl) ? query_materialize_parted_table(tbl)
+                    : (ray_retain(tbl), tbl);
+        if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+        pv = eval_expr_whole_column(prob_expr, rows);
+        ray_release(rows);
+    }
+    if (!pv) return ray_error("domain", "select: %s probability evaluation failed", name);
+    if (RAY_IS_ERR(pv)) return pv;
+    if (ray_is_lazy(pv)) {
+        pv = ray_lazy_materialize(pv);
+        if (!pv || RAY_IS_ERR(pv)) return pv ? pv : ray_error("oom", NULL);
+    }
+    if (no_rows) { ray_release(pv); return NULL; }
+    ray_t* err = ray_quantile_prob_arg(pv, percentile ? 100.0 : 1.0, name, out_q);
+    ray_release(pv);
+    return err ? ray_sig_note(name, err) : NULL;
 }
 
 /* ---- An `if` over a column, chosen per row (#1297, #1300) ----
@@ -28150,14 +28189,19 @@ by_dict_done:
             if (s_max < 1) s_max = 1;
             ray_t* sagg_hdr = NULL;
             ray_op_t** s_agg_ins = (ray_op_t**)scratch_alloc(&sagg_hdr,
-                    (size_t)s_max * (2 * sizeof(ray_op_t*) + sizeof(uint16_t)));
+                    (size_t)s_max * (2 * sizeof(ray_op_t*) + sizeof(ray_t*) + sizeof(uint16_t)));
             if (!s_agg_ins) {
                 if (g->selection) { ray_release(g->selection); g->selection = NULL; }
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
             }
             ray_op_t** s_agg_ins2 = s_agg_ins + s_max;
-            uint16_t*  s_agg_ops  = (uint16_t*)(s_agg_ins2 + s_max);
+            /* A native quantile's probability that is neither a literal nor
+             * a name bound to one: evaluated after every output has
+             * compiled, so it runs once even when the select hands its
+             * outputs to the evaluator instead (#981). */
+            ray_t**    s_prob_call = (ray_t**)(s_agg_ins2 + s_max);
+            uint16_t*  s_agg_ops  = (uint16_t*)(s_prob_call + s_max);
             int64_t    s_n_aggs = 0;
             int        s_has_binary = 0;
             int        s_has_param = 0;
@@ -28173,12 +28217,14 @@ by_dict_done:
                  * all output slots, and their storage outlives this GROUP.
                  * Presence, not nonzero bits, distinguishes q=0 from no q. */
                 agg_k[s_n_aggs] = 0;
+                s_prob_call[s_n_aggs] = NULL;
                 if (op == OP_QUANTILE) {
                     double q;
-                    /* Preserve the existing median default for parameters
-                     * this literal-only path cannot resolve.  In a mixed
-                     * parameter array each such slot still needs q=.5;
-                     * zero bits mean q=0, not an absent probability. */
+                    /* q=.5 unless the native quantile's probability is
+                     * resolved below (a literal or a bound name here, any
+                     * other expression after the loop).  In a mixed
+                     * parameter array each slot needs its q; zero bits
+                     * mean q=0, not an absent probability. */
                     agg_k[s_n_aggs] = encode_agg_f64_param(0.5);
                     bool percentile = agg_name_is_percentile(agg_elems[0]->i64);
                     if (ray_len(val_expr) == 3) {
@@ -28192,20 +28238,13 @@ by_dict_done:
                         ray_binary_fn native = percentile ? ray_percentile_fn : ray_quantile_fn;
                         bool native_fn = fn && fn->type == RAY_BINARY &&
                                          (ray_binary_fn)(uintptr_t)fn->i64 == native;
-                        ray_t* pv = native_fn ? quantile_computed_prob(agg_elems[2], tbl) : NULL;
-                        if (pv && RAY_IS_ERR(pv)) {
-                            if (g->selection) { ray_release(g->selection); g->selection = NULL; }
-                            ray_graph_free(g); ray_release(tbl);
-                            scratch_free(sagg_hdr);
-                            scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return pv;
-                        }
-                        if (native_fn &&
-                            (pv ? quantile_literal_prob(pv, percentile, &q)
-                                : quantile_keyless_prob(agg_elems[2], tbl, percentile, &q))) {
-                            agg_k[s_n_aggs] = encode_agg_f64_param(q);
+                        if (native_fn) {
                             s_has_param = 1;
+                            if (quantile_keyless_prob(agg_elems[2], tbl, percentile, &q))
+                                agg_k[s_n_aggs] = encode_agg_f64_param(q);
+                            else
+                                s_prob_call[s_n_aggs] = val_expr;   /* evaluated below */
                         }
-                        if (pv) ray_release(pv);
                     }
                 }
                 s_agg_ops[s_n_aggs] = op;
@@ -28347,6 +28386,20 @@ by_dict_done:
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sagg_hdr);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return result;
+            }
+            for (int64_t a = 0; a < s_n_aggs; a++) {
+                if (!s_prob_call[a]) continue;
+                ray_t** qe = (ray_t**)ray_data(s_prob_call[a]);
+                double q = 0.5;
+                ray_t* perr = quantile_select_prob(qe[2], tbl, g, g->selection,
+                                                   agg_name_is_percentile(qe[0]->i64), &q);
+                if (perr) {
+                    if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                    ray_graph_free(g); ray_release(tbl);
+                    scratch_free(sagg_hdr);
+                    scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return perr;
+                }
+                agg_k[a] = encode_agg_f64_param(q);
             }
             /* Later input compilation may move g->nodes; retain ids during
              * collection and resolve pointers only after the last compile. */

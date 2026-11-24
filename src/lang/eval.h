@@ -373,6 +373,8 @@ ray_t* ray_med_fn(ray_t* x);
 ray_t* ray_mode_fn(ray_t* x);
 ray_t* ray_quantile_fn(ray_t* x, ray_t* q);
 ray_t* ray_percentile_fn(ray_t* x, ray_t* p);
+ray_t* ray_quantile_prob_arg(ray_t* q_obj, double scale, const char* name,
+                             double* out_q);
 ray_t* ray_dev_fn(ray_t* x);
 ray_t* ray_stddev_fn(ray_t* x);
 ray_t* ray_stddev_pop_fn(ray_t* x);

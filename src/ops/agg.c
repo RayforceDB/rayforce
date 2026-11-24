@@ -1498,8 +1498,11 @@ ray_t* ray_mode_fn(ray_t* x) {
     return out;
 }
 
-static ray_t* quantile_prob_arg(ray_t* q_obj, double scale, const char* name,
-                                double* out_q) {
+/* The probability argument of quantile (scale 1) or percentile (scale
+ * 100): NULL and *out_q in 0..1, or the builtin's error.  A select's
+ * quantile checks its probability with it too (query.c). */
+ray_t* ray_quantile_prob_arg(ray_t* q_obj, double scale, const char* name,
+                             double* out_q) {
     if (!q_obj || !ray_is_atom(q_obj) || !is_numeric(q_obj))
         return ray_error("type", "%s: probability must be a numeric atom", name);
     if (RAY_ATOM_IS_NULL(q_obj))
@@ -1605,14 +1608,14 @@ static ray_t* quantile_core(ray_t* x, double q, const char* name) {
 
 ray_t* ray_quantile_fn(ray_t* x, ray_t* q_obj) {
     double q = 0.0;
-    ray_t* err = quantile_prob_arg(q_obj, 1.0, "quantile", &q);
+    ray_t* err = ray_quantile_prob_arg(q_obj, 1.0, "quantile", &q);
     if (err) return err;
     return quantile_core(x, q, "quantile");
 }
 
 ray_t* ray_percentile_fn(ray_t* x, ray_t* p_obj) {
     double q = 0.0;
-    ray_t* err = quantile_prob_arg(p_obj, 100.0, "percentile", &q);
+    ray_t* err = ray_quantile_prob_arg(p_obj, 100.0, "percentile", &q);
     if (err) return err;
     return quantile_core(x, q, "percentile");
 }

@@ -29,13 +29,13 @@
 (at (select {q: (quantile s P981) from: Q981}) 'q) -- [0.0]
 ((fn [P981] (at (select {q: (quantile s P981) from: Q981}) 'q)) 0.75) -- [18.0]
 ;; A caller lexical binding keeps SELECT precedence even when the source has a
-;; same-named column; without a lexical binding, the column still wins over a
-;; global scalar and leaves the existing median fallback intact.
+;; same-named column; without a lexical binding, the column wins over a global
+;; scalar: a probability per row, the builtin's type error, not the median.
 (set QC981 (table [s P981] (list (as 'F64 [0 8 16 24]) [1 2 3 4])))
 ((fn [P981] (at (select {q: (quantile s P981) from: QC981}) 'q)) 0.25) -- [6.0]
 ((fn [] (let P981 0.75) (at (select {q: (quantile s P981) from: QC981}) 'q))) -- [18.0]
 (set P981 0.25)
-(at (select {q: (quantile s P981) from: QC981}) 'q) -- [12.0]
+(at (select {q: (quantile s P981) from: QC981}) 'q) !- type
 (set PP981 50)
 (value (select {a: (percentile s 25) b: (percentile s PP981) from: Q981})) -- (list [6.0] [12.0])
 (set PP981 25)
@@ -59,3 +59,76 @@
 ((fn [x] (at (select {q: (quantile s (+ x 0)) from: Q981}) 'q)) 0.75) -- [18.0]
 (set QT981 (table [s] (list (as 'TIMESPAN [0 8 16 24]))))
 (at (select {q: (quantile s (+ P981 0)) from: QT981}) 'q) -- (enlist (quantile (at QT981 's) 0.25))
+;; Every other probability is evaluated as the builtin's argument, over the
+;; rows where: keeps, as by: evaluates it over a group's rows (#981): a value
+;; is honoured, and what the builtin refuses is its error, never the median.
+(set Q2981 (table [s t] (list (as 'F64 [0 8 16 24]) (as 'F64 [0.1 0.2 0.3 0.4]))))
+(set H981 (fn [] 0.25))
+(set HV981 (fn [x] (* x 0.25)))
+(at (select {q: (quantile s (H981)) from: Q2981}) 'q) -- [6.0]
+(at (select {q: (quantile s (HV981 3)) from: Q2981}) 'q) -- [18.0]
+(at (select {p: (percentile s (* 100 (H981))) from: Q2981}) 'p) -- [6.0]
+(quantile (at Q2981 's) (first (at Q2981 't))) -- 2.4
+(at (select {q: (quantile s (first t)) from: Q2981}) 'q) -- [2.4]
+(at (select {q: (quantile s (* 2.5 (first t))) from: Q2981}) 'q) -- [6.0]
+(quantile [8.0 16.0 24.0] 0.2) -- 11.2
+(at (select {q: (quantile s (first t)) from: Q2981 where: (> s 5)}) 'q) -- [11.2]
+(value (select {a: (quantile s (first t)) b: (sum s) c: (quantile s 0.5) from: Q2981})) -- (list [2.4] [48.0] [12.0])
+((fn [t] (at (select {q: (quantile s t) from: Q2981}) 'q)) 0.75) -- [18.0]
+(at (select {q: (quantile s (first t)) from: Q2981 by: s asc: s}) 'q) -- [0.0 8.0 16.0 24.0]
+;; A probability per row: the builtin's type error.
+(quantile (at Q2981 's) (at Q2981 't)) !- type
+(at (select {q: (quantile s t) from: Q2981}) 'q) !- type
+(at (select {q: (quantile s (* t 1)) from: Q2981}) 'q) !- type
+(at (select {q: (quantile s t) from: Q2981 by: s}) 'q) !- type
+(at (select {q: (quantile s [0.25 0.75]) from: Q2981}) 'q) !- type
+(set PV981 [0.25 0.5])
+(at (select {q: (quantile s PV981) from: Q2981}) 'q) !- type
+(at (select {q: (quantile s (+ PV981 0)) from: Q2981}) 'q) !- type
+(at (select {q: (quantile s 'a) from: Q2981}) 'q) !- type
+(at (select {q: (quantile s "x") from: Q2981}) 'q) !- type
+(at (try (select {q: (quantile s t) from: Q2981}) (fn [e] e)) 'msg) -- "quantile: probability must be a numeric atom"
+;; Out of range or null, literal, bound, computed or from a helper: domain.
+(quantile (at Q2981 's) 1.25) !- domain
+(at (select {q: (quantile s 1.25) from: Q2981}) 'q) !- domain
+(at (select {q: (quantile s -0.5) from: Q2981}) 'q) !- domain
+(at (select {q: (quantile s (+ P981 1)) from: Q2981}) 'q) !- domain
+(at (select {q: (quantile s (HV981 5)) from: Q2981}) 'q) !- domain
+(at (select {p: (percentile s 125) from: Q2981}) 'p) !- domain
+(set PO981 1.5)
+(at (select {q: (quantile s PO981) from: Q2981}) 'q) !- domain
+((fn [x] (at (select {q: (quantile s x) from: Q2981}) 'q)) 1.5) !- domain
+(at (try (select {q: (quantile s 1.25) from: Q2981}) (fn [e] e)) 'msg) -- "quantile: probability out of range"
+(at (try (select {p: (percentile s 125) from: Q2981}) (fn [e] e)) 'msg) -- "percentile: probability out of range"
+(quantile (at Q2981 's) 0Nf) !- domain
+(at (select {q: (quantile s 0Nf) from: Q2981}) 'q) !- domain
+(at (select {q: (quantile s 0N) from: Q2981}) 'q) !- domain
+(set PN981 0Nf)
+(at (select {q: (quantile s PN981) from: Q2981}) 'q) !- domain
+(at (try (select {q: (quantile s PN981) from: Q2981}) (fn [e] e)) 'msg) -- "quantile: probability must be non-null"
+;; No rows, an empty table or a where: that keeps none: no row for the
+;; probability to be wrong about, so the answer is dev's, as for a literal
+;; ([] and [0Nf]), and by: gives no groups.  A probability that reads no
+;; column is still evaluated: an error in evaluating it is the select's.
+(set E981 (select {from: Q2981 where: (> s 99)}))
+(at (select {q: (quantile s 0.25) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s (first t)) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s t) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s 1.25) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s 0Nf) from: E981}) 'q) -- (as 'F64 [])
+(at (select {q: (quantile s (HV981 5)) from: E981}) 'q) -- (as 'F64 [])
+(at (select {p: (percentile s 125) from: E981}) 'p) -- (as 'F64 [])
+((fn [t] (at (select {q: (quantile s t) from: E981}) 'q)) 1.5) -- (as 'F64 [])
+(at (select {q: (quantile s (first t)) c: (count s) from: E981}) 'q) -- (as 'F64 [])
+(count (select {q: (quantile s t) from: E981 by: t})) -- 0
+(count (select {q: (quantile s 1.25) from: E981 by: t})) -- 0
+(at (select {q: (quantile s (+ P981 'a)) from: E981}) 'q) !- type
+(at (select {q: (quantile s 0.25) from: Q2981 where: false}) 'q) -- [0Nf]
+(at (select {q: (quantile s (first t)) from: Q2981 where: false}) 'q) -- [0Nf]
+(at (select {q: (quantile s t) from: Q2981 where: false}) 'q) -- [0Nf]
+(at (select {q: (quantile s 1.25) from: Q2981 where: (> s 99)}) 'q) -- [0Nf]
+(at (select {q: (quantile s 0Nf) from: Q2981 where: (> s 99)}) 'q) -- [0Nf]
+;; An effect in the probability runs once.
+(set E981 0)
+(at (select {q: (quantile s (do (set E981 (+ E981 1)) 0.25)) from: Q2981}) 'q) -- [6.0]
+E981 -- 1
