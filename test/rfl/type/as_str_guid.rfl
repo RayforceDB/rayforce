@@ -1,0 +1,26 @@
+;; @also-unfused
+;; #1583: a STR vector casts to GUID as each of its strings does as an atom:
+;; the canonical form is parsed (hex digits of either case), the empty
+;; string is 0Ng and any other text is a domain error.  The vector cast
+;; refused every STR vector, while the atom cast and a select read them.
+(set S ["0c8b7a9e-2c3b-4f8a-9e0e-1b2c3d4e5f60" "" "1C8B7A9E-2c3b-4f8a-9e0e-1b2c3d4e5f61"])
+(as 'GUID S) -- (map (fn [s] (as 'GUID s)) S)
+(type (as 'GUID S)) -- 'GUID
+(nil? (as 'GUID S)) -- [false true false]
+(at (as 'GUID S) 0) -- (as 'GUID "0c8b7a9e-2c3b-4f8a-9e0e-1b2c3d4e5f60")
+(at (as 'GUID S) 2) -- (as 'GUID "1c8b7a9e-2c3b-4f8a-9e0e-1b2c3d4e5f61")
+(as 'GUID ["x"]) !- domain
+(as 'GUID "x") !- domain
+(as 'GUID ["0c8b7a9e-2c3b-4f8a-9e0e-1b2c3d4e5f6z"]) !- domain
+(as 'GUID ["0c8b7a9e+2c3b-4f8a-9e0e-1b2c3d4e5f60"]) !- domain
+(as 'GUID (as 'STR (as 'GUID S))) -- (as 'GUID S)
+(count (as 'GUID (take ["a"] 0))) -- 0
+;; every query route follows it
+(set G (table [c v] (list S [1 2 3])))
+(at (select {r: (as 'GUID c) from: G}) 'r) -- (as 'GUID S)
+(at (update {r: (as 'GUID c) from: G}) 'r) -- (as 'GUID S)
+(at (select {r: ((quote as) 'GUID c) from: G}) 'r) -- (as 'GUID S)
+(at (select {r: (as 'GUID c) from: G where: (> v 1)}) 'r) -- (as 'GUID (at S [1 2]))
+(at (select {r: (first (as 'GUID c)) from: G by: v}) 'r) -- (as 'GUID S)
+(select {r: (as 'GUID c) from: (table [c] (list ["x" "y"]))}) !- domain
+(update {r: (as 'GUID c) from: (table [c] (list ["x" "y"]))}) !- domain
