@@ -2698,34 +2698,10 @@ static int idx_flatten_and(ray_graph_t* g, ray_op_t* op,
     return n;
 }
 
-static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
-                             ray_t** out_col, uint16_t* out_cmp_op,
-                             int64_t* out_key_i, double* out_key_f,
-                             int* out_is_float, ray_col_meta_t* out_meta) {
-    if (!pred_op || pred_op->arity != 2) return 0;
-    uint16_t opc = pred_op->opcode;
-    if (opc != OP_EQ && opc != OP_NE &&
-        opc != OP_LT && opc != OP_LE &&
-        opc != OP_GT && opc != OP_GE) return 0;
-
-    ray_op_t* lhs = op_child(g, pred_op, 0);
-    ray_op_t* rhs = op_child(g, pred_op, 1);
-    if (!lhs || !rhs) return 0;
-    if (lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
-    ray_op_ext_t* lext = find_ext(g, lhs->id);
-    ray_op_ext_t* rext = find_ext(g, rhs->id);
-    if (!lext || !rext || !rext->literal) return 0;
-    uint16_t stored_table_id = 0;
-    memcpy(&stored_table_id, lext->base.pad, sizeof(uint16_t));
-    if (stored_table_id != 0) return 0;  /* non-default table — skip */
-    ray_t* tbl = g->table;
-    if (!tbl) return 0;
-    ray_col_meta_t m;
-    if (!ray_table_col_meta(tbl, lext->sym, &m)) return 0;
-    if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
-    if (!idx_want_ok(&m, want)) return 0;
-
-    ray_t* cv = rext->literal;
+/* The probe key of a comparison literal `cv` against a column of type ct:
+ * *key_i (integer family, temporal, a SYM's global intern id) or *key_f,
+ * *is_float.  0 when the pair is not one an index can answer. */
+static int idx_cmp_key(int8_t ct, ray_t* cv, int64_t* out_key_i, double* out_key_f, int* out_is_float) {
     if (!cv) return 0;
     int64_t key_i = 0;
     double  key_f = 0.0;
@@ -2754,7 +2730,7 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
      * (an integer meets a TIMESPAN as nanoseconds, as the builtin does);
      * a symbol only a SYM column.  Any other pair takes the scan. */
     {
-        int8_t ct = m.type, lt = (int8_t)-cv->type;
+        int8_t lt = (int8_t)-cv->type;
         bool ctemp = ct == RAY_DATE || ct == RAY_TIME || ct == RAY_TIMESTAMP;
         bool ltemp = lt == RAY_DATE || lt == RAY_TIME || lt == RAY_TIMESTAMP;
         if ((ctemp || ltemp) && ct != lt) return 0;
@@ -2767,7 +2743,7 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
      * cross-type predicate would otherwise compare against the zero-filled
      * key slot — e.g. (> f 100) on an F64 column decoded key_f=0.0 and
      * misclassified ALL/NONE. */
-    int col_is_float = (m.type == RAY_F32 || m.type == RAY_F64);
+    int col_is_float = (ct == RAY_F32 || ct == RAY_F64);
     if (col_is_float && !is_float) {
         /* Integer literal vs float column: coerce, but only when the
          * value round-trips exactly through double.  Doubles have a
@@ -2782,6 +2758,44 @@ static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
          * promotion semantics own this shape — reject. */
         return 0;
     }
+
+    *out_key_i = key_i;
+    *out_key_f = key_f;
+    *out_is_float = is_float;
+    return 1;
+}
+
+static int idx_filter_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want,
+                             ray_t** out_col, uint16_t* out_cmp_op,
+                             int64_t* out_key_i, double* out_key_f,
+                             int* out_is_float, ray_col_meta_t* out_meta) {
+    if (!pred_op || pred_op->arity != 2) return 0;
+    uint16_t opc = pred_op->opcode;
+    if (opc != OP_EQ && opc != OP_NE &&
+        opc != OP_LT && opc != OP_LE &&
+        opc != OP_GT && opc != OP_GE) return 0;
+
+    ray_op_t* lhs = op_child(g, pred_op, 0);
+    ray_op_t* rhs = op_child(g, pred_op, 1);
+    if (!lhs || !rhs) return 0;
+    if (lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
+    ray_op_ext_t* lext = find_ext(g, lhs->id);
+    ray_op_ext_t* rext = find_ext(g, rhs->id);
+    if (!lext || !rext || !rext->literal) return 0;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, lext->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0) return 0;  /* non-default table — skip */
+    ray_t* tbl = g->table;
+    if (!tbl) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(tbl, lext->sym, &m)) return 0;
+    if (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON) return 0;
+    if (!idx_want_ok(&m, want)) return 0;
+
+    int64_t key_i = 0;
+    double  key_f = 0.0;
+    int     is_float = 0;
+    if (!idx_cmp_key(m.type, rext->literal, &key_i, &key_f, &is_float)) return 0;
 
     if (out_meta) *out_meta = m;
     if (out_col) {
@@ -2880,6 +2894,544 @@ static int idx_filter_in_decode(ray_graph_t* g, ray_op_t* pred_op, unsigned want
     }
     *out_set_lit = rext->literal;
     return 1;
+}
+
+/* ---- Per-segment hash indexes of a parted column (#1422) ----
+ *
+ * (== c k) and (in c set) over a parted column of the default table, after
+ * partition pruning (the select drops pruned partitions before the filter
+ * runs, so every segment here is one the query reads).  Each segment is
+ * answered by its own saved index, with the probes and eligibility of the
+ * unparted route: a HASH (or PART) attached to a plain or materialized
+ * segment, or the HASH region a generation-2 segment records (an integer or
+ * SYM equality, a STR equality or STR set).  Each probe checks its index
+ * against the segment (a stale or mismatched one declines, as unparted),
+ * and declines a needle or a dense group it leaves to the scan.  A segment
+ * no index answers is compared row by row when every needle is non-null
+ * (null rows then match on neither side): read by range as the scan reads
+ * it, generation 0 in place and generation 2 a vector at a time, never
+ * materialized.  Otherwise, or when no segment has an index at all, the
+ * filter scans as before.  The segments' rows are concatenated into one
+ * selection over the table's rows, in row order. */
+typedef struct {
+    uint16_t op;          /* OP_EQ or OP_IN */
+    int8_t   type;        /* the column's base type */
+    int64_t  key;         /* OP_EQ on an integer-family or SYM column (a global intern id) */
+    ray_t*   lit;         /* the CONST: the OP_EQ atom or the OP_IN set */
+} idx_parted_key_t;
+
+/* No needle of k is null: a "" STR, a zero GUID, a null atom or a set
+ * holding one. */
+static bool idx_parted_needles_nonnull(const idx_parted_key_t* k) {
+    ray_t* l = k->lit;
+    if (k->op == OP_EQ) {
+        if (k->type == RAY_STR) return ray_str_len(l) > 0;
+        if (k->type == RAY_GUID) {
+            const uint8_t* b = l->obj ? (const uint8_t*)ray_data(l->obj) : NULL;
+            if (!b) return false;
+            for (int i = 0; i < 16; i++) if (b[i]) return true;
+            return false;
+        }
+        return k->type == RAY_SYM ? k->key != 0 : !RAY_ATOM_IS_NULL(l);
+    }
+    if (l->attrs & RAY_ATTR_HAS_NULLS) return false;
+    if (l->type == RAY_STR) {
+        for (int64_t i = 0; i < l->len; i++) {
+            size_t n = 0;
+            if (!ray_str_vec_get(l, i, &n) || n == 0) return false;
+        }
+    } else if (l->type == RAY_GUID) {
+        const uint8_t* b = (const uint8_t*)ray_data(l);
+        for (int64_t i = 0; i < l->len; i++) {
+            bool z = true;
+            for (int j = 0; j < 16 && z; j++) z = b[i * 16 + j] == 0;
+            if (z) return false;
+        }
+    } else if (l->type == RAY_SYM) {
+        for (int64_t i = 0; i < l->len; i++)
+            if (ray_read_sym(ray_data(l), i, RAY_SYM, l->attrs) == 0) return false;
+    }
+    return true;
+}
+
+/* A SYM key (global intern id) in a segment's domain: its id there, or -1
+ * when the segment holds no such symbol. */
+static int64_t idx_parted_sym_key(struct ray_sym_domain_s* dom, int64_t key) {
+    ray_t* s = dom ? ray_sym_str(key) : NULL;
+    return s ? ray_sym_domain_find(dom, ray_str_ptr(s), ray_str_len(s)) : -1;
+}
+
+/* The rows a selection over n rows keeps, + base, appended at ids[*m]. */
+static void idx_parted_sel_rows(ray_t* sel, int64_t n, int64_t base, int64_t* ids, int64_t* m) {
+    ray_rowsel_t* sm = ray_rowsel_meta(sel);
+    const uint8_t* fl = ray_rowsel_flags(sel);
+    const uint32_t* so = ray_rowsel_offsets(sel);
+    const uint16_t* ix = ray_rowsel_idx(sel);
+    for (uint32_t s = 0; s < sm->n_segs; s++) {
+        int64_t s0 = (int64_t)s * RAY_MORSEL_ELEMS;
+        if (fl[s] == RAY_SEL_ALL) {
+            int64_t s1 = s0 + RAY_MORSEL_ELEMS < n ? s0 + RAY_MORSEL_ELEMS : n;
+            for (int64_t r = s0; r < s1; r++) ids[(*m)++] = base + r;
+        } else if (fl[s] == RAY_SEL_MIX) {
+            for (uint32_t j = so[s]; j < so[s + 1]; j++) ids[(*m)++] = base + s0 + ix[j];
+        }
+    }
+}
+
+static int idx_parted_cmp_i64(const void* x, const void* y) {
+    int64_t a = *(const int64_t*)x, b = *(const int64_t*)y;
+    return (a > b) - (a < b);
+}
+
+/* A generation-2 segment's recorded HASH probed once per element of an
+ * integer-family or SYM set (at most 64), the rows united: 1 with *sel, 0
+ * when any probe declines, -1 with *err owned. */
+static int idx_parted_enc_in(ray_t* seg, ray_enccol_t* e, ray_t* set, ray_t** sel, ray_t** err) {
+    if (set->len > 64 || set->type == RAY_STR || set->type == RAY_GUID ||
+        (set->attrs & RAY_ATTR_HAS_NULLS)) return 0;
+    int64_t n = 0, cap = 0;
+    int64_t* ids = NULL;
+    ray_t* ids_hdr = NULL;
+    int rc = 1;
+    for (int64_t i = 0; i < set->len && rc == 1; i++) {
+        int64_t key;
+        if (set->type == RAY_SYM) {
+            int64_t gid = ray_read_sym(ray_data(set), i, RAY_SYM, set->attrs);
+            if (gid == 0) { rc = 0; break; }             /* a null symbol: the scan */
+            key = idx_parted_sym_key(e->dom, gid);
+            if (key < 0) continue;                       /* no such symbol in the segment */
+        } else {
+            key = read_col_i64(ray_data(set), i, set->type, set->attrs);
+        }
+        ray_t* one = NULL;
+        rc = ray_enc_hash_eq_rowsel(seg, key, &one, err);
+        if (rc != 1) break;
+        int64_t m = ray_rowsel_meta(one)->total_pass;
+        if (n + m > cap) {
+            int64_t nc = (n + m) * 2 + 16;
+            ray_t* nh = NULL;
+            int64_t* nb = (int64_t*)scratch_alloc(&nh, (size_t)nc * sizeof(int64_t));
+            if (!nb) { ray_rowsel_release(one); rc = 0; break; }
+            if (n) memcpy(nb, ids, (size_t)n * sizeof(int64_t));
+            if (ids_hdr) ray_free(ids_hdr);
+            ids = nb; ids_hdr = nh; cap = nc;
+        }
+        idx_parted_sel_rows(one, e->len, 0, ids, &n);
+        ray_rowsel_release(one);
+    }
+    if (rc == 1) {
+        /* ascending and distinct, as a selection is built from */
+        if (n > 1) qsort(ids, (size_t)n, sizeof(int64_t), idx_parted_cmp_i64);
+        int64_t u = 0;
+        for (int64_t i = 0; i < n; i++) if (u == 0 || ids[u - 1] != ids[i]) ids[u++] = ids[i];
+        *sel = ray_index_rowsel_from_ids(e->len, ids, u);
+        if (!*sel) rc = 0;
+    }
+    if (ids_hdr) ray_free(ids_hdr);
+    return rc;
+}
+
+/* One segment's rows from its own index: 1 with *sel (a selection over the
+ * segment's rows) and *use the object its use is noted under (a vector, or
+ * a generation-2 segment: *use_enc), 0 when no index answers, -1 with
+ * *err owned.  Nothing is noted here: the caller notes the uses once the
+ * whole filter is answered. */
+static int idx_parted_seg_probe(ray_t* seg, const idx_parted_key_t* k, ray_t** sel, ray_t** use,
+                                bool* use_enc, ray_t** err) {
+    *sel = NULL; *err = NULL; *use = NULL; *use_enc = false;
+    ray_t* v = seg;
+    if (seg->type == RAY_ENCCOL) {
+        v = ray_enccol_decoded_peek(seg);
+        if (!v && k->type == RAY_GUID) {
+            /* as unparted: a generation-2 GUID column is materialized for its hash */
+            ray_col_meta_t gm;
+            ray_enccol_meta(seg, &gm);
+            if (gm.index_kind != RAY_IDX_HASH) return 0;
+            v = ray_enccol_materialize(seg);
+            if (!v) return 0;
+            if (RAY_IS_ERR(v)) { *err = v; return -1; }
+        }
+        if (!v) {
+            ray_enccol_t* e = ray_enccol_of(seg);
+            if (!e || e->kind != RAY_ENCCOL_SINGLE) return 0;
+            int rc = 0;
+            if (k->type == RAY_STR)
+                rc = k->op == OP_EQ
+                    ? ray_enc_hash_eq_str_rowsel(seg, ray_str_ptr(k->lit), ray_str_len(k->lit), sel, err)
+                    : ray_enc_hash_in_str_rowsel(seg, k->lit, sel, err);
+            else if (k->op == OP_EQ && k->type != RAY_GUID) {
+                int64_t key = k->key;
+                if (k->type == RAY_SYM && (key = idx_parted_sym_key(e->dom, k->key)) < 0) {
+                    *sel = ray_index_empty_rowsel(e->len);   /* no such symbol in the segment */
+                    return *sel ? 1 : 0;
+                }
+                rc = ray_enc_hash_eq_rowsel(seg, key, sel, err);
+            } else if (k->op == OP_IN && k->type != RAY_GUID) {
+                rc = idx_parted_enc_in(seg, e, k->lit, sel, err);
+            }
+            if (rc == 1) { *use = seg; *use_enc = true; }
+            return rc;
+        }
+    }
+    if (!(v->attrs & RAY_ATTR_HAS_INDEX) || v->type == RAY_F32 || v->type == RAY_F64) return 0;
+    ray_idx_kind_t kind = ray_index_kind(v);
+    if (kind != RAY_IDX_HASH && kind != RAY_IDX_PART) return 0;
+    if (k->op == OP_IN) {
+        *sel = ray_index_in_rowsel(v, k->lit);
+    } else if (v->type == RAY_STR) {
+        if (kind == RAY_IDX_HASH) *sel = ray_index_hash_eq_str_rowsel(v, ray_str_ptr(k->lit), ray_str_len(k->lit));
+    } else if (v->type == RAY_GUID) {
+        if (kind == RAY_IDX_HASH) *sel = ray_index_hash_eq_guid_rowsel(v, (const uint8_t*)ray_data(k->lit->obj));
+    } else {
+        int64_t key = k->key;
+        if (v->type == RAY_SYM) {
+            if ((key = idx_parted_sym_key(ray_sym_vec_domain(v), k->key)) < 0) {
+                *sel = ray_index_empty_rowsel(v->len);    /* no such symbol in the segment */
+                return *sel ? 1 : 0;
+            }
+        } else if (ray_vec_may_have_nulls(v)) {
+            return 0;                                     /* as unparted: an integer hash wants no nulls */
+        }
+        *sel = kind == RAY_IDX_HASH ? ray_index_hash_eq_rowsel(v, key) : ray_index_part_eq_rowsel(v, key);
+    }
+    if (!*sel) return 0;
+    *use = v;
+    return 1;
+}
+
+/* The needles a segment no index answers is matched against, as the scan
+ * compares: integer-family keys and SYM ids (global) sorted and distinct;
+ * STR and GUID needles by their bytes, at most IDX_PARTED_SCAN_BYTES_MAX of
+ * them.  Built once per filter; lkeys holds a range's SYM keys in its
+ * domain. */
+#define IDX_PARTED_SCAN_BYTES_MAX 64
+typedef struct {
+    int8_t         type;
+    int64_t        m;
+    int64_t*       keys;
+    int64_t*       lkeys;
+    int64_t        nl;
+    const void*    ldom;
+    const char**   sp;
+    size_t*        sl;
+    const uint8_t* g;
+} idx_parted_set_t;
+
+static void idx_parted_set_free(idx_parted_set_t* s) {
+    if (s->keys) ray_free_raw(s->keys);
+    if (s->lkeys) ray_free_raw(s->lkeys);
+    if (s->sp) ray_free_raw((void*)s->sp);
+    if (s->sl) ray_free_raw(s->sl);
+    *s = (idx_parted_set_t){ 0 };
+}
+
+/* False when the needles are not ones matched here: a cell of the column's
+ * type could not hold one (out of range, or its null), or too many byte
+ * needles.  The caller has checked that none is null. */
+static bool idx_parted_set_build(const idx_parted_key_t* k, idx_parted_set_t* s) {
+    *s = (idx_parted_set_t){ .type = k->type, .ldom = NULL };
+    ray_t* l = k->lit;
+    int64_t m = k->op == OP_EQ ? 1 : l->len;
+    s->m = m;
+    if (m <= 0) return true;
+    if (k->type == RAY_STR || k->type == RAY_GUID) {
+        if (m > IDX_PARTED_SCAN_BYTES_MAX) return false;
+        if (k->type == RAY_GUID) {
+            s->g = (const uint8_t*)ray_data(k->op == OP_EQ ? l->obj : l);
+            return true;
+        }
+        s->sp = (const char**)ray_alloc_raw((size_t)m * sizeof(char*));
+        s->sl = (size_t*)ray_alloc_raw((size_t)m * sizeof(size_t));
+        if (!s->sp || !s->sl) return false;
+        for (int64_t i = 0; i < m; i++) {
+            if (k->op == OP_EQ) { s->sp[i] = ray_str_ptr(l); s->sl[i] = ray_str_len(l); }
+            else s->sp[i] = ray_str_vec_get(l, i, &s->sl[i]);
+            if (!s->sp[i]) return false;
+        }
+        return true;
+    }
+    s->keys = (int64_t*)ray_alloc_raw((size_t)m * sizeof(int64_t));
+    if (!s->keys) return false;
+    if (k->type == RAY_SYM) {
+        s->lkeys = (int64_t*)ray_alloc_raw((size_t)m * sizeof(int64_t));
+        if (!s->lkeys) return false;
+    }
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    switch (k->type) {
+    case RAY_BOOL: lo = 0; hi = 1; break;
+    case RAY_U8:   lo = 0; hi = UINT8_MAX; break;
+    case RAY_I16:  lo = INT16_MIN; hi = INT16_MAX; break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: lo = INT32_MIN; hi = INT32_MAX; break;
+    default: break;
+    }
+    int64_t null_key = agg_int_null_sentinel_for(k->type);
+    bool nullable = k->type != RAY_BOOL && k->type != RAY_U8 && k->type != RAY_SYM;
+    for (int64_t i = 0; i < m; i++) {
+        int64_t v;
+        if (k->op == OP_EQ) v = k->key;
+        else if (k->type == RAY_SYM) v = ray_read_sym(ray_data(l), i, RAY_SYM, l->attrs);
+        else v = read_col_i64(ray_data(l), i, l->type, l->attrs);
+        if (v < lo || v > hi || (nullable && v == null_key)) return false;
+        s->keys[i] = v;
+    }
+    qsort(s->keys, (size_t)m, sizeof(int64_t), idx_parted_cmp_i64);
+    int64_t d = 0;
+    for (int64_t i = 0; i < m; i++) if (d == 0 || s->keys[d - 1] != s->keys[i]) s->keys[d++] = s->keys[i];
+    s->m = d;
+    return true;
+}
+
+static bool idx_parted_has(const int64_t* keys, int64_t n, int64_t v) {
+    int64_t lo = 0, hi = n;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (keys[mid] < v) lo = mid + 1; else hi = mid;
+    }
+    return lo < n && keys[lo] == v;
+}
+
+/* out[r] = data[r] is one of the m sorted keys, over n cells of an
+ * integer-family type (a null cell is never a key): one compare for a
+ * single key, a few for a short set, else a binary search. */
+#define IDX_PARTED_MATCH(T)                                                       \
+    do {                                                                          \
+        const T* d = (const T*)data;                                              \
+        if (m == 1) {                                                             \
+            const int64_t k0 = keys[0];                                           \
+            for (int64_t r = 0; r < n; r++) out[r] = (int64_t)d[r] == k0;         \
+        } else if (m <= 8) {                                                      \
+            for (int64_t r = 0; r < n; r++) {                                     \
+                uint8_t h = 0;                                                    \
+                for (int64_t j = 0; j < m; j++) h |= (int64_t)d[r] == keys[j];    \
+                out[r] = h;                                                       \
+            }                                                                     \
+        } else {                                                                  \
+            for (int64_t r = 0; r < n; r++) out[r] = idx_parted_has(keys, m, (int64_t)d[r]); \
+        }                                                                         \
+    } while (0)
+
+static void idx_parted_match_ints(const void* data, int64_t n, int8_t type, uint8_t attrs, const int64_t* keys,
+                                  int64_t m, uint8_t* out) {
+    if (m <= 0) { memset(out, 0, (size_t)n); return; }
+    if (type == RAY_SYM) {
+        switch (attrs & RAY_SYM_W_MASK) {
+        case RAY_SYM_W8:  IDX_PARTED_MATCH(uint8_t); break;
+        case RAY_SYM_W16: IDX_PARTED_MATCH(uint16_t); break;
+        case RAY_SYM_W32: IDX_PARTED_MATCH(uint32_t); break;
+        default:          IDX_PARTED_MATCH(int64_t); break;
+        }
+        return;
+    }
+    switch (ray_type_sizes[type]) {
+    case 8: IDX_PARTED_MATCH(int64_t); break;
+    case 4: IDX_PARTED_MATCH(int32_t); break;
+    case 2: IDX_PARTED_MATCH(int16_t); break;
+    default: IDX_PARTED_MATCH(uint8_t); break;
+    }
+}
+#undef IDX_PARTED_MATCH
+
+/* Rows [lo, lo + n) of the bound parted source matched against the
+ * needles, read by range (generation 0 in place, generation 2 decoded a
+ * vector at a time, nothing materialized): out[r] set for a match, *hits
+ * their count.  A null cell never matches.  NULL or an owned error. */
+static ray_t* idx_parted_scan_rows(ray_col_src_t* src, int64_t lo, int64_t n, idx_parted_set_t* s,
+                                   ray_col_scratch_t* sc, uint8_t* out, int64_t* hits) {
+    int64_t at = 0, h = 0;
+    while (at < n) {
+        ray_col_range_t v;
+        ray_t* e = ray_col_range(src, lo + at, n - at, sc, &v);
+        if (e) return e;
+        if (v.n <= 0) return ray_error("range", "parted index filter: empty range read at row %lld", (long long)(lo + at));
+        uint8_t* o = out + at;
+        switch (s->type) {
+        case RAY_STR: {
+            const ray_str_t* c = (const ray_str_t*)v.data;
+            for (int64_t r = 0; r < v.n; r++) {
+                bool hit = false;
+                for (int64_t j = 0; j < s->m && !hit; j++)
+                    hit = c[r].len == s->sl[j] && c[r].len > 0 &&
+                          memcmp(ray_str_t_ptr(&c[r], v.str_pool), s->sp[j], s->sl[j]) == 0;
+                o[r] = hit;
+            }
+            break;
+        }
+        case RAY_GUID: {
+            const uint8_t* c = (const uint8_t*)v.data;
+            for (int64_t r = 0; r < v.n; r++) {
+                bool hit = false;
+                for (int64_t j = 0; j < s->m && !hit; j++) hit = memcmp(c + r * 16, s->g + j * 16, 16) == 0;
+                o[r] = hit;
+            }
+            break;
+        }
+        case RAY_SYM: {
+            if (v.dom != s->ldom || !s->ldom) {
+                s->nl = 0;
+                for (int64_t j = 0; j < s->m; j++) {
+                    int64_t id = idx_parted_sym_key(v.dom, s->keys[j]);
+                    if (id > 0) s->lkeys[s->nl++] = id;
+                }
+                qsort(s->lkeys, (size_t)s->nl, sizeof(int64_t), idx_parted_cmp_i64);
+                s->ldom = v.dom;
+            }
+            idx_parted_match_ints(v.data, v.n, RAY_SYM, v.attrs, s->lkeys, s->nl, o);
+            break;
+        }
+        default:
+            idx_parted_match_ints(v.data, v.n, v.type, v.attrs, s->keys, s->m, o);
+            break;
+        }
+        for (int64_t r = 0; r < v.n; r++) h += o[r];
+        at += v.n;
+    }
+    *hits = h;
+    return NULL;
+}
+
+/* FILTER over a parted column: 1 with *out the selection over input's rows,
+ * 0 when the route is not taken (the filter scans as before), -1 with *out
+ * an owned error. */
+static int idx_parted_filter(ray_graph_t* g, ray_op_t* pred, ray_t* input, ray_t** out) {
+    *out = NULL;
+    if (!pred || pred->arity != 2 || (pred->opcode != OP_EQ && pred->opcode != OP_IN)) return 0;
+    if (!g->table || input != g->table) return 0;
+    ray_op_t* lhs = op_child(g, pred, 0);
+    ray_op_t* rhs = op_child(g, pred, 1);
+    if (!lhs || !rhs || lhs->opcode != OP_SCAN || rhs->opcode != OP_CONST) return 0;
+    ray_op_ext_t* le = find_ext(g, lhs->id);
+    ray_op_ext_t* re = find_ext(g, rhs->id);
+    if (!le || !re || !re->literal) return 0;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, le->base.pad, sizeof(uint16_t));
+    if (stored_table_id != 0) return 0;
+    ray_col_meta_t m;
+    if (!ray_table_col_meta(g->table, le->sym, &m) || !RAY_IS_PARTED(m.type)) return 0;
+
+    idx_parted_key_t k = { pred->opcode, (int8_t)RAY_PARTED_BASETYPE(m.type), 0, re->literal };
+    ray_t* l = k.lit;
+    bool str_like = k.type == RAY_STR || k.type == RAY_GUID;
+    if (k.op == OP_EQ) {
+        if (!ray_is_atom(l)) return 0;
+        if (str_like) {
+            if (l->type != -k.type) return 0;
+            if (k.type == RAY_GUID && !l->obj) return 0;
+        } else {
+            double kf = 0.0; int isf = 0;
+            if (l->type == -RAY_STR || l->type == -RAY_GUID) return 0;
+            if (!idx_cmp_key(k.type, l, &k.key, &kf, &isf) || isf) return 0;
+        }
+    } else {
+        if (ray_is_atom(l)) return 0;
+        bool lint = l->type == RAY_I64 || l->type == RAY_I32 || l->type == RAY_I16 || l->type == RAY_U8 ||
+                    l->type == RAY_BOOL;
+        bool cint = k.type == RAY_I64 || k.type == RAY_I32 || k.type == RAY_I16 || k.type == RAY_U8 ||
+                    k.type == RAY_BOOL;
+        if (l->type != k.type && !(lint && cint)) return 0;
+        if (k.type == RAY_F32 || k.type == RAY_F64) return 0;
+    }
+    if (k.type == RAY_F32 || k.type == RAY_F64) return 0;
+    bool scan_ok = idx_parted_needles_nonnull(&k);
+
+    if (ray_col_bind_declines(g->table, le->sym)) return 0;
+    ray_t* err = NULL;
+    ray_col_src_t* src = ray_graph_bind_col(g, g->table, le->sym, &err);
+    if (err) { *out = err; return -1; }
+    int64_t nrows = ray_table_nrows(input);
+    if (!src || !src->parted || src->len != nrows) return 0;
+    int64_t ns = 0; ray_t** segv = NULL; const int64_t* off = NULL;
+    if (!ray_col_src_parted_segs(src, &ns, &segv, &off, &err)) {
+        if (err) { *out = err; return -1; }
+        return 0;
+    }
+    if (ns <= 0 || off[ns] != nrows) return 0;           /* a missing (ragged) segment: the scan */
+
+    /* every segment's answer first: a probe's selection, or the scan's
+     * BOOL; nothing is installed unless all of them answer */
+    idx_parted_set_t set = { 0 };                        /* the needles, for a segment that is scanned */
+    ray_col_scratch_t sc;
+    bool set_ok = false;
+    ray_t** ans = (ray_t**)ray_calloc_raw((size_t)ns * sizeof(ray_t*));
+    ray_t** uses = (ray_t**)ray_calloc_raw((size_t)ns * sizeof(ray_t*));
+    bool* probed = (bool*)ray_calloc_raw((size_t)ns * 2 * sizeof(bool));   /* [ns]: probed, [ns + i]: use_enc */
+    int rc = 0;
+    if (!ans || !uses || !probed) goto done;
+    int64_t nprobed = 0, total = 0;
+    for (int64_t i = 0; i < ns; i++) {
+        int64_t sl = off[i + 1] - off[i];
+        if (sl == 0) continue;                           /* an empty segment: no rows */
+        ray_t* seg = segv[i];
+        if (!seg || RAY_IS_ERR(seg) || ray_table_col_nrows(seg) != sl) goto done;
+        ray_t* sel = NULL;
+        int pr = idx_parted_seg_probe(seg, &k, &sel, &uses[i], &probed[ns + i], &err);
+        if (pr < 0) { *out = err; rc = -1; goto done; }
+        if (pr == 1) {
+            if (ray_rowsel_meta(sel)->nrows != sl) { ray_rowsel_release(sel); goto done; }
+            ans[i] = sel; probed[i] = true; nprobed++;
+            total += ray_rowsel_meta(sel)->total_pass;
+        }
+    }
+    if (nprobed == 0) goto done;                         /* no index anywhere: the scan as before */
+    ray_idx_consults[k.op == OP_EQ ? IDX_SITE_FILTER_HASH : IDX_SITE_IN]++;
+    for (int64_t i = 0; i < ns; i++) {
+        int64_t sl = off[i + 1] - off[i];
+        if (sl == 0 || probed[i]) continue;
+        if (!scan_ok) goto done;
+        if (!set_ok) {
+            if (!idx_parted_set_build(&k, &set)) goto done;
+            ray_col_scratch_init(&sc);
+            set_ok = true;
+        }
+        ray_t* bv = ray_vec_new(RAY_BOOL, sl);
+        if (!bv || RAY_IS_ERR(bv)) { if (bv) ray_error_free(bv); goto done; }
+        bv->len = sl;
+        ans[i] = bv;
+        int64_t h = 0;
+        ray_t* e = idx_parted_scan_rows(src, off[i], sl, &set, &sc, (uint8_t*)ray_data(bv), &h);
+        if (e) { ray_error_free(e); goto done; }          /* the scan reads it again and reports */
+        total += h;
+    }
+    {
+        ray_t* ids_hdr = NULL;
+        int64_t* ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)(total > 0 ? total : 1) * sizeof(int64_t));
+        if (!ids) goto done;
+        int64_t mcount = 0;
+        for (int64_t i = 0; i < ns; i++) {
+            if (!ans[i]) continue;
+            if (probed[i]) {
+                idx_parted_sel_rows(ans[i], off[i + 1] - off[i], off[i], ids, &mcount);
+            } else {
+                const uint8_t* b = (const uint8_t*)ray_data(ans[i]);
+                for (int64_t r = 0; r < off[i + 1] - off[i]; r++)
+                    if (b[r]) ids[mcount++] = off[i] + r;
+            }
+        }
+        ray_t* sel = ray_index_rowsel_from_ids(nrows, ids, mcount);
+        if (ids_hdr) ray_free(ids_hdr);
+        if (!sel) goto done;
+        ray_idx_hits[k.op == OP_EQ ? IDX_SITE_FILTER_HASH : IDX_SITE_IN]++;
+        for (int64_t i = 0; i < ns; i++) {
+            if (!uses[i]) continue;
+            if (probed[ns + i]) ray_idx_note_use_enc(uses[i]);
+            else ray_idx_note_use(uses[i]);
+        }
+        *out = sel;
+        rc = 1;
+    }
+done:
+    if (ans) {
+        for (int64_t i = 0; i < ns; i++) {
+            if (!ans[i]) continue;
+            if (probed[i]) ray_rowsel_release(ans[i]);
+            else ray_release(ans[i]);
+        }
+        ray_free_raw(ans);
+    }
+    if (probed) ray_free_raw(probed);
+    if (uses) ray_free_raw(uses);
+    if (set_ok) ray_col_scratch_free(&sc);
+    idx_parted_set_free(&set);
+    return rc;
 }
 
 /* True when every leaf of the op tree under `id` is a constant or, with
@@ -4354,6 +4906,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
              * pre-existing selection (the entry shape downstream
              * group-by / sort already expects). */
             if (input->type == RAY_TABLE && !g->selection) {
+                /* a parted column: each segment's own index (#1422) */
+                {
+                    ray_t* psel = NULL;
+                    int prc = idx_parted_filter(g, op_child(g, op, 1), input, &psel);
+                    if (prc < 0) { ray_release(input); return psel; }
+                    if (prc == 1) { g->selection = psel; return input; }
+                }
                 /* A symbol missing from the column's domain selects no rows,
                  * indexed or not.  Decided from the domain alone: a generation-2
                  * column is never decoded to learn that. */
