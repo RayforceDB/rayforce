@@ -1441,9 +1441,12 @@ static int private_cwd_enter(void) {
 static void private_cwd_leave(void) {
     if (g_orig_cwd[0] && chdir(g_orig_cwd) != 0) perror(g_orig_cwd);
 }
+
+const char* ray_test_launch_dir(void) { return g_orig_cwd[0] ? g_orig_cwd : NULL; }
 #else
 static int  private_cwd_enter(void) { return 0; }
 static void private_cwd_leave(void) {}
+const char* ray_test_launch_dir(void) { return NULL; }
 #endif
 
 /* ─── Recorded timings (parallel scheduling) ─────────────────────── */
