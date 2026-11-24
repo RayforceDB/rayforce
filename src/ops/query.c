@@ -6201,7 +6201,7 @@ static bool derived_key_head_ok(int64_t head) {
         "let", "if", "cond", "and", "or", "not",
         "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%",
         "abs", "neg", "floor", "ceil", "round", "xbar", "as",
-        "substr", "str-find", "strlen", "within", "nil?", "upper", "lower", "like",
+        "substr", "str-find", "strlen", "within", "nil?", "upper", "lower", "trim", "like",
     };
     ray_t* name = ray_sym_str(head);
     if (!name || RAY_IS_ERR(name)) return false;
@@ -6278,6 +6278,7 @@ static int64_t derived_key_name(ray_t* by_expr) {
  * have the same row-wise semantics as projections, and eval-level `if`
  * tests whole-vector truthiness and would choose one branch for every
  * input row. */
+static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
 static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
     /* Exact-size carve: collect_col_refs dedups against real table
      * columns, so ray_table_ncols(tbl) is a hard upper bound. */
@@ -6305,6 +6306,9 @@ static ray_t* group_key_eval(ray_t* v, ray_t* tbl) {
             ray_env_set_query_local(ref_syms[ri], flat);
         }
     }
+    /* a key over one SYM or STR column of few distinct values: once per value */
+    if (!col_vec)
+        col_vec = derived_key_over_values(v, tbl, n_refs == 1 ? materialized_refs[0] : NULL, NULL);
     if (!col_vec) {
         ray_graph_t* key_graph = ray_graph_new(tbl);
         if (!key_graph) col_vec = ray_error("oom", NULL);
@@ -7681,7 +7685,6 @@ static ray_t* select_topk_hh(ray_t* dict, ray_t* tbl) {
 }
 
 
-#define DERIVED_KEY_MAX_DOMAIN (64LL * 1024 * 1024)
 /* The distinct-symbol evaluation, in chunks and over STR.
  *
  * Feeding the DAG a SYM column whose ids live in a FILE domain makes every
@@ -7923,46 +7926,6 @@ static ray_t* derived_key_chunk_strs(const char** ptr, uint32_t* len, int64_t n)
     scratch_free(aux_hdr);
     if (pool_cancelled(pool)) { ray_release(sv); return NULL; }
     return sv;
-}
-
-/* ---- the spread pass of derived_key_over_sym_domain: each row takes the
- * key of its symbol's slot (workers, disjoint ranges). */
-typedef struct {
-    const void*    cd;
-    uint8_t        attrs;
-    int64_t        dn;
-    const int32_t* pos;
-    const int64_t* key;      /* spread: key per slot; NULL = write the slot */
-    int64_t*       out;
-    bool           sparse;   /* a selection: an unslotted id (-1) takes slot 0 */
-} dk_rows_ctx_t;
-
-static void dk_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    const dk_rows_ctx_t* c = (const dk_rows_ctx_t*)vctx;
-    if (c->sparse) {
-        /* rows outside the selection have no slot: they take slot 0 (the
-         * grouping never reads them — it honours the same selection) */
-        if (c->key) {
-            for (int64_t r = start; r < end; r++) {
-                int32_t s = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
-                c->out[r] = c->key[s >= 0 ? s : 0];
-            }
-        } else {
-            for (int64_t r = start; r < end; r++) {
-                int32_t s = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
-                c->out[r] = s >= 0 ? s : 0;
-            }
-        }
-        return;
-    }
-    if (c->key) {
-        for (int64_t r = start; r < end; r++)
-            c->out[r] = c->key[c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)]];
-    } else {
-        for (int64_t r = start; r < end; r++)
-            c->out[r] = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->attrs)];
-    }
 }
 
 /* ---- the rows of a selection, in row order (every row when sel is NULL):
@@ -11077,115 +11040,484 @@ vfail:
  * which distinct symbols are evaluated — the grouping that consumes the key
  * honours the same selection, so a symbol that occurs in no selected row
  * is never evaluated (nor its key interned). */
+static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel);
 static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel) {
+    return derived_key_over_values(by_expr, tbl, NULL, sel);
+}
+
+/* ---- A key over ONE STR column, evaluated once per distinct string ------
+ *
+ * `(upper (trim C))` over a STR column of a few distinct strings ran every
+ * string op over every row (exec_string_unary: one serial per-row append
+ * per op, 330 ms for 5M rows).  Here the rows are grouped by their bytes
+ * first — the workers over row ranges, each into a small first-seen table,
+ * the tables merged in row order so the slots come out in first-seen order
+ * of the values — the expression is evaluated once over the du distinct
+ * strings through the DAG compiler the row-wise key takes, and each row
+ * takes the value of its slot (a gather).  The same values and the same
+ * group order as the row-wise evaluation.  NULL when the shape does not
+ * apply, or the column is near-unique (a probe of the first rows, then a
+ * cap of nrows/2 distinct on the way): the caller evaluates the key
+ * row-wise as before. */
+#define DKS_PROBE_ROWS 65536
+typedef struct { uint64_t hash; int64_t id; } dks_slot_t;       /* id -1: empty */
+typedef struct {
+    dks_slot_t* slots;
+    uint64_t    cap;        /* power of two, load kept under 1/2 */
+    int64_t*    first;      /* [du]: the first row of each local id, in id order */
+    uint64_t*   hash;       /* [du] */
+    int64_t     du, du_cap;
+    bool        fail;       /* OOM, or past the cap: near-unique */
+} dks_task_t;
+typedef struct {
+    bool             sym;       /* a SYM column: ids (cd, dn), else STR descriptors (el, pool) */
+    const void*      cd;
+    uint8_t          cattrs;
+    int64_t          dn;        /* the domain's count: an id past it is foreign */
+    const ray_str_t* el;
+    const char*      pool;
+    int64_t          n;
+    uint32_t         tasks;
+    int32_t*         code;      /* [n]: the row's local id, then its global one; -1 unselected */
+    dks_task_t*      tk;        /* [tasks] */
+    int64_t**        remap;     /* [tasks]: local id -> global id */
+    ray_t*           sel;       /* the selection (NULL: every row), by morsel flags */
+    const uint8_t*   flags;
+    const uint32_t*  offs;
+    const uint16_t*  idx;
+    int64_t          n_segs;    /* morsels of the n rows */
+} dks_ctx_t;
+
+/* The home slot of a hash (a SYM id is its own hash: mixed here). */
+static inline uint64_t dks_home(uint64_t h, uint64_t m) {
+    return ((h * 0x9E3779B97F4A7C15ULL) >> 16) & m;
+}
+static void dks_task_free(dks_task_t* t) {
+    if (t->slots) ray_free_raw(t->slots);
+    if (t->first) ray_free_raw(t->first);
+    if (t->hash) ray_free_raw(t->hash);
+    memset(t, 0, sizeof *t);
+}
+/* Twice the slots; the entries carry their hash, so no string is reread. */
+static bool dks_grow(dks_task_t* t) {
+    uint64_t ncap = t->cap ? t->cap * 2 : 1024;
+    dks_slot_t* ns = ray_alloc_raw((size_t)ncap * sizeof *ns);
+    if (!ns) return false;
+    for (uint64_t i = 0; i < ncap; i++) ns[i].id = -1;
+    for (uint64_t i = 0; i < t->cap; i++) {
+        if (t->slots[i].id < 0) continue;
+        uint64_t h = dks_home(t->slots[i].hash, ncap - 1);
+        while (ns[h].id >= 0) h = (h + 1) & (ncap - 1);
+        ns[h] = t->slots[i];
+    }
+    if (t->slots) ray_free_raw(t->slots);
+    t->slots = ns; t->cap = ncap;
+    int64_t nfc = t->cap / 2 + 1;
+    int64_t* nf = ray_alloc_raw((size_t)nfc * sizeof *nf);
+    uint64_t* nh = ray_alloc_raw((size_t)nfc * sizeof *nh);
+    if (!nf || !nh) { if (nf) ray_free_raw(nf); if (nh) ray_free_raw(nh); return false; }
+    if (t->du > 0) { memcpy(nf, t->first, (size_t)t->du * sizeof *nf); memcpy(nh, t->hash, (size_t)t->du * sizeof *nh); }
+    if (t->first) ray_free_raw(t->first);
+    if (t->hash) ray_free_raw(t->hash);
+    t->first = nf; t->hash = nh;
+    return true;
+}
+/* Row r into task t's table: its local first-seen id in *out.  A SYM cell
+ * is keyed by its id (equal ids, equal values; an id past the domain is a
+ * foreign one: the task fails and the caller takes the row-wise key); a
+ * STR cell by the hash of its bytes, compared byte for byte. */
+static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, int32_t* out) {
+    uint64_t h;
+    if (c->sym) {
+        int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
+        if (id < 0 || id >= c->dn) { t->fail = true; return; }
+        h = (uint64_t)id;
+    } else {
+        h = ray_str_t_hash(&c->el[r], c->pool);
+    }
+    uint64_t m = t->cap - 1, p = dks_home(h, m);
+    for (;;) {
+        dks_slot_t* sl = &t->slots[p];
+        if (sl->id < 0) {
+            if (t->du >= t->du_cap) { t->fail = true; return; }
+            sl->hash = h; sl->id = t->du;
+            t->first[t->du] = r; t->hash[t->du] = h;
+            *out = (int32_t)t->du++;
+            if ((uint64_t)t->du * 2 > t->cap && !dks_grow(t)) t->fail = true;
+            return;
+        }
+        if (sl->hash == h &&
+            (c->sym || ray_str_t_eq(&c->el[t->first[sl->id]], c->pool, &c->el[r], c->pool))) {
+            *out = (int32_t)sl->id;
+            return;
+        }
+        p = (p + 1) & m;
+    }
+}
+/* One task: the morsels [n_segs*t/T, n_segs*(t+1)/T) coded by local
+ * first-seen id; a row the selection drops gets -1 (its key is never read:
+ * the grouping honours the same selection). */
+static void dks_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dks_ctx_t* c = (dks_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        dks_task_t* t = &c->tk[ti];
+        int64_t s0 = c->n_segs * ti / c->tasks, s1 = c->n_segs * (ti + 1) / c->tasks;
+        if (!dks_grow(t)) { t->fail = true; continue; }
+        for (int64_t seg = s0; seg < s1 && !t->fail; seg++) {
+            int64_t lo = seg * RAY_MORSEL_ELEMS;
+            int64_t hi = lo + RAY_MORSEL_ELEMS < c->n ? lo + RAY_MORSEL_ELEMS : c->n;
+            uint8_t f = c->sel ? c->flags[seg] : RAY_SEL_ALL;
+            if (f == RAY_SEL_NONE) {
+                for (int64_t r = lo; r < hi; r++) c->code[r] = -1;
+            } else if (f == RAY_SEL_ALL) {
+                for (int64_t r = lo; r < hi && !t->fail; r++) dks_code_row(c, t, r, &c->code[r]);
+            } else {
+                uint8_t in_seg[RAY_MORSEL_ELEMS / 8] = {0};
+                for (uint32_t i = c->offs[seg]; i < c->offs[seg + 1]; i++)
+                    in_seg[c->idx[i] >> 3] |= (uint8_t)(1u << (c->idx[i] & 7));
+                for (int64_t r = lo; r < hi && !t->fail; r++) {
+                    uint16_t loc = (uint16_t)(r - lo);
+                    if (in_seg[loc >> 3] & (1u << (loc & 7))) dks_code_row(c, t, r, &c->code[r]);
+                    else c->code[r] = -1;
+                }
+            }
+        }
+    }
+}
+static void dks_remap_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dks_ctx_t* c = (const dks_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        int64_t lo = c->n_segs * ti / c->tasks * RAY_MORSEL_ELEMS;
+        int64_t hi = c->n_segs * (ti + 1) / c->tasks * RAY_MORSEL_ELEMS;
+        if (hi > c->n) hi = c->n;
+        const int64_t* rm = c->remap[ti];
+        /* an unselected row takes cell 0 (never read) */
+        for (int64_t r = lo; r < hi; r++) c->code[r] = c->code[r] >= 0 ? (int32_t)rm[c->code[r]] : 0;
+    }
+}
+
+/* ---- the spread: row r takes cell code[r] of the du-long key vector ----
+ * Fixed-width cells are copied by the workers over disjoint row ranges; a
+ * STR key's descriptors and pooled bytes the way gbi_str copies them (the
+ * tasks' pooled byte counts prefix-summed into regions of one pool). */
+typedef struct {
+    const int32_t*   code;
+    int64_t          n;
+    uint32_t         tasks;
+    const char*      src;       /* fixed width */
+    char*            dst;
+    uint8_t          esz;
+    const ray_str_t* sel;       /* STR */
+    const char*      spool;
+    ray_str_t*       sdst;
+    char*            dpool;
+    uint64_t*        bytes;     /* [tasks + 1] */
+    _Atomic(bool)    empty;
+} dks_spread_ctx_t;
+
+static void dks_spread_fixed_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dks_spread_ctx_t* c = (const dks_spread_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        int64_t lo = c->n * ti / c->tasks, hi = c->n * (ti + 1) / c->tasks;
+        switch (c->esz) {
+        case 8: for (int64_t r = lo; r < hi; r++) memcpy(c->dst + r * 8, c->src + (int64_t)c->code[r] * 8, 8); break;
+        case 4: for (int64_t r = lo; r < hi; r++) memcpy(c->dst + r * 4, c->src + (int64_t)c->code[r] * 4, 4); break;
+        case 2: for (int64_t r = lo; r < hi; r++) memcpy(c->dst + r * 2, c->src + (int64_t)c->code[r] * 2, 2); break;
+        case 1: for (int64_t r = lo; r < hi; r++) c->dst[r] = c->src[c->code[r]]; break;
+        default: for (int64_t r = lo; r < hi; r++) memcpy(c->dst + r * c->esz, c->src + (int64_t)c->code[r] * c->esz, c->esz); break;
+        }
+    }
+}
+static void dks_spread_str_count_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dks_spread_ctx_t* c = (dks_spread_ctx_t*)vctx;
+    bool empty = false;
+    for (int64_t ti = start; ti < end; ti++) {
+        int64_t lo = c->n * ti / c->tasks, hi = c->n * (ti + 1) / c->tasks;
+        uint64_t b = 0;
+        for (int64_t r = lo; r < hi; r++) {
+            uint32_t l = c->sel[c->code[r]].len;
+            if (l > RAY_STR_INLINE_MAX) b += l;
+            else if (l == 0) empty = true;
+        }
+        c->bytes[ti] = b;
+    }
+    if (empty) atomic_store_explicit(&c->empty, true, memory_order_relaxed);
+}
+static void dks_spread_str_fill_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dks_spread_ctx_t* c = (const dks_spread_ctx_t*)vctx;
+    for (int64_t ti = start; ti < end; ti++) {
+        int64_t lo = c->n * ti / c->tasks, hi = c->n * (ti + 1) / c->tasks;
+        uint64_t off = c->bytes[ti];
+        for (int64_t r = lo; r < hi; r++) {
+            const ray_str_t* sv = &c->sel[c->code[r]];
+            ray_str_t* d = &c->sdst[r];
+            *d = *sv;
+            if (ray_str_is_inline(sv)) continue;
+            memcpy(c->dpool + off, c->spool + sv->pool_off, sv->len);
+            d->pool_off = (uint32_t)off;
+            off += sv->len;
+        }
+    }
+}
+/* The n-row key vector, or NULL (OOM, a cancel, or a kind of cell this
+ * does not copy: the caller gathers through gather_by_idx). */
+static ray_t* dks_spread(ray_t* key_dom, const int32_t* code, int64_t n, uint32_t tasks) {
+    int8_t t = key_dom->type;
+    if (t == RAY_LIST || !ray_is_vec(key_dom)) return NULL;
+    ray_pool_t* pool = ray_pool_get();
+    dks_spread_ctx_t c;
+    memset(&c, 0, sizeof c);
+    c.code = code; c.n = n; c.tasks = tasks;
+    atomic_store_explicit(&c.empty, false, memory_order_relaxed);
+    ray_t* out = NULL;
+    if (t == RAY_STR) {
+        str_resolve(key_dom, &c.sel, &c.spool);
+        ray_t* bytes_hdr = NULL;
+        c.bytes = (uint64_t*)scratch_alloc(&bytes_hdr, ((size_t)tasks + 1) * sizeof(uint64_t));
+        if (!c.bytes) return NULL;
+        out = ray_vec_new(RAY_STR, n);
+        if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); scratch_free(bytes_hdr); return NULL; }
+        out->len = n;
+        if (tasks > 1) ray_pool_dispatch_n(pool, dks_spread_str_count_fn, &c, tasks);
+        else dks_spread_str_count_fn(&c, 0, 0, 1);
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < tasks; i++) { uint64_t b = c.bytes[i]; c.bytes[i] = total; total += b; }
+        if (total > UINT32_MAX || pool_cancelled(pool)) { ray_release(out); scratch_free(bytes_hdr); return NULL; }
+        if (total > 0) {
+            ray_t* sp = ray_alloc((size_t)total);
+            if (!sp || RAY_IS_ERR(sp)) { ray_release(out); scratch_free(bytes_hdr); return NULL; }
+            sp->type = RAY_U8;
+            sp->len = (int64_t)total;
+            out->str_pool = sp;
+            c.dpool = (char*)ray_data(sp);
+        }
+        c.sdst = (ray_str_t*)ray_data(out);
+        if (tasks > 1) ray_pool_dispatch_n(pool, dks_spread_str_fill_fn, &c, tasks);
+        else dks_spread_str_fill_fn(&c, 0, 0, 1);
+        scratch_free(bytes_hdr);
+        if (atomic_load_explicit(&c.empty, memory_order_relaxed)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    } else {
+        out = t == RAY_SYM ? ray_sym_vec_new(key_dom->attrs & RAY_SYM_W_MASK, n) : ray_vec_new(t, n);
+        if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return NULL; }
+        out->len = n;
+        c.esz = (uint8_t)ray_sym_elem_size(t, key_dom->attrs);
+        {   /* a slice reads its parent's cells from its offset */
+            const ray_t* owner = (key_dom->attrs & RAY_ATTR_SLICE) ? key_dom->slice_parent : key_dom;
+            int64_t base = (key_dom->attrs & RAY_ATTR_SLICE) ? key_dom->slice_offset : 0;
+            c.src = (const char*)ray_data((ray_t*)owner) + base * c.esz;
+        }
+        c.dst = (char*)ray_data(out);
+        if (tasks > 1) ray_pool_dispatch_n(pool, dks_spread_fixed_fn, &c, tasks);
+        else dks_spread_fixed_fn(&c, 0, 0, 1);
+        if (t == RAY_SYM) ray_sym_vec_adopt_domain(out, key_dom);
+        /* a null cell of the key (the length of "", a null arm of an if)
+         * is a null of every row that takes it */
+        if (ray_vec_may_have_nulls(key_dom) && t != RAY_SYM) {
+            ray_t* nv_hdr = NULL;
+            int64_t du = ray_len(key_dom);
+            uint8_t* nv = (uint8_t*)scratch_alloc(&nv_hdr, (size_t)du);
+            if (!nv) { ray_release(out); return NULL; }
+            bool any = false;
+            for (int64_t d = 0; d < du; d++) any |= (nv[d] = ray_vec_is_null(key_dom, d));
+            if (any) for (int64_t r = 0; r < n; r++) if (nv[code[r]]) ray_vec_set_null(out, r, true);
+            scratch_free(nv_hdr);
+        }
+    }
+    if (pool_cancelled(pool)) { ray_release(out); return NULL; }
+    return out;
+}
+
+/* The key over the distinct values of its one column, SYM (by id: the
+ * tables hold the ids present in the column, never the domain — a symfile
+ * shared with a URL column has tens of millions of entries the column
+ * never uses) or STR (by bytes).  A SYM key's values are evaluated over the
+ * vocabulary bytes (derived_key_str_chunks: the key strings interned once
+ * into a domain of the key vector's own, nothing enters the global table),
+ * else through the DAG over a one-column table of the values.
+ * `col`: the column `by_expr` reads when the caller holds it flattened
+ * (NULL: the table's).  `sel`: the where: as a rowsel over the table's
+ * rows (NULL: every row) — only the selected rows are grouped and
+ * evaluated (a value only the dropped rows hold is never seen), the key
+ * vector is still one of nrows. */
+static ray_t* derived_key_over_values(ray_t* by_expr, ray_t* tbl, ray_t* col, ray_t* sel) {
     if (!by_expr || by_expr->type != RAY_LIST || !tbl) return NULL;
     int64_t ref_syms[2];
     int nref = collect_col_refs(by_expr, tbl, ref_syms, 2, 0);
     if (nref != 1) return NULL;
     int64_t bound[32];
     if (!derived_key_expr_ok(by_expr, tbl, ref_syms[0], bound, 0)) return NULL;
-    ray_t* C = tbl_col_or_null(tbl, ref_syms[0]);
-    int64_t nrows = ray_table_nrows(tbl);
-    if (!C || C->type != RAY_SYM || !ray_is_vec(C) || C->len != nrows || nrows < 4096)
+    ray_t* C = col ? col : tbl_col_or_null(tbl, ref_syms[0]);
+    int64_t n = ray_table_nrows(tbl);
+    if (!C || (C->type != RAY_STR && C->type != RAY_SYM) || !ray_is_vec(C) || C->len != n || n < 4096)
         return NULL;
-    int64_t sel_rows = nrows;
-    if (sel) {
-        /* a rowsel block (ray_rowsel_new: an untyped block, its meta first) */
-        ray_rowsel_t* sm = ray_rowsel_meta(sel);
-        if (!sm || sm->nrows != nrows) return NULL;
-        sel_rows = sm->total_pass;
-        if (sel_rows < 4096) return NULL;
-    }
-    struct ray_sym_domain_s* dom = ray_sym_vec_domain(C);
+    const bool sym = C->type == RAY_SYM;
+    struct ray_sym_domain_s* dom = sym ? ray_sym_vec_domain(C) : NULL;
     int64_t dn = dom ? ray_sym_domain_count(dom) : 0;
-    /* The slot table is dn ints: refuse a domain far wider than the table
-     * (a process-wide symbol domain behind a small in-memory column). */
-    if (dn <= 0 || dn > DERIVED_KEY_MAX_DOMAIN || dn > 16 * nrows) return NULL;
+    if (sym && dn <= 0) return NULL;
+    int64_t sel_rows = n;
+    if (sel) {
+        ray_rowsel_t* sm = ray_rowsel_meta(sel);
+        if (!sm || sm->nrows != n) return NULL;
+        sel_rows = sm->total_pass;
+        if (sel_rows <= 0) return NULL;
+    }
+    const ray_str_t* el = NULL; const char* pool = NULL;
+    if (!sym) str_resolve(C, &el, &pool);
+    const dks_ctx_t kind = { .sym = sym, .cd = ray_data(C), .cattrs = C->attrs, .dn = dn, .el = el, .pool = pool };
+    /* A selection of a quarter of the rows or less: the per-value path
+     * wins whatever the distinct count (the row-wise key ran every string
+     * op over every row of the table, selected or not), so its tables may
+     * hold every selected value — once the probe below has excluded a large
+     * near-unique selection (its tables would hold 20M values for 20M
+     * selected rows).  A selection within the probe's size is evaluated per
+     * value whatever it holds: that many values cost nothing. */
+    const bool sparse = sel_rows * 4 <= n;
 
-    /* Probe the first block before touching anything domain-sized: a
-     * distinct share above 3/4 over the first 65536 rows means a
-     * near-unique column, for which the per-symbol evaluation cannot win.
-     * A 128k-slot open-addressing set on scratch — no dn-sized memory. */
-    const void* cd = ray_data(C);
-    {
-        const int64_t probe_rows = sel_rows < 65536 ? sel_rows : 65536;
-        int64_t PROBE_SLOTS = 1024;               /* power of two, load <= 1/2 */
-        while (PROBE_SLOTS < 2 * probe_rows) PROBE_SLOTS <<= 1;
-        ray_t* set_hdr = NULL;
-        int64_t* set = (int64_t*)scratch_alloc(&set_hdr, (size_t)PROBE_SLOTS * sizeof(int64_t));
-        if (!set) return NULL;
-        memset(set, 0xff, (size_t)PROBE_SLOTS * sizeof(int64_t));
-        int64_t seen = 0;
-        dk_sel_it_t pit;
-        dk_sel_it_init(&pit, sel, nrows);
-        for (int64_t r = 0; r < probe_rows; r++) {
-            int64_t row = dk_sel_it_next(&pit);
-            if (row < 0) break;
-            int64_t id = ray_read_sym(cd, row, C->type, C->attrs);
-            if (id < 0 || id >= dn) { seen = probe_rows; break; }
-            uint64_t h = (((uint64_t)id * 0x9E3779B97F4A7C15ull) >> 32) & (uint64_t)(PROBE_SLOTS - 1);
-            while (set[h] >= 0 && set[h] != id) h = (h + 1) & (uint64_t)(PROBE_SLOTS - 1);
-            if (set[h] < 0) { set[h] = id; seen++; }
+    /* The first block decides cheaply: a distinct share above 3/4 over the
+     * first 65536 selected rows is a near-unique column, for which the
+     * per-value evaluation cannot win. */
+    if (sel_rows > DKS_PROBE_ROWS) {
+        dks_task_t pt; memset(&pt, 0, sizeof pt);
+        dks_ctx_t pc = kind;
+        pc.n = n; pc.tasks = 1; pc.tk = &pt;
+        const int64_t probe_rows = DKS_PROBE_ROWS;
+        pt.du_cap = probe_rows * 3 / 4;
+        if (!dks_grow(&pt)) return NULL;
+        dk_sel_it_t it;
+        dk_sel_it_init(&it, sel, n);
+        for (int64_t i = 0; i < probe_rows && !pt.fail; i++) {
+            int64_t r = dk_sel_it_next(&it);
+            if (r < 0) break;
+            int32_t unused;
+            dks_code_row(&pc, &pt, r, &unused);
         }
-        scratch_free(set_hdr);
-        if (seen * 4 > probe_rows * 3) return NULL;
+        bool unique = pt.fail;
+        dks_task_free(&pt);
+        if (unique) return NULL;
     }
 
-    /* Pass 1: first-seen slot per symbol id; bail on an id outside the
-     * domain (a foreign domain) or once du crosses the gate.  The null
-     * symbol is id 0, inside the domain: it gets a slot and the expression
-     * sees it once, exactly as the row-wise evaluation sees it per row. */
-    ray_t* pos_hdr = NULL;
-    int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
-    if (!pos) return NULL;
-    memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
-    ray_t* dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), dn);
-    if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); scratch_free(pos_hdr); return NULL; }
-    ray_sym_vec_adopt_domain(dom_vec, C);
-    int64_t du = 0, du_max = sel_rows / 2;
-    if (du_max > INT32_MAX) du_max = INT32_MAX;       /* slots are int32 */
-    /* Slots in first-seen row order (over the selected rows): the interned
-     * key ids follow the slot order, and with them the order the groups
-     * come out in — the same order the row-wise evaluation gives. */
-    bool ok = true;
-    dk_sel_it_t it;
-    dk_sel_it_init(&it, sel, nrows);
-    for (;;) {
-        int64_t r = dk_sel_it_next(&it);
-        if (r < 0) break;
-        int64_t id = ray_read_sym(cd, r, C->type, C->attrs);
-        if (id < 0 || id >= dn) { ok = false; break; }
-        if (pos[id] < 0) {
-            if (du >= du_max) { ok = false; break; }
-            pos[id] = (int32_t)du;
-            write_col_i64(ray_data(dom_vec), du, id, dom_vec->type, dom_vec->attrs);
-            du++;
-        }
-    }
-    if (!ok || du == 0) { ray_release(dom_vec); scratch_free(pos_hdr); return NULL; }
-    dom_vec->len = du;
-    dk_rows_ctx_t rc;
-    memset(&rc, 0, sizeof(rc));
-    rc.cd = cd; rc.attrs = C->attrs; rc.dn = dn;
-    rc.sparse = sel != NULL;
     ray_pool_t* rpool = ray_pool_get();
-    bool rows_par = ray_pool_par_dispatch_ok(rpool, nrows, RAY_PARALLEL_THRESHOLD);
+    bool par = ray_pool_par_dispatch_ok(rpool, n, RAY_PARALLEL_THRESHOLD);
+    uint32_t tasks = par ? ray_pool_total_workers(rpool) * 2 : 1;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    while (tasks > 1 && n / tasks < 16384) tasks /= 2;
+    if (n > INT32_MAX) return NULL;                     /* the codes are int32 */
+    ray_t* ids = ray_vec_new(RAY_I32, n);
+    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); return NULL; }
+    ids->len = n;
+    ray_t* tk_hdr = NULL;
+    dks_task_t* tk = (dks_task_t*)scratch_calloc(&tk_hdr, (size_t)tasks * (sizeof(dks_task_t) + sizeof(int64_t*)));
+    if (!tk) { ray_release(ids); return NULL; }
+    int64_t** remap = (int64_t**)(tk + tasks);
+    for (uint32_t t = 0; t < tasks; t++)
+        tk[t].du_cap = sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
+    dks_ctx_t c = kind;
+    c.n = n; c.tasks = tasks; c.code = (int32_t*)ray_data(ids); c.tk = tk; c.remap = remap;
+    c.n_segs = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    if (sel) {
+        c.sel = sel;
+        c.flags = ray_rowsel_flags(sel);
+        c.offs = ray_rowsel_offsets(sel);
+        c.idx = ray_rowsel_idx(sel);
+    }
+    if (tasks > 1) ray_pool_dispatch_n(rpool, dks_code_fn, &c, tasks);
+    else dks_code_fn(&c, 0, 0, 1);
+    bool ok = !pool_cancelled(rpool);
+    for (uint32_t t = 0; t < tasks && ok; t++) ok = !tk[t].fail;
 
-    /* Evaluate the expression over the du distinct symbols through the
-     * same DAG compiler the row-wise key would take, against a one-column
-     * table holding the distinct vector under the referenced name. */
-    ray_t* key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
-    if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
-    if (key_dom) {
-        ray_release(dom_vec);
-    } else if (pool_cancelled(rpool)) {       /* refused for the cancel: no recomputation */
-        ray_release(dom_vec); scratch_free(pos_hdr);
-        return NULL;
-    } else {
+    /* Merge in task order: a value's global id is given by its first task
+     * (the earliest row), and inside a task the local ids follow the rows,
+     * so the global ids are in first-seen row order over the table. */
+    dks_task_t g; memset(&g, 0, sizeof g);
+    g.du_cap = sparse ? sel_rows : sel_rows / 2;
+    int64_t sum = 0;
+    for (uint32_t t = 0; t < tasks && ok; t++) sum += tk[t].du;
+    if (ok) ok = sum <= g.du_cap;
+    if (ok) {
+        while (ok && g.cap < (uint64_t)sum * 2) ok = dks_grow(&g);
+        if (ok && g.cap == 0) ok = dks_grow(&g);
+    }
+    ray_t* rm_hdr = NULL;
+    int64_t* rm_all = ok && sum > 0 ? (int64_t*)scratch_alloc(&rm_hdr, (size_t)sum * sizeof(int64_t)) : NULL;
+    if (ok && sum > 0 && !rm_all) ok = false;
+    for (uint32_t t = 0, at = 0; t < tasks && ok; t++) {
+        remap[t] = rm_all + at;
+        at += (uint32_t)tk[t].du;
+        for (int64_t l = 0; l < tk[t].du; l++) {
+            uint64_t h = tk[t].hash[l];
+            int64_t row = tk[t].first[l];
+            uint64_t m = g.cap - 1, p = dks_home(h, m);
+            for (;;) {
+                dks_slot_t* sl = &g.slots[p];
+                if (sl->id < 0) {
+                    sl->hash = h; sl->id = g.du;
+                    g.first[g.du] = row; g.hash[g.du] = h;
+                    remap[t][l] = g.du++;
+                    break;
+                }
+                if (sl->hash == h && (sym || ray_str_t_eq(&el[g.first[sl->id]], pool, &el[row], pool))) {
+                    remap[t][l] = sl->id;
+                    break;
+                }
+                p = (p + 1) & m;
+            }
+        }
+    }
+    for (uint32_t t = 0; t < tasks; t++) dks_task_free(&tk[t]);
+    if (ok && g.du > 0) {
+        if (tasks > 1) ray_pool_dispatch_n(rpool, dks_remap_fn, &c, tasks);
+        else dks_remap_fn(&c, 0, 0, 1);
+        ok = !pool_cancelled(rpool);
+    }
+    if (rm_hdr) scratch_free(rm_hdr);
+    scratch_free(tk_hdr);
+    if (!ok || g.du == 0) { dks_task_free(&g); ray_release(ids); return NULL; }
+    ray_profile_tick("derived key: values grouped");
+
+    /* The du distinct values as a column under the referenced name: a SYM
+     * key over the vocabulary bytes, else the expression through the DAG. */
+    ray_t* key_dom = NULL;
+    {
+        int64_t du = g.du;
+        ray_t* dom_vec = NULL;
+        if (sym) {
+            dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), du);
+            if (dom_vec && !RAY_IS_ERR(dom_vec)) {
+                ray_sym_vec_adopt_domain(dom_vec, C);
+                for (int64_t i = 0; i < du; i++)
+                    write_col_i64(ray_data(dom_vec), i, (int64_t)g.hash[i], dom_vec->type, dom_vec->attrs);
+                dom_vec->len = du;
+            }
+        } else {
+            ray_t* pv_hdr = NULL;
+            const char** ptrs = (const char**)scratch_alloc(&pv_hdr, (size_t)du * (sizeof(char*) + sizeof(uint32_t)));
+            if (!ptrs) { dks_task_free(&g); ray_release(ids); return NULL; }
+            uint32_t* lens = (uint32_t*)(ptrs + du);
+            for (int64_t i = 0; i < du; i++) {
+                const ray_str_t* sv = &el[g.first[i]];
+                ptrs[i] = ray_str_t_ptr(sv, pool);
+                lens[i] = sv->len;
+            }
+            dom_vec = ray_str_vec_from_parts(ptrs, lens, NULL, du);
+            scratch_free(pv_hdr);
+        }
+        dks_task_free(&g);
+        if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); ray_release(ids); return NULL; }
+        if (sym) {
+            key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
+            if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
+            if (!key_dom && pool_cancelled(rpool)) { ray_release(dom_vec); ray_release(ids); return NULL; }
+        }
+        if (key_dom) { ray_release(dom_vec); goto evaluated; }
         ray_t* mini = ray_table_new(0);
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
         ray_release(dom_vec);
-        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); scratch_free(pos_hdr); return NULL; }
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); return NULL; }
         ray_graph_t* g2 = ray_graph_new(mini);
         if (g2) {
             ray_op_t* kop = compile_expr_dag(g2, by_expr);
@@ -11195,43 +11527,32 @@ static ray_t* derived_key_over_sym_domain(ray_t* by_expr, ray_t* tbl, ray_t* sel
         }
         ray_release(mini);
         if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
-        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); scratch_free(pos_hdr); return NULL; }
-        if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(ids); return NULL; }
+evaluated:
+        if (!(ray_is_vec(key_dom) || key_dom->type == RAY_LIST) || ray_len(key_dom) != du) {
+            ray_release(key_dom); ray_release(ids); return NULL;
+        }
     }
+    ray_profile_tick("derived key: values evaluated");
 
-    /* Pass 2: spread by slot — each row takes the key of its symbol's slot,
-     * written straight into the result (no index vector, no gather). */
-    if (!ray_is_vec(key_dom) || key_dom->len != du) { ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
-    ray_t* spread = NULL;
-    if (key_dom->type == RAY_SYM && (key_dom->attrs & RAY_SYM_W_MASK) == RAY_SYM_W64) {
-        spread = ray_sym_vec_new(RAY_SYM_W64, nrows);
-        if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
-        spread->len = nrows;
-        ray_sym_vec_adopt_domain(spread, key_dom);
-        rc.pos = pos; rc.key = (const int64_t*)ray_data(key_dom); rc.out = (int64_t*)ray_data(spread);
-        if (rows_par) ray_pool_dispatch(rpool, dk_spread_fn, &rc, nrows);
-        else          dk_spread_fn(&rc, 0, 0, nrows);
-        scratch_free(pos_hdr);
-        ray_release(key_dom);
-        if (pool_cancelled(rpool)) { ray_release(spread); return NULL; }
-    } else {
-        /* Any other key vector (the one-shot SYM evaluation's width, or a
-         * non-SYM result): index by slot and gather. */
-        ray_t* ids = ray_vec_new(RAY_I64, nrows);
-        if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); ray_release(key_dom); scratch_free(pos_hdr); return NULL; }
-        ids->len = nrows;
-        rc.pos = pos; rc.key = NULL; rc.out = (int64_t*)ray_data(ids);
-        if (rows_par) ray_pool_dispatch(rpool, dk_spread_fn, &rc, nrows);
-        else          dk_spread_fn(&rc, 0, 0, nrows);
-        scratch_free(pos_hdr);
-        if (pool_cancelled(rpool)) { ray_release(ids); ray_release(key_dom); return NULL; }
-        spread = ray_at_fn(key_dom, ids);
-        ray_release(ids);
-        ray_release(key_dom);
-        if (spread && !RAY_IS_ERR(spread) && ray_is_lazy(spread)) spread = ray_lazy_materialize(spread);
-        if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
-        if (!ray_is_vec(spread) || spread->len != nrows) { ray_release(spread); return NULL; }
+    /* Each row takes the key of its value (dks_spread; a kind of cell it
+     * does not copy goes through the generic gather by int64 index). */
+    const int32_t* code = (const int32_t*)ray_data(ids);
+    ray_t* spread = dks_spread(key_dom, code, n, tasks);
+    if (!spread && !pool_cancelled(rpool) && (key_dom->type == RAY_LIST || !ray_is_vec(key_dom))) {
+        ray_t* ix = ray_vec_new(RAY_I64, n);
+        if (ix && !RAY_IS_ERR(ix)) {
+            ix->len = n;
+            int64_t* ixd = (int64_t*)ray_data(ix);
+            for (int64_t r = 0; r < n; r++) ixd[r] = code[r];
+            spread = gather_by_idx(key_dom, ixd, n);
+            ray_release(ix);
+        } else if (ix) ray_error_free(ix);
     }
+    ray_release(ids);
+    ray_release(key_dom);
+    if (!spread || RAY_IS_ERR(spread)) { if (spread) ray_error_free(spread); return NULL; }
+    ray_profile_tick("derived key: keys spread");
     agg_route_note_key_domain();
     return spread;
 }
@@ -15160,17 +15481,23 @@ static void rgid_probe_str_fn(void* ctx_, uint32_t worker_id,
 }
 
 /* Composite (multi-key) row→gid probe: the sibling of rgid_probe_fn for a
- * `by: [k1 k2 ...]` of fixed-width / SYM keys (#756).  The hash table maps
- * each result group's key tuple (gk[gid * nk ..]) to gid + 1; a row hashes
- * its nk key cells, read as int64 the way the single-key probe reads them,
- * and walks the slots comparing tuples.  Rows a selection drops get -1, as
- * in rgid_probe_fn.  The table is read-only and row_gid writes are
- * disjoint, so workers need no synchronisation. */
+ * `by: [k1 k2 ...]` of fixed-width / SYM / STR keys (#756).  The hash table
+ * maps each result group's key tuple (gk[gid * nk ..]) to gid + 1; a row
+ * hashes its nk key cells, read as int64 the way the single-key probe reads
+ * them, and walks the slots comparing tuples.  A STR key's tuple cell is
+ * the hash of its bytes (ray_str_t_hash, as the single-key STR probe), and
+ * the compare reads the group's descriptor against the row's.  Rows a
+ * selection drops get -1, as in rgid_probe_fn.  The table is read-only and
+ * row_gid writes are disjoint, so workers need no synchronisation. */
 typedef struct {
     int                nk;
     const void* const* key_data;   /* [nk] flat source key column data */
     const int8_t*      key_type;   /* [nk] */
     const uint8_t*     key_attrs;  /* [nk] */
+    const ray_str_t* const* sdesc; /* [nk] STR keys: the rows' descriptors, else NULL */
+    const char* const* spool;      /* [nk] */
+    const ray_str_t* const* gdesc; /* [nk] STR keys: the groups' descriptors */
+    const char* const* gpool;      /* [nk] */
     const int64_t*     gk;         /* [n_groups * nk] group key tuples */
     const int64_t*     hk_gid_p1;  /* [mask + 1]: gid + 1, 0 = empty */
     uint64_t           mask;
@@ -15190,20 +15517,28 @@ static inline uint64_t rgid_mk_hash_step(uint64_t h, int64_t v) {
     return h;
 }
 
+/* The tuple cell of key k at row r: the cell as int64, a STR cell's hash. */
+static inline int64_t rgid_mk_cell(const rgid_probe_mk_ctx_t* x, int k, int64_t r) {
+    if (x->key_type[k] == RAY_STR)
+        return (int64_t)ray_str_t_hash(&x->sdesc[k][r], x->spool[k]);
+    return key_read_i64(x->key_data[k], r, x->key_type[k], x->key_attrs[k]);
+}
 static inline int64_t rgid_mk_probe_row(const rgid_probe_mk_ctx_t* x, int64_t r) {
     uint64_t h = 0x9E3779B97F4A7C15ULL;
-    for (int k = 0; k < x->nk; k++)
-        h = rgid_mk_hash_step(h, key_read_i64(x->key_data[k], r,
-                                              x->key_type[k], x->key_attrs[k]));
+    for (int k = 0; k < x->nk; k++) h = rgid_mk_hash_step(h, rgid_mk_cell(x, k, r));
     uint64_t s = h & x->mask;
     for (;;) {
         int64_t g_p1 = x->hk_gid_p1[s];
         if (g_p1 == 0) return -1;
         const int64_t* t = x->gk + (g_p1 - 1) * x->nk;
         int k = 0;
-        for (; k < x->nk; k++)
-            if (t[k] != key_read_i64(x->key_data[k], r, x->key_type[k], x->key_attrs[k]))
+        for (; k < x->nk; k++) {
+            if (x->key_type[k] == RAY_STR) {
+                if (!ray_str_t_eq(&x->gdesc[k][g_p1 - 1], x->gpool[k], &x->sdesc[k][r], x->spool[k]))
+                    break;
+            } else if (t[k] != key_read_i64(x->key_data[k], r, x->key_type[k], x->key_attrs[k]))
                 break;
+        }
         if (k == x->nk) return g_p1 - 1;
         s = (s + 1) & x->mask;
     }
@@ -15275,13 +15610,14 @@ static void rgid_probe_mk_compact_fn(void* ctx_, uint32_t worker_id,
     }
 }
 
-/* The base types the composite probe reads: KEY_READ's coverage less STR,
- * which the single-key scatter resolves through its own descriptor probe. */
+/* The base types the composite probe reads: KEY_READ's coverage, STR by
+ * its descriptors (a computed STR key beside an int one no longer sends the
+ * select to the serial eval-level grouping over boxed LIST cells). */
 static int rgid_mk_key_type_ok(int8_t bt) {
     switch (bt) {
     case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
     case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
-    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM: case RAY_STR:
         return 1;
     default:
         return 0;
@@ -15292,8 +15628,8 @@ static int rgid_mk_key_type_ok(int8_t bt) {
  * `tbl` the composite probe can read.  Such a select stays on the DAG path
  * when its only non-DAG outputs are count(distinct) aggregates and literal
  * broadcasts; the post-group scatter then maps rows to groups through
- * rgid_build_multikey.  STR, GUID, LIST and mapcommon keys keep their
- * existing routes. */
+ * rgid_build_multikey.  GUID, LIST and mapcommon keys keep their existing
+ * routes. */
 static int multikey_scatter_keys_ok(ray_t* by_expr, ray_t* tbl) {
     if (!by_expr || by_expr->type != RAY_SYM || ray_len(by_expr) < 2) return 0;
     const int64_t* ids = (const int64_t*)ray_data(by_expr);
@@ -15322,14 +15658,19 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
     ray_t* cols_hdr = NULL;
     ray_t* gk_hdr = NULL;
     ray_t* slot_hdr = NULL;
-    /* [nk] scan columns, [nk] owned flags, [nk] data, [nk] types, [nk] attrs */
-    size_t cols_sz = (size_t)nk * (2 * sizeof(ray_t*) + sizeof(void*) + 2);
+    /* [nk] scan columns, [nk] group columns, [nk] data, [nk] STR descriptors
+     * and pools of both, [nk] types, [nk] attrs */
+    size_t cols_sz = (size_t)nk * (2 * sizeof(ray_t*) + 5 * sizeof(void*) + 2);
     uint8_t* cols_mem = (uint8_t*)scratch_calloc(&cols_hdr, cols_sz);
     if (!cols_mem) return ray_error("oom", NULL);
     ray_t**      scan  = (ray_t**)cols_mem;
     ray_t**      grp   = scan + nk;
     const void** kdata = (const void**)(grp + nk);
-    int8_t*      ktype = (int8_t*)(kdata + nk);
+    const ray_str_t** sdesc = (const ray_str_t**)(kdata + nk);
+    const char**      spool = (const char**)(sdesc + nk);
+    const ray_str_t** gdesc = (const ray_str_t**)(spool + nk);
+    const char**      gpool = (const char**)(gdesc + nk);
+    int8_t*      ktype = (int8_t*)(gpool + nk);
     uint8_t*     kattr = (uint8_t*)(ktype + nk);
     uint8_t*     owned = NULL;
     ray_t* owned_hdr = NULL;
@@ -15357,6 +15698,10 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
         }
         scan[k] = sc; grp[k] = g;
         kdata[k] = ray_data(sc); ktype[k] = sc->type; kattr[k] = sc->attrs;
+        if (sc->type == RAY_STR) {
+            str_resolve(sc, &sdesc[k], &spool[k]);
+            str_resolve(g, &gdesc[k], &gpool[k]);
+        }
     }
 
     uint64_t cap = 0, mask = 0;
@@ -15378,7 +15723,9 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
     if (!err) {
         for (int64_t gi = 0; gi < n_groups; gi++)
             for (int k = 0; k < nk; k++)
-                gk[gi * nk + k] = key_read_i64(ray_data(grp[k]), gi, grp[k]->type, grp[k]->attrs);
+                gk[gi * nk + k] = ktype[k] == RAY_STR
+                    ? (int64_t)ray_str_t_hash(&gdesc[k][gi], gpool[k])
+                    : key_read_i64(ray_data(grp[k]), gi, grp[k]->type, grp[k]->attrs);
         for (int64_t gi = 0; gi < n_groups; gi++) {
             const int64_t* t = gk + gi * nk;
             uint64_t h = 0x9E3779B97F4A7C15ULL;
@@ -15389,13 +15736,18 @@ static ray_t* rgid_build_multikey(ray_t* tbl, ray_t* result, ray_t* by_expr,
                 if (cur == 0) { slot[s] = gi + 1; break; }
                 const int64_t* u = gk + (cur - 1) * nk;
                 int k = 0;
-                for (; k < nk; k++) if (u[k] != t[k]) break;
+                for (; k < nk; k++) {
+                    if (u[k] != t[k]) break;
+                    if (ktype[k] == RAY_STR &&
+                        !ray_str_t_eq(&gdesc[k][cur - 1], gpool[k], &gdesc[k][gi], gpool[k])) break;
+                }
                 if (k == nk) break;   /* duplicate tuple — keep the first */
                 s = (s + 1) & mask;
             }
         }
         rgid_probe_mk_ctx_t ctx = {
             .nk = nk, .key_data = kdata, .key_type = ktype, .key_attrs = kattr,
+            .sdesc = sdesc, .spool = spool, .gdesc = gdesc, .gpool = gpool,
             .gk = gk, .hk_gid_p1 = slot, .mask = mask, .row_gid = row_gid,
             .sel_flg = NULL, .sel_offs = NULL, .sel_idx = NULL, .sel_n_segs = 0,
         };
@@ -30866,6 +31218,14 @@ by_dict_done:
                  * where the slices' row buffers would not fit. */
                 bool cd_bounded_rows = ray_cd_bounded_preferred(tbl, NULL, NULL, NULL, nrows, n_groups) ||
                                        cd_nonaggs_by_range(nonagg_exprs, n_nonaggs, tbl);
+                /* The row-map kernel (ray_count_distinct_per_group) over the
+                 * per-group slices: past 50 000 groups (the slices' per-group
+                 * setup), and under a few groups over many rows, where the
+                 * slices give at most n_groups-way parallelism and the
+                 * largest group is one serial dedup (12 groups over 4M rows:
+                 * one of 1.2M rows); the kernel partitions by (group, value)
+                 * there, see count_distinct_per_group_parallel. */
+                bool cd_gid_kernel = n_groups > 50000 || ray_cd_few_groups_kernel_ok(nrows, n_groups);
                 int needs_slice_idx = 0;
                 for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
                     ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
@@ -30874,7 +31234,7 @@ by_dict_done:
                     if (simple_cd && cd_bounded_rows &&
                         cd_src_bounded_ok(tbl, cd_inner))
                         continue;
-                    int simple_cd_global = simple_cd && n_groups > 50000;
+                    int simple_cd_global = simple_cd && cd_gid_kernel;
                     if (simple_cd_global) {
                         ray_col_meta_t sm;
                         int8_t type = (!ray_env_get_lexical_local(cd_inner->i64) && ray_table_col_meta(tbl, cd_inner->i64, &sm)) ? sm.type : 0;
@@ -30930,7 +31290,7 @@ by_dict_done:
                         /* the bounded kernel reads an encoded column by
                          * range (cd_enc_slot); the other kernels decoded */
                         ray_t* src_enc = cd_col_ref && cd_bounded_rows ? cd_enc_slot(tbl, cd_inner->i64) : NULL;
-                        if (cd_col_ref && (cd_bounded_rows || n_groups > 50000)) {
+                        if (cd_col_ref && (cd_bounded_rows || cd_gid_kernel)) {
                             src_for_global = src_enc ? src_enc : ray_table_col(tbl, cd_inner->i64);
                             if (src_for_global && RAY_IS_ERR(src_for_global)) {
                                 col = src_for_global;      /* the query's error, below */
@@ -30944,7 +31304,7 @@ by_dict_done:
                                                  nrows);
                             if (!col && cd_compact)
                                 col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
-                            if (!col && !idx_buf && n_groups <= 50000)
+                            if (!col && !idx_buf && !cd_gid_kernel)
                                 col = ray_error("domain", "select by: count distinct column does not cover the table's rows");
                         }
                         if (!col && src_enc && src_for_global == src_enc) {
@@ -30954,7 +31314,7 @@ by_dict_done:
                                 src_for_global = NULL;
                             }
                         }
-                        if (!col && src_for_global && n_groups > 50000) {
+                        if (!col && src_for_global && cd_gid_kernel) {
                             if (RAY_IS_PARTED(src_for_global->type) ||
                                 src_for_global->type == RAY_MAPCOMMON) {
                                 ray_t* flat = query_materialize_parted_col(src_for_global, tbl);
@@ -30967,7 +31327,7 @@ by_dict_done:
                                 }
                             }
                         }
-                        if (cd_col_ref && (src_for_global || n_groups <= 50000)) {
+                        if (cd_col_ref && (src_for_global || !cd_gid_kernel)) {
                             /* COUNT(DISTINCT) is exact per SQL/DSL
                              * semantics — the streaming HLL fast path
                              * here silently returned an approximate
@@ -30984,7 +31344,7 @@ by_dict_done:
                              * avoid slicing through the partition layout
                              * again. */
                             if (!col) {
-                                if (n_groups <= 50000) {
+                                if (!cd_gid_kernel) {
                                     col = count_distinct_per_group_buf(
                                         cd_inner, tbl, idx_buf, offsets, grp_cnt, n_groups);
                                 } else {

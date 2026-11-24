@@ -2385,6 +2385,13 @@ typedef struct {
     int64_t         n_rows;
     int64_t         n_groups;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
+    /* Few groups (n_groups <= CDPG_FEW_GROUPS): partition by the (gid,
+     * val) hash instead, so the rows of one large group spread over every
+     * partition rather than one serial dedup; each partition then counts
+     * into its own pcnt[p * n_groups + gid], summed into odata at the end. */
+    bool            by_val;
+    int64_t*        pcnt;            /* [P * n_groups] when by_val */
+    uint16_t*       gids16_out;      /* by_val: the gid + 1 fits 16 bits (2 B a row, not 8) */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
      * so there's no atomic contention.  task_id is start / grain, both
@@ -2429,12 +2436,14 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
      * we wrote here.  No atomics: each task owns its row. */
     int64_t task_id = start / x->grain;
     int64_t* my_hist = &x->hist[task_id * (int64_t)(p_mask + 1)];
+    uint8_t esz = ray_sym_elem_size(x->in_type, x->in_attrs);
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
         /* Partition by gid (not gid×val) so the dedup pass can write to
-         * odata[gid] without atomics. */
-        uint64_t h = CDPG_PART_HASH(gid + 1);
+         * odata[gid] without atomics; by (gid, val) under few groups. */
+        uint64_t h = x->by_val ? CDPG_HASH(gid + 1, cdpg_read(x->base, r, x->in_type, esz))
+                               : CDPG_PART_HASH(gid + 1);
         my_hist[h & p_mask]++;
     }
 }
@@ -2455,9 +2464,10 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
         if (gid < 0 || gid >= x->n_groups) continue;
         int64_t val = cdpg_read(x->base, r, x->in_type, esz);
         int64_t gid_p1 = gid + 1;
-        uint64_t h = CDPG_PART_HASH(gid_p1);
+        uint64_t h = x->by_val ? CDPG_HASH(gid_p1, val) : CDPG_PART_HASH(gid_p1);
         int64_t pos = my_cur[h & p_mask]++;
-        x->gids_out[pos] = gid_p1;
+        if (x->by_val) x->gids16_out[pos] = (uint16_t)gid_p1;
+        else x->gids_out[pos] = gid_p1;
         x->vals_out[pos] = val;
     }
 }
@@ -2493,10 +2503,12 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
             continue;
         }
 
-        const int64_t* gids = x->gids_out + off;
+        const int64_t* gids = x->by_val ? NULL : x->gids_out + off;
+        const uint16_t* gids16 = x->by_val ? x->gids16_out + off : NULL;
         const int64_t* vals = x->vals_out + off;
+        int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
         for (int64_t i = 0; i < cnt; i++) {
-            int64_t gid_p1 = gids[i];
+            int64_t gid_p1 = gids ? gids[i] : (int64_t)gids16[i];
             int64_t val    = vals[i];
             uint64_t h = CDPG_HASH(gid_p1, val);
             uint64_t slot = h & mask;
@@ -2507,8 +2519,8 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                     slot_val[slot] = val;
                     /* Partition is keyed on gid (CDPG_PART_HASH), so
                      * each gid is owned by exactly one task — drop the
-                     * atomic. */
-                    x->odata[gid_p1 - 1]++;
+                     * atomic; by (gid, val), the partition's own counts. */
+                    cnt_out[gid_p1 - 1]++;
                     break;
                 }
                 if (cur == gid_p1 && slot_val[slot] == val) break;
@@ -2548,9 +2560,15 @@ static ray_t* count_distinct_per_group_parallel(
         .n_groups = n_groups,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
+        .by_val = n_groups <= CDPG_FEW_GROUPS,
     };
 
     if (P > 256) return NULL;
+    ray_t* pcnt_hdr = NULL;
+    if (ctx.by_val) {
+        ctx.pcnt = (int64_t*)scratch_calloc(&pcnt_hdr, (size_t)P * (size_t)n_groups * sizeof(int64_t));
+        if (!ctx.pcnt) return NULL;
+    }
 
     /* Counters per dispatch task, sized from the geometry the pool takes
      * (its clamp included), computed once: both passes dispatch at that
@@ -2568,13 +2586,16 @@ static ray_t* count_distinct_per_group_parallel(
     ray_t* hist_hdr = NULL;
     ctx.hist = (int64_t*)scratch_calloc(&hist_hdr,
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
-    if (!ctx.hist) { return NULL; }
+    if (!ctx.hist) { if (pcnt_hdr) scratch_free(pcnt_hdr); return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
     /* Each pass reads the one before it: the histogram sizes and places the
      * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
      * their part unwritten (a short histogram would send the scatter past
      * its partitions). */
-    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
+    if (pool_cancelled(pool)) {
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2588,7 +2609,7 @@ static ray_t* count_distinct_per_group_parallel(
     if (!ctx.part_off || !ctx.cursor) {
         if (off_hdr) scratch_free(off_hdr);
         if (cur_hdr) scratch_free(cur_hdr);
-        scratch_free(hist_hdr);
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     /* Two-step prefix: per-partition global offset, then per-(task,
@@ -2609,14 +2630,17 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 2: scatter (gid+1, val) pairs into partitioned out_buf. */
     ray_t* gids_hdr = NULL;
     ray_t* vals_hdr = NULL;
-    ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr,
-                                           (size_t)total * sizeof(int64_t));
+    if (ctx.by_val)
+        ctx.gids16_out = (uint16_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(uint16_t));
+    else
+        ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(int64_t));
     ctx.vals_out = (int64_t*)scratch_alloc(&vals_hdr,
                                            (size_t)total * sizeof(int64_t));
-    if (!ctx.gids_out || !ctx.vals_out) {
+    if (!(ctx.gids_out || ctx.gids16_out) || !ctx.vals_out) {
         if (gids_hdr) scratch_free(gids_hdr);
         if (vals_hdr) scratch_free(vals_hdr);
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     if (total > 0)
@@ -2630,10 +2654,13 @@ static ray_t* count_distinct_per_group_parallel(
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
         cancelled = pool_cancelled(pool);
     }
+    if (ctx.by_val && !cancelled)
+        for (uint64_t p = 0; p < P; p++)
+            for (int64_t g = 0; g < n_groups; g++) ctx.odata[g] += ctx.pcnt[p * n_groups + g];
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
-    scratch_free(hist_hdr);
+    scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
     return cancelled ? ray_error("cancel", NULL) : out;
 }
 
@@ -2730,6 +2757,33 @@ __attribute__((unused)) static ray_t* count_distinct_per_group_hll(ray_t* src, c
  * are distinct pairs → load factor 0.5, no rehash needed.  Slot stores
  * gid+1 (so 0 means empty) and the int64-encoded value.  64-bit composite
  * hash mixes both halves so rare-gid collisions don't cluster. */
+/* Few groups over many rows: the kernel above, partitioned by (group,
+ * value), instead of the per-group slices (whose largest group is one
+ * serial dedup).  Only with workers to spread over, and only when its
+ * buffers fit the heap's room: 10 B a row (the values and 16-bit group
+ * ids) beside the row map both routes hold, where the slices hold 8 B a
+ * row (their index) plus a table of twice the largest group's rows. */
+bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups) {
+    if (n_groups <= 0 || n_groups > CDPG_FEW_GROUPS || n_rows < 200000) return false;
+    ray_pool_t* pool = ray_pool_live();
+    if (!pool || ray_pool_total_workers(pool) < 2) return false;
+    /* The partitioned kernel is three passes over the rows (count, scatter,
+     * dedup) and stops scaling near 8 workers; the slices do less total work
+     * and keep scaling with the groups.  Measured on 5M rows: with 2-3
+     * workers the slices win below ~64 groups (the kernel's fixed work is
+     * ~2x theirs); from 16 workers on they win from ~64 groups up, so the
+     * kernel keeps only the few-group and skewed shapes there. */
+    int64_t workers = ray_pool_total_workers(pool);
+    if (workers < 4 && n_groups < 64) return false;
+    if (workers >= 16 && n_groups > 32) return false;
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0) {
+        int64_t room = wm - ray_heap_anon_committed();
+        if ((double)n_rows * 10.0 > (double)room / 2) return false;
+    }
+    return true;
+}
+
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups) {
     if (!src || RAY_IS_ERR(src)) return ray_error("domain", "count distinct per group: invalid source column");
