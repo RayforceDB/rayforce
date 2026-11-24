@@ -494,12 +494,14 @@ ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
 ray_t* ray_inv_fn(ray_t* x);
 ray_t* ray_flip_mat_fn(ray_t* x);
 ray_t* ray_gram_fn(ray_t* x);
-/* The matrix product's F32 kernel over rows (ops/linalg.c): c += a * b. */
-/* Rows against rows (ops/linalg.c): c[i * cols + o] += a_i . b_o. */
-void ray_lin_rowdot_acc_f32(const float* a, int64_t as, const float* b, int64_t bs,
-                            float* c, int64_t r, int64_t n, int64_t cols);
-void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
-                          int64_t r, int64_t k, int64_t cols);
+/* The matrix product's F32 kernel (ops/linalg.c): columns [j0, j1) of
+ * c[m rows, cs apart] += a[m x k, rows `as` apart] * b, where b is k rows of
+ * n, or with `sideways` n rows of k, `bs` apart.  One thread; a caller that
+ * shares the columns out splits them at multiples of RAY_LIN_STRIP_F32. */
+#define RAY_LIN_STRIP_F32 24
+void ray_lin_mul_acc_f32(const float* a, int64_t as, int64_t m, int64_t k,
+                         const float* b, int64_t bs, bool sideways,
+                         float* c, int64_t cs, int64_t j0, int64_t j1);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);
