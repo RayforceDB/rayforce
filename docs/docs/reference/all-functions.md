@@ -170,7 +170,7 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `sum` | unary | aggr | Sum of all elements | `(sum [1 2 3])` → `6` |
-| `prod` | unary | aggr | Product of all non-null numeric elements | `(prod [2 3 4])` → `24` |
+| `prod` | unary | aggr | Product of all non-null numeric elements; empty/all-null returns `1` | `(prod [2 3 4])` → `24` |
 | `all` | unary | aggr | True if every non-null numeric element is truthy; empty/all-null returns `true` | `(all [1 2 3])` → `true` |
 | `any` | unary | aggr | True if any non-null numeric element is truthy; empty/all-null returns `false` | `(any [0 0 3])` → `true` |
 | `count` | unary | aggr | Count of elements | `(count [1 2 3])` → `3` |
