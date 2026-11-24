@@ -35,7 +35,7 @@ Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is
 
 A `where:` predicate or a `by:` output that the planner leaves to the evaluator chooses per row as well, because the evaluator's `if` chooses per row for a boolean-vector condition (below). That covers a side effect in the expression (a lambda that sets a global, `set`, a `try` handler that raises), an `if` inside a helper the planner does not inline (several statements, a closure, recursion), a nested query in an arm or beside the `if` such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and a `by:` output where a `let` in one aggregate's argument binds a name the rest of the output also reads: that output is evaluated per group as written, and each group's `if` chooses per row within the group. A side effect in an arm runs once per evaluation, whatever the condition holds, since both arms are evaluated.
 
-One case still raises: a name a `let` binds and a later argument of the same `do` reads raises `schema` in a `where:` predicate ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)).
+One case still raises: a name a `let` binds and a later argument of the same `do` reads raises `schema` in a `where:` predicate ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)), because on the planned routes only the last form of a `do` is evaluated (see [Sequential Evaluation: do](#sequential-evaluation-do)).
 
 ### A boolean vector as the condition
 
@@ -135,6 +135,48 @@ For the full name lookup rules, see [Names and scope](name-resolution.md).
     (+ x y))
 30
 ```
+
+!!! warning "Inside a query, do not rely on the earlier forms of a `do`"
+
+    In a query clause (`where:`, an output column, `update`, `delete`, a `by:`
+    key or aggregate) that the planner compiles, a `do` of several forms is
+    compiled as its last form alone. On those planned routes the earlier forms
+    are not evaluated: their effects (`set`, a helper that writes a global,
+    `println`) do not happen, a `raise` or an error in them is not raised, and a
+    name a `let` among them binds is not seen by the last form, which reads it
+    as a column or a global instead:
+
+    ```text
+    ‣ (set T (table [a i] (list ['x 'y 'x] [1 2 3])))
+    ‣ (select {from: T where: (do (let k 'x) (== a k))})
+    error: schema: column 'k' not found
+    ```
+
+    A clause the planner declines is evaluated by the evaluator instead, and
+    there the earlier forms do run, with their effects and their errors, in
+    `where:`, projections and `by:` alike. Which route a query takes is not
+    something to rely on, so a query must not depend on the earlier forms of a
+    `do` either running or not running.
+
+    Put the effects and the bindings in a helper of more than one statement,
+    called from the query, or before the query. The planner does not inline
+    such a helper, so its body runs as written. A helper whose body is a single
+    expression, a `do` included, may be inlined, and then behaves like the `do`
+    written in the query:
+
+    ```text
+    ‣ (set H (fn [v] (let k 'x) (== v k)))
+    ‣ (at (select {from: T where: (H a)}) 'i)
+    [1 3]
+    ‣ (set k 'x)
+    ‣ (at (select {from: T where: (== a k)}) 'i)
+    [1 3]
+    ```
+
+    See [#1650](https://github.com/RayforceDB/rayforce/issues/1650),
+    [#1612](https://github.com/RayforceDB/rayforce/issues/1612),
+    [#1653](https://github.com/RayforceDB/rayforce/issues/1653) and
+    [#1654](https://github.com/RayforceDB/rayforce/issues/1654).
 
 ## Iteration: while
 
