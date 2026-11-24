@@ -4755,6 +4755,283 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     return ray_error("type", "concat: cannot concatenate %s and %s", ray_type_name(a->type), ray_type_name(b->type));
 }
 
+/* ---- raze: the left fold of concat in one pass per stretch (#1656) ----
+ *
+ * (raze l) is (concat ... (concat (concat l0 l1) l2) ... ln-1).  Folding it
+ * literally copies the result so far at every item.  Here the fold runs in
+ * stretches, each built once, to the same answer:
+ *   - a run of vectors and atoms of one type T, while the result is a T
+ *     vector (or the first item, a T atom): the T vector of all their
+ *     cells, with the null flag, the float null bits, the width bits and
+ *     the symbol domain concat leaves (raze_typed_run);
+ *   - once the result is a list: every later list, vector or atom only adds
+ *     to it, its cells retained, its elements boxed, itself retained, as
+ *     concat does (raze_list_tail);
+ *   - anything else (strings, slices, symbols of two domains, dicts,
+ *     tables, a change of type, an error) is one concat, as before. */
+
+/* The type of a run, or 0: a fixed-width type concat appends element by
+ * element. */
+static int8_t raze_run_type(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_GUID: case RAY_SYM:
+        return t;
+    default:
+        return 0;
+    }
+}
+
+/* The cell concat writes for atom a in a T vector. */
+static void raze_atom_cell(const ray_t* a, int8_t t, uint8_t* dst) {
+    switch (t) {
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        memcpy(dst, &a->i64, 8); break;
+    case RAY_F64: memcpy(dst, &a->f64, 8); break;
+    case RAY_F32: { float f = (float)a->f64; memcpy(dst, &f, 4); break; }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: memcpy(dst, &a->i32, 4); break;
+    case RAY_I16: memcpy(dst, &a->i16, 2); break;
+    case RAY_BOOL: *dst = a->b8 ? 1 : 0; break;
+    case RAY_U8: *dst = a->u8; break;
+    case RAY_GUID: {
+        const uint8_t* gd = a->obj ? (const uint8_t*)ray_data(a->obj) : (const uint8_t*)ray_data((ray_t*)a);
+        memcpy(dst, gd, 16);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* Does x continue a run of type t over symbol domain dom (SYM: every vector
+ * of the run shares one domain; an atom only beside the runtime domain,
+ * where an atom's id is a cell as it is)? */
+static bool raze_run_member(const ray_t* x, int8_t t, struct ray_sym_domain_s** dom, bool* atom) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (x->type == -t) {
+        if (t == RAY_SYM && *dom && *dom != ray_sym_runtime_domain()) return false;
+        *atom = true;
+        return true;
+    }
+    if (x->type != t || (x->attrs & RAY_ATTR_SLICE)) return false;
+    if (t == RAY_SYM) {
+        struct ray_sym_domain_s* d = ray_sym_vec_domain((ray_t*)x);
+        if (*dom && d != *dom) return false;
+        if (*atom && d != ray_sym_runtime_domain()) return false;
+        *dom = d;
+    }
+    return true;
+}
+
+/* The fold of r (a T vector, or the first item as a T atom) with
+ * items[k..j), all members of its run: the T vector concat would leave. */
+__attribute__((noinline)) static ray_t* raze_typed_run(ray_t* r, ray_t** items, int64_t k, int64_t j, int8_t t,
+                             struct ray_sym_domain_s* dom, bool any_atom) {
+    bool r_atom = r->type < 0;
+    int64_t total = r_atom ? 1 : r->len;
+    uint8_t wbits = r_atom ? 0 : (r->attrs & RAY_SYM_W_MASK);   /* SYM: widest wins */
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        if (x->type < 0) { total += 1; continue; }
+        total += x->len;
+        if (t == RAY_SYM && ray_sym_elem_size(RAY_SYM, x->attrs) > ray_sym_elem_size(RAY_SYM, wbits))
+            wbits = x->attrs & RAY_SYM_W_MASK;
+    }
+    ray_t* out;
+    if (t == RAY_SYM) {
+        out = ray_sym_vec_new(any_atom ? RAY_SYM_W64 : wbits, total);
+        if (out && !RAY_IS_ERR(out) && !any_atom && dom && dom != ray_sym_runtime_domain()) {
+            ray_sym_domain_retain(dom);
+            out->sym_domain = dom;
+        }
+    } else {
+        out = ray_vec_new(t, total);
+    }
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = total;
+
+    if (t == RAY_SYM) {
+        /* Cells are positions in dom (runtime ids when atoms take part),
+         * at the output's width.  The null flag is what the last step sets:
+         * an atom step (vector and atom) always, SYM vectors may hold nulls;
+         * two atoms, either one null; two vectors, a null symbol in either. */
+        void* dst = ray_data(out);
+        int64_t pos = 0;
+        bool zero = false, flag = false;
+        bool prev_atom = r_atom;
+        if (r_atom) {
+            ray_write_sym(dst, pos++, (uint64_t)r->i64, RAY_SYM, out->attrs);
+            zero = r->i64 == 0;
+        } else {
+            for (int64_t c = 0; c < r->len; c++) {
+                int64_t v = ray_read_sym(ray_data(r), c, RAY_SYM, r->attrs);
+                zero |= v == 0;
+                ray_write_sym(dst, pos++, (uint64_t)v, RAY_SYM, out->attrs);
+            }
+        }
+        for (int64_t i = k; i < j; i++) {
+            ray_t* x = items[i];
+            if (x->type < 0) {
+                ray_write_sym(dst, pos++, (uint64_t)x->i64, RAY_SYM, out->attrs);
+                flag = prev_atom ? (RAY_ATOM_IS_NULL(r) || RAY_ATOM_IS_NULL(x)) : true;
+                zero |= x->i64 == 0;
+                prev_atom = false;
+                continue;
+            }
+            for (int64_t c = 0; c < x->len; c++) {
+                int64_t v = ray_read_sym(ray_data(x), c, RAY_SYM, x->attrs);
+                zero |= v == 0;
+                ray_write_sym(dst, pos++, (uint64_t)v, RAY_SYM, out->attrs);
+            }
+            flag = prev_atom ? true : zero;
+            prev_atom = false;
+        }
+        if (flag) out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+
+    /* Fixed width: cells copied raw.  concat's null flag and null bits are
+     * followed step by step.  An atom step (an atom and a vector, or two
+     * atoms) sets the flag when the atom is null or the vector may hold
+     * nulls, and rewrites nothing.  A step of two vectors, when either may
+     * hold nulls, rewrites every null cell of both as the canonical null
+     * (it changes bits only for a float NaN with another payload) and sets
+     * the flag when it found one; it carries the first vector's width bits.
+     * The result so far is checked once per step from where the last such
+     * rewrite of it ended, so each cell is read a bounded number of times. */
+    uint8_t esz = ray_elem_size(t);
+    uint8_t* dst = (uint8_t*)ray_data(out);
+    int64_t pos = 0;
+    bool flag, sent;           /* the result's null flag; a cell of it reads as null under the flag */
+    bool orig = !r_atom;       /* the result so far is still the first item itself */
+    int64_t canon = 0;         /* cells below this were rewritten under the flag */
+    uint8_t w = 0;
+    if (r_atom) {
+        raze_atom_cell(r, t, dst);
+        pos = 1;
+        flag = false;
+        sent = ray_raw_is_null(t, 0, dst, 0);
+    } else {
+        memcpy(dst, ray_data(r), (size_t)r->len * esz);
+        pos = r->len;
+        flag = ray_vec_may_have_nulls(r);
+        w = r->attrs & RAY_SYM_W_MASK;
+        sent = false;
+        for (int64_t c = 0; c < r->len && !sent; c++) sent = ray_raw_is_null(t, 0, dst, c);
+    }
+    bool prev_atom = r_atom;
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        int64_t at = pos;
+        if (x->type < 0) {   /* vector (or the first atom) and atom */
+            raze_atom_cell(x, t, dst + at * esz);
+            pos += 1;
+            flag = prev_atom ? (RAY_ATOM_IS_NULL(r) || RAY_ATOM_IS_NULL(x))
+                             : (RAY_ATOM_IS_NULL(x) || flag);
+            w = 0;
+        } else {
+            memcpy(dst + at * esz, ray_data(x), (size_t)x->len * esz);
+            pos += x->len;
+            if (prev_atom) {   /* the first atom and a vector */
+                flag = RAY_ATOM_IS_NULL(r) || ray_vec_may_have_nulls(x);
+                w = 0;
+            } else {
+                bool cond = flag || ray_vec_may_have_nulls(x);
+                bool found = false;
+                if (cond) {
+                    if (orig) {   /* the first item, under its own flag */
+                        for (int64_t c = 0; c < at; c++)
+                            if (ray_vec_is_null(r, c)) { found = true; ray_vec_set_null_checked(out, c, true); }
+                    } else if (flag) {
+                        for (int64_t c = canon; c < at; c++)
+                            if (ray_raw_is_null(t, 0, dst, c)) { found = true; ray_vec_set_null_checked(out, c, true); }
+                        found |= sent;
+                    }
+                    if (flag) canon = at;   /* checked under the flag: rewritten up to here */
+                    for (int64_t c = 0; c < x->len; c++)
+                        if (ray_vec_is_null(x, c)) { found = true; ray_vec_set_null_checked(out, at + c, true); }
+                }
+                flag = found;
+                /* w: the first vector's width bits, kept */
+            }
+        }
+        for (int64_t c = at; c < pos && !sent; c++) sent = ray_raw_is_null(t, 0, dst, c);
+        orig = false;
+        prev_atom = false;
+    }
+    out->attrs = (uint8_t)(w | (flag ? RAY_ATTR_HAS_NULLS : 0));
+    return out;
+}
+
+/* The fold of a list r with items[k..j), each a list, vector or atom: r's
+ * cells, then each list's cells retained, each vector's elements boxed,
+ * each atom retained, as concat appends them. */
+__attribute__((noinline)) static ray_t* raze_list_tail(ray_t* r, ray_t** items, int64_t k, int64_t j) {
+    int64_t total = r->len;
+    for (int64_t i = k; i < j; i++)
+        total += items[i]->type == RAY_LIST || ray_is_vec(items[i]) ? items[i]->len : 1;
+    ray_t* out = ray_alloc((size_t)total * sizeof(ray_t*));
+    if (!out) return ray_error("oom", NULL);
+    out->type = RAY_LIST;
+    out->len = total;
+    ray_t** o = (ray_t**)ray_data(out);
+    ray_t** rc = (ray_t**)ray_data(r);
+    int64_t pos = 0;
+    for (int64_t c = 0; c < r->len; c++) { ray_retain(rc[c]); o[pos++] = rc[c]; }
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        if (x->type == RAY_LIST) {
+            ray_t** xc = (ray_t**)ray_data(x);
+            for (int64_t c = 0; c < x->len; c++) { ray_retain(xc[c]); o[pos++] = xc[c]; }
+        } else if (ray_is_vec(x)) {
+            for (int64_t c = 0; c < x->len; c++) { int alloc = 0; o[pos++] = collection_elem(x, c, &alloc); }
+        } else {
+            ray_retain(x);
+            o[pos++] = x;
+        }
+    }
+    return out;
+}
+
+/* Up to this many items raze folds pairwise: the copies are few, and the
+ * stretches would not pay for themselves. */
+#define RAZE_FOLD_MIN 4
+
+/* A stretch of one item is one concat, as cheap as the fold it replaces. */
+__attribute__((noinline)) static ray_t* raze_fold(ray_t** items, int64_t n) {
+    ray_t* r = items[0];
+    ray_retain(r);
+    int64_t k = 1;
+    while (k < n) {
+        ray_t* next;
+        if (r->type == RAY_LIST) {
+            /* a list grows by lists, vectors and atoms; anything else is
+             * concat's to answer (an error) */
+            int64_t j = k;
+            while (j < n && items[j] && !RAY_IS_ERR(items[j]) &&
+                   (items[j]->type == RAY_LIST || ray_is_vec(items[j]) || ray_is_atom(items[j])))
+                j++;
+            if (j <= k + 1) { next = ray_concat_fn(r, items[k]); k++; }
+            else { next = raze_list_tail(r, items, k, j); k = j; }
+        } else {
+            int8_t t = (r->type < 0 && k == 1) ? raze_run_type((int8_t)-r->type)
+                     : (r->type > 0 && !(r->attrs & RAY_ATTR_SLICE)) ? raze_run_type(r->type) : 0;
+            struct ray_sym_domain_s* dom = NULL;
+            bool any_atom = r->type < 0;
+            if (t == RAY_SYM && r->type > 0) dom = ray_sym_vec_domain(r);
+            if (t == RAY_SYM && any_atom) dom = ray_sym_runtime_domain();
+            int64_t j = k;
+            if (t) while (j < n && raze_run_member(items[j], t, &dom, &any_atom)) j++;
+            if (j <= k + 1) { next = ray_concat_fn(r, items[k]); k++; }
+            else { next = raze_typed_run(r, items, k, j, t, dom, any_atom); k = j; }
+        }
+        ray_release(r);
+        if (!next || RAY_IS_ERR(next)) return next ? next : ray_error("oom", NULL);
+        r = next;
+    }
+    return r;
+}
+
 /* (raze list-of-vecs) -> flattened vector */
 /* raze of n >= 2 items that are all string atoms (one string atom, each
  * without its trailing NUL bytes, as concat joins them) or all string
@@ -4865,8 +5142,8 @@ ray_t* ray_raze_fn(ray_t* x) {
         }
     }
 
-    /* Strings: copied once each, in one pass, instead of the pairwise
-     * concat below, which copies the result again at every item; a string
+    /* Strings: copied once each, in one pass, instead of concat's string
+     * joins, which copy the result again at every item; a string
      * held by several items is charged its bytes again each time (#1648). */
     if (n >= 2 && items[0] && (items[0]->type == -RAY_STR ||
                                (items[0]->type == RAY_STR && !ray_index_has(items[0])))) {
@@ -4874,17 +5151,24 @@ ray_t* ray_raze_fn(ray_t* x) {
         if (r) return r;   /* NULL: not all strings of one kind */
     }
 
-    /* Slow path: pairwise concat — used for mixed types, null-bearing
-     * inputs, and non-fixed-width vectors (SYM/STR/GUID/LIST). */
-    ray_t* result = items[0];
-    ray_retain(result);
-    for (int64_t i = 1; i < n; i++) {
-        ray_t* next = ray_concat_fn(result, items[i]);
-        ray_release(result);
-        if (RAY_IS_ERR(next)) return next;
-        result = next;
+    /* Everything else: the answer is the pairwise concat from the left,
+     * (concat (concat i0 i1) i2) ...  Folding it literally copied the result
+     * so far at every item, quadratic in the items (#1656).  The fold is
+     * computed in one pass per stretch instead (raze_fold), with the same
+     * answer.  A handful of items, and a first item with an index (carried
+     * from concat to concat), are folded pairwise as before. */
+    if (n <= RAZE_FOLD_MIN || ray_index_has(items[0])) {   /* a handful: folded as it reads */
+        ray_t* result = items[0];
+        ray_retain(result);
+        for (int64_t i = 1; i < n; i++) {
+            ray_t* next = ray_concat_fn(result, items[i]);
+            ray_release(result);
+            if (RAY_IS_ERR(next)) return next;
+            result = next;
+        }
+        return result;
     }
-    return result;
+    return raze_fold(items, n);
 }
 
 /* ungroup t — flatten nested-list columns, replicate flat columns.
