@@ -1187,13 +1187,13 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
 /* ============================================================================
  * String functions: UPPER, LOWER, TRIM, STRLEN, SUBSTR, REPLACE, CONCAT
  *
- * Over a SYM column, UPPER / LOWER / TRIM (sym_unary_by_code) and SUBSTR at
- * scalar bounds (substr_sym_by_code) run once per distinct code; REPLACE and
- * CONCAT still call ray_sym_intern() per output row.
+ * Over a SYM column, UPPER / LOWER / TRIM, SUBSTR at scalar bounds, REPLACE
+ * and CONCAT with constants run once per distinct code (sym_map_by_code);
+ * the STR paths and the per-row-argument shapes run their row loops.
  * ============================================================================ */
 
-/* UPPER / LOWER / TRIM: exec_string_unary, after the SYM reader it uses
- * (sym_reader_t, below). */
+/* UPPER / LOWER / TRIM: exec_string_unary, after the SYM reader and the
+ * per-code machinery it uses (sym_reader_t, sym_map_by_code, below). */
 
 /* LENGTH — SYM → I64 */
 typedef struct {
@@ -1365,39 +1365,111 @@ static void sym_reader_at(const sym_reader_t* r, int64_t pos,
     *sl = ray_str_len(atom);
 }
 
-/* ---- UPPER / LOWER / TRIM over a SYM vector, once per distinct code ----
- * The transform is a function of the string alone, so the rows only say
- * WHICH entries of the input's domain take part: a parallel pass marks the
- * codes the rows name (a bit per domain position), the marked entries are
- * transformed in rank order (parallel, in chunks of bounded bytes) and
- * interned as a batch into a domain of the result's own
- * (ray_sym_domain_new; the batch dedupes, so entries that fold to one string
- * — "ABC" and "abc" — share one position), and a last parallel pass maps
- * each row through rank → position.  The global table never grows by a
- * derived value (the derived-key path of group-by, query.c, keeps its keys
- * the same way), and the transform runs K times for K distinct codes, not
- * once per row.  Width: the narrowest that holds the result's dictionary.
- * A few distinct results (SYM_UNARY_GLOBAL_MAX: a country or language
- * column) are interned into the global table instead, as the row loop did,
- * and the result stays in the runtime domain: the growth is bounded by the
- * constant, and what reads the result next — a compare with another such
- * column, a group — takes its same-domain path.
+/* ---- a string function of a SYM column, once per distinct code ----------
+ * UPPER / LOWER / TRIM, SUBSTR at scalar bounds, REPLACE (constant pattern
+ * and replacement) and CONCAT of one SYM column with constants are
+ * functions of the cell's string alone, so the rows only say WHICH entries
+ * of the input's domain take part: a parallel pass marks the codes the rows
+ * name (a bit per domain position), the marked entries are transformed in
+ * rank order (parallel, in chunks of bounded bytes) and interned as a batch
+ * into a domain of the result's own (ray_sym_domain_new; the batch dedupes,
+ * so entries that map to one string — "ABC" and "abc" under lower — share
+ * one position), and a last parallel pass maps each row through rank →
+ * position.  The global table never grows by a derived value (the
+ * derived-key path of group-by, query.c, keeps its keys the same way), and
+ * the function runs K times for K distinct codes, not once per row.
+ * Width: the narrowest that holds the result's dictionary.
+ * A few distinct results (SYM_MAP_GLOBAL_MAX: a country or language
+ * column, a substring that few share) are then interned into the global
+ * table, as the row loop did, and the result is in the runtime domain: the
+ * growth is bounded by the constant, and what reads the result next — a
+ * compare with another such column, a group — takes its same-domain path.
  * 1 when served, 0 when not (a code outside the domain, no memory: the
  * caller runs its row loop, as before), -1 cancelled. */
-#define SYM_UNARY_MIN_ROWS   4096                    /* below: the row loop (bounded interns, no bitmap of the domain) */
-#define SYM_UNARY_GLOBAL_MAX 256                     /* distinct results interned globally, not into a domain of their own */
-#define SYM_UNARY_CHUNK      ((int64_t)1 << 20)      /* ranks per intern batch */
-#define SYM_UNARY_CHUNK_BYTES ((int64_t)64 << 20)    /* output bytes per intern batch */
+#define SYM_MAP_MIN_ROWS   4096                    /* below: the row loop (bounded interns, no bitmap of the domain) */
+#define SYM_MAP_GLOBAL_MAX 256                     /* distinct results interned globally, not into a domain of their own */
+#define SYM_MAP_CHUNK      ((int64_t)1 << 20)      /* ranks per intern batch */
+#define SYM_MAP_CHUNK_BYTES ((int64_t)64 << 20)    /* output bytes per intern batch */
+
+/* The function: its opcode and constant arguments. */
+typedef struct {
+    uint16_t    opc;          /* OP_UPPER, OP_LOWER, OP_TRIM, OP_SUBSTR, OP_REPLACE, OP_CONCAT */
+    int64_t     st, ln;       /* SUBSTR: 0-based start; ln < 0: to the end */
+    const char* from; size_t from_len;   /* REPLACE */
+    const char* to;   size_t to_len;
+    const char* pre;  size_t pre_len;    /* CONCAT: the constants before and after the column */
+    const char* post; size_t post_len;
+} sym_map_op_t;
+
+/* A bound on the output's bytes from the input's length: the length pass
+ * sizes the chunk buffer by it without reading the strings. */
+static inline uint64_t sym_map_bound(const sym_map_op_t* m, uint64_t sl) {
+    switch (m->opc) {
+        case OP_CONCAT:  return sl + m->pre_len + m->post_len;
+        case OP_REPLACE:
+            /* every from_len bytes a match replaced by to_len (the row loop's worst) */
+            if (m->from_len > 0 && m->to_len > m->from_len)
+                return (sl / m->from_len) * m->to_len + sl % m->from_len;
+            return sl;
+        default:         return sl;
+    }
+}
+
+/* The function of one string, written into `out` (at least
+ * sym_map_bound(sl) bytes); its length. */
+static inline size_t sym_map_apply(const sym_map_op_t* m, const char* sp, size_t sl, char* out) {
+    switch (m->opc) {
+        case OP_UPPER:
+            for (size_t j = 0; j < sl; j++) out[j] = (char)toupper((unsigned char)sp[j]);
+            return sl;
+        case OP_LOWER:
+            for (size_t j = 0; j < sl; j++) out[j] = (char)tolower((unsigned char)sp[j]);
+            return sl;
+        case OP_TRIM: {
+            size_t start = 0, end = sl;
+            while (start < sl && isspace((unsigned char)sp[start])) start++;
+            while (end > start && isspace((unsigned char)sp[end - 1])) end--;
+            memcpy(out, sp + start, end - start);
+            return end - start;
+        }
+        case OP_SUBSTR: {
+            if ((uint64_t)m->st >= sl) return 0;
+            int64_t ln = m->ln;
+            if (ln < 0 || ln > (int64_t)(sl - (size_t)m->st)) ln = (int64_t)sl - m->st;
+            memcpy(out, sp + m->st, (size_t)ln);
+            return (size_t)ln;
+        }
+        case OP_REPLACE: {
+            size_t bi = 0;
+            for (size_t j = 0; j < sl; ) {
+                if (m->from_len > 0 && j + m->from_len <= sl && memcmp(sp + j, m->from, m->from_len) == 0) {
+                    memcpy(out + bi, m->to, m->to_len); bi += m->to_len;
+                    j += m->from_len;
+                } else {
+                    out[bi++] = sp[j++];
+                }
+            }
+            return bi;
+        }
+        default: {   /* OP_CONCAT */
+            memcpy(out, m->pre, m->pre_len);
+            memcpy(out + m->pre_len, sp, sl);
+            memcpy(out + m->pre_len + sl, m->post, m->post_len);
+            return m->pre_len + sl + m->post_len;
+        }
+    }
+}
+
 typedef struct {
     sym_reader_t   rd;
+    const sym_map_op_t* m;
     uint64_t*      bm;        /* codes present, a bit per domain position */
     int64_t        words;
     int64_t        dn;
     ray_pool_t*    pool;
     _Atomic(int)   bad;       /* a code outside the domain */
-    uint16_t       opc;
     const int32_t* base;      /* rank of each word's first set bit */
-    uint32_t*      ilen;      /* [K] the input entry's length, by rank */
+    uint32_t*      olen;      /* [K] the bound on the entry's output, by rank */
     /* the chunk of ranks [r0, r0 + n) over words [w0, w1) */
     int64_t        w0, r0;
     const uint64_t* off;      /* [n + 1] byte offset of each rank's output in `bytes` */
@@ -1408,11 +1480,11 @@ typedef struct {
     const int32_t* ids;       /* result position by rank */
     void*          dst;
     uint8_t        dst_attrs;
-} sym_unary_ctx_t;
+} sym_map_ctx_t;
 
-static void sym_unary_mark(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+static void sym_map_mark(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
-    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
     const void* base = ray_data(c->rd.v);
     uint8_t attrs = c->rd.v->attrs;
     for (int64_t i = lo; i < hi; i++) {
@@ -1425,11 +1497,16 @@ static void sym_unary_mark(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     }
 }
 
-/* The marked entries' lengths, by rank: a file's from its index (no string
- * read), any other from its atom. */
-static void sym_unary_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+static inline uint32_t sym_map_olen(const sym_map_op_t* m, uint64_t sl) {
+    uint64_t b = sym_map_bound(m, sl);
+    return b > UINT32_MAX ? UINT32_MAX : (uint32_t)b;
+}
+
+/* The bound on each marked entry's output, by rank: a file's lengths from
+ * its index (no string read), any other's from its atom. */
+static void sym_map_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
-    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
     for (int64_t w = lo; w < hi; w++) {
         if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
         uint64_t bits = c->bm[w];
@@ -1441,7 +1518,7 @@ static void sym_unary_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         if (c->rd.raw_ok && ids[n - 1] < c->rd.raw.count) {
             for (int j = 0; j < n; j++, k++) {
                 int64_t l = ray_sym_domain_raw_len(&c->rd.raw, ids[j]);
-                c->ilen[k] = l < 0 ? 0 : (l > UINT32_MAX ? UINT32_MAX : (uint32_t)l);
+                c->olen[k] = sym_map_olen(c->m, l < 0 ? 0 : (uint64_t)l);
             }
             continue;
         }
@@ -1451,33 +1528,18 @@ static void sym_unary_len(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         } else {
             for (int j = 0; j < n; j++) sym_reader_at(&c->rd, ids[j], &sp[j], &sl[j]);
         }
-        for (int j = 0; j < n; j++, k++) c->ilen[k] = sl[j] > UINT32_MAX ? UINT32_MAX : (uint32_t)sl[j];
+        for (int j = 0; j < n; j++, k++) c->olen[k] = sym_map_olen(c->m, sl[j]);
     }
 }
 
-static inline size_t sym_unary_apply(uint16_t opc, const char* sp, size_t sl, char* out) {
-    if (opc == OP_UPPER) {
-        for (size_t j = 0; j < sl; j++) out[j] = (char)toupper((unsigned char)sp[j]);
-        return sl;
-    }
-    if (opc == OP_LOWER) {
-        for (size_t j = 0; j < sl; j++) out[j] = (char)tolower((unsigned char)sp[j]);
-        return sl;
-    }
-    size_t start = 0, end = sl;
-    while (start < sl && isspace((unsigned char)sp[start])) start++;
-    while (end > start && isspace((unsigned char)sp[end - 1])) end--;
-    memcpy(out, sp + start, end - start);
-    return end - start;
-}
-
-/* The chunk's entries transformed into `bytes` at their offsets (the input
- * length bounds the output's), with the batch's pointers, lengths and
- * hashes.  A compressed file's entries are decoded one at a time (the
- * thread's ring holds few), any other's read in blocks. */
-static void sym_unary_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+/* The chunk's entries transformed into `bytes` at their offsets, with the
+ * batch's pointers, lengths and hashes.  A compressed file's entries are
+ * decoded one at a time (the thread's ring holds few), any other's read in
+ * blocks.  An entry whose output would not fit its bound (the bound is
+ * exact or larger; only a 4 GB string is clipped) is cut at the bound. */
+static void sym_map_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
-    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
     bool one_at_a_time = c->rd.raw_ok && c->rd.raw.z;
     for (int64_t w = c->w0 + lo; w < c->w0 + hi; w++) {
         if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
@@ -1495,8 +1557,9 @@ static void sym_unary_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
             if (one_at_a_time) sym_reader_at(&c->rd, ids[j], &sp[j], &sl[j]);
             char* out = c->bytes + c->off[k];
             size_t room = (size_t)(c->off[k + 1] - c->off[k]);
-            size_t l = sl[j] < room ? sl[j] : room;     /* the length pass bounded the room */
-            size_t ol = sym_unary_apply(c->opc, sp[j], l, out);
+            size_t l = sl[j];
+            while (l > 0 && sym_map_bound(c->m, l) > room) l--;
+            size_t ol = sym_map_apply(c->m, sp[j], l, out);
             c->strs[k] = out;
             c->lens[k] = ol;
             c->hashes[k] = (uint32_t)ray_hash_bytes(out, ol);
@@ -1504,16 +1567,16 @@ static void sym_unary_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     }
 }
 
-static void sym_unary_fill(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+static void sym_map_fill(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
     (void)wid;
-    sym_unary_ctx_t* c = (sym_unary_ctx_t*)vctx;
+    sym_map_ctx_t* c = (sym_map_ctx_t*)vctx;
     const void* base = ray_data(c->rd.v);
     uint8_t attrs = c->rd.v->attrs;
     const uint64_t* bm = c->bm;
     const int32_t* rank0 = c->base;
     const int32_t* ids = c->ids;
     uint8_t w = (uint8_t)(c->dst_attrs & RAY_SYM_W_MASK);
-#define SYM_UNARY_FILL_LOOP(T)                                                        \
+#define SYM_MAP_FILL_LOOP(T)                                                          \
     do {                                                                              \
         T* d = (T*)c->dst;                                                            \
         for (int64_t i = lo; i < hi; i++) {                                           \
@@ -1524,38 +1587,38 @@ static void sym_unary_fill(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
             d[i] = (T)ids[rank0[wd] + __builtin_popcountll(below)];                   \
         }                                                                             \
     } while (0)
-    if (w == RAY_SYM_W8)       SYM_UNARY_FILL_LOOP(uint8_t);
-    else if (w == RAY_SYM_W16) SYM_UNARY_FILL_LOOP(uint16_t);
-    else if (w == RAY_SYM_W32) SYM_UNARY_FILL_LOOP(uint32_t);
-    else                       SYM_UNARY_FILL_LOOP(int64_t);
-#undef SYM_UNARY_FILL_LOOP
+    if (w == RAY_SYM_W8)       SYM_MAP_FILL_LOOP(uint8_t);
+    else if (w == RAY_SYM_W16) SYM_MAP_FILL_LOOP(uint16_t);
+    else if (w == RAY_SYM_W32) SYM_MAP_FILL_LOOP(uint32_t);
+    else                       SYM_MAP_FILL_LOOP(int64_t);
+#undef SYM_MAP_FILL_LOOP
 }
 
-static void sym_unary_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
-                          sym_unary_ctx_t* c, int64_t n) {
+static void sym_map_run(ray_pool_t* pool, void (*fn)(void*, uint32_t, int64_t, int64_t),
+                        sym_map_ctx_t* c, int64_t n) {
     if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, fn, c, n);
     else                                                           fn(c, 0, 0, n);
 }
 
-static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
+static int sym_map_by_code(ray_t* input, const sym_map_op_t* m, ray_t** out) {
     int64_t nrows = input->len;
     ray_pool_t* pool = ray_pool_get();
-    sym_unary_ctx_t c;
+    sym_map_ctx_t c;
     memset(&c, 0, sizeof c);
     sym_reader_init(&c.rd, input);
+    c.m = m;
     int rc = 0;
-    ray_t *bm_hdr = NULL, *base_hdr = NULL, *ilen_hdr = NULL, *ids_hdr = NULL,
+    ray_t *bm_hdr = NULL, *base_hdr = NULL, *olen_hdr = NULL, *ids_hdr = NULL,
           *chunk_hdr = NULL, *off_hdr = NULL, *bytes_hdr = NULL;
     struct ray_sym_domain_s* kdom = NULL;
     c.dn = ray_sym_domain_count(c.rd.dom);
     if (c.dn <= 0 || c.dn > ((int64_t)1 << 31)) goto out;
     c.words = (c.dn + 63) >> 6;
     c.pool  = pool;
-    c.opc   = opc;
     c.bm = (uint64_t*)scratch_calloc(&bm_hdr, (size_t)c.words * sizeof(uint64_t));
     if (!c.bm) goto out;
     atomic_init(&c.bad, 0);
-    sym_unary_run(pool, sym_unary_mark, &c, nrows);
+    sym_map_run(pool, sym_map_mark, &c, nrows);
     if (pool_cancelled(pool)) { rc = -1; goto out; }
     if (atomic_load_explicit(&c.bad, memory_order_relaxed)) goto out;
     int32_t* base = (int32_t*)scratch_alloc(&base_hdr, (size_t)c.words * sizeof(int32_t));
@@ -1563,31 +1626,29 @@ static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
     int64_t K = 0;
     for (int64_t w = 0; w < c.words; w++) { base[w] = (int32_t)K; K += __builtin_popcountll(c.bm[w]); }
     if (K <= 0 || K > INT32_MAX) goto out;
-    bool global = K <= SYM_UNARY_GLOBAL_MAX;
     c.base = base;
-    c.ilen = (uint32_t*)scratch_alloc(&ilen_hdr, (size_t)K * sizeof(uint32_t));
-    if (!c.ilen) goto out;
-    sym_unary_run(pool, sym_unary_len, &c, c.words);
+    c.olen = (uint32_t*)scratch_alloc(&olen_hdr, (size_t)K * sizeof(uint32_t));
+    if (!c.olen) goto out;
+    sym_map_run(pool, sym_map_len, &c, c.words);
     if (pool_cancelled(pool)) { rc = -1; goto out; }
     int32_t* ids = (int32_t*)scratch_alloc(&ids_hdr, (size_t)K * sizeof(int32_t));
     if (!ids) goto out;
-    int64_t cap = K < SYM_UNARY_CHUNK ? K : SYM_UNARY_CHUNK;    /* ranks a chunk holds at most */
-    size_t per = sizeof(const char*) + sizeof(size_t) + sizeof(uint32_t) + sizeof(int64_t);
+    int64_t cap = K < SYM_MAP_CHUNK ? K : SYM_MAP_CHUNK;    /* ranks a chunk holds at most */
+    /* the 8-byte arrays first, so each stays aligned whatever `cap` is */
+    size_t per = sizeof(const char*) + sizeof(int64_t) + sizeof(size_t) + sizeof(uint32_t);
     char* chunk = (char*)scratch_alloc(&chunk_hdr, (size_t)cap * per);
     if (!chunk) goto out;
     c.strs   = (const char**)chunk;
-    c.lens   = (size_t*)(c.strs + cap);
+    int64_t* pos = (int64_t*)(c.strs + cap);
+    c.lens   = (size_t*)(pos + cap);
     c.hashes = (uint32_t*)(c.lens + cap);
-    int64_t* pos = (int64_t*)(c.hashes + cap);
     uint64_t* off = (uint64_t*)scratch_alloc(&off_hdr, (size_t)(cap + 1) * sizeof(uint64_t));
     if (!off) goto out;
     c.off = off;
-    if (!global) {
-        kdom = ray_sym_domain_new();
-        if (!kdom) goto out;
-    }
-    /* chunks of whole words: at most SYM_UNARY_CHUNK ranks and about
-     * SYM_UNARY_CHUNK_BYTES of output each (one word may exceed either) */
+    kdom = ray_sym_domain_new();
+    if (!kdom) goto out;
+    /* chunks of whole words: at most SYM_MAP_CHUNK ranks and about
+     * SYM_MAP_CHUNK_BYTES of output each (one word may exceed either) */
     int64_t w0 = 0;
     size_t bytes_cap = 0;
     while (w0 < c.words) {
@@ -1597,10 +1658,10 @@ static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
         for (;;) {
             int64_t r1 = w1 + 1 < c.words ? (int64_t)base[w1 + 1] : K;
             uint64_t wb = 0;
-            for (int64_t r = (w1 < c.words ? (int64_t)base[w1] : K); r < r1; r++) wb += c.ilen[r];
-            if (w1 > w0 && (r1 - r0 > SYM_UNARY_CHUNK || nb + wb > (uint64_t)SYM_UNARY_CHUNK_BYTES)) break;
+            for (int64_t r = (int64_t)base[w1]; r < r1; r++) wb += c.olen[r];
+            if (w1 > w0 && (r1 - r0 > SYM_MAP_CHUNK || nb + wb > (uint64_t)SYM_MAP_CHUNK_BYTES)) break;
             nb += wb; n = r1 - r0; w1++;
-            if (w1 >= c.words || n >= SYM_UNARY_CHUNK || nb >= (uint64_t)SYM_UNARY_CHUNK_BYTES) break;
+            if (w1 >= c.words || n >= SYM_MAP_CHUNK || nb >= (uint64_t)SYM_MAP_CHUNK_BYTES) break;
         }
         if (n > 0) {
             if (nb + 1 > bytes_cap) {
@@ -1611,13 +1672,11 @@ static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
                 if (!c.bytes) goto out;
             }
             off[0] = 0;
-            for (int64_t r = 0; r < n; r++) off[r + 1] = off[r] + c.ilen[r0 + r];
+            for (int64_t r = 0; r < n; r++) off[r + 1] = off[r] + c.olen[r0 + r];
             c.w0 = w0; c.r0 = r0;
-            sym_unary_run(pool, sym_unary_cut, &c, w1 - w0);
+            sym_map_run(pool, sym_map_cut, &c, w1 - w0);
             if (pool_cancelled(pool)) { rc = -1; goto out; }
-            if (global) {
-                if (ray_sym_intern_batch(c.hashes, c.strs, c.lens, n, pos) < 0) goto out;
-            } else if (!ray_sym_domain_intern_batch(kdom, n, c.strs, c.lens, c.hashes, pos)) {
+            if (!ray_sym_domain_intern_batch(kdom, n, c.strs, c.lens, c.hashes, pos)) {
                 rc = pool_cancelled(pool) ? -1 : 0;
                 goto out;
             }
@@ -1629,10 +1688,24 @@ static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
         w0 = w1;
     }
     c.ids = ids;
+    /* few distinct results: runtime ids as the row loop wrote them (position
+     * 0 is the seeded "", used or not) */
+    int64_t kc = ray_sym_domain_count(kdom);
+    bool global = kc <= SYM_MAP_GLOBAL_MAX + 1;
+    if (global) {
+        int32_t gmap[SYM_MAP_GLOBAL_MAX + 1];
+        for (int64_t q = 0; q < kc; q++) {
+            ray_t* str = ray_sym_domain_str(kdom, q);
+            int64_t id = str ? ray_sym_intern(ray_str_ptr(str), ray_str_len(str)) : -1;
+            if (id < 0 || id > INT32_MAX) goto out;
+            gmap[q] = (int32_t)id;
+        }
+        for (int64_t r = 0; r < K; r++) ids[r] = gmap[ids[r]];
+    }
     {
-        /* runtime ids as the row loop wrote them (W64); a domain of the
+        /* W64 for runtime ids, as the row loop wrote them; a domain of the
          * result's own at the narrowest width that holds it */
-        uint8_t w = global ? RAY_SYM_W64 : ray_sym_dict_width(ray_sym_domain_count(kdom));
+        uint8_t w = global ? RAY_SYM_W64 : ray_sym_dict_width(kc);
         ray_t* res = ray_sym_vec_new(w, nrows);
         if (!res || RAY_IS_ERR(res)) { if (res) ray_error_free(res); goto out; }
         res->len = nrows;
@@ -1644,7 +1717,7 @@ static int sym_unary_by_code(ray_t* input, uint16_t opc, ray_t** out) {
         }
         c.dst = ray_data(res);
         c.dst_attrs = res->attrs;
-        sym_unary_run(pool, sym_unary_fill, &c, nrows);
+        sym_map_run(pool, sym_map_fill, &c, nrows);
         if (pool_cancelled(pool)) { ray_release(res); rc = -1; goto out; }
         *out = res;
         rc = 1;
@@ -1656,10 +1729,17 @@ out:
     if (off_hdr) scratch_free(off_hdr);
     if (chunk_hdr) scratch_free(chunk_hdr);
     if (ids_hdr) scratch_free(ids_hdr);
-    if (ilen_hdr) scratch_free(ilen_hdr);
+    if (olen_hdr) scratch_free(olen_hdr);
     if (base_hdr) scratch_free(base_hdr);
     if (bm_hdr) scratch_free(bm_hdr);
     return rc;
+}
+
+/* The by-code path for a SYM column of enough rows: *res set and 1 when it
+ * served, -1 cancelled, 0 when the caller runs its row loop. */
+static int sym_map_column(ray_t* input, const sym_map_op_t* m, ray_t** res) {
+    if (input->type != RAY_SYM || input->len < SYM_MAP_MIN_ROWS) return 0;
+    return sym_map_by_code(input, m, res);
 }
 
 /* UPPER / LOWER / TRIM — unary SYM/STR → SYM/STR */
@@ -1683,9 +1763,10 @@ ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
     /* A SYM column: once per distinct code, into the result's own domain
      * (above).  A small one keeps the row loop: its interns are few, and
      * the bitmap of the domain is not paid. */
-    if (!is_str && len >= SYM_UNARY_MIN_ROWS) {
+    {
+        sym_map_op_t m = { .opc = op->opcode };
         ray_t* res = NULL;
-        int rc = sym_unary_by_code(input, op->opcode, &res);
+        int rc = sym_map_column(input, &m, &res);
         if (rc != 0) {
             ray_release(input);
             return rc < 0 ? ray_error("cancel", NULL) : res;
@@ -2103,159 +2184,6 @@ static ray_t* substr_str_view(ray_t* input, ray_t* start_v, ray_t* len_v) {
     return result;
 }
 
-/* ---- SUBSTR over a SYM vector with scalar bounds, once per code ---------
- * A row's result is a function of its code.  The codes present are marked
- * in a bitmap over the domain; each distinct one's cut is taken and hashed
- * in parallel, in chunks of ranks; the distinct results are interned in
- * one batch per chunk (the ids ray_sym_intern gives, so the row loop's);
- * the rows are then filled from their code's rank.  One intern per
- * distinct code instead of one per row.  1 when served, 0 when not (a
- * compressed vocabulary, a code outside the domain, no memory: the caller
- * runs its row loop), -1 cancelled. */
-#define SUBSTR_SYM_CHUNK ((int64_t)1 << 20)
-typedef struct {
-    sym_reader_t   rd;
-    uint64_t*      bm;        /* codes present, a bit per domain position */
-    int64_t        words;
-    int64_t        dn;
-    ray_pool_t*    pool;
-    _Atomic(int)   bad;       /* a code outside the domain */
-    int64_t        st, ln;    /* 0-based start; ln < 0: to the end */
-    /* the chunk of ranks [r0, r0 + n) over words [w0, w1) */
-    int64_t        w0, r0;
-    const int32_t* base;      /* rank of each word's first set bit */
-    const char**   strs;
-    size_t*        lens;
-    uint32_t*      hashes;
-    const int32_t* ids;       /* result id by rank */
-    int64_t*       dst;
-} substr_sym_ctx_t;
-
-static void substr_sym_mark(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
-    (void)wid;
-    substr_sym_ctx_t* c = (substr_sym_ctx_t*)vctx;
-    const void* base = ray_data(c->rd.v);
-    uint8_t attrs = c->rd.v->attrs;
-    for (int64_t i = lo; i < hi; i++) {
-        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(c->pool)) return;
-        int64_t pos = ray_read_sym(base, i, RAY_SYM, attrs);
-        if (pos < 0 || pos >= c->dn) { atomic_store_explicit(&c->bad, 1, memory_order_relaxed); return; }
-        uint64_t bit = (uint64_t)1 << (pos & 63);
-        if (!(__atomic_load_n(&c->bm[pos >> 6], __ATOMIC_RELAXED) & bit))
-            __atomic_fetch_or(&c->bm[pos >> 6], bit, __ATOMIC_RELAXED);
-    }
-}
-
-static void substr_sym_cut(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
-    (void)wid;
-    substr_sym_ctx_t* c = (substr_sym_ctx_t*)vctx;
-    for (int64_t w = c->w0 + lo; w < c->w0 + hi; w++) {
-        if (((w - lo) & 63) == 0 && pool_cancelled(c->pool)) return;
-        uint64_t bits = c->bm[w];
-        if (!bits) continue;
-        int64_t k = (int64_t)c->base[w] - c->r0;
-        int64_t ids[64]; const char* sp[64]; size_t sl[64];
-        int n = 0;
-        while (bits) { ids[n++] = w * 64 + __builtin_ctzll(bits); bits &= bits - 1; }
-        // cppcheck-suppress uninitvar // bits is nonzero here, so the loop above fills ids[0, n)
-        sym_reader_block(&c->rd, ids, n, sp, sl);
-        for (int j = 0; j < n; j++, k++) {
-            if ((size_t)c->st >= sl[j]) {
-                c->strs[k] = ""; c->lens[k] = 0;
-            } else {
-                int64_t ln = c->ln;
-                if (ln < 0 || ln > (int64_t)(sl[j] - (size_t)c->st)) ln = (int64_t)sl[j] - c->st;
-                c->strs[k] = sp[j] + c->st; c->lens[k] = (size_t)ln;
-            }
-            c->hashes[k] = (uint32_t)ray_hash_bytes(c->strs[k], c->lens[k]);
-        }
-    }
-}
-
-static void substr_sym_fill(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
-    (void)wid;
-    substr_sym_ctx_t* c = (substr_sym_ctx_t*)vctx;
-    const void* base = ray_data(c->rd.v);
-    uint8_t attrs = c->rd.v->attrs;
-    for (int64_t i = lo; i < hi; i++) {
-        if (((i - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(c->pool)) return;
-        int64_t pos = ray_read_sym(base, i, RAY_SYM, attrs);
-        int64_t w = pos >> 6;
-        uint64_t below = c->bm[w] & (((uint64_t)1 << (pos & 63)) - 1);
-        c->dst[i] = c->ids[c->base[w] + __builtin_popcountll(below)];
-    }
-}
-
-static int substr_sym_by_code(ray_t* input, int64_t start, int64_t len, int64_t* dst, int64_t nrows) {
-    ray_pool_t* pool = ray_pool_get();
-    if (!pool || ray_pool_total_workers(pool) < 2) return 0;
-    substr_sym_ctx_t c;
-    memset(&c, 0, sizeof c);
-    sym_reader_init(&c.rd, input);
-    int rc = 0;
-    ray_t *bm_hdr = NULL, *base_hdr = NULL, *ids_hdr = NULL, *chunk_hdr = NULL;
-    if (c.rd.raw_ok && c.rd.raw.z) goto out;        /* a compressed entry lives in a ring: not kept */
-    c.dn = ray_sym_domain_count(c.rd.dom);
-    if (c.dn <= 0 || c.dn > ((int64_t)1 << 31)) goto out;
-    c.words = (c.dn + 63) >> 6;
-    c.pool  = pool;
-    c.st    = start - 1;
-    if (c.st < 0) c.st = 0;
-    c.ln    = len;
-    c.dst   = dst;
-    c.bm = (uint64_t*)scratch_alloc(&bm_hdr, (size_t)c.words * sizeof(uint64_t));
-    if (!c.bm) goto out;
-    memset(c.bm, 0, (size_t)c.words * sizeof(uint64_t));
-    atomic_init(&c.bad, 0);
-    ray_pool_dispatch(pool, substr_sym_mark, &c, nrows);
-    if (pool_cancelled(pool)) { rc = -1; goto out; }
-    if (atomic_load_explicit(&c.bad, memory_order_relaxed)) goto out;
-    int32_t* base = (int32_t*)scratch_alloc(&base_hdr, (size_t)c.words * sizeof(int32_t));
-    if (!base) goto out;
-    int64_t K = 0;
-    for (int64_t w = 0; w < c.words; w++) { base[w] = (int32_t)K; K += __builtin_popcountll(c.bm[w]); }
-    if (K > INT32_MAX) goto out;
-    c.base = base;
-    int32_t* ids = (int32_t*)scratch_alloc(&ids_hdr, (size_t)(K > 0 ? K : 1) * sizeof(int32_t));
-    if (!ids) goto out;
-    size_t per = sizeof(const char*) + sizeof(size_t) + sizeof(uint32_t) + sizeof(int64_t);
-    char* chunk = (char*)scratch_alloc(&chunk_hdr, (size_t)SUBSTR_SYM_CHUNK * per);
-    if (!chunk) goto out;
-    c.strs   = (const char**)chunk;
-    c.lens   = (size_t*)(c.strs + SUBSTR_SYM_CHUNK);
-    c.hashes = (uint32_t*)(c.lens + SUBSTR_SYM_CHUNK);
-    int64_t* tmp_ids = (int64_t*)(c.hashes + SUBSTR_SYM_CHUNK);
-    /* chunks of at most SUBSTR_SYM_CHUNK ranks, whole words each */
-    int64_t w0 = 0;
-    while (w0 < c.words) {
-        int64_t r0 = base[w0], w1 = w0;
-        while (w1 < c.words && (w1 + 1 < c.words ? (int64_t)base[w1 + 1] : K) - r0 <= SUBSTR_SYM_CHUNK) w1++;
-        if (w1 == w0) goto out;                       /* one word of more than the chunk: never */
-        int64_t n = (w1 < c.words ? (int64_t)base[w1] : K) - r0;
-        c.w0 = w0; c.r0 = r0;
-        if (n > 0) {
-            ray_pool_dispatch(pool, substr_sym_cut, &c, w1 - w0);
-            if (pool_cancelled(pool)) { rc = -1; goto out; }
-            if (ray_sym_intern_batch(c.hashes, c.strs, c.lens, n, tmp_ids) < 0) goto out;
-            for (int64_t j = 0; j < n; j++) {
-                if (tmp_ids[j] < 0 || tmp_ids[j] > INT32_MAX) goto out;
-                ids[r0 + j] = (int32_t)tmp_ids[j];
-            }
-        }
-        w0 = w1;
-    }
-    c.ids = ids;
-    ray_pool_dispatch(pool, substr_sym_fill, &c, nrows);
-    rc = pool_cancelled(pool) ? -1 : 1;
-out:
-    sym_reader_done(&c.rd);
-    if (chunk_hdr) scratch_free(chunk_hdr);
-    if (ids_hdr) scratch_free(ids_hdr);
-    if (base_hdr) scratch_free(base_hdr);
-    if (bm_hdr) scratch_free(bm_hdr);
-    return rc;
-}
-
 ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     ray_t* input = exec_node(g, op_child(g, op, 0));
     ray_t* start_v = exec_node(g, op_child(g, op, 1));
@@ -2343,14 +2271,15 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
     bool s_all_null = !s_data && !s_data_i32 && substr_scalar_is_null(start_v);
     bool l_all_null = !l_data && !l_data_i32 && substr_scalar_is_null(len_v);
 
-    /* A SYM column cut at scalar bounds: once per code (above). */
-    if (!is_str && !s_all_null && !l_all_null && !s_data && !s_data_i32 && !l_data && !l_data_i32 &&
-        nrows >= RAY_PARALLEL_THRESHOLD) {
-        int rc = substr_sym_by_code(input, s_scalar, l_scalar, sym_dst, nrows);
+    /* A SYM column cut at scalar bounds: once per code (sym_map_by_code). */
+    if (!is_str && !s_all_null && !l_all_null && !s_data && !s_data_i32 && !l_data && !l_data_i32) {
+        sym_map_op_t m = { .opc = OP_SUBSTR, .st = s_scalar - 1 < 0 ? 0 : s_scalar - 1, .ln = l_scalar };
+        ray_t* res = NULL;
+        int rc = sym_map_column(input, &m, &res);
         if (rc != 0) {
+            ray_release(result);
             ray_release(input); ray_release(start_v); ray_release(len_v);
-            if (rc < 0) { ray_release(result); return ray_error("cancel", NULL); }
-            return result;
+            return rc < 0 ? ray_error("cancel", NULL) : res;
         }
     }
 
@@ -2440,6 +2369,17 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
 
     int64_t nrows = input->len;
     bool is_str = (input->type == RAY_STR);
+
+    /* A SYM column: once per distinct code (sym_map_by_code). */
+    {
+        sym_map_op_t m = { .opc = OP_REPLACE, .from = from_str, .from_len = from_len, .to = to_str, .to_len = to_len };
+        ray_t* res = NULL;
+        int rc = sym_map_column(input, &m, &res);
+        if (rc != 0) {
+            ray_release(input); ray_release(from_v); ray_release(to_v);
+            return rc < 0 ? ray_error("cancel", NULL) : res;
+        }
+    }
 
     ray_t* result;
     if (is_str) {
@@ -2535,6 +2475,46 @@ static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
         nrows = args[a]->len;
         has_vector = true;
     }
+    /* One SYM column among constants: once per distinct code
+     * (sym_map_by_code), the constants' bytes gathered before and after
+     * it.  A null constant is empty text, as the row loop has it. */
+    if (!out_str && has_vector) {
+        int col = -1;
+        bool fits = true;
+        size_t pre_len = 0, post_len = 0;
+        for (int a = 0; a < n_args && fits; a++) {
+            if (args[a]->type == RAY_SYM) { fits = col < 0; col = a; continue; }
+            if (args[a]->type != -RAY_STR && args[a]->type != -RAY_SYM) { fits = false; break; }
+            size_t l = 0;
+            if (args[a]->type == -RAY_STR) l = ray_str_len(args[a]);
+            else { ray_t* st = ray_sym_str(args[a]->i64); if (st) l = ray_str_len(st); }
+            if (col < 0) pre_len += l; else post_len += l;
+        }
+        if (fits && col >= 0 && args[col]->len >= SYM_MAP_MIN_ROWS) {
+            ray_t* khdr = NULL;
+            char* kb = (char*)scratch_alloc(&khdr, pre_len + post_len + 1);
+            if (kb) {
+                size_t bi = 0;
+                for (int a = 0; a < n_args; a++) {
+                    if (a == col) continue;
+                    const char* sp = NULL; size_t l = 0;
+                    if (args[a]->type == -RAY_STR) { sp = ray_str_ptr(args[a]); l = ray_str_len(args[a]); }
+                    else { ray_t* st = ray_sym_str(args[a]->i64); if (st) { sp = ray_str_ptr(st); l = ray_str_len(st); } }
+                    if (sp && l) { memcpy(kb + bi, sp, l); bi += l; }
+                }
+                sym_map_op_t m = { .opc = OP_CONCAT, .pre = kb, .pre_len = pre_len,
+                                   .post = kb + pre_len, .post_len = post_len };
+                ray_t* res = NULL;
+                int rc = sym_map_column(args[col], &m, &res);
+                scratch_free(khdr);
+                if (rc != 0) {
+                    for (int i = 0; i < n_args; i++) ray_release(args[i]);
+                    return rc < 0 ? ray_error("cancel", NULL) : res;
+                }
+            }
+        }
+    }
+
     ray_t* result = ray_vec_new(out_str ? RAY_STR : RAY_SYM, nrows);
     if (!result || RAY_IS_ERR(result)) {
         for (int i = 0; i < n_args; i++) ray_release(args[i]);

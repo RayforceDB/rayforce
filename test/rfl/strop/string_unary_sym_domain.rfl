@@ -158,3 +158,51 @@
 (count PG) -- 1000
 (all (== (at PG 'u) (at GO 'lu))) -- true
 (.sys.exec "rm -rf /tmp/rfl_string_unary_sym_domain") -- 0
+
+;; ── substr, replace and concat with constants take the same path ──
+;; (sym_map_by_code): values as the STR row loop gives them, no growth of
+;; the global table past 256 distinct results, results that coincide share
+;; a position
+(count ['RS 'RS2 'ss 'rp 'cc 'RP 'RC 'np 'x]) -- 9
+(set s0 (symc))
+(set RS2 (select {from: T ss: (substr u 13 -1) v: v}))
+(- (symc) s0) -- 0
+(all (== (at RS2 'ss) (as 'SYM (substr (as 'STR u) 13 -1)))) -- true
+(count (distinct (at RS2 'ss))) -- 1000
+;; a cut that few share (10 of 1000 codes) is runtime symbols, as a
+;; column of few values is: the decision is by the result's distinct count
+(set s0 (symc))
+(set RS (select {from: T ss: (substr u 8 5) v: v}))
+(- (symc) s0) -- 10
+(all (== (at RS 'ss) (as 'SYM (substr (as 'STR u) 8 5)))) -- true
+(count (distinct (at RS 'ss))) -- 10
+;; a start past the string is the empty symbol; a per-row start keeps the row loop
+(count (select {from: T where: (== (substr u 500 3) "")})) -- 6000
+(set US (as 'STR u))
+(set RS3 (select {from: T ss: (substr u (+ 1 (% v 3)) 6) v: v}))
+(all (== (at RS3 'ss) (as 'SYM (map (fn [k] (substr (at US k) (+ 1 (% k 3)) 6)) i)))) -- true
+(set s0 (symc))
+(set RP (select {from: T rp: (replace u "Page" "p") v: v}))
+(- (symc) s0) -- 0
+(all (== (at RP 'rp) (as 'SYM (replace (as 'STR u) "Page" "p")))) -- true
+(count (distinct (at RP 'rp))) -- 1000
+;; an expanding replacement, and one whose results coincide
+(set RP2 (select {from: T rp: (replace u "." "<dot>") v: v}))
+(all (== (at RP2 'rp) (as 'SYM (replace (as 'STR u) "." "<dot>")))) -- true
+(set RP3 (select {from: TM rp: (replace m "K" "k") v: v}))
+(all (== (at RP3 'rp) (as 'SYM (replace (as 'STR m) "K" "k")))) -- true
+(count (distinct (at RP3 'rp))) -- 600
+(set s0 (symc))
+(set RC (select {from: T cc: (concat "<" u ">" 'x) v: v}))
+(- (symc) s0) -- 0
+(all (== (at RC 'cc) (as 'SYM (concat "<" (concat (as 'STR u) ">x"))))) -- true
+(count (distinct (at RC 'cc))) -- 1000
+(set RC2 (select {from: T cc: (concat u "/end") v: v}))
+(all (== (at RC2 'cc) (as 'SYM (concat (as 'STR u) "/end")))) -- true
+;; the parameter-count shape: strlen of the column less strlen of it with
+;; the separators removed
+(set NP (select {from: (select {from: T np: (+ (- (strlen u) (strlen (replace u "e" ""))) 1) v: v where: (not (nil? (str-find u "/")))}) by: {n: (if (>= np 4) 4 np)} c: (count v)}))
+(set NPO (select {from: (select {from: TO np: (+ (- (strlen (as 'STR lu)) (strlen (replace (as 'STR lu) "e" ""))) 1) v: v where: (not (nil? (str-find (as 'STR lu) "/")))}) by: {n: (if (>= np 4) 4 np)} c: (count v)}))
+(all (== (at (xasc NP 'n) 'n) (at (xasc NPO 'n) 'n))) -- true
+(all (== (at (xasc NP 'n) 'c) (at (xasc NPO 'n) 'c))) -- true
+(sum (at NP 'c)) -- 6000
