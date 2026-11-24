@@ -17,6 +17,7 @@ Rayfall's builtins are organised under dotted namespaces. Names beginning with `
 | [`.json.*`](json.md) | JSON text in and out: `parse`, `get` (one field of a string column), `format`. |
 | [`.ipc.*`](ipc.md) | Client IPC (TCP, moving to shared memory or RDMA when both sides can), the transport policy, and the server connection-hook accessor. |
 | [`.log.*`](log.md) | Write-ahead log: open, write, sync, snapshot, roll, replay, validate. |
+| [`.mc.*`](../storage/ipc.md#multicast) | Multicast topics: subscribe, unsubscribe, publish, stats. |
 | [`.mem.*`](mem.md) | Value sizing and scoped time/allocation measurement. |
 | [`.os.*`](os.md) | Process environment: `getenv`, `setenv`. |
 | [`.parquet.*`](parquet.md) | Parquet metadata, reads, lazy queries, callbacks, and native imports. |
@@ -32,6 +33,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.db.splayed.set`, `.db.parted.fill`
 - `.ipc.open`, `.ipc.close`, `.ipc.send`, `.ipc.post`, `.ipc.txlimit`, `.ipc.transport`
 - `.log.open`, `.log.posts`, `.log.replay`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge`
+- `.mc.pub`
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
 - `.repl.connect`, `.repl.disconnect`

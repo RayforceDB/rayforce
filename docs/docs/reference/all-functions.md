@@ -10,13 +10,13 @@
 
 | | | |
 |---|---|---|
-| [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
+| [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (8) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (21) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
-| [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (3) |
-| [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (15) |
-| [Serialization](#serialization) (5) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
+| [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (4) |
+| [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (17) |
+| [Serialization](#serialization) (5) | [Storage](#storage) (11) | [IPC](#ipc) (14) |
 | [EAV Triple Store](#eav) (5) | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) |
 
 The examples below use these small in-memory fixtures where a table is needed:
@@ -36,7 +36,7 @@ The examples below use these small in-memory fixtures where a table is needed:
 
 ## Registered Builtin Surface
 
-Generated from `src/lang/eval.c` in this checkout. The categorized reference below expands the most commonly used functions; this list is the complete registered name surface.
+Listed from `src/lang/eval.c` in this checkout. The categorized reference below expands the most commonly used functions; this list is the complete registered name surface. It is maintained by hand: a builtin registered in `eval.c` is added here, and `scripts/check-builtin-docs.py` fails when one is missing (see [CONTRIBUTING](https://github.com/RayforceDB/rayforce/blob/dev/CONTRIBUTING.md#documentation)).
 
 ### Unary
 
@@ -46,21 +46,22 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `read-bytes`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
-`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
+`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.cmd`, `.sys.listen`,
 `.sys.trust`, `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `.time.sleep`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `inv`, `flip`, `gram`, `.emb.hnsw.free`, `.emb.hnsw.get`, `.emb.hnsw.info`, `.emb.model.get`, `.emb.model.info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
-`.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
-`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`
+`.idx.drop`, `.idx.has?`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
+`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`,
+`.parquet.meta`, `.mc.unsub`, `.idx.uses`, `.repl.complete`, `.mem.objsize`
 
 ### Binary
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `quantile`, `percentile`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
-`rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
+`rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `.emb.cos-dist`, `.emb.inner-prod`, `.emb.l2-dist`, `.emb.tokens`, `mmu`, `lsq`, `.emb.hnsw.set`, `.attr.set`,
-`.col.link`
+`.col.link`, `identical`, `trunc`, `not-in`, `.mc.pub`
 
 ### Variadic / Special
 
@@ -68,8 +69,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `semi-mask`, `anti-mask`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
-`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
-`.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.ts`, `.sys.timeit`,
+`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
@@ -77,7 +78,9 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
-`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`, `.json.get`
+`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`, `.json.get`,
+`.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`, `.mc.sub`, `.mc.stats`,
+`while`, `times`, `.ipc.txlimit`, `.ipc.auto_journal_eval`
 
 ## Arithmetic
 
@@ -137,6 +140,7 @@ All comparison operators are **atomic** and return boolean results.
 | `==` | binary | atomic | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | atomic | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | — | Check which elements fall within an inclusive `[lo hi]` range | `(within [1 5 10] [3 7])` → `[false true false]` |
+| `identical` | binary | — | Whole-value equality: same type, shape and contents; returns one boolean | `(identical [1 2] [1 2])` → `true` |
 
 ```lisp
 ; Vector comparisons return boolean vectors
@@ -146,6 +150,8 @@ All comparison operators are **atomic** and return boolean results.
 ; within checks the inclusive range [lo, hi]
 (within [1 3 5 7] [3 6])  ; [false true true false]
 ```
+
+`==` and the other operators map over elements, so on two tables or lists they return an elementwise result, not one boolean. To ask whether two values are the same value, use `identical`; it compares type, shape and contents, so `(identical (list 1 2) [1 2])` is `false` and `(identical 1 1i)` is `false`. See [`identical`](../language/math.md).
 
 ## Logic
 
@@ -618,6 +624,7 @@ Temporal constructors. Pass `0` to get the current clock value. Cross-temporal c
 | `date` | unary | — | Current date, or extract date from timestamp | `(date 0)` → today's date |
 | `time` | unary | — | Current wall-clock time (millisecond resolution), or extract time from timestamp | `(time 0)` → current time |
 | `timestamp` | unary | — | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
+| `trunc` | binary | — | Floor a DATE, TIME or TIMESTAMP (atom or vector) to the start of the calendar or clock unit that holds it: `'year` `'quarter` `'month` `'week` `'day` `'hour` `'minute` `'second`. The result has the type of the second argument | `(trunc 'month 2024.05.17)` → `2024.05.01` |
 
 ```lisp
 ; Get current date/time
@@ -717,6 +724,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
 | `.sys.join.par.min` | variadic | restricted | Read or set the probe-side rows from which a hash join's probe goes parallel; returns the value in effect | `(.sys.join.par.min 65536)` |
 | `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
+| `.idx.uses` | unary | — | Per-column count of index hits since the previous call; the first call arms the counter. See [`.idx.uses`](../namespaces/idx.md#idx-uses) | `(.idx.uses t)` → `{a:1}` |
+| `.repl.complete` | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix. See [`.repl.complete`](../namespaces/repl.md#repl-complete) | `(.repl.complete "xas")` → `[xasc]` |
 
 ```lisp
 ; Metaprogramming: parse and eval
@@ -769,6 +778,12 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |
 | `.db.parted.fill` | variadic | restricted | Backfill missing tables across a parted db's partitions | `(.db.parted.fill "db")` |
+| `.parquet.meta` | unary | restricted | Column-chunk metadata table of a Parquet file; see [`.parquet.*`](../namespaces/parquet.md) | `(.parquet.meta "t.parquet")` |
+| `.parquet.read` | variadic | restricted | Read a Parquet file into a table; optional projection or options before the path | `(.parquet.read "t.parquet")` |
+| `.parquet.scan` | variadic | restricted | Reusable lazy `select` source over a Parquet file; optional options before the path | `(select {from: (.parquet.scan "t.parquet") where: (> x 0)})` |
+| `.parquet.each` | variadic | restricted | Deliver a Parquet file to a callback in chunks; returns the number of rows delivered | `(.parquet.each "t.parquet" (fn [chunk] ...))` |
+| `.parquet.splayed` | variadic | restricted | Import a Parquet file as a splayed table; returns the row count | `(.parquet.splayed "t.parquet" "db/t")` |
+| `.parquet.parted` | variadic | restricted | Import Parquet files into a partitioned table under a root; returns the row count | `(.parquet.parted "t.parquet" "db" 'trades)` |
 
 ```lisp
 ; Save and reload a splayed table
@@ -790,11 +805,15 @@ IPC for connecting to remote Rayforce instances. Uses binary serialization on th
 |---|---|---|---|---|
 | `.ipc.open` | variadic | restricted | Open a connection to host:port (optional connect timeout in ms, or an options dict with `timeout`, `compress`, `keepalive`, `transport`), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
-| `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
+| `.ipc.send` | variadic | restricted | Send a value over an IPC handle (sync request); optional third argument is a deadline in ms | `(.ipc.send h "(sum (til 100))")`, `(.ipc.send h "(sum (til 100))" 2000)` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's view (`inbound`, `transport`, `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
 | `.ipc.auto_journal_eval` | variadic | — | `true` while evaluating inside an auto-journaled IPC request (the request itself is the journal entry and `.log.write` refuses), `false` otherwise | `(if (.ipc.auto_journal_eval) null (.log.write x))` |
 | `.ipc.txlimit` | variadic | restricted | Transmit backlog policy: `()` reads the process default, `(bytes [frames])` sets it, `(h bytes frames)` overrides one connection; a frame that would exceed a connection's limit is refused and a multicast subscriber is dropped and closed | `(.ipc.txlimit 8388608 64)` |
 | `.ipc.transport` | variadic | restricted | Transport policy: `()` reads it, `('auto|'tcp|'shm|'rdma)` sets what this process offers as a server and asks for as a client (`auto`: shared memory on one host, RDMA across hosts, else TCP) | `(.ipc.transport 'tcp)` |
+| `.mc.sub` | variadic | — | Subscribe the calling connection to a multicast topic (symbol or string); the filter argument must be null. Returns the sequence number the next publication will carry. See [Multicast topics](../storage/ipc.md#multicast) | `(.ipc.send h (list '.mc.sub "depth" null))` |
+| `.mc.unsub` | unary | — | Remove the calling connection's subscription to a topic; null | `(.mc.unsub "depth")` |
+| `.mc.pub` | binary | restricted | Publish a payload to every subscriber of a topic as an async `(upd topic seq payload)`; returns the sequence number, or `0` when the topic has no subscribers | `(.mc.pub "depth" batch)` |
+| `.mc.stats` | variadic | — | Multicast counters as a dict: `topics`, `subscriptions`, `published`, `delivered`, `dropped`, `framed`, `tx_limit_bytes`, `tx_limit_frames`, `tx_hwm_bytes` | `(.mc.stats)` |
 | `.ipc.on.open` | hook | user-settable | Fires after inbound connection completes handshake; arg = handle | `(set .ipc.on.open (fn [h] ...))` |
 | `.ipc.on.close` | hook | user-settable | Fires once before an established connection is torn down, inbound or outbound, on any cause; arg = handle | `(set .ipc.on.close (fn [h] ...))` |
 | `.ipc.on.sync` | hook | user-settable | Intercepts sync messages; return value becomes the response | `(set .ipc.on.sync (fn [m] (eval (parse m))))` |

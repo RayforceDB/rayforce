@@ -681,6 +681,11 @@ cppcheck:
 
 .PHONY: tidy cppcheck
 
+# Every registered builtin is listed in the reference, and nothing else is.
+docs-check:
+	python3 scripts/check-builtin-docs.py
+.PHONY: docs-check
+
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)
 	-rm -f lib$(TARGET).so lib$(TARGET).dylib
