@@ -3157,8 +3157,10 @@ static test_result_t test_repl_cli_cores_reject_malformed(void) {
         { "-Q 0abc", "0abc" },
     };
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        char command[256], output[512];
-        int status;
+        /* set before the run: a popen that fails leaves both unwritten,
+         * and the failure message below prints them */
+        char command[256], output[512] = "";
+        int status = -1;
         snprintf(command, sizeof command,
                  "./rayforce %s </dev/null 2>&1", bad[i].args);
         int rc = run_cli_capture(command, output, sizeof(output), &status);
