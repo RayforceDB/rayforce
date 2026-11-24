@@ -1025,6 +1025,13 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     ray_col_meta_t m;
     return ray_table_col_meta(tbl, sym, &m);
 }
+
+/* Is `sym` the name `null`, which the evaluator reads as the null keyword
+ * before any binding (eval.c)?  By its text, as the evaluator compares it. */
+static bool query_sym_is_null_keyword(int64_t sym) {
+    ray_t* s = ray_sym_str(sym);
+    return s && ray_str_len(s) == 4 && memcmp(ray_str_ptr(s), "null", 4) == 0;
+}
 static bool agg_arg_is_list_col(ray_t* arg, ray_t* tbl);   /* defined below */
 static bool agg_reads_list_col(ray_t* expr, ray_t* tbl);    /* defined below */
 
@@ -2315,6 +2322,10 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
         }
+        /* `null` naming no column is the null keyword, as the evaluator
+         * reads it (#1483): no column, and no node here, so the evaluator
+         * answers it. */
+        if (query_sym_is_null_keyword(expr->i64)) return NULL;
         /* Unknown name — retain an explicit invalid-scan marker.  Optimizer
          * shortcuts may make the scan dead (count/max/projection paths), but
          * execution must still reject the original column reference. */
@@ -19226,7 +19237,9 @@ static bool key_names_binder(ray_t* e, ray_t* tbl) {
 static int64_t key_unknown_name(ray_t* e, ray_t* tbl) {
     if (!e) return -1;
     if (e->type == -RAY_SYM) {
-        if ((e->attrs & ATTR_QUOTED) || sym_names_col(tbl, e->i64)) return -1;
+        if ((e->attrs & ATTR_QUOTED) || sym_names_col(tbl, e->i64) ||
+            query_sym_is_null_keyword(e->i64))
+            return -1;
         return sym_binding(e->i64) ? -1 : e->i64;
     }
     if (e->type != RAY_LIST || e->len < 1) return -1;

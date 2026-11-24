@@ -106,7 +106,11 @@ as `r: (min (sum x))` still raises `domain` in a grouped select.
 
 A literal symbol inside a select resolves to an earlier alias or a source
 column of that name, in that order; one naming neither stays a constant
-symbol.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
+symbol. The bare name `null` is the null value inside a select, update,
+`where:`, `take:` or `by:` (a key expression too), as outside a query, unless
+the table has a column named `null`: `(if (> v 1) v null)` keeps each row's
+`v` above 1 and is null elsewhere, and `by: (if (> v 2) g null)` groups the
+rows at or below 2 under a null key.  Arithmetic on a symbol — a literal or a symbol column — is a `type`
 error inside a select, as it is outside.
 
 Equality (`==`) and inequality (`!=`) between a non-null symbol and a

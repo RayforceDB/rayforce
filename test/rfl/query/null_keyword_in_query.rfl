@@ -1,0 +1,32 @@
+;; `null` inside a select or update expression is the null keyword, as it
+;; is outside a query, unless the table has a column named null (#1483).
+(set T (table [g v] (list [a a b b c] [1 2 3 4 5])))
+;; projection, keyless and under where:, as update reads it
+(at (select {r: (if (> v 1) v null) from: T}) 'r) -- (list null 2 3 4 5)
+(at (select {r: (if (> v 1) v null) from: T}) 'r) -- (at (update {r: (if (> v 1) v null) from: T}) 'r)
+(at (select {r: (if (> v 1) v null) from: T where: (> v 2)}) 'r) -- [3 4 5]
+(at (select {r: (if (> v 3) v null) from: T where: (> v 2)}) 'r) -- (list null 4 5)
+(at (select {r: null from: T}) 'r) -- (list null null null null null)
+(at (select {r: (nil? null) from: T}) 'r) -- [true true true true true]
+(count (select {from: T where: (== v null)})) -- 0
+(count (select {from: T where: (nil? null)})) -- 5
+;; under by: and in an aggregate
+(value (select {r: (first (if (> v 1) v null)) from: T by: g})) -- (list [a b c] [2 3 5])
+(value (select {r: (count (if (> v 1) v null)) from: T by: g})) -- (list [a b c] [2 2 1])
+(at (update {r: (count (if (> v 1) v null)) from: T by: g}) 'r) -- [2 2 2 2 1]
+;; a column named null is the column
+(set N (table [g null] (list [a b] [7 8])))
+(at (select {r: (+ null 1) from: N}) 'r) -- [8 9]
+(at (update {r: (+ null 1) from: N}) 'r) -- [8 9]
+(at (select {r: (sum null) from: N by: g}) 'r) -- [7 8]
+;; a by: key expression, as the by-dict form of the same key groups it
+(value (select {n: (count v) from: T by: (if (> v 2) g null)})) -- (value (select {n: (count v) from: T by: {k: (if (> v 2) g null)}}))
+(value (select {n: (count v) from: T by: (if (> v 2) g null)})) -- (list [' b c] [2 2 1])
+(value (select {n: (sum v) from: T by: (if (> v 2) v null) where: (> v 1)})) -- (list [0Nl 3 4 5] [2 3 4 5])
+(value (select {n: (count v) from: T where: (nil? null) by: (if (nil? null) g v)})) -- (value (select {n: (count v) from: T by: g}))
+(value (select {n: (count v) from: T by: {k: (if (> v 2) g null) j: g}})) -- (list [' b c] [a b c] [2 2 1])
+;; take: and from: expressions
+(at (select {v: v from: T take: (if (nil? null) 2 3)}) 'v) -- [1 2]
+(count (select {v: v from: (if (nil? null) T N)})) -- 5
+;; a column named null is a by: key expression's column too
+(value (select {n: (count g) from: N by: (+ null 1)})) -- (list [8 9] [1 1])
