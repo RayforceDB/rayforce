@@ -287,6 +287,85 @@ static test_result_t test_tz_malformed(void) {
     PASS();
 }
 
+/* ---- The database built in ------------------------------------------------- */
+
+static ray_tz_t* builtin(const char* name) {
+    size_t n = 0;
+    const uint8_t* p = ray_tzdata_find(name, strlen(name), &n);
+    return p ? ray_tz_parse(p, n) : NULL;
+}
+
+/* Every zone of the index is found by its name, parses, and the index is in
+ * the order the lookup searches. */
+static test_result_t test_tzdata_every_zone_parses(void) {
+    TEST_ASSERT_TRUE(strlen(ray_tzdata_version) >= 5);
+    TEST_ASSERT_TRUE(ray_tzdata_count > 300);
+    for (int32_t i = 0; i < ray_tzdata_count; i++) {
+        const char* name = ray_tzdata_zones[i].name;
+        if (i) TEST_ASSERT_FMT(strcmp(ray_tzdata_zones[i - 1].name, name) < 0, "%s is out of order", name);
+        size_t n = 0;
+        const uint8_t* p = ray_tzdata_find(name, strlen(name), &n);
+        TEST_ASSERT_FMT(p == ray_tzdata_blob + ray_tzdata_zones[i].at && n == ray_tzdata_zones[i].len,
+                        "%s is not found by its name", name);
+        ray_tz_t* z = ray_tz_parse(p, n);
+        TEST_ASSERT_FMT(z != NULL, "%s does not parse", name);
+        for (int32_t k = 1; k < z->n; k++)
+            TEST_ASSERT_FMT(z->at[k - 1] < z->at[k], "%s: changes out of order", name);
+        ray_tz_free(z);
+    }
+    PASS();
+}
+
+static test_result_t test_tzdata_lookup(void) {
+    size_t n = 0, m = 0;
+    TEST_ASSERT_NULL(ray_tzdata_find("Mars/Olympus_Mons", 17, &n));
+    TEST_ASSERT_NULL(ray_tzdata_find("America/New_Yor", 15, &n));
+    TEST_ASSERT_NULL(ray_tzdata_find("America/New_York1", 17, &n));
+    TEST_ASSERT_NULL(ray_tzdata_find("../etc/passwd", 13, &n));
+    TEST_ASSERT_NULL(ray_tzdata_find("", 0, &n));
+    /* an old name is the same file as the zone it links to */
+    const uint8_t* a = ray_tzdata_find("America/New_York", 16, &n);
+    const uint8_t* b = ray_tzdata_find("US/Eastern", 10, &m);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_TRUE(a == b && n == m);
+    PASS();
+}
+
+/* Offsets no release of the database has changed, read from the real zones. */
+static test_result_t test_tzdata_known_offsets(void) {
+    ray_tz_t* z = builtin("America/New_York");
+    TEST_ASSERT_NOT_NULL(z);
+    TEST_ASSERT_EQ_I(off_at(z, -4733510400LL, 0), -17762);   /* 1850.01.01, local mean time */
+    TEST_ASSERT_EQ_I(off_at(z, -3155673600LL, 0), -18000);   /* 1900.01.01, standard time since 1883 */
+    TEST_ASSERT_EQ_I(off_at(z, 763369200, -1), -18000);      /* 2024.03.10D07:00 */
+    TEST_ASSERT_EQ_I(off_at(z, 763369200, 0), -14400);
+    TEST_ASSERT_EQ_I(off_at(z, 783928800, -1), -14400);      /* 2024.11.03D06:00 */
+    TEST_ASSERT_EQ_I(off_at(z, 783928800, 0), -18000);
+    ray_tz_free(z);
+
+    static const struct { const char* name; int64_t jan, jul; } zones[] = {   /* 2024.01.01, 2024.07.01 */
+        { "UTC",                 0,     0     },
+        { "Etc/GMT+5",           -18000, -18000 },
+        { "Asia/Kolkata",        19800, 19800 },
+        { "Asia/Kathmandu",      20700, 20700 },   /* a quarter-hour zone */
+        { "Europe/London",       0,     3600  },
+        { "Europe/Dublin",       0,     3600  },   /* its rule has winter as the DST */
+        { "Australia/Sydney",    39600, 36000 },
+        { "Australia/Lord_Howe", 39600, 37800 },   /* DST of half an hour */
+        { "America/Sao_Paulo",   -10800, -10800 },
+    };
+    for (size_t i = 0; i < sizeof(zones) / sizeof(zones[0]); i++) {
+        z = builtin(zones[i].name);
+        TEST_ASSERT_FMT(z != NULL, "%s is not built in", zones[i].name);
+        TEST_ASSERT_FMT(off_at(z, 757382400, 0) == zones[i].jan, "%s in January: %lld", zones[i].name,
+                        (long long)off_at(z, 757382400, 0));
+        TEST_ASSERT_FMT(off_at(z, 773107200, 0) == zones[i].jul, "%s in July: %lld", zones[i].name,
+                        (long long)off_at(z, 773107200, 0));
+        ray_tz_free(z);
+    }
+    PASS();
+}
+
 const test_entry_t tz_entries[] = {
     { "tz/name",                 test_tz_name,                 NULL,     NULL },
     { "tz/listed_changes",       test_tz_listed_changes,       tz_setup, tz_teardown },
@@ -296,5 +375,8 @@ const test_entry_t tz_entries[] = {
     { "tz/julian_rules",         test_tz_julian_rules,         tz_setup, tz_teardown },
     { "tz/out_of_range_changes", test_tz_out_of_range_changes, tz_setup, tz_teardown },
     { "tz/malformed",            test_tz_malformed,            tz_setup, tz_teardown },
+    { "tz/data/every_zone_parses", test_tzdata_every_zone_parses, tz_setup, tz_teardown },
+    { "tz/data/lookup",          test_tzdata_lookup,           NULL,     NULL },
+    { "tz/data/known_offsets",   test_tzdata_known_offsets,    tz_setup, tz_teardown },
     { NULL, NULL, NULL, NULL },
 };

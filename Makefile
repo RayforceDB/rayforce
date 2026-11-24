@@ -666,6 +666,12 @@ cppcheck:
 
 .PHONY: tidy cppcheck
 
+# The built-in time zone database, regenerated once a release from the newest
+# IANA archive (needs python3 and zic):  make tzdata TZDATA=tzdata2026f.tar.gz
+tzdata:
+	@test -n "$(TZDATA)" || { echo "usage: make tzdata TZDATA=path/to/tzdataYYYYx.tar.gz"; exit 2; }
+	python3 scripts/gen-tzdata.py $(TZDATA) -o src/core/tzdata.c
+
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)
 	-rm -f lib$(TARGET).so lib$(TARGET).dylib
@@ -687,7 +693,7 @@ clean:
 	-rm -f cov-*.profraw default.profraw coverage.profdata
 	-rm -rf coverage_html
 
-.PHONY: check-wasm32-layout default debug release lib shared dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck clean
+.PHONY: check-wasm32-layout default debug release lib shared dist install-headers test test-full test-full-bin test-ndebug test-release test-large coverage compdb tsan tsan-test hardened fuzz-smoke tidy cppcheck tzdata clean
 
 # Header dependencies last: .d fragments only add prerequisites to the
 # object targets above, and being last they can't hijack the default goal.

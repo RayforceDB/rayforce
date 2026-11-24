@@ -338,3 +338,21 @@ done:
 }
 
 void ray_tz_free(ray_tz_t* z) { ray_sys_free(z); }
+
+const uint8_t* ray_tzdata_find(const char* name, size_t len, size_t* out_len) {
+    char key[65];
+    if (!ray_tz_name_ok(name, len)) return NULL;   /* which also bounds len to the key */
+    memcpy(key, name, len);
+    key[len] = '\0';
+    int32_t lo = 0, hi = ray_tzdata_count;
+    while (lo < hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        int c = strcmp(key, ray_tzdata_zones[mid].name);
+        if (c == 0) {
+            *out_len = ray_tzdata_zones[mid].len;
+            return ray_tzdata_blob + ray_tzdata_zones[mid].at;
+        }
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    return NULL;
+}

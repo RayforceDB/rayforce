@@ -67,4 +67,20 @@ static inline int32_t ray_tz_find(const ray_tz_t* z, int64_t ts) {
     return lo;
 }
 
+/* ---- The database built in (src/core/tzdata.c, generated) ----------------- */
+
+typedef struct {
+    const char* name;
+    uint32_t    at, len;   /* the zone's TZif file is ray_tzdata_blob[at .. at + len) */
+} ray_tzdata_zone_t;
+
+extern const char              ray_tzdata_version[];   /* the IANA release, "2026f" */
+extern const int32_t           ray_tzdata_count;
+extern const ray_tzdata_zone_t ray_tzdata_zones[];     /* sorted by name, strcmp order */
+extern const uint8_t           ray_tzdata_blob[];
+
+/* The built-in TZif file of zone `name` and its length, NULL when the
+ * database has no zone of that name. */
+const uint8_t* ray_tzdata_find(const char* name, size_t len, size_t* out_len);
+
 #endif /* RAY_CORE_TZ_H */
