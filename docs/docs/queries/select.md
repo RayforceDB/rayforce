@@ -379,15 +379,21 @@ expression over columns, gives one value per row, and each group aggregates
 its own rows. An argument that reads no column follows one of two rules,
 depending on whether it is written as a value or computed.
 
-A keyless select gives `first` and `last` the argument `by:` gives its one
+A keyless select gives every aggregate the argument `by:` gives its one
 group, whichever route evaluates it: builtin calls over the columns, such as
-`(first (at s (til 4)))` or `(first (except s 'b))`, are evaluated over the
-whole column and their error is the query's (`(last (if c s d))` with SYM
+`(first (at s (til 4)))`, `(sum (at c (til 4)))` or `(count (except s 'b))`,
+and calls of a lambda the planner does not inline, which gets the column,
+are evaluated over the whole column and their error is the query's (`(last (if c s d))` with SYM
 and DATE arms raises `if: branches mix SYM and DATE`); over an empty
 `where:` the answer is the null of the argument's type, `0Nd` for a DATE
 lambda, `0x00` for U8; and an answer that is a collection, such as the cell
 of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
-`(list (list 1))`.
+`(list (list 1))`. Not yet settled: `fold`, and `at` with a constant index (one
+written in place, or under a `where:` any index that reads no column), read
+the whole column under `by:`, and whether they read the rows a `where:` keeps
+is an open question (#1429). Keyless, aggregates other than `first` and
+`last` of such an argument are evaluated as before: `(sum (at c [3 2 1 0]))`
+is a `type` error there.
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a

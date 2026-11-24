@@ -15352,15 +15352,60 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
     ray_t** es = (ray_t**)ray_data(e);
     if (!rw_if_kind(e, tbl)) {
         ray_t* h = es[0];
+        /* a lambda the planner does not inline, written or global: called
+         * once over the rows, as by: calls it over a group's (#1401) */
+        if (h && h->type == RAY_LIST && h->len >= 1 && ((ray_t**)ray_data(h))[0] &&
+            ((ray_t**)ray_data(h))[0]->type == -RAY_SYM &&
+            ((ray_t**)ray_data(h))[0]->i64 == ray_sym_intern("fn", 2)) {
+            for (int64_t i = 1; i < e->len; i++)
+                if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
+            return true;
+        }
         if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
             tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
         ray_t* fn = ray_env_get(h->i64);
+        if (fn && fn->type == RAY_LAMBDA) {
+            for (int64_t i = 1; i < e->len; i++)
+                if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
+            return true;
+        }
         if (!fn || RAY_IS_ERR(fn) || fn->type < RAY_UNARY || fn->type > RAY_VARY ||
             (fn->attrs & RAY_FN_SPECIAL_FORM)) return false;
     }
     for (int64_t i = 1; i < e->len; i++)
         if (!scalar_edge_src_builtin(es[i], tbl, depth + 1)) return false;
     return true;
+}
+
+/* Does `e` read a column whole the way #1429 asks about: a call of fold,
+ * or of at with a constant index -- one written in place, or, under a
+ * where: (`filtered`), any index that reads no column?  Lambda and quoted
+ * bodies are not entered. */
+static bool src_reads_whole_1429(ray_t* e, ray_t* tbl, bool filtered, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 32) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && !tbl_has_col(tbl, h->i64) &&
+        !ray_env_has_lexical_local(h->i64)) {
+        ray_t* fn = ray_env_get(h->i64);
+        bool builtin = fn && fn->type >= RAY_UNARY && fn->type <= RAY_VARY;
+        ray_t* hs = ray_sym_str(h->i64);
+        size_t hl = hs ? ray_str_len(hs) : 0;
+        const char* hp = hs ? ray_str_ptr(hs) : "";
+        if (builtin && hl == 4 && memcmp(hp, "fold", 4) == 0) return true;
+        if (builtin && hl == 2 && memcmp(hp, "at", 2) == 0 && e->len == 3) {
+            ray_t* ix = es[2];
+            bool literal = ix && ((ix->type < 0 && ix->type != -RAY_SYM) ||
+                                  (ix->type > 0 && ix->type != RAY_LIST));
+            if (literal || (filtered && ix && expr_reads_no_column(ix, tbl))) return true;
+        }
+        if (h->i64 == ray_sym_intern("fn", 2)) return false;   /* a lambda's body */
+    }
+    /* the arguments, of a lambda written in place too (its head is not
+     * entered) */
+    for (int64_t i = 1; i < e->len; i++)
+        if (src_reads_whole_1429(es[i], tbl, filtered, depth + 1)) return true;
+    return false;
 }
 
 /* first/last's argument over the rows in one pass, where the answer is the
@@ -15379,7 +15424,7 @@ static bool scalar_edge_src_builtin(ray_t* e, ray_t* tbl, int depth) {
  * no rows `(first (count d))` is the null the compiled route gives.  Over
  * rows text stays one value, as first takes its first character: `(first
  * (format "%" c))` is "[".  NULL leaves the argument to the per-row pass. */
-static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
+static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows, bool spread) {
     bool elementwise = scalar_edge_src_vectorizes(e, tbl, 0);
     if (!elementwise && !(scalar_edge_src_builtin(e, tbl, 0) && query_expr_effect_free(e)))
         return NULL;
@@ -15405,7 +15450,11 @@ static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows) {
         ray_release(src);
         return NULL;
     }
-    if (ray_is_atom(src) && (src->type != -RAY_STR || nrows == 0)) src = scalar_atom_rows(src, nrows);
+    /* first/last: a scalar stands for every row.  Any other aggregate
+     * folds the one value the source gave, as by: folds it for a group:
+     * (sum (h v)) with h giving (count v) is that count, not count times
+     * the rows (#1401). */
+    if (spread && ray_is_atom(src) && (src->type != -RAY_STR || nrows == 0)) src = scalar_atom_rows(src, nrows);
     return src;
 }
 
@@ -15561,24 +15610,37 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
                 src = scalar_atom_rows(src, nrows);
         }
         else {
-            /* first/last of a builtin-call source: its column in one
-             * vectorized pass (an `if` blended per row), not one eval per
-             * row (scalar_edge_src_whole).  Anything else runs per row.
+            /* A builtin-call or lambda-call source: its column in one
+             * pass (an `if` blended per row), not one eval per row
+             * (scalar_edge_src_whole), for every aggregate, as by: gives a
+             * group its rows (#1401, #1402).  Anything else runs per row.
              * A vector written as a value that elementwise calls read row
              * by row stands for a column of the table it was written
              * against, as by: and the compiled route read it: `(+ c GI)`
              * is evaluated over the rows before the where:, which then
              * keeps its rows (expr_vconst_on_rows).  Over a parted table it
              * runs per row, as before. */
-            bool vconst = edge && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
+            /* fold, and at with a constant index, read the whole column
+             * under by:; whether they read the rows a where: keeps is the
+             * open question of #1429.  Such a source keeps the path it had
+             * before #1401 (first/last over the column, any other aggregate
+             * per row), so no answer of it moves until that is decided.  A
+             * computed index without a where: reads every row on either
+             * reading: (sum (at c (til 4))) is #1402's. */
+            bool open1429 = !edge && src_reads_whole_1429(agg_src_expr, tbl, sel != NULL, 0);
+            bool vconst = (edge || !open1429) && sel && expr_holds_vector_const(agg_src_expr, tbl) &&
                           expr_vconst_on_rows(agg_src_expr, tbl, true, 0);
             if (vconst) {
                 if (src_tbl) {
                     int64_t sn = ray_table_nrows(src_tbl);
-                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn);
+                    src = scalar_edge_src_whole(agg_src_expr, src_tbl, sn, edge);
                     if (src) src = scalar_edge_keep_rows(src, sn, sel);
                 }
-            } else if (edge) src = scalar_edge_src_whole(agg_src_expr, tbl, nrows);
+            } else if (edge || (!open1429 && !expr_contains_call_named(agg_src_expr, "enlist", 6))) {
+                /* enlist stays the per-row constructor it is in a query,
+                 * under by: too: (count (enlist x)) counts the rows */
+                src = scalar_edge_src_whole(agg_src_expr, tbl, nrows, edge);
+            }
             if (!src) src = rw_if_mix_err(agg_src_expr, tbl);
             if (!src) {
                 src = eval_expr_per_row_impl(agg_src_expr, tbl, nrows);
