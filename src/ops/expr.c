@@ -5212,8 +5212,18 @@ ray_t* exec_elementwise_unary(ray_graph_t* g, ray_op_t* op, ray_t* input) {
                 }
             }
         } else if (it == RAY_I64) {
-            /* Narrowing I64 → I32/I16/U8/BOOL: truncate. */
-            if (ot == RAY_I32) {
+            /* Narrowing I64 → I32/I16/U8/BOOL: truncate.  An I64 input to F64
+             * took the branch above, but a TIMESTAMP one arrives here; with no
+             * F64 arm it left the result unwritten (#1573). */
+            if (ot == RAY_F64) {
+                while (ray_morsel_next(&m)) {
+                    int64_t n = m.morsel_len;
+                    int64_t* src = (int64_t*)m.morsel_ptr;
+                    double* dst = (double*)ray_data(result) + out_off;
+                    for (int64_t i = 0; i < n; i++) dst[i] = (double)src[i];
+                    out_off += n;
+                }
+            } else if (ot == RAY_I32) {
                 while (ray_morsel_next(&m)) {
                     int64_t n = m.morsel_len;
                     int64_t* src = (int64_t*)m.morsel_ptr;

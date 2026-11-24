@@ -2787,13 +2787,19 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             if (tgt < 0) return NULL;
             ray_op_t* col = compile_expr_dag(g, elems[2]);
             if (!col) return NULL;
-            /* SYM lanes store intern IDs, not numeric values. Let eager as
-             * decide the cast instead of exposing the storage representation. */
-            if (col->out_type == RAY_SYM) return NULL;
-            /* Nor is a LIST a lane of values: eager as casts the list as a
-             * whole, a typed vector of its cells (#1400), where the DAG cast
-             * refused it or mapped over the cells (#1406). */
-            if (col->out_type == RAY_LIST) return NULL;
+            /* The DAG cast reads fixed-width numeric and temporal lanes
+             * (TIMESPAN hands its input to eager as).  Any other input, such
+             * as SYM intern ids, STR or GUID storage, or a LIST of cells
+             * (#1406), is left to eager as, which parses, casts as a whole
+             * or raises (#1573); reading it as lanes gave garbage. */
+            switch (col->out_type) {
+            case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+            case RAY_F32: case RAY_F64:
+            case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+                break;
+            default:
+                return NULL;
+            }
             if (quoted_call) {
                 int8_t it = col->out_type;
                 if (it != RAY_BOOL && it != RAY_U8 && it != RAY_I16 && it != RAY_I32 &&
