@@ -1,0 +1,27 @@
+;; #1024: a batch insert into a table's SYM column flags it as holding nulls
+;; only when an inserted cell is null.  The in-place same-type append set
+;; HAS_NULLS whenever the payload might have nulls, which every SYM vector
+;; might, so ser of equal null-free data depended on how the rows arrived.
+(set mk (fn [a b] (as 'table (dict [a b] (list a b)))))
+(set fl (fn [t] (at (ser (at t 'a)) 17)))
+(fl (mk [SRC SRC SRC] [0 1 2])) -- 0x00
+;; a table, a list of columns and rows, in place
+(set j (mk [SRC] [0]))
+(insert 'j (mk [SRC SRC] [1 2]))
+(fl j) -- 0x00
+(ser j) -- (ser (mk [SRC SRC SRC] [0 1 2]))
+(set j (mk [SRC] [0]))
+(insert 'j (list (take [SRC] 2) [1 2]))
+(fl j) -- 0x00
+(ser j) -- (ser (mk [SRC SRC SRC] [0 1 2]))
+(set j (mk [SRC] [0]))
+(insert 'j (list 'SRC 1))
+(insert 'j (list 'SRC 2))
+(ser j) -- (ser (mk [SRC SRC SRC] [0 1 2]))
+;; and not in place
+(ser (insert (mk [SRC] [0]) (mk [SRC SRC] [1 2]))) -- (ser (mk [SRC SRC SRC] [0 1 2]))
+;; a null cell still flags the column
+(set j (mk [SRC] [0]))
+(insert 'j (mk [SRC '] [1 2]))
+(fl j) -- 0x40
+(nil? (at j 'a)) -- [false false true]
