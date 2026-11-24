@@ -738,7 +738,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `ser` | unary | — | Serialize any value to binary format (byte vector) | `(ser [1 2 3])` |
+| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
 | `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |

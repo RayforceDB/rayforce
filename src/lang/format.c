@@ -21,6 +21,7 @@
  *   SOFTWARE.
  */
 
+#include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "ops/colgather.h"   /* fmt_enc_window: the shown rows of an encoded column */
 #include "core/timespan.h"
 #include "lang/format.h"
@@ -1856,7 +1857,22 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
 
 /* ===== Core dispatch ===== */
 
+/* The value formatters recurse once per level of nesting (a list in a
+ * list...), and a value can be nested arbitrarily deep at run time.  They
+ * stop with a limit error at the thread's stack reserve (#1591), whatever
+ * a level costs in this build; a format already failed writes no more. */
+static bool fmt_too_deep(fmt_buf_t* b) {
+    if (b->err) return true;
+    if (RAY_LIKELY(!ray_stack_short())) return false;
+    b->err = true;
+    b->err_msg = "format";
+    snprintf(b->cause_code, sizeof b->cause_code, "limit");
+    snprintf(b->cause_msg, sizeof b->cause_msg, "value nested too deep for this thread's stack");
+    return true;
+}
+
 static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
+    if (fmt_too_deep(b)) return;
     if (!obj || RAY_IS_NULL(obj)) { fmt_puts(b, "null"); return; } /* keep !obj: ray_fmt(NULL) is a public entry point, receives genuine-absence C NULL, not a value; also renders list/dict elements, which may be C NULL */
     if (RAY_IS_ERR(obj)) {
         if (mode == RAY_FMT_ROUNDTRIP) {
@@ -2023,6 +2039,7 @@ static void fmt_pp_list_broken(fmt_buf_t* b, ray_t* list, int indent) {
 }
 
 static void fmt_pp(fmt_buf_t* b, ray_t* obj, int indent) {
+    if (fmt_too_deep(b)) return;
     /* Only dicts and generic lists participate in width-triggered breaking;
      * everything else renders exactly as REPL mode 1. */
     if (!obj || RAY_IS_ERR(obj) ||

@@ -93,6 +93,11 @@ void ray_lang_print(FILE* fp, ray_t* val) {
         return;
     }
     if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
+    /* A list prints its cells through here again: one frame per level of
+     * nesting, and a value can be nested arbitrarily deep (#1591).  This
+     * writes to a stream and has no error to give, so past the thread's
+     * stack reserve the rest of the value prints as "...". */
+    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { fputs("...", fp); return; }
     /* STR/SYM use their empty literals as canonical null spellings. */
     if (val->type != -RAY_STR && val->type != -RAY_SYM &&
         RAY_ATOM_IS_NULL(val)) {
@@ -1619,6 +1624,10 @@ ray_t* cast_str_list(ray_t* type_sym, ray_t* val) {
 }
 
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
+    /* A list is cast cell by cell through here: one frame per level of
+     * nesting, and a value can be nested arbitrarily deep (#1591). */
+    if (val && !RAY_IS_ERR(val) && val->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "as: value nested too deep for this thread's stack");
     if (type_sym->type != -RAY_SYM) return ray_error("type", "as: target type must be sym, got %s", ray_type_name(type_sym->type));
     /* Nullable targets preserve nulls; BOOL/U8 produce ordinary values. */
     if (ray_is_atom(val) && RAY_ATOM_IS_NULL(val)) {
@@ -3251,7 +3260,24 @@ static inline uint64_t hash_i64(int64_t v) {
  * the existing path is degenerate for composite multi-key composites.
  * Uses the canonical wyhash helpers from ops/hash.h, same as the
  * pivot / datalog / join hashers. */
-uint64_t ray_atom_hash(ray_t* a) {
+/* The hash recurses once per level of nesting through lists, tables and
+ * dicts, and a value can be nested arbitrarily deep at run time (#1591):
+ * past ATOM_HASH_DEPTH levels a container hashes by its type and length
+ * alone.  The bound is a depth, not the stack, so values atom_eq calls
+ * equal still hash equal wherever they are hashed. */
+#define ATOM_HASH_DEPTH 128
+static uint64_t atom_hash_d(ray_t* a, int depth);
+uint64_t ray_atom_hash(ray_t* a) { return atom_hash_d(a, 0); }
+/* A dict's keys or values, or a table's column, at depth + 1: a typed
+ * vector hashes by its type and length (atom_hash_d's default arm), here
+ * without a call. */
+static inline uint64_t atom_hash_part(ray_t* p, int depth) {
+    if (p && !RAY_IS_NULL(p) && p->type > 0 && p->type != RAY_LIST &&
+        p->type != RAY_TABLE && p->type != RAY_DICT)
+        return ray_hash_i64(((int64_t)p->type << 32) ^ (int64_t)p->len);
+    return atom_hash_d(p, depth + 1);
+}
+static uint64_t atom_hash_d(ray_t* a, int depth) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -3272,31 +3298,34 @@ uint64_t ray_atom_hash(ray_t* a) {
         case -RAY_STR:
             return ray_hash_bytes(ray_str_ptr(a), ray_str_len(a));
         case RAY_LIST: {
+            if (RAY_UNLIKELY(depth >= ATOM_HASH_DEPTH)) goto too_deep;
             int64_t n = a->len;
             ray_t** elems = (ray_t**)ray_data(a);
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
             for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, ray_atom_hash(elems[i]));
+                h = ray_hash_combine(h, atom_hash_d(elems[i], depth + 1));
             return h;
         }
         case RAY_TABLE: {
             /* atom_eq: same names in order, equal columns.  Hashing them
              * only spreads the buckets: the default arm's type and length
              * would put every table of one length in one bucket. */
+            if (RAY_UNLIKELY(depth >= ATOM_HASH_DEPTH)) goto too_deep;
             int64_t nc = ray_table_ncols(a);
             uint64_t h = ray_hash_i64(nc);
             for (int64_t c = 0; c < nc; c++) {
                 h = ray_hash_combine(h, ray_hash_i64(ray_table_col_name(a, c)));
                 ray_t* col = ray_table_col_idx(a, c);
                 if (col && RAY_IS_ERR(col)) { ray_error_free(col); col = NULL; }   /* hashes as absent */
-                h = ray_hash_combine(h, ray_atom_hash(col));
+                h = ray_hash_combine(h, atom_hash_part(col, depth));
             }
             return h;
         }
         case RAY_DICT:
-            return ray_hash_combine(ray_atom_hash(ray_dict_keys(a)),
-                                    ray_atom_hash(ray_dict_vals(a)));
+            if (RAY_UNLIKELY(depth >= ATOM_HASH_DEPTH)) goto too_deep;
+            return ray_hash_combine(atom_hash_part(ray_dict_keys(a), depth),
+                                    atom_hash_part(ray_dict_vals(a), depth));
         default:
             /* Vec or unknown atom kind: fold type tag and length.  Two
              * structurally-equal lists, tables or dicts never reach here
@@ -3305,6 +3334,8 @@ uint64_t ray_atom_hash(ray_t* a) {
              * pairs. */
             return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
     }
+too_deep:   /* past ATOM_HASH_DEPTH: a container hashes by its type and length */
+    return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
 }
 
 /* Context for GUID rehash: the 16-byte source base and, indirectly,
