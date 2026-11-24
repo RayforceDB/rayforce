@@ -498,15 +498,20 @@ static test_result_t test_derived_key_per_symbol_route(void) {
          * over the selected rows */
         { "(select {from: TU by: (substr u 0 2) c: (count v)})", 0 },
         { "(select {from: TU by: (substr u 0 2) c: (count v) where: (== w 0)})", 1 },
-        /* a selection below the row floor keeps the row path */
-        { "(select {from: TU by: (substr u 0 2) c: (count v) where: (and (== w 0) (< v 2))})", 0 },
+        /* a selection of a few rows is evaluated per value too: that many
+         * values cost nothing, the row-wise key would run over every row */
+        { "(select {from: TU by: (substr u 0 2) c: (count v) where: (and (== w 0) (< v 2))})", 1 },
+        /* the by-dict forms, with a second computed key and a count distinct */
+        { "(select {from: T by: {k: (substr s 0 2)} c: (count v)})", 1 },
+        { "(select {from: T by: {k: (substr s 0 2) m: (> v 3)} c: (count v) u: (count (distinct v)) where: (> v 1)})", 1 },
     };
     for (size_t c = 0; c < sizeof(cases)/sizeof(cases[0]); c++) {
         agg_route_reset();
         ray_t* out = ray_eval_str(cases[c].q);
         TEST_ASSERT_NOT_NULL(out); TEST_ASSERT_FALSE(RAY_IS_ERR(out));
         ray_release(out);
-        TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, cases[c].evals);
+        TEST_ASSERT_FMT(agg_route_stats().key_domain_evals == cases[c].evals, "%s: %llu per-value evaluations",
+                        cases[c].q, (unsigned long long)agg_route_stats().key_domain_evals);
     }
     /* A user lambda shadowing `substr` is what the compiled key would call. */
     r = ray_eval_str("(set substr (fn [x a b] x))");

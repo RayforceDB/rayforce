@@ -533,3 +533,39 @@
 (count RYW) -- 3
 (all (== (FY RYW) (FY OYW))) -- true
 (asc (as 'STR (at RYW 'k))) -- (asc (as 'STR (distinct (trim (at sy (where (!= sy "")))))))
+
+;; ── a SYM column in a splayed table whose symfile is shared with a wide
+;; column ─────────────────────────────────────────────────────────────────
+;; The per-symbol evaluation works over the ids present in the column, so a
+;; symfile of hundreds of thousands of URL entries beside eight charsets
+;; costs it nothing; the by-dict forms (one computed key, two keys with a
+;; count distinct) take it too.  Oracle: the keys as projected columns.
+(.sys.exec "rm -rf /tmp/rfl_dkey_symfile")
+(set NZ 200000)
+(set iz (til NZ))
+(set csz (as 'SYMBOL ["windows-1251" "utf-8" "UTF-8" " koi8-r" "" "iso-8859-1" "windows-1252 " "cp866"]))
+(set pcz (at csz (% (+ (* 4 (div iz 7)) iz) 8)))
+(set uz (% (* iz 31) 977))
+(.db.splayed.set "/tmp/rfl_dkey_symfile/urls/" (table [URL] (list (as 'SYM (concat "http://u/" (as 'STR (til 300000)))))) "/tmp/rfl_dkey_symfile/.sym")
+(.db.splayed.set "/tmp/rfl_dkey_symfile/hits/" (table [UserID PageCharset URL] (list uz pcz (as 'SYM (concat "http://x/" (as 'STR iz))))) "/tmp/rfl_dkey_symfile/.sym")
+(set HZ (.db.splayed.get "/tmp/rfl_dkey_symfile/hits/" "/tmp/rfl_dkey_symfile/.sym"))
+(count HZ) -- 200000
+(set tuz (at (select {from: HZ by: UserID c: (count UserID) desc: c asc: UserID take: 50}) 'UserID))
+(set FZ1 (fn [r k] (ser (xasc (table [k c] (list (as 'STR (at r k)) (at r 'c))) 'k))))
+(set Z1 (select {from: HZ by: {cn: (upper (trim PageCharset))} c: (count UserID) where: (!= PageCharset "")}))
+(set Z1O (select {from: (select {from: HZ k: (upper (trim PageCharset)) UserID: UserID where: (!= PageCharset "")}) by: k c: (count UserID)}))
+(count Z1) -- 6
+(all (== (FZ1 Z1 'cn) (FZ1 Z1O 'k))) -- true
+(as 'STR (at Z1 'cn)) -- (as 'STR (distinct (upper (trim (at (at HZ 'PageCharset) (where (!= (at HZ 'PageCharset) "")))))))
+(set Z1S (select {from: HZ by: (upper (trim PageCharset)) c: (count UserID) where: (!= PageCharset "")}))
+(all (== (FZ1 Z1 'cn) (FZ1 Z1S (first (key Z1S))))) -- true
+(set FZ2 (fn [r k] (ser (xasc (xasc (table [k p c u] (list (as 'STR (at r k)) (at r 'p) (at r 'c) (at r 'u))) 'p) 'k))))
+(set Z2 (select {from: HZ by: {cn: (upper (trim PageCharset)) p: (if (in UserID tuz) 1 0)} c: (count UserID) u: (count (distinct UserID)) where: (!= PageCharset "")}))
+(set Z2O (select {from: (select {from: HZ k: (upper (trim PageCharset)) p: (if (in UserID tuz) 1 0) UserID: UserID where: (!= PageCharset "")}) by: [k p] c: (count UserID) u: (count (distinct UserID))}))
+(count Z2) -- 12
+(all (== (FZ2 Z2 'cn) (FZ2 Z2O 'k))) -- true
+(sum (at Z2 'c)) -- (count (where (!= (at HZ 'PageCharset) "")))
+(set Z3 (select {from: HZ by: {cn: (upper (trim PageCharset))} u: (count (distinct UserID)) where: (!= PageCharset "")}))
+(set Z3O (select {from: (select {from: HZ k: (upper (trim PageCharset)) UserID: UserID where: (!= PageCharset "")}) by: k u: (count (distinct UserID))}))
+(all (== (ser (xasc (table [k u] (list (as 'STR (at Z3 'cn)) (at Z3 'u))) 'k)) (ser (xasc (table [k u] (list (as 'STR (at Z3O 'k)) (at Z3O 'u))) 'k)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_symfile") -- 0
