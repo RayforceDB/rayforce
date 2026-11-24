@@ -1,0 +1,60 @@
+;; raze is the left fold of concat, (concat ... (concat (concat l0 l1) l2) ...),
+;; computed in one pass per stretch instead of copying the result at every
+;; item (#1656).  Every answer, type, flags and float null bits included, is
+;; that of the fold: compared here through ser against (fold concat l).
+(set same (fn [l] (identical (ser (raze l)) (ser (fold concat l)))))
+(set b (ser [1.5 2.5]))
+(set x (de (concat (take b 26) (concat [0x01 0x00 0x00 0x00 0x00 0x00 0xf8 0x7f] (drop b 34)))))
+(set b2 (ser [1.5 0Nf]))
+(set y (de (concat (take b2 26) (concat [0x01 0x00 0x00 0x00 0x00 0x00 0xf8 0x7f] (drop b2 34)))))
+(set g (as 'GUID "00000000-0000-0000-0000-000000000001"))
+(set sl (drop (til 10) 3))
+
+;; numbers, with and without nulls, atoms and vectors in any order
+(same (list 1 2 3 4 5 6)) -- true
+(same (list 0N 1 2 0N 3)) -- true
+(same (list [1 2] [3 4] [5 6] [7] [8])) -- true
+(same (list [1 0N] [2 3] [4] [5] [6 0N])) -- true
+(same (list [1 2] 3 [0N 4] 5 [6] 0N)) -- true
+(same (list 1 [2 3] 4 [5 0N] 6)) -- true
+(same (list 1.5 0Nf [2.5] [0Nf 3.5] 4.5)) -- true
+(same (list [true false] true [false] true false)) -- true
+(same (list (as 'U8 [1 2]) (as 'U8 [3]) (as 'U8 [4]) (as 'U8 [5]) (as 'U8 [6]))) -- true
+(same (list (as 'F32 [1 2]) (as 'F32 1.5) (as 'F32 [3]) (as 'F32 [4]) (as 'F32 2.5))) -- true
+(same (list 2024.01.01 [2024.01.02] 2024.01.03 [2024.01.04] 2024.01.05)) -- true
+(same (list g (enlist g) g g (enlist g))) -- true
+;; float nulls: a NaN with another payload keeps or loses its bits as concat
+;; leaves them, with the null flag on or off
+(same (list x [1.5] 0Nf [2.5] x [0Nf])) -- true
+(same (list x x x [0Nf] x)) -- true
+(same (list y 1.5 x [2.5] x)) -- true
+(same (list 1.5 x [0Nf] x 2.5)) -- true
+(same (list [1.5] x 0Nf x [2.5])) -- true
+;; symbols: vectors, atoms, the null symbol
+(same (list ['a 'b] ['c] ['d] ['e 'f] ['g])) -- true
+(same (list 'a ['b 'c] 'd ['e] 'f)) -- true
+(same (list (enlist 'a (as 'SYM "")) 'c ['d] ['e] 'f)) -- true
+(same (list 'a 'b 'c 'd 'e)) -- true
+;; the result becomes a list: mixed types, lists, strings
+(same (list 1 'a "s" 1.5 [1 2] ['b] ["p"] (list 3))) -- true
+(same (list [1 2] [1.5 2.5] [3] (list 4) 5)) -- true
+(same (list (list 1 2) [3 4] 5 'a "x" (list) (list (list 6)))) -- true
+(same (list (list) (list 1) (list) (list 2 3) (list))) -- true
+(same (list [1 2] (list) [3] 4 'b)) -- true
+(same (list sl [1 2] sl 3 sl)) -- true
+(same (list "ab" "c" "d" "e" "f")) -- true
+(same (list ["a"] "b" ["c"] ["d"] "e")) -- true
+(same (list (dict [a] (list 1)) (dict [b] (list 2)) (dict [a] (list 3)) (dict [c] (list 4)) (dict [d] (list 5)))) -- true
+(same (list (table [a] (list [1])) (table [a] (list [2])) (table [a] (list [3])) (table [a] (list [4])) (table [a] (list [5])))) -- true
+;; empty, one item, and the errors concat gives
+(raze (list)) -- (list)
+(raze (list [1 2])) -- [1 2]
+(try (raze (list (list 1) 2 3 (dict [a] (list 1)) 4)) (fn [e] (get e 'msg))) -- "concat: cannot concatenate LIST and DICT"
+(try (raze (list [1 2] [3] [4] 'a 5)) (fn [e] (get e 'msg))) -- "concat: cannot concatenate I64 and sym"
+
+;; linear in the items: these took seconds to minutes when every item
+;; copied the result so far
+(count (raze (take (list 1 'a) 200000))) -- 200000
+(count (raze (map (fn [i] (list i 1.5)) (til 200000)))) -- 400000
+(count (raze (map (fn [i] [1 0N]) (til 200000)))) -- 400000
+(count (raze (map (fn [i] ['a 'b]) (til 200000)))) -- 400000
