@@ -1,0 +1,53 @@
+;; The order of an equi-join's rows is not specified (#1253, joins.md "Row
+;; order"): two runs of the same left-join over duplicate keys on the radix
+;; path return their matches in different orders.  What is guaranteed, and
+;; pinned here, is the multiset of rows (equal after an explicit sort), and
+;; the left order of anti-join, the masks, asof-join and window-join.  No
+;; test may pin the order of an unsorted inner, left or full join.
+
+(set RD (table [k ri] (list (% (til 100000) 50) (til 100000))))
+(set L2 (table [k li] (list (+ 49 (% (til 40000) 2000)) (til 40000))))
+(set RS (table [k ri] (list (% (til 1000) 50) (til 1000))))
+(set LS (table [k li] (list (+ 49 (% (til 400) 20)) (til 400))))
+(set Srt (fn [t] (xasc t [li ri])))
+(set Col (fn [t c] (at (Srt t) c)))
+
+;; ── the same rows every run, on the radix path and the small path ──
+(set A (left-join [k] L2 RD))
+(set B (left-join [k] L2 RD))
+(count A) -- 79980
+(count A) -- (count B)
+(Col A 'li) -- (Col B 'li)
+(Col A 'ri) -- (Col B 'ri)
+(Col A 'k) -- (Col B 'k)
+(set A (inner-join [k] L2 RD))
+(set B (inner-join [k] L2 RD))
+(count A) -- 40000
+(Col A 'li) -- (Col B 'li)
+(Col A 'ri) -- (Col B 'ri)
+(set A (full-join [k] L2 RD))
+(set B (full-join [k] L2 RD))
+(count A) -- 177980
+(Col A 'li) -- (Col B 'li)
+(Col A 'ri) -- (Col B 'ri)
+;; the small path and the radix path agree as multisets
+(set A (left-join [k] LS RS))
+(count A) -- 780
+(Col A 'ri) -- (Col (left-join [k] LS RS) 'ri)
+;; after the sort, each left row's matches are in right-row order
+(take (Col A 'ri) 5) -- [49 99 149 199 249]
+(take (Col (left-join [k] L2 RD) 'ri) 3) -- [49 99 149]
+
+;; ── orders that are guaranteed ──
+;; anti-join keeps the left order, as anti-mask selects it
+(set N (anti-join [k] L2 RD))
+(at N 'li) -- (asc (at N 'li))
+(at N 'li) -- (at (select {from: L2 where: (anti-mask [k] L2 RD)}) 'li)
+(count (semi-mask [k] L2 RD)) -- 40000
+;; asof-join and window-join: one row per left row, in left order
+(set TL (table [s t li] (list (% (* 7 (til 1000)) 13) (% (* 13 (til 1000)) 500) (til 1000))))
+(set TR (table [s t ri] (list (% (til 3000) 13) (% (* 31 (til 3000)) 500) (til 3000))))
+(at (asof-join [s t] TL TR) 'li) -- (til 1000)
+(at (window-join [s t] (list (- (at TL 't) 5) (+ (at TL 't) 5)) TL TR {c: (count ri)}) 'li) -- (til 1000)
+;; an as-of tie on key and time takes the last right row
+(at (asof-join [s t] (table [s t li] (list [0] [2] [0])) (table [s t ri] (list [0 0 0] [1 1 1] [10 11 12]))) 'ri) -- [12]

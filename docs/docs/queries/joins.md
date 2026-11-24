@@ -52,6 +52,9 @@ Every named key must exist in both input tables. A misspelled or missing key is
 a `domain` error instead of an empty result. A string key must be paired with a
 string key on the other side.
 
+The order of the result's rows is not specified: sort it when you need one
+(see [Row order](#row-order)).
+
 ## Left Join
 
 The `left-join` function keeps all rows from the left table. Unmatched rows have null in the right-side columns.
@@ -68,6 +71,8 @@ independent values. Duplicate matches still expand and gather the rows.
 `(left-join [keys] left right)`
 
 Left outer join. All left rows are preserved; unmatched right columns are null.
+When a left row matches several right rows, the order of its matches, and of
+the result's rows, is not specified (see [Row order](#row-order)).
 
 ### Examples
 
@@ -96,6 +101,7 @@ The `full-join` function keeps every row from both tables. Matched rows combine 
 `(full-join [keys] left right)`
 
 Full outer join. All left and right rows are preserved; unmatched columns are null.
+The order of the result's rows is not specified (see [Row order](#row-order)).
 
 ### Examples
 
@@ -175,6 +181,53 @@ A compound key matches the tuple, not each column on its own: `(V0 C)` above is 
 This is the rule the rest of the runtime already applies to key columns: `distinct` keeps exactly one null, group-by folds nulls into a single group, and `in` matches a null against a null. It differs from SQL, where `NULL = NULL` is unknown and a self-anti-join can return rows. The invariant that follows — `(anti-join [cols] X X)` is empty for every `X` and every key set — is what makes anti-join usable for "which of these tuples have I not seen yet".
 
 As-of join is the exception — its null keys never match. See its own [Null-key semantics](#null-key-semantics) section below.
+
+## Row order
+
+Which rows a join returns is fixed; the order it returns them in is not, for
+the equi-joins that can return several rows per left row.
+
+- **`inner-join`, `left-join` and `full-join`: the order is not specified.**
+  When a key matches several right rows, the order of those matches is not
+  specified, and on the large-input (radix) path neither is the order of the
+  left rows: it can differ between two runs of the same join in the same
+  process, between core counts, and between the small-input and radix
+  routes. Each run returns the same rows, the same multiset, and only their
+  order changes. The order is left unspecified so the join can run on the
+  fastest path; do not rely on any order you observe.
+- **`anti-join`: left order.** The kept left rows come out in the left
+  table's order, the same rows in the same order as
+  `(select {from: left where: (anti-mask ks left right)})`.
+- **`semi-mask` and `anti-mask`: one value per left row**, in left order.
+- **`asof-join` and `window-join`: one row per left row, in left order.** An
+  as-of join that finds several right rows with the same key and time takes
+  the last of them in right order.
+
+To get an order from an equi-join, sort its result with `xasc` (or `xdesc`)
+by columns that tell every row apart. When no column does, number the right
+rows before joining:
+
+```lisp
+(set orders (table [id sym qty] (list [1 2 3 4] [AAPL GOOG MSFT AAPL] [100 200 50 150])))
+(set fills (table [sym px] (list [AAPL GOOG AAPL AAPL] [150 280 151 149])))
+
+; each AAPL order matches three fills, in no specified order
+(left-join [sym] orders fills)
+
+; ordered by order id, then by the fill's position in fills
+(set fills (update {rn: (til (count fills)) from: fills}))
+(xasc (left-join [sym] orders fills) [id rn])
+; id sym  qty px  rn
+; -- ---- --- --- ---
+;  1 AAPL 100 150   0
+;  1 AAPL 100 151   2
+;  1 AAPL 100 149   3
+;  2 GOOG 200 280   1
+;  3 MSFT  50 0Nl 0Nl
+;  4 AAPL 150 150   0
+;  4 AAPL 150 151   2
+;  4 AAPL 150 149   3
+```
 
 ## As-of Join
 
@@ -329,7 +382,7 @@ All join operations compile to the Rayforce execution DAG. The optimizer and exe
 
 1. **DAG construction** — `inner-join`, `left-join`, and `full-join` emit `OP_JOIN` nodes with join type flags. `asof-join` emits `OP_ASOF_JOIN`. `window-join` emits `OP_WINDOW_JOIN`.
 2. **Optimizer** — Predicate pushdown moves filters closer to data sources (past `SELECT`/`ALIAS`, `GROUP`, and `EXPAND` nodes); filters on join inputs are not currently pushed across join boundaries. Type inference propagates column types through join boundaries. SIP (Sideways Information Passing) can prune the build side using selection bitmaps.
-3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order for inner joins on the radix-parallel path is partition- and thread-dependent and is not guaranteed to be stable. On the small-input (chained) path, an inner or left join whose left side is more than twice the size of the right first builds a bitmap of the right side's values for its symbol and integer key columns (a column gets none when its right-side values span more than 2^24, when that span is more than 64 times the left row count, or when it pairs a symbol key with a non-symbol one). The executor tests a sample of 1024 left rows and keeps only the bitmaps that reject enough of them, up to four, most selective first. A left row whose value on a kept column appears nowhere on the right cannot match, so it is not hashed: an inner join drops it, and a left join emits it with null right-side columns. This works for any number of key columns. For `(inner-join [venue instrument] big small)` with a few books in `small`, the sample usually keeps `instrument` alone, since `venue` rejects nothing more after it. The cost becomes a bit test per left row plus hashing only for the rows whose instrument occurs in `small`. A join where most left rows match keeps no bitmap and pays almost nothing extra: only the bitmap build over the right side and the sample. Null keys are unaffected and still match each other. `semi-mask` and `anti-mask` run the same probe on the chained hash table built over the right side, with the same bitmap rule, at any right-side size; the probe is split across workers, and each left row writes its own byte of the mask instead of a row pair. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
+3. **Execution** — Equi-joins use a radix-partitioned hash join: the build side is partitioned by hash, then each morsel from the probe side looks up matches in the corresponding partition. For inner joins on the radix-parallel path, the executor picks the build side at runtime using actual materialized row counts — whichever input has fewer rows becomes the build side, reducing hash-table memory and improving cache utilisation. This selection is most effective when the larger side has many rows per key (e.g. a fact table joining a small dimension); on near-unique keys the benefit is small. LEFT, FULL, and ANTI joins always build on the right because their semantics require preserving every left row. The small-input (chained) path also always builds on the right. During the per-partition build the executor monitors per-key duplicate counts; if any single key exceeds a threshold it abandons the radix attempt and re-runs the whole join through the chained hash table, which is O(n) regardless of duplication. This ensures that no join — INNER, LEFT, or FULL — degrades to quadratic cost when the build side contains a heavily-duplicated key. It complements build-side selection (which handles INNER joins by choosing the smaller side) by covering LEFT and FULL joins, which cannot swap sides, and any INNER case where the forced-build side happens to be skewed. Output row order is partition- and thread-dependent on the radix-parallel path and differs from the chained path; see [Row order](#row-order) for what each join kind guarantees. On the small-input (chained) path, an inner or left join whose left side is more than twice the size of the right first builds a bitmap of the right side's values for its symbol and integer key columns (a column gets none when its right-side values span more than 2^24, when that span is more than 64 times the left row count, or when it pairs a symbol key with a non-symbol one). The executor tests a sample of 1024 left rows and keeps only the bitmaps that reject enough of them, up to four, most selective first. A left row whose value on a kept column appears nowhere on the right cannot match, so it is not hashed: an inner join drops it, and a left join emits it with null right-side columns. This works for any number of key columns. For `(inner-join [venue instrument] big small)` with a few books in `small`, the sample usually keeps `instrument` alone, since `venue` rejects nothing more after it. The cost becomes a bit test per left row plus hashing only for the rows whose instrument occurs in `small`. A join where most left rows match keeps no bitmap and pays almost nothing extra: only the bitmap build over the right side and the sample. Null keys are unaffected and still match each other. `semi-mask` and `anti-mask` run the same probe on the chained hash table built over the right side, with the same bitmap rule, at any right-side size; the probe is split across workers, and each left row writes its own byte of the mask instead of a row pair. As-of and window joins use sorted merge with binary search on the temporal column — the as-of executor skips the per-join sort when the inputs carry the `sorted` / `parted` [attributes](attributes.md) described above.
 
 !!! note "Performance note"
     Join key columns may be symbol (`RAY_SYM`), numeric or string (`RAY_STR`); a string key must be paired with a string key on the other side. Symbol columns are dictionary-encoded integers and join fastest. A string key is hashed and compared by its bytes and gets no bitmap prefilter, so converting it to a symbol (`(as 'sym col)`) pays off when the same column is joined repeatedly.
