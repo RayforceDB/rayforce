@@ -2063,18 +2063,70 @@ static uint8_t* pf_map(const char* path, size_t* size) {
     return p;
 }
 
-/* No sampled page of [p, p+n) is resident. */
-static bool pf_none_resident(const uint8_t* p, size_t n) {
-    for (size_t off = 0; off < n; off += n / 16)
-        if (ray_vm_resident(p + off, 4096)) return false;
-    return true;
-}
-
 /* Resident pages of [p, p+n), probed one by one. */
 static int64_t pf_resident_pages(const uint8_t* p, size_t n) {
     int64_t k = 0;
     for (size_t off = 0; off < n; off += 4096) k += ray_vm_resident(p + off, 1);
     return k;
+}
+
+/* The pages of a mapping an eviction left resident.  POSIX_FADV_DONTNEED is
+ * best effort: a page the kernel holds at that moment (isolated by reclaim,
+ * in another CPU's LRU batch, being read) is skipped, and under memory
+ * pressure an eviction leaves a few pages here and there — 1 to 4 of 2048
+ * with four suites and a reclaiming load running (#1578).  The tests take a
+ * mark after each eviction and judge what a pass requested by the pages
+ * resident outside it: those the pass, or nothing, brought in.  An eviction
+ * that leaves more than an eighth of the pages is taken for one that has no
+ * effect here (tmpfs), and the test skips. */
+typedef struct { const uint8_t* base; size_t pages; uint8_t* left; int64_t count; } pf_mark_t;
+
+static void pf_mark_free(pf_mark_t* m) { free(m->left); m->left = NULL; m->pages = 0; m->count = 0; }
+
+static bool pf_mark(pf_mark_t* m, const uint8_t* p, size_t n) {
+    pf_mark_free(m);
+    m->base = p;
+    m->pages = (n + 4095) / 4096;
+    m->left = (uint8_t*)calloc(m->pages ? m->pages : 1, 1);
+    if (!m->left) return false;
+    for (size_t i = 0; i < m->pages; i++)
+        if (ray_vm_resident(p + i * 4096, 1)) { m->left[i] = 1; m->count++; }
+    return true;
+}
+
+/* Whether the eviction the mark follows had its effect: at most an eighth of
+ * the pages left. */
+static bool pf_mark_evicted(const pf_mark_t* m) { return m->count <= (int64_t)(m->pages / 8); }
+
+static bool pf_mark_left(const pf_mark_t* m, const uint8_t* q) {
+    size_t i = (size_t)(q - m->base) / 4096;
+    return q >= m->base && i < m->pages && m->left[i];
+}
+
+/* Pages of [p, p+n) resident now that were not when the mark was taken. */
+static int64_t pf_new_pages(const pf_mark_t* m, const uint8_t* p, size_t n) {
+    int64_t k = 0;
+    for (size_t off = 0; off < n; off += 4096)
+        k += ray_vm_resident(p + off, 1) && !pf_mark_left(m, p + off);
+    return k;
+}
+
+/* No sampled page of [p, p+n) is resident, past the pages the mark found
+ * resident. */
+static bool pf_none_new(const pf_mark_t* m, const uint8_t* p, size_t n) {
+    for (size_t off = 0; off < n; off += n / 16)
+        if (ray_vm_resident(p + off, 4096) && !pf_mark_left(m, p + off)) return false;
+    return true;
+}
+
+/* Marks of columns A and B after the last eviction (pf_reset). */
+static pf_mark_t pf_mark_a, pf_mark_b;
+
+/* Evict both columns and mark what the eviction left of each: false when an
+ * eviction failed or had no effect. */
+static bool pf_evict_marked(const uint8_t* base, size_t size, const uint8_t* bbase, size_t bsize) {
+    return pf_evict() && pf_mark(&pf_mark_a, base, size) && pf_mark(&pf_mark_b, bbase, bsize) &&
+           pf_mark_evicted(&pf_mark_a) && pf_mark_evicted(&pf_mark_b);
 }
 
 /* Pages this process has read stay mapped and are not evicted: drop both
@@ -2104,8 +2156,10 @@ static bool pf_reset(uint8_t** base, size_t* size, uint8_t** bbase, size_t* bsiz
     if (!*base || !*bbase) return false;
     scan->base[0] = *base;
     scan->base[1] = *bbase;
-    /* Every page: what an eviction leaves is a few pages here and there. */
-    return !pf_resident_pages(*base, *size) && !pf_resident_pages(*bbase, *bsize);
+    /* Every page: what an eviction leaves is a few pages here and there,
+     * marked so that the checks after it look past them. */
+    return pf_mark(&pf_mark_a, *base, *size) && pf_mark(&pf_mark_b, *bbase, *bsize) &&
+           pf_mark_evicted(&pf_mark_a) && pf_mark_evicted(&pf_mark_b);
 }
 
 /* Bounded wait (~10 s) for `want` pages of [p, p+n) to be resident. */
@@ -2154,7 +2208,7 @@ static test_result_t test_scan_read_ahead(void) {
     TEST_ASSERT_EQ_U(size, (uint64_t)PF_ROWS * 8);
 
     if (!pool->scan_bytes) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
-    if (!pf_evict() || ray_vm_resident(base, size) || !pf_none_resident(bbase, bsize)) {
+    if (!pf_evict_marked(base, size, bbase, bsize)) {
         res = (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" };
         goto out;
     }
@@ -2176,7 +2230,7 @@ static test_result_t test_scan_read_ahead(void) {
             res = (test_result_t){ TEST_FAIL, "per-ticket read-ahead left the rows unread" };
             goto restore;
         }
-        if (!pf_none_resident(bbase, bsize)) {
+        if (!pf_none_new(&pf_mark_b, bbase, bsize)) {
             res = (test_result_t){ TEST_FAIL, "per-ticket read-ahead requested a column no ticket read" };
             goto restore;
         }
@@ -2190,7 +2244,7 @@ static test_result_t test_scan_read_ahead(void) {
         res = (test_result_t){ TEST_FAIL, "task-reported read-ahead left the rows unread" };
         goto restore;
     }
-    if (!pf_none_resident(bbase, bsize)) {
+    if (!pf_none_new(&pf_mark_b, bbase, bsize)) {
         res = (test_result_t){ TEST_FAIL, "task-reported read-ahead requested a column no task read" };
         goto restore;
     }
@@ -2205,7 +2259,7 @@ static test_result_t test_scan_read_ahead(void) {
         res = (test_result_t){ TEST_FAIL, "a column read from the first block was not requested" };
         goto restore;
     }
-    if (pf_resident_pages(bbase, bsize) > PF_PAGES / 8) {
+    if (pf_new_pages(&pf_mark_b, bbase, bsize) > PF_PAGES / 8) {
         res = (test_result_t){ TEST_FAIL, "a column found unread four times was requested" };
         goto restore;
     }
@@ -2218,7 +2272,7 @@ static test_result_t test_scan_read_ahead(void) {
         res = (test_result_t){ TEST_FAIL, "a named column was not requested" };
         goto restore;
     }
-    if (!pf_none_resident(bbase, bsize)) {
+    if (!pf_none_new(&pf_mark_b, bbase, bsize)) {
         res = (test_result_t){ TEST_FAIL, "a column no task named was requested" };
         goto restore;
     }
@@ -2238,7 +2292,7 @@ static test_result_t test_scan_read_ahead(void) {
             res = (test_result_t){ TEST_FAIL, "a gated-in chunk was not read" };
             goto restore;
         }
-        if (c % 2 == 1 && ray_vm_resident(p + chunk / 2, 4096)) {
+        if (c % 2 == 1 && pf_new_pages(&pf_mark_a, p + chunk / 2, 4096)) {
             res = (test_result_t){ TEST_FAIL, "a gated-out chunk was read" };
             goto restore;
         }
@@ -2323,7 +2377,7 @@ static test_result_t test_scan_read_ahead_new_pool(void) {
     TEST_ASSERT_NOT_NULL(bbase);
 
     if (!pool->scan_bytes) { res = (test_result_t){ TEST_SKIP, "RAY_SCAN_PREFETCH=0" }; goto out; }
-    if (!pf_evict() || ray_vm_resident(base, size) || !pf_none_resident(bbase, bsize)) {
+    if (!pf_evict_marked(base, size, bbase, bsize)) {
         res = (test_result_t){ TEST_SKIP, "page cache eviction has no effect here" };
         goto out;
     }
@@ -2344,7 +2398,7 @@ static test_result_t test_scan_read_ahead_new_pool(void) {
         res = (test_result_t){ TEST_FAIL, "task-reported read-ahead left the rows unread" };
         goto restore;
     }
-    if (!pf_none_resident(bbase, bsize)) {
+    if (!pf_none_new(&pf_mark_b, bbase, bsize)) {
         res = (test_result_t){ TEST_FAIL, "a column only the old pool's dispatch read was requested" };
         goto restore;
     }
@@ -2433,6 +2487,9 @@ static void pq_rm(const char* path) {
     }
 }
 
+/* What the eviction before the last pq_open_cold left of its column. */
+static pf_mark_t pq_mark;
+
 /* Open the table cold as M, with the kernel's read-ahead on faults off for
  * column `name`; its data through *p, *n.  1 when eviction has no effect
  * here, -1 on an error. */
@@ -2453,9 +2510,11 @@ static int pq_open_cold(const char* name, const uint8_t** p, size_t* n) {
     uintptr_t a = (uintptr_t)*p & ~(uintptr_t)4095;
     posix_madvise((void*)a, (uintptr_t)*p + *n - a, POSIX_MADV_RANDOM);
     /* Opening reads the header, and the kernel the pages after it, and the
-     * last pages of the file.  Every page between is probed: an eviction
-     * that falls short leaves a few pages here and there. */
-    return pf_resident_pages(*p + (512 << 10), *n - (1024 << 10)) ? 1 : 0;
+     * last pages of the file.  Every page between is marked: an eviction
+     * that falls short leaves a few pages here and there, which the checks
+     * after it look past (pf_mark). */
+    if (!pf_mark(&pq_mark, *p, *n)) return -1;
+    return pf_resident_pages(*p + (512 << 10), *n - (1024 << 10)) > (int64_t)((*n - (1024 << 10)) / 4096 / 8) ? 1 : 0;
 }
 
 static long pq_majflt(void) {
@@ -2531,7 +2590,7 @@ static test_result_t test_scan_read_ahead_queries(void) {
         res = (test_result_t){ TEST_FAIL, "count w" };
         goto out;
     }
-    if (pf_resident_pages(p + (512 << 10), n - (1024 << 10)) > 0) {
+    if (pf_new_pages(&pq_mark, p + (512 << 10), n - (1024 << 10)) > 0) {
         res = (test_result_t){ TEST_FAIL, "a column no pass read was requested" };
         goto out;
     }
@@ -2548,7 +2607,7 @@ static test_result_t test_scan_read_ahead_queries(void) {
         res = (test_result_t){ TEST_FAIL, "clustered count distinct" };
         goto out;
     }
-    if (pf_resident_pages(p + n / 4, n / 2) > 0) {
+    if (pf_new_pages(&pq_mark, p + n / 4, n / 2) > 0) {
         res = (test_result_t){ TEST_FAIL, "count distinct over clustered rows asked for pages none of them is on" };
         goto out;
     }
