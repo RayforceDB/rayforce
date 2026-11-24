@@ -132,6 +132,7 @@ ray> (as 'DATE "2024.01.15")
 | I64, F64 | BOOL | Non-zero → `true` |
 | Any scalar | STR | Formatted string representation |
 | STR | I64, F32, F64, DATE, TIME, TIMESTAMP | Parsed from standard format |
+| STR | GUID | The form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hex digits of either case; the empty string is `0Ng`, any other text a `domain` error. A STR vector casts each string as the atom cast does |
 | SYM | STR | Resolves interned string |
 | STR | SYM | Interns the string |
 | DATE | TIMESTAMP | Midnight on that date |

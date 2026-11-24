@@ -2258,6 +2258,33 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
         /* Vector of GUIDs: empty vector cast */
         if (ray_is_vec(val) && val->len == 0)
             return ray_vec_new(RAY_GUID, 0);
+        /* STR vector -> GUID vector: each string casts as the atom does, the
+         * canonical form parsed, "" a null and other text a domain error.
+         * The vector cast refused a STR vector the atom cast reads (#1583). */
+        if (val->type == RAY_STR) {
+            int64_t n2 = val->len;
+            ray_t* vec = ray_vec_new(RAY_GUID, n2);
+            if (RAY_IS_ERR(vec)) return vec;
+            vec->len = n2;
+            uint8_t* data = (uint8_t*)ray_data(vec);
+            for (int64_t i = 0; i < n2; i++) {
+                size_t sl = 0;
+                const char* sp = ray_str_vec_get(val, i, &sl);
+                ray_t* cell = ray_str(sp ? sp : "", sp ? sl : 0);
+                if (!cell || RAY_IS_ERR(cell)) { ray_release(vec); return cell ? cell : ray_error("oom", NULL); }
+                ray_t* cast = ray_cast_fn(type_sym, cell);
+                ray_release(cell);
+                if (!cast || RAY_IS_ERR(cast)) { ray_release(vec); return cast ? cast : ray_error("oom", NULL); }
+                if (RAY_ATOM_IS_NULL(cast)) {
+                    memset(data + i * 16, 0, 16);
+                    ray_vec_set_null(vec, i, true);
+                } else {
+                    memcpy(data + i * 16, cast->obj ? ray_data(cast->obj) : ray_data(cast), 16);
+                }
+                ray_release(cast);
+            }
+            return vec;
+        }
         /* List of strings -> GUID vector */
         if (val->type == RAY_LIST) {
             int64_t n2 = val->len;
