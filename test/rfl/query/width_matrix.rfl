@@ -984,19 +984,13 @@
 ;; Raw-sentinel 33/64/65-aggregate checks live in lang/query/group_wide_null_masks.
 
 ;; ── keyless, EMPTY table (0 rows), 9 total aggs — n_keys==0 so the DA
-;; path's `n_keys > 0` gate excludes it outright and the scalar fast path's
-;; own `nrows > 0` guard (group.c ~7503, the same guard the `wm_tp`
-;; PEARSON_CORR cell above skips via `sc_has_binary` instead) also excludes
-;; it here since nrows==0 — both routes decline for the SAME reason nrows
-;; gives them nothing to scan, landing on ht_path unconditionally, same as
-;; every other keyless shape in this file. Verified today's deterministic
-;; behavior is a 9-column, 0-ROW result (not a 1-row all-null/zero scalar
-;; row) — identical in shape to the always-legal 2-agg keyless-empty case,
-;; just wider; a mix of SUM/COUNT/MIN/MAX/AVG confirms the shape holds
-;; across agg kinds, not just one. ──
+;; path's `n_keys > 0` gate excludes it outright, and the scalar route
+;; takes it: a keyless select of aggregates over no rows answers one row
+;; of identities, as a where: keeping no row does (#1614).  A mix of
+;; SUM/COUNT/MIN/MAX/AVG confirms the shape holds across agg kinds. ──
 (set wm_e0 (table [x] (list (take [1] 0))))
 (count (at wm_e0 'x)) -- 0
 (set wm_e0_r9 (select {from: wm_e0 a01: (sum x) a02: (count x) a03: (min x) a04: (max x) a05: (avg x) a06: (sum x) a07: (min x) a08: (max x) a09: (count x)}))
 (at (meta wm_e0_r9) 'len) -- 9
-(count (at wm_e0_r9 'a01)) -- 0
-(count (at wm_e0_r9 'a09)) -- 0
+(count (at wm_e0_r9 'a01)) -- 1
+(count (at wm_e0_r9 'a09)) -- 1

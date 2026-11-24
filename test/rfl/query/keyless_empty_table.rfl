@@ -1,0 +1,125 @@
+;; @requires: posix
+;; A keyless select of aggregates over a table with no rows answers ONE row
+;; of identities, with or without where:, as a where: that keeps no row of
+;; a non-empty table does, and as the evaluator fallback does (#1614).  The
+;; planned route answered no row.  A select with by: over an empty table
+;; still answers no row.
+(set T (table [c f d v s] (list [1 5] [1.5 2.0] [2024.01.01 2024.01.02] [10 20] [a b])))
+(set E (take T 0))
+
+;; each aggregate: the empty table, with and without where:, is the
+;; answer of a where: that keeps no row of T
+(select {from: E s: (sum c)}) -- (select {from: T s: (sum c) where: (> v 100)})
+(select {from: E s: (sum c) where: (> v 0)}) -- (select {from: T s: (sum c) where: (> v 100)})
+(select {from: E s: (avg c)}) -- (select {from: T s: (avg c) where: (> v 100)})
+(select {from: E s: (avg c) where: (> v 0)}) -- (select {from: T s: (avg c) where: (> v 100)})
+(select {from: E s: (min c)}) -- (select {from: T s: (min c) where: (> v 100)})
+(select {from: E s: (min c) where: (> v 0)}) -- (select {from: T s: (min c) where: (> v 100)})
+(select {from: E s: (max c)}) -- (select {from: T s: (max c) where: (> v 100)})
+(select {from: E s: (max c) where: (> v 0)}) -- (select {from: T s: (max c) where: (> v 100)})
+(select {from: E s: (dev c)}) -- (select {from: T s: (dev c) where: (> v 100)})
+(select {from: E s: (dev c) where: (> v 0)}) -- (select {from: T s: (dev c) where: (> v 100)})
+(select {from: E s: (var c)}) -- (select {from: T s: (var c) where: (> v 100)})
+(select {from: E s: (var c) where: (> v 0)}) -- (select {from: T s: (var c) where: (> v 100)})
+(select {from: E s: (all c)}) -- (select {from: T s: (all c) where: (> v 100)})
+(select {from: E s: (all c) where: (> v 0)}) -- (select {from: T s: (all c) where: (> v 100)})
+(select {from: E s: (any c)}) -- (select {from: T s: (any c) where: (> v 100)})
+(select {from: E s: (any c) where: (> v 0)}) -- (select {from: T s: (any c) where: (> v 100)})
+(select {from: E s: (prod c)}) -- (select {from: T s: (prod c) where: (> v 100)})
+(select {from: E s: (prod c) where: (> v 0)}) -- (select {from: T s: (prod c) where: (> v 100)})
+(select {from: E s: (last c)}) -- (select {from: T s: (last c) where: (> v 100)})
+(select {from: E s: (last c) where: (> v 0)}) -- (select {from: T s: (last c) where: (> v 100)})
+(select {from: E s: (count c)}) -- (select {from: T s: (count c) where: (> v 100)})
+(select {from: E s: (count c) where: (> v 0)}) -- (select {from: T s: (count c) where: (> v 100)})
+(select {from: E s: (first c)}) -- (select {from: T s: (first c) where: (> v 100)})
+(select {from: E s: (first c) where: (> v 0)}) -- (select {from: T s: (first c) where: (> v 100)})
+(select {from: E s: (stddev c)}) -- (select {from: T s: (stddev c) where: (> v 100)})
+(select {from: E s: (stddev c) where: (> v 0)}) -- (select {from: T s: (stddev c) where: (> v 100)})
+(select {from: E s: (dev_pop c)}) -- (select {from: T s: (dev_pop c) where: (> v 100)})
+(select {from: E s: (dev_pop c) where: (> v 0)}) -- (select {from: T s: (dev_pop c) where: (> v 100)})
+(select {from: E s: (var_pop c)}) -- (select {from: T s: (var_pop c) where: (> v 100)})
+(select {from: E s: (var_pop c) where: (> v 0)}) -- (select {from: T s: (var_pop c) where: (> v 100)})
+(select {from: E s: (stddev_pop c)}) -- (select {from: T s: (stddev_pop c) where: (> v 100)})
+(select {from: E s: (stddev_pop c) where: (> v 0)}) -- (select {from: T s: (stddev_pop c) where: (> v 100)})
+(select {from: E s: (med c)}) -- (select {from: T s: (med c) where: (> v 100)})
+(select {from: E s: (med c) where: (> v 0)}) -- (select {from: T s: (med c) where: (> v 100)})
+(select {from: E s: (median f)}) -- (select {from: T s: (median f) where: (> v 100)})
+(select {from: E s: (median f) where: (> v 0)}) -- (select {from: T s: (median f) where: (> v 100)})
+(select {from: E s: (mode c)}) -- (select {from: T s: (mode c) where: (> v 100)})
+(select {from: E s: (mode c) where: (> v 0)}) -- (select {from: T s: (mode c) where: (> v 100)})
+(select {from: E s: (top c 2)}) -- (select {from: T s: (top c 2) where: (> v 100)})
+(select {from: E s: (top c 2) where: (> v 0)}) -- (select {from: T s: (top c 2) where: (> v 100)})
+(select {from: E s: (bot c 2)}) -- (select {from: T s: (bot c 2) where: (> v 100)})
+(select {from: E s: (bot c 2) where: (> v 0)}) -- (select {from: T s: (bot c 2) where: (> v 100)})
+(select {from: E s: (quantile f 0.5)}) -- (select {from: T s: (quantile f 0.5) where: (> v 100)})
+(select {from: E s: (quantile f 0.5) where: (> v 0)}) -- (select {from: T s: (quantile f 0.5) where: (> v 100)})
+(select {from: E s: (percentile f 50)}) -- (select {from: T s: (percentile f 50) where: (> v 100)})
+(select {from: E s: (percentile f 50) where: (> v 0)}) -- (select {from: T s: (percentile f 50) where: (> v 100)})
+(select {from: E s: (sum f)}) -- (select {from: T s: (sum f) where: (> v 100)})
+(select {from: E s: (sum f) where: (> v 0)}) -- (select {from: T s: (sum f) where: (> v 100)})
+(select {from: E s: (min f)}) -- (select {from: T s: (min f) where: (> v 100)})
+(select {from: E s: (min f) where: (> v 0)}) -- (select {from: T s: (min f) where: (> v 100)})
+(select {from: E s: (first s)}) -- (select {from: T s: (first s) where: (> v 100)})
+(select {from: E s: (first s) where: (> v 0)}) -- (select {from: T s: (first s) where: (> v 100)})
+(select {from: E s: (max d)}) -- (select {from: T s: (max d) where: (> v 100)})
+(select {from: E s: (max d) where: (> v 0)}) -- (select {from: T s: (max d) where: (> v 100)})
+(select {from: E s: (count s)}) -- (select {from: T s: (count s) where: (> v 100)})
+(select {from: E s: (count s) where: (> v 0)}) -- (select {from: T s: (count s) where: (> v 100)})
+(select {from: E s: (sum (+ c 1))}) -- (select {from: T s: (sum (+ c 1)) where: (> v 100)})
+(select {from: E s: (sum (+ c 1)) where: (> v 0)}) -- (select {from: T s: (sum (+ c 1)) where: (> v 100)})
+
+;; the identities themselves, several outputs at once
+(set R (select {from: E a: (sum c) b: (count c) m: (min f) x: (max d) g: (avg c) l: (last s) p: (prod c)}))
+(count R) -- 1
+(at R 'a) -- [0]
+(at R 'b) -- [0]
+(at R 'm) -- [0Nf]
+(at R 'x) -- [0Nd]
+(at R 'g) -- [0Nf]
+(at R 'l) -- [']
+(at R 'p) -- [1]
+(set R 0)
+
+;; the evaluator fallback (a declined second output) answers the same row
+(at (select {from: E s: (sum c) z: (first (+ d 0))}) 's) -- (at (select {from: E s: (sum c)}) 's)
+(at (select {from: E s: (count c) z: (first (+ d 0))}) 's) -- (at (select {from: E s: (count c)}) 's)
+(at (select {from: E s: (min c) z: (first (+ d 0))}) 's) -- (at (select {from: E s: (min c)}) 's)
+
+;; by: over an empty table: no row
+(count (select {from: E a: (sum c) by: s})) -- 0
+(count (select {from: E a: (sum c) by: s where: (> v 0)})) -- 0
+
+;; a nested empty source
+(count (select {from: (select {from: T where: (> v 100)}) s: (sum c)})) -- 1
+
+;; parted: a where: on the partition key that prunes every partition
+(.sys.exec "rm -rf /tmp/rf_keyless_empty")
+(.db.splayed.set "/tmp/rf_keyless_empty/2024.01.01/t/" (select {from: T c: c f: f v: v s: s}))
+(.db.splayed.set "/tmp/rf_keyless_empty/2024.01.02/t/" (select {from: T c: c f: f v: v s: s}))
+(set P (.db.parted.get "/tmp/rf_keyless_empty/" 't))
+(set R (select {from: P a: (sum c) b: (count c) m: (min f) where: (== date 2030.01.01)}))
+(count R) -- 1
+(at R 'a) -- [0]
+(at R 'b) -- [0]
+(at R 'm) -- [0Nf]
+(count (select {from: P a: (sum c) by: s where: (== date 2030.01.01)})) -- 0
+(set R 0)
+(set P 0)
+
+;; parted by its partition key with an empty partition: the empty
+;; partition is no group
+(.sys.exec "rm -rf /tmp/rf_keyless_empty")
+(.db.splayed.set "/tmp/rf_keyless_empty/1/t/" (table [v] (list (til 100))))
+(.db.splayed.set "/tmp/rf_keyless_empty/2/t/" (table [v] (list (take (til 100) 0))))
+(.db.splayed.set "/tmp/rf_keyless_empty/3/t/" (table [v] (list (til 100))))
+(set P (.db.parted.get "/tmp/rf_keyless_empty/" 't))
+(at (select {c: (count v) by: part from: P}) 'part) -- [1 3]
+(at (select {c: (count v) by: part from: P}) 'c) -- [100 100]
+(at (select {c: (count v) from: P}) 'c) -- [200]
+(set P 0)
+(.sys.exec "rm -rf /tmp/rf_keyless_empty")
+
+;; a source large enough for the parallel scan, filtered to no row
+(set B (table [c v] (list (% (til 1000000) 7) (til 1000000))))
+(select {from: (take B 0) s: (sum c) n: (count c) m: (max c)}) -- (select {from: B s: (sum c) n: (count c) m: (max c) where: (> v 2000000)})
+(set B 0)

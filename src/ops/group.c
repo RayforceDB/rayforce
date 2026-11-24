@@ -16772,7 +16772,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (agg_is_binary_agg(ext->agg_ops[a])) { sc_has_binary = true; break; }
     /* The scalar route is the one that emits a FLOAT affine bias over an
      * integer column as F64 (emit_agg_columns); the others decline it. */
-    bool sc_route = n_keys == 0 && nrows > 0 && !sc_has_binary;
+    bool sc_route = n_keys == 0 && !sc_has_binary;
     /* A lone keyless SUM / AVG over every row: the scalar route's tight
      * kernel, where a narrow linear plan may take its pass's total alone
      * (agg_linear_t.pre_only, #1287). */
@@ -23216,8 +23216,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
              * has no key and still answers one row (the aggregates of no
              * rows), which the merge would key by this partition: keep
              * its columns, drop the row.  With no key at all that row is
-             * the empty-input answer of a whole-table aggregate: keep it. */
-            if (sel_cnt == 0 && n_part_keys == 0 && n_mc_keys > 0) {
+             * the empty-input answer of a whole-table aggregate: keep it.
+             * A partition holding no rows answers that one row too. */
+            if ((sel_cnt == 0 || part_nrows == 0) && n_part_keys == 0 && n_mc_keys > 0) {
                 ray_t* zero = make_i64(0);
                 ray_t* empty = zero ? ray_take_fn(bp[bi], zero) : NULL;
                 if (zero) ray_release(zero);
