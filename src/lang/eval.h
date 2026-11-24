@@ -480,6 +480,9 @@ ray_t* ray_inv_fn(ray_t* x);
 ray_t* ray_flip_mat_fn(ray_t* x);
 ray_t* ray_gram_fn(ray_t* x);
 /* The matrix product's F32 kernel over rows (ops/linalg.c): c += a * b. */
+/* Rows against rows (ops/linalg.c): c[i * cols + o] += a_i . b_o. */
+void ray_lin_rowdot_acc_f32(const float* a, int64_t as, const float* b, int64_t bs,
+                            float* c, int64_t r, int64_t n, int64_t cols);
 void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
                           int64_t r, int64_t k, int64_t cols);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);

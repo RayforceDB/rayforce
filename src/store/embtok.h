@@ -24,8 +24,8 @@
 #ifndef RAY_EMBTOK_H
 #define RAY_EMBTOK_H
 
-/* The tokenizer of a sentence-piece unigram model, as text encoders of the
- * XLM-R family use it: text to the ids the model was trained on.
+/* The tokenizer of a unigram model of sub-word pieces, as multilingual text
+ * encoders use it: text to the ids the model was trained on.
  *
  * Four steps, each of them the reference tokenizer's, id for id:
  *
@@ -104,21 +104,21 @@ static void emb_tok_free(emb_tok_t* t) {
  * decoded (a 32-bit length of the trie in bytes, the trie, the strings) and
  * the vocabulary in id order.  NULL when memory runs out or the table is
  * not in form. */
+/* `charsmap` is a block from emb_alloc (or NULL) that the call takes for its
+ * own whether it succeeds or not; the tokens and scores are copied. */
 static emb_tok_t* emb_tok_new(const uint8_t* charsmap, size_t charsmap_len,
                               const char* const* toks, const uint32_t* lens, const double* scores,
                               int32_t n, int32_t unk, int32_t bos, int32_t eos) {
-    if (n <= 0 || unk < 0 || unk >= n || bos < 0 || bos >= n || eos < 0 || eos >= n) return NULL;
-    emb_tok_t* t = (emb_tok_t*)emb_alloc(sizeof *t);
-    if (!t) return NULL;
+    emb_tok_t* t = NULL;
+    if (n > 0 && unk >= 0 && unk < n && bos >= 0 && bos < n && eos >= 0 && eos < n) t = (emb_tok_t*)emb_alloc(sizeof *t);
+    if (!t) { emb_free((void*)(uintptr_t)charsmap); return NULL; }
     memset(t, 0, sizeof *t);
     t->n = n; t->unk = unk; t->bos = bos; t->eos = eos;
+    t->charsmap = (void*)(uintptr_t)charsmap;   /* taken, not copied; freed with the tokenizer from here on */
     if (charsmap_len >= 4) {
         uint32_t tsize;
         memcpy(&tsize, charsmap, 4);
         if (tsize % 4 != 0 || (size_t)tsize + 4 > charsmap_len) { emb_tok_free(t); return NULL; }
-        t->charsmap = emb_alloc(charsmap_len);
-        if (!t->charsmap) { emb_tok_free(t); return NULL; }
-        memcpy(t->charsmap, charsmap, charsmap_len);
         t->trie = (const uint32_t*)((const char*)t->charsmap + 4);
         t->trie_len = tsize / 4;
         t->norm = (const char*)t->charsmap + 4 + tsize;
@@ -194,6 +194,12 @@ static inline uint32_t emb_char(const uint8_t* p, size_t n, uint32_t* cp) {
     return len;
 }
 
+/* A control character is a cluster by itself: a mark after it does not join it. */
+static inline bool emb_control(uint32_t cp) {
+    return cp < 0x20 || (cp >= 0x7F && cp < 0xA0) || cp == 0xAD || cp == 0x200B ||
+           (cp >= 0x2028 && cp <= 0x202E) || (cp >= 0x2060 && cp <= 0x206F) || cp == 0xFEFF;
+}
+
 static inline bool emb_clings(uint32_t cp) {
     if (cp < 0x0300) return false;
     size_t lo = 0, hi = sizeof emb_extend / sizeof emb_extend[0];
@@ -243,7 +249,7 @@ static int64_t emb_prepare(const emb_tok_t* t, emb_scratch_t* s, const uint8_t* 
         uint32_t cp, first = emb_char(in + i, n - i, &cp);
         size_t g = first;
         if (cp == '\r' && i + g < n && in[i + g] == '\n') g += 1;
-        else for (;;) {
+        else if (!emb_control(cp)) for (;;) {
             if (i + g >= n) break;
             uint32_t next, k = emb_char(in + i + g, n - i - g, &next);
             if (!emb_clings(next)) break;

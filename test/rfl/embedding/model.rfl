@@ -62,6 +62,11 @@
 (count (.emb.encode M (take ["x"] 0))) -- 0
 ;; The vectors are what the search takes.
 (at (at (.emb.knn (take V 6) (.emb.encode M "hello world") 1) '_rowid) 0) -- 0
+;; And what a query's `nearest:` takes.
+(set TB (table [text vec] (list (take T 6) (take V 6))))
+(set NN (select {from: TB nearest: (.emb.knn vec (.emb.encode M "a cat, hello!")) take: 2}))
+(count NN) -- 2
+(at (at NN 'text) 0) -- "a cat, hello!"
 
 ;; ────────────── the handle ──────────────
 ;; A model does not change, so another name for it is the same model, and it

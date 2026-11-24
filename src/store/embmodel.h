@@ -69,8 +69,7 @@ int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
  * (ray_pool_par_dispatch_ok), and must then check for an interrupt before it
  * trusts the vector: a cancelled dispatch leaves it unfinished.  With NULL
  * it is computed by the calling thread, as a task of a dispatch must.
- * Returns the tokens used; -1 when memory runs out, -2 when the model was
- * opened without weights. */
+ * Returns the tokens used, or -1 when memory runs out. */
 struct ray_pool;
 int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, struct ray_pool* pool,
                             const char* text, size_t len, int64_t max_tokens, float* out);

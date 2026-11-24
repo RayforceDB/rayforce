@@ -625,7 +625,8 @@ static ray_embmodel_t* embmodel_unwrap(ray_t* h) {
 }
 
 /* (.emb.model.get dir) → I64 handle (RAY_ATTR_EMBMODEL).  The directory is a
- * model as its publisher ships it: config.json and tokenizer.json. */
+ * model as its publisher ships it: config.json, tokenizer.json and
+ * model.safetensors. */
 ray_t* ray_emb_model_get_fn(ray_t* path) {
     if (!path || path->type != -RAY_STR)
         return ray_error("type", ".emb.model.get: path must be a string, got %s", ray_type_name(path ? path->type : 0));

@@ -78,13 +78,13 @@ Signature: `(.emb.hnsw.free handle)`. Releases the index now. Optional: a handle
 
 ## Text into vectors
 
-A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers, maps the weights and computes on its worker pool with the kernel that `mmu` has.
+A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernels `mmu` and `gram` have. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
 
 ```lisp
 (set m (.emb.model.get "models/my-encoder"))
 (set docs ["how to restart the service" "the quarterly numbers" "restarting after a crash"])
 (set t (table [text vec] (list docs (.emb.encode m docs))))
-(select {from: t nearest: (.emb.knn vec (.emb.encode m "restart") 2)})
+(select {from: t nearest: (.emb.knn vec (.emb.encode m "restart")) take: 2})
 ```
 
 What is read: encoders of the BERT family (`"model_type": "bert"` in `config.json`: absolute positions, GELU, layer norm after each sublayer) with a Unigram tokenizer and F32 weights. The vector of a text is the last layer averaged over its tokens and scaled to length one, so cosine distance and inner product order results alike. A model of another family is refused by name rather than computed wrongly.
