@@ -104,6 +104,11 @@
 (min (as 'DATE [200000 300000]) (as 'DATE 300000)) -- (min (list (as 'DATE 200000) (as 'DATE 300000)) (as 'DATE 300000))
 (min (as 'DATE 300000) (as 'DATE [200000 300000])) -- (min (as 'DATE 300000) (list (as 'DATE 200000) (as 'DATE 300000)))
 (min (as 'DATE 300000) (as 'DATE [200000 300000])) -- (as 'DATE [300000 300000])
+;; the last day inside the range stays below the first one past it
+(min (as 'DATE [106752 106752]) (as 'DATE 106751)) -- (min (list (as 'DATE 106752) (as 'DATE 106752)) (as 'DATE 106751))
+(min (as 'DATE [106752 106752]) (as 'DATE 106751)) -- (as 'DATE [106751 106751])
+(max (as 'DATE [-106752 -106752]) (as 'DATE -106751)) -- (as 'DATE [-106751 -106751])
+(min (as 'DATE [106752 106751]) (as 'DATE [106751 106752])) -- (as 'DATE [106751 106751])
 ;; the cell is null by its payload, whatever the vector's null flag says
 (min (til 3) 0Nl) -- [0Nl 0Nl 0Nl]
 (max (til 3) 0Nl) -- [0 1 2]
