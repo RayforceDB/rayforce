@@ -277,15 +277,24 @@ int64_t ray_sym_domain_find(ray_sym_domain_t* dom, const char* str, size_t len);
  * DIFFERENT domains): pos[i] = ray_sym_domain_find(dst, string of ids[i]),
  * -1 when `dst` lacks the string or `src` cannot resolve the id; id 0, the
  * null in every domain, stays 0 without a lookup.  Nothing is interned.
- * What one call finds is kept in a per-pair cache (id → position, bounded
- * by the distinct ids ever asked) that lives until either domain is
- * released, so a repeated id, in one call or the next, is a hash lookup;
+ * What one call finds is kept in a per-pair cache (id → position, 8 bytes
+ * per distinct id ever asked, all pairs together under a bound of memory)
+ * that lives until either domain is released or the runtime table is
+ * destroyed, so a repeated id, in one call or the next, is a hash lookup;
  * a -1 is dropped once `dst` has grown, since the string may have arrived.
- * Returns the number of ids resolved by string lookup (the cache misses),
- * or -1 on OOM.  `pos` may be `ids` itself.  Sequential: callers run it in
- * setup, never in a worker. */
+ * Ids the cache cannot keep are memoized for the call.  Returns the number
+ * of ids resolved by string lookup (the cache misses); never fails (short
+ * of memory it looks up).  `pos` may be `ids` itself.  Sequential: callers
+ * run it in setup, never in a worker. */
 int64_t ray_sym_domain_xlat(ray_sym_domain_t* src, ray_sym_domain_t* dst,
                             const int64_t* ids, int64_t n, int64_t* pos);
+/* Drops every translation cache: ray_sym_destroy calls it, as the runtime
+ * table's ids are about to be reassigned. */
+void ray_sym_domain_xlat_reset(void);
+/* Test hooks: the byte bound all translation caches share (0 = the
+ * default, a sixteenth of the anon watermark), and the bytes they hold. */
+void   ray_sym_domain_test_xlat_bound(size_t bytes);
+size_t ray_sym_domain_test_xlat_bytes(void);
 
 /* Position → runtime-intern-id translation table.
  *

@@ -801,16 +801,93 @@ static test_result_t test_jp_sym_domains(void) {
     TEST_ASSERT_EQ_I(rows, 10);
     ray_release(t);
     TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 20);
-    /* (TWO's 20 ids are among BIG3's 1500 and already in the pair's cache) */
+    /* Under a byte bound the caches together may not pass, the pair's
+     * table keeps what it holds (20 ids, 1024 slots) and takes 492 more
+     * (its load bound); the other 988 ids are memoized for the call only.
+     * (TWO's 20 ids are among BIG3's 1500 and already in the cache.) */
+    size_t bytes0 = ray_sym_domain_test_xlat_bytes();
+    ray_sym_domain_test_xlat_bound(bytes0 + 8 * 1024);     /* no room to double */
     t = jsd_eval_rows("(inner-join [k] BIG BIG3)", &rows);
     TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
     ray_release(t);
     TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_xlat_bytes(), bytes0);
     t = jsd_eval_rows("(inner-join [k] BIG3 BIG)", &rows);
     TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
     ray_release(t);
-    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500 + 988);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_xlat_bytes(), bytes0);
+    /* room again: the next call keeps the 988 (1024 -> 4096 slots), the
+     * one after is all hits */
+    ray_sym_domain_test_xlat_bound(0);
+    t = jsd_eval_rows("(inner-join [k] BIG3 BIG)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500 + 2 * 988);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_xlat_bytes(), bytes0 + 3 * 8 * 1024);
+    t = jsd_eval_rows("(inner-join [k] BIG BIG3)", &rows);
+    TEST_ASSERT_EQ_I(rows, 10 * 70 * (JSD_BIG3 / 1500));
+    ray_release(t);
+    TEST_ASSERT_EQ_I(ray_join_test_sym_finds() - finds0, 1500 + 2 * 988);
     TEST_ASSERT_EQ_I(ray_sym_count(), c1);
+    /* the null stays the null, a negative id (no cell holds one) names
+     * nothing, neither is looked up */
+    int64_t odd[3] = { -1, 0, p1[5] };
+    TEST_ASSERT_EQ_I(ray_sym_domain_xlat(d1, ray_sym_runtime_domain(), odd, 3, odd), 1);  /* jsd5 only */
+    TEST_ASSERT_EQ_I(odd[0], -1);
+    TEST_ASSERT_EQ_I(odd[1], 0);
+    TEST_ASSERT_EQ_I(odd[2], ray_sym_find("jsd5", 4));
+    int64_t odd2[3] = { -1, 0, p1[5] };
+    TEST_ASSERT_EQ_I(ray_sym_domain_xlat(d1, ray_sym_runtime_domain(), odd2, 3, odd2), 0);
+    TEST_ASSERT_EQ_I(odd2[0], -1);
+    TEST_ASSERT_EQ_I(odd2[2], odd[2]);
+    PASS();
+}
+
+/* A FILE domain a holder keeps across a runtime restart (an embedding host
+ * that re-creates the runtime): what was translated into the old runtime
+ * table dies with it -- the new table assigns ids afresh. */
+static test_result_t test_jp_sym_domains_restart(void) {
+    ray_sym_domain_t* d = ray_sym_domain_open_or_create(ray_test_tmp(JP_TMP "/dr.sym"));
+    TEST_ASSERT(d, "a symfile domain");
+    static int64_t p[10];
+    char buf[32];
+    for (int64_t i = 0; i < 10; i++) {
+        int n = snprintf(buf, sizeof buf, "jsr%lld", (long long)i);
+        p[i] = ray_sym_domain_intern(d, buf, (size_t)n);
+        TEST_ASSERT(p[i] > 0, "appended to the symfile");
+    }
+    /* F (10 rows over d) is the side translated into the runtime table */
+    jp_bind("F", jsd_table(d, p, 10, "v"));
+    ray_t* e = ray_eval_str("(set RT (table [k x] (list (as 'SYM [\"jsr3\" \"jsr5\" \"jsr_none\"]) [1 2 3])))");
+    TEST_ASSERT(e && !RAY_IS_ERR(e), "RT");
+    ray_release(e);
+    int64_t rows = 0;
+    ray_t* t = jsd_eval_rows("(inner-join [k] F RT)", &rows);
+    TEST_ASSERT_EQ_I(rows, 2);
+    ray_release(t);
+    t = ray_eval_str("(sum (at (inner-join [k] F RT) 'x))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "sum");
+    TEST_ASSERT_EQ_I(t->i64, 1 + 2);
+    ray_release(t);
+
+    /* the runtime restarts under d (this holder keeps it); the same three
+     * strings are interned in the other order, so an id the old table gave
+     * jsr3 now names another string */
+    ray_runtime_destroy(__RUNTIME);
+    ray_runtime_create(0, NULL);
+    jp_bind("F", jsd_table(d, p, 10, "v"));
+    e = ray_eval_str("(set RT (table [k x] (list (as 'SYM [\"jsr_none\" \"jsr5\" \"jsr3\"]) [3 2 1])))");
+    TEST_ASSERT(e && !RAY_IS_ERR(e), "RT");
+    ray_release(e);
+    t = jsd_eval_rows("(inner-join [k] F RT)", &rows);
+    TEST_ASSERT_EQ_I(rows, 2);
+    ray_release(t);
+    t = ray_eval_str("(sum (at (inner-join [k] F RT) 'x))");
+    TEST_ASSERT(t && !RAY_IS_ERR(t), "sum");
+    TEST_ASSERT_EQ_I(t->i64, 1 + 2);
+    ray_release(t);
+    ray_sym_domain_release(d);
     PASS();
 }
 
@@ -827,5 +904,6 @@ const test_entry_t join_prefilter_entries[] = {
     { "join_prefilter/knob",                 test_jp_knob,                 jp_setup, jp_teardown },
     { "join_prefilter/par_min",              test_jp_par_min,              jp_setup, jp_teardown },
     { "join_prefilter/sym_domains",          test_jp_sym_domains,          jp_setup, jp_teardown },
+    { "join_prefilter/sym_domains_restart",  test_jp_sym_domains_restart,  jp_setup, jp_teardown },
     { NULL, NULL, NULL, NULL },
 };

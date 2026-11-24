@@ -240,6 +240,9 @@ ray_err_t ray_sym_init(void) {
 void ray_sym_destroy(void) {
     atomic_fetch_add_explicit(&g_sym_epoch_ctr, 1, memory_order_release);
     if (!atomic_load_explicit(&g_sym_inited, memory_order_acquire)) return;
+    /* the next table assigns ids afresh: no translation into or out of
+     * this one may survive it (a FILE domain its holders keep does) */
+    ray_sym_domain_xlat_reset();
 
     if (g_sym.lazy_map) {
         ray_vm_unmap_file(g_sym.lazy_map, g_sym.lazy_size);
