@@ -25,8 +25,8 @@
 #define RAY_EMBMODEL_H
 
 /*
- * embmodel.h -- a text-embedding model held by the engine: its tokenizer and,
- * in time, its weights (docs/docs/namespaces/emb.md).
+ * embmodel.h -- a text-embedding model held by the engine: its tokenizer and
+ * its weights (docs/docs/namespaces/emb.md).
  *
  * A model is opened from a directory as its publisher ships it (config.json,
  * tokenizer.json, model.safetensors) and never changes afterwards, so every
@@ -60,5 +60,13 @@ void ray_embwork_free(ray_embwork_t* w);
  * Returns how many, or -1 when memory runs out. */
 int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
                             const char* text, size_t len, const int32_t** ids);
+
+/* The vector of `text` in out[0 .. dim): the encoder's last layer averaged
+ * over the tokens and scaled to length one.  A text longer than the model's
+ * limit, or than max_tokens when that is positive and smaller, is cut to its
+ * beginning.  Returns the tokens used; -1 when memory runs out, -2 when the
+ * model was opened without weights. */
+int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, const char* text, size_t len,
+                            int64_t max_tokens, float* out);
 
 #endif /* RAY_EMBMODEL_H */

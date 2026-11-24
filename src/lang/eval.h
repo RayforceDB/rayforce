@@ -479,6 +479,9 @@ ray_t* ray_lsq_fn(ray_t* b, ray_t* a);
 ray_t* ray_inv_fn(ray_t* x);
 ray_t* ray_flip_mat_fn(ray_t* x);
 ray_t* ray_gram_fn(ray_t* x);
+/* The matrix product's F32 kernel over rows (ops/linalg.c): c += a * b. */
+void ray_lin_gemm_acc_f32(const float* const* a, const float* const* b, float* c,
+                          int64_t r, int64_t k, int64_t cols);
 ray_t* ray_l2_dist_fn(ray_t* a, ray_t* b);
 ray_t* ray_norm_fn(ray_t* x);
 ray_t* ray_knn_fn(ray_t** args, int64_t n);
@@ -491,6 +494,7 @@ ray_t* ray_hnsw_info_fn(ray_t* h);
 ray_t* ray_emb_model_get_fn(ray_t* path);
 ray_t* ray_emb_model_info_fn(ray_t* h);
 ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x);
+ray_t* ray_emb_encode_fn(ray_t** args, int64_t n);
 
 /* Cast and type */
 ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val);

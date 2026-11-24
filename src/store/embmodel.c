@@ -35,16 +35,42 @@
 #define emb_alloc(n) ray_sys_alloc(n)
 #define emb_free(p)  do { void* p_ = (p); if (p_) ray_sys_free(p_); } while (0)
 #include "store/embtok.h"
+#include "core/platform.h"
+#include <math.h>
+
+/* One layer of the encoder.  A dense weight is kept as the kernel wants it:
+ * [in x out], rows in one block, with the pointers to its rows beside it. */
+typedef struct {
+    float *qkv, *qkv_b;  const float** qkv_r;   /* H x 3H: query, key and value side by side */
+    float *ao,  *ao_b;   const float** ao_r;    /* H x H */
+    float *in,  *in_b;   const float** in_r;    /* H x I */
+    float *out, *out_b;  const float** out_r;   /* I x H */
+    float *ln1_w, *ln1_b, *ln2_w, *ln2_b;       /* H each */
+} emb_layer_t;
 
 struct ray_embmodel {
     _Atomic(int64_t) rc;
     emb_tok_t* tok;
     int64_t dim, layers, heads, inner, max_tokens;
     char kind[32];
+    /* the weights */
+    void* map; size_t map_len;                 /* model.safetensors, mapped */
+    const float *word, *pos, *type;            /* the three tables, in the mapping */
+    int64_t words;                             /* rows of `word` */
+    float *eln_w, *eln_b;                      /* the embeddings' layer norm */
+    float eps;
+    emb_layer_t* layer;
+    void** owned; int64_t n_owned;             /* every block the weights own */
 };
 
 struct ray_embwork {
     emb_scratch_t scratch;
+    /* the forward pass, sized for `cap` tokens */
+    int64_t cap;
+    float *x, *qkv, *kt, *sc, *ch, *ctx, *mid;
+    const float** rows;   /* pointers to the rows of whatever is on the left */
+    const float** krows;  /* and to the rows of the transposed keys of one head */
+    const float** vrows;  /* and to one head's values */
 };
 
 void ray_embmodel_retain(ray_embmodel_t* m) {
@@ -55,6 +81,10 @@ void ray_embmodel_release(ray_embmodel_t* m) {
     if (!m) return;
     if (atomic_fetch_sub_explicit(&m->rc, 1, memory_order_acq_rel) != 1) return;
     emb_tok_free(m->tok);
+    for (int64_t i = 0; i < m->n_owned; i++) ray_sys_free(m->owned[i]);
+    if (m->owned) ray_sys_free(m->owned);
+    if (m->layer) ray_sys_free(m->layer);
+    if (m->map) ray_vm_unmap_file(m->map, m->map_len);
     ray_sys_free(m);
 }
 
@@ -69,16 +99,186 @@ ray_embwork_t* ray_embwork_new(const ray_embmodel_t* m) {
     return w;
 }
 
+static void emb_work_drop(ray_embwork_t* w) {
+    emb_free(w->x); emb_free(w->qkv); emb_free(w->kt); emb_free(w->sc); emb_free(w->ch);
+    emb_free(w->ctx); emb_free(w->mid); emb_free((void*)w->rows); emb_free((void*)w->krows); emb_free((void*)w->vrows);
+    w->x = w->qkv = w->kt = w->sc = w->ch = w->ctx = w->mid = NULL;
+    w->rows = w->krows = w->vrows = NULL;
+    w->cap = 0;
+}
+
 void ray_embwork_free(ray_embwork_t* w) {
     if (!w) return;
     emb_scratch_free(&w->scratch);
+    emb_work_drop(w);
     ray_sys_free(w);
+}
+
+/* Room for a text of t tokens. */
+static bool emb_work_fit(const ray_embmodel_t* m, ray_embwork_t* w, int64_t t) {
+    if (t <= w->cap) return true;
+    emb_work_drop(w);
+    size_t T = (size_t)t, H = (size_t)m->dim, I = (size_t)m->inner, dh = H / (size_t)m->heads;
+    w->x   = (float*)ray_sys_alloc(T * H * sizeof(float));
+    w->qkv = (float*)ray_sys_alloc(T * 3 * H * sizeof(float));
+    w->kt  = (float*)ray_sys_alloc(dh * T * sizeof(float));
+    w->sc  = (float*)ray_sys_alloc(T * T * sizeof(float));
+    w->ch  = (float*)ray_sys_alloc(T * dh * sizeof(float));
+    w->ctx = (float*)ray_sys_alloc(T * H * sizeof(float));
+    w->mid = (float*)ray_sys_alloc(T * I * sizeof(float));
+    w->rows  = (const float**)ray_sys_alloc(T * sizeof(float*));
+    w->krows = (const float**)ray_sys_alloc(dh * sizeof(float*));
+    w->vrows = (const float**)ray_sys_alloc(T * sizeof(float*));
+    if (!w->x || !w->qkv || !w->kt || !w->sc || !w->ch || !w->ctx || !w->mid || !w->rows || !w->krows || !w->vrows) { emb_work_drop(w); return false; }
+    w->cap = t;
+    return true;
 }
 
 int64_t ray_embmodel_tokens(const ray_embmodel_t* m, ray_embwork_t* w,
                             const char* text, size_t len, const int32_t** ids) {
     int64_t n = emb_tok_encode(m->tok, &w->scratch, text, len);
     *ids = w->scratch.ids;
+    return n;
+}
+
+
+/* ---- the forward pass ---------------------------------------------------- */
+
+/* exp for the softmax: x <= 0 there.  Range reduction by powers of two and a
+ * polynomial on the remainder, written so that the loop it sits in turns into
+ * SIMD; within 2e-7 of the library's, relatively. */
+static inline float emb_exp(float x) {
+    x = x < -87.0f ? -87.0f : x;
+    float n = __builtin_floorf(x * 1.44269504088896341f + 0.5f);
+    float r = x - n * 0.693359375f + n * 2.12194440e-4f;
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    float e = p * r * r + r + 1.0f;
+    int32_t bits = ((int32_t)n + 127) << 23;
+    float scale;
+    memcpy(&scale, &bits, sizeof scale);
+    return e * scale;
+}
+
+/* gelu as the models are trained with it, x/2 (1 + erf(x/sqrt 2)), with erf
+ * by a rational form that needs no exp (Abramowitz and Stegun 7.1.28, within
+ * 3e-7): it too is written to turn into SIMD. */
+static inline float emb_gelu(float x) {
+    float z = __builtin_fabsf(x) * 0.70710678118654752f;
+    float d = 1.0f + z * (0.0705230784f + z * (0.0422820123f + z * (0.0092705272f
+              + z * (0.0001520143f + z * (0.0002765672f + z * 0.0000430638f)))));
+    d *= d; d *= d; d *= d; d *= d;
+    float erf = 1.0f - 1.0f / d;
+    return 0.5f * x * (1.0f + __builtin_copysignf(erf, x));
+}
+
+/* y = (x - mean) / sqrt(var + eps) * w + b over each row of x, in place. */
+static void emb_layer_norm(float* x, int64_t t, int64_t h, const float* w, const float* b, float eps) {
+    for (int64_t i = 0; i < t; i++) {
+        float* r = x + i * h;
+        float mean = 0.0f;
+        for (int64_t j = 0; j < h; j++) mean += r[j];
+        mean /= (float)h;
+        float var = 0.0f;
+        for (int64_t j = 0; j < h; j++) { float d = r[j] - mean; var += d * d; }
+        float inv = 1.0f / __builtin_sqrtf(var / (float)h + eps);
+        for (int64_t j = 0; j < h; j++) r[j] = (r[j] - mean) * inv * w[j] + b[j];
+    }
+}
+
+/* c[t x cols] = bias under every row, then += a * b through the kernel the
+ * matrix product has (ops/linalg.c). */
+static void emb_dense(const float* a, int64_t t, int64_t k, const float* const* b_rows, const float* bias,
+                      float* c, int64_t cols, const float** rows) {
+    for (int64_t i = 0; i < t; i++) { rows[i] = a + i * k; memcpy(c + i * cols, bias, (size_t)cols * sizeof(float)); }
+    ray_lin_gemm_acc_f32(rows, b_rows, c, t, k, cols);
+}
+
+/* The vector of the tokens `ids` (t of them, t <= w->cap): the encoder's
+ * last layer averaged over the tokens, scaled to length one. */
+static void emb_forward(const ray_embmodel_t* m, ray_embwork_t* w, const int32_t* ids, int64_t t, float* out) {
+    const int64_t H = m->dim, I = m->inner, nh = m->heads, dh = H / nh;
+    float* x = w->x;
+    for (int64_t i = 0; i < t; i++) {
+        int64_t id = ids[i] >= 0 && ids[i] < m->words ? ids[i] : m->tok->unk;
+        const float* e = m->word + id * H;
+        const float* p = m->pos + i * H;
+        float* r = x + i * H;
+        for (int64_t j = 0; j < H; j++) r[j] = e[j] + p[j] + m->type[j];
+    }
+    emb_layer_norm(x, t, H, m->eln_w, m->eln_b, m->eps);
+    const float scale = 1.0f / __builtin_sqrtf((float)dh);
+    for (int64_t l = 0; l < m->layers; l++) {
+        const emb_layer_t* L = &m->layer[l];
+        /* query, key and value in one product */
+        emb_dense(x, t, H, L->qkv_r, L->qkv_b, w->qkv, 3 * H, w->rows);
+        for (int64_t h = 0; h < nh; h++) {
+            const float* q0 = w->qkv + h * dh;
+            const float* k0 = w->qkv + H + h * dh;
+            const float* v0 = w->qkv + 2 * H + h * dh;
+            /* the keys of this head turned on their side: dh rows of t */
+            for (int64_t d = 0; d < dh; d++) {
+                float* kr = w->kt + d * t;
+                w->krows[d] = kr;
+                for (int64_t i = 0; i < t; i++) kr[i] = k0[i * 3 * H + d] * scale;
+            }
+            for (int64_t i = 0; i < t; i++) w->rows[i] = q0 + i * 3 * H;
+            memset(w->sc, 0, (size_t)t * (size_t)t * sizeof(float));
+            ray_lin_gemm_acc_f32(w->rows, w->krows, w->sc, t, dh, t);
+            for (int64_t i = 0; i < t; i++) {
+                float* r = w->sc + i * t;
+                float mx = r[0];
+                for (int64_t j = 1; j < t; j++) mx = r[j] > mx ? r[j] : mx;
+                float sum = 0.0f;
+                for (int64_t j = 0; j < t; j++) { r[j] = emb_exp(r[j] - mx); sum += r[j]; }
+                float inv = 1.0f / sum;
+                for (int64_t j = 0; j < t; j++) r[j] *= inv;
+            }
+            /* the weighted values: t x dh, then into this head's columns */
+            for (int64_t i = 0; i < t; i++) w->rows[i] = w->sc + i * t;
+            /* the values of this head are rows already, t of them, in qkv */
+            for (int64_t i = 0; i < t; i++) w->vrows[i] = v0 + i * 3 * H;
+            memset(w->ch, 0, (size_t)t * (size_t)dh * sizeof(float));
+            ray_lin_gemm_acc_f32(w->rows, w->vrows, w->ch, t, t, dh);
+            for (int64_t i = 0; i < t; i++) memcpy(w->ctx + i * H + h * dh, w->ch + i * dh, (size_t)dh * sizeof(float));
+        }
+        /* attention's output, added to what came in, normalized */
+        emb_dense(w->ctx, t, H, L->ao_r, L->ao_b, w->qkv, H, w->rows);
+        for (int64_t i = 0; i < t * H; i++) x[i] += w->qkv[i];
+        emb_layer_norm(x, t, H, L->ln1_w, L->ln1_b, m->eps);
+        /* the wide layer, gelu, back to H, added, normalized */
+        emb_dense(x, t, H, L->in_r, L->in_b, w->mid, I, w->rows);
+        for (int64_t i = 0; i < t * I; i++) w->mid[i] = emb_gelu(w->mid[i]);
+        emb_dense(w->mid, t, I, L->out_r, L->out_b, w->qkv, H, w->rows);
+        for (int64_t i = 0; i < t * H; i++) x[i] += w->qkv[i];
+        emb_layer_norm(x, t, H, L->ln2_w, L->ln2_b, m->eps);
+    }
+    for (int64_t j = 0; j < H; j++) out[j] = 0.0f;
+    for (int64_t i = 0; i < t; i++) { const float* r = x + i * H; for (int64_t j = 0; j < H; j++) out[j] += r[j]; }
+    float nn = 0.0f;
+    for (int64_t j = 0; j < H; j++) { out[j] /= (float)t; nn += out[j] * out[j]; }
+    float inv = nn > 0.0f ? 1.0f / __builtin_sqrtf(nn) : 0.0f;
+    for (int64_t j = 0; j < H; j++) out[j] *= inv;
+}
+
+int64_t ray_embmodel_encode(const ray_embmodel_t* m, ray_embwork_t* w, const char* text, size_t len,
+                            int64_t max_tokens, float* out) {
+    if (!m->layer) return -2;
+    int64_t n = emb_tok_encode(m->tok, &w->scratch, text, len);
+    if (n < 0) return -1;
+    int64_t cap = max_tokens > 0 && max_tokens < m->max_tokens ? max_tokens : m->max_tokens;
+    if (cap < 2) cap = 2;
+    if (n > cap) {
+        /* The beginning is kept, and the end mark with it. */
+        w->scratch.ids[cap - 1] = m->tok->eos;
+        n = cap;
+    }
+    if (!emb_work_fit(m, w, n)) return -1;
+    emb_forward(m, w, w->scratch.ids, n, out);
     return n;
 }
 
@@ -167,6 +367,185 @@ static uint8_t* emb_base64(const char* s, size_t n, size_t* out_len) {
     }
     *out_len = w;
     return out;
+}
+
+/* ---- the weights ---------------------------------------------------------- */
+
+/* A block the model owns until it is freed; NULL when memory runs out. */
+static void* emb_own(ray_embmodel_t* m, size_t bytes) {
+    void* p = ray_sys_alloc(bytes ? bytes : 1);
+    if (!p) return NULL;
+    void** grown = (void**)ray_sys_alloc(((size_t)m->n_owned + 1) * sizeof(void*));
+    if (!grown) { ray_sys_free(p); return NULL; }
+    if (m->owned) { memcpy(grown, m->owned, (size_t)m->n_owned * sizeof(void*)); ray_sys_free(m->owned); }
+    m->owned = grown;
+    m->owned[m->n_owned++] = p;
+    return p;
+}
+
+typedef struct {
+    ray_t* head;          /* the file's table of tensors, parsed */
+    const char* base;     /* where the tensors' bytes begin */
+    size_t room;          /* and how many there are */
+    const char* prefix;   /* some files name every tensor under "bert." */
+} emb_file_t;
+
+/* The F32 tensor `name` of the shape given (cols 0 for a vector), in the
+ * mapping; NULL when it is missing or is not that. */
+static const float* emb_tensor(const emb_file_t* f, const char* name, int64_t rows, int64_t cols) {
+    char full[160];
+    int k = snprintf(full, sizeof full, "%s%s", f->prefix, name);
+    if (k < 0 || (size_t)k >= sizeof full) return NULL;
+    const float* out = NULL;
+    ray_t *key = ray_str(full, (size_t)k), *t = NULL, *dt = NULL, *sh = NULL, *off = NULL, *kk = NULL;
+    if (!key || RAY_IS_ERR(key)) return NULL;
+    t = ray_dict_get(f->head, key);
+    ray_release(key);
+    if (!t || RAY_IS_ERR(t) || t->type != RAY_DICT) goto done;
+#define EMB_GET(dst, lit) do { kk = ray_str(lit, sizeof(lit) - 1); dst = kk && !RAY_IS_ERR(kk) ? ray_dict_get(t, kk) : NULL; if (kk) ray_release(kk); } while (0)
+    EMB_GET(dt, "dtype"); EMB_GET(sh, "shape"); EMB_GET(off, "data_offsets");
+#undef EMB_GET
+    if (!emb_is_str(dt) || ray_str_len(dt) != 3 || memcmp(ray_str_ptr(dt), "F32", 3) != 0) goto done;
+    if (!sh || sh->type != RAY_I64 || !off || off->type != RAY_I64 || off->len != 2) goto done;
+    const int64_t* shape = (const int64_t*)ray_data(sh);
+    if (cols == 0 ? !(sh->len == 1 && shape[0] == rows) : !(sh->len == 2 && shape[0] == rows && shape[1] == cols)) goto done;
+    const int64_t* o = (const int64_t*)ray_data(off);
+    size_t want = (size_t)rows * (size_t)(cols ? cols : 1) * sizeof(float);
+    if (o[0] < 0 || o[1] < o[0] || (size_t)(o[1] - o[0]) != want || (size_t)o[1] > f->room) goto done;
+    const char* at = f->base + o[0];
+    if (((uintptr_t)at & (sizeof(float) - 1)) != 0) goto done;   /* a file that lays floats off their boundary is not read */
+    out = (const float*)(const void*)at;
+done:
+    if (t) ray_release(t);
+    if (dt) ray_release(dt);
+    if (sh) ray_release(sh);
+    if (off) ray_release(off);
+    return out;
+}
+
+/* A dense weight as the file has it, [out x in], turned to [in x out] into
+ * dst at a column offset, dst being `stride` wide. */
+static void emb_turn(const float* w, int64_t out, int64_t in, float* dst, int64_t stride, int64_t at) {
+    for (int64_t o = 0; o < out; o++) {
+        const float* row = w + o * in;
+        for (int64_t i = 0; i < in; i++) dst[i * stride + at + o] = row[i];
+    }
+}
+
+static const float** emb_rows(ray_embmodel_t* m, const float* b, int64_t k, int64_t stride) {
+    const float** r = (const float**)emb_own(m, (size_t)k * sizeof(float*));
+    if (!r) return NULL;
+    for (int64_t i = 0; i < k; i++) r[i] = b + i * stride;
+    return r;
+}
+
+static float* emb_copy(ray_embmodel_t* m, const float* src, int64_t n) {
+    float* p = src ? (float*)emb_own(m, (size_t)n * sizeof(float)) : NULL;
+    if (p) memcpy(p, src, (size_t)n * sizeof(float));
+    return p;
+}
+
+/* Maps model.safetensors and lays the encoder's weights out.  False with
+ * *err set when the file is missing, is not in form, or lacks a tensor. */
+static bool emb_read_weights(ray_embmodel_t* m, const char* dir, ray_t* limits, ray_t** err) {
+    char path[1200];
+    int pk = snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    if (pk < 0 || (size_t)pk >= sizeof path) { *err = ray_error("domain", ".emb.model.get: the path of model.safetensors is too long"); return false; }
+    m->map = ray_vm_map_file(path, &m->map_len);
+    if (!m->map) { *err = ray_error("io", ".emb.model.get: cannot map %s", path); return false; }
+    uint64_t hlen = 0;
+    if (m->map_len >= 8) memcpy(&hlen, m->map, 8);
+    if (m->map_len < 8 || hlen == 0 || hlen > m->map_len - 8) { *err = ray_error("domain", ".emb.model.get: %s is not a safetensors file", path); return false; }
+    ray_t* text = ray_str((const char*)m->map + 8, (size_t)hlen);
+    if (!text || RAY_IS_ERR(text)) { *err = text ? text : ray_error("oom", NULL); return false; }
+    ray_t* args[2] = { text, limits };
+    ray_t* head = ray_json_parse_fn(args, 2);
+    ray_release(text);
+    if (!head || RAY_IS_ERR(head) || head->type != RAY_DICT) {
+        if (head) ray_release(head);
+        *err = ray_error("domain", ".emb.model.get: the table of tensors in %s cannot be read", path);
+        return false;
+    }
+    emb_file_t f = { .head = head, .base = (const char*)m->map + 8 + hlen, .room = m->map_len - 8 - (size_t)hlen, .prefix = "" };
+    const int64_t H = m->dim, I = m->inner, P = m->max_tokens;
+    const char* missing = NULL;
+    bool ok = false;
+#define EMB_NEED(dst, name, r, c) do { dst = emb_tensor(&f, name, r, c); if (!dst) { missing = name; goto done; } } while (0)
+    /* The first table tells how many tokens the weights know, and whether the names carry a prefix. */
+    {
+        static const char* const prefixes[] = { "", "bert.", "roberta.", "model." };
+        int64_t words = 0;
+        for (size_t pi = 0; pi < sizeof prefixes / sizeof prefixes[0] && words == 0; pi++) {
+            char name[160];
+            int k = snprintf(name, sizeof name, "%sembeddings.word_embeddings.weight", prefixes[pi]);
+            ray_t* key = ray_str(name, (size_t)k);
+            ray_t* t = key && !RAY_IS_ERR(key) ? ray_dict_get(head, key) : NULL;
+            if (key) ray_release(key);
+            if (t && !RAY_IS_ERR(t) && t->type == RAY_DICT) {
+                ray_t* kk = ray_str("shape", 5);
+                ray_t* sh = ray_dict_get(t, kk);
+                ray_release(kk);
+                if (sh && sh->type == RAY_I64 && sh->len == 2 && ((const int64_t*)ray_data(sh))[1] == H) {
+                    words = ((const int64_t*)ray_data(sh))[0];
+                    f.prefix = prefixes[pi];
+                }
+                if (sh) ray_release(sh);
+            }
+            if (t) ray_release(t);
+        }
+        if (words <= 0) { missing = "embeddings.word_embeddings.weight"; goto done; }
+        m->words = words;
+    }
+    const float *w, *b;
+    EMB_NEED(m->word, "embeddings.word_embeddings.weight", m->words, H);
+    EMB_NEED(m->pos,  "embeddings.position_embeddings.weight", P, H);
+    EMB_NEED(w, "embeddings.token_type_embeddings.weight", 2, H);
+    m->type = w;
+    EMB_NEED(w, "embeddings.LayerNorm.weight", H, 0);
+    EMB_NEED(b, "embeddings.LayerNorm.bias", H, 0);
+    m->eln_w = emb_copy(m, w, H); m->eln_b = emb_copy(m, b, H);
+    m->layer = (emb_layer_t*)ray_sys_alloc((size_t)m->layers * sizeof(emb_layer_t));
+    if (!m->eln_w || !m->eln_b || !m->layer) { *err = ray_error("oom", NULL); goto done; }
+    for (int64_t l = 0; l < m->layers; l++) {
+        emb_layer_t* L = &m->layer[l];
+        char name[160];
+#define EMB_L(dst, suffix, r, c) do { snprintf(name, sizeof name, "encoder.layer.%lld.%s", (long long)l, suffix); dst = emb_tensor(&f, name, r, c); if (!dst) { missing = suffix; goto done; } } while (0)
+        const float *qw, *qb, *kw, *kb, *vw, *vb, *aw, *ab, *iw, *ib, *ow, *ob, *n1w, *n1b, *n2w, *n2b;
+        EMB_L(qw, "attention.self.query.weight", H, H); EMB_L(qb, "attention.self.query.bias", H, 0);
+        EMB_L(kw, "attention.self.key.weight", H, H);   EMB_L(kb, "attention.self.key.bias", H, 0);
+        EMB_L(vw, "attention.self.value.weight", H, H); EMB_L(vb, "attention.self.value.bias", H, 0);
+        EMB_L(aw, "attention.output.dense.weight", H, H); EMB_L(ab, "attention.output.dense.bias", H, 0);
+        EMB_L(n1w, "attention.output.LayerNorm.weight", H, 0); EMB_L(n1b, "attention.output.LayerNorm.bias", H, 0);
+        EMB_L(iw, "intermediate.dense.weight", I, H); EMB_L(ib, "intermediate.dense.bias", I, 0);
+        EMB_L(ow, "output.dense.weight", H, I); EMB_L(ob, "output.dense.bias", H, 0);
+        EMB_L(n2w, "output.LayerNorm.weight", H, 0); EMB_L(n2b, "output.LayerNorm.bias", H, 0);
+#undef EMB_L
+        L->qkv = (float*)emb_own(m, (size_t)H * 3 * (size_t)H * sizeof(float));
+        L->qkv_b = (float*)emb_own(m, 3 * (size_t)H * sizeof(float));
+        L->ao  = (float*)emb_own(m, (size_t)H * (size_t)H * sizeof(float));
+        L->in  = (float*)emb_own(m, (size_t)H * (size_t)I * sizeof(float));
+        L->out = (float*)emb_own(m, (size_t)I * (size_t)H * sizeof(float));
+        if (!L->qkv || !L->qkv_b || !L->ao || !L->in || !L->out) { *err = ray_error("oom", NULL); goto done; }
+        emb_turn(qw, H, H, L->qkv, 3 * H, 0); emb_turn(kw, H, H, L->qkv, 3 * H, H); emb_turn(vw, H, H, L->qkv, 3 * H, 2 * H);
+        memcpy(L->qkv_b, qb, (size_t)H * sizeof(float)); memcpy(L->qkv_b + H, kb, (size_t)H * sizeof(float)); memcpy(L->qkv_b + 2 * H, vb, (size_t)H * sizeof(float));
+        emb_turn(aw, H, H, L->ao, H, 0);
+        emb_turn(iw, I, H, L->in, I, 0);
+        emb_turn(ow, H, I, L->out, H, 0);
+        L->ao_b = emb_copy(m, ab, H); L->in_b = emb_copy(m, ib, I); L->out_b = emb_copy(m, ob, H);
+        L->ln1_w = emb_copy(m, n1w, H); L->ln1_b = emb_copy(m, n1b, H); L->ln2_w = emb_copy(m, n2w, H); L->ln2_b = emb_copy(m, n2b, H);
+        L->qkv_r = emb_rows(m, L->qkv, H, 3 * H); L->ao_r = emb_rows(m, L->ao, H, H);
+        L->in_r = emb_rows(m, L->in, H, I); L->out_r = emb_rows(m, L->out, I, H);
+        if (!L->ao_b || !L->in_b || !L->out_b || !L->ln1_w || !L->ln1_b || !L->ln2_w || !L->ln2_b || !L->qkv_r || !L->ao_r || !L->in_r || !L->out_r) {
+            *err = ray_error("oom", NULL); goto done;
+        }
+    }
+    ok = true;
+done:
+#undef EMB_NEED
+    ray_release(head);
+    if (!ok && !*err)
+        *err = ray_error("domain", ".emb.model.get: %s has no F32 tensor %s%s of the shape config.json describes", path, f.prefix, missing ? missing : "?");
+    return ok;
 }
 
 /* The tokenizer described by tokenizer.json; NULL with *err set otherwise. */
@@ -262,8 +641,19 @@ ray_embmodel_t* ray_embmodel_open(const char* dir, ray_t** err) {
         *err = ray_error("domain", ".emb.model.get: config.json does not describe an encoder: hidden_size, num_hidden_layers, num_attention_heads, intermediate_size and max_position_embeddings are needed");
         goto fail;
     }
+    {
+        ray_t* e = emb_field(cfg, "layer_norm_eps", limits);
+        m->eps = e && !RAY_IS_ERR(e) && e->type == -RAY_F64 ? (float)e->f64 : 1e-12f;
+        if (e) ray_release(e);
+    }
+    /* Positions that begin after a padding index, as the roberta family counts them, are not read yet. */
+    if (strcmp(m->kind, "bert") != 0) {
+        *err = ray_error("domain", ".emb.model.get: config.json names a model of the kind '%s'; the one kind read is bert", m->kind[0] ? m->kind : "?");
+        goto fail;
+    }
     m->tok = emb_read_tokenizer(dir, limits, err);
     if (!m->tok) goto fail;
+    if (!emb_read_weights(m, dir, limits, err)) goto fail;
     ray_release(cfg);
     ray_release(limits);
     return m;

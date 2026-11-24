@@ -25,6 +25,8 @@
 #include "lang/internal.h"
 #include "mem/sys.h"
 #include "store/embmodel.h"
+#include "core/pool.h"
+#include <stdatomic.h>
 
 /* ==========================================================================
  *  Rayfall builtins — direct metrics, exact KNN, HNSW lifecycle/query
@@ -710,5 +712,98 @@ ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x) {
         if (!out) out = ray_error("oom", NULL);
     }
     ray_embwork_free(w);
+    return out;
+}
+
+/* One task of .emb.encode: a run of texts, each into the vector made for it. */
+typedef struct {
+    const ray_embmodel_t* m;
+    ray_t* texts;            /* RAY_STR vector */
+    ray_t** rows;            /* the F32 vectors, made before the dispatch */
+    ray_embwork_t** work;    /* one per worker, made by the worker that first needs it */
+    int64_t n, per, max_tokens;
+    _Atomic(int) failed;     /* 1 out of memory */
+} emb_encode_ctx_t;
+
+static void emb_encode_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
+    emb_encode_ctx_t* c = (emb_encode_ctx_t*)vctx;
+    (void)end;
+    if (atomic_load_explicit(&c->failed, memory_order_relaxed)) return;
+    ray_embwork_t* w = c->work[worker];
+    if (!w) { w = c->work[worker] = ray_embwork_new(c->m); if (!w) { atomic_store(&c->failed, 1); return; } }
+    int64_t lo = start * c->per, hi = lo + c->per < c->n ? lo + c->per : c->n;
+    for (int64_t i = lo; i < hi; i++) {
+        if (ray_interrupted()) return;   /* the caller sees it after the dispatch */
+        size_t len = 0;
+        const char* s = ray_str_vec_get(c->texts, i, &len);
+        if (ray_embmodel_encode(c->m, w, s ? s : "", s ? len : 0, c->max_tokens, (float*)ray_data(c->rows[i])) < 0) {
+            atomic_store(&c->failed, 1);
+            return;
+        }
+    }
+}
+
+/* (.emb.encode handle text [max-tokens]) → the text's vector, F32, of length
+ * one; a vector of strings gives a list of them, computed on the pool. */
+ray_t* ray_emb_encode_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 3) return ray_error("rank", ".emb.encode: expects 2 or 3 args (model text [max-tokens]), got %lld", (long long)n);
+    ray_embmodel_t* m = embmodel_unwrap(args[0]);
+    if (!m) return ray_error("type", ".emb.encode: expects a model handle, got %s", ray_type_name(args[0] ? args[0]->type : 0));
+    ray_t* x = args[1];
+    if (!x || (x->type != -RAY_STR && x->type != RAY_STR))
+        return ray_error("type", ".emb.encode: expects a string or a vector of strings, got %s", ray_type_name(x ? x->type : 0));
+    int64_t max_tokens = 0;
+    if (n == 3) {
+        if (!args[2] || args[2]->type != -RAY_I64 || args[2]->attrs != 0 || args[2]->i64 < 2)
+            return ray_error("domain", ".emb.encode: max-tokens must be an integer of 2 or more");
+        max_tokens = args[2]->i64;
+    }
+    ray_embmodel_info_t in;
+    ray_embmodel_info(m, &in);
+    if (x->type == -RAY_STR) {
+        ray_embwork_t* w = ray_embwork_new(m);
+        if (!w) return ray_error("oom", NULL);
+        ray_t* v = ray_vec_new(RAY_F32, in.dim);
+        if (v && !RAY_IS_ERR(v)) {
+            v->len = in.dim;
+            if (ray_embmodel_encode(m, w, ray_str_ptr(x), ray_str_len(x), max_tokens, (float*)ray_data(v)) < 0) {
+                ray_release(v);
+                v = ray_error("oom", NULL);
+            }
+        }
+        ray_embwork_free(w);
+        return v ? v : ray_error("oom", NULL);
+    }
+    int64_t cnt = x->len;
+    ray_t* out = ray_list_new(cnt);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < cnt; i++) {
+        ray_t* v = ray_vec_new(RAY_F32, in.dim);
+        if (!v || RAY_IS_ERR(v)) { ray_release(out); return v ? v : ray_error("oom", NULL); }
+        v->len = in.dim;
+        out = ray_list_append(out, v);
+        ray_release(v);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (cnt == 0) return out;
+    ray_pool_t* pool = ray_pool_get();
+    uint32_t workers = pool ? ray_pool_total_workers(pool) : 1;
+    emb_encode_ctx_t c = { .m = m, .texts = x, .rows = (ray_t**)ray_data(out), .n = cnt, .max_tokens = max_tokens };
+    c.work = (ray_embwork_t**)ray_sys_alloc((size_t)workers * sizeof(ray_embwork_t*));
+    if (!c.work) { ray_release(out); return ray_error("oom", NULL); }
+    /* Texts differ in length, so the runs are short: a worker that drew long ones does not hold the rest up. */
+    c.per = cnt / ((int64_t)workers * 16) + 1;
+    int64_t tasks = (cnt + c.per - 1) / c.per;
+    if (pool && workers > 1 && tasks > 1) ray_pool_dispatch_n(pool, emb_encode_task, &c, (uint32_t)tasks);
+    else for (int64_t t = 0; t < tasks; t++) emb_encode_task(&c, 0, t, t + 1);
+    for (uint32_t i = 0; i < workers; i++) ray_embwork_free(c.work[i]);
+    ray_sys_free(c.work);
+    if (atomic_load(&c.failed)) { ray_release(out); return ray_error("oom", NULL); }
+    /* A cancelled dispatch skips the tasks it had not started: the vectors
+     * of those texts were never computed. */
+    if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_relaxed))) {
+        ray_release(out);
+        return ray_error("cancel", "interrupted");
+    }
     return out;
 }

@@ -1,0 +1,83 @@
+;; A text-embedding model inside the engine: `.emb.model.get`, `.emb.model.info`,
+;; `.emb.tokens`, `.emb.encode`.
+;;
+;; test/data/emb/tiny is an encoder of two layers and eight dimensions with a
+;; vocabulary of sixteen tokens, written by scripts/emb-tiny-model.py.  The
+;; vectors expected below are that script's: the same arithmetic, written
+;; apart from the engine's.
+
+(set M (.emb.model.get "test/data/emb/tiny"))
+(set near (fn [v want] (< (max (abs (- (as 'F64 v) want))) 1e-5)))
+
+;; ────────────── what the model is ──────────────
+(at (.emb.model.info M) 'kind)      -- 'bert
+(at (.emb.model.info M) 'tokenizer) -- 'unigram
+(at (.emb.model.info M) 'vocab)     -- 16
+(at (.emb.model.info M) 'dim)       -- 8
+(at (.emb.model.info M) 'layers)    -- 2
+(at (.emb.model.info M) 'heads)     -- 2
+(at (.emb.model.info M) 'inner)     -- 16
+(at (.emb.model.info M) 'tokens)    -- 16
+
+;; ────────────── how it cuts text ──────────────
+;; The likeliest cut wins: "hello" is one token, not "he" and "llo".
+(as 'I64 (.emb.tokens M "hello world"))   -- [0 5 6 2]
+(as 'I64 (.emb.tokens M "a cat, hello!")) -- [0 12 13 14 5 15 2]
+;; Runs of spaces are one, and a character the vocabulary lacks is the unknown.
+(as 'I64 (.emb.tokens M "hello    world")) -- [0 5 6 2]
+(as 'I64 (.emb.tokens M "hello ж"))        -- [0 5 4 3 2]
+(as 'I64 (.emb.tokens M ""))               -- [0 2]
+(type (.emb.tokens M "hello"))             -- 'I32
+(map count (.emb.tokens M ["hello world" "" "a cat"])) -- [4 2 4]
+
+;; ────────────── the vector of a text ──────────────
+(type (.emb.encode M "hello world"))  -- 'F32
+(count (.emb.encode M "hello world")) -- 8
+(near (.emb.encode M "hello world") [-0.4737449 0.3908900 0.4812481 -0.4984711 0.2559089 -0.1638875 0.1522380 -0.1648415]) -- true
+(near (.emb.encode M "a cat, hello!") [-0.4829617 0.3065379 0.5427374 -0.5085632 0.2196330 -0.1698911 0.1822179 -0.0963176]) -- true
+(near (.emb.encode M "hello ж") [-0.5413381 0.2857192 0.5070103 -0.4493881 0.2686200 -0.1807478 0.2181463 -0.1178736]) -- true
+;; Its length is one.
+(< (abs (- (norm (.emb.encode M "a cat, hello!")) 1.0)) 1e-6) -- true
+
+;; A text longer than asked for is cut to its beginning, the end mark kept.
+(near (.emb.encode M "a cat, hello!" 4) [-0.4418674 0.3880668 0.4984805 -0.5111301 0.2424585 -0.2186521 0.1479494 -0.1262410]) -- true
+;; And one longer than the model's positions, to as many as it has.
+(set LONG "hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello")
+(count (.emb.tokens M LONG)) -- 22
+(near (.emb.encode M LONG) [-0.5774677 0.0935011 0.2092439 -0.2145858 0.5712182 -0.1215071 0.3596441 -0.3123467]) -- true
+(near (.emb.encode M LONG 500) [-0.5774677 0.0935011 0.2092439 -0.2145858 0.5712182 -0.1215071 0.3596441 -0.3123467]) -- true
+
+;; ────────────── many texts at once ──────────────
+;; A vector of strings gives a list of vectors, each what its text gives alone.
+(set T (map (fn [i] (at ["hello world" "a cat, hello!" "hello ж" "" "a" "cat a cat"] (% i 6))) (til 600)))
+(set V (.emb.encode M T))
+(count V) -- 600
+(sum (map (fn [i] (== 0.0 (max (abs (- (at V i) (.emb.encode M (at T i))))))) (til 600))) -- 600
+(count (.emb.encode M (take ["x"] 0))) -- 0
+;; The vectors are what the search takes.
+(at (at (.emb.knn (take V 6) (.emb.encode M "hello world") 1) '_rowid) 0) -- 0
+
+;; ────────────── the handle ──────────────
+;; A model does not change, so another name for it is the same model, and it
+;; lives until the last name is gone.
+(set M2 M)
+(set M 0)
+(as 'I64 (.emb.tokens M2 "hello world")) -- [0 5 6 2]
+(near (.emb.encode M2 "hello world") [-0.4737449 0.3908900 0.4812481 -0.4984711 0.2559089 -0.1638875 0.1522380 -0.1648415]) -- true
+
+;; ────────────── what is refused ──────────────
+(.emb.model.get 42) !- type
+(.emb.model.get "") !- domain
+(.emb.model.get "test/data/emb/no-such-model") !- io
+;; Only the bert family is read.
+(.emb.model.get "test/data/emb/roberta") !- domain
+;; A model without its weights is not a model.
+(.emb.model.get "test/data/emb/noweights") !- io
+(.emb.model.info 42) !- type
+(.emb.tokens 42 "hello") !- type
+(.emb.tokens M2 42) !- type
+(.emb.encode 42 "hello") !- type
+(.emb.encode M2 42) !- type
+(.emb.encode M2 "hello" 1) !- domain
+(.emb.encode M2 "hello" "many") !- domain
+(.emb.encode M2) !- rank

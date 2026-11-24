@@ -5912,6 +5912,7 @@ static void ray_register_builtins(void) {
     register_unary (".emb.model.get",   RAY_FN_RESTRICTED, ray_emb_model_get_fn);
     register_unary (".emb.model.info",  RAY_FN_NONE, ray_emb_model_info_fn);
     register_binary(".emb.tokens",      RAY_FN_NONE, ray_emb_tokens_fn);
+    register_vary  (".emb.encode",      RAY_FN_NONE, ray_emb_encode_fn);
 
     /* Per-vector accelerator indices (see src/ops/idxop.h) */
     register_unary (".idx.zone",   RAY_FN_NONE, ray_idx_zone_fn);
