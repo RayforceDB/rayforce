@@ -594,3 +594,22 @@
 (set Vsk (xasc (select {from: (distinct (select {from: Tsk s: s k2: k2 v: v where: (!= w 0)})) by: [s k2] u: (count v)}) [s k2]))
 (count Wsk) -- (count Vsk)
 (all (== (at Wsk 'u) (at Vsk 'u))) -- true
+;; a partition's dedup table starts small and grows by rehash: a column of
+;; 300 values over the first half of the rows (the table quadruples) and
+;; 60000 over the second (it reaches its full size), by five groups and by
+;; 100000 groups — the counts are the tuple-distinct oracle's, and by hand:
+;; g and v repeat with period lcm(5, 300) and lcm(5, 60000), so each of
+;; the five groups sees a fifth of the 300 values, then of the 60000
+(set rg (til 400000))
+(set vg (% rg (+ 300 (* 59700 (as 'I64 (>= rg 200000))))))
+(set Tg (table [g k v b] (list (% rg 5) (% rg 100000) vg (% rg 100))))
+(set Mg (select {from: Tg by: g u: (count (distinct v)) m: (max b) asc: g}))
+(set Og (select {from: (distinct (select {from: Tg g: g v: v})) by: g u: (count v) asc: g}))
+(all (== (at Mg 'u) (at Og 'u))) -- true
+(at Mg 'u) -- [12000 12000 12000 12000 12000]
+(at Mg 'm) -- [95 96 97 98 99]
+(set Mk (select {from: Tg by: k u: (count (distinct v)) m: (max b) asc: k}))
+(set Ok (select {from: (distinct (select {from: Tg k: k v: v})) by: k u: (count v) asc: k}))
+(count Mk) -- 100000
+(all (== (at Mk 'u) (at Ok 'u))) -- true
+(sum (at Mk 'u)) -- (count (distinct (select {from: Tg k: k v: v})))

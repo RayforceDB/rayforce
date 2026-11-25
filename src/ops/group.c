@@ -2495,6 +2495,49 @@ static cdpg_slot_t* cdpg_slots_alloc(ray_t** hdr, uint64_t cap) {
     return (cdpg_slot_t*)scratch_calloc(hdr, (size_t)cap * sizeof(cdpg_slot_t));
 }
 
+/* A partition's table starts at CDPG_SLOTS_START slots and grows by rehash
+ * when half full, up to the size its pairs would need were they all
+ * distinct (twice the pairs, a power of two).  Sized for the pairs at
+ * once, a partition of 78k pairs zeroed 262,144 slots (4 MB) to hold the
+ * five values of a column of few distinct ones: 128 MB of zeroing a query
+ * over 64 partitions.  The growth reads what the table has seen: while
+ * most pairs so far were new (more than half) the column is of many
+ * distinct values and the table goes straight to its full size — one
+ * rehash of a few hundred entries — otherwise it quadruples, so a table
+ * of few values stays in a few KB.  The per-value mode only (few groups,
+ * 64 partitions sized from a 64th of the rows). */
+#define CDPG_SLOTS_START 1024
+
+/* The pairs [i, cnt) into a table that no longer grows; one loop per width
+ * of the gid stream. */
+#define CDPG_PROBE_FULL(GID)                                                \
+    for (; i < cnt; i++) {                                                  \
+        int64_t gid_p1 = (int64_t)(GID);                                    \
+        int64_t val    = vals[i];                                           \
+        uint64_t slot = CDPG_HASH(gid_p1, val) & mask;                      \
+        for (;;) {                                                          \
+            cdpg_slot_t* sl = &slots[slot];                                 \
+            if (sl->gid_p1 == 0) {                                          \
+                sl->gid_p1 = gid_p1;                                        \
+                sl->val = val;                                              \
+                /* Partition is keyed on gid (CDPG_PART_HASH), so each gid  \
+                 * is owned by exactly one task — no atomic; by (gid,       \
+                 * val), the partition's own counts. */                     \
+                cnt_out[gid_p1 - 1]++;                                      \
+                break;                                                      \
+            }                                                               \
+            if (sl->gid_p1 == gid_p1 && sl->val == val) break;              \
+            slot = (slot + 1) & mask;                                       \
+        }                                                                   \
+    }
+static void cdpg_probe_full(cdpg_slot_t* restrict slots, uint64_t mask,
+                            const int64_t* gids, const uint16_t* gids16, const int64_t* vals,
+                            int64_t* restrict cnt_out, int64_t i, int64_t cnt) {
+    if (gids) { CDPG_PROBE_FULL(gids[i]) }
+    else      { CDPG_PROBE_FULL(gids16[i]) }
+}
+#undef CDPG_PROBE_FULL
+
 static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                           int64_t start, int64_t end) {
     (void)worker_id;
@@ -2504,46 +2547,86 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
         int64_t cnt = x->part_off[p + 1] - off;
         if (cnt == 0) continue;
 
-        uint64_t cap = (uint64_t)cnt * 2;
-        if (cap < 32) cap = 32;
+        uint64_t cap_full = (uint64_t)cnt * 2;
+        if (cap_full < 32) cap_full = 32;
         uint64_t c = 1;
-        while (c && c < cap) c <<= 1;
+        while (c && c < cap_full) c <<= 1;
         if (!c) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
-        cap = c;
+        cap_full = c;
+        /* (per value only: per group — many groups, up to 256 partitions
+         * of about 1 MB tables — keeps the table sized at once, as it was) */
+        uint64_t cap = cap_full < CDPG_SLOTS_START || !x->by_val ? cap_full : CDPG_SLOTS_START;
         uint64_t mask = cap - 1;
 
         /* gid and value side by side: one cache line per probe, where
-         * two arrays cost a miss each */
+         * two arrays cost a miss each.  The starting table is on the
+         * stack (16 KB): a table that outgrows it takes one block from
+         * the heap, as the table sized at once did. */
+        cdpg_slot_t first[CDPG_SLOTS_START];
         ray_t* s_hdr = NULL;
-        cdpg_slot_t* slots = cdpg_slots_alloc(&s_hdr, cap);
-        /* a partition left uncounted would undercount its groups */
-        if (!slots) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
+        cdpg_slot_t* slots = first;
+        if (cap <= CDPG_SLOTS_START) {
+            memset(first, 0, (size_t)cap * sizeof(cdpg_slot_t));
+#ifdef DEBUG
+            /* the test seam counts a partition's first table too */
+            ray_t* t_hdr = NULL;
+            cdpg_slot_t* t = cdpg_slots_alloc(&t_hdr, 1);
+            /* a partition left uncounted would undercount its groups */
+            if (!t) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
+            scratch_free(t_hdr);
+#endif
+        } else {
+            slots = cdpg_slots_alloc(&s_hdr, cap);
+            if (!slots) { atomic_store_explicit(&x->oom, true, memory_order_relaxed); continue; }
+        }
 
         const int64_t* gids = x->by_val ? NULL : x->gids_out + off;
         const uint16_t* gids16 = x->by_val ? x->gids16_out + off : NULL;
         const int64_t* vals = x->vals_out + off;
         int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
-        for (int64_t i = 0; i < cnt; i++) {
+        uint64_t used = 0;
+        bool failed = false;
+        int64_t i = 0;
+        /* while the table may still grow: count what it holds */
+        for (; i < cnt && cap < cap_full; i++) {
             int64_t gid_p1 = gids ? gids[i] : (int64_t)gids16[i];
             int64_t val    = vals[i];
-            uint64_t h = CDPG_HASH(gid_p1, val);
-            uint64_t slot = h & mask;
+            uint64_t slot = CDPG_HASH(gid_p1, val) & mask;
             for (;;) {
                 cdpg_slot_t* sl = &slots[slot];
                 if (sl->gid_p1 == 0) {
                     sl->gid_p1 = gid_p1;
                     sl->val = val;
-                    /* Partition is keyed on gid (CDPG_PART_HASH), so
-                     * each gid is owned by exactly one task — drop the
-                     * atomic; by (gid, val), the partition's own counts. */
                     cnt_out[gid_p1 - 1]++;
+                    used++;
                     break;
                 }
                 if (sl->gid_p1 == gid_p1 && sl->val == val) break;
                 slot = (slot + 1) & mask;
             }
+            if (used * 2 > cap) {
+                /* half full: the full size when most pairs so far were
+                 * new, else four times the slots */
+                uint64_t ncap = used * 2 > (uint64_t)(i + 1) ? cap_full : cap * 4;
+                if (ncap > cap_full) ncap = cap_full;
+                ray_t* n_hdr = NULL;
+                cdpg_slot_t* ns = cdpg_slots_alloc(&n_hdr, ncap);
+                if (!ns) { failed = true; break; }
+                uint64_t nmask = ncap - 1;
+                for (uint64_t k = 0; k < cap; k++) {
+                    if (slots[k].gid_p1 == 0) continue;
+                    uint64_t q = CDPG_HASH(slots[k].gid_p1, slots[k].val) & nmask;
+                    while (ns[q].gid_p1 != 0) q = (q + 1) & nmask;
+                    ns[q] = slots[k];
+                }
+                if (s_hdr) scratch_free(s_hdr);
+                s_hdr = n_hdr; slots = ns; cap = ncap; mask = nmask;
+            }
         }
-        scratch_free(s_hdr);
+        /* at its full size: the plain probe loop */
+        if (!failed && i < cnt) cdpg_probe_full(slots, mask, gids, gids16, vals, cnt_out, i, cnt);
+        if (s_hdr) scratch_free(s_hdr);
+        if (failed) atomic_store_explicit(&x->oom, true, memory_order_relaxed);
     }
 }
 
