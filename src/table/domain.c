@@ -2687,8 +2687,11 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
         uint64_t h64[1024];
         for (int64_t o = 0; o < n; o += 1024) {
             int64_t k = n - o < 1024 ? n - o : 1024;
-            for (int64_t i = 0; i < k; i++)
-                h64[i] = strs[o + i] ? ray_hash_bytes(strs[o + i], lens[o + i]) : ray_hash_bytes("", 0);
+            /* o < n, so k >= 1: the fill runs at least once (written so,
+             * the batch below takes h64[0, k) all filled) */
+            int64_t i = 0;
+            do h64[i] = strs[o + i] ? ray_hash_bytes(strs[o + i], lens[o + i]) : ray_hash_bytes("", 0);
+            while (++i < k);
             if (!ray_symimp_intern_batch(dom->imp, k, strs + o, lens + o, h64, out_pos + o)) return false;
         }
         return true;
