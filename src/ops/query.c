@@ -30095,6 +30095,17 @@ by_dict_done:
                                                                       expr_one_value(expr, eval_tbl, 0)))) ||
                                      (nested_whole && ray_is_atom(col)));
                                 if (whole_atom) one_value = 1;
+                                /* an aggregate whose one value is a collection
+                                 * (top, bot): one cell, as the planned route
+                                 * holds it, never a column of its length (#1676) */
+                                if (one_value && !whole_verb && col && !RAY_IS_ERR(col) &&
+                                    !ray_is_atom(col) && is_agg_expr(expr)) {
+                                    ray_t* cell = ray_list_new(1);
+                                    if (cell && !RAY_IS_ERR(cell)) cell = ray_list_append(cell, col);
+                                    ray_release(col);
+                                    col = cell ? cell : ray_error("oom", NULL);
+                                    whole_atom = col && !RAY_IS_ERR(col);
+                                }
                                 scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar || whole_atom) &&
                                     (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1) ||
                                      (whole_atom && col->type == RAY_LIST && col->len == 1));
