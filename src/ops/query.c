@@ -11429,6 +11429,19 @@ static void dkv_list_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         t->seen_hdr = NULL; t->seen = NULL;
     }
 }
+typedef struct {
+    const void*    cd;
+    uint8_t        cattrs;
+    const int32_t* pos;
+    const uint8_t* key;   /* the W8 position of each slot's text */
+    uint8_t*       out;
+} dkv_spread_ctx_t;
+static void dkv_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const dkv_spread_ctx_t* c = (const dkv_spread_ctx_t*)vctx;
+    for (int64_t r = start; r < end; r++)
+        c->out[r] = c->key[c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->cattrs)]];
+}
 static void dkv_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     const dkv_ctx_t* c = (const dkv_ctx_t*)vctx;
@@ -11694,6 +11707,10 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     const bool bydict_mem = text_syms && !al && sym && !sel && dn * 4 <= n &&
                             (uint64_t)n * 16 > (uint64_t)dk_mem_budget() / 8;
     const bool vocab_small = (al || bydict_mem) && sym && !sel && dn * 4 <= n;
+    /* the text projection's rows take their slots straight from the column
+     * at the spread (no code a row); a by-dict key of any type keeps the
+     * codes for the typed spread */
+    const bool direct_spread = vocab_small && al;
     if (!vocab_small && sel_rows > DKS_PROBE_ROWS) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
         dks_ctx_t pc = kind;
@@ -11720,9 +11737,12 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     while (tasks > 1 && n / tasks < 16384) tasks /= 2;
     if (n > INT32_MAX) return NULL;                     /* the codes are int32 */
-    ray_t* ids = ray_vec_new(RAY_I32, n);
-    if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); return NULL; }
-    ids->len = n;
+    ray_t* ids = NULL;
+    if (!direct_spread) {
+        ids = ray_vec_new(RAY_I32, n);
+        if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); return NULL; }
+        ids->len = n;
+    }
     ray_t* tk_hdr = NULL;
     dks_task_t* tk = (dks_task_t*)scratch_calloc(&tk_hdr, (size_t)tasks * (sizeof(dks_task_t) + sizeof(int64_t*)));
     if (!tk) { ray_release(ids); return NULL; }
@@ -11732,7 +11752,7 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     for (uint32_t t = 0; t < tasks; t++)
         tk[t].du_cap = sparse ? sel_rows : (int64_t)(sel_rows / tasks) / 2 + 4096;
     dks_ctx_t c = kind;
-    c.n = n; c.tasks = tasks; c.code = (int32_t*)ray_data(ids); c.tk = tk; c.remap = remap;
+    c.n = n; c.tasks = tasks; c.code = ids ? (int32_t*)ray_data(ids) : NULL; c.tk = tk; c.remap = remap;
     c.n_segs = (n + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
     if (sel) {
         c.sel = sel;
@@ -11742,6 +11762,8 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     }
     bool ok = true;
     dks_task_t g; memset(&g, 0, sizeof g);
+    ray_t* slot_pos_hdr = NULL;          /* direct_spread: the slot of each id, to the spread */
+    const int32_t* slot_pos = NULL;
     if (vocab_small) {
         /* The vocabulary bounds the key: the rows are coded through one
          * int32 slot per symbol id (72 MB for 18M URLs) — the hash tables
@@ -11777,7 +11799,7 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
         }
         memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
         dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .tasks = vtasks,
-                         .n_segs = c.n_segs, .tk = vt, .pos = pos, .code = (int32_t*)ray_data(ids) };
+                         .n_segs = c.n_segs, .tk = vt, .pos = pos, .code = ids ? (int32_t*)ray_data(ids) : NULL };
         if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_list_fn, &vc, vtasks);
         else dkv_list_fn(&vc, 0, 0, 1);
         ok = !pool_cancelled(rpool);
@@ -11791,15 +11813,16 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
             if (vt[t].seen_hdr) scratch_free(vt[t].seen_hdr);
         }
         scratch_free(vt_hdr);
-        if (ok && g.du > 0) {
+        if (ok && g.du > 0 && ids) {
             if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_code_fn, &vc, vtasks);
             else dkv_code_fn(&vc, 0, 0, 1);
             ok = !pool_cancelled(rpool);
-            agg_route_note_key_slot_tasks(vtasks);
         }
-        scratch_free(pos_hdr);
+        if (ok && g.du > 0) agg_route_note_key_slot_tasks(vtasks);
+        if (ids) { scratch_free(pos_hdr); pos_hdr = NULL; pos = NULL; }
         scratch_free(tk_hdr); tk_hdr = NULL;
-        if (!ok || g.du == 0) { dks_task_free(&g); ray_release(ids); return NULL; }
+        if (!ok || g.du == 0) { if (pos_hdr) scratch_free(pos_hdr); dks_task_free(&g); ray_release(ids); return NULL; }
+        slot_pos_hdr = pos_hdr; slot_pos = pos;
         goto grouped;
     }
     if (tasks > 1) ray_pool_dispatch_n(rpool, dks_code_fn, &c, tasks);
@@ -11873,7 +11896,7 @@ grouped:
         } else {
             ray_t* pv_hdr = NULL;
             const char** ptrs = (const char**)scratch_alloc(&pv_hdr, (size_t)du * (sizeof(char*) + sizeof(uint32_t)));
-            if (!ptrs) { dks_task_free(&g); ray_release(ids); return NULL; }
+            if (!ptrs) { dks_task_free(&g); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
             uint32_t* lens = (uint32_t*)(ptrs + du);
             for (int64_t i = 0; i < du; i++) {
                 const ray_str_t* sv = &el[g.first[i]];
@@ -11884,17 +11907,17 @@ grouped:
             scratch_free(pv_hdr);
         }
         dks_task_free(&g);
-        if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); ray_release(ids); return NULL; }
+        if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
         if (sym) {
             key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
             if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
-            if (!key_dom && pool_cancelled(rpool)) { ray_release(dom_vec); ray_release(ids); return NULL; }
+            if (!key_dom && pool_cancelled(rpool)) { ray_release(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
         }
         if (key_dom) { ray_release(dom_vec); goto evaluated; }
         ray_t* mini = ray_table_new(0);
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
         ray_release(dom_vec);
-        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); return NULL; }
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
         ray_t* ev = by_expr;
         if (al && al->expr && dk_bind_aliases(&mini, al, tbl, ref_syms[0], du)) ev = al->expr;
         ray_graph_t* g2 = ray_graph_new(mini);
@@ -11906,10 +11929,10 @@ grouped:
         }
         ray_release(mini);
         if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
-        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(ids); return NULL; }
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
 evaluated:
         if (!(ray_is_vec(key_dom) || key_dom->type == RAY_LIST) || ray_len(key_dom) != du) {
-            ray_release(key_dom); ray_release(ids); return NULL;
+            ray_release(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL;
         }
     }
     ray_profile_tick("derived key: values evaluated");
@@ -11927,10 +11950,36 @@ evaluated:
             ray_release(key_dom); key_dom = sym_vec_narrow(syms); narrow = true;
         } else if (syms) ray_release(syms);
     }
+    ray_t* spread = NULL;
+    if (direct_spread) {
+        /* The text projection: its rows take the byte of their symbol's
+         * slot straight from the column, in parallel; a result that is not
+         * a text key is of no use to the caller (it keeps the row-wise
+         * projection), so nothing is spread for it. */
+        if (narrow && (key_dom->attrs & RAY_SYM_W_MASK) == RAY_SYM_W8) {
+            spread = ray_sym_vec_new(RAY_SYM_W8, n);
+            if (spread && !RAY_IS_ERR(spread)) {
+                spread->len = n;
+                ray_sym_vec_adopt_domain(spread, key_dom);
+                dkv_spread_ctx_t sc = { .cd = kind.cd, .cattrs = kind.cattrs, .pos = slot_pos,
+                                        .key = (const uint8_t*)ray_data(key_dom), .out = (uint8_t*)ray_data(spread) };
+                if (par) ray_pool_dispatch(rpool, dkv_spread_fn, &sc, n);
+                else     dkv_spread_fn(&sc, 0, 0, n);
+                if (pool_cancelled(rpool)) { ray_release(spread); spread = NULL; }
+            } else { if (spread) ray_error_free(spread); spread = NULL; }
+        }
+        scratch_free(slot_pos_hdr);
+        ray_release(key_dom);
+        if (!spread) return NULL;
+        ray_profile_tick("derived key: keys spread");
+        agg_route_note_key_domain();
+        agg_route_note_key_text();
+        return spread;
+    }
     /* Each row takes the key of its value (dks_spread; a kind of cell it
      * does not copy goes through the generic gather by int64 index). */
     const int32_t* code = (const int32_t*)ray_data(ids);
-    ray_t* spread = dks_spread(key_dom, code, n, tasks);
+    spread = dks_spread(key_dom, code, n, tasks);
     if (!spread && !pool_cancelled(rpool) && (key_dom->type == RAY_LIST || !ray_is_vec(key_dom))) {
         ray_t* ix = ray_vec_new(RAY_I64, n);
         if (ix && !RAY_IS_ERR(ix)) {
