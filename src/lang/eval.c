@@ -6875,6 +6875,9 @@ static void ray_register_builtins(void) {
     /* Where the function a named global holds was written (#946): server
      * file paths and loaded source, so refused under -U. */
     register_unary(".repl.definition", RAY_FN_RESTRICTED, ray_repl_definition_fn);
+    /* Read-only members and schema of a named global path (#945): reads
+     * headers only, never rows or decoded columns; allowed under -U. */
+    register_vary(".repl.inspect",     RAY_FN_NONE,       ray_repl_inspect_fn);
 
     /* Transaction-log journaling under `.log.*` — the -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at

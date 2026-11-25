@@ -30,6 +30,10 @@
 #include "lang/nfo.h"
 #include "core/crc32.h"
 #include <stdio.h>
+#include "table/table.h"
+#include "store/enccol.h"
+#include "ops/ops.h"
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -71,6 +75,19 @@ static ray_t* insp_sym(const char* s) { return ray_sym(ray_sym_intern(s, strlen(
 
 /* ---- lookup ---- */
 
+/* Cell `i` of a SYM vector as a runtime symbol id.  A vector from a stored
+ * column holds positions in its file's domain, not runtime ids: its text is
+ * looked up (-1 when the runtime table has no such symbol, so it names no
+ * global and no member the caller asks for), or interned when `intern`. */
+static int64_t insp_cell_sym(ray_t* vec, int64_t i, bool intern) {
+    if (ray_sym_vec_domain(vec) == ray_sym_runtime_domain())
+        return ray_read_sym(ray_data(vec), i, RAY_SYM, vec->attrs);
+    ray_t* s = ray_sym_vec_cell(vec, i);
+    if (!s) return -1;
+    return intern ? ray_sym_intern(ray_str_ptr(s), ray_str_len(s))
+                  : ray_sym_find(ray_str_ptr(s), ray_str_len(s));
+}
+
 /* The member `id` of the dict `d`, owned, or NULL.  Only symbol keys are
  * matched; a member of a typed value vector is its atom. */
 static ray_t* insp_dict_member(ray_t* d, int64_t id) {
@@ -78,7 +95,7 @@ static ray_t* insp_dict_member(ray_t* d, int64_t id) {
     ray_t* vals = ray_dict_vals(d);
     if (!keys || !vals || keys->type != RAY_SYM) return NULL;
     for (int64_t i = 0; i < keys->len; i++) {
-        if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) != id) continue;
+        if (insp_cell_sym(keys, i, false) != id) continue;
         if (vals->type == RAY_LIST) {
             ray_t* v = ((ray_t**)ray_data(vals))[i];
             if (v) ray_retain(v);
@@ -274,6 +291,266 @@ ray_t* ray_repl_definition_fn(ray_t* name) {
         insp_put(&d, "digest", ray_str("", 0));
         insp_put(&d, "size", ray_typed_null(-RAY_I64));
     }
+    if (v) ray_release(v);
+    return insp_done(&d);
+}
+
+/* ---- .repl.inspect (#945) ---- */
+
+#define INSP_LIMIT 1000
+
+/* The type a value reads as, from its header alone: a parted or encoded
+ * column its element type, a partition column the type of its key values.
+ * False when that is not known without a read. */
+static bool insp_logical_type(ray_t* v, int8_t* t) {
+    if (!v || RAY_IS_ERR(v)) return false;
+    if (v->type == RAY_ENCCOL) {
+        ray_enccol_t* e = ray_enccol_of(v);
+        if (!e) return false;
+        *t = e->type;
+        return true;
+    }
+    if (RAY_IS_PARTED(v->type)) { *t = (int8_t)RAY_PARTED_BASETYPE(v->type); return true; }
+    if (v->type == RAY_MAPCOMMON) {
+        ray_t* kv = ((ray_t**)ray_data(v))[0];
+        if (!kv || RAY_IS_ERR(kv)) return false;
+        *t = kv->type;
+        return true;
+    }
+    *t = v->type;
+    return true;
+}
+
+static int64_t insp_type_id(ray_t* v) {
+    if (v && !RAY_IS_ERR(v) && RAY_IS_NULL(v)) return ray_sym_intern("null", 4);
+    int8_t t;
+    if (!insp_logical_type(v, &t)) return ray_sym_intern("", 0);
+    const char* nm = ray_type_name(t);
+    return ray_sym_intern(nm, strlen(nm));
+}
+
+/* Rows of a column held in its header (a plain vector, an encoded column, a
+ * partition column's in-memory counts), or -1 when counting them would
+ * read a plain parted column's segments. */
+static int64_t insp_col_rows(ray_t* c) {
+    if (!c || RAY_IS_ERR(c) || RAY_IS_PARTED(c->type)) return -1;
+    return ray_table_col_nrows(c);
+}
+
+static ray_t* insp_len(ray_t* v) {
+    int64_t n = -1;
+    if (v->type == RAY_DICT) {
+        ray_t* k = ray_dict_keys(v);
+        n = k ? k->len : -1;
+    } else if (v->type == RAY_TABLE) {
+        int64_t nc = ray_table_ncols(v);
+        if (nc == 0) n = 0;
+        for (int64_t i = 0; i < nc && n < 0; i++) n = insp_col_rows(ray_table_slot_idx(v, i));
+    } else if (v->type == RAY_ENCCOL || v->type == RAY_MAPCOMMON || RAY_IS_PARTED(v->type)) {
+        n = insp_col_rows(v);
+    } else if (v->type >= 0 && v->type != RAY_LAMBDA && !insp_is_builtin(v) && !RAY_IS_NULL(v)) {
+        n = v->len;
+    }
+    return n >= 0 ? ray_i64(n) : ray_typed_null(-RAY_I64);
+}
+
+static const char* insp_kind(ray_t* v) {
+    if (!v) return "missing";
+    if (RAY_IS_NULL(v) || v->type < 0) return "atom";
+    switch (v->type) {
+    case RAY_DICT:   return "dict";
+    case RAY_TABLE:  return "table";
+    case RAY_LAMBDA: return "lambda";
+    case RAY_LIST:   return "list";
+    default: break;
+    }
+    if (insp_is_builtin(v)) return "builtin";
+    if (ray_is_vec(v) || v->type == RAY_ENCCOL || v->type == RAY_MAPCOMMON || RAY_IS_PARTED(v->type))
+        return "vector";
+    return "other";
+}
+
+/* Follows `path` (a symbol, or a symbol vector [root member ...]) through
+ * dict members and, last, one table column, read from the slot as stored. */
+static ray_t* insp_follow(ray_t* path) {
+    if (path->type == -RAY_SYM) return ray_inspect_lookup(path->i64);
+    int64_t n = path->len;
+    int64_t root = insp_cell_sym(path, 0, false);
+    ray_t* v = root >= 0 ? ray_inspect_lookup(root) : NULL;
+    for (int64_t i = 1; i < n && v; i++) {
+        int64_t id = insp_cell_sym(path, i, false);
+        ray_t* next = NULL;
+        if (v->type == RAY_DICT) next = insp_dict_member(v, id);
+        else if (v->type == RAY_TABLE && i == n - 1) {
+            next = ray_table_slot(v, id);
+            if (next) ray_retain(next);
+        }
+        ray_release(v);
+        v = next;
+    }
+    return v;
+}
+
+typedef struct { int64_t id; int64_t type; const char* s; size_t n; } insp_member_t;
+
+static int insp_member_cmp(const void* a, const void* b) {
+    const insp_member_t* x = a;
+    const insp_member_t* y = b;
+    size_t m = x->n < y->n ? x->n : y->n;
+    int c = memcmp(x->s, y->s, m);
+    return c ? c : (x->n > y->n) - (x->n < y->n);
+}
+
+/* The members of a dict (symbol keys) or the columns of a table whose names
+ * start with `pfx`, sorted by name, at most `limit` of them: their names
+ * into *keys, their types into *types.  One pass over the members and a
+ * sort of the matches; no value is read past its header. */
+static bool insp_members(ray_t* v, const char* pfx, size_t plen, int64_t limit,
+                         ray_t** keys, ray_t** types, bool* truncated) {
+    *keys = NULL; *types = NULL; *truncated = false;
+    bool table = v && v->type == RAY_TABLE;
+    ray_t* dk = v && v->type == RAY_DICT ? ray_dict_keys(v) : NULL;
+    ray_t* dv = dk ? ray_dict_vals(v) : NULL;
+    int64_t n = table ? ray_table_ncols(v) : dk && dv && dk->type == RAY_SYM ? dk->len : 0;
+
+    ray_t* scratch = ray_vec_new(RAY_U8, n * (int64_t)sizeof(insp_member_t) + 1);
+    if (!scratch || RAY_IS_ERR(scratch)) return false;
+    insp_member_t* m = (insp_member_t*)ray_data(scratch);
+    int64_t hits = 0;
+    for (int64_t i = 0; i < n; i++) {
+        /* a stored key column's names are its domain's text; such a name
+         * is interned only if it is returned */
+        bool cell = !table && ray_sym_vec_domain(dk) != ray_sym_runtime_domain();
+        int64_t id = table ? ray_table_col_name(v, i)
+                   : cell ? -1 : ray_read_sym(ray_data(dk), i, RAY_SYM, dk->attrs);
+        ray_t* nm = cell ? ray_sym_vec_cell(dk, i) : ray_sym_str(id);
+        const char* s = nm ? ray_str_ptr(nm) : "";
+        size_t len = nm ? ray_str_len(nm) : 0;
+        if (len < plen || memcmp(s, pfx, plen) != 0) continue;
+        int64_t ty;
+        if (table) ty = insp_type_id(ray_table_slot_idx(v, i));
+        else if (dv->type == RAY_LIST) ty = insp_type_id(((ray_t**)ray_data(dv))[i]);
+        else {
+            const char* tn = ray_type_name((int8_t)-dv->type);
+            ty = ray_sym_intern(tn, strlen(tn));
+        }
+        m[hits++] = (insp_member_t){ id, ty, s, len };
+    }
+    qsort(m, (size_t)hits, sizeof *m, insp_member_cmp);
+    int64_t out = hits < limit ? hits : limit;
+    *truncated = hits > out;
+    *keys = ray_vec_new(RAY_SYM, out);
+    *types = ray_vec_new(RAY_SYM, out);
+    bool ok = *keys && !RAY_IS_ERR(*keys) && *types && !RAY_IS_ERR(*types);
+    if (ok) {
+        for (int64_t i = 0; i < out; i++) {
+            ((int64_t*)ray_data(*keys))[i] = m[i].id >= 0 ? m[i].id : ray_sym_intern(m[i].s, m[i].n);
+            ((int64_t*)ray_data(*types))[i] = m[i].type;
+        }
+        (*keys)->len = out;
+        (*types)->len = out;
+    }
+    ray_release(scratch);
+    return ok;
+}
+
+/* Reads {prefix: str, limit: integer} into the prefix string atom (owned:
+ * a member of a typed value vector is a fresh atom, so the caller keeps it
+ * until the prefix is no longer read and then releases it) and the limit;
+ * NULL, or an error with *pfx released. */
+static ray_t* insp_opts(ray_t* opts, ray_t** pfx, int64_t* limit) {
+    if (opts->type != RAY_DICT)
+        return ray_error("type", ".repl.inspect options must be a dict, got %s", ray_type_name(opts->type));
+    ray_t* k = ray_dict_keys(opts);
+    if (k && k->len == 0) return NULL;   /* {}: no options */
+    if (!k || k->type != RAY_SYM)
+        return ray_error("type", ".repl.inspect options must have symbol keys");
+    int64_t prefix_id = ray_sym_intern("prefix", 6), limit_id = ray_sym_intern("limit", 5);
+    for (int64_t i = 0; i < k->len; i++) {
+        int64_t id = insp_cell_sym(k, i, false);
+        if (id != prefix_id && id != limit_id) {
+            ray_t* nm = ray_sym_vec_cell(k, i);
+            return ray_error("domain", ".repl.inspect: unknown option '%.*s' (prefix, limit)",
+                             nm ? (int)ray_str_len(nm) : 0, nm ? ray_str_ptr(nm) : "");
+        }
+        ray_t* v = insp_dict_member(opts, id);
+        ray_t* err = NULL;
+        if (id == prefix_id) {
+            if (!v || v->type != -RAY_STR)
+                err = ray_error("type", ".repl.inspect: prefix must be a string");
+            else {
+                if (*pfx) ray_release(*pfx);
+                *pfx = v;
+                v = NULL;
+            }
+        } else {
+            int64_t lim = 0;
+            bool integer = v && !RAY_IS_NULL(v) && !RAY_IS_ERR(v);
+            if (integer) {
+                switch (v->type) {
+                case -RAY_I64: lim = v->i64; break;
+                case -RAY_I32: lim = v->i32; break;
+                case -RAY_I16: lim = v->i16; break;
+                case -RAY_U8:  lim = v->u8;  break;
+                default: integer = false; break;
+                }
+            }
+            if (!integer)
+                err = ray_error("type", ".repl.inspect: limit must be an integer");
+            else if (RAY_ATOM_IS_NULL(v))
+                err = ray_error("type", ".repl.inspect: limit must not be null");
+            else if (lim < 0)
+                err = ray_error("domain", ".repl.inspect: limit must not be negative, got %lld",
+                                (long long)lim);
+            else *limit = lim;
+        }
+        if (v) ray_release(v);
+        if (err) {
+            if (*pfx) { ray_release(*pfx); *pfx = NULL; }
+            return err;
+        }
+    }
+    return NULL;
+}
+
+ray_t* ray_repl_inspect_fn(ray_t** args, int64_t n) {
+    if (n < 1 || n > 2)
+        return ray_error("arity", ".repl.inspect expects 1 or 2 arguments, got %lld", (long long)n);
+    ray_t* path = args[0];
+    if (!path || !(path->type == -RAY_SYM || (path->type == RAY_SYM && path->len > 0)))
+        return ray_error("type", ".repl.inspect expects a symbol or a non-empty symbol vector, got %s",
+                         path ? ray_type_name(path->type) : "null");
+    ray_t* pfx = NULL;
+    int64_t limit = INSP_LIMIT;
+    if (n == 2) {
+        ray_t* err = insp_opts(args[1], &pfx, &limit);
+        if (err) return err;
+    }
+
+    ray_t* v = insp_follow(path);
+    ray_t *keys, *types;
+    bool truncated;
+    bool listed = insp_members(v, pfx ? ray_str_ptr(pfx) : "", pfx ? ray_str_len(pfx) : 0,
+                               limit, &keys, &types, &truncated);
+    if (pfx) ray_release(pfx);
+    if (!listed) {
+        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
+        if (types && !RAY_IS_ERR(types)) ray_release(types);
+        if (v) ray_release(v);
+        return ray_error("oom", NULL);
+    }
+
+    insp_dict_t d;
+    insp_init(&d, 8);
+    ray_retain(path);
+    insp_put(&d, "path", path);
+    insp_put(&d, "bound", ray_bool(v != NULL));
+    insp_put(&d, "type", ray_sym(v ? insp_type_id(v) : ray_sym_intern("", 0)));
+    insp_put(&d, "kind", insp_sym(insp_kind(v)));
+    insp_put(&d, "len", v ? insp_len(v) : ray_typed_null(-RAY_I64));
+    insp_put(&d, "keys", keys);
+    insp_put(&d, "types", types);
+    insp_put(&d, "truncated", ray_bool(truncated));
     if (v) ray_release(v);
     return insp_done(&d);
 }
