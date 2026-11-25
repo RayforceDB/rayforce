@@ -216,6 +216,7 @@ static const ray_sig_entry_t sigs[] = {
     {".repl.complete", "(.repl.complete <prefix: str>)"},
     {".repl.signature", "(.repl.signature <name: sym>)"},
     {".repl.definition", "(.repl.definition <name: sym>)"},
+    {".repl.inspect", "(.repl.inspect <path: sym or sym vector> [<opts: dict>])"},
     {"ser", "(ser <x: any>)"},
     {"de", "(de <bytes: U8 vector>)"},
     {"raise", "(raise <message: str>)"},

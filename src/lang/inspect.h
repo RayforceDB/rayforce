@@ -43,5 +43,9 @@ ray_t* ray_repl_signature_fn(ray_t* name);
 /* (.repl.definition name): where the function a name holds now was
  * written, from the source record its lambda already retains. */
 ray_t* ray_repl_definition_fn(ray_t* name);
+/* (.repl.inspect path [opts]): kind, type and cheap length of a named
+ * global or dict member / table column path; member or column names and
+ * types from headers only, filtered by prefix, sorted, bounded by limit. */
+ray_t* ray_repl_inspect_fn(ray_t** args, int64_t n);
 
 #endif

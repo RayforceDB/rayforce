@@ -1,0 +1,124 @@
+;; @requires: posix  (an on-disk database and a -U server through a POSIX shell)
+;; .repl.inspect: kind, type and cheap length of a named global or a path
+;; through dict members and, last, one table column, with member or column
+;; names (sorted) and types (#945).  It reads headers only: no rows, no
+;; decoded column, nothing called.
+(.sys.exec "rm -rf /tmp/rftest_replinsp") -- 0
+;; dict members, sorted, with their types; a reassignment is followed
+(set rin_bt (dict ['zeta 'alpha 'mid] (list 1 "s" (fn [x] x))))
+(key (.repl.inspect 'rin_bt)) -- ['path 'bound 'type 'kind 'len 'keys 'types 'truncated]
+(value (.repl.inspect 'rin_bt)) -- (list 'rin_bt true 'DICT 'dict 3 ['alpha 'mid 'zeta] ['str 'LAMBDA 'i64] false)
+(set rin_bt {b: 1 a: 2})
+(at (.repl.inspect 'rin_bt) 'keys) -- ['a 'b]
+(at (.repl.inspect 'rin_bt) 'types) -- ['i64 'i64]
+;; an empty dict is a successful empty answer, not a missing one
+(set rin_e (dict (as 'SYM []) (list)))
+(value (.repl.inspect 'rin_e)) -- (list 'rin_e true 'DICT 'dict 0 (as 'SYM []) (as 'SYM []) false)
+;; a path: a dotted name or a symbol vector, through dict members
+(set rin_cfg {db: {host: "h" port: 5000} tag: 'x})
+(at (.repl.inspect 'rin_cfg.db) 'keys) -- ['host 'port]
+(at (.repl.inspect ['rin_cfg 'db]) 'keys) -- ['host 'port]
+(value (.repl.inspect ['rin_cfg 'db 'port])) -- (list ['rin_cfg 'db 'port] true 'i64 'atom 0Nl (as 'SYM []) (as 'SYM []) false)
+(at (.repl.inspect ['rin_cfg 'nosuch]) 'kind) -- 'missing
+(at (.repl.inspect ['rin_cfg 'tag 'more]) 'bound) -- false
+;; prefix and limit: the prefix filters, the limit cuts after sorting
+(set rin_w (dict ['bx 'ab 'ba 'bb 'aa] (list 1 2 3 4 5)))
+(at (.repl.inspect 'rin_w {prefix: "b"}) 'keys) -- ['ba 'bb 'bx]
+;; options built with dict rather than a {…} literal (typed STR-vector
+;; values, which only C or IPC can build, are in repl/inspect/str_vector_opts)
+(at (.repl.inspect 'rin_w (dict ['prefix] ["b"])) 'keys) -- ['ba 'bb 'bx]
+(at (.repl.inspect 'rin_w (dict ['prefix 'limit] (list "bb" 5))) 'keys) -- ['bb]
+(at (.repl.inspect 'rin_w (dict ['limit] [2])) 'keys) -- ['aa 'ab]
+(.repl.inspect 'rin_w (dict ['prefix 'limit] (list "b" -1))) !- domain
+(set rin_r (.repl.inspect 'rin_w {prefix: "b" limit: 2}))
+(at rin_r 'keys) -- ['ba 'bb]
+(at rin_r 'truncated) -- true
+(at rin_r 'len) -- 5
+(at (.repl.inspect 'rin_w {prefix: "b" limit: 3}) 'truncated) -- false
+(at (.repl.inspect 'rin_w {limit: 0}) 'keys) -- (as 'SYM [])
+(at (.repl.inspect 'rin_w {prefix: "zz"}) 'truncated) -- false
+;; a dict keyed by other than symbols: its length, no member names
+(value (.repl.inspect 'rin_n)) -- (list 'rin_n false (as 'SYM "") 'missing 0Nl (as 'SYM []) (as 'SYM []) false)
+(set rin_n (dict [1 2] [3 4]))
+(value (.repl.inspect 'rin_n)) -- (list 'rin_n true 'DICT 'dict 2 (as 'SYM []) (as 'SYM []) false)
+;; a table: column names and types; a column as the last step
+(set rin_t (table [x y s] (list [1 2 3] [1.0 2.0 3.0] ['a 'b 'c])))
+(value (.repl.inspect 'rin_t)) -- (list 'rin_t true 'TABLE 'table 3 ['s 'x 'y] ['SYM 'I64 'F64] false)
+(value (.repl.inspect ['rin_t 'y])) -- (list ['rin_t 'y] true 'F64 'vector 3 (as 'SYM []) (as 'SYM []) false)
+(at (.repl.inspect ['rin_t 'nosuch]) 'kind) -- 'missing
+(at (.repl.inspect ['rin_t 'y 'more]) 'kind) -- 'missing
+(set rin_d (dict ['t] (list rin_t)))
+(at (.repl.inspect ['rin_d 't 'x]) 'type) -- 'I64
+;; other kinds
+(at (.repl.inspect 'min) 'kind) -- 'builtin
+(at (.repl.inspect 'min) 'len) -- 0Nl
+(set rin_f (fn [a] a))
+(at (.repl.inspect 'rin_f) 'kind) -- 'lambda
+(set rin_v [1 2 3 4])
+(at (.repl.inspect 'rin_v) 'len) -- 4
+(at (.repl.inspect 'rin_v) 'kind) -- 'vector
+(set rin_l (list 1 'a))
+(at (.repl.inspect 'rin_l) 'kind) -- 'list
+;; a compressed splayed table: names, types and rows from the headers, and
+;; no column decoded (the query below is what does decode one)
+(set rin_big (table [k s v] (list (til 70000) (take ["aa" "bb" "cc"] 70000) (take [1.5 2.5] 70000))))
+(.db.splayed.set "/tmp/rftest_replinsp/c/t" rin_big {compress: true})
+(set rin_c (.db.splayed.get "/tmp/rftest_replinsp/c/t"))
+(set rin_m0 (at (.sys.mem) 'decode-cache-bytes))
+(value (.repl.inspect 'rin_c)) -- (list 'rin_c true 'TABLE 'table 70000 ['k 's 'v] ['I64 'STR 'F64] false)
+(value (.repl.inspect ['rin_c 's])) -- (list ['rin_c 's] true 'STR 'vector 70000 (as 'SYM []) (as 'SYM []) false)
+(at (.idx.info rin_c 's) 'materialized) -- false
+(- (at (.sys.mem) 'decode-cache-bytes) rin_m0) -- 0
+(count (select {from: rin_c by: k l: (max (strlen s))})) -- 70000
+(at (.idx.info rin_c 's) 'materialized) -- true
+;; a parted table: the partition column's type and the rows its counts
+;; hold; a plain parted column's rows would need its segments, so 0Nl
+(.db.splayed.set "/tmp/rftest_replinsp/p/2024.01.01/t/" (take rin_big 5) "/tmp/rftest_replinsp/p/.sym" {compress: false})
+(.db.splayed.set "/tmp/rftest_replinsp/p/2024.01.02/t/" (drop rin_big 69990) "/tmp/rftest_replinsp/p/.sym" {compress: false})
+(set rin_p (.db.parted.get "/tmp/rftest_replinsp/p" 't))
+(value (.repl.inspect 'rin_p)) -- (list 'rin_p true 'TABLE 'table 15 ['date 'k 's 'v] ['DATE 'I64 'STR 'F64] false)
+(value (.repl.inspect ['rin_p 'k])) -- (list ['rin_p 'k] true 'I64 'vector 0Nl (as 'SYM []) (as 'SYM []) false)
+(at (.repl.inspect ['rin_p 'date]) 'len) -- 15
+;; a compressed parted column holds its row count in its header
+(.db.splayed.set "/tmp/rftest_replinsp/q/2024.01.01/t/" (take rin_big 5) "/tmp/rftest_replinsp/q/.sym" {compress: true})
+(.db.splayed.set "/tmp/rftest_replinsp/q/2024.01.02/t/" (drop rin_big 69990) "/tmp/rftest_replinsp/q/.sym" {compress: true})
+(set rin_q (.db.parted.get "/tmp/rftest_replinsp/q" 't))
+(at (.repl.inspect ['rin_q 'k]) 'len) -- 15
+(at (.repl.inspect ['rin_q 's]) 'type) -- 'STR
+;; a dict keyed by a stored SYM column, and a path taken from one: their
+;; cells are positions in the file's symbol domain, read through it, not
+;; runtime symbol ids; .repl.signature's dotted names follow such a dict too
+(.db.splayed.set "/tmp/rftest_replinsp/dom/t/" (table [k s] (list (as 'SYM ["rin_k0" "rin_k1" "rin_k2" "rin_k3"]) (as 'SYM ["rin_zz" "rin_yy" "rin_zz" "rin_yy"]))) "/tmp/rftest_replinsp/dom/.sym")
+(set rin_z (.db.splayed.get "/tmp/rftest_replinsp/dom/t/" "/tmp/rftest_replinsp/dom/.sym"))
+(set rin_d3 (dict (take (at rin_z 'k) 3) [1 2 3]))
+(value (.repl.inspect 'rin_d3)) -- (list 'rin_d3 true 'DICT 'dict 3 ['rin_k0 'rin_k1 'rin_k2] ['i64 'i64 'i64] false)
+(at (.repl.inspect ['rin_d3 'rin_k1]) 'type) -- 'i64
+(at (.repl.inspect 'rin_d3.rin_k1) 'bound) -- true
+(at (.repl.inspect 'rin_d3 {prefix: "rin_k2"}) 'keys) -- ['rin_k2]
+(set rin_zz (dict ['rin_yy] (list 7)))
+(at (.repl.inspect (take (at rin_z 's) 2)) 'type) -- 'i64
+(set rin_dl (dict (take (at rin_z 'k) 2) (list (fn [a] a) (fn [b c] b))))
+(at (.repl.signature 'rin_dl.rin_k1) 'params) -- ['b 'c]
+;; options: an empty dict is no options; any integer width is a limit
+(at (.repl.inspect 'rin_w {}) 'keys) -- ['aa 'ab 'ba 'bb 'bx]
+(at (.repl.inspect 'rin_w {limit: 2i}) 'keys) -- ['aa 'ab]
+(at (.repl.inspect 'rin_w {limit: 2h}) 'truncated) -- true
+;; errors: the path, the options
+(.repl.inspect "rin_t") !- type
+(.repl.inspect (as 'SYM [])) !- type
+(.repl.inspect 'rin_t 5) !- type
+(.repl.inspect 'rin_t {prefix: 'x}) !- type
+(.repl.inspect 'rin_t {limit: 1.5}) !- type
+(.repl.inspect 'rin_t {limit: -1}) !- domain
+(.repl.inspect 'rin_t {limit: -1i}) !- domain
+(.repl.inspect 'rin_t {limit: 0Nl}) !- type
+(.repl.inspect 'rin_t {limit: 0Ni}) !- type
+(.repl.inspect 'rin_t {colour: 1}) !- domain
+(.repl.inspect 'rin_t {limit: 1} 2) !- arity
+;; allowed under -U, like .repl.complete
+(.sys.exec "test/serve.sh --listen /tmp/rftest_replinsp/s -U pw") -- 0
+(set rin_h (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_replinsp/s/port")) ":u:pw"))))
+(set rin_ask (fn [src] (try (.ipc.send rin_h src) (fn [e] (get e 'code)))))
+(rin_ask "(at (.repl.inspect 'min) 'kind)") -- 'builtin
+(.ipc.close rin_h)
+(.sys.exec "test/serve.sh --stop /tmp/rftest_replinsp/s; rm -rf /tmp/rftest_replinsp") -- 0

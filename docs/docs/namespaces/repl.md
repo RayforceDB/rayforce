@@ -16,6 +16,7 @@ Attach the local interactive REPL to a remote Rayforce server. While attached, e
 | [`.repl.complete`](#repl-complete) | unary | — | Names the engine knows that start with a prefix, sorted. |
 | [`.repl.signature`](#repl-signature) | unary | — | How a named global is called: kind, convention, parameters, usage. |
 | [`.repl.definition`](#repl-definition) | unary | restricted | Where the function a named global holds was written. |
+| [`.repl.inspect`](#repl-inspect) | variadic | — | Kind, type and length of a named global or member path, with its member or column names and types. |
 
 ## `.repl.connect` { #repl-connect }
 
@@ -62,11 +63,11 @@ Signature: `(.repl.complete prefix)`. Returns a sorted `sym` vector of the names
 
 ## Editor metadata
 
-`.repl.complete`, `.repl.signature` and `.repl.definition` answer an editor's questions about the live session over IPC. They share these rules:
-- **Naming.** They take an explicitly named global, a symbol. It is the global of that exact name, dotted builtin names (`.sys.mem`) included. For a dotted name no global holds, the name is followed through dictionary members (`'D.f` is the member `f` of the dict `D`), never through a table column, a call or a method.
+`.repl.complete`, `.repl.signature`, `.repl.definition` and `.repl.inspect` answer an editor's questions about the live session over IPC. They share these rules:
+- **Naming.** They take an explicitly named global, a symbol. It is the global of that exact name, dotted builtin names (`.sys.mem`) included. For a dotted name no global holds, the name is followed through dictionary members (`'D.f` is the member `f` of the dict `D`), never through a table column, a call or a method. Only `.repl.inspect`'s symbol-vector path may end at a table column.
 - **Read-only.** They evaluate and call nothing.
 - **Missing.** A missing binding is an ordinary result, not an error.
-- **Restricted connections.** `.repl.complete` and `.repl.signature` are allowed under `-U`. They call and evaluate nothing, and give a restricted client nothing it cannot already get. Evaluating a name over IPC returns its value, a lambda included, with its parameters. Printing a lambda gives only `lambda`, so that is not where the parameter names come from. `.repl.definition` is refused there with `access`, because it exposes server file paths and loaded source.
+- **Restricted connections.** `.repl.complete`, `.repl.signature` and `.repl.inspect` are allowed under `-U`. They call and evaluate nothing, and give a restricted client nothing it cannot already get. Evaluating a name over IPC returns its value, a lambda, dict or table included. Printing a lambda gives only `lambda`, so that is not where the parameter names come from. `.repl.definition` is refused there with `access`, because it exposes server file paths and loaded source.
 
 ## `.repl.signature` { #repl-signature }
 
@@ -131,6 +132,49 @@ A name that is not a symbol raises `type`.
 ;; {name:add bound:true kind:lambda available:true file:"lib.rfl" start:[0 9] end:[1 10]
 ;;  text:"(fn [a b]\n  (+ a b))" digest:"974e76eb" size:31}
 (at (.repl.definition 'min) 'available)   ;; false
+```
+
+## `.repl.inspect` { #repl-inspect }
+
+Signature: `(.repl.inspect path)` or `(.repl.inspect path opts)`.
+
+- `path` is a symbol, or a symbol vector `[root member …]`. The vector steps through dictionary members and may end at one table column: `['cfg 'db]` is the member `db` of the dict `cfg`, and `['t 'price]` is the column `price` of the table `t`. A dotted symbol (`'cfg.db`) follows dictionary members only, as for `.repl.signature`.
+- `opts` is a dict with optional `prefix` (a string) and `limit` (a non-negative integer of any width, default 1000). An empty dict `{}` means no options.
+
+It returns a dict:
+
+| Key | Value |
+|---|---|
+| `path` | the path asked for |
+| `bound` | whether the path names a value |
+| `type` | the type `type` would give, for a stored column the type of the column it reads as (`I64`, `STR`, `DATE`, …); the empty symbol when missing |
+| `kind` | `dict`, `table`, `vector`, `atom`, `list`, `lambda`, `builtin`, `other` or `missing` |
+| `len` | members, rows or elements when held in a header; `0Nl` for an atom, a function, a missing path, or a count that would need a read |
+| `keys` | the dict's member names or the table's column names that start with `prefix`, sorted, at most `limit` of them |
+| `types` | the matching members' or columns' types, in the same order |
+| `truncated` | whether `limit` left matching names out |
+
+A symbol read from a stored `SYM` column (a dict keyed by one, or a path taken from one) is resolved through that column's symbol file, as printing it is, so its names are the ones `key` shows.
+
+It reads headers only. It never reads a row, decodes a compressed column, or calls anything. A compressed column's type and row count come from its file header. A partitioned table's row count comes from its partition column. A plain partitioned column has no row count of its own, so its `len` is `0Nl`. The work is one pass over the members and a sort of the matching names, and at most `limit` names are returned.
+
+Every outcome is distinct:
+- A missing name, member or column gives `bound:false` and `kind:missing`; so does a path that steps into something that is not a dict, or past a column.
+- An empty dict or table is `bound:true` with `len:0` and no keys.
+- A dict keyed by anything other than symbols reports its `len`, with `keys` and `types` empty.
+
+A path that is not a symbol or a non-empty symbol vector raises `type`. Options other than a dict, a `prefix` that is not a string, or a `limit` that is not an integer or is null raise `type`. A negative `limit` or an unknown option raises `domain`.
+
+```lisp
+(set cfg {db: {host: "h" port: 5000} tag: 'x})
+(at (.repl.inspect 'cfg) 'keys)             ;; [db tag]
+(.repl.inspect ['cfg 'db 'port])
+;; {path:[cfg db port] bound:true type:i64 kind:atom len:0Nl keys:[] types:[] truncated:false}
+(set t (table [x y s] (list [1 2 3] [1.0 2.0 3.0] ['a 'b 'c])))
+(.repl.inspect 't)
+;; {path:t bound:true type:TABLE kind:table len:3 keys:[s x y] types:[SYM I64 F64] truncated:false}
+(.repl.inspect 't {prefix: "s" limit: 10})  ;; keys:[s] types:[SYM]
+(at (.repl.inspect ['t 'y]) 'type)          ;; 'F64
 ```
 
 ## See also

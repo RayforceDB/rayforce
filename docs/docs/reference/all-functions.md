@@ -70,7 +70,7 @@ Listed from `src/lang/eval.c` in this checkout. The categorized reference below 
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.append`, `.db.splayed.get`,
 `.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.ts`, `.sys.timeit`,
-`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.handles`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.handles`, `.ipc.transport`, `.repl.disconnect`, `.repl.inspect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.stats`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
@@ -760,6 +760,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.repl.complete` | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix. See [`.repl.complete`](../namespaces/repl.md#repl-complete) | `(.repl.complete "xas")` → `[xasc]` |
 | `.repl.signature` | unary | — | How a named global is called: kind, calling convention, special form, lambda parameters, documented usage; calls nothing. See [`.repl.signature`](../namespaces/repl.md#repl-signature) | `(at (.repl.signature 'min) 'kind)` → `'unary` |
 | `.repl.definition` | unary | restricted | Where the function a named global holds was written: file, `(fn …)` span, text, and a digest of the loaded source. See [`.repl.definition`](../namespaces/repl.md#repl-definition) | `(at (.repl.definition 'add) 'start)` → `[0 9]` |
+| `.repl.inspect` | variadic | — | Kind, type and length of a named global or member path, with its dict member or table column names and types, read from headers only. See [`.repl.inspect`](../namespaces/repl.md#repl-inspect) | `(at (.repl.inspect 't) 'keys)` → `[a b]` |
 
 ```lisp
 ; Metaprogramming: parse and eval

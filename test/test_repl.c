@@ -54,6 +54,7 @@
 #include "lang/nfo.h"      /* ray_span_t */
 #include "lang/parse.h"    /* ray_parse: the parse error frame out of memory */
 #include "lang/syscmd.h"   /* ray_syscmd_dispatch: :h NAME */
+#include "lang/inspect.h"  /* ray_repl_inspect_fn: options held as typed vectors */
 #include "mem/heap.h"       /* ray_alloc_fail_set_for_test: frame building out of memory */
 #include "store/serde.h"   /* RAY_SERDE_WIRE_VERSION: the listen probe */
 #include "mem/sys.h"
@@ -1650,6 +1651,44 @@ static test_result_t test_repl_help_name(void) {
     /* both bare forms list the commands */
     const char* first = strstr(buf, ". Commands list:");
     TEST_ASSERT_FMT(first && strstr(first + 1, ". Commands list:"), "two command lists in:\n%.1500s", buf);
+    PASS();
+}
+
+/* .repl.inspect options whose values are a typed STR vector (as a dict
+ * built in C or received over IPC can hold them, unlike a {…} literal's
+ * list): the prefix is a fresh atom read out of the vector, and must stay
+ * alive while the member names are filtered.  Under ASan the prefix used
+ * to be read after the atom was freed. */
+static test_result_t test_repl_inspect_str_vector_opts(void) {
+    ray_t* r = ray_eval_str("(set zri_w (dict ['bx 'ab 'ba 'bb 'aa] (list 1 2 3 4 5)))");
+    TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "set failed");
+    ray_release(r);
+    ray_t* k = ray_vec_new(RAY_SYM, 1);
+    TEST_ASSERT_NOT_NULL(k);
+    ((int64_t*)ray_data(k))[0] = ray_sym_intern("prefix", 6);
+    k->len = 1;
+    ray_t* vals = ray_str_vec_append(ray_vec_new(RAY_STR, 1), "b", 1);
+    TEST_ASSERT_FMT(vals && !RAY_IS_ERR(vals) && vals->type == RAY_STR, "STR vector");
+    ray_t* opts = ray_dict_new(k, vals);
+    TEST_ASSERT_FMT(opts && !RAY_IS_ERR(opts), "dict");
+    ray_t* path = ray_sym(ray_sym_intern("zri_w", 5));
+    ray_t* args[2] = { path, opts };
+    ray_t* res = ray_repl_inspect_fn(args, 2);
+    TEST_ASSERT_FMT(res && !RAY_IS_ERR(res), "inspect failed");
+    ray_t* kk = ray_sym(ray_sym_intern("keys", 4));
+    ray_t* keys = ray_dict_get(res, kk);
+    TEST_ASSERT_FMT(keys && keys->type == RAY_SYM && keys->len == 3, "three keys");
+    const char* want[] = { "ba", "bb", "bx" };
+    for (int64_t i = 0; i < 3; i++) {
+        ray_t* s = ray_sym_str(((int64_t*)ray_data(keys))[i]);
+        TEST_ASSERT_FMT(s && ray_str_len(s) == 2 && memcmp(ray_str_ptr(s), want[i], 2) == 0,
+                        "key %lld", (long long)i);
+    }
+    ray_release(keys);
+    ray_release(kk);
+    ray_release(res);
+    ray_release(opts);
+    ray_release(path);
     PASS();
 }
 
@@ -3527,6 +3566,7 @@ const test_entry_t repl_entries[] = {
     { "repl/run/piped/help",            test_repl_run_piped_help,                repl_setup, repl_teardown },
     { "repl/run/piped/help_full",       test_repl_run_piped_help_full,           repl_setup, repl_teardown },
     { "repl/help/name",                 test_repl_help_name,                     repl_setup, repl_teardown },
+    { "repl/inspect/str_vector_opts",   test_repl_inspect_str_vector_opts,       repl_setup, repl_teardown },
     { "repl/run/piped/clear",           test_repl_run_piped_clear,               repl_setup, repl_teardown },
     { "repl/run/piped/listen_no_arg",   test_repl_run_piped_listen_no_arg,       repl_setup, repl_teardown },
     { "repl/run/piped/listen_bad_port", test_repl_run_piped_listen_bad_port,     repl_setup, repl_teardown },
