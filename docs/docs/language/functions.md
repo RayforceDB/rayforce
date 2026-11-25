@@ -636,7 +636,7 @@ spills exactly as it did before.
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`) | `(ser [1 2 3])` |
-| `de` | unary | Deserialize from binary format | `(de bytes)` |
+| `de` | unary | Deserialize from binary format; a list holding an error value (built in C, never in Rayfall, where a caught error is a dict) reads back as its first error, see [A list holding an error value](../storage/ipc.md#a-list-holding-an-error-value) | `(de bytes)` |
 | `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |

@@ -569,7 +569,9 @@ const char* ray_err_code(ray_t* err);
 const char* ray_err_msg(ray_t* err);
 ```
 
-Serialization (`ray_ser`, IPC, the journal) writes each error's own message, so a list holding several errors writes each one's text. `ray_error_msg()` is the message of the last error made on the calling thread; for an error object at hand, use `ray_err_msg(err)`.
+Serialization (`ray_ser`, IPC, the journal) writes each error's own message, so a list holding several errors writes each one's text. Deserialization (`ray_de`, an IPC reply) stops at a list's first error cell: the list reads back as that error alone, with its own code and message, and the other cells are lost. Journal replay drops that error: `ray_journal_replay` stops at the frame with `RAY_JREPLAY_DESER` (after replaying the entries before it), and `.log.replay` fails with `deser`, not with the cell's code or message. A Rayfall program never builds such a list (a caught error is the dict `{code msg}`), so this arises only for lists built in C or read from the wire, such as the `[captured, result]` reply to a `RAY_IPC_FLAG_VERBOSE` request whose result is an error. To send errors as cells, carry each one in the form `try` gives it: a dict with the keys `code` (the symbol of `ray_err_code(err)`) and `msg` (a string of `ray_err_msg(err)`), and free the error object with `ray_error_free`. A list of such dicts round-trips whole. See [A list holding an error value](../storage/ipc.md#a-list-holding-an-error-value).
+
+`ray_error_msg()` is the message of the last error made on the calling thread; for an error object at hand, use `ray_err_msg(err)`.
 
 ### RAY_IS_ERR(p)
 

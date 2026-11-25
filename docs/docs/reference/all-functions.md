@@ -780,7 +780,7 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(ser [1 2 3])` |
-| `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
+| `de` | unary | — | Deserialize from binary format back to value; a list holding an error value (built in C, never in Rayfall, where a caught error is a dict) reads back as its first error, see [A list holding an error value](../storage/ipc.md#a-list-holding-an-error-value) | `(de bytes)` → `[1 2 3]` |
 | `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
 | `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
