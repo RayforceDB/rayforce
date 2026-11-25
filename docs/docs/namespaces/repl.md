@@ -15,6 +15,7 @@ Attach the local interactive REPL to a remote Rayforce server. While attached, e
 | [`.repl.disconnect`](#repl-disconnect) | variadic | restricted | Detach and close the active remote session. |
 | [`.repl.complete`](#repl-complete) | unary | — | Names the engine knows that start with a prefix, sorted. |
 | [`.repl.signature`](#repl-signature) | unary | — | How a named global is called: kind, convention, parameters, usage. |
+| [`.repl.definition`](#repl-definition) | unary | restricted | Where the function a named global holds was written. |
 
 ## `.repl.connect` { #repl-connect }
 
@@ -61,11 +62,11 @@ Signature: `(.repl.complete prefix)`. Returns a sorted `sym` vector of the names
 
 ## Editor metadata
 
-`.repl.complete` and `.repl.signature` answer an editor's questions about the live session over IPC. They share these rules:
+`.repl.complete`, `.repl.signature` and `.repl.definition` answer an editor's questions about the live session over IPC. They share these rules:
 - **Naming.** They take an explicitly named global, a symbol. It is the global of that exact name, dotted builtin names (`.sys.mem`) included. For a dotted name no global holds, the name is followed through dictionary members (`'D.f` is the member `f` of the dict `D`), never through a table column, a call or a method.
 - **Read-only.** They evaluate and call nothing.
 - **Missing.** A missing binding is an ordinary result, not an error.
-- **Restricted connections.** Both are allowed under `-U`. They call and evaluate nothing, and give a restricted client nothing it cannot already get. Evaluating a name over IPC returns its value, a lambda included, with its parameters. Printing a lambda gives only `lambda`, so that is not where the parameter names come from.
+- **Restricted connections.** `.repl.complete` and `.repl.signature` are allowed under `-U`. They call and evaluate nothing, and give a restricted client nothing it cannot already get. Evaluating a name over IPC returns its value, a lambda included, with its parameters. Printing a lambda gives only `lambda`, so that is not where the parameter names come from. `.repl.definition` is refused there with `access`, because it exposes server file paths and loaded source.
 
 ## `.repl.signature` { #repl-signature }
 
@@ -94,6 +95,40 @@ A builtin's calling convention is not the set of forms it accepts. `min` is unar
 ;; "(min <x: vector, atom or list>) or (min <a: num> <b: num>)"
 (at (.repl.signature 'if) 'special)     ;; true
 (at (.repl.signature 'nosuch) 'kind)    ;; 'missing
+```
+
+## `.repl.definition` { #repl-definition }
+
+Signature: `(.repl.definition name)`, `name` a symbol. It returns a dict saying where the function the name holds now was written. That is not the assignment that bound the name: after `(set alias original)`, `alias` reports `original`'s source. It reads the source record a lambda keeps from parsing, the same record error traces use, so the parse and call paths do nothing extra for it.
+
+| Key | Value |
+|---|---|
+| `name` | the symbol asked for |
+| `bound` | whether the name holds a value |
+| `kind` | `lambda`, `builtin`, `value` or `missing` |
+| `available` | whether a source location is known |
+| `file` | the file the lambda was loaded from; `"repl"` for input that came from no file (the REPL, an evaluated string) |
+| `start`, `end` | `[line col]` of the `(fn …)` form: 0-based lines, 0-based byte columns, `end` exclusive |
+| `text` | that form's source text |
+| `digest`, `size` | the CRC-32 (8 hex digits) and the byte length of the whole text loaded with it, so an editor can tell its buffer has changed since |
+
+Nothing is invented. When no location is known, `available` is `false`, `file`, `text` and `digest` are empty, `start` and `end` are empty vectors and `size` is `0Nl`. That covers:
+
+- a builtin, a value or a missing name;
+- a lambda built at run time from quoted pieces, as in `(eval (list 'fn ['x] 'x))`: its parts were written somewhere, but no `(fn` form was;
+- a position past the parser's 16-bit line or column.
+
+A name that is not a symbol raises `type`.
+
+```lisp
+;; lib.rfl holds:
+;; (set add (fn [a b]
+;;   (+ a b)))
+(load "lib.rfl")
+(.repl.definition 'add)
+;; {name:add bound:true kind:lambda available:true file:"lib.rfl" start:[0 9] end:[1 10]
+;;  text:"(fn [a b]\n  (+ a b))" digest:"974e76eb" size:31}
+(at (.repl.definition 'min) 'available)   ;; false
 ```
 
 ## See also

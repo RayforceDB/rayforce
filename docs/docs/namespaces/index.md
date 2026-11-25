@@ -36,7 +36,7 @@ When the server is started with `-U <password>`, the following dotted builtins a
 - `.mc.pub`
 - `.os.getenv`, `.os.setenv`
 - `.parquet.meta`, `.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`
-- `.repl.connect`, `.repl.disconnect`
+- `.repl.connect`, `.repl.disconnect`, `.repl.definition`
 - `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset`, `.sys.trust`
 - `.time.timer.set`, `.time.timer.del`, `.time.sleep`
 
