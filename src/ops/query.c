@@ -13309,6 +13309,10 @@ static ray_t* eval_expr_per_row_impl(ray_t* expr, ray_t* tbl, int64_t nrows) {
 
         g_active_query_row = row;
         ray_t* cell = ray_eval(expr);
+        /* A per-row value may be a lazy DAG chain (reverse, distinct, asc,
+         * desc return one): a cell holds a value, so force it here, as the
+         * whole-column path does (#1680). */
+        if (cell && !RAY_IS_ERR(cell) && ray_is_lazy(cell)) cell = ray_lazy_materialize(cell);
         /* The query scope still holds each marked cell, so the pointers
          * are live here. */
         for (int k = 0; k < n_marked; k++) marked[k]->attrs &= (uint8_t)~RAY_ATTR_STR_CELL;
