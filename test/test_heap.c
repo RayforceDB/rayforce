@@ -4541,6 +4541,134 @@ static test_result_t test_relieve_abandon_spill(void) {
 /* An abandoned heap with no live block keeps no pool, and its committed
  * bytes leave the anonymous watermark's count with it: the thread that
  * adopts it maps a pool as a new heap does. */
+#ifdef DEBUG
+/* The pool count is not a ceiling on small blocks: a heap that may add no
+ * more standard pools fails its next block (what a query of 100M boxed cells
+ * met at RAY_MAX_POOLS — `oom` with the disk half empty), and the same
+ * count with grown pools serves far more; past the watermark the grown
+ * pools are spill files like the standard ones. */
+static test_result_t test_pool_growth_ceiling(void) {
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) SKIP("no heap");
+    enum { BLK = (1 << 20) - 64, MAX_BLKS = 4096 };
+    static ray_t* blks[MAX_BLKS];
+    uint32_t have = h->pool_count;
+
+    /* 1. the old ceiling: one more pool, standard pools only — the heap's
+     * free blocks and the 32 MB pool, then the count fails a block */
+    ray_heap_test_pool_growth(have + 1, UINT32_MAX, 0);
+    int n_old = 0;
+    while (n_old < MAX_BLKS && (blks[n_old] = ray_alloc(BLK)) != NULL && !RAY_IS_ERR(blks[n_old])) n_old++;
+    bool old_fails = n_old < MAX_BLKS && (blks[n_old] == NULL || RAY_IS_ERR(blks[n_old]));
+    if (n_old < MAX_BLKS && blks[n_old] && RAY_IS_ERR(blks[n_old])) ray_error_free(blks[n_old]);
+    for (int i = 0; i < n_old; i++) ray_release(blks[i]);
+    TEST_ASSERT(old_fails, "a heap at its pool count fails a small block");
+    TEST_ASSERT(h->pool_count <= have + 1, "one pool at most was added at the count");
+
+    /* 2. two more pools, grown with the count: 64 and 128 MB (one and two
+     * doublings) — 192 MB past what the standard pools held */
+    ray_heap_test_pool_growth(have + 3, 1, 2);
+    int want = n_old + 150;
+    int n_new = 0;
+    while (n_new < want && (blks[n_new] = ray_alloc(BLK)) != NULL && !RAY_IS_ERR(blks[n_new])) n_new++;
+    bool grown_ok = n_new == want;
+    uint8_t last_order = h->pool_count > have ? h->pools[h->pool_count - 1].pool_order : 0;
+    if (n_new < want && blks[n_new] && RAY_IS_ERR(blks[n_new])) ray_error_free(blks[n_new]);
+    for (int i = 0; i < n_new; i++) ray_release(blks[i]);
+    ray_heap_test_pool_growth(0, 0, UINT32_MAX);
+    TEST_ASSERT_FMT(grown_ok, "grown pools serve %d of %d blocks", n_new, want);
+    TEST_ASSERT_FMT(last_order == RAY_HEAP_POOL_ORDER + 2, "the last pool added is grown twice, order %u", (unsigned)last_order);
+    PASS();
+}
+
+static test_result_t test_pool_growth_spills(void) {
+#if defined(_WIN32)
+    SKIP("file-backed spill is POSIX-only");
+#endif
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) SKIP("no heap");
+    enum { BLK = (1 << 20) - 64, N = 100 };
+    static ray_t* blks[N];
+    uint32_t have = h->pool_count;
+    int64_t previous = ray_heap_anon_watermark();
+    /* every new pool crosses the watermark: a grown pool is a spill file */
+    ray_heap_set_anon_watermark(1);
+    ray_heap_test_pool_growth(have + 3, 1, 2);   /* 32 + 64 + 128 MB of spill pools at most */
+    int n = 0;
+    while (n < N && (blks[n] = ray_alloc(BLK)) != NULL && !RAY_IS_ERR(blks[n])) {
+        memset(ray_data(blks[n]), (int)(n & 0xff), 4096);   /* the spilled pool is written */
+        n++;
+    }
+    bool ok = n == N;
+    bool added = h->pool_count > have;
+    bool backed = added && h->pools[h->pool_count - 1].backed;
+    bool rw = true;
+    for (int i = 0; i < n; i++) {
+        rw = rw && ((const uint8_t*)ray_data(blks[i]))[4095] == (uint8_t)(i & 0xff);
+        ray_release(blks[i]);
+    }
+    if (n < N && blks[n] && RAY_IS_ERR(blks[n])) ray_error_free(blks[n]);
+    ray_heap_test_pool_growth(0, 0, UINT32_MAX);
+    ray_heap_set_anon_watermark(previous);
+    if (added && !backed) SKIP("no spill file could be made");
+    TEST_ASSERT_FMT(ok, "grown spill pools serve %d of %d blocks", n, N);
+    TEST_ASSERT(added, "a pool was added past the watermark");
+    TEST_ASSERT(rw, "the spilled pools read back what was written");
+    PASS();
+}
+
+/* A grown pool that neither RAM nor a spill file can hold is tried once
+ * more at the standard size: a heap whose next pool is grown still serves a
+ * block that fits a 32 MB pool, from a standard pool, rather than fail it. */
+static test_result_t test_pool_growth_refused(void) {
+    ray_heap_t* h = ray_tl_heap;
+    if (!h) SKIP("no heap");
+    enum { BLK = (1 << 20) - 64, MAX_BLKS = 4096 };
+    static ray_t* blks[MAX_BLKS];
+    ray_t* first = NULL;
+    if (h->pool_count == 0) first = ray_alloc(BLK);   /* a pool, so the next one grows */
+    uint32_t have = h->pool_count;
+    if (have == 0) { if (first && !RAY_IS_ERR(first)) ray_release(first); FAIL("no pool was added"); }
+
+    /* 1. no pool to add: the free blocks of the heap's pools run out */
+    ray_heap_test_pool_growth(have, 1, 1);
+    int n = 0;
+    while (n < MAX_BLKS && (blks[n] = ray_alloc(BLK)) != NULL && !RAY_IS_ERR(blks[n])) n++;
+    bool full = n < MAX_BLKS;
+    if (full && blks[n] && RAY_IS_ERR(blks[n])) ray_error_free(blks[n]);
+
+    /* 2. one more pool, grown once (64 MB), and no room for it anywhere */
+    ray_heap_test_pool_growth(have + 1, 1, 1);
+    ray_heap_test_pool_refuse(RAY_HEAP_POOL_ORDER);
+    ray_t* blk = full ? ray_alloc(BLK) : NULL;
+    bool served = blk && !RAY_IS_ERR(blk);
+    if (blk && RAY_IS_ERR(blk)) ray_error_free(blk);
+    bool added = h->pool_count == have + 1;
+    uint8_t order = added ? h->pools[have].pool_order : 0;
+
+    /* 3. control: with room, the same heap's next pool is the grown one */
+    ray_heap_test_pool_refuse(0);
+    ray_heap_test_pool_growth(have + 2, 1, 1);
+    ray_t* more[64];
+    int m = 0;
+    while (m < 64 && h->pool_count < have + 2 && (more[m] = ray_alloc(BLK)) != NULL && !RAY_IS_ERR(more[m])) m++;
+    if (m < 64 && h->pool_count < have + 2 && more[m] && RAY_IS_ERR(more[m])) ray_error_free(more[m]);
+    uint8_t grown_order = h->pool_count == have + 2 ? h->pools[have + 1].pool_order : 0;
+
+    for (int i = 0; i < m; i++) ray_release(more[i]);
+    if (served) ray_release(blk);
+    for (int i = 0; i < n; i++) ray_release(blks[i]);
+    if (first && !RAY_IS_ERR(first)) ray_release(first);
+    ray_heap_test_pool_growth(0, 0, UINT32_MAX);
+    TEST_ASSERT_FMT(full, "the heap's pools filled within %d blocks", MAX_BLKS);
+    TEST_ASSERT(served, "a block the refused grown pool was for is served");
+    TEST_ASSERT(added, "one pool was added for it");
+    TEST_ASSERT_FMT(order == RAY_HEAP_POOL_ORDER, "the pool added is standard, order %u", (unsigned)order);
+    TEST_ASSERT_FMT(grown_order == RAY_HEAP_POOL_ORDER + 1, "with room the next pool is grown, order %u", (unsigned)grown_order);
+    PASS();
+}
+#endif
+
 static test_result_t test_heap_abandon_unmaps_empty(void) {
     relieve_env_t e;
     relieve_env_begin(&e);
@@ -7005,6 +7133,11 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_spill_not_room_unmap", test_relieve_spill_not_room_unmap, heap_setup, heap_teardown },
     { "heap/relieve_abandon_spill",    test_relieve_abandon_spill,       heap_setup, heap_teardown },
     { "heap/abandon_unmaps_empty",     test_heap_abandon_unmaps_empty,   heap_setup, heap_teardown },
+#ifdef DEBUG
+    { "heap/pool_growth_ceiling",      test_pool_growth_ceiling,         heap_setup, heap_teardown },
+    { "heap/pool_growth_spills",       test_pool_growth_spills,          heap_setup, heap_teardown },
+    { "heap/pool_growth_refused",      test_pool_growth_refused,         heap_setup, heap_teardown },
+#endif
     { "heap/relieve_spill_last_pool",  test_relieve_spill_last_pool,     heap_setup, heap_teardown },
     { "heap/relieve_spill_last_pool_unmap", test_relieve_spill_last_pool_unmap, heap_setup, heap_teardown },
     { "heap/relieve_no_spill_file",    test_relieve_no_spill_file,       heap_setup, heap_teardown },

@@ -194,6 +194,15 @@ ray_t*    ray_cow(ray_t* v);
 /* Test seam: ray_alloc on this thread returns NULL for `count` calls,
  * starting with the nth from now; nth 0 disarms. */
 void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
+/* Test seam: the pools a heap may hold (0: RAY_MAX_POOLS), how many pools
+ * share a size before the next ones double (0: the default), and the most
+ * doublings (UINT32_MAX: the default; 0: standard pools only, the old
+ * ceiling).  See heap_add_pool. */
+void ray_heap_test_pool_growth(uint32_t max_pools, uint32_t grow_every, uint32_t grow_max);
+/* Test seam: a pool of an order above `max_order` is refused by RAM and
+ * spill file alike, as on a box with room for neither (0 disarms).
+ * Disarmed by ray_test_hooks_off. */
+void ray_heap_test_pool_refuse(uint8_t max_order);
 #endif
 
 /* ===== Memory Statistics ===== */
@@ -507,10 +516,14 @@ void    ray_heap_unlock_idle(void);
 typedef struct {
     uint16_t heap_id;     /* owning heap ID (for cross-thread free) */
     uint8_t  pool_order;  /* pool's top order */
-    uint8_t  _pad;
+    uint8_t  magic;       /* RAY_POOL_HDR_MAGIC: part of the signature ray_pool_hdr_valid reads */
     uint32_t parked_ms;   /* when it was last parked, ms, wrapping (heap_park_empty_pools) */
     void*    vm_base;     /* original mmap base (for ray_vm_free on Windows) */
 } ray_pool_hdr_t;
+#define RAY_POOL_HDR_MAGIC 0xA5
+/* The header block's len: no object has a negative length, so no live
+ * block reads as a header, whatever its aux bytes hold. */
+#define RAY_POOL_HDR_LEN   ((int64_t)0x9E3779B97F4A7C15ULL)
 
 _Static_assert(sizeof(ray_pool_hdr_t) <= 16,
                "ray_pool_hdr_t must fit in ray_t aux (16 bytes)");
@@ -604,40 +617,54 @@ static inline bool ray_is_pool_hdr(ray_t* b) {
            ray_atomic_load(&b->rc) == 1;
 }
 
+/* Whether the min-block at `base` (a 32 MB boundary) is the header of the
+ * pool holding address v.  A block at an interior 32 MB boundary of a
+ * larger pool — a live min-block of a grown pool (heap_add_pool), or bytes
+ * of the one block of an oversized pool — lands at the same boundary, so
+ * the block signature (order, mmod, rc) is not enough: the header also
+ * has the length RAY_POOL_HDR_LEN (negative: no object's), carries
+ * RAY_POOL_HDR_MAGIC, claims a pool order a pool can have, sits at
+ * a base aligned to that pool's size (a 64 MB pool starts at a 64 MB
+ * boundary: a candidate at the odd 32 MB boundary inside it is rejected),
+ * covers v, and names the mapping it came from (vm_base: the base itself
+ * on POSIX, at most a pool size below it where the mapping is trimmed to
+ * alignment) — a live block's aux bytes there hold a pointer to another
+ * object, never one into its own 32 MB.  A candidate that fails is passed
+ * over and the walk goes on to the next boundary below. */
+static inline bool ray_pool_hdr_valid(ray_t* b, uintptr_t base, uintptr_t v) {
+    if (!ray_is_pool_hdr(b) || b->len != RAY_POOL_HDR_LEN) return false;
+    const ray_pool_hdr_t* hdr = (const ray_pool_hdr_t*)b;
+    uint8_t po = hdr->pool_order;
+    if (hdr->magic != RAY_POOL_HDR_MAGIC || po < RAY_HEAP_POOL_ORDER || po > RAY_HEAP_MAX_ORDER)
+        return false;
+    uintptr_t size = BSIZEOF(po);
+    if ((base & (size - 1)) != 0 || v < base || v >= base + size) return false;
+    uintptr_t vm = (uintptr_t)hdr->vm_base;
+    return vm <= base && base - vm < size;
+}
+
 static inline ray_pool_hdr_t* ray_pool_of(ray_t* v) {
-    /* Standard pools (32 MB, self-aligned): one AND gives the base.
-     * Oversized pools need a downward walk but are rare. */
+    /* Standard pools (32 MB, self-aligned): one AND gives the base.  Larger
+     * pools (grown, oversized) need a downward walk, one 32 MB stride at a
+     * time: at most 2^k - 1 strides for a pool of 2^k standard sizes. */
     uintptr_t stride = BSIZEOF(RAY_HEAP_POOL_ORDER);  /* 32 MB */
     uintptr_t base = (uintptr_t)v & ~(stride - 1);
-    ray_t* hb = (ray_t*)base;
-    ray_pool_hdr_t* hdr = (ray_pool_hdr_t*)base;
 
-    /* Fast path: a real pool header sits at this 32 MB boundary (99%+ of
-     * calls).  Gate on the header signature, NOT pool_order alone: a
-     * 32 MB-aligned block in the INTERIOR of an oversized pool lands here
-     * too, and trusting its overlaid pool_order byte would resolve it to
-     * itself — after which heap_coalesce's buddy walk runs past the real
-     * mapping and faults at pool_base+0x14 (the rc field). */
-    if (RAY_LIKELY(ray_is_pool_hdr(hb))) {
-        if (hdr->pool_order == RAY_HEAP_POOL_ORDER)
-            return hdr;                          /* standard pool */
-        if (hdr->pool_order > RAY_HEAP_POOL_ORDER &&
-            hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
-            (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
-            return hdr;                          /* oversized header at boundary */
-    }
+    /* Fast path: the pool header sits at this 32 MB boundary (99%+ of
+     * calls).  ray_pool_hdr_valid, not the overlaid pool_order byte alone:
+     * a block at an interior 32 MB boundary of a larger pool lands here too,
+     * and trusting it would resolve the pool to that block — after which
+     * heap_coalesce's buddy walk runs past the real mapping and faults at
+     * pool_base+0x14 (the rc field). */
+    if (RAY_LIKELY(ray_pool_hdr_valid((ray_t*)base, base, (uintptr_t)v)))
+        return (ray_pool_hdr_t*)base;
 
-    /* Oversized pool: the header is one or more 32 MB strides below v. */
+    /* A larger pool: the header is one or more 32 MB strides below v. */
     for (;;) {
         if (base < stride) break;
         base -= stride;
-        hdr = (ray_pool_hdr_t*)base;
-        ray_t* hdr_blk = (ray_t*)base;
-        if (ray_is_pool_hdr(hdr_blk) &&
-            hdr->pool_order >= RAY_HEAP_POOL_ORDER &&
-            hdr->pool_order <= RAY_HEAP_MAX_ORDER &&
-            (uintptr_t)v < base + BSIZEOF(hdr->pool_order))
-            return hdr;
+        if (ray_pool_hdr_valid((ray_t*)base, base, (uintptr_t)v))
+            return (ray_pool_hdr_t*)base;
     }
 
     /* No signature-valid header covers v.  Pool headers are always at a

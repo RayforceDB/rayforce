@@ -573,10 +573,10 @@ static test_result_t test_pool_of_oversized_interior(void) {
     const uint8_t po    = RAY_HEAP_POOL_ORDER + 1;            /* order 26 */
     const size_t  psize = BSIZEOF(po);                        /* 64 MB */
 
-    /* 32MB-aligned 64MB region — same self-alignment real pools use. */
-    void* region = ray_vm_alloc_aligned(psize, stride);
+    /* A self-aligned 64MB region — the alignment real pools have. */
+    void* region = ray_vm_alloc_aligned(psize, psize);
     TEST_ASSERT_NOT_NULL(region);
-    TEST_ASSERT_EQ_U((uintptr_t)region & (stride - 1), 0);
+    TEST_ASSERT_EQ_U((uintptr_t)region & (psize - 1), 0);
 
     /* Real pool header at offset 0: full valid signature. */
     memset(region, 0, 64);
@@ -584,9 +584,11 @@ static test_result_t test_pool_of_oversized_interior(void) {
     hdr->order = RAY_ORDER_MIN;
     hdr->mmod  = 0;
     hdr->rc    = 1;
+    hdr->len   = RAY_POOL_HDR_LEN;
     ray_pool_hdr_t* ph = (ray_pool_hdr_t*)region;
     ph->pool_order = po;
     ph->heap_id    = 0;
+    ph->magic      = RAY_POOL_HDR_MAGIC;
     ph->vm_base    = region;
 
     /* Interior block at +32MB: a freed buddy whose overlaid pool_order byte
@@ -605,10 +607,80 @@ static test_result_t test_pool_of_oversized_interior(void) {
     PASS();
 }
 
+/* ---- ray_pool_of: a live min-block at a grown pool's interior boundary ---- */
+/* A grown pool (heap_add_pool past 64 pools: 64 MB and up) has 32 MB
+ * boundaries inside it that hold ordinary small blocks.  A live min-block
+ * there has the block signature a header has (order RAY_ORDER_MIN, mmod 0,
+ * rc 1), and its aux bytes may read as any pool_order — 25 passes every
+ * alignment, as every 32 MB boundary is a standard pool's.  The header's
+ * magic byte, its alignment to its own pool size and its vm_base reject
+ * such a block, whatever it claims, and the walk finds the real header
+ * below; a forged candidate that claims a 64 MB pool from an odd 32 MB
+ * boundary is rejected on alignment alone. */
+static test_result_t test_pool_of_grown_interior_live_block(void) {
+    const size_t stride = BSIZEOF(RAY_HEAP_POOL_ORDER);        /* 32 MB */
+    const uint8_t po    = RAY_HEAP_POOL_ORDER + 1;            /* 64 MB pool */
+    const size_t  psize = BSIZEOF(po);
+    void* region = ray_vm_alloc_aligned(psize, psize);        /* self-aligned, as a real pool */
+    TEST_ASSERT_NOT_NULL(region);
+    memset(region, 0, 64);
+    ray_t* hdr = (ray_t*)region;
+    hdr->order = RAY_ORDER_MIN; hdr->mmod = 0; hdr->rc = 1; hdr->len = RAY_POOL_HDR_LEN;
+    ray_pool_hdr_t* ph = (ray_pool_hdr_t*)region;
+    ph->pool_order = po; ph->heap_id = 7; ph->magic = RAY_POOL_HDR_MAGIC; ph->vm_base = region;
+
+    /* the live block at +32 MB: a SYM vector, say, whose aux holds a domain
+     * pointer; its pool_order byte reads 25 */
+    ray_t* live = (ray_t*)((char*)region + stride);
+    memset(live, 0, 64);
+    live->order = RAY_ORDER_MIN; live->mmod = 0; live->rc = 1;
+    ray_pool_hdr_t* fake = (ray_pool_hdr_t*)live;
+    fake->pool_order = RAY_HEAP_POOL_ORDER;
+    fake->heap_id    = 0x1234;
+    fake->vm_base    = (void*)hdr;              /* a pointer elsewhere */
+    uint8_t probe_order[3] = { RAY_HEAP_POOL_ORDER, po, RAY_HEAP_MAX_ORDER };
+    for (int i = 0; i < 3; i++) {
+        fake->pool_order = probe_order[i];
+        fake->magic = 0;
+        live->len = 1;
+        ray_t* v = (ray_t*)((char*)live + 4096);
+        TEST_ASSERT_EQ_U((uintptr_t)ray_pool_of(v), (uintptr_t)region);
+        TEST_ASSERT_EQ_U((uintptr_t)ray_pool_of(live), (uintptr_t)region);
+        /* the aux bytes a live block can hold: a pointer to a neighbour in
+         * the same 32 MB (a slice's parent, a string's pool) where vm_base
+         * sits, the magic's byte in another pointer — still a block, by
+         * its length */
+        fake->vm_base = (void*)((char*)live - 65536);
+        fake->magic = RAY_POOL_HDR_MAGIC;
+        TEST_ASSERT_EQ_U((uintptr_t)ray_pool_of(v), (uintptr_t)region);
+        /* a slice header's length is any length an object has: never negative */
+        live->len = (int64_t)1 << 40;
+        TEST_ASSERT_EQ_U((uintptr_t)ray_pool_of(v), (uintptr_t)region);
+        fake->vm_base = (void*)hdr;
+    }
+    /* the predicate itself: the real header, and the same bytes at a base
+     * not aligned to the claimed pool */
+    TEST_ASSERT(ray_pool_hdr_valid(hdr, (uintptr_t)region, (uintptr_t)region + psize - 1), "the real header is valid");
+    TEST_ASSERT(!ray_pool_hdr_valid(hdr, (uintptr_t)region, (uintptr_t)region + psize), "the header does not cover the next pool");
+    TEST_ASSERT(!ray_pool_hdr_valid(hdr, (uintptr_t)region + stride, (uintptr_t)region + stride + 1), "a 64 MB claim at an odd 32 MB boundary is no header");
+    ph->magic = 0;
+    TEST_ASSERT(!ray_pool_hdr_valid(hdr, (uintptr_t)region, (uintptr_t)region + 1), "no magic, no header");
+    ph->magic = RAY_POOL_HDR_MAGIC;
+    hdr->len = 64;
+    TEST_ASSERT(!ray_pool_hdr_valid(hdr, (uintptr_t)region, (uintptr_t)region + 1), "an object's length, no header");
+    hdr->len = RAY_POOL_HDR_LEN;
+    ph->vm_base = (void*)((char*)region + 4096);
+    TEST_ASSERT(!ray_pool_hdr_valid(hdr, (uintptr_t)region, (uintptr_t)region + 1), "a mapping base above the pool, no header");
+    ph->vm_base = region;
+    ray_vm_free(region, psize);
+    PASS();
+}
+
 /* ---- Suite definition -------------------------------------------------- */
 
 const test_entry_t buddy_entries[] = {
     { "buddy/pool_of_oversized_interior", test_pool_of_oversized_interior, NULL, NULL },
+    { "buddy/pool_of_grown_interior_live_block", test_pool_of_grown_interior_live_block, NULL, NULL },
     { "buddy/alloc_basic", test_alloc_basic, buddy_setup, buddy_teardown },
     { "buddy/alloc_small_atom", test_alloc_small_atom, buddy_setup, buddy_teardown },
     { "buddy/alloc_medium_vec", test_alloc_medium_vector, buddy_setup, buddy_teardown },
