@@ -18274,8 +18274,21 @@ static bool val_holds_no_callable(const ray_t* v) {
  * and names of global builtins other than eval and resolve: a lambda (bound or literal
  * body aside, which is walked), a local, a quoted name or an unknown name may
  * read query locals by name at run time, so those keep every column bound. */
+static ray_t* update_spread_fn(ray_t* x);
+static ray_t* update_spread_keep_null_fn(ray_t* x);
+/* Is `h` the head update_spread_walk writes (#1682)? */
+static bool update_spread_head(const ray_t* h) {
+    return h && h->type == RAY_UNARY &&
+           ((void*)(uintptr_t)h->i64 == (void*)update_spread_fn ||
+            (void*)(uintptr_t)h->i64 == (void*)update_spread_keep_null_fn);
+}
+
 static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
     if (!e) return true;
+    /* the spread of an update aggregate's scalar reads what its argument reads */
+    if (e->type == RAY_LIST && e->len == 2 && !(e->attrs & ATTR_QUOTED) &&
+        update_spread_head(((ray_t**)ray_data(e))[0]))
+        return expr_reads_named_columns_only(((ray_t**)ray_data(e))[1], tbl);   /* not-a-table */
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return false;
         /* a lexical local wins over a column of its name (query locals never
@@ -21771,7 +21784,198 @@ static inline bool fv_holds_private_c(ray_t* v, int depth) {
  * and update both plan through this one function. */
 static const int64_t* select_clause_ids(void);   /* defined below */
 static inline bool select_clause_key(const int64_t* rid, int64_t kid);
+/* An update aggregate's argument that is one value stands for every row
+ * the aggregate reads, as in select (#1682): `(sum C)` with C bound to 4
+ * over 5 rows is 20, `(sum (count v))` is the count times the rows, a
+ * helper's scalar likewise.  The argument is wrapped in this function
+ * (update_spread_walk), which runs where the aggregate runs: the table the
+ * evaluator has bound there (the table, the kept rows of a where:, a group
+ * of a by:) gives the rows' count.  Whether the argument is one value is
+ * its value's to say, as on select's route; a vector passes. */
+static ray_t* update_spread_fn(ray_t* x) {
+    if (x) ray_retain(x);
+    ray_t* t = g_active_query_table;   /* the rows the evaluator reads here */
+    if (!x || RAY_IS_ERR(x) || !ray_is_atom(x) || !t || t->type != RAY_TABLE) return x;
+    int64_t n = ray_table_nrows(t);
+    if (x->type == -RAY_STR && n != 0) return x;   /* text stays one value, as select's helper spread */
+    return scalar_atom_rows(x, n);
+}
+
+/* 0: `e` is a form the walk does not enter; 1: a spreading aggregate of one
+ * argument; 2: any other call. */
+static int update_spread_kind(ray_t* e, const int64_t* ids) {
+    (void)ids;
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return 2;
+    ray_t* hs = ray_sym_str(h->i64);
+    if (!hs) return 2;
+    const char* n = ray_str_ptr(hs);
+    size_t l = ray_str_len(hs);
+    if ((l == 2 && memcmp(n, "fn", 2) == 0) || (l == 5 && memcmp(n, "quote", 5) == 0) ||
+        (l == 6 && (memcmp(n, "select", 6) == 0 || memcmp(n, "update", 6) == 0)) ||
+        (l == 4 && memcmp(n, "exec", 4) == 0)) return 0;
+    if (e->len != 2) return 2;
+    /* the aggregates whose answer for one repeated value depends on how many
+     * rows hold it; min, max, avg, med, first, last, all, any and mode give
+     * the value itself, so their argument is left as written */
+    switch (resolve_agg_opcode(h->i64)) {
+        case OP_SUM: case OP_PROD: case OP_COUNT: case OP_VAR: case OP_VAR_POP:
+        case OP_STDDEV: case OP_STDDEV_POP:
+            return 1;   /* the caller checks a local of that name, when it matters */
+        default:
+            return 2;
+    }
+}
+
+/* Is `sym` a column of `tbl`, read from its schema: no metadata lookup. */
+static bool update_names_col(ray_t* tbl, int64_t sym) {
+    ray_t* sch = ray_table_schema(tbl);
+    if (!sch || RAY_IS_ERR(sch)) return false;
+    const int64_t* nm = (const int64_t*)ray_data(sch);
+    for (int64_t c = 0; c < sch->len; c++) if (nm[c] == sym) return true;
+    return false;
+}
+
+/* Does the aggregate argument `a` read no row of its own, as select's
+ * route tells a source that may be one value (agg_of_group): no column
+ * outside an aggregate in it, or a helper call, whose value only the run
+ * shows?  Whether it is one value is decided when it runs
+ * (update_spread_fn), so every form select spreads is spread: a bound or
+ * literal scalar, a quoted symbol, a cast, an `at`, an `if`, a helper of
+ * any arity.  A column name costs one lookup, the common case. */
+static bool update_spread_arg(ray_t* a, ray_t* tbl) {
+    if (!a) return false;
+    if (a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED)) {
+        /* A name resolves as select resolves it in the query: a lambda's
+         * parameter or a let of the frame wins over a column of its name,
+         * and its value decides when it runs; otherwise a column of the
+         * table is the common case, settled by its name. */
+        if (ray_env_get_lexical_local(a->i64)) return true;
+        if (update_names_col(tbl, a->i64)) return false;
+    }
+    if (a->type != RAY_LIST && a->type >= 0) return false;   /* a vector literal */
+    return !expr_reads_rows_outside_agg(a, tbl, true) || query_expr_has_helper(a);
+}
+
+
+/* One walk of an update output, allocating nothing: bit 1 when it holds an
+ * aggregate update_spread_walk wraps, bit 2 when an aggregate holds an
+ * aggregate or a helper call (a grouped output select may refuse as a
+ * refold, which refold_error then decides).  `in_agg`: under an aggregate.
+ * The common shapes leave before any name is read: a call of several
+ * arguments none of which is a call, and an aggregate of a column. */
+static unsigned update_scan(ray_t* e, ray_t* tbl, bool in_agg, int depth) {
+    if (!e || e->type != RAY_LIST || e->len == 0 || (e->attrs & ATTR_QUOTED) || depth > 64) return 0;
+    ray_t** el = (ray_t**)ray_data(e);
+    bool any_list = false;
+    for (int64_t k = 1; k < e->len && !any_list; k++) any_list = el[k] && el[k]->type == RAY_LIST;
+    if (!in_agg && !any_list && e->len != 2) return 0;
+    if (!in_agg && e->len == 2 && el[1] && el[1]->type == -RAY_SYM && !(el[1]->attrs & ATTR_QUOTED) &&
+        update_names_col(tbl, el[1]->i64) && !ray_env_get_lexical_local(el[1]->i64)) return 0;
+    ray_t* h = el[0];
+    if (h && h->type == RAY_LIST) return in_agg ? 2 : 0;      /* a lambda called inline */
+    int kind = update_spread_kind(e, NULL);
+    if (kind == 0) return 0;
+    bool agg = h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && is_agg_expr(e);
+    unsigned r = 0;
+    if (in_agg && (agg || query_expr_has_helper(e))) r |= 2;
+    if (kind == 1 && update_spread_arg(el[1], tbl) && !ray_env_has_lexical_local(h->i64)) r |= 1;
+    for (int64_t k = 1; k < e->len && r != 3; k++)
+        r |= update_scan(el[k], tbl, in_agg || agg, depth + 1);
+    return r;
+}
+
+static bool update_spread_needed(ray_t* e, ray_t* tbl, const int64_t* ids, int depth) {
+    (void)ids;
+    return (update_scan(e, tbl, false, depth) & 1) != 0;
+}
+
+/* update_spread_fn for a grouped `prod`: a null stays one value, so the
+ * group's product is null, as select's grouped product of nulls is; the
+ * per-group pass's product of a vector of nulls would be 1. */
+static ray_t* update_spread_keep_null_fn(ray_t* x) {
+    if (x && !RAY_IS_ERR(x) && ray_is_atom(x) && ray_atom_is_null_fn(x)) { ray_retain(x); return x; }
+    return update_spread_fn(x);
+}
+/* `e` with the argument of each one-argument aggregate that reads no row
+ * of its own (a bound scalar, a literal, an aggregate) or calls a helper
+ * wrapped as (spread arg); `e` itself (retained) when none is.  A
+ * lambda, a quoted form or a nested query keeps its own rule.  `*sp` is
+ * made on first use. */
+static ray_t* update_spread_walk(ray_t* e, ray_t* tbl, ray_t** sp, int depth) {
+    /* sp[0]: update_spread_fn; sp[1]: its grouped-prod form; sp[2] non-NULL
+     * when the update is grouped */
+    const int64_t* ids = NULL;
+    if (!update_spread_needed(e, tbl, ids, depth)) { ray_retain(e); return e; }
+    ray_t** es = (ray_t**)ray_data(e);
+    bool agg = update_spread_kind(e, ids) == 1 && !ray_env_has_lexical_local(es[0]->i64);
+    ray_t* out = ray_list_new(e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** os = (ray_t**)ray_data(out);
+    bool changed = false;
+    for (int64_t k = 0; k < e->len; k++) {
+        ray_t* c = k == 0 ? (ray_retain(es[0]), es[0]) : update_spread_walk(es[k], tbl, sp, depth + 1);
+        bool keep_null = agg && sp[2] && resolve_agg_opcode(es[0]->i64) == OP_PROD;   /* grouped prod */
+        if (c && !RAY_IS_ERR(c) && k == 1 && agg && update_spread_arg(es[1], tbl)) {
+            ray_t** fp = &sp[keep_null ? 1 : 0];
+            if (!*fp) *fp = ray_fn_unary("spread", RAY_FN_NONE,
+                                         keep_null ? update_spread_keep_null_fn : update_spread_fn);
+            ray_t* w = *fp && !RAY_IS_ERR(*fp) ? ray_list_new(2) : NULL;
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, *fp);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, c);
+            ray_release(c);
+            c = w ? w : ray_error("oom", NULL);
+        }
+        if (!c || RAY_IS_ERR(c)) { out->len = k; ray_release(out); return c ? c : ray_error("oom", NULL); }
+        if (c != es[k]) changed = true;
+        os[k] = c;
+    }
+    out->len = e->len;
+    out->attrs = e->attrs;
+    if (!changed) { ray_release(out); ray_retain(e); return e; }
+    return out;
+}
+
+
+static ray_t* refold_error(ray_t* dict, ray_t* tbl, const char* verb);
+
+/* The update dict with every output's aggregate scalars spread
+ * (update_spread_walk), or NULL when no output has one. */
+static ray_t* update_spread_dict(ray_t* dict, ray_t* tbl, bool grouped) {
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    const int64_t* rid = select_clause_ids();
+    int64_t nd = ray_dict_len(dict);
+    ray_t* sp[3] = { NULL, NULL, grouped ? dict : NULL };
+    ray_t* out = NULL;
+    const int64_t* ids = NULL;
+    for (int64_t i = 0; i < nd; i++) {
+        ray_t* v = ((ray_t**)ray_data(vals))[i];
+        if (!v || v->type != RAY_LIST || select_clause_key(rid, sym_cell_runtime_id(keys, i)) ||
+            !update_spread_needed(v, tbl, ids, 0)) continue;
+        ray_t* nv = update_spread_walk(v, tbl, sp, 0);
+        if (nv == v) { ray_release(nv); continue; }
+        if (!nv || RAY_IS_ERR(nv)) { if (out) ray_release(out); out = nv ? nv : ray_error("oom", NULL); break; }
+        if (!out) { out = dict; ray_retain(out); }
+        ray_t* k = ray_sym(sym_cell_runtime_id(keys, i));
+        out = k && !RAY_IS_ERR(k) ? ray_dict_upsert(out, k, nv) : out;
+        if (k) ray_release(k);
+        ray_release(nv);
+        if (!out || RAY_IS_ERR(out)) { out = out ? out : ray_error("oom", NULL); break; }
+    }
+    for (int f = 0; f < 2; f++) if (sp[f] && !RAY_IS_ERR(sp[f])) ray_release(sp[f]);
+    return out;
+}
+
+/* What fv_bind's walk of an update's outputs saw, so the passes after it
+ * run only when an output needs them (#1682). */
+enum { UPD_BY = 1, UPD_SPREAD = 2, UPD_REFOLD = 4 };
+static ray_t* fv_bind_ex(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work, unsigned* uflags);
 static ray_t* fv_bind(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work) {
+    return fv_bind_ex(dict, tbl, aliases, work, NULL);
+}
+static ray_t* fv_bind_ex(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work, unsigned* uflags) {
     *work = NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -21786,8 +21990,15 @@ static ray_t* fv_bind(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work) {
     ray_t* err = NULL;
     for (int64_t i = 0; i < nd && !err; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
+        if (uflags && kid == rid[2]) *uflags |= UPD_BY;
         if (select_clause_key(rid, kid)) continue;
         ray_t* ov = ((ray_t**)ray_data(vals))[i];
+        if (uflags && ov && ov->type == RAY_LIST &&
+            (*uflags & (UPD_SPREAD | UPD_REFOLD)) != (UPD_SPREAD | UPD_REFOLD)) {
+            unsigned sc = update_scan(ov, tbl, false, 0);
+            if (sc & 1) *uflags |= UPD_SPREAD;
+            if (sc & 2) *uflags |= UPD_REFOLD;
+        }
         /* update (no aliases): a name holding a list is the whole list in
          * every row (#1570) */
         ray_t* nv = !aliases && ov && ov->type == -RAY_SYM && !(ov->attrs & ATTR_QUOTED)
@@ -21932,7 +22143,9 @@ static ray_t* select_plan_free_vectors(ray_t* dict, ray_t* tbl) {
 
 /* The error for a grouped output that aggregates only aggregates of the
  * group, written out or through a helper, on any route; NULL if none. */
-static ray_t* select_refold_error(ray_t* dict, ray_t* tbl) {
+static ray_t* refold_error(ray_t* dict, ray_t* tbl, const char* verb);
+static ray_t* select_refold_error(ray_t* dict, ray_t* tbl) { return refold_error(dict, tbl, "select"); }
+static ray_t* refold_error(ray_t* dict, ray_t* tbl, const char* verb) {
     if (!dict_get(dict, "by")) return NULL;
     ray_t* keys = ray_dict_keys(dict);
     ray_t* vals = ray_dict_vals(dict);
@@ -21948,8 +22161,8 @@ static ray_t* select_refold_error(ray_t* dict, ray_t* tbl) {
         if (x) ray_release(x);
         if (!refold) continue;
         ray_t* nm = ray_sym_str(kid);
-        return ray_error("domain", "select by: output `%.*s` aggregates an aggregate of the group",
-                         nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
+        return ray_error("domain", "%s by: output `%.*s` aggregates an aggregate of the group",
+                         verb, nm ? (int)ray_str_len(nm) : 1, nm ? ray_str_ptr(nm) : "?");
     }
     return NULL;
 }
@@ -33688,6 +33901,7 @@ static bool update_expr_aggregates(ray_t* e, ray_t* tbl) {
  * calls run over the whole table into hidden columns first
  * (select_plan_running_where), then the expression over the kept rows of
  * the table and those columns.  Owned: an atom or one value per kept row. */
+static bool update_expr_has_spread(ray_t* e, int depth);
 static ray_t* update_eval_kept(ray_t* tbl, ray_t* expr, ray_t* kept) {
     int64_t name = ray_sym_intern("#upd", 4);
     ray_t* keys = ray_vec_new(RAY_SYM, 1);
@@ -33725,6 +33939,12 @@ static ray_t* update_eval_kept(ray_t* tbl, ray_t* expr, ray_t* kept) {
         int64_t* refs = (int64_t*)scratch_alloc(&refs_hdr, (size_t)nc * sizeof(int64_t));
         int n = refs ? collect_col_refs_set(x, src, refs, (int)nc, 0) : 0;
         if (n > 0 && n < nc) narrow = project_table_cols(src, refs, n);
+        /* names no column but spreads a scalar (#1682): one column carries
+         * the kept rows' count */
+        else if (n == 0 && update_expr_has_spread(x, 0)) {
+            int64_t c0 = ray_table_col_name(src, 0);
+            narrow = project_table_cols(src, &c0, 1);
+        }
         if (refs_hdr) scratch_free(refs_hdr);
         if (narrow && RAY_IS_ERR(narrow)) { if (plan) ray_release(plan); return narrow; }
         if (narrow) src = narrow;
@@ -33795,8 +34015,27 @@ static ray_t* update_spread_kept(ray_t* v, const uint8_t* m, int64_t nrows) {
  * per row of `tbl` (or an atom): update_eval_where, except for an
  * aggregating expression, evaluated over the kept rows (update_eval_kept)
  * and spread back to them (update_spread_kept). */
+/* Does `e` call update_spread_fn (update_spread_walk put it there)? */
+__attribute__((noinline)) static bool update_expr_has_spread(ray_t* e, int depth) {
+    if (!e || e->type != RAY_LIST || e->len == 0 || (e->attrs & ATTR_QUOTED) || depth > 64) return false;
+    if (update_spread_head(((ray_t**)ray_data(e))[0])) return true;
+    for (int64_t k = 1; k < e->len; k++)
+        if (update_expr_has_spread(((ray_t**)ray_data(e))[k], depth + 1)) return true;
+    return false;
+}
+
+/* Is the update value `expr` under where: evaluated over the whole table
+ * (update_eval_where) rather than over the kept rows?  An aggregate whose
+ * scalar spreads (#1682) reads the kept rows, though it names no column.
+ * Out of line: inlined, it changed how the grouped update's row loops in
+ * ray_update_on were compiled. */
+__attribute__((noinline)) static bool update_where_whole(ray_t* expr, ray_t* tbl) {
+    return (update_expr_elementwise(expr, tbl, false) || !update_expr_aggregates(expr, tbl)) &&
+           !update_expr_has_spread(expr, 0);
+}
+
 static ray_t* update_where_value_c(ray_t* tbl, ray_t* expr, ray_t* mask, bool cells) {
-    if (update_expr_elementwise(expr, tbl, false) || !update_expr_aggregates(expr, tbl))
+    if (update_where_whole(expr, tbl))
         return update_eval_where(tbl, expr, mask);
     ray_t* kept = ray_where_fn(mask);
     if (!kept || RAY_IS_ERR(kept)) return kept ? kept : ray_error("oom", NULL);
@@ -34256,16 +34495,30 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
      * The same walk reads an output that names a list as the whole list in
      * every row (update_whole_list_value, #1570). */
     ray_t* work = NULL;
-    ray_t* fv_dict = fv_bind(dict, tbl, false, &work);
+    /* A grouped output that aggregates an aggregate of the group is refused
+     * as select refuses it: its scalar would stand for the group's rows
+     * (#1682), which select declines to fold again. */
+    unsigned uflags = 0;
+    ray_t* fv_dict = fv_bind_ex(dict, tbl, false, &work, &uflags);
     if (fv_dict && RAY_IS_ERR(fv_dict)) { ray_release(tbl); return fv_dict; }
-    if (!fv_dict) {
-        ray_t* r = ray_update_on(dict, tbl, inplace_sym);
-        fv_assert_no_private(r);
-        return r;
+    ray_t* q = fv_dict ? fv_dict : dict;
+    ray_t* qt = fv_dict ? work : tbl;
+    /* Then each aggregate's scalar argument stands for the rows it reads,
+     * as in select (#1682). */
+    /* only a grouped output can refold (refold_error decides, after free
+     * vectors are planned, as select does) */
+    ray_t* rerr = (uflags & UPD_BY) && (uflags & UPD_REFOLD) ? refold_error(q, qt, "update") : NULL;
+    ray_t* sp_dict = rerr || !(uflags & UPD_SPREAD) ? NULL : update_spread_dict(q, qt, (uflags & UPD_BY) != 0);
+    if (rerr || (sp_dict && RAY_IS_ERR(sp_dict))) {
+        if (fv_dict) { ray_release(fv_dict); ray_release(work); }
+        ray_release(tbl);
+        return rerr ? rerr : sp_dict;
     }
-    ray_release(tbl);
-    ray_t* r = ray_update_on(fv_dict, work, inplace_sym);
-    ray_release(fv_dict);
+    if (sp_dict) q = sp_dict;
+    if (fv_dict) ray_release(tbl);
+    ray_t* r = ray_update_on(q, qt, inplace_sym);
+    if (sp_dict) ray_release(sp_dict);
+    if (fv_dict) ray_release(fv_dict);
     fv_assert_no_private(r);
     return r;
 }

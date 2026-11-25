@@ -35,8 +35,8 @@
 (at (select {from: T2 by: k s: (sum (hk v)) where: (> v 15)}) 's) -- [7 21]
 (at (select {from: T2 by: k s: (sum C)}) 's) -- [8 12]
 
-;; ── update is unchanged here: it folds every scalar once, inline and
-;; bound ones included (#1682) ──
-(at (update {from: T n: (sum (hq v))}) 'n) -- [4 4 4 4]
+;; ── update spreads it as select does, inline and bound ones included
+;; (#1682) ──
+(at (update {from: T n: (sum (hq v))}) 'n) -- [16 16 16 16]
 (at (update {from: T n: (sum (hq v))}) 'n) -- (at (update {from: T n: (sum (count v))}) 'n)
-(at (update {from: T2 by: k n: (sum (hq v))}) 'n) -- [2 2 3 3 3]
+(at (update {from: T2 by: k n: (sum (hq v))}) 'n) -- [4 4 9 9 9]
