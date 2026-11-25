@@ -30527,9 +30527,14 @@ by_dict_done:
         self_emit_set = true;
     }
 
-    /* Optimize and execute */
+    /* Optimize and execute.  A sorted grouped select asks its group node
+     * for first-seen order: the stable sort's ties go to the group seen
+     * first, whichever route groups (#1664). */
+    int32_t prev_first_seen = by_expr && has_sort
+        ? ray_group_first_seen_set(__VM ? __VM->eval_depth : 0) : -2;
     root = ray_optimize(g, root);
     ray_t* result = ray_execute(g, root);
+    if (prev_first_seen != -2) ray_group_first_seen_set(prev_first_seen);
     if (n_hidden_sort > 0 && result && !RAY_IS_ERR(result)) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
         if (result && !RAY_IS_ERR(result) && result->type == RAY_TABLE) {

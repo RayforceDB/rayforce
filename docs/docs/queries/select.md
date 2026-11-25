@@ -694,6 +694,13 @@ they first appear in the source, and in a grouped select the group whose first
 source row comes first wins a tie. A `take:` after the sort therefore returns
 the same rows on every run, on in-memory, splayed and parted tables alike.
 
+There is one exception for now: when the group keys are integer, temporal or
+symbol columns, the order of groups that tie on the sort keys is not
+guaranteed, because the engine may emit such groups in key order
+([#1678](https://github.com/RayforceDB/rayforce/issues/1678)). If the order of
+ties matters, add the group key as a last sort key, as in
+`(select {r: (count v) from: t by: k asc: [r k] take: 10})`.
+
 ### Limiting Rows with `take:`
 
 Limit the number of rows in the result. Positive values take from the beginning, negative from the end:
