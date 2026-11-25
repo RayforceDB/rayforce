@@ -206,3 +206,86 @@
 (all (== (at (xasc NP 'n) 'n) (at (xasc NPO 'n) 'n))) -- true
 (all (== (at (xasc NP 'n) 'c) (at (xasc NPO 'n) 'c))) -- true
 (sum (at NP 'c)) -- 6000
+
+;; ── what keeps the per-code passes no costlier than the row loop ──
+(count ['RL 'l2 'RX 'a 'b 'c 'e 'RY 'big 'rw 'pad 'TP 'RZ 'z 'rv 'LV 'l]) -- 17
+(set runs (fn [] (at (.sys.mem) 'sym-map-runs)))
+(set rowruns (fn [] (at (.sys.mem) 'sym-map-row-runs)))
+(set sameruns (fn [] (at (.sys.mem) 'sym-map-same-runs)))
+;; every entry maps to its own string (lower of lowercase, trim of trimmed
+;; text): the column itself is the result, nothing interned
+(set p0 (runs))
+(set q0 (sameruns))
+(set s0 (symc))
+(set RL (select {from: R l2: (lower lu) tu: (trim u)}))
+(- (runs) p0) -- 2
+(- (sameruns) q0) -- 2
+(- (symc) s0) -- 0
+(all (== (at RL 'l2) lu)) -- true
+(all (== (at RL 'tu) u)) -- true
+;; one entry that changes: no longer the column
+(set q0 (sameruns))
+(set lm (lower (concat (take lu 5999) (as 'SYM ["MIXED"]))))
+(- (sameruns) q0) -- 0
+(at lm 5999) -- 'mixed
+(all (== (take lm 5999) (take lu 5999))) -- true
+;; a cut of no bytes, and a cut every entry of which is the same few strings
+(count (distinct (substr u 3 0))) -- 1
+(== (at (substr u 3 0) 0) (as 'SYM "")) -- true
+(all (== (substr u 1 4) (as 'SYM (substr (as 'STR u) 1 4)))) -- true
+(count (distinct (substr u 1 4))) -- 1
+
+;; a domain of more than 64 positions per row (4096 rows of a column over a
+;; global table of 300,000 symbols and more): the rows are the entries, no
+;; bitmap of the domain; a code the rows repeat is read once per task
+(set big (as 'SYM (as 'STR (+ 5000000 (til 300000)))))
+(count big) -- 300000
+(set rw (as 'SYM (map (fn [k] (format "Row%-Item%" (% k 3) (% (* 13 k) 700))) (til 4096))))
+(set TR (table [rw] (list rw)))
+(set p0 (rowruns))
+(set RX (select {from: TR a: (lower rw) c: (replace rw "Item" "") e: (concat rw "!")}))
+(- (rowruns) p0) -- 3
+(set s0 (symc))
+(count (at (select {from: TR a: (lower rw)}) 'a)) -- 4096
+(- (symc) s0) -- 0
+(all (== (at RX 'a) (ORA lower rw))) -- true
+(all (== (at RX 'c) (as 'SYM (replace (as 'STR rw) "Item" "")))) -- true
+(all (== (at RX 'e) (as 'SYM (concat (as 'STR rw) "!")))) -- true
+(count (distinct (at RX 'a))) -- 2100
+;; few results (global symbols), one with no bytes, and the column itself
+(set p0 (rowruns))
+(set q0 (sameruns))
+(set RY (select {from: TR b: (substr rw 1 4) z: (substr rw 40 3) t: (trim rw)}))
+(- (rowruns) p0) -- 3
+(- (sameruns) q0) -- 1
+(all (== (at RY 'b) (as 'SYM (substr (as 'STR rw) 1 4)))) -- true
+(count (distinct (at RY 'b))) -- 3
+(all (== (at RY 'z) (as 'SYM (substr (as 'STR rw) 40 3)))) -- true
+(all (== (at RY 't) rw)) -- true
+;; one row in ten repeats the code before it, too few repeats to send only
+;; the first of each to the batch: a repeat carries its entry's result
+(set rv (as 'SYM (map (fn [k] (format "Val%" (- k (div k 10)))) (til 4096))))
+(set p0 (rowruns))
+(set LV (at (select {from: (table [rv] (list rv)) l: (lower rv)}) 'l))
+(- (rowruns) p0) -- 1
+(all (== LV (ORA lower rv))) -- true
+(count (distinct LV)) -- 3687
+;; the same column over the domain's bitmap agrees (the rows of a small
+;; domain: lower rw's own)
+(set p0 (rowruns))
+(all (== (upper (at RX 'a)) (ORA upper rw))) -- true
+(- (rowruns) p0) -- 0
+
+;; more than a chunk of 1M distinct codes, unchanged by trim in the first
+;; chunk and changed in the last: the chunks before the first change are
+;; cut again and interned
+(set pad (as 'SYM (concat (as 'STR (til 1050000)) (map (fn [k] (format " Q% " k)) (til 5000)))))
+(set q0 (sameruns))
+(set p0 (runs))
+(set RZ (trim pad))
+(- (runs) p0) -- 1
+(- (sameruns) q0) -- 0
+(all (== (take RZ 1050000) (take pad 1050000))) -- true
+(at RZ 1050000) -- 'Q0
+(at RZ 1054999) -- 'Q4999
+(count (distinct RZ)) -- 1055000

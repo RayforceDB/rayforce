@@ -1465,6 +1465,8 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
         { "window-perpart-runs", 19, ray_window_perpart_runs() },
         { "join-perpart-runs",   17, ray_join_perpart_runs()   },
         { "sym-map-runs",        12, ray_string_sym_map_runs() },
+        { "sym-map-row-runs",    16, ray_string_sym_map_row_runs() },
+        { "sym-map-same-runs",   17, ray_string_sym_map_same_runs() },
         /* the global symbol table: entries and the bytes of their strings,
          * so a test can assert that a query leaves it where it found it */
         { "sym-count",        9, (int64_t)ray_sym_count()       },

@@ -1868,6 +1868,11 @@ int64_t ray_group_perpart_runs(void);
 /* Runs of the per-distinct-code string path (ops/string.c, sym_map_by_code)
  * that served since process start: (.sys.mem)'s sym-map-runs. */
 int64_t ray_string_sym_map_runs(void);
+/* Of them, the runs over rows (a domain of more than 64 positions per row)
+ * and the runs whose every entry mapped to its own string (the column is
+ * the result): (.sys.mem)'s sym-map-row-runs and sym-map-same-runs. */
+int64_t ray_string_sym_map_row_runs(void);
+int64_t ray_string_sym_map_same_runs(void);
 /* Serial grouping invocations that used exact boxed-I64 hashing. */
 int64_t ray_group_boxed_i64_runs(void);
 /* Monotonic count of exec_group_per_partition runs that returned their
