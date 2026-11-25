@@ -469,6 +469,7 @@ static inline bool agg_is_truth_agg(uint16_t op) {
 #define OP_FLAG_TEMPORAL_INT 0x08  /* temporal +/- integer lowered by the query compiler (#1302) */
 #define OP_FLAG_XBAR         0x10  /* OP_MOD of an xbar: a zero or null divisor raises domain (#1355) */
 #define OP_FLAG_NARROW_AS    0x20  /* explicit as to I16/I32 can produce a null sentinel */
+#define OP_FLAG_WHERE_DEFER  0x40  /* a select's where: wired under its group for the first-N route (#1695) */
 
 /* ray_xbar_fn's error for a zero or null bucket */
 #define RAY_XBAR_BUCKET_ERR "xbar: bucket size must be non-zero and non-null"
@@ -715,6 +716,13 @@ typedef struct ray_graph {
     /* exec_group_v2's second run of a group whose 64-bit integer variance
      * may have wrapped: its vtables are the checked ones (#1670). */
     bool            var_checked;
+    /* An unordered take over a group under a where: (#1695): the GROUP's
+     * filter, left unexecuted by the HEAD(GROUP) arm.  The group's first-N
+     * route tests it at the rows it reads; any other route declines
+     * (firstn_declined, a NULL result) and the arm runs the filter and the
+     * group as before. */
+    ray_op_t*       firstn_where;
+    bool            firstn_declined;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */

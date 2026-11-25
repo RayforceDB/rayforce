@@ -18911,6 +18911,36 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     return true;
 }
 
+/* An unordered take: N of a group by plain key columns, N a literal within
+ * the first-N route's reach (#1695): the where: may then wait for the group
+ * (firstn_where in ray_select_body).  Keys of a type the route admits, and no
+ * BOOL key, whose first-occurrence order is restored from the selection.
+ * The caller has checked that every output is a group aggregate. */
+static bool firstn_where_armable(ray_t* by_expr, ray_t* tbl, ray_t* take_expr, bool has_sort,
+                                 ray_t* nearest_expr, ray_t* post_group_where_expr,
+                                 bool parted_bydict_deferred) {
+    if (!take_expr || has_sort || nearest_expr || post_group_where_expr || parted_bydict_deferred)
+        return false;
+    int64_t n = take_expr->type == -RAY_I64 ? take_expr->i64
+              : take_expr->type == -RAY_I32 ? (int64_t)take_expr->i32 : 0;
+    if (n <= 0 || n > AGG_FIRSTN_MAX || table_has_parted_columns(tbl)) return false;
+    bool atom = by_expr->type == -RAY_SYM && !(by_expr->attrs & ATTR_QUOTED);
+    if (!atom && by_expr->type != RAY_SYM) return false;
+    int64_t nk = atom ? 1 : ray_len(by_expr);
+    if (nk < 1) return false;
+    for (int64_t k = 0; k < nk; k++) {
+        int64_t key = atom ? by_expr->i64 : ray_read_sym(ray_data(by_expr), k, RAY_SYM, by_expr->attrs);
+        ray_col_meta_t cm;
+        if (!ray_table_col_meta(tbl, key, &cm)) return false;
+        switch (cm.type) {
+            case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_SYM:
+            case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN: break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
 /* Filter-compaction keep-set for a `select {where: … by: [k1 k2 …]}` whose sole
  * consumer is the keys-only multi-key DISTINCT path (agg_select_distinct) under
  * an active projection hint.  In that shape the WHERE filter's result table need
@@ -27019,6 +27049,9 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
      * ray_select_impl. */
     ray_t* saved_selection = NULL;
     ray_t* post_group_where_expr = NULL;
+    /* The where: filter of an unordered grouped take, left unexecuted until
+     * the take is pushed onto the group (#1695): see firstn_where_armable. */
+    ray_op_t* firstn_where = NULL;
     DICT_VIEW_DECL(byv);
     if (by_expr && by_expr->type == RAY_DICT) {
         ray_t* by_dict_ast = by_expr;   /* original by-dict; value ASTs read again at compile */
@@ -30252,6 +30285,18 @@ by_dict_done:
                     }
                 }
                 if (sg_armed) goto where_done;
+                /* An unordered take of a few groups: the group's first-N
+                 * route needs the where: only at the rows it reads (#1695).
+                 * The filter stays unexecuted here; once the take is pushed
+                 * onto the group it is wired under it, GROUP(FILTER), and
+                 * exec_group runs it, or the first-N route tests it at its
+                 * rows.  Every other outcome runs it below, as here. */
+                if (!has_cd_output && n_grp_agg_outputs > 0 &&
+                    firstn_where_armable(by_expr, tbl, take_expr, has_sort, nearest_expr,
+                                         post_group_where_expr, parted_bydict_deferred)) {
+                    firstn_where = root;
+                    goto where_done;
+                }
                 /* exec_node populates g->selection as a side effect
                  * of OP_FILTER on a table input, and returns the
                  * uncompacted table (== g->table).  Discard the
@@ -32230,6 +32275,36 @@ by_dict_done:
             ray_graph_free(g); ray_release(tbl);
             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("domain", "select: `take:` must be an integer atom or a 2-element integer range, got %s", ray_type_name(tv_t));
         }
+    }
+
+    /* The deferred where: (#1695): wired under the group the take was
+     * pushed onto, as the predicate pushdown wires a filter (opt.c), or run
+     * now as the fused path runs it. */
+    if (firstn_where) {
+        ray_op_t* grp = group_head_pushed && root->opcode == OP_HEAD ? op_child(g, root, 0) : NULL;
+        ray_op_ext_t* gext = grp && grp->opcode == OP_GROUP ? find_ext(g, grp->id) : NULL;
+        /* outputs past the group (a constant, a scatter) read the
+         * selection afterwards (saved_selection): those run it here */
+        if (gext && gext->n_keys > 0 && n_nonaggs == 0) {
+            firstn_where->flags |= OP_FLAG_PUSHED | OP_FLAG_WHERE_DEFER;
+            grp->in_id[0] = firstn_where->id;         /* dense copy */
+            gext->base.in_id[0] = firstn_where->id;   /* ext copy in sync */
+        } else {
+            ray_t* fres = exec_node(g, firstn_where);
+            if (!fres || RAY_IS_ERR(fres)) {
+                if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                ray_graph_free(g); ray_release(tbl);
+                scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv);
+                return fres ? fres : ray_error("domain", "select: `where:` filter produced no result");
+            }
+            ray_release(fres);
+            if (g->selection) {
+                saved_selection = g->selection;
+                ray_retain(saved_selection);
+                own->selection = saved_selection;
+            }
+        }
+        firstn_where = NULL;
     }
 
     /* Install the pre-computed top-count emit filter just before

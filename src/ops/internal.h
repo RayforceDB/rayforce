@@ -1810,6 +1810,10 @@ uint64_t ray_filter_test_parted_runs(void);
 uint64_t ray_filter_test_cols_gathered(void);
 #endif
 
+/* exec.c: the rows of ids[0..n) the filter keeps (#1695). */
+ray_t* exec_filter_keep_rows(ray_graph_t* g, ray_op_t* filter_op, int64_t* ids, int64_t n,
+                             int64_t* kept);
+
 /* ── join.c ── */
 ray_t* exec_join(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ray_t* right_table);
 ray_t* exec_antijoin(ray_graph_t* g, ray_op_t* op,

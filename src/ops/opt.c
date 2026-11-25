@@ -1947,6 +1947,15 @@ static bool pass_projection_pushdown(ray_graph_t* g, ray_op_t* root) {
         if (ext) {
             switch (n->opcode) {
                 case OP_GROUP:
+                    /* inputs[0] past the arity: a filter pushed under the
+                     * group (pass_predicate_pushdown, the deferred where: of
+                     * #1695) or the first key, as mark_live follows it.  A
+                     * pushed filter marked dead here kept its predicate from
+                     * the walks that skip dead nodes (collect_scan_syms). */
+                    if (op_child(g, n, 0) && !live[n->in_id[0]]) {
+                        live[n->in_id[0]] = true;
+                        if (qt < (int)nc) q[qt++] = n->in_id[0];
+                    }
                     for (uint32_t k = 0; k < ext->n_keys; k++)
                         if (op_node(g, ext->keys[k]) && !live[ext->keys[k]]) {
                             live[ext->keys[k]] = true;

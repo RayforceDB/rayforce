@@ -35,6 +35,7 @@
 #include "table/table.h"
 #include "ops/fused_group.h"
 #include "ops/idxop.h"
+#include "ops/agg_engine.h"   /* AGG_FIRSTN_MAX */
 #include "ops/hash.h"
 #include "mem/heap.h"
 #include "mem/sys.h"
@@ -3489,6 +3490,67 @@ static bool op_tree_is_const(ray_graph_t* g, uint32_t id) {
     return op_tree_leaves(g, id, false, false, 0);
 }
 
+/* The rows ids[0..n) (ascending, distinct rows of g->table) that the filter
+ * `filter_op` keeps, compacted in place, their count in *kept (#1695).  The
+ * rows are installed as the selection and the filter runs over them as a
+ * chained filter refines the rows before it: it reads its columns at those
+ * rows, not over the table.  Only the given rows are kept, so a path that
+ * selects over the whole table instead gives the same answer.  NULL or an
+ * owned error; *kept is -1 when the filter handed back a compacted table,
+ * which names no row of g->table: the caller then runs it as before. */
+ray_t* exec_filter_keep_rows(ray_graph_t* g, ray_op_t* filter_op, int64_t* ids, int64_t n,
+                             int64_t* kept) {
+    *kept = -1;
+    ray_t* tbl = g->table;
+    if (!tbl || tbl->type != RAY_TABLE || g->selection) return NULL;
+    if (n <= 0) { *kept = 0; return NULL; }
+    int64_t nrows = ray_table_nrows(tbl);
+    ray_t* sel = ray_index_rowsel_from_ids(nrows, ids, n);
+    if (!sel) return ray_error("oom", NULL);
+    g->selection = sel;
+    /* A memo of its own: a shared node computed over these rows (the
+     * operand `within` compares twice) holds only them, and must serve
+     * neither another set of rows nor the full filter after a decline. */
+    ray_exec_memo_save_t memo_save;
+    ray_exec_memo_push(g, filter_op, &memo_save);
+    ray_t* res = exec_node(g, filter_op);
+    ray_exec_memo_pop(g, &memo_save);
+    ray_t* out = g->selection;
+    g->selection = NULL;
+    if (!res || RAY_IS_ERR(res)) {
+        if (out) ray_rowsel_release(out);
+        return res ? res : ray_error("nyi", "filter yielded no result");
+    }
+    bool lazy = res == tbl;
+    ray_release(res);
+    if (!lazy || (out && ray_rowsel_meta(out)->nrows != nrows)) {
+        if (out) ray_rowsel_release(out);
+        return NULL;
+    }
+    if (!out) { *kept = n; return NULL; }       /* every row of the table passes */
+    const uint8_t*  fl = ray_rowsel_flags(out);
+    const uint32_t* of = ray_rowsel_offsets(out);
+    const uint16_t* ix = ray_rowsel_idx(out);
+    /* ids and each segment's selected rows both ascend: one merge walk */
+    int64_t w = 0, cur = -1;
+    uint32_t p = 0, pe = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t r = ids[i], seg = r / RAY_MORSEL_ELEMS;
+        if (seg != cur) { cur = seg; p = of[seg]; pe = of[seg + 1]; }
+        uint8_t f = fl[seg];
+        bool in = f == RAY_SEL_ALL;
+        if (f == RAY_SEL_MIX) {
+            uint16_t lr = (uint16_t)(r % RAY_MORSEL_ELEMS);
+            while (p < pe && ix[p] < lr) p++;
+            in = p < pe && ix[p] == lr;
+        }
+        if (in) ids[w++] = r;
+    }
+    ray_rowsel_release(out);
+    *kept = w;
+    return NULL;
+}
+
 /* Execute a pushed-down filter interposed as a GROUP's inputs[0]
  * (GROUP predicate pushdown, opt.c Task-3).
  *
@@ -3631,6 +3693,25 @@ static int refine_in_keep(ray_graph_t* g, ray_op_t* pred, ray_t* tbl, int64_t* k
     keep[0] = x->sym;
     atomic_fetch_add(&g_refine_in, 1);
     return 1;
+}
+
+/* A filter chain whose every predicate reads only its own row through
+ * element-wise nodes over the table's columns (collect_scan_syms): over a
+ * few installed rows it is evaluated at those rows alone, so its test at
+ * the first-N route's rows (#1695, exec_filter_keep_rows) costs about those
+ * rows.  Any other predicate (a reduction, `in`, a vector constant) would be
+ * evaluated over the table at every such test. */
+static bool exec_filter_rows_ok(ray_graph_t* g, ray_op_t* filter_op) {
+    int depth = 0;
+    for (ray_op_t* f = filter_op; f && f->opcode == OP_FILTER; f = op_child(g, f, 0)) {
+        ray_op_t* pred = op_child(g, f, 1);
+        if (!pred || ++depth > 16) return false;
+        int64_t keep[32];
+        bool has_expr = false;
+        uint32_t roots[1] = { pred->id };
+        if (collect_scan_syms(g, roots, 1, keep, 32, &has_expr) <= 0) return false;
+    }
+    return true;
 }
 
 /* collect_scan_syms over a GROUP's key + agg-input subtrees. */
@@ -5923,11 +6004,35 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 ray_t* owned_tbl = NULL;
                 /* Pushed-down filter: execute it first via the shared helper. */
                 ray_op_t* child_in0 = op_child(g, child_op, 0);
+                /* An unordered take of a few groups: the group's first-N
+                 * route tests the filter only at the rows it reads (#1695);
+                 * declined, the filter and the group run as below. */
+                if (child_in0 && child_in0->opcode == OP_FILTER && n > 0 &&
+                    n <= AGG_FIRSTN_MAX && !g->selection && !g->firstn_where &&
+                    exec_filter_rows_ok(g, child_in0)) {
+                    g->firstn_where = child_in0;
+                    g->firstn_declined = false;
+                    ray_t* fr = exec_group(g, child_op, tbl, n);
+                    bool declined = g->firstn_declined;
+                    g->firstn_where = NULL;
+                    g->firstn_declined = false;
+                    if (g->selection) { ray_release(g->selection); g->selection = NULL; }
+                    if (!declined) {
+                        if (!fr) return ray_error("nyi", "group yielded no result");
+                        input = fr;
+                        goto head_group_done;
+                    }
+                    if (fr) { if (RAY_IS_ERR(fr)) ray_error_free(fr); else ray_release(fr); }
+                }
                 if (child_in0 && child_in0->opcode == OP_FILTER) {
                     ray_t* res = exec_pushed_group_filter(g, child_in0);
                     if (res && RAY_IS_ERR(res)) return res;
                     if (res) { owned_tbl = res; tbl = res; }
-                    /* NULL → lazy path; g->selection installed, tbl unchanged */
+                    /* NULL → lazy path; g->selection installed, tbl unchanged.
+                     * The select's own where: (#1695) then goes on as the
+                     * fused where: does, below. */
+                    else if (child_in0->flags & OP_FLAG_WHERE_DEFER)
+                        group_sel_precompact(g, child_op, &tbl, &owned_tbl);
                 } else {
                     /* As OP_GROUP: the group reads the selection in place;
                      * only a sparse where: under an expression input gathers
@@ -5940,6 +6045,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     ray_release(g->selection);
                     g->selection = NULL;
                 }
+            head_group_done: ;
             } else if (child_op && child_op->opcode == OP_FILTER && n >= 0 &&
                        filter_chain_subset_invariant(g, child_op)) {
                 /* The chain narrows the inner filters' selection and the
