@@ -34,6 +34,7 @@
 #include "lang/eval.h"
 #include "store/hnsw.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ==========================================================================
@@ -341,6 +342,13 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
  *  exec_knn_rerank — brute force over a filtered column
  * ========================================================================== */
 
+/* A row the search found, and which it was among those found. */
+typedef struct { int64_t row, found; } rr_found_t;
+static int rr_found_cmp(const void* a, const void* b) {
+    int64_t x = ((const rr_found_t*)a)->row, y = ((const rr_found_t*)b)->row;
+    return x < y ? -1 : x > y;
+}
+
 ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
@@ -369,15 +377,23 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_t* col = ray_table_col(src, col_sym);
     if (col && RAY_IS_ERR(col)) return col;
     if (!col) return ray_error("name", NULL);
-    if (col->type != RAY_LIST) return ray_error("type", "knn rerank: vector column must be a list of vectors, got %s", ray_type_name(col->type));
+    /* a list of vectors, or the same in every partition of a parted table */
+    const bool parted = RAY_IS_PARTED(col->type) && RAY_PARTED_BASETYPE(col->type) == RAY_LIST;
+    if (col->type != RAY_LIST && !parted)
+        return ray_error("type", "knn rerank: vector column must be a list of vectors, got %s", ray_type_name(col->type));
 
-    int64_t nrows = col->len;
+    int64_t nrows = parted ? src_rows : col->len;
 
     int64_t  accepted_count = 0;
     int64_t* accepted = accepted_rowids(g, nrows, &accepted_count);
     if (accepted_count < 0) return ray_error("oom", NULL);
     if (accepted_count == 0) {
-        ray_t* r = empty_result_with_dist(src);
+        /* an answer of no rows, in the columns a flat table would give */
+        int64_t none = 0;
+        ray_t* flat = parted ? ray_table_gather_rows(src, &none, 0) : NULL;
+        if (parted && (!flat || RAY_IS_ERR(flat))) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = empty_result_with_dist(parted ? flat : src);
+        if (flat) ray_release(flat);
         return r ? r : ray_error("oom", NULL);
     }
 
@@ -395,13 +411,17 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     /* The accepted rows (all of them when there is no filter) go through the
      * one exact search .emb.knn has. */
     int64_t bad_row = -1;
-    int64_t heap_size = ray_emb_knn_scan(col, accepted, accepted_count, query, dim,
+    int64_t n_parts = 0;
+    const int64_t* part_rows = parted ? parted_table_counts(src, &n_parts) : NULL;
+    int64_t heap_size = ray_emb_knn_scan(col, part_rows, n_parts, accepted, accepted_count, query, dim,
                                          ext->rerank.metric, k_eff, out_ids, out_ds, &bad_row);
     if (accepted) ray_free_raw(accepted);
     if (heap_size < 0) {
         ray_free_raw(out_ids); ray_free_raw(out_ds);
         if (heap_size == RAY_EMB_KNN_BAD_ROW) {
-            ray_t*  row = bad_row >= 0 && bad_row < nrows ? ray_list_get(col, bad_row) : NULL;
+            ray_t*  row = !parted && bad_row >= 0 && bad_row < nrows ? ray_list_get(col, bad_row) : NULL;
+            if (parted)
+                return ray_error("type", "knn rerank: row %lld is not a numeric vector of length %lld", (long long)bad_row, (long long)dim);
             int8_t  rt = row ? row->type : RAY_NULL;
             int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
             if (rl >= 0)
@@ -411,7 +431,30 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
         return heap_size == RAY_EMB_KNN_CANCELLED ? ray_error("cancel", "interrupted") : ray_error("oom", NULL);
     }
 
-    ray_t* result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
+    ray_t* result = NULL;
+    if (parted && heap_size > 0) {
+        /* The rows are gathered in the order they lie (the gather of a parted
+         * table's rows wants them so), then laid out nearest first. */
+        int64_t* asc = (int64_t*)ray_alloc_raw((size_t)heap_size * 2 * sizeof(int64_t));
+        rr_found_t* by_row = (rr_found_t*)ray_alloc_raw((size_t)heap_size * sizeof(rr_found_t));
+        if (asc && by_row) {
+            int64_t* at = asc + heap_size;         /* at[i]: where found row i lies among the gathered */
+            for (int64_t i = 0; i < heap_size; i++) by_row[i] = (rr_found_t){ out_ids[i], i };
+            qsort(by_row, (size_t)heap_size, sizeof *by_row, rr_found_cmp);
+            for (int64_t j = 0; j < heap_size; j++) { asc[j] = by_row[j].row; at[by_row[j].found] = j; }
+            ray_t* flat = ray_table_gather_rows(src, asc, heap_size);
+            if (flat && !RAY_IS_ERR(flat)) {
+                result = gather_rows_with_dist(flat, at, out_ds, heap_size);
+                ray_release(flat);
+            } else {
+                result = flat;
+            }
+        }
+        if (asc) ray_free_raw(asc);
+        if (by_row) ray_free_raw(by_row);
+    } else {
+        result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
+    }
     if (out_ids) ray_free_raw(out_ids);
     if (out_ds)  ray_free_raw(out_ds);
     if (!result) return ray_error("oom", NULL);

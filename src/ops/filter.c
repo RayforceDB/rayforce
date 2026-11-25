@@ -699,76 +699,16 @@ ray_t* exec_filter(ray_graph_t* g, ray_op_t* op, ray_t* input, ray_t* pred) {
  * gathered into the result table, avoiding full-table gather when the
  * number of matches far exceeds the limit.
  * ============================================================================ */
-ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
+/* The rows `match_idx[0, found)` of `input`, ascending, as a flat table:
+ * every kind of column a table can hold, plain, parted, encoded, or a
+ * partition key.  The head of a filter and the rows a nearest-neighbour
+ * search found are both gathered here. */
+ray_t* ray_table_gather_rows(ray_t* input, const int64_t* match_idx, int64_t found) {
     int64_t ncnt = 0;
     const int64_t* cnt = parted_table_counts(input, &ncnt);   /* ragged partitions */
-    if (!input || RAY_IS_ERR(input)) return input;
-    if (!pred || RAY_IS_ERR(pred)) return pred;
-    /* Over a table the predicate goes through the one where: rule
-     * (ray_where_mask_coerce): a scalar or one-element BOOL is spread over
-     * the rows, any other vector (a numeric or symbol column) is a type
-     * error.  The checks below used to pass an atom and
-     * any non-BOOL vector through as "keep the whole table" — so
-     * `where: x take: 2` over an I64 column returned every row. */
-    if (input->type == RAY_TABLE &&
-        !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
-        ray_retain(pred);
-        ray_t* m = ray_where_mask_coerce(pred, ray_table_nrows(input), "where");
-        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
-        ray_t* r = exec_filter_head(input, m, limit);
-        ray_release(m);
-        return r;
-    }
-    /* Pass-through must hand back an OWNED ref: the exec.c caller
-     * releases its own input ref and returns this value as the node
-     * result, so a bare `input` would leave the result dangling once
-     * that release dropped the last ref.  (NULL/error above stay bare —
-     * retain/release are no-ops for both.) */
-    if (input->type != RAY_TABLE || pred->type != RAY_BOOL) {
-        ray_retain(input);
-        return input;
-    }
-
     int64_t ncols = ray_table_ncols(input);
-    int64_t nrows = ray_table_nrows(input);
-    if (ncols <= 0) return ray_table_new(0);
-    if (limit <= 0) {
-        /* No rows, but the table's columns: an empty table without them
-         * made `(at r 'x)` fail on `take: 0`. */
-        ray_t* zero = make_i64(0);
-        ray_t* r = zero ? ray_take_fn(input, zero) : NULL;
-        if (zero) ray_release(zero);
-        if (r && !RAY_IS_ERR(r)) return r;
-        if (r) ray_error_free(r);
-        limit = 0;   /* a parted table takes no `take`: gather no rows */
-    }
-    if (limit > nrows) limit = nrows;
-
-    /* VLA guard */
-    if (ncols > 256) return ray_error("limit", "table exceeds 256 columns");
-
-    /* Collect up to `limit` matching row indices, stopping early */
-    ray_t* idx_hdr = NULL;
-    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
-                                    (size_t)(limit > 0 ? limit : 1) * sizeof(int64_t));
-    if (!match_idx) return ray_error("oom", NULL);
-
-    int64_t found = 0;
-    {
-        ray_morsel_t mp;
-        ray_morsel_init(&mp, pred);
-        int64_t row_base = 0;
-        while (ray_morsel_next(&mp) && found < limit) {
-            uint8_t* bits = (uint8_t*)mp.morsel_ptr;
-            for (int64_t i = 0; i < mp.morsel_len && found < limit; i++)
-                if (bits[i]) match_idx[found++] = row_base + i;
-            row_base += mp.morsel_len;
-        }
-    }
-
-    /* Build result table with gathered rows */
     ray_t* tbl = ray_table_new(ncols);
-    if (!tbl || RAY_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl; }
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
 
     for (int64_t c = 0; c < ncols; c++) {
         int64_t name_id = ray_table_col_name(input, c);
@@ -777,19 +717,18 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         if (enc) {
             ray_t* gc = NULL;
             ray_t* ge = ray_col_gather_enc(enc, NULL, true, match_idx, found, &gc);
-            if (ge) { scratch_free(idx_hdr); ray_release(tbl); return ge; }
+            if (ge) { ray_release(tbl); return ge; }
             tbl = ray_table_add_col(tbl, name_id, gc);
             ray_release(gc);
-            if (!tbl || RAY_IS_ERR(tbl)) { scratch_free(idx_hdr); return tbl ? tbl : ray_error("oom", NULL); }
+            if (!tbl || RAY_IS_ERR(tbl)) { return tbl ? tbl : ray_error("oom", NULL); }
             continue;
         }
         ray_t* col = ray_table_col_idx(input, c);
-        if (col && RAY_IS_ERR(col)) { scratch_free(idx_hdr); ray_release(tbl); return col; }
+        if (col && RAY_IS_ERR(col)) { ray_release(tbl); return col; }
         if (!col) continue;
         if (col->type == RAY_MAPCOMMON) {
             ray_t* mc = materialize_mapcommon_gather(col, match_idx, found);
             if (!mc || RAY_IS_ERR(mc)) {
-                scratch_free(idx_hdr);
                 ray_release(tbl);
                 return mc;
             }
@@ -874,6 +813,75 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         ray_release(new_col);
     }
 
+    return tbl;
+}
+
+ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
+    if (!input || RAY_IS_ERR(input)) return input;
+    if (!pred || RAY_IS_ERR(pred)) return pred;
+    /* Over a table the predicate goes through the one where: rule
+     * (ray_where_mask_coerce): a scalar or one-element BOOL is spread over
+     * the rows, any other vector (a numeric or symbol column) is a type
+     * error.  The checks below used to pass an atom and
+     * any non-BOOL vector through as "keep the whole table" — so
+     * `where: x take: 2` over an I64 column returned every row. */
+    if (input->type == RAY_TABLE &&
+        !(pred->type == RAY_BOOL && pred->len == ray_table_nrows(input))) {
+        ray_retain(pred);
+        ray_t* m = ray_where_mask_coerce(pred, ray_table_nrows(input), "where");
+        if (!m || RAY_IS_ERR(m)) return m ? m : ray_error("oom", NULL);
+        ray_t* r = exec_filter_head(input, m, limit);
+        ray_release(m);
+        return r;
+    }
+    /* Pass-through must hand back an OWNED ref: the exec.c caller
+     * releases its own input ref and returns this value as the node
+     * result, so a bare `input` would leave the result dangling once
+     * that release dropped the last ref.  (NULL/error above stay bare —
+     * retain/release are no-ops for both.) */
+    if (input->type != RAY_TABLE || pred->type != RAY_BOOL) {
+        ray_retain(input);
+        return input;
+    }
+
+    int64_t ncols = ray_table_ncols(input);
+    int64_t nrows = ray_table_nrows(input);
+    if (ncols <= 0) return ray_table_new(0);
+    if (limit <= 0) {
+        /* No rows, but the table's columns: an empty table without them
+         * made `(at r 'x)` fail on `take: 0`. */
+        ray_t* zero = make_i64(0);
+        ray_t* r = zero ? ray_take_fn(input, zero) : NULL;
+        if (zero) ray_release(zero);
+        if (r && !RAY_IS_ERR(r)) return r;
+        if (r) ray_error_free(r);
+        limit = 0;   /* a parted table takes no `take`: gather no rows */
+    }
+    if (limit > nrows) limit = nrows;
+
+    /* VLA guard */
+    if (ncols > 256) return ray_error("limit", "table exceeds 256 columns");
+
+    /* Collect up to `limit` matching row indices, stopping early */
+    ray_t* idx_hdr = NULL;
+    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
+                                    (size_t)(limit > 0 ? limit : 1) * sizeof(int64_t));
+    if (!match_idx) return ray_error("oom", NULL);
+
+    int64_t found = 0;
+    {
+        ray_morsel_t mp;
+        ray_morsel_init(&mp, pred);
+        int64_t row_base = 0;
+        while (ray_morsel_next(&mp) && found < limit) {
+            uint8_t* bits = (uint8_t*)mp.morsel_ptr;
+            for (int64_t i = 0; i < mp.morsel_len && found < limit; i++)
+                if (bits[i]) match_idx[found++] = row_base + i;
+            row_base += mp.morsel_len;
+        }
+    }
+
+    ray_t* tbl = ray_table_gather_rows(input, match_idx, found);
     scratch_free(idx_hdr);
     return tbl;
 }

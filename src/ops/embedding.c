@@ -395,7 +395,9 @@ static inline void knn_push(knn_ent_t* heap, int64_t* hsz, int64_t k, knn_ent_t 
 
 /* The exact search: each task keeps the best of its run of rows. */
 typedef struct {
-    ray_t* col;
+    ray_t* const* segs;      /* the column: one list, or a parted column's segments in order */
+    const int64_t* off;      /* off[s]: the first row of segment s; off[ns]: the rows in all */
+    int64_t ns;
     const int64_t* only;     /* the rows to look at, or NULL for all of them */
     const emb_query_t* q;
     ray_hnsw_metric_t metric;
@@ -415,11 +417,16 @@ static void knn_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
     /* The inner product is negated so that lower is closer, as with the others. */
     metric_kind_t kind = c->metric == RAY_HNSW_L2 ? MET_L2_DIST : c->metric == RAY_HNSW_IP ? MET_INNER_PROD : MET_COS_DIST;
     double sign = c->metric == RAY_HNSW_IP ? -1.0 : 1.0;
-    int64_t nrows = c->col->len;
+    int64_t nrows = c->off[c->ns];
+    int64_t sg = 0;          /* the segment the last row was in: rows mostly go on from there */
     for (int64_t at = lo; at < hi; at++) {
         int64_t i = c->only ? c->only[at] : at;
         if (i < 0 || i >= nrows) continue;
-        ray_t* row = ray_list_get(c->col, i);
+        while (i >= c->off[sg + 1]) sg++;
+        while (i < c->off[sg]) sg--;
+        ray_t* seg = c->segs[sg];
+        /* a partition without this column, or holding something else than vectors, has no row to give */
+        ray_t* row = seg && seg->type == RAY_LIST ? ray_list_get(seg, i - c->off[sg]) : NULL;
         if (!rayvec_is_numeric(row) || row->len != c->q->dim) { atomic_store(&c->bad_row, i); atomic_store(&c->bad, 1); return; }
         knn_push(heap, &hsz, c->kk, (knn_ent_t){ sign * row_score(kind, row, c->q), i });
     }
@@ -430,11 +437,34 @@ static void knn_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
  * k nearest of the rows of `col` (all, or the n listed in `only`) to the
  * query, into ids and dists, nearest first.  Returns how many, or one of the
  * codes below; *bad_row is then the row that is no vector of the dimension. */
-static int64_t knn_scan(ray_t* col, const int64_t* only, int64_t n, const emb_query_t* q,
-                        ray_hnsw_metric_t metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
+static int64_t knn_scan(ray_t* col, const int64_t* part_rows, int64_t n_parts, const int64_t* only, int64_t n,
+                        const emb_query_t* q, ray_hnsw_metric_t metric, int64_t k, int64_t* ids, double* dists,
+                        int64_t* bad_row) {
     if (k > n) k = n;
     if (k <= 0) return 0;
-    knn_ctx_t c = { .col = col, .only = only, .q = q, .metric = metric, .n = n };
+    /* The column as segments with the row each begins at: a list is one. */
+    ray_t* one[1] = { col };
+    int64_t one_off[2] = { 0, col->len };
+    ray_t* const* segs = one;
+    const int64_t* off = one_off;
+    int64_t ns = 1;
+    int64_t* made_off = NULL;
+    if (RAY_IS_PARTED(col->type)) {
+        ns = col->len;
+        segs = (ray_t* const*)ray_data(col);
+        made_off = (int64_t*)ray_alloc_raw((size_t)(ns + 1) * sizeof(int64_t));
+        if (!made_off) return RAY_EMB_KNN_OOM;
+        made_off[0] = 0;
+        /* A partition that lacks the column still has its rows, and they are
+         * numbered: counted as every reader of a parted column counts them
+         * (parted_seg_rows), so that a row number means here what it means to
+         * the filter before the search and to the gather after it. */
+        for (int64_t s = 0; s < ns; s++)
+            made_off[s + 1] = made_off[s] + parted_seg_rows((ray_t**)ray_data(col), s, part_rows, n_parts);
+        off = made_off;
+        if (ns == 0 || off[ns] == 0) { ray_free_raw(made_off); return 0; }
+    }
+    knn_ctx_t c = { .segs = segs, .off = off, .ns = ns, .only = only, .q = q, .metric = metric, .n = n };
     int64_t tasks;
     ray_pool_t* pool = emb_rows_plan(n, q->dim, &c.per, &tasks);
     c.kk = k < c.per ? k : c.per;
@@ -463,11 +493,12 @@ static int64_t knn_scan(ray_t* col, const int64_t* only, int64_t n, const emb_qu
     if (c.heaps) ray_free_raw(c.heaps);
     if (c.sizes) ray_free_raw(c.sizes);
     if (heap) ray_free_raw(heap);
+    if (made_off) ray_free_raw(made_off);
     return out;
 }
 
-int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float* query, int32_t dim,
-                         int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
+int64_t ray_emb_knn_scan(ray_t* col, const int64_t* part_rows, int64_t n_parts, const int64_t* only, int64_t n,
+                         const float* query, int32_t dim, int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
     emb_query_t q;
     q.d = (double*)ray_calloc_raw((size_t)(dim > 0 ? dim : 1) * (sizeof(double) + sizeof(float)));
     if (!q.d) return RAY_EMB_KNN_OOM;
@@ -476,7 +507,7 @@ int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float
     double ns = 0.0;
     for (int32_t j = 0; j < dim; j++) { q.f[j] = query[j]; q.d[j] = (double)query[j]; ns += q.d[j] * q.d[j]; }
     q.norm = sqrt(ns);
-    int64_t out = knn_scan(col, only, n, &q, (ray_hnsw_metric_t)metric, k, ids, dists, bad_row);
+    int64_t out = knn_scan(col, part_rows, n_parts, only, n, &q, (ray_hnsw_metric_t)metric, k, ids, dists, bad_row);
     emb_query_drop(&q);
     return out;
 }
@@ -530,7 +561,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
         if (dv && !RAY_IS_ERR(dv)) ray_release(dv);
         return ray_error("oom", NULL);
     }
-    int64_t got = knn_scan(col, NULL, nrows, &q, metric, k, (int64_t*)ray_data(rv), (double*)ray_data(dv), NULL);
+    int64_t got = knn_scan(col, NULL, 0, NULL, nrows, &q, metric, k, (int64_t*)ray_data(rv), (double*)ray_data(dv), NULL);
     emb_query_drop(&q);
     if (got < 0) {
         ray_release(rv); ray_release(dv);

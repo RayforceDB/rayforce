@@ -1,0 +1,63 @@
+;; `nearest:` over a partitioned table: the vector column is a list of vectors
+;; in every partition, and the search walks the partitions as one column.
+;; The answer is the flat table's, row for row, with the partition key, a
+;; symbol, a string and the vectors themselves among the columns; with a
+;; filter; with a day inserted in memory and not yet written; and in the
+;; order found, nearest first.  Before, a parted source was refused
+;; ("vector column must be a list of vectors, got PARTED_LIST").
+(.sys.exec "rm -rf /tmp/rfl_nearest_parted")
+(set vec (fn [i] (as 'F32 (/ (as 'F64 (% (* (+ i 1) [7 13 29 31 37 41 43 47]) 1009)) 1009.0))))
+(set mk (fn [base n] (table [doc kind note v] (list (+ base (til n)) (as 'SYMBOL (at ["memory" "heard" "reply"] (% (+ base (til n)) 3))) (map (fn [i] (format "a note about row % of the journal" i)) (+ base (til n))) (map vec (+ base (til n)))))))
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.01/t/" (mk 0 300) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.02/t/" (mk 300 5) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.03/t/" (mk 305 400) "/tmp/rfl_nearest_parted/.sym")
+(set P (.db.parted.get "/tmp/rfl_nearest_parted/" 't))
+(set F (select {from: P}))
+(count P) -- 705
+(set Q (vec 4242))
+
+;; ────────────── the parted table answers as the flat one ──────────────
+(select {from: P nearest: (.emb.knn v Q) take: 7}) -- (select {from: F nearest: (.emb.knn v Q) take: 7})
+(select {from: P nearest: (.emb.knn v Q 'l2) take: 7}) -- (select {from: F nearest: (.emb.knn v Q 'l2) take: 7})
+(select {from: P nearest: (.emb.knn v Q 'ip) take: 7}) -- (select {from: F nearest: (.emb.knn v Q 'ip) take: 7})
+;; and as the search called on the column
+(at (select {from: P nearest: (.emb.knn v Q 'l2) take: 12}) 'doc) -- (at (.emb.knn (at F 'v) Q 12 'l2) '_rowid)
+;; a row is nearest to itself, whichever partition holds it
+(at (at (select {from: P nearest: (.emb.knn v (vec 302) 'l2) take: 1}) 'doc) 0) -- 302
+(at (at (select {from: P nearest: (.emb.knn v (vec 302) 'l2) take: 1}) 'date) 0) -- 2024.01.02
+(at (at (select {from: P nearest: (.emb.knn v (vec 700) 'l2) take: 1}) 'note) 0) -- "a note about row 700 of the journal"
+;; nearest first
+;; (the distance is a column of the answer when the projection names it)
+(set D (at (select {from: P nearest: (.emb.knn v Q 'l2) take: 50 doc: doc d: _dist}) 'd))
+(== D (asc D)) -- (take [true] 50)
+;; more asked for than there are
+(count (select {from: P nearest: (.emb.knn v Q) take: 5000})) -- 705
+
+;; ────────────── with a filter ──────────────
+(select {from: P where: (== kind 'memory) nearest: (.emb.knn v Q) take: 9}) -- (select {from: F where: (== kind 'memory) nearest: (.emb.knn v Q) take: 9})
+(select {from: P where: (== date 2024.01.02) nearest: (.emb.knn v Q) take: 9}) -- (select {from: F where: (== date 2024.01.02) nearest: (.emb.knn v Q) take: 9})
+(select {from: P where: (and (>= doc 290) (< doc 320)) nearest: (.emb.knn v Q 'l2) take: 9}) -- (select {from: F where: (and (>= doc 290) (< doc 320)) nearest: (.emb.knn v Q 'l2) take: 9})
+(count (select {from: P where: (< doc 0) nearest: (.emb.knn v Q) take: 9})) -- 0
+
+;; ────────────── a day inserted and not yet written ──────────────
+(insert 'P 2024.01.04 (mk 705 40))
+(count P) -- 745
+(set F2 (select {from: P}))
+(select {from: P nearest: (.emb.knn v (vec 730) 'l2) take: 6}) -- (select {from: F2 nearest: (.emb.knn v (vec 730) 'l2) take: 6})
+(at (at (select {from: P nearest: (.emb.knn v (vec 730) 'l2) take: 1}) 'doc) 0) -- 730
+;; ────────────── a partition that lacks the vectors ──────────────
+;; Its rows keep their numbers: the partitions after it answer with their own
+;; rows, and a search that reaches a row without a vector says so, as over a
+;; flat table.
+(.sys.exec "rm -rf /tmp/rfl_nearest_parted")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.01/t/" (mk 0 100) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.02/t/" (select {from: (mk 100 50) doc: doc kind: kind note: note}) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.03/t/" (mk 150 100) "/tmp/rfl_nearest_parted/.sym")
+(set R (.db.parted.get "/tmp/rfl_nearest_parted/" 't))
+(count R) -- 250
+(at (at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v (vec 160) 'l2) take: 1}) 'doc) 0) -- 160
+(at (at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v (vec 249) 'l2) take: 1}) 'doc) 0) -- 249
+(at (at (select {from: R where: (== date 2024.01.03) nearest: (.emb.knn v (vec 249) 'l2) take: 1}) 'note) 0) -- "a note about row 249 of the journal"
+(at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v Q 'l2) take: 11}) 'doc) -- (at (select {from: (select {from: R where: (!= date 2024.01.02)}) nearest: (.emb.knn v Q 'l2) take: 11}) 'doc)
+(select {from: R nearest: (.emb.knn v Q 'l2) take: 3}) !- type
+(.sys.exec "rm -rf /tmp/rfl_nearest_parted")

@@ -2514,6 +2514,8 @@ ray_t* pivot_col_names(ray_t* pcol, int64_t* rows, int64_t n, ray_t* tbl);
 /* ── embedding_exec.c ── */
 ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
 ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src);
+/* The rows idx[0, n) of `tbl`, ascending, as a flat table (ops/filter.c). */
+ray_t* ray_table_gather_rows(ray_t* tbl, const int64_t* idx, int64_t n);
 
 /* ── temporal_exec.c ── */
 ray_t* exec_extract(ray_graph_t* g, ray_op_t* op);
