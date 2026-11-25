@@ -274,7 +274,14 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off
              * decoded segments, as a pruned source is, has no decode of its
              * own, and would otherwise decode a vector the segment holds. */
             ray_t* pk = ray_enccol_decoded_peek(obj);
-            if (pk) { range_plain(pk, start, n, out); return NULL; }
+            if (pk) {
+                /* clipped where a decode of the vector would end: a range
+                 * of an encoded column stays inside one vector, read from
+                 * its file or from its decode */
+                int64_t room = RAY_ENC_VEC - (start & (RAY_ENC_VEC - 1));
+                range_plain(pk, start, n < room ? n : room, out);
+                return NULL;
+            }
             return range_enc(e, start, n, sc, out);
         }
         obj = e->wrapper;

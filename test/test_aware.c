@@ -2994,9 +2994,13 @@ static test_result_t test_gather_sym_points(void) {
 }
 
 /* A few rows of an encoded STR column are read cell by cell: no vector of
- * strings is decoded for them, whichever way the vector is encoded (a
- * dictionary, FSST, a constant, raw cells), by a selection and by row ids,
- * and the cells are what generation 0 gives.  And a parted column made anew
+ * strings is decoded for them, by a selection and by row ids, and the cells
+ * are what generation 0 gives.  The columns: d a dictionary, f FSST with
+ * short cells, c one string in every row, w FSST with cells from a few
+ * bytes to over two kilobytes (past the gather's own room, and growing, so
+ * the room is taken from the heap and taken again larger), e all empty.
+ * The encodings a writer chooses for these are asserted below; a CONST or a
+ * RAW vector of strings it does not choose for any of them.  And a parted column made anew
  * over segments that are already decoded, as a pruned source is, reads
  * those decodes in place.  Before, a string was reached only by decoding
  * its whole vector, on every query. */
@@ -3004,23 +3008,27 @@ static test_result_t test_gather_str_points(void) {
     static const int64_t np[2] = { 3000, 5000 };
     for (int gen = 0; gen <= 2; gen += 2)
         for (int p = 0; p < 2; p++) {
-            char q[2000];
+            char q[2600];
             snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/st%d/2024.01.0%d/t/\" "
-                     "(table [k d f c] (list (+ %lld (til %lld)) "
+                     "(table [k d f c w e] (list (+ %lld (til %lld)) "
                      "(map (fn [j] (if (== 0 (%% j 11)) \"\" (at [\"a string long enough to be pooled, one\" \"short\" \"another string long enough to be pooled\"] (%% j 3)))) (+ %lld (til %lld))) "
                      "(map (fn [j] (if (== 0 (%% j 13)) \"\" (format \"a line of the journal, row %% of many, in words that repeat again and again and again\" (* j 7919)))) (+ %lld (til %lld))) "
-                     "(take [\"the same string, long enough to be pooled, in every row\"] %lld))) "
+                     "(take [\"the same string, long enough to be pooled, in every row\"] %lld) "
+                     "(map (fn [j] (str-join (take [\"words of a line that grows,\"] (+ 1 (%% (* j 37) 90))) (format \" %% \" j))) (+ %lld (til %lld))) "
+                     "(take [\"\"] %lld))) "
                      "\"" AW_TMP "/st%d/.sym\" {compress: %s})", gen, p + 1, (long long)(p ? np[0] : 0), (long long)np[p],
                      (long long)(p ? np[0] : 0), (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p],
-                     (long long)np[p], gen, gen ? "true" : "false");
+                     (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], (long long)np[p],
+                     gen, gen ? "true" : "false");
             aw_eval_ok(q);
         }
     ray_t* tp[2] = { aw_eval("(.db.parted.get \"" AW_TMP "/st0\" 't)"), aw_eval("(.db.parted.get \"" AW_TMP "/st2\" 't)") };
     TEST_ASSERT_TRUE(tp[0] && tp[1] && !RAY_IS_ERR(tp[0]) && !RAY_IS_ERR(tp[1]));
-    static const char* const cols[] = { "d", "f", "c" };
+    static const char* const cols[] = { "d", "f", "c", "w", "e" };
+    enum { NC = 5 };
     /* the encodings the three columns took: the cell read has an arm for each */
     int64_t encs[16] = { 0 };
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < NC; c++) {
         ray_t* encv = ray_table_get_col_enc(tp[1], ray_sym_intern(cols[c], 1));
         TEST_ASSERT_FMT(encv != NULL, "%s is not encoded", cols[c]);
         for (int64_t sg = 0; ; sg++) {
@@ -3049,7 +3057,7 @@ static test_result_t test_gather_str_points(void) {
     for (int64_t i = 0; i < ni / 2; i++) { int64_t x = ids[i]; ids[i] = ids[ni - 1 - i]; ids[ni - 1 - i] = x; }  /* unsorted */
     ray_t* sel = ray_rowsel_from_pred(pred);
     TEST_ASSERT_NOT_NULL(sel);
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < NC; c++) {
         ray_t* refs[2];
         for (int w = 0; w < 2; w++) {
             char q[1600];

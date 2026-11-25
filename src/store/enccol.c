@@ -2129,19 +2129,21 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
     return ray_enccol_desc_pool_bytes(e, c, j, &ray_enccol_descs(e, c)[j], out);
 }
 
-/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  The cell
- * is read where the file says it is, under the same trust as dec_str (files
- * this engine wrote are trusted): an FSST vector's compressed lengths and
- * the one slice (its decoded length compared first), a STR_DICT vector's
- * codes and the one entry, a RAW vector's cell (and the pooled lengths
- * before it), a CONST vector's value.  The vector is never decoded whole.
+/* One cell of the STR column `e`, read where the file says it is, under the
+ * same trust as dec_str (files this engine wrote are trusted): an FSST
+ * vector's compressed lengths and the one slice, a STR_DICT vector's codes
+ * and the one entry, a RAW vector's cell (and the pooled lengths before it),
+ * a CONST vector's value.  The vector is never decoded whole.  *p and *len
+ * are the cell's bytes, where the file has them or, for an FSST cell,
+ * decoded into b.
+ * `want` >= 0 says the caller only cares for a cell of that length: an FSST
+ * or a RAW cell of another length then comes back undecoded, *p NULL and
+ * *len its length; a dictionary entry or a constant comes back as it is,
+ * for the caller to compare lengths.
  * Checked: the row against the column's length and against its vector's
  * length (a `range` error); a STR_DICT or FSST table that fails to load is
  * the loader's error.  The file's offsets and lengths are not checked
  * against the mapping. */
-/* The cell's bytes, where the file has them or, for an FSST cell, decoded
- * into b.  `want` >= 0 asks only for a cell of that length: one of another
- * length comes back with *p NULL and nothing decoded. */
 static ray_t* enc_str_cell(ray_enccol_t* e, int64_t row, int64_t want, ray_enc_cellbuf_t* b,
                            const char** p, uint32_t* len) {
     *p = NULL; *len = 0;
@@ -2213,6 +2215,9 @@ ray_t* ray_enccol_str_cell(ray_enccol_t* e, int64_t row, ray_enc_cellbuf_t* b, c
     return enc_str_cell(e, row, -1, b, p, len);
 }
 
+/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  The cell is
+ * read by enc_str_cell, an FSST cell's decoded length compared before it is
+ * decoded. */
 ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq) {
     *eq = false;
     uint8_t stack[256];
