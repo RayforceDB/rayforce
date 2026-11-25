@@ -365,6 +365,7 @@ static ray_t* grows_range(ray_col_src_t* src, const int64_t* ids, const int64_t*
                 int64_t rows[GATHER_STR_POINT_ROWS], at[GATHER_STR_POINT_ROWS];
                 for (int64_t q = k; q < j; q++) { at[q - k] = ord ? ord[q] : q; rows[q - k] = ids[at[q - k]]; }
                 bool served;
+                // cppcheck-suppress uninitvar // rows and at are filled for [k, j) just above, and j > k
                 if ((err = gather_str_points(src, rows, j - k, a, at, 0, &served)) != NULL) break;
                 if (served) { k = j; continue; }       /* declined: the cursor reads the vector */
             }
@@ -530,6 +531,7 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
                     int64_t rows[GATHER_STR_POINT_ROWS];
                     for (uint32_t q = k; q < j; q++) rows[q - k] = lo + in->idx[q];
                     bool served;
+                    // cppcheck-suppress uninitvar // rows is filled for [k, j) just above, and j > k
                     if ((err = gather_str_points(src, rows, j - k, a, NULL, pos, &served)) != NULL) break;
                     if (served) { pos += j - k; k = j; continue; }   /* declined: the cursor reads the vector */
                 }
