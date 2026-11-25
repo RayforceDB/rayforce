@@ -1,0 +1,30 @@
+;; @requires: posix
+;; A grouped distinct count of an expression over a parted table flattens
+;; the columns the select reads, not the whole table (#1693).  64 unused I32
+;; columns x 40000 rows are 10240000 payload bytes for a full flatten; the
+;; four columns read (q, a, b, c: I64) are 1280000.  The 8 MiB traffic bound
+;; separates the two.  The answer is the inner-select form's.
+(.sys.exec "rm -rf rfl_cd_expr_alloc")
+(set Ncd 5000)
+(set mkcd (fn [p] (do (let i (+ (* p Ncd) (til Ncd))) (table (concat ['q 'a 'b 'c] (as 'SYMBOL (map (fn [j] (format "u%" j)) (til 64)))) (concat (list (% i 10) (% i 2) (% (* i 7) 13) (% (* i 11) 17)) (map (fn [j] (as 'I32 (+ j (til Ncd)))) (til 64)))))))
+(map (fn [p] (do (.db.splayed.set (format "rfl_cd_expr_alloc/2024.01.0%/t/" (+ p 1)) (mkcd p)) 0)) (til 8))
+(set Pcd (.db.parted.get "rfl_cd_expr_alloc/" 't))
+(set _prime (at Pcd 'q))
+(set _prime (at Pcd 'a))
+(set _prime (at Pcd 'b))
+(set _prime (at Pcd 'c))
+(set _prime 0)
+(set cd_expr (fn [] (select {by: q n: (count (distinct (if (== a 1) b c))) from: Pcd})))
+(set _measurement (.mem.ts (count (cd_expr))))
+(at _measurement 'result) -- 10
+(< (at _measurement 'allocated-bytes) 8388608) -- true
+(set _measurement 0)
+;; the same answer as the distinct count over a column computed one select down
+(set A (select {from: (cd_expr) asc: q}))
+(set B (select {from: (select {by: q n: (count (distinct x)) from: (select {q: q x: (if (== a 1) b c) from: Pcd})}) asc: q}))
+(== (at A 'n) (at B 'n)) -- [true true true true true true true true true true]
+(at A 'q) -- [0 1 2 3 4 5 6 7 8 9]
+(set A 0)
+(set B 0)
+(set Pcd 0)
+(.sys.exec "rm -rf rfl_cd_expr_alloc")
