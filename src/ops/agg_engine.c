@@ -210,7 +210,7 @@ agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
         switch (km.type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-            case RAY_TIMESTAMP: case RAY_SYM:
+            case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_SYM:
             case RAY_F32: case RAY_F64: case RAY_GUID: case RAY_STR: case RAY_LIST: break;
             default: return AGG_V2_KEY_TYPE;
         }
@@ -524,7 +524,7 @@ static ray_t* agg_idx_walk(const agg_rr_t* rr, agg_curs_t* cs, const int64_t* id
         if (!src || !ray_col_src_encoded(src)) continue;
         switch (src->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_BOOL:
-        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_SYM:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_SYM:
             sp_src[nsp] = s; sp_lo[nsp] = sp_hi[nsp] = -1; nsp++; break;
         default: break;
         }
@@ -1260,7 +1260,7 @@ bool agg_group_card_sample(ray_t** cols, uint32_t n, uint32_t n_prefix,
         switch (c->type) {
         case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
         case RAY_BOOL: case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP:
-        case RAY_SYM:
+        case RAY_TIMESPAN: case RAY_SYM:
             break;
         default:
             return false;
@@ -12446,7 +12446,7 @@ static bool agg_firstn_admitted(ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl,
         switch (key_cols[k]->type) {
             case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
             case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-            case RAY_TIMESTAMP: case RAY_SYM: break;
+            case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_SYM: break;
             default: return false;
         }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
@@ -13169,7 +13169,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             switch (kc->type) {
                 case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8:
                 case RAY_BOOL: case RAY_DATE: case RAY_TIME:
-                case RAY_TIMESTAMP: case RAY_SYM: break;
+                case RAY_TIMESTAMP: case RAY_TIMESPAN: case RAY_SYM: break;
                 default: keys_intsym = false;
             }
             /* Signed null sentinels are distinct canonical radix keys. */
