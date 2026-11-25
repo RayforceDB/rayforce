@@ -123,3 +123,31 @@ jobs:
           name: soak-rss
           path: /tmp/rf_soak_*_rss.csv
           if-no-files-found: ignore
+
+  # The suite with every assert() compiled out, and the macOS release build:
+  # out of the merge queue for its pace (ci.yml), so dev gets them here every
+  # night as well as on each release PR into master.
+  ndebug:
+    runs-on: ubuntu-latest
+    env:
+      RAY_MARCH: x86-64
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Install a comma-decimal locale
+        run: sudo locale-gen de_DE.UTF-8
+      - name: Test with NDEBUG
+        run: make -j4 test-ndebug
+
+  macos-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: dev }
+      - name: Build (release)
+        run: make -j4 release CC=clang
+      - name: Build shared library and run an example against it
+        run: |
+          make -j4 shared CC=clang
+          clang -O2 -Iinclude -Isrc examples/analytics.c -L. -lrayforce -lm -lpthread -Wl,-rpath,"$PWD" -o analytics-shared
+          ./analytics-shared
