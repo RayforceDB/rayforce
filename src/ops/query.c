@@ -11744,6 +11744,29 @@ static ray_t* edge_skip_walk(ray_t* e, ray_t* tbl, ray_t* fsk, ray_t* lsk) {
     return out;
 }
 
+/* An aggregate the keyless fallback evaluates once over the whole table
+ * (an output beside a row output, or one reduced out of a row expression):
+ * its first / last skip nulls as in the planned select and the per-group
+ * fallback, not the builtin's first cell (#1674).  Over `expr` as given,
+ * helpers already inlined; returns the value, owned, or an error. */
+static ray_t* eval_expr_whole_column_impl(ray_t* expr, ray_t* tbl);
+static ray_t* eval_whole_edge_skip(ray_t* expr, ray_t* tbl) {
+    ray_t* fsk = ray_fn_unary("first", RAY_FN_NONE, first_skip_fn);
+    ray_t* lsk = ray_fn_unary("last", RAY_FN_NONE, last_skip_fn);
+    ray_t* r;
+    if (!fsk || RAY_IS_ERR(fsk) || !lsk || RAY_IS_ERR(lsk)) {
+        r = ray_error("oom", NULL);
+    } else {
+        ray_t* edged = edge_skip_walk(expr, tbl, fsk, lsk);
+        r = !edged || RAY_IS_ERR(edged) ? (edged ? edged : ray_error("oom", NULL))
+                                        : eval_expr_whole_column_impl(edged, tbl);
+        if (edged && !RAY_IS_ERR(edged)) ray_release(edged);
+    }
+    if (fsk && !RAY_IS_ERR(fsk)) ray_release(fsk); else if (fsk) ray_error_free(fsk);
+    if (lsk && !RAY_IS_ERR(lsk)) ray_release(lsk); else if (lsk) ray_error_free(lsk);
+    return r;
+}
+
 static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -19066,7 +19089,9 @@ static ray_t* select_fallback_prereduce(ray_t* expr, void* vctx) {
     if (!is_agg_expr(expr))
         return select_alias_map_list(expr, el[0]->type == RAY_LIST ? 0 : 1,
                                      select_fallback_prereduce, c);
-    ray_t* v = eval_expr_whole_column(expr, c->tbl);
+    ray_t* expanded = query_inline_helpers(expr, c->tbl);
+    ray_t* v = expanded && !RAY_IS_ERR(expanded) ? eval_whole_edge_skip(expanded, c->tbl) : expanded;
+    if (expanded && !RAY_IS_ERR(expanded)) ray_release(expanded);
     if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     if (v->type > 0 && v->type != RAY_LIST && ray_is_vec(v) && v->len == 1) {
         int allocated = 0;
@@ -30034,6 +30059,8 @@ by_dict_done:
                                               !ray_is_atom(expr) &&
                                               !select_fallback_has_agg(expr);
                                 col = at_row0 ? eval_expr_per_row_impl(expr, eval_tbl, 1)
+                                    : one_value && !whole_verb && select_fallback_has_agg(expr)
+                                    ? eval_whole_edge_skip(expr, eval_tbl)   /* #1674 */
                                     : (whole_verb || one_value)
                                     ? eval_expr_whole_column_impl(expr, eval_tbl)
                                     : nrows == 0 ? select_fallback_empty_col(expr, eval_tbl)
