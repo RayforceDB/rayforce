@@ -4525,6 +4525,24 @@ static ray_t* exec_node_all_rows(ray_graph_t* g, ray_op_t* child) {
     return v;
 }
 
+static void exec_filt_keep(const int64_t** keep, int* keep_n);
+/* `tbl` narrowed to the keep-set's columns (each retained), for a head over
+ * a filter whose select gathers only those (#1691); NULL keeps every column. */
+static ray_t* exec_keep_cols(ray_t* tbl, const int64_t* keep, int keep_n) {
+    if (!keep || keep_n <= 0 || !tbl || tbl->type != RAY_TABLE) return NULL;
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new(keep_n);
+    for (int64_t c = 0; out && !RAY_IS_ERR(out) && c < nc; c++) {
+        int64_t name = ray_table_col_name(tbl, c);
+        bool kept = false;
+        for (int j = 0; j < keep_n && !kept; j++) kept = keep[j] == name;
+        if (kept) out = ray_table_add_col(out, name, ray_table_slot_idx(tbl, c));
+    }
+    if (!out || RAY_IS_ERR(out)) { if (out) ray_error_free(out); return NULL; }
+    if (ray_table_ncols(out) == 0) { ray_release(out); return NULL; }
+    return out;
+}
+
 static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
     if (!op) return ray_error("nyi", NULL);
 
@@ -5958,7 +5976,13 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                     return pred;
                 }
 
-                ray_t* result = exec_filter_head(ftbl, pred, n);
+                /* the first N matches of only the columns this select's
+                 * consumer reads (#1691), the predicate having read its own */
+                const int64_t* hk = NULL; int hk_n = 0;
+                exec_filt_keep(&hk, &hk_n);
+                ray_t* narrow = exec_keep_cols(ftbl, hk, hk_n);
+                ray_t* result = exec_filter_head(narrow ? narrow : ftbl, pred, n);
+                if (narrow) ray_release(narrow);
                 ray_release(pred);
                 exec_release_tmp(g, filter_input);
                 /* Top-level statement GC catches intermediates. */
@@ -5971,7 +5995,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                 /* only the first n rows the selection keeps */
                 ray_t* hsel = (n >= 0 && n < ray_rowsel_meta(g->selection)->total_pass)
                             ? ray_rowsel_head(g->selection, n) : NULL;
-                ray_t* compacted = sel_compact(g, input, hsel ? hsel : g->selection, NULL, 0);
+                const int64_t* hk = NULL; int hk_n = 0;
+                exec_filt_keep(&hk, &hk_n);           /* #1691 */
+                ray_t* compacted = sel_compact(g, input, hsel ? hsel : g->selection, hk, hk_n);
                 if (hsel) ray_rowsel_release(hsel);
                 ray_release(input);
                 ray_release(g->selection);

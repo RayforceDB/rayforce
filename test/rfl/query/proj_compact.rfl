@@ -56,3 +56,13 @@
 ;; nested multi-key DISTINCT with a nullable key under an outer count:
 ;; distinct(ik,val) where val>0 = 5 distinct pairs → sum of per-ik counts = 5
 (sum (at (select {c: (count ik) from: (select {from: N where: (> val 0) by: {ik: ik val: val}}) by: {ik: ik}}) 'c)) -- 5
+
+;; ── A symbol-vector by: names its columns to the pushdown too ───────────────
+;; The outer by: [k1 g] reads g, which the inner distinct must carry (the
+;; keep-set took only symbol atoms, so g was dropped: a domain error).
+;; distinct (k1,k2): (a,x) (a,y) (b,x) (b,y) (c,x), carrying g of each pair's
+;; first row: p p q p p → groups (a,p) (b,q) (b,p) (c,p)
+(set U (table [k1 k2 v g] (list ['a 'a 'a 'b 'b 'b 'c 'c] ['x 'x 'y 'x 'y 'y 'x 'x] [1 2 3 4 5 6 7 8] ['p 'q 'p 'q 'p 'q 'p 'q])))
+(set I (select {from: U where: (> v 0) by: [k1 k2]}))
+(select {n: (count k1) from: (select {from: U where: (> v 0) by: [k1 k2]}) by: [k1 g]}) -- (select {n: (count k1) from: I by: [k1 g]})
+(count (select {n: (count k1) from: (select {from: U where: (> v 0) by: [k1 k2]}) by: [k1 g]})) -- 4

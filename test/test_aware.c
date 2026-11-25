@@ -3264,6 +3264,75 @@ static bool aw_rows_same(const char* q, int64_t k) {
     return ok;
 }
 
+/* A select whose only clauses are where: (and take:), read by an outer
+ * select that names its columns, gathers only those columns (#1691): the
+ * filter used to gather every column of every row it kept, on a parted table
+ * every column of every partition.  Each shape matches the form that lists
+ * the columns itself, on a table in memory, splayed in both generations and
+ * parted in both generations with an empty partition, with nulls. */
+static test_result_t test_filter_only_columns(void) {
+#define AW_FO_COLS(R) "(table [r a b w x y] (list " R " (% " R " 3) (% (* " R " 7) 5) " \
+    "(+ (* 0.5 " R ") (at [0.0 0Nf] (+ 0 (== 0 (% " R " 11))))) (+ (% " R " 100) (at [0 0N] (+ 0 (== 0 (% " R " 13))))) " \
+    "(as 'SYMBOL (at [\"p\" \"q\" \"\"] (% " R " 3)))))"
+    aw_eval_ok("(set X (table [r] (list (til 90000))))");
+    aw_eval_ok("(set M " AW_FO_COLS("(at X 'r)") ")");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/fos0/\" M {compress: false})");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/fos2/\" M {compress: true})");
+    for (int gen = 0; gen < 2; gen++)
+        for (int p = 0; p < 4; p++) {
+            char q[1400];
+            snprintf(q, sizeof q, "(set X (table [r] (list (+ %d (til %d)))))", p * 30000, p < 3 ? 30000 : 0);
+            aw_eval_ok(q);
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/fop%d/2024.01.0%d/t/\" %s \"" AW_TMP "/fop%d/.sym\" {compress: %s})",
+                     gen * 2, p + 1, AW_FO_COLS("(at X 'r)"), gen * 2, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+#undef AW_FO_COLS
+    static const char* const srcs[] = {
+        "M", "(.db.splayed.get \"" AW_TMP "/fos0/\")", "(.db.splayed.get \"" AW_TMP "/fos2/\")",
+        "(.db.parted.get \"" AW_TMP "/fop0/\" 't)", "(.db.parted.get \"" AW_TMP "/fop2/\" 't)",
+    };
+    /* the fast form, the form listing its columns, the columns it reads */
+    static const char* const q[][3] = {
+        { "(select {from: (select {from: S where: (== a 1)}) by: b n: (count r) m: (max x)})",
+          "(select {from: (select {b: b r: r x: x from: S where: (== a 1)}) by: b n: (count r) m: (max x)})", "3" },
+        { "(select {n: (sum w) m: (max r) from: (select {from: S where: (and (== a 2) (> x 40)) take: 500})})",
+          "(select {n: (sum w) m: (max r) from: (select {w: w r: r from: S where: (and (== a 2) (> x 40)) take: 500})})", "2" },
+        { "(select {n: (count y) c: (first y) from: (select {from: S where: (> r 89990)}) by: y})",
+          "(select {n: (count y) c: (first y) from: (select {y: y from: S where: (> r 89990)}) by: y})", "1" },
+        /* a symbol-vector by: names its columns too */
+        { "(select {n: (count r) from: (select {from: S where: (== a 1)}) by: [b y]})",
+          "(select {n: (count r) from: (select {b: b y: y r: r from: S where: (== a 1)}) by: [b y]})", "3" },
+        { "(select {r: r from: (select {from: S where: (== a 7)})})",
+          "(select {r: r from: (select {r: r from: S where: (== a 7)})})", "1" },
+    };
+    for (size_t si = 0; si < sizeof srcs / sizeof *srcs; si++) {
+        char buf[600];
+        snprintf(buf, sizeof buf, "(set S %s)", srcs[si]);
+        aw_eval_ok(buf);
+        for (size_t k = 0; k < sizeof q / sizeof *q; k++) {
+            uint64_t g0 = ray_filter_test_cols_gathered();
+            ray_t* a = aw_eval(q[k][0]);
+            uint64_t gathered = ray_filter_test_cols_gathered() - g0;
+            ray_t* b = aw_eval(q[k][1]);
+            TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b), "%s on %s failed", q[k][0], srcs[si]);
+            ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+            bool same = ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            TEST_ASSERT_FMT(same, "%s on %s: %.*s, listing its columns: %.*s", q[k][0], srcs[si],
+                            (int)ray_str_len(fa), ray_str_ptr(fa), (int)ray_str_len(fb), ray_str_ptr(fb));
+            ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+            /* In memory and splayed generation 0 the two selects merge into
+             * one (select_merge), whose filter gathers nothing but a 64-row
+             * probe of every column; the rest filter the inner select. */
+            if (si < 2) continue;
+            TEST_ASSERT_FMT(gathered <= (uint64_t)atoi(q[k][2]), "%s on %s: the filter gathered %llu columns, it reads %s",
+                            q[k][0], srcs[si], (unsigned long long)gathered, q[k][2]);
+        }
+    }
+    aw_eval_ok("(set S 0)"); aw_eval_ok("(set M 0)"); aw_eval_ok("(set X 0)");
+    PASS();
+}
+
 static test_result_t test_sort_head_late_chunked(void) {
 #define AW_TKC_COLS(R) "(table [r up dn c d n f i] (list " R " " R " (- 0 " R ") (+ 7 (* 0 " R ")) (div " R " 3000) " \
     "(+ (% (* " R " 7919) 1000) (at [0 0N] (+ 0 (== 0 (% " R " 97))))) " \
@@ -6169,5 +6238,6 @@ const test_entry_t aware_entries[] = {
     { "aware/agg_admission",     test_agg_admission,     aw_setup, aw_teardown },
     { "aware/sign_bit_widths",   test_sign_bit_widths,   aw_setup, aw_teardown },
     { "aware/topk_never_pruned", test_topk_never_pruned, aw_setup, aw_teardown },
+    { "aware/filter_only_columns", test_filter_only_columns, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

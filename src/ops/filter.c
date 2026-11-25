@@ -816,6 +816,9 @@ ray_t* ray_table_gather_rows(ray_t* input, const int64_t* match_idx, int64_t fou
     return tbl;
 }
 
+static _Atomic(uint64_t) g_cols_gathered;   /* test hook: columns a filter gathered */
+uint64_t ray_filter_test_cols_gathered(void) { return atomic_load_explicit(&g_cols_gathered, memory_order_relaxed); }
+
 ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
     if (!input || RAY_IS_ERR(input)) return input;
     if (!pred || RAY_IS_ERR(pred)) return pred;
@@ -881,6 +884,9 @@ ray_t* exec_filter_head(ray_t* input, ray_t* pred, int64_t limit) {
         }
     }
 
+#ifdef DEBUG
+    atomic_fetch_add_explicit(&g_cols_gathered, (uint64_t)ncols, memory_order_relaxed);
+#endif
     ray_t* tbl = ray_table_gather_rows(input, match_idx, found);
     scratch_free(idx_hdr);
     return tbl;
@@ -1235,6 +1241,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         if (use_keep && !sel_compact_keep(col_names[c], keep_syms, keep_n)) {
             new_cols[c] = NULL; continue;
         }
+#ifdef DEBUG
+        atomic_fetch_add_explicit(&g_cols_gathered, 1, memory_order_relaxed);
+#endif
         /* A generation-2 slot (single file or parted) gathers under the
          * selection into its finished column; src_cols[c] stays NULL, so
          * the batch gather, the LIST and parted passes and the fix-ups
