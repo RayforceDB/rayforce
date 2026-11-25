@@ -295,6 +295,14 @@ volume. Comparisons take the operand types they take outside a query
 ([Comparison](../language/math.md#comparison)): `where: (> date 8000)` over
 a `DATE` column is a `type` error; compare with a date, `(> date 2021.11.26)`.
 
+An `or` of `==` on one column against literals of its own type,
+`(or (== sym 'AAPL) (== sym 'MSFT) ...)`, nested or written as one `or`, is
+planned as that column's `in`, `(in sym ['AAPL 'MSFT ...])`: the column is
+read once, however many values there are. This covers integer, temporal and
+symbol columns. It does not cover an `or` over different columns, a float
+column, a null literal, or a literal symbol that names a column (which reads
+that column). Those keep the `or`, with the same rows.
+
 ### Running functions under `where:`
 
 A running, moving or shift function in a projection (`sums`, `deltas`,

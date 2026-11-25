@@ -2372,6 +2372,114 @@ static ray_op_t* like_pattern_const(ray_graph_t* g, ray_t* pat) {
     return op;
 }
 
+/* ---- An `or` of `==` on one column (#1694) ----
+ * `(or (== b 'B1) (== b 'B2) ...)`, nested or variadic, with every term an
+ * equality of the same column against a literal of the column's own type,
+ * keeps exactly the rows `(in b ['B1 'B2 ...])` keeps, which reads the
+ * column once and tests each row against the set.  The fused `or` needs
+ * four registers per term and gives up past a handful of them.  Only types
+ * whose `==` and `in` agree value for value are taken: integers, temporal
+ * types and non-empty symbols; never a null literal, a float (-0.0, NaN)
+ * or text. */
+static bool or_eq_term(ray_t* e, ray_graph_t* g, int64_t* col, int8_t* ctype, ray_t** lit) {
+    if (!e || e->type != RAY_LIST || e->len != 3 || (e->attrs & ATTR_QUOTED)) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    ray_t* hs = ray_sym_str(h->i64);
+    if (!hs || ray_str_len(hs) != 2 || memcmp(ray_str_ptr(hs), "==", 2) != 0) return false;
+    if (ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* c = NULL; ray_t* l = NULL;
+    for (int side = 1; side <= 2 && !c; side++) {
+        ray_t* a = el[side];
+        ray_t* b = el[3 - side];
+        if (a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) && b && b->type < 0) { c = a; l = b; }
+    }
+    if (!c) return false;
+    /* the column side resolves as compile_expr_dag resolves a name: a
+     * binding of the compile, an earlier output, a lexical local come
+     * first; only a column of the table is taken */
+    if (ray_sym_is_dotted(c->i64) || ray_sym_is_private(c->i64)) return false;
+    if (cexpr_env_lookup(g, c->i64) || sel_alias_lookup(g, c->i64)) return false;
+    if (g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(c->i64) != NULL
+                                  : ray_env_get_lexical_local(c->i64) != NULL) return false;
+    ray_col_meta_t cm;
+    if (!g->table || g->table->type != RAY_TABLE || !ray_table_col_meta(g->table, c->i64, &cm)) return false;
+    int8_t t = cm.type;
+    if (RAY_IS_PARTED(t)) t = (int8_t)RAY_PARTED_BASETYPE(t);
+    switch (t) {
+        case RAY_I16: case RAY_I32: case RAY_I64: case RAY_U8:
+        case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+            if (l->type != -t || ray_atom_is_null_fn(l)) return false;
+            break;
+        case RAY_SYM: {
+            if (l->type != -RAY_SYM || !(l->attrs & ATTR_QUOTED)) return false;
+            ray_t* ls = ray_sym_str(l->i64);
+            if (!ls || ray_str_len(ls) == 0) return false;
+            /* a literal naming an earlier output or a column reads it, in
+             * query text (compile_expr_dag, B3 Part 2) */
+            ray_col_meta_t lm;
+            if (!g->cexpr_helper_depth &&
+                (sel_alias_lookup(g, l->i64) || ray_table_col_meta(g->table, l->i64, &lm))) return false;
+            break;
+        }
+        default:
+            return false;
+    }
+    if (*col >= 0 && (*col != c->i64 || *ctype != t)) return false;
+    *col = c->i64; *ctype = t; *lit = l;
+    return true;
+}
+
+/* Collects the literals of an `or` tree of or_eq_term terms on one column
+ * into lits (at most cap); false when any leaf is something else. */
+static bool or_eq_collect(ray_t* e, ray_graph_t* g, int64_t* col, int8_t* ctype,
+                          ray_t** lits, int* n, int cap, int depth) {
+    if (!e || e->type != RAY_LIST || e->len < 2 || (e->attrs & ATTR_QUOTED) || depth > 64) return false;
+    ray_t** el = (ray_t**)ray_data(e);
+    ray_t* h = el[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED)) {
+        ray_t* hs = ray_sym_str(h->i64);
+        if (hs && ray_str_len(hs) == 2 && memcmp(ray_str_ptr(hs), "or", 2) == 0 &&
+            !ray_env_has_lexical_local(h->i64)) {
+            for (int64_t i = 1; i < e->len; i++)
+                if (!or_eq_collect(el[i], g, col, ctype, lits, n, cap, depth + 1)) return false;
+            return true;
+        }
+    }
+    ray_t* lit = NULL;
+    if (*n >= cap || !or_eq_term(e, g, col, ctype, &lit)) return false;
+    lits[(*n)++] = lit;
+    return true;
+}
+
+/* `(in col [lits])` for an `or` of `==` on one column, or NULL. */
+static ray_t* or_eq_as_in(ray_t* e, ray_graph_t* g) {
+    ray_t* lits[256];
+    int n = 0;
+    int64_t col = -1;
+    int8_t ctype = 0;
+    if (!or_eq_collect(e, g, &col, &ctype, lits, &n, 256, 0) || n < 2) return NULL;
+    ray_t* set = ray_enlist_fn(lits, n);
+    if (!set || RAY_IS_ERR(set) || set->type != ctype) {
+        if (set && !RAY_IS_ERR(set)) ray_release(set); else if (set) ray_error_free(set);
+        return NULL;
+    }
+    ray_t* in = ray_list_new(3);
+    ray_t* h = ray_sym(ray_sym_intern("in", 2));
+    ray_t* c = ray_sym(col);
+    if (in && !RAY_IS_ERR(in) && h && c) {
+        in = ray_list_append(in, h);
+        if (in && !RAY_IS_ERR(in)) in = ray_list_append(in, c);
+        if (in && !RAY_IS_ERR(in)) in = ray_list_append(in, set);
+    }
+    if (h) ray_release(h);
+    if (c) ray_release(c);
+    ray_release(set);
+    if (!in || RAY_IS_ERR(in)) return NULL;
+    return in;
+}
+
 ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     uint32_t base = g->node_count;
     ray_op_t* r = compile_expr_dag_node(g, expr);
@@ -3180,6 +3288,15 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             bool is_or1  = (fname_len == 2 && memcmp(fname, "or",  2) == 0);
             if (is_and1 || is_or1) {
                 return compile_expr_dag(g, elems[1]);
+            }
+        }
+        /* an `or` of `==` on one column is that column's `in` (#1694) */
+        if (n >= 3 && fname_len == 2 && memcmp(fname, "or", 2) == 0) {
+            ray_t* in = or_eq_as_in(expr, g);
+            if (in) {
+                ray_op_t* r = compile_expr_dag(g, in);
+                ray_release(in);
+                if (r) return r;
             }
         }
         if (n >= 4) {
