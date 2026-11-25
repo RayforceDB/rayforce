@@ -648,9 +648,11 @@ static inline ray_t* parted_tail_str(ray_t** segs, int64_t n_segs, int64_t n) {
 }
 
 /* Deep-copy flatten all rows from parted RAY_STR segments; a NULL segment
- * yields its partition's rows as null (empty) strings. */
-static inline ray_t* parted_flatten_str_c(ray_t** segs, int64_t n_segs,
-                                          const int64_t* cnt, int64_t ncnt) {
+ * yields its partition's rows as null (empty) strings.  One string at a
+ * time through ray_str_vec_append: the general form, kept for a sliced
+ * segment and for a pool past what an offset can address. */
+static inline ray_t* parted_flatten_str_append_c(ray_t** segs, int64_t n_segs,
+                                                 const int64_t* cnt, int64_t ncnt) {
     int64_t total = 0;
     for (int64_t s = 0; s < n_segs; s++) total += parted_seg_rows(segs, s, cnt, ncnt);
     ray_t* out = ray_vec_new(RAY_STR, total);
@@ -673,6 +675,73 @@ static inline ray_t* parted_flatten_str_c(ray_t** segs, int64_t n_segs,
             if (RAY_IS_ERR(out)) return out;
         }
     }
+    return out;
+}
+
+/* Deep-copy flatten all rows from parted RAY_STR segments; a NULL segment
+ * yields its partition's rows as null (empty) strings.  The same vector
+ * parted_flatten_str_append_c builds, in two passes: the pool is sized once,
+ * then each descriptor is copied and each pooled string copied to its new
+ * offset, without the copy-on-write and pool checks of an append per
+ * string (#1692).  An empty string is the STR null, as an append marks it. */
+static inline ray_t* parted_flatten_str_c(ray_t** segs, int64_t n_segs,
+                                          const int64_t* cnt, int64_t ncnt) {
+    int64_t total = 0;
+    uint64_t pool_bytes = 0;
+    for (int64_t s = 0; s < n_segs; s++) {
+        total += parted_seg_rows(segs, s, cnt, ncnt);
+        if (!segs[s] || RAY_IS_ERR(segs[s])) continue;
+        if (segs[s]->attrs & RAY_ATTR_SLICE) return parted_flatten_str_append_c(segs, n_segs, cnt, ncnt);
+        const ray_str_t* e = (const ray_str_t*)ray_data(segs[s]);
+        for (int64_t i = 0; i < segs[s]->len; i++)
+            if (e[i].len > RAY_STR_INLINE_MAX) pool_bytes += e[i].len;
+    }
+    if (pool_bytes > UINT32_MAX) return parted_flatten_str_append_c(segs, n_segs, cnt, ncnt);
+    ray_t* out = ray_vec_new(RAY_STR, total);
+    if (!out || RAY_IS_ERR(out)) return out;
+    char* pool = NULL;
+    if (pool_bytes > 0) {
+        out->str_pool = ray_alloc((size_t)pool_bytes + 32);
+        if (!out->str_pool || RAY_IS_ERR(out->str_pool)) {
+            out->str_pool = NULL;
+            ray_release(out);
+            return ray_error("oom", NULL);
+        }
+        out->str_pool->type = RAY_U8;
+        out->str_pool->len = 0;
+        pool = (char*)ray_data(out->str_pool);
+    }
+    ray_str_t* d = (ray_str_t*)ray_data(out);
+    uint64_t used = 0;
+    bool nulls = false;
+    int64_t r = 0;
+    for (int64_t s = 0; s < n_segs; s++) {
+        if (!segs[s] || RAY_IS_ERR(segs[s])) {
+            int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
+            memset(d + r, 0, (size_t)n * sizeof(ray_str_t));
+            r += n;
+            nulls |= n > 0;
+            continue;
+        }
+        const ray_str_t* e = (const ray_str_t*)ray_data(segs[s]);
+        const char* src_pool = segs[s]->str_pool ? (const char*)ray_data(segs[s]->str_pool) : NULL;
+        for (int64_t i = 0; i < segs[s]->len; i++, r++) {
+            uint32_t len = e[i].len;
+            memset(&d[r], 0, sizeof(ray_str_t));
+            d[r].len = len;
+            if (len == 0) { nulls = true; continue; }
+            if (len <= RAY_STR_INLINE_MAX) { memcpy(d[r].data, e[i].data, len); continue; }
+            const char* str = src_pool + e[i].pool_off;
+            memcpy(pool + used, str, len);
+            memcpy(d[r].prefix, str, 4);
+            d[r].pool_off = (uint32_t)used;
+            ray_str_t_cache_hash(&d[r], pool);
+            used += len;
+        }
+    }
+    if (out->str_pool) out->str_pool->len = (int64_t)used;
+    out->len = r;
+    if (nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
     return out;
 }
 

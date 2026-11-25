@@ -21305,10 +21305,228 @@ ray_t* ray_select(ray_t** args, int64_t n) {
     return r;
 }
 
+/* ── Sort and take before the projection of a parted table (#1692) ───────────
+ *
+ * `(select {from: P <outputs> desc: k take: n})`, and the same written as a
+ * sort and take above a select of the outputs, `(select {from: (select {from:
+ * P <outputs>}) desc: k take: n})`, projected every row of every partition
+ * (flattening each output column, a STR one string at a time) before the
+ * sort read one column.  When every output is row-local (a column, a
+ * constant, an element-wise builtin or an `if` over such values), the
+ * projection of a row depends on that row alone, so sorting and taking the
+ * source first and projecting the rows kept gives the same rows: the sort
+ * and take run as `(select {from: P where: w desc: k take: n})`, which reads
+ * the key and gathers n rows, and the outputs are then evaluated over those.
+ * Only for a source with parted columns, where the flattening is the cost. */
+
+static int64_t sp_id(const char* nm) { return ray_sym_intern(nm, strlen(nm)); }
+
+/* Is `e` a call of the builtin `select` on a dict written in place? */
+static ray_t* sp_select_form_dict(ray_t* e) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len != 2) return NULL;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (!es[0] || es[0]->type != -RAY_SYM || (es[0]->attrs & ATTR_QUOTED) ||
+        es[0]->i64 != sp_id("select") || ray_env_has_lexical_local(es[0]->i64)) return NULL;
+    ray_t* fn = ray_env_get(es[0]->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY || strcmp(ray_fn_name(fn), "select") != 0) return NULL;
+    return es[1] && es[1]->type == RAY_DICT ? es[1] : NULL;
+}
+
+/* Is the output `e` row-local over `tbl`: a column, a constant (a literal, a
+ * quoted form, a name holding an atom), or an element-wise builtin or an
+ * `if` applied to such values? */
+static bool sp_row_local(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 64) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        if (ray_env_has_lexical_local(e->i64)) {
+            ray_t* v = ray_env_get(e->i64);
+            return v && ray_is_atom(v);
+        }
+        if (tbl_has_col(tbl, e->i64)) return true;
+        ray_t* v = ray_env_get(e->i64);
+        return v && ray_is_atom(v) && v->type != -RAY_SYM;
+    }
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST || e->len == 0) return false;
+    if (e->attrs & ATTR_QUOTED) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64) ||
+        ray_env_has_lexical_local(h->i64)) return false;
+    if (h->i64 == sp_id("quote")) return e->len == 2;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    bool is_if = (fn->attrs & RAY_FN_SPECIAL_FORM) && h->i64 == sp_id("if") && strcmp(ray_fn_name(fn), "if") == 0;
+    if (!is_if && ((fn->attrs & RAY_FN_SPECIAL_FORM) || !(fn->attrs & RAY_FN_ATOMIC))) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (!sp_row_local(es[i], tbl, depth + 1)) return false;
+    return true;
+}
+
+/* The sort-and-take-first form of the select `dict`, evaluated; NULL when
+ * it does not apply (the select runs as written).  `*plain` is set when it
+ * does not apply only because every output is a source column by its own
+ * name: the planner's per-partition top-k (try_stream_parted_order_by_topk)
+ * serves that select as written. */
+static ray_t* select_sort_take_pushdown(ray_t* dict, int depth, bool* plain) {
+    if (plain) *plain = false;
+    if (!dict || dict->type != RAY_DICT || depth > 8) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    int64_t nd = ray_dict_len(dict);
+    ray_t** vs = (ray_t**)ray_data(vals);
+    int64_t id_from = sp_id("from"), id_where = sp_id("where"), id_take = sp_id("take"),
+            id_asc = sp_id("asc"), id_desc = sp_id("desc"), id_by = sp_id("by"), id_near = sp_id("nearest");
+    int64_t from_i = -1, where_i = -1, take_i = -1, sort_i = -1, nout = 0;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t k = sym_cell_runtime_id(keys, i);
+        if (k == id_from) from_i = i;
+        else if (k == id_where) where_i = i;
+        else if (k == id_take) take_i = i;
+        else if (k == id_asc || k == id_desc) { if (sort_i >= 0) return NULL; sort_i = i; }
+        else if (k == id_by || k == id_near) return NULL;
+        else nout++;
+    }
+    if (from_i < 0 || take_i < 0 || sort_i < 0) return NULL;
+    /* the sort key: one name, or a SYM vector of names */
+    ray_t* sk = vs[sort_i];
+    int64_t nsk = sk && sk->type == -RAY_SYM ? 1 : sk && sk->type == RAY_SYM ? sk->len : 0;
+    if (nsk < 1 || nsk > 16) return NULL;
+    int64_t skeys[16];
+    for (int64_t j = 0; j < nsk; j++)
+        skeys[j] = sk->type == -RAY_SYM ? sk->i64 : ray_read_sym(ray_data(sk), j, sk->type, sk->attrs);
+    /* `(select {from: X})`, a select of nothing but its source, is X */
+    ray_t* fe = vs[from_i];
+    for (ray_t* d; (d = sp_select_form_dict(fe)) && ray_dict_len(d) == 1 &&
+                   sym_cell_runtime_id(ray_dict_keys(d), 0) == id_from; )
+        fe = ((ray_t**)ray_data(ray_dict_vals(d)))[0];
+    if (nout == 0) {
+        /* a sort and take above a select of outputs (and a where:): one
+         * select, its sort keys being those outputs */
+        if (where_i >= 0) return NULL;
+        ray_t* in = sp_select_form_dict(fe);
+        if (!in) return NULL;
+        ray_t* ik = ray_dict_keys(in);
+        ray_t** iv = (ray_t**)ray_data(ray_dict_vals(in));
+        int64_t ni = ray_dict_len(in), iouts = 0;
+        if (!ik || ik->type != RAY_SYM) return NULL;
+        for (int64_t i = 0; i < ni; i++) {
+            int64_t k = sym_cell_runtime_id(ik, i);
+            if (k == id_take || k == id_asc || k == id_desc || k == id_by || k == id_near) return NULL;
+            if (k != id_from && k != id_where) iouts++;
+        }
+        if (!iouts) return NULL;
+        for (int64_t j = 0; j < nsk; j++) {
+            bool out = false;
+            for (int64_t i = 0; i < ni && !out; i++) out = sym_cell_runtime_id(ik, i) == skeys[j];
+            if (!out) return NULL;
+        }
+        ray_t* mk = ray_vec_new(RAY_SYM, ni + 2);
+        ray_t* mv = ray_list_new((int32_t)(ni + 2));
+        for (int64_t i = 0; i < ni && mk && !RAY_IS_ERR(mk) && mv && !RAY_IS_ERR(mv); i++) {
+            int64_t k = sym_cell_runtime_id(ik, i);
+            mk = ray_vec_append(mk, &k);
+            mv = ray_list_append(mv, iv[i]);
+        }
+        int64_t ks = sym_cell_runtime_id(keys, sort_i);
+        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append(mk, &ks);
+        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append(mv, vs[sort_i]);
+        if (mk && !RAY_IS_ERR(mk)) mk = ray_vec_append(mk, &id_take);
+        if (mv && !RAY_IS_ERR(mv)) mv = ray_list_append(mv, vs[take_i]);
+        if (!mk || RAY_IS_ERR(mk) || !mv || RAY_IS_ERR(mv)) {
+            if (mk && !RAY_IS_ERR(mk)) ray_release(mk);
+            if (mv && !RAY_IS_ERR(mv)) ray_release(mv);
+            return NULL;
+        }
+        ray_t* merged = ray_dict_new(mk, mv);
+        if (!merged || RAY_IS_ERR(merged)) return NULL;
+        bool mplain = false;
+        ray_t* r = select_sort_take_pushdown(merged, depth + 1, &mplain);
+        /* outputs that are columns alone: the merged select as written */
+        if (!r && mplain) r = ray_select(&merged, 1);
+        ray_release(merged);
+        return r;
+    }
+    /* outputs, a sort and a take over a source read by name (evaluating it
+     * has no effect, so a decline after it leaves the query as written) */
+    ray_t* tbl = NULL;
+    if (fe && fe->type == RAY_TABLE) { ray_retain(fe); tbl = fe; }
+    else if (fe && fe->type == -RAY_SYM && !(fe->attrs & ATTR_QUOTED) && !ray_sym_is_dotted(fe->i64)) {
+        ray_t* g = ray_env_get(fe->i64);
+        if (g && g->type == RAY_TABLE) { ray_retain(g); tbl = g; }
+    }
+    if (!tbl) return NULL;
+    bool ok = table_has_parted_columns(tbl), all_cols = true;
+    for (int64_t i = 0; i < nd && ok; i++) {
+        int64_t k = sym_cell_runtime_id(keys, i);
+        if (i == from_i || i == where_i || i == take_i || i == sort_i) continue;
+        ok = sp_row_local(vs[i], tbl, 0);
+        bool ident = vs[i]->type == -RAY_SYM && !(vs[i]->attrs & ATTR_QUOTED) && vs[i]->i64 == k &&
+                     !ray_env_has_lexical_local(k) && tbl_has_col(tbl, k);
+        all_cols &= ident;
+        /* an output named like a sort key is that column itself */
+        for (int64_t j = 0; j < nsk && ok; j++)
+            if (k == skeys[j]) ok = ident;
+    }
+    /* a sort key a local of that name hides is left as written */
+    for (int64_t j = 0; j < nsk && ok; j++)
+        ok = tbl_has_col(tbl, skeys[j]) && !ray_env_has_lexical_local(skeys[j]);
+    if (ok && all_cols) {
+        if (plain) *plain = true;
+        ok = false;
+    }
+    if (!ok) { ray_release(tbl); return NULL; }
+    /* the sort and take over the source: the key read, n rows gathered */
+    int64_t ni = where_i >= 0 ? 4 : 3;
+    ray_t* ik = ray_vec_new(RAY_SYM, ni);
+    ray_t* iv = ray_list_new((int32_t)ni);
+    int64_t ks = sym_cell_runtime_id(keys, sort_i);
+    ik = ray_vec_append(ik, &id_from);  iv = ray_list_append(iv, tbl);
+    if (where_i >= 0) { ik = ray_vec_append(ik, &id_where); iv = ray_list_append(iv, vs[where_i]); }
+    ik = ray_vec_append(ik, &ks);       iv = ray_list_append(iv, vs[sort_i]);
+    ik = ray_vec_append(ik, &id_take);  iv = ray_list_append(iv, vs[take_i]);
+    ray_release(tbl);
+    if (!ik || RAY_IS_ERR(ik) || !iv || RAY_IS_ERR(iv)) {
+        if (ik && !RAY_IS_ERR(ik)) ray_release(ik);
+        if (iv && !RAY_IS_ERR(iv)) ray_release(iv);
+        return ray_error("oom", NULL);
+    }
+    ray_t* inner = ray_dict_new(ik, iv);
+    if (!inner || RAY_IS_ERR(inner)) return inner ? inner : ray_error("oom", NULL);
+    ray_t* rows = ray_select(&inner, 1);
+    ray_release(inner);
+    if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+    /* then the outputs, in their order, over those rows */
+    ray_t* ok2 = ray_vec_new(RAY_SYM, nout + 1);
+    ray_t* ov = ray_list_new((int32_t)(nout + 1));
+    ok2 = ray_vec_append(ok2, &id_from); ov = ray_list_append(ov, rows);
+    ray_release(rows);
+    for (int64_t i = 0; i < nd && ok2 && !RAY_IS_ERR(ok2) && ov && !RAY_IS_ERR(ov); i++) {
+        if (i == from_i || i == where_i || i == take_i || i == sort_i) continue;
+        int64_t k = sym_cell_runtime_id(keys, i);
+        ok2 = ray_vec_append(ok2, &k);
+        ov = ray_list_append(ov, vs[i]);
+    }
+    if (!ok2 || RAY_IS_ERR(ok2) || !ov || RAY_IS_ERR(ov)) {
+        if (ok2 && !RAY_IS_ERR(ok2)) ray_release(ok2);
+        if (ov && !RAY_IS_ERR(ov)) ray_release(ov);
+        return ray_error("oom", NULL);
+    }
+    ray_t* outer = ray_dict_new(ok2, ov);
+    if (!outer || RAY_IS_ERR(outer)) return outer ? outer : ray_error("oom", NULL);
+    ray_t* r = ray_select(&outer, 1);
+    ray_release(outer);
+    return r;
+}
+
 static ray_t* ray_select_lowered(ray_t** args, int64_t n) {
     ray_t* clash = n == 1 && args[0] && args[0]->type == RAY_DICT
         ? select_check_key_named_outputs(args[0]) : NULL;
     if (clash) return clash;
+    ray_t* pushed = n == 1 ? select_sort_take_pushdown(args[0], 0, NULL) : NULL;
+    if (pushed) return pushed;
     ray_t* merged = n > 0 ? ray_select_merge_plan(args[0]) : NULL;
     if (merged) args = &merged;
     ray_t* user = n > 0 ? args[0] : NULL;

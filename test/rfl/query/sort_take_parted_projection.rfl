@@ -1,0 +1,43 @@
+;; @requires: posix
+;; A sort and take above a projection of a parted table (#1692): the
+;; projection of a row depends on that row alone, so the source is sorted
+;; and taken first and only the rows kept are projected, as
+;; (select {from: (select {from: P desc: v take: n}) <outputs>}) does.  On dev
+;; every output column of every partition was flattened first, a STR one
+;; string at a time.  Relative paths stay inside the harness per-process
+;; working directory.
+(.sys.exec "rm -rf rfl_sort_take_parted")
+(set n 40000)
+(set T (table [i v s l y] (list (til n) (as 'F64 (% (* (til n) 48271) 100003)) (at ["p" "" "q"] (% (til n) 3)) (at ["a-pooled-string-value" "" "short" "another-pooled-string"] (% (til n) 4)) (at ['x 'y 'z] (% (til n) 3)))))
+(set T (update {from: T v: (if (== 0 (% i 97)) 0Nf v)}))
+(.db.splayed.set "rfl_sort_take_parted/db/2024.01.01/t/" (take T 15000) "rfl_sort_take_parted/db/.sym")
+(.db.splayed.set "rfl_sort_take_parted/db/2024.01.02/t/" (take T 0) "rfl_sort_take_parted/db/.sym")
+(.db.splayed.set "rfl_sort_take_parted/db/2024.01.03/t/" (drop T 15000) "rfl_sort_take_parted/db/.sym")
+(set P (.db.parted.get "rfl_sort_take_parted/db/" 't))
+
+;; the same rows as the sort and take first, and as the in-memory table
+(set A (select {from: (select {from: (select {from: P}) i: i v: v s: s l: l a: (if (== y 'x) "one" "zero")}) desc: v take: 50}))
+(set B (select {from: (select {from: P desc: v take: 50}) i: i v: v s: s l: l a: (if (== y 'x) "one" "zero")}))
+(set C (select {from: T i: i v: v s: s l: l a: (if (== y 'x) "one" "zero") desc: v take: 50}))
+(ser A) -- (ser B)
+(ser A) -- (ser C)
+(ser (select {from: P i: i l: l desc: v take: 7})) -- (ser (select {from: T i: i l: l desc: v take: 7}))
+(ser (select {from: P where: (> i 100) i: i s: s asc: v take: -5})) -- (ser (select {from: T where: (> i 100) i: i s: s asc: v take: -5}))
+(ser (select {from: (select {from: P i: i v: v y: y}) asc: [y v] take: 6})) -- (ser (select {from: T i: i v: v y: y asc: [y v] take: 6}))
+
+;; and it holds no more than the sort and take first does: dev flattened
+;; every row of every output first
+(set slow (at (.mem.ts (select {from: (select {from: P i: i v: v s: s l: l}) desc: v take: 50})) 'peak-live-bytes))
+(set fast (at (.mem.ts (select {from: (select {from: P desc: v take: 50}) i: i v: v s: s l: l})) 'peak-live-bytes))
+(<= slow (* 2 fast)) -- true
+(set one (at (.mem.ts (select {from: P i: i v: v s: s l: l desc: v take: 50})) 'peak-live-bytes))
+(<= one (* 2 fast)) -- true
+
+;; a parted STR column flattened whole: the same vector as the flat one,
+;; long, short and empty strings and the empty partition included
+(ser (select {from: P s: s l: l})) -- (ser (select {from: T s: s l: l}))
+(ser (select {from: P where: (> i 39990) l: l})) -- (ser (select {from: T where: (> i 39990) l: l}))
+
+;; unchanged: an output that is no row-local value keeps the query as written
+(ser (select {from: P m: (max v) desc: m take: 1})) -- (ser (select {from: T m: (max v) desc: m take: 1}))
+(.sys.exec "rm -rf rfl_sort_take_parted")
