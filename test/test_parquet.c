@@ -857,8 +857,8 @@ static test_result_t test_pq_parallel(void) {
 static void pq_remove_native(const char* dir, const char** columns, int n) {
     char path[512];
     for (int i = 0; i < n; i++) { snprintf(path,sizeof(path),"%s/%s",dir,columns[i]); unlink(path); }
-    const char* special[] = {".d",".sym",".sym.lk",".sym.ix"};
-    for (int i = 0; i < 4; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
+    const char* special[] = {".d",".sym",".sym.lk",".sym.ix",".sym.ixh"};
+    for (int i = 0; i < 5; i++) { snprintf(path,sizeof(path),"%s/%s",dir,special[i]); unlink(path); }
     rmdir(dir);
 }
 /* The direct import picks its pass layout from memory; RAY_PQ_PASS_COLS
@@ -5441,9 +5441,9 @@ static int64_t pq_symfile_count(const char* path) {
 /* An import under symfile 'column: its column symbol files too. */
 static void pq_remove_symcol(const char* dir, const char** columns, int n) {
     char path[512];
-    const char* sfx[] = {"", ".ix", ".lk"};
+    const char* sfx[] = {"", ".ix", ".ixh", ".lk"};
     for (int i = 0; i < n; i++)
-        for (int k = 0; k < 3; k++) { snprintf(path, sizeof(path), "%s/.%s.sym%s", dir, columns[i], sfx[k]); unlink(path); }
+        for (int k = 0; k < 4; k++) { snprintf(path, sizeof(path), "%s/.%s.sym%s", dir, columns[i], sfx[k]); unlink(path); }
     pq_remove_native(dir, columns, n);
 }
 /* {types: [...] symfile: 'column}, with compress: true when asked. */
@@ -5551,6 +5551,7 @@ static test_result_t test_pq_sym_prefix_bounds(void) {
         if (l == 0) pq_remove_native(dir, names, 3); else pq_remove_symcol(dir, names, 3);
         snprintf(sym, sizeof(sym), "%s/.sym", dir); unlink(sym);
         snprintf(sym, sizeof(sym), "%s/.sym.ix", dir); unlink(sym);
+        snprintf(sym, sizeof(sym), "%s/.sym.ixh", dir); unlink(sym);
     }
     unlink(src);
     ray_release(types);

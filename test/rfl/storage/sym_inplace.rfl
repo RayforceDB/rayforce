@@ -1,0 +1,56 @@
+;; @requires: posix  (fixtures built and copied through .sys.exec)
+;; A mounted root's .sym overwritten in place (same inode, as cp does over
+;; an existing file) by another vocabulary whose records have the same
+;; lengths and one more (#1730): the remount refuses it with corrupt, as
+;; any in-place change but an append, instead of decoding the old
+;; partitions' codes through the new strings.
+(.sys.exec "rm -rf /tmp/rf_sym_inplace && mkdir -p /tmp/rf_sym_inplace") -- 0
+(set A "/tmp/rf_sym_inplace")
+(.db.splayed.set (format "%/c1/2024.01.01/t/" A) (table [k v] (list ['p 'q] [1 2])))
+(.db.splayed.set (format "%/c1/2024.01.02/t/" A) (table [k v] (list ['r 'q] [3 4])))
+(.db.splayed.set (format "%/c2/2024.01.02/t/" A) (table [k v] (list ['r 'q 'z] [3 4 5])))
+(.db.splayed.set (format "%/c2/2024.01.01/t/" A) (table [k v] (list ['p 'q] [1 2])))
+(.sys.exec (format "cp -r %/c1 %/root" A A)) -- 0
+(set P1 (.db.parted.get (format "%/root" A) 't))
+(at P1 'k) -- ['p 'q 'r 'q]
+(.sys.exec (format "cp %/c2/.sym %/root/.sym" A A)) -- 0
+(.db.parted.get (format "%/root" A) 't) !- corrupt
+;; the same with longer strings in another order
+(.db.splayed.set (format "%/d1/2024.01.01/t/" A) (table [k] (list ['apple 'banana 'cherry])))
+(.db.splayed.set (format "%/d2/2024.01.01/t/" A) (table [k] (list ['cherry 'banana 'apple 'date])))
+(.sys.exec (format "cp -r %/d1 %/root2" A A)) -- 0
+(set P2 (.db.parted.get (format "%/root2" A) 't))
+(at P2 'k) -- ['apple 'banana 'cherry]
+(.sys.exec (format "cp %/d2/.sym %/root2/.sym" A A)) -- 0
+(.db.parted.get (format "%/root2" A) 't) !- corrupt
+;; A writer's append seen by a process holding the root (#1730): the
+;; writer replaces the hash sidecar by a new file, so the holder keeps the
+;; hashes of the image it read and the remount takes the append.  A symbol
+;; file over 1 MiB, so the index and its sidecar are used.
+(.db.splayed.set "/tmp/rf_sym_inplace/big/2024.01.01/t" (table [s] (list (as 'SYM (+ 1000000 (til 100000))))) "/tmp/rf_sym_inplace/big/.sym")
+(.sys.exec "[ -f /tmp/rf_sym_inplace/big/.sym.ix ] && [ -f /tmp/rf_sym_inplace/big/.sym.ixh ]") -- 0
+(set Q (.db.parted.get "/tmp/rf_sym_inplace/big" 't))
+(.sys.exec "printf '%s\n' '(.db.splayed.set \"/tmp/rf_sym_inplace/big/2024.01.02/t\" (table [s] (list [newa newb])) \"/tmp/rf_sym_inplace/big/.sym\")' > /tmp/rf_sym_inplace/app.rfl && ./rayforce -f /tmp/rf_sym_inplace/app.rfl > /dev/null") -- 0
+(set Q2 (.db.parted.get "/tmp/rf_sym_inplace/big" 't))
+(count Q2) -- 100002
+(last (at Q2 's)) -- 'newb
+(first (at Q 's)) -- '1000000
+;; The issue's case 2 (review of #1734): a rebuilt root copied over the
+;; live one in place, `cp -r new/. root/`, while the holder took its hashes
+;; from the sidecar (an open after another process wrote the index and the
+;; sidecar for the root) and the old image ends on a block boundary
+;; (100,016 entries = 28 x 3,572): the sidecar written into in place
+;; refuses the remount.
+(.db.splayed.set "/tmp/rf_sym_inplace/e1/2024.01.01/t" (table [s] (list (as 'SYM (+ 10000000 (til 100015))))) "/tmp/rf_sym_inplace/e1/.sym")
+(.db.splayed.set "/tmp/rf_sym_inplace/e2/2024.01.01/t" (table [s] (list (as 'SYM (+ 20000000 (til 100029))))) "/tmp/rf_sym_inplace/e2/.sym")
+(.sys.exec "cp -r /tmp/rf_sym_inplace/e1 /tmp/rf_sym_inplace/eroot && printf '%s\n' '(count (.db.parted.get \"/tmp/rf_sym_inplace/eroot\" (quote t)))' > /tmp/rf_sym_inplace/open.rfl && ./rayforce -f /tmp/rf_sym_inplace/open.rfl > /dev/null") -- 0
+(set E (.db.parted.get "/tmp/rf_sym_inplace/eroot" 't))
+(first (at E 's)) -- '10000000
+(.sys.exec "cp -r /tmp/rf_sym_inplace/e2/. /tmp/rf_sym_inplace/eroot/") -- 0
+(.db.parted.get "/tmp/rf_sym_inplace/eroot" 't) !- corrupt
+(set E 0)
+(set Q 0)
+(set Q2 0)
+(set P1 0)
+(set P2 0)
+(.sys.exec "rm -rf /tmp/rf_sym_inplace") -- 0
