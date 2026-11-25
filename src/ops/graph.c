@@ -2168,6 +2168,8 @@ ray_t* ray_lazy_append(ray_t* lazy, uint16_t opcode) {
         case OP_STDDEV_POP:
         case OP_VAR:
         case OP_VAR_POP:
+        case OP_VAR_K:
+        case OP_VAR_D:
             out_type = RAY_F64; break;
         case OP_SUM:
         case OP_PROD:

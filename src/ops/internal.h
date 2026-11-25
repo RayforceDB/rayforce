@@ -2036,6 +2036,46 @@ ray_t* desc_vec_eager(ray_t* x);
  * in idxop.h).  Set whenever an OP_AVG agg has a non-float input; SUM keeps
  * reading off_sum alone (int64 wraparound is its contract). */
 #define GHT_NEED_SUM128  0x20
+/* The variance family, OP_VAR_K / OP_VAR_D included: one accumulator
+ * (sums about a value k of the group, #1666). */
+static inline bool agg_op_is_var(uint16_t op) {
+    return op == OP_VAR || op == OP_VAR_POP || op == OP_STDDEV || op == OP_STDDEV_POP ||
+           op == OP_VAR_K || op == OP_VAR_D;
+}
+
+/* k minus k rounded to double, exact (its magnitude is at most half an ulp
+ * of k, below 2^10): OP_VAR_D's integer remainder. */
+static inline double ray_var_k_rem(int64_t k) {
+    double kf = (double)k;
+    if (kf >= 9223372036854775808.0)          /* k rounded up to 2^63 */
+        return (double)(int64_t)((uint64_t)k - (uint64_t)INT64_MAX) - 1.0;
+    return (double)(int64_t)((uint64_t)k - (uint64_t)(int64_t)kf);
+}
+
+/* A variance-family result from its shifted state: n non-null values,
+ * s1 = sum(x - k), s2 = sum((x - k)^2), k as an int64 (k_is_f false) or the
+ * bits of a double.  *is_null is set for too few values. */
+static inline double ray_var_final(uint16_t op, int64_t n, double s1, double s2,
+                                   bool k_is_f, int64_t k_bits, bool* is_null) {
+    bool sample = op == OP_VAR || op == OP_STDDEV;
+    *is_null = sample ? n <= 1 : n <= 0;
+    if (*is_null) return 0.0;
+    double dn = (double)n;
+    if (op == OP_VAR_K || op == OP_VAR_D) {
+        double kd;
+        if (k_is_f) memcpy(&kd, &k_bits, sizeof kd); else kd = (double)k_bits;
+        if (op == OP_VAR_K) return kd;
+        return (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+    }
+    double mean = s1 / dn;
+    double vp = s2 / dn - mean * mean;
+    if (vp < 0) vp = 0;
+    if (op == OP_VAR_POP) return vp;
+    if (op == OP_VAR) return vp * dn / (dn - 1);
+    if (op == OP_STDDEV_POP) return sqrt(vp);
+    return sqrt(vp * dn / (dn - 1));
+}
+
 /* VAR/STDDEV about the group's first value (#1666): an int64 block
  * (off_var_k) holds each such slot's value, an integer or a double's bits,
  * and off_sum / off_sumsq then hold the sums of (x - k) and its square. */

@@ -622,11 +622,14 @@ Sample and population variance.
 
 `var`, `var_pop`, `stddev`, `stddev_pop`, `dev` and `dev_pop` give the same
 value, to the bound below, on every route a query takes: keyless or
-grouped, `select` or `update`, in-memory or splayed, any key type, any
-number of workers. Each sums the differences of the values from a value of
-the data (the first value of the group, or of the part of it one worker
-summed) and the squares of those differences; an integer's difference is
-taken exactly in 64-bit integer arithmetic and rounded once. So the error
+grouped, `select` or `update`, in-memory, splayed or partitioned, any key
+type, any number of workers. Each sums the differences of the values from a
+value of the data (the first value of the group, or of the part of it one
+worker or one partition summed) and the squares of those differences; an
+integer's difference is taken exactly in 64-bit integer arithmetic and
+rounded once. The parts combine exactly: each re-centres its sums on the
+others' value, and a partition hands its value, its mean about it and its
+variance to the merge. So the error
 follows the spread of the data, not its magnitude: values near 1e8 or at
 timestamp scale (1e18 nanoseconds) are as accurate as values near 1.
 
