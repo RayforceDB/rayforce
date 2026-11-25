@@ -556,8 +556,20 @@ scalar that a helper the planner does not inline returns, here and under
 count of its argument in two statements, `(sum (hq v))` over the same four
 rows is `16`, `9` over a `where:` keeping three, and under `by:` each
 group's count times its rows ([#1576](https://github.com/RayforceDB/rayforce/issues/1576)).
-`update` folds such a scalar once, as it does an inline or bound one
-([#1682](https://github.com/RayforceDB/rayforce/issues/1682)).
+`update` spreads a scalar the same way, on every route
+([#1682](https://github.com/RayforceDB/rayforce/issues/1682)): with `C`
+bound to `4` over five rows, `(update {n: (sum C) from: t})` writes `20` to
+every row; under a `where:` keeping four rows, `16` to those rows; under
+`by:`, each group's `4` times its rows (`8` and `12` for groups of 2 and 3).
+Whether an argument is one value is decided by what it gives when it runs,
+so every form `select` spreads spreads here: inline code (`(sum (count v))`),
+a helper's scalar (with or without arguments), a cast, an `at`, an `if`, a
+quoted symbol (`(count 'x)` is the row count). A null scalar gives
+`select`'s answers too (`(prod 0Nl)` is null under `by:`). So an aggregate
+gives the same value per row or group in `update` as in `select`.
+That includes `select`'s refusal under `by:` of an aggregate of an aggregate
+of the group: `(update {n: (sum (count v)) from: t by: k})` raises
+`domain`.
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a

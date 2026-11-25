@@ -1,0 +1,72 @@
+;; An update aggregate's scalar argument stands for every row the aggregate
+;; reads, as in select (#1682): inline code, a bound scalar and a helper's
+;; scalar alike, keyless, under where: and under by:.  The same aggregate
+;; gives the same value per row (or group) in update as in select.
+(set T (table [k c v] (list [0 0 1 1 1] [1 5 6 2 7] [10 20 30 40 50])))
+(set C 4)
+(set Cf 2.5)
+(set hq (fn [y] (let q (count y)) q))
+(set hc (fn [y] (let q 1) 4))
+;; keyless: every row takes select's one value
+(at (update {n: (sum C) from: T}) 'n) -- [20 20 20 20 20]
+(at (update {n: (sum (count v)) from: T}) 'n) -- [25 25 25 25 25]
+(at (update {n: (sum (hq v)) from: T}) 'n) -- [25 25 25 25 25]
+(at (update {n: (sum 1) from: T}) 'n) -- [5 5 5 5 5]
+(at (update {n: (count C) from: T}) 'n) -- [5 5 5 5 5]
+(at (update {n: (prod C) from: T}) 'n) -- [1024 1024 1024 1024 1024]
+(at (update {n: (var C) from: T}) 'n) -- [0.0 0.0 0.0 0.0 0.0]
+(at (update {n: (sum Cf) from: T}) 'n) -- [12.5 12.5 12.5 12.5 12.5]
+(at (update {n: (+ 1 (sum C)) from: T}) 'n) -- [21 21 21 21 21]
+(first (at (update {n: (sum C) from: T}) 'n)) -- (first (at (select {n: (sum C) from: T}) 'n))
+;; where: the kept rows take select's value over them
+(at (update {n: (sum C) from: T where: (> v 15)}) 'n) -- [0Nl 16 16 16 16]
+(at (update {n: (sum (count v)) from: T where: (> v 15)}) 'n) -- [0Nl 16 16 16 16]
+(at (update {n: (sum (hc v)) from: T where: (> v 15)}) 'n) -- [0Nl 16 16 16 16]
+(at (update {v: (sum C) from: T where: (> v 15)}) 'v) -- [10 16 16 16 16]
+(last (at (update {n: (sum C) from: T where: (> v 15)}) 'n)) -- (first (at (select {n: (sum C) from: T where: (> v 15)}) 'n))
+;; by: each group's value, written to its rows
+(at (update {n: (sum C) from: T by: k}) 'n) -- [8 8 12 12 12]
+(at (update {n: (sum (hq v)) from: T by: k}) 'n) -- [4 4 9 9 9]
+(at (update {n: (count C) from: T by: k}) 'n) -- [2 2 3 3 3]
+(do (set M T) (update {n: (sum C) from: 'M by: k}) (at M 'n)) -- [8 8 12 12 12]
+(at (select {n: (sum C) from: T by: k}) 'n) -- [8 12]
+;; as select, an aggregate of an aggregate of the group is refused under by:
+(update {n: (sum (count v)) from: T by: k}) !- domain
+(select {n: (sum (count v)) from: T by: k}) !- domain
+;; the values that do not depend on the row count, and aggregates over
+;; columns, are as before
+(at (update {n: (max C) from: T by: k}) 'n) -- [4 4 4 4 4]
+(at (update {n: (avg (count v)) from: T}) 'n) -- [5.0 5.0 5.0 5.0 5.0]
+(at (update {n: (- v (avg C)) from: T}) 'n) -- [6.0 16.0 26.0 36.0 46.0]
+(at (update {n: (sum v) from: T by: k}) 'n) -- [30 30 120 120 120]
+(at (update {n: (sum (+ v c)) from: T where: (> v 15)}) 'n) -- [0Nl 160 160 160 160]
+;; a local named like the first column does not change the row count
+((fn [k] (at (update {n: (sum C) from: T}) 'n)) 9) -- [20 20 20 20 20]
+;; every form select spreads, decided by its value when it runs: a helper of
+;; no argument, an at, an if, a cast, a quoted symbol (#1682 review)
+(set U (table [k i v] (list [2 0 2 1 0 2] [0 1 2 3 4 5] [10 20 30 40 50 60])))
+(set h0 (fn [] (let q 0) 4))
+(at (update {r: (sum (h0)) from: U}) 'r) -- [24 24 24 24 24 24]
+(at (update {r: (sum (h0)) from: U where: (> i 1)}) 'r) -- [0Nl 0Nl 16 16 16 16]
+(at (update {r: (sum (h0)) from: U by: k}) 'r) -- [12 8 12 4 8 12]
+(at (update {r: (sum (at [4] 0)) from: U by: k}) 'r) -- [12 8 12 4 8 12]
+(at (update {r: (sum (if true 4 5)) from: U where: (> i 1)}) 'r) -- [0Nl 0Nl 16 16 16 16]
+(at (update {r: (count 'x) from: U}) 'r) -- [6 6 6 6 6 6]
+(at (update {r: (count 'x) from: U by: k}) 'r) -- [3 2 3 1 2 3]
+;; a cast spreads over the rows the update keeps, not the table's
+(at (update {r: (sum (as 'I64 4)) from: U where: (> i 1)}) 'r) -- [0Nl 0Nl 16 16 16 16]
+(first (at (select {r: (sum (as 'I64 4)) from: U where: (> i 1)}) 'r)) -- 16
+;; a null scalar: the answers select gives, grouped prod included
+(at (update {r: (prod 0Nl) from: U by: k}) 'r) -- [0Nl 0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (select {r: (prod 0Nl) from: U by: k}) 'r) -- [0Nl 0Nl 0Nl]
+(at (update {r: (prod 0Nl) from: U}) 'r) -- [1 1 1 1 1 1]
+(at (update {r: (sum 0Nl) from: U by: k}) 'r) -- [0 0 0 0 0 0]
+(at (update {r: (count 0Nl) from: U where: (> i 1)}) 'r) -- [0Nl 0Nl 4 4 4 4]
+;; a local named like a column wins over it, as in select: a scalar
+;; parameter or let spreads on every route (#1682 review)
+(set fl (fn [v] (list (at (update {r: (sum v) from: U}) 'r) (at (update {r: (sum v) from: U where: (> i 1)}) 'r) (at (update {r: (sum v) from: U by: k}) 'r) (at (update {r: (prod v) from: U by: k}) 'r) (at (update {r: (count v) from: U}) 'r) (at (update {r: (var v) from: U}) 'r))))
+(fl 4) -- (list [24 24 24 24 24 24] [0Nl 0Nl 16 16 16 16] [12 8 12 4 8 12] [64 16 64 4 16 64] [6 6 6 6 6 6] [0.0 0.0 0.0 0.0 0.0 0.0])
+(fl 4) -- (list (take (first (at (select {r: (sum 4) from: U}) 'r)) 6) [0Nl 0Nl 16 16 16 16] [12 8 12 4 8 12] [64 16 64 4 16 64] [6 6 6 6 6 6] [0.0 0.0 0.0 0.0 0.0 0.0])
+((fn [] (do (let v 4) (at (update {r: (sum v) from: U}) 'r)))) -- [24 24 24 24 24 24]
+;; a vector local of the table's length is read as rows, as before
+(at ((fn [v] (update {r: (sum v) from: U by: k})) [1 2 3 4 5 6]) 'r) -- [10 7 10 4 7 10]
