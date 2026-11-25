@@ -437,12 +437,72 @@ typedef struct {
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
     bool dict_borrowed;    /* dict, strings and symbol_ids are a pq_shared_dict's, not freed here */
+    struct pq_seed_list* seed;   /* the seeding's (pq_seed_read): strings collected, rows given entries */
+    const uint32_t* pre;   /* the chunk's rows' positions, seeded (pq_shared_dict.rows): copied, no page read */
 } pq_column;
 /* A cursor is used by one decoder at a time. Flush each PLAIN batch before
  * advancing pages, so dictionary decoding may reuse the same heap scratch. */
 static pq_symbol_scratch* pq_symbols(pq_column* c) {
     if (!c->symbols) c->symbols = ray_alloc_raw(sizeof(*c->symbols));
     return c->symbols;
+}
+/* A symbol column chunk with PLAIN pages as the seeding reads it
+ * (pq_seed_read_values): every string the decoder meets, in order (its
+ * dictionary page's entries, then its rows'), each with the position its
+ * domain already gives it (looked up without the domain's lock), or -1 and
+ * its bytes copied out of the page for the in-order interning
+ * (pq_seed_intern), which gives repeats their first one's position. */
+typedef struct pq_seed_list {
+    char* bytes; size_t used, bcap;
+    uint64_t* off; uint64_t* hash; uint32_t* len; int64_t* pos;
+    int64_t n, cap;
+    ray_sym_domain_t* dom;
+} pq_seed_list;
+static void pq_seed_list_free(pq_seed_list* l) {
+    ray_free_raw(l->bytes); ray_free_raw(l->off); ray_free_raw(l->hash); ray_free_raw(l->len); ray_free_raw(l->pos);
+    memset(l,0,sizeof(*l));
+}
+/* Up to 8192 strings met, in order; entry: each one's entry. */
+static bool pq_seed_add(pq_seed_list* l, int64_t n, const char* const* strs, const size_t* lens, const uint64_t* hashes,
+                        int64_t* entry) {
+    if (l->n+n > l->cap) {
+        int64_t cap = l->cap ? l->cap : 8192;
+        while (cap < l->n+n) cap *= 2;
+        uint64_t* off = ray_alloc_raw((size_t)cap*sizeof(*off)); uint64_t* hash = ray_alloc_raw((size_t)cap*sizeof(*hash));
+        uint32_t* len = ray_alloc_raw((size_t)cap*sizeof(*len)); int64_t* pos = ray_alloc_raw((size_t)cap*sizeof(*pos));
+        if (!off || !hash || !len || !pos) { ray_free_raw(off); ray_free_raw(hash); ray_free_raw(len); ray_free_raw(pos); return false; }
+        if (l->n) {
+            memcpy(off,l->off,(size_t)l->n*sizeof(*off)); memcpy(hash,l->hash,(size_t)l->n*sizeof(*hash));
+            memcpy(len,l->len,(size_t)l->n*sizeof(*len)); memcpy(pos,l->pos,(size_t)l->n*sizeof(*pos));
+        }
+        ray_free_raw(l->off); ray_free_raw(l->hash); ray_free_raw(l->len); ray_free_raw(l->pos);
+        l->off = off; l->hash = hash; l->len = len; l->pos = pos; l->cap = cap;
+    }
+    int64_t* found = l->pos+l->n;
+    if (!ray_sym_domain_find_batch64(l->dom,n,strs,lens,hashes,found))
+        for (int64_t i = 0; i < n; i++) found[i] = -1;
+    size_t need = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (strs[i] && lens[i] > UINT32_MAX) return false;
+        if (found[i] < 0 && strs[i]) need += lens[i];
+    }
+    if (l->used+need > l->bcap) {
+        size_t cap = l->bcap ? l->bcap : 1 << 16;
+        while (cap < l->used+need) cap *= 2;
+        char* b = ray_alloc_raw(cap);
+        if (!b) return false;
+        if (l->used) memcpy(b,l->bytes,l->used);
+        ray_free_raw(l->bytes); l->bytes = b; l->bcap = cap;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t e = l->n+i;
+        size_t len = strs[i] ? lens[i] : 0;
+        l->len[e] = (uint32_t)len; l->hash[e] = hashes[i]; l->off[e] = l->used;
+        if (found[i] < 0 && len) { memcpy(l->bytes+l->used,strs[i],len); l->used += len; }
+        entry[i] = e;
+    }
+    l->n += n;
+    return true;
 }
 typedef struct { int64_t lo, hi; } pq_interval;
 struct ray_parquet {
@@ -463,6 +523,7 @@ struct ray_parquet {
     bool failed, emitted, borrowed, filter_nulls;
     uint8_t compress;     /* the import's compress option (ray_compress_t; 0 = absent) */
     bool symcol;          /* the import's symfile 'column option: a symbol file per column */
+    bool reproducible;    /* the import's reproducible option: chunks with PLAIN pages seeded too (#1706) */
 };
 static bool pq_reserve(uint8_t** buf, size_t* cap, size_t n) {
     if (n > PQ_MAX_PAGE) return false;
@@ -1078,7 +1139,10 @@ static bool pq_dictionary(pq_column* c, pq_schema* s, const uint8_t* payload, si
                     strings[i] = (const char*)c->strings[off+i].p; lengths[i] = c->strings[off+i].n;
                     hashes[i] = ray_hash_bytes(strings[i],lengths[i]);
                 }
-                if (!ray_sym_domain_intern_batch64(s->import_domain,n,strings,lengths,hashes,c->symbol_ids+off)) return false;
+                if (c->seed) {   /* collected: an entry's id is its entry + 1 (0: null) */
+                    if (!pq_seed_add(c->seed,n,strings,lengths,hashes,c->symbol_ids+off)) return false;
+                    for (int64_t i = 0; i < n; i++) c->symbol_ids[off+i]++;
+                } else if (!ray_sym_domain_intern_batch64(s->import_domain,n,strings,lengths,hashes,c->symbol_ids+off)) return false;
             }
         }
         return true;
@@ -1371,6 +1435,12 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
     if (!v || RAY_IS_ERR(v)) { if (v) ray_release(v); return "symbol vector allocation failed"; }
     v->sym_domain = s->import_domain; ray_sym_domain_retain(v->sym_domain);
     v->len = rows; *out = v; uint32_t* dst = ray_data(v);
+    if (c->pre) {   /* seeded: the rows' positions, the pages read already */
+        memcpy(dst,c->pre,(size_t)rows*sizeof(*dst));
+        for (int64_t i = 0; i < rows; i++) if (!dst[i]) { v->attrs |= RAY_ATTR_HAS_NULLS; break; }
+        c->pre += rows;
+        return NULL;
+    }
     const char** strings = scratch->strings; size_t* lengths = scratch->lengths;
     uint64_t* hashes = scratch->hashes;
     int64_t* ids = scratch->ids; int64_t* positions = scratch->positions;
@@ -1413,7 +1483,10 @@ static const char* pq_decode_symbols(pq_column* c, pq_schema* s, ray_t** out, in
                 hashes[count] = ray_hash_bytes(p,len); positions[count++] = at+i;
             }
         }
-        if (count) {
+        if (count && c->seed) {   /* collected: a row's id is its entry + 1 */
+            if (!pq_seed_add(c->seed,count,strings,lengths,hashes,ids)) return "symbol seed allocation failed";
+            for (int64_t i = 0; i < count; i++) dst[positions[i]] = (uint32_t)ids[i]+1;
+        } else if (count) {
             if (!ray_sym_domain_intern_batch64(s->import_domain,count,strings,lengths,hashes,ids)) return "symbol domain allocation failed";
             for (int64_t i = 0; i < count; i++) {
                 if (ids[i] < 0 || (uint64_t)ids[i] >= UINT32_MAX) return "symbol domain exceeds W32";
@@ -1547,6 +1620,9 @@ static const char* pq_decode(pq_column* c, pq_schema* s, ray_t** out, int64_t ro
     return NULL;
 }
 static const char* pq_discard(pq_column* c, pq_schema* s, int64_t rows) {
+    /* seeded rows' positions (pq_shared_dict.rows) stand for the chunk's
+     * pages: stepping over rows steps over theirs, no page read */
+    if (c->pre) { c->pre += rows; return NULL; }
     while (rows) {
         if (ray_interrupted()) return "scan interrupted";
         if (!c->page_left) {
@@ -1800,6 +1876,7 @@ static ray_parquet_t* pq_group_reader(const ray_parquet_t* parent, int64_t group
     r->filter_nulls = parent->filter_nulls;
     r->compress = parent->compress;
     r->symcol = parent->symcol;
+    r->reproducible = parent->reproducible;
     r->text_pattern = parent->text_pattern; r->text_pos = parent->text_pos;
     r->selected = ray_alloc_raw((size_t)r->nselected*sizeof(*r->selected));
     r->cursors = ray_calloc_raw((size_t)r->nselected*sizeof(*r->cursors));
@@ -2007,7 +2084,8 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
         if (!keys || keys->type != RAY_SYM) return pq_error("import option keys must be symbols");
         for (int64_t i = 0; i < keys->len; i++) {
             ray_t* key = ray_sym_vec_cell(keys,i); const char* k = key ? ray_str_ptr(key) : NULL;
-            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows") && strcmp(k,"compress") && strcmp(k,"symfile"))) return pq_error("unknown import option");
+            if (!k || (strcmp(k,"types") && strcmp(k,"strict") && strcmp(k,"rows") && strcmp(k,"compress") && strcmp(k,"symfile") &&
+                       strcmp(k,"reproducible"))) return pq_error("unknown import option");
         }
         ray_t* err = pq_strict_option(r,types);
         ray_t* rows = pq_option(types,"rows");
@@ -2031,6 +2109,16 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
             else r->compress = cmp->b8 ? RAY_COMPRESS_ON : RAY_COMPRESS_OFF;
         }
         if (cmp) ray_release(cmp);
+        ray_t* rep = pq_option(types,"reproducible");
+        if (rep && RAY_IS_ERR(rep)) {            /* the lookup itself failed */
+            if (!err) err = rep; else ray_error_free(rep);
+            rep = NULL;
+        }
+        if (!err && rep) {
+            if (rep->type != -RAY_BOOL) err = ray_error("domain","parquet: reproducible must be true or false");
+            else r->reproducible = rep->b8;
+        }
+        if (rep) ray_release(rep);
         if (!err) {
             ray_symfile_t layout;
             err = ray_symfile_opt_parse(types,&layout);
@@ -2092,9 +2180,10 @@ typedef struct {
     uint8_t* dict; pq_string* strings; int64_t* symbol_ids;
     int64_t count;
     const uint8_t *at, *after; /* the page's start and the chunk past it; NULL: none, read as before */
+    uint32_t* rows;            /* or the chunk's rows' positions (seeded, PLAIN pages), from `at` to `after` */
 } pq_shared_dict;
 static void pq_dicts_free_one(pq_shared_dict* d) {
-    ray_free_raw(d->dict); ray_free_raw(d->strings); ray_free_raw(d->symbol_ids);
+    ray_free_raw(d->dict); ray_free_raw(d->strings); ray_free_raw(d->symbol_ids); ray_free_raw(d->rows);
     memset(d,0,sizeof(*d));
 }
 typedef struct pq_dicts {
@@ -2115,28 +2204,76 @@ static bool pq_chunk_values(const pq_span* mf) {
  * chunks taken into their domains in the order one worker meets them,
  * before the tasks that decode the chunks, so that every task finds its
  * dictionary's strings there and the positions are the same at any worker
- * count.  Only chunks whose strings are all their dictionary page's (the
- * encoding stats say so: pq_chunk_values) are seeded; the others' tasks
- * intern their strings as they meet them, as before.  The pages are read,
- * hashed and looked up in parallel, a window at a time, against the domain
- * as the earlier windows left it, and their strings not found then
- * interned in chunk order.  A page's ids, then its positions, may be kept
- * (`lend`) without its strings, which a symbol column's decode does not
- * read, for the chunk's tasks to borrow instead of reading the page again
- * (within a sixty-fourth of memory, freed as the tasks finish with them). */
+ * count.  A chunk whose strings are all its dictionary page's (the
+ * encoding stats say so: pq_chunk_values) is seeded by that page.  One with
+ * strings outside it (PLAIN pages) is seeded only under the reproducible
+ * option (#1706), by decoding it whole: every string the decoder meets
+ * looked up, those not found copied out in order (pq_seed_list), each row
+ * given its entry; without the option its tasks intern its strings as they
+ * meet them, as before.  The chunks are read,
+ * hashed and looked up (against an import dictionary) in parallel, a
+ * window at a time, against the domain as the earlier windows left it, and
+ * their strings not found then interned in chunk order.  A page's ids, then
+ * its positions, or a decoded chunk's rows' positions (4 bytes a row), may
+ * be kept (`lend`) for the chunk's tasks to borrow instead of reading the
+ * chunk's pages again (within a sixty-fourth of memory, freed as the tasks
+ * finish with them); a symbol column's decode reads nothing else of them. */
 typedef struct {
     ray_parquet_t* r; int64_t c;   /* the reader and the schema column */
     pq_span meta; int64_t rows;    /* the chunk and its group's rows */
-    bool lend;                     /* its ids kept as the positions, in `dict` (no strings) */
+    bool values;                   /* strings outside its dictionary page (the reproducible option): decoded whole */
+    bool lend;                     /* its ids kept as the positions, in `dict` (no strings), or its rows' */
     int64_t count;                 /* the domain's count once its strings are in */
     pq_shared_dict dict;           /* the page read (symbol_ids: the positions, -1 not found yet) */
     const char** strs; size_t* lens; uint64_t* hashes;   /* its strings, while seeding */
     const char* err;               /* the decoder's reason the page cannot be read, or NULL */
-    int64_t dict_entries;          /* its page's (the trace's) */
+    int64_t dict_entries;          /* its page's entries, or its strings met (the trace's) */
+    pq_seed_list* list;            /* values: its strings met, in order */
+    uint32_t* rowpos;              /* values: its rows' entries + 1 (0: null), then their positions */
 } pq_seed_job;
 static void pq_seed_job_scratch_free(pq_seed_job* j) {
     ray_free_raw(j->strs); ray_free_raw(j->lens); ray_free_raw(j->hashes);
     j->strs = NULL; j->lens = NULL; j->hashes = NULL;
+    if (j->list) { pq_seed_list_free(j->list); ray_free_raw(j->list); j->list = NULL; }
+}
+/* A chunk with PLAIN pages decoded whole as the decoder decodes it, its
+ * strings into j->list (pq_seed_list) and its rows' entries into j->rowpos:
+ * j->err on failure, the decoder's reason. */
+static void pq_seed_read_values(pq_seed_job* j, int64_t offset, int64_t bytes, int64_t codec) {
+    ray_parquet_t* r = j->r;
+    pq_column col;
+    memset(&col,0,sizeof(col));
+    col.metadata = j->meta;
+    col.chunk = (pq_cur){r->map+offset,r->map+offset+bytes,false};
+    col.codec = (int)codec; col.chunk_left = j->rows; col.optional = r->schema[j->c].optional;
+    pq_schema s = r->schema[j->c];
+    j->list = ray_calloc_raw(sizeof(*j->list));
+    j->rowpos = ray_alloc_raw((size_t)(j->rows ? j->rows : 1)*sizeof(*j->rowpos));
+    if (!j->list || !j->rowpos) { j->err = "symbol seed allocation failed"; return; }
+    j->list->dom = s.import_domain;
+    col.seed = j->list;
+    j->dict.at = col.chunk.p; j->dict.after = col.chunk.end;   /* the whole chunk, when lent */
+    const char* err = NULL;
+    /* every page decoded (pq_discard would step over whole pages unread) */
+    for (int64_t at = 0; at < j->rows && !err;) {
+        int64_t n = j->rows-at < PQ_BATCH ? j->rows-at : PQ_BATCH;
+        ray_t* v = NULL;
+        err = ray_interrupted() ? "scan interrupted" : pq_decode(&col,&s,&v,n);
+        if (!err) {
+            const uint32_t* e = ray_data(v);
+            memcpy(j->rowpos+at,e,(size_t)n*sizeof(*e));
+            /* the decoder's check on a position 0 that is no null: a
+             * dictionary entry "" (PLAIN pages check their own) */
+            for (int64_t i = 0; s.strict && i < n && !err; i++)
+                if (e[i] && !j->list->len[e[i]-1]) err = "nonnull empty text collides with native null";
+        }
+        if (v) ray_release(v);
+        at += n;
+    }
+    j->dict_entries = j->list->n;
+    ray_free_raw(col.page); ray_free_raw(col.symbols);
+    ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids);
+    if (err) j->err = err;
 }
 /* A chunk's dictionary page read as the decoder reads it (pq_page), its
  * strings hashed and looked up in the domain: j->err on failure. */
@@ -2152,6 +2289,7 @@ static void pq_seed_read(pq_seed_job* j) {
     if (offset < 4 || bytes < 0 || (uint64_t)offset > r->data_end || (uint64_t)bytes > r->data_end-(size_t)offset) {
         j->err = "column chunk outside file data"; return;
     }
+    if (j->values) { pq_seed_read_values(j,offset,bytes,codec); return; }
     pq_column col;
     memset(&col,0,sizeof(col));
     col.codec = (int)codec;
@@ -2167,7 +2305,7 @@ static void pq_seed_read(pq_seed_job* j) {
         else if (!pq_dict_page(&col,&s,f,payload,size,raw,&count))
             err = col.lz4_multichunk ? PQ_MULTICHUNK_ERR : "invalid dictionary page";
     }
-    j->dict = (pq_shared_dict){col.dict,col.strings,NULL,col.dict_count,r->map+offset,chunk.p};
+    j->dict = (pq_shared_dict){col.dict,col.strings,NULL,col.dict_count,r->map+offset,chunk.p,NULL};
     ray_free_raw(col.page); ray_free_raw(col.symbols);
     if (err) { j->err = err; return; }
     j->dict_entries = count;
@@ -2192,33 +2330,62 @@ static void pq_seed_read(pq_seed_job* j) {
  * (grown to the largest chunk) and the first failure. */
 typedef struct {
     int64_t cap; const char** strs; size_t* lens; uint64_t* hashes; uint32_t* h32; int64_t* ids;
+    int64_t* miss; int64_t* added;   /* an import dictionary's: the strings still not found, their positions */
     const char* err; int64_t bad;
 } pq_seed_state;
+/* An import dictionary's lookups of a chunk's strings, across the pool. */
+typedef struct { ray_symimp_t* imp; const char* const* strs; const size_t* lens; const uint64_t* hashes; int64_t* ids; } pq_seed_find;
+static void pq_seed_find_task(void* ptr, uint32_t worker, int64_t start, int64_t end) {
+    (void)worker; pq_seed_find* f = ptr;
+    if (!ray_symimp_find_batch(f->imp,end-start,f->strs+start,f->lens+start,f->hashes+start,f->ids+start))
+        for (int64_t i = start; i < end; i++) f->ids[i] = -1;
+}
 /* A chunk's strings not found into its domain, in the page's order: as one
  * batch, which a file domain probes, deduplicates and appends across the
  * pool (from the coordinator), positions in batch order; an import
  * dictionary takes it in its own batches. */
 static bool pq_seed_intern(pq_seed_job* j, pq_seed_state* st) {
     ray_sym_domain_t* dom = j->r->schema[j->c].import_domain;
-    int64_t* pos = j->dict.symbol_ids, m = 0;
-    for (int64_t i = 0; i < j->dict.count; i++) m += pos[i] < 0;
+    pq_seed_list* l = j->list;
+    int64_t* pos = l ? l->pos : j->dict.symbol_ids, cnt = l ? l->n : j->dict.count, m = 0;
+    for (int64_t i = 0; i < cnt; i++) m += pos[i] < 0;
     if (!m) return true;
     if (m > st->cap) {
         ray_free_raw(st->strs); ray_free_raw(st->lens); ray_free_raw(st->hashes); ray_free_raw(st->h32); ray_free_raw(st->ids);
+        ray_free_raw(st->miss); ray_free_raw(st->added);
         st->strs = ray_alloc_raw((size_t)m*sizeof(*st->strs)); st->lens = ray_alloc_raw((size_t)m*sizeof(*st->lens));
         st->hashes = ray_alloc_raw((size_t)m*sizeof(*st->hashes)); st->h32 = ray_alloc_raw((size_t)m*sizeof(*st->h32));
         st->ids = ray_alloc_raw((size_t)m*sizeof(*st->ids));
-        st->cap = st->strs && st->lens && st->hashes && st->h32 && st->ids ? m : 0;
+        st->miss = ray_alloc_raw((size_t)m*sizeof(*st->miss)); st->added = ray_alloc_raw((size_t)m*sizeof(*st->added));
+        st->cap = st->strs && st->lens && st->hashes && st->h32 && st->ids && st->miss && st->added ? m : 0;
         if (!st->cap) return false;
     }
-    for (int64_t i = 0, k = 0; i < j->dict.count; i++) if (pos[i] < 0) {
-        st->strs[k] = j->strs[i]; st->lens[k] = j->lens[i];
-        st->hashes[k] = j->hashes[i]; st->h32[k] = (uint32_t)j->hashes[i]; k++;
+    for (int64_t i = 0, k = 0; i < cnt; i++) {
+        if (pos[i] >= 0) continue;
+        st->strs[k] = l ? (l->bytes ? l->bytes+l->off[i] : "") : j->strs[i];
+        st->lens[k] = l ? l->len[i] : j->lens[i];
+        st->hashes[k] = l ? l->hash[i] : j->hashes[i];
+        st->h32[k] = (uint32_t)st->hashes[k]; k++;
     }
     ray_symimp_t* imp = ray_sym_domain_import(dom);
-    bool ok = imp ? ray_symimp_add_batch(imp,m,st->strs,st->lens,st->hashes,st->ids)
-                  : ray_sym_domain_intern_batch(dom,m,st->strs,st->lens,st->h32,st->ids);
-    for (int64_t i = 0, k = 0; ok && i < j->dict.count; i++) if (pos[i] < 0) pos[i] = st->ids[k++];
+    bool ok;
+    if (imp && j->values) {
+        /* looked up again, across the pool, against what the chunks before
+         * it added since the window was read; only the rest taken in order
+         * under the dictionary's lock */
+        pq_seed_find f = {imp,st->strs,st->lens,st->hashes,st->ids};
+        ray_pool_t* pool = ray_pool_get();
+        if (ray_pool_par_dispatch_ok(pool,m,16384)) ray_pool_dispatch(pool,pq_seed_find_task,&f,m);
+        else pq_seed_find_task(&f,0,0,m);
+        int64_t q = 0;
+        for (int64_t k = 0; k < m; k++) if (st->ids[k] < 0) {
+            st->miss[q] = k; st->strs[q] = st->strs[k]; st->lens[q] = st->lens[k]; st->hashes[q] = st->hashes[k]; q++;
+        }
+        ok = !q || ray_symimp_add_batch(imp,q,st->strs,st->lens,st->hashes,st->added);
+        for (int64_t k = 0; ok && k < q; k++) st->ids[st->miss[k]] = st->added[k];
+    } else if (imp) ok = ray_symimp_add_batch(imp,m,st->strs,st->lens,st->hashes,st->ids);
+    else ok = ray_sym_domain_intern_batch(dom,m,st->strs,st->lens,st->h32,st->ids);
+    for (int64_t i = 0, k = 0; ok && i < cnt; i++) if (pos[i] < 0) pos[i] = st->ids[k++];
     return ok;
 }
 /* The chunks jobs[b0, b1) interned in order, until the first failure. */
@@ -2228,6 +2395,20 @@ static void pq_seed_commit(pq_seed_job* jobs, int64_t b0, int64_t b1, pq_seed_st
         if (j->err) { st->err = j->err; st->bad = t; break; }
         if (!pq_seed_intern(j,st)) { st->err = "symbol domain allocation failed"; st->bad = t; break; }
         j->count = ray_sym_domain_count(j->r->schema[j->c].import_domain);
+        if (j->values) {   /* the rows' entries to their positions */
+            const int64_t* pos = j->list->pos;
+            bool fits = true;
+            for (int64_t i = 0; i < j->rows; i++) {
+                int64_t p = j->rowpos[i] ? pos[j->rowpos[i]-1] : 0;
+                fits &= p >= 0 && (uint64_t)p < UINT32_MAX;
+                j->rowpos[i] = (uint32_t)p;
+            }
+            pq_seed_job_scratch_free(j);
+            if (!fits) { st->err = "symbol domain exceeds W32"; st->bad = t; break; }
+            if (j->lend) { j->dict.rows = j->rowpos; j->rowpos = NULL; }
+            else { ray_free_raw(j->rowpos); j->rowpos = NULL; pq_dicts_free_one(&j->dict); }
+            continue;
+        }
         pq_seed_job_scratch_free(j);
         if (!j->lend) { pq_dicts_free_one(&j->dict); continue; }
         /* lent: its ids, now the positions, are all a symbol column's
@@ -2264,8 +2445,13 @@ static const char* pq_seed_chunks(pq_seed_job* jobs, int64_t n, int64_t* bad) {
     ray_pool_t* pool = ray_pool_get();
     int64_t win = pool ? 2*(int64_t)ray_pool_total_workers(pool) : 1;
     if (win < 1) win = 1;
+    /* import dictionaries: interned while the pool reads the next window,
+     * unless a chunk with PLAIN pages is seeded (the reproducible option):
+     * then on the coordinator, which looks the strings up again across the
+     * pool before taking them in order (pq_seed_intern) */
     bool pipe = pool != NULL;
-    for (int64_t t = 0; t < n && pipe; t++) pipe = ray_sym_domain_import(jobs[t].r->schema[jobs[t].c].import_domain) != NULL;
+    for (int64_t t = 0; t < n && pipe; t++)
+        pipe = !jobs[t].values && ray_sym_domain_import(jobs[t].r->schema[jobs[t].c].import_domain) != NULL;
     pq_seed_state st = {0};
     st.bad = -1;
     const char* err = NULL;
@@ -2283,9 +2469,11 @@ static const char* pq_seed_chunks(pq_seed_job* jobs, int64_t n, int64_t* bad) {
     if (!err && st.err) { err = st.err; *bad = st.bad; }
     for (int64_t t = 0; t < n; t++) {
         pq_seed_job_scratch_free(&jobs[t]);
+        ray_free_raw(jobs[t].rowpos); jobs[t].rowpos = NULL;
         if (err) pq_dicts_free_one(&jobs[t].dict);
     }
     ray_free_raw(st.ids); ray_free_raw(st.strs); ray_free_raw(st.lens); ray_free_raw(st.hashes); ray_free_raw(st.h32);
+    ray_free_raw(st.miss); ray_free_raw(st.added);
     return err;
 }
 static void pq_dicts_free_group(pq_dicts* ds, int64_t t) {
@@ -2310,6 +2498,7 @@ static void pq_lend_dicts(const pq_native_work* w, ray_parquet_t* r, int64_t t) 
         const pq_shared_dict* d = &w->dicts->d[t*w->dicts->nsel+i];
         pq_column* c = &r->cursors[i];
         if (!d->after || c->have_dict || c->chunk.p != d->at || d->after > c->chunk.end) continue;
+        if (d->rows) { c->pre = d->rows; continue; }   /* its rows' positions: no page read */
         c->chunk.p = d->after;
         c->dict = d->dict; c->dict_cap = 0; c->strings = d->strings; c->symbol_ids = d->symbol_ids;
         c->dict_count = d->count; c->have_dict = true; c->dict_borrowed = true;
@@ -2676,7 +2865,7 @@ static pq_dicts* pq_read_dicts(ray_parquet_t* const* rs, int nrs, int64_t nflat)
                 ok = pq_dict_page(&col,&sch,pf,payload,size,raw,&count);
                 ray_free_raw(col.symbols);
                 if (!ok) { ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); break; }
-                ds->d[t*nsel+i] = (pq_shared_dict){col.dict,col.strings,col.symbol_ids,col.dict_count,r->map+dict,cur.p};
+                ds->d[t*nsel+i] = (pq_shared_dict){col.dict,col.strings,col.symbol_ids,col.dict_count,r->map+dict,cur.p,NULL};
             }
             if (ds->counts) ds->counts[t+1] = ray_sym_domain_count(domain);
         }
@@ -2732,15 +2921,20 @@ static pq_dicts* pq_seed_groups(ray_parquet_t* const* rs, int nrs, int64_t nflat
                 int64_t c = r->selected[i]; pq_span mf[17];
                 if (!r->schema[c].import_domain) continue;
                 if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
-                /* strings outside the dictionary page: interned by the
-                 * tasks as they meet them, so no header counts are kept */
-                if (pq_chunk_values(mf)) { plain = true; continue; }
+                /* its positions kept for its tasks (a page's ids, or a
+                 * chunk with PLAIN pages its rows') while those kept stay
+                 * within a share of memory */
+                bool values = pq_chunk_values(mf);
+                /* strings outside the dictionary page without the option:
+                 * interned by the tasks as they meet them, so no header
+                 * counts are kept */
+                if (values && !r->reproducible) { plain = true; continue; }
                 int64_t draw = 0, entries = 0, dict = pq_get(mf[11],-1);
-                /* its page kept for its tasks while those kept stay within
-                 * a share of memory */
-                bool lend = pq_dict_header(r,dict,&draw,&entries) && lent + entries*(int64_t)sizeof(int64_t) <= budget;
-                if (lend) lent += entries*(int64_t)sizeof(int64_t);
-                jobs[n] = (pq_seed_job){.r = r, .c = c, .meta = cols[c], .rows = rows, .lend = lend};
+                int64_t keep = values ? rows*(int64_t)sizeof(uint32_t)
+                             : pq_dict_header(r,dict,&draw,&entries) ? entries*(int64_t)sizeof(int64_t) : INT64_MAX;
+                bool lend = keep <= budget - lent;
+                if (lend) lent += keep;
+                jobs[n] = (pq_seed_job){.r = r, .c = c, .meta = cols[c], .rows = rows, .values = values, .lend = lend};
                 slot[n] = t*nsel+i;
                 last[t] = n++;
             }
@@ -3160,6 +3354,7 @@ static const char* pq_direct_lend(const pq_direct_work* w, ray_parquet_t* r, int
     if (err) { r->failed = true; return err; }
     pq_column* k = &r->cursors[0];
     if (k->have_dict || k->chunk.p != d->at || d->after > k->chunk.end) return NULL;
+    if (d->rows) { k->pre = d->rows; return NULL; }   /* its rows' positions: no page read */
     if (spare) { ray_free_raw(spare->dict); spare->dict = k->dict; spare->dict_cap = k->dict_cap; }
     else ray_free_raw(k->dict);
     k->chunk.p = d->after;
@@ -3389,14 +3584,18 @@ static const char* pq_seed_direct(ray_parquet_t* r, const int64_t* order, int64_
             int64_t c = order[i]; pq_span mf[17];
             if (!pq_fields(cols[c],mf,17)) { err = "invalid column metadata"; *bad_col = c; break; }
             if (!r->schema[c].import_domain) { err = "symbol column without an import dictionary"; *bad_col = c; break; }
-            if (pq_chunk_values(mf)) continue;   /* its tasks intern its strings as they meet them */
-            /* its page kept for its task while those kept stay within a
-             * share of memory */
+            /* its positions kept for its task (a page's ids, or a chunk with
+             * PLAIN pages its rows') while those kept stay within a share
+             * of memory */
+            bool values = pq_chunk_values(mf);
+            if (values && !r->reproducible) continue;   /* its tasks intern its strings as they meet them */
             int64_t draw = 0, entries = 0;
-            bool lend = ds && pq_dict_header(r,pq_get(mf[11],-1),&draw,&entries) && lent + entries*(int64_t)sizeof(int64_t) <= budget;
-            if (lend) lent += entries*(int64_t)sizeof(int64_t);
+            int64_t keep = values ? rows*(int64_t)sizeof(uint32_t)
+                         : pq_dict_header(r,pq_get(mf[11],-1),&draw,&entries) ? entries*(int64_t)sizeof(int64_t) : INT64_MAX;
+            bool lend = ds && keep <= budget - lent;
+            if (lend) lent += keep;
             slot[n] = g*r->ncols+c;
-            jobs[n++] = (pq_seed_job){.r = r, .c = c, .meta = cols[c], .rows = rows, .lend = lend};
+            jobs[n++] = (pq_seed_job){.r = r, .c = c, .meta = cols[c], .rows = rows, .values = values, .lend = lend};
         }
     }
     int64_t bad;

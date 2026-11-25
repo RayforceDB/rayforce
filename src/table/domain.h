@@ -354,6 +354,14 @@ void ray_sym_domain_test_hook(void (*fn)(int event, const char* path));
 /* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the
  * import dictionary keys on them (the 32-bit entry point hashes its strings
  * again for it); the other domains take their low 32 bits. */
+/* The positions of the strings the domain holds, -1 for the others (or
+ * for any it could not tell), adding none: an import dictionary's or a
+ * file domain's lock-free lookups, safe from several threads at once and
+ * beside an intern.  False when nothing was looked up (no index yet,
+ * another kind of domain). */
+bool ray_sym_domain_find_batch64(ray_sym_domain_t* dom, int64_t n,
+                                 const char* const* strs, const size_t* lens,
+                                 const uint64_t* hashes, int64_t* out_pos);
 bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
                                    const char* const* strs, const size_t* lens,
                                    const uint64_t* hashes, int64_t* out_pos);
