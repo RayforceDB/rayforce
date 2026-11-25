@@ -7,6 +7,11 @@
 (set ucv_bare (map (fn [s] (== 0 (count (at s 'usage)))) ucv_sigs))
 ;; builtins without a usage line: none
 (map (fn [s] (at s 'name)) (filter ucv_sigs (and ucv_builtin ucv_bare))) -- (list)
+;; and every one has its one-line summary too (#1737), from the same table;
+;; a name that is no builtin has none, never an invented one
+(set ucv_nosum (map (fn [s] (== 0 (count (at s 'summary)))) ucv_sigs))
+(map (fn [s] (at s 'name)) (filter ucv_sigs (and ucv_builtin ucv_nosum))) -- (list)
+(count (filter ucv_sigs (and (not ucv_builtin) (not ucv_nosum)))) -- 0
 ;; the names that have no usage line are namespace roots or the literals
 (set ucv_rest (filter ucv_sigs ucv_bare))
 (asc (distinct (map (fn [s] (at s 'kind)) ucv_rest))) -- ['literal 'namespace]

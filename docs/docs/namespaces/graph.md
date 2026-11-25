@@ -8,25 +8,25 @@ All algorithm wrappers follow the same template: validate the handle, fold posit
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.graph.build`](#graph-build) | variadic | — | Build a graph handle from an edge table. |
-| [`.graph.free`](#graph-free) | unary | — | Release a graph handle (idempotent). |
-| [`.graph.info`](#graph-info) | unary | — | Dict of n_nodes / n_edges / sorted / has_weights. |
-| [`.graph.expand`](#graph-expand) | variadic | — | 1-hop neighbour expansion from a seed node. |
-| [`.graph.var-expand`](#graph-var-expand) | variadic | — | BFS variable-depth expansion with optional path tracking. |
-| [`.graph.dfs`](#graph-dfs) | variadic | — | Depth-first traversal from a seed node. |
-| [`.graph.random-walk`](#graph-random-walk) | variadic | — | Uniform random walk from a seed node. |
-| [`.graph.shortest-path`](#graph-shortest-path) | variadic | — | BFS shortest path between two nodes. |
-| [`.graph.dijkstra`](#graph-dijkstra) | variadic | — | Weighted shortest paths from a source (optionally to a target). |
-| [`.graph.k-shortest`](#graph-k-shortest) | variadic | — | Yen's k shortest weighted paths between two nodes. |
-| [`.graph.pagerank`](#graph-pagerank) | variadic | — | Iterative PageRank scores. |
-| [`.graph.degree`](#graph-degree) | variadic | — | In/out/total degree per node. |
-| [`.graph.betweenness`](#graph-betweenness) | variadic | — | Brandes betweenness centrality (exact or sampled). |
-| [`.graph.closeness`](#graph-closeness) | variadic | — | Closeness centrality (exact or sampled). |
-| [`.graph.connected`](#graph-connected) | variadic | — | Connected components via label propagation. |
-| [`.graph.louvain`](#graph-louvain) | variadic | — | Louvain modularity-based community detection. |
-| [`.graph.cluster`](#graph-cluster) | variadic | — | Local clustering coefficient per node. |
-| [`.graph.mst`](#graph-mst) | variadic | — | Minimum spanning tree (Kruskal). |
-| [`.graph.topsort`](#graph-topsort) | variadic | — | Topological sort (Kahn). |
+| [`.graph.build`](#graph-build) | variadic | — | Build a graph handle from an edge table |
+| [`.graph.free`](#graph-free) | unary | — | Release a graph handle (idempotent) |
+| [`.graph.info`](#graph-info) | unary | — | Dict of n_nodes / n_edges / sorted / has_weights |
+| [`.graph.expand`](#graph-expand) | variadic | — | 1-hop neighbour expansion from a seed node |
+| [`.graph.var-expand`](#graph-var-expand) | variadic | — | BFS variable-depth expansion with optional path tracking |
+| [`.graph.dfs`](#graph-dfs) | variadic | — | Depth-first traversal from a seed node |
+| [`.graph.random-walk`](#graph-random-walk) | variadic | — | Uniform random walk from a seed node |
+| [`.graph.shortest-path`](#graph-shortest-path) | variadic | — | BFS shortest path between two nodes |
+| [`.graph.dijkstra`](#graph-dijkstra) | variadic | — | Weighted shortest paths from a source (optionally to a target) |
+| [`.graph.k-shortest`](#graph-k-shortest) | variadic | — | Yen's k shortest weighted paths between two nodes |
+| [`.graph.pagerank`](#graph-pagerank) | variadic | — | Iterative PageRank scores |
+| [`.graph.degree`](#graph-degree) | variadic | — | In/out/total degree per node |
+| [`.graph.betweenness`](#graph-betweenness) | variadic | — | Brandes betweenness centrality (exact or sampled) |
+| [`.graph.closeness`](#graph-closeness) | variadic | — | Closeness centrality (exact or sampled) |
+| [`.graph.connected`](#graph-connected) | variadic | — | Connected components via label propagation |
+| [`.graph.louvain`](#graph-louvain) | variadic | — | Louvain modularity-based community detection |
+| [`.graph.cluster`](#graph-cluster) | variadic | — | Local clustering coefficient per node |
+| [`.graph.mst`](#graph-mst) | variadic | — | Minimum spanning tree (Kruskal) |
+| [`.graph.topsort`](#graph-topsort) | variadic | — | Topological sort (Kahn) |
 
 ## `.graph.build` { #graph-build }
 

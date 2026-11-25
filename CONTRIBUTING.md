@@ -113,15 +113,23 @@ reference drifts further from the code with every PR that skips this.
 
 For a new builtin that means:
 
-1. Add its name to the right arity list under **Registered Builtin Surface** in
-   `docs/docs/reference/all-functions.md`. That section is the complete list
-   of registered names and is maintained by hand.
-2. Give it a row in the matching category table on the same page, with its
-   arity, flags (`restricted`, `special`, ...) and a working example.
-3. If it belongs to a namespace (`.idx.*`, `.parquet.*`, ...), document it on
-   that namespace's page under `docs/docs/namespaces/` as well, and add the
-   usage line in `src/lang/sig.c` so error messages can show its call shape.
-4. If it is blocked under `-U`, add it to the restricted-mode summary in
+1. Give it an entry in `src/lang/sig.c`: its usage line (the call shape error
+   messages, `.repl.signature` and `:h` show) and its one-line summary (what it
+   does). The file is the one source of both: the summary is what
+   `.repl.signature` and `:h` answer, and the reference pages are generated
+   from it. A `/* docs: ... */` comment after the entry adds more text to the
+   builtin's row in `docs/docs/reference/all-functions.md` only.
+2. Run `make docs-gen`. It writes the **Registered Builtin Surface** section of
+   `docs/docs/reference/all-functions.md` (every registered name, by arity,
+   with its summary) and the Description cell of every row for the builtin in
+   the "Function" tables of that page and of `docs/docs/namespaces/*.md`.
+   Commit what it writes; do not edit those cells by hand.
+3. Give it a row in the matching category table of the reference page, with
+   its arity, flags (`restricted`, `special`, ...) and a working example, and
+   run `make docs-gen` again to fill its description.
+4. If it belongs to a namespace (`.idx.*`, `.parquet.*`, ...), document it on
+   that namespace's page under `docs/docs/namespaces/` as well.
+5. If it is blocked under `-U`, add it to the restricted-mode summary in
    `docs/docs/namespaces/index.md`.
 
 Run the check before opening the PR:
@@ -130,11 +138,13 @@ Run the check before opening the PR:
 make docs-check     # python3 scripts/check-builtin-docs.py
 ```
 
-It fails when a registered builtin is missing from the surface list, or when
-the list names something that is no longer registered, and when a name is
-listed under a different arity than its registration call (`register_unary`,
-`register_binary`, `register_vary`). It checks names and arities only;
-whether a description is right is for the author and the reviewer.
+It fails when a registered builtin has no summary in `src/lang/sig.c`, when a
+page differs from what `make docs-gen` writes, when a registered builtin is
+missing from the surface list, or when the list names something that is no
+longer registered or lists it under a different arity than its registration
+call (`register_unary`, `register_binary`, `register_vary`). Whether a summary
+is right is for the author and the reviewer; `system/usage_coverage` checks
+that every builtin has one from the running engine as well.
 
 ## Local build notes
 

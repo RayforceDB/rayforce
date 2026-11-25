@@ -14,12 +14,12 @@ The `get` builtins memory-map every column file — load is constant-time regard
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.db.splayed.set`](#db-splayed-set) | variadic | restricted | Save a table to a splayed directory. |
-| [`.db.splayed.append`](#db-splayed-append) | variadic | restricted | Append a table's rows to a splayed table on disk without loading it. |
-| [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd; compressed columns decode on first read). |
-| [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
-| [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
-| [`.db.parted.fill`](#db-parted-fill) | variadic | restricted | Fill missing tables across a parted db's partitions. |
+| [`.db.splayed.set`](#db-splayed-set) | variadic | restricted | Save table as splayed columns to a directory |
+| [`.db.splayed.append`](#db-splayed-append) | variadic | restricted | Append a table's rows to a splayed table on disk without loading it |
+| [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load splayed table from a directory |
+| [`.db.parted.get`](#db-parted-get) | variadic | — | Load partitioned table from root directory |
+| [`.db.parted.tables`](#db-parted-tables) | variadic | — | List table names under a parted root (from the most recent partition) |
+| [`.db.parted.fill`](#db-parted-fill) | variadic | restricted | Backfill missing tables across a parted db's partitions |
 
 ## `.db.splayed.set` { #db-splayed-set }
 

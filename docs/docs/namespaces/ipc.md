@@ -12,13 +12,13 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages. A c
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a connection (optional connect timeout or options dict); return an i64 handle. |
-| [`.ipc.send`](#ipc-send) | variadic | restricted | Send a message synchronously (optional deadline); return the server's result. |
-| [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
-| [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
-| [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. Given a live handle, that connection's view, transport included. |
-| [`.ipc.handles`](#ipc-handles) | variadic | — | Every open connection as a table: the columns of `(.ipc.handle h)` and `opened`. |
-| [`.ipc.transport`](#ipc-transport) | variadic | restricted | Read or set the process's transport policy: `auto`, `tcp`, `shm` or `rdma`. |
+| [`.ipc.open`](#ipc-open) | variadic | restricted | Open a connection to host:port (optional connect timeout in ms, or an options dict with `timeout`, `compress`, `keepalive`, `transport`), returns handle |
+| [`.ipc.send`](#ipc-send) | variadic | restricted | Send a value over an IPC handle (sync request); optional third argument is a deadline in ms |
+| [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object |
+| [`.ipc.close`](#ipc-close) | unary | restricted | Close an IPC connection handle |
+| [`.ipc.handle`](#ipc-handle) | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside |
+| [`.ipc.handles`](#ipc-handles) | variadic | — | Every open IPC connection of this process as a table, one row per connection in handle order: the columns of `(.ipc.handle h)` and `opened`, when it was accepted or opened. Allowed under `-U` |
+| [`.ipc.transport`](#ipc-transport) | variadic | restricted | Read or set the transport policy, `'auto`, `'tcp`, `'shm` or `'rdma`: what this process offers as a server and asks for as a client |
 
 ## `.ipc.open` { #ipc-open }
 

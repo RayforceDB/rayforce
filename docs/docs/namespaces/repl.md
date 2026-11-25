@@ -11,12 +11,12 @@ Attach the local interactive REPL to a remote Rayforce server. While attached, e
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.repl.connect`](#repl-connect) | unary | restricted | Open an IPC session and route REPL input to it. |
-| [`.repl.disconnect`](#repl-disconnect) | variadic | restricted | Detach and close the active remote session. |
-| [`.repl.complete`](#repl-complete) | unary | — | Names the engine knows that start with a prefix, sorted. |
-| [`.repl.signature`](#repl-signature) | unary | — | How a named global is called: kind, convention, parameters, usage. |
-| [`.repl.definition`](#repl-definition) | unary | restricted | Where the function a named global holds was written. |
-| [`.repl.inspect`](#repl-inspect) | variadic | — | Kind, type and length of a named global or member path, with its member or column names and types. |
+| [`.repl.connect`](#repl-connect) | unary | restricted | Open an IPC session and route REPL input to it |
+| [`.repl.disconnect`](#repl-disconnect) | variadic | restricted | Detach and close the active remote session |
+| [`.repl.complete`](#repl-complete) | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix |
+| [`.repl.signature`](#repl-signature) | unary | — | How a named global is called: kind, calling convention, special form, lambda parameters, documented usage; calls nothing |
+| [`.repl.definition`](#repl-definition) | unary | restricted | Where the function a named global holds was written: file, `(fn …)` span, text, and a digest of the loaded source |
+| [`.repl.inspect`](#repl-inspect) | variadic | — | Kind, type and length of a named global or member path, with its dict member or table column names and types, read from headers only |
 
 ## `.repl.connect` { #repl-connect }
 
@@ -83,6 +83,7 @@ Signature: `(.repl.signature name)`, `name` a symbol. It returns a dict describi
 | `params` | a lambda's parameter names, a `sym` vector; empty otherwise |
 | `arity` | a lambda's parameter count; `0Nl` for a builtin |
 | `usage` | a builtin's documented call forms, the text its errors cite; `""` when it has none |
+| `summary` | a builtin's one-line summary of what it does, the text the [function reference](../reference/all-functions.md) shows; `""` for anything else (a lambda, a value, a namespace root, a literal, a missing name): never invented |
 | `builtin` | the builtin's own name, read from the function object: also when reached through an alias, and the held builtin's name when a builtin name was rebound to another builtin; the empty symbol otherwise |
 | `restricted` | whether the builtin is refused under `-U` |
 
@@ -91,7 +92,7 @@ A builtin's calling convention is not the set of forms it accepts. `min` is unar
 ```lisp
 (set add (fn [a b] (+ a b)))
 (.repl.signature 'add)
-;; {name:add bound:true callable:true kind:lambda special:false params:[a b] arity:2 usage:"" builtin:' restricted:false}
+;; {name:add bound:true callable:true kind:lambda special:false params:[a b] arity:2 usage:"" summary:"" builtin:' restricted:false}
 (at (.repl.signature 'min) 'usage)
 ;; "(min <x: vector, atom or list>) or (min <a: num> <b: num>)"
 (at (.repl.signature 'if) 'special)     ;; true

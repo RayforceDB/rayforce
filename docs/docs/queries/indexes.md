@@ -235,10 +235,10 @@ This design has three useful properties:
 
 | Function | Syntax | Description |
 |---|---|---|
-| `.idx.zone` | `(.idx.zone v)` | Attach a min/max + null-count zonemap |
-| `.idx.hash` | `(.idx.hash v)` | Attach a chained hash table for eq lookups |
-| `.idx.sort` | `(.idx.sort v)` | Attach an ascending row-id permutation |
-| `.idx.bloom` | `(.idx.bloom v)` | Attach an *m*-bit Bloom filter |
-| `.idx.drop` | `(.idx.drop v)` | Remove any attached index |
-| `.idx.has?` | `(.idx.has? v)` | True iff `v` carries an index |
-| `.idx.info` | `(.idx.info v)` | Dict of kind + length + per-kind stats, or null |
+| `.idx.zone` | `(.idx.zone v)` | Attach a zone (min/max) index |
+| `.idx.hash` | `(.idx.hash v)` | Attach a hash-set index |
+| `.idx.sort` | `(.idx.sort v)` | Attach a sorted-permutation index |
+| `.idx.bloom` | `(.idx.bloom v)` | Attach a Bloom filter |
+| `.idx.drop` | `(.idx.drop v)` | Detach whatever index the vector carries |
+| `.idx.has?` | `(.idx.has? v)` | True if the vector carries any index |
+| `.idx.info` | `(.idx.info v)` | Dict describing the attached index, or a table column's format |

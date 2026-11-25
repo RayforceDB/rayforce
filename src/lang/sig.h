@@ -32,6 +32,10 @@
  * builtin without an entry. */
 const char* ray_sig_usage(const char* name);
 
+/* One-line summary of a builtin: what it does (#1737), e.g. "Count of
+ * elements".  NULL for a name without an entry. */
+const char* ray_sig_summary(const char* name);
+
 /* An error a builtin returned for a bad call gets the builtin's usage line in the
  * thread's error usage (ray_error_usage), a field of its own next to the message:
  * the caller sees which arguments are expected, of which types and in which order, and

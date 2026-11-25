@@ -78,6 +78,16 @@ zsg_calls -- 0
 (at (.repl.signature 'false) 'bound) -- false
 (at (.repl.signature 'zsg_nosuch) 'bound) -- false
 (at (.repl.signature 'zsg_D.nosuch) 'bound) -- false
+;; summary: a builtin's one line from src/lang/sig.c (#1737), the held
+;; builtin's through an alias; "" for anything else, never invented
+(at (.repl.signature 'count) 'summary) -- "Count of elements"
+(at (.repl.signature 'zsg_m) 'summary) -- (at (.repl.signature 'min) 'summary)
+(at (.repl.signature '.sys.querylog.enable) 'summary) -- "Toggle query-statistics logging; returns new state"
+(at (.repl.signature 'zsg_add) 'summary) -- ""
+(at (.repl.signature 'zsg_v) 'summary) -- ""
+(at (.repl.signature '.sys) 'summary) -- ""
+(at (.repl.signature 'true) 'summary) -- ""
+(at (.repl.signature 'zsg_nosuch) 'summary) -- ""
 ;; the argument is a symbol
 (.repl.signature "zsg_add") !- type
 (.repl.signature 42) !- type

@@ -1023,10 +1023,10 @@ To remove rows matching a predicate, use `select` with the inverse condition:
 
 | Form | Syntax | Description |
 |---|---|---|
-| `select` | `(select {from: t col: expr where: pred by: key asc: col desc: col take: n})` | Query with projection, filtering, grouping, sorting, and limiting |
-| `update` | `(update {col: expr from: 't where: pred})` | In-place column mutation |
-| `insert` | `(insert t rows)` or `(insert 't rows)` | Append rows (list, dict, or table) |
-| `upsert` | `(upsert t key-idx rows)` | Insert or update by key column |
+| `select` | `(select {from: t col: expr where: pred by: key asc: col desc: col take: n})` | Query table with optional filter, projection, grouping, and aggregation |
+| `update` | `(update {col: expr from: 't where: pred})` | Add or modify columns: `{from: 't …}` updates the named table in place, `{from: t …}` returns a new table |
+| `insert` | `(insert t rows)` or `(insert 't rows)` | Append rows, or grow a parted table's in-memory live tail with an explicit partition key |
+| `upsert` | `(upsert t key-idx rows)` | Insert or update flat-table rows by key match (target, key, row); a null key matches a null-keyed row for every key type, and a key value the key column cannot hold is a `domain` error |
 | *delete rows* | `(select {from: t where: (not pred)})` | Remove matching rows via inverse filter |
 
 !!! note "Execution model"

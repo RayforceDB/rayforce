@@ -308,6 +308,7 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
 
     ray_t* kind = sig_field(d, "kind");
     ray_t* usage = sig_field(d, "usage");
+    ray_t* summary = sig_field(d, "summary");
     ray_t* params = sig_field(d, "params");
     ray_t* own = sig_field(d, "builtin");
     const char* k = "";
@@ -347,6 +348,9 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
             fprintf(stdout, "  %.*s\n", (int)(ul - s), u + s);
             if (color) fprintf(stdout, "\033[0m");
         }
+        /* what it does, under the forms */
+        if (summary && !RAY_IS_ERR(summary) && summary->type == -RAY_STR && ray_str_len(summary) > 0)
+            fprintf(stdout, "  %.*s\n", (int)ray_str_len(summary), ray_str_ptr(summary));
     } else if (lambda) {
         fprintf(stdout, ": lambda\n");
         if (color) fprintf(stdout, "\033[90m");
@@ -373,7 +377,7 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
     } else {
         fprintf(stdout, ": not defined\n");
     }
-    ray_t* held[] = { kind, usage, params, own, d };
+    ray_t* held[] = { kind, usage, summary, params, own, d };
     for (size_t i = 0; i < sizeof held / sizeof held[0]; i++)
         if (held[i]) { if (RAY_IS_ERR(held[i])) ray_error_free(held[i]); else ray_release(held[i]); }
     return NULL;

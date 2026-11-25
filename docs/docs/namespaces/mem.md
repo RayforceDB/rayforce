@@ -7,8 +7,8 @@ operations are unrestricted and do not change the measured value.
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.mem.objsize`](#mem-objsize) | unary | — | Logical bytes retained by a value. |
-| [`.mem.ts`](#mem-ts) | 1 | special form | Evaluate once and return result plus time, allocation, peak-memory, result-size, and worker statistics. |
+| [`.mem.objsize`](#mem-objsize) | unary | — | Logical bytes retained by an object graph; shared children count once |
+| [`.mem.ts`](#mem-ts) | 1 | special form | Evaluate once and return result, time, allocation, peak-memory, result-size, and worker statistics as a dict |
 
 ## `.mem.objsize` { #mem-objsize }
 

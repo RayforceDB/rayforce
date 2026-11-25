@@ -9,10 +9,10 @@ CSV is Rayfall's bulk text I/O format. The `.csv.*` builtins cover four shapes: 
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.csv.read`](#csv-read) | variadic | restricted | Parse a CSV file into an in-memory table. |
-| [`.csv.write`](#csv-write) | variadic | restricted | Serialise a table to a CSV file. |
-| [`.csv.splayed`](#csv-splayed) | variadic | restricted | Stream a CSV directly into a splayed on-disk table; return it loaded. |
-| [`.csv.parted`](#csv-parted) | variadic | restricted | Stream a CSV directly into a partitioned table under a db root. |
+| [`.csv.read`](#csv-read) | variadic | restricted | Load CSV file into table (mmap, parallel parse) |
+| [`.csv.write`](#csv-write) | variadic | restricted | Write table to CSV file |
+| [`.csv.splayed`](#csv-splayed) | variadic | restricted | Stream a CSV directly into a splayed on-disk table; return it loaded |
+| [`.csv.parted`](#csv-parted) | variadic | restricted | Stream a CSV directly into a partitioned table under a db root |
 
 ## `.csv.read` { #csv-read }
 

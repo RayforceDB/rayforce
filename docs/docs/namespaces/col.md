@@ -6,11 +6,11 @@ A *linked column* is an integer vector whose values are row IDs into a named tab
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.col.link`](#col-link) | binary | — | Attach a foreign-key link from an int vector to a named table. |
-| [`.col.unlink`](#col-unlink) | unary | — | Detach the link metadata, returning a plain int vector. |
-| [`.col.link?`](#col-link-p) | unary | — | Test whether a value carries link metadata. |
-| [`.col.target`](#col-target) | unary | — | Read back the link's target table name (or `null`). |
-| [`fkeys`](#fkeys) | unary | — | Inspect a table's linked columns as `column -> target table`. |
+| [`.col.link`](#col-link) | binary | — | Attach a foreign-key link from an int vector to a named table |
+| [`.col.unlink`](#col-unlink) | unary | — | Detach the link metadata, returning a plain int vector |
+| [`.col.link?`](#col-link-p) | unary | — | Test whether a value carries link metadata |
+| [`.col.target`](#col-target) | unary | — | Read back the link's target table name (or `null`) |
+| [`fkeys`](#fkeys) | unary | — | Inspect linked-column metadata as `column -> target table` |
 
 ## `.col.link` { #col-link }
 

@@ -11,10 +11,10 @@ The clock is the same `CLOCK_MONOTONIC` source the scheduler uses for its deadli
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.time.now`](#time-now) | variadic | — | Current monotonic time in milliseconds. |
-| [`.time.timer.set`](#time-timer-set) | variadic | restricted | Schedule a callback; return its timer id. |
-| [`.time.timer.del`](#time-timer-del) | unary | restricted | Cancel a scheduled timer (idempotent). |
-| [`.time.sleep`](#time-sleep) | unary | restricted | Block the calling thread for a number of milliseconds; return null. |
+| [`.time.now`](#time-now) | variadic | — | Monotonic time in milliseconds |
+| [`.time.timer.set`](#time-timer-set) | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id |
+| [`.time.timer.del`](#time-timer-del) | unary | restricted | Cancel a scheduled timer by id; returns null |
+| [`.time.sleep`](#time-sleep) | unary | restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null |
 
 ## `.time.now` { #time-now }
 

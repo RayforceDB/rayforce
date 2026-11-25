@@ -229,10 +229,10 @@ A server can fan one stream of updates out to many connected clients with the `.
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| `.mc.sub` | variadic (1-2) | — | `(.mc.sub topic)` or `(.mc.sub topic filter)`: subscribe the calling connection. `topic` is a symbol or a string. `filter` must be null; a non-null filter raises `nyi`. Returns the sequence number the next publication on the topic will carry. Subscribing again from the same connection keeps one subscription. |
-| `.mc.unsub` | unary | — | `(.mc.unsub topic)`: remove the calling connection's subscription. Null; an unknown topic is not an error. |
-| `.mc.pub` | binary | restricted | `(.mc.pub topic payload)`: send `payload` to every subscriber. Returns the publication's sequence number, or `0` when the topic has no subscribers (nothing is sent and the sequence does not advance). |
-| `.mc.stats` | variadic (0) | — | Counters for the process, as a dict. |
+| `.mc.sub` | variadic (1-2) | — | Subscribe the calling connection to a multicast topic (symbol or string); the filter argument must be null. Returns the sequence number the next publication will carry. A non-null filter raises `nyi`. See [Multicast topics](../storage/ipc.md#multicast) |
+| `.mc.unsub` | unary | — | Remove the calling connection's subscription to a topic; null; an unknown topic is not an error |
+| `.mc.pub` | binary | restricted | Publish a payload to every subscriber of a topic as an async `(upd topic seq payload)`; returns the sequence number, or `0` when the topic has no subscribers (nothing is sent and the sequence does not advance) |
+| `.mc.stats` | variadic (0) | — | Multicast counters as a dict: `topics`, `subscriptions`, `published`, `delivered`, `dropped`, `framed`, `tx_limit_bytes`, `tx_limit_frames`, `tx_hwm_bytes` |
 
 `.mc.sub` and `.mc.unsub` act on the connection that sent the request, so they are called over IPC, from the client's side of an `.ipc.send`; called outside a connection they raise `domain`.
 
