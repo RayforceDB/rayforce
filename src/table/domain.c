@@ -266,6 +266,9 @@ typedef struct {
 struct ray_sym_domain_s {
     uint8_t   kind;        /* dom_kind_t */
     bool      immortal;    /* runtime singleton: retain/release skip */
+    bool      replaced;    /* FILE: detached from the cache because its file was
+                            * replaced at the path (#1497): the holders keep it,
+                            * and it never writes to the path again */
     uint32_t  rc;          /* FILE: open/attach refs (guarded by lock) */
     char*     path;        /* FILE: malloc'd resolved path; NULL for runtime */
 
@@ -943,7 +946,11 @@ static const char* dom_bytes_locked(ray_sym_domain_t* d, int64_t pos, size_t* le
  * already unlinked it from the cache. */
 static void dom_preload_release(ray_sym_domain_t* d);
 
+static _Atomic(int64_t) g_dom_replaced_live;   /* test hook: detached replaced domains alive */
+int64_t ray_sym_domain_test_replaced_live(void) { return atomic_load(&g_dom_replaced_live); }
+
 static void dom_destroy(ray_sym_domain_t* d) {
+    if (d->replaced) atomic_fetch_sub(&g_dom_replaced_live, 1);
     dom_preload_release(d);
     if (d->imp) ray_symimp_free(d->imp);
     ray_sys_free(d->z);
@@ -1715,6 +1722,12 @@ static ray_file_id_t dom_stat_id(const struct stat* st) {
     return id;
 }
 
+/* Another file at the path: a rename over it, or a removal and a new
+ * write.  The holders still map the old one, so its inode is not reused. */
+static bool dom_file_replaced(const ray_file_id_t* old, const ray_file_id_t* now) {
+    return old->valid && now->valid && old->ino != now->ino;
+}
+
 static bool dom_file_id_changed(const ray_file_id_t* old, const ray_file_id_t* now) {
     return old->valid && now->valid &&
            (old->ino != now->ino || old->size != now->size ||
@@ -1772,6 +1785,19 @@ static ray_sym_domain_t* dom_open_impl(const char* path, bool create) {
                 (counted_tail && !dom_extend_from_file_locked(d, cur_size)) ||
                 (cur_size != d->disk_size &&
                  !dom_extend_from_file_locked(d, cur_size))) {
+                /* The file diverges from this entry.  Another file at the
+                 * path (#1497) is a new vocabulary: the entry leaves the
+                 * cache, its holders keep it and its symbols, and the path
+                 * is opened afresh below (an invalid file there fails as
+                 * any open does).  The same file changed other than by an
+                 * append is damage: loud. */
+                if (exists && d->disk_size && dom_file_replaced(&d->disk_id, &current_id)) {
+                    *pp = d->next;
+                    d->next = NULL;
+                    d->replaced = true;
+                    atomic_fetch_add(&g_dom_replaced_live, 1);
+                    break;
+                }
                 dom_unlock();
                 ray_sys_free(rpath);
                 return NULL;
@@ -3082,6 +3108,7 @@ ray_err_t ray_sym_domain_flush(ray_sym_domain_t* dom, bool durable) {
     if (dom->kind == DOM_RUNTIME) return RAY_OK; /* sym.c owns its own files */
     if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
+    if (dom->replaced) return RAY_ERR_CORRUPT;   /* the path holds another file */
 
     dom_lock();
     bool dirty = atomic_load_explicit(&dom->count, memory_order_relaxed) != dom->disk_count;
@@ -3310,6 +3337,7 @@ ray_err_t ray_sym_domain_flush_append(ray_sym_domain_t* dom, bool durable) {
     if (dom->kind == DOM_RUNTIME) return RAY_OK;
     if (dom->kind == DOM_IMPORT) return ray_symimp_sync(dom->imp, durable);
     if (!dom->path) return RAY_ERR_DOMAIN;
+    if (dom->replaced) return RAY_ERR_CORRUPT;   /* the path holds another file */
 
     /* Nothing to write, and (durable) nothing written earlier left unsynced:
      * no write and no sync. */

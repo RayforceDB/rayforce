@@ -2232,7 +2232,10 @@ static test_result_t test_stream_sym_chunks(void) {
 }
 
 /* A rebuilt symbol file with the same byte count must not reuse the old
- * cached id-to-string mapping merely because its size did not change. */
+ * cached id-to-string mapping merely because its size did not change.
+ * Since #1497 the open reads the new file (another inode) into a fresh
+ * domain; the held one keeps the old strings, refuses to flush (the path
+ * holds another file), and is freed with its last holder. */
 static test_result_t test_sym_domain_same_size_replacement(void) {
 #if defined(RAY_OS_WINDOWS) || defined(RAY_OS_WASM)
     SKIP("file identity is unavailable on this platform");
@@ -2261,9 +2264,32 @@ static test_result_t test_sym_domain_same_size_replacement(void) {
     TEST_ASSERT_EQ_I(stat(replacement, &b), 0);
     TEST_ASSERT_EQ_I(a.st_size, b.st_size);
     TEST_ASSERT_EQ_I(rename(replacement, path), 0);
-    TEST_ASSERT_NULL(ray_sym_domain_open(path));
+    int64_t live0 = ray_sym_domain_test_replaced_live();
+    ray_sym_domain_t* now = ray_sym_domain_open(path);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_replaced_live(), live0 + 1);
+    TEST_ASSERT_NOT_NULL(now);
+    TEST_ASSERT_TRUE(now != old && now != fresh);
+    ray_t* s1 = ray_sym_domain_str(now, 1);
+    TEST_ASSERT_TRUE(s1 && ray_str_len(s1) == 2 && memcmp(ray_str_ptr(s1), "bb", 2) == 0);
+    s1 = ray_sym_domain_str(old, 1);
+    TEST_ASSERT_TRUE(s1 && ray_str_len(s1) == 2 && memcmp(ray_str_ptr(s1), "aa", 2) == 0);
+    /* the old domain takes a symbol in memory, and never writes it to the
+     * new file */
+    TEST_ASSERT_EQ_I(ray_sym_domain_intern(old, "cc", 2), 3);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(old, false), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush(old, false), RAY_ERR_CORRUPT);
+    TEST_ASSERT_EQ_I(stat(path, &a), 0);
+    TEST_ASSERT_EQ_I(a.st_size, b.st_size);
+    /* the cache holds the new domain only */
+    ray_sym_domain_t* again2 = ray_sym_domain_open(path);
+    TEST_ASSERT_TRUE(again2 == now);
+    ray_sym_domain_release(again2);
+    TEST_ASSERT_EQ_I(ray_sym_domain_find(now, "cc", 2), -1);
+    ray_sym_domain_release(now);
     ray_sym_domain_release(fresh);
-    ray_sym_domain_release(old);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_replaced_live(), live0 + 1);
+    ray_sym_domain_release(old);   /* the detached entry goes with its last holder */
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_replaced_live(), live0);
     (void)ray_test_rm_rf(dir);
     PASS();
 #endif

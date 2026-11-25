@@ -2117,10 +2117,10 @@ static test_result_t test_domain_extend_reopen_flat(void) {
 }
 /* Write `words` as the symfile at `path` the way another process's writer
  * does: a tmp file renamed over it (a new inode). */
-static bool write_symfile(const char* path, const char* const* words, int n) {
+static bool write_symfile_at(const char* path, const char* const* words, int n, bool in_place) {
     char tmp[256];
     snprintf(tmp, sizeof tmp, "%s.ext", path);
-    FILE* f = fopen(tmp, "wb");
+    FILE* f = fopen(in_place ? path : tmp, "wb");
     if (!f) return false;
     uint32_t magic = 0x4C525453U;   /* "STRL" */
     int64_t count = n;
@@ -2130,7 +2130,12 @@ static bool write_symfile(const char* path, const char* const* words, int n) {
         ok = fwrite(&l, 4, 1, f) == 1 && (l == 0 || fwrite(words[i], 1, l, f) == l);
     }
     ok = fclose(f) == 0 && ok;
-    return ok && rename(tmp, path) == 0;
+    return ok && (in_place || rename(tmp, path) == 0);
+}
+
+/* As another process's flush leaves it: a new file renamed over the path. */
+static bool write_symfile(const char* path, const char* const* words, int n) {
+    return write_symfile_at(path, words, n, false);
 }
 
 /* Every position resolves to words[pos], by position and by string, and
@@ -2182,10 +2187,11 @@ static test_result_t test_domain_extend_after_flush(void) {
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gc", 2), 3);
     TEST_ASSERT_EQ_I(ray_sym_domain_intern(dom, "gd", 2), 4);
     TEST_ASSERT_EQ_I(ray_sym_domain_flush(dom, false), RAY_OK);
-    /* a file that disagrees with the flushed tail is refused, and leaves
-     * the domain as it was */
+    /* the same file rewritten in place to disagree with the flushed tail
+     * is refused, and leaves the domain as it was (another file at the
+     * path is a new vocabulary, #1497: test_domain_replaced_file) */
     const char* wrong[] = { "", "ga", "gb", "gc", "gX", "ge" };
-    TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, wrong, 6), "diverging file");
+    TEST_ASSERT(write_symfile_at(TMP_DOM_SYM_PATH, wrong, 6, true), "diverging file");
     TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
     const char* grown2[] = { "", "ga", "gb", "gc", "gd", "ge", "gf" };
     TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, grown2, 7), "external growth");
@@ -4488,10 +4494,17 @@ static test_result_t test_domain_index_extend_prefix(void) {
             ray_sym_domain_ix_info_t in = ix_info(dom);
             if (in.from_index != (v == 0)) FAILF("case %d: from_index %d", v, (int)in.from_index);
             ray_sym_domain_release(again);
-        } else if (again) {
+        } else if (again == dom) {
             ray_sym_domain_release(again);
             ray_sym_domain_release(dom);
             FAILF("case %d: a changed prefix was taken for growth", v);
+        } else {
+            /* another file at the path (renamed in): read afresh (#1497),
+             * the held domain keeps the old records */
+            if (!again) FAILF("case %d: the replaced file was not read", v);
+            if (!ix_check_all(again, &ix_vb, N + M)) FAILF("case %d: the new file misread", v);
+            if (!ix_check_all(dom, &ix_va, N)) FAILF("case %d: the held domain changed", v);
+            ray_sym_domain_release(again);
         }
         ray_sym_domain_release(dom);
     }
