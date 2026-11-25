@@ -2637,7 +2637,7 @@ static test_result_t test_col_build_hash_index_bytes(void) {
                 /* row 2's key finds its group, row 2 among its rows */
                 int64_t key = ((int64_t*)ray_data(m))[2];
                 ray_idx_rows_t rows = { NULL, false }; int64_t gn = 0, hit = 0;
-                if (ray_index_hash_group(m, key, &rows, &gn) != 1) bad++;
+                if (ray_index_hash_group(m, key, &rows, &gn, NULL) != 1) bad++;
                 for (int64_t j = 0; j < gn; j++) hit += ray_idx_rows_at(rows, j) == 2;
                 if (hit != 1) bad++;
             }

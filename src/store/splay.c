@@ -2051,12 +2051,12 @@ static void splay_build_index_col(const char* dir, ray_t* tbl, int64_t c,
                 char path[1024];
                 int n = snprintf(path, sizeof(path), "%s/%.*s", dir,
                                  (int)ray_str_len(nstr), ray_str_ptr(nstr));
-                /* a first-row-only hash (an append repeated a key) is
-                 * written as the complete one its values give.  If that
-                 * can't be built (OOM, cancel) the column is saved without
+                /* a hash carrying a delta (an append repeated a key) is
+                 * written with it folded in (#595).  If that can't be
+                 * done (OOM, cancel) the column is saved without
                  * an index, best effort here as the append is, and a
                  * reload answers by scanning. */
-                bool partial = ray_index_hash_first_only(col);
+                bool partial = ray_index_hash_has_delta(col);
                 ray_t* full = partial ? ray_index_hash_rebuild(col) : NULL;
                 if (n > 0 && n < (int)sizeof(path) && (full || !partial))
                     (void)ray_col_append_index(path, ray_index_payload(full ? full : col->index),

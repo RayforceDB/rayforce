@@ -71,12 +71,13 @@
 ;; concat of a sorted column with more data drops the marker
 (.attr.get (concat (.attr.set 'sorted [1 2 3]) [0 1])) -- (take ['a] 0)
 ;; concat of a grouped column carries the backing index (see
-;; ops/idx_find_in.rfl, ops/idx_append.rfl); a repeated key leaves it
-;; first-row-only, which no longer claims `grouped`
+;; ops/idx_find_in.rfl, ops/idx_append.rfl); a repeated key goes to the
+;; index's delta (#595), which still holds every row: `grouped` stays
 (.idx.has? (concat (.attr.set 'grouped [1 1 2 3 3]) [4 5])) -- true
 (.attr.get (concat (.attr.set 'grouped [1 1 2 3 3]) [4 5])) -- ['grouped]
 (.idx.has? (concat (.attr.set 'grouped [1 1 2 3 3]) [3 4])) -- true
-(.attr.get (concat (.attr.set 'grouped [1 1 2 3 3]) [3 4])) -- (take ['a] 0)
+(.attr.get (concat (.attr.set 'grouped [1 1 2 3 3]) [3 4])) -- ['grouped]
+(at (.idx.info (concat (.attr.set 'grouped [1 1 2 3 3]) [3 4])) 'delta) -- 1
 ;; where-filtered selection off a sorted column drops the marker
 (.attr.get (at (.attr.set 'sorted [1 2 3 4 5]) (where [true false true false true]))) -- (take ['a] 0)
 ;; a plain rebind PRESERVES the marker (trivially-preserving)

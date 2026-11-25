@@ -3168,7 +3168,7 @@ static test_result_t test_vec_grow_slice_sym_widths(void) {
  * n rows {1, 2, 9} in some order, found through the index. */
 static bool grow_hash_extended(ray_t* v, int64_t n) {
     if ((v->attrs & (RAY_ATTR_SLICE | RAY_ATTR_SORTED)) || ray_index_kind(v) != RAY_IDX_HASH ||
-        ray_index_hash_first_only(v) || ray_index_payload(v->index)->built_for_len != n)
+        ray_index_payload(v->index)->built_for_len != n)
         return false;
     const int64_t* d = (const int64_t*)ray_data(v);
     for (int64_t i = 0; i < n; i++)

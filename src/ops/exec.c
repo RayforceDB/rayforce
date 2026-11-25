@@ -5249,8 +5249,9 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                         }
                         ray_idx_rows_t grows = { NULL, false };
                         int64_t gn = 0;
+                        ray_t* ghold = NULL;   /* a delta group's rows (#595) */
                         int hit = absent ? 0
-                            : ray_index_hash_group(eq_col, probe, &grows, &gn);
+                            : ray_index_hash_group(eq_col, probe, &grows, &gn, &ghold);
                         if (hit == 0 || (hit > 0 && lo > hi)) {
                             /* provably empty: absent key or empty range */
                             int64_t nrows = ray_table_nrows(input);
@@ -5258,6 +5259,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             if (sel) {
                                 ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                 ray_idx_note_use(eq_col);
+                                if (ghold) ray_release(ghold);
                                 if (eq_lazy) ray_release(eq_lazy);
                                 g->selection = sel;
                                 return input;
@@ -5293,6 +5295,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                                 if (sel) {
                                     ray_idx_hits[IDX_SITE_FILTER_EQRANGE]++;
                                     ray_idx_note_use(eq_col);
+                                    if (ghold) ray_release(ghold);
                                     if (eq_lazy) ray_release(eq_lazy);
                                     g->selection = sel;
                                     return input;
@@ -5301,6 +5304,7 @@ static ray_t* exec_node_inner(ray_graph_t* g, ray_op_t* op) {
                             /* non-monotone slice / OOM: fall through */
                         }
                         /* hit < 0 (stale/ineligible index): fall through */
+                        if (ghold) ray_release(ghold);   /* every fall-through */
                     }
                     if (eq_lazy) ray_release(eq_lazy);
                 }

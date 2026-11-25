@@ -72,14 +72,15 @@
 (at (select {from: HR where: (in s k1v) i: i}) 'i) -- [500]
 (at (.idx.uses HR) 's) -- 1
 
-;; A first-row-only index (a concat repeated a key) is not read for rows:
-;; the scan finds the repeat
+;; An index a concat extended under a key it held (#595): the repeat is in
+;; its delta, and the index answers with it
 (set HC (table [s i] (list (concat (.idx.hash (at u [0 1 2])) (at u [0 3])) (til 5))))
-(at (.idx.info (at HC 's)) 'first_only) -- true
+(at (.idx.info (at HC 's)) 'delta) -- 1
+(do (.idx.uses HC) null)
 (at (select {from: HC where: (== s k0) i: i}) 'i) -- [0 3]
 (set k03 (at u [0 3]))
 (at (select {from: HC where: (in s k03) i: i}) 'i) -- [0 3 4]
-(.idx.uses HC) -- {}
+(at (.idx.uses HC) 's) -- 2
 ;; after .idx.drop the scan gives the same rows
 (set HX (table [s i] (list (.idx.drop (.idx.hash s)) (til 8))))
 (at (select {from: HX where: (in s k02) i: i}) 'i) -- [1 3 4 7]

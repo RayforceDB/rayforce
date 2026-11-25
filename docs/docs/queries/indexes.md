@@ -37,7 +37,7 @@ All five sites apply the same prechecks before consulting an index:
 - **Partitioned columns:** a column of a partitioned table routes `==` and `in` through each partition's own hash, under the rules in the routing table; its other sites, and MAPCOMMON columns (the partition key), skip index routing.
 - **Default table:** filter and IN sites only route columns from the query's default table (non-default table references are skipped).
 
-A write to existing rows (`(alter 'v set i val)`, an `update`) drops the attached index, so the column has `HAS_INDEX` clear afterward; reattach explicitly after the write.  An append keeps a hash index and drops any other kind: `insert` (into a vector or a table's column, in place or not), `concat` and `(alter 'v concat vals)` extend the hash over the appended rows — see [Mutation Drops the Index](#mutation-drops-the-index).
+A write to existing rows (`(alter 'v set i val)`, an `update`) drops the attached index, so the column has `HAS_INDEX` clear afterward; reattach explicitly after the write.  An append keeps a hash index and drops any other kind: `insert` (into a vector or a table's column, in place or not), `concat`, `(alter 'v concat vals)` and an `upsert` that adds keys extend the hash over the appended rows, a repeated key's rows in the hash's delta, which every site reads — see [Mutation Drops the Index](#mutation-drops-the-index).
 
 ### Fallback guarantee
 
@@ -138,7 +138,7 @@ Indexed columns participate in normal operations transparently.  `(sum vh)`, `(a
 
 A write to existing rows — `(alter 'v set i val)` — invalidates the attached index.  The mutator paths drop the index transparently, restore the original nullmap bytes, and proceed with the write.  Subsequent `(.idx.has?)` calls return false; reattach the index after the write if you want index routing on the updated column.
 
-An append keeps a **hash** index (any other kind is dropped): `(insert 'v x)` of one value, `(insert 't rows)` on a table's indexed column, their non-quoted forms, `concat` and `(alter 'v concat vals)` extend it over the new rows, probing each once — the old rows are not rehashed.  `(insert 'v vals)` of several values into a plain vector, quoted or not, builds a fresh vector without the index (`(alter 'v concat vals)` appends them and keeps it), and an insert at a position, `(insert 'v i vals)`, is a write that drops it.  A new key becomes a group of its own.  A key the hash already holds is not added to its group (that would re-lay every row): the hash is left first-row-only, `.idx.info` reports `first_only: true`, and it still answers `find`, `in`, a dict lookup and `distinct` — every other consult reads the column, and a save writes a complete hash built from the values.  `.idx.hash` or `.attr.set 'grouped` rebuilds a complete one.  A null appended to a column other than a guid one drops the hash.  An append to a column whose hash is shared (another binding holds it, or it was loaded from a file) copies it once.
+An append keeps a **hash** index (any other kind is dropped): `(insert 'v x)` of one value, `(insert 't rows)` on a table's indexed column, their non-quoted forms, `concat` and `(alter 'v concat vals)` extend it over the new rows, probing each once — the old rows are not rehashed.  `(insert 'v vals)` of several values into a plain vector, quoted or not, builds a fresh vector without the index (`(alter 'v concat vals)` appends them and keeps it), and an insert at a position, `(insert 'v i vals)`, is a write that drops it.  A new key becomes a group of its own.  A row under a key the hash already holds goes to the hash's **delta**, a small side table of appended rows, instead of into the key's group (which would re-lay every row).  The hash stays complete: every site in the routing table reads a key's rows as its group followed by its delta rows, which are always later rows, so the answers and their order are those of a freshly built hash.  Once the delta holds more than 4096 rows and more than half the grouped rows, it is folded into the groups in one pass over the rows, about three row copies per appended row amortized; a single large append folds as it goes.  What that costs an append: a batch that does not fold costs what an append to a hash-indexed column cost before (on 900-row batches of repeated symbols into 351 000 and 2 000 000 rows, 11 µs and 15 µs against 13.5 µs and 15.1 µs), and a batch that folds pays one pass over the index's rows (1.2 ms at 351 000 rows, 2.7 ms at 2 000 000), so averaged over every batch an append to an indexed column costs about a sixth to a quarter more than when an append left the index first-row-only, and the queries after it read the index instead of scanning.  An append to a column without an index costs what it did.  A save writes the hash with its delta folded in.  `.idx.info` reports `n_keys` as every indexed row, delta included (the number a fresh `.idx.hash` reports), and `delta` as the rows waiting to be folded (0 when none); `.attr.get` keeps `grouped`, and drops `unique` as soon as an append repeats a key.  A null appended to a numeric column drops the hash; a `SYM` or `STR` null row is left out of it, as the build leaves it out.  An `upsert` that adds keys extends the hash on every column it appends to; one that rewrites matched cells drops the index of each column it rewrites, as any write does (its key columns are never rewritten).  An append to a column whose hash is shared (another binding holds it, or it was loaded from a file) copies it, delta included, once; the other holder keeps its own.
 
 ```lisp
 (set v [5 1 9 3 7])
@@ -151,8 +151,10 @@ An append keeps a **hash** index (any other kind is dropped): `(insert 'v x)` of
 (insert 't (table [k] (list [40])))
 (.idx.has? (at t 'k))                          ; ⇒ true   — a new key: a group of its own
 (insert 't (table [k] (list [20])))
-(at (.idx.info (at t 'k)) 'first_only)         ; ⇒ true   — a repeat
+(at (.idx.info (at t 'k)) 'delta)              ; ⇒ 1      — a repeat, in the delta
+(at (.idx.info (at t 'k)) 'n_keys)             ; ⇒ 5
 (find (at t 'k) [20 40])                       ; ⇒ [1 3]  — still through the hash
+(select {from: t where: (== k 20)})            ; both rows of 20, through the hash
 ```
 
 ### Coexistence with Linked Columns
@@ -174,7 +176,7 @@ An accelerator index uses bytes 0–7 of the column's [nullmap union](https://gi
 (set v (.idx.drop v))         ; optional early release; mutators auto-drop
 ```
 
-An append keeps the hash: `(concat v [7000 7007])` carries the index over, and so does `(insert 'v 7014)` in place; an appended repeat leaves it first-row-only, still serving `find` and `in` (see [Mutation Drops the Index](#mutation-drops-the-index)).
+An append keeps the hash: `(concat v [7000 7007])` carries the index over, and so does `(insert 'v 7014)` in place; an appended repeat goes to its delta, and every site keeps using it (see [Mutation Drops the Index](#mutation-drops-the-index)).
 
 ### Range scans on a stable column
 
