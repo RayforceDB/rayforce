@@ -436,7 +436,7 @@ static void splay_retire_legacy_schema(const char* root) {
         }
         /* the column's own symfile (per-column layout) and its index and
          * lock: they describe the root column only */
-        static const char* const sym_suffix[] = {"", ".ix", ".lk"};
+        static const char* const sym_suffix[] = {"", ".ix", ".ixh", ".lk"};
         char spath[1100];
         if (all_gone && ray_splay_col_sym_path(spath, sizeof(spath), root, name, len)) {
             size_t sl = strlen(spath);

@@ -233,6 +233,18 @@ typedef struct dom_blk_s {
     uint64_t       end;
     const dom_ixb_t* ib;       /* block k: starts at map + ib[k].off, its entries' lengths */
     dom_ixb_t*     own_ib;     /* ib, when this allocation holds it (a walk) */
+    /* block k's content hash (dom_bh_of over its records' bytes, the last
+     * block over the records it holds): the sidecar's, mapped, or this
+     * allocation's own (computed from the records); NULL when none */
+    const uint64_t* bh;
+    uint64_t*      own_bh;
+    /* bh is the mapped sidecar's (taken at open on its header alone): its
+     * file's identity then and the sum its header gave, so a remount can
+     * tell whether anything wrote into it since (a writer renames a new
+     * one over it, never writes into it) and check its hashes then */
+    bool           bh_mapped;
+    ray_file_id_t  bh_id;
+    uint64_t       bh_sum;
 } dom_blk_t;
 
 typedef struct dom_raw_snap_s {
@@ -712,11 +724,12 @@ const char* ray_sym_domain_raw_str_z(const ray_sym_domain_raw_t* r, int64_t pos,
 /* A block table for `count` entries; with room for its own checkpoints
  * and lengths when `own` (else both are the index file's, set by the
  * caller).  NULL on OOM. */
-static dom_blk_t* dom_blk_new(int64_t count, bool own) {
+static dom_blk_t* dom_blk_new(int64_t count, bool own, bool hashes) {
     int64_t n = dom_ck_count(count);
     size_t head = (sizeof(dom_blk_t) + 7) & ~(size_t)7;
     size_t ibb = own ? (size_t)n * sizeof(dom_ixb_t) : 0;
-    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb);
+    size_t hb = hashes ? (size_t)n * sizeof(uint64_t) : 0;
+    dom_blk_t* b = (dom_blk_t*)ray_sys_alloc(head + ibb + hb);
     if (!b) return NULL;
     uint8_t* p = (uint8_t*)b + head;
     b->n = n;
@@ -725,7 +738,44 @@ static dom_blk_t* dom_blk_new(int64_t count, bool own) {
     b->own_ib = own ? (dom_ixb_t*)p : NULL;
     b->ib = b->own_ib;
     if (own) memset(b->own_ib, 0, ibb);   /* unused lengths of the last block: 0 */
+    b->own_bh = hashes ? (uint64_t*)(p + ibb) : NULL;
+    b->bh = b->own_bh;
+    b->bh_mapped = false;
+    memset(&b->bh_id, 0, sizeof b->bh_id);
+    b->bh_sum = 0;
     return b;
+}
+
+/* b (a table over the index file's blocks, no hashes of its own) as a
+ * table with room for its own hashes; b is freed.  NULL on OOM (b freed). */
+static dom_blk_t* dom_blk_with_hashes(dom_blk_t* b) {
+    dom_blk_t* h = dom_blk_new(b->count, false, true);
+    if (h) { h->end = b->end; h->ib = b->ib; h->bh_mapped = false; }
+    ray_sys_free(b);
+    return h;
+}
+
+/* ---- content hashes (#1730) --------------------------------------------------
+ *
+ * Every block of the table has a 64-bit hash of its records' bytes (the
+ * last block: of the records it holds).  An image grown in place is taken
+ * for an append only when every block the old image held hashes the same
+ * in the new one: comparing against the domain's own mapping would compare
+ * a file rewritten in place with itself.  The hashes come from the walk of
+ * the records, or from the sidecar `<symfile>.ixh` written next to the
+ * index (dom_ixh_*), so an open that takes the index reads no records. */
+static inline uint64_t dom_bh_of(const uint8_t* p, uint64_t len) {
+    return ray_hash_bytes(p, (size_t)len) ^ (len * UINT64_C(0x9E3779B97F4A7C15));
+}
+
+/* Hashes of blocks [k0, k1) of the image `map` whose blocks start at ck[k]
+ * (n blocks, records ending at `end`), into out[k]. */
+static void dom_bh_fill(const uint8_t* map, const uint64_t* ck, int64_t n, uint64_t end,
+                        int64_t k0, int64_t k1, uint64_t* out) {
+    for (int64_t k = k0; k < k1; k++) {
+        uint64_t lo = ck[k], hi = k + 1 < n ? ck[k + 1] : end;
+        out[k] = dom_bh_of(map + lo, hi - lo);
+    }
 }
 
 static inline uint64_t dom_blk_lim(const dom_blk_t* b, int64_t k) {
@@ -841,8 +891,17 @@ static const uint8_t* dom_src_get(dom_src_t* s, uint64_t off, uint64_t len) {
 static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t* off,
                              const ray_fsst_table_t* z) {
     uint64_t o = *off;
+    /* hashes (a table that holds them, walked whole): each block's when the
+     * next one starts, the last one's at the end, its bytes just read */
+    bool hash = b->own_bh && from == 0;
     for (int64_t i = from; i < b->count; i++) {
         int64_t k = i / DOM_IX_STRIDE, j = i % DOM_IX_STRIDE;
+        if (!j && hash && k > 0) {
+            uint64_t lo = b->own_ib[k - 1].off;
+            const uint8_t* p = dom_src_get(src, lo, o - lo);
+            if (!p) return false;
+            b->own_bh[k - 1] = dom_bh_of(p, o - lo);
+        }
         if (!j) b->own_ib[k].off = o;
         const uint8_t* h = dom_src_get(src, o, 4);
         if (!h) return false;
@@ -855,7 +914,25 @@ static bool dom_blk_walk_src(dom_src_t* src, dom_blk_t* b, int64_t from, size_t*
         o += 4 + (uint64_t)l;
         b->own_ib[k].len[j] = sl < DOM_LEN_LONG ? (uint16_t)sl : (uint16_t)DOM_LEN_LONG;
     }
+    if (hash && b->n > 0) {
+        uint64_t lo = b->own_ib[b->n - 1].off;
+        const uint8_t* p = dom_src_get(src, lo, o - lo);
+        if (!p) return false;
+        b->own_bh[b->n - 1] = dom_bh_of(p, o - lo);
+    }
     *off = (size_t)o;
+    return true;
+}
+
+/* The hashes of a table over the index file's blocks, from the records
+ * (one pass over the file, explicit reads where it can). */
+static bool dom_blk_hash_src(dom_src_t* src, dom_blk_t* b) {
+    for (int64_t k = 0; k < b->n; k++) {
+        uint64_t lo = b->ib[k].off, hi = dom_blk_lim(b, k);
+        const uint8_t* p = hi >= lo ? dom_src_get(src, lo, hi - lo) : NULL;
+        if (!p) return false;
+        b->own_bh[k] = dom_bh_of(p, hi - lo);
+    }
     return true;
 }
 
@@ -1005,9 +1082,14 @@ static bool dom_fseek_ix(FILE* f, int64_t off) {
 #endif
 }
 
-/* Remove the temporary index files (`<sym>.ix.<pid>.tmp`) a process that
- * no longer runs left behind. */
+/* Remove the temporary index and sidecar files (`<sym>.ix.<pid>.tmp`,
+ * `<sym>.ixh.<pid>.tmp`) a process that no longer runs left behind. */
+static void dom_ix_sweep_tmp_one(const char* path, const char* kind);
 static void dom_ix_sweep_tmp(const char* path) {
+    dom_ix_sweep_tmp_one(path, "ix");
+    dom_ix_sweep_tmp_one(path, "ixh");
+}
+static void dom_ix_sweep_tmp_one(const char* path, const char* kind) {
 #if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
     char dir[PATH_MAX], pre[PATH_MAX];
     const char* slash = strrchr(path, '/');
@@ -1015,7 +1097,7 @@ static void dom_ix_sweep_tmp(const char* path) {
     size_t dl = slash ? (size_t)(slash - path) : 0;
     if (dl >= sizeof(dir)) return;
     if (slash) { memcpy(dir, path, dl); dir[dl] = 0; } else { dir[0] = '.'; dir[1] = 0; }
-    int prl = snprintf(pre, sizeof(pre), "%s.ix.", base);
+    int prl = snprintf(pre, sizeof(pre), "%s.%s.", base, kind);
     if (prl <= 0 || (size_t)prl >= sizeof(pre)) return;
     DIR* dh = opendir(dir);
     if (!dh) return;
@@ -1035,7 +1117,7 @@ static void dom_ix_sweep_tmp(const char* path) {
     }
     closedir(dh);
 #else
-    (void)path;
+    (void)path; (void)kind;
 #endif
 }
 
@@ -1118,7 +1200,7 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
               x.ino == id->ino && x.stamp == dom_id_stamp(id);
     fclose(f);
     (void)map;
-    dom_blk_t* b = ok ? dom_blk_new(count, false) : NULL;
+    dom_blk_t* b = ok ? dom_blk_new(count, false, false) : NULL;
     void* m = NULL;
     size_t msz = 0;
     ray_file_id_t iid;
@@ -1139,6 +1221,203 @@ static dom_blk_t* dom_ix_load(const char* path, const uint8_t* map, size_t size,
     *ixsize = msz;
     *hx = x;
     return b;
+}
+
+/* ---- the hash sidecar `<symfile>.ixh` (#1730) ---------------------------------
+ *
+ * The content hashes of the index's blocks, in a file of their own so that
+ * the index stays in the format every binary reads (a binary that does not
+ * know the sidecar neither reads nor rewrites it, and keeps using the
+ * index).  Taken only for the very image it was written for, as the index
+ * is (inode, stamp, entry count, size), with room for its hashes;
+ * anything else is never trusted, never an error: the open hashes the
+ * records and writes it anew.  An open reads the header only; the hashes
+ * are summed against the header's checksum when a remount first uses them
+ * (dom_blk_bh_usable), and a sidecar written into since the open refuses
+ * the remount.  A cache, written to a
+ * temporary file renamed over it (never written into: a reader keeps the
+ * sidecar it opened mapped, and with it the hashes of the image it read),
+ * never synced.
+ *
+ *   0  u32 "STRH"   4 u32 version   8 u32 stride (28)   12 u32 0
+ *  16  i64 count    24 u64 end (the image's size)   32 u64 inode   40 u64 stamp
+ *  48  u64 cap: hash slots   56 u64 sum over the blocks k < n of
+ *      dom_ixh_term(k, hash k)
+ *  64  cap u64 hashes, n = ceil(count / 28) of them, then zeros */
+#define DOM_IXH_MAGIC   0x48525453U   /* "STRH" */
+#define DOM_IXH_VERSION 1u
+#define DOM_IXH_HDR     64
+
+typedef struct { int64_t count; uint64_t end, ino, stamp, cap, sum; } dom_ixhh_t;
+
+static inline uint64_t dom_ixh_term(int64_t k, uint64_t h) {
+    uint64_t x = h ^ ((uint64_t)k * UINT64_C(0xD6E8FEB86659FD93));
+    x ^= x >> 32; x *= UINT64_C(0xD6E8FEB86659FD93); x ^= x >> 29;
+    return x;
+}
+
+static void dom_ixhh_put(uint8_t* h, const dom_ixhh_t* x) {
+    memset(h, 0, DOM_IXH_HDR);
+    uint32_t w = DOM_IXH_MAGIC;  memcpy(h, &w, 4);
+    w = DOM_IXH_VERSION;         memcpy(h + 4, &w, 4);
+    w = (uint32_t)DOM_IX_STRIDE; memcpy(h + 8, &w, 4);
+    memcpy(h + 16, &x->count, 8); memcpy(h + 24, &x->end, 8);
+    memcpy(h + 32, &x->ino, 8);   memcpy(h + 40, &x->stamp, 8);
+    memcpy(h + 48, &x->cap, 8);   memcpy(h + 56, &x->sum, 8);
+}
+
+static bool dom_ixhh_get(const uint8_t* h, dom_ixhh_t* x) {
+    if (dom_rd32(h) != DOM_IXH_MAGIC || dom_rd32(h + 4) != DOM_IXH_VERSION ||
+        dom_rd32(h + 8) != (uint32_t)DOM_IX_STRIDE)
+        return false;
+    memcpy(&x->count, h + 16, 8);
+    x->end = dom_rd64(h + 24); x->ino = dom_rd64(h + 32); x->stamp = dom_rd64(h + 40);
+    x->cap = dom_rd64(h + 48); x->sum = dom_rd64(h + 56);
+    return x->count > 0 && x->cap >= (uint64_t)dom_ck_count(x->count) &&
+           x->cap <= (uint64_t)dom_ck_count(x->count) * 2 + 4096;
+}
+
+static _Atomic(int64_t) g_ixh_hashed;   /* test hook: images hashed whole for want of a sidecar */
+int64_t ray_sym_domain_test_ixh_hashed(void) { return atomic_load(&g_ixh_hashed); }
+
+/* The hashes the sidecar of `path` holds for the image of `count` entries
+ * and identity `id` (whose size is the records' end): the mapped sidecar
+ * (*m / *msz, for the caller to keep while the hashes are used), or NULL. */
+static const uint64_t* dom_ixh_load(const char* path, int64_t count, const ray_file_id_t* id,
+                                    void** m, size_t* msz, bool sum_now,
+                                    ray_file_id_t* hid_out, uint64_t* sum_out) {
+    char hp[PATH_MAX];
+    *m = NULL; *msz = 0;
+    if (count <= 0 || !path || !id || !id->valid || !dom_ix_name(hp, sizeof(hp), path, "h"))
+        return NULL;
+    size_t sz = 0;
+    ray_file_id_t hid;
+    uint8_t* map = (uint8_t*)ray_vm_map_file_id(hp, &sz, &hid);
+    if (!map) return NULL;
+    dom_ixhh_t x;
+    int64_t n = dom_ck_count(count);
+    bool ok = sz >= DOM_IXH_HDR && dom_ixhh_get(map, &x) && x.count == count &&
+              x.end == id->size && (x.ino | x.stamp) != 0 && x.ino == id->ino &&
+              x.stamp == dom_id_stamp(id) && x.cap >= (uint64_t)n &&
+              (sz - DOM_IXH_HDR) / sizeof(uint64_t) >= x.cap;
+    const uint64_t* bh = (const uint64_t*)(map + DOM_IXH_HDR);
+    /* the hashes are summed now (sum_now), or when they are first used (an
+     * open reads the header only: dom_blk_bh_usable) */
+    uint64_t sum = 0;
+    for (int64_t k = 0; ok && sum_now && k < n; k++) sum += dom_ixh_term(k, bh[k]);
+    if (!ok || (sum_now && sum != x.sum)) { ray_vm_unmap_file(map, sz); return NULL; }
+    if (hid_out) *hid_out = hid;
+    if (sum_out) *sum_out = x.sum;
+    *m = map; *msz = sz;
+    return bh;
+}
+
+static ray_file_id_t dom_stat_id(const struct stat* st);
+static bool dom_file_id_changed(const ray_file_id_t* old, const ray_file_id_t* now);
+
+/* Before a remount compares against the hashes of the image a domain
+ * read: 1 when they can be used; 0 when they cannot be checked (the
+ * mapped sidecar's hashes do not sum to what its header said at open: a
+ * damaged cache, the comparison then goes without them); -1 when the
+ * sidecar the domain mapped was written into since it was opened, which
+ * no writer does (they rename a new one over it), so a copy in place went
+ * over the root: the remount is refused.  Hashes of the domain's own (a
+ * walk, or computed for want of a sidecar) are always usable. */
+static int dom_blk_bh_usable(const char* path, const dom_blk_t* b) {
+    if (!b || !b->bh) return 0;
+    if (!b->bh_mapped) return 1;
+    char hp[PATH_MAX];
+    struct stat st;
+    if (dom_ix_name(hp, sizeof(hp), path, "h") && stat(hp, &st) == 0 &&
+        (uint64_t)st.st_ino == b->bh_id.ino) {
+        ray_file_id_t now = dom_stat_id(&st);
+        if (dom_file_id_changed(&b->bh_id, &now)) return -1;
+    }
+    /* the mapped file is as it was opened (or renamed over: its inode is
+     * no one else's to write): its hashes, summed once */
+    uint64_t sum = 0;
+    for (int64_t k = 0; k < b->n; k++) sum += dom_ixh_term(k, b->bh[k]);
+    return sum == b->bh_sum ? 1 : 0;
+}
+
+/* Write the sidecar whole: hashes bh[0..n) of the image of `count`
+ * entries of identity `id` (stamped: no sidecar for an image an index
+ * would not claim either).  Best effort. */
+static void dom_ixh_save(const char* path, const uint64_t* bh, int64_t n, int64_t count,
+                         const ray_file_id_t* id) {
+    if (!path || !bh || count <= 0 || n != dom_ck_count(count) || !id || !id->valid) return;
+    char hp[PATH_MAX], tp[PATH_MAX], sfx[40];
+    snprintf(sfx, sizeof(sfx), "h.%llu.tmp", dom_pid());
+    if (!dom_ix_name(hp, sizeof(hp), path, "h") || !dom_ix_name(tp, sizeof(tp), path, sfx)) return;
+    dom_ixhh_t x = { .count = count, .end = id->size, .ino = id->ino, .stamp = dom_id_stamp(id),
+                     .cap = (uint64_t)n + (uint64_t)n / 4 + 64, .sum = 0 };
+    for (int64_t k = 0; k < n; k++) x.sum += dom_ixh_term(k, bh[k]);
+    uint8_t h[DOM_IXH_HDR];
+    dom_ixhh_put(h, &x);
+    FILE* f = fopen(tp, "wb");
+    bool ok = f && fwrite(h, 1, DOM_IXH_HDR, f) == DOM_IXH_HDR &&
+              fwrite(bh, sizeof(uint64_t), (size_t)n, f) == (size_t)n;
+    for (uint64_t z = (uint64_t)n; ok && z < x.cap; z++) {
+        static const uint64_t zero = 0;
+        ok = fwrite(&zero, sizeof zero, 1, f) == 1;
+    }
+    if (f && fclose(f) != 0) ok = false;
+    if (ok) ok = ray_file_rename(tp, hp) == RAY_OK;
+    if (!ok && f) remove(tp);
+}
+
+/* The sidecar of the image `map` (blocks starting at ck[0..n), records
+ * ending at `end`, `count` entries, identity `id`): hashed whole and
+ * written whole. */
+static void dom_ixh_write_image(const char* path, const uint8_t* map, const uint64_t* ck, int64_t n,
+                                int64_t count, uint64_t end, const ray_file_id_t* id) {
+    if (!id || !id->valid || id->size != end) return;
+    uint64_t* bh = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
+    if (!bh) return;
+    dom_bh_fill(map, ck, n, end, 0, n, bh);
+    dom_ixh_save(path, bh, n, count, id);
+    ray_sys_free(bh);
+}
+
+/* A writer's refresh of the sidecar after it appended: a new file renamed
+ * over it, never a write into it, since a reader holds the hashes of the
+ * image it read mapped from the sidecar it opened.  When the sidecar on
+ * disk is the one for the image this process last read or wrote
+ * (`ix_count` entries ending at `ix_end`), the hashes of the blocks before
+ * the one the old entries ended in are taken from it and only the rest
+ * are hashed (the cost of what was appended, plus a copy of the hashes);
+ * otherwise every block is hashed.  Under the symfile's `.lk` flock.
+ * Best effort. */
+static void dom_ixh_refresh(const char* path, const uint8_t* map, const uint64_t* ck, int64_t n,
+                            int64_t count, uint64_t end, int64_t ix_count, uint64_t ix_end,
+                            const ray_file_id_t* id) {
+    if (!id || !id->valid || id->size != end) return;
+    char hp[PATH_MAX];
+    uint64_t* bh = (uint64_t*)ray_sys_alloc((size_t)n * sizeof(uint64_t));
+    if (!bh) return;
+    int64_t k0 = 0;
+    void* hm = NULL;
+    size_t hs = 0;
+    ray_file_id_t hid;
+    if (ix_count > 0 && dom_ix_name(hp, sizeof(hp), path, "h"))
+        hm = ray_vm_map_file_id(hp, &hs, &hid);
+    dom_ixhh_t x;
+    if (hm && hs >= DOM_IXH_HDR && dom_ixhh_get((const uint8_t*)hm, &x) && x.count == ix_count &&
+        x.end == ix_end && x.count <= count &&
+        (hs - DOM_IXH_HDR) / sizeof(uint64_t) >= (uint64_t)dom_ck_count(x.count)) {
+        const uint64_t* old = (const uint64_t*)((const uint8_t*)hm + DOM_IXH_HDR);
+        int64_t n0 = dom_ck_count(x.count);
+        uint64_t sum = 0;
+        for (int64_t k = 0; k < n0; k++) sum += dom_ixh_term(k, old[k]);
+        if (sum == x.sum) {
+            k0 = n0 - 1;
+            memcpy(bh, old, (size_t)k0 * sizeof(uint64_t));
+        }
+    }
+    if (hm) ray_vm_unmap_file(hm, hs);
+    dom_bh_fill(map, ck, n, end, k0, n, bh);
+    dom_ixh_save(path, bh, n, count, id);
+    ray_sys_free(bh);
 }
 
 /* Write `bytes` zero bytes to f. */
@@ -1194,7 +1473,8 @@ static bool dom_write_blocks(FILE* f, const uint64_t* ck, const dom_lsrc_t* ls, 
  * effort: the index is a cache. */
 static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
                         const uint64_t* ck, int64_t n, const dom_lsrc_t* ls,
-                        int64_t count, uint64_t end, const ray_file_id_t* id) {
+                        int64_t count, uint64_t end, const ray_file_id_t* id,
+                        const uint64_t* bh) {
     if (!path || count <= 0 || n != dom_ck_count(count) || end > map_size || map_size < 12 ||
         ck[0] != dom_rec0_of(map) ||
         ck[n - 1] >= end || (ls->na > 0 && !ls->pb) || (ls->na < count && !ls->lb))
@@ -1223,6 +1503,11 @@ static void dom_ix_save(const char* path, const uint8_t* map, size_t map_size,
     if (f && fclose(f) != 0) ok = false;
     if (ok) ok = ray_file_rename(tp, ip) == RAY_OK;
     if (!ok && f) remove(tp);
+    /* its sidecar, for the same image (claimed only where the index is) */
+    if (ok && x.stamp) {
+        if (bh) dom_ixh_save(path, bh, n, count, id);
+        else    dom_ixh_write_image(path, map, ck, n, count, end, id);
+    }
 }
 
 /* A writer's refresh of the index of `path` after it appended (`count`
@@ -1262,7 +1547,8 @@ static void dom_ix_refresh(const char* path, const uint64_t* ck, int64_t n,
               fflush(f) == 0 && dom_fseek_ix(f, 0) && fwrite(h, 1, DOM_IX_HDR, f) == DOM_IX_HDR;
     }
     if (f && fclose(f) != 0) app = false;
-    if (!app) dom_ix_save(path, map, size, ck, n, ls, count, end, stamp ? &id : NULL);
+    if (!app) dom_ix_save(path, map, size, ck, n, ls, count, end, stamp ? &id : NULL, NULL);
+    else if (stamp) dom_ixh_refresh(path, map, ck, n, count, end, ix_count, ix_end, &id);
     ray_vm_unmap_file(map, size);
 }
 
@@ -1274,7 +1560,7 @@ static void dom_ix_save_file(const char* path, const uint64_t* ck, int64_t n,
     void* map = ray_vm_map_file_id(path, &size, &id);
     if (!map) return;
     dom_lsrc_t ls = { NULL, 0, lens };
-    dom_ix_save(path, (const uint8_t*)map, size, ck, n, &ls, count, end, &id);
+    dom_ix_save(path, (const uint8_t*)map, size, ck, n, &ls, count, end, &id, NULL);
     ray_vm_unmap_file(map, size);
 }
 
@@ -1285,7 +1571,7 @@ static void dom_blk_save(const char* path, const uint8_t* map, size_t map_size,
     if (!ck) return;
     for (int64_t k = 0; k < b->n; k++) ck[k] = b->ib[k].off;
     dom_lsrc_t ls = { b->ib, b->count, NULL };
-    dom_ix_save(path, map, map_size, ck, b->n, &ls, b->count, b->end, id);
+    dom_ix_save(path, map, map_size, ck, b->n, &ls, b->count, b->end, id, b->bh);
     ray_sys_free(ck);
 }
 
@@ -1297,6 +1583,7 @@ void ray_sym_domain_index_save(const char* path, const uint64_t* ckpt, int64_t n
 void ray_sym_domain_index_remove(const char* path) {
     char ip[PATH_MAX];
     if (path && dom_ix_name(ip, sizeof(ip), path, "")) (void)remove(ip);
+    if (path && dom_ix_name(ip, sizeof(ip), path, "h")) (void)remove(ip);   /* its sidecar */
 }
 
 static _Atomic(void (*)(int, const char*)) g_dom_test_hook;
@@ -1359,8 +1646,33 @@ static bool dom_index_image(ray_sym_domain_t* d, int64_t count) {
     bool have = b != NULL;
     if (have) {
         dom_keep_map(d, ixm, ixs);
+        /* the blocks' hashes: the sidecar's when it is this image's, else
+         * from the records (one pass) and the sidecar written anew; the
+         * index is kept as it is */
+        void* hm = NULL;
+        size_t hs = 0;
+        ray_file_id_t hid;
+        uint64_t hsum = 0;
+        const uint64_t* bh = dom_ixh_load(d->path, count, &d->map_id, &hm, &hs, false, &hid, &hsum);
+        if (bh) {
+            b->bh = bh;
+            b->bh_mapped = true;
+            b->bh_id = hid;
+            b->bh_sum = hsum;
+            dom_keep_map(d, hm, hs);
+        } else {
+            b = dom_blk_with_hashes(b);
+            if (!b) return false;
+            /* through the mapping: a file in the page cache is hashed at
+             * memory speed (explicit reads would drop it, see dom_src_get) */
+            dom_src_t src = dom_src_map(map, size);
+            bool hashed = dom_blk_hash_src(&src, b);
+            if (!hashed) { ray_sys_free(b); return false; }
+            atomic_fetch_add(&g_ixh_hashed, 1);
+            dom_ixh_save(d->path, b->bh, b->n, count, &d->map_id);
+        }
     } else {
-        b = dom_blk_new(count, true);
+        b = dom_blk_new(count, true, true);
         if (!b) return false;
         size_t o = d->rec0;
         dom_src_t src;
@@ -1446,19 +1758,51 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
      * with the index is tried once more with a walk. */
     dom_blk_t* ob = d->blk;
     const uint8_t* obase = (const uint8_t*)d->map;
+    /* the hashes of the image read: usable, unusable (a damaged cache: the
+     * checks go without them, as before them), or the sidecar written
+     * into since: refused (dom_blk_bh_usable) */
+    int ob_bh = d->base_count > 0 ? dom_blk_bh_usable(d->path, ob) : 1;
     dom_dir_t* cur = atomic_load_explicit(&d->atoms, memory_order_relaxed);
     dom_blk_t* nb = NULL;
     bool from_ix = false;
     void* nixm = NULL;
     size_t nixs = 0;
+    void* nixh = NULL;     /* the new image's sidecar, mapped */
+    size_t nixhs = 0;
     dom_ixh_t nhx;
     memset(&nhx, 0, sizeof(nhx));
     for (int pass = 0; ok && pass < 2; pass++) {
         nb = pass == 0 ? dom_ix_load(d->path, nbase, map_size, fresh_count, &nid, &nixm, &nixs, &nhx)
                        : NULL;
         if (pass == 0 && !nb) pass = 1;
+        if (nb) {
+            /* the new image's hashes: its sidecar's, else from its records
+             * (and the sidecar written for it) */
+            void* hm = NULL;
+            size_t hs = 0;
+            ray_file_id_t hid;
+            uint64_t hsum = 0;
+            const uint64_t* bh = dom_ixh_load(d->path, fresh_count, &nid, &hm, &hs, true, &hid, &hsum);
+            if (bh) {
+                nb->bh = bh;
+                nb->bh_mapped = true;
+                nb->bh_id = hid;
+                nb->bh_sum = hsum;
+                if (nixh) ray_vm_unmap_file(nixh, nixhs);
+                nixh = hm; nixhs = hs;
+            } else {
+                nb = dom_blk_with_hashes(nb);
+                if (!nb) { ok = false; break; }
+                for (int64_t k = 0; k < nb->n; k++) {
+                    uint64_t lo = nb->ib[k].off, hi = dom_blk_lim(nb, k);
+                    nb->own_bh[k] = dom_bh_of(nbase + lo, hi - lo);
+                }
+                atomic_fetch_add(&g_ixh_hashed, 1);
+                dom_ixh_save(d->path, nb->bh, nb->n, fresh_count, &nid);
+            }
+        }
         if (!nb) {
-            nb = dom_blk_new(fresh_count, true);
+            nb = dom_blk_new(fresh_count, true, true);
             if (!nb) { ok = false; break; }
             size_t o = 12;
             dom_src_t src;
@@ -1487,6 +1831,18 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
                 size_t hb = d->map_end - 12 < DOM_IX_HEAD ? d->map_end - 12 : DOM_IX_HEAD;
                 good = memcmp(nbase + 12, obase + 12, hb) == 0;
             }
+            /* The comparisons above read the old image through the
+             * domain's mapping, which is the new image when the file was
+             * rewritten in place (#1730): the prefix's content is held to
+             * the hashes taken of the old image instead.  Every full block
+             * the old image held hashes the same in the new one, and the
+             * old last, partial block's records hash as they did. */
+            good = good && ob_bh >= 0 && (ob_bh == 0 || nb->bh);
+            for (int64_t k = 0; good && ob_bh > 0 && k < full; k++) good = nb->bh[k] == ob->bh[k];
+            if (good && ob_bh > 0 && full < ob->n) {
+                uint64_t lo = ob->ib[full].off;
+                good = dom_bh_of(nbase + lo, d->map_end - lo) == ob->bh[full];
+            }
         }
         /* the entries this process flushed past the mapping, in order */
         size_t ro = d->base_count > 0 ? d->map_end : 12;
@@ -1502,6 +1858,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
         if (good) break;
         ray_sys_free(nb);
         nb = NULL;
+        if (nixh) { ray_vm_unmap_file(nixh, nixhs); nixh = NULL; }
         if (nixm) { ray_vm_unmap_file(nixm, nixs); nixm = NULL; }
         if (pass == 1) ok = false;
     }
@@ -1534,6 +1891,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
             d->ix_end = from_ix ? nhx.end : 0;
             d->ix_covered = from_ix ? fresh_count : 0;
             if (nixm) { dom_keep_map(d, nixm, nixs); nixm = NULL; }
+            if (nixh) { dom_keep_map(d, nixh, nixhs); nixh = NULL; }
             void* old_map = d->map;
             size_t old_map_size = d->map_size;
             d->map = map;
@@ -1607,6 +1965,7 @@ static bool dom_extend_from_file_locked(ray_sym_domain_t* d, size_t st_size) {
     if (ok && fresh_count == count) { d->disk_size = st_size; d->disk_end = nb->end; d->disk_id = nid; }
     ray_sys_free(nb);
     if (nixm) ray_vm_unmap_file(nixm, nixs);
+    if (nixh) ray_vm_unmap_file(nixh, nixhs);
     ray_vm_unmap_file(map, map_size);
     return ok;
 }
@@ -3581,7 +3940,7 @@ ray_err_t ray_sym_domain_compress(const char* path) {
     size_t ixs = 0;
     dom_blk_t* b = dom_ix_load(rpath, map, size, count, &id, &ixm, &ixs, &hx);
     if (!b) {
-        b = dom_blk_new(count, true);
+        b = dom_blk_new(count, true, false);
         size_t o = 12;
         dom_src_t src;
         if (b && !dom_src_open(&src, rpath, &id, size)) src = dom_src_map(map, size);
@@ -3683,7 +4042,7 @@ ray_err_t ray_sym_domain_compress(const char* path) {
         if (zmap) {
             /* the lengths are the strings', as before: the old table's */
             dom_lsrc_t ls = { b->ib, count, NULL };
-            dom_ix_save(rpath, zmap, zsize, ck, n, &ls, count, zsize, &zid);
+            dom_ix_save(rpath, zmap, zsize, ck, n, &ls, count, zsize, &zid, NULL);
             ray_vm_unmap_file((void*)zmap, zsize);
         }
     }

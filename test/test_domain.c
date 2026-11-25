@@ -83,6 +83,7 @@ static void domain_ix_cleanup(void) {
     unlink(TMP_DOM_SYM_PATH);
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".lk"));
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".ix"));
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".ixh"));
 }
 
 static void domain_teardown(void) {
@@ -3891,6 +3892,7 @@ static void ix_unlink_all(void) {
     unlink(TMP_DOM_SYM_PATH);
     unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".lk"));
     unlink(TMP_IX_PATH);
+    unlink(ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".ixh"));
 }
 
 /* Open, check every entry, report what the index did, release. */
@@ -4453,6 +4455,239 @@ static test_result_t test_domain_index_new_file_removes(void) {
     PASS();
 }
 
+/* #1730: a file rewritten in place (same inode) and grown is an append
+ * only when the records the domain read are still there: whatever their
+ * lengths, and in the last, partial block too.  The domain's own mapping
+ * shows the rewritten bytes, so only the hashes taken of what it read
+ * tell.  With the index and its sidecar (RAY_SYM_INDEX_MIN 0) and
+ * without (a small file: every open walks). */
+static test_result_t test_domain_inplace_rewrite(void) {
+    static const char* const base[] = {
+        "", "w01", "w02", "w03", "w04", "w05", "w06", "w07", "w08", "w09", "w10",
+        "w11", "w12", "w13", "w14", "w15", "w16", "w17", "w18", "w19", "w20",
+        "w21", "w22", "w23", "w24", "w25", "w26", "w27", "w28", "w29" };   /* 30: a full block and 2 */
+    enum { NB = 30 };
+    const char* grown[NB + 1];
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode) setenv("RAY_SYM_INDEX_MIN", "0", 1); else unsetenv("RAY_SYM_INDEX_MIN");
+        for (int v = 0; v < 4; v++) {
+            ix_unlink_all();
+            TEST_ASSERT(write_symfile(TMP_DOM_SYM_PATH, base, NB), "base file");
+            ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+            TEST_ASSERT_NOT_NULL(dom);
+            TEST_ASSERT(dom_holds(dom, base, NB), "base read");
+            if (mode) {   /* the open after the walk takes the index and the sidecar */
+                ray_sym_domain_release(dom);
+                int64_t h0 = ray_sym_domain_test_ixh_hashed();
+                dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+                TEST_ASSERT_NOT_NULL(dom);
+                TEST_ASSERT_EQ_I(ray_sym_domain_test_ixh_hashed(), h0);
+            }
+            static const char* const same_len[] = {
+                "", "x01", "x02", "x03", "x04", "x05", "x06", "x07", "x08", "x09", "x10",
+                "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20",
+                "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29" };
+            static const char* const other_len[] = {
+                "", "y001", "y02", "y03", "y04", "y05", "y06", "y07", "y08", "y09", "y10",
+                "y11", "y12", "y13", "y14", "y15", "y16", "y17", "y18", "y19", "y20",
+                "y21", "y22", "y23", "y24", "y25", "y26", "y27", "y28", "y29" };
+            for (int i = 0; i < NB; i++)
+                grown[i] = v == 0 ? same_len[i] : v == 1 ? other_len[i] : base[i];
+            if (v == 2) grown[29] = "z29";   /* only the last, partial block */
+            grown[NB] = "w30";
+            /* v 3: the same records and one more: an append */
+            TEST_ASSERT(write_symfile_at(TMP_DOM_SYM_PATH, grown, NB + 1, true), "rewrite in place");
+            ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+            if (v < 3) {
+                TEST_ASSERT_FMT(again == NULL, "mode %d case %d: an in-place rewrite was taken", mode, v);
+            } else {
+                TEST_ASSERT_FMT(again == dom, "mode %d: an in-place append was refused", mode);
+                TEST_ASSERT(dom_holds(dom, grown, NB + 1), "appended");
+                ray_sym_domain_release(again);
+            }
+            ray_sym_domain_release(dom);
+        }
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+static uint8_t* slurp(const char* path, size_t* len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    uint8_t* b = n > 0 ? (uint8_t*)malloc((size_t)n) : NULL;
+    if (b && fread(b, 1, (size_t)n, f) != (size_t)n) { free(b); b = NULL; }
+    fclose(f);
+    *len = b ? (size_t)n : 0;
+    return b;
+}
+static bool spit(const char* path, const uint8_t* b, size_t len) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(b, 1, len, f) == len;
+    return fclose(f) == 0 && ok;
+}
+
+/* The sidecar `<symfile>.ixh` (#1730): an open that finds it this image's
+ * hashes no record; one missing, truncated, with a hash changed, or left
+ * by an image before an append (as a binary that does not know it leaves
+ * it after appending) is not used and not an error: the open hashes the
+ * records once and writes it anew; the index file is left as it is. */
+static test_result_t test_domain_ixh_sidecar(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    ix_unlink_all();
+    enum { N = 1000 };
+    ix_gen(&ix_va, "sc", N + 10);
+    TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "symfile");
+    const char* hp = ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".ixh");
+    ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* walks: index and sidecar */
+    TEST_ASSERT_NOT_NULL(dom);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_EQ_I(access(hp, F_OK), 0);
+    size_t ixl = 0, hl = 0;
+    uint8_t* ix0 = slurp(TMP_IX_PATH, &ixl);
+    uint8_t* h0 = slurp(hp, &hl);
+    TEST_ASSERT_TRUE(ix0 && h0 && hl > 64);
+    struct stat ixst0;
+    TEST_ASSERT_EQ_I(stat(TMP_IX_PATH, &ixst0), 0);
+
+    /* each damage the header shows: not trusted, hashed once, written
+     * anew; the index kept (a damaged hash under an intact header is the
+     * remount's to find: test_domain_ixh_lazy) */
+    for (int v = 0; v < 3; v++) {
+        if (v == 0) unlink(hp);
+        if (v == 1) TEST_ASSERT_TRUE(spit(hp, h0, hl / 2));
+        if (v == 2) { uint8_t* c = (uint8_t*)malloc(hl); memcpy(c, h0, hl); c[3] = 'X'; spit(hp, c, hl); free(c); }
+        int64_t c0 = ray_sym_domain_test_ixh_hashed();
+        dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+        TEST_ASSERT_FMT(dom != NULL, "case %d: a bad sidecar made the open fail", v);
+        TEST_ASSERT(ix_check_all(dom, &ix_va, N), "read");
+        ray_sym_domain_release(dom);
+        TEST_ASSERT_FMT(ray_sym_domain_test_ixh_hashed() == c0 + 1, "case %d: hashed %lld times", v,
+                        (long long)(ray_sym_domain_test_ixh_hashed() - c0));
+        dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* written anew: taken */
+        TEST_ASSERT_NOT_NULL(dom);
+        ray_sym_domain_release(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_test_ixh_hashed(), c0 + 1);
+        size_t l2 = 0;
+        uint8_t* ix2 = slurp(TMP_IX_PATH, &l2);
+        struct stat ixst;
+        TEST_ASSERT_EQ_I(stat(TMP_IX_PATH, &ixst), 0);
+        TEST_ASSERT_FMT(ix2 && l2 == ixl && memcmp(ix2, ix0, ixl) == 0 && ixst.st_ino == ixst0.st_ino &&
+                        ixst.st_mtime == ixst0.st_mtime, "case %d: the index was rewritten", v);
+        free(ix2);
+    }
+
+    /* an append that leaves the sidecar of the image before it (as a binary
+     * that does not know the sidecar does): the next open hashes once */
+    size_t hbl = 0;
+    uint8_t* before = slurp(hp, &hbl);
+    TEST_ASSERT_NOT_NULL(before);
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    for (int i = N; i < N + 10; i++)
+        TEST_ASSERT_TRUE(ray_sym_domain_intern(dom, ix_va.s[i], ix_va.l[i]) == i);
+    TEST_ASSERT_EQ_I(ray_sym_domain_flush_append(dom, false), RAY_OK);
+    ray_sym_domain_release(dom);
+    size_t ixal = 0;
+    uint8_t* ixa = slurp(TMP_IX_PATH, &ixal);   /* the index the append left */
+    TEST_ASSERT_TRUE(spit(hp, before, hbl));
+    int64_t c1 = ray_sym_domain_test_ixh_hashed();
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    TEST_ASSERT(ix_check_all(dom, &ix_va, N + 10), "appended read");
+    ray_sym_domain_release(dom);
+    dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_NOT_NULL(dom);
+    ray_sym_domain_release(dom);
+    TEST_ASSERT_EQ_I(ray_sym_domain_test_ixh_hashed(), c1 + 1);   /* once */
+    size_t l3 = 0;
+    uint8_t* ix3 = slurp(TMP_IX_PATH, &l3);
+    TEST_ASSERT_TRUE(ixa && ix3 && l3 == ixal && memcmp(ix3, ixa, ixal) == 0);   /* index kept */
+
+    /* the sidecar goes with the index */
+    ray_sym_domain_index_remove(TMP_DOM_SYM_PATH);
+    TEST_ASSERT_EQ_I(access(hp, F_OK), -1);
+    free(ix0); free(h0); free(before); free(ixa); free(ix3);
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
+/* An open takes the sidecar on its header alone (it reads no hashes); a
+ * remount that sees growth checks the hashes then (review of #1734):
+ *  - hashes that no longer sum to the header's sum (a damaged cache) are
+ *    not used, and a real append is still taken: never an error;
+ *  - a sidecar written into since the open (a copy of a whole rebuilt root
+ *    over the live one, `cp -r new/. root/`: no writer does that, they
+ *    rename) refuses the remount, here on an old image that ends on a
+ *    block boundary, where no partial block is left to differ. */
+static test_result_t test_domain_ixh_lazy(void) {
+    setenv("RAY_SYM_INDEX_MIN", "0", 1);
+    enum { N = 56 };   /* two full blocks */
+    const char* hp = ray_test_tmp(TMP_DOM_SYM_PATH_LIT ".ixh");
+    const char* ip = TMP_IX_PATH;
+    for (int v = 0; v < 2; v++) {
+        ix_unlink_all();
+        ix_gen(&ix_va, "lz", N + 30);
+        TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N), "symfile");
+        ray_sym_domain_t* dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* walks, writes .ix and .ixh */
+        TEST_ASSERT_NOT_NULL(dom);
+        ray_sym_domain_release(dom);
+        if (v == 0) {   /* one hash changed, the header intact */
+            size_t hl = 0;
+            uint8_t* h = slurp(hp, &hl);
+            TEST_ASSERT_TRUE(h && hl > 80);
+            h[64 + 8] ^= 1;
+            TEST_ASSERT_TRUE(spit(hp, h, hl));
+            free(h);
+        }
+        int64_t c0 = ray_sym_domain_test_ixh_hashed();
+        dom = ray_sym_domain_open(TMP_DOM_SYM_PATH);   /* takes .ix and .ixh: reads no hashes */
+        TEST_ASSERT_NOT_NULL(dom);
+        TEST_ASSERT_EQ_I(ray_sym_domain_test_ixh_hashed(), c0);
+        if (v == 0) {
+            /* a real append, in place: taken */
+            TEST_ASSERT(ix_write_vocab(TMP_DOM_SYM_PATH, &ix_va, N + 3), "appended in place");
+            ray_sym_domain_t* again = ray_sym_domain_open(TMP_DOM_SYM_PATH);
+            TEST_ASSERT_FMT(again == dom, "an append refused over a damaged sidecar");
+            TEST_ASSERT(ix_check_all(dom, &ix_va, N + 3), "appended read");
+            ray_sym_domain_release(again);
+        } else {
+            /* another root, of the same lengths, copied over this one in
+             * place, its index and sidecar with it */
+            char other[300];
+            snprintf(other, sizeof other, "%s", ray_test_tmp(TMP_DOM_SYM_PATH_LIT "_other"));
+            ix_gen(&ix_vb, "LZ", N + 30);   /* other strings, same lengths */
+            TEST_ASSERT(ix_write_vocab(other, &ix_vb, N + 3), "other root");
+            ray_sym_domain_t* od = ray_sym_domain_open(other);
+            TEST_ASSERT_NOT_NULL(od);
+            ray_sym_domain_release(od);
+            char oix[320], oixh[320];
+            snprintf(oix, sizeof oix, "%s.ix", other);
+            snprintf(oixh, sizeof oixh, "%s.ixh", other);
+            size_t l1 = 0, l2 = 0, l3 = 0;
+            uint8_t* a = slurp(other, &l1);
+            uint8_t* b = slurp(oix, &l2);
+            uint8_t* c = slurp(oixh, &l3);
+            TEST_ASSERT_TRUE(a && b && c);
+            TEST_ASSERT_TRUE(spit(TMP_DOM_SYM_PATH, a, l1) && spit(ip, b, l2) && spit(hp, c, l3));   /* in place */
+            free(a); free(b); free(c);
+            TEST_ASSERT_NULL(ray_sym_domain_open(TMP_DOM_SYM_PATH));
+            unlink(other); unlink(oix); unlink(oixh);
+            snprintf(oix, sizeof oix, "%s.lk", other); unlink(oix);
+        }
+        ray_sym_domain_release(dom);
+    }
+    unsetenv("RAY_SYM_INDEX_MIN");
+    ix_unlink_all();
+    PASS();
+}
+
 /* A reopen after another process changed the file: growth that keeps every
  * published byte extends the domain — through the new file's index, or by
  * a walk — and a change inside the old records is refused, with the new
@@ -4548,6 +4783,9 @@ const test_entry_t domain_entries[] = {
     { "domain/index_refresh_in_place",  test_domain_index_refresh_in_place,  domain_setup, domain_teardown },
     { "domain/index_new_file_removes",  test_domain_index_new_file_removes,  domain_setup, domain_teardown },
     { "domain/index_extend_prefix",     test_domain_index_extend_prefix,     domain_setup, domain_teardown },
+    { "domain/inplace_rewrite",         test_domain_inplace_rewrite,         domain_setup, domain_teardown },
+    { "domain/ixh_sidecar",             test_domain_ixh_sidecar,             domain_setup, domain_teardown },
+    { "domain/ixh_lazy",                test_domain_ixh_lazy,                domain_setup, domain_teardown },
     { "domain/index_scenarios",         test_domain_index_scenarios,         domain_setup, domain_teardown },
     { "domain/private", test_domain_private, domain_setup, domain_teardown },
     { "domain/flush_append", test_domain_flush_append, domain_setup, domain_teardown },

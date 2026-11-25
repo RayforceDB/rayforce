@@ -174,8 +174,9 @@ the same files at any worker count: the symbol file takes the dictionaries'
 strings row group by row group in file order, and by column within a row group,
 as one worker reads them, and each partition's `SYM` columns record the symbol
 count one worker leaves after the partition's row groups. Only the symbol
-file's index (`.sym.ix`) differs between two such imports: it records the
-identity of the symbol file it was written for. A chunk with strings outside
+file's index (`.sym.ix`) and its hash sidecar (`.sym.ixh`) differ between two
+such imports: they record the identity of the symbol file they were written
+for. A chunk with strings outside
 its dictionary page (a writer's fallback to plain pages once a dictionary grows
 large, or a column written without one) takes its strings in the order the
 workers reach them, unless the import passes `reproducible: true`.
