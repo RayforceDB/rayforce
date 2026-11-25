@@ -140,19 +140,19 @@ Accepted by `.emb.hnsw.build`, `.emb.knn`, and the `nearest` clause:
 
 ## Reference
 
-| Name | Arity | Signature |
-|---|---|---|
-| `.emb.cos-dist` | 2 | `(.emb.cos-dist a b)` — cosine distance; vec×vec → atom, LIST×vec → vector |
-| `.emb.l2-dist` | 2 | `(.emb.l2-dist a b)` — euclidean distance |
-| `.emb.inner-prod` | 2 | `(.emb.inner-prod a b)` — positive dot product |
-| `norm` | 1 | `(norm x)` — L2 norm; scalar if vec, per-row vector if LIST |
-| `.emb.knn` | 3–4 | `(.emb.knn col query k [metric])` — brute-force top-K |
-| `.emb.hnsw.build` | 1–4 | `(.emb.hnsw.build col [metric] [M] [ef_c])` — build index |
-| `.emb.ann` | 3–4 | `(.emb.ann handle query k [ef_s])` — approximate top-K via HNSW |
-| `.emb.hnsw.set` | 2 | `(.emb.hnsw.set path handle)` — persist index to directory |
-| `.emb.hnsw.get` | 1 | `(.emb.hnsw.get path)` — restore index from directory |
-| `.emb.hnsw.free` | 1 | `(.emb.hnsw.free handle)` — explicit release (rc-managed, optional) |
-| `.emb.hnsw.info` | 1 | `(.emb.hnsw.info handle)` — dict of `{nrows dim metric nlayers M efc}` |
+| Function | Arity | Signature | Description |
+|---|---|---|---|
+| `.emb.cos-dist` | 2 | `(.emb.cos-dist a b)` | Cosine distance between two vectors; a vector and a vector give an atom, a list of vectors and a vector give a vector |
+| `.emb.l2-dist` | 2 | `(.emb.l2-dist a b)` | Euclidean distance between two vectors |
+| `.emb.inner-prod` | 2 | `(.emb.inner-prod a b)` | Inner product of two vectors |
+| `norm` | 1 | `(norm x)` | Euclidean (L2) norm of a numeric vector, or of each vector in a list |
+| `.emb.knn` | 3–4 | `(.emb.knn col query k [metric])` | Exact k nearest neighbours by brute force |
+| `.emb.hnsw.build` | 1–4 | `(.emb.hnsw.build col [metric] [M] [ef_c])` | Build an HNSW index over an embedding column |
+| `.emb.ann` | 3–4 | `(.emb.ann handle query k [ef_s])` | Approximate k nearest neighbours through an HNSW index |
+| `.emb.hnsw.set` | 2 | `(.emb.hnsw.set path handle)` | Persist an index to a directory |
+| `.emb.hnsw.get` | 1 | `(.emb.hnsw.get path)` | Load an index from a directory |
+| `.emb.hnsw.free` | 1 | `(.emb.hnsw.free handle)` | Release an index early (indexes are reference-counted, so this is optional) |
+| `.emb.hnsw.info` | 1 | `(.emb.hnsw.info handle)` | Dict describing an index: `nrows`, `dim`, `metric`, `nlayers`, `M`, `efc` |
 
 ## Design Notes
 

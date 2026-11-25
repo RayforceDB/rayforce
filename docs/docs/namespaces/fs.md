@@ -9,8 +9,8 @@ Minimal filesystem-metadata primitives. The namespace is deliberately small: two
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.fs.size`](#fs-size) | unary | — | File size in bytes. |
-| [`.fs.list`](#fs-list) | unary | — | Sorted sym vector of directory entries. |
+| [`.fs.size`](#fs-size) | unary | — | File size in bytes |
+| [`.fs.list`](#fs-list) | unary | — | Sorted sym vector of directory entries |
 
 ## `.fs.size` { #fs-size }
 

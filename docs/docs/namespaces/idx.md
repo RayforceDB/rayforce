@@ -13,14 +13,14 @@ Indexes are dropped automatically when the column is mutated (`alter set`, `upda
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.idx.zone`](#idx-zone) | unary | — | Attach a zone (min/max) index. |
-| [`.idx.hash`](#idx-hash) | unary | — | Attach a hash-set index. |
-| [`.idx.sort`](#idx-sort) | unary | — | Attach a sorted-permutation index. |
-| [`.idx.bloom`](#idx-bloom) | unary | — | Attach a Bloom filter. |
-| [`.idx.drop`](#idx-drop) | unary | — | Detach whatever index the vector carries. |
-| [`.idx.has?`](#idx-has-p) | unary | — | True if the vector carries any index. |
-| [`.idx.info`](#idx-info) | variadic | — | Dict describing the attached index, or a table column's format. |
-| [`.idx.uses`](#idx-uses) | unary | — | How many times each column's index answered a query since the last call. |
+| [`.idx.zone`](#idx-zone) | unary | — | Attach a zone (min/max) index |
+| [`.idx.hash`](#idx-hash) | unary | — | Attach a hash-set index |
+| [`.idx.sort`](#idx-sort) | unary | — | Attach a sorted-permutation index |
+| [`.idx.bloom`](#idx-bloom) | unary | — | Attach a Bloom filter |
+| [`.idx.drop`](#idx-drop) | unary | — | Detach whatever index the vector carries |
+| [`.idx.has?`](#idx-has-p) | unary | — | True if the vector carries any index |
+| [`.idx.info`](#idx-info) | variadic | — | Dict describing the attached index, or a table column's format |
+| [`.idx.uses`](#idx-uses) | unary | — | Per-column count of index hits since the previous call; the first call arms the counter |
 
 ## `.idx.zone` { #idx-zone }
 

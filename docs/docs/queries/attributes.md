@@ -196,6 +196,6 @@ A duplicated value answers its first position, and a missing value answers `0Nl`
 
 | Function | Syntax | Description |
 |---|---|---|
-| `.attr.set` | `(.attr.set 'name v)` | Verify and stamp `sorted` / `unique` / `grouped` / `parted`; errors on violation |
-| `.attr.get` | `(.attr.get v)` | Symbol vector of held attributes (empty when none) |
-| `.attr.drop` | `(.attr.drop v)` | Remove all attributes from `v` |
+| `.attr.set` | `(.attr.set 'name v)` | Verify and stamp `sorted`, `unique`, `grouped` or `parted` on a vector; errors on a violation |
+| `.attr.get` | `(.attr.get v)` | Symbol vector of the attributes a vector holds (empty when none) |
+| `.attr.drop` | `(.attr.drop v)` | Remove all attributes from a vector |

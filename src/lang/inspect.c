@@ -175,6 +175,7 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     int64_t own = builtin ? ray_env_builtin_own_sym(v) : -1;
     ray_t* own_str = own >= 0 ? ray_sym_str(own) : NULL;
     const char* usage = NULL;
+    const char* summary = NULL;
     if (own_str) {
         char nm[256];
         size_t l = ray_str_len(own_str);
@@ -182,11 +183,12 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
             memcpy(nm, ray_str_ptr(own_str), l);
             nm[l] = '\0';
             usage = ray_sig_usage(nm);
+            summary = ray_sig_summary(nm);
         }
     }
 
     insp_dict_t d;
-    insp_init(&d, 11);
+    insp_init(&d, 12);
     ray_retain(name);
     insp_put(&d, "name", name);
     insp_put(&d, "bound", ray_bool(v != NULL));
@@ -197,6 +199,7 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     insp_put(&d, "arity", lambda && params && !RAY_IS_ERR(params) ? ray_i64(params->len)
                                                                   : ray_typed_null(-RAY_I64));
     insp_put(&d, "usage", usage ? ray_str(usage, strlen(usage)) : ray_str("", 0));
+    insp_put(&d, "summary", summary ? ray_str(summary, strlen(summary)) : ray_str("", 0));
     insp_put(&d, "builtin", own >= 0 ? ray_sym(own) : insp_sym(""));
     insp_put(&d, "restricted", ray_bool(builtin && (v->attrs & RAY_FN_RESTRICTED)));
     if (v) ray_release(v);

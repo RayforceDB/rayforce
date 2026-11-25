@@ -405,11 +405,11 @@ Measured on joins below 65536 rows, a floor of 65536 costs about 2.6x the wall t
 
 | Function | Syntax | Description |
 |---|---|---|
-| `inner-join` | `(inner-join [keys] left right)` | Equi-join; only matching rows |
-| `left-join` | `(left-join [keys] left right)` | Left outer join; all left rows preserved |
-| `full-join` | `(full-join [keys] left right)` | Full outer join; all rows from both sides preserved |
-| `anti-join` | `(anti-join [keys] left right)` | Keep left rows with no right match |
-| `semi-mask` | `(semi-mask [keys] left right)` | Boolean vector over left: true where the row has a right match |
-| `anti-mask` | `(anti-mask [keys] left right)` | Boolean vector over left: true where the row has no right match |
-| `asof-join` | `(asof-join [keys time-col] left right)` | Time-series alignment; most recent match |
-| `window-join` | `(window-join [keys tc] intervals left right {aggs})` | Window aggregation over time intervals |
+| `inner-join` | `(inner-join [keys] left right)` | Inner join — only matching rows from both sides |
+| `left-join` | `(left-join [keys] left right)` | Left join — all left rows, unmatched filled with null. Keys are a symbol list |
+| `full-join` | `(full-join [keys] left right)` | Full outer join — all rows from both sides, unmatched columns filled with null |
+| `anti-join` | `(anti-join [keys] left right)` | Anti-semi-join — left rows with no right match |
+| `semi-mask` | `(semi-mask [keys] left right)` | Boolean vector over left rows — true where the row has a right match |
+| `anti-mask` | `(anti-mask [keys] left right)` | Boolean vector over left rows — true where the row has no right match |
+| `asof-join` | `(asof-join [keys time-col] left right)` | As-of join — match most recent preceding value. Keys come first, last key is the time key |
+| `window-join` | `(window-join [keys tc] intervals left right {aggs})` | Window join — `[eq-keys... time-key]`, intervals, left, right, agg dict |

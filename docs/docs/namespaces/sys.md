@@ -9,25 +9,25 @@ Process-level introspection (build, memory, host info) and command-style operati
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.sys.args`](#sys-args) | variadic | — | Command-line arguments as a typed dict. |
-| [`.sys.build`](#sys-build) | nullary | — | Version + build date as a dict. |
-| [`.sys.info`](#sys-info) | nullary | — | Host and process facts: cores, page size, total memory, pool size, pid, hostname. |
-| [`.sys.mem`](#sys-mem) | nullary | — | Allocator statistics. |
-| [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table. |
-| [`.sys.profile`](#sys-profile) | nullary | — | Per-call-site profile of Rayfall code (file, line, function) as a table. |
-| [`.sys.profile.enable`](#sys-profile-enable) | variadic | restricted | Toggle the call profiler. |
-| [`.sys.profile.reset`](#sys-profile-reset) | nullary | restricted | Drop the call profiler's rows. |
-| [`.sys.querylog`](#sys-querylog) | variadic (0–1) | — | Ambient per-query statistics ring as a table; `(.sys.querylog n)` only the rows from `seq` `n` on. |
-| [`.sys.querylog.stats`](#sys-querylog-stats) | nullary | — | The ring's counters: the next `seq`, the rows overwritten, the capacity. |
-| [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
-| [`.sys.join.par.min`](#sys-join-par-min) | variadic (0–1) | restricted | Read or set the probe-side row count from which a hash join's probe is split across the pool. |
-| [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also releases free pages now, best effort. |
-| [`.sys.env`](#sys-env) | variadic (0–1) | — | Count or list of globally bound names. |
-| [`.sys.exec`](#sys-exec) | variadic | restricted | Run a shell command; return its exit code, optionally with stdout. |
-| [`.sys.cmd`](#sys-cmd) | unary | restricted | Dispatch a colon-command string. |
-| [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port. |
-| [`.sys.trust`](#sys-trust) | unary | restricted | Let restricted (`-U`) callers run these lambdas with the restriction lifted. |
-| [`.sys.timeit`](#sys-timeit) | variadic (0–1) | — | Toggle / set the per-expression profiler. |
+| [`.sys.args`](#sys-args) | variadic | — | Application arguments as a typed dict; `user` subdict holds post-`--` args |
+| [`.sys.build`](#sys-build) | nullary | — | Build metadata dict with `version` + `build-date` |
+| [`.sys.info`](#sys-info) | nullary | — | Host and process info (cores, page size, total memory, workers, pid, hostname) |
+| [`.sys.mem`](#sys-mem) | nullary | — | Memory allocator statistics (alloc / peak / slab hits) |
+| [`.sys.prof`](#sys-prof) | nullary | — | Last profiled query's per-step statistics as a table (opt-in via `:t`) |
+| [`.sys.profile`](#sys-profile) | nullary | — | Per-call-site profile of Rayfall code as a table (opt-in via `.sys.profile.enable`) |
+| [`.sys.profile.enable`](#sys-profile-enable) | variadic | restricted | Toggle the call profiler; returns new state |
+| [`.sys.profile.reset`](#sys-profile-reset) | nullary | restricted | Drop the call profiler's rows |
+| [`.sys.querylog`](#sys-querylog) | variadic (0–1) | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`); a `seq` column numbers every logged query from 1, and `(.sys.querylog n)` answers only the rows with `seq >= n` |
+| [`.sys.querylog.stats`](#sys-querylog-stats) | nullary | — | The query-statistics ring's counters: `next` seq, rows `dropped` by the wrap, `capacity` |
+| [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging; returns new state |
+| [`.sys.join.par.min`](#sys-join-par-min) | variadic (0–1) | restricted | Read or set the probe-side rows from which a hash join's probe goes parallel; returns the value in effect |
+| [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Trigger GC / heap flush, returns `0`; mode `1` also releases free pages now, best effort |
+| [`.sys.env`](#sys-env) | variadic (0–1) | — | Number of global bindings (the REPL's `:env` lists them) |
+| [`.sys.exec`](#sys-exec) | variadic | restricted | Execute a shell command; exit code, or `{code, out}` with `'out` |
+| [`.sys.cmd`](#sys-cmd) | unary | restricted | Run a system command by name (`env`, `timeit`, `listen`), or else the string as a shell command, returning its exit code (128 + the signal number for a command a signal killed) |
+| [`.sys.listen`](#sys-listen) | unary | restricted | Bind an IPC listener on a TCP port |
+| [`.sys.trust`](#sys-trust) | unary | restricted | Mark lambdas a restricted (`-U`) caller may run with the restriction lifted, isolated from the caller; returns its argument |
+| [`.sys.timeit`](#sys-timeit) | variadic (0–1) | — | Toggle / set the per-expression profiler |
 
 ## `.sys.args` { #sys-args }
 

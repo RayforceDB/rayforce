@@ -15506,8 +15506,10 @@ static void bdoc_root(char* buf, size_t cap) {
     bdoc_copy(buf, cap, launch ? launch : ".");
 }
 
-/* the backticked names of the subsection `head` of the surface section,
- * as one string " a b c " for whole-word lookup */
+/* the names of the subsection `head` of the surface section, as one string
+ * " a b c " for whole-word lookup: the first cell of each table row
+ * (`| `name` | summary |`, generated from src/lang/sig.c, #1737), whose
+ * summary may hold backticked words of its own */
 static char* bdoc_names(const char* doc, const char* head) {
     const char* sec = strstr(doc, "\n## Registered Builtin Surface");
     if (!sec) return NULL;
@@ -15523,14 +15525,18 @@ static char* bdoc_names(const char* doc, const char* head) {
     size_t n = 0;
     out[n++] = ' ';
     while (p < q) {
-        const char* a = memchr(p, '`', (size_t)(q - p));
-        if (!a) break;
-        const char* b = memchr(a + 1, '`', (size_t)(q - a - 1));
-        if (!b) break;
-        memcpy(out + n, a + 1, (size_t)(b - a - 1));
-        n += (size_t)(b - a - 1);
-        out[n++] = ' ';
-        p = b + 1;
+        const char* eol = memchr(p, '\n', (size_t)(q - p));
+        if (!eol) eol = q;
+        if (eol - p > 3 && !memcmp(p, "| `", 3)) {
+            const char* a = p + 2;
+            const char* b = memchr(a + 1, '`', (size_t)(eol - a - 1));
+            if (b) {
+                memcpy(out + n, a + 1, (size_t)(b - a - 1));
+                n += (size_t)(b - a - 1);
+                out[n++] = ' ';
+            }
+        }
+        p = eol + 1;
     }
     out[n] = 0;
     return out;

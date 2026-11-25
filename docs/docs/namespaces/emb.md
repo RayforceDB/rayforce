@@ -8,20 +8,20 @@ These functions were global names (`cos-dist`, `knn`, `hnsw-build`, …) before 
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.emb.cos-dist`](#emb-cos-dist) | binary | — | Cosine distance between two vectors. |
-| [`.emb.inner-prod`](#emb-inner-prod) | binary | — | Inner product of two vectors. |
-| [`.emb.l2-dist`](#emb-l2-dist) | binary | — | Euclidean distance between two vectors. |
-| [`.emb.knn`](#emb-knn) | variadic | — | Exact k nearest neighbours by brute force. |
-| [`.emb.hnsw.build`](#emb-hnsw-build) | variadic | — | Build an HNSW index over an embedding column. |
-| [`.emb.ann`](#emb-ann) | variadic | — | Approximate k nearest neighbours through an HNSW index. |
-| [`.emb.hnsw.info`](#emb-hnsw-info) | unary | — | Dict describing an index. |
-| [`.emb.hnsw.set`](#emb-hnsw-set) | binary | restricted | Persist an index to a directory. |
-| [`.emb.hnsw.get`](#emb-hnsw-get) | unary | restricted | Load an index from a directory. |
-| [`.emb.hnsw.free`](#emb-hnsw-free) | unary | restricted | Release an index early. |
-| [`.emb.model.get`](#emb-model-get) | unary | restricted | Open a text-embedding model from a directory. |
-| [`.emb.model.info`](#emb-model-info) | unary | — | Dict describing a model. |
-| [`.emb.tokens`](#emb-tokens) | binary | — | The token ids a model cuts a text into. |
-| [`.emb.encode`](#emb-encode) | variadic | — | The vector of a text, or of each of many. |
+| [`.emb.cos-dist`](#emb-cos-dist) | binary | — | Cosine distance between two vectors |
+| [`.emb.inner-prod`](#emb-inner-prod) | binary | — | Inner product of two vectors |
+| [`.emb.l2-dist`](#emb-l2-dist) | binary | — | Euclidean distance between two vectors |
+| [`.emb.knn`](#emb-knn) | variadic | — | Exact k nearest neighbours by brute force |
+| [`.emb.hnsw.build`](#emb-hnsw-build) | variadic | — | Build an HNSW index over an embedding column |
+| [`.emb.ann`](#emb-ann) | variadic | — | Approximate k nearest neighbours through an HNSW index |
+| [`.emb.hnsw.info`](#emb-hnsw-info) | unary | — | Dict describing an index |
+| [`.emb.hnsw.set`](#emb-hnsw-set) | binary | restricted | Persist an index to a directory |
+| [`.emb.hnsw.get`](#emb-hnsw-get) | unary | restricted | Load an index from a directory |
+| [`.emb.hnsw.free`](#emb-hnsw-free) | unary | restricted | Release an index early |
+| [`.emb.model.get`](#emb-model-get) | unary | restricted | Open a text-embedding model from a directory |
+| [`.emb.model.info`](#emb-model-info) | unary | — | Dict describing a model |
+| [`.emb.tokens`](#emb-tokens) | binary | — | The token ids a model cuts a text into |
+| [`.emb.encode`](#emb-encode) | variadic | — | The vector of a text, or of each of many |
 
 ## `.emb.cos-dist` { #emb-cos-dist }
 

@@ -1634,7 +1634,8 @@ static test_result_t test_repl_help_name(void) {
     ray_repl_destroy(repl);
     TEST_ASSERT_TRUE(all_null);
     const char* want[] = {
-        "min: builtin (unary)\n  (min <x: vector, atom or list>)\n  (min <a: num> <b: num>)\n",
+        /* the usage lines, then the summary right under them */
+        "min: builtin (unary)\n  (min <x: vector, atom or list>)\n  (min <a: num> <b: num>)\n  Reduce one vector, or choose the element-wise minimum of two values",
         "zhn_add: lambda\n  (zhn_add a b)\n",
         "zhn_m: builtin min (unary)\n  (min <x: vector, atom or list>)\n",
         "if: builtin (vary), special form\n  (if <cond: bool or bool vector>",

@@ -134,8 +134,8 @@ Two design forks would need to be settled before parted-target links could ship:
 
 | Function | Syntax | Description |
 |---|---|---|
-| `.col.link` | `(.col.link target int-vec)` | Attach a link to a target table |
-| `.col.unlink` | `(.col.unlink v)` | Remove the link, return the underlying int column |
-| `.col.link?` | `(.col.link? v)` | True iff `v` carries a link |
-| `.col.target` | `(.col.target v)` | Returns the target sym, or null |
+| `.col.link` | `(.col.link target int-vec)` | Attach a foreign-key link from an int vector to a named table |
+| `.col.unlink` | `(.col.unlink v)` | Detach the link metadata, returning a plain int vector |
+| `.col.link?` | `(.col.link? v)` | Test whether a value carries link metadata |
+| `.col.target` | `(.col.target v)` | Read back the link's target table name (or `null`) |
 | `linked.field` | dotted access | Dereference the link, gathering target.field at each row |

@@ -53,7 +53,7 @@ You can also exit with `\\`, `exit`, or **Ctrl-D** on an empty line.
 
 `:h NAME` (or `:help NAME`) prints what [`.repl.signature`](../namespaces/repl.md#repl-signature) reports for `NAME`, formatted for reading. It resolves the name by the same rules: a global, or a dotted path through dictionary members. Nothing is evaluated or called.
 
-- **A builtin:** its documented call forms, one per line, from the engine's usage table (the text its errors cite). Through an alias, the header names the builtin the alias holds.
+- **A builtin:** its documented call forms, one per line, from the engine's usage table (the text its errors cite), then its one-line summary. Through an alias, the header names the builtin the alias holds.
 - **A lambda:** its call shape from its parameter names.
 - **Flags:** `special form` and `restricted under -U` are added where they apply.
 - **Anything else:** one line: a namespace root (`:h .sys`) gives its number of names and how to ask for one, `true` and `false` are literals, and a value or a missing name says so.
@@ -63,6 +63,7 @@ You can also exit with `\\`, `exit`, or **Ctrl-D** on an empty line.
 min: builtin (unary)
   (min <x: vector, atom or list>)
   (min <a: num> <b: num>)
+  Reduce one vector, or choose the element-wise minimum of two values, in their promoted type (null lowest); f32 input answers f32
 ‣ (set add (fn [a b] (+ a b)))
 ‣ :h add
 add: lambda
@@ -70,9 +71,11 @@ add: lambda
 ‣ :h if
 if: builtin (vary), special form
   (if <cond: bool or bool vector> <then> [<cond> <then> ...] [<else>])
+  Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins
 ‣ :h .ipc.close
 .ipc.close: builtin (unary), restricted under -U
   (.ipc.close <handle: i32 or i64>)
+  Close an IPC connection handle
 ‣ :h nosuch
 nosuch: not defined
 ```

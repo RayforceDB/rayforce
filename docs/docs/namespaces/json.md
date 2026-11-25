@@ -4,9 +4,9 @@ Reads JSON text into values and writes values out as JSON. The reader is strict 
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.json.parse`](#json-parse) | variadic | — | JSON text to a value; element-wise over a string vector. |
-| [`.json.get`](#json-get) | variadic | — | One field of each document, by a dotted path, without building the rest. |
-| [`.json.format`](#json-format) | unary | — | A value to JSON text. |
+| [`.json.parse`](#json-parse) | variadic | — | JSON text to a value (object to dict with string keys, array to a vector or list); element-wise over a string vector; strict, the limits of `read-value` |
+| [`.json.get`](#json-get) | variadic | — | One field of each JSON document by a dotted path (or one path per row), without building the rest |
+| [`.json.format`](#json-format) | unary | — | A value as JSON text (a table as an array of objects); in a query element-wise: one string per row of a column, on every route |
 
 All three are pure and always available, including in [restricted mode](../storage/ipc.md).
 

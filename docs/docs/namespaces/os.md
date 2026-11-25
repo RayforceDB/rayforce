@@ -9,8 +9,8 @@ Process-environment access. The namespace is deliberately small: two builtins re
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.os.getenv`](#os-getenv) | unary | restricted | Read an environment variable as a string. |
-| [`.os.setenv`](#os-setenv) | binary | restricted | Set an environment variable. |
+| [`.os.getenv`](#os-getenv) | unary | restricted | Get environment variable value |
+| [`.os.setenv`](#os-setenv) | binary | restricted | Set environment variable |
 
 ## `.os.getenv` { #os-getenv }
 

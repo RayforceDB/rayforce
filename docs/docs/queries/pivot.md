@@ -134,15 +134,15 @@ Pivot compiles to a single `OP_PIVOT` node in the execution DAG. The implementat
 
 | Function | Description |
 |---|---|
-| `sum` | Sum of values |
-| `avg` | Arithmetic mean |
-| `count` | Number of values |
-| `min` | Minimum value |
-| `max` | Maximum value |
-| `first` | First value in group |
-| `last` | Last value in group |
-| `med` | Median value |
-| `dev` | Standard deviation |
+| `sum` | Sum of values <!-- docs-gen: own --> |
+| `avg` | Arithmetic mean <!-- docs-gen: own --> |
+| `count` | Number of values <!-- docs-gen: own --> |
+| `min` | Minimum value <!-- docs-gen: own --> |
+| `max` | Maximum value <!-- docs-gen: own --> |
+| `first` | First value in group <!-- docs-gen: own --> |
+| `last` | Last value in group <!-- docs-gen: own --> |
+| `med` | Median value <!-- docs-gen: own --> |
+| `dev` | Standard deviation <!-- docs-gen: own --> |
 | `(fn [x] ...)` | Custom lambda aggregation |
 
 ## Window Functions

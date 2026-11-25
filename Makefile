@@ -681,10 +681,16 @@ cppcheck:
 
 .PHONY: tidy cppcheck
 
-# Every registered builtin is listed in the reference, and nothing else is.
+# Every registered builtin is listed in the reference with its summary, and
+# the generated parts of the reference pages match src/lang/sig.c.
 docs-check:
 	python3 scripts/check-builtin-docs.py
 .PHONY: docs-check
+
+# Write the generated parts of the reference pages from src/lang/sig.c.
+docs-gen:
+	python3 scripts/check-builtin-docs.py --write
+.PHONY: docs-gen
 
 clean:
 	-rm -f $(LIB_OBJ) $(MAIN_OBJ) $(TEST_OBJ) $(REL_LIB_OBJ) $(REL_MAIN_OBJ) $(LIB_LIB_OBJ)

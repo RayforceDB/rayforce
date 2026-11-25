@@ -11,18 +11,18 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode. |
-| [`.log.status`](#log-status) | variadic | — | Report the journal state as a dict. |
-| [`.log.write`](#log-write) | unary | restricted | Append a serialised expression to the open journal. |
-| [`.log.posts`](#log-posts) | variadic | restricted | Read or set whether async requests are journaled too (off by default). |
-| [`.log.sync`](#log-sync) | nullary | — | `fsync` the journal. |
-| [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment. |
-| [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one. |
-| [`.log.replay`](#log-replay) | unary | restricted | Replay a journal file; return the processed-entry count, including evaluation errors. |
-| [`.log.replay_report`](#log-replay-report) | unary | restricted | Replay once; return `entries` and `eval_errors` on a clean tail. |
-| [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)`. |
-| [`.log.close`](#log-close) | nullary | restricted | Flush and close the active journal. |
-| [`.log.purge`](#log-purge) | nullary | restricted | Close the active journal and delete all its files. |
+| [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode |
+| [`.log.status`](#log-status) | variadic | — | Journal state as a dict of seven fields |
+| [`.log.write`](#log-write) | unary | restricted | Append a serialised expression to the open journal |
+| [`.log.posts`](#log-posts) | variadic | restricted | Read (no argument) or set (`0`/`1`) whether an open journal also records async requests; off by default, `--log-posts N` at startup; returns the state as `i64` |
+| [`.log.sync`](#log-sync) | nullary | — | `fsync` the journal |
+| [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment |
+| [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one |
+| [`.log.replay`](#log-replay) | unary | restricted | Replay and return processed entries, **including** evaluation errors; warns and continues, no rollback |
+| [`.log.replay_report`](#log-replay-report) | unary | restricted | Replay **once** and return I64 `entries` / `eval_errors` on a clean tail |
+| [`.log.validate`](#log-validate) | unary | — | Scan a journal file; return `(chunks valid_bytes)` |
+| [`.log.close`](#log-close) | nullary | restricted | Flush and close the active journal |
+| [`.log.purge`](#log-purge) | nullary | restricted | Close the active journal and delete all its files |
 
 ## `.log.open` { #log-open }
 
