@@ -1,7 +1,6 @@
 ;; Inside a query, a name that is no column reads its global when it holds
 ;; a table or a dict, as it does an atom or a vector, not a missing column
-;; (#1496).  A name holding a list is left as it was: select still reports
-;; it as a missing column (how a list reads is the open question #1570).
+;; (#1496).  A name holding a list is one whole value too (#1570).
 (set T (table [v] (list (til 100))))
 (set W (table [x] (list (til 50))))
 (set Z (til 50))
@@ -11,8 +10,8 @@
 (count (select {from: T where: (>= v (- (count W) 10)) v: v})) -- 60
 (count (select {from: T where: (>= v (- (count T) 10)) v: v})) -- 10
 (count (select {from: T where: (>= v (- (count D) 10)) v: v})) -- 100
-(select {from: T where: (>= v (+ (count L) 95)) v: v}) !- schema
-(select {from: T r: (count L)}) !- schema
+(at (select {from: T where: (>= v (+ (count L) 95)) v: v}) 'v) -- [98 99]
+(at (select {from: T r: (count L)}) 'r) -- [3]
 ;; projection and keyless aggregate
 (at (select {from: T r: (count W)}) 'r) -- [50]
 (at (select {from: T r: (+ (count W) (count v))}) 'r) -- [150]

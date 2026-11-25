@@ -870,12 +870,10 @@
 (set Lwm (list [true false true false true true]))
 (set gwm (fn [] [true false true false true true]))
 (set cyl (fn [t] (at t 'y)))
-(select {x: x from: Qlc where: (first Lwm) desc: x take: 3}) !- schema
-(select {x: x from: Ulc where: (first Lwm) desc: x take: 3}) !- schema
-;; xfail BUG: the first of a global list holding a mask raises schema
-;; ("column 'Lwm' not found") in a where: on the flat table too, where it
-;; should filter by the mask
-;; (at (select {x: x from: Ulc where: (first Lwm) desc: x take: 3}) 'x) -- [6 5 3]
+;; a global list is one whole value (#1570): its first is the mask, which
+;; filters the rows, parted and flat alike
+(at (select {x: x from: Qlc where: (first Lwm) desc: x take: 3}) 'x) -- [6 5 3]
+(at (select {x: x from: Ulc where: (first Lwm) desc: x take: 3}) 'x) -- [6 5 3]
 (at (select {x: x from: Qlc where: (gwm) desc: x take: 3}) 'x) -- [6 5 3]
 (select {x: x from: Qlc where: (gwm) asc: x}) -- (select {x: x from: Ulc where: (gwm) asc: x})
 (at (select {x: x from: Qlc where: (in y (cyl (select {y: y from: Qlc where: (> x 4)}))) desc: x take: 3}) 'x) -- [6 5]

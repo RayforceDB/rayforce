@@ -1058,6 +1058,58 @@ static bool tbl_has_col(ray_t* tbl, int64_t sym) {
     return ray_table_col_meta(tbl, sym, &m);
 }
 
+/* A name, no column of `tbl`, bound to a list: one whole value inside a
+ * query, at any length, as a table or a dict is (#1570).  A name bound to
+ * a vector is a free vector instead (#1492). */
+static bool query_name_whole_list(ray_t* e, ray_t* tbl) {
+    /* the column first: a lookup of a name no binding holds costs more */
+    if (!e || e->type != -RAY_SYM || (e->attrs & ATTR_QUOTED) || tbl_has_col(tbl, e->i64)) return false;
+    ray_t* gv = ray_env_get(e->i64);
+    return gv && gv->type == RAY_LIST;
+}
+
+/* An update output `e` that names a list (query_name_whole_list) as the
+ * whole list in every row, as an atom fills every row:
+ * (take (enlist e) (count c)) over a column c no local hides, which counts
+ * the rows of the table, of a group or of the kept rows.  NULL when `e` is
+ * no such name, or no column is free to count with. */
+static ray_t* update_whole_list_value(ray_t* e, ray_t* tbl) {
+    if (!query_name_whole_list(e, tbl)) return NULL;
+    int64_t ncols = ray_table_ncols(tbl), cnt_col = -1;
+    for (int64_t c = 0; c < ncols && cnt_col < 0; c++)
+        if (!ray_env_has_lexical_local(ray_table_col_name(tbl, c))) cnt_col = ray_table_col_name(tbl, c);
+    if (cnt_col < 0) return NULL;
+    ray_t* en = ray_list_new(2);
+    ray_t* cn = ray_list_new(2);
+    ray_t* tk = ray_list_new(3);
+    ray_t* h_en = ray_sym(ray_sym_intern("enlist", 6));
+    ray_t* h_cn = ray_sym(ray_sym_intern("count", 5));
+    ray_t* h_tk = ray_sym(ray_sym_intern("take", 4));
+    ray_t* col = ray_sym(cnt_col);
+    bool ok = en && cn && tk && h_en && h_cn && h_tk && col &&
+              !RAY_IS_ERR(en) && !RAY_IS_ERR(cn) && !RAY_IS_ERR(tk);
+    if (ok) {
+        en = ray_list_append(en, h_en); en = ray_list_append(en, e);
+        cn = ray_list_append(cn, h_cn); cn = ray_list_append(cn, col);
+        ok = en && cn && !RAY_IS_ERR(en) && !RAY_IS_ERR(cn);
+    }
+    if (ok) {
+        tk = ray_list_append(tk, h_tk); tk = ray_list_append(tk, en); tk = ray_list_append(tk, cn);
+        ok = tk && !RAY_IS_ERR(tk);
+    }
+    if (h_en) ray_release(h_en);
+    if (h_cn) ray_release(h_cn);
+    if (h_tk) ray_release(h_tk);
+    if (col) ray_release(col);
+    if (en && !RAY_IS_ERR(en)) ray_release(en);
+    if (cn && !RAY_IS_ERR(cn)) ray_release(cn);
+    if (!ok) {
+        if (tk && !RAY_IS_ERR(tk)) ray_release(tk);
+        return ray_error("oom", NULL);
+    }
+    return tk;
+}
+
 /* Is `sym` the name `null`, which the evaluator reads as the null keyword
  * before any binding (eval.c)?  By its text, as the evaluator compares it. */
 static bool query_sym_is_null_keyword(int64_t sym) {
@@ -2438,11 +2490,12 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
         if (gv) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
-            /* A name bound to a table or a dict is that global, as the
-             * evaluator reads it, not a missing column (#1496): no node
-             * here, so the evaluator answers it.  A name bound to a list
-             * keeps the marker below (#1496 leaves lists as they were). */
-            if (gv->type == RAY_TABLE || gv->type == RAY_DICT) return NULL;
+            /* A name bound to a table, a dict or a list is that global, one
+             * whole value, as the evaluator reads it, not a missing column
+             * (#1496, #1570): no node here, so the evaluator answers it.  A
+             * list is whole at any length; a vector is a const above, read
+             * by the free-vector rule (#1492). */
+            if (gv->type == RAY_TABLE || gv->type == RAY_DICT || gv->type == RAY_LIST) return NULL;
         }
         /* `null` naming no column is the null keyword, as the evaluator
          * reads it (#1483): no column, and no node here, so the evaluator
@@ -21067,7 +21120,12 @@ static ray_t* fv_bind(ray_t* dict, ray_t* tbl, bool aliases, ray_t** work) {
     for (int64_t i = 0; i < nd && !err; i++) {
         int64_t kid = sym_cell_runtime_id(keys, i);
         if (select_clause_key(rid, kid)) continue;
-        ray_t* nv = fv_expr(((ray_t**)ray_data(vals))[i], tbl, &fc);
+        ray_t* ov = ((ray_t**)ray_data(vals))[i];
+        /* update (no aliases): a name holding a list is the whole list in
+         * every row (#1570) */
+        ray_t* nv = !aliases && ov && ov->type == -RAY_SYM && !(ov->attrs & ATTR_QUOTED)
+                  ? update_whole_list_value(ov, tbl) : NULL;
+        if (!nv) nv = fv_expr(ov, tbl, &fc);
         if (aliases) al[fc.naliases++] = kid;
         if (!nv) continue;
         if (RAY_IS_ERR(nv)) { err = nv; break; }
@@ -22494,12 +22552,12 @@ static ray_t* select_plan_column_free_aggs(ray_t* dict, ray_t* tbl) {
         ray_t* src = query_inline_helpers(el[1], tbl);
         if (!src || RAY_IS_ERR(src)) { if (engine) ray_release(engine); return src ? src : ray_error("oom", NULL); }
         bool take = src->type == RAY_LIST && !expr_contains_agg(src) && expr_reads_no_column(src, tbl);
-        /* a name holding a table or a dict: one value, as a computed
-         * collection is (#1496) */
+        /* a name holding a table, a dict or a list: one value, as a
+         * computed collection is (#1496, #1570) */
         if (!take && src->type == -RAY_SYM && !(src->attrs & ATTR_QUOTED) &&
             !tbl_has_col(tbl, src->i64) && !ray_env_has_lexical_local(src->i64)) {
             ray_t* gv = ray_env_get(src->i64);
-            take = gv && (gv->type == RAY_TABLE || gv->type == RAY_DICT);
+            take = gv && (gv->type == RAY_TABLE || gv->type == RAY_DICT || gv->type == RAY_LIST);
         }
         if (take) {
             ray_graph_t* pg = ray_graph_new(tbl);
@@ -31897,8 +31955,11 @@ by_dict_done:
                     int refs_column = expr_refs_row_column(nonagg_exprs[ni], tbl);
                     int is_indexable =
                         ray_is_vec(full_val) || full_val->type == RAY_LIST;
+                    /* a name holding a list is one whole value, in every
+                     * group (#1570) */
                     int full_is_row_aligned =
-                        is_indexable && full_val->len == nrows;
+                        is_indexable && full_val->len == nrows &&
+                        !query_name_whole_list(nonagg_exprs[ni], tbl);
 
                     if (refs_column && !full_is_row_aligned) {
                         /* Non-streaming fallback: the expression didn't
@@ -33435,7 +33496,9 @@ static ray_t* ray_update_lowered(ray_t** args, int64_t n) {
 
     /* A free vector an update expression's aggregate reads is a private
      * column of the working table, planned as select plans it (fv_bind);
-     * every path below carries it with the rows, and no result keeps it. */
+     * every path below carries it with the rows, and no result keeps it.
+     * The same walk reads an output that names a list as the whole list in
+     * every row (update_whole_list_value, #1570). */
     ray_t* work = NULL;
     ray_t* fv_dict = fv_bind(dict, tbl, false, &work);
     if (fv_dict && RAY_IS_ERR(fv_dict)) { ray_release(tbl); return fv_dict; }
