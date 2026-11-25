@@ -15,8 +15,10 @@ on:
   #                      ndebug, the full-length fuzz-smoke and test-full:
   #                      the gate before anything ships.
   # The nightly workflow also runs ndebug and macOS release on dev.
-  # No push triggers: a post-merge `push` run only re-tests what the queue
-  # already validated.  Direct pushes to a branch are not expected.
+  # No push triggers here: a post-merge `push` run would only re-test what
+  # the queue validated.  The one exception is macOS debug, which also runs
+  # on every push to dev (macos-dev.yml), since hosted macOS capacity can
+  # leave the queue's macOS leg without a runner.
   pull_request:
     branches: [master, dev]
   merge_group:
@@ -57,7 +59,9 @@ jobs:
   # The Linux legs on every event; macOS debug on QUEUE and RELEASE (one
   # macOS job per merge-group build: the hosted macOS concurrency is small);
   # macOS release on RELEASE only.  The matrix is chosen per event
-  # (fromJSON), so the job name and the steps stay the same.
+  # (fromJSON), so the job name and the steps stay the same.  The queue's leg
+  # names are listed in .github/ci-success.sh (QUEUE_LEGS); change both
+  # together, or the macOS tolerance stops applying.
   build-and-test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -316,15 +320,32 @@ jobs:
   # job fails, and the explicit check fails it -- without that a failed need
   # would SKIP this job, and a skipped required check counts as passed,
   # silently opening the gate.  static-analysis is advisory and not in
-  # `needs`.  The logic reads only its env, so it can be run outside Actions
-  # to enumerate every combination (see the commit introducing the queue).
+  # `needs`.  One tolerance, merge queue only: a macOS debug leg GitHub never
+  # gave a runner (see .github/ci-success.sh).
   ci-success:
     needs: [build-and-test, docs, clang-current, gcc-12, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
+    # actions: read for this run's jobs and checks: read for the macOS leg's
+    # check-run annotations (the one tolerance below); nothing else.
+    permissions:
+      actions: read
+      checks: read
+      contents: read
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/ci-success.sh
+          sparse-checkout-cone-mode: false
+      # The verdict is .github/ci-success.sh, so it can be run and tested
+      # outside a workflow.  In the merge queue only, it tolerates a macOS
+      # debug leg GitHub never gave a runner in any attempt of the run
+      # (cancelled after three acquisition attempts, about 15 minutes, with
+      # no step run and GitHub's not-acquired annotation); that leg runs on
+      # the push to dev (macos-dev.yml).  Every other result fails as before.
       - name: Verify the jobs this tier requires passed
         env:
+          GH_TOKEN: ${{ github.token }}
           TIER: ${{ github.event_name == 'merge_group' && 'queue' || (github.base_ref == 'master' && 'release' || 'cheap') }}
           R_build_and_test: ${{ needs.build-and-test.result }}
           R_docs: ${{ needs.docs.result }}
@@ -333,16 +354,4 @@ jobs:
           R_ndebug: ${{ needs.ndebug.result }}
           R_fuzz_smoke: ${{ needs.fuzz-smoke.result }}
           R_tsan: ${{ needs.tsan.result }}
-        run: |
-          ok=1
-          want() {   # job, the result its tier requires
-            r=$(printenv "R_$1"); echo "$1: $r (want $2, tier $TIER)"
-            [ "$r" = "$2" ] || ok=0
-          }
-          want build_and_test success
-          want docs success
-          q=skipped; [ "$TIER" = cheap ] || q=success
-          for j in clang_current gcc_12 fuzz_smoke tsan; do want "$j" "$q"; done
-          n=skipped; [ "$TIER" = release ] && n=success
-          want ndebug "$n"
-          [ "$ok" = 1 ] || { echo "ci-success: a job this tier requires did not pass"; exit 1; }
+        run: bash .github/ci-success.sh

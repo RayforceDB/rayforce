@@ -1,0 +1,40 @@
+name: macOS on dev
+
+# macOS debug and the suite on every push to dev, as its own check (not one
+# the merge queue requires).  The queue runs the same leg, but hosted macOS
+# capacity sometimes leaves it without a runner, and ci-success then lets
+# the change land (.github/ci-success.sh); this run is where such a change
+# gets its macOS test.  A run in progress is never cancelled (landings
+# closer together than one macOS run would otherwise starve it); a newer
+# push replaces a run still pending, so dev's newest head is always tested.
+on:
+  push:
+    branches: [dev]
+
+concurrency:
+  group: macos-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MAKEFLAGS: -j4
+
+jobs:
+  macos-debug:
+    name: macos-debug (dev)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (debug)
+        run: make debug CC=clang
+      - name: Test (test)
+        run: make test CC=clang
+      - name: Upload test replay files
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-replay-macos-dev
+          path: /tmp/rayforce_replay.*
+          if-no-files-found: ignore
