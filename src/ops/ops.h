@@ -92,6 +92,22 @@ void     ray_cancel(void);
  * clearing of the first (src/lang/eval.c). */
 bool     ray_take_interrupt(void);
 void     ray_cancel_reset(void);
+/* A process cancel (ray_request_interrupt) is pending, whoever it is for. */
+bool     ray_interrupt_pending(void);
+
+/* The IPC request cancel (src/lang/eval.c, #1623): a client's cancel byte
+ * for the request a server evaluates is honoured only on the thread
+ * evaluating it, never consumed or cleared by a client thread. */
+typedef struct { const void* thread; bool cancelled; } ray_cancel_save_t;
+void     ray_cancel_request(void);            /* async-signal-safe */
+bool     ray_request_cancelled(void);         /* for the calling thread */
+void     ray_cancel_request_begin(ray_cancel_save_t* save);
+void     ray_cancel_request_end(const ray_cancel_save_t* save);
+void     ray_cancel_waiter(int delta);        /* a sync send waits (+1) or is done (-1) */
+void     ray_cancel_dispatch(bool open);      /* the calling thread's pool dispatch */
+void     ray_cancel_state_reset_for_test(void);
+/* The calling thread is one of the pool's workers (src/core/pool.c). */
+bool     ray_pool_on_worker(void);
 
 /* ===== Parted Types ===== */
 
