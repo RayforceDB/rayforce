@@ -65,10 +65,18 @@
 #include "ops/walkmemo.h"
 
 /* Debug builds check at every query's exit that its result holds no
- * private id (#1462; fv_holds_private, below). */
-#ifndef NDEBUG
+ * private id (#1462; fv_holds_private, below).  DEBUG, not NDEBUG: release
+ * builds keep assert() live, and the walk reads every SYM and LIST cell of
+ * the result (#1672).  It aborts itself rather than through assert(), so a
+ * DEBUG build with NDEBUG (`make test-ndebug`) checks too. */
+#ifdef DEBUG
 static bool fv_holds_private(ray_t* v, int depth);
-#define fv_assert_no_private(v) assert(!fv_holds_private((v), 0))
+static void fv_private_leaked(const char* file, int line) {
+    fprintf(stderr, "%s:%d: a query result holds a private id\n", file, line);
+    abort();
+}
+#define fv_assert_no_private(v) \
+    do { if (fv_holds_private((v), 0)) fv_private_leaked(__FILE__, __LINE__); } while (0)
 #else
 #define fv_assert_no_private(v) ((void)0)
 #endif
@@ -20714,7 +20722,7 @@ static ray_t* fv_strip_private(ray_t* tbl) {
     return out ? out : ray_error("oom", NULL);
 }
 
-#ifndef NDEBUG
+#ifdef DEBUG
 /* Does `v` hold a private id anywhere: a symbol atom or cell, a table's
  * column name or cell, a dict key or value, a list element, a lambda's
  * code, constants or captures (recursively, `depth` bounded)?  A lazy
