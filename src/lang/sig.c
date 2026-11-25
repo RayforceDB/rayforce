@@ -214,6 +214,7 @@ static const ray_sig_entry_t sigs[] = {
     {".log.replay_report", "(.log.replay_report <path: str>)"},
     {".log.validate", "(.log.validate <path: str>)"},
     {".repl.complete", "(.repl.complete <prefix: str>)"},
+    {".repl.signature", "(.repl.signature <name: sym>)"},
     {"ser", "(ser <x: any>)"},
     {"de", "(de <bytes: U8 vector>)"},
     {"raise", "(raise <message: str>)"},

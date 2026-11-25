@@ -28,6 +28,7 @@
 #include "app/repl.h"
 #include "lang/env.h"
 #include "lang/sig.h"
+#include "lang/inspect.h"
 #include "lang/nfo.h"
 #include "lang/parse.h"
 #include "core/types.h"
@@ -6868,6 +6869,9 @@ static void ray_register_builtins(void) {
      * user bindings whose name begins with the given prefix.  RAY_FN_NONE
      * so remote editor clients can query it over IPC. */
     register_unary(".repl.complete",   RAY_FN_NONE,       ray_repl_complete_fn);
+    /* Read-only metadata of a named global for editor tooling (#947):
+     * calls and evaluates nothing, names only, so allowed under -U. */
+    register_unary(".repl.signature",  RAY_FN_NONE,       ray_repl_signature_fn);
 
     /* Transaction-log journaling under `.log.*` — the -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at

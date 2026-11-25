@@ -52,7 +52,7 @@ Listed from `src/lang/eval.c` in this checkout. The categorized reference below 
 `norm`, `inv`, `flip`, `gram`, `.emb.hnsw.free`, `.emb.hnsw.get`, `.emb.hnsw.info`, `.emb.model.get`, `.emb.model.info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
 `.idx.drop`, `.idx.has?`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
 `.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`,
-`.parquet.meta`, `.mc.unsub`, `.idx.uses`, `.repl.complete`, `.mem.objsize`
+`.parquet.meta`, `.mc.unsub`, `.idx.uses`, `.repl.complete`, `.repl.signature`, `.mem.objsize`
 
 ### Binary
 
@@ -758,6 +758,7 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
 | `.idx.uses` | unary | — | Per-column count of index hits since the previous call; the first call arms the counter. See [`.idx.uses`](../namespaces/idx.md#idx-uses) | `(.idx.uses t)` → `{a:1}` |
 | `.repl.complete` | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix. See [`.repl.complete`](../namespaces/repl.md#repl-complete) | `(.repl.complete "xas")` → `[xasc]` |
+| `.repl.signature` | unary | — | How a named global is called: kind, calling convention, special form, lambda parameters, documented usage; calls nothing. See [`.repl.signature`](../namespaces/repl.md#repl-signature) | `(at (.repl.signature 'min) 'kind)` → `'unary` |
 
 ```lisp
 ; Metaprogramming: parse and eval
