@@ -11357,13 +11357,7 @@ static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, in
  * the grouping honours the same selection). */
 /* ---- the slot coding of a SYM column whose domain bounds the key
  * (derived_key_over_values_al, vocab_small): per task, the ids its rows
- * show first, in row order.  Each task keeps a bitmap of the domain while
- * it runs: the tasks of a pass are halved until their bitmaps fit
- * DKV_BITMAP_BUDGET together (64 MB: 28 tasks over an 18M-id domain, one
- * task past a 512M-id domain), whatever the pool's size — 1024 tasks over
- * 18M ids would hold 2.3 GB of bitmaps.  The id lists add at most 4 bytes
- * a row over the pass (as the codes do), each freed as soon as it is
- * merged. */
+ * show first, in row order (dkv_task_t below). */
 #define DKV_BITMAP_BUDGET ((uint64_t)64 << 20)
 #ifdef DEBUG
 static uint64_t g_dkv_bitmap_budget_test = 0;
@@ -11384,23 +11378,83 @@ static int64_t dk_mem_budget(void) {
 #endif
     return ray_heap_mem_budget();
 }
+/* The symbol ids a column uses, as a bitmap of its domain (dn bits: 16 MB
+ * for a 131M-entry shared symfile) with a popcount prefix per 64-bit word
+ * (dn/16 bytes): dk_used_rank gives each used id its rank among the used
+ * ones — the slot coding and its gate are sized by the USED vocabulary,
+ * never by the domain (a shared symfile holds every text column's words:
+ * 131M entries behind a URL column of 18M). */
+typedef struct {
+    const void*   cd;
+    uint8_t       cattrs;
+    int64_t       dn;
+    uint64_t*     bits;      /* [ceil(dn/64)] */
+    atomic_bool   foreign;   /* an id past the domain */
+} dk_used_ctx_t;
+static void dk_used_mark_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    dk_used_ctx_t* c = (dk_used_ctx_t*)vctx;
+    for (int64_t r = start; r < end; r++) {
+        int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
+        if (id < 0 || id >= c->dn) { atomic_store_explicit(&c->foreign, true, memory_order_relaxed); return; }
+        uint64_t m = (uint64_t)1 << (id & 63);
+        _Atomic(uint64_t)* w = (_Atomic(uint64_t)*)&c->bits[id >> 6];
+        if (!(atomic_load_explicit(w, memory_order_relaxed) & m)) atomic_fetch_or_explicit(w, m, memory_order_relaxed);
+    }
+}
+static inline int64_t dk_used_rank(const uint64_t* bits, const uint32_t* prefix, int64_t id) {
+    return (int64_t)prefix[id >> 6] + __builtin_popcountll(bits[id >> 6] & (((uint64_t)1 << (id & 63)) - 1));
+}
+/* Mark the ids of C's n rows (in parallel) and rank them: *bits and
+ * *prefix in one scratch block (*hdr), the used count returned; -1 on OOM,
+ * a foreign id or a cancel (nothing kept). */
+static int64_t dk_used_vocab(ray_t* C, int64_t n, int64_t dn, ray_pool_t* rpool,
+                             ray_t** hdr, uint64_t** bits, uint32_t** prefix) {
+    int64_t words = (dn + 63) / 64;
+    char* mem = (char*)scratch_calloc(hdr, (size_t)words * sizeof(uint64_t) + (size_t)(words + 1) * sizeof(uint32_t));
+    if (!mem) return -1;
+    *bits = (uint64_t*)mem;
+    *prefix = (uint32_t*)(mem + (size_t)words * sizeof(uint64_t));
+    dk_used_ctx_t uc = { .cd = ray_data(C), .cattrs = C->attrs, .dn = dn, .bits = *bits };
+    atomic_init(&uc.foreign, false);
+    if (ray_pool_par_dispatch_ok(rpool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(rpool, dk_used_mark_fn, &uc, n);
+    else dk_used_mark_fn(&uc, 0, 0, n);
+    if (pool_cancelled(rpool) || atomic_load_explicit(&uc.foreign, memory_order_relaxed)) {
+        scratch_free(*hdr); *hdr = NULL; return -1;
+    }
+    uint64_t used = 0;
+    for (int64_t w = 0; w < words; w++) { (*prefix)[w] = (uint32_t)used; used += (uint64_t)__builtin_popcountll((*bits)[w]); }
+    (*prefix)[words] = (uint32_t)used;
+    return (int64_t)used;
+}
+
+/* ---- the slot coding of a SYM column whose used vocabulary bounds the key
+ * (derived_key_over_values_al, vocab_small): per task, the ids its rows
+ * show first, in row order.  Each task keeps a bitmap over the USED ranks
+ * while it runs: the tasks of a pass are halved until their bitmaps fit
+ * DKV_BITMAP_BUDGET together (64 MB: 28 tasks over 18M used ids, one task
+ * past 512M), whatever the pool's size.  The id lists add at most 4 bytes
+ * a row over the pass (as the codes do), each freed as soon as it is
+ * merged. */
 typedef struct {
     ray_t*   ids_hdr;
     int32_t* ids;        /* the task's first-seen ids, in row order */
     int64_t  n;
     ray_t*   seen_hdr;
-    uint8_t* seen;       /* a bit per id of the domain */
+    uint8_t* seen;       /* a bit per used rank */
     bool     fail;       /* OOM, or an id past the domain (a foreign one) */
 } dkv_task_t;
 typedef struct {
-    const void*    cd;
-    uint8_t        cattrs;
-    int64_t        dn, n;
-    uint32_t       tasks;
-    int64_t        n_segs;
-    dkv_task_t*    tk;
-    const int32_t* pos;   /* after the merge: the slot of each id */
-    int32_t*       code;  /* [n] */
+    const void*     cd;
+    uint8_t         cattrs;
+    int64_t         dn, n, used;
+    const uint64_t* bits;    /* the used ids and their ranks (dk_used_vocab) */
+    const uint32_t* prefix;
+    uint32_t        tasks;
+    int64_t         n_segs;
+    dkv_task_t*     tk;
+    const int32_t*  slot;    /* after the merge: the slot of each used rank */
+    int32_t*        code;    /* [n], or NULL (the text projection spreads straight from the column) */
 } dkv_ctx_t;
 static void dkv_rows_of(const dkv_ctx_t* c, int64_t ti, int64_t* lo, int64_t* hi) {
     *lo = c->n_segs * ti / c->tasks * RAY_MORSEL_ELEMS;
@@ -11414,15 +11468,16 @@ static void dkv_list_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         dkv_task_t* t = &c->tk[ti];
         int64_t lo, hi;
         dkv_rows_of(c, ti, &lo, &hi);
-        int64_t cap = hi - lo < c->dn ? hi - lo : c->dn;
-        t->seen = (uint8_t*)scratch_calloc(&t->seen_hdr, (size_t)((c->dn + 7) / 8));
+        int64_t cap = hi - lo < c->used ? hi - lo : c->used;
+        t->seen = (uint8_t*)scratch_calloc(&t->seen_hdr, (size_t)((c->used + 7) / 8));
         t->ids  = cap > 0 ? (int32_t*)scratch_alloc(&t->ids_hdr, (size_t)cap * sizeof(int32_t)) : NULL;
         if (!t->seen || (cap > 0 && !t->ids)) { t->fail = true; continue; }
         for (int64_t r = lo; r < hi; r++) {
             int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
             if (id < 0 || id >= c->dn) { t->fail = true; break; }
-            uint8_t* b = &t->seen[id >> 3];
-            uint8_t m = (uint8_t)(1u << (id & 7));
+            int64_t rk = dk_used_rank(c->bits, c->prefix, id);
+            uint8_t* b = &t->seen[rk >> 3];
+            uint8_t m = (uint8_t)(1u << (rk & 7));
             if (!(*b & m)) { *b |= m; t->ids[t->n++] = (int32_t)id; }
         }
         scratch_free(t->seen_hdr);   /* the bitmap served its task: only the list stays */
@@ -11430,17 +11485,19 @@ static void dkv_list_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     }
 }
 typedef struct {
-    const void*    cd;
-    uint8_t        cattrs;
-    const int32_t* pos;
-    const uint8_t* key;   /* the W8 position of each slot's text */
-    uint8_t*       out;
+    const void*     cd;
+    uint8_t         cattrs;
+    const uint64_t* bits;
+    const uint32_t* prefix;
+    const int32_t*  slot;
+    const uint8_t*  key;   /* the W8 position of each slot's text */
+    uint8_t*        out;
 } dkv_spread_ctx_t;
 static void dkv_spread_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     const dkv_spread_ctx_t* c = (const dkv_spread_ctx_t*)vctx;
     for (int64_t r = start; r < end; r++)
-        c->out[r] = c->key[c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->cattrs)]];
+        c->out[r] = c->key[c->slot[dk_used_rank(c->bits, c->prefix, ray_read_sym(c->cd, r, RAY_SYM, c->cattrs))]];
 }
 static void dkv_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
@@ -11449,7 +11506,7 @@ static void dkv_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
         int64_t lo, hi;
         dkv_rows_of(c, ti, &lo, &hi);
         for (int64_t r = lo; r < hi; r++)
-            c->code[r] = c->pos[ray_read_sym(c->cd, r, RAY_SYM, c->cattrs)];
+            c->code[r] = c->slot[dk_used_rank(c->bits, c->prefix, ray_read_sym(c->cd, r, RAY_SYM, c->cattrs))];
     }
 }
 static void dks_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -11697,16 +11754,29 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
      * probe: `like` over SYM is already evaluated per distinct symbol
      * row-wise, so the per-value key would only trade time for the smaller
      * key column. */
-    /* ...and a by-dict's text key when the row-wise STR key column alone
-     * (16 bytes a row, two of them 3.2 GB over 100M rows) would take more
-     * than an eighth of the memory the query may plan for (dk_mem_budget:
-     * the watermark, else the RAM or container limit): under a small
-     * budget the per-symbol key — a byte a row — is what keeps the query
-     * off the spill; with room to spare the probe decides, as `like` over
-     * SYM is already evaluated per distinct symbol row-wise. */
-    const bool bydict_mem = text_syms && !al && sym && !sel && dn * 4 <= n &&
-                            (uint64_t)n * 16 > (uint64_t)dk_mem_budget() / 8;
-    const bool vocab_small = (al || bydict_mem) && sym && !sel && dn * 4 <= n;
+    /* The inner select's text projection, and a by-dict's text key when the
+     * row-wise STR key column alone (16 bytes a row, two of them 3.2 GB
+     * over 100M rows) would take more than an eighth of the memory the
+     * query may plan for (dk_mem_budget: the watermark, else the RAM or
+     * container limit), are evaluated per symbol — through the slot coding
+     * below, a byte a row — when the column USES at most a quarter as many
+     * symbols as it has rows (dk_used_vocab: the used ids of the domain,
+     * never the domain's size — a shared symfile holds every text column's
+     * words).  Under a small budget that keeps the query off the spill;
+     * with room to spare the by-dict key lets the probe decide, as `like`
+     * over SYM is already evaluated per distinct symbol row-wise. */
+    ray_t*    used_hdr = NULL;
+    uint64_t* used_bits = NULL;
+    uint32_t* used_prefix = NULL;
+    int64_t   used = 0;
+    bool vocab_small = false;
+    if (sym && !sel && dn <= INT32_MAX && n >= 4 &&
+        (al || (text_syms && (uint64_t)n * 16 > (uint64_t)dk_mem_budget() / 8))) {
+        used = dk_used_vocab(C, n, dn, ray_pool_get(), &used_hdr, &used_bits, &used_prefix);
+        if (used > 0 && used * 4 <= n) vocab_small = true;
+        else if (used_hdr) { scratch_free(used_hdr); used_hdr = NULL; }
+        if (used < 0 && pool_cancelled(ray_pool_get())) return NULL;
+    }
     /* the text projection's rows take their slots straight from the column
      * at the spread (no code a row); a by-dict key of any type keeps the
      * codes for the typed spread */
@@ -11762,44 +11832,48 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     }
     bool ok = true;
     dks_task_t g; memset(&g, 0, sizeof g);
-    ray_t* slot_pos_hdr = NULL;          /* direct_spread: the slot of each id, to the spread */
+    ray_t* slot_pos_hdr = NULL;          /* direct_spread: the slot of each used rank, to the spread */
     const int32_t* slot_pos = NULL;
+    ray_t* pre_dom_vec = NULL;           /* vocab_small: the distinct ids, in slot order */
     if (vocab_small) {
-        /* The vocabulary bounds the key: the rows are coded through one
-         * int32 slot per symbol id (72 MB for 18M URLs) — the hash tables
+        /* The used vocabulary bounds the key: the rows are coded through
+         * one int32 slot per used id (72 MB for 18M URLs) — the hash tables
          * per task would hold every value of the task's rows (the values of
          * such a column can all differ within a task while they repeat
          * across tasks), 1.7 GB and 480 ms over 5M rows of 1M URLs.  Each
-         * task lists the ids its rows show first (a bitmap of the domain
-         * per task), the lists are merged in task order — the tasks hold
-         * row ranges in order, so the slots come out in first-seen row
-         * order, as the hashed values do — and the rows take their slots
-         * in parallel. */
+         * task lists the ids its rows show first, the lists are merged in
+         * task order — the tasks hold row ranges in order, so the slots
+         * come out in first-seen row order, as the hashed values do — and
+         * the rows take their slots in parallel.  The distinct ids go
+         * straight into the domain vector of the evaluation. */
         ray_t* pos_hdr = NULL;
-        int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
-        g.hash  = (uint64_t*)ray_alloc_raw((size_t)dn * sizeof(uint64_t));
-        g.first = (int64_t*)ray_alloc_raw((size_t)dn * sizeof(int64_t));
+        int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)used * sizeof(int32_t));
+        pre_dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), used);
+        if (pre_dom_vec && RAY_IS_ERR(pre_dom_vec)) { ray_error_free(pre_dom_vec); pre_dom_vec = NULL; }
         uint32_t vtasks = tasks;
         {
             uint64_t budget = DKV_BITMAP_BUDGET;
 #ifdef DEBUG
             if (g_dkv_bitmap_budget_test) budget = g_dkv_bitmap_budget_test;
 #endif
-            while (vtasks > 1 && (uint64_t)vtasks * (uint64_t)((dn + 7) / 8) > budget) vtasks /= 2;
+            while (vtasks > 1 && (uint64_t)vtasks * (uint64_t)((used + 7) / 8) > budget) vtasks /= 2;
         }
         ray_t* vt_hdr = NULL;
         dkv_task_t* vt = (dkv_task_t*)scratch_calloc(&vt_hdr, (size_t)vtasks * sizeof(dkv_task_t));
-        if (!pos || !g.hash || !g.first || !vt) {
+        if (!pos || !pre_dom_vec || !vt) {
             if (pos_hdr) scratch_free(pos_hdr);
             if (vt_hdr) scratch_free(vt_hdr);
-            dks_task_free(&g);
+            if (pre_dom_vec) ray_release(pre_dom_vec);
+            scratch_free(used_hdr);
             ray_release(ids);
             scratch_free(tk_hdr);
             return NULL;
         }
-        memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
-        dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .tasks = vtasks,
-                         .n_segs = c.n_segs, .tk = vt, .pos = pos, .code = ids ? (int32_t*)ray_data(ids) : NULL };
+        ray_sym_vec_adopt_domain(pre_dom_vec, C);
+        memset(pos, 0xff, (size_t)used * sizeof(int32_t));
+        dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .used = used,
+                         .bits = used_bits, .prefix = used_prefix, .tasks = vtasks, .n_segs = c.n_segs,
+                         .tk = vt, .slot = pos, .code = ids ? (int32_t*)ray_data(ids) : NULL };
         if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_list_fn, &vc, vtasks);
         else dkv_list_fn(&vc, 0, 0, 1);
         ok = !pool_cancelled(rpool);
@@ -11807,21 +11881,33 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
         for (uint32_t t = 0; t < vtasks; t++) {
             for (int64_t l = 0; l < vt[t].n && ok; l++) {
                 int64_t id = vt[t].ids[l];
-                if (pos[id] < 0) { pos[id] = (int32_t)g.du; g.hash[g.du] = (uint64_t)id; g.first[g.du] = 0; g.du++; }
+                int64_t rk = dk_used_rank(used_bits, used_prefix, id);
+                if (pos[rk] < 0) {
+                    pos[rk] = (int32_t)g.du;
+                    write_col_i64(ray_data(pre_dom_vec), g.du, id, pre_dom_vec->type, pre_dom_vec->attrs);
+                    g.du++;
+                }
             }
             if (vt[t].ids_hdr) scratch_free(vt[t].ids_hdr);
             if (vt[t].seen_hdr) scratch_free(vt[t].seen_hdr);
         }
         scratch_free(vt_hdr);
+        pre_dom_vec->len = g.du;
         if (ok && g.du > 0 && ids) {
             if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_code_fn, &vc, vtasks);
             else dkv_code_fn(&vc, 0, 0, 1);
             ok = !pool_cancelled(rpool);
         }
         if (ok && g.du > 0) agg_route_note_key_slot_tasks(vtasks);
-        if (ids) { scratch_free(pos_hdr); pos_hdr = NULL; pos = NULL; }
+        if (ids) { scratch_free(pos_hdr); pos_hdr = NULL; pos = NULL; scratch_free(used_hdr); used_hdr = NULL; }
         scratch_free(tk_hdr); tk_hdr = NULL;
-        if (!ok || g.du == 0) { if (pos_hdr) scratch_free(pos_hdr); dks_task_free(&g); ray_release(ids); return NULL; }
+        if (!ok || g.du == 0) {
+            if (pos_hdr) scratch_free(pos_hdr);
+            if (used_hdr) scratch_free(used_hdr);
+            ray_release(pre_dom_vec);
+            ray_release(ids);
+            return NULL;
+        }
         slot_pos_hdr = pos_hdr; slot_pos = pos;
         goto grouped;
     }
@@ -11885,7 +11971,9 @@ grouped:
     {
         int64_t du = g.du;
         ray_t* dom_vec = NULL;
-        if (sym) {
+        if (pre_dom_vec) {
+            dom_vec = pre_dom_vec;
+        } else if (sym) {
             dom_vec = ray_sym_vec_new(ray_sym_dict_width(dn), du);
             if (dom_vec && !RAY_IS_ERR(dom_vec)) {
                 ray_sym_vec_adopt_domain(dom_vec, C);
@@ -11896,7 +11984,7 @@ grouped:
         } else {
             ray_t* pv_hdr = NULL;
             const char** ptrs = (const char**)scratch_alloc(&pv_hdr, (size_t)du * (sizeof(char*) + sizeof(uint32_t)));
-            if (!ptrs) { dks_task_free(&g); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
+            if (!ptrs) { dks_task_free(&g); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL; }
             uint32_t* lens = (uint32_t*)(ptrs + du);
             for (int64_t i = 0; i < du; i++) {
                 const ray_str_t* sv = &el[g.first[i]];
@@ -11907,17 +11995,17 @@ grouped:
             scratch_free(pv_hdr);
         }
         dks_task_free(&g);
-        if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
+        if (!dom_vec || RAY_IS_ERR(dom_vec)) { if (dom_vec) ray_error_free(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL; }
         if (sym) {
             key_dom = derived_key_str_chunks(by_expr, ref_syms[0], dom_vec, dom, du);
             if (key_dom && RAY_IS_ERR(key_dom)) { ray_error_free(key_dom); key_dom = NULL; }
-            if (!key_dom && pool_cancelled(rpool)) { ray_release(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
+            if (!key_dom && pool_cancelled(rpool)) { ray_release(dom_vec); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL; }
         }
         if (key_dom) { ray_release(dom_vec); goto evaluated; }
         ray_t* mini = ray_table_new(0);
         if (mini && !RAY_IS_ERR(mini)) mini = ray_table_add_col(mini, ref_syms[0], dom_vec);
         ray_release(dom_vec);
-        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
+        if (!mini || RAY_IS_ERR(mini)) { if (mini) ray_error_free(mini); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL; }
         ray_t* ev = by_expr;
         if (al && al->expr && dk_bind_aliases(&mini, al, tbl, ref_syms[0], du)) ev = al->expr;
         ray_graph_t* g2 = ray_graph_new(mini);
@@ -11929,10 +12017,10 @@ grouped:
         }
         ray_release(mini);
         if (key_dom && !RAY_IS_ERR(key_dom) && ray_is_lazy(key_dom)) key_dom = ray_lazy_materialize(key_dom);
-        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL; }
+        if (!key_dom || RAY_IS_ERR(key_dom)) { if (key_dom) ray_error_free(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL; }
 evaluated:
         if (!(ray_is_vec(key_dom) || key_dom->type == RAY_LIST) || ray_len(key_dom) != du) {
-            ray_release(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); return NULL;
+            ray_release(key_dom); ray_release(ids); if (slot_pos_hdr) scratch_free(slot_pos_hdr); if (used_hdr) scratch_free(used_hdr); return NULL;
         }
     }
     ray_profile_tick("derived key: values evaluated");
@@ -11961,14 +12049,15 @@ evaluated:
             if (spread && !RAY_IS_ERR(spread)) {
                 spread->len = n;
                 ray_sym_vec_adopt_domain(spread, key_dom);
-                dkv_spread_ctx_t sc = { .cd = kind.cd, .cattrs = kind.cattrs, .pos = slot_pos,
-                                        .key = (const uint8_t*)ray_data(key_dom), .out = (uint8_t*)ray_data(spread) };
+                dkv_spread_ctx_t sc = { .cd = kind.cd, .cattrs = kind.cattrs, .bits = used_bits, .prefix = used_prefix,
+                                        .slot = slot_pos, .key = (const uint8_t*)ray_data(key_dom), .out = (uint8_t*)ray_data(spread) };
                 if (par) ray_pool_dispatch(rpool, dkv_spread_fn, &sc, n);
                 else     dkv_spread_fn(&sc, 0, 0, n);
                 if (pool_cancelled(rpool)) { ray_release(spread); spread = NULL; }
             } else { if (spread) ray_error_free(spread); spread = NULL; }
         }
         scratch_free(slot_pos_hdr);
+        scratch_free(used_hdr);
         ray_release(key_dom);
         if (!spread) return NULL;
         ray_profile_tick("derived key: keys spread");

@@ -581,14 +581,17 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     ray_release(r);
 #ifndef RAY_OS_WINDOWS
     /* A FILE-domain column whose first 65536 rows read as near-unique (the
-     * 50000 distinct values come first) over 240000 rows: the vocabulary is
-     * under a quarter of the rows, so an inner select's text projection is
-     * evaluated per symbol without the probe — a URL column of 18M values
-     * over 100M rows is this shape. */
+     * 50000 distinct values come first) over 240000 rows, in a symfile the
+     * table's other text column fills with 240000 words of its own (the
+     * domain is 290000 entries — more than the rows — as a shared symfile
+     * is behind a URL column of 18M values over 100M rows): the column USES
+     * under a quarter as many symbols as it has rows, so an inner select's
+     * text projection is evaluated per symbol without the probe. */
     r = ray_eval_str("(do (.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\") "
                      "(set j (til 240000)) "
                      "(set uu (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" \"https://b/%.php\") (% k 50000))) j))) "
-                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t\" (table [u v] (list uu (% j 7)))) "
+                     "(set ww (as 'SYMBOL (map (fn [k] (format \"w%\" k)) j))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t\" (table [w u v] (list ww uu (% j 7)))) "
                      "(set TF (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t\")) 0)");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     agg_route_reset();
@@ -638,7 +641,7 @@ static test_result_t test_derived_key_per_symbol_route(void) {
      * the second half of the rows alone shows comes last, whatever task
      * coded its rows. */
     r = ray_eval_str("(do (set u3 (as 'SYMBOL (map (fn [k] (format (if (== 0 (% k 2)) \"http://a/%.html\" (< k 120000) \"https://b/%.php\" \"https://c/%.jpg\") (% k 25000))) j))) "
-                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t3\" (table [u v] (list u3 (% j 7)))) "
+                     "(.db.splayed.set \"/tmp/rf_agg_contract_dkgate/t3\" (table [w u v] (list ww u3 (% j 7)))) "
                      "(set TF3 (.db.splayed.get \"/tmp/rf_agg_contract_dkgate/t3\")) 0)");
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
     agg_route_reset();
