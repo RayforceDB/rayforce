@@ -24,6 +24,7 @@
 #include "lang/internal.h"
 #include "ops/ops.h"   /* RAY_LAZY, ray_is_lazy, ray_lazy_materialize */
 #include "ops/internal.h" /* ray_table_col_value */
+#include "ops/walkmemo.h"
 #include "lang/format.h"   /* ray_type_name (error context) */
 #include "core/platform.h" /* ray_stack_short: the depth guard */
 
@@ -287,7 +288,7 @@ static ray_t* eq_key_find(ray_t* keys, ray_t* probes) {
 
 /* Keep equality's container shape while delegating cells to the existing
  * atomic mapper, including numeric promotion and nested lists. */
-static ray_t* eq_container(ray_t* a, ray_t* b) {
+static inline __attribute__((always_inline)) ray_t* eq_container(ray_t* a, ray_t* b) {
     bool tables = a->type == RAY_TABLE || b->type == RAY_TABLE;
     ray_t* shape = tables ? (a->type == RAY_TABLE ? a : b)
                           : (a->type == RAY_DICT ? a : b);
@@ -421,9 +422,20 @@ static ray_t* eq_container(ray_t* a, ray_t* b) {
     return ray_dict_new(outkeys, result);
 }
 
+/* A shared dict or table compared again in one element-wise `==` gives the
+ * same answer: kept for the outermost call (#1627). */
+static _Thread_local ray_walk_memo_t g_eq_memo;
+typedef struct { ray_t* a; ray_t* b; } eq_ctx_t;
+static ray_t* eq_container_run(void* p) { eq_ctx_t* c = p; return eq_container(c->a, c->b); }
+__attribute__((noinline)) static ray_t* eq_container_memo(ray_t* a, ray_t* b) {
+    eq_ctx_t c = { a, b };
+    return ray_wm_result(&g_eq_memo, a, b, 0, eq_container_run, &c);
+}
 ray_t* ray_eq_fn(ray_t* a, ray_t* b) {
-    if (a->type == RAY_DICT || b->type == RAY_DICT || a->type == RAY_TABLE || b->type == RAY_TABLE)
+    if (a->type == RAY_DICT || b->type == RAY_DICT || a->type == RAY_TABLE || b->type == RAY_TABLE) {
+        if (RAY_UNLIKELY(ray_wm_reused(a) || ray_wm_reused(b))) return eq_container_memo(a, b);
         return eq_container(a, b);
+    }
     if (ray_has_timespan(a) || ray_has_timespan(b)) return ray_timespan_binary(OP_EQ, a, b);
     /* Handle null forms (RAY_NULL_OBJ, typed null atoms) */
     RAY_ASSERT_VALUE(a); RAY_ASSERT_VALUE(b);
@@ -503,7 +515,26 @@ ray_t* ray_neq_fn(ray_t* a, ray_t* b) {
  * through `fn`, so a nested list recurses, and a result whose elements
  * are all booleans is a B8 vector.  An atom broadcasts; two collections
  * must have the same length. */
+static ray_t* logic_map_c(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b);
+/* A shared operand's answer is kept for the outermost `and` / `or` (#1627). */
+static _Thread_local ray_walk_memo_t g_logic_memo;
+typedef struct { ray_binary_fn fn; const char* name; ray_t* a; ray_t* b; } logic_ctx_t;
+static ray_t* logic_map_run(void* p) {
+    logic_ctx_t* c = p;
+    return logic_map_c(c->fn, c->name, c->a, c->b);
+}
 static ray_t* logic_map(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b) {
+    if (RAY_LIKELY(!ray_wm_reused(a) && !ray_wm_reused(b))) return logic_map_c(fn, name, a, b);
+    logic_ctx_t c = { fn, name, a, b };
+    return ray_wm_result(&g_logic_memo, a, b, (uint64_t)(uintptr_t)fn, logic_map_run, &c);
+}
+static ray_t* logic_map_c(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b) {
+    /* A list's cells go through here again: one frame per level of
+     * nesting, and a value can be nested arbitrarily deep (#1591, #1627).
+     * Stop at the thread's stack reserve, as `not` and the other
+     * element-wise maps do. */
+    if ((a->type == RAY_LIST || b->type == RAY_LIST) && RAY_UNLIKELY(ray_stack_short()))
+        return ray_error("limit", "%s: value nested too deep for this thread's stack", name);
     int ac = is_collection(a), bc = is_collection(b);
     if (ac && bc && ray_len(a) != ray_len(b))
         return ray_error("length", "%s: operand lengths must match, got %lld and %lld",
@@ -582,16 +613,50 @@ ray_t* ray_or_fn(ray_t* a, ray_t* b) {
  * If the accumulator is a vector we cannot short-circuit (subsequent
  * args may be vectors that still need element-wise combination), so we
  * fall through to ray_and_fn / ray_or_fn for that step. */
-static ray_t* eval_and_short(ray_t* arg) {
+/* The row provenance of a value (lang/eval.c g_eval_rows: 1 rows, 0 not,
+ * -1 unknown) joined: one operand derived from the rows makes the result
+ * so; otherwise an unknown one makes it unknown. */
+static inline int8_t logic_rows_join(int8_t a, int8_t b) {
+    if (a == 1 || b == 1) return 1;
+    if (a < 0 || b < 0) return -1;
+    return 0;
+}
+
+static ray_t* eval_and_short(ray_t* arg, int8_t* rows) {
     ray_t* v = ray_eval(arg);
+    *rows = logic_rows_join(*rows, ray_eval_rows());
     if (!v || RAY_IS_ERR(v)) return v;
     if (ray_is_lazy(v)) v = ray_lazy_materialize(v);
     return v;
 }
 
+/* `and` / `or` combine their operands into a new value (ray_and_fn,
+ * ray_or_fn), so its provenance is every evaluated operand's joined, not
+ * the last one's: `(and (> v 15) true)` over a column is a value over the
+ * rows.  Whoever reads provenance after it (a `let` binding, a helper's
+ * result, the per-row pass's hidden locals, query.c ray_eval_last_rows)
+ * sees that.  A `while`'s test inside a query does not depend on it: it
+ * tests every vector as long as the rows (cond_rows_test, #1647). */
+static ray_t* and_vary_impl(ray_t** args, int64_t n, int8_t* rows);
+static ray_t* or_vary_impl(ray_t** args, int64_t n, int8_t* rows);
+
 ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
+    int8_t rows = 0;
+    ray_t* r = and_vary_impl(args, n, &rows);
+    ray_eval_set_rows(rows);
+    return r;
+}
+
+ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
+    int8_t rows = 0;
+    ray_t* r = or_vary_impl(args, n, &rows);
+    ray_eval_set_rows(rows);
+    return r;
+}
+
+static ray_t* and_vary_impl(ray_t** args, int64_t n, int8_t* rows) {
     if (n < 1) return ray_error("arity", "and: expected at least 1 arg, got %lld", (long long)n);
-    ray_t* acc = eval_and_short(args[0]);
+    ray_t* acc = eval_and_short(args[0], rows);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity: (and X) == X, (or X) == X — monoid identity
      * rule (Scheme/Haskell).  Enables programmatic AST construction like
@@ -607,7 +672,7 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
         return make_bool(0);
     }
     for (int64_t i = 1; i < n; i++) {
-        ray_t* v = eval_and_short(args[i]);
+        ray_t* v = eval_and_short(args[i], rows);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
         ray_t* next = ray_and_fn(acc, v);
         ray_release(acc);
@@ -619,9 +684,9 @@ ray_t* ray_and_vary_fn(ray_t** args, int64_t n) {
     return acc;
 }
 
-ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
+static ray_t* or_vary_impl(ray_t** args, int64_t n, int8_t* rows) {
     if (n < 1) return ray_error("arity", "or: expected at least 1 arg, got %lld", (long long)n);
-    ray_t* acc = eval_and_short(args[0]);
+    ray_t* acc = eval_and_short(args[0], rows);
     if (!acc || RAY_IS_ERR(acc)) return acc;
     /* Single arg = identity — see ray_and_vary_fn for rationale. */
     if (n == 1) return acc;
@@ -632,7 +697,7 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
         return make_bool(1);
     }
     for (int64_t i = 1; i < n; i++) {
-        ray_t* v = eval_and_short(args[i]);
+        ray_t* v = eval_and_short(args[i], rows);
         if (!v || RAY_IS_ERR(v)) { ray_release(acc); return v; }
         ray_t* next = ray_or_fn(acc, v);
         ray_release(acc);
@@ -645,7 +710,16 @@ ray_t* ray_or_vary_fn(ray_t** args, int64_t n) {
 }
 
 /* Unary */
+/* A shared list's answer is kept for the outermost `not` (#1627). */
+static ray_t* not_c(ray_t* x);
+static _Thread_local ray_walk_memo_t g_not_memo;
+static ray_t* not_run(void* p) { return not_c((ray_t*)p); }
 ray_t* ray_not_fn(ray_t* x) {
+    if (RAY_LIKELY(!x || RAY_IS_ERR(x) || x->type != RAY_LIST || !ray_wm_reused(x)))
+        return not_c(x);
+    return ray_wm_result(&g_not_memo, x, NULL, 0, not_run, x);
+}
+static ray_t* not_c(ray_t* x) {
     /* A list's cells go through here again: one frame per level (#1591). */
     if (x && !RAY_IS_ERR(x) && x->type == RAY_LIST && RAY_UNLIKELY(ray_stack_short()))
         return ray_error("limit", "not: value nested too deep for this thread's stack");
@@ -718,7 +792,41 @@ ray_t* ray_not_fn(ray_t* x) {
 }
 
 /* Whole-value equality deliberately does not use numeric promotion. */
+/* A pair of lists, dicts or tables met again in one comparison (#1627): the
+ * walk stops at the first difference, so a pair met before is identical or
+ * still being compared, and is not walked twice. */
+static _Thread_local ray_walk_memo_t g_identical_memo;
+static inline ray_t* identical_c(ray_t* a, ray_t* b);
+__attribute__((noinline)) static ray_t* identical_memo(ray_t* a, ray_t* b) {
+    ray_walk_memo_t* m = &g_identical_memo;
+    const void* skip = m->skip;
+    ray_t* r;
+    m->skip = a;   /* ray_identical_fn takes this pair into its own body */
+    if (!m->active) {   /* the outermost pair: it cannot recur inside itself */
+        ray_wm_begin(m);
+        r = ray_identical_fn(a, b);
+        ray_wm_end(m);
+    } else {
+        uint64_t met;
+        if (ray_wm_get(m, a, b, 0, &met)) {
+            r = make_bool(1);
+        } else {
+            ray_wm_put(m, a, b, 0, 1);
+            r = ray_identical_fn(a, b);
+        }
+    }
+    m->skip = skip;
+    return r;
+}
 ray_t* ray_identical_fn(ray_t* a, ray_t* b) {
+    if (a && b && RAY_UNLIKELY(ray_wm_reused(a) || ray_wm_reused(b)) && !RAY_IS_ERR(a) &&
+        !RAY_IS_ERR(b) && a->type == b->type &&
+        (a->type == RAY_LIST || a->type == RAY_DICT || a->type == RAY_TABLE) &&
+        a != g_identical_memo.skip)
+        return identical_memo(a, b);
+    return identical_c(a, b);
+}
+static inline ray_t* identical_c(ray_t* a, ray_t* b) {
     if (!a || !b) return ray_error("type", "identical: missing value");
     /* A list, dict or table compares its parts through here again: one
      * frame per level of nesting, and a value can be nested arbitrarily

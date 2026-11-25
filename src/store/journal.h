@@ -160,6 +160,9 @@ ray_err_t ray_journal_roll(void);
  * is fresh and a future restart loads .qdb instead of replaying the
  * old (now archived) log. */
 ray_err_t ray_journal_snapshot(void);
+/* The error the last ray_journal_snapshot failed with, when the serializer
+ * gave one (its code and message), owned by the caller; NULL otherwise. */
+ray_t* ray_journal_take_error(void);
 
 /* Where the next frame will be appended: the live log's generation and
  * byte offset.  False when nothing would be written. */

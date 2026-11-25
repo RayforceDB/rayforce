@@ -233,6 +233,11 @@ Grouped aggregates run on the parallel aggregation engine, which picks a strateg
 
 Without an explicit ordering clause, full grouped results can follow the selected
 strategy's group order. Use `asc:` or `desc:` when result positions matter.
+After a sort, groups that tie on the sort keys are meant to come in
+first-seen order. For integer, temporal and symbol group keys that is not
+guaranteed yet: the engine may emit such groups in key order
+([#1678](https://github.com/RayforceDB/rayforce/issues/1678)). Add the group key
+as a last sort key when the order of ties matters.
 A computed key (`by: (% v 3)`, `by: (xbar t 60)`) or a name holding a vector is
 evaluated into a column first and grouped as its by-dict spelling
 `by: {k: (% v 3)}` is, and an unordered `take:` keeps the first groups seen

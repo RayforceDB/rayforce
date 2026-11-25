@@ -13,6 +13,7 @@ Attach the local interactive REPL to a remote Rayforce server. While attached, e
 |---|---|---|---|
 | [`.repl.connect`](#repl-connect) | unary | restricted | Open an IPC session and route REPL input to it. |
 | [`.repl.disconnect`](#repl-disconnect) | variadic | restricted | Detach and close the active remote session. |
+| [`.repl.complete`](#repl-complete) | unary | — | Names the engine knows that start with a prefix, sorted. |
 
 ## `.repl.connect` { #repl-connect }
 
@@ -46,6 +47,15 @@ Signature: `(.repl.disconnect)`. Closes the remote handle, clears the active-han
 
 ```lisp
 (.repl.disconnect)
+```
+
+## `.repl.complete` { #repl-complete }
+
+Signature: `(.repl.complete prefix)`. Returns a sorted `sym` vector of the names that begin with the string `prefix`: builtins, keywords and the bindings of the live session. It is the engine side of the REPL's own tab completion, exposed as a read-only call so editor tooling can ask a running server over IPC. History-word completion is not included, since it is local to the terminal client. A prefix that is not a string raises `type`.
+
+```lisp
+(.repl.complete "xas")      ;; => [xasc]
+(.repl.complete "identi")   ;; => [identical]
 ```
 
 ## See also

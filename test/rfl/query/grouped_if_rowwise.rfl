@@ -231,19 +231,17 @@
 
 ;; ── an effect keeps the evaluator's route ───────────────────────────────────
 ;; The blend evaluates both arms over the column.  An expression with an
-;; effect is evaluated as before and no part of it twice.  That route's `if`
-;; tests its condition whole, so one that differs between a group's rows
-;; raises `nyi` rather than give every row the first arm (#1610, #1630): the
-;; condition runs once, under an aggregate for the first group only, and no
-;; arm is run.
+;; effect is evaluated as before and no part of it twice: under an aggregate
+;; once per group (3 groups), as a plain output once over the rows, and an
+;; arm of a vector condition is run as the choice needs both: once per group.
 (set n 0)
 (set fx (fn [v] (set n (+ n 1)) v))
-(select {from: F by: g q: (avg (if (fx (> c 4)) d (+ d 1)))}) !- nyi
-n -- 1
-(select {from: F by: g q: (if (fx (> c 4)) d (+ d 1))}) !- nyi
-n -- 2
-(select {from: F by: g q: (avg (if (> c 4) d (fx (+ d 1))))}) !- nyi
-n -- 2
+(count (select {from: F by: g q: (avg (if (fx (> c 4)) d (+ d 1)))})) -- 3
+n -- 3
+(count (select {from: F by: g q: (if (fx (> c 4)) d (+ d 1))})) -- 3
+n -- 4
+(count (select {from: F by: g q: (avg (if (> c 4) d (fx (+ d 1))))})) -- 3
+n -- 7
 
 ;; ── splayed ─────────────────────────────────────────────────────────────────
 (.sys.exec "rm -rf /tmp/rfl_grouped_if_rowwise/") -- 0

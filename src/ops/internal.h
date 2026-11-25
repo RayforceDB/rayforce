@@ -2040,6 +2040,56 @@ ray_t* desc_vec_eager(ray_t* x);
  * in idxop.h).  Set whenever an OP_AVG agg has a non-float input; SUM keeps
  * reading off_sum alone (int64 wraparound is its contract). */
 #define GHT_NEED_SUM128  0x20
+/* The variance family, OP_VAR_K / OP_VAR_D included: one accumulator
+ * (sums about a value k of the group, #1666). */
+static inline bool agg_op_is_var(uint16_t op) {
+    return op == OP_VAR || op == OP_VAR_POP || op == OP_STDDEV || op == OP_STDDEV_POP ||
+           op == OP_VAR_K || op == OP_VAR_D;
+}
+
+/* k minus k rounded to double, exact (its magnitude is at most half an ulp
+ * of k, below 2^10): OP_VAR_D's integer remainder. */
+static inline double ray_var_k_rem(int64_t k) {
+    double kf = (double)k;
+    if (kf >= 9223372036854775808.0)          /* k rounded up to 2^63 */
+        return (double)(int64_t)((uint64_t)k - (uint64_t)INT64_MAX) - 1.0;
+    return (double)(int64_t)((uint64_t)k - (uint64_t)(int64_t)kf);
+}
+
+/* A variance-family result from its shifted state: n non-null values,
+ * s1 = sum(x - k), s2 = sum((x - k)^2), k as an int64 (k_is_f false) or the
+ * bits of a double.  *is_null is set for too few values. */
+static inline double ray_var_final(uint16_t op, int64_t n, double s1, double s2,
+                                   bool k_is_f, int64_t k_bits, bool* is_null) {
+    bool sample = op == OP_VAR || op == OP_STDDEV;
+    *is_null = sample ? n <= 1 : n <= 0;
+    if (*is_null) return 0.0;
+    double dn = (double)n;
+    if (op == OP_VAR_K || op == OP_VAR_D) {
+        double kd;
+        if (k_is_f) memcpy(&kd, &k_bits, sizeof kd); else kd = (double)k_bits;
+        if (op == OP_VAR_K) return kd;
+        double dv = (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+        *is_null = !isfinite(dv);
+        return dv;
+    }
+    /* An intermediate that overflowed (#1669: the sums are doubles) makes
+     * the result null, never a number: only a finite rounding residue
+     * below 0 is taken as 0. */
+    double mean = s1 / dn;
+    double vp = s2 / dn - mean * mean;   /* an overflowed mean^2 leaves -inf */
+    if (!isfinite(s1) || !isfinite(s2) || !isfinite(vp)) { *is_null = true; return 0.0; }
+    if (vp < 0) vp = 0;
+    if (op == OP_VAR_POP) return vp;
+    if (op == OP_VAR) return vp * dn / (dn - 1);
+    if (op == OP_STDDEV_POP) return sqrt(vp);
+    return sqrt(vp * dn / (dn - 1));
+}
+
+/* VAR/STDDEV about the group's first value (#1666): an int64 block
+ * (off_var_k) holds each such slot's value, an integer or a double's bits,
+ * and off_sum / off_sumsq then hold the sums of (x - k) and its square. */
+#define GHT_NEED_VARK    0x40
 
 /* ── ght_layout_t — inline-or-spill, fixed-size, by-value embeddable ──
  *
@@ -2081,10 +2131,11 @@ ray_t* desc_vec_eager(ray_t* x);
                                * path (pair-skip contract).  Entry packing
                                * canonicalizes int y nulls (NaN in F64-packed
                                * entries, NULL_I64 in int-packed ones). */
+#define GHT_AF2_VAR      8u  /* VAR/STDDEV slot: accumulates about off_var_k */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
-typedef struct {
+typedef struct ght_layout_s {
     uint16_t entry_stride;
     uint16_t row_stride;
     uint16_t n_keys;           /* widened from uint8_t (unbounded-ready) */
@@ -2115,6 +2166,9 @@ typedef struct {
     /* High words of the 128-bit integer sums (GHT_NEED_SUM128); 0 when the
      * layout carries none. */
     uint16_t off_sum_hi;
+    /* The value each VAR/STDDEV slot centres on (GHT_NEED_VARK); 0 when the
+     * layout carries none. */
+    uint16_t off_var_k;
     /* Earliest contributing source row for this group.  Every packed entry
      * carries its source row in the tail slot; partition merges retain the
      * minimum so output order is independent of radix partition count. */
@@ -2146,6 +2200,12 @@ typedef struct {
      * group_key_f64_bits).  Pinned by group_extra/ght_packed_key_excludes_f64. */
     uint8_t  packed_key;
     uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
+    /* The row accumulator for an existing group (group.c ght_accum_fns):
+     * 0 plain, 1 plain with VAR / STDDEV about each slot's first value
+     * (#1666), 2 null-aware, 3 null-aware with VAR / STDDEV.  Chosen once by
+     * ght_compute_layout, so the per-entry call carries no test; a byte in
+     * the padding, so the layout keeps its size. */
+    uint8_t  accum_kind;
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
     int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
     uint8_t* agg_flags;        /* [n_aggs] GHT_AF_* per agg */
@@ -2339,6 +2399,14 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void);
  * depth (or no VM is bound); a disabled filter otherwise. */
 ray_group_emit_filter_t ray_group_emit_filter_active(void);
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
+/* A grouped select that sorts its groups (asc:/desc:) arms this for its own
+ * group node: the sort is stable and the group whose first source row comes
+ * first wins a tie, so its input must come in first-seen order on every route
+ * (#1664).  The dense slot routes emit slot (key value) order otherwise.  The
+ * depth is the select's eval depth; -1 disarms.  Returns the previous depth. */
+int32_t ray_group_first_seen_set(int32_t depth);
+/* Whether the calling thread's eval depth is the armed depth. */
+bool ray_group_first_seen_active(void);
 /* Hash-aggregate rows [start, end) into ht.
  *
  * When match_idx is non-NULL, the loop iterates `i` in [start, end)
@@ -2461,6 +2529,9 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
 ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection);
 /* LIKE / ILIKE with a STR column as the pattern: row i against pattern i (#1615). */
 ray_t* ray_like_rows(ray_t* x, ray_t* pat, bool ci);
+/* Test hook: segments of a generation-2 STR column a like read by vector
+ * (#1645), since process start. */
+uint64_t ray_like_test_by_vector(void);
 bool   ray_like_pat_rows(ray_t* pat);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);

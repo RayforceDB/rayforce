@@ -385,6 +385,12 @@ Evaluates multiple expressions in order, returning the last result:
   (+ x y))    ; 30
 ```
 
+Inside a query, on the planned routes, only the last form of a `do` is
+evaluated, while the evaluator's fallback runs every form: do not depend on the
+earlier forms either running or not, and put effects and bindings in a helper
+of more than one statement called from the query, or before it (see
+[Sequential Evaluation: do](control-flow.md#sequential-evaluation-do)).
+
 ### Variable Binding: `set` and `let`
 
 ```lisp

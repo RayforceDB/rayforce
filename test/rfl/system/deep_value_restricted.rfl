@@ -33,6 +33,11 @@
 (.ipc.send h "(+ 1 2)") -- 3
 (ask "((fn [] (let T (table [a] (list (list 1)))) (times 100000 (let T (table [a] (list (list T))))) (count (group (list T T)))))") -- 1
 (.ipc.send h "(+ 1 2)") -- 3
+;; and / or over a deep list stop at the stack reserve too (#1627)
+(ask "((fn [] (let L (list 1)) (times 200000 (let L (list L))) (and L L)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 200000 (let L (list L))) (or L 0)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
 (.ipc.close h)
 (.sys.exec "test/serve.sh --stop /tmp/rftest_deepval/s") -- 0
 (.sys.exec "rm -rf /tmp/rftest_deepval; true") -- 0

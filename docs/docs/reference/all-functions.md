@@ -10,13 +10,13 @@
 
 | | | |
 |---|---|---|
-| [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (7) | [Logic](#logic) (3) |
+| [Arithmetic](#arithmetic) (24) | [Comparison](#comparison) (8) | [Logic](#logic) (3) |
 | [Aggregation](#aggregation) (25) | [Higher-Order](#higher-order) (13) | [Collection](#collection) (41) |
 | [Sorting & Ordering](#sorting) (10) | [Control Flow & Special Forms](#control) (13) | [Table Operations](#table-ops) (21) |
 | [Query](#query) (4) | [Joins](#joins) (7) | [Pivot](#pivot) (1) |
-| [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (3) |
-| [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (15) |
-| [Serialization](#serialization) (5) | [Storage](#storage) (5) | [IPC](#ipc) (10) |
+| [Linear Algebra](#linalg) (5) | [String](#string-ops) (11) | [Temporal](#temporal) (4) |
+| [Type & Introspection](#type-ops) (5) | [I/O & Output](#io) (12) | [System & Utility](#system) (17) |
+| [Serialization](#serialization) (5) | [Storage](#storage) (11) | [IPC](#ipc) (14) |
 | [EAV Triple Store](#eav) (5) | [Datalog](#datalog) (2) | [Datalog Program API](#datalog-program) (6) |
 
 The examples below use these small in-memory fixtures where a table is needed:
@@ -36,7 +36,7 @@ The examples below use these small in-memory fixtures where a table is needed:
 
 ## Registered Builtin Surface
 
-Generated from `src/lang/eval.c` in this checkout. The categorized reference below expands the most commonly used functions; this list is the complete registered name surface.
+Listed from `src/lang/eval.c` in this checkout. The categorized reference below expands the most commonly used functions; this list is the complete registered name surface. It is maintained by hand: a builtin registered in `eval.c` is added here, and `scripts/check-builtin-docs.py` fails when one is missing (see [CONTRIBUTING](https://github.com/RayforceDB/rayforce/blob/dev/CONTRIBUTING.md#documentation)).
 
 ### Unary
 
@@ -46,21 +46,22 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `reverse`, `til`, `lag`, `lead`, `deltas`, `ratios`, `fills`, `sums`, `avgs`, `mins`, `maxs`, `prds`,
 `differ`, `asc`, `desc`, `iasc`, `idesc`, `rank`, `key`, `cols`, `value`, `type`, `read`, `read-bytes`, `load`, `exit`,
 `nil?`, `where`, `group`, `raze`, `ungroup`, `ser`, `de`, `guid`, `date`, `time`, `timestamp`, `ss`, `hh`,
-`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.exec`, `.sys.cmd`, `.sys.listen`,
+`minute`, `yyyy`, `mm`, `dd`, `dow`, `doy`, `eval`, `parse`, `meta`, `fkeys`, `.sys.cmd`, `.sys.listen`,
 `.sys.trust`, `.os.getenv`, `.fs.size`, `.fs.list`, `.ipc.close`, `.repl.connect`, `.log.write`, `.log.replay`, `.log.replay_report`,
 `.log.validate`, `rc`, `diverse`, `.time.timer.del`, `.time.sleep`, `env`, `sym-name`, `dl-stratify`, `dl-eval`, `dl-free`,
 `norm`, `inv`, `flip`, `gram`, `.emb.hnsw.free`, `.emb.hnsw.get`, `.emb.hnsw.info`, `.emb.model.get`, `.emb.model.info`, `.idx.zone`, `.idx.hash`, `.idx.sort`, `.idx.bloom`,
-`.idx.drop`, `.idx.has?`, `.idx.info`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
-`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`
+`.idx.drop`, `.idx.has?`, `.attr.get`, `.attr.drop`, `.col.unlink`, `.col.link?`, `.col.target`,
+`.graph.free`, `.graph.info`, `strlen`, `upper`, `lower`, `trim`, `.json.format`,
+`.parquet.meta`, `.mc.unsub`, `.idx.uses`, `.repl.complete`, `.mem.objsize`
 
 ### Binary
 
 `+`, `-`, `*`, `/`, `%`, `>`, `<`, `>=`, `<=`, `==`, `!=`, `pow`, `top`, `bot`, `pearson_corr`, `cov`, `scov`, `wsum`, `wavg`, `quantile`, `percentile`, `set`, `let`,
 `try`, `filter`, `in`, `except`, `union`, `sect`, `take`, `drop`, `rotate`, `cut`, `cross`, `at`, `find`, `fill`, `min`, `max`, `msum`, `mavg`, `mmin`, `mmax`,
 `mcount`, `mvar`, `mdev`, `xasc`, `xdesc`, `table`, `union-all`, `xbar`, `as`, `write`, `write-bytes`, `dict`, `concat`, `within`, `div`,
-`rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.send`, `.ipc.post`, `get`, `remove`, `row`,
+`rand`, `bin`, `binr`, `split`, `str-find`, `str-join`, `like`, `.os.setenv`, `.ipc.post`, `get`, `remove`, `row`,
 `unify`, `xcol`, `xcols`, `xkey`, `xgroup`, `xrank`, `dl-query`, `dl-provenance`, `.emb.cos-dist`, `.emb.inner-prod`, `.emb.l2-dist`, `.emb.tokens`, `mmu`, `lsq`, `.emb.hnsw.set`, `.attr.set`,
-`.col.link`
+`.col.link`, `identical`, `trunc`, `not-in`, `.mc.pub`
 
 ### Variadic / Special
 
@@ -68,8 +69,8 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `update`, `insert`, `upsert`, `delete`, `left-join`, `inner-join`, `full-join`, `anti-join`, `semi-mask`, `anti-mask`, `window-join`, `window-join1`,
 `asof-join`, `println`, `show`, `format`, `read-csv`, `write-csv`, `.csv.read`, `.csv.splayed`, `.csv.parted`,
 `.csv.write`, `resolve`, `timeit`, `enlist`, `map-left`, `map-right`, `.db.splayed.set`, `.db.splayed.get`,
-`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.objsize`, `.mem.ts`, `.sys.timeit`,
-`.sys.env`, `.sys.args`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
+`.db.parted.get`, `.db.parted.tables`, `.db.parted.fill`, `alter`, `print`, `.sys.gc`, `.mem.ts`, `.sys.timeit`,
+`.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
 `.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
@@ -77,7 +78,9 @@ Generated from `src/lang/eval.c` in this checkout. The categorized reference bel
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
 `.graph.random-walk`, `.graph.k-shortest`, `.graph.shortest-path`, `.graph.expand`, `.graph.var-expand`,
-`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`, `.json.get`
+`substr`, `replace`, `repr`, `read-value`, `read-limits`, `.json.parse`, `.json.get`,
+`.parquet.read`, `.parquet.scan`, `.parquet.each`, `.parquet.splayed`, `.parquet.parted`, `.mc.sub`, `.mc.stats`,
+`while`, `times`, `.ipc.txlimit`, `.ipc.auto_journal_eval`
 
 ## Arithmetic
 
@@ -137,6 +140,7 @@ All comparison operators are **atomic** and return boolean results.
 | `==` | binary | atomic | Equal | `(== 3 3)` → `true` |
 | `!=` | binary | atomic | Not equal | `(!= 3 4)` → `true` |
 | `within` | binary | — | Check which elements fall within an inclusive `[lo hi]` range | `(within [1 5 10] [3 7])` → `[false true false]` |
+| `identical` | binary | — | Whole-value equality: same type, shape and contents; returns one boolean | `(identical [1 2] [1 2])` → `true` |
 
 ```lisp
 ; Vector comparisons return boolean vectors
@@ -146,6 +150,8 @@ All comparison operators are **atomic** and return boolean results.
 ; within checks the inclusive range [lo, hi]
 (within [1 3 5 7] [3 6])  ; [false true true false]
 ```
+
+`==` and the other operators map over elements, so on two tables or lists they return an elementwise result, not one boolean. To ask whether two values are the same value, use `identical`; it compares type, shape and contents, so `(identical (list 1 2) [1 2])` is `false` and `(identical 1 1i)` is `false`. See [`identical`](../language/math.md).
 
 ## Logic
 
@@ -179,20 +185,20 @@ Aggregation functions reduce vectors to scalar values. Functions marked **aggr**
 | `max` | unary aggr, or binary | aggr/atomic | Reduce one vector, or choose the element-wise maximum of two values, in their promoted type (null lowest); f32 input answers f32 | `(max [3 9 1] 5)` → `[5 9 5]`, `(max [2 0] true)` → `[2 1]` |
 | `first` | unary | — | First element of a vector. A direct call takes the element by position, nulls included, for every type: `(first [0Nl 1])` is `0Nl`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, `""` in a STR column and `'` in a SYM one, like `0Nl` in an I64 one (grouped `(first s)` over `["" "x"]` is `"x"`, a direct `(first ["" "x"])` is `""`; see [Nulls in a query](../language/math.md#first-last-nulls)), whether its argument is a column or computed (`(first (+ d 1))`, `(first (if c d 0Nd))`); a computed argument that reads no column, such as `(first (take X 4))`, stays positional | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `0Nl` |
 | `last` | unary | — | Last element of a vector. A direct call takes the element by position, nulls included, for every type: `(at v (- (count v) 1))`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, `""` in a STR column and `'` in a SYM one, like `0Nl` in an I64 one (grouped `(last s)` over `["x" ""]` is `"x"`, a direct `(last ["x" ""])` is `""`; see [Nulls in a query](../language/math.md#first-last-nulls)), whether its argument is a column or computed (`(last (+ d 1))`, `(last (if c d 0Nd))`); a computed argument that reads no column, such as `(last (take X 4))`, stays positional | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `0Nl` |
-| `med` | unary | aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `med` | unary | aggr | Median value (returns f64); a vector of another type than numbers and temporals is a type error, empty or not | `(med [1 3 2])` → `2.0` |
 | `mode` | unary | aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
-| `dev` | unary | aggr | Population standard deviation | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
-| `stddev` | unary | aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`) | `(stddev [1 2 3])` → `1.0` |
+| `dev` | unary | aggr | Population standard deviation; a vector of another type than numbers and temporals is a type error, empty or not | `(dev [2 4 4 4 5 5 7 9])` → `2.0` |
+| `stddev` | unary | aggr | Sample standard deviation (Bessel-corrected; not an alias of `dev`); a vector of another type than numbers and temporals is a type error, empty or not | `(stddev [1 2 3])` → `1.0` |
 | `stddev_pop` | unary | aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
 | `dev_pop` | unary | aggr | Population standard deviation (alias) | `(dev_pop [1 2 3])` |
-| `var` | unary | aggr | Sample variance | `(var [1 2 3])` → `1.0` |
-| `var_pop` | unary | aggr | Population variance | `(var_pop [1 2 3])` |
+| `var` | unary | aggr | Sample variance; a vector of another type than numbers and temporals is a type error, empty or not | `(var [1 2 3])` → `1.0` |
+| `var_pop` | unary | aggr | Population variance ([accuracy](../language/math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary | aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
 | `cov` | binary | aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
 | `scov` | binary | aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
 | `wsum` | binary | aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
 | `wavg` | binary | aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
-| `quantile` | binary | aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
+| `quantile` | binary | aggr | Exact linear-interpolated quantile; probability is `0.0..1.0`; a vector of another type than numbers and temporals is a type error, empty or not | `(quantile [1 2 3 4] 0.5)` → `2.5` |
 | `percentile` | binary | aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
 
 Numeric reducers skip nulls where applicable. Pairwise binary reducers skip a row when either vector input is null. Inside `select`/`by:`, these reducers lower to morsel-based DAG aggregation paths that can run in parallel and poll for cancellation.
@@ -229,7 +235,7 @@ Functions that take other functions as arguments for mapping, folding, and filte
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `map` | variadic | — | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (a collection `val` gives one row per element; same as `map-right`). Same-type atom results form a typed vector, otherwise a list. String results that repeat shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fail with `limit`. Exactly 2 or 3 arguments | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
 | `pmap` | variadic | — | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `fold` | variadic | — | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
 | `fold-left` | variadic | — | Left-associative fold | `(fold-left - 10 [1 2 3])` → `4` |
@@ -273,13 +279,44 @@ Use `(concat (list) result)` to explicitly box a result for a list-only
 consumer, such as a positional row payload or `raze` joining string fragments.
 `raze` leaves an already typed vector unchanged.
 
+A symbol result is packed as a name. A `SYM` vector holds only each cell's
+symbol, not a quote, so a quoted symbol (one `parse` returns for `'a`, or
+one a lambda returns as `'a`) loses its quote when `map` packs it beside
+other symbols. Mapping over parsed code can therefore change what it
+evaluates to: the cell is now the name `a`, and evaluating it looks the name
+up. Boxing the packed result with `(concat (list) result)` comes after the
+packing and does not bring the quote back:
+
+```lisp
+(set L (list (parse "'a") (parse "b")))
+(set M (map (fn [x] x) L))
+(type L)            ; 'LIST
+(type M)            ; 'SYM
+(set b 42)
+(eval (first L))    ; 'a
+(eval (first M))    ; error: name: 'a' undefined
+(eval (at M 1))     ; 42
+```
+
+To keep quoted symbols, build the result as a `LIST` so nothing is packed:
+fold with `concat` into a list, or have the function wrap each result in a
+list and read it back with `first`:
+
+```lisp
+(set R (fold (fn [acc x] (concat acc (list x))) (list) L))
+(type R)                          ; 'LIST
+(eval (first R))                  ; 'a
+(set W (map (fn [x] (list x)) L))
+(eval (first (first W)))          ; 'a
+```
+
 ## Collection Operations { #collection }
 
 Operations on vectors and lists as collections — set operations, indexing, searching, and construction.
 
 Outside queries, `in` matches null to null. `not-in` inverts each membership result, preserving nested list/vector shapes. For numeric, temporal, SYM, and GUID membership evaluated during a query (including called functions), null input rows return `false` for both operations. STR membership is not supported by the typed query-plan kernel. A string atom tested against a list is one whole value and returns one boolean: `(in "ab" (list "ab" "c"))` → `true`. A string tested against a string returns one result per character: `(in "ab" "abc")` → `[true true]`. A vector or list of strings is tested element by element: `(in ["p" "qq"] (list "qq"))` → `[false true]`. In a query, a `SYM` column against a string, a string vector or a list of strings reads each string as the symbol it spells, as `==` does: `(select {from: t where: (in s (list "a" "b"))})` keeps the rows holding `'a` or `'b`; each string is looked up in the column's own symbols (a string no row holds matches nothing), and `""` selects the null rows, as `(== s "")` does, whether the set is written out, bound to a name or computed while the query runs (`(in s (concat ["a"] [""]))`, `(in s (f "a"))`); a `GUID` column against strings is a `type` error, as for `==`.
 
-Query `concat` joins text row by row when an operand comes from a source column, including computed text columns. Scalar text operands also retain query string concatenation. Literal and bound collections keep ordinary `concat` semantics, as do calls inside user functions whose operands do not derive from the query's rows. Numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Scalars broadcast to the projected collection length; a one-row input column is still a column. Non-scalar output columns of different lengths are rejected before `take:`; a standalone collection projection may change the row count. When a `where:` selection is applied to a collection projection, its rows must align with the input rows. A `concat` operand the planner has no node for (a reordered, indexed or cast column) is evaluated over the whole column in a projection, matching update, `where:` and `by:`. Inside a helper body a quoted symbol is the symbol itself and a nested helper's free names are globals or source columns, never its caller's formals; helpers built from pure builtins are inlined, never closures. Grouped outputs the planner cannot serve natively keep the requested output order; an output named like a group key keeps both columns, the key first. Helpers the planner cannot inline run as bytecode from a query fallback with row provenance tracked per value: `concat` keeps text semantics through `let`, nested calls and results, a bound vector stays a collection, and a free source-column name is the row's cell (or the whole column) rather than an output alias. Such a helper can also be the `by:` key, evaluated over the rows `where:` keeps: a body built from pure builtins and pure helpers runs whole first, and again row by row when a conditional in it tested a vector or the whole-column run failed (a failed run is swallowed whole, its `raise` payload included); a body with an effect (`set`, `eval`, system or I/O builtins, a computed or unknown callee) runs row by row from the start, so the effect happens once per row; callees are followed wherever they are bound, so a pure helper reached through a parameter, a `let` or a capture keeps the whole-column semantics. A source column shadows a global of the same name inside a helper, on the planned path and in fallbacks alike. A text cell reduced from a column (`first`, `last`, `min`, `max`) is a cell of those rows, so a grouped `(concat (first s) 'zz)` joins each group's cell with the literal, an empty cell is empty text, and a cell of a STR column keeps STR output, at every operand position (a query `concat` takes up to 255 operands).
+Query `concat` joins text row by row when an operand comes from a source column, including computed text columns. Scalar text operands also retain query string concatenation. Literal and bound collections keep ordinary `concat` semantics, as do calls inside user functions whose operands do not derive from the query's rows. Numeric collection concatenation evaluates over the whole column, or each group inside an aggregate. Non-text collection concatenation is binary. Scalars broadcast to the projected collection length; a one-row input column is still a column. Non-scalar output columns of different lengths are rejected before `take:`; a standalone collection projection may change the row count. When a `where:` selection is applied to a collection projection, its rows must align with the input rows. A `concat` operand the planner has no node for (a reordered, indexed or cast column) is evaluated over the whole column in a projection, matching update, `where:` and `by:`. Inside a helper body a quoted symbol is the symbol itself and a nested helper's free names are globals or source columns, never its caller's formals; helpers built from pure builtins are inlined, never closures. Grouped outputs the planner cannot serve natively keep the requested output order; an output named like a group key keeps both columns, the key first. Helpers the planner cannot inline run as bytecode from a query fallback with row provenance tracked per value: `concat` keeps text semantics through `let`, nested calls and results, a bound vector stays a collection, and a free source-column name is the row's cell (or the whole column) rather than an output alias. Such a helper can also be the `by:` key, evaluated over the rows `where:` keeps: a body built from pure builtins and pure helpers runs whole first, and again row by row when a conditional in it tested a vector or the whole-column run failed (a failed run is swallowed whole, its `raise` payload included); a body with an effect (`set`, `eval`, system or I/O builtins, a computed or unknown callee) runs row by row from the start, so the effect happens once per row, whether the key is written bare (`by: (h x)`) or as a by-dict value (`by: {k: (h x)}`), and the select reads every partition of a parted table for it, skipping none by statistics; callees are followed wherever they are bound, so a pure helper reached through a parameter, a `let` or a capture keeps the whole-column semantics. A source column shadows a global of the same name inside a helper, on the planned path and in fallbacks alike. A text cell reduced from a column (`first`, `last`, `min`, `max`) is a cell of those rows, so a grouped `(concat (first s) 'zz)` joins each group's cell with the literal, an empty cell is empty text, and a cell of a STR column keeps STR output, at every operand position (a query `concat` takes up to 255 operands).
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
@@ -319,7 +356,7 @@ Query `concat` joins text row by row when an operand comes from a source column,
 | `mdev` | binary | lazy/DAG | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | — | Wrap value(s) in a vector (list of atoms) | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | — | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and on every query route: `(concat "" "a")` is `"a"`, and `(concat s "")` in a select keeps each cell of `s` | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
-| `raze` | unary | — | Flatten a list of vectors into one vector | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
+| `raze` | unary | — | Flatten a list of vectors into one vector; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | — | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | — | Group indices by value (returns dict) | `(group ['a 'b 'a])` → dict |
 | `diverse` | unary | — | Check if all elements are unique (no duplicates) | `(diverse [1 2 3])` → `true` |
@@ -399,9 +436,9 @@ Special forms receive their arguments unevaluated. These are the core language p
 |---|---|---|---|---|
 | `set` | binary | special, restricted | Bind value to global variable | `(set x 42)` |
 | `let` | binary | special | Bind value to local variable (lexical scope); at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type`; where the query leaves it to the evaluator, a condition that differs between the rows raises `nyi` | `(if (> x 0) "pos" "neg")` |
-| `do` | variadic | special | Sequential execution, returns last value | `(do (set x 1) (set y 2) (+ x y))` |
-| `while` | variadic | special | Iterate while cond is truthy; returns null | `(while (> n 0) (set n (- n 1)))` |
+| `if` | variadic | special | Conditional: (if c1 r1 c2 r2 ... else?) — first truthy condition wins. A boolean-vector condition chooses per row between the two arms, as in a query: both arms are always evaluated (their side effects happen, and an arm that raises raises), arms are vectors of its length or atoms, and a length-1 vector gives a 1-element vector. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types (DATE, TIME, TIMESTAMP, TIMESPAN) or a temporal beside a number raise `type` | `(if (> x 0) "pos" "neg")`, `(if [true false] [1 2] [3 4])` → `[1 4]` |
+| `do` | variadic | special | Sequential execution, returns last value. Inside a query, on the planned routes, only the last form is evaluated; do not depend on the earlier forms running or not ([control flow](../language/control-flow.md#sequential-evaluation-do)) | `(do (set x 1) (set y 2) (+ x y))` |
+| `while` | variadic | special | Iterate while cond is truthy; returns null. A vector condition is one truth value (non-empty is true); in a query, a vector as long as the rows (or the group) is true or false when every cell agrees and otherwise raises `nyi`, whatever computes it ([control flow](../language/control-flow.md#iteration-while)) | `(while (> n 0) (set n (- n 1)))` |
 | `times` | variadic | special | Run body exactly n times (count evaluated once); `(times [i n] ...)` binds `i` to 0..n-1, one per pass (at the top level a global, refused for a restricted caller); returns null | `(times 5 (set n (+ n 1)))`, `(times [i 3] (println i))` |
 | `fn` | variadic | special | Create lambda function | `(fn [x y] (+ x y))` |
 | `try` | binary | special | Error handling: (try expr handler-fn-or-fallback-value); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call) | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
@@ -432,7 +469,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `list` | variadic | — | Create a list from vectors (column data for tables) | `(list [1 2] ['a 'b])` |
-| `table` | binary | — | Create table from column names and list of vectors | `(table [x y] (list [1 2] ['a 'b]))` |
+| `table` | binary | — | Create table from column names and list of vectors; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(table [x y] (list [1 2] ['a 'b]))` |
 | `dict` | binary | — | Create dictionary from evaluated keys and values vectors | `(dict ['a 'b] [1 2])` |
 | `key` | unary | — | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | — | Get table column names | `(cols trades)` → `[sym price size time date]` |
@@ -618,6 +655,7 @@ Temporal constructors. Pass `0` to get the current clock value. Cross-temporal c
 | `date` | unary | — | Current date, or extract date from timestamp | `(date 0)` → today's date |
 | `time` | unary | — | Current wall-clock time (millisecond resolution), or extract time from timestamp | `(time 0)` → current time |
 | `timestamp` | unary | — | Current wall-clock timestamp at the system clock's full resolution (nanoseconds on Linux) | `(timestamp 0)` |
+| `trunc` | binary | — | Floor a DATE, TIME or TIMESTAMP (atom or vector) to the start of the calendar or clock unit that holds it: `'year` `'quarter` `'month` `'week` `'day` `'hour` `'minute` `'second`. The result has the type of the second argument | `(trunc 'month 2024.05.17)` → `2024.05.01` |
 
 ```lisp
 ; Get current date/time
@@ -633,7 +671,7 @@ Type checking, casting, null testing, and object inspection.
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
 | `type` | unary | — | Get the type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` | `(type 42)` → `i64` |
-| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms | `(as 'i64 "42")` → `42` |
+| `as` | binary | — | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | DAG in queries | Test for null; element-wise over vectors and lists (a `B8` per element), the same in and out of queries | `(nil? [1 0N 3])` → `[false true false]` |
 | `rc` | unary | — | Get reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | — | Generate a vector of N v4 GUIDs, seeded from the OS (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -659,10 +697,10 @@ Printing, file I/O, CSV loading, and script execution.
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `println` | variadic | — | Print values with newline | `(println "hello" 42)` |
-| `print` | unary | — | Print value without newline | `(print "hello")` |
-| `show` | variadic | — | Pretty-print a value (tables formatted) | `(show trades)` |
-| `format` | variadic | — | Format value to string (% as placeholder) | `(format "val=%" 42)` → `"val=42"` |
+| `println` | variadic | — | Print values with newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(println "hello" 42)` |
+| `print` | unary | — | Print value without newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(print "hello")` |
+| `show` | variadic | — | Pretty-print a value (tables formatted); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(show trades)` |
+| `format` | variadic | — | Format value to string (% as placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | restricted | Load CSV file into table (mmap, parallel parse) | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | restricted | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | `read` | unary | restricted | Read file contents as string, to EOF | `(read "/proc/self/cmdline")` |
@@ -717,6 +755,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
 | `.sys.join.par.min` | variadic | restricted | Read or set the probe-side rows from which a hash join's probe goes parallel; returns the value in effect | `(.sys.join.par.min 65536)` |
 | `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |
+| `.idx.uses` | unary | — | Per-column count of index hits since the previous call; the first call arms the counter. See [`.idx.uses`](../namespaces/idx.md#idx-uses) | `(.idx.uses t)` → `{a:1}` |
+| `.repl.complete` | unary | — | Sorted names (builtins, keywords, session bindings) that start with a prefix. See [`.repl.complete`](../namespaces/repl.md#repl-complete) | `(.repl.complete "xas")` → `[xasc]` |
 
 ```lisp
 ; Metaprogramming: parse and eval
@@ -739,9 +779,9 @@ Binary serialization for any Rayforce object. Useful for IPC, caching, and persi
 
 | Function | Type | Flags | Description | Example |
 |---|---|---|---|---|
-| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads | `(ser [1 2 3])` |
+| `ser` | unary | — | Serialize any value to binary format (byte vector); a value nested deeper than 512 levels fails with `limit`, the depth `de` reads; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(ser [1 2 3])` |
 | `de` | unary | — | Deserialize from binary format back to value | `(de bytes)` → `[1 2 3]` |
-| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
+| `repr` | variadic | — | `(repr v)` writes `v` as Rayfall text that reads back to the same value; `(repr v n)` fails with `limit` rather than return more than `n` bytes; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`. See [`repr`](../language/string.md#repr) | `(repr [1i 2i])` → `"[1i 2i]"` |
 | `read-value` | variadic | — | Reads one value from data text without evaluating anything; an optional dict overrides the limits. See [Reading Data Text](../language/read-value.md) | `(read-value "{a: 1 b: [2 3]}")` → `{a:1 b:[2 3]}` |
 | `read-limits` | variadic | — | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | — | JSON text to a value (object to dict with string keys, array to a vector or list); element-wise over a string vector; strict, the limits of `read-value`. See [`.json.*`](../namespaces/json.md) | `(.json.parse "{\"a\":[1,2]}")` → `(dict ["a"] (list [1 2]))` |
@@ -769,6 +809,12 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 | `.db.parted.get` | variadic | — | Load partitioned table from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | — | List table names under a parted root (from the most recent partition) | `(.db.parted.tables "db")` |
 | `.db.parted.fill` | variadic | restricted | Backfill missing tables across a parted db's partitions | `(.db.parted.fill "db")` |
+| `.parquet.meta` | unary | restricted | Column-chunk metadata table of a Parquet file; see [`.parquet.*`](../namespaces/parquet.md) | `(.parquet.meta "t.parquet")` |
+| `.parquet.read` | variadic | restricted | Read a Parquet file into a table; optional projection or options before the path | `(.parquet.read "t.parquet")` |
+| `.parquet.scan` | variadic | restricted | Reusable lazy `select` source over a Parquet file; optional options before the path | `(select {from: (.parquet.scan "t.parquet") where: (> x 0)})` |
+| `.parquet.each` | variadic | restricted | Deliver a Parquet file to a callback in chunks; returns the number of rows delivered | `(.parquet.each "t.parquet" (fn [chunk] ...))` |
+| `.parquet.splayed` | variadic | restricted | Import a Parquet file as a splayed table; returns the row count | `(.parquet.splayed "t.parquet" "db/t")` |
+| `.parquet.parted` | variadic | restricted | Import Parquet files into a partitioned table under a root; returns the row count | `(.parquet.parted "t.parquet" "db" 'trades)` |
 
 ```lisp
 ; Save and reload a splayed table
@@ -790,11 +836,15 @@ IPC for connecting to remote Rayforce instances. Uses binary serialization on th
 |---|---|---|---|---|
 | `.ipc.open` | variadic | restricted | Open a connection to host:port (optional connect timeout in ms, or an options dict with `timeout`, `compress`, `keepalive`, `transport`), returns handle | `(.ipc.open "localhost:5000" 2000)` |
 | `.ipc.close` | unary | restricted | Close an IPC connection handle | `(.ipc.close h)` |
-| `.ipc.send` | binary | restricted | Send a value over an IPC handle (sync request) | `(.ipc.send h "(sum (til 100))")` |
+| `.ipc.send` | variadic | restricted | Send a value over an IPC handle (sync request); optional third argument is a deadline in ms | `(.ipc.send h "(sum (til 100))")`, `(.ipc.send h "(sum (til 100))" 2000)` |
 | `.ipc.handle` | variadic | — | Current connection handle inside any `.ipc.on.*` hook, `-1` outside; given a live connection handle, that connection's view (`inbound`, `transport`, `limit_bytes`, `limit_frames`, `queued_bytes`, `queued_frames`, `hwm_bytes`) | `(.ipc.handle)`, `(.ipc.handle h)` |
 | `.ipc.auto_journal_eval` | variadic | — | `true` while evaluating inside an auto-journaled IPC request (the request itself is the journal entry and `.log.write` refuses), `false` otherwise | `(if (.ipc.auto_journal_eval) null (.log.write x))` |
 | `.ipc.txlimit` | variadic | restricted | Transmit backlog policy: `()` reads the process default, `(bytes [frames])` sets it, `(h bytes frames)` overrides one connection; a frame that would exceed a connection's limit is refused and a multicast subscriber is dropped and closed | `(.ipc.txlimit 8388608 64)` |
 | `.ipc.transport` | variadic | restricted | Transport policy: `()` reads it, `('auto|'tcp|'shm|'rdma)` sets what this process offers as a server and asks for as a client (`auto`: shared memory on one host, RDMA across hosts, else TCP) | `(.ipc.transport 'tcp)` |
+| `.mc.sub` | variadic | — | Subscribe the calling connection to a multicast topic (symbol or string); the filter argument must be null. Returns the sequence number the next publication will carry. See [Multicast topics](../storage/ipc.md#multicast) | `(.ipc.send h (list '.mc.sub "depth" null))` |
+| `.mc.unsub` | unary | — | Remove the calling connection's subscription to a topic; null | `(.mc.unsub "depth")` |
+| `.mc.pub` | binary | restricted | Publish a payload to every subscriber of a topic as an async `(upd topic seq payload)`; returns the sequence number, or `0` when the topic has no subscribers | `(.mc.pub "depth" batch)` |
+| `.mc.stats` | variadic | — | Multicast counters as a dict: `topics`, `subscriptions`, `published`, `delivered`, `dropped`, `framed`, `tx_limit_bytes`, `tx_limit_frames`, `tx_hwm_bytes` | `(.mc.stats)` |
 | `.ipc.on.open` | hook | user-settable | Fires after inbound connection completes handshake; arg = handle | `(set .ipc.on.open (fn [h] ...))` |
 | `.ipc.on.close` | hook | user-settable | Fires once before an established connection is torn down, inbound or outbound, on any cause; arg = handle | `(set .ipc.on.close (fn [h] ...))` |
 | `.ipc.on.sync` | hook | user-settable | Intercepts sync messages; return value becomes the response | `(set .ipc.on.sync (fn [m] (eval (parse m))))` |

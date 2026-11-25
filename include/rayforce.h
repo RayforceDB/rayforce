@@ -422,7 +422,11 @@ int64_t  ray_heap_anon_peak(void);
  * Long-running queries poll ray_interrupted() at morsel granularity
  * and bail out with a "cancel" error. The REPL's SIGINT handler wires
  * Ctrl-C to ray_request_interrupt(); embedders can call it from their
- * own signal handlers or cancellation threads. */
+ * own signal handlers or cancellation threads.  ray_interrupted() answers
+ * for the calling thread: in a process that serves IPC on one thread
+ * while another waits on a sync send, an interrupt requested meanwhile is
+ * the waiting send's (it forwards it to its server), and a client's cancel
+ * of a served request stops only that request. */
 
 void     ray_request_interrupt(void);
 void     ray_clear_interrupt(void);

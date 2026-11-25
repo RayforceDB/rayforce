@@ -766,6 +766,11 @@ static void dec_guid(const ray_enc_desc_t* d, int vlen, const uint8_t* p, void* 
  * the codes in the same order, so they count the same bytes); at
  * materialization the dictionary region's offset of each code, whose
  * entries add no bytes to the vector's (Task 4). */
+/* Test hook: FSST cells whose expanded length was measured on its own
+ * (ray_fsst_expanded_len), counted a vector at a time. */
+static _Atomic(uint64_t) g_fsst_measured;
+uint64_t ray_enccol_test_fsst_measured(void) { return atomic_load(&g_fsst_measured); }
+
 static ray_t* dec_str(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
                       const uint8_t* p, uint64_t avail, void* out, char* pool_out,
                       uint64_t pool_base, uint64_t* pooled_out, const uint32_t* dict_pool_off) {
@@ -811,23 +816,60 @@ static ray_t* dec_str(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
         const ray_fsst_table_t* t;
         ray_t* err = enc_fsst(e, &t);
         if (err) return err;
-        uint64_t clen[RAY_ENC_VEC], xlen[RAY_ENC_VEC]; const uint8_t* cb;
-        ray_enc_fsst_parse(p, (size_t)avail, vlen, t, clen, xlen, &cb);
-        for (int i = 0; i < vlen; i++) if (xlen[i] > RAY_STR_INLINE_MAX) pooled += xlen[i];
-        uint64_t at = 0, run = 0;
-        for (int i = 0; out && i < vlen; i++) {
-            memset(&o[i], 0, sizeof o[i]);
-            o[i].len = (uint32_t)xlen[i];
-            if (xlen[i] <= RAY_STR_INLINE_MAX) {
-                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], (uint8_t*)o[i].data);
-            } else {
-                uint8_t* dst = (uint8_t*)pool_out + pool_base + run;
-                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], dst);
-                memcpy(o[i].prefix, dst, 4);
-                o[i].pool_off = (uint32_t)(pool_base + run);
-                run += xlen[i];
+        uint64_t clen[RAY_ENC_VEC]; const uint8_t* cb;
+        if (!out) {
+            /* sizing: each cell's expanded length, measured once */
+            uint64_t xlen[RAY_ENC_VEC];
+            ray_enc_fsst_parse(p, (size_t)avail, vlen, t, clen, xlen, &cb);
+            for (int i = 0; i < vlen; i++) if (xlen[i] > RAY_STR_INLINE_MAX) pooled += xlen[i];
+            atomic_fetch_add_explicit(&g_fsst_measured, (uint64_t)vlen, memory_order_relaxed);
+        } else {
+            /* decoding: a cell expands once, into a buffer that holds any
+             * cell of the vector (a code expands to at most 8 bytes, and the
+             * fast decode writes 8 past the end): on the stack, or from the
+             * heap for a vector with a longer cell; its length is then known,
+             * so it goes inline or to the pool.  Only when that buffer cannot
+             * be had is a cell measured first and expanded in place. */
+            enum { FSST_TMP = 4096 };
+            uint8_t stack[FSST_TMP];
+            cb = ray_enc_fsst_lengths(p, (size_t)avail, vlen, clen);
+            uint64_t maxcl = 0;
+            for (int i = 0; i < vlen; i++) if (clen[i] > maxcl) maxcl = clen[i];
+            uint8_t* tmp = stack;
+            uint64_t room = FSST_TMP;
+            if (maxcl * 8 + 8 > FSST_TMP) {
+                uint8_t* h = (uint8_t*)ray_alloc_raw((size_t)(maxcl * 8 + 8));
+                if (h) { tmp = h; room = maxcl * 8 + 8; }
             }
-            at += clen[i];
+            uint64_t at = 0, measured = 0;
+            for (int i = 0; i < vlen; i++) {
+                memset(&o[i], 0, sizeof o[i]);
+                const uint32_t cl = (uint32_t)clen[i];
+                uint64_t xl;
+                const uint8_t* src = NULL;
+                if ((uint64_t)cl * 8 + 8 <= room) {
+                    xl = (uint64_t)ray_fsst_decode_fast(t, cb + at, cl, tmp);
+                    src = tmp;
+                } else {
+                    xl = (uint64_t)ray_fsst_expanded_len(t, cb + at, cl);
+                    measured++;
+                }
+                o[i].len = (uint32_t)xl;
+                if (xl <= RAY_STR_INLINE_MAX) {
+                    if (src) memcpy(o[i].data, src, xl);
+                    else (void)ray_fsst_decode(t, cb + at, cl, (uint8_t*)o[i].data);
+                } else {
+                    uint8_t* dst = (uint8_t*)pool_out + pool_base + pooled;
+                    if (src) memcpy(dst, src, xl);
+                    else (void)ray_fsst_decode(t, cb + at, cl, dst);
+                    memcpy(o[i].prefix, dst, 4);
+                    o[i].pool_off = (uint32_t)(pool_base + pooled);
+                    pooled += xl;
+                }
+                at += cl;
+            }
+            if (tmp != stack) ray_free_raw(tmp);
+            if (measured) atomic_fetch_add_explicit(&g_fsst_measured, measured, memory_order_relaxed);
         }
     } else if (d->encoding == RAY_ENC_CONST) {
         uint32_t len; memcpy(&len, p, 4);
@@ -2087,18 +2129,24 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out) {
     return ray_enccol_desc_pool_bytes(e, c, j, &ray_enccol_descs(e, c)[j], out);
 }
 
-/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  The cell
- * is read where the file says it is, under the same trust as dec_str (files
- * this engine wrote are trusted): an FSST vector's compressed lengths and
- * the one slice (its decoded length compared first), a STR_DICT vector's
- * codes and the one entry, a RAW vector's cell (and the pooled lengths
- * before it), a CONST vector's value.  The vector is never decoded whole.
+/* One cell of the STR column `e`, read where the file says it is, under the
+ * same trust as dec_str (files this engine wrote are trusted): an FSST
+ * vector's compressed lengths and the one slice, a STR_DICT vector's codes
+ * and the one entry, a RAW vector's cell (and the pooled lengths before it),
+ * a CONST vector's value.  The vector is never decoded whole.  *p and *len
+ * are the cell's bytes, where the file has them or, for an FSST cell,
+ * decoded into b.
+ * `want` >= 0 says the caller only cares for a cell of that length: an FSST
+ * or a RAW cell of another length then comes back undecoded, *p NULL and
+ * *len its length; a dictionary entry or a constant comes back as it is,
+ * for the caller to compare lengths.
  * Checked: the row against the column's length and against its vector's
  * length (a `range` error); a STR_DICT or FSST table that fails to load is
  * the loader's error.  The file's offsets and lengths are not checked
  * against the mapping. */
-ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq) {
-    *eq = false;
+static ray_t* enc_str_cell(ray_enccol_t* e, int64_t row, int64_t want, ray_enc_cellbuf_t* b,
+                           const char** p, uint32_t* len) {
+    *p = NULL; *len = 0;
     if (e->type != RAY_STR || row < 0 || row >= e->len)
         return ray_error("range", "column %s: row %lld", e->path, (long long)row);
     const int64_t vec = row / RAY_ENC_VEC;
@@ -2111,16 +2159,15 @@ ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_
     if (i >= vlen) return ray_error("range", "column %s: row %lld", e->path, (long long)row);
     const uint8_t* body = NULL; uint64_t avail = 0; const uint8_t* bm = NULL;
     payload_parts(e, c, d, &body, &avail, &bm);
-    if (bm && ((bm[i >> 3] >> (i & 7)) & 1)) { *eq = l == 0; return NULL; }
+    if (bm && ((bm[i >> 3] >> (i & 7)) & 1)) { *p = ""; return NULL; }   /* a null: the empty string, as decoded */
     if (d->encoding == RAY_ENC_STR_DICT) {
         const ray_enc_sdict_t* sd;
         ray_t* err = ray_enccol_strdict(e, &sd);
         if (err) return err;
         uint64_t codes[RAY_ENC_VEC];
         ray_enc_strdict_read(body, (size_t)avail, vlen, codes);
-        const char* sp; uint32_t len;
-        ray_enc_sdict_entry(sd, (uint32_t)codes[i], &sp, &len);
-        *eq = len == l && (l == 0 || memcmp(sp, s, l) == 0);
+        ray_enc_sdict_entry(sd, (uint32_t)codes[i], p, len);
+        if (!*p) *p = "";
         return NULL;
     }
     if (d->encoding == RAY_ENC_FSST) {
@@ -2131,33 +2178,55 @@ ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_
         const uint8_t* cb = ray_enc_fsst_lengths(body, (size_t)avail, vlen, clen);
         uint64_t at = 0;
         for (int k = 0; k < i; k++) at += clen[k];
-        if ((uint64_t)ray_fsst_expanded_len(t, cb + at, (uint32_t)clen[i]) != l) return NULL;
-        if (l == 0) { *eq = true; return NULL; }
-        uint8_t stack[256];
-        uint8_t* buf = l + 8 <= sizeof stack ? stack : (uint8_t*)ray_alloc_raw(l + 8);
-        if (!buf) return ray_error("oom", NULL);
-        (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], buf);
-        *eq = memcmp(buf, s, l) == 0;
-        if (buf != stack) ray_free_raw(buf);
+        uint64_t l = (uint64_t)ray_fsst_expanded_len(t, cb + at, (uint32_t)clen[i]);
+        *len = (uint32_t)l;
+        if (want >= 0 && l != (uint64_t)want) return NULL;
+        if (l == 0) { *p = ""; return NULL; }
+        if (l + 8 > b->cap) {                             /* the decoder writes whole words */
+            uint8_t* nb = (uint8_t*)ray_alloc_raw((size_t)l + 8);
+            if (!nb) return ray_error("oom", NULL);
+            if (b->heap) ray_free_raw(b->p);
+            b->p = nb; b->cap = (size_t)l + 8; b->heap = true;
+        }
+        (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], b->p);
+        *p = (const char*)b->p;
         return NULL;
     }
     if (d->encoding == RAY_ENC_CONST) {
-        uint32_t len; memcpy(&len, body, 4);
-        *eq = len == l && (l == 0 || memcmp(body + 8, s, l) == 0);
+        memcpy(len, body, 4);
+        *p = (const char*)body + 8;
         return NULL;
     }
     /* RAW: 16-byte cells, then the pooled bytes in row order */
     const uint8_t* w = body + (size_t)i * 16;
-    uint32_t len; memcpy(&len, w, 4);
-    if (len != l) return NULL;
-    if (len <= RAY_STR_INLINE_MAX) { *eq = l == 0 || memcmp(w + 4, s, l) == 0; return NULL; }
+    memcpy(len, w, 4);
+    if (want >= 0 && *len != (uint64_t)want) return NULL;
+    if (*len <= RAY_STR_INLINE_MAX) { *p = (const char*)w + 4; return NULL; }
     uint64_t run = 0;
     for (int k = 0; k < i; k++) {
         uint32_t kl; memcpy(&kl, body + (size_t)k * 16, 4);
         if (kl > RAY_STR_INLINE_MAX) run += kl;
     }
-    *eq = memcmp(body + (uint64_t)vlen * 16 + 8 + run, s, l) == 0;
+    *p = (const char*)body + (uint64_t)vlen * 16 + 8 + run;
     return NULL;
+}
+
+ray_t* ray_enccol_str_cell(ray_enccol_t* e, int64_t row, ray_enc_cellbuf_t* b, const char** p, uint32_t* len) {
+    return enc_str_cell(e, row, -1, b, p, len);
+}
+
+/* Does row `row` of the STR column `e` hold the bytes s[0..l)?  The cell is
+ * read by enc_str_cell, an FSST cell's decoded length compared before it is
+ * decoded. */
+ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq) {
+    *eq = false;
+    uint8_t stack[256];
+    ray_enc_cellbuf_t b = { .p = stack, .cap = sizeof stack, .heap = false };
+    const char* p; uint32_t len;
+    ray_t* err = enc_str_cell(e, row, (int64_t)l, &b, &p, &len);
+    if (!err) *eq = p && len == l && (l == 0 || memcmp(p, s, l) == 0);
+    if (b.heap) ray_free_raw(b.p);
+    return err;
 }
 
 /* ---- Single-column materialization (spec "Materialized equivalence") ---- */
@@ -2249,22 +2318,67 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
  * dictionary's entries over 12 bytes once, in code order (sd, the STR_DICT
  * entry, or NULL), then every RAW / CONST / FSST vector's pooled bytes in
  * row order; STR_DICT vectors share the dictionary region and add none.
- * chunk_pool[c] is where chunk c's pooled bytes start. */
-static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool, const ray_enc_sdict_t* sd) {
-    uint64_t total = sd ? sd->pooled : 0;                 /* rule 1: the dictionary region first */
-    for (int64_t c = 0; c < e->n_chunks; c++) {
+ * chunk_pool[c] is where chunk c's pooled bytes start.  Each chunk's bytes
+ * are sized on its own (an FSST vector expands every cell once to measure
+ * it), one pool task per chunk, and the bases are their prefix sum; a
+ * failure reports the lowest failing chunk's error, as the decode does. */
+typedef struct {
+    ray_enccol_t*   e;
+    uint64_t*       bytes;          /* each chunk's pooled bytes */
+    enc_task_res_t* res;
+} enc_prepass_ctx_t;
+
+static void enc_str_prepass_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    enc_prepass_ctx_t* x = raw;
+    ray_enccol_t* e = x->e;
+    for (int64_t c = start; c < end; c++) {
         const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
-        chunk_pool[c] = total;
         int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
-        for (int j = 0; j < nv; j++) {
+        uint64_t total = 0;
+        ray_t* err = NULL;
+        for (int j = 0; !err && j < nv; j++) {
             if (descs[j].encoding == RAY_ENC_STR_DICT) continue;   /* rows in the dictionary region */
-            uint64_t pb;
-            ray_t* err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);
-            if (err) return err;
+            uint64_t pb = 0;
+            err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);
             total += pb;
         }
+        x->bytes[c] = total;
+        if (err) { ray_enc_snap_take(&x->res[c].snap, err); x->res[c].failed = true; }
+        else x->res[c].done = true;
     }
-    return NULL;
+}
+
+static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool, const ray_enc_sdict_t* sd) {
+    uint64_t* bytes = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)(e->n_chunks + 1) * sizeof(uint64_t));
+    enc_task_res_t* res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);
+    if (!bytes || !res) {
+        ray_free_raw(bytes); ray_free_raw(res);
+        return ray_error("oom", "column %s: materialize", e->path);
+    }
+    if (e->n_chunks > (int64_t)UINT32_MAX) {
+        ray_free_raw(bytes); ray_free_raw(res);
+        return ray_error("range", "column %s: too many chunks", e->path);
+    }
+    enc_prepass_ctx_t x = { .e = e, .bytes = bytes, .res = res };
+    ray_pool_t* tp = ray_pool_get();
+    if (e->n_chunks >= 2 && ray_pool_par_dispatch_ok(tp, e->n_chunks, 2))
+        ray_pool_dispatch_n(tp, enc_str_prepass_chunk, &x, (uint32_t)e->n_chunks);
+    else
+        enc_str_prepass_chunk(&x, 0, 0, e->n_chunks);
+    ray_t* err = NULL;
+    uint64_t total = sd ? sd->pooled : 0;                 /* rule 1: the dictionary region first */
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        if (res[c].failed || !res[c].done) {
+            err = res[c].failed ? ray_enc_snap_error(&res[c].snap)
+                                : ray_error("cancel", "column %s: interrupted", e->path);
+            break;
+        }
+        chunk_pool[c] = total;
+        total += bytes[c];
+    }
+    ray_free_raw(bytes); ray_free_raw(res);
+    return err;
 }
 
 static _Atomic(bool) g_fail_index_parse;

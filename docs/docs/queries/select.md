@@ -191,6 +191,27 @@ the whole table (see [running functions](#running-functions-under-where)):
 `(sums (rank v))` by `k` takes each group's rows of the running sum of the
 whole table's ranks, not the running sum of each group's ranks.
 
+Without `by:` the verb also reads the whole column when it sits under a call
+(`(+ 1 (reverse v))`) or is the last form of a `do`, as it does in `update` and
+under `by:`. A helper the planner does not inline (one whose body has more than one
+statement, `(fn [x] (let y 1) (reverse x))`, named or written in place as a
+lambda literal) is called with the column, not a row, when its body applies a
+whole-column verb to its argument: to a parameter, or to a value the body
+derives from one through `let`s and calls (the latest `let` of a name decides,
+so a parameter rebound to a constant no longer counts, nor does a name rebound
+inside a nested `do`, an `if` arm or another argument). The verb may stand at the top of a
+statement, under a call, in a `let`'s value, in a `do`'s last form, or in a
+helper the body calls with such a value. In a `select` projection such a helper
+receives the whole column (the rows `where:` keeps), as it does in `update` and
+under `by:`, so it gives what the verb written in place gives; an effect in it
+happens once, not once per row. Otherwise the helper keeps its per-row call,
+and a verb in it sees one cell: a closure, a verb only reached through an `if`
+arm, a verb applied to a constant or a global
+(`(fn [x] (let k (reverse [1 2])) (count x))` counts each row's cell), a verb
+passed in as an argument, and a lambda bound by a `let` in the projection and
+then called, `(do (let h (fn [x] (let y 1) (reverse x))) (h b))`
+([#1654](https://github.com/RayforceDB/rayforce/issues/1654)).
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its
@@ -474,8 +495,14 @@ of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
 `(sum (at c [3 2 1 0]))` is the sum of the kept rows at those indexes. A scalar the argument gives stands for every row on
 every keyless route, as `1` does in `(sum 1)`: `(sum (count v))` over four rows
 is `16` whether or not another output is declined, and over a `where:` that
-keeps no row `(max (count v))` is `0Nl`, the empty column's. A scalar a
-helper with several statements returns is folded once (#1576).
+keeps no row `(max (count v))` is `0Nl`, the empty column's. So does a
+scalar that a helper the planner does not inline returns, here and under
+`by:`, where it stands for each row of the group: with `hq` giving the
+count of its argument in two statements, `(sum (hq v))` over the same four
+rows is `16`, `9` over a `where:` keeping three, and under `by:` each
+group's count times its rows ([#1576](https://github.com/RayforceDB/rayforce/issues/1576)).
+`update` folds such a scalar once, as it does an inline or bound one
+([#1682](https://github.com/RayforceDB/rayforce/issues/1682)).
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a
@@ -672,6 +699,13 @@ The sort is stable: rows that tie on every sort key keep the order in which
 they first appear in the source, and in a grouped select the group whose first
 source row comes first wins a tie. A `take:` after the sort therefore returns
 the same rows on every run, on in-memory, splayed and parted tables alike.
+
+There is one exception for now: when the group keys are integer, temporal or
+symbol columns, the order of groups that tie on the sort keys is not
+guaranteed, because the engine may emit such groups in key order
+([#1678](https://github.com/RayforceDB/rayforce/issues/1678)). If the order of
+ties matters, add the group key as a last sort key, as in
+`(select {r: (count v) from: t by: k asc: [r k] take: 10})`.
 
 ### Limiting Rows with `take:`
 

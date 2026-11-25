@@ -37,6 +37,7 @@
 #include "mem/heap.h"
 #include "core/ipc.h"
 #include "ops/journal.h"
+#include "ops/walkmemo.h"
 #include "core/qlog.h"
 
 #include <stdio.h>
@@ -1576,6 +1577,220 @@ static test_result_t snapshot_skips_handles_body(const char* base) {
 static test_result_t test_journal_snapshot_skips_handles(void) {
     char base[256]; make_base(base, sizeof(base), "snap_handles");
     test_result_t res = snapshot_skips_handles_body(base);
+    if (ray_journal_is_open()) (void)ray_journal_close();
+    cleanup_base(base);
+    return res;
+}
+
+/* #1627 audit: the snapshot's handle probe is a size pass of its own.  It
+ * used to run the size pass's inner walk with the memo closed: what it
+ * kept and charged carried over from the last size pass and from one
+ * binding to the next.  After a refused ser (over 1 GiB of repeats) a
+ * probe stopped with limit at the first shared part, before it reached the
+ * handle; the binding was then not skipped and the save failed on it. */
+static test_result_t snapshot_probe_fresh_body(const char* base) {
+    char qpath[270]; qdb_path(qpath, sizeof(qpath), base);
+
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str(
+        "(set jp_big (til 100000))"
+        "(set jp_v (list jp_big 2))"
+        "(set jp_a jp_v)"
+        "(set jp_b (list jp_v jp_v))"
+        "(set jp_h (list jp_v (dl-program)))"
+        "(try (ser (take (list jp_big) 1500)) (fn [e] (get e 'code)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->type, -RAY_SYM);   /* the ser was refused: limit */
+    ray_release(r);
+
+#ifndef RAY_OS_WINDOWS
+    char warn_path[300];
+    snprintf(warn_path, sizeof(warn_path), "%s.warn", base);
+    int warn_fd = open(warn_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_TRUE(warn_fd >= 0);
+    fflush(stderr);
+    int saved_stderr = dup(STDERR_FILENO);
+    TEST_ASSERT_TRUE(saved_stderr >= 0);
+    TEST_ASSERT_EQ_I(dup2(warn_fd, STDERR_FILENO), STDERR_FILENO);
+#endif
+    ray_err_t snap = ray_journal_snapshot();
+#ifndef RAY_OS_WINDOWS
+    fflush(stderr);
+    TEST_ASSERT_EQ_I(dup2(saved_stderr, STDERR_FILENO), STDERR_FILENO);
+    close(saved_stderr);
+    char warn[2048];
+    ssize_t wn = pread(warn_fd, warn, sizeof(warn) - 1, 0);
+    close(warn_fd);
+    unlink(warn_path);
+    TEST_ASSERT_TRUE(wn > 0);
+    warn[wn] = '\0';
+    TEST_ASSERT_NOT_NULL(strstr(warn, "snapshot skips 'jp_h'"));
+    TEST_ASSERT_NULL(strstr(warn, "'jp_a'"));
+    TEST_ASSERT_NULL(strstr(warn, "'jp_b'"));
+#endif
+    TEST_ASSERT_EQ_I(snap, RAY_OK);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* A new process: the shared bindings reload, the handle one is gone. */
+    ray_runtime_destroy(__RUNTIME);
+    ray_runtime_create(0, NULL);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* n = ray_eval_str("(+ (count (at jp_a 0)) (count (at (at jp_b 1) 0)))");
+    TEST_ASSERT_NOT_NULL(n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n));
+    TEST_ASSERT_EQ_I(n->i64, 200000);
+    ray_release(n);
+    ray_t* h = ray_eval_str("jp_h");
+    TEST_ASSERT_NOT_NULL(h);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(h));
+    TEST_ASSERT_STR_EQ(ray_err_code(h), "name");
+    ray_error_free(h);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    PASS();
+}
+
+static test_result_t test_journal_snapshot_probe_fresh(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_probe");
+    test_result_t res = snapshot_probe_fresh_body(base);
+    if (ray_journal_is_open()) (void)ray_journal_close();
+    cleanup_base(base);
+    return res;
+}
+
+/* #1627 audit: the probe leaves nothing behind for the next size pass.  It
+ * used to keep a shared part's size in the closed memo; a later ser that
+ * met another shared part first then found that stale size for the part
+ * (here grown since the probe) and sized its buffer short, and the write
+ * ran past it.  The ser must size the part as it is now. */
+static test_result_t test_journal_probe_then_ser(void) {
+    ray_t* a = ray_list_new(8);
+    TEST_ASSERT_NOT_NULL(a);
+    for (int64_t i = 0; i < 8; i++) {
+        ray_t* x = ray_i64(1000 + i);
+        a = ray_list_append(a, x);
+        ray_release(x);
+    }
+    ray_retain(a);                    /* held twice: a part that may repeat */
+    int64_t full = a->len;
+    a->len = 1;                       /* probed with one cell */
+    TEST_ASSERT_FALSE(ray_serde_holds_handle(a));
+    a->len = full;                    /* then grown in place to eight */
+
+    ray_t* b = ray_list_new(1);       /* another shared part, met first */
+    ray_t* one = ray_i64(1);
+    b = ray_list_append(b, one);
+    ray_release(one);
+    ray_retain(b);
+    ray_t* outer = ray_list_new(3);
+    outer = ray_list_append(outer, b);
+    outer = ray_list_append(outer, a);
+    outer = ray_list_append(outer, a);
+
+    ray_t* bytes = ray_ser(outer);
+    TEST_ASSERT_NOT_NULL(bytes);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(bytes));
+    ray_t* back = ray_de(bytes);
+    TEST_ASSERT_NOT_NULL(back);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(back));
+    TEST_ASSERT_EQ_I(back->len, 3);
+    ray_t* c2 = ((ray_t**)ray_data(back))[2];
+    TEST_ASSERT_EQ_I(c2->len, 8);
+    TEST_ASSERT_EQ_I(((ray_t**)ray_data(c2))[7]->i64, 1007);
+    ray_release(back);
+    ray_release(bytes);
+    ray_release(outer);
+    ray_release(b); ray_release(b);
+    ray_release(a); ray_release(a);
+    PASS();
+}
+
+/* #1627 delta review: the snapshot is the server's own data, written whole.
+ * A value bound under several names is written once per name, as on dev,
+ * not refused by the budget of repeated output (scaled down here: a 1 MB
+ * budget, a 320 KB vector under five names, 1.28 MB written again).  A
+ * table directory that holds the vector in several columns saves too. */
+static test_result_t snapshot_shared_names_body(const char* base) {
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str(
+        "(set jn_a (til 40000))"
+        "(set jn_b jn_a) (set jn_c jn_a) (set jn_d jn_a) (set jn_e jn_a)");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    /* the lowered budget is in effect: an ordinary ser of the five refuses */
+    ray_t* e = ray_eval_str("(ser (list jn_a jn_b jn_c jn_d jn_e))");
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "limit");
+    ray_error_free(e);
+
+    TEST_ASSERT_EQ_I(ray_journal_snapshot(), RAY_OK);
+
+    char tdir[640];
+    snprintf(tdir, sizeof(tdir), "(.db.splayed.set \"%s.splay/t/\" (table [a b c d e] (list (list jn_a) (list jn_b) (list jn_c) (list jn_d) (list jn_e))))", base);
+    r = ray_eval_str(tdir);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    /* A new process: every name reloads, with the whole vector. */
+    ray_runtime_destroy(__RUNTIME);
+    ray_runtime_create(0, NULL);
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* n = ray_eval_str("(sum (map count (list jn_a jn_b jn_c jn_d jn_e)))");
+    TEST_ASSERT_NOT_NULL(n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n));
+    TEST_ASSERT_EQ_I(n->i64, 200000);
+    ray_release(n);
+    snprintf(tdir, sizeof(tdir), "(count (at (at (.db.splayed.get \"%s.splay/t/\") 'e) 0))", base);
+    n = ray_eval_str(tdir);
+    TEST_ASSERT_NOT_NULL(n);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(n));
+    TEST_ASSERT_EQ_I(n->i64, 40000);
+    ray_release(n);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    PASS();
+}
+
+static test_result_t test_journal_snapshot_shared_names(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_names");
+    uint64_t was = ray_dup_budget_set((uint64_t)1 << 20);
+    test_result_t res = snapshot_shared_names_body(base);
+    (void)ray_dup_budget_set(was);
+    if (ray_journal_is_open()) (void)ray_journal_close();
+    char cmd[320];
+    snprintf(cmd, sizeof(cmd), "rm -rf '%s.splay'", base);
+    if (system(cmd) != 0) { /* best effort */ }
+    cleanup_base(base);
+    return res;
+}
+
+/* A snapshot the serializer refuses reports why, with its code and
+ * message: a binding nested deeper than the wire format reads is a limit
+ * error, not an empty domain one. */
+static test_result_t snapshot_reports_limit_body(const char* base) {
+    TEST_ASSERT_EQ_I(ray_journal_open(base, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* r = ray_eval_str("(set jd (list 1)) (times 600 (set jd (list jd)))");
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    ray_release(r);
+    ray_t* e = ray_eval_str("(.log.snapshot)");
+    TEST_ASSERT_NOT_NULL(e);
+    TEST_ASSERT_TRUE(RAY_IS_ERR(e));
+    TEST_ASSERT_STR_EQ(ray_err_code(e), "limit");
+    const char* msg = ray_err_msg(e);
+    TEST_ASSERT_NOT_NULL(msg);
+    TEST_ASSERT_NOT_NULL(strstr(msg, "nested"));
+    ray_error_free(e);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    PASS();
+}
+
+static test_result_t test_journal_snapshot_reports_limit(void) {
+    char base[256]; make_base(base, sizeof(base), "snap_limit");
+    test_result_t res = snapshot_reports_limit_body(base);
     if (ray_journal_is_open()) (void)ray_journal_close();
     cleanup_base(base);
     return res;
@@ -3886,6 +4101,10 @@ const test_entry_t journal_entries[] = {
     { "journal/snapshot_basic",            test_journal_snapshot_basic,            jrn_setup, jrn_teardown },
     { "journal/open_with_qdb",             test_journal_open_with_qdb,             jrn_setup, jrn_teardown },
     { "journal/snapshot_skips_handles",    test_journal_snapshot_skips_handles,    jrn_setup, jrn_teardown },
+    { "journal/snapshot_probe_fresh",      test_journal_snapshot_probe_fresh,      jrn_setup, jrn_teardown },
+    { "journal/probe_then_ser",            test_journal_probe_then_ser,            jrn_setup, jrn_teardown },
+    { "journal/snapshot_shared_names",     test_journal_snapshot_shared_names,     jrn_setup, jrn_teardown },
+    { "journal/snapshot_reports_limit",    test_journal_snapshot_reports_limit,    jrn_setup, jrn_teardown },
     { "journal/snapshot_empty_env",        test_journal_snapshot_empty_env,        jrn_setup, jrn_teardown },
     { "journal/snapshot_function_binding", test_journal_snapshot_function_binding_recovers, jrn_setup, jrn_teardown },
     { "journal/snapshot_keeps_trust",      test_journal_snapshot_keeps_trust,      jrn_setup, jrn_teardown },

@@ -1,0 +1,46 @@
+;; A like over a compressed STR column (#1645): STR_DICT partitions are
+;; read a vector at a time, each dictionary entry matched once; FSST and
+;; RAW partitions are decoded whole while that fits the decode cache's
+;; budget, else read by vector (encstr/like_policy tests which path each
+;; takes).  Every answer is compared with the same rows saved plain.
+(set n 70000)
+(set u (fn [o] (table [k s] (list (+ o (til n)) (map (fn [j] (format "id-%" (+ o j))) (til n))))))
+(set lc (fn [o] (table [k s] (list (+ o (til n)) (map (fn [j] (if (== 0 (% j 13)) "" (format "category number % long" (% j 37)))) (til n))))))
+(set sh (fn [o] (table [k s] (list (+ o (til 3000)) (map (fn [j] (format "s%" (% j 400))) (til 3000))))))
+;; compressed: unique strings (FSST), low cardinality with nulls (STR_DICT),
+;; an empty partition, short strings, and one saved plain among them
+(.db.splayed.set "/tmp/rf_test_1645/c/2026.01.01/t/" (u 0) "/tmp/rf_test_1645/c/.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_1645/c/2026.01.02/t/" (lc n) "/tmp/rf_test_1645/c/.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_1645/c/2026.01.03/t/" (take (u 0) 0) "/tmp/rf_test_1645/c/.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_1645/c/2026.01.04/t/" (sh (* 2 n)) "/tmp/rf_test_1645/c/.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_1645/c/2026.01.05/t/" (u (* 3 n)) "/tmp/rf_test_1645/c/.sym")
+(.db.splayed.set "/tmp/rf_test_1645/p/2026.01.01/t/" (u 0) "/tmp/rf_test_1645/p/.sym")
+(.db.splayed.set "/tmp/rf_test_1645/p/2026.01.02/t/" (lc n) "/tmp/rf_test_1645/p/.sym")
+(.db.splayed.set "/tmp/rf_test_1645/p/2026.01.03/t/" (take (u 0) 0) "/tmp/rf_test_1645/p/.sym")
+(.db.splayed.set "/tmp/rf_test_1645/p/2026.01.04/t/" (sh (* 2 n)) "/tmp/rf_test_1645/p/.sym")
+(.db.splayed.set "/tmp/rf_test_1645/p/2026.01.05/t/" (u (* 3 n)) "/tmp/rf_test_1645/p/.sym")
+(set C (.db.parted.get "/tmp/rf_test_1645/c" 't))
+(set P (.db.parted.get "/tmp/rf_test_1645/p" 't))
+(count C) -- 213000
+(select {from: C where: (like s "id-7777*")}) -- (select {from: P where: (like s "id-7777*")})
+(count (select {from: C where: (like s "id-2?7*")})) -- (count (select {from: P where: (like s "id-2?7*")}))
+(select {from: C where: (like s "*number 3? long")}) -- (select {from: P where: (like s "*number 3? long")})
+(select {from: C where: (like s "*7")}) -- (select {from: P where: (like s "*7")})
+(select {from: C where: (like s "s1*")}) -- (select {from: P where: (like s "s1*")})
+(select {from: C where: (like s "[cs]*1")}) -- (select {from: P where: (like s "[cs]*1")})
+(select {from: C where: (like s "")}) -- (select {from: P where: (like s "")})
+(count (select {from: C where: (like s "*")})) -- 213000
+(select {from: C where: (like s "nothing*")}) -- (select {from: P where: (like s "nothing*")})
+;; in a conjunction, in an output, and by a key
+(select {from: C where: (and (> k 1000) (like s "*number 1? long"))}) -- (select {from: P where: (and (> k 1000) (like s "*number 1? long"))})
+(select {m: (like s "id-1*") from: C}) -- (select {m: (like s "id-1*") from: P})
+(select {c: (count k) from: C where: (like s "*3*") by: date}) -- (select {c: (count k) from: P where: (like s "*3*") by: date})
+;; a pattern that is no string atom keeps #1615's answers
+(select {from: C where: (like s (first ["id-7777*"]))}) -- (select {from: P where: (like s "id-7777*")})
+;; a materialized partition is read in place: the same answers
+(count (select {from: C where: (== s "id-77")})) -- 1
+(select {from: C where: (like s "id-7*")}) -- (select {from: P where: (like s "id-7*")})
+;; one compressed splayed table, not partitioned
+(.db.splayed.set "/tmp/rf_test_1645/one/t/" (u 0) "/tmp/rf_test_1645/one/.sym" {compress: true})
+(set O (.db.splayed.get "/tmp/rf_test_1645/one/t/" "/tmp/rf_test_1645/one/.sym"))
+(select {from: O where: (like s "id-6?9")}) -- (select {from: (u 0) where: (like s "id-6?9")})

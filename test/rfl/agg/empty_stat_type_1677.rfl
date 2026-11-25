@@ -1,0 +1,32 @@
+;; dev, var, stddev, their _pop forms, med and quantile take numbers and
+;; temporals: any other type is a type error, empty or not, as avg and sum
+;; already were (#1677).  An empty symbol vector used to answer 0Nf, and the
+;; select fallback over no rows followed it with an empty column where the
+;; planned route raised type.
+(set e (take (enlist 'a) 0))
+(dev e) !- type
+(var e) !- type
+(stddev e) !- type
+(dev_pop e) !- type
+(var_pop e) !- type
+(stddev_pop e) !- type
+(med e) !- type
+(quantile e 0.5) !- type
+(dev (enlist 'a)) !- type
+(avg e) !- type
+;; an empty vector of a type they take is still the null
+(dev (take [1] 0)) -- 0Nf
+(var (take [1.5] 0)) -- 0Nf
+(med (take [1i] 0)) -- 0Nf
+(quantile (take (as 'DATE [1]) 0) 0.5) -- 0Nf
+;; the select over no rows: type on both routes, as over rows
+(set Hm2 (fn [v] (let q 1) (+ v q)))
+(set T (table [i s h] (list (til 6) (enlist 'a 'b 'c 'd 'e 'f) [1 2 3 4 5 6])))
+(select {v: (dev s) from: T where: (> i 100)}) !- type
+(select {v: (dev s) w: (Hm2 i) from: T where: (> i 100)}) !- type
+(select {v: (med s) w: (Hm2 i) from: T where: (> i 100)}) !- type
+(select {v: (var s) w: (Hm2 i) from: (take T 0)}) !- type
+(select {v: (dev s) w: (Hm2 i) from: T}) !- type
+;; a numeric column over no rows: one row of the null, planned route
+(at (select {v: (dev h) from: T where: (> i 100)}) 'v) -- [0Nf]
+(count (at (select {v: (dev h) w: (Hm2 i) from: T where: (> i 100)}) 'v)) -- 0

@@ -32,6 +32,7 @@
 struct ray_sym_domain_s;
 struct ray_enc_chunk_stat_s;   /* store/enccol.h */
 struct ray_enc_vview_s;        /* store/enccol.h */
+struct ray_enc_cellbuf_s;      /* store/enccol.h */
 
 /* A bound column source: the object a scan reads ranges of.  Binding
  * retains the object (and a non-runtime SYM domain) and never decodes.
@@ -89,7 +90,12 @@ typedef struct {
  * that generation 0, reading its columns in place, never pays.  One per
  * scratch, alive until the scratch is freed. */
 #define RAY_COL_FIXED_BYTES ((size_t)1024 * 16)   /* one vector of the widest element (GUID) */
-typedef struct { _Alignas(64) uint8_t b[RAY_COL_FIXED_BYTES]; } ray_col_fixed_t;
+/* 32-byte aligned, as the heap's fixed vector is (ray_alloc_raw data sits
+ * 32 bytes past a block start): no decoder relies on more.  64 was more
+ * than gcc 11/12's ASan fake stack gives a stack local, so every lent
+ * scratch and every agg_curs_t embedding one was misaligned there and
+ * UBSan stopped the sanitized suite (#1652). */
+typedef struct { _Alignas(32) uint8_t b[RAY_COL_FIXED_BYTES]; } ray_col_fixed_t;
 
 /* NULL or an owned error (ray_error_free). */
 ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out);
@@ -235,6 +241,12 @@ void ray_col_src_want_points(ray_col_src_t* s, const int64_t* rows, int64_t n);
  * and vectors with a null bitmap served too, nul[q] 1 for a bitmap null. */
 int  ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
                                ray_t** err);
+/* One STR cell for a gather (ray_enccol_str_cell): 1 served, *p and *len
+ * holding until b is next used; 0 declined (a source that is not an
+ * encoded STR one, or a plain or materialized source or segment: a cursor
+ * reads it); -1 an owned *err. */
+int  ray_col_src_str_point(ray_col_src_t* s, int64_t row, struct ray_enc_cellbuf_s* b, const char** p, uint32_t* len,
+                           ray_t** err);
 /* The rows [*lo, *hi) of the vector holding row `row` (segment-local
  * vectors for a parted source) when ray_col_src_point_i64 may serve it (a
  * single-file encoded column or segment, not materialized): true.  False

@@ -30,6 +30,7 @@
 #ifdef DEBUG
 #include "rayforce.h"       /* ray_request_interrupt: the cancel-at test hook */
 #endif
+#include "ops/ops.h"        /* ray_cancel_dispatch, ray_pool_on_worker */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -484,8 +485,14 @@ static void pool_trace_dump(const ray_pool_t* pool) {
     }
 }
 
+/* Set on the pool's worker threads: a request's cancel reaches the workers
+ * running its dispatch (src/lang/eval.c). */
+static RAY_TLS bool t_pool_worker = false;
+bool ray_pool_on_worker(void) { return t_pool_worker; }
+
 static void worker_loop(void* arg) {
     worker_ctx_t wctx = *(worker_ctx_t*)arg;
+    t_pool_worker = true;
     ray_sys_free(arg);
 
     ray_pool_t* pool = wctx.pool;
@@ -865,6 +872,9 @@ static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, b
      * only).  A worker holding a surplus token from an earlier window may
      * claim a ticket the moment it is published, so the flag goes first. */
     atomic_store_explicit(&ray_parallel_flag, 1, memory_order_release);
+    /* The dispatch is the calling thread's: a cancel addressed to it stops
+     * the workers, one addressed elsewhere does not (#1623). */
+    ray_cancel_dispatch(true);
     /* Main thread enters atomic refcount mode during parallel dispatch */
     ray_rc_sync = true;
 
@@ -917,6 +927,7 @@ static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, b
 
     /* All tasks done, workers heading to sem_wait (no GC in loop).
      * Safe for main to modify worker heaps between dispatches. */
+    ray_cancel_dispatch(false);
     atomic_store_explicit(&ray_parallel_flag, 0, memory_order_release);
 
     /* Memory fence ensures all worker RC operations are visible before

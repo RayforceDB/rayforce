@@ -71,6 +71,13 @@ static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
 int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
 ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
+#ifdef DEBUG
+/* Test hook (C tests only, DEBUG builds): rows ray_timespan_binary has
+ * evaluated cell by cell (span_eval), an atom pair counting one, on every
+ * thread since the process started.  TIMESTAMP / TIMESPAN / I64 vector
+ * arithmetic and comparisons take whole-vector kernels instead (#1633). */
+int64_t ray_timespan_test_cell_rows(void);
+#endif
 /* A non-null numeric atom as a TIMESPAN: its value is a count of
  * nanoseconds.  A float rounds half away from zero, NaN is the null and a
  * value beyond the I64 lane (an infinity included) saturates to 0Wn or
@@ -85,6 +92,22 @@ void     ray_cancel(void);
  * clearing of the first (src/lang/eval.c). */
 bool     ray_take_interrupt(void);
 void     ray_cancel_reset(void);
+/* A process cancel (ray_request_interrupt) is pending, whoever it is for. */
+bool     ray_interrupt_pending(void);
+
+/* The IPC request cancel (src/lang/eval.c, #1623): a client's cancel byte
+ * for the request a server evaluates is honoured only on the thread
+ * evaluating it, never consumed or cleared by a client thread. */
+typedef struct { const void* thread; bool cancelled; } ray_cancel_save_t;
+void     ray_cancel_request(void);            /* async-signal-safe */
+bool     ray_request_cancelled(void);         /* for the calling thread */
+void     ray_cancel_request_begin(ray_cancel_save_t* save);
+void     ray_cancel_request_end(const ray_cancel_save_t* save);
+void     ray_cancel_waiter(int delta);        /* a sync send waits (+1) or is done (-1) */
+void     ray_cancel_dispatch(bool open);      /* the calling thread's pool dispatch */
+void     ray_cancel_state_reset_for_test(void);
+/* The calling thread is one of the pool's workers (src/core/pool.c). */
+bool     ray_pool_on_worker(void);
 
 /* ===== Parted Types ===== */
 
@@ -279,6 +302,14 @@ static inline bool ray_has_timespan(const ray_t* x) {
  * place (agg_stream.c); a group bound for the legacy engine is re-planned
  * with the slot as SUM over a not-null indicator (exec_group_run). */
 #define OP_COUNT_NN    147
+/* Internal aggregates, never compiled from Rayfall (#1666): a partition's
+ * variance-family state for the parted merge (exec_group_per_partition).
+ * Each accumulates exactly as OP_VAR_POP, about a value k of the group;
+ * OP_VAR_K emits k rounded to double, OP_VAR_D the group mean about that
+ * double (k's rounding remainder taken exactly, plus sum(x - k) / n), so
+ * K + D is the mean to the spread's precision at any magnitude. */
+#define OP_VAR_K       148
+#define OP_VAR_D       149
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */
@@ -1075,8 +1106,8 @@ ray_t* ray_query_helper_table(void);
 /* The length a value over the rows of the query being evaluated has here:
  * the group's row count while a group is evaluated, else the active
  * table's.  -1 outside a query, and while it is evaluated one row at a
- * time (its columns are cells then).  For the evaluator's `if`, which
- * cannot choose per row (ray_cond_fn). */
+ * time (its columns are cells then).  For `while`, whose condition is
+ * tested whole (eval.c cond_rows_test). */
 int64_t ray_query_rows_len(void);
 /* Owned: the source column `sym` names, or its cell during a per-row
  * evaluation; NULL when it names none. */

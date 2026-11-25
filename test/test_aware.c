@@ -2993,6 +2993,136 @@ static test_result_t test_gather_sym_points(void) {
     PASS();
 }
 
+/* A few rows of an encoded STR column are read cell by cell: no vector of
+ * strings is decoded for them, by a selection and by row ids, and the cells
+ * are what generation 0 gives.  The columns: d a dictionary, f FSST with
+ * short cells, c one string in every row, w FSST with cells from a few
+ * bytes to over two kilobytes (past the gather's own room, and growing, so
+ * the room is taken from the heap and taken again larger), e all empty.
+ * The encodings a writer chooses for these are asserted below; a CONST or a
+ * RAW vector of strings it does not choose for any of them.  And a parted column made anew
+ * over segments that are already decoded, as a pruned source is, reads
+ * those decodes in place.  Before, a string was reached only by decoding
+ * its whole vector, on every query. */
+static test_result_t test_gather_str_points(void) {
+    static const int64_t np[2] = { 3000, 5000 };
+    for (int gen = 0; gen <= 2; gen += 2)
+        for (int p = 0; p < 2; p++) {
+            char q[2600];
+            snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/st%d/2024.01.0%d/t/\" "
+                     "(table [k d f c w e] (list (+ %lld (til %lld)) "
+                     "(map (fn [j] (if (== 0 (%% j 11)) \"\" (at [\"a string long enough to be pooled, one\" \"short\" \"another string long enough to be pooled\"] (%% j 3)))) (+ %lld (til %lld))) "
+                     "(map (fn [j] (if (== 0 (%% j 13)) \"\" (format \"a line of the journal, row %% of many, in words that repeat again and again and again\" (* j 7919)))) (+ %lld (til %lld))) "
+                     "(take [\"the same string, long enough to be pooled, in every row\"] %lld) "
+                     "(map (fn [j] (str-join (take [\"words of a line that grows,\"] (+ 1 (%% (* j 37) 90))) (format \" %% \" j))) (+ %lld (til %lld))) "
+                     "(take [\"\"] %lld))) "
+                     "\"" AW_TMP "/st%d/.sym\" {compress: %s})", gen, p + 1, (long long)(p ? np[0] : 0), (long long)np[p],
+                     (long long)(p ? np[0] : 0), (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p],
+                     (long long)np[p], (long long)(p ? np[0] : 0), (long long)np[p], (long long)np[p],
+                     gen, gen ? "true" : "false");
+            aw_eval_ok(q);
+        }
+    ray_t* tp[2] = { aw_eval("(.db.parted.get \"" AW_TMP "/st0\" 't)"), aw_eval("(.db.parted.get \"" AW_TMP "/st2\" 't)") };
+    TEST_ASSERT_TRUE(tp[0] && tp[1] && !RAY_IS_ERR(tp[0]) && !RAY_IS_ERR(tp[1]));
+    static const char* const cols[] = { "d", "f", "c", "w", "e" };
+    enum { NC = 5 };
+    /* the encodings the three columns took: the cell read has an arm for each */
+    int64_t encs[16] = { 0 };
+    for (int c = 0; c < NC; c++) {
+        ray_t* encv = ray_table_get_col_enc(tp[1], ray_sym_intern(cols[c], 1));
+        TEST_ASSERT_FMT(encv != NULL, "%s is not encoded", cols[c]);
+        for (int64_t sg = 0; ; sg++) {
+            ray_t* seg = ray_enccol_seg(encv, sg);
+            if (!seg) break;
+            ray_enccol_t* e = ray_enccol_of(seg);
+            for (int64_t v = 0; e && v * RAY_ENC_VEC < e->len; v++) {
+                int enc = ray_enccol_descs(e, v / RAY_ENC_VECS_PER_CHUNK)[v % RAY_ENC_VECS_PER_CHUNK].encoding;
+                if (enc >= 0 && enc < 16) encs[enc]++;
+            }
+        }
+    }
+    /* (a column of one string takes a dictionary of one entry) */
+    TEST_ASSERT_FMT(encs[RAY_ENC_STR_DICT] > 0 && encs[RAY_ENC_FSST] > 0,
+                    "STR_DICT %lld, FSST %lld, CONST %lld, RAW %lld", (long long)encs[RAY_ENC_STR_DICT],
+                    (long long)encs[RAY_ENC_FSST], (long long)encs[RAY_ENC_CONST], (long long)encs[RAY_ENC_RAW]);
+    const int64_t n = np[0] + np[1];
+    ray_t* pred = ray_vec_new(RAY_BOOL, n); pred->len = n;
+    memset(ray_data(pred), 0, (size_t)n);
+    int64_t ids[128], ni = 0;
+    for (int64_t r = 0; r < n; r++)
+        if (r % 997 == 5 || (r >= 2998 && r <= 3001) || r == n - 1 || r == 0 || r == 13 * 11) {
+            ((uint8_t*)ray_data(pred))[r] = 1;
+            if (ni < 128) ids[ni++] = r;
+        }
+    for (int64_t i = 0; i < ni / 2; i++) { int64_t x = ids[i]; ids[i] = ids[ni - 1 - i]; ids[ni - 1 - i] = x; }  /* unsorted */
+    ray_t* sel = ray_rowsel_from_pred(pred);
+    TEST_ASSERT_NOT_NULL(sel);
+    for (int c = 0; c < NC; c++) {
+        ray_t* refs[2];
+        for (int w = 0; w < 2; w++) {
+            char q[1600];
+            if (w) {
+                char lst[128 * 8] = "[";
+                for (int64_t i = 0; i < ni; i++)
+                    snprintf(lst + strlen(lst), sizeof lst - strlen(lst), "%s%lld", i ? " " : "", (long long)ids[i]);
+                strcat(lst, "]");
+                snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/st0\" 't) '%s) %s)", cols[c], lst);
+            } else {
+                snprintf(q, sizeof q, "(at (at (.db.parted.get \"" AW_TMP "/st0\" 't) '%s) (where (or (== 5 (%% (til %lld) 997)) "
+                         "(and (>= (til %lld) 2998) (<= (til %lld) 3001)) (== (til %lld) %lld) (== (til %lld) 0) (== (til %lld) 143))))",
+                         cols[c], (long long)n, (long long)n, (long long)n, (long long)n, (long long)(n - 1), (long long)n, (long long)n);
+            }
+            refs[w] = aw_eval(q);
+            TEST_ASSERT_FMT(refs[w] && !RAY_IS_ERR(refs[w]), "%s: %s", q, ray_error_msg());
+        }
+        for (int g = 0; g < 2; g++) {
+            ray_col_src_t s;
+            ray_t* out[2];
+            TEST_ASSERT_NULL(ray_table_col_src(tp[g], ray_sym_intern(cols[c], 1), &s));
+            ray_enc_counters_reset();
+            TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out[0]));
+            TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, ni, &out[1]));
+            ray_col_src_release(&s);
+            ray_enc_counters_t k; ray_enc_counters_get(&k);
+            if (g)
+                TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s: decoded %llu bytes, materialized %llu",
+                                cols[c], (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
+            AW_GATHER_REF(out[0], refs[0], false, cols[c]);
+            AW_GATHER_REF(out[1], refs[1], false, cols[c]);
+            ray_release(out[0]); ray_release(out[1]);
+        }
+        /* The segments decoded, and a parted column made anew over them: the
+         * decodes are read where they are, nothing is decoded again. */
+        ray_t* encv = ray_table_get_col_enc(tp[1], ray_sym_intern(cols[c], 1));
+        for (int64_t sg = 0; ; sg++) {
+            ray_t* seg = ray_enccol_seg(encv, sg);
+            if (!seg) break;
+            ray_t* dec = ray_enccol_materialize(seg);
+            TEST_ASSERT_FMT(dec && !RAY_IS_ERR(dec), "%s: segment %lld does not decode", cols[c], (long long)sg);
+        }
+        ray_t* anew = ray_enccol_parted_new(ray_enccol_of(encv)->wrapper);
+        TEST_ASSERT_TRUE(anew && !RAY_IS_ERR(anew));
+        ray_col_src_t s;
+        ray_t* out[2];
+        TEST_ASSERT_NULL(ray_col_src_bind(anew, &s));
+        ray_enc_counters_reset();
+        TEST_ASSERT_NULL(ray_col_gather_sel(&s, sel, &out[0]));
+        TEST_ASSERT_NULL(ray_col_gather_rows(&s, ids, ni, &out[1]));
+        ray_col_src_release(&s);
+        ray_enc_counters_t k; ray_enc_counters_get(&k);
+        TEST_ASSERT_FMT(k.decoded_bytes == 0 && k.materialized == 0, "%s over decoded segments: decoded %llu bytes, materialized %llu",
+                        cols[c], (unsigned long long)k.decoded_bytes, (unsigned long long)k.materialized);
+        AW_GATHER_REF(out[0], refs[0], false, cols[c]);
+        AW_GATHER_REF(out[1], refs[1], false, cols[c]);
+        ray_release(out[0]); ray_release(out[1]);
+        ray_release(anew);
+        ray_release(refs[0]); ray_release(refs[1]);
+    }
+    ray_rowsel_release(sel); ray_release(pred);
+    ray_release(tp[0]); ray_release(tp[1]);
+    PASS();
+}
+
 /* Task 10b: HEAD(SORT) under a lazy selection over a parted table (late
  * materialization).  The keys are compacted and top-k'd, then only the
  * winners' rows of every column gathered: the answer is the full sort's
@@ -5985,6 +6115,7 @@ const test_entry_t aware_entries[] = {
     { "aware/gather_points",      test_gather_points,      aw_setup, aw_teardown },
     { "aware/gather_raw_points",  test_gather_raw_points,  aw_setup, aw_teardown },
     { "aware/gather_sym_points",  test_gather_sym_points,  aw_setup, aw_teardown },
+    { "aware/gather_str_points",  test_gather_str_points,  aw_setup, aw_teardown },
     { "aware/sort_head_late",     test_sort_head_late,     aw_setup, aw_teardown },
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },

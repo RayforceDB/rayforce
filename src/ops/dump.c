@@ -110,6 +110,8 @@ const char* ray_opcode_name(uint16_t op) {
         case OP_COUNT_DISTINCT:return "COUNT_DISTINCT";
         case OP_STDDEV:        return "STDDEV";
         case OP_STDDEV_POP:    return "STDDEV_POP";
+        case OP_VAR_K:         return "VAR_K";
+        case OP_VAR_D:         return "VAR_D";
         case OP_VAR:           return "VAR";
         case OP_VAR_POP:       return "VAR_POP";
         case OP_PEARSON_CORR:  return "PEARSON_CORR";

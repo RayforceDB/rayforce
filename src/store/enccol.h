@@ -254,6 +254,16 @@ ray_t* ray_enccol_vec_pool_bytes(ray_enccol_t* e, int64_t vec, uint64_t* out);
  * and a dictionary or FSST table that fails to load is an error).  NULL
  * with *eq set, or an owned error. */
 ray_t* ray_enccol_str_cell_eq(ray_enccol_t* e, int64_t row, const char* s, size_t l, bool* eq);
+/* Room a cell read may decode into: the caller's own block (heap false) or
+ * one the read took from ray_alloc_raw when the cell did not fit (heap
+ * true: the caller frees it with ray_free_raw when it is done reading). */
+typedef struct ray_enc_cellbuf_s { uint8_t* p; size_t cap; bool heap; } ray_enc_cellbuf_t;
+/* The bytes of row `row` of the STR column `e`, read where the file says
+ * the cell is, with no vector decode: *p and *len, *p pointing into the
+ * file (a dictionary entry, a constant, a raw cell) or into b (an FSST
+ * cell, decoded there), and holding until b is next used.  A null is the
+ * empty string, as a decode gives it.  NULL, or an owned error. */
+ray_t* ray_enccol_str_cell(ray_enccol_t* e, int64_t row, ray_enc_cellbuf_t* b, const char** p, uint32_t* len);
 uint8_t ray_enccol_esz(const ray_enccol_t* e);   /* generation-0 element width */
 
 /* The plain column (borrowed, cached for the object's lifetime) or an
@@ -472,6 +482,10 @@ ray_t* ray_enccol_idict_codes(ray_enccol_t* e, int64_t start, int64_t n, const i
 ray_t* ray_enccol_idict_codes_vec(ray_enccol_t* e, ray_t** out);
 /* Test hook: how many STR pools materialization has allocated so far. */
 uint64_t ray_enccol_test_str_pool_allocs(void);
+/* Test hook: FSST cells whose expanded length was measured on its own (the
+ * pool sizing measures each cell once; a decode measures a cell only when
+ * it cannot get a buffer to expand it into), since process start. */
+uint64_t ray_enccol_test_fsst_measured(void);
 /* A fresh SYM vector `out` (runtime domain) takes the domain the column's ids
  * resolve over, as its materialization would; no decode. */
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv);

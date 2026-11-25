@@ -4809,12 +4809,15 @@ static test_result_t test_select_parted_prunes_if_f64_sym(void) {
         { "q: qty", true, "(and (== date 2024.01.02) (> (if (>= px 1.0) px 0.0) 1.2))", 5 },
         { "by: g n: (count qty)", true, "(and (== date 2024.01.02) (!= (if (> px 0.5) act 'none) 'none))", 2 },
         { "q: qty", true, "(and (== date 2024.01.02) (in (if (== side 'b) act side) ['New 's]))", 5 },
-        /* not an operand: a bare conjunct, under a logic head, in by: */
+        /* not an operand: a bare conjunct, under a logic head */
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) (> qty 2) (< qty 2)))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) qty 0))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (if (> px 1.0) act side))", -1 },
         { "q: qty", false, "(and (== date 2024.01.02) (or (if (> px 1.0) (> qty 2) (< qty 2)) (> qty 4)))", -1 },
-        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", false, NULL, -1 },
+        /* a by: key computing an if reads only its row (#1604, after #1605);
+         * one whose branches have two types stays declined */
+        { "by: {k: (if (> px 1.0) 1 0)} n: (count qty)", true, NULL, 2 },
+        { "by: {k: (if (> px 1.0) 1 0.5)} n: (count qty)", false, NULL, 2 },
     };
     for (int gen = 0; gen < 2; gen++) {
         char root[256], sym_path[512];
@@ -5302,16 +5305,15 @@ static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
  * blanket rejection cannot satisfy the decline assertions. */
 static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
     /* These concrete lexical calls intentionally retain their evaluator
-     * semantics. A local IF is no `if` to the planner: the evaluator's `if`
-     * gets the condition vector, which differs between the rows, and raises
-     * `nyi` rather than give every row its first arm (#1630; expected[] is
-     * unused for it). A local NOT only stops the DAG
+     * semantics. A local IF is no special form, but the builtin it holds
+     * chooses per row over a boolean condition vector, as `if` does, so it
+     * answers the same values; only the pruning is declined. A local NOT only stops the DAG
      * lowering; the `if` still chooses per row over the evaluated condition
      * (#1300). A local SUM still aggregates the rowwise-lowered inner IF in
      * this query shape. */
     static const struct { const char* local; bool pruned; int64_t expected[4]; } heads[] = {
         { NULL,  true,  { 370, 13, 300, 13 } },
-        { "if",  false, {  70,  6, 600, 20 } },
+        { "if",  false, { 370, 13, 300, 13 } },
         { "sum", false, { 370, 13, 300, 13 } },
         { "not", false, { 370, 13, 300, 13 } },
     };
@@ -5348,12 +5350,8 @@ static test_result_t test_select_parted_prunes_grouped_if_captures(void) {
             uint64_t created = ray_query_test_parted_pruned_sources(true);
 #endif
             ray_t* u = ray_eval_str(reference);
-            bool raises = heads[i].local && strcmp(heads[i].local, "if") == 0;
-            bool values = raises
-                ? (r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "nyi") == 0 &&
-                   u && RAY_IS_ERR(u) && strcmp(ray_err_code(u), "nyi") == 0)
-                : (pdb_grouped_if_values(r, false, expected) &&
-                   pdb_grouped_if_values(u, false, expected) && sp_same(r, u));
+            bool values = pdb_grouped_if_values(r, false, expected) &&
+                          pdb_grouped_if_values(u, false, expected) && sp_same(r, u);
             bool structural = true;
 #ifdef DEBUG
             structural = created == (uint64_t)heads[i].pruned &&

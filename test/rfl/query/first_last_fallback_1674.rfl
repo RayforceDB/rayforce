@@ -1,0 +1,43 @@
+;; first and last skip nulls inside a select: beside an output the planner
+;; declines (the evaluator fallback), as an output of their own, or reduced
+;; out of a row expression, they give the planned value, broadcast (#1674).
+;; Before, the fallback took the builtin's first or last cell: a null.
+(.sys.exec "rm -rf /tmp/rfl_first_last_1674") -- 0
+(set Hm2 (fn [v] (let q 1) (+ v q)))
+(set T (table [i h f s] (list (til 6) [0N 2 3 0N 5 0N] [0Nf 2.5 3.5 0Nf 5.5 0Nf] (enlist (as 'SYM "") 'b 'c (as 'SYM "") 'e (as 'SYM "")))))
+(.db.splayed.set "/tmp/rfl_first_last_1674/s/t/" T "/tmp/rfl_first_last_1674/s.sym")
+(set S (.db.splayed.get "/tmp/rfl_first_last_1674/s/t/" "/tmp/rfl_first_last_1674/s.sym"))
+(.db.splayed.set "/tmp/rfl_first_last_1674/p/2024.01.01/t/" (take T 3) "/tmp/rfl_first_last_1674/p/.sym")
+(.db.splayed.set "/tmp/rfl_first_last_1674/p/2024.01.02/t/" (drop T 3) "/tmp/rfl_first_last_1674/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_first_last_1674/p" 't))
+
+;; the planned value
+(at (select {v: (first h) from: T}) 'v) -- [2]
+(at (select {v: (last h) from: T}) 'v) -- [5]
+;; beside a declined output: plain, splayed, parted
+(at (select {v: (first h) w: (Hm2 i) from: T}) 'v) -- [2 2 2 2 2 2]
+(at (select {v: (last h) w: (Hm2 i) from: T}) 'v) -- [5 5 5 5 5 5]
+(at (select {v: (first h) w: (Hm2 i) from: S}) 'v) -- [2 2 2 2 2 2]
+(at (select {v: (last h) w: (Hm2 i) from: S}) 'v) -- [5 5 5 5 5 5]
+(at (select {v: (first h) w: (Hm2 i) from: P}) 'v) -- [2 2 2 2 2 2]
+(at (select {v: (last h) w: (Hm2 i) from: P}) 'v) -- [5 5 5 5 5 5]
+(at (select {v: (first f) w: (Hm2 i) from: T}) 'v) -- [2.5 2.5 2.5 2.5 2.5 2.5]
+(at (select {v: (last f) w: (Hm2 i) from: P}) 'v) -- [5.5 5.5 5.5 5.5 5.5 5.5]
+(at (select {v: (first s) w: (Hm2 i) from: S}) 'v) -- ['b 'b 'b 'b 'b 'b]
+(at (select {v: (last s) w: (Hm2 i) from: T}) 'v) -- ['e 'e 'e 'e 'e 'e]
+;; where: keeping some rows, and none
+(at (select {v: (first h) w: (Hm2 i) from: T where: (> i 2)}) 'v) -- [5 5 5]
+(at (select {v: (last h) w: (Hm2 i) from: P where: (< i 4)}) 'v) -- [3 3 3 3]
+(count (at (select {v: (first h) w: (Hm2 i) from: T where: (> i 100)}) 'v)) -- 0
+;; inside an expression, and reduced out of a row expression
+(at (select {v: (+ (first h) (last h)) w: (Hm2 i) from: T}) 'v) -- [7 7 7 7 7 7]
+(at (select {v: (+ i (first h)) w: (Hm2 i) from: T}) 'v) -- [2 3 4 5 6 7]
+(at (select {v: (- (last h) i) w: (Hm2 i) from: S}) 'v) -- [5 4 3 2 1 0]
+;; the other aggregates in that position, as before
+(at (select {v: (sum h) w: (Hm2 i) from: T}) 'v) -- [10 10 10 10 10 10]
+(at (select {v: (max h) w: (Hm2 i) from: P}) 'v) -- [5 5 5 5 5 5]
+(at (select {v: (count h) w: (Hm2 i) from: T}) 'v) -- [6 6 6 6 6 6]
+;; outside a query first and last stay positional
+(first [0N 2]) -- 0N
+(last [2 0N]) -- 0N
+(.sys.exec "rm -rf /tmp/rfl_first_last_1674") -- 0

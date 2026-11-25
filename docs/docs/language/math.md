@@ -618,6 +618,59 @@ Sample and population variance.
 (var_pop [1 2 3])  ; 0.666...
 ```
 
+#### Variance and standard deviation accuracy
+
+`var`, `var_pop`, `stddev`, `stddev_pop`, `dev` and `dev_pop` give the same
+value, to the bound below, on every route a query takes: keyless or
+grouped, `select` or `update`, in-memory, splayed or partitioned, any key
+type, any number of workers. Each sums the differences of the values from a
+value of the data (the first value of the group, or of the part of it one
+worker or one partition summed) and the squares of those differences; an
+integer's difference is taken exactly in 64-bit integer arithmetic and
+rounded once. The parts combine exactly: each re-centres its sums on the
+others' value, and a partition hands its value, its mean about it and its
+variance to the merge. So the error
+follows the spread of the data, not its magnitude: values near 1e8 or at
+timestamp scale (1e18 nanoseconds) are as accurate as values near 1.
+
+For n values, the relative error of the variance is at most
+c·n·ε·(1 + z0²), with ε = 2⁻⁵³ ≈ 1.1e-16, c a small constant, and z0 the
+largest distance, in standard deviations, between the mean and a value
+the sums were taken about. A standard deviation's relative error is half
+that. The eager builtin on a vector (`(var v)` outside a query) takes two
+passes over the differences from the first value and is tighter: at most
+c·n·ε, whatever the data's first value is.
+
+z0 is a few at most when the data does not start far out in its own tail:
+for values in no particular order the values summed about are typical
+ones, and for values sorted by size the farthest is the minimum or the
+maximum (under 2 standard deviations for evenly spread values, about 5 for
+a million normally distributed ones). z0 is large when data starts far
+from its mean, for example a group whose first value is an outlier a
+thousand standard deviations from the rest: the error then grows with
+z0², a million-fold in that example, and stays within the bound. That is
+the one kind of data where the result can be less accurate than summing
+the raw squares, which was accurate for values near 0 and lost everything
+once their magnitude was large next to their spread (1e8 + [0 1 2 3] gave
+0). A variance of values that are all equal is exactly 0.
+
+Overflow. The sums are doubles; Rayfall has no infinity, and an
+overflowing float is `0Nf`, as in `(* 1e300 1e300)`. When an intermediate
+of the variance (a difference, the sum of differences or its square, the
+sum of squares) overflows, every member of the family returns `0Nf`,
+standard deviations included, never a wrong number. Only a tiny negative
+residue from rounding is taken as 0. The sum of differences is the one to
+watch: it is about n·|x − first value|, and its square overflows once that
+passes roughly 1e154. For example, a million values alternating 0 and 1e149
+sum to about 5e154: a grouped `(var_pop v)` over them gives `0Nf`, while
+the eager builtin (two passes, the second about the mean) and, here, the
+keyless routes (whose partial sums per chunk stay smaller) give the
+variance 2.5e297. Squares that overflow outright overflow on
+every route: `(stddev [1e300 -1e300 1e300])` is `0Nf`. Routes may differ
+in whether they overflow, since each takes its sums about a different value
+(the first of the group, of a worker's part or of a partition). Ordinary
+data is far from these magnitudes and is unaffected.
+
 ### `(pearson_corr x y)` — aggregate
 
 Pearson correlation over paired non-null numeric inputs.

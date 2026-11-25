@@ -1325,6 +1325,19 @@ ray_t* ray_last_fn(ray_t* x) {
 /* Helper: copy non-null vec elements to double scratch buffer, compacted.
  * scratch->len is set to the number of non-null values copied.
  * Returns scratch ray_t* (caller must ray_release), or error. */
+/* The vector types med, quantile, var and stddev read (vec_to_f64_scratch,
+ * var_shifted_scratch); any other is a type error, empty or not (#1677). */
+static bool vec_stat_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+    case RAY_F64: case RAY_F32: case RAY_I32: case RAY_DATE: case RAY_TIME:
+    case RAY_I16: case RAY_U8: case RAY_BOOL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
     int64_t len = ray_len(x);
     ray_t* scratch = ray_alloc(len * sizeof(double));
@@ -1383,7 +1396,8 @@ static ray_t* med_f64(ray_t* x) {
 
     if (ray_is_vec(x)) {
         len = ray_len(x);
-        if (len == 0) return ray_typed_null(-RAY_F64);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (len == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
         scratch = vec_to_f64_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
     } else if (is_list(x)) {
@@ -1562,7 +1576,8 @@ static ray_t* quantile_f64(ray_t* x, double q, const char* name) {
 
     if (ray_is_vec(x)) {
         len = ray_len(x);
-        if (len == 0) return ray_typed_null(-RAY_F64);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (len == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
         scratch = vec_to_f64_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
     } else if (is_list(x)) {
@@ -1652,6 +1667,66 @@ static ray_t* stddev_core(ray_t* x, int sample) {
 
 ray_t* ray_dev_fn(ray_t* x) { return stddev_core(x, 0); }
 
+/* A numeric vector's non-null values as their differences from its first
+ * non-null one, into a fresh F64 scratch (#1666): an integer's difference
+ * exact in integer arithmetic (rounded once, to double, as the grouped
+ * routes take it), a float's in double.  Its spread, not its magnitude,
+ * then sets the error of the two passes over it.  Nulls are tested only on a
+ * vector that may hold them, as ray_vec_is_null would. */
+#define VAR_SHIFT_I(T)                                                         \
+    do {                                                                       \
+        const T* d = (const T*)ray_data(x);                                    \
+        for (int64_t i = 0; i < len; i++) {                                    \
+            if (hn && ray_vec_is_null(x, i)) continue;                         \
+            int64_t v = (int64_t)d[i];                                         \
+            if (!seen) { k = v; seen = true; }                                 \
+            int64_t dv;                                                        \
+            vals[cnt++] = __builtin_sub_overflow(v, k, &dv) ? (double)v - (double)k : (double)dv; \
+        }                                                                      \
+    } while (0)
+#define VAR_SHIFT_F(T)                                                         \
+    do {                                                                       \
+        const T* d = (const T*)ray_data(x);                                    \
+        for (int64_t i = 0; i < len; i++) {                                    \
+            if (hn && ray_vec_is_null(x, i)) continue;                         \
+            double v = (double)d[i];                                           \
+            if (!seen) { kf = v; seen = true; }                                \
+            vals[cnt++] = v - kf;                                              \
+        }                                                                      \
+    } while (0)
+static ray_t* var_shifted_scratch(ray_t* x, double** out_vals) {
+    int64_t len = ray_len(x);
+    bool hn = ray_vec_may_have_nulls(x), seen = false;
+    int64_t k = 0, cnt = 0;
+    double kf = 0.0;
+    double* vals;
+    switch (x->type) {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+    case RAY_F64: case RAY_F32: case RAY_I32: case RAY_DATE: case RAY_TIME:
+    case RAY_I16: case RAY_U8: case RAY_BOOL:
+        break;
+    default:
+        return ray_error("type", "expects a numeric or temporal vector, got %s", ray_type_name(x->type));
+    }
+    ray_t* scratch = ray_alloc(len * sizeof(double));
+    if (!scratch) return ray_error("oom", NULL);
+    scratch->type = RAY_F64;
+    vals = (double*)ray_data(scratch);
+    switch (x->type) {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN: VAR_SHIFT_I(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:          VAR_SHIFT_I(int32_t); break;
+    case RAY_I16:                                        VAR_SHIFT_I(int16_t); break;
+    case RAY_U8: case RAY_BOOL:                          VAR_SHIFT_I(uint8_t); break;
+    case RAY_F64:                                        VAR_SHIFT_F(double);  break;
+    default:                                             VAR_SHIFT_F(float);   break;
+    }
+    scratch->len = cnt;
+    *out_vals = vals;
+    return scratch;
+}
+#undef VAR_SHIFT_I
+#undef VAR_SHIFT_F
+
 /* Shared core for variance / stddev in sample or population mode.
  * sample=1 -> divide sum-of-squares by (n-1); sample=0 -> divide by n.
  * take_sqrt=1 -> stddev; take_sqrt=0 -> variance. */
@@ -1670,8 +1745,9 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     int64_t cnt = 0;
 
     if (ray_is_vec(x)) {
-        if (ray_len(x) == 0) return ray_typed_null(-RAY_F64);
-        scratch = vec_to_f64_scratch(x, &vals);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (ray_len(x) == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
+        scratch = var_shifted_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
         cnt = scratch->len;
     } else if (is_list(x)) {
@@ -1687,6 +1763,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
             if (!RAY_ATOM_IS_NULL(elems[i])) vals[cnt++] = as_f64(elems[i]);
         }
         scratch->len = cnt;
+        /* about the first value, as a vector's (var_shifted_scratch) */
+        for (int64_t i = cnt - 1; i >= 0; i--) vals[i] -= vals[0];
     } else {
         return ray_error("type", "var/stddev expects a numeric atom, vector, or list, got %s", ray_type_name(x->type));
     }
@@ -1704,6 +1782,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     ray_release(scratch);
     double divisor = sample ? (double)(cnt - 1) : (double)cnt;
     double v = sqdiff / divisor;
+    /* an intermediate that overflowed is null, never a number (#1669) */
+    if (!isfinite(sum) || !isfinite(v)) return ray_typed_null(-RAY_F64);
     return make_f64(take_sqrt ? sqrt(v) : v);
 }
 

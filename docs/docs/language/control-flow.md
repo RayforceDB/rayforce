@@ -33,23 +33,40 @@ other result, are never evaluated:
 
 Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is evaluated row by row like the three-argument form; a chain without a fallback is left to the evaluator. This holds wherever the `if` sits in the expression: in an argument of a builtin call (`(== a (if c 'x 'y))`, `(not ...)`), of `and` and `or`, of `do`, in the value of a `let`, in the expression of a `try`, and in the body of a helper the planner inlines (a pure one-statement lambda). So `(and (> p 0) (== a (if c 'x 'y)))` compares each row with its own arm. These forms keep their own rules: `and` and `or` stop on a scalar that decides them, `do` evaluates in turn, and `try` hands an error raised anywhere in its expression, a mix of arm types included, to its handler for the whole column. Arguments are evaluated left to right, as outside a query, so a `let` in one binds for the arguments after it only: `(== a (let a (if c 'x 'y)))` compares the column with the new value, and `(== (let a (if c 'x 'y)) a)` compares the new value with itself.
 
-A few shapes leave the choice to the evaluator's own `if`, which cannot choose per row: it tests a condition vector whole. Inside a query, when such an `if` gets a condition over the query's rows (or a group's rows) that is true on some and false on others, it raises a `nyi` error rather than give every row its first arm:
+A `where:` predicate or a `by:` output that the planner leaves to the evaluator chooses per row as well, because the evaluator's `if` chooses per row for a boolean-vector condition (below). That covers a side effect in the expression (a lambda that sets a global, `set`, a `try` handler that raises), an `if` inside a helper the planner does not inline (several statements, a closure, recursion), a nested query in an arm or beside the `if` such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and a `by:` output where a `let` in one aggregate's argument binds a name the rest of the output also reads: that output is evaluated per group as written, and each group's `if` chooses per row within the group. A side effect in an arm runs once per evaluation, whatever the condition holds, since both arms are evaluated.
+
+One case still raises: a name a `let` binds and a later argument of the same `do` reads raises `schema` in a `where:` predicate ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)), because on the planned routes only the last form of a `do` is evaluated (see [Sequential Evaluation: do](#sequential-evaluation-do)).
+
+### A boolean vector as the condition
+
+When the condition is a boolean vector, `if` chooses per row, outside a query as inside one. Both arms are evaluated, because every row needs one of them; each arm is a vector of the condition's length or an atom that broadcasts:
 
 ```lisp
-‣ (select {from: t where: (H a act)})     ; H: a helper of two statements
-error: nyi: if: its condition differs between the query's rows, and on this route it is tested whole, not row by row; see Conditionals: if in language/control-flow.md
+‣ (if [true false true] [1 2 3] [10 20 30])
+[1 20 3]
+‣ (if [true false] "x" "y")
+["x" "y"]
+‣ (if (> [3 8 5] 4) 1 0)
+[0 1 1]
 ```
 
-A condition true on every row takes the first arm, and one false on every row the fallback, as each row would. A vector that does not come from the rows (a global, a literal) is tested whole, as outside a query. The shapes are:
+Both arms are always evaluated, whatever the condition holds, so their side effects happen and an arm that raises raises: `(if (< v 100) v (raise 7))` raises as soon as `v` is a vector, even if no cell is `>= 100`. A boolean vector of length one gives a vector of length one, not an atom: `(if [true] 1 2)` is `[1]`. An empty one gives an empty vector.
 
-- a side effect anywhere in a `where:` predicate: a lambda that sets a global, `set`, or a `try` handler that raises ([#1610](https://github.com/RayforceDB/rayforce/issues/1610));
-- an `if` inside a helper the planner does not inline: several statements, a closure, or recursion ([#1611](https://github.com/RayforceDB/rayforce/issues/1611));
-- a nested query anywhere in a `where:` predicate, in an arm or beside the `if`, such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and such an output under `by:` ([#1629](https://github.com/RayforceDB/rayforce/issues/1629));
-- under `by:`, an output where a `let` in one aggregate's argument binds a name that the rest of the output also reads, such as `(+ (sum (== a (let a (if c 'x 'y)))) (sum (== a 'x)))`, which is evaluated per group as written ([#1617](https://github.com/RayforceDB/rayforce/issues/1617)). With one aggregate, `(sum (== a (let a (if c 'x 'y))))`, the output answers per row.
+The result type follows the promotion `if` has in a query: numbers promote, a temporal beside a number or another temporal type raises `type`. An arm of the wrong length raises `length`, and an arm that is neither a vector nor an atom raises `type`. A vector choice needs its fallback, so `(if [true false] 1)` raises `domain`.
 
-A name a `let` binds in a `where:` and a later argument of the same `do` reads raises `schema` before any `if` is reached ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)).
+In a chain, a boolean-vector condition chooses per row between its result and the rest of the chain, which is evaluated whole; a later condition that is a single value picks a whole result, as it does alone:
 
-Projections answer per row in these shapes. An opaque `by:` key (a helper the planner does not inline) that raises this error over the whole column is evaluated again row by row, as it is when its whole-column run fails for any reason. A `try` in the query catches the error as it does any other.
+```lisp
+‣ (if [true false false] [1 2 3] [false true false] [10 20 30] 0)
+[1 20 0]
+```
+
+Inside a compiled lambda the per-row path runs on the tree walker, which has two limits that a scalar condition does not meet:
+
+- `if`s written inside each other's then arms, each with a vector condition, share the tree walker's depth limit: about five hundred levels raise `limit`.
+- A lambda that calls itself from an arm of an `if` with a vector condition holds one of the runtime's 64 scope frames per level, so about sixty levels of that recursion raise `limit` (`stack overflow`). The same lambda with a scalar condition recurses as far as any other, past two hundred levels. Prefer a loop or a fold over a mask to a recursive helper.
+
+A condition that is a single value, or a vector of another type, is unchanged: it is tested as one truth value and only the arm it takes is evaluated.
 
 A query's `if` gives one column, so its arms must have a common type. Two
 numeric arms take the [promotion table](math.md#result-types) (`(if c i 1.5)`
@@ -119,6 +136,48 @@ For the full name lookup rules, see [Names and scope](name-resolution.md).
 30
 ```
 
+!!! warning "Inside a query, do not rely on the earlier forms of a `do`"
+
+    In a query clause (`where:`, an output column, `update`, `delete`, a `by:`
+    key or aggregate) that the planner compiles, a `do` of several forms is
+    compiled as its last form alone. On those planned routes the earlier forms
+    are not evaluated: their effects (`set`, a helper that writes a global,
+    `println`) do not happen, a `raise` or an error in them is not raised, and a
+    name a `let` among them binds is not seen by the last form, which reads it
+    as a column or a global instead:
+
+    ```text
+    ‣ (set T (table [a i] (list ['x 'y 'x] [1 2 3])))
+    ‣ (select {from: T where: (do (let k 'x) (== a k))})
+    error: schema: column 'k' not found
+    ```
+
+    A clause the planner declines is evaluated by the evaluator instead, and
+    there the earlier forms do run, with their effects and their errors, in
+    `where:`, projections and `by:` alike. Which route a query takes is not
+    something to rely on, so a query must not depend on the earlier forms of a
+    `do` either running or not running.
+
+    Put the effects and the bindings in a helper of more than one statement,
+    called from the query, or before the query. The planner does not inline
+    such a helper, so its body runs as written. A helper whose body is a single
+    expression, a `do` included, may be inlined, and then behaves like the `do`
+    written in the query:
+
+    ```text
+    ‣ (set H (fn [v] (let k 'x) (== v k)))
+    ‣ (at (select {from: T where: (H a)}) 'i)
+    [1 3]
+    ‣ (set k 'x)
+    ‣ (at (select {from: T where: (== a k)}) 'i)
+    [1 3]
+    ```
+
+    See [#1650](https://github.com/RayforceDB/rayforce/issues/1650),
+    [#1612](https://github.com/RayforceDB/rayforce/issues/1612),
+    [#1653](https://github.com/RayforceDB/rayforce/issues/1653) and
+    [#1654](https://github.com/RayforceDB/rayforce/issues/1654).
+
 ## Iteration: while
 
 `while` evaluates `cond`, and while it is truthy evaluates each body expression
@@ -169,6 +228,35 @@ does push a scope:
 
 A loop whose condition never goes false runs until interrupted; Ctrl-C breaks
 out of one at the REPL.
+
+Unlike `if`, `while` tests a vector condition as one truth value: a non-empty
+vector is true, so a loop over a vector whose cells all turn false still runs.
+
+Inside a query, a `while` condition that is a vector (or a list) whose length is
+the number of rows being evaluated (the query's rows, or the group's rows under
+`by:`) is tested as a whole, so that a loop over the rows cannot run forever.
+It does not matter what computes the vector: `(> v 15)` in a helper or a lambda
+called with a column, `(and (> v 15) true)`, `(if (> v 15) true false)`, but
+also a global, a constant or another table's column that happens to have that
+length.
+
+- A boolean vector true on every row is true.
+- A boolean vector false on every row, or an empty one when there are no rows,
+  is false, so the loop stops.
+- A boolean vector true on some rows and false on others, or a vector of any
+  other type, raises `nyi`: a loop cannot take a different number of passes
+  for each row.
+
+A vector of any other length, a single value, a `while` outside a query, and a
+projection evaluated one row at a time are tested as before. Compared with
+testing the vector as one truth value, which every query did before, three
+cases now differ: a vector false on every row ends the loop where it used to
+run it, a mixed boolean vector or a vector of another type raises `nyi` where
+it used to count as true, and an empty vector in a query with no rows ends the
+loop where it used to run it. A loop that only needs to know whether any or
+every cell holds should test `(any c)` or `(all c)`, which are single values.
+Write a loop over one row's value and call the helper from a projection,
+where it runs once per row, or replace the loop with a vector expression.
 
 ## Bounded Iteration: times
 

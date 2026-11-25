@@ -158,7 +158,7 @@ In a `select`, a `.json.get` or `.json.parse` of a column is called once over th
 
 ## `.json.format` { #json-format }
 
-Signature: `(.json.format v)`. Returns a string of JSON text.
+Signature: `(.json.format v)`. Returns a string of JSON text. JSON writes a value out in full, so a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output is refused with `limit` before any text is written.
 
 | Value | JSON |
 |---|---|

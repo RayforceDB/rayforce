@@ -28,6 +28,7 @@
 #endif
 
 #include "col.h"
+#include "ops/walkmemo.h"   /* RAY_DUP_BUDGET */
 #include "core/platform.h"
 #include "core/pool.h"     /* ray_pool_want — large scattered-row requests */
 #include "mem/heap.h"
@@ -223,6 +224,80 @@ static bool col_nest_enter(void) {
     return true;
 }
 
+/* A list or table column is written out in full, a shared part again each
+ * time it is met (#1627, ops/walkmemo.h).  col_dup_size gives the bytes
+ * col_write_rec writes for obj, exactly (a type byte; an atom's 8 bytes, a
+ * GUID's 16, a symbol's or string's 4-byte length and its text; a vector's
+ * length, cells and string pool; a symbol vector's texts; a list's count,
+ * a table's shape and column names, and their parts).  A shared part's
+ * size is kept the first time; a later visit is charged it and not walked
+ * again.  A column whose repeats would add more than RAY_DUP_BUDGET bytes
+ * is refused before anything is written. */
+typedef struct { ray_walk_memo_t m; uint64_t dup; bool over; } col_dup_t;
+static inline uint64_t col_dup_add(uint64_t a, uint64_t b) {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+static uint64_t col_dup_size(ray_t* obj, col_dup_t* t, int depth) {
+    if (!obj || RAY_IS_ERR(obj) || t->over) return 0;
+    if (depth > COL_MAX_NEST || ray_stack_short()) return 0;   /* the preflight refuses it */
+    bool tracked = obj->rc != 1 && (obj->type >= 0 ? obj->type < RAY_LAMBDA : obj->type == -RAY_STR);
+    uint64_t v;
+    if (tracked && ray_wm_get(&t->m, obj, NULL, 0, &v)) {
+        t->dup = col_dup_add(t->dup, v);
+        if (t->dup > RAY_DUP_BUDGET) t->over = true;
+        return v;
+    }
+    int8_t type = obj->type;
+    uint64_t n = 1;   /* the type byte */
+    if (type < 0) {
+        if (type == -RAY_STR || type == -RAY_SYM) {
+            ray_t* s = type == -RAY_SYM ? ray_sym_str(obj->i64) : obj;
+            n += 4 + (s ? (uint64_t)ray_str_len(s) : 0);
+        } else {
+            n += type == -RAY_GUID ? 16 : 8;
+        }
+    } else if (type == RAY_SYM) {
+        n += 8;
+        for (int64_t i = 0; i < obj->len; i++) {
+            ray_t* s = ray_sym_vec_cell(obj, i);
+            n = col_dup_add(n, 4 + (s ? (uint64_t)ray_str_len(s) : 0));
+        }
+    } else if (is_serializable_type(type)) {
+        ray_t* pool_owner = (obj->attrs & RAY_ATTR_SLICE) ? obj->slice_parent : obj;
+        n += 8 + (type == RAY_STR ? 1 : 0);
+        n = col_dup_add(n, (uint64_t)(obj->len > 0 ? obj->len : 0) * ray_sym_elem_size(type, obj->attrs));
+        if (type == RAY_STR) n = col_dup_add(n, 8 + (uint64_t)col_str_pool_payload_len(pool_owner));
+    } else if (type == RAY_LIST) {
+        n += 8;
+        ray_t** slots = (ray_t**)ray_data(obj);
+        for (int64_t i = 0; i < obj->len && !t->over; i++)
+            n = col_dup_add(n, col_dup_size(slots[i], t, depth + 1));
+    } else if (type == RAY_TABLE) {
+        n += 16;
+        for (int64_t c = 0; c < ray_table_ncols(obj) && !t->over; c++) {
+            n += 8;
+            ray_t* col = ray_table_col_idx(obj, c);
+            if (col && RAY_IS_ERR(col)) { ray_error_free(col); continue; }   /* the writer reports it */
+            n = col_dup_add(n, col_dup_size(col, t, depth + 1));
+        }
+    } else if (type == RAY_DICT) {
+        n = col_dup_add(n, col_dup_size(ray_dict_keys(obj), t, depth + 1));
+        n = col_dup_add(n, col_dup_size(ray_dict_vals(obj), t, depth + 1));
+    }
+    if (tracked && !t->over) ray_wm_put(&t->m, obj, NULL, 0, n);
+    return n;
+}
+static bool col_repeats(ray_t* vec) {
+    col_dup_t t = { .dup = 0, .over = false };
+    memset(&t.m, 0, sizeof t.m);
+    t.m.active = true;
+    (void)col_dup_size(vec, &t, 0);
+    ray_wm_end(&t.m);
+    if (!t.over) return false;
+    g_col_limit_msg = "save: list column repeats shared parts beyond 1 GiB of extra output";
+    return true;
+}
+
 const char* ray_col_limit_msg(void) {
     const char* m = g_col_limit_msg;
     g_col_limit_msg = NULL;
@@ -281,7 +356,7 @@ ray_err_t ray_col_save_preflight(ray_t* vec) {
     if (vec->type == RAY_ENCCOL) return ray_enccol_is_parted(vec) ? RAY_ERR_NYI : RAY_OK;
     if (is_serializable_type(vec->type)) return RAY_OK;
     if (vec->type == RAY_LIST || vec->type == RAY_TABLE)
-        return col_preflight_recursive(vec);
+        return col_repeats(vec) ? RAY_ERR_LIMIT : col_preflight_recursive(vec);
     return RAY_ERR_NYI;
 }
 
@@ -755,6 +830,7 @@ static ray_t* col_read_rec(const uint8_t** pp, size_t* remaining) {
 
 static ray_err_t col_save_list(ray_t* list, FILE* f) {
     uint32_t magic = LIST_MAGIC;
+    if (col_repeats(list)) return RAY_ERR_LIMIT;
     if (fwrite(&magic, 4, 1, f) != 1) return RAY_ERR_IO;
     return col_write_recursive(list, f);
 }
@@ -765,6 +841,7 @@ static ray_err_t col_save_list(ray_t* list, FILE* f) {
 
 static ray_err_t col_save_table(ray_t* tbl, FILE* f) {
     uint32_t magic = TABLE_MAGIC;
+    if (col_repeats(tbl)) return RAY_ERR_LIMIT;
     if (fwrite(&magic, 4, 1, f) != 1) return RAY_ERR_IO;
     return col_write_recursive(tbl, f);
 }

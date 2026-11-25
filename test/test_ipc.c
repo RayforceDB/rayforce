@@ -3159,8 +3159,10 @@ typedef struct {
     ray_sock_t   lfd;
     uint16_t     port;
     bool         drain;     /* false: never read past the handshake */
-    volatile int saw_eof;
-    volatile int gave_up;   /* !drain: the client's send is over, read on */
+    /* Shared with the peer thread, so atomics: a volatile int orders
+     * nothing between threads (#1675). */
+    _Atomic int  saw_eof;
+    _Atomic int  gave_up;   /* !drain: the client's send is over, read on */
     ray_thread_t tid;
 } silent_peer_t;
 
@@ -3177,13 +3179,14 @@ static void silent_peer_thread(void* arg) {
         send((int)c, resp, 2, 0);
         /* window fills meanwhile; read on once the send gave up (1.5 s at most) */
         if (!p->drain)
-            for (int i = 0; i < 150 && !p->gave_up; i++) ray_test_sleep_ms(10);
+            for (int i = 0; i < 150 && !atomic_load_explicit(&p->gave_up, memory_order_acquire); i++)
+                ray_test_sleep_ms(10);
         uint8_t buf[65536];
         for (;;) {
             ssize_t n = recv((int)c, buf, sizeof(buf), 0);
-            if (n == 0) { p->saw_eof = 1; break; }
+            if (n == 0) { atomic_store_explicit(&p->saw_eof, 1, memory_order_release); break; }
             if (n < 0) {
-                if (errno == ECONNRESET) p->saw_eof = 1;
+                if (errno == ECONNRESET) atomic_store_explicit(&p->saw_eof, 1, memory_order_release);
                 break;
             }
         }
@@ -3244,7 +3247,7 @@ static test_result_t test_ipc_send_deadline_expires(void) {
     if (r) ray_release(r);
 
     silent_peer_stop(&peer);
-    TEST_ASSERT_EQ_I(peer.saw_eof, 1);           /* our end really closed */
+    TEST_ASSERT_EQ_I(atomic_load_explicit(&peer.saw_eof, memory_order_acquire), 1);  /* our end really closed */
     PASS();
 }
 
@@ -3267,7 +3270,7 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     int64_t t0 = ray_time_now_ms();
     ray_t* r = ray_ipc_send_timeout(h, big, 300);
     int64_t took = ray_time_now_ms() - t0;
-    peer.gave_up = 1;
+    atomic_store_explicit(&peer.gave_up, 1, memory_order_release);
     ray_release(big);
     TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_IO);
@@ -3281,7 +3284,7 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     ray_release(msg);
 
     silent_peer_stop(&peer);
-    TEST_ASSERT_EQ_I(peer.saw_eof, 1);
+    TEST_ASSERT_EQ_I(atomic_load_explicit(&peer.saw_eof, memory_order_acquire), 1);
     PASS();
 }
 
@@ -4179,6 +4182,236 @@ static test_result_t test_ipc_time_sleep_cancel_urg_blocked(void) {
 #endif
 }
 
+/* ---- #1623: a cancel is the request's or the client's it was meant for ---
+ * One process that is both an IPC server (S, on a thread of its own) and
+ * a client (this thread, waiting on a sync request to another server P,
+ * its own process as a client's server would be).  S serves a raw socket
+ * X.  The interrupt flag was one bit for the whole process, so:
+ *   - X's cancel byte for S's running request was taken by this thread's
+ *     wait and forwarded to P, cancelling the wrong request, while S's
+ *     request ran on uncancelled;
+ *   - a request starting on S cleared a Ctrl-C this thread had not yet
+ *     forwarded, so P's request was never cancelled.
+ * Each request is bounded, so a cancel gone astray fails the test instead
+ * of hanging it. */
+#if !defined(RAY_OS_WINDOWS)
+/* A sync request framed in memory, so a thread with no heap can send it. */
+static uint8_t* wire_frame(ray_t* obj, size_t* len) {
+    int64_t n = ray_serde_size(obj);
+    if (n <= 0) return NULL;
+    uint8_t* buf = (uint8_t*)malloc(sizeof(ray_ipc_header_t) + (size_t)n);
+    if (!buf) return NULL;
+    ray_ipc_header_t hdr = {
+        .prefix = RAY_SERDE_PREFIX, .version = RAY_SERDE_WIRE_VERSION, .flags = 0,
+        .endian = RAY_SERDE_ENDIAN, .msgtype = RAY_IPC_MSG_SYNC, .size = n,
+    };
+    memcpy(buf, &hdr, sizeof hdr);
+    ray_ser_raw(buf + sizeof hdr, obj);
+    *len = sizeof hdr + (size_t)n;
+    return buf;
+}
+
+/* The reply to X's request, waiting at most `ms`: its error code, "value"
+ * for a value, or "none" when nothing came. */
+static const char* wire_reply_code(ray_sock_t s, int ms, char* out, size_t cap, int64_t* val) {
+    struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    ray_ipc_header_t hdr;
+    snprintf(out, cap, "none");
+    if (wire_recv_exact(s, &hdr, sizeof hdr) < 0 || hdr.size <= 0 || hdr.size > (1 << 20)) return out;
+    uint8_t* body = (uint8_t*)malloc((size_t)hdr.size);
+    if (!body) return out;
+    if (wire_recv_exact(s, body, (size_t)hdr.size) == 0) {
+        int64_t blen = hdr.size;
+        ray_t* v = ray_de_raw(body, &blen);
+        if (v && RAY_IS_ERR(v)) snprintf(out, cap, "%s", ray_err_code(v));
+        else if (v) { snprintf(out, cap, "value"); if (val && v->type == -RAY_I64) *val = v->i64; }
+        drop(v);
+    }
+    free(body);
+    return out;
+}
+
+static bool wait_file(const char* path, int ms) {
+    for (int i = 0; i < ms / 5; i++) { if (access(path, F_OK) == 0) return true; sleep_ms(5); }
+    return access(path, F_OK) == 0;
+}
+
+/* What the helper thread does once P runs this thread's request. */
+typedef struct {
+    const char* p_running;   /* P's request writes it when it starts */
+    ray_sock_t  x;           /* X's socket to S */
+    bool        ctrl_c;      /* a Ctrl-C here, then X's frame; else X's cancel byte */
+    uint8_t*    frame;
+    size_t      frame_len;
+    int64_t     at_ms;
+} scoped_cancel_t;
+
+static void* scoped_cancel_fn(void* arg) {
+    scoped_cancel_t* c = (scoped_cancel_t*)arg;
+    if (!wait_file(c->p_running, 15000)) return NULL;
+    /* Into this thread's wait for P's reply: a slice of it is 50 ms. */
+    sleep_ms(120);
+    c->at_ms = ray_time_now_ms();
+    if (c->ctrl_c) {
+        /* Ctrl-C as an embedder's handler raises it, waking no wait; S
+         * starts a request at once, before this thread looks at the flag. */
+        ray_request_interrupt();
+        if (send(c->x, c->frame, c->frame_len, 0) < 0) { /* the reply check fails */ }
+    } else {
+        if (send(c->x, "!", 1, MSG_OOB) < 0) { /* the reply check fails */ }
+    }
+    return NULL;
+}
+
+/* ctrl_c false: X's cancel byte is S's; this thread's request to P must be
+ * answered (42), and S's request must end with "cancel".  ctrl_c true: the
+ * Ctrl-C is this thread's; P's request must end with "cancel", and S's
+ * request (+ 1 2), started meanwhile, must be answered (3). */
+static test_result_t scoped_cancel_run(const char* dir, bool ctrl_c) {
+    if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
+    ray_poll_t* spoll; ray_vm_t* svm; uint16_t sport; ray_thread_t stid;
+    test_result_t sr = wire_start_server(&spoll, &sport, &svm, &stid);
+    if (sr.status != TEST_PASS) return sr;
+    uint16_t pport = serve_server(dir);
+    int64_t h = pport ? connect_retry(pport) : -1;
+    ray_sock_t x = wire_connect(sport);
+    char buf[256], p_run[256], s_run[256];
+    snprintf(buf, sizeof buf, "%s_p_running", dir);
+    snprintf(p_run, sizeof p_run, "%s", ray_test_tmp(buf));
+    snprintf(buf, sizeof buf, "%s_s_running", dir);
+    snprintf(s_run, sizeof s_run, "%s", ray_test_tmp(buf));
+    unlink(p_run); unlink(s_run);
+    bool up = pport && h >= 0 && x != RAY_INVALID_SOCK;
+    static scoped_cancel_t c;
+    memset(&c, 0, sizeof c);
+    c.p_running = p_run; c.x = x; c.ctrl_c = ctrl_c;
+    if (up) {
+        /* S's request: the long sleep X's cancel byte must end, or the
+         * (+ 1 2) a Ctrl-C must not stop S from answering. */
+        char q[320];
+        if (ctrl_c) snprintf(q, sizeof q, "(+ 1 2)");
+        else snprintf(q, sizeof q, "(do (write \"%s\" \"1\") (.time.sleep 20000))", s_run);
+        ray_t* m = ray_str(q, strlen(q));
+        c.frame = wire_frame(m, &c.frame_len);
+        ray_release(m);
+        up = c.frame != NULL;
+        if (up && !ctrl_c)
+            up = send(x, c.frame, c.frame_len, 0) == (ssize_t)c.frame_len && wait_file(s_run, 10000);
+    }
+    if (!up) {
+        free(c.frame);
+        if (x != RAY_INVALID_SOCK) ray_sock_close(x);
+        if (h >= 0) ray_ipc_close(h);
+        serve_stop(dir);
+        wire_stop_server(spoll, sport, svm, stid);
+        TEST_ASSERT(up, "both servers up and S running X's request");
+    }
+    pthread_t tid;
+    pthread_create(&tid, NULL, scoped_cancel_fn, &c);
+    char pq[320];
+    if (ctrl_c) snprintf(pq, sizeof pq, "(do (write \"%s\" \"1\") (.time.sleep 9223372036854775807))", p_run);
+    else snprintf(pq, sizeof pq, "(do (write \"%s\" \"1\") (.time.sleep 1500) 42)", p_run);
+    ray_t* msg = ray_str(pq, strlen(pq));
+    ray_t* r = ray_ipc_send_timeout(h, msg, 10000);
+    ray_release(msg);
+    int64_t p_done = ray_time_now_ms();
+    pthread_join(tid, NULL);
+    char xcode[64];
+    int64_t xval = 0;
+    wire_reply_code(x, 8000, xcode, sizeof xcode, &xval);
+    int64_t x_done = ray_time_now_ms();
+    ray_clear_interrupt();
+    char pgot[160];
+    if (!r) snprintf(pgot, sizeof pgot, "no result");
+    else if (RAY_IS_ERR(r)) snprintf(pgot, sizeof pgot, "error %s: %s", ray_err_code(r), ray_err_msg(r));
+    else snprintf(pgot, sizeof pgot, "%lld", r->type == -RAY_I64 ? (long long)r->i64 : -1LL);
+    drop(r);
+    free(c.frame);
+    ray_sock_close(x);
+    ray_ipc_close(h);
+    serve_stop(dir);
+    wire_stop_server(spoll, sport, svm, stid);
+    unlink(p_run); unlink(s_run);
+    if (ctrl_c) {
+        TEST_ASSERT_FMT(strncmp(pgot, "error cancel", 12) == 0,
+                        "this thread's Ctrl-C cancels its request to P: got %s after %lld ms",
+                        pgot, (long long)(p_done - c.at_ms));
+        TEST_ASSERT_FMT(strcmp(xcode, "value") == 0 && xval == 3,
+                        "S answers the request it started meanwhile: got %s", xcode);
+    } else {
+        TEST_ASSERT_FMT(strcmp(pgot, "42") == 0,
+                        "X's cancel byte for S is not forwarded to P: this thread's request got %s", pgot);
+        TEST_ASSERT_FMT(strcmp(xcode, "cancel") == 0,
+                        "X's cancel byte cancels S's request: got %s", xcode);
+        TEST_ASSERT_FMT(x_done - c.at_ms < 5000,
+                        "S's request ended %lld ms after the byte", (long long)(x_done - c.at_ms));
+    }
+    PASS();
+}
+#endif
+
+static test_result_t test_ipc_cancel_scoped_server_request(void) {
+#if !defined(RAY_OS_WINDOWS)
+    return scoped_cancel_run("/tmp/ipc_scoped_req", false);
+#else
+    SKIP("out-of-band cancel is POSIX-only");
+#endif
+}
+
+static test_result_t test_ipc_cancel_scoped_client_ctrl_c(void) {
+#if !defined(RAY_OS_WINDOWS)
+    return scoped_cancel_run("/tmp/ipc_scoped_ctrl_c", true);
+#else
+    SKIP("out-of-band cancel is POSIX-only");
+#endif
+}
+
+/* ---- the SIGURG handler leaves errno as it found it ----------------------
+ * The handler runs on whatever thread SIGURG lands on, between two of its
+ * instructions.  Its recv(MSG_OOB) fails whenever there is no urgent byte
+ * to take, and a failing call sets errno: unless the handler gives errno
+ * back, the interrupted code reads the handler's error after a failed call
+ * of its own (an EAGAIN turned into EINVAL, a retry loop that gives up).
+ * Deterministic: the signal is raised on this thread, which runs the
+ * handler before raise returns, with the connection under evaluation
+ * named as a pipe, where recv always fails (ENOTSOCK). */
+static test_result_t test_ipc_sigurg_keeps_errno(void) {
+#if !defined(RAY_OS_WINDOWS)
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+    int64_t lid = ray_ipc_listen(poll, 0);            /* installs the handler */
+    int fds[2];
+    int piped = pipe(fds);
+    if (lid < 0 || piped != 0) {
+        if (piped == 0) { close(fds[0]); close(fds[1]); }
+        ray_poll_destroy(poll);
+        TEST_ASSERT(lid >= 0 && piped == 0, "listener and pipe");
+    }
+    sigset_t urg, old;
+    sigemptyset(&urg);
+    sigaddset(&urg, SIGURG);
+    pthread_sigmask(SIG_UNBLOCK, &urg, &old);
+    ray_clear_interrupt();
+    ray_ipc_cancel_active_fd_for_test(fds[0]);
+    errno = EDOM;
+    int rr = raise(SIGURG);
+    int seen = errno;
+    ray_ipc_cancel_state_reset_for_test();
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    close(fds[0]); close(fds[1]);
+    ray_poll_destroy(poll);
+    TEST_ASSERT_EQ_I(rr, 0);
+    TEST_ASSERT_FMT(seen == EDOM, "errno after the handler: %d (%s), not EDOM", seen, strerror(seen));
+    TEST_ASSERT(!cancelled, "no byte taken, so nothing cancelled");
+    PASS();
+#else
+    SKIP("no SIGURG on Windows");
+#endif
+}
+
 /* The same byte mid-query on a moved connection cancels that query (the
  * server's SIGURG takes it), and the link answers the next one.  The
  * server is its own process, as a client's would be: in one process the
@@ -4576,6 +4809,9 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_seen_nested_moved_link", test_ipc_cancel_seen_nested_moved_link, ipc_setup, ipc_teardown },
     { "ipc/time_sleep_cancel",          test_ipc_time_sleep_cancel,              ipc_setup, ipc_teardown },
     { "ipc/time_sleep_cancel_urg_blocked", test_ipc_time_sleep_cancel_urg_blocked, ipc_setup, ipc_teardown },
+    { "ipc/cancel_scoped_server_request", test_ipc_cancel_scoped_server_request, ipc_setup, ipc_teardown },
+    { "ipc/cancel_scoped_client_ctrl_c",  test_ipc_cancel_scoped_client_ctrl_c,  ipc_setup, ipc_teardown },
+    { "ipc/sigurg_keeps_errno",         test_ipc_sigurg_keeps_errno,             ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },

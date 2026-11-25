@@ -24,6 +24,7 @@
 #include "core/platform.h"   /* ray_stack_short: the depth guard */
 #include "ops/colgather.h"   /* fmt_enc_window: the shown rows of an encoded column */
 #include "core/timespan.h"
+#include "ops/walkmemo.h"   /* ray_dup_t */
 #include "lang/format.h"
 #include "lang/env.h"
 #include "table/table.h"
@@ -61,7 +62,17 @@ typedef struct {
     bool    flushed;    /* some output already reached sink */
     char    cause_code[16];   /* code of the error that stopped a column from loading */
     char    cause_msg[192];   /* its detail (names the column file) */
+    uint64_t base;      /* bytes already flushed to sink: base + len is all written */
+    int64_t  clip;      /* when non-zero, the buffer stops (err) at its first growth
+                         * once len has reached it: a table cell needs no more
+                         * than its shown width */
+    ray_dup_t dup;      /* what is written again for shared parts (#1627); a write
+                         * that is part of a larger one holds that one's tracker
+                         * here while it runs (fmt_dup_in/fmt_dup_out, #1648) */
+    const ray_t* skip;  /* the value fmt_obj_watched is writing (its body's turn) */
 } fmt_buf_t;
+
+static inline uint64_t fmt_out(const fmt_buf_t* b) { return b->base + (uint64_t)b->len; }
 
 #define FMT_SINK_FLUSH ((int64_t)1 << 20)
 
@@ -84,6 +95,10 @@ static void fmt_init(fmt_buf_t* b) {
     b->over_limit = false;
     b->cause_code[0] = '\0';
     b->cause_msg[0]  = '\0';
+    b->base    = 0;
+    b->clip    = 0;
+    b->skip    = NULL;
+    ray_dup_begin(&b->dup);
     b->block   = ray_alloc(256);
     if (!b->block) {   /* ray_alloc returns NULL (never an error object) on failure */
         b->err = true; b->err_msg = "cannot allocate the initial output buffer";
@@ -96,6 +111,7 @@ static void fmt_init(fmt_buf_t* b) {
 }
 
 static void fmt_destroy(fmt_buf_t* b) {
+    ray_dup_end(&b->dup);
     if (b->block) {
         ray_free(b->block);
         b->block = NULL;
@@ -119,6 +135,7 @@ static void fmt_ensure_space(fmt_buf_t* b, int64_t extra, bool terminator) {
             b->err = true; b->io_err = true; b->err_msg = "cannot write formatted output";
             return;
         }
+        b->base += (uint64_t)b->len;
         b->len = 0;
         b->flushed = true;
     }
@@ -130,6 +147,9 @@ static void fmt_ensure_space(fmt_buf_t* b, int64_t extra, bool terminator) {
     /* vsnprintf needs a NUL slot that is not part of the output limit. */
     if (terminator) need++;
     if (need <= (int64_t)b->cap) return;
+    /* A clipped buffer (a table cell) stops at its first growth past the
+     * clip: it holds at least that much already, all the cell shows. */
+    if (b->clip && b->len >= b->clip) { b->err = true; b->err_msg = "clipped"; return; }
     if (need > (int64_t)INT32_MAX) {
         /* int32 buffer ceiling: the doubling loop and cap field are int32, so
          * 2GiB is the hard limit.  Fail loud but recoverable, not abort(). */
@@ -608,7 +628,9 @@ const char* ray_fmt_null_literal(int8_t type) {
  * (format "%" v) gives.  The text is *txt, *len bytes: in `buf` (cap >= 64)
  * or borrowed from `a`, and NULL is returned; or inside the returned owned
  * STR, which the caller releases; or an error is returned. */
-ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len) {
+static inline __attribute__((always_inline))
+ray_t* fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len,
+               ray_dup_t* t, uint64_t base) {
     int n = 0;
     *txt = buf;
     if (!a || RAY_IS_ERR(a)) {
@@ -638,7 +660,7 @@ ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* le
             return ss;
         }
     } else {
-        ray_t* s = ray_fmt(a, RAY_FMT_COMPACT);
+        ray_t* s = t ? ray_fmt_dup(a, RAY_FMT_COMPACT, t, base) : ray_fmt(a, RAY_FMT_COMPACT);
         if (s && !RAY_IS_ERR(s)) {
             *txt = ray_str_ptr(s);
             *len = ray_str_len(s);
@@ -649,6 +671,17 @@ ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* le
     }
     *len = n > 0 ? (size_t)n : 0;
     return NULL;
+}
+
+ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len) {
+    return fmt_pct(a, buf, cap, txt, len, NULL, 0);
+}
+
+/* ray_fmt_pct for one argument of a call that tracks repeats with t (the
+ * caller has entered a and written `base` bytes, #1648). */
+ray_t* ray_fmt_pct_dup(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len,
+                       ray_dup_t* t, uint64_t base) {
+    return fmt_pct(a, buf, cap, txt, len, t, base);
 }
 
 /* ===== Vector element formatter ===== */
@@ -1652,6 +1685,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             fmt_cell_t* cell = &cells[ci * table_height + ri];
             fmt_buf_t tmp;
             fmt_init(&tmp);
+            tmp.clip = FMT_CELL_BUF_SIZE;   /* the cell shows no more */
             if (ri < col_len && fmt_col_write(&tmp, &cur, ri, RAY_FMT_SHOW)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
@@ -1677,6 +1711,7 @@ static void fmt_table(fmt_buf_t* b, ray_t* tbl, int mode) {
             }
             fmt_buf_t tmp;
             fmt_init(&tmp);
+            tmp.clip = FMT_CELL_BUF_SIZE;   /* the cell shows no more */
             if (src_idx >= 0 && src_idx < col_len && fmt_col_write(&tmp, &cur, src_idx, RAY_FMT_SHOW)) {
                 int32_t clen = tmp.len < FMT_CELL_BUF_SIZE - 1 ? tmp.len : FMT_CELL_BUF_SIZE - 1;
                 if (clen > 0) memcpy(cell->str, tmp.buf, (size_t)clen);
@@ -1871,7 +1906,34 @@ static bool fmt_too_deep(fmt_buf_t* b) {
     return true;
 }
 
+/* Text writes a value out in full, a shared part again each time it is
+ * met: the bytes written again are counted as they are written, and past
+ * RAY_DUP_BUDGET the write stops with limit (#1627, ops/walkmemo.h). */
+static void fmt_dup_check(fmt_buf_t* b) {
+    if (b->err || RAY_LIKELY(!ray_dup_over(&b->dup, fmt_out(b)))) return;
+    b->err = true;
+    b->err_msg = "format";
+    snprintf(b->cause_code, sizeof b->cause_code, "limit");
+    snprintf(b->cause_msg, sizeof b->cause_msg, "value repeats shared parts beyond 1 GiB of extra output");
+}
+/* The tracked path writes obj through fmt_obj again with obj as `skip`,
+ * so the body below has one copy. */
+__attribute__((noinline)) static void fmt_obj_watched(fmt_buf_t* b, ray_t* obj, int mode) {
+    const ray_t* skip = b->skip;
+    bool opened = ray_dup_enter(&b->dup, obj, fmt_out(b));
+    fmt_dup_check(b);   /* the lower bound can refuse before the repeat is written */
+    if (b->err) { ray_dup_leave(&b->dup, opened, fmt_out(b)); return; }
+    b->skip = obj;
+    fmt_obj(b, obj, mode);
+    b->skip = skip;
+    ray_dup_leave(&b->dup, opened, fmt_out(b));
+    fmt_dup_check(b);
+}
 static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
+    if (RAY_UNLIKELY(ray_dup_watch(&b->dup, obj)) && obj != b->skip) {
+        fmt_obj_watched(b, obj, mode);
+        return;
+    }
     if (fmt_too_deep(b)) return;
     if (!obj || RAY_IS_NULL(obj)) { fmt_puts(b, "null"); return; } /* keep !obj: ray_fmt(NULL) is a public entry point, receives genuine-absence C NULL, not a value; also renders list/dict elements, which may be C NULL */
     if (RAY_IS_ERR(obj)) {
@@ -1974,7 +2036,35 @@ static void fmt_obj(fmt_buf_t* b, ray_t* obj, int mode) {
 ray_t* ray_fmt(ray_t* obj, int mode) {
     fmt_buf_t b;
     fmt_init(&b);
+    /* every mode but the REPL's display writes the value in full */
+    if (mode != RAY_FMT_REPL) ray_dup_root(&b.dup, obj, false);
     fmt_obj(&b, obj, mode);
+    return fmt_to_str(&b);
+}
+
+/* A write that is part of a larger one takes over its tracker while it
+ * runs and hands it back after, so the per-object check reads the buffer's
+ * own field as before; the larger write is suspended meanwhile. */
+static inline void fmt_dup_in(fmt_buf_t* b, ray_dup_t* t) {
+    b->dup = *t;   /* fmt_init's own tracker holds nothing yet */
+}
+static inline void fmt_dup_out(fmt_buf_t* b, ray_dup_t* t) {
+    *t = b->dup;
+    b->dup.m.slots = NULL;   /* t's now: fmt_destroy frees nothing of it */
+}
+
+/* Format obj as part of a write that tracks repeats with t (#1648): the
+ * caller has written `base` bytes and has entered obj itself, and appends
+ * this text next, so obj's text is counted where the caller counts it.
+ * Past the budget the result is a `limit` error. */
+ray_t* ray_fmt_dup(ray_t* obj, int mode, ray_dup_t* t, uint64_t base) {
+    fmt_buf_t b;
+    fmt_init(&b);
+    fmt_dup_in(&b, t);
+    b.base = base;
+    b.skip = obj;
+    fmt_obj(&b, obj, mode);
+    fmt_dup_out(&b, t);
     return fmt_to_str(&b);
 }
 
@@ -1982,6 +2072,7 @@ ray_t* ray_fmt_limited(ray_t* obj, int mode, int64_t max_bytes) {
     fmt_buf_t b;
     fmt_init(&b);
     b.limit = max_bytes;
+    if (mode != RAY_FMT_REPL) ray_dup_root(&b.dup, obj, false);
     fmt_obj(&b, obj, mode);
     return fmt_to_str(&b);
 }
@@ -2047,15 +2138,31 @@ static void fmt_pp(fmt_buf_t* b, ray_t* obj, int indent) {
         fmt_obj(b, obj, 1);
         return;
     }
-    /* Render compact first; keep it if it fits the row width from here. */
+    /* Render compact first; keep it if it fits the row width from here.
+     * Both renderings are counted as written (#1627): a rewound one was
+     * still work done. */
+    bool opened = ray_dup_enter(&b->dup, obj, fmt_out(b));
+    fmt_dup_check(b);
+    if (b->err) { ray_dup_leave(&b->dup, opened, fmt_out(b)); return; }
     int32_t col   = fmt_cur_col(b);
     int32_t saved = b->len;
+    const ray_t* skip = b->skip;
+    b->skip = obj;   /* counted here: fmt_obj writes it without tracking it again */
     fmt_obj(b, obj, 1);
-    if (col + (b->len - saved) <= g_row_width) return;
+    b->skip = skip;
+    uint64_t tried = fmt_out(b);
+    if (col + (b->len - saved) <= g_row_width) {
+        ray_dup_leave(&b->dup, opened, tried);
+        fmt_dup_check(b);
+        return;
+    }
     /* Too wide — rewind and break across indented lines. */
+    uint64_t compact = (uint64_t)(b->len - saved);
     b->len = saved;
     if (obj->type == RAY_DICT) fmt_pp_dict_broken(b, obj, indent);
     else                       fmt_pp_list_broken(b, obj, indent);
+    ray_dup_leave(&b->dup, opened, fmt_out(b) + compact);
+    fmt_dup_check(b);
 }
 
 ray_t* ray_fmt_pp(ray_t* obj) {
@@ -2065,20 +2172,26 @@ ray_t* ray_fmt_pp(ray_t* obj) {
     return fmt_to_str(&b);
 }
 
-void ray_fmt_print(FILE* fp, ray_t* obj, int mode) {
-    ray_t* s = ray_fmt(obj, mode);
-    if (s) {
-        fwrite(ray_str_ptr(s), 1, ray_str_len(s), fp);
-        ray_release(s);
+/* A value the formatter refused (a shared part repeated beyond the budget)
+ * prints its error line. */
+static void fmt_print_result(FILE* fp, ray_t* s) {
+    if (!s) return;
+    if (RAY_IS_ERR(s)) {
+        const char* msg = ray_err_msg(s);
+        fprintf(fp, "error: %s%s%s", ray_err_code(s), msg ? ": " : "", msg ? msg : "");
+        ray_error_free(s);
+        return;
     }
+    fwrite(ray_str_ptr(s), 1, ray_str_len(s), fp);
+    ray_release(s);
+}
+
+void ray_fmt_print(FILE* fp, ray_t* obj, int mode) {
+    fmt_print_result(fp, ray_fmt(obj, mode));
 }
 
 void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
-    ray_t* s = ray_fmt_pp(obj);
-    if (s) {
-        fwrite(ray_str_ptr(s), 1, ray_str_len(s), fp);
-        ray_release(s);
-    }
+    fmt_print_result(fp, ray_fmt_pp(obj));
 }
 
 /* Write obj to fp in full (show): no row, column or width limits, and
@@ -2089,13 +2202,27 @@ void ray_fmt_pp_print(FILE* fp, ray_t* obj) {
  * ray_err_t is returned.  Output flushed before the failure stays written
  * (a table's columns are all loaded before its first byte, so only values
  * formatted ahead of it in the same call are affected). */
+static ray_err_t fmt_write(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t);
 ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause) {
+    return fmt_write(fp, obj, cause, NULL);
+}
+
+/* ray_fmt_write as one of several values an operation writes, sharing the
+ * operation's tracker t (show's arguments, #1648); NULL: its own. */
+ray_err_t ray_fmt_write_dup(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t) {
+    return fmt_write(fp, obj, cause, t);
+}
+static inline __attribute__((always_inline))
+ray_err_t fmt_write(FILE* fp, ray_t* obj, ray_t** cause, ray_dup_t* t) {
     if (cause) *cause = NULL;
     fmt_buf_t b;
     fmt_init(&b);
     if (b.err) return RAY_ERR_OOM;
     b.sink = fp;
+    if (t) fmt_dup_in(&b, t);
+    else ray_dup_root(&b.dup, obj, false);
     fmt_obj(&b, obj, 2);
+    if (t) fmt_dup_out(&b, t);
     if (!b.err && b.len > 0 && fwrite(b.buf, 1, (size_t)b.len, fp) != (size_t)b.len)
         b.io_err = b.err = true;
     if (b.err && b.cause_code[0] && cause) {

@@ -1,0 +1,72 @@
+;; @requires: posix
+;; When an intermediate of var / stddev overflows, the result is 0Nf, never
+;; a wrong number (#1669).  The sums are doubles, taken about a value of the
+;; group: a million values alternating 0 and 1e149 give a shifted sum near
+;; 5e154 whose square overflows, and the grouped routes clamped the -inf
+;; that left to 0.0.  Each route now gives the right value (population
+;; variance 2.5e297) or 0Nf.
+
+(set rel (fn [got want] (/ (abs (- got want)) want)))
+;; every element right, or 0Nf
+(set fine (fn [got want] (all (or (nil? got) (< (rel got want) 0.000000001)))))
+(set noz (fn [got] (all (or (nil? got) (> got 0.0)))))
+
+(set n 1000000)
+(set V (* 1e149 (as 'F64 (% (til n) 2))))
+(set k (% (div (til n) 2) 2))
+(set T (table [g k s f v] (list (* 0 k) k (at ['a 'b] k) (+ 0.5 (as 'F64 k)) V)))
+(set vp 2.5e297)
+
+;; the eager builtin and keyless take the sums about the mean: right
+(fine (var_pop V) vp) -- true
+(fine (dev V) (sqrt vp)) -- true
+(fine (at (select {from: T q: (var_pop v)}) 'q) vp) -- true
+(fine (first (at (update {q: (var_pop v) from: T}) 'q)) vp) -- true
+
+;; grouped: right or 0Nf, never 0
+(fine (at (select {from: T by: g q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: T by: s q: (stddev_pop v)}) 'q) (sqrt vp)) -- true
+(fine (at (select {from: T by: f q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: T by: k q: (var v)}) 'q) (/ (* vp 500000) 499999)) -- true
+(fine (at (update {q: (var_pop v) by: g from: T}) 'q) vp) -- true
+(noz (at (select {from: T by: g q: (var_pop v)}) 'q)) -- true
+(noz (at (select {from: T by: k q: (stddev v)}) 'q)) -- true
+;; the one-group case overflows on the grouped route: 0Nf, as documented
+(nil? (at (select {from: T by: g q: (var_pop v)}) 'q)) -- [true]
+
+;; splayed and partitioned copies
+(set D "/tmp/rf_var_overflow")
+(.sys.exec (format "rm -rf %" D))
+(.db.splayed.set (format "%/spl/t/" D) T)
+(.db.splayed.set (format "%/par/2024.01.01/t/" D) (take T 500000))
+(.db.splayed.set (format "%/par/2024.01.02/t/" D) (drop T 500000))
+(set SPL (.db.splayed.get (format "%/spl/t/" D)))
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(fine (at (select {from: SPL q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: SPL by: g q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: PT q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: PT by: g q: (var_pop v)}) 'q) vp) -- true
+(fine (at (select {from: PT by: s q: (dev v)}) 'q) (sqrt vp)) -- true
+(noz (at (select {from: PT by: g q: (var_pop v)}) 'q)) -- true
+(.sys.exec (format "rm -rf %" D)) -- 0
+
+;; a parted keyless where: whose group's rows sit one per partition: each
+;; partition's partial is a single value, and the merge's overflow (a
+;; difference near 2e300 between partitions) is 0Nf, not the partials' 0
+(.db.splayed.set (format "%/pw/2024.01.01/t/" D) (table [g x] (list [5 1 2] [1e300 3.0 4.0])))
+(.db.splayed.set (format "%/pw/2024.01.02/t/" D) (table [g x] (list [5 1] [-1e300 5.0])))
+(.db.splayed.set (format "%/pw/2024.01.03/t/" D) (table [g x] (list [5 2 2] [1e300 6.0 7.0])))
+(.db.splayed.set (format "%/pw/2024.01.04/t/" D) (table [g x] (list [1 2] [8.0 9.0])))
+(set PW (.db.parted.get (format "%/pw/" D) 't))
+(at (select {v: (var x) from: PW where: (== g 5)}) 'v) -- [0Nf]
+(at (select {v: (var_pop x) from: PW where: (== g 5)}) 'v) -- [0Nf]
+(at (select {v: (stddev x) from: PW where: (== g 5)}) 'v) -- [0Nf]
+(at (select {v: (dev x) from: PW where: (== g 5)}) 'v) -- [0Nf]
+(at (select {v: (var x) from: PW by: g where: (== g 5)}) 'v) -- [0Nf]
+;; and an ordinary group the same way: its variance
+(at (select {v: (var_pop x) from: PW where: (== g 2)}) 'v) -- (at (select {v: (var_pop x) from: (select {from: PW}) where: (== g 2)}) 'v)
+(.sys.exec (format "rm -rf %" D)) -- 0
+
+;; squares that overflow for every route: 0Nf everywhere
+(var_pop [1e300 -1e300 1e300]) -- 0Nf
+(at (select {from: (table [g v] (list [0 0 0] [1e300 -1e300 1e300])) by: g q: (stddev v)}) 'q) -- [0Nf]

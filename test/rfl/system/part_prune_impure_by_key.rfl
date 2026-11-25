@@ -1,0 +1,65 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1661: a by: key whose evaluation has an effect behaves the same written
+;; bare, by: (h x), and as a by-dict value, by: {k: (h x)}.  The effect runs
+;; once per kept row in both (the documented rule for a key with an effect;
+;; a by-dict value ran it once, over the whole column), and the select reads
+;; every partition in both (a bare key was pruned through the filter that
+;; feeds it, the by-dict one was not).  A pure key is pruned as before.
+;;
+;; A read of a partition is made visible without a clock: two date
+;; partitions of 70 000 uncompressed rows, and the second partition's ts
+;; values copied over the first partition's ts data in place, keeping its
+;; header and statistics.  A select that skips the first partition counts
+;; the second's rows alone (70000); one that reads it counts them twice.
+
+(set R (format "/tmp/rfl_part_prune_impure_by_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %/stale %/clean" R R R)) -- 0
+(set n 70000)
+(set mk (fn [d] (table [ts s v] (list (+ d (* 1000000 (til n))) (at ['x 'y 'z] (% (til n) 3)) (at [1 0Nl 3 400 5 0Nl 7] (% (til n) 7))))))
+(.db.splayed.set (format "%/stale/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/stale/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.sys.exec (format "dd if=%/stale/2026.01.06/t/ts of=%/stale/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null" R R)) -- 0
+(set P (.db.parted.get (format "%/stale/" R) 't))
+(.db.splayed.set (format "%/clean/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(.db.splayed.set (format "%/clean/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(.db.splayed.set (format "%/clean/2026.01.07/t/" R) (mk 2026.01.07D00:00:00.000) (format "%/clean/.sym" R) {compress: true})
+(set C (.db.parted.get (format "%/clean/" R) 't))
+(set cnt 0)
+(set Lf (fn [x] (set cnt (+ cnt 1)) x))
+(set Lh (fn [x] (set cnt (+ cnt 1)) (% x 2)))
+
+;; a key with an effect reads every partition, in both spellings
+(sum (at (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 140000
+(sum (at (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 140000
+(sum (at (select {c: (count v) by: (Lh v) from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 140000
+(sum (at (select {c: (count v) by: {k: (Lh v)} from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 140000
+;; a pure key is still pruned
+(sum (at (select {c: (count v) by: (% v 2) from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 70000
+(sum (at (select {c: (count v) by: {k: (% v 2)} from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c)) -- 70000
+
+;; the effect runs once per kept row, in both spellings: on the clean root
+;; (rows 1 ms apart from each partition's midnight) ts >= 2026.01.06D12:00
+;; keeps the third partition's 70000 rows, ts >= 2026.01.06D00:00 the
+;; second's and third's 140000, and no where: all 210000
+(set kept (fn [q] (do (set cnt 0) (q) cnt)))
+(kept (fn [] (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: C where: (>= ts 2026.01.06D12:00:00.000)})))  -- (kept (fn [] (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (>= ts 2026.01.06D12:00:00.000)})))
+(kept (fn [] (select {c: (count v) by: (Lh v) from: C where: (>= ts 2026.01.06D12:00:00.000)}))) -- (kept (fn [] (select {c: (count v) by: {k: (Lh v)} from: C where: (>= ts 2026.01.06D12:00:00.000)})))
+(kept (fn [] (select {c: (count v) by: {k: (Lh v)} from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- 140000
+(kept (fn [] (select {c: (count v) by: (Lh v) from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- 140000
+(kept (fn [] (select {c: (count v) by: {k: (Lh v) s: s} from: C}))) -- 210000
+
+;; every answer equals the one without pruning, in both spellings
+(xasc (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: C where: (>= ts 2026.01.06D00:00:00.000)}) (key (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- (xasc (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))}) (key (select {c: (count v) by: (if (> v (Lf 2)) 1 0) from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})))
+(xasc (select {c: (sum v) m: (max v) by: (if (> v (Lf 2)) 1 0) from: C where: (>= ts 2026.01.06D00:00:00.000)}) (key (select {c: (sum v) m: (max v) by: (if (> v (Lf 2)) 1 0) from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- (xasc (select {c: (sum v) m: (max v) by: (if (> v (Lf 2)) 1 0) from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))}) (key (select {c: (sum v) m: (max v) by: (if (> v (Lf 2)) 1 0) from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})))
+(xasc (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (>= ts 2026.01.06D00:00:00.000)}) (key (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- (xasc (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))}) (key (select {c: (count v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})))
+(xasc (select {c: (sum v) m: (max v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (>= ts 2026.01.06D00:00:00.000)}) (key (select {c: (sum v) m: (max v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (>= ts 2026.01.06D00:00:00.000)}))) -- (xasc (select {c: (sum v) m: (max v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))}) (key (select {c: (sum v) m: (max v) by: {k: (if (> v (Lf 2)) 1 0)} from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000))})))
+(xasc (select {c: (count v) by: (Lh v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}) (key (select {c: (count v) by: (Lh v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}))) -- (xasc (select {c: (count v) by: (Lh v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))}) (key (select {c: (count v) by: (Lh v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))})))
+(xasc (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}) (key (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}))) -- (xasc (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))}) (key (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))})))
+(xasc (select {c: (count v) by: {k: (Lh v) s: s} from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}) (key (select {c: (count v) by: {k: (Lh v) s: s} from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}))) -- (xasc (select {c: (count v) by: {k: (Lh v) s: s} from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))}) (key (select {c: (count v) by: {k: (Lh v) s: s} from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))})))
+(xasc (select {c: (sum v) m: (max v) by: {k: (Lh v) s: s} from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}) (key (select {c: (sum v) m: (max v) by: {k: (Lh v) s: s} from: C where: (and (>= ts 2026.01.06D00:00:00.000) (> v 2))}))) -- (xasc (select {c: (sum v) m: (max v) by: {k: (Lh v) s: s} from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))}) (key (select {c: (sum v) m: (max v) by: {k: (Lh v) s: s} from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (> v 2)) (and (>= ts 2026.01.06D00:00:00.000) (> v 2)))})))
+(xasc (select {c: (count v) by: {k: (Lh v)} from: C where: (== date 2026.01.07)}) (key (select {c: (count v) by: {k: (Lh v)} from: C where: (== date 2026.01.07)}))) -- (xasc (select {c: (count v) by: {k: (Lh v)} from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))}) (key (select {c: (count v) by: {k: (Lh v)} from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))})))
+(xasc (select {c: (sum v) m: (max v) by: {k: (Lh v)} from: C where: (== date 2026.01.07)}) (key (select {c: (sum v) m: (max v) by: {k: (Lh v)} from: C where: (== date 2026.01.07)}))) -- (xasc (select {c: (sum v) m: (max v) by: {k: (Lh v)} from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))}) (key (select {c: (sum v) m: (max v) by: {k: (Lh v)} from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))})))
+(xasc (select {c: (count v) by: (Lh v) from: C where: (== date 2026.01.07)}) (key (select {c: (count v) by: (Lh v) from: C where: (== date 2026.01.07)}))) -- (xasc (select {c: (count v) by: (Lh v) from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))}) (key (select {c: (count v) by: (Lh v) from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))})))
+(xasc (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (== date 2026.01.07)}) (key (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (== date 2026.01.07)}))) -- (xasc (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))}) (key (select {c: (sum v) m: (max v) by: (Lh v) from: C where: (or false (== date 2026.01.07) (== date 2026.01.07))})))
+
+(.sys.exec (format "rm -rf %" R)) -- 0
