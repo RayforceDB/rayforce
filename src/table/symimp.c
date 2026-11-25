@@ -351,7 +351,10 @@ bool ray_symimp_add_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
         bool ok = true;
         pthread_mutex_lock(&m->alock);
         if (atomic_load_explicit(&m->reserved, memory_order_relaxed)) ok = false;
-        int64_t* sp = m->stats ? (int64_t[SI_ST_N]){0} : NULL;
+        /* a named array, not a compound literal in the ?: arm, which the
+         * static analyser cannot parse (#1717); zeroed each batch as before */
+        int64_t counts[SI_ST_N] = {0};
+        int64_t* sp = m->stats ? counts : NULL;
         for (int64_t i = o; i < o + k && ok; i++) {
             const char* s = strs[i] ? strs[i] : "";
             size_t len = strs[i] ? lens[i] : 0;
