@@ -4653,6 +4653,12 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
  * progress, where a column is already its cell; not outside a query.
  * `fn_type` is the builtin's type and `fnp` its function; `rows` the
  * arguments' flags in the VM encoding.  NULL when it does not apply. */
+/* Is the builtin function pointer `fp` first or last, whose query reading
+ * skips nulls (ray_query_edge_value, #1673)? */
+static inline bool vm_fn_is_edge(int64_t fp) {
+    return (void*)(uintptr_t)fp == (void*)ray_first_fn || (void*)(uintptr_t)fp == (void*)ray_last_fn;
+}
+
 #define ROWWISE_MAX_ARGS 64   /* a builtin call takes at most 64 arguments */
 static ray_t* rowwise_apply(int8_t fn_type, void* fnp, ray_t** args, const uint8_t* rows,
                             int64_t argc) {
@@ -5236,6 +5242,10 @@ op_jmpf: {
         ? rowwise_apply(RAY_UNARY, (void*)(uintptr_t)fn_obj->i64, &arg,     \
                         &arg_rows, 1) : NULL;   /* per row in a query */    \
     bool rowwise_done = result != NULL;                                     \
+    if (!result && arg_rows == 1 && fn_obj->type == RAY_UNARY &&            \
+        vm_fn_is_edge(fn_obj->i64))   /* first / last (#1673) */            \
+        result = ray_query_edge_value((void*)(uintptr_t)fn_obj->i64, arg,   \
+                                      arg_rows);                            \
     if (!result) result = APPLY;                                            \
     uint8_t result_rows = rowwise_done ? 1                                  \
         : arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;                 \
@@ -5479,6 +5489,12 @@ op_callf: {
                 (result = rowwise_apply(RAY_UNARY, (void*)(uintptr_t)unary, fn_args, arg_rows, 1)) != NULL) {
                 ray_release(fn_args[0]);
                 rowwise_done = true;
+                break;
+            }
+            /* first / last of the query's rows skip nulls (#1673) */
+            if (arg_rows[0] == 1 && vm_fn_is_edge((int64_t)(uintptr_t)unary) &&
+                (result = ray_query_edge_value((void*)(uintptr_t)unary, fn_args[0], arg_rows[0])) != NULL) {
+                ray_release(fn_args[0]);
                 break;
             }
             /* The generic null: only nil?, type and ser take it, as on the
@@ -7123,6 +7139,13 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                     rows = RAY_IS_ERR(rw) ? 0 : 1;
                     ret = rw; goto out;
                 }
+            }
+            /* first / last of the query's rows skip nulls (#1673) */
+            ray_t* edge = vm_fn_is_edge((int64_t)(uintptr_t)fn)
+                ? ray_query_edge_value((void*)(uintptr_t)fn, arg, vrows_from(arg_rows)) : NULL;
+            if (edge) {
+                if (arg) ray_release(arg);
+                ret = edge; goto out;
             }
             if (RAY_IS_NULL(arg)) {
                 /* Only nil?/type/ser safely handle null */

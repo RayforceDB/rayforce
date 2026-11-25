@@ -225,10 +225,33 @@ under `by:`, so it gives what the verb written in place gives; an effect in it
 happens once, not once per row. Otherwise the helper keeps its per-row call,
 and a verb in it sees one cell: a closure, a verb only reached through an `if`
 arm, a verb applied to a constant or a global
-(`(fn [x] (let k (reverse [1 2])) (count x))` counts each row's cell), a verb
+(`(fn [x] (let k (reverse [1 2])) (+ x (count k)))` adds 2 to each row's
+cell), a verb
 passed in as an argument, and a lambda bound by a `let` in the projection and
 then called, `(do (let h (fn [x] (let y 1) (reverse x))) (h b))`
 ([#1654](https://github.com/RayforceDB/rayforce/issues/1654)).
+
+The same holds for an aggregate: a helper the planner does not inline whose
+body applies an aggregate to its argument, by the same rule, means what its
+body written inline means. In a keyless select it is evaluated once over the
+whole column (the rows `where:` keeps), so `(fn [x] (let q 1) (sum x))` gives
+one value, one row alone and spread beside a row output as an inline `(sum h)`
+is, and a body that keeps the rows, `(fn [x] (let q 1) (- x (avg x)))`, gives
+the column `(- h (avg h))` gives; under `by:` it gives each group's value, and
+in `update` the value written to every row. Inside such a body called from a
+query, `first` and `last` of a value of the query's rows skip nulls, as the
+query's own do, so `(fn [x] (let q 1) (first x))` gives the first non-null
+cell on every route. A closure, an aggregate reached only through an `if` arm,
+one applied to a constant or a global, or passed in as an argument, keep the
+per-row call ([#1673](https://github.com/RayforceDB/rayforce/issues/1673)).
+
+```lisp
+(set t (table [g h] (list [0 1 0 1 0 1] [0N 2 3 0N 5 6])))
+(set H (fn [x] (let q 1) (first x)))
+(at (select {v: (H h) from: t}) 'v)         ; [2]
+(at (select {v: (H h) from: t by: g}) 'v)   ; [3 2]
+(at (update {v: (H h) from: t}) 'v)         ; [2 2 2 2 2 2]
+```
 
 Element-wise builtins work row by row on every route. The text renderers
 `format`, `repr` and `.json.format` are element-wise: over a column each gives

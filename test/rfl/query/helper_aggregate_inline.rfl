@@ -1,0 +1,78 @@
+;; @also-unfused
+;; A helper the planner does not inline (a body of more than one statement),
+;; whose body applies an aggregate to its argument, means in a query what
+;; its body written inline means (#1673): one value in a keyless select,
+;; spread beside a row output; each group's value under by:; the value
+;; written to every row in update.  Inside such a body called from a query,
+;; first and last of a value of the query's rows skip nulls, as the query's
+;; own do.  On dev the keyless select called it once per row, so the
+;; aggregate reduced one cell (count gave 1s, sum the column itself), and
+;; under by: and in update the body's first and last were positional.
+
+(set T (table [i g h f] (list (til 6) (% (til 6) 2) [0N 2 3 0N 5 6] [1.5 0Nf 2.5 4.0 0Nf 3.0])))
+(set HM (fn [x] (let q 1) (first x)))
+(set HL (fn [x] (let q 1) (last x)))
+(set HS (fn [x] (let q 1) (sum x)))
+(set HC (fn [x] (let q 1) (count x)))
+(set HA (fn [x] (let s (avg x)) s))
+(set H1 (fn [x] (max x)))
+(set HN (fn [x] (let q 1) (H1 x)))
+
+;; ── keyless: one value, as inline ──
+(at (select {v: (HM h) from: T}) 'v) -- (at (select {v: (first h) from: T}) 'v)
+(at (select {v: (HM h) from: T}) 'v) -- [2]
+(at (select {v: (HL f) from: T}) 'v) -- [3.0]
+(at (select {v: (HS h) from: T}) 'v) -- [16]
+(at (select {v: (HC h) from: T}) 'v) -- [6]
+(at (select {v: (HA f) from: T}) 'v) -- (at (select {v: (avg f) from: T}) 'v)
+(at (select {v: (HN h) from: T}) 'v) -- [6]
+(at (select {v: (+ 1 (HS h)) from: T}) 'v) -- [17]
+(at (select {v: ((fn [x] (let q 1) (sum x)) h) from: T}) 'v) -- [16]
+;; beside a row output: spread, as an inline aggregate is
+(value (select {v: (HS h) w: i from: T})) -- (value (select {v: (sum h) w: i from: T}))
+(at (select {v: (HM h) w: i from: T}) 'v) -- [2 2 2 2 2 2]
+;; with where:: over the kept rows
+(at (select {v: (HS h) from: T where: (> i 1)}) 'v) -- [14]
+(at (select {v: (HM h) from: T where: (> i 2)}) 'v) -- [5]
+;; over no row: the aggregate's answer over no values, one row
+(at (select {v: (HS h) from: T where: (> i 100)}) 'v) -- (at (select {v: (sum h) from: T where: (> i 100)}) 'v)
+;; a body that keeps the rows gives the column its inline form gives
+(set HD (fn [x] (let q 1) (- x (avg x))))
+(at (select {v: (HD f) from: T}) 'v) -- (at (select {v: (- f (avg f)) from: T}) 'v)
+
+;; ── by: and update: the body's first and last skip nulls ──
+(at (select {v: (HM h) from: T by: g}) 'v) -- (at (select {v: (first h) from: T by: g}) 'v)
+(at (select {v: (HM h) from: T by: g}) 'v) -- [3 2]
+(at (select {v: (HL h) from: T by: g}) 'v) -- [5 6]
+(at (update {v: (HM h) from: T}) 'v) -- [2 2 2 2 2 2]
+(at (update {v: (HL f) from: T}) 'v) -- [3.0 3.0 3.0 3.0 3.0 3.0]
+(at (update {v: (HM h) from: T by: g}) 'v) -- (at (update {v: (first h) from: T by: g}) 'v)
+;; outside a query, first and last stay positional
+(HM [0N 1]) -- 0N
+(HL [1 0N]) -- 0N
+
+;; an effect in such a helper happens once, not once per row
+(set cnt 0)
+(set HE (fn [x] (set cnt (+ cnt 1)) (sum x)))
+(at (select {v: (HE h) from: T}) 'v) -- [16]
+cnt -- 1
+
+;; ── unchanged: called once per row, as on dev ──
+;; a closure, whose captures the walk cannot see
+(set Hc ((fn [z] (fn [x] (let q z) (sum x))) 1))
+(at (select {v: (Hc h) from: T}) 'v) -- [0N 2 3 0N 5 6]
+;; an aggregate reached only through an if arm
+(set Hi (fn [x] (let q 1) (if (> (count x) 100) (sum x) 0)))
+(at (select {v: (Hi h) from: T}) 'v) -- [0 0 0 0 0 0]
+;; an aggregate of a constant or a global, not of the argument
+(set G [1 2 3])
+(set Hg (fn [x] (let q 1) (+ x (sum G))))
+(at (select {v: (Hg h) from: T}) 'v) -- [0N 8 9 0N 11 12]
+;; a parameter rebound to a constant, in order or inside a nested do
+(set Hr (fn [x] (let x [3 1 2]) (sum x)))
+(at (select {v: (Hr h) from: T}) 'v) -- [6 6 6 6 6 6]
+(set Hr2 (fn [x] (do (let x [3 1 2]) 0) (sum x)))
+(at (select {v: (Hr2 h) from: T}) 'v) -- [6 6 6 6 6 6]
+;; an aggregate passed in as an argument
+(set Hf (fn [fu x] (let q 1) (fu x)))
+(at (select {v: (Hf sum h) from: T}) 'v) -- [0N 2 3 0N 5 6]
