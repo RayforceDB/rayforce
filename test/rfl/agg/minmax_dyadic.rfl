@@ -121,9 +121,13 @@
 (set W (- 500 V))
 (min V 300) -- (min (map (fn [x] x) V) 300)
 (max V W) -- (max (map (fn [x] x) V) (map (fn [x] x) W))
-;; the kernel runs well under the boxed map's time (one atom a cell)
-(set best (fn [f] (min (map (fn [i] (f)) (til 3)))))
+;; the kernel runs over the vector, not one boxed atom a cell: counted in
+;; allocator blocks (.mem.ts), not wall time (#1729).  The boxed LIST form
+;; allocates an atom a cell; the kernel a few blocks whatever the length.
 (set BIG (% (* (til 500000) 7919) 100000))
 (set BIGL (as 'LIST BIG))
-(< (* 4 (best (fn [] (timeit (min BIG 5))))) (best (fn [] (timeit (min BIGL 5))))) -- true
-(< (* 4 (best (fn [] (timeit (max BIG (- 100000 BIG)))))) (best (fn [] (timeit (max BIGL (- 100000 BIG)))))) -- true
+(set allocs (fn [m] (at m 'alloc-count)))
+(< (allocs (.mem.ts (min BIG 5))) 100) -- true
+(>= (allocs (.mem.ts (min BIGL 5))) 500000) -- true
+(< (allocs (.mem.ts (max BIG (- 100000 BIG)))) 100) -- true
+(>= (allocs (.mem.ts (max BIGL (- 100000 BIG)))) 500000) -- true

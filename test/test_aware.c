@@ -3395,6 +3395,50 @@ static test_result_t test_firstn_where_deferred(void) {
     PASS();
 }
 
+/* The grouped select's plans for grade and rank verbs (#1414), asserted by
+ * route rather than by wall time (#1729): a shape the planner keeps on the
+ * group node or on the row-aligned scatter evaluates nothing once per group
+ * (ray_query_test_group_evals); a whole-column verb that must see its
+ * group's rows does.  A row-local output nested past the bounded walk's
+ * depth stays row-aligned; (first (asc v)) is planned as (min v), and
+ * (count (iasc w)) and (count (rank w)) as (count w). */
+static test_result_t test_grouped_grade_routes(void) {
+    aw_eval_ok("(set n5 20000)");
+    aw_eval_ok("(set K5 (table [k v w] (list (at (as 'SYM (map (fn [i] (format \"k%\" i)) (til 4000))) (% (* (til n5) 7919) 4000)) "
+               "(% (* (til n5) 104729) 1000003) (as 'I64 (map (fn [i] (if (== 0 (% i 9)) 0N i)) (til n5))))))");
+    static const struct { const char* out; bool per_group; } c[] = {
+        { "(+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))))))", false },
+        { "(+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))", false },
+        { "(first (asc v))", false },
+        { "(min v)", false },
+        { "(count (iasc w))", false },
+        { "(count (rank w))", false },
+        { "(count w)", false },
+        /* whole-column verbs that need their group: evaluated per group */
+        { "(rank w)", true },
+        { "(sum (rank w))", true },
+        { "(count (xrank 0 w))", true },
+    };
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++) {
+        char q[600];
+        snprintf(q, sizeof q, "(select {from: K5 by: k r: %s})", c[i].out);
+        uint64_t e0 = ray_query_test_group_evals();
+        ray_t* r = aw_eval(q);
+        uint64_t evals = ray_query_test_group_evals() - e0;
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s failed", q);
+        TEST_ASSERT_FMT(ray_table_nrows(r) == 4000, "%s: %lld groups", q, (long long)ray_table_nrows(r));
+        ray_release(r);
+#ifdef DEBUG   /* the counter counts in debug builds */
+        TEST_ASSERT_FMT(c[i].per_group ? evals > 0 : evals == 0, "%s: evaluated per group %llu times",
+                        q, (unsigned long long)evals);
+#else
+        (void)evals;
+#endif
+    }
+    aw_eval_ok("(set K5 0)");
+    PASS();
+}
+
 static test_result_t test_sort_head_late_chunked(void) {
 #define AW_TKC_COLS(R) "(table [r up dn c d n f i] (list " R " " R " (- 0 " R ") (+ 7 (* 0 " R ")) (div " R " 3000) " \
     "(+ (% (* " R " 7919) 1000) (at [0 0N] (+ 0 (== 0 (% " R " 97))))) " \
@@ -6302,5 +6346,6 @@ const test_entry_t aware_entries[] = {
     { "aware/topk_never_pruned", test_topk_never_pruned, aw_setup, aw_teardown },
     { "aware/filter_only_columns", test_filter_only_columns, aw_setup, aw_teardown },
     { "aware/firstn_where_deferred", test_firstn_where_deferred, aw_setup, aw_teardown },
+    { "aware/grouped_grade_routes", test_grouped_grade_routes, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };
