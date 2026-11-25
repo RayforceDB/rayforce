@@ -16509,6 +16509,8 @@ enum {
     SELECT_COLUMN_FREE_PLANNED = 2,   /* column-free aggregate sources evaluated */
     SELECT_RUNNING_PLANNED     = 4,   /* keyless running calls hoisted */
     SELECT_FREE_VECS_PLANNED   = 8,   /* free vectors read as rows made columns */
+    SELECT_NO_PRUNE            = 16,  /* read every partition: the rows feed a by: key
+                                       * with an effect (#1661) */
 };
 static ray_t* ray_select_impl(ray_t** args, int64_t n, unsigned plan);
 ray_t* ray_update(ray_t** args, int64_t n);
@@ -21002,6 +21004,13 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
             ray_t* where_expr = dict_get(dict, "where");
             ray_t* base = tbl;
             ray_retain(base);
+            /* A body with an effect runs once per row, never whole first:
+             * a repeated run would repeat the effect.  Its rows are read
+             * from every partition, as a by-dict key with an effect is
+             * (prune_by_ok declines it): no partition pruning (#1661). */
+            key_bind_t pure_binds[KEY_PURE_MAX_BIND];
+            key_pure_ctx_t pure_ctx = { NULL, pure_binds, 0, 0 };
+            bool effect_free = key_expr_pure(by_expr, 0, &pure_ctx);
             if (where_expr) {
                 ray_t* fk = ray_vec_new(RAY_SYM, 2);
                 ray_t* fv = ray_list_new(2);
@@ -21010,7 +21019,8 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
                 if (fv && !RAY_IS_ERR(fv)) fv = ray_list_append(fv, where_expr);
                 ray_t* fdict = ray_dict_new(fk, fv);
                 if (!fdict || RAY_IS_ERR(fdict)) { ray_release(base); return fdict ? fdict : ray_error("oom", NULL); }
-                ray_t* filtered = ray_select_impl(&fdict, 1, SELECT_ALIASES_RESOLVED);
+                ray_t* filtered = ray_select_impl(&fdict, 1, SELECT_ALIASES_RESOLVED |
+                                                  (effect_free ? 0u : (unsigned)SELECT_NO_PRUNE));
                 ray_release(fdict);
                 if (filtered && !RAY_IS_ERR(filtered) && ray_is_lazy(filtered)) filtered = ray_lazy_materialize(filtered);
                 if (!filtered || RAY_IS_ERR(filtered)) { ray_release(base); return filtered ? filtered : ray_error("oom", NULL); }
@@ -21044,15 +21054,11 @@ static ray_t* select_plan_computed_key(ray_t* dict, ray_t* tbl, int64_t* key_nam
             int64_t nrows = ray_table_nrows(base);
             int32_t conds = __VM->rows_cond;
             uint32_t mixes = g_if_mixes;
-            /* A body with an effect runs once per row, never whole first:
-             * a repeated run would repeat the effect. */
-            key_bind_t pure_binds[KEY_PURE_MAX_BIND];
-            key_pure_ctx_t pure_ctx = { NULL, pure_binds, 0, 0 };
             /* A JSON read of a column, under element-wise builtins only, is
              * read whole as a projection is (json_rowwise): it holds no
              * conditional, and its error is the query's. */
             bool json_whole = json_rowwise(by_expr, base) == 1;
-            bool pure = json_whole || key_expr_pure(by_expr, 0, &pure_ctx);
+            bool pure = json_whole || effect_free;
             ray_t* keyvec = pure ? eval_expr_whole_column(by_expr, base) : NULL;
             if (!pure) keyvec = eval_expr_per_row(by_expr, base, nrows);
             else if (!json_whole && g_if_mixes == mixes &&
@@ -24545,7 +24551,7 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     }
 
     /* Prune partitions the where: rules out before any column is fetched. */
-    {
+    if (!(plan & SELECT_NO_PRUNE)) {
         ray_t* pruned = select_prune_partitions(dict, tbl, where_expr);
         if (pruned) {
             ray_release(tbl);
@@ -25607,7 +25613,15 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
                 sv_data[i] = k->i64;
                 continue;
             }
-            ray_t* col_vec = group_key_eval_bound(v, tbl);
+            /* A value that calls a helper with an effect runs once per row,
+             * as a bare by: key with one does (#1661): evaluated whole, the
+             * effect ran once.  Any other value is read whole, as before:
+             * planner-only names (hour, minute) and builtins such as resolve
+             * keep the answer the whole column gives. */
+            bool per_row = query_expr_has_helper(v) && !query_expr_effect_free(v);
+            ray_t* col_vec = per_row ? eval_expr_per_row(v, tbl, ray_table_nrows(tbl))
+                                     : group_key_eval_bound(v, tbl);
+            if (col_vec && !RAY_IS_ERR(col_vec) && ray_is_lazy(col_vec)) col_vec = ray_lazy_materialize(col_vec);
             if (!col_vec || RAY_IS_ERR(col_vec)) {
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");
                 failed = true; break;
