@@ -630,6 +630,26 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the groups come out html, php, jpg — first-seen over the rows — with the materialized select's counts");
     ray_release(r);
+    /* The bitmaps of the slot coding's tasks fit their budget together:
+     * under a budget of one byte the pass runs as one task, under one of
+     * two bitmaps as at most two, with the same groups in the same order. */
+    uint32_t slot_tasks = agg_route_stats().key_slot_tasks;
+    TEST_ASSERT(slot_tasks >= 1, "the slot coding ran");
+    static const uint64_t budgets[] = { 1, 2 * ((37501 + 7) / 8) };
+    for (size_t b = 0; b < 2; b++) {
+        ray_derived_key_slot_budget_set_for_test(budgets[b]);
+        agg_route_reset();
+        r = ray_eval_str("(set G3b (select {from: (select {from: TF3 k: (if (like u \"*.html\") \"html\" (like u \"*.php\") \"php\" \"jpg\") v: v}) by: [k] c: (count v) d: (count (distinct v))}))");
+        ray_derived_key_slot_budget_set_for_test(0);
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+        TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+        TEST_ASSERT_FMT(agg_route_stats().key_slot_tasks <= (b == 0 ? 1u : 2u), "budget %llu: %u slot-coding tasks",
+                        (unsigned long long)budgets[b], agg_route_stats().key_slot_tasks);
+        r = ray_eval_str("(all (== (ser (map (fn [c] (as 'STR (at G3b c))) (cols G3b))) (ser (map (fn [c] (as 'STR (at G3 c))) (cols G3)))))");
+        TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+        TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the capped pass answers the same groups in the same order");
+        ray_release(r);
+    }
     r = ray_eval_str("(.sys.exec \"rm -rf /tmp/rf_agg_contract_dkgate\")");
     if (r) ray_release(r);
 #endif

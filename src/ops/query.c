@@ -11357,7 +11357,20 @@ static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, in
  * the grouping honours the same selection). */
 /* ---- the slot coding of a SYM column whose domain bounds the key
  * (derived_key_over_values_al, vocab_small): per task, the ids its rows
- * show first, in row order. */
+ * show first, in row order.  Each task keeps a bitmap of the domain while
+ * it runs: the tasks of a pass are halved until their bitmaps fit
+ * DKV_BITMAP_BUDGET together (64 MB: 28 tasks over an 18M-id domain, one
+ * task past a 512M-id domain), whatever the pool's size — 1024 tasks over
+ * 18M ids would hold 2.3 GB of bitmaps.  The id lists add at most 4 bytes
+ * a row over the pass (as the codes do), each freed as soon as it is
+ * merged. */
+#define DKV_BITMAP_BUDGET ((uint64_t)64 << 20)
+#ifdef DEBUG
+static uint64_t g_dkv_bitmap_budget_test = 0;
+/* Test seam: a budget in bytes for the bitmaps of the slot coding until
+ * reset to 0 (DKV_BITMAP_BUDGET). */
+void ray_derived_key_slot_budget_set_for_test(uint64_t bytes) { g_dkv_bitmap_budget_test = bytes; }
+#endif
 typedef struct {
     ray_t*   ids_hdr;
     int32_t* ids;        /* the task's first-seen ids, in row order */
@@ -11399,6 +11412,8 @@ static void dkv_list_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
             uint8_t m = (uint8_t)(1u << (id & 7));
             if (!(*b & m)) { *b |= m; t->ids[t->n++] = (int32_t)id; }
         }
+        scratch_free(t->seen_hdr);   /* the bitmap served its task: only the list stays */
+        t->seen_hdr = NULL; t->seen = NULL;
     }
 }
 static void dkv_code_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
@@ -11720,8 +11735,16 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
         int32_t* pos = (int32_t*)scratch_alloc(&pos_hdr, (size_t)dn * sizeof(int32_t));
         g.hash  = (uint64_t*)ray_alloc_raw((size_t)dn * sizeof(uint64_t));
         g.first = (int64_t*)ray_alloc_raw((size_t)dn * sizeof(int64_t));
+        uint32_t vtasks = tasks;
+        {
+            uint64_t budget = DKV_BITMAP_BUDGET;
+#ifdef DEBUG
+            if (g_dkv_bitmap_budget_test) budget = g_dkv_bitmap_budget_test;
+#endif
+            while (vtasks > 1 && (uint64_t)vtasks * (uint64_t)((dn + 7) / 8) > budget) vtasks /= 2;
+        }
         ray_t* vt_hdr = NULL;
-        dkv_task_t* vt = (dkv_task_t*)scratch_calloc(&vt_hdr, (size_t)tasks * sizeof(dkv_task_t));
+        dkv_task_t* vt = (dkv_task_t*)scratch_calloc(&vt_hdr, (size_t)vtasks * sizeof(dkv_task_t));
         if (!pos || !g.hash || !g.first || !vt) {
             if (pos_hdr) scratch_free(pos_hdr);
             if (vt_hdr) scratch_free(vt_hdr);
@@ -11731,23 +11754,26 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
             return NULL;
         }
         memset(pos, 0xff, (size_t)dn * sizeof(int32_t));
-        dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .tasks = tasks,
+        dkv_ctx_t vc = { .cd = kind.cd, .cattrs = kind.cattrs, .dn = dn, .n = n, .tasks = vtasks,
                          .n_segs = c.n_segs, .tk = vt, .pos = pos, .code = (int32_t*)ray_data(ids) };
-        if (tasks > 1) ray_pool_dispatch_n(rpool, dkv_list_fn, &vc, tasks);
+        if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_list_fn, &vc, vtasks);
         else dkv_list_fn(&vc, 0, 0, 1);
         ok = !pool_cancelled(rpool);
-        for (uint32_t t = 0; t < tasks && ok; t++) ok = !vt[t].fail;
-        for (uint32_t t = 0; t < tasks && ok; t++)
-            for (int64_t l = 0; l < vt[t].n; l++) {
+        for (uint32_t t = 0; t < vtasks && ok; t++) ok = !vt[t].fail;
+        for (uint32_t t = 0; t < vtasks; t++) {
+            for (int64_t l = 0; l < vt[t].n && ok; l++) {
                 int64_t id = vt[t].ids[l];
                 if (pos[id] < 0) { pos[id] = (int32_t)g.du; g.hash[g.du] = (uint64_t)id; g.first[g.du] = 0; g.du++; }
             }
-        for (uint32_t t = 0; t < tasks; t++) { if (vt[t].ids_hdr) scratch_free(vt[t].ids_hdr); if (vt[t].seen_hdr) scratch_free(vt[t].seen_hdr); }
+            if (vt[t].ids_hdr) scratch_free(vt[t].ids_hdr);
+            if (vt[t].seen_hdr) scratch_free(vt[t].seen_hdr);
+        }
         scratch_free(vt_hdr);
         if (ok && g.du > 0) {
-            if (tasks > 1) ray_pool_dispatch_n(rpool, dkv_code_fn, &vc, tasks);
+            if (vtasks > 1) ray_pool_dispatch_n(rpool, dkv_code_fn, &vc, vtasks);
             else dkv_code_fn(&vc, 0, 0, 1);
             ok = !pool_cancelled(rpool);
+            agg_route_note_key_slot_tasks(vtasks);
         }
         scratch_free(pos_hdr);
         scratch_free(tk_hdr); tk_hdr = NULL;
