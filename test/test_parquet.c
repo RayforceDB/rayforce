@@ -2167,6 +2167,196 @@ static const char* pq_synth_long(int64_t r, char* buf, uint32_t* len) {
 }
 /* An import with RAY_CSV_TRACE set, its trace (stderr) kept in buf, which
  * ends with a NUL; buf is empty when stderr cannot be redirected. */
+/* Two staged trees alike: the same names under each directory, every file
+ * the same bytes (pq_same_file). */
+static bool pq_same_tree(const char* a, const char* b) {
+    DIR* da = opendir(a);
+    if (!da) return !opendir(b) ? pq_same_file(a,b) : false;
+    bool ok = true; int na = 0, nb = 0;
+    struct dirent* e;
+    while (ok && (e = readdir(da))) {
+        if (!strcmp(e->d_name,".") || !strcmp(e->d_name,"..")) continue;
+        char x[1400], y[1400];
+        snprintf(x,sizeof(x),"%s/%s",a,e->d_name); snprintf(y,sizeof(y),"%s/%s",b,e->d_name);
+        ok = pq_same_tree(x,y); na++;
+    }
+    closedir(da);
+    DIR* db = opendir(b);
+    if (!db) return false;
+    while ((e = readdir(db))) if (strcmp(e->d_name,".") && strcmp(e->d_name,"..")) nb++;
+    closedir(db);
+    return ok && na == nb;
+}
+/* A .parquet.parted import of src into root with the `rows` option and
+ * types (NULL: the defaults); *msg the error's message, "" on success. */
+static ray_t* pq_parted_rows(const char* src, const char* root, int64_t rows, ray_t* types,
+                             char* msg, size_t cap) {
+    int64_t keys[] = {ray_sym_intern("rows",4),ray_sym_intern("types",5)};
+    ray_t* vals = ray_list_new(2);
+    ((ray_t**)ray_data(vals))[0] = ray_i64(rows);
+    if (types) { ray_retain(types); ((ray_t**)ray_data(vals))[1] = types; }
+    vals->len = types ? 2 : 1;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,types ? 2 : 1),vals);
+    pq_rm_rf(root);
+    ray_t* r = ray_parquet_parted_typed(src,root,"t",opts);
+    ray_release(opts);
+    snprintf(msg,cap,"%s",r && RAY_IS_ERR(r) ? ray_error_msg() : "");
+    return r;
+}
+/* The same import with the large row groups split into slices and as one
+ * task each: the same result or error, and the same files, byte for byte. */
+static bool pq_slices_alike(const char* src, int64_t rows, ray_t* types, int64_t* sliced) {
+    /* one destination for both, so that the messages name the same paths;
+     * the first import's tree is moved aside before the second */
+    char a[160], b[160], part[200], ma[512], mb[512];
+    snprintf(a,sizeof(a),"/tmp/rayforce-pq-slices-%d",(int)getpid());
+    snprintf(b,sizeof(b),"/tmp/rayforce-pq-slices-%d-whole",(int)getpid());
+    snprintf(part,sizeof(part),"%s.parquet-partial",a);
+    pq_rm_rf(b); pq_rm_rf(part);
+    ray_parquet_test_slices(false);
+    ray_t* rb = pq_parted_rows(src,a,rows,types,mb,sizeof(mb));
+    rename(a,b); pq_rm_rf(part);
+    ray_parquet_test_slices(true);
+    ray_t* ra = pq_parted_rows(src,a,rows,types,ma,sizeof(ma));
+    *sliced = ray_parquet_test_sliced();
+    bool ok = ra && rb && RAY_IS_ERR(ra) == RAY_IS_ERR(rb) && !strcmp(ma,mb) &&
+              (RAY_IS_ERR(ra) || (ra->i64 == rb->i64 && pq_same_tree(a,b)));
+    if (!ok) fprintf(stderr,"  slices differ: %s rows %lld: '%s' vs '%s'\n",src,(long long)rows,ma,mb);
+    if (ra) { if (RAY_IS_ERR(ra)) ray_error_free(ra); else ray_release(ra); }
+    if (rb) { if (RAY_IS_ERR(rb)) ray_error_free(rb); else ray_release(rb); }
+    pq_rm_rf(a); pq_rm_rf(b); pq_rm_rf(part);
+    return ok;
+}
+/* Each group's dictionary in its own order: of the 12000 rows in two
+ * groups, column s's first group takes 60 strings forwards, its second 80
+ * backwards, 20 of them new; column t the other way round. */
+static const char* pq_synth_two_orders(int64_t r, char* buf, uint32_t* len) {
+    int64_t k = r < 6000 ? r % 60 : 79 - r % 80;
+    *len = (uint32_t)snprintf(buf, 256, "order-%02lld", (long long)k);
+    return buf;
+}
+static const char* pq_synth_two_orders_t(int64_t r, char* buf, uint32_t* len) {
+    int64_t k = r < 6000 ? 59 - r % 60 : r % 80;
+    *len = (uint32_t)snprintf(buf, 256, "order-%02lld", (long long)k);
+    return buf;
+}
+/* Several sliced groups: their dictionaries reach the symbol file in the
+ * groups' order, and each partition's SYM header the symbol count, as
+ * with one worker, whatever the workers' timing. */
+static test_result_t test_pq_group_slices_order(void) {
+    char path[160], a[160], b[160], part[200], msg[512];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-order-%d.parquet",(int)getpid());
+    snprintf(a,sizeof(a),"/tmp/rayforce-pq-order-%d",(int)getpid());
+    snprintf(b,sizeof(b),"/tmp/rayforce-pq-order-%d-one",(int)getpid());
+    snprintf(part,sizeof(part),"%s.parquet-partial",a);
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
+    ray_t* syms = ray_vec_from_raw(RAY_SYM,ids,3);
+    pq_synth_dict = 6; pq_synth_t = pq_synth_two_orders_t;
+    TEST_ASSERT_TRUE(pq_synth(path,12000,2,pq_synth_two_orders));
+    pq_synth_dict = 0; pq_synth_t = NULL;
+    pq_rm_rf(b); pq_rm_rf(part);
+    ray_parquet_test_slices(true);
+    TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+    ray_t* r = pq_parted_rows(path,a,500,syms,msg,sizeof(msg));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,12000); ray_release(r);
+    TEST_ASSERT_EQ_I(ray_parquet_test_sliced(),0);
+    TEST_ASSERT_EQ_I(rename(a,b),0);
+    static const int workers[] = {4,8,16};
+    bool same = true;
+    for (size_t w = 0; same && w < sizeof(workers)/sizeof(*workers); w++) {
+        TEST_ASSERT_EQ_I(pq_pool(workers[w]), RAY_OK);
+        for (int k = 0; same && k < 8; k++) {
+            ray_parquet_test_slices(true);
+            r = pq_parted_rows(path,a,500,syms,msg,sizeof(msg));
+            TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,12000); ray_release(r);
+            TEST_ASSERT_TRUE(ray_parquet_test_sliced() >= 2);
+            same = pq_same_tree(a,b);
+            if (!same) fprintf(stderr,"  symbol order differs at %d workers, run %d\n",workers[w],k);
+            pq_rm_rf(a);
+        }
+    }
+    pq_rm_rf(b); pq_rm_rf(part); unlink(path); ray_release(syms);
+    ray_pool_destroy();
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
+/* #1206: a row group of many partitions is written by several tasks, each a
+ * slice of its rows, and the import is the one a task per group makes. */
+static test_result_t test_pq_group_slices(void) {
+    TEST_ASSERT_EQ_I(pq_pool(8), RAY_OK);
+    static const char* files[] = {
+        "flat-0-v1","flat-0-v2","flat-1-v1","flat-1-v2","flat-5-v1","flat-5-v2","flat-5raw-v1",
+        "flat-5raw-v2","flat-7-v1","flat-7-v2","v2-uncompressed","legacy","no-statistics",
+        "decimal-0-0","decimal-0-1","decimal-1-0","decimal-1-1","decimal-wide-0-0","decimal-wide-1-1",
+        "decimal-round","uint64-0","uint64-1","uint64-bulk","uint64-edge-opt-1","uint64-max-nul-1",
+        "rle-runs","parallel","row-groups","zones","sentinels","simd-sentinels","all-null",
+        "bool","bool-rle-v1","bool-rle-v2","nested","indexed-v1","indexed-v2","indexed-null",
+        "indexed-v1-bad","timestamp-range","unix","multichunk-dict","multichunk-plain",
+        "empty-group","empty","projection","bloom","strict-good","unsupported-columns"};
+    /* partitions of a few rows, within a page, and of several pages; the
+     * large files only of several pages */
+    static const int64_t rows[] = {7,100,1000,20000};
+    int64_t total = 0, sliced;
+    char src[200];
+    for (size_t f = 0; f < sizeof(files)/sizeof(*files); f++)
+        for (size_t k = 0; k < sizeof(rows)/sizeof(*rows); k++) {
+            bool large = strstr(" uint64-bulk rle-runs parallel row-groups zones ",files[f]) != NULL;
+            if (large ? rows[k] < 1000 : rows[k] > 1000) continue;
+            snprintf(src,sizeof(src),FIX "%s.parquet",files[f]);
+            TEST_ASSERT_TRUE(pq_slices_alike(src,rows[k],NULL,&sliced));
+            total += sliced;
+        }
+    TEST_ASSERT_TRUE(total > 0);
+    /* A damaged page in any slice, header or body: the import fails, or not,
+     * as when one task reads the group, with the same message. */
+    char path[160];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-slices-%d.parquet",(int)getpid());
+    static const char* damaged[] = {"flat-1-v1","flat-0-v2","flat-5-v1"};
+    for (size_t f = 0; f < sizeof(damaged)/sizeof(*damaged); f++) {
+        snprintf(src,sizeof(src),FIX "%s.parquet",damaged[f]);
+        FILE* in = fopen(src,"rb"); TEST_ASSERT_TRUE(in != NULL);
+        uint8_t bytes[8192]; size_t n = fread(bytes,1,sizeof(bytes),in); fclose(in);
+        TEST_ASSERT_TRUE(n > 12 && n < sizeof(bytes));
+        uint32_t flen; memcpy(&flen,bytes+n-8,4);
+        for (size_t at = 4; at + 8 + flen < n; at += 17) {
+            bytes[at] ^= 0x5a;
+            FILE* out = fopen(path,"wb"); TEST_ASSERT_TRUE(out != NULL);
+            TEST_ASSERT_TRUE(fwrite(bytes,1,n,out) == n); fclose(out);
+            bytes[at] ^= 0x5a;
+            TEST_ASSERT_TRUE(pq_slices_alike(path,7,NULL,&sliced));
+        }
+    }
+    /* One group of 5000 rows: symbols from a dictionary page (sliced, each
+     * slice reading the page) or plain (one task: the intern order is the
+     * rows'), with nulls. */
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
+    ray_t* syms = ray_vec_from_raw(RAY_SYM,ids,3);
+    pq_synth_dict = 6;
+    TEST_ASSERT_TRUE(pq_synth(path,5000,1,pq_synth_mixed));
+    TEST_ASSERT_TRUE(pq_slices_alike(path,700,syms,&sliced)); TEST_ASSERT_EQ_I(sliced,8);
+    TEST_ASSERT_TRUE(pq_slices_alike(path,700,NULL,&sliced)); TEST_ASSERT_EQ_I(sliced,8);
+    pq_synth_dict = 0;
+    TEST_ASSERT_TRUE(pq_synth(path,5000,1,pq_synth_mixed));
+    TEST_ASSERT_TRUE(pq_slices_alike(path,700,syms,&sliced)); TEST_ASSERT_EQ_I(sliced,0);
+    TEST_ASSERT_TRUE(pq_slices_alike(path,700,NULL,&sliced));
+    /* the slices' rows, read back: every row in its place */
+    char root[160];
+    snprintf(root,sizeof(root),"/tmp/rayforce-pq-slices-r-%d",(int)getpid());
+    pq_synth_dict = 6;
+    TEST_ASSERT_TRUE(pq_synth(path,5000,1,pq_synth_mixed));
+    pq_synth_dict = 0;
+    ray_parquet_test_slices(true);
+    char msg[512];
+    ray_t* r = pq_parted_rows(path,root,700,syms,msg,sizeof(msg));
+    TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,5000); ray_release(r);
+    TEST_ASSERT_EQ_I(ray_parquet_test_sliced(),8);
+    ray_t* t = ray_read_parted(root,"t"); TEST_ASSERT_FALSE(RAY_IS_ERR(t));
+    TEST_ASSERT_EQ_I(ray_table_nrows(t),5000);
+    ray_release(t);
+    pq_rm_rf(root); unlink(path); ray_release(syms);
+    ray_parquet_test_slices(true);
+    ray_pool_destroy(); PASS();
+}
 static ray_t* pq_traced_import(const char* src, const char* dir, ray_t* types, char* buf, size_t cap) {
     char path[160]; snprintf(path, sizeof(path), "/tmp/rayforce-pq-trace-%d.txt", (int)getpid());
     buf[0] = 0;
@@ -5597,6 +5787,8 @@ const test_entry_t parquet_entries[] = {
     {"parquet/decimal-rounding",test_pq_decimal_rounding,pq_setup,pq_teardown},
     {"parquet/unsupported-columns",test_pq_unsupported_columns,pq_setup,pq_teardown},
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
+    {"parquet/group_slices",test_pq_group_slices,pq_setup,pq_teardown},
+    {"parquet/group_slices_order",test_pq_group_slices_order,pq_setup,pq_teardown},
     {"parquet/parted_many_files",test_pq_parted_many_files,pq_setup,pq_teardown},
     {"parquet/parted_pack_error",test_pq_parted_pack_error,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},

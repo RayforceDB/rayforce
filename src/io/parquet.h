@@ -60,6 +60,11 @@ bool ray_parquet_lz4_hadoop(const uint8_t* src, size_t len, uint8_t* dst, size_t
 #if defined(DEBUG)
 void    ray_parquet_test_cert_interrupt_after(int64_t nth);
 int64_t ray_parquet_test_cert_levels(void);
+/* Test hook: off, a large row group is one unit of the partitioned import
+ * again (the whole group read by one task), for the differential checks. */
+void    ray_parquet_test_slices(bool on);
+/* The slice units the partitioned imports planned since the hook was last set. */
+int64_t ray_parquet_test_sliced(void);
 #endif
 
 /* Returns NULL for a non-Parquet source; otherwise an owned table/error.
