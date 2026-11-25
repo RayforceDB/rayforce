@@ -6933,6 +6933,7 @@ static void ray_register_builtins(void) {
     register_unary(".idx.uses", RAY_FN_NONE, ray_idx_uses_fn);
     register_vary(".sys.prof",  RAY_FN_NONE, ray_prof_fn);
     register_vary(".sys.querylog",        RAY_FN_NONE,       ray_qlog_fn);
+    register_vary(".sys.querylog.stats",  RAY_FN_NONE,       ray_qlog_stats_fn);
     register_vary(".sys.querylog.enable", RAY_FN_RESTRICTED, ray_qlog_enable_fn);
     register_vary(".sys.join.par.min",    RAY_FN_RESTRICTED, ray_join_par_min_fn);
     register_vary(".sys.profile",         RAY_FN_NONE,       ray_callprof_fn);

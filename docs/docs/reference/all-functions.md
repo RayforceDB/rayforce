@@ -73,7 +73,7 @@ Listed from `src/lang/eval.c` in this checkout. The categorized reference below 
 `.sys.env`, `.sys.args`, `.sys.exec`, `.idx.info`, `.ipc.send`, `.ipc.open`, `.ipc.handle`, `.ipc.handles`, `.ipc.transport`, `.repl.disconnect`, `.log.open`, `.log.roll`,
 `.log.snapshot`, `.log.status`, `.log.posts`, `.log.sync`, `.log.close`, `.log.purge`, `quote`, `return`, `.time.now`, `.time.timer.set`,
 `fold-left`, `fold-while`, `fold-right`, `scan-left`, `scan-right`, `del`, `.sys.build`, `.sys.mem`, `.sys.prof`,
-`.sys.querylog`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
+`.sys.querylog`, `.sys.querylog.stats`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile`, `.sys.profile.enable`, `.sys.profile.reset`, `modify`, `pivot`, `.sys.info`, `datoms`, `assert-fact`,
 `retract-fact`, `scan-eav`, `pull`, `rule`, `query`, `dl-program`, `dl-add-edb`, `.emb.knn`, `.emb.hnsw.build`, `.emb.ann`, `.emb.encode`,
 `.graph.build`, `.graph.pagerank`, `.graph.connected`, `.graph.dijkstra`, `.graph.louvain`, `.graph.degree`,
 `.graph.topsort`, `.graph.dfs`, `.graph.cluster`, `.graph.betweenness`, `.graph.closeness`, `.graph.mst`,
@@ -751,7 +751,8 @@ System interaction, metaprogramming, diagnostics, and runtime inspection.
 | `.sys.profile` | nullary | — | Per-call-site profile of Rayfall code as a table (opt-in via `.sys.profile.enable`) | `(.sys.profile)` |
 | `.sys.profile.enable` | variadic | restricted | Toggle the call profiler; returns new state | `(.sys.profile.enable 1)` |
 | `.sys.profile.reset` | nullary | restricted | Drop the call profiler's rows | `(.sys.profile.reset)` |
-| `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`) | `(.sys.querylog)` |
+| `.sys.querylog` | variadic | — | Ambient per-query statistics ring as a table (opt-in via `-Q` / `.sys.querylog.enable`); a `seq` column numbers every logged query from 1, and `(.sys.querylog n)` answers only the rows with `seq >= n` | `(.sys.querylog)`, `(.sys.querylog 4200)` |
+| `.sys.querylog.stats` | variadic | — | The query-statistics ring's counters: `next` seq, rows `dropped` by the wrap, `capacity` | `(.sys.querylog.stats)` |
 | `.sys.querylog.enable` | variadic | restricted | Toggle query-statistics logging; returns new state | `(.sys.querylog.enable 1)` |
 | `.sys.join.par.min` | variadic | restricted | Read or set the probe-side rows from which a hash join's probe goes parallel; returns the value in effect | `(.sys.join.par.min 65536)` |
 | `.sys.info` | nullary | — | Host and process info (cores, page size, total memory, pid, hostname) | `(.sys.info)` |

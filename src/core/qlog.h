@@ -16,6 +16,11 @@
  *   the single-threaded eval boundary — an O(1) struct write into the ring, no
  *   allocation, no per-row work.  The ring needs no lock because only the eval
  *   thread writes it.
+ *
+ *   Every row carries `seq`, its number among all rows logged since start
+ *   (#1159).  The slot and the number are claimed in one step, an atomic add
+ *   on `logged`, so the numbers are gap-free and strictly increasing however
+ *   many writers there are; a reader asks for the rows from a number on.
  */
 
 #ifndef RAY_QLOG_H
@@ -38,6 +43,7 @@
 /* One completed query's summary.  POD, fixed size — written by value into the
  * ring, so no ownership or lifetime concerns. */
 typedef struct {
+    int64_t  seq;           /* 1 for the first row logged since start, +1 each */
     int64_t  time_ns;       /* wall-clock finish time (RAY_TIMESTAMP units)  */
     double   duration_ms;   /* total wall time                               */
     int64_t  result_rows;   /* rows in the result (atom => 1)                */
@@ -52,8 +58,8 @@ typedef struct {
 
 typedef struct {
     _Atomic(uint8_t) enabled;   /* dedicated switch, default 0               */
-    uint32_t         head;      /* next write index (mod CAP)                */
-    uint32_t         count;     /* rows written, saturates at CAP            */
+    _Atomic(uint64_t) logged;   /* rows ever logged: the last row's seq; its
+                                 * slot is (seq - 1) mod CAP                 */
     ray_qlog_row_t   slot[RAY_QLOG_CAP];
 } ray_qlog_t;
 
@@ -84,6 +90,9 @@ void ray_qlog_end(ray_qlog_ctx_t* c, const char* src, size_t src_len,
 
 /* Materialize the ring into a fresh table (oldest row first).  Returns an
  * empty, well-formed table when the ring is empty. */
-ray_t* ray_qlog_table(void);
+/* The kept rows with seq >= from (every kept row for from <= 1), oldest
+ * first, as a table; and {next dropped capacity}. */
+ray_t* ray_qlog_table(int64_t from);
+ray_t* ray_qlog_stats(void);
 
 #endif /* RAY_QLOG_H */
