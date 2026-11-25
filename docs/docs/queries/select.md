@@ -495,8 +495,14 @@ of a LIST column, is one cell: `(first l)` over `(list (list 1) …)` is
 `(sum (at c [3 2 1 0]))` is the sum of the kept rows at those indexes. A scalar the argument gives stands for every row on
 every keyless route, as `1` does in `(sum 1)`: `(sum (count v))` over four rows
 is `16` whether or not another output is declined, and over a `where:` that
-keeps no row `(max (count v))` is `0Nl`, the empty column's. A scalar a
-helper with several statements returns is folded once (#1576).
+keeps no row `(max (count v))` is `0Nl`, the empty column's. So does a
+scalar that a helper the planner does not inline returns, here and under
+`by:`, where it stands for each row of the group: with `hq` giving the
+count of its argument in two statements, `(sum (hq v))` over the same four
+rows is `16`, `9` over a `where:` keeping three, and under `by:` each
+group's count times its rows ([#1576](https://github.com/RayforceDB/rayforce/issues/1576)).
+`update` folds such a scalar once, as it does an inline or bound one
+([#1682](https://github.com/RayforceDB/rayforce/issues/1682)).
 
 A vector written as a value — a literal, a global holding one, a global a
 single-expression helper reads, or a bound value: a lambda parameter or a
