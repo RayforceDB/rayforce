@@ -3159,8 +3159,10 @@ typedef struct {
     ray_sock_t   lfd;
     uint16_t     port;
     bool         drain;     /* false: never read past the handshake */
-    volatile int saw_eof;
-    volatile int gave_up;   /* !drain: the client's send is over, read on */
+    /* Shared with the peer thread, so atomics: a volatile int orders
+     * nothing between threads (#1675). */
+    _Atomic int  saw_eof;
+    _Atomic int  gave_up;   /* !drain: the client's send is over, read on */
     ray_thread_t tid;
 } silent_peer_t;
 
@@ -3177,13 +3179,14 @@ static void silent_peer_thread(void* arg) {
         send((int)c, resp, 2, 0);
         /* window fills meanwhile; read on once the send gave up (1.5 s at most) */
         if (!p->drain)
-            for (int i = 0; i < 150 && !p->gave_up; i++) ray_test_sleep_ms(10);
+            for (int i = 0; i < 150 && !atomic_load_explicit(&p->gave_up, memory_order_acquire); i++)
+                ray_test_sleep_ms(10);
         uint8_t buf[65536];
         for (;;) {
             ssize_t n = recv((int)c, buf, sizeof(buf), 0);
-            if (n == 0) { p->saw_eof = 1; break; }
+            if (n == 0) { atomic_store_explicit(&p->saw_eof, 1, memory_order_release); break; }
             if (n < 0) {
-                if (errno == ECONNRESET) p->saw_eof = 1;
+                if (errno == ECONNRESET) atomic_store_explicit(&p->saw_eof, 1, memory_order_release);
                 break;
             }
         }
@@ -3244,7 +3247,7 @@ static test_result_t test_ipc_send_deadline_expires(void) {
     if (r) ray_release(r);
 
     silent_peer_stop(&peer);
-    TEST_ASSERT_EQ_I(peer.saw_eof, 1);           /* our end really closed */
+    TEST_ASSERT_EQ_I(atomic_load_explicit(&peer.saw_eof, memory_order_acquire), 1);  /* our end really closed */
     PASS();
 }
 
@@ -3267,7 +3270,7 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     int64_t t0 = ray_time_now_ms();
     ray_t* r = ray_ipc_send_timeout(h, big, 300);
     int64_t took = ray_time_now_ms() - t0;
-    peer.gave_up = 1;
+    atomic_store_explicit(&peer.gave_up, 1, memory_order_release);
     ray_release(big);
     TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(ray_err_from_obj(r), RAY_ERR_IO);
@@ -3281,7 +3284,7 @@ static test_result_t test_ipc_send_deadline_covers_write(void) {
     ray_release(msg);
 
     silent_peer_stop(&peer);
-    TEST_ASSERT_EQ_I(peer.saw_eof, 1);
+    TEST_ASSERT_EQ_I(atomic_load_explicit(&peer.saw_eof, memory_order_acquire), 1);
     PASS();
 }
 
