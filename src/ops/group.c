@@ -9841,6 +9841,15 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void) {
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter) {
     tl_group_emit_filter = filter;
 }
+static _Thread_local int32_t tl_group_first_seen = -1;
+int32_t ray_group_first_seen_set(int32_t depth) {
+    int32_t prev = tl_group_first_seen;
+    tl_group_first_seen = depth;
+    return prev;
+}
+bool ray_group_first_seen_active(void) {
+    return tl_group_first_seen >= 0 && (!__VM || __VM->eval_depth == tl_group_first_seen);
+}
 ray_group_emit_filter_t ray_group_emit_filter_active(void) {
     ray_group_emit_filter_t f = ray_group_emit_filter_get();
     if (!f.enabled) return f;
@@ -23227,7 +23236,11 @@ static bool pp_var_fold(ray_t* mt, uint32_t n_keys, uint32_t n_std, const uint8_
                 continue;
             }
             double vp = x[3] / x[0];
-            K[r] = x[1]; D[r] = x[2]; V[r] = vp < 0 ? 0 : vp;
+            K[r] = x[1]; D[r] = x[2];
+            /* an intermediate that overflowed is +inf here, a value the
+             * merge's FIRST keeps (a null would read as an absent one), and
+             * the final read makes it 0Nf, never a number (#1669) */
+            V[r] = !isfinite(vp) || !isfinite(x[2]) ? INFINITY : vp < 0 ? 0 : vp;
         }
     }
     scratch_free(st_hdr);

@@ -6,6 +6,8 @@
 ;; row is true and one false on every row is false; one that differs between
 ;; the rows raises `nyi`, since a loop cannot take a different number of
 ;; passes per row (#1630).  The projection runs the helper once per row.
+;; Under by: a helper's scalar (its pass count) stands for each of the
+;; group's 10 rows, so (sum ...) of one pass is 10 (#1576).
 
 (set n 20)
 (set T (table [a i g] (list (at ['x 'y 'z 'w] (% (til n) 4)) (til n) (% (til n) 2))))
@@ -25,8 +27,9 @@
 ;; ── 2. a condition the same on every row is that truth ──
 (at (select {from: T where: (> (Wf i) 15)}) 'i) -- [16 17 18 19]
 (at (select {from: T where: (> (Wt i) 0)}) 'i) -- (til 20)
-;; under by: the helper runs once per group, over its rows: one pass each
-(at (select {s: (sum (Wt i)) from: T by: g}) 's) -- [1 1]
+;; under by: the helper runs once per group, over its rows: one pass each;
+;; its scalar 1 stands for each of the group's 10 rows (#1576)
+(at (select {s: (sum (Wt i)) from: T by: g}) 's) -- [10 10]
 
 ;; ── 3. one row at a time: the projection, and outside a query ──
 (at (select {m: (Wl i) from: T}) 'm) -- [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 -84 -83 -82 -81]
@@ -56,8 +59,9 @@
 ;; true on every row, then false on every row: one pass
 (at (select {from: T where: (> (Wta i) 0)}) 'i) -- (til 20)
 (at (select {from: T where: (> (Wto i) 0)}) 'i) -- (til 20)
-(at (select {s: (sum (Wta i)) from: T by: g}) 's) -- [1 1]
-(at (select {s: (sum (Wto i)) from: T by: g}) 's) -- [1 1]
+;; the scalar 1 stands for each of the group's 10 rows (#1576)
+(at (select {s: (sum (Wta i)) from: T by: g}) 's) -- [10 10]
+(at (select {s: (sum (Wto i)) from: T by: g}) 's) -- [10 10]
 ;; a lambda literal, as a read-only client can send it: its `while` runs on
 ;; the tree walker (ray_while_fn), which tested a vector condition whole too,
 ;; so even a plain condition false on every row never ended
@@ -68,7 +72,7 @@
 (select {from: T where: (> ((fn [v] (let k 0) (while (and (> v 15) true) (let v (- v 100))) v) i) 0)}) !- nyi
 (select {s: (sum ((fn [v] (let k 0) (while (or (> v 15) false) (let v (- v 100))) v) i)) from: T by: g}) !- nyi
 (at (select {from: T where: (> ((fn [v] (let k 0) (let s 0) (while (and (>= v 0) true) (let v (- v 100)) (let s (+ s 1))) s) i) 0)}) 'i) -- (til 20)
-(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (or (>= v 0) false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [1 1]
+(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (or (>= v 0) false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [10 10]
 ;; ── 5. whatever computes the condition (#1647) ──
 ;; Every vector condition as long as the rows is tested, whatever computed
 ;; it: an `if`'s per-row result took its arms' provenance (`true`, `false`),
@@ -83,8 +87,8 @@
 (at (select {s: (sum (Wiff i)) from: T by: g}) 's) -- [90 100]
 (at (select {from: T where: (> ((fn [v] (let k 0) (while (if (< v 0) true false) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
 (at (select {from: T where: (> (Wift i) 0)}) 'i) -- (til 20)
-(at (select {s: (sum (Wift i)) from: T by: g}) 's) -- [1 1]
-(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (if (>= v 0) true false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [1 1]
+(at (select {s: (sum (Wift i)) from: T by: g}) 's) -- [10 10]
+(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (if (>= v 0) true false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [10 10]
 ;; a cast, a `try`, a lambda applied to the condition
 (at (select {from: T where: (> ((fn [v] (let k 0) (while (as 'B8 (< v 0)) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
 (at (select {from: T where: (> ((fn [v] (let k 0) (while (try (< v 0) (fn [e] false)) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]

@@ -1,0 +1,42 @@
+;; @also-unfused
+;; #1576: a scalar that a helper the planner does not inline returns as an
+;; aggregate's argument stands for every row the aggregate reads, as 1 does
+;; in (sum 1), as the same code written inline and a bound scalar do: on the
+;; keyless planned route, the fallback (an output beside one the planner
+;; declines), under where:, and for each group's rows under by:.  It was
+;; folded once.  The helper is given what it was before (#1673).
+(set T (table [k c d s v] (list [0 0 0 0] [1 5 6 2] [2024.01.01 2024.01.02 0Nd 2024.01.04] ['aa 'bb 'cc 'aa] [10 20 30 40])))
+(set T2 (table [k v] (list [0 0 1 1 1] [10 20 30 40 50])))
+(set hq (fn [y] (let q (count y)) q))
+(set hk (fn [y] (let q 1) 7))
+(set C 4)
+
+;; ── keyless: the helper, inline code and a bound scalar agree ──
+(at (select {from: T s: (sum (hq v))}) 's) -- [16]
+(at (select {from: T s: (sum (hq v))}) 's) -- (at (select {from: T s: (sum (count v))}) 's)
+(at (select {from: T s: (sum (hq v))}) 's) -- (at (select {from: T s: (sum C)}) 's)
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [16]
+(at (select {from: T s: (sum (hq v)) where: (> v 15)}) 's) -- [9]
+(at (select {from: T s: (sum (hq v)) where: (> v 15)}) 's) -- (at (select {from: T s: (sum (count v)) where: (> v 15)}) 's)
+(at (select {from: T s: (sum (hq v)) where: (> v 15) z: (first (+ d 0))}) 's) -- [9]
+(at (select {from: T2 s: (sum (hk v))}) 's) -- [35]
+(at (select {from: T s: (count (hq v))}) 's) -- (at (select {from: T s: (count C)}) 's)
+(at (select {from: T s: (sum (+ 1 (hq v)))}) 's) -- (at (select {from: T s: (sum (+ 1 (count v)))}) 's)
+;; values that do not depend on the row count are unchanged
+(at (select {from: T s: (avg (hq v))}) 's) -- [4.0]
+(at (select {from: T s: (max (hq v))}) 's) -- [4]
+(at (select {from: T s: (first (hq v))}) 's) -- [4]
+(at (select {from: T s: (sum (+ v (hq v)))}) 's) -- [116]
+
+;; ── by: the scalar stands for each row of its group ──
+(at (select {from: T by: k s: (sum (hq v))}) 's) -- [16]
+(at (select {from: T2 by: k s: (sum (hq v))}) 's) -- [4 9]
+(at (select {from: T2 by: k s: (sum (hk v))}) 's) -- [14 21]
+(at (select {from: T2 by: k s: (sum (hk v)) where: (> v 15)}) 's) -- [7 21]
+(at (select {from: T2 by: k s: (sum C)}) 's) -- [8 12]
+
+;; ── update is unchanged here: it folds every scalar once, inline and
+;; bound ones included (#1682) ──
+(at (update {from: T n: (sum (hq v))}) 'n) -- [4 4 4 4]
+(at (update {from: T n: (sum (hq v))}) 'n) -- (at (update {from: T n: (sum (count v))}) 'n)
+(at (update {from: T2 by: k n: (sum (hq v))}) 'n) -- [2 2 3 3 3]

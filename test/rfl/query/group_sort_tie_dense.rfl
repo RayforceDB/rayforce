@@ -1,0 +1,44 @@
+;; @requires: posix  (splayed/parted fixtures and a -c 1 / -c 4 rerun through .sys.exec)
+;; A sort after a group breaks ties by each group's first source row
+;; (select.md, Sorting).  Keys close enough for the dense slots used to come
+;; out of the task-local dense kernel in key-value order, so a sorted take:
+;; over tied groups picked other groups than the routes that emit first-seen
+;; order (#1664).  Every group below ties on the sort key.
+(.sys.exec "rm -rf /tmp/rf_test_gstie") -- 0
+(set n 65536)
+(set I (table [k v w] (list (take [2 0Nl -1 0] n) (take [1 2 3 4] n) (take [5] n))))
+;; the issue's shapes: I64 and TIMESTAMP keys, and SYM keys on the same slots
+(at (select {from: I by: k r: (count v) asc: r take: 2}) 'k) -- [2 0Nl]
+(at (select {from: I by: k r: (count v) desc: r take: 3}) 'k) -- [2 0Nl -1]
+(at (select {from: I by: k r: (count v) asc: r}) 'k) -- [2 0Nl -1 0]
+(at (select {from: I by: k r: (sum w) desc: r}) 'k) -- [2 0Nl -1 0]
+(at (select {from: I by: k r: (max w) c: (count v) asc: r take: 1}) 'k) -- [2]
+(at (select {from: I by: k r: (count v) where: (> v 1) asc: r take: 2}) 'k) -- [0Nl -1]
+(set TS (table [t v] (list (as 'TIMESTAMP (take [2 0Nl -1 0] n)) (take [1 2 3 4] n))))
+(as 'I64 (at (select {from: TS by: t r: (count v) asc: r take: 2}) 't)) -- [2 0Nl]
+(set _syms ['gstie_a 'gstie_b 'gstie_c 'gstie_d])   ; interned first: their ids rise a, b, c, d
+(set SY (table [s v] (list (take ['gstie_c 'gstie_a 'gstie_d 'gstie_b] n) (take [1 2 3] n))))
+(at (select {from: SY by: s r: (count v) desc: r}) 's) -- [gstie_c gstie_a gstie_d gstie_b]
+(set D2 (table [k v] (list (take [7 3 9 1 5 3 7 9 1 5] n) (take [1 2 3 4 5] n))))
+(at (select {from: D2 by: k r: (count v) asc: r take: 3}) 'k) -- [7 9 1]
+;; two keys on the dense slots
+(set MK (table [a b v] (list (take [3 1 2 3] n) (take [9 9 8 7] n) (take [1 2 3 4] n))))
+(at (select {from: MK by: [a b] r: (count v) asc: r}) 'a) -- [3 1 2 3]
+(at (select {from: MK by: [a b] r: (count v) asc: r}) 'b) -- [9 9 8 7]
+;; splayed and parted copies answer the same
+(.db.splayed.set "/tmp/rf_test_gstie/s/" I "/tmp/rf_test_gstie/s.sym")
+(.db.splayed.set "/tmp/rf_test_gstie/c/" I "/tmp/rf_test_gstie/c.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_gstie/p/2024.01.01/t/" I "/tmp/rf_test_gstie/p/.sym")
+(.db.splayed.set "/tmp/rf_test_gstie/p/2024.01.02/t/" I "/tmp/rf_test_gstie/p/.sym")
+(set S (.db.splayed.get "/tmp/rf_test_gstie/s/" "/tmp/rf_test_gstie/s.sym"))
+(set C (.db.splayed.get "/tmp/rf_test_gstie/c/" "/tmp/rf_test_gstie/c.sym"))
+(set P (.db.parted.get "/tmp/rf_test_gstie/p/" 't))
+(at (select {from: S by: k r: (count v) asc: r take: 2}) 'k) -- [2 0Nl]
+(at (select {from: C by: k r: (count v) asc: r take: 2}) 'k) -- [2 0Nl]
+(at (select {from: P by: k r: (count v) asc: r take: 2}) 'k) -- [2 0Nl]
+(at (select {from: P by: k r: (sum w) desc: r}) 'k) -- [2 0Nl -1 0]
+;; one and four workers: the dense keys against the same groups with keys
+;; spread past the dense slots (another route), each sorted select compared
+(.sys.exec "printf '%s\n' '(set n 65536)' '(set M 1000000000039)' '(set I (table [k v w] (list (take [2 0Nl -1 0 7 3] n) (take [1 2 3 4] n) (take [5] n))))' '(set J (table [k v w] (list (* M (at I (quote k))) (at I (quote v)) (at I (quote w)))))' '(set same (fn [f] (println (all (== (at (f I) (quote k)) (div (at (f J) (quote k)) M))))))' '(same (fn [t] (select {from: t by: k r: (count v) asc: r})))' '(same (fn [t] (select {from: t by: k r: (count v) desc: r take: 2})))' '(same (fn [t] (select {from: t by: k r: (sum w) asc: r take: 3})))' '(same (fn [t] (select {from: t by: k r: (count v) where: (> v 2) desc: r})))' > /tmp/rf_test_gstie/w.rfl") -- 0
+(.sys.exec "./rayforce -c 1 /tmp/rf_test_gstie/w.rfl </dev/null >/tmp/rf_test_gstie/w1.out 2>&1; ./rayforce -c 4 /tmp/rf_test_gstie/w.rfl </dev/null >/tmp/rf_test_gstie/w4.out 2>&1; [ $(cat /tmp/rf_test_gstie/w1.out /tmp/rf_test_gstie/w4.out | grep -c '^true$') -eq 8 ]") -- 0
+(.sys.exec "rm -rf /tmp/rf_test_gstie") -- 0

@@ -2065,10 +2065,16 @@ static inline double ray_var_final(uint16_t op, int64_t n, double s1, double s2,
         double kd;
         if (k_is_f) memcpy(&kd, &k_bits, sizeof kd); else kd = (double)k_bits;
         if (op == OP_VAR_K) return kd;
-        return (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+        double dv = (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+        *is_null = !isfinite(dv);
+        return dv;
     }
+    /* An intermediate that overflowed (#1669: the sums are doubles) makes
+     * the result null, never a number: only a finite rounding residue
+     * below 0 is taken as 0. */
     double mean = s1 / dn;
-    double vp = s2 / dn - mean * mean;
+    double vp = s2 / dn - mean * mean;   /* an overflowed mean^2 leaves -inf */
+    if (!isfinite(s1) || !isfinite(s2) || !isfinite(vp)) { *is_null = true; return 0.0; }
     if (vp < 0) vp = 0;
     if (op == OP_VAR_POP) return vp;
     if (op == OP_VAR) return vp * dn / (dn - 1);
@@ -2389,6 +2395,14 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void);
  * depth (or no VM is bound); a disabled filter otherwise. */
 ray_group_emit_filter_t ray_group_emit_filter_active(void);
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
+/* A grouped select that sorts its groups (asc:/desc:) arms this for its own
+ * group node: the sort is stable and the group whose first source row comes
+ * first wins a tie, so its input must come in first-seen order on every route
+ * (#1664).  The dense slot routes emit slot (key value) order otherwise.  The
+ * depth is the select's eval depth; -1 disarms.  Returns the previous depth. */
+int32_t ray_group_first_seen_set(int32_t depth);
+/* Whether the calling thread's eval depth is the armed depth. */
+bool ray_group_first_seen_active(void);
 /* Hash-aggregate rows [start, end) into ht.
  *
  * When match_idx is non-NULL, the loop iterates `i` in [start, end)

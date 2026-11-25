@@ -1,0 +1,315 @@
+;; @also-unfused
+;; A helper the planner does not inline (a body of more than one statement),
+;; called in a select projection, whose body reaches a whole-column verb
+;; (distinct where reverse asc desc iasc idesc rank: at the top of a
+;; statement, under a call, in a let's value, in a do's last form, or in a
+;; helper it calls the same way) is called with the whole (kept) column, as
+;; update and by: call it, not once per row (#1654).  Called per row, the verb
+;; saw one cell: reverse, asc and desc returned the column as it was, the
+;; others raised type.  A lambda literal is such a helper too.  Only a verb
+;; applied to the helper's argument (a parameter, or a value derived from one
+;; through lets and calls) counts.  A closure, a verb in an if arm, a verb on
+;; a constant or a global, and a let-bound lambda keep the row-by-row reading.
+
+(set T (table [i g c] (list (til 6) (% (til 6) 2) [3 1 4 1 5 9])))
+(set cnt 0)
+(set Hm2 (fn [v] (let q 1) (+ v q)))
+
+;; ── reverse ──
+(set Hm (fn [v] (let q 1) (reverse v)))
+(set H (fn [v] (let q 1) (reverse v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(set H (fn [v] (let y (reverse v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(set H (fn [v] (set cnt (+ cnt 1)) (reverse v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 1 4]
+;; ── asc ──
+(set Hm (fn [v] (let q 1) (asc v)))
+(set H (fn [v] (let q 1) (asc v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(set H (fn [v] (let y (asc v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(set H (fn [v] (set cnt (+ cnt 1)) (asc v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 1 3 4 5 9]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 4 5 9]
+;; ── desc ──
+(set Hm (fn [v] (let q 1) (desc v)))
+(set H (fn [v] (let q 1) (desc v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(set H (fn [v] (let y (desc v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(set H (fn [v] (set cnt (+ cnt 1)) (desc v)))
+(at (select {v: (H c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [9 5 4 3 1 1]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [9 5 4 1]
+;; ── iasc ──
+(set Hm (fn [v] (let q 1) (iasc v)))
+(set H (fn [v] (let q 1) (iasc v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (let y (iasc v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (set cnt (+ cnt 1)) (iasc v)))
+(at (select {v: (H c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [1 3 0 2 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+;; ── idesc ──
+(set Hm (fn [v] (let q 1) (idesc v)))
+(set H (fn [v] (let q 1) (idesc v)))
+(at (select {v: (H c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(set H (fn [v] (let y (idesc v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(set H (fn [v] (set cnt (+ cnt 1)) (idesc v)))
+(at (select {v: (H c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [5 4 2 0 1 3]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [3 2 0 1]
+;; ── rank ──
+(set Hm (fn [v] (let q 1) (rank v)))
+(set H (fn [v] (let q 1) (rank v)))
+(at (select {v: (H c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (let y (rank v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(set H (fn [v] (set cnt (+ cnt 1)) (rank v)))
+(at (select {v: (H c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) -- [2 0 3 1 4 5]
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [1 0 2 3]
+;; ── distinct ──
+(set Hm (fn [v] (let q 1) (distinct v)))
+(set H (fn [v] (let q 1) (distinct v)))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(set H (fn [v] (let y (distinct v)) y))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(set H (fn [v] (set cnt (+ cnt 1)) (distinct v)))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (H c) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H c) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+(at (select {v: (+ 0 (H c)) from: T}) 'v) -- [3 1 4 5 9]
+(at (select {v: (+ 0 (H c)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H c)) from: T where: (> i 1)}) 'v) -- [4 1 5 9]
+;; ── where ──
+(set Hm (fn [v] (let q 1) (where v)))
+(set H (fn [v] (let q 1) (where v)))
+(at (select {v: (H (> c 2)) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (H (> c 2)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H (> c 2)) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(at (select {v: (+ 0 (H (> c 2))) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (+ 0 (H (> c 2))) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H (> c 2))) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(set H (fn [v] (let y (where v)) y))
+(at (select {v: (H (> c 2)) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (H (> c 2)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H (> c 2)) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(at (select {v: (+ 0 (H (> c 2))) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (+ 0 (H (> c 2))) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H (> c 2))) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(set H (fn [v] (let q 1) (Hm v)))
+(at (select {v: (H (> c 2)) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (H (> c 2)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H (> c 2)) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(at (select {v: (+ 0 (H (> c 2))) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (+ 0 (H (> c 2))) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H (> c 2))) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(set H (fn [v] (set cnt (+ cnt 1)) (where v)))
+(at (select {v: (H (> c 2)) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (H (> c 2)) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (H (> c 2)) from: T where: (> i 1)}) 'v) -- [0 2 3]
+(at (select {v: (+ 0 (H (> c 2))) from: T}) 'v) -- [0 2 4 5]
+(at (select {v: (+ 0 (H (> c 2))) w: (Hm2 c) from: T}) 'v) !- length
+(at (select {v: (+ 0 (H (> c 2))) from: T where: (> i 1)}) 'v) -- [0 2 3]
+
+;; the effect in the helper runs once: it is called once, with the column
+(set H (fn [v] (set cnt (+ cnt 1)) (reverse v)))
+(set cnt 0)
+(at (select {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+cnt -- 1
+;; answers equal update and by: for the same expression
+(at (update {v: (H c) from: T}) 'v) -- [9 5 1 4 1 3]
+(at (select {v: (H c) from: T by: g}) 'v) -- (list [5 4 3] [9 1 1])
+;; unchanged: a closure, and a verb in an if arm, are called per row
+(set H ((fn [z] (fn [v] (let q z) (reverse v))) 1))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 1 5 9]
+(set H (fn [v] (let q 1) (if (> (count v) 0) (reverse v) v)))
+(at (select {v: (H c) from: T}) 'v) -- [3 1 4 1 5 9]
+
+;; a lambda literal of several statements is such a helper too
+(set T2 (table [i b f L] (list (til 4) [5 2 7 1] [2.5 0.5 3.5 1.5] (list [1 2] [3] [4 5 6] [7]))))
+(at (select {v: ((fn [x] (let y 1) (reverse x)) b) from: T2}) 'v) -- [1 7 2 5]
+(at (select {v: ((fn [x] (let y 1) (reverse x)) b) from: T2 where: (> b 1)}) 'v) -- [7 2 5]
+(at (select {v: ((fn [x] (let y 1) (reverse x)) L) from: T2}) 'v) -- (list [7] [4 5 6] [3] [1 2])
+(at (update {v: ((fn [x] (let y 1) (reverse x)) L) from: T2}) 'v) -- (list [7] [4 5 6] [3] [1 2])
+(at (select {v: ((fn [x] (let y 1) (iasc x)) f) from: T2}) 'v) -- [1 3 0 2]
+;; a value derived from the argument through a let
+(at (select {v: ((fn [x] (let y (* x 2)) (reverse y)) b) from: T2}) 'v) -- [2 14 4 10]
+;; a verb applied to a constant or a global does not take the argument: per row
+(at (select {v: ((fn [x] (let k (reverse [1 2])) (count x)) b) from: T2}) 'v) -- [1 1 1 1]
+(set Hk (fn [x] (let k (reverse [1 2])) (count x)))
+(at (select {v: (Hk b) from: T2}) 'v) -- [1 1 1 1]
+(set G [3 1 2])
+(at (select {v: ((fn [x] (let y 1) (+ x (count (reverse G)))) b) from: T2}) 'v) -- [8 5 10 4]
+(set H1 (fn [x] (let y 1) (reverse x)))
+(at (select {v: ((fn [x] (let y 1) (+ x (count (H1 [1 2 3])))) b) from: T2}) 'v) -- [8 5 10 4]
+;; a lambda bound by a let in the projection is not followed: per row
+(at (select {v: (do (let h (fn [x] (let y 1) (reverse x))) (h b)) from: T2}) 'v) -- [5 2 7 1]
+;; (Per-row cases holding a 3-value vector in each cell assert the row
+;; count, 8 here against 3 for a flip: under this runner each such cell comes
+;; back as an error, on dev as well, while a script gives [2 1 3] per row:
+;; #1680)
+;; the latest let of a name decides: a parameter or a derived name rebound
+;; to a constant is no longer the argument, so the helper keeps its per-row
+;; call (one value per row, not the constant reversed once), and one bound
+;; back to a value derived from it is again.  A name rebound where the walk
+;; cannot follow which binding a later statement reads (in a nested do, an
+;; if arm, a call's argument) is not derived from there on: per row, as dev
+(set T3 (table [i b] (list (til 8) [5 2 7 2 9 1 4 6])))
+(count (at (select {v: ((fn [x] (let x [3 1 2]) (reverse x)) b) from: T3}) 'v)) -- 8
+(count (at (select {v: ((fn [x] (let y x) (let y [3 1 2]) (reverse y)) b) from: T3}) 'v)) -- 8
+(set Hr (fn [x] (let x [3 1 2]) (reverse x)))
+(count (at (select {v: (Hr b) from: T3}) 'v)) -- 8
+(at (select {v: ((fn [x] (let y x) (let y [3 1 2]) (let y (* x 2)) (reverse y)) b) from: T3}) 'v) -- [12 8 2 18 4 14 4 10]
+(at (update {v: ((fn [x] (let y x) (let y [3 1 2]) (let y (* x 2)) (reverse y)) b) from: T3}) 'v) -- [12 8 2 18 4 14 4 10]
+(at (select {v: ((fn [x] (let z x) (let x [3 1 2]) (reverse z)) b) from: T3}) 'v) -- [6 4 1 9 2 7 2 5]
+(at (select {v: ((fn [x] (do (let x [3 1 2]) 0) (reverse x)) b) from: T3}) 'v) -- [5 2 7 2 9 1 4 6]
+(count (at (select {v: ((fn [x] (if true (let x [3 1 2]) 0) (reverse x)) b) from: T3}) 'v)) -- 8
+(count (at (select {v: ((fn [x] (let q 1) (do (let x [3 1 2]) (reverse x))) b) from: T3}) 'v)) -- 8
+(at (select {v: ((fn [x] (let y (do (let x 1) x)) (reverse y)) b) from: T3}) 'v) -- [1 1 1 1 1 1 1 1]
+;; a let inside a lambda literal in the body is that lambda's own
+(at (select {v: ((fn [x] (let f (fn [z] (let x 1) z)) (reverse x)) b) from: T3}) 'v) -- [6 4 1 9 2 7 2 5]

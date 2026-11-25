@@ -506,7 +506,9 @@ static void var_i64_merge(void* dd, const void* ss, acc_arena_t* a) {
 }
 static inline double var_i64_varpop(const var_i64_state* st) {
     double n = (double)st->cnt;
-    double vp = (st->sumsq - st->sum*st->sum/n) / n;
+    double vp = (st->sumsq - st->sum*st->sum/n) / n;   /* an overflowed sum^2 leaves -inf */
+    /* an intermediate that overflowed is null, never a number (#1669) */
+    if (!isfinite(st->sum) || !isfinite(st->sumsq) || !isfinite(vp)) return NULL_F64;
     return vp < 0 ? 0 : vp;   /* -0.0 / tiny negative residue */
 }
 static double fin_var_pop_i64_result(const void* s) {
@@ -578,7 +580,9 @@ static void var_f64_merge(void* dd, const void* ss, acc_arena_t* a) {
 }
 static inline double var_f64_varpop(const var_f64_state* st) {
     double n = (double)st->cnt;
-    double vp = (st->sumsq - st->sum*st->sum/n) / n;
+    double vp = (st->sumsq - st->sum*st->sum/n) / n;   /* an overflowed sum^2 leaves -inf */
+    /* an intermediate that overflowed is null, never a number (#1669) */
+    if (!isfinite(st->sum) || !isfinite(st->sumsq) || !isfinite(vp)) return NULL_F64;
     return vp < 0 ? 0 : vp;   /* -0.0 / tiny negative residue */
 }
 static double fin_var_pop_f64_result(const void* s) {
@@ -1950,7 +1954,8 @@ static double fin_var_k_i64_result(const void* s) {
 AGG_SCALAR_FINAL(fin_var_k_i64, double, ray_f64, value != value)
 static double fin_var_d_i64_result(const void* s) {
     const var_i64_state* st = s;
-    return st->cnt <= 0 ? NULL_F64 : ray_var_k_rem(st->k) + st->sum / (double)st->cnt;
+    double d = st->cnt <= 0 ? NULL_F64 : ray_var_k_rem(st->k) + st->sum / (double)st->cnt;
+    return isfinite(d) ? d : NULL_F64;
 }
 AGG_SCALAR_FINAL(fin_var_d_i64, double, ray_f64, value != value)
 static double fin_var_k_f64_result(const void* s) {
@@ -1960,7 +1965,8 @@ static double fin_var_k_f64_result(const void* s) {
 AGG_SCALAR_FINAL(fin_var_k_f64, double, ray_f64, value != value)
 static double fin_var_d_f64_result(const void* s) {
     const var_f64_state* st = s;
-    return st->cnt <= 0 ? NULL_F64 : st->sum / (double)st->cnt;
+    double d = st->cnt <= 0 ? NULL_F64 : st->sum / (double)st->cnt;
+    return isfinite(d) ? d : NULL_F64;
 }
 AGG_SCALAR_FINAL(fin_var_d_f64, double, ray_f64, value != value)
 #define VAR_KD_TABLES(SFX, ST, UPD)                                            \
