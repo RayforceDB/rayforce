@@ -98,7 +98,7 @@ Retaining batches increases memory use.
 ## `.parquet.splayed` { #parquet-splayed }
 
 Convert into a new native directory and return the row count. The optional
-argument is a type vector or `{types: [...] rows: n strict: true compress: true}`. For example,
+argument is a type vector or `{types: [...] rows: n strict: true compress: true reproducible: true}`. For example,
 a source containing an integer ID and text can be imported as:
 
 ```lisp
@@ -177,4 +177,30 @@ count one worker leaves after the partition's row groups. Only the symbol
 file's index (`.sym.ix`) differs between two such imports: it records the
 identity of the symbol file it was written for. A chunk with strings outside
 its dictionary page (a writer's fallback to plain pages once a dictionary grows
-large) still takes its strings in the order the workers reach them.
+large, or a column written without one) takes its strings in the order the
+workers reach them, unless the import passes `reproducible: true`.
+
+With `reproducible: true`, either conversion writes the same files at any
+worker count whatever the encoding. Each such chunk is read once before the
+import's tasks: its strings are interned in the same order (row group by row
+group, column by column, rows in order), and each row's symbol position (4
+bytes a row) is kept for the task that writes the chunk, within a sixty-fourth
+of memory, so the task does not read the chunk's pages again. The order costs
+time and memory where such chunks are large, and the share grows as those
+columns become more of the table's work. On 8,000,000 rows of one or two such
+columns holding 2,000,000 distinct strings, in tables from three to ten
+columns wide, measured against an import without the option:
+- about 1 to 13% more instructions, the most on the narrowest tables;
+- up to about 20% more wall time on one worker, and up to about 10%
+  partitioned on four workers;
+- about 30 to 35% more wall time splayed on four workers;
+- 75 to 300 MB more peak memory.
+
+Imports whose `SYM` chunks are all dictionaries cost the same with or without
+the option. Without the option, or with `false`, an import runs as before at the same
+speed. Any other value is a `domain` error.
+
+```lisp
+(.parquet.parted {types: [I64 SYM SYM] reproducible: true} "events.parquet" "/tmp/events-db" 'events)
+(.parquet.splayed {types: [I64 SYM SYM] reproducible: true} "events.parquet" "/tmp/events")
+```

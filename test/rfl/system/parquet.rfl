@@ -210,6 +210,26 @@
 (select {from: (.parquet.scan {strict: true} "test/data/parquet/strict-collisions-0.parquet") i: i}) !- parquet
 (.parquet.parted {rows: 0} "test/data/parquet/flat-1-v2.parquet" "unused" 'hits) !- parquet
 (.parquet.parted {rows: 1048577} "test/data/parquet/flat-1-v2.parquet" "unused" 'hits) !- parquet
+;; reproducible (#1706): a bool, like compress
+(.parquet.parted {reproducible: 1} "test/data/parquet/flat-1-v2.parquet" "unused" 'hits) !- domain
+(.parquet.splayed {reproducible: 'yes} "test/data/parquet/flat-1-v2.parquet" "unused") !- domain
+(.sys.exec "rm -rf /tmp/rfl_parquet_rep /tmp/rfl_parquet_rep.parquet-partial") -- 0
+(.parquet.parted {rows: 3 reproducible: true} "test/data/parquet/flat-1-v2.parquet" "/tmp/rfl_parquet_rep" 'hits) -- 18
+(count (.db.parted.get "/tmp/rfl_parquet_rep" 'hits)) -- 18
+(.sys.exec "rm -rf /tmp/rfl_parquet_rep") -- 0
+;; the same rows with and without it: PLAIN-only string chunks of three
+;; pages, several partitions a row group
+(.sys.exec "rm -rf /tmp/rfl_pq_rep_a /tmp/rfl_pq_rep_b /tmp/rfl_pq_rep_c /tmp/rfl_pq_rep_d") -- 0
+(.parquet.parted {types: [I32 I64 SYM] rows: 3000 reproducible: true} "test/data/parquet/row-groups.parquet" "/tmp/rfl_pq_rep_a" 'h) -- 44009
+(.parquet.parted {types: [I32 I64 SYM] rows: 3000} "test/data/parquet/row-groups.parquet" "/tmp/rfl_pq_rep_b" 'h) -- 44009
+(set rpa (select {from: (.db.parted.get "/tmp/rfl_pq_rep_a" 'h)}))
+(set rpb (select {from: (.db.parted.get "/tmp/rfl_pq_rep_b" 'h)}))
+(all (== (as 'STR (at rpa 's)) (as 'STR (at rpb 's)))) -- true
+(all (== (at rpa 'y) (at rpb 'y))) -- true
+(.parquet.splayed {types: [I32 I64 SYM] reproducible: true} "test/data/parquet/row-groups.parquet" "/tmp/rfl_pq_rep_c") -- 44009
+(.parquet.splayed {types: [I32 I64 SYM]} "test/data/parquet/row-groups.parquet" "/tmp/rfl_pq_rep_d") -- 44009
+(all (== (as 'STR (at (.db.splayed.get "/tmp/rfl_pq_rep_c") 's)) (as 'STR (at (.db.splayed.get "/tmp/rfl_pq_rep_d") 's)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_pq_rep_a /tmp/rfl_pq_rep_b /tmp/rfl_pq_rep_c /tmp/rfl_pq_rep_d") -- 0
 (.sys.exec "rm -rf /tmp/rfl_parquet_rows /tmp/rfl_parquet_strict /tmp/rfl_parquet_strict.parquet-partial")
 (.parquet.parted {rows: 3} "test/data/parquet/flat-1-v2.parquet" "/tmp/rfl_parquet_rows" 'hits) -- 18
 (count (.db.parted.get "/tmp/rfl_parquet_rows" 'hits)) -- 18

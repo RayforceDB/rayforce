@@ -2959,6 +2959,39 @@ bool ray_sym_domain_intern_batch(ray_sym_domain_t* dom, int64_t n,
     return ok;
 }
 
+bool ray_sym_domain_find_batch64(ray_sym_domain_t* dom, int64_t n,
+                                 const char* const* strs, const size_t* lens,
+                                 const uint64_t* hashes, int64_t* out_pos) {
+    if (!dom || n < 0) return false;
+    if (n == 0) return true;
+    if (dom->kind == DOM_IMPORT) return ray_symimp_find_batch(dom->imp, n, strs, lens, hashes, out_pos);
+    if (dom->kind != DOM_FILE) return false;
+    /* the batch intern's lock-free probe (dom_batch_probe_fn), against the
+     * index there is: none built yet, nothing is looked up */
+    dom_batch_ctx_t b;
+    memset(&b, 0, sizeof(b));
+    dom_lock();
+    if (!dom->buckets) { dom_unlock(); return false; }
+    b.buckets = dom->buckets;
+    b.mask    = dom->bucket_mask;
+    b.atoms   = atomic_load_explicit(&dom->atoms, memory_order_acquire);
+    b.count   = atomic_load_explicit(&dom->count, memory_order_acquire);
+    dom->batch_inflight++;
+    dom_unlock();
+    if (!ray_sym_domain_raw_pin(dom, &b.raw)) b.raw.count = 0;
+    uint32_t h32[1024];
+    for (int64_t o = 0; o < n; o += 1024) {
+        int64_t k = n - o < 1024 ? n - o : 1024;
+        for (int64_t i = 0; i < k; i++) h32[i] = (uint32_t)hashes[o + i];
+        b.strs = strs + o; b.lens = lens + o; b.hashes = h32; b.out_pos = out_pos + o;
+        dom_batch_probe_fn(&b, 0, 0, k);
+    }
+    dom_lock();
+    dom->batch_inflight--;
+    dom_unlock();
+    return true;
+}
+
 bool ray_sym_domain_intern_batch64(ray_sym_domain_t* dom, int64_t n,
                                    const char* const* strs, const size_t* lens,
                                    const uint64_t* hashes, int64_t* out_pos) {

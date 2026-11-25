@@ -813,8 +813,8 @@ Persistent columnar storage — splayed (one file per column) and partitioned ta
 | `.parquet.read` | variadic | restricted | Read a Parquet file into a table; optional projection or options before the path | `(.parquet.read "t.parquet")` |
 | `.parquet.scan` | variadic | restricted | Reusable lazy `select` source over a Parquet file; optional options before the path | `(select {from: (.parquet.scan "t.parquet") where: (> x 0)})` |
 | `.parquet.each` | variadic | restricted | Deliver a Parquet file to a callback in chunks; returns the number of rows delivered | `(.parquet.each "t.parquet" (fn [chunk] ...))` |
-| `.parquet.splayed` | variadic | restricted | Import a Parquet file as a splayed table; returns the row count | `(.parquet.splayed "t.parquet" "db/t")` |
-| `.parquet.parted` | variadic | restricted | Import Parquet files into a partitioned table under a root; returns the row count | `(.parquet.parted "t.parquet" "db" 'trades)` |
+| `.parquet.splayed` | variadic | restricted | Import a Parquet file as a splayed table; returns the row count; optional `{types: [...] strict: bool compress: bool symfile: 'shared/'column reproducible: bool}` | `(.parquet.splayed "t.parquet" "db/t")` |
+| `.parquet.parted` | variadic | restricted | Import Parquet files into a partitioned table under a root; returns the row count; optional `{types: [...] rows: n strict: bool compress: bool reproducible: bool}` | `(.parquet.parted "t.parquet" "db" 'trades)` |
 
 ```lisp
 ; Save and reload a splayed table

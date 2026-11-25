@@ -395,7 +395,9 @@ decoding, and streaming grouped queries remain future work.
 Both `.parquet.splayed [types] path directory` and
 `.parquet.parted [types] path-or-paths root table-name` return the imported row count.
 An options dict in place of the type vector may add `compress: true` for
-compressed (generation-2) column files; `.csv.splayed` and `.csv.parted` take
+compressed (generation-2) column files, and `reproducible: true` for the same
+files at any worker count whatever the strings' encoding (see
+[`.parquet.parted`](../namespaces/parquet.md#parquet-parted)); `.csv.splayed` and `.csv.parted` take
 `{compress: true}` as a leading argument.
 The optional positional type vector has one entry per source column. It accepts
 matching native types, checked signed integer widths, and `SYM` for text. Raw

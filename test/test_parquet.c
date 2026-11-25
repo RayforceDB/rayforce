@@ -2281,21 +2281,33 @@ static test_result_t test_pq_group_slices_order(void) {
     PASS();
 }
 /* One import of src into dest for test_pq_sym_order: kind 0 partitioned a
- * partition a row group, 1 several partitions a group, 2 splayed. */
-static ray_t* pq_sym_order_import(int kind, const char* src, const char* dest, ray_t* types,
-                                  char* msg, size_t cap) {
-    if (kind < 2) return pq_parted_rows(src,dest,kind ? 2500 : 65536,types,msg,cap);
+ * partition a row group, 1 several partitions a group, 2 splayed; with the
+ * reproducible option when asked. */
+static ray_t* pq_sym_order_import_opt(int kind, const char* src, const char* dest, ray_t* types, bool reproducible,
+                                      bool strict, char* msg, size_t cap) {
+    int64_t keys[4]; ray_t* vals = ray_list_new(4); int64_t n = 0;
+    keys[n] = ray_sym_intern("types",5); ray_retain(types); ((ray_t**)ray_data(vals))[n++] = types;
+    if (kind < 2) { keys[n] = ray_sym_intern("rows",4); ((ray_t**)ray_data(vals))[n++] = ray_i64(kind ? 2500 : 65536); }
+    if (reproducible) { keys[n] = ray_sym_intern("reproducible",12); ((ray_t**)ray_data(vals))[n++] = ray_bool(true); }
+    if (strict) { keys[n] = ray_sym_intern("strict",6); ((ray_t**)ray_data(vals))[n++] = ray_bool(true); }
+    vals->len = n;
+    ray_t* opts = ray_dict_new(ray_vec_from_raw(RAY_SYM,keys,n),vals);
     pq_rm_rf(dest);
-    ray_t* r = ray_parquet_splayed_typed(src,dest,types);
+    ray_t* r = kind < 2 ? ray_parquet_parted_typed(src,dest,"t",opts) : ray_parquet_splayed_typed(src,dest,opts);
+    ray_release(opts);
     snprintf(msg,cap,"%s",r && RAY_IS_ERR(r) ? ray_error_msg() : "");
     return r;
 }
-/* #1681: two symbol columns of dictionary chunks share the import's symbol
- * file, over row groups the pool decodes at once; at any worker count the
- * symbol file and the symbol counts in the columns' headers are the
- * one-worker import's, byte for byte, run after run, partitioned (a
- * partition a group, and several a group) and splayed. */
-static test_result_t test_pq_sym_order(void) {
+static ray_t* pq_sym_order_import(int kind, const char* src, const char* dest, ray_t* types, bool reproducible,
+                                  char* msg, size_t cap) {
+    return pq_sym_order_import_opt(kind,src,dest,types,reproducible,false,msg,cap);
+}
+/* An import of two symbol columns sharing the symbol file (pq_synth_dict:
+ * those written as dictionaries, the others PLAIN), over row groups the
+ * pool decodes at once, at 1 worker, then 20 times at 2, 4 and 16: every
+ * tree the one-worker tree, byte for byte, partitioned (a partition a
+ * group, and several a group) and splayed. */
+static bool pq_sym_order_run(unsigned dict, bool reproducible) {
     char path[160], a[160], b[160], part[200], msg[512];
     snprintf(path,sizeof(path),"/tmp/rayforce-pq-symorder-%d.parquet",(int)getpid());
     snprintf(a,sizeof(a),"/tmp/rayforce-pq-symorder-%d",(int)getpid());
@@ -2303,31 +2315,68 @@ static test_result_t test_pq_sym_order(void) {
     snprintf(part,sizeof(part),"%s.parquet-partial",a);
     int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
     ray_t* syms = ray_vec_from_raw(RAY_SYM,ids,3);
-    pq_synth_dict = 6;   /* s and t dictionaries */
-    TEST_ASSERT_TRUE(pq_synth(path,24000,4,pq_synth_mixed));
+    pq_synth_dict = dict;
+    bool made = pq_synth(path,24000,4,pq_synth_mixed);
     pq_synth_dict = 0;
     static const int workers[] = {2,4,16};
-    bool same = true;
+    bool same = made;
     for (int kind = 0; same && kind < 3; kind++) {
         pq_rm_rf(b); pq_rm_rf(part);
-        TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
-        ray_t* r = pq_sym_order_import(kind,path,a,syms,msg,sizeof(msg));
-        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,24000); ray_release(r);
-        TEST_ASSERT_EQ_I(rename(a,b),0);
+        ray_t* r = pq_pool(1) == RAY_OK ? pq_sym_order_import(kind,path,a,syms,reproducible,msg,sizeof(msg)) : NULL;
+        same = r && !RAY_IS_ERR(r) && r->i64 == 24000 && rename(a,b) == 0;
+        if (!same) fprintf(stderr,"  import %d at 1 worker: %s\n",kind,msg);
+        if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
         for (size_t w = 0; same && w < sizeof(workers)/sizeof(*workers); w++) {
-            TEST_ASSERT_EQ_I(pq_pool(workers[w]), RAY_OK);
+            same = pq_pool(workers[w]) == RAY_OK;
             for (int k = 0; same && k < 20; k++) {
-                r = pq_sym_order_import(kind,path,a,syms,msg,sizeof(msg));
-                TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,24000); ray_release(r);
-                same = pq_same_tree(a,b);
-                if (!same) fprintf(stderr,"  import %d differs at %d workers, run %d\n",kind,workers[w],k);
+                r = pq_sym_order_import(kind,path,a,syms,reproducible,msg,sizeof(msg));
+                same = r && !RAY_IS_ERR(r) && r->i64 == 24000 && pq_same_tree(a,b);
+                if (!same) fprintf(stderr,"  import %d differs at %d workers, run %d%s%s\n",kind,workers[w],k,*msg ? ": " : "",msg);
+                if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
                 pq_rm_rf(a);
             }
         }
     }
     pq_rm_rf(a); pq_rm_rf(b); pq_rm_rf(part); unlink(path); ray_release(syms);
     ray_pool_destroy();
-    TEST_ASSERT_TRUE(same);
+    return same;
+}
+/* #1681: two symbol columns of dictionary chunks: the same files at any
+ * worker count, without an option. */
+static test_result_t test_pq_sym_order(void) {
+    TEST_ASSERT_TRUE(pq_sym_order_run(6,false));   /* s and t dictionaries */
+    PASS();
+}
+/* #1706: one of them PLAIN (s), the other a dictionary (t), with the
+ * reproducible option: the same files at any worker count.  And under
+ * strict: true, whose checks the seeding makes as the decoder does (the
+ * rows' "" in s's PLAIN pages, t's dictionary entry ""), the import fails
+ * with the words it fails with without the option. */
+static test_result_t test_pq_sym_order_plain(void) {
+    TEST_ASSERT_TRUE(pq_sym_order_run(4,true));
+    char path[160], dest[160], m0[512], m1[512];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-symstrict-%d.parquet",(int)getpid());
+    snprintf(dest,sizeof(dest),"/tmp/rayforce-pq-symstrict-%d",(int)getpid());
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
+    ray_t* syms = ray_vec_from_raw(RAY_SYM,ids,3);
+    pq_synth_dict = 4;
+    bool made = pq_synth(path,24000,4,pq_synth_mixed);
+    pq_synth_dict = 0;
+    TEST_ASSERT_TRUE(made);
+    TEST_ASSERT_EQ_I(pq_pool(4), RAY_OK);
+    for (int kind = 0; kind < 3; kind++) {
+        ray_t* r0 = pq_sym_order_import_opt(kind,path,dest,syms,false,true,m0,sizeof(m0));
+        bool e0 = r0 && RAY_IS_ERR(r0);
+        if (r0) { if (e0) ray_error_free(r0); else ray_release(r0); }
+        char part[200]; snprintf(part,sizeof(part),"%s.parquet-partial",dest); pq_rm_rf(part);
+        ray_t* r1 = pq_sym_order_import_opt(kind,path,dest,syms,true,true,m1,sizeof(m1));
+        bool e1 = r1 && RAY_IS_ERR(r1);
+        if (r1) { if (e1) ray_error_free(r1); else ray_release(r1); }
+        pq_rm_rf(part); pq_rm_rf(dest);
+        if (!e0 || !e1 || strcmp(m0,m1)) fprintf(stderr,"  strict import %d: '%s' vs '%s'\n",kind,m0,m1);
+        TEST_ASSERT_TRUE(e0 && e1 && !strcmp(m0,m1));
+    }
+    unlink(path); ray_release(syms); ray_pool_destroy();
     PASS();
 }
 /* #1206: a row group of many partitions is written by several tasks, each a
@@ -5841,6 +5890,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/group_slices",test_pq_group_slices,pq_setup,pq_teardown},
     {"parquet/group_slices_order",test_pq_group_slices_order,pq_setup,pq_teardown},
     {"parquet/sym_order",test_pq_sym_order,pq_setup,pq_teardown},
+    {"parquet/sym_order_plain",test_pq_sym_order_plain,pq_setup,pq_teardown},
     {"parquet/parted_many_files",test_pq_parted_many_files,pq_setup,pq_teardown},
     {"parquet/parted_pack_error",test_pq_parted_pack_error,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
