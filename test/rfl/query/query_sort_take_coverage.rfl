@@ -332,11 +332,13 @@
 (select {c: (count x) by: (+ nosuch 1) from: Trk}) !- schema
 (select {c: (count x) by: (reverse nosuch) from: Trk where: (> x 1)}) !- schema
 (select {c: (count x) by: (nosuchfn x) from: Trk}) !- name
-;; a name the key binds itself, by let or set in a do, is no column; a key
-;; that binds names is left to the evaluator, which reports any unknown one
+;; a name the key binds itself, by let or set in a do, is no column: the
+;; do's earlier forms run first, once, and its last form is then planned as
+;; if it stood alone, so an unknown column in it reads as schema, as above,
+;; and a name read before the form that binds it is unknown (#1650)
 (value (select {c: (count x) by: (do (let qk x) (reverse qk)) from: Trk})) -- (value (select {c: (count x) by: (reverse x) from: Trk}))
 (at (select {c: (count x) by: (do (set qkg x) (reverse qkg)) from: Trk}) (quote c)) -- [2 2 1 1]
-(select {c: (count x) by: (do (let qk x) (reverse nosuch)) from: Trk}) !- name
+(select {c: (count x) by: (do (let qk x) (reverse nosuch)) from: Trk}) !- schema
 (select {c: (count x) by: (do (reverse qk2) (let qk2 x)) from: Trk}) !- name
 ;; a name bound inside nested forms, by set or let in a do, an if, or
 ;; through a binder called by another name, is the evaluator's to resolve:
