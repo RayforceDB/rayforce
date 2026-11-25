@@ -974,6 +974,16 @@ void ray_heap_test_pool_growth(uint32_t max_pools, uint32_t grow_every, uint32_t
     atomic_store_explicit(&g_pool_grow_every, grow_every ? grow_every : HEAP_POOL_GROW_EVERY, memory_order_relaxed);
     atomic_store_explicit(&g_pool_grow_max, grow_max == UINT32_MAX ? HEAP_POOL_GROW_MAX : grow_max, memory_order_relaxed);
 }
+static _Atomic(uint32_t) g_pool_refuse_over = 0;   /* 0: off */
+void ray_heap_test_pool_refuse(uint8_t max_order) {
+    atomic_store_explicit(&g_pool_refuse_over, max_order, memory_order_relaxed);
+}
+static bool heap_pool_refused_for_test(uint8_t pool_order) {
+    uint32_t max = atomic_load_explicit(&g_pool_refuse_over, memory_order_relaxed);
+    return max && pool_order > max;
+}
+#else
+#define heap_pool_refused_for_test(pool_order) ((void)(pool_order), false)
 #endif
 /* The order of the pool a heap of pool_count pools adds for a block of
  * `order`: a block of a pool's own order or more takes a pool one order
@@ -1010,12 +1020,14 @@ retry:
      * can't be OOM-killed.  Otherwise take the fast anon path (and still fall
      * back to a spill file below if the kernel refuses the mapping). */
     over = heap_anon_would_exceed(pool_size);
+    if (heap_pool_refused_for_test(pool_order)) goto refused;
     if (!over)
         mem = ray_vm_alloc_aligned(pool_size, pool_size);
 
 #if !RAY_HEAP_FILE_SPILL
     /* No spill files here: past the watermark the pool comes from RAM. */
     if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
+refused:
     if (!mem && grown) {
         grown = false;
         pool_order = RAY_HEAP_POOL_ORDER;
@@ -1132,6 +1144,7 @@ retry:
     /* No spill file (no writable spill directory, disk full): RAM past the
      * watermark rather than failing the allocation. */
     if (!mem && over) mem = ray_vm_alloc_aligned(pool_size, pool_size);
+refused:
     if (!mem && grown) {
         grown = false;
         pool_order = RAY_HEAP_POOL_ORDER;

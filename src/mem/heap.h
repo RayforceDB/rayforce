@@ -199,6 +199,10 @@ void ray_alloc_fail_set_for_test(int64_t nth, int64_t count);
  * doublings (UINT32_MAX: the default; 0: standard pools only, the old
  * ceiling).  See heap_add_pool. */
 void ray_heap_test_pool_growth(uint32_t max_pools, uint32_t grow_every, uint32_t grow_max);
+/* Test seam: a pool of an order above `max_order` is refused by RAM and
+ * spill file alike, as on a box with room for neither (0 disarms).
+ * Disarmed by ray_test_hooks_off. */
+void ray_heap_test_pool_refuse(uint8_t max_order);
 #endif
 
 /* ===== Memory Statistics ===== */

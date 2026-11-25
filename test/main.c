@@ -1051,6 +1051,7 @@ void ray_test_hooks_off(void) {
     ray_pool_test_ring_fail(0);
     ray_pool_test_cancel_at(0, false);
     ray_heap_test_scribble(false);
+    ray_heap_test_pool_refuse(0);
     ray_file_writeback_test_hold(false);
     ray_file_writeback_test_fail(false);
     ray_sym_domain_test_hook(NULL);
