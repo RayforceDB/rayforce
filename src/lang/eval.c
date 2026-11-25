@@ -1516,9 +1516,9 @@ static ray_t* fastmap_minmax(bool is_min, ray_t* a, ray_t* b) {
             int64_t x = fastmap_side_i64(&sa, i, &na);
             int64_t y = fastmap_side_i64(&sb, i, &nb);
             /* null orders lowest; a saturated date orders like its bound */
-            int64_t kx = na ? INT64_MIN : date ? fastmap_date_key(x) : x;
-            int64_t ky = nb ? INT64_MIN : date ? fastmap_date_key(y) : y;
-            bool pick_a = is_min ? kx <= ky : kx >= ky;
+            int64_t key_x = na ? INT64_MIN : date ? fastmap_date_key(x) : x;
+            int64_t key_y = nb ? INT64_MIN : date ? fastmap_date_key(y) : y;
+            bool pick_a = is_min ? key_x <= key_y : key_x >= key_y;
             bool nv = pick_a ? na : nb;
             fastmap_write_i64(dst, ot, i, pick_a ? x : y, nv);
             any_null |= nv;
