@@ -1260,6 +1260,11 @@ bool ray_ipc_request_peer_gone(void)
            ray_sock_peer_closed((ray_sock_t)fd) == 1;
 }
 
+void ray_ipc_cancel_active_fd_for_test(int fd)
+{
+    g_ipc_active_fd = fd;
+}
+
 void ray_ipc_cancel_state_reset_for_test(void)
 {
     ray_cancel_state_reset_for_test();
@@ -1285,15 +1290,25 @@ static bool oob_cancel_for(int fd, int want, volatile sig_atomic_t* taken)
 #ifndef RAY_OS_WINDOWS   /* no SIGURG on Windows: OOB cancel is POSIX-only */
 static void ipc_sigurg_handler(int sig)
 {
+    /* The recv(MSG_OOB) below sets errno whenever there is no byte to take
+     * (EWOULDBLOCK, EINVAL), and the handler runs in the middle of whatever
+     * the interrupted thread was doing: a read of errno after a failed call
+     * of its own would see the handler's instead.  Saved first and given
+     * back on every way out. */
+    int saved_errno = errno;
     (void)sig;
     int fd = g_ipc_active_fd;
-    if (fd < 0) return;   /* nothing running — a queued client's cancel is
+    if (fd < 0) {         /* nothing running — a queued client's cancel is
                            * honored when its own request is dispatched */
+        errno = saved_errno;
+        return;
+    }
     /* Cancel ONLY if the urgent byte is on the RUNNING query's connection.
      * OOB from any OTHER (queued) client must not touch this query; that byte
      * stays pending on its socket and is honored when that client runs. */
     if (oob_cancel_for(fd, g_ipc_active_seq, &g_ipc_oob_taken))
         ray_cancel_request();
+    errno = saved_errno;
 }
 #endif
 

@@ -4367,6 +4367,51 @@ static test_result_t test_ipc_cancel_scoped_client_ctrl_c(void) {
 #endif
 }
 
+/* ---- the SIGURG handler leaves errno as it found it ----------------------
+ * The handler runs on whatever thread SIGURG lands on, between two of its
+ * instructions.  Its recv(MSG_OOB) fails whenever there is no urgent byte
+ * to take, and a failing call sets errno: unless the handler gives errno
+ * back, the interrupted code reads the handler's error after a failed call
+ * of its own (an EAGAIN turned into EINVAL, a retry loop that gives up).
+ * Deterministic: the signal is raised on this thread, which runs the
+ * handler before raise returns, with the connection under evaluation
+ * named as a pipe, where recv always fails (ENOTSOCK). */
+static test_result_t test_ipc_sigurg_keeps_errno(void) {
+#if !defined(RAY_OS_WINDOWS)
+    ray_poll_t* poll = ray_poll_create();
+    TEST_ASSERT_NOT_NULL(poll);
+    int64_t lid = ray_ipc_listen(poll, 0);            /* installs the handler */
+    int fds[2];
+    int piped = pipe(fds);
+    if (lid < 0 || piped != 0) {
+        if (piped == 0) { close(fds[0]); close(fds[1]); }
+        ray_poll_destroy(poll);
+        TEST_ASSERT(lid >= 0 && piped == 0, "listener and pipe");
+    }
+    sigset_t urg, old;
+    sigemptyset(&urg);
+    sigaddset(&urg, SIGURG);
+    pthread_sigmask(SIG_UNBLOCK, &urg, &old);
+    ray_clear_interrupt();
+    ray_ipc_cancel_active_fd_for_test(fds[0]);
+    errno = EDOM;
+    int rr = raise(SIGURG);
+    int seen = errno;
+    ray_ipc_cancel_state_reset_for_test();
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    bool cancelled = ray_interrupted();
+    ray_clear_interrupt();
+    close(fds[0]); close(fds[1]);
+    ray_poll_destroy(poll);
+    TEST_ASSERT_EQ_I(rr, 0);
+    TEST_ASSERT_FMT(seen == EDOM, "errno after the handler: %d (%s), not EDOM", seen, strerror(seen));
+    TEST_ASSERT(!cancelled, "no byte taken, so nothing cancelled");
+    PASS();
+#else
+    SKIP("no SIGURG on Windows");
+#endif
+}
+
 /* The same byte mid-query on a moved connection cancels that query (the
  * server's SIGURG takes it), and the link answers the next one.  The
  * server is its own process, as a client's would be: in one process the
@@ -4766,6 +4811,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/time_sleep_cancel_urg_blocked", test_ipc_time_sleep_cancel_urg_blocked, ipc_setup, ipc_teardown },
     { "ipc/cancel_scoped_server_request", test_ipc_cancel_scoped_server_request, ipc_setup, ipc_teardown },
     { "ipc/cancel_scoped_client_ctrl_c",  test_ipc_cancel_scoped_client_ctrl_c,  ipc_setup, ipc_teardown },
+    { "ipc/sigurg_keeps_errno",         test_ipc_sigurg_keeps_errno,             ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
