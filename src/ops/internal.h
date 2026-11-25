@@ -1769,6 +1769,10 @@ void ray_group_test_fail_scalar_alloc(int fail);
  * Disarmed by ray_test_hooks_off. */
 void ray_distinct_guid_test_fail_alloc(int64_t nth);
 void ray_distinct_guid_test_table_cap(int64_t slots);
+/* Test hook (C tests only): fail the nth slot table of the parallel
+ * per-group count distinct's partitions, in the order the workers take
+ * them (0 = off).  Disarmed by ray_test_hooks_off. */
+void ray_cdpg_test_fail_slots(int64_t nth);
 /* Test hook (C tests only): the scalar route's chunk walk (scalar_chunk_fn)
  * runs serially in tasks of `rows` rows, any cut (as ray_pool_dispatch's
  * grain after its ring clamp); 0 dispatches as usual.  Disarmed by

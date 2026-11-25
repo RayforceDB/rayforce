@@ -2331,6 +2331,107 @@ static test_result_t test_eval_distinct_guid_cancel(void) {
     PASS();
 }
 
+/* Fill u[k] (k in [0, n)) with the column `col` of a by-k table; false if
+ * the result is no table or has a short or odd shape. */
+static bool cdpg_counts_by_k(ray_t* r, const char* col, int64_t* u, int64_t n) {
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE || ray_table_nrows(r) != n) return false;
+    ray_t* kc = ray_table_get_col(r, ray_sym_intern("k", 1));
+    ray_t* uc = ray_table_get_col(r, ray_sym_intern(col, strlen(col)));
+    if (!kc || !uc || kc->type != RAY_I64 || uc->type != RAY_I64) return false;
+    const int64_t* kd = (const int64_t*)ray_data(kc);
+    const int64_t* ud = (const int64_t*)ray_data(uc);
+    for (int64_t i = 0; i < n; i++) {
+        if (kd[i] < 0 || kd[i] >= n) return false;
+        u[kd[i]] = ud[i];
+    }
+    return true;
+}
+
+/* ---- Test: a count distinct partition short of memory answers "oom" ----
+ * The per-group count distinct deduplicates in partitions, each in its own
+ * slot table.  Fail the first, then the last, partition's table: the query
+ * answers "oom", never a table whose counts are short.  Disarmed, it answers
+ * the counts of the two-pass form.  A where: keeps the select off the fused
+ * single-key kernel, and the route is forced to the slices. */
+static test_result_t test_eval_cd_group_partition_oom(void) {
+    if (!ray_pool_get() || ray_pool_total_workers(ray_pool_get()) < 2)
+        SKIP("no pool to dispatch to");
+    enum { NG = 100000 };   /* above the 50000 groups the per-group slices take */
+    ray_t* t = ray_eval_str("(set _ct (table [k x] (list (% (til 300000) 100000) (% (* (til 300000) 7919) 1000003))))");
+    TEST_ASSERT_TRUE(t && !RAY_IS_ERR(t));
+    ray_release(t);
+    static int64_t want[NG], got[NG];
+    ray_t* o = ray_eval_str("(select {from: (select {from: _ct where: (>= x 0) by: [k x] c: (count x)}) by: k u: (count c)})");
+    TEST_ASSERT_TRUE(cdpg_counts_by_k(o, "u", want, NG));
+    ray_release(o);
+    /* 300000 rows: 64 partitions, each holding some of the groups */
+    const int64_t nths[] = { 1, 64 };
+    for (size_t c = 0; c < sizeof(nths) / sizeof(nths[0]); c++) {
+        long long nth = (long long)nths[c];
+        ray_query_test_cd_route(2);   /* the slices, where the kernel runs */
+        ray_cdpg_test_fail_slots(nths[c]);
+        ray_t* r = ray_eval_str("(select {from: _ct where: (>= x 0) by: k u: (count (distinct x))})");
+        ray_cdpg_test_fail_slots(0);
+        ray_query_test_cd_route(0);
+        bool is_oom = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0;
+        bool is_table = r && !RAY_IS_ERR(r) && r->type == RAY_TABLE;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r);
+        else if (r) ray_release(r);
+        ray_error_clear();
+        TEST_ASSERT_FMT(!is_table, "nth %lld: answered a table", nth);
+        TEST_ASSERT_FMT(is_oom, "nth %lld: not an oom error", nth);
+    }
+    o = ray_eval_str("(select {from: _ct where: (>= x 0) by: k u: (count (distinct x))})");
+    TEST_ASSERT_TRUE(cdpg_counts_by_k(o, "u", got, NG));
+    ray_release(o);
+    for (int64_t i = 0; i < NG; i++)
+        TEST_ASSERT_FMT(got[i] == want[i] && want[i] > 0, "key %lld: %lld, want %lld",
+                        (long long)i, (long long)got[i], (long long)want[i]);
+
+    /* Few groups, at 4 workers: the per-value mode, whose partition table
+     * starts small and grows.  A column of 300 values that turns into one
+     * of 60000 halfway makes every partition grow more than once; failing
+     * the nth table for each nth of 1..128 — a partition's first table or
+     * one of its growths — answers "oom", never a table.  Disarmed, the
+     * counts are the tuple-distinct ones: 12000 in each of the five groups
+     * (g and v repeat together, so a group sees a fifth of the values). */
+    int64_t cores = ray_pool_get() ? (int64_t)ray_pool_total_workers(ray_pool_get()) : 1;
+    ray_pool_destroy();
+    /* No assert until the pool is back at its size: a failure in between
+     * would leave the tests after this one a 4-worker pool. */
+    bool pv_pool = ray_pool_init_total(4) == RAY_OK;
+    t = pv_pool ? ray_eval_str("(do (set _cr (til 400000)) "
+                               "(set _cg (table [g v b] (list (% _cr 5) (% _cr (+ 300 (* 59700 (as 'I64 (>= _cr 200000))))) (% _cr 100)))) 0)")
+                : NULL;
+    bool pv_setup = t && !RAY_IS_ERR(t);
+    if (t && RAY_IS_ERR(t)) ray_error_free(t); else if (t) ray_release(t);
+    ray_error_clear();
+    bool pv_ok = pv_setup;
+    long long pv_bad = 0;
+    for (long long nth = 1; nth <= 128 && pv_ok; nth++) {
+        ray_cdpg_test_fail_slots(nth);
+        ray_t* r = ray_eval_str("(select {from: _cg by: g u: (count (distinct v)) m: (max b)})");
+        ray_cdpg_test_fail_slots(0);
+        bool is_oom = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r);
+        else if (r) ray_release(r);
+        ray_error_clear();
+        if (!is_oom) { pv_ok = false; pv_bad = nth; }
+    }
+    ray_t* pv = !pv_setup ? NULL : ray_eval_str("(and (all (== (at (select {from: _cg by: g u: (count (distinct v)) m: (max b) asc: g}) 'u) "
+                             "(at (select {from: (distinct (select {from: _cg g: g v: v})) by: g u: (count v) asc: g}) 'u))) "
+                             "(all (== (at (select {from: _cg by: g u: (count (distinct v)) m: (max b) asc: g}) 'u) [12000 12000 12000 12000 12000])))");
+    bool pv_counts = pv && !RAY_IS_ERR(pv) && pv->type == -RAY_BOOL && pv->b8;
+    if (pv && RAY_IS_ERR(pv)) ray_error_free(pv); else if (pv) ray_release(pv);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total((uint32_t)cores), RAY_OK);
+    TEST_ASSERT_TRUE(pv_pool);
+    TEST_ASSERT_TRUE(pv_setup);
+    TEST_ASSERT_FMT(pv_ok, "per value, nth %lld: not an oom error", pv_bad);
+    TEST_ASSERT_TRUE(pv_counts);
+    PASS();
+}
+
 /* The i64 atom an expression evaluates to, or INT64_MIN. */
 static int64_t rb_eval_i64(const char* e) {
     ray_t* r = ray_eval_str(e);
@@ -15445,6 +15546,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/distinct_guid_skewed", test_eval_distinct_guid_skewed, lang_setup, lang_teardown },
     { "lang/eval/distinct_guid_table_growth", test_eval_distinct_guid_table_growth, lang_setup, lang_teardown },
     { "lang/eval/distinct_guid_oom", test_eval_distinct_guid_oom, lang_setup, lang_teardown },
+    { "lang/eval/cd_group_partition_oom", test_eval_cd_group_partition_oom, lang_setup, lang_teardown },
     { "lang/eval/distinct_guid_cancel", test_eval_distinct_guid_cancel, lang_setup, lang_teardown },
     { "lang/eval/insert_upsert_rollback_index", test_eval_insert_upsert_rollback_index, lang_setup, lang_teardown },
     { "lang/eval/guid_cancel", test_eval_guid_cancel, lang_setup, lang_teardown },

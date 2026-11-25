@@ -1048,6 +1048,7 @@ void ray_test_hooks_off(void) {
     ray_in_guid_test_fail_alloc(0);
     ray_distinct_guid_test_fail_alloc(0);
     ray_distinct_guid_test_table_cap(0);
+    ray_cdpg_test_fail_slots(0);
     ray_pool_test_ring_fail(0);
     ray_pool_test_cancel_at(0, false);
     ray_heap_test_scribble(false);

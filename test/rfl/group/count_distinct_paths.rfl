@@ -517,3 +517,99 @@
 ;; the null is one value of the column: groups whose rows hold it count it
 (set xh (at (select {from: (table [i] (list nq)) x: (if (== (% i 2) 0) 0N (% i 5))}) 'x))
 (at (select {from: (table [k x] (list (% nq 2) xh)) by: {g: k} c: (count x) u: (count (distinct x))}) 'u) -- [1 5]
+
+;; ── count(distinct) beside another aggregate, many groups ──────────────
+;; The grouping engine answers the other aggregates; count(distinct) then
+;; maps every row to its group through a group → gid table (the scatter
+;; path).  Above RGID_PAR_GROUPS (65536) groups that table is built on the
+;; pool (rgid_insert_fn), for one key and for a composite key, and the
+;; per-group dedup (count_distinct_per_group_parallel) takes 128 or 256
+;; partitions above a million rows.  The oracle is the count alone, which
+;; the fused kernel and the two-pass rewrite answer without that table,
+;; and the other aggregates alone.
+(set Np 1500000)
+(set rp (til Np))
+(set kd (% rp 300007))                        ;; dense keys: 300007 groups
+(set ks (* kd 2654435761))                    ;; the same groups, sparse
+(set vp (% rp 3))
+(set wp (% rp 5))
+(set k2p (% rp 3))
+;; by construction a key's rows are r = k + 300007 j, j < 5, and
+;; 300007 = 1 (mod 3): every key sees all three values of v
+(set Td (table [k k2 v w] (list kd k2p vp wp)))
+(set Ts (table [k k2 v w] (list ks k2p vp wp)))
+(set Md (xasc (select {from: Td by: k u: (count (distinct v)) m: (max w) n: (count v)}) 'k))
+(count Md) -- 300007
+(sum (at Md 'u)) -- 900021
+(set Od (xasc (select {from: Td by: k m: (max w) n: (count v)}) 'k))
+(all (== (at Md 'k) (at Od 'k))) -- true
+(all (== (at Md 'm) (at Od 'm))) -- true
+(all (== (at Md 'n) (at Od 'n))) -- true
+(set Ms (xasc (select {from: Ts by: k u: (count (distinct v)) m: (max w) n: (count v)}) 'k))
+(set Us (xasc (select {from: Ts by: k u: (count (distinct v))}) 'k))
+(set Os (xasc (select {from: Ts by: k m: (max w) n: (count v)}) 'k))
+(count Ms) -- 300007
+(all (== (at Ms 'k) (at Us 'k))) -- true
+(all (== (at Ms 'u) (at Us 'u))) -- true
+(all (== (at Ms 'm) (at Os 'm))) -- true
+(all (== (at Ms 'n) (at Os 'n))) -- true
+(sum (at Ms 'u)) -- 900021
+;; a composite key under a where: the tuples are laid out and inserted on
+;; the pool (rgid_gk_fill_fn, rgid_insert_fn), then every selected row is
+;; probed
+(set cmb (fn [t] (xasc (select {from: t c: (+ (* k 3) k2) u: u n: n}) 'c)))
+(set Mc (cmb (select {from: Ts by: [k k2] u: (count (distinct v)) n: (count v) where: (!= w 0)})))
+(set Uc (xasc (select {from: (select {from: Ts by: [k k2] u: (count (distinct v)) where: (!= w 0)}) c: (+ (* k 3) k2) u: u n: u}) 'c))
+(set Oc (xasc (select {from: (select {from: Ts by: [k k2] n: (count v) where: (!= w 0)}) c: (+ (* k 3) k2) u: n n: n}) 'c))
+(count Mc) -- (count Uc)
+(count Mc) -- (count Oc)
+(all (== (at Mc 'c) (at Uc 'c))) -- true
+(all (== (at Mc 'u) (at Uc 'u))) -- true
+(all (== (at Mc 'n) (at Oc 'n))) -- true
+;; a null key among many groups
+(set kn (at (select {from: (table [k d] (list ks kd)) x: (if (== d 7) 0Nl k)}) 'x))
+(set Mn (xasc (select {from: (table [k v w] (list kn vp wp)) by: k u: (count (distinct v)) m: (max w)}) 'k))
+(set Un (xasc (select {from: (table [k v w] (list kn vp wp)) by: k u: (count (distinct v))}) 'k))
+(count Mn) -- 300007
+(all (== (at Mn 'k) (at Un 'k))) -- true
+(all (== (at Mn 'u) (at Un 'u))) -- true
+;; a composite key with a STR column above RGID_PAR_GROUPS groups: the
+;; tuples carry the string's hash and the parallel insert compares the bytes
+;; of equal hashes.  Oracle: the distinct (key, value) rows counted per key,
+;; which no count(distinct) kernel answers.
+(set ri (til 400000))
+(set skey (as 'STR (% (* ri 7) 100003)))
+;; every other key is a pooled string (past the 12-byte inline form)
+(set skey (if (== (% ri 2) 0) skey (concat "pooled-string-key-" skey)))
+(set Tsk (table [s k2 v w] (list skey (% ri 2) (% ri 5) (% ri 3))))
+(set Msk (xasc (select {from: Tsk by: [s k2] u: (count (distinct v)) n: (count v)}) [s k2]))
+(set Osk (xasc (select {from: (distinct (select {from: Tsk s: s k2: k2 v: v})) by: [s k2] u: (count v)}) [s k2]))
+(count Msk) -- 200006
+(count Msk) -- (count Osk)
+(all (== (at Msk 's) (at Osk 's))) -- true
+(all (== (at Msk 'k2) (at Osk 'k2))) -- true
+(all (== (at Msk 'u) (at Osk 'u))) -- true
+(sum (at Msk 'n)) -- 400000
+(set Wsk (xasc (select {from: Tsk by: [s k2] u: (count (distinct v)) n: (count v) where: (!= w 0)}) [s k2]))
+(set Vsk (xasc (select {from: (distinct (select {from: Tsk s: s k2: k2 v: v where: (!= w 0)})) by: [s k2] u: (count v)}) [s k2]))
+(count Wsk) -- (count Vsk)
+(all (== (at Wsk 'u) (at Vsk 'u))) -- true
+;; a partition's dedup table starts small and grows by rehash: a column of
+;; 300 values over the first half of the rows (the table quadruples) and
+;; 60000 over the second (it reaches its full size), by five groups and by
+;; 100000 groups — the counts are the tuple-distinct oracle's, and by hand:
+;; g and v repeat with period lcm(5, 300) and lcm(5, 60000), so each of
+;; the five groups sees a fifth of the 300 values, then of the 60000
+(set rg (til 400000))
+(set vg (% rg (+ 300 (* 59700 (as 'I64 (>= rg 200000))))))
+(set Tg (table [g k v b] (list (% rg 5) (% rg 100000) vg (% rg 100))))
+(set Mg (select {from: Tg by: g u: (count (distinct v)) m: (max b) asc: g}))
+(set Og (select {from: (distinct (select {from: Tg g: g v: v})) by: g u: (count v) asc: g}))
+(all (== (at Mg 'u) (at Og 'u))) -- true
+(at Mg 'u) -- [12000 12000 12000 12000 12000]
+(at Mg 'm) -- [95 96 97 98 99]
+(set Mk (select {from: Tg by: k u: (count (distinct v)) m: (max b) asc: k}))
+(set Ok (select {from: (distinct (select {from: Tg k: k v: v})) by: k u: (count v) asc: k}))
+(count Mk) -- 100000
+(all (== (at Mk 'u) (at Ok 'u))) -- true
+(sum (at Mk 'u)) -- (count (distinct (select {from: Tg k: k v: v})))
