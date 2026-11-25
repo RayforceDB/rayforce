@@ -29375,9 +29375,12 @@ by_dict_done:
          * shape, which keeps the where: in place, as on a flat table
          * (#1243). */
         if ((has_nonagg_needing_flat || (has_cd_output && has_running_agg_in)) && table_is_parted) {
-            /* Every parted slot, encoded or not, is read and flattened; only
-             * a non-parted encoded column passes into flat_tbl encoded. */
-            ray_t* flat_tbl = query_materialize_parted_table(tbl);
+            /* The columns the clauses read and the keys (a by-dict key is a
+             * column under its alias, which no clause names) are read and
+             * flattened, not the whole table (#1693); every column when a
+             * clause runs code whose reads it does not show.  Only a
+             * non-parted encoded column passes into flat_tbl encoded. */
+            ray_t* flat_tbl = parted_flatten_read_cols(dict, tbl, false, by_expr);
             if (!flat_tbl || RAY_IS_ERR(flat_tbl)) {
                 ray_graph_free(g); ray_release(tbl);
                 scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return flat_tbl ? flat_tbl : ray_error("oom", NULL);
