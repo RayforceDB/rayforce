@@ -68,6 +68,9 @@ ray_qstats_t g_qstats;
 
 /* Task granularity: RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS elements per task */
 #define TASK_GRAIN  ((int64_t)RAY_DISPATCH_MORSELS * RAY_MORSEL_ELEMS)
+/* Workers that keep a slot per morsel (the if split's counts) rely on task
+ * ranges starting on morsel boundaries. */
+_Static_assert(TASK_GRAIN % RAY_MORSEL_ELEMS == 0, "TASK_GRAIN is a whole number of morsels");
 
 /* Maximum ring capacity (power of 2) — mirrors RAY_POOL_MAX_TASKS in pool.h */
 #define MAX_RING_CAP  RAY_POOL_MAX_TASKS

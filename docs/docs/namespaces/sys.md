@@ -138,6 +138,9 @@ watermark, a few diagnostic counters and the symbol-table size, all `i64`:
 | `sort-perpart-runs` | Diagnostic: partitions processed by the streaming parted `asc:` / `desc:` paths (ordered concat of pre-sorted partitions, or per-partition top-k). |
 | `window-perpart-runs` | Diagnostic: segments processed by the streaming parted window path (the window's partition key includes the table's partition key). |
 | `join-perpart-runs` | Diagnostic: segments processed by the broadcast-streaming join (one side parted, each segment joined against the whole other side). |
+| `sym-map-runs` | Diagnostic: calls of `upper` / `lower` / `trim`, `substr` at scalar bounds, `replace` with atom arguments or `concat` with constants over a SYM column of 4096 rows or more that ran once per distinct symbol — one per call, not per symbol. |
+| `sym-map-row-runs` | Diagnostic: of those, the calls over a column whose dictionary has more than 64 entries per row (a few rows of a column over a large symbol table): the rows are transformed, no pass over the dictionary. |
+| `sym-map-same-runs` | Diagnostic: of those, the calls in which every symbol mapped to its own string (`trim` of trimmed text, `lower` of lowercase): the column is the result, nothing interned. |
 | `sym-count` | Entries in the global symbol table. |
 | `sym-bytes` | Bytes held by the symbol table's string arena (every interned name). |
 
@@ -167,6 +170,7 @@ symbol table where it found it.
 ;;     group-perpart-runs: 0, group-boxed-i64-runs: 0, asof-perpart-runs: 0,
 ;;     sort-perpart-runs: 0,
 ;;     window-perpart-runs: 0, join-perpart-runs: 0,
+;;     sym-map-runs: 0, sym-map-row-runs: 0, sym-map-same-runs: 0,
 ;;     sym-count: 424, sym-bytes: 30336}
 ```
 

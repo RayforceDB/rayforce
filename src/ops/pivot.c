@@ -172,65 +172,105 @@ static bool if_make_branch_plan(ray_graph_t* g, ray_op_t* root,
     return ok;
 }
 
-static int64_t if_selected_true_count(const uint8_t* cond, int64_t nrows,
-                                      ray_t* outer_sel) {
-    int64_t total = 0;
-    if (!outer_sel) {
-        for (int64_t i = 0; i < nrows; i++) total += cond[i] ? 1 : 0;
-        return total;
-    }
-    ray_rowsel_t* m = ray_rowsel_meta(outer_sel);
-    const uint8_t* flags = ray_rowsel_flags(outer_sel);
-    const uint32_t* offsets = ray_rowsel_offsets(outer_sel);
-    const uint16_t* idx = ray_rowsel_idx(outer_sel);
-    for (uint32_t seg = 0; seg < m->n_segs; seg++) {
-        uint8_t f = flags[seg];
-        if (f == RAY_SEL_NONE) continue;
-        int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
+/* The selected rows split by the condition into the ids the then arm runs
+ * over and the ids the else arm runs over, in row order: a count per
+ * morsel segment in parallel, a prefix sum over the segments, then the
+ * segments written at their offsets in parallel.  The selection's segments
+ * are morsel-aligned, as the pool's tasks are, so no segment straddles two
+ * tasks.  Serially this was two passes over every row per `if` of a chain. */
+typedef struct {
+    const uint8_t*  cond;
+    int64_t         nrows;
+    const uint8_t*  sel_flg;      /* NULL: every row */
+    const uint32_t* sel_offs;
+    const uint16_t* sel_idx;
+    uint32_t*       tcnt;         /* [n_segs] true rows of the segment */
+    uint32_t*       fcnt;         /* [n_segs] false rows of the segment */
+    const int64_t*  toff;         /* [n_segs] where the segment's true ids go */
+    const int64_t*  foff;
+    int64_t*        tids;
+    int64_t*        fids;
+    bool            fill;
+} if_split_ctx_t;
+
+static void if_split_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    const if_split_ctx_t* c = (const if_split_ctx_t*)vctx;
+    const uint8_t* cond = c->cond;
+    int64_t seg0 = lo / RAY_MORSEL_ELEMS, seg1 = (hi + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    for (int64_t seg = seg0; seg < seg1; seg++) {
+        uint8_t f = c->sel_flg ? c->sel_flg[seg] : RAY_SEL_ALL;
+        if (f == RAY_SEL_NONE) { if (!c->fill) { c->tcnt[seg] = 0; c->fcnt[seg] = 0; } continue; }
+        int64_t base = seg * RAY_MORSEL_ELEMS;
         int64_t end = base + RAY_MORSEL_ELEMS;
-        if (end > nrows) end = nrows;
+        if (end > c->nrows) end = c->nrows;
+        uint32_t t = 0, fl = 0;
+        if (!c->fill) {
+            if (f == RAY_SEL_ALL) {
+                for (int64_t r = base; r < end; r++) t += cond[r] ? 1 : 0;
+                fl = (uint32_t)(end - base) - t;
+            } else {
+                uint32_t off = c->sel_offs[seg], cnt = c->sel_offs[seg + 1] - off;
+                for (uint32_t i = 0; i < cnt; i++) t += cond[base + c->sel_idx[off + i]] ? 1 : 0;
+                fl = cnt - t;
+            }
+            c->tcnt[seg] = t; c->fcnt[seg] = fl;
+            continue;
+        }
+        int64_t* tp = c->tids + c->toff[seg];
+        int64_t* fp = c->fids + c->foff[seg];
         if (f == RAY_SEL_ALL) {
-            for (int64_t r = base; r < end; r++) total += cond[r] ? 1 : 0;
+            for (int64_t r = base; r < end; r++) { if (cond[r]) *tp++ = r; else *fp++ = r; }
         } else {
-            uint32_t off = offsets[seg];
-            uint32_t cnt = offsets[seg + 1] - off;
+            uint32_t off = c->sel_offs[seg], cnt = c->sel_offs[seg + 1] - off;
             for (uint32_t i = 0; i < cnt; i++) {
-                int64_t r = base + idx[off + i];
-                total += cond[r] ? 1 : 0;
+                int64_t r = base + c->sel_idx[off + i];
+                if (cond[r]) *tp++ = r; else *fp++ = r;
             }
         }
     }
-    return total;
 }
 
-static void if_fill_branch_ids(const uint8_t* cond, int64_t nrows,
-                               ray_t* outer_sel, int64_t* true_ids,
-                               int64_t* false_ids) {
-    int64_t ti = 0, fi = 0;
-#define IF_ADD_ROW(R) do { int64_t _r = (R); if (cond[_r]) true_ids[ti++] = _r; else false_ids[fi++] = _r; } while (0)
-    if (!outer_sel) {
-        for (int64_t r = 0; r < nrows; r++) IF_ADD_ROW(r);
-    } else {
-        ray_rowsel_t* m = ray_rowsel_meta(outer_sel);
-        const uint8_t* flags = ray_rowsel_flags(outer_sel);
-        const uint32_t* offsets = ray_rowsel_offsets(outer_sel);
-        const uint16_t* idx = ray_rowsel_idx(outer_sel);
-        for (uint32_t seg = 0; seg < m->n_segs; seg++) {
-            uint8_t f = flags[seg];
-            if (f == RAY_SEL_NONE) continue;
-            int64_t base = (int64_t)seg * RAY_MORSEL_ELEMS;
-            int64_t end = base + RAY_MORSEL_ELEMS;
-            if (end > nrows) end = nrows;
-            if (f == RAY_SEL_ALL) {
-                for (int64_t r = base; r < end; r++) IF_ADD_ROW(r);
-            } else {
-                uint32_t off = offsets[seg];
-                uint32_t cnt = offsets[seg + 1] - off;
-                for (uint32_t i = 0; i < cnt; i++) IF_ADD_ROW(base + idx[off + i]);
-            }
-        }
+/* ids[0..*true_count) the rows the condition holds for, ids[*true_count..
+ * selected) the others; false on OOM or a cancel (pool_cancelled).  `ids` holds `selected` entries. */
+static bool if_split_ids(const uint8_t* cond, int64_t nrows, ray_t* outer_sel,
+                         int64_t* ids, int64_t selected, int64_t* true_count) {
+    int64_t n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
+    if (n_segs <= 0) { *true_count = 0; return true; }
+    ray_t* hdr = NULL;
+    char* mem = (char*)scratch_alloc(&hdr, (size_t)n_segs * (2 * sizeof(uint32_t) + 2 * sizeof(int64_t)));
+    if (!mem) return false;
+    int64_t*  toff = (int64_t*)mem;
+    int64_t*  foff = toff + n_segs;
+    uint32_t* tcnt = (uint32_t*)(foff + n_segs);
+    uint32_t* fcnt = tcnt + n_segs;
+    if_split_ctx_t c = { .cond = cond, .nrows = nrows, .tcnt = tcnt, .fcnt = fcnt,
+                         .toff = toff, .foff = foff, .fill = false };
+    if (outer_sel) {
+        c.sel_flg  = ray_rowsel_flags(outer_sel);
+        c.sel_offs = ray_rowsel_offsets(outer_sel);
+        c.sel_idx  = ray_rowsel_idx(outer_sel);
     }
-#undef IF_ADD_ROW
+    ray_pool_t* pool = ray_pool_get();
+    bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    if (par) ray_pool_dispatch(pool, if_split_fn, &c, nrows);
+    else     if_split_fn(&c, 0, 0, nrows);
+    /* a cancelled dispatch left the counts of the tasks it skipped unwritten */
+    if (pool_cancelled(pool)) { scratch_free(hdr); return false; }
+    int64_t t = 0, fl = 0;
+    for (int64_t seg = 0; seg < n_segs; seg++) {
+        toff[seg] = t; foff[seg] = fl;
+        t += tcnt[seg]; fl += fcnt[seg];
+    }
+    if (t + fl != selected) { scratch_free(hdr); return false; }
+    *true_count = t;
+    c.fill = true;
+    c.tids = ids;
+    c.fids = ids + t;
+    if (par) ray_pool_dispatch(pool, if_split_fn, &c, nrows);
+    else     if_split_fn(&c, 0, 0, nrows);
+    scratch_free(hdr);
+    return !pool_cancelled(pool);
 }
 
 static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
@@ -259,6 +299,10 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
      * outer memo (values of the full table) is set aside meanwhile. */
     ray_exec_memo_save_t memo_save;
     ray_exec_memo_push(g, branch, &memo_save);
+    /* ... seeded with the outer values' rows the arm runs over, so a shared
+     * node (a lower-cased column every condition of a chain reads) is
+     * computed once, not once per arm. */
+    ray_exec_memo_seed(g, &memo_save, branch, saved_table, ids, count, nrows);
     ray_t* value = exec_node(g, branch);
     ray_exec_memo_pop(g, &memo_save);
     if (g->selection) {
@@ -1039,17 +1083,18 @@ static __attribute__((noinline)) ray_t* exec_if_selected(ray_graph_t* g, ray_op_
         return NULL;
 
     uint8_t* cond = (uint8_t*)ray_data(cond_v);
-    int64_t true_count = if_selected_true_count(cond, nrows, outer_sel);
-    int64_t false_count = selected - true_count;
-    if (true_count < 0 || false_count < 0) return NULL;
-
+    int64_t true_count = 0;
     ray_t* ids_hdr = NULL;
     int64_t* ids = NULL;
     if (selected > 0) {
         ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)selected * sizeof(int64_t));
         if (!ids) return ray_error("oom", NULL);
-        if_fill_branch_ids(cond, nrows, outer_sel, ids, ids + true_count);
+        if (!if_split_ids(cond, nrows, outer_sel, ids, selected, &true_count)) {
+            scratch_free(ids_hdr);
+            return ray_error(pool_cancelled(ray_pool_get()) ? "cancel" : "oom", NULL);
+        }
     }
+    int64_t false_count = selected - true_count;
     int64_t* true_ids = ids;
     int64_t* false_ids = ids ? ids + true_count : NULL;
 
@@ -1551,7 +1596,10 @@ static ray_t* if_str_text_build(ray_t* result, const uint8_t* cond, int64_t len,
                                 ray_t* else_v, bool else_scalar) {
     bool t_sym = then_v->type == -RAY_SYM || RAY_IS_SYM(then_v->type);
     bool e_sym = else_v->type == -RAY_SYM || RAY_IS_SYM(else_v->type);
-    if (!t_sym && !e_sym) return NULL;
+    /* Two STR vectors take the descriptor path below; a STR literal beside
+     * a STR vector or literal (`(if c "directory" "other")`) builds here
+     * too — it ran the row loop, an append per row. */
+    if (!t_sym && !e_sym && !then_scalar && !else_scalar) return NULL;
     if (len <= 0) return NULL;
 
     if_txt_side_t t, e;

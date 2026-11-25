@@ -1945,6 +1945,14 @@ ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit)
 /* Monotonic count of streaming parted-GROUP kernel (exec_group_per_partition)
  * entries.  O(1) per query; surfaced via (.sys.mem)'s "group-perpart-runs". */
 int64_t ray_group_perpart_runs(void);
+/* Runs of the per-distinct-code string path (ops/string.c, sym_map_by_code)
+ * that served since process start: (.sys.mem)'s sym-map-runs. */
+int64_t ray_string_sym_map_runs(void);
+/* Of them, the runs over rows (a domain of more than 64 positions per row)
+ * and the runs whose every entry mapped to its own string (the column is
+ * the result): (.sys.mem)'s sym-map-row-runs and sym-map-same-runs. */
+int64_t ray_string_sym_map_row_runs(void);
+int64_t ray_string_sym_map_same_runs(void);
 /* Serial grouping invocations that used exact boxed-I64 hashing. */
 int64_t ray_group_boxed_i64_runs(void);
 /* Monotonic count of exec_group_per_partition runs that returned their
@@ -2583,6 +2591,15 @@ typedef struct {
 } ray_exec_memo_save_t;
 void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
 void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
+/* After a push for an `if` arm over rows ids[0..count) of the outer table's
+ * `nrows` rows of `ids_table` (the table before the arm's sub-table was
+ * swapped in; a memo armed over another table seeds nothing): the arm's
+ * memo takes, for every node it reads that the set-aside
+ * outer memo holds a fixed-width value for, that value's rows at `ids` (the
+ * value itself when count == nrows), so the arm reads shared nodes instead
+ * of computing them again over its rows. */
+void ray_exec_memo_seed(ray_graph_t* g, const ray_exec_memo_save_t* outer, ray_op_t* branch,
+                        ray_t* ids_table, const int64_t* ids, int64_t count, int64_t nrows);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 ray_t* pivot_flatten_parted(ray_t* tbl);
 /* A flattened copy of a table with a parted / mapcommon column (a ragged
