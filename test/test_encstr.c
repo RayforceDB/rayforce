@@ -1991,11 +1991,11 @@ static test_result_t test_idict_groupby(void) {
     /* a count-distinct beside the key: the stashed result codes' consumer */
     ST_SAME("gb", "(select {d: (count (distinct u)) from: T by: s asc: s})", NULL);
     ST_SAME_MEM(ST_GB_LOAD2, "(select {d: (count (distinct u)) from: T by: s asc: s})");
-    /* the counter sees s's range decodes: the filter reads the DICT codes
-     * (P6b Task 5), and the output's gather of s decodes the matched URL
-     * vector (not STR_DICT) by range */
+    /* nothing of s is decoded for one matched row: the filter reads the
+     * DICT codes (P6b Task 5), and the output's gather reads the matched
+     * cell of the URL vector (not STR_DICT) where the file has it */
     ST_SAME("gb", "(select {s: s from: T where: (== s \"https://e.org/1024/31744\")})", NULL);
-    TEST_ASSERT_TRUE(st_col_decoded("s") > 0);
+    TEST_ASSERT_EQ_I((int64_t)st_col_decoded("s"), 0);
     /* Task 3 review Minor 5: by: s and distinct on the DICT column equal
      * generation 0 and the in-memory table (sorted) */
     static const char* const par[] = {
