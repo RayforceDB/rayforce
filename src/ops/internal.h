@@ -1653,6 +1653,8 @@ void ray_query_test_cd_firstn_set_max(int64_t cap);
 /* query.c test hook: selects whose parted source was pruned before fetch,
  * and the partitions they dropped, since process start. */
 void ray_query_test_part_prune(uint64_t* runs, uint64_t* pruned_parts);
+/* Expressions a grouped select evaluated once per group (#1729; debug). */
+uint64_t ray_query_test_group_evals(void);
 /* query.c test hook: rows of data[0, n) of `type` (BOOL, U8, I16, I32,
  * I64, DATE, TIME, TIMESTAMP) for which `x op rhs` holds, op 1..6 = == !=
  * < <= > >=; ref: through the reference widening compare instead of the

@@ -110,24 +110,20 @@
 (set tm (table [g h v] (list ['a 'a 'a 'b 'b] [1 2 1 1 1] [30 10 20 5 7])))
 (at (xasc (select {from: tm by: [g h] r: (rank v)}) [g h]) 'r) -- (list [1 0] [0] [0 1])
 
-;; Routes, compared within the run (500,000 rows, 100,000 groups)
+;; Routes (500,000 rows, 100,000 groups).  Which route each shape takes is
+;; asserted by aware/grouped_grade_routes (test/test_aware.c), which counts
+;; the expressions evaluated once per group (#1729); here, the answers.
 (set n5 500000)
 (set K5 (table [k v w] (list (at (as 'SYM (map (fn [i] (format "k%" i)) (til 100000))) (% (* (til n5) 7919) 100000)) (% (* (til n5) 104729) 1000003) (as 'I64 (map (fn [i] (if (== 0 (% i 9)) 0N i)) (til n5))))))
 ;; a row-local output nested past the code walk's depth is not sent per group
 (set D16 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))})))
 (set D20 (fn [] (select {from: K5 by: k r: (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 (+ 1 v))))))))))))))))))))})))
 (at (D20) 'r) -- (+ 4 (at (D16) 'r))
-;; each side the best of 5 runs, so a scheduling spike under a loaded suite
-;; does not decide the comparison
-(set BT (fn [f] (min (map (fn [j] (timeit (f) 1)) (til 5)))))
-(< (BT D20) (+ 50.0 (* 4.0 (BT D16)))) -- true
 ;; (first (asc v)) is planned as (min v), (count (iasc w)) as (count w)
 (count (select {from: K5 by: k r: (count w)})) -- 100000
 (at (select {from: K5 by: k r: (first (asc v))}) 'r) -- (at (select {from: K5 by: k r: (min v)}) 'r)
-(< (BT (fn [] (select {from: K5 by: k r: (first (asc v))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (min v)})))))) -- true
 (at (select {from: K5 by: k r: (count (iasc w))}) 'r) -- (at (select {from: K5 by: k r: (count w)}) 'r)
-(< (BT (fn [] (select {from: K5 by: k r: (count (iasc w))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (count w)})))))) -- true
-(< (BT (fn [] (select {from: K5 by: k r: (count (rank w))}))) (+ 5.0 (* 2.0 (BT (fn [] (select {from: K5 by: k r: (count w)})))))) -- true
+(at (select {from: K5 by: k r: (count (rank w))}) 'r) -- (at (select {from: K5 by: k r: (count w)}) 'r)
 (at (select {from: t by: g r: (count (xrank 2 v))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (rotate v 1))}) 'r) -- [3 2]
 (at (select {from: t by: g r: (count (idesc v))}) 'r) -- [3 2]

@@ -12301,9 +12301,24 @@ static ray_t* helper_spread_walk(ray_t* e, ray_t* sp) {
     return out;
 }
 
+/* Test hook (#1729): expressions evaluated once per group by the grouped
+ * select's fallbacks (an output or an aggregate argument that must see its
+ * group's rows), counted in debug builds.  A shape planned onto the group
+ * node or the row-aligned scatter adds nothing. */
+static _Atomic(uint64_t) g_query_group_evals;
+uint64_t ray_query_test_group_evals(void) {
+    return atomic_load_explicit(&g_query_group_evals, memory_order_relaxed);
+}
+static inline void query_group_eval_note(void) {
+#ifdef DEBUG
+    atomic_fetch_add_explicit(&g_query_group_evals, 1, memory_order_relaxed);
+#endif
+}
+
 static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
+    query_group_eval_note();
     /* Exact-size carve: collect_col_refs dedups against real table columns,
      * so ray_table_ncols(tbl) is a hard upper bound — no silent truncation
      * past the former [16] cap. */
@@ -14214,6 +14229,7 @@ static ray_t* aggr_unary_per_group_buf(ray_t* expr, ray_t* tbl,
                                        const int64_t* offsets,
                                        const int64_t* grp_cnt,
                                        int64_t n_groups) {
+    query_group_eval_note();
     ray_t** elems = (ray_t**)ray_data(expr);
     ray_t* fn_name = elems[0];
     ray_t* col_expr = elems[1];
