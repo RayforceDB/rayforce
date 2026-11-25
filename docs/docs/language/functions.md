@@ -175,6 +175,37 @@ Use `(concat (list) result)` to explicitly box a result for a list-only
 consumer, such as a positional row payload or `raze` joining string fragments.
 `raze` leaves an already typed vector unchanged.
 
+A symbol result is packed as a name. A `SYM` vector holds only each cell's
+symbol, not a quote, so a quoted symbol (one `parse` returns for `'a`, or
+one a lambda returns as `'a`) loses its quote when `map` packs it beside
+other symbols. Mapping over parsed code can therefore change what it
+evaluates to: the cell is now the name `a`, and evaluating it looks the name
+up. Boxing the packed result with `(concat (list) result)` comes after the
+packing and does not bring the quote back:
+
+```lisp
+(set L (list (parse "'a") (parse "b")))
+(set M (map (fn [x] x) L))
+(type L)            ; 'LIST
+(type M)            ; 'SYM
+(set b 42)
+(eval (first L))    ; 'a
+(eval (first M))    ; error: name: 'a' undefined
+(eval (at M 1))     ; 42
+```
+
+To keep quoted symbols, build the result as a `LIST` so nothing is packed:
+fold with `concat` into a list, or have the function wrap each result in a
+list and read it back with `first`:
+
+```lisp
+(set R (fold (fn [acc x] (concat acc (list x))) (list) L))
+(type R)                          ; 'LIST
+(eval (first R))                  ; 'a
+(set W (map (fn [x] (list x)) L))
+(eval (first (first W)))          ; 'a
+```
+
 ## Collection Operations
 
 Operations on vectors as collections.
