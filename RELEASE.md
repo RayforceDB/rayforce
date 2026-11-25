@@ -7,7 +7,8 @@ truth for the version** — no version literal is ever hand-edited in source.
 
 - **`dev`** — integration upstream and the **repository default branch**.
   Feature/fix branches merge here; all contributions target `dev` (see
-  [CONTRIBUTING.md](CONTRIBUTING.md)). CI runs on every push and PR.
+  [CONTRIBUTING.md](CONTRIBUTING.md)) and land through its merge queue (see
+  [How a pull request lands on dev](CONTRIBUTING.md#how-a-pull-request-lands-on-dev)).
 - **`master`** — protected, stable releases only. The only way in is a merged
   release PR. A PR opened against `master` that isn't the `dev -> master` release
   PR is automatically moved to `dev` by the **Retarget stray PRs** workflow.
@@ -131,9 +132,8 @@ make dist RAY_VERSION=2.1.3
 - **Branch protection / ruleset on `master`**: require a pull request before
   merging; require these two status checks to pass, and disallow direct pushes:
   - **`ci-success`** — a single aggregator job in `ci.yml` that goes green only
-    when every CI matrix leg (ubuntu/macOS × debug/release) passed. Require this
-    one instead of the four matrix names so renaming the matrix can't silently
-    drop the gate.
+    when every job of the release tier passed. Require this one instead of the
+    job names so renaming a job can't silently drop the gate.
   - **`check-version`** — the Version Guard job that validates the release
     version in the PR title.
 - No release secret or bypass token is needed — the default `GITHUB_TOKEN`
