@@ -139,20 +139,79 @@ static void affine_sum_cache_clear(void) {
  * VM — __VM->nfo / __VM->trace — so they survive across bytecode
  * invocations and stay one-per-thread, per the runtime/VM state model. */
 
-/* Interrupt flag: set by the SIGINT and SIGURG handlers (and by
- * ray_request_interrupt from any thread), checked by the eval/VM loops and
- * long-running builtins, reset per request.  It is shared by every thread of
- * the process: an in-process IPC server and the client threads waiting on
- * replies all read and write it, so it is a C11 atomic, not a
- * volatile sig_atomic_t (which orders nothing between threads).  It must be
- * lock-free: a signal handler writes it (#1623). */
-static _Atomic int g_eval_interrupted = 0;
+/* Cancel state (#1623).  Two cancels, each addressed to its own target:
+ *
+ *  - the PROCESS cancel: the SIGINT handler, ray_request_interrupt from
+ *    any thread, the test hooks.  It is the user's Ctrl-C, for the local
+ *    evaluation, or for the sync request a client thread is waiting on,
+ *    which forwards it to its server and consumes it (ray_take_interrupt);
+ *  - the REQUEST cancel: the SIGURG handler, when a client's cancel byte
+ *    arrives for the IPC request the server is evaluating.  It belongs to
+ *    that request only, so it is honoured only on the thread evaluating
+ *    it (and by the pool workers running that thread's dispatch).
+ *
+ * In a process that is an IPC server on one thread and a client on
+ * another, neither can take or clear the other's cancel: a client never
+ * consumes the server's request cancel, and a server request starting
+ * clears only its own cancel, and the process cancel only while no sync
+ * send waits for it.  While a sync send waits, the process cancel is that
+ * client's to forward, so the request being evaluated does not act on it
+ * either.  In separate processes (the supported setup for a client and a
+ * server) nothing changes.
+ *
+ * Both live in one word, so a checkpoint still costs one relaxed load and
+ * a branch; only a pending cancel takes the slow path that asks whether it
+ * is addressed to the calling thread.  Every access is a lock-free atomic:
+ * the signal handlers set the bits and read the request owner. */
+#define CANCEL_PROCESS 1u
+#define CANCEL_REQUEST 2u
+static _Atomic unsigned g_eval_interrupted = 0;
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "the interrupt flag is set from signal handlers: it must be lock-free");
+_Static_assert(ATOMIC_POINTER_LOCK_FREE == 2,
+               "the request owner is read in a signal handler: it must be lock-free");
+
+/* A thread's identity: the address of a thread-local, unique among live
+ * threads and never NULL. */
+static _Thread_local char t_cancel_self;
+#define CANCEL_SELF() ((const void*)&t_cancel_self)
+/* The thread evaluating the IPC request the request cancel is for (NULL
+ * when none is), the thread whose pool dispatch is in flight (NULL when
+ * none is), and how many sync sends are waiting for a reply. */
+static _Atomic(const void*) g_cancel_req_thread = NULL;
+static _Atomic(const void*) g_cancel_dispatcher = NULL;
+static _Atomic int          g_cancel_waiters = 0;
+
+/* Whether the calling thread works for the request being evaluated: it is
+ * the thread evaluating it, or a pool worker running that thread's
+ * dispatch. */
+static bool cancel_on_request_thread(void) {
+    const void* rq = atomic_load_explicit(&g_cancel_req_thread, memory_order_acquire);
+    if (!rq) return false;
+    if (rq == CANCEL_SELF()) return true;
+    return ray_pool_on_worker() &&
+           atomic_load_explicit(&g_cancel_dispatcher, memory_order_acquire) == rq;
+}
+
+/* Whether the cancels pending in `w` are addressed to the calling thread. */
+static bool cancel_applies(unsigned w) {
+    bool req = cancel_on_request_thread();
+    if ((w & CANCEL_REQUEST) && req) return true;
+    if (w & CANCEL_PROCESS)
+        return !(req && atomic_load_explicit(&g_cancel_waiters, memory_order_acquire) > 0);
+    return false;
+}
+
+/* The checkpoint's slow path, taken only while some cancel is pending. */
+__attribute__((noinline, cold)) static bool cancel_applies_now(void) {
+    return cancel_applies(atomic_load_explicit(&g_eval_interrupted, memory_order_acquire));
+}
+
 /* The hot-path read: a plain load on every target, ordering nothing; a
  * checkpoint only needs to see the flag eventually. */
 #define EVAL_INTERRUPTED() \
-    (atomic_load_explicit(&g_eval_interrupted, memory_order_relaxed) != 0)
+    (RAY_UNLIKELY(atomic_load_explicit(&g_eval_interrupted, memory_order_relaxed) != 0) && \
+     cancel_applies_now())
 
 /* A cancel request must reach BOTH the main-thread eval/VM loops (this flag)
  * and any in-flight parallel workers (the pool's cancel flag, via ray_cancel).
@@ -160,28 +219,115 @@ _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
  * cancel message later — stops the whole query, not just the serial half.
  * ray_cancel/ray_cancel_reset are async-signal-safe, so this stays callable
  * from the signal handler.  Zero hot-path cost: only runs when a cancel is
- * actually requested. */
+ * actually requested.  The pool is left alone while a sync send waits and
+ * a request is being evaluated: the cancel is the client's then, and the
+ * dispatch in flight would be the request's. */
 void ray_request_interrupt(void) {
-    atomic_store_explicit(&g_eval_interrupted, 1, memory_order_release);
-    ray_cancel();
+    atomic_fetch_or_explicit(&g_eval_interrupted, CANCEL_PROCESS, memory_order_release);
+    if (!(atomic_load_explicit(&g_cancel_req_thread, memory_order_acquire) &&
+          atomic_load_explicit(&g_cancel_waiters, memory_order_acquire) > 0))
+        ray_cancel();
 }
+/* Clears the process cancel.  The pool's flag is reset with it unless a
+ * request cancel is pending, which may be what set it. */
 void ray_clear_interrupt(void) {
-    atomic_store_explicit(&g_eval_interrupted, 0, memory_order_release);
-    ray_cancel_reset();
+    unsigned old = atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_PROCESS,
+                                             memory_order_acq_rel);
+    if (!(old & CANCEL_REQUEST)) ray_cancel_reset();
 }
 bool ray_interrupted(void) {
-    return atomic_load_explicit(&g_eval_interrupted, memory_order_acquire) != 0;
+    unsigned w = atomic_load_explicit(&g_eval_interrupted, memory_order_acquire);
+    return w && cancel_applies(w);
 }
-/* Consume a pending interrupt: true, and the flag cleared, when one was
- * set; false otherwise.  One exchange, so a second request that lands
- * between a look and a clear is not swallowed with the first: it stays set
- * for the next take.  The one place a request's cancel is consumed (the IPC
- * client forwarding a Ctrl-C to its server). */
+/* Consume a pending process cancel: true, and the bit cleared, when one was
+ * set; false otherwise.  One atomic read-modify-write, so a second request
+ * that lands between a look and a clear is not swallowed with the first:
+ * it stays set for the next take.  The one place a cancel is consumed (the
+ * IPC client forwarding a Ctrl-C to its server).  It never touches the
+ * request cancel: that one is the server's. */
 bool ray_take_interrupt(void) {
-    if (!atomic_exchange_explicit(&g_eval_interrupted, 0, memory_order_acq_rel))
-        return false;
-    ray_cancel_reset();
+    unsigned old = atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_PROCESS,
+                                             memory_order_acq_rel);
+    if (!(old & CANCEL_PROCESS)) return false;
+    if (!(old & CANCEL_REQUEST)) ray_cancel_reset();
     return true;
+}
+bool ray_interrupt_pending(void) {
+    return (atomic_load_explicit(&g_eval_interrupted, memory_order_acquire) & CANCEL_PROCESS) != 0;
+}
+
+/* ── The request cancel (src/core/ipc.c) ── */
+
+/* Async-signal-safe: cancel the request being evaluated.  The pool's flag
+ * is set only when the dispatch in flight is that request's. */
+void ray_cancel_request(void) {
+    atomic_fetch_or_explicit(&g_eval_interrupted, CANCEL_REQUEST, memory_order_release);
+    const void* rq = atomic_load_explicit(&g_cancel_req_thread, memory_order_acquire);
+    if (rq && atomic_load_explicit(&g_cancel_dispatcher, memory_order_acquire) == rq)
+        ray_cancel();
+}
+bool ray_request_cancelled(void) {
+    return (atomic_load_explicit(&g_eval_interrupted, memory_order_acquire) & CANCEL_REQUEST) &&
+           cancel_on_request_thread();
+}
+
+/* A request starts on the calling thread: it owns the request cancel, which
+ * starts clear (a stale one would fail it spuriously), and so does the
+ * pool's flag.  The process cancel is cleared too, as before, but only
+ * while no sync send waits: a waiting client's Ctrl-C is not this
+ * request's to erase.  *save keeps the cancel of an outer request this one
+ * runs nested in. */
+void ray_cancel_request_begin(ray_cancel_save_t* save) {
+    save->thread = atomic_load_explicit(&g_cancel_req_thread, memory_order_acquire);
+    unsigned old = atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_REQUEST,
+                                             memory_order_acq_rel);
+    save->cancelled = (old & CANCEL_REQUEST) != 0;
+    atomic_store_explicit(&g_cancel_req_thread, CANCEL_SELF(), memory_order_release);
+    if (atomic_load_explicit(&g_cancel_waiters, memory_order_acquire) == 0)
+        atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_PROCESS, memory_order_acq_rel);
+    ray_cancel_reset();
+}
+/* The request has returned: its cancel ends with it, and an outer
+ * request's comes back.  A pool flag the request cancel set is reset unless
+ * a process cancel is pending, which may want it. */
+void ray_cancel_request_end(const ray_cancel_save_t* save) {
+    unsigned old;
+    if (save->cancelled)
+        old = atomic_fetch_or_explicit(&g_eval_interrupted, CANCEL_REQUEST, memory_order_acq_rel);
+    else
+        old = atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_REQUEST, memory_order_acq_rel);
+    atomic_store_explicit(&g_cancel_req_thread, save->thread, memory_order_release);
+    if ((old & CANCEL_REQUEST) && !save->cancelled && !(old & CANCEL_PROCESS))
+        ray_cancel_reset();
+}
+
+/* A sync send starts (+1) or stops (-1) waiting for its reply. */
+void ray_cancel_waiter(int delta) {
+    atomic_fetch_add_explicit(&g_cancel_waiters, delta, memory_order_acq_rel);
+}
+
+/* The calling thread opens (or, with false, closes) a pool dispatch.
+ * Opening one when a cancel addressed to this thread is pending marks the
+ * pool cancelled, and one pending for another thread only is not this
+ * dispatch's: the pool's flag is cleared for it. */
+void ray_cancel_dispatch(bool open) {
+    if (!open) {
+        atomic_store_explicit(&g_cancel_dispatcher, NULL, memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&g_cancel_dispatcher, CANCEL_SELF(), memory_order_release);
+    unsigned w = atomic_load_explicit(&g_eval_interrupted, memory_order_acquire);
+    if (!w) return;
+    if (cancel_applies(w)) ray_cancel();
+    else ray_cancel_reset();
+}
+
+/* Test hook: no request owner, no waiter, no cancel. */
+void ray_cancel_state_reset_for_test(void) {
+    atomic_store_explicit(&g_cancel_req_thread, NULL, memory_order_release);
+    atomic_store_explicit(&g_cancel_dispatcher, NULL, memory_order_release);
+    atomic_store_explicit(&g_cancel_waiters, 0, memory_order_release);
+    atomic_fetch_and_explicit(&g_eval_interrupted, ~CANCEL_REQUEST, memory_order_acq_rel);
 }
 
 /* Legacy internal names — thin wrappers kept for existing callers. */

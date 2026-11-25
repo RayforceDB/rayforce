@@ -1224,8 +1224,9 @@ static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
  * unwind it and a "cancel" error is returned.  g_ipc_active_fd names the
  * connection whose payload is currently being evaluated (-1 when idle) so the
  * handler knows which socket to drain.  Everything here is async-signal-safe:
- * a sig_atomic_t read, recv(MSG_OOB), and the flag stores in
- * ray_request_interrupt(). */
+ * a sig_atomic_t read, recv(MSG_OOB), and the atomic stores in
+ * ray_cancel_request(), which cancels only the request being evaluated: a
+ * client thread of the same process never sees it (#1623). */
 static volatile sig_atomic_t g_ipc_active_fd = -1;
 
 /* Which cancel byte the running query answers to.  On TCP any byte does:
@@ -1261,6 +1262,7 @@ bool ray_ipc_request_peer_gone(void)
 
 void ray_ipc_cancel_state_reset_for_test(void)
 {
+    ray_cancel_state_reset_for_test();
     g_ipc_active_fd  = -1;
     g_ipc_active_seq = CANCEL_ANY;
     g_ipc_oob_taken  = 0;
@@ -1291,7 +1293,7 @@ static void ipc_sigurg_handler(int sig)
      * OOB from any OTHER (queued) client must not touch this query; that byte
      * stays pending on its socket and is honored when that client runs. */
     if (oob_cancel_for(fd, g_ipc_active_seq, &g_ipc_oob_taken))
-        ray_request_interrupt();
+        ray_cancel_request();
 }
 #endif
 
@@ -1608,9 +1610,12 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         /* Clear any stale cancel first: the server is single-threaded, so each
          * request starts a fresh query — without this reset a prior cancel
          * would make every later query fail spuriously (the REPL clears per
-         * line the same way).  Publish the active fd so a SIGURG for THIS
-         * connection cancels this query. */
-        ray_clear_interrupt();
+         * line the same way).  Only this request's own cancel is cleared: a
+         * client's Ctrl-C waiting to be forwarded by a sync send on another
+         * thread is that client's (#1623).  Publish the active fd so a SIGURG
+         * for THIS connection cancels this query. */
+        ray_cancel_save_t csave;
+        ray_cancel_request_begin(&csave);
         /* An eval can dispatch another connection's request inside it
          * (a sync send pumps its peer's frames while it waits), so the
          * running request's cancel context is saved and given back: a
@@ -1630,9 +1635,10 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
          * published raised its SIGURG with no request to cancel: the
          * handler left it pending.  Look again now the handler would act. */
         if (oob_cancel_for((int)sel->fd, cancel_seq, &g_ipc_oob_taken))
-            ray_request_interrupt();
+            ray_cancel_request();
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
         g_ipc_active_fd  = -1;
+        ray_cancel_request_end(&csave);
         if (g_ipc_oob_taken) taken = 1;
         g_ipc_oob_taken  = prev_taken;
         g_ipc_active_seq = prev_seq;
@@ -1641,7 +1647,7 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
         /* A byte for the outer request that came while the nested one ran
          * raised its SIGURG then, against the nested connection: look again. */
         if (prev_fd >= 0 && oob_cancel_for(prev_fd, prev_seq, &g_ipc_oob_taken))
-            ray_request_interrupt();
+            ray_cancel_request();
     }
 
     ipc_ctx_set(prev_handle, prev_poll);
@@ -2975,8 +2981,24 @@ static ray_t* sync_expire(ray_poll_t* poll, int64_t id, int64_t timeout_ms)
  * just before a wait is forwarded within this (see the loop below). */
 #define SYNC_WAIT_SLICE_MS 50
 
+static ray_t* sync_send_wait(int64_t handle, ray_t* msg, uint8_t extra_flags,
+                             int64_t timeout_ms);
+
+/* A sync send, counted as waiting from its first byte to its reply: while
+ * it waits, a process cancel (Ctrl-C) is its to forward, and a server
+ * request evaluated meanwhile on another thread neither clears nor acts on
+ * it (#1623). */
 static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
                         int64_t timeout_ms)
+{
+    ray_cancel_waiter(1);
+    ray_t* r = sync_send_wait(handle, msg, extra_flags, timeout_ms);
+    ray_cancel_waiter(-1);
+    return r;
+}
+
+static ray_t* sync_send_wait(int64_t handle, ray_t* msg, uint8_t extra_flags,
+                             int64_t timeout_ms)
 {
     int64_t deadline = timeout_ms > 0 ? ray_time_now_ms() + timeout_ms : -1;
 
@@ -3049,6 +3071,9 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
     cd->sync_ready   = false;
     cd->sync_resp    = NULL;
     int64_t id = sel->id;
+    /* The request this thread evaluates was cancelled: its server is told
+     * once, and the cancel stays the request's (it unwinds on the reply). */
+    bool req_cancel_sent = false;
 
     for (;;) {
         /* Process anything already buffered/readable first, then block
@@ -3090,8 +3115,13 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
          * before each wait (and handled as a wake-up by a signal).  One
          * that lands between this look and the wait starting cannot wake
          * it either; the wait is cut into slices so the next look finds it
-         * within SYNC_WAIT_SLICE_MS. */
-        int w = ray_interrupted() ? -2 : conn_wait_readable(sel, wait_ms);
+         * within SYNC_WAIT_SLICE_MS.  The cancels looked at are the
+         * process cancel (a Ctrl-C), which this send consumes, and the
+         * cancel of a request this thread is evaluating, which it passes on
+         * without consuming; never another thread's request cancel (#1623). */
+        bool req_cancel = !req_cancel_sent && ray_request_cancelled();
+        int w = (ray_interrupt_pending() || req_cancel) ? -2
+                                                       : conn_wait_readable(sel, wait_ms);
         if (w == -3) {
             /* The socket of an upgraded connection spoke: the peer is
              * gone.  Deregistering frees cd; nothing of it is touched. */
@@ -3105,7 +3135,9 @@ static ray_t* sync_send(int64_t handle, ray_t* msg, uint8_t extra_flags,
              * there and cancels the running query.  Then keep awaiting its
              * cancel reply.  Best-effort: a server without OOB-cancel support
              * ignores the byte and the query completes as before. */
-            if (ray_take_interrupt()) {  /* consume: never resent, never cancels locally */
+            bool fwd = ray_take_interrupt();  /* consume: never resent, never cancels locally */
+            if (!fwd && req_cancel) { fwd = true; req_cancel_sent = true; }
+            if (fwd) {
                 bool sent = send_cancel(sel);
                 if (!sent) {
                     /* An earlier request's cancel is still unconfirmed, so
