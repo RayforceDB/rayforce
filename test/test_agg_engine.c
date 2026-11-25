@@ -2865,7 +2865,7 @@ static test_result_t test_parted_flatten_into_bounds(void) {
  * are over the direct cache's budget has its workers drop their pages ahead
  * of the free (agg_free_input_sized) on a kernel with transparent huge
  * pages off, taken so by a test seam.  On a 2 GB budget (a 128 MB cache),
- * taken for a big one by the test seam (8 GB and up otherwise), 8M
+ * taken for a big one by the test seam (48 GB and up otherwise), 8M
  * distinct keys take that path, and the answer is still each row its own
  * group, in first-seen order.  With huge pages on the blocks go to the
  * free alone.

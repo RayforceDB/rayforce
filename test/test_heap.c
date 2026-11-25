@@ -2849,9 +2849,12 @@ static size_t heap_vm_kb(void) {
 /* A fresh direct block the cache will not keep (over its budget) is mapped
  * 2 MB-aligned for huge pages; on a kernel with transparent huge pages off
  * it is also transient (its pages may go ahead of the free), unless it is
- * locked.  One the cache keeps is neither.  On a memory budget under 8 GB
- * no block is either, however large.  Whether the kernel has them on is
- * its sysfs mode, "[always]" or "[madvise]". */
+ * locked.  One the cache keeps is neither.  On a memory budget under the
+ * gate (48 GB; 8 GB here by the test seam) no block is either, however
+ * large.  Whether the kernel has them on is its sysfs mode, "[always]" or
+ * "[madvise]".  The gate itself: a 32 GB budget's block over its 2 GB
+ * cache budget is a plain mapping, a 48 GB budget's over its 3 GB cache
+ * budget takes huge pages. */
 static test_result_t test_direct_huge_over_budget(void) {
 #if !defined(RAY_OS_LINUX)
     SKIP("direct blocks take huge pages on Linux only");
@@ -2866,10 +2869,26 @@ static test_result_t test_direct_huge_over_budget(void) {
         fclose(f);
     }
     bool thp_heap = ray_vm_thp_enabled();
-    ray_heap_test_direct_thp(0);   /* transparent huge pages off */
     ray_heap_direct_cache_drain();
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);
+    /* The gate as built: 32 GB is under it, 48 GB is not. */
+    const size_t g32 = (size_t)5 << 29, g48 = (size_t)7 << 29;   /* 2.5 and 3.5 GB */
+    ray_heap_set_anon_watermark(INT64_C(32) << 30);
+    int64_t gn0 = ray_heap_direct_huge_count();
+    ray_t* gb = ray_alloc(g32);
+    int64_t gn1 = ray_heap_direct_huge_count();
+    bool    gb_anon = gb && !ray_direct_file_backed(gb);
+    if (gb) ray_free(gb);
+    ray_heap_set_anon_watermark(INT64_C(48) << 30);
+    int64_t gn2 = ray_heap_direct_huge_count();
+    ray_t* gc = ray_alloc(g48);
+    int64_t gn3 = ray_heap_direct_huge_count();
+    bool    gc_anon = gc && !ray_direct_file_backed(gc);
+    if (gc) ray_free(gc);
+    ray_heap_direct_cache_drain();
+    ray_heap_test_direct_huge_min_budget(INT64_C(8) << 30);
+    ray_heap_test_direct_thp(0);   /* transparent huge pages off */
     /* An 8 GB budget: the cache keeps up to 512 MB, the big block is over it. */
     ray_heap_set_anon_watermark(INT64_C(8) << 30);
     int64_t n0 = ray_heap_direct_huge_count();
@@ -2896,7 +2915,8 @@ static test_result_t test_direct_huge_over_budget(void) {
     size_t l_tr = l ? ray_raw_transient_bytes(ray_data(l)) : 1;
     if (l) ray_free(l);
     ray_heap_set_lock(false);
-    /* Under 8 GB the same over-budget block (budget 256 MB) is a plain mapping. */
+    /* Under 8 GB the same over-budget block (cache budget 256 MB) is a plain
+     * mapping. */
     ray_heap_set_anon_watermark(INT64_C(4) << 30);
     int64_t n3 = ray_heap_direct_huge_count();
     ray_t* c = ray_alloc(big);
@@ -2906,9 +2926,12 @@ static test_result_t test_direct_huge_over_budget(void) {
     if (c) ray_free(c);
     ray_heap_direct_cache_drain();
     ray_heap_test_direct_thp(-1);
+    ray_heap_test_direct_huge_min_budget(0);
     ray_heap_set_lock(was_lock);
     ray_heap_set_anon_watermark(previous);
     TEST_ASSERT(thp_heap == thp_sysfs, "the kernel's huge-page mode as sysfs has it");
+    if (gb_anon) TEST_ASSERT_EQ_I(gn1 - gn0, 0);   /* 32 GB: dev's plain mapping */
+    if (gc_anon) TEST_ASSERT_EQ_I(gn3 - gn2, 1);   /* 48 GB: huge pages */
     if (!s || !b || !c || !l) SKIP("600 MB block unavailable");
     if (b_spilled) SKIP("the big block spilled: the watermark is near");
     TEST_ASSERT_EQ_I(n1 - n0, 0);   /* the cache keeps the small one */
@@ -2939,6 +2962,7 @@ static test_result_t test_direct_huge_release(void) {
     const size_t big = 600u << 20, slice = 2u << 20;
     if (heap_vm_kb() == 0 || !relieve_mincore()) SKIP("no /proc/self/statm or mincore");
     ray_heap_test_direct_thp(0);   /* transient: transparent huge pages off */
+    ray_heap_test_direct_huge_min_budget(INT64_C(8) << 30);   /* 8 GB is a big budget */
     ray_heap_direct_cache_drain();
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);
@@ -2951,6 +2975,7 @@ static test_result_t test_direct_huge_release(void) {
     if (!b || ray_direct_file_backed(b) || ray_heap_direct_huge_count() != n0 + 1) {
         if (b) ray_free(b);
         ray_heap_test_direct_thp(-1);
+        ray_heap_test_direct_huge_min_budget(0);
         ray_heap_set_lock(was_lock);
         ray_heap_set_anon_watermark(previous);
         SKIP("600 MB block unavailable or not a huge-page block");
@@ -2980,6 +3005,7 @@ static test_result_t test_direct_huge_release(void) {
              && mincore((char*)base + map - 4096, 4096, &v) != 0 && errno == ENOMEM;
     int64_t committed_after = ray_heap_anon_committed();
     ray_heap_test_direct_thp(-1);
+    ray_heap_test_direct_huge_min_budget(0);
     ray_heap_set_lock(was_lock);
     ray_heap_set_anon_watermark(previous);
     TEST_ASSERT_EQ_I((int64_t)(vm1 - vm0), (int64_t)(map / 1024));   /* no slack kept */

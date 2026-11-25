@@ -1949,17 +1949,21 @@ static int64_t direct_cache_bytes(void) {
  * A block the cache keeps pays its faults once and is never unmapped, so
  * the advice is not given there — and not everywhere, as THP on every
  * direct block was once a loss (compaction stalls on a fragmented box):
- * the blocks here are few and large.  Only on a memory budget of 8 GB and
- * up, whose cache budget is 512 MB at least: a smaller box keeps its
- * direct blocks as they were, huge pages and early page release
- * (ray_raw_transient_bytes) alike — its memory is the more fragmented, and
- * its few cores gain little from releasing pages in parallel.  The
+ * the blocks here are few and large.  Only on a memory budget of 48 GB and
+ * up, whose cache budget is 3 GB at least: a smaller box keeps its direct
+ * blocks as they were, huge pages and early page release
+ * (ray_raw_transient_bytes) alike.  A 32 GB box ran the 100M-row random
+ * query set (4 clients) the same with the advice and without (165 s), so
+ * it gains nothing there for the risk it takes: with THP defrag at
+ * "madvise" a huge-page fault compacts or reclaims synchronously, and a
+ * small box is the one whose memory is full of page cache and fragmented.
+ * The
  * alignment costs no memory — the surplus of the mapping is unmapped
  * (ray_vm_alloc_aligned) and map_size stays page-rounded, so the cache
  * fits such a block as any other should the budget rise before it is
  * freed.  Linux only. */
 #define RAY_DIRECT_HUGE             ((size_t)2 << 20)
-#define RAY_DIRECT_HUGE_MIN_BUDGET  (INT64_C(8) << 30)
+#define RAY_DIRECT_HUGE_MIN_BUDGET  (INT64_C(48) << 30)
 #ifdef DEBUG
 static _Atomic(int64_t) g_direct_huge_count, g_direct_transient_count;
 static _Atomic(int64_t) g_direct_huge_min_budget = RAY_DIRECT_HUGE_MIN_BUDGET;
