@@ -1,0 +1,49 @@
+;; @requires: posix
+;; An integer group whose values span more than INT64_MAX: var and stddev
+;; are taken about a value of the group, and x - k wrapped in int64 for a
+;; pair of values near -2^62 and +2^62, turning the far values' differences
+;; to the wrong sign (#1670): every grouped route gave 5.75e18 for a
+;; population standard deviation of 3.77e18.  Such a difference is now
+;; taken in double.
+;;
+;; Data: groups i mod 3, each cycling through -C, 0 and +C (C a little over
+;; 2^62), so each group's population variance is 2C^2/3 exactly.
+
+(set rel (fn [got want] (/ (abs (- got want)) want)))
+(set ok (fn [got want] (all (< (rel got want) 0.000000001))))
+
+(set n 9000)
+(set C 4611686018427388000)
+(set k (% (til n) 3))
+(set V (* C (- (% (div (til n) 3) 3) 1)))
+(set T (table [k s f v] (list k (at ['a 'b 'c] k) (+ 0.5 (as 'F64 k)) V)))
+(set sd (* (as (quote F64) C) (sqrt (/ 2.0 3.0))))
+(set vp (* sd sd))
+
+;; every grouped route, and keyless and the eager builtin
+(ok (at (select {from: T by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: T by: s q: (dev v) asc: s}) 'q) sd) -- true
+(ok (at (select {from: T by: f q: (var_pop v) asc: f}) 'q) vp) -- true
+(ok (at (select {from: T by: k q: (var v) asc: k}) 'q) (/ (* vp 3000) 2999)) -- true
+(ok (at (select {from: (update {q: (var_pop v) by: k from: T}) by: k q: (first q) asc: k}) 'q) vp) -- true
+(ok (at (select {from: T by: k q: (stddev_pop v) where: (> k 0) asc: k}) 'q) sd) -- true
+(ok (at (select {from: T q: (stddev_pop v)}) 'q) sd) -- true
+(ok (stddev_pop V) sd) -- true
+
+;; a TIMESPAN column
+(set TS (table [k v] (list k (as 'TIMESPAN V))))
+(ok (at (select {from: TS by: k q: (var_pop v) asc: k}) 'q) vp) -- true
+
+;; splayed and partitioned copies of the same rows
+(set D "/tmp/rf_var_wide_span")
+(.sys.exec (format "rm -rf %" D))
+(.db.splayed.set (format "%/spl/t/" D) T)
+(.db.splayed.set (format "%/par/2024.01.01/t/" D) (take T 4500))
+(.db.splayed.set (format "%/par/2024.01.02/t/" D) (drop T 4500))
+(set SPL (.db.splayed.get (format "%/spl/t/" D)))
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(ok (at (select {from: SPL by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: PT by: k q: (stddev_pop v) asc: k}) 'q) sd) -- true
+(ok (at (select {from: PT by: s q: (var_pop v) asc: s}) 'q) vp) -- true
+(ok (at (select {from: PT q: (stddev_pop v)}) 'q) sd) -- true
+(.sys.exec (format "rm -rf %" D)) -- 0

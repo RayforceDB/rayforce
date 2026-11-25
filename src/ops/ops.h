@@ -712,6 +712,9 @@ typedef struct ray_graph {
      * table's parted columns are grouped from their segments (no flatten);
      * exec_group_run skips its parted dispatch. */
     bool            grp_seg_stream;
+    /* exec_group_v2's second run of a group whose 64-bit integer variance
+     * may have wrapped: its vtables are the checked ones (#1670). */
+    bool            var_checked;
 } ray_graph_t;
 
 /* ===== Morsel Iterator ===== */

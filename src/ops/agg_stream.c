@@ -475,6 +475,67 @@ static void var_i64_init(void* s) { var_i64_state* st = s; st->k = 0; st->sum = 
         (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
     } while (0)
 
+/* A 64-bit input (#1670).  The step takes x - k as a wrapping int64
+ * difference, which turns to the wrong sign when the two are more than
+ * INT64_MAX apart (a group spanning -2^62 .. +2^62).  The plain step
+ * stays as it is, at no cost to ordinary data; a wrap can happen only when
+ *   - k is at least 2^62 from zero ("wide"): seen when k is set, in the
+ *     first-row branch, or
+ *   - k is not, and then the wrapped difference is above 2^62, its square
+ *     above 2^124: seen in the sum of squares by the finalizer and the
+ *     merge.
+ * Either bumps ray_var_wrap_suspects, and exec_group_v2 runs the group
+ * again with the graph's var_checked set, which resolves these inputs to
+ * the checked vtables (agg_resolve_checked): every row takes the
+ * difference with an overflow check, falling back to double.  The mode
+ * belongs to that execution, so a concurrent one keeps its plain path. */
+_Atomic uint64_t ray_var_wrap_suspects;
+__attribute__((noinline, cold)) static void var_i64_suspect(void) {
+    atomic_fetch_add_explicit(&ray_var_wrap_suspects, 1, memory_order_relaxed);
+}
+static inline bool var_i64_wide(int64_t v) { return ((uint64_t)v + (UINT64_C(1) << 62)) >> 63; }
+#define VAR_SQ_WRAP 0x1p124
+static inline double var_i64_diff(int64_t v, int64_t k) {
+    int64_t d;
+    if (__builtin_sub_overflow(v, k, &d)) return (double)v - (double)k;
+    return (double)d;
+}
+#define VAR_ACC_STEP_I64(st, val) do {                                      \
+        int64_t v_ = (int64_t)(val);                                        \
+        if ((st)->cnt == 0) {                                               \
+            (st)->k = v_;                                                   \
+            if (RAY_UNLIKELY(var_i64_wide(v_))) var_i64_suspect();          \
+        }                                                                   \
+        double d_ = (double)(int64_t)((uint64_t)v_ - (uint64_t)(st)->k);    \
+        (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
+    } while (0)
+#define VAR_ACC_STEP_I64_CHECKED(st, val) do {                              \
+        int64_t v_ = (int64_t)(val);                                        \
+        if ((st)->cnt == 0) (st)->k = v_;                                   \
+        double d_ = var_i64_diff(v_, (st)->k);                              \
+        (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
+    } while (0)
+#define VAR_I64_UPDATE(NAME)                                                \
+static void NAME(void* base, size_t stride, const uint32_t* gids,          \
+                 const void* vals, const ray_valid_t* valid,               \
+                 int64_t n, acc_arena_t* a) {                              \
+    (void)a; const int64_t* d = (const int64_t*)vals;                       \
+    AGG_UPDATE_LOOP(valid, n, {                                             \
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride); \
+        VAR_ACC_STEP_I64(st, d[i]);                                         \
+    });                                                                     \
+}
+/* The checked step for every row: the update of the checked vtables. */
+static void var_i64_update_checked(void* base, size_t stride, const uint32_t* gids,
+                                   const void* vals, const ray_valid_t* valid,
+                                   int64_t n, acc_arena_t* a) {
+    (void)a; const int64_t* d = (const int64_t*)vals;
+    AGG_UPDATE_LOOP(valid, n, {
+        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
+        VAR_ACC_STEP_I64_CHECKED(st, d[i]);
+    });
+}
+
 #define VAR_ACC_STEP_FLT(st, val) do {                                      \
         double v_ = (double)(val);                                          \
         if ((st)->cnt == 0) (st)->k = v_;                                   \
@@ -482,15 +543,7 @@ static void var_i64_init(void* s) { var_i64_state* st = s; st->k = 0; st->sum = 
         (st)->sum += d_; (st)->sumsq += d_ * d_; (st)->cnt++;               \
     } while (0)
 
-static void var_i64_update(void* base, size_t stride, const uint32_t* gids,
-                           const void* vals, const ray_valid_t* valid,
-                           int64_t n, acc_arena_t* a) {
-    (void)a; const int64_t* d = (const int64_t*)vals;
-    AGG_UPDATE_LOOP(valid, n, {
-        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        VAR_ACC_STEP_INT(st, d[i]);
-    });
-}
+VAR_I64_UPDATE(var_i64_update)
 /* Combining two shifted states means re-centring one on the other's k:
  *   sum'   = sum   + n*dk
  *   sumsq' = sumsq + 2*dk*sum + n*dk^2      (dk = k_src - k_dst)
@@ -499,12 +552,16 @@ static void var_i64_merge(void* dd, const void* ss, acc_arena_t* a) {
     (void)a; var_i64_state* d = dd; const var_i64_state* s = ss;
     if (s->cnt == 0) return;
     if (d->cnt == 0) { *d = *s; return; }
-    double dk = (double)(int64_t)((uint64_t)s->k - (uint64_t)d->k), sn = (double)s->cnt;
+    /* a partial that may hold a wrapped difference (see VAR_ACC_STEP_I64);
+     * the merged sums could hide it */
+    if (RAY_UNLIKELY(!(s->sumsq < VAR_SQ_WRAP) || !(d->sumsq < VAR_SQ_WRAP))) var_i64_suspect();
+    double dk = var_i64_diff(s->k, d->k), sn = (double)s->cnt;
     d->sumsq += s->sumsq + 2.0*dk*s->sum + sn*dk*dk;
     d->sum   += s->sum + sn*dk;
     d->cnt   += s->cnt;
 }
 static inline double var_i64_varpop(const var_i64_state* st) {
+    if (RAY_UNLIKELY(!(st->sumsq < VAR_SQ_WRAP))) var_i64_suspect();
     double n = (double)st->cnt;
     double vp = (st->sumsq - st->sum*st->sum/n) / n;   /* an overflowed sum^2 leaves -inf */
     /* an intermediate that overflowed is null, never a number (#1669) */
@@ -1720,15 +1777,7 @@ static const agg_vtable_t AVG_TIMESTAMP_NATIVE = {
     .merge = avg_i128_merge, .finalize = avg_i128_final, .finalize_value = avg_i128_final_value,
 };
 
-static void var_timestamp_native_update(void* base, size_t stride, const uint32_t* gids,
-                           const void* vals, const ray_valid_t* valid,
-                           int64_t n, acc_arena_t* a) {
-    (void)a; const int64_t* d = (const int64_t*)vals;
-    AGG_UPDATE_LOOP(valid, n, {
-        var_i64_state* st = (var_i64_state*)((char*)base + (size_t)gids[i]*stride);
-        VAR_ACC_STEP_INT(st, d[i]);
-    });
-}
+VAR_I64_UPDATE(var_timestamp_native_update)
 
 static const agg_vtable_t VAR_TIMESTAMP_NATIVE = {
     .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64,
@@ -1954,6 +2003,7 @@ static double fin_var_k_i64_result(const void* s) {
 AGG_SCALAR_FINAL(fin_var_k_i64, double, ray_f64, value != value)
 static double fin_var_d_i64_result(const void* s) {
     const var_i64_state* st = s;
+    if (RAY_UNLIKELY(!(st->sumsq < VAR_SQ_WRAP))) var_i64_suspect();
     double d = st->cnt <= 0 ? NULL_F64 : ray_var_k_rem(st->k) + st->sum / (double)st->cnt;
     return isfinite(d) ? d : NULL_F64;
 }
@@ -1991,6 +2041,36 @@ VAR_KD_TABLES(DATE, i64, var_date_native_update)
 VAR_KD_TABLES(TIME, i64, var_time_native_update)
 VAR_KD_TABLES(TIMESTAMP, i64, var_timestamp_native_update)
 #undef VAR_KD_TABLES
+
+/* The 64-bit variance family with every row's difference overflow-checked
+ * (#1670): exec_group_v2's second run asks for them (agg_resolve_checked). */
+#define VAR_CHECKED_TABLE(NAME, FIN)                                          \
+static const agg_vtable_t NAME = {                                             \
+    .state_size = sizeof(var_i64_state), .kind = ACC_STREAMING, .out_type = RAY_F64, \
+    .init = var_i64_init, .update_batch = var_i64_update_checked,              \
+    .merge = var_i64_merge, .finalize = FIN, .finalize_value = FIN##_value,     \
+};
+VAR_CHECKED_TABLE(VAR_I64_CHECKED, fin_var_i64)
+VAR_CHECKED_TABLE(VAR_POP_I64_CHECKED, fin_var_pop_i64)
+VAR_CHECKED_TABLE(STDDEV_I64_CHECKED, fin_stddev_i64)
+VAR_CHECKED_TABLE(STDDEV_POP_I64_CHECKED, fin_stddev_pop_i64)
+VAR_CHECKED_TABLE(VAR_K_I64_CHECKED, fin_var_k_i64)
+VAR_CHECKED_TABLE(VAR_D_I64_CHECKED, fin_var_d_i64)
+#undef VAR_CHECKED_TABLE
+
+const agg_vtable_t* agg_resolve_checked(uint16_t agg_kind, int8_t in_type) {
+    if (in_type == RAY_I64 || in_type == RAY_TIMESPAN || in_type == RAY_TIMESTAMP)
+        switch (agg_kind) {
+        case OP_VAR:        return &VAR_I64_CHECKED;
+        case OP_VAR_POP:    return &VAR_POP_I64_CHECKED;
+        case OP_STDDEV:     return &STDDEV_I64_CHECKED;
+        case OP_STDDEV_POP: return &STDDEV_POP_I64_CHECKED;
+        case OP_VAR_K:      return &VAR_K_I64_CHECKED;
+        case OP_VAR_D:      return &VAR_D_I64_CHECKED;
+        default: break;
+        }
+    return agg_resolve(agg_kind, in_type);
+}
 
 /* VAR_K / VAR_D of in_type: the pair whose update is VAR_POP's for it. */
 static const agg_vtable_t* agg_resolve_var_kd(uint16_t agg_kind, const agg_vtable_t* pop) {
