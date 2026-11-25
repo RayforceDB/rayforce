@@ -1,0 +1,79 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1742: a cast of a literal used as a comparison's bound prunes as the
+;; literal it denotes: (as 'TIMESTAMP n) and (as (quote TIMESTAMP) n) skip the
+;; partitions the timestamp column's statistics rule out, as the timestamp
+;; literal does.  A cast that raises narrows nothing and raises as before.
+;;
+;; The fixture is #1604's: two date partitions of 70 000 uncompressed rows,
+;; the second partition's ts values copied over the first's in place, so a
+;; select that skips the first partition counts the second's rows alone and
+;; one that reads it counts them twice.  A second, untouched root checks every
+;; answer against the same select with pruning off: the where written as
+;; (or false p p), which narrows no partition.
+
+(set R (format "/tmp/rfl_part_castb_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %/stale %/clean" R R R)) -- 0
+(set n 70000)
+(set mk (fn [d] (table [ts s v] (list (+ d (* 1000000 (til n))) (at ['x 'y 'z] (% (til n) 3)) (at [1 0Nl 3 4 5] (% (til n) 5))))))
+(.db.splayed.set (format "%/stale/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/stale/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.sys.exec (format "dd if=%/stale/2026.01.06/t/ts of=%/stale/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null" R R)) -- 0
+(set P (.db.parted.get (format "%/stale/" R) 't))
+(set C (.db.parted.get (format "%/clean/" R) 't))
+
+;; 2026.01.06D00:00:00 is 820972800000000000 ns from 2000.01.01
+(as 'TIMESTAMP 820972800000000000) -- 2026.01.06D00:00:00.000000000
+;; the literal skips the first partition; both cast spellings now do too
+(at (select {c: (count v) from: P where: (>= ts 2026.01.06D00:00:00.000)}) 'c) -- [70000]
+(at (select {c: (count v) from: P where: (>= ts (as 'TIMESTAMP 820972800000000000))}) 'c) -- [70000]
+(at (select {c: (count v) from: P where: (>= ts (as (quote TIMESTAMP) 820972800000000000))}) 'c) -- [70000]
+(at (select {c: (count v) from: P where: (> (as (quote TIMESTAMP) 820972800000000000) ts)}) 'c) -- [0]
+(at (select {c: (count v) from: P where: (and (== s 'x) (>= ts (as (quote TIMESTAMP) 820972800000000000)))}) 'c) -- [23334]
+(count (select {from: P where: (>= ts (as 'TIMESTAMP 820972800000000000)) k: (+ v 1)})) -- 70000
+;; a null bound decides nothing, as the null literal: both partitions read
+(at (select {c: (count v) from: P where: (>= ts (as (quote TIMESTAMP) 0Nl))}) 'c) -- [140000]
+;; a cast that raises still raises
+(select {c: (count v) from: P where: (>= ts (as (quote TIMESTAMP) "bad"))}) !- domain
+(select {c: (count v) from: C where: (or false (>= ts (as (quote TIMESTAMP) "bad")) (>= ts (as (quote TIMESTAMP) "bad")))}) !- domain
+
+;; every answer equals the one without pruning, on the untouched root
+(select {c: (count v) m: (max v) from: C where: (>= ts (as 'TIMESTAMP 820972800000000000))}) -- (select {c: (count v) m: (max v) from: C where: (or false (>= ts (as 'TIMESTAMP 820972800000000000)) (>= ts (as 'TIMESTAMP 820972800000000000)))})
+(select {c: (count v) m: (max v) from: C where: (>= ts (as (quote TIMESTAMP) 820972800000000000))}) -- (select {c: (count v) m: (max v) from: C where: (or false (>= ts (as (quote TIMESTAMP) 820972800000000000)) (>= ts (as (quote TIMESTAMP) 820972800000000000)))})
+(select {c: (count v) from: C where: (and (== s 'x) (< ts (as (quote TIMESTAMP) 820972800000000000)))}) -- (select {c: (count v) from: C where: (or false (and (== s 'x) (< ts (as (quote TIMESTAMP) 820972800000000000))) (and (== s 'x) (< ts (as (quote TIMESTAMP) 820972800000000000))))})
+(select {from: C where: (>= ts (as (quote TIMESTAMP) 820972800000000000)) k: (+ v 1)}) -- (select {from: C where: (or false (>= ts (as (quote TIMESTAMP) 820972800000000000)) (>= ts (as (quote TIMESTAMP) 820972800000000000))) k: (+ v 1)})
+
+;; The fold is for the partition mask only: the select's plan is dev's, so
+;; a cast in a where:, an output, a by: key or an if arm answers, types and
+;; raises exactly as it did (#1743 review).
+(set tb (table [v] (list [-1 0 1 2])))
+(set nb (table [v] (list [-1 65535 4294967295])))
+;; a narrow negative cast keeps its sign
+(at (select {from: nb where: (in v (as 'I16 -1))}) 'v) -- [-1]
+(at (select {from: tb where: (in v (as 'I16 -1))}) 'v) -- [-1]
+(at (select {from: tb where: (in v (as (quote I32) -1))}) 'v) -- [-1]
+;; a type held by a name resolves as the evaluator resolves it: the output first
+(set typ 'I32)
+(at (select {from: tb typ: 'F64 r: (as typ 1)}) 'r) -- [1.0 1.0 1.0 1.0]
+(select {from: tb typ: 'BAD r: (as typ 1)}) !- domain
+;; a vector cast stays one cell per row, and an empty selection raises nothing
+(at (select {from: tb r: (as 'DATE [1 2])}) 'r) -- (list [2000.01.02 2000.01.03] [2000.01.02 2000.01.03] [2000.01.02 2000.01.03] [2000.01.02 2000.01.03])
+(count (select {from: tb where: (> v 100) r: (as 'DATE [1 2])})) -- 0
+;; a constant cast as a group key still broadcasts
+(at (select {from: tb n: (count v) by: {k: (as 'I32 1)}}) 'n) -- [4]
+;; an untaken DATE or TIMESTAMP arm is not checked against the other
+(at (select {from: tb r: (if false (as 'DATE 0) 42)}) 'r) -- [42 42 42 42]
+(count (select {from: tb where: (> v 100) r: (if false (as 'DATE 0) 42)})) -- 0
+(count (select {from: C where: (>= ts (as 'TIMESTAMP 820972800000000000)) r: (if false (as 'TIMESTAMP 0) 42)})) -- 70000
+(count (select {from: C where: (>= ts (as (quote TIMESTAMP) 900000000000000000)) r: (if false (as 'TIMESTAMP 0) 42)})) -- 0
+
+;; a narrow negative bound prunes as its literal, on a compressed root
+(.db.splayed.set (format "%/n16/2026.01.05/t/" R) (table [i] (list (as 'I16 (- 0 (+ 1 (% (til 70000) 3)))))) (format "%/n16/.sym" R) {compress: true})
+(.db.splayed.set (format "%/n16/2026.01.06/t/" R) (table [i] (list (as 'I16 (+ 1 (% (til 70000) 3))))) (format "%/n16/.sym" R) {compress: true})
+(set Z (.db.parted.get (format "%/n16/" R) 't))
+(select {c: (count i) from: Z where: (== i (as 'I16 -1))}) -- (select {c: (count i) from: Z where: (or false (== i (as 'I16 -1)) (== i (as 'I16 -1)))})
+(at (select {c: (count i) from: Z where: (< i (as (quote I16) 0))}) 'c) -- [70000]
+(select {c: (count i) from: Z where: (< i (as (quote I16) 0))}) -- (select {c: (count i) from: Z where: (or false (< i (as (quote I16) 0)) (< i (as (quote I16) 0)))})
+
+(.sys.exec (format "rm -rf %" R)) -- 0
