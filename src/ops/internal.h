@@ -2457,6 +2457,9 @@ ray_t* exec_like(ray_graph_t* g, ray_op_t* op);
 ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection);
 /* LIKE / ILIKE with a STR column as the pattern: row i against pattern i (#1615). */
 ray_t* ray_like_rows(ray_t* x, ray_t* pat, bool ci);
+/* Test hook: segments of a generation-2 STR column a like read by vector
+ * (#1645), since process start. */
+uint64_t ray_like_test_by_vector(void);
 bool   ray_like_pat_rows(ray_t* pat);
 ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op);
 ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op);
