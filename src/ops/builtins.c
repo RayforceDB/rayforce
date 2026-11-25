@@ -1249,13 +1249,16 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
 } while (0)
 #define CAST_LOOP(R, W, EXPR) CAST_LOOP_RANGE(R, W, EXPR, 0, n2)
 
-/* Same-byte-rep type relabels (I64↔TIMESTAMP, I32↔DATE↔TIME): the
- * per-element data is identical, so a single memcpy populates the new
- * vector.  Returns true on hit. */
+/* Same-byte-rep type relabels (I64↔TIMESTAMP, I64↔TIMESPAN,
+ * I32↔DATE↔TIME): the per-element data is identical, so a single memcpy
+ * populates the new vector.  TIMESTAMP↔TIMESPAN is not one (a timestamp to
+ * a span is the time of day; a span to a timestamp is refused).  Returns
+ * true on hit. */
 static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
     if (a == b) return true;
     if ((a == RAY_I64 || a == RAY_TIMESTAMP) &&
         (b == RAY_I64 || b == RAY_TIMESTAMP)) return true;
+    if ((a == RAY_I64 && b == RAY_TIMESPAN) || (a == RAY_TIMESPAN && b == RAY_I64)) return true;
     if ((a == RAY_I32 || a == RAY_DATE || a == RAY_TIME) &&
         (b == RAY_I32 || b == RAY_DATE || b == RAY_TIME)) return true;
     return false;
@@ -1682,10 +1685,16 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     if (RAY_IS_ERR(vec)) return vec;
     vec->len = n2;
 
-    /* Fast path: typed numeric vec → numeric vec, no list/string. */
+    /* Fast path: typed numeric vec → numeric vec, no list/string.  A
+     * TIMESPAN takes it only to or from I64 (or to itself), a copy of the
+     * 8-byte values with the nulls carried over (#1634); every other pair
+     * with a TIMESPAN converts per cell (the time of day of a timestamp,
+     * TIME * 1e6, a rounded float, a refused span to timestamp). */
+    bool span_copy = (val->type == RAY_TIMESPAN && (out_type == RAY_I64 || out_type == RAY_TIMESPAN)) ||
+                     (val->type == RAY_I64 && out_type == RAY_TIMESPAN);
     if (ray_is_vec(val) && val->type != RAY_STR && val->type != RAY_SYM &&
         val->type != RAY_GUID && out_type != RAY_SYM &&
-        val->type != RAY_TIMESPAN && out_type != RAY_TIMESPAN) {
+        (span_copy || (val->type != RAY_TIMESPAN && out_type != RAY_TIMESPAN))) {
         ray_t* fast = cast_vec_numeric_fast(val, vec, out_type);
         /* Three return states (helper does NOT release `vec`):
          *   - vec on success
