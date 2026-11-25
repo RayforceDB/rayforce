@@ -11389,17 +11389,26 @@ typedef struct {
     uint8_t       cattrs;
     int64_t       dn;
     uint64_t*     bits;      /* [ceil(dn/64)] */
+    int64_t       stop_at;   /* more ids than this fail the gate: the marking stops */
+    _Atomic(int64_t) marked; /* the ids marked so far (each task adds its morsel's) */
     atomic_bool   foreign;   /* an id past the domain */
 } dk_used_ctx_t;
 static void dk_used_mark_fn(void* vctx, uint32_t wid, int64_t start, int64_t end) {
     (void)wid;
     dk_used_ctx_t* c = (dk_used_ctx_t*)vctx;
-    for (int64_t r = start; r < end; r++) {
-        int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
-        if (id < 0 || id >= c->dn) { atomic_store_explicit(&c->foreign, true, memory_order_relaxed); return; }
-        uint64_t m = (uint64_t)1 << (id & 63);
-        _Atomic(uint64_t)* w = (_Atomic(uint64_t)*)&c->bits[id >> 6];
-        if (!(atomic_load_explicit(w, memory_order_relaxed) & m)) atomic_fetch_or_explicit(w, m, memory_order_relaxed);
+    for (int64_t lo = start; lo < end; lo += RAY_MORSEL_ELEMS) {
+        if (atomic_load_explicit(&c->marked, memory_order_relaxed) > c->stop_at) return;
+        int64_t hi = lo + RAY_MORSEL_ELEMS < end ? lo + RAY_MORSEL_ELEMS : end;
+        int64_t fresh = 0;
+        for (int64_t r = lo; r < hi; r++) {
+            int64_t id = ray_read_sym(c->cd, r, RAY_SYM, c->cattrs);
+            if (id < 0 || id >= c->dn) { atomic_store_explicit(&c->foreign, true, memory_order_relaxed); return; }
+            uint64_t m = (uint64_t)1 << (id & 63);
+            _Atomic(uint64_t)* w = (_Atomic(uint64_t)*)&c->bits[id >> 6];
+            if (!(atomic_load_explicit(w, memory_order_relaxed) & m) &&
+                !(atomic_fetch_or_explicit(w, m, memory_order_relaxed) & m)) fresh++;
+        }
+        if (fresh) atomic_fetch_add_explicit(&c->marked, fresh, memory_order_relaxed);
     }
 }
 static inline int64_t dk_used_rank(const uint64_t* bits, const uint32_t* prefix, int64_t id) {
@@ -11407,20 +11416,30 @@ static inline int64_t dk_used_rank(const uint64_t* bits, const uint32_t* prefix,
 }
 /* Mark the ids of C's n rows (in parallel) and rank them: *bits and
  * *prefix in one scratch block (*hdr), the used count returned; -1 on OOM,
- * a foreign id or a cancel (nothing kept). */
-static int64_t dk_used_vocab(ray_t* C, int64_t n, int64_t dn, ray_pool_t* rpool,
+ * a foreign id or a cancel (nothing kept).  The block is dn/64 words plus
+ * dn/64 prefixes — 24 MB for a 131M-entry symfile, 400 MB at the int32
+ * limit of the ids — and lives for this pass and, when the gate passes,
+ * the slot coding; it is outside the per-task bitmap budget, which bounds
+ * what grows with the pool.  A column that uses more than `stop_at` ids
+ * fails the gate (used * 4 > rows): the tasks count the ids they mark,
+ * and stop at the next morsel once the count is past it, so a near-unique
+ * column costs a quarter of a pass, not a whole one. */
+static int64_t dk_used_vocab(ray_t* C, int64_t n, int64_t dn, int64_t stop_at, ray_pool_t* rpool,
                              ray_t** hdr, uint64_t** bits, uint32_t** prefix) {
     int64_t words = (dn + 63) / 64;
     char* mem = (char*)scratch_calloc(hdr, (size_t)words * sizeof(uint64_t) + (size_t)(words + 1) * sizeof(uint32_t));
     if (!mem) return -1;
     *bits = (uint64_t*)mem;
     *prefix = (uint32_t*)(mem + (size_t)words * sizeof(uint64_t));
-    dk_used_ctx_t uc = { .cd = ray_data(C), .cattrs = C->attrs, .dn = dn, .bits = *bits };
+    dk_used_ctx_t uc = { .cd = ray_data(C), .cattrs = C->attrs, .dn = dn, .bits = *bits, .stop_at = stop_at };
+    atomic_init(&uc.marked, 0);
     atomic_init(&uc.foreign, false);
     if (ray_pool_par_dispatch_ok(rpool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(rpool, dk_used_mark_fn, &uc, n);
     else dk_used_mark_fn(&uc, 0, 0, n);
-    if (pool_cancelled(rpool) || atomic_load_explicit(&uc.foreign, memory_order_relaxed)) {
-        scratch_free(*hdr); *hdr = NULL; return -1;
+    if (pool_cancelled(rpool) || atomic_load_explicit(&uc.foreign, memory_order_relaxed) ||
+        atomic_load_explicit(&uc.marked, memory_order_relaxed) > stop_at) {
+        scratch_free(*hdr); *hdr = NULL;
+        return pool_cancelled(rpool) || atomic_load_explicit(&uc.foreign, memory_order_relaxed) ? -1 : stop_at + 1;
     }
     uint64_t used = 0;
     for (int64_t w = 0; w < words; w++) { (*prefix)[w] = (uint32_t)used; used += (uint64_t)__builtin_popcountll((*bits)[w]); }
@@ -11770,9 +11789,10 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     uint32_t* used_prefix = NULL;
     int64_t   used = 0;
     bool vocab_small = false;
+    const int64_t mem_budget = dk_mem_budget();        /* <= 0: unknown, no by-dict gate */
     if (sym && !sel && dn <= INT32_MAX && n >= 4 &&
-        (al || (text_syms && (uint64_t)n * 16 > (uint64_t)dk_mem_budget() / 8))) {
-        used = dk_used_vocab(C, n, dn, ray_pool_get(), &used_hdr, &used_bits, &used_prefix);
+        (al || (text_syms && mem_budget > 0 && (uint64_t)n * 16 > (uint64_t)mem_budget / 8))) {
+        used = dk_used_vocab(C, n, dn, n / 4, ray_pool_get(), &used_hdr, &used_bits, &used_prefix);
         if (used > 0 && used * 4 <= n) vocab_small = true;
         else if (used_hdr) { scratch_free(used_hdr); used_hdr = NULL; }
         if (used < 0 && pool_cancelled(ray_pool_get())) return NULL;
@@ -11806,16 +11826,27 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
     uint32_t tasks = par ? ray_pool_total_workers(rpool) * 2 : 1;
     if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
     while (tasks > 1 && n / tasks < 16384) tasks /= 2;
-    if (n > INT32_MAX) return NULL;                     /* the codes are int32 */
+    if (n > INT32_MAX) {                                /* the codes are int32 */
+        if (used_hdr) scratch_free(used_hdr);
+        return NULL;
+    }
     ray_t* ids = NULL;
     if (!direct_spread) {
         ids = ray_vec_new(RAY_I32, n);
-        if (!ids || RAY_IS_ERR(ids)) { if (ids) ray_error_free(ids); return NULL; }
+        if (!ids || RAY_IS_ERR(ids)) {
+            if (ids) ray_error_free(ids);
+            if (used_hdr) scratch_free(used_hdr);
+            return NULL;
+        }
         ids->len = n;
     }
     ray_t* tk_hdr = NULL;
     dks_task_t* tk = (dks_task_t*)scratch_calloc(&tk_hdr, (size_t)tasks * (sizeof(dks_task_t) + sizeof(int64_t*)));
-    if (!tk) { ray_release(ids); return NULL; }
+    if (!tk) {
+        ray_release(ids);
+        if (used_hdr) scratch_free(used_hdr);
+        return NULL;
+    }
     int64_t** remap = (int64_t**)(tk + tasks);
     /* a task's table holds at most half its rows' values (a near-unique
      * stretch refuses) */
