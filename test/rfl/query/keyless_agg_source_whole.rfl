@@ -12,8 +12,9 @@
 (at (select {from: T s: (first ((fn [y] (let q (count y)) q) v)) z: (first (+ d 0))}) 's) -- [4]
 (at (select {from: T s: (first (hq v))}) 's) -- (at (select {from: T by: k s: (first (hq v))}) 's)
 (at (select {from: T s: (sum (hq v))}) 's) -- (at (select {from: T by: k s: (sum (hq v))}) 's)
-(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [4]
-(at (select {from: T s: (sum (hq v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [3]
+;; its scalar stands for every row, as (count v) inline does (#1576)
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [16]
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [9]
 (at (select {from: T s: (sum ((fn [y] (* y 2)) v)) z: (first (+ d 0))}) 's) -- [200]
 (at (select {from: T s: (max ((fn [y] (* y 2)) v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [80]
 ;; #1402: a call that is not elementwise, for every aggregate

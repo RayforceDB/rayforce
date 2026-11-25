@@ -3,8 +3,8 @@
 ;; planner declines), a scalar an aggregate's source gives stands for every
 ;; row, as 1 does in (sum 1) and as on the planned route: (sum (count v))
 ;; over 4 rows is 16, under a where: keeping 3 rows 9.  The fallback folded
-;; it once (4, 3).  A non-inlined helper's scalar is folded once on every
-;; route, as pinned by #1401; whether it should spread is #1576.  Each line
+;; it once (4, 3).  A non-inlined helper's scalar spreads too, on every
+;; route (#1576; it was folded once, as #1401 pinned).  Each line
 ;; is the fallback against the planned route, over 13 aggregates of 9
 ;; sources, with no where:, one keeping 3 rows and one keeping none; prod
 ;; over no row differs between the routes for any source (#1577) and is
@@ -16,9 +16,9 @@
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0))}) 's) -- (at (select {from: T s: (sum C)}) 's)
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0))}) 's) -- [16]
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- [9]
-;; the helper's scalar, folded on every route, as before
-(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [4]
-(at (select {from: T s: (sum (hq v))}) 's) -- [4]
+;; the helper's scalar spreads on every route, as the inline count does (#1576)
+(at (select {from: T s: (sum (hq v)) z: (first (+ d 0))}) 's) -- [16]
+(at (select {from: T s: (sum (hq v))}) 's) -- [16]
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0))}) 's) -- (at (select {from: T s: (sum (count v))}) 's)
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0)) where: (> v 15)}) 's) -- (at (select {from: T s: (sum (count v)) where: (> v 15)}) 's)
 (at (select {from: T s: (sum (count v)) z: (first (+ d 0)) where: (> v 100)}) 's) -- (at (select {from: T s: (sum (count v)) where: (> v 100)}) 's)

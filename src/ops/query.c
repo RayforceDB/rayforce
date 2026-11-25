@@ -11935,6 +11935,58 @@ static ray_t* eval_whole_edge_skip(ray_t* expr, ray_t* tbl) {
     return r;
 }
 
+static ray_t* scalar_atom_rows(ray_t* a, int64_t nrows);
+
+/* A scalar that a helper the planner does not inline gives as an
+ * aggregate's argument stands for every row of the group, as `1` does in
+ * `(sum 1)` and as the same code written inline does: (sum (hq v)) with hq
+ * giving (count v) is the count times the group's rows (#1576).  The
+ * aggregate's argument is wrapped in this function (helper_spread_walk);
+ * it runs inside the per-group pass, which names the group's rows. */
+static ray_t* helper_spread_fn(ray_t* x) {
+    if (x) ray_retain(x);
+    if (!x || RAY_IS_ERR(x) || !ray_is_atom(x) || !g_active_query_group_idx) return x;
+    int64_t n = ray_len(g_active_query_group_idx);
+    if (x->type == -RAY_STR && n != 0) return x;   /* text stays one value, as on the fallback */
+    return scalar_atom_rows(x, n);
+}
+
+/* `e` with each argument of an aggregate call that still calls a helper
+ * (one query_inline_helpers could not expand) wrapped in `sp`; `e` itself
+ * (retained) when none is.  A lambda, a quoted form or a nested query keeps
+ * its own rule and is not entered. */
+static ray_t* helper_spread_walk(ray_t* e, ray_t* sp) {
+    if (!e || e->type != RAY_LIST || e->len == 0 || (e->attrs & ATTR_QUOTED)) { ray_retain(e); return e; }
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) &&
+        (h->i64 == ray_sym_intern("fn", 2) || h->i64 == ray_sym_intern("quote", 5) ||
+         h->i64 == ray_sym_intern("select", 6) || h->i64 == ray_sym_intern("update", 6) ||
+         h->i64 == ray_sym_intern("exec", 4))) { ray_retain(e); return e; }
+    bool agg = is_agg_expr(e) && !ray_env_has_lexical_local(h->i64);
+    ray_t* out = ray_list_new(e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    ray_t** os = (ray_t**)ray_data(out);
+    bool changed = false;
+    for (int64_t k = 0; k < e->len; k++) {
+        ray_t* c = k == 0 ? (ray_retain(es[0]), es[0]) : helper_spread_walk(es[k], sp);
+        if (c && !RAY_IS_ERR(c) && k > 0 && agg && query_expr_has_helper(es[k])) {
+            ray_t* w = ray_list_new(2);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, sp);
+            if (w && !RAY_IS_ERR(w)) w = ray_list_append(w, c);
+            ray_release(c);
+            c = w ? w : ray_error("oom", NULL);
+        }
+        if (!c || RAY_IS_ERR(c)) { out->len = k; ray_release(out); return c ? c : ray_error("oom", NULL); }
+        if (c != es[k]) changed = true;
+        os[k] = c;
+    }
+    out->len = e->len;
+    out->attrs = e->attrs;
+    if (!changed) { ray_release(out); ray_retain(e); return e; }
+    return out;
+}
+
 static ray_t* nonagg_eval_per_group_impl(ray_t* expr, ray_t* tbl,
                                          idx_feeder_fn feeder, void* fstate,
                                          int64_t n_groups) {
@@ -12474,6 +12526,28 @@ static ray_t* nonagg_eval_per_group_core(ray_t* expr, ray_t* tbl,
     }
     if (fsk && !RAY_IS_ERR(fsk)) ray_release(fsk); else if (fsk) ray_error_free(fsk);
     if (lsk && !RAY_IS_ERR(lsk)) ray_release(lsk); else if (lsk) ray_error_free(lsk);
+    if (edged && !RAY_IS_ERR(edged) && query_expr_has_helper(edged)) {
+        ray_t* sp = ray_fn_unary("spread", RAY_FN_NONE, helper_spread_fn);
+        if (!sp || RAY_IS_ERR(sp)) {
+            ray_release(edged);
+            if (hoisted) ray_release(hoisted);
+            if (hs.out) ray_release(hs.out);
+            for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
+            g_query_dependencies = prev;
+            return sp ? sp : ray_error("oom", NULL);
+        }
+        ray_t* spread = helper_spread_walk(edged, sp);
+        ray_release(sp);
+        ray_release(edged);
+        edged = spread;
+        if (!edged || RAY_IS_ERR(edged)) {
+            if (hoisted) ray_release(hoisted);
+            if (hs.out) ray_release(hs.out);
+            for (int i = 0; i < cache.n; i++) ray_release(cache.exprs[i]);
+            g_query_dependencies = prev;
+            return edged ? edged : ray_error("oom", NULL);
+        }
+    }
     ray_t* result = nonagg_eval_per_group_impl(edged, tbl, feeder, fstate, n_groups);
     ray_release(edged);
     if (hoisted) ray_release(hoisted);
@@ -16428,10 +16502,11 @@ static ray_t* scalar_edge_src_whole(ray_t* e, ray_t* tbl, int64_t nrows, bool sp
         ray_release(src);
         return NULL;
     }
-    /* first/last: a scalar stands for every row.  Any other aggregate
-     * folds the one value the source gave, as by: folds it for a group:
-     * (sum (h v)) with h giving (count v) is that count, not count times
-     * the rows (#1401). */
+    /* With `spread` (first/last, a source holding an aggregate or calling
+     * a helper the planner does not inline) a scalar stands for every row,
+     * as 1 does in (sum 1): (sum (h v)) with h giving (count v) is the count
+     * times the rows (#1571, #1576).  Otherwise the aggregate folds the one
+     * value the source gave. */
     if (spread && ray_is_atom(src) && (src->type != -RAY_STR || nrows == 0)) src = scalar_atom_rows(src, nrows);
     return src;
 }
@@ -16676,10 +16751,9 @@ static ray_t* eval_scalar_agg_outputs(ray_t** dict_elems, int64_t dict_n,
              * runs per row, as before. */
             /* A scalar the source gives stands for every row, as 1 does in
              * (sum 1), as on the planned route: (sum (count v)) over 4 rows
-             * is 16 (#1571).  A non-inlined helper's scalar is folded once,
-             * as every route gives it ((sum (hq v)) is the count; whether
-             * that should spread too is #1576). */
-            bool spread = edge || expr_contains_agg(agg_src_expr);
+             * is 16 (#1571).  So does a non-inlined helper's scalar:
+             * (sum (hq v)) with hq giving (count v) is 16 too (#1576). */
+            bool spread = edge || expr_contains_agg(agg_src_expr) || query_expr_has_helper(agg_src_expr);
             /* over no row, fold or at of a column reads as on dev, per row
              * (nothing): (sum (fold + v)) is 0, not fold's empty error */
             bool empty_whole = nrows == 0 && (expr_reads_group_whole(agg_src_expr, tbl) ||

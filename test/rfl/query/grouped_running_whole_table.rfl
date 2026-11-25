@@ -518,7 +518,8 @@
 ;; A helper with an aggregate inside runs per group when it fails over the
 ;; whole table, or gives no value per row.
 (set ha (fn [x] (let y x) (avg y)))
-(Z (select {from: T by: k z: (sum (ha i))})) -- [7.0 14.0]
+;; its scalar, the group's avg, stands for each of the group's 3 rows (#1576)
+(Z (select {from: T by: k z: (sum (ha i))})) -- [21.0 42.0]
 (set he (fn [x] (let y x) (if (> (count y) 3) (raise "big") (sums y))))
 (Z (select {from: T by: k z: (sum (he i))})) -- [27 54]
 ;; An aggregate passed to a helper is the group's, as it is inline: the
@@ -551,7 +552,8 @@ NC -- 2
 ;; tried over the whole table first.
 (set NR 0)
 (set hred (fn [x] (set NR (+ NR 1)) (let y x) (med y)))
-(Z (select {from: T by: k z: (sum (hred i))})) -- [4.0 8.0]
+;; its scalar, the group's med, stands for each of the group's 3 rows (#1576)
+(Z (select {from: T by: k z: (sum (hred i))})) -- [12.0 24.0]
 NR -- 2
 ;; A helper that gives a LIST (not one typed value per row) runs per group.
 (set hlst (fn [x] (let y x) (map (fn [a] (list a a)) (sums y))))
