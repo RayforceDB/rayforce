@@ -66,3 +66,24 @@
 (all (== (at L 'c) (at ["" "x"] (at LI 'ix)))) -- true
 (sum (== (at L 'c) "")) -- 1892
 (count (select {from: L where: (== a "a-very-long-literal-text")})) -- 1892
+
+;; ── an arm's memo is seeded only from values over the table its rows
+;; index: a select that reorders or filters its rows (a sort key, a sorted
+;; inner select, a where) answers the if-chain over the reordered rows, as
+;; the chain written without the alias does ──
+(set w (% (* 7919 i) 70001))
+(set T2 (table [u v w] (list u i w)))
+(set PT (fn [x] (if (like x "*site7.com/*") 1 (like x "*site1*") 2 3)))
+(set KR (fn [r] (ser (list (at r 'v) (at r 'pt)))))
+(set A1 (select {from: T2 lu: (lower u) pt: (if (like lu "*site7.com/*") 1 (like lu "*site1*") 2 3) v: v desc: w}))
+(set B1 (select {from: T2 pt: (if (like (lower u) "*site7.com/*") 1 (like (lower u) "*site1*") 2 3) v: v desc: w}))
+(all (== (KR A1) (KR B1))) -- true
+(all (== (at A1 'pt) (PT (at (lower US) (at A1 'v))))) -- true
+(set A2 (select {from: (select {from: T2 desc: w}) lu: (lower u) pt: (if (like lu "*site7.com/*") 1 (like lu "*site1*") 2 3) v: v}))
+(all (== (KR A2) (KR B1))) -- true
+(set A3 (select {from: T2 lu: (lower u) pt: (if (like lu "*site7.com/*") 1 (like lu "*site1*") 2 3) v: v where: (and (like (lower u) "*site*") (>= w 0)) desc: w}))
+(all (== (KR A3) (KR B1))) -- true
+(set A4 (select {from: T2 lu: (lower u) pt: (if (like lu "*site7.com/*") 1 (like lu "*site1*") 2 3) v: v where: (> w 35000) asc: w}))
+(all (== (at A4 'pt) (PT (at (lower US) (at A4 'v))))) -- true
+(count A4) -- (sum (> w 35000))
+(sum (== (at A1 'pt) 1)) -- 1892

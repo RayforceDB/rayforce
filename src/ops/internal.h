@@ -2493,12 +2493,14 @@ typedef struct {
 void ray_exec_memo_push(ray_graph_t* g, ray_op_t* root, ray_exec_memo_save_t* save);
 void ray_exec_memo_pop(ray_graph_t* g, const ray_exec_memo_save_t* save);
 /* After a push for an `if` arm over rows ids[0..count) of the outer table's
- * `nrows`: the arm's memo takes, for every node it reads that the set-aside
+ * `nrows` rows of `ids_table` (the table before the arm's sub-table was
+ * swapped in; a memo armed over another table seeds nothing): the arm's
+ * memo takes, for every node it reads that the set-aside
  * outer memo holds a fixed-width value for, that value's rows at `ids` (the
  * value itself when count == nrows), so the arm reads shared nodes instead
  * of computing them again over its rows. */
 void ray_exec_memo_seed(ray_graph_t* g, const ray_exec_memo_save_t* outer, ray_op_t* branch,
-                        const int64_t* ids, int64_t count, int64_t nrows);
+                        ray_t* ids_table, const int64_t* ids, int64_t count, int64_t nrows);
 ray_t* exec_pivot(ray_graph_t* g, ray_op_t* op, ray_t* tbl);
 ray_t* pivot_flatten_parted(ray_t* tbl);
 /* A flattened copy of a table with a parted / mapcommon column (a ragged

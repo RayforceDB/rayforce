@@ -232,7 +232,7 @@ static void if_split_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
 }
 
 /* ids[0..*true_count) the rows the condition holds for, ids[*true_count..
- * selected) the others; false on OOM.  `ids` holds `selected` entries. */
+ * selected) the others; false on OOM or a cancel (pool_cancelled).  `ids` holds `selected` entries. */
 static bool if_split_ids(const uint8_t* cond, int64_t nrows, ray_t* outer_sel,
                          int64_t* ids, int64_t selected, int64_t* true_count) {
     int64_t n_segs = (nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS;
@@ -255,6 +255,8 @@ static bool if_split_ids(const uint8_t* cond, int64_t nrows, ray_t* outer_sel,
     bool par = ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
     if (par) ray_pool_dispatch(pool, if_split_fn, &c, nrows);
     else     if_split_fn(&c, 0, 0, nrows);
+    /* a cancelled dispatch left the counts of the tasks it skipped unwritten */
+    if (pool_cancelled(pool)) { scratch_free(hdr); return false; }
     int64_t t = 0, fl = 0;
     for (int64_t seg = 0; seg < n_segs; seg++) {
         toff[seg] = t; foff[seg] = fl;
@@ -268,7 +270,7 @@ static bool if_split_ids(const uint8_t* cond, int64_t nrows, ray_t* outer_sel,
     if (par) ray_pool_dispatch(pool, if_split_fn, &c, nrows);
     else     if_split_fn(&c, 0, 0, nrows);
     scratch_free(hdr);
-    return true;
+    return !pool_cancelled(pool);
 }
 
 static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
@@ -300,7 +302,7 @@ static ray_t* if_eval_branch(ray_graph_t* g, ray_op_t* branch,
     /* ... seeded with the outer values' rows the arm runs over, so a shared
      * node (a lower-cased column every condition of a chain reads) is
      * computed once, not once per arm. */
-    ray_exec_memo_seed(g, &memo_save, branch, ids, count, nrows);
+    ray_exec_memo_seed(g, &memo_save, branch, saved_table, ids, count, nrows);
     ray_t* value = exec_node(g, branch);
     ray_exec_memo_pop(g, &memo_save);
     if (g->selection) {
@@ -1089,7 +1091,7 @@ static __attribute__((noinline)) ray_t* exec_if_selected(ray_graph_t* g, ray_op_
         if (!ids) return ray_error("oom", NULL);
         if (!if_split_ids(cond, nrows, outer_sel, ids, selected, &true_count)) {
             scratch_free(ids_hdr);
-            return ray_error("oom", NULL);
+            return ray_error(pool_cancelled(ray_pool_get()) ? "cancel" : "oom", NULL);
         }
     }
     int64_t false_count = selected - true_count;
