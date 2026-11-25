@@ -325,6 +325,37 @@ The `de` builtin reconstructs a value from its binary representation. Compose it
 ;; => the same 3-row table with columns x (i64) and y (sym)
 ```
 
+### A list holding an error value { #a-list-holding-an-error-value }
+
+A list that holds an error value among its cells deserializes to its first
+error, not to the list: `de` and an IPC reply give that error alone, with its
+own code and message, and the other cells are lost. Journal replay does not
+pass that error on: a frame whose payload is such a list stops the replay
+there, after the entries before it have run, and
+[`.log.replay`](../namespaces/log.md#log-replay) fails with `deser`
+("deserialization failed at chunk N — framing intact, content/version
+skew"), not with the cell's code or message (`RAY_JREPLAY_DESER` from
+`ray_journal_replay` in C).
+
+No Rayfall program builds such a list. A caught error is a dict,
+`{code msg}` (`{code msg usage}` when it is about a builtin's call), and a
+list of those round-trips whole:
+
+```lisp
+(type (try (+ 1 "a") (fn [e] e)))            ;; => 'DICT
+(set L (list (try (+ 1 "a") (fn [e] e)) 3))
+(de (ser L))                                 ;; => the same two-cell list
+```
+
+An error that is not caught cannot become a cell: `(list 1 (+ 1 "a"))`
+raises the error instead of making a list. The case arises only for a list
+built in C, or read from the wire, whose cells hold `RAY_ERROR` objects. One
+is the reply to a request sent with `RAY_IPC_FLAG_VERBOSE`
+(`[captured, result]`): when the result is an error, the client reads that
+error, not the two cells. A C program that needs a list of errors to arrive
+whole carries each one as its dict form (see the
+[C API notes](../c-api/core.md#ray_err_code-ray_err_msg)).
+
 ## Wire Format
 
 Every serialized payload begins with a 16-byte `ray_ipc_header_t` header, followed by the serialized object bytes. The header layout:
@@ -447,6 +478,7 @@ The serialization functions are declared in `src/store/serde.h`:
 - **No streaming** — the entire object is serialized at once; there is no chunked or incremental mode
 - **Nesting depth** — a value nested deeper than 512 levels cannot be sent or received (`limit` when sending, `domain` when reading one)
 - **Repeated parts** — a value whose repeated shared parts would add more than 1 GiB of output cannot be sent (`limit`)
+- **Error cells** — a list built in C whose cells hold error objects reads back as its first error, not as the list, and stops a journal replay with `deser` (see [A list holding an error value](#a-list-holding-an-error-value)); a caught error, a dict, round-trips
 - **Single-threaded server** — the server processes queries sequentially on the main thread. Long-running queries block other clients.
 - **Plaintext transport** — data travels unencrypted over TCP. Use on trusted networks or tunnel through SSH for security.
 - **Shared secret only** — authentication uses a single password for all clients (`-u`/`-U`). There is no per-user access control.
