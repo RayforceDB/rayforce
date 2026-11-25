@@ -34,8 +34,9 @@ cnt -- 0
 (at (select {from: T where: (H a act)}) 'i) -- rows
 (at (select {from: T where: (C a act)}) 'i) -- rows
 (at (select {from: T where: (and (>= i 0) (H a act))}) 'i) -- rows
-;; a `let` read by a later argument of its `do` raises before the `if` (#1612)
-(select {from: T where: (do (let k (if (== act 'New) 'x 'y)) (== a k))}) !- schema
+;; a `let` read by a later form of its `do`: the `let` runs once over the
+;; rows, its `if` choosing per row, and the last form reads it (#1612, #1650)
+(at (select {from: T where: (do (let k (if (== act 'New) 'x 'y)) (== a k))}) 'i) -- rows
 ;; under by:, a `let` name crossing aggregates: per group as written (#1617);
 ;; the later aggregate reads the rebound name, the arm each row takes
 (set Tr (update {from: T h: hit r: arm}))

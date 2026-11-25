@@ -1,0 +1,247 @@
+;; @requires: posix
+;; Inside a query, a `do` of several forms runs its earlier forms ONCE per
+;; query, in order, over the selected rows (after where:), and its last form
+;; is then planned as if it stood alone, with the names the earlier forms bound
+;; by `let` visible to it (#1650, #1612).  On dev the planned routes compiled
+;; the last form alone: the earlier forms did not run, their errors were not
+;; raised (#1653) and their `let`s were read as columns ("schema").
+;; Relative paths stay inside the harness per-process working directory.
+
+(set T (table [i g a] (list (til 6) (% (til 6) 2) (at ['x 'y 'z] (% (til 6) 3)))))
+(set k 100)
+(set cnt 0)
+(set Lf (fn [x] (set cnt (+ cnt 1)) x))
+
+;; ── 1. a let's name is never substituted, nor read as a column ──
+(at (select {v: (do (let k 1) (let k (+ k 1))) from: T}) 'v) -- [2 2 2 2 2 2]
+(at (select {v: (do (let k 1) (do (let k 2) (+ i k))) from: T}) 'v) -- [2 3 4 5 6 7]
+(at (select {v: (do (let k 5) (+ i k)) from: T}) 'v) -- [5 6 7 8 9 10]
+(at (select {from: T where: (do (let m 'x) (== a m))}) 'i) -- [0 3]
+;; the global of that name is untouched
+k -- 100
+
+;; ── 2. a let bound to a lambda, then called ──
+(at (select {v: (do (let f (fn [x] (* x 2))) (f i)) from: T}) 'v) -- [0 2 4 6 8 10]
+(at (select {from: T where: (do (let f (fn [x] (> x 2))) (f i))}) 'i) -- [3 4 5]
+
+;; ── 3. a let's value is a binding: one of the rows is column-like, aligned
+;; with the selected rows; any other value is a constant ──
+;; beside an aggregate, under by:
+(value (select {v: (do (let kk (* i 10)) (+ (sum i) kk)) from: T by: g})) -- (list [0 1] (list [6 26 46] [19 39 59]))
+;; with where:, in a projection and in update
+(at (select {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (> i 1)}) 'v) -- [22 33 44 55]
+(at (update {v: (do (let kk (* i 10)) (+ (sum i) kk)) from: T where: (> i 1)}) 'v) -- [0N 0N 34 44 54 64]
+(at (update {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (> i 1)}) 'v) -- [0N 0N 22 33 44 55]
+;; a vector of another length is a constant
+(at (select {v: (do (let kk [10 20 30]) (at kk 0)) from: T where: (> i 2)}) 'v) -- [10 10 10]
+;; the rows a let reads are the selected rows, wherever they are read
+(at (select {v: (do (let s (sum i)) (+ i s)) from: T where: (> i 3)}) 'v) -- [13 14]
+(at (select {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (> i 1) take: 2}) 'v) -- [22 33]
+(value (select {c: (count i) from: T where: (> i 1) by: (do (let kk (% i 3)) kk)})) -- (list [2 0 1] [2 1 1])
+;; a computed key keeps the name its written form gives
+(key (select {c: (count i) from: T by: (do (let kk (% i 3)) kk)})) -- ['kk 'c]
+(key (select {c: (count i) from: T by: (do (set cnt 0) (+ i k))})) -- ['key 'c]
+
+;; a do in where: and one in an output, each binding a value of the rows:
+;; the output's earlier forms see the rows where: keeps
+(at (select {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (do (let m (* i 2)) (> m 4))}) 'v) -- [33 44 55]
+(at (update {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (do (let m (* i 2)) (> m 4))}) 'v) -- [0N 0N 0N 33 44 55]
+(value (select {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (do (let m (* i 2)) (> m 4)) by: g})) -- (list [1 0] (list [33 55] [44]))
+(at (update {v: (do (let kk (* i 1.5)) (+ i kk)) from: T where: (> i 3)}) 'v) -- [0Nf 0Nf 0Nf 0Nf 10.0 12.5]
+
+;; ── 4. provenance decides, not length: a value bound from the rows is
+;; aligned with the selected rows whatever their count; any other value is
+;; a written vector, under the rule for one (a global, a parameter, a let):
+;; one as long as the table is read as a column, one of another length is a
+;; `length` error in an aggregate, as the global written in place is ──
+(at (select {v: (do (let kk (* i 1)) (count kk)) from: T where: (> i 2)}) 'v) -- [3]
+(set V6 [9 9 9 9 9 9])
+(at (select {v: (do (let kk V6) (+ i kk)) from: T where: (> i 2)}) 'v) -- (at (select {v: (+ i V6) from: T where: (> i 2)}) 'v)
+(at (select {v: (do (let kk V6) (count kk)) from: T where: (> i 2)}) 'v) -- (at (select {v: (count V6) from: T where: (> i 2)}) 'v)
+(set V4 (til 4))
+(select {v: (do (let kk V4) (count kk)) from: T where: (> i 2)}) !- length
+(select {v: (count V4) from: T where: (> i 2)}) !- length
+(at (select {v: (do (let kk V4) (at kk 1)) from: T where: (> i 2)}) 'v) -- [1 1 1]
+
+;; ── 5. from: and where: are evaluated once ──
+(set cnt 0)
+(value (select {v: (do 0 (sum i)) from: (Lf T)})) -- (list [15])
+cnt -- 1
+(set cnt 0)
+(value (select {v: (do 0 (sum i)) from: T where: (> (Lf i) 2)})) -- (list [12])
+cnt -- 1
+(set cnt 0)
+(value (select {v: (do (let kk (* i 10)) (+ i kk)) from: T where: (> (Lf i) 3)})) -- (list [44 55])
+cnt -- 1
+
+;; the order: an output's earlier form that reads no rows runs before
+;; where:'s own effects; one that reads rows runs after where: is evaluated
+(set log [])
+(set W (fn [x] (set log (concat log ['w])) x))
+(at (select {v: (do (set log (concat log ['o])) i) from: T where: (> (W i) 2)}) 'v) -- [3 4 5]
+log -- ['o 'w]
+(set log [])
+(at (select {v: (do (set log (concat log (if (> (count i) 0) ['r] ['z]))) i) from: T where: (> (W i) 2)}) 'v) -- [3 4 5]
+log -- ['w 'r]
+
+;; ── the earlier forms run once: their effects happen once ──
+(set cnt 0)
+(at (select {v: (do (set cnt (+ cnt 1)) (* i 2)) from: T}) 'v) -- [0 2 4 6 8 10]
+cnt -- 1
+(set cnt 0)
+(at (select {v: (do (set cnt (+ cnt 1)) (sum i)) from: T by: g}) 'v) -- [6 9]
+cnt -- 1
+(set cnt 0)
+(at (update {v: (do (set cnt (+ cnt 1)) (+ i 1)) from: T where: (> i 3)}) 'v) -- [0N 0N 0N 0N 5 6]
+cnt -- 1
+(set cnt 0)
+(count (delete {from: T where: (do (set cnt (+ cnt 1)) (> i 3))})) -- 4
+cnt -- 1
+;; over the selected rows: a helper mapped over a column runs once per kept row
+(set cnt 0)
+(at (select {v: (do (map Lf i) (+ i 0)) from: T where: (> i 3)}) 'v) -- [4 5]
+cnt -- 2
+;; under a call, inside an aggregate, in an if's condition: still once
+(set cnt 0)
+(at (select {v: (+ 1 (do (set cnt (+ cnt 1)) (let kk 10) (+ i kk))) from: T}) 'v) -- [11 12 13 14 15 16]
+cnt -- 1
+(set cnt 0)
+(at (select {v: (sum (do (set cnt (+ cnt 1)) (let kk 10) (+ i kk))) from: T by: g}) 'v) -- [36 39]
+cnt -- 1
+(set cnt 0)
+(at (select {v: (if (do (set cnt (+ cnt 1)) (let kk 2) (> i kk)) 1 0) from: T}) 'v) -- [0 0 0 1 1 1]
+cnt -- 1
+
+;; ── errors in the earlier forms are raised (#1653) ──
+(select {v: (do (raise "r") i) from: T}) !- r
+(select {from: T where: (do (+ i 'a) (> i 1))}) !- type
+(select {v: (do (+ nosuch 1) i) from: T}) !- name
+(update {v: (do (raise "r") i) from: T}) !- r
+(try (select {v: (do (raise "r") i) from: T}) (fn [e] 'caught)) -- 'caught
+;; #1653: an earlier form's error surfaces as it does outside a query
+(select {from: T where: (do (as 'I64 "zz") (> i 2))}) !- domain
+(select {from: T where: (do (til -1) (> i 2))}) !- domain
+(select {from: T where: (do nosuch (> i 2))}) !- name
+(select {from: T where: (do (+ nocol 1) (> i 2))}) !- name
+;; a name read before the form that binds it is unknown
+(select {c: (count i) by: (do (reverse qk2) (let qk2 i)) from: T}) !- name
+
+;; ── under by:, a let bound to an aggregate is a whole-selection value ──
+;; (sum i) in the earlier form is the sum over every selected row, 15, not
+;; each group's: each group's own sum (6, 9) plus 15 gives [21 24], where
+;; reading the let per group gave [12 18]
+(at (select {v: (do (let s (sum i)) (+ (sum i) s)) from: T by: g}) 'v) -- [21 24]
+(at (select {v: (do (let s (sum i)) (+ i s)) from: T by: g}) 'v) -- (list [15 17 19] [16 18 20])
+
+;; #1612: a let read by a later form of its do, where an if chooses per row
+(at (select {from: T where: (do (let kk (if (== a 'x) 'x 'y)) (== a kk))}) 'i) -- [0 1 3 4]
+
+;; ── single-form do and no do: unchanged ──
+(at (select {v: (do (* i 2)) from: T}) 'v) -- [0 2 4 6 8 10]
+(at (select {from: T where: (do (> i 3))}) 'i) -- [4 5]
+
+;; ── 7. a do that is not on a path its clause always evaluates is
+;; evaluated where it stands, each time the code around it runs ──
+;; in an if arm: with the arm, for the rows that take it
+(set cnt 0)
+(at (select {v: (if (> i 2) (do (set cnt (+ cnt 1)) (let kk 10) (+ i kk)) 0) from: T}) 'v) -- [0 0 0 13 14 15]
+cnt -- 3
+(set cnt 0)
+(at (update {v: (if (> i 2) (do (set cnt (+ cnt 1)) (let kk 10) (+ i kk)) 0) from: T}) 'v) -- [0 0 0 13 14 15]
+cnt -- 3
+;; in where:, both arms are evaluated once over every row, then the if
+;; chooses per row
+(set cnt 0)
+(at (select {from: T where: (if (> i 2) (do (set cnt (+ cnt (count i))) (> i 3)) false)}) 'i) -- [4 5]
+cnt -- 6
+;; in update, an arm whose earlier forms can neither raise nor have an effect
+;; (a literal, a column, its count) is planned as its last form alone, as
+;; before, where the fallback would refuse the if: the same answers as dev
+(at (update {v: (if (> i 2) (do (count i) i) 0) from: T}) 'v) -- [0 0 0 3 4 5]
+(at (update {v: (if (> i 2) (do (count i) (+ i 1)) 0) from: T where: (> i 1)}) 'v) -- [0N 0N 0 4 5 6]
+(at (select {v: (if (> i 2) (do (count i) i) 0) from: T}) 'v) -- [0 0 0 3 4 5]
+(update {v: (if (> i 2) (do (let s (sum i)) (+ i 1)) 0) from: T}) !- nyi
+;; #1653 where the rule leaves a do: an earlier form that raises raises,
+;; in an if arm of a select, an update and a where:, and in a later and
+;; argument; only an update arm's inert prefix (a literal, a column, its
+;; count) is skipped, where the fallback would refuse the if
+(set Rz (fn [x] (let q 1) (raise "rz")))
+(select {v: (if (> i 2) (do (+ i 'a) i) 0) from: T}) !- type
+(update {v: (if (> i 2) (do (+ i 'a) i) 0) from: T}) !- type
+(select {from: T where: (if (> i 2) (do (+ i 'a) (> i 3)) false)}) !- type
+(select {from: T where: (and (> i 1) (do (+ i 'a) (< i 4)))}) !- type
+(select {v: (if (> i 2) (do (as 'I64 "zz") i) 0) from: T}) !- domain
+(update {v: (if (> i 2) (do (as 'I64 "zz") i) 0) from: T}) !- domain
+(select {from: T where: (if (> i 2) (do (as 'I64 "zz") (> i 3)) false)}) !- domain
+(select {from: T where: (and (> i 1) (do (as 'I64 "zz") (< i 4)))}) !- domain
+(select {v: (if (> i 2) (do (til -1) i) 0) from: T}) !- domain
+(update {v: (if (> i 2) (do (til -1) i) 0) from: T}) !- domain
+(select {from: T where: (if (> i 2) (do (til -1) (> i 3)) false)}) !- domain
+(select {from: T where: (and (> i 1) (do (til -1) (< i 4)))}) !- domain
+(select {v: (if (> i 2) (do nosuch i) 0) from: T}) !- name
+(update {v: (if (> i 2) (do nosuch i) 0) from: T}) !- name
+(select {from: T where: (if (> i 2) (do nosuch (> i 3)) false)}) !- name
+(select {from: T where: (and (> i 1) (do nosuch (< i 4)))}) !- name
+(select {v: (if (> i 2) (do (+ nocol 1) i) 0) from: T}) !- name
+(update {v: (if (> i 2) (do (+ nocol 1) i) 0) from: T}) !- name
+(select {from: T where: (if (> i 2) (do (+ nocol 1) (> i 3)) false)}) !- name
+(select {from: T where: (and (> i 1) (do (+ nocol 1) (< i 4)))}) !- name
+(try (select {v: (if (> i 2) (do (Rz i) i) 0) from: T}) (fn [e] 'raised)) -- 'raised
+(try (update {v: (if (> i 2) (do (Rz i) i) 0) from: T}) (fn [e] 'raised)) -- 'raised
+(try (select {from: T where: (if (> i 2) (do (Rz i) (> i 3)) false)}) (fn [e] 'raised)) -- 'raised
+(try (select {from: T where: (and (> i 1) (do (Rz i) (< i 4)))}) (fn [e] 'raised)) -- 'raised
+;; a raise in the arm's earlier forms is raised where the arm runs
+(update {v: (if (> i 2) (do (raise "r") i) 0) from: T}) !- r
+;; any other earlier form in such an arm (an effect, a let, a sum) raises
+;; nyi, as an if over a column that also aggregates does in update
+(update {v: (if (> i 2) (do (let s (sum i)) (+ i s)) 0) from: T}) !- nyi
+(update {v: (if (> i 2) (do (set cnt (count i)) i) 0) from: T}) !- nyi
+(update {v: (if (> i 2) (+ i (sum i)) 0) from: T}) -- (update {v: (if (> i 2) (+ i 15) 0) from: T})
+;; in a later and / or argument: where it stands
+(set cnt 0)
+(at (select {from: T where: (and (> i 1) (do (set cnt (+ cnt 1)) (let kk 4) (< i kk)))}) 'i) -- [2 3]
+cnt -- 1
+(set cnt 0)
+(at (select {from: T where: (or (> i 4) (do (set cnt (+ cnt 1)) (let kk 1) (< i kk)))}) 'i) -- [0 5]
+cnt -- 1
+;; in a try: with the try, once per row in a projection
+(set cnt 0)
+(at (select {v: (try (do (set cnt (+ cnt 1)) (let kk 10) (+ i kk)) (fn [e] 0)) from: T}) 'v) -- [10 11 12 13 14 15]
+cnt -- 6
+(at (select {v: (try (do (raise "x") i) (fn [e] -1)) from: T}) 'v) -- [-1 -1 -1 -1 -1 -1]
+;; in a helper's body: each time the helper is called, once per row in a
+;; projection, once per group under by:
+(set H2 (fn [x] (let z 0) (do (set cnt (+ cnt 1)) (let kk 10) (+ x kk))))
+(set cnt 0)
+(at (select {v: (H2 i) from: T}) 'v) -- [10 11 12 13 14 15]
+cnt -- 6
+(set cnt 0)
+(at (select {v: (sum (H2 i)) from: T by: g}) 'v) -- [36 39]
+cnt -- 2
+
+;; ── a parted table: the same answers as the query without the do ──
+(.sys.exec "rm -rf rfl_do_forms_run_once")
+(set P0 (table [i g] (list (til 2000) (% (til 2000) 3))))
+(.db.splayed.set "rfl_do_forms_run_once/db/2024.01.01/t/" (take P0 1000))
+(.db.splayed.set "rfl_do_forms_run_once/db/2024.01.02/t/" (drop P0 1000))
+(set P (.db.parted.get "rfl_do_forms_run_once/db/" 't))
+(at (select {s: (do (set cnt 0) (sum i)) from: P where: (> i 7) by: g}) 's) -- (at (select {s: (sum i) from: P where: (> i 7) by: g}) 's)
+(count (select {v: (do (let kk (* i 10)) (+ i kk)) from: P where: (> i 7)})) -- 1992
+(sum (at (select {v: (do (let kk (* i 10)) (+ i kk)) from: P where: (> i 7)}) 'v)) -- (* 11 (sum (at (select {from: P where: (> i 7)}) 'i)))
+(at (select {v: (do (let kk 5) (+ (sum i) kk)) from: P by: g}) 'v) -- (+ 5 (at (select {v: (sum i) from: P by: g}) 'v))
+(.sys.exec "rm -rf rfl_do_forms_run_once")
+
+;; a name rebound to another function is not that builtin: an update arm's
+;; prefix through it runs, so it is not skipped (the fallback then refuses
+;; the if, as for any other prefix); the builtins are restored after
+(set Cnt0 count)
+(set Fst0 first)
+(set count til)
+(update {v: (if (> i 2) (do (count i) i) 0) from: T}) !- nyi
+(set count Cnt0)
+(set first raise)
+(update {v: (if (> i 2) (do (first i) i) 0) from: T}) !- nyi
+(set first Fst0)
+(at (update {v: (if (> i 2) (do (count i) i) 0) from: T}) 'v) -- [0 0 0 3 4 5]
+(count [1 2]) -- 2
+(first [5 6]) -- 5

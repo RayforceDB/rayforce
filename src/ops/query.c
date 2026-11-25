@@ -3083,13 +3083,14 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
             }
         }
 
-        /* (do e1 e2 ... en) → compile only the last expression.
-         * Earlier expressions can't have side-effects in DAG context;
-         * if they do, they'll be silently dropped.  Use eval-level
-         * for side-effectful scripts. */
+        /* (do e) is e.  A query's own multi-form `do` was replaced by its last
+         * form at the entry, its earlier forms evaluated once
+         * (query_hoist_do_dict); one that reaches here stands where a query
+         * does not always evaluate it (an `if` arm, a `try`, a helper's body)
+         * and is left to the evaluator, which runs every form (#1650). */
         if (fname_len == 2 && memcmp(fname, "do", 2) == 0) {
-            if (n < 2) return NULL;
-            return compile_expr_dag(g, elems[n - 1]);
+            if (n != 2) return NULL;
+            return compile_expr_dag(g, elems[1]);
         }
 
         /* (let var val body) — compile `val` in the current env,
@@ -20492,13 +20493,674 @@ static ray_t* query_too_deep(ray_t** args, int64_t n, const char* verb) {
     return NULL;
 }
 
+/* ── A multi-form `do` written in a query (#1650) ─────────────────────────
+ *
+ * Inside a query, `(do e1 ... en)` written in a clause evaluates e1 ... en-1
+ * once per query, in order, over the rows the clause sees (the `from:`
+ * table for a where: predicate, the rows where: keeps for an output column
+ * or a by: key), with the meaning they have over those columns outside a
+ * query; then `en` is planned as if it stood alone.  A name a `let` among
+ * the earlier forms binds is seen by `en` as a binding of its own: a value
+ * derived from the rows (its provenance says so, not its length) is a
+ * column of the table the query reads: a select then reads the kept rows
+ * alone, without where:; update and delete keep the whole table, the value
+ * placed at the kept rows; any other value is a constant, a lambda a
+ * function.  The name is renamed in `en` to a hidden name bound for the
+ * whole query, so it never collides with a column, another output's `let`
+ * or a nested query.
+ *
+ * The rewrite runs at the entry of select, update and delete along the
+ * paths a query always evaluates: a builtin's arguments, a `let`'s value,
+ * an `if`'s first condition, the first argument of `and` / `or`, the last
+ * form of a `do`.  A `do` elsewhere (an `if` arm, a later `and` / `or`
+ * argument, a `try`, a helper's or a lambda's body) is evaluated where it
+ * stands, by the evaluator. */
+
+enum { HK_NONE, HK_DO, HK_LET, HK_IF, HK_AND, HK_OR, HK_BUILTIN };
+static int hoist_head_kind(ray_t* e) {
+    static _Thread_local int64_t ids[5];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        static const char* const nm[5] = { "do", "let", "if", "and", "or" };
+        for (int i = 0; i < 5; i++) ids[i] = ray_sym_intern(nm[i], strlen(nm[i]));
+        epoch = ray_sym_epoch();
+    }
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return HK_NONE;
+    if (ray_env_has_lexical_local(h->i64)) return HK_NONE;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return HK_NONE;
+    if (!(fn->attrs & RAY_FN_SPECIAL_FORM)) return HK_BUILTIN;
+    for (int i = 0; i < 5; i++) if (h->i64 == ids[i]) return HK_DO + i;
+    return HK_NONE;
+}
+
+/* Does `e` hold a `do` of more than one form where hoist_do_expr reaches? */
+static bool hoist_has_do(ray_t* e, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 256) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    switch (hoist_head_kind(e)) {
+    case HK_DO:  return e->len > 2 || hoist_has_do(es[1], depth + 1);
+    case HK_LET: return e->len == 3 && hoist_has_do(es[2], depth + 1);
+    case HK_IF: case HK_AND: case HK_OR: return hoist_has_do(es[1], depth + 1);
+    case HK_BUILTIN:
+        for (int64_t i = 1; i < e->len; i++)
+            if (hoist_has_do(es[i], depth + 1)) return true;
+        return false;
+    default: return false;
+    }
+}
+
+static bool hoist_is_head(ray_t* h, const char* nm, size_t nl) {
+    return h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) && h->i64 == ray_sym_intern(nm, nl);
+}
+
+/* The names a `let` (and, with `with_set`, a `set`) binds along the forms
+ * the evaluator runs in turn in `e`: not inside a lambda literal, a quote or
+ * a nested `do`, which keep their own.  Added to names[n..cap); the count. */
+static int hoist_bound_names(ray_t* e, int64_t* names, int n, int cap, bool with_set, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 256) return n;
+    ray_t** es = (ray_t**)ray_data(e);
+    if (hoist_is_head(es[0], "fn", 2) || hoist_is_head(es[0], "quote", 5) || hoist_is_head(es[0], "do", 2))
+        return n;
+    if ((hoist_is_head(es[0], "let", 3) || (with_set && hoist_is_head(es[0], "set", 3))) &&
+        e->len == 3 && es[1]->type == -RAY_SYM) {
+        bool seen = false;
+        for (int k = 0; k < n; k++) seen |= names[k] == es[1]->i64;
+        if (!seen && n < cap) names[n++] = es[1]->i64;
+    }
+    for (int64_t i = 1; i < e->len; i++) n = hoist_bound_names(es[i], names, n, cap, with_set, depth + 1);
+    return n;
+}
+
+enum { HOIST_MAX_LETS = 32 };
+typedef struct { int64_t from[HOIST_MAX_LETS]; int64_t to[HOIST_MAX_LETS]; int n; } hoist_ren_t;
+
+static void hoist_ren_drop(hoist_ren_t* r, int64_t sym) {
+    for (int k = 0; k < r->n; k++)
+        if (r->from[k] == sym) { r->from[k] = r->from[r->n - 1]; r->to[k] = r->to[r->n - 1]; r->n--; return; }
+}
+
+/* `e` with each read of a name in `r` renamed to its hidden name.  Not the
+ * name a `let` or `set` binds, not a lambda literal's parameters in its
+ * body, not inside a quote; and once a form among a call's arguments (or a
+ * sequence's forms) binds a name again, the forms after it read that new
+ * binding, so the name is no longer renamed there.  Owned. */
+static ray_t* hoist_rename(ray_t* e, hoist_ren_t r, int depth) {
+    if (!e) return NULL;
+    if (r.n == 0) { ray_retain(e); return e; }
+    if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) {
+        for (int k = 0; k < r.n; k++)
+            if (r.from[k] == e->i64) { ray_t* s = ray_sym(r.to[k]); return s ? s : ray_error("oom", NULL); }
+        ray_retain(e); return e;
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 256) {
+        ray_retain(e); return e;
+    }
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (hoist_is_head(h, "quote", 5)) { ray_retain(e); return e; }
+    int64_t from = 0;
+    if (hoist_is_head(h, "fn", 2) && e->len >= 2) {
+        /* the parameters are the lambda's own */
+        ray_t* ps = es[1];
+        for (int k = r.n - 1; k >= 0; k--) {
+            bool param = false;
+            if (ps && ps->type == RAY_SYM)
+                for (int64_t j = 0; j < ps->len && !param; j++)
+                    param = ray_read_sym(ray_data(ps), j, ps->type, ps->attrs) == r.from[k];
+            else if (ps && ps->type == RAY_LIST)
+                for (int64_t j = 0; j < ps->len && !param; j++) {
+                    ray_t* p = ((ray_t**)ray_data(ps))[j];
+                    param = p && p->type == -RAY_SYM && p->i64 == r.from[k];
+                }
+            if (param) hoist_ren_drop(&r, r.from[k]);
+        }
+        from = 2;
+    }
+    bool binder = (hoist_is_head(h, "let", 3) || hoist_is_head(h, "set", 3)) && e->len == 3 &&
+                  es[1]->type == -RAY_SYM;
+    ray_t* out = ray_list_new((int32_t)e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < e->len; i++) {
+        ray_t* s;
+        if (i < from || (binder && i == 1)) { ray_retain(es[i]); s = es[i]; }
+        else s = hoist_rename(es[i], r, depth + 1);
+        if (!s || RAY_IS_ERR(s)) { ray_release(out); return s ? s : ray_error("oom", NULL); }
+        ray_t* nx = ray_list_append(out, s);
+        ray_release(s);
+        if (!nx || RAY_IS_ERR(nx)) { ray_release(out); return nx ? nx : ray_error("oom", NULL); }
+        out = nx;
+        /* a form that binds a name again: the forms after it read that */
+        if (i > 0 && r.n) {
+            int64_t b[HOIST_MAX_LETS + 1];
+            int nb = hoist_bound_names(es[i], b, 0, HOIST_MAX_LETS + 1, true, 0);
+            for (int k = 0; k < nb; k++) hoist_ren_drop(&r, b[k]);
+        }
+    }
+    out->attrs = e->attrs;
+    return out;
+}
+
+/* Where a clause's earlier forms run: `tbl`, the table the query reads, and
+ * with a where: (`where`) the rows it keeps, computed the first time an
+ * earlier form reads a row: `mask`, `idx` (their positions, ascending) and
+ * `pos` (as long as `tbl`: each row's place among them, null for a dropped
+ * row); `next` numbers the hidden names. */
+typedef struct {
+    ray_t*  tbl;
+    ray_t*  where;
+    ray_t*  mask;
+    ray_t*  idx;
+    ray_t*  pos;
+    int64_t* next;
+    /* the values of the rows a `let` bound, as hidden columns of the table
+     * the query reads (cols: their names and full-length values), when the
+     * table can take one (an in-memory table the query does not update in
+     * place); NULL: they are bound as locals instead */
+    ray_t** cols;
+    /* a select: once the rows are computed, the table it reads is the kept
+     * rows of `*cols` (the columns in `keep`, every one when `keep_all`),
+     * where: is dropped, and a `let`'s value of the rows is a column of it
+     * as it stands */
+    bool     kept_only;
+    bool     keep_all;
+    int      nkeep;
+    int64_t  keep[64];
+} hoist_ctx_t;
+
+/* Do the forms es[0..n) read the rows of `tbl`: a column, or code that may? */
+static bool hoist_forms_read_rows(ray_t* tbl, ray_t* const* es, int64_t n) {
+    int64_t refs[1];
+    for (int64_t i = 0; i < n; i++)
+        if (collect_col_refs_set(es[i], tbl, refs, 1, 0) > 0 || clause_runs_code_in(es[i], tbl, false))
+            return true;
+    return false;
+}
+
+static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr);
+/* The rows `c->where` keeps, computed once: its mask, their positions and
+ * each row's place among them.  NULL, or the error. */
+static ray_t* hoist_need_rows(hoist_ctx_t* c) {
+    if (!c->where || c->mask) return NULL;
+    /* where: may read the hidden columns its own `do` added */
+    ray_t* mask = update_where_mask_vec(c->cols && *c->cols ? *c->cols : c->tbl, c->where);
+    if (!mask || RAY_IS_ERR(mask)) return mask ? mask : ray_error("oom", NULL);
+    int64_t n0 = mask->len;
+    const uint8_t* m = (const uint8_t*)ray_data(mask);
+    int64_t kept = 0;
+    for (int64_t r = 0; r < n0; r++) kept += m[r] != 0;
+    ray_t* idx = ray_vec_new(RAY_I64, kept);
+    if (!idx || RAY_IS_ERR(idx)) { ray_release(mask); return idx ? idx : ray_error("oom", NULL); }
+    int64_t* id = (int64_t*)ray_data(idx);
+    int64_t j = 0;
+    for (int64_t r = 0; r < n0; r++) { id[j] = r; j += m[r] != 0; }
+    idx->len = kept;
+    c->mask = mask; c->idx = idx;
+    if (c->kept_only && c->cols && *c->cols) {
+        ray_t* src = *c->cols;
+        int64_t nc = ray_table_ncols(src);
+        ray_t* out = ray_table_new(nc);
+        for (int64_t ci = 0; ci < nc && out && !RAY_IS_ERR(out); ci++) {
+            int64_t cn = ray_table_col_name(src, ci);
+            bool want = c->keep_all;
+            for (int r = 0; r < c->nkeep && !want; r++) want = c->keep[r] == cn;
+            if (!want) continue;
+            ray_t* g = ray_at_fn(ray_table_col_idx(src, ci), idx);
+            if (!g || RAY_IS_ERR(g)) { ray_release(out); return g ? g : ray_error("oom", NULL); }
+            out = ray_table_add_col(out, cn, g);
+            ray_release(g);
+        }
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        ray_release(src);
+        *c->cols = out;
+    }
+    return NULL;
+}
+
+/* `v`, a value of the kept rows, as long as `c->tbl`: each kept row's value
+ * at its place, a dropped row's never read.  Owned, or the error. */
+static ray_t* hoist_spread(ray_t* v, hoist_ctx_t* c) {
+    int8_t t = v->type;
+    if (ray_is_vec(v) && t != RAY_SYM && t != RAY_STR && !(v->attrs & RAY_ATTR_SLICE) &&
+        c->idx && c->idx->len == v->len) {
+        size_t esz = ray_elem_size(t);
+        int64_t n0 = c->mask->len;
+        ray_t* full = esz ? ray_vec_new(t, n0) : NULL;
+        if (full && !RAY_IS_ERR(full)) {
+            char* dst = (char*)ray_data(full);
+            const char* src = (const char*)ray_data(v);
+            const int64_t* id = (const int64_t*)ray_data(c->idx);
+            int64_t nk = v->len;
+            memset(dst, 0, (size_t)n0 * esz);
+            switch (esz) {
+            case 8: for (int64_t j = 0; j < nk; j++) ((uint64_t*)dst)[id[j]] = ((const uint64_t*)src)[j]; break;
+            case 4: for (int64_t j = 0; j < nk; j++) ((uint32_t*)dst)[id[j]] = ((const uint32_t*)src)[j]; break;
+            case 2: for (int64_t j = 0; j < nk; j++) ((uint16_t*)dst)[id[j]] = ((const uint16_t*)src)[j]; break;
+            case 1: for (int64_t j = 0; j < nk; j++) dst[id[j]] = src[j]; break;
+            default:
+                for (int64_t j = 0; j < nk; j++) memcpy(dst + (size_t)id[j] * esz, src + (size_t)j * esz, esz);
+            }
+            full->len = n0;
+            full->attrs |= (uint8_t)(v->attrs & RAY_ATTR_HAS_NULLS);
+            return full;
+        }
+        if (full && RAY_IS_ERR(full)) return full;
+    }
+    /* any other value: through each row's place among the kept rows */
+    if (!c->pos) {
+        int64_t n0 = c->mask->len;
+        ray_t* pos = ray_vec_new(RAY_I64, n0);
+        if (!pos || RAY_IS_ERR(pos)) return pos ? pos : ray_error("oom", NULL);
+        const uint8_t* m = (const uint8_t*)ray_data(c->mask);
+        int64_t* pd = (int64_t*)ray_data(pos);
+        int64_t j = 0;
+        for (int64_t r = 0; r < n0; r++) pd[r] = m[r] ? j++ : NULL_I64;
+        pos->len = n0;
+        if (j < n0) pos->attrs |= RAY_ATTR_HAS_NULLS;
+        c->pos = pos;
+    }
+    return ray_at_fn(v, c->pos);
+}
+
+/* The columns of `c->tbl` the forms es[0..n) read, at the kept rows: a
+ * table of them, owned, or the error. */
+static ray_t* hoist_rows_table(hoist_ctx_t* c, ray_t* const* es, int64_t n) {
+    ray_t* tbl = c->tbl;
+    int64_t refs[256];
+    int nref = 0;
+    bool all = false;
+    for (int64_t i = 0; i < n && !all; i++) {
+        nref = collect_col_refs_set(es[i], tbl, refs, 256, nref);
+        all = nref >= 256 || clause_runs_code_in(es[i], tbl, false);
+    }
+    int64_t nc = ray_table_ncols(tbl);
+    ray_t* out = ray_table_new(nc);
+    for (int64_t ci = 0; ci < nc && out && !RAY_IS_ERR(out); ci++) {
+        int64_t cn = ray_table_col_name(tbl, ci);
+        bool want = all;
+        for (int r = 0; r < nref && !want; r++) want = refs[r] == cn;
+        if (!want) continue;
+        ray_t* col = ray_table_col_idx(tbl, ci);
+        if (!col || RAY_IS_ERR(col)) { ray_release(out); return col ? col : ray_error("oom", NULL); }
+        ray_t* flat = NULL;
+        ray_col_meta_t m;
+        if (ray_table_col_meta_idx(tbl, ci, &m) && (RAY_IS_PARTED(m.type) || m.type == RAY_MAPCOMMON)) {
+            flat = query_materialize_parted_col(col, tbl);
+            if (!flat || RAY_IS_ERR(flat)) { ray_release(out); return flat ? flat : ray_error("oom", NULL); }
+            col = flat;
+        }
+        ray_t* g = c->idx ? ray_at_fn(col, c->idx) : (ray_retain(col), col);
+        if (flat) ray_release(flat);
+        if (!g || RAY_IS_ERR(g)) { ray_release(out); return g ? g : ray_error("oom", NULL); }
+        out = ray_table_add_col(out, cn, g);
+        ray_release(g);
+    }
+    return out ? out : ray_error("oom", NULL);
+}
+
+/* `e` with each multi-form `do` on its always-evaluated paths replaced by
+ * its last form, the earlier forms evaluated once over the clause's rows and
+ * their `let`s bound under hidden names in the innermost scope (the one the
+ * verb pushed).  Owned, or the error an earlier form raised. */
+static ray_t* hoist_do_expr(ray_t* e, hoist_ctx_t* c, int depth) {
+    if (!hoist_has_do(e, depth)) { ray_retain(e); return e; }
+    ray_t** es = (ray_t**)ray_data(e);
+    int kind = hoist_head_kind(e);
+    if (kind == HK_DO) {
+        if (e->len == 2) return hoist_do_expr(es[1], c, depth + 1);
+        int64_t nforms = e->len - 2;
+        int64_t names[HOIST_MAX_LETS + 1];
+        int nl = 0;
+        for (int64_t i = 1; i <= nforms; i++)
+            nl = hoist_bound_names(es[i], names, nl, HOIST_MAX_LETS + 1, false, 0);
+        if (nl > HOIST_MAX_LETS)
+            return ray_error("limit", "do: more than %d names bound by let in a query's do", HOIST_MAX_LETS);
+        /* the rows the earlier forms see: the columns they read, at the
+         * rows where: keeps (the whole table without one) */
+        ray_t* rows = NULL;
+        if (c->where && !c->mask && hoist_forms_read_rows(c->tbl, es + 1, nforms)) {
+            ray_t* re = hoist_need_rows(c);
+            if (re) return re;
+        }
+        if (c->idx && c->kept_only && c->cols && *c->cols) {
+            ray_retain(*c->cols); rows = *c->cols;
+        } else if (c->idx) {
+            rows = hoist_rows_table(c, es + 1, nforms);
+            if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+        } else if (table_has_parted_columns(c->tbl)) {
+            rows = parted_flatten_expr_cols(e, c->tbl);
+            if (!rows || RAY_IS_ERR(rows)) return rows ? rows : ray_error("oom", NULL);
+        } else {
+            ray_retain(c->tbl); rows = c->tbl;
+        }
+        int64_t nrows_seen = ray_table_nrows(rows);
+        if (ray_env_push_query_scope() != RAY_OK) { ray_release(rows); return ray_error("oom", NULL); }
+        ray_t* bind_err = NULL;
+        ray_t* aqt = bind_referenced_query(rows, es + 1, nforms, &bind_err);
+        ray_t* before[HOIST_MAX_LETS];
+        for (int k = 0; k < nl; k++) before[k] = ray_env_get(names[k]);
+        ray_t* err = bind_err;
+        for (int64_t i = 1; i <= nforms && !err; i++) {
+            ray_t* v = ray_eval(es[i]);
+            if (v && RAY_IS_ERR(v)) { err = v; break; }
+            if (v) ray_release(v);
+        }
+        /* the `let`s that ran, with their values and provenance */
+        ray_t* bv[HOIST_MAX_LETS];
+        int8_t brows[HOIST_MAX_LETS];
+        int64_t bn[HOIST_MAX_LETS];
+        int nb = 0;
+        for (int k = 0; k < nl && !err; k++) {
+            ray_t* now = ray_env_get(names[k]);
+            if (!now || now == before[k]) continue;
+            int rws = ray_env_binding_rows(names[k]);
+            ray_retain(now);
+            if (ray_is_lazy(now)) {
+                now = ray_lazy_materialize(now);
+                if (!now || RAY_IS_ERR(now)) { err = now ? now : ray_error("oom", NULL); break; }
+            }
+            bn[nb] = names[k]; bv[nb] = now; brows[nb] = (int8_t)(rws < 0 ? 2 : rws); nb++;
+        }
+        g_active_query_table = aqt;
+        ray_env_pop_scope();
+        ray_release(rows);
+        if (err) { for (int k = 0; k < nb; k++) ray_release(bv[k]); return err; }
+        /* bound under hidden names, in the verb's scope; a value of the rows
+         * as long as the kept rows stands for them over the whole table */
+        hoist_ren_t ren = { .n = 0 };
+        for (int k = 0; k < nb && !err; k++) {
+            ray_t* v = bv[k];
+            if (brows[k] == 1 && c->idx && !c->kept_only && (ray_is_vec(v) || v->type == RAY_LIST) && ray_len(v) == nrows_seen) {
+                ray_t* full = hoist_spread(v, c);
+                ray_release(v);
+                bv[k] = v = full;
+                if (!v || RAY_IS_ERR(v)) { err = v ? v : ray_error("oom", NULL); bv[k] = NULL; break; }
+            }
+            char nm[40];
+            int ln = snprintf(nm, sizeof nm, "#do%lld", (long long)(*c->next)++);
+            int64_t hid = ray_sym_intern(nm, (size_t)ln);
+            bool as_col = c->cols && brows[k] == 1 && (ray_is_vec(v) || v->type == RAY_LIST) &&
+                          ray_len(v) == (c->kept_only && c->idx ? ray_table_nrows(*c->cols)
+                                                                 : ray_table_nrows(c->tbl));
+            if (as_col) {
+                /* a column of the table the query reads, beside its own */
+                ray_t* t2 = ray_table_add_col(*c->cols, hid, v);
+                if (!t2 || RAY_IS_ERR(t2)) { *c->cols = NULL; err = t2 ? t2 : ray_error("oom", NULL); break; }
+                *c->cols = t2;
+            } else {
+                ray_err_t be = ray_env_set_local_rows(hid, v, brows[k] == 1 ? 1 : 0);
+                if (be != RAY_OK) { err = ray_error(ray_err_code_str(be), NULL); break; }
+            }
+            ren.from[ren.n] = bn[k]; ren.to[ren.n] = hid; ren.n++;
+        }
+        for (int k = 0; k < nb; k++) if (bv[k]) ray_release(bv[k]);
+        if (err) return err;
+        ray_t* last = hoist_rename(es[e->len - 1], ren, 0);
+        if (!last || RAY_IS_ERR(last)) return last ? last : ray_error("oom", NULL);
+        ray_t* out = hoist_do_expr(last, c, depth + 1);
+        ray_release(last);
+        return out;
+    }
+    int64_t from = 1, to = e->len - 1;
+    if (kind == HK_LET) from = to = 2;
+    else if (kind == HK_IF || kind == HK_AND || kind == HK_OR) from = to = 1;
+    else if (kind != HK_BUILTIN) { ray_retain(e); return e; }
+    ray_t* out = ray_list_new((int32_t)e->len);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    for (int64_t i = 0; i < e->len; i++) {
+        ray_t* s;
+        if (i >= from && i <= to) s = hoist_do_expr(es[i], c, depth + 1);
+        else { ray_retain(es[i]); s = es[i]; }
+        if (!s || RAY_IS_ERR(s)) { ray_release(out); return s ? s : ray_error("oom", NULL); }
+        ray_t* nx = ray_list_append(out, s);
+        ray_release(s);
+        if (!nx || RAY_IS_ERR(nx)) { ray_release(out); return nx ? nx : ray_error("oom", NULL); }
+        out = nx;
+    }
+    out->attrs = e->attrs;
+    return out;
+}
+
+/* A clause key of a query dict that holds no expression of the rows. */
+static bool hoist_clause_skipped(int64_t k) {
+    static const char* const skip[] = { "from", "take", "asc", "desc", "nearest" };
+    enum { NSKIP = sizeof skip / sizeof *skip };
+    static _Thread_local int64_t ids[NSKIP];
+    static _Thread_local uint64_t epoch;
+    if (epoch != ray_sym_epoch() || !epoch) {
+        for (size_t i = 0; i < NSKIP; i++) ids[i] = ray_sym_intern(skip[i], strlen(skip[i]));
+        epoch = ray_sym_epoch();
+    }
+    for (size_t i = 0; i < NSKIP; i++) if (k == ids[i]) return true;
+    return false;
+}
+
+static bool hoist_value_has_do(ray_t* v) {
+    if (v && v->type == RAY_DICT) {
+        ray_t* sv = ray_dict_vals(v);
+        if (sv && sv->type == RAY_LIST)
+            for (int64_t j = 0; j < sv->len; j++)
+                if (hoist_has_do(((ray_t**)ray_data(sv))[j], 0)) return true;
+        return false;
+    }
+    return hoist_has_do(v, 0);
+}
+
+static ray_t* hoist_value(ray_t* v, hoist_ctx_t* c) {
+    if (v && v->type == RAY_DICT) {
+        ray_t* sk = ray_dict_keys(v);
+        ray_t* sv = ray_dict_vals(v);
+        if (!sv || sv->type != RAY_LIST) { ray_retain(v); return v; }
+        ray_t* nsv = ray_list_new((int32_t)sv->len);
+        for (int64_t j = 0; j < sv->len && nsv && !RAY_IS_ERR(nsv); j++) {
+            ray_t* x = hoist_do_expr(((ray_t**)ray_data(sv))[j], c, 0);
+            if (!x || RAY_IS_ERR(x)) { ray_release(nsv); return x ? x : ray_error("oom", NULL); }
+            ray_t* nx = ray_list_append(nsv, x);
+            ray_release(x);
+            nsv = nx;
+        }
+        if (!nsv || RAY_IS_ERR(nsv)) return nsv ? nsv : ray_error("oom", NULL);
+        ray_retain(sk);
+        ray_t* d = ray_dict_new(sk, nsv);
+        return d ? d : ray_error("oom", NULL);
+    }
+    return hoist_do_expr(v, c, 0);
+}
+
+static ray_t* update_where_mask_vec(ray_t* tbl, ray_t* where_expr);
+
+/* The query `dict` with its multi-form `do`s hoisted (hoist_do_expr): the
+ * where: predicate's over the `from:` table, every other clause's over the
+ * rows where: keeps.  `from:` and `where:` are evaluated once: when another
+ * clause needs the kept rows, the predicate's mask is computed here and
+ * replaces it, and an evaluated `from:` replaces its expression.  NULL when
+ * the dict holds no such `do` (the query is planned as it stands); else
+ * owned, or the error an earlier form raised.  Once it finds such a `do`
+ * it pushes the scope the hidden names are bound in and sets *pushed: the
+ * verb pops it when the query is done. */
+static ray_t* query_hoist_do_dict(ray_t* dict, bool* pushed, int64_t* key_names, bool kept_only) {
+    *pushed = false;
+    if (!dict || dict->type != RAY_DICT) return NULL;
+    ray_t* keys = ray_dict_keys(dict);
+    ray_t* vals = ray_dict_vals(dict);
+    if (!keys || keys->type != RAY_SYM || !vals || vals->type != RAY_LIST) return NULL;
+    int64_t nd = ray_dict_len(dict);
+    ray_t** vs = (ray_t**)ray_data(vals);
+    static _Thread_local int64_t id_where_c, id_from_c;
+    static _Thread_local uint64_t ids_epoch;
+    if (ids_epoch != ray_sym_epoch() || !ids_epoch) {
+        id_where_c = ray_sym_intern("where", 5);
+        id_from_c = ray_sym_intern("from", 4);
+        ids_epoch = ray_sym_epoch();
+    }
+    int64_t id_where = id_where_c, id_from = id_from_c, id_by = ray_sym_intern("by", 2);
+    bool any = false, rest = false;
+    int64_t where_i = -1, from_i = -1;
+    for (int64_t i = 0; i < nd; i++) {
+        int64_t k = sym_cell_runtime_id(keys, i);
+        if (k == id_where) where_i = i;
+        if (k == id_from) from_i = i;
+        if (hoist_clause_skipped(k)) continue;
+        bool has = hoist_value_has_do(vs[i]);
+        any |= has;
+        if (has && k != id_where) rest = true;
+    }
+    if (!any || from_i < 0) return NULL;
+    /* the scope the hidden names are bound in, popped by the verb */
+    if (ray_env_push_scope() != RAY_OK) return ray_error("oom", NULL);
+    *pushed = true;
+
+    /* `from:`, evaluated once */
+    ray_t* tbl = ray_eval(vs[from_i]);
+    if (!tbl || RAY_IS_ERR(tbl)) return tbl ? tbl : ray_error("oom", NULL);
+    bool from_sym = tbl->type == -RAY_SYM;   /* update/delete in place: keep the name */
+    if (from_sym) {
+        ray_t* g = ray_env_get(tbl->i64);
+        ray_release(tbl);
+        if (!g) return NULL;   /* the verb reports it */
+        ray_retain(g); tbl = g;
+    }
+    if (ray_is_lazy(tbl)) tbl = ray_lazy_materialize(tbl);
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE) {
+        if (tbl && !RAY_IS_ERR(tbl)) ray_release(tbl);
+        return NULL;   /* the verb reports it */
+    }
+
+    ray_t* nv = ray_list_new((int32_t)nd);
+    ray_t* err = NULL;
+    for (int64_t i = 0; i < nd && nv && !RAY_IS_ERR(nv); i++) nv = ray_list_append(nv, vs[i]);
+    if (!nv || RAY_IS_ERR(nv)) { ray_release(tbl); return nv ? nv : ray_error("oom", NULL); }
+    ray_t** ns = (ray_t**)ray_data(nv);
+    if (!from_sym) { ray_release(ns[from_i]); ray_retain(tbl); ns[from_i] = tbl; }
+
+    int64_t next = 0;
+    /* hidden columns go to a copy of the table, read in place of `from:` */
+    ray_t* coltbl = NULL;
+    if (!from_sym && !table_has_parted_columns(tbl)) { ray_retain(tbl); coltbl = tbl; }
+    hoist_ctx_t whole = { .tbl = tbl, .where = NULL, .mask = NULL, .idx = NULL, .pos = NULL, .next = &next,
+                          .cols = coltbl ? &coltbl : NULL };
+    if (where_i >= 0) {
+        ray_t* w = hoist_do_expr(ns[where_i], &whole, 0);
+        if (!w || RAY_IS_ERR(w)) err = w ? w : ray_error("oom", NULL);
+        else { ray_release(ns[where_i]); ns[where_i] = w; }
+    }
+    /* the rows where: keeps, for the other clauses, computed when an
+     * earlier form first reads a row; its mask then replaces where: */
+    hoist_ctx_t sel = { .tbl = tbl, .where = (rest && where_i >= 0 && !err) ? ns[where_i] : NULL,
+                        .mask = NULL, .idx = NULL, .pos = NULL, .next = &next,
+                        .cols = coltbl ? &coltbl : NULL, .kept_only = kept_only && coltbl,
+                        .keep_all = false, .nkeep = 0 };
+    if (sel.kept_only) {
+        /* the columns the clauses but where: read; all of them for a
+         * select of the whole row or code that may read any */
+        bool outputs = false;
+        for (int64_t i = 0; i < nd && !sel.keep_all; i++) {
+            int64_t k = sym_cell_runtime_id(keys, i);
+            if (k == id_where || k == id_from) continue;
+            if (!hoist_clause_skipped(k) && k != id_by) outputs = true;
+            sel.nkeep = collect_col_refs_set(ns[i], tbl, sel.keep, 64, sel.nkeep);
+            sel.keep_all = sel.nkeep >= 64 || clause_runs_code_in(ns[i], tbl, false);
+        }
+        if (!outputs) sel.keep_all = true;
+        /* the hidden columns a do in where: added are read by where: only */
+    }
+    for (int64_t i = 0; i < nd && !err && rest; i++) {
+        int64_t k = sym_cell_runtime_id(keys, i);
+        if (hoist_clause_skipped(k) || k == id_where) continue;
+        ray_t* x = hoist_value(ns[i], &sel);
+        if (!x || RAY_IS_ERR(x)) { err = x ? x : ray_error("oom", NULL); break; }
+        if (k == id_by && key_names && x != ns[i] && ns[i]->type == RAY_LIST) {
+            /* a computed key keeps the name its written form gives
+             * (derived_key_name), not one its rewritten form gives */
+            key_names[0] = x->type == -RAY_SYM ? x->i64 : derived_key_name(x);
+            key_names[1] = derived_key_name(ns[i]);
+        }
+        ray_release(ns[i]); ns[i] = x;
+    }
+    bool drop_where = false;
+    if (sel.mask) {
+        if (!err && sel.kept_only) { ray_release(sel.mask); drop_where = true; }
+        else if (!err) { ray_release(ns[where_i]); ns[where_i] = sel.mask; }
+        else ray_release(sel.mask);
+    }
+    if (sel.idx) ray_release(sel.idx);
+    if (sel.pos) ray_release(sel.pos);
+    if (!err && coltbl && coltbl != tbl) {
+        /* the table with the hidden columns is what the query reads */
+        ray_release(ns[from_i]); ns[from_i] = coltbl; coltbl = NULL;
+    }
+    if (coltbl) ray_release(coltbl);
+    ray_release(tbl);
+    if (err) { ray_release(nv); return err; }
+    if (drop_where) {
+        /* the table read holds the kept rows only: no where: */
+        ray_t* k2 = ray_vec_new(RAY_SYM, nd - 1);
+        ray_t* v2 = ray_list_new((int32_t)(nd - 1));
+        for (int64_t i = 0; i < nd && k2 && !RAY_IS_ERR(k2) && v2 && !RAY_IS_ERR(v2); i++) {
+            if (i == where_i) continue;
+            int64_t kid = sym_cell_runtime_id(keys, i);
+            k2 = ray_vec_append(k2, &kid);
+            v2 = ray_list_append(v2, ns[i]);
+        }
+        ray_release(nv);
+        if (!k2 || RAY_IS_ERR(k2) || !v2 || RAY_IS_ERR(v2)) {
+            if (k2 && !RAY_IS_ERR(k2)) ray_release(k2);
+            if (v2 && !RAY_IS_ERR(v2)) ray_release(v2);
+            return ray_error("oom", NULL);
+        }
+        ray_t* out = ray_dict_new(k2, v2);
+        return out ? out : ray_error("oom", NULL);
+    }
+    ray_retain(keys);
+    ray_t* out = ray_dict_new(keys, nv);
+    return out ? out : ray_error("oom", NULL);
+}
+
+
+/* `r` without the hidden columns a query's `do` added to the table it read
+ * (query_hoist_do_dict): a select of the whole table, an update or a delete
+ * returns every column of it.  Consumes `r`. */
+static ray_t* hoist_strip_cols(ray_t* r) {
+    if (!r || RAY_IS_ERR(r) || r->type != RAY_TABLE) return r;
+    int64_t nc = ray_table_ncols(r);
+    bool any = false;
+    for (int64_t c = 0; c < nc && !any; c++) {
+        ray_t* nm = ray_sym_str(ray_table_col_name(r, c));
+        any = nm && ray_str_len(nm) > 3 && memcmp(ray_str_ptr(nm), "#do", 3) == 0;
+    }
+    if (!any) return r;
+    ray_t* out = ray_table_new(nc);
+    for (int64_t c = 0; c < nc && out && !RAY_IS_ERR(out); c++) {
+        int64_t cn = ray_table_col_name(r, c);
+        ray_t* nm = ray_sym_str(cn);
+        if (nm && ray_str_len(nm) > 3 && memcmp(ray_str_ptr(nm), "#do", 3) == 0) continue;
+        out = ray_table_add_col(out, cn, ray_table_slot_idx(r, c));
+    }
+    ray_release(r);
+    return out ? out : ray_error("oom", NULL);
+}
 ray_t* ray_select(ray_t** args, int64_t n) {
     ray_t* deep = query_too_deep(args, n, "select");
     if (deep) return deep;
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
-    ray_t* r = ray_select_lowered(args, n);
+    bool pushed = false;
+    int64_t key_names[2] = { -1, -1 };
+    ray_t* hoisted = n == 1 ? query_hoist_do_dict(args[0], &pushed, key_names, true) : NULL;
+    ray_t* r;
+    if (hoisted && RAY_IS_ERR(hoisted)) r = hoisted;
+    else r = ray_select_lowered(hoisted ? &hoisted : args, n);
+    if (r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && key_names[0] != key_names[1] &&
+        ray_table_ncols(r) > 0 && ray_table_col_name(r, 0) == key_names[0]) {
+        /* the key column first, named as the written `by:` names it */
+        r = ray_cow(r);
+        if (r && !RAY_IS_ERR(r)) ray_table_set_col_name(r, 0, key_names[1]);
+    }
+    if (hoisted && !RAY_IS_ERR(hoisted)) r = hoist_strip_cols(r);
+    if (hoisted && !RAY_IS_ERR(hoisted)) ray_release(hoisted);
+    if (pushed) ray_env_pop_scope();
     if (lowered) ray_release(lowered);
     return r;
 }
@@ -32805,6 +33467,72 @@ static ray_t* update_cell_collapse(ray_t* expr, ray_t* tbl, ray_t* v) {
     return ray_error("type", "update: a new column under where: must be a typed vector, got LIST");
 }
 
+/* Can the earlier form `f` of a `do` neither raise nor have an effect: a
+ * literal, a column of `tbl`, or `count` / `first` / `last` of one? */
+static bool update_do_prefix_inert(ray_t* f, ray_t* tbl) {
+    if (!f) return false;
+    if (f->type == -RAY_SYM) return (f->attrs & ATTR_QUOTED) || tbl_has_col(tbl, f->i64);
+    if (f->type != RAY_LIST) return true;               /* an atom or a vector literal */
+    if (f->attrs & ATTR_QUOTED) return true;
+    if (f->len != 2) return false;
+    ray_t** fs = (ray_t**)ray_data(f);
+    ray_t* h = fs[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    if (tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+    bool total = h->i64 == ray_sym_intern("count", 5) || h->i64 == ray_sym_intern("first", 5) ||
+                 h->i64 == ray_sym_intern("last", 4);
+    if (!total) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    /* that builtin itself, not another one a program bound to the name: the
+     * name a builtin carries is its own (ray_env_builtin_sym returns the
+     * first name bound to the object, which after `(set first raise)` can
+     * be `first` itself) */
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    ray_t* hn = ray_sym_str(h->i64);
+    const char* own = ray_fn_name(fn);
+    size_t hl = hn ? ray_str_len(hn) : 0;
+    size_t ol = 0;
+    while (ol < 14 && own[ol]) ol++;                     /* aux holds at most 13 */
+    if (!hn || ol != hl || memcmp(own, ray_str_ptr(hn), hl) != 0) return false;
+    ray_t* a = fs[1];
+    return a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) && tbl_has_col(tbl, a->i64);
+}
+
+/* `e` with each `do` whose earlier forms are all inert (update_do_prefix_inert)
+ * replaced by its last form; NULL when there is none.  Owned. */
+static ray_t* update_strip_inert_do(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 256) return NULL;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED)) {
+        if (h->i64 == ray_sym_intern("quote", 5) || h->i64 == ray_sym_intern("fn", 2)) return NULL;
+        if (h->i64 == ray_sym_intern("do", 2) && e->len > 2 && !ray_env_has_lexical_local(h->i64)) {
+            bool inert = true;
+            for (int64_t i = 1; i < e->len - 1 && inert; i++) inert = update_do_prefix_inert(es[i], tbl);
+            if (inert) {
+                ray_t* last = update_strip_inert_do(es[e->len - 1], tbl, depth + 1);
+                if (!last) { ray_retain(es[e->len - 1]); last = es[e->len - 1]; }
+                return last;
+            }
+        }
+    }
+    ray_t* out = NULL;
+    for (int64_t i = 0; i < e->len; i++) {
+        ray_t* x = update_strip_inert_do(es[i], tbl, depth + 1);
+        if (!x) continue;
+        if (RAY_IS_ERR(x)) { if (out) ray_release(out); return x; }
+        if (!out) {
+            out = ray_list_new((int32_t)e->len);
+            for (int64_t j = 0; j < e->len && out && !RAY_IS_ERR(out); j++) out = ray_list_append(out, es[j]);
+            if (!out || RAY_IS_ERR(out)) { ray_release(x); return out ? out : ray_error("oom", NULL); }
+            out->attrs = e->attrs;
+        }
+        ray_t** os = (ray_t**)ray_data(out);
+        ray_release(os[i]); os[i] = x;
+    }
+    return out;
+}
+
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
                                   ray_t* mask) {
     ray_t* out = NULL;
@@ -32861,6 +33589,16 @@ static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* da
              * first (#692).  (An aggregate over a global or a literal is the
              * same value on every row and goes through.) */
             if (cerr) ray_error_free(cerr);
+            /* A `do` in an `if` arm whose earlier forms can neither raise
+             * nor have an effect (a literal, a column, its count): planned
+             * as its last form, as before #1650, rather than refused */
+            ray_t* stripped = update_strip_inert_do(expr, sub, 0);
+            if (stripped && !RAY_IS_ERR(stripped)) {
+                ray_t* r = update_eval_on_impl(sub, stripped, expand, NULL, mask);
+                ray_release(stripped);
+                return r;
+            }
+            if (stripped) return stripped;
             return ray_error("nyi", "update: an if over a column that also aggregates is not supported without the planner");
         }
         if (!per_row) {
@@ -33450,7 +34188,14 @@ ray_t* ray_update(ray_t** args, int64_t n) {
     ray_t* lowered = n > 0 ? query_lower_cond_dict(args[0], 0) : NULL;
     if (lowered && RAY_IS_ERR(lowered)) return lowered;
     if (lowered) args = &lowered;
-    ray_t* r = ray_update_lowered(args, n);
+    bool pushed = false;
+    ray_t* hoisted = n == 1 ? query_hoist_do_dict(args[0], &pushed, NULL, false) : NULL;
+    ray_t* r;
+    if (hoisted && RAY_IS_ERR(hoisted)) r = hoisted;
+    else r = ray_update_lowered(hoisted ? &hoisted : args, n);
+    if (hoisted && !RAY_IS_ERR(hoisted)) r = hoist_strip_cols(r);
+    if (hoisted && !RAY_IS_ERR(hoisted)) ray_release(hoisted);
+    if (pushed) ray_env_pop_scope();
     if (lowered) ray_release(lowered);
     return r;
 }
@@ -41025,10 +41770,25 @@ ray_t* ray_delete_fn(ray_t** args, int64_t n) {
  * list with the same code, so they cannot disagree about which rows go.  The
  * functional form is deliberately NOT `select` over a negated predicate: that
  * would be a second expression to keep in step with this one. */
+static ray_t* ray_delete_hoisted(ray_t** args, int64_t n);
+static ray_t* query_hoist_do_dict(ray_t* dict, bool* pushed, int64_t* key_names, bool kept_only);
+
 ray_t* ray_delete(ray_t** args, int64_t n) {
     if (n < 1) return ray_error("arity", "delete: expects a query dict, got %lld args", (long long)n);
     ray_t* deep = query_too_deep(args, n, "delete");
     if (deep) return deep;
+    bool pushed = false;
+    ray_t* hoisted = n == 1 ? query_hoist_do_dict(args[0], &pushed, NULL, false) : NULL;
+    ray_t* r;
+    if (hoisted && RAY_IS_ERR(hoisted)) r = hoisted;
+    else r = ray_delete_hoisted(hoisted ? &hoisted : args, n);
+    if (hoisted && !RAY_IS_ERR(hoisted)) r = hoist_strip_cols(r);
+    if (hoisted && !RAY_IS_ERR(hoisted)) ray_release(hoisted);
+    if (pushed) ray_env_pop_scope();
+    return r;
+}
+
+static ray_t* ray_delete_hoisted(ray_t** args, int64_t n) {
     ray_t* dict = args[0];
     if (!dict || dict->type != RAY_DICT)
         return ray_error("type", "delete: query must be a dict, got %s", dict ? ray_type_name(dict->type) : "null");

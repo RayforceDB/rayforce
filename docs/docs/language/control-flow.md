@@ -35,7 +35,7 @@ Inside a query (a projection, `where:`, a `by:` key), a chain with a fallback is
 
 A `where:` predicate or a `by:` output that the planner leaves to the evaluator chooses per row as well, because the evaluator's `if` chooses per row for a boolean-vector condition (below). That covers a side effect in the expression (a lambda that sets a global, `set`, a `try` handler that raises), an `if` inside a helper the planner does not inline (several statements, a closure, recursion), a nested query in an arm or beside the `if` such as `(== a (if c (first (at (select {k: k from: U}) 'k)) 'y))`, and a `by:` output where a `let` in one aggregate's argument binds a name the rest of the output also reads: that output is evaluated per group as written, and each group's `if` chooses per row within the group. A side effect in an arm runs once per evaluation, whatever the condition holds, since both arms are evaluated.
 
-One case still raises: a name a `let` binds and a later argument of the same `do` reads raises `schema` in a `where:` predicate ([#1612](https://github.com/RayforceDB/rayforce/issues/1612)), because on the planned routes only the last form of a `do` is evaluated (see [Sequential Evaluation: do](#sequential-evaluation-do)).
+A name a `let` in an earlier form of a `do` binds is seen by its last form: `(select {from: T where: (do (let k (if (== act 'New) 'x 'y)) (== a k))})` keeps the rows whose `a` equals that row's arm, since the earlier forms run once over the rows first ([#1612](https://github.com/RayforceDB/rayforce/issues/1612); see [`do` inside a query](#do-inside-a-query)).
 
 ### A boolean vector as the condition
 
@@ -136,47 +136,89 @@ For the full name lookup rules, see [Names and scope](name-resolution.md).
 30
 ```
 
-!!! warning "Inside a query, do not rely on the earlier forms of a `do`"
+### `do` inside a query
 
-    In a query clause (`where:`, an output column, `update`, `delete`, a `by:`
-    key or aggregate) that the planner compiles, a `do` of several forms is
-    compiled as its last form alone. On those planned routes the earlier forms
-    are not evaluated: their effects (`set`, a helper that writes a global,
-    `println`) do not happen, a `raise` or an error in them is not raised, and a
-    name a `let` among them binds is not seen by the last form, which reads it
-    as a column or a global instead:
+Inside a query clause (`where:`, an output column, `update`, `delete`, a `by:`
+key or an aggregate), a `do` of several forms runs its earlier forms **once per
+query**, in order, over the selected rows: the rows `where:` keeps, or every row
+without one. Its last form is then planned as if it stood alone, and the names a
+`let` among the earlier forms binds are visible to it. `from:` and `where:` are
+still evaluated once each.
 
-    ```text
-    ‣ (set T (table [a i] (list ['x 'y 'x] [1 2 3])))
-    ‣ (select {from: T where: (do (let k 'x) (== a k))})
-    error: schema: column 'k' not found
-    ```
+```text
+‣ (set T (table [a i g] (list ['x 'y 'x 'y] [1 2 3 4] [0 1 0 1])))
+‣ (at (select {from: T where: (do (let k 'x) (== a k))}) 'i)
+[1 3]
+‣ (at (select {v: (do (let k (* i 10)) (+ i k)) from: T where: (> i 1)}) 'v)
+[22 33 44]
+```
 
-    A clause the planner declines is evaluated by the evaluator instead, and
-    there the earlier forms do run, with their effects and their errors, in
-    `where:`, projections and `by:` alike. Which route a query takes is not
-    something to rely on, so a query must not depend on the earlier forms of a
-    `do` either running or not running.
+- **Effects happen once.** A `set`, a helper that writes a global or a
+  `println` among the earlier forms runs once for the query, not once per row
+  or per group.
+- **Errors are raised.** A `raise`, a type error or an unknown name in an
+  earlier form fails the query, as it would outside one.
+- **A `let`'s value is a binding of the query.** Its provenance decides how the
+  last form reads it, not its length. A value computed from the rows is
+  column-like: it lines up with the selected rows, beside an aggregate, under
+  `by:` and in `update … where:` alike, on in-memory and partitioned tables. Any
+  other value follows the rule for a vector written in the query (a global, a
+  parameter): it is a constant, and in an aggregate one as long as the table
+  is read as a column ([Aggregate sources](../queries/select.md#aggregate-sources)).
+  The name is never read as a column, and a `let` of a name the query also has
+  as a column or a global hides it in that `do`'s last form only: the other
+  clauses still read the column or the global.
+- **Under `by:`, the earlier forms run over the whole selection, not per
+  group.** A `let` bound to an aggregate is therefore the aggregate of every
+  selected row:
 
-    Put the effects and the bindings in a helper of more than one statement,
-    called from the query, or before the query. The planner does not inline
-    such a helper, so its body runs as written. A helper whose body is a single
-    expression, a `do` included, may be inlined, and then behaves like the `do`
-    written in the query:
+  ```text
+  ‣ (set T6 (table [i g] (list (til 6) (% (til 6) 2))))
+  ‣ (at (select {v: (do (let s (sum i)) (+ (sum i) s)) from: T6 by: g}) 'v)
+  [21 24]
+  ```
 
-    ```text
-    ‣ (set H (fn [v] (let k 'x) (== v k)))
-    ‣ (at (select {from: T where: (H a)}) 'i)
-    [1 3]
-    ‣ (set k 'x)
-    ‣ (at (select {from: T where: (== a k)}) 'i)
-    [1 3]
-    ```
+  `s` is 15, the sum over all six rows, so each group gets its own sum (6, 9)
+  plus 15, not twice its own sum (`[12 18]`). To use each group's value, write
+  the aggregate in the last form, or call a helper of more than one statement,
+  which runs once per group.
 
-    See [#1650](https://github.com/RayforceDB/rayforce/issues/1650),
-    [#1612](https://github.com/RayforceDB/rayforce/issues/1612),
-    [#1653](https://github.com/RayforceDB/rayforce/issues/1653) and
-    [#1654](https://github.com/RayforceDB/rayforce/issues/1654).
+These are the forms a clause always evaluates: the clause itself, a call's
+arguments, the first argument of `and` and `or`, the condition of an `if`, and
+an aggregate's argument. A `do` anywhere else is evaluated where it stands,
+each time the code around it runs, and its earlier forms run with it:
+
+- in an `if` arm, with the arm, as the `if` evaluates it: once per row that
+  takes the arm in a projection or `update`, and once over every row in
+  `where:`, where both arms are evaluated and the `if` then chooses per row. In
+  `update`, an arm whose `do` aggregates raises `nyi`
+  (`(do (let s (sum i)) (+ i s))`), as an `if` over a column that also
+  aggregates does there;
+- in a later argument of `and` or `or`, once, when that argument is evaluated;
+- in a `try`, with the `try`: once per row in a projection;
+- in a helper's body, each time the helper is called: once per row in a
+  projection when the planner does not inline it, once per group under `by:`.
+
+Its earlier forms run there, so their effects happen and their errors are
+raised. The one exception is an `if` arm in `update` that would otherwise
+raise `nyi`. There, earlier forms that can neither raise nor have an effect
+(a literal, a column, `count`, `first` or `last` of a column) are skipped,
+and the arm is planned as its last form: `(update {v: (if (> i 2) (do (count
+i) i) 0) from: T})` answers.
+
+A `do` of one form is that form.
+
+The order of evaluation is: `from:`; then the earlier forms of a `do` in
+`where:`; then the earlier forms of each other clause, in the order the
+clauses are written. `where:` itself is evaluated once, the first time one of
+those forms reads a row, or else by the query after all of them have run. So
+an output's earlier form that reads no rows (`(do (set n 0) …)`) runs before
+`where:`'s own effects, such as a helper in the predicate that writes a
+global.
+
+See [#1650](https://github.com/RayforceDB/rayforce/issues/1650),
+[#1612](https://github.com/RayforceDB/rayforce/issues/1612) and
+[#1653](https://github.com/RayforceDB/rayforce/issues/1653).
 
 ## Iteration: while
 

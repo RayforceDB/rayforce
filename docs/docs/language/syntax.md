@@ -385,11 +385,12 @@ Evaluates multiple expressions in order, returning the last result:
   (+ x y))    ; 30
 ```
 
-Inside a query, on the planned routes, only the last form of a `do` is
-evaluated, while the evaluator's fallback runs every form: do not depend on the
-earlier forms either running or not, and put effects and bindings in a helper
-of more than one statement called from the query, or before it (see
-[Sequential Evaluation: do](control-flow.md#sequential-evaluation-do)).
+Inside a query, a `do` of several forms runs its earlier forms once per query,
+in order, over the selected rows (after `where:`), and its last form is planned
+as if it stood alone, seeing the names their `let`s bind. A `do` in an `if` arm,
+a later `and`/`or` argument, a `try` or a helper's body is evaluated where it
+stands, each time that code runs (see
+[`do` inside a query](control-flow.md#do-inside-a-query)).
 
 ### Variable Binding: `set` and `let`
 
