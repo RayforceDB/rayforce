@@ -6872,6 +6872,9 @@ static void ray_register_builtins(void) {
     /* Read-only metadata of a named global for editor tooling (#947):
      * calls and evaluates nothing, names only, so allowed under -U. */
     register_unary(".repl.signature",  RAY_FN_NONE,       ray_repl_signature_fn);
+    /* Where the function a named global holds was written (#946): server
+     * file paths and loaded source, so refused under -U. */
+    register_unary(".repl.definition", RAY_FN_RESTRICTED, ray_repl_definition_fn);
 
     /* Transaction-log journaling under `.log.*` — the -l/-L feature.
      * The CLI flags -l <base> / -L <base> call ray_journal_open() at

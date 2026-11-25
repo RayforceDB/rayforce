@@ -1,0 +1,58 @@
+;; @requires: posix  (a source file and a -U server through a POSIX shell)
+;; .repl.definition: where the function a named global holds now was
+;; written, from the source record its lambda keeps (#946).  The extent is
+;; the `(fn …)` form, lines and byte columns 0-based, end exclusive.  It is
+;; not the assignment that bound the name, and nothing is invented: a
+;; builtin, a value, a lambda built at run time are unavailable.
+(.sys.exec "rm -rf /tmp/rftest_repldef; mkdir -p /tmp/rftest_repldef; true") -- 0
+(.sys.exec "printf '%s\n' '(set rdf_add (fn [a b]' '  (+ a b)))' '(set rdf_one (fn [x] x))' > /tmp/rftest_repldef/lib.rfl") -- 0
+(load "/tmp/rftest_repldef/lib.rfl")
+(set rdf_d (.repl.definition 'rdf_add))
+(at rdf_d 'kind) -- 'lambda
+(at rdf_d 'available) -- true
+(at rdf_d 'file) -- "/tmp/rftest_repldef/lib.rfl"
+(at rdf_d 'start) -- [0 13]
+(at rdf_d 'end) -- [1 10]
+(at rdf_d 'text) -- "(fn [a b]\n  (+ a b))"
+(at rdf_d 'size) -- 60
+(count (at rdf_d 'digest)) -- 8
+(at (.repl.definition 'rdf_one) 'text) -- "(fn [x] x)"
+(at (.repl.definition 'rdf_one) 'start) -- [2 13]
+;; one file, one digest; text from elsewhere has its own
+(at (.repl.definition 'rdf_one) 'digest) -- (at rdf_d 'digest)
+(set rdf_here (fn [q] (* q 2)))
+(at (.repl.definition 'rdf_here) 'text) -- "(fn [q] (* q 2))"
+(== (at (.repl.definition 'rdf_here) 'digest) (at rdf_d 'digest)) -- false
+;; an alias reports the function's origin, not its own assignment; a
+;; reassignment reports the new function
+(set rdf_al rdf_add)
+(at (.repl.definition 'rdf_al) 'file) -- "/tmp/rftest_repldef/lib.rfl"
+(at (.repl.definition 'rdf_al) 'text) -- "(fn [a b]\n  (+ a b))"
+(set rdf_add (fn [z] z))
+(at (.repl.definition 'rdf_add) 'text) -- "(fn [z] z)"
+(at (.repl.definition 'rdf_al) 'text) -- "(fn [a b]\n  (+ a b))"
+;; a dict member
+(set rdf_D (dict ['f] (list (fn [k] k))))
+(at (.repl.definition 'rdf_D.f) 'text) -- "(fn [k] k)"
+;; nothing invented
+(at (.repl.definition 'min) 'kind) -- 'builtin
+(at (.repl.definition 'min) 'available) -- false
+(at (.repl.definition 'min) 'start) -- (as 'I64 [])
+(set rdf_v 3)
+(at (.repl.definition 'rdf_v) 'kind) -- 'value
+(at (.repl.definition 'rdf_v) 'available) -- false
+(at (.repl.definition 'rdf_nosuch) 'kind) -- 'missing
+(at (.repl.definition 'rdf_nosuch) 'bound) -- false
+(set rdf_made (eval (list 'fn ['x] 'x)))
+(at (.repl.definition 'rdf_made) 'kind) -- 'lambda
+(at (.repl.definition 'rdf_made) 'available) -- false
+(.repl.definition "rdf_add") !- type
+;; under -U: refused (server paths and loaded source); .repl.signature and
+;; .repl.complete still answer
+(.sys.exec "test/serve.sh --listen /tmp/rftest_repldef/s -U pw") -- 0
+(set rdf_h (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_repldef/s/port")) ":u:pw"))))
+(set rdf_ask (fn [src] (try (.ipc.send rdf_h src) (fn [e] (get e 'code)))))
+(rdf_ask "(.repl.definition 'min)") -- 'access
+(rdf_ask "(at (.repl.signature 'min) 'kind)") -- 'unary
+(.ipc.close rdf_h)
+(.sys.exec "test/serve.sh --stop /tmp/rftest_repldef/s; rm -rf /tmp/rftest_repldef") -- 0

@@ -27,6 +27,9 @@
 #include "lang/sig.h"
 #include "lang/format.h"
 #include "table/sym.h"
+#include "lang/nfo.h"
+#include "core/crc32.h"
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -158,6 +161,119 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     insp_put(&d, "usage", usage ? ray_str(usage, strlen(usage)) : ray_str("", 0));
     insp_put(&d, "builtin", own >= 0 ? ray_sym(own) : insp_sym(""));
     insp_put(&d, "restricted", ray_bool(builtin && (v->attrs & RAY_FN_RESTRICTED)));
+    if (v) ray_release(v);
+    return insp_done(&d);
+}
+
+/* ---- .repl.definition (#946) ---- */
+
+/* The byte offset of line `line`, column `col` (both 0-based) in `src`, or
+ * -1 past its end. */
+static int64_t insp_offset(const char* src, int64_t len, int64_t line, int64_t col) {
+    int64_t at = 0;
+    for (int64_t l = 0; l < line; l++) {
+        const char* nl = at < len ? memchr(src + at, '\n', (size_t)(len - at)) : NULL;
+        if (!nl) return -1;
+        at = (int64_t)(nl - src) + 1;
+    }
+    return at + col <= len ? at + col : -1;
+}
+
+static ray_t* insp_pos(int64_t line, int64_t col) {
+    ray_t* p = ray_vec_new(RAY_I64, 2);
+    if (!p || RAY_IS_ERR(p)) return p;
+    ((int64_t*)ray_data(p))[0] = line;
+    ((int64_t*)ray_data(p))[1] = col;
+    p->len = 2;
+    return p;
+}
+
+ray_t* ray_repl_definition_fn(ray_t* name) {
+    if (!name || name->type != -RAY_SYM)
+        return ray_error("type", ".repl.definition expects a symbol, got %s",
+                         name ? ray_type_name(name->type) : "null");
+    ray_t* v = ray_inspect_lookup(name->i64);
+    bool lambda = v && v->type == RAY_LAMBDA;
+    const char* kind = !v ? "missing" : lambda ? "lambda" : insp_is_builtin(v) ? "builtin" : "value";
+
+    /* The lambda's extent, from what the parser recorded (0-based lines and
+     * byte columns, inclusive end): its parameter list through its last
+     * body expression.  It is a definition only when `(fn` stands right
+     * before the parameters in the text; a lambda built at run time from
+     * quoted pieces, `(eval (list 'fn ['x] 'x))`, has spans of those pieces
+     * and none of a definition.  The extent then widens to that `(` and the
+     * `)` after the body.  A coordinate the 16-bit span saturated is not a
+     * position. */
+    ray_t* nfo = lambda ? LAMBDA_NFO(v) : NULL;
+    ray_t* file = nfo ? NFO_FILENAME(nfo) : NULL;
+    ray_t* src = nfo ? NFO_SOURCE(nfo) : NULL;
+    ray_span_t first = { .id = 0 }, last = { .id = 0 };
+    if (nfo && src && file) {
+        ray_t* body = LAMBDA_BODY(v);
+        first = LAMBDA_PARAMS(v) ? ray_nfo_get(nfo, LAMBDA_PARAMS(v)) : first;
+        if (body && body->type == RAY_LIST && body->len > 0) {
+            ray_t** b = (ray_t**)ray_data(body);
+            if (!first.id) first = ray_nfo_get(nfo, b[0]);
+            last = ray_nfo_get(nfo, b[body->len - 1]);
+        }
+        if (!last.id) last = first;
+    }
+    bool available = first.id && last.id &&
+                     first.start_line != UINT16_MAX && first.start_col != UINT16_MAX &&
+                     last.end_line != UINT16_MAX && last.end_col != UINT16_MAX;
+    int64_t sl = first.start_line, sc = first.start_col, el = last.end_line, ec = (int64_t)last.end_col + 1;
+    int64_t from = -1, to = -1;
+    if (available) {
+        const char* sp = ray_str_ptr(src);
+        int64_t slen = (int64_t)ray_str_len(src);
+        from = insp_offset(sp, slen, sl, sc);
+        to = insp_offset(sp, slen, el, ec);
+        available = from >= 0 && to >= from;
+        /* `(fn` and blanks right before the parameters */
+        int64_t k = from - 1;
+        while (available && k >= 0 && (sp[k] == ' ' || sp[k] == '\t' || sp[k] == '\n' || sp[k] == '\r')) k--;
+        available = available && k >= 2 && sp[k] == 'n' && sp[k - 1] == 'f';
+        k -= 2;
+        while (available && k >= 0 && (sp[k] == ' ' || sp[k] == '\t' || sp[k] == '\n' || sp[k] == '\r')) k--;
+        available = available && k >= 0 && sp[k] == '(';
+        if (available) {
+            int64_t e = to;
+            while (e < slen && (sp[e] == ' ' || sp[e] == '\t' || sp[e] == '\n' || sp[e] == '\r')) e++;
+            if (e < slen && sp[e] == ')') to = e + 1;
+            from = k;
+            /* the positions of the widened extent */
+            sl = 0; sc = 0;
+            for (int64_t i = 0; i < from; i++) { if (sp[i] == '\n') { sl++; sc = 0; } else sc++; }
+            el = sl; ec = sc;
+            for (int64_t i = from; i < to; i++) { if (sp[i] == '\n') { el++; ec = 0; } else ec++; }
+        }
+    }
+
+    insp_dict_t d;
+    insp_init(&d, 10);
+    ray_retain(name);
+    insp_put(&d, "name", name);
+    insp_put(&d, "bound", ray_bool(v != NULL));
+    insp_put(&d, "kind", insp_sym(kind));
+    insp_put(&d, "available", ray_bool(available));
+    if (available) {
+        char hex[16];
+        uint32_t crc = ray_crc32(0, ray_str_ptr(src), ray_str_len(src));
+        snprintf(hex, sizeof hex, "%08x", crc);
+        insp_put(&d, "file", ray_str(ray_str_ptr(file), ray_str_len(file)));
+        insp_put(&d, "start", insp_pos(sl, sc));
+        insp_put(&d, "end", insp_pos(el, ec));
+        insp_put(&d, "text", ray_str(ray_str_ptr(src) + from, (size_t)(to - from)));
+        insp_put(&d, "digest", ray_str(hex, strlen(hex)));
+        insp_put(&d, "size", ray_i64((int64_t)ray_str_len(src)));
+    } else {
+        insp_put(&d, "file", ray_str("", 0));
+        insp_put(&d, "start", ray_vec_new(RAY_I64, 0));
+        insp_put(&d, "end", ray_vec_new(RAY_I64, 0));
+        insp_put(&d, "text", ray_str("", 0));
+        insp_put(&d, "digest", ray_str("", 0));
+        insp_put(&d, "size", ray_typed_null(-RAY_I64));
+    }
     if (v) ray_release(v);
     return insp_done(&d);
 }

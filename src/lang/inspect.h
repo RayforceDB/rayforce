@@ -40,4 +40,8 @@ ray_t* ray_inspect_lookup(int64_t sym_id);
  * lambda parameters, documented usage. */
 ray_t* ray_repl_signature_fn(ray_t* name);
 
+/* (.repl.definition name): where the function a name holds now was
+ * written, from the source record its lambda already retains. */
+ray_t* ray_repl_definition_fn(ray_t* name);
+
 #endif
