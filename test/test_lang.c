@@ -3051,6 +3051,51 @@ static bool unary_arith_int_col(const char* col) {
            !strcmp(col, "i") || !strcmp(col, "l");
 }
 
+/* #1694: an `or` of `==` on one column against literals of its type is
+ * planned as that column's `in` (one pass over the column), at any count of
+ * terms, nested or variadic, the column on either side.  Other shapes keep
+ * the `or`: two columns, a float column, a null or empty-symbol literal, a
+ * literal symbol that names a column (it reads that column), a term that is
+ * no equality, one term only. */
+static test_result_t test_eval_select_or_eq_as_in(void) {
+    ray_t* tbl = ray_eval_str(
+        "(table [s i d f w] (list ['a 'b 'c] [1 2 3] [2024.01.01 2024.01.02 2024.01.03] "
+        "[1.5 2.5 3.5] (as 'I32 [1 2 3])))");
+    TEST_ASSERT_NOT_NULL(tbl);
+    TEST_ASSERT_FALSE(RAY_IS_ERR(tbl));
+    static const struct { const char* src; bool in; } cases[] = {
+        { "(or (== s 'a) (== s 'b))", true },
+        { "(or (== 'a s) (== s 'b))", true },
+        { "(or (== s 'a) (== s 'b) (== s 'c) (== s 'zz))", true },
+        { "(or (or (or (or (or (or (or (or (or (== s 'B1) (== s 'B2)) (== s 'B3)) (== s 'B4)) (== s 'B5)) (== s 'B6)) (== s 'B7)) (== s 'B8)) (== s 'B9)) (== s 'B10))", true },
+        { "(or (== i 1) (== i 3))", true },
+        { "(or (== d 2024.01.01) (== d 2024.01.03))", true },
+        { "(or (== s 'a) (== i 1))", false },
+        { "(or (== f 1.5) (== f 2.5))", false },
+        { "(or (== i 1) (== i 0Nl))", false },
+        { "(or (== i 1) (== i 2.0))", false },
+        { "(or (== w 1) (== w 2))", false },
+        { "(or (== s 'a) (== s 'd))", false },
+        { "(or (== s 'a) (> i 2))", false },
+        { "(or (== s 'a) (in s ['b]))", false },
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        ray_t* expr = ray_parse(cases[k].src);
+        TEST_ASSERT_NOT_NULL(expr);
+        TEST_ASSERT_FALSE(RAY_IS_ERR(expr));
+        ray_graph_t* g = ray_graph_new(tbl);
+        TEST_ASSERT_NOT_NULL(g);
+        ray_op_t* op = compile_expr_dag(g, expr);
+        bool is_in = op && op->opcode == OP_IN;
+        TEST_ASSERT_FMT(is_in == cases[k].in, "%s: compiled to %s, want %s", cases[k].src,
+                        op ? (is_in ? "in" : "another op") : "nothing", cases[k].in ? "in" : "no in");
+        ray_graph_free(g);
+        ray_release(expr);
+    }
+    ray_release(tbl);
+    PASS();
+}
+
 static test_result_t test_eval_select_unary_arith_dag_admission(void) {
     ray_t* tbl = ray_eval_str(
         "(table [d t ts b u h i l f s] (list [2024.01.01 2024.01.02] "
@@ -15470,6 +15515,7 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/select_where", test_eval_select_where, lang_setup, lang_teardown },
     { "lang/eval/select_where_in_sym", test_eval_select_where_in_sym, lang_setup, lang_teardown },
     { "lang/eval/select_unary_arith_dag_admission", test_eval_select_unary_arith_dag_admission, lang_setup, lang_teardown },
+    { "lang/eval/select_or_eq_as_in", test_eval_select_or_eq_as_in, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_mod_dag_admission", test_eval_select_temporal_mod_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/select_temporal_int_dag_admission", test_eval_select_temporal_int_dag_admission, lang_setup, lang_teardown },
     { "lang/eval/empty_probe_error_ownership", test_eval_empty_probe_error_ownership, lang_setup, lang_teardown },

@@ -1,0 +1,31 @@
+;; @requires: posix  (splayed and parted fixtures through .sys.exec)
+;; #1694: an `or` of `==` on one column against literals of its type is
+;; planned as that column's `in`.  It keeps exactly the rows the `or` keeps:
+;; each line compares it with the same predicate whose terms are wrapped so
+;; that no rewrite applies, on a plain, a splayed, a compressed and a parted
+;; table (one partition empty), with null rows in each column.
+(.sys.exec "rm -rf /tmp/rf_test_oreq") -- 0
+(set n 600)
+(set i (til n))
+(set T (table [s i d w] (list (at (concat ['a 'b 'c 'd] (as 'symbol (list ""))) (% i 5)) (at [1 2 3 0Nl 5 6] (% i 6)) (+ 2024.01.01 (% i 7)) (as 'I32 (% i 11)))))
+(.db.splayed.set "/tmp/rf_test_oreq/s/" T "/tmp/rf_test_oreq/s.sym")
+(.db.splayed.set "/tmp/rf_test_oreq/c/" T "/tmp/rf_test_oreq/c.sym" {compress: true})
+(.db.splayed.set "/tmp/rf_test_oreq/p/2024.01.01/t/" T "/tmp/rf_test_oreq/p/.sym")
+(.db.splayed.set "/tmp/rf_test_oreq/p/2024.01.02/t/" (take T 0) "/tmp/rf_test_oreq/p/.sym")
+(.db.splayed.set "/tmp/rf_test_oreq/p/2024.01.03/t/" T "/tmp/rf_test_oreq/p/.sym")
+(set S (.db.splayed.get "/tmp/rf_test_oreq/s/" "/tmp/rf_test_oreq/s.sym"))
+(set C (.db.splayed.get "/tmp/rf_test_oreq/c/" "/tmp/rf_test_oreq/c.sym"))
+(set P (.db.parted.get "/tmp/rf_test_oreq/p/" 't))
+(set same (fn [X] (and (and (== (format "%" (select {x: i y: s from: X where: (or (== s 'a) (== s 'c) (== s 'zz))})) (format "%" (select {x: i y: s from: X where: (or (and true (== s 'a)) (and true (== s 'c)) (and true (== s 'zz)))}))) (== (format "%" (select {c: (count i) from: X where: (or (or (== i 1) (== i 3)) (== i 6)) by: s})) (format "%" (select {c: (count i) from: X where: (or (or (and true (== i 1)) (and true (== i 3))) (and true (== i 6))) by: s})))) (and (== (format "%" (select {x: i from: X where: (or (== d 2024.01.02) (== 2024.01.05 d)) take: 7})) (format "%" (select {x: i from: X where: (or (and true (== d 2024.01.02)) (and true (== 2024.01.05 d))) take: 7}))) (== (format "%" (select {x: i from: X where: (and (> i 1) (or (== s 'b) (== s 'c)))})) (format "%" (select {x: i from: X where: (and (> i 1) (or (and true (== s 'b)) (and true (== s 'c))))})))))))
+(same T) -- true
+(same S) -- true
+(same C) -- true
+(same P) -- true
+;; the counts themselves, against the in that keeps the same rows
+(count (select {from: T where: (or (== s 'a) (== s 'c))})) -- (count (select {from: T where: (in s ['a 'c])}))
+(count (select {from: P where: (or (== s 'a) (== s 'c))})) -- 480
+(count (select {from: P where: (or (== i 1) (== i 0Nl))})) -- (count (select {from: P where: (or (and true (== i 1)) (and true (== i 0Nl)))}))
+;; a literal symbol naming a column reads the column, as before: here a type
+;; error, the same with or without the rewrite
+(select {from: T where: (or (== s 'a) (== s 'd))}) !- type
+(.sys.exec "rm -rf /tmp/rf_test_oreq") -- 0

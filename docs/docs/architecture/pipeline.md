@@ -93,7 +93,7 @@ Evaluates operations on constant inputs at optimization time. For example, `ray_
 
 ### 3. Idiom Rewrite
 
-Recognizes high-level expression patterns and rewrites them to more efficient equivalents before later passes run. For example, `count(distinct col)` is rewritten to use a dedicated HLL-backed distinct-count aggregate node. Because this pass may replace the root, it runs before predicate pushdown and SIP.
+Recognizes high-level expression patterns and rewrites them to more efficient equivalents before later passes run. For example, `count(distinct col)` is rewritten to use a dedicated HLL-backed distinct-count aggregate node. When a predicate is compiled, an `or` of `==` on one integer, temporal or symbol column against literals of its type becomes that column's `in`, one pass over the column instead of a fused `or` that gives up past a few terms. Because this pass may replace the root, it runs before predicate pushdown and SIP.
 
 ### 4. Sideways Information Passing (SIP)
 
