@@ -2863,10 +2863,12 @@ static test_result_t test_parted_flatten_into_bounds(void) {
 
 /* A radix grouping whose input-sized blocks (the payload, the order map)
  * are over the direct cache's budget has its workers drop their pages ahead
- * of the free (agg_free_input_sized).  On a 2 GB budget (a 128 MB cache),
+ * of the free (agg_free_input_sized) on a kernel with transparent huge
+ * pages off, taken so by a test seam.  On a 2 GB budget (a 128 MB cache),
  * taken for a big one by the test seam (8 GB and up otherwise), 8M
  * distinct keys take that path, and the answer is still each row its own
- * group, in first-seen order.
+ * group, in first-seen order.  With huge pages on the blocks go to the
+ * free alone.
  * The blocks are still freed: a grouping whose result is dropped leaves
  * none of them committed. */
 static test_result_t test_group_radix_transient_release(void) {
@@ -2879,6 +2881,7 @@ static test_result_t test_group_radix_transient_release(void) {
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);   /* MADV_DONTNEED refuses a locked block */
     ray_heap_set_anon_watermark(INT64_C(2) << 30);
+    ray_heap_test_direct_thp(0);
     /* a 2 GB budget leaves its blocks to the free... */
     int64_t t1 = ray_heap_direct_transient_count();
     ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
@@ -2888,6 +2891,12 @@ static test_result_t test_group_radix_transient_release(void) {
     ray_heap_test_direct_huge_min_budget(INT64_C(2) << 30);
     ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
     int64_t t2 = ray_heap_direct_transient_count();
+    /* ...and the huge pages are off */
+    ray_heap_test_direct_thp(1);
+    ae_eval_ok("(set rd (select {from: T by: k e: (max v)}))");
+    int64_t t2h = ray_heap_direct_transient_count();
+    ae_eval_ok("(set rd 0)");
+    ray_heap_test_direct_thp(0);
     /* once more, its result dropped: it leaves nothing committed */
     ray_heap_direct_cache_drain();
     int64_t committed_rb = ray_heap_anon_committed();
@@ -2897,6 +2906,7 @@ static test_result_t test_group_radix_transient_release(void) {
     ray_heap_direct_cache_drain();
     int64_t committed_end = ray_heap_anon_committed();
     ray_heap_test_direct_huge_min_budget(0);
+    ray_heap_test_direct_thp(-1);
     ray_heap_set_lock(was_lock);
     ray_heap_set_anon_watermark(previous);
     /* every key distinct: the groups are the rows, in first-seen order */
@@ -2908,7 +2918,8 @@ static test_result_t test_group_radix_transient_release(void) {
     ae_eval_ok("(set T 0) (set rb 0)");
     TEST_ASSERT_EQ_I(ng, 8000000);
     TEST_ASSERT_EQ_I(t1s - t1, 0);    /* a small budget does not release early */
-    TEST_ASSERT(t2 - t1s >= 1 && t3 - t2 >= 1, "an input-sized block was released ahead of its free");
+    TEST_ASSERT_EQ_I(t2h - t2, 0);    /* nor do huge pages */
+    TEST_ASSERT(t2 - t1s >= 1 && t3 - t2h >= 1, "an input-sized block was released ahead of its free");
     TEST_ASSERT(ok, "each row is its own group, in order");
     /* The released blocks were unmapped.  Each is over the 128 MB cache
      * budget; a heap pool (32 MB) the grouping added may stay. */

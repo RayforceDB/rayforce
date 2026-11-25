@@ -660,6 +660,34 @@ bool ray_vm_hugepage(void* ptr, size_t size) {
 #endif
 }
 
+/* Linux: the mode of /sys/kernel/mm/transparent_hugepage/enabled, read once
+ * — "[always]" or "[madvise]" grants the pages ray_vm_hugepage advises,
+ * "[never]" or a kernel without the file does not (madvise still returns 0
+ * under "never"). */
+bool ray_vm_thp_enabled(void) {
+#if defined(RAY_OS_LINUX)
+    static _Atomic(int) mode = -1;   /* -1 unread, 0 off, 1 on */
+    int m = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (m < 0) {
+        m = 0;
+        int fd = open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[128];
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                m = (strstr(buf, "[always]") || strstr(buf, "[madvise]")) ? 1 : 0;
+            }
+        }
+        atomic_store_explicit(&mode, m, memory_order_relaxed);
+    }
+    return m == 1;
+#else
+    return false;
+#endif
+}
+
 /* Linux: mlock2(MLOCK_ONFAULT) — only the pages faulted in are locked, as
  * they are faulted.  Called as a raw system call: sanitizer runtimes
  * intercept mlock() and make it a no-op, and an old libc has no mlock2
@@ -1549,6 +1577,7 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_thp_enabled(void) { return false; }
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }
@@ -1816,6 +1845,7 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment) {
 }
 
 bool ray_vm_hugepage(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
+bool ray_vm_thp_enabled(void) { return false; }
 bool ray_vm_lock(void* ptr, size_t size) { (void)ptr; (void)size; return false; }
 void ray_vm_unlock(void* ptr, size_t size) { (void)ptr; (void)size; }
 int ray_vm_release_locked(void* ptr, size_t size) { ray_vm_release(ptr, size); return 0; }

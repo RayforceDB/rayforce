@@ -245,6 +245,10 @@ void* ray_vm_alloc_aligned(size_t size, size_t alignment);
  * if the hint was issued (Linux THP); false where unsupported (macOS, WASM,
  * Windows). */
 bool ray_vm_hugepage(void* ptr, size_t size);
+/* Whether the kernel grants the huge pages ray_vm_hugepage advises: Linux
+ * with transparent huge pages in "always" or "madvise" mode (read once).
+ * False elsewhere. */
+bool ray_vm_thp_enabled(void);
 /* Lock [ptr, ptr+size) of an anonymous mapping against swap-out, page by
  * page as each is faulted in (Linux: mlock2 MLOCK_ONFAULT); munmap unlocks
  * it.  False where it cannot be — RLIMIT_MEMLOCK, a kernel before 4.4, a

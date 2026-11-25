@@ -2847,14 +2847,26 @@ static size_t heap_vm_kb(void) {
 #endif
 
 /* A fresh direct block the cache will not keep (over its budget) is mapped
- * 2 MB-aligned for huge pages and is transient (its pages may go ahead of
- * the free), unless it is locked; one the cache keeps is neither.  On a
- * memory budget under 8 GB no block is either, however large. */
+ * 2 MB-aligned for huge pages; on a kernel with transparent huge pages off
+ * it is also transient (its pages may go ahead of the free), unless it is
+ * locked.  One the cache keeps is neither.  On a memory budget under 8 GB
+ * no block is either, however large.  Whether the kernel has them on is
+ * its sysfs mode, "[always]" or "[madvise]". */
 static test_result_t test_direct_huge_over_budget(void) {
 #if !defined(RAY_OS_LINUX)
     SKIP("direct blocks take huge pages on Linux only");
 #else
     const size_t small = 64u << 20, big = 600u << 20;   /* never written: address space only */
+    bool thp_sysfs = false;
+    FILE* f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+    if (f) {
+        char mode[128] = {0};
+        if (fgets(mode, sizeof(mode), f))
+            thp_sysfs = strstr(mode, "[always]") || strstr(mode, "[madvise]");
+        fclose(f);
+    }
+    bool thp_heap = ray_vm_thp_enabled();
+    ray_heap_test_direct_thp(0);   /* transparent huge pages off */
     ray_heap_direct_cache_drain();
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);
@@ -2870,6 +2882,9 @@ static test_result_t test_direct_huge_over_budget(void) {
     size_t s_tr = s ? ray_raw_transient_bytes(ray_data(s)) : 1;
     size_t b_tr = b ? ray_raw_transient_bytes(ray_data(b)) : 0;
     size_t b_data = b ? ray_block_data_bytes(b) : 1;
+    ray_heap_test_direct_thp(1);   /* on: the huge pages make the free short */
+    size_t b_tr_thp = b ? ray_raw_transient_bytes(ray_data(b)) : 1;
+    ray_heap_test_direct_thp(0);
     if (s) ray_free(s);
     if (b) ray_free(b);
     /* Locked against swap, the same block is not transient: munmap's own
@@ -2890,8 +2905,10 @@ static test_result_t test_direct_huge_over_budget(void) {
     size_t c_data = c ? ray_block_data_bytes(c) : 1;
     if (c) ray_free(c);
     ray_heap_direct_cache_drain();
+    ray_heap_test_direct_thp(-1);
     ray_heap_set_lock(was_lock);
     ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT(thp_heap == thp_sysfs, "the kernel's huge-page mode as sysfs has it");
     if (!s || !b || !c || !l) SKIP("600 MB block unavailable");
     if (b_spilled) SKIP("the big block spilled: the watermark is near");
     TEST_ASSERT_EQ_I(n1 - n0, 0);   /* the cache keeps the small one */
@@ -2899,6 +2916,7 @@ static test_result_t test_direct_huge_over_budget(void) {
     TEST_ASSERT(b_aligned, "the advised block is mapped 2 MB-aligned");
     TEST_ASSERT_EQ_I((int64_t)s_tr, 0);
     TEST_ASSERT_EQ_I((int64_t)b_tr, (int64_t)b_data);
+    TEST_ASSERT_EQ_I((int64_t)b_tr_thp, 0);
     if (l_locked) TEST_ASSERT_EQ_I((int64_t)l_tr, 0);
     /* a 4 GB budget's block over its cache budget takes no huge pages and
      * is left to its free */
@@ -2920,6 +2938,7 @@ static test_result_t test_direct_huge_release(void) {
 #else
     const size_t big = 600u << 20, slice = 2u << 20;
     if (heap_vm_kb() == 0 || !relieve_mincore()) SKIP("no /proc/self/statm or mincore");
+    ray_heap_test_direct_thp(0);   /* transient: transparent huge pages off */
     ray_heap_direct_cache_drain();
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);
@@ -2931,6 +2950,7 @@ static test_result_t test_direct_huge_release(void) {
     size_t vm1 = heap_vm_kb();
     if (!b || ray_direct_file_backed(b) || ray_heap_direct_huge_count() != n0 + 1) {
         if (b) ray_free(b);
+        ray_heap_test_direct_thp(-1);
         ray_heap_set_lock(was_lock);
         ray_heap_set_anon_watermark(previous);
         SKIP("600 MB block unavailable or not a huge-page block");
@@ -2959,6 +2979,7 @@ static test_result_t test_direct_huge_release(void) {
     bool gone = mincore(base, 4096, &v) != 0 && errno == ENOMEM
              && mincore((char*)base + map - 4096, 4096, &v) != 0 && errno == ENOMEM;
     int64_t committed_after = ray_heap_anon_committed();
+    ray_heap_test_direct_thp(-1);
     ray_heap_set_lock(was_lock);
     ray_heap_set_anon_watermark(previous);
     TEST_ASSERT_EQ_I((int64_t)(vm1 - vm0), (int64_t)(map / 1024));   /* no slack kept */

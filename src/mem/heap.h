@@ -388,6 +388,9 @@ int64_t ray_heap_direct_transient_count(void);
 /* The memory budget from which direct blocks take huge pages and an early
  * page release (8 GB; 0 restores it).  For tests. */
 void ray_heap_test_direct_huge_min_budget(int64_t bytes);
+/* Take transparent huge pages as on (1) or off (0) in the kernel, or ask
+ * the kernel again (-1: ray_vm_thp_enabled).  For tests. */
+void ray_heap_test_direct_thp(int on);
 #endif
 
 /* ray_alloc whose data bytes read as zero, on the calling thread: a block
@@ -469,7 +472,7 @@ bool ray_raw_discard(void* p, size_t from, size_t upto);
 /* The data capacity of ray_alloc_raw block `p` when ray_free_raw will unmap
  * it at once and its pages may go first — an anonymous direct block over
  * the direct cache's budget, not locked against swap, on a memory budget
- * of 8 GB and up — else 0.  Such a block's pages may be released ahead of
+ * of 8 GB and up, on a kernel with transparent huge pages off — else 0.  Such a block's pages may be released ahead of
  * the free (ray_vm_release, from any thread, in parallel), which leaves
  * the single-threaded munmap nothing to walk. */
 size_t ray_raw_transient_bytes(const void* p);

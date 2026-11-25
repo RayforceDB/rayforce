@@ -1974,8 +1974,17 @@ void ray_heap_test_direct_huge_min_budget(int64_t bytes) {
                           bytes > 0 ? bytes : RAY_DIRECT_HUGE_MIN_BUDGET, memory_order_relaxed);
 }
 #define DIRECT_HUGE_MIN_BUDGET() atomic_load_explicit(&g_direct_huge_min_budget, memory_order_relaxed)
+static _Atomic(int) g_direct_thp_test = -1;   /* -1: the kernel's answer */
+void ray_heap_test_direct_thp(int on) {
+    atomic_store_explicit(&g_direct_thp_test, on < 0 ? -1 : on != 0, memory_order_relaxed);
+}
+static bool direct_thp_enabled(void) {
+    int t = atomic_load_explicit(&g_direct_thp_test, memory_order_relaxed);
+    return t >= 0 ? t == 1 : ray_vm_thp_enabled();
+}
 #else
 #define DIRECT_HUGE_MIN_BUDGET() RAY_DIRECT_HUGE_MIN_BUDGET
+#define direct_thp_enabled() ray_vm_thp_enabled()
 #endif
 /* A memory budget whose direct blocks over the cache budget take huge
  * pages and an early page release. */
@@ -2027,9 +2036,13 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cach
          * (heap_make_room). */
         bool force_file = heap_anon_would_exceed(map_size) && heap_make_room(map_size);
         bool huge = !force_file && direct_huge_wanted(map_size);
-        if (huge)
+        if (huge) {
             base = ray_vm_alloc_aligned(map_size, RAY_DIRECT_HUGE);   /* anon RW, 2 MB-aligned, counted */
-        else if (!force_file)
+            /* Refused the alignment's extra 2 MB of address space: the
+             * plain mapping below, as the block would take on a small budget. */
+            if (!base) huge = false;
+        }
+        if (!base && !force_file)
             base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
         if (!base) {
             base = heap_direct_map_file(h, map_size, &swap_fd, &swap_path);
@@ -2776,8 +2789,16 @@ size_t ray_raw_transient_bytes(const void* p) {
     const ray_direct_hdr_t* hdr = (const ray_direct_hdr_t*)((const char*)v - RAY_DIRECT_HDR);
     /* A locked block's pages go with munmap's own unlock walk, which a
      * madvise cannot shorten (MADV_DONTNEED refuses a locked range).  A
-     * small budget's blocks are left to the free (direct_huge_wanted). */
-    if (hdr->locked || hdr->map_size <= direct_cache_budget() || !direct_big_budget()) return 0;
+     * small budget's blocks are left to the free (direct_huge_wanted).
+     * Where the kernel grants the huge pages the block was advised for,
+     * the munmap is short already (a 4 GB block: 18 ms) and the release
+     * only adds its dispatch (30-37 ms in all; a 1B-row grouping ran the
+     * same either way), so the release is for a kernel with transparent
+     * huge pages off: there it cut a 4 GB block's free from 440 to 295 ms
+     * and the 1B-row grouping from 13.2 to 11 s. */
+    if (hdr->locked || hdr->map_size <= direct_cache_budget() || !direct_big_budget()
+        || direct_thp_enabled())
+        return 0;
 #ifdef DEBUG
     atomic_fetch_add_explicit(&g_direct_transient_count, 1, memory_order_relaxed);
 #endif
