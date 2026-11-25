@@ -288,6 +288,11 @@ ray_err_t ray_col_build_hash_index(const char* path, ray_t* col, void* trace);
  * flushes. Does not touch the header. The caller stamps the marker with
  * ray_col_stamp_index or rolls the file back on error. */
 ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload_end_out);
+/* The same for the DICT a STR column's dictionary accumulator (a
+ * ray_dict_acc_t*, void as `ix` above) holds over `len` rows, written from
+ * it (ray_dict_acc_write_region) without building the index.
+ * RAY_ERR_DOMAIN, the file untouched, when the accumulator makes none. */
+ray_err_t ray_col_write_dict_region(FILE* f, void* acc, int64_t len, int64_t* payload_end_out);
 
 /* Flush f and cut it to `len` bytes: undoes a partial index region. */
 bool ray_col_truncate(FILE* f, int64_t len);

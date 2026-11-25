@@ -1892,6 +1892,117 @@ static test_result_t test_dict_acc_high_cardinality(void) {
     PASS();
 }
 
+/* A spilling accumulator (#1182) holds one window of codes, never the
+ * column's: its region, written from the spill file, carries the codes
+ * and first-occurrence rows ray_index_dict_compute makes, and the file
+ * goes with the accumulator. */
+static test_result_t test_dict_acc_spill(void) {
+    int64_t n = 200000;
+    ray_t* v = dict_test_col(n, 3000, false);
+    TEST_ASSERT_NOT_NULL(v);
+    char spill[256], got_path[256];
+    snprintf(spill, sizeof spill, "%s", ray_test_tmp("/tmp/dict_spill.codes"));
+    snprintf(got_path, sizeof got_path, "%s", ray_test_tmp("/tmp/dict_spill.region"));
+    ray_dict_acc_t acc;
+    TEST_ASSERT_EQ_I(ray_dict_acc_init(&acc), RAY_OK);
+    TEST_ASSERT_EQ_I(ray_dict_acc_spill(&acc, spill), RAY_OK);
+    for (int64_t off = 0; off < n; off += 90000) {
+        int64_t cnt = n - off < 90000 ? n - off : 90000;
+        ray_t* s = ray_vec_new(RAY_STR, cnt);
+        for (int64_t i = 0; i < cnt; i++) {
+            size_t len; const char* p = ray_str_vec_get(v, off + i, &len);
+            s = ray_str_vec_append(s, p, len);
+        }
+        TEST_ASSERT_EQ_I(ray_dict_acc_add(&acc, s), RAY_OK);
+        ray_release(s);
+        TEST_ASSERT_TRUE(acc.cap_rows <= RAY_DICT_SPILL_ROWS);
+    }
+    TEST_ASSERT_EQ_I(acc.n_rows, n);
+    FILE* f = fopen(got_path, "wb+");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQ_I(ray_dict_acc_write_region(f, &acc, n), RAY_OK);
+    TEST_ASSERT_EQ_I(fflush(f), 0);
+    long got_sz = ftell(f);
+    ray_t* want = ray_index_dict_compute(v);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    const ray_index_t* w = ray_index_payload(want);
+    TEST_ASSERT_EQ_I(got_sz, ray_index_inline_size(w));
+    uint8_t* got = ray_alloc_raw((size_t)got_sz);
+    TEST_ASSERT_NOT_NULL(got);
+    rewind(f);
+    TEST_ASSERT_EQ_I((long)fread(got, 1, (size_t)got_sz, f), got_sz);
+    fclose(f);
+    /* the region maps to the same dictionary */
+    ray_t* m = ray_index_inline_map(got, got_sz);
+    TEST_ASSERT_NOT_NULL(m);
+    const ray_index_t* x = ray_index_payload(m);
+    TEST_ASSERT_EQ_I(x->kind, RAY_IDX_DICT);
+    TEST_ASSERT_EQ_I(x->u.dict.n_distinct, w->u.dict.n_distinct);
+    TEST_ASSERT_EQ_I(x->u.dict.codes->len, n);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.codes), ray_data(w->u.dict.codes), (size_t)n * 4), 0);
+    TEST_ASSERT_EQ_I(memcmp(ray_data(x->u.dict.first_occ), ray_data(w->u.dict.first_occ),
+                            (size_t)w->u.dict.n_distinct * 4), 0);
+    ray_free_raw(got);
+    ray_release(want);
+    ray_dict_acc_free(&acc);
+    TEST_ASSERT_EQ_I(access(spill, F_OK), -1);   /* the spill file went with it */
+    remove(got_path);
+    ray_release(v);
+    PASS();
+}
+
+/* .db.splayed.append (#1182): a durable append syncs the link sidecar it
+ * copies into the new generation (a bulk one does not); and when the
+ * directory sync after the .current rename fails, the call reports that
+ * the rows were published, which they are, so a caller does not append
+ * them again blindly. */
+static ray_t* append_eval(const char* q) { return ray_eval_str(ray_test_tmp(q)); }
+static ray_runtime_t* g_append_rt;
+static void append_setup(void) { g_append_rt = ray_runtime_create(0, NULL); }
+static void append_teardown(void) {
+    ray_splay_test_fail_publish_sync(false);
+    (void)ray_test_rm_rf(ray_test_tmp("/tmp/rf_append_dur"));
+    ray_runtime_destroy(g_append_rt);
+}
+static test_result_t test_splay_append_durable(void) {
+    ray_t* r = append_eval("(do (.sys.exec \"rm -rf /tmp/rf_append_dur\") (set custs (table [name] (list ['a 'b 'c]))) "
+                           "(.db.splayed.set \"/tmp/rf_append_dur/o\" (table [c v] (list (.col.link 'custs [0 1]) [10 20]))))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    int64_t s0 = ray_splay_test_link_syncs();
+    r = append_eval("(.db.splayed.append \"/tmp/rf_append_dur/o\" (table [c v] (list [2] [30])) {durable: false})");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(ray_splay_test_link_syncs(), s0);
+    r = append_eval("(.db.splayed.append \"/tmp/rf_append_dur/o\" (table [c v] (list [0] [40])))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(ray_splay_test_link_syncs(), s0 + 1);
+
+    /* the sync after the commit point fails: io, naming the publication */
+    ray_splay_test_fail_publish_sync(true);
+    r = append_eval("(.db.splayed.append \"/tmp/rf_append_dur/o\" (table [c v] (list [1] [50])))");
+    ray_splay_test_fail_publish_sync(false);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "io");
+    TEST_ASSERT_TRUE(ray_err_msg(r) && strstr(ray_err_msg(r), "were published"));
+    ray_error_free(r);
+    r = append_eval("(count (.db.splayed.get \"/tmp/rf_append_dur/o\"))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 5);
+    ray_release(r);
+    /* a failure before the commit point publishes nothing and says nothing of it */
+    ray_splay_test_fail_publish_sync(true);
+    r = append_eval("(.db.splayed.append \"/tmp/rf_append_dur/o\" (table [c v] (list [1.5] [60])))");
+    ray_splay_test_fail_publish_sync(false);
+    TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+    TEST_ASSERT_STR_EQ(ray_err_code(r), "type");
+    ray_error_free(r);
+    r = append_eval("(count (.db.splayed.get \"/tmp/rf_append_dur/o\"))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    TEST_ASSERT_EQ_I(r->i64, 5);
+    ray_release(r);
+    ray_test_rm_rf(ray_test_tmp("/tmp/rf_append_dur"));
+    PASS();
+}
+
 /* Stream a 200000-row I64 column in 70000-row slices; the file carries the
  * zone and loads with it. Values are clustered so no hash is wanted. */
 static test_result_t test_stream_inline_zone(void) {
@@ -8776,6 +8887,8 @@ const test_entry_t store_entries[] = {
     { "store/dict_acc_slices_equal_compute", test_dict_acc_slices_equal_compute, store_setup, store_teardown },
     { "store/dict_acc_leading_empty", test_dict_acc_leading_empty, store_setup, store_teardown },
     { "store/dict_acc_high_cardinality",     test_dict_acc_high_cardinality,     store_setup, store_teardown },
+    { "store/dict_acc_spill",                test_dict_acc_spill,                store_setup, store_teardown },
+    { "store/splay_append_durable",          test_splay_append_durable,          append_setup, append_teardown },
     { "store/stream_inline_zone", test_stream_inline_zone, store_setup, store_teardown },
     { "store/zone_acc_sentinel_without_flag", test_zone_acc_sentinel_without_flag, store_setup, store_teardown },
     { "store/stream_sentinel_has_nulls", test_stream_sentinel_publishes_has_nulls, store_setup, store_teardown },

@@ -273,6 +273,67 @@ ray_t* ray_set_splayed_fn(ray_t** args, int64_t n) {
     return tbl;
 }
 
+/* (.db.splayed.append "dir" table), (... "sym_path"), (... opts), (... "sym_path" opts):
+ * the table's rows appended to the splayed table in dir (#1182) */
+ray_t* ray_append_splayed_fn(ray_t** args, int64_t n) {
+    if (n < 2 || n > 4)
+        return ray_error("domain", ".db.splayed.append expects 2 to 4 arguments, got %lld", (long long)n);
+
+    char dir[1024];
+    if (!str_to_cpath(args[0], dir, sizeof(dir)))
+        return ray_error("type", ".db.splayed.append expects a string dir path, got %s", ray_type_name(args[0]->type));
+
+    ray_t* tbl = args[1];
+    if (!tbl || tbl->type != RAY_TABLE)
+        return ray_error("type", ".db.splayed.append expects a table, got %s", ray_type_name(tbl->type));
+
+    char sym[1024];
+    const char* sym_path = NULL;
+    ray_t* opts = NULL;
+    bool sym_given = false;
+    for (int64_t i = 2; i < n; i++) {
+        ray_t* a = args[i];
+        if (a && a->type == RAY_DICT) {
+            if (opts) return ray_error("domain", ".db.splayed.append: a second options dict");
+            opts = a;
+        } else if (i == 2 && a && a->type == -RAY_STR) {
+            sym_given = true;
+            sym_path = str_to_cpath(a, sym, sizeof(sym));
+            if (!sym_path)
+                return ray_error("domain", ".db.splayed.append: an empty or over-long symfile path");
+        } else {
+            return ray_error("type", ".db.splayed.append: argument %lld must be %s, got %s",
+                             (long long)(i + 1), i == 2 ? "a symfile path or an options dict"
+                                                       : "an options dict",
+                             a ? ray_type_name(a->type) : "null");
+        }
+    }
+    /* options: index and durable, as .db.splayed.set takes them; an append
+     * keeps each column's generation and the target's symfile layout, so
+     * compress and symfile are not taken */
+    ray_t* okeys = opts ? ray_dict_keys(opts) : NULL;
+    for (int64_t i = 0; okeys && okeys->type == RAY_SYM && i < okeys->len; i++) {
+        ray_t* k = ray_sym_vec_cell(okeys, i);
+        bool known = k && ((ray_str_len(k) == 5 && memcmp(ray_str_ptr(k), "index", 5) == 0) ||
+                           (ray_str_len(k) == 7 && memcmp(ray_str_ptr(k), "durable", 7) == 0));
+        if (!known)
+            return ray_error("domain", "unknown option '%.*s' (index and durable are accepted)",
+                             k ? (int)ray_str_len(k) : 1, k ? ray_str_ptr(k) : "?");
+    }
+    ray_index_opt_t index;
+    ray_t* oerr = ray_splay_index_opt_parse(opts, &index);
+    if (oerr) return oerr;
+    bool durable;
+    oerr = ray_splay_durable_opt_parse(opts, &durable);
+    if (oerr) return oerr;
+    if (!sym_given) sym_path = splay_resolve_sym(dir, sym, sizeof(sym), true);
+
+    ray_t* err = ray_splay_append(tbl, dir, sym_path, sym_given, index, durable);
+    if (err) return err;
+    ray_retain(tbl);
+    return tbl;
+}
+
 /* (.db.splayed.get "dir") or (.db.splayed.get "dir" "sym_path") */
 ray_t* ray_get_splayed_fn(ray_t** args, int64_t n) {
     if (n < 1 || n > 2)

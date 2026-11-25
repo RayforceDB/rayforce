@@ -1,0 +1,147 @@
+;; @requires: posix  (fixtures built and removed through .sys.exec)
+;; .db.splayed.append (#1182): a table's rows appended to the splayed table
+;; on disk, without loading it.  The target's columns are mapped and written
+;; with the new rows into a new generation, published as a save publishes,
+;; so the result reads back as the concatenation of the two tables.
+(.sys.exec "rm -rf /tmp/rf_splay_append") -- 0
+(set A "/tmp/rf_splay_append")
+(set t1 (table [a s n f b] (list [1 2 3] ['x 'y 'x] (list "aa" "" "a string longer than the inline twelve") [1.5 0Nf 2.5] [true false true])))
+(set t2 (table [a s n f b] (list [4 0Nl] ['z '] (list "bb" "another string longer than twelve") [3.5 4.5] [false true])))
+
+;; Nulls, empty strings, a new symbol and the null symbol, BOOL.
+(.db.splayed.set (format "%/t" A) t1 {compress: false})
+(.db.splayed.append (format "%/t" A) t2) -- t2
+(set R (.db.splayed.get (format "%/t" A)))
+(select {from: R}) -- (concat t1 t2)
+(count (select {from: R where: (nil? a)})) -- 1
+(count (select {from: R where: (nil? f)})) -- 1
+(count (select {from: R where: (== n "")})) -- 1
+(count (select {from: R where: (== s 'z)})) -- 1
+(map (fn [c] (at (.idx.info R c) 'gen)) (cols R)) -- [0 0 0 0 0]
+;; one generation is kept, as after a save
+(.sys.exec (format "[ $(ls %/t/.generations | wc -l) -eq 1 ]" A)) -- 0
+
+;; Columns given in another order are written in the target's.
+(.db.splayed.append (format "%/t" A) (table [n b f s a] (list (list "cc") [true] [5.5] ['y] [5])))
+(set R (.db.splayed.get (format "%/t" A)))
+(cols R) -- [a s n f b]
+(count R) -- 6
+(at (get R 'a) 5) -- 5
+(at (get R 'n) 5) -- "cc"
+(at (get R 's) 5) -- 'y
+
+;; New symbols join the symfile; the rows on disk keep theirs.
+(.db.splayed.append (format "%/t" A) (table [a s n f b] (list [6 7] ['q 'x] (list "dd" "ee") [6.5 7.5] [false false])))
+(get (.db.splayed.get (format "%/t" A)) 's) -- ['x 'y 'x 'z ' 'y 'q 'x]
+
+;; No rows: nothing is written, the table stays as it was.
+(.sys.exec (format "cp %/t/.current %/cur0" A A)) -- 0
+(.db.splayed.append (format "%/t" A) (select {from: t1 where: (< a 0)}))
+(.sys.exec (format "cmp %/t/.current %/cur0" A A)) -- 0
+(count (.db.splayed.get (format "%/t" A))) -- 8
+
+;; A missing target is written, as .db.splayed.set would write it.
+(.db.splayed.append (format "%/new/t" A) t1)
+(select {from: (.db.splayed.get (format "%/new/t" A))}) -- t1
+(.db.splayed.append (format "%/new/t" A) t2)
+(select {from: (.db.splayed.get (format "%/new/t" A))}) -- (concat t1 t2)
+
+;; Every refusal comes before anything is written.
+(.sys.exec (format "cp %/t/.current %/cur1" A A)) -- 0
+(.db.splayed.append (format "%/t" A) (table [a s n f] (list [1] ['x] (list "q") [1.0]))) !- domain
+(.db.splayed.append (format "%/t" A) (table [a s n f c] (list [1] ['x] (list "q") [1.0] [true]))) !- domain
+(.db.splayed.append (format "%/t" A) (table [a s n f b] (list [1.0] ['x] (list "q") [1.0] [true]))) !- type
+(.db.splayed.append (format "%/t" A) (table [a s n f b] (list [1] (list "x") (list "q") [1.0] [true]))) !- type
+(.db.splayed.append (format "%/t" A) t2 {compress: true}) !- domain
+(.db.splayed.append (format "%/t" A) t2 {symfile: 'column}) !- domain
+(.db.splayed.append (format "%/t" A) t2 {durable: 1}) !- domain
+(.db.splayed.append (format "%/t" A) t2 {index: 'yes}) !- domain
+(.db.splayed.append (format "%/t" A) t2 7) !- type
+(.db.splayed.append (format "%/t" A) [1 2]) !- type
+(.db.splayed.append 'x t2) !- type
+(.db.splayed.append (format "%/t" A)) !- domain
+(.sys.exec (format "cmp %/t/.current %/cur1" A A)) -- 0
+(count (.db.splayed.get (format "%/t" A))) -- 8
+
+;; A target without columns takes no columns: the column sets differ.
+(.db.splayed.set (format "%/ze/t" A) (table [] (list)))
+(.sys.exec (format "cp %/ze/t/.d %/ze0" A A)) -- 0
+(.db.splayed.append (format "%/ze/t" A) (table [a] (list [1 2]))) !- domain
+(.sys.exec (format "cmp %/ze/t/.d %/ze0 && [ ! -e %/ze/t/.current ]" A A A)) -- 0
+(cols (.db.splayed.get (format "%/ze/t" A))) -- []
+(count (.db.splayed.get (format "%/ze/t" A))) -- 0
+
+;; A string column of 65,536 rows or more carries its dictionary, and a
+;; numeric one its chunk zone, over every row after the append; a symbol
+;; column widens when the vocabulary outgrows its width.
+(set n 70000)
+(set big (table [s k v] (list (take ['a 'b 'c] n) (map (fn [j] (format "k%" (% j 5))) (til n)) (til n))))
+(.db.splayed.set (format "%/big/t" A) big {compress: false})
+(set more (table [s k v] (list (as 'SYM (map (fn [j] (format "w%" j)) (til 300))) (take ["k1" "zz"] 300) (+ n (til 300)))))
+(.db.splayed.append (format "%/big/t" A) more)
+(set B (.db.splayed.get (format "%/big/t" A)))
+(count B) -- 70300
+(at (at (.idx.info B 'k) 'index) 'kind) -- 'dict
+(at (at (.idx.info B 'k) 'index) 'n_distinct) -- 6
+(at (at (.idx.info B 'k) 'index) 'length) -- 70300
+(at (at (.idx.info B 'v) 'index) 'kind) -- 'chunk_zone
+(at (.idx.info B 's) 'encoded_bytes) -- 140600
+(select {from: B}) -- (concat big more)
+(count (select {from: B where: (== k "zz")})) -- 150
+(count (select {from: B where: (== k "k1")})) -- 14150
+(count (select {from: B where: (> v 69990)})) -- 309
+;; {index: false} builds neither
+(.db.splayed.append (format "%/big/t" A) more {index: false durable: false})
+(set B (.db.splayed.get (format "%/big/t" A)))
+(at (.idx.info B 'k) 'index) -- null
+(at (.idx.info B 'v) 'index) -- null
+(select {from: B}) -- (concat (concat big more) more)
+
+;; A compressed target stays compressed (generation 2), its symbols and
+;; strings re-encoded with the new rows.
+(.db.splayed.set (format "%/z/t" A) big {compress: true})
+(.db.splayed.append (format "%/z/t" A) more)
+(set Z (.db.splayed.get (format "%/z/t" A)))
+(map (fn [c] (at (.idx.info Z c) 'gen)) (cols Z)) -- [2 2 2]
+(select {from: Z}) -- (concat big more)
+(at (.idx.info Z 'k) 'index) -- 'dict
+(count (select {from: Z where: (== k "zz")})) -- 150
+(count (select {from: Z where: (== k "k1")})) -- 14150
+(count (select {from: Z where: (in k ["k3" "zz"])})) -- 14150
+
+;; Symbol files of their own per column (symfile 'column) stay per column.
+(.db.splayed.set (format "%/pc/t" A) t1 {symfile: 'column})
+(.db.splayed.append (format "%/pc/t" A) t2)
+(.sys.exec (format "[ -f $(cat %/pc/t/.current | sed 's|^|%/pc/t/|')/.s.sym ]" A A)) -- 0
+(select {from: (.db.splayed.get (format "%/pc/t" A))}) -- (concat t1 t2)
+(.db.splayed.append (format "%/pc/t" A) t2 (format "%/pc/t/.sym" A)) !- domain
+
+;; A linked column keeps its link: the target's, whatever the new rows carry.
+(set custs (table [name] (list ['a 'b 'c])))
+(.db.splayed.set (format "%/lk/o" A) (table [c v] (list (.col.link 'custs [0 1]) [10 20])))
+(.db.splayed.append (format "%/lk/o" A) (table [c v] (list [2] [30])))
+(set L (get (.db.splayed.get (format "%/lk/o" A)) 'c))
+(.col.link? L) -- true
+(.col.target L) -- 'custs
+L.name -- ['a 'b 'c]
+
+;; A partition of a parted root: its symbols go to the root's symfile, and
+;; the parted table reads the appended rows.
+(set D (format "%/db" A))
+(.db.splayed.set (format "%/2026.10.21/t" D) (table [a s] (list [1 2] ['x 'y])) (format "%/.sym" D))
+(.db.splayed.set (format "%/2026.10.22/t" D) (table [a s] (list [3] ['z])) (format "%/.sym" D))
+(.db.splayed.append (format "%/2026.10.22/t" D) (table [a s] (list [4 5] ['w 'x])))
+(set P (.db.parted.get D 't))
+(count P) -- 5
+(select {a: a s: s from: P where: (== date 2026.10.22)}) -- (table [a s] (list [3 4 5] ['z 'w 'x]))
+
+;; Merging the partitions one at a time: each appended from its mapped
+;; files, the result the table .db.splayed.set writes from the parted one.
+(.db.splayed.append (format "%/merged/t" A) (.db.splayed.get (format "%/2026.10.21/t" D) (format "%/.sym" D)))
+(.db.splayed.append (format "%/merged/t" A) (.db.splayed.get (format "%/2026.10.22/t" D) (format "%/.sym" D)))
+(select {from: (.db.splayed.get (format "%/merged/t" A))}) -- (select {a: a s: s from: P where: (> a 0)})
+;; a parted table is refused: written whole with .db.splayed.set instead
+(.db.splayed.append (format "%/merged/t" A) P) !- nyi
+(count (.db.splayed.get (format "%/merged/t" A))) -- 5
+
+(.sys.exec "rm -rf /tmp/rf_splay_append") -- 0

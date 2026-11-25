@@ -55,6 +55,8 @@ typedef struct {
     bool no_auto_index;     /* the index option false: build no size-gated dictionary
                              * or chunk zone; an index the column already carries is
                              * written as usual; set after begin */
+    const uint8_t* keep_gens; /* an append: each column's generation, the target's own
+                             * (0 or 2), in place of the resolution; set after begin */
     bool keep_dict;         /* the index option true: a generation-2 STR dictionary is
                              * written even where it makes the file larger than
                              * generation 0's (absent leaves it out); set after begin */
@@ -127,6 +129,16 @@ typedef enum { RAY_INDEX_ABSENT = 0, RAY_INDEX_ON = 1, RAY_INDEX_OFF = 2 } ray_i
 ray_err_t ray_splay_save_layout(ray_t* tbl, const char* dir, const char* sym_path,
                                 ray_compress_t mode, ray_symfile_t layout,
                                 ray_index_opt_t index, bool durable);
+/* Append tbl's rows to the splayed table published in dir, without loading
+ * it (#1182): tbl has the target's column names (any order) and types; the
+ * target's columns are mapped and streamed with the new rows into a new
+ * generation (each column keeping its generation and its symfile layout),
+ * published as a save publishes.  No table in dir: tbl is written there,
+ * as ray_splay_save_layout writes it.  sym_given: the caller named
+ * sym_path (refused for a target with per-column symfiles).  NULL on
+ * success, else an owned error. */
+ray_t*    ray_splay_append(ray_t* tbl, const char* dir, const char* sym_path, bool sym_given,
+                           ray_index_opt_t index, bool durable);
 /* The `symfile` option of an options dict (NULL or no key: SHARED): the
  * symbol 'shared or 'column, anything else a domain error.  Returns NULL or
  * an owned error. */
@@ -157,6 +169,10 @@ void      ray_splay_build_indexes(const char* dir, ray_t* tbl);
 int64_t   ray_splay_test_parted_appends(void);
 int64_t   ray_splay_test_parted_max_rows(void);
 void      ray_splay_test_parted_reset(void);
+/* Test hooks of the append: link sidecars it synced; and, while set, the
+ * directory sync after a durable publish's .current rename fails (io). */
+int64_t   ray_splay_test_link_syncs(void);
+void      ray_splay_test_fail_publish_sync(bool on);
 
 /* Loader accepting a shared FILE domain. It resolves the generation first,
  * then refreshes the cached domain to include any externally appended symbols. */

@@ -241,6 +241,7 @@ static void splay_sweep_stale(ray_t* tbl, const char* dir) {
  * one filesystem rename.  Readers that predate this format continue to use
  * the legacy directory when .current is absent. */
 static _Atomic unsigned long splay_generation_seq;
+static _Atomic(bool) g_fail_publish_sync;   /* test hook: ray_splay_test_fail_publish_sync */
 
 static ray_err_t splay_current_dir(const char* dir, char* out, size_t out_sz,
                                    bool* active) {
@@ -318,7 +319,8 @@ static ray_err_t splay_publish_generation(const char* dir, const char* gen,
         (void)remove(tmp);
         return RAY_ERR_IO;
     }
-    return durable ? ray_file_sync_dir(manifest) : RAY_OK;
+    if (!durable) return RAY_OK;
+    return atomic_load(&g_fail_publish_sync) ? RAY_ERR_IO : ray_file_sync_dir(manifest);
 }
 
 static ray_err_t splay_has_file(const char* dir, const char* name, bool* exists) {
@@ -577,7 +579,9 @@ static ray_err_t splay_merge_vocab(ray_t* col, ray_sym_domain_t* dom) {
     ray_col_src_t src;
     ray_t* berr = ray_col_src_bind(col, &src);
     if (berr) { ray_err_t e = ray_err_from_obj(berr); ray_error_free(berr); return e; }
-    if (src.dom == dom) { ray_col_src_release(&src); return RAY_OK; }   /* already merged */
+    /* already merged; a parted source's segments may resolve over other
+     * domains (an append's new rows), each range says its own */
+    if (src.dom == dom && !src.parted) { ray_col_src_release(&src); return RAY_OK; }
     ray_col_scratch_t scr; ray_col_scratch_init(&scr);
     ray_err_t merr = RAY_OK;
     for (int64_t r = 0; merr == RAY_OK && r < src.len; ) {
@@ -585,7 +589,7 @@ static ray_err_t splay_merge_vocab(ray_t* col, ray_sym_domain_t* dom) {
         ray_t* rerr = ray_col_range(&src, r, src.len - r, &scr, &v);
         if (rerr) { merr = ray_err_from_obj(rerr); ray_error_free(rerr); break; }
         if (v.n <= 0) { merr = RAY_ERR_CORRUPT; break; }
-        for (int64_t i = 0; i < v.n; i++) {
+        for (int64_t i = 0; v.dom != dom && i < v.n; i++) {   /* a range over dom is merged */
             ray_t* str = ray_sym_domain_str(v.dom, ray_read_sym(v.data, i, RAY_SYM, v.attrs));
             if (!str) { merr = RAY_ERR_CORRUPT; break; }
             if (ray_sym_domain_intern(dom, ray_str_ptr(str), ray_str_len(str)) < 0) {
@@ -962,6 +966,7 @@ static ray_err_t splay_write_table_cols(ray_t* tbl, ray_t* gen_src, const char* 
             ray_free_raw(gens);
             return write->cur_err;                         /* inheritance needs the destination */
         }
+        if (write && write->keep_gens) { gens[c] = write->keep_gens[c]; continue; }
         ray_err_t gerr = ray_col_resolve_gen_err(mode, splay_slot(gen_src, c),
                                                  write ? write->cur : NULL,
                                                  ray_str_ptr(na), ray_str_len(na), &gens[c]);
@@ -1575,6 +1580,237 @@ ray_err_t ray_splay_save_staged_bulk(ray_t* tbl, const char* dir, const char* sy
 ray_err_t ray_splay_save_staged_bulk_mode(ray_t* tbl, const char* dir, const char* sym_path,
                                           ray_compress_t mode) {
     return splay_write_table_impl(tbl, dir, sym_path, false, false, false, mode, NULL, false);
+}
+
+/* --------------------------------------------------------------------------
+ * Append (#1182)
+ *
+ * The rows of a table are appended to the splayed table published in a
+ * directory without loading it: under the table's write lock the current
+ * generation is mapped, and each of its columns is written into a new
+ * generation through the parted writer above, as a two-segment parted
+ * column (the rows on disk, then the new rows), so a column is streamed a
+ * segment at a time and its dictionary's codes go to a spill file.  The
+ * publish order is a save's: symfile, columns, .d, then .current.
+ * -------------------------------------------------------------------------- */
+
+static _Atomic(int64_t) g_link_syncs;   /* test hook: link sidecars an append synced */
+int64_t ray_splay_test_link_syncs(void) { return atomic_load(&g_link_syncs); }
+
+/* An injected failure of the directory sync that follows the .current
+ * rename (test hook): the commit point has passed when it fails. */
+void ray_splay_test_fail_publish_sync(bool on) { atomic_store(&g_fail_publish_sync, on); }
+
+/* `<from>/<name>.link` copied to `<to>/<name>.link` when it exists: the
+ * link a column carries is the target's, whatever the new rows' column.
+ * durable: the copy is synced before the generation can be published (its
+ * directory entry is synced with the generation's, at the write finish). */
+static ray_err_t splay_copy_link(const char* from, const char* to, const char* name, size_t len,
+                                 bool durable) {
+    char src[1100], dst[1100];
+    int a = snprintf(src, sizeof src, "%s/%.*s.link", from, (int)len, name);
+    int b = snprintf(dst, sizeof dst, "%s/%.*s.link", to, (int)len, name);
+    if (a < 0 || (size_t)a >= sizeof src || b < 0 || (size_t)b >= sizeof dst) return RAY_ERR_RANGE;
+    FILE* in = fopen(src, "rb");
+    if (!in) return errno == ENOENT ? RAY_OK : RAY_ERR_IO;
+    char buf[4096];
+    FILE* out = fopen(dst, "wb");
+    ray_err_t err = out ? RAY_OK : RAY_ERR_IO;
+    size_t n;
+    while (err == RAY_OK && (n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) err = RAY_ERR_IO;
+    if (err == RAY_OK && ferror(in)) err = RAY_ERR_IO;
+    fclose(in);
+    if (out && fclose(out) != 0 && err == RAY_OK) err = RAY_ERR_IO;
+    if (err == RAY_OK && durable) {
+        ray_fd_t fd = ray_file_open(dst, RAY_OPEN_READ | RAY_OPEN_WRITE);
+        if (fd == RAY_FD_INVALID) err = RAY_ERR_IO;
+        else { err = ray_file_sync(fd); ray_file_close(fd); }
+        if (err == RAY_OK) atomic_fetch_add(&g_link_syncs, 1);
+    }
+    return err;
+}
+
+static ray_t* splay_append_err(ray_splay_write_t* write, ray_err_t code, ray_t* err) {
+    ray_splay_write_finish(write, code, false);
+    return err ? err : ray_error(ray_err_code_str(code), NULL);
+}
+
+static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const char* dir,
+                                 bool durable, ray_t** out, bool* sym_col);
+static ray_t* splay_load_dom_impl(const char* dir, ray_sym_domain_t* dom,
+                                  bool use_mmap, bool col_syms);
+
+ray_t* ray_splay_append(ray_t* tbl, const char* dir, const char* sym_path, bool sym_given,
+                        ray_index_opt_t index, bool durable) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE)
+        return ray_error("type", ".db.splayed.append expects a table");
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_t* col = splay_slot(tbl, c);
+        if (col && RAY_IS_ERR(col)) {   /* a failed decode: its code, message left in the slot */
+            ray_err_t derr = ray_err_from_obj(col);
+            ray_error_free(col);
+            return ray_error(ray_err_code_str(derr), NULL);
+        }
+        if (splay_slot_parted(col))
+            return ray_error("nyi", ".db.splayed.append: a parted table; write it with "
+                             ".db.splayed.set, or append its partitions one at a time");
+    }
+    ray_err_t err = splay_validate_persisted_names(tbl);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+
+    ray_splay_write_t write;
+    err = ray_splay_write_begin_mode(dir, RAY_COMPRESS_ABSENT, &write);
+    if (err != RAY_OK) return ray_error(ray_err_code_str(err), NULL);
+    write.no_auto_index = index == RAY_INDEX_OFF;
+    write.keep_dict = index == RAY_INDEX_ON;
+    if (!write.staged) {
+        /* no table published there: the rows are the table, as a save writes it */
+        err = ray_splay_write_table_ctx(tbl, &write, sym_path, durable);
+        err = ray_splay_write_finish(&write, err, durable);
+        if (err == RAY_ERR_LIMIT) {
+            const char* why = ray_col_limit_msg();
+            if (why) return ray_error("limit", "%s", why);
+        }
+        return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), NULL);
+    }
+    if (write.cur_err != RAY_OK) return splay_append_err(&write, write.cur_err, NULL);
+
+    /* The current generation, mapped: its SYM columns over the table's
+     * symfile (or their own); nothing is read but the files' headers. */
+    ray_sym_domain_t* dom = NULL;
+    struct stat st;
+    if (sym_path && stat(sym_path, &st) == 0) {
+        dom = ray_sym_domain_open(sym_path);
+        if (!dom)
+            return splay_append_err(&write, RAY_ERR_CORRUPT,
+                ray_error("corrupt", "symfile %s: unreadable or not a symfile", sym_path));
+    }
+    ray_t* old = splay_load_dom_impl(write.cur, dom, true, true);
+    if (dom) ray_sym_domain_release(dom);
+    if (!old || RAY_IS_ERR(old))
+        return splay_append_err(&write, old ? ray_err_from_obj(old) : RAY_ERR_IO, old);
+
+    ray_t* comb = NULL;
+    bool sym_col = false;
+    ray_t* serr = splay_append_slots(tbl, old, write.cur, write.dir, durable, &comb, &sym_col);
+    if (serr) { ray_release(old); return splay_append_err(&write, ray_err_from_obj(serr), serr); }
+    if (sym_col && sym_given) {
+        ray_release(comb); ray_release(old);
+        return splay_append_err(&write, RAY_ERR_DOMAIN, ray_error("domain",
+            ".db.splayed.append: a symfile path for a table whose SYM columns have "
+            "symfiles of their own (symfile 'column)"));
+    }
+    if (ray_table_nrows(tbl) == 0) {
+        /* nothing to add: the generation begun goes, the table stays as it is */
+        ray_release(comb); ray_release(old);
+        ray_splay_write_finish(&write, RAY_ERR_CANCEL, false);
+        return NULL;
+    }
+    write.sym_col = sym_col;
+    /* each column keeps the generation of the target's file: a compressed
+     * (encoded) column stays generation 2, a plain one 0 */
+    int64_t onc = ray_table_ncols(old);
+    uint8_t* keep = ray_calloc_raw((size_t)(onc > 0 ? onc : 1));
+    if (!keep) { ray_release(comb); ray_release(old); return splay_append_err(&write, RAY_ERR_OOM, NULL); }
+    for (int64_t c = 0; c < onc; c++) keep[c] = ray_table_get_col_enc_idx(old, c) ? 2 : 0;
+    write.keep_gens = keep;
+    (void)ray_col_limit_msg();   /* a stale reason from an earlier save */
+    err = splay_write_table_cols(comb, old, write.dir, sym_path, durable, true, true,
+                                 RAY_COMPRESS_ABSENT, &write, sym_col);
+    write.keep_gens = NULL;
+    ray_free_raw(keep);
+    ray_release(comb);
+    ray_release(old);
+    err = ray_splay_write_finish(&write, err, durable);
+    /* The commit point is the .current rename.  A failure after it (the
+     * directory sync) leaves the rows published: say so, as a retry would
+     * append them twice. */
+    if (err != RAY_OK && splay_generation_is_current(&write))
+        return ray_error(ray_err_code_str(err), ".db.splayed.append: the rows were published, "
+                         "but making the publication durable failed; reopen the table "
+                         "before appending them again");
+    if (err == RAY_ERR_LIMIT) {
+        const char* why = ray_col_limit_msg();
+        if (why) return ray_error("limit", "%s", why);
+    }
+    return err == RAY_OK ? NULL : ray_error(ray_err_code_str(err), NULL);
+}
+
+/* The table to write: each of `old`'s columns, in its order, as a
+ * two-segment parted column of the rows on disk and the same-named column
+ * of `tbl`; the links the target's columns carry copied into `dir`.
+ * *sym_col: the target's SYM columns have symfiles of their own. */
+static ray_t* splay_append_slots(ray_t* tbl, ray_t* old, const char* cur, const char* dir,
+                                 bool durable, ray_t** out, bool* sym_col) {
+    int64_t on = ray_table_ncols(old), nn = ray_table_ncols(tbl);
+    *out = NULL;
+    *sym_col = false;
+    /* before the walk over the target's columns, which a target without
+     * columns would skip */
+    if (on != nn)
+        return ray_error("domain", ".db.splayed.append: the table has %lld columns, "
+                         "the target %lld", (long long)nn, (long long)on);
+    bool own = false, shared = false;
+    ray_t* comb = ray_table_new(on > 0 ? on : 1);
+    if (!comb || RAY_IS_ERR(comb)) return comb ? comb : ray_error("oom", NULL);
+    for (int64_t c = 0; c < on; c++) {
+        int64_t name_id = ray_table_col_name(old, c);
+        ray_t* na = ray_sym_str(name_id);
+        if (!na) { ray_release(comb); return ray_error("corrupt", NULL); }
+        int64_t j = 0;
+        while (j < nn && ray_table_col_name(tbl, j) != name_id) j++;
+        if (j == nn) {
+            ray_release(comb);
+            return ray_error("domain", ".db.splayed.append: the table has no column '%.*s', "
+                             "which the target has", (int)ray_str_len(na), ray_str_ptr(na));
+        }
+        ray_t* os = splay_slot(old, c);
+        ray_t* ns = splay_slot(tbl, j);
+        int8_t ot = splay_slot_type(os), nt = splay_slot_type(ns);
+        if (ot != nt) {
+            ray_release(comb);
+            return ray_error("type", ".db.splayed.append: column '%.*s' is %s on disk, %s in the table",
+                             (int)ray_str_len(na), ray_str_ptr(na),
+                             ray_type_name(ot), ray_type_name(nt));
+        }
+        if (!ray_is_vector_type(ot)) {
+            ray_release(comb);
+            return ray_error("nyi", ".db.splayed.append: column '%.*s' is a %s column",
+                             (int)ray_str_len(na), ray_str_ptr(na), ray_type_name(ot));
+        }
+        if (ot == RAY_SYM) {
+            char spath[1100];
+            struct stat st;
+            bool has = ray_splay_col_sym_path(spath, sizeof spath, cur, ray_str_ptr(na), ray_str_len(na)) &&
+                       stat(spath, &st) == 0;
+            own |= has; shared |= !has;
+        }
+        ray_err_t lerr = splay_copy_link(cur, dir, ray_str_ptr(na), ray_str_len(na), durable);
+        if (lerr != RAY_OK) { ray_release(comb); return ray_error(ray_err_code_str(lerr), NULL); }
+        ray_t* w = ray_alloc(2 * sizeof(ray_t*));
+        if (!w || RAY_IS_ERR(w)) { ray_release(comb); return w ? w : ray_error("oom", NULL); }
+        w->type = (int8_t)(RAY_PARTED_BASE + ot);
+        w->len = 2;
+        w->attrs = 0;
+        memset(w->aux, 0, 16);
+        ray_retain(os); ray_retain(ns);
+        ((ray_t**)ray_data(w))[0] = os;
+        ((ray_t**)ray_data(w))[1] = ns;   /* not-a-table */
+        ray_t* next = ray_table_add_col(comb, name_id, w);
+        ray_release(w);
+        if (!next || RAY_IS_ERR(next)) { ray_release(comb); return next ? next : ray_error("oom", NULL); }
+        comb = next;
+    }
+    if (own && shared) {
+        ray_release(comb);
+        return ray_error("nyi", ".db.splayed.append: a target whose SYM columns mix "
+                         "symfiles of their own and the shared one");
+    }
+    *sym_col = own;
+    *out = comb;
+    return NULL;
 }
 
 /* --------------------------------------------------------------------------

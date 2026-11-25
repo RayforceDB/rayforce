@@ -644,6 +644,7 @@ spills exactly as it did before.
 | `.json.get` | variadic | One field of each JSON document by a dotted path (or one path per row), with an optional type (`'STR`, `'I64`, `'F64`: always that type, null where absent or another kind) and optional limits | `(.json.get line "kind")` |
 | `.json.format` | unary | A value as JSON text; in a query element-wise: one string per row of a column, on every route | `(.json.format (dict ["a"] (list 1)))` |
 | `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
+| `.db.splayed.append` | variadic | Append a table's rows to a splayed table on disk without loading it; same column names and types; optional `{index: bool, durable: bool}` | `(.db.splayed.append "db/trades" new_trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |
 | `.db.parted.tables` | variadic | List table names under a parted root | `(.db.parted.tables "db")` |

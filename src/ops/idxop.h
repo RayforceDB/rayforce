@@ -531,8 +531,31 @@ typedef struct ray_dict_acc_s {
     char*     pool;      uint64_t pool_len;  uint64_t pool_cap;
     uint32_t* slot;      uint64_t mask;      /* code + 1, 0 = empty */
     bool      dead;      /* row count overflowed int32 codes: nothing is kept */
+    /* ray_dict_acc_spill: the codes go to a file a window at a time;
+     * codes[0] is row spill_base's.  ray_dict_acc_codes maps the file. */
+    FILE*     spill;     char* spill_path;   int64_t spill_base;
+    void*     spill_map; size_t spill_map_sz;
 } ray_dict_acc_t;
 ray_err_t ray_dict_acc_init(ray_dict_acc_t* a);
+/* Right after init: write the codes to `path` (created or truncated) as
+ * they are made, holding RAY_DICT_SPILL_ROWS of them in memory instead of
+ * every row's, so the accumulator's memory follows the distinct strings and
+ * not the rows.  free removes the file. */
+#define RAY_DICT_SPILL_ROWS 65536
+ray_err_t ray_dict_acc_spill(ray_dict_acc_t* a, const char* path);
+/* Every row's code, contiguous: the codes array, or the spill file mapped
+ * read-only (the mapping goes with free).  NULL when the file cannot be
+ * written or mapped. */
+const int32_t* ray_dict_acc_codes(ray_dict_acc_t* a);
+/* Write to f, at its position, the inline index region (ray_index_inline_write_file)
+ * of the DICT ray_dict_acc_finish would make for a column of `len` rows,
+ * its codes streamed from ray_dict_acc_codes: no codes vector is built.
+ * RAY_ERR_DOMAIN when finish would make none (dead, len below
+ * RAY_DICT_MIN_ROWS, or not every row fed); the accumulator is left as it
+ * was, for the caller to free. */
+ray_err_t ray_dict_acc_write_region(FILE* f, ray_dict_acc_t* a, int64_t len);
+/* Whether ray_dict_acc_finish would make a DICT for a column of `len` rows. */
+bool ray_dict_acc_wanted(const ray_dict_acc_t* a, int64_t len);
 /* Appends every row of STR vector v. There is no cardinality cap: the
  * result matches ray_index_dict_compute for any number of distinct strings.
  * Only a row count past INT32_MAX (codes are int32) frees the accumulator,
