@@ -5186,21 +5186,171 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
  * call, or as the last form of a `do`?  Scattered per row, such a verb sees
  * one cell: `(+ 0 (reverse c))` gave the column unreversed and `(do 0 (iasc
  * c))` raised `type`, where update and by: read the whole column (#1654).
- * Not inside a lambda, a quote, an `if` arm or any other special form, which
+ * Not inside a closure, a quote, an `if` arm or any other special form, which
  * keep the row-by-row semantics; the caller leaves an expression with an
  * aggregate to its own path (one value, or reduced before the scatter). */
-static bool expr_nests_whole_verb(ray_t* e, ray_t* tbl, int depth) {
+/* Is `sym` one of the lambda parameters `params` (a SYM vector or a list)? */
+static bool whole_verb_is_param(ray_t* params, int64_t sym) {
+    if (!params) return false;
+    if (params->type == RAY_SYM) {
+        for (int64_t j = 0; j < params->len; j++)
+            if (ray_read_sym(ray_data(params), j, params->type, params->attrs) == sym) return true;
+    } else if (params->type == RAY_LIST) {
+        for (int64_t j = 0; j < params->len; j++) {
+            ray_t* q = ((ray_t**)ray_data(params))[j];
+            if (q && q->type == -RAY_SYM && q->i64 == sym) return true;
+        }
+    }
+    return false;
+}
+
+/* Inside a helper's body: its parameters, and each name a `let` statement of
+ * the body has bound so far, in order, with whether that value derives from
+ * the parameters (the latest binding of a name decides, so a parameter
+ * rebound to a constant no longer is the argument). */
+enum { WV_MAX_NAMES = 32 };
+typedef struct {
+    ray_t*  params;
+    int64_t names[WV_MAX_NAMES];
+    bool    derived[WV_MAX_NAMES];
+    int     n;
+} wv_scope_t;
+
+static bool wv_name_derived(const wv_scope_t* sc, int64_t sym) {
+    for (int k = sc->n - 1; k >= 0; k--) if (sc->names[k] == sym) return sc->derived[k];
+    return whole_verb_is_param(sc->params, sym);
+}
+
+/* Record that `sym` is now bound to a value derived from the arguments, or
+ * not.  False when there are too many names to track. */
+static bool wv_name_set(wv_scope_t* sc, int64_t sym, bool d) {
+    for (int k = 0; k < sc->n; k++) if (sc->names[k] == sym) { sc->derived[k] = d; return true; }
+    if (sc->n >= WV_MAX_NAMES) return false;
+    sc->names[sc->n] = sym; sc->derived[sc->n] = d; sc->n++;
+    return true;
+}
+
+/* A name a `let` or `set` binds inside `e` (a nested `do`, an `if` arm, an
+ * argument, a `try`, a loop), where the in-order walk of the body's
+ * statements cannot follow which binding a later read sees: from here on it
+ * does not derive from the arguments.  Not inside a lambda literal or a
+ * quote, which keep their own; `skip_top`: `e` is a `let` statement whose own
+ * name the caller tracks.  False when there are too many names to track. */
+static bool wv_drop_nested(ray_t* e, wv_scope_t* sc, bool skip_top, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 64) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED)) {
+        if (h->i64 == ray_sym_intern("fn", 2) || h->i64 == ray_sym_intern("quote", 5)) return true;
+        if ((h->i64 == ray_sym_intern("let", 3) || h->i64 == ray_sym_intern("set", 3)) &&
+            e->len == 3 && es[1]->type == -RAY_SYM && !skip_top &&
+            !wv_name_set(sc, es[1]->i64, false))
+            return false;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!wv_drop_nested(es[i], sc, false, depth + 1)) return false;
+    return true;
+}
+
+/* Does `e` derive from the helper's arguments: a parameter, a name bound
+ * from one, or a call over one?  A literal, a global, a quote or a lambda
+ * literal does not. */
+static bool wv_derives(ray_t* e, const wv_scope_t* sc, int depth) {
+    if (!e || depth > 64) return false;
+    if (e->type == -RAY_SYM && !(e->attrs & ATTR_QUOTED)) return wv_name_derived(sc, e->i64);
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (h && h->type == -RAY_SYM && !(h->attrs & ATTR_QUOTED) &&
+        (h->i64 == ray_sym_intern("quote", 5) || h->i64 == ray_sym_intern("fn", 2)))
+        return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (wv_derives(es[i], sc, depth + 1)) return true;
+    return false;
+}
+
+/* The lambda `e`'s head calls: a symbol bound to one that is no closure, or
+ * a `(fn [params] body...)` literal.  Its parameters and body forms. */
+static bool wv_lambda_head(ray_t* h, ray_t* tbl, bool in_body, ray_t** params,
+                           ray_t* const** body, int64_t* nbody) {
+    if (h && h->type == RAY_LIST && !(h->attrs & ATTR_QUOTED) && h->len >= 3) {
+        ray_t** hs = (ray_t**)ray_data(h);
+        if (!hs[0] || hs[0]->type != -RAY_SYM || (hs[0]->attrs & ATTR_QUOTED) ||
+            hs[0]->i64 != ray_sym_intern("fn", 2)) return false;
+        *params = hs[1]; *body = hs + 2; *nbody = h->len - 2;
+        return true;
+    }
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64)) return false;
+    if (!in_body && ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = in_body ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
+    if (!fn || fn->type != RAY_LAMBDA || LAMBDA_CLOSURE(fn)) return false;
+    ray_t* bodies = LAMBDA_BODY(fn);
+    if (!bodies || bodies->type != RAY_LIST) return false;
+    *params = LAMBDA_PARAMS(fn); *body = (ray_t* const*)ray_data(bodies); *nbody = bodies->len;
+    return true;
+}
+
+/* `sc`: inside a helper's body, its parameters and derived names (a head
+ * naming a parameter is the argument, not a builtin, and a verb counts only
+ * when its operand derives from them); NULL in the query's own expression,
+ * where a caller's local shadows instead.  A helper's free names are
+ * globals. */
+static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_scope_t* sc) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 64) return false;
     ray_t** es = (ray_t**)ray_data(e);
     ray_t* h = es[0];
+    ray_t* lparams = NULL;
+    ray_t* const* lbody = NULL;
+    int64_t nlbody = 0;
+    if (!(sc && h && h->type == -RAY_SYM && whole_verb_is_param(sc->params, h->i64)) &&
+        wv_lambda_head(h, tbl, sc != NULL, &lparams, &lbody, &nlbody)) {
+        /* A helper the planner does not inline, whose body reaches a
+         * whole-column verb on the same paths over its argument: called with
+         * the column, as update and by: call it, not once per row (#1654).
+         * Inside a body, only through an argument derived from the caller's
+         * own; a closure reads captures this walk cannot see: per row. */
+        bool passed = !sc;
+        for (int64_t i = 1; i < e->len && !passed; i++) passed = wv_derives(es[i], sc, 0);
+        if (passed) {
+            wv_scope_t inner = { .params = lparams, .n = 0 };
+            for (int64_t b = 0; b < nlbody; b++) {
+                ray_t* st = lbody[b];
+                bool top_let = st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3 &&
+                               ((ray_t**)ray_data(st))[0]->type == -RAY_SYM &&
+                               ((ray_t**)ray_data(st))[0]->i64 == ray_sym_intern("let", 3);
+                /* a name rebound inside the statement is not followed:
+                 * not derived from here on, before the statement is read */
+                if (!wv_drop_nested(st, &inner, top_let, 0)) break;
+                if (expr_nests_whole_verb_in(st, tbl, depth + 1, &inner)) return true;
+                /* a `let` statement rebinds its name for the statements
+                 * after it: derived from the arguments when its value is */
+                if (st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3) {
+                    ray_t** ss = (ray_t**)ray_data(st);
+                    if (ss[0]->type == -RAY_SYM && ss[0]->i64 == ray_sym_intern("let", 3) &&
+                        ss[1]->type == -RAY_SYM) {
+                        if (!wv_name_set(&inner, ss[1]->i64, wv_derives(ss[2], &inner, 0)))
+                            break;   /* too many names to track: no further statement counts */
+                    }
+                }
+            }
+        }
+        for (int64_t i = 1; i < e->len; i++)
+            if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc)) return true;
+        return false;
+    }
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
-    if (tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
-    ray_t* fn = ray_env_get(h->i64);
+    if (tbl_has_col(tbl, h->i64)) return false;
+    if (sc ? whole_verb_is_param(sc->params, h->i64) : ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = sc ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
     if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
     if (fn->attrs & RAY_FN_SPECIAL_FORM) {
+        /* a `let`'s value is evaluated wherever the `let` is */
+        if (h->i64 == ray_sym_intern("let", 3))
+            return e->len == 3 && expr_nests_whole_verb_in(es[2], tbl, depth + 1, sc);
         if (h->i64 != ray_sym_intern("do", 2)) return false;
         ray_t* last = es[e->len - 1];
-        return is_whole_column_projection(last, tbl) || expr_nests_whole_verb(last, tbl, depth + 1);
+        return (!sc && is_whole_column_projection(last, tbl)) ||
+               expr_nests_whole_verb_in(last, tbl, depth + 1, sc);
     }
     if (depth > 0) {
         static const char* const verbs[] = { "distinct", "where", "reverse", "asc", "desc", "iasc", "idesc", "rank" };
@@ -5209,12 +5359,22 @@ static bool expr_nests_whole_verb(ray_t* e, ray_t* tbl, int depth) {
             size_t l = ray_str_len(nm);
             const char* pp = ray_str_ptr(nm);
             for (size_t k = 0; k < sizeof verbs / sizeof *verbs; k++)
-                if (l == strlen(verbs[k]) && memcmp(pp, verbs[k], l) == 0) return true;
+                if (l == strlen(verbs[k]) && memcmp(pp, verbs[k], l) == 0) {
+                    /* in a helper's body, only a verb over its argument */
+                    if (!sc) return true;
+                    for (int64_t i = 1; i < e->len; i++)
+                        if (wv_derives(es[i], sc, 0)) return true;
+                    break;
+                }
         }
     }
     for (int64_t i = 1; i < e->len; i++)
-        if (expr_nests_whole_verb(es[i], tbl, depth + 1)) return true;
+        if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc)) return true;
     return false;
+}
+
+static bool expr_nests_whole_verb(ray_t* e, ray_t* tbl, int depth) {
+    return expr_nests_whole_verb_in(e, tbl, depth, NULL);
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,

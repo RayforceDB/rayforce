@@ -193,16 +193,24 @@ whole table's ranks, not the running sum of each group's ranks.
 
 Without `by:` the verb also reads the whole column when it sits under a call
 (`(+ 1 (reverse v))`) or is the last form of a `do`, as it does in `update` and
-under `by:`. A helper the planner does not inline (one whose body has more than
-one statement, `(fn [x] (let y 1) (reverse x))`) is different: in a `select`
-projection without `by:` it is called once per row, so a whole-column verb in
-its body sees one cell. `reverse`, `asc` and `desc` then return the column as
-it was, and `distinct`, `where`, `iasc`, `idesc` and `rank` raise `type`;
-`update` and `by:` read the whole column. Call the verb in the projection
-itself, or in a helper whose body is that one expression, which the planner
-inlines ([#1654](https://github.com/RayforceDB/rayforce/issues/1654); whether
-such a helper sees a row or the whole column is open with
-[#1650](https://github.com/RayforceDB/rayforce/issues/1650)).
+under `by:`. A helper the planner does not inline (one whose body has more than one
+statement, `(fn [x] (let y 1) (reverse x))`, named or written in place as a
+lambda literal) is called with the column, not a row, when its body applies a
+whole-column verb to its argument: to a parameter, or to a value the body
+derives from one through `let`s and calls (the latest `let` of a name decides,
+so a parameter rebound to a constant no longer counts, nor does a name rebound
+inside a nested `do`, an `if` arm or another argument). The verb may stand at the top of a
+statement, under a call, in a `let`'s value, in a `do`'s last form, or in a
+helper the body calls with such a value. In a `select` projection such a helper
+receives the whole column (the rows `where:` keeps), as it does in `update` and
+under `by:`, so it gives what the verb written in place gives; an effect in it
+happens once, not once per row. Otherwise the helper keeps its per-row call,
+and a verb in it sees one cell: a closure, a verb only reached through an `if`
+arm, a verb applied to a constant or a global
+(`(fn [x] (let k (reverse [1 2])) (count x))` counts each row's cell), a verb
+passed in as an argument, and a lambda bound by a `let` in the projection and
+then called, `(do (let h (fn [x] (let y 1) (reverse x))) (h b))`
+([#1654](https://github.com/RayforceDB/rayforce/issues/1654)).
 
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
