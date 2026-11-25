@@ -862,6 +862,24 @@ int repl_child_main(const char* variant) {
 /* ─── PTY helper for interactive (run_interactive) coverage ──────── */
 
 #ifndef RAY_OS_WINDOWS
+/* Wait (5 s at most) until the REPL in the pty child has printed
+ * something: it prints its banner only once its terminal is set up, so
+ * input written from then on is read, not discarded by the switch to raw
+ * mode, however slowly the child started (#1685). */
+static void pty_wait_first_output(int master_fd) {
+    for (int waited = 0; waited < 5000; waited += 10) {
+        char buf[1024];
+        ssize_t n = read(master_fd, buf, sizeof(buf));
+        if (n > 0) return;
+        if (n < 0 && errno != EAGAIN && errno != EINTR) return;
+        usleep(10 * 1000);
+    }
+}
+
+/* Set by a test: write the input at once, before the REPL can have
+ * printed anything (type-ahead), instead of waiting for its output. */
+static bool g_pty_type_ahead = false;
+
 /* Run ray_repl_run inside a forkpty()ed child so stdin/stdout/stderr
  * are real ptys.  ray_repl_create therefore takes the isatty=true
  * branch and ray_repl_run dispatches to run_interactive — the only
@@ -892,16 +910,7 @@ static int run_pty_with_input(const char* input, int use_poll)
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
 
-    /* The REPL puts the terminal in raw mode with TCSAFLUSH before it
-     * prints anything, discarding what was typed before: wait for its
-     * first output (5 s at most), then type. */
-    for (int waited = 0; waited < 5000; waited += 10) {
-        char buf[1024];
-        ssize_t n = read(master_fd, buf, sizeof(buf));
-        if (n > 0) break;
-        if (n < 0 && errno != EAGAIN && errno != EINTR) break;
-        usleep(10 * 1000);
-    }
+    if (!g_pty_type_ahead) pty_wait_first_output(master_fd);
 
     if (input && *input) {
         const char* sigint_marker = strchr(input, '\x01');
@@ -980,6 +989,19 @@ done:
     return -1;
 }
 #endif /* !RAY_OS_WINDOWS */
+
+/* What a user types before the prompt appears is read, not discarded by
+ * the switch to raw mode (#1685): written at once after the fork, while
+ * the child is still starting, the line still runs. */
+static test_result_t test_repl_pty_type_ahead(void) {
+#ifndef RAY_OS_WINDOWS
+    g_pty_type_ahead = true;
+    int rc = run_pty_with_input("(exit 5)\n", 1);
+    g_pty_type_ahead = false;
+    TEST_ASSERT_FMT(rc == 5, "type-ahead before the prompt was lost: child rc %d", rc);
+#endif
+    PASS();
+}
 
 /* :q from a pty drives the poll branch of run_interactive: print_banner,
  * ray_repl_create's tty-true branch (terminal alloc + signal install +
@@ -2172,7 +2194,7 @@ static int run_pty_with_env_and_input(const char* input, int use_poll,
 
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
-    usleep(80 * 1000);
+    pty_wait_first_output(master_fd);
 
     if (input && *input) {
         const char* p   = input;
@@ -2476,7 +2498,7 @@ static int run_pty_listen_with_poll(const char* input)
 
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags >= 0) fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
-    usleep(80 * 1000);
+    pty_wait_first_output(master_fd);
 
     if (input && *input) {
         const char* p = input;
@@ -3480,6 +3502,7 @@ const test_entry_t repl_entries[] = {
 
     /* PTY-driven interactive (run_interactive) coverage */
     { "repl/pty/quit",                       test_repl_pty_quit,                       repl_setup, repl_teardown },
+    { "repl/pty/type_ahead",                 test_repl_pty_type_ahead,                 repl_setup, repl_teardown },
     { "repl/pty/backslash_exit",             test_repl_pty_backslash_exit,             repl_setup, repl_teardown },
     { "repl/pty/eval_then_quit",             test_repl_pty_eval_then_quit,             repl_setup, repl_teardown },
     { "repl/pty/ctrl_d",                     test_repl_pty_ctrl_d,                     repl_setup, repl_teardown },

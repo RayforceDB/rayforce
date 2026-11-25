@@ -386,7 +386,9 @@ ray_term_t* ray_term_create(void) {
     term->newattr.c_lflag &= ~(ICANON | ECHO | ISIG);
     term->newattr.c_cc[VMIN]  = 1;
     term->newattr.c_cc[VTIME] = 0;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term->newattr);
+    /* TCSADRAIN, not TCSAFLUSH: what was typed before the prompt appeared
+     * is kept and read by the line editor, not discarded (#1685) */
+    tcsetattr(STDIN_FILENO, TCSADRAIN, &term->newattr);
 
     term->term_width  = 80;
     term->term_height = 24;
