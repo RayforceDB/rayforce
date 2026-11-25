@@ -4820,6 +4820,13 @@ static ray_t* call_lambda_impl(ray_t* lambda, ray_t** call_args, int64_t argc,
     return result;
 }
 
+/* Compile `lambda` now if its first call would (lambda_wants_compile):
+ * pmap does so on the calling thread before workers call it, so no two
+ * threads compile one lambda. */
+void ray_lambda_ready(ray_t* lambda) {
+    if (lambda && lambda->type == RAY_LAMBDA && lambda_wants_compile(lambda)) lambda_compile(lambda);
+}
+
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     if (RAY_UNLIKELY(lambda_lifts(lambda)))
         return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
@@ -7709,7 +7716,9 @@ out:
         /* Release pins before a final progress callback can start more work,
          * and before a caller is allowed to destroy its runtime. */
         affine_sum_cache_clear();
-        ray_progress_end();
+        /* a pool worker's own VM (pmap, #1248) ends no progress: the bar
+         * is the dispatching thread's */
+        if (!ray_pool_on_worker()) ray_progress_end();
     }
     return ret;
 }

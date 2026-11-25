@@ -1,4 +1,7 @@
-;; Invariants for `pmap` — sequential alias for map; identical semantics.
+;; `pmap` (#1248): map's forms and answers.  A function proven pure runs
+;; its calls on the pool's workers once they are worth a dispatch (each
+;; call here costs tens of microseconds over a few thousand elements);
+;; anything else runs as map.  Every answer below is map's.
 
 (pmap (fn [x] (* x x)) [1 2 3 4 5]) -- [1 4 9 16 25]
 (pmap (fn [x] x) [10 20 30]) -- [10 20 30]
@@ -9,3 +12,46 @@
 
 ;; count preserved
 (count V) -- (count (pmap (fn [x] (* x 2)) V))
+
+;; Bodies heavy enough to be dispatched: results in input order, typed as
+;; map types them (an I64 vector, an F64 vector, a list of vectors, strings).
+(set B (til 3000))
+(set N (til 4000))
+(set heavy (fn [x] (count (distinct (% (* B 7) (+ 1 (% x 97)))))))
+(pmap heavy N) -- (map heavy N)
+(type (pmap heavy N)) -- 'I64
+(set fheavy (fn [x] (avg (sqrt (+ B x)))))
+(pmap fheavy N) -- (map fheavy N)
+(set lheavy (fn [x] (take (asc (% (* B 3) (+ 2 (% x 31)))) 3)))
+(pmap lheavy N) -- (map lheavy N)
+(set sheavy (fn [x] (upper (at ["ab" "cd" "ef"] (% (+ (sum B) x) 3)))))
+(pmap sheavy N) -- (map sheavy N)
+;; the binary form, a local `let`, if/and/or, a capture
+(set bheavy (fn [k x] (do (let y (+ x k)) (if (and (> y 10) (< y 3000)) (sum (% B y)) (or 0 -1)))))
+(pmap bheavy 3 N) -- (map bheavy 3 N)
+(set mk (fn [m] (fn [x] (count (where (> (% B (+ m (% x 50))) 3))))))
+(set cap (mk 5))
+(pmap cap N) -- (map cap N)
+;; nested: pmap inside a pmapped body runs as map
+(pmap (fn [x] (sum (pmap neg (til (% x 7))))) (til 50)) -- (map (fn [x] (sum (map neg (til (% x 7))))) (til 50))
+
+;; Errors: the one map reports, at the lowest failing element.
+(set bad (fn [x] (if (== x 2500) (+ x 'a) (count (distinct (% (* B 7) (+ 1 (% x 97))))))))
+(pmap bad N) !- type
+(set bad2 (fn [x] (if (> x 1000) (+ x 'a) (count (distinct (% (* B 7) (+ 1 (% x 97))))))))
+(pmap bad2 N) !- type
+(set firstbad (fn [x] (if (== x 0) (+ x 'a) (count (distinct (% (* B 7) (+ 1 (% x 97))))))))
+(pmap firstbad N) !- type
+
+;; Not proven pure: runs as map, effects and all, in order.
+(set acc 0)
+(set eff (fn [x] (do (set acc (+ acc 1)) (count (distinct (% B (+ 1 (% x 97))))))))
+(pmap eff (til 2000)) -- (map (fn [x] (count (distinct (% B (+ 1 (% x 97)))))) (til 2000))
+acc -- 2000
+(set order [])
+(set track (fn [x] (do (set order (concat order x)) (sum (% B (+ 1 x))))))
+(count (pmap track (til 300))) -- 300
+order -- (til 300)
+;; a user function called from the body
+(set inner (fn [x] (count (distinct (% B (+ 1 (% x 97)))))))
+(pmap (fn [x] (inner x)) N) -- (map inner N)

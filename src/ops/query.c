@@ -3595,6 +3595,182 @@ static bool query_inline_pure_builtin(int64_t id) {
     return !(fn->attrs & RAY_FN_RESTRICTED);
 }
 
+/* ── pmap: functions proven safe to call on pool workers (#1248) ──
+ *
+ * What the proof judges is the function objects a call will reach, never a
+ * name: a builtin by its own name (ray_fn_name, set when it was registered
+ * and kept whatever names it is bound to), so `reverse` rebound to print is
+ * print.  A pure builtin is one of query_inline_pure_builtin's kind
+ * (deterministic, no effect, no input but its arguments, never calling back
+ * into user code), never restricted.
+ *
+ * A lambda is proven when its body is built from calls of such builtins,
+ * the forms below, its own parameters, captures and `let` locals, literals
+ * and global data (no `set`, no call of a local or a user function, no
+ * lambda literal, no global lambda named as a value: a builtin could be
+ * handed it), and, compiled, when its constant pool holds no other
+ * callee: the builtins the compiler baked in when it compiled the body (a
+ * name may have meant another function then) and every name it resolves
+ * at call time, judged by what that name is bound to now.  The proof is
+ * taken at each call, so a rebinding between two calls is seen.  Anything
+ * it cannot identify is not proven, and pmap runs it as map does. */
+enum { PMAP_MAX_LOCALS = 64, PMAP_MAX_DEPTH = 64 };
+typedef struct { int64_t ids[PMAP_MAX_LOCALS]; int n; ray_t* closure; } pmap_scope_t;
+
+static bool pmap_is_builtin(const ray_t* fn) {
+    return fn && (fn->type == RAY_UNARY || fn->type == RAY_BINARY || fn->type == RAY_VARY);
+}
+
+/* A builtin object pmap may call on a worker: pure by its own name. */
+static bool pmap_fnobj_ok(const ray_t* fn) {
+    if (!pmap_is_builtin(fn) || (fn->attrs & (RAY_FN_RESTRICTED | RAY_FN_SPECIAL_FORM))) return false;
+    static const char* const extra[] = {
+        "concat", "distinct", "reverse", "asc", "desc", "iasc", "idesc", "rank",
+        "til", "take", "drop", "enlist", "list", "count", "first", "last", "at", "in",
+        "not-in", "except", "union", "sect", "where", "raze", "flip", "key", "value",
+        "type", "sublist", "differ", "fills", "group", "upper", "lower", "trim", "strlen",
+        "like", "ilike", "str-find", "nil?",
+    };
+    const char* own = ray_fn_name(fn);
+    if (!own[0] || own[0] == '.') return false;   /* dotted builtins: system, I/O */
+    for (size_t i = 0; i < sizeof extra / sizeof *extra; i++)
+        if (strcmp(own, extra[i]) == 0) return true;
+    return ray_query_rowwise_builtin(ray_sym_intern(own, strlen(own)));
+}
+
+static bool pmap_local(const pmap_scope_t* sc, int64_t id) {
+    for (int i = 0; i < sc->n; i++) if (sc->ids[i] == id) return true;
+    if (sc->closure) {
+        ray_t* keys = ray_dict_keys(sc->closure);
+        for (int64_t i = 0; keys && keys->type == RAY_SYM && i < keys->len; i++)
+            if (ray_read_sym(ray_data(keys), i, RAY_SYM, keys->attrs) == id) return true;
+    }
+    return false;
+}
+
+static bool pmap_bind(pmap_scope_t* sc, int64_t id) {
+    if (sc->n >= PMAP_MAX_LOCALS) return false;
+    sc->ids[sc->n++] = id;
+    return true;
+}
+
+/* The forms pmap's bodies may use, by name. */
+enum { PF_NONE, PF_IF, PF_DO, PF_LET, PF_LOGIC, PF_QUOTE };
+static int pmap_form_named(const char* name) {
+    static const char* const names[] = { "if", "do", "let", "and", "or", "cond", "quote" };
+    static const int kinds[] = { PF_IF, PF_DO, PF_LET, PF_LOGIC, PF_LOGIC, PF_LOGIC, PF_QUOTE };
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+        if (strcmp(name, names[i]) == 0) return kinds[i];
+    return PF_NONE;
+}
+
+/* The form `id` names where it is written: if, do and let are the forms
+ * whatever their global binding (the compiler wires them); and, or, cond
+ * and quote resolve, so the object bound to the name must be that form. */
+static int pmap_form(int64_t id, const pmap_scope_t* sc) {
+    if (pmap_local(sc, id)) return PF_NONE;
+    ray_t* na = ray_sym_str(id);
+    if (!na) return PF_NONE;
+    char name[16];
+    size_t len = ray_str_len(na);
+    if (len >= sizeof name) return PF_NONE;
+    memcpy(name, ray_str_ptr(na), len);
+    name[len] = 0;
+    int kind = pmap_form_named(name);
+    if (kind == PF_IF || kind == PF_DO || kind == PF_LET || kind == PF_NONE) return kind;
+    ray_t* g = ray_env_get_global(id);
+    return pmap_is_builtin(g) && strcmp(ray_fn_name(g), name) == 0 ? kind : PF_NONE;
+}
+
+/* A value a call may reach: a builtin object must be pure (or one of the
+ * forms), a lambda is not proven. */
+static bool pmap_callee_ok(const ray_t* v) {
+    if (!v || RAY_IS_ERR(v)) return true;
+    if (v->type == RAY_LAMBDA) return false;
+    if (!pmap_is_builtin(v)) return true;                  /* data */
+    if (v->attrs & RAY_FN_SPECIAL_FORM) return pmap_form_named(ray_fn_name(v)) != PF_NONE;
+    return pmap_fnobj_ok(v);
+}
+
+static bool pmap_expr_ok(ray_t* e, int depth, pmap_scope_t* sc) {
+    if (!e || depth > PMAP_MAX_DEPTH) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        if (pmap_local(sc, e->i64)) return true;
+        ray_t* g = ray_env_get_global(e->i64);
+        /* a user function named as a value may be called by whatever
+         * receives it; a builtin value only by a call of a local, which
+         * is refused below */
+        return !(g && g->type == RAY_LAMBDA);
+    }
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED)) return true;   /* literal data */
+    if (e->len == 0) return true;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    int form = pmap_form(h->i64, sc);
+    if (form == PF_QUOTE) return true;
+    if (form == PF_LET) {
+        if (e->len != 3 || !es[1] || es[1]->type != -RAY_SYM) return false;
+        if (!pmap_expr_ok(es[2], depth + 1, sc)) return false;
+        return pmap_bind(sc, es[1]->i64);
+    }
+    if (form == PF_NONE) {
+        if (pmap_local(sc, h->i64)) return false;     /* a call of a local: unknown callee */
+        if (!pmap_fnobj_ok(ray_env_get_global(h->i64))) return false;
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (!pmap_expr_ok(es[i], depth + 1, sc)) return false;
+    return true;
+}
+
+/* A compiled lambda's constant pool: every function object in it (baked in
+ * at compile time, whatever its name means now) and what every name in it
+ * is bound to now (resolved at call time) is a pure builtin or data.
+ * Nested lists (a tree-walked `if` site's text, quoted data) are walked. */
+static bool pmap_consts_ok(ray_t* v, int depth) {
+    if (!v || RAY_IS_ERR(v)) return true;
+    if (depth > PMAP_MAX_DEPTH) return false;
+    if (v->type == -RAY_SYM) return pmap_callee_ok(ray_env_get_global(v->i64));
+    if (v->type == RAY_SYM) {   /* a vector of names (a site's locals): their globals */
+        for (int64_t i = 0; i < v->len; i++)
+            if (!pmap_callee_ok(ray_env_get_global(ray_read_sym(ray_data(v), i, RAY_SYM, v->attrs))))
+                return false;
+        return true;
+    }
+    if (v->type == RAY_LIST) {
+        ray_t** es = (ray_t**)ray_data(v);
+        for (int64_t i = 0; i < v->len; i++)
+            if (!pmap_consts_ok(es[i], depth + 1)) return false;
+        return true;
+    }
+    return pmap_callee_ok(v);
+}
+
+bool ray_pmap_fn_pure(ray_t* fn) {
+    if (!fn || RAY_IS_ERR(fn)) return false;
+    if (pmap_is_builtin(fn)) return pmap_fnobj_ok(fn);
+    if (fn->type != RAY_LAMBDA) return false;
+    /* trusted (.sys.trust): runs lifted and isolated; made in a query: the
+     * query's text, on the tree walker with the query's rules */
+    if (LAMBDA_TRUSTED(fn) || LAMBDA_CAPQ(fn)) return false;
+    ray_t* params = LAMBDA_PARAMS(fn);
+    ray_t* body = LAMBDA_BODY(fn);
+    if (!body || body->type != RAY_LIST) return false;
+    pmap_scope_t sc = { .n = 0, .closure = LAMBDA_CLOSURE(fn) };
+    if (sc.closure && sc.closure->type != RAY_DICT) return false;
+    int64_t np = params ? params->len : 0;
+    if (np > 0 && params->type != RAY_SYM) return false;
+    for (int64_t i = 0; i < np; i++)
+        if (!pmap_bind(&sc, ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs))) return false;
+    ray_t** es = (ray_t**)ray_data(body);
+    for (int64_t i = 0; i < body->len; i++)
+        if (!pmap_expr_ok(es[i], 0, &sc)) return false;
+    /* compiled: what the bytecode will call */
+    if (LAMBDA_IS_COMPILED(fn) && !pmap_consts_ok(LAMBDA_CONSTS(fn), 0)) return false;
+    return true;
+}
+
 /* Fallback can inline pure expressions even when the DAG cannot lower
  * their types or shapes. Never move effects or opaque user calls. */
 static bool query_inline_pure(ray_t* expr, int depth) {

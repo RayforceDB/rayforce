@@ -34,6 +34,9 @@
 #include "ops/internal.h"   /* col_propagate_str_pool */
 #include "ops/idxop.h"
 #include "ops/ops.h"
+#include "core/runtime.h"   /* __VM: a worker VM for pmap's tasks */
+#include "core/profile.h"   /* ray_profile_now_ns: pmap times its first call */
+#include "lang/callprof.h"  /* ray_callprof_on: pmap runs as map under .sys.profile */
 #include "store/enccol.h"   /* ray_enccol_is_parted: (at tbl 'col) on an encoded slot */
 #include <stdatomic.h>
 #include <math.h>
@@ -1099,6 +1102,31 @@ static ray_t* map_collect(ray_t** pres, ray_t* value, int64_t i, int64_t len,
  * passed whole on every call, whatever it is (so it is the same as map-right).
  * Also supports (map fn vec) for unary mapping.  Any other argument count is
  * an error: the extra arguments would be dropped without a word. */
+/* map's loop over elements [i, end) of `coll`, `len` elements long, into
+ * *pres: NULL when every element was collected, else the error (an
+ * element's, the callback's, or the collector's), *pres then released or
+ * NULL.  val NULL: (map fn x). */
+static ray_t* map_walk(ray_t* fn, ray_t* val, ray_t* coll, int64_t i, int64_t end, int64_t len,
+                       ray_t** pres, ray_dup_copy_t* dup) {
+    for (; i < end; i++) {
+        int owned = 0;
+        ray_t* elem = iter_elem(coll, i, &owned);
+        ray_t* value;
+        if (RAY_IS_ERR(elem))  value = elem;
+        else if (!val)        value = call_fn1(fn, elem);
+        else                  value = call_fn2(fn, val, elem);
+        if (owned) ray_release(elem);
+        /* Force each result before choosing its representation, as the
+         * previous list collector did for lazy callback results. */
+        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
+        if (RAY_IS_ERR(value)) { ray_release(*pres); *pres = NULL; return value; }
+
+        ray_t* bad = map_collect(pres, value, i, len, dup);
+        if (bad) return bad;
+    }
+    return NULL;
+}
+
 ray_t* ray_map_fn(ray_t** args, int64_t n) {
     if (n < 2 || n > 3) return ray_error("domain", "map: requires 2 or 3 args (fn and vec, or fn, val and vec), got %lld", (long long)n);
     for (int64_t i = 0; i < n; i++)
@@ -1127,32 +1155,257 @@ ray_t* ray_map_fn(ray_t** args, int64_t n) {
     ray_t* result = NULL;
     ray_dup_copy_t dup;
     ray_dup_copy_begin(&dup);
-    for (int64_t i = 0; i < len; i++) {
-        int owned = 0;
-        ray_t* elem = iter_elem(coll, i, &owned);
-        ray_t* value;
-        if (RAY_IS_ERR(elem))  value = elem;
-        else if (n == 2)      value = call_fn1(fn, elem);
-        else                  value = call_fn2(fn, val, elem);
-        if (owned) ray_release(elem);
-        /* Force each result before choosing its representation, as the
-         * previous list collector did for lazy callback results. */
-        if (ray_is_lazy(value)) value = ray_lazy_materialize(value);
-        if (RAY_IS_ERR(value)) { ray_dup_copy_end(&dup); ray_release(result); return value; }
-
-        ray_t* bad = map_collect(&result, value, i, len, &dup);
-        if (bad) { ray_dup_copy_end(&dup); return bad; }
-    }
+    ray_t* err = map_walk(fn, n == 3 ? val : NULL, coll, 0, len, len, &result, &dup);
     ray_dup_copy_end(&dup);
-    return result;
+    return err ? err : result;
 }
 
-/* (pmap fn val vec) — sequential alias for map, kept as a distinct builtin so
- * call sites can signal intent.  Evaluation is NOT parallelised: the applied
- * function runs on the calling thread's VM (the VM is thread-local and eval is
- * single-threaded), so results and semantics are identical to map. */
+/* ── pmap (#1248) ─────────────────────────────────────────────────────────
+ *
+ * map's forms and results, the calls made on the pool's workers when the
+ * function is proven pure (ray_pmap_fn_pure): deterministic, no effect, no
+ * input but its arguments, so the order the calls run in cannot be seen.
+ * Anything not proven runs as map.
+ *
+ * Granularity: an input of fewer than PMAP_MIN_LEN elements is map's call
+ * outright, and so is one whose timed calls dispatched to the pool
+ * themselves (their kernels already use the workers).  Otherwise the calls start on the calling thread as map's do, timed
+ * (the clock read after 1, 2, 4, 8, ... calls: see the probe below), for up to PMAP_WARM_NS.  The
+ * rest go to the workers only when a call costs at
+ * least PMAP_MIN_CALL_NS (below that, handing each result back to the
+ * calling thread's heap costs about as much as the call) and the rest
+ * would take at least PMAP_MIN_REST_NS; otherwise they stay here, so a
+ * small or cheap input costs what map costs.  Each worker runs one task
+ * on a VM of its own, taking chunks of elements from a shared cursor,
+ * each about PMAP_CHUNK_NS of calls at the probe's estimate.
+ *
+ * A probe on a prefix is fooled by an input whose later calls are cheaper
+ * (heavy first elements, a cheap tail).  Dispatched cheap calls cost more
+ * than map's (each touches the function's shared objects, whose counts
+ * then move between cores), so the workers time their chunks: once a
+ * worker's last PMAP_WIN_CALLS calls average under an eighth of the
+ * estimate and under PMAP_MIN_CALL_NS, no chunk more is taken and the rest
+ * run on the calling thread as map's do.  A wrong dispatch then costs a
+ * few chunks per worker.
+ *
+ * Errors: an error at element i stops the workers from starting elements
+ * past i; the first element left without a value (an error, a skip, a
+ * cancel) is evaluated again on the calling thread and the walk goes on
+ * there as map's, so the error, its context and an interrupt are map's. */
+#define PMAP_MIN_LEN      16
+#define PMAP_WARM_NS      (100 * 1000)
+#define PMAP_MIN_CALL_NS  (4 * 1000)
+#define PMAP_MIN_REST_NS  (1000 * 1000)
+#define PMAP_CHUNK_NS     (50 * 1000)
+#define PMAP_WIN_CALLS    8
+
+typedef struct {
+    ray_t*   fn;
+    ray_t*   val;              /* (pmap f val x): the left argument, else NULL */
+    ray_t*   coll;
+    ray_t**  out;              /* one value per element, NULL until made */
+    int64_t  len, chunk;
+    bool     restricted;       /* the caller's -U state, given to each worker VM */
+    _Atomic(int64_t) next;     /* the next element no task has taken */
+    _Atomic(int64_t) stop;     /* lowest element that failed: later ones are not started */
+    double   cheap_ns;         /* a call under this, on average, is far cheaper than the probe's */
+    _Atomic(bool)    cheap;    /* the calls proved too cheap: no further chunk is taken */
+} pmap_ctx_t;
+
+static ray_t* pmap_call(ray_t* fn, ray_t* val, ray_t* coll, int64_t i) {
+    int owned = 0;
+    ray_t* elem = iter_elem(coll, i, &owned);
+    ray_t* value;
+    if (RAY_IS_ERR(elem)) value = elem;
+    else if (!val)        value = call_fn1(fn, elem);
+    else                  value = call_fn2(fn, val, elem);
+    if (owned) ray_release(elem);
+    if (value && ray_is_lazy(value)) value = ray_lazy_materialize(value);
+    return value;
+}
+
+static _Atomic(int64_t) g_pmap_par_elems;   /* test hook: elements a pmap dispatch evaluated */
+/* The workers' clock (thread-safe); a test seam replaces it. */
+static int64_t pmap_clock_default(void) { return ray_profile_now_ns(); }
+static int64_t (*g_pmap_task_clock)(void) = pmap_clock_default;
+void ray_pmap_test_task_clock(int64_t (*fn)(void)) { g_pmap_task_clock = fn ? fn : pmap_clock_default; }
+int64_t ray_pmap_test_parallel_elems(void) { return atomic_load(&g_pmap_par_elems); }
+
+static void pmap_task(void* raw, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid; (void)t0; (void)t1;
+    pmap_ctx_t* c = (pmap_ctx_t*)raw;
+    /* a pool worker has no VM: one for this task, as a hook dispatch binds
+     * one (core/ipc.c); the calling thread, worker 0, has its own */
+    ray_vm_t* own = NULL;
+    if (!__VM) {
+        own = (ray_vm_t*)ray_alloc_raw(sizeof(ray_vm_t));
+        if (!own) return;                     /* its elements stay NULL: redone by the caller */
+        ray_vm_init(own, -1);
+        own->restricted = c->restricted;
+        __VM = own;
+    }
+    int64_t done = 0, win_ns = 0, win_calls = 0;
+    for (;;) {
+        if (atomic_load_explicit(&c->cheap, memory_order_relaxed)) break;
+        int64_t ts = g_pmap_task_clock();
+        int64_t lo = atomic_fetch_add_explicit(&c->next, c->chunk, memory_order_relaxed);
+        if (lo >= c->len) break;
+        int64_t hi = lo + c->chunk < c->len ? lo + c->chunk : c->len;
+        bool stop = false;
+        for (int64_t i = lo; i < hi; i++) {
+            if (i > atomic_load_explicit(&c->stop, memory_order_relaxed) || ray_interrupted()) {
+                stop = true;
+                break;
+            }
+            ray_t* v = pmap_call(c->fn, c->val, c->coll, i);
+            if (!v || RAY_IS_ERR(v)) {
+                if (v) ray_error_free(v);         /* the caller makes it again, with its context */
+                int64_t cur = atomic_load_explicit(&c->stop, memory_order_relaxed);
+                while (i < cur && !atomic_compare_exchange_weak_explicit(
+                           &c->stop, &cur, i, memory_order_relaxed, memory_order_relaxed)) {}
+                stop = true;
+                break;
+            }
+            c->out[i] = v;
+            done++;
+        }
+        if (stop) break;
+        /* This worker's last PMAP_WIN_CALLS calls or more, as timed here
+         * (contention for the shared objects included), average far under
+         * the probe's estimate and under PMAP_MIN_CALL_NS: the probe's
+         * calls were not these.  No more chunks are taken; the rest run on
+         * the calling thread, as map's do. */
+        win_ns += g_pmap_task_clock() - ts;
+        win_calls += hi - lo;
+        if (win_calls >= PMAP_WIN_CALLS) {
+            if ((double)win_ns < c->cheap_ns * (double)win_calls)
+                atomic_store_explicit(&c->cheap, true, memory_order_relaxed);
+            win_ns = win_calls = 0;
+        }
+    }
+    atomic_fetch_add_explicit(&g_pmap_par_elems, done, memory_order_relaxed);
+    if (own) {
+        if (own->raise_val) ray_release(own->raise_val);
+        if (own->return_val) ray_release(own->return_val);
+        if (own->trace) ray_release(own->trace);
+        __VM = NULL;
+        ray_free_raw(own);
+    }
+}
+
+static __attribute__((noinline)) ray_t* pmap_run(ray_t** args, int64_t n);
+
+/* The probe's clock; a test seam replaces it with scripted readings. */
+static int64_t (*g_pmap_clock)(void) = pmap_clock_default;
+void ray_pmap_test_clock(int64_t (*fn)(void)) { g_pmap_clock = fn ? fn : pmap_clock_default; }
+
+/* Fewer than PMAP_MIN_LEN elements (any short container; map answers for
+ * whatever it holds): map's call, with nothing set up before it. */
 ray_t* ray_pmap_fn(ray_t** args, int64_t n) {
-    return ray_map_fn(args, n);
+    if (n < 2 || n > 3) return ray_map_fn(args, n);
+    ray_t* c = args[n - 1];
+    if ((uintptr_t)c > 31 && c->type >= 0 && c->len < PMAP_MIN_LEN) return ray_map_fn(args, n);
+    return pmap_run(args, n);
+}
+
+static __attribute__((noinline)) ray_t* pmap_run(ray_t** args, int64_t n) {
+    for (int64_t i = 0; i < n; i++)
+        if (ray_is_lazy(args[i])) args[i] = ray_lazy_materialize(args[i]);
+    ray_t* fn = args[0];
+    ray_t* val = n == 3 ? args[1] : NULL;
+    ray_t* coll = args[n - 1];
+    if (RAY_IS_ERR(coll) || !is_collection(coll)) return ray_map_fn(args, n);
+    int64_t len = ray_len(coll);
+    ray_pool_t* pool = ray_pool_get();
+    /* Parallel only where it can be sound: a pool with workers and no
+     * dispatch in flight (pmap inside another's call runs as map), no
+     * query on this thread (a body sees the query's columns there, a
+     * worker does not) and no call profile being taken.  The function is
+     * proven pure only when the calls turn out to be worth a dispatch. */
+    if (len < 2 || !ray_pool_par_dispatch_ok(pool, len, 2) || ray_pool_on_worker() ||
+        ray_active_query_table() || ray_callprof_on() || g_ray_profile.active)
+        return ray_map_fn(args, n);
+
+    /* map's walk, timed while it goes: once the calls made so far took
+     * PMAP_WARM_NS the rest either go to the workers or run on here in
+     * map's loop.  The workers' values are taken from `out` in order; the
+     * first one missing there (an error, a skip, a cancel) and every one
+     * after it are made here again. */
+    ray_t* result = NULL;
+    ray_t* ret = NULL;
+    ray_t** out = NULL;
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    int64_t i = 0;
+    /* The probe.  The clock is read after 1, 2, 4, 8, ... calls; the first
+     * call is left out of the estimate (it pays the cold caches and page
+     * faults of the input), and each later reading closes a window of
+     * calls.  A call's cost is the lower of the last two windows' per-call
+     * times, so one window a stall or a clock jump stretched does not make
+     * cheap calls look heavy; a clock that does not move forwards ends the
+     * probe on map's path.  The decision is taken once the windows cover
+     * PMAP_WARM_NS.  Whether the calls woke the pool themselves is counted
+     * only while the probe runs (ray_pool_windows_arm). */
+    ray_pool_windows_arm(true);
+    uint64_t w0 = ray_pool_windows();
+    int64_t t1 = 0, t_prev = 0, c_prev = 0;
+    double per_prev = -1;
+    for (int64_t k = 1; !ret && i < len; k *= 2) {
+        int64_t to = k < len ? k : len;
+        ret = map_walk(fn, val, coll, i, to, len, &result, &dup);
+        i = to;
+        if (ret || i >= len) break;
+        int64_t now = g_pmap_clock();
+        if (i == 1) { t1 = t_prev = now; c_prev = 1; continue; }
+        if (now <= t_prev) break;                       /* the clock did not move on */
+        double per = (double)(now - t_prev) / (double)(i - c_prev);
+        double low = per_prev < 0 ? -1 : (per < per_prev ? per : per_prev);
+        per_prev = per; t_prev = now; c_prev = i;
+        if (low < 0 || now - t1 < PMAP_WARM_NS) continue;
+        if (low < PMAP_MIN_CALL_NS || low * (double)(len - i) < PMAP_MIN_REST_NS) break;
+        /* A body that dispatches to the pool itself already has the
+         * workers: on a worker its kernels run inline, so the dispatch
+         * would trade that parallelism for running several calls at once,
+         * each with its whole working set (several large vectors instead
+         * of one the caches hold).  It stays here, as map's calls. */
+        if (ray_pool_windows() != w0) break;
+        ray_lambda_ready(fn);   /* compiled here, before any worker calls it */
+        if (!ray_pmap_fn_pure(fn)) break;   /* judged as compiled */
+        out = (ray_t**)ray_alloc_raw((size_t)len * sizeof(ray_t*));
+        if (!out) break;
+        memset(out, 0, (size_t)len * sizeof(ray_t*));
+        ray_pool_windows_arm(false);
+        uint32_t workers = ray_pool_total_workers(pool);
+        /* A chunk is about PMAP_CHUNK_NS of calls at the probe's cost, so
+         * taking one (a cursor bump, two clock reads) is a small share of
+         * it, and calls far cheaper than the probe saw are found after a
+         * few of them; no more than 1/16 of a worker's share either. */
+        int64_t chunk = (int64_t)(PMAP_CHUNK_NS / low);
+        int64_t share = (len - i) / ((int64_t)workers * 16);
+        if (chunk > share) chunk = share;
+        if (chunk < 1) chunk = 1;
+        pmap_ctx_t ctx = { .fn = fn, .val = val, .coll = coll, .out = out, .len = len,
+                           .chunk = chunk, .restricted = __VM->restricted,
+                           .cheap_ns = low / 8 < PMAP_MIN_CALL_NS ? low / 8 : PMAP_MIN_CALL_NS,
+                           .next = i, .stop = INT64_MAX };
+        ray_pool_dispatch_n(pool, pmap_task, &ctx, workers);
+        ray_pool_windows_arm(true);   /* balanced by the disarm below */
+        break;
+    }
+    ray_pool_windows_arm(false);
+    for (; !ret && out && i < len && out[i]; i++) {    /* the workers' values */
+        ray_t* value = out[i];
+        out[i] = NULL;
+        ret = map_collect(&result, value, i, len, &dup);
+    }
+    if (!ret && i < len) ret = map_walk(fn, val, coll, i, len, len, &result, &dup);   /* the rest */
+    ray_dup_copy_end(&dup);
+    if (out) {
+        for (int64_t j = 0; j < len; j++) if (out[j]) ray_release(out[j]);
+        ray_free_raw(out);
+    }
+    if (ret) { if (result) ray_release(result); return ret; }
+    return result;
 }
 
 /* (fold fn vec) or (fold fn init vec) — reduce with binary fn */

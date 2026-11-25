@@ -108,6 +108,10 @@ void     ray_cancel_dispatch(bool open);      /* the calling thread's pool dispa
 void     ray_cancel_state_reset_for_test(void);
 /* The calling thread is one of the pool's workers (src/core/pool.c). */
 bool     ray_pool_on_worker(void);
+/* Pool windows that woke a worker while counting was armed (a counter),
+ * and arming it: a pmap probe arms it around its timed calls. */
+uint64_t ray_pool_windows(void);
+void     ray_pool_windows_arm(bool on);
 
 /* ===== Parted Types ===== */
 
@@ -1153,6 +1157,17 @@ void ray_query_resume(const ray_query_state_t* saved);
 /* A builtin the planner lowers row by row: its result over a column-derived
  * operand is itself column-derived. */
 bool ray_query_rowwise_builtin(int64_t sym_id);
+/* pmap (#1248): can `fn` be called on pool workers?  A builtin that is
+ * deterministic, has no effect and never calls back into user code, or a
+ * lambda built only from such calls, its locals and data (see query.c). */
+bool ray_pmap_fn_pure(ray_t* fn);
+/* Test hook: elements pmap's dispatches evaluated, over every call. */
+int64_t ray_pmap_test_parallel_elems(void);
+/* Test seam: the clock pmap's probe reads (NULL: the real one). */
+void    ray_pmap_test_clock(int64_t (*fn)(void));
+/* Test seam: the clock pmap's workers time their chunks by (thread-safe;
+ * NULL: the real one). */
+void    ray_pmap_test_task_clock(int64_t (*fn)(void));
 ray_t* ray_active_query_literal(int64_t sym);
 bool ray_query_expr_reads_rows(ray_t* expr);
 

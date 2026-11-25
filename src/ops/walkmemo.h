@@ -49,6 +49,13 @@
 
 #include <rayforce.h>
 #include "core/platform.h"   /* RAY_LIKELY */
+#include "mem/cow.h"         /* ray_rc_sync: a count other threads may change */
+
+/* x's reference count, read atomically while other threads may change it
+ * (a pool dispatch: pmap runs user code there, #1248). */
+static inline uint32_t ray_wm_rc(const ray_t* x) {
+    return RAY_LIKELY(!ray_rc_sync) ? x->rc : ray_atomic_load(&((ray_t*)x)->rc);
+}
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -71,7 +78,7 @@ typedef struct {
 /* May x be reached more than once in a walk: a container whose reference
  * count is not exactly one. */
 static inline bool ray_wm_shared(const ray_t* x) {
-    return x->rc != 1;
+    return ray_wm_rc(x) != 1;
 }
 
 /* Does the list, dict or table x hold a list, dict or table: only such a
@@ -96,7 +103,7 @@ static inline bool ray_wm_list_nested(const ray_t* l) {
     return false;
 }
 static inline bool ray_wm_reused(const ray_t* x) {
-    if (x->type < 0 || RAY_LIKELY(x->rc == 1)) return false;   /* an atom, or held once */
+    if (x->type < 0 || RAY_LIKELY(ray_wm_rc(x) == 1)) return false;   /* an atom, or held once */
     if (x->type == RAY_LIST) return ray_wm_list_nested(x);
     if (x->type == RAY_DICT) {   /* its keys and values: slots 0 and 1 */
         ray_t* const* kv = (ray_t* const*)ray_data((ray_t*)x);
@@ -265,7 +272,7 @@ bool ray_dup_enter_slow(ray_dup_t* t, const ray_t* x, uint64_t out);
 
 /* Before writing x: true when x opens a repeat (pass it to ray_dup_leave). */
 static inline bool ray_dup_enter(ray_dup_t* t, const ray_t* x, uint64_t out) {
-    if (t->in || !x || x->rc == 1) return false;
+    if (t->in || !x || ray_wm_rc(x) == 1) return false;
     if (x->type >= 0 ? x->type >= RAY_LAMBDA : x->type != -RAY_STR) return false;
     return ray_dup_enter_slow(t, x, out);
 }
@@ -273,7 +280,7 @@ static inline bool ray_dup_enter(ray_dup_t* t, const ray_t* x, uint64_t out) {
  * budget checked), or x is a part that may be met again.  When false the
  * writer writes x with no bookkeeping. */
 static inline bool ray_dup_watch(const ray_dup_t* t, const ray_t* x) {
-    return t->in || (x && x->rc != 1 &&
+    return t->in || (x && ray_wm_rc(x) != 1 &&
                      (x->type >= 0 ? x->type < RAY_LAMBDA : x->type == -RAY_STR));
 }
 static inline void ray_dup_leave(ray_dup_t* t, bool opened, uint64_t out) {

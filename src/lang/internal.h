@@ -435,6 +435,7 @@ ray_t* to_boxed_list(ray_t* x);
 ray_t* unbox_vec_arg(ray_t* x, ray_t** _bx);
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc);
 ray_t* call_fn1(ray_t* fn, ray_t* arg);
+void   ray_lambda_ready(ray_t* lambda);
 ray_t* ray_try_handle(ray_t* handler, ray_t* err_val);
 ray_t* call_fn2(ray_t* fn, ray_t* a, ray_t* b);
 ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n);
