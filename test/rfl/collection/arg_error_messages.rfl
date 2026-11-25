@@ -139,8 +139,8 @@
 ;; message, each of which begins with its own name
 (at (try (.sys.querylog.enable 1 2) (fn [e] e)) 'msg) -- ".sys.querylog.enable takes 0 or 1 arguments"
 (at (try (.sys.querylog.enable 1 2) (fn [e] e)) 'usage) -- "(.sys.querylog.enable [<on: i64, 0 or 1>])"
-(at (try (.sys.querylog 1) (fn [e] e)) 'msg) -- ".sys.querylog takes no arguments"
-(at (try (.sys.querylog 1) (fn [e] e)) 'usage) -- "(.sys.querylog)"
+(at (try (.sys.querylog 1 2) (fn [e] e)) 'msg) -- ".sys.querylog takes 0 or 1 arguments"
+(at (try (.sys.querylog 1 2) (fn [e] e)) 'usage) -- "(.sys.querylog [<from: i64, a seq>])"
 (at (try (.sys.profile.enable 'a) (fn [e] e)) 'msg) -- ".sys.profile.enable: flag must be i64, got sym"
 (at (try (.sys.profile.enable 'a) (fn [e] e)) 'usage) -- "(.sys.profile.enable [<on: i64, 0 or 1>])"
 (at (try (.sys.profile.reset 1) (fn [e] e)) 'msg) -- ".sys.profile.reset takes no arguments"

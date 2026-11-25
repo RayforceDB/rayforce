@@ -685,6 +685,7 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n);
 ray_t* ray_memstat_fn(ray_t** args, int64_t n);
 ray_t* ray_prof_fn(ray_t** args, int64_t n);
 ray_t* ray_qlog_fn(ray_t** args, int64_t n);
+ray_t* ray_qlog_stats_fn(ray_t** args, int64_t n);
 ray_t* ray_qlog_enable_fn(ray_t** args, int64_t n);
 ray_t* ray_join_par_min_fn(ray_t** args, int64_t n);
 ray_t* ray_callprof_fn(ray_t** args, int64_t n);

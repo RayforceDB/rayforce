@@ -1699,8 +1699,11 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
  * back with ordinary queries, no extra protocol.  Each call materializes a
  * fresh snapshot, so anything a caller does to the returned table (upsert,
  * delete) touches the copy, never the ring.  Empty until logging is enabled
- * (`-Q` flag or `(.sys.querylog.enable 1)`).  Columns:
+ * (`-Q` flag or `(.sys.querylog.enable 1)`).  `(.sys.querylog n)` answers
+ * only the kept rows with seq >= n (#1159): an empty table past the next
+ * seq, every kept row below the oldest.  Columns:
  *
+ *   seq          the row's number among all rows logged since start
  *   time         wall-clock time the query finished (timestamp)
  *   duration-ms  total wall time
  *   result-rows  rows in the result (scalar => 1)
@@ -1711,9 +1714,22 @@ ray_t* ray_prof_fn(ray_t** args, int64_t n) {
  *   query        source text (truncated)
  */
 ray_t* ray_qlog_fn(ray_t** args, int64_t n) {
+    if (n == 0) return ray_qlog_table(1);
+    if (n != 1) return ray_error("domain", ".sys.querylog takes 0 or 1 arguments");
+    if (args[0]->type != -RAY_I64)
+        return ray_error("type", ".sys.querylog: from must be i64, got %s", ray_type_name(args[0]->type));
+    if (args[0]->i64 < 0)
+        return ray_error("domain", ".sys.querylog: from must be >= 0, got %lld", (long long)args[0]->i64);
+    return ray_qlog_table(args[0]->i64);
+}
+
+/* (.sys.querylog.stats) — {next dropped capacity}: the seq the next logged
+ * query gets, the rows overwritten since start, the ring's capacity.  A
+ * reader that asked from n and got a first seq above n lost the difference. */
+ray_t* ray_qlog_stats_fn(ray_t** args, int64_t n) {
     (void)args;
-    if (n != 0) return ray_error("domain", ".sys.querylog takes no arguments");
-    return ray_qlog_table();
+    if (n != 0) return ray_error("domain", ".sys.querylog.stats takes no arguments");
+    return ray_qlog_stats();
 }
 
 /* (.sys.querylog.enable [flag]) — toggle query-statistics logging.  No arg

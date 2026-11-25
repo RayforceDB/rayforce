@@ -9,12 +9,26 @@
 ;; It is a table.
 (type (.sys.querylog)) -- 'TABLE
 
-;; Eight fixed columns, in order.
-(count (key (.sys.querylog))) -- 8
-(key (.sys.querylog)) -- [time duration-ms result-rows memory-kib workers parallelism status query]
+;; Nine fixed columns, in order: seq first (#1159).
+(count (key (.sys.querylog))) -- 9
+(key (.sys.querylog)) -- [seq time duration-ms result-rows memory-kib workers parallelism status query]
+(type (at (.sys.querylog) 'seq)) -- 'I64
 
 ;; Empty in the harness (logging capture never fires here).
 (count (.sys.querylog)) -- 0
+
+;; The read-from form: the rows with seq >= n, the same columns.
+(key (.sys.querylog 0)) -- (key (.sys.querylog))
+(count (.sys.querylog 5)) -- 0
+(.sys.querylog -1) !- domain
+(.sys.querylog 0Nl) !- domain
+(.sys.querylog 1.0) !- type
+(.sys.querylog 'a) !- type
+(.sys.querylog 1 2) !- domain
+
+;; Nothing logged: the next row is 1, none dropped.
+(.sys.querylog.stats) -- {next:1 dropped:0 capacity:4096}
+(.sys.querylog.stats 1) !- domain
 
 ;; The enable toggle returns the new state as i64; explicit 0/1 set it,
 ;; no argument flips it.

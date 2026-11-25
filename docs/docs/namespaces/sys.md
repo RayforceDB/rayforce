@@ -3,7 +3,7 @@
 Process-level introspection (build, memory, host info) and command-style operations (shell-out, profiler toggle, IPC listener bind, env dump, GC trigger). The dotted `.sys.<name>` builtins are the typed entry points; `.sys.cmd` parses a colon-style command string and dispatches to the same handlers — used by the REPL's `:listen 5000` style commands.
 
 !!! note "Restricted under `-U`"
-    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging, profiling or execution behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.profile`, `.sys.querylog`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
+    `.sys.exec`, `.sys.cmd`, `.sys.listen`, `.sys.querylog.enable`, `.sys.join.par.min`, `.sys.profile.enable`, `.sys.profile.reset` and `.sys.trust` are `RAY_FN_RESTRICTED` — they can run arbitrary shell commands, change the process's network surface, change server-wide logging, profiling or execution behaviour, or hand restricted callers more rights. The introspection entries (`.sys.args`, `.sys.build`, `.sys.info`, `.sys.mem`, `.sys.prof`, `.sys.profile`, `.sys.querylog`, `.sys.querylog.stats`, `.sys.gc`, `.sys.env`, `.sys.timeit`) are unrestricted.
 
 ## Reference
 
@@ -17,7 +17,8 @@ Process-level introspection (build, memory, host info) and command-style operati
 | [`.sys.profile`](#sys-profile) | nullary | — | Per-call-site profile of Rayfall code (file, line, function) as a table. |
 | [`.sys.profile.enable`](#sys-profile-enable) | variadic | restricted | Toggle the call profiler. |
 | [`.sys.profile.reset`](#sys-profile-reset) | nullary | restricted | Drop the call profiler's rows. |
-| [`.sys.querylog`](#sys-querylog) | variadic | — | Ambient per-query statistics ring as a table. |
+| [`.sys.querylog`](#sys-querylog) | variadic (0–1) | — | Ambient per-query statistics ring as a table; `(.sys.querylog n)` only the rows from `seq` `n` on. |
+| [`.sys.querylog.stats`](#sys-querylog-stats) | nullary | — | The ring's counters: the next `seq`, the rows overwritten, the capacity. |
 | [`.sys.querylog.enable`](#sys-querylog-enable) | variadic | restricted | Toggle query-statistics logging. |
 | [`.sys.join.par.min`](#sys-join-par-min) | variadic (0–1) | restricted | Read or set the probe-side row count from which a hash join's probe is split across the pool. |
 | [`.sys.gc`](#sys-gc) | variadic (0–1) | — | Run allocator maintenance and return `0`; `(.sys.gc 1)` also releases free pages now, best effort. |
@@ -312,8 +313,10 @@ whether profiling is on does not change. Returns null. Restricted under `-U`.
 
 ## `.sys.querylog` { #sys-querylog }
 
-Signature: `(.sys.querylog)`. Returns the **query-statistics ring** as a table —
-one row per completed query, oldest first, capped at the ring capacity (4096).
+Signature: `(.sys.querylog)` or `(.sys.querylog n)`. Returns the
+**query-statistics ring** as a table — one row per completed query, oldest
+first, capped at the ring capacity (4096). With `n`, only the kept rows whose
+`seq` is `n` or more.
 This is the ambient, server-side statistics feed: when logging is enabled the
 server records a summary of every query it handles, and you read it back with an
 ordinary query (an IPC client needs no extra protocol). The model mirrors a
@@ -326,10 +329,10 @@ logging is enabled with the `-Q` startup flag or `(.sys.querylog.enable 1)`.
 
 | Column | Meaning |
 |---|---|
-| `time` | Wall-clock time the query finished (timestamp). |
+| `seq` | The row's number among all queries logged since the process started: 1, 2, 3, … with no gap and no repeat, whichever connection a query came from. |
+| `time` | Wall-clock time the query finished (timestamp, nanosecond resolution). |
 | `duration-ms` | Total wall time to answer the query. |
 | `result-rows` | Rows in the result (a scalar counts as 1). |
-| `output-kib` | Serialized result footprint, KiB. |
 | `memory-kib` | Net process allocation across the query, KiB. |
 | `workers` | Worker threads that ran a task. |
 | `parallelism` | Effective parallelism = worker busy time ÷ wall time. |
@@ -339,7 +342,7 @@ logging is enabled with the `-Q` startup flag or `(.sys.querylog.enable 1)`.
 ```lisp
 ;; start the server with -Q 1 (or toggle at runtime), then:
 (.sys.querylog)
-;; a table: time | duration-ms | result-rows | output-kib | memory-kib |
+;; a table: seq | time | duration-ms | result-rows | memory-kib |
 ;;          workers | parallelism | status | query
 
 ;; it is a normal table, so query it — slowest queries first:
@@ -351,6 +354,33 @@ logging is enabled with the `-Q` startup flag or `(.sys.querylog.enable 1)`.
 
 Capturing a row adds no measurable cost to a query, and logging is off by
 default — the disabled path is a single predicted branch.
+
+**Reading incrementally.** A poller keeps the `seq` it has read up to and asks
+for the rows after it: `(.sys.querylog (+ upto 1))` builds only those rows, so a
+poll costs what is new, not the whole ring, and a `select` of the columns it
+needs leaves the `query` text out. `n` past the next `seq` gives an empty table
+with the same columns; `n` below the oldest kept row gives every kept row. A
+negative `n` is a `domain` error and anything but an `i64` a `type` error. When
+the first row's `seq` is above the `n` asked for, the ring wrapped in between
+and the difference is the number of rows lost.
+
+```lisp
+(set upto 0)
+(set rows (select {seq: seq status: status duration-ms: duration-ms from: (.sys.querylog (+ upto 1))}))
+(set lost (if (> (count rows) 0) (- (first (at rows 'seq)) (+ upto 1)) 0))
+(set upto (if (> (count rows) 0) (last (at rows 'seq)) upto))
+```
+
+## `.sys.querylog.stats` { #sys-querylog-stats }
+
+Signature: `(.sys.querylog.stats)`. Returns the ring's counters as a dict:
+`next`, the `seq` the next logged query will get; `dropped`, the rows
+overwritten since the process started (logged beyond the capacity); and
+`capacity`, 4096. Unrestricted, like `.sys.querylog`.
+
+```lisp
+(.sys.querylog.stats)   ;; => {next:4201 dropped:104 capacity:4096}
+```
 
 ## `.sys.querylog.enable` { #sys-querylog-enable }
 

@@ -44,6 +44,46 @@
 ;; Rows carry a non-negative duration (the timing column is populated).
 (.ipc.send h "(> (count (select {from: (.sys.querylog) where: (>= duration-ms 0.0)})) 0)") -- true
 
+;; ── seq and the read-from form (#1159) ─────────────────────────────
+;; seq numbers every logged row from 1, one apart; the kept rows from n on
+;; are the tail of the same table
+(set Q (.ipc.send h "(.sys.querylog)"))
+(first (key Q)) -- 'seq
+(first (at Q 'seq)) -- 1
+(at Q 'seq) -- (+ 1 (til (count Q)))
+(set n (last (at Q 'seq)))
+(set R (at (.ipc.send h (format "(.sys.querylog %)" n)) 'seq))
+(first R) -- n
+R -- (+ n (til (count R)))
+(count (.ipc.send h "(.sys.querylog 1000000)")) -- 0
+(key (.ipc.send h "(.sys.querylog 1000000)")) -- (key Q)
+(.ipc.send h "(.sys.querylog -1)") !- domain
+(set st (.ipc.send h "(.sys.querylog.stats)"))
+(at st 'dropped) -- 0
+(at st 'capacity) -- 4096
+;; next is the seq the stats query itself was then logged under
+(last (at (.ipc.send h (format "(.sys.querylog %)" n)) 'seq)) -- (at st 'next)
+
+;; ── concurrent connections: four clients at once, no gap, no repeat ──
+(write "/tmp/rfl_qlog_ipc/client.rfl" (format "(set c (.ipc.open \"127.0.0.1:%\"))\n(map (fn [i] (.ipc.send c \"(+ 1 1)\")) (til 600))\n(.ipc.close c)\n(exit 0)\n" (trim (read "/tmp/rfl_qlog_ipc/port"))))
+(set s0 (at (.ipc.send h "(.sys.querylog.stats)") 'next))
+(.sys.exec "for i in 1 2 3 4; do ./rayforce /tmp/rfl_qlog_ipc/client.rfl </dev/null >/dev/null 2>&1 & done; wait") -- 0
+(set C (.ipc.send h (format "(select {seq: seq from: (.sys.querylog %)})" s0)))
+;; the clients' 2400 queries and this connection's read: seq s0, s0+1, ...
+(at C 'seq) -- (+ s0 (til (count C)))
+(>= (count C) 2401) -- true
+
+;; ── the ring wraps: the oldest rows go, seq keeps counting ───────────
+(map (fn [i] (.ipc.send h "(+ 1 1)")) (til 2000))
+(set st (.ipc.send h "(.sys.querylog.stats)"))
+(> (at st 'dropped) 0) -- true
+(set W (.ipc.send h "(select {seq: seq from: (.sys.querylog 1)})"))
+(count W) -- 4096
+;; asked from 1, it starts at the oldest kept row, past every row dropped
+;; when st was taken (the stats query itself was logged after it)
+(> (first (at W 'seq)) (at st 'dropped)) -- true
+(at W 'seq) -- (+ (first (at W 'seq)) (til 4096))
+
 (.ipc.close h)
 
 ;; ── teardown: SIGTERM the server, wait for exit ─────────────────────
