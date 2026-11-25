@@ -27,6 +27,8 @@
 #include "core/pool.h"         /* the parallel selection gather */
 #include "table/domain.h"    /* ray_sym_domain_retain */
 #include "table/sym.h"
+#include "store/enc.h"         /* RAY_ENC_VEC */
+#include "store/enccol.h"      /* ray_enc_cellbuf_t */
 #include "vec/str.h"
 #include "vec/vec.h"           /* ray_str_pool_reserve, ray_raw_is_null */
 #include <assert.h>
@@ -223,6 +225,54 @@ static ray_t* acc_put_list(gather_acc_t* a, const ray_col_range_t* v, int64_t ba
  * materialized source) leaves the vector to the cursor, which decodes it. */
 #define GATHER_POINT_ROWS RAY_COL_POINT_ROWS
 
+/* A vector of an encoded STR column holding at most this many of the rows
+ * asked for is not decoded: each of those cells is read where the file has
+ * it (ray_enccol_str_cell).  A decode of the vector expands every one of
+ * its RAY_ENC_VEC strings to reach them. */
+#define GATHER_STR_POINT_ROWS (RAY_ENC_VEC / 32)
+
+/* One string into output position pos, as acc_put leaves a cell: inline,
+ * or in the result's pool with its prefix and hash. */
+static ray_t* acc_str(gather_acc_t* a, int64_t pos, const char* p, uint32_t len) {
+    ray_str_t e;
+    memset(&e, 0, sizeof e);
+    e.len = len;
+    if (len == 0) {
+        a->nulls = true;
+    } else if (len <= RAY_STR_INLINE_MAX) {
+        memcpy(e.data, p, len);
+    } else {
+        uint32_t off = 0;
+        ray_t* err = acc_pool_put(a, p, len, &off);
+        if (err) return err;
+        memcpy(e.prefix, p, 4);
+        e.pool_off = off;
+        e.hash32 = ray_str_t_hash32(&e, (const char*)ray_data(a->pool));
+    }
+    ((ray_str_t*)ray_data(a->out))[pos] = e;
+    return NULL;
+}
+
+/* rows[0, n), all in one vector of an encoded STR source, read cell by cell
+ * into the output positions at[0, n) (or base, base + 1, ... when at is
+ * NULL).  *served false when the source declines (a plain or materialized
+ * segment): nothing the caller cannot write again was written. */
+static ray_t* gather_str_points(ray_col_src_t* src, const int64_t* rows, int64_t n, gather_acc_t* a,
+                                const int64_t* at, int64_t base, bool* served) {
+    uint8_t stack[512];
+    ray_enc_cellbuf_t b = { .p = stack, .cap = sizeof stack, .heap = false };
+    ray_t* err = NULL;
+    *served = true;
+    for (int64_t q = 0; q < n && !err && *served; q++) {
+        const char* p; uint32_t len;
+        int pr = ray_col_src_str_point(src, rows[q], &b, &p, &len, &err);
+        if (pr == 0) *served = false;
+        else if (pr > 0) err = acc_str(a, at ? at[q] : base + q, p, len);
+    }
+    if (b.heap) ray_free_raw(b.p);
+    return err;
+}
+
 /* The source's values can be point-read: an encoded integer, temporal or
  * SYM column. */
 static bool gather_point_src(const ray_col_src_t* src) {
@@ -306,6 +356,19 @@ static ray_t* grows_range(ray_col_src_t* src, const int64_t* ids, const int64_t*
     for (int64_t k = k0; k < n && !err; ) {
         int64_t pos = ord ? ord[k] : k, r = ids[pos];
         int64_t vlo, vhi;
+        if (src->type == RAY_STR && ray_col_src_vec_span(src, r, &vlo, &vhi)) {
+            /* the ids inside r's vector: few are read cell by cell */
+            int64_t j = k + 1;
+            while (j < n && j - k <= GATHER_STR_POINT_ROWS && ids[ord ? ord[j] : j] < vhi &&
+                   ids[ord ? ord[j] : j] >= vlo) j++;
+            if (j - k <= GATHER_STR_POINT_ROWS) {
+                int64_t rows[GATHER_STR_POINT_ROWS], at[GATHER_STR_POINT_ROWS];
+                for (int64_t q = k; q < j; q++) { at[q - k] = ord ? ord[q] : q; rows[q - k] = ids[at[q - k]]; }
+                bool served;
+                if ((err = gather_str_points(src, rows, j - k, a, at, 0, &served)) != NULL) break;
+                if (served) { k = j; continue; }       /* declined: the cursor reads the vector */
+            }
+        }
         if (point && ray_col_src_vec_span(src, r, &vlo, &vhi)) {
             /* the ids inside r's vector, in decode order: few are point-read */
             int64_t j = k + 1;
@@ -458,6 +521,19 @@ static ray_t* gsel_range(const gsel_in_t* in, gather_acc_t* a, ray_col_cursor_t*
             if (err) break;
         }
         while (k < k1 && !err) {
+            int64_t vlo, vhi;
+            if (src->type == RAY_STR && ray_col_src_vec_span(src, lo + in->idx[k], &vlo, &vhi)) {
+                /* few rows of this vector: each cell read where it lies */
+                uint32_t j = k + 1;
+                while (j < k1 && j - k <= GATHER_STR_POINT_ROWS && lo + in->idx[j] < vhi) j++;
+                if (j - k <= GATHER_STR_POINT_ROWS) {
+                    int64_t rows[GATHER_STR_POINT_ROWS];
+                    for (uint32_t q = k; q < j; q++) rows[q - k] = lo + in->idx[q];
+                    bool served;
+                    if ((err = gather_str_points(src, rows, j - k, a, NULL, pos, &served)) != NULL) break;
+                    if (served) { pos += j - k; k = j; continue; }   /* declined: the cursor reads the vector */
+                }
+            }
             const ray_col_range_t* v;
             if ((err = ray_col_cursor_at(cur, lo + in->idx[k], &v)) != NULL) break;
             int64_t end = v->start + v->n;

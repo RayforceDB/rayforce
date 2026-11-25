@@ -32,6 +32,7 @@
 struct ray_sym_domain_s;
 struct ray_enc_chunk_stat_s;   /* store/enccol.h */
 struct ray_enc_vview_s;        /* store/enccol.h */
+struct ray_enc_cellbuf_s;      /* store/enccol.h */
 
 /* A bound column source: the object a scan reads ranges of.  Binding
  * retains the object (and a non-runtime SYM domain) and never decodes.
@@ -240,6 +241,12 @@ void ray_col_src_want_points(ray_col_src_t* s, const int64_t* rows, int64_t n);
  * and vectors with a null bitmap served too, nul[q] 1 for a bitmap null. */
 int  ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, int64_t* out, uint8_t* nul,
                                ray_t** err);
+/* One STR cell for a gather (ray_enccol_str_cell): 1 served, *p and *len
+ * holding until b is next used; 0 declined (a source that is not an
+ * encoded STR one, or a plain or materialized source or segment: a cursor
+ * reads it); -1 an owned *err. */
+int  ray_col_src_str_point(ray_col_src_t* s, int64_t row, struct ray_enc_cellbuf_s* b, const char** p, uint32_t* len,
+                           ray_t** err);
 /* The rows [*lo, *hi) of the vector holding row `row` (segment-local
  * vectors for a parted source) when ray_col_src_point_i64 may serve it (a
  * single-file encoded column or segment, not materialized): true.  False

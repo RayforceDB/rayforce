@@ -268,7 +268,15 @@ static ray_t* range_obj(ray_t* obj, int64_t start, int64_t n, const int64_t* off
                         ray_col_scratch_t* sc, ray_col_range_t* out) {
     if (obj->type == RAY_ENCCOL) {
         ray_enccol_t* e = ray_enccol_of(obj);
-        if (e->kind == RAY_ENCCOL_SINGLE) return range_enc(e, start, n, sc, out);
+        if (e->kind == RAY_ENCCOL_SINGLE) {
+            /* A segment's published decode is read in place, as the whole
+             * column's is (ray_col_cursor_at): a parted column made over
+             * decoded segments, as a pruned source is, has no decode of its
+             * own, and would otherwise decode a vector the segment holds. */
+            ray_t* pk = ray_enccol_decoded_peek(obj);
+            if (pk) { range_plain(pk, start, n, out); return NULL; }
+            return range_enc(e, start, n, sc, out);
+        }
         obj = e->wrapper;
     }
     if (RAY_IS_PARTED(obj->type)) {
@@ -805,6 +813,16 @@ int ray_col_src_gather_points(ray_col_src_t* s, const int64_t* rows, int64_t n, 
     int64_t s0, s1;
     ray_enccol_t* e = n > 0 ? src_point_col(s, rows[0], &s0, &s1) : NULL;
     return e ? ray_enccol_gather_points(e, rows, n, s0, out, nul, err) : 0;
+}
+
+int ray_col_src_str_point(ray_col_src_t* s, int64_t row, struct ray_enc_cellbuf_s* b, const char** p, uint32_t* len,
+                          ray_t** err) {
+    *err = NULL;
+    int64_t s0, s1;
+    ray_enccol_t* e = s->type == RAY_STR ? src_point_col(s, row, &s0, &s1) : NULL;
+    if (!e || row < s0 || row >= s1) return 0;
+    *err = ray_enccol_str_cell(e, row - s0, b, p, len);
+    return *err ? -1 : 1;
 }
 
 bool ray_col_src_vec_span(ray_col_src_t* s, int64_t row, int64_t* lo, int64_t* hi) {
