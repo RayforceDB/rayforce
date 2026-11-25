@@ -41,12 +41,43 @@ All commands start with `:` and are handled before expression evaluation.
 | Command | Alias | Description |
 |---|---|---|
 | `:?` | `:help` | Display the command list. |
+| `:h NAME` | `:help NAME` | Show how a builtin or lambda is called (see [below](#help-for-a-name)). |
 | `:t` | `:timeit` | Toggle profiling on/off. |
 | `:env` |  | List all defined variables with their types. |
 | `:clear` |  | Clear the screen. |
 | `:q` | `:quit` | Exit the REPL. |
 
 You can also exit with `\\`, `exit`, or **Ctrl-D** on an empty line.
+
+## Help for a name { #help-for-a-name }
+
+`:h NAME` (or `:help NAME`) prints what [`.repl.signature`](../namespaces/repl.md#repl-signature) reports for `NAME`, formatted for reading. It resolves the name by the same rules: a global, or a dotted path through dictionary members. Nothing is evaluated or called.
+
+- **A builtin:** its documented call forms, one per line, from the engine's usage table (the text its errors cite). Through an alias, the header names the builtin the alias holds.
+- **A lambda:** its call shape from its parameter names.
+- **Flags:** `special form` and `restricted under -U` are added where they apply.
+- **Anything else:** a value, a missing name, or a builtin with no usage entry gets one line saying so.
+
+```
+‣ :h min
+min: builtin (unary)
+  (min <x: vector, atom or list>)
+  (min <a: num> <b: num>)
+‣ (set add (fn [a b] (+ a b)))
+‣ :h add
+add: lambda
+  (add a b)
+‣ :h if
+if: builtin (vary), special form
+  (if <cond: bool or bool vector> <then> [<cond> <then> ...] [<else>])
+‣ :h .ipc.open
+.ipc.open: builtin (vary), restricted under -U
+  no usage entry
+‣ :h nosuch
+nosuch: not defined
+```
+
+Bare `:?`, `:help` and `:h` list the commands. Scripts and editors ask `.repl.signature` itself, which returns the same facts as a dict.
 
 ## Profiling with :t
 

@@ -53,6 +53,7 @@
 #include "lang/eval.h"     /* ray_get_error_trace: the parse error frame */
 #include "lang/nfo.h"      /* ray_span_t */
 #include "lang/parse.h"    /* ray_parse: the parse error frame out of memory */
+#include "lang/syscmd.h"   /* ray_syscmd_dispatch: :h NAME */
 #include "mem/heap.h"       /* ray_alloc_fail_set_for_test: frame building out of memory */
 #include "store/serde.h"   /* RAY_SERDE_WIRE_VERSION: the listen probe */
 #include "mem/sys.h"
@@ -1595,6 +1596,60 @@ static test_result_t test_repl_run_piped_help(void) {
 static test_result_t test_repl_run_piped_help_full(void) {
     int rc = run_piped_with_input(":help\n");
     TEST_ASSERT_EQ_I(rc, 0);
+    PASS();
+}
+
+/* `:h NAME` / `:help NAME` (#1726): what .repl.signature reports, for a
+ * person.  A builtin's documented forms one per line, a lambda's call shape
+ * from its parameters, special form / restricted where they apply, and one
+ * line for a value, a missing name or a builtin without a usage entry.
+ * Bare `:h` and `:help` still list the commands, `:h` among them. */
+static test_result_t test_repl_help_name(void) {
+    const char* defs[] = { "(set zhn_add (fn [a b] (+ a b)))", "(set zhn_m min)",
+                           "(set zhn_x 5)", "(set zhn_none0 (fn [] 1))" };
+    for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
+        ray_t* r = ray_eval_str(defs[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s failed", defs[i]);
+        ray_release(r);
+    }
+    ray_repl_t* repl = ray_repl_create(NULL);
+    TEST_ASSERT_NOT_NULL(repl);
+    ray_syscmd_ctx_t ctx = { repl, false };
+    const char* cmds[] = { "h min", "help zhn_add", "h 'zhn_m", "h if", "h .sys.exec",
+                           "h .ipc.open", "h zhn_x", "h zhn_nosuch", "h zhn_none0",
+                           "h a b", "h", "help", "h .sys.querylog.enable", "h .sys.profile.reset" };
+    char path[256];
+    char buf[8192];
+    int saved = cap_begin(path, sizeof path);
+    bool all_null = true;
+    for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) {
+        ray_t* r = ray_syscmd_dispatch(cmds[i], strlen(cmds[i]), &ctx, false);
+        if (r != RAY_NULL_OBJ) all_null = false;
+        if (r && r != RAY_NULL_OBJ) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    }
+    cap_end(saved, path, buf, sizeof buf);
+    ray_repl_destroy(repl);
+    TEST_ASSERT_TRUE(all_null);
+    const char* want[] = {
+        "min: builtin (unary)\n  (min <x: vector, atom or list>)\n  (min <a: num> <b: num>)\n",
+        "zhn_add: lambda\n  (zhn_add a b)\n",
+        "zhn_m: builtin min (unary)\n  (min <x: vector, atom or list>)\n",
+        "if: builtin (vary), special form\n  (if <cond: bool or bool vector>",
+        ".sys.exec: builtin (vary), restricted under -U\n  no usage entry\n",
+        ".ipc.open: builtin (vary), restricted under -U\n  no usage entry\n",
+        "zhn_x: a value, not a function\n",
+        "zhn_nosuch: not defined\n",
+        "zhn_none0: lambda\n  (zhn_none0)\n",
+        ". :h takes one name, e.g. :h min\n",
+        "  :h             - How NAME is called: :h NAME (or :help NAME).\n",
+        ".sys.querylog.enable: builtin (vary), restricted under -U\n  (.sys.querylog.enable [<on: i64, 0 or 1>])\n",
+        ".sys.profile.reset: builtin (vary), restricted under -U\n  (.sys.profile.reset)\n",
+    };
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
+        TEST_ASSERT_FMT(strstr(buf, want[i]) != NULL, "no \"%s\" in:\n%.1500s", want[i], buf);
+    /* both bare forms list the commands */
+    const char* first = strstr(buf, ". Commands list:");
+    TEST_ASSERT_FMT(first && strstr(first + 1, ". Commands list:"), "two command lists in:\n%.1500s", buf);
     PASS();
 }
 
@@ -3471,6 +3526,7 @@ const test_entry_t repl_entries[] = {
     { "repl/run/piped/timeit_bad_arg",  test_repl_run_piped_timeit_bad_arg,      repl_setup, repl_teardown },
     { "repl/run/piped/help",            test_repl_run_piped_help,                repl_setup, repl_teardown },
     { "repl/run/piped/help_full",       test_repl_run_piped_help_full,           repl_setup, repl_teardown },
+    { "repl/help/name",                 test_repl_help_name,                     repl_setup, repl_teardown },
     { "repl/run/piped/clear",           test_repl_run_piped_clear,               repl_setup, repl_teardown },
     { "repl/run/piped/listen_no_arg",   test_repl_run_piped_listen_no_arg,       repl_setup, repl_teardown },
     { "repl/run/piped/listen_bad_port", test_repl_run_piped_listen_bad_port,     repl_setup, repl_teardown },

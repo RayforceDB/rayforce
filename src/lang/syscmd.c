@@ -31,6 +31,7 @@
 #include "core/ipc.h"
 #include "core/profile.h"
 #include "lang/env.h"
+#include "lang/inspect.h"
 #include "table/sym.h"
 
 /* Forward decls of the bare runtime accessors — defined in
@@ -243,11 +244,122 @@ static ray_t* h_clear(ray_t* arg, ray_syscmd_ctx_t* ctx) {
     return NULL;
 }
 
-/* help/? — REPL-only.  Walks the table to print every command's
- * one-liner so we never get out of sync with what's registered. */
+/* One field of a .repl.signature dict, owned, or NULL. */
+static ray_t* sig_field(ray_t* d, const char* key) {
+    ray_t* k = ray_sym(ray_sym_intern(key, strlen(key)));
+    if (!k || RAY_IS_ERR(k)) return NULL;
+    ray_t* v = ray_dict_get(d, k);
+    ray_release(k);
+    return v;
+}
+
+static bool sig_flag(ray_t* d, const char* key) {
+    ray_t* v = sig_field(d, key);
+    bool b = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+    if (v) ray_release(v);
+    return b;
+}
+
+/* Prints a symbol's name. */
+static void print_sym(int64_t id) {
+    ray_t* s = ray_sym_str(id);
+    if (s) fwrite(ray_str_ptr(s), 1, ray_str_len(s), stdout);
+}
+
+/* `:h name` — what (.repl.signature name) reports, for a person: the kind,
+ * then a builtin's documented forms one per line, or a lambda's call shape
+ * from its parameter names.  Nothing is evaluated or called. */
+static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
+    if (len > 0 && p[0] == '\'') { p++; len--; }
+    bool one = len > 0;
+    for (size_t i = 0; i < len; i++)
+        if (p[i] == ' ' || p[i] == '\t') one = false;
+    if (!one) {
+        fprintf(stdout, ". :h takes one name, e.g. :h min\n");
+        return NULL;
+    }
+    int64_t id = ray_sym_intern(p, len);
+    ray_t* name = ray_sym(id);
+    if (!name || RAY_IS_ERR(name)) return name ? name : ray_error("oom", NULL);
+    ray_t* d = ray_repl_signature_fn(name);
+    ray_release(name);
+    if (!d || RAY_IS_ERR(d)) return d ? d : ray_error("oom", NULL);
+
+    ray_t* kind = sig_field(d, "kind");
+    ray_t* usage = sig_field(d, "usage");
+    ray_t* params = sig_field(d, "params");
+    ray_t* own = sig_field(d, "builtin");
+    const char* k = "";
+    ray_t* ks = kind && !RAY_IS_ERR(kind) && kind->type == -RAY_SYM ? ray_sym_str(kind->i64) : NULL;
+    if (ks) k = ray_str_ptr(ks);
+    bool lambda = strcmp(k, "lambda") == 0;
+    bool builtin = strcmp(k, "unary") == 0 || strcmp(k, "binary") == 0 || strcmp(k, "vary") == 0;
+    bool color = ctx && ctx->color;
+
+    if (color) fprintf(stdout, "\033[1;33m");
+    fwrite(p, 1, len, stdout);
+    if (color) fprintf(stdout, "\033[0m");
+    if (builtin) {
+        fprintf(stdout, ": builtin");
+        if (own && !RAY_IS_ERR(own) && own->type == -RAY_SYM && own->i64 != id) {
+            fputc(' ', stdout);
+            print_sym(own->i64);
+        }
+        fprintf(stdout, " (%s)", k);
+        if (sig_flag(d, "special")) fprintf(stdout, ", special form");
+        if (sig_flag(d, "restricted")) fprintf(stdout, ", restricted under -U");
+        fputc('\n', stdout);
+        const char* u = usage && !RAY_IS_ERR(usage) && usage->type == -RAY_STR ? ray_str_ptr(usage) : "";
+        size_t ul = usage && !RAY_IS_ERR(usage) && usage->type == -RAY_STR ? ray_str_len(usage) : 0;
+        if (ul == 0) {
+            fprintf(stdout, "  no usage entry\n");
+        } else {
+            /* the usage table joins a builtin's forms with ") or (" */
+            if (color) fprintf(stdout, "\033[90m");
+            size_t s = 0;
+            for (size_t i = 0; i + 6 <= ul; i++) {
+                if (memcmp(u + i, ") or (", 6) != 0) continue;
+                fprintf(stdout, "  %.*s\n", (int)(i + 1 - s), u + s);
+                s = i + 5;
+                i += 5;
+            }
+            fprintf(stdout, "  %.*s\n", (int)(ul - s), u + s);
+            if (color) fprintf(stdout, "\033[0m");
+        }
+    } else if (lambda) {
+        fprintf(stdout, ": lambda\n");
+        if (color) fprintf(stdout, "\033[90m");
+        fprintf(stdout, "  (");
+        fwrite(p, 1, len, stdout);
+        if (params && !RAY_IS_ERR(params) && params->type == RAY_SYM)
+            for (int64_t i = 0; i < params->len; i++) {
+                fputc(' ', stdout);
+                print_sym(ray_read_sym(ray_data(params), i, RAY_SYM, params->attrs));
+            }
+        fprintf(stdout, ")\n");
+        if (color) fprintf(stdout, "\033[0m");
+    } else if (strcmp(k, "value") == 0) {
+        fprintf(stdout, ": a value, not a function\n");
+    } else {
+        fprintf(stdout, ": not defined\n");
+    }
+    ray_t* held[] = { kind, usage, params, own, d };
+    for (size_t i = 0; i < sizeof held / sizeof held[0]; i++)
+        if (held[i]) { if (RAY_IS_ERR(held[i])) ray_error_free(held[i]); else ray_release(held[i]); }
+    return NULL;
+}
+
+/* help/? — REPL-only.  With a name, what .repl.signature reports for it;
+ * bare, every command's one-liner, walked from the table so it never gets
+ * out of sync with what's registered. */
 static ray_t* h_help(ray_t* arg, ray_syscmd_ctx_t* ctx) {
-    (void)arg;
     if (!ctx || !ctx->repl) return RAY_NULL_OBJ;
+    if (!arg_is_null(arg) && arg->type == -RAY_STR) {
+        const char* p = ray_str_ptr(arg);
+        size_t len = ray_str_len(arg);
+        while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\r')) len--;
+        if (len > 0) return help_name(p, len, ctx);
+    }
     bool color = ctx->color;
     if (color) fprintf(stdout, "\033[1;33m");
     fprintf(stdout, ". Commands list:");
@@ -260,7 +372,7 @@ static ray_t* h_help(ray_t* arg, ray_syscmd_ctx_t* ctx) {
         char tag[32];
         if (tbl[i].alias) snprintf(tag, sizeof(tag), ":%s/:%s", tbl[i].name, tbl[i].alias);
         else              snprintf(tag, sizeof(tag), ":%s",     tbl[i].name);
-        fprintf(stdout, "  %-12s - %s\n", tag, tbl[i].help ? tbl[i].help : "");
+        fprintf(stdout, "  %-14s - %s\n", tag, tbl[i].help ? tbl[i].help : "");
     }
     if (color) fprintf(stdout, "\033[0m");
     fprintf(stdout, "\n");
@@ -285,6 +397,7 @@ static ray_t* h_quit(ray_t* arg, ray_syscmd_ctx_t* ctx) {
 
 static const ray_syscmd_t TABLE[] = {
     { "help",   "?",  h_help,   RAY_SYSCMD_REPL_ONLY,            "Display this help."                       },
+    { "h",      NULL, h_help,   RAY_SYSCMD_REPL_ONLY,            "How NAME is called: :h NAME (or :help NAME)." },
     { "timeit", "t",  h_timeit, 0,                                "Toggle profiling on/off (or :t 0|1)."     },
     { "env",    NULL, h_env,    0,                                "List defined globals."                    },
     { "clear",  NULL, h_clear,  RAY_SYSCMD_REPL_ONLY,            "Clear the screen."                        },
