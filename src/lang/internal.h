@@ -699,6 +699,7 @@ ray_t* ray_hclose_fn(ray_t* x);
 ray_t* ray_hsend_fn(ray_t** args, int64_t n);
 ray_t* ray_hpost_fn(ray_t* handle, ray_t* msg);
 ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n);
+ray_t* ray_ipc_handles_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_auto_journal_eval_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_txlimit_fn(ray_t** args, int64_t n);
 ray_t* ray_ipc_transport_fn(ray_t** args, int64_t n);

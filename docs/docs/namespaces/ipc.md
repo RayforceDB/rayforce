@@ -6,7 +6,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages. A c
     A handle is a handle, whichever side of the wire you are on: the `i64` returned by `.ipc.open` and the `h` a server-side hook receives (or reads via `.ipc.handle`) name connections in the same namespace, and `.ipc.send`, `.ipc.post`, and `.ipc.close` accept either. A server can therefore push messages back through the handle its hooks were given — from inside the hook or any time later. Handles are only meaningful inside the process that owns the connection; they are not stable identifiers across processes or reconnects.
 
 !!! note "Restricted under `-U`"
-    `.ipc.open`, `.ipc.close`, `.ipc.send`, and `.ipc.post` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` is always available so hooks can read the current connection ID.
+    `.ipc.open`, `.ipc.close`, `.ipc.send`, and `.ipc.post` are `RAY_FN_RESTRICTED` — IPC chaining is blocked on a `-U` server (a peer cannot dial outward to a third server). `.ipc.handle` and `.ipc.handles` are always available: hooks read the current connection ID, and a client of a `-U` server can list its connections.
 
 ## Reference
 
@@ -17,6 +17,7 @@ Connect to a Rayforce server (`./rayforce -p <port>`) and exchange messages. A c
 | [`.ipc.post`](#ipc-post) | binary | restricted | Send a message asynchronously (fire-and-forget); return the null object. |
 | [`.ipc.close`](#ipc-close) | unary | restricted | Close a connection handle. |
 | [`.ipc.handle`](#ipc-handle) | variadic | — | The current connection's handle inside a server-side hook; `-1` otherwise. Given a live handle, that connection's view, transport included. |
+| [`.ipc.handles`](#ipc-handles) | variadic | — | Every open connection as a table: the columns of `(.ipc.handle h)` and `opened`. |
 | [`.ipc.transport`](#ipc-transport) | variadic | restricted | Read or set the process's transport policy: `auto`, `tcp`, `shm` or `rdma`. |
 
 ## `.ipc.open` { #ipc-open }
@@ -151,6 +152,29 @@ This is the only way to read the handle inside `on.sync` / `on.async` / `on.auth
 ;; Outside any hook
 (.ipc.handle)
 ;; => -1
+```
+
+## `.ipc.handles` { #ipc-handles }
+
+Signature: `(.ipc.handles)`. It takes no argument; any argument is a `rank` error.
+
+Returns a table with one row per open IPC connection of this process, in handle order: the connections it accepted and the ones it opened with `.ipc.open`. Only connections past the handshake are listed, the same set `(.ipc.handle h)` answers for. The columns are the keys of `(.ipc.handle h)`, in that order, then `opened`:
+
+| Column | Type | Meaning |
+|---|---|---|
+| `handle` | i64 | The connection's handle. |
+| `inbound` | b8 | Accepted here (`true`) or opened by `.ipc.open` (`false`). |
+| `transport` | sym | Where its bytes go: `tcp`, `shm` or `rdma`. |
+| `limit_bytes`, `limit_frames` | i64 | Its transmit backlog limits (`.ipc.txlimit`; `0` frames is unlimited). |
+| `queued_bytes`, `queued_frames` | i64 | Its backlog right now. |
+| `hwm_bytes` | i64 | The largest backlog it has held. |
+| `opened` | timestamp | When it was accepted or opened. |
+
+With no connection open it returns an empty table with these columns. It only reads state, so it is not restricted: a client of a `-U` server can call it to watch the server's connections, for example a subscriber whose `queued_bytes` keeps growing.
+
+```lisp
+(select {handle: handle queued_bytes: queued_bytes from: (.ipc.handles) where: (> queued_bytes 1048576)})
+(count (.ipc.handles))
 ```
 
 ## `.ipc.transport` { #ipc-transport }

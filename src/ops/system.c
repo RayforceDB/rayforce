@@ -2274,6 +2274,55 @@ ray_t* ray_ipc_handle_fn(ray_t** args, int64_t n) {
     return make_i64(ray_ipc_current_handle());
 }
 
+/* (.ipc.handles) -> a table, one row per open IPC connection of the active
+ * poll, inbound and outbound, in handle order (#1158): the keys of
+ * (.ipc.handle h) as columns, and `opened`, when the connection was
+ * accepted or opened.  Only handshake-complete connections, the set
+ * (.ipc.handle h) answers for.  It reads state only, so it is allowed
+ * under -U, as .ipc.handle is. */
+ray_t* ray_ipc_handles_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("rank", ".ipc.handles takes no arguments, got %lld", (long long)n);
+    enum { NC = 9 };
+    static const char* const names[NC] = { "handle", "inbound", "transport", "limit_bytes", "limit_frames",
+                                           "queued_bytes", "queued_frames", "hwm_bytes", "opened" };
+    static const int8_t types[NC] = { RAY_I64, RAY_BOOL, RAY_SYM, RAY_I64, RAY_I64,
+                                      RAY_I64, RAY_I64, RAY_I64, RAY_TIMESTAMP };
+    int64_t bound = ray_ipc_handle_bound(), rows = 0;
+    ray_ipc_tx_info_t ti;
+    for (int64_t h = 0; h < bound; h++)
+        if (ray_ipc_tx_info(h, &ti) == RAY_OK) rows++;
+    ray_t* cols[NC];
+    for (int c = 0; c < NC; c++) {
+        cols[c] = types[c] == RAY_SYM ? ray_sym_vec_new(RAY_SYM_W64, rows) : ray_vec_new(types[c], rows);
+        if (!cols[c] || RAY_IS_ERR(cols[c])) {
+            for (int j = 0; j < c; j++) ray_release(cols[j]);
+            return cols[c] && RAY_IS_ERR(cols[c]) ? cols[c] : ray_error("oom", NULL);
+        }
+    }
+    int64_t r = 0;
+    for (int64_t h = 0; h < bound && r < rows; h++) {
+        if (ray_ipc_tx_info(h, &ti) != RAY_OK) continue;
+        const char* tn = ray_ipc_xport_kind_name(ti.transport);
+        if (!tn) tn = "tcp";
+        int64_t iv[NC] = { h, 0, ray_sym_intern(tn, strlen(tn)), ti.limit_bytes, ti.limit_frames,
+                           ti.queued_bytes, ti.queued_frames, ti.hwm_bytes, ti.opened_ns };
+        for (int c = 0; c < NC; c++) {
+            if (c == 1) ((uint8_t*)ray_data(cols[c]))[r] = ti.inbound ? 1 : 0;
+            else ((int64_t*)ray_data(cols[c]))[r] = iv[c];
+        }
+        r++;
+    }
+    ray_t* tbl = ray_table_new(NC);
+    for (int c = 0; c < NC; c++) {
+        cols[c]->len = r;
+        if (tbl && !RAY_IS_ERR(tbl))
+            tbl = ray_table_add_col(tbl, ray_sym_intern(names[c], strlen(names[c])), cols[c]);
+        ray_release(cols[c]);
+    }
+    return tbl ? tbl : ray_error("oom", NULL);
+}
+
 /* `(.ipc.auto_journal_eval)` answers true while the current evaluation
  * runs inside an auto-journaled IPC request: the engine (or an embedder
  * such as a q-wire layer, through ray_ipc_set_auto_journal_eval) has

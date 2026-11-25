@@ -218,6 +218,7 @@ Every connection queues outbound bytes the socket cannot take immediately (async
 (.ipc.txlimit 8388608 64)      ; at most 8 MiB or 64 queued frames, whichever first
 (.ipc.txlimit h 67108864 0)    ; one connection may hold 64 MiB
 (.ipc.handle h)                ; {handle inbound transport limit_bytes limit_frames queued_bytes queued_frames hwm_bytes}
+(.ipc.handles)                 ; every open connection: those columns and `opened`, one row each
 ```
 
 The default is 256 MiB with no frame cap; the minimum is 4 KiB, and `frames` of `0` means unlimited. Changing the default applies to every connection without an override, including ones already open. `.mc.stats` reports the default as `tx_limit_bytes` / `tx_limit_frames` and the largest backlog any connection has held as `tx_hwm_bytes`. `.ipc.txlimit` is restricted: it decides when a peer is dropped.
