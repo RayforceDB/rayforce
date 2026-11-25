@@ -1782,6 +1782,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     ray_release(scratch);
     double divisor = sample ? (double)(cnt - 1) : (double)cnt;
     double v = sqdiff / divisor;
+    /* an intermediate that overflowed is null, never a number (#1669) */
+    if (!isfinite(sum) || !isfinite(v)) return ray_typed_null(-RAY_F64);
     return make_f64(take_sqrt ? sqrt(v) : v);
 }
 
