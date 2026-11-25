@@ -4553,7 +4553,13 @@ static test_result_t test_select_parted_prunes_local_shapes(void) {
         { "a: a", "(and (>= date 2024.01.02) (> a (avg a)))", 3300, false },
         { "a: a", "(and (== date 2024.01.02) (== (and (> a 0) (< a 12000)) true))", 2999, true },
         { "by: b s: (sum (if (< a 8) a 0))", "(== date 2024.01.02)", 3000, true },
-        { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, false },
+        /* an IF named like a column: pruned when no later output reads
+         * that name (#1698) */
+        { "a: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "b: (if (< a 8) a 0)", "(== date 2024.01.02)", 3000, true },
+        { "a: (if (< a 8) a 0) z: a", "(== date 2024.01.02)", 3000, false },
+        { "a: (if (< a 8) a 0) z: (+ b 1)", "(== date 2024.01.02)", 3000, true },
+        { "b: (+ a 1) a: (if (< b 8) a 0)", "(== date 2024.01.02)", 3000, false },
         /* an IF beside other row-local outputs (#1181) */
         { "b: b a: a q: (if (or (< a 8) (> a 11990)) a 0)", "(== date 2024.01.02)", 3000, true },
         { "q: (if (< a 8) a b) r: (if (> b a) 1 0) s: (+ a b)", "(and (== date 2024.01.02) (> a 5))", 2998, true },
@@ -5674,7 +5680,9 @@ static test_result_t test_select_parted_prunes_dictionary_key_widths(void) {
                               r->type == RAY_TABLE && u->type == RAY_TABLE && sp_same(r, u);
                 bool structural = true;
 #ifdef DEBUG
-                structural = created == (alias ? 0u : 1u) && ref_created == 0;
+                /* named like the column `a` it reads, the IF is pruned too:
+                 * no later output reads `a` (#1698) */
+                structural = created == 1u && ref_created == 0;
 #endif
                 drop_out(r); drop_out(u);
                 if (!values || !structural) {

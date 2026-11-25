@@ -1,0 +1,28 @@
+;; @requires: posix  (dd over a partition's ts through .sys.exec)
+;; #1698: an ungrouped `if` output named like a column of the table keeps
+;; partition pruning when no later output mentions that name.  The first
+;; partition's ts is overwritten with the second's after it is written, its
+;; statistics kept, so a read of it shows in the count: 70000 is the skip,
+;; 140000 a read of both.
+(.sys.exec "rm -rf /tmp/rf_test_ifname && mkdir -p /tmp/rf_test_ifname") -- 0
+(set n 70000)
+(set mk (fn [d] (table [ts k v] (list (+ d (* 1000000 (til n))) (at ['x 'y 'z] (% (til n) 3)) (til n)))))
+(.db.splayed.set "/tmp/rf_test_ifname/2026.01.05/t/" (mk 2026.01.05D00:00:00.000) "/tmp/rf_test_ifname/.sym" {compress: false})
+(.db.splayed.set "/tmp/rf_test_ifname/2026.01.06/t/" (mk 2026.01.06D00:00:00.000) "/tmp/rf_test_ifname/.sym" {compress: false})
+(.sys.exec "dd if=/tmp/rf_test_ifname/2026.01.06/t/ts of=/tmp/rf_test_ifname/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null") -- 0
+(set P (.db.parted.get "/tmp/rf_test_ifname/" 't))
+;; controls: the window alone, and the if under a name of its own
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000)})) -- 70000
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) a: (if (== k 'x) 'X k)})) -- 70000
+;; under the name of the column it reads (a relabel), and of another column
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== k 'x) 'X k)})) -- 70000
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) v: (if (== k 'x) 1 0)})) -- 70000
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== k 'x) 'X k) j: v})) -- 70000
+;; a later output that reads the relabelled name, or a literal of it, keeps
+;; the full source; so does an earlier output that rebinds a name the if reads
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== k 'x) 'X k) j: k})) -- 140000
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== k 'x) 'X k) q: (quote k)})) -- 140000
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) v: (+ v 1) k: (if (> v 3) 'big k)})) -- 140000
+;; the relabelled values themselves
+(distinct (at (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== k 'x) 'X k)}) 'k)) -- ['X 'y 'z]
+(.sys.exec "rm -rf /tmp/rf_test_ifname") -- 0

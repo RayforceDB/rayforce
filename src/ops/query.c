@@ -25002,6 +25002,30 @@ static bool prune_clause_key(ray_t* k) {
     return false;
 }
 
+/* Does `e` mention the name `id` anywhere: as a name, a literal symbol (in
+ * query text one names the column), inside a nested form or a dict, or
+ * through a call of a lambda, whose body may read it as a free name?  A
+ * conservative test for "reads that name". */
+static bool prune_expr_mentions(ray_t* e, int64_t id, int depth) {
+    if (!e) return false;
+    if (depth > 64) return true;
+    if (e->type == -RAY_SYM) return e->i64 == id;
+    if (e->type == RAY_SYM) {
+        for (int64_t i = 0; i < e->len; i++)
+            if (ray_read_sym(ray_data(e), i, RAY_SYM, e->attrs) == id) return true;
+        return false;
+    }
+    if (e->type == RAY_LAMBDA) return true;
+    if (e->type == RAY_DICT)
+        return prune_expr_mentions(ray_dict_keys(e), id, depth + 1) ||
+               prune_expr_mentions(ray_dict_vals(e), id, depth + 1);
+    if (e->type != RAY_LIST) return false;
+    if (e->len > 0 && query_expr_has_helper(e)) return true;
+    for (int64_t i = 0; i < e->len; i++)
+        if (prune_expr_mentions(((ray_t**)ray_data(e))[i], id, depth + 1)) return true;
+    return false;
+}
+
 /* Every where conjunct, by: expression and output of the select reads only
  * the rows the where keeps. */
 static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
@@ -25032,16 +25056,38 @@ static bool prune_shape_ordinary_ok(ray_t* dict, ray_t* tbl, ray_t* where) {
         if (by || n_clauses != 2 || !dict_get(dict, "from") || !dict_get(dict, "where")) return false;
         /* Clause keys can have a compact width or a non-runtime domain. */
         int64_t output_id = sym_cell_runtime_id(keys, i);
-        if (output_id < 0 || ray_table_slot(tbl, output_id) ||
+        if (output_id < 0 ||
             !prune_if_projection(((ray_t**)ray_data(vals))[i], tbl, &budget, 0)) return false;
+        /* Named like a column (a relabel, `k: (if (== k 'x) 'X k)`), the IF
+         * still reads the source's values: outputs run in order, and its
+         * name is rebound for the outputs after it only.  So none of those
+         * may read that name (#1698). */
+        if (ray_table_slot(tbl, output_id))
+            for (int64_t j = i + 1; j < keys->len; j++)
+                if (!prune_clause_key(ray_sym_vec_cell(keys, j)) &&
+                    prune_expr_mentions(((ray_t**)ray_data(vals))[j], output_id, 0)) return false;
         /* The proof types the IF's names from the source; an earlier output
          * may rebind one for later outputs (`a: (avg a)`). Only a column
-         * passed through under its own name keeps its type. */
+         * passed through under its own name keeps its type, and an IF named
+         * like a column, which the check above keeps from being read. */
         for (int64_t j = 0; !if_checked && j < keys->len; j++) {
             int64_t id = sym_cell_runtime_id(keys, j);
             ray_t* v = ((ray_t**)ray_data(vals))[j];
             if (id < 0 || prune_clause_key(ray_sym_vec_cell(keys, j)) || !ray_table_slot(tbl, id)) continue;
-            if (!v || v->type != -RAY_SYM || (v->attrs & ATTR_QUOTED) || v->i64 != id) return false;
+            if (v && v->type == -RAY_SYM && !(v->attrs & ATTR_QUOTED) && v->i64 == id) continue;
+            if (j == i) continue;
+            /* another IF named like a column is checked on its own turn */
+            if (!prune_output_ok(v, tbl, grouped)) {
+                int b2 = PRUNE_IF_MAX_VISITS;
+                if (v && prune_if_projection(v, tbl, &b2, 0)) {
+                    bool read_later = false;
+                    for (int64_t m = j + 1; m < keys->len && !read_later; m++)
+                        read_later = !prune_clause_key(ray_sym_vec_cell(keys, m)) &&
+                                     prune_expr_mentions(((ray_t**)ray_data(vals))[m], id, 0);
+                    if (!read_later) continue;
+                }
+            }
+            return false;
         }
         if_checked = true;
     }
