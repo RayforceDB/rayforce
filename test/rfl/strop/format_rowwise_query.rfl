@@ -1,0 +1,57 @@
+;; @also-unfused
+;; format, repr and .json.format are element-wise in a query (#1594): over
+;; columns they render each row's values, on every route, as the keyless
+;; projection always did.  update, by: outputs and keys, aggregates of them,
+;; where: and helpers used the whole vectors: one string for every row, one
+;; per group, a length error as a by: key.  Outside a query a column is a
+;; value like any other and is rendered whole.
+(set t (table [g k s u y] (list ['p 'p 'q 'q] [0 1 2 3] ["x" "" "y" "w"] ["a" "b" "" "c"] ['a 'b 'c 'd])))
+(set Hm2 (fn [v] (let q 1) (+ v q)))
+(set H1 (fn [a b] (format "%-%" a b)))
+(set H2 (fn [a b] (let zz 1) (format "%-%" a b)))
+
+;; the projection, as before
+(at (select {from: t v: (format "%-%" s u)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t where: (> k 0) v: (format "%-%" s u)}) 'v) -- ["-b" "y-" "w-c"]
+(at (select {from: t v: (format "%-%" s u) w: (Hm2 k)}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+;; update, with where: and by:
+(at (update {v: (format "%-%" s u) from: t}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (update {v: (format "%-%" s u) from: t where: (> k 1)}) 'v) -- ["" "" "y-" "w-c"]
+(at (update {v: (format "%-%" s u) from: t by: g}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+;; by: outputs and keys
+(at (select {from: t by: g v: (format "%-%" s u)}) 'v) -- (list ["x-a" "-b"] ["y-" "w-c"])
+(value (select {from: t by: (format "%-%" s u) c: (count k)})) -- (list ["x-a" "-b" "y-" "w-c"] [1 1 1 1])
+;; a named key, as the bare one: each builtin, through helpers, with where:
+(value (select {from: t by: {z: (format "%-%" s u)} c: (count k)})) -- (list ["x-a" "-b" "y-" "w-c"] [1 1 1 1])
+(value (select {from: t by: {z: (repr k) g: g} c: (count k)})) -- (list ["0" "1" "2" "3"] ['p 'p 'q 'q] [1 1 1 1])
+(value (select {from: t by: {z: (.json.format s)} c: (count k)})) -- (list ["\"x\"" "\"\"" "\"y\"" "\"w\""] [1 1 1 1])
+(value (select {from: t by: {z: (H1 s u)} c: (count k)})) -- (list ["x-a" "-b" "y-" "w-c"] [1 1 1 1])
+(value (select {from: t by: {z: (H2 s u)} c: (count k)})) -- (list ["x-a" "-b" "y-" "w-c"] [1 1 1 1])
+(value (select {from: t by: {z: (format "%" (upper s))} c: (count k) where: (> k 0)})) -- (list ["" "Y" "W"] [1 1 1])
+(value (select {from: t by: {z: (format "%" g)} c: (count k)})) -- (list ["p" "q"] [2 2])
+;; aggregates of it, keyless and grouped, and where:
+(at (select {from: t v: (last (format "%-%" s u))}) 'v) -- ["w-c"]
+(at (select {from: t v: (count (format "%" k))}) 'v) -- [4]
+(at (select {from: t by: g v: (first (format "%-%" s u))}) 'v) -- ["x-a" "y-"]
+(at (select {from: t where: (== (format "%" k) "2") v: k}) 'v) -- [2]
+;; helpers, inlined and compiled
+(at (update {v: (H1 s u) from: t}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (update {v: (H2 s u) from: t}) 'v) -- ["x-a" "-b" "y-" "w-c"]
+(at (select {from: t by: g v: (H2 s u)}) 'v) -- (list ["x-a" "-b"] ["y-" "w-c"])
+;; a value that is not a column's rows is one value: a bound vector, an aggregate
+(set GV [7 8 9 10])
+(at (update {v: (format "%|%" k GV) from: t}) 'v) -- ["0|[7 8 9 10]" "1|[7 8 9 10]" "2|[7 8 9 10]" "3|[7 8 9 10]"]
+(at (update {v: (format "%" (sum k)) from: t}) 'v) -- ["6" "6" "6" "6"]
+;; repr and .json.format: the same rule
+(at (update {v: (repr k) from: t}) 'v) -- ["0" "1" "2" "3"]
+(at (select {from: t by: g v: (repr s)}) 'v) -- (list ["\"x\"" "\"\""] ["\"y\"" "\"w\""])
+(at (update {v: (.json.format y) from: t}) 'v) -- ["\"a\"" "\"b\"" "\"c\"" "\"d\""]
+(at (select {from: t by: g v: (.json.format k)}) 'v) -- (list ["0" "1"] ["2" "3"])
+;; over no rows: no string
+(count (at (select {from: t where: (> k 9) v: (format "%" k) w: (Hm2 k)}) 'v)) -- 0
+(at (select {from: t where: (> k 9) v: (first (format "%" k)) w: (first (Hm2 k))}) 'v) -- [""]
+;; outside a query a column is rendered whole
+(format "%-%" ["x" ""] ["a" "b"]) -- "[\"x\" \"\"]-[\"a\" \"b\"]"
+(repr [0 1]) -- "[0 1]"
+(.json.format [0 1]) -- "[0,1]"
+(H2 ["x"] ["a"]) -- "[\"x\"]-[\"a\"]"

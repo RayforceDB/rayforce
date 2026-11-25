@@ -1103,6 +1103,9 @@ ray_t*    ray_lazy_promote(ray_t* lazy);
  * so a literal never captures a lambda/let local and resolution fires only
  * inside a query.  Returns NULL when no query is active. */
 ray_t* ray_active_query_table(void);
+/* Is a per-row evaluation of the active query in progress: its columns
+ * bound to one row's cells? */
+bool ray_query_row_active(void);
 /* The table a helper called from a query may read columns from: the
  * source schema while a projection binds aliases, else the active table. */
 ray_t* ray_query_helper_table(void);
