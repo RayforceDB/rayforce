@@ -32733,27 +32733,15 @@ static bool update_dag_err_final(ray_t* out, ray_t* cerr, bool if_refused) {
 static bool update_agg_is_cell(ray_t* expr, ray_t* tbl);
 static ray_t* update_cell_rows(ray_t* expr, ray_t* tbl, ray_t* val, int64_t n);
 
-/* A new column under where: from first/last of a LIST column keeps dev's
- * legacy reading (#1468): a one-element cell is collapsed to its value, so
- * w: (last l) over cells [4] gives 4 in each kept row; any other cell is
- * left as it is and fails as on dev (a new column under where: must be a
- * typed vector).  This is inconsistent with the cell an existing LIST
- * column or by: takes (#1574 asks which rule a new column under where:
- * should follow); it only keeps the answers dev gave. */
+/* A new column under where: from first/last of a LIST column: the cell is
+ * a LIST value, which a new column under where: cannot take (it must be a
+ * typed vector), whatever the cell's length (#1574).  A cell that is an atom
+ * is a value of its own type, as keyless: it is broadcast as any atom.  An
+ * existing LIST column, keyless, by: and select keep the cell whole. */
 static ray_t* update_cell_collapse(ray_t* expr, ray_t* tbl, ray_t* v) {
     if (!v || RAY_IS_ERR(v) || ray_is_atom(v) || !update_agg_is_cell(expr, tbl)) return v;
-    if (ray_len(v) != 1) {
-        /* a cell of several values is never spread over the kept rows,
-         * even when its length matches theirs: the documented error */
-        ray_release(v);
-        return ray_error("type", "update: a new column under where: must be a typed vector, got LIST");
-    }
-    int alloc = 0;
-    ray_t* a = collection_elem(v, 0, &alloc);
-    if (!a || RAY_IS_ERR(a)) return v;
-    if (!alloc) ray_retain(a);
     ray_release(v);
-    return a;
+    return ray_error("type", "update: a new column under where: must be a typed vector, got LIST");
 }
 
 static ray_t* update_eval_on_impl(ray_t* sub, ray_t* expr, bool expand, bool* dag_declined,
@@ -34183,7 +34171,7 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
             for (int64_t c = 0; c < ncols; c++)
                 if (ray_table_col_name(tbl, c) == kid) { exists = true; break; }
             if (exists) continue;
-            /* a new column: dev's legacy reading of a LIST cell (#1468) */
+            /* a new column: a LIST cell is refused (update_cell_collapse) */
             ray_t* v = update_where_value_c(tbl, dict_elems[d + 1], mask_vec, false);
             if (v && !RAY_IS_ERR(v) && ray_is_atom(v)) {
                 ray_t* wide;

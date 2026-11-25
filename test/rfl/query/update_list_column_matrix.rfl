@@ -14,9 +14,10 @@
 ;;   the index counts within each group is #1429's open question, and every
 ;;   update by: of a LIST column raised on dev.  Keyless and under where:
 ;;   it keeps dev's answer.
-;; - a new column under where: from first/last of a LIST column keeps dev's
-;;   legacy answer: a one-element cell collapses to its value, any other
-;;   fails as on dev (the open design question #1574).
+;; - a new column under where: from first/last (or a one-value at) of a
+;;   LIST column raises type, whatever the cell's length (#1574): a new
+;;   column under where: must be a typed vector.  A cell that is an atom
+;;   fills the kept rows as any atom does.
 ;; Every form is crossed with by:, keyless, where: keeping all, some and no
 ;; rows, a copy, in place, and a new column.
 (set U (table [g v i l] (list ['a 'a 'a 'b 'b] [1 2 3 4 5] [1 0 2 1 0] (list [1 2] [3] [7] [8 9 10] [4]))))
@@ -43,7 +44,7 @@
 (at (update {w: (first l) from: U by: g}) 'w) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
 (at (update {w: (first l) from: U }) 'w) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
 (at (update {w: (first l) from: U where: (> v 0)}) 'w) !- type
-(at (update {w: (first l) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 7 7 7]
+(at (update {w: (first l) from: U where: (> v 2)}) 'w) !- type
 (at (update {w: (first l) from: U where: (> v 9)}) 'w) !- type
 (at (update {l: (last l) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
 (do (set M U) (update {l: (last l) from: 'M by: g}) (at M 'l)) -- (list [7] [7] [7] [4] [4])
@@ -57,9 +58,9 @@
 (do (set M U) (update {l: (last l) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
 (at (update {w: (last l) from: U by: g}) 'w) -- (list [7] [7] [7] [4] [4])
 (at (update {w: (last l) from: U }) 'w) -- (list [4] [4] [4] [4] [4])
-(at (update {w: (last l) from: U where: (> v 0)}) 'w) -- [4 4 4 4 4]
-(at (update {w: (last l) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 4 4 4]
-(at (update {w: (last l) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {w: (last l) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (last l) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (last l) from: U where: (> v 9)}) 'w) !- type
 (at (update {l: (first (reverse l)) from: U by: g}) 'l) -- (list [7] [7] [7] [4] [4])
 (do (set M U) (update {l: (first (reverse l)) from: 'M by: g}) (at M 'l)) -- (list [7] [7] [7] [4] [4])
 (at (update {l: (first (reverse l)) from: U }) 'l) -- (list [4] [4] [4] [4] [4])
@@ -72,9 +73,9 @@
 (do (set M U) (update {l: (first (reverse l)) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
 (at (update {w: (first (reverse l)) from: U by: g}) 'w) -- (list [7] [7] [7] [4] [4])
 (at (update {w: (first (reverse l)) from: U }) 'w) -- (list [4] [4] [4] [4] [4])
-(at (update {w: (first (reverse l)) from: U where: (> v 0)}) 'w) -- [4 4 4 4 4]
-(at (update {w: (first (reverse l)) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 4 4 4]
-(at (update {w: (first (reverse l)) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {w: (first (reverse l)) from: U where: (> v 0)}) 'w) !- type
+(at (update {w: (first (reverse l)) from: U where: (> v 2)}) 'w) !- type
+(at (update {w: (first (reverse l)) from: U where: (> v 9)}) 'w) !- type
 (at (update {l: (at l 0) from: U by: g}) 'l) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
 (do (set M U) (update {l: (at l 0) from: 'M by: g}) (at M 'l)) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
 (at (update {l: (at l 0) from: U }) 'l) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
@@ -88,7 +89,7 @@
 (at (update {w: (at l 0) from: U by: g}) 'w) -- (list [1 2] [1 2] [1 2] [8 9 10] [8 9 10])
 (at (update {w: (at l 0) from: U }) 'w) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
 (at (update {w: (at l 0) from: U where: (> v 0)}) 'w) !- type
-(at (update {w: (at l 0) from: U where: (> v 2)}) 'w) -- [0Nl 0Nl 7 7 7]
+(at (update {w: (at l 0) from: U where: (> v 2)}) 'w) !- type
 (at (update {w: (at l 0) from: U where: (> v 9)}) 'w) !- type
 (at (update {l: (at l 1) from: U by: g}) 'l) -- (list [3] [3] [3] [4] [4])
 (do (set M U) (update {l: (at l 1) from: 'M by: g}) (at M 'l)) -- (list [3] [3] [3] [4] [4])
@@ -102,9 +103,9 @@
 (do (set M U) (update {l: (at l 1) from: 'M where: (> v 9)}) (at M 'l)) -- (list [1 2] [3] [7] [8 9 10] [4])
 (at (update {w: (at l 1) from: U by: g}) 'w) -- (list [3] [3] [3] [4] [4])
 (at (update {w: (at l 1) from: U }) 'w) -- (list [3] [3] [3] [3] [3])
-(at (update {w: (at l 1) from: U where: (> v 0)}) 'w) -- [3 3 3 3 3]
+(at (update {w: (at l 1) from: U where: (> v 0)}) 'w) !- type
 (at (update {w: (at l 1) from: U where: (> v 2)}) 'w) !- type
-(at (update {w: (at l 1) from: U where: (> v 9)}) 'w) -- [0Nl 0Nl 0Nl 0Nl 0Nl]
+(at (update {w: (at l 1) from: U where: (> v 9)}) 'w) !- type
 (at (update {l: (at l i) from: U by: g}) 'l) -- (list [3] [1 2] [7] [4] [8 9 10])
 (do (set M U) (update {l: (at l i) from: 'M by: g}) (at M 'l)) -- (list [3] [1 2] [7] [4] [8 9 10])
 (at (update {l: (at l i) from: U }) 'l) -- (list [3] [1 2] [7] [3] [1 2])
@@ -195,3 +196,10 @@
 (at (update {w: (reverse l) from: U where: (> v 0)}) 'w) !- type
 (at (update {w: (reverse l) from: U where: (> v 2)}) 'w) !- type
 (at (update {w: (reverse l) from: U where: (> v 9)}) 'w) !- type
+;; #1574: a one-element cell is refused as a longer one is; an atom cell is a
+;; value of its own type
+(set A (table [v l] (list [1 2 3 4 5] (list [9] 1 (quote x) [1 2] 5))))
+(at (update {w: (first l) from: A where: (== v 1)}) 'w) !- type
+(at (update {w: (last l) from: A where: (> v 2)}) 'w) -- [0Nl 0Nl 5 5 5]
+(at (update {w: (last l) from: A}) 'w) -- [5 5 5 5 5]
+(at (update {l: (first l) from: A where: (> v 3)}) 'l) -- (list [9] 1 (quote x) [1 2] [1 2])
