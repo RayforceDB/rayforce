@@ -70,6 +70,12 @@ zsg_calls -- 0
 (at (.repl.signature 'zsg_D.f) 'params) -- ['x 'y 'z]
 (at (.repl.signature 'zsg_D.n) 'kind) -- 'value
 (at (.repl.signature 'zsg_nosuch) 'kind) -- 'missing
+;; a namespace root is a namespace, true and false are literals, not
+;; undefined names; a user dict stays a value (above)
+(at (.repl.signature '.sys) 'kind) -- 'namespace
+(at (.repl.signature '.sys) 'bound) -- true
+(at (.repl.signature 'true) 'kind) -- 'literal
+(at (.repl.signature 'false) 'bound) -- false
 (at (.repl.signature 'zsg_nosuch) 'bound) -- false
 (at (.repl.signature 'zsg_D.nosuch) 'bound) -- false
 ;; the argument is a symbol

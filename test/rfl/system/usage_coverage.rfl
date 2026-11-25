@@ -1,0 +1,21 @@
+;; Every builtin .repl.complete lists has a usage line in src/lang/sig.c
+;; (#1736), so .repl.signature, :h and the errors it raises show its call
+;; shape; a new builtin cannot land without one.  The names without one
+;; are only the namespace roots (nothing to call) and the literals.
+(set ucv_sigs (map (fn [n] (.repl.signature n)) (.repl.complete "")))
+(set ucv_builtin (map (fn [s] (in (at s 'kind) ['unary 'binary 'vary])) ucv_sigs))
+(set ucv_bare (map (fn [s] (== 0 (count (at s 'usage)))) ucv_sigs))
+;; builtins without a usage line: none
+(map (fn [s] (at s 'name)) (filter ucv_sigs (and ucv_builtin ucv_bare))) -- (list)
+;; the names that have no usage line are namespace roots or the literals
+(set ucv_rest (filter ucv_sigs ucv_bare))
+(asc (distinct (map (fn [s] (at s 'kind)) ucv_rest))) -- ['literal 'namespace]
+(asc (map (fn [s] (at s 'name)) (filter ucv_rest (map (fn [s] (== (at s 'kind) 'literal)) ucv_rest)))) -- ['false 'true]
+;; completion offers no `def`: it is no form ((def x 1) is an undefined name)
+(in 'def (.repl.complete "de")) -- false
+;; the builtins #1736 named: their errors now carry the line
+(try (.ipc.close "x") (fn [e] (at e 'usage))) -- "(.ipc.close <handle: i32 or i64>)"
+(try (.ipc.open 5) (fn [e] (at e 'usage))) -- "(.ipc.open <address: str, \"host:port[:user:password]\"> [<timeout-ms: int, or options: dict of timeout, compress, keepalive, transport>])"
+(try (.json.parse 5) (fn [e] (at e 'usage))) -- "(.json.parse <text: str or str vector> [<limits: dict>])"
+(try (.time.timer.del "x") (fn [e] (at e 'usage))) -- "(.time.timer.del <id: i64>)"
+(at (.repl.signature 'println) 'usage) -- "(println <x: any>...) or (println <template: str, each % marks a value> <value: any>...)"

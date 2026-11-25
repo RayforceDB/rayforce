@@ -56,7 +56,7 @@ You can also exit with `\\`, `exit`, or **Ctrl-D** on an empty line.
 - **A builtin:** its documented call forms, one per line, from the engine's usage table (the text its errors cite). Through an alias, the header names the builtin the alias holds.
 - **A lambda:** its call shape from its parameter names.
 - **Flags:** `special form` and `restricted under -U` are added where they apply.
-- **Anything else:** a value, a missing name, or a builtin with no usage entry gets one line saying so.
+- **Anything else:** one line: a namespace root (`:h .sys`) gives its number of names and how to ask for one, `true` and `false` are literals, and a value or a missing name says so.
 
 ```
 ‣ :h min
@@ -70,9 +70,9 @@ add: lambda
 ‣ :h if
 if: builtin (vary), special form
   (if <cond: bool or bool vector> <then> [<cond> <then> ...] [<else>])
-‣ :h .ipc.open
-.ipc.open: builtin (vary), restricted under -U
-  no usage entry
+‣ :h .ipc.close
+.ipc.close: builtin (unary), restricted under -U
+  (.ipc.close <handle: i32 or i64>)
 ‣ :h nosuch
 nosuch: not defined
 ```

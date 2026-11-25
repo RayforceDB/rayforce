@@ -338,6 +338,15 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
             }
         fprintf(stdout, ")\n");
         if (color) fprintf(stdout, "\033[0m");
+    } else if (strcmp(k, "namespace") == 0) {
+        ray_t* ns = ray_inspect_lookup(id);
+        ray_t* nk = ns && ns->type == RAY_DICT ? ray_dict_keys(ns) : NULL;
+        fprintf(stdout, ": namespace of %lld names; :h ", (long long)(nk ? nk->len : 0));
+        fwrite(p, 1, len, stdout);
+        fprintf(stdout, ".<name> for one of them\n");
+        if (ns) ray_release(ns);
+    } else if (strcmp(k, "literal") == 0) {
+        fprintf(stdout, ": a literal (b8)\n");
     } else if (strcmp(k, "value") == 0) {
         fprintf(stdout, ": a value, not a function\n");
     } else {

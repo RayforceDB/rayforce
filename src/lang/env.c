@@ -1558,7 +1558,7 @@ int32_t ray_env_list_user(int64_t* sym_ids, ray_t** vals, int32_t max_entries) {
 /* ---- Prefix lookup ---- */
 
 static const char* s_keywords[] = {
-    "def", "do", "false", "fn", "if", "let", "set", "times", "true", "while", NULL
+    "do", "false", "fn", "if", "let", "set", "times", "true", "while", NULL
 };
 
 /* Compare helper for qsort on const char* */

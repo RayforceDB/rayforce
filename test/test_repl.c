@@ -1603,7 +1603,8 @@ static test_result_t test_repl_run_piped_help_full(void) {
 /* `:h NAME` / `:help NAME` (#1726): what .repl.signature reports, for a
  * person.  A builtin's documented forms one per line, a lambda's call shape
  * from its parameters, special form / restricted where they apply, and one
- * line for a value, a missing name or a builtin without a usage entry.
+ * line for a value or a missing name.  (Every builtin has a usage entry since
+ * #1736; system/usage_coverage keeps it so.)
  * Bare `:h` and `:help` still list the commands, `:h` among them. */
 static test_result_t test_repl_help_name(void) {
     const char* defs[] = { "(set zhn_add (fn [a b] (+ a b)))", "(set zhn_m min)",
@@ -1618,7 +1619,8 @@ static test_result_t test_repl_help_name(void) {
     ray_syscmd_ctx_t ctx = { repl, false };
     const char* cmds[] = { "h min", "help zhn_add", "h 'zhn_m", "h if", "h .sys.exec",
                            "h .ipc.open", "h zhn_x", "h zhn_nosuch", "h zhn_none0",
-                           "h a b", "h", "help", "h .sys.querylog.enable", "h .sys.profile.reset" };
+                           "h a b", "h", "help", "h .sys.querylog.enable", "h .sys.profile.reset",
+                           "h .ipc", "h true" };
     char path[256];
     char buf[8192];
     int saved = cap_begin(path, sizeof path);
@@ -1636,8 +1638,8 @@ static test_result_t test_repl_help_name(void) {
         "zhn_add: lambda\n  (zhn_add a b)\n",
         "zhn_m: builtin min (unary)\n  (min <x: vector, atom or list>)\n",
         "if: builtin (vary), special form\n  (if <cond: bool or bool vector>",
-        ".sys.exec: builtin (vary), restricted under -U\n  no usage entry\n",
-        ".ipc.open: builtin (vary), restricted under -U\n  no usage entry\n",
+        ".sys.exec: builtin (vary), restricted under -U\n  (.sys.exec <command: str> [<mode: sym, 'out>])\n",
+        ".ipc.open: builtin (vary), restricted under -U\n  (.ipc.open <address: str, \"host:port[:user:password]\">",
         "zhn_x: a value, not a function\n",
         "zhn_nosuch: not defined\n",
         "zhn_none0: lambda\n  (zhn_none0)\n",
@@ -1645,6 +1647,9 @@ static test_result_t test_repl_help_name(void) {
         "  :h             - How NAME is called: :h NAME (or :help NAME).\n",
         ".sys.querylog.enable: builtin (vary), restricted under -U\n  (.sys.querylog.enable [<on: i64, 0 or 1>])\n",
         ".sys.profile.reset: builtin (vary), restricted under -U\n  (.sys.profile.reset)\n",
+        ".ipc: namespace of ",
+        "; :h .ipc.<name> for one of them\n",
+        "true: a literal (b8)\n",
     };
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
         TEST_ASSERT_FMT(strstr(buf, want[i]) != NULL, "no \"%s\" in:\n%.1500s", want[i], buf);
