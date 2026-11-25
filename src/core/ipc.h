@@ -274,6 +274,9 @@ int       ray_ipc_cancel_unconfirmed_for_test(int64_t handle);
  * process breaks it, and their save/restore of this state can interleave
  * and leave a stale descriptor behind for the next test (#1265). */
 void      ray_ipc_cancel_state_reset_for_test(void);
+/* Test hook: name `fd` as the connection whose request is being evaluated,
+ * as a request's dispatch does, so a SIGURG acts on it. */
+void      ray_ipc_cancel_active_fd_for_test(int fd);
 /* The message type of the IPC request being evaluated on this server:
  * RAY_IPC_MSG_SYNC or RAY_IPC_MSG_ASYNC, or -1 when none is running. */
 int       ray_ipc_request_kind(void);
