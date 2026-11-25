@@ -110,7 +110,7 @@ But a column holds at most one backing index — setting `grouped` or `parted` r
 
 Attributes propagate **conservatively**.  Only operations that trivially preserve the values — a refcount / copy-on-write copy, a plain rebind — keep the attributes.  *Any* transform that could change ordering, length, or values (arithmetic, `filter` / `where`, `reverse`, `take`) **drops** them.  This keeps the invariant honest: a held attribute always reflects the current bytes.
 
-An append is the exception.  `(concat v rows)`, `(concat v atom)`, `(alter 'v concat rows)`, an `insert` of one value into a `grouped` vector and an `insert` of rows into a table's `grouped` column (in place or not) keep the hash.  An `insert` of several values into a vector builds a fresh, unattributed one; `concat` keeps the attribute.  With the hash kept, each appended row with a **new** key becomes a group of its own, so an append-only keyed vector never pays a rebuild, and `unique` stays.  An appended row that **repeats** a key the hash already holds is not added to that key's group, which would cost a re-lay of every row: the hash is left first-row-only (`.idx.info` reports `first_only: true`).  It still answers `find`, `in`, a dict lookup and `distinct` — a key's first row and its presence are exact — but `grouped` and `unique` are no longer claimed, every other consult reads the column, and a save writes a complete hash built from the values.  `.attr.set 'grouped` rebuilds a complete one.  A null appended (to any column but a guid one, whose hash keys the null guid), or a symbol from another domain, leaves the result a plain vector, as before; `sorted` is always dropped by an append.
+An append is the exception.  `(concat v rows)`, `(concat v atom)`, `(alter 'v concat rows)`, an `insert` of one value into a `grouped` vector and an `insert` of rows into a table's `grouped` column (in place or not) keep the hash.  An `insert` of several values into a vector builds a fresh, unattributed one; `concat` keeps the attribute.  With the hash kept, each appended row with a **new** key becomes a group of its own, so an append-only keyed vector never pays a rebuild, and `unique` stays.  An appended row that **repeats** a key the hash already holds goes to the hash's delta, which every consult reads with the key's group (see [Mutation Drops the Index](indexes.md#mutation-drops-the-index)): the hash still holds every row of every key, so `grouped` stays, and `unique` goes, as a rebuild would find.  `.idx.info` reports the rows waiting in the delta as `delta`.  A null appended to a numeric column, or a symbol from another domain, leaves the result a plain vector, as before (a `SYM` or `STR` null is left out of the hash, a guid one is keyed like any guid); `sorted` is always dropped by an append.
 
 ```lisp
 ; Arithmetic drops the marker (and a backing index).
@@ -121,11 +121,11 @@ An append is the exception.  `(concat v rows)`, `(concat v atom)`, `(alter 'v co
 (.attr.get (reverse (.attr.set 'sorted [1 2 3])))               ; ⇒ no attributes
 (.attr.get (concat (.attr.set 'sorted [1 2 3]) [0 1]))          ; ⇒ no attributes
 
-; An append of NEW keys carries a hash index (and `unique`); a repeat leaves
-; it first-row-only: no longer `grouped`, still used by find / in.
+; An append of NEW keys carries a hash index (and `unique`); a repeat goes
+; to the hash's delta: still `grouped`, no longer `unique`.
 (.attr.get (concat (.attr.set 'unique (.attr.set 'grouped [1 2 3])) [4 5]))   ; ⇒ ['unique 'grouped]
-(.attr.get (concat (.attr.set 'grouped [1 2 3]) [3]))                          ; ⇒ no attributes
-(at (.idx.info (concat (.attr.set 'grouped [1 2 3]) [3])) 'first_only)         ; ⇒ true
+(.attr.get (concat (.attr.set 'unique (.attr.set 'grouped [1 2 3])) [3]))     ; ⇒ ['grouped]
+(at (.idx.info (concat (.attr.set 'grouped [1 2 3]) [3])) 'delta)              ; ⇒ 1
 
 ; Plain rebind preserves.
 (set _s (.attr.set 'sorted [1 2 3]))

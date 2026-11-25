@@ -292,12 +292,12 @@ static test_result_t test_index_hash_attach_drop(void) {
     /* CSR slice for key 7: rows 0 and 2 (both store 7), ascending. */
     ray_idx_rows_t grows = { NULL, false };
     int64_t gn = 0;
-    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 7, &grows, &gn), 1);
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 7, &grows, &gn, NULL), 1);
     TEST_ASSERT_EQ_I(gn, 2);
     TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, 0), 0);
     TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, 1), 2);
     /* Absent key → provable miss. */
-    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 42, &grows, &gn), 0);
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 42, &grows, &gn, NULL), 0);
 
     ray_index_drop(&w);
     aux_snap_t after = snap_take(w);
@@ -455,13 +455,13 @@ static test_result_t test_index_hash_large_parallel(void) {
     for (int64_t k = 0; k < kmax; k += 61) {
         ray_idx_rows_t grows = { NULL, false };
         int64_t gn = 0;
-        TEST_ASSERT_EQ_I(ray_index_hash_group(w, k - 17, &grows, &gn), 1);
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, k - 17, &grows, &gn, NULL), 1);
         TEST_ASSERT_EQ_I(gn, ref_cnt[gid_of_key[k]]);
     }
     {
         ray_idx_rows_t grows = { NULL, false };
         int64_t gn = 0;
-        TEST_ASSERT_EQ_I(ray_index_hash_group(w, kmax + 1000, &grows, &gn), 0);
+        TEST_ASSERT_EQ_I(ray_index_hash_group(w, kmax + 1000, &grows, &gn, NULL), 0);
     }
 
     ray_sys_free(gid_of_key); ray_sys_free(ref_key); ray_sys_free(ref_cnt);
@@ -678,7 +678,7 @@ static test_result_t idx_narrow_check(ray_t* col, int64_t n, int64_t keys) {
         int64_t want = k < keys ? k : -1;
         TEST_ASSERT_EQ_I(ray_index_find_row(col, k), want);
         ray_idx_rows_t rows = { NULL, false }; int64_t gn = 0;
-        int hit = ray_index_hash_group(col, k, &rows, &gn);
+        int hit = ray_index_hash_group(col, k, &rows, &gn, NULL);
         if (k >= keys) { TEST_ASSERT_EQ_I(hit, 0); continue; }
         TEST_ASSERT_EQ_I(hit, 1);
         TEST_ASSERT_EQ_I(gn, (n - 1 - k) / keys + 1);
@@ -3405,7 +3405,7 @@ static test_result_t test_index_hash_collisions(void) {
     /* One CSR group holding rows 0..4 in ascending order. */
     ray_idx_rows_t grows = { NULL, false };
     int64_t gn = 0;
-    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 5, &grows, &gn), 1);
+    TEST_ASSERT_EQ_I(ray_index_hash_group(w, 5, &grows, &gn, NULL), 1);
     TEST_ASSERT_EQ_I(gn, 5);
     for (int64_t i = 0; i < 5; i++)
         TEST_ASSERT_EQ_I(ray_idx_rows_at(grows, i), i);
@@ -4619,7 +4619,14 @@ static test_result_t test_index_hash_eq_rowsel_stale(void) {
  * most 256 values and a two-byte one 65536, so appending 1M rows to an
  * indexed U8 or I16 column stages no more groups than that, not 20 bytes
  * for every row appended (a count whose bytes can also wrap a 32-bit
- * size_t).  The extended index answers every value's first row. */
+ * size_t).  The extended index answers every value's first row.
+ *
+ * Every repeated row is now held (#595): in the delta (an entry and a share
+ * of its group table, grown by doubling) until it is past half the
+ * CSR rows, then folded, old and new narrow row arrays live at once.  The
+ * bound allows 32 bytes a row for that.  Measured: 18.9 MB (U8) and 38.3 MB
+ * (I16) for this append, against 66 MB for building the same 1M-row index
+ * fresh with .idx.hash. */
 static test_result_t test_index_hash_append_narrow_scratch(void) {
     ray_heap_init();
     const int64_t add = INT64_C(1) << 20;
@@ -4664,7 +4671,7 @@ static test_result_t test_index_hash_append_narrow_scratch(void) {
         TEST_ASSERT_EQ_I(w->len, add + 2);
         TEST_ASSERT_EQ_I(ray_index_kind(w), RAY_IDX_HASH);
         TEST_ASSERT_EQ_I(ray_index_payload(w->index)->u.hash.n_groups, groups);
-        TEST_ASSERT_FMT(mt.peak_live_bytes <= (uint64_t)add * (uint64_t)esz * 6,
+        TEST_ASSERT_FMT(mt.peak_live_bytes <= (uint64_t)add * ((uint64_t)esz * 6 + 32),
                         "type %d: peak %llu bytes appending %lld rows of %d bytes", t,
                         (unsigned long long)mt.peak_live_bytes, (long long)add, esz);
         int64_t bad = 0;
@@ -4682,9 +4689,81 @@ static test_result_t test_index_hash_append_narrow_scratch(void) {
     PASS();
 }
 
+
+/* #595: rows appended under keys the index holds go to its delta, and every
+ * key's rows read back through ray_index_hash_group (slice + delta) are the
+ * rows a scan finds, in ascending order — across batches that cross the
+ * fold threshold, a shared copy (append_take copies the index, delta
+ * included, and leaves the other holder's as it was), the concat carry and
+ * the folded copy a save writes.  Releasing everything returns every byte. */
+static bool delta_rows_ok(ray_t* v, int64_t nkeys) {
+    const int64_t* d = (const int64_t*)ray_data(v);
+    for (int64_t k = 0; k < nkeys; k++) {
+        ray_idx_rows_t rows; int64_t n = 0; ray_t* hold = NULL;
+        int hit = ray_index_hash_group(v, k, &rows, &n, &hold);
+        int64_t j = 0;
+        bool ok = hit >= 0;
+        for (int64_t i = 0; ok && i < v->len; i++)
+            if (d[i] == k) ok = j < n && ray_idx_rows_at(rows, j++) == i;
+        if (ok) ok = j == n && (hit == 1) == (n > 0);
+        if (hold) ray_release(hold);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static test_result_t test_index_hash_delta_rows(void) {
+    ray_heap_init();
+    ray_mem_trace_t mt;
+    TEST_ASSERT_TRUE(ray_mem_trace_begin());
+    const int64_t nk = 97;
+    ray_t* v = ray_vec_new(RAY_I64, 1000);
+    TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+    for (int64_t i = 0; i < 1000; i++) ((int64_t*)ray_data(v))[i] = (i * 13) % 50;
+    v->len = 1000;
+    ray_t* r = ray_index_attach_hash(&v);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_t* other = NULL;
+    int64_t buf[700];
+    bool folded = false;
+    for (int b = 0; b < 40; b++) {
+        /* repeats of held keys, and new keys 50..96 over time */
+        for (int64_t i = 0; i < 700; i++) buf[i] = (i * 7 + b * 3) % (50 + b + 7 > nk ? nk : 50 + b + 7);
+        if (b == 5) { other = v; ray_retain(other); }   /* shared from here: copied once */
+        v = ray_vec_append_raw(v, buf, 700);
+        TEST_ASSERT_TRUE(v && !RAY_IS_ERR(v));
+        TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_HASH);
+        ray_index_t* ix = ray_index_payload(v->index);
+        TEST_ASSERT_EQ_I(ix->u.hash.n_keys + ray_index_hash_delta_rows(ix), v->len);
+        if (ray_index_hash_delta_rows(ix) < 700) folded = true;
+        TEST_ASSERT_TRUE(ray_index_hash_delta_rows(ix) <= 4096 + 700 ||
+                         ray_index_hash_delta_rows(ix) <= v->len / 2 + 700);
+        if (b % 7 == 0) TEST_ASSERT_TRUE(delta_rows_ok(v, nk + 1));
+    }
+    TEST_ASSERT_TRUE(folded);
+    TEST_ASSERT_TRUE(delta_rows_ok(v, nk + 1));
+    /* the holder shared at batch 5 kept its own index */
+    TEST_ASSERT_EQ_I(other->len, 1000 + 5 * 700);
+    TEST_ASSERT_EQ_I(ray_index_payload(other->index)->built_for_len, other->len);
+    TEST_ASSERT_TRUE(delta_rows_ok(other, nk + 1));
+    /* the folded copy a writer takes: no delta, the same rows */
+    ray_t* full = ray_index_hash_rebuild(v);
+    TEST_ASSERT_TRUE(full != NULL);
+    TEST_ASSERT_TRUE(ray_index_hash_delta(ray_index_payload(full)) == NULL);
+    TEST_ASSERT_EQ_I(ray_index_payload(full)->u.hash.n_keys, v->len);
+    ray_release(full);
+    ray_release(other);
+    ray_release(v);
+    ray_mem_trace_end(&mt);
+    TEST_ASSERT_EQ_I(mt.net_bytes, 0);
+    ray_heap_destroy();
+    PASS();
+}
+
 const test_entry_t index_entries[] = {
     { "index/attach_drop_no_nulls",          test_index_attach_drop_no_nulls,          NULL, NULL },
     { "index/hash_append_narrow_scratch",    test_index_hash_append_narrow_scratch,   NULL, NULL },
+    { "index/hash_delta_rows",               test_index_hash_delta_rows,              NULL, NULL },
     { "index/attach_drop_with_inline_nulls", test_index_attach_drop_with_inline_nulls, NULL, NULL },
     { "index/attach_drop_large_sentinel_nulls", test_index_attach_drop_large_sentinel_nulls, NULL, NULL },
     { "index/replace_existing",              test_index_replace_existing,              NULL, NULL },

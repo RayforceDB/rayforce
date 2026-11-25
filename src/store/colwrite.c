@@ -139,13 +139,12 @@ static ray_err_t colw_gen2_vec(ray_t* vec, const char* path, bool durable, uint8
     ray_encw_t w;
     ray_err_t e = ray_encw_begin(&w, f, vec->type, vec->attrs, vec->len, sc, ik, cf);
     w.keep_dict = keep_dict;
-    /* A hash an append left first-row-only is not what a file may hold: the
-     * region is a complete one, built from the values (owned; the writer
-     * borrows it until ray_encw_free). */
+    /* A file holds no delta (#595): a hash carrying one is written with it
+     * folded in (owned; the writer borrows it until ray_encw_free). */
     ray_t* full = NULL;
     if (e == RAY_OK && region) {
         ray_t* root = vec->index;
-        if (ray_index_hash_first_only(vec)) {
+        if (ray_index_hash_has_delta(vec)) {
             full = ray_index_hash_rebuild(vec);
             if (!full) e = RAY_ERR_OOM;
             root = full;

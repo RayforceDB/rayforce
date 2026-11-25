@@ -2,12 +2,12 @@
 ;; (ray_vec_append_raw / ray_vec_append) and the rebuilding insert (concat's
 ;; carry) extend the column's index over the new rows instead of dropping it.
 ;;
-;; A new key becomes a group of its own.  A key the index already holds
-;; leaves it first-row-only: find / in / dict lookup still read it (a key's
-;; first row and its presence are exact), every other consult reads the
-;; column, `grouped` and `unique` are no longer claimed, and a save writes a
-;; complete index built from the values.  Every indexed answer is
-;; cross-checked against the same call on the plain column.
+;; A new key becomes a group of its own.  A row under a key the index already
+;; holds goes to its delta (#595): the index stays complete, every consult
+;; reads it, `grouped` stays claimed, `unique` goes, `.idx.info` counts the
+;; delta's rows in n_keys and in `delta`, and a save writes the index with
+;; its delta folded in.  Every indexed answer is cross-checked against the
+;; same call on the plain column.
 (.sys.exec "rm -rf /tmp/rf-idx-append")
 
 ;; ─────────────────────────── I64: in place, new keys ───────────────────────
@@ -30,23 +30,25 @@
 
 ;; ─────────────────────────── I64: a repeated key ───────────────────────────
 (insert 'ti (table ['k 'v] (list [5 6003] [10 11])))
-(at (.idx.info (at ti 'k)) 'first_only) -- true
+(at (.idx.info (at ti 'k)) 'delta) -- 1
+(at (.idx.info (at ti 'k)) 'n_keys) -- 6005
 (at (.idx.info (at ti 'k)) 'kind) -- 'hash
-(.attr.get (at ti 'k)) -- (.attr.get [1 2])
+(.attr.get (at ti 'k)) -- ['grouped]
 (find (at ti 'k) [5 6003 6004]) -- [5 6004 0N]
 (find (at ti 'k) [5 6003 6004]) -- (find (.idx.drop (at ti 'k)) [5 6003 6004])
 (in [5 6003 6004] (at ti 'k)) -- [true true false]
 (find (at ti 'k) 5) -- 5
-;; a filter reads the column: both rows of key 5
+;; a filter reads the index, its delta included: both rows of key 5
 (at (select {from: ti where: (== k 5)}) 'v) -- [5 10]
 (at (select {from: ti where: (in k [5 6003])}) 'v) -- [5 10 11]
 ;; new keys after a repeat still join the index
 (insert 'ti (table ['k 'v] (list [7000] [12])))
 (find (at ti 'k) [7000 5]) -- [6005 5]
-(at (.idx.info (at ti 'k)) 'first_only) -- true
-;; re-attaching builds a complete index again
+(at (.idx.info (at ti 'k)) 'delta) -- 1
+;; re-attaching builds the same index with no delta
 (.attr.get (.attr.set 'grouped (at ti 'k))) -- ['grouped]
-(nil? (at (.idx.info (.attr.set 'grouped (at ti 'k))) 'first_only)) -- true
+(at (.idx.info (.attr.set 'grouped (at ti 'k))) 'delta) -- 0
+(at (.idx.info (.attr.set 'grouped (at ti 'k))) 'n_keys) -- (at (.idx.info (at ti 'k)) 'n_keys)
 
 ;; ─────────────────────────── a null appended drops a numeric index ─────────
 (set tn (table ['k] (list (.idx.hash [1 2 3]))))
@@ -61,7 +63,8 @@
 (count (at ti 'k)) -- 6006
 ;; concat itself, past a repeated key
 (set cg (concat (.attr.set 'grouped [10 20 30]) [20 40]))
-(at (.idx.info cg) 'first_only) -- true
+(at (.idx.info cg) 'delta) -- 1
+(at (select {from: (table [k] (list cg)) where: (== k 20)}) 'k) -- [20 20]
 (find cg [20 40 50]) -- [1 4 0N]
 
 ;; ─────────────────────────── GUID: in place ────────────────────────────────
@@ -73,9 +76,9 @@
 (find (at tg 'k) (at g [4 0 7])) -- [4 0 0N]
 (insert 'tg (list (at g 5) 6))
 (find (at tg 'k) (at g [5])) -- [5]
-;; a repeated guid: first-row-only
+;; a repeated guid: into the delta
 (insert 'tg (table ['k 'v] (list (at g [1 6]) [7 8])))
-(at (.idx.info (at tg 'k)) 'first_only) -- true
+(at (.idx.info (at tg 'k)) 'delta) -- 1
 (find (at tg 'k) (at g [1 6 7])) -- [1 7 0N]
 (find (at tg 'k) (at g [1 6 7])) -- (find (.idx.drop (at tg 'k)) (at g [1 6 7]))
 (in (at g [1 6 7]) (at tg 'k)) -- [true true false]
@@ -150,7 +153,7 @@
 (.db.splayed.set "/tmp/rf-idx-append/i0/" ti)
 (set l0 (at (.db.splayed.get "/tmp/rf-idx-append/g0/") 'k))
 (.attr.get l0) -- ['grouped]
-(nil? (at (.idx.info l0) 'first_only)) -- true
+(at (.idx.info l0) 'delta) -- 0
 (at (.idx.info l0) 'n_keys) -- 9
 (find l0 (at g [1 6 7])) -- [1 7 0N]
 (at (select {from: (.db.splayed.get "/tmp/rf-idx-append/g0/") where: (in k (at g [1]))}) 'v) -- [2 7]
@@ -161,21 +164,22 @@
 (.attr.get li) -- ['grouped]
 (at (.idx.info li) 'n_keys) -- 6006
 (at (select {from: (.db.splayed.get "/tmp/rf-idx-append/i0/") where: (== k 5)}) 'v) -- [5 10]
-;; the in-memory index is left first-row-only by the save
-(at (.idx.info (at tg 'k)) 'first_only) -- true
+;; the in-memory index keeps its delta through the save
+(at (.idx.info (at tg 'k)) 'delta) -- 1
 ;; a STR column: in-place appends drop its hash, but concat carries one,
-;; and a repeat leaves it first-row-only; the save writes the complete one
+;; and a repeat goes to the delta; the save writes it folded
 (set tss (table ['s 'v] (list (concat (.idx.hash ["a" "b" "c"]) ["a" "d"]) [1 2 3 4 5])))
-(at (.idx.info (at tss 's)) 'first_only) -- true
-(at (.idx.info (at tss 's)) 'n_keys) -- 4
+(at (.idx.info (at tss 's)) 'delta) -- 1
+(at (.idx.info (at tss 's)) 'n_keys) -- 5
+(at (select {from: tss where: (in s ["a"])}) 'v) -- [1 4]
 (.db.splayed.set "/tmp/rf-idx-append/s0/" tss)
 (set ls (at (.db.splayed.get "/tmp/rf-idx-append/s0/") 's))
 (.idx.has? ls) -- true
 (at (.idx.info ls) 'n_keys) -- 5
-(nil? (at (.idx.info ls) 'first_only)) -- true
+(at (.idx.info ls) 'delta) -- 0
 (find ls ["a" "d" "c" "z"]) -- [0 4 2 0N]
 (at (select {from: (.db.splayed.get "/tmp/rf-idx-append/s0/") where: (in s ["a"])}) 'v) -- [1 4]
-(at (.idx.info (at tss 's)) 'first_only) -- true
+(at (.idx.info (at tss 's)) 'delta) -- 1
 
 ;; ─────────────────────────── a loaded column: its mapped index copied ──────
 (set tl (.db.splayed.get "/tmp/rf-idx-append/g0/"))

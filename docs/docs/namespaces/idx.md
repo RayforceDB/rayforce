@@ -35,7 +35,7 @@ Signature: `(.idx.zone v)`. Returns `v` with a zone index attached. `info` keys:
 
 ## `.idx.hash` { #idx-hash }
 
-Signature: `(.idx.hash v)`. Returns `v` with a hash index attached. `info` keys add `capacity` (next power of two ≥ length) and `n_keys` (distinct keys hashed).
+Signature: `(.idx.hash v)`. Returns `v` with a hash index attached. `info` keys add `capacity` (the bucket table's slots, a power of two), `n_keys` (rows indexed: every non-null row, a `GUID` column's null rows included), `n_groups` (distinct keys) and `delta` (rows an append added under a key the hash already held, waiting to be folded into its groups; 0 when none — see [Mutation Drops the Index](../queries/indexes.md#mutation-drops-the-index)).  `n_keys` counts the delta's rows, so it is the number a fresh `.idx.hash` of the same column reports.
 
 ## `.idx.sort` { #idx-sort }
 

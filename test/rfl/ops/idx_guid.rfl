@@ -71,8 +71,8 @@
 (.idx.has? c1) -- true
 (find c1 (at g [4 0 5])) -- [6 0 0N]
 (find c1 (at g [4 0 5])) -- (find (concat h (at g [4])) (at g [4 0 5]))
-;; a repeated key leaves it first-row-only (see ops/idx_append.rfl)
-(at (.idx.info (concat gi (at g [0]))) 'first_only) -- true
+;; a repeated key goes to the index's delta (see ops/idx_append.rfl)
+(at (.idx.info (concat gi (at g [0]))) 'delta) -- 1
 (find (concat gi (at g [0])) (at g [0 2])) -- [0 3]
 
 ;; ─────────────────────────── distinct: from the index, and without one ─────
@@ -84,9 +84,9 @@
 (distinct gz) -- (concat (at g [0 1 2 3]) [0Ng])
 (distinct hz) -- (concat (at g [0 1 2 3]) [0Ng])
 (count (distinct gz)) -- 5
-;; a first-row-only index still answers: its missing rows are repeats
+;; an index with a delta answers: a delta row repeats a key
 (set gf (concat gi (at g [5 0 4])))
-(at (.idx.info gf) 'first_only) -- true
+(at (.idx.info gf) 'delta) -- 1
 (distinct gf) -- (at g [0 1 2 3 5 4])
 (count (distinct gf)) -- 6
 ;; past 65536 rows: the parallel kernel unindexed, the groups indexed

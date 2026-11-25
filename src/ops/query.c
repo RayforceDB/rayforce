@@ -34263,12 +34263,14 @@ static int update_where_index_rows(ray_t* tbl, ray_t* where_expr,
     ray_release(v);
     if (!ok) return 0;
     ray_idx_rows_t ids = { NULL, false }; int64_t n = 0;
-    int hit = absent ? 0 : ray_index_hash_group(col, key, &ids, &n);
-    if (hit < 0) return 0;
+    ray_t* hold = NULL;                            /* a delta group's rows (#595) */
+    int hit = absent ? 0 : ray_index_hash_group(col, key, &ids, &n, &hold);
+    if (hit < 0) { if (hold) ray_release(hold); return 0; }
     if (absent) n = 0;                             /* not in the domain: no row */
     int64_t* out = (int64_t*)scratch_alloc(rows_hdr, (size_t)(n > 0 ? n : 1) * sizeof(int64_t));
-    if (!out) return 0;
+    if (!out) { if (hold) ray_release(hold); return 0; }
     for (int64_t i = 0; i < n; i++) out[i] = ray_idx_rows_at(ids, i);
+    if (hold) ray_release(hold);
     *rows = out; *n_out = n;
     return 1;
 }
@@ -39211,18 +39213,25 @@ static ray_t* upsert_apply_vectors(ray_t** slots, int64_t ncols,
             /* Grow the column by napp zeroed cells in one step, then gather
              * the new rows straight into the tail.  An append extends a
              * hash index over the cells it writes, the zeros here, so the
-             * index goes first. */
+             * hash is taken off first and extended over the moved cells
+             * after (#595); any other index goes, as any append drops it. */
+            ray_t* keep = NULL;
             if (ray_index_has(slots[c])) {
-                ray_t* col = slots[c];
-                col = ray_index_drop(&col);
-                if (!col || RAY_IS_ERR(col)) { err = col ? col : ray_error("oom", NULL); goto out; }
-                slots[c] = col;
+                keep = ray_index_append_take(slots[c]);
+                if (!keep && ray_index_has(slots[c])) {
+                    ray_t* col = slots[c];
+                    col = ray_index_drop(&col);
+                    if (!col || RAY_IS_ERR(col)) { err = col ? col : ray_error("oom", NULL); goto out; }
+                    slots[c] = col;
+                }
             }
             int64_t tail = slots[c]->len;
             ray_t* res = ray_vec_append_raw(slots[c], buf, napp);
-            if (RAY_IS_ERR(res)) { err = res; goto out; }
+            if (RAY_IS_ERR(res)) { if (keep) ray_release(keep); err = res; goto out; }
             slots[c] = res;
             upsert_vec_move(res, NULL, tail, src[c], app, napp);
+            /* best effort: a null or OOM leaves the column unindexed */
+            if (keep) ray_index_append_extend(res, keep, tail);
         }
     }
 

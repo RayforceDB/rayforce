@@ -804,6 +804,7 @@ static bool objsize_push_index_children(ray_objsize_walk_t* w, ray_index_t* ix) 
     case RAY_IDX_HASH:
         OBJSIZE_PUSH(ix->u.hash.table); OBJSIZE_PUSH(ix->u.hash.gkeys);
         OBJSIZE_PUSH(ix->u.hash.offs);  OBJSIZE_PUSH(ix->u.hash.rows);
+        if (ray_index_hash_delta(ix)) OBJSIZE_PUSH(ray_index_hash_delta(ix));
         break;
     case RAY_IDX_SORT:       OBJSIZE_PUSH(ix->u.sort.perm); break;
     case RAY_IDX_BLOOM:      OBJSIZE_PUSH(ix->u.bloom.bits); break;

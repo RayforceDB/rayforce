@@ -1681,6 +1681,9 @@ static void ray_detach_owned_refs(ray_t* v) {
         case RAY_IDX_HASH:
             ix->u.hash.table = ix->u.hash.gkeys = NULL;
             ix->u.hash.offs  = ix->u.hash.rows  = NULL;
+            /* the delta moved with the header (ray_index_delta_slot) */
+            v->index = NULL;
+            ix->markers &= (uint8_t)~RAY_MARK_HASH_DELTA;
             break;
         case RAY_IDX_SORT:  ix->u.sort.perm = NULL; break;
         case RAY_IDX_BLOOM: ix->u.bloom.bits = NULL; break;
@@ -4635,8 +4638,8 @@ static size_t index_own_bytes(const ray_t* idx) {
     ray_index_t* ix = ray_index_payload((ray_t*)idx);
     if (ix->markers & RAY_MARK_MMAP) return 0;
     size_t n = block_own_bytes(idx);
-    ray_t* kids[4];
-    int k = ray_index_child_blocks(ix, kids, 4);
+    ray_t* kids[5];
+    int k = ray_index_child_blocks(ix, kids, 5);
     for (int i = 0; i < k; i++) n += block_own_bytes(kids[i]);
     return n;
 }
@@ -4740,8 +4743,8 @@ static size_t retained_walk(const ray_t* root, ptrset_t* seen) {
             ray_index_t* ix = ray_index_payload((ray_t*)v);
             if (v->mmod == 1 || (ix->markers & RAY_MARK_MMAP)) continue;   /* a mapped index: none of it */
             n += own;
-            ray_t* kids[4];
-            int k = ray_index_child_blocks(ix, kids, 4);
+            ray_t* kids[5];
+            int k = ray_index_child_blocks(ix, kids, 5);
             for (int i = 0; i < k; i++) rw_push(&st, kids[i]);
             continue;
         }

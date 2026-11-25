@@ -121,13 +121,14 @@
 (set c2 (concat c1 600))
 (.attr.get c2) -- ['unique 'grouped]
 (find c2 [600 100]) -- [5 0]
-;; a repeated key is not carried: the result is a plain vector, as before
-(.attr.get (concat c0 [300 700])) -- (.attr.get [1 2])
+;; a repeated key: carried, the repeat in the index's delta (#595); `unique`
+;; goes, as a rebuild would find, `grouped` stays
+(.attr.get (concat c0 [300 700])) -- ['grouped]
 (find (concat c0 [300 700]) [300 700]) -- [2 4]
-;; grouped without unique: new keys carry, a repeat drops
+;; grouped without unique: new keys and repeats carry
 (.attr.get (concat gi [1 2 3])) -- ['grouped]
 (find (concat gi [1 2 3]) [3 10 1]) -- [12 0 10]
-(.attr.get (concat gi [10])) -- (.attr.get [1 2])
+(.attr.get (concat gi [10])) -- ['grouped]
 ;; many appends grow the bucket table past its load factor
 (set cg (concat (.attr.set 'grouped (til 5)) (+ 5 (til 2000))))
 (.attr.get cg) -- ['grouped]
@@ -139,7 +140,9 @@
 (set cs (concat gstr ["epsilon"]))
 (.attr.get cs) -- ['grouped]
 (find cs ["epsilon" "alpha"]) -- [6 0]
-(.attr.get (concat gstr ["alpha"])) -- (.attr.get [1 2])
+(.attr.get (concat gstr ["alpha"])) -- ['grouped]
+(at (.idx.info (concat gstr ["alpha"])) 'delta) -- 1
+(find (concat gstr ["alpha"]) ["alpha"]) -- [0]
 (set csy (concat gs ['d]))
 (.attr.get csy) -- ['grouped]
 (find csy ['d 'a 'z]) -- [6 0 0N]

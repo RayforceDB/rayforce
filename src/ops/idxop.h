@@ -48,6 +48,7 @@
  * ray_index_append_extend, below), as concat carries one onto its result.
  */
 
+#include <stddef.h>  /* offsetof: ray_index_delta_slot */
 #include <stdio.h>   /* FILE: ray_index_inline_write_file */
 #include <rayforce.h>
 #include "mem/heap.h"  /* RAY_ATTR_HAS_INDEX */
@@ -106,14 +107,15 @@ typedef enum {
  * table built before it.  Fixed for the life of the table: a rebuild picks
  * its own. */
 #define RAY_MARK_HASH_HIGH 0x04
-/* Hash index an append left holding each key's FIRST row only: an appended
- * row that repeated a key already held was not added to its group (adding
- * it would re-lay the CSR rows, O(n) per append).  Every key, and the first
- * row of each, is still exact, so find / in / dict lookup and distinct read
- * it (ray_index_find_*, ray_index_hash_first_rows); every other consumer
- * goes through idx_fresh, which treats it as stale.  A save rebuilds it from
- * the values, so it never reaches a file.  Cleared only by a rebuild. */
-#define RAY_MARK_FIRST_ONLY 0x08
+/* Hash index carrying a delta (#595): rows an append added under a key
+ * the CSR already holds, kept outside it so the CSR need not be re-laid
+ * per append.  A key's rows are its CSR slice followed by its delta chain
+ * (every delta row is past every CSR row of its key, so the whole list
+ * ascends).  The delta lives in the RAY_INDEX block's own header (see
+ * ray_index_delta_slot), never in ray_index_t, whose bytes are persisted;
+ * a save folds it first, so it never reaches a file.  Set exactly while
+ * that header slot holds a delta block. */
+#define RAY_MARK_HASH_DELTA 0x08
 
 /* The payload stored inside data[] of a RAY_INDEX ray_t. */
 typedef struct {
@@ -264,6 +266,20 @@ _Static_assert(sizeof(ray_index_t) % 32 == 0,
 static inline ray_index_t* ray_index_payload(ray_t* idx) {
     return (ray_index_t*)idx->data;
 }
+
+/* The header slot of the RAY_INDEX block holding `ix` that carries a hash
+ * index's delta (bytes 0-7 of the block's own aux, unused otherwise; a
+ * persisted region writes a zeroed header).  Read it only under
+ * RAY_MARK_HASH_DELTA: a ray_index_t copied out of its block has no slot. */
+static inline ray_t** ray_index_delta_slot(ray_index_t* ix) {
+    return &((ray_t*)((uint8_t*)ix - offsetof(ray_t, data)))->index;
+}
+static inline ray_t* ray_index_hash_delta(const ray_index_t* ix) {
+    return (ix->kind == RAY_IDX_HASH && (ix->markers & RAY_MARK_HASH_DELTA))
+        ? *ray_index_delta_slot((ray_index_t*)ix) : NULL;
+}
+/* Rows a hash index's delta holds (0 without one). */
+int64_t ray_index_hash_delta_rows(const ray_index_t* ix);
 
 /* The 64-bit mix every hash index uses (builder, probes, and the
  * generation-2 validator). */
@@ -854,8 +870,8 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec);
  *   -2    → not eligible; caller falls back to the scan.
  *
  * Uses idx_fresh_nonull: null-bearing columns fall back (-2) so the
- * scan correctly surfaces null-equality searches.  A first-row-only index
- * (RAY_MARK_FIRST_ONLY) answers: the first row is all it returns. */
+ * scan correctly surfaces null-equality searches.  A key's first row is
+ * its CSR slice's first, a delta (RAY_MARK_HASH_DELTA) never holds it. */
 int64_t ray_index_find_row(ray_t* col, int64_t key);
 
 /* ===== Hash-index find: one atom / a vector of needles =====
@@ -873,7 +889,7 @@ int64_t ray_index_find_row(ray_t* col, int64_t key);
  * Returns 1 when handled, 0 when not eligible (out is then unspecified and
  * the caller builds its own hash).  Integer-family needles for an
  * integer-family column, SYM for SYM (any domain), STR for STR, GUID for
- * GUID.  Both read a first-row-only index (RAY_MARK_FIRST_ONLY). */
+ * GUID.  Both read the CSR only: a key's first row is never in the delta. */
 int64_t ray_index_find_atom(ray_t* col, ray_t* atom);
 int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss);
 
@@ -884,7 +900,7 @@ int ray_index_find_vec(ray_t* col, ray_t* needles, int64_t* out, bool* any_miss)
  * fresh hash index (null-free unless SYM or GUID), dst gets one extended
  * over the tail in O(groups + appended) without re-hashing the old rows
  * (ray_index_append_extend's rules: a new key adds a group, a repeated key
- * leaves the index first-row-only).  A STR column, a SYM domain change, a
+ * goes to the delta).  A STR column, a SYM domain change, a
  * null appended to a numeric column or OOM leave dst unindexed (the caller
  * re-attaches if it wants one).  Best-effort: never fails the append. */
 void ray_index_carry_append(ray_t* src, ray_t* dst);
@@ -906,20 +922,23 @@ void ray_index_carry_append(ray_t* src, ray_t* dst);
  * if any, is then still attached for the caller to drop.
  *
  * ray_index_append_extend probes each appended row once: a new key becomes
- * a new single-row group; a key already held leaves the index
- * RAY_MARK_FIRST_ONLY (and clears `unique` and the within-group order).  A
+ * a new single-row group; a row under a key already held is entered in
+ * the index's delta (RAY_MARK_HASH_DELTA; it clears `unique` and the
+ * within-group order), which is folded into the CSR once it holds more
+ * than max(4096, CSR rows / 2) rows.  A
  * null appended to a numeric column, or OOM, releases the index instead (v
  * stays unindexed, as every append left it before).  Never fails the append. */
 ray_t* ray_index_append_take(ray_t* v);
 void   ray_index_append_extend(ray_t* v, ray_t* idx, int64_t n0);
 
-/* Is `col`'s attached index a hash that an append left first-row-only? */
-bool ray_index_hash_first_only(const ray_t* col);
+/* Does `col`'s attached index carry a delta (a hash an append extended
+ * under a key it already held)? */
+bool ray_index_hash_has_delta(const ray_t* col);
 
-/* A complete hash index over `col`'s values, for a writer that must not
- * persist the first-row-only one `col` carries: an owned, unattached
- * RAY_INDEX block whose saved aux is the attached index's (`col` itself is
- * left as it is).  NULL when `col` carries no hash, or on OOM / cancel. */
+/* The hash index `col` carries with its delta folded into the CSR, for a
+ * writer (a file holds no delta): an owned, unattached RAY_INDEX block whose
+ * saved aux is the attached index's (`col` itself is left as it is).  NULL
+ * when `col` carries no hash, or on OOM / cancel. */
 ray_t* ray_index_hash_rebuild(ray_t* col);
 
 /* Row ids borrowed from a hash index: 64-bit, or unsigned 32-bit when the
@@ -948,11 +967,16 @@ static inline ray_idx_rows_t ray_idx_rows_from(ray_idx_rows_t r, int64_t off) {
  *
  * Returns:
  *    1 → hit: *rows_out holds the ascending row ids, *n_out the size.
- *        The slice borrows the index payload — valid while the index is.
+ *        The slice borrows the index payload — valid while the index is —
+ *        unless the key has rows in the index's delta: then its rows are
+ *        copied into a vector appended to *hold (a RAY_LIST made on first
+ *        use; the caller releases *hold, when set, once done with every
+ *        slice it was given).  `hold` NULL: such a key is not eligible.
  *    0 → key provably absent (rows_out->p NULL, *n_out 0).
- *   -1 → not eligible (no fresh hash index / bad key) — caller falls back. */
+ *   -1 → not eligible (no fresh hash index / bad key / OOM) — caller falls
+ *        back. */
 int ray_index_hash_group(ray_t* col, int64_t key,
-                         ray_idx_rows_t* rows_out, int64_t* n_out);
+                         ray_idx_rows_t* rows_out, int64_t* n_out, ray_t** hold);
 
 /* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
 ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
@@ -1037,8 +1061,7 @@ ray_t* ray_index_distinct_ids(ray_t* col, int64_t* out_count);
  *
  * A GUID hash keys every row, the zero guid included, so its groups are the
  * column's distinct values and each group's first row is that value's first
- * occurrence — also in a first-row-only index (RAY_MARK_FIRST_ONLY), whose
- * missing rows are repeats.
+ * occurrence, which is always in the CSR (a delta row repeats its key).
  *
  * ray_index_hash_first_rows: a RAY_I64 vector of those first rows in
  * ascending order (distinct's first-appearance order), or NULL when `col`

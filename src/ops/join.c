@@ -3200,13 +3200,15 @@ static int asof_part_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
     return 1;
 }
 
-static int asof_index_group(ray_t* col, int64_t key, asof_idx_slice_t* out) {
+/* `hold` keeps a hash group's rows copied out of its delta (#595); the
+ * caller releases it once done with every slice. */
+static int asof_index_group(ray_t* col, int64_t key, asof_idx_slice_t* out, ray_t** hold) {
     out->rows = (ray_idx_rows_t){ NULL, false };
     out->start = 0;
     out->n = 0;
     out->contig = 0;
     if (ray_index_kind(col) == RAY_IDX_HASH) {
-        int hit = ray_index_hash_group(col, key, &out->rows, &out->n);
+        int hit = ray_index_hash_group(col, key, &out->rows, &out->n, hold);
         out->contig = 0;
         return hit;
     }
@@ -3519,6 +3521,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
         ray_idx_consults[IDX_SITE_ASOF]++;
         bool served = true;
         ray_t* gsl_hdr = NULL;
+        ray_t* gsl_hold = NULL;
         asof_idx_slice_t* gsl = (asof_idx_slice_t*)scratch_alloc(&gsl_hdr,
                            (size_t)(n_groups > 0 ? n_groups : 1) *
                            sizeof(asof_idx_slice_t));
@@ -3535,7 +3538,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
             /* counts the route decision, not a served use (the variant may still bail) */
             if (idx_ordered) ray_idx_consults[IDX_SITE_ASOF_ORDERED]++;
             for (int32_t g = 0; g < n_groups && served; g++) {
-                int hit = asof_index_group(rt_eq[0], gkeys[g], &gsl[g]);
+                int hit = asof_index_group(rt_eq[0], gkeys[g], &gsl[g], &gsl_hold);
                 if (hit < 0) { served = false; break; }  /* ineligible */
                 verify_rows += gsl[g].n;
             }
@@ -3562,10 +3565,12 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 else
                     asof_idx_match_fn(&mctx, 0, 0, left_n);
                 scratch_free(gsl_hdr);
+                if (gsl_hold) ray_release(gsl_hold);
                 goto done;
             }
         }
         scratch_free(gsl_hdr);
+        if (gsl_hold) ray_release(gsl_hold);
         /* ineligible / OOM — fall through to the scan variants */
     }
 
@@ -3591,7 +3596,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
         while (fcap < (uint64_t)n_groups * 2u) fcap <<= 1;
         uint64_t fmask = fcap - 1;
         ray_t *ftab_hdr = NULL, *fhead_hdr = NULL, *fnext_hdr = NULL,
-              *fgid_hdr = NULL, *fsl_hdr = NULL;
+              *fgid_hdr = NULL, *fsl_hdr = NULL, *fsl_hold = NULL;
         ray_t *lcnt_hdr = NULL, *ls_hdr = NULL, *cur_hdr = NULL,
               *prev_hdr = NULL;
         int32_t* ftab    = (int32_t*)scratch_alloc(&ftab_hdr, fcap * 4);
@@ -3653,7 +3658,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 int32_t rep = fk_head[f];
                 int hit = asof_index_group(rt_eq[0],
                                            gkeys[(int64_t)rep * n_eq],
-                                           &fsl[f]);
+                                           &fsl[f], &fsl_hold);
                 if (hit < 0) { served = false; break; }   /* ineligible */
                 /* The cursor merge needs ascending time along the walk;
                  * globally sorted right time implies it, otherwise verify
@@ -3708,6 +3713,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                     scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
                     scratch_free(fnext_hdr); scratch_free(fgid_hdr);
                     scratch_free(fsl_hdr);
+                    if (fsl_hold) ray_release(fsl_hold);
                     scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
                     scratch_free(prev_hdr);  scratch_free(ls_hdr);
                     goto done;
@@ -3791,6 +3797,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
                 scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
                 scratch_free(fnext_hdr); scratch_free(fgid_hdr);
                 scratch_free(fsl_hdr);
+                if (fsl_hold) ray_release(fsl_hold);
                 scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
                 scratch_free(prev_hdr);  scratch_free(ls_hdr);
                 goto done;
@@ -3799,6 +3806,7 @@ static bool asof_hash_group_match(uint32_t n_eq,
         scratch_free(ftab_hdr);  scratch_free(fhead_hdr);
         scratch_free(fnext_hdr); scratch_free(fgid_hdr);
         scratch_free(fsl_hdr);
+        if (fsl_hold) ray_release(fsl_hold);
         scratch_free(lcnt_hdr);  scratch_free(cur_hdr);
         scratch_free(prev_hdr);  scratch_free(ls_hdr);
         /* ineligible / dense / OOM — fall through to the scan variants */

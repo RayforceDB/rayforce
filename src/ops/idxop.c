@@ -389,6 +389,7 @@ static ray_t* ray_index_alloc(ray_idx_kind_t kind, int8_t parent_type, int64_t p
     idx->attrs = 0;
     idx->len   = (int64_t)sizeof(ray_index_t);
     memset(idx->data, 0, sizeof(ray_index_t));
+    idx->index = NULL;   /* a hash index's delta slot (ray_index_delta_slot) */
     ray_index_t* ix = ray_index_payload(idx);
     ix->kind         = (uint8_t)kind;
     ix->parent_type  = parent_type;
@@ -502,6 +503,12 @@ void ray_index_release_payload(ray_index_t* ix) {
             ray_release(ix->u.hash.rows);
         ix->u.hash.table = ix->u.hash.gkeys = NULL;
         ix->u.hash.offs  = ix->u.hash.rows  = NULL;
+        if (ix->markers & RAY_MARK_HASH_DELTA) {
+            ray_t** ds = ray_index_delta_slot(ix);
+            if (*ds && !RAY_IS_ERR(*ds)) ray_release(*ds);
+            *ds = NULL;
+            ix->markers &= (uint8_t)~RAY_MARK_HASH_DELTA;
+        }
         break;
     case RAY_IDX_SORT:
         if (ix->u.sort.perm && !RAY_IS_ERR(ix->u.sort.perm))
@@ -545,12 +552,13 @@ void ray_index_release_payload(ray_index_t* ix) {
 }
 
 int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
-    ray_t* c[4] = { NULL, NULL, NULL, NULL };
+    ray_t* c[5] = { NULL, NULL, NULL, NULL, NULL };
     switch ((ray_idx_kind_t)ix->kind) {
     case RAY_IDX_UKEY:       c[0] = ix->u.ukey.slots; break;
     case RAY_IDX_HASH:
         c[0] = ix->u.hash.table; c[1] = ix->u.hash.gkeys;
         c[2] = ix->u.hash.offs;  c[3] = ix->u.hash.rows;
+        c[4] = ray_index_hash_delta(ix);
         break;
     case RAY_IDX_SORT:       c[0] = ix->u.sort.perm; break;
     case RAY_IDX_BLOOM:      c[0] = ix->u.bloom.bits; break;
@@ -569,7 +577,7 @@ int ray_index_child_blocks(const ray_index_t* ix, ray_t** out, int cap) {
         break;
     }
     int n = 0;
-    for (int i = 0; i < 4 && n < cap; i++)
+    for (int i = 0; i < 5 && n < cap; i++)
         if (c[i] && !RAY_IS_ERR(c[i])) out[n++] = c[i];
     return n;
 }
@@ -589,6 +597,7 @@ void ray_index_retain_payload(ray_index_t* ix) {
             ray_retain(ix->u.hash.offs);
         if (ix->u.hash.rows && !RAY_IS_ERR(ix->u.hash.rows))
             ray_retain(ix->u.hash.rows);
+        if (ray_index_hash_delta(ix)) ray_retain(ray_index_hash_delta(ix));
         break;
     case RAY_IDX_SORT:
         if (ix->u.sort.perm && !RAY_IS_ERR(ix->u.sort.perm))
@@ -636,6 +645,7 @@ static ray_t* clone_index_block(ray_t* blk) {
     if (!nb || RAY_IS_ERR(nb)) return nb ? nb : ray_error("oom", NULL);
     ray_index_t* dst = ray_index_payload(nb);
     memcpy(dst, src, sizeof(ray_index_t));   /* kind, markers, saved_aux, union */
+    *ray_index_delta_slot(dst) = ray_index_hash_delta(src);   /* shared with src */
     ray_index_retain_payload(dst);           /* child vectors now referenced twice */
     ray_index_retain_saved(dst);             /* no-op for numeric, kept symmetric */
     return nb;
@@ -1731,6 +1741,352 @@ static void hx_narrow_payload(ray_index_t* ix) {
     ix->u.hash.offs  = hx_narrow(ix->u.hash.offs,  ix->u.hash.n_keys);
     ix->u.hash.rows  = hx_narrow(ix->u.hash.rows,  ix->built_for_len);
 }
+
+/* ---- Hash index delta (#595) -----------------------------------------------
+ *
+ * Rows an append adds under a key the CSR already holds are entered here
+ * instead of in the CSR (which would re-lay every later key's slice).  One
+ * RAY_I64 block, hung off the RAY_INDEX block's header (ray_index_delta_slot,
+ * RAY_MARK_HASH_DELTA):
+ *
+ *   w[0] n        entries
+ *   w[1] cap      entry capacity
+ *   w[2] tmask    group-table slots - 1 (a power of two)
+ *   w[3] tn       groups the table holds
+ *   w[4] dense    1: slot = group id (a hash with at most HXD_DENSE_MAX
+ *                 groups when the delta was made), 0: open addressing
+ *   erow[cap]     row id of each entry, in append (= ascending row) order
+ *   enext[cap]    the next entry of the same group (its tail's is unused:
+ *                 a chain is read by its count)
+ *   egid[cap]     the group of each entry (a fold reads the entries in
+ *                 order instead of walking each group's chain, whose
+ *                 steps are cache misses)
+ *   tab[4*slots]  per slot: group id + 1 (0 = empty), head, tail, count
+ *
+ * The entry arrays are 32-bit (12 bytes an entry): an index is extended
+ * only below 2^32 rows (hash_extend), and group ids and entries stay below
+ * the row count.  cap is a power of two of at least 64, so the table that
+ * follows them starts on a word.
+ *
+ * The table is keyed by GROUP id: every key with delta rows is a CSR group
+ * (a new key becomes a group of its own first), and every reader resolves a
+ * key to its group through the CSR's table anyway, so the delta is one more
+ * slot probe and is never hashed by key.  A group's rows are its CSR slice
+ * then its chain; a chain row was appended after every row of the slice, so
+ * the whole list ascends.
+ *
+ * Only the appending writer changes a delta, and only one it holds alone
+ * (ray_index_append_take copies a shared index first, delta included); a
+ * reader — another binding, a running query, its pool workers — only ever
+ * sees a delta that no longer changes.  Folded into the CSR (hx_fold) once
+ * it holds more than max(HXD_FOLD_MIN, CSR rows / HXD_FOLD_DIV) rows: one
+ * O(rows + groups) pass after at least half the rows were appended, so
+ * about three row copies per appended row, amortized.  Half, not less: a
+ * fold's copy is most of what an append costs beyond the probe the index
+ * always paid, and at a quarter a feed's appends paid about twice the
+ * fold cost of a half.  At most 12 bytes an entry, so a delta stays within 6 bytes per
+ * indexed row. */
+
+#define HXD_HDR      5
+#define HXD_FOLD_MIN 4096
+#define HXD_FOLD_DIV 2
+/* A delta whose index has at most this many groups when it is made is
+ * dense: a group's slot is its id, so an append addresses it without a
+ * hash or a probe.  A dense table grows by doubling with the group ids a
+ * later append adds; a sparse one is never larger than twice its groups. */
+#define HXD_DENSE_MAX 65536
+
+static inline int64_t* hxd_w(const ray_t* d) { return (int64_t*)ray_data((ray_t*)d); }
+static inline uint32_t* hxd_erow(int64_t* w)  { return (uint32_t*)(w + HXD_HDR); }
+static inline uint32_t* hxd_enext(int64_t* w) { return hxd_erow(w) + w[1]; }
+static inline uint32_t* hxd_egid(int64_t* w)  { return hxd_erow(w) + 2 * w[1]; }
+static inline int64_t* hxd_tab(int64_t* w)    { return w + HXD_HDR + 3 * w[1] / 2; }
+
+int64_t ray_index_hash_delta_rows(const ray_index_t* ix) {
+    ray_t* d = ray_index_hash_delta(ix);
+    return d ? hxd_w(d)[0] : 0;
+}
+
+/* Table slot of group `gid`, or -1. */
+static inline int64_t hxd_slot(int64_t* w, int64_t gid) {
+    const int64_t* tab = hxd_tab(w);
+    if (w[4]) return gid <= w[2] && tab[gid * 4] ? gid : -1;
+    uint64_t m = (uint64_t)w[2];
+    uint64_t s = mix64((uint64_t)gid) & m;
+    for (;;) {
+        int64_t g1 = tab[s * 4];
+        if (g1 == 0) return -1;
+        if (g1 == gid + 1) return (int64_t)s;
+        s = (s + 1) & m;
+    }
+}
+
+/* An empty delta of `cap` entries and `slots` table slots, or NULL (OOM). */
+static ray_t* hxd_new(int64_t cap, int64_t slots, bool dense) {
+    int64_t len = HXD_HDR + 3 * cap / 2 + 4 * slots;
+    ray_t* d = ray_vec_new(RAY_I64, len);
+    if (!d || RAY_IS_ERR(d)) { if (d) ray_error_free(d); return NULL; }
+    d->len = len;
+    int64_t* w = hxd_w(d);
+    w[0] = 0; w[1] = cap; w[2] = slots - 1; w[3] = 0; w[4] = dense;
+    memset(hxd_tab(w), 0, (size_t)slots * 4 * sizeof(int64_t));
+    return d;
+}
+
+/* `d` re-laid with room for `cap` entries and `slots` slots (each at least
+ * what it holds); NULL on OOM, `d` then unchanged. */
+static ray_t* hxd_grow(ray_t* d, int64_t cap, int64_t slots) {
+    int64_t* w = hxd_w(d);
+    ray_t* nd = hxd_new(cap, slots, w[4] != 0);
+    if (!nd) return NULL;
+    int64_t* nw = hxd_w(nd);
+    int64_t n = w[0];
+    memcpy(hxd_erow(nw), hxd_erow(w), (size_t)n * sizeof(uint32_t));
+    memcpy(hxd_enext(nw), hxd_enext(w), (size_t)n * sizeof(uint32_t));
+    memcpy(hxd_egid(nw), hxd_egid(w), (size_t)n * sizeof(uint32_t));
+    nw[0] = n; nw[3] = w[3];
+    const int64_t* tab = hxd_tab(w);
+    int64_t* ntab = hxd_tab(nw);
+    if (w[4]) {                              /* dense: same slots, more of them */
+        memcpy(ntab, tab, (size_t)(w[2] + 1) * 4 * sizeof(int64_t));
+        return nd;
+    }
+    uint64_t m = (uint64_t)nw[2];
+    for (int64_t s = 0; s <= w[2]; s++) {
+        if (tab[s * 4] == 0) continue;
+        uint64_t t = mix64((uint64_t)(tab[s * 4] - 1)) & m;
+        while (ntab[t * 4] != 0) t = (t + 1) & m;
+        memcpy(ntab + t * 4, tab + s * 4, 4 * sizeof(int64_t));
+    }
+    return nd;
+}
+
+static inline uint64_t hxd_pow2(uint64_t n) {
+    uint64_t p = 64;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+/* Enter row `row` under group `gid` in the delta of `ix` (an index the
+ * caller holds alone), making the delta on first use, `hint` rows expected
+ * (sizes its first allocation).  False on OOM. */
+static bool hxd_add(ray_index_t* ix, int64_t gid, int64_t row, int64_t hint) {
+    ray_t** ds = ray_index_delta_slot(ix);
+    ray_t* d = ray_index_hash_delta(ix);
+    if (!d) {
+        int64_t ng = ix->u.hash.n_groups > gid ? ix->u.hash.n_groups : gid + 1;
+        bool dense = ng <= HXD_DENSE_MAX;
+        d = hxd_new((int64_t)hxd_pow2((uint64_t)(hint > 0 ? hint : 1)),
+                    dense ? (int64_t)hxd_pow2((uint64_t)ng) : 64, dense);
+        if (!d) return false;
+        *ds = d;
+        ix->markers |= RAY_MARK_HASH_DELTA;
+    }
+    int64_t* w = hxd_w(d);
+    bool full = w[0] == w[1];
+    bool roomy = w[4] ? gid <= w[2] : (w[3] + 1) * 2 <= w[2] + 1;
+    if (__builtin_expect(full || !roomy, 0)) {
+        int64_t slots = w[2] + 1;
+        if (!roomy) slots = w[4] ? (int64_t)hxd_pow2((uint64_t)gid + 1) : slots * 2;
+        ray_t* nd = hxd_grow(d, full ? w[1] * 2 : w[1], slots);
+        if (!nd) return false;
+        ray_release(d);
+        *ds = d = nd;
+        w = hxd_w(d);
+    }
+    int64_t e = w[0]++;
+    uint32_t* enext = hxd_enext(w);
+    hxd_erow(w)[e] = (uint32_t)row;
+    hxd_egid(w)[e] = (uint32_t)gid;
+    int64_t* tab = hxd_tab(w);
+    int64_t s;
+    if (w[4]) {
+        s = gid;
+        if (tab[s * 4] == 0) {
+            tab[s * 4] = gid + 1; tab[s * 4 + 1] = e; tab[s * 4 + 2] = e; tab[s * 4 + 3] = 1;
+            w[3]++;
+            return true;
+        }
+    } else {
+        s = hxd_slot(w, gid);
+        if (s < 0) {
+            uint64_t m = (uint64_t)w[2];
+            uint64_t t = mix64((uint64_t)gid) & m;
+            while (tab[t * 4] != 0) t = (t + 1) & m;
+            tab[t * 4] = gid + 1; tab[t * 4 + 1] = e; tab[t * 4 + 2] = e; tab[t * 4 + 3] = 1;
+            w[3]++;
+            return true;
+        }
+    }
+    enext[tab[s * 4 + 2]] = (uint32_t)e;
+    tab[s * 4 + 2] = e;
+    tab[s * 4 + 3]++;
+    return true;
+}
+
+/* Delta rows of group `gid` (0 without), its first entry in *head. */
+static inline int64_t hx_dcount(const ray_index_t* ix, int64_t gid, int64_t* head) {
+    ray_t* d = ray_index_hash_delta(ix);
+    if (!d) return 0;
+    int64_t* w = hxd_w(d);
+    int64_t s = hxd_slot(w, gid);
+    if (s < 0) return 0;
+    if (head) *head = hxd_tab(w)[s * 4 + 1];
+    return hxd_tab(w)[s * 4 + 3];
+}
+
+/* Every row of group `gid`: its CSR slice plus its delta rows. */
+static inline int64_t hx_gsize(const ray_index_t* ix, int64_t gid) {
+    const ray_t* ofv = ix->u.hash.offs;
+    return hx_get(ofv, gid + 1) - hx_get(ofv, gid) + hx_dcount(ix, gid, NULL);
+}
+
+/* Write every row of group `gid`, ascending, to dst; returns the count. */
+static int64_t hx_gcopy(const ray_index_t* ix, int64_t gid, int64_t* dst) {
+    const ray_t* ofv = ix->u.hash.offs;
+    int64_t off = hx_get(ofv, gid), nb = hx_get(ofv, gid + 1) - off;
+    hx_copy_rows(dst, ix->u.hash.rows, off, nb);
+    int64_t head = -1;
+    int64_t nd = hx_dcount(ix, gid, &head);
+    if (nd > 0) {
+        int64_t* w = hxd_w(ray_index_hash_delta(ix));
+        const uint32_t* erow = hxd_erow(w);
+        const uint32_t* enext = hxd_enext(w);
+        for (int64_t e = head, i = 0; i < nd; i++) {
+            dst[nb + i] = (int64_t)erow[e];
+            if (i + 1 < nd) e = enext[e];
+        }
+    }
+    return nb + nd;
+}
+
+/* The rows of group `gid` as one ascending run: the CSR slice itself when
+ * the group has no delta rows, else a copy in a vector appended to *hold (a
+ * RAY_LIST made on first use; NULL hold declines).  False on OOM / decline. */
+static bool hx_gview(const ray_index_t* ix, int64_t gid, ray_idx_rows_t* rows,
+                     int64_t* n, ray_t** hold) {
+    const ray_t* ofv = ix->u.hash.offs;
+    int64_t nd = hx_dcount(ix, gid, NULL);
+    if (nd == 0) {
+        *rows = hx_rows(ix->u.hash.rows, hx_get(ofv, gid));
+        *n = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+        return true;
+    }
+    if (!hold) return false;
+    int64_t tot = hx_gsize(ix, gid);
+    ray_t* v = ray_vec_new(RAY_I64, tot);
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return false; }
+    v->len = hx_gcopy(ix, gid, (int64_t*)ray_data(v));
+    if (!*hold) {
+        ray_t* l = ray_list_new(4);
+        if (!l || RAY_IS_ERR(l)) { if (l) ray_error_free(l); ray_release(v); return false; }
+        *hold = l;
+    }
+    ray_t* l2 = ray_list_append(*hold, v);
+    ray_release(v);
+    if (!l2 || RAY_IS_ERR(l2)) { if (l2) ray_error_free(l2); return false; }
+    *hold = l2;
+    *rows = (ray_idx_rows_t){ ray_data(v), false };
+    *n = tot;
+    return true;
+}
+
+static bool hx_sole(const ray_t* v);
+
+typedef struct { int64_t gid, slot, cnt; } hxd_grp_t;
+static int hxd_grp_cmp(const void* a, const void* b) {
+    int64_t x = ((const hxd_grp_t*)a)->gid, y = ((const hxd_grp_t*)b)->gid;
+    return x < y ? -1 : x > y;
+}
+
+/* Fold the delta of `ix` (an index the caller holds alone) into its CSR:
+ * new offsets and rows, each group's slice followed by its delta rows, then
+ * the delta goes.  Runs of groups without delta rows are copied whole; the
+ * delta rows are then dealt to their groups in one pass over the entries
+ * (append order is row order, so each group's rows land ascending).  The
+ * child vectors keep their widths (an append already declined any row id or
+ * offset a narrow one cannot hold).  False on OOM, `ix` then unchanged.
+ * (Folding in place — growing the rows array and moving the runs up —
+ * measured slower: the overlapping moves and the reallocation's copy cost
+ * more than the fresh array.)
+ * `keep`: an appending writer's fold leaves the emptied delta block in
+ * place, so the next rows reuse it instead of re-growing it from scratch
+ * (fresh pages each time measured as much as the fold); it is never larger
+ * than the fold threshold made it.  A writer's copy drops it. */
+static bool hx_fold(ray_index_t* ix, bool keep) {
+    ray_t* d = ray_index_hash_delta(ix);
+    if (!d) return true;
+    int64_t* w = hxd_w(d);
+    int64_t ng = ix->u.hash.n_groups, nk0 = ix->u.hash.n_keys, dn = w[0], tn = w[3];
+    const ray_t* ofv = ix->u.hash.offs;
+    const ray_t* rwv = ix->u.hash.rows;
+    if (dn > 0) {
+        ray_t* grp_hdr = NULL;
+        hxd_grp_t* grp = (hxd_grp_t*)scratch_alloc(&grp_hdr, (size_t)(tn > 0 ? tn : 1) * sizeof(hxd_grp_t));
+        if (!grp) return false;
+        int64_t* wtab = hxd_tab(w);   /* the delta is the folder's: its tails turn cursors */
+        int64_t k = 0;
+        for (int64_t sl = 0; sl <= w[2]; sl++)
+            if (wtab[sl * 4]) grp[k++] = (hxd_grp_t){ wtab[sl * 4] - 1, sl, wtab[sl * 4 + 3] };
+        qsort(grp, (size_t)k, sizeof(hxd_grp_t), hxd_grp_cmp);
+        ray_t* no = ray_vec_new(ofv->type, ng + 1);
+        ray_t* nr = ray_vec_new(rwv->type, nk0 + dn);
+        if (!no || RAY_IS_ERR(no) || !nr || RAY_IS_ERR(nr)) {
+            if (no && !RAY_IS_ERR(no)) ray_release(no); else if (no) ray_error_free(no);
+            if (nr && !RAY_IS_ERR(nr)) ray_release(nr); else if (nr) ray_error_free(nr);
+            scratch_free(grp_hdr);
+            return false;
+        }
+        no->len = ng + 1;
+        nr->len = nk0 + dn;
+        size_t es = (size_t)ray_elem_size(rwv->type);
+        const uint8_t* orb = (const uint8_t*)ray_data((ray_t*)rwv);
+        uint8_t* nrb = (uint8_t*)ray_data(nr);
+        int64_t shift = 0, g0 = 0;
+        for (int64_t i = 0; i <= k; i++) {
+            /* groups [g0, g1] keep their slices, shifted; group g1 (when a
+             * delta group) then has room for its delta rows */
+            int64_t g1 = i < k ? grp[i].gid : ng - 1;
+            for (int64_t g = g0; g <= g1; g++) hx_set(no, g, hx_get(ofv, g) + shift);
+            int64_t lo = hx_get(ofv, g0), hi = hx_get(ofv, g1 + 1);
+            if (hi > lo) memcpy(nrb + (size_t)(lo + shift) * es, orb + (size_t)lo * es, (size_t)(hi - lo) * es);
+            if (i < k) {
+                wtab[grp[i].slot * 4 + 2] = hi + shift;
+                shift += grp[i].cnt;
+            }
+            g0 = g1 + 1;
+        }
+        hx_set(no, ng, nk0 + dn);
+        const uint32_t* erow = hxd_erow(w);
+        const uint32_t* egid = hxd_egid(w);
+        /* a dense delta's slot is the group id itself */
+        if (w[4] && nr->type == RAY_I32) {
+            uint32_t* o = (uint32_t*)nrb;
+            for (int64_t e = 0; e < dn; e++) o[wtab[(int64_t)egid[e] * 4 + 2]++] = erow[e];
+        } else if (nr->type == RAY_I32) {
+            uint32_t* o = (uint32_t*)nrb;
+            for (int64_t e = 0; e < dn; e++) o[wtab[hxd_slot(w, egid[e]) * 4 + 2]++] = erow[e];
+        } else {
+            int64_t* o = (int64_t*)nrb;
+            for (int64_t e = 0; e < dn; e++) o[wtab[hxd_slot(w, egid[e]) * 4 + 2]++] = (int64_t)erow[e];
+        }
+        scratch_free(grp_hdr);
+        ray_release(ix->u.hash.offs);
+        ray_release(ix->u.hash.rows);
+        ix->u.hash.offs = no;
+        ix->u.hash.rows = nr;
+        ix->u.hash.n_keys = nk0 + dn;
+    }
+    if (keep && hx_sole(d)) {
+        w[0] = 0; w[3] = 0;
+        memset(hxd_tab(w), 0, (size_t)(w[2] + 1) * 4 * sizeof(int64_t));
+        return true;
+    }
+    ray_release(d);
+    *ray_index_delta_slot(ix) = NULL;
+    ix->markers &= (uint8_t)~RAY_MARK_HASH_DELTA;
+    return true;
+}
 static uint8_t idx_format_of(const ray_index_t* ix) {
     if (ix->kind == RAY_IDX_HASH && (ix->markers & RAY_MARK_HASH_HIGH))
         return RAY_IDX_FORMAT_HASH_HIGH;
@@ -1751,6 +2107,9 @@ static uint8_t idx_format_of(const ray_index_t* ix) {
  * A SYM child's header holds this process's domain pointer at bytes 8-15;
  * the column file's symfile is the keys' domain on load, so none is kept. */
 static void idx_region_head_scrub(ray_index_t* on) {
+    /* a file holds no delta: a writer folds a non-empty one first, and an
+     * emptied one (a fold kept its block for the next appends) is nothing */
+    on->markers &= (uint8_t)~RAY_MARK_HASH_DELTA;
     if (on->kind == RAY_IDX_HASH) on->u.hash.order_sym = -1;
     else if (on->kind == RAY_IDX_PART) on->u.part.order_sym = -1;
 }
@@ -2884,9 +3243,19 @@ ray_t* ray_index_attach_hash(ray_t** vp) {
     return attach_finalize(v, idx);
 }
 
+static ray_t* hash_index_copy(const ray_index_t* sx);
+
 ray_t* ray_index_hash_rebuild(ray_t* v) {
     if (!v || RAY_IS_ERR(v) || ray_index_kind(v) != RAY_IDX_HASH) return NULL;
     const ray_index_t* ox = ray_index_payload(v->index);
+    /* A delta is folded on a private copy: one pass over the rows, no
+     * rehash.  The copy keeps the saved aux, attrs and markers. */
+    if (ray_index_hash_delta_rows(ox) > 0 && ox->built_for_len == v->len) {
+        ray_t* c = hash_index_copy(ox);
+        if (!c) return NULL;
+        if (!hx_fold(ray_index_payload(c), false)) { ray_release(c); return NULL; }
+        return c;
+    }
     ray_t* idx = hash_build_block(v);
     if (!idx || RAY_IS_ERR(idx)) { if (idx) ray_error_free(idx); return NULL; }
     ray_index_t* nx = ray_index_payload(idx);
@@ -2907,7 +3276,8 @@ static int hx_first_cmp(const void* a, const void* b) {
 bool ray_index_hash_legacy(const ray_index_t* ix, ray_t** table, ray_t** gkeys,
                            ray_t** offs, ray_t** rows) {
     *table = *gkeys = *offs = *rows = NULL;
-    if (!ix || ix->kind != RAY_IDX_HASH) return false;
+    /* a writer folds a delta first (ray_index_hash_rebuild) */
+    if (!ix || ix->kind != RAY_IDX_HASH || ray_index_hash_delta_rows(ix) > 0) return false;
     const ray_t *t = ix->u.hash.table, *gk = ix->u.hash.gkeys, *of = ix->u.hash.offs, *rw = ix->u.hash.rows;
     if (!t || RAY_IS_ERR(t) || !gk || RAY_IS_ERR(gk) || !of || RAY_IS_ERR(of) || !rw || RAY_IS_ERR(rw))
         return false;
@@ -3175,10 +3545,8 @@ static ray_index_t* hash_probe_setup_guid(ray_t* col, const uint8_t* p, int64_t*
  * must exclude null-bearing columns for semantic reasons (sort perm, range
  * scan) should add their own HAS_NULLS check.
  *
- * idx_fresh_any also admits a first-row-only hash (RAY_MARK_FIRST_ONLY),
- * whose groups miss the rows an append repeated a key in; only the
- * first-row consults (idx_find_fresh) may read one.  idx_fresh, the gate
- * of every other consult, refuses it. */
+ * A hash carrying a delta (RAY_MARK_HASH_DELTA) is as fresh as any: every
+ * consult reads a key's rows through hx_gsize / hx_gcopy / hx_gview. */
 static bool idx_fresh_any(ray_t* col, ray_idx_kind_t kind) {
     if (!col || RAY_IS_ERR(col)) return false;
     if (RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
@@ -3188,18 +3556,16 @@ static bool idx_fresh_any(ray_t* col, ray_idx_kind_t kind) {
 }
 
 static bool idx_fresh(ray_t* col, ray_idx_kind_t kind) {
-    return idx_fresh_any(col, kind) &&
-           !(ray_index_payload(col->index)->markers & RAY_MARK_FIRST_ONLY);
+    return idx_fresh_any(col, kind);
 }
 
-bool ray_index_hash_first_only(const ray_t* col) {
+bool ray_index_hash_has_delta(const ray_t* col) {
     return col && !RAY_IS_ERR(col) && ray_index_kind((ray_t*)col) == RAY_IDX_HASH &&
-           (ray_index_payload(col->index)->markers & RAY_MARK_FIRST_ONLY);
+           ray_index_hash_delta_rows(ray_index_payload(col->index)) > 0;
 }
 
 /* The freshness a find / in / dict probe of `col`'s hash needs — the key's
- * first row, or its presence, which a first-row-only index still holds.
- * SYM and GUID probes are sound beside null rows (a nonzero SYM id; GUID
+ * first row, or its presence, both in the CSR.  SYM and GUID probes are sound beside null rows (a nonzero SYM id; GUID
  * cells compare by their bytes), every other type wants a null-free
  * column. */
 static bool idx_find_fresh(ray_t* col) {
@@ -3221,7 +3587,8 @@ static bool idx_fresh_nonull(ray_t* col, ray_idx_kind_t kind) {
         /* Builders already counted non-null rows. Keep admission O(1)
          * instead of rescanning the column on each indexed lookup. */
         if (kind == RAY_IDX_HASH)
-            return ix->u.hash.rows && ix->u.hash.rows->len == col->len;
+            return ix->u.hash.rows &&
+                   ix->u.hash.rows->len + ray_index_hash_delta_rows(ix) == col->len;
         if (kind == RAY_IDX_BLOOM) return ix->u.bloom.n_keys == col->len;
         if (kind == RAY_IDX_ZONE) return ix->u.zone.n_nulls == 0;
         if (kind == RAY_IDX_PART) return true; /* builder rejects nulls */
@@ -3416,6 +3783,24 @@ ray_t* ray_index_empty_rowsel(int64_t n) {
     return rowsel_from_sorted_ids(n, NULL, 0);
 }
 
+/* The rowsel of group `gid`'s rows over a column of n rows: its CSR slice
+ * fed directly, or, with delta rows, slice and chain copied out first.
+ * NULL on OOM. */
+static ray_t* hx_group_rowsel(const ray_index_t* ix, int64_t n, int64_t gid) {
+    if (hx_dcount(ix, gid, NULL) == 0) {
+        const ray_t* ofv = ix->u.hash.offs;
+        return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)),
+                                       hx_get(ofv, gid + 1) - hx_get(ofv, gid));
+    }
+    ray_t* hdr = NULL;
+    int64_t* ids = (int64_t*)scratch_alloc(&hdr, (size_t)hx_gsize(ix, gid) * sizeof(int64_t));
+    if (!ids) return NULL;
+    int64_t m = hx_gcopy(ix, gid, ids);
+    ray_t* sel = rowsel_from_sorted_ids(n, ids, m);
+    scratch_free(hdr);
+    return sel;
+}
+
 ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
     /* Sanity precheck — idx_fresh validates parted/nulls/kind/staleness;
      * hash_probe_setup below also validates key-range, elem-size, and
@@ -3433,12 +3818,11 @@ ray_t* ray_index_hash_eq_rowsel(ray_t* col, int64_t key) {
      * it to the rowsel builder directly.  Group size is known up front;
      * a dense key (where the SIMD scan would win) returns NULL with zero
      * wasted work instead of the chain-walk budget the old layout needed. */
-    const ray_t* ofv = ix->u.hash.offs;
-    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    int64_t gsz = hx_gsize(ix, gid);
     if (gsz > 64 && gsz > (n >> 3))
         return NULL;   /* dense: fall through to the scan path */
 
-    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+    return hx_group_rowsel(ix, n, gid);
 }
 
 ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l) {
@@ -3452,11 +3836,10 @@ ray_t* ray_index_hash_eq_str_rowsel(ray_t* col, const char* p, size_t l) {
     if (!ix) return NULL;
     int64_t n = col->len;
     if (gid < 0) return rowsel_from_sorted_ids(n, NULL, 0);
-    const ray_t* ofv = ix->u.hash.offs;
-    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    int64_t gsz = hx_gsize(ix, gid);
     if (gsz > 64 && gsz > (n >> 3))
         return NULL;   /* dense: the scan wins, as for ray_index_hash_eq_rowsel */
-    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+    return hx_group_rowsel(ix, n, gid);
 }
 
 /* The all-zero GUID is the GUID null.  The builder keeps null GUID rows in
@@ -3476,11 +3859,10 @@ ray_t* ray_index_hash_eq_guid_rowsel(ray_t* col, const uint8_t* p) {
     if (!ix) return NULL;
     int64_t n = col->len;
     if (gid < 0) return rowsel_from_sorted_ids(n, NULL, 0);
-    const ray_t* ofv = ix->u.hash.offs;
-    int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    int64_t gsz = hx_gsize(ix, gid);
     if (gsz > 64 && gsz > (n >> 3))
         return NULL;   /* dense: the scan wins, as for ray_index_hash_eq_rowsel */
-    return rowsel_from_sorted_rows(n, hx_rows(ix->u.hash.rows, hx_get(ofv, gid)), gsz);
+    return hx_group_rowsel(ix, n, gid);
 }
 
 static _Atomic(uint64_t) g_enc_hash_probes;   /* test hook */
@@ -3838,8 +4220,6 @@ ray_t* ray_index_part_eq_rowsel(ray_t* col, int64_t key) {
  * scratch holding `gids`.  NULL when the union is dense or on OOM. */
 static ray_t* hash_in_rowsel_from_gids(ray_index_t* ix, int64_t n, const int64_t* gids,
                                        int64_t ngid, int64_t total, ray_t* gid_hdr) {
-    const ray_t* ofv = ix->u.hash.offs;
-    const ray_t* rwv = ix->u.hash.rows;
     /* Dense union: the SIMD membership scan wins — bail with zero waste.
      * Tighter than the eq probe's n/8: a multi-key union pays an
      * O(m log m) qsort the single-slice path doesn't. */
@@ -3859,10 +4239,7 @@ static ray_t* hash_in_rowsel_from_gids(ray_index_t* ix, int64_t n, const int64_t
     int64_t* matches = (int64_t*)ray_data(match_hdr);
     int64_t mcnt = 0;
     for (int64_t si = 0; si < ngid; si++) {
-        int64_t gid = gids[si];
-        int64_t gsz = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
-        hx_copy_rows(matches + mcnt, rwv, hx_get(ofv, gid), gsz);
-        mcnt += gsz;
+        mcnt += hx_gcopy(ix, gids[si], matches + mcnt);
     }
     scratch_free(gid_hdr);
     if (ngid > 1 && mcnt > 1)
@@ -3899,11 +4276,10 @@ static ray_t* str_in_rowsel(ray_t* col, ray_t* set_vec) {
     /* a needle given twice is one group: its rows once */
     qsort(gids, (size_t)ngid, sizeof(int64_t), cmp_i64_plain);
     int64_t total = 0, w = 0;
-    const ray_t* ofv = ix->u.hash.offs;
     for (int64_t i = 0; i < ngid; i++) {
         if (w > 0 && gids[i] == gids[w - 1]) continue;
         gids[w++] = gids[i];
-        total += hx_get(ofv, gids[i] + 1) - hx_get(ofv, gids[i]);
+        total += hx_gsize(ix, gids[i]);
     }
     return hash_in_rowsel_from_gids(ix, n, gids, w, total, gid_hdr);
 }
@@ -3932,11 +4308,10 @@ static ray_t* guid_in_rowsel(ray_t* col, ray_t* set_vec) {
     /* a needle given twice is one group: its rows once */
     qsort(gids, (size_t)ngid, sizeof(int64_t), cmp_i64_plain);
     int64_t total = 0, w = 0;
-    const ray_t* ofv = ix->u.hash.offs;
     for (int64_t i = 0; i < ngid; i++) {
         if (w > 0 && gids[i] == gids[w - 1]) continue;
         gids[w++] = gids[i];
-        total += hx_get(ofv, gids[i] + 1) - hx_get(ofv, gids[i]);
+        total += hx_gsize(ix, gids[i]);
     }
     return hash_in_rowsel_from_gids(ix, n, gids, w, total, gid_hdr);
 }
@@ -4079,7 +4454,6 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
     if (!gids) { ray_release(set_hdr); return NULL; }
 
     int64_t total = 0;
-    const ray_t* ofv = NULL;
     {
         ray_index_t* ix = ray_index_payload(col->index);
         if (!ix->u.hash.table || !ix->u.hash.gkeys ||
@@ -4088,7 +4462,6 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
             ray_release(set_hdr);
             return NULL;
         }
-        ofv = ix->u.hash.offs;
         int es = numeric_elem_size(col->type);
         int64_t ngid = 0;
         for (int64_t si = 0; si < set_len; si++) {
@@ -4107,7 +4480,7 @@ ray_t* ray_index_in_rowsel(ray_t* col, ray_t* set_vec) {
             }
             if (gid >= 0) {
                 gids[ngid++] = gid;
-                total += hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+                total += hx_gsize(ix, gid);
             }
         }
         set_len = ngid;
@@ -4919,16 +5292,15 @@ ray_t* ray_index_info(ray_t* v) {
     case RAY_IDX_HASH:
         r = dict_append_sym_i64(&keys, &vals, "capacity", (int64_t)(ix->u.hash.mask + 1));
         if (RAY_IS_ERR(r)) goto fail;
-        r = dict_append_sym_i64(&keys, &vals, "n_keys",   ix->u.hash.n_keys);
+        /* n_keys: every indexed row, CSR and delta, as a fresh build
+         * counts them; delta: the rows an append left to be folded in */
+        r = dict_append_sym_i64(&keys, &vals, "n_keys",
+                                ix->u.hash.n_keys + ray_index_hash_delta_rows(ix));
         if (RAY_IS_ERR(r)) goto fail;
         r = dict_append_sym_i64(&keys, &vals, "n_groups", ix->u.hash.n_groups);
         if (RAY_IS_ERR(r)) goto fail;
-        /* An append left it holding each key's first row only: find / in
-         * still read it, nothing else does (RAY_MARK_FIRST_ONLY). */
-        if (ix->markers & RAY_MARK_FIRST_ONLY) {
-            r = dict_append_sym_bool(&keys, &vals, "first_only", true);
-            if (RAY_IS_ERR(r)) goto fail;
-        }
+        r = dict_append_sym_i64(&keys, &vals, "delta", ray_index_hash_delta_rows(ix));
+        if (RAY_IS_ERR(r)) goto fail;
         break;
     case RAY_IDX_SORT:
         r = dict_append_sym_i64(&keys, &vals, "perm_len",
@@ -5185,7 +5557,7 @@ static ray_t* attach_backing_index_carry_markers(ray_t* v, ray_t* (*fn)(ray_t**)
     /* The rebuilt table keeps its own home rule, and holds every row. */
     uint8_t carry = (v && !RAY_IS_ERR(v) && ray_index_has(v))
                     ? (uint8_t)(ray_index_payload(v->index)->markers &
-                                ~(RAY_MARK_HASH_HIGH | RAY_MARK_FIRST_ONLY)) : 0;
+                                ~(RAY_MARK_HASH_HIGH | RAY_MARK_HASH_DELTA)) : 0;
     int64_t order_sym = index_order_sym(v);
     ray_t* w = attach_via(v, fn);
     if (w && !RAY_IS_ERR(w) && carry && (w->attrs & RAY_ATTR_HAS_INDEX))
@@ -5286,7 +5658,7 @@ static ray_t* col_without_order(ray_t* col) {
     ray_index_t* sx = ray_index_payload(col->index);
     ray_idx_kind_t kind = (ray_idx_kind_t)sx->kind;
     uint8_t carry = (uint8_t)(sx->markers &
-                    ~(RAY_MARK_HASH_HIGH | RAY_MARK_FIRST_ONLY | RAY_MARK_MMAP));
+                    ~(RAY_MARK_HASH_HIGH | RAY_MARK_HASH_DELTA | RAY_MARK_MMAP));
     ray_t* w = col;
     ray_retain(w);
     ray_t* d = ray_index_drop(&w);          /* copies: the caller holds col */
@@ -5364,8 +5736,8 @@ ray_t* ray_attr_get_fn(ray_t* v) {
         ray_index_t* ix = ray_index_payload(v->index);
         if (ix->markers & RAY_MARK_UNIQUE)
             out[syms->len++] = ray_sym_intern_runtime("unique", 6);
-        /* a first-row-only hash no longer holds every row of a key */
-        if (ix->kind == RAY_IDX_HASH && !(ix->markers & RAY_MARK_FIRST_ONLY))
+        /* a hash holds every row of each key, a delta's rows included */
+        if (ix->kind == RAY_IDX_HASH)
             out[syms->len++] = ray_sym_intern_runtime("grouped", 7);
         else if (ix->kind == RAY_IDX_PART)
             out[syms->len++] = ray_sym_intern_runtime("parted", 6);
@@ -5416,7 +5788,7 @@ int64_t ray_index_find_row(ray_t* col, int64_t key) {
     if (hash_byte_keyed(t)) return -2;   /* STR / GUID: see ray_index_find_atom */
 
     /* Nonzero symbol equality is safe even when other rows are null.  The
-     * first row is all this returns, so a first-row-only index answers. */
+     * first row is all this returns, and it is always in the CSR. */
     if (t == RAY_SYM && key == 0) return -2;
     if (!idx_find_fresh(col)) return -2;
 
@@ -5473,17 +5845,42 @@ int64_t ray_index_sym_slices(ray_t* col, ray_t* keys,
         if (doms[i] != doms[i - 1]) doms[w++] = doms[i];
     nd = w;
 
-    ray_t* shdr = ray_alloc((size_t)nd * (int64_t)sizeof(ray_idx_slice_t));
+    /* A hash key with delta rows has no contiguous slice: its rows are
+     * copied into the slices block after the slice array (one block, freed
+     * by the caller as before).  First pass: the room that takes. */
+    int64_t extra = 0;
+    if (kind == RAY_IDX_HASH && ray_index_hash_delta(ray_index_payload(col->index))) {
+        for (int64_t i = 0; i < nd; i++) {
+            int64_t gid = -1;
+            ray_index_t* ix = hash_probe_setup(col, doms[i], &gid);
+            if (!ix) { ray_free(dhdr); return -1; }
+            if (gid >= 0 && hx_dcount(ix, gid, NULL) > 0) extra += hx_gsize(ix, gid);
+        }
+    }
+    ray_t* shdr = ray_alloc((size_t)nd * (int64_t)sizeof(ray_idx_slice_t) +
+                            (size_t)extra * sizeof(int64_t));
     if (!shdr) { ray_free(dhdr); return -1; }
     ray_idx_slice_t* sl = (ray_idx_slice_t*)ray_data(shdr);
+    int64_t* xrows = (int64_t*)(sl + nd);
     int64_t k = 0;
     if (kind == RAY_IDX_HASH) {
         for (int64_t i = 0; i < nd; i++) {
-            ray_idx_rows_t rows = { NULL, false };
-            int64_t n = 0;
-            int hit = ray_index_hash_group(col, doms[i], &rows, &n);
-            if (hit < 0) { ray_free(dhdr); ray_free(shdr); return -1; }
-            if (hit == 0 || n == 0) continue;
+            int64_t gid = -1;
+            ray_index_t* ix = hash_probe_setup(col, doms[i], &gid);
+            if (!ix) { ray_free(dhdr); ray_free(shdr); return -1; }
+            if (gid < 0) continue;
+            ray_idx_rows_t rows;
+            int64_t n;
+            if (hx_dcount(ix, gid, NULL) > 0) {
+                n = hx_gcopy(ix, gid, xrows);
+                rows = (ray_idx_rows_t){ xrows, false };
+                xrows += n;
+            } else {
+                const ray_t* ofv = ix->u.hash.offs;
+                rows = hx_rows(ix->u.hash.rows, hx_get(ofv, gid));
+                n = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+            }
+            if (n == 0) continue;
             sl[k].dom = doms[i]; sl[k].rows = rows;
             sl[k].first = 0; sl[k].n = n; k++;
         }
@@ -5528,7 +5925,7 @@ ray_t* ray_index_rowsel_from_rows(int64_t nrows, ray_idx_rows_t ids, int64_t n) 
 }
 
 int ray_index_hash_group(ray_t* col, int64_t key,
-                         ray_idx_rows_t* rows_out, int64_t* n_out) {
+                         ray_idx_rows_t* rows_out, int64_t* n_out, ray_t** hold) {
     *rows_out = (ray_idx_rows_t){ NULL, false };
     *n_out = 0;
     if (!idx_fresh(col, RAY_IDX_HASH)) return -1;
@@ -5543,9 +5940,11 @@ int ray_index_hash_group(ray_t* col, int64_t key,
         return hash_key_in_range(col->type, key) ? -1 : 0;
     }
     if (gid < 0) return 0;
-    const ray_t* ofv = ix->u.hash.offs;
-    *rows_out = hx_rows(ix->u.hash.rows, hx_get(ofv, gid));
-    *n_out = hx_get(ofv, gid + 1) - hx_get(ofv, gid);
+    if (!hx_gview(ix, gid, rows_out, n_out, hold)) {
+        *rows_out = (ray_idx_rows_t){ NULL, false };
+        *n_out = 0;
+        return -1;
+    }
     return 1;
 }
 
@@ -5707,10 +6106,10 @@ int ray_index_find_vec(ray_t* col, ray_t* nd, int64_t* out, bool* any_miss) {
  * One routine serves the in-place append (ray_index_append_take / _extend,
  * called from vec.c) and the concat carry: hash_extend probes each appended
  * row once against an index whose child vectors the caller holds alone,
- * adding a single-row group for a new key and leaving the index
- * first-row-only (RAY_MARK_FIRST_ONLY) on a key it already holds — that row
- * would belong in the middle of the CSR rows, a re-lay of O(n) per append.
- * Nothing over the old rows is rehashed. */
+ * adding a single-row group for a new key and entering a row under a key
+ * it already holds in the delta (hxd_add) — in the CSR that row would
+ * belong in the middle of the rows, a re-lay of O(n) per append.  Nothing
+ * over the old rows is rehashed. */
 
 /* A heap copy of child vector `v` (same type and length). */
 static ray_t* hx_vec_copy(const ray_t* v) {
@@ -5738,6 +6137,14 @@ static ray_t* hash_index_copy(const ray_index_t* sx) {
     ix->u.hash.gkeys = ix->u.hash.table ? hx_vec_copy(sx->u.hash.gkeys) : NULL;
     ix->u.hash.offs  = ix->u.hash.gkeys ? hx_vec_copy(sx->u.hash.offs)  : NULL;
     ix->u.hash.rows  = ix->u.hash.offs  ? hx_vec_copy(sx->u.hash.rows)  : NULL;
+    /* the delta, copied too: the slot of the new block holds it */
+    ix->markers &= (uint8_t)~RAY_MARK_HASH_DELTA;
+    if (ix->u.hash.rows && ray_index_hash_delta_rows(sx) > 0) {   /* an emptied one is not copied */
+        ray_t* d = hx_vec_copy(ray_index_hash_delta(sx));
+        if (!d) { ray_release(idx); return NULL; }
+        *ray_index_delta_slot(ix) = d;
+        ix->markers |= RAY_MARK_HASH_DELTA;
+    }
     if (!ix->u.hash.rows) { ray_release(idx); return NULL; }   /* releases the copies made */
     return idx;
 }
@@ -5782,11 +6189,101 @@ static bool hx_append(ray_t** vp, const int64_t* src, int64_t n, uint32_t* narro
     return true;
 }
 
+/* Commit the `na` groups an extension staged (key words nkw, first rows
+ * nrow) to the CSR of `ix`: each holds one row, its offset bound one past
+ * the last.  nkw is reused as staging.  False on OOM. */
+static bool hx_commit_groups(ray_index_t* ix, int64_t* nkw, const int64_t* nrow,
+                             uint32_t* narrow, int64_t na) {
+    if (na == 0) return true;
+    int64_t nk0 = ix->u.hash.n_keys;
+    if (!hx_append(&ix->u.hash.gkeys, nkw, na, narrow) ||
+        !hx_append(&ix->u.hash.rows, nrow, na, narrow)) return false;
+    for (int64_t j = 0; j < na; j++) nkw[j] = nk0 + j + 1;
+    if (!hx_append(&ix->u.hash.offs, nkw, na, narrow)) return false;
+    ix->u.hash.n_groups += na;
+    ix->u.hash.n_keys   += na;
+    return true;
+}
+
+/* Delta rows past which the delta of `ix` is folded, `pending` rows yet to
+ * join its CSR. */
+static inline int64_t hxd_due_at(const ray_index_t* ix, int64_t pending) {
+    int64_t q = (ix->u.hash.n_keys + pending) / HXD_FOLD_DIV;
+    return q > HXD_FOLD_MIN ? q : HXD_FOLD_MIN;
+}
+
+/* The key words of v's rows [r0, r1) into kw[], and 1 into nul[] for a null
+ * row the index leaves out (SYM / STR), the numeric ones marked -1 (they
+ * drop the index).  One typed pass, so the probe loop below reads plain
+ * words.  GUID keys its null like any value. */
+static void hx_key_words(ray_t* v, int64_t r0, int64_t r1, uint64_t* kw, int8_t* nul) {
+    int8_t t = v->type;
+    const uint8_t* base = (const uint8_t*)ray_data(v);
+    int64_t n = r1 - r0;
+    if (t == RAY_SYM) {
+        /* one loop per id width (ray_read_sym switches per call) */
+        switch (v->attrs & RAY_SYM_W_MASK) {
+#define HXK_SYM(T) for (int64_t i = 0; i < n; i++) { kw[i] = (uint64_t)((const T*)base)[r0 + i]; nul[i] = kw[i] == 0; }
+        case RAY_SYM_W8:  HXK_SYM(uint8_t);  break;
+        case RAY_SYM_W16: HXK_SYM(uint16_t); break;
+        case RAY_SYM_W32: HXK_SYM(uint32_t); break;
+        default:
+            for (int64_t i = 0; i < n; i++) {
+                kw[i] = (uint64_t)ray_read_sym(base, r0 + i, RAY_SYM, v->attrs);
+                nul[i] = kw[i] == 0;
+            }
+            break;
+#undef HXK_SYM
+        }
+        return;
+    }
+    if (t == RAY_STR || t == RAY_GUID) {
+        for (int64_t i = 0; i < n; i++) {
+            nul[i] = t == RAY_STR && ray_raw_is_null(t, v->attrs, base, r0 + i);
+            kw[i] = nul[i] ? 0 : hash_row_key_word(v, base, r0 + i);
+        }
+        return;
+    }
+    if (t == RAY_F32 || t == RAY_F64) {      /* NaN / -0 rules: numeric_key_word */
+        for (int64_t i = 0; i < n; i++) {
+            kw[i] = numeric_key_word(base, t, r0 + i);
+            nul[i] = ray_raw_is_null(t, v->attrs, base, r0 + i) ? -1 : 0;
+        }
+        return;
+    }
+    /* integers: the value, sign-extended; a null is the width's sentinel
+     * (ray_raw_is_null), and a one-byte type has none */
+    switch (numeric_elem_size(t)) {
+    case 1:
+        for (int64_t i = 0; i < n; i++) { kw[i] = (uint64_t)base[r0 + i]; nul[i] = 0; }
+        break;
+    case 2:
+        for (int64_t i = 0; i < n; i++) {
+            int16_t x; memcpy(&x, base + (r0 + i) * 2, 2);
+            kw[i] = (uint64_t)(int64_t)x; nul[i] = x == NULL_I16 ? -1 : 0;
+        }
+        break;
+    case 4:
+        for (int64_t i = 0; i < n; i++) {
+            int32_t x; memcpy(&x, base + (r0 + i) * 4, 4);
+            kw[i] = (uint64_t)(int64_t)x; nul[i] = x == NULL_I32 ? -1 : 0;
+        }
+        break;
+    default:
+        for (int64_t i = 0; i < n; i++) {
+            int64_t x; memcpy(&x, base + (r0 + i) * 8, 8);
+            kw[i] = (uint64_t)x; nul[i] = x == NULL_I64 ? -1 : 0;
+        }
+        break;
+    }
+}
+
 /* Extend hash index `ix` — its built_for_len rows are v's first n0, its
  * child vectors the caller's alone — over v's rows [n0, n1).  False when it
  * cannot be (the caller then releases the index): a null appended to a
- * column other than GUID (whose index keys the zero guid like any value),
- * row ids past a narrow table's width, a malformed payload, OOM. */
+ * numeric column (a SYM or STR null is left out, as the builder leaves it
+ * out; GUID's index keys the zero guid like any value), row ids past a
+ * narrow table's width, a malformed payload, OOM. */
 static bool hash_extend(ray_index_t* ix, ray_t* v, int64_t n0, int64_t n1) {
     if (ix->kind != RAY_IDX_HASH || ix->built_for_len != n0 || n1 < n0) return false;
     ray_t* gkeys = ix->u.hash.gkeys;
@@ -5799,84 +6296,170 @@ static bool hash_extend(ray_index_t* ix, ray_t* v, int64_t n0, int64_t n1) {
     if (add == 0) return true;
     /* every value a narrow child stores must fit 32 bits: row ids below n1,
      * offsets up to nk0 + add, slot entries up to ng0 + add */
-    if ((rows->type == RAY_I32 && n1 > (int64_t)UINT32_MAX) ||
+    /* the delta's entries are 32-bit: no index is extended past 2^32 rows */
+    if (n1 > (int64_t)UINT32_MAX ||
         (offs->type == RAY_I32 && nk0 + add > (int64_t)UINT32_MAX) ||
         (ix->u.hash.table->type == RAY_I32 && ng0 + add > (int64_t)UINT32_MAX)) return false;
 
     int8_t t = v->type;
     bool bytes = hash_byte_keyed(t);
-    bool keep_nulls = (t == RAY_GUID);
     /* Scratch per new group: its key word, its row, then a narrow staging
      * area.  A new group is a key the index lacks: at most one a row, and
      * for a one- or two-byte key (its key word is its value) no more than
      * the type has values.  A count whose bytes a size_t can't hold (a
-     * 32-bit target) declines: the caller drops the index, the rows stay. */
+     * 32-bit target) declines: the caller drops the index, the rows stay.
+     * The rows' key words and null marks are read a block at a time. */
     const size_t per_group = 2 * sizeof(int64_t) + sizeof(uint32_t);
+    enum { KW_BLK = 4096 };
     int64_t ncap = add;
     if ((t == RAY_BOOL || t == RAY_U8) && ncap > 256) ncap = 256;
     else if (t == RAY_I16 && ncap > 65536) ncap = 65536;
-    if ((uint64_t)ncap > SIZE_MAX / per_group) return false;
+    if ((uint64_t)ncap > (SIZE_MAX - KW_BLK * 9) / per_group) return false;
     ray_t* sc_hdr = NULL;
-    int64_t* nkw = (int64_t*)scratch_alloc(&sc_hdr, (size_t)ncap * per_group);
+    int64_t* nkw = (int64_t*)scratch_alloc(&sc_hdr, (size_t)ncap * per_group + KW_BLK * 9);
     if (!nkw) return false;
     int64_t* nrow = nkw + ncap;
     uint32_t* narrow = (uint32_t*)(nrow + ncap);
+    uint64_t* kwb = (uint64_t*)(narrow + ncap + (ncap & 1));   /* 8-aligned */
+    int8_t* nub = (int8_t*)(kwb + KW_BLK);
     const int64_t* gk = (const int64_t*)ray_data(gkeys);
-    const uint8_t* base = (const uint8_t*)ray_data(v);
     int64_t na = 0;
     bool repeat = false;
     bool ok = true;
+    bool fold_failed = false;   /* OOM folding: keep the delta, stop trying */
+    int64_t dn = ray_index_hash_delta_rows(ix);
+    int64_t due = hxd_due_at(ix, 0);
+    const ray_t* tab = ix->u.hash.table;
+    uint64_t mask = ix->u.hash.mask;
+    uint8_t mk = ix->markers;
+    /* the slot table read directly in its width (hx_get re-derives both
+     * per call), re-read after it grows */
+    const void* tabd = ray_data((ray_t*)tab);
+    bool tab32 = tab->type == RAY_I32;
+    /* the home slot without a branch: the top bits under
+     * RAY_MARK_HASH_HIGH (h >> clz(mask) is below mask + 1), else the low */
+    int hsh = (mk & RAY_MARK_HASH_HIGH) ? __builtin_clzll(mask) : 0;
+    /* the delta's arrays while it is dense and has room: a repeated key's
+     * row is entered here without a call (hxd_add does the rest) */
+    int64_t *dw = NULL, *dtab = NULL;
+    uint32_t *derow = NULL, *denext = NULL, *degid = NULL;
+    /* its entry count, capacity and slot bound in registers (the table
+     * writes through int64_t* could alias dw); dw[0] is written back
+     * (HX_DELTA_SYNC) before anything else reads the delta */
+    int64_t de = 0, dcap = 0, dmaxg = -1;
+#define HX_DELTA_LOAD() do {                                                  \
+        ray_t* d_ = ray_index_hash_delta(ix);                                 \
+        dw = d_ ? hxd_w(d_) : NULL;                                           \
+        if (dw && dw[4]) { derow = hxd_erow(dw); denext = hxd_enext(dw);      \
+                           degid = hxd_egid(dw); dtab = hxd_tab(dw);          \
+                           de = dw[0]; dcap = dw[1]; dmaxg = dw[2]; }         \
+        else { dw = NULL; dcap = 0; dmaxg = -1; }                             \
+    } while (0)
+#define HX_DELTA_SYNC() do { if (dw) dw[0] = de; } while (0)
+    HX_DELTA_LOAD();
 
-    for (int64_t r = n0; r < n1 && ok; r++) {
-        if (!keep_nulls && ray_raw_is_null(t, v->attrs, base, r)) { ok = false; break; }
-        uint64_t kw = hash_row_key_word(v, base, r);
-        uint64_t h = mix64(kw);
-        uint64_t mask = ix->u.hash.mask;
-        uint64_t slot = hx_home_m(ix->markers, mask, h);
-        bool hit = false;
-        for (;;) {
-            int64_t gp1 = hx_get(ix->u.hash.table, (int64_t)slot);
-            if (gp1 == 0) break;
-            int64_t g = gp1 - 1;
-            if (hx_group_kw(gk, ng0, nkw, g) == kw) {
-                int64_t first = g < ng0 ? hx_get(rows, hx_get(offs, g)) : nrow[g - ng0];
-                if (!bytes || hash_rows_eq(v, first, r)) { hit = true; break; }
+    for (int64_t b0 = n0; b0 < n1 && ok; b0 += KW_BLK) {
+        int64_t b1 = b0 + KW_BLK < n1 ? b0 + KW_BLK : n1;
+        hx_key_words(v, b0, b1, kwb, nub);
+        for (int64_t r = b0; r < b1; r++) {
+            int8_t nl = nub[r - b0];
+            if (nl) {
+                /* a SYM or STR null row is left out, as the builder leaves
+                 * it out (#595); a numeric null drops the index (its
+                 * consults want a null-free column) */
+                if (nl > 0) continue;
+                ok = false; break;
             }
-            slot = (slot + 1) & mask;
+            uint64_t kw = kwb[r - b0];
+            uint64_t h = mix64(kw);
+            uint64_t slot = (h >> hsh) & mask;
+            int64_t g_hit = -1;
+            for (;;) {
+                int64_t gp1 = tab32 ? (int64_t)((const uint32_t*)tabd)[slot]
+                                    : ((const int64_t*)tabd)[slot];
+                if (gp1 == 0) break;
+                int64_t g = gp1 - 1;
+                if ((uint64_t)hx_group_kw(gk, ng0, nkw, g) == kw) {
+                    if (!bytes) { g_hit = g; break; }
+                    /* a byte-keyed word hit is confirmed on the group's
+                     * first row */
+                    int64_t first = g < ng0 ? hx_get(rows, hx_get(offs, g)) : nrow[g - ng0];
+                    if (hash_rows_eq(v, first, r)) { g_hit = g; break; }
+                }
+                slot = (slot + 1) & mask;
+            }
+            if (g_hit >= 0) {
+                /* a key already held: the row goes to the delta (#595) */
+                repeat = true;
+                if (de < dcap && g_hit <= dmaxg) {
+                    /* dense with room: hxd_add's work, inline */
+                    int64_t e = de++;
+                    derow[e] = (uint32_t)r; degid[e] = (uint32_t)g_hit;
+                    int64_t* t4 = dtab + g_hit * 4;
+                    if (t4[0] == 0) { t4[0] = g_hit + 1; t4[1] = e; t4[2] = e; t4[3] = 1; dw[3]++; }
+                    else { denext[t4[2]] = (uint32_t)e; t4[2] = e; t4[3]++; }
+                } else {
+                    /* a first allocation for a few batches' rows, never
+                     * past the fold threshold: small appends don't re-lay
+                     * it per doubling, one large one isn't given more than
+                     * it keeps */
+                    int64_t hint = 4 * (n1 - r);
+                    if (hint < 4096) hint = 4096;
+                    if (hint > due - dn + 1) hint = due - dn + 1;
+                    HX_DELTA_SYNC();
+                    if (!hxd_add(ix, g_hit, r, hint)) { ok = false; break; }
+                    HX_DELTA_LOAD();
+                }
+                /* Fold as soon as the delta is due, not at the end: one
+                 * large append then never holds a delta bigger than the
+                 * threshold.  The staged groups join the CSR first.  A
+                 * fold that fails (OOM) keeps the delta, which is complete
+                 * either way. */
+                if (++dn > due && !fold_failed) {
+                    HX_DELTA_SYNC();
+                    if (!hx_commit_groups(ix, nkw, nrow, narrow, na)) { ok = false; break; }
+                    na = 0;
+                    fold_failed = !hx_fold(ix, true);
+                    ng0 = ix->u.hash.n_groups;
+                    gk = (const int64_t*)ray_data(ix->u.hash.gkeys);
+                    offs = ix->u.hash.offs;
+                    rows = ix->u.hash.rows;
+                    dn = ray_index_hash_delta_rows(ix);
+                    due = hxd_due_at(ix, 0);
+                    HX_DELTA_LOAD();
+                }
+                continue;
+            }
+            /* a new key, in bounds of the scratch (ncap bounds the new keys) */
+            if (na == ncap) { ok = false; break; }
+            /* keep the table at most half full */
+            if ((uint64_t)(ng0 + na + 1) * 2 > mask + 1) {
+                if (!hx_table_grow(ix, gk, ng0, nkw, na)) { ok = false; break; }
+                tab = ix->u.hash.table;
+                tabd = ray_data((ray_t*)tab);
+                tab32 = tab->type == RAY_I32;
+                mask = ix->u.hash.mask;
+                hsh = (mk & RAY_MARK_HASH_HIGH) ? __builtin_clzll(mask) : 0;
+                slot = hx_home_m(mk, mask, h);
+                while (hx_get(tab, (int64_t)slot) != 0) slot = (slot + 1) & mask;
+            }
+            hx_set(ix->u.hash.table, (int64_t)slot, ng0 + na + 1);
+            nkw[na] = (int64_t)kw;
+            nrow[na] = r;
+            na++;
+            /* the fold threshold counts rows not yet in the CSR */
         }
-        if (hit) { repeat = true; continue; }
-        /* a new key, in bounds of the scratch (ncap bounds the new keys) */
-        if (na == ncap) { ok = false; break; }
-        /* keep the table at most half full */
-        if ((uint64_t)(ng0 + na + 1) * 2 > ix->u.hash.mask + 1) {
-            if (!hx_table_grow(ix, gk, ng0, nkw, na)) { ok = false; break; }
-            mask = ix->u.hash.mask;
-            slot = hx_home_m(ix->markers, mask, h);
-            while (hx_get(ix->u.hash.table, (int64_t)slot) != 0) slot = (slot + 1) & mask;
-        }
-        hx_set(ix->u.hash.table, (int64_t)slot, ng0 + na + 1);
-        nkw[na] = (int64_t)kw;
-        nrow[na] = r;
-        na++;
     }
-    if (ok && na > 0) {
-        /* each new group holds one row: its offset bound is one past the last */
-        ok = hx_append(&ix->u.hash.gkeys, nkw, na, narrow) &&
-             hx_append(&ix->u.hash.rows, nrow, na, narrow);
-        if (ok) {
-            for (int64_t j = 0; j < na; j++) nkw[j] = nk0 + j + 1;
-            ok = hx_append(&ix->u.hash.offs, nkw, na, narrow);
-        }
-    }
+    HX_DELTA_SYNC();
+#undef HX_DELTA_LOAD
+#undef HX_DELTA_SYNC
+    if (ok) ok = hx_commit_groups(ix, nkw, nrow, narrow, na);
     scratch_free(sc_hdr);
     if (!ok) return false;
-    ix->u.hash.n_groups = ng0 + na;
-    ix->u.hash.n_keys   = nk0 + na;
     ix->built_for_len   = n1;
     if (repeat) {
-        /* The repeated rows are not in their groups: `unique` is no longer
-         * true, and neither is any within-group order. */
-        ix->markers |= RAY_MARK_FIRST_ONLY;
+        /* A key now has several rows: `unique` is no longer true (as a
+         * rebuild would find), and no within-group order is known. */
         ix->markers &= (uint8_t)~RAY_MARK_UNIQUE;
         ix->u.hash.order_sym = -1;
     }
@@ -5896,7 +6479,8 @@ ray_t* ray_index_append_take(ray_t* v) {
     bool own = !mapped && !(ix->markers & RAY_MARK_MMAP) &&
                ray_atomic_load(&idx->rc) == 1 &&
                hx_sole(ix->u.hash.table) && hx_sole(ix->u.hash.gkeys) &&
-               hx_sole(ix->u.hash.offs) && hx_sole(ix->u.hash.rows);
+               hx_sole(ix->u.hash.offs) && hx_sole(ix->u.hash.rows) &&
+               (!ray_index_hash_delta(ix) || hx_sole(ray_index_hash_delta(ix)));
     ray_t* keep = own ? idx : hash_index_copy(ix);
     if (!keep) return NULL;
     /* Detach as vec_drop_index_inplace does: the saved aux holds no owned

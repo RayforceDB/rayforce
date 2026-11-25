@@ -1,0 +1,168 @@
+;; A hash index that survives appends (#595): a row an append adds under a
+;; key the index already holds goes to the index's delta, and every consumer
+;; reads a key's rows as its grouped slice followed by its delta rows.  Each
+;; answer below is checked against the same query on an unindexed copy that
+;; took the same writes, and `.idx.uses` shows the index answered.
+(.sys.exec "rm -rf /tmp/rf-idx-delta")
+(set N 3000)
+
+;; ─────────────────── the tables: indexed T, plain P, same rows ─────────────
+;; k: I64 keys 0..49, s: SYM keys with nulls (the empty symbol), g: GUIDs
+(set gs (guid 40))
+(set k0 (% (* (til N) 7) 50))
+(set s0 (at ['a 'b 'c 'd 'e ' 'f 'g] (% (til N) 8)))
+(set g0 (at gs (% (til N) 30)))
+(set t0 (til N))
+(set P (table [k s g t v] (list k0 s0 g0 t0 (til N))))
+(set T (table [k s g t v] (list (.idx.hash k0) (.idx.hash s0) (.idx.hash g0) t0 (til N))))
+
+;; batch 1, in place: repeated keys and new ones (k 50 51, s 'h, a new guid)
+(set B1 (table [k s g t v] (list [3 50 3 51 7] ['a 'h ' 'b 'h] (at gs [1 30 2 31 1]) [3000 3001 3002 3003 3004] [10 11 12 13 14])))
+(insert 'T B1)
+(insert 'P B1)
+(at (.idx.info (at T 'k)) 'delta) -- 3
+(at (.idx.info (at T 's)) 'delta) -- 3
+(at (.idx.info (at T 's)) 'n_keys) -- (at (.idx.info (.idx.hash (at P 's))) 'n_keys)
+(at (.idx.info (at T 'g)) 'delta) -- 3
+(at (.idx.info (at T 'k)) 'n_keys) -- (count (at T 'k))
+(at (.idx.info (at T 'k)) 'n_keys) -- (at (.idx.info (.idx.hash (at P 'k))) 'n_keys)
+(at (.idx.info (at T 'k)) 'n_groups) -- 52
+(.attr.get (at T 'k)) -- ['grouped]
+(.attr.get (at T 's)) -- ['grouped]
+
+;; batch 2, one row at a time
+(insert 'T (list 7 'c (at gs 3) 3005 15))
+(insert 'P (list 7 'c (at gs 3) 3005 15))
+(at (.idx.info (at T 'k)) 'delta) -- 4
+
+;; ─────────────────── filter: EQ and IN ─────────────────────────────────────
+(do (.idx.uses T) null)
+(select {from: T where: (== k 3)}) -- (select {from: P where: (== k 3)})
+(select {from: T where: (== k 51)}) -- (select {from: P where: (== k 51)})
+(select {from: T where: (in k [7 3 50 99])}) -- (select {from: P where: (in k [7 3 50 99])})
+(at (.idx.uses T) 'k) -- 3
+(select {from: T where: (== s 'h)}) -- (select {from: P where: (== s 'h)})
+;; 'a is dense (more than an eighth of the rows): the scan answers, by design
+(select {from: T where: (== s 'a)}) -- (select {from: P where: (== s 'a)})
+(select {from: T where: (in s ['h 'zz])}) -- (select {from: P where: (in s ['h 'zz])})
+(at (.idx.uses T) 's) -- 2
+;; the SYM null is not probed (the scan selects it), answers the same
+(select {from: T where: (== s ')}) -- (select {from: P where: (== s ')})
+(set gq (at gs [1 31]))
+(select {from: T where: (in g gq)}) -- (select {from: P where: (in g gq)})
+(set g1 (at gs 1))
+(select {from: T where: (== g g1)}) -- (select {from: P where: (== g g1)})
+(at (.idx.uses T) 'g) -- 2
+
+;; ─────────────────── equality plus a range on another column ───────────────
+(select {from: T where: (and (== k 3) (>= t 100) (<= t 3002))}) -- (select {from: P where: (and (== k 3) (>= t 100) (<= t 3002))})
+(select {from: T where: (and (== k 7) (> t 2990))}) -- (select {from: P where: (and (== k 7) (> t 2990))})
+(at (.idx.uses T) 'k) -- 2
+
+;; ─────────────────── where key in … by key ─────────────────────────────────
+(select {n: (count v) m: (sum v) from: T where: (in s ['a 'h 'c]) by: s}) -- (select {n: (count v) m: (sum v) from: P where: (in s ['a 'h 'c]) by: s})
+(select {n: (count v) from: T where: (== s 'h) by: s}) -- (select {n: (count v) from: P where: (== s 'h) by: s})
+(at (.idx.uses T) 's) -- 2
+
+;; ─────────────────── find, in, dict lookup, distinct ───────────────────────
+(find (at T 'k) [3 50 51 7 99]) -- (find (at P 'k) [3 50 51 7 99])
+(in [3 51 99] (at T 'k)) -- (in [3 51 99] (at P 'k))
+(find (at T 's) ['h 'a 'zz]) -- (find (at P 's) ['h 'a 'zz])
+(find (at T 'g) (at gs [31 1 39])) -- (find (at P 'g) (at gs [31 1 39]))
+(at (dict (at T 'k) (at T 'v)) [51 3]) -- (at (dict (at P 'k) (at P 'v)) [51 3])
+(distinct (at T 'g)) -- (distinct (at P 'g))
+(count (distinct (at T 'g))) -- 32
+
+;; ─────────────────── a key set from another symbol domain ──────────────────
+(.db.splayed.set "/tmp/rf-idx-delta/keys/" (table [s] (list ['h 'zz 'b])))
+(set FK (at (.db.splayed.get "/tmp/rf-idx-delta/keys/") 's))
+(select {from: T where: (in s FK)}) -- (select {from: P where: (in s FK)})
+(select {n: (count v) from: T where: (in s FK) by: s}) -- (select {n: (count v) from: P where: (in s FK) by: s})
+
+;; ─────────────────── concat carries the delta, and adds to it ──────────────
+(set ck (concat (at T 'k) [3 3 52]))
+(at (.idx.info ck) 'delta) -- 6
+(at (.idx.info (at T 'k)) 'delta) -- 4
+(find ck [52 3]) -- (find (.idx.drop ck) [52 3])
+(select {from: (table [k] (list ck)) where: (== k 3)}) -- (select {from: (table [k] (list (.idx.drop ck))) where: (== k 3)})
+
+;; ─────────────────── upsert: a batch of new ids, repeated s ─────────────────
+(set U (table [id s] (list (.idx.hash (til 10)) (.idx.hash (at ['x 'y] (% (til 10) 2))))))
+(set UP (table [id s] (list (til 10) (at ['x 'y] (% (til 10) 2)))))
+(upsert 'U 'id (table [id s] (list [10 11 12] ['x 'x 'z])))
+(upsert 'UP 'id (table [id s] (list [10 11 12] ['x 'x 'z])))
+(at (.idx.info (at U 's)) 'delta) -- 2
+(select {from: U where: (== s 'x)}) -- (select {from: UP where: (== s 'x)})
+(find (at U 'id) [12 0 99]) -- [12 0 0N]
+;; a hit rewrites s in place: its index goes, the id's stays
+(upsert 'U 'id (table [id s] (list [1] ['z])))
+(.idx.has? (at U 's)) -- false
+(.idx.has? (at U 'id)) -- true
+(at (.idx.info (at U 'id)) 'delta) -- 0
+
+;; ─────────────────── update where k = …: rows through the index ─────────────
+(update {v: 0 from: 'T where: (== k 51)})
+(update {v: 0 from: 'P where: (== k 51)})
+(select {from: T where: (== k 51)}) -- (select {from: P where: (== k 51)})
+(at (.idx.info (at T 'k)) 'delta) -- 4
+
+;; ─────────────────── asof join: the right side's SYM key indexed ───────────
+(set Q (table [s t px] (list (.idx.hash (at ['aa 'bb 'cc] (% (til 300) 3))) (til 300) (as 'F64 (til 300)))))
+(set QP (table [s t px] (list (at ['aa 'bb 'cc] (% (til 300) 3)) (til 300) (as 'F64 (til 300)))))
+(insert 'Q (table [s t px] (list ['bb 'aa 'bb] [300 301 302] [1000.0 1001.0 1002.0])))
+(insert 'QP (table [s t px] (list ['bb 'aa 'bb] [300 301 302] [1000.0 1001.0 1002.0])))
+(at (.idx.info (at Q 's)) 'delta) -- 3
+(set L (table [s t] (list ['aa 'bb 'cc 'bb] [302 302 302 100])))
+(do (.idx.uses Q) null)
+(asof-join [s t] L Q) -- (asof-join [s t] L QP)
+(at (asof-join [s t] L Q) 'px) -- [1001.0 1002.0 299.0 100.0]
+(at (.idx.uses Q) 's) -- 2
+
+;; ─────────────────── past the threshold the delta is folded ────────────────
+;; 6000 repeats into a 3006-row index: folded on the way (more than 4096
+;; delta rows and more than half the grouped ones), so at most 4096 rows are
+;; left in the delta, and every answer still holds
+(set BIG (table [k s g t v] (list (% (til 6000) 50) (at ['a 'b 'h] (% (til 6000) 3)) (at gs (% (til 6000) 32)) (+ 4000 (til 6000)) (til 6000))))
+(insert 'T BIG)
+(insert 'P BIG)
+(< (at (.idx.info (at T 'k)) 'delta) 4097) -- true
+(at (.idx.info (at T 'k)) 'n_keys) -- (count (at T 'k))
+(select {from: T where: (== k 3)}) -- (select {from: P where: (== k 3)})
+(select {from: T where: (in s ['h 'a])}) -- (select {from: P where: (in s ['h 'a])})
+(select {n: (count v) from: T where: (in s ['a 'h]) by: s}) -- (select {n: (count v) from: P where: (in s ['a 'h]) by: s})
+(find (at T 'g) (at gs [31 0])) -- (find (at P 'g) (at gs [31 0]))
+(at (.idx.uses T) 'k) -- 1
+
+;; ─────────────────── a save writes the folded index ────────────────────────
+(insert 'T (list 3 'h (at gs 1) 99999 1))
+(insert 'P (list 3 'h (at gs 1) 99999 1))
+(> (at (.idx.info (at T 'k)) 'delta) 0) -- true
+(.db.splayed.set "/tmp/rf-idx-delta/t/" T)
+(set TL (.db.splayed.get "/tmp/rf-idx-delta/t/"))
+(at (.idx.info (at TL 'k)) 'delta) -- 0
+(at (.idx.info (at TL 'k)) 'n_keys) -- (count (at P 'k))
+(select {from: TL where: (== k 3)}) -- (select {from: P where: (== k 3)})
+(select {from: TL where: (in s ['h])}) -- (select {from: P where: (in s ['h])})
+;; the in-memory one keeps its delta
+(> (at (.idx.info (at T 'k)) 'delta) 0) -- true
+;; appends to the loaded table copy its mapped index, then extend the copy
+(insert 'TL (list 3 'h (at gs 1) 100000 2))
+(insert 'P (list 3 'h (at gs 1) 100000 2))
+(at (.idx.info (at TL 'k)) 'delta) -- 1
+(select {from: TL where: (== k 3)}) -- (select {from: P where: (== k 3)})
+(at (.idx.info (at (.db.splayed.get "/tmp/rf-idx-delta/t/") 'k)) 'delta) -- 0
+
+;; ─────────────────── a shared index: the other holder keeps its own ────────
+(set A (table [k] (list (.idx.hash [1 2 3]))))
+(set A2 A)
+(insert 'A (list 2))
+(at (.idx.info (at A 'k)) 'delta) -- 1
+(at (.idx.info (at A2 'k)) 'delta) -- 0
+(count (at A2 'k)) -- 3
+(select {from: A where: (== k 2)}) -- (table [k] (list [2 2]))
+(select {from: A2 where: (== k 2)}) -- (table [k] (list [2]))
+
+;; ─────────────────── a write to existing rows still drops it ───────────────
+(alter 'ck set 0 9)
+(.idx.has? ck) -- false
+(.sys.exec "rm -rf /tmp/rf-idx-delta")

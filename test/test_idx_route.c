@@ -2406,8 +2406,8 @@ static ray_t* tbl_col_set(ray_t* tbl, int64_t slot, int64_t idx, const void* ele
 /* ─── Staleness: filter-eq hash — append mutation ────────────────────── */
 
 /* stale_filter_hash: attach hash to k, run (== k 9) → 2 rows (index hit).
- * Append k=9, v=10 → len grows; built_for_len mismatch.
- * Re-run (== k 9): correct result (3 rows, scan path), hit UNCHANGED. */
+ * Append k=9, v=10 → the append keeps the index, the repeated key's row in
+ * its delta (#595).  Re-run (== k 9): 3 rows, through the index again. */
 static test_result_t test_stale_filter_hash(void) {
     ray_heap_init();
     ray_t* tbl = make_idx_table();
@@ -2422,7 +2422,7 @@ static test_result_t test_stale_filter_hash(void) {
     TEST_ASSERT(ray_idx_hits[IDX_SITE_FILTER_HASH] > hits0, "first run must hit");
     ray_release(r0);
 
-    /* Mutate: append k=9, v=10 → index dropped by ray_vec_append. */
+    /* Mutate: append k=9, v=10 → the index is extended, the row in its delta. */
     int64_t kslot = find_col_slot(tbl, ray_sym_intern("k", 1));
     int64_t vslot = find_col_slot(tbl, ray_sym_intern("v", 1));
     TEST_ASSERT(kslot >= 0, "k slot"); TEST_ASSERT(vslot >= 0, "v slot");
@@ -2439,13 +2439,14 @@ static test_result_t test_stale_filter_hash(void) {
     /* Sanity: after mutation the table must have 11 rows. */
     TEST_ASSERT_EQ_I(ray_table_nrows(tbl), 11);
 
-    /* Second run: 11-row table, k=9 now at rows 2, 6, 10 → 3 rows via scan.
-     * Hit counter must NOT advance (index was dropped on mutation). */
+    /* Second run: 11-row table, k=9 now at rows 2, 6, 10 → 3 rows, the
+     * third from the delta.  The index answers again. */
+    TEST_ASSERT_TRUE(ray_index_hash_has_delta(ray_table_get_col_idx(tbl, kslot)));
     uint64_t hits1 = ray_idx_hits[IDX_SITE_FILTER_HASH];
     ray_t* r1 = run_filter(tbl, pred_eq_9);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     TEST_ASSERT_EQ_I(ray_table_nrows(r1), 3);
-    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits1), 0);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_FILTER_HASH] - hits1), 1);
     ray_release(r1);
 
     ray_release(tbl);
@@ -2457,8 +2458,8 @@ static test_result_t test_stale_filter_hash(void) {
 /* ─── Staleness: filter-IN hash — append mutation ────────────────────── */
 
 /* stale_in_hash: attach hash to k, run IN(k,[9,5]) → 4 rows (index hit).
- * Append k=5, v=10 → len grows; index dropped.
- * Re-run: 5 rows via scan, hit UNCHANGED. */
+ * Append k=5, v=10 → the index is kept, the row in its delta (#595).
+ * Re-run: 5 rows, through the index again. */
 static test_result_t test_stale_in_hash(void) {
     ray_heap_init();
     ray_t* tbl = make_idx_table();
@@ -2483,11 +2484,12 @@ static test_result_t test_stale_in_hash(void) {
     { ray_t* _r = tbl_col_append(tbl, vslot, &vval); TEST_ASSERT_FALSE(RAY_IS_ERR(_r)); }
 
     /* Second run: 11-row table, {9,5} matches {5,9,9,5,5} at rows 0,2,6,7,10 → 5 rows. */
+    TEST_ASSERT_TRUE(ray_index_hash_has_delta(ray_table_get_col_idx(tbl, kslot)));
     uint64_t hits1 = ray_idx_hits[IDX_SITE_IN];
     ray_t* r1 = run_filter(tbl, pred_in_9_5);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r1));
     TEST_ASSERT_EQ_I(ray_table_nrows(r1), 5);
-    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN] - hits1), 0);
+    TEST_ASSERT_EQ_I((int64_t)(ray_idx_hits[IDX_SITE_IN] - hits1), 1);
     ray_release(r1);
 
     ray_release(tbl);
@@ -3389,7 +3391,7 @@ cleanup:
  * and count distinct, with the zero guid a key like any other.  The scan
  * gives the same answers, so only the counters show a route that has
  * fallen back to it: each call must consult the index and hit, on a
- * complete index and on one an appended repeat left first-row-only. */
+ * fresh index and on one an appended repeat left with a delta. */
 static void guid_bytes(uint8_t* out, int k) {
     memset(out, 0, 16);
     if (k > 0) { out[0] = (uint8_t)k; out[7] = 0xA5; out[15] = (uint8_t)(0x30 + k); }
@@ -3424,13 +3426,13 @@ static test_result_t test_guid_index_routes(void) {
 
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) {
-            /* append a repeat of key 2: the index is kept, first-row-only */
+            /* append a repeat of key 2: the index is kept, the row in its delta */
             uint8_t b2[16];
             guid_bytes(b2, 2);
             v = ray_vec_append(v, b2);
             TEST_ASSERT_FALSE(RAY_IS_ERR(v));
             TEST_ASSERT_EQ_I(ray_index_kind(v), RAY_IDX_HASH);
-            TEST_ASSERT_TRUE(ray_index_hash_first_only(v));
+            TEST_ASSERT_TRUE(ray_index_hash_has_delta(v));
         }
         uint64_t c0 = ray_idx_consults[IDX_SITE_FIND], h0 = ray_idx_hits[IDX_SITE_FIND];
         ray_t* fa = ray_find_fn(v, atom);
