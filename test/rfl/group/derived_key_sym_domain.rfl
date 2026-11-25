@@ -388,3 +388,213 @@
 (all (== (at RQ 'c) 1)) -- true
 (all (== (at (value RQ) 0) refq)) -- true
 (all (== (at RQ 'mn) refq)) -- true
+
+;; ── the same over ONE STR column ──────────────────────────────────────
+;; A key computed from one STR column of few distinct strings is evaluated
+;; once per distinct string and spread over the rows (the row-wise string
+;; ops appended a fresh string per row per op).  Oracle: the key as a
+;; projected column, then a plain group-by on it.  Groups come out in
+;; first-seen order of the derived values, as the row-wise key gives them;
+;; "" is a value (and the STR null) like any other, so it groups and the
+;; where: drops it.  Strings over 12 bytes live in the pool (the padded
+;; "windows-1252 ", "x-mac-cyrillic").  100000 rows: the rows are grouped
+;; by several workers and their tables merged in row order.
+(set NS 100000)
+(set is (til NS))
+(set cs ["windows-1251" "utf-8" "UTF-8" " koi8-r" "" "iso-8859-1" "windows-1252 " "cp866" " Shift_JIS " "x-mac-cyrillic"])
+(set pc (at cs (% (+ (* 4 (div is 7)) is) 10)))
+(set uid (% (* is 31) 977))
+(set uidn (at (select {from: (table [i u] (list is uid)) x: (if (== (% i 13) 0) 0N u)}) 'x))
+(set TS2 (table [pc uid uidn] (list pc uid uidn)))
+(set tu2 (at (select {from: TS2 by: uid c: (count uid) desc: c asc: uid take: 50}) 'uid))
+(set KS (fn [t] (select {from: t by: {cn: (upper (trim pc))} c: (count uid) mn: (min uid) where: (!= pc "")})))
+(set KSO (fn [t] (select {from: (select {from: t cn: (upper (trim pc)) uid: uid where: (!= pc "")}) by: cn c: (count uid) mn: (min uid)})))
+(set FS (fn [r] (ser (xasc (table [k c mn] (list (at r 'cn) (at r 'c) (at r 'mn))) 'k))))
+(set RS (KS TS2))
+(count RS) -- 8
+(all (== (FS RS) (FS (KSO TS2)))) -- true
+(at RS 'cn) -- (distinct (upper (trim (at pc (where (!= pc ""))))))
+(sum (at RS 'c)) -- (count (where (!= pc "")))
+;; without the where: "" is the third group seen
+(set RN (select {from: TS2 by: {cn: (upper (trim pc))} c: (count uid)}))
+(at RN 'cn) -- (distinct (upper (trim pc)))
+(sum (at RN 'c)) -- 100000
+;; a derived I64 key and a derived BOOL key beside it, the same oracle
+(set RL (select {from: TS2 by: {ln: (strlen (trim pc)) e: (== pc "")} c: (count uid)}))
+(set OL (select {from: (select {from: TS2 ln: (strlen (trim pc)) e: (== pc "") uid: uid}) by: [ln e] c: (count uid)}))
+(count RL) -- 7
+(all (== (at RL 'ln) (at OL 'ln))) -- true
+(all (== (at RL 'e) (at OL 'e))) -- true
+(all (== (at RL 'c) (at OL 'c))) -- true
+;; two computed keys, a derived STR one and an I64 one testing a global
+;; vector, with count distinct (a null-bearing column too) under a where:
+;; the groups and their order are those of the plain multi-key group over
+;; the projected keys
+(set K2 (fn [t] (select {from: t by: {cn: (upper (trim pc)) p: (if (in uid tu2) 1 0)} c: (count uid) u: (count (distinct uid)) un: (count (distinct uidn)) where: (!= pc "")})))
+(set PJ (fn [t] (select {from: t cn: (upper (trim pc)) p: (if (in uid tu2) 1 0) uid: uid uidn: uidn where: (!= pc "")})))
+(set K2O (fn [t] (select {from: (PJ t) by: [cn p] c: (count uid) u: (count (distinct uid)) un: (count (distinct uidn))})))
+(set F2 (fn [r] (ser (xasc (xasc (table [k p c u un] (list (at r 'cn) (at r 'p) (at r 'c) (at r 'u) (at r 'un))) 'p) 'k))))
+(set R2 (K2 TS2))
+(count R2) -- 16
+(all (== (F2 R2) (F2 (K2O TS2)))) -- true
+(set O2K (select {from: (PJ TS2) by: [cn p] c: (count uid)}))
+(all (== (at R2 'cn) (at O2K 'cn))) -- true
+(all (== (at R2 'p) (at O2K 'p))) -- true
+(sum (at R2 'c)) -- (count (where (!= pc "")))
+;; one group's distinct counts by hand: the kept rows of that group, deduplicated
+(set G1 (where (and (== (upper (trim pc)) "KOI8-R") (not (in uid tu2)))))
+(at (at R2 'u) (first (where (and (== (at R2 'cn) "KOI8-R") (== (at R2 'p) 0))))) -- (count (distinct (at uid G1)))
+(at (at R2 'un) (first (where (and (== (at R2 'cn) "KOI8-R") (== (at R2 'p) 0))))) -- (count (distinct (at uidn G1)))
+;; a STR column of 3000 distinct strings beside a two-valued key: 6000
+;; groups, the composite row map probed through a well-filled table
+(set sm (concat "k" (as 'STR (% (* is 7) 3000))))
+(set TM (table [sm uid] (list sm uid)))
+(set RM (select {from: TM by: {cn: (upper sm) p: (% uid 2)} c: (count uid) u: (count (distinct uid))}))
+(set OM (select {from: (select {from: TM cn: (upper sm) p: (% uid 2) uid: uid}) by: [cn p] c: (count uid) u: (count (distinct uid))}))
+(count RM) -- 6000
+(set FM (fn [r] (ser (xasc (xasc (table [k p c u] (list (at r 'cn) (at r 'p) (at r 'c) (at r 'u))) 'p) 'k))))
+(all (== (FM RM) (FM OM))) -- true
+(all (== (at RM 'cn) (at OM 'cn))) -- true
+;; below the row gate (3000 rows) and over a near-unique STR column: the
+;; row-wise key, the same answers
+(set TS3 (take TS2 3000))
+(all (== (FS (KS TS3)) (FS (KSO TS3)))) -- true
+(all (== (F2 (K2 TS3)) (F2 (K2O TS3)))) -- true
+(set TSU (table [pc uid uidn] (list (concat "u" (as 'STR is)) uid uidn)))
+(count (KS TSU)) -- 100000
+(all (== (FS (KS TSU)) (FS (KSO TSU)))) -- true
+;; a composite by: [strcol intcol] with count distinct over the column
+;; forms the row map may meet: a compressed splayed STR (its dictionary
+;; codes), a parted STR, a sliced table, an all-"" column, an empty result
+(set C2 (fn [t] (select {from: t by: [sm p] c: (count uid) u: (count (distinct uid))})))
+(set C2O (fn [t] (select {from: (select {from: t sm: sm p: p uid: uid}) by: [sm p] c: (count uid) u: (count (distinct uid))})))
+(set FC (fn [r] (ser (xasc (xasc (table [k p c u] (list (at r 'sm) (at r 'p) (at r 'c) (at r 'u))) 'p) 'k))))
+(set TC (table [sm p uid] (list sm (% uid 2) uid)))
+(.sys.exec "rm -rf /tmp/rfl_dkey_str")
+(.db.splayed.set "/tmp/rfl_dkey_str/c2/" TC {compress: true})
+(set TCS (.db.splayed.get "/tmp/rfl_dkey_str/c2/"))
+(count (C2 TCS)) -- 6000
+(all (== (FC (C2 TCS)) (FC (C2O TC)))) -- true
+(set rootC "/tmp/rfl_dkey_str/c2p/")
+(.db.splayed.set (concat rootC "1/t/") (take TC 70000) (concat rootC ".sym") {compress: false})
+(.db.splayed.set (concat rootC "2/t/") (take TC -30000) (concat rootC ".sym") {compress: false})
+(set TCP (.db.parted.get rootC 't))
+(all (== (FC (C2 TCP)) (FC (C2O TC)))) -- true
+(all (== (FC (C2 (take TC 50000))) (FC (C2O (take TC 50000))))) -- true
+(all (== (FC (C2 (select {from: TC where: (> uid 500)}))) (FC (C2O (select {from: TC where: (> uid 500)}))))) -- true
+(set TE (table [sm p uid] (list (at [""] (* 0 is)) (% uid 2) uid)))
+(at (C2 TE) 'u) -- (at (C2O TE) 'u)
+(count (C2 TE)) -- 2
+(count (select {from: TCS by: [sm p] c: (count uid) u: (count (distinct uid)) where: (> uid 100000)})) -- 0
+(count (select {from: TCP by: [sm p] c: (count uid) u: (count (distinct uid)) where: (> uid 100000)})) -- 0
+;; a compressed splayed table and a parted one answer as the in-memory table
+(.db.splayed.set "/tmp/rfl_dkey_str/flat/" TS2 {compress: true})
+(set TSP (.db.splayed.get "/tmp/rfl_dkey_str/flat/"))
+(all (== (FS (KS TSP)) (FS RS))) -- true
+(all (== (at (KS TSP) 'cn) (at RS 'cn))) -- true
+(all (== (F2 (K2 TSP)) (F2 R2))) -- true
+(all (== (at (K2 TSP) 'cn) (at R2 'cn))) -- true
+(set rootS "/tmp/rfl_dkey_str/part/")
+(.db.splayed.set (concat rootS "1/t/") (take TS2 60000) (concat rootS ".sym") {compress: false})
+(.db.splayed.set (concat rootS "2/t/") (take TS2 -40000) (concat rootS ".sym") {compress: false})
+(set TPP (.db.parted.get rootS 't))
+(count TPP) -- 100000
+(all (== (FS (KS TPP)) (FS RS))) -- true
+(all (== (F2 (K2 TPP)) (F2 R2))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_str") -- 0
+;; a single computed key under a where: that keeps few rows (the key is
+;; evaluated over the selected rows only), and one that keeps most: the
+;; groups of the kept rows, as the projection gives them
+(set FW (fn [r] (ser (xasc (table [k c] (list (at (value r) 0) (at r 'c))) 'k))))
+(set FWO (fn [r] (ser (xasc (table [k c] (list (at r 'k) (at r 'c))) 'k))))
+(set W1 (select {from: TS2 by: (upper (trim pc)) c: (count uid) where: (< uid 30)}))
+(all (== (FW W1) (FWO (select {from: (select {from: TS2 k: (upper (trim pc)) uid: uid where: (< uid 30)}) by: k c: (count uid)})))) -- true
+(count W1) -- (count (distinct (upper (trim (at pc (where (< uid 30)))))))
+(set W2 (select {from: TS2 by: (upper (trim pc)) c: (count uid) where: (> uid 100)}))
+(all (== (FW W2) (FWO (select {from: (select {from: TS2 k: (upper (trim pc)) uid: uid where: (> uid 100)}) by: k c: (count uid)})))) -- true
+(all (== (at (value W2) 0) (distinct (upper (trim (at pc (where (> uid 100)))))))) -- true
+;; a value only the dropped rows hold never becomes a group
+(set pcx (at (select {from: (table [i p] (list is pc)) x: (if (< i 50) "dropped-only" p)}) 'x))
+(set TX (table [pc uid i] (list pcx uid is)))
+(set W3 (select {from: TX by: (upper (trim pc)) c: (count uid) where: (>= i 50)}))
+(count (where (== (at (value W3) 0) "DROPPED-ONLY"))) -- 0
+(all (== (FW W3) (FWO (select {from: (select {from: TX k: (upper (trim pc)) uid: uid where: (>= i 50)}) by: k c: (count uid)})))) -- true
+
+;; ── trim over a SYM column takes the per-symbol path ────────────────────
+(set sy (as 'SYMBOL (at [" a" "a" "b " " b " "" "c"] (% (+ (* 4 (div is 7)) is) 6))))
+(set TY (table [sy uid] (list sy uid)))
+(set RY (select {from: TY by: (trim sy) c: (count uid)}))
+(set OY (select {from: (select {from: TY k: (trim sy) uid: uid}) by: k c: (count uid)}))
+(set FY (fn [r] (ser (xasc (table [k c] (list (as 'STR (at (value r) 0)) (at r 'c))) 'k))))
+(count RY) -- 4
+(all (== (FY RY) (FY OY))) -- true
+(set RYW (select {from: TY by: {k: (trim sy)} c: (count uid) where: (!= sy "")}))
+(set OYW (select {from: (select {from: TY k: (trim sy) uid: uid where: (!= sy "")}) by: k c: (count uid)}))
+(count RYW) -- 3
+(all (== (FY RYW) (FY OYW))) -- true
+(asc (as 'STR (at RYW 'k))) -- (asc (as 'STR (distinct (trim (at sy (where (!= sy "")))))))
+
+;; ── a SYM column in a splayed table whose symfile is shared with a wide
+;; column ─────────────────────────────────────────────────────────────────
+;; The per-symbol evaluation works over the ids present in the column, so a
+;; symfile of hundreds of thousands of URL entries beside eight charsets
+;; costs it nothing; the by-dict forms (one computed key, two keys with a
+;; count distinct) take it too.  Oracle: the keys as projected columns.
+(.sys.exec "rm -rf /tmp/rfl_dkey_symfile")
+(set NZ 200000)
+(set iz (til NZ))
+(set csz (as 'SYMBOL ["windows-1251" "utf-8" "UTF-8" " koi8-r" "" "iso-8859-1" "windows-1252 " "cp866"]))
+(set pcz (at csz (% (+ (* 4 (div iz 7)) iz) 8)))
+(set uz (% (* iz 31) 977))
+(.db.splayed.set "/tmp/rfl_dkey_symfile/urls/" (table [URL] (list (as 'SYM (concat "http://u/" (as 'STR (til 300000)))))) "/tmp/rfl_dkey_symfile/.sym")
+(.db.splayed.set "/tmp/rfl_dkey_symfile/hits/" (table [UserID PageCharset URL] (list uz pcz (as 'SYM (concat "http://x/" (as 'STR iz))))) "/tmp/rfl_dkey_symfile/.sym")
+(set HZ (.db.splayed.get "/tmp/rfl_dkey_symfile/hits/" "/tmp/rfl_dkey_symfile/.sym"))
+(count HZ) -- 200000
+(set tuz (at (select {from: HZ by: UserID c: (count UserID) desc: c asc: UserID take: 50}) 'UserID))
+(set FZ1 (fn [r k] (ser (xasc (table [k c] (list (as 'STR (at r k)) (at r 'c))) 'k))))
+(set Z1 (select {from: HZ by: {cn: (upper (trim PageCharset))} c: (count UserID) where: (!= PageCharset "")}))
+(set Z1O (select {from: (select {from: HZ k: (upper (trim PageCharset)) UserID: UserID where: (!= PageCharset "")}) by: k c: (count UserID)}))
+(count Z1) -- 6
+(all (== (FZ1 Z1 'cn) (FZ1 Z1O 'k))) -- true
+(as 'STR (at Z1 'cn)) -- (as 'STR (distinct (upper (trim (at (at HZ 'PageCharset) (where (!= (at HZ 'PageCharset) "")))))))
+(set Z1S (select {from: HZ by: (upper (trim PageCharset)) c: (count UserID) where: (!= PageCharset "")}))
+(all (== (FZ1 Z1 'cn) (FZ1 Z1S (first (key Z1S))))) -- true
+(set FZ2 (fn [r k] (ser (xasc (xasc (table [k p c u] (list (as 'STR (at r k)) (at r 'p) (at r 'c) (at r 'u))) 'p) 'k))))
+(set Z2 (select {from: HZ by: {cn: (upper (trim PageCharset)) p: (if (in UserID tuz) 1 0)} c: (count UserID) u: (count (distinct UserID)) where: (!= PageCharset "")}))
+(set Z2O (select {from: (select {from: HZ k: (upper (trim PageCharset)) p: (if (in UserID tuz) 1 0) UserID: UserID where: (!= PageCharset "")}) by: [k p] c: (count UserID) u: (count (distinct UserID))}))
+(count Z2) -- 12
+(all (== (FZ2 Z2 'cn) (FZ2 Z2O 'k))) -- true
+(sum (at Z2 'c)) -- (count (where (!= (at HZ 'PageCharset) "")))
+(set Z3 (select {from: HZ by: {cn: (upper (trim PageCharset))} u: (count (distinct UserID)) where: (!= PageCharset "")}))
+(set Z3O (select {from: (select {from: HZ k: (upper (trim PageCharset)) UserID: UserID where: (!= PageCharset "")}) by: k u: (count (distinct UserID))}))
+(all (== (ser (xasc (table [k u] (list (as 'STR (at Z3 'cn)) (at Z3 'u))) 'k)) (ser (xasc (table [k u] (list (as 'STR (at Z3O 'k)) (at Z3O 'u))) 'k)))) -- true
+(.sys.exec "rm -rf /tmp/rfl_dkey_symfile") -- 0
+
+;; Group order of a derived key over a SYM column against the same texts in
+;; a STR column.  70000 rows (past the size at which the per-symbol route is
+;; used), 9 texts that fold to 5 keys.  Pinned order, lone key: SYM puts the
+;; empty (null) group FIRST then the keys in the order rows first show them;
+;; STR keeps "" at its row position.  Dict key {k p}: SYM lists the p=0
+;; groups then the p=1 groups, each led by "" ; STR lists first-seen pairs.
+(set DB (list "  Alpha " "alpha" "GAMMA  " "beta " "Beta" "" " zeta" "Zeta  " "alpha  "))
+(set DN 70000)
+(set DTX (map (fn [k] (at DB (% k 9))) (til DN)))
+(set DV (til DN))
+(set DTS (table [c v] (list (as 'SYMBOL DTX) DV)))
+(set DTT (table [c v] (list (as 'STR DTX) DV)))
+(.sys.exec "rm -rf /tmp/rfl_dko/") -- 0
+(.db.splayed.set "/tmp/rfl_dko/s/t/" DTS "/tmp/rfl_dko/s/.sym")
+(.db.splayed.set "/tmp/rfl_dko/t/t/" DTT "/tmp/rfl_dko/t/.sym")
+(set DSS (.db.splayed.get "/tmp/rfl_dko/s/t/" "/tmp/rfl_dko/s/.sym"))
+(set DST (.db.splayed.get "/tmp/rfl_dko/t/t/" "/tmp/rfl_dko/t/.sym"))
+(set DQ1 (fn [t] (as 'STR (at (select {n: (count v) from: t by: {k: (upper (trim c))}}) 'k))))
+(set DQ2 (fn [t] (set r (select {n: (count v) from: t by: {k: (upper (trim c)) p: (% v 2)}})) (list (as 'STR (at r 'k)) (at r 'p))))
+(DQ1 DTS) -- ["" "ALPHA" "GAMMA" "BETA" "ZETA"]
+(DQ1 DSS) -- ["" "ALPHA" "GAMMA" "BETA" "ZETA"]
+(DQ1 DTT) -- ["ALPHA" "GAMMA" "BETA" "" "ZETA"]
+(DQ1 DST) -- ["ALPHA" "GAMMA" "BETA" "" "ZETA"]
+(DQ2 DTS) -- (list ["" "ALPHA" "GAMMA" "BETA" "ZETA" "" "ALPHA" "GAMMA" "BETA" "ZETA"] [0 0 0 0 0 1 1 1 1 1])
+(DQ2 DSS) -- (list ["" "ALPHA" "GAMMA" "BETA" "ZETA" "" "ALPHA" "GAMMA" "BETA" "ZETA"] [0 0 0 0 0 1 1 1 1 1])
+(DQ2 DTT) -- (list ["ALPHA" "ALPHA" "GAMMA" "BETA" "BETA" "" "ZETA" "ZETA" "GAMMA" ""] [0 1 0 1 0 1 0 1 1 0])
+(DQ2 DST) -- (list ["ALPHA" "ALPHA" "GAMMA" "BETA" "BETA" "" "ZETA" "ZETA" "GAMMA" ""] [0 1 0 1 0 1 0 1 1 0])
+(.sys.exec "rm -rf /tmp/rfl_dko/") -- 0

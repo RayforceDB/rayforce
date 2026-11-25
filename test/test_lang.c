@@ -44,9 +44,12 @@
 #include <stdio.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <limits.h>   /* PATH_MAX */
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #ifndef RAY_OS_WINDOWS
 #include <pthread.h>   /* pthread_kill -- the .time.sleep cancel test */
 #include <signal.h>
@@ -914,6 +917,54 @@ static test_result_t test_closure_tmpl_live_entry_own_nfo(void) {
         ray_release(c);
         TEST_ASSERT_FMT(own, "case %zu: the closure does not carry its definition's text", d);
     }
+    PASS();
+}
+
+/* ---- #1615: a like pattern's dropped plan-time error leaves no trace ----
+ * A pattern computed from no column is evaluated once when the query is
+ * planned; when that raises, the error is dropped and the pattern keeps its
+ * deferred route.  A select that keeps no row then answers no rows, and the
+ * thread's last-error message and usage, the VM's trace and its pending
+ * raise are what they were before the select. */
+static test_result_t test_like_pattern_probe_leaves_no_trace(void) {
+    ray_t* r = ray_eval_str("(set T1615 (table [t v] (list (as 'STR (list \"ab\" \"cd\")) [0 1])))");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    static const char* const qs[] = {
+        "(select {k: (like t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (ilike t (take \"a*\" \"bad\")) from: T1615 where: (< v 0)})",
+        "(select {k: (sum (like t (take \"a*\" \"bad\"))) by: v from: T1615 where: (< v 0)})",
+        "(select {k: (if (> v 5) (like t (take \"a*\" \"bad\")) false) from: T1615 where: (< v 0)})",
+    };
+    for (int before = 0; before < 2; before++) {
+        for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+            ray_error_clear();
+            const char* prior = NULL;
+            if (before) {          /* an earlier error's message stays the last one */
+                r = ray_eval_str("(+ 1 'a)");
+                TEST_ASSERT_TRUE(r && RAY_IS_ERR(r));
+                ray_error_free(r);
+                prior = ray_error_msg();
+                TEST_ASSERT_NOT_NULL(prior);
+            }
+            char saved[256] = "";
+            if (prior) snprintf(saved, sizeof saved, "%s", prior);
+            const char* usage0 = ray_error_usage();
+            ray_t* trace0 = __VM->trace;
+            ray_t* raise0 = __VM->raise_val;
+            r = ray_eval_str(qs[i]);
+            TEST_ASSERT_FMT(r && !RAY_IS_ERR(r) && r->type == RAY_TABLE && ray_table_nrows(r) == 0,
+                            "query %zu: not an empty table", i);
+            ray_release(r);
+            const char* now = ray_error_msg();
+            TEST_ASSERT_FMT(before ? (now && strcmp(now, saved) == 0) : now == NULL,
+                            "query %zu: last message %s", i, now ? now : "<none>");
+            TEST_ASSERT_FMT(ray_error_usage() == usage0, "query %zu: usage changed", i);
+            TEST_ASSERT_FMT(__VM->trace == trace0, "query %zu: trace changed", i);
+            TEST_ASSERT_FMT(__VM->raise_val == raise0, "query %zu: pending raise changed", i);
+        }
+    }
+    ray_error_clear();
     PASS();
 }
 
@@ -9897,6 +9948,71 @@ static test_result_t test_time_sleep_cancel(void) {
     PASS();
 }
 
+/* ---- #1623: the interrupt flag is one atomic, shared by every thread ----
+ * A take consumes exactly one pending interrupt: a request is seen once,
+ * and a take with nothing pending finds nothing.  Single-threaded. */
+static test_result_t test_interrupt_take(void) {
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_interrupted());
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* requests do not stack: two before a take are one interrupt */
+    ray_request_interrupt();
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    /* a clear drops a pending one */
+    ray_request_interrupt();
+    ray_clear_interrupt();
+    TEST_ASSERT_FALSE(ray_take_interrupt());
+    PASS();
+}
+
+/* Threads that request, clear, look at and take the interrupt at once, as
+ * an in-process IPC server (a clear per request) and client threads (a look
+ * before each wait, a take to forward a Ctrl-C) do.  Under ThreadSanitizer
+ * the flag being a plain volatile reported a data race on every pair; as an
+ * atomic it reports none.  The count of takes that found an interrupt can
+ * never exceed the requests made (a take consumes one, nothing invents
+ * one).  Named for the TSan job's `parallel` filter. */
+#define IFLAG_THREADS 3
+#define IFLAG_ITERS   20000
+static _Atomic int64_t g_iflag_requests, g_iflag_taken;
+static void iflag_worker(void* arg) {
+    int role = (int)(intptr_t)arg;
+    for (int i = 0; i < IFLAG_ITERS; i++) {
+        switch ((role + i) % 4) {
+        case 0: ray_request_interrupt(); atomic_fetch_add(&g_iflag_requests, 1); break;
+        case 1: ray_clear_interrupt(); break;
+        case 2: (void)ray_interrupted(); break;
+        default: if (ray_take_interrupt()) atomic_fetch_add(&g_iflag_taken, 1); break;
+        }
+    }
+}
+
+static test_result_t test_interrupt_flag_threads(void) {
+    ray_clear_interrupt();
+    atomic_store(&g_iflag_requests, 0);
+    atomic_store(&g_iflag_taken, 0);
+    ray_thread_t tid[IFLAG_THREADS];
+    for (int t = 0; t < IFLAG_THREADS; t++)
+        TEST_ASSERT_EQ_I(ray_thread_create(&tid[t], iflag_worker, (void*)(intptr_t)t), RAY_OK);
+    iflag_worker((void*)(intptr_t)IFLAG_THREADS);
+    for (int t = 0; t < IFLAG_THREADS; t++) ray_thread_join(tid[t]);
+    int64_t taken = atomic_load(&g_iflag_taken), asked = atomic_load(&g_iflag_requests);
+    ray_clear_interrupt();
+    TEST_ASSERT_FMT(taken <= asked, "%lld takes found an interrupt, %lld were requested",
+                    (long long)taken, (long long)asked);
+    /* the flag is usable afterwards, as it was */
+    ray_request_interrupt();
+    TEST_ASSERT_TRUE(ray_take_interrupt());
+    TEST_ASSERT_FALSE(ray_interrupted());
+    PASS();
+}
+
 /* Under -U a sleep is refused: it would stop the single-threaded server
  * for every connection, as .sys.exec "sleep" would, and that is restricted. */
 static test_result_t test_time_sleep_restricted(void) {
@@ -14947,6 +15063,171 @@ static test_result_t test_builtin_row_shape(void) {
     PASS();
 }
 
+/* ---- #1564: the function reference lists every registered builtin ----
+ * docs/docs/reference/all-functions.md has a "Registered Builtin Surface"
+ * section, one subsection per arity, that claims the complete registered
+ * name surface (#1565; scripts/check-builtin-docs.py checks it by hand).
+ * This walks the global environment of the built binary, as
+ * lang/builtin_row_shape does, so the suite enforces it on every platform:
+ * every registered builtin must be listed under its arity, and every listed
+ * name must be registered under the arity it is listed with.  A unary
+ * builtin the evaluator promotes to a two-argument form (min, max) is
+ * listed under Binary as well, and must be. */
+#define BDOC_REL "docs/docs/reference/all-functions.md"
+
+/* The repository root, decided once as the suite decides it for its
+ * fixtures: RFL_ROOT/../.. when RFL_ROOT (<repo>/test/rfl) is set, else
+ * the directory the runner was started from (it works in a private
+ * directory of its own).  The page is <root>/docs/docs/reference/... */
+/* src into buf of cap bytes, or "" when it does not fit (the docs tree is
+ * then not found there, and the test fails or skips on that path) */
+static void bdoc_copy(char* buf, size_t cap, const char* src) {
+    size_t n = strlen(src);
+    if (n < cap) memcpy(buf, src, n + 1);
+    else buf[0] = 0;
+}
+
+static void bdoc_root(char* buf, size_t cap) {
+    const char* rfl = getenv("RFL_ROOT");
+    const char* launch = ray_test_launch_dir();
+    if (rfl && *rfl) {
+        /* a relative RFL_ROOT is relative to the launch directory, as the
+         * driver read it, not to the runner's private directory */
+        char joined[2048];
+        if (rfl[0] != '/' && launch) snprintf(joined, sizeof joined, "%s/%s/../..", launch, rfl);
+        else snprintf(joined, sizeof joined, "%s/../..", rfl);
+#if !defined(_WIN32)
+        char real[PATH_MAX];
+        if (realpath(joined, real)) { bdoc_copy(buf, cap, real); return; }
+#endif
+        bdoc_copy(buf, cap, joined);
+        return;
+    }
+    bdoc_copy(buf, cap, launch ? launch : ".");
+}
+
+/* the backticked names of the subsection `head` of the surface section,
+ * as one string " a b c " for whole-word lookup */
+static char* bdoc_names(const char* doc, const char* head) {
+    const char* sec = strstr(doc, "\n## Registered Builtin Surface");
+    if (!sec) return NULL;
+    const char* end = strstr(sec + 1, "\n## ");
+    if (!end) end = sec + strlen(sec);
+    const char* p = strstr(sec, head);
+    if (!p || p > end) return NULL;
+    p += strlen(head);
+    const char* q = strstr(p, "\n### ");
+    if (!q || q > end) q = end;
+    char* out = malloc((size_t)(q - p) + 3);
+    if (!out) return NULL;
+    size_t n = 0;
+    out[n++] = ' ';
+    while (p < q) {
+        const char* a = memchr(p, '`', (size_t)(q - p));
+        if (!a) break;
+        const char* b = memchr(a + 1, '`', (size_t)(q - a - 1));
+        if (!b) break;
+        memcpy(out + n, a + 1, (size_t)(b - a - 1));
+        n += (size_t)(b - a - 1);
+        out[n++] = ' ';
+        p = b + 1;
+    }
+    out[n] = 0;
+    return out;
+}
+
+static bool bdoc_has(const char* names, const char* nm) {
+    char w[160];
+    snprintf(w, sizeof w, " %s ", nm);
+    return names && strstr(names, w) != NULL;
+}
+
+static test_result_t test_builtin_doc_surface(void) {
+    char root[900], docs[1024], path[1100];
+    bdoc_root(root, sizeof root);
+    snprintf(docs, sizeof docs, "%s/docs", root);
+    snprintf(path, sizeof path, "%s/" BDOC_REL, root);
+    const char* bdoc_path = path;
+    /* No docs tree at the root (an install, or a run outside the checkout):
+     * nothing to check.  Any other outcome is checked: a docs tree that
+     * cannot be looked at, a page that cannot be read, an empty page or one
+     * without the section fails, so the test cannot pass on nothing. */
+    struct stat st;
+    if (stat(docs, &st) != 0) {
+        if (errno == ENOENT)
+            SKIP("no docs tree at the repository root (RFL_ROOT/../.., else the launch directory)");
+        FAILF("%s: %s", docs, strerror(errno));
+    }
+    FILE* f = fopen(bdoc_path, "rb");
+    TEST_ASSERT_FMT(f != NULL, "%s: %s", bdoc_path, strerror(errno));
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); FAIL("the function reference page is empty or unreadable"); }
+    char* doc = malloc((size_t)sz + 1);
+    if (!doc) { fclose(f); FAIL("out of memory reading the function reference"); }
+    size_t got = fread(doc, 1, (size_t)sz, f);
+    fclose(f);
+    doc[got] = 0;
+    TEST_ASSERT_FMT(got == (size_t)sz, "%s: read %zu of %ld bytes", bdoc_path, got, sz);
+    static const char* const heads[3] = { "### Unary\n", "### Binary\n", "### Variadic / Special\n" };
+    static const char* const arity[3] = { "Unary", "Binary", "Variadic / Special" };
+    char* names[3];
+    for (int k = 0; k < 3; k++) names[k] = bdoc_names(doc, heads[k]);
+    free(doc);
+    TEST_ASSERT_FMT(names[0] && names[1] && names[2], "%s: no Registered Builtin Surface section", bdoc_path);
+
+    int32_t cap = ray_env_global_count() + 16;
+    int64_t* ids = calloc((size_t)cap, sizeof(int64_t));
+    ray_t** vals = calloc((size_t)cap, sizeof(ray_t*));
+    TEST_ASSERT_NOT_NULL(ids);
+    TEST_ASSERT_NOT_NULL(vals);
+    int32_t n = ray_env_list(ids, vals, cap);
+    static char bad[8192];
+    size_t bl = 0;
+    bad[0] = 0;
+    /* registered, one string per arity in the lookup form, to check the
+     * list back: a name a subsection lists must be registered under it */
+    size_t rcap = (size_t)n * 64 + 2;
+    char* reg[3];
+    size_t rl[3] = { 0, 0, 0 };
+    for (int k = 0; k < 3; k++) {
+        reg[k] = malloc(rcap);
+        TEST_ASSERT_NOT_NULL(reg[k]);
+        reg[k][rl[k]++] = ' ';
+        reg[k][rl[k]] = 0;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        ray_t* fn = vals[i];
+        if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) continue;
+        ray_t* s = ray_sym_str(ids[i]);
+        if (!s) continue;
+        char nm[128];
+        snprintf(nm, sizeof nm, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
+        int k = fn->type == RAY_UNARY ? 0 : fn->type == RAY_BINARY ? 1 : 2;
+        /* a unary builtin with a two-argument form is a Binary entry too */
+        bool also_binary = k == 0 && ray_fn_row_arg(fn, 2, 1);
+        for (int a = 0; a < 3; a++) {
+            if (a != k && !(a == 1 && also_binary)) continue;
+            if (rl[a] + strlen(nm) + 2 < rcap) rl[a] += (size_t)snprintf(reg[a] + rl[a], rcap - rl[a], "%s ", nm);
+            if (!bdoc_has(names[a], nm) && bl < sizeof bad - 200)
+                bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s(missing from %s)", nm, arity[a]);
+        }
+    }
+    /* every listed name is registered under the arity it is listed with */
+    for (int k = 0; k < 3; k++) {
+        for (char* w = strtok(names[k], " "); w; w = strtok(NULL, " "))
+            if (!bdoc_has(reg[k], w) && bl < sizeof bad - 200)
+                bl += (size_t)snprintf(bad + bl, sizeof bad - bl, " %s(listed under %s, not registered so)", w, arity[k]);
+        free(names[k]);
+        free(reg[k]);
+    }
+    free(ids);
+    free(vals);
+    TEST_ASSERT_FMT(bl == 0, BDOC_REL " Registered Builtin Surface:%.1900s", bad);
+    PASS();
+}
+
 /* ---- #1462: no number from outside the process becomes a private id ----
  * A legacy table frame names its columns by raw ids (an I64 schema): one in
  * the private range is refused, a real one still decodes. */
@@ -15085,6 +15366,7 @@ static test_result_t test_sym_private_range(void) {
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
+    { "lang/query/like_pattern_probe_leaves_no_trace", test_like_pattern_probe_leaves_no_trace, lang_setup, lang_teardown },
     { "lang/callprof/repeated_requests", test_callprof_repeated_requests, lang_setup, lang_teardown },
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
@@ -15430,6 +15712,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
     { "lang/time_sleep_cancel", test_time_sleep_cancel, lang_setup, lang_teardown },
     { "lang/time_sleep_restricted", test_time_sleep_restricted, lang_setup, lang_teardown },
+    { "lang/interrupt_take", test_interrupt_take, lang_setup, lang_teardown },
+    { "lang/parallel_interrupt_flag", test_interrupt_flag_threads, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },
     { "lang/eval/restricted_parquet", test_eval_restricted_parquet, lang_setup, lang_teardown },
     { "lang/eval/restricted_fn", test_eval_restricted_fn, lang_setup, lang_teardown },
@@ -15604,6 +15888,7 @@ const test_entry_t lang_entries[] = {
     { "lang/io/read_unsized_bounded", test_read_unsized_stream_is_bounded, lang_setup, lang_teardown },
     { "lang/io/exec_capture_bounded", test_exec_capture_is_bounded, lang_setup, lang_teardown },
     { "lang/builtin_row_shape", test_builtin_row_shape, lang_setup, lang_teardown },
+    { "lang/builtin_doc_surface", test_builtin_doc_surface, lang_setup, lang_teardown },
     { "lang/sym_private_range", test_sym_private_range, lang_setup, lang_teardown },
     { "lang/serde_private_schema_id", test_serde_private_schema_id, lang_setup, lang_teardown },
     { "lang/col_private_sym_cell", test_col_private_sym_cell, lang_setup, lang_teardown },

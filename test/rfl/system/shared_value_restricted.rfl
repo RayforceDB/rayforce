@@ -1,0 +1,91 @@
+;; @requires: posix  (the server is started and stopped through a POSIX shell)
+;; A restricted (-U) client builds, with `let` and `times`, a value that holds
+;; one part twice on each of 60 levels (61 lists, 2^60 paths) and has the
+;; server hash it, compare it, map over it or reply with it (#1627).  Each
+;; used to hold the server thread for good; now each answers at once, with
+;; a value or a limit error, and the server goes on answering.
+(.sys.exec "rm -rf /tmp/rftest_sharedval; mkdir -p /tmp/rftest_sharedval; true") -- 0
+(.sys.exec "test/serve.sh --listen /tmp/rftest_sharedval/s -U pw") -- 0
+(set h (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_sharedval/s/port")) ":u:pw"))))
+(set ask (fn [src] (try (.ipc.send h src) (fn [e] (get e 'code)))))
+
+;; the reply is the value itself: ser refuses it
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) L))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (let M (list 1)) (times 60 (let M (list M M))) (count (distinct (list L M)))))") -- 1
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (let M (list 1)) (times 60 (let M (list M M))) (identical L M)))") -- true
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (let M (list 1)) (times 60 (let M (list M M))) (type (== L M))))") -- 'LIST
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (dict [a b] (list 1 2))) (times 60 (let L (dict [a b] (list L L)))) (count (group (list L L)))))") -- 1
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let T (table [a] (list (list 1)))) (times 40 (let T (table [a b] (list (list T) (list T))))) (count (distinct (list T T)))))") -- 1
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (let M (list 1)) (times 60 (let M (list M M))) (type (and L M))))") -- 'LIST
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (type (or L 0))))") -- 'LIST
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (let M (list 1)) (times 60 (let M (list M M))) (type (not-in L (list M)))))") -- 'LIST
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (format \"%\" L)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+;; the text writers refuse the shape at once, during the request itself
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (.json.format L)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (println L)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(< (.sys.exec "[ $(wc -c < /tmp/rftest_sharedval/s/server.log) -lt 100000 ]") 1) -- true
+(.ipc.send h "(+ 1 2)") -- 3
+;; shared string data is charged at its length: a symbol vector of long
+;; names, a string vector of long strings, a long string atom
+(ask "((fn [] (let s (take \"a\" 1000)) (let v (as 'SYM (map (fn [i] s) (til 1000)))) (map (fn [i] v) (til 1100))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (as 'STR (map (fn [i] (take \"b\" 100000)) (til 100)))) (map (fn [i] v) (til 120))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let s (take \"c\" 1000000)) (take (list s) 1100)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+;; print counts what it prints: 15,000 references to a 100,000-cell vector,
+;; printed to /dev/null by a process of its own, stop with limit
+(.sys.exec "printf '%s\\n' \"(set v (til 100000))\" \"(set V (map (fn [i] v) (til 15000)))\" \"(exit (if (== (try (do (println V) 0) (fn [e] (get e 'code))) 'limit) 0 3))\" > /tmp/rftest_sharedval/print.rfl") -- 0
+(.sys.exec "./rayforce -c 1 /tmp/rftest_sharedval/print.rfl > /dev/null") -- 0
+;; one budget per call (#1648): three lists of 4,300 references to one
+;; 100,000-cell vector each write 860 MB again, inside the budget alone, and
+;; are refused at once in one call; println prints nothing
+(.sys.exec "wc -c < /tmp/rftest_sharedval/s/server.log > /tmp/rftest_sharedval/n0") -- 0
+(ask "((fn [] (let z (take [0] 100000)) (let a (map (fn [i] z) (til 4300))) (let b (map (fn [i] z) (til 4300))) (let c (map (fn [i] z) (til 4300))) (count (format \"% % %\" a b c))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let z (take [0] 100000)) (let a (map (fn [i] z) (til 4300))) (let b (map (fn [i] z) (til 4300))) (let c (map (fn [i] z) (til 4300))) (println a b c)))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+;; println refuses before its first byte: the 600 KB of text ahead of the
+;; first repeat is not printed either
+(ask "((fn [] (let L (list 1)) (times 60 (let L (list L L))) (println (list (til 100000) L))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(.sys.exec "[ $(wc -c < /tmp/rftest_sharedval/s/server.log) -eq $(cat /tmp/rftest_sharedval/n0) ]") -- 0
+;; string atoms copied cell by cell: a shared 1 MB string copied again 1,099
+;; times is refused, in a cast, a map and a raze; a set for in
+;; copies it once
+(ask "((fn [] (let s (take \"c\" 1000000)) (count (as 'STR (take (list s) 1100)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let s (take \"c\" 1000000)) (count (map (fn [i] s) (til 1100)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let s (take \"c\" 1000000)) (count (raze (take (list s) 1100)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (til 1000000)) (count (raze (take (list v) 300)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (concat (til 1000000) 0N)) (count (raze (take (list v) 300)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let l (as 'LIST (til 100000))) (count (raze (take (list l) 3000)))))") -- 'limit
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let v (til 1000)) (count (raze (take (list v) 300)))))") -- 300000
+(ask "((fn [] (let s (take \"c\" 1000000)) (in [\"x\"] (take (list s) 100000))))") -- [false]
+(.ipc.send h "(+ 1 2)") -- 3
+(ask "((fn [] (let s (take \"c\" 1000000)) (count (as 'STR (take (list s) 100)))))") -- 100
+;; the exact count is per call too: two lists of 1,300 references to one
+;; 100,000-cell vector of 500 KB of text write 650 MB again each, 1.3 GB in
+;; one println, printed to /dev/null by a process of its own: limit
+(.sys.exec "printf '%s\\n' \"(set f (take [0.123457] 100000))\" \"(set A (map (fn [i] f) (til 1300)))\" \"(set B (map (fn [i] f) (til 1300)))\" \"(exit (if (== (try (do (println A B) 0) (fn [e] (get e 'code))) 'limit) 0 3))\" > /tmp/rftest_sharedval/print2.rfl") -- 0
+(.sys.exec "./rayforce -c 1 /tmp/rftest_sharedval/print2.rfl > /dev/null") -- 0
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rftest_sharedval/s") -- 0
+(.sys.exec "rm -rf /tmp/rftest_sharedval; true") -- 0

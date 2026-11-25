@@ -1,0 +1,103 @@
+;; @also-unfused
+;; A `while` tests its condition as one truth value, unlike `if`, which
+;; chooses per row for a boolean vector.  Inside a query, a helper or a lambda
+;; called with a column gets a `while` condition over the query's rows (or a
+;; group's), run as bytecode or on the tree walker.  A condition true on every
+;; row is true and one false on every row is false; one that differs between
+;; the rows raises `nyi`, since a loop cannot take a different number of
+;; passes per row (#1630).  The projection runs the helper once per row.
+
+(set n 20)
+(set T (table [a i g] (list (at ['x 'y 'z 'w] (% (til n) 4)) (til n) (% (til n) 2))))
+;; rows above 15 subtract 100 once: the condition differs between the rows
+(set Wl (fn [v] (let k 0) (while (> v 15) (let v (- v 100))) v))
+;; never true: the loop does not run
+(set Wf (fn [v] (let k 0) (while (< v 0) (let v (+ v 1))) v))
+;; true on every row, then false on every row: one pass
+(set Wt (fn [v] (let k 0) (let s 0) (while (>= v 0) (let v (- v 100)) (let s (+ s 1))) s))
+
+;; ── 1. a condition that differs between the rows raises ──
+(select {from: T where: (> (Wl i) 0)}) !- nyi
+(select {s: (sum (Wl i)) from: T by: g}) !- nyi
+(update {m: 1 from: T where: (> (Wl i) 0)}) !- nyi
+(try (select {from: T where: (> (Wl i) 0)}) (fn [e] (at e 'code))) -- 'nyi
+
+;; ── 2. a condition the same on every row is that truth ──
+(at (select {from: T where: (> (Wf i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> (Wt i) 0)}) 'i) -- (til 20)
+;; under by: the helper runs once per group, over its rows: one pass each
+(at (select {s: (sum (Wt i)) from: T by: g}) 's) -- [1 1]
+
+;; ── 3. one row at a time: the projection, and outside a query ──
+(at (select {m: (Wl i) from: T}) 'm) -- [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 -84 -83 -82 -81]
+(Wl 16) -- -84
+(Wt 3) -- 1
+
+;; ── 4. a condition built with `and` / `or` is seen the same (#1647) ──
+;; `and` and `or` build their value from every operand, so it is a value over
+;; the rows when one operand is; taking the last operand's provenance (a
+;; literal here) left it tested whole, and these loops never ended.
+(set Wla (fn [v] (let k 0) (while (and (> v 15) true) (let v (- v 100))) v))
+(set Wlo (fn [v] (let k 0) (while (or (> v 15) false) (let v (- v 100))) v))
+(set Wfa (fn [v] (let k 0) (while (and (< v 0) true) (let v (+ v 1))) v))
+(set Wfo (fn [v] (let k 0) (while (or (< v 0) false) (let v (+ v 1))) v))
+(set Wta (fn [v] (let k 0) (let s 0) (while (and (>= v 0) true) (let v (- v 100)) (let s (+ s 1))) s))
+(set Wto (fn [v] (let k 0) (let s 0) (while (or (>= v 0) false) (let v (- v 100)) (let s (+ s 1))) s))
+;; the rows disagree: raises, on the whole table and per group
+(select {from: T where: (> (Wla i) 0)}) !- nyi
+(select {from: T where: (> (Wlo i) 0)}) !- nyi
+(select {s: (sum (Wla i)) from: T by: g}) !- nyi
+(select {s: (sum (Wlo i)) from: T by: g}) !- nyi
+;; false on every row: the loop does not run
+(at (select {from: T where: (> (Wfa i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> (Wfo i) 15)}) 'i) -- [16 17 18 19]
+(at (select {s: (sum (Wfa i)) from: T by: g}) 's) -- [90 100]
+(at (select {s: (sum (Wfo i)) from: T by: g}) 's) -- [90 100]
+;; true on every row, then false on every row: one pass
+(at (select {from: T where: (> (Wta i) 0)}) 'i) -- (til 20)
+(at (select {from: T where: (> (Wto i) 0)}) 'i) -- (til 20)
+(at (select {s: (sum (Wta i)) from: T by: g}) 's) -- [1 1]
+(at (select {s: (sum (Wto i)) from: T by: g}) 's) -- [1 1]
+;; a lambda literal, as a read-only client can send it: its `while` runs on
+;; the tree walker (ray_while_fn), which tested a vector condition whole too,
+;; so even a plain condition false on every row never ended
+(at (select {from: T where: (> ((fn [v] (let k 0) (while (< v 0) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> ((fn [v] (let k 0) (while (and (< v 0) true) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+(at (select {s: (sum ((fn [v] (let k 0) (while (or (< v 0) false) (let v (+ v 1))) v) i)) from: T by: g}) 's) -- [90 100]
+(select {from: T where: (> ((fn [v] (let k 0) (while (> v 15) (let v (- v 100))) v) i) 0)}) !- nyi
+(select {from: T where: (> ((fn [v] (let k 0) (while (and (> v 15) true) (let v (- v 100))) v) i) 0)}) !- nyi
+(select {s: (sum ((fn [v] (let k 0) (while (or (> v 15) false) (let v (- v 100))) v) i)) from: T by: g}) !- nyi
+(at (select {from: T where: (> ((fn [v] (let k 0) (let s 0) (while (and (>= v 0) true) (let v (- v 100)) (let s (+ s 1))) s) i) 0)}) 'i) -- (til 20)
+(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (or (>= v 0) false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [1 1]
+;; ── 5. whatever computes the condition (#1647) ──
+;; Every vector condition as long as the rows is tested, whatever computed
+;; it: an `if`'s per-row result took its arms' provenance (`true`, `false`),
+;; and the loop never ended
+(set Wif (fn [v] (let k 0) (while (if (> v 15) true false) (let v (- v 100))) v))
+(set Wiff (fn [v] (let k 0) (while (if (< v 0) true false) (let v (+ v 1))) v))
+(set Wift (fn [v] (let k 0) (let s 0) (while (if (>= v 0) true false) (let v (- v 100)) (let s (+ s 1))) s))
+(select {from: T where: (> (Wif i) 0)}) !- nyi
+(select {s: (sum (Wif i)) from: T by: g}) !- nyi
+(select {from: T where: (> ((fn [v] (let k 0) (while (if (> v 15) true false) (let v (- v 100))) v) i) 0)}) !- nyi
+(at (select {from: T where: (> (Wiff i) 15)}) 'i) -- [16 17 18 19]
+(at (select {s: (sum (Wiff i)) from: T by: g}) 's) -- [90 100]
+(at (select {from: T where: (> ((fn [v] (let k 0) (while (if (< v 0) true false) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> (Wift i) 0)}) 'i) -- (til 20)
+(at (select {s: (sum (Wift i)) from: T by: g}) 's) -- [1 1]
+(at (select {s: (sum ((fn [v] (let k 0) (let s 0) (while (if (>= v 0) true false) (let v (- v 100)) (let s (+ s 1))) s) i)) from: T by: g}) 's) -- [1 1]
+;; a cast, a `try`, a lambda applied to the condition
+(at (select {from: T where: (> ((fn [v] (let k 0) (while (as 'B8 (< v 0)) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> ((fn [v] (let k 0) (while (try (< v 0) (fn [e] false)) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+(at (select {from: T where: (> ((fn [v] (let k 0) (while ((fn [z] z) (< v 0)) (let v (+ v 1))) v) i) 15)}) 'i) -- [16 17 18 19]
+;; a vector of another type over the rows cannot decide one loop
+(select {from: T where: (> ((fn [v] (let k 0) (while (if (< v 0) 1 0) (let v (+ v 1))) v) i) 15)}) !- nyi
+(select {from: T where: (> ((fn [v] (let k 0) (while (+ v 0) (let v (- v 1))) v) i) 15)}) !- nyi
+;; no rows: false, the loop does not run
+(set E (table [i g] (list (til 0) (til 0))))
+(count (select {from: E where: (> ((fn [v] (let k 0) (while (< v 0) (let v (+ v 1))) v) i) 15)})) -- 0
+(count (select {from: E where: (> (Wiff i) 15)})) -- 0
+
+;; outside a query, one value: unchanged
+(Wla 16) -- -84
+(Wfa 3) -- 3
+(Wta 3) -- 1

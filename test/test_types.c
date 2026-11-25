@@ -199,6 +199,47 @@ static test_result_t test_fn_name_builtin(void) {
     PASS();
 }
 
+#ifdef DEBUG
+/* #1633: TIMESTAMP / TIMESPAN / I64 vector + and - with a TIMESPAN, and the
+ * comparisons with one, run whole-vector kernels: no row goes through the
+ * per-cell span_eval loop.  Nor does a select output of TIMESTAMP plus a
+ * span, which the planner now lowers instead of evaluating it row by row
+ * (its per-row fallback called the atom path once a row).  The control, a
+ * DATE moved by a span (the unit conversion stays per cell), still counts,
+ * so the hook is live.  The answers are pinned in
+ * test/rfl/arith/timespan_vector_kernels.rfl. */
+static test_result_t test_timespan_vector_kernels_route(void) {
+    ray_t* r = ray_eval_str("(do (set KTS (+ 2024.03.05D00:00:00.000000000 (* 0D00:00:00.00864 (til 100000)))) "
+                            "(set KSP (* 0D00:00:00.000000001 (til 100000))) "
+                            "(set KT (table [ts sp] (list KTS KSP))) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    static const char* const qs[] = {
+        "(+ KTS 0D01:00:00)", "(- KTS 0D01:00:00)", "(+ 0D01:00:00 KTS)", "(+ KSP 0D01:00:00)",
+        "(- KSP KSP)", "(+ KTS KSP)", "(+ KSP 3600000000000)", "(> KSP 0D01:00:00)",
+        "(== KSP KSP)", "(< KTS 0D12:00:00)", "(+ KTS 0Nn)",
+        "(select {from: KT a: (+ ts 0D01:00:00)})", "(select {from: KT a: (- 0D01:00:00 ts)})",
+        "(select {from: KT a: (+ ts sp)})", "(select {from: KT a: (+ sp 0D01:00:00)})",
+        "(select {from: KT a: (> sp 0D01:00:00)})",
+    };
+    for (size_t i = 0; i < sizeof qs / sizeof qs[0]; i++) {
+        int64_t before = ray_timespan_test_cell_rows();
+        r = ray_eval_str(qs[i]);
+        TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s failed", qs[i]);
+        ray_release(r);
+        int64_t rows = ray_timespan_test_cell_rows() - before;
+        TEST_ASSERT_FMT(rows == 0, "%s: %lld rows evaluated cell by cell", qs[i], (long long)rows);
+    }
+    int64_t before = ray_timespan_test_cell_rows();
+    r = ray_eval_str("(+ (as 'DATE (% (til 100000) 1000)) 0D01:00:00)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+    ray_release(r);
+    TEST_ASSERT_FMT(ray_timespan_test_cell_rows() - before >= 100000, "control: %lld",
+                    (long long)(ray_timespan_test_cell_rows() - before));
+    PASS();
+}
+#endif
+
 static test_result_t test_timespan_storage_tag(void) {
     ray_t* atom = ray_timespan(NULL_I64);
     TEST_ASSERT_FALSE(RAY_IS_ERR(atom));
@@ -253,6 +294,9 @@ static test_result_t test_timespan_dag_difference(void) {
 const test_entry_t types_entries[] = {
     { "types/timespan_dag_difference", test_timespan_dag_difference, types_runtime_setup, types_runtime_teardown },
     { "types/timespan_storage_tag", test_timespan_storage_tag, types_runtime_setup, types_runtime_teardown },
+#ifdef DEBUG
+    { "types/timespan_vector_kernels_route", test_timespan_vector_kernels_route, types_runtime_setup, types_runtime_teardown },
+#endif
     { "types/sizes_known_types", test_type_sizes_known_types, NULL, NULL },
     { "types/elem_size_macro", test_elem_size_macro, NULL, NULL },
     { "types/sizes_pointer_types", test_type_sizes_pointer_types, NULL, NULL },

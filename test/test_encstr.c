@@ -2555,10 +2555,137 @@ static test_result_t test_idict_kept_iff_fits(void) {
     PASS();
 }
 
+/* #1646: a whole decode of an FSST STR column measures each cell's expanded
+ * length once: the pool sizing (run a chunk per pool task) measures every
+ * FSST cell, and the decode expands each once into a buffer (on the
+ * stack, or from the heap for a vector holding a longer cell).  Several chunks, cells inline (12 bytes or
+ * less) and pooled, nulls and a few cells of 6000 bytes: the materialized
+ * column equals the one saved. */
+static const char* gen_1646(int64_t i, char* b) {
+    if (i % 101 == 0) return "";
+    if (i % 7 == 0) { snprintf(b, 64, "k%lld", (long long)(i % 9999)); return b; }
+    snprintf(b, 64, "category number %lld long", (long long)i);
+    return b;
+}
+static test_result_t test_fsst_measured_once(void) {
+    const int64_t n = 3 * 65536 + 777;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char b[64];
+    static char big[6001];
+    int64_t longs = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i % 50000 == 3) {
+            for (int k = 0; k < 6000; k++) big[k] = (char)('!' + (k * 7919 + i) % 90);
+            v = ray_str_vec_append(v, big, 6000);
+            longs++;
+            continue;
+        }
+        const char* x = gen_1646(i, b);
+        v = ray_str_vec_append(v, x, strlen(x));
+    }
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, STP("/m1646"), 2), RAY_OK);
+    int64_t fsst_rows = 0;
+    for (int64_t vec = 0; vec < ray_enc_nvecs(n); vec++)
+        if (st_desc_enc(STP("/m1646"), vec, NULL) == RAY_ENC_FSST) fsst_rows += ray_enc_vec_len(n, vec);
+    TEST_ASSERT_TRUE(fsst_rows > n / 2);
+    ray_t* c = ray_col_mmap(STP("/m1646"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    uint64_t before = ray_enccol_test_fsst_measured();
+    ray_t* m = ray_enccol_materialize(c);
+    uint64_t measured = ray_enccol_test_fsst_measured() - before;
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->len, n);
+    int64_t diff = 0;
+    for (int64_t i = 0; i < n; i++) {
+        size_t la = 0, lb = 0;
+        const char* pa = ray_str_vec_get(v, i, &la);
+        const char* pb = ray_str_vec_get(m, i, &lb);
+        if (la != lb || (la && memcmp(pa, pb, la) != 0)) diff++;
+    }
+    ray_release(c);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(diff, 0);
+    /* once per FSST cell: the long ones expand into a heap buffer */
+    TEST_ASSERT_FMT((int64_t)measured == fsst_rows && longs > 0,
+                    "measured %llu FSST cells, the column has %lld", (unsigned long long)measured, (long long)fsst_rows);
+    PASS();
+}
+
+/* #1645: which segments of a generation-2 STR column a like reads by
+ * vector.  A segment of STR_DICT vectors always (no string is decoded);
+ * one of FSST / RAW vectors is materialized as before when its decode
+ * fits the decode cache's budget, read in place once cached, and read by
+ * vector only when it does not fit.  Every answer equals the plain one. */
+#define LK_DIR ST_TMP "/lk"
+#define LK_MK \
+    "(set lc (fn [o] (table [k s] (list (+ o (til 70000)) (map (fn [j] (if (== 0 (% j 13)) \"\" (format \"category number % long\" (% j 37)))) (til 70000))))))" \
+    "(set un (fn [o] (table [k s] (list (+ o (til 70000)) (map (fn [j] (format \"order number %\" (+ o j))) (til 70000))))))"
+#define LK_SUM(T, PAT) "(sum (at (select {from: " T " where: (like s \"" PAT "\")}) 'k))"
+#define LK_SAME(T, R, PAT) "(== " LK_SUM(T, PAT) " " LK_SUM(R, PAT) ")"
+static test_result_t test_like_policy(void) {
+    ST_Q_OK(LK_MK);
+    const char* saves[] = {
+        "(.db.splayed.set \"" LK_DIR "/d/2026.01.01/t/\" (lc 0) \"" LK_DIR "/d/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/d/2026.01.02/t/\" (lc 70000) \"" LK_DIR "/d/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/u/2026.01.01/t/\" (un 0) \"" LK_DIR "/u/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/u/2026.01.02/t/\" (un 70000) \"" LK_DIR "/u/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/m/2026.01.01/t/\" (lc 0) \"" LK_DIR "/m/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/m/2026.01.02/t/\" (un 70000) \"" LK_DIR "/m/.sym\" {compress: true})",
+        "(.db.splayed.set \"" LK_DIR "/p/2026.01.01/t/\" (lc 0) \"" LK_DIR "/p/.sym\" {compress: false})",
+        "(.db.splayed.set \"" LK_DIR "/p/2026.01.02/t/\" (lc 70000) \"" LK_DIR "/p/.sym\" {compress: false})",
+        "(.db.splayed.set \"" LK_DIR "/q/2026.01.01/t/\" (un 0) \"" LK_DIR "/q/.sym\" {compress: false})",
+        "(.db.splayed.set \"" LK_DIR "/q/2026.01.02/t/\" (un 70000) \"" LK_DIR "/q/.sym\" {compress: false})",
+        "(.db.splayed.set \"" LK_DIR "/r/2026.01.01/t/\" (lc 0) \"" LK_DIR "/r/.sym\" {compress: false})",
+        "(.db.splayed.set \"" LK_DIR "/r/2026.01.02/t/\" (un 70000) \"" LK_DIR "/r/.sym\" {compress: false})",
+    };
+    for (size_t i = 0; i < sizeof saves / sizeof saves[0]; i++) ST_Q_OK(saves[i]);
+    ST_Q_OK("(set D (.db.parted.get \"" LK_DIR "/d\" 't))");
+    ST_Q_OK("(set U (.db.parted.get \"" LK_DIR "/u\" 't))");
+    ST_Q_OK("(set P (.db.parted.get \"" LK_DIR "/p\" 't))");
+    ST_Q_OK("(set Q (.db.parted.get \"" LK_DIR "/q\" 't))");
+    ST_Q_OK("(set R (.db.parted.get \"" LK_DIR "/r\" 't))");
+
+    /* dictionary vectors: by vector, nothing decoded */
+    uint64_t bv = ray_like_test_by_vector();
+    int64_t cache0 = ray_enccol_cache_bytes();
+    ST_Q_TRUE(LK_SAME("D", "P", "*number 1? long"));
+    ST_Q_TRUE(LK_SAME("D", "P", ""));
+    TEST_ASSERT_EQ_U(ray_like_test_by_vector() - bv, 4);
+    TEST_ASSERT_EQ_I(ray_enccol_cache_bytes(), cache0);
+
+    /* FSST / RAW vectors whose decode fits the budget: decoded whole, as before */
+    bv = ray_like_test_by_vector();
+    ST_Q_TRUE(LK_SAME("U", "Q", "order number 1*"));
+    TEST_ASSERT_EQ_U(ray_like_test_by_vector() - bv, 0);
+    int64_t cache1 = ray_enccol_cache_bytes();
+    TEST_ASSERT_TRUE(cache1 > cache0);
+
+    /* already cached: read in place, nothing decoded again */
+    ST_Q_TRUE(LK_SAME("U", "Q", "*7?"));
+    TEST_ASSERT_EQ_U(ray_like_test_by_vector() - bv, 0);
+    TEST_ASSERT_TRUE(ray_enccol_cache_bytes() <= cache1);   /* no decode added */
+
+    /* a budget the decode does not fit: by vector, nothing decoded; the
+     * dictionary partition by vector as always */
+    int64_t prev = ray_heap_anon_watermark();
+    ray_heap_set_anon_watermark(ray_enccol_cache_bytes() * 4 + (1 << 20));
+    ST_Q_OK("(set M (.db.parted.get \"" LK_DIR "/m\" 't))");
+    bv = ray_like_test_by_vector();
+    bool same = st_q_true(LK_SAME("M", "R", "*1*"));
+    uint64_t got = ray_like_test_by_vector() - bv;
+    int64_t cache2 = ray_enccol_cache_bytes();
+    ray_heap_set_anon_watermark(prev);
+    TEST_ASSERT_FMT(same, "%s", st_msg);
+    TEST_ASSERT_EQ_U(got, 2);
+    TEST_ASSERT_TRUE(cache2 <= cache1);                     /* no decode added */
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
     { "encstr/fsst_train_verdict", test_fsst_train_verdict, st_setup, st_teardown },
+    { "encstr/fsst_measured_once", test_fsst_measured_once, st_setup, st_teardown },
     { "encstr/writer_strdict",     test_writer_strdict,     st_setup, st_teardown },
     { "encstr/writer_fsst",        test_writer_fsst,        st_setup, st_teardown },
     { "encstr/writer_two_entries", test_writer_two_entries, st_setup, st_teardown },
@@ -2567,6 +2694,7 @@ const test_entry_t encstr_entries[] = {
     { "encstr/strdict_lookup",     test_strdict_lookup,       st_setup, st_teardown },
     { "encstr/force_str_wins",     test_force_str_wins,     st_setup, st_teardown },
     { "encstr/stats_chokepoint",   test_stats_chokepoint,   st_q_setup, st_q_teardown },
+    { "encstr/like_policy",        test_like_policy,        st_q_setup, st_q_teardown },
     { "encstr/stats_chokepoint_pooled", test_stats_chokepoint_pooled, st_q_setup, st_q_teardown },
     { "encstr/dict_slot_spread",   test_dict_slot_spread,   st_setup, st_teardown },
     { "encstr/pool_order",         test_pool_order,         st_setup, st_teardown },

@@ -1544,6 +1544,234 @@ static test_result_t test_ipc_journal_snapshot_literal_args(void) {
     PASS();
 }
 
+/* ---- #1608: async requests are journaled like sync ones ----
+ * Every request a server evaluates, sync or async, is written to the journal
+ * once, before it runs, so replay rebuilds the effects of `.ipc.post`
+ * requests too, in the order the server ran them across connections. */
+static ray_t* j1608_eval(const char* q) {
+    return ray_eval_str(q);
+}
+
+static void j1608_drop(ray_t* r) {
+    if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+}
+
+static void j1608_boot(void) {
+    j1608_drop(j1608_eval("(do (set __j1608_a 42) (set __j1608_seq (list)) (set __j1608_hits 0)"
+                          " (set __j1608_upd (fn [m] (set __j1608_seq (concat __j1608_seq (list m)))"
+                          " (count __j1608_seq))) 0)"));
+    j1608_drop(j1608_eval("(set .ipc.on.async (fn [m] (set __j1608_hits (+ __j1608_hits 1))"
+                          " (if (== (type m) 'str) (eval (parse m)) (eval m))))"));
+}
+
+static ray_t* j1608_state(void) {
+    return j1608_eval("(repr (list __j1608_seq __j1608_hits))");
+}
+
+static bool j1608_post(int64_t h, const char* q, bool list) {
+    ray_t* m = list ? ray_eval_str(q) : ray_str(q, strlen(q));
+    if (!m || RAY_IS_ERR(m)) { j1608_drop(m); return false; }
+    ray_err_t e = ray_ipc_send_async(h, m);
+    ray_release(m);
+    return e == RAY_OK;
+}
+
+static bool j1608_send(int64_t h, const char* q) {
+    ray_t* m = ray_eval_str(q);
+    if (!m || RAY_IS_ERR(m)) { j1608_drop(m); return false; }
+    ray_t* r = ray_ipc_send(h, m);
+    ray_release(m);
+    bool ok = r && !RAY_IS_ERR(r);
+    j1608_drop(r);
+    return ok;
+}
+
+/* (.log.posts on): true when the verb and (.log.status) agree on it */
+static bool j1608_posts(int on) {
+    char q[96];
+    snprintf(q, sizeof q, "(.log.posts %d)", on);
+    ray_t* r = j1608_eval(q);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_I64 && r->i64 == on;
+    j1608_drop(r);
+    r = j1608_eval("(get (.log.status) 'posts)");
+    ok = ok && r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && (r->b8 != 0) == (on != 0);
+    j1608_drop(r);
+    return ok;
+}
+
+/* A1, the data list of A2, S1, S2, A4, S3, S4: A3 does not parse */
+#define J1608_SEQ "(list (as 'SYM \"A1\") (list (as 'SYM \"__j1608_a\") (as 'SYM \"A2\")) (as 'SYM \"S1\") (as 'SYM \"S2\") (as 'SYM \"A4\") (as 'SYM \"S3\") (as 'SYM \"S4\"))"
+
+static test_result_t test_ipc_journal_async_requests(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608");
+    ipc_rm_journal(jbase);
+    j1608_boot();
+    TEST_ASSERT_TRUE(j1608_posts(1));
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h1 = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    int64_t h2 = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h1) >= (0) && (h2) >= (0), "connected");
+    /* Interleaved across two connections; a sync request on a connection
+     * returns after every request posted before it on that connection ran.
+     * A1 is a string, A2 a list whose argument is a data list (its head is
+     * a global that is not a function), A3 a string that does not parse. */
+    bool ok = true;
+    ok &= j1608_post(h1, "(__j1608_upd 'A1)", false);
+    ok &= j1608_post(h1, "(list '__j1608_upd (list '__j1608_a 'A2))", true);
+    ok &= j1608_send(h1, "(list '__j1608_upd (list 'quote 'S1))");
+    ok &= j1608_send(h2, "(list '__j1608_upd (list 'quote 'S2))");
+    ok &= j1608_post(h2, "(__j1608_upd 'A3", false);
+    ok &= j1608_post(h2, "(__j1608_upd 'A4)", false);
+    ok &= j1608_send(h2, "(list '__j1608_upd (list 'quote 'S3))");
+    ok &= j1608_send(h1, "(list '__j1608_upd (list 'quote 'S4))");
+    ray_ipc_close(h1);
+    ray_ipc_close(h2);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1608_state();
+    bool off = j1608_posts(0);   /* replay does not read the switch */
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(off);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    /* the async hook ran for the four posts, the unparsable one included */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list " J1608_SEQ " 4)");
+
+    /* .log.replay_report: one entry per request, eight, of which the
+     * unparsable post is the one evaluation error, as it was live */
+    j1608_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    TEST_ASSERT_TRUE(rep && !RAY_IS_ERR(rep));
+    ray_t* ent = ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7)));
+    ray_t* errs = ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11)));
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    ray_t* replayed = j1608_state();
+
+    /* -l recovery of the same journal */
+    j1608_boot();
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_t* recovered = j1608_state();
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_EQ_I(n_ent, 8);
+    TEST_ASSERT_EQ_I(n_err, 1);
+    TEST_ASSERT_TRUE(replayed && !RAY_IS_ERR(replayed) && replayed->type == -RAY_STR);
+    TEST_ASSERT_TRUE(recovered && !RAY_IS_ERR(recovered) && recovered->type == -RAY_STR);
+    /* the same sequence; the async hook is not run on replay, as the sync
+     * hook is not: its count stays 0 */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(replayed),
+                       "(list " J1608_SEQ " 0)");
+    TEST_ASSERT_STR_EQ(ray_str_ptr(recovered), ray_str_ptr(replayed));
+    ray_release(live);
+    ray_release(replayed);
+    ray_release(recovered);
+    PASS();
+}
+
+/* The posts switch is off by default (#1608): an open journal records the
+ * sync requests only, as it always did, and .log.write inside an async
+ * request writes its own entry, which replay evaluates. */
+static test_result_t test_ipc_journal_async_off(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608o");
+    ipc_rm_journal(jbase);
+    j1608_boot();
+    ray_t* st = j1608_eval("(list (.log.posts) (get (.log.status) 'posts))");
+    bool dflt = st && !RAY_IS_ERR(st) && st->type == RAY_LIST && st->len == 2 &&
+                ray_list_get(st, 0)->i64 == 0 && ray_list_get(st, 1)->b8 == 0;
+    j1608_drop(st);
+    TEST_ASSERT_TRUE(dflt);
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START(srv);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "connected");
+    bool ok = j1608_post(h, "(__j1608_upd 'A1)", false);
+    ok &= j1608_post(h, "(set __j1608_w (type (.log.write (quote (__j1608_upd 'W)))))", false);
+    ok &= j1608_send(h, "(list '__j1608_upd (list 'quote 'S1))");
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    ray_t* live = j1608_state();
+    ray_t* w = j1608_eval("(repr __j1608_w)");
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+
+    j1608_boot();
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    ray_t* ent = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7))) : NULL;
+    ray_t* errs = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11))) : NULL;
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    ray_t* replayed = j1608_state();
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(live && !RAY_IS_ERR(live) && live->type == -RAY_STR);
+    TEST_ASSERT_TRUE(w && !RAY_IS_ERR(w) && w->type == -RAY_STR);
+    TEST_ASSERT_TRUE(replayed && !RAY_IS_ERR(replayed) && replayed->type == -RAY_STR);
+    /* live: both posts ran, and .log.write returned instead of raising */
+    TEST_ASSERT_STR_EQ(ray_str_ptr(live),
+                       "(list (list (as 'SYM \"A1\") (as 'SYM \"S1\")) 2)");
+    /* the log: the .log.write entry and S1; the posts are not in it */
+    TEST_ASSERT_EQ_I(n_ent, 2);
+    TEST_ASSERT_EQ_I(n_err, 0);
+    TEST_ASSERT_STR_EQ(ray_str_ptr(replayed),
+                       "(list (list (as 'SYM \"W\") (as 'SYM \"S1\")) 0)");
+    ray_release(live);
+    ray_release(w);
+    ray_release(replayed);
+    PASS();
+}
+
+/* A restricted connection's async request the server refused live is
+ * refused on replay too: it is journaled with the restricted mark. */
+static test_result_t test_ipc_journal_async_restricted(void) {
+    const char* jbase = ray_test_tmp("/tmp/rayforce_test_ipc_j1608r");
+    ipc_rm_journal(jbase);
+    (void)unsetenv("RF_J1608");
+    TEST_ASSERT_TRUE(j1608_posts(1));
+    TEST_ASSERT_EQ_I(ray_journal_open(jbase, RAY_JOURNAL_ASYNC), RAY_OK);
+    ray_test_server_t srv;
+    RAY_TEST_SERVER_START_OPTS(srv, NULL, true);
+    int64_t h = ray_ipc_connect("127.0.0.1", srv.port, NULL, NULL, 0);
+    TEST_ASSERT((h) >= (0), "connected");
+    bool ok = j1608_post(h, "(.os.setenv \"RF_J1608\" \"1\")", false);
+    ok &= j1608_send(h, "(+ 1 2)");          /* the post ran before this answer */
+    ray_ipc_close(h);
+    ray_test_server_stop(&srv);
+    const char* live = getenv("RF_J1608");
+    bool off = j1608_posts(0);
+    TEST_ASSERT_EQ_I(ray_journal_close(), RAY_OK);
+    TEST_ASSERT_TRUE(off);
+    char q[512];
+    snprintf(q, sizeof q, "(.log.replay_report \"%s.log\")", jbase);
+    ray_t* rep = j1608_eval(q);
+    ray_t* ent = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("entries", 7))) : NULL;
+    ray_t* errs = rep && !RAY_IS_ERR(rep) ? ray_dict_get(rep, ray_sym(ray_sym_intern("eval_errors", 11))) : NULL;
+    int64_t n_ent = ent && !RAY_IS_ERR(ent) ? ent->i64 : -1;
+    int64_t n_err = errs && !RAY_IS_ERR(errs) ? errs->i64 : -1;
+    j1608_drop(ent); j1608_drop(errs); j1608_drop(rep);
+    const char* replayed = getenv("RF_J1608");
+    (void)ray_journal_purge();
+    ipc_rm_journal(jbase);
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(live == NULL);
+    TEST_ASSERT_EQ_I(n_ent, 2);
+    TEST_ASSERT_EQ_I(n_err, 1);       /* refused again: access */
+    TEST_ASSERT_TRUE(replayed == NULL);
+    PASS();
+}
+
 /* ---- test_ipc_decompress_literal_overrun -------------------------------- */
 /*
  * Exercise the literal-block overrun guard in ray_ipc_decompress
@@ -3702,10 +3930,13 @@ static void oob_later_fn(void* arg) {
  * reply, whose handler raises the interrupt.  The wait wakes on it and
  * sends the server the cancel byte itself. */
 static void ctrl_c_handler(int sig) { (void)sig; ray_request_interrupt(); }
-typedef struct { pthread_t to; long after_ms; } ctrl_c_later_t;
+/* `when` is NULL to send the Ctrl-C at once, or a file to wait for first
+ * (up to 15 s): what the request writes once the server runs it. */
+typedef struct { pthread_t to; const char* when; } ctrl_c_later_t;
 static void* ctrl_c_later_fn(void* arg) {
     ctrl_c_later_t* c = (ctrl_c_later_t*)arg;
-    sleep_ms(c->after_ms);
+    for (int i = 0; c->when && i < 3000 && access(c->when, F_OK) != 0; i++)
+        sleep_ms(5);
     pthread_kill(c->to, SIGUSR2);
     return NULL;
 }
@@ -3758,59 +3989,191 @@ static void drop(ray_t* r) {
  * cancel (the out-of-band byte its Ctrl-C sends) must end it promptly with
  * "cancel", and the connection answers the next request.  The Ctrl-C is a
  * signal to this thread, as a terminal's would be, so the client sends the
- * byte itself, with no second thread touching the handle.  It comes at
- * once (so it lands while the request is still being sent, before the
- * client waits: a cancel there was lost until the deadline, the client
- * looking at the flag only when a signal broke its wait), then 200 ms in,
- * while the client waits.  The sleep asked for is the longest there is
- * (its deadline past the clock's range: only a cancel ends it); the
- * client's wait is bounded at 20 s, so a lost cancel fails the test
- * instead of hanging it. */
-static test_result_t test_ipc_time_sleep_cancel(void) {
+ * byte itself, with no second thread touching the handle.  It comes twice:
+ *   - at once, so it lands while the request is still being sent, before
+ *     the client waits (a cancel there was lost until the deadline, the
+ *     client looking at the flag only when a signal broke its wait);
+ *   - once the server is running the request: the request writes a file
+ *     before it sleeps, and the Ctrl-C waits for that file, so the byte
+ *     surely arrives mid-request, where only the server's SIGURG sees it
+ *     (a fixed 200 ms did not say where the server was).
+ * The sleep asked for is the longest there is (its deadline past the
+ * clock's range: only a cancel ends it); the client's wait is bounded at
+ * 20 s, so a lost cancel fails the test instead of hanging it.  A failure
+ * says what the request returned and after how long. */
 #if !defined(RAY_OS_WINDOWS)
+/* A ./rayforce server exec'd with SIGURG blocked, as it is when the process
+ * that starts it has SIGURG blocked (see ipc_oob_cancel_unblock in
+ * src/core/ipc.c; on macOS one tmpfile() on another thread of the parent was
+ * enough).  Forked and exec'd here, not through system() and test/serve.sh:
+ * a shell between the two need not hand the mask on (on Linux it does not),
+ * and then the server would not be in the state under test.  Between fork
+ * and exec the child only sets its mask, checks it took, and points its
+ * output at dir/server.log.  The port comes from `serve.sh --port`, and
+ * `serve.sh --tie` stops the server if this test dies first.  The port, and
+ * the pid in *pid_out; 0 when it did not come up. */
+static uint16_t serve_server_urg_blocked(const char* dir, pid_t* pid_out) {
+    *pid_out = -1;
+    /* log has room for any path plus its suffix, and cmd for the path plus
+     * the command around it: none of them can truncate */
+    char path[512], log[sizeof path + sizeof "/server.log"], cmd[sizeof path + 64];
+    if ((size_t)snprintf(path, sizeof path, "%s", ray_test_tmp(dir)) >= sizeof path) return 0;
+    ray_test_rm_rf(path);
+    if (ray_test_mkdir_p(path) != 0) return 0;
+    snprintf(log, sizeof log, "%s/server.log", path);
+    for (int attempt = 0; attempt < 5; attempt++) {
+        FILE* pf = popen("test/serve.sh --port", "r");
+        unsigned port = 0;
+        if (pf) { if (fscanf(pf, "%u", &port) != 1) port = 0; pclose(pf); }
+        if (!port) continue;
+        char portstr[16];
+        snprintf(portstr, sizeof portstr, "%u", port);
+        pid_t pid = fork();
+        if (pid < 0) return 0;
+        if (pid == 0) {
+            sigset_t urg, now;
+            sigemptyset(&urg);
+            sigaddset(&urg, SIGURG);
+            sigprocmask(SIG_BLOCK, &urg, NULL);
+            sigprocmask(SIG_BLOCK, NULL, &now);
+            if (!sigismember(&now, SIGURG)) _exit(97);
+            int in = open("/dev/null", O_RDONLY);
+            int out = open(log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (in >= 0) dup2(in, STDIN_FILENO);
+            if (out >= 0) { dup2(out, STDOUT_FILENO); dup2(out, STDERR_FILENO); }
+            execl("./rayforce", "./rayforce", "-p", portstr, (char*)NULL);
+            _exit(127);
+        }
+        snprintf(cmd, sizeof cmd, "test/serve.sh --tie %ld %s", (long)pid, path);
+        if (system(cmd) != 0) { /* the kill below still stops it */ }
+        /* Up once it answers the handshake; gone (the port was taken
+         * meanwhile, or the mask did not take) and another port is tried. */
+        for (int i = 0; i < 200; i++) {
+            int st;
+            if (waitpid(pid, &st, WNOHANG) == pid) { pid = -1; break; }
+            ray_sock_t k = ray_sock_connect("127.0.0.1", (uint16_t)port, 200);
+            if (k != RAY_INVALID_SOCK) { ray_sock_close(k); *pid_out = pid; return (uint16_t)port; }
+            sleep_ms(25);
+        }
+        if (pid > 0) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); }
+    }
+    return 0;
+}
+
+static void serve_stop_pid(pid_t pid) {
+    if (pid <= 0) return;
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+}
+
+/* Whether pid `pid` runs with SIGURG blocked: 1 or 0 from /proc on Linux,
+ * -1 where nothing shows another process's mask (macOS: ps prints 0 for a
+ * process exec'd with SIGURG blocked). */
+static int urg_blocked_in(pid_t pid) {
+#if defined(__linux__)
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/%ld/status", (long)pid);
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    int r = -1;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long m;
+        if (sscanf(line, "SigBlk: %llx", &m) == 1) { r = (m >> (SIGURG - 1)) & 1; break; }
+    }
+    fclose(f);
+    return r;
+#else
+    (void)pid;
+    return -1;
+#endif
+}
+
+static test_result_t time_sleep_cancel_run(const char* dir, bool urg_blocked) {
     if (access("./rayforce", X_OK) != 0) SKIP("needs the ./rayforce binary");
-    const char* dir = "/tmp/ipc_time_sleep";
-    uint16_t port = serve_server(dir);
-    if (!port) serve_stop(dir);
+    /* urg_blocked: the server runs with SIGURG blocked (#1637).  Its SIGURG
+     * then never came unless it unblocked the signal itself, and only a
+     * cancel byte already there when the request started was seen. */
+    pid_t upid = -1;
+    uint16_t port = urg_blocked ? serve_server_urg_blocked(dir, &upid) : serve_server(dir);
+#define TSC_STOP() do { if (urg_blocked) serve_stop_pid(upid); else serve_stop(dir); } while (0)
+    if (!port) TSC_STOP();
     TEST_ASSERT(port, "server started");
+    if (urg_blocked) {
+        /* the state under test, where it can be seen: before any request */
+        int b = urg_blocked_in(upid);
+        if (b == 0) TSC_STOP();
+        TEST_ASSERT(b != 0, "the server runs with SIGURG blocked before its first request");
+    }
     int64_t h = connect_retry(port);
-    if (h < 0) serve_stop(dir);
+    if (h < 0) TSC_STOP();
     TEST_ASSERT((h) >= (0), "connected to the spawned server");
+    char buf[256];
+    int n1 = snprintf(buf, sizeof buf, "%s_running", dir);
+    const char* running = ray_test_tmp(buf);
+    int n2 = snprintf(buf, sizeof buf, "(do (write \"%s_running\" \"1\") (.time.sleep 9223372036854775807))", dir);
+    const char* sleep_q = ray_test_tmp(buf);
+    if ((size_t)n1 >= sizeof buf || (size_t)n2 >= sizeof buf) { ray_ipc_close(h); TSC_STOP(); }
+    TEST_ASSERT((size_t)n1 < sizeof buf && (size_t)n2 < sizeof buf, "the marker path and the request fit");
+    unlink(running);
     struct sigaction sa, old;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = ctrl_c_handler;   /* no SA_RESTART: the wait must wake */
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR2, &sa, &old);
-    static const long delays[] = { 0, 200 };
+    static const char* const when[] = { "at once", "once the server runs it" };
     bool cancelled[2];
     int64_t took[2];
+    char got[2][160];
     for (int i = 0; i < 2; i++) {
         static ctrl_c_later_t c;
         c.to = pthread_self();
-        c.after_ms = delays[i];
+        c.when = i == 0 ? NULL : running;
         pthread_t tid;
         pthread_create(&tid, NULL, ctrl_c_later_fn, &c);
         int64_t t0 = ray_time_now_ms();
-        ray_t* r1 = send_str(h, "(.time.sleep 9223372036854775807)");
+        ray_t* r1 = send_str(h, sleep_q);
         took[i] = ray_time_now_ms() - t0;
         pthread_join(tid, NULL);
         ray_clear_interrupt();
+        unlink(running);
         cancelled[i] = r1 && RAY_IS_ERR(r1) && strcmp(ray_err_code(r1), "cancel") == 0;
+        if (!r1) snprintf(got[i], sizeof got[i], "no result");
+        else if (RAY_IS_ERR(r1))
+            snprintf(got[i], sizeof got[i], "error %s: %s", ray_err_code(r1), ray_err_msg(r1));
+        else snprintf(got[i], sizeof got[i], "a value of type %d", (int)r1->type);
         drop(r1);
     }
     sigaction(SIGUSR2, &old, NULL);
     ray_t* r2 = send_str(h, "(+ 1 2)");
     ray_ipc_close(h);
-    serve_stop(dir);
+    TSC_STOP();
+#undef TSC_STOP
     bool answered = r2 && !RAY_IS_ERR(r2) && r2->type == -RAY_I64 && r2->i64 == 3;
     drop(r2);
     for (int i = 0; i < 2; i++) {
-        TEST_ASSERT_FMT(cancelled[i], "a Ctrl-C %ld ms in ends the sleep with a cancel error", delays[i]);
-        TEST_ASSERT_FMT(took[i] < 5000, "a Ctrl-C %ld ms in took %lld ms to end the sleep",
-                        delays[i], (long long)took[i]);
+        TEST_ASSERT_FMT(cancelled[i], "a Ctrl-C %s ends the sleep with a cancel error: got %s after %lld ms",
+                        when[i], got[i], (long long)took[i]);
+        TEST_ASSERT_FMT(took[i] < 5000, "a Ctrl-C %s took %lld ms to end the sleep",
+                        when[i], (long long)took[i]);
     }
     TEST_ASSERT(answered, "the connection answers the next request");
     PASS();
+}
+#endif
+
+static test_result_t test_ipc_time_sleep_cancel(void) {
+#if !defined(RAY_OS_WINDOWS)
+    return time_sleep_cancel_run("/tmp/ipc_time_sleep", false);
+#else
+    SKIP("out-of-band cancel is POSIX-only");
+#endif
+}
+
+/* The same with the server started with SIGURG blocked: it must unblock the
+ * signal itself for the requests it runs (#1637). */
+static test_result_t test_ipc_time_sleep_cancel_urg_blocked(void) {
+#if !defined(RAY_OS_WINDOWS)
+    return time_sleep_cancel_run("/tmp/ipc_time_sleep_urg", true);
 #else
     SKIP("out-of-band cancel is POSIX-only");
 #endif
@@ -4212,6 +4575,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_seen_on_self_closed_moved_link", test_ipc_cancel_seen_on_self_closed_moved_link, ipc_setup, ipc_teardown },
     { "ipc/cancel_seen_nested_moved_link", test_ipc_cancel_seen_nested_moved_link, ipc_setup, ipc_teardown },
     { "ipc/time_sleep_cancel",          test_ipc_time_sleep_cancel,              ipc_setup, ipc_teardown },
+    { "ipc/time_sleep_cancel_urg_blocked", test_ipc_time_sleep_cancel_urg_blocked, ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
@@ -4236,6 +4600,9 @@ const test_entry_t ipc_entries[] = {
     { "ipc/journal_path",               test_ipc_journal_path,                   ipc_setup, ipc_teardown },
     { "ipc/journal_replay_literal_args", test_ipc_journal_replay_literal_args, ipc_setup, ipc_teardown },
     { "ipc/journal_replay_skips_sync_hook", test_ipc_journal_replay_skips_sync_hook, ipc_setup, ipc_teardown },
+    { "ipc/journal_async_requests",     test_ipc_journal_async_requests,         ipc_setup, ipc_teardown },
+    { "ipc/journal_async_restricted",   test_ipc_journal_async_restricted,       ipc_setup, ipc_teardown },
+    { "ipc/journal_async_off",          test_ipc_journal_async_off,              ipc_setup, ipc_teardown },
     { "ipc/journal_snapshot_literal_args", test_ipc_journal_snapshot_literal_args, ipc_setup, ipc_teardown },
     { "ipc/decompress_literal_overrun", test_ipc_decompress_literal_overrun,     ipc_setup, ipc_teardown },
     { "ipc/compress_small",             test_ipc_compress_small,                 ipc_setup, ipc_teardown },

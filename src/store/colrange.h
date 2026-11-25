@@ -89,7 +89,12 @@ typedef struct {
  * that generation 0, reading its columns in place, never pays.  One per
  * scratch, alive until the scratch is freed. */
 #define RAY_COL_FIXED_BYTES ((size_t)1024 * 16)   /* one vector of the widest element (GUID) */
-typedef struct { _Alignas(64) uint8_t b[RAY_COL_FIXED_BYTES]; } ray_col_fixed_t;
+/* 32-byte aligned, as the heap's fixed vector is (ray_alloc_raw data sits
+ * 32 bytes past a block start): no decoder relies on more.  64 was more
+ * than gcc 11/12's ASan fake stack gives a stack local, so every lent
+ * scratch and every agg_curs_t embedding one was misaligned there and
+ * UBSan stopped the sanitized suite (#1652). */
+typedef struct { _Alignas(32) uint8_t b[RAY_COL_FIXED_BYTES]; } ray_col_fixed_t;
 
 /* NULL or an owned error (ray_error_free). */
 ray_t* ray_col_src_bind(ray_t* col, ray_col_src_t* out);

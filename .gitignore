@@ -5,6 +5,8 @@
 *.dylib
 rayforce
 rayforce.test
+# the example CI links against the shared library (ci.yml)
+analytics-shared
 build/
 build_*/
 # `make install-headers` staging tree (see Makefile)

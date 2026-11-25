@@ -1,0 +1,82 @@
+;; @requires: posix
+;; var, var_pop, stddev, dev, dev_pop and stddev_pop over a partitioned
+;; table give the value they give over the same rows in memory or splayed
+;; (#1666).  Each partition's group used to ship SUM(x), SUM(x^2) and the
+;; count, merged by SUM: the raw squares cancel once the values are large
+;; next to their spread (1e8 + [0 1 2 3] gave 923.86 where the variance is
+;; 0.078125).  A partition now ships its variance state (a value of the
+;; group, the mean about it, the population variance and the count) and
+;; the merge combines the partials with the Chan update.
+;;
+;; Data: 4 partitions of 2,000 rows and an empty fifth.  Groups k = i mod 5
+;; sit at very different magnitudes (0, 1e8, 100, 1e15, 7) and cycle
+;; through + [0 1 2 3] * step; group 2 is all null in partition 1; key h
+;; folds group 4 into group 3 from partition 2 on, so h = 4 is in two
+;; partitions only.  A second table holds date-sliced timestamp-scale
+;; integers (1.7e18 + a day per partition).
+
+(set rel (fn [got want] (/ (abs (- got want)) (abs want))))
+(set same (fn [a b] (all (< (rel a b) 0.000000001))))
+
+(set n 8000)
+(set k (% (til n) 5))
+(set part (div (til n) 2000))
+(set h (- k (* (>= part 2) (== k 4))))
+(set mk (fn [base step] (table [k s f h part v] (list k (at ['a 'b 'c 'd 'e] k) (+ 0.5 (as 'F64 k)) h part (+ (at base k) (* step (% (div (til n) 5) 4)))))))
+(set D "/tmp/rf_var_parted")
+
+;; T, its splayed copy and its parted copy; the nulls in place first
+(set build (fn [T] (do (.sys.exec (format "rm -rf %" D)) (.db.splayed.set (format "%/spl/t/" D) T) (.db.splayed.set (format "%/par/2024.01.01/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 0)})) (.db.splayed.set (format "%/par/2024.01.02/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 1)})) (.db.splayed.set (format "%/par/2024.01.03/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 2)})) (.db.splayed.set (format "%/par/2024.01.04/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 3)})) (.db.splayed.set (format "%/par/2024.01.05/t/" D) (select {from: T k: k s: s f: f h: h v: v where: (== part 9)})) 0)))
+
+;; every route of a table: keyless, and by each key type, ascending
+(set routes (fn [X] (raze (list (at (select {from: X q: (var_pop v)}) 'q) (at (select {from: X q: (var v)}) 'q) (at (select {from: X q: (stddev v)}) 'q) (at (select {from: X q: (dev v)}) 'q) (at (select {from: X q: (dev_pop v)}) 'q) (at (select {from: X q: (stddev_pop v)}) 'q) (at (select {from: X by: k q: (var_pop v) asc: k}) 'q) (at (select {from: X by: s q: (var v) asc: s}) 'q) (at (select {from: X by: f q: (dev v) asc: f}) 'q) (at (select {from: X by: h q: (var_pop v) asc: h}) 'q) (at (select {from: X by: k q: (stddev v) where: (> k 0) asc: k}) 'q)))))
+
+;; floats: magnitudes 0 to 1e15, quarter steps
+(set T (update {v: 0Nf from: (mk [0.0 100000000.0 100.0 1000000000000000.0 7.0] 0.25) where: (and (== part 1) (== k 2))}))
+(build T) -- 0
+(set SPL (.db.splayed.get (format "%/spl/t/" D)))
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(count PT) -- 8000
+(same (routes PT) (routes T)) -- true
+(same (routes SPL) (routes T)) -- true
+;; each group's population variance is 1.25 * 0.25^2; h = 3 mixes groups
+(at (select {from: PT by: k q: (var_pop v) asc: k}) 'q) -- [0.078125 0.078125 0.078125 0.078125 0.078125]
+(same (at (select {from: PT by: h q: (var_pop v) asc: h}) 'q) (at (select {from: T by: h q: (var_pop v) asc: h}) 'q)) -- true
+
+;; integers, the same magnitudes
+(set T (update {v: 0Nl from: (mk [0 100000000 100 1000000000000000 7] 1) where: (and (== part 1) (== k 2))}))
+(build T) -- 0
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(same (routes PT) (routes T)) -- true
+(at (select {from: PT by: k q: (var_pop v) asc: k}) 'q) -- [1.25 1.25 1.25 1.25 1.25]
+
+;; date-sliced timestamp-scale integers: 1.7e18, a day further each partition
+(set T (table [k s f h part v] (list k (at ['a 'b 'c 'd 'e] k) (+ 0.5 (as 'F64 k)) h part (+ (+ 1700000000000000000 (* 86400000000000 part)) (* 1000000000 (% (div (til n) 5) 4))))))
+(build T) -- 0
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(same (routes PT) (routes T)) -- true
+
+;; a group all null in every partition is null, as in memory
+(set T (update {v: 0Nf from: (mk [0.0 100000000.0 100.0 1000000000000000.0 7.0] 0.25) where: (== k 2)}))
+(build T) -- 0
+(set PT (.db.parted.get (format "%/par/" D) 't))
+(at (select {from: PT by: k q: (var_pop v) asc: k}) 'q) -- (at (select {from: T by: k q: (var_pop v) asc: k}) 'q)
+(at (select {from: PT by: k q: (var v) asc: k}) 'q) -- (at (select {from: T by: k q: (var v) asc: k}) 'q)
+
+;; the internal ops a partition ships its state with are not names
+(var_k [1 2 3]) !- name
+(var_d [1 2 3]) !- name
+(select {from: T q: (var_k v)}) !- name
+(select {from: T by: k q: (var_d v)}) !- name
+(eval (parse "(var_k [1 2])")) !- name
+
+;; nor over IPC
+(.sys.exec "rm -rf /tmp/rf_var_parted_srv")
+(.sys.exec "test/serve.sh /tmp/rf_var_parted_srv") -- 0
+(set c (.ipc.open (format "127.0.0.1:%" (trim (read "/tmp/rf_var_parted_srv/port")))))
+(.ipc.send c "(var_pop [1 2 3 4])") -- 1.25
+(.ipc.send c "(var_k [1 2 3])") !- name
+(.ipc.send c "(select {from: (table [k v] (list [0 0 1] [1.0 2.0 4.0])) by: k q: (var_d v)})") !- name
+(.ipc.close c)
+(.sys.exec "test/serve.sh --stop /tmp/rf_var_parted_srv") -- 0
+(.sys.exec (format "rm -rf % /tmp/rf_var_parted_srv" D)) -- 0

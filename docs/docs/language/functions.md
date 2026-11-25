@@ -93,7 +93,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
 | `dev_pop` | unary, aggr | Population standard deviation alias | `(dev_pop [1 2 3])` |
 | `var` | unary, aggr | Sample variance | `(var [1 2 3])` → `1.0` |
-| `var_pop` | unary, aggr | Population variance | `(var_pop [1 2 3])` |
+| `var_pop` | unary, aggr | Population variance ([accuracy](math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
 | `cov` | binary, aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
 | `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
@@ -143,7 +143,7 @@ Functions that take other functions as arguments.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
+| `map` | variadic | `(map f v)` applies `f` to each element of `v`; `(map f val v)` calls `f(val, elem)` for each element, passing `val` whole each time (same as `map-right`). Same-type atom results form a typed vector, otherwise a list. String results that repeat shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fail with `limit`. Exactly 2 or 3 arguments, else `domain` | `(map (fn [x] (* x 2)) [1 2 3])` → `[2 4 6]`, `(map + 100 [1 2 3])` → `[101 102 103]` |
 | `pmap` | variadic | Currently a sequential alias for `map`, with the same result types and the same 2 or 3 arguments, else `domain` | `(pmap (fn [x] (* x x)) [1 2 3])` → `[1 4 9]` |
 | `filter` | binary | Keep elements where boolean mask is true | `(filter [1 2 3 4] (> [1 2 3 4] 2))` → `[3 4]` |
 | `fold` | variadic | Reduce with function and initial value | `(fold + 0 [1 2 3])` → `6` |
@@ -221,7 +221,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `mdev` | binary | Moving population standard deviation over trailing N rows and non-null values | `(mdev 2 [1 3 5])` → `[0.0 1.0 1.0]` |
 | `enlist` | variadic | Wrap value(s) in a vector | `(enlist 1 2 3)` → `[1 2 3]` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). Text joins with the STR null `""` as empty text: `(concat ["x" ""] "!")` is `["x!" "!"]` | `(concat [1 2] [3 4])` → `[1 2 3 4]` |
-| `raze` | unary | Flatten a list of vectors into one | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
+| `raze` | unary | Flatten a list of vectors into one; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(raze (list [1 2] [3 4]))` → `[1 2 3 4]` |
 | `where` | unary | Indices where boolean vector is true | `(where [true false true])` → `[0 2]` |
 | `group` | unary | Group indices by value | `(group [A B A])` → dict of groups |
 | `diverse` | unary | Check if all elements are unique | `(diverse [1 2 3])` → `true` |
@@ -250,7 +250,7 @@ The time-series vector functions above are lazy-aware DAG operations for vector 
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `list` | variadic | Create a list from vectors | `(list [1 2] [A B])` |
-| `table` | binary | Create a table from column names and columns. A LIST of numeric atoms of one type keeps that type; mixed numeric atoms use the wider type (BOOL < U8 < I16 < I32 < I64 < F64); F32 atoms alone give F32, and F32 mixed with any other numeric type gives F64. Typed nulls stay null except in BOOL and U8 columns, which store false and zero respectively. | `(table [x y] (list [1 2] [A B]))` |
+| `table` | binary | Create a table from column names and columns. A LIST of numeric atoms of one type keeps that type; mixed numeric atoms use the wider type (BOOL < U8 < I16 < I32 < I64 < F64); F32 atoms alone give F32, and F32 mixed with any other numeric type gives F64. Typed nulls stay null except in BOOL and U8 columns, which store false and zero respectively; a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit`. | `(table [x y] (list [1 2] [A B]))` |
 | `key` | unary | Get column names (table) or keys (dict) | `(key trades)` → `[sym price size]` |
 | `cols` | unary | Get table column names | `(cols trades)` → `[sym price size]` |
 | `value` | unary | Get column data (table) or values (dict) | `(value trades)` |
@@ -432,9 +432,9 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `trim` | unary | Strip leading/trailing whitespace; lazy/DAG for vectors | `(trim "  abc  ")` → `"abc"` |
 | `substr` | variadic | Substring by 1-based start and length; lazy/DAG for vectors | `(substr "abcdef" 2 3)` → `"bcd"` |
 | `replace` | variadic | Replace all occurrences; lazy/DAG for vectors. An empty `to` deletes each match, an empty `from` matches nothing | `(replace "a-b" "-" "_")` → `"a_b"` |
-| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class | `(like "hello" "hel*")` → `true` |
+| `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class. The pattern is a string atom, or a string column matched row by row; a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and in a query: `(concat "" "a")` is `"a"` | `(concat "hello" " world")` → `"hello world"` |
-| `format` | variadic | Format values as string (% is placeholder) | `(format "x=%" 42)` → `"x=42"` |
+| `format` | variadic | Format values as string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"
     String transforms are available as direct builtins and use the same DAG opcodes inside `select`/`update`. All string transformations propagate nulls: null input rows produce null output rows.
@@ -498,7 +498,7 @@ Cross-temporal comparisons are supported: dates, times, and timestamps are all c
 | Function | Type | Description | Example |
 |---|---|---|---|
 | `type` | unary | Get type name of a value; a function value answers `UNARY`, `BINARY`, `VARY` or `LAMBDA` | `(type 42)` → `i64` |
-| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`) | `(as 'i64 "42")` → `42` |
+| `as` | binary | Cast value to another type; `'LIST` boxes a typed vector into a generic `LIST` of atoms (per row in `select`, whole column in `update`); a list of string atoms that repeats shared strings beyond 1 GiB of extra data ([values that repeat their parts](../data-types/collections.md#values-that-repeat-their-parts)) fails with `limit` | `(as 'i64 "42")` → `42` |
 | `nil?` | unary | Test if value is null; element-wise inside query expressions | `(nil? x)` |
 | `rc` | unary | Reference count of an object | `(rc x)` → `1` |
 | `guid` | unary | Generate a vector of N v4 GUIDs (`(guid 0)` → `[]`) | `(guid 1)` |
@@ -526,10 +526,10 @@ not collide between two processes writing into the same table, use `guid`.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `println` | variadic | Print values with newline | `(println "hello" 42)` |
-| `print` | unary | Print value without newline | `(print "hello")` |
-| `show` | variadic | Pretty-print a value (tables formatted) | `(show trades)` |
-| `format` | variadic | Format value to string (% is placeholder) | `(format "val=%" 42)` → `"val=42"` |
+| `println` | variadic | Print values with newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(println "hello" 42)` |
+| `print` | unary | Print value without newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(print "hello")` |
+| `show` | variadic | Pretty-print a value (tables formatted); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(show trades)` |
+| `format` | variadic | Format value to string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | [`.parquet.read`](../namespaces/parquet.md#parquet-read) | variadic | Read a Parquet file into a table | `(.parquet.read [id price] "trades.parquet")` |
@@ -568,8 +568,8 @@ spills exactly as it did before.
 |---|---|---|---|
 | `set` | binary, special | Bind value to global variable | `(set x 42)` |
 | `let` | binary, special | Bind value to local variable; at the top level it binds a global, refused for a restricted caller | `(let y (+ x 1))` |
-| `if` | variadic, special | Conditional: condition/result pairs, optional final else. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")` |
-| `do` | variadic, special | Sequential execution, returns last | `(do (set x 1) (set y 2) (+ x y))` |
+| `if` | variadic, special | Conditional: condition/result pairs, optional final else. A boolean-vector condition chooses per row between the arms: both are always evaluated (side effects happen, a raising arm raises), and a length-1 vector gives a 1-element vector. In a query the arms give one column: numbers promote, a temporal beside a null keeps its type, two different temporal types or a temporal beside a number raise `type` ([control flow](control-flow.md#conditionals-if)) | `(if (> x 0) "pos" "neg")`, `(if [true false] [1 2] [3 4])` → `[1 4]` |
+| `do` | variadic, special | Sequential execution, returns last. Inside a query, on the planned routes, only the last form is evaluated; do not depend on the earlier forms running or not ([control flow](control-flow.md#sequential-evaluation-do)) | `(do (set x 1) (set y 2) (+ x y))` |
 | `fn` | variadic, special | Create lambda function | `(fn [x] (* x x))` |
 | `try` | binary, special | Error handling (expr handler-or-fallback); the handler gets the raised value, or `{code msg}` for an engine error (`{code msg usage}` when it is about a builtin's call) | `(try (+ 1 'a) (fn [e] (at e 'code)))` → `'type` |
 | `raise` | unary | Throw an error | `(raise "bad input")` |
@@ -604,9 +604,9 @@ spills exactly as it did before.
 
 | Function | Type | Description | Example |
 |---|---|---|---|
-| `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`) | `(ser [1 2 3])` |
+| `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`) | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format | `(de bytes)` |
-| `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more | `(repr [1i 2i])` |
+| `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | JSON text to a value; element-wise over a string vector; see [`.json.*`](../namespaces/json.md) | `(.json.parse "[1,2]")` |

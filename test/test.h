@@ -58,6 +58,10 @@ int ray_test_mkdir_p(const char* path);   /* mkdir -p path */
 const char* ray_test_tmp(const char* s);
 /* Immutable startup snapshot; later fixture environment changes do not move it. */
 const char* ray_test_tmp_root(void);
+/* The directory the runner was started from, before it entered its private
+ * working directory; NULL when it never left it (the working directory is
+ * then the launch directory). */
+const char* ray_test_launch_dir(void);
 
 /* A test's child process (#1560).  The runtime's rule is that a forked
  * child execs before it runs rayforce code: a forked copy keeps the

@@ -64,6 +64,38 @@ changes merely to reduce the PR count.
 4. Open the PR against **`dev`**. CI runs on every pull request (there are no
    push-triggered runs — the PR run tests the exact merge result).
 
+## Documentation
+
+A change that adds, renames or removes a builtin, or changes what it accepts or
+returns, updates the documentation **in the same PR**. A function that is
+registered but undocumented cannot be found by the people who need it, and the
+reference drifts further from the code with every PR that skips this.
+
+For a new builtin that means:
+
+1. Add its name to the right arity list under **Registered Builtin Surface** in
+   `docs/docs/reference/all-functions.md`. That section is the complete list
+   of registered names and is maintained by hand.
+2. Give it a row in the matching category table on the same page, with its
+   arity, flags (`restricted`, `special`, ...) and a working example.
+3. If it belongs to a namespace (`.idx.*`, `.parquet.*`, ...), document it on
+   that namespace's page under `docs/docs/namespaces/` as well, and add the
+   usage line in `src/lang/sig.c` so error messages can show its call shape.
+4. If it is blocked under `-U`, add it to the restricted-mode summary in
+   `docs/docs/namespaces/index.md`.
+
+Run the check before opening the PR:
+
+```sh
+make docs-check     # python3 scripts/check-builtin-docs.py
+```
+
+It fails when a registered builtin is missing from the surface list, or when
+the list names something that is no longer registered, and when a name is
+listed under a different arity than its registration call (`register_unary`,
+`register_binary`, `register_vary`). It checks names and arities only;
+whether a description is right is for the author and the reviewer.
+
 ## Local build notes
 
 - Zero external dependencies; C17 toolchain only.

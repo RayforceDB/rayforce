@@ -71,6 +71,11 @@ void ray_fmt_print(FILE* fp, ray_t* obj, int mode);
  * fails to load yields its own code and an owned error in *cause (free with
  * ray_error_free); *cause is NULL otherwise. */
 ray_err_t ray_fmt_write(FILE* fp, ray_t* obj, ray_t** cause);
+struct ray_dup_s;
+ray_err_t ray_fmt_write_dup(FILE* fp, ray_t* obj, ray_t** cause, struct ray_dup_s* t);
+/* ray_fmt for a value written inside a write that tracks repeats with t
+ * (lang/format.c, #1648). */
+ray_t* ray_fmt_dup(ray_t* obj, int mode, struct ray_dup_s* t, uint64_t base);
 
 /* The printed null of a vector or atom of `type` (a positive type tag):
  * 0Nl, 0Ne, 0Ng, ...  The one table every printer uses, so a null reads
@@ -80,6 +85,8 @@ const char* ray_fmt_null_literal(int8_t type);
 /* The text (format "%" a) gives `a`: in buf (cap >= 64) or borrowed from
  * `a` (returns NULL), inside the returned owned STR, or an error. */
 ray_t* ray_fmt_pct(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len);
+ray_t* ray_fmt_pct_dup(ray_t* a, char* buf, size_t cap, const char** txt, size_t* len,
+                       struct ray_dup_s* t, uint64_t base);
 
 /* Display settings */
 void ray_fmt_set_precision(int digits);

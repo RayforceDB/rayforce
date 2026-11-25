@@ -32,6 +32,7 @@
 #include "lang/parse.h"
 #include "core/types.h"
 #include "ops/ops.h"
+#include "ops/walkmemo.h"
 #include "ops/temporal.h"
 #include "ops/datalog.h"
 #include "ops/idxop.h"
@@ -56,6 +57,7 @@
 /* ray_error() is declared in <rayforce.h> (included via eval.h) */
 
 #include <string.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +90,13 @@ static inline int8_t  vrows_to(uint8_t r)  { return r == 2 ? -1 : (int8_t)r; }
  * `let` keeps it.  For a caller that evaluates a query's arguments itself
  * (query.c rw_eval_call). */
 uint8_t ray_eval_last_rows(void) { return vrows_from(g_eval_rows); }
+
+/* The same in the tree walker's encoding (1 rows, 0 not, -1 unknown), and
+ * its setter: for a special form that builds its value from several of its
+ * operands, so the value's provenance is theirs joined, not the last one's
+ * (cmp.c `and` / `or`). */
+int8_t ray_eval_rows(void) { return g_eval_rows; }
+void ray_eval_set_rows(int8_t rows) { g_eval_rows = rows; }
 
 #include <math.h>
 #include <signal.h>
@@ -130,8 +139,20 @@ static void affine_sum_cache_clear(void) {
  * VM — __VM->nfo / __VM->trace — so they survive across bytecode
  * invocations and stay one-per-thread, per the runtime/VM state model. */
 
-/* Interrupt flag — set by REPL signal handler, checked by eval/VM loops */
-static volatile sig_atomic_t g_eval_interrupted = 0;
+/* Interrupt flag: set by the SIGINT and SIGURG handlers (and by
+ * ray_request_interrupt from any thread), checked by the eval/VM loops and
+ * long-running builtins, reset per request.  It is shared by every thread of
+ * the process: an in-process IPC server and the client threads waiting on
+ * replies all read and write it, so it is a C11 atomic, not a
+ * volatile sig_atomic_t (which orders nothing between threads).  It must be
+ * lock-free: a signal handler writes it (#1623). */
+static _Atomic int g_eval_interrupted = 0;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "the interrupt flag is set from signal handlers: it must be lock-free");
+/* The hot-path read: a plain load on every target, ordering nothing; a
+ * checkpoint only needs to see the flag eventually. */
+#define EVAL_INTERRUPTED() \
+    (atomic_load_explicit(&g_eval_interrupted, memory_order_relaxed) != 0)
 
 /* A cancel request must reach BOTH the main-thread eval/VM loops (this flag)
  * and any in-flight parallel workers (the pool's cancel flag, via ray_cancel).
@@ -140,9 +161,28 @@ static volatile sig_atomic_t g_eval_interrupted = 0;
  * ray_cancel/ray_cancel_reset are async-signal-safe, so this stays callable
  * from the signal handler.  Zero hot-path cost: only runs when a cancel is
  * actually requested. */
-void ray_request_interrupt(void)      { g_eval_interrupted = 1; ray_cancel(); }
-void ray_clear_interrupt(void)        { g_eval_interrupted = 0; ray_cancel_reset(); }
-bool ray_interrupted(void)            { return g_eval_interrupted != 0; }
+void ray_request_interrupt(void) {
+    atomic_store_explicit(&g_eval_interrupted, 1, memory_order_release);
+    ray_cancel();
+}
+void ray_clear_interrupt(void) {
+    atomic_store_explicit(&g_eval_interrupted, 0, memory_order_release);
+    ray_cancel_reset();
+}
+bool ray_interrupted(void) {
+    return atomic_load_explicit(&g_eval_interrupted, memory_order_acquire) != 0;
+}
+/* Consume a pending interrupt: true, and the flag cleared, when one was
+ * set; false otherwise.  One exchange, so a second request that lands
+ * between a look and a clear is not swallowed with the first: it stays set
+ * for the next take.  The one place a request's cancel is consumed (the IPC
+ * client forwarding a Ctrl-C to its server). */
+bool ray_take_interrupt(void) {
+    if (!atomic_exchange_explicit(&g_eval_interrupted, 0, memory_order_acq_rel))
+        return false;
+    ray_cancel_reset();
+    return true;
+}
 
 /* Legacy internal names — thin wrappers kept for existing callers. */
 void ray_eval_request_interrupt(void) { ray_request_interrupt(); }
@@ -363,8 +403,8 @@ static inline ray_binary_fn unary_binary_overload(ray_unary_fn fn) {
  * are not registered atomic (they do not auto-map over lists): the argument
  * positions that are row-shaped (bit i: argument i+1; these builtins take
  * at most three).  An argument a builtin consumes whole -- in's set,
- * like's pattern, within's bounds, bin's breaks, at's source -- is not
- * listed.  The conformance test (lang/builtin_row_shape) measures every
+ * within's bounds, bin's breaks, at's source -- is not listed.  like's
+ * pattern is row-shaped: a string column matches row by row (#1615).  The conformance test (lang/builtin_row_shape) measures every
  * entry, and every pure builtin's undeclared positions. */
 static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
     { (void*)ray_not_fn,             1, 1 }, { (void*)ray_nil_fn,             1, 1 },
@@ -379,7 +419,7 @@ static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
     { (void*)ray_sym_name_fn,        1, 1 }, { (void*)ray_strlen_fn,          1, 1 },
     { (void*)ray_cast_fn,            2, 2 }, { (void*)ray_xbar_fn,            2, 3 },
     { (void*)ray_in_eval_fn,         2, 1 }, { (void*)ray_not_in_fn,          2, 1 },
-    { (void*)ray_like_fn,            2, 1 }, { (void*)ray_str_find_fn,        2, 1 },
+    { (void*)ray_like_fn,            2, 3 }, { (void*)ray_str_find_fn,        2, 1 },
     { (void*)ray_within_fn,          2, 1 },
     { (void*)ray_upper_fn,           1, 1 }, { (void*)ray_lower_fn,           1, 1 },
     { (void*)ray_trim_fn,            1, 1 }, { (void*)ray_substr_fn,          3, 1 },
@@ -1106,6 +1146,8 @@ static ray_t* zero_atom_for_elem_type(ray_t* coll) {
     }
 }
 
+static bool str_cells_repeat(ray_t* const* cells, int64_t n);
+
 /* The scalar fill/min/max results for wide cells have a common type, but the
  * generic atomic mapper boxes them.  Collapse only homogeneous wide results;
  * mixed-type LIST operands keep their existing boxed shape. */
@@ -1118,6 +1160,10 @@ static ray_t* atomic_collapse_wide(ray_t* list) {
     for (int64_t i = 1; i < list->len; i++)
         if (!cells[i] || cells[i]->type != t) return list;
 
+    if (t == -RAY_STR && str_cells_repeat(cells, list->len)) {
+        ray_release(list);
+        return ray_error("limit", "a string vector repeats shared strings beyond 1 GiB of extra data");
+    }
     ray_t* vec = ray_vec_new((int8_t)-t, t == -RAY_STR ? 0 : list->len);
     if (!vec || RAY_IS_ERR(vec)) {
         ray_release(list);
@@ -1689,7 +1735,42 @@ static ray_t* tempint_arith(uint16_t dag_opcode, ray_t* left, ray_t* right,
     return out;
 }
 
+/* An element-wise op over a value that holds one list at several positions
+ * maps that list once (#1627): the result for a shared list (and the
+ * other operand, and the op) is kept for the rest of the outermost map and
+ * reused, so the result shares as the operand does and the work is linear
+ * in the distinct lists, not in the paths through them.  The memo holds a
+ * reference to each kept result and drops it when the outermost map ends. */
+static _Thread_local ray_walk_memo_t g_map_memo;
+static inline bool map_memo_wanted(const ray_t* x) {
+    return x && RAY_UNLIKELY(ray_wm_reused(x)) && !RAY_IS_ERR(x) &&
+           (x->type == RAY_LIST || x->type == RAY_DICT || x->type == RAY_TABLE);
+}
+typedef struct { ray_binary_fn fn2; ray_unary_fn fn1; uint16_t op; ray_t* l; ray_t* r; } map_ctx_t;
+
+static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right);
+static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary_fn fn, ray_t* arg);
+static ray_t* map_binary_run(void* p) {
+    map_ctx_t* c = p;
+    return atomic_map_binary_op_c(c->fn2, c->op, c->l, c->r);
+}
+static ray_t* map_unary_run(void* p) {
+    map_ctx_t* c = p;
+    return atomic_map_unary_c(c->fn1, c->l);
+}
+__attribute__((noinline))
+static ray_t* atomic_map_binary_op_memo(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    /* user-space pointers are below 2^48: the opcode fits above fn */
+    uint64_t tag = (uint64_t)(uintptr_t)fn ^ ((uint64_t)dag_opcode << 48);
+    map_ctx_t c = { fn, NULL, dag_opcode, left, right };
+    return ray_wm_result(&g_map_memo, left, right, tag, map_binary_run, &c);
+}
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
+    if (RAY_UNLIKELY(map_memo_wanted(left) || map_memo_wanted(right)))
+        return atomic_map_binary_op_memo(fn, dag_opcode, left, right);
+    return atomic_map_binary_op_c(fn, dag_opcode, left, right);
+}
+static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (fn == ray_eq_fn && left && right && !RAY_IS_ERR(left) && !RAY_IS_ERR(right) &&
         (left->type == RAY_DICT || right->type == RAY_DICT ||
                             left->type == RAY_TABLE || right->type == RAY_TABLE))
@@ -2282,7 +2363,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
         ray_release(e0);
 
         for (int64_t i = 1; i < len; i++) {
-            if ((i & 0xFFFF) == 0 && g_eval_interrupted) { ray_release(vec); return ray_error("cancel", "interrupted"); }
+            if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) { ray_release(vec); return ray_error("cancel", "interrupted"); }
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
@@ -2331,7 +2412,7 @@ ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, 
     out[0] = e0;  /* first element already computed */
 
     for (int64_t i = 1; i < len; i++) {
-        if ((i & 0xFFFF) == 0 && g_eval_interrupted) {
+        if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) {
             result->len = i;                 /* the filled prefix only */
             ray_release(result);
             return ray_error("cancel", "interrupted");
@@ -2396,7 +2477,10 @@ static ray_t* atomic_unary_elem(ray_unary_fn fn, ray_t* e) {
  * Produces typed vectors when output is numeric/bool, boxed lists otherwise;
  * a nested collection maps to a collection of the same shape. */
 typedef struct { ray_t* x; int64_t i; } nest_frame_t;
+static _Thread_local ray_walk_memo_t g_nest_memo;
 bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
+    ray_walk_memo_t* m = NULL;   /* the thread-local memo's address only when wanted */
+    bool own = false;
     if (!x || RAY_IS_ERR(x) || (x->type != RAY_LIST && x->type != RAY_DICT)) return limit < 1;
     nest_frame_t local[64];
     nest_frame_t* st = local;
@@ -2419,6 +2503,15 @@ bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
             continue;
         }
         if (top + 1 > limit) { deeper = true; break; }
+        /* A shared container already walked from this depth or deeper
+         * holds nothing deeper from here (#1627): not walked again. */
+        if (RAY_UNLIKELY(ray_wm_reused(c))) {
+            if (!m) m = &g_nest_memo;
+            if (!m->active) own = ray_wm_begin(m);
+            uint64_t at;
+            if (m->active && ray_wm_get(m, c, NULL, 0, &at) && at >= (uint64_t)(top + 1)) continue;
+            if (m->active) ray_wm_put(m, c, NULL, 0, (uint64_t)(top + 1));
+        }
         if (top == cap) {
             nest_frame_t* grown = (nest_frame_t*)ray_alloc_raw((size_t)cap * 2 * sizeof *grown);
             if (!grown) { deeper = true; break; }   /* cannot measure it: refuse */
@@ -2430,10 +2523,20 @@ bool ray_nests_deeper_than(ray_t* x, int64_t limit) {
         st[top++] = (nest_frame_t){ c, 0 };
     }
     if (st != local) ray_free_raw(st);
+    if (own) ray_wm_end(m);
     return deeper;
 }
 
+__attribute__((noinline)) static ray_t* atomic_map_unary_memo(ray_unary_fn fn, ray_t* arg) {
+    uint64_t tag = (uint64_t)(uintptr_t)fn | (UINT64_C(1) << 63);   /* apart from a binary op's */
+    map_ctx_t c = { NULL, fn, 0, arg, NULL };
+    return ray_wm_result(&g_map_memo, arg, NULL, tag, map_unary_run, &c);
+}
 ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
+    if (RAY_UNLIKELY(map_memo_wanted(arg))) return atomic_map_unary_memo(fn, arg);
+    return atomic_map_unary_c(fn, arg);
+}
+static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
     /* A list's cells are mapped through here again: one C frame per level
      * of nesting, and a value can be nested arbitrarily deep at run time
@@ -2758,6 +2861,114 @@ static void gbi_want(gbi_ctx_t* gc, ray_t* vec, const int64_t* idx, int64_t n, b
     ray_col_want_rows(vec, idx, n);
 }
 
+/* STR gather in two parallel passes.  A STR cell is a 16-byte descriptor
+ * (inline up to 12 bytes, else an offset into the vector's immutable pool),
+ * so the tasks first count the pooled bytes of their rows, a prefix sum over
+ * the tasks places each task's region of the output pool, then every task
+ * copies its descriptors and pooled bytes into disjoint ranges.  The
+ * per-cell ray_str_vec_set it replaces (a copy-on-write check and a pool
+ * growth per cell, serial) was the whole cost of compacting a STR key over
+ * millions of rows.  NULL when the pooled bytes pass the u32 offsets, the
+ * per-cell path then reports it. */
+typedef struct {
+    const ray_str_t* src;
+    const char*      spool;
+    const int64_t*   idx;
+    ray_str_t*       dst;
+    char*            dpool;
+    int64_t          n;
+    uint32_t         tasks;
+    uint64_t*        bytes;     /* [tasks + 1]: pooled bytes per task, then their prefix */
+    _Atomic(bool)    empty;     /* a zero-length cell: the output is marked HAS_NULLS */
+} gbi_str_ctx_t;
+
+static void gbi_str_count_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    gbi_str_ctx_t* c = (gbi_str_ctx_t*)ctxp;
+    bool empty = false;
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = c->n * t / c->tasks, hi = c->n * (t + 1) / c->tasks;
+        uint64_t b = 0;
+        for (int64_t i = lo; i < hi; i++) {
+            uint32_t l = c->src[c->idx[i]].len;
+            if (l > RAY_STR_INLINE_MAX) b += l;
+            else if (l == 0) empty = true;
+        }
+        c->bytes[t] = b;
+    }
+    if (empty) atomic_store_explicit(&c->empty, true, memory_order_relaxed);
+}
+
+static void gbi_str_fill_fn(void* ctxp, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const gbi_str_ctx_t* c = (const gbi_str_ctx_t*)ctxp;
+    for (int64_t t = start; t < end; t++) {
+        int64_t lo = c->n * t / c->tasks, hi = c->n * (t + 1) / c->tasks;
+        uint64_t off = c->bytes[t];
+        for (int64_t i = lo; i < hi; i++) {
+            const ray_str_t* s = &c->src[c->idx[i]];
+            ray_str_t* d = &c->dst[i];
+            if (ray_str_is_inline(s)) { *d = *s; continue; }
+            memcpy(c->dpool + off, c->spool + s->pool_off, s->len);
+            *d = *s;                      /* len, prefix and the content hash */
+            d->pool_off = (uint32_t)off;
+            off += s->len;
+        }
+    }
+}
+
+static ray_t* gbi_str(ray_t* vec, const int64_t* idx, int64_t n) {
+    ray_t* owner = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_parent : vec;
+    int64_t base = (vec->attrs & RAY_ATTR_SLICE) ? vec->slice_offset : 0;
+    gbi_str_ctx_t c;
+    memset(&c, 0, sizeof c);
+    c.src = (const ray_str_t*)ray_data(owner) + base;
+    c.spool = owner->str_pool ? (const char*)ray_data(owner->str_pool) : NULL;
+    c.idx = idx;
+    c.n = n;
+    atomic_store_explicit(&c.empty, false, memory_order_relaxed);
+    ray_pool_t* gpool = ray_pool_get();
+    bool par = n > 0 && gbi_par_ok(gpool, n);
+    /* tasks of at least a morsel: the prefix sum below is over them */
+    c.tasks = par ? ray_pool_total_workers(gpool) * 4 : 1;
+    if (c.tasks > RAY_POOL_INIT_TASKS) c.tasks = RAY_POOL_INIT_TASKS;
+    while (c.tasks > 1 && n / c.tasks < RAY_MORSEL_ELEMS) c.tasks /= 2;
+    ray_t* bytes_hdr = ray_alloc(((size_t)c.tasks + 1) * sizeof(uint64_t));
+    if (!bytes_hdr || RAY_IS_ERR(bytes_hdr)) return bytes_hdr ? bytes_hdr : ray_error("oom", NULL);
+    c.bytes = (uint64_t*)ray_data(bytes_hdr);
+    ray_t* result = ray_vec_new(RAY_STR, n);
+    if (!result || RAY_IS_ERR(result)) { ray_free(bytes_hdr); return result ? result : ray_error("oom", NULL); }
+    result->len = n;
+    if (n > 0) {
+        if (c.tasks > 1) ray_pool_dispatch_n(gpool, gbi_str_count_fn, &c, c.tasks);
+        else gbi_str_count_fn(&c, 0, 0, 1);
+        uint64_t total = 0;
+        for (uint32_t t = 0; t < c.tasks; t++) { uint64_t b = c.bytes[t]; c.bytes[t] = total; total += b; }
+        c.bytes[c.tasks] = total;
+        if (total > UINT32_MAX) { ray_release(result); ray_free(bytes_hdr); return NULL; }
+        if (total > 0) {
+            ray_t* sp = ray_alloc((size_t)total);
+            if (!sp || RAY_IS_ERR(sp)) { ray_release(result); ray_free(bytes_hdr); return ray_error("oom", NULL); }
+            sp->type = RAY_U8;
+            sp->len = (int64_t)total;
+            result->str_pool = sp;
+            c.dpool = (char*)ray_data(sp);
+        }
+        c.dst = (ray_str_t*)ray_data(result);
+        if (c.tasks > 1) ray_pool_dispatch_n(gpool, gbi_str_fill_fn, &c, c.tasks);
+        else gbi_str_fill_fn(&c, 0, 0, 1);
+        /* the pool skips the tasks of a cancelled query: their cells are unwritten */
+        if (c.tasks > 1 && (ray_interrupted() ||
+                            atomic_load_explicit(&gpool->cancelled, memory_order_acquire))) {
+            ray_release(result); ray_free(bytes_hdr);
+            return ray_error("cancel", NULL);
+        }
+        if (atomic_load_explicit(&c.empty, memory_order_relaxed)) result->attrs |= RAY_ATTR_HAS_NULLS;
+    }
+    ray_free(bytes_hdr);
+    return result;
+}
+
 /* Reorder vector elements by an index array */
 ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     int8_t type = vec->type;
@@ -2766,7 +2977,10 @@ ray_t* gather_by_idx(ray_t* vec, int64_t* idx, int64_t n) {
     bool has_nulls = ray_vec_may_have_nulls(vec);
 
     if (type == RAY_STR) {
-        ray_t* result = ray_vec_new(type, n);
+        ray_t* result = gbi_str(vec, idx, n);
+        if (result) return result;
+        /* the pooled bytes pass UINT32_MAX: the per-cell path's error */
+        result = ray_vec_new(type, n);
         if (RAY_IS_ERR(result)) return result;
         result->len = n;
         for (int64_t i = 0; i < n; i++) {
@@ -2877,6 +3091,14 @@ static bool table_widens_atom(int8_t t) {
 }
 
 /* (table [col_names] (list col1 col2 ...)) — build a RAY_TABLE */
+/* Do the string atoms of a would-be string column, some held by several
+ * cells, copy more than RAY_DUP_BUDGET bytes of text again (#1627)?  A
+ * table's string column and a mapped result collapsed to a string vector
+ * (atomic_collapse_wide) both ask. */
+static bool str_cells_repeat(ray_t* const* cells, int64_t n) {
+    return ray_str_cells_repeat_over(cells, n);
+}
+
 ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
     ray_t *_bxn = NULL, *_bxc = NULL;
     names = unbox_vec_arg(names, &_bxn);
@@ -2902,8 +3124,24 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         /* Convert Rayfall list (or typed vec) to typed column vector */
         ray_t* col_src = col_elems[i];
 
-        /* Single atom → wrap in a 1-element vector */
+        /* Single atom → wrap in a 1-element vector.  A process-local
+         * handle is wrapped in a 1-cell LIST instead: an I64 cell would
+         * keep its pointer as a plain integer and drop what marks it. */
         ray_t* atom_wrap = NULL;
+        if (ray_is_handle_atom(col_src)) {
+            ray_t* one = ray_list_new(1);
+            if (RAY_IS_ERR(one)) { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return one; }
+            ray_t* prev = one;
+            one = ray_list_append(one, col_src);
+            if (RAY_IS_ERR(one)) { ray_release(prev); ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return one; }
+            if (expected_rows < 0) expected_rows = 1;
+            else if (expected_rows != 1)
+                { ray_release(one); ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return ray_error("domain", "table: all columns must have %lld rows, got 1", (long long)expected_rows); }
+            tbl = ray_table_add_col(tbl, name_id, one);
+            ray_release(one);
+            if (RAY_IS_ERR(tbl)) { if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return tbl; }
+            continue;
+        }
         if (ray_is_atom(col_src) && col_src->type != -RAY_SYM) {
             int8_t atype = -col_src->type;
             if (atype == RAY_GUID) {
@@ -2997,6 +3235,13 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
             col_type = RAY_I64; /* unsupported first atom: report element mismatch below */
         }
 
+        /* A string column copies each cell's text: a string atom held by
+         * many cells is written out again for each (#1627).  Up to 1 GiB of
+         * such copies, as for every writer that writes a value out in full. */
+        if (col_type == RAY_STR && str_cells_repeat(row_elems, nrows))
+            { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc);
+              return ray_error("limit", "table: a string column repeats shared strings beyond 1 GiB of extra data"); }
+
         ray_t* col_vec = ray_vec_new(col_type, nrows);
         if (RAY_IS_ERR(col_vec))
             { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
@@ -3006,6 +3251,10 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
         /* ray_vec_append copies the atom payload raw and never sets HAS_NULLS,
          * so track typed null atoms and flip the column flag after the loop. */
         bool col_has_nulls = false;
+        /* A process-local handle met while filling: the column stays the
+         * source LIST, since a typed I64 cell would turn the handle into
+         * its pointer as a plain integer (#802). */
+        bool has_handle = false;
 
         for (int64_t j = 0; j < nrows; j++) {
             /* Promotion preserves logical nulls, not the source sentinel's
@@ -3042,6 +3291,8 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                     return ray_error("type", "table: %s column element type mismatch, got %s", ray_type_name(col_type), ray_type_name(et));
                 }
                 if (numeric) {
+                    if (RAY_UNLIKELY(cell->attrs & RAY_HANDLE_ATTRS) && cell->type == -RAY_I64)
+                        { has_handle = true; break; }
                     if (cell_is_null && (col_type == RAY_BOOL || col_type == RAY_U8))
                         ((uint8_t*)ray_data(col_vec))[j] = 0;
                     else if (cell_is_null) ray_vec_set_null(col_vec, j, true);
@@ -3059,7 +3310,11 @@ ray_t* ray_table_fn(ray_t* names, ray_t* cols) {
                 { ray_release(tbl); if (_bxn) ray_release(_bxn); if (_bxc) ray_release(_bxc); return col_vec; }
         }
 
-        if (col_has_nulls && col_vec->type != RAY_SYM)
+        if (RAY_UNLIKELY(has_handle)) {
+            ray_release(col_vec);
+            col_vec = col_src;
+            ray_retain(col_vec);
+        } else if (col_has_nulls && col_vec->type != RAY_SYM)
             col_vec->attrs |= RAY_ATTR_HAS_NULLS;
 
         tbl = ray_table_add_col(tbl, name_id, col_vec);
@@ -3164,23 +3419,153 @@ ray_t* ray_let_fn(ray_t* name_obj, ray_t* val_expr) {
     return val;
 }
 
+/* A `while` condition inside a query that is a vector as long as the rows
+ * being evaluated (the group's under a per-group evaluation, the active
+ * table's otherwise; ray_query_rows_len) (#1630, #1647).  This is the
+ * condition of a compiled `while`'s jump (vm_cond_test; a `times` count is
+ * normalized to an atom first, and `if` chooses per row for a boolean
+ * vector, ray_cond_rows) or of the tree walker's (ray_while_fn).  Tested
+ * whole, any non-empty vector is true, so a loop over the rows ran on the
+ * first row's say, and one false on every row never ended: a server could
+ * be held by one query.
+ *
+ * Every such vector is tested, whatever computed it.  Row provenance is not
+ * consulted: a value computed from the rows is reported as such only where
+ * each route that builds one says so (an `if`'s result took its arms'
+ * provenance, `and`'s its last operand's), and one route that does not
+ * would loop forever.  A BOOL vector true on every row is true and one
+ * false on every row false (no rows: false, there being no row to loop
+ * for); one true on some rows and false on others, or a vector of another
+ * type, is an error, since a loop cannot take a different number of passes
+ * for each row.  *truth is set to 1 or 0; a vector of another length, or
+ * an atom, leaves it at -1, tested whole as outside a query.  NULL unless
+ * an error. */
+static __attribute__((noinline)) ray_t* cond_rows_test(ray_t* cond, int* truth) {
+    *truth = -1;
+    if (!(ray_is_vec(cond) || cond->type == RAY_LIST)) return NULL;
+    int64_t len = ray_query_rows_len();
+    if (len < 0 || len != ray_len(cond)) return NULL;
+    if (len == 0) { *truth = 0; return NULL; }
+    if (cond->type != RAY_BOOL)
+        return ray_error("nyi", "while: its condition is a vector of %s over the query's rows, "
+                         "and a loop tests it whole, not row by row; "
+                         "see Iteration: while in language/control-flow.md",
+                         ray_type_name(cond->type));
+    const uint8_t* b = (const uint8_t*)ray_data(cond);
+    bool first = b[0] != 0;
+    /* Eight cells a word: a BOOL cell is 0 or 1, so a word of cells all
+     * like the first is 0 or 0x0101...; any other word is read a cell at a
+     * time, which also accepts a true cell stored as another non-zero. */
+    const uint64_t want = first ? 0x0101010101010101ULL : 0;
+    bool mixed = false;
+    int64_t k = 0;
+    for (; k + 8 <= len && !mixed; k += 8) {
+        uint64_t w;
+        memcpy(&w, b + k, sizeof w);
+        if (w == want) continue;
+        for (int j = 0; j < 8; j++) mixed |= (b[k + j] != 0) != first;
+    }
+    for (; k < len && !mixed; k++) mixed = (b[k] != 0) != first;
+    if (mixed)
+        return ray_error("nyi", "while: its condition differs between the query's rows, "
+                         "and a loop tests it whole, not row by row; "
+                         "see Iteration: while in language/control-flow.md");
+    *truth = first ? 1 : 0;
+    return NULL;
+}
+
+/* The bytecode jump's test of a vector condition (op_jmpf, the jumps other than
+ * `if`'s, which takes OP_JMPFV): counted toward rows_cond, and inside a query a
+ * condition over its rows goes through cond_rows_test.  Consumes `cond`; an
+ * error goes to *err. */
+static __attribute__((noinline)) int vm_cond_test(ray_t* cond, ray_t** err) {
+    __VM->rows_cond++;   /* a vector tested whole */
+    int truth = -1;
+    ray_t* mixed = cond_rows_test(cond, &truth);
+    if (mixed) { ray_release(cond); *err = mixed; return 0; }
+    int t = truth >= 0 ? truth : is_truthy(cond);
+    ray_release(cond);
+    return t;
+}
+
 /* (if c1 r1 c2 r2 ... else?) — conditional chain.  Receives unevaluated
  * args.  Conditions are tried in order and the result paired with the
  * first truthy one is evaluated; an odd trailing arg is the fallback.  No
  * fallback: return 0. */
+/* Elementwise choice for a boolean-vector condition: `mask` picks per row
+ * between `then_v` and `else_v`, both already evaluated and materialized,
+ * none consumed.  The arms are vectors of the mask's length or atoms that
+ * broadcast.  The result type follows the promotion `if` has inside a
+ * query, because the choice runs through the same OP_IF kernel. */
+ray_t* ray_cond_rows(ray_t* mask, ray_t* then_v, ray_t* else_v) {
+    int64_t len = mask->len;
+    ray_t* arms[2] = { then_v, else_v };
+    for (int k = 0; k < 2; k++) {
+        ray_t* a = arms[k];
+        if (ray_is_atom(a)) continue;
+        if (!ray_is_vec(a))
+            return ray_error("type", "if: an arm of a vector condition must be a vector or an atom, got %s",
+                             ray_type_name(a->type));
+        if (a->len != len)
+            return ray_error("length", "if: condition has %lld rows, %s arm has %lld",
+                             (long long)len, k ? "else" : "then", (long long)a->len);
+    }
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return ray_error("oom", NULL);
+    ray_op_t* ops[3] = { ray_const_vec(g, mask), NULL, NULL };
+    for (int k = 0; k < 2 && ops[0]; k++)
+        ops[k + 1] = ray_is_atom(arms[k]) ? ray_const_atom(g, arms[k])
+                                          : ray_const_vec(g, arms[k]);
+    ray_op_t* root = (ops[0] && ops[1] && ops[2]) ? ray_if(g, ops[0], ops[1], ops[2]) : NULL;
+    if (!root) {
+        ray_t* e = g->compile_err;
+        g->compile_err = NULL;
+        ray_graph_free(g);
+        return e ? e : ray_error("type", "if: cannot choose between %s and %s rows",
+                                 ray_type_name(then_v->type), ray_type_name(else_v->type));
+    }
+    ray_t* r = ray_execute(g, root);
+    ray_graph_free(g);
+    return r ? r : ray_error("oom", NULL);
+}
+
 ray_t* ray_cond_fn(ray_t** args, int64_t n) {
     if (n < 2) return ray_error("domain", "if: expected at least 2 args (cond then), got %lld", (long long)n);
     int64_t i = 0;
     for (; i + 1 < n; i += 2) {
         ray_t* cond = ray_eval(args[i]);
         if (RAY_IS_ERR(cond)) return cond;
-        /* A vector condition tested whole: the expression may have needed
-         * row-by-row evaluation (see the opaque by: key). */
-        if (!ray_is_atom(cond)) __VM->rows_cond++;
         /* Materialize lazy handles before testing truthiness */
         if (ray_is_lazy(cond))
             cond = ray_lazy_materialize(cond);
         if (RAY_IS_ERR(cond)) return cond;
+        if (cond->type == RAY_BOOL) {
+            /* A boolean vector chooses per row, so both the then arm and
+             * the rest of the chain are evaluated, then merged.  It still
+             * counts as a vector condition for the opaque by: key, whose
+             * row-by-row route is unchanged. */
+            __VM->rows_cond++;
+            if (i + 2 >= n) {
+                ray_release(cond);
+                return ray_error("domain", "if: a boolean-vector condition needs an else arm");
+            }
+            ray_t* tv = ray_eval(args[i + 1]);
+            if (tv && !RAY_IS_ERR(tv) && ray_is_lazy(tv)) tv = ray_lazy_materialize(tv);
+            if (!tv || RAY_IS_ERR(tv)) { ray_release(cond); return tv ? tv : ray_error("oom", NULL); }
+            ray_t* ev = (n - i - 2 == 1) ? ray_eval(args[i + 2])
+                                            : ray_cond_fn(args + i + 2, n - i - 2);
+            if (ev && !RAY_IS_ERR(ev) && ray_is_lazy(ev)) ev = ray_lazy_materialize(ev);
+            ray_t* out = (!ev || RAY_IS_ERR(ev)) ? (ev ? ev : ray_error("oom", NULL))
+                                                 : ray_cond_rows(cond, tv, ev);
+            ray_release(cond);
+            ray_release(tv);
+            if (ev && !RAY_IS_ERR(ev)) ray_release(ev);
+            return out;
+        }
+        /* A non-boolean vector condition is still tested whole: the
+         * expression may have needed row-by-row evaluation (see the
+         * opaque by: key). */
+        if (!ray_is_atom(cond)) __VM->rows_cond++;
         int truthy = is_truthy(cond);
         ray_release(cond);
         if (truthy) return ray_eval(args[i + 1]);
@@ -3239,7 +3624,16 @@ ray_t* ray_while_fn(ray_t** args, int64_t n) {
         if (ray_is_lazy(cond))
             cond = ray_lazy_materialize(cond);
         if (RAY_IS_ERR(cond)) return cond;
-        int truthy = is_truthy(cond);
+        /* Inside a query a condition over its rows is tested as the
+         * compiled `while`'s is (cond_rows_test): tested whole, a
+         * non-empty vector false on every row stayed true and the loop
+         * never ended (#1647). */
+        int truth = -1;
+        if (!ray_is_atom(cond)) {
+            ray_t* mixed = cond_rows_test(cond, &truth);
+            if (mixed) { ray_release(cond); return mixed; }
+        }
+        int truthy = truth >= 0 ? truth : is_truthy(cond);
         ray_release(cond);
         if (!truthy) return RAY_NULL_OBJ;
         for (int64_t i = 1; i < n; i++) {
@@ -4296,6 +4690,8 @@ static ray_t* vm_exec_rows(ray_t* lambda, ray_t** call_args, int64_t argc,
         [OP_CALL2R]        = &&op_call2r,
         [OP_CALLNR]        = &&op_callnr,
         [OP_PATHGET]       = &&op_pathget,
+        [OP_JMPFV]         = &&op_jmpfv,
+        [OP_IFTREE]        = &&op_iftree,
     };
 
     /* Arity check before allocating VM state */
@@ -4514,7 +4910,68 @@ op_jmp: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ip += offset;
-    if (offset < 0 && g_eval_interrupted) goto vm_error_cancel;
+    if (offset < 0 && EVAL_INTERRUPTED()) goto vm_error_cancel;
+    DISPATCH();
+}
+
+op_jmpfv: {
+    /* An `if` condition: a boolean vector chooses per row (OP_IFTREE, the
+     * second offset) and stays on the stack; anything else is OP_JMPF. */
+    int16_t off_false = (int16_t)((code[ip] << 8) | code[ip + 1]);
+    int16_t off_vec = (int16_t)((code[ip + 2] << 8) | code[ip + 3]);
+    ip += 4;
+    ray_t *cond = PEEK();
+    if (cond && cond->type == RAY_BOOL) { ip += off_vec; DISPATCH(); }
+    cond = POP();
+    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
+    int truthy = is_truthy(cond);
+    ray_release(cond);
+    if (!truthy) ip += off_false;
+    DISPATCH();
+}
+
+op_iftree: {
+    uint16_t site = (uint16_t)((code[ip] << 8) | code[ip + 1]);
+    uint8_t start = code[ip + 2];
+    int16_t offset = (int16_t)((code[ip + 3] << 8) | code[ip + 4]);
+    ip += 5;
+    ray_t *pool = LAMBDA_CONSTS(vm.fn);
+    ray_t *table = ((ray_t **)ray_data(pool))[pool->len - 1];
+    ray_t **te = (ray_t **)ray_data(table);
+    ray_t *form = te[2 * (size_t)site];
+    ray_t *syms = te[2 * (size_t)site + 1];
+    ray_t **fe = (ray_t **)ray_data(form);
+    int64_t nargs = form->len - start;   /* the chain: its condition and the rest */
+    ray_t *targs_stack[64];
+    ray_t **targs = targs_stack;
+    ray_t *targs_obj = NULL;
+    if (nargs > 64) {
+        targs_obj = ray_alloc((size_t)nargs * sizeof(ray_t *));
+        if (!targs_obj || RAY_IS_ERR(targs_obj)) { vm_err_obj = ray_error("oom", NULL); goto vm_error; }
+        targs = (ray_t **)ray_data(targs_obj);
+    }
+    ray_t *cond = POP();
+    targs[0] = cond;
+    for (int64_t i = 1; i < nargs; i++) targs[i] = fe[start + i];
+    /* The window binds the locals for the arms, as OP_SCOPE_EVAL does. */
+    if (ray_env_scope_bind((const int64_t*)ray_data(syms), (int32_t)syms->len,
+                           &vm.ps[vm.fp], &vm.rows[vm.fp], vm.fn) != RAY_OK) {
+        ray_release(cond);
+        if (targs_obj) ray_release(targs_obj);
+        goto vm_error_limit;
+    }
+    ray_env_mark_eval_window();
+    ray_t *res = ray_cond_fn(targs, nargs);
+    ray_release(cond);
+    if (targs_obj) ray_release(targs_obj);
+    if (!res || RAY_IS_ERR(res)) { vm_err_obj = res ? res : ray_error("oom", NULL); goto vm_error; }
+    ray_t *before[256];
+    int64_t nsync = syms->len < 256 ? syms->len : 256;
+    for (int64_t i = 0; i < nsync; i++) before[i] = LOCAL(i);
+    ray_env_scope_sync((const int64_t*)ray_data(syms), (int32_t)syms->len, &vm.ps[vm.fp]);
+    for (int64_t i = 0; i < nsync; i++) if (LOCAL(i) != before[i]) LROWS(i) = 2;
+    PUSHR(res, 0);
+    ip += offset;
     DISPATCH();
 }
 
@@ -4522,7 +4979,15 @@ op_jmpf: {
     int16_t offset = (int16_t)((code[ip] << 8) | code[ip + 1]);
     ip += 2;
     ray_t *cond = POP();
-    if (cond && !ray_is_atom(cond)) __VM->rows_cond++;   /* a vector tested whole */
+    if (cond && !ray_is_atom(cond)) {
+        /* a vector tested whole, or a condition over a query's rows
+         * (vm_cond_test, out of line) */
+        ray_t* err = NULL;
+        int t = vm_cond_test(cond, &err);   /* consumes cond */
+        if (err) { vm_err_obj = err; goto vm_error; }
+        if (!t) ip += offset;
+        DISPATCH();
+    }
     int truthy = is_truthy(cond);
     ray_release(cond);
     if (!truthy) ip += offset;
@@ -4737,7 +5202,7 @@ op_callf: {
                 ray_release(fn_args[i]);  /* excess args */
 
             /* Check for Ctrl-C interrupt on each compiled call */
-            if (g_eval_interrupted) goto vm_error_cancel;
+            if (EVAL_INTERRUPTED()) goto vm_error_cancel;
 
             /* Switch to callee bytecode */
             code = (uint8_t *)ray_data(LAMBDA_BC(fn_obj));
@@ -5944,6 +6409,7 @@ static void ray_register_builtins(void) {
     register_vary(".log.roll",     RAY_FN_RESTRICTED, ray_log_roll_fn);
     register_vary(".log.snapshot", RAY_FN_RESTRICTED, ray_log_snapshot_fn);
     register_vary(".log.sync",     RAY_FN_NONE,       ray_log_sync_fn);
+    register_vary(".log.posts",    RAY_FN_RESTRICTED, ray_log_posts_fn);
     register_vary(".log.close",    RAY_FN_RESTRICTED, ray_log_close_fn);
     register_vary(".log.purge",    RAY_FN_RESTRICTED, ray_log_purge_fn);
 
@@ -6183,7 +6649,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
     }
 
     /* Check for external interrupt (e.g. Ctrl-C from REPL) */
-    if (g_eval_interrupted) return ray_error("cancel", "interrupted");
+    if (EVAL_INTERRUPTED()) return ray_error("cancel", "interrupted");
 
     /* The stack is read every fourth level: four levels are far below
      * the reserve in any build, and the hot path skips the read. */

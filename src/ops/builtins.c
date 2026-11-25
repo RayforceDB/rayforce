@@ -51,6 +51,7 @@ static inline double clear_neg_zero(double v) {
     return v;
 }
 #include "ops/hash.h"
+#include "ops/walkmemo.h"
 #include "store/col.h"
 #include "store/part.h"
 #include "store/splay.h"
@@ -62,6 +63,7 @@ static inline double clear_neg_zero(double v) {
 #include <string.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
@@ -79,72 +81,171 @@ static inline double clear_neg_zero(double v) {
  * ══════════════════════════════════════════ */
 
 /* Helper: print a ray_t value to a file handle */
-void ray_lang_print(FILE* fp, ray_t* val) {
-    if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
-    if (RAY_IS_NULL(val)) { fprintf(fp, "null"); return; }
+/* print and println write a value out in full, a shared part again each
+ * time it is met: the bytes written again are counted as they are written,
+ * and past RAY_DUP_BUDGET printing stops (#1627, ops/walkmemo.h).  One
+ * tracker serves all the values of one call (#1648). */
+typedef struct {
+    ray_dup_t dup;
+    uint64_t  out;
+    bool      over;
+    FILE*     fp;
+    bool      held;    /* output is held in buf, not yet written to fp */
+    char*     buf;     /* small, then the heap */
+    size_t    len, cap;
+    char      small[256];
+} lang_print_t;
+#define LP_OUT(p, n) do { int n_ = (n); if (n_ > 0) (p)->out += (uint64_t)n_; } while (0)
+
+/* Output reaching fp cannot be taken back, so print holds it until the
+ * value can no longer be refused before it is printed: until the lower
+ * bound of its repeats has run and passed (at the first repeat, as for
+ * every text writer), or up to LP_HOLD bytes, past which the bound is
+ * taken at once when the values hold a shared part (ray_dup_bound_now).
+ * A refusal while output is held prints nothing (#1648). */
+#define LP_HOLD ((size_t)64 << 20)
+static void lp_drop(lang_print_t* p) {
+    if (p->buf != p->small) ray_free_raw(p->buf);
+    p->buf = NULL;
+    p->len = p->cap = 0;
+    p->held = false;
+}
+static void lp_release(lang_print_t* p) {
+    if (p->len) fwrite(p->buf, 1, p->len, p->fp);
+    lp_drop(p);
+}
+__attribute__((noinline)) static void lp_hold_full(lang_print_t* p) {
+    if (ray_dup_bound_now(&p->dup)) { p->over = true; return; }   /* the caller drops it */
+    p->dup.lb_done = true;   /* bounded, or nothing in it can repeat */
+    lp_release(p);
+}
+/* Room for n more held bytes; false (output released to fp) if none. */
+__attribute__((noinline)) static bool lp_grow(lang_print_t* p, size_t n) {
+    size_t cap = p->cap * 2;
+    while (cap - p->len < n) cap *= 2;
+    char* nb = ray_alloc_raw(cap);
+    if (!nb) { lp_release(p); return false; }
+    memcpy(nb, p->buf, p->len);
+    if (p->buf != p->small) ray_free_raw(p->buf);
+    p->buf = nb;
+    p->cap = cap;
+    return true;
+}
+static int lp_write(lang_print_t* p, const char* s, size_t n) {
+    if (!p->held) return fwrite(s, 1, n, p->fp) == n ? (int)n : -1;
+    if (RAY_UNLIKELY(p->cap - p->len < n) && !lp_grow(p, n))
+        return fwrite(s, 1, n, p->fp) == n ? (int)n : -1;
+    memcpy(p->buf + p->len, s, n);
+    p->len += n;
+    if (RAY_UNLIKELY(p->len > LP_HOLD)) lp_hold_full(p);
+    return (int)n;
+}
+static inline int lp_str(lang_print_t* p, const char* s) { return lp_write(p, s, strlen(s)); }
+static int lp_i64(lang_print_t* p, int64_t v) {
+    char tmp[24];
+    char* e = tmp + sizeof tmp;
+    char* q = e;
+    uint64_t u = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+    do { *--q = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) *--q = '-';
+    return lp_write(p, q, (size_t)(e - q));
+}
+__attribute__((format(printf, 2, 3)))
+static int lp_printf(lang_print_t* p, const char* fmt, ...) {
+    char tmp[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0) return n;
+    return lp_write(p, tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+}
+static void lang_print(FILE* fp, ray_t* val, lang_print_t* p);
+static void lp_bounded(lang_print_t* p) { if (p->held && p->dup.lb_done && !p->over) lp_release(p); }
+static void lang_print_part(FILE* fp, ray_t* val, lang_print_t* p) {
+    if (RAY_LIKELY(!ray_dup_watch(&p->dup, val))) { lang_print(fp, val, p); return; }
+    bool opened = ray_dup_enter(&p->dup, val, p->out);
+    if (RAY_UNLIKELY(ray_dup_over(&p->dup, p->out))) {   /* the lower bound refused it */
+        ray_dup_leave(&p->dup, opened, p->out);
+        p->over = true;
+        return;
+    }
+    lang_print(fp, val, p);
+    ray_dup_leave(&p->dup, opened, p->out);
+    if (RAY_UNLIKELY(ray_dup_over(&p->dup, p->out))) p->over = true;
+    lp_bounded(p);   /* the bound ran at a repeat and passed: print what is held */
+}
+static void lang_print(FILE* fp, ray_t* val, lang_print_t* p) {
+    if (p->over) return;
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, lp_write(p, "error", 5)); return; }
+    if (RAY_IS_NULL(val)) { LP_OUT(p, lp_write(p, "null", 4)); return; }
     /* Materialize lazy handles before printing.  val is BORROWED and
      * ray_lazy_materialize consumes its input, so give it its own ref;
      * print the owned concrete result and release it before returning. */
     if (ray_is_lazy(val)) {
         ray_retain(val);
         ray_t* mat = ray_lazy_materialize(val);
-        ray_lang_print(fp, mat);
+        lang_print(fp, mat, p);
         if (mat && !RAY_IS_ERR(mat)) ray_release(mat);
         return;
     }
-    if (!val || RAY_IS_ERR(val)) { fprintf(fp, "error"); return; }
+    if (!val || RAY_IS_ERR(val)) { LP_OUT(p, lp_write(p, "error", 5)); return; }
     /* A list prints its cells through here again: one frame per level of
      * nesting, and a value can be nested arbitrarily deep (#1591).  This
      * writes to a stream and has no error to give, so past the thread's
      * stack reserve the rest of the value prints as "...". */
-    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { fputs("...", fp); return; }
+    if (val->type >= 0 && RAY_UNLIKELY(ray_stack_short())) { LP_OUT(p, lp_write(p, "...", 3)); return; }
     /* STR/SYM use their empty literals as canonical null spellings. */
     if (val->type != -RAY_STR && val->type != -RAY_SYM &&
         RAY_ATOM_IS_NULL(val)) {
-        fprintf(fp, "%s", ray_fmt_null_literal(-val->type));
+        LP_OUT(p, lp_str(p, ray_fmt_null_literal(-val->type)));
         return;
     }
     switch (val->type) {
-    case -RAY_I64:  fprintf(fp, "%" PRId64, val->i64); break;
+    case -RAY_I64:  LP_OUT(p, lp_i64(p, val->i64)); break;
     case -RAY_F64: {
         double fv = val->f64;
         fv = clear_neg_zero(fv);
         char buf[32];
         int n = ray_snprintf_c(buf, sizeof(buf), "%g", fv);
-        if (n > 0 && (size_t)n < sizeof(buf)) fputs(buf, fp);
+        if (n > 0 && (size_t)n < sizeof(buf)) LP_OUT(p, lp_write(p, buf, (size_t)n));
         break;
     }
-    case -RAY_BOOL: fprintf(fp, "%s", val->b8 ? "true" : "false"); break;
+    case -RAY_BOOL: LP_OUT(p, (val->b8 ? lp_write(p, "true", 4) : lp_write(p, "false", 5))); break;
     case -RAY_SYM: {
         ray_t* s = ray_sym_str(val->i64);
-        if (s) fprintf(fp, "'%.*s", (int)ray_str_len(s), ray_str_ptr(s));
-        else fprintf(fp, "'?");
+        if (s) { LP_OUT(p, lp_write(p, "'", 1)); LP_OUT(p, lp_write(p, ray_str_ptr(s), ray_str_len(s))); }
+        else LP_OUT(p, lp_write(p, "'?", 2));
         break;
     }
     case -RAY_STR: {
         const char* s = ray_str_ptr(val);
         size_t slen = ray_str_len(val);
-        fprintf(fp, "%.*s", (int)slen, s);
+        LP_OUT(p, lp_write(p, s, slen));
         break;
     }
     case RAY_LIST: {
-        fprintf(fp, "[");
+        LP_OUT(p, lp_write(p, "[", 1));
         int64_t len = ray_len(val);
         ray_t** elems = (ray_t**)ray_data(val);
         for (int64_t i = 0; i < len; i++) {
-            if (i > 0) fprintf(fp, " ");
-            ray_lang_print(fp, elems[i]);
+            if (i > 0) LP_OUT(p, lp_write(p, " ", 1));
+            lang_print_part(fp, elems[i], p);
+            if (p->over) return;
         }
-        fprintf(fp, "]");
+        LP_OUT(p, lp_write(p, "]", 1));
         break;
     }
     case RAY_TABLE:
-        fprintf(fp, "<table %" PRId64 "x%" PRId64 ">",
-                ray_table_nrows(val), ray_table_ncols(val));
+        LP_OUT(p, lp_write(p, "<table ", 7));
+        LP_OUT(p, lp_i64(p, ray_table_nrows(val)));
+        LP_OUT(p, lp_write(p, "x", 1));
+        LP_OUT(p, lp_i64(p, ray_table_ncols(val)));
+        LP_OUT(p, lp_write(p, ">", 1));
         break;
     case RAY_UNARY: case RAY_BINARY: case RAY_VARY: {
         const char* name = ray_fn_name(val);
-        fprintf(fp, "%s", name[0] ? name : "builtin");
+        LP_OUT(p, lp_str(p, name[0] ? name : "builtin"));
         break;
     }
     default: {
@@ -152,12 +253,15 @@ void ray_lang_print(FILE* fp, ray_t* val) {
          * vector types (I16/I32/F64/SYM/...), DICT, GUID, temporal, etc.
          * Without this println on (println 5i) printed "<type:-4>" — a
          * debug placeholder, not the value. */
-        ray_t* s = ray_fmt(val, RAY_FMT_COMPACT);
+        ray_t* s = ray_fmt_dup(val, RAY_FMT_COMPACT, &p->dup, p->out);
         if (s && !RAY_IS_ERR(s)) {
-            fprintf(fp, "%.*s", (int)ray_str_len(s), ray_str_ptr(s));
+            LP_OUT(p, lp_write(p, ray_str_ptr(s), ray_str_len(s)));
             ray_release(s);
+        } else if (s && strcmp(ray_err_code(s), "limit") == 0) {   /* the budget */
+            ray_error_free(s);
+            p->over = true;
         } else {
-            fprintf(fp, "<type:%d>", val->type);
+            LP_OUT(p, lp_printf(p, "<type:%d>", val->type));
             if (s) ray_release(s);
         }
         break;
@@ -165,11 +269,112 @@ void ray_lang_print(FILE* fp, ray_t* val) {
     }
 }
 
+/* Print vals to fp, separated by spaces, under one budget (#1648); output
+ * is held until it can no longer be refused (lp_printf).  LP_DONE:
+ * printed; LP_REFUSED: refused with nothing printed; LP_STOPPED: stopped
+ * at the budget after printing some. */
+enum { LP_DONE, LP_REFUSED, LP_STOPPED };
+static int lang_print_vals(FILE* fp, ray_t* const* vals, int64_t n) {
+    lang_print_t p;
+    memset(&p, 0, offsetof(lang_print_t, small));   /* the bytes of small are written before read */
+    p.fp = fp;
+    p.held = true;
+    p.buf = p.small;
+    p.cap = sizeof p.small;
+    ray_dup_begin(&p.dup);
+    ray_dup_roots(&p.dup, vals, n, true);   /* print writes a table as one line */
+    for (int64_t i = 0; i < n && !p.over; i++) {
+        if (i > 0) LP_OUT(&p, lp_write(&p, " ", 1));
+        lang_print_part(fp, vals[i], &p);
+    }
+    int r = LP_DONE;
+    if (p.over) r = p.held ? LP_REFUSED : LP_STOPPED;
+    if (p.held) { if (p.over) lp_drop(&p); else lp_release(&p); }
+    ray_dup_end(&p.dup);
+    return r;
+}
+
+/* A caller with no error to give (the REPL's echo): past the budget the
+ * rest prints as "...". */
+void ray_lang_print(FILE* fp, ray_t* val) {
+    if (lang_print_vals(fp, &val, 1) != LP_DONE) fputs("...", fp);
+}
+
 /* Helper: format string with % placeholders, substituting args.
  * Returns a heap-allocated char* (caller must ray_free_raw) and sets *out_len.
  * If fmt has no %, returns NULL (caller falls back to plain print).  When an
  * argument fails to format (a table column that fails to load), returns NULL
  * with *err set to the owned error object; otherwise *err stays NULL. */
+/* fmt_interpolate for a call with an argument that can repeat
+ * (ray_dup_call_tracks): one budget of repeated output, one memo and one
+ * lower bound for every argument the call writes (#1648).  Kept apart so
+ * a call over numbers and symbols runs the plain loop below unchanged. */
+__attribute__((noinline))
+static char* fmt_interpolate_tracked(const char* fmt, size_t flen, ray_t** args, int64_t nargs,
+                                     int64_t arg_start, size_t* out_len, ray_t** err) {
+    int64_t npct = 0;
+    for (size_t i = 0; i < flen; i++) if (fmt[i] == '%') npct++;
+    int64_t nused = nargs - arg_start < npct ? nargs - arg_start : npct;   /* the args written */
+    ray_dup_t dup;
+    ray_dup_begin(&dup);
+    ray_dup_roots(&dup, args + arg_start, nused, false);
+
+    size_t cap = flen + 256;
+    char* buf = ray_calloc_raw(cap);
+    if (!buf) { ray_dup_end(&dup); return NULL; }
+    size_t pos = 0;
+    int64_t ai = arg_start;
+    for (size_t i = 0; i < flen; i++) {
+        if (fmt[i] == '%' && ai < nargs) {
+            char tmp[256];
+            ray_t* a = args[ai++];
+            ray_t* a_owned = NULL;
+            if (a && ray_is_lazy(a)) {   /* a private ref: a is borrowed */
+                ray_retain(a);
+                a = a_owned = ray_lazy_materialize(a);
+            }
+            const char* sp = NULL;
+            size_t sl = 0;
+            bool tracked = ray_dup_call_tracks(a), opened = false;
+            ray_t* own;
+            if (!tracked) {
+                own = ray_fmt_pct(a, tmp, sizeof(tmp), &sp, &sl);
+            } else {
+                opened = ray_dup_enter(&dup, a, pos);
+                own = ray_dup_over(&dup, pos)   /* the lower bound refused it */
+                    ? ray_error("limit", "format: value repeats shared parts beyond 1 GiB of extra output")
+                    : ray_fmt_pct_dup(a, tmp, sizeof(tmp), &sp, &sl, &dup, pos);
+            }
+            if (own && RAY_IS_ERR(own)) {
+                if (a_owned) ray_release(a_owned);
+                ray_free_raw(buf);
+                ray_dup_end(&dup);
+                *err = own;
+                return NULL;
+            }
+            while (pos + sl + 1 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            memcpy(buf + pos, sp, sl);
+            pos += sl;
+            if (own) ray_release(own);
+            if (a_owned && !RAY_IS_ERR(a_owned)) ray_release(a_owned);
+            if (tracked) ray_dup_leave(&dup, opened, pos);
+            if (tracked && ray_dup_over(&dup, pos)) {
+                ray_free_raw(buf);
+                ray_dup_end(&dup);
+                *err = ray_error("limit", "format: value repeats shared parts beyond 1 GiB of extra output");
+                return NULL;
+            }
+        } else {
+            if (pos + 2 > cap) { cap *= 2; buf = ray_realloc_raw(buf, cap); }
+            buf[pos++] = fmt[i];
+        }
+    }
+    ray_dup_end(&dup);
+    buf[pos] = '\0';
+    *out_len = pos;
+    return buf;
+}
+
 static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t nargs, int64_t arg_start, size_t* out_len, ray_t** err) {
     *err = NULL;
     /* Quick scan: any % in fmt? */
@@ -196,6 +401,14 @@ static char* fmt_interpolate(const char* fmt, size_t flen, ray_t** args, int64_t
             if (a && ray_is_lazy(a)) {
                 ray_retain(a);
                 a = a_owned = ray_lazy_materialize(a);
+            }
+            if (RAY_UNLIKELY(ray_dup_call_tracks(a))) {
+                /* an argument that can repeat: the call is written again
+                 * under one budget (#1648); the arguments before it were
+                 * numbers, symbols or strings held once */
+                if (a_owned) ray_release(a_owned);
+                ray_free_raw(buf);
+                return fmt_interpolate_tracked(fmt, flen, args, nargs, arg_start, out_len, err);
             }
             const char* sp = NULL;
             size_t sl = 0;
@@ -226,6 +439,7 @@ static ray_t* print_end(FILE* out) {
     return RAY_NULL_OBJ;
 }
 
+
 /* (println val1 val2 ...) — print values to stdout, newline at end.
  * If first arg is a string with % placeholders, substitutes remaining args. */
 ray_t* ray_println_fn(ray_t** args, int64_t n) {
@@ -252,9 +466,10 @@ ray_t* ray_println_fn(ray_t** args, int64_t n) {
     }
 
     FILE* out = stdout;
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', out);
-        ray_lang_print(out, args[i]);
+    int r = lang_print_vals(out, args, n);
+    if (r != LP_DONE) {
+        if (r == LP_STOPPED) { fputc('\n', out); fflush(out); }
+        return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
     }
     fputc('\n', out);
     return print_end(out);
@@ -281,18 +496,59 @@ ray_t* ray_print_fn(ray_t** args, int64_t n) {
     }
 
     FILE* out = stdout;
-    for (int64_t i = 0; i < n; i++) {
-        if (i > 0) fputc(' ', out);
-        ray_lang_print(out, args[i]);
+    int r = lang_print_vals(out, args, n);
+    if (r != LP_DONE) {
+        if (r == LP_STOPPED) { fputc('\n', out); fflush(out); }
+        return ray_error("limit", "print: value repeats shared parts beyond 1 GiB of extra output");
     }
     return print_end(out);
 }
 
 /* (show val1 val2 ...) — print values to stdout using ray_fmt, newline at end */
+/* show from args[from], the first value that can repeat
+ * (ray_dup_call_tracks), to the end: one budget of repeated output for all
+ * of them (#1648); the values before it cannot repeat.  Kept apart so a
+ * call over numbers and symbols runs the plain loop below unchanged. */
+__attribute__((noinline)) static ray_t* show_tracked(ray_t** args, int64_t n, int64_t from) {
+    /* args are pre-materialized by eval — see ray_println_fn. */
+    FILE* out = stdout;
+    ray_dup_t dup;   /* one budget of repeated output for the rest of the call (#1648) */
+    ray_dup_begin(&dup);
+    ray_dup_roots(&dup, args + from, n - from, false);
+    for (int64_t i = from; i < n; i++) {
+        if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
+        /* show prints the whole value, streamed; the display limits belong
+         * to the REPL and to print. */
+        ray_t* cause;
+        ray_err_t e = ray_fmt_write_dup(out, args[i], &cause, &dup);
+        if (cause) {   /* a column failed to load: report it, output already written stays */
+            ray_dup_end(&dup);
+            ray_t* r = print_end(out);
+            if (r && RAY_IS_ERR(r)) { ray_error_free(cause); return r; }
+            return cause;
+        }
+        if (e == RAY_OK || e == RAY_ERR_IO) continue;   /* written, partly written, or stdout failed */
+        /* out of memory before any output: fall back to the bounded REPL display */
+        ray_t* formatted = ray_fmt(args[i], 1);
+        if (formatted && !RAY_IS_ERR(formatted)) {
+            const char* sp = ray_str_ptr(formatted);
+            size_t sl = ray_str_len(formatted);
+            fwrite(sp, 1, sl, out);
+            ray_release(formatted);
+        } else {
+            if (formatted) ray_error_free(formatted);
+            ray_lang_print(out, args[i]);
+        }
+    }
+    ray_dup_end(&dup);
+    fputc('\n', out);
+    return print_end(out);
+}
 ray_t* ray_show_fn(ray_t** args, int64_t n) {
     /* args are pre-materialized by eval — see ray_println_fn. */
     FILE* out = stdout;
     for (int64_t i = 0; i < n; i++) {
+        if (RAY_UNLIKELY(ray_dup_call_tracks(args[i]))) return show_tracked(args, n, i);
         if (!args[i] || RAY_IS_ERR(args[i])) { fprintf(out, "error"); continue; }
         /* show prints the whole value, streamed; the display limits belong
          * to the REPL and to print. */
@@ -993,13 +1249,16 @@ static ray_t* cast_vec_copy_nulls(ray_t* vec, ray_t* val) {
 } while (0)
 #define CAST_LOOP(R, W, EXPR) CAST_LOOP_RANGE(R, W, EXPR, 0, n2)
 
-/* Same-byte-rep type relabels (I64↔TIMESTAMP, I32↔DATE↔TIME): the
- * per-element data is identical, so a single memcpy populates the new
- * vector.  Returns true on hit. */
+/* Same-byte-rep type relabels (I64↔TIMESTAMP, I64↔TIMESPAN,
+ * I32↔DATE↔TIME): the per-element data is identical, so a single memcpy
+ * populates the new vector.  TIMESTAMP↔TIMESPAN is not one (a timestamp to
+ * a span is the time of day; a span to a timestamp is refused).  Returns
+ * true on hit. */
 static bool cast_vec_relabel_compat(int8_t a, int8_t b) {
     if (a == b) return true;
     if ((a == RAY_I64 || a == RAY_TIMESTAMP) &&
         (b == RAY_I64 || b == RAY_TIMESTAMP)) return true;
+    if ((a == RAY_I64 && b == RAY_TIMESPAN) || (a == RAY_TIMESPAN && b == RAY_I64)) return true;
     if ((a == RAY_I32 || a == RAY_DATE || a == RAY_TIME) &&
         (b == RAY_I32 || b == RAY_DATE || b == RAY_TIME)) return true;
     return false;
@@ -1426,10 +1685,16 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     if (RAY_IS_ERR(vec)) return vec;
     vec->len = n2;
 
-    /* Fast path: typed numeric vec → numeric vec, no list/string. */
+    /* Fast path: typed numeric vec → numeric vec, no list/string.  A
+     * TIMESPAN takes it only to or from I64 (or to itself), a copy of the
+     * 8-byte values with the nulls carried over (#1634); every other pair
+     * with a TIMESPAN converts per cell (the time of day of a timestamp,
+     * TIME * 1e6, a rounded float, a refused span to timestamp). */
+    bool span_copy = (val->type == RAY_TIMESPAN && (out_type == RAY_I64 || out_type == RAY_TIMESPAN)) ||
+                     (val->type == RAY_I64 && out_type == RAY_TIMESPAN);
     if (ray_is_vec(val) && val->type != RAY_STR && val->type != RAY_SYM &&
         val->type != RAY_GUID && out_type != RAY_SYM &&
-        val->type != RAY_TIMESPAN && out_type != RAY_TIMESPAN) {
+        (span_copy || (val->type != RAY_TIMESPAN && out_type != RAY_TIMESPAN))) {
         ray_t* fast = cast_vec_numeric_fast(val, vec, out_type);
         /* Three return states (helper does NOT release `vec`):
          *   - vec on success
@@ -1570,12 +1835,22 @@ ray_t* cast_str_atom(ray_t* val) {
     return ray_error("type", "as: cannot cast %s to str", ray_type_name(val->type));
 }
 
+__attribute__((noinline, cold)) static ray_t* cast_str_limit(ray_t* cast, ray_t* vec) {
+    ray_release(cast);
+    ray_release(vec);
+    return ray_error("limit", "as: a string vector repeats shared strings beyond 1 GiB of extra data");
+}
+
 /* Choose the collection contract once. A boxed flat-vector element can
  * only produce a string atom on success; LIST children may recurse to vectors.
  * Keep the collection loop outside scalar dispatch's register frame. */
 static inline __attribute__((always_inline))
 ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
     int64_t n2 = val->len;
+    /* A list's cell held by several cells is copied again each time
+     * (#1648): once the copy passes RAY_DUP_COPY_SCAN bytes, the list's
+     * repeats are counted once, and the cast refused past the budget. */
+    uint64_t copied = 0, scan_at = may_nest ? RAY_DUP_COPY_SCAN : UINT64_MAX;
     ray_t* vec = ray_vec_new(RAY_STR, n2);
     if (!vec || RAY_IS_ERR(vec)) return vec ? vec : ray_error("oom", NULL);
     for (int64_t i = 0; i < n2; i++) {
@@ -1603,6 +1878,12 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
         }
         const char* sp = ray_str_ptr(cast);
         size_t slen = ray_str_len(cast);
+        copied += slen;
+        if (RAY_UNLIKELY(copied > scan_at)) {
+            if (ray_str_cells_repeat_over((ray_t* const*)ray_data(val), n2))
+                return cast_str_limit(cast, vec);
+            scan_at = UINT64_MAX;   /* the whole list is counted */
+        }
         vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
         ray_release(cast);
         if (RAY_IS_ERR(vec)) return vec;
@@ -3277,7 +3558,58 @@ static inline uint64_t atom_hash_part(ray_t* p, int depth) {
         return ray_hash_i64(((int64_t)p->type << 32) ^ (int64_t)p->len);
     return atom_hash_d(p, depth + 1);
 }
+/* A shared list, table or dict can be reached more than once in one hash
+ * (#1627): its hash is kept per depth (past ATOM_HASH_DEPTH the answer
+ * depends on where the walk is). */
+static _Thread_local ray_walk_memo_t g_atom_hash_memo;
+static inline uint64_t atom_hash_c(ray_t* a, int depth);
+__attribute__((noinline)) static uint64_t atom_hash_shared(ray_t* a, int depth) {
+    ray_walk_memo_t* m = &g_atom_hash_memo;
+    const void* skip = m->skip;
+    uint64_t h;
+    m->skip = a;
+    if (!m->active) {   /* the outermost visit: it cannot recur inside itself */
+        ray_wm_begin(m);
+        h = atom_hash_d(a, depth);
+        ray_wm_end(m);
+    } else if (!ray_wm_get(m, a, NULL, (uint64_t)depth, &h)) {
+        h = atom_hash_d(a, depth);
+        ray_wm_put(m, a, NULL, (uint64_t)depth, h);
+    }
+    m->skip = skip;
+    return h;
+}
 static uint64_t atom_hash_d(ray_t* a, int depth) {
+    if (depth > 0 && a && RAY_UNLIKELY(ray_wm_reused(a)) &&
+        (a->type == RAY_LIST || a->type == RAY_TABLE || a->type == RAY_DICT) &&
+        a != g_atom_hash_memo.skip)
+        return atom_hash_shared(a, depth);
+    return atom_hash_c(a, depth);
+}
+/* An atom's hash: atom_hash_c's atom arms, for a list's atom cells, which
+ * take it here without the walk's call (and its memo test). */
+static inline uint64_t atom_hash_atom(ray_t* a) {
+    if (RAY_ATOM_IS_NULL(a)) return 0;
+    if (is_numeric(a)) return ray_hash_f64(as_f64(a));
+    switch (a->type) {
+        case -RAY_SYM:       return ray_hash_i64(a->i64);
+        case -RAY_DATE:
+        case -RAY_TIME:      return ray_hash_i64((int64_t)a->i32);
+        case -RAY_TIMESPAN:
+        case -RAY_TIMESTAMP: return ray_hash_i64(a->i64);
+        case -RAY_GUID: {
+            const uint8_t* g = a->obj
+                ? (const uint8_t*)ray_data(a->obj)
+                : (const uint8_t*)ray_data((ray_t*)a);
+            return ray_hash_bytes(g, 16);
+        }
+        case -RAY_STR:
+            return ray_hash_bytes(ray_str_ptr(a), ray_str_len(a));
+        default:
+            return ray_hash_i64(((int64_t)a->type << 32) ^ (int64_t)a->len);
+    }
+}
+static inline uint64_t atom_hash_c(ray_t* a, int depth) {
     /* List-element position: elements may be a bare C NULL (ray_list_set stores
      * NULL unretained; ray_list_get is out-of-range), mirroring atom_eq's
      * C-NULL-tolerant element handling — so keep the !a guard, not RAY_ASSERT_VALUE. */
@@ -3303,8 +3635,10 @@ static uint64_t atom_hash_d(ray_t* a, int depth) {
             ray_t** elems = (ray_t**)ray_data(a);
             /* Seed with len so [] and a list of zeros differ. */
             uint64_t h = ray_hash_i64(n);
-            for (int64_t i = 0; i < n; i++)
-                h = ray_hash_combine(h, atom_hash_d(elems[i], depth + 1));
+            for (int64_t i = 0; i < n; i++) {
+                ray_t* e = elems[i];
+                h = ray_hash_combine(h, e && e->type < 0 ? atom_hash_atom(e) : atom_hash_d(e, depth + 1));
+            }
             return h;
         }
         case RAY_TABLE: {
@@ -4430,7 +4764,381 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     return ray_error("type", "concat: cannot concatenate %s and %s", ray_type_name(a->type), ray_type_name(b->type));
 }
 
+/* ---- raze: the left fold of concat in one pass per stretch (#1656) ----
+ *
+ * (raze l) is (concat ... (concat (concat l0 l1) l2) ... ln-1).  Folding it
+ * literally copies the result so far at every item.  Here the fold runs in
+ * stretches, each built once, to the same answer:
+ *   - a run of vectors and atoms of one type T, while the result is a T
+ *     vector (or the first item, a T atom): the T vector of all their
+ *     cells, with the null flag, the float null bits, the width bits and
+ *     the symbol domain concat leaves (raze_typed_run);
+ *   - once the result is a list: every later list, vector or atom only adds
+ *     to it, its cells retained, its elements boxed, itself retained, as
+ *     concat does (raze_list_tail);
+ *   - anything else (strings, slices, symbols of two domains, dicts,
+ *     tables, a change of type, an error) is one concat, as before. */
+
+/* raze copies a vector's cells, or a list's cell pointers, again for each
+ * item that holds it: a part held by several items is charged its bytes
+ * again each time against the budget of repeated output, as raze_strings
+ * charges a string (#1657).  Atoms are appended as themselves, not copied.
+ * Run before anything is allocated, and only when the copy could pass the
+ * budget at all: what repeats cannot exceed what is copied. */
+__attribute__((noinline)) static bool raze_parts_repeat_over(ray_t* r, ray_t** items, int64_t n) {
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    bool over = false;
+    for (int64_t i = -1; i < n && !over; i++) {   /* -1: r, the result so far, when given */
+        ray_t* x = i < 0 ? r : items[i];
+        if (!x || RAY_IS_ERR(x) || x->rc == 1 || x->type < 0) continue;
+        uint64_t esz = x->type == RAY_LIST ? sizeof(ray_t*)
+                     : ray_is_vec(x) ? ray_sym_elem_size(x->type, x->attrs) : 0;
+        if (esz) over = ray_dup_copy(&dup, x, (uint64_t)x->len * esz);
+    }
+    ray_dup_copy_end(&dup);
+    return over;
+}
+__attribute__((noinline, cold)) static ray_t* raze_limit(void) {
+    return ray_error("limit", "raze: the result repeats shared parts beyond 1 GiB of extra data");
+}
+
+/* The type of a run, or 0: a fixed-width type concat appends element by
+ * element. */
+static int8_t raze_run_type(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_F32: case RAY_F64: case RAY_DATE: case RAY_TIME:
+    case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_GUID: case RAY_SYM:
+        return t;
+    default:
+        return 0;
+    }
+}
+
+/* The cell concat writes for atom a in a T vector. */
+static void raze_atom_cell(const ray_t* a, int8_t t, uint8_t* dst) {
+    switch (t) {
+    case RAY_TIMESPAN: case RAY_I64: case RAY_TIMESTAMP: case RAY_SYM:
+        memcpy(dst, &a->i64, 8); break;
+    case RAY_F64: memcpy(dst, &a->f64, 8); break;
+    case RAY_F32: { float f = (float)a->f64; memcpy(dst, &f, 4); break; }
+    case RAY_I32: case RAY_DATE: case RAY_TIME: memcpy(dst, &a->i32, 4); break;
+    case RAY_I16: memcpy(dst, &a->i16, 2); break;
+    case RAY_BOOL: *dst = a->b8 ? 1 : 0; break;
+    case RAY_U8: *dst = a->u8; break;
+    case RAY_GUID: {
+        const uint8_t* gd = a->obj ? (const uint8_t*)ray_data(a->obj) : (const uint8_t*)ray_data((ray_t*)a);
+        memcpy(dst, gd, 16);
+        break;
+    }
+    default: break;
+    }
+}
+
+/* Does x continue a run of type t over symbol domain dom (SYM: every vector
+ * of the run shares one domain; an atom only beside the runtime domain,
+ * where an atom's id is a cell as it is)? */
+static bool raze_run_member(const ray_t* x, int8_t t, struct ray_sym_domain_s** dom, bool* atom) {
+    if (!x || RAY_IS_ERR(x)) return false;
+    if (x->type == -t) {
+        if (t == RAY_SYM && *dom && *dom != ray_sym_runtime_domain()) return false;
+        *atom = true;
+        return true;
+    }
+    if (x->type != t || (x->attrs & RAY_ATTR_SLICE)) return false;
+    if (t == RAY_SYM) {
+        struct ray_sym_domain_s* d = ray_sym_vec_domain((ray_t*)x);
+        if (*dom && d != *dom) return false;
+        if (*atom && d != ray_sym_runtime_domain()) return false;
+        *dom = d;
+    }
+    return true;
+}
+
+/* The fold of r (a T vector, or the first item as a T atom) with
+ * items[k..j), all members of its run: the T vector concat would leave. */
+__attribute__((noinline)) static ray_t* raze_typed_run(ray_t* r, ray_t** items, int64_t k, int64_t j, int8_t t,
+                             struct ray_sym_domain_s* dom, bool any_atom) {
+    bool r_atom = r->type < 0;
+    int64_t total = r_atom ? 1 : r->len;
+    uint8_t wbits = r_atom ? 0 : (r->attrs & RAY_SYM_W_MASK);   /* SYM: widest wins */
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        if (x->type < 0) { total += 1; continue; }
+        total += x->len;
+        if (t == RAY_SYM && ray_sym_elem_size(RAY_SYM, x->attrs) > ray_sym_elem_size(RAY_SYM, wbits))
+            wbits = x->attrs & RAY_SYM_W_MASK;
+    }
+    /* a vector held by several items is copied again for each (#1657) */
+    if (RAY_UNLIKELY((uint64_t)total * 16 > RAY_DUP_BUDGET) &&   /* 16: the widest cell */
+        raze_parts_repeat_over(r, items + k, j - k))
+        return raze_limit();
+    ray_t* out;
+    if (t == RAY_SYM) {
+        out = ray_sym_vec_new(any_atom ? RAY_SYM_W64 : wbits, total);
+        if (out && !RAY_IS_ERR(out) && !any_atom && dom && dom != ray_sym_runtime_domain()) {
+            ray_sym_domain_retain(dom);
+            out->sym_domain = dom;
+        }
+    } else {
+        out = ray_vec_new(t, total);
+    }
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = total;
+
+    if (t == RAY_SYM) {
+        /* Cells are positions in dom (runtime ids when atoms take part),
+         * at the output's width.  The null flag is what the last step sets:
+         * an atom step (vector and atom) always, SYM vectors may hold nulls;
+         * two atoms, either one null; two vectors, a null symbol in either. */
+        void* dst = ray_data(out);
+        int64_t pos = 0;
+        bool zero = false, flag = false;
+        bool prev_atom = r_atom;
+        if (r_atom) {
+            ray_write_sym(dst, pos++, (uint64_t)r->i64, RAY_SYM, out->attrs);
+            zero = r->i64 == 0;
+        } else {
+            for (int64_t c = 0; c < r->len; c++) {
+                int64_t v = ray_read_sym(ray_data(r), c, RAY_SYM, r->attrs);
+                zero |= v == 0;
+                ray_write_sym(dst, pos++, (uint64_t)v, RAY_SYM, out->attrs);
+            }
+        }
+        for (int64_t i = k; i < j; i++) {
+            ray_t* x = items[i];
+            if (x->type < 0) {
+                ray_write_sym(dst, pos++, (uint64_t)x->i64, RAY_SYM, out->attrs);
+                flag = prev_atom ? (RAY_ATOM_IS_NULL(r) || RAY_ATOM_IS_NULL(x)) : true;
+                zero |= x->i64 == 0;
+                prev_atom = false;
+                continue;
+            }
+            for (int64_t c = 0; c < x->len; c++) {
+                int64_t v = ray_read_sym(ray_data(x), c, RAY_SYM, x->attrs);
+                zero |= v == 0;
+                ray_write_sym(dst, pos++, (uint64_t)v, RAY_SYM, out->attrs);
+            }
+            flag = prev_atom ? true : zero;
+            prev_atom = false;
+        }
+        if (flag) out->attrs |= RAY_ATTR_HAS_NULLS;
+        return out;
+    }
+
+    /* Fixed width: cells copied raw.  concat's null flag and null bits are
+     * followed step by step.  An atom step (an atom and a vector, or two
+     * atoms) sets the flag when the atom is null or the vector may hold
+     * nulls, and rewrites nothing.  A step of two vectors, when either may
+     * hold nulls, rewrites every null cell of both as the canonical null
+     * (it changes bits only for a float NaN with another payload) and sets
+     * the flag when it found one; it carries the first vector's width bits.
+     * The result so far is checked once per step from where the last such
+     * rewrite of it ended, so each cell is read a bounded number of times. */
+    uint8_t esz = ray_elem_size(t);
+    uint8_t* dst = (uint8_t*)ray_data(out);
+    int64_t pos = 0;
+    bool flag, sent;           /* the result's null flag; a cell of it reads as null under the flag */
+    bool orig = !r_atom;       /* the result so far is still the first item itself */
+    int64_t canon = 0;         /* cells below this were rewritten under the flag */
+    uint8_t w = 0;
+    if (r_atom) {
+        raze_atom_cell(r, t, dst);
+        pos = 1;
+        flag = false;
+        sent = ray_raw_is_null(t, 0, dst, 0);
+    } else {
+        memcpy(dst, ray_data(r), (size_t)r->len * esz);
+        pos = r->len;
+        flag = ray_vec_may_have_nulls(r);
+        w = r->attrs & RAY_SYM_W_MASK;
+        sent = false;
+        for (int64_t c = 0; c < r->len && !sent; c++) sent = ray_raw_is_null(t, 0, dst, c);
+    }
+    bool prev_atom = r_atom;
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        int64_t at = pos;
+        if (x->type < 0) {   /* vector (or the first atom) and atom */
+            raze_atom_cell(x, t, dst + at * esz);
+            pos += 1;
+            flag = prev_atom ? (RAY_ATOM_IS_NULL(r) || RAY_ATOM_IS_NULL(x))
+                             : (RAY_ATOM_IS_NULL(x) || flag);
+            w = 0;
+        } else {
+            memcpy(dst + at * esz, ray_data(x), (size_t)x->len * esz);
+            pos += x->len;
+            if (prev_atom) {   /* the first atom and a vector */
+                flag = RAY_ATOM_IS_NULL(r) || ray_vec_may_have_nulls(x);
+                w = 0;
+            } else {
+                bool cond = flag || ray_vec_may_have_nulls(x);
+                bool found = false;
+                if (cond) {
+                    if (orig) {   /* the first item, under its own flag */
+                        for (int64_t c = 0; c < at; c++)
+                            if (ray_vec_is_null(r, c)) { found = true; ray_vec_set_null_checked(out, c, true); }
+                    } else if (flag) {
+                        for (int64_t c = canon; c < at; c++)
+                            if (ray_raw_is_null(t, 0, dst, c)) { found = true; ray_vec_set_null_checked(out, c, true); }
+                        found |= sent;
+                    }
+                    if (flag) canon = at;   /* checked under the flag: rewritten up to here */
+                    for (int64_t c = 0; c < x->len; c++)
+                        if (ray_vec_is_null(x, c)) { found = true; ray_vec_set_null_checked(out, at + c, true); }
+                }
+                flag = found;
+                /* w: the first vector's width bits, kept */
+            }
+        }
+        for (int64_t c = at; c < pos && !sent; c++) sent = ray_raw_is_null(t, 0, dst, c);
+        orig = false;
+        prev_atom = false;
+    }
+    out->attrs = (uint8_t)(w | (flag ? RAY_ATTR_HAS_NULLS : 0));
+    return out;
+}
+
+/* The fold of a list r with items[k..j), each a list, vector or atom: r's
+ * cells, then each list's cells retained, each vector's elements boxed,
+ * each atom retained, as concat appends them. */
+__attribute__((noinline)) static ray_t* raze_list_tail(ray_t* r, ray_t** items, int64_t k, int64_t j) {
+    int64_t total = r->len;
+    for (int64_t i = k; i < j; i++)
+        total += items[i]->type == RAY_LIST || ray_is_vec(items[i]) ? items[i]->len : 1;
+    /* a list or vector held by several items is copied again for each
+     * (#1657); 16 bytes a cell bound what any part copies */
+    if (RAY_UNLIKELY((uint64_t)total * 16 > RAY_DUP_BUDGET) &&
+        raze_parts_repeat_over(r, items + k, j - k))
+        return raze_limit();
+    ray_t* out = ray_alloc((size_t)total * sizeof(ray_t*));
+    if (!out) return ray_error("oom", NULL);
+    out->type = RAY_LIST;
+    out->len = total;
+    ray_t** o = (ray_t**)ray_data(out);
+    ray_t** rc = (ray_t**)ray_data(r);
+    int64_t pos = 0;
+    for (int64_t c = 0; c < r->len; c++) { ray_retain(rc[c]); o[pos++] = rc[c]; }
+    for (int64_t i = k; i < j; i++) {
+        ray_t* x = items[i];
+        if (x->type == RAY_LIST) {
+            ray_t** xc = (ray_t**)ray_data(x);
+            for (int64_t c = 0; c < x->len; c++) { ray_retain(xc[c]); o[pos++] = xc[c]; }
+        } else if (ray_is_vec(x)) {
+            for (int64_t c = 0; c < x->len; c++) { int alloc = 0; o[pos++] = collection_elem(x, c, &alloc); }
+        } else {
+            ray_retain(x);
+            o[pos++] = x;
+        }
+    }
+    return out;
+}
+
+/* Up to this many items raze folds pairwise: the copies are few, and the
+ * stretches would not pay for themselves. */
+#define RAZE_FOLD_MIN 4
+
+/* A stretch of one item is one concat, as cheap as the fold it replaces. */
+__attribute__((noinline)) static ray_t* raze_fold(ray_t** items, int64_t n) {
+    ray_t* r = items[0];
+    ray_retain(r);
+    int64_t k = 1;
+    while (k < n) {
+        ray_t* next;
+        if (r->type == RAY_LIST) {
+            /* a list grows by lists, vectors and atoms; anything else is
+             * concat's to answer (an error) */
+            int64_t j = k;
+            while (j < n && items[j] && !RAY_IS_ERR(items[j]) &&
+                   (items[j]->type == RAY_LIST || ray_is_vec(items[j]) || ray_is_atom(items[j])))
+                j++;
+            if (j <= k + 1) { next = ray_concat_fn(r, items[k]); k++; }
+            else { next = raze_list_tail(r, items, k, j); k = j; }
+        } else {
+            int8_t t = (r->type < 0 && k == 1) ? raze_run_type((int8_t)-r->type)
+                     : (r->type > 0 && !(r->attrs & RAY_ATTR_SLICE)) ? raze_run_type(r->type) : 0;
+            struct ray_sym_domain_s* dom = NULL;
+            bool any_atom = r->type < 0;
+            if (t == RAY_SYM && r->type > 0) dom = ray_sym_vec_domain(r);
+            if (t == RAY_SYM && any_atom) dom = ray_sym_runtime_domain();
+            int64_t j = k;
+            if (t) while (j < n && raze_run_member(items[j], t, &dom, &any_atom)) j++;
+            if (j <= k + 1) { next = ray_concat_fn(r, items[k]); k++; }
+            else { next = raze_typed_run(r, items, k, j, t, dom, any_atom); k = j; }
+        }
+        ray_release(r);
+        if (!next || RAY_IS_ERR(next)) return next ? next : ray_error("oom", NULL);
+        r = next;
+    }
+    return r;
+}
+
 /* (raze list-of-vecs) -> flattened vector */
+/* raze of n >= 2 items that are all string atoms (one string atom, each
+ * without its trailing NUL bytes, as concat joins them) or all string
+ * vectors (one string vector); NULL when they are not. */
+static ray_t* raze_strings(ray_t** items, int64_t n) {
+    int8_t t = items[0]->type;
+    uint64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!items[i] || items[i]->type != t) return NULL;
+        total += t == RAY_STR ? (uint64_t)items[i]->len : ray_str_len(items[i]);
+    }
+    ray_dup_copy_t dup;
+    ray_dup_copy_begin(&dup);
+    bool over = false;
+    for (int64_t i = 0; i < n && !over; i++) {
+        ray_t* it = items[i];
+        if (it->rc == 1) continue;
+        uint64_t bytes = 0;
+        if (t == -RAY_STR) bytes = ray_str_len(it);
+        else for (int64_t j = 0; j < it->len; j++) { size_t l = 0; ray_str_vec_get(it, j, &l); bytes += l; }
+        over = ray_dup_copy(&dup, it, bytes);
+    }
+    ray_dup_copy_end(&dup);
+    if (over) return ray_error("limit", "raze: the result repeats shared strings beyond 1 GiB of extra data");
+    if (t == -RAY_STR) {
+        size_t len = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const char* p = ray_str_ptr(items[i]);
+            size_t l = ray_str_len(items[i]);
+            while (l > 0 && p[l - 1] == '\0') l--;
+            len += l;
+        }
+        if (len > (size_t)INT64_MAX) return ray_error("oom", NULL);
+        char* buf = (char*)ray_alloc_raw(len ? len : 1);
+        if (!buf) return ray_error("oom", NULL);
+        size_t pos = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const char* p = ray_str_ptr(items[i]);
+            size_t l = ray_str_len(items[i]);
+            while (l > 0 && p[l - 1] == '\0') l--;
+            memcpy(buf + pos, p, l);
+            pos += l;
+        }
+        ray_t* r = ray_str(buf, len);
+        ray_free_raw(buf);
+        return r;
+    }
+    if (total > (uint64_t)INT64_MAX) return ray_error("oom", NULL);
+    ray_t* out = ray_vec_new(RAY_STR, (int64_t)total);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    bool nulls = false;
+    for (int64_t i = 0; i < n; i++) {
+        ray_t* it = items[i];
+        nulls |= ray_vec_text_has_nulls(it);
+        for (int64_t j = 0; j < it->len; j++) {
+            size_t l = 0;
+            const char* p = ray_str_vec_get(it, j, &l);
+            out = ray_str_vec_append(out, p ? p : "", p ? l : 0);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+        }
+    }
+    if (nulls) out->attrs |= RAY_ATTR_HAS_NULLS;
+    return out;
+}
+
 ray_t* ray_raze_fn(ray_t* x) {
     /* Scalar passthrough */
     if (ray_is_atom(x)) { ray_retain(x); return x; }
@@ -4461,6 +5169,11 @@ ray_t* ray_raze_fn(ray_t* x) {
             }
         }
         if (fast) {
+            /* a vector held by several items is copied again for each
+             * (#1657); an output of at most the budget cannot repeat more */
+            if (RAY_UNLIKELY((uint64_t)total * ray_elem_size(t) > RAY_DUP_BUDGET) &&
+                raze_parts_repeat_over(NULL, items, n))
+                return raze_limit();
             ray_t* out = ray_vec_new(t, total);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
             out->len = total;
@@ -4476,17 +5189,37 @@ ray_t* ray_raze_fn(ray_t* x) {
         }
     }
 
-    /* Slow path: pairwise concat — used for mixed types, null-bearing
-     * inputs, and non-fixed-width vectors (SYM/STR/GUID/LIST). */
-    ray_t* result = items[0];
-    ray_retain(result);
-    for (int64_t i = 1; i < n; i++) {
-        ray_t* next = ray_concat_fn(result, items[i]);
-        ray_release(result);
-        if (RAY_IS_ERR(next)) return next;
-        result = next;
+    /* Strings: copied once each, in one pass, instead of concat's string
+     * joins, which copy the result again at every item; a string
+     * held by several items is charged its bytes again each time (#1648). */
+    if (n >= 2 && items[0] && (items[0]->type == -RAY_STR ||
+                               (items[0]->type == RAY_STR && !ray_index_has(items[0])))) {
+        ray_t* r = raze_strings(items, n);
+        if (r) return r;   /* NULL: not all strings of one kind */
     }
-    return result;
+
+    /* Everything else: the answer is the pairwise concat from the left,
+     * (concat (concat i0 i1) i2) ...  Folding it literally copied the result
+     * so far at every item, quadratic in the items (#1656).  The fold is
+     * computed in one pass per stretch instead (raze_fold), with the same
+     * answer.  A handful of items, and a first item with an index (carried
+     * from concat to concat), are folded pairwise as before. */
+    if (n <= RAZE_FOLD_MIN || ray_index_has(items[0])) {   /* a handful: folded as it reads */
+        /* a part held by several items is copied again for each (#1657):
+         * a handful copies at most that many times what it holds; a long
+         * list after an indexed first item is checked here */
+        if (n > RAZE_FOLD_MIN && raze_parts_repeat_over(NULL, items, n)) return raze_limit();
+        ray_t* result = items[0];
+        ray_retain(result);
+        for (int64_t i = 1; i < n; i++) {
+            ray_t* next = ray_concat_fn(result, items[i]);
+            ray_release(result);
+            if (RAY_IS_ERR(next)) return next;
+            result = next;
+        }
+        return result;
+    }
+    return raze_fold(items, n);
 }
 
 /* ungroup t — flatten nested-list columns, replicate flat columns.

@@ -349,6 +349,145 @@ static ray_t* span_point_vec(uint16_t op, ray_t* a, ray_t* b, int64_t n, bool sh
     return r;
 }
 
+/* Vector kernels for the shapes whose operands are all 8-byte integers
+ * (TIMESPAN, TIMESTAMP, I64), #1633: span_eval reads them as their raw
+ * values, a null being NULL_I64 itself, so a row is the arithmetic on two
+ * int64s with the null rule span_eval applies:
+ *  - + and - to a TIMESPAN or a TIMESTAMP: a null on either side is null;
+ *    otherwise the sum wraps, and a sum that lands on NULL_I64 reads as a
+ *    null, as the per-cell loop flags it.
+ *  - the comparisons: a TIMESTAMP side is its time of day (floor modulo a
+ *    day) unless it is null; a null compares below every value and equal
+ *    to a null, which is the signed compare of NULL_I64 = INT64_MIN.
+ * On the pool, one task per range of rows. */
+typedef struct {
+    const int64_t* a;
+    const int64_t* b;
+    int64_t a0, b0;          /* the atom side, already reduced */
+    bool a_ts, b_ts;         /* a TIMESTAMP side compared as its time of day */
+    uint16_t op;
+    void* out;
+    _Atomic bool nulls;
+} span_i64_ctx_t;
+
+#define SPAN_DAY_NS INT64_C(86400000000000)
+static inline int64_t span_tod(int64_t v) {
+    if (v == NULL_I64) return v;
+    int64_t r = v % SPAN_DAY_NS;
+    return r < 0 ? r + SPAN_DAY_NS : r;
+}
+
+static void span_i64_arith_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    span_i64_ctx_t* c = vctx;
+    const int64_t* a = c->a;
+    const int64_t* b = c->b;
+    int64_t* o = c->out;
+    uint64_t neg = c->op == OP_SUB ? ~UINT64_C(0) : 0;   /* x - y is x + (~y + 1) */
+    uint64_t one = c->op == OP_SUB ? 1 : 0;
+    bool any = false;
+#define SPAN_ARITH_ROW(X, Y) do {                                                   \
+        int64_t x_ = (X), y_ = (Y);                                                 \
+        int64_t v_ = x_ == NULL_I64 || y_ == NULL_I64 ? NULL_I64                   \
+                   : (int64_t)((uint64_t)x_ + ((uint64_t)y_ ^ neg) + one);          \
+        o[i] = v_; any |= v_ == NULL_I64;                                           \
+    } while (0)
+    if (a && b)  for (int64_t i = lo; i < hi; i++) SPAN_ARITH_ROW(a[i], b[i]);
+    else if (a)  for (int64_t i = lo; i < hi; i++) SPAN_ARITH_ROW(a[i], c->b0);
+    else         for (int64_t i = lo; i < hi; i++) SPAN_ARITH_ROW(c->a0, b[i]);
+#undef SPAN_ARITH_ROW
+    if (any) atomic_store_explicit(&c->nulls, true, memory_order_relaxed);
+}
+
+static void span_i64_cmp_fn(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
+    (void)wid;
+    span_i64_ctx_t* c = vctx;
+    const int64_t* a = c->a;
+    const int64_t* b = c->b;
+    uint8_t* o = c->out;
+    bool ats = c->a_ts, bts = c->b_ts;
+#define SPAN_CMP_LOOP(CMP) do {                                                     \
+        if (a && b)                                                                 \
+            for (int64_t i = lo; i < hi; i++) {                                     \
+                int64_t x = ats ? span_tod(a[i]) : a[i];                            \
+                int64_t y = bts ? span_tod(b[i]) : b[i];                            \
+                o[i] = (uint8_t)(x CMP y);                                          \
+            }                                                                       \
+        else if (a) {                                                               \
+            int64_t y = c->b0;                                                      \
+            if (ats) for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(span_tod(a[i]) CMP y); \
+            else     for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(a[i] CMP y);           \
+        } else {                                                                    \
+            int64_t x = c->a0;                                                      \
+            if (bts) for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(x CMP span_tod(b[i])); \
+            else     for (int64_t i = lo; i < hi; i++) o[i] = (uint8_t)(x CMP b[i]);           \
+        }                                                                           \
+    } while (0)
+    switch (c->op) {
+    case OP_EQ: SPAN_CMP_LOOP(==); break;
+    case OP_NE: SPAN_CMP_LOOP(!=); break;
+    case OP_LT: SPAN_CMP_LOOP(<);  break;
+    case OP_LE: SPAN_CMP_LOOP(<=); break;
+    case OP_GT: SPAN_CMP_LOOP(>);  break;
+    default:    SPAN_CMP_LOOP(>=); break;
+    }
+#undef SPAN_CMP_LOOP
+}
+
+static bool span_i64_operand(int8_t t) {
+    t = span_base(t);
+    return t == RAY_TIMESPAN || t == RAY_TIMESTAMP || t == RAY_I64;
+}
+
+/* The kernels above for op over a and b (n rows, result type), or NULL when
+ * the shape is not theirs. */
+static ray_t* span_i64_vec(uint16_t op, ray_t* a, ray_t* b, int64_t n, int8_t type) {
+    bool cmp = op >= OP_EQ && op <= OP_GE;
+    if (!span_i64_operand(a->type) || !span_i64_operand(b->type)) return NULL;
+    if (cmp ? type != RAY_BOOL
+            : !((op == OP_ADD || op == OP_SUB) && (type == RAY_TIMESPAN || type == RAY_TIMESTAMP)))
+        return NULL;
+    bool av = ray_is_vec(a), bv = ray_is_vec(b);
+    ray_t* r = ray_vec_new(type, n);
+    if (RAY_IS_ERR(r)) return r;
+    r->len = n;
+    span_i64_ctx_t c = { .op = op, .out = ray_data(r) };
+    c.a = av ? ray_data(a) : NULL;
+    c.b = bv ? ray_data(b) : NULL;
+    bool ats = span_base(a->type) == RAY_TIMESTAMP, bts = span_base(b->type) == RAY_TIMESTAMP;
+    if (cmp) {
+        c.a_ts = av && ats;
+        c.b_ts = bv && bts;
+        c.a0 = av ? 0 : ats ? span_tod(a->i64) : a->i64;
+        c.b0 = bv ? 0 : bts ? span_tod(b->i64) : b->i64;
+    } else {
+        c.a0 = av ? 0 : a->i64;
+        c.b0 = bv ? 0 : b->i64;
+    }
+    ray_pool_fn fn = cmp ? span_i64_cmp_fn : span_i64_arith_fn;
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, n, RAY_PARALLEL_THRESHOLD)) ray_pool_dispatch(pool, fn, &c, n);
+    else fn(&c, 0, 0, n);
+    if (ray_interrupted() || (pool && atomic_load_explicit(&pool->cancelled, memory_order_acquire))) {
+        ray_release(r);
+        return ray_error("cancel", NULL);
+    }
+    if (atomic_load_explicit(&c.nulls, memory_order_relaxed)) r->attrs |= RAY_ATTR_HAS_NULLS;
+    return r;
+}
+
+#ifdef DEBUG
+/* Rows evaluated cell by cell through span_eval (an atom pair counts one),
+ * every thread: the test hook below (#1633). */
+static int64_t g_span_cell_rows;
+int64_t ray_timespan_test_cell_rows(void) {
+    return __atomic_load_n(&g_span_cell_rows, __ATOMIC_RELAXED);
+}
+#define SPAN_CELL_ROWS(n) __atomic_fetch_add(&g_span_cell_rows, (int64_t)(n), __ATOMIC_RELAXED)
+#else
+#define SPAN_CELL_ROWS(n) ((void)0)
+#endif
+
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (a->type == RAY_LIST || b->type == RAY_LIST ||
         RAY_IS_PARTED(a->type) || RAY_IS_PARTED(b->type)) {
@@ -359,7 +498,7 @@ ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (type <= 0) return ray_error("type", "duration operation is not defined for %s and %s",
                                    ray_type_name(a->type), ray_type_name(b->type));
     bool av = ray_is_vec(a), bv = ray_is_vec(b);
-    if (!av && !bv) return span_atom(type, span_eval(op, a, b, type));
+    if (!av && !bv) { SPAN_CELL_ROWS(1); return span_atom(type, span_eval(op, a, b, type)); }
     if (av && bv && a->len != b->len)
         return ray_error("length", "duration operand lengths must match");
     int64_t n = av ? a->len : b->len;
@@ -369,6 +508,9 @@ ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b) {
     if (type == RAY_TIME && (op == OP_ADD || op == OP_SUB) && av != bv &&
         (av ? b : a)->type == -RAY_TIMESPAN)
         return span_point_vec(op, a, b, n, true, type);
+    ray_t* fast = span_i64_vec(op, a, b, n, type);
+    if (fast) return fast;
+    SPAN_CELL_ROWS(n);
     ray_t* result = ray_vec_new(type, n);
     if (RAY_IS_ERR(result)) return result;
     result->len = n;

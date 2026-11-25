@@ -30,6 +30,7 @@
 #include "lang/format.h"    /* ray_type_name */
 #include "table/domain.h"   /* sym-domain resolution (ray_sym_domain_count) */
 #include "ops/agg_engine.h" /* v2 agg engine routing gate (ray_agg_engine_v2) */
+#include "ops/aggseq.h"     /* floating-point products in row order */
 #include "vec/str.h"        /* ray_str_t SSO hash/eq for wide STR group keys */
 #include "ops/idxop.h"      /* RAY_IDX_DICT: group on persisted string codes */
 #include "ops/strdom.h"     /* query-wide string domain: generation-2 STR keys */
@@ -48,6 +49,8 @@
 static inline bool group_fp_type(int8_t t) {
     return t == RAY_F32 || t == RAY_F64;
 }
+
+/* The variance family: accumulated about a value of the data (#1666). */
 
 /* Does an integer AVG over this input need the 128-bit high word next to
  * its int64 sum?  Only a 64-bit input can push a group's total past int64
@@ -259,27 +262,40 @@ typedef struct { double l[SC_F64_LANES]; } sc_f64_lanes_t;
 typedef double  sc_vd __attribute__((vector_size(SC_V * 8)));
 typedef float   sc_vf __attribute__((vector_size(SC_V * 4)));
 typedef int64_t sc_vl __attribute__((vector_size(SC_V * 8)));
-#define SC_LANES_BODY(T, VT, NULLS) do { \
-    sc_vd v[SC_F64_LANES / SC_V]; \
-    sc_vl cnt = { 0 }, nz = cnt + (int64_t)INT64_MIN;   /* -0.0's bits */ \
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
-        memcpy(&v[k], &s->l[k * SC_V], sizeof v[k]); \
-        SC_F64_PIN(v[k]);           /* the head's last adds stay folded in */ \
-    } \
-    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) \
-        for (int k = 0; k < SC_F64_LANES / SC_V; k++) { \
-            VT x; \
-            memcpy(&x, d + i + k * SC_V, sizeof x); \
+/* The accumulators are named variables, one per vector (SC_VREP), not an
+ * array: gcc 11 to 13 kept an array of them on the stack, loading and storing
+ * one around every add (about 1 instruction a row against clang's 0.45,
+ * #1628).  Each lane is still one row-order chain: the same bits. */
+#define SC_VREP8(X)  X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7)
+#define SC_VREP16(X) SC_VREP8(X) X(8) X(9) X(10) X(11) X(12) X(13) X(14) X(15)
+#if SC_F64_LANES / SC_V == 8
+#define SC_VREP SC_VREP8
+#else
+#define SC_VREP SC_VREP16
+#endif
+#define SC_VLOAD(k)  sc_vd v##k; memcpy(&v##k, &s->l[(k) * SC_V], sizeof v##k); \
+                     SC_F64_PIN(v##k);   /* the head's last adds stay folded in */
+#define SC_VSTEP(k)  { \
+            sc_vt_ x; \
+            memcpy(&x, d + i + (k) * SC_V, sizeof x); \
             sc_vd y = __builtin_convertvector(x, sc_vd); \
-            if (NULLS) { \
+            if (sc_nulls_) { \
                 sc_vl m = (sc_vl)(y == y); \
                 y = (sc_vd)(((sc_vl)y & m) | (nz & ~m)); \
                 cnt -= m; \
             } \
-            v[k] += y; \
-            SC_F64_PIN(v[k]); \
-        } \
-    for (int k = 0; k < SC_F64_LANES / SC_V; k++) memcpy(&s->l[k * SC_V], &v[k], sizeof v[k]); \
+            v##k += y; \
+            SC_F64_PIN(v##k); \
+        }
+#define SC_VSTORE(k) memcpy(&s->l[(k) * SC_V], &v##k, sizeof v##k);
+#define SC_LANES_BODY(T, VT, NULLS) do { \
+    typedef VT sc_vt_; \
+    enum { sc_nulls_ = (NULLS) }; \
+    sc_vl cnt = { 0 }, nz = cnt + (int64_t)INT64_MIN;   /* -0.0's bits */ \
+    (void)nz; \
+    SC_VREP(SC_VLOAD) \
+    for (; i + SC_F64_LANES <= n; i += SC_F64_LANES) { SC_VREP(SC_VSTEP) } \
+    SC_VREP(SC_VSTORE) \
     if (NULLS) for (int k = 0; k < SC_V; k++) nn += cnt[k]; \
 } while (0)
 #else
@@ -346,12 +362,14 @@ static inline double red_shift_diff(int64_t v, int64_t shift) {
 typedef struct {
     double sum_f, min_f, max_f, prod_f, first_f, last_f, sum_sq_f;
     int64_t sum_i, min_i, max_i, prod_i, first_i, last_i;
-    /* Variance / stddev of integers: sums of (x - shift_i) and its square,
-     * the shift being the first value this accumulator saw.  Squares of the
-     * raw values lose the variance to cancellation (a constant column of
-     * hour-long durations would not come out as 0). */
+    /* Variance / stddev: sums of (x - shift) and its square, the shift being
+     * the first non-null value this accumulator saw (shift_i for integers,
+     * exact; shift_f for floats).  Squares of the raw values lose the
+     * variance to cancellation once the values are large next to their
+     * spread (#1666: 1e8 + [0 1 2 3] came out 0 or 18927.75, not 1.25). */
     double sum_c, sum_sq_c;
     int64_t shift_i;
+    double shift_f;
     bool shift_set;
     /* High word of the exact 128-bit sum of the integer stream; sum_i is
      * its low word.  AVG of an integer column divides this exact total,
@@ -372,7 +390,7 @@ static void reduce_acc_init(reduce_acc_t* acc) {
     acc->sum_i = 0; acc->min_i = INT64_MAX; acc->max_i = INT64_MIN;
     acc->prod_i = 1; acc->first_i = 0; acc->last_i = 0;
     acc->sum_hi = 0;
-    acc->sum_c = 0; acc->sum_sq_c = 0; acc->shift_i = 0; acc->shift_set = false;
+    acc->sum_c = 0; acc->sum_sq_c = 0; acc->shift_i = 0; acc->shift_f = 0; acc->shift_set = false;
     acc->cnt = 0; acc->zero_count = 0; acc->has_first = false;
     memset(&acc->sum_l, 0, sizeof acc->sum_l);
 }
@@ -567,7 +585,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define RED_MASK_AVG_I     (RED_NEED_SUM_128 | RED_NEED_COUNT)
 #define RED_MASK_AVG_F     (RED_NEED_SUM | RED_NEED_COUNT)
 #define RED_MASK_STATS_I   (RED_NEED_SUM_SQ | RED_NEED_COUNT)
-#define RED_MASK_STATS_F   (RED_NEED_SUM | RED_NEED_SUM_SQ | RED_NEED_COUNT)
+#define RED_MASK_STATS_F   (RED_NEED_SUM_SQ | RED_NEED_COUNT)   /* the shifted sums: sum_c, sum_sq_c */
 
 /* Integer reduction loop — reads native type T, accumulates as i64.
  * HAS_NULLS and HAS_IDX must be integer literal constants (0 or 1) so the
@@ -665,12 +683,26 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
 #define REDUCE_LOOP_F(T, base, start, end, acc, HAS_NULLS, HAS_IDX, idx, NEEDS) \
     do { \
         const T* d = (const T*)(base); \
+        if (((NEEDS) & RED_NEED_SUM_SQ) && !(acc)->shift_set) \
+            for (int64_t j = start; j < end; j++) { \
+                int64_t r_ = (HAS_IDX) ? (idx)[j] : j; \
+                double v_ = (double)d[r_]; \
+                if (v_ != v_) continue; \
+                (acc)->shift_f = v_; (acc)->shift_set = true; break; \
+            } \
+        /* the shifted sums and the count in locals: a loop of them alone \
+         * (VAR / STDDEV by themselves) runs in lanes */ \
+        double sc_ = (acc)->sum_c, sq_ = (acc)->sum_sq_c, k_ = (acc)->shift_f; \
+        int64_t cn_ = (acc)->cnt; \
         for (int64_t i = start; i < end; i++) { \
             int64_t row = (HAS_IDX) ? (idx)[i] : i; \
             double v = (double)d[row]; \
             if ((HAS_NULLS) && v != v) continue; \
             if ((NEEDS) & RED_NEED_SUM) (acc)->sum_f += v; \
-            if ((NEEDS) & RED_NEED_SUM_SQ) (acc)->sum_sq_f += v * v; \
+            if ((NEEDS) & RED_NEED_SUM_SQ) { \
+                double dv_ = v - k_; \
+                sc_ += dv_; sq_ += dv_ * dv_; \
+            } \
             if ((NEEDS) & RED_NEED_PROD) (acc)->prod_f *= v; \
             if (((NEEDS) & RED_NEED_ZERO) && v == 0.0) (acc)->zero_count++; \
             if (((NEEDS) & RED_NEED_MIN) && v < (acc)->min_f) (acc)->min_f = v; \
@@ -681,8 +713,9 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
             if ((NEEDS) & RED_NEED_LAST) { \
                 (acc)->last_f = v; (acc)->has_first = true; /* a value seen */ \
             } \
-            if ((NEEDS) & RED_NEED_COUNT) (acc)->cnt++; \
+            if ((NEEDS) & RED_NEED_COUNT) cn_++; \
         } \
+        (acc)->sum_c = sc_; (acc)->sum_sq_c = sq_; (acc)->cnt = cn_; \
     } while (0)
 
 /* Dispatch helper: expand REDUCE_LOOP_I/F with compile-time 0/1 constants for
@@ -737,7 +770,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
         case OP_MIN:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
         case OP_MAX:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
         case OP_AVG:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
-        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D: \
             DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
         case OP_FIRST: DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
         case OP_LAST:  DISPATCH_I(T, NULL_SENT, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
@@ -755,7 +788,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
         case OP_MIN:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
         case OP_MAX:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
         case OP_AVG:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_I); break; \
-        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D: \
             DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_I); break; \
         case OP_FIRST: DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
         case OP_LAST:  DISPATCH_BITMAP_I(T, input, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
@@ -773,7 +806,7 @@ static ray_t* agg_wide_reduce(ray_t* input, uint16_t op,
         case OP_MIN:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MIN); break; \
         case OP_MAX:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_MAX); break; \
         case OP_AVG:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_AVG_F); break; \
-        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: \
+        case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D: \
             DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_STATS_F); break; \
         case OP_FIRST: DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_FIRST); break; \
         case OP_LAST:  DISPATCH_F(T, base, start, end, acc, has_nulls, idx, RED_MASK_LAST); break; \
@@ -1015,22 +1048,18 @@ static void reduce_merge(reduce_acc_t* dst, const reduce_acc_t* src, int8_t in_t
         }
         dst->cnt += src->cnt;
         break;
-    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
-        if (fp) {
-            dst->sum_f += src->sum_f;
-            dst->sum_sq_f += src->sum_sq_f;
-        } else {
-            if (src->shift_set) {
-                if (!dst->shift_set) {
-                    dst->shift_i = src->shift_i; dst->shift_set = true;
-                    dst->sum_c = src->sum_c; dst->sum_sq_c = src->sum_sq_c;
-                } else {
-                    /* src's sums re-expressed about dst's shift */
-                    double d = red_shift_diff(src->shift_i, dst->shift_i);
-                    double n = (double)src->cnt;
-                    dst->sum_c += src->sum_c + n * d;
-                    dst->sum_sq_c += src->sum_sq_c + 2 * d * src->sum_c + n * d * d;
-                }
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D:
+        if (src->shift_set) {
+            if (!dst->shift_set) {
+                dst->shift_i = src->shift_i; dst->shift_f = src->shift_f; dst->shift_set = true;
+                dst->sum_c = src->sum_c; dst->sum_sq_c = src->sum_sq_c;
+            } else {
+                /* src's sums re-expressed about dst's shift */
+                double d = fp ? src->shift_f - dst->shift_f
+                              : red_shift_diff(src->shift_i, dst->shift_i);
+                double n = (double)src->cnt;
+                dst->sum_c += src->sum_c + n * d;
+                dst->sum_sq_c += src->sum_sq_c + 2 * d * src->sum_c + n * d * d;
             }
         }
         dst->cnt += src->cnt;
@@ -2371,6 +2400,13 @@ typedef struct {
     int64_t         n_rows;
     int64_t         n_groups;
     uint64_t        p_mask;          /* P - 1, P = number of partitions */
+    /* Few groups (n_groups <= CDPG_FEW_GROUPS): partition by the (gid,
+     * val) hash instead, so the rows of one large group spread over every
+     * partition rather than one serial dedup; each partition then counts
+     * into its own pcnt[p * n_groups + gid], summed into odata at the end. */
+    bool            by_val;
+    int64_t*        pcnt;            /* [P * n_groups] when by_val */
+    uint16_t*       gids16_out;      /* by_val: the gid + 1 fits 16 bits (2 B a row, not 8) */
     /* Pass 1 outputs / pass 2 inputs.  Per-task counters: each worker
      * writes to its own slice of hist[task_id * P] / cursor[task_id * P]
      * so there's no atomic contention.  task_id is start / grain, both
@@ -2415,12 +2451,14 @@ static void cdpg_hist_fn(void* ctx_, uint32_t worker_id,
      * we wrote here.  No atomics: each task owns its row. */
     int64_t task_id = start / x->grain;
     int64_t* my_hist = &x->hist[task_id * (int64_t)(p_mask + 1)];
+    uint8_t esz = ray_sym_elem_size(x->in_type, x->in_attrs);
     for (int64_t r = start; r < end; r++) {
         int64_t gid = x->row_gid[r];
         if (gid < 0 || gid >= x->n_groups) continue;
         /* Partition by gid (not gid×val) so the dedup pass can write to
-         * odata[gid] without atomics. */
-        uint64_t h = CDPG_PART_HASH(gid + 1);
+         * odata[gid] without atomics; by (gid, val) under few groups. */
+        uint64_t h = x->by_val ? CDPG_HASH(gid + 1, cdpg_read(x->base, r, x->in_type, esz))
+                               : CDPG_PART_HASH(gid + 1);
         my_hist[h & p_mask]++;
     }
 }
@@ -2441,9 +2479,10 @@ static void cdpg_scat_fn(void* ctx_, uint32_t worker_id,
         if (gid < 0 || gid >= x->n_groups) continue;
         int64_t val = cdpg_read(x->base, r, x->in_type, esz);
         int64_t gid_p1 = gid + 1;
-        uint64_t h = CDPG_PART_HASH(gid_p1);
+        uint64_t h = x->by_val ? CDPG_HASH(gid_p1, val) : CDPG_PART_HASH(gid_p1);
         int64_t pos = my_cur[h & p_mask]++;
-        x->gids_out[pos] = gid_p1;
+        if (x->by_val) x->gids16_out[pos] = (uint16_t)gid_p1;
+        else x->gids_out[pos] = gid_p1;
         x->vals_out[pos] = val;
     }
 }
@@ -2479,10 +2518,12 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
             continue;
         }
 
-        const int64_t* gids = x->gids_out + off;
+        const int64_t* gids = x->by_val ? NULL : x->gids_out + off;
+        const uint16_t* gids16 = x->by_val ? x->gids16_out + off : NULL;
         const int64_t* vals = x->vals_out + off;
+        int64_t* cnt_out = x->by_val ? x->pcnt + p * x->n_groups : x->odata;
         for (int64_t i = 0; i < cnt; i++) {
-            int64_t gid_p1 = gids[i];
+            int64_t gid_p1 = gids ? gids[i] : (int64_t)gids16[i];
             int64_t val    = vals[i];
             uint64_t h = CDPG_HASH(gid_p1, val);
             uint64_t slot = h & mask;
@@ -2493,8 +2534,8 @@ static void cdpg_dedup_fn(void* ctx_, uint32_t worker_id,
                     slot_val[slot] = val;
                     /* Partition is keyed on gid (CDPG_PART_HASH), so
                      * each gid is owned by exactly one task — drop the
-                     * atomic. */
-                    x->odata[gid_p1 - 1]++;
+                     * atomic; by (gid, val), the partition's own counts. */
+                    cnt_out[gid_p1 - 1]++;
                     break;
                 }
                 if (cur == gid_p1 && slot_val[slot] == val) break;
@@ -2534,9 +2575,15 @@ static ray_t* count_distinct_per_group_parallel(
         .n_groups = n_groups,
         .p_mask = p_mask,
         .odata = (int64_t*)ray_data(out),
+        .by_val = n_groups <= CDPG_FEW_GROUPS,
     };
 
     if (P > 256) return NULL;
+    ray_t* pcnt_hdr = NULL;
+    if (ctx.by_val) {
+        ctx.pcnt = (int64_t*)scratch_calloc(&pcnt_hdr, (size_t)P * (size_t)n_groups * sizeof(int64_t));
+        if (!ctx.pcnt) return NULL;
+    }
 
     /* Counters per dispatch task, sized from the geometry the pool takes
      * (its clamp included), computed once: both passes dispatch at that
@@ -2554,13 +2601,16 @@ static ray_t* count_distinct_per_group_parallel(
     ray_t* hist_hdr = NULL;
     ctx.hist = (int64_t*)scratch_calloc(&hist_hdr,
                                         (size_t)n_tasks * (size_t)P * sizeof(int64_t));
-    if (!ctx.hist) { return NULL; }
+    if (!ctx.hist) { if (pcnt_hdr) scratch_free(pcnt_hdr); return NULL; }
     ray_pool_dispatch_grain(pool, cdpg_hist_fn, &ctx, n_rows, grain);
     /* Each pass reads the one before it: the histogram sizes and places the
      * scatter, the scatter feeds the dedup.  The tasks a cancel skips leave
      * their part unwritten (a short histogram would send the scatter past
      * its partitions). */
-    if (pool_cancelled(pool)) { scratch_free(hist_hdr); return ray_error("cancel", NULL); }
+    if (pool_cancelled(pool)) {
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
+        return ray_error("cancel", NULL);
+    }
 
     /* Compute global per-partition totals + prefix offsets, then per-task
      * scatter cursors.  Layout invariant: tasks within a partition write
@@ -2574,7 +2624,7 @@ static ray_t* count_distinct_per_group_parallel(
     if (!ctx.part_off || !ctx.cursor) {
         if (off_hdr) scratch_free(off_hdr);
         if (cur_hdr) scratch_free(cur_hdr);
-        scratch_free(hist_hdr);
+        scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     /* Two-step prefix: per-partition global offset, then per-(task,
@@ -2595,14 +2645,17 @@ static ray_t* count_distinct_per_group_parallel(
     /* Pass 2: scatter (gid+1, val) pairs into partitioned out_buf. */
     ray_t* gids_hdr = NULL;
     ray_t* vals_hdr = NULL;
-    ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr,
-                                           (size_t)total * sizeof(int64_t));
+    if (ctx.by_val)
+        ctx.gids16_out = (uint16_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(uint16_t));
+    else
+        ctx.gids_out = (int64_t*)scratch_alloc(&gids_hdr, (size_t)total * sizeof(int64_t));
     ctx.vals_out = (int64_t*)scratch_alloc(&vals_hdr,
                                            (size_t)total * sizeof(int64_t));
-    if (!ctx.gids_out || !ctx.vals_out) {
+    if (!(ctx.gids_out || ctx.gids16_out) || !ctx.vals_out) {
         if (gids_hdr) scratch_free(gids_hdr);
         if (vals_hdr) scratch_free(vals_hdr);
         scratch_free(cur_hdr); scratch_free(off_hdr); scratch_free(hist_hdr);
+        if (pcnt_hdr) scratch_free(pcnt_hdr);
         return NULL;
     }
     if (total > 0)
@@ -2616,10 +2669,13 @@ static ray_t* count_distinct_per_group_parallel(
         ray_pool_dispatch_n(pool, cdpg_dedup_fn, &ctx, (uint32_t)P);
         cancelled = pool_cancelled(pool);
     }
+    if (ctx.by_val && !cancelled)
+        for (uint64_t p = 0; p < P; p++)
+            for (int64_t g = 0; g < n_groups; g++) ctx.odata[g] += ctx.pcnt[p * n_groups + g];
 
     scratch_free(vals_hdr); scratch_free(gids_hdr);
     scratch_free(cur_hdr);  scratch_free(off_hdr);
-    scratch_free(hist_hdr);
+    scratch_free(hist_hdr); if (pcnt_hdr) scratch_free(pcnt_hdr);
     return cancelled ? ray_error("cancel", NULL) : out;
 }
 
@@ -2716,6 +2772,33 @@ __attribute__((unused)) static ray_t* count_distinct_per_group_hll(ray_t* src, c
  * are distinct pairs → load factor 0.5, no rehash needed.  Slot stores
  * gid+1 (so 0 means empty) and the int64-encoded value.  64-bit composite
  * hash mixes both halves so rare-gid collisions don't cluster. */
+/* Few groups over many rows: the kernel above, partitioned by (group,
+ * value), instead of the per-group slices (whose largest group is one
+ * serial dedup).  Only with workers to spread over, and only when its
+ * buffers fit the heap's room: 10 B a row (the values and 16-bit group
+ * ids) beside the row map both routes hold, where the slices hold 8 B a
+ * row (their index) plus a table of twice the largest group's rows. */
+bool ray_cd_few_groups_kernel_ok(int64_t n_rows, int64_t n_groups) {
+    if (n_groups <= 0 || n_groups > CDPG_FEW_GROUPS || n_rows < 200000) return false;
+    ray_pool_t* pool = ray_pool_live();
+    if (!pool || ray_pool_total_workers(pool) < 2) return false;
+    /* The partitioned kernel is three passes over the rows (count, scatter,
+     * dedup) and stops scaling near 8 workers; the slices do less total work
+     * and keep scaling with the groups.  Measured on 5M rows: with 2-3
+     * workers the slices win below ~64 groups (the kernel's fixed work is
+     * ~2x theirs); from 16 workers on they win from ~64 groups up, so the
+     * kernel keeps only the few-group and skewed shapes there. */
+    int64_t workers = ray_pool_total_workers(pool);
+    if (workers < 4 && n_groups < 64) return false;
+    if (workers >= 16 && n_groups > 32) return false;
+    int64_t wm = ray_heap_anon_watermark();
+    if (wm > 0) {
+        int64_t room = wm - ray_heap_anon_committed();
+        if ((double)n_rows * 10.0 > (double)room / 2) return false;
+    }
+    return true;
+}
+
 ray_t* ray_count_distinct_per_group(ray_t* src, const int64_t* row_gid,
                                     int64_t n_rows, int64_t n_groups) {
     if (!src || RAY_IS_ERR(src)) return ray_error("domain", "count distinct per group: invalid source column");
@@ -4919,21 +5002,16 @@ static ray_t* reduce_result(uint16_t opcode, int8_t op_out_type, int8_t in_type,
         case OP_FIRST: return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->first_f) : reduction_i64_result(m->first_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_LAST:  return m->has_first ? (group_fp_type(in_type) ? ray_f64(m->last_f) : reduction_i64_result(m->last_i, in_type, sym_src)) : ray_typed_null(-(op_out_type ? op_out_type : in_type));
         case OP_VAR: case OP_VAR_POP:
-        case OP_STDDEV: case OP_STDDEV_POP: {
-            bool insufficient = (opcode == OP_VAR || opcode == OP_STDDEV) ? m->cnt <= 1 : m->cnt <= 0;
+        case OP_STDDEV: case OP_STDDEV_POP:
+        case OP_VAR_K: case OP_VAR_D: {
             /* the standard deviation of durations is a duration, null or not */
             bool dur_dev = in_type == RAY_TIMESPAN && (opcode == OP_STDDEV || opcode == OP_STDDEV_POP);
-            if (insufficient)
+            int64_t kb = m->shift_i;
+            if (fp) memcpy(&kb, &m->shift_f, sizeof kb);
+            bool vnull;
+            double val = ray_var_final(opcode, m->cnt, m->sum_c, m->sum_sq_c, fp, kb, &vnull);
+            if (vnull)
                 return dur_dev ? ray_typed_null(-RAY_TIMESPAN) : ray_typed_null(-RAY_F64);
-            double mean, var_pop;
-            if (fp) { mean = m->sum_f / m->cnt; var_pop = m->sum_sq_f / m->cnt - mean * mean; }
-            else { mean = m->sum_c / m->cnt; var_pop = m->sum_sq_c / m->cnt - mean * mean; }
-            if (var_pop < 0) var_pop = 0;
-            double val;
-            if (opcode == OP_VAR_POP) val = var_pop;
-            else if (opcode == OP_VAR) val = var_pop * m->cnt / (m->cnt - 1);
-            else if (opcode == OP_STDDEV_POP) val = sqrt(var_pop);
-            else val = sqrt(var_pop * m->cnt / (m->cnt - 1));
             ray_t* r = ray_f64(ray_f64_fin(val));
             return dur_dev ? ray_timespan_of_f64_atom(r) : r;
         }
@@ -5331,7 +5409,7 @@ ray_t* ray_reduce_src(ray_col_src_t* src, uint16_t opcode, int8_t out_type) {
     switch (opcode) {
     case OP_SUM: case OP_PROD: case OP_ALL: case OP_ANY: case OP_MIN: case OP_MAX:
     case OP_AVG: case OP_FIRST: case OP_LAST:
-    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: break;
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D: break;
     default: return NULL;
     }
     /* BOOL / U8 nulls would be a bitmap the raw kernel cannot read; the
@@ -5502,6 +5580,24 @@ void ght_layout_copy(ght_layout_t* dst, const ght_layout_t* src) {
 
 static inline bool ray_key_may_be_null(const ray_t* kv);
 
+/* The value slot of an earlier variance-family agg over the same input
+ * vector as agg a, when either of them is internal (OP_VAR_K / OP_VAR_D, only
+ * the parted merge asks for them), else -1. */
+static int ght_var_alias_slot(const ght_layout_t* out, const uint16_t* agg_ops,
+                              ray_t** agg_vecs, uint32_t a) {
+    if (!agg_ops || !agg_op_is_var(agg_ops[a])) return -1;
+    for (uint32_t b = 0; b < a; b++) {
+        if (!agg_op_is_var(agg_ops[b]) || agg_vecs[b] != agg_vecs[a]) continue;
+        if (agg_ops[a] != OP_VAR_K && agg_ops[a] != OP_VAR_D &&
+            agg_ops[b] != OP_VAR_K && agg_ops[b] != OP_VAR_D) continue;
+        if (out->agg_val_slot[b] >= 0) return out->agg_val_slot[b];
+    }
+    return -1;
+}
+
+/* An agg's slot for its emit: its own, or the slot it reads (-2 - s). */
+static inline int8_t ght_emit_slot(int8_t s) { return s <= -2 ? (int8_t)(-2 - s) : s; }
+
 bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
                         ray_t** agg_vecs, ray_t** agg_vecs2,
                         uint8_t need_flags,
@@ -5608,6 +5704,12 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             out->agg_val_slot[a] = -1;
         } else if (valueless) {
             out->agg_val_slot[a] = -1;
+        } else if (agg_vecs[a] && ght_var_alias_slot(out, agg_ops, agg_vecs, a) >= 0) {
+            /* reads an earlier variance slot's sums (the parted merge's
+             * OP_VAR_K / OP_VAR_D / OP_VAR_POP of one input): no slot of
+             * its own, so nothing accumulates twice; -2 - s names the
+             * source slot s for the emit (ght_emit_slot) */
+            out->agg_val_slot[a] = (int8_t)(-2 - ght_var_alias_slot(out, agg_ops, agg_vecs, a));
         } else if (agg_vecs[a]) {
             out->agg_val_slot[a] = (int8_t)nv;
             bool pair = agg_ops && agg_is_binary_agg(agg_ops[a]);
@@ -5655,6 +5757,10 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
         int8_t vslot = out->agg_val_slot[a];
         if (agg_ops && (agg_ops[a] == OP_ALL || agg_ops[a] == OP_ANY))
             af2 |= GHT_AF2_TRUTHY;
+        if (agg_ops && vslot >= 0 && agg_op_is_var(agg_ops[a])) {
+            af2 |= GHT_AF2_VAR;
+            out->need_flags |= GHT_NEED_VARK;
+        }
         if (vslot >= 0 && agg_vecs[a]) {
             ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                          ? agg_vecs[a]->slice_parent : agg_vecs[a];
@@ -5753,6 +5859,7 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
     if (need_flags & GHT_NEED_SUMSQ) { out->off_sumsq = (uint16_t)off; off += block; }
     /* High words of the exact 128-bit integer sums (integer AVG). */
     if (need_flags & GHT_NEED_SUM128) { out->off_sum_hi = (uint16_t)off; off += block; }
+    if (out->need_flags & GHT_NEED_VARK) { out->off_var_k = (uint16_t)off; off += block; }
     /* Per-slot row-index bounds for FIRST/LAST.  Two int64 blocks of
      * n_agg_vals slots each, allocated only when needed. */
     if (has_first_last) {
@@ -5773,6 +5880,12 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
      * Null-free shapes leave off_nn == 0 and finalize on the group row count,
      * so their row_stride and layout are byte-identical to before. */
     if (out->any_agg_null) { out->off_nn = (uint16_t)off; off += block; }
+    /* The row accumulator: VAR / STDDEV about each slot's k get their own
+     * copies (#1666), so every other layout runs the loops as before. */
+    {
+        bool var = (out->need_flags & GHT_NEED_VARK) != 0;
+        out->accum_kind = (uint8_t)((out->any_agg_null ? 2 : 0) + (var ? 1 : 0));
+    }
     /* Refuse (not wrap) any layout past the int8 value-slot count or the
      * uint16 entry/row-stride budget.  On overflow the off_* casts above
      * stored wrapped junk, but nothing reads it — the layout is freed and
@@ -6404,6 +6517,14 @@ static inline void init_accum_from_entry(char* row, const char* entry,
                 memcpy(row + ly->off_sumsq + s * 8, &sq, 8);
             }
         }
+        if ((nf & GHT_NEED_VARK) && (aflags2[a] & GHT_AF2_VAR)) {
+            /* VAR/STDDEV about the opening value: it is k, and its own
+             * difference and square are 0 (#1666) */
+            memcpy(row + ly->off_var_k + s * 8, agg_data + s * 8, 8);
+            memset(row + ly->off_sum + s * 8, 0, 8);
+            memset(row + ly->off_sumsq + s * 8, 0, 8);
+            if (nf & GHT_NEED_SUM128) memset(row + ly->off_sum_hi + s * 8, 0, 8);
+        }
         /* PEARSON y-side: seed Σy, Σy², Σxy from the (x, y) pair packed
          * at slots (s, s+1).  x-side Σx/Σx² are seeded by the SUM/SUMSQ
          * blocks above (OP_PEARSON_CORR sets both need-flags).  Reads
@@ -6441,10 +6562,33 @@ static inline void init_accum_from_entry(char* row, const char* entry,
  * All row offsets are 8-byte aligned by construction. */
 /* ROW_RD/WR macros defined in exec_internal.h */
 
+/* A VAR/STDDEV value into slot s of an HT row, about the slot's k
+ * (off_var_k, #1666): off_sum takes x - k as a double for every type (an
+ * integer's difference taken exactly first, as da_var_add), off_sumsq its
+ * square. */
+static inline void ght_var_add(char* row, const ght_layout_t* ly, int8_t s, uint8_t af,
+                               const char* val) {
+    if (af & GHT_AF_F64) {
+        double v, k;
+        memcpy(&v, val, 8);
+        memcpy(&k, row + ly->off_var_k + s * 8, 8);
+        double d = v - k;
+        ROW_WR_F64(row, ly->off_sum, s) += d;
+        ROW_WR_F64(row, ly->off_sumsq, s) += d * d;
+    } else {
+        int64_t v, k;
+        memcpy(&v, val, 8);
+        memcpy(&k, row + ly->off_var_k + s * 8, 8);
+        double d = red_shift_diff(v, k);
+        ROW_WR_F64(row, ly->off_sum, s) += d;
+        ROW_WR_F64(row, ly->off_sumsq, s) += d * d;
+    }
+}
+
 /* Accumulate into existing group from entry's inline agg values */
-static inline void accum_from_entry(char* row, const char* entry,
-                                    const ght_layout_t* ly) {
-    if (ly->any_agg_null) { accum_from_entry_nullable(row, entry, ly); return; }
+static inline __attribute__((always_inline)) void
+accum_from_entry_body(char* row, const char* entry, const ght_layout_t* ly, const bool with_var) {
+    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR) : GHT_AF2_TRUTHY;
     const char* agg_data = entry + 8 + (size_t)ly->key_region;
     uint16_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
@@ -6488,7 +6632,15 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_SUM) {
                 if (af & GHT_AF_FIRST) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
-                else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
+                    if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                    else {
+                        /* VAR / STDDEV about the slot's k (#1666, its first
+                         * value): its own sums only */
+                        ght_var_add(row, ly, s, af, val);
+                        continue;
+                    }
+                }
                 else if (af & GHT_AF_PROD) { ROW_WR_F64(row, ly->off_sum, s) *= v; }
                 else { ROW_WR_F64(row, ly->off_sum, s) += v; }
             }
@@ -6509,7 +6661,15 @@ static inline void accum_from_entry(char* row, const char* entry,
             if (nf & GHT_NEED_SUM) {
                 if (af & GHT_AF_FIRST) { if (take_first) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
-                else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
+                    if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                    else {
+                        /* VAR / STDDEV about the slot's k (#1666, its first
+                         * value): its own sums only */
+                        ght_var_add(row, ly, s, af, val);
+                        continue;
+                    }
+                }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
                 else if (nf & GHT_NEED_SUM128) { ray_i128_add(&ROW_WR_I64(row, ly->off_sum_hi, s), (uint64_t*)&ROW_WR_I64(row, ly->off_sum, s), v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
@@ -6545,6 +6705,15 @@ static inline void accum_from_entry(char* row, const char* entry,
     }
 }
 
+static void accum_from_entry_var(char* row, const char* entry, const ght_layout_t* ly) {
+    accum_from_entry_body(row, entry, ly, true);
+}
+
+/* Accumulate into existing group, the plain loop (ght_accum_fns). */
+static void accum_from_entry(char* row, const char* entry, const ght_layout_t* ly) {
+    accum_from_entry_body(row, entry, ly, false);
+}
+
 /* ── Null-aware row-layout accumulators ──────────────────────────────────
  * Reached only when the layout carries a nullable agg input.  They skip
  * null values (F64 NaN, or the per-agg NULL_I* sentinel for integer/temporal
@@ -6562,8 +6731,9 @@ static inline bool agg_entry_is_null(uint8_t af, uint8_t af2, int64_t sentinel,
     int64_t v; memcpy(&v, val, 8); return v == sentinel;
 }
 
-static void accum_from_entry_nullable(char* row, const char* entry,
-                                      const ght_layout_t* ly) {
+static inline __attribute__((always_inline)) void
+accum_from_entry_nullable_body(char* row, const char* entry, const ght_layout_t* ly, const bool with_var) {
+    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR) : GHT_AF2_TRUTHY;
     const char* agg_data = entry + 8 + (size_t)ly->key_region;
     uint16_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
@@ -6612,7 +6782,16 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                         memcpy(row + ly->off_sum + s * 8, val, 8);
                         ROW_WR_I64(row, ly->off_last_row, s) = entry_row;
                     }
-                } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                } else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
+                    if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                    else {
+                        /* VAR / STDDEV about the slot's k (#1666, its first
+                         * value): its own sums only */
+                        if (nn[s] == 1) memcpy(row + ly->off_var_k + s * 8, val, 8);
+                        ght_var_add(row, ly, s, af, val);
+                        continue;
+                    }
+                }
                 else if (af & GHT_AF_PROD) { ROW_WR_F64(row, ly->off_sum, s) *= v; }
                 else { ROW_WR_F64(row, ly->off_sum, s) += v; }
             }
@@ -6638,7 +6817,16 @@ static void accum_from_entry_nullable(char* row, const char* entry,
                         memcpy(row + ly->off_sum + s * 8, val, 8);
                         ROW_WR_I64(row, ly->off_last_row, s) = entry_row;
                     }
-                } else if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                } else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
+                    if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                    else {
+                        /* VAR / STDDEV about the slot's k (#1666, its first
+                         * value): its own sums only */
+                        if (nn[s] == 1) memcpy(row + ly->off_var_k + s * 8, val, 8);
+                        ght_var_add(row, ly, s, af, val);
+                        continue;
+                    }
+                }
                 else if (af & GHT_AF_PROD) { ROW_WR_I64(row, ly->off_sum, s) = (int64_t)((uint64_t)ROW_RD_I64(row, ly->off_sum, s) * (uint64_t)v); }
                 else if (nf & GHT_NEED_SUM128) { ray_i128_add(&ROW_WR_I64(row, ly->off_sum_hi, s), (uint64_t*)&ROW_WR_I64(row, ly->off_sum, s), v); }
                 else { ROW_WR_I64(row, ly->off_sum, s) = wrap_add_i64(ROW_RD_I64(row, ly->off_sum, s), v); }
@@ -6664,6 +6852,19 @@ static void accum_from_entry_nullable(char* row, const char* entry,
         }
     }
 }
+
+static void accum_from_entry_nullable(char* row, const char* entry, const ght_layout_t* ly) {
+    accum_from_entry_nullable_body(row, entry, ly, false);
+}
+
+static void accum_from_entry_nullable_var(char* row, const char* entry, const ght_layout_t* ly) {
+    accum_from_entry_nullable_body(row, entry, ly, true);
+}
+
+/* By ght_layout_t.accum_kind */
+static void (* const ght_accum_fns[4])(char*, const char*, const ght_layout_t*) = {
+    accum_from_entry, accum_from_entry_var, accum_from_entry_nullable, accum_from_entry_nullable_var,
+};
 
 static void init_accum_from_entry_nullable(char* row, const char* entry,
                                             const ght_layout_t* ly) {
@@ -6703,7 +6904,7 @@ static void init_accum_from_entry_nullable(char* row, const char* entry,
         }
     }
     /* Fold the opening row in through the same null-aware update. */
-    accum_from_entry_nullable(row, entry, ly);
+    ght_accum_fns[ly->accum_kind](row, entry, ly);   /* the null-aware one, VAR or not */
 }
 
 /* ── Lane-wise key-region copy / compare ───────────────────────────────────
@@ -6883,7 +7084,7 @@ static inline uint32_t group_probe_entry(group_ht_t* ht,
                 if (entry_row < first)
                     memcpy(row + ly->off_group_first, &entry_row, 8);
                 if (!accum_skip)
-                    accum_from_entry(row, entry, ly);
+                    ght_accum_fns[ly->accum_kind](row, entry, ly);
                 return mask;
             }
         }
@@ -8094,7 +8295,7 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                 if (!ao->dst) continue; /* allocation failed (OOM) */
                 uint16_t op = ao->agg_op;
                 bool sf = ao->src_f64;
-                int8_t s = vslot[a];
+                int8_t s = ght_emit_slot(vslot[a]);
                 /* nn = per-slot non-null count (nullable layout) or the group
                  * row count (null-free).  Drives the AVG/VAR/STDDEV divisor
                  * and the all-null → typed-null decision, matching the DA path. */
@@ -8147,19 +8348,15 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
                             break;
                         case OP_VAR: case OP_VAR_POP:
-                        case OP_STDDEV: case OP_STDDEV_POP: {
-                            bool insuf = (op == OP_VAR || op == OP_STDDEV) ? nn <= 1 : nn <= 0;
-                            if (insuf) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
-                            double sum_val = sf ? ROW_RD_F64(row, ly->off_sum, s)
-                                                : (double)ROW_RD_I64(row, ly->off_sum, s);
-                            double sq_val = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
-                            double mean = sum_val / nn;
-                            double var_pop = sq_val / nn - mean * mean;
-                            if (var_pop < 0) var_pop = 0;
-                            if (op == OP_VAR_POP) v = var_pop;
-                            else if (op == OP_VAR) v = var_pop * nn / (nn - 1);
-                            else if (op == OP_STDDEV_POP) v = sqrt(var_pop);
-                            else v = sqrt(var_pop * nn / (nn - 1));
+                        case OP_STDDEV: case OP_STDDEV_POP:
+                        case OP_VAR_K: case OP_VAR_D: {
+                            /* about the slot's k, sums in double for every
+                             * type (ght_var_add, #1666) */
+                            bool vnull;
+                            v = ray_var_final(op, nn, ROW_RD_F64(row, ly->off_sum, s),
+                                              ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0,
+                                              sf, ly->off_var_k ? ROW_RD_I64(row, ly->off_var_k, s) : 0, &vnull);
+                            if (vnull) { v = NULL_F64; grp_set_null(ao->vec, di); }
                             break;
                         }
                         case OP_PEARSON_CORR:
@@ -9072,6 +9269,13 @@ typedef struct {
      * for a set seeded whole. */
     uint64_t* touched;
     int64_t   unseeded;  /* chunks not yet seeded; 0 for a set seeded whole */
+    /* VAR/STDDEV (#1666): per slot, the value this accumulator centres on
+     * (its first non-null value: an integer, or a double's bits) and the
+     * count of values taken about it.  sum and sumsq_f64 then hold the sums
+     * of (x - k) and its square.  NULL without a variance-family aggregate
+     * (DA_NEED_VARK). */
+    int64_t*  var_k;
+    int64_t*  var_n;
     /* Arena headers */
     ray_t* _h_sum;
     ray_t* _h_sum_hi;
@@ -9087,6 +9291,8 @@ typedef struct {
     ray_t* _h_sumsq_y;
     ray_t* _h_sumxy;
     ray_t* _h_touched;
+    ray_t* _h_var_k;
+    ray_t* _h_var_n;
     /* A fused product overflowed while no nn_count is kept (#1349): an AVG
      * over it reruns on ht_path.  The partitioned DA path's drain tasks
      * share accums[0], so it is set with a relaxed atomic store (always
@@ -9122,6 +9328,82 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_sumsq_y);
     scratch_free(a->_h_sumxy);
     scratch_free(a->_h_touched);
+    scratch_free(a->_h_var_k);
+    scratch_free(a->_h_var_n);
+}
+
+
+/* A variance-family value into slot idx, about the slot's first value
+ * (#1666).  The sum of squares of the raw values cancels once they are large
+ * next to their spread (1e8 + [0 1 2 3] repeated came out 0, or 18927.75,
+ * where the population variance is 1.25); about a value of the data both
+ * sums stay the size of the spread.  An integer's difference is taken in
+ * integer arithmetic (exact), then both sums are doubles, sum[].f for every
+ * type: an integer total of differences can pass int64 (timestamps a few
+ * years apart over a thousand rows), a double's error is relative. */
+__attribute__((noinline)) static void da_var_add(da_accum_t* acc, size_t idx, bool is_f, double fv, int64_t iv) {
+    int64_t* kn = &acc->var_n[idx];
+    if (*kn == 0) {
+        if (is_f) memcpy(&acc->var_k[idx], &fv, sizeof fv);
+        else acc->var_k[idx] = iv;
+    }
+    (*kn)++;
+    if (is_f) {
+        double k; memcpy(&k, &acc->var_k[idx], sizeof k);
+        double d = fv - k;
+        acc->sum[idx].f += d;
+        acc->sumsq_f64[idx] += d * d;
+    } else {
+        double d = red_shift_diff(iv, acc->var_k[idx]);
+        acc->sum[idx].f += d;
+        acc->sumsq_f64[idx] += d * d;
+    }
+}
+
+/* Slot si of src into slot di of dst: src's sums re-expressed about dst's
+ * value, then added (n = src's count, dk = k_src - k_dst):
+ *   sum'   = sum   + n*dk
+ *   sumsq' = sumsq + 2*dk*sum + n*dk^2
+ * src's sum and sumsq are left zero, so a merge that adds every slot's sums
+ * afterwards adds nothing more for this one. */
+static inline void da_var_merge(da_accum_t* dst, size_t di, da_accum_t* src, size_t si, bool is_f) {
+    int64_t ns = src->var_n[si];
+    if (ns == 0) return;
+    int64_t nd = dst->var_n[di];
+    if (nd == 0) {
+        dst->var_k[di] = src->var_k[si];
+        dst->var_n[di] = ns;
+        dst->sum[di] = src->sum[si];
+        dst->sumsq_f64[di] = src->sumsq_f64[si];
+    } else {
+        double dk;
+        if (is_f) {
+            double ks, kd;
+            memcpy(&ks, &src->var_k[si], sizeof ks);
+            memcpy(&kd, &dst->var_k[di], sizeof kd);
+            dk = ks - kd;
+        } else {
+            dk = red_shift_diff(src->var_k[si], dst->var_k[di]);
+        }
+        double s1 = src->sum[si].f;
+        dst->sum[di].f += s1 + (double)ns * dk;
+        dst->sumsq_f64[di] += src->sumsq_f64[si] + 2 * dk * s1 + (double)ns * dk * dk;
+        dst->var_n[di] = nd + ns;
+    }
+    src->sum[si].f = 0;
+    if (src->sum_hi) src->sum_hi[si] = 0;
+    src->sumsq_f64[si] = 0;
+}
+
+/* Every variance-family slot of slots [lo, hi) (n_aggs per slot) of src
+ * into dst, ahead of a merge that adds the rest. */
+static void da_var_merge_slots(da_accum_t* dst, da_accum_t* src, size_t lo, size_t hi, uint32_t n_aggs,
+                               const uint16_t* ops, const int8_t* types) {
+    if (!dst->var_n || !src->var_n) return;
+    for (size_t sl = lo; sl < hi; sl++)
+        for (uint32_t a = 0; a < n_aggs; a++)
+            if (agg_op_is_var(ops[a]))
+                da_var_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a, group_fp_type(types[a]));
 }
 
 /* Unified agg result emitter — used by both DA and HT paths.
@@ -9150,7 +9432,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                               const int64_t* nn_counts,
                               const double*  sum_y_f64,
                               const double*  sumsq_y_f64,
-                              const double*  sumxy_f64) {
+                              const double*  sumxy_f64,
+                              const int64_t* var_k) {
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
         ray_t* agg_col = agg_vecs[a];
@@ -9168,6 +9451,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
             case OP_AVG:
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
+            case OP_VAR_K: case OP_VAR_D:
             case OP_PEARSON_CORR:
             case OP_COV: case OP_SCOV:
             case OP_WSUM: case OP_WAVG:
@@ -9276,19 +9560,14 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
                     case OP_VAR: case OP_VAR_POP:
-                    case OP_STDDEV: case OP_STDDEV_POP: {
-                        int64_t cnt = nn;
-                        bool insuf = (agg_op == OP_VAR || agg_op == OP_STDDEV) ? cnt <= 1 : cnt <= 0;
-                        if (insuf) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
-                        double sum_val = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
-                        double sq_val = sumsq_f64 ? sumsq_f64[idx] : 0.0;
-                        double mean = sum_val / cnt;
-                        double var_pop = sq_val / cnt - mean * mean;
-                        if (var_pop < 0) var_pop = 0;
-                        if (agg_op == OP_VAR_POP) v = var_pop;
-                        else if (agg_op == OP_VAR) v = var_pop * cnt / (cnt - 1);
-                        else if (agg_op == OP_STDDEV_POP) v = sqrt(var_pop);
-                        else v = sqrt(var_pop * cnt / (cnt - 1));
+                    case OP_STDDEV: case OP_STDDEV_POP:
+                    case OP_VAR_K: case OP_VAR_D: {
+                        /* about the slot's first value, sums in double for
+                         * every type (da_var_add, #1666) */
+                        bool vnull;
+                        v = ray_var_final(agg_op, nn, sum_f64[idx], sumsq_f64 ? sumsq_f64[idx] : 0.0,
+                                          is_f64, var_k ? var_k[idx] : 0, &vnull);
+                        if (vnull) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); }
                         break;
                     }
                     case OP_PEARSON_CORR:
@@ -9409,6 +9688,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                 case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
+                case OP_VAR_K:      nsfx = "_var_k";      nslen = 6; break;
+                case OP_VAR_D:      nsfx = "_var_d";      nslen = 6; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
                 case OP_QUANTILE:   nsfx = "_quantile";   nslen = 9; break;
                 case OP_MODE:       nsfx = "_mode";       nslen = 5; break;
@@ -9438,6 +9719,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
 #define DA_NEED_COUNT 0x08  /* count array */
 #define DA_NEED_SUMSQ 0x10  /* sumsq_f64 array (for STDDEV/VAR) */
 #define DA_NEED_PAIR  0x20  /* sum_y/sumsq_y/sumxy co-moments (PEARSON/COV/WAVG) */
+#define DA_NEED_VARK  0x40  /* var_k/var_n: VAR/STDDEV about a value (#1666) */
 
 typedef struct {
     da_accum_t*    accums;
@@ -10140,12 +10422,6 @@ struct scalar_ctx_s {
      * silently alias past that many aggregates. */
     const bool*    agg_int_null_has;
     int64_t*       agg_int_null_sentinel;
-    /* Per agg: the value an integer VAR/STDDEV input is centered on (0: none).
-     * Variance is shift-invariant, and squares of the raw values lose it to
-     * cancellation once they exceed 2^53 (a constant column of hours of
-     * nanoseconds would not come out as 0).  One value for the whole scan, so
-     * the chunk and worker accumulators merge by plain addition. */
-    const int64_t* var_shift;
     /* Range reads (R-WALK).  A plain context (staged false) reads whole
      * columns: row_base 0, srcs/plain/piece_attrs/fail unused.  A staged
      * one (some input is generation 2) runs each task through
@@ -10167,7 +10443,7 @@ struct scalar_ctx_s {
      * an offset of 0 marks an array the query does not use. */
     int64_t*       acc_base;
     size_t         acc_words;
-    size_t         off_sum, off_sum_hi, off_min, off_max, off_sumsq, off_nn;
+    size_t         off_sum, off_sum_hi, off_min, off_max, off_sumsq, off_nn, off_var_k, off_var_n;
     int64_t        n_scan;
     int64_t        chunk_rows;
     scalar_range_fn_t range_fn;
@@ -10187,6 +10463,8 @@ static void scalar_chunk_acc(const scalar_ctx_t* c, int64_t k, da_accum_t* acc) 
     if (c->off_max)    acc->max_val   = (da_val_t*)(void*)(blk + c->off_max);
     if (c->off_sumsq)  acc->sumsq_f64 = (double*)(void*)(blk + c->off_sumsq);
     if (c->off_nn)     acc->nn_count  = blk + c->off_nn;
+    if (c->off_var_k)  acc->var_k     = blk + c->off_var_k;
+    if (c->off_var_n)  acc->var_n     = blk + c->off_var_n;
 }
 
 /* SYM attrs (width) of input a in this context: the piece's when staged. */
@@ -10242,6 +10520,63 @@ static void scalar_run_staged(scalar_ctx_t* c, uint32_t wid, int64_t start, int6
 static inline int64_t scalar_i64_at(const void* ptr, int8_t type, int64_t r) {
     return read_col_i64(ptr, r, type, 0);  /* attrs=0: agg columns are numeric, never SYM */
 }
+
+/* The wrapping int64 sum of rows [start, end) of a column, each read as
+ * scalar_i64_at reads it.  The type is dispatched once, outside the row
+ * loop, so each width has a plain typed loop: gcc 11 and 12 kept
+ * read_col_i64's switch inside a per-row loop and never vectorized it, about
+ * 11 instructions a row against under 1 here (#1628).  Integer addition
+ * wraps modulo 2^64, so the order of the adds does not change the bits. */
+#define COL_WRAP_SUM_LOOP(T)                                                  \
+    do {                                                                      \
+        const T* restrict d = (const T*)ptr;                                  \
+        for (int64_t r = start; r < end; r++) s += (uint64_t)(int64_t)d[r];  \
+    } while (0)
+static int64_t col_wrap_sum(const void* ptr, int8_t type, int64_t start, int64_t end) {
+    uint64_t s = 0;
+    switch (type) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+    case RAY_SYM:                      /* attrs 0: read as int64 (read_col_i64) */
+        COL_WRAP_SUM_LOOP(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        COL_WRAP_SUM_LOOP(int32_t); break;
+    case RAY_I16:
+        COL_WRAP_SUM_LOOP(int16_t); break;
+    case RAY_BOOL: case RAY_U8:
+        COL_WRAP_SUM_LOOP(uint8_t); break;
+    default:                           /* F32 lanes as bits: the per-row reader */
+        for (int64_t r = start; r < end; r++) s += (uint64_t)scalar_i64_at(ptr, type, r);
+        break;
+    }
+    return (int64_t)s;
+}
+#undef COL_WRAP_SUM_LOOP
+
+/* The same over selected rows start + idx[0 .. n) (a morsel's selection). */
+#define COL_WRAP_SUM_IDX_LOOP(T)                                              \
+    do {                                                                      \
+        const T* restrict d = (const T*)ptr + start;                          \
+        for (int64_t i = 0; i < n; i++) s += (uint64_t)(int64_t)d[idx[i]];    \
+    } while (0)
+static int64_t col_wrap_sum_idx(const void* ptr, int8_t type, int64_t start,
+                                const uint16_t* restrict idx, int64_t n) {
+    uint64_t s = 0;
+    switch (type) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: case RAY_SYM:
+        COL_WRAP_SUM_IDX_LOOP(int64_t); break;
+    case RAY_I32: case RAY_DATE: case RAY_TIME:
+        COL_WRAP_SUM_IDX_LOOP(int32_t); break;
+    case RAY_I16:
+        COL_WRAP_SUM_IDX_LOOP(int16_t); break;
+    case RAY_BOOL: case RAY_U8:
+        COL_WRAP_SUM_IDX_LOOP(uint8_t); break;
+    default:
+        for (int64_t i = 0; i < n; i++) s += (uint64_t)scalar_i64_at(ptr, type, start + idx[i]);
+        break;
+    }
+    return (int64_t)s;
+}
+#undef COL_WRAP_SUM_IDX_LOOP
 
 /* Exact 128-bit sum of a contiguous int64 run, kept vectorizable.
  * Blocks of 1024 rows, three forms, escalating once for the rest of the
@@ -10417,9 +10752,7 @@ static void scalar_linear_sum(da_accum_t* acc, const agg_linear_t* lin, uint32_t
             const int64_t blk = (int64_t)1 << 30;
             for (int64_t b = start; b < end; b += blk) {
                 int64_t e = (end - b > blk) ? b + blk : end;
-                int64_t sum = 0;
-                for (int64_t r = b; r < e; r++)
-                    sum += scalar_i64_at(lin->term_ptrs[0], t0, r);
+                int64_t sum = col_wrap_sum(lin->term_ptrs[0], t0, b, e);
                 ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, sum);
             }
         } else {
@@ -10440,11 +10773,7 @@ static void scalar_linear_sum(da_accum_t* acc, const agg_linear_t* lin, uint32_t
     for (uint8_t t = 0; t < lin->n_terms; t++) {
         int64_t coeff = lin->coeff_i64[t];
         if (coeff == 0) continue;
-        const void* ptr = lin->term_ptrs[t];
-        int8_t type = lin->term_types[t];
-        int64_t term_sum = 0;
-        for (int64_t r = start; r < end; r++)
-            term_sum = wrap_add_i64(term_sum, scalar_i64_at(ptr, type, r));
+        int64_t term_sum = col_wrap_sum(lin->term_ptrs[t], lin->term_types[t], start, end);
         sum = wrap_add_i64(sum, wrap_mul_i64(coeff, term_sum));
     }
 
@@ -10490,7 +10819,7 @@ static bool scalar_stageable(int8_t t, uint16_t op) {
     switch (op) {
     case OP_SUM: case OP_AVG: case OP_MIN: case OP_MAX:
     case OP_FIRST: case OP_LAST: case OP_PROD: case OP_ALL: case OP_ANY:
-    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP:
+    case OP_VAR: case OP_VAR_POP: case OP_STDDEV: case OP_STDDEV_POP: case OP_VAR_K: case OP_VAR_D:
         return !agg_needs_row_gather(t, op);
     default:
         return false;
@@ -10565,10 +10894,21 @@ static void scalar_emit_vecs_free(ray_t* hdr, ray_t** ev, ray_t** agg_vecs, uint
     scratch_free(hdr);
 }
 
+#ifdef DEBUG
+/* Rows taken through scalar_accum_agg, every thread (test hook below). */
+static int64_t g_scalar_generic_rows;
+int64_t ray_group_test_scalar_generic_rows(void) {
+    return __atomic_load_n(&g_scalar_generic_rows, __ATOMIC_RELAXED);
+}
+#endif
+
 /* Generic scalar accumulation: handles all ops, all types, mask */
 /* Inner scalar accumulation for a single row */
 /* Row r into aggregate a (acc->count[0] is the caller's). */
 static inline void scalar_accum_agg(scalar_ctx_t* c, da_accum_t* acc, int64_t r, uint32_t a) {
+#ifdef DEBUG
+    __atomic_fetch_add(&g_scalar_generic_rows, 1, __ATOMIC_RELAXED);
+#endif
     /* Per-(group, agg) non-null counters drive AVG/VAR/STDDEV divisors
      * and all-null finalization for MIN/MAX/PROD/FIRST/LAST.  Only
      * allocated when at least one agg can produce a null
@@ -10641,25 +10981,23 @@ static inline void scalar_accum_agg(scalar_ctx_t* c, da_accum_t* acc, int64_t r,
                 acc->sum[a].i += (is_f ? (fv != 0.0) : (iv != 0)) ? 1 : 0;
                 if (nn) nn[a]++;
             }
-        } else if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+        } else if (op == OP_SUM || op == OP_AVG || agg_op_is_var(op)) {
             if (is_f) {
                 /* NaN payload = null, skip from sum/sumsq. */
                 if (RAY_LIKELY(fv == fv)) {
-                    acc->sum[a].f += fv;
-                    if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
+                    /* the variance family about the slot's first value
+                     * (da_var_add, #1666); var_n is there whenever one is */
+                    if (RAY_UNLIKELY(acc->var_n != NULL) && agg_op_is_var(op))
+                        da_var_add(acc, a, true, fv, 0);
+                    else
+                        acc->sum[a].f += fv;
                     if (nn) nn[a]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                /* a variance input is centered (see var_shift); every other
-                 * aggregate has shift 0 */
-                int64_t sh = c->var_shift ? c->var_shift[a] : 0;
-                if (sh) {
-                    fv = red_shift_diff(iv, sh);
-                    iv = (int64_t)((uint64_t)iv - (uint64_t)sh);
-                }
-                if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
+                if (RAY_UNLIKELY(acc->var_n != NULL) && agg_op_is_var(op))
+                    da_var_add(acc, a, false, 0.0, iv);
+                else if (acc->sum_hi) ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, iv);
                 else acc->sum[a].i = wrap_add_i64(acc->sum[a].i, iv);
-                if (acc->sumsq_f64) acc->sumsq_f64[a] += fv * fv;
                 if (nn) nn[a]++;
             }
         } else if (op == OP_PROD) {
@@ -10726,10 +11064,13 @@ static inline void scalar_accum_row(scalar_ctx_t* c, da_accum_t* acc, int64_t r)
 /* Can the rows go aggregate by aggregate?  PROD and FIRST without
  * non-null counters take "first value" from count[0] == 1, which only a
  * row-by-row walk keeps. */
+static bool scalar_pick_takes(const scalar_ctx_t* c, uint32_t a);
+
 static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
     if (acc->nn_count) return true;
     for (uint32_t a = 0; a < c->n_aggs; a++)
-        if (c->agg_ops[a] == OP_PROD || c->agg_ops[a] == OP_FIRST) return false;
+        if ((c->agg_ops[a] == OP_PROD || c->agg_ops[a] == OP_FIRST) && !scalar_pick_takes(c, a))
+            return false;
     return true;
 }
 
@@ -10737,12 +11078,51 @@ static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
  * start + idx[0 .. n) (a morsel's selected rows, start its first row). */
 #define SC_ROW(i) (idx ? start + idx[i] : start + (i))
 
+/* Lanes of the elementwise integer MIN / MAX loop below (#1628), measured
+ * over 10M rows: gcc vectorizes the single running extreme itself, and
+ * lanes only add to it, so gcc keeps one lane, the loop it had; clang
+ * leaves that loop a serial chain (about 7.8 instructions a row) and takes
+ * 8 lanes (about 1.5).  Under a selection (idx) every compiler runs the
+ * single running extreme.  Floating-point MIN / MAX run in aggseq.c. */
+#if defined(__clang__)
+#define SC_MM_ILANES 8
+#else
+#define SC_MM_ILANES 1
+#endif
+
 /* SUM/AVG/MIN/MAX of null-free integer rows of input a: one tight loop.
  * Values as read_col_i64 reads them. */
 #define SC_INT_RUN(T)                                                          \
     do {                                                                       \
         const T* restrict d = (const T*)base;   /* row row_base */             \
-        if (op == OP_MIN) {                                                    \
+        if ((op == OP_MIN || op == OP_MAX) && SC_MM_ILANES > 1 && !idx) {      \
+            /* clang: lanes, elementwise (see SC_MM_ILANES); integer       \
+             * extremes are exact in any order. */                          \
+            bool mn = op == OP_MIN;                                            \
+            int64_t m = mn ? acc->min_val[a].i : acc->max_val[a].i;            \
+            const T* restrict x = d + (start - c->row_base);                   \
+            int64_t l[SC_MM_ILANES], i = 0;                                    \
+            for (int j = 0; j < SC_MM_ILANES; j++) l[j] = m;                   \
+            if (mn) {                                                          \
+                for (; i + SC_MM_ILANES <= n; i += SC_MM_ILANES)               \
+                    for (int j = 0; j < SC_MM_ILANES; j++) {                   \
+                        int64_t v = (int64_t)x[i + j];                         \
+                        l[j] = v < l[j] ? v : l[j];                            \
+                    }                                                          \
+                for (; i < n; i++) { int64_t v = (int64_t)x[i]; l[0] = v < l[0] ? v : l[0]; } \
+                for (int j = 0; j < SC_MM_ILANES; j++) m = l[j] < m ? l[j] : m; \
+                acc->min_val[a].i = m;                                         \
+            } else {                                                           \
+                for (; i + SC_MM_ILANES <= n; i += SC_MM_ILANES)               \
+                    for (int j = 0; j < SC_MM_ILANES; j++) {                   \
+                        int64_t v = (int64_t)x[i + j];                         \
+                        l[j] = v > l[j] ? v : l[j];                            \
+                    }                                                          \
+                for (; i < n; i++) { int64_t v = (int64_t)x[i]; l[0] = v > l[0] ? v : l[0]; } \
+                for (int j = 0; j < SC_MM_ILANES; j++) m = l[j] > m ? l[j] : m; \
+                acc->max_val[a].i = m;                                         \
+            }                                                                  \
+        } else if (op == OP_MIN) {                                             \
             int64_t m = acc->min_val[a].i;                                     \
             for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)d[SC_ROW(i) - c->row_base]; m = v < m ? v : m; } \
             acc->min_val[a].i = m;                                             \
@@ -10765,6 +11145,184 @@ static bool scalar_by_column_ok(const scalar_ctx_t* c, const da_accum_t* acc) {
         }                                                                      \
     } while (0)
 
+
+/* FIRST / LAST / PROD of a run with no selection, the same as
+ * scalar_accum_agg row by row.  FIRST takes the first non-null row while no
+ * non-null row was taken before (nn_count[a] == 0), or, without per-input
+ * counters, only the accumulator's very first row (count[0] == 1 there:
+ * c0 == 0 and the run's first row); PROD starts from that same row and
+ * multiplies the rest; LAST keeps the last non-null row.  So FIRST and LAST
+ * read one row when the input has no nulls.  Integer PROD wraps (modulo
+ * 2^64, any order); a floating-point product keeps row order
+ * (ray_aggseq_prod_*, strict IEEE).  c0: count[0] before the run. */
+static bool scalar_pick_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
+                            int64_t start, int64_t n, int64_t c0) {
+    uint16_t op = c->agg_ops[a];
+    int8_t t = c->agg_types[a];
+    int64_t* nn = acc->nn_count;
+    if (n <= 0) return true;
+    if (group_fp_type(t)) {
+        const void* p = (const char*)c->agg_ptrs[a] + (size_t)(start - c->row_base) * (t == RAY_F32 ? 4 : 8);
+#define SC_FAT(i) (t == RAY_F64 ? ((const double*)p)[i] : (double)((const float*)p)[i])
+        if (op == OP_LAST) {
+            int64_t i = n - 1;
+            while (i >= 0 && !(SC_FAT(i) == SC_FAT(i))) i--;
+            if (i < 0) return true;              /* no non-null row */
+            acc->sum[a].f = SC_FAT(i);
+            if (nn) {
+                int64_t k = 0;
+                for (int64_t j = 0; j <= i; j++) k += SC_FAT(j) == SC_FAT(j);
+                nn[a] += k;
+            }
+            return true;
+        }
+        if (op == OP_FIRST) {
+            if (!nn) {                           /* only row 0 of the first run */
+                if (c0 == 0 && SC_FAT(0) == SC_FAT(0)) acc->sum[a].f = SC_FAT(0);
+                return true;
+            }
+            int64_t i = 0;
+            while (i < n && !(SC_FAT(i) == SC_FAT(i))) i++;
+            if (i == n) return true;
+            if (nn[a] == 0) acc->sum[a].f = SC_FAT(i);
+            int64_t k = 0;
+            for (int64_t j = i; j < n; j++) k += SC_FAT(j) == SC_FAT(j);
+            nn[a] += k;
+            return true;
+        }
+        /* OP_PROD */
+        int64_t i = 0, k = 0;
+        if (nn ? nn[a] == 0 : c0 == 0) {
+            /* the first factor is set, not multiplied in */
+            if (nn) { while (i < n && !(SC_FAT(i) == SC_FAT(i))) i++; }
+            if (i == n) return true;
+            if (SC_FAT(i) == SC_FAT(i)) { acc->sum[a].f = SC_FAT(i); k = 1; }
+            i++;
+        }
+        acc->sum[a].f = t == RAY_F64
+            ? ray_aggseq_prod_f64(acc->sum[a].f, (const double*)p + i, n - i, &k)
+            : ray_aggseq_prod_f32(acc->sum[a].f, (const float*)p + i, n - i, &k);
+        if (nn) nn[a] += k;
+        return true;
+#undef SC_FAT
+    }
+    /* integers with no null sentinel: every row is non-null */
+    const void* p = c->agg_ptrs[a];
+    int64_t r0 = start - c->row_base;
+#define SC_IAT(i) read_col_i64(p, r0 + (i), t, 0)
+    if (op == OP_LAST) {
+        acc->sum[a].i = SC_IAT(n - 1);
+    } else if (op == OP_FIRST) {
+        if (nn ? nn[a] == 0 : c0 == 0) acc->sum[a].i = SC_IAT(0);
+    } else {                                     /* OP_PROD */
+        int64_t i = 0;
+        uint64_t pr;
+        if (nn ? nn[a] == 0 : c0 == 0) { pr = (uint64_t)SC_IAT(0); i = 1; }
+        else pr = (uint64_t)acc->sum[a].i;
+#define SC_PROD_LOOP(T) do { const T* restrict d = (const T*)p + r0;                  \
+            for (; i < n; i++) pr *= (uint64_t)(int64_t)d[i]; } while (0)
+        switch (t) {
+        case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP: SC_PROD_LOOP(int64_t); break;
+        case RAY_I32: case RAY_DATE: case RAY_TIME:         SC_PROD_LOOP(int32_t); break;
+        case RAY_I16:                                       SC_PROD_LOOP(int16_t); break;
+        default:                                            SC_PROD_LOOP(uint8_t); break;
+        }
+#undef SC_PROD_LOOP
+        acc->sum[a].i = (int64_t)pr;
+    }
+#undef SC_IAT
+    if (nn) nn[a] += n;
+    return true;
+}
+
+/* Does scalar_pick_run take input a?  A FIRST / LAST / PROD with no
+ * selection over a plain numeric column (integers only without a null
+ * sentinel).  Under a selection, or for any other input, the rows go
+ * through scalar_accum_agg as before. */
+static bool scalar_pick_takes(const scalar_ctx_t* c, uint32_t a) {
+    uint16_t op = c->agg_ops[a];
+    if (op != OP_FIRST && op != OP_LAST && op != OP_PROD) return false;
+    if (c->rowsel || c->match_idx || !c->agg_ptrs[a]) return false;
+    if ((c->agg_prod && c->agg_prod[a].enabled) || (c->agg_linear && c->agg_linear[a].enabled) ||
+        (c->agg_strlen && c->agg_strlen[a]))
+        return false;
+    switch (c->agg_types[a]) {
+    case RAY_F64: case RAY_F32: return true;
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+    case RAY_I32: case RAY_DATE: case RAY_TIME: case RAY_I16:
+    case RAY_U8: case RAY_BOOL:
+        return !c->agg_int_null_has[a];
+    default: return false;
+    }
+}
+
+/* A variance-family input over the run, about the slot's first value as
+ * da_var_add takes it (#1666): a plain F64 / F32 column skipping NaN, or an
+ * integer one without a null sentinel, its differences exact in integers
+ * (both sums in double, as da_var_add).
+ * The run's sums gather in locals and land once. */
+#define SC_VAR_RUN_F(T)                                                        \
+    do {                                                                       \
+        const T* restrict x = (const T*)base + off;                            \
+        int64_t i = 0, m = 0;                                                  \
+        if (acc->var_n[a] == 0) {                                              \
+            for (; i < n; i++) { double v = (double)x[idx ? idx[i] : i]; if (v == v) break; } \
+            if (i == n) return true;                                           \
+            double v0 = (double)x[idx ? idx[i] : i];                           \
+            memcpy(&acc->var_k[a], &v0, sizeof v0);                            \
+        }                                                                      \
+        double k; memcpy(&k, &acc->var_k[a], sizeof k);                        \
+        double s1 = 0, s2 = 0;                                                 \
+        if (idx) {                                                             \
+            for (; i < n; i++) { double v = (double)x[idx[i]];                 \
+                if (v == v) { double d = v - k; s1 += d; s2 += d * d; m++; } } \
+        } else {                                                               \
+            for (; i < n; i++) { double v = (double)x[i];                      \
+                if (v == v) { double d = v - k; s1 += d; s2 += d * d; m++; } } \
+        }                                                                      \
+        acc->sum[a].f += s1; acc->sumsq_f64[a] += s2;                          \
+        acc->var_n[a] += m;                                                    \
+        if (acc->nn_count) acc->nn_count[a] += m;                              \
+    } while (0)
+#define SC_VAR_RUN_I(T, DIFF)                                                  \
+    do {                                                                       \
+        const T* restrict x = (const T*)base + off;                            \
+        if (acc->var_n[a] == 0) acc->var_k[a] = (int64_t)x[idx ? idx[0] : 0];  \
+        int64_t k = acc->var_k[a];                                             \
+        double s1 = 0, s2 = 0;                                                 \
+        if (idx) {                                                             \
+            for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)x[idx[i]];  \
+                double d = DIFF; s1 += d; s2 += d * d; }                       \
+        } else {                                                               \
+            for (int64_t i = 0; i < n; i++) { int64_t v = (int64_t)x[i];       \
+                double d = DIFF; s1 += d; s2 += d * d; }                       \
+        }                                                                      \
+        acc->sum[a].f += s1;                                                   \
+        acc->sumsq_f64[a] += s2;                                               \
+        acc->var_n[a] += n;                                                    \
+        if (acc->nn_count) acc->nn_count[a] += n;                              \
+    } while (0)
+static bool scalar_var_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
+                           int64_t start, int64_t n, const uint16_t* idx) {
+    const void* base = c->agg_ptrs[a];
+    size_t off = (size_t)(start - c->row_base);
+    int8_t t = c->agg_types[a];
+    if (n <= 0) return true;
+    if (t == RAY_F64) { SC_VAR_RUN_F(double); return true; }
+    if (t == RAY_F32) { SC_VAR_RUN_F(float); return true; }
+    if (c->agg_int_null_has[a]) return false;
+    switch (t) {
+    case RAY_I64: case RAY_TIMESPAN: case RAY_TIMESTAMP:
+        SC_VAR_RUN_I(int64_t, red_shift_diff(v, k)); return true;
+    case RAY_I32: case RAY_DATE: case RAY_TIME: SC_VAR_RUN_I(int32_t, (double)(v - k)); return true;
+    case RAY_I16:                               SC_VAR_RUN_I(int16_t, (double)(v - k)); return true;
+    case RAY_U8: case RAY_BOOL:                 SC_VAR_RUN_I(uint8_t, (double)(v - k)); return true;
+    default: return false;
+    }
+}
+#undef SC_VAR_RUN_F
+#undef SC_VAR_RUN_I
+
 /* Input a over the run, if one of the tight loops computes it exactly as
  * scalar_accum_agg would row by row; false leaves it to the caller. */
 static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
@@ -10773,8 +11331,26 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
     if (op == OP_COUNT) return true;            /* count[0] is the caller's */
     if (c->agg_linear && c->agg_linear[a].enabled && (op == OP_SUM || op == OP_AVG)) {
         const agg_linear_t* lin = &c->agg_linear[a];   /* null-free terms */
+        int8_t t0 = lin->term_types[0];
         if (!idx) {
             scalar_linear_sum(acc, lin, a, start, start + n);
+        } else if (!acc->sum_hi) {
+            /* The wrapping total of b + sum(c_t * x_t) over the rows is
+             * n * b + sum(c_t * (the wrapping sum of x_t)) modulo 2^64: a
+             * typed gather sum per term gives the per-row loop's bits. */
+            int64_t sum = wrap_mul_i64(lin->bias_i64, n);
+            for (uint8_t t = 0; t < lin->n_terms; t++) {
+                if (lin->coeff_i64[t] == 0) continue;
+                sum = wrap_add_i64(sum, wrap_mul_i64(lin->coeff_i64[t],
+                        col_wrap_sum_idx(lin->term_ptrs[t], lin->term_types[t], start, idx, n)));
+            }
+            acc->sum[a].i = wrap_add_i64(acc->sum[a].i, sum);
+        } else if (lin->n_terms == 1 && lin->coeff_i64[0] == 1 && lin->bias_i64 == 0 &&
+                   (t0 == RAY_I64 || t0 == RAY_TIMESPAN || t0 == RAY_TIMESTAMP)) {
+            /* a bare 64-bit column: each row's value exactly, into 128 bits */
+            const int64_t* restrict x = (const int64_t*)lin->term_ptrs[0] + start;
+            for (int64_t i = 0; i < n; i++)
+                ray_i128_add(&acc->sum_hi[a], (uint64_t*)&acc->sum[a].i, x[idx[i]]);
         } else {
             for (int64_t i = 0; i < n; i++) {
                 int64_t r = SC_ROW(i), iv = lin->bias_i64;
@@ -10789,6 +11365,25 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
         return true;
     }
     const void* base = c->agg_ptrs[a];
+    if (!idx && scalar_pick_takes(c, a))
+        return scalar_pick_run(c, acc, a, start, n, acc->count[0] - n);
+    if (base && (op == OP_MIN || op == OP_MAX) && group_fp_type(c->agg_types[a]) &&
+        !(c->agg_prod && c->agg_prod[a].enabled) && !(c->agg_strlen && c->agg_strlen[a])) {
+        /* F64 / F32 MIN / MAX in lanes, the row-by-row fold's bits and zero
+         * sign included (ray_aggseq_minmax_*, strict IEEE: the release
+         * profile's -fno-signed-zeros let gcc fold the sign of a zero away
+         * here, #1628 review). */
+        double* slot = op == OP_MIN ? &acc->min_val[a].f : &acc->max_val[a].f;
+        int64_t* nnp = acc->nn_count ? &acc->nn_count[a] : NULL;
+        size_t off = (size_t)(start - c->row_base);
+        *slot = c->agg_types[a] == RAY_F64
+            ? ray_aggseq_minmax_f64(*slot, (const double*)base + off, idx, n, op == OP_MIN, nnp)
+            : ray_aggseq_minmax_f32(*slot, (const float*)base + off, idx, n, op == OP_MIN, nnp);
+        return true;
+    }
+    if (base && acc->var_n && agg_op_is_var(op) &&
+        !(c->agg_prod && c->agg_prod[a].enabled) && !(c->agg_strlen && c->agg_strlen[a]))
+        return scalar_var_run(c, acc, a, start, n, idx);
     if (!base || (c->agg_prod && c->agg_prod[a].enabled) ||
         (c->agg_strlen && c->agg_strlen[a]) || c->agg_int_null_has[a])
         return false;
@@ -10804,6 +11399,7 @@ static bool scalar_column_run(scalar_ctx_t* c, da_accum_t* acc, uint32_t a,
     return true;
 }
 #undef SC_INT_RUN
+#undef SC_MM_ILANES
 
 /* A run of rows (see SC_ROW), all of them aggregated: input by input. */
 static void scalar_accum_columns(scalar_ctx_t* c, da_accum_t* acc, int64_t start, int64_t n,
@@ -11282,6 +11878,7 @@ da_chunk_seed(const da_ctx_t* c, da_accum_t* acc, uint64_t ch) {
     if (acc->sum_y)     memset(acc->sum_y + lo * na, 0, n * na * sizeof(double));
     if (acc->sumsq_y)   memset(acc->sumsq_y + lo * na, 0, n * na * sizeof(double));
     if (acc->sumxy)     memset(acc->sumxy + lo * na, 0, n * na * sizeof(double));
+    if (acc->var_n)     memset(acc->var_n + lo * na, 0, n * na * sizeof(int64_t));
     for (size_t i = lo * na; i < hi * na; i++) {
         bool fp = group_fp_type(c->agg_types[i % na]);
         if (acc->min_val) { if (fp) acc->min_val[i].f = DBL_MAX;  else acc->min_val[i].i = INT64_MAX; }
@@ -11423,18 +12020,23 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
                 acc->sum[idx].i += (is_f ? (fv != 0.0) : (iv != 0)) ? 1 : 0;
                 if (nn) nn[idx]++;
             }
-        } else if (op == OP_SUM || op == OP_AVG || op == OP_STDDEV || op == OP_STDDEV_POP || op == OP_VAR || op == OP_VAR_POP) {
+        } else if (op == OP_SUM || op == OP_AVG || agg_op_is_var(op)) {
             if (is_f) {
                 /* NaN payload = null, skip from sum/sumsq. */
                 if (RAY_LIKELY(fv == fv)) {
-                    acc->sum[idx].f += fv;
-                    if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
+                    /* the variance family about the slot's first value
+                     * (da_var_add, #1666); var_n is there whenever one is */
+                    if (RAY_UNLIKELY(acc->var_n != NULL) && agg_op_is_var(op))
+                        da_var_add(acc, idx, true, fv, 0);
+                    else
+                        acc->sum[idx].f += fv;
                     if (nn) nn[idx]++;
                 }
             } else if (RAY_LIKELY(!int_null)) {
-                if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, iv);
+                if (RAY_UNLIKELY(acc->var_n != NULL) && agg_op_is_var(op))
+                    da_var_add(acc, idx, false, 0.0, iv);
+                else if (acc->sum_hi) ray_i128_add(&acc->sum_hi[idx], (uint64_t*)&acc->sum[idx].i, iv);
                 else acc->sum[idx].i = (int64_t)((uint64_t)acc->sum[idx].i + (uint64_t)iv);
-                if (acc->sumsq_f64) acc->sumsq_f64[idx] += fv * fv;
                 if (nn) nn[idx]++;
             }
         } else if (op == OP_PEARSON_CORR || op == OP_COV || op == OP_SCOV ||
@@ -12110,6 +12712,7 @@ static void da_merge_fn(void* ctx, uint32_t wid, int64_t start, int64_t end) {
         for (int64_t s = start; s < end; s++) {
             if (!da_chunk_touched(wa, s)) { s |= DA_LZ_MASK; skipped++; continue; }   /* nothing there */
             size_t base = (size_t)s * n_aggs;
+            da_var_merge_slots(merged, wa, (size_t)s, (size_t)s + 1, n_aggs, c->agg_ops, agg_types);
             if (c->need_flags & DA_NEED_SUMSQ) {
                 for (uint32_t a = 0; a < n_aggs; a++)
                     merged->sumsq_f64[base + a] += wa->sumsq_f64[base + a];
@@ -14380,6 +14983,23 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
     *sx = ax; *sy = ay; *sxx = axx; *syy = ayy; *sxy = axy;
 }
 
+/* The value a slice's VAR/STDDEV sums are taken about (#1666): its first
+ * row's value for an integer input (the slice path admits no integer null),
+ * else its first non-NaN value; an int64, or a double's bits.  Every task of
+ * the slice centres on it, so the task-order fold is a plain addition. */
+static int64_t sg_slice_var_k(const ray_idx_slice_t* sl, ray_t* vec) {
+    bool fp = group_fp_type(vec->type);
+    for (int64_t j = 0; j < sl->n; j++) {
+        int64_t rj = !sl->rows.p ? sl->first + j
+                   : sl->rows.narrow ? (int64_t)((const uint32_t*)sl->rows.p)[j]
+                                     : ((const int64_t*)sl->rows.p)[j];
+        if (!fp) return read_col_i64(ray_data(vec), rj, vec->type, vec->attrs);
+        double k = group_fp_at(ray_data(vec), vec->type, rj);
+        if (k == k || j + 1 == sl->n) { int64_t b; memcpy(&b, &k, sizeof b); return b; }
+    }
+    return 0;
+}
+
 static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
     sg_ctx_t* c = (sg_ctx_t*)raw;
     for (int64_t ti = tstart; ti < tend; ti++) {
@@ -14441,9 +15061,18 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 double acc = 0.0;
                 double ssq = 0.0;
                 bool need_sq = c->partial_sumsq &&
-                    (op == OP_STDDEV || op == OP_STDDEV_POP ||
-                     op == OP_VAR || op == OP_VAR_POP);
-                if (contig) {
+                    agg_op_is_var(op);
+                if (need_sq) {
+                    /* the slice's first non-NaN value (a NaN is skipped as a
+                     * null below; every task of the slice finds the same) */
+                    int64_t kb = sg_slice_var_k(sl, c->agg_vecs[a]);
+                    double k; memcpy(&k, &kb, sizeof k);
+                    for (int64_t j = 0; j < n; j++) {
+                        double v = group_fp_at(ray_data(c->agg_vecs[a]), c->agg_vecs[a]->type,
+                                               contig ? r0 + j : rows[j]);
+                        if (RAY_LIKELY(v == v)) { double d = v - k; acc += d; ssq += d * d; }
+                    }
+                } else if (contig) {
                     for (int64_t j = 0; j < n; j++) {
                         double v = group_fp_at(ray_data(c->agg_vecs[a]),
                                                c->agg_vecs[a]->type, r0 + j);
@@ -14475,9 +15104,29 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
                 int64_t hi = 0;     /* 128-bit high word (integer AVG) */
                 double ssq = 0.0;
                 bool need_sq = c->partial_sumsq &&
-                    (op == OP_STDDEV || op == OP_STDDEV_POP ||
-                     op == OP_VAR || op == OP_VAR_POP);
-                if (contig && (t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP)) {
+                    agg_op_is_var(op);
+                if (need_sq) {
+                    /* about the slice's first value: the difference in
+                     * integer arithmetic (exact), its square in double */
+                    int64_t k = sg_slice_var_k(sl, av);
+                    double s1 = 0.0;   /* in double, as da_var_add */
+#define SG_VAR_ROW(V) do { int64_t v_ = (V); \
+                           double d_ = red_shift_diff(v_, k); s1 += d_; ssq += d_ * d_; } while (0)
+                    if (contig && (t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP)) {
+                        const int64_t* restrict x = (const int64_t*)p + r0;
+                        for (int64_t j = 0; j < n; j++) SG_VAR_ROW(x[j]);
+                    } else if (contig && (t == RAY_I32 || t == RAY_DATE || t == RAY_TIME)) {
+                        const int32_t* restrict x = (const int32_t*)p + r0;
+                        for (int64_t j = 0; j < n; j++) SG_VAR_ROW((int64_t)x[j]);
+                    } else {
+                        for (int64_t j = 0; j < n; j++)
+                            SG_VAR_ROW(read_col_i64(p, contig ? r0 + j : rows[j], t, at));
+                    }
+#undef SG_VAR_ROW
+                    c->partials[idx].f = s1;
+                    c->partial_sumsq[idx] = ssq;
+                    continue;
+                } else if (contig && (t == RAY_I64 || t == RAY_TIMESPAN || t == RAY_TIMESTAMP)) {
                     const int64_t* restrict x = (const int64_t*)p + r0;
                     if (c->partials_hi) {
                         /* exact 128-bit total, still a vectorized stream */
@@ -14611,9 +15260,7 @@ static bool sg_shape_eligible(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (aop == OP_COUNT) continue;    /* group size; input unused */
         bool pair = agg_is_binary_agg(aop);
         if (!pair &&
-            aop != OP_SUM && aop != OP_AVG &&
-            aop != OP_STDDEV && aop != OP_STDDEV_POP &&
-            aop != OP_VAR && aop != OP_VAR_POP)
+            aop != OP_SUM && aop != OP_AVG && !agg_op_is_var(aop))
             return false;
         ray_op_t* in = op_node(g, ext->agg_ins[a]);
         if (!in) return false;
@@ -14712,9 +15359,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     bool need_sumsq = false, need_pair = false, need_sum128 = false;
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t aop = ext->agg_ops[a];
-        if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
-            aop == OP_VAR || aop == OP_VAR_POP ||
-            agg_is_binary_agg(aop))
+        if (agg_op_is_var(aop) || agg_is_binary_agg(aop))
             need_sumsq = true;
         if (agg_is_binary_agg(aop))
             need_pair = true;
@@ -14874,7 +15519,8 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 size_t si = (size_t)ti * n_aggs + a;
                 bool pair = agg_is_binary_agg(ext->agg_ops[a]);
                 if (pair || prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
-                    (agg_vecs[a] && group_fp_type(agg_vecs[a]->type)))
+                    (agg_vecs[a] && group_fp_type(agg_vecs[a]->type)) ||
+                    (sumsq && agg_op_is_var(ext->agg_ops[a])))   /* a double (#1666) */
                     sums[di].f += partials[si].f;
                 else if (sums_hi)
                     ray_i128_add128(&sums_hi[di], (uint64_t*)&sums[di].i,
@@ -14950,10 +15596,30 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         return result;
     }
 
+    /* OP_VAR_K / OP_VAR_D read each slice's k (sg_slice_var_k) */
+    ray_t* sg_vk_hdr = NULL;
+    int64_t* sg_var_k = NULL;
+    for (uint32_t a = 0; a < n_aggs && !sg_var_k && K > 0; a++) {
+        if (ext->agg_ops[a] != OP_VAR_K && ext->agg_ops[a] != OP_VAR_D) continue;
+        sg_var_k = (int64_t*)scratch_calloc(&sg_vk_hdr, (size_t)K * n_aggs * sizeof(int64_t));
+        if (!sg_var_k) {
+            ray_release(result);
+            scratch_free(sum_hdr); scratch_free(cnt_hdr);
+            scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+            scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+            scratch_free(sum_hi_hdr);
+            return NULL;
+        }
+        for (int64_t gi = 0; gi < K; gi++)
+            for (uint32_t b = 0; b < n_aggs; b++)
+                if (agg_op_is_var(ext->agg_ops[b]) && agg_vecs[b])
+                    sg_var_k[(size_t)gi * n_aggs + b] = sg_slice_var_k(&slices[gi], agg_vecs[b]);
+    }
     emit_agg_columns(&result, g, ext, agg_vecs, (uint32_t)K, n_aggs,
                      (double*)sums, (int64_t*)sums, sums_hi,
                      NULL, NULL, NULL, NULL,
-                     counts, NULL, prod, sumsq, NULL, sum_y, sumsq_y, sumxy);
+                     counts, NULL, prod, sumsq, NULL, sum_y, sumsq_y, sumxy, sg_var_k);
+    scratch_free(sg_vk_hdr);
 
     scratch_free(sum_hdr); scratch_free(cnt_hdr);
     scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
@@ -16100,7 +16766,7 @@ dyn_dense_done:
                                      (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                                      NULL, NULL, NULL, NULL,
                                      dense_count, agg_affine, agg_prod, NULL, NULL,
-                                     NULL, NULL, NULL);
+                                     NULL, NULL, NULL, NULL);
 
                     scratch_free(_h_sum); scratch_free(_h_sum_hi); scratch_free(_h_cnt);
                     scratch_free(range_sum_hdr); scratch_free(range_hi_hdr); scratch_free(cnt_hdr);
@@ -17140,8 +17806,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             uint16_t aop = ext->agg_ops[a];
             if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST)
                 need_flags |= DA_NEED_SUM;
-            else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
-                { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
+            else if (agg_op_is_var(aop))
+                { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_VARK; }
             else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
             else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
             if (aop == OP_FIRST || aop == OP_LAST) has_first_last = true;
@@ -17167,8 +17833,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         const void**    sc_plain       = (const void**)(sc_srcs + vla_aggs);       /* staged only */
         const ray_str_t** sc_agg_str = (const ray_str_t**)(sc_plain + vla_aggs);
         int64_t  *sc_int_null_sentinel = (int64_t*)(sc_agg_str + vla_aggs);
-        int64_t  *sc_var_shift         = sc_int_null_sentinel + vla_aggs;
-        int8_t   *agg_types            = (int8_t*)(sc_var_shift + vla_aggs);
+        int8_t   *agg_types            = (int8_t*)(sc_int_null_sentinel + 2 * vla_aggs);
         /* Per-element flag, not a bitmask: this path's n_aggs is VLA-sized
          * with no fixed cap, so a fixed-width bitmask would silently alias
          * once n_aggs exceeded its bit width. */
@@ -17407,7 +18072,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                                          sums_f64, sums_i64, sums_hi,
                                          NULL, NULL, NULL, NULL,
                                          counts, agg_affine, agg_prod,
-                                         NULL, NULL, NULL, NULL, NULL);
+                                         NULL, NULL, NULL, NULL, NULL, NULL);
                         scalar_emit_vecs_free(sv_hdr, emit_vecs, agg_vecs, n_aggs);
                         scratch_free(sum_hdr);
                         scratch_free(cnt_hdr);
@@ -17497,13 +18162,15 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         const size_t sc_line = 128;
         size_t sc_words = 1;                                   /* count[1] */
         size_t sc_off_sum = 0, sc_off_hi = 0, sc_off_min = 0, sc_off_max = 0;
-        size_t sc_off_sq = 0, sc_off_nn = 0;
+        size_t sc_off_sq = 0, sc_off_nn = 0, sc_off_vk = 0, sc_off_vn = 0;
         if (need_flags & DA_NEED_SUM)   { sc_off_sum = sc_words; sc_words += n_aggs; }
         if (sc_need_sum128)             { sc_off_hi  = sc_words; sc_words += n_aggs; }
         if (need_flags & DA_NEED_MIN)   { sc_off_min = sc_words; sc_words += n_aggs; }
         if (need_flags & DA_NEED_MAX)   { sc_off_max = sc_words; sc_words += n_aggs; }
         if (need_flags & DA_NEED_SUMSQ) { sc_off_sq  = sc_words; sc_words += n_aggs; }
         if (sc_any_nullable)            { sc_off_nn  = sc_words; sc_words += n_aggs; }
+        if (need_flags & DA_NEED_VARK)  { sc_off_vk  = sc_words; sc_words += n_aggs;
+                                          sc_off_vn  = sc_words; sc_words += n_aggs; }
         size_t sc_bytes = ((sc_words * sizeof(int64_t)) + sc_line - 1) / sc_line * sc_line;
         ray_t* sc_hdr = NULL;
         /* After the per-chunk blocks: one pinned vocabulary per aggregate. */
@@ -17547,23 +18214,6 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     ray_sym_strings_borrow(&sc_sym_strings, &sc_sym_count);
             }
         }
-        /* Center each integer VAR/STDDEV input on its first non-null cell.  A
-         * staged input (read by range) keeps shift 0. */
-        for (uint32_t a = 0; a < n_aggs; a++) {
-            sc_var_shift[a] = 0;
-            uint16_t vop = ext->agg_ops[a];
-            if (!(vop == OP_VAR || vop == OP_VAR_POP || vop == OP_STDDEV || vop == OP_STDDEV_POP))
-                continue;
-            if (!agg_ptrs[a] || !agg_vecs[a] || agg_strlen[a] || group_fp_type(agg_types[a]))
-                continue;
-            int64_t lim = agg_vecs[a]->len < 4096 ? agg_vecs[a]->len : 4096;
-            for (int64_t r = 0; r < lim; r++) {
-                int64_t v = scalar_i64_at(agg_ptrs[a], agg_types[a], r);
-                if (sc_int_null_has[a] && v == sc_int_null_sentinel[a]) continue;
-                sc_var_shift[a] = v;
-                break;
-            }
-        }
 
         scalar_ctx_t sc_ctx = {
             .agg_ptrs   = agg_ptrs,
@@ -17585,7 +18235,6 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .rowsel     = rowsel,
             .agg_int_null_has = sc_int_null_has,
             .agg_int_null_sentinel = sc_int_null_sentinel,
-            .var_shift  = sc_var_shift,
             .row_base   = 0,
             .srcs       = sc_staged ? sc_srcs : NULL,
             .plain      = sc_staged ? sc_plain : NULL,
@@ -17601,6 +18250,8 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             .off_max    = sc_off_max,
             .off_sumsq  = sc_off_sq,
             .off_nn     = sc_off_nn,
+            .off_var_k  = sc_off_vk,
+            .off_var_n  = sc_off_vn,
             .n_scan     = n_scan,
             .chunk_rows = red_chunk_rows(n_scan),
         };
@@ -17695,6 +18346,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scalar_chunk_acc(&sc_ctx, 0, m);
         for (int64_t w = 1; w < sc_n; w++) {
             scalar_chunk_acc(&sc_ctx, w, wa);
+            da_var_merge_slots(m, wa, 0, 1, n_aggs, ext->agg_ops, agg_types);
             if (need_flags & DA_NEED_SUM) {
                 for (uint32_t a = 0; a < n_aggs; a++) {
                     uint16_t merge_op = ext->agg_ops[a];
@@ -17806,7 +18458,7 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                          (double*)m->min_val, (double*)m->max_val,
                          (int64_t*)m->min_val, (int64_t*)m->max_val,
                          m->count, agg_affine, agg_prod, m->sumsq_f64, sc_nn,
-                         NULL, NULL, NULL);
+                         NULL, NULL, NULL, m->var_k);
         scalar_emit_vecs_free(sv_hdr, emit_vecs, agg_vecs, n_aggs);
 
         /* Row-gathered min/max/first/last cannot be represented in
@@ -18212,8 +18864,8 @@ da_path:;
             for (uint32_t a = 0; a < n_aggs; a++) {
                 uint16_t aop = ext->agg_ops[a];
                 if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
-                else if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
-                    { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; }
+                else if (agg_op_is_var(aop))
+                    { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_VARK; }
                 else if (agg_is_binary_agg(aop))
                     { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_PAIR; }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
@@ -18348,6 +19000,7 @@ da_path:;
             if (need_flags & DA_NEED_MAX) arrays_per_agg += 1;
             if (need_flags & DA_NEED_SUMSQ) arrays_per_agg += 1;
             if (need_flags & DA_NEED_PAIR) arrays_per_agg += 3; /* sum_y+sumsq_y+sumxy */
+            if (need_flags & DA_NEED_VARK) arrays_per_agg += 2; /* var_k+var_n */
             /* Nullable aggs add a per-(group, agg) non-null count array.
              * ~8 bytes per (group, agg). */
             if (da_any_nullable) arrays_per_agg += 1;
@@ -18422,6 +19075,12 @@ da_path:;
                 if (need_flags & DA_NEED_SUMSQ) {
                     accums[w].sumsq_f64 = DA_ARR(double, &accums[w]._h_sumsq, total);
                     if (!accums[w].sumsq_f64) { alloc_ok = false; break; }
+                }
+                if (need_flags & DA_NEED_VARK) {
+                    /* var_k is read only where var_n says it was set */
+                    accums[w].var_k = DA_ARR(int64_t, &accums[w]._h_var_k, total);
+                    accums[w].var_n = DA_ARR(int64_t, &accums[w]._h_var_n, total);
+                    if (!accums[w].var_k || !accums[w].var_n) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_PAIR) {
                     accums[w].sum_y = DA_ARR(double, &accums[w]._h_sum_y, total);
@@ -18697,6 +19356,7 @@ da_path:;
             if (has_first_last) {
                 for (uint32_t w = 1; w < da_n_workers; w++) {
                     da_accum_t* wa = &accums[w];
+                    da_var_merge_slots(merged, wa, 0, n_slots, n_aggs, ext->agg_ops, agg_types);
                     if (need_flags & DA_NEED_SUMSQ) {
                         for (size_t i = 0; i < total; i++)
                             merged->sumsq_f64[i] += wa->sumsq_f64[i];
@@ -18718,7 +19378,7 @@ da_path:;
                             for (uint32_t a = 0; a < n_aggs; a++) {
                                 size_t idx = base + a;
                                 uint16_t aop = ext->agg_ops[a];
-                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP || agg_is_binary_agg(aop)) {
+                                if (aop == OP_SUM || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || agg_op_is_var(aop) || agg_is_binary_agg(aop)) {
                                     if (group_fp_type(agg_types[a]) || agg_is_binary_agg(aop)) merged->sum[idx].f += wa->sum[idx].f;
                                     else if (merged->sum_hi) ray_i128_add128(&merged->sum_hi[idx], (uint64_t*)&merged->sum[idx].i, wa->sum_hi[idx], (uint64_t)wa->sum[idx].i);
                                     else merged->sum[idx].i = wrap_add_i64(merged->sum[idx].i, wa->sum[idx].i);
@@ -18817,6 +19477,7 @@ da_path:;
                 /* Sequential merge for small slot counts */
                 for (uint32_t w = 1; w < da_n_workers; w++) {
                     da_accum_t* wa = &accums[w];
+                    da_var_merge_slots(merged, wa, 0, n_slots, n_aggs, ext->agg_ops, agg_types);
                     if (need_flags & DA_NEED_SUMSQ) {
                         for (size_t i = 0; i < total; i++)
                             merged->sumsq_f64[i] += wa->sumsq_f64[i];
@@ -18991,7 +19652,8 @@ da_path:;
             size_t dense_total = (size_t)grp_count * n_aggs;
             ray_t *_h_dsum = NULL, *_h_dmin = NULL, *_h_dmax = NULL;
             ray_t *_h_dsq = NULL, *_h_dcnt = NULL, *_h_dnn = NULL;
-            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL, *_h_dshi = NULL;
+            ray_t *_h_dsy = NULL, *_h_dsqy = NULL, *_h_dxy = NULL, *_h_dshi = NULL, *_h_dvk = NULL;
+            int64_t*  dense_var_k   = merged->var_k ? (int64_t*)scratch_alloc(&_h_dvk, dense_total * sizeof(int64_t)) : NULL;
             da_val_t* dense_sum     = da_sum     ? (da_val_t*)scratch_alloc(&_h_dsum, dense_total * sizeof(da_val_t)) : NULL;
             int64_t*  dense_sum_hi  = da_sum_hi  ? (int64_t*)scratch_alloc(&_h_dshi, dense_total * sizeof(int64_t)) : NULL;
             da_val_t* dense_min_val = da_min_val ? (da_val_t*)scratch_alloc(&_h_dmin, dense_total * sizeof(da_val_t)) : NULL;
@@ -19023,6 +19685,7 @@ da_path:;
                     if (dense_sum_y)   dense_sum_y[di]   = da_sum_y[si];
                     if (dense_sumsq_y) dense_sumsq_y[di] = da_sumsq_y[si];
                     if (dense_sumxy)   dense_sumxy[di]   = da_sumxy[si];
+                    if (dense_var_k)   dense_var_k[di]   = merged->var_k[si];
                     if (dense_nn_counts) {
                         /* An AVG(strlen) divides by its non-empty rows. */
                         int64_t nnv = da_nn_count ? da_nn_count[si] : da_count[s];
@@ -19039,14 +19702,14 @@ da_path:;
                              (double*)dense_min_val, (double*)dense_max_val,
                              (int64_t*)dense_min_val, (int64_t*)dense_max_val,
                              dense_counts, agg_affine, agg_prod, dense_sumsq,
-                             dense_nn_counts, dense_sum_y, dense_sumsq_y, dense_sumxy);
+                             dense_nn_counts, dense_sum_y, dense_sumsq_y, dense_sumxy, dense_var_k);
 
             scratch_free(_h_dsum); scratch_free(_h_dmin);
             scratch_free(_h_dmax);
             scratch_free(_h_dsq); scratch_free(_h_dcnt);
             scratch_free(_h_dnn);
             scratch_free(_h_dsy); scratch_free(_h_dsqy); scratch_free(_h_dxy);
-            scratch_free(_h_dshi);
+            scratch_free(_h_dshi); scratch_free(_h_dvk);
 
             da_accum_free(&accums[0]); scratch_free(accums_hdr);
             scalar_emit_vecs_free(da_ac_hdr, da_agg_cols, agg_vecs, n_aggs);
@@ -19515,7 +20178,7 @@ da_path:;
                                      (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                                      NULL, NULL, NULL, NULL,
                                      dense_count, agg_affine, agg_prod, NULL, NULL,
-                                     NULL, NULL, NULL);
+                                     NULL, NULL, NULL, NULL);
 
                     scratch_free(_h_sum); scratch_free(_h_sum_hi);
                     scratch_free(_h_cnt);
@@ -19799,7 +20462,7 @@ da_path:;
                              (double*)dense_sum, (int64_t*)dense_sum, dense_sum_hi,
                              NULL, NULL, NULL, NULL,
                              dense_count, agg_affine, agg_prod, NULL, NULL,
-                             NULL, NULL, NULL);
+                             NULL, NULL, NULL, NULL);
 
             scratch_free(_h_sum); scratch_free(_h_sum_hi);
             scratch_free(_h_cnt);
@@ -19921,7 +20584,7 @@ ht_path:;
         if (aop == OP_AVG && agg_vecs[a] && !group_fp_type(agg_vecs[a]->type) &&
             !agg_strlen[a] && group_avg_needs_hi(agg_vecs[a]->type, nrows))
             ght_need |= GHT_NEED_SUM128;
-        if (aop == OP_STDDEV || aop == OP_STDDEV_POP || aop == OP_VAR || aop == OP_VAR_POP)
+        if (agg_op_is_var(aop))
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ; }
         if (agg_is_binary_agg(aop))
             { ght_need |= GHT_NEED_SUM; ght_need |= GHT_NEED_SUMSQ;
@@ -20960,6 +21623,7 @@ v2_emit:;
                 case OP_AVG:
                 case OP_STDDEV: case OP_STDDEV_POP:
                 case OP_VAR: case OP_VAR_POP:
+                case OP_VAR_K: case OP_VAR_D:
                 case OP_PEARSON_CORR:
                 case OP_COV: case OP_SCOV:
                 case OP_WSUM: case OP_WAVG:
@@ -21296,6 +21960,8 @@ v2_emit:;
                     case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
                     case OP_VAR:        sfx = "_var";        slen = 4; break;
                     case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
+                    case OP_VAR_K:      sfx = "_var_k";      slen = 6; break;
+                    case OP_VAR_D:      sfx = "_var_d";      slen = 6; break;
                     case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
                     case OP_QUANTILE:   sfx = "_quantile";   slen = 9; break;
                     case OP_MODE:       sfx = "_mode";       slen = 5; break;
@@ -21594,6 +22260,7 @@ sequential_fallback:;
             case OP_AVG:
             case OP_STDDEV: case OP_STDDEV_POP:
             case OP_VAR: case OP_VAR_POP:
+            case OP_VAR_K: case OP_VAR_D:
             case OP_PEARSON_CORR:
             case OP_COV: case OP_SCOV:
             case OP_WSUM: case OP_WAVG:
@@ -21646,7 +22313,7 @@ sequential_fallback:;
             new_col->len = (int64_t)grp_count;
         }
 
-        int8_t s = ly->agg_val_slot[a]; /* unified accum slot */
+        int8_t s = ght_emit_slot(ly->agg_val_slot[a]); /* unified accum slot */
         /* Holistic agg (OP_MEDIAN / OP_TOP_N / OP_BOT_N) is already
          * filled — skip row-layout reads.  Naming + add_col below
          * still applies. */
@@ -21705,19 +22372,15 @@ sequential_fallback:;
                                    : (double)ROW_RD_I64(row, ly->off_sum, s);
                         break;
                     case OP_VAR: case OP_VAR_POP:
-                    case OP_STDDEV: case OP_STDDEV_POP: {
-                        bool insuf = (agg_op == OP_VAR || agg_op == OP_STDDEV) ? nn <= 1 : nn <= 0;
-                        if (insuf) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
-                        double sum_val = is_f64 ? ROW_RD_F64(row, ly->off_sum, s)
-                                                : (double)ROW_RD_I64(row, ly->off_sum, s);
-                        double sq_val = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
-                        double mean = sum_val / nn;
-                        double var_pop = sq_val / nn - mean * mean;
-                        if (var_pop < 0) var_pop = 0;
-                        if (agg_op == OP_VAR_POP) v = var_pop;
-                        else if (agg_op == OP_VAR) v = var_pop * nn / (nn - 1);
-                        else if (agg_op == OP_STDDEV_POP) v = sqrt(var_pop);
-                        else v = sqrt(var_pop * nn / (nn - 1));
+                    case OP_STDDEV: case OP_STDDEV_POP:
+                    case OP_VAR_K: case OP_VAR_D: {
+                        /* about the slot's k, sums in double for every type
+                         * (ght_var_add, #1666) */
+                        bool vnull;
+                        v = ray_var_final(agg_op, nn, ROW_RD_F64(row, ly->off_sum, s),
+                                          ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0,
+                                          is_f64, ly->off_var_k ? ROW_RD_I64(row, ly->off_var_k, s) : 0, &vnull);
+                        if (vnull) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); }
                         break;
                     }
                     case OP_PEARSON_CORR:
@@ -21826,6 +22489,8 @@ sequential_fallback:;
                 case OP_STDDEV_POP: nsfx = "_stddev_pop"; nslen = 11; break;
                 case OP_VAR:        nsfx = "_var";        nslen = 4; break;
                 case OP_VAR_POP:    nsfx = "_var_pop";    nslen = 8; break;
+                case OP_VAR_K:      nsfx = "_var_k";      nslen = 6; break;
+                case OP_VAR_D:      nsfx = "_var_d";      nslen = 6; break;
                 case OP_MEDIAN:     nsfx = "_median";     nslen = 7; break;
                 case OP_QUANTILE:   nsfx = "_quantile";   nslen = 9; break;
                 case OP_MODE:       nsfx = "_mode";       nslen = 5; break;
@@ -22486,6 +23151,90 @@ static bool pp_wide_avg_split(ray_t** partp, int64_t si, int64_t mi, int64_t ci,
     return ok;
 }
 
+/* The variance partials of a merge table, combined per group (#1666).  Each
+ * row is a partition's (or the running result's) state of one STDDEV/VAR
+ * column: its count n, K (a value of the group, as a double), D (the mean
+ * about K) and its population variance.  Rows fold in row order, grouped by
+ * the key columns as agg_group_keys groups them, by the Chan update
+ *   delta = (K_r + D_r) - (K + D)      (K_r - K first: values of the data)
+ *   D    += delta * n_r / (N + n_r)
+ *   M2   += n_r * var_r + delta^2 * N * n_r / (N + n_r)
+ * and every row of a group then holds the group's K, D and M2 / N, which
+ * the merge takes as FIRST (its count merges as a SUM).  A group with no
+ * value yet (n = 0 everywhere: absent, or all null) stays null.  Four
+ * doubles per group; false on a shape it cannot read (the caller bails to
+ * the concat path). */
+static bool pp_var_fold(ray_t* mt, uint32_t n_keys, uint32_t n_std, const uint8_t* k_slot,
+                        const uint8_t* d_slot, const uint8_t* vp_slot, const uint8_t* cnt_slot) {
+    int64_t nr = ray_table_nrows(mt);
+    if (nr <= 0) return true;
+    agg_groups_t gr = { 0 };
+    int64_t ng = 1;
+    if (n_keys) {
+        ray_t* kc_hdr = NULL;
+        ray_t** kc = (ray_t**)scratch_alloc(&kc_hdr, n_keys * sizeof(ray_t*));
+        if (!kc) return false;
+        for (uint32_t k = 0; k < n_keys; k++) {
+            kc[k] = ray_table_col_idx(mt, (int64_t)k);
+            if (!kc[k] || RAY_IS_ERR(kc[k])) { scratch_free(kc_hdr); return false; }
+        }
+        int rc = agg_group_keys(kc, n_keys, nr, &gr);
+        scratch_free(kc_hdr);
+        if (rc != 0) return false;
+        ng = gr.ngroups;
+    }
+    ray_t* st_hdr = NULL;
+    double* st = (double*)scratch_alloc(&st_hdr, (size_t)ng * 4 * sizeof(double));
+    bool ok = st != NULL;
+    for (uint32_t i = 0; ok && i < n_std; i++) {
+        ray_t* kv = ray_table_col_idx(mt, (int64_t)n_keys + k_slot[i]);
+        ray_t* dv = ray_table_col_idx(mt, (int64_t)n_keys + d_slot[i]);
+        ray_t* vv = ray_table_col_idx(mt, (int64_t)n_keys + vp_slot[i]);
+        ray_t* cv = ray_table_col_idx(mt, (int64_t)n_keys + cnt_slot[i]);
+        ray_t* cols[4] = { kv, dv, vv, cv };
+        for (int c = 0; c < 4; c++)
+            if (!cols[c] || RAY_IS_ERR(cols[c]) || cols[c]->len != nr ||
+                (cols[c]->attrs & RAY_ATTR_SLICE) || cols[c]->type != (c < 3 ? RAY_F64 : RAY_I64))
+                ok = false;
+        if (!ok) break;
+        double* K = (double*)ray_data(kv);
+        double* D = (double*)ray_data(dv);
+        double* V = (double*)ray_data(vv);
+        const int64_t* C = (const int64_t*)ray_data(cv);
+        memset(st, 0, (size_t)ng * 4 * sizeof(double));
+        for (int64_t r = 0; r < nr; r++) {
+            if (C[r] <= 0) continue;
+            double* x = st + 4 * (n_keys ? gr.gids[r] : 0);
+            double n = (double)C[r];
+            if (x[0] == 0) { x[0] = n; x[1] = K[r]; x[2] = D[r]; x[3] = V[r] * n; continue; }
+            double tot = x[0] + n;
+            /* the difference of the K first, held so that the release
+             * profile's -fassociative-math cannot regroup it into
+             * (K_r + D_r) - (K + D), which cancels at magnitude */
+            volatile double dk = K[r] - x[1];
+            double delta = dk + (D[r] - x[2]);
+            x[2] += delta * n / tot;
+            x[3] += V[r] * n + delta * delta * (x[0] * n / tot);
+            x[0] = tot;
+        }
+        for (int64_t r = 0; r < nr; r++) {
+            const double* x = st + 4 * (n_keys ? gr.gids[r] : 0);
+            if (x[0] == 0) {
+                K[r] = D[r] = V[r] = NULL_F64;
+                ray_vec_set_null(kv, r, true);
+                ray_vec_set_null(dv, r, true);
+                ray_vec_set_null(vv, r, true);
+                continue;
+            }
+            double vp = x[3] / x[0];
+            K[r] = x[1]; D[r] = x[2]; V[r] = vp < 0 ? 0 : vp;
+        }
+    }
+    scratch_free(st_hdr);
+    if (n_keys) agg_groups_free(&gr);
+    return ok;
+}
+
 /* --------------------------------------------------------------------------
  * exec_group_per_partition — per-partition GROUP BY with merge
  *
@@ -22495,8 +23244,11 @@ static bool pp_wide_avg_split(ray_t** partp, int64_t si, int64_t mi, int64_t ci,
  * Merge ops: SUM→SUM, COUNT→SUM, MIN→MIN, MAX→MAX, FIRST→FIRST, LAST→LAST.
  * AVG: decomposed into SUM+N per partition, merged, then divided, where N is
  *   the input's non-null count (a SUM of its not-null indicator).
- * STDDEV/VAR: decomposed into SUM(x)+SUM(x²)+N per partition,
- *   merged with SUM, then final variance/stddev computed from merged totals.
+ * STDDEV/VAR: each partition ships its variance state, OP_VAR_K (k, a value
+ *   of the group, as a double) + OP_VAR_D (the mean about it) + OP_VAR_POP +
+ *   N, and pp_var_fold combines the partials with the Chan update before the
+ *   merge takes them as FIRST (#1666): the same accuracy as one in-memory
+ *   group, at any magnitude, groups present in any subset of partitions.
  *
  * Pushed-down WHERE (g->selection set): the global selection covers the parted
  * table's concatenated row space in segment order.  It is flattened once to a
@@ -22545,8 +23297,9 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
         else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
                  aop == OP_VAR || aop == OP_VAR_POP) n_std++;
     }
-    /* + the first-row slot, + two hidden slots per wide AVG (pp_wide_avg_split) */
-    uint32_t part_n_aggs_max = n_aggs + 3 * n_avg + 2 * n_std + 1;
+    /* + the first-row slot, + two hidden slots per wide AVG (pp_wide_avg_split),
+     * + three per STDDEV/VAR (OP_VAR_D, its count, OP_VAR_POP) */
+    uint32_t part_n_aggs_max = n_aggs + 3 * n_avg + 3 * n_std + 1;
 
     size_t key_n = n_keys ? n_keys : 1;             /* min-1 guarded */
     size_t agg_n = n_aggs ? n_aggs : 1;
@@ -22579,11 +23332,12 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
     /* per-agg decomposition carves (sized n_aggs) */
     ray_t *avg_idx_hdr = NULL, *std_idx_hdr = NULL, *std_orig_op_hdr = NULL,
-          *std_sq_slot_hdr = NULL, *std_cnt_slot_hdr = NULL;
+          *std_sq_slot_hdr = NULL, *std_cnt_slot_hdr = NULL, *std_vp_slot_hdr = NULL;
     uint8_t*  avg_idx      = scratch_alloc(&avg_idx_hdr,      agg_n * sizeof(uint8_t));
     uint8_t*  std_idx      = scratch_alloc(&std_idx_hdr,      agg_n * sizeof(uint8_t));
     uint16_t* std_orig_op  = scratch_alloc(&std_orig_op_hdr,  agg_n * sizeof(uint16_t));
-    uint8_t*  std_sq_slot  = scratch_alloc(&std_sq_slot_hdr,  agg_n * sizeof(uint8_t));
+    uint8_t*  std_sq_slot  = scratch_alloc(&std_sq_slot_hdr,  agg_n * sizeof(uint8_t));   /* OP_VAR_D */
+    uint8_t*  std_vp_slot  = scratch_alloc(&std_vp_slot_hdr,  agg_n * sizeof(uint8_t));   /* OP_VAR_POP */
     uint8_t*  std_cnt_slot = scratch_alloc(&std_cnt_slot_hdr, agg_n * sizeof(uint8_t));
     ray_t* cnt_nn_hdr = NULL;   /* per count slot (AVG's, then STDDEV/VAR's): counts non-nulls */
     uint8_t*  cnt_nn       = scratch_alloc(&cnt_nn_hdr,       agg_n * sizeof(uint8_t));
@@ -22596,12 +23350,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
 
     /* decomposed per-partition/merge slot carves (sized part_n_aggs_max) */
     ray_t *part_ops_hdr = NULL, *merge_ops_hdr = NULL, *part_agg_syms_hdr = NULL,
-          *part_needs_sq_hdr = NULL, *agg_name_ids_hdr = NULL, *pagg_ins_hdr = NULL,
+          *agg_name_ids_hdr = NULL, *pagg_ins_hdr = NULL,
           *magg_ins_hdr = NULL, *unique_agg_hdr = NULL;
     uint16_t* part_ops      = scratch_alloc(&part_ops_hdr,      pna_n * sizeof(uint16_t));
     uint16_t* merge_ops     = scratch_alloc(&merge_ops_hdr,     pna_n * sizeof(uint16_t));
     int64_t*  part_agg_syms = scratch_alloc(&part_agg_syms_hdr, pna_n * sizeof(int64_t));
-    int*      part_needs_sq = scratch_alloc(&part_needs_sq_hdr, pna_n * sizeof(int));
     int64_t*  agg_name_ids  = scratch_alloc(&agg_name_ids_hdr,  pna_n * sizeof(int64_t));
     ray_op_t** pagg_ins     = scratch_alloc(&pagg_ins_hdr,      pna_n * sizeof(ray_op_t*));
     ray_op_t** magg_ins     = scratch_alloc(&magg_ins_hdr,      pna_n * sizeof(ray_op_t*));
@@ -22612,8 +23365,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                                         (key_n + pna_n) * sizeof(int64_t));
 
     if (!mc_sym_ids || !pk_syms || !pkeys || !mkeys || !avg_idx || !std_idx ||
-        !std_orig_op || !std_sq_slot || !std_cnt_slot || !cnt_nn || !wide_slot || !part_ops ||
-        !merge_ops || !part_agg_syms || !part_needs_sq || !agg_name_ids ||
+        !std_orig_op || !std_sq_slot || !std_vp_slot || !std_cnt_slot || !cnt_nn || !wide_slot || !part_ops ||
+        !merge_ops || !part_agg_syms || !agg_name_ids ||
         !pagg_ins || !magg_ins || !unique_agg || !mcol_names)
         goto pp_cleanup;
 
@@ -22707,7 +23460,8 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     }
 
     /* Decomposition: AVG(x) → SUM(x) + COUNT(x).
-     * STDDEV/VAR(x) → SUM(x) + SUM(x²) + COUNT(x).
+     * STDDEV/VAR(x) → VAR_K(x) + VAR_D(x) + COUNT(x) + VAR_POP(x), the
+     * partition's variance state (pp_var_fold merges it).
      * COUNT(x) here is the NON-NULL count (SUM skips null x, so the divisor
      * must too).  OP_COUNT is the group row count (nulls included), so it is
      * used only for a partition whose segment cannot hold nulls; otherwise
@@ -22727,17 +23481,17 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             avg_idx[n_avg++] = a;
         } else if (aop == OP_STDDEV || aop == OP_STDDEV_POP ||
                    aop == OP_VAR || aop == OP_VAR_POP) {
-            part_ops[a] = OP_SUM;     /* partition: compute SUM(x) */
+            part_ops[a] = OP_VAR_K;   /* partition: its k, as a double */
             std_orig_op[n_std] = aop;
             std_idx[n_std++] = a;
         } else {
             part_ops[a] = aop;
         }
     }
-    /* Append SUM(x²) for each STDDEV/VAR slot. */
+    /* Append VAR_D (the mean about k) for each STDDEV/VAR slot. */
     for (uint32_t i = 0; i < n_std; i++) {
         std_sq_slot[i] = part_n_aggs;
-        part_ops[part_n_aggs++] = OP_SUM;  /* SUM(x²) */
+        part_ops[part_n_aggs++] = OP_VAR_D;
     }
     /* Append the count of each AVG column, then of each STDDEV/VAR column.
      * OP_COUNT counts rows, nulls included, while SUM(x) and SUM(x²) skip
@@ -22757,6 +23511,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             : !pp_input_null_free(parted_tbl, agg_syms[a], n_parts);
         std_cnt_slot[i] = part_n_aggs;
         part_ops[part_n_aggs++] = cnt_nn[n_avg + i] ? OP_SUM : OP_COUNT;
+    }
+    /* and the population variance of each STDDEV/VAR column */
+    for (uint32_t i = 0; i < n_std; i++) {
+        std_vp_slot[i] = part_n_aggs;
+        part_ops[part_n_aggs++] = OP_VAR_POP;
     }
 
     /* First-row slot: an unordered `take: N` (group_limit > 0) keeps the
@@ -22854,20 +23613,21 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
     }
     for (uint32_t i = 0; i < n_avg; i++)
         if (wide_slot[i]) merge_ops[wide_slot[i]] = merge_ops[wide_hi[i]] = OP_SUM;
+    /* pp_var_fold writes each group's combined state to all its rows */
+    for (uint32_t i = 0; i < n_std; i++)
+        merge_ops[std_idx[i]] = merge_ops[std_sq_slot[i]] = merge_ops[std_vp_slot[i]] = OP_FIRST;
 
     /* Agg input syms for the decomposed ops.
      * AVG's COUNT uses same input column as the AVG itself.
      * STDDEV's SUM(x²) and COUNT use same input column as the STDDEV. */
-    /* part_agg_syms/part_needs_sq carved above (sized part_n_aggs_max).
-     * part_needs_sq flags slots that need an x*x graph node (for SUM(x²)). */
-    memset(part_needs_sq, 0, pna_n * sizeof(int));
+    /* part_agg_syms carved above (sized part_n_aggs_max). */
 
     for (uint32_t a = 0; a < n_aggs; a++)
         part_agg_syms[a] = agg_syms[a];
-    /* SUM(x²) slots for STDDEV/VAR */
+    /* VAR_D and VAR_POP slots for STDDEV/VAR: the same input */
     for (uint32_t i = 0; i < n_std; i++) {
         part_agg_syms[std_sq_slot[i]] = agg_syms[std_idx[i]];
-        part_needs_sq[std_sq_slot[i]] = 1;
+        part_agg_syms[std_vp_slot[i]] = agg_syms[std_idx[i]];
     }
     /* COUNT slots for AVG */
     for (uint32_t i = 0; i < n_avg; i++)
@@ -23175,16 +23935,6 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             /* strlen is null exactly when its STR/SYM source is null.
              * The auxiliary count scans that source directly: its null
              * predicate can run by range without decoding a strlen vector. */
-            for (uint32_t j = 0; j < n_std; j++) {
-                uint8_t sq = std_sq_slot[j];
-                ray_op_t* x = pagg_ins[sq];
-                /* STDDEV/VAR is inherently F64 (mean, sqrt).  Cast input to
-                 * F64 before squaring so SUM(x²) is F64 across partitions —
-                 * readout below assumes F64 sumsq.  Also avoids I64 overflow
-                 * for large x (matters near INT_MAX). */
-                ray_op_t* xf = (x->out_type == RAY_F64) ? x : ray_cast(pg, x, RAY_F64);
-                pagg_ins[sq] = ray_mul(pg, xf, xf);
-            }
             /* SUM over TIME emits TIME (4 bytes) on both engines, while the
              * readout below takes every non-F64 sum partial as I64 (and a
              * clock-value sum overflows 32 bits within a few thousand rows):
@@ -23197,6 +23947,10 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
                     if (!pagg_ins[a]) { ray_graph_free(pg); pp_release_sub(g, sub); goto batch_fail; }
                 }
             }
+            /* A STDDEV/VAR column's VAR_K, VAR_D and VAR_POP read one input
+             * node: one accumulation, so VAR_D is about VAR_K's k. */
+            for (uint32_t j = 0; j < n_std; j++)
+                pagg_ins[std_sq_slot[j]] = pagg_ins[std_vp_slot[j]] = pagg_ins[std_idx[j]];
             /* The non-null count slots of nullable inputs (AVG's, then
              * STDDEV/VAR's): SUM of the input's not-null indicator as I64. */
             for (uint32_t j = 0; j < n_avg + n_std; j++) {
@@ -23553,6 +24307,11 @@ exec_group_per_partition(ray_graph_t* g, ray_t* parted_tbl, ray_op_ext_t* ext,
             bp[i] = NULL;
         }
 
+        /* The variance partials, combined per group (pp_var_fold) */
+        if (n_std && !pp_var_fold(merge_tbl, n_keys, n_std, std_idx, std_sq_slot,
+                                  std_vp_slot, std_cnt_slot))
+            goto batch_fail;
+
         /* Pass 3: merge GROUP BY */
         ray_graph_t* mg = ray_graph_new(merge_tbl);
         if (!mg) goto batch_fail;
@@ -23765,34 +24524,29 @@ batch_fail:
                 trimmed = ray_table_add_col(trimmed, nm, avg_col);
                 ray_release(avg_col);
             } else if (is_std_slot) {
-                /* STDDEV/VAR from merged SUM(x), SUM(x²), COUNT(x):
-                 * var_pop = SUM_SQ/N - (SUM/N)²
-                 * var_samp = var_pop * N/(N-1)
-                 * stddev_pop = sqrt(var_pop), stddev_samp = sqrt(var_samp) */
-                int64_t sum_ci = c;
-                int64_t sq_ci  = (int64_t)n_keys + std_sq_slot[std_i];
+                /* STDDEV/VAR from the merged state (pp_var_fold): the
+                 * population variance and the non-null count
+                 *   var_samp = var_pop * N/(N-1)
+                 *   stddev_pop = sqrt(var_pop), stddev_samp = sqrt(var_samp) */
+                int64_t vp_ci  = (int64_t)n_keys + std_vp_slot[std_i];
                 int64_t cnt_ci = (int64_t)n_keys + std_cnt_slot[std_i];
-                ray_t* sum_col = ray_table_col_idx(result, sum_ci);
-                ray_t* sq_col  = (sq_ci < rncols) ? ray_table_col_idx(result, sq_ci) : NULL;
+                ray_t* vp_col  = (vp_ci < rncols) ? ray_table_col_idx(result, vp_ci) : NULL;
                 ray_t* cnt_col = (cnt_ci < rncols) ? ray_table_col_idx(result, cnt_ci) : NULL;
-                ray_t* rd[3] = { sum_col, sq_col, cnt_col };
-                ray_t* rd_err = group_first_err(rd, 3);
+                ray_t* rd[2] = { vp_col, cnt_col };
+                ray_t* rd_err = group_first_err(rd, 2);
                 if (rd_err) {
                     ray_release(trimmed); ray_release(result);
                     if (merge_tbl) ray_release(merge_tbl);
                     ret = rd_err;
                     goto pp_cleanup;
                 }
-                if (!sum_col || !sq_col || !cnt_col) {
-                    if (sum_col) {
-                        ray_retain(sum_col);
-                        trimmed = ray_table_add_col(trimmed, nm, sum_col);
-                        ray_release(sum_col);
-                    }
-                    continue;
+                if (!vp_col || !cnt_col || vp_col->type != RAY_F64 || cnt_col->type != RAY_I64) {
+                    ray_release(trimmed); ray_release(result);
+                    if (merge_tbl) ray_release(merge_tbl);
+                    goto pp_cleanup;
                 }
 
-                int64_t nrows = sum_col->len;
+                int64_t nrows = vp_col->len;
                 ray_t* out_col = ray_vec_new(RAY_F64, nrows);
                 if (!out_col || RAY_IS_ERR(out_col)) {
                     ray_release(trimmed); ray_release(result);
@@ -23803,40 +24557,17 @@ batch_fail:
                 double* out = (double*)ray_data(out_col);
 
                 uint16_t orig_op = std_orig_op[std_i];
-                /* SUM(x) is always F64 after merge (SUM produces F64 for F64 input,
-                 * I64 for integer input; SUM(x²) via ray_mul always produces F64). */
-                const double* sq = (const double*)ray_data(sq_col);
+                const double* vpv = (const double*)ray_data(vp_col);
                 const int64_t* cv = (const int64_t*)ray_data(cnt_col);
-                if (sum_col->type == RAY_F64) {
-                    const double* sv = (const double*)ray_data(sum_col);
-                    for (int64_t r = 0; r < nrows; r++) {
-                        double n = (double)cv[r];
-                        if (n <= 0) { out[r] = NULL_F64; ray_vec_set_null(out_col, r, true); continue; }
-                        double mean = sv[r] / n;
-                        double var_pop = sq[r] / n - mean * mean;
-                        if (var_pop < 0) var_pop = 0;
-                        bool insuf = (orig_op == OP_VAR || orig_op == OP_STDDEV) && n <= 1;
-                        if (insuf) { out[r] = NULL_F64; ray_vec_set_null(out_col, r, true); continue; }
-                        if (orig_op == OP_VAR_POP)         out[r] = ray_f64_fin(var_pop);
-                        else if (orig_op == OP_VAR)         out[r] = ray_f64_fin(var_pop * n / (n - 1));
-                        else if (orig_op == OP_STDDEV_POP)  out[r] = ray_f64_fin(sqrt(var_pop));
-                        else /* OP_STDDEV */                out[r] = ray_f64_fin(sqrt(var_pop * n / (n - 1)));
-                    }
-                } else {
-                    const int64_t* sv = (const int64_t*)ray_data(sum_col);
-                    for (int64_t r = 0; r < nrows; r++) {
-                        double n = (double)cv[r];
-                        if (n <= 0) { out[r] = NULL_F64; ray_vec_set_null(out_col, r, true); continue; }
-                        double mean = (double)sv[r] / n;
-                        double var_pop = sq[r] / n - mean * mean;
-                        if (var_pop < 0) var_pop = 0;
-                        bool insuf = (orig_op == OP_VAR || orig_op == OP_STDDEV) && n <= 1;
-                        if (insuf) { out[r] = NULL_F64; ray_vec_set_null(out_col, r, true); continue; }
-                        if (orig_op == OP_VAR_POP)         out[r] = ray_f64_fin(var_pop);
-                        else if (orig_op == OP_VAR)         out[r] = ray_f64_fin(var_pop * n / (n - 1));
-                        else if (orig_op == OP_STDDEV_POP)  out[r] = ray_f64_fin(sqrt(var_pop));
-                        else /* OP_STDDEV */                out[r] = ray_f64_fin(sqrt(var_pop * n / (n - 1)));
-                    }
+                for (int64_t r = 0; r < nrows; r++) {
+                    double n = (double)cv[r];
+                    bool insuf = (orig_op == OP_VAR || orig_op == OP_STDDEV) ? n <= 1 : n <= 0;
+                    if (insuf) { out[r] = NULL_F64; ray_vec_set_null(out_col, r, true); continue; }
+                    double var_pop = vpv[r];
+                    if (orig_op == OP_VAR_POP)         out[r] = ray_f64_fin(var_pop);
+                    else if (orig_op == OP_VAR)         out[r] = ray_f64_fin(var_pop * n / (n - 1));
+                    else if (orig_op == OP_STDDEV_POP)  out[r] = ray_f64_fin(sqrt(var_pop));
+                    else /* OP_STDDEV */                out[r] = ray_f64_fin(sqrt(var_pop * n / (n - 1)));
                 }
                 /* Single-null float model: flip HAS_NULLS for any var/stddev
                  * canonicalized to NULL_F64 (overflow). */
@@ -23900,13 +24631,13 @@ pp_cleanup:
     scratch_free(std_idx_hdr);
     scratch_free(std_orig_op_hdr);
     scratch_free(std_sq_slot_hdr);
+    scratch_free(std_vp_slot_hdr);
     scratch_free(std_cnt_slot_hdr);
     scratch_free(cnt_nn_hdr);
     scratch_free(wide_slot_hdr);
     scratch_free(part_ops_hdr);
     scratch_free(merge_ops_hdr);
     scratch_free(part_agg_syms_hdr);
-    scratch_free(part_needs_sq_hdr);
     scratch_free(agg_name_ids_hdr);
     scratch_free(pagg_ins_hdr);
     scratch_free(magg_ins_hdr);

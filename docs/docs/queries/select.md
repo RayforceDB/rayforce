@@ -191,6 +191,19 @@ the whole table (see [running functions](#running-functions-under-where)):
 `(sums (rank v))` by `k` takes each group's rows of the running sum of the
 whole table's ranks, not the running sum of each group's ranks.
 
+Without `by:` the verb also reads the whole column when it sits under a call
+(`(+ 1 (reverse v))`) or is the last form of a `do`, as it does in `update` and
+under `by:`. A helper the planner does not inline (one whose body has more than
+one statement, `(fn [x] (let y 1) (reverse x))`) is different: in a `select`
+projection without `by:` it is called once per row, so a whole-column verb in
+its body sees one cell. `reverse`, `asc` and `desc` then return the column as
+it was, and `distinct`, `where`, `iasc`, `idesc` and `rank` raise `type`;
+`update` and `by:` read the whole column. Call the verb in the projection
+itself, or in a helper whose body is that one expression, which the planner
+inlines ([#1654](https://github.com/RayforceDB/rayforce/issues/1654); whether
+such a helper sees a row or the whole column is open with
+[#1650](https://github.com/RayforceDB/rayforce/issues/1650)).
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its

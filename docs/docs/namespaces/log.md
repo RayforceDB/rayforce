@@ -1,11 +1,11 @@
 # `.log.*` — write-ahead log
 
-A binary append-only journal of serialised Rayfall expressions. The runtime keeps one journal open at a time. While open, every IPC mutation (and any value explicitly handed to `.log.write`) is appended; `replay` deserialises and re-evaluates each entry to reconstruct state. Files use the same 16-byte IPC header + serialized-payload frames as `.ipc.send`, with optional delta+RLE compression on large entries — the journal is interoperable with the wire format.
+A binary append-only journal of serialised Rayfall expressions. The runtime keeps one journal open at a time. While open, every inbound sync IPC request (`.ipc.send`) is appended before it is evaluated, as is any value explicitly handed to `.log.write`; async requests (`.ipc.post`) are appended too only when the [posts switch](#log-posts) is on; `replay` deserialises and re-evaluates each entry to reconstruct state. Files use the same 16-byte IPC header + serialized-payload frames as `.ipc.send`, with optional delta+RLE compression on large entries — the journal is interoperable with the wire format.
 
 The journal is intentionally minimal: there's no per-entry timestamp or transaction grouping at the journal layer. Snapshot + replay is the only recovery model.
 
 !!! note "Restricted under `-U`"
-    `.log.open`, `.log.write`, `.log.replay`, `.log.replay_report`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.sync`, `.log.validate`, `.log.status`) are unrestricted. Replay executes journal expressions; the reporting variant is **not** a read-only status getter.
+    `.log.open`, `.log.write`, `.log.posts`, `.log.replay`, `.log.replay_report`, `.log.roll`, `.log.snapshot`, `.log.close`, `.log.purge` are `RAY_FN_RESTRICTED`. The introspection / I/O-only entries (`.log.sync`, `.log.validate`, `.log.status`) are unrestricted. Replay executes journal expressions; the reporting variant is **not** a read-only status getter.
 
 ## Reference
 
@@ -14,6 +14,7 @@ The journal is intentionally minimal: there's no per-entry timestamp or transact
 | [`.log.open`](#log-open) | variadic | restricted | Open a journal in async or sync mode. |
 | [`.log.status`](#log-status) | variadic | — | Report the journal state as a dict. |
 | [`.log.write`](#log-write) | unary | restricted | Append a serialised expression to the open journal. |
+| [`.log.posts`](#log-posts) | variadic | restricted | Read or set whether async requests are journaled too (off by default). |
 | [`.log.sync`](#log-sync) | nullary | — | `fsync` the journal. |
 | [`.log.snapshot`](#log-snapshot) | nullary | restricted | Write a snapshot of current state and roll to a fresh segment. |
 | [`.log.roll`](#log-roll) | nullary | restricted | Close the active segment and start a new one. |
@@ -43,7 +44,7 @@ Errors: `rank` (arity != 2), `type` (mode not a sym / base not a string), `domai
 (.log.close)
 ```
 
-The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup and, unlike the bare verb, additionally load the latest snapshot and replay the log first — a full crash-recovery, then open-for-append.
+The server CLI flags `-l` (async) and `-L` (sync) open the journal at startup and, unlike the bare verb, additionally load the latest snapshot and replay the log first — a full crash-recovery, then open-for-append. `--log-posts 1` beside them also journals async requests; see [`.log.posts`](#log-posts).
 
 ## `.log.status` { #log-status }
 
@@ -57,8 +58,9 @@ Signature: `(.log.status)`. Returns a dict describing the journal; read-only, an
 | `mode` | sym, or null | `'sync` or `'async` of that journal; null if there was none |
 | `bytes` | i64, or null | size of the active log in bytes; `0` when `open` is false, null if the size could not be read |
 | `auto` | bool | the current evaluation runs inside an auto-journaled IPC request (same value as [`.ipc.auto_journal_eval`](#log-write)) |
+| `posts` | bool | async IPC requests are journaled too: the [posts switch](#log-posts), set by `--log-posts` or `.log.posts`; false by default |
 
-`path` and `mode` are committed only when an open succeeds. A failed `.log.open` therefore never reports an identity (`opened_ok` stays false, `path` and `mode` stay null) and never replaces the remembered one. They keep the values of the last successful journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, sync requests are no longer journaled, and `.log.sync` still returns null; `open` is false while `opened_ok` is true. An embedder that must not run unjournaled can check it and stop:
+`path` and `mode` are committed only when an open succeeds. A failed `.log.open` therefore never reports an identity (`opened_ok` stays false, `path` and `mode` stay null) and never replaces the remembered one. They keep the values of the last successful journal after `.log.close`, and after a `.log.roll` that failed once the old file was closed (for example the new log could not be created: disk full, out of file descriptors). In that second case the process has no journal handle, requests are no longer journaled, and `.log.sync` still returns null; `open` is false while `opened_ok` is true. An embedder that must not run unjournaled can check it and stop:
 
 ```lisp
 (if (get (.log.status) 'open) null (exit 1))
@@ -68,10 +70,10 @@ The getter only reports. Whether a request is acknowledged while the journal is 
 
 ```lisp
 (.log.status)
-;; {open:false opened_ok:false path:null mode:null bytes:0 auto:false}
+;; {open:false opened_ok:false path:null mode:null bytes:0 auto:false posts:false}
 (.log.open 'async "/tmp/rayforce-journal")
 (.log.status)
-;; {open:true opened_ok:true path:"/tmp/rayforce-journal.log" mode:async bytes:16 auto:false}
+;; {open:true opened_ok:true path:"/tmp/rayforce-journal.log" mode:async bytes:16 auto:false posts:false}
 (.log.close)
 ```
 
@@ -79,9 +81,9 @@ The getter only reports. Whether a request is acknowledged while the journal is 
 
 Signature: `(.log.write expr)`. Serialises `expr` and appends a frame to the open journal.
 
-Errors: `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
+Errors: `limit` (`expr` nested deeper than 512 levels, or one that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output: a frame writes it out in full), `noopen` (no journal active — surfaced explicitly so callers don't believe a no-op succeeded), `type` (no arg), `domain` (`expr` has zero serialised size, or the call runs inside an auto-journaled IPC request), `oom`, `io`. Lazy values are forced before serialisation.
 
-Inside an auto-journaled IPC request the request itself is the journal entry and is re-evaluated on replay, so an extra frame would apply the change twice. Code shared between journaled request handlers and other paths tests `(.ipc.auto_journal_eval)` and skips its own write there:
+Every inbound sync request is auto-journaled, and so is every async request while the [posts switch](#log-posts) is on; `.log.write` raises `domain` inside any of them. With the switch off, the default, an async request is not journaled and `.log.write` works inside it. Inside an auto-journaled IPC request the request itself is the journal entry and is re-evaluated on replay, so an extra frame would apply the change twice. Code shared between journaled request handlers and other paths tests `(.ipc.auto_journal_eval)` and skips its own write there:
 
 ```lisp
 (if (.ipc.auto_journal_eval) null (.log.write expr))
@@ -94,6 +96,30 @@ Inside an auto-journaled IPC request the request itself is the journal entry and
 (.log.close)
 ```
 
+## `.log.posts` { #log-posts }
+
+Signature: `(.log.posts [flag])`. Reads or sets the posts switch, which decides whether an open journal records async IPC requests (`.ipc.post`) as well as sync ones. With no argument it returns the current state; `0` turns it off and any other `i64` turns it on. Returns the state in effect as `i64` (`0` or `1`). The server flag `--log-posts N` sets it at startup (`N` other than `0` turns it on). It is **off by default**, and [`.log.status`](#log-status) reports it as `posts`. Restricted under `-U`.
+
+Errors: `type` (`flag` not an `i64`), `domain` (more than one argument).
+
+```lisp
+(.log.posts)      ;; => 0  (off: the default)
+(.log.posts 1)    ;; => 1  (async requests are journaled from now on)
+(.log.posts 0)    ;; => 0
+```
+
+The switch belongs to the process, not to a journal: opening, closing, rolling or purging a journal leaves it as it is. Replay does not change it either: while a log replays, `.log.posts` only reads the switch, so a journaled `(.log.posts 1)` or `(.log.posts 0)` has no effect on recovery. `--log-posts` is applied after the `-l`/`-L` startup replay, so the server runs with what the flag says; without the flag the switch stays off.
+
+**Off** (the default), the journal holds the sync requests and the `.log.write` entries, as it always has. An async request is evaluated without being journaled, so its effects are lost on recovery, and `.log.write` inside it appends an entry of its own.
+
+**On**, each async request is written once, before it is evaluated, as a request frame like a sync one. The log keeps the requests from every connection in the order the server ran them, and replay evaluates an async request the way it evaluates a sync one (see [`.log.replay`](#log-replay)): the same argument marking, a request refused live (`-U`, a parse error) refused again, and no hook run. Replay does not read the switch: a journal that holds async requests replays them whatever the switch is set to. A journal written with the switch off, or by an earlier build, has none and replays as before. Turn the switch on only after checking each of the following.
+
+- **Cost.** Each post becomes a journal write. On x86 with an NVMe disk, 20,000 small posts took 74–160 ms on a server with `-l` and the switch off, and 96–188 ms with it on: about 760 instructions and one `write` system call per post. Under `-L` every write is `fsync`'d, so every post is: 2,000 posts took 13–20 ms with the switch off and 10.1–10.6 s with it on, about 5 ms a post. The server is single-threaded, so this caps an `-L` server at about 200 posts a second. On macOS `fsync` does not force the data to the device, so a timing taken there understates the cost by about 200×.
+- **Hooks are not replayed.** An installed `.ipc.on.async` hook is not run on replay, as `.ipc.on.sync` is not: the journaled message is evaluated as if no hook were installed. A hook that filters, counts or rewrites the messages it receives, instead of only evaluating them, rebuilds a different state on replay.
+- **Handlers must exist at replay time.** A post such as `(upd x)` calls `upd` again on replay. The `-l`/`-L` startup replay runs before the startup script, so a function the script defines does not exist yet and each such entry fails with `name`. Keep the handlers in the snapshot ([`.log.snapshot`](#log-snapshot) saves every global binding), or define them first and replay with `.log.replay`.
+- **Subscribers.** A process that has a journal open and receives posts from a peer, such as a subscriber fed by its publisher, journals every message pushed to it. The log grows with each tick until a `.log.snapshot` or `.log.roll`, each tick is an `fsync` under `-L`, and in the usual setup, where the script defines `upd` and replay runs before the script, every tick fails on replay with `name`. A subscriber usually rebuilds from its publisher instead, and leaves the switch off.
+- **`.log.write`** inside an async request raises `domain` while the switch is on, because the request is already the entry (see [`.log.write`](#log-write)). Use `(if (.ipc.auto_journal_eval) null (.log.write expr))` in code that runs both ways.
+
 ## `.log.sync` { #log-sync }
 
 Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null. No-op when no journal is open (the underlying call returns `RAY_OK`).
@@ -101,6 +127,16 @@ Signature: `(.log.sync)`. Forces an `fsync` on the active segment. Returns null.
 ## `.log.snapshot` { #log-snapshot }
 
 Signature: `(.log.snapshot)`. Writes a snapshot of current state (env globals serialised into a special frame) and rolls to a new segment. Snapshots let `replay` start from a recent state and only re-apply entries written after.
+
+A process-local handle has no saved form: a graph from [`.graph.build`](graph.md#graph-build), a vector index from [`.emb.hnsw.build`](emb.md#emb-hnsw-build), an embedding model from [`.emb.model.get`](emb.md#emb-model-get) and a Datalog program from `dl-program` each point into the running process. The snapshot leaves out every global that holds one, alone or anywhere inside a list, dict or table, and prints one line per name on stderr:
+
+```
+log: WARN  snapshot skips 'G': it holds a process-local handle (graph, vector index, embedding model or Datalog program)
+```
+
+The other globals are saved and the log rolls as usual. After a restart the skipped names are unbound, so rebuild them from saved data (for example in the boot script) before using them. Outside the snapshot nothing changes: a direct `(ser G)` fails with `domain`, and an IPC reply that holds a handle reaches the client as a `type` error ("result of type i64 is not serializable over IPC").
+
+The snapshot is the server's own data and writes every kept global in full: a value bound under several names is saved once per name, whatever its size, outside the [budget of repeated output](../data-types/collections.md#values-that-repeat-their-parts) that `ser` and `.log.write` keep. A global the serializer cannot write (one nested deeper than 512 levels) fails the snapshot with that error's own code and message, `limit` for the depth; nothing is written and the log does not roll.
 
 A lambda marked with [`.sys.trust`](sys.md#sys-trust) keeps its mark in the snapshot, and `-l`/`-L` recovery restores it before replaying the log. Replay lifts a restricted (`-U`) request's trusted calls only as they ran live:
 
@@ -143,7 +179,7 @@ Signature: `(.log.replay "path")`. Reads each frame in the file, deserialises th
 
 This legacy integer result is unchanged. Use [`.log.replay_report`](#log-replay-report) **instead of** `.log.replay` when the caller needs the evaluation-error count; the reporting verb performs its own replay, not an inspection of a previous call. Neither verb rolls back an entry's partial effects or an already-applied prefix. After an error, retry only from an appropriate known state rather than blindly applying the same log again.
 
-A frame an IPC request wrote is evaluated directly, with the same argument marking the live request had: each argument list whose head does not resolve, or names a global that is not a function, is data. So `(upd (a 1 "s"))` with `a` bound to `42` passes the list `(a 1 "s")` to `upd` on replay, as it did live. A head naming a function is called, live and on replay. An installed `.ipc.on.sync` hook is **not** run on replay: the journaled message is evaluated as if no hook were installed, so a hook's own side effects are not replayed, and a hook that does more than evaluate its message rebuilds a different state. An entry written by `.log.write` is evaluated as written. The `-l`/`-L` startup replay works the same way.
+A frame an IPC request wrote is evaluated directly, with the same argument marking the live request had: each argument list whose head does not resolve, or names a global that is not a function, is data. So `(upd (a 1 "s"))` with `a` bound to `42` passes the list `(a 1 "s")` to `upd` on replay, as it did live. A head naming a function is called, live and on replay. An async request posted with `.ipc.post`, journaled when the [posts switch](#log-posts) was on, replays the same way. An installed `.ipc.on.sync` or `.ipc.on.async` hook is **not** run on replay: the journaled message is evaluated as if no hook were installed, so a hook's own side effects are not replayed, and a hook that does more than evaluate its message rebuilds a different state. A request the live server refused is refused again on replay: one that arrived on a `-U` restricted connection is replayed restricted, and one that failed to parse fails again and counts as an evaluation error. An entry written by `.log.write` is evaluated as written. The `-l`/`-L` startup replay works the same way.
 
 !!! note "A journal written by an earlier build now recovers to the live state"
     The journal format did not change, but earlier builds replayed a request without the argument marking: a data list whose head named a bound global was called during replay. A journal written by an older build therefore recovers to a different state with this build, the state the live server had. With `a` bound to `42` and `upd` appending its argument to `state`, the requests `(upd (zz 1 2))`, `(upd (a 1 "s"))` and `(upd (in 1 2))` left the live `state` at `((zz 1 2) (a 1 "s") false)`. An older build replays them to `(false)`, raising `name` and `type` on the first two, and this build replays them to the live state. A server already recovered with an older build holds the older result until it is recovered again.

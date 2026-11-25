@@ -132,6 +132,22 @@
  * its owning atom is released; users may call (dl-free h) for early release. */
 #define RAY_ATTR_DLPROG       0x20
 
+/* The attrs that mark an I64 atom as a process-local handle (a graph, a
+ * vector index, an embedding model or a Datalog program): its .i64 slot is
+ * a pointer into this process.  Such an atom has no wire form and must
+ * never be copied into a plain I64 cell, where it would read as an
+ * ordinary integer.
+ *
+ * This mask is the one list of handle kinds.  A new kind of handle is
+ * added here and nowhere else: the serializer, the journal snapshot, the
+ * table builder, the vector builders and the query planner all test this
+ * mask (or ray_is_handle_atom), never the bits one by one. */
+#define RAY_HANDLE_ATTRS (RAY_ATTR_GRAPH | RAY_ATTR_HNSW | RAY_ATTR_EMBMODEL | RAY_ATTR_DLPROG)
+
+static inline bool ray_is_handle_atom(const ray_t* x) {
+    return x && x->type == -RAY_I64 && (x->attrs & RAY_HANDLE_ATTRS);
+}
+
 /* Vector is a linked column.  The 8 bytes of the aux union at offset
  * 8 (i.e. parent->_idx_pad / parent->slice_offset / parent->str_pool
  * slot, depending on which arm is in use) hold an int64

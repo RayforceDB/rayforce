@@ -20,6 +20,7 @@ Indexes are dropped automatically when the column is mutated (`alter set`, `upda
 | [`.idx.drop`](#idx-drop) | unary | — | Detach whatever index the vector carries. |
 | [`.idx.has?`](#idx-has-p) | unary | — | True if the vector carries any index. |
 | [`.idx.info`](#idx-info) | variadic | — | Dict describing the attached index, or a table column's format. |
+| [`.idx.uses`](#idx-uses) | unary | — | How many times each column's index answered a query since the last call. |
 
 ## `.idx.zone` { #idx-zone }
 
@@ -94,3 +95,19 @@ Signature: `(.idx.info table 'col)`. Describes a table column's on-disk format w
 
 - [Indexes Overview](../queries/indexes-overview.md) — when each kind helps and the query patterns it accelerates.
 - [Accelerator Indexes](../queries/indexes.md) — query examples showing index-aware execution.
+
+## `.idx.uses` { #idx-uses }
+
+Signature: `(.idx.uses t)`. Returns a dict from column name to the number of times an index on that column answered a query since the previous call, and resets the counts. Columns whose index was not used are left out, so the result is `{}` when nothing was used. `t` must be a table; anything else raises `type`.
+
+Counting is off until `.idx.uses` has been called once in the process, so the first call arms it and always returns `{}`. Use it to check that a workload really reaches the indexes you built, rather than assuming it does.
+
+```lisp
+(set t (table [a b] (list (.idx.hash (til 100000)) (til 100000))))
+(.idx.uses t)                         ;; => {}      first call arms the counter
+(select {from: t where: (== a 4242)})
+(.idx.uses t)                         ;; => {a:1}   the hash index answered the filter
+(.idx.uses t)                         ;; => {}      reading reset the counts
+```
+
+An index counts when a filter, `in`, `find`, sort, join or similar operation consults it and gets its answer from it.

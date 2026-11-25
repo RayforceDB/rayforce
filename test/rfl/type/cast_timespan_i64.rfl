@@ -1,0 +1,30 @@
+;; #1634: a vector cast between I64 and TIMESPAN (and a TIMESPAN to itself)
+;; is a copy of the 8-byte values with the nulls carried over, done on the
+;; whole-vector fast path like I64 <-> TIMESTAMP, not one boxed atom per row.
+(set I [0Nl 9223372036854775807 -9223372036854775807 -5 0 7])
+(repr (as 'TIMESPAN I)) -- "[0Nn 0Wn -0Wn -0D00:00:00.000000005 0D00:00:00.000000000 0D00:00:00.000000007]"
+(repr (as 'I64 (as 'TIMESPAN I))) -- "[0Nl 9223372036854775807 -9223372036854775807 -5 0 7]"
+(repr (as 'TIMESPAN (as 'TIMESPAN I))) -- "[0Nn 0Wn -0Wn -0D00:00:00.000000005 0D00:00:00.000000000 0D00:00:00.000000007]"
+(repr (as 'I64 [0Nn 0D00:00:01 -0D00:00:01])) -- "[0Nl 1000000000 -1000000000]"
+(nil? (as 'TIMESPAN I)) -- [true false false false false false]
+;; the null flag travels with the values: the serialized vectors are the
+;; input's bytes with the type changed
+(all (== (drop (ser (as 'TIMESPAN I)) 17) (drop (ser I) 17))) -- true
+(all (== (ser (as 'I64 (as 'TIMESPAN I))) (ser I))) -- true
+(repr (as 'TIMESPAN (as 'I64 []))) -- "(as 'TIMESPAN [])"
+(repr (as 'TIMESPAN (list 1 0Nl 3))) -- "[0D00:00:00.000000001 0Nn 0D00:00:00.000000003]"
+
+;; no allocation per row: one block, the result (the per-cell path made
+;; one or two per row)
+(set CI (til 100000))
+(set CS (as 'TIMESPAN CI))
+(<= (get (.mem.ts (as 'I64 CS)) 'alloc-count) 2) -- true
+(<= (get (.mem.ts (as 'TIMESPAN CI)) 'alloc-count) 2) -- true
+(<= (get (.mem.ts (as 'TIMESPAN CS)) 'alloc-count) 2) -- true
+(all (== (as 'I64 CS) CI)) -- true
+
+;; the pairs that are not a copy keep converting per cell
+(repr (as 'TIMESPAN [2024.03.05D01:02:03.000000004 0Np])) -- "[0D01:02:03.000000004 0Nn]"
+(repr (as 'TIMESPAN (as 'TIME [1000 2000]))) -- "[0D00:00:01.000000000 0D00:00:02.000000000]"
+(repr (as 'TIMESPAN [1.6 0Nf])) -- "[0D00:00:00.000000002 0Nn]"
+(as 'TIMESTAMP (as 'TIMESPAN [1 2])) !- type

@@ -30,6 +30,9 @@
 #include "lang/format.h"   /* ray_type_name (error context) */
 #include "lang/env.h"
 #include "lang/internal.h" /* ray_like_fn (list-of-strings delegate) */
+#include "store/colrange.h"  /* a scanned column bound without decoding (#1645) */
+#include "store/enccol.h"
+#include "store/encfmt.h"
 
 /* ============================================================================
  * OP_LIKE: glob pattern matching on STR / SYM columns.  See ops/glob.[ch].
@@ -430,11 +433,121 @@ static ray_t* exec_like_input(ray_graph_t* g, ray_op_t* input_op) {
     return exec_node(g, input_op);
 }
 
+/* A text cursor over a STR or SYM vector, flat or parted (a parted one's
+ * missing segments hold no rows), or a STR/SYM atom repeated: row by row,
+ * the text of each cell (a SYM cell through its vector's domain). */
+typedef struct {
+    ray_t*  atom;                /* a STR or SYM atom, the same text every row */
+    ray_t*  held;                /* a SYM atom's text, owned */
+    ray_t** segs;                /* the vectors: one, or a parted column's segments */
+    int64_t n_segs, seg, row;
+    const ray_str_t* elems;      /* the current STR segment */
+    const char* pool;
+} like_text_cur_t;
+
+static bool like_text_kind(ray_t* v, bool atom_ok) {
+    if (!v) return false;
+    if (v->type == -RAY_STR || v->type == -RAY_SYM) return atom_ok;
+    int8_t t = RAY_IS_PARTED(v->type) ? (int8_t)RAY_PARTED_BASETYPE(v->type) : v->type;
+    return t == RAY_STR || RAY_IS_SYM(t);
+}
+
+static int64_t like_text_rows(ray_t* v) {
+    if (v->type < 0) return -1;
+    return RAY_IS_PARTED(v->type) ? parted_row_count(v) : v->len;
+}
+
+static void like_text_open(like_text_cur_t* c, ray_t** one) {
+    ray_t* v = *one;
+    memset(c, 0, sizeof *c);
+    if (v->type < 0) { c->atom = v; return; }
+    if (RAY_IS_PARTED(v->type)) { c->segs = (ray_t**)ray_data(v); c->n_segs = v->len; }
+    else { c->segs = one; c->n_segs = 1; }
+}
+
+static void like_text_close(like_text_cur_t* c) {
+    if (c->held) ray_release(c->held);
+    c->held = NULL;
+}
+
+/* The text of the next row; false past the last. */
+static bool like_text_next(like_text_cur_t* c, const char** sp, size_t* sl) {
+    if (c->atom) {
+        if (c->atom->type == -RAY_SYM) {
+            if (!c->held) c->held = ray_sym_str(c->atom->i64);   /* released by like_text_close */
+            *sp = c->held ? ray_str_ptr(c->held) : ""; *sl = c->held ? ray_str_len(c->held) : 0;
+        } else {
+            *sp = ray_str_ptr(c->atom); *sl = ray_str_len(c->atom);
+        }
+        return true;
+    }
+    while (c->seg < c->n_segs && (!c->segs[c->seg] || c->row >= c->segs[c->seg]->len)) {
+        c->seg++; c->row = 0; c->elems = NULL;
+    }
+    if (c->seg >= c->n_segs) return false;
+    ray_t* seg = c->segs[c->seg];
+    if (seg->type == RAY_STR) {
+        if (!c->elems) str_resolve(seg, &c->elems, &c->pool);
+        *sp = ray_str_t_ptr(&c->elems[c->row], c->pool);
+        *sl = c->elems[c->row].len;
+    } else {
+        ray_t* t = ray_sym_vec_cell(seg, c->row);              /* borrowed */
+        *sp = t ? ray_str_ptr(t) : ""; *sl = t ? ray_str_len(t) : 0;
+    }
+    c->row++;
+    return true;
+}
+
+/* (like x p) with p a STR vector (a column): row i of x matched against
+ * pattern i, x a STR or SYM vector of as many rows (flat or parted) or a
+ * STR/SYM atom matched against every pattern (#1615).  `ci`: ilike.
+ * Borrows both; returns an owned BOOL vector or an error. */
+ray_t* ray_like_rows(ray_t* x, ray_t* pat, bool ci) {
+    const char* fn = ci ? "ilike" : "like";
+    if (!like_text_kind(x, true))
+        return ray_error("type", "%s: expected a string or symbol, or a vector of them, got %s",
+                         fn, ray_type_name(x->type));
+    int64_t n = like_text_rows(pat);
+    int64_t xn = like_text_rows(x);
+    if (xn >= 0 && xn != n)
+        return ray_error("length", "%s: %lld values against %lld patterns", fn, (long long)xn, (long long)n);
+    ray_t* out = ray_vec_new(RAY_BOOL, n);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    out->len = n;
+    uint8_t* dst = (uint8_t*)ray_data(out);
+    like_text_cur_t cx, cp;
+    ray_t* xs[1] = { x };
+    ray_t* ps[1] = { pat };
+    like_text_open(&cx, xs);
+    like_text_open(&cp, ps);
+    for (int64_t i = 0; i < n; i++) {
+        const char *s = "", *p = "";
+        size_t sl = 0, pl = 0;
+        if (!like_text_next(&cx, &s, &sl) || !like_text_next(&cp, &p, &pl)) {
+            like_text_close(&cx);
+            ray_release(out);
+            return ray_error("length", "%s: the values and the patterns have different lengths", fn);
+        }
+        dst[i] = (ci ? ray_glob_match_ci(s, sl, p, pl) : ray_glob_match(s, sl, p, pl)) ? 1 : 0;
+    }
+    like_text_close(&cx);
+    return out;
+}
+
+/* Is `pat` a pattern column: a STR vector, flat or parted? */
+bool ray_like_pat_rows(ray_t* pat) {
+    if (!pat || pat->type < 0) return false;
+    int8_t t = RAY_IS_PARTED(pat->type) ? (int8_t)RAY_PARTED_BASETYPE(pat->type) : pat->type;
+    return t == RAY_STR;
+}
+
 /* LIKE over a whole STR / SYM column (flat or parted): the parallel kernel
  * shared by the DAG executor (exec_like) and the direct builtin (ray_like_fn),
  * so `(like col pat)` and `where: (like col pat)` run the same code — one
  * pattern resolve per distinct symbol, the row passes spread over the worker
  * pool.  `selection` is the executor's rowsel, or NULL for every row.
+ * `pat_v` is a string atom (both callers check it; a string column takes
+ * ray_like_rows, #1615).
  * Borrows `input` and `pat_v`; returns an owned BOOL vector. */
 ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
     int8_t in_type = input->type;
@@ -579,11 +692,317 @@ ray_t* ray_like_vec(ray_t* input, ray_t* pat_v, ray_t* selection) {
     return result;
 }
 
+static ray_t* exec_like_with(ray_graph_t* g, ray_t* input, ray_t* pat_v);
+
+/* ---- LIKE over a generation-2 STR column, a vector at a time (#1645) ----
+ *
+ * A scanned STR column whose segments (one, or a parted column's) are
+ * generation-2 files not yet materialized is read where it is mapped
+ * instead of decoded whole: a STR_DICT vector's codes are mapped through
+ * the dictionary, each entry matched once per query (a byte per entry:
+ * 0 unknown, else match + 1); any other vector is decoded alone into the
+ * task's buffer and matched cell by cell.  Every encoded segment's vectors
+ * are one dispatch, spread over the worker pool.  A plain (or already
+ * materialized) segment takes the plain kernel.  The answer is the plain
+ * kernel's: the same text, row for row.
+ *
+ * Which segments are read by vector: one whose vectors are all STR_DICT
+ * (or CONST) always, as that is cheaper than any decode.  The others (FSST
+ * and RAW vectors, which a repeated query would decode again) are
+ * materialized as before when their whole decode fits the decode cache's
+ * budget (ray_enccol_cache_trim keeps a quarter of the anonymous
+ * watermark), so a repeat reads them cached; only when it does not fit are
+ * they read by vector, and nothing is decoded whole. */
+typedef struct {
+    ray_enccol_t*           e;
+    int64_t                 row0;       /* the segment's first row in the output */
+    const ray_enc_sdict_t*  sd;         /* its STR dictionary, or NULL */
+    _Atomic(uint8_t)*       lut;        /* sd->n entries, or NULL */
+} like_enc_seg_t;
+
+typedef struct {
+    like_enc_seg_t*            segs;
+    int64_t                    n_segs;
+    const int64_t*             vbase;     /* n_segs + 1: each segment's first task (vector) */
+    uint8_t*                   dst;
+    const ray_glob_compiled_t* pc;
+    bool                       use_simple;
+    const char*                pat_str;
+    size_t                     pat_len;
+    ray_scan_fail_t            fail;
+} like_enc_ctx_t;
+
+static inline uint8_t like_enc_match(const like_enc_ctx_t* x, const char* sp, size_t sl) {
+    return (x->use_simple ? ray_glob_match_compiled(x->pc, sp, sl)
+                          : ray_glob_match(sp, sl, x->pat_str, x->pat_len)) ? 1 : 0;
+}
+
+static void like_enc_fn(void* vctx, uint32_t worker_id, int64_t start, int64_t end) {
+    (void)worker_id;
+    like_enc_ctx_t* x = (like_enc_ctx_t*)vctx;
+    ray_str_t cells[RAY_ENC_VEC];
+    char* pool = NULL;
+    uint64_t pool_cap = 0;
+    int64_t s = 0;
+    while (s + 1 < x->n_segs && x->vbase[s + 1] <= start) s++;
+    for (int64_t g = start; g < end; g++) {
+        if (ray_scan_fail_skip(&x->fail, g)) break;
+        while (x->vbase[s + 1] <= g) s++;
+        like_enc_seg_t* sg = &x->segs[s];
+        int64_t v = g - x->vbase[s];
+        int n = ray_enc_vec_len(sg->e->len, v);
+        uint8_t* o = x->dst + sg->row0 + v * RAY_ENC_VEC;
+        ray_t* err = NULL;
+        if (sg->lut) {
+            ray_enc_vview_t vv;
+            int r = ray_enccol_vview(sg->e, v, &vv, &err);
+            if (r < 0) { ray_scan_fail_note(&x->fail, g, err); break; }
+            if (r == 1 && vv.enc == RAY_ENC_STR_DICT) {
+                for (int i = 0; i < n; i++) {
+                    uint32_t c = vv.codes[i];
+                    uint8_t m = atomic_load_explicit(&sg->lut[c], memory_order_relaxed);
+                    if (!m) {
+                        const char* sp; uint32_t sl;
+                        ray_enc_sdict_entry(sg->sd, c, &sp, &sl);
+                        m = (uint8_t)(like_enc_match(x, sp, sl) + 1);
+                        atomic_store_explicit(&sg->lut[c], m, memory_order_relaxed);
+                    }
+                    o[i] = (uint8_t)(m - 1);
+                }
+                continue;
+            }
+        }
+        uint64_t pb = 0;
+        err = ray_enccol_vec_pool_bytes(sg->e, v, &pb);
+        if (!err && pb > pool_cap) {
+            char* np = (char*)ray_alloc_raw((size_t)pb);
+            if (!np) err = ray_error("oom", NULL);
+            else { if (pool) ray_free_raw(pool); pool = np; pool_cap = pb; }
+        }
+        if (!err) err = ray_enccol_decode_vec(sg->e, v, cells, pool, 0);
+        if (err) { ray_scan_fail_note(&x->fail, g, err); break; }
+        for (int i = 0; i < n; i++)
+            o[i] = like_enc_match(x, ray_str_t_ptr(&cells[i], pool), cells[i].len);
+    }
+    if (pool) ray_free_raw(pool);
+}
+
+/* The plain kernel over one plain STR vector, into dst. */
+static void like_plain_str(ray_t* v, uint8_t* dst, const ray_glob_compiled_t* pc, bool use_simple,
+                           const char* pat_str, size_t pat_len) {
+    const ray_str_t* elems; const char* pool_data;
+    str_resolve(v, &elems, &pool_data);
+    str_like_par_ctx_t lctx = {
+        .elems = elems, .pool_data = pool_data, .dst = dst, .pc = pc,
+        .use_simple = use_simple, .pat_str = pat_str, .pat_len = pat_len,
+    };
+    ray_pool_t* pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(pool, v->len, LIKE_PAR_MIN_ROWS_STR))
+        ray_pool_dispatch(pool, str_like_par_fn, &lctx, v->len);
+    else
+        str_like_par_fn(&lctx, 0, 0, v->len);
+}
+
+/* Every vector of the single-file column e is STR_DICT or CONST: reading
+ * it by vector decodes no string. */
+static bool like_enc_dict_only(const ray_enccol_t* e) {
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        int64_t rows = e->len - c * RAY_ENC_CHUNK;
+        if (rows > RAY_ENC_CHUNK) rows = RAY_ENC_CHUNK;
+        int nv = (int)((rows + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
+        const ray_enc_desc_t* d = ray_enccol_descs(e, c);
+        for (int j = 0; j < nv; j++)
+            if (d[j].encoding != RAY_ENC_STR_DICT && d[j].encoding != RAY_ENC_CONST) return false;
+    }
+    return true;
+}
+
+/* The bytes a whole decode of e holds: its cells and its string pool. */
+static int64_t like_enc_decode_bytes(const ray_enccol_t* e) {
+    return e->len * (int64_t)sizeof(ray_str_t) + (int64_t)e->hdr.str_pool_bytes;
+}
+
+/* Test hook: the segments like_encoded_str read by vector, since process
+ * start. */
+static _Atomic(uint64_t) g_like_enc_by_vector;
+uint64_t ray_like_test_by_vector(void) { return atomic_load(&g_like_enc_by_vector); }
+
+/* (like col pat) with col a scanned STR column holding a generation-2
+ * segment not yet materialized and pat a STR atom: 1 with *out the BOOL
+ * answer (or an owned error), 0 when the column is not such a column (the
+ * caller reads it as before).  Decodes nothing whole. */
+static int like_encoded_str(ray_t* tbl, int64_t sym, ray_t* pat_v, ray_t** out) {
+    *out = NULL;
+    ray_col_src_t src;
+    memset(&src, 0, sizeof src);
+    ray_t* err = ray_table_col_src(tbl, sym, &src);
+    if (err) { ray_error_free(err); return 0; }
+    int rc = 0;
+    ray_t** segv = NULL; int64_t ns = 0; const int64_t* off = NULL;
+    int64_t one_off[2];
+    ray_t* one[1];
+    like_enc_seg_t* es = NULL;
+    int64_t* vbase = NULL;
+    if (!src.obj || src.type != RAY_STR) goto done;
+    if (src.parted) {
+        if (!ray_col_src_parted_segs(&src, &ns, &segv, &off, &err)) {
+            if (err) { *out = err; rc = 1; }
+            goto done;
+        }
+    } else {
+        one[0] = src.obj; segv = one; ns = 1;
+        one_off[0] = 0; one_off[1] = src.len; off = one_off;
+    }
+    /* every segment a plain STR vector or a single-file generation-2 one of
+     * its rows; at least one of those not materialized */
+    int64_t n_enc = 0;
+    for (int64_t i = 0; i < ns; i++) {
+        int64_t sl = off[i + 1] - off[i];
+        ray_t* sg = segv[i];
+        if (!sg) { if (sl) goto done; continue; }
+        if (sg->type == RAY_ENCCOL) {
+            ray_enccol_t* e = ray_enccol_of(sg);
+            if (!e || e->kind != RAY_ENCCOL_SINGLE || e->type != RAY_STR || e->len != sl) goto done;
+            if (!ray_enccol_decoded_peek(sg)) n_enc++;
+        } else if (sg->type != RAY_STR || sg->len != sl) {
+            goto done;
+        }
+    }
+    if (n_enc == 0) goto done;
+    rc = 1;
+    es = (like_enc_seg_t*)ray_calloc_raw((size_t)n_enc * sizeof *es);
+    vbase = (int64_t*)ray_alloc_raw((size_t)(n_enc + 1) * sizeof *vbase);
+    ray_t* res = ray_vec_new(RAY_BOOL, src.len);
+    if (!es || !vbase || !res || RAY_IS_ERR(res)) {
+        *out = (res && RAY_IS_ERR(res)) ? res : ray_error("oom", NULL);
+        if (res && !RAY_IS_ERR(res)) ray_release(res);
+        goto done;
+    }
+    res->len = src.len;
+    uint8_t* dst = (uint8_t*)ray_data(res);
+    const char* pat_str = ray_str_ptr(pat_v);
+    size_t pat_len = ray_str_len(pat_v);
+    ray_glob_compiled_t pc = ray_glob_compile(pat_str, pat_len);
+    bool use_simple = pc.shape != RAY_GLOB_SHAPE_NONE;
+    /* the segments a repeat would decode again: whole, as before, when
+     * their decodes fit the cache's budget */
+    int64_t need = 0;
+    for (int64_t i = 0; i < ns; i++) {
+        ray_t* sg = segv[i];
+        if (!sg || off[i + 1] == off[i] || sg->type != RAY_ENCCOL || ray_enccol_decoded_peek(sg)) continue;
+        if (!like_enc_dict_only(ray_enccol_of(sg))) need += like_enc_decode_bytes(ray_enccol_of(sg));
+    }
+    int64_t wm = ray_heap_anon_watermark();
+    bool whole = need > 0 && (wm <= 0 || ray_enccol_cache_bytes() + need <= wm / 4);
+    int64_t k = 0, nv = 0;
+    for (int64_t i = 0; i < ns && !err; i++) {
+        ray_t* sg = segv[i];
+        if (!sg || off[i + 1] == off[i]) continue;
+        ray_t* plain = sg->type == RAY_ENCCOL ? ray_enccol_decoded_peek(sg) : sg;
+        if (!plain && whole && !like_enc_dict_only(ray_enccol_of(sg))) {
+            plain = ray_enccol_materialize(sg);          /* borrowed, cached */
+            if (plain && RAY_IS_ERR(plain)) { err = plain; break; }
+        }
+        if (plain) { like_plain_str(plain, dst + off[i], &pc, use_simple, pat_str, pat_len); continue; }
+        atomic_fetch_add_explicit(&g_like_enc_by_vector, 1, memory_order_relaxed);
+        like_enc_seg_t* t = &es[k];
+        t->e = ray_enccol_of(sg);
+        t->row0 = off[i];
+        err = ray_enccol_strdict(t->e, &t->sd);
+        if (!err && t->sd && t->sd->n > 0) {
+            t->lut = (_Atomic(uint8_t)*)ray_calloc_raw((size_t)t->sd->n);
+            if (!t->lut) err = ray_error("oom", NULL);
+        }
+        vbase[k] = nv;
+        nv += ray_enc_nvecs(t->e->len);
+        k++;
+    }
+    vbase[k] = nv;
+    if (!err) {
+        like_enc_ctx_t x = {
+            .segs = es, .n_segs = k, .vbase = vbase, .dst = dst, .pc = &pc,
+            .use_simple = use_simple, .pat_str = pat_str, .pat_len = pat_len,
+        };
+        ray_scan_fail_init(&x.fail);
+        ray_pool_t* pool = ray_pool_get();
+        if (nv >= 2 && nv <= (int64_t)UINT32_MAX && ray_pool_par_dispatch_ok(pool, src.len, LIKE_PAR_MIN_ROWS_STR))
+            ray_pool_dispatch_n(pool, like_enc_fn, &x, (uint32_t)nv);
+        else
+            like_enc_fn(&x, 0, 0, nv);
+        err = ray_scan_fail_finish(&x.fail, pool);
+    }
+    for (int64_t i = 0; i < k; i++) if (es[i].lut) ray_free_raw((void*)es[i].lut);
+    if (err) { ray_release(res); *out = err; }
+    else *out = res;
+done:
+    if (es) ray_free_raw(es);
+    if (vbase) ray_free_raw(vbase);
+    ray_col_src_release(&src);
+    return rc;
+}
+
+/* The table and column a SCAN reads, without reading it: 1 when found. */
+static int like_scan_col(ray_graph_t* g, ray_op_t* input_op, ray_t** tbl, int64_t* sym) {
+    if (!input_op || input_op->opcode != OP_SCAN) return 0;
+    ray_op_ext_t* ext = find_ext(g, input_op->id);
+    if (!ext) return 0;
+    uint16_t stored_table_id = 0;
+    memcpy(&stored_table_id, ext->base.pad, sizeof(uint16_t));
+    ray_t* t = NULL;
+    if (stored_table_id > 0 && g->tables && (stored_table_id - 1) < g->n_tables)
+        t = g->tables[stored_table_id - 1];
+    else
+        t = g->table;
+    if (!t) return 0;
+    *tbl = t; *sym = ext->sym;
+    return 1;
+}
+
 ray_t* exec_like(ray_graph_t* g, ray_op_t* op) {
+    {
+        /* a generation-2 STR column is matched where it is mapped (#1645) */
+        ray_t* st = NULL; int64_t ssym = 0;
+        if (like_scan_col(g, op_child(g, op, 0), &st, &ssym)) {
+            ray_col_meta_t cm;
+            int8_t bt = 0;
+            if (ray_table_col_meta(st, ssym, &cm))
+                bt = RAY_IS_PARTED(cm.type) ? (int8_t)RAY_PARTED_BASETYPE(cm.type) : cm.type;
+            if (bt == RAY_STR) {
+                ray_t* pat = exec_node(g, op_child(g, op, 1));
+                if (!pat || RAY_IS_ERR(pat)) return pat;
+                if (pat->type == -RAY_STR) {
+                    ray_t* r = NULL;
+                    if (like_encoded_str(st, ssym, pat, &r)) { ray_release(pat); return r; }
+                }
+                ray_t* input = exec_like_input(g, op_child(g, op, 0));
+                return exec_like_with(g, input, pat);
+            }
+        }
+    }
     ray_t* input = exec_like_input(g, op_child(g, op, 0));
     ray_t* pat_v = exec_node(g, op_child(g, op, 1));
+    return exec_like_with(g, input, pat_v);
+}
+
+/* exec_like over its evaluated operands; consumes both. */
+static ray_t* exec_like_with(ray_graph_t* g, ray_t* input, ray_t* pat_v) {
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
+    /* A query compiles any expression into the pattern slot.  A string
+     * column is matched row by row; a string atom takes the kernels below;
+     * anything else (a symbol, a number, a SYM column) is the builtin's
+     * type error.  Reading it as a string crashed or matched nothing
+     * (#1615). */
+    if (ray_like_pat_rows(pat_v)) {
+        ray_t* r = ray_like_rows(input, pat_v, false);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+    if (pat_v->type != -RAY_STR) {
+        int8_t pt = pat_v->type;
+        ray_release(input); ray_release(pat_v);
+        return ray_error("type", "like: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pt));
+    }
 
     int8_t in_type = input->type;
     bool in_parted = RAY_IS_PARTED(in_type);
@@ -666,6 +1085,17 @@ ray_t* exec_ilike(ray_graph_t* g, ray_op_t* op) {
     ray_t* pat_v = exec_node(g, op_child(g, op, 1));
     if (!input || RAY_IS_ERR(input)) { if (pat_v && !RAY_IS_ERR(pat_v)) ray_release(pat_v); return input; }
     if (!pat_v || RAY_IS_ERR(pat_v)) { ray_release(input); return pat_v; }
+    /* As for like (#1615): a string column row by row, else a string atom. */
+    if (ray_like_pat_rows(pat_v)) {
+        ray_t* r = ray_like_rows(input, pat_v, true);
+        ray_release(input); ray_release(pat_v);
+        return r;
+    }
+    if (pat_v->type != -RAY_STR) {
+        int8_t pt = pat_v->type;
+        ray_release(input); ray_release(pat_v);
+        return ray_error("type", "ilike: pattern must be a STR atom or a STR vector, got %s", ray_type_name(pt));
+    }
 
     const char* pat_str = ray_str_ptr(pat_v);
     size_t pat_len = ray_str_len(pat_v);

@@ -7,3 +7,91 @@
 ;; range: 1..31
 (set D [2024.01.15 2024.06.30 2024.02.29])
 (count D) -- (sum (and (>= (dd D) 1) (<= (dd D) 31)))
+
+;; ── in a query the short names lower to the DAG extract ───────────────
+;; (compile_expr_dag), so a grouped (min (dd d)) runs in the grouping
+;; engine instead of once per group.  The lowered column is the builtin's,
+;; cell for cell, null included; the long names (day, month, ...) are the
+;; oracle where one exists, else the builtin over the whole column.
+(set D (as 'DATE [8766 0N 8767 -5000 300000 8766]))
+(set T (as 'TIME [3723000 0N 86399000 0 45000000 3723000]))
+(set TS (enlist 2024.01.02D09:30:00.000000000 2024.01.03D10:30:00.000000000 0Np 2024.01.05D00:00:00.000000000 1999.12.31D23:59:59.999999999 2024.01.02D09:30:00.000000000))
+(set K [1 1 2 2 1 3])
+(set TD (table [k d] (list K D)))
+(set TT (table [k t] (list K T)))
+(set TTS (table [k ts] (list K TS)))
+(set eqv (fn [a b] (and (== (type a) (type b)) (if (== (count a) (count b)) (all (== a b)) false))))
+(set SD (select {from: TD x: (dd d) y: (mm d) z: (yyyy d) w: (dow d) v: (doy d) x2: (day d) y2: (month d) z2: (year d)}))
+(eqv (at SD 'x) (dd D)) -- true
+(eqv (at SD 'y) (mm D)) -- true
+(eqv (at SD 'z) (yyyy D)) -- true
+(eqv (at SD 'w) (dow D)) -- true
+(eqv (at SD 'v) (doy D)) -- true
+(eqv (at SD 'x) (at SD 'x2)) -- true
+(eqv (at SD 'y) (at SD 'y2)) -- true
+(eqv (at SD 'z) (at SD 'z2)) -- true
+(at SD 'x) -- [1 0Nl 2 24 16 1]
+(set ST (select {from: TT x: (hh t) y: (ss t) z: (minute t) x2: (hour t) y2: (second t)}))
+(eqv (at ST 'x) (hh T)) -- true
+(eqv (at ST 'y) (ss T)) -- true
+(eqv (at ST 'z) (minute T)) -- true
+(eqv (at ST 'x) (at ST 'x2)) -- true
+(eqv (at ST 'y) (at ST 'y2)) -- true
+(set STS (select {from: TTS x: (dd ts) y: (hh ts) z: (ss ts) w: (yyyy ts) v: (dow ts) u: (doy ts) m: (mm ts)}))
+(eqv (at STS 'x) (dd TS)) -- true
+(eqv (at STS 'y) (hh TS)) -- true
+(eqv (at STS 'z) (ss TS)) -- true
+(eqv (at STS 'w) (yyyy TS)) -- true
+(eqv (at STS 'v) (dow TS)) -- true
+(eqv (at STS 'u) (doy TS)) -- true
+(eqv (at STS 'm) (mm TS)) -- true
+
+;; grouped: the aggregate over the lowered column is the aggregate over the
+;; builtin's column, rows ordered alike
+(set G1 (select {from: TD by: k a: (min (dd d)) b: (max (mm d)) c: (max (dow d)) n: (count (distinct (yyyy d)))}))
+(set O1 (select {from: (table [k x y z w] (list K (dd D) (mm D) (dow D) (yyyy D))) by: k a: (min x) b: (max y) c: (max z) n: (count (distinct w))}))
+(eqv (at G1 'k) (at O1 'k)) -- true
+(eqv (at G1 'a) (at O1 'a)) -- true
+(eqv (at G1 'b) (at O1 'b)) -- true
+(eqv (at G1 'c) (at O1 'c)) -- true
+(eqv (at G1 'n) (at O1 'n)) -- true
+(at G1 'a) -- [1 2 1]
+(type (at G1 'a)) -- 'I64
+(set G2 (select {from: TTS by: k a: (min (hh ts)) b: (max (ss ts)) c: (avg (doy ts)) where: (!= k 3)}))
+(set O2 (select {from: (table [k x y z] (list K (hh TS) (ss TS) (doy TS))) by: k a: (min x) b: (max y) c: (avg z) where: (!= k 3)}))
+(eqv (at G2 'k) (at O2 'k)) -- true
+(eqv (at G2 'a) (at O2 'a)) -- true
+(eqv (at G2 'b) (at O2 'b)) -- true
+(eqv (at G2 'c) (at O2 'c)) -- true
+;; a null key row and all-null groups
+(set TN (table [k d] (list [1 0Nl 2 2] (as 'DATE [8766 8767 0N 0N]))))
+(set G3 (select {from: TN by: k a: (min (dd d)) b: (max (yyyy d))}))
+(set O3 (select {from: (table [k x y] (list [1 0Nl 2 2] (dd (at TN 'd)) (yyyy (at TN 'd)))) by: k a: (min x) b: (max y)}))
+(eqv (at G3 'k) (at O3 'k)) -- true
+(eqv (at G3 'a) (at O3 'a)) -- true
+(eqv (at G3 'b) (at O3 'b)) -- true
+;; a parted table: the lowered extract reads each partition
+(.sys.exec "rm -rf /tmp/rfl_dd_parted")
+(.db.splayed.set "/tmp/rfl_dd_parted/1/t/" (table [k d] (list [1 1 2] (as 'DATE [8766 0N 8767]))))
+(.db.splayed.set "/tmp/rfl_dd_parted/2/t/" (table [k d] (list [2 3 1] (as 'DATE [8800 8830 8766]))))
+(set PD (.db.parted.get "/tmp/rfl_dd_parted/" 't))
+(set G4 (select {from: PD by: k a: (min (dd d)) b: (max (mm d)) c: (count d)}))
+(set O4 (select {from: (table [k x y] (list [1 1 2 2 3 1] (dd (as 'DATE [8766 0N 8767 8800 8830 8766])) (mm (as 'DATE [8766 0N 8767 8800 8830 8766])))) by: k a: (min x) b: (max y) c: (count x)}))
+(eqv (at (xasc G4 'k) 'k) (at (xasc O4 'k) 'k)) -- true
+(eqv (at (xasc G4 'k) 'a) (at (xasc O4 'k) 'a)) -- true
+(eqv (at (xasc G4 'k) 'b) (at (xasc O4 'k) 'b)) -- true
+(eqv (at (xasc G4 'k) 'c) (at (xasc O4 'k) 'c)) -- true
+;; the short names keep the builtins' type check inside a query too
+(select {from: TD x: (dd k)}) !- type
+(select {from: TD by: k a: (min (dd k))}) !- type
+(dd (at TD 'k)) !- type
+;; a wide table: engine and per-group evaluation agree
+(set N 200000)
+(set KW (% (* (til N) 7919) 50000))
+(set DW (as 'DATE (+ 8000 (% (* (til N) 104729) 3000))))
+(set GW (select {from: (table [k d] (list KW DW)) by: k a: (min (dd d)) b: (max (mm d)) c: (max (yyyy d))}))
+(set OW (select {from: (table [k x y z] (list KW (dd DW) (mm DW) (yyyy DW))) by: k a: (min x) b: (max y) c: (max z)}))
+(eqv (at GW 'k) (at OW 'k)) -- true
+(eqv (at GW 'a) (at OW 'a)) -- true
+(eqv (at GW 'b) (at OW 'b)) -- true
+(eqv (at GW 'c) (at OW 'c)) -- true

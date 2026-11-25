@@ -43,6 +43,8 @@ Signature: `(.emb.l2-dist a b)`. Euclidean distance: lower is closer.
 
 Signature: `(.emb.knn col query k [metric])`. Scans every vector of `col` and returns a table `{_rowid, _dist}` of the `k` nearest to `query`, ascending by distance. `metric` is `'cosine` (default), `'l2` or `'ip`. No index is needed; it is the right tool for small columns and one-off queries.
 
+The scan is exact and runs on the worker pool: a column of F32 or F64 vectors is computed in its own width, a run of rows to a worker, each keeping its own best. Of rows as near as each other the earlier comes first, so the answer does not depend on the number of workers. The same scan serves `nearest: (.emb.knn …)` in `select`, with or without a `where:`, and a distance over a whole column (`(.emb.cos-dist col query)`) is shared out the same way.
+
 ```lisp
 (.emb.knn vecs [0.1 0.2 0.3 0.4] 2)
 ```
@@ -78,7 +80,7 @@ Signature: `(.emb.hnsw.free handle)`. Releases the index now. Optional: a handle
 
 ## Text into vectors
 
-A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernels `mmu` and `gram` have. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
+A text-embedding model runs inside the engine: no service to call and no library to link. The model is a directory as its publisher ships it, holding `config.json`, `tokenizer.json` and `model.safetensors`; the engine reads the three with its own readers and computes on its worker pool with the kernel `mmu` has. The weights are mapped, not loaded: every tensor is used where the file has it, nothing of them is copied, and a page is read from disk when a text first needs it, so opening a model costs the tokenizer alone and two processes that open one model share its memory.
 
 ```lisp
 (set m (.emb.model.get "models/my-encoder"))

@@ -737,7 +737,11 @@ static void xtr_extract_fn(void* ctx, uint32_t worker_id, int64_t start, int64_t
     xtr_extract_range((xtr_par_ctx_t*)ctx, start, end);
 }
 
+static _Atomic(uint64_t) g_dag_extracts;
+uint64_t ray_temporal_test_dag_extracts(void) { return atomic_load_explicit(&g_dag_extracts, memory_order_relaxed); }
+
 ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
+    atomic_fetch_add_explicit(&g_dag_extracts, 1, memory_order_relaxed);
     ray_t* input = exec_node(g, op_child(g, op, 0));
     if (!input || RAY_IS_ERR(input)) return input;
 
@@ -753,7 +757,11 @@ ray_t* exec_extract(ray_graph_t* g, ray_op_t* op) {
     /* A literal (`(year 2020.01.01)`) arrives as an atom, whose len field
      * aliases its value: the date became a vector of 7305 rows.  The atom
      * path of the builtin answers it as one value. */
-    if (input->type < 0) {
+    /* The kernel reads DATE/TIME as 32-bit and anything else as TIMESTAMP
+     * nanoseconds; another column type takes the builtin's own answer
+     * (its type error), not a misread payload. */
+    if (input->type < 0 || (input->type != RAY_DATE && input->type != RAY_TIME &&
+                            input->type != RAY_TIMESTAMP)) {
         ray_t* r = ray_temporal_extract(input, (int)field);
         ray_release(input);
         return r;

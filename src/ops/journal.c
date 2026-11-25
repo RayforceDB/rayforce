@@ -25,6 +25,7 @@
 #include "store/journal.h"
 #include "store/serde.h"
 #include "core/ipc.h"
+#include "lang/format.h"
 #include "mem/sys.h"
 #include "ops/ops.h"
 
@@ -122,13 +123,15 @@ static ray_t* status_sym(const char* s) {
  *                    the size probe failed
  *   auto       bool  the current evaluation runs inside an auto-journaled
  *                    IPC request (same value as (.ipc.auto_journal_eval))
+ *   posts      bool  async IPC requests are journaled too (--log-posts,
+ *                    .log.posts); a process setting, false by default
  * path and mode are committed only when an open succeeds, so a failed open
  * (of a first or a later journal) never replaces them.  They survive
  * .log.close and a .log.roll that lost its handle: `open` false with
  * `opened_ok` true tells a lost or closed journal from one that never
  * existed.  Raises only on allocation or symbol-intern failure; any
  * partially built result is released and the error is returned. */
-#define STATUS_N 6
+#define STATUS_N 7
 ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
     (void)args; (void)n;
     ray_journal_info_t info;
@@ -140,7 +143,7 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     static const char* names[STATUS_N] =
-        { "open", "opened_ok", "path", "mode", "bytes", "auto" };
+        { "open", "opened_ok", "path", "mode", "bytes", "auto", "posts" };
     for (int i = 0; i < STATUS_N; i++) {
         ray_t* v;
         switch (i) {
@@ -150,7 +153,8 @@ ray_t* ray_log_status_fn(ray_t** args, int64_t n) {
         case 3: v = !info.opened_ok ? RAY_NULL_OBJ
                   : status_sym(info.mode == RAY_JOURNAL_SYNC ? "sync" : "async"); break;
         case 4: v = info.bytes_ok ? status_i64(info.bytes) : RAY_NULL_OBJ; break;
-        default: v = status_bool(ray_ipc_auto_journal_eval()); break;
+        case 5: v = status_bool(ray_ipc_auto_journal_eval()); break;
+        default: v = status_bool(ray_journal_posts()); break;
         }
         if (RAY_IS_ERR(v)) { ray_release(keys); ray_release(vals); return v; }
 
@@ -197,9 +201,20 @@ ray_t* ray_log_write_fn(ray_t* expr) {
         owned = true;
     }
 
+    ray_serde_fail_clear();
     int64_t pay_size = ray_serde_size(expr);
     if (pay_size <= 0) {
         if (owned) ray_release(expr);
+        /* the serializer's own refusal (limit: nested too deep, or shared
+         * parts repeated beyond the budget; a column that cannot be read)
+         * passes through with its code and message */
+        const char* fcode = ray_serde_fail_code();
+        if (pay_size < 0 && fcode) {
+            char code[8], msg[256];
+            snprintf(code, sizeof code, "%s", fcode);
+            snprintf(msg, sizeof msg, "%s", ray_error_msg() ? ray_error_msg() : "");
+            return ray_error(code, ".log.write: %s", msg);
+        }
         return ray_error("domain", ".log.write: serde size 0");
     }
 
@@ -350,7 +365,28 @@ ray_t* ray_log_snapshot_fn(ray_t** args, int64_t n) {
     if (n != 0) return ray_error("arity", ".log.snapshot takes no arguments");
     if (!ray_journal_is_open())
         return ray_error("domain", ".log.snapshot: no journal open");
-    return err_to_ray(ray_journal_snapshot(), "io");
+    ray_err_t e = ray_journal_snapshot();
+    ray_t* why = e != RAY_OK ? ray_journal_take_error() : NULL;
+    if (why) return why;   /* the serializer's own code and message */
+    return err_to_ray(e, "io");
+}
+
+/* (.log.posts [flag]) — the posts switch (#1608).  No argument reads it;
+ * 0 turns it off, any other i64 on.  When on, an open journal also records
+ * each inbound async IPC request (.ipc.post) before evaluating it, as a
+ * request frame that replay evaluates like a sync one.  Off by default.
+ * Returns the state in effect as i64 (0/1).  Restricted: it changes what
+ * the server persists.  During replay it only reads: a journaled call must
+ * not change the live setting, which is the operator's (--log-posts). */
+ray_t* ray_log_posts_fn(ray_t** args, int64_t n) {
+    if (n == 1) {
+        if (args[0]->type != -RAY_I64)
+            return ray_error("type", ".log.posts: flag must be i64, got %s", ray_type_name(args[0]->type));
+        if (!ray_journal_in_replay()) ray_journal_set_posts(args[0]->i64 != 0);
+    } else if (n != 0) {
+        return ray_error("domain", ".log.posts takes 0 or 1 arguments");
+    }
+    return status_i64(ray_journal_posts() ? 1 : 0);
 }
 
 ray_t* ray_log_sync_fn(ray_t** args, int64_t n) {
