@@ -86,6 +86,11 @@ typedef struct ray_syscmd {
  * tokeniser).  Returns NULL if not found. */
 const ray_syscmd_t* ray_syscmd_lookup(const char* name, size_t name_len);
 
+/* The exit code a shell would report for a wait(2)-style status from
+ * system() or pclose(): the code of a normal exit, 128 + the signal number
+ * for a command a signal killed.  .sys.exec and .sys.cmd's shell fallback. */
+int64_t ray_shell_exit_code(int status);
+
 /* Walk the table.  Returns the entry array + count. */
 const ray_syscmd_t* ray_syscmd_table(size_t* out_count);
 

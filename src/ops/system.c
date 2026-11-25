@@ -30,6 +30,7 @@
 #include "lang/eval.h"  /* LAMBDA_PARAMS */
 #include "lang/nfo.h"   /* NFO_FILENAME */
 #include "lang/parse.h"
+#include "lang/syscmd.h"   /* ray_shell_exit_code */
 #include "ops/ops.h"    /* ray_is_lazy, ray_lazy_materialize */
 #include "ops/internal.h"   /* ray_group_perpart_runs — (.sys.mem) counter */
 #include "mem/heap.h"
@@ -1050,22 +1051,6 @@ ray_t* ray_gc_fn(ray_t** args, int64_t n) {
  * compiles out — guard them so the fuzz build does not trip
  * -Werror,-Wunused-function. */
 #ifndef RAY_FUZZING
-/* Turn a wait(2)-style status into the exit code a shell would report.
- * system() and pclose() hand back an encoded status, not a code: "exit 3"
- * arrives as 768 (3 << 8).  Signals follow the shell's 128+N convention, so
- * a command killed by SIGTERM reads as 143 rather than as a bare 15 that
- * could be confused with a real exit status. */
-static int64_t exec_exit_code(int status) {
-#if defined(RAY_OS_WINDOWS)
-    /* The CRT's system()/_pclose() already return the child's exit code. */
-    return (int64_t)status;
-#else
-    if (WIFEXITED(status))   return (int64_t)WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return (int64_t)(128 + WTERMSIG(status));
-    return (int64_t)status;
-#endif
-}
-
 /* Read everything the child writes to stdout.  Grows geometrically rather
  * than sizing from any stat(), so output from a pipe — which has no size to
  * ask for — comes back whole (cf. #572). */
@@ -1103,7 +1088,7 @@ static ray_t* exec_capture(const char* cmd, int64_t* code_out) {
 
     int status = RAY_PCLOSE(fp);
     if (status == -1) { ray_free_raw(buf); return ray_error("io", ".sys.exec: command did not complete: %s", strerror(errno)); }
-    *code_out = exec_exit_code(status);
+    *code_out = ray_shell_exit_code(status);
 
     ray_t* out = ray_str(buf, len);
     ray_free_raw(buf);
@@ -1173,7 +1158,7 @@ ray_t* ray_system_fn(ray_t** args, int64_t n) {
             if (heapbuf) ray_free_raw(heapbuf);
             return ray_error("io", ".sys.exec: failed to run command: %s", strerror(errno));
         }
-        result = make_i64(exec_exit_code(rc));
+        result = make_i64(ray_shell_exit_code(rc));
     } else {
         int64_t code = 0;
         ray_t* out = exec_capture(cmd, &code);

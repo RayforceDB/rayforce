@@ -1,0 +1,15 @@
+;; @requires: posix  (a POSIX shell: exit codes and kill)
+;; .sys.cmd's shell fallback answers the command's exit code, as .sys.exec
+;; does, not the wait status system() returns (#1740: "exit 3" was 768).
+;; A command a signal killed answers 128 + the signal number, the shell's
+;; convention, from both.
+(.sys.cmd "exit 3") -- 3
+(.sys.cmd "false") -- 1
+(.sys.cmd "true") -- 0
+(.sys.cmd "exit 3") -- (.sys.exec "exit 3")
+;; a command the shell cannot find: the shell's 127
+(.sys.cmd "rfl_no_such_command_1740 2>/dev/null") -- 127
+;; killed by SIGTERM (15) and SIGKILL (9)
+(.sys.cmd "kill -TERM $$") -- 143
+(.sys.cmd "kill -KILL $$") -- 137
+(.sys.cmd "kill -TERM $$") -- (.sys.exec "kill -TERM $$")
