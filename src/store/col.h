@@ -129,6 +129,10 @@ typedef struct {
     const char*   name;                   /* column name, diagnostics */
     uint8_t       gen;                    /* resolved generation: 0 or 2 */
     struct ray_sym_domain_s* target_dom;  /* SYM: destination symfile domain; NULL = bare */
+    int64_t       sym_count;              /* SYM with target_dom: the domain count to stamp
+                                           * (header rc and id width), above every id
+                                           * written and at most the domain's; 0 = the
+                                           * domain's count now */
     uint8_t       index_decision;         /* RAY_COL_IDX_*: generation 2 keeps, rebuilds or drops a
                                            * region index; generation 0 takes KEEP only */
     uint8_t       index_kind;             /* generation 2: kind to record (0 = from the source) */
@@ -208,6 +212,11 @@ ray_t*    ray_col_mmap(const char* path);
  * and FLUSHED the domain first for live-table writes. Private import staging
  * may defer the flush until workers join, before publishing the root.
  * A cell whose symbol is absent from `target` is RAY_ERR_CORRUPT. */
+/* As ray_col_save_sym_encoded, stamping `count` (0: the domain's count now)
+ * as the domain count: an id at or past it is RAY_ERR_CORRUPT. */
+ray_err_t ray_col_save_sym_encoded_n(ray_t* vec, const char* path,
+                                     struct ray_sym_domain_s* target,
+                                     bool durable, int64_t count);
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
                                    struct ray_sym_domain_s* target,
                                    bool durable);

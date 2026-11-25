@@ -1581,12 +1581,18 @@ ray_err_t ray_col_save_bulk(ray_t* vec, const char* path) {
 ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
                                    struct ray_sym_domain_s* target,
                                    bool durable) {
+    return ray_col_save_sym_encoded_n(vec, path, target, durable, 0);
+}
+ray_err_t ray_col_save_sym_encoded_n(ray_t* vec, const char* path,
+                                     struct ray_sym_domain_s* target,
+                                     bool durable, int64_t count) {
     if (!vec || RAY_IS_ERR(vec) || vec->type != RAY_SYM) return RAY_ERR_TYPE;
     if (!path || !target) return RAY_ERR_IO;
     if (vec->len < 0) return RAY_ERR_CORRUPT;
 
     struct ray_sym_domain_s* src = ray_sym_vec_domain(vec);
     int64_t dcount = ray_sym_domain_count(target);
+    if (count > 0 && count < dcount) dcount = count;
     if (dcount > UINT32_MAX) return RAY_ERR_RANGE;
     uint8_t w = ray_sym_dict_width(dcount);
     uint8_t esz = (uint8_t)(1u << w);
@@ -1643,7 +1649,7 @@ ray_err_t ray_col_save_sym_encoded(ray_t* vec, const char* path,
                     if (!s) { err = RAY_ERR_CORRUPT; break; }
                     tpos = ray_sym_domain_find(target, ray_str_ptr(s),
                                                ray_str_len(s));
-                    if (tpos < 0) { err = RAY_ERR_CORRUPT; break; }
+                    if (tpos < 0 || tpos >= dcount) { err = RAY_ERR_CORRUPT; break; }
                 }
                 ray_write_sym(buf, i, (uint64_t)tpos, RAY_SYM, w);
             }

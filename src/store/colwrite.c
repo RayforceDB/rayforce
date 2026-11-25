@@ -193,14 +193,21 @@ static void colw_src_index_meta(ray_t* obj, uint8_t* ik, uint8_t* cf, bool* stal
  * when the source already resolves over it, re-expressed in target_dom
  * from another domain, or through the runtime LUT for a bare save of a
  * FILE-domain source.  False: the id has no target. */
+/* The domain count a write stamps: the caller's (sym_count), else the
+ * target's now. */
+static int64_t colw_target_count(const ray_col_write_t* w) {
+    int64_t dc = ray_sym_domain_count(w->target_dom);
+    return w->sym_count > 0 && w->sym_count < dc ? w->sym_count : dc;
+}
 static bool colw_sym_map(ray_col_write_t* w, struct ray_sym_domain_s* vdom, const int64_t* lut,
                          int64_t id, int64_t* pos) {
     *pos = id;
     if (w->target_dom && vdom == w->target_dom) {
-        if (id < 0 || id >= ray_sym_domain_count(w->target_dom)) *pos = -1;
+        if (id < 0 || id >= colw_target_count(w)) *pos = -1;
     } else if (w->target_dom) {
         ray_t* str = ray_sym_domain_str(vdom, id);
         *pos = str ? ray_sym_domain_find(w->target_dom, ray_str_ptr(str), ray_str_len(str)) : -1;
+        if (*pos >= colw_target_count(w)) *pos = -1;
     } else if (lut) {
         *pos = (id >= 0 && id < ray_sym_domain_count(vdom)) ? lut[id] : -1;
     }
@@ -304,7 +311,7 @@ static ray_err_t colw_gen2_range(ray_col_write_t* w, const char* path) {
     const int64_t* lut = NULL;
     if (type == RAY_SYM) {
         if (w->target_dom) {
-            int64_t dc = ray_sym_domain_count(w->target_dom);
+            int64_t dc = colw_target_count(w);
             if (dc > UINT32_MAX) return RAY_ERR_RANGE;
             uint8_t keep_sorted = (s->dom == w->target_dom) ? (attrs & RAY_ATTR_SORTED) : 0;
             attrs = (uint8_t)(ray_sym_dict_width(dc) | keep_sorted | (attrs & RAY_ATTR_HAS_NULLS));
@@ -464,7 +471,7 @@ ray_err_t ray_col_save_ctx(ray_col_write_t* w, const char* path) {
         if (RAY_IS_ERR(col)) { ray_err_t e = ray_err_from_obj(col); ray_error_free(col); return e; }
     }
     if (col->type == RAY_SYM && w->target_dom)
-        return ray_col_save_sym_encoded(col, path, w->target_dom, w->durable);
+        return ray_col_save_sym_encoded_n(col, path, w->target_dom, w->durable, w->sym_count);
     return w->durable ? ray_col_save(col, path) : ray_col_save_bulk(col, path);
 }
 

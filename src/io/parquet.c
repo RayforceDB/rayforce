@@ -436,6 +436,7 @@ typedef struct {
     bool lz4_multichunk;   /* the last page failed to unpack and looks like a multi-chunk LZ4 frame */
     bool bool_rle;   /* BOOLEAN values RLE-encoded (encoding 3), in `ids` */
     bool page_all_present; /* OPTIONAL PLAIN page whose definition levels are all present */
+    bool dict_borrowed;    /* dict, strings and symbol_ids are a pq_shared_dict's, not freed here */
 } pq_column;
 /* A cursor is used by one decoder at a time. Flush each PLAIN batch before
  * advancing pages, so dictionary decoding may reuse the same heap scratch. */
@@ -598,8 +599,11 @@ static bool pq_schema_type(pq_schema* s, pq_span* f) {
 void ray_parquet_close(ray_parquet_t* r) {
     if (!r) return;
     if (r->cursors) for (int64_t i = 0; i < r->nselected; i++) {
-        ray_free_raw(r->cursors[i].page); ray_free_raw(r->cursors[i].dict);
-        ray_free_raw(r->cursors[i].strings); ray_free_raw(r->cursors[i].symbol_ids);
+        ray_free_raw(r->cursors[i].page);
+        if (!r->cursors[i].dict_borrowed) {
+            ray_free_raw(r->cursors[i].dict);
+            ray_free_raw(r->cursors[i].strings); ray_free_raw(r->cursors[i].symbol_ids);
+        }
         ray_free_raw(r->cursors[i].symbols);
     }
     ray_free_raw(r->cursors); ray_free_raw(r->selected); ray_free_raw(r->excluded);
@@ -2066,9 +2070,10 @@ static ray_t* pq_import_types(ray_parquet_t* r, ray_t* types) {
  * that the groups of many small files run in parallel, not file by file. */
 /* A unit of work is one partition, or several of one row group, or, for small
  * groups, the whole groups [a,b) (positions in the batch's flat list of row
- * groups, across files) packed into one partition. A reader without a row
- * group is a unit of its own with a == b. */
-typedef struct { int f; int64_t a, b, part; } pq_unit;
+ * groups, across files) packed into one partition, or a slice of a large
+ * group: its rows [lo, lo+rows), from partition part on. A reader without a
+ * row group is a unit of its own with a == b. */
+typedef struct { int f; int64_t a, b, part, lo, rows; } pq_unit;   /* rows > 0: a slice (pq_write_slice) */
 typedef struct {
     ray_parquet_t* const* parents; /* the readers */
     const int64_t* starts;         /* per reader: its first flat group; nparents+1 entries */
@@ -2079,12 +2084,74 @@ typedef struct {
     bool durable;
     pq_task_msg* emsg;             /* the failed units' messages */
     int64_t* fail_at;              /* per packed unit: the flat group it failed in, else -1 */
+    struct pq_dicts* dicts;        /* the groups' dictionaries, read once (slices only), else NULL */
 } pq_native_work;
+/* A column chunk's dictionary page, decoded and interned once before the
+ * tasks run, for every reader of the group to borrow (pq_lend_dicts). */
+typedef struct {
+    uint8_t* dict; pq_string* strings; int64_t* symbol_ids;
+    int64_t count;
+    const uint8_t *at, *after; /* the page's start and the chunk past it; NULL: none, read as before */
+} pq_shared_dict;
+typedef struct pq_dicts {
+    int64_t nsel;
+    pq_shared_dict* d;      /* [flat group * nsel + selected column] */
+    _Atomic(int64_t)* refs; /* per flat group: the units yet to finish with it */
+    int64_t* counts;        /* the domain's count before the groups and after each, or NULL */
+} pq_dicts;
+static void pq_dicts_free_group(pq_dicts* ds, int64_t t) {
+    for (int64_t i = 0; i < ds->nsel; i++) {
+        pq_shared_dict* d = &ds->d[t*ds->nsel+i];
+        ray_free_raw(d->dict); ray_free_raw(d->strings); ray_free_raw(d->symbol_ids);
+        memset(d,0,sizeof(*d));
+    }
+}
+/* A unit is done with the groups [a,b): the last one frees them. */
+static void pq_dicts_done(pq_dicts* ds, int64_t a, int64_t b) {
+    if (ds) for (int64_t t = a; t < b; t++)
+        if (atomic_fetch_sub_explicit(&ds->refs[t],1,memory_order_acq_rel) == 1) pq_dicts_free_group(ds,t);
+}
+/* The count a unit's partitions stamp in their SYM columns: the domain's
+ * after the unit's last group, as one worker leaves it then; 0, the
+ * domain's count at the write, without the pre-read. */
+static int64_t pq_unit_stamp(const pq_native_work* w, const pq_unit* u) {
+    return w->dicts && w->dicts->counts ? w->dicts->counts[u->b] : 0;
+}
+/* The group's borrowed dictionaries into a started reader's cursors: each
+ * at its chunk's start steps past the page, as reading it would. */
+static void pq_lend_dicts(const pq_native_work* w, ray_parquet_t* r, int64_t t) {
+    if (!w->dicts) return;
+    for (int64_t i = 0; i < r->nselected; i++) {
+        const pq_shared_dict* d = &w->dicts->d[t*w->dicts->nsel+i];
+        pq_column* c = &r->cursors[i];
+        if (!d->after || c->have_dict || c->chunk.p != d->at || d->after > c->chunk.end) continue;
+        c->chunk.p = d->after;
+        c->dict = d->dict; c->dict_cap = 0; c->strings = d->strings; c->symbol_ids = d->symbol_ids;
+        c->dict_count = d->count; c->have_dict = true; c->dict_borrowed = true;
+    }
+}
+/* A reader of flat group t (of reader f), started, with the borrowed
+ * dictionaries; NULL with *e on failure, as the reader's first batch
+ * would fail.  Without borrowed dictionaries the group starts at the first
+ * batch, as before. */
+static ray_parquet_t* pq_unit_reader(const pq_native_work* w, int f, int64_t t, ray_t** e) {
+    ray_parquet_t* p = w->parents[f];
+    ray_parquet_t* r = pq_group_reader(p,t-w->starts[f],p->nselected);
+    *e = NULL;
+    if (!r) { *e = ray_error("oom",NULL); return NULL; }
+    if (!w->dicts) return r;
+    int64_t bad;
+    r->group++;
+    const char* err = pq_start_group(r,&bad);
+    if (err) { r->failed = true; *e = pq_col_error(r,err,bad); ray_parquet_close(r); return NULL; }
+    pq_lend_dicts(w,r,t);
+    return r;
+}
 /* These partitions are private to the import staging directory. Persist the
  * shared vocabulary once after all workers join, before publishing the root.
  * Flushing it here rewrites the growing dictionary for every partition. */
 static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* leaf,
-                                   const char* sym, bool durable, ray_compress_t mode) {
+                                   const char* sym, bool durable, ray_compress_t mode, int64_t stamp) {
     ray_sym_domain_t* domain = NULL;
     for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].import_domain) domain = r->schema[c].import_domain;
     /* No import domain means no SYM column, so the vocabulary is untouched.
@@ -2113,6 +2180,7 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
         cw.name = ray_str_ptr(name);
         e = ray_col_resolve_gen_err(mode,col,NULL,ray_str_ptr(name),ray_str_len(name),&cw.gen);
         cw.target_dom = col->type == RAY_SYM ? domain : NULL;
+        cw.sym_count = stamp;   /* 0: the domain's count now */
         cw.durable = durable;
         if (e == RAY_OK) e = ray_col_save_ctx(&cw,path);
         ray_col_src_release(&cw.src);
@@ -2130,7 +2198,7 @@ static ray_err_t pq_save_partition(ray_parquet_t* r, ray_t* batch, const char* l
 }
 /* One decoded batch as the partition `part` of the staged table. */
 static ray_t* pq_write_batch(ray_parquet_t* r, ray_t* batch, const char* root, const char* table,
-                             int64_t part, bool durable) {
+                             int64_t part, bool durable, int64_t stamp) {
     char sym[1200]; snprintf(sym,sizeof(sym),"%s/.sym",root);
     /* Native zones are built while the bounded decoded batch is resident. */
     if (durable) for (int64_t c = 0; c < r->ncols; c++) {
@@ -2148,16 +2216,16 @@ static ray_t* pq_write_batch(ray_parquet_t* r, ray_t* batch, const char* root, c
      * the workers finish, avoiding a directory fsync per column rename. */
     ray_err_t e = n < 0 || (size_t)n >= sizeof(leaf) ? RAY_ERR_RANGE :
         pq_save_partition(r,batch,leaf,sym,false,
-                          durable ? (ray_compress_t)r->compress : RAY_COMPRESS_OFF);
+                          durable ? (ray_compress_t)r->compress : RAY_COMPRESS_OFF,stamp);
     if (e != RAY_OK) return ray_error(ray_err_code_str(e),"parquet: native partition write failed");
     return NULL;
 }
 static ray_t* pq_write_reader(ray_parquet_t* r, const char* root, const char* table,
-                              int64_t part, bool durable) {
+                              int64_t part, bool durable, int64_t stamp) {
     for (;;) {
         ray_t* batch = ray_parquet_next(r);
         if (!batch || RAY_IS_ERR(batch)) return batch;
-        ray_t* err = pq_write_batch(r,batch,root,table,part++,durable);
+        ray_t* err = pq_write_batch(r,batch,root,table,part++,durable,stamp);
         ray_release(batch);
         if (err) return err;
     }
@@ -2199,8 +2267,8 @@ static ray_t* pq_write_pack(const pq_native_work* w, const pq_unit* u, int64_t* 
     for (int64_t t = u->a; t < u->b && !err; t++) {
         f = pq_flat_reader(w,f,t);
         *fail_at = t;     /* a failure from here on is this group's, so its file is named */
-        ray_parquet_t* r = pq_group_reader(w->parents[f],t-w->starts[f],w->parents[f]->nselected);
-        if (!r) { err = ray_error("oom",NULL); break; }
+        ray_parquet_t* r = pq_unit_reader(w,f,t,&err);
+        if (!r) break;
         for (;;) {
             ray_t* batch = ray_parquet_next(r);
             if (!batch) break;
@@ -2217,27 +2285,96 @@ static ray_t* pq_write_pack(const pq_native_work* w, const pq_unit* u, int64_t* 
         tbl = ray_table_add_col(tbl,p0->schema[p0->selected[c]].name,vectors[c]);
     if (!tbl || RAY_IS_ERR(tbl)) { err = tbl ? tbl : ray_error("oom",NULL); goto done; }
     *fail_at = u->a;
-    err = pq_write_batch(p0,tbl,w->root,w->table,u->part,w->durable);
+    err = pq_write_batch(p0,tbl,w->root,w->table,u->part,w->durable,pq_unit_stamp(w,u));
     ray_release(tbl);
 done:
     for (int64_t c = 0; c < nout; c++) if (vectors[c]) ray_release(vectors[c]);
     ray_free_raw(vectors);
     return err;
 }
+/* One slice of a large row group: its own reader steps over the rows before
+ * the slice (whole pages by their headers, as an excluded range is stepped
+ * over, then the rest of the page the slice starts in), then writes the
+ * slice's rows as its partitions, in the batches the whole group's reader
+ * would make.  Every page is read in full by the slice it starts in or the
+ * one before, and the last slice ends the chunks, so the checks are the
+ * whole group's. */
+static ray_t* pq_write_slice(const pq_native_work* w, const pq_unit* u) {
+    ray_parquet_t* p = w->parents[u->f];
+    ray_parquet_t* r = pq_group_reader(p,u->a-w->starts[u->f],p->nselected);
+    if (!r) return ray_error("oom",NULL);
+    int64_t bad;
+    r->group++;
+    const char* err = pq_start_group(r,&bad);
+    ray_t* e = NULL;
+    if (!err) pq_lend_dicts(w,r,u->a);
+    if (!err && (r->nexcluded || r->group_left < u->lo+u->rows)) err = "invalid row group row count";
+    for (int64_t i = 0; !err && u->lo && i < r->nselected; i++) {
+        /* with the import domain: the dictionary page read here is the one
+         * the slice's own rows decode with */
+        err = pq_discard(&r->cursors[i],&r->schema[r->selected[i]],u->lo);
+        if (err) bad = r->selected[i];
+    }
+    if (err) { r->failed = true; e = pq_col_error(r,err,bad); }
+    else {
+        r->group_left = u->rows;
+        e = pq_write_reader(r,w->root,w->table,u->part,w->durable,pq_unit_stamp(w,u));
+    }
+    ray_parquet_close(r);
+    return e;
+}
 static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t end) {
     (void)worker; pq_native_work* w = ptr;
     for (int64_t t = start; t < end; t++) {
         const pq_unit* u = &w->units[t];
         if (u->b-u->a > 1) w->errors[t] = pq_write_pack(w,u,&w->fail_at[t]);
-        else if (u->a == u->b) w->errors[t] = pq_write_reader(w->parents[u->f],w->root,w->table,u->part,w->durable);
+        else if (u->a == u->b) w->errors[t] = pq_write_reader(w->parents[u->f],w->root,w->table,u->part,w->durable,pq_unit_stamp(w,u));
+        else if (u->rows) w->errors[t] = pq_write_slice(w,u);
         else {
-            ray_parquet_t* r = pq_group_reader(w->parents[u->f],u->a-w->starts[u->f],w->parents[u->f]->nselected);
-            if (!r) { w->errors[t] = ray_error("oom",NULL); pq_task_msg_note(w->emsg,t); continue; }
-            w->errors[t] = pq_write_reader(r,w->root,w->table,u->part,w->durable);
-            ray_parquet_close(r);
+            ray_parquet_t* r = pq_unit_reader(w,u->f,u->a,&w->errors[t]);
+            if (r) {
+                w->errors[t] = pq_write_reader(r,w->root,w->table,u->part,w->durable,pq_unit_stamp(w,u));
+                ray_parquet_close(r);
+            }
         }
+        pq_dicts_done(w->dicts,u->a,u->b);
         if (w->errors[t]) pq_task_msg_note(w->emsg,t);
     }
+}
+static int64_t pq_chunk_vocab(ray_parquet_t* r, pq_span* mf, bool* dict_only);
+static bool pq_dict_header(ray_parquet_t* r, int64_t dict, int64_t* raw, int64_t* entries);
+static inline int64_t pq_sat_add(int64_t a, int64_t b);
+static inline int64_t pq_sat_mul(int64_t a, int64_t b);
+/* Test seams (debug builds only): slicing off, and the slice units
+ * planned.  Without them slicing is always on and nothing is counted. */
+#if defined(DEBUG)
+static bool pq_test_no_slices;
+static int64_t pq_test_sliced;
+void ray_parquet_test_slices(bool on) { pq_test_no_slices = !on; pq_test_sliced = 0; }
+int64_t ray_parquet_test_sliced(void) { return pq_test_sliced; }
+#define PQ_TEST_NO_SLICES pq_test_no_slices
+#define PQ_TEST_SLICED(n) (pq_test_sliced += (n))
+#else
+#define PQ_TEST_NO_SLICES false
+#define PQ_TEST_SLICED(n) ((void)0)
+#endif
+/* Whether group g's partitions may be written by slices: a plain import (no
+ * row filter), and every symbol column's strings its dictionary page's, so
+ * the domain receives them in the dictionary's order whichever slice reads
+ * it first, as when one task reads the whole group. */
+static bool pq_sliceable(ray_parquet_t* r, int64_t g) {
+    if (r->filter_pos >= 0 || r->text_pattern) return false;
+    pq_span* cols = ray_alloc_raw((size_t)r->ncols*sizeof(*cols));
+    int64_t rows;
+    bool ok = cols && pq_group_columns(r,g,cols,&rows,NULL);
+    for (int64_t i = 0; ok && i < r->nselected; i++) {
+        if (!r->schema[r->selected[i]].import_domain) continue;
+        pq_span mf[17]; bool dict_only;
+        ok = pq_fields(cols[r->selected[i]],mf,17);
+        if (ok) { pq_chunk_vocab(r,mf,&dict_only); ok = dict_only; }
+    }
+    ray_free_raw(cols);
+    return ok;
 }
 /* Plan the partitions, numbered from base, of the readers' row groups taken in
  * order: a group over its batch size gets several partitions, the others are
@@ -2246,10 +2383,13 @@ static void pq_write_group(void* ptr, uint32_t worker, int64_t start, int64_t en
  * partitions. A pack never crosses the readers handed in, and the caller ends a batch
  * of readers at PQ_FILE_BATCH files or PQ_BATCH_PARTS*rows rows, so the layout
  * depends on those two constants as well as on `rows`: deterministic, but a batch
- * boundary can cost one partition more than a single batch would make. units has
- * room for every group and every reader; starts for nrs+1 entries. On failure, *failed is the reader at fault. */
+ * boundary can cost one partition more than a single batch would make. A group
+ * over its batch size is one unit, or with `slices` up to that many slice
+ * units of whole partitions.  units NULL: only *nunits is counted, for the
+ * caller to size units; starts has nrs+1 entries. On failure, *failed is the
+ * reader at fault. */
 static ray_t* pq_plan_units(ray_parquet_t* const* rs, int nrs, int64_t base, pq_unit* units,
-                            int64_t* nunits, int64_t* starts, int64_t* parts, int* failed) {
+                            int64_t* nunits, int64_t* starts, int64_t* parts, int* failed, int64_t slices) {
     int64_t nu = 0, flat = 0, packrows = 0, packlimit = 0; bool open = false;
     *parts = 0; starts[0] = 0;
     for (int f = 0; f < nrs; f++) {
@@ -2258,7 +2398,8 @@ static ray_t* pq_plan_units(ray_parquet_t* const* rs, int nrs, int64_t base, pq_
         *failed = f;
         if (!r->ngroups) {   /* its one, empty, partition */
             open = false;
-            units[nu++] = (pq_unit){f,flat,flat,base+*parts}; (*parts)++;
+            if (units) units[nu] = (pq_unit){f,flat,flat,base+*parts,0,0};
+            nu++; (*parts)++;
             continue;
         }
         for (int64_t g = 0; g < r->ngroups; g++, flat++) {
@@ -2269,13 +2410,24 @@ static ray_t* pq_plan_units(ray_parquet_t* const* rs, int nrs, int64_t base, pq_
             int64_t limit = pq_group_batch(r,g);
             int64_t n = rows > limit ? 1+(rows-1)/limit : 1;
             if (base > INT64_MAX-*parts || *parts > INT64_MAX-base-n) return pq_error("too many partitions");
-            if (rows > limit) {
-                units[nu++] = (pq_unit){f,flat,flat+1,base+*parts}; *parts += n; open = false;
+            int64_t per = slices ? (n+slices-1)/slices : 0;
+            if (rows > limit && per && per < n) {
+                for (int64_t k = 0; k < n; k += per) {
+                    int64_t lo = k*limit, len = rows-lo < per*limit ? rows-lo : per*limit;
+                    if (units) units[nu] = (pq_unit){f,flat,flat+1,base+*parts+k,lo,len};
+                    nu++;
+                }
+                *parts += n; open = false;
+            } else if (rows > limit) {
+                if (units) units[nu] = (pq_unit){f,flat,flat+1,base+*parts,0,0};
+                nu++; *parts += n; open = false;
             } else if (open && rows <= (limit < packlimit ? limit : packlimit)-packrows) {
-                units[nu-1].b = flat+1; packrows += rows;
+                if (units) units[nu-1].b = flat+1;
+                packrows += rows;
                 if (limit < packlimit) packlimit = limit;
             } else {
-                units[nu++] = (pq_unit){f,flat,flat+1,base+*parts}; (*parts)++;
+                if (units) units[nu] = (pq_unit){f,flat,flat+1,base+*parts,0,0};
+                nu++; (*parts)++;
                 open = true; packrows = rows; packlimit = limit;
             }
         }
@@ -2283,28 +2435,149 @@ static ray_t* pq_plan_units(ray_parquet_t* const* rs, int nrs, int64_t base, pq_
     *nunits = nu;
     return NULL;
 }
+/* Slices of several groups would read their groups' dictionary pages in
+ * whatever order the workers reach them, and the symbol domain takes the
+ * strings in that order; each slice would also decode its group's
+ * dictionary again.  So, when there are slices, every dictionary page of
+ * the readers' groups is read here once, group by group in file order and
+ * by column within a group, as one worker reaches them; the units borrow
+ * the decoded pages (pq_lend_dicts), and counts[] keeps the domain's size
+ * after each group for the partitions' headers (pq_unit_stamp).  The
+ * decoder's own steps read each page.  A chunk without a dictionary is
+ * passed over; a page that cannot be read stops the reading, its unit and
+ * the later ones read their pages as before (and report the bad one), and
+ * the counts are not kept.  NULL when out of memory: the units read their
+ * pages themselves. */
+static pq_dicts* pq_read_dicts(ray_parquet_t* const* rs, int nrs, int64_t nflat) {
+    int64_t nsel = rs[0]->nselected;
+    ray_sym_domain_t* domain = NULL;
+    for (int64_t i = 0; i < nsel; i++)
+        if (rs[0]->schema[rs[0]->selected[i]].import_domain) domain = rs[0]->schema[rs[0]->selected[i]].import_domain;
+    pq_dicts* ds = ray_calloc_raw(sizeof(*ds));
+    if (!ds) return NULL;
+    ds->nsel = nsel;
+    ds->d = ray_calloc_raw((size_t)(nflat ? nflat : 1)*(size_t)(nsel ? nsel : 1)*sizeof(*ds->d));
+    ds->refs = ray_calloc_raw((size_t)(nflat ? nflat : 1)*sizeof(*ds->refs));
+    ds->counts = domain ? ray_alloc_raw((size_t)(nflat+1)*sizeof(*ds->counts)) : NULL;
+    if (!ds->d || !ds->refs || (domain && !ds->counts)) {
+        ray_free_raw(ds->d); ray_free_raw(ds->refs); ray_free_raw(ds->counts); ray_free_raw(ds);
+        return NULL;
+    }
+    if (ds->counts) ds->counts[0] = ray_sym_domain_count(domain);
+    bool ok = true;
+    for (int f = 0, t = 0; f < nrs; f++) {
+        ray_parquet_t* r = rs[f];
+        pq_span* cols = ok ? ray_calloc_raw((size_t)r->ncols*sizeof(*cols)) : NULL;
+        if (!cols) ok = false;
+        for (int64_t g = 0; g < r->ngroups; g++, t++) {
+            int64_t rows = 0;
+            if (ok && !pq_group_columns(r,g,cols,&rows,NULL)) ok = false;
+            for (int64_t i = 0; ok && rows && i < nsel; i++) {
+                int64_t c = r->selected[i]; pq_span mf[17];
+                if (!pq_fields(cols[c],mf,17)) { ok = false; break; }
+                int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1), codec = pq_get(mf[4],-1);
+                int64_t bytes = pq_get(mf[7],-1);
+                if (dict < 4 || dict >= data) continue;   /* no dictionary page */
+                if (!pq_codec_supported(codec) || bytes < 0 || (uint64_t)dict > r->data_end ||
+                    (uint64_t)bytes > r->data_end-(uint64_t)dict) { ok = false; break; }
+                pq_cur cur = {r->map+dict,r->map+dict+bytes,false};
+                pq_span pf[10]; int64_t raw, size, count;
+                const uint8_t* payload;
+                if (pq_page_take(&cur,pf,&raw,&size,&payload) || pq_page_crc(pf,payload,size) ||
+                    pq_get(pf[1],-1) != 2) { ok = false; break; }
+                pq_column col = {0};
+                col.codec = (int)codec;
+                pq_schema sch = r->schema[c];
+                ok = pq_dict_page(&col,&sch,pf,payload,size,raw,&count);
+                ray_free_raw(col.symbols);
+                if (!ok) { ray_free_raw(col.dict); ray_free_raw(col.strings); ray_free_raw(col.symbol_ids); break; }
+                ds->d[t*nsel+i] = (pq_shared_dict){col.dict,col.strings,col.symbol_ids,col.dict_count,r->map+dict,cur.p};
+            }
+            if (ds->counts) ds->counts[t+1] = ray_sym_domain_count(domain);
+        }
+        ray_free_raw(cols);
+    }
+    if (!ok && ds->counts) { ray_free_raw(ds->counts); ds->counts = NULL; }
+    return ds;
+}
+static void pq_dicts_free(pq_dicts* ds, int64_t nflat) {
+    if (!ds) return;
+    for (int64_t t = 0; t < nflat; t++) pq_dicts_free_group(ds,t);
+    ray_free_raw(ds->d); ray_free_raw(ds->refs); ray_free_raw(ds->counts); ray_free_raw(ds);
+}
+/* Whether slicing the readers' large groups pays.  Only when the units of
+ * one per group are fewer than the workers (else the pool is busy anyway),
+ * every group may be sliced (pq_sliceable), and the estimate, in decoded
+ * values, of the sliced import (every dictionary entry read once before
+ * the tasks, PQ_DICT_ENTRY_COST values each, then all the rows across the
+ * workers) is under three quarters of the import of one task a group
+ * (the largest group: its rows and its own dictionaries). */
+#define PQ_DICT_ENTRY_COST 4
+static bool pq_slicing_pays(ray_parquet_t* const* rs, int nrs, int64_t units, uint32_t workers) {
+    if (workers < 2 || units >= (int64_t)workers) return false;
+    int64_t entries = 0, values = 0, largest = 0;
+    for (int f = 0; f < nrs; f++) {
+        ray_parquet_t* r = rs[f];
+        pq_span* cols = ray_calloc_raw((size_t)r->ncols*sizeof(*cols));
+        if (!cols) return false;
+        for (int64_t g = 0; g < r->ngroups; g++) {
+            int64_t rows = 0, own = 0;
+            if (!pq_group_columns(r,g,cols,&rows,NULL)) { ray_free_raw(cols); return false; }
+            if (!rows) continue;   /* nothing to read, as the decoder skips it */
+            if (!pq_sliceable(r,g)) { ray_free_raw(cols); return false; }
+            for (int64_t i = 0; i < r->nselected; i++) {
+                pq_span mf[17]; int64_t raw, n;
+                if (!pq_fields(cols[r->selected[i]],mf,17)) continue;
+                int64_t dict = pq_get(mf[11],-1), data = pq_get(mf[9],-1);
+                if (dict >= 4 && dict < data && pq_dict_header(r,dict,&raw,&n)) own = pq_sat_add(own,n);
+            }
+            int64_t v = pq_sat_mul(rows,r->nselected);
+            entries = pq_sat_add(entries,own); values = pq_sat_add(values,v);
+            int64_t cost = pq_sat_add(v,pq_sat_mul(own,PQ_DICT_ENTRY_COST));
+            if (cost > largest) largest = cost;
+        }
+        ray_free_raw(cols);
+    }
+    int64_t sliced = pq_sat_add(pq_sat_mul(entries,PQ_DICT_ENTRY_COST),values/(int64_t)workers);
+    return sliced < largest/4*3;
+}
 /* Plan and write the row groups of nrs readers, in parallel across all of them,
  * as partitions from `base`; *parts is how many. On failure, *failed is the reader
  * owning the first failed unit. */
 static ray_t* pq_write_readers(ray_parquet_t* const* rs, int nrs, const char* root, const char* table,
                                bool durable, int64_t base, int64_t* parts, int* failed) {
     *failed = -1;
-    int64_t ngroups = 0;
-    for (int f = 0; f < nrs; f++) ngroups += rs[f]->ngroups;
-    pq_unit* units = ray_alloc_raw((size_t)(ngroups+nrs)*sizeof(*units));
     int64_t* starts = ray_alloc_raw((size_t)(nrs+1)*sizeof(*starts));
-    if (!units || !starts) { ray_free_raw(units); ray_free_raw(starts); return ray_error("oom",NULL); }
-    int64_t nunits = 0;
-    ray_t* err = pq_plan_units(rs,nrs,base,units,&nunits,starts,parts,failed);
+    if (!starts) return ray_error("oom",NULL);
+    /* A group of many partitions is split into about two slices a worker,
+     * so a file of a few large groups keeps the pool busy as one of many
+     * small groups does.  Without workers to share them, one unit a group. */
+    uint32_t workers = PQ_TEST_NO_SLICES ? 0 : ray_pool_size();
+    int64_t nunits = 0, slices = 0, nflat = 0;
+    for (int f = 0; f < nrs; f++) nflat += rs[f]->ngroups;
+    ray_t* err = pq_plan_units(rs,nrs,base,NULL,&nunits,starts,parts,failed,0);
+    if (!err && pq_slicing_pays(rs,nrs,nunits,workers)) {
+        slices = 2*(int64_t)workers;
+        err = pq_plan_units(rs,nrs,base,NULL,&nunits,starts,parts,failed,slices);
+    }
+    pq_unit* units = err ? NULL : ray_alloc_raw((size_t)(nunits ? nunits : 1)*sizeof(*units));
+    if (!err && !units) err = ray_error("oom",NULL);
+    if (!err) err = pq_plan_units(rs,nrs,base,units,&nunits,starts,parts,failed,slices);
+    int64_t nsliced = 0;
+    for (int64_t t = 0; !err && t < nunits; t++) nsliced += units[t].rows > 0;
+    PQ_TEST_SLICED(nsliced);
+    pq_dicts* dicts = !err && nsliced ? pq_read_dicts(rs,nrs,nflat) : NULL;
+    for (int64_t t = 0; dicts && t < nunits; t++)
+        for (int64_t g = units[t].a; g < units[t].b; g++) atomic_fetch_add_explicit(&dicts->refs[g],1,memory_order_relaxed);
     ray_t** errors = err ? NULL : ray_calloc_raw((size_t)(nunits+1)*sizeof(*errors));
     int64_t* fail_at = err || !errors ? NULL : ray_alloc_raw((size_t)(nunits+1)*sizeof(*fail_at));
     if (!err && !fail_at) err = ray_error("oom",NULL);
-    if (err) { ray_free_raw(units); ray_free_raw(starts); ray_free_raw(errors); return err; }
+    if (err) { pq_dicts_free(dicts,nflat); ray_free_raw(units); ray_free_raw(starts); ray_free_raw(errors); return err; }
     for (int64_t t = 0; t <= nunits; t++) fail_at[t] = -1;
     *failed = -1;
     pq_task_msg emsg;
     pq_task_msg_reset(&emsg);
-    pq_native_work work = {rs,starts,units,nrs,root,table,errors,durable,&emsg,fail_at};
+    pq_native_work work = {rs,starts,units,nrs,root,table,errors,durable,&emsg,fail_at,dicts};
     ray_pool_t* pool = nunits > 1 ? ray_pool_get() : NULL;
     if (!ray_pool_par_dispatch_ok(pool,nunits,2)) pool = NULL;
     if (pool) {
@@ -2319,6 +2592,7 @@ static ray_t* pq_write_readers(ray_parquet_t* const* rs, int nrs, const char* ro
         } else ray_error_free(errors[t]);
     }
     if (!err && ray_interrupted()) err = ray_error("cancel","parquet conversion interrupted");
+    pq_dicts_free(dicts,nflat);   /* what an interrupted or failed unit left */
     ray_free_raw(fail_at); ray_free_raw(errors); ray_free_raw(starts); ray_free_raw(units);
     return err;
 }
