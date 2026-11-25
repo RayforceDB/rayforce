@@ -41,7 +41,7 @@
 static void fn_set_name(ray_t* obj, const char* name) {
     memset(obj->aux, 0, 16);
     size_t len = strlen(name);
-    if (len > 13) len = 13;
+    if (len > RAY_FN_NAME_INLINE) len = RAY_FN_NAME_INLINE;
     memcpy(obj->aux + 2, name, len);
 }
 
@@ -172,6 +172,25 @@ int64_t ray_env_builtin_sym(const ray_t* fn) {
     if (!fn) return -1;
     for (int32_t i = 0; i < g_env.count; i++)
         if (g_env.vals[i] == fn) return g_env.keys[i];
+    return -1;
+}
+
+int64_t ray_env_builtin_own_sym(const ray_t* fn) {
+    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY))
+        return -1;
+    const char* nm = ray_fn_name(fn);
+    size_t n = 0;
+    while (n < RAY_FN_NAME_INLINE && nm[n]) n++;
+    if (n == 0) return -1;
+    if (n < RAY_FN_NAME_INLINE) return ray_sym_intern(nm, n);   /* the whole name */
+    /* inlined to its first RAY_FN_NAME_INLINE bytes: the global holding
+     * `fn` whose name starts with them, not merely the first holding it */
+    for (int32_t i = 0; i < g_env.count; i++) {
+        if (g_env.vals[i] != fn) continue;
+        ray_t* s = ray_sym_str(g_env.keys[i]);
+        if (s && ray_str_len(s) >= n && memcmp(ray_str_ptr(s), nm, n) == 0)
+            return g_env.keys[i];
+    }
     return -1;
 }
 

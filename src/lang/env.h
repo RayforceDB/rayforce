@@ -169,6 +169,14 @@ int32_t ray_env_global_count(void);
  * 13 bytes (ray_fn_name). */
 int64_t ray_env_builtin_sym(const ray_t* fn);
 
+/* A builtin's own registered name, read from the function object: after
+ * (set first raise) the object `first` holds reports `raise`, where
+ * ray_env_builtin_sym answers the first global holding it.  A name longer
+ * than the object inlines is completed from the global env.  -1 when `fn`
+ * is no builtin. */
+#define RAY_FN_NAME_INLINE 13
+int64_t ray_env_builtin_own_sym(const ray_t* fn);
+
 /* Local scope stack for lexical binding (let, do, lambda) */
 ray_err_t ray_env_push_scope(void);
 void      ray_env_mark_lexical_scope(int32_t below);

@@ -1,0 +1,71 @@
+;; .repl.signature: how a named global is called, read without calling it
+;; (#947).  Lambdas give their parameters, builtins their calling convention
+;; and documented usage; a missing name is an ordinary result.
+(set zsg_add (fn [a b] (+ a b)))
+(set zsg_calls 0)
+(set zsg_bump (fn [x] (set zsg_calls (+ zsg_calls 1)) x))
+(set zsg_v 42)
+(set zsg_D (dict ['f 'n] (list (fn [x y z] x) 5)))
+;; a lambda
+(at (.repl.signature 'zsg_add) 'kind) -- 'lambda
+(at (.repl.signature 'zsg_add) 'params) -- ['a 'b]
+(at (.repl.signature 'zsg_add) 'arity) -- 2
+(at (.repl.signature 'zsg_add) 'callable) -- true
+(at (.repl.signature 'zsg_add) 'special) -- false
+(at (.repl.signature 'zsg_add) 'usage) -- ""
+;; an alias reports the function it holds; a reassignment the new one
+(set zsg_al zsg_add)
+(at (.repl.signature 'zsg_al) 'params) -- ['a 'b]
+(set zsg_add (fn [x] x))
+(at (.repl.signature 'zsg_add) 'params) -- ['x]
+(at (.repl.signature 'zsg_al) 'params) -- ['a 'b]
+;; asking does not call the function
+(.repl.signature 'zsg_bump)
+zsg_calls -- 0
+;; builtins: the calling convention, the usage text, the own name
+(at (.repl.signature 'count) 'kind) -- 'unary
+(at (.repl.signature '+) 'kind) -- 'binary
+(at (.repl.signature 'select) 'kind) -- 'vary
+(at (.repl.signature 'min) 'usage) -- "(min <x: vector, atom or list>) or (min <a: num> <b: num>)"
+(at (.repl.signature 'min) 'arity) -- 0Nl
+(set zsg_m min)
+(at (.repl.signature 'zsg_m) 'builtin) -- 'min
+(at (.repl.signature 'zsg_m) 'kind) -- 'unary
+;; the builtin's own name is read from the function object, not from the
+;; first global holding it: a builtin name rebound to another builtin
+;; reports the one it holds now, with that one's usage
+(set zsg_first first)
+(set first raise)
+(at (.repl.signature 'first) 'builtin) -- 'raise
+(at (.repl.signature 'first) 'usage) -- (at (.repl.signature 'raise) 'usage)
+(set first zsg_first)
+(at (.repl.signature 'first) 'builtin) -- 'first
+(set zsg_keep count)
+(set count til)
+(at (.repl.signature 'count) 'builtin) -- 'til
+(at (.repl.signature 'count) 'usage) -- (at (.repl.signature 'til) 'usage)
+(set count zsg_keep)
+(at (.repl.signature 'count) 'builtin) -- 'count
+(at (.repl.signature 'zsg_keep) 'builtin) -- 'count
+;; a name longer than the object inlines, directly and through an alias
+(at (.repl.signature '.sys.querylog.enable) 'builtin) -- '.sys.querylog.enable
+(set zsg_q .sys.querylog.enable)
+(at (.repl.signature 'zsg_q) 'builtin) -- '.sys.querylog.enable
+(at (.repl.signature 'zsg_q) 'usage) -- (at (.repl.signature '.sys.querylog.enable) 'usage)
+;; special forms and restricted builtins
+(at (.repl.signature 'if) 'special) -- true
+(at (.repl.signature 'set) 'special) -- true
+(at (.repl.signature 'set) 'restricted) -- true
+(at (.repl.signature '.sys.exec) 'restricted) -- true
+(at (.repl.signature '.repl.signature) 'usage) -- "(.repl.signature <name: sym>)"
+;; a value, a dict member, a missing name
+(at (.repl.signature 'zsg_v) 'kind) -- 'value
+(at (.repl.signature 'zsg_v) 'callable) -- false
+(at (.repl.signature 'zsg_D.f) 'params) -- ['x 'y 'z]
+(at (.repl.signature 'zsg_D.n) 'kind) -- 'value
+(at (.repl.signature 'zsg_nosuch) 'kind) -- 'missing
+(at (.repl.signature 'zsg_nosuch) 'bound) -- false
+(at (.repl.signature 'zsg_D.nosuch) 'bound) -- false
+;; the argument is a symbol
+(.repl.signature "zsg_add") !- type
+(.repl.signature 42) !- type
