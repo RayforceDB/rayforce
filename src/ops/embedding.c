@@ -437,8 +437,9 @@ static void knn_task(void* vctx, uint32_t worker, int64_t start, int64_t end) {
  * k nearest of the rows of `col` (all, or the n listed in `only`) to the
  * query, into ids and dists, nearest first.  Returns how many, or one of the
  * codes below; *bad_row is then the row that is no vector of the dimension. */
-static int64_t knn_scan(ray_t* col, const int64_t* only, int64_t n, const emb_query_t* q,
-                        ray_hnsw_metric_t metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
+static int64_t knn_scan(ray_t* col, const int64_t* part_rows, int64_t n_parts, const int64_t* only, int64_t n,
+                        const emb_query_t* q, ray_hnsw_metric_t metric, int64_t k, int64_t* ids, double* dists,
+                        int64_t* bad_row) {
     if (k > n) k = n;
     if (k <= 0) return 0;
     /* The column as segments with the row each begins at: a list is one. */
@@ -454,7 +455,12 @@ static int64_t knn_scan(ray_t* col, const int64_t* only, int64_t n, const emb_qu
         made_off = (int64_t*)ray_alloc_raw((size_t)(ns + 1) * sizeof(int64_t));
         if (!made_off) return RAY_EMB_KNN_OOM;
         made_off[0] = 0;
-        for (int64_t s = 0; s < ns; s++) made_off[s + 1] = made_off[s] + (segs[s] ? segs[s]->len : 0);
+        /* A partition that lacks the column still has its rows, and they are
+         * numbered: counted as every reader of a parted column counts them
+         * (parted_seg_rows), so that a row number means here what it means to
+         * the filter before the search and to the gather after it. */
+        for (int64_t s = 0; s < ns; s++)
+            made_off[s + 1] = made_off[s] + parted_seg_rows((ray_t**)ray_data(col), s, part_rows, n_parts);
         off = made_off;
         if (ns == 0 || off[ns] == 0) { ray_free_raw(made_off); return 0; }
     }
@@ -491,8 +497,8 @@ static int64_t knn_scan(ray_t* col, const int64_t* only, int64_t n, const emb_qu
     return out;
 }
 
-int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float* query, int32_t dim,
-                         int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
+int64_t ray_emb_knn_scan(ray_t* col, const int64_t* part_rows, int64_t n_parts, const int64_t* only, int64_t n,
+                         const float* query, int32_t dim, int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row) {
     emb_query_t q;
     q.d = (double*)ray_calloc_raw((size_t)(dim > 0 ? dim : 1) * (sizeof(double) + sizeof(float)));
     if (!q.d) return RAY_EMB_KNN_OOM;
@@ -501,7 +507,7 @@ int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float
     double ns = 0.0;
     for (int32_t j = 0; j < dim; j++) { q.f[j] = query[j]; q.d[j] = (double)query[j]; ns += q.d[j] * q.d[j]; }
     q.norm = sqrt(ns);
-    int64_t out = knn_scan(col, only, n, &q, (ray_hnsw_metric_t)metric, k, ids, dists, bad_row);
+    int64_t out = knn_scan(col, part_rows, n_parts, only, n, &q, (ray_hnsw_metric_t)metric, k, ids, dists, bad_row);
     emb_query_drop(&q);
     return out;
 }
@@ -555,7 +561,7 @@ ray_t* ray_knn_fn(ray_t** args, int64_t n) {
         if (dv && !RAY_IS_ERR(dv)) ray_release(dv);
         return ray_error("oom", NULL);
     }
-    int64_t got = knn_scan(col, NULL, nrows, &q, metric, k, (int64_t*)ray_data(rv), (double*)ray_data(dv), NULL);
+    int64_t got = knn_scan(col, NULL, 0, NULL, nrows, &q, metric, k, (int64_t*)ray_data(rv), (double*)ray_data(dv), NULL);
     emb_query_drop(&q);
     if (got < 0) {
         ray_release(rv); ray_release(dv);

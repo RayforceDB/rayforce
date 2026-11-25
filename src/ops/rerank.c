@@ -34,6 +34,7 @@
 #include "lang/eval.h"
 #include "store/hnsw.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ==========================================================================
@@ -341,6 +342,13 @@ ray_t* exec_ann_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
  *  exec_knn_rerank — brute force over a filtered column
  * ========================================================================== */
 
+/* A row the search found, and which it was among those found. */
+typedef struct { int64_t row, found; } rr_found_t;
+static int rr_found_cmp(const void* a, const void* b) {
+    int64_t x = ((const rr_found_t*)a)->row, y = ((const rr_found_t*)b)->row;
+    return x < y ? -1 : x > y;
+}
+
 ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     if (!ext) return ray_error("nyi", NULL);
@@ -403,7 +411,9 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     /* The accepted rows (all of them when there is no filter) go through the
      * one exact search .emb.knn has. */
     int64_t bad_row = -1;
-    int64_t heap_size = ray_emb_knn_scan(col, accepted, accepted_count, query, dim,
+    int64_t n_parts = 0;
+    const int64_t* part_rows = parted ? parted_table_counts(src, &n_parts) : NULL;
+    int64_t heap_size = ray_emb_knn_scan(col, part_rows, n_parts, accepted, accepted_count, query, dim,
                                          ext->rerank.metric, k_eff, out_ids, out_ds, &bad_row);
     if (accepted) ray_free_raw(accepted);
     if (heap_size < 0) {
@@ -425,17 +435,13 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     if (parted && heap_size > 0) {
         /* The rows are gathered in the order they lie (the gather of a parted
          * table's rows wants them so), then laid out nearest first. */
-        int64_t* asc = (int64_t*)ray_alloc_raw((size_t)heap_size * 3 * sizeof(int64_t));
-        if (asc) {
-            int64_t* ord = asc + heap_size;        /* ord[j]: which found row is j-th by row number */
-            int64_t* at = ord + heap_size;         /* at[i]: where found row i lies among the gathered */
-            for (int64_t i = 0; i < heap_size; i++) ord[i] = i;
-            for (int64_t i = 1; i < heap_size; i++) {            /* k is small: insertion by row number */
-                int64_t x = ord[i], j = i - 1;
-                while (j >= 0 && out_ids[ord[j]] > out_ids[x]) { ord[j + 1] = ord[j]; j--; }
-                ord[j + 1] = x;
-            }
-            for (int64_t j = 0; j < heap_size; j++) { asc[j] = out_ids[ord[j]]; at[ord[j]] = j; }
+        int64_t* asc = (int64_t*)ray_alloc_raw((size_t)heap_size * 2 * sizeof(int64_t));
+        rr_found_t* by_row = (rr_found_t*)ray_alloc_raw((size_t)heap_size * sizeof(rr_found_t));
+        if (asc && by_row) {
+            int64_t* at = asc + heap_size;         /* at[i]: where found row i lies among the gathered */
+            for (int64_t i = 0; i < heap_size; i++) by_row[i] = (rr_found_t){ out_ids[i], i };
+            qsort(by_row, (size_t)heap_size, sizeof *by_row, rr_found_cmp);
+            for (int64_t j = 0; j < heap_size; j++) { asc[j] = by_row[j].row; at[by_row[j].found] = j; }
             ray_t* flat = ray_table_gather_rows(src, asc, heap_size);
             if (flat && !RAY_IS_ERR(flat)) {
                 result = gather_rows_with_dist(flat, at, out_ds, heap_size);
@@ -443,8 +449,9 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
             } else {
                 result = flat;
             }
-            ray_free_raw(asc);
         }
+        if (asc) ray_free_raw(asc);
+        if (by_row) ray_free_raw(by_row);
     } else {
         result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
     }

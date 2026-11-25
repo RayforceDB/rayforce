@@ -45,4 +45,19 @@
 (set F2 (select {from: P}))
 (select {from: P nearest: (.emb.knn v (vec 730) 'l2) take: 6}) -- (select {from: F2 nearest: (.emb.knn v (vec 730) 'l2) take: 6})
 (at (at (select {from: P nearest: (.emb.knn v (vec 730) 'l2) take: 1}) 'doc) 0) -- 730
+;; ────────────── a partition that lacks the vectors ──────────────
+;; Its rows keep their numbers: the partitions after it answer with their own
+;; rows, and a search that reaches a row without a vector says so, as over a
+;; flat table.
+(.sys.exec "rm -rf /tmp/rfl_nearest_parted")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.01/t/" (mk 0 100) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.02/t/" (select {from: (mk 100 50) doc: doc kind: kind note: note}) "/tmp/rfl_nearest_parted/.sym")
+(.db.splayed.set "/tmp/rfl_nearest_parted/2024.01.03/t/" (mk 150 100) "/tmp/rfl_nearest_parted/.sym")
+(set R (.db.parted.get "/tmp/rfl_nearest_parted/" 't))
+(count R) -- 250
+(at (at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v (vec 160) 'l2) take: 1}) 'doc) 0) -- 160
+(at (at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v (vec 249) 'l2) take: 1}) 'doc) 0) -- 249
+(at (at (select {from: R where: (== date 2024.01.03) nearest: (.emb.knn v (vec 249) 'l2) take: 1}) 'note) 0) -- "a note about row 249 of the journal"
+(at (select {from: R where: (!= date 2024.01.02) nearest: (.emb.knn v Q 'l2) take: 11}) 'doc) -- (at (select {from: (select {from: R where: (!= date 2024.01.02)}) nearest: (.emb.knn v Q 'l2) take: 11}) 'doc)
+(select {from: R nearest: (.emb.knn v Q 'l2) take: 3}) !- type
 (.sys.exec "rm -rf /tmp/rfl_nearest_parted")

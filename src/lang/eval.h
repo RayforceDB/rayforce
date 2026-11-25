@@ -517,12 +517,16 @@ ray_t* ray_hnsw_info_fn(ray_t* h);
  * through the partitions; all of them, or the n listed in `only`) to `query`, into ids and dists, nearest
  * first, lower being closer (an inner product comes negated).  Returns how
  * many, or a code below; on RAY_EMB_KNN_BAD_ROW *bad_row is the row that is
- * no numeric vector of length dim.  `metric` is a ray_hnsw_metric_t. */
+ * no numeric vector of length dim.  `metric` is a ray_hnsw_metric_t.
+ * For a parted column, part_rows[0, n_parts) are its table's rows a
+ * partition (parted_table_counts): a partition that lacks the column keeps
+ * its rows' numbers, and a search that reaches one of them reports it as a
+ * bad row.  NULL for a list. */
 #define RAY_EMB_KNN_OOM       (-1)
 #define RAY_EMB_KNN_BAD_ROW   (-2)
 #define RAY_EMB_KNN_CANCELLED (-3)
-int64_t ray_emb_knn_scan(ray_t* col, const int64_t* only, int64_t n, const float* query, int32_t dim,
-                         int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row);
+int64_t ray_emb_knn_scan(ray_t* col, const int64_t* part_rows, int64_t n_parts, const int64_t* only, int64_t n,
+                         const float* query, int32_t dim, int metric, int64_t k, int64_t* ids, double* dists, int64_t* bad_row);
 ray_t* ray_emb_model_get_fn(ray_t* path);
 ray_t* ray_emb_model_info_fn(ray_t* h);
 ray_t* ray_emb_tokens_fn(ray_t* h, ray_t* x);
