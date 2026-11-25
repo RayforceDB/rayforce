@@ -86,20 +86,20 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `avg` | unary, aggr | Arithmetic mean | `(avg [1 2 3])` → `2.0` |
 | `min` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise minimum of two values; f32 input answers f32 | `(min [3 9 1] [2 10 4])` → `[2 9 1]` |
 | `max` | unary aggr, or binary atomic | Reduce one vector, or choose the element-wise maximum of two values; f32 input answers f32 | `(max [3 9 1] 5)` → `[5 9 5]` |
-| `med` | unary, aggr | Median value (returns f64) | `(med [1 3 2])` → `2.0` |
+| `med` | unary, aggr | Median value (returns f64); a vector of another type than numbers and temporals is a type error, empty or not | `(med [1 3 2])` → `2.0` |
 | `mode` | unary, aggr | Most frequent non-null value; ties keep the first encountered value | `(mode [1 2 2 3])` → `2` |
-| `dev` | unary, aggr | Population standard deviation | `(dev [1 2 3])` → `0.816...` |
-| `stddev` | unary, aggr | Sample standard deviation | `(stddev [1 2 3])` → `1.0` |
+| `dev` | unary, aggr | Population standard deviation; a vector of another type than numbers and temporals is a type error, empty or not | `(dev [1 2 3])` → `0.816...` |
+| `stddev` | unary, aggr | Sample standard deviation; a vector of another type than numbers and temporals is a type error, empty or not | `(stddev [1 2 3])` → `1.0` |
 | `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
 | `dev_pop` | unary, aggr | Population standard deviation alias | `(dev_pop [1 2 3])` |
-| `var` | unary, aggr | Sample variance | `(var [1 2 3])` → `1.0` |
+| `var` | unary, aggr | Sample variance; a vector of another type than numbers and temporals is a type error, empty or not | `(var [1 2 3])` → `1.0` |
 | `var_pop` | unary, aggr | Population variance ([accuracy](math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
 | `cov` | binary, aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
 | `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |
 | `wsum` | binary, aggr | Weighted sum, `sum(weights * values)`, skipping null pairs | `(wsum [1 3] [10 20])` → `70.0` |
 | `wavg` | binary, aggr | Weighted average, `wsum / sum(weights)`; null for zero total weight | `(wavg [1 3] [10 20])` → `17.5` |
-| `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0` | `(quantile [1 2 3 4] 0.5)` → `2.5` |
+| `quantile` | binary, aggr | Exact linear-interpolated quantile; probability is `0.0..1.0`; a vector of another type than numbers and temporals is a type error, empty or not | `(quantile [1 2 3 4] 0.5)` → `2.5` |
 | `percentile` | binary, aggr | Exact linear-interpolated percentile; probability is `0..100` | `(percentile [1 2 3 4] 50)` → `2.5` |
 | `first` | unary | First element of vector. A direct call takes the element by position, nulls included, for every type: `(first [0Nl 1])` is `0Nl`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, `""` in a STR column and `'` in a SYM one, like `0Nl` in an I64 one (grouped `(first s)` over `["" "x"]` is `"x"`, a direct `(first ["" "x"])` is `""`; see [Nulls in a query](math.md#first-last-nulls)), whether its argument is a column or computed (`(first (+ d 1))`, `(first (if c d 0Nd))`); a computed argument that reads no column, such as `(first (take X 4))`, stays positional | `(first [10 20 30])` → `10`, `(first [0Nl 1])` → `0Nl` |
 | `last` | unary | Last element of vector. A direct call takes the element by position, nulls included, for every type: `(at v (- (count v) 1))`. Inside `select … by:`, or as the aggregate of a keyless select output, nulls of a typed vector are skipped, `""` in a STR column and `'` in a SYM one, like `0Nl` in an I64 one (grouped `(last s)` over `["x" ""]` is `"x"`, a direct `(last ["x" ""])` is `""`; see [Nulls in a query](math.md#first-last-nulls)), whether its argument is a column or computed (`(last (+ d 1))`, `(last (if c d 0Nd))`); a computed argument that reads no column, such as `(last (take X 4))`, stays positional | `(last [10 20 30])` → `30`, `(last [1 2 0Nl])` → `0Nl` |
