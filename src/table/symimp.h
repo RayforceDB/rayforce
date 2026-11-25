@@ -52,6 +52,16 @@ ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count);
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                              const size_t* lens, const uint64_t* hashes,
                              int64_t* out_pos);
+/* As ray_symimp_intern_batch, for strings a lookup (ray_symimp_find_batch)
+ * did not find: added in order under the lock, each looked up there only
+ * (another batch may have added it since), none looked up without it. */
+bool ray_symimp_add_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                          const size_t* lens, const uint64_t* hashes, int64_t* out_pos);
+/* The positions of the strings already there, -1 for the others, adding
+ * none: the batch's lookups alone, thread-safe and without the lock.
+ * False while the dictionary is reserved (its index then misses records). */
+bool ray_symimp_find_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                           const size_t* lens, const uint64_t* hashes, int64_t* out_pos);
 /* Write the header count and start writing back what was added since the
  * last call; `durable` cuts the file to its records and syncs it. */
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable);

@@ -2280,6 +2280,56 @@ static test_result_t test_pq_group_slices_order(void) {
     TEST_ASSERT_TRUE(same);
     PASS();
 }
+/* One import of src into dest for test_pq_sym_order: kind 0 partitioned a
+ * partition a row group, 1 several partitions a group, 2 splayed. */
+static ray_t* pq_sym_order_import(int kind, const char* src, const char* dest, ray_t* types,
+                                  char* msg, size_t cap) {
+    if (kind < 2) return pq_parted_rows(src,dest,kind ? 2500 : 65536,types,msg,cap);
+    pq_rm_rf(dest);
+    ray_t* r = ray_parquet_splayed_typed(src,dest,types);
+    snprintf(msg,cap,"%s",r && RAY_IS_ERR(r) ? ray_error_msg() : "");
+    return r;
+}
+/* #1681: two symbol columns of dictionary chunks share the import's symbol
+ * file, over row groups the pool decodes at once; at any worker count the
+ * symbol file and the symbol counts in the columns' headers are the
+ * one-worker import's, byte for byte, run after run, partitioned (a
+ * partition a group, and several a group) and splayed. */
+static test_result_t test_pq_sym_order(void) {
+    char path[160], a[160], b[160], part[200], msg[512];
+    snprintf(path,sizeof(path),"/tmp/rayforce-pq-symorder-%d.parquet",(int)getpid());
+    snprintf(a,sizeof(a),"/tmp/rayforce-pq-symorder-%d",(int)getpid());
+    snprintf(b,sizeof(b),"/tmp/rayforce-pq-symorder-%d-one",(int)getpid());
+    snprintf(part,sizeof(part),"%s.parquet-partial",a);
+    int64_t ids[] = {ray_sym_intern("I32",3),ray_sym_intern("SYM",3),ray_sym_intern("SYM",3)};
+    ray_t* syms = ray_vec_from_raw(RAY_SYM,ids,3);
+    pq_synth_dict = 6;   /* s and t dictionaries */
+    TEST_ASSERT_TRUE(pq_synth(path,24000,4,pq_synth_mixed));
+    pq_synth_dict = 0;
+    static const int workers[] = {2,4,16};
+    bool same = true;
+    for (int kind = 0; same && kind < 3; kind++) {
+        pq_rm_rf(b); pq_rm_rf(part);
+        TEST_ASSERT_EQ_I(pq_pool(1), RAY_OK);
+        ray_t* r = pq_sym_order_import(kind,path,a,syms,msg,sizeof(msg));
+        TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,24000); ray_release(r);
+        TEST_ASSERT_EQ_I(rename(a,b),0);
+        for (size_t w = 0; same && w < sizeof(workers)/sizeof(*workers); w++) {
+            TEST_ASSERT_EQ_I(pq_pool(workers[w]), RAY_OK);
+            for (int k = 0; same && k < 20; k++) {
+                r = pq_sym_order_import(kind,path,a,syms,msg,sizeof(msg));
+                TEST_ASSERT_FALSE(RAY_IS_ERR(r)); TEST_ASSERT_EQ_I(r->i64,24000); ray_release(r);
+                same = pq_same_tree(a,b);
+                if (!same) fprintf(stderr,"  import %d differs at %d workers, run %d\n",kind,workers[w],k);
+                pq_rm_rf(a);
+            }
+        }
+    }
+    pq_rm_rf(a); pq_rm_rf(b); pq_rm_rf(part); unlink(path); ray_release(syms);
+    ray_pool_destroy();
+    TEST_ASSERT_TRUE(same);
+    PASS();
+}
 /* #1206: a row group of many partitions is written by several tasks, each a
  * slice of its rows, and the import is the one a task per group makes. */
 static test_result_t test_pq_group_slices(void) {
@@ -4735,7 +4785,7 @@ static test_result_t test_pq_symgrp_empty_group(void) {
     TEST_ASSERT_FALSE(!res || RAY_IS_ERR(res)); ray_release(res);
     if (!pqx_check(dir, 2400, 3, nm, fns, "empty group, small", NULL)) bad++;
     bool ud = pq_trace_line_has(trace, "parquet symcol: col=u ", " mode=direct");
-    if (!ud || strstr(trace, "parquet symseed:")) { fprintf(stderr, "  empty group, small: u %s\n", ud ? "direct, seeded" : "grouped"); bad++; }
+    if (!ud) { fprintf(stderr, "  empty group, small: u grouped\n"); bad++; }
     pq_remove_native(dir, fnames, 4);
     unlink(src);
     ray_pool_destroy();
@@ -4903,9 +4953,10 @@ static test_result_t test_pq_sk_codec_message(void) {
             }
             fprintf(stderr, "  sk codec %zu %s %d: %s: %s%s\n", v, mixed ? "mixed" : "direct", cores, failed ? "failed" : "imported",
                     msg ? msg : "(no message)", mixed ? "" : pd ? " (p direct)" : " (p grouped)");
-            /* the mixed import fails in its seeding, before its symcol lines:
-             * the seeding checks what it interns as the decoder would (no
-             * page the pass then refuses is interned first: no symseed line) */
+            /* every import fails in its seeding (the direct ones' too, since
+             * #1681): the seeding checks what it interns as the decoder would
+             * (no page the pass then refuses is interned first: no symseed
+             * line) */
             if (!failed || !msg || !strstr(msg, cases[v].want) || !strstr(msg, "(column p)") || (!mixed && !pd)) bad++;
             if (!run && msg) snprintf(first, sizeof(first), "%s", msg);
             if (run && (!msg || strcmp(first, msg))) bad++;   /* the same words on any worker, and seeding */
@@ -5789,6 +5840,7 @@ const test_entry_t parquet_entries[] = {
     {"parquet/parted_files",test_pq_parted_files,pq_setup,pq_teardown},
     {"parquet/group_slices",test_pq_group_slices,pq_setup,pq_teardown},
     {"parquet/group_slices_order",test_pq_group_slices_order,pq_setup,pq_teardown},
+    {"parquet/sym_order",test_pq_sym_order,pq_setup,pq_teardown},
     {"parquet/parted_many_files",test_pq_parted_many_files,pq_setup,pq_teardown},
     {"parquet/parted_pack_error",test_pq_parted_pack_error,pq_setup,pq_teardown},
     {"parquet/lz4_multichunk",test_pq_lz4_multichunk,pq_setup,pq_teardown},
