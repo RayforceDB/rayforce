@@ -1603,10 +1603,13 @@ static void sym_map_len_rows(void* vctx, uint32_t wid, int64_t lo, int64_t hi) {
         if (((b0 - lo) & (RAY_MORSEL_ELEMS - 1)) == 0 && pool_cancelled(c->pool)) return;
         int n = (int)(hi - b0 < 64 ? hi - b0 : 64);
         int64_t ids[64]; const char* sp[64]; size_t sl[64];
-        for (int j = 0; j < n; j++) {
+        /* b0 < hi, so n >= 1: the fill runs at least once (written so,
+         * the read below takes ids[0, n) all filled) */
+        int j = 0;
+        do {
             ids[j] = ray_read_sym(base, b0 + j, RAY_SYM, attrs);
             if (ids[j] < 0 || ids[j] >= c->dn) { atomic_store_explicit(&c->bad, 1, memory_order_relaxed); return; }
-        }
+        } while (++j < n);
         sym_map_read(c, ids, n, sp, sl);
         for (int j = 0; j < n; j++) c->olen[b0 + j] = sym_map_olen(c->m, sl[j]);
     }
