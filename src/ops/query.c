@@ -5149,6 +5149,43 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
             head_is_builtin_unary(fn, ray_rank_fn));
 }
 
+/* Does `e` call a whole-column verb (is_whole_column_projection's list:
+ * distinct, where, reverse, asc, desc, iasc, idesc, rank) below its top,
+ * where the projection always evaluates it: in an argument of a builtin
+ * call, or as the last form of a `do`?  Scattered per row, such a verb sees
+ * one cell: `(+ 0 (reverse c))` gave the column unreversed and `(do 0 (iasc
+ * c))` raised `type`, where update and by: read the whole column (#1654).
+ * Not inside a lambda, a quote, an `if` arm or any other special form, which
+ * keep the row-by-row semantics; the caller leaves an expression with an
+ * aggregate to its own path (one value, or reduced before the scatter). */
+static bool expr_nests_whole_verb(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 64) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
+    if (tbl_has_col(tbl, h->i64) || ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    if (fn->attrs & RAY_FN_SPECIAL_FORM) {
+        if (h->i64 != ray_sym_intern("do", 2)) return false;
+        ray_t* last = es[e->len - 1];
+        return is_whole_column_projection(last, tbl) || expr_nests_whole_verb(last, tbl, depth + 1);
+    }
+    if (depth > 0) {
+        static const char* const verbs[] = { "distinct", "where", "reverse", "asc", "desc", "iasc", "idesc", "rank" };
+        ray_t* nm = ray_sym_str(h->i64);
+        if (nm) {
+            size_t l = ray_str_len(nm);
+            const char* pp = ray_str_ptr(nm);
+            for (size_t k = 0; k < sizeof verbs / sizeof *verbs; k++)
+                if (l == strlen(verbs[k]) && memcmp(pp, verbs[k], l) == 0) return true;
+        }
+    }
+    for (int64_t i = 1; i < e->len; i++)
+        if (expr_nests_whole_verb(es[i], tbl, depth + 1)) return true;
+    return false;
+}
+
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
                                  int max_out, int n, bool sym_vecs_data);
 static bool clause_runs_code_in(ray_t* v, ray_t* tbl, bool containers);
@@ -29865,7 +29902,11 @@ by_dict_done:
                      * one value of the (kept) column, as an aggregate is
                      * (#1429) */
                     bool group_scalar = ray_table_nrows(tbl) > 0 &&
-                        (expr_reads_group_whole(e, tbl) || helper_reads_group_whole(e, tbl)) &&
+                        (expr_reads_group_whole(e, tbl) || helper_reads_group_whole(e, tbl) ||
+                         /* at a one-value index of a whole-column verb's
+                          * value, `(at (reverse c) 0)`: one value too (#1654) */
+                         (!has_agg && !is_whole_column_projection(e, tbl) &&
+                          expr_nests_whole_verb(e, tbl, 0))) &&
                         expr_one_value(e, tbl, 0);
                     any_agg |= has_agg || group_scalar;
                     any_row_proj = group_scalar ? 0
@@ -29896,10 +29937,15 @@ by_dict_done:
                      * alias bound below as a one-row column must not be read
                      * per row.  A bare column name is the column itself. */
                     ray_t* expr = dict_elems[i + 1];
+                    /* a verb below the top (#1654): its value may be one
+                     * value, `(at (reverse c) 0)`, taken as such below */
+                    int nested_whole = !select_fallback_has_agg(expr) &&
+                                       !is_whole_column_projection(expr, tbl) &&
+                                       expr_nests_whole_verb(expr, tbl, 0);
                     int whole_verb = select_fallback_bulk_minmax(expr, tbl, nrows) ||
                                      (!(nrows == 0 && (expr_reads_group_whole(expr, tbl) ||
                                                        helper_reads_group_whole(expr, tbl))) &&
-                                      is_whole_column_projection(expr, tbl));
+                                      (is_whole_column_projection(expr, tbl) || nested_whole));
                     int one_value = !whole_verb &&
                                     (!any_row_proj ||
                                      (select_fallback_has_agg(expr) && !expr_refs_row_column(expr, tbl)) ||
@@ -29981,9 +30027,10 @@ by_dict_done:
                                     ray_release(col);
                                     col = cell ? cell : ray_error("oom", NULL);
                                 }
-                                bool whole_atom = whole_verb && gwhole && col && !RAY_IS_ERR(col) &&
-                                    (ray_is_atom(col) || (col->type == RAY_LIST && col->len == 1 &&
-                                                          expr_one_value(expr, eval_tbl, 0)));
+                                bool whole_atom = whole_verb && col && !RAY_IS_ERR(col) &&
+                                    ((gwhole && (ray_is_atom(col) || (col->type == RAY_LIST && col->len == 1 &&
+                                                                      expr_one_value(expr, eval_tbl, 0)))) ||
+                                     (nested_whole && ray_is_atom(col)));
                                 if (whole_atom) one_value = 1;
                                 scalar_col = col && !RAY_IS_ERR(col) && (one_value || enlist_scalar || whole_atom) &&
                                     (ray_is_atom(col) || (ray_is_vec(col) && ray_len(col) == 1) ||
