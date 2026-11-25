@@ -8,6 +8,7 @@
 #include "test_rfl.h"
 #include "ops/agg_engine.h"
 #include "ops/agg_registry.h"
+#include "store/serde.h"      /* ray_ser: answers compared byte for byte */
 #include "core/pool.h"
 #include "core/platform.h"
 #include "page_cache.h"   /* ray_test_file_refaults: the fault budgets */
@@ -6605,6 +6606,124 @@ static test_result_t test_cd_groups_row_gather_cancel_at_dispatch(void) {
     PASS();
 }
 
+/* #1635: a TIMESPAN group key takes the route a TIMESTAMP key holding the
+ * same values takes (v2, in memory and partitioned), not the legacy ladder,
+ * and every answer is the legacy route's (route 1 forces it), byte for
+ * byte: single and two-key, a key with nulls, under where:.  The one
+ * exception is the dense slots (a small range of keys), below. */
+static bool span_key_ser_eq(ray_t* a, ray_t* b) {
+    ray_t* sa = ray_ser(a);
+    ray_t* sb = ray_ser(b);
+    bool eq = sa && sb && !RAY_IS_ERR(sa) && !RAY_IS_ERR(sb) && sa->len == sb->len &&
+              memcmp(ray_data(sa), ray_data(sb), (size_t)sa->len) == 0;
+    if (sa && !RAY_IS_ERR(sa)) ray_release(sa);
+    if (sb && !RAY_IS_ERR(sb)) ray_release(sb);
+    return eq;
+}
+static test_result_t test_timespan_key_v2_route(void) {
+    char dir[96];
+    snprintf(dir, sizeof dir, "/tmp/rf_agg_span_key_%lld", wave_pid());
+    (void)ray_test_rm_rf(dir);
+    char src[1400];
+    snprintf(src, sizeof src,
+        "(set skn 200000) (set skh (%% (* (til skn) 7919) 24)) "
+        "(set SK (table [t s k v] (list (as 'TIMESTAMP (* 3600000000000 skh)) (* 0D01:00:00 skh) "
+        "(%% (til skn) 5) (as 'F64 (%% (* (til skn) 7919) 1000))))) "
+        "(set SK (update {tn: t sn: s from: SK})) "
+        "(set SK (update {tn: 0Np sn: 0Nn from: SK where: (== (%% (til skn) 13) 0)})) "
+        "(.db.splayed.set \"%s/1/T/\" (take SK 50000)) (.db.splayed.set \"%s/2/T/\" (take (drop SK 50000) 50000)) "
+        "(.db.splayed.set \"%s/3/T/\" (take (drop SK 100000) 50000)) (.db.splayed.set \"%s/4/T/\" (drop SK 150000)) "
+        "(set SP (.db.parted.get \"%s/\" 'T))", dir, dir, dir, dir, dir);
+    ray_t* setup = ray_eval_str(src);
+    TEST_ASSERT_FMT(setup && !RAY_IS_ERR(setup), "setup: %s", ray_error_msg());
+    ray_release(setup);
+    static const char* const tabs[] = { "SK", "SP" };
+    /* the key, with %c for the temporal letter: s (TIMESPAN) or t (TIMESTAMP) */
+    static const char* const keys[] = { "%c", "[%c k]", "%cn" };
+    static const char* const aggs[] = {
+        "a: (avg v) n: (count v)", "sm: (sum v) mn: (min v) mx: (max v)", "f: (first v) l: (last v)",
+    };
+    static const char* const whs[] = { "", " where: (> v 100.0)" };
+    for (size_t ti = 0; ti < 2; ti++)
+        for (size_t ki = 0; ki < 3; ki++)
+            for (size_t ai = 0; ai < 3; ai++)
+                for (size_t wi = 0; wi < 2; wi++) {
+                    char key[16], qs[400], qt[400];
+                    char kfmt[16];
+                    snprintf(kfmt, sizeof kfmt, "%s", keys[ki]);
+                    snprintf(key, sizeof key, kfmt, 's');
+                    snprintf(qs, sizeof qs, "(select {from: %s by: %s %s%s})", tabs[ti], key, aggs[ai], whs[wi]);
+                    snprintf(key, sizeof key, kfmt, 't');
+                    snprintf(qt, sizeof qt, "(select {from: %s by: %s %s%s})", tabs[ti], key, aggs[ai], whs[wi]);
+                    agg_route_reset();
+                    ray_t* rt = ray_eval_str(qt);
+                    agg_route_stats_t st_t = agg_route_stats();
+                    agg_route_reset();
+                    ray_t* rs = ray_eval_str(qs);
+                    agg_route_stats_t st_s = agg_route_stats();
+                    ray_group_test_route(1);
+                    ray_t* rl = ray_eval_str(qs);
+                    ray_group_test_route(0);
+                    bool ok = rs && rt && rl && !RAY_IS_ERR(rs) && !RAY_IS_ERR(rt) && !RAY_IS_ERR(rl);
+                    bool same_route = memcmp(st_s.routes, st_t.routes, sizeof st_s.routes) == 0;
+                    bool same_answer = ok && span_key_ser_eq(rs, rl);
+                    uint64_t legacy = st_s.routes[AGG_ROUTE_LEGACY], legacy_t = st_t.routes[AGG_ROUTE_LEGACY];
+                    for (int k = 0; k < 3; k++) {
+                        ray_t* o = k == 0 ? rs : k == 1 ? rt : rl;
+                        if (o && RAY_IS_ERR(o)) ray_error_free(o); else if (o) ray_release(o);
+                    }
+                    TEST_ASSERT_FMT(ok, "%s: error", qs);
+                    TEST_ASSERT_FMT(same_route, "%s: routes differ from the TIMESTAMP key's (legacy %llu vs %llu)",
+                                    qs, (unsigned long long)legacy, (unsigned long long)legacy_t);
+                    TEST_ASSERT_FMT(same_answer, "%s: differs from the legacy route", qs);
+                }
+    /* Densely spaced span keys (a small range of nanoseconds), where a
+     * TIMESTAMP or I64 key takes the dense slots: a TIMESPAN key keeps a
+     * route that emits the groups in first-seen order, so a sort after the
+     * group keeps the documented tie order (the group whose first source
+     * row comes first wins a tie, docs/queries/select.md) and every answer,
+     * row order included, is the legacy route's. */
+    ray_t* dsetup = ray_eval_str(
+        "(set SD (table [s v k c] (list (as 'TIMESPAN (take [2 0Nl -1 0] 65536)) (take [1 2 3 4] 65536) "
+        "(% (til 65536) 3) (take [7] 65536)))) "
+        "(set SE (table [s v] (list (as 'TIMESPAN (take [2 0Nl -1 0 5 3] 200000)) (% (til 200000) 1000))))");
+    TEST_ASSERT_FMT(dsetup && !RAY_IS_ERR(dsetup), "dense setup: %s", ray_error_msg());
+    ray_release(dsetup);
+    static const char* const dq[] = {
+        "(select {from: SD by: s r: (count v) asc: r take: 2})",
+        "(select {from: SD by: s r: (count v) desc: r take: 2})",
+        "(select {from: SD by: s r: (count v) where: (> v 0) asc: r take: 2})",
+        "(select {from: SD by: [s c] r: (count v) asc: r take: 2})",
+        "(select {from: SD by: s r: (count v) s2: (sum v)})",
+        "(select {from: SD by: [s k] r: (count v) asc: r take: 3})",
+        "(select {from: SE by: s n: (count v) a: (avg v) asc: n take: 4})",
+        "(select {from: SE by: s n: (count v) f: (first v) l: (last v)})",
+    };
+    for (size_t q = 0; q < sizeof dq / sizeof dq[0]; q++) {
+        agg_route_reset();
+        ray_t* got = ray_eval_str(dq[q]);
+        agg_route_stats_t st = agg_route_stats();
+        ray_group_test_route(1);
+        ray_t* want = ray_eval_str(dq[q]);
+        ray_group_test_route(0);
+        bool ok = got && want && !RAY_IS_ERR(got) && !RAY_IS_ERR(want);
+        bool same = ok && span_key_ser_eq(got, want);
+        if (got && RAY_IS_ERR(got)) ray_error_free(got); else if (got) ray_release(got);
+        if (want && RAY_IS_ERR(want)) ray_error_free(want); else if (want) ray_release(want);
+        TEST_ASSERT_FMT(ok, "%s: error", dq[q]);
+        TEST_ASSERT_FMT(st.routes[AGG_ROUTE_LEGACY] == 0, "%s: took the legacy route", dq[q]);
+        TEST_ASSERT_FMT(same, "%s: differs from the legacy route (order included)", dq[q]);
+    }
+    /* the review's case: every group has 16384 rows, and 2 and null come first */
+    ray_t* tie = ray_eval_str("(as 'I64 (at (select {from: SD by: s r: (count v) asc: r take: 2}) 's))");
+    TEST_ASSERT_TRUE(tie && !RAY_IS_ERR(tie) && tie->type == RAY_I64 && tie->len == 2);
+    bool tie_ok = ((int64_t*)ray_data(tie))[0] == 2 && ((int64_t*)ray_data(tie))[1] == NULL_I64;
+    ray_release(tie);
+    TEST_ASSERT_FMT(tie_ok, "sorted take: not the first-seen groups [2 0Nl]");
+    (void)ray_test_rm_rf(dir);
+    PASS();
+}
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
@@ -6629,6 +6748,7 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/unary_types_values", test_unary_contracts, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_routes", test_f32_extrema_routes, contract_setup, contract_teardown },
     { "agg_contract/dense_key_prefetch_where", test_dense_key_prefetch_where, contract_setup, contract_teardown },
+    { "agg_contract/timespan_key_v2_route", test_timespan_key_v2_route, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_unflagged_nan", test_f32_extrema_unflagged_nan, contract_setup, contract_teardown },
     { "agg_contract/f32_extrema_large_routes", test_f32_extrema_large_routes, contract_setup, contract_teardown },
     { "agg_contract/pairwise_numeric", test_pairwise_numeric_contracts, contract_setup, contract_teardown },
