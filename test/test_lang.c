@@ -278,6 +278,9 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         "(set vc (as 'U8 [128 133 164])) (set ic [-927849349i -927849348i 0Ni]) (set _ntc (table [v i] (list vc ic)))",
         "(set xc [1 2 3]) (set yc [1 2 0Nl]) (set _nty (table [x y] (list xc yc)))",
         "(set _nt100 (table [x] (list (til 100))))",
+        "(set _bx (til 70000))",
+        "(set _bk (as 'I16 (- (% (til 70000) 2001) 1000)))",
+        "(set _bigT (table [x k] (list _bx _bk)))",
         NULL,
     };
     for (int q = 0; setup[q]; q++)
@@ -391,6 +394,11 @@ static test_result_t test_narrow_sum_bound_routes(void) {
         { NS_Q("(select {s: (sum (* -12038h 0x7f)) from: _nt100})", "-2149800"), REF },
         /* Plain I64 pair SUM accounts for sentinel hits directly, without a bounds scan. */
         { NS_Q("(select {s: (sum (+ x y)) from: (table [x y] (list _nI _nI))})", "(sum (+ _nI _nI))"), PRE },
+        /* #1463: the selected route declines on dense selections over large
+         * tables (>= 65,536 rows, more than half kept). Sparse selections on
+         * the same table keep it. */
+        { NS_Q("(select {s: (sum (+ x 1)) from: _bigT where: (< k 0)})", "(sum (+ (at _bx (where (< _bk 0))) 1))"), NSR(NARROW_SUM_SELECTED) },
+        { NS_Q("(select {s: (sum (+ x 1)) from: _bigT where: (> k -500)})", "(sum (+ (at _bx (where (> _bk -500))) 1))"), SCAN },
         { NULL, 0 },
     };
     test_result_t r = narrow_sum_run_cases(cases);

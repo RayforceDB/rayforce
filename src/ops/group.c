@@ -17152,10 +17152,6 @@ static ray_t* exec_group_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     bool use_selected = sc_route && rowsel && !match_idx && n_aggs <= 2;
     for (uint32_t a = 0; use_selected && a < n_aggs; ++a)
         if (ext->agg_ops[a] != OP_SUM && ext->agg_ops[a] != OP_AVG && ext->agg_ops[a] != OP_COUNT) use_selected = false;
-    /* Dense selections: the per-row loop walks every step and tests the
-     * null sentinel per row, where dev runs each step as a vector pass.
-     * The review of 59bacb8f measured the crossover near one half of the
-     * rows kept for one step, lower for more; decline past it (#1463). */
     /* Dense selections over large tables: the per-row loop walks every
      * step and tests the null sentinel per row, where dev runs each step as
      * a vector pass. The review of 59bacb8f measured the crossover near one
