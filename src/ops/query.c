@@ -509,7 +509,16 @@ static ray_op_t* dag_temporal_mod(ray_graph_t* g, const char* name, size_t len,
  *     builtin.
  * The temporal side is a column or a lowered pair (not a literal, not a
  * partition key's MAPCOMMON wrapper); the integer side a column or a
- * non-null integer literal. */
+ * non-null integer literal.
+ *
+ * A TIMESPAN beside a TIMESTAMP is an integer side too (#1633): both are
+ * nanosecond counts in an I64 lane, and ray_timespan_binary adds them as
+ * the I64 kernel does, wrapping, with a null on either side null.  A
+ * TIMESPAN literal is planned as its I64 count; a TIMESPAN column as the
+ * column.  Unlike an integer, a span minus a timestamp is defined (a
+ * TIMESTAMP), so both orders of - are admitted.  A TIMESPAN beside a DATE
+ * or a TIME converts units (days, milliseconds) and stays with the
+ * builtin. */
 static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t len,
                                         ray_op_t* left, ray_op_t* right,
                                         int8_t left_type, int8_t right_type) {
@@ -522,7 +531,8 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
     int8_t tt = lt_temp ? left_type : right_type;
     int8_t xt = lt_temp ? right_type : left_type;
     if (RAY_IS_PARTED(tt) || RAY_IS_PARTED(xt)) return NULL;
-    if (!add && !lt_temp && tt != RAY_TIME) return NULL;   /* int - DATE: an error */
+    bool xspan = xt == RAY_TIMESPAN && tt == RAY_TIMESTAMP;
+    if (!add && !lt_temp && tt != RAY_TIME && !xspan) return NULL;   /* int - DATE: an error */
     if (tv->out_type != tt || xv->out_type != xt) return NULL;
     /* The builtin reads a sentinel in either operand as null; the DAG reads
      * it as null only where its source says so.  So the temporal side is a
@@ -531,9 +541,22 @@ static ray_op_t* dag_temporal_int_arith(ray_graph_t* g, const char* name, size_t
      * sentinel (`(+ i 1i)` at I32 max) would be added as a number. */
     if (tv->opcode != OP_SCAN && !(tv->flags & OP_FLAG_TEMPORAL_INT)) return NULL;
     if (xv->opcode != OP_SCAN && xv->opcode != OP_CONST) return NULL;
-    if (xt != RAY_BOOL && xt != RAY_U8 && xt != RAY_I16 && xt != RAY_I32 && xt != RAY_I64)
+    if (xt != RAY_BOOL && xt != RAY_U8 && xt != RAY_I16 && xt != RAY_I32 && xt != RAY_I64 && !xspan)
         return NULL;
-    if (xv->opcode == OP_CONST) {
+    if (xv->opcode == OP_CONST && xspan) {
+        /* the span literal as its nanosecond count, an I64 constant */
+        ray_op_ext_t* xe = find_ext(g, xv->id);
+        ray_t* lit = xe ? xe->literal : NULL;
+        if (!lit || RAY_IS_ERR(lit) || lit->type != -RAY_TIMESPAN || RAY_ATOM_IS_NULL(lit))
+            return NULL;
+        ray_t* a = ray_i64(lit->i64);
+        if (!a || RAY_IS_ERR(a)) return NULL;
+        uint32_t tid = tv->id;
+        xv = ray_const_atom(g, a);
+        ray_release(a);
+        if (!xv) return NULL;
+        tv = &g->nodes[tid];
+    } else if (xv->opcode == OP_CONST) {
         int64_t c = 0;
         if (!const_op_i64(g, xv, &c)) return NULL;
         if (tt != RAY_TIMESTAMP && xt == RAY_I64) {

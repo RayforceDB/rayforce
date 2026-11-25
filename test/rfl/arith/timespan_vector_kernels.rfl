@@ -1,0 +1,39 @@
+;; #1633: TIMESTAMP and TIMESPAN plus or minus a TIMESPAN (or an I64 beside
+;; a TIMESPAN), and the comparisons with a TIMESPAN, on vectors run
+;; whole-vector kernels on the pool; a select output of a TIMESTAMP plus a
+;; span is lowered to the I64 kernel instead of evaluated row by row.  The
+;; answers are the per-cell span_eval's: a null on either side is null, a
+;; sum wraps (and one landing on the null sentinel reads as null), a
+;; TIMESTAMP compared with a span is its time of day, a null compares
+;; lowest.  The route is pinned by types/timespan_vector_kernels_route.
+(set TS [2024.03.05D10:00:00.000000000 0Np 1960.01.01D23:00:00.000000001 2262.04.11D23:47:16.854775806 2024.03.05D00:00:00.000000000])
+(set SP [0D01:00:00 0Nn -0D00:00:00.000000005 0D00:00:00.000000002 0Wn])
+(set SP2 [0D00:30:00 0D00:00:01 0Nn -0Wn 0D00:00:00.000000002])
+(set EX (as 'TIMESPAN [9223372036854775807 -9223372036854775807 1 -1]))
+(set EX2 (as 'TIMESPAN [1 -1 -9223372036854775807 9223372036854775807]))
+(set EXT (as 'TIMESTAMP [9223372036854775807 -9223372036854775807 1 -9223372036854775807]))
+(set T (table [ts sp] (list TS SP)))
+(repr (+ TS 0D01:00:00)) -- "[2024.03.05D11:00:00.000000000 0Np 1960.01.02D00:00:00.000000001 2262.04.12D00:47:16.854775806 2024.03.05D01:00:00.000000000]"
+(repr (- TS 0D01:00:00)) -- "[2024.03.05D09:00:00.000000000 0Np 1960.01.01D22:00:00.000000001 2262.04.11D22:47:16.854775806 2024.03.04D23:00:00.000000000]"
+(repr (+ 0D01:00:00 TS)) -- "[2024.03.05D11:00:00.000000000 0Np 1960.01.02D00:00:00.000000001 2262.04.12D00:47:16.854775806 2024.03.05D01:00:00.000000000]"
+(repr (- 0D01:00:00 TS)) -- "[1975.10.28D15:00:00.000000000 0Np 2039.12.31D01:59:59.999999999 1737.09.21D01:12:43.145224194 1975.10.29D01:00:00.000000000]"
+(repr (+ TS 0Nn)) -- "[0Np 0Np 0Np 0Np 0Np]"
+(repr (+ SP 0D00:00:01)) -- "[0D01:00:01.000000000 0Nn 0D00:00:00.999999995 0D00:00:01.000000002 -106751D23:47:15.854775809]"
+(repr (- SP SP2)) -- "[0D00:30:00.000000000 0Nn 0Nn -0Wn 106751D23:47:16.854775805]"
+(repr (+ SP 3600000000000)) -- "[0D02:00:00.000000000 0Nn 0D00:59:59.999999995 0D01:00:00.000000002 -106751D22:47:16.854775809]"
+(repr (+ TS SP)) -- "[2024.03.05D11:00:00.000000000 0Np 1960.01.01D22:59:59.999999996 2262.04.11D23:47:16.854775808 1731.11.25D00:12:43.145224191]"
+(repr (- TS SP)) -- "[2024.03.05D09:00:00.000000000 0Np 1960.01.01D23:00:00.000000006 2262.04.11D23:47:16.854775804 1731.11.25D00:12:43.145224193]"
+(repr (+ EX EX2)) -- "[0Nn 0Nn -106751D23:47:16.854775806 106751D23:47:16.854775806]"
+(repr (- EX EX2)) -- "[106751D23:47:16.854775806 -106751D23:47:16.854775806 0Nn 0Nn]"
+(repr (+ EXT EX)) -- "[1999.12.31D23:59:59.999999998 2000.01.01D00:00:00.000000002 2000.01.01D00:00:00.000000002 0Np]"
+(repr (> SP 0D00:00:01)) -- "[true false false false true]"
+(repr (<= SP SP2)) -- "[false true false false false]"
+(repr (== SP 0Nn)) -- "[false true false false false]"
+(repr (< SP 3)) -- "[false true true true false]"
+(repr (> TS 0D12:00:00)) -- "[false false true true false]"
+(repr (>= 0D12:00:00 TS)) -- "[true true false false true]"
+(repr (!= SP2 SP)) -- "[true true true true true]"
+(repr (select {from: T a: (+ ts 0D01:00:00) b: (- 0D00:00:01 ts) c: (+ ts sp) d: (+ sp 0D00:00:01)})) -- "(table (as 'SYM (list \"a\" \"b\" \"c\" \"d\")) (list [2024.03.05D11:00:00.000000000 0Np 1960.01.02D00:00:00.000000001 2262.04.12D00:47:16.854775806 2024.03.05D01:00:00.000000000] [1975.10.28D14:00:01.000000000 0Np 2039.12.31D01:00:00.999999999 1737.09.21D00:12:44.145224194 1975.10.29D00:00:01.000000000] [2024.03.05D11:00:00.000000000 0Np 1960.01.01D22:59:59.999999996 2262.04.11D23:47:16.854775808 1731.11.25D00:12:43.145224191] [0D01:00:01.000000000 0Nn 0D00:00:00.999999995 0D00:00:01.000000002 -106751D23:47:15.854775809]))"
+(repr (select {from: T a: (> sp 0D00:00:01) b: (- ts 0Nn)})) -- "(table (as 'SYM (list \"a\" \"b\")) (list [true false false false true] [0Np 0Np 0Np 0Np 0Np]))"
+(repr (update {ts: (+ ts 0D01:00:00) from: T})) -- "(table (as 'SYM (list \"ts\" \"sp\")) (list [2024.03.05D11:00:00.000000000 0Np 1960.01.02D00:00:00.000000001 2262.04.12D00:47:16.854775806 2024.03.05D01:00:00.000000000] [0D01:00:00.000000000 0Nn -0D00:00:00.000000005 0D00:00:00.000000002 0Wn]))"
+(repr (select {from: T n: (count ts) where: (> (+ ts 0D01:00:00) 2024.03.05D00:00:00.000000000)})) -- "(table (as 'SYM (list \"n\")) (list [3]))"

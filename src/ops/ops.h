@@ -71,6 +71,13 @@ static inline bool ray_point_diff(const ray_t* a, const ray_t* b) {
 int8_t ray_timespan_binary_type(uint16_t op, int8_t a, int8_t b);
 ray_t* ray_timespan_binary(uint16_t op, ray_t* a, ray_t* b);
 ray_t* ray_timespan_xbar(ray_t* values, ray_t* width);
+#ifdef DEBUG
+/* Test hook (C tests only, DEBUG builds): rows ray_timespan_binary has
+ * evaluated cell by cell (span_eval), an atom pair counting one, on every
+ * thread since the process started.  TIMESTAMP / TIMESPAN / I64 vector
+ * arithmetic and comparisons take whole-vector kernels instead (#1633). */
+int64_t ray_timespan_test_cell_rows(void);
+#endif
 /* A non-null numeric atom as a TIMESPAN: its value is a count of
  * nanoseconds.  A float rounds half away from zero, NaN is the null and a
  * value beyond the I64 lane (an infinity included) saturates to 0Wn or
