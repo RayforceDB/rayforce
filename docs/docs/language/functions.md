@@ -93,7 +93,7 @@ Aggregation functions are marked **aggr** and reduce vectors to scalar values. U
 | `stddev_pop` | unary, aggr | Population standard deviation | `(stddev_pop [1 2 3])` |
 | `dev_pop` | unary, aggr | Population standard deviation alias | `(dev_pop [1 2 3])` |
 | `var` | unary, aggr | Sample variance | `(var [1 2 3])` → `1.0` |
-| `var_pop` | unary, aggr | Population variance | `(var_pop [1 2 3])` |
+| `var_pop` | unary, aggr | Population variance ([accuracy](math.md#variance-and-standard-deviation-accuracy)) | `(var_pop [1 2 3])` |
 | `pearson_corr` | binary, aggr | Pearson correlation over paired non-null numeric inputs | `(pearson_corr [1 2 3] [2 4 6])` → `1.0` |
 | `cov` | binary, aggr | Population covariance over paired non-null numeric inputs | `(cov [1 3] [2 6])` → `2.0` |
 | `scov` | binary, aggr | Sample covariance over paired non-null numeric inputs | `(scov [1 3] [2 6])` → `4.0` |

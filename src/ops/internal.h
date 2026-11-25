@@ -2036,6 +2036,10 @@ ray_t* desc_vec_eager(ray_t* x);
  * in idxop.h).  Set whenever an OP_AVG agg has a non-float input; SUM keeps
  * reading off_sum alone (int64 wraparound is its contract). */
 #define GHT_NEED_SUM128  0x20
+/* VAR/STDDEV about the group's first value (#1666): an int64 block
+ * (off_var_k) holds each such slot's value, an integer or a double's bits,
+ * and off_sum / off_sumsq then hold the sums of (x - k) and its square. */
+#define GHT_NEED_VARK    0x40
 
 /* ── ght_layout_t — inline-or-spill, fixed-size, by-value embeddable ──
  *
@@ -2077,10 +2081,11 @@ ray_t* desc_vec_eager(ray_t* x);
                                * path (pair-skip contract).  Entry packing
                                * canonicalizes int y nulls (NaN in F64-packed
                                * entries, NULL_I64 in int-packed ones). */
+#define GHT_AF2_VAR      8u  /* VAR/STDDEV slot: accumulates about off_var_k */
 /* key_flags bits */
 #define GHT_KEYF_WIDE       1u  /* key does not fit in 8 B (RAY_GUID / RAY_STR) */
 #define GHT_KEYF_INLINE_STR 2u  /* key stores a 16 B ray_str_t descriptor inline */
-typedef struct {
+typedef struct ght_layout_s {
     uint16_t entry_stride;
     uint16_t row_stride;
     uint16_t n_keys;           /* widened from uint8_t (unbounded-ready) */
@@ -2111,6 +2116,9 @@ typedef struct {
     /* High words of the 128-bit integer sums (GHT_NEED_SUM128); 0 when the
      * layout carries none. */
     uint16_t off_sum_hi;
+    /* The value each VAR/STDDEV slot centres on (GHT_NEED_VARK); 0 when the
+     * layout carries none. */
+    uint16_t off_var_k;
     /* Earliest contributing source row for this group.  Every packed entry
      * carries its source row in the tail slot; partition merges retain the
      * minimum so output order is independent of radix partition count. */
@@ -2142,6 +2150,12 @@ typedef struct {
      * group_key_f64_bits).  Pinned by group_extra/ght_packed_key_excludes_f64. */
     uint8_t  packed_key;
     uint8_t  any_agg_null;     /* OR of GHT_AF2_NULLABLE over aggs — hoisted hot-loop gate */
+    /* The row accumulator for an existing group (group.c ght_accum_fns):
+     * 0 plain, 1 plain with VAR / STDDEV about each slot's first value
+     * (#1666), 2 null-aware, 3 null-aware with VAR / STDDEV.  Chosen once by
+     * ght_compute_layout, so the per-entry call carries no test; a byte in
+     * the padding, so the layout keeps its size. */
+    uint8_t  accum_kind;
     /* ── base pointers: aim at the *_in inline arrays (≤8) or the spill block ── */
     int8_t*  agg_val_slot;     /* [n_aggs] accum slot per agg, -1 = none */
     uint8_t* agg_flags;        /* [n_aggs] GHT_AF_* per agg */
