@@ -537,8 +537,17 @@ static const ray_sig_entry_t* find_entry(const char* name, bool* own, const char
 }
 
 const char* ray_sig_usage(const char* name) {
+    if (!name) return NULL;
+    /* a full name, as .repl.signature and :h pass it, is matched whole
+     * first: the error path's lookup keys a name of 13 bytes or more on
+     * its cut-off prefix and finds nothing where several share it
+     * (.sys.querylog, .sys.querylog.enable, .sys.querylog.stats) */
+    for (size_t i = 0; i < sizeof sigs / sizeof *sigs; i++)
+        if (strcmp(sigs[i].name, name) == 0) return sigs[i].usage;
+    for (size_t i = 0; i < sizeof own_sigs / sizeof *own_sigs; i++)
+        if (strcmp(own_sigs[i].name, name) == 0) return own_sigs[i].usage;
     bool own;
-    const ray_sig_entry_t* e = name ? find_entry(name, &own, NULL) : NULL;
+    const ray_sig_entry_t* e = find_entry(name, &own, NULL);
     return e ? e->usage : NULL;
 }
 

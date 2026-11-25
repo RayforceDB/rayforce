@@ -52,6 +52,12 @@ zsg_calls -- 0
 (set zsg_q .sys.querylog.enable)
 (at (.repl.signature 'zsg_q) 'builtin) -- '.sys.querylog.enable
 (at (.repl.signature 'zsg_q) 'usage) -- (at (.repl.signature '.sys.querylog.enable) 'usage)
+;; a long name's usage is matched on the whole name, also where several
+;; names share their first 13 bytes
+(at (.repl.signature '.sys.querylog.enable) 'usage) -- "(.sys.querylog.enable [<on: i64, 0 or 1>])"
+(at (.repl.signature '.sys.querylog) 'usage) -- "(.sys.querylog [<from: i64, a seq>])"
+(at (.repl.signature '.sys.querylog.stats) 'usage) -- "(.sys.querylog.stats)"
+(at (.repl.signature '.sys.profile.reset) 'usage) -- "(.sys.profile.reset)"
 ;; special forms and restricted builtins
 (at (.repl.signature 'if) 'special) -- true
 (at (.repl.signature 'set) 'special) -- true

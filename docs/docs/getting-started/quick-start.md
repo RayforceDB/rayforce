@@ -188,6 +188,7 @@ The REPL supports several built-in commands:
 | Command | Description |
 |---|---|
 | `:help` | Show available commands |
+| `:h NAME` (or `:help NAME`) | Show how a builtin or lambda is called |
 | `:timeit` (alias `:t`) | Toggle profiling on/off (or `:t 0`/`:t 1`) |
 | `:env` | List all global bindings |
 | `:clear` | Clear the screen |

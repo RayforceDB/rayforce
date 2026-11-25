@@ -97,6 +97,8 @@ A builtin's calling convention is not the set of forms it accepts. `min` is unar
 (at (.repl.signature 'nosuch) 'kind)    ;; 'missing
 ```
 
+At the REPL, [`:h NAME`](../language/repl.md#help-for-a-name) prints the same facts for a person.
+
 ## `.repl.definition` { #repl-definition }
 
 Signature: `(.repl.definition name)`, `name` a symbol. It returns a dict saying where the function the name holds now was written. That is not the assignment that bound the name: after `(set alias original)`, `alias` reports `original`'s source. It reads the source record a lambda keeps from parsing, the same record error traces use, so the parse and call paths do nothing extra for it.
