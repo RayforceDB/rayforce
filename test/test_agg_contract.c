@@ -611,6 +611,28 @@ static test_result_t test_derived_key_per_symbol_route(void) {
     TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "the by-dict key answers the same groups row-wise");
     ray_release(r);
+    /* Under a memory budget the row-wise STR key column (16 bytes a row:
+     * 3.84 MB here) would take more than an eighth of, the by-dict key is
+     * evaluated per symbol — a byte a row — whatever the first rows read
+     * as; the groups are the same. */
+    ray_derived_key_mem_budget_set_for_test(16 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(set GBm (select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) d: (count (distinct v)) asc: k}))");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 1);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_text_syms, 1);
+    r = ray_eval_str("(and (all (== (at GBm 'c) (at GF 'c))) (all (== (at GBm 'd) (at GF 'd))) (all (== (as 'STR (at GBm 'k)) (as 'STR (at GF 'k)))) (== (type (at GBm 'k)) 'STR))");
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r));
+    TEST_ASSERT(r->type == -RAY_BOOL && r->b8, "under a small budget the by-dict key is per symbol with the same groups");
+    ray_release(r);
+    /* a budget the column fits in an eighth of: the probe decides, row-wise */
+    ray_derived_key_mem_budget_set_for_test((int64_t)64 * 1024 * 1024);
+    agg_route_reset();
+    r = ray_eval_str("(select {from: TF by: {k: (if (like u \"*.html\") \"html\" \"php\")} c: (count v) asc: k})");
+    ray_derived_key_mem_budget_set_for_test(0);
+    TEST_ASSERT_NOT_NULL(r); TEST_ASSERT_FALSE(RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_EQ_I(agg_route_stats().key_domain_evals, 0);
     /* The groups of an unsorted outer select come out in the first-seen
      * order of the texts, as the materialized inner select's do: a kind
      * the second half of the rows alone shows comes last, whatever task

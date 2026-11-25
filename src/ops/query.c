@@ -11367,10 +11367,23 @@ static inline void dks_code_row(const dks_ctx_t* c, dks_task_t* t, int64_t r, in
 #define DKV_BITMAP_BUDGET ((uint64_t)64 << 20)
 #ifdef DEBUG
 static uint64_t g_dkv_bitmap_budget_test = 0;
+static int64_t  g_dk_mem_budget_test = 0;
 /* Test seam: a budget in bytes for the bitmaps of the slot coding until
  * reset to 0 (DKV_BITMAP_BUDGET). */
 void ray_derived_key_slot_budget_set_for_test(uint64_t bytes) { g_dkv_bitmap_budget_test = bytes; }
+/* Test seam: the memory a query may plan for (ray_heap_mem_budget) as the
+ * by-dict text key's probe reads it, until reset to 0. */
+void ray_derived_key_mem_budget_set_for_test(int64_t bytes) { g_dk_mem_budget_test = bytes; }
 #endif
+/* The memory a by-dict text key plans against: the row-wise STR key column
+ * (16 bytes a row) taking more than an eighth of it is what the per-symbol
+ * key — a byte a row — is for. */
+static int64_t dk_mem_budget(void) {
+#ifdef DEBUG
+    if (g_dk_mem_budget_test) return g_dk_mem_budget_test;
+#endif
+    return ray_heap_mem_budget();
+}
 typedef struct {
     ray_t*   ids_hdr;
     int32_t* ids;        /* the task's first-seen ids, in row order */
@@ -11671,7 +11684,16 @@ static ray_t* derived_key_over_values_al(ray_t* by_expr, ray_t* tbl, ray_t* col,
      * probe: `like` over SYM is already evaluated per distinct symbol
      * row-wise, so the per-value key would only trade time for the smaller
      * key column. */
-    const bool vocab_small = al && sym && !sel && dn * 4 <= n;
+    /* ...and a by-dict's text key when the row-wise STR key column alone
+     * (16 bytes a row, two of them 3.2 GB over 100M rows) would take more
+     * than an eighth of the memory the query may plan for (dk_mem_budget:
+     * the watermark, else the RAM or container limit): under a small
+     * budget the per-symbol key — a byte a row — is what keeps the query
+     * off the spill; with room to spare the probe decides, as `like` over
+     * SYM is already evaluated per distinct symbol row-wise. */
+    const bool bydict_mem = text_syms && !al && sym && !sel && dn * 4 <= n &&
+                            (uint64_t)n * 16 > (uint64_t)dk_mem_budget() / 8;
+    const bool vocab_small = (al || bydict_mem) && sym && !sel && dn * 4 <= n;
     if (!vocab_small && sel_rows > DKS_PROBE_ROWS) {
         dks_task_t pt; memset(&pt, 0, sizeof pt);
         dks_ctx_t pc = kind;
