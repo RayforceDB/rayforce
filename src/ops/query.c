@@ -25082,14 +25082,21 @@ static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
     uint16_t op = prune_cmp_op(el[0], fn);
     if (!op || op == OP_IN) return false;
     int8_t l = prune_if_leaf_type(el[1], tbl), r = prune_if_leaf_type(el[2], tbl);
+    bool eq = op == OP_EQ || op == OP_NE;
     /* F64 as I64: a null (NaN reads as null) is the lowest value and equals
-     * itself on every route, the filter's included. */
-    return (l == r && (l == RAY_I64 || l == RAY_F64)) ||
-           (l == RAY_SYM && r == RAY_SYM && (op == OP_EQ || op == OP_NE));
+     * itself on every route, the filter's included.  STR as well (#1660): its
+     * null is "", the lowest string, equal to itself and to a "" literal on
+     * every route.  A SYM beside a STR literal compares as text on every route
+     * (a null symbol equals ""); a SYM beside a STR column, or a STR beside a
+     * symbol literal, is a type error on every route and stays declined. */
+    return (l == r && (l == RAY_I64 || l == RAY_F64 || l == RAY_STR)) ||
+           (l == RAY_SYM && r == RAY_SYM && eq) ||
+           (eq && l == RAY_SYM && r == RAY_STR && el[2]->type == -RAY_STR) ||
+           (eq && l == RAY_STR && r == RAY_SYM && el[1]->type == -RAY_STR);
 }
 
 /* An ungrouped projection with explicit ELSE whose branches share one type,
- * I64, F64 or SYM (0: declined). Compiled IF is per-row; its
+ * I64, F64, SYM or STR (0: declined; STR since #1660). Compiled IF is per-row; its
  * aggregate-free fallback scatters per-row after WHERE too. A SYM branch
  * reads as text: OP_IF re-expresses every side in the runtime domain.
  * Also an operand in where: (prune_where_elementwise_impl) and a by: key
@@ -25098,7 +25105,7 @@ static bool prune_if_cond(ray_t* e, ray_t* tbl, int* budget, int depth) {
 static int8_t prune_if_projection(ray_t* e, ray_t* tbl, int* budget, int depth) {
     if (--*budget < 0 || depth > PRUNE_IF_MAX_DEPTH || !e || RAY_IS_ERR(e)) return 0;
     int8_t t = prune_if_leaf_type(e, tbl);
-    if (t == RAY_I64 || t == RAY_F64 || t == RAY_SYM) return t;
+    if (t == RAY_I64 || t == RAY_F64 || t == RAY_SYM || t == RAY_STR) return t;
     if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 4) return 0;
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* fn = prune_head_fn(el[0], tbl);
@@ -25147,8 +25154,8 @@ static bool prune_output_ok(ray_t* e, ray_t* tbl, bool grouped) {
 
 /* A by: clause of column names or elementwise expressions. */
 /* A by: key reads only its row: elementwise, or an if of the bounded
- * ungrouped grammar (prune_if_projection: branches of one type, I64, F64
- * or SYM, conditions comparisons of a column with a constant).  The key is
+ * ungrouped grammar (prune_if_projection: branches of one type, I64, F64,
+ * SYM or STR, conditions comparisons of a column with a constant).  The key is
  * computed over the rows the where keeps, compiled per row or by the
  * evaluator, whose if chooses per row for a BOOL vector condition (#1605),
  * so the stand-in row of a skipped partition never forms a group (#1604). */

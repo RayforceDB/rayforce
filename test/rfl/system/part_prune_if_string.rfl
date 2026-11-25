@@ -1,0 +1,55 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; #1660: a where: comparing a timestamp column skips the partitions its
+;; statistics rule out beside an if holding strings too: STR branches, STR
+;; comparisons in its condition (null "" is the lowest string, equal to itself
+;; and to a "" literal on every route), and a SYM column compared with a
+;; string literal, which compares as text on every route.  The if reads only
+;; its row, and the stand-in row a skipped partition leaves fails the where
+;; by the timestamp comparison, so the answer is the one without pruning.
+;; A SYM column against a STR column is a type error on every route and
+;; still reads every partition.
+;;
+;; The fixture is #1604's: two date partitions of 70 000 uncompressed rows,
+;; the second partition's ts values copied over the first's in place, so a
+;; select that skips the first partition counts the second's rows alone and
+;; one that reads it counts them twice.  A second, untouched root checks every
+;; answer against the same select with pruning off: the where written as
+;; (or false p p), which narrows no partition.
+
+(set R (format "/tmp/rfl_part_ifstr_%" (get (.sys.info) 'pid)))
+(.sys.exec (format "rm -rf % && mkdir -p %/stale %/clean" R R R)) -- 0
+(set n 70000)
+(set mk (fn [d] (table [ts s t u v] (list (+ d (* 1000000 (til n))) (at (as 'SYM (list "x" "y" "z" "")) (% (til n) 4)) (at (as 'STR (list "ab" "cd" "ef" "")) (% (til n) 4)) (at (as 'STR (list "cd" "" "ab")) (% (til n) 3)) (at [1 0Nl 3 4 5] (% (til n) 5))))))
+(.db.splayed.set (format "%/stale/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/stale/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/stale/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.05/t/" R) (mk 2026.01.05D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.db.splayed.set (format "%/clean/2026.01.06/t/" R) (mk 2026.01.06D00:00:00.000) (format "%/clean/.sym" R) {compress: false})
+(.sys.exec (format "dd if=%/stale/2026.01.06/t/ts of=%/stale/2026.01.05/t/ts bs=8 skip=4 seek=4 count=70000 conv=notrunc 2>/dev/null" R R)) -- 0
+(set P (.db.parted.get (format "%/stale/" R) 't))
+(set C (.db.parted.get (format "%/clean/" R) 't))
+
+;; the issue's two shapes: an if holding strings in where:, and an if over a
+;; SYM column compared with a string
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s 'x) "p" "q") "p"))}) 'c) -- [17500]
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== s "x") v 0)})) -- 70000
+;; STR nulls in the condition, a STR column against another, a null symbol
+;; against "", a STR output and a STR by: key
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== t "") "e" t) "e"))}) 'c) -- [17500]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (< (if (<= u t) u t) "b"))}) 'c) -- [58334]
+(at (select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s "") 1 0) 1))}) 'c) -- [17500]
+(count (select {from: P where: (>= ts 2026.01.06D00:00:00.000) k: (if (== t "ab") "AB" u)})) -- 70000
+(at (select {from: P where: (>= ts 2026.01.06D00:00:00.000) by: (if (!= "y" s) "Y" "N") c: (count v)}) 'c) -- [52500 17500]
+;; a SYM column against a STR column: a type error, the partitions read as before
+(select {c: (count v) from: P where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s t) 1 0) 1))}) !- type
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s t) 1 0) 1))}) !- type
+
+;; every answer equals the one without pruning, on the untouched root
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s 'x) "p" "q") "p"))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s 'x) "p" "q") "p")) (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s 'x) "p" "q") "p")))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== t "") "e" t) "e"))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== (if (== t "") "e" t) "e")) (and (>= ts 2026.01.06D00:00:00.000) (== (if (== t "") "e" t) "e")))})
+(select {c: (count v) m: (max v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (< (if (<= u t) u t) "b"))}) -- (select {c: (count v) m: (max v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (< (if (<= u t) u t) "b")) (and (>= ts 2026.01.06D00:00:00.000) (< (if (<= u t) u t) "b")))})
+(select {c: (count v) from: C where: (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s "") 1 0) 1))}) -- (select {c: (count v) from: C where: (or false (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s "") 1 0) 1)) (and (>= ts 2026.01.06D00:00:00.000) (== (if (== s "") 1 0) 1)))})
+(select {from: C where: (>= ts 2026.01.06D00:00:00.000) k: (if (== s "x") v 0)}) -- (select {from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000)) k: (if (== s "x") v 0)})
+(select {from: C where: (>= ts 2026.01.06D00:00:00.000) k: (if (== t "ab") "AB" u)}) -- (select {from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000)) k: (if (== t "ab") "AB" u)})
+(select {from: C where: (>= ts 2026.01.06D00:00:00.000) by: (if (!= "y" s) "Y" "N") c: (count v)}) -- (select {from: C where: (or false (>= ts 2026.01.06D00:00:00.000) (>= ts 2026.01.06D00:00:00.000)) by: (if (!= "y" s) "Y" "N") c: (count v)})
+
+(.sys.exec (format "rm -rf %" R)) -- 0
