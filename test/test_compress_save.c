@@ -5306,6 +5306,62 @@ static test_result_t test_select_parted_prunes_grouped_if_mixed(void) {
     PASS();
 }
 
+/* A cast of literals used as a comparison's bound prunes as the literal it
+ * denotes (#1742): (as 'DATE "…") and (as (quote DATE) "…") on the
+ * partition key drop the partitions the literal drops, also beside another
+ * conjunct.  A cast that raises narrows nothing and raises as unpruned.
+ * Each answer equals the select with pruning off, (or false p p). */
+static test_result_t test_select_parted_prunes_cast_bound(void) {
+    static const struct { const char* pred; uint64_t pruned; } cases[] = {
+        { "(== date 2024.01.02)", 2 },
+        { "(== date (as 'DATE \"2024.01.02\"))", 2 },
+        { "(== date (as (quote DATE) \"2024.01.02\"))", 2 },
+        { "(>= date (as (quote DATE) 8767))", 1 },
+        { "(and (== date (as (quote DATE) \"2024.01.03\")) (> qty 0))", 2 },
+        /* an in set is left as written: admitted, not folded */
+        { "(in date (as (quote DATE) (list 8766 8768)))", 0 },
+        { "(== date (as (quote DATE) 0Nl))", 0 },
+    };
+    for (int gen = 0; gen < 2; gen++) {
+        char root[256];
+        snprintf(root, sizeof root, "%s/cast_bound%d", ray_test_tmp(CS_TMP), gen);
+        if (!pdb_mix_bind(root, gen != 0)) { pdb_mix_unbind(); FAIL("cast bound fixture"); }
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            char q[512], ref[768];
+            snprintf(q, sizeof q, "(select {from:_pm_p where:%s n:(count qty) s:(sum qty) a:(min a)})", cases[i].pred);
+            snprintf(ref, sizeof ref, "(select {from:_pm_p where:(or false %s %s) n:(count qty) s:(sum qty) a:(min a)})",
+                     cases[i].pred, cases[i].pred);
+            uint64_t runs0, parts0, runs1, parts1;
+            ray_query_test_part_prune(&runs0, &parts0);
+            ray_t* r = ray_eval_str(q);
+            ray_query_test_part_prune(&runs1, &parts1);
+            ray_t* u = ray_eval_str(ref);
+            bool counted = parts1 - parts0 == cases[i].pruned && runs1 - runs0 == (cases[i].pruned ? 1u : 0u);
+            bool values = r && !RAY_IS_ERR(r) && u && !RAY_IS_ERR(u) && sp_same(r, u);
+            drop_out(r); drop_out(u);
+            if (!values || !counted) {
+                pdb_mix_unbind();
+                TEST_ASSERT_FMT(values && counted, "cast bound gen %d: %s: values=%d pruned %llu, want %llu",
+                                gen, cases[i].pred, (int)values, (unsigned long long)(parts1 - parts0),
+                                (unsigned long long)cases[i].pruned);
+            }
+        }
+        /* a cast that raises: the same error pruned and unpruned, and nothing pruned by it */
+        uint64_t runs0, parts0, runs1, parts1;
+        ray_query_test_part_prune(&runs0, &parts0);
+        ray_t* e1 = ray_eval_str("(select {from:_pm_p where:(== date (as (quote DATE) \"bad\")) n:(count qty)})");
+        ray_query_test_part_prune(&runs1, &parts1);
+        ray_t* e2 = ray_eval_str("(select {from:_pm_p where:(or false (== date (as (quote DATE) \"bad\")) (== date (as (quote DATE) \"bad\"))) n:(count qty)})");
+        bool raised = e1 && RAY_IS_ERR(e1) && e2 && RAY_IS_ERR(e2) &&
+                      strcmp(ray_err_code(e1), ray_err_code(e2)) == 0 && parts1 == parts0;
+        if (e1 && RAY_IS_ERR(e1)) ray_error_free(e1); else drop_out(e1);
+        if (e2 && RAY_IS_ERR(e2)) ray_error_free(e2); else drop_out(e2);
+        if (!raised) { pdb_mix_unbind(); FAIL("a raising cast bound"); }
+        pdb_mix_unbind();
+    }
+    PASS();
+}
+
 /* Local canonical-looking heads and earlier output aliases must not be
  * mistaken for the native, fresh-name grammar. Keep one admitted control so
  * blanket rejection cannot satisfy the decline assertions. */
@@ -6222,6 +6278,7 @@ const test_entry_t compress_entries[] = {
     { "compress/select_parted_prunes_take_head_effects", test_select_parted_prunes_take_head_effects, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_shadow",  test_select_parted_prunes_shadow,  rt_setup, rt_teardown },
     { "compress/select_parted_prunes_none",    test_select_parted_prunes_none,    rt_setup, rt_teardown },
+    { "compress/select_parted_prunes_cast_bound", test_select_parted_prunes_cast_bound, rt_setup, rt_teardown },
     { "compress/select_parted_prunes_by_key_uneven", test_select_parted_prunes_by_key_uneven, rt_setup, rt_teardown },
     { "compress/select_gen2_equal",          test_select_gen2_equal,          rt_setup, rt_teardown },
     { "compress/select_parted_bydict_streams", test_select_parted_bydict_streams, rt_setup, rt_teardown },

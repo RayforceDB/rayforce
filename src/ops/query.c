@@ -24718,6 +24718,7 @@ static ray_t* prune_within_range(ray_t* x, ray_t* tbl) {
 
 static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
                            uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc);
+static ray_t* prune_fold_const_cast(ray_t* x, ray_t* tbl);
 
 /* Bounds the and/or/not nesting the mask walks (deeper keeps every
  * partition, which is always correct). */
@@ -24804,9 +24805,24 @@ static void prune_where_mask_at(ray_t* e, bool neg, int depth, ray_t* tbl, int64
     prune_cmp_mask(op, x[1], x[2], tbl, key_id, kv, acc, tmp, n_words, sc);
 }
 
-/* AND into `acc` the partitions `x1 op x2` can pass (prune_where_mask). */
+static void prune_cmp_mask_at(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                              uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc);
+
+/* AND into `acc` the partitions `x1 op x2` can pass (prune_where_mask).  A
+ * scalar cast of a scalar literal compares as the constant it denotes
+ * (#1742), as a literal written in its place does; an `in` set is left as
+ * written. */
 static void prune_cmp_mask(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
                            uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
+    ray_t* f1 = op == OP_IN ? NULL : prune_fold_const_cast(x1, tbl);
+    ray_t* f2 = op == OP_IN ? NULL : prune_fold_const_cast(x2, tbl);
+    prune_cmp_mask_at(op, f1 ? f1 : x1, f2 ? f2 : x2, tbl, key_id, kv, acc, tmp, n_words, sc);
+    if (f1) ray_release(f1);
+    if (f2) ray_release(f2);
+}
+
+static void prune_cmp_mask_at(uint16_t op, ray_t* x1, ray_t* x2, ray_t* tbl, int64_t key_id, ray_t* kv,
+                              uint64_t* acc, uint64_t* tmp, int64_t n_words, prune_stat_cols_t* sc) {
     /* a name bound to a constant compares as that constant (a symbol it
      * holds is left to the filter: it reads here as a name would) */
     ray_t* lb = prune_bound_const(x1, tbl, op == OP_IN);
@@ -25127,16 +25143,69 @@ static bool prune_literal(ray_t* x, ray_t* tbl, bool vec) {
 /* (as 'T <literal>): one constant whatever the source, so an operand reads
  * it as it reads a literal: (as 'GUID "…") beside a GUID column.  `vec`: the
  * literal may be a vector, for the set of an `in`; elsewhere a vector's
- * length would meet the row count.  The type name must name no column
- * either, or the cast would read it. */
-static bool prune_const_cast(ray_t* e, ray_t* tbl, bool vec) {
+ * length would meet the row count.  The type is 'T, which must name no
+ * column either, or the cast would read it; or (quote T), the symbol T
+ * whatever the source holds (#1742).  *type_out, when given, is the type's
+ * symbol id. */
+static bool prune_const_cast_type(ray_t* e, ray_t* tbl, bool vec, int64_t* type_out) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || ray_len(e) != 3) return false;
     ray_t** el = (ray_t**)ray_data(e);
     ray_t* fn = prune_head_fn(el[0], tbl);
-    return fn && fn->type == RAY_BINARY && !(fn->attrs & RAY_FN_SPECIAL_FORM) &&
-           (ray_binary_fn)(uintptr_t)fn->i64 == ray_cast_fn && prune_head_named(el[0], "as") &&
-           el[1] && el[1]->type == -RAY_SYM && (el[1]->attrs & ATTR_QUOTED) &&
-           !ray_table_slot(tbl, el[1]->i64) && prune_literal(el[2], tbl, vec);
+    if (!fn || fn->type != RAY_BINARY || (fn->attrs & RAY_FN_SPECIAL_FORM) ||
+        (ray_binary_fn)(uintptr_t)fn->i64 != ray_cast_fn || !prune_head_named(el[0], "as") ||
+        !el[1] || !prune_literal(el[2], tbl, vec)) return false;
+    int64_t t;
+    if (el[1]->type == -RAY_SYM && (el[1]->attrs & ATTR_QUOTED) && !ray_table_slot(tbl, el[1]->i64))
+        t = el[1]->i64;
+    else if (prune_quote_sym(el[1], tbl))
+        t = ((ray_t**)ray_data(el[1]))[1]->i64;   /* not-a-table */
+    else return false;
+    if (type_out) *type_out = t;
+    return true;
+}
+
+static bool prune_const_cast(ray_t* e, ray_t* tbl, bool vec) {
+    return prune_const_cast_type(e, tbl, vec, NULL);
+}
+
+/* The constant a scalar cast of a scalar literal denotes, owned, for a
+ * comparison's bound in the partition mask only (#1742): the select's
+ * plan is untouched, the filter evaluates the cast where it did.  Only a
+ * non-symbol atom cast to a fixed-width numeric or temporal type, with the
+ * type a literal symbol no lexical local or column shadows; the value is
+ * the native cast's, its signed width kept.  NULL for anything else, or
+ * when the cast raises: nothing narrows by it, the filter raises as it
+ * would unpruned, and no error state is left behind. */
+static ray_t* prune_fold_const_cast(ray_t* x, ray_t* tbl) {
+    int64_t t;
+    if (!prune_const_cast_type(x, tbl, false, &t)) return NULL;
+    ray_t* lit = ((ray_t**)ray_data(x))[2];
+    if (!lit || lit->type >= 0 || lit->type == -RAY_SYM) return NULL;     /* a scalar literal */
+    if (ray_env_has_lexical_local(t) || ray_table_slot(tbl, t)) return NULL;
+    ray_t* tn = ray_sym_str(t);
+    if (!tn) return NULL;
+    static const struct { const char* n; int8_t ty; } targets[] = {
+        { "BOOL", RAY_BOOL }, { "U8", RAY_U8 }, { "I16", RAY_I16 }, { "I32", RAY_I32 },
+        { "I64", RAY_I64 }, { "F32", RAY_F32 }, { "F64", RAY_F64 }, { "DATE", RAY_DATE },
+        { "TIME", RAY_TIME }, { "TIMESTAMP", RAY_TIMESTAMP }, { "TIMESPAN", RAY_TIMESPAN },
+    };
+    int8_t want = 0;
+    for (size_t i = 0; i < sizeof targets / sizeof *targets && !want; i++)
+        if (ray_str_len(tn) == strlen(targets[i].n) &&
+            memcmp(ray_str_ptr(tn), targets[i].n, ray_str_len(tn)) == 0) want = targets[i].ty;
+    if (!want) return NULL;
+    ray_error_state_t es;
+    ray_error_state_save(&es);
+    ray_t* ty = ray_sym(t);
+    ray_t* out = ty && !RAY_IS_ERR(ty) ? ray_cast_fn(ty, lit) : NULL;
+    if (ty && !RAY_IS_ERR(ty)) ray_release(ty);
+    if (!out || RAY_IS_ERR(out)) {
+        if (out) ray_error_free(out);
+        ray_error_state_restore(&es);
+        return NULL;
+    }
+    if (out->type != -want) { ray_release(out); return NULL; }        /* an atom of the type named */
+    return out;
 }
 
 /* (nil? x): a BOOL per row of x. */
