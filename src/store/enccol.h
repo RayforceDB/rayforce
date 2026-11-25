@@ -472,6 +472,10 @@ ray_t* ray_enccol_idict_codes(ray_enccol_t* e, int64_t start, int64_t n, const i
 ray_t* ray_enccol_idict_codes_vec(ray_enccol_t* e, ray_t** out);
 /* Test hook: how many STR pools materialization has allocated so far. */
 uint64_t ray_enccol_test_str_pool_allocs(void);
+/* Test hook: FSST cells whose expanded length was measured on its own (the
+ * pool sizing measures each cell once; a decode measures a cell only when
+ * it cannot get a buffer to expand it into), since process start. */
+uint64_t ray_enccol_test_fsst_measured(void);
 /* A fresh SYM vector `out` (runtime domain) takes the domain the column's ids
  * resolve over, as its materialization would; no decode. */
 void ray_enccol_adopt_domain(ray_t* out, ray_t* encv);

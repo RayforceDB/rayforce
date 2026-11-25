@@ -766,6 +766,11 @@ static void dec_guid(const ray_enc_desc_t* d, int vlen, const uint8_t* p, void* 
  * the codes in the same order, so they count the same bytes); at
  * materialization the dictionary region's offset of each code, whose
  * entries add no bytes to the vector's (Task 4). */
+/* Test hook: FSST cells whose expanded length was measured on its own
+ * (ray_fsst_expanded_len), counted a vector at a time. */
+static _Atomic(uint64_t) g_fsst_measured;
+uint64_t ray_enccol_test_fsst_measured(void) { return atomic_load(&g_fsst_measured); }
+
 static ray_t* dec_str(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
                       const uint8_t* p, uint64_t avail, void* out, char* pool_out,
                       uint64_t pool_base, uint64_t* pooled_out, const uint32_t* dict_pool_off) {
@@ -811,23 +816,60 @@ static ray_t* dec_str(ray_enccol_t* e, const ray_enc_desc_t* d, int vlen,
         const ray_fsst_table_t* t;
         ray_t* err = enc_fsst(e, &t);
         if (err) return err;
-        uint64_t clen[RAY_ENC_VEC], xlen[RAY_ENC_VEC]; const uint8_t* cb;
-        ray_enc_fsst_parse(p, (size_t)avail, vlen, t, clen, xlen, &cb);
-        for (int i = 0; i < vlen; i++) if (xlen[i] > RAY_STR_INLINE_MAX) pooled += xlen[i];
-        uint64_t at = 0, run = 0;
-        for (int i = 0; out && i < vlen; i++) {
-            memset(&o[i], 0, sizeof o[i]);
-            o[i].len = (uint32_t)xlen[i];
-            if (xlen[i] <= RAY_STR_INLINE_MAX) {
-                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], (uint8_t*)o[i].data);
-            } else {
-                uint8_t* dst = (uint8_t*)pool_out + pool_base + run;
-                (void)ray_fsst_decode(t, cb + at, (uint32_t)clen[i], dst);
-                memcpy(o[i].prefix, dst, 4);
-                o[i].pool_off = (uint32_t)(pool_base + run);
-                run += xlen[i];
+        uint64_t clen[RAY_ENC_VEC]; const uint8_t* cb;
+        if (!out) {
+            /* sizing: each cell's expanded length, measured once */
+            uint64_t xlen[RAY_ENC_VEC];
+            ray_enc_fsst_parse(p, (size_t)avail, vlen, t, clen, xlen, &cb);
+            for (int i = 0; i < vlen; i++) if (xlen[i] > RAY_STR_INLINE_MAX) pooled += xlen[i];
+            atomic_fetch_add_explicit(&g_fsst_measured, (uint64_t)vlen, memory_order_relaxed);
+        } else {
+            /* decoding: a cell expands once, into a buffer that holds any
+             * cell of the vector (a code expands to at most 8 bytes, and the
+             * fast decode writes 8 past the end): on the stack, or from the
+             * heap for a vector with a longer cell; its length is then known,
+             * so it goes inline or to the pool.  Only when that buffer cannot
+             * be had is a cell measured first and expanded in place. */
+            enum { FSST_TMP = 4096 };
+            uint8_t stack[FSST_TMP];
+            cb = ray_enc_fsst_lengths(p, (size_t)avail, vlen, clen);
+            uint64_t maxcl = 0;
+            for (int i = 0; i < vlen; i++) if (clen[i] > maxcl) maxcl = clen[i];
+            uint8_t* tmp = stack;
+            uint64_t room = FSST_TMP;
+            if (maxcl * 8 + 8 > FSST_TMP) {
+                uint8_t* h = (uint8_t*)ray_alloc_raw((size_t)(maxcl * 8 + 8));
+                if (h) { tmp = h; room = maxcl * 8 + 8; }
             }
-            at += clen[i];
+            uint64_t at = 0, measured = 0;
+            for (int i = 0; i < vlen; i++) {
+                memset(&o[i], 0, sizeof o[i]);
+                const uint32_t cl = (uint32_t)clen[i];
+                uint64_t xl;
+                const uint8_t* src = NULL;
+                if ((uint64_t)cl * 8 + 8 <= room) {
+                    xl = (uint64_t)ray_fsst_decode_fast(t, cb + at, cl, tmp);
+                    src = tmp;
+                } else {
+                    xl = (uint64_t)ray_fsst_expanded_len(t, cb + at, cl);
+                    measured++;
+                }
+                o[i].len = (uint32_t)xl;
+                if (xl <= RAY_STR_INLINE_MAX) {
+                    if (src) memcpy(o[i].data, src, xl);
+                    else (void)ray_fsst_decode(t, cb + at, cl, (uint8_t*)o[i].data);
+                } else {
+                    uint8_t* dst = (uint8_t*)pool_out + pool_base + pooled;
+                    if (src) memcpy(dst, src, xl);
+                    else (void)ray_fsst_decode(t, cb + at, cl, dst);
+                    memcpy(o[i].prefix, dst, 4);
+                    o[i].pool_off = (uint32_t)(pool_base + pooled);
+                    pooled += xl;
+                }
+                at += cl;
+            }
+            if (tmp != stack) ray_free_raw(tmp);
+            if (measured) atomic_fetch_add_explicit(&g_fsst_measured, measured, memory_order_relaxed);
         }
     } else if (d->encoding == RAY_ENC_CONST) {
         uint32_t len; memcpy(&len, p, 4);
@@ -2249,22 +2291,67 @@ static void enc_mat_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
  * dictionary's entries over 12 bytes once, in code order (sd, the STR_DICT
  * entry, or NULL), then every RAW / CONST / FSST vector's pooled bytes in
  * row order; STR_DICT vectors share the dictionary region and add none.
- * chunk_pool[c] is where chunk c's pooled bytes start. */
-static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool, const ray_enc_sdict_t* sd) {
-    uint64_t total = sd ? sd->pooled : 0;                 /* rule 1: the dictionary region first */
-    for (int64_t c = 0; c < e->n_chunks; c++) {
+ * chunk_pool[c] is where chunk c's pooled bytes start.  Each chunk's bytes
+ * are sized on its own (an FSST vector expands every cell once to measure
+ * it), one pool task per chunk, and the bases are their prefix sum; a
+ * failure reports the lowest failing chunk's error, as the decode does. */
+typedef struct {
+    ray_enccol_t*   e;
+    uint64_t*       bytes;          /* each chunk's pooled bytes */
+    enc_task_res_t* res;
+} enc_prepass_ctx_t;
+
+static void enc_str_prepass_chunk(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    enc_prepass_ctx_t* x = raw;
+    ray_enccol_t* e = x->e;
+    for (int64_t c = start; c < end; c++) {
         const ray_enc_desc_t* descs = ray_enccol_descs(e, c);
-        chunk_pool[c] = total;
         int nv = (int)((chunk_rows(e, c) + RAY_ENC_VEC - 1) / RAY_ENC_VEC);
-        for (int j = 0; j < nv; j++) {
+        uint64_t total = 0;
+        ray_t* err = NULL;
+        for (int j = 0; !err && j < nv; j++) {
             if (descs[j].encoding == RAY_ENC_STR_DICT) continue;   /* rows in the dictionary region */
-            uint64_t pb;
-            ray_t* err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);
-            if (err) return err;
+            uint64_t pb = 0;
+            err = ray_enccol_desc_pool_bytes(e, c, j, &descs[j], &pb);
             total += pb;
         }
+        x->bytes[c] = total;
+        if (err) { ray_enc_snap_take(&x->res[c].snap, err); x->res[c].failed = true; }
+        else x->res[c].done = true;
     }
-    return NULL;
+}
+
+static ray_t* enc_str_prepass(ray_enccol_t* e, uint64_t* chunk_pool, const ray_enc_sdict_t* sd) {
+    uint64_t* bytes = enc_alloc_fails(e) ? NULL : ray_alloc_raw((size_t)(e->n_chunks + 1) * sizeof(uint64_t));
+    enc_task_res_t* res = enc_alloc_fails(e) ? NULL : ray_calloc_raw((size_t)(e->n_chunks + 1) * sizeof *res);
+    if (!bytes || !res) {
+        ray_free_raw(bytes); ray_free_raw(res);
+        return ray_error("oom", "column %s: materialize", e->path);
+    }
+    if (e->n_chunks > (int64_t)UINT32_MAX) {
+        ray_free_raw(bytes); ray_free_raw(res);
+        return ray_error("range", "column %s: too many chunks", e->path);
+    }
+    enc_prepass_ctx_t x = { .e = e, .bytes = bytes, .res = res };
+    ray_pool_t* tp = ray_pool_get();
+    if (e->n_chunks >= 2 && ray_pool_par_dispatch_ok(tp, e->n_chunks, 2))
+        ray_pool_dispatch_n(tp, enc_str_prepass_chunk, &x, (uint32_t)e->n_chunks);
+    else
+        enc_str_prepass_chunk(&x, 0, 0, e->n_chunks);
+    ray_t* err = NULL;
+    uint64_t total = sd ? sd->pooled : 0;                 /* rule 1: the dictionary region first */
+    for (int64_t c = 0; c < e->n_chunks; c++) {
+        if (res[c].failed || !res[c].done) {
+            err = res[c].failed ? ray_enc_snap_error(&res[c].snap)
+                                : ray_error("cancel", "column %s: interrupted", e->path);
+            break;
+        }
+        chunk_pool[c] = total;
+        total += bytes[c];
+    }
+    ray_free_raw(bytes); ray_free_raw(res);
+    return err;
 }
 
 static _Atomic(bool) g_fail_index_parse;

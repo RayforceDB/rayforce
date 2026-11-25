@@ -2555,10 +2555,67 @@ static test_result_t test_idict_kept_iff_fits(void) {
     PASS();
 }
 
+/* #1646: a whole decode of an FSST STR column measures each cell's expanded
+ * length once: the pool sizing (run a chunk per pool task) measures every
+ * FSST cell, and the decode expands each once into a buffer (on the
+ * stack, or from the heap for a vector holding a longer cell).  Several chunks, cells inline (12 bytes or
+ * less) and pooled, nulls and a few cells of 6000 bytes: the materialized
+ * column equals the one saved. */
+static const char* gen_1646(int64_t i, char* b) {
+    if (i % 101 == 0) return "";
+    if (i % 7 == 0) { snprintf(b, 64, "k%lld", (long long)(i % 9999)); return b; }
+    snprintf(b, 64, "category number %lld long", (long long)i);
+    return b;
+}
+static test_result_t test_fsst_measured_once(void) {
+    const int64_t n = 3 * 65536 + 777;
+    ray_t* v = ray_vec_new(RAY_STR, n);
+    char b[64];
+    static char big[6001];
+    int64_t longs = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i % 50000 == 3) {
+            for (int k = 0; k < 6000; k++) big[k] = (char)('!' + (k * 7919 + i) % 90);
+            v = ray_str_vec_append(v, big, 6000);
+            longs++;
+            continue;
+        }
+        const char* x = gen_1646(i, b);
+        v = ray_str_vec_append(v, x, strlen(x));
+    }
+    TEST_ASSERT_EQ_I(ray_col_save_gen(v, STP("/m1646"), 2), RAY_OK);
+    int64_t fsst_rows = 0;
+    for (int64_t vec = 0; vec < ray_enc_nvecs(n); vec++)
+        if (st_desc_enc(STP("/m1646"), vec, NULL) == RAY_ENC_FSST) fsst_rows += ray_enc_vec_len(n, vec);
+    TEST_ASSERT_TRUE(fsst_rows > n / 2);
+    ray_t* c = ray_col_mmap(STP("/m1646"));
+    TEST_ASSERT_TRUE(c && !RAY_IS_ERR(c));
+    uint64_t before = ray_enccol_test_fsst_measured();
+    ray_t* m = ray_enccol_materialize(c);
+    uint64_t measured = ray_enccol_test_fsst_measured() - before;
+    TEST_ASSERT_TRUE(m && !RAY_IS_ERR(m));
+    TEST_ASSERT_EQ_I(m->len, n);
+    int64_t diff = 0;
+    for (int64_t i = 0; i < n; i++) {
+        size_t la = 0, lb = 0;
+        const char* pa = ray_str_vec_get(v, i, &la);
+        const char* pb = ray_str_vec_get(m, i, &lb);
+        if (la != lb || (la && memcmp(pa, pb, la) != 0)) diff++;
+    }
+    ray_release(c);
+    ray_release(v);
+    TEST_ASSERT_EQ_I(diff, 0);
+    /* once per FSST cell: the long ones expand into a heap buffer */
+    TEST_ASSERT_FMT((int64_t)measured == fsst_rows && longs > 0,
+                    "measured %llu FSST cells, the column has %lld", (unsigned long long)measured, (long long)fsst_rows);
+    PASS();
+}
+
 const test_entry_t encstr_entries[] = {
     { "encstr/strdict_body",       test_strdict_body,       st_setup, st_teardown },
     { "encstr/fsst_body",          test_fsst_body,          st_setup, st_teardown },
     { "encstr/fsst_train_verdict", test_fsst_train_verdict, st_setup, st_teardown },
+    { "encstr/fsst_measured_once", test_fsst_measured_once, st_setup, st_teardown },
     { "encstr/writer_strdict",     test_writer_strdict,     st_setup, st_teardown },
     { "encstr/writer_fsst",        test_writer_fsst,        st_setup, st_teardown },
     { "encstr/writer_two_entries", test_writer_two_entries, st_setup, st_teardown },
