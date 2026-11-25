@@ -1,0 +1,27 @@
+;; top and bot beside an output the planner declines (the evaluator
+;; fallback): their one value, the k values, is one cell, broadcast to every
+;; row as the planned route holds it (#1676).  It used to be read as a
+;; column of length k and fail with length.
+(.sys.exec "rm -rf /tmp/rfl_top_bot_1676") -- 0
+(set Hm2 (fn [v] (let q 1) (+ v q)))
+(set T (table [i h f] (list (til 6) [0N 2 3 0N 5 6] [1.5 0Nf 3.5 2.5 0Nf 6.5])))
+(.db.splayed.set "/tmp/rfl_top_bot_1676/s/t/" T "/tmp/rfl_top_bot_1676/s.sym")
+(set S (.db.splayed.get "/tmp/rfl_top_bot_1676/s/t/" "/tmp/rfl_top_bot_1676/s.sym"))
+(.db.splayed.set "/tmp/rfl_top_bot_1676/p/2024.01.01/t/" (take T 3) "/tmp/rfl_top_bot_1676/p/.sym")
+(.db.splayed.set "/tmp/rfl_top_bot_1676/p/2024.01.02/t/" (drop T 3) "/tmp/rfl_top_bot_1676/p/.sym")
+(set P (.db.parted.get "/tmp/rfl_top_bot_1676/p" 't))
+
+;; the planned value: one cell
+(first (at (select {v: (top h 2) from: T}) 'v)) -- [6 5]
+;; beside a declined output, and beside a plain row column
+(at (select {v: (top h 2) w: (Hm2 i) from: T}) 'v) -- (list [6 5] [6 5] [6 5] [6 5] [6 5] [6 5])
+(at (select {v: (top h 2) w: i from: T}) 'v) -- (list [6 5] [6 5] [6 5] [6 5] [6 5] [6 5])
+(at (select {w: (Hm2 i) v: (bot f 2) from: T}) 'v) -- (at (select {v: (bot f 2) w: i from: T}) 'v)
+(first (at (select {v: (bot f 2) w: (Hm2 i) from: T}) 'v)) -- (first (at (select {v: (bot f 2) from: T}) 'v))
+;; splayed and parted, with where: keeping some rows and none
+(at (select {v: (top h 2) w: (Hm2 i) from: S where: (> i 2)}) 'v) -- (list [6 5] [6 5] [6 5])
+(at (select {v: (top h 3) w: (Hm2 i) from: P where: (< i 3)}) 'v) -- (list [3 2 0N] [3 2 0N] [3 2 0N])
+(count (at (select {v: (top h 2) w: (Hm2 i) from: T where: (> i 100)}) 'v)) -- 0
+;; the other outputs keep their rows
+(at (select {v: (top h 2) w: (Hm2 i) from: T}) 'w) -- [1 2 3 4 5 6]
+(.sys.exec "rm -rf /tmp/rfl_top_bot_1676") -- 0
