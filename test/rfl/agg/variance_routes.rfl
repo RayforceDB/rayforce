@@ -1,0 +1,89 @@
+;; var, var_pop, stddev, dev, dev_pop and stddev_pop give the same, accurate
+;; value on every route (#1666).  The routes summed the raw values and
+;; their squares, which cancel once the values are large next to their
+;; spread: 1e8 + [0 1 2 3] repeated came out 0 from 4,000 rows and 18927.75
+;; from 400,000, where the population variance is 1.25.  Every route now
+;; sums differences from a value of the data (an integer's exactly), so
+;; its spread, not its magnitude, sets the error.
+;;
+;; Data: 5 groups (i mod 5), each cycling through base + [0 1 2 3] * step, so
+;; every group and the whole column have population variance 1.25 * step^2
+;; exactly and sample variance that times m / (m - 1) for m rows.
+
+(set rel (fn [got want] (/ (abs (- got want)) want)))
+(set ok (fn [got want] (all (< (rel got want) 0.000000001))))
+
+;; table over n rows: v the values, keys of every type over the same groups
+(set mk (fn [n base step] (table [k s t f p d g v] (list (% (til n) 5) (at ['a 'b 'c 'd 'e] (% (til n) 5)) (as 'STR (at ['a 'b 'c 'd 'e] (% (til n) 5))) (+ 0.5 (as 'F64 (% (til n) 5))) (* 0D00:00:00.000000001 (% (til n) 5)) (+ 2024.01.01 (as 'I32 (% (til n) 5))) (.attr.set 'grouped (at ['a 'b 'c 'd 'e] (% (til n) 5))) (+ base (* step (% (div (til n) 5) 4)))))))
+
+;; var_pop on each grouped route, groups in key order
+(set byall (fn [T] (raze (list (at (select {from: T by: k q: (var_pop v) asc: k}) 'q) (at (select {from: T by: s q: (var_pop v) asc: s}) 'q) (at (select {from: T by: t q: (var_pop v) asc: t}) 'q) (at (select {from: T by: f q: (var_pop v) asc: f}) 'q) (at (select {from: T by: p q: (var_pop v) asc: p}) 'q) (at (select {from: T by: d q: (var_pop v) asc: d}) 'q) (at (select {from: T by: k q: (var_pop v) where: (> k 0) asc: k}) 'q) (at (select {from: T by: g q: (var_pop v) where: (in g ['a 'b]) asc: g}) 'q) (at (select {from: (update {q: (var_pop v) by: k from: T}) by: k q: (first q) asc: k}) 'q)))))
+;; var_pop on each keyless route
+(set keyless (fn [T] (raze (list (at (select {from: T q: (var_pop v)}) 'q) (at (select {from: T q: (var_pop v) where: (>= k 0)}) 'q) (first (at (update {q: (var_pop v) from: T}) 'q)) (var_pop (at T 'v))))))
+
+;; 4,000 rows: 1e8 floats (quarter steps), 1e8 integers, timestamp-scale
+;; integers (1.7e18, steps of 1e9) and the same as floats
+(set T (mk 4000 100000000.0 0.25))
+(ok (byall T) 0.078125) -- true
+(ok (keyless T) 0.078125) -- true
+(set T (mk 4000 100000000 1))
+(ok (byall T) 1.25) -- true
+(ok (keyless T) 1.25) -- true
+(set T (mk 4000 1700000000000000000 1000000000))
+(ok (byall T) 1250000000000000000.0) -- true
+(ok (keyless T) 1250000000000000000.0) -- true
+(set T (mk 4000 1700000000000000000.0 1000000000.0))
+(ok (byall T) 1250000000000000000.0) -- true
+(ok (keyless T) 1250000000000000000.0) -- true
+;; magnitude 1
+(set T (mk 4000 1.0 0.25))
+(ok (byall T) 0.078125) -- true
+(ok (keyless T) 0.078125) -- true
+
+;; 400,000 rows: the accumulators' error grows with the row count only
+(set T (mk 400000 100000000.0 0.25))
+(ok (byall T) 0.078125) -- true
+(ok (keyless T) 0.078125) -- true
+(set T (mk 400000 1700000000000000000 1000000000))
+(ok (byall T) 1250000000000000000.0) -- true
+(ok (keyless T) 1250000000000000000.0) -- true
+
+;; the aliases: var and stddev are the sample forms, var_pop, dev, dev_pop
+;; and stddev_pop the population ones, on a keyless and a grouped route
+(set T (mk 4000 100000000 1))
+(ok (at (select {from: T q: (var v)}) 'q) (/ (* 1.25 4000) 3999)) -- true
+(ok (at (select {from: T q: (stddev v)}) 'q) (sqrt (/ (* 1.25 4000) 3999))) -- true
+(ok (at (select {from: T q: (dev v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T q: (dev_pop v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T q: (stddev_pop v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T by: s q: (var v)}) 'q) (/ (* 1.25 800) 799)) -- true
+(ok (at (select {from: T by: s q: (stddev v)}) 'q) (sqrt (/ (* 1.25 800) 799))) -- true
+(ok (at (select {from: T by: s q: (dev v)}) 'q) (sqrt 1.25)) -- true
+(ok (at (select {from: T by: s q: (stddev_pop v)}) 'q) (sqrt 1.25)) -- true
+(ok (var (at T 'v)) (/ (* 1.25 4000) 3999)) -- true
+(ok (dev (at T 'v)) (sqrt 1.25)) -- true
+
+;; nulls: every other row null, the variance of the rest unchanged
+(set N (update {v: 0Nl from: (mk 8000 100000000 1) where: (== 1 (% (til 8000) 2))}))
+(set N (update {v: (+ 100000000 (% (div (div (til 8000) 2) 5) 4)) k: (% (div (til 8000) 2) 5) from: N where: (== 0 (% (til 8000) 2))}))
+(ok (at (select {from: N by: k q: (var_pop v) asc: k}) 'q) 1.25) -- true
+(ok (at (select {from: N q: (var_pop v)}) 'q) 1.25) -- true
+(ok (var_pop (at N 'v)) 1.25) -- true
+
+;; groups of very different magnitude in one query
+(set M (table [k v] (list (% (til 4000) 4) (+ (at [0 100000000 1000000000000000 7] (% (til 4000) 4)) (% (div (til 4000) 4) 4)))))
+(ok (at (select {from: M by: k q: (var_pop v) asc: k}) 'q) 1.25) -- true
+
+;; a single row: population variance 0, sample variance null; all-equal
+;; values: exactly 0 on every route
+(at (select {from: (table [k v] (list [1] [100000000.5])) by: k q: (var_pop v)}) 'q) -- [0.0]
+(at (select {from: (table [k v] (list [1] [100000000.5])) by: k q: (var v)}) 'q) -- [0Nf]
+(at (select {from: (table [v] (list [100000000.5])) q: (var_pop v)}) 'q) -- [0.0]
+(set E (mk 4000 1700000000000000000 0))
+(all (== (byall E) 0.0)) -- true
+(all (== (keyless E) 0.0)) -- true
+
+;; values whose squares overflow while their spread does not: 0, not NaN
+(var_pop [1e308 1e308]) -- 0.0
+(at (select {from: (table [v] (list [1e308 1e308])) q: (var_pop v)}) 'q) -- [0.0]
+(at (select {from: (table [k v] (list [0 0 0] [1e200 1e200 1e200])) by: k q: (var_pop v)}) 'q) -- [0.0]
