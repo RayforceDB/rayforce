@@ -351,6 +351,9 @@ enum {
     RAY_SYM_DOMAIN_EV_HEADER    = 5    /* a symfile's header count was just read, before it is mapped */
 };
 void ray_sym_domain_test_hook(void (*fn)(int event, const char* path));
+/* Test hook: domains detached from the cache because their file was
+ * replaced at its path (#1497) and not yet freed. */
+int64_t ray_sym_domain_test_replaced_live(void);
 /* The same with hashes[i] = ray_hash_bytes of strs[i], all 64 bits: the
  * import dictionary keys on them (the 32-bit entry point hashes its strings
  * again for it); the other domains take their low 32 bits. */

@@ -1,0 +1,63 @@
+;; @requires: posix  (fixtures built, moved and checked through .sys.exec)
+;; A root whose symbol file was replaced at the same path (#1497) mounts
+;; again while a table read from the old file is held: the new mount reads
+;; the new file, and the held table keeps the old one for as long as it
+;; lives.  The replacement is built at another path in this process and
+;; moved over the root, as a rebuild in another process would leave it.
+(.sys.exec "rm -rf /tmp/rf_remount && mkdir -p /tmp/rf_remount") -- 0
+(set R "/tmp/rf_remount/root")
+(set N "/tmp/rf_remount/new")
+(.db.splayed.set (format "%/2024.01.01/t" R) (table [k v] (list ['p 'q] [1 2])) (format "%/.sym" R))
+(.db.splayed.set (format "%/2024.01.02/t" R) (table [k v] (list ['r 'q] [3 4])) (format "%/.sym" R))
+(set P1 (.db.parted.get R 't))
+(at P1 'k) -- ['p 'q 'r 'q]
+
+;; The rebuild: the same rows with the symbols in another order, so every
+;; old position names another string in the new file.
+(.db.splayed.set (format "%/2024.01.02/t" N) (table [k v] (list ['r 'q] [3 4])) (format "%/.sym" N))
+(.db.splayed.set (format "%/2024.01.01/t" N) (table [k v] (list ['p 'q] [1 2])) (format "%/.sym" N))
+(.sys.exec (format "rm -rf % && mv % %" R N R)) -- 0
+
+;; The remount reads the new file; the held table still reads the old one,
+;; whose last link is gone.
+(set P2 (.db.parted.get R 't))
+(at P2 'k) -- ['p 'q 'r 'q]
+(at P1 'k) -- ['p 'q 'r 'q]
+(select {k: k v: v from: P2 where: (== k 'q)}) -- (table [k v] (list ['q 'q] [2 4]))
+(select {k: k v: v from: P1 where: (== k 'q)}) -- (table [k v] (list ['q 'q] [2 4]))
+
+;; Values of the two files compare and join by their strings.
+(== (at P1 'k) (at P2 'k)) -- [true true true true]
+(in (at P1 'k) ['r]) -- [false false true false]
+(set A (select {k: k v: v from: P1 where: (> v 0)}))
+(set B (select {k: k w: (* 10 v) from: P2 where: (> v 0)}))
+(inner-join [k] A (select {k: k w: (max w) from: B by: k})) -- (table [k v w] (list ['p 'q 'r 'q] [1 2 3 4] [10 40 30 40]))
+(distinct (concat (at P1 'k) (at P2 'k))) -- ['p 'q 'r]
+
+;; A splayed table of the old file mounts afresh the same way.
+(set S1 (.db.splayed.get (format "%/2024.01.01/t" R)))
+(at S1 'k) -- ['p 'q]
+
+;; A symbol added in memory to the old table after the replacement stays
+;; with it; written back at rollover, it goes into the new file through the
+;; new vocabulary, and the root reads every symbol by its string.
+(insert 'P1 2024.01.03 (list ['zz 'p] [5 6]))
+(at P1 'k) -- ['p 'q 'r 'q 'zz 'p]
+(.db.splayed.set (format "%/2024.01.03/t" R) (select {k: k v: v from: P1 where: (== date 2024.01.03)}) (format "%/.sym" R))
+(at (.db.parted.get R 't) 'k) -- ['p 'q 'r 'q 'zz 'p]
+(at P2 'k) -- ['p 'q 'r 'q]
+
+;; Still refused: the same file changed in place other than by an append
+;; (same inode), and a replacement that is not a symbol file.
+(set P3 (.db.parted.get R 't))
+(.sys.exec (format "printf 'XX' | dd of=%/.sym bs=1 seek=24 conv=notrunc 2>/dev/null" R)) -- 0
+(.db.parted.get R 't) !- corrupt
+(set P3 0)
+(set P1 0)
+(set P2 0)
+(set S1 0)
+(.sys.gc)
+(.sys.exec (format "printf 'not a symbol file at all' > %/.sym.bad && mv %/.sym.bad %/.sym" R R R)) -- 0
+(.db.parted.get R 't) !- corrupt
+
+(.sys.exec "rm -rf /tmp/rf_remount") -- 0

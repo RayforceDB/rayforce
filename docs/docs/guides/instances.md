@@ -50,7 +50,7 @@ Instances that read the same tables share the operating system's page cache, so 
 
 ## Sharing a database
 
-**Readers.** Any number of instances can read the same splayed or partitioned tables. A reader sees either the whole previous version of a table or the whole new one, and a table it has already loaded stays valid when another process rewrites it. The shared symbol file is appended to in place by a writer: a reader that opens it meanwhile sees the symbols counted when it opened the file and takes in the ones appended since at its next read of the database, and a table it already holds keeps its own.
+**Readers.** Any number of instances can read the same splayed or partitioned tables. A reader sees either the whole previous version of a table or the whole new one, and a table it has already loaded stays valid when another process rewrites it. The shared symbol file is appended to in place by a writer: a reader that opens it meanwhile sees the symbols counted when it opened the file and takes in the ones appended since at its next read of the database, and a table it already holds keeps its own. A symbol file replaced at the same path, as by a rebuild moved into place, is read afresh at the next mount while the tables read from the old file keep the old one (see [Append-Only .sym Files](../storage/index.md#append-only-sym-files)).
 
 **One writer per database.** Only one process at a time may write a database: `.db.splayed.set`, a `.csv` or `.parquet` import into an existing root, or a live `insert` into a partitioned table followed by its rollover. All tables and partitions of a database share the root's symbol file.
 
