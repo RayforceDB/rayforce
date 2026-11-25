@@ -1,54 +1,69 @@
 name: CI
 
 on:
-  # PR-only. Every change reaches dev and master through a pull request, and
-  # the pull_request run tests the exact merge result — so one run gates each
-  # hop:
-  #   • PR -> dev    : gates feature/fix work landing on the integration branch
-  #   • PR -> master : the required gate for a release (dev -> master, vX.Y.Z)
-  # No push triggers: a post-merge `push` run only re-tests what the PR run
-  # already validated (the redundant on-merge-to-dev run we were paying for).
-  # Direct pushes to a branch are not expected — the flow is PRs onto dev,
-  # then dev baked to master as a release.
+  # Three tiers.  Every change reaches dev through the merge queue and master
+  # through a release pull request:
+  #   • PR -> dev      : CHEAP (Linux gcc debug + the suite, Linux gcc release
+  #                      + library builds, the docs).  It gates entry to the
+  #                      queue; the queue re-tests the combination.
+  #   • merge group    : QUEUE, on the queue's speculative branch (dev + the
+  #                      pull requests ahead + this one): CHEAP plus macOS
+  #                      debug, clang-current, gcc-12, tsan, a short
+  #                      fuzz-smoke and the advisory static-analysis.  Built for wall time: one macOS job,
+  #                      every build on all cores.
+  #   • PR -> master   : RELEASE, everything: QUEUE plus macOS release,
+  #                      ndebug, the full-length fuzz-smoke and test-full:
+  #                      the gate before anything ships.
+  # The nightly workflow also runs ndebug and macOS release on dev.
+  # No push triggers: a post-merge `push` run only re-tests what the queue
+  # already validated.  Direct pushes to a branch are not expected.
   pull_request:
     branches: [master, dev]
+  merge_group:
+    types: [checks_requested]
 
 # A new push to a PR supersedes its older run, so cancel that run instead of
 # letting it hold runners (macOS slots especially).  Keyed per PR; any other
 # event gets a group of its own (ref + sha) and never cancels, so a commit
-# that lands on a branch is not left untested.
+# that lands on a branch is not left untested.  A merge group's ref is its
+# own temporary branch (gh-readonly-queue/dev/pr-N-<sha>), so each group runs
+# alone and the queue, not this block, cancels a group it abandons.
 # Do not re-run a superseded run by hand: it rejoins this PR's group and
 # cancels the head's run, whose ci-success then fails until it is re-run.
 concurrency:
   group: ci-${{ github.event.pull_request.number || format('{0}-{1}', github.ref, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Test tiers.  A PR into dev runs `make test`: the dev-loop suite (DEBUG
-# checks, no sanitizers, no equivalence pass or stress soak, all tests in
-# parallel).  A release PR into master runs `make test-full`: every test
-# under ASan+UBSan, plus the NDEBUG leg -- the gate before anything ships.
+# Test tiers.  A PR into dev and a merge group onto dev run `make test`: the
+# dev-loop suite (DEBUG checks, no sanitizers, no equivalence pass or stress
+# soak, all tests in parallel).  A release PR into master runs `make
+# test-full`: every test under ASan+UBSan -- the gate before anything ships.
+#
+# Which jobs run (each job's `if:` spells its condition, the env context is
+# not available there):
+#   every event         build-and-test (its matrix grows per tier), docs
+#   QUEUE and RELEASE   clang-current, gcc-12, tsan, fuzz-smoke and the
+#                       advisory static-analysis:
+#                         github.event_name == 'merge_group' || github.base_ref == 'master'
+#   RELEASE only        ndebug: github.base_ref == 'master'
 env:
-  TEST_TIER: ${{ github.base_ref == 'master' && 'test-full' || 'test' }}
+  TEST_TIER: ${{ (github.base_ref == 'master' || github.event.merge_group.base_ref == 'refs/heads/master') && 'test-full' || 'test' }}
+  # Every build on the runner's cores (4 on Linux, 3 on macOS; one more job
+  # than cores keeps them busy across link steps).  The suite already runs
+  # one worker per core (TEST_JOBS in the Makefile).
+  MAKEFLAGS: -j4
 
 jobs:
+  # The Linux legs on every event; macOS debug on QUEUE and RELEASE (one
+  # macOS job per merge-group build: the hosted macOS concurrency is small);
+  # macOS release on RELEASE only.  The matrix is chosen per event
+  # (fromJSON), so the job name and the steps stay the same.
   build-and-test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: debug
-            compiler: gcc
-          - os: ubuntu-latest
-            target: release
-            compiler: gcc
-          - os: macos-latest
-            target: debug
-            compiler: clang
-          - os: macos-latest
-            target: release
-            compiler: clang
+        include: ${{ fromJSON(github.base_ref == 'master' && '[{"os":"ubuntu-latest","target":"debug","compiler":"gcc"},{"os":"ubuntu-latest","target":"release","compiler":"gcc"},{"os":"macos-latest","target":"debug","compiler":"clang"},{"os":"macos-latest","target":"release","compiler":"clang"}]' || (github.event_name == 'merge_group' && '[{"os":"ubuntu-latest","target":"debug","compiler":"gcc"},{"os":"ubuntu-latest","target":"release","compiler":"gcc"},{"os":"macos-latest","target":"debug","compiler":"clang"}]' || '[{"os":"ubuntu-latest","target":"debug","compiler":"gcc"},{"os":"ubuntu-latest","target":"release","compiler":"gcc"}]')) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +81,7 @@ jobs:
       # do not exercise codec strict-FP overrides in that profile.
       - name: Build static library
         if: matrix.target == 'release' && matrix.compiler == 'gcc'
-        run: make -j2 lib CC=${{ matrix.compiler }}
+        run: make lib CC=${{ matrix.compiler }}
 
       # The shared library is what a run-time host loads. Linking an example
       # against it and running that proves the symbols are exported and the
@@ -74,7 +89,7 @@ jobs:
       - name: Build shared library and run an example against it
         if: matrix.target == 'release'
         run: |
-          make -j2 shared CC=${{ matrix.compiler }}
+          make shared CC=${{ matrix.compiler }}
           ${{ matrix.compiler }} -O2 -Iinclude -Isrc examples/analytics.c -L. -lrayforce -lm -lpthread -Wl,-rpath,"$PWD" -o analytics-shared
           ./analytics-shared
 
@@ -99,6 +114,7 @@ jobs:
   # upstream Clang as well, so new -Werror diagnostics reach CI before users
   # of rolling-release toolchains encounter them.
   clang-current:
+    if: github.event_name == 'merge_group' || github.base_ref == 'master'
     runs-on: ubuntu-latest
     env:
       RAY_MARCH: x86-64
@@ -129,11 +145,13 @@ jobs:
   # Pinned to ubuntu-24.04, whose archive ships gcc-12; a later ubuntu-latest
   # may not.
   gcc-12:
+    if: github.event_name == 'merge_group' || github.base_ref == 'master'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install gcc 12
-        run: sudo apt-get update && sudo apt-get install -y gcc-12
+      # ubuntu-24.04's image ships gcc-12; install it only if it is gone.
+      - name: Install gcc 12 (if the image lacks it)
+        run: command -v gcc-12 || { sudo apt-get update && sudo apt-get install -y gcc-12; }
       - name: Build release with gcc 12
         run: make release CC=gcc-12
       - name: Build shared library with gcc 12
@@ -143,7 +161,8 @@ jobs:
   # asserts on, but CMake Release, distro packagers and `zig cc` define NDEBUG;
   # work placed inside an assert then silently vanishes (#652: an NDEBUG build
   # registered no builtins).  This leg keeps the code correct either way.
-  # A whole sanitized suite: release PRs (into master) only.
+  # A whole sanitized suite: release PRs (into master) and the nightly only;
+  # not in the merge queue (about 29 min, it would set the queue's pace).
   ndebug:
     if: github.base_ref == 'master'
     runs-on: ubuntu-latest
@@ -159,39 +178,58 @@ jobs:
         run: make test-ndebug
 
   # Coverage-guided fuzz smoke pass over the untrusted-input decoders
-  # (parser, numeric scanners, wire-frame decoder).  A healthy corpus finds
-  # nothing new in a minute, so any crash here is a genuine regression.
-  # Linux + clang only (the fuzzing runtime is not bundled on the macOS
-  # system toolchain).  The working corpus is regenerated from the test
-  # suite each run and cached so coverage accretes across runs.
+  # (parser, numeric scanners, wire-frame decoder) and the nested-select
+  # differential fuzzer.  A healthy corpus finds nothing new in a minute, so
+  # any crash here is a genuine regression.  Linux + clang only (the fuzzing
+  # runtime is not bundled on the macOS system toolchain).
+  # Most of this leg was the instrumented build, run serially (about 6 of
+  # its 12 minutes); it now builds on all cores, and the three smoke
+  # targets run side by side.  In the merge queue each target fuzzes 20 s
+  # (FUZZ_SECS), from the cached corpus and the committed seeds, without
+  # the frame seeding that needs a debug server build, and the cache is
+  # only restored (a merge group's cache would be scoped to its throwaway
+  # ref).  Release PRs keep 60 s per target, the seeding and the cache
+  # update; the nightly fuzzes each target for 15 minutes.
   fuzz-smoke:
+    if: github.event_name == 'merge_group' || github.base_ref == 'master'
     runs-on: ubuntu-latest
     env:
       # Hosted runner `-march=native` can expose transient CPU features that
       # clang promotes to -Werror diagnostics; fuzzing does not need native ISA.
       RAY_MARCH: x86-64
+      FUZZ_SECS: ${{ github.event_name == 'merge_group' && '20' || '60' }}
     steps:
       - uses: actions/checkout@v4
       - name: Cache fuzz corpus
+        if: github.event_name != 'merge_group'
         uses: actions/cache@v4
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
+      - name: Restore the fuzz corpus (merge queue)
+        if: github.event_name == 'merge_group'
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
       - name: Seed corpora
+        run: scripts/fuzz-seed-parse.sh
+      - name: Seed wire-frame corpora from a real server
+        if: github.event_name != 'merge_group'
         run: |
-          scripts/fuzz-seed-parse.sh
           make debug            # fuzz-seed-frames.sh drives a real server
           scripts/fuzz-seed-frames.sh || true
-      - name: Fuzz smoke
-        run: make fuzz-smoke
+      - name: Fuzz smoke (${{ env.FUZZ_SECS }} s per target, side by side)
+        run: make fuzz-parse fuzz-numparse fuzz-de FUZZ_RUNTIME="$FUZZ_SECS"
       - name: Nested select differential fuzz (serial and parallel)
         run: |
           # Start each mode from committed seeds. Replaying the growing cache
           # can exhaust the short run before it reaches any mutations.
           corpus_root=$(mktemp -d "$RUNNER_TEMP/select-merge.XXXXXX")
-          make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/serial"
-          RAY_FUZZ_CORES=4 make fuzz-select_merge FUZZ_RUNTIME=60 FUZZ_CORPUS_ROOT="$corpus_root/parallel"
+          make fuzz-select_merge FUZZ_RUNTIME="$FUZZ_SECS" FUZZ_CORPUS_ROOT="$corpus_root/serial"
+          RAY_FUZZ_CORES=4 make fuzz-select_merge FUZZ_RUNTIME="$FUZZ_SECS" FUZZ_CORPUS_ROOT="$corpus_root/parallel"
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -209,6 +247,7 @@ jobs:
   # exclusive, so this is a separate build flavour.  TSAN_CORES=4 gives the
   # work-stealing ring real contention to race against.  Linux + clang only.
   tsan:
+    if: github.event_name == 'merge_group' || github.base_ref == 'master'
     runs-on: ubuntu-latest
     env:
       # Keep Clang off transient hosted-runner ISA features that become
@@ -233,7 +272,11 @@ jobs:
   # (`make tidy`) runs locally and in the nightly workflow.  Flip to a
   # blocking gate once the baseline is annotated clean.  The timeout keeps a
   # regression in analysis time from holding a runner for hours.
+  # QUEUE and RELEASE: advisory (not in ci-success), about 2 min and in
+  # parallel, so it does not lengthen a merge-group build, and a new finding
+  # is seen when the change lands.
   static-analysis:
+    if: github.event_name == 'merge_group' || github.base_ref == 'master'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
@@ -244,24 +287,62 @@ jobs:
       - name: cppcheck
         run: make cppcheck
 
-  # Single stable check to require in branch protection, instead of the four
-  # brittle matrix names (which break if the matrix is renamed). `if: always()`
-  # makes this job run even when a matrix leg fails, and the explicit result
-  # check fails it — without that, a failed matrix would SKIP this job, and a
-  # skipped required check can be treated as passed, silently opening the gate.
-  # static-analysis is intentionally NOT in `needs` — it is advisory only.
+  # The docs build as the site builds it (pages.yml), strict, and the
+  # builtin reference check: about 25 s, so in the cheap tier.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install MkDocs
+        run: pip install -r .github/requirements-docs.txt
+      - name: mkdocs build --strict
+        run: mkdocs build --strict
+      - name: Every builtin is in the reference
+        run: make docs-check
+
+  # Single stable check to require in branch protection and in the merge
+  # queue, instead of the brittle matrix names.  It is reported on the pull
+  # request AND on the merge group (the queue waits for a required check on
+  # both), and its verdict depends on the tier:
+  #   • build-and-test and docs must succeed on every tier;
+  #   • clang-current, gcc-12, tsan, fuzz-smoke must succeed on QUEUE and
+  #     RELEASE and be SKIPPED on CHEAP;
+  #   • ndebug must succeed on RELEASE and be SKIPPED otherwise.
+  # A job skipped where its tier runs it fails the check: a job that should
+  # have run did not.  `if: always()` makes this job run even when a needed
+  # job fails, and the explicit check fails it -- without that a failed need
+  # would SKIP this job, and a skipped required check counts as passed,
+  # silently opening the gate.  static-analysis is advisory and not in
+  # `needs`.  The logic reads only its env, so it can be run outside Actions
+  # to enumerate every combination (see the commit introducing the queue).
   ci-success:
-    needs: [build-and-test, clang-current, gcc-12, ndebug, fuzz-smoke, tsan]
+    needs: [build-and-test, docs, clang-current, gcc-12, ndebug, fuzz-smoke, tsan]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all required jobs passed
+      - name: Verify the jobs this tier requires passed
+        env:
+          TIER: ${{ github.event_name == 'merge_group' && 'queue' || (github.base_ref == 'master' && 'release' || 'cheap') }}
+          R_build_and_test: ${{ needs.build-and-test.result }}
+          R_docs: ${{ needs.docs.result }}
+          R_clang_current: ${{ needs.clang-current.result }}
+          R_gcc_12: ${{ needs.gcc-12.result }}
+          R_ndebug: ${{ needs.ndebug.result }}
+          R_fuzz_smoke: ${{ needs.fuzz-smoke.result }}
+          R_tsan: ${{ needs.tsan.result }}
         run: |
-          bt='${{ needs.build-and-test.result }}'
-          cl='${{ needs.clang-current.result }}'
-          g12='${{ needs.gcc-12.result }}'
-          nd='${{ needs.ndebug.result }}'   # skipped on PRs into dev (release-PR only)
-          fz='${{ needs.fuzz-smoke.result }}'
-          ts='${{ needs.tsan.result }}'
-          echo "build-and-test: $bt   clang-current: $cl   gcc-12: $g12   ndebug: $nd   fuzz-smoke: $fz   tsan: $ts"
-          [ "$bt" = "success" ] && [ "$cl" = "success" ] && [ "$g12" = "success" ] && { [ "$nd" = "success" ] || [ "$nd" = "skipped" ]; } && [ "$fz" = "success" ] && [ "$ts" = "success" ] || exit 1
+          ok=1
+          want() {   # job, the result its tier requires
+            r=$(printenv "R_$1"); echo "$1: $r (want $2, tier $TIER)"
+            [ "$r" = "$2" ] || ok=0
+          }
+          want build_and_test success
+          want docs success
+          q=skipped; [ "$TIER" = cheap ] || q=success
+          for j in clang_current gcc_12 fuzz_smoke tsan; do want "$j" "$q"; done
+          n=skipped; [ "$TIER" = release ] && n=success
+          want ndebug "$n"
+          [ "$ok" = 1 ] || { echo "ci-success: a job this tier requires did not pass"; exit 1; }

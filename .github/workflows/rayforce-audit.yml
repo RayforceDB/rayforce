@@ -3,25 +3,41 @@ name: Rayforce audit
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # The merge queue needs the required check on its merge group too.  The
+  # audit reads a pull request's diff, and every pull request in a group was
+  # audited before it could enter the queue, so a merge group reports
+  # success without auditing again (and without the self-hosted runner).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
   issues: write
   pull-requests: write
 
+# One audit per pull request at a time; a merge group has its own ref
+# (gh-readonly-queue/dev/pr-N-<sha>), so groups never cancel one another.
 concurrency:
-  group: rayforce-audit-${{ github.event.pull_request.number }}
+  group: rayforce-audit-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   rayforce-audit:
     name: rayforce-audit
-    if: github.event.pull_request.draft == false
-    runs-on: [self-hosted, rayforce-audit, claude-code]
+    if: github.event_name == 'merge_group' || github.event.pull_request.draft == false
+    runs-on: ${{ github.event_name == 'merge_group' && 'ubuntu-latest' || fromJSON('["self-hosted", "rayforce-audit", "claude-code"]') }}
     timeout-minutes: 45
 
     steps:
+      - name: Merge group (every pull request in it was audited)
+        if: github.event_name == 'merge_group'
+        env:
+          GROUP_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          echo "merge group ${GROUP_REF}: each pull request in it was audited before entering the queue"
+
       - name: Checkout PR head
+        if: github.event_name == 'pull_request'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -29,11 +45,13 @@ jobs:
           persist-credentials: false
 
       - name: Fetch base branch
+        if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags --prune origin \
             +refs/heads/${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}
 
       - name: Run Claude rayforce-audit skill
+        if: github.event_name == 'pull_request'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: origin/${{ github.event.pull_request.base.ref }}
@@ -173,7 +191,7 @@ jobs:
           fi
 
       - name: Upload audit report
-        if: always()
+        if: always() && github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: rayforce-audit-report
