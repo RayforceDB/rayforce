@@ -524,7 +524,7 @@ or did not complete), `oom`.
 
 ## `.sys.cmd` { #sys-cmd }
 
-Signature: `(.sys.cmd "name args")`. Parses a colon-style command name (without the leading `:`) and dispatches. Names supported: `timeit`/`t`, `listen`, `env`, `clear`, `help`/`?`, `q`/`quit`. Unknown names fall back to `system()` (so `(.sys.cmd "ls /tmp")` works too).
+Signature: `(.sys.cmd "name args")`. Parses a colon-style command name (without the leading `:`) and dispatches. Names supported: `timeit`/`t`, `listen`, `env`, `clear`, `help`/`?`, `q`/`quit`. An unknown name hands the whole string to the shell (so `(.sys.cmd "ls /tmp")` works too) and returns the command's **exit code**, as [`.sys.exec`](#sys-exec) does: the code of a normal exit, and `128 + signum` for a command a signal killed (`143` for `SIGTERM`).
 
 `clear`, `help`, and `q` are REPL-only — invoking them from a script returns a `domain` error rather than silently no-op'ing.
 
@@ -532,7 +532,15 @@ Signature: `(.sys.cmd "name args")`. Parses a colon-style command name (without 
 (.sys.cmd "listen 5000")   ;; => listener id
 (.sys.cmd "env")           ;; => binding count
 (.sys.cmd "timeit 1")      ;; => 1   (profiler enabled)
+(.sys.cmd "exit 3")        ;; => 3   (the shell's exit code)
 ```
+
+!!! warning "Behaviour change"
+    Before this, the shell fallback returned the raw `waitpid`-encoded status
+    `system()` gives, so `(.sys.cmd "exit 3")` was `768`, `(.sys.cmd "false")`
+    was `256`, and a command killed by `SIGTERM` was `15`. Success was `0`
+    either way, so code that only checks for zero is unaffected; code
+    comparing against an encoded value needs updating.
 
 ## `.sys.listen` { #sys-listen }
 

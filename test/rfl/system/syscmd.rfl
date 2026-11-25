@@ -40,8 +40,8 @@
 ;; The shell fallback gets the entire string verbatim, so quoting
 ;; and arg passing survive the round-trip.
 (.sys.cmd "test 1 -eq 1") -- 0
-;; Failed shell command returns nonzero (exact code is shell-encoded
-;; via WEXITSTATUS so we don't pin the value, only that it's not 0).
+;; Failed shell command returns nonzero: its exit code, as .sys.exec
+;; gives it (#1740; the exact codes are pinned in syscmd_exit_code.rfl).
 (== 0 (.sys.cmd "false")) -- false
 
 ;; ────────────── REPL-only commands rejected from .sys.cmd ──────────────

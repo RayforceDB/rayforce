@@ -30,6 +30,7 @@
 #include "core/poll.h"
 #include "core/ipc.h"
 #include "core/profile.h"
+#include "core/platform.h"   /* RAY_OS_WINDOWS */
 #include "lang/env.h"
 #include "lang/inspect.h"
 #include "table/sym.h"
@@ -44,6 +45,26 @@ void* ray_runtime_get_poll(void);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(RAY_OS_WINDOWS)
+#include <sys/wait.h>   /* WIFEXITED/WEXITSTATUS: shell exit codes */
+#endif
+
+/* Turn a wait(2)-style status into the exit code a shell would report.
+ * system() and pclose() hand back an encoded status, not a code: "exit 3"
+ * arrives as 768 (3 << 8).  Signals follow the shell's 128+N convention, so
+ * a command killed by SIGTERM reads as 143 rather than as a bare 15 that
+ * could be confused with a real exit status.  .sys.exec and the shell
+ * fallback of .sys.cmd both answer through it (#1740). */
+int64_t ray_shell_exit_code(int status) {
+#if defined(RAY_OS_WINDOWS)
+    /* The CRT's system()/_pclose() already return the child's exit code. */
+    return (int64_t)status;
+#else
+    if (WIFEXITED(status))   return (int64_t)WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return (int64_t)(128 + WTERMSIG(status));
+    return (int64_t)status;
+#endif
+}
 
 /* Public header reaches us through syscmd.h.  These few helpers were
  * previously sourced from lang/internal.h; pulling them in directly
@@ -492,7 +513,9 @@ ray_t* ray_syscmd_dispatch(const char* str, size_t len,
         cmd[len] = '\0';
         int rc = system(cmd);
         if (cmd_block) ray_free(cmd_block);
-        return ray_i64(rc);
+        /* the shell's exit code, as .sys.exec gives it, not the wait
+         * status system() returns ("exit 3" was 768, #1740) */
+        return ray_i64(ray_shell_exit_code(rc));
     }
 
     if (!e->fn) return ray_error("nyi", "command has no handler");
