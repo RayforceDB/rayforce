@@ -5092,6 +5092,12 @@ static bool expr_reads_list_col(ray_t* e, ray_t* tbl, int depth);
 static bool expr_reads_group_whole(ray_t* e, ray_t* tbl);
 static bool helper_reads_group_whole(ray_t* e, ray_t* tbl);
 
+/* Is `t`, the target of an `as`, the type LIST: 'LIST, or (quote LIST)? */
+static bool as_target_is_list(ray_t* t) {
+    int64_t sym = t && t->type == -RAY_SYM ? t->i64 : quote_call_sym(t);
+    return sym >= 0 && sym == ray_sym_intern("LIST", 4);
+}
+
 static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) < 2) return 0;
@@ -5148,7 +5154,12 @@ static int is_whole_column_projection(ray_t* expr, ray_t* tbl) {
         /* A cast of a LIST column casts the list as a whole, as eager as
          * does (#1400): a typed vector of its cells, not one cast per cell
          * (#1406).  It keeps the column's length. */
-        return expr_reads_list_col(((ray_t**)ray_data(expr))[2], tbl, 0);   /* not-a-table */
+        ray_t** ae = (ray_t**)ray_data(expr);
+        if (expr_reads_list_col(ae[2], tbl, 0)) return 1;   /* not-a-table */
+        /* A cast to LIST is a container cast: the column boxed as a LIST,
+         * as eager as, update and by: give, and the rows a where: keeps
+         * (#1582).  Per row it had nothing to box: (as 'LIST 1) is type. */
+        return as_target_is_list(ae[1]) && expr_refs_row_column(ae[2], tbl);
     }
     if (l == 6 && memcmp(p, "enlist", 6) == 0) {
         /* Only a single scalar value can stand for a broadcast column.
