@@ -132,7 +132,8 @@ make dist RAY_VERSION=2.1.3
 - **Branch protection / ruleset on `master`**: require a pull request before
   merging; require these two status checks to pass, and disallow direct pushes:
   - **`ci-success`** — a single aggregator job in `ci.yml` that goes green only
-    when every job of the release tier passed. Require this one instead of the
+    when every job of the release tier passed (on a release PR a macOS leg
+    that got no runner fails it too). Require this one instead of the
     job names so renaming a job can't silently drop the gate.
   - **`check-version`** — the Version Guard job that validates the release
     version in the PR title.

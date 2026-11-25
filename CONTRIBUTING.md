@@ -86,10 +86,21 @@ merge queue batches landings, so there are no roll-up pull requests.
    queue tier: the cheap tier plus macOS debug, `clang-current`, gcc 12,
    ThreadSanitizer, a short fuzz smoke and the advisory cppcheck.
    `rayforce-audit` reports success there without auditing again.
+   GitHub's hosted macOS runners are sometimes all busy: when it gives the
+   macOS debug leg no runner at all (it cancels the leg after about 15
+   minutes without running a step and annotates it "The job was not
+   acquired by Runner"), `ci-success` lets the pull request land without
+   it, and says so in its log. It checks every attempt of the run, so a
+   re-run does not forgive an earlier failure. A leg that ran and failed,
+   or one cancelled while waiting, still fails the queue. macOS debug also
+   runs on every push to `dev`, as its own check ("macOS on dev"), so such
+   a change gets its macOS test there; a run in progress finishes, and a
+   newer push replaces only a run still pending.
 6. On green it is squash-merged into `dev`. On a failure it is removed from
    the queue: fix it, push, and queue it again.
 
-A pull request into `master` (the release PR) runs the full release tier: the
+A pull request into `master` (the release PR) runs the full release tier, with
+no tolerance for a leg that did not run: the
 queue tier plus macOS release, the NDEBUG suite, the full-length fuzz smoke,
 and `make test-full` under ASan + UBSan.
 
