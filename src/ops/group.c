@@ -23236,7 +23236,11 @@ static bool pp_var_fold(ray_t* mt, uint32_t n_keys, uint32_t n_std, const uint8_
                 continue;
             }
             double vp = x[3] / x[0];
-            K[r] = x[1]; D[r] = x[2]; V[r] = vp < 0 ? 0 : vp;
+            K[r] = x[1]; D[r] = x[2];
+            /* an intermediate that overflowed is +inf here, a value the
+             * merge's FIRST keeps (a null would read as an absent one), and
+             * the final read makes it 0Nf, never a number (#1669) */
+            V[r] = !isfinite(vp) || !isfinite(x[2]) ? INFINITY : vp < 0 ? 0 : vp;
         }
     }
     scratch_free(st_hdr);

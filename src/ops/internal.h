@@ -2065,10 +2065,16 @@ static inline double ray_var_final(uint16_t op, int64_t n, double s1, double s2,
         double kd;
         if (k_is_f) memcpy(&kd, &k_bits, sizeof kd); else kd = (double)k_bits;
         if (op == OP_VAR_K) return kd;
-        return (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+        double dv = (k_is_f ? 0.0 : ray_var_k_rem(k_bits)) + s1 / dn;
+        *is_null = !isfinite(dv);
+        return dv;
     }
+    /* An intermediate that overflowed (#1669: the sums are doubles) makes
+     * the result null, never a number: only a finite rounding residue
+     * below 0 is taken as 0. */
     double mean = s1 / dn;
-    double vp = s2 / dn - mean * mean;
+    double vp = s2 / dn - mean * mean;   /* an overflowed mean^2 leaves -inf */
+    if (!isfinite(s1) || !isfinite(s2) || !isfinite(vp)) { *is_null = true; return 0.0; }
     if (vp < 0) vp = 0;
     if (op == OP_VAR_POP) return vp;
     if (op == OP_VAR) return vp * dn / (dn - 1);

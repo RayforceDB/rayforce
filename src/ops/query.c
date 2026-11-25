@@ -38927,6 +38927,8 @@ static void wj_scan_fn(void* ctx_, uint32_t worker_id, int64_t start, int64_t en
                         mean    = (double)A->sum_i / (double)A->cnt;
                         var_pop = (double)A->sum_sq_i / (double)A->cnt - mean * mean;
                     }
+                    /* an overflowed intermediate is null, never a number (#1669) */
+                    if (!isfinite(var_pop)) { null_out = true; break; }
                     if (var_pop < 0) var_pop = 0;
                     if      (c->agg_ops[a] == OP_VAR_POP)    out_f = var_pop;
                     else if (c->agg_ops[a] == OP_VAR)        out_f = var_pop * A->cnt / (A->cnt - 1);

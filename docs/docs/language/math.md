@@ -654,6 +654,23 @@ the raw squares, which was accurate for values near 0 and lost everything
 once their magnitude was large next to their spread (1e8 + [0 1 2 3] gave
 0). A variance of values that are all equal is exactly 0.
 
+Overflow. The sums are doubles; Rayfall has no infinity, and an
+overflowing float is `0Nf`, as in `(* 1e300 1e300)`. When an intermediate
+of the variance (a difference, the sum of differences or its square, the
+sum of squares) overflows, every member of the family returns `0Nf`,
+standard deviations included, never a wrong number. Only a tiny negative
+residue from rounding is taken as 0. The sum of differences is the one to
+watch: it is about n·|x − first value|, and its square overflows once that
+passes roughly 1e154. For example, a million values alternating 0 and 1e149
+sum to about 5e154: a grouped `(var_pop v)` over them gives `0Nf`, while
+the eager builtin (two passes, the second about the mean) and, here, the
+keyless routes (whose partial sums per chunk stay smaller) give the
+variance 2.5e297. Squares that overflow outright overflow on
+every route: `(stddev [1e300 -1e300 1e300])` is `0Nf`. Routes may differ
+in whether they overflow, since each takes its sums about a different value
+(the first of the group, of a worker's part or of a partition). Ordinary
+data is far from these magnitudes and is unaffected.
+
 ### `(pearson_corr x y)` — aggregate
 
 Pearson correlation over paired non-null numeric inputs.
