@@ -1,0 +1,47 @@
+;; @requires: posix  (fixtures/checks run through a POSIX shell via .sys.exec)
+;; (.ipc.handles) lists the process's open IPC connections, one row per
+;; connection, in handle order, with the keys of (.ipc.handle h) as columns
+;; and `opened`, when the connection was accepted or opened (#1158).  It
+;; only reads state, so a client of a -U server may call it.
+;;
+;; The server runs under -U on a port of its own (test/serve.sh, stopped by
+;; its pid, #1140).  This process opens two connections to it: the server
+;; lists both as inbound, and this process lists both as outbound.
+
+;; no connection: an empty table with the columns
+(count (.ipc.handles)) -- 0
+(key (.ipc.handles)) -- [handle inbound transport limit_bytes limit_frames queued_bytes queued_frames hwm_bytes opened]
+(type (at (.ipc.handles) 'opened)) -- 'TIMESTAMP
+(.ipc.handles 1) !- rank
+
+(.sys.exec "rm -rf /tmp/rftest_ipc_handles; mkdir -p /tmp/rftest_ipc_handles; true") -- 0
+(.sys.exec "test/serve.sh --listen /tmp/rftest_ipc_handles -U secret") -- 0
+(set addr (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_ipc_handles/port")) ":mon:secret")))
+(set t0 (timestamp 'global))
+(set h1 (.ipc.open addr 3000))
+(set h2 (.ipc.open addr 3000))
+
+;; the server, restricted, lists both connections, the asking one among them
+(.ipc.send h1 "(set zz 1)") !- access
+(set S (.ipc.send h1 "(.ipc.handles)"))
+(count S) -- 2
+(at S 'inbound) -- [true true]
+(all (in (at S 'transport) ['tcp 'shm 'rdma])) -- true
+(in (.ipc.send h1 "(.ipc.handle)") (at S 'handle)) -- true
+(asc (at S 'handle)) -- (at S 'handle)
+(all (>= (at S 'opened) t0)) -- true
+(all (== (at S 'queued_bytes) 0)) -- true
+;; each row is the connection's (.ipc.handle h) view
+(.ipc.send h1 "(== (first (at (.ipc.handles) 'limit_bytes)) (at (.ipc.handle (first (at (.ipc.handles) 'handle))) 'limit_bytes))") -- true
+
+;; this process lists its two outbound connections
+(set C (.ipc.handles))
+(at C 'handle) -- (asc (enlist h1 h2))
+(at C 'inbound) -- [false false]
+(all (>= (at C 'opened) t0)) -- true
+
+(.ipc.close h1)
+(.ipc.close h2)
+(count (.ipc.handles)) -- 0
+(.sys.exec "test/serve.sh --stop /tmp/rftest_ipc_handles") -- 0
+(.sys.exec "rm -rf /tmp/rftest_ipc_handles; true") -- 0

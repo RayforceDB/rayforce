@@ -324,12 +324,16 @@ typedef struct {
     int64_t hwm_bytes;      /* largest backlog ever queued here */
     bool    inbound;        /* accepted by a listener here (true) or opened by .ipc.open (false) */
     uint8_t transport;      /* RAY_XPORT_TCP / RAY_XPORT_SHM / RAY_XPORT_RDMA: where its bytes go */
+    int64_t opened_ns;      /* when it was accepted or opened (RAY_TIMESTAMP units) */
 } ray_ipc_tx_info_t;
 
 void      ray_ipc_tx_limit_get(int64_t* bytes, int64_t* frames);
 ray_err_t ray_ipc_tx_limit_set(int64_t bytes, int64_t frames);       /* process default */
 ray_err_t ray_ipc_tx_limit_set_handle(int64_t handle, int64_t bytes, int64_t frames);
 ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out);   /* RAY_ERR_IO: not a live connection */
+/* One past the largest handle that may be live in the active poll: every
+ * connection's handle is below it (ray_ipc_tx_info answers which are). */
+int64_t ray_ipc_handle_bound(void);
 int64_t   ray_ipc_tx_hwm_bytes(ray_poll_t* poll);
 
 /* Remote-REPL helper: send a SYNC message with RAY_IPC_FLAG_VERBOSE

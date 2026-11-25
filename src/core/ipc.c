@@ -1091,6 +1091,9 @@ typedef struct {
      * and the request number it carries.  At most one is outstanding. */
     bool             cancel_unconfirmed;
     uint8_t          cancel_tag;
+    /* When the connection was accepted or opened (RAY_TIMESTAMP units), for
+     * (.ipc.handles). */
+    int64_t          opened_ns;
 } ray_ipc_conn_data_t;
 
 #ifdef RAY_IPC_XPORT
@@ -1364,6 +1367,7 @@ static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
     memset(cd, 0, sizeof(*cd));
     cd->phase = RAY_IPC_PHASE_HANDSHAKE;
     cd->listener_id = sel->id;
+    cd->opened_ns = ray_timestamp_now_ns();
     cd->auth_required = (poll->auth_secret[0] != '\0');
     cd->restricted    = poll->restricted;
     cd->compress_threshold = ray_ipc_link_threshold(new_fd);
@@ -2866,6 +2870,7 @@ int64_t ray_ipc_connect_with(const char* host, uint16_t port,
     memset(cd, 0, sizeof(*cd));
     cd->phase       = RAY_IPC_PHASE_HEADER;
     cd->listener_id = -1;               /* outbound: on.open never fires, on.close does */
+    cd->opened_ns   = ray_timestamp_now_ns();
     cd->restricted  = poll->restricted; /* -U narrows pushed evals too */
     cd->compress_threshold = (compress_threshold == RAY_IPC_COMPRESS_AUTO)
                            ? ray_ipc_link_threshold(fd)
@@ -3377,7 +3382,14 @@ ray_err_t ray_ipc_tx_info(int64_t handle, ray_ipc_tx_info_t* out)
     out->inbound      = sel->data &&
                         ((ray_ipc_conn_data_t*)sel->data)->listener_id >= 0;
     out->transport    = sel->xport ? sel->xport->kind : RAY_XPORT_TCP;
+    out->opened_ns    = ((ray_ipc_conn_data_t*)sel->data)->opened_ns;
     return RAY_OK;
+}
+
+int64_t ray_ipc_handle_bound(void)
+{
+    ray_poll_t* poll = ray_ipc_active_poll();
+    return poll ? (int64_t)poll->n_sels : 0;
 }
 
 int64_t ray_ipc_tx_hwm_bytes(ray_poll_t* poll)

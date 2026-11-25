@@ -6839,6 +6839,8 @@ static void ray_register_builtins(void) {
     /* Current connection handle inside any `.ipc.on.*` hook, -1 otherwise.
      * Variadic for the `(.ipc.handle)` / `(.ipc.handle 0)` convention. */
     register_vary(  ".ipc.handle", RAY_FN_NONE,       ray_ipc_handle_fn);
+    /* Every open connection as a table: read-only, so allowed under -U. */
+    register_vary(  ".ipc.handles", RAY_FN_NONE,      ray_ipc_handles_fn);
     /* True while evaluating inside an auto-journaled IPC request, where
      * the request itself is the journal entry and `.log.write` refuses. */
     register_vary(  ".ipc.auto_journal_eval", RAY_FN_NONE, ray_ipc_auto_journal_eval_fn);
