@@ -746,7 +746,11 @@ group whose cells are all `""` gives `""`. To get the positional answer in
 a `by:` select, index the group instead: `(at s (- (count s) 1))` gives
 `["" ""]` above.
 
-The skip applies wherever `first` or `last` aggregates a group's rows.
+The skip applies wherever `first` or `last` aggregates a group's rows,
+including inside the body of a helper called from a query, for a value of
+the query's rows: `(fn [x] (let q 1) (first x))` applied to a column gives
+the first non-null cell, as `(first h)` does
+([#1673](https://github.com/RayforceDB/rayforce/issues/1673)).
 Which arguments a query reads as rows is set out in
 [Aggregate sources](../queries/select.md#aggregate-sources).
 

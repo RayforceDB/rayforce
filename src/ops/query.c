@@ -5306,7 +5306,15 @@ static bool wv_name_set(wv_scope_t* sc, int64_t sym, bool d) {
  * does not derive from the arguments.  Not inside a lambda literal or a
  * quote, which keep their own; `skip_top`: `e` is a `let` statement whose own
  * name the caller tracks.  False when there are too many names to track. */
+static bool wv_drop_nested_as(ray_t* e, wv_scope_t* sc, bool skip_top, int depth, bool as);
 static bool wv_drop_nested(ray_t* e, wv_scope_t* sc, bool skip_top, int depth) {
+    return wv_drop_nested_as(e, sc, skip_top, depth, false);
+}
+/* wv_drop_nested for helper_result_one_value: such a name is rows */
+static bool wv_drop_nested_rows(ray_t* e, wv_scope_t* sc, bool skip_top, int depth) {
+    return wv_drop_nested_as(e, sc, skip_top, depth, true);
+}
+static bool wv_drop_nested_as(ray_t* e, wv_scope_t* sc, bool skip_top, int depth, bool as) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 1 || depth > 64) return true;
     ray_t** es = (ray_t**)ray_data(e);
     ray_t* h = es[0];
@@ -5314,11 +5322,11 @@ static bool wv_drop_nested(ray_t* e, wv_scope_t* sc, bool skip_top, int depth) {
         if (h->i64 == ray_sym_intern("fn", 2) || h->i64 == ray_sym_intern("quote", 5)) return true;
         if ((h->i64 == ray_sym_intern("let", 3) || h->i64 == ray_sym_intern("set", 3)) &&
             e->len == 3 && es[1]->type == -RAY_SYM && !skip_top &&
-            !wv_name_set(sc, es[1]->i64, false))
+            !wv_name_set(sc, es[1]->i64, as))
             return false;
     }
     for (int64_t i = 1; i < e->len; i++)
-        if (!wv_drop_nested(es[i], sc, false, depth + 1)) return false;
+        if (!wv_drop_nested_as(es[i], sc, false, depth + 1, as)) return false;
     return true;
 }
 
@@ -5365,7 +5373,24 @@ static bool wv_lambda_head(ray_t* h, ray_t* tbl, bool in_body, ray_t** params,
  * when its operand derives from them); NULL in the query's own expression,
  * where a caller's local shadows instead.  A helper's free names are
  * globals. */
-static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_scope_t* sc) {
+static uint16_t resolve_agg_call_opcode(int64_t sym_id, int64_t nargs);
+/* Is the call `e`'s head, bound to `fn`, that aggregate builtin itself: by
+ * the name the function object carries, which a program rebinding the name
+ * to another function does not change? */
+static bool wv_head_is_own_agg(ray_t* e, ray_t* fn) {
+    ray_t* h = ((ray_t**)ray_data(e))[0];
+    if (!resolve_agg_call_opcode(h->i64, e->len - 1)) return false;
+    ray_t* hn = ray_sym_str(h->i64);
+    const char* own = ray_fn_name(fn);
+    size_t hl = hn ? ray_str_len(hn) : 0, ol = 0;
+    while (ol < 14 && own[ol]) ol++;
+    return hn && ol == hl && memcmp(own, ray_str_ptr(hn), hl) == 0;
+}
+
+/* `agg`: find, instead of a whole-column verb, an aggregate applied in a
+ * helper's body to its argument (#1673); the query's own aggregates do not
+ * count, they are classified as written. */
+static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_scope_t* sc, bool agg) {
     if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len < 2 || depth > 64) return false;
     ray_t** es = (ray_t**)ray_data(e);
     ray_t* h = es[0];
@@ -5380,7 +5405,14 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
          * Inside a body, only through an argument derived from the caller's
          * own; a closure reads captures this walk cannot see: per row. */
         bool passed = !sc;
-        for (int64_t i = 1; i < e->len && !passed; i++) passed = wv_derives(es[i], sc, 0);
+        /* an aggregate's: only over an argument that reads the query's
+         * rows, as an inline aggregate of a column (#1673); a quoted
+         * symbol or a constant is no column */
+        if (agg && !sc) {
+            passed = false;
+            for (int64_t i = 1; i < e->len && !passed; i++) passed = expr_refs_row_column(es[i], tbl);
+        }
+        for (int64_t i = 1; i < e->len && !passed; i++) passed = sc && wv_derives(es[i], sc, 0);
         if (passed) {
             wv_scope_t inner = { .params = lparams, .n = 0 };
             for (int64_t b = 0; b < nlbody; b++) {
@@ -5391,7 +5423,7 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
                 /* a name rebound inside the statement is not followed:
                  * not derived from here on, before the statement is read */
                 if (!wv_drop_nested(st, &inner, top_let, 0)) break;
-                if (expr_nests_whole_verb_in(st, tbl, depth + 1, &inner)) return true;
+                if (expr_nests_whole_verb_in(st, tbl, depth + 1, &inner, agg)) return true;
                 /* a `let` statement rebinds its name for the statements
                  * after it: derived from the arguments when its value is */
                 if (st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3) {
@@ -5405,7 +5437,7 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
             }
         }
         for (int64_t i = 1; i < e->len; i++)
-            if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc)) return true;
+            if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc, agg)) return true;
         return false;
     }
     if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED)) return false;
@@ -5416,13 +5448,18 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
     if (fn->attrs & RAY_FN_SPECIAL_FORM) {
         /* a `let`'s value is evaluated wherever the `let` is */
         if (h->i64 == ray_sym_intern("let", 3))
-            return e->len == 3 && expr_nests_whole_verb_in(es[2], tbl, depth + 1, sc);
+            return e->len == 3 && expr_nests_whole_verb_in(es[2], tbl, depth + 1, sc, agg);
         if (h->i64 != ray_sym_intern("do", 2)) return false;
         ray_t* last = es[e->len - 1];
-        return (!sc && is_whole_column_projection(last, tbl)) ||
-               expr_nests_whole_verb_in(last, tbl, depth + 1, sc);
+        return (!sc && !agg && is_whole_column_projection(last, tbl)) ||
+               expr_nests_whole_verb_in(last, tbl, depth + 1, sc, agg);
     }
-    if (depth > 0) {
+    if (agg) {
+        /* in a helper's body, an aggregate over its argument */
+        if (sc && wv_head_is_own_agg(e, fn))
+            for (int64_t i = 1; i < e->len; i++)
+                if (wv_derives(es[i], sc, 0)) return true;
+    } else if (depth > 0) {
         static const char* const verbs[] = { "distinct", "where", "reverse", "asc", "desc", "iasc", "idesc", "rank" };
         ray_t* nm = ray_sym_str(h->i64);
         if (nm) {
@@ -5439,12 +5476,102 @@ static bool expr_nests_whole_verb_in(ray_t* e, ray_t* tbl, int depth, const wv_s
         }
     }
     for (int64_t i = 1; i < e->len; i++)
-        if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc)) return true;
+        if (expr_nests_whole_verb_in(es[i], tbl, depth + 1, sc, agg)) return true;
     return false;
 }
 
 static bool expr_nests_whole_verb(ray_t* e, ray_t* tbl, int depth) {
-    return expr_nests_whole_verb_in(e, tbl, depth, NULL);
+    return expr_nests_whole_verb_in(e, tbl, depth, NULL, false);
+}
+
+/* Does `e` call a helper the planner does not inline whose body reaches an
+ * aggregate applied to its argument, on the paths the body always
+ * evaluates (#1673)?  Such a call means what its body written inline
+ * means: over the whole (kept) column, not once per row. */
+static bool expr_nests_helper_agg(ray_t* e, ray_t* tbl) {
+    return expr_nests_whole_verb_in(e, tbl, 0, NULL, true);
+}
+
+static int is_agg_expr(ray_t* expr);
+/* Is `e` one value of the rows, as written inline it would be: a constant,
+ * an aggregate, an atomic builtin over such values, a `let`'s value or a
+ * `do`'s last form, or a helper (expr_nests_helper_agg's kind) whose last
+ * statement is one value, its parameters given values of the rows when
+ * their arguments are.  `sc` names what is rows inside a helper's body
+ * (wv_scope_t's `derived`), NULL in the query's own expression.  Anything
+ * else, an `if` included, is taken to be rows: then the call is evaluated
+ * over the whole column and its value is a column (#1673). */
+static bool helper_result_one_value(ray_t* e, ray_t* tbl, const wv_scope_t* sc, int depth) {
+    if (!e || depth > 32) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;
+        if (sc) {
+            for (int k = sc->n - 1; k >= 0; k--) if (sc->names[k] == e->i64) return !sc->derived[k];
+            /* a free name in a body: a source column is rows, a global
+             * holding an atom one value */
+            if (tbl_has_col(tbl, e->i64)) return false;
+            ray_t* g = ray_env_get_global(e->i64);
+            return g && ray_is_atom(g);
+        }
+        if (ray_env_has_lexical_local(e->i64) || tbl_has_col(tbl, e->i64)) return false;
+        ray_t* v = ray_env_get(e->i64);
+        return v && ray_is_atom(v);
+    }
+    if (e->type < 0) return true;
+    if (e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || e->len == 0) return false;
+    ray_t** es = (ray_t**)ray_data(e);
+    ray_t* h = es[0];
+    ray_t* lparams = NULL;
+    ray_t* const* lbody = NULL;
+    int64_t nlbody = 0;
+    if (!(sc && h && h->type == -RAY_SYM && wv_name_derived(sc, h->i64)) &&
+        wv_lambda_head(h, tbl, sc != NULL, &lparams, &lbody, &nlbody)) {
+        if (nlbody < 1) return false;
+        int64_t np = lparams && (lparams->type == RAY_SYM || lparams->type == RAY_LIST) ? lparams->len : 0;
+        if (np != e->len - 1 || np > WV_MAX_NAMES) return false;
+        wv_scope_t inner = { .params = NULL, .n = 0 };
+        for (int64_t j = 0; j < np; j++) {
+            int64_t ps = lparams->type == RAY_SYM
+                ? ray_read_sym(ray_data(lparams), j, lparams->type, lparams->attrs)
+                : (((ray_t**)ray_data(lparams))[j] && ((ray_t**)ray_data(lparams))[j]->type == -RAY_SYM
+                   ? ((ray_t**)ray_data(lparams))[j]->i64 : -1);
+            if (ps < 0 || !wv_name_set(&inner, ps, !helper_result_one_value(es[j + 1], tbl, sc, depth + 1)))
+                return false;
+        }
+        for (int64_t b = 0; b + 1 < nlbody; b++) {
+            ray_t* st = lbody[b];
+            bool top_let = st && st->type == RAY_LIST && !(st->attrs & ATTR_QUOTED) && st->len == 3 &&
+                           ((ray_t**)ray_data(st))[0]->type == -RAY_SYM &&
+                           ((ray_t**)ray_data(st))[0]->i64 == ray_sym_intern("let", 3);
+            /* a name rebound where this walk cannot follow it: rows */
+            if (!wv_drop_nested_rows(st, &inner, top_let, 0)) return false;
+            if (top_let) {
+                ray_t** ss = (ray_t**)ray_data(st);
+                if (ss[1]->type != -RAY_SYM ||
+                    !wv_name_set(&inner, ss[1]->i64, !helper_result_one_value(ss[2], tbl, &inner, depth + 1)))
+                    return false;
+            }
+        }
+        ray_t* last = lbody[nlbody - 1];
+        if (!wv_drop_nested_rows(last, &inner, false, 0)) return false;
+        return helper_result_one_value(last, tbl, &inner, depth + 1);
+    }
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) || tbl_has_col(tbl, h->i64)) return false;
+    if (sc ? wv_name_derived(sc, h->i64) : ray_env_has_lexical_local(h->i64)) return false;
+    ray_t* fn = sc ? ray_env_get_global(h->i64) : ray_env_get(h->i64);
+    if (!fn || fn->type < RAY_UNARY || fn->type > RAY_VARY) return false;
+    if (fn->attrs & RAY_FN_SPECIAL_FORM) {
+        if (h->i64 == ray_sym_intern("let", 3))
+            return e->len == 3 && helper_result_one_value(es[2], tbl, sc, depth + 1);
+        if (h->i64 == ray_sym_intern("do", 2))
+            return helper_result_one_value(es[e->len - 1], tbl, sc, depth + 1);
+        return false;
+    }
+    if (wv_head_is_own_agg(e, fn) && is_agg_expr(e)) return true;
+    if (!(fn->attrs & RAY_FN_ATOMIC)) return false;
+    for (int64_t i = 1; i < e->len; i++)
+        if (!helper_result_one_value(es[i], tbl, sc, depth + 1)) return false;
+    return true;
 }
 
 static int collect_col_refs_walk(ray_t* expr, ray_t* tbl, int64_t* out_syms,
@@ -16663,6 +16790,14 @@ static ray_t* scalar_edge_skip_nulls(ray_t* v, bool last) {
     ray_t* x = collection_elem(v, r, &alloc);
     if (x && !RAY_IS_ERR(x) && !alloc) ray_retain(x);
     return x ? x : ray_error("oom", NULL);
+}
+
+ray_t* ray_query_edge_value(void* fnp, ray_t* arg, uint8_t rows) {
+    if (rows != 1 || !arg || RAY_IS_ERR(arg)) return NULL;
+    bool last = fnp == (void*)ray_last_fn;
+    if (!last && fnp != (void*)ray_first_fn) return NULL;
+    if (!ray_active_query_table() || ray_query_row_active()) return NULL;
+    return scalar_edge_skip_nulls(arg, last);
 }
 
 /* A data argument of a two-argument aggregate over `nrows` rows, read as
@@ -30938,13 +31073,17 @@ by_dict_done:
                     /* fold over a column, at of one at a one-value index:
                      * one value of the (kept) column, as an aggregate is
                      * (#1429) */
-                    bool group_scalar = ray_table_nrows(tbl) > 0 &&
+                    bool group_scalar = (ray_table_nrows(tbl) > 0 &&
                         (expr_reads_group_whole(e, tbl) || helper_reads_group_whole(e, tbl) ||
                          /* at a one-value index of a whole-column verb's
                           * value, `(at (reverse c) 0)`: one value too (#1654) */
                          (!has_agg && !is_whole_column_projection(e, tbl) &&
                           expr_nests_whole_verb(e, tbl, 0))) &&
-                        expr_one_value(e, tbl, 0);
+                        expr_one_value(e, tbl, 0)) ||
+                        /* a helper whose body aggregates its argument and
+                         * ends in one value: an aggregate, as written
+                         * inline (#1673) */
+                        (expr_nests_helper_agg(e, tbl) && helper_result_one_value(e, tbl, NULL, 0));
                     any_agg |= has_agg || group_scalar;
                     any_row_proj = group_scalar ? 0
                                  : has_agg ? expr_refs_row_column(e, tbl)
@@ -30979,7 +31118,11 @@ by_dict_done:
                     int nested_whole = !select_fallback_has_agg(expr) &&
                                        !is_whole_column_projection(expr, tbl) &&
                                        expr_nests_whole_verb(expr, tbl, 0);
-                    int whole_verb = select_fallback_bulk_minmax(expr, tbl, nrows) ||
+                    /* a helper whose body aggregates its argument: over the
+                     * whole (kept) column, once, as its body written inline
+                     * reads it; one value or a column, as that gives (#1673) */
+                    bool helper_agg = expr_nests_helper_agg(expr, tbl);
+                    int whole_verb = helper_agg || select_fallback_bulk_minmax(expr, tbl, nrows) ||
                                      (!(nrows == 0 && (expr_reads_group_whole(expr, tbl) ||
                                                        helper_reads_group_whole(expr, tbl))) &&
                                       (is_whole_column_projection(expr, tbl) || nested_whole));
@@ -31043,8 +31186,8 @@ by_dict_done:
                                               !ray_is_atom(expr) &&
                                               !select_fallback_has_agg(expr);
                                 col = at_row0 ? eval_expr_per_row_impl(expr, eval_tbl, 1)
-                                    : one_value && !whole_verb && select_fallback_has_agg(expr)
-                                    ? eval_whole_edge_skip(expr, eval_tbl)   /* #1674 */
+                                    : (one_value && !whole_verb && select_fallback_has_agg(expr)) || helper_agg
+                                    ? eval_whole_edge_skip(expr, eval_tbl)   /* #1674, #1673 */
                                     : (whole_verb || one_value)
                                     ? eval_expr_whole_column_impl(expr, eval_tbl)
                                     : nrows == 0 ? select_fallback_empty_col(expr, eval_tbl)
@@ -31069,7 +31212,7 @@ by_dict_done:
                                 bool whole_atom = whole_verb && col && !RAY_IS_ERR(col) &&
                                     ((gwhole && (ray_is_atom(col) || (col->type == RAY_LIST && col->len == 1 &&
                                                                       expr_one_value(expr, eval_tbl, 0)))) ||
-                                     (nested_whole && ray_is_atom(col)));
+                                     ((nested_whole || helper_agg) && ray_is_atom(col)));
                                 if (whole_atom) one_value = 1;
                                 /* an aggregate whose one value is a collection
                                  * (top, bot): one cell, as the planned route

@@ -1106,6 +1106,13 @@ ray_t* ray_active_query_table(void);
 /* Is a per-row evaluation of the active query in progress: its columns
  * bound to one row's cells? */
 bool ray_query_row_active(void);
+/* `(first v)` / `(last v)` evaluated by the interpreter inside a query, `v`
+ * a value of the query's rows (`rows` 1, the VM's provenance flag): its
+ * first (last) non-null cell, as the query's first and last give (#1673).
+ * NULL when that does not apply and the builtin answers as it is: another
+ * function, a value not of the rows, no query, a per-row evaluation in
+ * progress, no null to skip. */
+ray_t* ray_query_edge_value(void* fnp, ray_t* arg, uint8_t rows);
 /* The table a helper called from a query may read columns from: the
  * source schema while a projection binds aliases, else the active table. */
 ray_t* ray_query_helper_table(void);

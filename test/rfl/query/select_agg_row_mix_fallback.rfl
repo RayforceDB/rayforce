@@ -53,11 +53,14 @@
 (at (select {d: (* i 2) m: (+ i (max d)) x: (- ts ts) from: T}) 'm) -- [9 10 11 12]
 (at (select {d: (* i 2) m: (+ i (max d)) y: (- m 1) x: (- ts ts) from: T}) 'y) -- [8 9 10 11]
 
-;; ── a lambda call's argument is reduced; a lambda body is left alone ─────────
-;; (a lambda call is a per-row projection on the fallback, #690: its body
-;;  folds the formal it was given, one cell, so (max a) there is a itself)
+;; ── a lambda call's argument is reduced; a lambda body aggregating its
+;; argument means what it means written inline (#1673) ─────────────────────────
+;; (a lambda call was a per-row projection on the fallback, #690, its body
+;;  folding one cell, so (max a) there was a itself; it is now evaluated over
+;;  the whole column, as (- i (max i)) is)
 (at (select {m: (+ i ((fn [a] (* a 2)) (max i))) x: (- ts ts) from: T}) 'm) -- [9 10 11 12]
-(at (select {m: ((fn [a] (- a (max a))) i) x: (- ts ts) from: T}) 'm) -- [0 0 0 0]
+(at (select {m: ((fn [a] (- a (max a))) i) x: (- ts ts) from: T}) 'm) -- (at (select {m: (- i (max i)) x: (- ts ts) from: T}) 'm)
+(at (select {m: ((fn [a] (- a (max a))) i) x: (- ts ts) from: T}) 'm) -- [-3 -2 -1 0]
 (at (select {k: ((fn [a] (if (> a 2) 1 0)) i) x: (- ts ts) from: T}) 'k) -- [0 0 1 1]
 
 ;; ── what already held: an aggregate alone broadcasts, all-aggregate is one row ─
