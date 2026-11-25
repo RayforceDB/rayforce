@@ -35,7 +35,8 @@ the work internally. Keep the PR in draft while the agreed scope is incomplete,
 and address review feedback in the same PR. When consolidating existing PRs,
 link them and account for their changes and unresolved reviews before closing
 the superseded ones. Leave already-merged work alone, and do not bundle unrelated
-changes merely to reduce the PR count.
+changes merely to reduce the PR count. Each fix is its own pull request: the
+merge queue batches landings, so there are no roll-up pull requests.
 
 ## Opening a pull request
 
@@ -61,8 +62,36 @@ changes merely to reduce the PR count.
    ./rayforce.test.fast --replay /tmp/rayforce_replay.<pid>.<n>
    ```
 
-4. Open the PR against **`dev`**. CI runs on every pull request (there are no
-   push-triggered runs — the PR run tests the exact merge result).
+4. Open the PR against **`dev`**. It lands through the merge queue; see
+   [How a pull request lands on dev](#how-a-pull-request-lands-on-dev).
+
+## How a pull request lands on dev
+
+`dev` is protected by a merge queue. The required checks are
+**`rayforce-audit`** and **`ci-success`**.
+
+1. **On the pull request**, CI runs the cheap tier: the Linux gcc debug build
+   with `make test`, the Linux gcc release build with the static and shared
+   libraries, and the docs (`mkdocs build --strict`, `make docs-check`). The
+   `rayforce-audit` check reviews the diff. Each push re-runs both.
+2. The branch does **not** need to be up to date with `dev`: do not merge
+   `dev` into it or rebase it only to catch up. The queue tests it against the
+   `dev` it will land on.
+3. **Before queueing**, make the pull request's title and description final:
+   the queue squash-merges with them, so the title must be a conventional
+   commit (`fix(scope): ...`) and the description the commit body.
+4. **Queue it** once `rayforce-audit` and `ci-success` are green:
+   `gh pr merge <n> --squash`, or the **Merge when ready** button.
+5. The queue builds it on top of the pull requests ahead of it and runs the
+   queue tier: the cheap tier plus macOS debug, `clang-current`, gcc 12,
+   ThreadSanitizer, a short fuzz smoke and the advisory cppcheck.
+   `rayforce-audit` reports success there without auditing again.
+6. On green it is squash-merged into `dev`. On a failure it is removed from
+   the queue: fix it, push, and queue it again.
+
+A pull request into `master` (the release PR) runs the full release tier: the
+queue tier plus macOS release, the NDEBUG suite, the full-length fuzz smoke,
+and `make test-full` under ASan + UBSan.
 
 ## Documentation
 
@@ -159,18 +188,19 @@ The debug binaries load the ASan runtime DLL from `clang64\bin`, so keep it on
 ## Stability tooling
 
 Beyond the ASan/UBSan test run, the repo carries a stability toolset. These
-gate CI (fuzz smoke + TSan on every PR) and run deeper overnight.
+gate the merge queue (fuzz smoke + TSan on every merge group) and run deeper
+overnight.
 
-Each PR is built with these compilers (`.github/workflows/ci.yml`): gcc for
-the Ubuntu debug and release legs, clang for the macOS debug and release
-legs, upstream Clang 23 from apt.llvm.org for the Ubuntu `clang-current` test
-leg, and the Ubuntu runner's `clang` for the NDEBUG, fuzz-smoke and TSan
-legs.
+The compilers (`.github/workflows/ci.yml`): gcc for the Ubuntu debug and
+release legs, gcc 12 for a release and shared build, clang for the macOS
+legs, the current upstream Clang for the Ubuntu `clang-current` test leg, and
+the Ubuntu runner's `clang` for the NDEBUG, fuzz-smoke and TSan legs.
 
 - **Fuzzing** (Linux + clang): coverage-guided targets under `fuzz/` cover the
   parser, numeric scanners, the binary wire/journal decoder, and the sandboxed
-  evaluator, CSV, and journal-replay paths. `make fuzz-smoke` is the PR gate;
-  `make fuzz-<target> FUZZ_RUNTIME=<secs>` runs one locally. See
+  evaluator, CSV, and journal-replay paths. `make fuzz-smoke` runs the smoke targets locally;
+  `make fuzz-<target> FUZZ_RUNTIME=<secs>` runs one locally; the merge queue
+  fuzzes each target for 20 s, a release PR for 60 s. See
   [`fuzz/README.md`](fuzz/README.md), including the crash-triage workflow.
 - **ThreadSanitizer**: `make tsan-test TSAN_FILTER=<pool|heap|parallel|stress>`
   runs the concurrency suites under TSan at 4 cores. Every entry in
