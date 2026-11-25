@@ -369,15 +369,23 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     ray_t* col = ray_table_col(src, col_sym);
     if (col && RAY_IS_ERR(col)) return col;
     if (!col) return ray_error("name", NULL);
-    if (col->type != RAY_LIST) return ray_error("type", "knn rerank: vector column must be a list of vectors, got %s", ray_type_name(col->type));
+    /* a list of vectors, or the same in every partition of a parted table */
+    const bool parted = RAY_IS_PARTED(col->type) && RAY_PARTED_BASETYPE(col->type) == RAY_LIST;
+    if (col->type != RAY_LIST && !parted)
+        return ray_error("type", "knn rerank: vector column must be a list of vectors, got %s", ray_type_name(col->type));
 
-    int64_t nrows = col->len;
+    int64_t nrows = parted ? src_rows : col->len;
 
     int64_t  accepted_count = 0;
     int64_t* accepted = accepted_rowids(g, nrows, &accepted_count);
     if (accepted_count < 0) return ray_error("oom", NULL);
     if (accepted_count == 0) {
-        ray_t* r = empty_result_with_dist(src);
+        /* an answer of no rows, in the columns a flat table would give */
+        int64_t none = 0;
+        ray_t* flat = parted ? ray_table_gather_rows(src, &none, 0) : NULL;
+        if (parted && (!flat || RAY_IS_ERR(flat))) return flat ? flat : ray_error("oom", NULL);
+        ray_t* r = empty_result_with_dist(parted ? flat : src);
+        if (flat) ray_release(flat);
         return r ? r : ray_error("oom", NULL);
     }
 
@@ -401,7 +409,9 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
     if (heap_size < 0) {
         ray_free_raw(out_ids); ray_free_raw(out_ds);
         if (heap_size == RAY_EMB_KNN_BAD_ROW) {
-            ray_t*  row = bad_row >= 0 && bad_row < nrows ? ray_list_get(col, bad_row) : NULL;
+            ray_t*  row = !parted && bad_row >= 0 && bad_row < nrows ? ray_list_get(col, bad_row) : NULL;
+            if (parted)
+                return ray_error("type", "knn rerank: row %lld is not a numeric vector of length %lld", (long long)bad_row, (long long)dim);
             int8_t  rt = row ? row->type : RAY_NULL;
             int64_t rl = (row && rr_is_numeric(row)) ? row->len : -1;
             if (rl >= 0)
@@ -411,7 +421,33 @@ ray_t* exec_knn_rerank(ray_graph_t* g, ray_op_t* op, ray_t* src) {
         return heap_size == RAY_EMB_KNN_CANCELLED ? ray_error("cancel", "interrupted") : ray_error("oom", NULL);
     }
 
-    ray_t* result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
+    ray_t* result = NULL;
+    if (parted && heap_size > 0) {
+        /* The rows are gathered in the order they lie (the gather of a parted
+         * table's rows wants them so), then laid out nearest first. */
+        int64_t* asc = (int64_t*)ray_alloc_raw((size_t)heap_size * 3 * sizeof(int64_t));
+        if (asc) {
+            int64_t* ord = asc + heap_size;        /* ord[j]: which found row is j-th by row number */
+            int64_t* at = ord + heap_size;         /* at[i]: where found row i lies among the gathered */
+            for (int64_t i = 0; i < heap_size; i++) ord[i] = i;
+            for (int64_t i = 1; i < heap_size; i++) {            /* k is small: insertion by row number */
+                int64_t x = ord[i], j = i - 1;
+                while (j >= 0 && out_ids[ord[j]] > out_ids[x]) { ord[j + 1] = ord[j]; j--; }
+                ord[j + 1] = x;
+            }
+            for (int64_t j = 0; j < heap_size; j++) { asc[j] = out_ids[ord[j]]; at[ord[j]] = j; }
+            ray_t* flat = ray_table_gather_rows(src, asc, heap_size);
+            if (flat && !RAY_IS_ERR(flat)) {
+                result = gather_rows_with_dist(flat, at, out_ds, heap_size);
+                ray_release(flat);
+            } else {
+                result = flat;
+            }
+            ray_free_raw(asc);
+        }
+    } else {
+        result = gather_rows_with_dist(src, out_ids, out_ds, heap_size);
+    }
     if (out_ids) ray_free_raw(out_ids);
     if (out_ds)  ray_free_raw(out_ds);
     if (!result) return ray_error("oom", NULL);

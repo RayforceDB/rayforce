@@ -108,6 +108,16 @@ Brute-force variant on a column reference (no pre-built index needed):
          take: 3})
 ```
 
+The source may be a partitioned table (`.db.parted.get`): a column that is a list of vectors in every partition is searched as one column, on disk and in a day inserted in memory alike, and a `where:` on the partition key or on any other column narrows the rows first. The answer is a flat table, the partition key among its columns.
+
+```lisp
+(set docs (.db.parted.get "/data/memory/" 'vectors))
+(select {from: docs
+         where: (== kind 'memory)
+         nearest: (.emb.knn vec (.emb.encode m "how the store is rebuilt"))
+         take: 20})
+```
+
 ### Projection & `_dist`
 
 The rerank step emits a synthetic `_dist` column, but it is **not** included in the default output — `(select {from: t nearest: …})` returns the source schema exactly, preserving shape compatibility with `(select {from: t})`. To include the distance, reference `_dist` in an explicit projection:

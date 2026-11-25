@@ -513,7 +513,8 @@ ray_t* ray_hnsw_load_fn(ray_t* path);
 ray_t* ray_hnsw_info_fn(ray_t* h);
 /* The exact nearest-neighbour search (ops/embedding.c), shared by .emb.knn
  * and by the query's nearest: operator: the k nearest of the rows of `col`
- * (all, or the n listed in `only`) to `query`, into ids and dists, nearest
+ * (a list of vectors, or a parted column of such lists, its rows numbered
+ * through the partitions; all of them, or the n listed in `only`) to `query`, into ids and dists, nearest
  * first, lower being closer (an inner product comes negated).  Returns how
  * many, or a code below; on RAY_EMB_KNN_BAD_ROW *bad_row is the row that is
  * no numeric vector of length dim.  `metric` is a ray_hnsw_metric_t. */
