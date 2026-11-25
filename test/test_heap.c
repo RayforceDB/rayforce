@@ -2829,6 +2829,154 @@ static test_result_t test_direct_cache_replaces_old_blocks(void) {
     PASS();
 }
 
+/* Mapped address space of the process in KB (statm field 1), or 0 where
+ * /proc is unavailable. */
+static size_t heap_vm_kb(void) {
+#if defined(__linux__)
+    int fd = open("/proc/self/statm", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[128];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    unsigned long long pages = strtoull(buf, NULL, 10);
+    long pgsz = sysconf(_SC_PAGESIZE);
+    return pgsz > 0 ? (size_t)((pages * (unsigned long long)pgsz) / 1024) : 0;
+#else
+    return 0;
+#endif
+}
+
+/* A fresh direct block the cache will not keep (over its budget) is mapped
+ * 2 MB-aligned for huge pages and is transient (its pages may go ahead of
+ * the free), unless it is locked; one the cache keeps is neither.  On a
+ * memory budget under 8 GB no block is either, however large. */
+static test_result_t test_direct_huge_over_budget(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("direct blocks take huge pages on Linux only");
+#else
+    const size_t small = 64u << 20, big = 600u << 20;   /* never written: address space only */
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);
+    /* An 8 GB budget: the cache keeps up to 512 MB, the big block is over it. */
+    ray_heap_set_anon_watermark(INT64_C(8) << 30);
+    int64_t n0 = ray_heap_direct_huge_count();
+    ray_t* s = ray_alloc(small);
+    int64_t n1 = ray_heap_direct_huge_count();
+    ray_t* b = ray_alloc(big);
+    int64_t n2 = ray_heap_direct_huge_count();
+    bool   b_aligned = b && (((uintptr_t)b - RAY_DIRECT_HDR) & ((2u << 20) - 1)) == 0;
+    bool   b_spilled = b && ray_direct_file_backed(b);
+    size_t s_tr = s ? ray_raw_transient_bytes(ray_data(s)) : 1;
+    size_t b_tr = b ? ray_raw_transient_bytes(ray_data(b)) : 0;
+    size_t b_data = b ? ray_block_data_bytes(b) : 1;
+    if (s) ray_free(s);
+    if (b) ray_free(b);
+    /* Locked against swap, the same block is not transient: munmap's own
+     * unlock walk frees its pages, which MADV_DONTNEED refuses. */
+    ray_heap_set_lock(true);
+    int64_t locked0 = ray_heap_locked_bytes();
+    ray_t* l = ray_alloc(big);
+    bool   l_locked = ray_heap_locked_bytes() > locked0;
+    size_t l_tr = l ? ray_raw_transient_bytes(ray_data(l)) : 1;
+    if (l) ray_free(l);
+    ray_heap_set_lock(false);
+    /* Under 8 GB the same over-budget block (budget 256 MB) is a plain mapping. */
+    ray_heap_set_anon_watermark(INT64_C(4) << 30);
+    int64_t n3 = ray_heap_direct_huge_count();
+    ray_t* c = ray_alloc(big);
+    int64_t n4 = ray_heap_direct_huge_count();
+    size_t c_tr = c ? ray_raw_transient_bytes(ray_data(c)) : 0;
+    size_t c_data = c ? ray_block_data_bytes(c) : 1;
+    if (c) ray_free(c);
+    ray_heap_direct_cache_drain();
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    if (!s || !b || !c || !l) SKIP("600 MB block unavailable");
+    if (b_spilled) SKIP("the big block spilled: the watermark is near");
+    TEST_ASSERT_EQ_I(n1 - n0, 0);   /* the cache keeps the small one */
+    TEST_ASSERT_EQ_I(n2 - n1, 1);   /* the big one is over the cache budget */
+    TEST_ASSERT(b_aligned, "the advised block is mapped 2 MB-aligned");
+    TEST_ASSERT_EQ_I((int64_t)s_tr, 0);
+    TEST_ASSERT_EQ_I((int64_t)b_tr, (int64_t)b_data);
+    if (l_locked) TEST_ASSERT_EQ_I((int64_t)l_tr, 0);
+    /* a 4 GB budget's block over its cache budget takes no huge pages and
+     * is left to its free */
+    TEST_ASSERT_EQ_I(n4 - n3, 0);
+    TEST_ASSERT_EQ_I((int64_t)c_tr, 0);
+    TEST_ASSERT(c_data > 0, "the 4 GB budget's block");
+    PASS();
+#endif
+}
+
+/* A huge-page direct block keeps no slack of its aligned over-allocation:
+ * the process maps its map_size and no more.  Its transient pages released
+ * ahead of the free, in 2 MB slices as the grouping's workers do, go from
+ * RAM while the header page it is freed by stays; the free then unmaps the
+ * whole block and returns its committed bytes. */
+static test_result_t test_direct_huge_release(void) {
+#if !defined(RAY_OS_LINUX)
+    SKIP("direct blocks take huge pages on Linux only");
+#else
+    const size_t big = 600u << 20, slice = 2u << 20;
+    if (heap_vm_kb() == 0 || !relieve_mincore()) SKIP("no /proc/self/statm or mincore");
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);
+    ray_heap_set_anon_watermark(INT64_C(8) << 30);
+    int64_t committed = ray_heap_anon_committed();
+    int64_t n0 = ray_heap_direct_huge_count();
+    size_t vm0 = heap_vm_kb();
+    ray_t* b = ray_alloc(big);
+    size_t vm1 = heap_vm_kb();
+    if (!b || ray_direct_file_backed(b) || ray_heap_direct_huge_count() != n0 + 1) {
+        if (b) ray_free(b);
+        ray_heap_set_lock(was_lock);
+        ray_heap_set_anon_watermark(previous);
+        SKIP("600 MB block unavailable or not a huge-page block");
+    }
+    size_t map = ray_direct_map_size(b);
+    char*  base = (char*)b - RAY_DIRECT_HDR;
+    char*  p = ray_data(b);
+    size_t bytes = ray_raw_transient_bytes(p);
+    uintptr_t lo = ((uintptr_t)p + slice - 1) & ~(uintptr_t)(slice - 1);
+    uintptr_t hi = ((uintptr_t)p + bytes) & ~(uintptr_t)(slice - 1);
+    bool range_ok = hi > lo && (size_t)(hi - lo) > big - 2 * slice && lo >= (uintptr_t)p;
+    /* Write one byte in each of eight slices past the first, and the last. */
+    int res_before = 0, res_after = 0;
+    if (range_ok) {
+        char* touched[9];
+        for (int i = 0; i < 8; i++) { touched[i] = (char*)lo + (size_t)i * 37 * slice + 4096; *touched[i] = 1; }
+        touched[8] = (char*)hi - 1; *touched[8] = 1;
+        for (int i = 0; i < 9; i++) res_before += relieve_resident(touched[i]);
+        for (uintptr_t a = lo; a < hi; a += slice) ray_vm_release((void*)a, slice);
+        for (int i = 0; i < 9; i++) res_after += relieve_resident(touched[i]);
+    }
+    bool hdr_kept = ray_direct_map_size(b) == map && relieve_resident(base) == 1;
+    ray_free(b);
+    size_t vm2 = heap_vm_kb();
+    unsigned char v = 0;
+    bool gone = mincore(base, 4096, &v) != 0 && errno == ENOMEM
+             && mincore((char*)base + map - 4096, 4096, &v) != 0 && errno == ENOMEM;
+    int64_t committed_after = ray_heap_anon_committed();
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    TEST_ASSERT_EQ_I((int64_t)(vm1 - vm0), (int64_t)(map / 1024));   /* no slack kept */
+    /* the transient range is the block less its first and last slice,
+     * and starts past the headers */
+    TEST_ASSERT(range_ok, "transient range");
+    TEST_ASSERT_EQ_I(res_before, 9);
+    TEST_ASSERT_EQ_I(res_after, 0);
+    TEST_ASSERT(hdr_kept, "the header page survives the release");
+    TEST_ASSERT_EQ_I((int64_t)(vm1 - vm2), (int64_t)(map / 1024));    /* the free unmaps it all */
+    TEST_ASSERT(gone, "the block's first and last pages are unmapped");
+    TEST_ASSERT_EQ_I(committed_after, committed);
+    PASS();
+#endif
+}
+
 /* Allocations off the per-thread heaps (ray_sys_alloc: the symbol and domain
  * string arenas, index-build scratch) count toward the anonymous watermark,
  * and a large one that would cross it is backed by a spill file (#712): it
@@ -7030,6 +7178,8 @@ const test_entry_t heap_entries[] = {
     { "heap/relieve_park",             test_relieve_park,                heap_setup, heap_teardown },
     { "heap/abandon_drops_last_spill_pool", test_abandon_drops_last_spill_pool, heap_setup, heap_teardown },
     { "heap/direct_cache_concurrent", test_direct_cache_concurrent_replacement, heap_setup, heap_teardown },
+    { "heap/direct_huge_over_budget", test_direct_huge_over_budget,           heap_setup, heap_teardown },
+    { "heap/direct_huge_release",     test_direct_huge_release,               heap_setup, heap_teardown },
     { "heap/anon_watermark_spill",     test_anon_watermark_spill,              heap_setup, heap_teardown },
     { "heap/anon_watermark_spill_after_empty_pools", test_anon_watermark_spill_after_empty_pools, heap_setup, heap_teardown },
     { "heap/lock_pool_under_watermark", test_lock_pool_under_watermark, heap_setup, heap_teardown },

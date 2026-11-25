@@ -2861,6 +2861,63 @@ static test_result_t test_parted_flatten_into_bounds(void) {
     PASS();
 }
 
+/* A radix grouping whose input-sized blocks (the payload, the order map)
+ * are over the direct cache's budget has its workers drop their pages ahead
+ * of the free (agg_free_input_sized).  On a 2 GB budget (a 128 MB cache),
+ * taken for a big one by the test seam (8 GB and up otherwise), 8M
+ * distinct keys take that path, and the answer is still each row its own
+ * group, in first-seen order.
+ * The blocks are still freed: a grouping whose result is dropped leaves
+ * none of them committed. */
+static test_result_t test_group_radix_transient_release(void) {
+#if !defined(RAY_OS_LINUX) || !defined(DEBUG)
+    SKIP("the early page release is Linux only; its counter is DEBUG");
+#else
+    ae_eval_ok("(set n 8000000)");
+    ae_eval_ok("(set T (table [k v] (list (% (* (til n) 2654435761) 1000000007) (% (til n) 3))))");
+    ray_heap_direct_cache_drain();
+    int64_t previous = ray_heap_anon_watermark();
+    bool    was_lock = ray_heap_set_lock(false);   /* MADV_DONTNEED refuses a locked block */
+    ray_heap_set_anon_watermark(INT64_C(2) << 30);
+    /* a 2 GB budget leaves its blocks to the free... */
+    int64_t t1 = ray_heap_direct_transient_count();
+    ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
+    int64_t t1s = ray_heap_direct_transient_count();
+    ae_eval_ok("(set rb 0)");
+    /* ...unless the seam counts it as a big one */
+    ray_heap_test_direct_huge_min_budget(INT64_C(2) << 30);
+    ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
+    int64_t t2 = ray_heap_direct_transient_count();
+    /* once more, its result dropped: it leaves nothing committed */
+    ray_heap_direct_cache_drain();
+    int64_t committed_rb = ray_heap_anon_committed();
+    ae_eval_ok("(set rc (select {from: T by: k e: (max v)}))");
+    int64_t t3 = ray_heap_direct_transient_count();
+    ae_eval_ok("(set rc 0)");
+    ray_heap_direct_cache_drain();
+    int64_t committed_end = ray_heap_anon_committed();
+    ray_heap_test_direct_huge_min_budget(0);
+    ray_heap_set_lock(was_lock);
+    ray_heap_set_anon_watermark(previous);
+    /* every key distinct: the groups are the rows, in first-seen order */
+    ray_t* same = ae_eval("(and (all (== (at rb 'k) (at T 'k))) (all (== (at rb 'e) (at T 'v))))");
+    ray_t* groups = ae_eval("(count rb)");
+    bool ok = same && !RAY_IS_ERR(same) && same->type == -RAY_BOOL && same->b8;
+    int64_t ng = groups && !RAY_IS_ERR(groups) ? groups->i64 : -1;
+    ae_drop(same); ae_drop(groups);
+    ae_eval_ok("(set T 0) (set rb 0)");
+    TEST_ASSERT_EQ_I(ng, 8000000);
+    TEST_ASSERT_EQ_I(t1s - t1, 0);    /* a small budget does not release early */
+    TEST_ASSERT(t2 - t1s >= 1 && t3 - t2 >= 1, "an input-sized block was released ahead of its free");
+    TEST_ASSERT(ok, "each row is its own group, in order");
+    /* The released blocks were unmapped.  Each is over the 128 MB cache
+     * budget; a heap pool (32 MB) the grouping added may stay. */
+    TEST_ASSERT_FMT(committed_end - committed_rb < (INT64_C(128) << 20),
+                    "committed grew by %lld", (long long)(committed_end - committed_rb));
+    PASS();
+#endif
+}
+
 /* #1670: the checked mode of a 64-bit integer variance's second run is the
  * execution's (ray_graph_t.var_checked), not the process's.  Two threads
  * run group-bys at once, as workers inside a parallel dispatch do (the
@@ -3025,5 +3082,6 @@ const test_entry_t agg_engine_entries[] = {
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
     { "var_checked_parallel_two_threads", test_var_checked_parallel_two_threads, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
+    { "group_radix_transient_release", test_group_radix_transient_release, ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
