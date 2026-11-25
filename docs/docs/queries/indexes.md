@@ -3,13 +3,13 @@
 Per-column accelerator structures — `zone`, `hash`, `sort`, `bloom` — attached directly to numeric vectors.  Build once at user request; survive copy / refcount semantics; ride alongside the column through the pipeline.
 
 !!! note "v1 status"
-    The four index kinds, their build kernels, and the `(.idx.*)` Rayfall surface are shipped.  The executor consults indexes at five sites: filter comparisons, filter IN, ORDER BY, distinct, and find.  See the [routing table](#routing-table) below.
+    The four index kinds, their build kernels, and the `(.idx.*)` Rayfall surface are shipped.  The executor consults indexes at six sites: filter comparisons, filter IN, ORDER BY, distinct, find, and equi-joins.  See the [routing table](#routing-table) below.
 
 This page is the **reference** for the `.idx.*` family. For the broader index landscape (HNSW, linked columns, partition pruning, CSR), see [Indexes Overview](indexes-overview.md). For decision walk-throughs and worked workflows, see the [Indexes Guide](../guides/indexes.md).
 
 ## Routing Table
 
-The executor consults indexes at five sites.  Each site has a specific consumption point, eligibility contract, and fallback guarantee — results never differ from the scan path (verified by drop-differential tests in `test/rfl/ops/idx_route.rfl`).
+The executor consults indexes at six sites.  Each site has a specific consumption point, eligibility contract, and fallback guarantee — results never differ from the scan path (verified by drop-differential tests in `test/rfl/ops/idx_route.rfl`).
 
 | Index kind | Consumption site | What happens |
 |---|---|---|
@@ -26,11 +26,12 @@ The executor consults indexes at five sites.  Each site has a specific consumpti
 | `.idx.sort` | `distinct` | Walk the sort permutation once to collect first-occurrence row ids per distinct value — O(n) with no hash table.  SYM/GUID/STR columns fall back. |
 | `.idx.hash` | `find` | Hash-chain probe returns the minimum row id matching the needle, or a provably-absent signal.  Integer-family, `SYM`, `STR` and `GUID` needles against a column of the same family; float and cross-family needles fall through to the scan.  A `GUID` index keys every row by its bytes, the null guid included, so a `GUID` column with nulls keeps its index and a null needle finds a null cell, as on the scan.  A **vector** of needles probes once per needle — nothing is built per call. |
 | `.idx.hash` | `in` — `(in needles v)` with `v` indexed, and `(at d keys)` on a dict keyed by an indexed vector | One probe per needle, same type matrix as `find`.  Without an index, `find` / `in` hash whichever side is smaller and scan the other once. |
+| `.idx.hash` on a left key column | `inner-join`, `semi-mask`, `anti-mask` — integer-family and `SYM` keys, one key column or several | The left rows that can match are the index's rows for the values the right side holds on that column (an append's delta included; `SYM` values looked up in the left column's domain); the path is taken only when 32 × the right side's rows + r × its candidates stays below the left side's rows, r being 32 for a join and 8 for a mask (each right row costs a lookup in the index, each candidate a gathered and checked row).  It is decided in two steps.  First, at no cost, from sizes and the index's own row and group counts: a right side with a row for every 2048 left rows or more is not tried, and the rule is applied to the candidates the index's mean rows per value predicts; a join declined here looks up nothing.  Then the chosen column's right values are counted exactly from the index, before any row is read, stopping as soon as the count breaks the rule; a skewed index, whose mean underrates a heavy group, can be declined there, having looked up at most every right key, which the 2048 bound keeps within a fraction of a percent of the join.  The candidates, in row order, then go through the same hash, probe and whole-key equality as the scan, so the pairs or the mask, and their order, are the scan's.  With several indexed key columns the one with the fewest candidates is probed.  Otherwise the join runs as without the index (the bitmap prefilter or the plain probe): a left, full or anti join; a float, `STR` or `GUID` key; a numeric left column that may hold nulls; a `SYM` right column holding the null (a null key matches the left's null keys, which the index leaves out); for a join (not a mask), a right side over 65536 rows, which takes the join's radix path. |
 | `.idx.hash` | `distinct`, `count` of `distinct` — `GUID` columns | The hash's groups are the distinct guids and each group's first row is that guid's first occurrence: `distinct` gathers them in first-appearance order, `(count (distinct v))` is the group count.  Without an index a `GUID` `distinct` dedups on the 16 bytes (in parallel on large columns). |
 
 ### Eligibility conditions (uniform)
 
-All five sites apply the same prechecks before consulting an index:
+All six sites apply the same prechecks before consulting an index:
 
 - **Fresh:** the index's `built_for_len` must match the column's current length (mismatch → stale → fallback).
 - **No nulls (new paths):** `HAS_NULLS` set on the column → fallback for all paths except hash-EQ at the filter site, which also re-checks `HAS_NULLS` explicitly.

@@ -1199,6 +1199,10 @@ extern uint64_t ray_join_nullfree_keys;
 /* #595: right-side key bitmap prefilter on the chained probe */
 extern bool     ray_join_no_prefilter;
 extern uint64_t ray_join_prefilter_builds;
+/* #595 step 3: a switch (set from C) suppressing the index-probe access
+ * path, and the joins (and masks) whose left rows it took from an index. */
+extern bool     ray_join_no_index_probe;
+extern uint64_t ray_join_index_probes;
 extern _Atomic(uint64_t) ray_join_prefilter_skips;
 /* #599: settable dispatch floor of the chained probe (.sys.join.par.min).
  * The default is one join morsel plus one row: the split rule before #599. */

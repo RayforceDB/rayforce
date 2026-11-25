@@ -18,7 +18,7 @@ Three properties hold for every kind of index documented on this page:
 
 Attach one of four kinds to a numeric vector (`.idx.hash` also to a symbol, string or guid vector). Each kind builds a structure suited to a different query shape: hash for equality lookups, sort for binary search and ordered access, zone for column-level min/max/null pruning, bloom for cheap probabilistic membership rejection. All four occupy the same per-column slot — one kind at a time today.
 
-**Today's status:** all four are *built, inspectable via `(.idx.info)`, and consulted by the executor at six routing sites* — filter comparisons, filter IN, ORDER BY (single ascending key), distinct, and find.  The routing is transparent: a query against an indexed column uses the fast path; the same query without the index falls back to the linear scan and returns identical results.
+**Today's status:** all four are *built, inspectable via `(.idx.info)`, and consulted by the executor at six routing sites* — filter comparisons, filter IN, ORDER BY (single ascending key), distinct, find, and equi-joins (`inner-join`, `semi-mask`, `anti-mask`).  The routing is transparent: a query against an indexed column uses the fast path; the same query without the index falls back to the linear scan and returns identical results.
 
 **Surface:** `(.idx.zone v)`, `(.idx.hash v)`, `(.idx.sort v)`, `(.idx.bloom v)`, `(.idx.drop v)`, `(.idx.has? v)`, `(.idx.info v)`. Numeric/boolean columns (`RAY_BOOL` through `RAY_TIMESTAMP`) are supported by all kinds; `.idx.hash` additionally accepts `RAY_SYM`, `RAY_STR` and `RAY_GUID`. `RAY_SYM`, `RAY_STR` and `RAY_GUID` on the non-hash kinds are deferred.
 

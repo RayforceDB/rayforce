@@ -978,6 +978,23 @@ static inline ray_idx_rows_t ray_idx_rows_from(ray_idx_rows_t r, int64_t off) {
 int ray_index_hash_group(ray_t* col, int64_t key,
                          ray_idx_rows_t* rows_out, int64_t* n_out, ray_t** hold);
 
+/* The number of rows ray_index_hash_group would give `key` (its delta's
+ * included), without collecting them: >= 0, or -1 not eligible. */
+int64_t ray_index_hash_count(ray_t* col, int64_t key);
+/* A fresh hash index's rows (its delta's included) and groups (distinct
+ * keys), read from the payload: a few loads, no call (a join asks before
+ * deciding whether to pay for anything).  False when `col` has none. */
+static inline bool ray_index_hash_stats(const ray_t* col, int64_t* rows, int64_t* groups) {
+    if (!(col->attrs & RAY_ATTR_HAS_INDEX) || !col->index || RAY_IS_ERR(col->index) ||
+        RAY_IS_PARTED(col->type) || col->type == RAY_MAPCOMMON) return false;
+    const ray_index_t* ix = ray_index_payload(col->index);
+    if (ix->kind != RAY_IDX_HASH || ix->built_for_len != col->len || ix->u.hash.n_groups <= 0) return false;
+    ray_t* d = ray_index_hash_delta(ix);
+    *rows = ix->u.hash.n_keys + (d ? ((const int64_t*)ray_data(d))[0] : 0);
+    *groups = ix->u.hash.n_groups;
+    return true;
+}
+
 /* Build a rowsel from ASCENDING row ids (empty n=0 is valid).  NULL on OOM. */
 ray_t* ray_index_rowsel_from_ids(int64_t nrows, const int64_t* ids, int64_t n);
 /* Same, from row ids borrowed from an index. */
