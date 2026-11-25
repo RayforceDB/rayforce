@@ -125,6 +125,8 @@ Within an eligible run, static selectivity classes derived from opcode, operand 
 
 Identifies which columns are actually needed by the query and pushes projection below joins and group-by operations. Columns that are never referenced after a certain point are dropped early, reducing memory bandwidth and intermediate result sizes.
 
+The same holds across a nested select. A select whose only clauses are `where:` and, optionally, `take:` keeps rows and adds no columns, so when it is the `from:` of a select that names the columns it reads, it gathers just those columns of the rows it keeps: `(select {from: (select {from: t where: (== a 'x)}) by: b n: (count id)})` gathers `b` and `id`, not every column of `t` (of every partition, on a partitioned table). The `where:` and `take:` still read their own columns. An outer select that names no columns (`(select {from: (select {from: t where: …})})`) or one that reads columns by other means keeps them all.
+
 ### 9. Partition Pruning
 
 For partitioned tables, derives a necessary mask from supported literal predicates on the partition key and checks whether the remaining query shape is local to the retained partitions. Unsupported or nonlocal shapes keep the original source. The residual filter still runs; this is not a universal physical-I/O guarantee. See [Partition Pruning](../storage/index.md#partition-pruning) for supported forms and proof limits, and [block offloading](offloading.md) for later segment work.

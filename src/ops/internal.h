@@ -1736,6 +1736,9 @@ int64_t ray_sort_test_topk_pairs(void);
 uint64_t ray_sort_test_topk_inplace(void);
 /* Parted columns sel_compact gathered on the pool (sel_parted_gather). */
 uint64_t ray_filter_test_parted_runs(void);
+/* Columns a filter gathered: sel_compact's kept columns, and every column
+ * of exec_filter_head's input (#1691). */
+uint64_t ray_filter_test_cols_gathered(void);
 #endif
 
 /* ── join.c ── */

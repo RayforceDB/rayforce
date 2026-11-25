@@ -18607,7 +18607,8 @@ static int64_t proj_keep_bound(ray_t* dict) {
     int64_t cnt = 0;
     for (int64_t i = 0; i < n; i++) {
         if (sym_cell_runtime_id(keys, i) == from_id) continue;  /* the subquery */
-        cnt += count_syms(vptrs[i]);
+        ray_t* v = vptrs[i];   /* a SYM vector (by: [a b]) names a column per element */
+        cnt += v && v->type == RAY_SYM ? ray_len(v) : count_syms(v);
     }
     return cnt + 1;
 }
@@ -18643,6 +18644,17 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
             !eval_group_keep_ok(clause, NULL)) {
             DICT_VIEW_CLOSE(pv);
             return false;
+        }
+        if (clause && clause->type == RAY_SYM) {
+            /* by: [a b], asc: [a b]: each element names a column the
+             * select reads (collect_syms sees only sym atoms) */
+            for (int64_t j = 0; j < ray_len(clause) && n < max; j++) {
+                int64_t s = ray_read_sym(ray_data(clause), j, RAY_SYM, clause->attrs);
+                bool dup = false;
+                for (int q = 0; q < n && !dup; q++) dup = out[q] == s;
+                if (!dup) out[n++] = s;
+            }
+            continue;
         }
         n = collect_syms(pv[i + 1], out, max, n);
     }
@@ -18731,6 +18743,46 @@ static int filt_compact_keep(ray_t* dict, ray_t* by_expr, ray_t* tbl,
         int64_t s = vm->proj_keep[j];
         bool dup = false;
         for (int q = 0; q < n; q++) if (out[q] == s) { dup = true; break; }
+        if (!dup) out[n++] = s;
+    }
+    return n;
+}
+
+/* Filter-compaction keep-set for a select whose only clauses are where: and,
+ * optionally, take: (#1691), evaluated as the from: of a select that
+ * published the columns it reads (an active projection hint at this
+ * eval_depth).  Its result is that select's input and nothing else, which
+ * reads only the published columns, so the filter gathers those alone
+ * rather than every column of every row it keeps.  The where: and the take:
+ * run before the gather, over the whole table, as before.  Returns the
+ * columns of `tbl` among the published ones, or 0 (carry all) for any other
+ * shape, or when none is a column: a result with no column would lose its
+ * row count. */
+static int filter_only_keep(ray_t* dict, ray_t* tbl, int64_t* out, int max) {
+    ray_vm_t* vm = __VM;
+    if (!vm || !vm->proj_active || vm->eval_depth != vm->proj_depth + 1)
+        return 0;
+    int64_t from_id  = dict_key_id(dict, "from");
+    int64_t where_id = dict_key_id(dict, "where");
+    int64_t take_id  = dict_key_id(dict, "take");
+    bool has_where = false;
+    DICT_VIEW_DECL(pv);
+    DICT_VIEW_OPEN(dict, pv);
+    if (DICT_VIEW_OVERFLOW(pv)) { DICT_VIEW_CLOSE(pv); return 0; }
+    for (int64_t i = 0; i + 1 < pv_n; i += 2) {
+        int64_t kid = pv[i]->i64;
+        if (kid == where_id) has_where = true;
+        else if (kid != from_id && kid != take_id) { DICT_VIEW_CLOSE(pv); return 0; }
+    }
+    DICT_VIEW_CLOSE(pv);
+    if (!has_where) return 0;
+    int n = 0;
+    for (int j = 0; j < vm->proj_keep_n && n < max; j++) {
+        int64_t s = vm->proj_keep[j];
+        ray_col_meta_t cm;
+        if (!ray_table_col_meta(tbl, s, &cm)) continue;   /* not a column */
+        bool dup = false;
+        for (int q = 0; q < n && !dup; q++) dup = out[q] == s;
         if (!dup) out[n++] = s;
     }
     return n;
@@ -31492,7 +31544,25 @@ by_dict_done:
     int32_t prev_first_seen = by_expr && has_sort
         ? ray_group_first_seen_set(__VM ? __VM->eval_depth : 0) : -2;
     root = ray_optimize(g, root);
+    /* A select of only where: (and take:) under its consumer's projection
+     * hint gathers just the columns that consumer reads (#1691). */
+    ray_vm_t* fo_vm = __VM;
+    ray_t*   fo_hdr = NULL;
+    const int64_t* fo_sv_k = fo_vm ? fo_vm->filt_keep   : NULL;
+    int            fo_sv_n = fo_vm ? fo_vm->filt_keep_n : 0;
+    int32_t        fo_sv_d = fo_vm ? fo_vm->filt_depth  : 0;
+    if (fo_vm && where_expr && !by_expr && fo_vm->proj_active && fo_vm->proj_keep_n > 0) {
+        int64_t* fo_buf = (int64_t*)scratch_alloc(&fo_hdr, (size_t)fo_vm->proj_keep_n * sizeof(int64_t));
+        int fo_n = fo_buf ? filter_only_keep(dict, tbl, fo_buf, fo_vm->proj_keep_n) : 0;
+        if (fo_n > 0) {
+            fo_vm->filt_keep = fo_buf; fo_vm->filt_keep_n = fo_n;
+            fo_vm->filt_depth = fo_vm->eval_depth;
+        }
+    }
     ray_t* result = ray_execute(g, root);
+    if (fo_vm) { fo_vm->filt_keep = fo_sv_k; fo_vm->filt_keep_n = fo_sv_n;
+                 fo_vm->filt_depth = fo_sv_d; }
+    scratch_free(fo_hdr);
     if (prev_first_seen != -2) ray_group_first_seen_set(prev_first_seen);
     if (n_hidden_sort > 0 && result && !RAY_IS_ERR(result)) {
         if (ray_is_lazy(result)) result = ray_lazy_materialize(result);
