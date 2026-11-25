@@ -2385,6 +2385,48 @@ static test_result_t test_eval_cd_group_partition_oom(void) {
     for (int64_t i = 0; i < NG; i++)
         TEST_ASSERT_FMT(got[i] == want[i] && want[i] > 0, "key %lld: %lld, want %lld",
                         (long long)i, (long long)got[i], (long long)want[i]);
+
+    /* Few groups, at 4 workers: the per-value mode, whose partition table
+     * starts small and grows.  A column of 300 values that turns into one
+     * of 60000 halfway makes every partition grow more than once; failing
+     * the nth table for each nth of 1..128 — a partition's first table or
+     * one of its growths — answers "oom", never a table.  Disarmed, the
+     * counts are the tuple-distinct ones: 12000 in each of the five groups
+     * (g and v repeat together, so a group sees a fifth of the values). */
+    int64_t cores = ray_pool_get() ? (int64_t)ray_pool_total_workers(ray_pool_get()) : 1;
+    ray_pool_destroy();
+    /* No assert until the pool is back at its size: a failure in between
+     * would leave the tests after this one a 4-worker pool. */
+    bool pv_pool = ray_pool_init_total(4) == RAY_OK;
+    t = pv_pool ? ray_eval_str("(do (set _cr (til 400000)) "
+                               "(set _cg (table [g v b] (list (% _cr 5) (% _cr (+ 300 (* 59700 (as 'I64 (>= _cr 200000))))) (% _cr 100)))) 0)")
+                : NULL;
+    bool pv_setup = t && !RAY_IS_ERR(t);
+    if (t && RAY_IS_ERR(t)) ray_error_free(t); else if (t) ray_release(t);
+    ray_error_clear();
+    bool pv_ok = pv_setup;
+    long long pv_bad = 0;
+    for (long long nth = 1; nth <= 128 && pv_ok; nth++) {
+        ray_cdpg_test_fail_slots(nth);
+        ray_t* r = ray_eval_str("(select {from: _cg by: g u: (count (distinct v)) m: (max b)})");
+        ray_cdpg_test_fail_slots(0);
+        bool is_oom = r && RAY_IS_ERR(r) && strcmp(ray_err_code(r), "oom") == 0;
+        if (r && RAY_IS_ERR(r)) ray_error_free(r);
+        else if (r) ray_release(r);
+        ray_error_clear();
+        if (!is_oom) { pv_ok = false; pv_bad = nth; }
+    }
+    ray_t* pv = !pv_setup ? NULL : ray_eval_str("(and (all (== (at (select {from: _cg by: g u: (count (distinct v)) m: (max b) asc: g}) 'u) "
+                             "(at (select {from: (distinct (select {from: _cg g: g v: v})) by: g u: (count v) asc: g}) 'u))) "
+                             "(all (== (at (select {from: _cg by: g u: (count (distinct v)) m: (max b) asc: g}) 'u) [12000 12000 12000 12000 12000])))");
+    bool pv_counts = pv && !RAY_IS_ERR(pv) && pv->type == -RAY_BOOL && pv->b8;
+    if (pv && RAY_IS_ERR(pv)) ray_error_free(pv); else if (pv) ray_release(pv);
+    ray_pool_destroy();
+    TEST_ASSERT_EQ_I(ray_pool_init_total((uint32_t)cores), RAY_OK);
+    TEST_ASSERT_TRUE(pv_pool);
+    TEST_ASSERT_TRUE(pv_setup);
+    TEST_ASSERT_FMT(pv_ok, "per value, nth %lld: not an oom error", pv_bad);
+    TEST_ASSERT_TRUE(pv_counts);
     PASS();
 }
 
