@@ -344,6 +344,53 @@ bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs
     return true;
 }
 
+bool ray_symimp_add_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                          const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
+    for (int64_t o = 0; o < n; o += SI_BATCH) {
+        int64_t k = n - o < SI_BATCH ? n - o : SI_BATCH;
+        bool ok = true;
+        pthread_mutex_lock(&m->alock);
+        if (atomic_load_explicit(&m->reserved, memory_order_relaxed)) ok = false;
+        int64_t* sp = m->stats ? (int64_t[SI_ST_N]){0} : NULL;
+        for (int64_t i = o; i < o + k && ok; i++) {
+            const char* s = strs[i] ? strs[i] : "";
+            size_t len = strs[i] ? lens[i] : 0;
+            if (len > UINT32_MAX - 4) { ok = false; break; }
+            si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
+            int64_t pos = si_find(m, atomic_load_explicit(&sh->tab, memory_order_relaxed), (uint32_t)hashes[i], s, len, sp);
+            if (pos < 0) pos = si_add(m, sh, (uint32_t)hashes[i], s, len, sp);
+            if (pos < 0) ok = false;
+            else out_pos[i] = pos;
+        }
+        si_tab_t* done = si_reclaim(m);
+        pthread_mutex_unlock(&m->alock);
+        for (int j = 0; sp && j < SI_ST_N; j++)
+            if (sp[j]) atomic_fetch_add_explicit(&m->st[j], sp[j], memory_order_relaxed);
+        for (si_tab_t* t = done; t;) { si_tab_t* nx = t->next; ray_sys_free(t); t = nx; }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool ray_symimp_find_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                           const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
+    uint64_t e;
+    for (;;) {   /* registered as si_batch's lookups are */
+        e = atomic_load_explicit(&m->epoch, memory_order_seq_cst);
+        atomic_fetch_add_explicit(&m->active[e & 1], 1, memory_order_seq_cst);
+        if (atomic_load_explicit(&m->epoch, memory_order_seq_cst) == e) break;
+        atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
+    }
+    bool ok = !atomic_load_explicit(&m->reserved, memory_order_seq_cst);
+    for (int64_t i = 0; ok && i < n; i++) {
+        const si_shard_t* sh = &m->shards[si_shard_of(hashes[i])];
+        out_pos[i] = si_find(m, atomic_load_explicit(&sh->tab, memory_order_acquire), (uint32_t)hashes[i],
+                             strs[i] ? strs[i] : "", strs[i] ? lens[i] : 0, NULL);
+    }
+    atomic_fetch_sub_explicit(&m->active[e & 1], 1, memory_order_release);
+    return ok;
+}
+
 bool ray_symimp_reserve(ray_symimp_t* m, int64_t n, int64_t bytes, int64_t* pos0, int64_t* off0) {
     if (n < 0 || bytes < 0) return false;
     pthread_mutex_lock(&m->alock);
@@ -607,6 +654,14 @@ void ray_symimp_free(ray_symimp_t* m) {
 ray_symimp_t* ray_symimp_create(const char* path, _Atomic(int64_t)* count) { (void)path; (void)count; return NULL; }
 bool ray_symimp_intern_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
                              const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
+    (void)m; (void)n; (void)strs; (void)lens; (void)hashes; (void)out_pos; return false;
+}
+bool ray_symimp_add_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                          const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
+    (void)m; (void)n; (void)strs; (void)lens; (void)hashes; (void)out_pos; return false;
+}
+bool ray_symimp_find_batch(ray_symimp_t* m, int64_t n, const char* const* strs,
+                           const size_t* lens, const uint64_t* hashes, int64_t* out_pos) {
     (void)m; (void)n; (void)strs; (void)lens; (void)hashes; (void)out_pos; return false;
 }
 ray_err_t ray_symimp_sync(ray_symimp_t* m, bool durable) { (void)m; (void)durable; return RAY_ERR_IO; }

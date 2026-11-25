@@ -167,3 +167,14 @@ parted table resolves over the one root `.sym`.
 ```lisp
 (.parquet.splayed {types: [I64 SYM SYM] symfile: 'column} "hits.parquet" "/tmp/hits")
 ```
+
+When every `SYM` column chunk of the source holds its strings in a dictionary
+page (the column chunk's encoding statistics say so), both conversions write
+the same files at any worker count: the symbol file takes the dictionaries'
+strings row group by row group in file order, and by column within a row group,
+as one worker reads them, and each partition's `SYM` columns record the symbol
+count one worker leaves after the partition's row groups. Only the symbol
+file's index (`.sym.ix`) differs between two such imports: it records the
+identity of the symbol file it was written for. A chunk with strings outside
+its dictionary page (a writer's fallback to plain pages once a dictionary grows
+large) still takes its strings in the order the workers reach them.
