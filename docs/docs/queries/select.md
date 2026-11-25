@@ -112,7 +112,25 @@ the table has a column named `null`: `(if (> v 1) v null)` keeps each row's
 `v` above 1 and is null elsewhere, and `by: (if (> v 2) g null)` groups the
 rows at or below 2 under a null key. A name that is neither an alias nor a
 column and holds a table or a dict reads that global: `(count W)` with `W` a
-table or a dict counts it. Inside a nested select, a column of its own table, and
+table or a dict counts it. A name holding a list (a `LIST`, such as
+`(list 10 20 30)`) is one whole value too, at any length, on every route:
+- `r: L` gives every row, or every group, the whole list, in `select` and in
+  `update` alike, as an atom fills every row;
+- an aggregate sees the whole list, so `(count L)` is the list's length in
+  every group;
+- `where: L` is the `type` error any value that is no mask gives, and
+  `where: (first L)` filters by the mask `L` holds;
+- `by: L` is the `schema` error a table or a dict there gives (`update`:
+  `domain`), since a whole value is no key.
+
+In `update`, a whole list into a typed column, or a new column of it under
+`by:` or `where:`, is the `type` error any `LIST` value gives there. A name
+holding a vector is read differently: a vector as long as the table is a
+column, sliced per group and filtered by `where:`
+([Aggregate sources](#aggregate-sources)). A vector is one value per row of
+one type, so it lines up with the rows; a list holds arbitrary values (a
+cell may itself be a vector), so it is never taken to be rows. To read a
+list's elements as a column, make it a vector first, e.g. `(as 'I64 L)`. Inside a nested select, a column of its own table, and
 within its outputs its own outputs, are its own, even when the outer table
 has a column of that name (its table given by name, as a parameter or a
 `let`, or as an expression of builtins): in `(count (at (select {from: u by: k x: (sum v)}) 'x))` over a table
@@ -540,7 +558,8 @@ aggregate, `count` included, in `select` and `update`, keyless, under
 
 The rule is by length alone: over a three-row table with `g` `[a b b]`,
 `(sum [1 2 3])` by `g` is `[1 5]`, while over ten rows it is a `length`
-error. A vector meant as one whole value that happens to be as long as the
+error. A list is never read this way: a name holding one is one whole
+value (see above). A vector meant as one whole value that happens to be as long as the
 table is read as a column too; read it through a call that takes it whole,
 `(sum (raze W))`, or a helper of several statements. An earlier output's alias is that output, not a vector of
 the same name: in `{W: (* x 2) s: (sum W)}` the sum reads the projected

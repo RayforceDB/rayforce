@@ -1,0 +1,64 @@
+;; A name holding a list reads as one whole value inside a query, on every
+;; route and at any length (#1570), as a name holding a table or a dict does
+;; (#1496).  A name holding a vector is a free vector instead (#1492): as
+;; long as the table it is a column, sliced by by: and filtered by where:.
+(set T (table [g v l] (list ['a 'a 'b 'b 'c] [1 2 3 4 5] (list [1] [2] [3] [4] [5]))))
+(set L (list 10 20 30 40 50))
+(set L3 (list 1 2 3))
+(set V [10 20 30 40 50])
+;; select: a projection gives every row (or group) the whole list
+(at (select {r: L from: T}) 'r) -- (list L L L L L)
+(at (select {r: L3 from: T}) 'r) -- (list L3 L3 L3 L3 L3)
+(at (select {r: L from: T by: g}) 'r) -- (list L L L)
+(at (select {r: L from: T where: (> v 2)}) 'r) -- (list L L L)
+(at (select {r: V from: T}) 'r) -- V
+(at (select {r: V from: T by: g}) 'r) -- (list [10 20] [30 40] [50])
+;; aggregates see the whole list
+(at (select {r: (count L) from: T}) 'r) -- [5]
+(at (select {r: (count L) from: T by: g}) 'r) -- [5 5 5]
+(at (select {r: (sum L) from: T by: g}) 'r) -- [150 150 150]
+(at (select {r: (count L) from: T where: (> v 2)}) 'r) -- [5]
+(at (select {r: (count (distinct L)) from: T by: g}) 'r) -- [5 5 5]
+(at (select {r: (at L 0) from: T}) 'r) -- [10 10 10 10 10]
+(at (update {r: (count L) from: T by: g}) 'r) -- [5 5 5 5 5]
+(at (update {r: (sum L) from: T by: g}) 'r) -- [150 150 150 150 150]
+(at (update {r: (count L) from: T where: (> v 2)}) 'r) -- [0Nl 0Nl 5 5 5]
+(at (select {r: (count V) from: T by: g}) 'r) -- [2 2 1]
+(at (update {r: (count V) from: T where: (> v 2)}) 'r) -- [0Nl 0Nl 3 3 3]
+;; update: every row takes the whole list, as it takes an atom; a LIST
+;; value into a typed column, and a new column of one under by: or where:,
+;; are the errors any LIST value gives there
+(at (update {r: L from: T}) 'r) -- (list L L L L L)
+(at (update {r: L3 from: T}) 'r) -- (list L3 L3 L3 L3 L3)
+(at (update {l: L from: T}) 'l) -- (list L L L L L)
+(at (update {l: L from: T where: (> v 2)}) 'l) -- (list [1] [2] L L L)
+(at (update {l: L from: T by: g}) 'l) -- (list L L L L L)
+(do (set M T) (update {l: L from: 'M}) (at M 'l)) -- (list L L L L L)
+(update {r: L from: T by: g}) !- type
+(update {r: L from: T where: (> v 2)}) !- type
+(update {v: L from: T}) !- type
+(at (update {r: V from: T}) 'r) -- V
+;; a local holding a list is whole too; a local named like a column hides it
+;; for the row count
+((fn [L] (at (update {r: L from: T}) 'r)) (list 1 2)) -- (list [1 2] [1 2] [1 2] [1 2] [1 2])
+((fn [g] (at (update {r: L from: T}) 'r)) 1) -- (list L L L L L)
+;; where: a whole list is no mask: the type error a dict gives there; the
+;; first of a list holding a mask is the mask
+(set Lwm (list [true false true false true]))
+(select {v: v from: T where: L}) !- type
+(at (select {v: v from: T where: (first Lwm)}) 'v) -- [1 3 5]
+(at (update {v: 0 from: T where: (first Lwm)}) 'v) -- [0 2 0 4 0]
+;; by: a whole list is no key: the schema error a table or a dict gives
+(select {r: (count v) from: T by: L}) !- schema
+(update {r: (count v) from: T by: L}) !- domain
+(at (select {r: (count v) from: T by: V}) 'r) -- [1 1 1 1 1]
+;; an update that fails after a list output was read whole (a free vector of
+;; another length beside it) frees what it built: the live bytes do not grow
+;; with the number of failed calls
+(set V3 [1 2 3])
+(set leakf (fn [] (try (update {r: L x: (sum V3) from: T}) (fn [e] 0))))
+(leakf) -- 0
+(times 100 (leakf))
+(set m0 (at (.sys.mem) 'bytes-allocated))
+(times 1000 (leakf))
+(< (- (at (.sys.mem) 'bytes-allocated) m0) 100000) -- true
