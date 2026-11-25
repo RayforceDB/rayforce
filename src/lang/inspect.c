@@ -130,6 +130,25 @@ ray_t* ray_inspect_lookup(int64_t sym_id) {
 
 /* ---- .repl.signature (#947) ---- */
 
+/* A namespace root: a dict bound under a one-segment dotted name (.sys,
+ * .ipc, ...), a reserved name user code cannot bind. */
+static bool insp_is_namespace(int64_t id, ray_t* v) {
+    ray_t* s = v && v->type == RAY_DICT ? ray_sym_str(id) : NULL;
+    if (!s) return false;
+    const char* p = ray_str_ptr(s);
+    size_t n = ray_str_len(s);
+    return n > 1 && p[0] == '.' && !memchr(p + 1, '.', n - 1);
+}
+
+/* `true` and `false` are literals the parser reads, not bindings. */
+static bool insp_is_literal(int64_t id) {
+    ray_t* s = ray_sym_str(id);
+    if (!s) return false;
+    size_t n = ray_str_len(s);
+    const char* p = ray_str_ptr(s);
+    return (n == 4 && !memcmp(p, "true", 4)) || (n == 5 && !memcmp(p, "false", 5));
+}
+
 static bool insp_is_builtin(const ray_t* v) {
     return v && (v->type == RAY_UNARY || v->type == RAY_BINARY || v->type == RAY_VARY);
 }
@@ -141,7 +160,9 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     ray_t* v = ray_inspect_lookup(name->i64);
     bool lambda = v && v->type == RAY_LAMBDA;
     bool builtin = insp_is_builtin(v);
-    const char* kind = !v ? "missing" : lambda ? "lambda" : !builtin ? "value"
+    const char* kind = !v ? (insp_is_literal(name->i64) ? "literal" : "missing")
+                     : lambda ? "lambda"
+                     : !builtin ? (insp_is_namespace(name->i64, v) ? "namespace" : "value")
                      : v->type == RAY_UNARY ? "unary" : v->type == RAY_BINARY ? "binary" : "vary";
 
     ray_t* params = NULL;

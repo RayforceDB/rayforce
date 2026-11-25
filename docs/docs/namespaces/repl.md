@@ -78,7 +78,7 @@ Signature: `(.repl.signature name)`, `name` a symbol. It returns a dict describi
 | `name` | the symbol asked for |
 | `bound` | whether the name holds a value |
 | `callable` | whether that value is a function |
-| `kind` | `lambda`; `unary`, `binary` or `vary` for a builtin (its calling convention); `value` for a bound value that is no function; `missing` |
+| `kind` | `lambda`; `unary`, `binary` or `vary` for a builtin (its calling convention); `namespace` for a namespace root such as `.sys`; `value` for another bound value that is no function; `literal` for `true` and `false`; `missing` |
 | `special` | whether it is a special form, which receives its arguments unevaluated (`if`, `select`, `set`, …) |
 | `params` | a lambda's parameter names, a `sym` vector; empty otherwise |
 | `arity` | a lambda's parameter count; `0Nl` for a builtin |
