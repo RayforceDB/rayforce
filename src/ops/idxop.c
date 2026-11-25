@@ -5924,6 +5924,14 @@ ray_t* ray_index_rowsel_from_rows(int64_t nrows, ray_idx_rows_t ids, int64_t n) 
     return rowsel_from_sorted_rows(nrows, ids, n);
 }
 
+int64_t ray_index_hash_count(ray_t* col, int64_t key) {
+    if (!idx_fresh(col, RAY_IDX_HASH) || hash_byte_keyed(col->type)) return -1;
+    int64_t gid = -1;
+    ray_index_t* ix = hash_probe_setup(col, key, &gid);
+    if (!ix) return hash_key_in_range(col->type, key) ? -1 : 0;
+    return gid < 0 ? 0 : hx_gsize(ix, gid);
+}
+
 int ray_index_hash_group(ray_t* col, int64_t key,
                          ray_idx_rows_t* rows_out, int64_t* n_out, ray_t** hold) {
     *rows_out = (ray_idx_rows_t){ NULL, false };

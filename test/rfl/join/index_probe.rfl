@@ -1,0 +1,145 @@
+;; The index-probe access path for joins (#595 step 3): when a key column of
+;; the left side carries .idx.hash and the right side names few of its
+;; values, inner-join, semi-mask and anti-mask probe only the left rows the
+;; index gives for those values, then check the whole key as the scan does.
+;; Every answer is compared with the same call on an unindexed copy (the
+;; scan, or the bitmap prefilter), rows and order alike; .idx.uses shows
+;; which calls took the index.
+(.sys.exec "rm -rf /tmp/rf-join-index-probe")
+(do (.idx.uses (table [a] (list [1]))) null)
+(set N 120000)
+(set books (as 'SYM (+ 1000 (til 800))))
+(set bi (% (* (til N) 7919) 766))
+;; P: plain, T: the same rows with instrument and seq indexed
+(set P (table [venue instrument seq px] (list (at ['v0 'v1 'v2 'v3 'v4 'v5] (% bi 6)) (at books bi) (% (til N) 977) (til N))))
+(set T (table [venue instrument seq px] (list (at P 'venue) (.idx.hash (at P 'instrument)) (.idx.hash (at P 'seq)) (at P 'px))))
+
+;; ─────────────────── compound SYM key, a few books ─────────────────────────
+(set K (table [venue instrument q] (list ['v1 'v5 'v3 'v1] (at books [7 5 700 7]) [1 2 3 4])))
+(inner-join [venue instrument] T K) -- (inner-join [venue instrument] P K)
+(at (.idx.uses T) 'instrument) -- 1
+(semi-mask [venue instrument] T K) -- (semi-mask [venue instrument] P K)
+(anti-mask [venue instrument] T K) -- (anti-mask [venue instrument] P K)
+(at (.idx.uses T) 'instrument) -- 2
+;; keys last, and the other column order
+(inner-join T K [instrument venue]) -- (inner-join P K [instrument venue])
+(at (.idx.uses T) 'instrument) -- 1
+
+;; 40 books: past 4096 candidates their groups are merged through a bitmap
+;; (a mask takes the index up to one candidate in 8 left rows, a join in 32)
+(set K40 (table [venue instrument] (list (at ['v0 'v1 'v2 'v3 'v4 'v5] (% (til 40) 6)) (at books (til 40)))))
+(semi-mask [venue instrument] T K40) -- (semi-mask [venue instrument] P K40)
+(anti-mask [venue instrument] T K40) -- (anti-mask [venue instrument] P K40)
+(at (.idx.uses T) 'instrument) -- 2
+(inner-join [venue instrument] T K40) -- (inner-join [venue instrument] P K40)
+(nil? (at (.idx.uses T) 'instrument)) -- true
+
+;; ─────────────────── single keys: SYM and I64 ──────────────────────────────
+(set K1 (table [instrument w] (list (at books [3 9 9 760]) [1 2 3 4])))
+(inner-join [instrument] T K1) -- (inner-join [instrument] P K1)
+(set KS (table [seq w] (list [5 900 5 5000] [1 2 3 4])))
+(inner-join [seq] T KS) -- (inner-join [seq] P KS)
+(semi-mask [seq] T KS) -- (semi-mask [seq] P KS)
+(anti-mask [seq] T KS) -- (anti-mask [seq] P KS)
+(at (.idx.uses T) 'seq) -- 3
+;; both indexed: the column with fewer candidates is probed (seq: 1 row a
+;; value at most 123, instrument: ~157), and the answer is the same
+(set K2 (table [instrument seq] (list (at (at P 'instrument) [0 1 2]) (at (at P 'seq) [0 1 2]))))
+(inner-join [instrument seq] T K2) -- (inner-join [instrument seq] P K2)
+(set u (.idx.uses T))
+(at u 'seq) -- 1
+(nil? (at u 'instrument)) -- true
+
+;; ─────────────────── integer and temporal keys, negative values ───────────
+;; h: -10000..9999, 6 rows each.  A key repeated on the right (-1 above all,
+;; which once collided with the empty mark of the dedupe set) is one key:
+;; its rows are candidates once, and every right copy pairs with them.
+;; 2 keys: the insertion-sort merge; 20: the radix merge; 50: the bitmap.
+(set h (- (% (* (til N) 7) 20000) 10000))
+(set PI (table [h i d v] (list h (as 'I32 h) (as 'DATE h) (til N))))
+(set TI (table [h i d v] (list (.idx.hash h) (.idx.hash (as 'I32 h)) (.idx.hash (as 'DATE h)) (til N))))
+(set R2 (table [h w] (list [-1 -1 5 -1] [1 2 3 4])))
+(inner-join [h] TI R2) -- (inner-join [h] PI R2)
+(count (inner-join [h] TI R2)) -- 24
+(semi-mask [h] TI R2) -- (semi-mask [h] PI R2)
+(set R20 (table [h] (list (concat [-1 -1] (- (* (til 18) 37) 300)))))
+(inner-join [h] TI R20) -- (inner-join [h] PI R20)
+(anti-mask [h] TI R20) -- (anti-mask [h] PI R20)
+(set R100 (table [h] (list (concat [-1 -1 -1] (- (* (til 47) 101) 2500)))))
+(inner-join [h] TI R100) -- (inner-join [h] PI R100)
+(semi-mask [h] TI R100) -- (semi-mask [h] PI R100)
+(at (.idx.uses TI) 'h) -- 7
+(set RI (table [i] (list (as 'I32 [-1 -1 -10000 9999 7]))))
+(inner-join [i] TI RI) -- (inner-join [i] PI RI)
+(anti-mask [i] TI RI) -- (anti-mask [i] PI RI)
+(set RD (table [d] (list (as 'DATE [-1 -1 0 123]))))
+(inner-join [d] TI RD) -- (inner-join [d] PI RD)
+(semi-mask [d] TI RD) -- (semi-mask [d] PI RD)
+(set u (.idx.uses TI))
+(at u 'i) -- 2
+(at u 'd) -- 2
+
+;; ─────────────────── no match, absent values, empty right ───────────────────
+(set KN (table [venue instrument] (list ['v0] (at books [7]))))
+(inner-join [venue instrument] T KN) -- (inner-join [venue instrument] P KN)
+(count (semi-mask [venue instrument] T KN)) -- N
+(set KA (table [instrument] (list ['nosuchbook 'another])))
+(inner-join [instrument] T KA) -- (inner-join [instrument] P KA)
+(anti-mask [instrument] T KA) -- (anti-mask [instrument] P KA)
+(set KE (table [instrument] (list (take ['x] 0))))
+(inner-join [instrument] T KE) -- (inner-join [instrument] P KE)
+
+;; ─────────────────── nulls ─────────────────────────────────────────────────
+;; a SYM null on the right matches left null rows, which the index leaves
+;; out: that column is not probed, the answer is the scan's
+(set PN (table [instrument v] (list (concat (at P 'instrument) [' ' 'zz]) (til (+ N 3)))))
+(set TN (table [instrument v] (list (.idx.hash (at PN 'instrument)) (at PN 'v))))
+(set KNL (table [instrument] (list [' 'zz])))
+(inner-join [instrument] TN KNL) -- (inner-join [instrument] PN KNL)
+(semi-mask [instrument] TN KNL) -- (semi-mask [instrument] PN KNL)
+(nil? (at (.idx.uses TN) 'instrument)) -- true
+;; without the null on the right the null-bearing left is probed
+(set KZ (table [instrument] (list ['zz])))
+(inner-join [instrument] TN KZ) -- (inner-join [instrument] PN KZ)
+(anti-mask [instrument] TN KZ) -- (anti-mask [instrument] PN KZ)
+(at (.idx.uses TN) 'instrument) -- 2
+;; an integer null on the right matches nothing in a null-free left column
+(set KI (table [seq] (list [0N 7])))
+(inner-join [seq] T KI) -- (inner-join [seq] P KI)
+
+;; ─────────────────── through appends: the index's delta ────────────────────
+(set B (table [venue instrument seq px] (list ['v1 'v5 'v1 'v2] (at books [7 5 7 790]) [5 5 9 1] [-1 -2 -3 -4])))
+(insert 'T B)
+(insert 'P B)
+(> (at (.idx.info (at T 'instrument)) 'delta) 0) -- true
+(inner-join [venue instrument] T K) -- (inner-join [venue instrument] P K)
+(semi-mask [venue instrument] T K) -- (semi-mask [venue instrument] P K)
+(inner-join [seq] T KS) -- (inner-join [seq] P KS)
+(at (.idx.uses T) 'instrument) -- 2
+(upsert 'T 'px (table [venue instrument seq px] (list ['v3] (at books [700]) [3] [-9])))
+(upsert 'P 'px (table [venue instrument seq px] (list ['v3] (at books [700]) [3] [-9])))
+(inner-join [venue instrument] T K) -- (inner-join [venue instrument] P K)
+(at (.idx.uses T) 'instrument) -- 1
+
+;; ─────────────────── another symbol domain on the right ────────────────────
+(.db.splayed.set "/tmp/rf-join-index-probe/k/" (table [venue instrument] (list ['v1 'v3 'v4] (at books [7 700 3]))))
+(set KF (.db.splayed.get "/tmp/rf-join-index-probe/k/"))
+(inner-join [venue instrument] T KF) -- (inner-join [venue instrument] P KF)
+(semi-mask [venue instrument] T KF) -- (semi-mask [venue instrument] P KF)
+(at (.idx.uses T) 'instrument) -- 2
+;; and an indexed left side loaded from a splayed table (its own domain)
+(.db.splayed.set "/tmp/rf-join-index-probe/t/" T)
+(set TL (.db.splayed.get "/tmp/rf-join-index-probe/t/"))
+(.idx.has? (at TL 'instrument)) -- true
+(inner-join [venue instrument] TL K) -- (inner-join [venue instrument] P K)
+(at (.idx.uses TL) 'instrument) -- 1
+
+;; ─────────────────── when the index is not the cheaper path ────────────────
+;; the right side names most books: the prefilter / scan answers
+(set KM (table [instrument] (list (take books 700))))
+(count (inner-join [instrument] T KM)) -- (count (inner-join [instrument] P KM))
+(nil? (at (.idx.uses T) 'instrument)) -- true
+;; a left-join keeps every left row: never through the index
+(left-join [venue instrument] T K) -- (left-join [venue instrument] P K)
+(nil? (at (.idx.uses T) 'instrument)) -- true
+(.sys.exec "rm -rf /tmp/rf-join-index-probe")

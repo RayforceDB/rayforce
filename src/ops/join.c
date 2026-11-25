@@ -58,6 +58,12 @@ bool ray_join_no_prefilter = false;
 uint64_t ray_join_prefilter_builds = 0;
 _Atomic(uint64_t) ray_join_prefilter_skips = 0;
 
+/* #595 step 3: see join_index_choose.  A kill switch for the index path,
+ * set from C (the differential tests compare against an unindexed copy
+ * instead, which reaches the same scan). */
+bool ray_join_no_index_probe = false;
+uint64_t ray_join_index_probes = 0;
+
 /* #599: probe-side rows from which the chained probe goes to the pool, set by
  * (.sys.join.par.min).  The default reproduces the morsel rule — a probe of
  * more than one JOIN_MORSEL splits — so a value at or below it changes
@@ -1170,6 +1176,255 @@ static void join_build_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
 _Static_assert(RAY_JOIN_PAR_MIN_DEFAULT == JOIN_MORSEL + 1,
                "the default probe floor must keep the one-morsel split rule");
 
+/* ── #595 step 3: index-probe access path ─────────────────────────────────
+ *
+ * When a key column of the LEFT side carries a fresh `.idx.hash`, the left
+ * rows that can match are exactly the index's rows for the values the
+ * right side holds on that column — its delta's included, so an index an
+ * append extended answers as a fresh one.  Their count is summed from the
+ * groups' sizes (one probe per distinct right value, no row read) before
+ * any is collected, and the path is taken only when it is the cheaper one:
+ *
+ *   right rows * JOIN_IDX_SEL_COST + candidates * ratio < left rows
+ *
+ * The alternative is a pass over every left row (a prefilter bit test, or
+ * the hash and probe themselves).  Each right row costs a dedupe and an
+ * index probe (JOIN_IDX_SEL_COST left rows' worth); each candidate a
+ * gathered row id, a place in the merged list and a scattered read of its
+ * keys (ratio left rows' worth).  The ratio is measured: a mask
+ * (semi-mask / anti-mask) wins up to about one candidate in 8 left rows
+ * (JOIN_IDX_RATIO_MASK), an inner join, whose two probe passes read the
+ * candidates' keys twice, up to about one in 32 (JOIN_IDX_RATIO_JOIN).
+ *
+ * Selection is paid only when it can pay off.  Phase 1 (join_index_choose)
+ * reads sizes and the index's own row and group counts — an inline payload
+ * read, no call — tries only a right side under left rows / JOIN_IDX_RISK,
+ * and applies the rule to the expected candidates: min(right rows, groups)
+ * at the index's mean rows per group.  A join declined there sorts and
+ * probes nothing.  Phase 2 (join_index_candidates) dedupes and counts the
+ * right values of the one column with the fewest expected candidates in
+ * one pass, against a budget the rule gives before it starts, and stops
+ * the moment the count reaches it: a skewed index (its mean underrates a
+ * heavy group) is rejected after the keys looked at, at most one lookup per
+ * right row, which JOIN_IDX_RISK keeps small against the scan that then
+ * runs.  The candidates, in
+ * ascending row order, then go through the same hash, probe and full-key
+ * equality as the scan, so the pairs (or the mask) and their order are the
+ * scan's.
+ *
+ * Eligible: an integer-family or SYM key column on the left with a fresh
+ * hash index, against a right column of the same type (SYM: any domain,
+ * each right symbol looked up in the left column's).  Not eligible, so the
+ * join runs as before: a float, STR or GUID key; a numeric left column
+ * that may hold nulls; a SYM right column holding the null (a null key
+ * matches null keys, which the index leaves out); OOM. */
+#define JOIN_IDX_RATIO_JOIN 32
+#define JOIN_IDX_RATIO_MASK 8
+/* Left rows' worth of work a right row's dedupe and index probe costs (see
+ * join_index_choose). */
+#define JOIN_IDX_SEL_COST 32
+/* Left rows per right row below which phase 2 is tried at all.  A phase-2
+ * rejection (the exact count breaks the rule: a skewed index) has looked
+ * up at most every right key, about 130 instructions each, before the join
+ * runs as without the index; the cheapest scan it then runs, a prefilter
+ * pass, is about 28 per left row.  At one right row per 2048 left rows a
+ * rejection stays within about 0.3% of the join. */
+#define JOIN_IDX_RISK 2048
+
+static bool join_idx_int_type(int8_t t) {
+    switch (t) {
+    case RAY_BOOL: case RAY_U8: case RAY_I16: case RAY_I32: case RAY_I64:
+    case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The distinct values of right column `rc` as keys of left column `lc`'s
+ * index, into a scratch array (*hdr), and the left rows the index holds for
+ * them, counted as they are found (*count).  SYM ids are translated into
+ * lc's domain (a symbol lc's domain lacks matches nothing and is left out);
+ * integers are values.  One pass dedupes, translates and counts, and stops
+ * as soon as the count reaches `limit`: a rejection then costs the keys
+ * looked at, never a heavy group's rows.  Returns the number of keys,
+ * -2 when the limit was reached, -1 when this column cannot be probed (a
+ * SYM null on the right, OOM). */
+static int64_t join_idx_right_keys(ray_t* lc, ray_t* rc, int64_t limit,
+                                   int64_t** keys, ray_t** hdr, int64_t* count) {
+    int64_t n = rc->len;
+    *count = 0;
+    /* distinct through an open-addressed set at most half full: the keys,
+     * the set's values, then one occupancy byte per slot (every int64 is a
+     * possible key: -1 included, so no value can mark an empty slot), in
+     * one zeroed scratch block */
+    uint64_t cap = 16;
+    while (cap < (uint64_t)n * 2) cap <<= 1;
+    size_t nk = (size_t)(n > 0 ? n : 1);
+    int64_t* k = (int64_t*)scratch_calloc(hdr, (nk + cap) * sizeof(int64_t) + cap);
+    if (!k) return -1;
+    int64_t* set = k + nk;
+    uint8_t* used = (uint8_t*)(set + cap);
+    const void* rd = ray_data(rc);
+    struct ray_sym_domain_s* rdom = rc->type == RAY_SYM && ray_sym_vec_domain(rc) != ray_sym_vec_domain(lc)
+                                    ? ray_sym_vec_domain(rc) : NULL;
+    int64_t u = 0, c = 0;
+    for (int64_t r = 0; r < n; r++) {
+        int64_t v;
+        if (rc->type == RAY_SYM) {
+            v = ray_read_sym(rd, r, RAY_SYM, rc->attrs);
+            if (v == 0) { scratch_free(*hdr); *hdr = NULL; return -1; }
+        } else {
+            /* a null matches only a null, which the null-free left lacks */
+            if (ray_raw_is_null(rc->type, rc->attrs, rd, r)) continue;
+            v = read_col_i64(rd, r, rc->type, rc->attrs);
+        }
+        uint64_t s = ray_hash_i64(v) & (cap - 1);
+        bool dup = false;
+        while (used[s]) {
+            if (set[s] == v) { dup = true; break; }
+            s = (s + 1) & (cap - 1);
+        }
+        if (dup) continue;
+        used[s] = 1;
+        set[s] = v;
+        if (rdom) {
+            ray_t* str = ray_sym_domain_str(rdom, v);
+            v = str ? ray_sym_vec_lookup(lc, ray_str_ptr(str), ray_str_len(str)) : -1;
+            if (v <= 0) continue;
+        }
+        int64_t g = ray_index_hash_count(lc, v);
+        if (g < 0) { scratch_free(*hdr); *hdr = NULL; return -1; }
+        c += g;
+        if (c >= limit) { scratch_free(*hdr); *hdr = NULL; *count = c; return -2; }
+        k[u++] = v;
+    }
+    *keys = k;
+    *count = c;
+    return u;
+}
+
+/* Phase 1 of the index path: the key column to probe, or -1.  Reads sizes
+ * and the index's own row and group counts only (an inline payload read,
+ * no call), so a declined join pays a few loads and compares.  `lo` / `ro`
+ * are the tables' own key columns (join_keys_orig: an aligned SYM copy
+ * carries no index).  The caller has already checked the right side's
+ * size against JOIN_IDX_RISK. */
+static inline int32_t join_index_choose(ray_t* const* lo, ray_t* const* ro, uint32_t n_keys,
+                                        int64_t left_rows, int64_t ratio) {
+    if (ray_join_no_index_probe) return -1;
+    int64_t best_est = -1;
+    int32_t best_k = -1;
+    for (uint32_t k = 0; k < n_keys; k++) {
+        ray_t* lc = lo[k];
+        ray_t* rc = ro[k];
+        if (!lc || !rc || RAY_IS_ERR(lc) || RAY_IS_ERR(rc) || ray_is_atom(lc) || ray_is_atom(rc)) continue;
+        /* phase 2 may still reject (a skewed index: its mean underrates a
+         * heavy group), after one lookup per right key at most */
+        if (rc->len * JOIN_IDX_RISK >= left_rows) continue;
+        int64_t irows = 0, igroups = 0;
+        if (lc->len != left_rows || !ray_index_hash_stats(lc, &irows, &igroups)) continue;
+        /* the expected candidates: as many distinct values as the right
+         * side can name, at the index's mean rows per value (integer
+         * arithmetic: vals * irows stays far below 2^63) */
+        int64_t vals = rc->len < igroups ? rc->len : igroups;
+        int64_t est = vals * irows / igroups;
+        /* the selection (each right row sorted and probed) and the
+         * candidates are paid together, against one pass over the left */
+        if (rc->len * JOIN_IDX_SEL_COST + est * ratio >= left_rows) continue;
+        if (lc->type == RAY_SYM) {
+            if (rc->type != RAY_SYM) continue;
+        } else {
+            if (!join_idx_int_type(lc->type) || rc->type != lc->type) continue;
+            if (ray_vec_may_have_nulls(lc)) continue;
+        }
+        if (best_est < 0 || est < best_est) { best_est = est; best_k = (int32_t)k; }
+    }
+    return best_k;
+}
+
+/* Phase 2: the left rows column `best_k`'s index gives for the right
+ * side's values, ascending, into a scratch array (*cand_hdr, *cand), or -1
+ * when the exact count says the path is not cheaper (nothing is then
+ * allocated). */
+static __attribute__((noinline))
+int64_t join_index_candidates(ray_t* const* lo, ray_t* const* ro, uint32_t best_k,
+                              int64_t left_rows, int64_t ratio,
+                              ray_t** cand_hdr, int64_t** cand) {
+    *cand_hdr = NULL; *cand = NULL;
+    /* Phase 2, the chosen column only: its distinct right values and their
+     * exact row count from the index (bounded by phase 1's size gate). */
+    ray_t* best_hdr = NULL;
+    int64_t* best_keys = NULL;
+    /* the rule, as a candidate budget known before any key is looked at:
+     * right rows * JOIN_IDX_SEL_COST + candidates * ratio < left rows */
+    int64_t room = left_rows - ro[best_k]->len * JOIN_IDX_SEL_COST;
+    int64_t limit = room > 0 ? (room + ratio - 1) / ratio : 0;
+    int64_t best_c = 0;
+    int64_t best_n = join_idx_right_keys(lo[best_k], ro[best_k], limit, &best_keys, &best_hdr, &best_c);
+    if (best_n < 0) return -1;
+    int64_t* out = (int64_t*)scratch_alloc(cand_hdr, (size_t)(best_c > 0 ? best_c : 1) * sizeof(int64_t));
+    if (!out) { scratch_free(best_hdr); return -1; }
+    ray_t* lc = lo[best_k];
+    ray_t* hold = NULL;
+    int64_t m = 0, groups = 0;
+    for (int64_t i = 0; i < best_n; i++) {
+        ray_idx_rows_t rows; int64_t n = 0;
+        int hit = ray_index_hash_group(lc, best_keys[i], &rows, &n, &hold);
+        if (hit < 0 || m + n > best_c) { m = -1; break; }
+        for (int64_t j = 0; j < n; j++) out[m + j] = ray_idx_rows_at(rows, j);
+        m += n;
+        if (n) groups++;
+    }
+    if (hold) ray_release(hold);
+    scratch_free(best_hdr);
+    if (m < 0) { scratch_free(*cand_hdr); *cand_hdr = NULL; return -1; }
+    /* each group's rows ascend; several groups are merged without a
+     * comparison sort: an insertion sort for a handful, a bitmap over the
+     * left rows when its pass costs little against m, else an LSD radix
+     * sort on three 11-bit digits: 33 bits, and both callers refuse a
+     * side of more than INT32_MAX rows ("nyi") before getting here */
+    if (groups > 1) {
+        if (m <= 32) {
+            for (int64_t i = 1; i < m; i++) {
+                int64_t x = out[i], j = i;
+                while (j > 0 && out[j - 1] > x) { out[j] = out[j - 1]; j--; }
+                out[j] = x;
+            }
+        } else if ((left_rows + 63) / 64 > m * 8) {
+            ray_t* tmp_hdr = NULL;
+            int64_t* tmp = (int64_t*)scratch_alloc(&tmp_hdr, (size_t)m * sizeof(int64_t));
+            if (!tmp) { scratch_free(*cand_hdr); *cand_hdr = NULL; return -1; }
+            int64_t* src = out;
+            int64_t* dst = tmp;
+            for (int sh = 0; sh < 33; sh += 11) {
+                uint32_t cnt[2048] = { 0 };
+                for (int64_t i = 0; i < m; i++) cnt[(src[i] >> sh) & 2047]++;
+                uint32_t acc = 0;
+                for (int b = 0; b < 2048; b++) { uint32_t c = cnt[b]; cnt[b] = acc; acc += c; }
+                for (int64_t i = 0; i < m; i++) dst[cnt[(src[i] >> sh) & 2047]++] = src[i];
+                int64_t* t = src; src = dst; dst = t;
+            }
+            if (src != out) memcpy(out, src, (size_t)m * sizeof(int64_t));
+            scratch_free(tmp_hdr);
+        } else {
+            ray_t* bm_hdr = NULL;
+            uint64_t* bm = (uint64_t*)scratch_calloc(&bm_hdr, (size_t)((left_rows + 63) / 64) * sizeof(uint64_t));
+            if (!bm) { scratch_free(*cand_hdr); *cand_hdr = NULL; return -1; }
+            for (int64_t i = 0; i < m; i++) bm[out[i] >> 6] |= 1ull << (out[i] & 63);
+            int64_t w = 0;
+            for (int64_t b = 0; b < (left_rows + 63) / 64; b++)
+                for (uint64_t x = bm[b]; x; x &= x - 1)
+                    out[w++] = b * 64 + __builtin_ctzll(x);
+            scratch_free(bm_hdr);
+        }
+    }
+    ray_join_index_probes++;
+    ray_idx_note_use(lc);
+    *cand = out;
+    return m;
+}
+
 /* ── #595: right-side key bitmap prefilter ────────────────────────────────
  * One bitmap per chosen key column, over the right side's values of that
  * column.  A left row whose value's bit is clear in ANY chosen bitmap
@@ -1401,6 +1656,10 @@ typedef struct {
      * place of hash_row_keys / join_keys_eq (NULL otherwise). */
     const int64_t* l64;
     const int64_t* r64;
+    /* #595 step 3: the left rows to probe, ascending (join_index_candidates),
+     * n_cand of them; the morsels then cover their positions */
+    const int64_t* cand;
+    int64_t        n_cand;
 } join_probe_ctx_t;
 
 static inline bool join_i64_key_type(int8_t t) {
@@ -1419,13 +1678,15 @@ static inline bool join_probe_eq(const join_probe_ctx_t* c, int64_t l, int64_t r
 }
 
 /* Pass 2a: count matches per morsel */
-RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64) {
+RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64, bool use_cand) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
     int64_t row_start = (int64_t)tid * JOIN_MORSEL;
     int64_t row_end = row_start + JOIN_MORSEL;
-    if (row_end > c->left_rows) row_end = c->left_rows;
+    int64_t lim = use_cand ? c->n_cand : c->left_rows;
+    if (row_end > lim) row_end = lim;
+    const int64_t* cand = c->cand;
 
     const join_pf_col_t* pf = c->pf;
     uint32_t n_pf = c->n_pf;
@@ -1437,16 +1698,17 @@ RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int
     int64_t count = 0;
     int64_t skipped = 0;
     uint32_t ht_mask = c->ht_cap - 1;
-    for (int64_t l = row_start; l < row_end; l++) {
+    for (int64_t i = row_start; i < row_end; i++) {
+        int64_t l = use_cand ? cand[i] : i;
         /* #595: no right row holds this key value, skip the probe */
-        if (JOIN_PF_REJECT(l)) {
+        if (!use_cand && JOIN_PF_REJECT(l)) {
             skipped++;
             if (c->join_type >= 1) count++;  /* LEFT/FULL: emit unmatched */
             continue;
         }
 
-        if (prefetch_heads && l + 8 < row_end) {
-            uint64_t pf_h = join_probe_hash(c, l + 8);
+        if (prefetch_heads && i + 8 < row_end) {
+            uint64_t pf_h = join_probe_hash(c, use_cand ? cand[i + 8] : l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
         uint64_t h = join_probe_hash(c, l);
@@ -1468,26 +1730,31 @@ RAY_INLINE void join_count_rows(void* raw, uint32_t wid, int64_t task_start, int
 
 /* Compile both modes from one body; select once per pass, not per row. */
 static void join_count_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, true, false);
+    join_count_rows(raw, wid, start, end, true, false, false);
 }
 static void join_count_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, false, false);
+    join_count_rows(raw, wid, start, end, false, false, false);
 }
 static void join_count_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, true, true);
+    join_count_rows(raw, wid, start, end, true, true, false);
 }
 static void join_count_tiny_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_count_rows(raw, wid, start, end, false, true);
+    join_count_rows(raw, wid, start, end, false, true, false);
+}
+static void join_count_cand_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_count_rows(raw, wid, start, end, true, false, true);
 }
 
 /* Pass 2b: fill match pairs using pre-computed offsets */
-RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64) {
+RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int64_t task_end, bool prefetch_heads, bool single64, bool use_cand) {
     (void)wid; (void)task_end;
     join_probe_ctx_t* c = (join_probe_ctx_t*)raw;
     uint32_t tid = (uint32_t)task_start;
     int64_t row_start = (int64_t)tid * JOIN_MORSEL;
     int64_t row_end = row_start + JOIN_MORSEL;
-    if (row_end > c->left_rows) row_end = c->left_rows;
+    int64_t lim = use_cand ? c->n_cand : c->left_rows;
+    if (row_end > lim) row_end = lim;
+    const int64_t* cand = c->cand;
 
     int64_t off = c->morsel_offsets[tid];
     int64_t* restrict li = c->l_idx;
@@ -1501,9 +1768,10 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
     uint64_t span64 = single64 ? pf[0].span : 0;
 
     uint32_t ht_mask = c->ht_cap - 1;
-    for (int64_t l = row_start; l < row_end; l++) {
+    for (int64_t i = row_start; i < row_end; i++) {
+        int64_t l = use_cand ? cand[i] : i;
         /* #595: the same test as the count pass, so offsets line up */
-        if (JOIN_PF_REJECT(l)) {
+        if (!use_cand && JOIN_PF_REJECT(l)) {
             if (c->join_type >= 1) {
                 li[off] = l;
                 ri[off] = -1;
@@ -1512,8 +1780,8 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
             continue;
         }
 
-        if (prefetch_heads && l + 8 < row_end) {
-            uint64_t pf_h = join_probe_hash(c, l + 8);
+        if (prefetch_heads && i + 8 < row_end) {
+            uint64_t pf_h = join_probe_hash(c, use_cand ? cand[i + 8] : l + 8);
             __builtin_prefetch(&c->ht_heads[(uint32_t)(pf_h & ht_mask)], 0, 1);
         }
         uint64_t h = join_probe_hash(c, l);
@@ -1539,16 +1807,19 @@ RAY_INLINE void join_fill_rows(void* raw, uint32_t wid, int64_t task_start, int6
 
 /* Compile both modes from one body; select once per pass, not per row. */
 static void join_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, true, false);
+    join_fill_rows(raw, wid, start, end, true, false, false);
 }
 static void join_fill_tiny_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, false, false);
+    join_fill_rows(raw, wid, start, end, false, false, false);
 }
 static void join_fill_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, true, true);
+    join_fill_rows(raw, wid, start, end, true, true, false);
 }
 static void join_fill_tiny_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    join_fill_rows(raw, wid, start, end, false, true);
+    join_fill_rows(raw, wid, start, end, false, true, false);
+}
+static void join_fill_cand_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    join_fill_rows(raw, wid, start, end, true, false, true);
 }
 
 /* Segment count of a parted table = length of any parted column's segs
@@ -1672,6 +1943,8 @@ static ray_t* exec_join_flat(ray_graph_t* g, ray_op_t* op, ray_t* left_table, ra
     ray_t* matched_right_hdr = NULL;
     join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
     uint32_t n_pf = 0;
+    ray_t* cand_hdr = NULL;
+    int64_t* cand = NULL;
     ray_t* asp_sel = NULL;
     ray_t* ht_next_hdr = NULL;
     ray_t* ht_heads_hdr = NULL;
@@ -2035,7 +2308,22 @@ chained_ht_fallback:;
      * the left side is large enough to amortise the bitmaps (> 2x right).
      * join_pf_choose keeps only bitmaps that reject on a sample of the left
      * side, so a join where most left rows match pays no per-row test. */
-    if ((join_type == 0 || join_type == 1) && !ray_join_no_prefilter &&
+    /* #595 step 3: an inner join whose left key column carries a hash
+     * index probes only the rows the index gives, when that is cheaper
+     * (join_index_candidates); the prefilter is then not built. */
+    /* (the size gate first, inline: a right side this large reads nothing) */
+    int64_t n_cand = -1;
+    if (join_type == 0 && right_rows * JOIN_IDX_RISK < left_rows) {
+        int32_t ik = join_index_choose(join_keys_orig(key_vecs, key_slots, 0),
+                                       join_keys_orig(key_vecs, key_slots, 1),
+                                       n_keys, left_rows, JOIN_IDX_RATIO_JOIN);
+        if (ik >= 0)
+            n_cand = join_index_candidates(join_keys_orig(key_vecs, key_slots, 0),
+                                           join_keys_orig(key_vecs, key_slots, 1),
+                                           (uint32_t)ik, left_rows, JOIN_IDX_RATIO_JOIN,
+                                           &cand_hdr, &cand);
+    }
+    if (n_cand < 0 && (join_type == 0 || join_type == 1) && !ray_join_no_prefilter &&
         left_rows > right_rows * 2) {
         n_pf = join_pf_choose(pf_cols, l_key_vecs, r_key_vecs, n_keys,
                               left_rows, right_rows);
@@ -2043,11 +2331,12 @@ chained_ht_fallback:;
     }
 
     /* Pass 2: Parallel probe (two-pass: count → prefix-sum → fill) */
-    uint32_t n_tasks = (uint32_t)((left_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
+    int64_t iter_rows = n_cand >= 0 ? n_cand : left_rows;
+    uint32_t n_tasks = (uint32_t)((iter_rows + JOIN_MORSEL - 1) / JOIN_MORSEL);
     if (n_tasks == 0) n_tasks = 1;
     /* #599: below the settable floor the morsels run on this thread.  Same
      * morsels either way, so the output and its order do not change. */
-    bool par_probe = pool && n_tasks > 1 && left_rows >= ray_join_par_min();
+    bool par_probe = pool && n_tasks > 1 && iter_rows >= ray_join_par_min();
 
     int64_t* morsel_counts = (int64_t*)scratch_calloc(&counts_hdr,
                               (size_t)(n_tasks + 1) * sizeof(int64_t));
@@ -2055,6 +2344,7 @@ chained_ht_fallback:;
         scratch_free(ht_next_hdr); scratch_free(ht_heads_hdr);
         join_keys_drop(key_vecs_hdr, key_slots);
         for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+        if (cand_hdr) scratch_free(cand_hdr);
         if (asp_sel) ray_release(asp_sel);
         return ray_error("oom", NULL);
     }
@@ -2080,6 +2370,8 @@ chained_ht_fallback:;
         .pf          = pf_cols,
         .n_pf        = n_pf,
         .nullfree    = keys_kf,
+        .cand        = cand,
+        .n_cand      = n_cand,
     };
     if (n_keys == 1 && keys_nullfree && l_key_vecs[0] && r_key_vecs[0] &&
         !ray_is_atom(l_key_vecs[0]) && !ray_is_atom(r_key_vecs[0]) &&
@@ -2092,7 +2384,8 @@ chained_ht_fallback:;
      * Bodies share their implementation; constant modes remove the row-loop
      * capacity decision instead of relying on compiler loop unswitching. */
     bool pf_s64 = join_pf_single64(pf_cols, n_pf);
-    const ray_pool_fn count_probe = ht_cap > JHT_MIN_CAP
+    const ray_pool_fn count_probe = n_cand >= 0 ? join_count_cand_fn
+        : ht_cap > JHT_MIN_CAP
         ? (pf_s64 ? join_count_s64_fn : join_count_fn)
         : (pf_s64 ? join_count_tiny_s64_fn : join_count_tiny_fn);
     /* 2a: Count matches per morsel */
@@ -2124,7 +2417,8 @@ chained_ht_fallback:;
     probe_ctx.r_idx = r_idx;
 
     if (pair_count > 0) {
-        const ray_pool_fn fill_probe = ht_cap > JHT_MIN_CAP
+        const ray_pool_fn fill_probe = n_cand >= 0 ? join_fill_cand_fn
+            : ht_cap > JHT_MIN_CAP
             ? (pf_s64 ? join_fill_s64_fn : join_fill_fn)
             : (pf_s64 ? join_fill_tiny_s64_fn : join_fill_tiny_fn);
         if (par_probe) {
@@ -2438,6 +2732,7 @@ join_cleanup:
     scratch_free(matched_right_hdr);
     join_keys_drop(key_vecs_hdr, key_slots);
     for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+    if (cand_hdr) scratch_free(cand_hdr);
     if (asp_sel) ray_release(asp_sel);
 
     return result;
@@ -2917,6 +3212,19 @@ static void join_mask_s64_fn(void* raw, uint32_t wid, int64_t start, int64_t end
     (void)wid; join_mask_rows(raw, start, end, false, true);
 }
 
+/* #595 step 3: the mask over the index's candidate rows only; every other
+ * left row was set to the miss value up front. */
+typedef struct { const join_mask_ctx_t* m; const int64_t* cand; } join_mask_cand_ctx_t;
+static void join_mask_cand_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
+    (void)wid;
+    const join_mask_cand_ctx_t* cc = (const join_mask_cand_ctx_t*)raw;
+    const join_mask_ctx_t* c = cc->m;
+    for (int64_t i = start; i < end; i++) {
+        int64_t l = cc->cand[i];
+        c->out[l] = join_mask_probe(c, l, hash_row_keys(c->l_key_vecs, c->n_keys, l, c->nullfree));
+    }
+}
+
 /* BOOL vector over left's rows: true where some right row equals it on
  * every key in key_names[0..n_keys) (anti: the negation).  Keys are column
  * names present in both tables (the caller checks).  Flat tables only:
@@ -2961,6 +3269,9 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
     ray_t* ht_heads_hdr = NULL;
     join_pf_col_t pf_cols[JOIN_PF_MAX_CAND];
     uint32_t n_pf = 0;
+    ray_t* cand_hdr = NULL;
+    int64_t* cand = NULL;
+    int64_t n_cand = -1;
 
     if ((err = join_align_sym_keys(key_vecs, key_slots, n_keys)) != NULL) goto out;
     bool keys_nullfree = join_keys_nullfree(l_key_vecs, r_key_vecs, n_keys);
@@ -2989,8 +3300,19 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
         join_build_fn(&bctx, 0, 0, right_rows);
     if (pool_cancelled(pool)) { err = ray_error("cancel", NULL); goto out; }
 
+    /* #595 step 3: the index's candidates, when cheaper (as the join) */
+    if (right_rows * JOIN_IDX_RISK < left_rows) {
+        int32_t ik = join_index_choose(join_keys_orig(key_vecs, key_slots, 0),
+                                       join_keys_orig(key_vecs, key_slots, 1),
+                                       n_keys, left_rows, JOIN_IDX_RATIO_MASK);
+        if (ik >= 0)
+            n_cand = join_index_candidates(join_keys_orig(key_vecs, key_slots, 0),
+                                           join_keys_orig(key_vecs, key_slots, 1),
+                                           (uint32_t)ik, left_rows, JOIN_IDX_RATIO_MASK,
+                                           &cand_hdr, &cand);
+    }
     /* Same gate as the join's Pass 1.5. */
-    if (!ray_join_no_prefilter && left_rows > right_rows * 2) {
+    if (n_cand < 0 && !ray_join_no_prefilter && left_rows > right_rows * 2) {
         n_pf = join_pf_choose(pf_cols, l_key_vecs, r_key_vecs, n_keys,
                               left_rows, right_rows);
         if (n_pf) ray_join_prefilter_builds++;
@@ -3004,17 +3326,29 @@ static ray_t* join_mask_flat(ray_t* left_table, ray_t* right_table,
     };
     /* Lookahead hashing pays only when heads outgrow cache and most rows
      * reach the probe; behind a prefilter the survivors are few. */
-    ray_pool_fn probe = join_pf_single64(pf_cols, n_pf) ? join_mask_s64_fn
-                      : (ht_cap > JHT_MIN_CAP && !n_pf) ? join_mask_fn
-                      : join_mask_tiny_fn;
-    if (pool && left_rows > RAY_PARALLEL_THRESHOLD)
-        ray_pool_dispatch(pool, probe, &mctx, left_rows);
-    else
-        probe(&mctx, 0, 0, left_rows);
+    if (n_cand >= 0) {
+        memset(out, anti, (size_t)left_rows);
+        join_mask_cand_ctx_t cctx = { .m = &mctx, .cand = cand };
+        /* split as soon as there is work to share: the scan this replaces
+         * runs on every worker from its first morsel */
+        if (pool && n_cand >= 4096)
+            ray_pool_dispatch(pool, join_mask_cand_fn, &cctx, n_cand);
+        else
+            join_mask_cand_fn(&cctx, 0, 0, n_cand);
+    } else {
+        ray_pool_fn probe = join_pf_single64(pf_cols, n_pf) ? join_mask_s64_fn
+                          : (ht_cap > JHT_MIN_CAP && !n_pf) ? join_mask_fn
+                          : join_mask_tiny_fn;
+        if (pool && left_rows > RAY_PARALLEL_THRESHOLD)
+            ray_pool_dispatch(pool, probe, &mctx, left_rows);
+        else
+            probe(&mctx, 0, 0, left_rows);
+    }
     if (pool_cancelled(pool)) err = ray_error("cancel", NULL);
 
 out:
     for (uint32_t j = 0; j < n_pf; j++) scratch_free(pf_cols[j].bits_hdr);
+    if (cand_hdr) scratch_free(cand_hdr);
     if (ht_next_hdr) scratch_free(ht_next_hdr);
     if (ht_heads_hdr) scratch_free(ht_heads_hdr);
     join_keys_drop(key_vecs_hdr, key_slots);
