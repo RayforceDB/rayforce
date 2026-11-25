@@ -2830,9 +2830,9 @@ static test_result_t test_direct_cache_replaces_old_blocks(void) {
 }
 
 /* Mapped address space of the process in KB (statm field 1), or 0 where
- * /proc is unavailable. */
+ * /proc is unavailable.  Only the Linux huge-page tests use it. */
+#if defined(RAY_OS_LINUX)
 static size_t heap_vm_kb(void) {
-#if defined(__linux__)
     int fd = open("/proc/self/statm", O_RDONLY);
     if (fd < 0) return 0;
     char buf[128];
@@ -2843,10 +2843,8 @@ static size_t heap_vm_kb(void) {
     unsigned long long pages = strtoull(buf, NULL, 10);
     long pgsz = sysconf(_SC_PAGESIZE);
     return pgsz > 0 ? (size_t)((pages * (unsigned long long)pgsz) / 1024) : 0;
-#else
-    return 0;
-#endif
 }
+#endif
 
 /* A fresh direct block the cache will not keep (over its budget) is mapped
  * 2 MB-aligned for huge pages and is transient (its pages may go ahead of
