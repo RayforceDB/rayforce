@@ -780,19 +780,19 @@
 (type (at (as 'LIST ASF) 1)) -- 'sym
 (at (as 'LIST ASF) 1) -- 'y
 (.sys.exec "rm -rf /tmp/rfl_as_list_fdom/") -- 0
-;; the query form: a cast of a LIST column is the eager cast of the whole
-;; column (#1406), so `as 'LIST` returns the LIST column unchanged, its
-;; cells as they are; a column of atoms is applied per row and rejected
-;; with the same type error as the builtin
+;; the query form: a cast to LIST is a container cast, the eager cast of
+;; the whole column on every route: a LIST column is returned unchanged,
+;; its cells as they are (#1406), and a column of atoms is boxed (#1582)
 (set ASQ (table [c] (list (list [1 2] [3 4 5]))))
 (set ASQR (at (select {r: (as 'LIST c) from: ASQ}) 'r))
 ASQR -- (as 'LIST (at ASQ 'c))
 (type ASQR) -- 'LIST
 (at ASQR 1) -- [3 4 5]
-(select {r: (as 'LIST v) from: (table [v] (list [1 2 3]))}) !- type
-;; the verb decides the evaluation strategy. select evaluates per row, so a
-;; column of atoms is rejected (above); update evaluates the whole column, so
-;; the same expression boxes it into a LIST column of atoms
+(set ASS (at (select {r: (as 'LIST v) from: (table [v] (list [1 2 3]))}) 'r))
+ASS -- (as 'LIST [1 2 3])
+(type ASS) -- 'LIST
+(at (select {r: (as 'LIST v) from: (table [k v] (list [1 1 2] [10 20 30])) where: (> v 15)}) 'r) -- (as 'LIST [20 30])
+;; update boxes the whole column too, into a LIST column of atoms
 (set ASU (update {w: (as 'LIST v) from: (table [k v] (list [1 1 2] [10 20 30]))}))
 (type (at ASU 'w)) -- 'LIST
 (count (at ASU 'w)) -- 3

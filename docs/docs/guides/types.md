@@ -129,12 +129,15 @@ unchanged, and an atom, a dict or a table is a `type` error
 (as 'LIST 1)          ; type error: as: cannot cast i64 to list
 ```
 
-In a query the verb decides how `as 'LIST` is evaluated, so the same
-expression can succeed or fail. With `T: (table [k v] (list [1 1 2] [10 20 30]))`:
+In a query `as 'LIST` is a container cast: it reads the whole column, as the
+eager cast does, on every route. Element-wise builtins work row by row in a
+query; a cast to `LIST` boxes the column instead. With
+`T: (table [k v] (list [1 1 2] [10 20 30]))`:
 
 | Query | Evaluation | Result |
 |---|---|---|
-| `(select {r: (as 'LIST v) from: T})` | per row | `type` error `as: cannot cast i64 to list`, since each cell is an atom |
+| `(select {r: (as 'LIST v) from: T})` | whole column | `r` is a `LIST` column of i64 atoms, `(as 'LIST v)` |
+| `(select {r: (as 'LIST v) from: T where: (> v 15)})` | whole column of the kept rows | `r` holds the atoms `20` and `30` |
 | `(select {r: (as 'LIST v) from: T by: k})` | per group | one `LIST` per group, holding that group's boxed cells |
 | `(update {w: (as 'LIST v) from: T})` | whole column | `w` is a `LIST` column of i64 atoms |
 | `(update {w: (as 'LIST v) from: T where: (> v 15)})` | whole column | `type` error `update: a new column under where: must be a typed vector, got LIST` |

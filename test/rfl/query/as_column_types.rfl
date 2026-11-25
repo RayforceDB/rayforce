@@ -66,11 +66,7 @@
 (set MOff (fn [ri x c] (let rt (at MR ri)) (not (identical (R (format (at rt 0) x c)) (R (format (at rt 1) x c))))))
 ;; the probes whose route differs from eager, as "route target column"
 (set MBad (raze (map (fn [ri] (raze (map (fn [c] (raze (map (fn [x] (if (MOff ri x c) (enlist (format "% % %" ri x c)) (list))) MX))) MC))) (til (count MR)))))
-;; One case still differs, as documented (a design question, #1582): a
-;; select of (as 'LIST c) over a column of atoms is cast per row and refused
-;; (docs: guides/types.md, data-types), where eager boxes the column.  On the
-;; select projection, plain and quoted, with and without where: (routes 0 1
-;; 4 5), for every input but LIST.
-(set MExp (raze (map (fn [ri] (map (fn [c] (format "% LIST %" ri c)) (at MC (til 14)))) [0 1 4 5])))
-(asc (as 'SYM MBad)) -- (asc (as 'SYM MExp))
-(count MBad) -- 56
+;; None differs.  A select of (as 'LIST c) over a column of atoms boxes the
+;; column (the rows a where: keeps), as eager does: a cast to LIST is a
+;; container cast, whole-column on every route (#1582).
+(count MBad) -- 0
