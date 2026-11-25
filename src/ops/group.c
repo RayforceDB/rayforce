@@ -9841,6 +9841,15 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void) {
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter) {
     tl_group_emit_filter = filter;
 }
+static _Thread_local int32_t tl_group_first_seen = -1;
+int32_t ray_group_first_seen_set(int32_t depth) {
+    int32_t prev = tl_group_first_seen;
+    tl_group_first_seen = depth;
+    return prev;
+}
+bool ray_group_first_seen_active(void) {
+    return tl_group_first_seen >= 0 && (!__VM || __VM->eval_depth == tl_group_first_seen);
+}
 ray_group_emit_filter_t ray_group_emit_filter_active(void) {
     ray_group_emit_filter_t f = ray_group_emit_filter_get();
     if (!f.enabled) return f;

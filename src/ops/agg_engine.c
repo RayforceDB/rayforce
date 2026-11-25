@@ -4492,6 +4492,49 @@ static int agg_occ_collect(ray_pool_t* pool, const uint64_t* occ, int64_t slots,
     return ok;
 }
 
+/* Orders n groups, slot[i] with first row first[i], by first row: the
+ * first-seen order the other routes emit (#1664).  First rows are distinct
+ * row ids, so the order is total.  Groups already in that order (keys that
+ * rise with the rows) cost one compare each; otherwise an LSD radix sort on
+ * 11-bit digits of the row id.  False on allocation failure. */
+static bool agg_order_by_first(int64_t* slot, int64_t* first, int64_t n) {
+    int64_t i = 1;
+    while (i < n && first[i - 1] < first[i]) i++;
+    if (i >= n) return true;
+    if (n <= 64) {
+        for (int64_t a = 1; a < n; a++) {
+            int64_t f = first[a], s = slot[a], b = a;
+            for (; b > 0 && first[b - 1] > f; b--) { first[b] = first[b - 1]; slot[b] = slot[b - 1]; }
+            first[b] = f; slot[b] = s;
+        }
+        return true;
+    }
+    int64_t* tf = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    int64_t* ts = ray_alloc_raw((size_t)n * sizeof(int64_t));
+    if (!tf || !ts) { ray_free_raw(tf); ray_free_raw(ts); return false; }
+    uint64_t mx = 0;
+    for (int64_t k = 0; k < n; k++) if ((uint64_t)first[k] > mx) mx = (uint64_t)first[k];
+    int64_t *sf = first, *ss = slot, *df = tf, *ds = ts;
+    for (unsigned shift = 0; shift < 64 && (mx >> shift) != 0; shift += 11) {
+        int64_t cnt[2048] = {0};
+        for (int64_t k = 0; k < n; k++) cnt[((uint64_t)sf[k] >> shift) & 2047]++;
+        int64_t at = 0;
+        for (int d = 0; d < 2048; d++) { int64_t c = cnt[d]; cnt[d] = at; at += c; }
+        for (int64_t k = 0; k < n; k++) {
+            int64_t o = cnt[((uint64_t)sf[k] >> shift) & 2047]++;
+            df[o] = sf[k]; ds[o] = ss[k];
+        }
+        int64_t* t = sf; sf = df; df = t;
+        t = ss; ss = ds; ds = t;
+    }
+    if (sf != first) {
+        memcpy(first, sf, (size_t)n * sizeof(int64_t));
+        memcpy(slot, ss, (size_t)n * sizeof(int64_t));
+    }
+    ray_free_raw(tf); ray_free_raw(ts);
+    return true;
+}
+
 /* Shared output stage. Takes ownership of states/first/occ (occ: a bitmap of
  * the occupied slots that stands in for first; first is then NULL), borrows the
  * prepared aggregate layout and descriptors.  u32c: gstates is a count-only slab
@@ -4514,6 +4557,12 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
     int64_t ng = 0;
     int64_t* occupied_slot = NULL;
     int64_t* first_row_ordered = NULL;
+    /* A sorted grouped select wants the groups in first-seen order: its
+     * stable sort gives a tie to the group seen first (#1664).  Task-local
+     * slabs keep a true first row per slot, which orders the slots below.
+     * The shared and partitioned slabs keep none: their groups stay in slot
+     * order (#1678 tracks that gap). */
+    bool first_seen = group_limit <= 0 && gfirst && !key_plan && ray_group_first_seen_active();
     /* A first-row array of a key-planned output (the keys are rebuilt from
      * the slots, the array only says which are occupied): its occupancy as
      * a bitmap, so the selection and the collection below walk the words on
@@ -4687,6 +4736,16 @@ static ray_t* agg_dense_finish(ray_t** key_cols, int64_t* key_syms, ray_op_ext_t
         }
         ray_free_raw(keep);
         ray_profile_tick("dense: selected top-N groups");
+    }
+
+    /* First-seen order, after the top-N cut (which keeps the threshold's
+     * ties, so the order only has to rank what it kept). */
+    if (first_seen && first_row_ordered && ng > 1 &&
+        !agg_order_by_first(occupied_slot, first_row_ordered, ng)) {
+        ray_free_raw(occupied_slot); ray_free_raw(first_row_ordered);
+        agg_dense_slab_destroy_states(gstates, total_slots, vts, off, block, n_aggs);
+        ray_free_raw(gstates); ray_free_raw(gfirst); ray_free_raw((void*)occ);
+        return ray_error("oom", NULL);
     }
 
 emit:

@@ -2389,6 +2389,14 @@ ray_group_emit_filter_t ray_group_emit_filter_get(void);
  * depth (or no VM is bound); a disabled filter otherwise. */
 ray_group_emit_filter_t ray_group_emit_filter_active(void);
 void ray_group_emit_filter_set(ray_group_emit_filter_t filter);
+/* A grouped select that sorts its groups (asc:/desc:) arms this for its own
+ * group node: the sort is stable and the group whose first source row comes
+ * first wins a tie, so its input must come in first-seen order on every route
+ * (#1664).  The dense slot routes emit slot (key value) order otherwise.  The
+ * depth is the select's eval depth; -1 disarms.  Returns the previous depth. */
+int32_t ray_group_first_seen_set(int32_t depth);
+/* Whether the calling thread's eval depth is the armed depth. */
+bool ray_group_first_seen_active(void);
 /* Hash-aggregate rows [start, end) into ht.
  *
  * When match_idx is non-NULL, the loop iterates `i` in [start, end)
