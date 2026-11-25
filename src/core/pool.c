@@ -22,6 +22,8 @@
  */
 
 #include "core/pool.h"
+extern _Atomic(uint64_t) g_pool_windows;
+extern _Atomic(int32_t) g_pool_windows_armed;
 #include "core/platform.h"   /* RAY_CPU_RELAX */
 #include "core/qstats.h"     /* per-worker query-stats slab */
 #include "mem/cow.h"
@@ -490,6 +492,16 @@ static void pool_trace_dump(const ray_pool_t* pool) {
 static RAY_TLS bool t_pool_worker = false;
 bool ray_pool_on_worker(void) { return t_pool_worker; }
 
+/* Windows that woke at least one worker, counted only while a pmap probe
+ * is timing its first calls (armed, #1248): pmap asks whether those calls
+ * used the pool themselves.  Other dispatches pay a plain load. */
+_Atomic(uint64_t) g_pool_windows;
+_Atomic(int32_t) g_pool_windows_armed;
+uint64_t ray_pool_windows(void) { return atomic_load_explicit(&g_pool_windows, memory_order_relaxed); }
+void ray_pool_windows_arm(bool on) {
+    atomic_fetch_add_explicit(&g_pool_windows_armed, on ? 1 : -1, memory_order_relaxed);
+}
+
 static void worker_loop(void* arg) {
     worker_ctx_t wctx = *(worker_ctx_t*)arg;
     t_pool_worker = true;
@@ -900,6 +912,8 @@ static void pool_run_window(ray_pool_t* pool, uint64_t base, uint32_t n_tasks, b
      * signal count, so an unsignalled worker simply stays asleep. */
     uint32_t wake = n_tasks > 0 ? n_tasks - 1 : 0;
     if (wake > pool->n_workers) wake = pool->n_workers;
+    if (RAY_UNLIKELY(atomic_load_explicit(&g_pool_windows_armed, memory_order_relaxed)) && wake)
+        atomic_fetch_add_explicit(&g_pool_windows, 1, memory_order_relaxed);
     for (uint32_t i = 0; i < wake; i++) {
         ray_sem_signal(&pool->work_ready);
     }
@@ -979,9 +993,26 @@ static void dispatch_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
  * TASK_GRAIN for ray_pool_dispatch): callers index per-task state by
  * start / grain (fused WHERE rowsel builders, per-task histograms) and rely
  * on grain-aligned starts. */
+/* A dispatch made while another is in flight: from a task, on a worker
+ * or on the dispatching thread (a lambda pmap runs calls a builtin that
+ * dispatches, #1248).  The ring has one producer, so such a dispatch runs
+ * its tasks here, in order, as worker 0 of its own; callers that pick a
+ * parallel algorithm ask ray_pool_par_dispatch_ok first and never get
+ * here. */
+static inline bool pool_nested(void) {
+    return atomic_load_explicit(&ray_parallel_flag, memory_order_acquire) != 0;
+}
+
 static void pool_dispatch_at(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                              int64_t total_elems, int64_t grain) {
     if (total_elems <= 0) return;
+    if (RAY_UNLIKELY(pool_nested())) {
+        for (int64_t s0 = 0; s0 < total_elems; s0 += grain) {
+            if (atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) return;
+            fn(ctx, 0, s0, total_elems - s0 < grain ? total_elems : s0 + grain);
+        }
+        return;
+    }
     pool_test_cancel_tick(pool);
 
     /* Calculate number of tasks.
@@ -1063,6 +1094,13 @@ static void dispatch_n_round(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
 void ray_pool_dispatch_n(ray_pool_t* pool, ray_pool_fn fn, void* ctx,
                          uint32_t n_tasks) {
     if (n_tasks == 0) return;
+    if (RAY_UNLIKELY(pool_nested())) {   /* see pool_dispatch_at */
+        for (uint32_t i = 0; i < n_tasks; i++) {
+            if (atomic_load_explicit(&pool->cancelled, memory_order_relaxed)) return;
+            fn(ctx, 0, i, i + 1);
+        }
+        return;
+    }
     pool_test_cancel_tick(pool);
 
     pool_ring_grow(pool, (int64_t)n_tasks);

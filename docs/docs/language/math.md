@@ -1005,27 +1005,94 @@ Keep elements of `vec` where the boolean `mask` is true.
 
 ### `(pmap f x)`
 
-Currently a **sequential alias for `map`**: it calls the function for each
-input element in order on the calling thread's VM and returns the same result as
-`map`. A larger input or a larger `-c` setting does not distribute these callback
-invocations across workers. The name can signal intent, but does not currently
-provide parallel lambda evaluation.
+`map` with its calls run in parallel on the thread pool's workers when that is
+safe and worth it. It takes the same forms as `map`: `(pmap f x)` or
+`(pmap f val x)`, and `domain` for any other number of arguments. It returns
+the value `map` returns, of the same type and in the input's order, and the
+error `map` reports.
 
 ```lisp
-(pmap (fn [x] (* x x)) [1 2 3])  ; [1 4 9], evaluated sequentially
+(set B (til 3000))
+(set heavy (fn [x] (count (distinct (% (* B 7) (+ 1 (% x 97)))))))
+(pmap heavy (til 10000))         ; heavy's calls spread over the workers
+(pmap (fn [x] (* x x)) [1 2 3])  ; [1 4 9]: too cheap to dispatch, runs as map
 (pmap + 100 [1 2 3])             ; [101 102 103]
 ```
 
-It takes the same forms as `map`: exactly 2 or 3 arguments (`(pmap f x)` or
-`(pmap f val x)`), and `domain` otherwise.
+The calls run on the workers only when the function is proven pure, so the
+order the calls run in cannot be seen. The proof judges the functions a call
+will reach, not the names written in the body. A builtin is recognized by its
+own registered name, whatever names it is bound to now: with `reverse` bound
+to `rand`, a call of `reverse` is a call of `rand`. A lambda that was already
+compiled is judged by what its compiled code holds: a builtin the compiler
+baked in stays the function it was then, and a name resolved at call time is
+judged by its binding when `pmap` is called. The proof is taken at every call,
+so a rebinding between two calls is seen. A function is proven pure when it
+is:
 
-Eligible vector builtins and query operators can use the morsel-driven thread
-pool **inside** a callback; that is separate from scheduling callbacks in
-parallel. Eligibility, input-size thresholds and worker availability depend on
-the operator; a large vector alone is not a guarantee of parallel execution.
-See [Thread Pool](../architecture/pipeline.md#thread-pool). For independent
-Rayfall task sweeps today, use separate processes and budget their workers as
-described in [Multiple Instances](../guides/instances.md).
+- A builtin that is deterministic, has no effect, reads nothing but its
+  arguments and never calls back into user code: arithmetic and comparisons,
+  aggregates (`sum`, `avg`, `min`, `max`, `count`, ...), the string verbs
+  (`upper`, `lower`, `trim`, `like`, ...), the collection verbs (`til`, `take`,
+  `drop`, `distinct`, `asc`, `in`, `where`, `group`, `at`, ...) and the casts
+  the query planner lowers.
+- A lambda whose body is built only from such calls, its parameters, its
+  captures, `let` locals, literals and global data, with the forms `if`, `do`,
+  `let`, `and`, `or`, `cond` and `quote`.
+
+Anything else runs as `map` does, on the calling thread, in order. That includes
+a body that uses `set`, prints, does I/O, calls `rand`, `eval` or a dotted
+(`.sys`, `.ipc`, `.db`, ...) builtin, calls a user function, a local or a lambda
+literal, or is a trusted (`.sys.trust`) lambda. It also includes any call
+inside a `select`, inside another `pmap`'s calls, under `.sys.profile` or the
+query profiler, and on a pool with no workers (`-c 1`).
+
+**Choosing the route.** `pmap` decides between running the rest of the calls on
+the workers and running them on the calling thread, as `map` does, from a
+timing probe of its first calls. The route therefore depends on time, and the
+same input can run sequentially on one call and in parallel on another. The
+results, the errors and the effects never differ between the two routes: only a
+function proven pure is ever run on the workers.
+
+- An input of fewer than 16 elements runs as `map` outright, with no probe.
+- Otherwise the calls start on the calling thread, in `map`'s own loop. The clock
+  is read after 1, 2, 4, 8, … calls. The first call is not counted: it pays for
+  cold caches and page faults. Each later reading closes a window of calls, and a
+  call's cost is the lower of the last two windows' per-call times. One window
+  stretched by a stall or a clock jump therefore cannot make cheap calls look
+  heavy. A clock that does not move forwards ends the probe, and the calls stay
+  on the calling thread.
+- After the windows cover about 100 µs, the rest go to the workers only when:
+  - one call costs at least about 4 µs;
+  - the remaining calls would take at least about 1 ms;
+  - the probed calls did not use the thread pool themselves.
+- A body that uses the pool itself (one over large vectors, whose kernels already
+  run on the workers) stays on the calling thread. Running several such calls at
+  once would give up that parallelism, and it would hold several large vectors at
+  once instead of one that the caches hold.
+- Each worker evaluates its share on a VM of its own, with the caller's `-U`
+  restriction. Builtins inside a call that would use the pool run inline on that
+  worker. The workers take the calls in chunks of about 50 µs each at the
+  probe's estimate.
+- The workers time their own calls. Once a worker's last 8 calls average under
+  an eighth of the probe's estimate and under about 4 µs, no more calls go to
+  the workers, and the rest run on the calling thread as in `map`.
+
+When the probe is right, `pmap` costs at most what `map` costs plus the probe:
+a few clock reads, plus the calls made before the decision, which `map` makes
+anyway. A probe on the first calls can be wrong when later calls are much
+cheaper, for example after a few heavy elements. A cheap call costs more on a
+worker than on the calling thread, because the calls share the function's
+objects across cores. In that case the workers stop after a few calls each, and
+the wrong dispatch costs those calls plus waking the pool. The workers judge by
+their own timings, and those include that sharing cost. So a tail that still
+measures above the cutoff on the workers keeps running there.
+
+An error at one element stops the workers from starting later elements. The
+first element left without a value is then evaluated again on the calling
+thread, and the rest follow there in order, as in `map`. So the error you get,
+with its source position, is the one `map` gives, from the lowest failing
+element. An interrupt also ends as it does in `map`.
 
 ## Quick Reference Table
 

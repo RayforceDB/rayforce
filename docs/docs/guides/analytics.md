@@ -366,7 +366,7 @@ Null literals are type-suffixed: `0Nl` (i64), `0Nf` (f64), `0Nd` (date), `0Nt` (
 
         This small example may run serially. See [Thread Pool](../architecture/pipeline.md#thread-pool) for the distinction between kernel parallelism and language evaluation.
 
-    - **Do not use `pmap` as a parallel task scheduler.** It is currently a sequential alias for `map`, including for large inputs and expensive lambdas. Builtins inside a callback may use workers independently, but the callback invocations themselves remain sequential. For independent backtest configurations or other Rayfall task sweeps, use separate processes with an explicit per-process worker budget; see [Multiple Instances](instances.md).
+    - **`pmap` parallelizes pure callbacks only.** It runs a lambda's calls on the pool's workers when the body is proven pure (pure builtins, its own locals, data) and each call is worth a dispatch; anything with an effect, a user function call or I/O runs as `map`, in order (see [`pmap`](../language/math.md#pmap-f-x)). For independent backtest configurations that call user functions or write results, use separate processes with an explicit per-process worker budget; see [Multiple Instances](instances.md).
 
 ## 11. Linear Regression { #linear-regression }
 

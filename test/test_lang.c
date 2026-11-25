@@ -1737,6 +1737,249 @@ static test_result_t test_eval_pmap(void) {
     PASS();
 }
 
+/* pmap (#1248): a pure body worth a dispatch runs on the pool's workers
+ * (the test hook counts the elements they made) and answers as map; a body
+ * not proven pure (set, a user function, rand) never reaches them; an
+ * error is map's, message included; a body whose builtins dispatch to the
+ * pool themselves (til) runs them inline on the worker. */
+static ray_t* pm_eval(const char* q) { return ray_eval_str(q); }
+static bool pm_same(const char* a, const char* b) {
+    char q[1024];
+    snprintf(q, sizeof q, "(identical %s %s)", a, b);
+    ray_t* r = pm_eval(q);
+    bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return ok;
+}
+static test_result_t test_pmap_parallel(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("no pool workers");
+    ray_t* r = pm_eval("(do (set B (til 3000)) (set N (til 4000)) "
+                       "(set heavy (fn [x] (count (distinct (% (* B 7) (+ 1 (% x 97))))))) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+
+    int64_t c0 = ray_pmap_test_parallel_elems();
+    TEST_ASSERT_TRUE(pm_same("(pmap heavy N)", "(map heavy N)"));
+    TEST_ASSERT_TRUE(ray_pmap_test_parallel_elems() > c0);
+
+    /* not proven pure: no element reaches a worker */
+    const char* impure[] = {
+        "(do (set acc 0) (pmap (fn [x] (do (set acc (+ acc 1)) (heavy x))) N))",
+        "(pmap (fn [x] (heavy x)) N)",
+        "(pmap (fn [x] (+ (heavy x) (rand 1 1))) N)",
+        "(pmap (fn [x] ((fn [y] (heavy y)) x)) N)",
+    };
+    for (size_t k = 0; k < sizeof impure / sizeof *impure; k++) {
+        int64_t c1 = ray_pmap_test_parallel_elems();
+        r = pm_eval(impure[k]);
+        TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r));
+        ray_release(r);
+        TEST_ASSERT_FMT(ray_pmap_test_parallel_elems() == c1, "case %zu ran on the workers", k);
+    }
+    r = pm_eval("acc");
+    TEST_ASSERT_TRUE(r && r->type == -RAY_I64 && r->i64 == 4000);
+    ray_release(r);
+
+    /* the error at the lowest failing element, as map reports it */
+    r = pm_eval("(set bad (fn [x] (if (> x 2500) (+ x 'a) (count (distinct (% (* B 7) (+ 1 (% x 97))))))))");
+    ray_release(r);
+    ray_t* em = pm_eval("(map bad N)");
+    int64_t c2 = ray_pmap_test_parallel_elems();
+    ray_t* ep = pm_eval("(pmap bad N)");
+    TEST_ASSERT_TRUE(ray_pmap_test_parallel_elems() > c2);
+    TEST_ASSERT_TRUE(em && RAY_IS_ERR(em) && ep && RAY_IS_ERR(ep));
+    TEST_ASSERT_STR_EQ(ray_err_code(ep), ray_err_code(em));
+    TEST_ASSERT_TRUE(ray_err_msg(em) && ray_err_msg(ep));
+    TEST_ASSERT_STR_EQ(ray_err_msg(ep), ray_err_msg(em));
+    ray_error_free(em); ray_error_free(ep);
+
+    /* a body whose timed calls dispatch to the pool themselves stays on
+     * the calling thread: its kernels already use the workers (review of
+     * #1728: 128 x (sum (til 3000000)) ran 2.8x slower dispatched) */
+    int64_t c3 = ray_pmap_test_parallel_elems();
+    TEST_ASSERT_TRUE(pm_same("(pmap (fn [x] (sum (til (+ 3000000 x)))) (til 64))",
+                             "(map (fn [x] (sum (til (+ 3000000 x)))) (til 64))"));
+    TEST_ASSERT_EQ_I(ray_pmap_test_parallel_elems(), c3);
+    /* builtins that dispatch themselves, met on a worker (the timed calls
+     * did not dispatch): they run there inline */
+    c3 = ray_pmap_test_parallel_elems();
+    TEST_ASSERT_TRUE(pm_same("(pmap (fn [x] (if (< x 40) (count (distinct (% (* B 7) (+ 1 x)))) (sum (til (+ 200000 x))))) (til 200))",
+                             "(map (fn [x] (if (< x 40) (count (distinct (% (* B 7) (+ 1 x)))) (sum (til (+ 200000 x))))) (til 200))"));
+    TEST_ASSERT_TRUE(ray_pmap_test_parallel_elems() > c3);
+
+    /* under -U the same pure body still runs on the workers */
+    ray_eval_set_restricted(true);
+    int64_t c4 = ray_pmap_test_parallel_elems();
+    r = pm_eval("(pmap heavy N)");
+    ray_eval_set_restricted(false);
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r) && ray_len(r) == 4000);
+    ray_release(r);
+    TEST_ASSERT_TRUE(ray_pmap_test_parallel_elems() > c4);
+    PASS();
+}
+
+/* The probe's clock (review of #1728): scripted readings decide the route
+ * for a cheap body alone.  The first call is never measured; a window one
+ * stall stretched is outvoted by the next; a clock that does not move on
+ * keeps map's path; steady readings of a heavy call dispatch.  The answer
+ * is map's on every route. */
+static const int64_t* g_pm_script;
+static int g_pm_at, g_pm_n;
+static int64_t pm_script_clock(void) {
+    int64_t v = g_pm_script[g_pm_at < g_pm_n ? g_pm_at : g_pm_n - 1];
+    if (g_pm_at < g_pm_n) g_pm_at++;
+    else v += (int64_t)(g_pm_at++ - g_pm_n + 1) * 1000000;   /* steady past the script */
+    return v;
+}
+static bool pm_route(const int64_t* script, int n, bool* parallel) {
+    g_pm_script = script; g_pm_at = 0; g_pm_n = n;
+    ray_pmap_test_clock(pm_script_clock);
+    int64_t c = ray_pmap_test_parallel_elems();
+    bool same = pm_same("(pmap (fn [x] (+ x 1)) (til 4000))", "(map (fn [x] (+ x 1)) (til 4000))");
+    ray_pmap_test_clock(NULL);
+    *parallel = ray_pmap_test_parallel_elems() > c;
+    return same;
+}
+static test_result_t test_pmap_probe_clock(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("no pool workers");
+    bool par;
+    /* readings after 1, 2, 4, 8, 16 calls: 10 us a call, steady: dispatched */
+    static const int64_t steady[] = { 0, 10000, 30000, 70000, 150000, 310000 };
+    TEST_ASSERT_TRUE(pm_route(steady, 6, &par));
+    TEST_ASSERT_TRUE(par);
+    /* one window stretched by a second (a stall, a jump), then 50 ns a
+     * call: the cheaper window decides, map's path */
+    static const int64_t spike[] = { 0, 1000000000, 1000000100, 1000000300, 1000000700 };
+    TEST_ASSERT_TRUE(pm_route(spike, 5, &par));
+    TEST_ASSERT_FALSE(par);
+    /* the clock going backwards, or standing still: map's path */
+    static const int64_t back[] = { 0, -5000 };
+    TEST_ASSERT_TRUE(pm_route(back, 2, &par));
+    TEST_ASSERT_FALSE(par);
+    static const int64_t still[] = { 1000, 1000 };
+    TEST_ASSERT_TRUE(pm_route(still, 2, &par));
+    TEST_ASSERT_FALSE(par);
+    PASS();
+}
+
+/* A dispatch the probe was wrong about (review of #1728): heavy calls
+ * timed, the dispatched ones far cheaper.  Each worker judges its last
+ * calls; once they run under an eighth of the probe's estimate no chunk
+ * more is taken, and the rest are map's on the calling thread.  The
+ * workers' clock is scripted: a tick per reading (cheap calls) or a
+ * millisecond (heavy ones).  Values and errors are map's either way. */
+static _Atomic(int64_t) g_pm_tick, g_pm_step;
+static int64_t pm_task_clock(void) {
+    return atomic_fetch_add(&g_pm_tick, atomic_load(&g_pm_step));
+}
+static int64_t pm_dispatched(const char* pq, const char* mq, int64_t step, bool* same) {
+    static const int64_t steady[] = { 0, 10000, 30000, 70000, 150000, 310000 };
+    g_pm_script = steady; g_pm_at = 0; g_pm_n = 6;
+    atomic_store(&g_pm_step, step);
+    ray_pmap_test_clock(pm_script_clock);
+    ray_pmap_test_task_clock(pm_task_clock);
+    int64_t c = ray_pmap_test_parallel_elems();
+    *same = pm_same(pq, mq);
+    ray_pmap_test_clock(NULL);
+    ray_pmap_test_task_clock(NULL);
+    return ray_pmap_test_parallel_elems() - c;
+}
+static test_result_t test_pmap_cheap_after_dispatch(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("no pool workers");
+    int64_t w = (int64_t)ray_pool_total_workers(pool);
+    bool same;
+    /* heavy on the workers too: every element after the probe's 16 */
+    int64_t d = pm_dispatched("(pmap (fn [x] (+ x 1)) (til 4000))",
+                              "(map (fn [x] (+ x 1)) (til 4000))", 1000000, &same);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_EQ_I(d, 4000 - 16);
+    /* cheap there: each worker stops after its first window (8 calls,
+     * chunks of 5 at the probe's 10 us) */
+    d = pm_dispatched("(pmap (fn [x] (+ x 1)) (til 4000))",
+                      "(map (fn [x] (+ x 1)) (til 4000))", 1, &same);
+    TEST_ASSERT_TRUE(same);
+    TEST_ASSERT_TRUE(d > 0 && d <= w * 10);
+    /* an error past the workers' stop is map's, made on the calling thread */
+    ray_t* em = pm_eval("(map (fn [x] (if (> x 3000) (+ x 'a) (+ x 1))) (til 4000))");
+    g_pm_script = (const int64_t[]){ 0, 10000, 30000, 70000, 150000, 310000 };
+    g_pm_at = 0; g_pm_n = 6;
+    atomic_store(&g_pm_step, 1);
+    ray_pmap_test_clock(pm_script_clock);
+    ray_pmap_test_task_clock(pm_task_clock);
+    int64_t c = ray_pmap_test_parallel_elems();
+    ray_t* ep = pm_eval("(pmap (fn [x] (if (> x 3000) (+ x 'a) (+ x 1))) (til 4000))");
+    ray_pmap_test_clock(NULL);
+    ray_pmap_test_task_clock(NULL);
+    d = ray_pmap_test_parallel_elems() - c;
+    TEST_ASSERT_TRUE(d > 0 && d <= w * 10);
+    TEST_ASSERT_TRUE(em && RAY_IS_ERR(em) && ep && RAY_IS_ERR(ep));
+    TEST_ASSERT_STR_EQ(ray_err_code(ep), ray_err_code(em));
+    TEST_ASSERT_TRUE(ray_err_msg(em) && ray_err_msg(ep));
+    TEST_ASSERT_STR_EQ(ray_err_msg(ep), ray_err_msg(em));
+    ray_error_free(em); ray_error_free(ep);
+    PASS();
+}
+
+/* The proof judges the functions a call reaches, not names (review of
+ * #1728): a builtin rebound under a pure builtin's name is the builtin it
+ * is; a lambda compiled while a name meant an effectful builtin keeps
+ * calling it after the name is restored; a name resolved at call time is
+ * judged by its binding at each pmap; fewer than 16 elements are map's
+ * call outright. */
+static bool pm_ran_parallel(const char* q) {
+    int64_t c = ray_pmap_test_parallel_elems();
+    ray_t* r = pm_eval(q);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return ok && ray_pmap_test_parallel_elems() > c;
+}
+static bool pm_ran_here(const char* q) {
+    int64_t c = ray_pmap_test_parallel_elems();
+    ray_t* r = pm_eval(q);
+    bool ok = r && !RAY_IS_ERR(r);
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return ok && ray_pmap_test_parallel_elems() == c;
+}
+static test_result_t test_pmap_proof_identity(void) {
+    ray_pool_t* pool = ray_pool_get();
+    if (!pool || pool->n_workers == 0) SKIP("no pool workers");
+    ray_t* r = pm_eval("(do (set orig_reverse reverse) (set orig_concat concat) (set orig_plus +) "
+                       "(set N (til 1024)) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    /* the control: pure, dispatched */
+    TEST_ASSERT_TRUE(pm_ran_parallel("(pmap (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (reverse (list x 1)))) N)"));
+    /* a pure builtin's name bound to an effectful one */
+    TEST_ASSERT_TRUE(pm_ran_here("(do (set reverse rand) "
+                                 "(pmap (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (reverse 1 10))) N))"));
+    TEST_ASSERT_TRUE(pm_ran_here("(do (set concat rand) "
+                                 "(pmap (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (concat 1 10))) N))"));
+    TEST_ASSERT_FALSE(ray_pmap_fn_pure(ray_env_get_global(ray_sym_intern("concat", 6))));
+    /* compiled while reverse meant rand; reverse restored: the bytecode
+     * still holds rand */
+    r = pm_eval("(do (set f (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (reverse 1 10)))) (set reverse rand) "
+                "(f -1) (set reverse orig_reverse) (set concat orig_concat) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_TRUE(pm_ran_here("(pmap f N)"));
+    /* a name rebound between compile and call, and between two pmaps */
+    r = pm_eval("(do (set myop orig_plus) (set g (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (myop x 1)))) (g 0) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_TRUE(pm_ran_parallel("(pmap g N)"));
+    TEST_ASSERT_TRUE(pm_ran_here("(do (set myop rand) (pmap g N))"));
+    TEST_ASSERT_TRUE(pm_ran_here("(pmap g N)"));
+    TEST_ASSERT_TRUE(pm_ran_parallel("(do (set myop orig_plus) (set g (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (myop x 1)))) (pmap g N))"));
+    /* a closure resolves its names at call time: judged at each pmap */
+    r = pm_eval("(do (set mk (fn [] (fn [x] (do (count (distinct (% (til 3000) (+ 2 x)))) (myop x 1))))) (set h (mk)) 0)");
+    TEST_ASSERT_TRUE(r && !RAY_IS_ERR(r)); ray_release(r);
+    TEST_ASSERT_TRUE(pm_ran_parallel("(pmap h N)"));
+    TEST_ASSERT_TRUE(pm_ran_here("(do (set myop rand) (pmap h N))"));
+    TEST_ASSERT_TRUE(pm_ran_parallel("(do (set myop orig_plus) (pmap h N))"));
+    /* fewer than 16 elements: map's call, never dispatched */
+    TEST_ASSERT_TRUE(pm_ran_here("(pmap (fn [x] (sum (til (+ 3000000 x)))) (til 15))"));
+    PASS();
+}
+
 /* Private symbol positions must become runtime ids in map's output, and
  * a native BOOL/U8 typed-null must stay boxed (their vectors have no null). */
 static test_result_t test_map_typed_domains_and_nulls(void) {
@@ -15588,6 +15831,10 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/map_typed_domains_nulls", test_map_typed_domains_and_nulls, lang_setup, lang_teardown },
     { "lang/eval/map", test_eval_map, lang_setup, lang_teardown },
     { "lang/eval/pmap", test_eval_pmap, lang_setup, lang_teardown },
+    { "lang/eval/pmap_parallel", test_pmap_parallel, lang_setup, lang_teardown },
+    { "lang/eval/pmap_proof_identity", test_pmap_proof_identity, lang_setup, lang_teardown },
+    { "lang/eval/pmap_probe_clock", test_pmap_probe_clock, lang_setup, lang_teardown },
+    { "lang/eval/pmap_cheap_after_dispatch", test_pmap_cheap_after_dispatch, lang_setup, lang_teardown },
     { "lang/eval/fold", test_eval_fold, lang_setup, lang_teardown },
     { "lang/eval/scan", test_eval_scan, lang_setup, lang_teardown },
     { "lang/eval/filter", test_eval_filter, lang_setup, lang_teardown },
