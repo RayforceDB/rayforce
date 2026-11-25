@@ -161,6 +161,12 @@ bool agg_v2_parallel_wide(ray_graph_t* g, ray_op_t* op, ray_t* tbl, const int8_t
     return floating && !indexed;
 }
 
+/* The accumulator of agg_kind over in_type for execution g: the checked
+ * 64-bit variance ones on g's second run (exec_group_v2, #1670). */
+static inline const agg_vtable_t* agg_vt(const ray_graph_t* g, uint16_t agg_kind, int8_t in_type) {
+    return g && g->var_checked ? agg_resolve_checked(agg_kind, in_type) : agg_resolve(agg_kind, in_type);
+}
+
 agg_v2_reason_t agg_v2_admission(ray_graph_t* g, ray_op_t* op, ray_t* tbl) {
     if (!g || !op || !tbl) return AGG_V2_SHAPE;
     ray_op_ext_t* ext = find_ext(g, op->id);
@@ -2272,7 +2278,7 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
         ray_col_meta_t vm;
         bool vh = ext->agg_ops[a] != OP_COUNT && ie && agg_col_meta(g, tbl, ie->sym, &vm);
         int8_t in_type = vh ? vm.type : RAY_I64;
-        vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
+        vo->vts[a] = agg_vt(g, ext->agg_ops[a], in_type);
         uint32_t b = 0;
         for (; b < a; b++)
             if (vo->vts[a] && vo->vts[b] && vo->vts[b]->init != agg_alias_init &&
@@ -11421,7 +11427,7 @@ done:
  * for their turn.  1 with *col set (a's column, or a parked one), 0 when a
  * shares with no other slot, -1 on failure.  rows / offsets: the indexed
  * layout (NULL for the serial run over groups->gids). */
-static int agg_var_shared_col(ray_op_ext_t* ext, uint32_t a, ray_t* src, const agg_groups_t* groups,
+static int agg_var_shared_col(const ray_graph_t* g, ray_op_ext_t* ext, uint32_t a, ray_t* src, const agg_groups_t* groups,
                               const int64_t* rows, const int64_t* offsets, int64_t nrows,
                               ray_t** pre, ray_t** col) {
     *col = NULL;
@@ -11431,11 +11437,11 @@ static int agg_var_shared_col(ray_op_ext_t* ext, uint32_t a, ray_t* src, const a
     const agg_vtable_t* vtl[16];
     uint32_t slot[16];
     int nv = 0;
-    vtl[nv] = agg_resolve(ext->agg_ops[a], src->type); slot[nv++] = a;
+    vtl[nv] = agg_vt(g, ext->agg_ops[a], src->type); slot[nv++] = a;
     if (!vtl[0]) return 0;
     for (uint32_t b = a + 1; b < ext->n_aggs && nv < 16; b++) {
         if (!agg_vo_var_alias(ext, b, a)) continue;
-        const agg_vtable_t* vb = agg_resolve(ext->agg_ops[b], src->type);
+        const agg_vtable_t* vb = agg_vt(g, ext->agg_ops[b], src->type);
         if (!vb || vb->update_batch != vtl[0]->update_batch || vb->merge != vtl[0]->merge) continue;
         vtl[nv] = vb; slot[nv++] = b;
     }
@@ -11772,7 +11778,7 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* col = NULL;
         {
             if (var_pre && src && ray_pool_scan_on()) ray_col_want_rows(src, rows, nrows);
-            int vr = agg_var_shared_col(ext, a, src, &groups, rows, offsets, nrows, var_pre, &col);
+            int vr = agg_var_shared_col(g, ext, a, src, &groups, rows, offsets, nrows, var_pre, &col);
             if (vr < 0) {
                 ray_release(result);
                 result = ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
@@ -11813,12 +11819,12 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
             ray_t* ycol = ray_table_col(tbl, ye->sym);
             if (ycol && RAY_IS_ERR(ycol)) { ray_release(result); result = ycol; goto var_pre_fail; }
-            col = agg_index_streaming(agg_resolve(kind, src->type), src,
+            col = agg_index_streaming(agg_vt(g, kind, src->type), src,
                 ycol, &groups, rows, offsets, nrows, param);
         } else if (kind == OP_COUNT) {
             col = ray_vec_new(RAY_I64, ng);
             if (col && !RAY_IS_ERR(col)) { col->len = ng; memcpy(ray_data(col), counts, (size_t)ng * sizeof(int64_t)); }
-        } else col = agg_index_streaming(agg_resolve(kind, src ? src->type : RAY_I64),
+        } else col = agg_index_streaming(agg_vt(g, kind, src ? src->type : RAY_I64),
                                         src, NULL, &groups, rows, offsets, nrows, param);
 emit_col:
         if (!col || RAY_IS_ERR(col)) { ray_release(result); result = col; goto var_pre_fail; }
@@ -13513,7 +13519,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_t* col;
         ray_t* vsrc = var_pre && ie && agg_op_is_var(ext->agg_ops[a]) ? ray_table_col(tbl, ie->sym) : NULL;
         int vr = vsrc && !RAY_IS_ERR(vsrc)
-            ? agg_var_shared_col(ext, a, vsrc, &groups, NULL, NULL, nrows, var_pre, &col) : 0;
+            ? agg_var_shared_col(g, ext, a, vsrc, &groups, NULL, NULL, nrows, var_pre, &col) : 0;
         if (vr < 0) {
             agg_var_shared_free(ext, var_pre, var_pre_hdr);
             agg_groups_free(&groups); ray_release(result);
@@ -13526,13 +13532,13 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (x_col && RAY_IS_ERR(x_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return x_col; }
             ray_t* y_col = ray_table_col(tbl, ye->sym);
             if (y_col && RAY_IS_ERR(y_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return y_col; }
-            const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
+            const agg_vtable_t* vt = agg_vt(g, ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
             ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_col(tbl, ie->sym) : NULL;
             if (val_col && RAY_IS_ERR(val_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return val_col; }
             int8_t in_type = val_col ? val_col->type : RAY_I64;
-            const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
+            const agg_vtable_t* vt = agg_vt(g, ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
         }
         if (!col || RAY_IS_ERR(col)) {
@@ -13657,8 +13663,33 @@ static ray_t* agg_build_compact(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
  * with sel=NULL).  Representative (first_row) indices stay in ORIGINAL-row space
  * throughout so result key columns gather correctly (SYM domains preserved); the
  * output order is unspecified per the v2 contract. */
+static ray_t* exec_group_v2_once(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                 int64_t group_limit);
+
+/* A 64-bit integer variance whose difference may have wrapped
+ * (ray_var_wrap_suspects, agg_stream.c, #1670) runs again with every row's
+ * difference overflow-checked: values more than INT64_MAX apart, so the
+ * plain path's cost stays where it was.  The checked mode is the graph's
+ * (g->var_checked, read by agg_vt where this execution resolves its
+ * vtables), so concurrent executions never share it.  The suspect count is
+ * process-wide: a concurrent query's suspect only repeats this run, never
+ * changing an answer. */
 ray_t* exec_group_v2(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                      int64_t group_limit) {
+    uint64_t s0 = atomic_load_explicit(&ray_var_wrap_suspects, memory_order_relaxed);
+    ray_t* r = exec_group_v2_once(g, op, tbl, group_limit);
+    if (RAY_LIKELY(atomic_load_explicit(&ray_var_wrap_suspects, memory_order_relaxed) == s0) ||
+        !r || RAY_IS_ERR(r) || !g || g->var_checked)
+        return r;
+    ray_release(r);
+    g->var_checked = true;   /* this execution only: agg_vt */
+    r = exec_group_v2_once(g, op, tbl, group_limit);
+    g->var_checked = false;
+    return r;
+}
+
+static ray_t* exec_group_v2_once(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
+                                 int64_t group_limit) {
     if (agg_cancelled()) return ray_error("cancel", NULL);
     /* The top-N emit filter (`desc: AGG take: N`) is read once here and
      * handed to every strategy: radix and the dense finishes select the kept

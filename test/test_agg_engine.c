@@ -13,6 +13,7 @@
 #include "test.h"
 #include <rayforce.h>
 #include "mem/heap.h"
+#include "mem/cow.h"        /* ray_rc_sync: the two-thread variance test */
 #include "ops/ops.h"
 #include "ops/internal.h"
 #include "ops/agg_engine.h"
@@ -2860,6 +2861,85 @@ static test_result_t test_parted_flatten_into_bounds(void) {
     PASS();
 }
 
+/* #1670: the checked mode of a 64-bit integer variance's second run is the
+ * execution's (ray_graph_t.var_checked), not the process's.  Two threads
+ * run group-bys at once, as workers inside a parallel dispatch do (the
+ * flag raised, so neither dispatches; atomic refcounts on the shared
+ * tables), straight on the graph API: one over groups spanning more than
+ * 2^63, which take the checked second run, the other over ordinary data.
+ * Each answer holds on every repetition, and the TSan build sees no race. */
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+#include <pthread.h>
+typedef struct { ray_t* tbl; uint16_t op; ray_t* want; int ok; } ae_var_thr_t;
+/* (op v) by k over tbl: the aggregate column, or NULL */
+static ray_t* ae_var_group(ray_t* tbl, uint16_t op) {
+    ray_graph_t* g = ray_graph_new(tbl);
+    if (!g) return NULL;
+    ray_op_t* keys[] = { ray_scan(g, "k") };
+    ray_op_t* ins[]  = { ray_scan(g, "v") };
+    uint16_t  ops[]  = { op };
+    ray_op_t* grp = ray_group(g, keys, 1, ops, ins, 1);
+    ray_t* r = grp ? ray_execute(g, ray_optimize(g, grp)) : NULL;
+    ray_graph_free(g);
+    if (!r || RAY_IS_ERR(r)) { ae_drop(r); return NULL; }
+    ray_t* c = ray_table_col_idx(r, 1);
+    if (c && !RAY_IS_ERR(c)) ray_retain(c); else c = NULL;
+    ray_release(r);
+    return c;
+}
+static void* ae_var_thread(void* raw) {
+    ae_var_thr_t* t = raw;
+    ray_rc_sync = true;
+    t->ok = 1;
+    for (int i = 0; i < 20 && t->ok; i++) {
+        ray_t* c = ae_var_group(t->tbl, t->op);
+        if (!c || c->type != RAY_F64 || c->len != t->want->len ||
+            memcmp(ray_data(c), ray_data(t->want), (size_t)c->len * sizeof(double)) != 0)
+            t->ok = 0;
+        ae_drop(c);
+    }
+    return NULL;
+}
+#endif
+
+static test_result_t test_var_checked_parallel_two_threads(void) {
+#if !defined(RAY_OS_WINDOWS) && !defined(RAY_OS_WASM)
+    ae_eval_ok("(set n 9000)");
+    ae_eval_ok("(set kw (% (til n) 3))");
+    ae_eval_ok("(set W (table [k v] (list kw (* 4611686018427388000 (- (% (div (til n) 3) 3) 1)))))");
+    ae_eval_ok("(set N (table [k v] (list kw (+ 1000 (% (* (til n) 7919) 97)))))");
+    ray_t* W = ae_eval("W");
+    ray_t* N = ae_eval("N");
+    TEST_ASSERT_TRUE(W && N && !RAY_IS_ERR(W) && !RAY_IS_ERR(N));
+    /* the answers, once on this thread: the wide one through its second run */
+    ray_t* wa = ae_var_group(W, OP_STDDEV_POP);
+    ray_t* na = ae_var_group(N, OP_VAR);
+    TEST_ASSERT_TRUE(wa && na && wa->len == 3 && na->len == 3);
+    double sd = 4611686018427388000.0 * sqrt(2.0 / 3.0);
+    for (int64_t i = 0; i < 3; i++)
+        TEST_ASSERT_TRUE(fabs(((double*)ray_data(wa))[i] / sd - 1.0) < 1e-9);
+    ae_var_thr_t a = { W, OP_STDDEV_POP, wa, 0 };
+    ae_var_thr_t b = { N, OP_VAR, na, 0 };
+    atomic_store(&ray_parallel_flag, 1);
+    ray_rc_sync = true;
+    pthread_t ta, tb;
+    int rc = pthread_create(&ta, NULL, ae_var_thread, &a);
+    int rb = pthread_create(&tb, NULL, ae_var_thread, &b);
+    if (!rc) pthread_join(ta, NULL);
+    if (!rb) pthread_join(tb, NULL);
+    atomic_store(&ray_parallel_flag, 0);
+    ray_rc_sync = false;
+    ae_drop(wa); ae_drop(na); ae_drop(W); ae_drop(N);
+    TEST_ASSERT_EQ_I(rc, 0);
+    TEST_ASSERT_EQ_I(rb, 0);
+    TEST_ASSERT_EQ_I(a.ok, 1);
+    TEST_ASSERT_EQ_I(b.ok, 1);
+    PASS();
+#else
+    SKIP("requires POSIX threads");
+#endif
+}
+
 const test_entry_t agg_engine_entries[] = {
     { "pearson_old_engine_r_vs_r2",  test_pearson_old_engine_r_vs_r2, NULL, NULL },
     { "diff_group_pearson_1k",       test_diff_group_pearson_1k,    NULL, NULL },
@@ -2943,6 +3023,7 @@ const test_entry_t agg_engine_entries[] = {
     { "parted_flatten_parallel",     test_parted_flatten_parallel,     ae_rt_setup, ae_rt_teardown },
     { "dense_partitioned_cancel_at_dispatch", test_dense_partitioned_cancel_at_dispatch, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_in_place",     test_parted_flatten_in_place,     ae_rt_setup, ae_rt_teardown },
+    { "var_checked_parallel_two_threads", test_var_checked_parallel_two_threads, ae_rt_setup, ae_rt_teardown },
     { "parted_flatten_into_bounds",  test_parted_flatten_into_bounds,  ae_rt_setup, ae_rt_teardown },
     { NULL, NULL, NULL, NULL },
 };
