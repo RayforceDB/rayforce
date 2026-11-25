@@ -4101,8 +4101,13 @@ static void memo_walk(ray_graph_t* g, ray_op_t* op, uint64_t* visited) {
 }
 
 void ray_exec_memo_seed(ray_graph_t* g, const ray_exec_memo_save_t* outer, ray_op_t* branch,
-                        const int64_t* ids, int64_t count, int64_t nrows) {
+                        ray_t* ids_table, const int64_t* ids, int64_t count, int64_t nrows) {
     if (!g || !outer || !outer->vals || !branch || count <= 0 || g->node_count == 0) return;
+    /* The outer memo holds values over the rows of the table it was armed
+     * over; `ids` index the rows of `ids_table`.  Another table of the same
+     * length (a sorted or filtered one an operator swapped in) has other
+     * rows at those positions: nothing is seeded from it. */
+    if (outer->table != ids_table) return;
     uint32_t nc = g->node_count;
     if (outer->n < nc) return;
     ray_t* vhdr = NULL;
