@@ -1,0 +1,23 @@
+;; map packs symbol results into a SYM vector, and a SYM cell holds no
+;; quote: a quoted symbol comes back a name (#1507, kept as documented
+;; under the iterators in language/functions.md).  Building the result as
+;; a LIST keeps the quote.
+(set L (list (parse "'a") (parse "b")))
+(set M (map (fn [x] x) L))
+(type L) -- 'LIST
+(type M) -- 'SYM
+(set b 42)
+(eval (first L)) -- 'a
+(eval (first M)) !- name
+(eval (at M 1)) -- 42
+(type (map (fn [x] x) (list (parse "'a") (parse "'c")))) -- 'SYM
+(eval (first (concat (list) M))) !- name
+;; the workarounds: fold into a list, or wrap each result in a list
+(set R (fold (fn [acc x] (concat acc (list x))) (list) L))
+(type R) -- 'LIST
+(eval (first R)) -- 'a
+(eval (at R 1)) -- 42
+(set W (map (fn [x] (list x)) L))
+(type W) -- 'LIST
+(eval (first (first W))) -- 'a
+(set b 0)
