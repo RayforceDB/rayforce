@@ -1325,6 +1325,19 @@ ray_t* ray_last_fn(ray_t* x) {
 /* Helper: copy non-null vec elements to double scratch buffer, compacted.
  * scratch->len is set to the number of non-null values copied.
  * Returns scratch ray_t* (caller must ray_release), or error. */
+/* The vector types med, quantile, var and stddev read (vec_to_f64_scratch,
+ * var_shifted_scratch); any other is a type error, empty or not (#1677). */
+static bool vec_stat_type_ok(int8_t t) {
+    switch (t) {
+    case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN:
+    case RAY_F64: case RAY_F32: case RAY_I32: case RAY_DATE: case RAY_TIME:
+    case RAY_I16: case RAY_U8: case RAY_BOOL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static ray_t* vec_to_f64_scratch(ray_t* x, double** out_vals) {
     int64_t len = ray_len(x);
     ray_t* scratch = ray_alloc(len * sizeof(double));
@@ -1383,7 +1396,8 @@ static ray_t* med_f64(ray_t* x) {
 
     if (ray_is_vec(x)) {
         len = ray_len(x);
-        if (len == 0) return ray_typed_null(-RAY_F64);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (len == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
         scratch = vec_to_f64_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
     } else if (is_list(x)) {
@@ -1562,7 +1576,8 @@ static ray_t* quantile_f64(ray_t* x, double q, const char* name) {
 
     if (ray_is_vec(x)) {
         len = ray_len(x);
-        if (len == 0) return ray_typed_null(-RAY_F64);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (len == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
         scratch = vec_to_f64_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
     } else if (is_list(x)) {
@@ -1730,7 +1745,8 @@ static ray_t* var_stddev_core(ray_t* x, int sample, int take_sqrt) {
     int64_t cnt = 0;
 
     if (ray_is_vec(x)) {
-        if (ray_len(x) == 0) return ray_typed_null(-RAY_F64);
+        /* an empty vector is checked for its type like any other (#1677) */
+        if (ray_len(x) == 0 && vec_stat_type_ok(x->type)) return ray_typed_null(-RAY_F64);
         scratch = var_shifted_scratch(x, &vals);
         if (RAY_IS_ERR(scratch)) return scratch;
         cnt = scratch->len;
