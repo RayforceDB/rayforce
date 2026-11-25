@@ -3380,8 +3380,10 @@ static test_result_t test_first_n_take(void) {
 /* Unordered take: N under a where: (#736).  The HEAD(GROUP) arm hands the
  * group the lazy selection, as OP_GROUP does, so the first-N pre-pass reads
  * the selected rows in place instead of a copy of every column of the
- * table.  Each answer equals the unfused form (the where: materialized
- * first, then grouped) and the full aggregation. */
+ * table.  A where: that keeps at least half of the first rows is not run
+ * over the table at all (#1695): the pre-pass tests it at the rows it
+ * reads, and no selection is built.  Each answer equals the unfused form
+ * (the where: materialized first, then grouped) and the full aggregation. */
 static test_result_t test_first_n_take_where(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(8), RAY_OK);
@@ -3397,16 +3399,19 @@ static test_result_t test_first_n_take_where(void) {
     static const struct { const char* q; const char* w; const char* u; uint64_t fn, sel; } shapes[] = {
         { "(select {from:fw_t where:(> v 500) by:[u s] c:(count u) sv:(sum v) take:10})",
           "(> v 500)", "(select {from:fw_w by:[u s] c:(count u) sv:(sum v) take:10})", 1, 1 },
+        /* keeps 4 rows of 7: tested at the pre-pass's rows (#1695) */
         { "(select {from:fw_t where:(> p 2) by:y c:(count i) mx:(max v) take:10})",
-          "(> p 2)", "(select {from:fw_w by:y c:(count i) mx:(max v) take:10})", 1, 1 },
-        /* a where: on the key itself */
+          "(> p 2)", "(select {from:fw_w by:y c:(count i) mx:(max v) take:10})", 1, 0 },
+        /* a where: on the key itself, which keeps nearly every row */
         { "(select {from:fw_t where:(!= u 0) by:u c:(count i) take:10})",
-          "(!= u 0)", "(select {from:fw_w by:u c:(count i) take:10})", 1, 1 },
+          "(!= u 0)", "(select {from:fw_w by:u c:(count i) take:10})", 1, 0 },
         { "(select {from:fw_t where:(!= y '7919) by:y c:(count i) take:25})",
-          "(!= y '7919)", "(select {from:fw_w by:y c:(count i) take:25})", 1, 1 },
+          "(!= y '7919)", "(select {from:fw_w by:y c:(count i) take:25})", 1, 0 },
         /* a sparse where: (70k of 300k rows, contiguous) under an
          * expression input gathers only the columns the group reads; the
-         * first-N pre-pass then runs over the gathered rows, no selection */
+         * first-N pre-pass then runs over the gathered rows, no selection
+         * (the deferred where: of #1695 declines this group: it runs the
+         * where: as before) */
         { "(select {from:fw_t where:(< i 70000) by:u c:(count i) sv:(sum (* v 2)) take:10})",
           "(< i 70000)", "(select {from:fw_w by:u c:(count i) sv:(sum (* v 2)) take:10})", 1, 0 },
         /* keyless, some rows kept: the group reads the selection itself */

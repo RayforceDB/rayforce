@@ -12741,13 +12741,103 @@ static __attribute__((noinline)) int64_t agg_firstn_pick(
     return found;
 }
 
+/* Pass 1 under a deferred where: (#1695): the first group_limit distinct
+ * tuples among the rows the filter keeps, from row 0.
+ *
+ * The rows themselves come first: when the first 16 * group_limit + 1024
+ * rows hold fewer than group_limit distinct tuples, the rows the filter
+ * keeps there hold fewer too (few groups, or long runs): decline at once,
+ * before testing the filter, and leave the full selection's pass 1 to
+ * decide over its budget as before.  Then the filter is tested a chunk at a
+ * time (exec_filter_keep_rows), the chunks doubling from one morsel, until
+ * the set is full or the budget of kept rows is read.  A filter that keeps
+ * fewer than half the first chunk's rows declines: its selection is cheap
+ * to build and spares pass 2 most of its probes.
+ *
+ * *ok is false on any decline (also when more than two budgets of rows
+ * would be tested, or the filter compacted): the caller then runs the
+ * filter over the table and the full group.  NULL or an owned error. */
+static _Atomic(uint64_t) g_firstn_where_rows;   /* test hook: rows a deferred where: was tested at */
+uint64_t ray_agg_test_firstn_where_rows(void) {
+    return atomic_load_explicit(&g_firstn_where_rows, memory_order_relaxed);
+}
+static void agg_firstn_where_note(int64_t rows) {
+#ifdef DEBUG
+    atomic_fetch_add_explicit(&g_firstn_where_rows, (uint64_t)rows, memory_order_relaxed);
+#else
+    (void)rows;
+#endif
+}
+
+static ray_t* agg_firstn_seen_where(ray_graph_t* g, ray_op_t* fw, const agg_rr_t* krr,
+                                    ray_t** key_cols, const void** key_data, agg_firstn_set_t* set,
+                                    int64_t nrows, int64_t group_limit, int64_t* kv, bool* ok) {
+    *ok = false;
+    uint32_t n_keys = set->n_keys;
+    int64_t budget = group_limit * 64 > AGG_FIRSTN_PROBE_ROWS ? group_limit * 64 : AGG_FIRSTN_PROBE_ROWS;
+    int64_t cap = 2 * budget;
+    int64_t chunk = RAY_MORSEL_ELEMS, scanned = 0;
+    ray_t* ids_hdr = NULL;
+    int64_t* ids = NULL;
+    int64_t ids_cap = 0;
+    agg_curs_t cs;
+    memset(&cs, 0, sizeof cs);
+    if (krr && !agg_curs_init(&cs, krr)) return ray_error("oom", NULL);
+    ray_t* err = NULL;
+    /* the rows themselves: enough distinct tuples early on? */
+    int64_t pre = group_limit * 16 + RAY_MORSEL_ELEMS;
+    for (int64_t r = 0; r < nrows && r < pre && set->n < group_limit; r++) {
+        for (uint32_t k = 0; k < n_keys && !err; k++)
+            kv[k] = krr ? agg_firstn_key_cur(krr, &cs, k, r, &err)
+                        : agg_read_key_i64(key_cols[k], key_data[k], r);
+        if (err) goto out;
+        agg_firstn_probe(set, kv, agg_firstn_hash(kv, n_keys), true);
+    }
+    if (set->n < group_limit) goto out;
+    memset(set->rank, 0xFF, ((size_t)1 << set->bits) * sizeof(int32_t));
+    set->n = 0;
+    int64_t b = 0;
+    while (b < nrows && set->n < group_limit && scanned < budget) {
+        if (b >= cap) goto out;
+        int64_t e = nrows - b > chunk ? b + chunk : nrows;
+        if (e - b > ids_cap) {
+            if (ids_hdr) scratch_free(ids_hdr);
+            ids_hdr = NULL;
+            ids_cap = e - b;
+            ids = (int64_t*)scratch_alloc(&ids_hdr, (size_t)ids_cap * sizeof(int64_t));
+            if (!ids) { err = ray_error("oom", NULL); goto out; }
+        }
+        for (int64_t r = b; r < e; r++) ids[r - b] = r;
+        int64_t kept = -1;
+        if ((err = exec_filter_keep_rows(g, fw, ids, e - b, &kept)) != NULL || kept < 0) goto out;
+        agg_firstn_where_note(e - b);
+        if (b == 0 && kept * 2 < e - b) goto out;      /* a selective filter */
+        for (int64_t i = 0; i < kept && set->n < group_limit && scanned < budget; i++, scanned++) {
+            for (uint32_t k = 0; k < n_keys && !err; k++)
+                kv[k] = krr ? agg_firstn_key_cur(krr, &cs, k, ids[i], &err)
+                            : agg_read_key_i64(key_cols[k], key_data[k], ids[i]);
+            if (err) goto out;
+            agg_firstn_probe(set, kv, agg_firstn_hash(kv, n_keys), true);
+        }
+        b = e;
+        chunk *= 2;
+    }
+    *ok = set->n >= group_limit;
+out:
+    if (krr) agg_curs_free(&cs, krr);
+    if (ids_hdr) scratch_free(ids_hdr);
+    return err;
+}
+
 /* The first `group_limit` groups in first-seen order, an error, or NULL when
  * the shape or the data is not one the pre-pass serves (the caller then runs
- * the full aggregation). */
+ * the full aggregation).  With defer_where (#1695) there is no selection: the
+ * filter is tested at the rows pass 1 reads and at the rows pass 2 finds,
+ * and every decline goes back to the HEAD(GROUP) arm. */
 static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t nrows,
                               ray_t** key_cols, agg_keyset_t* ks, ray_t* sel, const int64_t* sel_prefix,
                               int64_t n_sel, int64_t group_limit,
-                              bool allow_heavy, bool* heavy_out) {
+                              bool allow_heavy, bool* heavy_out, ray_op_t* defer_where) {
     ray_op_ext_t* ext = find_ext(g, op->id);
     ray_pool_t* pool = ray_pool_get();
     int64_t eff_n = sel ? n_sel : nrows;
@@ -12795,7 +12885,13 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
     uint32_t n_segs = (uint32_t)((nrows + RAY_MORSEL_ELEMS - 1) / RAY_MORSEL_ELEMS);
 
     /* 1. the first N distinct tuples, serially from the first selected row */
-    if (krr) {
+    if (defer_where) {
+        bool ok = false;
+        ray_t* e1 = agg_firstn_seen_where(g, defer_where, krr, key_cols, key_data, &set, nrows,
+                                          group_limit, kv, &ok);
+        if (e1) { res = e1; goto done; }
+        if (!ok) goto done;                   /* declined: the filter and the full run */
+    } else if (krr) {
         ray_t* e1 = agg_firstn_seen_staged(krr, &set, sel, nrows, n_segs, group_limit, kv);
         if (e1) { res = e1; goto done; }
         if (set.n < group_limit) goto done;   /* few groups or long runs: full run */
@@ -12919,6 +13015,16 @@ static ray_t* agg_first_n_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t 
         }
     }
 
+    if (defer_where) {
+        /* the rows of the N groups the where: keeps: tested at those rows
+         * alone (ascending, as pass 2 wrote them) */
+        int64_t kept = -1;
+        ray_t* fe = exec_filter_keep_rows(g, defer_where, idx, m, &kept);
+        if (fe) { res = fe; goto done; }
+        agg_firstn_where_note(m);
+        if (kept <= 0) goto done;
+        m = kept;
+    }
     compact = agg_build_compact(g, op, tbl, idx, m);
     if (!compact || RAY_IS_ERR(compact)) {
         res = compact ? compact : ray_error("oom", NULL); compact = NULL; goto done;
@@ -13099,6 +13205,16 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         ray_col_meta_t cm;
         if (ie && agg_col_meta(g, tbl, ie->sym, &cm) && agg_indexed_supported(ext->agg_ops[a], cm.type)) indexed = true;
     }
+    /* A deferred where: (#1695): the first-N route alone, testing it at the
+     * rows it reads; any decline goes back to the HEAD(GROUP) arm, which
+     * runs the filter and the group as before. */
+    if (g->firstn_where && !firstn_nested) {
+        ray_t* fr = indexed || efp || sel || group_limit <= 0 ? NULL
+            : agg_first_n_run(g, op, tbl, nrows, key_cols, ks, NULL, NULL, 0,
+                              group_limit, false, NULL, g->firstn_where);
+        if (!fr) g->firstn_declined = true;
+        return fr;
+    }
     if (indexed) {
         if (sel) {
             ray_t* idx = ray_rowsel_to_indices(sel);
@@ -13123,7 +13239,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     bool firstn_heavy = false;   /* the N groups hold a large share: see agg_first_n_run */
     if (group_limit > 0 && !efp) {
         ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, ks, sel, sel_prefix, n_sel,
-                                    group_limit, false, &firstn_heavy);
+                                    group_limit, false, &firstn_heavy, NULL);
         if (fr) { return fr; }
     }
 
@@ -13435,7 +13551,7 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
              * picked from it.  Without a dense plan both runs are radix and
              * the bounded one selects the N groups itself. */
             ray_t* fr = agg_first_n_run(g, op, tbl, nrows, key_cols, ks, sel, sel_prefix, n_sel,
-                                        group_limit, true, NULL);
+                                        group_limit, true, NULL, NULL);
             if (fr) { agg_vo_free(&vo); agg_dense_plan_free(&dp); return fr; }
         }
         if (keys_intsym) {

@@ -38,6 +38,9 @@ extern int ray_agg_radix_spill;
  * and the parted group's first-key scan (group.c). */
 #define AGG_FIRSTN_MAX        1024     /* largest take: N the pre-pass serves */
 #define AGG_FIRSTN_PROBE_ROWS 65536    /* prefix budget for the serial scan, at least */
+/* Rows a deferred where: of the first-N route was tested at (#1695; counted
+ * in debug builds). */
+uint64_t ray_agg_test_firstn_where_rows(void);
 
 /* The group's transient-state budget: the dense compaction's per-task
  * bitmaps (agg_engine.c) and the null fills a ragged parted group builds

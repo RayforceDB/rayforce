@@ -3333,6 +3333,68 @@ static test_result_t test_filter_only_columns(void) {
     PASS();
 }
 
+/* An unordered take of a few groups under a where: finds its groups before
+ * the where: has run over every row (#1695): the first-N route tests the
+ * filter at the rows its first pass reads and at the rows of the N groups
+ * its second pass finds, not over the table.  Each shape gives what the same
+ * group over the materialized where: gives, in memory and over a compressed
+ * splayed copy (keys read through their sources), and the rows tested are
+ * counted (ray_agg_test_firstn_where_rows): a filter that keeps most rows is
+ * tested at a few thousand of the 400000; one that keeps few, or a key with
+ * fewer groups than the take, declines and runs the filter as before. */
+static test_result_t test_firstn_where_deferred(void) {
+    aw_eval_ok("(set N 400000)");
+    aw_eval_ok("(set M (table [k s f v] (list (% (* (til N) 7919) 50000) (at ['a 'b 'c 'd 'e 'f 'g] (% (til N) 7)) "
+               "(% (til N) 10) (+ (- (% (* (til N) 31) 1000) 500) (at [0 0N] (+ 0 (== 0 (% (til N) 37))))))))");
+    aw_eval_ok("(.db.splayed.set \"" AW_TMP "/fw2/\" M {compress: true})");
+    static const char* const srcs[] = { "M", "(.db.splayed.get \"" AW_TMP "/fw2/\")" };
+    /* the shape with its where: as W; the rows it may test: -1 at least one
+     * and under N/8, else at most that many */
+    static const struct { const char* q; const char* w; int64_t rows; } c[] = {
+        { "(select {c: (count v) s: (sum v) mn: (min v) mx: (max v) by: k from: W take: 10})", "(> f 0)", -1 },
+        { "(select {c: (count v) a: (avg v) by: [k s] from: W take: 50})", "(and (> f 0) (> v -400))", -1 },
+        { "(select {c: (count v) by: k from: W take: 1000})", "(>= f 2)", -1 },
+        { "(select {c: (count v) by: k from: W take: 10})", "(== f 0)", RAY_MORSEL_ELEMS },
+        { "(select {c: (count v) by: s from: W take: 10})", "(> f 0)", 0 },
+        /* within compares one shared operand twice: each test of the rows
+         * reads it computed over those rows, not a memo of other ones */
+        { "(select {c: (count v) mx: (max v) by: k from: W take: 10})", "(within (+ v f) [-450 600])", -1 },
+        { "(select {c: (count v) by: k from: W take: 10})", "(within (+ v f) [0 40])", RAY_MORSEL_ELEMS },
+    };
+    for (size_t si = 0; si < sizeof srcs / sizeof *srcs; si++)
+        for (size_t k = 0; k < sizeof c / sizeof *c; k++) {
+            char fast[600], slow[600], buf[700];
+            snprintf(buf, sizeof buf, "(set S %s)", srcs[si]);
+            aw_eval_ok(buf);
+            /* "from: W" spelled as the select's own where: and as a materialized one */
+            const char* at = strstr(c[k].q, "from: W");
+            snprintf(fast, sizeof fast, "%.*sfrom: S where: %s%s", (int)(at - c[k].q), c[k].q, c[k].w, at + 7);
+            snprintf(slow, sizeof slow, "%.*sfrom: (select {from: S where: %s})%s", (int)(at - c[k].q), c[k].q, c[k].w, at + 7);
+            uint64_t r0 = ray_agg_test_firstn_where_rows();
+            ray_t* a = aw_eval(fast);
+            uint64_t rows = ray_agg_test_firstn_where_rows() - r0;
+            ray_t* b = aw_eval(slow);
+            TEST_ASSERT_FMT(a && !RAY_IS_ERR(a) && b && !RAY_IS_ERR(b), "%s on %s failed", fast, srcs[si]);
+            ray_t* fa = ray_fmt(a, 0); ray_t* fb = ray_fmt(b, 0);
+            bool same = ray_str_len(fa) == ray_str_len(fb) && memcmp(ray_str_ptr(fa), ray_str_ptr(fb), ray_str_len(fa)) == 0;
+            TEST_ASSERT_FMT(same, "%s on %s: %.*s, over the materialized where: %.*s", fast, srcs[si],
+                            (int)ray_str_len(fa), ray_str_ptr(fa), (int)ray_str_len(fb), ray_str_ptr(fb));
+            ray_release(fa); ray_release(fb); ray_release(a); ray_release(b);
+#ifdef DEBUG   /* the counter counts in debug builds */
+            if (c[k].rows < 0)
+                TEST_ASSERT_FMT(rows > 0 && rows < 400000 / 8, "%s on %s: the where: was tested at %llu rows",
+                                fast, srcs[si], (unsigned long long)rows);
+            else
+                TEST_ASSERT_FMT(rows <= (uint64_t)c[k].rows, "%s on %s: the where: was tested at %llu rows",
+                                fast, srcs[si], (unsigned long long)rows);
+#else
+            (void)rows;
+#endif
+        }
+    aw_eval_ok("(set S 0)"); aw_eval_ok("(set M 0)");
+    PASS();
+}
+
 static test_result_t test_sort_head_late_chunked(void) {
 #define AW_TKC_COLS(R) "(table [r up dn c d n f i] (list " R " " R " (- 0 " R ") (+ 7 (* 0 " R ")) (div " R " 3000) " \
     "(+ (% (* " R " 7919) 1000) (at [0 0N] (+ 0 (== 0 (% " R " 97))))) " \
@@ -6239,5 +6301,6 @@ const test_entry_t aware_entries[] = {
     { "aware/sign_bit_widths",   test_sign_bit_widths,   aw_setup, aw_teardown },
     { "aware/topk_never_pruned", test_topk_never_pruned, aw_setup, aw_teardown },
     { "aware/filter_only_columns", test_filter_only_columns, aw_setup, aw_teardown },
+    { "aware/firstn_where_deferred", test_firstn_where_deferred, aw_setup, aw_teardown },
     { NULL, NULL, NULL, NULL },
 };

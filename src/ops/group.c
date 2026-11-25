@@ -14936,8 +14936,41 @@ static ray_t* group_retag_duration_means(ray_graph_t* g, uint32_t gid, ray_t* re
     return result;
 }
 
+/* A deferred where: (g->firstn_where, #1695) reaches the group's first-N
+ * route only through v2 over a flat table with plain integer, temporal or
+ * SYM keys: every other shape declines here, before any route reads rows. */
+static bool group_firstn_where_ok(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
+    if (!tbl || RAY_IS_ERR(tbl) || tbl->type != RAY_TABLE || tbl != g->table || g->selection ||
+        g->sg_col || g->grp_seg_stream || group_limit <= 0 || group_limit > AGG_FIRSTN_MAX ||
+        !ray_agg_engine_v2 || g_group_test_route != 0 || ray_group_emit_filter_active().enabled)
+        return false;
+    int64_t nc = ray_table_ncols(tbl);
+    for (int64_t c = 0; c < nc; c++) {
+        ray_col_meta_t cm;
+        if (!ray_table_col_meta_idx(tbl, c, &cm) || RAY_IS_PARTED(cm.type) || cm.type == RAY_MAPCOMMON)
+            return false;
+    }
+    ray_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext || ext->n_keys == 0) return false;
+    for (uint32_t k = 0; k < ext->n_keys; k++) {
+        ray_op_ext_t* ke = find_ext(g, ext->keys[k]);
+        ray_col_meta_t km;
+        if (!ke || ke->base.opcode != OP_SCAN || !ray_table_col_meta(tbl, ke->sym, &km)) return false;
+        switch (km.type) {
+            case RAY_I64: case RAY_I32: case RAY_I16: case RAY_U8: case RAY_SYM:
+            case RAY_DATE: case RAY_TIME: case RAY_TIMESTAMP: case RAY_TIMESPAN: break;
+            default: return false;
+        }
+    }
+    return agg_v2_admission(g, op, tbl) == AGG_V2_ADMITTED;
+}
+
 ray_t* exec_group(ray_graph_t* g, ray_op_t* op, ray_t* tbl, int64_t group_limit) {
     uint32_t gid = op->id;
+    if (g->firstn_where && !group_firstn_where_ok(g, op, tbl, group_limit)) {
+        g->firstn_declined = true;
+        return NULL;
+    }
     return group_retag_duration_means(g, gid, exec_group_core(g, op, tbl, group_limit));
 }
 
