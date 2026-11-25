@@ -105,11 +105,10 @@ cnt -- 1
 ;; a verb in an `if` arm keeps the row-by-row reading
 (at (select {v: (if (> i 2) (+ 0 c) 0) from: T}) 'v) -- [0 0 0 1 5 9]
 
-;; the limit: a helper the planner does not inline is called once per row in a
-;; select projection, so the verb in its body sees one cell (#1654, open with
-;; #1650); update and by: read the whole column
+;; a helper the planner does not inline is called with the whole column too,
+;; as update and by: call it (whole_verb_helper_projection.rfl)
 (set Hm (fn [v] (let q 1) (reverse v)))
-(at (select {v: (Hm c) from: T}) 'v) -- [3 1 4 1 5 9]
+(at (select {v: (Hm c) from: T}) 'v) -- [9 5 1 4 1 3]
 (at (update {v: (Hm c) from: T}) 'v) -- [9 5 1 4 1 3]
 ;; a helper whose body is the one call is inlined, and reads the whole column
 (set Hi (fn [v] (reverse v)))
