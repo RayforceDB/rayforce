@@ -194,9 +194,13 @@ ray> (format "% + % = %" 1 2 3)
 "1 + 2 = 3"
 ```
 
+In a query, `format` is element-wise: over a column it renders each row's value, one string per row, on every route (a projection, `update`, a `by:` output or key, an aggregate's argument, `where:`), so `(update {v: (format "%-%" s u) from: t})` gives `"x-a"` for the row where `s` is `"x"` and `u` is `"a"`. Any other argument (a bound vector, an aggregate) is one value. Outside a query a vector is a value like any other and is rendered whole: `(format "%" [1 2])` is `"[1 2]"`.
+
 ### repr
 
 **`(repr value [max-bytes])`**
+
+In a query `repr` is element-wise, as `format` is: over a column it writes each row's value.
 
 Returns Rayfall source text that reads back to the same value. Unlike
 `format`, `repr` preserves narrow integer types, the shortest exact

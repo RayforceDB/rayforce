@@ -230,6 +230,12 @@ passed in as an argument, and a lambda bound by a `let` in the projection and
 then called, `(do (let h (fn [x] (let y 1) (reverse x))) (h b))`
 ([#1654](https://github.com/RayforceDB/rayforce/issues/1654)).
 
+Element-wise builtins work row by row on every route. The text renderers
+`format`, `repr` and `.json.format` are element-wise: over a column each gives
+one string per row in a projection, in `update`, in a `by:` output (each
+group's rows) or key, in an aggregate's argument and in `where:`
+([#1594](https://github.com/RayforceDB/rayforce/issues/1594)).
+
 Because a whole-column verb changes the row count, it cannot be mixed with a
 full-length column in the same query — pairing `(distinct price)` with a plain
 `sym` column raises a `length` error. Project the single reshaped column on its

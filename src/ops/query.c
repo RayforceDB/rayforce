@@ -4408,6 +4408,11 @@ static _Thread_local ray_t*  g_active_query_row_tbl   = NULL;
 static _Thread_local int32_t g_active_query_row_depth = 0;
 
 ray_t* ray_active_query_table(void) { return g_active_query_table; }
+bool ray_query_row_active(void) {
+    return g_active_query_row >= 0 && g_active_query_table &&
+           g_active_query_table == g_active_query_row_tbl &&
+           !ray_env_query_scope_above(g_active_query_row_depth);
+}
 ray_t* ray_query_helper_table(void) {
     return g_query_source_table ? g_query_source_table : g_active_query_table;
 }
@@ -26682,8 +26687,14 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
              * planner-only names (hour, minute) and builtins such as resolve
              * keep the answer the whole column gives. */
             bool per_row = query_expr_has_helper(v) && !query_expr_effect_free(v);
+            /* Evaluated over its table as a bare by: key is: the table is
+             * the active query's, so row provenance and the row-wise
+             * builtins (format, repr, .json.format) apply (#1594). */
+            ray_t* aqt = g_active_query_table;
+            if (!per_row) g_active_query_table = tbl;
             ray_t* col_vec = per_row ? eval_expr_per_row(v, tbl, ray_table_nrows(tbl))
                                      : group_key_eval_bound(v, tbl);
+            g_active_query_table = aqt;
             if (col_vec && !RAY_IS_ERR(col_vec) && ray_is_lazy(col_vec)) col_vec = ray_lazy_materialize(col_vec);
             if (!col_vec || RAY_IS_ERR(col_vec)) {
                 fail_err = col_vec ? col_vec : ray_error("domain", "by-dict val eval");

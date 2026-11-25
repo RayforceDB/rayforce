@@ -4642,6 +4642,72 @@ static ray_t* vm_exec(ray_t* lambda, ray_t** call_args, int64_t argc) {
     return vm_exec_counted(lambda, call_args, argc, 0, NULL);
 }
 
+/* An element-wise builtin (RAY_FN_ROWWISE) called inside a query with an
+ * argument that is a column's rows (row flag 1, a vector or list) is
+ * applied once per row: each such argument gives that row's cell, any
+ * other argument is passed whole, and the row results, strings, form a
+ * string vector (a list when they are not all strings; an empty string
+ * vector over no rows).  So update, by:
+ * outputs and keys, and a whole-column projection answer row by row as the
+ * per-row projection does (#1594).  Not while a per-row evaluation is in
+ * progress, where a column is already its cell; not outside a query.
+ * `fn_type` is the builtin's type and `fnp` its function; `rows` the
+ * arguments' flags in the VM encoding.  NULL when it does not apply. */
+#define ROWWISE_MAX_ARGS 64   /* a builtin call takes at most 64 arguments */
+static ray_t* rowwise_apply(int8_t fn_type, void* fnp, ray_t** args, const uint8_t* rows,
+                            int64_t argc) {
+    /* The per-row arrays below hold one slot per argument: more than they
+     * hold is refused, never written past (callers refuse such a call
+     * before it gets here). */
+    if (argc > ROWWISE_MAX_ARGS)
+        return ray_error("limit", "row-wise call: at most %d arguments, got %lld",
+                         ROWWISE_MAX_ARGS, (long long)argc);
+    if (argc < 1 || !ray_active_query_table() || ray_query_row_active()) return NULL;
+    int64_t nrows = -1;
+    bool map[ROWWISE_MAX_ARGS] = { false };
+    for (int64_t j = 0; j < argc; j++) {
+        map[j] = rows[j] == 1 && args[j] && !RAY_IS_ERR(args[j]) && !ray_is_atom(args[j]) &&
+                 (ray_is_vec(args[j]) || args[j]->type == RAY_LIST);
+        if (!map[j]) continue;
+        if (nrows < 0) nrows = ray_len(args[j]);
+        else if (ray_len(args[j]) != nrows)
+            return ray_error("length", "row-wise call: arguments of %lld and %lld rows",
+                             (long long)nrows, (long long)ray_len(args[j]));
+    }
+    if (nrows < 0) return NULL;
+    ray_t* out = ray_list_new(nrows > 0 ? nrows : 1);
+    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    bool all_str = true;
+    for (int64_t i = 0; i < nrows; i++) {
+        ray_t* cargs[ROWWISE_MAX_ARGS] = { NULL };
+        int alloc[ROWWISE_MAX_ARGS] = { 0 };
+        for (int64_t j = 0; j < argc; j++) {
+            alloc[j] = 0;
+            cargs[j] = map[j] ? collection_elem(args[j], i, &alloc[j]) : args[j];
+        }
+        ray_t* r = fn_type == RAY_UNARY ? ((ray_unary_fn)fnp)(cargs[0])
+                 : fn_type == RAY_BINARY ? ((ray_binary_fn)fnp)(cargs[0], cargs[1])
+                 : ((ray_vary_fn)fnp)(cargs, argc);
+        for (int64_t j = 0; j < argc; j++) if (alloc[j]) ray_release(cargs[j]);
+        if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
+        all_str = all_str && r->type == -RAY_STR;
+        out = ray_list_append(out, r);
+        ray_release(r);
+        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+    }
+    if (nrows == 0) {   /* no rows: no string, the marked builtins render text */
+        ray_release(out);
+        return ray_vec_new(RAY_STR, 0);
+    }
+    if (!all_str) return out;
+    ray_t* sv = ray_vec_new(RAY_STR, nrows);
+    ray_t** cells = (ray_t**)ray_data(out);
+    for (int64_t i = 0; i < nrows && sv && !RAY_IS_ERR(sv); i++)
+        sv = ray_str_vec_append(sv, ray_str_ptr(cells[i]), ray_str_len(cells[i]));
+    ray_release(out);
+    return sv ? sv : ray_error("oom", NULL);
+}
+
 /* Whether a builtin keeps row provenance: the planner lowers it row by
  * row, so its result over a column-derived operand is column-derived.
  * Cached by object for one symbol-table epoch: the builtin objects live
@@ -5165,8 +5231,14 @@ op_jmpf: {
         }                                                                   \
     }                                                                       \
     RAY_ASSERT_VALUE(arg);                                                  \
-    ray_t *result = APPLY;                                                  \
-    uint8_t result_rows = arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0; \
+    ray_t *result = RAY_UNLIKELY(fn_obj->type == RAY_UNARY &&               \
+                                 (fn_obj->attrs & RAY_FN_ROWWISE))          \
+        ? rowwise_apply(RAY_UNARY, (void*)(uintptr_t)fn_obj->i64, &arg,     \
+                        &arg_rows, 1) : NULL;   /* per row in a query */    \
+    bool rowwise_done = result != NULL;                                     \
+    if (!result) result = APPLY;                                            \
+    uint8_t result_rows = rowwise_done ? 1                                  \
+        : arg_rows && vm_fn_rowwise(fn_obj) ? arg_rows : 0;                 \
     ray_release(arg);                                                       \
     ray_release(fn_obj);                                                    \
     if (RAY_IS_ERR(result)) { vm_err_obj = result; goto vm_error; }        \
@@ -5200,9 +5272,11 @@ op_jmpf: {
     if (n > 64) goto vm_error;                                              \
     ray_t *fn_args[64];                                                     \
     uint8_t args_rows = 0;                                                  \
+    uint8_t argn_rows[64];                                                  \
     for (int32_t i = n - 1; i >= 0; i--) {                                  \
         fn_args[i] = POP();                                                 \
-        args_rows = vrows_join(args_rows, POPPED_ROWS());                   \
+        argn_rows[i] = POPPED_ROWS();                                       \
+        args_rows = vrows_join(args_rows, argn_rows[i]);                    \
     }                                                                       \
     ray_t *fn_obj = POP();                                                  \
     if (RAY_UNLIKELY(fn_is_restricted(fn_obj))) {                           \
@@ -5216,8 +5290,12 @@ op_jmpf: {
         ray_t* err = materialize_owned_args(fn_args, n);                    \
         if (err) { ray_release(fn_obj); vm_err_obj = err; goto vm_error; }  \
     }                                                                       \
-    ray_t *result = ray_sig_note(ray_fn_name(fn_obj), APPLY);               \
-    uint8_t result_rows = args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0; \
+    ray_t *result = RAY_UNLIKELY(fn_obj->attrs & RAY_FN_ROWWISE)            \
+        ? rowwise_apply(RAY_VARY, (void*)fn, fn_args, argn_rows, n) : NULL; \
+    bool rowwise_done = result != NULL;   /* per row in a query (#1594) */  \
+    if (!result) result = ray_sig_note(ray_fn_name(fn_obj), APPLY);        \
+    uint8_t result_rows = rowwise_done ? 1                                  \
+        : args_rows && vm_fn_rowwise(fn_obj) ? args_rows : 0;               \
     for (int32_t i = 0; i < n; i++)                                         \
         ray_release(fn_args[i]);                                            \
     ray_release(fn_obj);                                                    \
@@ -5362,6 +5440,7 @@ op_callf: {
     {
         ray_t *result;
         int8_t lambda_rows = -1;
+        bool rowwise_done = false;   /* an element-wise builtin applied per row (#1594) */
         int32_t prof_frame = -1;
         if (RAY_UNLIKELY(ray_callprof_on())) prof_frame = ray_callprof_enter_vm(vm.fn, ip - 1);
         switch (fn_obj->type) {
@@ -5395,6 +5474,12 @@ op_callf: {
             if (!(fn_obj->attrs & RAY_FN_LAZY_AWARE) && fn_args[0] && ray_is_lazy(fn_args[0])) {
                 fn_args[0] = ray_lazy_materialize(fn_args[0]); /* consumes owned ref */
                 if (!fn_args[0] || RAY_IS_ERR(fn_args[0])) { result = fn_args[0] ? fn_args[0] : ray_error("type", NULL); fn_args[0] = NULL; break; }
+            }
+            if (RAY_UNLIKELY(fn_obj->attrs & RAY_FN_ROWWISE) &&
+                (result = rowwise_apply(RAY_UNARY, (void*)(uintptr_t)unary, fn_args, arg_rows, 1)) != NULL) {
+                ray_release(fn_args[0]);
+                rowwise_done = true;
+                break;
             }
             /* The generic null: only nil?, type and ser take it, as on the
              * tree walker and in OP_CALL1. */
@@ -5463,7 +5548,10 @@ unary_done:
                 result = materialize_owned_args(fn_args, n);
                 if (result) break;
             }
-            result = ((ray_vary_fn)(uintptr_t)fn_obj->i64)(fn_args, n);
+            result = RAY_UNLIKELY(fn_obj->attrs & RAY_FN_ROWWISE)
+                ? rowwise_apply(RAY_VARY, (void*)(uintptr_t)fn_obj->i64, fn_args, arg_rows, n) : NULL;
+            rowwise_done = result != NULL;
+            if (!result) result = ((ray_vary_fn)(uintptr_t)fn_obj->i64)(fn_args, n);
             for (int32_t i = 0; i < n; i++) ray_release(fn_args[i]);
             break;
         case RAY_LAMBDA: {
@@ -5481,7 +5569,8 @@ unary_done:
             break;
         }
         if (RAY_UNLIKELY(prof_frame >= 0)) ray_callprof_exit(prof_frame);
-        uint8_t result_rows = fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
+        uint8_t result_rows = rowwise_done ? 1
+            : fn_obj->type == RAY_LAMBDA ? vrows_from(lambda_rows)
             : fn_obj->type == RAY_BINARY ? (uint8_t)(lambda_rows == 1)
             : args_any && (fn_obj->type == RAY_UNARY || fn_obj->type == RAY_VARY) &&
               vm_fn_rowwise(fn_obj) ? args_any : 0;
@@ -6372,13 +6461,13 @@ static void ray_register_builtins(void) {
     /* I/O builtins */
     register_vary("println",    RAY_FN_NONE, ray_println_fn);
     register_vary("show",       RAY_FN_NONE, ray_show_fn);
-    register_vary("format",     RAY_FN_NONE, ray_format_fn);
-    register_vary("repr",      RAY_FN_NONE, ray_repr_fn);
+    register_vary("format",     RAY_FN_ROWWISE, ray_format_fn);
+    register_vary("repr",      RAY_FN_ROWWISE, ray_repr_fn);
     register_vary("read-value",  RAY_FN_NONE, ray_read_value_fn);
     register_vary("read-limits", RAY_FN_NONE, ray_read_limits_fn);
     register_vary(".json.parse", RAY_FN_NONE, ray_json_parse_fn);
     register_vary(".json.get", RAY_FN_NONE, ray_json_get_fn);
-    register_unary(".json.format", RAY_FN_NONE, ray_json_format_fn);
+    register_unary(".json.format", RAY_FN_ROWWISE, ray_json_format_fn);
     register_vary("read-csv",   RAY_FN_RESTRICTED, ray_read_csv_fn);
     register_vary("write-csv",  RAY_FN_RESTRICTED, ray_write_csv_fn);
     register_vary(".csv.read",         RAY_FN_RESTRICTED, ray_read_csv_fn);
@@ -7013,6 +7102,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             bool fused = false;
             ray_t* arg = eval_impl(elems[1], fn == (ray_unary_fn)ray_sum_fn ? &fused : NULL);
             if (fused) { ray_release(head); ret = arg; rows = 0; goto out; }
+            int8_t arg_rows = g_eval_rows;
             rows = rowwise ? g_eval_rows : 0;
             ray_release(head);
             if (arg && RAY_IS_ERR(arg)) { ret = arg; goto out; }
@@ -7025,6 +7115,15 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
             }
             ray_t* result;
             RAY_ASSERT_VALUE(arg);
+            if (RAY_UNLIKELY(fn_attrs & RAY_FN_ROWWISE)) {   /* applied per row in a query (#1594) */
+                uint8_t r1 = vrows_from(arg_rows);
+                ray_t* rw = rowwise_apply(RAY_UNARY, (void*)(uintptr_t)fn, &arg, &r1, 1);
+                if (rw) {
+                    if (arg) ray_release(arg);
+                    rows = RAY_IS_ERR(rw) ? 0 : 1;
+                    ret = rw; goto out;
+                }
+            }
             if (RAY_IS_NULL(arg)) {
                 /* Only nil?/type/ser safely handle null */
                 result = (fn == (ray_unary_fn)ray_nil_fn || fn == (ray_unary_fn)ray_type_fn ||
@@ -7233,6 +7332,7 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 if (!args) { ray_release(head); ret = ray_error("oom", NULL); goto out; }
             }
             int8_t any_rows = 0;
+            uint8_t argv_rows[64];   /* each argument's flag, for a row-wise builtin */
             for (int64_t i = 0; i < argc; i++) {
                 /* .json.get's type, a quoted symbol after the path, names a
                  * type, never a column a query would read it as */
@@ -7241,10 +7341,12 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                     (ai->attrs & ATTR_QUOTED)) {
                     ray_retain(ai);
                     args[i] = ai;
+                    argv_rows[i] = 0;
                     continue;
                 }
                 args[i] = ray_eval(ai);
                 any_rows = rows_join(any_rows, g_eval_rows);
+                if (i < 64) argv_rows[i] = vrows_from(g_eval_rows);
                 if (!args[i] || RAY_IS_ERR(args[i])) {
                     ray_t* err = (!args[i]) ? ray_error("type", NULL) : args[i];
                     for (int64_t j = 0; j < i; j++) ray_release(args[j]);
@@ -7259,9 +7361,15 @@ static ray_t* eval_impl(ray_t* obj, bool* summed) {
                 ray_t* err = materialize_owned_args(args, argc);
                 if (err) { if (args != stack_args) ray_free_raw(args); ray_release(head); ret = err; goto out; }
             }
+            uint8_t vary_attrs = head->attrs;
             ray_release(head);
             if (callee_mutator) ray_env_mutator_callee_arm();
-            ray_t* result = ray_sig_note(nm, fn(args, argc));
+            ray_t* result = NULL;
+            if (RAY_UNLIKELY(vary_attrs & RAY_FN_ROWWISE) && argc <= 64) {   /* per row in a query (#1594) */
+                result = rowwise_apply(RAY_VARY, (void*)(uintptr_t)fn, args, argv_rows, argc);
+                if (result) rows = RAY_IS_ERR(result) ? 0 : 1;
+            }
+            if (!result) result = ray_sig_note(nm, fn(args, argc));
             for (int64_t i = 0; i < argc; i++) ray_release(args[i]);
             if (args != stack_args) ray_free_raw(args);
             ret = result; goto out;

@@ -37,6 +37,12 @@
 #define RAY_FN_AGGR          0x08  /* aggregation function */
 #define RAY_FN_SPECIAL_FORM  0x10  /* receives unevaluated args */
 #define RAY_FN_RESTRICTED    0x20  /* forbidden during -U restricted IPC evals */
+/* A builtin (never a lambda: there the bit is RAY_FN_COMPILED) that is
+ * element-wise in a query: called inside a query with an argument that is
+ * a column's rows, it is applied once per row, on every route, as the
+ * per-row projection applies it.  Outside a query it takes its arguments
+ * whole.  The text renderers format, repr and .json.format (#1594). */
+#define RAY_FN_ROWWISE       0x40
 #define RAY_FN_LAZY_AWARE    0x80  /* fn extends or starts lazy chains;
                                       dispatcher must NOT materialise its
                                       args. Without this flag, dispatcher

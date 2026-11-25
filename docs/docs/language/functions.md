@@ -465,7 +465,7 @@ Rayforce supports equi-joins, outer joins, anti-joins, and time-series-aware joi
 | `replace` | variadic | Replace all occurrences; lazy/DAG for vectors. An empty `to` deletes each match, an empty `from` matches nothing | `(replace "a-b" "-" "_")` → `"a_b"` |
 | `like` | binary | Glob pattern match: `*` any, `?` one, `[abc]`/`[a-z]`/`[!abc]` char class. The pattern is a string atom, or a string column matched row by row; a symbol or a number is a `type` error | `(like "hello" "hel*")` → `true` |
 | `concat` | binary | Join two atoms, vectors or lists, mixed types giving a list; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and in a query: `(concat "" "a")` is `"a"` | `(concat "hello" " world")` → `"hello world"` |
-| `format` | variadic | Format values as string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "x=%" 42)` → `"x=42"` |
+| `format` | variadic | Format values as string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`; in a query element-wise: one string per row of a column, on every route | `(format "x=%" 42)` → `"x=42"` |
 
 !!! note "Note"
     String transforms are available as direct builtins and use the same DAG opcodes inside `select`/`update`. All string transformations propagate nulls: null input rows produce null output rows.
@@ -560,7 +560,7 @@ not collide between two processes writing into the same table, use `guid`.
 | `println` | variadic | Print values with newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(println "hello" 42)` |
 | `print` | unary | Print value without newline; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(print "hello")` |
 | `show` | variadic | Pretty-print a value (tables formatted); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(show trades)` |
-| `format` | variadic | Format value to string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(format "val=%" 42)` → `"val=42"` |
+| `format` | variadic | Format value to string (% is placeholder); a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`; in a query element-wise: one string per row of a column, on every route | `(format "val=%" 42)` → `"val=42"` |
 | `.csv.read` | variadic | Load CSV file into table | `(.csv.read "data.csv")` |
 | `.csv.write` | variadic | Write table to CSV file | `(.csv.write trades "out.csv")` |
 | [`.parquet.read`](../namespaces/parquet.md#parquet-read) | variadic | Read a Parquet file into a table | `(.parquet.read [id price] "trades.parquet")` |
@@ -637,12 +637,12 @@ spills exactly as it did before.
 |---|---|---|---|
 | `ser` | unary | Serialize value to binary format (a value nested deeper than 512 levels fails with `limit`; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`) | `(ser [1 2 3])` |
 | `de` | unary | Deserialize from binary format; a list holding an error value (built in C, never in Rayfall, where a caught error is a dict) reads back as its first error, see [A list holding an error value](../storage/ipc.md#a-list-holding-an-error-value) | `(de bytes)` |
-| `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit` | `(repr [1i 2i])` |
+| `repr` | variadic | Write a value as Rayfall text that reads back to the same value; an optional byte limit fails with `limit` instead of returning more; a value that [repeats its parts](../data-types/collections.md#values-that-repeat-their-parts) beyond 1 GiB of extra output fails with `limit`; in a query element-wise: one string per row of a column, on every route | `(repr [1i 2i])` |
 | `read-value` | variadic | Read one value from data text without evaluating it; an optional dict overrides the limits | `(read-value "{a: 1 b: [2 3]}")` |
 | `read-limits` | variadic | The default limits of `read-value`, as a dict | `(read-limits)` |
 | `.json.parse` | variadic | JSON text to a value; element-wise over a string vector; see [`.json.*`](../namespaces/json.md) | `(.json.parse "[1,2]")` |
 | `.json.get` | variadic | One field of each JSON document by a dotted path (or one path per row), with an optional type (`'STR`, `'I64`, `'F64`: always that type, null where absent or another kind) and optional limits | `(.json.get line "kind")` |
-| `.json.format` | unary | A value as JSON text | `(.json.format (dict ["a"] (list 1)))` |
+| `.json.format` | unary | A value as JSON text; in a query element-wise: one string per row of a column, on every route | `(.json.format (dict ["a"] (list 1)))` |
 | `.db.splayed.set` | variadic | Save table as splayed columns to directory; optional `{compress: bool, symfile: 'shared/'column, index: bool, durable: bool}`; `{durable: false}` skips the fsyncs; a parted table is written a segment at a time | `(.db.splayed.set "db/trades" trades)` |
 | `.db.splayed.get` | variadic | Load splayed table from directory | `(.db.splayed.get "db/trades")` |
 | `.db.parted.get` | variadic | Load partitioned table by name from root directory | `(.db.parted.get "db" 'trades)` |

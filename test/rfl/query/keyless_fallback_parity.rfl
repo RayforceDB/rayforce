@@ -135,13 +135,15 @@
 (S (select {from: T where: (> c 1) by: k s: (last (at s GX))}))                        -- [cc]
 (S (select {from: T where: (> c 100) s: (last (at s GX)) z: (first (+ w 0))}))         -- (S (select {from: T where: (> c 100) s: (last (at s GX))}))
 
-;; ── text is one value: first and last take a character of it ──────────────
+;; ── format is element-wise in a query: first and last take a row's text ──
+;; (#1594: one string per row on every route; a text atom, below, is one value
+;; and first and last take a character of it)
 (set V (table [c v k w] (list [1 5 6 2] (list "bb" "cc" "dd" "ee") [0 0 0 0] [2024.02.01 2024.02.02 2024.02.03 2024.02.04])))
-(S (select {from: T s: (first (format "%" c)) z: (first (+ w 0))}))       -- ["["]
-(S (select {from: T s: (first (format "%" c))}))                          -- ["["]
-(S (select {from: T by: k s: (first (format "%" c))}))                    -- ["["]
-(S (select {from: T where: (> c 1) s: (last (format "%" c)) z: (first (+ w 0))}))  -- ["]"]
-(S (select {from: T where: (> c 1) by: k s: (last (format "%" c))}))               -- ["]"]
+(S (select {from: T s: (first (format "%" c)) z: (first (+ w 0))}))       -- ["1"]
+(S (select {from: T s: (first (format "%" c))}))                          -- ["1"]
+(S (select {from: T by: k s: (first (format "%" c))}))                    -- ["1"]
+(S (select {from: T where: (> c 1) s: (last (format "%" c)) z: (first (+ w 0))}))  -- ["2"]
+(S (select {from: T where: (> c 1) by: k s: (last (format "%" c))}))               -- ["2"]
 (S (select {from: V s: (first (at v 0)) z: (first (+ w 0))}))           -- ["b"]
 (S (select {from: V s: (first (at v 0))}))                                -- ["b"]
 (S (select {from: V by: k s: (first (at v 0))}))                          -- ["b"]
