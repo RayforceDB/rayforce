@@ -10167,6 +10167,17 @@ static test_result_t test_time_sleep_restricted(void) {
     PASS();
 }
 
+/* Under -U an append to a splayed table on disk is refused, as a save is:
+ * nothing is written (the directory is never created). */
+static test_result_t test_splayed_append_restricted(void) {
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(ray_test_tmp(
+        "(.db.splayed.append \"/tmp/rf_append_restricted/t\" (table [a] (list [1])))")));
+    TEST_ASSERT_TRUE(restricted_expr_returns_access(ray_test_tmp(
+        "(.db.splayed.set \"/tmp/rf_append_restricted/t\" (table [a] (list [1])))")));
+    TEST_ASSERT_EQ_I(access(ray_test_tmp("/tmp/rf_append_restricted"), F_OK), -1);
+    PASS();
+}
+
 /* A request can be evaluated while server code waits inside a frame (a
  * request a peer pushes back during a sync send).  It binds only in frames
  * it opens itself: a `let` that would land in the waiting code's frame is
@@ -15860,6 +15871,8 @@ const test_entry_t lang_entries[] = {
     { "lang/eval/restricted_let_global", test_eval_restricted_let_global, lang_setup, lang_teardown },
     { "lang/time_sleep_cancel", test_time_sleep_cancel, lang_setup, lang_teardown },
     { "lang/time_sleep_restricted", test_time_sleep_restricted, lang_setup, lang_teardown },
+
+    { "lang/splayed_append_restricted", test_splayed_append_restricted, lang_setup, lang_teardown },
     { "lang/interrupt_take", test_interrupt_take, lang_setup, lang_teardown },
     { "lang/parallel_interrupt_flag", test_interrupt_flag_threads, lang_setup, lang_teardown },
     { "lang/eval/restricted_let_server_frame", test_eval_restricted_let_server_frame, lang_setup, lang_teardown },

@@ -1224,7 +1224,9 @@ ray_err_t ray_encw_finish(ray_encw_t* w) {
         if (w->idict) {
             const ray_dict_acc_t* a = w->idict;
             if (a->dead || a->n_rows != w->len) return RAY_ERR_RANGE;      /* internal: every row fed */
-            ray_enc_dict_src_t s = { .len = w->len, .n_distinct = a->n_distinct, .codes = a->codes,
+            const int32_t* codes = ray_dict_acc_codes(w->idict);   /* the array, or its spill file mapped */
+            if (!codes) return RAY_ERR_IO;
+            ray_enc_dict_src_t s = { .len = w->len, .n_distinct = a->n_distinct, .codes = codes,
                                      .first_occ = a->first_occ, .offs = a->offs, .bytes = a->pool,
                                      .bytes_len = a->pool_len };
             uint64_t nb = 0;

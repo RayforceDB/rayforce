@@ -304,6 +304,7 @@ static const ray_sig_entry_t own_sigs[] = {
     {".db.parted.fill", "(.db.parted.fill <root: str>)"},
     {".db.splayed.get", "(.db.splayed.get <dir: str> [<options>])"},
     {".db.splayed.set", "(.db.splayed.set <dir: str> <table: table> [<options>...])"},
+    {".db.splayed.append", "(.db.splayed.append <dir: str> <table: table> [<sym: str>] [<options>])"},
     {".csv.splayed", "(.csv.splayed [<schema>] [<options: dict>] <source: str path> <target: str dir>)"},
     {".csv.parted", "(.csv.parted [<schema>...] [<options: dict>] <source: str path> <root: str dir> <table: sym>)"},
     {".parquet.read", "(.parquet.read [<columns>] <path: nonempty str>)"},

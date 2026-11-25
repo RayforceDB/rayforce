@@ -8,13 +8,14 @@ Persist and reload tables. Rayforce stores tables in two on-disk shapes:
 The `get` builtins memory-map every column file — load is constant-time regardless of dataset size. `set` writes a table's columns to a splayed directory. A loaded parted table can also grow an in-memory live tail with `insert`; that operation is deliberately separate from persistence.
 
 !!! note "Restricted under `-U`"
-    `.db.splayed.set` and `.db.parted.fill` are `RAY_FN_RESTRICTED` (they write to disk). The `get`/`tables` builtins are read-only and unrestricted.
+    `.db.splayed.set`, `.db.splayed.append` and `.db.parted.fill` are `RAY_FN_RESTRICTED` (they write to disk). The `get`/`tables` builtins are read-only and unrestricted.
 
 ## Reference
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
 | [`.db.splayed.set`](#db-splayed-set) | variadic | restricted | Save a table to a splayed directory. |
+| [`.db.splayed.append`](#db-splayed-append) | variadic | restricted | Append a table's rows to a splayed table on disk without loading it. |
 | [`.db.splayed.get`](#db-splayed-get) | variadic | — | Load a splayed table (columns mmap'd; compressed columns decode on first read). |
 | [`.db.parted.get`](#db-parted-get) | variadic | — | Load a partitioned table by name from a db root. |
 | [`.db.parted.tables`](#db-parted-tables) | variadic | — | List the table names available under a parted db root. |
@@ -44,7 +45,7 @@ An index the column already carries (one built with `.idx.hash`, `.idx.sort` or 
 
 Compressed F32/F64 writes and whole-column materialization require default FP controls (nearest rounding, masked exceptions, no FTZ/DAZ) on every calling/executing thread. Rayforce never silently normalizes the host's controls. Detected unsupported controls return `fpenv`; restore supported controls before retrying. Detection is not a complete portable validator: see [the compressed floating-point environment contract](../storage/index.md#compressed-floating-point-environment) for conservative refusal scope, platform-specific checks, and embedder responsibilities.
 
-**A parted table** (one loaded with [`.db.parted.get`](#db-parted-get)) is written without holding it in memory: each column is written a partition segment at a time, a segment of a plain partition straight from its mapped file and a compressed one decoded a chunk (65,536 rows) at a time, so the process's own memory does not grow with the table's rows. The result is the table its in-memory copy would be: the partition key (`date`, `part`, …) is written as an ordinary column holding each row's key, `SYM` columns are re-encoded into the destination's symbol file, and a partition that lacks a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null), as in the in-memory copy. Drop the key from the written table with `xcols`, e.g. `(xcols P (drop (cols P) 1))`. When `compress` is absent, a parted column follows the inherit rule above: it is written at generation 2 when any of its partitions is compressed (so a root mixing plain and compressed partitions writes the whole column at generation 2) or when the destination's current file is generation 2, else at generation 0. The one cost that still grows with the rows is the dictionary index a save builds for a string column of 65,536 rows or more, up to about 12 bytes a row while it is built; `{index: false}` skips it. Use it to merge the partitions of a root into one splayed table, or to copy a parted table elsewhere.
+**A parted table** (one loaded with [`.db.parted.get`](#db-parted-get)) is written without holding it in memory: each column is written a partition segment at a time, a segment of a plain partition straight from its mapped file and a compressed one decoded a chunk (65,536 rows) at a time, so the process's own memory does not grow with the table's rows. The result is the table its in-memory copy would be: the partition key (`date`, `part`, …) is written as an ordinary column holding each row's key, `SYM` columns are re-encoded into the destination's symbol file, and a partition that lacks a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null), as in the in-memory copy. Drop the key from the written table with `xcols`, e.g. `(xcols P (drop (cols P) 1))`. When `compress` is absent, a parted column follows the inherit rule above: it is written at generation 2 when any of its partitions is compressed (so a root mixing plain and compressed partitions writes the whole column at generation 2) or when the destination's current file is generation 2, else at generation 0. The dictionary index a save builds for a string column of 65,536 rows or more is built the same way: its codes go to a file next to the column as they are made, so it holds one copy of each distinct string in memory instead of 4 bytes a row: its memory follows the column's distinct strings, not its rows. Use it to merge the partitions of a root into one splayed table, or to copy a parted table elsewhere.
 
 Returns `tbl` (retained), so the call can be threaded inside a larger expression.
 
@@ -55,6 +56,42 @@ Errors: `type` (dir/sym not strings, tbl not a table), `domain` (paths empty / t
   (list ['London 'Paris 'Tokyo] [15 22 28] [120.5 60.3 200.1])))
 
 (.db.splayed.set "/tmp/weather" t)
+```
+
+## `.db.splayed.append` { #db-splayed-append }
+
+Append a table's rows to the splayed table in a directory, without loading the table on disk.
+
+- `(.db.splayed.append "dir" tbl)` — the symbol file is resolved as `.db.splayed.set` resolves it: `dir/.sym`, or the root's `.sym` for a partition of a parted root.
+- `(.db.splayed.append "dir" tbl "sym_path")` — name the symbol file.
+- `(.db.splayed.append "dir" tbl opts)` and `(.db.splayed.append "dir" tbl "sym_path" opts)` — the same with an options dict: `index` and `durable`, as for [`.db.splayed.set`](#db-splayed-set). Any other key is a `domain` error, `compress` and `symfile` included: an append keeps each column's generation (a compressed column stays compressed) and the table's symbol-file layout (`'shared` or `'column`).
+
+`tbl` must have the target's column names, in any order; its rows are written in the target's column order. Each column must have the type of the target's column of that name. Columns may be in-memory vectors or columns of a loaded (mapped) table, such as a partition read with `.db.splayed.get`.
+
+The target is mapped, not loaded. Under the table's write lock, each column is written into a new generation, first the rows on disk (read from the mapped file, a compressed one a chunk of 65,536 rows at a time), then the new rows. Then the new generation is published as a save publishes it: the new symbols are appended to the symbol file and flushed first, then the columns are written, then `.d`, then `.current` is switched. A crash or a failure before the switch leaves the previous table current (see [Atomic table replacement](../storage/index.md#atomic-table-replacement)). The process's own memory does not grow with the number of rows on disk, but it does grow with the number of distinct values. A string column's dictionary index is rebuilt over every row. Its codes go to a file as they are made, but it keeps one copy of each distinct string in memory, and the symbol file keeps its vocabulary in memory too. One measurement on a two-core Linux host: appending one row to a table whose string column holds 100,000, 500,000 or 1,000,000 distinct strings peaked at 21, 63 and 111 MiB. Appending 1,000,000 rows over a fixed vocabulary peaked at about 15 MiB, whether 1, 4 or 8 million rows were on disk. `{index: false}` builds no dictionary. The rows on disk are copied into the new generation, so an append takes time in proportion to the table's size on disk (compressed columns are decoded and encoded again). New symbols are appended to the symbol file and the symbols already in it keep their positions. A `SYM` column is widened when the symbol file outgrows the column's width. A linked column keeps its link. An index the target column carries that the save does not build itself (one built with `.idx.hash`, `.idx.sort` or `.idx.bloom`) is not carried into the new generation. Build it again after the append if you need it.
+
+If no table is published in `dir`, `tbl` is written there, as `.db.splayed.set` would write it. A table with no rows writes nothing and leaves the target as it was. Returns `tbl` (retained).
+
+Use it to merge partitions one at a time into one splayed table, and to add the rows that arrived to a growing table without rewriting it from memory:
+
+```lisp
+(set root "/data/db")
+(.db.splayed.append "/data/merged/trades" (.db.splayed.get (format "%/2024.01.15/trades" root) (format "%/.sym" root)))
+(.db.splayed.append "/data/merged/trades" (.db.splayed.get (format "%/2024.01.16/trades" root) (format "%/.sym" root)))
+```
+
+Errors (all but the last item are raised before anything is written):
+
+- `domain`: `tbl` does not have the target's column names. Also a symbol-file path given for a target whose `SYM` columns have symbol files of their own, or an unknown option or a non-bool option value.
+- `type`: a column's type differs from the target's, `dir` or `sym_path` is not a string, `tbl` is not a table, or the third or fourth argument is not a string or an options dict.
+- `nyi`: `tbl` is a parted table (write it with `.db.splayed.set`, or append its partitions one at a time), or the target has a list column.
+- `access`: the call comes from an IPC peer of a server started with `-U`.
+- Also any `io`, `oom` or `corrupt` error from the writer. An error raised before `.current` is switched publishes nothing, and the previous table stays current. The switch is the commit point. With `durable` (the default), the table directory is synced after it. If that sync fails, the call answers `io` with a message saying that the rows were published, and they are: a reader sees the new table, but it may not survive a power loss. Reopen the table and check its row count before appending the same rows again.
+
+```lisp
+(.db.splayed.set "/tmp/weather" (table [city temp] (list ['London 'Paris] [15 22])))
+(.db.splayed.append "/tmp/weather" (table [temp city] (list [28] ['Tokyo])))
+(count (.db.splayed.get "/tmp/weather"))   ; 3
 ```
 
 ## `.db.splayed.get` { #db-splayed-get }

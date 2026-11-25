@@ -1366,7 +1366,9 @@ ray_t* ray_index_attach_dict(ray_t** vp) {
  * the column itself is on disk by then.  There is no cardinality cap: the
  * accumulator holds 4 B/row of codes plus one copy of each distinct string,
  * less than the whole-column ray_index_dict_compute (codes + slots +
- * first_occ), and a high-cardinality dictionary still serves distinct. */
+ * first_occ), and a high-cardinality dictionary still serves distinct.
+ * A spilling one (ray_dict_acc_spill, the stream writer's) writes the codes
+ * to a file a window at a time, so only the distinct strings stay. */
 ray_err_t ray_dict_acc_init(ray_dict_acc_t* a) {
     memset(a, 0, sizeof(*a));
     a->mask = 1023;
@@ -1377,6 +1379,9 @@ ray_err_t ray_dict_acc_init(ray_dict_acc_t* a) {
 void ray_dict_acc_free(ray_dict_acc_t* a) {
     ray_free_raw(a->codes); ray_free_raw(a->first_occ); ray_free_raw(a->offs);
     ray_free_raw(a->lens); ray_free_raw(a->pool); ray_free_raw(a->slot);
+    if (a->spill_map) ray_vm_unmap_file(a->spill_map, a->spill_map_sz);
+    if (a->spill) fclose(a->spill);
+    if (a->spill_path) { remove(a->spill_path); ray_free_raw(a->spill_path); }
     bool dead = a->dead;
     memset(a, 0, sizeof(*a));
     a->dead = dead;
@@ -1395,11 +1400,51 @@ static ray_err_t dict_acc_rehash(ray_dict_acc_t* a) {
     return RAY_OK;
 }
 
+ray_err_t ray_dict_acc_spill(ray_dict_acc_t* a, const char* path) {
+    if (a->n_rows || a->spill || a->dead || !path) return RAY_ERR_DOMAIN;
+    size_t n = strlen(path);
+    a->spill_path = (char*)ray_alloc_raw(n + 1);
+    if (!a->spill_path) return RAY_ERR_OOM;
+    memcpy(a->spill_path, path, n + 1);
+    a->spill = fopen(path, "w+b");
+    if (!a->spill) { ray_free_raw(a->spill_path); a->spill_path = NULL; return RAY_ERR_IO; }
+    return RAY_OK;
+}
+
+/* Spilling: the window's codes to the file, the window emptied. */
+static ray_err_t dict_acc_spill_flush(ray_dict_acc_t* a) {
+    int64_t k = a->n_rows - a->spill_base;
+    if (!a->spill || k <= 0) return RAY_OK;
+    if (fwrite(a->codes, sizeof(int32_t), (size_t)k, a->spill) != (size_t)k) return RAY_ERR_IO;
+    a->spill_base = a->n_rows;
+    return RAY_OK;
+}
+
+/* Rows the next window of an add takes: all `left` of them, or what fits
+ * in the spill window. */
+static int64_t dict_acc_window(const ray_dict_acc_t* a, int64_t left) {
+    return a->spill && left > RAY_DICT_SPILL_ROWS ? RAY_DICT_SPILL_ROWS : left;
+}
+
+const int32_t* ray_dict_acc_codes(ray_dict_acc_t* a) {
+    static const int32_t none[1] = {0};
+    if (!a->spill) return a->codes ? a->codes : none;
+    if (a->spill_map) return (const int32_t*)a->spill_map;
+    if (dict_acc_spill_flush(a) != RAY_OK || fflush(a->spill) != 0) return NULL;
+    if (a->n_rows == 0) return none;
+    size_t sz = 0;
+    void* m = ray_vm_map_file(a->spill_path, &sz);
+    if (!m) return NULL;
+    if (sz != (size_t)a->n_rows * sizeof(int32_t)) { ray_vm_unmap_file(m, sz); return NULL; }
+    a->spill_map = m; a->spill_map_sz = sz;
+    return (const int32_t*)m;
+}
+
 /* Codes capacity for n more rows (the growth rule of ray_dict_acc_add). */
 static ray_err_t dict_acc_reserve(ray_dict_acc_t* a, int64_t n) {
-    if (a->n_rows + n > a->cap_rows) {
+    if (a->n_rows - a->spill_base + n > a->cap_rows) {
         int64_t cap = a->cap_rows ? a->cap_rows : 65536;
-        while (cap < a->n_rows + n) cap *= 2;
+        while (cap < a->n_rows - a->spill_base + n) cap *= 2;
         int32_t* p = (int32_t*)ray_realloc_raw(a->codes, (size_t)cap * sizeof(int32_t));
         if (!p) return RAY_ERR_OOM;
         a->codes = p; a->cap_rows = cap;
@@ -1452,7 +1497,7 @@ static inline ray_err_t dict_acc_put(ray_dict_acc_t* a, const char* p, size_t le
             if (err != RAY_OK) return err;
         }
     }
-    a->codes[row] = code;
+    a->codes[row - a->spill_base] = code;
     return RAY_OK;
 }
 
@@ -1462,14 +1507,19 @@ ray_err_t ray_dict_acc_add(ray_dict_acc_t* a, ray_t* v) {
     int64_t n = v->len;
     if (n <= 0) return RAY_OK;
     if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
-    ray_err_t e = dict_acc_reserve(a, n);
-    if (e != RAY_OK) return e;
-    for (int64_t i = 0; i < n; i++) {
-        if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
-        size_t len; const char* p = ray_str_vec_get(v, i, &len);
-        if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
+    for (int64_t off = 0; off < n; ) {
+        int64_t k = dict_acc_window(a, n - off);
+        ray_err_t e = dict_acc_reserve(a, k);
+        if (e != RAY_OK) return e;
+        for (int64_t i = 0; i < k; i++) {
+            if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
+            size_t len; const char* p = ray_str_vec_get(v, off + i, &len);
+            if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
+        }
+        a->n_rows += k;
+        off += k;
+        if ((e = dict_acc_spill_flush(a)) != RAY_OK) return e;
     }
-    a->n_rows += n;
     return RAY_OK;
 }
 
@@ -1477,15 +1527,20 @@ ray_err_t ray_dict_acc_add_raw(ray_dict_acc_t* a, const ray_str_t* d, const char
     if (a->dead) return RAY_OK;
     if (n <= 0) return RAY_OK;
     if (a->n_rows + n > INT32_MAX) { a->dead = true; ray_dict_acc_free(a); return RAY_OK; }
-    ray_err_t e = dict_acc_reserve(a, n);
-    if (e != RAY_OK) return e;
-    for (int64_t i = 0; i < n; i++) {
-        if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
-        const uint32_t len = d[i].len;
-        const char* p = len ? ray_str_t_ptr(&d[i], pool) : "";
-        if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
+    for (int64_t off = 0; off < n; ) {
+        int64_t k = dict_acc_window(a, n - off);
+        ray_err_t e = dict_acc_reserve(a, k);
+        if (e != RAY_OK) return e;
+        for (int64_t i = 0; i < k; i++) {
+            if (RAY_UNLIKELY((i & 4095) == 0 && ray_interrupted())) return RAY_ERR_CANCEL;
+            const uint32_t len = d[off + i].len;
+            const char* p = len ? ray_str_t_ptr(&d[off + i], pool) : "";
+            if ((e = dict_acc_put(a, p, len, a->n_rows + i)) != RAY_OK) return e;
+        }
+        a->n_rows += k;
+        off += k;
+        if ((e = dict_acc_spill_flush(a)) != RAY_OK) return e;
     }
-    a->n_rows += n;
     return RAY_OK;
 }
 
@@ -1501,7 +1556,13 @@ ray_t* ray_dict_acc_finish(ray_dict_acc_t* a, int64_t len) {
         ray_dict_acc_free(a);
         return ray_error("oom", NULL);
     }
-    codes->len = len; memcpy(ray_data(codes), a->codes, (size_t)len * 4);
+    const int32_t* cs = ray_dict_acc_codes(a);
+    if (!cs) {
+        ray_release(codes); ray_release(first_occ); ray_release(idx);
+        ray_dict_acc_free(a);
+        return ray_error("io", NULL);
+    }
+    codes->len = len; memcpy(ray_data(codes), cs, (size_t)len * 4);
     first_occ->len = a->n_distinct; memcpy(ray_data(first_occ), a->first_occ, (size_t)a->n_distinct * 4);
     ray_index_t* ix = ray_index_payload(idx);
     ix->u.dict.codes = codes; ix->u.dict.first_occ = first_occ; ix->u.dict.n_distinct = a->n_distinct;
@@ -1790,6 +1851,66 @@ bool ray_index_inline_write_file(FILE* f, const ray_index_t* ix) {
         if (pad && fwrite(zeros, 1, pad, f) != pad) return false;
     }
     return true;
+}
+
+/* The spill file's `bytes` (read from its start) appended to f. */
+static ray_err_t dict_acc_copy_spill(ray_dict_acc_t* a, FILE* f, size_t bytes) {
+    enum { BUF = 1 << 20 };
+    char* buf = (char*)ray_alloc_raw(BUF);
+    if (!buf) return RAY_ERR_OOM;
+    ray_err_t e = RAY_OK;
+    for (size_t left = bytes; e == RAY_OK && left; ) {
+        size_t k = left < BUF ? left : BUF;
+        if (fread(buf, 1, k, a->spill) != k || fwrite(buf, 1, k, f) != k) e = RAY_ERR_IO;
+        left -= k;
+    }
+    ray_free_raw(buf);
+    return e;
+}
+
+bool ray_dict_acc_wanted(const ray_dict_acc_t* a, int64_t len) {
+    return !a->dead && len >= RAY_DICT_MIN_ROWS && a->n_rows == len;
+}
+
+ray_err_t ray_dict_acc_write_region(FILE* f, ray_dict_acc_t* a, int64_t len) {
+    if (!ray_dict_acc_wanted(a, len)) return RAY_ERR_DOMAIN;
+    /* spilled codes are copied from their file a buffer at a time (no
+     * mapping to fault in); else from the array */
+    const int32_t* codes = a->spill ? NULL : ray_dict_acc_codes(a);
+    if (a->spill && (dict_acc_spill_flush(a) != RAY_OK || fflush(a->spill) != 0 ||
+                     fseek(a->spill, 0, SEEK_SET) != 0))
+        return RAY_ERR_IO;
+    if (!a->spill && !codes) return RAY_ERR_IO;
+    /* The children as ray_dict_acc_finish makes them, headers only: their
+     * cells are written from the codes and first_occ arrays. */
+    _Alignas(32) ray_t ch[2];
+    memset(ch, 0, sizeof ch);
+    ch[0].type = RAY_I32; ch[0].len = len;
+    ch[1].type = RAY_I32; ch[1].len = a->n_distinct;
+    ray_index_t ix;
+    memset(&ix, 0, sizeof ix);
+    ix.kind = RAY_IDX_DICT; ix.parent_type = RAY_STR; ix.built_for_len = len;
+    ix.u.dict.codes = &ch[0]; ix.u.dict.first_occ = &ch[1]; ix.u.dict.n_distinct = a->n_distinct;
+    _Alignas(32) uint8_t head[IDX_HEAD_BYTES];
+    idx_inline_head(head, &ix);
+    if (fwrite(head, 1, sizeof(head), f) != sizeof(head)) return RAY_ERR_IO;
+    static const uint8_t zeros[32] = {0};
+    const int32_t* data[2] = { codes, a->first_occ };
+    for (int i = 0; i < 2; i++) {
+        ray_t chdr = ch[i];
+        chdr.mmod = 1; chdr.rc = 1;
+        if (fwrite(&chdr, 1, 32, f) != 32) return RAY_ERR_IO;
+        size_t dbytes = (size_t)ch[i].len * sizeof(int32_t);
+        if (i == 0 && a->spill) {
+            ray_err_t e = dict_acc_copy_spill(a, f, dbytes);
+            if (e != RAY_OK) return e;
+        } else if (dbytes && fwrite(data[i], 1, dbytes, f) != dbytes) {
+            return RAY_ERR_IO;
+        }
+        size_t pad = (size_t)idx_blk_bytes(&ch[i]) - 32 - dbytes;
+        if (pad && fwrite(zeros, 1, pad, f) != pad) return RAY_ERR_IO;
+    }
+    return RAY_OK;
 }
 
 /* Map an mmap'd inline region in place: patch child offsets to absolute

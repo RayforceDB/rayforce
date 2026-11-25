@@ -937,6 +937,26 @@ ray_err_t ray_col_write_index_region(FILE* f, const void* ix_v, int64_t* payload
     return fflush(f) == 0 ? RAY_OK : RAY_ERR_IO;
 }
 
+ray_err_t ray_col_write_dict_region(FILE* f, void* acc, int64_t len, int64_t* payload_end_out) {
+    ray_dict_acc_t* a = (ray_dict_acc_t*)acc;
+    if (!f || !a) return RAY_ERR_DOMAIN;
+    if (!ray_dict_acc_wanted(a, len)) return RAY_ERR_DOMAIN;
+    if (fseek(f, 0, SEEK_END) != 0) return RAY_ERR_IO;
+#ifdef RAY_OS_WINDOWS
+    int64_t fsz = (int64_t)_ftelli64(f);
+#else
+    int64_t fsz = (int64_t)ftello(f);
+#endif
+    if (fsz < 32) return RAY_ERR_CORRUPT;
+    if (payload_end_out) *payload_end_out = fsz;
+    int64_t pad = ((fsz + 31) & ~(int64_t)31) - fsz;
+    static const uint8_t zeros[32] = {0};
+    if (pad > 0 && fwrite(zeros, 1, (size_t)pad, f) != (size_t)pad) return RAY_ERR_IO;
+    ray_err_t err = ray_dict_acc_write_region(f, a, len);
+    if (err != RAY_OK) return err;
+    return fflush(f) == 0 ? RAY_OK : RAY_ERR_IO;
+}
+
 void ray_col_stamp_index(ray_t* hdr) {
     memset(hdr->aux, 0, 16);
     uint32_t mg = COL_IDX_AUX_MAGIC;

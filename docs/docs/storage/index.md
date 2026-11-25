@@ -217,7 +217,17 @@ What this guarantees:
 (.db.splayed.set "/data/merged/2024.01/trades" (xcols P (drop (cols P) 1)) "/data/merged/.sym")
 ```
 
-The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null). The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds; only a string column's dictionary index (up to about 12 bytes a row while it is built, `{index: false}` skips it) grows with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+The written table is the one an in-memory copy of `P` would be, so it keeps the partition key (`date` here) as an ordinary column unless the key is dropped first, as above. `SYM` columns are re-encoded into the destination's symbol file, and a partition without a column contributes its rows as nulls (`false` / `0` for `BOOL` and `U8`, which have no null). The writer's memory is one chunk per column, a cache of symbol positions and the indexes the save builds. None of these grows with the row count. A string column's dictionary index writes its codes to a file next to the column as they are made and keeps one copy of each distinct string in memory, so its memory grows with the number of distinct strings, not with the rows. See [`.db.splayed.set`](../namespaces/db.md#db-splayed-set) for the options and errors.
+
+### Appending to a Splayed Table on Disk
+
+`.db.splayed.append` adds a table's rows to the splayed table in a directory without loading it. The table on disk is mapped, and each column is written into a new generation, first its rows on disk, then the new ones, through the same writer. The new generation is then published as a save publishes one (see [Atomic table replacement](#atomic-table-replacement)). A partition can be merged into a larger table one at a time this way, and a growing table can take the rows that arrived:
+
+```lisp
+(.db.splayed.append "/data/merged/2024.01/trades" (.db.splayed.get "/data/db/2024.01.15/trades" "/data/db/.sym") "/data/merged/.sym")
+```
+
+The process's own memory does not grow with the number of rows on disk. It does grow with the number of distinct strings and symbols, because a string column's dictionary and the symbol vocabulary keep one copy of each. The time grows with the rows on disk: they are copied into the new generation, and compressed columns are encoded again. A cost proportional to the new rows alone would need a different layout, with immutable tails added to a column instead of a rewritten generation. See [`.db.splayed.append`](../namespaces/db.md#db-splayed-append) for the rules and errors.
 
 ### Loading Partitioned Data
 
@@ -399,7 +409,7 @@ All file operations go through a portable abstraction layer in `src/store/fileio
 
 ## Rayfall Storage Builtins {#rayfall-storage}
 
-Rayfall provides three builtins for working with on-disk storage directly from the REPL or scripts.
+Rayfall provides builtins for working with on-disk storage directly from the REPL or scripts.
 
 ### `.db.splayed.set` — Save a Splayed Table
 
@@ -418,6 +428,8 @@ Writes a table as column files to a directory. A symbol table file is saved auto
 An optional third argument specifies a custom symbol table path: `(.db.splayed.set "/tmp/weather" t "/tmp/my_sym")`. Without it, a `sym` file is created in the table directory.
 
 The table may be a parted one: it is then written a partition segment at a time, never held in memory (see [Writing a Parted Table as One Splayed Table](#writing-a-parted-table-as-one-splayed-table)).
+
+To add rows to a table already on disk, use `.db.splayed.append` (see [Appending to a Splayed Table on Disk](#appending-to-a-splayed-table-on-disk)).
 
 A trailing options dict selects the column file format: `(.db.splayed.set "/tmp/weather" t {compress: true})`, also after the symbol path. `true` writes generation-2 (compressed) files where eligible, `false` generation 0; when absent each file inherits (generation 2 when its source is an encoded column or the destination's current file is generation 2). Unknown keys or a non-bool value are a `domain` error. Linked and nested/list columns are always written uncompressed. Compressed files record their indexes in the file header: those you built, and the dictionary or chunk zone a save builds on its own.
 

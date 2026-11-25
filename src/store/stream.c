@@ -187,6 +187,16 @@ ray_err_t ray_col_stream_index_begin(ray_col_stream_t* w, int64_t start_row) {
         w->dict = (ray_dict_acc_t*)ray_alloc_raw(sizeof(*w->dict));
         if (!w->dict) return RAY_ERR_OOM;
         ray_err_t err = ray_dict_acc_init(w->dict);
+        /* the codes go to a file next to the staging file as they are made,
+         * so the dictionary's memory follows its distinct strings, not the
+         * rows (the region is written from that file at finish); a
+         * hand-built writer without a staging file keeps them in memory */
+        char codes[sizeof(w->tmp_path) + 8];
+        if (err == RAY_OK && w->tmp_path[0]) {
+            int n = snprintf(codes, sizeof codes, "%s.codes", w->tmp_path);
+            err = n > 0 && (size_t)n < sizeof codes ? ray_dict_acc_spill(w->dict, codes) : RAY_ERR_RANGE;
+            if (err != RAY_OK) ray_dict_acc_free(w->dict);
+        }
         if (err != RAY_OK) { ray_free_raw(w->dict); w->dict = NULL; }
         return err;
     }
@@ -419,6 +429,13 @@ static ray_err_t stream_finish_gen2(ray_col_stream_t* w, bool durable) {
     uint32_t sc = w->type == RAY_SYM ? (uint32_t)ray_sym_domain_count(w->dom) : 0;
     if (err == RAY_OK) err = ray_encw_begin(&ew, f, w->type, attrs, w->rows, sc, ik, 0);
     ew.keep_dict = w->keep_dict;
+    /* the DICT's codes go to a file as the chunks are encoded (see
+     * ray_col_stream_index_begin) */
+    if (err == RAY_OK && ew.idict) {
+        char codes[sizeof(w->tmp_path) + 8];
+        int n = snprintf(codes, sizeof codes, "%s.codes", w->tmp_path);
+        err = n > 0 && (size_t)n < sizeof codes ? ray_dict_acc_spill(ew.idict, codes) : RAY_ERR_RANGE;
+    }
     if (err == RAY_OK && w->type == RAY_SYM) {
         ray_encw_set_sym_domain(&ew, w->dom);
         if (w->sym_bhas) ray_encw_set_sym_bounds(&ew, w->sym_bmn, w->sym_bmx, w->sym_bhas);
@@ -503,10 +520,19 @@ ray_err_t ray_col_stream_finish(ray_col_stream_t* w, bool durable) {
      * sentinel in any slice, flagged or not, publishes the bit, so the
      * loaded column and the zone agree on every cell. */
     if (w->zone && w->zone->saw_null) w->had_nulls = true;
-    if (err == RAY_OK && (w->zone || w->dict)) {
-        ray_t* idx = w->zone ? ray_zone_acc_finish(w->zone, w->rows)
-                             : ray_dict_acc_finish(w->dict, w->rows);
-        ray_free_raw(w->zone); ray_free_raw(w->dict); w->zone = NULL; w->dict = NULL;
+    if (err == RAY_OK && w->dict) {
+        /* the dictionary is written from its accumulator: no codes vector */
+        int64_t payload_end = 0;
+        ray_err_t ierr = ray_col_write_dict_region(w->fp, w->dict, w->rows, &payload_end);
+        inline_index = ierr == RAY_OK;
+        /* best effort, as the zone below: cut a partial region back */
+        if (ierr != RAY_OK && payload_end > 0 && !ray_col_truncate(w->fp, payload_end))
+            err = RAY_ERR_IO;
+        stream_drop_index(w);
+    }
+    if (err == RAY_OK && w->zone) {
+        ray_t* idx = ray_zone_acc_finish(w->zone, w->rows);
+        ray_free_raw(w->zone); w->zone = NULL;
         if (idx && RAY_IS_ERR(idx)) { ray_error_free(idx); idx = NULL; }   /* best effort */
         if (idx) {
             /* Index policy (compressed-columns PI): the converters persist
