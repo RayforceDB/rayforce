@@ -1939,7 +1939,77 @@ static const agg_vtable_t MAX_TIMESPAN = {
     .merge = max_i64_merge, .finalize = ext_timespan_final, .finalize_value = ext_timespan_value,
 };
 
+/* ---- OP_VAR_K / OP_VAR_D (internal, the parted merge, #1666) -----------
+ * The variance state as a partition ships it: its k rounded to double, and
+ * the mean about that double (k's rounding remainder exact, plus
+ * sum / cnt).  The same update and merge as VAR_POP of the type. */
+static double fin_var_k_i64_result(const void* s) {
+    const var_i64_state* st = s;
+    return st->cnt <= 0 ? NULL_F64 : (double)st->k;
+}
+AGG_SCALAR_FINAL(fin_var_k_i64, double, ray_f64, value != value)
+static double fin_var_d_i64_result(const void* s) {
+    const var_i64_state* st = s;
+    return st->cnt <= 0 ? NULL_F64 : ray_var_k_rem(st->k) + st->sum / (double)st->cnt;
+}
+AGG_SCALAR_FINAL(fin_var_d_i64, double, ray_f64, value != value)
+static double fin_var_k_f64_result(const void* s) {
+    const var_f64_state* st = s;
+    return st->cnt <= 0 ? NULL_F64 : st->k;
+}
+AGG_SCALAR_FINAL(fin_var_k_f64, double, ray_f64, value != value)
+static double fin_var_d_f64_result(const void* s) {
+    const var_f64_state* st = s;
+    return st->cnt <= 0 ? NULL_F64 : st->sum / (double)st->cnt;
+}
+AGG_SCALAR_FINAL(fin_var_d_f64, double, ray_f64, value != value)
+#define VAR_KD_TABLES(SFX, ST, UPD)                                            \
+static const agg_vtable_t VAR_K_##SFX = {                                      \
+    .state_size = sizeof(var_##ST##_state), .kind = ACC_STREAMING, .out_type = RAY_F64, \
+    .init = var_##ST##_init, .update_batch = UPD,                              \
+    .merge = var_##ST##_merge, .finalize = fin_var_k_##ST, .finalize_value = fin_var_k_##ST##_value, \
+};                                                                             \
+static const agg_vtable_t VAR_D_##SFX = {                                      \
+    .state_size = sizeof(var_##ST##_state), .kind = ACC_STREAMING, .out_type = RAY_F64, \
+    .init = var_##ST##_init, .update_batch = UPD,                              \
+    .merge = var_##ST##_merge, .finalize = fin_var_d_##ST, .finalize_value = fin_var_d_##ST##_value, \
+};
+VAR_KD_TABLES(I64, i64, var_i64_update)
+VAR_KD_TABLES(F64, f64, var_f64_update)
+VAR_KD_TABLES(BOOL, i64, var_bool_native_update)
+VAR_KD_TABLES(U8, i64, var_u8_native_update)
+VAR_KD_TABLES(I16, i64, var_i16_native_update)
+VAR_KD_TABLES(I32, i64, var_i32_native_update)
+VAR_KD_TABLES(F32, f64, var_f32_native_update)
+VAR_KD_TABLES(DATE, i64, var_date_native_update)
+VAR_KD_TABLES(TIME, i64, var_time_native_update)
+VAR_KD_TABLES(TIMESTAMP, i64, var_timestamp_native_update)
+#undef VAR_KD_TABLES
+
+/* VAR_K / VAR_D of in_type: the pair whose update is VAR_POP's for it. */
+static const agg_vtable_t* agg_resolve_var_kd(uint16_t agg_kind, const agg_vtable_t* pop) {
+    static const struct { const agg_vtable_t *pop, *k, *d; } map[] = {
+        { &VAR_POP_I64, &VAR_K_I64, &VAR_D_I64 },
+        { &VAR_POP_F64, &VAR_K_F64, &VAR_D_F64 },
+        { &VAR_POP_BOOL_NATIVE, &VAR_K_BOOL, &VAR_D_BOOL },
+        { &VAR_POP_U8_NATIVE, &VAR_K_U8, &VAR_D_U8 },
+        { &VAR_POP_I16_NATIVE, &VAR_K_I16, &VAR_D_I16 },
+        { &VAR_POP_I32_NATIVE, &VAR_K_I32, &VAR_D_I32 },
+        { &VAR_POP_F32_NATIVE, &VAR_K_F32, &VAR_D_F32 },
+        { &VAR_POP_DATE_NATIVE, &VAR_K_DATE, &VAR_D_DATE },
+        { &VAR_POP_TIME_NATIVE, &VAR_K_TIME, &VAR_D_TIME },
+        { &VAR_POP_TIMESTAMP_NATIVE, &VAR_K_TIMESTAMP, &VAR_D_TIMESTAMP },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (map[i].pop == pop) return agg_kind == OP_VAR_K ? map[i].k : map[i].d;
+    return NULL;
+}
+
 const agg_vtable_t* agg_resolve(uint16_t agg_kind, int8_t in_type) {
+    if (agg_kind == OP_VAR_K || agg_kind == OP_VAR_D) {
+        const agg_vtable_t* pop = agg_resolve(OP_VAR_POP, in_type);
+        return pop ? agg_resolve_var_kd(agg_kind, pop) : NULL;
+    }
     if (in_type == RAY_TIMESPAN) {
         if (agg_kind == OP_SUM) return &SUM_TIMESPAN;
         if (agg_kind == OP_MIN) return &MIN_TIMESPAN;

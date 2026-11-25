@@ -1706,6 +1706,8 @@ static const char* agg_name_suffix(uint16_t agg_op, size_t* slen_out) {
         case OP_STDDEV_POP: sfx = "_stddev_pop"; slen = 11; break;
         case OP_VAR:        sfx = "_var";        slen = 4; break;
         case OP_VAR_POP:    sfx = "_var_pop";    slen = 8; break;
+        case OP_VAR_K:      sfx = "_var_k";      slen = 6; break;
+        case OP_VAR_D:      sfx = "_var_d";      slen = 6; break;
         case OP_MEDIAN:     sfx = "_median";     slen = 7; break;
         case OP_QUANTILE:   sfx = "_quantile";   slen = 9; break;
         case OP_MODE:       sfx = "_mode";       slen = 5; break;
@@ -2235,12 +2237,35 @@ typedef struct {
     size_t               block;
 } agg_vo_t;
 
+static void agg_alias_init(void* s) { (void)s; }
+static void agg_alias_update(void* base, size_t stride, const uint32_t* gids, const void* vals,
+                             const ray_valid_t* valid, int64_t n, acc_arena_t* a) {
+    (void)base; (void)stride; (void)gids; (void)vals; (void)valid; (void)n; (void)a;
+}
+static void agg_alias_merge(void* d, const void* s, acc_arena_t* a) { (void)d; (void)s; (void)a; }
+
+/* The parted merge's variance slots (#1666): a partition's group asks for
+ * OP_VAR_K, OP_VAR_D and OP_VAR_POP of one input, one state read three ways.
+ * A later slot of the variance family over the same input node as an earlier
+ * one, either of them internal (OP_VAR_K / OP_VAR_D: never a user's query),
+ * reads the earlier slot's state through a copy of its own vtable whose
+ * init, update and merge do nothing; only its finalize reads. */
+static bool agg_vo_var_alias(ray_op_ext_t* ext, uint32_t a, uint32_t b) {
+    uint16_t oa = ext->agg_ops[a], ob = ext->agg_ops[b];
+    if (!agg_op_is_var(oa) || !agg_op_is_var(ob)) return false;
+    if (oa != OP_VAR_K && oa != OP_VAR_D && ob != OP_VAR_K && ob != OP_VAR_D) return false;
+    if (ext->agg_ins[a] != ext->agg_ins[b]) return false;
+    if (ext->agg_ins2 && (ext->agg_ins2[a] != RAY_OP_NONE || ext->agg_ins2[b] != RAY_OP_NONE)) return false;
+    return true;
+}
+
 static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* tbl) {
     uint32_t na = ext->n_aggs;
     vo->vts = (const agg_vtable_t**)scratch_alloc(&vo->hdr,
-                (size_t)na * (sizeof(void*) + sizeof(size_t)));
+                (size_t)na * (sizeof(void*) + sizeof(size_t) + sizeof(agg_vtable_t)));
     if (!vo->vts) return false;
     vo->off = (size_t*)(vo->vts + na);
+    agg_vtable_t* alias = (agg_vtable_t*)(vo->off + na);   /* per-agg copies */
     vo->block = 0;
     for (uint32_t a = 0; a < na; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
@@ -2248,6 +2273,23 @@ static bool agg_vo_init(agg_vo_t* vo, ray_graph_t* g, ray_op_ext_t* ext, ray_t* 
         bool vh = ext->agg_ops[a] != OP_COUNT && ie && agg_col_meta(g, tbl, ie->sym, &vm);
         int8_t in_type = vh ? vm.type : RAY_I64;
         vo->vts[a] = agg_resolve(ext->agg_ops[a], in_type);
+        uint32_t b = 0;
+        for (; b < a; b++)
+            if (vo->vts[a] && vo->vts[b] && vo->vts[b]->init != agg_alias_init &&
+                vo->vts[b]->update_batch == vo->vts[a]->update_batch &&
+                vo->vts[b]->merge == vo->vts[a]->merge && agg_vo_var_alias(ext, a, b))
+                break;
+        if (b < a) {
+            alias[a] = *vo->vts[a];
+            alias[a].init = agg_alias_init;
+            alias[a].update_batch = agg_alias_update;
+            alias[a].update_shared = NULL;
+            alias[a].shared_add = false;
+            alias[a].merge = agg_alias_merge;
+            vo->vts[a] = &alias[a];
+            vo->off[a] = vo->off[b];
+            continue;
+        }
         vo->off[a] = vo->block;
         vo->block += vo->vts[a]->state_size;
     }
@@ -11257,6 +11299,114 @@ done:
     return result ? result : ray_error("oom", NULL);
 }
 
+/* agg_index_streaming over one state for nv results (the parted merge's
+ * variance slots, agg_vo_var_alias): vts[0]'s init, update and merge build
+ * the states once, and each vts[i]'s finalize reads them into outs[i].  A
+ * streaming unary state with no destroy.  False on failure (outs released). */
+static bool agg_index_streaming_n(const agg_vtable_t* const* vts, int nv, ray_t* x,
+        const agg_groups_t* groups, const int64_t* rows, const int64_t* offsets,
+        int64_t nrows, ray_t** outs) {
+    const agg_vtable_t* vt = vts[0];
+    ray_pool_t* pool = ray_pool_get();
+    int64_t ng = groups->ngroups;
+    bool par = rows && offsets && ray_pool_par_dispatch_ok(pool, nrows, RAY_PARALLEL_THRESHOLD);
+    uint32_t tasks = par ? ray_pool_total_workers(pool) * 4 : 0;
+    if (tasks > RAY_POOL_INIT_TASKS) tasks = RAY_POOL_INIT_TASKS;
+    agg_index_stream_t c = {.vt = vt, .x = x, .y = NULL, .rows = rows, .offsets = offsets,
+        .ng = ng, .nrows = nrows, .tasks = tasks, .failed = false};
+    c.states = ray_calloc_raw((size_t)(ng + 2 * tasks + 1) * vt->state_size);
+    c.partial_groups = par ? ray_alloc_raw((size_t)2 * tasks * sizeof(int64_t)) : NULL;
+    for (int i = 0; i < nv; i++) outs[i] = NULL;
+    bool ok = false;
+    if (!c.states || (par && !c.partial_groups)) goto done;
+    if (par) {
+        for (uint32_t t = 0; t < 2 * tasks; t++) c.partial_groups[t] = -1;
+        ray_pool_dispatch(pool, agg_index_stream_init, &c, ng);
+        ray_pool_dispatch_n(pool, agg_index_stream_reduce, &c, tasks);
+        if (agg_cancelled() || atomic_load(&c.failed)) goto done;
+        for (uint32_t t = 0; t < 2 * tasks; t++) if (c.partial_groups[t] >= 0)
+            vt->merge(c.states + c.partial_groups[t] * vt->state_size,
+                      c.states + (ng + t) * vt->state_size, NULL);
+    } else {
+        for (int64_t gi = 0; gi < ng; gi++) vt->init(c.states + (size_t)gi * vt->state_size);
+        ray_valid_t valid = { x ? ray_data(x) : NULL, x ? x->type : RAY_I64,
+                              x ? ray_vec_may_have_nulls(x) : false };
+        vt->update_batch(c.states, vt->state_size, groups->gids, x ? ray_data(x) : NULL,
+                         &valid, nrows, NULL);
+    }
+    for (int i = 0; i < nv; i++) {
+        ray_t* r = ray_vec_new(vts[i]->out_type, ng);
+        if (!r || RAY_IS_ERR(r)) { outs[i] = r; goto done; }
+        r->len = ng;
+        agg_dense_emit_ctx_t emit = {.vt = vts[i], .out = r, .states = c.states,
+            .block = vt->state_size, .param = 0, .any_null = false};
+        if (par) ray_pool_dispatch(pool, agg_dense_emit_fn, &emit, ng);
+        else agg_dense_emit_fn(&emit, 0, 0, ng);
+        if (atomic_load(&emit.any_null)) r->attrs |= RAY_ATTR_HAS_NULLS;
+        outs[i] = r;
+    }
+    ok = !agg_cancelled();
+done:
+    ray_free_raw(c.states); ray_free_raw(c.partial_groups);
+    if (!ok)
+        for (int i = 0; i < nv; i++) {
+            if (outs[i] && RAY_IS_ERR(outs[i])) ray_error_free(outs[i]);
+            else if (outs[i]) ray_release(outs[i]);
+            outs[i] = NULL;
+        }
+    return ok;
+}
+
+/* Slot a of a whole-column group and the later slots that read its state
+ * (agg_vo_var_alias): computed together, the later ones parked in pre[]
+ * for their turn.  1 with *col set (a's column, or a parked one), 0 when a
+ * shares with no other slot, -1 on failure.  rows / offsets: the indexed
+ * layout (NULL for the serial run over groups->gids). */
+static int agg_var_shared_col(ray_op_ext_t* ext, uint32_t a, ray_t* src, const agg_groups_t* groups,
+                              const int64_t* rows, const int64_t* offsets, int64_t nrows,
+                              ray_t** pre, ray_t** col) {
+    *col = NULL;
+    if (!pre) return 0;
+    if (pre[a]) { *col = pre[a]; pre[a] = NULL; return 1; }
+    if (!src || !agg_op_is_var(ext->agg_ops[a])) return 0;
+    const agg_vtable_t* vtl[16];
+    uint32_t slot[16];
+    int nv = 0;
+    vtl[nv] = agg_resolve(ext->agg_ops[a], src->type); slot[nv++] = a;
+    if (!vtl[0]) return 0;
+    for (uint32_t b = a + 1; b < ext->n_aggs && nv < 16; b++) {
+        if (!agg_vo_var_alias(ext, b, a)) continue;
+        const agg_vtable_t* vb = agg_resolve(ext->agg_ops[b], src->type);
+        if (!vb || vb->update_batch != vtl[0]->update_batch || vb->merge != vtl[0]->merge) continue;
+        vtl[nv] = vb; slot[nv++] = b;
+    }
+    if (nv < 2) return 0;
+    ray_t* outs[16];
+    if (!agg_index_streaming_n(vtl, nv, src, groups, rows, offsets, nrows, outs)) return -1;
+    *col = outs[0];
+    for (int i = 1; i < nv; i++) pre[slot[i]] = outs[i];
+    return 1;
+}
+
+/* pre[] for agg_var_shared_col when the group holds an internal variance
+ * slot (only the parted merge asks for one), else NULL. */
+static ray_t** agg_var_shared_pre(ray_op_ext_t* ext, ray_t** hdr, bool* oom) {
+    *hdr = NULL; *oom = false;
+    for (uint32_t a = 1; a < ext->n_aggs; a++)
+        if (ext->agg_ops[a] == OP_VAR_K || ext->agg_ops[a] == OP_VAR_D) {
+            ray_t** pre = (ray_t**)scratch_calloc(hdr, ext->n_aggs * sizeof(ray_t*));
+            *oom = pre == NULL;
+            return pre;
+        }
+    return NULL;
+}
+
+static void agg_var_shared_free(ray_op_ext_t* ext, ray_t** pre, ray_t* hdr) {
+    if (pre)
+        for (uint32_t a = 0; a < ext->n_aggs; a++) if (pre[a]) ray_release(pre[a]);
+    scratch_free(hdr);
+}
+
 /* The lexical ranks of the positions a SYM MIN / MAX names, for a column
  * whose FILE dictionary is cold.  Compared group by group, the strings are
  * read in row order, each where a row first names it: one page fault and a
@@ -11547,14 +11697,30 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         if (!result || RAY_IS_ERR(result)) goto done;
     }
     ray_profile_tick("indexed: emitted keys");
+    /* The parted merge's variance slots of one input read one state
+     * (agg_vo_var_alias): the first computes every alias's column too. */
+    ray_t* var_pre_hdr = NULL;
+    bool var_oom;
+    ray_t** var_pre = agg_var_shared_pre(ext, &var_pre_hdr, &var_oom);
+    if (var_oom) { ray_release(result); result = ray_error("oom", NULL); goto done; }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
-        if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
+        if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto var_pre_fail; }
         uint16_t kind = ext->agg_ops[a];
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         ray_t* src = ie ? ray_table_col(tbl, ie->sym) : NULL;
-        if (src && RAY_IS_ERR(src)) { ray_release(result); result = src; goto done; }
+        if (src && RAY_IS_ERR(src)) { ray_release(result); result = src; goto var_pre_fail; }
         int64_t param = ext->agg_k ? ext->agg_k[a] : 0;
         ray_t* col = NULL;
+        {
+            if (var_pre && src && ray_pool_scan_on()) ray_col_want_rows(src, rows, nrows);
+            int vr = agg_var_shared_col(ext, a, src, &groups, rows, offsets, nrows, var_pre, &col);
+            if (vr < 0) {
+                ray_release(result);
+                result = ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+                goto var_pre_fail;
+            }
+            if (vr > 0) goto emit_col;
+        }
         /* The kernels below read src at every row, group by group, so at
          * scattered rows: a cold mapped column is requested first, whole
          * (scan read-ahead). */
@@ -11580,14 +11746,14 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                     agg_sym_rank_build(src, rows, nrows, &rank)) work.rank = &rank;
                 ray_group_winners(agg_index_winner, &work, rows, offsets, counts, ng, winners);
                 agg_sym_rank_free(&rank);
-                if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto done; }
+                if (agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); goto var_pre_fail; }
                 ray_profile_tick("indexed: selected winning rows");
                 col = ray_group_gather(src, winners, ng);
             }
         } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
             ray_t* ycol = ray_table_col(tbl, ye->sym);
-            if (ycol && RAY_IS_ERR(ycol)) { ray_release(result); result = ycol; goto done; }
+            if (ycol && RAY_IS_ERR(ycol)) { ray_release(result); result = ycol; goto var_pre_fail; }
             col = agg_index_streaming(agg_resolve(kind, src->type), src,
                 ycol, &groups, rows, offsets, nrows, param);
         } else if (kind == OP_COUNT) {
@@ -11595,12 +11761,15 @@ static ray_t* agg_indexed_run(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             if (col && !RAY_IS_ERR(col)) { col->len = ng; memcpy(ray_data(col), counts, (size_t)ng * sizeof(int64_t)); }
         } else col = agg_index_streaming(agg_resolve(kind, src ? src->type : RAY_I64),
                                         src, NULL, &groups, rows, offsets, nrows, param);
-        if (!col || RAY_IS_ERR(col)) { ray_release(result); result = col; goto done; }
+emit_col:
+        if (!col || RAY_IS_ERR(col)) { ray_release(result); result = col; goto var_pre_fail; }
         ray_profile_tick("indexed: emitted aggregate");
         result = ray_table_add_col(result, agg_result_col_name(ie ? ie->sym : 0, kind), col);
         ray_release(col);
-        if (!result || RAY_IS_ERR(result)) goto done;
+        if (!result || RAY_IS_ERR(result)) goto var_pre_fail;
     }
+var_pre_fail:
+    agg_var_shared_free(ext, var_pre, var_pre_hdr);
 done:
     if (result && !RAY_IS_ERR(result) && agg_cancelled()) { ray_release(result); result = ray_error("cancel", NULL); }
     ray_free_raw(counts); ray_free_raw(offsets); ray_free_raw(cursor); ray_free_raw(rows);
@@ -13275,32 +13444,49 @@ static ray_t* exec_group_v2_run_keys(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
     }
     agg_dense_plan_free(&dp);   /* key_cols/key_syms done — agg loop below reads neither */
 
+    ray_t* var_pre_hdr = NULL;
+    bool var_oom;
+    ray_t** var_pre = agg_var_shared_pre(ext, &var_pre_hdr, &var_oom);
+    if (var_oom) { agg_groups_free(&groups); ray_release(result); return ray_error("oom", NULL); }
     for (uint32_t a = 0; a < ext->n_aggs; a++) {
         ray_op_ext_t* ie = find_ext(g, ext->agg_ins[a]);
         int64_t kparam = (ext->agg_k ? ext->agg_k[a] : 0);
         ray_t* col;
-        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {       /* binary agg (pearson) */
+        ray_t* vsrc = var_pre && ie && agg_op_is_var(ext->agg_ops[a]) ? ray_table_col(tbl, ie->sym) : NULL;
+        int vr = vsrc && !RAY_IS_ERR(vsrc)
+            ? agg_var_shared_col(ext, a, vsrc, &groups, NULL, NULL, nrows, var_pre, &col) : 0;
+        if (vr < 0) {
+            agg_var_shared_free(ext, var_pre, var_pre_hdr);
+            agg_groups_free(&groups); ray_release(result);
+            return ray_error(agg_cancelled() ? "cancel" : "oom", NULL);
+        }
+        if (vr > 0) {
+        } else if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE) {       /* binary agg (pearson) */
             ray_op_ext_t* ye = find_ext(g, ext->agg_ins2[a]);
             ray_t* x_col = ray_table_col(tbl, ie->sym);
-            if (x_col && RAY_IS_ERR(x_col)) { agg_groups_free(&groups); ray_release(result); return x_col; }
+            if (x_col && RAY_IS_ERR(x_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return x_col; }
             ray_t* y_col = ray_table_col(tbl, ye->sym);
-            if (y_col && RAY_IS_ERR(y_col)) { agg_groups_free(&groups); ray_release(result); return y_col; }
+            if (y_col && RAY_IS_ERR(y_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return y_col; }
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], x_col->type);
             col = agg_run_one_bin(vt, x_col, y_col, groups.gids, nrows, groups.ngroups, kparam);
         } else {
             ray_t* val_col = (ext->agg_ops[a] != OP_COUNT && ie) ? ray_table_col(tbl, ie->sym) : NULL;
-            if (val_col && RAY_IS_ERR(val_col)) { agg_groups_free(&groups); ray_release(result); return val_col; }
+            if (val_col && RAY_IS_ERR(val_col)) { agg_var_shared_free(ext, var_pre, var_pre_hdr); agg_groups_free(&groups); ray_release(result); return val_col; }
             int8_t in_type = val_col ? val_col->type : RAY_I64;
             const agg_vtable_t* vt = agg_resolve(ext->agg_ops[a], in_type);
             col = agg_run_one(vt, val_col, groups.gids, nrows, groups.ngroups, kparam);
         }
-        if (!col || RAY_IS_ERR(col)) { agg_groups_free(&groups); ray_release(result); return col ? col : ray_error("oom", NULL); }
+        if (!col || RAY_IS_ERR(col)) {
+            agg_var_shared_free(ext, var_pre, var_pre_hdr);
+            agg_groups_free(&groups); ray_release(result); return col ? col : ray_error("oom", NULL);
+        }
         /* A COUNT reads no input column, so its input node need not be a
          * scan (`(count (* price 2))`) and has no ext to name it by. */
         int64_t agg_name = agg_result_col_name(ie ? ie->sym : 0, ext->agg_ops[a]);
         result = ray_table_add_col(result, agg_name, col);
         ray_release(col);
     }
+    agg_var_shared_free(ext, var_pre, var_pre_hdr);
     agg_groups_free(&groups);
     return result;
     #undef AGG_RUN_COMPACT_FALLBACK

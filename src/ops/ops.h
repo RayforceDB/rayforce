@@ -286,6 +286,14 @@ static inline bool ray_has_timespan(const ray_t* x) {
  * place (agg_stream.c); a group bound for the legacy engine is re-planned
  * with the slot as SUM over a not-null indicator (exec_group_run). */
 #define OP_COUNT_NN    147
+/* Internal aggregates, never compiled from Rayfall (#1666): a partition's
+ * variance-family state for the parted merge (exec_group_per_partition).
+ * Each accumulates exactly as OP_VAR_POP, about a value k of the group;
+ * OP_VAR_K emits k rounded to double, OP_VAR_D the group mean about that
+ * double (k's rounding remainder taken exactly, plus sum(x - k) / n), so
+ * K + D is the mean to the spread's precision at any magnitude. */
+#define OP_VAR_K       148
+#define OP_VAR_D       149
 #define OP_ALL          131  /* truthy-all reduction (nulls skipped) */
 #define OP_ANY          132  /* truthy-any reduction (nulls skipped) */
 #define OP_COV          133  /* population covariance per group (binary input) */
