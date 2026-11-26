@@ -19218,6 +19218,37 @@ static int64_t proj_keep_bound(ray_t* dict) {
     return cnt + 1;
 }
 
+/* Can evaluating the `from:` expression `e` rebind a global (#1767)?  The
+ * keep set judges the outer select's names by what they hold before `from:`
+ * runs: an inner where: that calls (set neg f) would turn a builtin it
+ * trusted into a lambda reading a column it dropped.  An inner select, the
+ * select builtin by identity, is judged clause by clause, its own from:
+ * likewise; anything else by query_expr_effect_free. */
+static bool proj_from_effect_free(ray_t* e, int depth) {
+    if (!e || depth > 16) return !e;
+    if (e->type == RAY_LIST && !(e->attrs & ATTR_QUOTED) && ray_len(e) == 2) {
+        ray_t** el = (ray_t**)ray_data(e);
+        ray_t* fn = el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED) &&
+                    !ray_env_get_lexical_local(el[0]->i64) && !ray_env_get_local(el[0]->i64)
+                    ? ray_env_get(el[0]->i64) : NULL;
+        if (fn && fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == ray_select &&
+            el[1] && el[1]->type == RAY_DICT) {
+            ray_t* keys = ray_dict_keys(el[1]);
+            ray_t* vals = ray_dict_vals(el[1]);
+            if (!keys || !vals || vals->type != RAY_LIST) return false;
+            int64_t from_id = ray_sym_intern("from", 4);
+            ray_t** v = (ray_t**)ray_data(vals);
+            for (int64_t i = 0; i < ray_len(vals); i++) {
+                bool ok = sym_cell_runtime_id(keys, i) == from_id ? proj_from_effect_free(v[i], depth + 1)
+                                                                 : query_expr_effect_free(v[i]);
+                if (!ok) return false;
+            }
+            return true;
+        }
+    }
+    return query_expr_effect_free(e);
+}
+
 /* Projection-pushdown keep-set: for an EXPLICITLY-projected select (one with
  * value exprs, so it references only named columns), collect the column syms its
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
@@ -26945,7 +26976,8 @@ static ray_t* ray_select_body(ray_t** args, int64_t n, unsigned plan,
     int            pj_n = pvm ? pvm->proj_keep_n  : 0;
     bool           pj_a = pvm ? pvm->proj_active  : false;
     ray_t*         pj_q = pvm ? pvm->proj_dict    : NULL;
-    if (pvm && proj_buf && proj_compute_keep(dict, proj_buf, (int)proj_hdr_keys, &proj_n)) {
+    if (pvm && proj_buf && proj_compute_keep(dict, proj_buf, (int)proj_hdr_keys, &proj_n) &&
+        proj_from_effect_free(from_expr, 0)) {
         pvm->proj_keep = proj_buf; pvm->proj_keep_n = proj_n;
         pvm->proj_depth = pvm->eval_depth; pvm->proj_active = true;
         pvm->proj_dict = select_from_is_join(from_expr) ? dict : NULL;
