@@ -1,0 +1,69 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; A symbol literal in the outer select keeps the inner select's column
+;; narrowing (#1746), but only as data: a symbol reaching a call's head,
+;; ('f a), ((quote f) a) or one computed there ((first ['f]) a), calls what
+;; the name holds, and a lambda's body reads columns by name.  Such a name is
+;; judged as the bare name is, so the inner select keeps every column and f
+;; sees c (#1750 review).  Each answer is dev's, in memory, splayed and parted.
+
+(.sys.exec "rm -rf /tmp/rfl_pk_symcall && mkdir -p /tmp/rfl_pk_symcall") -- 0
+(set t (table [a b c s] (list [1 2 3 4] [10 20 30 40] [100 200 300 400] ['x 'y 'x 'y])))
+(.db.splayed.set "/tmp/rfl_pk_symcall/spl/t/" t)
+(.db.splayed.set "/tmp/rfl_pk_symcall/par/2024.01.01/t/" (at t [0 1]) "/tmp/rfl_pk_symcall/par/.sym")
+(.db.splayed.set "/tmp/rfl_pk_symcall/par/2024.01.02/t/" (at t [2 3]) "/tmp/rfl_pk_symcall/par/.sym")
+(set S (.db.splayed.get "/tmp/rfl_pk_symcall/spl/t/"))
+(set P (.db.parted.get "/tmp/rfl_pk_symcall/par/" 't))
+(set f (fn [v] (+ v c)))
+
+(at (select {r: ('f a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((quote f) a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((first ['f]) a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((first (list 'f)) a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((if true 'f 'f) a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ('f a) from: (select {from: t where: (> a 1) take: 2})}) 'r) -- [202 303]
+(at (select {r: ('f a) from: (select {from: (select {from: t where: (> a 0)}) where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ('f a) from: (select {from: S where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((quote f) a) from: (select {from: S where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ('f a) from: (select {from: P where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((quote f) a) from: (select {from: P where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ('f a) from: (select {from: P where: (> a 1) take: 2})}) 'r) -- [202 303]
+(at (select {r: (first ('f a)) from: (select {from: t where: (> a 0) by: [s a]}) by: s}) 'r) -- [101 202]
+;; with a global c the lambda must still see the column, not the global
+(set c 1000)
+(at (select {r: ('f a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((quote f) a) from: (select {from: P where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((first ['f]) a) from: (select {from: S where: (> a 1)})}) 'r) -- [202 303 404]
+(set c 0)
+;; a head computed at run time, also from text: the name no literal holds
+(at (select {r: ((as 'sym "f") a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((as (quote symbol) "f") a) from: (select {from: S where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((as 'sym "f") a) from: (select {from: P where: (> a 1)})}) 'r) -- [202 303 404]
+(set c 1000)
+(at (select {r: ((as 'sym "f") a) from: (select {from: t where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((as (quote symbol) "f") a) from: (select {from: S where: (> a 1)})}) 'r) -- [202 303 404]
+(at (select {r: ((as 'sym "f") a) from: (select {from: P where: (> a 1) take: 2})}) 'r) -- [202 303]
+(at (select {r: ((as 'sym (format "%" "f")) a) from: (select {from: P where: (> a 1)})}) 'r) -- [202 303 404]
+(set c 0)
+;; a lambda fetched from the environment and handed to a higher-order
+;; builtin, (map (get (env 0) (as 'sym "f")) ..): no head names it, yet map
+;; calls it and its body reads c.  Every call must be to a builtin known by
+;; identity, so these decline and f sees the column (#1750 review).
+(set f2 (fn [x y] (+ x (+ y c))))
+(at (select {r: (first (map (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: t where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (map (at (env 0) (as 'sym "f")) [1 2])) from: (select {from: S where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (pmap (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: P where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (apply (get (env 0) (as 'sym "f2")) [1 2] [3 4])) from: (select {from: t where: (> a 1)}) by: s}) 'r) -- (list [204 304 404] [204 304 404])
+(at (select {r: (first (prior (get (env 0) (as 'sym "f2")) [1 2])) from: (select {from: P where: (> a 1)}) by: s}) 'r) -- (list [202 302 402] [202 302 402])
+(at (select {r: (first (map (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: P where: (> a 1) take: 2}) by: s}) 'r) -- (list [201 301] [201 301])
+(set c 1000)
+(at (select {r: (first (map (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: t where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (map (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: S where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (map (get (env 0) (as 'sym "f")) [1 2])) from: (select {from: P where: (> a 1)}) by: s}) 'r) -- (list [201 301 401] [201 301 401])
+(at (select {r: (first (scan (get (env 0) (as 'sym "f2")) [1 2])) from: (select {from: P where: (> a 1)}) by: s}) 'r) -- [1 1]
+(set c 0)
+;; a higher-order builtin given a builtin by name still narrows
+(at (select {from: (select {from: P where: (> a 0)}) by: s n: (sum (map neg (* a (== s 'x))))}) 'n) -- [-4 0]
+;; symbols as data still narrow and answer as before
+(at (select {from: (select {from: t where: (> a 1)}) by: s n: (sum (== s 'x))}) 'n) -- [0 1]
+(at (select {from: (select {from: P where: (> a 0)}) by: s n: (sum (in s ['x 'y]))}) 'n) -- [2 2]
+(.sys.exec "rm -rf /tmp/rfl_pk_symcall") -- 0

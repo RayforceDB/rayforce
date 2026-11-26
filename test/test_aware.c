@@ -3300,6 +3300,18 @@ static test_result_t test_filter_only_columns(void) {
           "(select {n: (sum w) m: (max r) from: (select {w: w r: r from: S where: (and (== a 2) (> x 40)) take: 500})})", "2" },
         { "(select {n: (count y) c: (first y) from: (select {from: S where: (> r 89990)}) by: y})",
           "(select {n: (count y) c: (first y) from: (select {y: y from: S where: (> r 89990)}) by: y})", "1" },
+        /* a symbol literal in the outer select keeps the narrowing: its
+         * name is kept, whatever it names (#1746) */
+        { "(select {from: (select {from: S where: (== a 1)}) by: b n: (sum (== y 'p))})",
+          "(select {from: (select {b: b y: y from: S where: (== a 1)}) by: b n: (sum (== y 'p))})", "2" },
+        { "(select {from: (select {from: S where: (== a 1)}) by: b n: (sum (== y (quote p)))})",
+          "(select {from: (select {b: b y: y from: S where: (== a 1)}) by: b n: (sum (== y (quote p)))})", "2" },
+        { "(select {from: (select {from: S where: (== a 1)}) by: b n: (sum (in y ['p 'q]))})",
+          "(select {from: (select {b: b y: y from: S where: (== a 1)}) by: b n: (sum (in y ['p 'q]))})", "2" },
+        { "(select {from: (select {from: S where: (== a 2)}) where: (== y 'q) by: b n: (count r)})",
+          "(select {from: (select {b: b y: y r: r from: S where: (== a 2)}) where: (== y 'q) by: b n: (count r)})", "3" },
+        { "(select {from: (select {from: S where: (== a 2) take: 800}) n: (count r) m: (first (== y 'p))})",
+          "(select {from: (select {r: r y: y from: S where: (== a 2) take: 800}) n: (count r) m: (first (== y 'p))})", "2" },
         /* a symbol-vector by: names its columns too */
         { "(select {n: (count r) from: (select {from: S where: (== a 1)}) by: [b y]})",
           "(select {n: (count r) from: (select {b: b y: y r: r from: S where: (== a 1)}) by: [b y]})", "3" },
