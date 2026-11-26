@@ -1,0 +1,42 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; The outer select's narrowing (#1746) judges each name by what it holds,
+;; never by its spelling: after (set quote f), (quote a) calls f, whose body
+;; reads c, so the inner select keeps every column (#1750 review).  Each
+;; answer is dev's, in memory, splayed and parted, with and without a
+;; global c.
+(.sys.exec "rm -rf /tmp/rfl_pk_rebound && mkdir -p /tmp/rfl_pk_rebound") -- 0
+(set T (table [a b c s] (list [1 2 3 4] [10 20 30 40] [100 200 300 400] ['x 'y 'x 'y])))
+(.db.splayed.set "/tmp/rfl_pk_rebound/spl/t/" T)
+(.db.splayed.set "/tmp/rfl_pk_rebound/par/2024.01.01/t/" (at T [0 1]) "/tmp/rfl_pk_rebound/par/.sym")
+(.db.splayed.set "/tmp/rfl_pk_rebound/par/2024.01.02/t/" (at T [2 3]) "/tmp/rfl_pk_rebound/par/.sym")
+(set S (.db.splayed.get "/tmp/rfl_pk_rebound/spl/t/"))
+(set P (.db.parted.get "/tmp/rfl_pk_rebound/par/" 't))
+(set f (fn [v] (+ v c)))
+
+;; a filter that rebinds a builtin the outer select calls, (set neg f) in
+;; the inner where:, is #1767: the narrowing was judged while neg was the
+;; builtin.  In memory the answer is right; on a parted table the column f
+;; reads is gone.  The parted lines pin today's answer until #1767 is fixed,
+;; when they become [102 203 304 405].  They come first: once neg holds f,
+;; the narrowing declines.
+(set neg0 neg)
+(set flip (fn [x] (set neg f) true))
+(at (select {from: (select {from: T where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) -- [102 203 304 405]
+(set neg neg0)
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) !- schema
+(set neg neg0)
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) 1)}) 'r) !- schema
+(set neg neg0)
+
+;; quote rebound to a lambda
+(set quote f)
+(at (select {from: (select {from: T where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(at (select {from: (select {from: S where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(at (select {from: (select {from: P where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(at (select {from: (select {from: P where: (> a 1) take: 2}) r: (quote a)}) 'r) -- [202 303]
+(at (select {from: (select {from: T where: (> a 0)}) by: s r: (first (quote a))}) 'r) -- [101 202]
+(set c 1000)
+(at (select {from: (select {from: T where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(at (select {from: (select {from: S where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(at (select {from: (select {from: P where: (> a 1)}) r: (quote a)}) 'r) -- [202 303 404]
+(.sys.exec "rm -rf /tmp/rfl_pk_rebound") -- 0

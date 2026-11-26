@@ -18837,14 +18837,107 @@ static bool update_spread_head(const ray_t* h) {
             (void*)(uintptr_t)h->i64 == (void*)update_spread_keep_null_fn);
 }
 
-static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
+/* `lits`: a symbol literal ('x, (quote x), a SYM vector such as ['x 'y])
+ * is taken as reading at most the column it names, for a caller that keeps
+ * every name such a literal holds (proj_compute_keep, collect_sym_lits,
+ * #1746).  Without it they decline, as before. */
+static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits);
+
+/* Under `lits` a call is judged by the builtin it calls, found by its C
+ * function so every name bound to one is covered (#1750 review).  These
+ * read or run more than the arguments the walk sees: eval, resolve and env
+ * reach the environment by a computed name; fn makes a lambda; let and set
+ * (with every restricted builtin) bind a name a later call may resolve to
+ * a lambda; try calls its handler; pivot calls its aggregate. */
+static bool lit_call_declines(const ray_t* fn) {
+    if (fn->attrs & RAY_FN_RESTRICTED) return true;   /* set, del, alter, modify, .parquet.each, .time.timer.set, ... */
+    const void* fp = (const void*)(uintptr_t)fn->i64;
+    return fp == (const void*)ray_eval_builtin_fn || fp == (const void*)ray_resolve_fn ||
+           fp == (const void*)ray_env_fn || fp == (const void*)ray_fn ||
+           fp == (const void*)ray_let_fn || fp == (const void*)ray_try_fn ||
+           fp == (const void*)ray_pivot_fn;
+}
+
+/* The argument positions a higher-order builtin calls (key_hof_table: bit i
+ * for argument i), 0 for a builtin that calls none. */
+static uint8_t lit_call_hof_args(const ray_t* fn) {
+    for (int k = 0; k < KEY_HOF_N; k++)
+        if (key_hof_table[k].fn == (void*)(uintptr_t)fn->i64) return key_hof_table[k].calls;
+    return 0;
+}
+
+/* The builtin `h` names as a call's head or as the function given to a
+ * higher-order builtin: a builtin object, or a name ('f, (quote f) or a
+ * bare f) that no local shadows, bound globally to a builtin.  NULL for
+ * anything else: a lambda, a local, an unbound name (a let or set in the
+ * expression may bind it), a head computed at run time. */
+static bool lit_is_quote_head(ray_t* h);
+static ray_t* lit_named_builtin(ray_t* h) {
+    if (!h) return NULL;
+    if (h->type == RAY_UNARY || h->type == RAY_BINARY || h->type == RAY_VARY) return h;
+    if (h->type == RAY_LIST && !(h->attrs & ATTR_QUOTED) && ray_len(h) == 2) {
+        ray_t** hl = (ray_t**)ray_data(h);
+        if (lit_is_quote_head(hl[0]))
+            h = hl[1];                               /* (quote f): the name it holds */
+        else return NULL;
+    }
+    if (!h || h->type != -RAY_SYM) return NULL;
+    if (ray_env_get_lexical_local(h->i64) || ray_env_get_local(h->i64)) return NULL;
+    ray_t* fn = ray_env_get(h->i64);
+    if (!fn || (fn->type != RAY_UNARY && fn->type != RAY_BINARY && fn->type != RAY_VARY)) return NULL;
+    return fn;
+}
+
+/* Is `h` the head of a quote form: the name quote, bound now to the quote
+ * builtin and shadowed by no local?  Judged by what the name holds, not by
+ * its spelling: after (set quote f), (quote a) calls f (#1750 review). */
+static bool lit_is_quote_head(ray_t* h) {
+    if (!h || h->type != -RAY_SYM || (h->attrs & ATTR_QUOTED) ||
+        h->i64 != ray_sym_intern("quote", 5)) return false;
+    ray_t* fn = lit_named_builtin(h);
+    return fn && fn->type == RAY_VARY && (ray_vary_fn)(uintptr_t)fn->i64 == ray_quote_fn;
+}
+
+/* Can the call `e` (its head and arguments el[0..len)) run code the walk
+ * does not see?  Only a builtin known by identity is called: a lambda, a
+ * value fetched at run time, a declining builtin (lit_call_declines) and a
+ * higher-order builtin given anything but a first-order builtin by name
+ * all decline, so a lambda that reads a column is never called behind the
+ * keep set's back, however it was fetched ((map (get (env 0) ..) ..)). */
+static bool lit_call_sees_all(ray_t** el, int64_t len) {
+    ray_t* fn = lit_named_builtin(el[0]);
+    if (!fn || lit_call_declines(fn)) return false;
+    uint8_t calls = lit_call_hof_args(fn);
+    for (int i = 0; i < 8; i++) {
+        if (!(calls & (1u << i))) continue;
+        ray_t* g = i + 1 < len ? lit_named_builtin(el[i + 1]) : NULL;
+        if (!g || lit_call_declines(g) || lit_call_hof_args(g)) return false;
+    }
+    return true;
+}
+
+/* A symbol literal's name judged as the bare name is (#1750 review): a
+ * symbol is data until it reaches a call's head, as ('f a) or ((quote f) a)
+ * put it, and there the evaluator resolves it as it resolves the name
+ * (ray_env_resolve).  So a name that holds a lambda, a container, eval or
+ * resolve declines, as the bare name does; any other name reads no column
+ * the literal does not name.  A head computed at run time declines in the
+ * walk itself. */
+static bool sym_lit_reads_named_only(int64_t id, ray_t* tbl) {
+    ray_t bare = { 0 };
+    bare.type = -RAY_SYM;
+    bare.i64 = id;
+    return expr_reads_named_columns_only_at(&bare, tbl, false);
+}
+
+static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits) {
     if (!e) return true;
     /* the spread of an update aggregate's scalar reads what its argument reads */
     if (e->type == RAY_LIST && e->len == 2 && !(e->attrs & ATTR_QUOTED) &&
         update_spread_head(((ray_t**)ray_data(e))[0]))
-        return expr_reads_named_columns_only(((ray_t**)ray_data(e))[1], tbl);   /* not-a-table */
+        return expr_reads_named_columns_only_at(((ray_t**)ray_data(e))[1], tbl, lits);   /* not-a-table */
     if (e->type == -RAY_SYM) {
-        if (e->attrs & ATTR_QUOTED) return false;
+        if (e->attrs & ATTR_QUOTED) return lits && sym_lit_reads_named_only(e->i64, tbl);
         /* a lexical local wins over a column of its name (query locals never
          * shadow one): it may be a callable reading anything */
         ray_t* lex = ray_env_get_lexical_local(e->i64);
@@ -18879,14 +18972,34 @@ static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
         /* a quoted form names no column for collect_col_refs_set, which
          * skips it, yet its symbols may be looked up at run time */
         if (ray_len(e) == 2 && el[0] && el[0]->type == -RAY_SYM &&
-            !(el[0]->attrs & ATTR_QUOTED) && el[0]->i64 == ray_sym_intern("quote", 5))
-            return false;
+            !(el[0]->attrs & ATTR_QUOTED) && el[0]->i64 == ray_sym_intern("quote", 5)) {
+            if (!lits) return false;
+            /* (quote name) holds one symbol, kept by name; a quoted form
+             * of anything else may be evaluated.  A quote rebound to
+             * something else is a call, judged below. */
+            if (lit_is_quote_head(el[0]))
+                return el[1] && el[1]->type == -RAY_SYM && sym_lit_reads_named_only(el[1]->i64, tbl);
+        }
+        /* With symbol literals taken as data, every call must be to a
+         * builtin known by identity (lit_call_sees_all): a head computed
+         * at run time, ((as 'sym "f") a), or a lambda fetched and handed to
+         * map declines (#1750 review and audit). */
+        if (lits && ray_len(e) >= 1 && !lit_call_sees_all(el, ray_len(e))) return false;
         for (int64_t i = 0; i < ray_len(e); i++)
-            if (!expr_reads_named_columns_only(el[i], tbl)) return false;
+            if (!expr_reads_named_columns_only_at(el[i], tbl, lits)) return false;
         return true;
     }
     if (e->type < 0) return true;                                /* a non-symbol atom */
-    return ray_is_vec(e) && e->type != RAY_SYM;   /* a literal vector */
+    if (!ray_is_vec(e)) return false;
+    if (e->type != RAY_SYM) return true;                         /* a literal vector */
+    if (!lits) return false;
+    for (int64_t i = 0; i < ray_len(e); i++)                     /* each element, as its name */
+        if (!sym_lit_reads_named_only(ray_read_sym(ray_data(e), i, RAY_SYM, e->attrs), tbl)) return false;
+    return true;
+}
+
+static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
+    return expr_reads_named_columns_only_at(e, tbl, false);
 }
 
 /* Bind the columns of `tbl` as query locals for evaluating exprs[0..n): every
@@ -19018,6 +19131,66 @@ static int64_t count_syms(ray_t* e) {
     return 0;
 }
 
+/* The names the symbol literals of `e` hold, added to out[0..n) as
+ * collect_syms adds names (#1746): a quoted symbol ('x, which in a query
+ * reads the column of its name), the symbol of a (quote x), every element
+ * of a SYM vector.  A name that is no column costs nothing in a keep set.
+ * count_sym_lits over-counts them for proj_keep_bound. */
+static int collect_sym_lits(ray_t* e, int64_t* out, int max, int n) {
+    if (!e || n >= max) return n;
+    int64_t one = -1;
+    if (e->type == -RAY_SYM && (e->attrs & ATTR_QUOTED)) one = e->i64;
+    else if (e->type == RAY_SYM) {
+        for (int64_t i = 0; i < ray_len(e) && n < max; i++) {
+            int64_t s = ray_read_sym(ray_data(e), i, RAY_SYM, e->attrs);
+            bool dup = false;
+            for (int q = 0; q < n && !dup; q++) dup = out[q] == s;
+            if (!dup) out[n++] = s;
+        }
+        return n;
+    } else if (e->type == RAY_LIST) {
+        ray_t** el = (ray_t**)ray_data(e);
+        for (int64_t i = 0; i < ray_len(e) && n < max; i++) {
+            ray_t* x = el[i];
+            /* (quote x): its symbol, as a quoted atom */
+            if (i == 1 && ray_len(e) == 2 && el[0] && el[0]->type == -RAY_SYM &&
+                !(el[0]->attrs & ATTR_QUOTED) && el[0]->i64 == ray_sym_intern("quote", 5) &&
+                x && x->type == -RAY_SYM) { one = x->i64; break; }
+            n = collect_sym_lits(x, out, max, n);
+        }
+    } else if (e->type == RAY_DICT) {
+        ray_t* vals = ray_dict_vals(e);
+        if (vals && vals->type == RAY_LIST) {
+            ray_t** v = (ray_t**)ray_data(vals);
+            for (int64_t i = 0; i < ray_len(vals) && n < max; i++) n = collect_sym_lits(v[i], out, max, n);
+        }
+    }
+    if (one >= 0 && n < max) {
+        bool dup = false;
+        for (int q = 0; q < n && !dup; q++) dup = out[q] == one;
+        if (!dup) out[n++] = one;
+    }
+    return n;
+}
+
+static int64_t count_sym_lits(ray_t* e) {
+    if (!e) return 0;
+    if (e->type == -RAY_SYM) return (e->attrs & ATTR_QUOTED) ? 1 : 0;
+    if (e->type == RAY_SYM) return ray_len(e);
+    int64_t c = 0;
+    if (e->type == RAY_LIST) {
+        ray_t** el = (ray_t**)ray_data(e);
+        for (int64_t i = 0; i < ray_len(e); i++) c += count_sym_lits(el[i]) + 1;   /* + a (quote x)'s symbol */
+    } else if (e->type == RAY_DICT) {
+        ray_t* vals = ray_dict_vals(e);
+        if (vals && vals->type == RAY_LIST) {
+            ray_t** v = (ray_t**)ray_data(vals);
+            for (int64_t i = 0; i < ray_len(vals); i++) c += count_sym_lits(v[i]);
+        }
+    }
+    return c;
+}
+
 /* Buffer size that proj_compute_keep's keep-set can never saturate: walk the
  * same non-`from` value exprs collect_syms visits and count every sym atom
  * (an over-count of the distinct total — dedup only shrinks it), then add 1.
@@ -19040,7 +19213,7 @@ static int64_t proj_keep_bound(ray_t* dict) {
     for (int64_t i = 0; i < n; i++) {
         if (sym_cell_runtime_id(keys, i) == from_id) continue;  /* the subquery */
         ray_t* v = vptrs[i];   /* a SYM vector (by: [a b]) names a column per element */
-        cnt += v && v->type == RAY_SYM ? ray_len(v) : count_syms(v);
+        cnt += v && v->type == RAY_SYM ? ray_len(v) : count_syms(v) + count_sym_lits(v);
     }
     return cnt + 1;
 }
@@ -19050,6 +19223,7 @@ static int64_t proj_keep_bound(ray_t* dict) {
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
  * select, which references every column. */
 static bool eval_group_keep_ok(ray_t* e, ray_t* tbl);
+static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, bool lits);
 static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     int64_t from_id    = dict_key_id(dict, "from");
     int64_t where_id   = dict_key_id(dict, "where");
@@ -19073,7 +19247,7 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
          * not a callable that can read an unlisted column. */
         ray_t* clause = pv[i + 1];
         if ((!clause || clause->type != RAY_SYM) &&
-            !eval_group_keep_ok(clause, NULL)) {
+            !eval_group_keep_ok_at(clause, NULL, true)) {
             DICT_VIEW_CLOSE(pv);
             return false;
         }
@@ -19089,6 +19263,7 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
             continue;
         }
         n = collect_syms(pv[i + 1], out, max, n);
+        n = collect_sym_lits(pv[i + 1], out, max, n);   /* the names its symbol literals hold (#1746) */
     }
     DICT_VIEW_CLOSE(pv);  /* pv dead past the clause scan */
     if (!has_value_expr) return false;               /* implicit-all → carry all */
@@ -19259,16 +19434,20 @@ static int64_t eval_group_keep_cap(ray_t* tbl) {
 
 /* Can every column `e` reads be named (expr_reads_named_columns_only)?
  * A by-dict is judged by its values. */
-static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
+static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, bool lits) {
     if (e && e->type == RAY_DICT) {                  /* a by-dict: its values */
         ray_t* vals = ray_dict_vals(e);
         if (!vals || vals->type != RAY_LIST) return false;
         ray_t** v = (ray_t**)ray_data(vals);
         for (int64_t i = 0; i < ray_len(vals); i++)
-            if (!expr_reads_named_columns_only(v[i], tbl)) return false;
+            if (!expr_reads_named_columns_only_at(v[i], tbl, lits)) return false;
         return true;
     }
-    return expr_reads_named_columns_only(e, tbl);
+    return expr_reads_named_columns_only_at(e, tbl, lits);
+}
+
+static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
+    return eval_group_keep_ok_at(e, tbl, false);
 }
 
 /* Filter-compaction keep-set for a grouped select whose where: runs as its
