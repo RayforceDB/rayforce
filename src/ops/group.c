@@ -13788,6 +13788,20 @@ static ray_t* parted_empty_flat(ray_t* parted_tbl) {
 /* --------------------------------------------------------------------------
  * exec_group_parted — dispatch per-partition or concat-fallback
  * -------------------------------------------------------------------------- */
+/* Does every key and aggregate input of the group give, on a subset of the
+ * rows, what it gives on all of them (ray_expr_subset_invariant)?  Then the
+ * group of a where:'s kept rows is the group of all rows under that where:. */
+static bool group_inputs_subset_invariant(ray_graph_t* g, const ray_op_ext_t* ext) {
+    for (uint32_t k = 0; k < ext->n_keys; k++)
+        if (!ray_expr_subset_invariant(g, ext->keys[k])) return false;
+    for (uint32_t a = 0; a < ext->n_aggs; a++) {
+        if (ext->agg_ins && ext->agg_ins[a] != RAY_OP_NONE &&
+            !ray_expr_subset_invariant(g, ext->agg_ins[a])) return false;
+        if (ext->agg_ins2 && ext->agg_ins2[a] != RAY_OP_NONE &&
+            !ray_expr_subset_invariant(g, ext->agg_ins2[a])) return false;
+    }
+    return true;
+}
 static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
                                int64_t group_limit) {
     int64_t ncols = ray_table_ncols(parted_tbl);
@@ -14242,6 +14256,36 @@ static ray_t* exec_group_parted(ray_graph_t* g, ray_op_t* op, ray_t* parted_tbl,
         }
         if (copy_all) n_needed = 0;   /* 0 ⇒ downstream copies all ncols */
         scratch_free(c_esrc_hdr);
+
+        /* Under a where: (#1748), the flat table below would hold every
+         * row of the columns the group reads, and the group would evaluate
+         * its inputs at that length before the selection drops rows.  When
+         * every key and aggregate input gives on a subset of the rows what
+         * it gives on all of them (ray_expr_subset_invariant: scans,
+         * constants, pointwise operators; not an input that reads other
+         * rows, such as sums, whose rows are the whole table's under a
+         * where:), the kept rows of those columns are gathered from the
+         * segments instead (sel_compact) and grouped without the selection.
+         * A keyless group keeps the selection: an empty where: still makes
+         * its one row (#679).  Any decline keeps the flat table. */
+        if (g->selection && n_needed > 0 && n_keys > 0 && group_inputs_subset_invariant(g, ext)) {
+            ray_t* kept = sel_compact(g, parted_tbl, g->selection, needed, n_needed);
+            if (kept && !RAY_IS_ERR(kept) && kept != parted_tbl) {
+                ray_t* sel = g->selection;
+                ray_t* saved = g->table;
+                g->selection = NULL;
+                g->table = kept;
+                ray_t* result = exec_group(g, op, kept, group_limit);
+                g->table = saved;
+                g->selection = sel;
+                ray_graph_unbind_table(g, kept);   /* before its address can be reused */
+                ray_release(kept);
+                scratch_free(needed_hdr);
+                return result;
+            }
+            if (kept && RAY_IS_ERR(kept)) ray_error_free(kept);
+            else if (kept) ray_release(kept);
+        }
 
         /* Build flat table with only needed columns (or all if n_needed==0) */
         ray_t* flat_tbl = ray_table_new(n_needed > 0 ? (int64_t)n_needed : ncols);
