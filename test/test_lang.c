@@ -15265,6 +15265,7 @@ static const char* const k_rs_pure[] = {
     "ratios", "fills", "sums", "avgs", "mins", "maxs", "prds", "differ", "msum", "mavg",
     "mmin", "mmax", "mcount", "mvar", "mdev", "asc", "desc", "iasc", "idesc", "rank",
     "xrank", "list", "table", "key", "value", "cols", "union-all", "xbar", "trunc",
+    "date", "time", ".emb.tokens",
     "format", "repr", "as", "type", "enlist", "dict", "nil?", "where", "group",
     "concat", "raze", "within", "div", "bin", "binr", "split", "str-find", "str-join",
     "upper", "lower", "trim", "substr", "replace", "ser", "de", "like", "ss", "hh",
@@ -15284,9 +15285,9 @@ static const char* const k_rs_skip[] = {
     "dl-stratify", "dl-eval", "dl-query", "dl-provenance", "dl-free", "println", "show",
     "print", "read", "write", "read-bytes", "write-bytes", "load", "exit", "read-csv",
     "write-csv", "read-value", "read-limits", "eval", "parse", "resolve", "timeit",
-    "env", "get", "del", "rc", "rand", "guid", "date", "time", "timestamp",
+    "env", "get", "del", "rc", "rand", "guid", "timestamp",
     ".emb.hnsw.build", ".emb.hnsw.free", ".emb.hnsw.set", ".emb.hnsw.get", ".emb.hnsw.info", ".emb.knn", ".emb.ann",
-    ".emb.model.get", ".emb.model.info", ".emb.tokens", ".emb.encode",
+    ".emb.model.get", ".emb.model.info", ".emb.encode",
     "meta", NULL
 };
 /* namespaces of system, storage and I/O builtins: never called */
@@ -15328,8 +15329,23 @@ static const char* const k_rs_atom[] = {
 /* Does (nm ...) with the vector `vec` at position `pos` of `nargs` and
  * `other` at every other position map element by element: one result per
  * element, element j the call on element j alone? */
+/* builtins whose result per element is a vector (a split's parts, a
+ * text's tokens): results compared whole, with identical */
+static const char* const k_rs_nested[] = { "split", ".emb.tokens", NULL };
+
+/* witnesses the generic ones miss (#1755): a builtin's vector and the
+ * operand its other positions need -- a truncation unit, a delimiter, a
+ * model (rs_model, loaded by the test) */
+static const struct { const char* nm; const char* vec; const char* other; } k_rs_extra[] = {
+    { "trunc", "[2024.03.01D10:00:00.000 2024.01.05D09:30:00.000 2024.03.01D23:59:00.000 2024.01.05D09:30:00.000]", "'day" },
+    { "split", "[\"a,b\" \"c\" \"d,e,f\" \"a,b\"]", "\",\"" },
+    { ".emb.tokens", "[\"hello world\" \"\" \"a cat\" \"hello world\"]", "rs_model" },
+    { NULL, NULL, NULL }
+};
+
 static bool rs_maps(const char* nm, int nargs, int pos, const char* vec, const char* other) {
     char call[1024], mapped[1024], q[3072];
+    const char* same = rs_in(k_rs_nested, nm) ? "(identical rsr rsm)" : "(all (== rsr rsm))";
     int c = snprintf(call, sizeof call, "(%s", nm);
     int m = snprintf(mapped, sizeof mapped, "(map (fn [rsx] (%s", nm);
     for (int a = 1; a <= nargs; a++) {
@@ -15340,9 +15356,8 @@ static bool rs_maps(const char* nm, int nargs, int pos, const char* vec, const c
     snprintf(mapped + m, sizeof mapped - (size_t)m, ")) rsv)");
     snprintf(q, sizeof q,
              "(try (do (set rsv %s) (set rsr %s) (set rsm %s) "
-             "(if (== (type rsr) (type rsv)) (if (== (count rsr) (count rsv)) (all (== rsr rsm)) false) "
-             "(if (== (count rsr) (count rsv)) (all (== rsr rsm)) false))) (fn [e] false))",
-             vec, call, mapped);
+             "(if (== (count rsr) (count rsv)) %s false)) (fn [e] false))",
+             vec, call, mapped, same);
     ray_t* r = ray_eval_str(q);
     bool ok = r && !RAY_IS_ERR(r) && r->type == -RAY_BOOL && r->b8;
     if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
@@ -15404,10 +15419,17 @@ static bool rs_pos_maps(const char* nm, int nargs, int pos) {
         for (size_t o = 0; nargs > 1 && o < no; o++)
             if (maps(nm, nargs, pos, k_rs_vec[t], others[o])) return true;
     }
+    for (int x = 0; k_rs_extra[x].nm; x++)
+        if (strcmp(k_rs_extra[x].nm, nm) == 0 &&
+            maps(nm, nargs, pos, k_rs_extra[x].vec, k_rs_extra[x].other)) return true;
     return false;
 }
 
 static test_result_t test_builtin_row_shape(void) {
+    /* .emb.tokens' model operand (k_rs_extra) */
+    ray_t* mr = ray_eval_str("(set rs_model (.emb.model.get \"test/data/emb/tiny\"))");
+    TEST_ASSERT_FMT(mr && !RAY_IS_ERR(mr), "row shape: the tiny model does not load");
+    ray_release(mr);
     int32_t cap = ray_env_global_count() + 16;
     int64_t* ids = calloc((size_t)cap, sizeof(int64_t));
     ray_t** vals = calloc((size_t)cap, sizeof(ray_t*));

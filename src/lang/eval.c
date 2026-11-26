@@ -571,6 +571,11 @@ static const struct { void* fn; uint8_t nargs; uint8_t mask; } g_row_args[] = {
     { (void*)ray_upper_fn,           1, 1 }, { (void*)ray_lower_fn,           1, 1 },
     { (void*)ray_trim_fn,            1, 1 }, { (void*)ray_substr_fn,          3, 1 },
     { (void*)ray_replace_fn,         3, 1 },
+    /* a timestamp vector's dates and times, a truncation's values, a text
+     * vector split row by row, each text's tokens (#1755) */
+    { (void*)ray_date_clock_fn,      1, 1 }, { (void*)ray_time_clock_fn,      1, 1 },
+    { (void*)ray_trunc_fn,           2, 2 }, { (void*)ray_split_fn,           2, 1 },
+    { (void*)ray_emb_tokens_fn,      2, 2 },
 };
 
 /* Positions that do map element by element but a query reads whole by

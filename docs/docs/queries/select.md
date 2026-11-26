@@ -584,8 +584,10 @@ arithmetic and comparisons, `if`, `and`, `or`, `not`, `nil?`, binary
 cast's value `(as 'F64 W)`, `xbar`, `neg`, `abs`, `round`, `floor`, `ceil`,
 `sqrt`, `log`, `exp`, `pow`, `fill`, `div`, `sin`, `cos`, `tan`, `asin`,
 `acos`, `atan`, `reciprocal`, `signum`, the date and time parts (`yyyy`,
-`mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`), `upper`, `lower`, `trim`,
-`strlen`, `sym-name`, `substr`'s and `replace`'s text, and the tested side of `in`,
+`mm`, `dd`, `hh`, `minute`, `ss`, `dow`, `doy`), a timestamp's `date` and
+`time`, `trunc`'s values, `upper`, `lower`, `trim`, `strlen`, `sym-name`,
+`substr`'s, `replace`'s and `split`'s text, the texts of `.emb.tokens`, and
+the tested side of `in`,
 `not-in`, `like`, `str-find` and `within`. There, in every
 aggregate, `count` included, in `select` and `update`, keyless, under
 `where:` and under `by:`:

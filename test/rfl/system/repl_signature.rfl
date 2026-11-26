@@ -98,6 +98,13 @@ zsg_calls -- 0
 (at (.repl.signature 'in) 'elementwise) -- [true false]
 (at (.repl.signature 'substr) 'elementwise) -- [true false false]
 (at (.repl.signature 'and) 'elementwise) -- [true true]
+;; a timestamp's date and time, trunc's values, split's text, the texts
+;; .emb.tokens reads (#1755)
+(at (.repl.signature 'date) 'elementwise) -- [true]
+(at (.repl.signature 'time) 'elementwise) -- [true]
+(at (.repl.signature 'trunc) 'elementwise) -- [false true]
+(at (.repl.signature 'split) 'elementwise) -- [true false]
+(at (.repl.signature '.emb.tokens) 'elementwise) -- [false true]
 (at (.repl.signature 'sum) 'aggregate) -- true
 (at (.repl.signature 'sum) 'elementwise) -- [false]
 (at (.repl.signature 'min) 'aggregate) -- true
