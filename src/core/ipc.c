@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 #ifdef RAY_OS_WINDOWS
   #define WIN32_LEAN_AND_MEAN
@@ -1224,13 +1225,39 @@ static int64_t ipc_send_fn(int64_t fd, uint8_t* buf, int64_t len)
  * finished.  A client instead sends one byte of TCP urgent data (see the
  * sync-send await loop), which raises SIGURG here even mid-eval.  The handler
  * drains the byte and requests interrupt; the running query's checkpoints then
- * unwind it and a "cancel" error is returned.  g_ipc_active_fd names the
- * connection whose payload is currently being evaluated (-1 when idle) so the
- * handler knows which socket to drain.  Everything here is async-signal-safe:
- * a sig_atomic_t read, recv(MSG_OOB), and the atomic stores in
- * ray_cancel_request(), which cancels only the request being evaluated: a
- * client thread of the same process never sees it (#1623). */
-static volatile sig_atomic_t g_ipc_active_fd = -1;
+ * unwind it and a "cancel" error is returned.  g_ipc_active names the
+ * connection whose payload is currently being evaluated (fd -1 when idle) so
+ * the handler knows which socket to drain.  Everything here is
+ * async-signal-safe: lock-free atomics, recv(MSG_OOB), and the atomic stores
+ * in ray_cancel_request(), which cancels only the request being evaluated: a
+ * client thread of the same process never sees it (#1623).
+ *
+ * SIGURG is sent to the process, so the handler runs on whichever thread
+ * does not block it: the thread evaluating the request, or another one (a
+ * server on a spawned thread beside a main thread that takes signals, or any
+ * thread on macOS, where a sigprocmask(2) inside libc sets every thread's
+ * mask, #1637).  So the running request's connection and cancel number are
+ * one atomic word, published with release and read with acquire: a handler
+ * on any thread sees a matching pair, never a new fd with the previous
+ * request's number (#1758).  The byte-taken flag is atomic too, and a
+ * request's end waits out any handler still using its fd (ipc_unpublish),
+ * so no handler drains a socket whose fd has been closed and reused. */
+#define CANCEL_ANY  (-1)
+#define CANCEL_NONE (-2)
+#define IPC_ACTIVE(fd, seq) (((uint64_t)(uint32_t)(seq) << 32) | (uint64_t)(uint32_t)(fd))
+static inline int ipc_active_fd(uint64_t w)  { return (int)(uint32_t)w; }
+static inline int ipc_active_seq(uint64_t w) { return (int)(uint32_t)(w >> 32); }
+/* The handler may run on any thread and must not take a lock: every atomic
+ * it touches is lock-free, the active word (uint64_t: long on LP64, long
+ * long elsewhere), the busy count and taken flag (int), and through
+ * ray_cancel_request the interrupt word (unsigned int) and the request
+ * owner (a pointer). */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_LONG_LOCK_FREE == 2 &&
+               ATOMIC_LLONG_LOCK_FREE == 2 && ATOMIC_POINTER_LOCK_FREE == 2,
+               "the SIGURG handler's atomics (int, long, long long, pointer) must be lock-free");
+static _Atomic uint64_t g_ipc_active = IPC_ACTIVE(-1, CANCEL_ANY);
+/* Handlers between their read of g_ipc_active and the end of their recv. */
+static _Atomic int g_ipc_oob_busy = 0;
 
 /* Which cancel byte the running query answers to.  On TCP any byte does:
  * the stream is read past a byte sent after its query was answered,
@@ -1241,13 +1268,40 @@ static volatile sig_atomic_t g_ipc_active_fd = -1;
  * connection, nested sends on a busy handle are refused) and a byte for
  * any other request is dropped.  CANCEL_ANY on TCP, CANCEL_NONE while a
  * moved connection's async message runs (the client only cancels a sync
- * request; its byte waits for that one). */
-#define CANCEL_ANY  (-1)
-#define CANCEL_NONE (-2)
-static volatile sig_atomic_t g_ipc_active_seq = CANCEL_ANY;
+ * request; its byte waits for that one).  It is the high half of
+ * g_ipc_active. */
 /* Set by the SIGURG handler when it takes a numbered byte off the running
  * request's socket, so the reply can confirm it. */
-static volatile sig_atomic_t g_ipc_oob_taken = 0;
+static _Atomic int g_ipc_oob_taken = 0;
+
+#ifdef DEBUG
+/* Test gate (ray_ipc_oob_gate_for_test): a handler that read a published
+ * fd stops there, as one descheduled between its read and its recv would,
+ * until a request on the serving thread starts waiting it out. */
+static _Atomic int g_oob_gate_for_test = 0;        /* 0 off, 1 armed, 2 holding */
+static _Atomic int g_unpublish_waited_for_test = 0;
+#endif
+
+/* Publish the request whose connection and cancel number a SIGURG acts on. */
+static void ipc_publish(int fd, int seq)
+{
+    atomic_store_explicit(&g_ipc_active, IPC_ACTIVE(fd, seq), memory_order_seq_cst);
+}
+
+/* Unpublish it, keeping its number, and wait out a handler on another thread
+ * that read the fd before this store: once this returns no handler holds the
+ * fd, so its connection may close.  A handler on this thread cannot be
+ * waited on: it interrupts this loop, finds the fd unpublished and leaves. */
+static void ipc_unpublish(void)
+{
+    uint64_t w = atomic_load_explicit(&g_ipc_active, memory_order_relaxed);
+    atomic_store_explicit(&g_ipc_active, IPC_ACTIVE(-1, ipc_active_seq(w)), memory_order_seq_cst);
+#ifdef DEBUG
+    if (atomic_load_explicit(&g_ipc_oob_busy, memory_order_seq_cst) > 0)
+        atomic_store(&g_unpublish_waited_for_test, 1);
+#endif
+    while (atomic_load_explicit(&g_ipc_oob_busy, memory_order_seq_cst) > 0) { }
+}
 
 /* The message type (RAY_IPC_MSG_SYNC or _ASYNC) of the request being
  * evaluated, -1 when none is.  Main thread only, so a plain int; saved and
@@ -1258,28 +1312,30 @@ int ray_ipc_request_kind(void) { return g_ipc_active_kind; }
 
 bool ray_ipc_request_peer_gone(void)
 {
-    int fd = g_ipc_active_fd;
+    int fd = ipc_active_fd(atomic_load_explicit(&g_ipc_active, memory_order_relaxed));
     return g_ipc_active_kind == RAY_IPC_MSG_SYNC && fd >= 0 &&
            ray_sock_peer_closed((ray_sock_t)fd) == 1;
 }
 
 void ray_ipc_cancel_active_fd_for_test(int fd)
 {
-    g_ipc_active_fd = fd;
+    uint64_t w = atomic_load_explicit(&g_ipc_active, memory_order_relaxed);
+    if (fd < 0) ipc_unpublish();
+    else ipc_publish(fd, ipc_active_seq(w));
 }
 
 void ray_ipc_cancel_state_reset_for_test(void)
 {
     ray_cancel_state_reset_for_test();
-    g_ipc_active_fd  = -1;
-    g_ipc_active_seq = CANCEL_ANY;
-    g_ipc_oob_taken  = 0;
+    ipc_unpublish();
+    ipc_publish(-1, CANCEL_ANY);
+    atomic_store(&g_ipc_oob_taken, 0);
 }
 
 /* Whether a pending cancel byte on `fd` is for the request `want` names,
  * taking it when it is and dropping it when it names another request.
  * A numbered byte taken either way sets *taken.  Async-signal-safe. */
-static bool oob_cancel_for(int fd, int want, volatile sig_atomic_t* taken)
+static bool oob_cancel_for(int fd, int want, int* taken)
 {
     if (want == CANCEL_ANY) return ray_sock_take_oob((ray_sock_t)fd) != 0;
     if (want == CANCEL_NONE) return false;
@@ -1300,17 +1356,28 @@ static void ipc_sigurg_handler(int sig)
      * back on every way out. */
     int saved_errno = errno;
     (void)sig;
-    int fd = g_ipc_active_fd;
-    if (fd < 0) {         /* nothing running — a queued client's cancel is
-                           * honored when its own request is dispatched */
-        errno = saved_errno;
-        return;
+    /* Counted busy before the read: a request ending on another thread
+     * waits for the count to fall before its fd may close (ipc_unpublish). */
+    atomic_fetch_add_explicit(&g_ipc_oob_busy, 1, memory_order_seq_cst);
+    uint64_t w = atomic_load_explicit(&g_ipc_active, memory_order_seq_cst);
+    int fd = ipc_active_fd(w);
+#ifdef DEBUG
+    if (fd >= 0 && atomic_load(&g_oob_gate_for_test) == 1) {
+        atomic_store(&g_oob_gate_for_test, 2);
+        for (long spin = 0; !atomic_load(&g_unpublish_waited_for_test) && spin < 2000000000L; spin++) { }
+        atomic_store(&g_oob_gate_for_test, 0);
     }
-    /* Cancel ONLY if the urgent byte is on the RUNNING query's connection.
-     * OOB from any OTHER (queued) client must not touch this query; that byte
-     * stays pending on its socket and is honored when that client runs. */
-    if (oob_cancel_for(fd, g_ipc_active_seq, &g_ipc_oob_taken))
+#endif
+    /* fd < 0: nothing running — a queued client's cancel is honored when its
+     * own request is dispatched.  Otherwise cancel ONLY if the urgent byte is
+     * on the RUNNING query's connection.  OOB from any OTHER (queued) client
+     * must not touch this query; that byte stays pending on its socket and is
+     * honored when that client runs. */
+    int took = 0;
+    if (fd >= 0 && oob_cancel_for(fd, ipc_active_seq(w), &took))
         ray_cancel_request();
+    if (took) atomic_store_explicit(&g_ipc_oob_taken, 1, memory_order_seq_cst);
+    atomic_fetch_sub_explicit(&g_ipc_oob_busy, 1, memory_order_seq_cst);
     errno = saved_errno;
 }
 #endif
@@ -1352,6 +1419,96 @@ static void ipc_install_oob_cancel(void)
     sigaction(SIGURG, &sa, NULL);
 #endif
 }
+
+/* The cancel context of a request being evaluated, and what it replaced:
+ * an eval can dispatch another connection's request inside it (a sync
+ * send pumps its peer's frames while it waits), so the running request's
+ * context is saved and given back.  A byte taken in the nested request is
+ * that request's, and the outer one answers to its own byte again once it
+ * resumes. */
+typedef struct {
+    ray_cancel_save_t csave;
+    int prev_fd, prev_seq, prev_taken, prev_kind;
+} ipc_req_ctx_t;
+
+/* A request on `fd` answering to cancel number `seq` starts.  The order
+ * matters (#1758).  The outer request's pair is unpublished and any
+ * handler that read it is waited out FIRST: such a handler may still take
+ * the outer client's byte and raise a cancel, and that cancel and its
+ * taken flag are the outer request's.  Only then are they saved, the
+ * outer one's cancel into csave by ray_cancel_request_begin, which clears
+ * any stale cancel for the new request (the server is single-threaded, so
+ * each request starts a fresh query; only the request cancel is cleared: a
+ * client's Ctrl-C waiting to be forwarded by a sync send on another thread
+ * is that client's, #1623).  A handler on this thread between the
+ * unpublish and the begin sees no fd and does nothing. */
+static void ipc_request_enter(ipc_req_ctx_t* c, int fd, int seq, int kind)
+{
+    uint64_t prev = atomic_load_explicit(&g_ipc_active, memory_order_relaxed);
+    c->prev_fd   = ipc_active_fd(prev);
+    c->prev_seq  = ipc_active_seq(prev);
+    ipc_unpublish();
+    c->prev_taken = atomic_load(&g_ipc_oob_taken);
+    ray_cancel_request_begin(&c->csave);
+    c->prev_kind = g_ipc_active_kind;
+    g_ipc_active_kind = kind;
+    ipc_oob_cancel_unblock();
+    atomic_store(&g_ipc_oob_taken, 0);
+    ipc_publish(fd, seq);
+    /* A byte that came after the dispatch's first look but before the fd
+     * was published raised its SIGURG with no request to cancel: the
+     * handler left it pending.  Look again now the handler would act. */
+    int took = 0;
+    if (oob_cancel_for(fd, seq, &took)) ray_cancel_request();
+    if (took) atomic_store(&g_ipc_oob_taken, 1);
+}
+
+/* The request has returned: unpublished, its handlers waited out (so its
+ * connection may close and its taken flag is final), its cancel ended and
+ * the outer request's context given back.  True when the request's byte
+ * was taken. */
+static bool ipc_request_leave(ipc_req_ctx_t* c)
+{
+    ipc_unpublish();
+    ray_cancel_request_end(&c->csave);
+    bool taken = atomic_load(&g_ipc_oob_taken) != 0;
+    atomic_store(&g_ipc_oob_taken, c->prev_taken);
+    ipc_publish(c->prev_fd, c->prev_seq);
+    g_ipc_active_kind = c->prev_kind;
+    /* A byte for the outer request that came while the nested one ran
+     * raised its SIGURG then, against the nested connection: look again. */
+    int took = 0;
+    if (c->prev_fd >= 0 && oob_cancel_for(c->prev_fd, c->prev_seq, &took))
+        ray_cancel_request();
+    if (took) atomic_store(&g_ipc_oob_taken, 1);
+    return taken;
+}
+
+#ifdef DEBUG
+/* Test hooks (ipc.h). */
+static ipc_req_ctx_t g_req_ctx_for_test[4];
+static int g_req_depth_for_test = 0;
+void ray_ipc_request_enter_for_test(int fd, int seq)
+{
+    if (g_req_depth_for_test < 4)
+        ipc_request_enter(&g_req_ctx_for_test[g_req_depth_for_test++], fd, seq, RAY_IPC_MSG_SYNC);
+}
+bool ray_ipc_request_leave_for_test(void)
+{
+    return g_req_depth_for_test > 0 &&
+           ipc_request_leave(&g_req_ctx_for_test[--g_req_depth_for_test]);
+}
+void ray_ipc_oob_gate_for_test(bool on)
+{
+    atomic_store(&g_unpublish_waited_for_test, 0);
+    atomic_store(&g_oob_gate_for_test, on ? 1 : 0);
+}
+bool ray_ipc_oob_gate_holding_for_test(void) { return atomic_load(&g_oob_gate_for_test) == 2; }
+bool ray_ipc_oob_taken_for_test(void) { return atomic_load(&g_ipc_oob_taken) != 0; }
+#ifndef RAY_OS_WINDOWS
+void ray_ipc_sigurg_for_test(void) { ipc_sigurg_handler(SIGURG); }
+#endif
+#endif
 
 /* Accept callback — called when listener fd is readable */
 static ray_t* ipc_accept(ray_poll_t* poll, ray_selector_t* sel)
@@ -1622,51 +1779,16 @@ static ray_t* ipc_read_payload(ray_poll_t* poll, ray_selector_t* sel)
     if (hdr.msgtype == RAY_IPC_MSG_SYNC) cd->rx_sync_seq++;
     int cancel_seq = !sel->xport ? CANCEL_ANY
                    : hdr.msgtype == RAY_IPC_MSG_SYNC ? (int)cd->rx_sync_seq : CANCEL_NONE;
-    volatile sig_atomic_t taken = 0;
+    int taken = 0;
     if (oob_cancel_for((int)sel->fd, cancel_seq, &taken)) {
         result = ray_error("cancel", "interrupted");
     } else {
-        /* Clear any stale cancel first: the server is single-threaded, so each
-         * request starts a fresh query — without this reset a prior cancel
-         * would make every later query fail spuriously (the REPL clears per
-         * line the same way).  Only this request's own cancel is cleared: a
-         * client's Ctrl-C waiting to be forwarded by a sync send on another
-         * thread is that client's (#1623).  Publish the active fd so a SIGURG
-         * for THIS connection cancels this query. */
-        ray_cancel_save_t csave;
-        ray_cancel_request_begin(&csave);
-        /* An eval can dispatch another connection's request inside it
-         * (a sync send pumps its peer's frames while it waits), so the
-         * running request's cancel context is saved and given back: a
-         * byte taken in the nested request is that request's, and the
-         * outer one answers to its own byte again once it resumes. */
-        int prev_fd    = g_ipc_active_fd;
-        int prev_seq   = g_ipc_active_seq;
-        int prev_taken = g_ipc_oob_taken;
-        int prev_kind  = g_ipc_active_kind;
-        g_ipc_active_kind = (int)hdr.msgtype;
-        g_ipc_active_fd  = -1;
-        ipc_oob_cancel_unblock();
-        g_ipc_oob_taken  = 0;
-        g_ipc_active_seq = cancel_seq;
-        g_ipc_active_fd  = (int)sel->fd;
-        /* A byte that came after the look above but before the fd was
-         * published raised its SIGURG with no request to cancel: the
-         * handler left it pending.  Look again now the handler would act. */
-        if (oob_cancel_for((int)sel->fd, cancel_seq, &g_ipc_oob_taken))
-            ray_cancel_request();
+        /* Publish this connection so a SIGURG for it cancels this query
+         * (ipc_request_enter says in what order, and why). */
+        ipc_req_ctx_t rc;
+        ipc_request_enter(&rc, (int)sel->fd, cancel_seq, (int)hdr.msgtype);
         result = eval_payload(payload->data, (size_t)payload->offset, &hdr);
-        g_ipc_active_fd  = -1;
-        ray_cancel_request_end(&csave);
-        if (g_ipc_oob_taken) taken = 1;
-        g_ipc_oob_taken  = prev_taken;
-        g_ipc_active_seq = prev_seq;
-        g_ipc_active_fd  = prev_fd;
-        g_ipc_active_kind = prev_kind;
-        /* A byte for the outer request that came while the nested one ran
-         * raised its SIGURG then, against the nested connection: look again. */
-        if (prev_fd >= 0 && oob_cancel_for(prev_fd, prev_seq, &g_ipc_oob_taken))
-            ray_cancel_request();
+        if (ipc_request_leave(&rc)) taken = 1;
     }
 
     ipc_ctx_set(prev_handle, prev_poll);
