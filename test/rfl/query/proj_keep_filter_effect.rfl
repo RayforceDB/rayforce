@@ -1,0 +1,47 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; A select that only filters, as the from: of a select that names its
+;; columns, gathers just those columns (#1704).  The outer select's names are
+;; judged before the inner one runs, so the narrowing holds only while
+;; evaluating the from: cannot rebind a global: an inner where: calling
+;; (set neg f) turns the neg the outer select calls into f, which reads c
+;; (#1767).  Such a from: keeps every column.  Each case runs on a fresh
+;; table name with neg restored, in memory, splayed and parted.
+(.sys.exec "rm -rf /tmp/rfl_pk_effect && mkdir -p /tmp/rfl_pk_effect") -- 0
+(set T (table [a b c s] (list [1 2 3 4] [10 20 30 40] [100 200 300 400] ['x 'y 'x 'y])))
+(.db.splayed.set "/tmp/rfl_pk_effect/spl/t/" T)
+(.db.splayed.set "/tmp/rfl_pk_effect/par/2024.01.01/t/" (at T [0 1]) "/tmp/rfl_pk_effect/par/.sym")
+(.db.splayed.set "/tmp/rfl_pk_effect/par/2024.01.02/t/" (at T [2 3]) "/tmp/rfl_pk_effect/par/.sym")
+(set S (.db.splayed.get "/tmp/rfl_pk_effect/spl/t/"))
+(set P (.db.parted.get "/tmp/rfl_pk_effect/par/" 't))
+(set f (fn [v] (+ v c)))
+(set neg0 neg)
+(set flip (fn [x] (set neg f) true))
+(set pure (fn [x] (> x 1)))
+
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) 1)}) 'r) -- [102 203 304 405]
+(set neg neg0)
+(at (select {from: (select {from: P where: (flip a)}) by: s r: (sum (neg a))}) 'r) -- [404 606]
+(set neg neg0)
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) -- [102 203 304 405]
+(set neg neg0)
+(at (select {from: (select {from: P where: (flip a) take: 3}) r: (neg a)}) 'r) -- [101 202 303]
+(set neg neg0)
+(at (select {from: (select {from: S where: (flip a) take: 3}) r: (neg a)}) 'r) -- [101 202 303]
+(set neg neg0)
+(at (select {from: (select {from: T where: (flip a) take: 3}) r: (neg a)}) 'r) -- [101 202 303]
+(set neg neg0)
+(at (select {from: (select {from: (select {from: P where: (flip a)}) where: (> a 1)}) r: (neg a)}) 'r) -- [202 303 404]
+(set neg neg0)
+(at (select {from: (select {from: T where: (flip a)}) r: (+ (neg a) 1)}) 'r) -- [102 203 304 405]
+(set neg neg0)
+;; with a global c the column still wins
+(set c 1000)
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) 1)}) 'r) -- [102 203 304 405]
+(set neg neg0)
+(at (select {from: (select {from: S where: (flip a) take: 3}) r: (neg a)}) 'r) -- [101 202 303]
+(set neg neg0)
+(set c 0)
+;; a filter without effects still narrows and answers as before
+(at (select {from: (select {from: P where: (pure a)}) r: (neg a)}) 'r) -- [-2 -3 -4]
+(at (select {from: (select {from: P where: (> a 1)}) by: s r: (sum (neg a))}) 'r) -- [-6 -3]
+(.sys.exec "rm -rf /tmp/rfl_pk_effect") -- 0

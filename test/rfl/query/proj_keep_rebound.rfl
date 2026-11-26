@@ -14,18 +14,17 @@
 (set f (fn [v] (+ v c)))
 
 ;; a filter that rebinds a builtin the outer select calls, (set neg f) in
-;; the inner where:, is #1767: the narrowing was judged while neg was the
-;; builtin.  In memory the answer is right; on a parted table the column f
-;; reads is gone.  The parted lines pin today's answer until #1767 is fixed,
-;; when they become [102 203 304 405].  They come first: once neg holds f,
-;; the narrowing declines.
+;; the inner where:: the narrowing was judged while neg was the builtin, so
+;; an inner select whose clauses can have effects keeps every column and f
+;; sees c (#1767).  These come first, each with neg restored: once neg
+;; holds f when the outer select is judged, the narrowing declines anyway.
 (set neg0 neg)
 (set flip (fn [x] (set neg f) true))
 (at (select {from: (select {from: T where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) -- [102 203 304 405]
 (set neg neg0)
-(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) !- schema
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) (count ['x]))}) 'r) -- [102 203 304 405]
 (set neg neg0)
-(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) 1)}) 'r) !- schema
+(at (select {from: (select {from: P where: (flip a)}) r: (+ (neg a) 1)}) 'r) -- [102 203 304 405]
 (set neg neg0)
 
 ;; quote rebound to a lambda
