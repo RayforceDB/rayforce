@@ -39,3 +39,19 @@
 (count (table [a b] (list [1 2 3 4 5] [10 20 30 40 50]))) -- 5
 ;; empty table
 (count (table [a b] (list (as 'I64 []) (as 'I64 [])))) -- 0
+
+;; ─── keyless select: count and the other non-variance aggregates ─────
+;; gcc 13.3 -O3 (loop unswitching on the aggregate-op switch in
+;; emit_agg_columns) returned 0 for every one of these; a where: filter
+;; made count wrong as well.
+(set WC (table [v] (list (% (til 50000) 1013))))
+(at (select {from: WC where: (> v 10) c: (count v)}) 'c) -- [49450]
+(at (select {from: WC c: (count v)}) 'c) -- [50000]
+(at (select {from: WC where: (> v 10) c: (sum v)}) 'c) -- [25179275]
+(at (select {from: WC c: (sum v)}) 'c) -- [25182025]
+(at (select {from: WC where: (> v 10) c: (min v)}) 'c) -- [11]
+(at (select {from: WC where: (> v 10) c: (max v)}) 'c) -- [1012]
+(at (select {from: WC where: (> v 10) c: (first v)}) 'c) -- [11]
+(at (select {from: WC where: (> v 10) c: (last v)}) 'c) -- [362]
+(first (at (select {from: WC where: (> v 10) c: (avg v)}) 'c)) -- (/ 25179275.0 49450.0)
+(select {from: WC where: (> v 10) c: (count v) s: (sum v) lo: (min v) hi: (max v)}) -- (table [c s lo hi] (list [49450] [25179275] [11] [1012]))

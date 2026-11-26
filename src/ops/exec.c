@@ -976,6 +976,54 @@ static inline bool in_span_point_pair(int8_t ct, int8_t st) {
     return st == RAY_TIMESPAN && (ct == RAY_TIME || ct == RAY_TIMESTAMP);
 }
 
+/* The first n elements of the set vector, nulls skipped, widened into dst;
+ * returns how many were written (any other element type reads as 0).  One
+ * loop per element type, the type switch outside them: read through a
+ * switch inside a single loop, gcc 13.3 -O3 unswitched that loop on the
+ * type and lost the narrow arms (an I16 or U8 set matched nothing). */
+#define IN_WIDEN(EXPR) do {                                                \
+        for (int64_t i = 0; i < n; i++) {                                  \
+            if (has_nulls && ray_vec_is_null(set, i)) continue;            \
+            dst[k++] = (EXPR);                                             \
+        }                                                                  \
+    } while (0)
+
+static int64_t in_set_widen_i64(int64_t* dst, ray_t* set, int8_t st, int64_t n,
+                                bool has_nulls) {
+    const void* d = ray_data(set);
+    int64_t k = 0;
+    switch (st) {
+    case RAY_BOOL: case RAY_U8: IN_WIDEN(((const uint8_t*)d)[i]); break;
+    case RAY_I16:  IN_WIDEN(((const int16_t*)d)[i]); break;
+    case RAY_I32:  case RAY_DATE: case RAY_TIME:
+                   IN_WIDEN(((const int32_t*)d)[i]); break;
+    case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:
+                   IN_WIDEN(((const int64_t*)d)[i]); break;
+    case RAY_SYM:  IN_WIDEN(ray_read_sym(d, i, st, set->attrs)); break;
+    default:       IN_WIDEN(0); break;
+    }
+    return k;
+}
+
+static int64_t in_set_widen_f64(double* dst, ray_t* set, int8_t st, int64_t n,
+                                bool has_nulls) {
+    const void* d = ray_data(set);
+    int64_t k = 0;
+    switch (st) {
+    case RAY_BOOL: case RAY_U8: IN_WIDEN((double)((const uint8_t*)d)[i]); break;
+    case RAY_I16:  IN_WIDEN((double)((const int16_t*)d)[i]); break;
+    case RAY_I32:  case RAY_DATE: case RAY_TIME:
+                   IN_WIDEN((double)((const int32_t*)d)[i]); break;
+    case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:
+                   IN_WIDEN((double)((const int64_t*)d)[i]); break;
+    case RAY_F32:  IN_WIDEN((double)((const float*)d)[i]); break;
+    case RAY_F64:  IN_WIDEN(((const double*)d)[i]); break;
+    default:       IN_WIDEN(0.0); break;
+    }
+    return k;
+}
+#undef IN_WIDEN
+
 /* The body shared by in_build_worker_ctx (a column vector or atom) and
  * in_build_worker_ctx_meta (a bound source read by range), over the
  * column's description: `atom` is the column when it is an atom (else
@@ -1005,11 +1053,11 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     bool sym_of_str = (ct == RAY_SYM && st == RAY_STR);
     bool null_in = false;
     if ((ct == RAY_STR || st == RAY_STR) && !sym_of_str) return IN_CTX_UNSUPPORTED;
-    /* GUID cells are 16-byte blobs; the typed kernel's READ_I64/IN_READ_I64
-     * loops have no guid case and read them at the wrong width (every cell
-     * decodes to 0, so membership silently matched everything).  Bail so the
-     * caller routes to the guid-aware hashset path, mirroring how RAY_STR bails
-     * above and the guid == fix. */
+    /* GUID cells are 16-byte blobs; in_set_widen_i64 and the typed kernel's
+     * IN_READ_I64 loops have no guid case and read them at the wrong width
+     * (every cell decodes to 0, so membership silently matched everything).
+     * Bail so the caller routes to the guid-aware hashset path, mirroring how
+     * RAY_STR bails above and the guid == fix. */
     if (ct == RAY_GUID || st == RAY_GUID) return IN_CTX_UNSUPPORTED;
 
     /* Classify each side: 0=int-family, 1=float-family, 2=sym. */
@@ -1058,36 +1106,6 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
     bool col_atom_null = atom && RAY_ATOM_IS_NULL(atom);
     bool set_has_nulls = !ray_is_atom(set) && ray_vec_may_have_nulls(set);
 
-    #define READ_I64(dst, vec, type, idx) do {                             \
-        const void* _d = ray_data(vec);                                    \
-        switch (type) {                                                    \
-        case RAY_BOOL: case RAY_U8: (dst) = ((const uint8_t*)_d)[idx]; break; \
-        case RAY_I16:  (dst) = ((const int16_t*)_d)[idx]; break;           \
-        case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
-                       (dst) = ((const int32_t*)_d)[idx]; break;           \
-        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
-                       (dst) = ((const int64_t*)_d)[idx]; break;           \
-        case RAY_SYM:  (dst) = ray_read_sym(_d, (idx), (type),             \
-                                            (vec)->attrs); break;          \
-        default:       (dst) = 0; break;                                   \
-        }                                                                  \
-    } while (0)
-
-    #define READ_F64(dst, vec, type, idx) do {                             \
-        const void* _d = ray_data(vec);                                    \
-        switch (type) {                                                    \
-        case RAY_BOOL: case RAY_U8: (dst) = (double)((const uint8_t*)_d)[idx]; break; \
-        case RAY_I16:  (dst) = (double)((const int16_t*)_d)[idx]; break;   \
-        case RAY_I32:  case RAY_DATE: case RAY_TIME:                       \
-                       (dst) = (double)((const int32_t*)_d)[idx]; break;   \
-        case RAY_I64:  case RAY_TIMESTAMP: case RAY_TIMESPAN:              \
-                       (dst) = (double)((const int64_t*)_d)[idx]; break;   \
-        case RAY_F32:  (dst) = (double)((const float*)_d)[idx]; break;     \
-        case RAY_F64:  (dst) = ((const double*)_d)[idx]; break;            \
-        default:       (dst) = 0.0; break;                                 \
-        }                                                                  \
-    } while (0)
-
     /* Compact probe buffer: drop null set elements up front so the
      * inner loop doesn't special-case them. */
     int64_t sv_len = 0;
@@ -1129,11 +1147,7 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 sv_len = 1;
             }
         } else if (set_len > 0) {
-            for (int64_t i = 0; i < set_len; i++) {
-                if (set_has_nulls && ray_vec_is_null(set, i)) continue;
-                READ_F64(svf[sv_len], set, st, i);
-                sv_len++;
-            }
+            sv_len = in_set_widen_f64(svf, set, st, set_len, set_has_nulls);
         }
     } else if (sym_of_str) {
         struct ray_sym_domain_s* cd = (!atom && dom) ? dom : ray_sym_runtime_domain();
@@ -1165,24 +1179,22 @@ static in_ctx_status_t in_build_ctx_core(ray_t* atom, int8_t ct, bool may_null,
                 }
             }
         } else if (set_len > 0) {
-            for (int64_t i = 0; i < set_len; i++) {
-                if (set_has_nulls && ray_vec_is_null(set, i)) continue;
-                READ_I64(svi[sv_len], set, st, i);
-                if (in_col_dom) {
-                    /* cross-domain: re-express in the column's domain */
-                    ray_t* s = ray_sym_domain_str(in_set_dom, svi[sv_len]);
+            sv_len = in_set_widen_i64(svi, set, st, set_len, set_has_nulls);
+            if (in_col_dom) {
+                /* cross-domain: re-express in the column's domain */
+                int64_t nv = sv_len;
+                sv_len = 0;
+                for (int64_t i = 0; i < nv; i++) {
+                    ray_t* s = ray_sym_domain_str(in_set_dom, svi[i]);
                     int64_t xid = s ? ray_sym_domain_find(in_col_dom,
                                           ray_str_ptr(s), ray_str_len(s)) : -1;
                     if (xid < 0) continue;  /* absent: matches nothing */
-                    svi[sv_len] = xid;
+                    svi[sv_len++] = xid;
                 }
-                sv_len++;
             }
         }
     }
 
-    #undef READ_I64
-    #undef READ_F64
     #undef CLASSIFY
 
     /* SYM column: build the per-domain-position verdict LUT over the

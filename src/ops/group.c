@@ -9516,6 +9516,39 @@ static void da_var_merge_slots(da_accum_t* dst, da_accum_t* src, size_t lo, size
                 da_var_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a, group_fp_type(types[a]));
 }
 
+/* emit_agg_columns' per-group arms, one value each.  The switch that picks
+ * the arm sits in the per-group loop on a value fixed for the column, and
+ * gcc 13.3 -O3 unswitches that loop on it: when one arm's case labels form
+ * three disjoint ranges (the variance ops, 59 / 73-75 / 148-149), the copy
+ * for "none of these" drops the other live arms into default, and keyless
+ * sum / avg / min / max / first / last came back 0.  Dense kinds, one
+ * label per arm, keep each unswitch test a single comparison. */
+typedef enum {
+    EMIT_SUM, EMIT_PROD, EMIT_AVG, EMIT_MIN, EMIT_MAX, EMIT_FIRST_LAST,
+    EMIT_COUNT, EMIT_ALL, EMIT_ANY, EMIT_VAR, EMIT_PAIR, EMIT_OTHER
+} emit_kind_t;
+
+static inline emit_kind_t emit_kind_of(uint16_t op) {
+    switch (op) {
+        case OP_SUM:   return EMIT_SUM;
+        case OP_PROD:  return EMIT_PROD;
+        case OP_AVG:   return EMIT_AVG;
+        case OP_MIN:   return EMIT_MIN;
+        case OP_MAX:   return EMIT_MAX;
+        case OP_FIRST: case OP_LAST: return EMIT_FIRST_LAST;
+        case OP_COUNT: return EMIT_COUNT;
+        case OP_ALL:   return EMIT_ALL;
+        case OP_ANY:   return EMIT_ANY;
+        case OP_VAR: case OP_VAR_POP:
+        case OP_STDDEV: case OP_STDDEV_POP:
+        case OP_VAR_K: case OP_VAR_D: return EMIT_VAR;
+        case OP_PEARSON_CORR:
+        case OP_COV: case OP_SCOV:
+        case OP_WSUM: case OP_WAVG: return EMIT_PAIR;
+        default:       return EMIT_OTHER;
+    }
+}
+
 /* Unified agg result emitter — used by both DA and HT paths.
  * Arrays indexed by [gi * n_aggs + a], counts by [gi].  nn_counts (if
  * non-NULL) carries the per-(group, agg) non-null row count: AVG/VAR/
@@ -9546,6 +9579,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                               const int64_t* var_k) {
     for (uint32_t a = 0; a < n_aggs; a++) {
         uint16_t agg_op = ext->agg_ops[a];
+        emit_kind_t kind = emit_kind_of(agg_op);
         ray_t* agg_col = agg_vecs[a];
         /* agg_col == NULL means a fused input.  The accumulator family
          * follows the FUSION, not the expression's out_type: a fused
@@ -9622,8 +9656,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
             }
             if (out_type == RAY_F64 || out_type == RAY_F32) {
                 double v;
-                switch (agg_op) {
-                    case OP_SUM:
+                switch (kind) {
+                    case EMIT_SUM:
                         v = is_f64 ? sum_f64[idx]
                           : sum_hi64 ? ray_i128_to_f64(sum_hi64[idx], (uint64_t)sum_i64[idx])
                           : (double)sum_i64[idx];
@@ -9631,14 +9665,14 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         if (affine && affine[a].enabled)
                             v += affine[a].bias_f64 * nn;
                         break;
-                    case OP_PROD:
+                    case EMIT_PROD:
                         /* no row at all: the empty product, as the builtin
                          * and the evaluator give it (#1577) */
                         if (counts[gi] == 0) { v = 1.0; break; }
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx];
                         break;
-                    case OP_AVG:
+                    case EMIT_AVG:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         if (f64_bias) {
                             /* the sum of the F64 values over their count,
@@ -9660,18 +9694,16 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         if (affine && affine[a].enabled)
                             v += affine[a].bias_f64;
                         break;
-                    case OP_MIN:
+                    case EMIT_MIN:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? min_f64[idx] : (double)min_i64[idx]; break;
-                    case OP_MAX:
+                    case EMIT_MAX:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? max_f64[idx] : (double)max_i64[idx]; break;
-                    case OP_FIRST: case OP_LAST:
+                    case EMIT_FIRST_LAST:
                         if (nn == 0) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         v = is_f64 ? sum_f64[idx] : (double)sum_i64[idx]; break;
-                    case OP_VAR: case OP_VAR_POP:
-                    case OP_STDDEV: case OP_STDDEV_POP:
-                    case OP_VAR_K: case OP_VAR_D: {
+                    case EMIT_VAR: {
                         /* about the slot's first value, sums in double for
                          * every type (da_var_add, #1666) */
                         bool vnull;
@@ -9680,11 +9712,7 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                         if (vnull) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); }
                         break;
                     }
-                    case OP_PEARSON_CORR:
-                    case OP_COV:
-                    case OP_SCOV:
-                    case OP_WSUM:
-                    case OP_WAVG: {
+                    case EMIT_PAIR: {
                         int64_t cnt = nn;
                         if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && cnt < 2) {
                             v = NULL_F64; ray_vec_set_null(new_col, gi, true); break;
@@ -9731,26 +9759,26 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                  * into a narrow (I32/I16) slot by topk_write_i64 collapses to 0
                  * and shadows the null. */
                 int64_t int_null = agg_int_null_sentinel_for(out_type);
-                switch (agg_op) {
-                    case OP_SUM:
+                switch (kind) {
+                    case EMIT_SUM:
                         v = sum_i64[idx];
                         if (affine && affine[a].enabled)
                             v = wrap_add_i64(v, wrap_mul_i64(affine[a].bias_i64, nn));
                         break;
-                    case OP_PROD:
+                    case EMIT_PROD:
                         if (counts[gi] == 0) { v = 1; break; }   /* the empty product (#1577) */
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = sum_i64[idx]; break;
-                    case OP_COUNT: v = counts[gi]; break;
-                    case OP_ALL:   v = (sum_i64[idx] == nn) ? 1 : 0; break;
-                    case OP_ANY:   v = (sum_i64[idx] > 0) ? 1 : 0; break;
-                    case OP_MIN:
+                    case EMIT_COUNT: v = counts[gi]; break;
+                    case EMIT_ALL:   v = (sum_i64[idx] == nn) ? 1 : 0; break;
+                    case EMIT_ANY:   v = (sum_i64[idx] > 0) ? 1 : 0; break;
+                    case EMIT_MIN:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = min_i64[idx]; break;
-                    case OP_MAX:
+                    case EMIT_MAX:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = max_i64[idx]; break;
-                    case OP_FIRST: case OP_LAST:
+                    case EMIT_FIRST_LAST:
                         if (nn == 0) { v = int_null; ray_vec_set_null(new_col, gi, true); break; }
                         v = sum_i64[idx]; break;
                     default:       v = 0; break;
