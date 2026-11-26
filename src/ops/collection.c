@@ -464,6 +464,17 @@ static bool hashset_insert(hashset_t* hs, int64_t i) {
     return true;
 }
 
+/* hashset_insert of rows [0, n) in blocks, a cancel poll before each
+ * (#1747): false when a cancel stopped it. */
+static bool hashset_insert_rows(hashset_t* hs, int64_t n) {
+    for (int64_t b = 0; b < n; b += RAY_CANCEL_ROWS) {
+        if (ray_cancel_poll()) return false;
+        int64_t e = n - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : n;
+        for (int64_t j = b; j < e; j++) hashset_insert(hs, j);
+    }
+    return true;
+}
+
 #ifdef DEBUG
 static _Thread_local uint64_t find_sorted_runs;
 /* Completed synchronous typed sorted kernels, not index/hash lookups. */
@@ -649,51 +660,77 @@ static ray_t* wide_ints_as_f64(ray_t* w) {
  * by the hashset's representative row (the first needle inserted with that
  * key), so duplicate needles share one answer and a null needle matches the
  * haystack's first null exactly as the haystack-hashed path does.
- * Returns false only on OOM (caller falls back). */
-static bool find_hash_needles_core(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+ * `hit` NULL: out[i] as above.  `hit` given (in): hit[i] = needle i is
+ * found, out is unused and any_null untouched.
+ * Polls for a cancel once per block of rows in each of its three passes
+ * (#1747).  FHN_DONE when answered, FHN_FALLBACK on OOM (the caller takes
+ * another route), FHN_CANCEL on a cancel: the caller answers `cancel`
+ * without building the fallback's hashset over the haystack. */
+enum { FHN_CANCEL = -1, FHN_FALLBACK = 0, FHN_DONE = 1 };
+static int find_hash_needles_core(ray_t* hay, ray_t* nd, int64_t* out, bool* hit, bool* any_null) {
     int64_t m = nd->len, n = hay->len;
     hashset_t hs;
-    if (!hashset_init(&hs, nd, m)) return false;
+    if (!hashset_init(&hs, nd, m)) return FHN_FALLBACK;
     int64_t* first = (int64_t*)ray_alloc_raw((size_t)(m > 0 ? m : 1) * sizeof(int64_t));
-    if (!first) { hashset_destroy(&hs); return false; }
+    if (!first) { hashset_destroy(&hs); return FHN_FALLBACK; }
     int64_t distinct = 0;
-    for (int64_t j = 0; j < m; j++) {
-        first[j] = -1;
-        if (hashset_insert(&hs, j)) distinct++;
+    bool go = true;
+    for (int64_t b = 0; go && b < m; b += RAY_CANCEL_ROWS) {
+        if (ray_cancel_poll()) { go = false; break; }
+        int64_t e = m - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : m;
+        for (int64_t j = b; j < e; j++) {
+            first[j] = -1;
+            if (hashset_insert(&hs, j)) distinct++;
+        }
     }
     int8_t ht = hay->type; void* hd = ray_data(hay);
     int64_t found = 0;
-    for (int64_t r = 0; r < n && found < distinct; r++) {
-        int64_t rep = hashset_find_xrow(&hs, hay, r, ht, hd);
-        if (rep != HS_EMPTY && first[rep] < 0) { first[rep] = r; found++; }
+    for (int64_t b = 0; go && b < n && found < distinct; b += RAY_CANCEL_ROWS) {
+        if (ray_cancel_poll()) { go = false; break; }
+        int64_t e = n - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : n;
+        for (int64_t r = b; r < e && found < distinct; r++) {
+            int64_t rep = hashset_find_xrow(&hs, hay, r, ht, hd);
+            if (rep != HS_EMPTY && first[rep] < 0) { first[rep] = r; found++; }
+        }
     }
     int8_t nt = nd->type; void* ndd = ray_data(nd);
-    for (int64_t i = 0; i < m; i++) {
-        int64_t rep = hashset_find_xrow(&hs, nd, i, nt, ndd);
-        int64_t pos = (rep == HS_EMPTY) ? -1 : first[rep];
-        if (pos < 0) { out[i] = NULL_I64; *any_null = true; }
-        else out[i] = pos;
+    for (int64_t b = 0; go && b < m; b += RAY_CANCEL_ROWS) {
+        if (ray_cancel_poll()) { go = false; break; }
+        int64_t e = m - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : m;
+        if (hit) {
+            for (int64_t i = b; i < e; i++) {
+                int64_t rep = hashset_find_xrow(&hs, nd, i, nt, ndd);
+                hit[i] = rep != HS_EMPTY && first[rep] >= 0;
+            }
+            continue;
+        }
+        for (int64_t i = b; i < e; i++) {
+            int64_t rep = hashset_find_xrow(&hs, nd, i, nt, ndd);
+            int64_t pos = (rep == HS_EMPTY) ? -1 : first[rep];
+            if (pos < 0) { out[i] = NULL_I64; *any_null = true; }
+            else out[i] = pos;
+        }
     }
     ray_free_raw(first);
     hashset_destroy(&hs);
-    return true;
+    return go ? FHN_DONE : FHN_CANCEL;
 }
 
 /* Wide int needles against a float haystack: hash their doubles instead
  * (wide_int_vs_float). */
-static __attribute__((noinline, cold)) bool
-find_hash_needles_f64(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+static __attribute__((noinline, cold)) int
+find_hash_needles_f64(ray_t* hay, ray_t* nd, int64_t* out, bool* hit, bool* any_null) {
     ray_t* f = wide_ints_as_f64(nd);
-    if (!f) return false;
-    bool ok = find_hash_needles_core(hay, f, out, any_null);
+    if (!f) return FHN_FALLBACK;
+    int r = find_hash_needles_core(hay, f, out, hit, any_null);
     ray_release(f);
-    return ok;
+    return r;
 }
 
-static bool find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* any_null) {
+static int find_hash_needles(ray_t* hay, ray_t* nd, int64_t* out, bool* hit, bool* any_null) {
     if (RAY_UNLIKELY(wide_int_vs_float(nd, hay)))
-        return find_hash_needles_f64(hay, nd, out, any_null);
-    return find_hash_needles_core(hay, nd, out, any_null);
+        return find_hash_needles_f64(hay, nd, out, hit, any_null);
+    return find_hash_needles_core(hay, nd, out, hit, any_null);
 }
 
 /* Hash the smaller side only when the scan side probes cheaply: SYM rows
@@ -3042,9 +3079,17 @@ ray_t* distinct_vec_eager(ray_t* x) {
             const void* data = ray_data(x);
             int8_t ty = x->type; uint16_t at = x->attrs;
             int64_t count = 0;
-            for (int64_t i = 0; i < len; i++) {
-                int64_t code = ray_read_sym(data, i, ty, at);
-                if (!seen[code]) { seen[code] = 1; idx[count++] = i; }
+            for (int64_t b = 0; b < len; b += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) {
+                    ray_free_raw(seen);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("cancel", "interrupted");
+                }
+                int64_t e = len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len;
+                for (int64_t i = b; i < e; i++) {
+                    int64_t code = ray_read_sym(data, i, ty, at);
+                    if (!seen[code]) { seen[code] = 1; idx[count++] = i; }
+                }
             }
             ray_free_raw(seen);
             ray_t* result = gather_by_idx(x, idx, count);
@@ -3067,9 +3112,17 @@ ray_t* distinct_vec_eager(ray_t* x) {
             uint8_t* seen = (uint8_t*)ray_calloc_raw((size_t)nd);
             if (!seen) { if (idx != idx_stack) ray_free_raw(idx); return ray_error("oom", NULL); }
             int64_t count = 0;
-            for (int64_t i = 0; i < len; i++) {
-                int32_t c = codes[i];
-                if (c >= 0 && c < nd && !seen[c]) { seen[c] = 1; idx[count++] = i; }
+            for (int64_t b = 0; b < len; b += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) {
+                    ray_free_raw(seen);
+                    if (idx != idx_stack) ray_free_raw(idx);
+                    return ray_error("cancel", "interrupted");
+                }
+                int64_t e = len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len;
+                for (int64_t i = b; i < e; i++) {
+                    int32_t c = codes[i];
+                    if (c >= 0 && c < nd && !seen[c]) { seen[c] = 1; idx[count++] = i; }
+                }
             }
             ray_free_raw(seen);
             ray_t* result = gather_by_idx(x, idx, count);
@@ -3115,8 +3168,16 @@ ray_t* distinct_vec_eager(ray_t* x) {
             if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
-        for (int64_t i = 0; i < len; i++) {
-            if (hashset_insert(&hs, i)) idx[count++] = i;
+        /* the rows in blocks, a cancel poll before each (#1747) */
+        for (int64_t b = 0; b < len; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) {
+                hashset_destroy(&hs);
+                if (idx != idx_stack) ray_free_raw(idx);
+                return ray_error("cancel", "interrupted");
+            }
+            int64_t e = len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len;
+            for (int64_t i = b; i < e; i++)
+                if (hashset_insert(&hs, i)) idx[count++] = i;
         }
         hashset_destroy(&hs);
     }
@@ -3154,10 +3215,17 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
         if (!seg) {
             int64_t n = parted_seg_rows(segs, s, cnt, ncnt);
             if (base == RAY_STR) {
-                for (int64_t i = 0; i < n; i++) {
-                    out = ray_str_vec_append(out, "", 0);
-                    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-                    ray_vec_set_null(out, pos++, true);
+                for (int64_t b = 0; b < n; b += RAY_CANCEL_ROWS) {
+                    if (ray_cancel_poll()) {
+                        ray_release(out);
+                        return ray_error("cancel", "interrupted");
+                    }
+                    int64_t e = n - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : n;
+                    for (int64_t i = b; i < e; i++) {
+                        out = ray_str_vec_append(out, "", 0);
+                        if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+                        ray_vec_set_null(out, pos++, true);
+                    }
                 }
             } else {
                 parted_fill_nulls(out, pos, n);
@@ -3177,14 +3245,24 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
             pos += seg->len;
             continue;
         }
-        for (int64_t i = 0; i < seg->len; i++) {
+        /* the rows in blocks, a cancel poll before each (#1747) */
+        for (int64_t b = 0; b < seg->len; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) {
+                ray_release(out);
+                return ray_error("cancel", "interrupted");
+            }
+            int64_t e = seg->len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : seg->len;
             if (base == RAY_STR) {
-                size_t slen = 0;
-                const char* sp = ray_str_vec_get(seg, i, &slen);
-                out = ray_str_vec_append(out, sp ? sp : "", sp ? slen : 0);
-                if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
-                if (ray_vec_is_null(seg, i)) ray_vec_set_null(out, pos, true);
-            } else {
+                for (int64_t i = b; i < e; i++, pos++) {
+                    size_t slen = 0;
+                    const char* sp = ray_str_vec_get(seg, i, &slen);
+                    out = ray_str_vec_append(out, sp ? sp : "", sp ? slen : 0);
+                    if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
+                    if (ray_vec_is_null(seg, i)) ray_vec_set_null(out, pos, true);
+                }
+                continue;
+            }
+            for (int64_t i = b; i < e; i++, pos++) {
                 int allocated = 0;
                 ray_t* elem = collection_elem(seg, i, &allocated);
                 if (!elem || RAY_IS_ERR(elem) || store_typed_elem(out, pos, elem) != 0) {
@@ -3194,7 +3272,6 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
                 }
                 if (allocated) ray_release(elem);
             }
-            pos++;
         }
     }
     return out;
@@ -3721,27 +3798,29 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
             /* Fewer needles than set rows: hash the needles and scan the
              * set once instead of hashing the whole set per call. */
             if (find_needle_side_ok(vec, val)) {
-                int64_t* pos = (int64_t*)ray_calloc_raw((size_t)vlen * sizeof(int64_t));
-                bool miss = false;
-                if (pos && find_hash_needles(vec, val, pos, &miss)) {
-                    for (int64_t i = 0; i < vlen; i++) out[i] = pos[i] != NULL_I64;
-                    ray_free_raw(pos);
-                    return result;
+                int r = find_hash_needles(vec, val, NULL, out, NULL);
+                if (r == FHN_DONE) return result;
+                if (r == FHN_CANCEL) {
+                    ray_release(result);
+                    return ray_error("cancel", "interrupted");
                 }
-                if (pos) ray_free_raw(pos);
             }
             hashset_t hs;
             if (!hashset_init(&hs, vec, vec->len)) {
                 ray_release(result);
                 return ray_error("oom", NULL);
             }
-            for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
+            bool go = hashset_insert_rows(&hs, vec->len);
             int8_t val_type = val->type;
             void*  val_data = ray_data(val);
-            for (int64_t i = 0; i < vlen; i++) {
-                out[i] = hashset_find_xrow(&hs, val, i, val_type, val_data) != HS_EMPTY;
+            for (int64_t b = 0; go && b < vlen; b += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) { go = false; break; }
+                int64_t e = vlen - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : vlen;
+                for (int64_t i = b; i < e; i++)
+                    out[i] = hashset_find_xrow(&hs, val, i, val_type, val_data) != HS_EMPTY;
             }
             hashset_destroy(&hs);
+            if (!go) { ray_release(result); return ray_error("cancel", "interrupted"); }
             return result;
         }
         /* A list set: hash its cells once and probe per leaf (#1314). */
@@ -4029,15 +4108,22 @@ ray_t* ray_except_fn(ray_t* vec1, ray_t* vec2) {
                 if (idx != idx_stack) ray_free_raw(idx);
                 return ray_error("oom", NULL);
             }
-            for (int64_t j = 0; j < k2->len; j++) hashset_insert(&hs, j);
+            bool go = hashset_insert_rows(&hs, k2->len);
             int8_t v1_type = k1->type;
             void*  v1_data = ray_data(k1);
-            for (int64_t i = 0; i < len1; i++) {
-                if (hashset_find_xrow(&hs, k1, i, v1_type, v1_data) == HS_EMPTY)
-                    idx[count++] = i;
+            for (int64_t b = 0; go && b < len1; b += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) { go = false; break; }
+                int64_t e = len1 - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len1;
+                for (int64_t i = b; i < e; i++)
+                    if (hashset_find_xrow(&hs, k1, i, v1_type, v1_data) == HS_EMPTY)
+                        idx[count++] = i;
             }
             hashset_destroy(&hs);
             if (keys) ray_release(keys);
+            if (!go) {
+                if (idx != idx_stack) ray_free_raw(idx);
+                return ray_error("cancel", "interrupted");
+            }
         }
         ray_t* result = gather_by_idx(vec1, idx, count);
         if (idx != idx_stack) ray_free_raw(idx);
@@ -4142,10 +4228,21 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
         hashset_t* self = &hs;
         bool own_ready = false;
         bool exact_pass = true;
+        /* hs contains only k1 row indices.  Track accepted k2 rows in a
+         * separate set so repeated new RHS cells are appended just once,
+         * in their first-occurrence order. */
+        hashset_t added;
+        bool added_ready = false;
+        /* each loop below runs its rows in blocks, a cancel poll before
+         * each (#1747) */
         if (keys) {
             bool key_dup = false;
-            for (int64_t j = 0; j < k1->len; j++)
-                if (!hashset_insert(&hs, j)) key_dup = true;
+            for (int64_t b = 0; b < k1->len; b += RAY_CANCEL_ROWS) {
+                if (ray_cancel_poll()) goto cancelled;
+                int64_t e = k1->len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : k1->len;
+                for (int64_t j = b; j < e; j++)
+                    if (!hashset_insert(&hs, j)) key_dup = true;
+            }
             exact_pass = key_dup;
             kept1 = vec1->len;
             if (key_dup) {
@@ -4160,47 +4257,50 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
                 self = &hs_own;
             }
         }
-        for (int64_t j = 0; exact_pass && j < vec1->len; j++) {
-            if (hashset_insert(self, j)) {
-                if (idx1) idx1[kept1] = j;
-                kept1++;
-            } else if (!idx1) {
-                idx1 = (int64_t*)ray_alloc_raw((size_t)vec1->len * sizeof(int64_t));
-                if (!idx1) {
-                    if (own_ready) hashset_destroy(&hs_own);
-                    hashset_destroy(&hs);
-                    if (keys) ray_release(keys);
-                    if (idx != idx_stack) ray_free_raw(idx);
-                    return ray_error("oom", NULL);
+        for (int64_t b = 0; exact_pass && b < vec1->len; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) goto cancelled;
+            int64_t e = vec1->len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : vec1->len;
+            for (int64_t j = b; j < e; j++) {
+                if (hashset_insert(self, j)) {
+                    if (idx1) idx1[kept1] = j;
+                    kept1++;
+                } else if (!idx1) {
+                    idx1 = (int64_t*)ray_alloc_raw((size_t)vec1->len * sizeof(int64_t));
+                    if (!idx1) {
+                        if (own_ready) hashset_destroy(&hs_own);
+                        hashset_destroy(&hs);
+                        if (keys) ray_release(keys);
+                        if (idx != idx_stack) ray_free_raw(idx);
+                        return ray_error("oom", NULL);
+                    }
+                    for (int64_t r = 0; r < kept1; r++) idx1[r] = r;   /* the rows before the first duplicate are all kept */
+                    /* j itself is the duplicate: not kept */
                 }
-                for (int64_t r = 0; r < kept1; r++) idx1[r] = r;   /* the rows before the first duplicate are all kept */
-                /* j itself is the duplicate: not kept */
             }
         }
-        if (own_ready) hashset_destroy(&hs_own);
-        /* hs contains only k1 row indices.  Track accepted k2 rows in a
-         * separate set so repeated new RHS cells are appended just once,
-         * in their first-occurrence order. */
-        hashset_t added;
-        bool added_ready = false;
+        if (own_ready) { hashset_destroy(&hs_own); own_ready = false; }
         int8_t v2_type = k2->type;
         void*  v2_data = ray_data(k2);
         int64_t extra = 0;
-        for (int64_t i = 0; i < len2; i++) {
-            if (hashset_find_xrow(&hs, k2, i, v2_type, v2_data) != HS_EMPTY)
-                continue;
-            /* A RHS wholly covered by k1 needs no second table. */
-            if (!added_ready) {
-                if (!hashset_init(&added, k2, len2)) {
-                    hashset_destroy(&hs);
-                    if (idx1) ray_free_raw(idx1);
-                    if (keys) ray_release(keys);
-                    if (idx != idx_stack) ray_free_raw(idx);
-                    return ray_error("oom", NULL);
+        for (int64_t b = 0; b < len2; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) goto cancelled;
+            int64_t e = len2 - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len2;
+            for (int64_t i = b; i < e; i++) {
+                if (hashset_find_xrow(&hs, k2, i, v2_type, v2_data) != HS_EMPTY)
+                    continue;
+                /* A RHS wholly covered by k1 needs no second table. */
+                if (!added_ready) {
+                    if (!hashset_init(&added, k2, len2)) {
+                        hashset_destroy(&hs);
+                        if (idx1) ray_free_raw(idx1);
+                        if (keys) ray_release(keys);
+                        if (idx != idx_stack) ray_free_raw(idx);
+                        return ray_error("oom", NULL);
+                    }
+                    added_ready = true;
                 }
-                added_ready = true;
+                if (hashset_insert(&added, i)) idx[extra++] = i;
             }
-            if (hashset_insert(&added, i)) idx[extra++] = i;
         }
         if (added_ready) hashset_destroy(&added);
         hashset_destroy(&hs);
@@ -4218,6 +4318,14 @@ ray_t* ray_union_fn(ray_t* vec1, ray_t* vec2) {
         if (idx1) ray_release(part1);
         ray_release(part2);
         return result;
+    cancelled:
+        if (added_ready) hashset_destroy(&added);
+        if (own_ready) hashset_destroy(&hs_own);
+        hashset_destroy(&hs);
+        if (idx1) ray_free_raw(idx1);
+        if (keys) ray_release(keys);
+        if (idx != idx_stack) ray_free_raw(idx);
+        return ray_error("cancel", "interrupted");
     }
 
     /* Boxed list fallback */
@@ -4305,16 +4413,23 @@ ray_t* ray_sect_fn(ray_t* vec1, ray_t* vec2) {
             if (idx != idx_stack) ray_free_raw(idx);
             return ray_error("oom", NULL);
         }
-        for (int64_t j = 0; j < k2->len; j++) hashset_insert(&hs, j);
+        bool go = hashset_insert_rows(&hs, k2->len);
         int8_t v1_type = k1->type;
         void*  v1_data = ray_data(k1);
         int64_t count = 0;
-        for (int64_t i = 0; i < len1; i++) {
-            if (hashset_find_xrow(&hs, k1, i, v1_type, v1_data) != HS_EMPTY)
-                idx[count++] = i;
+        for (int64_t b = 0; go && b < len1; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) { go = false; break; }
+            int64_t e = len1 - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : len1;
+            for (int64_t i = b; i < e; i++)
+                if (hashset_find_xrow(&hs, k1, i, v1_type, v1_data) != HS_EMPTY)
+                    idx[count++] = i;
         }
         hashset_destroy(&hs);
         if (keys) ray_release(keys);
+        if (!go) {
+            if (idx != idx_stack) ray_free_raw(idx);
+            return ray_error("cancel", "interrupted");
+        }
         ray_t* result = gather_by_idx(vec1, idx, count);
         if (idx != idx_stack) ray_free_raw(idx);
         return result;
@@ -5706,8 +5821,14 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
              * This sparse admission avoids their sampled crossover region. */
             if (!done && vec->len >= 4096 && vlen <= vec->len / 8)
                 done = find_sorted_integer(vec, val, out, &any_null);
-            if (!done && find_needle_side_ok(vec, val))
-                done = find_hash_needles(vec, val, out, &any_null);
+            if (!done && find_needle_side_ok(vec, val)) {
+                int r = find_hash_needles(vec, val, out, NULL, &any_null);
+                if (r == FHN_CANCEL) {
+                    ray_release(result);
+                    return ray_error("cancel", "interrupted");
+                }
+                done = r == FHN_DONE;
+            }
             /* Hashing a wide int haystack for float needles: hash its
              * doubles instead (wide_int_vs_float). */
             if (!done && RAY_UNLIKELY(wide_int_vs_float(vec, val))) {
@@ -5717,14 +5838,19 @@ ray_t* ray_find_fn(ray_t* vec, ray_t* val) {
             if (!done) {
                 hashset_t hs;
                 if (!hashset_init(&hs, vec, vec->len)) { ray_release(result); return ray_error("oom", NULL); }
-                for (int64_t j = 0; j < vec->len; j++) hashset_insert(&hs, j);
+                bool go = hashset_insert_rows(&hs, vec->len);
                 int8_t vt = val->type; void* vd = ray_data(val);
-                for (int64_t i = 0; i < vlen; i++) {
-                    int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
-                    if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
-                    else out[i] = row;
+                for (int64_t b = 0; go && b < vlen; b += RAY_CANCEL_ROWS) {
+                    if (ray_cancel_poll()) { go = false; break; }
+                    int64_t e = vlen - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : vlen;
+                    for (int64_t i = b; i < e; i++) {
+                        int64_t row = hashset_find_xrow(&hs, val, i, vt, vd);
+                        if (row == HS_EMPTY) { out[i] = NULL_I64; any_null = true; }
+                        else out[i] = row;
+                    }
                 }
                 hashset_destroy(&hs);
+                if (!go) { ray_release(result); return ray_error("cancel", "interrupted"); }
             }
         } else if (vec->type == RAY_LIST && val->type == RAY_LIST && vlen >= 8 && vec->len >= 16) {
             ray_t** cells = ray_data(vec);
