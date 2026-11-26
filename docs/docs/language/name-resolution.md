@@ -37,7 +37,14 @@ value subsequent reads see.
 A source column takes precedence over a global of the same name. To use a
 global, bind it to a different local name before the query, or pass it as a
 parameter to a helper. A local parameter or `let` named like a column hides
-that column.
+that column. A helper's body sees the source columns the same way, whether the
+query calls it directly or a higher-order builtin such as `map`, `fold` or
+`scan` calls it, and whether it is named or fetched at run time:
+
+```lisp
+(set f (fn [v] (+ v price)))
+(select {r: (map f [1 2]) from: trades})  ; r is (list [11 12] [21 22])
+```
 
 ```lisp
 (set price 100)

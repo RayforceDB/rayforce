@@ -4869,9 +4869,103 @@ void ray_lambda_ready(ray_t* lambda) {
     if (lambda && lambda->type == RAY_LAMBDA && lambda_wants_compile(lambda)) lambda_compile(lambda);
 }
 
+/* Does `e`, a lambda body, name nothing but the lambda's parameters (as
+ * data, never called) and global unary or binary builtins that are neither
+ * special forms nor restricted nor eval?  Such a body reads no column, calls
+ * no function it was given and reaches no name at run time, so it needs no
+ * query call frame.  Anything else (a let, an if, a variadic or higher-order
+ * builtin, a helper, an unbound name, a quoted form) may. */
+static bool lambda_body_plain(ray_t* e, ray_t* params, int depth) {
+    if (!e) return true;
+    if (depth > 64) return false;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return true;   /* in a helper, the symbol itself */
+        for (int64_t i = 0; i < ray_len(params); i++)
+            if (((int64_t*)ray_data(params))[i] == e->i64) return true;
+        ray_t* g = ray_env_get_global(e->i64);
+        if (!g || (g->type != RAY_UNARY && g->type != RAY_BINARY)) return false;
+        if (g->attrs & (RAY_FN_SPECIAL_FORM | RAY_FN_RESTRICTED)) return false;
+        return !(g->type == RAY_UNARY && (ray_unary_fn)(uintptr_t)g->i64 == ray_eval_builtin_fn);
+    }
+    if (e->type == RAY_LIST) {
+        if (e->attrs & ATTR_QUOTED) return false;
+        ray_t** el = (ray_t**)ray_data(e);
+        if (ray_len(e) > 0 && el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED))
+            for (int64_t i = 0; i < ray_len(params); i++)
+                if (((int64_t*)ray_data(params))[i] == el[0]->i64) return false;   /* a parameter called */
+        for (int64_t i = 0; i < ray_len(e); i++)
+            if (!lambda_body_plain(el[i], params, depth + 1)) return false;
+        return true;
+    }
+    if (e->type < 0) return true;                    /* a non-symbol atom */
+    return ray_is_vec(e) && e->type != RAY_LIST;      /* a literal vector */
+}
+
+/* Does `e` name a column of `tbl` (a builtin's name may be one: date,
+ * count, first)?  A source column shadows the builtin in a helper. */
+static bool lambda_body_names_col(ray_t* e, ray_t* tbl, int depth) {
+    if (!e || depth > 64) return depth > 64;
+    if (e->type == -RAY_SYM) {
+        if (e->attrs & ATTR_QUOTED) return false;
+        for (int64_t i = 0, n = ray_table_ncols(tbl); i < n; i++)
+            if (ray_table_col_name(tbl, i) == e->i64) return true;
+        return false;
+    }
+    if (e->type == RAY_LIST)
+        for (int64_t i = 0; i < ray_len(e); i++)
+            if (lambda_body_names_col(((ray_t**)ray_data(e))[i], tbl, depth + 1)) return true;
+    return false;
+}
+
+/* Can a call of the closure-free `lambda` inside the query on `tbl` skip
+ * the query's call frame: its body names only parameters and first-order
+ * builtins (lambda_body_plain, cached for the current global epoch, since
+ * a global rebound may change the answer), none of them a column of `tbl`
+ * (cached for the last table checked)? */
+static inline uint32_t lambda_query_epoch(void) {
+    return (uint32_t)atomic_load_explicit(&g_global_epoch, memory_order_relaxed) & 0x3fffffffu;
+}
+static inline uint32_t lambda_query_tag(const ray_t* tbl) {
+    return ((uint32_t)((uintptr_t)tbl >> 4) << 2) | 2u;
+}
+static __attribute__((noinline)) bool lambda_query_plain(ray_t* lambda, ray_t* tbl) {
+    if (LAMBDA_CLOSURE(lambda) || !tbl || tbl->type != RAY_TABLE) return false;
+    uint32_t ge = lambda_query_epoch();
+    uint32_t c = LAMBDA_QPLAIN(lambda);
+    if (!(c & 2u) || (c >> 2) != ge) {
+        bool plain = LAMBDA_PARAMS(lambda) && LAMBDA_PARAMS(lambda)->type == RAY_SYM &&
+                     lambda_body_plain(LAMBDA_BODY(lambda), LAMBDA_PARAMS(lambda), 0);
+        c = LAMBDA_QPLAIN(lambda) = (ge << 2) | 2u | (plain ? 1u : 0u);
+        LAMBDA_QTBL(lambda) = 0;
+    }
+    if (!(c & 1u)) return false;
+    uint32_t tag = lambda_query_tag(tbl);
+    uint32_t t = LAMBDA_QTBL(lambda);
+    if ((t & ~1u) == tag) return t & 1u;
+    bool ok = !lambda_body_names_col(LAMBDA_BODY(lambda), tbl, 0);
+    LAMBDA_QTBL(lambda) = tag | (ok ? 1u : 0u);
+    return ok;
+}
+
 ray_t* call_lambda(ray_t* lambda, ray_t** call_args, int64_t argc) {
     if (RAY_UNLIKELY(lambda_lifts(lambda)))
         return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);
+    /* A helper a builtin calls inside a query, (map f ..), (fold g ..),
+     * however it was reached (a name, (at (env 0) ..)), sees the source
+     * columns as the direct call (f a) does: through the query's call
+     * frame (#1762).  The arguments are the builtin's elements, not the
+     * query's rows.  A lambda made inside the query is query text and
+     * keeps its own path, which already sees the columns; a body that can
+     * reach no column (lambda_query_plain) needs no frame. */
+    if (RAY_UNLIKELY(g_active_query_table != NULL) && !LAMBDA_CAPQ(lambda)) {
+        ray_t* tbl = g_query_source_table ? g_query_source_table : g_active_query_table;
+        /* The cached answer first, inline: a plain body checked against
+         * this table under this global epoch (lambda_query_plain). */
+        bool plain = LAMBDA_QPLAIN(lambda) == ((lambda_query_epoch() << 2) | 3u) &&
+                     LAMBDA_QTBL(lambda) == (lambda_query_tag(tbl) | 1u);
+        if (!plain && !lambda_query_plain(lambda, tbl))
+            return call_lambda_impl(lambda, call_args, argc, true, 0, true, NULL);
+    }
     if (lambda_wants_compile(lambda)) lambda_compile(lambda);
     if (LAMBDA_IS_COMPILED(lambda)) return vm_exec(lambda, call_args, argc);
     return call_lambda_impl(lambda, call_args, argc, false, 0, false, NULL);

@@ -3546,10 +3546,10 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
  * before every matching ray_env_pop_scope (including error returns).
  * Column-membership scoped and query-only by construction — see
  * ray_active_query_table. */
-static _Thread_local ray_t* g_active_query_table = NULL;
+_Thread_local ray_t* g_active_query_table = NULL;   /* read inline by call_lambda (ops.h) */
 /* The source schema while a projection fallback binds output aliases into
  * its evaluation table; a helper's free names read columns from here. */
-static _Thread_local ray_t* g_query_source_table = NULL;
+_Thread_local ray_t* g_query_source_table = NULL;
 /* Dependency classification is stable across group slices. Cache it for
  * one grouped evaluation so computed text does not compile per group. */
 typedef struct {

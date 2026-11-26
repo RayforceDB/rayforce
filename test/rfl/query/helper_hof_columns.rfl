@@ -1,0 +1,79 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; A helper a higher-order builtin calls inside a query, given by name or
+;; fetched from the environment, sees the source columns its body reads, as
+;; the direct call (f a) and a lambda literal do (#1762): the column, or the
+;; group's rows under by:, never a global of the same name.  A parameter or
+;; let named like a column still wins.  In memory, splayed and parted.
+
+(.sys.exec "rm -rf /tmp/rfl_hof_cols && mkdir -p /tmp/rfl_hof_cols") -- 0
+(set t (table [a c s] (list [1 2 3 4 5 6] [100 200 300 400 500 600] ['x 'y 'x 'y 'x 'y])))
+(.db.splayed.set "/tmp/rfl_hof_cols/spl/t/" t)
+(.db.splayed.set "/tmp/rfl_hof_cols/par/2024.01.01/t/" (at t [0 1 2]) "/tmp/rfl_hof_cols/par/.sym")
+(.db.splayed.set "/tmp/rfl_hof_cols/par/2024.01.02/t/" (at t [3 4 5]) "/tmp/rfl_hof_cols/par/.sym")
+(set S (.db.splayed.get "/tmp/rfl_hof_cols/spl/t/"))
+(set P (.db.parted.get "/tmp/rfl_hof_cols/par/" 't))
+(set f (fn [v] (+ v c)))
+(set f2 (fn [x y] (+ x (+ y c))))
+(set fp (fn [v] (> (+ v c) 250)))
+(set fc (fn [c] (+ c 1)))
+(set fl (fn [v] (do (let c 7) (+ v c))))
+(set fw (fn [v] (count (asc c))))
+(set fs (fn [v] (sum c)))
+(set FS (list f))
+(set K (find (key (env 0)) 'f))
+(at (select {from: t r: (map f [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402] [501 502] [601 602])
+(at (select {from: t by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: t by: s r: (first (map (fn [v] (+ v c)) [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: S by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: P by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: t where: (> a 2) by: s r: (first (map f [1 2]))}) 'r) -- (list [301 501] [401 601])
+(at (select {from: t by: s r: (first (map (at (value (env 0)) K) [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: S r: (pmap f [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402] [501 502] [601 602])
+(at (select {from: t by: s r: (first (apply f2 [1 2] [3 4]))}) 'r) -- (list [104 304 504] [204 404 604])
+(at (select {from: P by: s r: (first (scan f2 [1 2]))}) 'r) -- [1 1]
+(at (select {from: t by: s r: (first (prior f2 [1 2]))}) 'r) -- (list [102 302 502] [202 402 602])
+(at (select {from: S by: s r: (first (scan-right f2 [1 2]))}) 'r) -- (list [103 303 503] [203 403 603])
+(at (select {from: t by: s r: (first (map-left f2 [1 2] 3))}) 'r) -- (list [104 304 504] [204 404 604])
+(at (select {from: P r: (map-right f2 3 [1 2])}) 'r) -- (list [104 105] [204 205] [304 305] [404 405] [504 505] [604 605])
+(at (select {from: t by: s r: (fold f2 a)}) 'r) -- (list [209 609 1009] [412 812 1212])
+(at (select {from: S by: s r: (fold f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: P by: s r: (fold-left f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: t by: s r: (fold-while fp f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: t by: s r: (first (map fc [1 2]))}) 'r) -- [2 2]
+(at (select {from: t by: s r: (first (map fl [1 2]))}) 'r) -- [8 8]
+(at (select {from: t by: s r: (first (map fw [1 2]))}) 'r) -- [3 3]
+(at (select {from: P where: (> a 2) by: s r: (first (map fs [1 2]))}) 'r) -- [800 1000]
+;; with a global c the helpers still read the column
+(set c 1000)
+(at (select {from: t r: (map f [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402] [501 502] [601 602])
+(at (select {from: t by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: t by: s r: (first (map (fn [v] (+ v c)) [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: S by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: P by: s r: (first (map f [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: t where: (> a 2) by: s r: (first (map f [1 2]))}) 'r) -- (list [301 501] [401 601])
+(at (select {from: t by: s r: (first (map (at (value (env 0)) K) [1 2]))}) 'r) -- (list [101 301 501] [201 401 601])
+(at (select {from: S r: (pmap f [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402] [501 502] [601 602])
+(at (select {from: t by: s r: (first (apply f2 [1 2] [3 4]))}) 'r) -- (list [104 304 504] [204 404 604])
+(at (select {from: P by: s r: (first (scan f2 [1 2]))}) 'r) -- [1 1]
+(at (select {from: t by: s r: (first (prior f2 [1 2]))}) 'r) -- (list [102 302 502] [202 402 602])
+(at (select {from: S by: s r: (first (scan-right f2 [1 2]))}) 'r) -- (list [103 303 503] [203 403 603])
+(at (select {from: t by: s r: (first (map-left f2 [1 2] 3))}) 'r) -- (list [104 304 504] [204 404 604])
+(at (select {from: P r: (map-right f2 3 [1 2])}) 'r) -- (list [104 105] [204 205] [304 305] [404 405] [504 505] [604 605])
+(at (select {from: t by: s r: (fold f2 a)}) 'r) -- (list [209 609 1009] [412 812 1212])
+(at (select {from: S by: s r: (fold f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: P by: s r: (fold-left f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: t by: s r: (fold-while fp f2 0 a)}) 'r) -- (list [309 909 1509] [612 1212 1812])
+(at (select {from: t by: s r: (first (map fc [1 2]))}) 'r) -- [2 2]
+(at (select {from: t by: s r: (first (map fl [1 2]))}) 'r) -- [8 8]
+(at (select {from: t by: s r: (first (map fw [1 2]))}) 'r) -- [3 3]
+(at (select {from: P where: (> a 2) by: s r: (first (map fs [1 2]))}) 'r) -- [800 1000]
+;; a column named like a builtin (abs) shadows it in the helper's body too
+(set u (table [a abs s] (list [1 2 3 4] [100 200 300 400] ['x 'y 'x 'y])))
+(set ga (fn [v] (+ v abs)))
+(at (select {from: u by: s r: (first (map ga [1 2]))}) 'r) -- (list [101 301] [201 401])
+(at (select {from: u r: (map ga [1 2])}) 'r) -- (list [101 102] [201 202] [301 302] [401 402])
+;; a helper that reads no column still answers as before
+(set g (fn [v] (* v 2)))
+(at (select {from: t by: s r: (first (map g [1 2]))}) 'r) -- [2 2]
+(at (select {from: P by: s r: (fold + (map g a))}) 'r) -- [18 24]
+(.sys.exec "rm -rf /tmp/rfl_hof_cols") -- 0
