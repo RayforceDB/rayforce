@@ -2950,28 +2950,38 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary
         vec->len = len;
         store_typed_elem(vec, 0, e0);
         ray_release(e0);
-
-        for (int64_t i = 1; i < len; i++) {
-            int alloc = 0;
-            ray_t* e = collection_elem(arg, i, &alloc);
-            ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);
-            if (alloc) ray_release(e);
-            if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
-            if (elem->type >= 0) {
-                /* A nested collection after an atom: the typed vector cannot
-                 * hold it.  Start over as a boxed list. */
-                ray_release(elem);
-                ray_release(vec);
-                int alloc_r = 0;
-                ray_t* e_r = collection_elem(arg, 0, &alloc_r);
-                e0 = RAY_IS_ERR(e_r) ? e_r : atomic_unary_elem(fn, e_r);
-                if (alloc_r) ray_release(e_r);
-                if (RAY_IS_ERR(e0)) return e0;
-                goto boxed;
-            }
-            store_typed_elem(vec, i, elem);
-            ray_release(elem);
+        /* A boxed list's cells may answer different types ((neg (list 1
+         * 2.5)) is an I64 and an F64): stored into the first one's vector
+         * the others would be converted, 2.5 truncated to 2 (#1749).  The
+         * result is then the boxed list of the cells' own results, what
+         * (map f x) gives.  A typed vector's cells share one type: its loop
+         * is the one without the test (unswitched, so it pays nothing). */
+#define MAP_UNARY_TYPED_LOOP(CHECK_MIXED)                                       \
+        for (int64_t i = 1; i < len; i++) {                                     \
+            int alloc = 0;                                                      \
+            ray_t* e = collection_elem(arg, i, &alloc);                         \
+            ray_t* elem = RAY_IS_ERR(e) ? e : atomic_unary_elem(fn, e);         \
+            if (alloc) ray_release(e);                                          \
+            if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }            \
+            if (elem->type >= 0 || (CHECK_MIXED && elem->type != -out_type)) {  \
+                /* A nested collection after an atom, or a cell of another     \
+                 * type: the typed vector cannot hold it.  Start over as a     \
+                 * boxed list. */                                               \
+                ray_release(elem);                                              \
+                ray_release(vec);                                               \
+                int alloc_r = 0;                                                \
+                ray_t* e_r = collection_elem(arg, 0, &alloc_r);                 \
+                e0 = RAY_IS_ERR(e_r) ? e_r : atomic_unary_elem(fn, e_r);        \
+                if (alloc_r) ray_release(e_r);                                  \
+                if (RAY_IS_ERR(e0)) return e0;                                  \
+                goto boxed;                                                     \
+            }                                                                   \
+            store_typed_elem(vec, i, elem);                                     \
+            ray_release(elem);                                                  \
         }
+        if (arg->type == RAY_LIST) { MAP_UNARY_TYPED_LOOP(1) }
+        else                       { MAP_UNARY_TYPED_LOOP(0) }
+#undef MAP_UNARY_TYPED_LOOP
         return vec;
     }
 

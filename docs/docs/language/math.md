@@ -28,6 +28,16 @@ Atoms report the lowercase name (`'i32`), vectors and columns the uppercase one 
 
 `min` and `max` of a TIMESPAN and a number are a TIMESPAN, whichever wins: the number counts nanoseconds (see the [timespan guide](../guides/timespan.md#min-and-max-with-a-number)).
 
+Over a nonempty list (a `LIST`, whose cells may be of different types), an atomic builtin maps each cell on its own. What it returns depends on the builtin:
+
+- **`+ - * / % div`** return a `LIST` of the cells' results, each the cell promoted with the other operand (the table above): `(+ (list 1 2.5) 0)` is `(list 1 2.5)`. With every cell of one type it is still a `LIST`: `(+ (list 1 2) 0)` is `(list 1 2)`, which prints as `[1 2]`, not an I64 vector.
+- **`min` and `max`** promote each cell the same way, but return a typed vector when every cell's result is an atom of one type: `(min (list 1 2) 1)` is the I64 vector `[1 1]`, while `(min (list 1 2.5) 1)` is `(list 1 1.0)`, an I64 and an F64 cell.
+- **The comparisons** (`== != < <= > >=`) return a `B8` vector, whatever the cells: `(== (list 1 2.5) 2.5)` is `[false true]`.
+- **A unary one** (`neg`, `abs`, `floor`, `ceil`, ...) returns what `(map f x)` returns: a typed vector when every cell's result is an atom of one type, `(neg (list 1 2))` is `[-1 -2]` and `(sqrt (list 4 2.25))` is `[2.0 1.5]`, and otherwise the `LIST` of the cells' results, each in its own type, in either order of the cells: `(neg (list 1 2.5))` is `(list -1 -2.5)`, as `(- 0 (list 1 2.5))` is. Nothing is converted to the first cell's type. Cells whose results are vectors stay a `LIST` even when the vectors share a type: `(neg (list [1 2] [3 4]))` is a `LIST` of two I64 vectors.
+- **Unary against binary:** a unary builtin has no other operand to promote a cell with, so on cells of different integer widths it keeps each width. `(neg (list 1 -3i))` is a list of an I64 `-1` and an I32 `3`, where `(- 0 (list 1 -3i))` is a list of two I64 cells, each promoted with the I64 `0`.
+
+The empty list is the exception to `(map f x)`: `(neg (list))` is an empty I64 vector, where `(map neg (list))` is an empty `LIST`; `abs`, `floor` and `ceil` do the same, and `round`, `sqrt`, `log` and `exp` give an empty F64 vector.
+
 Two operands of one type keep it, and an integer result wraps in that width, as i64 does: `(+ 0xff 0x01)` is `0x00`, `(* 300h 300h)` is `24464`. A result that wraps exactly onto the i16, i32 or i64 minimum is that type's null (`(+ 32767h 1h)` is `0Nh`), and both vector and indexed reads report it as null even if neither input contains a null (see the [types guide](../guides/types.md#implicit-coercion)).
 
 Because `update` keeps a column's type, the f64 that f32 with an integer gives does not go back into an f32 column: `(update {f: (+ f 1) from: t})` over an `F32` column `f` is a `type` error. Add an f32 literal, `(+ f 1e)`, or cast the result with `as 'F32` (see [Column types](../queries/select.md#column-types)).

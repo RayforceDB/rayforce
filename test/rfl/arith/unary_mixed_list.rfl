@@ -1,0 +1,61 @@
+;; A unary atomic builtin over a LIST whose cells answer different types
+;; (#1749).  Each cell keeps its own result, as the binary atomics do for a
+;; list ((+ (list 1 2.5) 0) is (list 1 2.5)): (neg (list 1 2.5)) is
+;; (list -1 -2.5), not the first cell's type with 2.5 truncated to 2.
+
+;; ─────────────────── the values: no truncation ─────────────────────────────
+(neg (list 1 2.5)) -- (list -1 -2.5)
+(abs (list -1 -2.5)) -- (list 1 2.5)
+(floor (list 1 2.5)) -- (list 1 2.0)
+(ceil (list 1 2.5)) -- (list 1 3.0)
+(floor (list -1 -2.5)) -- (list -1 -3.0)
+(ceil (list -1 -2.5)) -- (list -1 -2.0)
+;; each cell's type, whichever comes first
+(map type (neg (list 1 2.5))) -- ['i64 'f64]
+(map type (neg (list 2.5 1))) -- ['f64 'i64]
+(map type (floor (list 1 2.5))) -- ['i64 'f64]
+(map type (abs (list 1i 2.5))) -- ['i32 'f64]
+(type (neg (list 1 2.5))) -- 'LIST
+
+;; ─────────────────── the same as the binary atomics ─────────────────────────
+(set ins (list (list 1 2.5) (list 2.5 1) (list -1 -2.5) (list 1 0N 2.5) (list 0Nf 2) (list 4 (list 2.25 1)) (list 1 (list 2 3.5) -1.5)))
+(map (fn [x] (identical (neg x) (- 0 x))) ins) -- (take [true] 7)
+(map (fn [x] (identical (neg x) (* -1 x))) ins) -- (take [true] 7)
+(identical (neg (list 1i 2.5)) (- 0i (list 1i 2.5))) -- true
+
+;; the rule: what (map f x) gives, cell by cell
+(set ins2 (list (list 1 2.5) (list 2.5 1) (list 1 -3i) (list 4h 100000) (list 1 0Nf) (list -3i 2.5 4h) (list 1 2) (list 4 (list 2.25 1))))
+(map (fn [x] (identical (neg x) (map neg x))) ins2) -- (take [true] 8)
+(map (fn [x] (identical (abs x) (map abs x))) ins2) -- (take [true] 8)
+(map (fn [x] (identical (floor x) (map floor x))) ins2) -- (take [true] 8)
+(map (fn [x] (identical (ceil x) (map ceil x))) ins2) -- (take [true] 8)
+(identical (floor (list true 1 2.5)) (map floor (list true 1 2.5))) -- true
+;; unlike a binary atomic, no other operand promotes a cell's width
+(map type (neg (list 1 -3i))) -- ['i64 'i32]
+(map type (- 0 (list 1 -3i))) -- ['i64 'i64]
+(neg (list 4h 100000)) -- (list -4h -100000)
+;; a binary atomic over a list of one type is still a list
+(type (+ (list 1 2) 0)) -- 'LIST
+
+;; ─────────────────── nulls and nested lists ─────────────────────────────────
+(neg (list 1 0N 2.5)) -- (list -1 0N -2.5)
+(abs (list 0Nf -2)) -- (list 0Nf 2)
+(neg (list 4 (list 2.25 1))) -- (list -4 (list -2.25 -1))
+(floor (list 1 (list 2.5 3))) -- (list 1 (list 2.0 3))
+
+;; ─────────────────── unchanged: one result type ─────────────────────────────
+;; a list whose cells all answer one type is still that typed vector, and
+;; the builtins that always answer a float do so in either order
+(neg (list 1 2)) -- [-1 -2]
+(type (neg (list 1 2))) -- 'I64
+(neg (list 1.5 2.5)) -- [-1.5 -2.5]
+(round (list 1 2.5)) -- [1.0 3.0]
+(sqrt (list 4 2.25)) -- [2.0 1.5]
+(exp (list 0 0.0)) -- [1.0 1.0]
+(log (list 1 1.0)) -- [0.0 0.0]
+(signum (list -2 2.5)) -- [-1 1]
+;; typed vectors
+(neg [1.0 2.5]) -- [-1.0 -2.5]
+(abs [-1 -2]) -- [1 2]
+(floor [1.5 -2.5]) -- [1.0 -3.0]
+(ceil [1.5 -2.5]) -- [2.0 -2.0]
