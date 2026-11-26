@@ -1,0 +1,36 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; A select that only filters, written inline as the from: of a select that
+;; names its columns, gathers just those columns, and since #1746 a symbol
+;; literal in the outer select keeps that.  A dotted symbol literal, 'x.y,
+;; (quote x.y) or ['x.y 'z] (a ticker such as 'XAMPLE.B), is data too: the
+;; evaluator reads no column or path through it, and the call rule of #1750
+;; leaves nothing that could resolve it (#1781).  Its first segment is judged
+;; as the bare name is: a dictionary, a namespace root or a lambda there
+;; still declines, as do resolve and a bare dotted name, which is a path read.
+(.sys.exec "rm -rf /tmp/rfl_pk_dotted && mkdir -p /tmp/rfl_pk_dotted") -- 0
+(set n 20000)
+(set mk (fn [p] (table [id a s q w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19] (list (+ (* p n) (til n)) (% (til n) 3) (at ['x.y 'y 'z] (% (til n) 3)) (% (til n) 100) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n) (til n)))))
+(map (fn [p] (.db.splayed.set (format "/tmp/rfl_pk_dotted/par/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rfl_pk_dotted/par/.sym")) (til 4))
+(set P (.db.parted.get "/tmp/rfl_pk_dotted/par/" 't))
+(set peak (fn [g] (at (.mem.ts (g)) 'peak-live-bytes)))
+(set listed (peak (fn [] (select {from: (select {s: s q: q from: P where: (== a 1)}) by: q n: (sum (== s 'x.y))}))))
+;; the dotted forms narrow as 'y does
+(<= (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s 'y))}))) (* 2 listed)) -- true
+(<= (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s 'x.y))}))) (* 2 listed)) -- true
+(<= (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s (quote x.y)))}))) (* 2 listed)) -- true
+(<= (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (in s ['x.y 'z]))}))) (* 2 listed)) -- true
+(<= (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s 'q.month))}))) (* 2 listed)) -- true
+;; a first segment that holds a dictionary, a namespace root, resolve and a
+;; bare dotted name still keep every column
+(set D {f: 5 g: {h: 7}})
+(> (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s 'D.f))}))) (* 4 listed)) -- true
+(> (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s '.sys.mem))}))) (* 4 listed)) -- true
+(> (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== q (resolve (quote D.f))))}))) (* 4 listed)) -- true
+(> (peak (fn [] (select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== q D.f))}))) (* 4 listed)) -- true
+;; the answers agree with the inner select that lists its columns
+(select {from: (select {from: P where: (== a 1)}) by: q n: (sum (== s 'x.y))}) -- (select {from: (select {s: s q: q from: P where: (== a 1)}) by: q n: (sum (== s 'x.y))})
+(select {from: (select {from: P where: (== a 1)}) by: q n: (sum (in s ['x.y 'z]))}) -- (select {from: (select {s: s q: q from: P where: (== a 1)}) by: q n: (sum (in s ['x.y 'z]))})
+(at (select {from: (select {from: P where: (< id 3)}) r: (== s 'x.y)}) 'r) -- [true false false]
+(at (select {from: (select {from: P where: (< id 3)}) r: 'q.month}) 'r) -- ['q.month 'q.month 'q.month]
+(at (select {from: (select {from: P where: (< id 3)}) r: (+ q D.f)}) 'r) -- [5 6 7]
+(.sys.exec "rm -rf /tmp/rfl_pk_dotted") -- 0
