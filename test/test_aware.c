@@ -3699,12 +3699,12 @@ static test_result_t test_distinct_str_cancel(void) {
     PASS();
 }
 
-/* sel_compact's row list over a selection of 80000 rows is filled on the
- * pool; a cancel landing before that dispatch (its first) leaves the list
- * unwritten, which fresh blocks fill with 0xA5 (ray_heap_test_scribble).
- * The compaction answers `cancel` and leaves no block behind, never a
- * gather of the parted key or the flat column over garbage rows (the
- * pooled parted gather read them as offsets far past its segments); both
+/* sel_compact over a selection of 80000 rows gathers its columns on the
+ * pool from the selection's morsels (#1757); a cancel landing before its
+ * first dispatch leaves the cells unwritten, which fresh blocks fill with
+ * 0xA5 (ray_heap_test_scribble).  The compaction answers `cancel` and
+ * leaves no block behind, never a table over unwritten cells (nor, as
+ * when it filled a row list first, a gather over garbage rows); both
  * cancel modes, then the plain run answers the selected rows. */
 static test_result_t test_sel_compact_cancel_at_dispatch(void) {
     ray_pool_destroy();
