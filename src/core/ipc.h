@@ -260,7 +260,9 @@ ray_t*    ray_ipc_send(int64_t handle, ray_t* msg);
  * outstanding on `handle` (one urgent byte; see ipc.c).  0; -1 for a
  * handle that is not a connection; -2 when nothing was sent because a
  * cancel for an earlier request on this moved connection is still
- * unconfirmed (close the handle to stop the request). */
+ * unconfirmed (close the handle to stop the request).  Call it on the
+ * thread that uses the handle: it updates the connection's cancel state,
+ * which that thread's sync send reads (#1758). */
 int       ray_ipc_send_cancel(int64_t handle);
 /* Test hooks (C tests only).  hold: a moved connection's cancel is
  * recorded as sent but its byte is kept back, as one held up in the
@@ -277,6 +279,22 @@ void      ray_ipc_cancel_state_reset_for_test(void);
 /* Test hook: name `fd` as the connection whose request is being evaluated,
  * as a request's dispatch does, so a SIGURG acts on it. */
 void      ray_ipc_cancel_active_fd_for_test(int fd);
+#ifdef DEBUG
+/* Test hooks for a request's cancel scope (DEBUG builds).  enter/leave:
+ * start a request on `fd` answering to cancel number `seq` (-1: any byte)
+ * and end it, as a dispatch does around its eval, nesting up to 4 deep;
+ * leave says whether the request's byte was taken.  gate: the next SIGURG
+ * handler that reads a published fd holds there (holding answers true)
+ * until a request on the serving thread waits it out, as a handler
+ * descheduled on another thread would.  sigurg: run the SIGURG handler on
+ * the calling thread.  taken: the running request's byte-taken flag. */
+void      ray_ipc_request_enter_for_test(int fd, int seq);
+bool      ray_ipc_request_leave_for_test(void);
+void      ray_ipc_oob_gate_for_test(bool on);
+bool      ray_ipc_oob_gate_holding_for_test(void);
+bool      ray_ipc_oob_taken_for_test(void);
+void      ray_ipc_sigurg_for_test(void);
+#endif
 /* The message type of the IPC request being evaluated on this server:
  * RAY_IPC_MSG_SYNC or RAY_IPC_MSG_ASYNC, or -1 when none is running. */
 int       ray_ipc_request_kind(void);

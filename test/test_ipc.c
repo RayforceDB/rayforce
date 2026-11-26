@@ -3918,21 +3918,39 @@ static test_result_t test_ipc_cancel_unconfirmed_moved_link(void) {
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <pthread.h>
-#if defined(__linux__)
-typedef struct { int64_t h; long after_ms; bool hold; } oob_later_t;
-static void oob_later_fn(void* arg) {
-    oob_later_t* o = (oob_later_t*)arg;
-    sleep_ms(o->after_ms);
-    if (o->hold) ray_ipc_hold_cancel_for_test(true);
-    (void)ray_ipc_send_cancel(o->h);
-    if (o->hold) ray_ipc_hold_cancel_for_test(false);
-}
-#endif
-
 /* Ctrl-C as the client gets it: a signal on the thread waiting for the
  * reply, whose handler raises the interrupt.  The wait wakes on it and
  * sends the server the cancel byte itself. */
 static void ctrl_c_handler(int sig) { (void)sig; ray_request_interrupt(); }
+#if defined(__linux__)
+/* A cancel `after_ms` into a sync send, sent as the product sends one: a
+ * Ctrl-C to the waiting thread, whose wait then sends the byte on its own
+ * thread.  Sending it from this helper thread instead (ray_ipc_send_cancel)
+ * wrote the connection's cancel state while the waiting thread read it
+ * (#1758). */
+typedef struct { pthread_t to; long after_ms; pthread_t tid; struct sigaction old; } cancel_later_t;
+static void* cancel_later_fn(void* arg) {
+    cancel_later_t* c = (cancel_later_t*)arg;
+    sleep_ms(c->after_ms);
+    pthread_kill(c->to, SIGUSR2);
+    return NULL;
+}
+static void cancel_later_start(cancel_later_t* c, long after_ms) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = ctrl_c_handler;   /* no SA_RESTART: the wait must wake */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR2, &sa, &c->old);
+    c->to = pthread_self();
+    c->after_ms = after_ms;
+    pthread_create(&c->tid, NULL, cancel_later_fn, c);
+}
+static void cancel_later_join(cancel_later_t* c) {
+    pthread_join(c->tid, NULL);
+    sigaction(SIGUSR2, &c->old, NULL);
+    ray_clear_interrupt();
+}
+#endif
 /* `when` is NULL to send the Ctrl-C at once, or a file to wait for first
  * (up to 15 s): what the request writes once the server runs it. */
 typedef struct { pthread_t to; const char* when; } ctrl_c_later_t;
@@ -4412,6 +4430,111 @@ static test_result_t test_ipc_sigurg_keeps_errno(void) {
 #endif
 }
 
+/* ---- a cancel for the outer request, taken as a nested one starts ------
+ * A request evaluated inside another (a sync send pumps its peer's frames
+ * while it waits) unpublishes the outer request's connection and saves the
+ * outer cancel state.  A SIGURG handler on another thread may have read
+ * the outer pair just before, and take the outer client's byte only once
+ * the nested request is starting.  That cancel and its taken flag are the
+ * outer request's: the nested request must not be cancelled, and the outer
+ * one must find both again once it resumes.  Saving the outer state before
+ * waiting out such handlers gave the cancel to the nested request and lost
+ * it for the outer one (#1758).  Deterministic: the test gate holds the
+ * handler, on a helper thread, between its read of the pair and its recv
+ * until the nested start waits it out.
+ * The byte is the one the platform's server answers to.  On Linux, where
+ * connections can move to shared memory or RDMA, it is numbered, as on a
+ * moved connection: the handler peeks it, takes it, and the reply confirms
+ * it (the taken flag).  Elsewhere no connection moves, every request
+ * answers to any byte (CANCEL_ANY), the client sends '!', the handler only
+ * takes it and nothing is confirmed, so only the cancel is checked. */
+#if defined(DEBUG) && !defined(RAY_OS_WINDOWS)
+static int tcp_loop_pair(int* client, int* server) {
+    *client = *server = -1;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    if (l < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    socklen_t al = sizeof a;
+    /* inet_pton, not INADDR_LOOPBACK: macOS hides that name under the
+     * _POSIX_C_SOURCE this file defines */
+    if (inet_pton(AF_INET, "127.0.0.1", &a.sin_addr) != 1 ||
+        bind(l, (struct sockaddr*)&a, sizeof a) != 0 || listen(l, 1) != 0 ||
+        getsockname(l, (struct sockaddr*)&a, &al) != 0) { close(l); return -1; }
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || connect(c, (struct sockaddr*)&a, sizeof a) != 0) {
+        if (c >= 0) close(c);
+        close(l);
+        return -1;
+    }
+    int s = accept(l, NULL, NULL);
+    close(l);
+    if (s < 0) { close(c); return -1; }
+    *client = c; *server = s;
+    return 0;
+}
+static void* sigurg_on_helper_fn(void* arg) { (void)arg; ray_ipc_sigurg_for_test(); return NULL; }
+#endif
+static test_result_t test_ipc_cancel_outer_byte_at_nested_start(void) {
+#if defined(DEBUG) && !defined(RAY_OS_WINDOWS)
+    int c1, s1, c2, s2;
+    if (tcp_loop_pair(&c1, &s1) != 0) SKIP("no loopback TCP pair");
+    if (tcp_loop_pair(&c2, &s2) != 0) { close(c1); close(s1); SKIP("no loopback TCP pair"); }
+    ray_ipc_cancel_state_reset_for_test();
+    ray_clear_interrupt();
+#if defined(__linux__)
+    const bool numbered = true;                       /* as on a moved connection */
+    const int outer_seq = 7, nested_seq = 3;
+    const char byte = 7;
+#else
+    const bool numbered = false;                      /* TCP: any byte */
+    const int outer_seq = -1, nested_seq = -1;
+    const char byte = '!';
+#endif
+    ray_ipc_request_enter_for_test(s1, outer_seq);    /* the outer request */
+    /* its client's cancel byte, once the outer request runs.  Arrival is
+     * seen through sockatmark (nothing but the urgent byte is sent, so the
+     * stream is at the mark once it is in), which leaves the urgent byte
+     * and its state untouched for the handler. */
+    bool sent = send(c1, &byte, 1, MSG_OOB) == 1;
+    bool arrived = false;
+    for (int i = 0; sent && i < 5000 && !(arrived = sockatmark(s1) == 1); i++)
+        sleep_ms(1);
+    bool held = false;
+    pthread_t tid;
+    bool started = false;
+    if (arrived) {
+        ray_ipc_oob_gate_for_test(true);
+        started = pthread_create(&tid, NULL, sigurg_on_helper_fn, NULL) == 0;
+        for (int i = 0; started && i < 5000 && !(held = ray_ipc_oob_gate_holding_for_test()); i++)
+            sleep_ms(1);
+    }
+    /* the nested request starts while the handler holds the outer pair */
+    ray_ipc_request_enter_for_test(s2, nested_seq);
+    bool nested_cancelled = ray_request_cancelled();
+    bool nested_taken = ray_ipc_request_leave_for_test();
+    bool outer_cancelled = ray_request_cancelled();
+    bool outer_flag = ray_ipc_oob_taken_for_test();
+    bool outer_taken = ray_ipc_request_leave_for_test();
+    if (started) pthread_join(tid, NULL);
+    ray_ipc_oob_gate_for_test(false);
+    ray_ipc_cancel_state_reset_for_test();
+    ray_clear_interrupt();
+    close(c1); close(s1); close(c2); close(s2);
+    TEST_ASSERT(arrived, "the outer client's urgent byte reached the server socket");
+    TEST_ASSERT(held, "the handler on the helper thread read the outer pair and held");
+    TEST_ASSERT(!nested_cancelled, "the nested request was cancelled by the outer client's byte");
+    TEST_ASSERT(!nested_taken, "the nested request's reply would confirm the outer client's byte");
+    TEST_ASSERT(outer_cancelled, "the outer request's cancel was lost across the nested one");
+    if (numbered)
+        TEST_ASSERT(outer_flag && outer_taken, "the outer request's byte-taken flag was lost across the nested one");
+    PASS();
+#else
+    SKIP("needs the DEBUG test gate and SIGURG");
+#endif
+}
+
 /* The same byte mid-query on a moved connection cancels that query (the
  * server's SIGURG takes it), and the link answers the next one.  The
  * server is its own process, as a client's would be: in one process the
@@ -4454,12 +4577,8 @@ static test_result_t cancel_mid_query_moved_link(const char* dir, bool refuse_fi
         TEST_ASSERT(refused, "a message that cannot be framed is refused");
         TEST_ASSERT(sel && sel->xport, "the refusal leaves the link open and moved");
     }
-    static oob_later_t o;
-    o.h = h;
-    o.after_ms = 200;
-    o.hold = false;
-    ray_thread_t tid;
-    ray_thread_create(&tid, oob_later_fn, &o);
+    static cancel_later_t o;
+    cancel_later_start(&o, 200);
     const char* q = "(do (set k 0) (while (< k 1000000000) (set k (+ k 1))) k)";
     int64_t t0 = ray_time_now_ms();
     ray_t* msg  = ray_str(q, strlen(q));
@@ -4467,7 +4586,7 @@ static test_result_t cancel_mid_query_moved_link(const char* dir, bool refuse_fi
     ray_t* r1   = ray_ipc_send_timeout(h, msg, 10000);
     ray_release(msg);
     int64_t took = ray_time_now_ms() - t0;
-    ray_thread_join(tid);
+    cancel_later_join(&o);
     msg = ray_str("(+ 1 2)", 7);
     ray_t* r2 = ray_ipc_send(h, msg);
     ray_release(msg);
@@ -4585,16 +4704,15 @@ static test_result_t test_ipc_cancel_seen_nested_moved_link(void) {
         if (!moved) SKIP("the connection did not move to shared memory here");
         TEST_ASSERT(setup, "servers set up");
     }
-    static oob_later_t o;
-    o.h = hs;
-    o.after_ms = 100;
-    o.hold = true;
-    ray_thread_t tid;
-    ray_thread_create(&tid, oob_later_fn, &o);
+    /* T's cancel for A is held back: marked sent, never written. */
+    static cancel_later_t o;
+    ray_ipc_hold_cancel_for_test(true);
+    cancel_later_start(&o, 100);
     int64_t t0 = ray_time_now_ms();
     ray_t* ra = send_str(hs, "(.ipc.send hb \"(g)\")");
     int64_t took = ray_time_now_ms() - t0;
-    ray_thread_join(tid);
+    cancel_later_join(&o);
+    ray_ipc_hold_cancel_for_test(false);
     int unconfirmed = ray_ipc_cancel_unconfirmed_for_test(hs);
     drop(ra);
     ray_ipc_close(hs);
@@ -4812,6 +4930,7 @@ const test_entry_t ipc_entries[] = {
     { "ipc/cancel_scoped_server_request", test_ipc_cancel_scoped_server_request, ipc_setup, ipc_teardown },
     { "ipc/cancel_scoped_client_ctrl_c",  test_ipc_cancel_scoped_client_ctrl_c,  ipc_setup, ipc_teardown },
     { "ipc/sigurg_keeps_errno",         test_ipc_sigurg_keeps_errno,             ipc_setup, ipc_teardown },
+    { "ipc/cancel_outer_byte_at_nested_start", test_ipc_cancel_outer_byte_at_nested_start, ipc_setup, ipc_teardown },
     { "ipc/listen_bind_addr",           test_ipc_listen_bind_addr,               ipc_setup, ipc_teardown },
     { "ipc/send_verbose",               test_ipc_send_verbose,                   ipc_setup, ipc_teardown },
     { "ipc/send_verbose_captures",      test_ipc_send_verbose_captures_output,   ipc_setup, ipc_teardown },
