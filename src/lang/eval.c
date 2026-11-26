@@ -2187,6 +2187,20 @@ static ray_t* map_cell_error(ray_t* left, int left_coll, ray_t* a, int la,
     return ray_error("type", NULL);
 }
 
+/* Whether a cell's result is a number a typed numeric or temporal vector
+ * holds as itself: store_typed_elem reads any other atom (a GUID, symbol or
+ * string) through its integer field. */
+static inline bool map_cell_is_number(ray_t* x) {
+    switch (x->type) {
+    case -RAY_BOOL: case -RAY_U8: case -RAY_I16: case -RAY_I32: case -RAY_I64:
+    case -RAY_F32: case -RAY_F64: case -RAY_DATE: case -RAY_TIME:
+    case -RAY_TIMESTAMP: case -RAY_TIMESPAN:
+        return true;
+    default:
+        return false;
+    }
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (RAY_UNLIKELY(map_memo_wanted(left) || map_memo_wanted(right)))
         return atomic_map_binary_op_memo(fn, dag_opcode, left, right);
@@ -2801,26 +2815,39 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
         if (RAY_IS_ERR(vec)) { ray_release(e0); return vec; }
         vec->len = len;
         store_typed_elem(vec, 0, e0);
-        ray_release(e0);
 
         for (int64_t i = 1; i < len; i++) {
-            if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) { ray_release(vec); return ray_error("cancel", "interrupted"); }
+            if ((i & 0xFFFF) == 0 && EVAL_INTERRUPTED()) { ray_release(vec); ray_release(e0); return ray_error("cancel", "interrupted"); }
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
             if (RAY_IS_ERR(a) || RAY_IS_ERR(b)) {
                 ray_release(vec);
+                ray_release(e0);
                 return map_cell_error(left, left_coll, a, la, right, right_coll, b, ra);
             }
             ray_t* elem = fn(a, b);
             if (la) ray_release(a);
             if (ra) ray_release(b);
-            if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+            if (RAY_IS_ERR(elem)) { ray_release(vec); ray_release(e0); return elem; }
+            if (RAY_UNLIKELY(!map_cell_is_number(elem))) {
+                /* A cell whose result is not a number (a GUID, symbol or
+                 * string fill keeps, a nested result): the typed vector
+                 * would hold it through the integer field, the GUID's
+                 * pointer, the symbol's id or the string's bytes as a
+                 * number.  The result is the LIST of the cells, as it is
+                 * when that cell comes first. */
+                ray_release(elem);
+                ray_release(vec);
+                goto boxed_cells;
+            }
             store_typed_elem(vec, i, elem);
             ray_release(elem);
         }
+        ray_release(e0);
         return vec;
     }
+boxed_cells:;
 
     /* Determine scalar int type for list+scalar coercion.
      * When a boxed list is combined with a scalar, integer results

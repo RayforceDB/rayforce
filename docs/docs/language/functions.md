@@ -229,7 +229,7 @@ Query `concat` joins text row by row when every vector operand comes from a sour
 | `cross` | binary | Cartesian product as pairs | `(cross [1 2] ['a 'b])` → `((1 'a) (1 'b) (2 'a) (2 'b))` |
 | `at` | binary | Index a collection; vector keys batch dictionary lookups. A typed vector indexed by an integer vector keeps its type: a null or out-of-range index gives the type's null (`false`/`0x00` for BOOL/U8) | `(at [10 20 30] 1)` → `20`, `(at [10 20 30] [2 9])` → `[30 0Nl]` |
 | `find` | binary | Find index of first occurrence | `(find [10 20 30] 20)` → `1` |
-| `fill` | binary, atomic | Replace null values; the replacement is the first argument; f32 input stays f32 | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
+| `fill` | binary, atomic | Replace null values; the replacement is the first argument; f32 input stays f32. A replacement and cells of different kinds, a number with a GUID, symbol or string, give the `LIST` of each cell, whichever comes first: `(fill 3 ["" "ab"])` is `(list 3 "ab")` | `(fill 0 [1 0Nl 3])` → `[1 0 3]` |
 | `reverse` | unary | Reverse element order; a table reverses its rows (columns and types kept), a dictionary its entries (keys and values together) | `(reverse [1 2 3])` → `[3 2 1]` |
 | `til` | unary | Generate range [0..n) | `(til 5)` → `[0 1 2 3 4]` |
 | `lag` | unary | Shift values one row back; first row is null/sentinel | `(lag [10 20 30])` → `[0Nl 10 20]` |

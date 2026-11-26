@@ -285,6 +285,7 @@ static const ray_sig_entry_t sigs[] = {
     /* docs: ; an atom joins a vector only of its own type, and a string joins each cell of a `STR` vector (`(concat "ab" ["c"])` → `["abc"]`, so `(concat "ab" [1 2])` is a `type` error); merge two dicts; append the rows of a table to a table that has each of its columns, of the same types (a parted table is refused: use `union-all`). The STR null `""` is empty text, in a direct call and on every query route: `(concat "" "a")` is `"a"`, and `(concat s "")` in a select keeps each cell of `s` */
     {"fill", "(fill <replacement: atom> <x: vector>)",
      "Replace null values; the replacement is the first argument; f32 input stays f32"},
+    /* docs: . A replacement and cells of different kinds, a number with a GUID, symbol or string, give the `LIST` of each cell, whichever comes first: `(fill 3 ["" "ab"])` is `(list 3 "ab")` */
     {"xbar", "(xbar <x: numeric or temporal vector> <bucket: non-zero num>)",
      "Round down to nearest multiple (bucketing)"},
     {"rand", "(rand <count: i64 or i32 atom> <max: i64 or i32 atom, above 0>)",
