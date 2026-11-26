@@ -240,6 +240,20 @@ bool ray_interrupted(void) {
     unsigned w = atomic_load_explicit(&g_eval_interrupted, memory_order_acquire);
     return w && cancel_applies(w);
 }
+#ifdef DEBUG
+/* The block poll of serial row loops (ops/internal.h) with its test seam:
+ * DEBUG only; release polls ray_interrupted() directly. */
+static _Atomic(uint32_t) g_cancel_poll_at;
+void ray_test_cancel_at_poll(uint32_t nth) {
+    atomic_store_explicit(&g_cancel_poll_at, nth, memory_order_relaxed);
+}
+bool ray_cancel_poll(void) {
+    if (RAY_UNLIKELY(atomic_load_explicit(&g_cancel_poll_at, memory_order_relaxed)) &&
+        atomic_fetch_sub_explicit(&g_cancel_poll_at, 1, memory_order_relaxed) == 1)
+        ray_request_interrupt();
+    return ray_interrupted();
+}
+#endif
 /* Consume a pending process cancel: true, and the bit cleared, when one was
  * set; false otherwise.  One atomic read-modify-write, so a second request
  * that lands between a look and a clear is not swallowed with the first:

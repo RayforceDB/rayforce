@@ -3574,6 +3574,119 @@ static test_result_t test_topk_cancel_at_dispatch(void) {
     PASS();
 }
 
+/* #1747: a distinct over a STR column, flat or parted, polls for a cancel
+ * while it copies the parted column and while it dedups, once per 65,536
+ * rows (ray_cancel_poll), so a cancel landing in either loop stops it
+ * within a block.  The seam raises the cancel at the nth poll: each n the
+ * route reaches answers `cancel` and leaves no block behind; past its polls
+ * the route answers in full.  140,000 rows in two partitions of 70,000:
+ * the flat dedup polls at rows 0, 65,536 and 131,072 (3 polls), each
+ * partition's copy at 0 and 65,536 (4), the parted distinct copies and then
+ * dedups (7).  On a route that never polls the seam never fires, and every
+ * n answers in full. */
+static test_result_t test_distinct_str_cancel(void) {
+    for (int p = 0; p < 2; p++) {
+        char q[400];
+        snprintf(q, sizeof q, "(.db.splayed.set \"" AW_TMP "/dsc/2024.01.0%d/t/\" "
+                 "(table [id u] (list (+ %d (til 70000)) "
+                 "(map (fn [i] (format \"row %% of a column of unique strings\" i)) (+ %d (til 70000))))) "
+                 "\"" AW_TMP "/dsc/.sym\")", p + 1, p * 70000, p * 70000);
+        aw_eval_ok(q);
+    }
+    aw_eval_ok("(set T (.db.parted.get \"" AW_TMP "/dsc\" 't))");
+    aw_eval_ok("(set V (get T 'u))");
+    ray_t* tbl = ray_env_get(ray_sym_intern("T", 1));
+    ray_t* pcol = ray_table_get_col(tbl, ray_sym_intern("u", 1));
+    ray_t* flat = ray_env_get(ray_sym_intern("V", 1));
+    TEST_ASSERT_TRUE(pcol && RAY_IS_PARTED(pcol->type) && flat && flat->type == RAY_STR && flat->len == 140000);
+    static const uint32_t polls[] = { 3, 7, 4 };
+    for (int k = 0; k < 3; k++)
+        for (uint32_t n = 1; n <= polls[k] + 1; n++) {
+            ray_heap_gc();
+            int64_t live0 = aw_live_blocks();
+            ray_test_cancel_at_poll(n);
+            ray_t* got = k == 0 ? distinct_vec_eager(flat)
+                       : k == 1 ? ray_distinct_fn(pcol)
+                       : parted_flatten_str_c((ray_t**)ray_data(pcol), pcol->len, NULL, 0);
+            ray_test_cancel_at_poll(0);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (n <= polls[k]) {
+                TEST_ASSERT_FMT(RAY_IS_ERR(got) && strcmp(ray_err_code(got), "cancel") == 0,
+                                "route %d, cancel at poll %u: no cancel", k, n);
+                ray_error_free(got);
+                ray_heap_gc();
+                TEST_ASSERT_FMT(aw_live_blocks() == live0, "route %d, cancel at poll %u: %lld blocks left",
+                                k, n, (long long)(aw_live_blocks() - live0));
+            } else {
+                TEST_ASSERT_FMT(!RAY_IS_ERR(got) && got->type == RAY_STR && got->len == 140000,
+                                "route %d, cancel at poll %u: not the answer", k, n);
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                ray_t* v = ray_eval_str("(and (== (count Q) 140000) (all (== Q V)))");
+                bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+                if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+                TEST_ASSERT_FMT(ok, "route %d: not the rows", k);
+            }
+        }
+    /* the same hashset build and probe in in, except, sect, find and union
+     * over STR: 3 polls building over 140,000 rows, 3 probing.  With fewer
+     * needles than rows, in and find hash the needles, scan the rows (3
+     * polls: the last needle is row 139,999) and answer each needle: 1,000
+     * needles poll once inserting and once answering, 70,000 twice each.
+     * A cancel there answers `cancel` at once, without the fallback's
+     * hashset over the 140,000 rows (bytes < 1 MiB, the 1,000-needle
+     * cases; "needles": the fallback alone allocates more). */
+    aw_eval_ok("(set W (reverse V))");
+    aw_eval_ok("(set S (take W 1000))");
+    aw_eval_ok("(set B (take W 70000))");
+    static const struct { const char* q; const char* ok; uint32_t polls; bool needles; } vs[] = {
+        { "(in W V)",     "(and (== (count Q) 140000) (all Q))", 6, false },
+        { "(except V W)", "(== (count Q) 0)", 6, false },
+        { "(sect V W)",   "(all (== Q V))", 6, false },
+        { "(find V W)",   "(all (== Q (reverse (til 140000))))", 6, false },
+        { "(union V W)",  "(all (== Q V))", 6, false },
+        { "(in S V)",     "(and (== (count Q) 1000) (all Q))", 5, true },
+        { "(find V S)",   "(all (== Q (take (reverse (til 140000)) 1000)))", 5, true },
+        { "(in B V)",     "(and (== (count Q) 70000) (all Q))", 7, false },
+        { "(find V B)",   "(all (== Q (take (reverse (til 140000)) 70000)))", 7, false },
+    };
+    for (size_t k = 0; k < sizeof vs / sizeof *vs; k++)
+        for (uint32_t n = 1; n <= vs[k].polls + 1; n++) {
+            ray_heap_gc();
+            int64_t live0 = aw_live_blocks();
+            ray_test_cancel_at_poll(n);
+            bool traced = vs[k].needles && ray_mem_trace_begin();
+            ray_t* got = aw_eval(vs[k].q);
+            ray_mem_trace_t tr = {0};
+            if (traced) ray_mem_trace_end(&tr);
+            ray_test_cancel_at_poll(0);
+            ray_clear_interrupt();
+            TEST_ASSERT_NOT_NULL(got);
+            if (n <= vs[k].polls) {
+                TEST_ASSERT_FMT(RAY_IS_ERR(got) && strcmp(ray_err_code(got), "cancel") == 0,
+                                "%s, cancel at poll %u: no cancel", vs[k].q, n);
+                TEST_ASSERT_FMT(!traced || tr.allocated_bytes < ((uint64_t)1 << 20),
+                                "%s, cancel at poll %u: %llu bytes allocated", vs[k].q, n,
+                                (unsigned long long)tr.allocated_bytes);
+                ray_error_free(got);
+                ray_heap_gc();
+                TEST_ASSERT_FMT(aw_live_blocks() == live0, "%s, cancel at poll %u: %lld blocks left",
+                                vs[k].q, n, (long long)(aw_live_blocks() - live0));
+                continue;
+            }
+            TEST_ASSERT_FMT(!RAY_IS_ERR(got), "%s: an error", vs[k].q);
+            ray_env_set(ray_sym_intern("Q", 1), got);
+            ray_release(got);
+            ray_t* v = ray_eval_str(vs[k].ok);
+            bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+            if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+            TEST_ASSERT_FMT(ok, "%s: not the answer", vs[k].q);
+        }
+    aw_eval_ok("(set Q 0)"); aw_eval_ok("(set V 0)"); aw_eval_ok("(set W 0)"); aw_eval_ok("(set S 0)"); aw_eval_ok("(set B 0)"); aw_eval_ok("(set T 0)");
+    PASS();
+}
+
 /* sel_compact's row list over a selection of 80000 rows is filled on the
  * pool; a cancel landing before that dispatch (its first) leaves the list
  * unwritten, which fresh blocks fill with 0xA5 (ray_heap_test_scribble).
@@ -6295,6 +6408,7 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/sel_compact_cancel_at_dispatch", test_sel_compact_cancel_at_dispatch, aw_setup, aw_teardown },
+    { "aware/distinct_str_cancel", test_distinct_str_cancel, aw_setup, aw_teardown },
     { "aware/topk_inplace", test_topk_inplace, aw_setup, aw_teardown },
     { "aware/firstn_runs",        test_firstn_runs,        aw_setup, aw_teardown },
     { "aware/firstn_sel",         test_firstn_sel,         aw_setup, aw_teardown },

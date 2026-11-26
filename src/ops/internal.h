@@ -51,6 +51,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* A serial loop over rows polls for a cancel once per RAY_CANCEL_ROWS rows
+ * (#1747): it runs its rows in blocks of that many and calls
+ * ray_cancel_poll() before each, so a cancel stops it within a block and the
+ * per-row work is the loop's alone.  ray_cancel_poll() is ray_interrupted();
+ * in DEBUG builds (every test flavour) it is that plus a test seam that
+ * raises the cancel at the nth poll (ray_test_cancel_at_poll; 0 disarms
+ * it), compiled out of release so a poll costs the release build no more
+ * than ray_interrupted() does. */
+#define RAY_CANCEL_ROWS ((int64_t)65536)
+#ifdef DEBUG
+bool ray_cancel_poll(void);
+void ray_test_cancel_at_poll(uint32_t nth);
+#else
+static inline bool ray_cancel_poll(void) { return ray_interrupted(); }
+#endif
+
 /* Shared strict parser for launcher flags and .sys.args.  When core_count is
  * true, values are limited to the heap registry's total worker capacity. */
 int parse_sys_int_arg(const char* s, bool nonnegative, bool core_count,
@@ -680,9 +696,16 @@ static inline ray_t* parted_flatten_str_append_c(ray_t** segs, int64_t n_segs,
         if (segs[s]->len <= 0) continue;
         const char* pool_base = segs[s]->str_pool
                               ? (const char*)ray_data(segs[s]->str_pool) : NULL;
-        for (int64_t i = 0; i < segs[s]->len; i++) {
-            out = parted_str_append_elem(out, segs[s], i, pool_base);
-            if (RAY_IS_ERR(out)) return out;
+        for (int64_t b = 0; b < segs[s]->len; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) {
+                ray_release(out);
+                return ray_error("cancel", "interrupted");
+            }
+            int64_t e = segs[s]->len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : segs[s]->len;
+            for (int64_t i = b; i < e; i++) {
+                out = parted_str_append_elem(out, segs[s], i, pool_base);
+                if (RAY_IS_ERR(out)) return out;
+            }
         }
     }
     return out;
@@ -735,18 +758,26 @@ static inline ray_t* parted_flatten_str_c(ray_t** segs, int64_t n_segs,
         }
         const ray_str_t* e = (const ray_str_t*)ray_data(segs[s]);
         const char* src_pool = segs[s]->str_pool ? (const char*)ray_data(segs[s]->str_pool) : NULL;
-        for (int64_t i = 0; i < segs[s]->len; i++, r++) {
-            uint32_t len = e[i].len;
-            memset(&d[r], 0, sizeof(ray_str_t));
-            d[r].len = len;
-            if (len == 0) { nulls = true; continue; }
-            if (len <= RAY_STR_INLINE_MAX) { memcpy(d[r].data, e[i].data, len); continue; }
-            const char* str = src_pool + e[i].pool_off;
-            memcpy(pool + used, str, len);
-            memcpy(d[r].prefix, str, 4);
-            d[r].pool_off = (uint32_t)used;
-            ray_str_t_cache_hash(&d[r], pool);
-            used += len;
+        /* the rows in blocks, a cancel poll before each (#1747) */
+        for (int64_t b = 0; b < segs[s]->len; b += RAY_CANCEL_ROWS) {
+            if (ray_cancel_poll()) {
+                ray_release(out);
+                return ray_error("cancel", "interrupted");
+            }
+            int64_t end = segs[s]->len - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : segs[s]->len;
+            for (int64_t i = b; i < end; i++, r++) {
+                uint32_t len = e[i].len;
+                memset(&d[r], 0, sizeof(ray_str_t));
+                d[r].len = len;
+                if (len == 0) { nulls = true; continue; }
+                if (len <= RAY_STR_INLINE_MAX) { memcpy(d[r].data, e[i].data, len); continue; }
+                const char* str = src_pool + e[i].pool_off;
+                memcpy(pool + used, str, len);
+                memcpy(d[r].prefix, str, 4);
+                d[r].pool_off = (uint32_t)used;
+                ray_str_t_cache_hash(&d[r], pool);
+                used += len;
+            }
         }
     }
     if (out->str_pool) out->str_pool->len = (int64_t)used;
