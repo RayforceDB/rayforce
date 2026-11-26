@@ -88,6 +88,30 @@ zsg_calls -- 0
 (at (.repl.signature '.sys) 'summary) -- ""
 (at (.repl.signature 'true) 'summary) -- ""
 (at (.repl.signature 'zsg_nosuch) 'summary) -- ""
+;; how a builtin treats a collection (#1744), from what the engine records:
+;; atomic (RAY_FN_ATOMIC, it maps vectors and lists), elementwise per
+;; argument over vectors (the row-shape record), aggregate (RAY_FN_AGGR)
+(at (.repl.signature '+) 'atomic) -- true
+(at (.repl.signature '+) 'elementwise) -- [true true]
+(at (.repl.signature 'sin) 'atomic) -- false
+(at (.repl.signature 'sin) 'elementwise) -- [true]
+(at (.repl.signature 'in) 'elementwise) -- [true false]
+(at (.repl.signature 'substr) 'elementwise) -- [true false false]
+(at (.repl.signature 'and) 'elementwise) -- [true true]
+(at (.repl.signature 'sum) 'aggregate) -- true
+(at (.repl.signature 'sum) 'elementwise) -- [false]
+(at (.repl.signature 'min) 'aggregate) -- true
+(at (.repl.signature 'min) 'elementwise) -- [false]
+(at (.repl.signature 'zsg_m) 'aggregate) -- true
+(at (.repl.signature 'first) 'aggregate) -- false
+(at (.repl.signature 'select) 'elementwise) -- (as 'B8 [])
+;; nothing for what is no builtin
+(at (.repl.signature 'zsg_add) 'atomic) -- false
+(at (.repl.signature 'zsg_add) 'elementwise) -- (as 'B8 [])
+(at (.repl.signature 'zsg_v) 'aggregate) -- false
+(at (.repl.signature '.sys) 'atomic) -- false
+(at (.repl.signature 'true) 'elementwise) -- (as 'B8 [])
+(at (.repl.signature 'zsg_nosuch) 'aggregate) -- false
 ;; the argument is a symbol
 (.repl.signature "zsg_add") !- type
 (.repl.signature 42) !- type

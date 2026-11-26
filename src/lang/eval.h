@@ -555,6 +555,13 @@ ray_t* ray_cond_rows(ray_t* mask, ray_t* then_v, ray_t* else_v);
  * element: one value per element, element j from element j alone?  The
  * single source of a query's row shape (#1462). */
 bool ray_fn_row_arg(ray_t* fn, int64_t nargs, int64_t pos);
+
+/* The argument count the row-shape record above describes a builtin at:
+ * 1 for a unary builtin, 2 for a binary one, 2 for and / or / if (their
+ * two-operand form), a declared variadic builtin's own count (substr 3);
+ * 0 for a variadic builtin the record does not cover, and for anything
+ * that is not a builtin.  .repl.signature's `elementwise` (#1744). */
+int64_t ray_fn_row_arity(ray_t* fn);
 /* Does it map argument `pos` element by element although a query reads it
  * whole by decision (lookups, raze, concat)?  The reason in *why. */
 bool ray_fn_row_arg_whole(ray_t* fn, int64_t nargs, int64_t pos, const char** why);

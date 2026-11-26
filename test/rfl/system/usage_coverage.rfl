@@ -12,6 +12,15 @@
 (set ucv_nosum (map (fn [s] (== 0 (count (at s 'summary)))) ucv_sigs))
 (map (fn [s] (at s 'name)) (filter ucv_sigs (and ucv_builtin ucv_nosum))) -- (list)
 (count (filter ucv_sigs (and (not ucv_builtin) (not ucv_nosum)))) -- 0
+;; how each treats a collection (#1744), from what the engine records: an
+;; atomic builtin maps every argument; elementwise has one flag per
+;; argument, or none where the record covers no arity; nothing at all for a
+;; name that is no builtin
+(set ucv_ew (map (fn [s] (at s 'elementwise)) ucv_sigs))
+(distinct (map (fn [e] (type e)) ucv_ew)) -- ['B8]
+(map (fn [s] (at s 'name)) (filter ucv_sigs (and (map (fn [s] (at s 'atomic)) ucv_sigs) (map (fn [s] (not (all (at s 'elementwise)))) ucv_sigs)))) -- (list)
+(map (fn [s] (at s 'name)) (filter ucv_sigs (and (not ucv_builtin) (map (fn [s] (or (at s 'atomic) (at s 'aggregate) (> (count (at s 'elementwise)) 0))) ucv_sigs)))) -- (list)
+(map (fn [s] (at s 'name)) (filter ucv_sigs (and ucv_builtin (map (fn [s] (and (!= (at s 'kind) 'vary) (== 0 (count (at s 'elementwise))))) ucv_sigs)))) -- (list)
 ;; the names that have no usage line are namespace roots or the literals
 (set ucv_rest (filter ucv_sigs ucv_bare))
 (asc (distinct (map (fn [s] (at s 'kind)) ucv_rest))) -- ['literal 'namespace]

@@ -330,6 +330,26 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
         fprintf(stdout, " (%s)", k);
         if (sig_flag(d, "special")) fprintf(stdout, ", special form");
         if (sig_flag(d, "restricted")) fprintf(stdout, ", restricted under -U");
+        /* how it treats a collection (#1744): atomic, else which arguments
+         * map element by element, and aggregate */
+        if (sig_flag(d, "atomic")) {
+            fprintf(stdout, ", atomic");
+        } else {
+            ray_t* ew = sig_field(d, "elementwise");
+            int64_t n = ew && !RAY_IS_ERR(ew) && ew->type == RAY_BOOL ? ew->len : 0;
+            int64_t on = 0;
+            for (int64_t i = 0; i < n; i++) on += ((uint8_t*)ray_data(ew))[i] != 0;
+            if (on > 0 && on == n) {
+                fprintf(stdout, ", element-wise");
+            } else if (on > 0) {
+                fprintf(stdout, ", element-wise in argument%s", on > 1 ? "s" : "");
+                for (int64_t i = 0, k = 0; i < n; i++)
+                    if (((uint8_t*)ray_data(ew))[i])
+                        fprintf(stdout, "%s%lld", k++ ? " and " : " ", (long long)(i + 1));
+            }
+            if (ew) { if (RAY_IS_ERR(ew)) ray_error_free(ew); else ray_release(ew); }
+        }
+        if (sig_flag(d, "aggregate")) fprintf(stdout, ", aggregate");
         fputc('\n', stdout);
         const char* u = usage && !RAY_IS_ERR(usage) && usage->type == -RAY_STR ? ray_str_ptr(usage) : "";
         size_t ul = usage && !RAY_IS_ERR(usage) && usage->type == -RAY_STR ? ray_str_len(usage) : 0;

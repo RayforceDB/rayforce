@@ -601,6 +601,19 @@ bool ray_fn_row_arg_whole(ray_t* fn, int64_t nargs, int64_t pos, const char** wh
     return false;
 }
 
+int64_t ray_fn_row_arity(ray_t* fn) {
+    if (!fn) return 0;
+    if (fn->type == RAY_UNARY) return 1;
+    if (fn->type == RAY_BINARY) return 2;
+    if (fn->type != RAY_VARY) return 0;
+    void* f = (void*)(uintptr_t)fn->i64;
+    if (f == (void*)ray_and_vary_fn || f == (void*)ray_or_vary_fn || f == (void*)ray_cond_fn)
+        return 2;
+    for (size_t i = 0; i < sizeof g_row_args / sizeof g_row_args[0]; i++)
+        if (g_row_args[i].fn == f) return g_row_args[i].nargs;
+    return 0;
+}
+
 bool ray_fn_row_arg(ray_t* fn, int64_t nargs, int64_t pos) {
     if (!fn || nargs < 1 || pos < 1 || pos > nargs) return false;
     void* f = (void*)(uintptr_t)fn->i64;

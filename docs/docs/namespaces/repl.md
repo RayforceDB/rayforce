@@ -86,13 +86,26 @@ Signature: `(.repl.signature name)`, `name` a symbol. It returns a dict describi
 | `summary` | a builtin's one-line summary of what it does, the text the [function reference](../reference/all-functions.md) shows; `""` for anything else (a lambda, a value, a namespace root, a literal, a missing name): never invented |
 | `builtin` | the builtin's own name, read from the function object: also when reached through an alias, and the held builtin's name when a builtin name was rebound to another builtin; the empty symbol otherwise |
 | `restricted` | whether the builtin is refused under `-U` |
+| `atomic` | whether the builtin is registered atomic: the evaluator maps it over vectors **and lists** itself, every argument (`+`, `neg`, `abs`, …; `(+ (list 1 2.5) 10)` is `(list 11 12.5)`); `false` for anything else |
+| `elementwise` | a `B8` vector, one flag per argument: whether that argument maps a **vector** element by element, one result per element, from the engine's row-shape record (the one queries plan by: for `if` it describes a query's evaluation, see below). `[true]` for `sin`, `[true false]` for `in` (its set is taken whole), `[true false false]` for `substr`. Empty for a variadic builtin the record does not describe, and for anything that is not a builtin |
+| `aggregate` | whether the builtin is registered as an aggregation, one that reduces a vector (`sum`, `count`, `avg`, `min`, …); `false` for anything else |
+
+The three describe a builtin as the engine records it, not as a guess from its name:
+
+- **`atomic` and `elementwise` differ.** An atomic builtin is element-wise in every argument. Many others map a vector element by element too, without being registered atomic: `sin`, `not`, `nil?`, `upper`, `like`, the date parts. They may refuse a list: `(upper (list "a" 'b))` is a `type` error.
+- **A lookup argument is not element-wise.** An argument a builtin reads as a lookup is `false`, even where it maps: `at`'s index, `find`'s needles, `bin`'s values.
+- **One form only, for builtins with more than one arity.** `elementwise` describes one form, and says nothing of the other:
+  - `min` and `max` are described with one argument, as aggregates (`[false]`), although `(min a b)` maps element-wise;
+  - `and` and `or` are described in their two-operand form (`[true true]`), and map their operands element by element in and out of a query: `(and [true false true] [true true false])` is `[true false false]`.
+  - `if` is described in its two-operand form too (`[true true]`), but that is how a **query** evaluates it: there, `(if c 7)` over a column `c` gives one value per row (`[7 0 7]` for `c` = `[true false true]`). An ordinary call with a boolean-vector condition needs an else arm: `(if [true false true] 7)` is a `domain` error ("a boolean-vector condition needs an else arm"), while `(if [true false true] 7 9)` is `[7 9 7]`.
+- **Not every reducing builtin is registered as an aggregation.** `first` and `last` reduce but are not registered so, and are `aggregate: false`.
 
 A builtin's calling convention is not the set of forms it accepts. `min` is unary as a function value, but `(min 1 2)` takes two numbers. So `arity` is left unknown for a builtin, and `usage` spells its forms out. The answer follows the name's current value: an alias reports the function it holds, and a reassignment reports the new one. A name that is not a symbol raises `type`.
 
 ```lisp
 (set add (fn [a b] (+ a b)))
 (.repl.signature 'add)
-;; {name:add bound:true callable:true kind:lambda special:false params:[a b] arity:2 usage:"" summary:"" builtin:' restricted:false}
+;; {name:add bound:true callable:true kind:lambda special:false params:[a b] arity:2 usage:"" summary:"" builtin:' restricted:false atomic:false elementwise:[] aggregate:false}
 (at (.repl.signature 'min) 'usage)
 ;; "(min <x: vector, atom or list>) or (min <a: num> <b: num>)"
 (at (.repl.signature 'if) 'special)     ;; true
