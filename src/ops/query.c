@@ -18837,11 +18837,15 @@ static bool update_spread_head(const ray_t* h) {
             (void*)(uintptr_t)h->i64 == (void*)update_spread_keep_null_fn);
 }
 
-/* `lits`: a symbol literal ('x, (quote x), a SYM vector such as ['x 'y])
- * is taken as reading at most the column it names, for a caller that keeps
- * every name such a literal holds (proj_compute_keep, collect_sym_lits,
- * #1746).  Without it they decline, as before. */
-static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits);
+/* The walk's modes.  RN_LITS: a symbol literal ('x, (quote x), a SYM vector
+ * such as ['x 'y]) is taken as reading at most the column it names, for a
+ * caller that keeps every name such a literal holds (proj_compute_keep,
+ * collect_sym_lits, #1746); without it they decline, as before.  RN_CALLS:
+ * every call must be to a builtin known by identity (lit_call_sees_all), so
+ * a function computed at run time, ((at (value (env 0)) k) 1), never runs a
+ * body that reads a column the keep set dropped (#1773). */
+enum { RN_LITS = 1, RN_CALLS = 2 };
+static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, int mode);
 
 /* Under `lits` a call is judged by the builtin it calls, found by its C
  * function so every name bound to one is covered (#1750 review).  These
@@ -18927,15 +18931,16 @@ static bool sym_lit_reads_named_only(int64_t id, ray_t* tbl) {
     ray_t bare = { 0 };
     bare.type = -RAY_SYM;
     bare.i64 = id;
-    return expr_reads_named_columns_only_at(&bare, tbl, false);
+    return expr_reads_named_columns_only_at(&bare, tbl, 0);
 }
 
-static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits) {
+static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, int mode) {
+    bool lits = mode & RN_LITS;
     if (!e) return true;
     /* the spread of an update aggregate's scalar reads what its argument reads */
     if (e->type == RAY_LIST && e->len == 2 && !(e->attrs & ATTR_QUOTED) &&
         update_spread_head(((ray_t**)ray_data(e))[0]))
-        return expr_reads_named_columns_only_at(((ray_t**)ray_data(e))[1], tbl, lits);   /* not-a-table */
+        return expr_reads_named_columns_only_at(((ray_t**)ray_data(e))[1], tbl, mode);   /* not-a-table */
     if (e->type == -RAY_SYM) {
         if (e->attrs & ATTR_QUOTED) return lits && sym_lit_reads_named_only(e->i64, tbl);
         /* a lexical local wins over a column of its name (query locals never
@@ -18984,9 +18989,9 @@ static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits) {
          * builtin known by identity (lit_call_sees_all): a head computed
          * at run time, ((as 'sym "f") a), or a lambda fetched and handed to
          * map declines (#1750 review and audit). */
-        if (lits && ray_len(e) >= 1 && !lit_call_sees_all(el, ray_len(e))) return false;
+        if ((mode & RN_CALLS) && ray_len(e) >= 1 && !lit_call_sees_all(el, ray_len(e))) return false;
         for (int64_t i = 0; i < ray_len(e); i++)
-            if (!expr_reads_named_columns_only_at(el[i], tbl, lits)) return false;
+            if (!expr_reads_named_columns_only_at(el[i], tbl, mode)) return false;
         return true;
     }
     if (e->type < 0) return true;                                /* a non-symbol atom */
@@ -18999,7 +19004,7 @@ static bool expr_reads_named_columns_only_at(ray_t* e, ray_t* tbl, bool lits) {
 }
 
 static bool expr_reads_named_columns_only(ray_t* e, ray_t* tbl) {
-    return expr_reads_named_columns_only_at(e, tbl, false);
+    return expr_reads_named_columns_only_at(e, tbl, 0);
 }
 
 /* Bind the columns of `tbl` as query locals for evaluating exprs[0..n): every
@@ -19223,7 +19228,7 @@ static int64_t proj_keep_bound(ray_t* dict) {
  * non-`from` clauses reference.  Returns false (→ carry all) for an implicit-all
  * select, which references every column. */
 static bool eval_group_keep_ok(ray_t* e, ray_t* tbl);
-static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, bool lits);
+static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, int mode);
 static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
     int64_t from_id    = dict_key_id(dict, "from");
     int64_t where_id   = dict_key_id(dict, "where");
@@ -19247,7 +19252,7 @@ static bool proj_compute_keep(ray_t* dict, int64_t* out, int max, int* out_n) {
          * not a callable that can read an unlisted column. */
         ray_t* clause = pv[i + 1];
         if ((!clause || clause->type != RAY_SYM) &&
-            !eval_group_keep_ok_at(clause, NULL, true)) {
+            !eval_group_keep_ok_at(clause, NULL, RN_LITS | RN_CALLS)) {
             DICT_VIEW_CLOSE(pv);
             return false;
         }
@@ -19434,20 +19439,22 @@ static int64_t eval_group_keep_cap(ray_t* tbl) {
 
 /* Can every column `e` reads be named (expr_reads_named_columns_only)?
  * A by-dict is judged by its values. */
-static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, bool lits) {
+static bool eval_group_keep_ok_at(ray_t* e, ray_t* tbl, int mode) {
     if (e && e->type == RAY_DICT) {                  /* a by-dict: its values */
         ray_t* vals = ray_dict_vals(e);
         if (!vals || vals->type != RAY_LIST) return false;
         ray_t** v = (ray_t**)ray_data(vals);
         for (int64_t i = 0; i < ray_len(vals); i++)
-            if (!expr_reads_named_columns_only_at(v[i], tbl, lits)) return false;
+            if (!expr_reads_named_columns_only_at(v[i], tbl, mode)) return false;
         return true;
     }
-    return expr_reads_named_columns_only_at(e, tbl, lits);
+    return expr_reads_named_columns_only_at(e, tbl, mode);
 }
 
+/* The group and filter-compaction keep sets: every call by identity, as
+ * the outer select's narrowing has it (#1773). */
 static bool eval_group_keep_ok(ray_t* e, ray_t* tbl) {
-    return eval_group_keep_ok_at(e, tbl, false);
+    return eval_group_keep_ok_at(e, tbl, RN_CALLS);
 }
 
 /* Filter-compaction keep-set for a grouped select whose where: runs as its
