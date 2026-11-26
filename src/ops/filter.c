@@ -984,103 +984,162 @@ static void sym_gather_set_nulls(ray_t* dst, int64_t n, ray_pool_t* pool) {
     if (atomic_load_explicit(&c.zero, memory_order_relaxed)) dst->attrs |= RAY_ATTR_HAS_NULLS;
 }
 
-/* A fixed-width parted column under the selection, on the pool (#1122):
- * each task finds the segment of its first row and copies runs of
- * consecutive rows within a segment with one parted_copy_cells.  Only when
- * every segment is present and none may hold nulls: the tasks then write
- * their own output cells and nothing else (no null bits, no fill). */
+/* A fixed-width column under the selection, read from the selection's
+ * morsels (#1122, #1757): a parted column's segments, or a flat column as
+ * one segment.  A morsel whose rows all pass goes as one copy a segment it
+ * spans.  A mixed morsel's positions rise strictly, so a block of them
+ * whose last is its first plus the block's length less one holds
+ * consecutive rows: it goes as one copy, any other block cell by cell
+ * (sel_run_cells_*).  One test a block, not one a cell, and no index of
+ * the kept rows: a dense selection costs about what a whole copy of the
+ * rows does, a scattered one moves only its cells.  Only when every
+ * segment is present and none may
+ * hold nulls (a flat column's null bits follow in sel_compact): the tasks
+ * then write their own output cells and nothing else.  A SYM segment saved
+ * at another width than the output's converts its cells
+ * (parted_copy_cells). */
 typedef struct {
-    ray_t* const*  segs;
-    const int64_t* seg_ends;     /* [n_segs] cumulative rows */
-    const int64_t* idx;          /* source rows, ascending */
-    char*          dst;
-    int64_t        n_segs;
-    int8_t         base;
-    uint8_t        out_attrs;
-} parted_runs_ctx_t;
+    ray_t* const*   segs;
+    const int64_t*  seg_ends;     /* [n_segs] cumulative rows */
+    int64_t         n_segs;
+    const uint8_t*  flags;        /* the selection's morsels */
+    const uint32_t* offsets;
+    const uint16_t* idx;
+    const int64_t*  mdst;         /* [n_morsels] each morsel's first output cell */
+    int64_t         nrows;
+    int64_t         n_morsels;
+    int64_t         per_task;     /* morsels a pool task takes */
+    char*           dst;
+    uint8_t         esz;
+    int8_t          base;
+    uint8_t         out_attrs;
+    bool            plain;        /* every segment's cells at the output's width */
+} sel_runs_ctx_t;
 
-static void parted_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) {
-    (void)wid;
-    const parted_runs_ctx_t* c = raw;
-    int64_t lo = 0, hi = c->n_segs - 1;                  /* the first row's segment */
-    while (lo < hi) {
-        int64_t mid = lo + (hi - lo) / 2;
-        if (c->idx[start] < c->seg_ends[mid]) hi = mid; else lo = mid + 1;
+/* Rows [row, row + n) to output cells [d, d + n), across the segments
+ * they span; *seg is the task's segment cursor (rows ascending). */
+static inline void sel_runs_span(const sel_runs_ctx_t* c, int64_t* seg, int64_t row, int64_t n, int64_t d) {
+    while (n > 0) {
+        while (*seg < c->n_segs - 1 && row >= c->seg_ends[*seg]) (*seg)++;
+        int64_t s0 = *seg > 0 ? c->seg_ends[*seg - 1] : 0;
+        int64_t k = c->seg_ends[*seg] - row;
+        if (k > n) k = n;
+        ray_t* sv = c->segs[*seg];
+        if (!c->plain) parted_copy_cells(c->dst, c->base, c->out_attrs, d, sv, row - s0, k);
+        else memcpy(c->dst + (size_t)d * c->esz, (const char*)ray_data(sv) + (size_t)(row - s0) * c->esz,
+                    (size_t)k * c->esz);
+        row += k; d += k; n -= k;
     }
-    int64_t seg = lo;
-    /* The cell size once, and each segment's data and bounds once per
-     * segment: a scattered selection is mostly runs of one cell (#1748). */
-    size_t esz = ray_sym_elem_size(c->base, c->out_attrs);
-    bool all_plain = c->base != RAY_SYM;
-    if (!all_plain) {
-        all_plain = true;
-        for (int64_t k = 0; k < c->n_segs && all_plain; k++)
-            all_plain = ((c->segs[k]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
+}
+
+/* out[q] = in[off + sl[q]] for q in [0, n), positions ascending, by blocks
+ * of B positions, 64 bytes of cells: a block of consecutive rows is one
+ * copy of a fixed size, a run of SEL_RUN_LONG positions one library copy,
+ * any other block cell by cell. */
+#define SEL_RUN_LONG 256u
+#define SEL_RUN_CELLS_FN(T, NAME)                                                        \
+    static void NAME(T* restrict out, const T* restrict in, int64_t off,                 \
+                     const uint16_t* restrict sl, uint32_t n) {                          \
+        enum { B = 64 / sizeof(T) };                                                     \
+        uint32_t q = 0;                                                                  \
+        while (q + B <= n) {                                                             \
+            if ((uint32_t)sl[q + B - 1] - sl[q] == B - 1) {                              \
+                if (q + SEL_RUN_LONG <= n && (uint32_t)sl[q + SEL_RUN_LONG - 1] - sl[q] == SEL_RUN_LONG - 1) { \
+                    memcpy(out + q, in + (off + sl[q]), SEL_RUN_LONG * sizeof(T));       \
+                    q += SEL_RUN_LONG;                                                   \
+                } else {                                                                 \
+                    memcpy(out + q, in + (off + sl[q]), B * sizeof(T));                  \
+                    q += B;                                                              \
+                }                                                                        \
+            } else {                                                                     \
+                for (uint32_t t = 0; t < B; t++) out[q + t] = in[off + sl[q + t]];       \
+                q += B;                                                                  \
+            }                                                                            \
+        }                                                                                \
+        for (; q < n; q++) out[q] = in[off + sl[q]];                                     \
     }
-    /* Every segment at the output's width, a cell of 1, 2, 4 or 8 bytes: a
-     * typed move a cell, a run of the rows that follow by one copy. */
-#define PARTED_RUNS_TYPED(T) do {                                                      \
-        T* out = (T*)(void*)c->dst;                                                    \
-        int64_t s0 = seg > 0 ? c->seg_ends[seg - 1] : 0, s1 = c->seg_ends[seg];        \
-        const T* in = (const T*)ray_data(c->segs[seg]);                                \
-        for (int64_t i = start; i < end; ) {                                           \
-            int64_t row = c->idx[i];                                                   \
-            if (row >= s1 && seg < c->n_segs - 1) {                                    \
-                while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;          \
-                s0 = seg > 0 ? c->seg_ends[seg - 1] : 0; s1 = c->seg_ends[seg];        \
-                in = (const T*)ray_data(c->segs[seg]);                                 \
-            }                                                                          \
-            if (i + 1 < end && c->idx[i + 1] == row + 1 && row + 1 < s1) {             \
-                int64_t j = i + 2;                                                     \
-                while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < s1) j++;   \
-                memcpy(out + i, in + (row - s0), (size_t)(j - i) * sizeof(T));         \
-                i = j;                                                                 \
-            } else {                                                                   \
-                out[i] = in[row - s0];                                                 \
-                i++;                                                                   \
-            }                                                                          \
-        }                                                                              \
-        return;                                                                        \
-    } while (0)
-    if (all_plain) {
-        switch (esz) {
-            case 1: PARTED_RUNS_TYPED(uint8_t);
-            case 2: PARTED_RUNS_TYPED(uint16_t);
-            case 4: PARTED_RUNS_TYPED(uint32_t);
-            case 8: PARTED_RUNS_TYPED(uint64_t);
-            default: break;
+SEL_RUN_CELLS_FN(uint8_t,  sel_run_cells_1)
+SEL_RUN_CELLS_FN(uint16_t, sel_run_cells_2)
+SEL_RUN_CELLS_FN(uint32_t, sel_run_cells_4)
+SEL_RUN_CELLS_FN(uint64_t, sel_run_cells_8)
+#undef SEL_RUN_CELLS_FN
+#undef SEL_RUN_LONG
+
+/* A mixed morsel's n positions sl, rows base + sl[q], to output cells
+ * from d: the positions in one segment at a time. */
+static void sel_runs_mixed(const sel_runs_ctx_t* c, int64_t* seg, int64_t base,
+                           const uint16_t* sl, uint32_t n, int64_t d) {
+    uint32_t q = 0;
+    while (q < n) {
+        while (*seg < c->n_segs - 1 && base + sl[q] >= c->seg_ends[*seg]) (*seg)++;
+        int64_t s0 = *seg > 0 ? c->seg_ends[*seg - 1] : 0, lim = c->seg_ends[*seg] - base;
+        uint32_t j = n;
+        if (lim < RAY_MORSEL_ELEMS && *seg < c->n_segs - 1) {   /* the segment ends inside the morsel */
+            j = q + 1;
+            while (j < n && sl[j] < lim) j++;
         }
-    }
-#undef PARTED_RUNS_TYPED
-    int64_t seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0, seg_end = c->seg_ends[seg];
-    bool plain = c->base != RAY_SYM || ((c->segs[seg]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
-    const char* src = (const char*)ray_data(c->segs[seg]);
-    for (int64_t i = start; i < end; ) {
-        int64_t row = c->idx[i];
-        if (row >= seg_end && seg < c->n_segs - 1) {
-            while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;
-            seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0;
-            seg_end = c->seg_ends[seg];
-            plain = c->base != RAY_SYM || ((c->segs[seg]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
-            src = (const char*)ray_data(c->segs[seg]);
-        }
-        int64_t j = i + 1;
-        while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < seg_end) j++;
-        if (!plain) {
-            parted_copy_cells(c->dst, c->base, c->out_attrs, i, c->segs[seg], row - seg_start, j - i);
+        if (c->plain) {
+            const void* in = ray_data(c->segs[*seg]);
+            char* out = c->dst + (size_t)(d + q) * c->esz;
+            int64_t off = base - s0;
+            switch (c->esz) {
+                case 1: sel_run_cells_1((uint8_t*)out, in, off, sl + q, j - q); break;
+                case 2: sel_run_cells_2((uint16_t*)(void*)out, in, off, sl + q, j - q); break;
+                case 4: sel_run_cells_4((uint32_t*)(void*)out, in, off, sl + q, j - q); break;
+                case 8: sel_run_cells_8((uint64_t*)(void*)out, in, off, sl + q, j - q); break;
+                default:
+                    for (uint32_t i = q; i < j; ) {
+                        uint32_t k = i + 1;
+                        while (k < j && sl[k] == sl[i] + (k - i)) k++;
+                        sel_runs_span(c, seg, base + sl[i], k - i, d + i);
+                        i = k;
+                    }
+                    break;
+            }
         } else {
-            char* d = c->dst + (size_t)i * esz;
-            const char* s = src + (size_t)(row - seg_start) * esz;
-            switch (j - i == 1 ? esz : 0) {
-                case 1:  *d = *s; break;
-                case 2:  memcpy(d, s, 2); break;
-                case 4:  memcpy(d, s, 4); break;
-                case 8:  memcpy(d, s, 8); break;
-                case 16: memcpy(d, s, 16); break;
-                default: memcpy(d, s, (size_t)(j - i) * esz); break;
+            for (uint32_t i = q; i < j; ) {
+                uint32_t k = i + 1;
+                while (k < j && sl[k] == sl[i] + (k - i)) k++;
+                sel_runs_span(c, seg, base + sl[i], k - i, d + i);
+                i = k;
             }
         }
-        i = j;
+        q = j;
+    }
+}
+
+_Static_assert(RAY_SEL_NONE == 0, "sel_runs_fn skips empty morsels as zero bytes");
+static void sel_runs_fn(void* raw, uint32_t wid, int64_t t0, int64_t t1) {
+    (void)wid;
+    const sel_runs_ctx_t* c = raw;
+    int64_t m0 = t0 * c->per_task, m1 = t1 * c->per_task;
+    if (m1 > c->n_morsels) m1 = c->n_morsels;
+    if (m0 >= m1) return;
+    int64_t first = m0 * RAY_MORSEL_ELEMS;
+    int64_t lo = 0, hi = c->n_segs - 1;                  /* the first morsel's segment */
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (first < c->seg_ends[mid]) hi = mid; else lo = mid + 1;
+    }
+    int64_t seg = lo;
+    for (int64_t m = m0; m < m1; m++) {
+        uint8_t f = c->flags[m];
+        if (f == RAY_SEL_NONE) {
+            /* the empty morsels that follow, eight flags a load */
+            for (uint64_t w; m + 9 <= m1; m += 8) {
+                memcpy(&w, c->flags + m + 1, 8);
+                if (w) break;
+            }
+            continue;
+        }
+        int64_t base = m * RAY_MORSEL_ELEMS;
+        if (f == RAY_SEL_ALL) {
+            int64_t end = base + RAY_MORSEL_ELEMS < c->nrows ? base + RAY_MORSEL_ELEMS : c->nrows;
+            sel_runs_span(c, &seg, base, end - base, c->mdst[m]);
+        } else {
+            sel_runs_mixed(c, &seg, base, c->idx + c->offsets[m],
+                           c->offsets[m + 1] - c->offsets[m], c->mdst[m]);
+        }
     }
 }
 
@@ -1089,35 +1148,170 @@ static _Atomic(uint64_t) g_parted_runs;   /* test hook: parted columns gathered 
 uint64_t ray_filter_test_parted_runs(void) { return atomic_load_explicit(&g_parted_runs, memory_order_relaxed); }
 #endif
 
-/* parted_gather_col, by runs on the pool when the column allows it. */
-static void sel_parted_gather(ray_pool_t* pool, ray_t* col, const int64_t* idx, int64_t count,
-                              ray_t* dst, const int64_t* cnt, int64_t ncnt) {
+#ifndef SEL_RUNS_MIN
+#define SEL_RUNS_MIN 32   /* kept rows, and kept rows a kept morsel, for a gather by runs */
+#endif
+
+/* Each of the selection's n morsels' first output cell: the kept rows
+ * before it (RAY_SEL_ALL its rows, RAY_SEL_MIX its positions). */
+static void sel_morsel_starts(const uint8_t* flags, const uint32_t* offsets, int64_t nrows,
+                              uint32_t n, int64_t* out) {
+    int64_t cum = 0;
+    for (uint32_t m = 0; m < n; m++) {
+        out[m] = cum;
+        if (flags[m] == RAY_SEL_ALL) {
+            int64_t lo = (int64_t)m * RAY_MORSEL_ELEMS;
+            cum += (lo + RAY_MORSEL_ELEMS < nrows ? lo + RAY_MORSEL_ELEMS : nrows) - lo;
+        } else if (flags[m] == RAY_SEL_MIX) {
+            cum += offsets[m + 1] - offsets[m];
+        }
+    }
+}
+
+/* The selection's morsels, once for every column sel_compact gathers by
+ * runs: each morsel's first output cell. */
+typedef struct {
+    const uint8_t*  flags;
+    const uint32_t* offsets;
+    const uint16_t* idx;
+    const int64_t*  mdst;
+    int64_t         nrows;
+    int64_t         n_morsels;
+    int64_t*        ends;         /* a parted column's cumulative rows, its segments at most */
+    int64_t         count;        /* the kept rows */
+} sel_runs_plan_t;
+
+/* Can a fixed-width column's segments go by runs (sel_runs_gather)?  Every
+ * segment present, and a parted one's free of nulls: a flat column's null
+ * bits follow in sel_compact, a parted one's would not. */
+static bool sel_runs_ok(ray_t* const* segs, int64_t n_segs, bool parted) {
+    if (n_segs <= 0) return false;
+    for (int64_t s = 0; s < n_segs; s++)
+        if (!segs[s] || RAY_IS_ERR(segs[s]) || (parted && ray_vec_may_have_nulls(segs[s]))) return false;
+    return true;
+}
+
+/* A flat column sel_compact gathers by runs: fixed width of a cell of 1, 2,
+ * 4 or 8 bytes, its cells copied as they are. */
+static bool sel_runs_flat_ok(const ray_t* col) {
+    if (col->type == RAY_LIST || col->type == RAY_MAPCOMMON || col->type == RAY_STR ||
+        RAY_IS_PARTED(col->type) || col->type <= 0) return false;
+    uint8_t e = col_esz(col);
+    return e == 1 || e == 2 || e == 4 || e == 8;
+}
+
+/* Gather a column's kept rows into dst by runs (sel_runs_fn): segs[0,
+ * n_segs) with sel_runs_ok, ends their cumulative rows.  False when the
+ * pool's dispatch was cancelled: dst's cells are then not all written. */
+static bool sel_runs_gather(ray_pool_t* pool, const sel_runs_plan_t* p, ray_t* const* segs,
+                            const int64_t* ends, int64_t n_segs, int8_t base, bool parted, ray_t* dst) {
+    uint8_t out_attrs = base == RAY_SYM ? dst->attrs : 0;
+    bool plain = true;
+    for (int64_t s = 0; s < n_segs && plain; s++)
+        plain = base != RAY_SYM || ((segs[s]->attrs ^ out_attrs) & RAY_SYM_W_MASK) == 0;
+    sel_runs_ctx_t c = {
+        .segs = segs, .seg_ends = ends, .n_segs = n_segs,
+        .flags = p->flags, .offsets = p->offsets, .idx = p->idx, .mdst = p->mdst,
+        .nrows = p->nrows, .n_morsels = p->n_morsels, .per_task = p->n_morsels,
+        .dst = (char*)ray_data(dst), .esz = (uint8_t)ray_sym_elem_size(base, out_attrs),
+        .base = base, .out_attrs = out_attrs, .plain = plain,
+    };
+    if (p->n_morsels > 1 && ray_pool_par_dispatch_ok(pool, p->count, RAY_PARALLEL_THRESHOLD)) {
+        /* morsels a task, so the tasks fit the pool's ring (see sel_compact's index fill) */
+        int64_t per = 1;
+        while ((p->n_morsels + per - 1) / per > RAY_POOL_INIT_TASKS) per *= 2;
+        c.per_task = per;
+        ray_pool_dispatch_n(pool, sel_runs_fn, &c, (uint32_t)((p->n_morsels + per - 1) / per));
+#ifdef DEBUG
+        if (parted) atomic_fetch_add_explicit(&g_parted_runs, 1, memory_order_relaxed);
+#endif
+        if (pool_cancelled(pool)) return false;          /* skipped tasks */
+    } else {
+        sel_runs_fn(&c, 0, 0, 1);
+    }
+    (void)parted;
+    return true;
+}
+
+/* A parted fixed-width column (not STR or LIST) by runs when by_runs
+ * (sel_runs_ok, and the plan's buffers allocated); parted_gather_col from
+ * the rows idx otherwise.  False on a cancelled dispatch. */
+static bool sel_parted_gather(ray_pool_t* pool, const sel_runs_plan_t* p, ray_t* col, bool by_runs,
+                              const int64_t* idx, ray_t* dst, const int64_t* cnt, int64_t ncnt) {
+    if (!by_runs) { parted_gather_col(col, idx, p->count, dst, cnt, ncnt); return true; }
     int64_t n_segs = col->len;
     ray_t** segs = (ray_t**)ray_data(col);
-    bool runs = n_segs > 0;
-    for (int64_t s = 0; s < n_segs && runs; s++)
-        runs = segs[s] && !RAY_IS_ERR(segs[s]) && !ray_vec_may_have_nulls(segs[s]);
-    ray_t* ends_hdr = NULL;
-    int64_t* ends = runs ? (int64_t*)scratch_alloc(&ends_hdr, (size_t)n_segs * sizeof(int64_t)) : NULL;
-    if (!ends) { parted_gather_col(col, idx, count, dst, cnt, ncnt); return; }
     int64_t cum = 0;
-    for (int64_t s = 0; s < n_segs; s++) ends[s] = cum += segs[s]->len;
-    int8_t base = (int8_t)RAY_PARTED_BASETYPE(col->type);
-    parted_runs_ctx_t c = {
-        .segs = segs, .seg_ends = ends, .idx = idx, .dst = (char*)ray_data(dst),
-        .n_segs = n_segs, .base = base, .out_attrs = base == RAY_SYM ? dst->attrs : 0,
-    };
-    if (ray_pool_par_dispatch_ok(pool, count, RAY_PARALLEL_THRESHOLD)) {
-        ray_pool_dispatch(pool, parted_runs_fn, &c, count);
-        if (pool_cancelled(pool))                        /* skipped tasks: no garbage cells */
-            memset(c.dst, 0, (size_t)count * ray_sym_elem_size(base, c.out_attrs));
-#ifdef DEBUG
-        atomic_fetch_add_explicit(&g_parted_runs, 1, memory_order_relaxed);
-#endif
-    } else {
-        parted_runs_fn(&c, 0, 0, count);
+    for (int64_t s = 0; s < n_segs; s++) p->ends[s] = cum += segs[s]->len;
+    return sel_runs_gather(pool, p, segs, p->ends, n_segs, (int8_t)RAY_PARTED_BASETYPE(col->type), true, dst);
+}
+
+/* The kept rows as an int64 index (*out, its block *hdr), for the columns
+ * that read it.  Per-seg pass counts are derivable from the rowsel itself
+ * (ALL→seg_len, MIX→offsets delta, NONE→0), so this parallelizes as: tiny
+ * serial prefix over segs (mdst when the caller has it) → parallel per-seg
+ * fill at disjoint offsets.  *out stays NULL when the index cannot be
+ * allocated; a cancelled fill answers the cancel, the index freed. */
+static inline ray_t* sel_compact_idx(ray_t* sel, int64_t nrows, int64_t pass_count, const int64_t* mdst,
+                              int64_t** out, ray_t** hdr) {
+    const uint8_t*  flags   = ray_rowsel_flags(sel);
+    const uint32_t* offsets = ray_rowsel_offsets(sel);
+    const uint16_t* sidx    = ray_rowsel_idx(sel);
+    uint32_t n_segs = ray_rowsel_meta(sel)->n_segs;
+    int64_t* match_idx = (int64_t*)scratch_alloc(hdr, (size_t)pass_count * sizeof(int64_t));
+    *out = NULL;
+    if (!match_idx) return NULL;
+    ray_pool_t* sc_pool = ray_pool_get();
+    if (ray_pool_par_dispatch_ok(sc_pool, nrows, RAY_PARALLEL_THRESHOLD)) {
+        ray_t* soff_hdr = NULL;
+        int64_t* own = mdst ? NULL : (int64_t*)scratch_alloc(&soff_hdr, (size_t)n_segs * sizeof(int64_t));
+        if (own) sel_morsel_starts(flags, offsets, nrows, n_segs, own);
+        const int64_t* seg_out = mdst ? mdst : own;
+        if (seg_out) {
+            /* One task per seg-chunk (dispatch_n; ray_pool_dispatch would
+             * morselize the seg RANGE by 8192 segs → 1 task under 8.4M
+             * rows).  Chunk count capped at 1024 = the pool's initial ring
+             * capacity, so the ring never needs to grow (see exec_filter). */
+            uint32_t spc = 64;
+            while ((n_segs + spc - 1) / spc > RAY_POOL_INIT_TASKS) spc *= 2;
+            uint32_t sc_chunks = (n_segs + spc - 1) / spc;
+            scidx_ctx_t sc = {
+                .flags = flags, .offsets = offsets, .idx = sidx,
+                .seg_out = seg_out, .match_idx = match_idx, .nrows = nrows,
+                .n_segs = n_segs, .segs_per_chunk = spc,
+            };
+            ray_pool_dispatch_n(sc_pool, scidx_fill_fn, &sc, sc_chunks);
+            scratch_free(soff_hdr);
+            /* a cancelled dispatch skips its tasks: match_idx is unfilled
+             * and every gather would read its garbage as rows */
+            if (pool_cancelled(sc_pool)) {
+                scratch_free(*hdr);
+                *hdr = NULL;
+                return ray_error("cancel", NULL);
+            }
+            *out = match_idx;
+            return NULL;
+        }
     }
-    scratch_free(ends_hdr);
+    int64_t j = 0;
+    for (uint32_t seg = 0; seg < n_segs; seg++) {
+        uint8_t f = flags[seg];
+        if (f == RAY_SEL_NONE) continue;
+        int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
+        int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
+        if (seg_end > nrows) seg_end = nrows;
+        if (f == RAY_SEL_ALL) {
+            for (int64_t r = seg_start; r < seg_end; r++)
+                match_idx[j++] = r;
+        } else {
+            const uint16_t* slice = sidx + offsets[seg];
+            uint32_t n = offsets[seg + 1] - offsets[seg];
+            for (uint32_t i = 0; i < n; i++)
+                match_idx[j++] = seg_start + slice[i];
+        }
+    }
+    *out = match_idx;
+    return NULL;
 }
 
 /* keep-set membership: is column name-sym `nm` present in keep_syms? */
@@ -1216,76 +1410,28 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     int64_t ncols = ray_table_ncols(tbl);
     if (ncols <= 0) { ray_retain(tbl); return tbl; }
 
-    /* Build match_idx from bitmap.  Per-seg pass counts are derivable
-     * from the rowsel itself (ALL→seg_len, MIX→offsets delta, NONE→0),
-     * so this parallelizes as: tiny serial prefix over segs → parallel
-     * per-seg fill at disjoint offsets. */
-    ray_t* idx_hdr = NULL;
-    int64_t* match_idx = (int64_t*)scratch_alloc(&idx_hdr,
-                                       (size_t)pass_count * sizeof(int64_t));
-    if (!match_idx) { ray_retain(tbl); return tbl; }
+    /* Gather by runs only when it pays for its setup a column and its walk
+     * of the morsels: SEL_RUNS_MIN kept rows at least, and as many on
+     * average in each morsel that keeps any.  Fewer, and the index of the
+     * kept rows, built once for every column, costs less. */
+    const uint8_t*  flags   = ray_rowsel_flags(sel);
+    const uint32_t* offsets = ray_rowsel_offsets(sel);
+    const uint16_t* sidx    = ray_rowsel_idx(sel);
+    uint32_t n_segs = meta->n_segs;
+    bool try_runs = pass_count >= SEL_RUNS_MIN;
+    if (try_runs) {
+        int64_t kept_morsels = 0;
+        for (uint32_t m = 0; m < n_segs; m++) kept_morsels += flags[m] != RAY_SEL_NONE;
+        try_runs = pass_count >= kept_morsels * SEL_RUNS_MIN;
+    }
 
-    {
-        const uint8_t*  flags   = ray_rowsel_flags(sel);
-        const uint32_t* offsets = ray_rowsel_offsets(sel);
-        const uint16_t* idx     = ray_rowsel_idx(sel);
-        uint32_t n_segs = meta->n_segs;
-        ray_pool_t* sc_pool = ray_pool_get();
-        ray_t* soff_hdr = NULL;
-        int64_t* seg_out = ray_pool_par_dispatch_ok(sc_pool, nrows, RAY_PARALLEL_THRESHOLD)
-            ? (int64_t*)scratch_alloc(&soff_hdr, (size_t)n_segs * sizeof(int64_t))
-            : NULL;
-        if (seg_out) {
-            int64_t cum = 0;
-            for (uint32_t seg = 0; seg < n_segs; seg++) {
-                seg_out[seg] = cum;
-                uint8_t f = flags[seg];
-                if (f == RAY_SEL_NONE) continue;
-                int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
-                int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
-                if (seg_end > nrows) seg_end = nrows;
-                cum += (f == RAY_SEL_ALL) ? (seg_end - seg_start)
-                                          : (int64_t)(offsets[seg + 1] - offsets[seg]);
-            }
-            /* One task per seg-chunk (dispatch_n; ray_pool_dispatch would
-             * morselize the seg RANGE by 8192 segs → 1 task under 8.4M
-             * rows).  Chunk count capped at 1024 = the pool's initial ring
-             * capacity, so the ring never needs to grow (see exec_filter). */
-            uint32_t spc = 64;
-            while ((n_segs + spc - 1) / spc > RAY_POOL_INIT_TASKS) spc *= 2;
-            uint32_t sc_chunks = (n_segs + spc - 1) / spc;
-            scidx_ctx_t sc = {
-                .flags = flags, .offsets = offsets, .idx = idx,
-                .seg_out = seg_out, .match_idx = match_idx, .nrows = nrows,
-                .n_segs = n_segs, .segs_per_chunk = spc,
-            };
-            ray_pool_dispatch_n(sc_pool, scidx_fill_fn, &sc, sc_chunks);
-            scratch_free(soff_hdr);
-            /* a cancelled dispatch skips its tasks: match_idx is unfilled
-             * and every gather below would read its garbage as rows */
-            if (pool_cancelled(sc_pool)) {
-                scratch_free(idx_hdr);
-                return ray_error("cancel", NULL);
-            }
-        } else {
-            int64_t j = 0;
-            for (uint32_t seg = 0; seg < n_segs; seg++) {
-                uint8_t f = flags[seg];
-                if (f == RAY_SEL_NONE) continue;
-                int64_t seg_start = (int64_t)seg * RAY_MORSEL_ELEMS;
-                int64_t seg_end = seg_start + RAY_MORSEL_ELEMS;
-                if (seg_end > nrows) seg_end = nrows;
-                if (f == RAY_SEL_ALL) {
-                    for (int64_t r = seg_start; r < seg_end; r++)
-                        match_idx[j++] = r;
-                } else {
-                    const uint16_t* slice = idx + offsets[seg];
-                    uint32_t n = offsets[seg + 1] - offsets[seg];
-                    for (uint32_t i = 0; i < n; i++)
-                        match_idx[j++] = seg_start + slice[i];
-                }
-            }
-        }
+    /* Not by runs: match_idx first, as every column reads it */
+    ray_t* idx_hdr = NULL;
+    int64_t* match_idx = NULL;
+    if (!try_runs) {
+        ray_t* fail = sel_compact_idx(sel, nrows, pass_count, NULL, &match_idx, &idx_hdr);
+        if (fail) return fail;
+        if (!match_idx) { ray_retain(tbl); return tbl; }
     }
 
     /* Parallel multi-column gather (same pattern as exec_filter) */
@@ -1294,12 +1440,18 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     if (!out || RAY_IS_ERR(out)) { scratch_free(idx_hdr); return out; }
 
     /* VLA guard: 256 cols max for stack arrays */
-    if (ncols > 256) { scratch_free(idx_hdr); return ray_error("limit", "table exceeds 256 columns"); }
+    if (ncols > 256) { scratch_free(idx_hdr); ray_release(out); return ray_error("limit", "table exceeds 256 columns"); }
 
     ray_t* new_cols[ncols];
     ray_t* src_cols[ncols];   /* borrowed: the plain kept columns */
     int64_t col_names[ncols];
+    bool by_runs[ncols];      /* gathered from the selection's morsels (sel_runs_gather): read only when any_runs */
     bool has_parted = false;
+    bool need_idx = false;    /* a column reads the kept rows as match_idx */
+    bool any_runs = false;    /* a column gathers by runs */
+    bool has_mapc = false;    /* a MAPCOMMON column */
+    int64_t max_segs = 0;
+
 
     for (int64_t c = 0; c < ncols; c++) {
         col_names[c] = ray_table_col_name(tbl, c);
@@ -1337,30 +1489,9 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         if (!col) { new_cols[c] = NULL; continue; }
         src_cols[c] = col;
         if (col->type == RAY_MAPCOMMON) {
-            ray_t** mc_ptrs = (ray_t**)ray_data(col);
-            ray_t* kv = mc_ptrs[0];
-            ray_t* rc = mc_ptrs[1];
-            if (!kv || !rc || col->len < 2) { new_cols[c] = NULL; continue; }
-            int64_t n_parts = kv->len;
-            int8_t kv_type = kv->type;
-            size_t esz = (size_t)ray_sym_elem_size(kv_type, kv->attrs);
-            const char* kdata = (const char*)ray_data(kv);
-            const int64_t* counts = (const int64_t*)ray_data(rc);
-            ray_t* flat = ray_vec_new(kv_type, pass_count);
-            if (!flat || RAY_IS_ERR(flat)) { new_cols[c] = NULL; continue; }
-            flat->len = pass_count;
-            char* out_mc = (char*)ray_data(flat);
-            for (int64_t i = 0; i < pass_count; i++) {
-                int64_t row_i = match_idx[i];
-                int64_t cum = 0;
-                int64_t pi = 0;
-                for (; pi < n_parts - 1; pi++) {
-                    cum += counts[pi];
-                    if (row_i < cum) break;
-                }
-                memcpy(out_mc + (size_t)i * esz, kdata + (size_t)pi * esz, esz);
-            }
-            new_cols[c] = flat;
+            /* materialized from match_idx once it is built, below */
+            new_cols[c] = NULL;
+            need_idx = has_mapc = true;
             continue;
         }
         int8_t ct = RAY_IS_PARTED(col->type)
@@ -1383,6 +1514,94 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         if (!nc || RAY_IS_ERR(nc)) { new_cols[c] = NULL; continue; }
         nc->len = pass_count;
         new_cols[c] = nc;
+    }
+
+    /* Which columns gather by runs, and which read match_idx */
+    for (int64_t c = 0; try_runs && c < ncols; c++) {
+        ray_t* col = src_cols[c];
+        by_runs[c] = false;
+        if (!col || !new_cols[c]) continue;
+        if (RAY_IS_PARTED(col->type)) {
+            if (RAY_PARTED_BASETYPE(col->type) != RAY_STR && !parted_base_is_list(col) &&
+                sel_runs_ok((ray_t* const*)ray_data(col), col->len, true)) {
+                by_runs[c] = true;
+                if (col->len > max_segs) max_segs = col->len;
+            }
+        } else if (sel_runs_flat_ok(col)) {
+            by_runs[c] = true;
+            /* its null bits from match_idx, but for a SYM's (a zero cell,
+             * sym_gather_set_nulls) */
+            if (ray_vec_may_have_nulls(col) &&
+                !(col->type == RAY_SYM && !(col->attrs & RAY_ATTR_SLICE)))
+                need_idx = true;
+        }
+        if (by_runs[c]) any_runs = true; else need_idx = true;
+    }
+
+    /* The selection's morsels: each one's first output cell, for the
+     * columns gathered by runs.  Without the buffers they read match_idx. */
+    ray_t* plan_hdr = NULL;
+    sel_runs_plan_t plan = {
+        .flags = flags, .offsets = offsets, .idx = sidx, .nrows = nrows,
+        .n_morsels = n_segs, .count = pass_count,
+    };
+    int64_t* plan_buf = any_runs
+        ? (int64_t*)scratch_alloc(&plan_hdr, ((size_t)n_segs + (size_t)max_segs) * sizeof(int64_t))
+        : NULL;
+    if (plan_buf) {
+        sel_morsel_starts(flags, offsets, nrows, n_segs, plan_buf);
+        plan.mdst = plan_buf;
+        plan.ends = plan_buf + n_segs;
+    } else if (any_runs) {
+        for (int64_t c = 0; c < ncols; c++) by_runs[c] = false;
+        any_runs = false;
+        need_idx = true;
+    }
+
+    /* match_idx for the columns that read it, when not built up front */
+    if (need_idx && !match_idx) {
+        ray_t* fail = sel_compact_idx(sel, nrows, pass_count, plan.mdst, &match_idx, &idx_hdr);
+        if (fail || !match_idx) {
+            /* no index: the table as it is (the caller gathers it another
+             * way); a cancel: the cancel */
+            for (int64_t c = 0; c < ncols; c++)
+                if (new_cols[c]) ray_release(new_cols[c]);
+            ray_release(out);
+            scratch_free(plan_hdr);
+            if (fail) return fail;
+            ray_retain(tbl);
+            return tbl;
+        }
+    }
+
+    /* MAPCOMMON: each kept row's partition value */
+    for (int64_t c = 0; has_mapc && c < ncols; c++) {
+        ray_t* col = src_cols[c];
+        if (!col || col->type != RAY_MAPCOMMON) continue;
+        ray_t** mc_ptrs = (ray_t**)ray_data(col);
+        ray_t* kv = mc_ptrs[0];
+        ray_t* rc = mc_ptrs[1];
+        if (!kv || !rc || col->len < 2) continue;
+        int64_t n_parts = kv->len;
+        int8_t kv_type = kv->type;
+        size_t esz = (size_t)ray_sym_elem_size(kv_type, kv->attrs);
+        const char* kdata = (const char*)ray_data(kv);
+        const int64_t* counts = (const int64_t*)ray_data(rc);
+        ray_t* flat = ray_vec_new(kv_type, pass_count);
+        if (!flat || RAY_IS_ERR(flat)) continue;
+        flat->len = pass_count;
+        char* out_mc = (char*)ray_data(flat);
+        for (int64_t i = 0; i < pass_count; i++) {
+            int64_t row_i = match_idx[i];
+            int64_t cum = 0;
+            int64_t pi = 0;
+            for (; pi < n_parts - 1; pi++) {
+                cum += counts[pi];
+                if (row_i < cum) break;
+            }
+            memcpy(out_mc + (size_t)i * esz, kdata + (size_t)pi * esz, esz);
+        }
+        new_cols[c] = flat;
     }
 
     /* LIST columns (flat or parted-LIST): gather element pointers with a
@@ -1417,12 +1636,26 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         }
     }
 
-    if (has_parted) {
-        for (int64_t c = 0; c < ncols; c++) {
+    /* Fixed-width columns by runs from the selection's morsels; a flat
+     * column is one segment.  A cancelled dispatch leaves cells unwritten:
+     * the compaction answers the cancel. */
+    bool cancelled = false;
+    for (int64_t c = 0; any_runs && c < ncols && !cancelled; c++) {
+        ray_t* col = src_cols[c];
+        if (!col || !new_cols[c] || !by_runs[c] || RAY_IS_PARTED(col->type)) continue;
+        ray_t* one[1] = { col };
+        int64_t end[1] = { nrows };
+        cancelled = !sel_runs_gather(pool, &plan, one, end, 1, col->type, false, new_cols[c]);
+    }
+
+    if (cancelled) {
+        /* no other gather: the cancel below */
+    } else if (has_parted) {
+        for (int64_t c = 0; c < ncols && !cancelled; c++) {
             ray_t* col = src_cols[c];
             if (!col || !new_cols[c]) continue;
-            if (col->type == RAY_LIST || parted_base_is_list(col))
-                continue;  /* gathered above with retain */
+            if (col->type == RAY_LIST || parted_base_is_list(col) || col->type == RAY_MAPCOMMON)
+                continue;  /* gathered above */
             if (RAY_IS_PARTED(col->type)) {
                 int8_t pbase = (int8_t)RAY_PARTED_BASETYPE(col->type);
                 if (pbase == RAY_STR) {
@@ -1432,10 +1665,10 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                                                            match_idx, pass_count,
                                                            cnt, ncnt);
                 } else {
-                    sel_parted_gather(pool, col, match_idx, pass_count, new_cols[c],
-                                      cnt, ncnt);
+                    cancelled = !sel_parted_gather(pool, &plan, col, any_runs && by_runs[c], match_idx,
+                                                   new_cols[c], cnt, ncnt);
                 }
-            } else {
+            } else if (!(any_runs && by_runs[c])) {
                 uint8_t esz = col_esz(col);
                 char* src = (char*)ray_data(col);
                 char* dst = (char*)ray_data(new_cols[c]);
@@ -1443,20 +1676,16 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
                     memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
             }
         }
-    } else if (ray_pool_par_dispatch_ok(pool, pass_count, RAY_PARALLEL_THRESHOLD)) {
+    } else if (match_idx && ray_pool_par_dispatch_ok(pool, pass_count, RAY_PARALLEL_THRESHOLD)) {
         /* Batched multi-column gather: fill mgctx with up to MGATHER_MAX_COLS
          * kept columns, dispatch, then continue with the next batch.  This is
          * column-count-agnostic — no per-column fallback. */
         multi_gather_ctx_t mgctx = { .idx = match_idx, .ncols = 0 };
         for (int64_t c = 0; c < ncols; c++) {
-            if (!new_cols[c]) continue;
+            if (!new_cols[c] || (any_runs && by_runs[c])) continue;
             ray_t* col = src_cols[c];
             if (!col) continue;                   /* generation 2: gathered above */
-            if (col->type == RAY_LIST) continue;  /* gathered above with retain */
-            /* RAY_MAPCOMMON is not skipped here: the pre-alloc loop above already
-             * materialized it to a flat new_cols[c], so col_esz returns 0 and the
-             * gather is a no-op.  exec_filter adds an explicit continue for clarity;
-             * sel_compact relies on the 0-byte no-op instead. */
+            if (col->type == RAY_LIST || col->type == RAY_MAPCOMMON) continue;  /* gathered above */
             int64_t ci = mgctx.ncols;
             mgctx.srcs[ci] = (char*)ray_data(col);
             mgctx.dsts[ci] = (char*)ray_data(new_cols[c]);
@@ -1469,17 +1698,26 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
         }
         if (mgctx.ncols > 0)
             ray_pool_dispatch(pool, multi_gather_fn, &mgctx, pass_count);
-    } else {
+    } else if (match_idx) {
         for (int64_t c = 0; c < ncols; c++) {
             ray_t* col = src_cols[c];
-            if (!col || !new_cols[c]) continue;
-            if (col->type == RAY_LIST) continue;  /* gathered above with retain */
+            if (!col || !new_cols[c] || (any_runs && by_runs[c])) continue;
+            if (col->type == RAY_LIST || col->type == RAY_MAPCOMMON) continue;  /* gathered above */
             uint8_t esz = col_esz(col);
             char* src = (char*)ray_data(col);
             char* dst = (char*)ray_data(new_cols[c]);
             for (int64_t i = 0; i < pass_count; i++)
                 memcpy(dst + i * esz, src + match_idx[i] * esz, esz);
         }
+    }
+
+    if (cancelled) {
+        for (int64_t c = 0; c < ncols; c++)
+            if (new_cols[c]) ray_release(new_cols[c]);
+        ray_release(out);
+        scratch_free(idx_hdr);
+        scratch_free(plan_hdr);
+        return ray_error("cancel", NULL);
     }
 
     for (int64_t c = 0; c < ncols; c++) {
@@ -1500,7 +1738,7 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
             if (scol->type == RAY_SYM && !(scol->attrs & RAY_ATTR_SLICE) && new_cols[c]->type == RAY_SYM &&
                 (new_cols[c]->attrs & RAY_SYM_W_MASK) == (scol->attrs & RAY_SYM_W_MASK))
                 sym_gather_set_nulls(new_cols[c], pass_count, pool);
-            else
+            else if (match_idx)   /* built whenever such a column may hold nulls */
                 col_propagate_nulls_gather(new_cols[c], scol, match_idx, pass_count);
         }
         /* SYM gathers above copied cell ids verbatim — resolve over the
@@ -1513,5 +1751,6 @@ ray_t* sel_compact(ray_graph_t* g, ray_t* tbl, ray_t* sel,
     }
 
     scratch_free(idx_hdr);
+    scratch_free(plan_hdr);
     return out;
 }

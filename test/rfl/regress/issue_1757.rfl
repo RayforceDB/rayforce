@@ -1,0 +1,35 @@
+;; #1757: sel_compact gathers a fixed-width column's kept rows from the
+;; selection's morsels, a run of consecutive kept rows as one copy, and
+;; builds the kept rows' int64 index only for a column that still reads it.
+;; Partitions of 20000 rows, so some morsels of the selection cross a
+;; partition's end.
+(.sys.exec "rm -rf /tmp/rf_issue_1757 && mkdir -p /tmp/rf_issue_1757") -- 0
+(set n 20000)
+(set mk (fn [p] (table [k f a b c] (list (+ (* p n) (til n)) (at ['x 'y 'z 'u 'v 'w 'r 's 'p 'o] (% (til n) 10)) (til n) (as 'I16 (% (til n) 7)) (as 'I32 (* 2 (til n)))))))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1757/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1757/.sym")) (til 8))
+(set P (.db.parted.get "/tmp/rf_issue_1757/" 't))
+(set F (select {from: P}))
+;; the kept rows of a parted table, scattered, dense, clustered and
+;; alternating, as those of the same table in memory
+(select {from: P where: (< (% (* k 7919) 10) 1) k: k f: f b: b c: c}) -- (select {from: F where: (< (% (* k 7919) 10) 1) k: k f: f b: b c: c})
+(select {from: P where: (< (% (* k 7919) 10) 9) k: k f: f b: b c: c}) -- (select {from: F where: (< (% (* k 7919) 10) 9) k: k f: f b: b c: c})
+(select {from: P where: (< (% (/ k 1000) 10) 5) k: k f: f b: b c: c}) -- (select {from: F where: (< (% (/ k 1000) 10) 5) k: k f: f b: b c: c})
+(select {from: P where: (== (% k 2) 0) k: k f: f b: b c: c}) -- (select {from: F where: (== (% k 2) 0) k: k f: f b: b c: c})
+(select {from: P where: (< (% k 1100) 1090) k: k f: f b: b c: c}) -- (select {from: F where: (< (% k 1100) 1090) k: k f: f b: b c: c})
+;; the group under a where: (#1748) on the gathered rows
+(select {from: P where: (< (% (* k 7919) 10) 9) by: k a: (first a) b: (max b) c: (sum c)}) -- (select {from: F where: (< (% (* k 7919) 10) 9) by: k a: (first a) b: (max b) c: (sum c)})
+;; a flat table compacted under a where: for a sort, nulls included
+(set T (table [k a g s] (list (til 50000) (as 'I32 (% (* 7919 (til 50000)) 1000)) (at [1.5 0Nf 2.25] (% (til 50000) 3)) (at ['x 'y 'z] (% (til 50000) 3)))))
+(select {from: T where: (< (% (* k 7919) 10) 7) asc: a}) -- (select {from: (select {from: T where: (< (% (* k 7919) 10) 7) k: k a: a g: g s: s}) asc: a})
+;; a few kept rows (under SEL_RUNS_MIN) gather from the index of the kept
+;; rows, as before #1757, every column
+(select {from: T where: (> k 49996) desc: k}) -- (table [k a g s] (list [49999 49998 49997] (as 'I32 [81 162 243]) [0Nf 1.5 2.25] ['y 'x 'z]))
+(set Wd (table [id c1 c2 c3] (list (til 8) (* 10 (til 8)) (as 'I16 (til 8)) (+ 0.5 (til 8)))))
+(select {from: Wd where: (== (% id 4) 1) desc: id}) -- (table [id c1 c2 c3] (list [5 1] [50 10] (as 'I16 [5 1]) [5.5 1.5]))
+;; the gather keeps its output and the selection, not an int64 index of the
+;; kept rows besides: a projection keeping 9 rows in 10 peaks under 2.5
+;; times its 16 bytes a row (dev built the index: about 3 times)
+(set r (select {from: P where: (!= f 'x) k: k a: a}))
+(set pk (at (.mem.ts (select {from: P where: (!= f 'x) k: k a: a})) 'peak-live-bytes))
+(< pk (* 40 (count r))) -- true
+(.sys.exec "rm -rf /tmp/rf_issue_1757") -- 0
