@@ -2161,6 +2161,32 @@ static ray_t* atomic_map_binary_op_memo(ray_binary_fn fn, uint16_t dag_opcode, r
     map_ctx_t c = { fn, NULL, dag_opcode, left, right };
     return ray_wm_result(&g_map_memo, left, right, tag, map_binary_run, &c);
 }
+/* Let go of a vector a fast path allocated and will not answer with: a
+ * failed ray_vec_new is an owned error, freed (ray_release leaves errors
+ * alone), so falling back to the slow path keeps nothing. */
+static inline void map_drop_vec(ray_t* v) {
+    if (!v) return;
+    if (RAY_IS_ERR(v)) ray_error_free(v); else ray_release(v);
+}
+
+/* A pair of cells the binary map read with collection_elem, one of them an
+ * error: the error the map answers, with what it read released.  An error
+ * read from a typed vector is the map's own (the oom of the cell's atom, or
+ * the type error of a cell it cannot read) and is the answer; a LIST holds
+ * its cells, so an error there is the list's, not the map's, and the
+ * answer is a type error as before. */
+static ray_t* map_cell_error(ray_t* left, int left_coll, ray_t* a, int la,
+                             ray_t* right, int right_coll, ray_t* b, int ra) {
+    bool own_a = left_coll && left->type != RAY_LIST && RAY_IS_ERR(a);
+    bool own_b = right_coll && right->type != RAY_LIST && RAY_IS_ERR(b);
+    if (la && !RAY_IS_ERR(a)) ray_release(a);
+    if (ra && !RAY_IS_ERR(b)) ray_release(b);
+    if (own_a && own_b) ray_error_free(b);
+    if (own_a) return a;
+    if (own_b) return b;
+    return ray_error("type", NULL);
+}
+
 ray_t* atomic_map_binary_op(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     if (RAY_UNLIKELY(map_memo_wanted(left) || map_memo_wanted(right)))
         return atomic_map_binary_op_memo(fn, dag_opcode, left, right);
@@ -2255,9 +2281,9 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
     ray_t* a0 = left_coll  ? collection_elem(left, 0, &la0)  : left;
     ray_t* b0 = right_coll ? collection_elem(right, 0, &ra0) : right;
     ray_t* e0;
-    if (RAY_IS_ERR(a0) || RAY_IS_ERR(b0)) {
-        e0 = ray_error("type", NULL);
-    } else if (is_collection(a0) || is_collection(b0)) {
+    if (RAY_IS_ERR(a0) || RAY_IS_ERR(b0))
+        return map_cell_error(left, left_coll, a0, la0, right, right_coll, b0, ra0);
+    if (is_collection(a0) || is_collection(b0)) {
         e0 = atomic_map_binary(fn, a0, b0);
     } else {
         e0 = fn(a0, b0);
@@ -2501,7 +2527,7 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
                 ray_release(e0);
                 return out;
             }
-            if (out) ray_release(out);
+            map_drop_vec(out);   /* a failed ray_vec_new is an owned error */
             /* Fall through to slow path on allocation failure. */
         }
     }
@@ -2561,7 +2587,7 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
                 return out;
             }
             if (lut_hdr) ray_release(lut_hdr);
-            if (out && !RAY_IS_ERR(out)) ray_release(out);
+            map_drop_vec(out);   /* a failed ray_vec_new is an owned error */
             /* Fall through to slow path on allocation failure. */
         }
     }
@@ -2621,7 +2647,7 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
                 }
                 if (rl_hdr) ray_release(rl_hdr);
                 if (rr_hdr) ray_release(rr_hdr);
-                if (out && !RAY_IS_ERR(out)) ray_release(out);
+                map_drop_vec(out);   /* a failed ray_vec_new is an owned error */
                 /* fall through on OOM */
             }
         } else if ((l_sym_vec && r_sym_atom) || (r_sym_vec && l_sym_atom)) {
@@ -2667,7 +2693,7 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
                     return out;
                 }
                 if (vd_hdr) ray_release(vd_hdr);
-                if (out && !RAY_IS_ERR(out)) ray_release(out);
+                map_drop_vec(out);   /* a failed ray_vec_new is an owned error */
             }
         }
     }
@@ -2713,7 +2739,7 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
                 ray_release(e0);
                 return out;
             }
-            if (out && !RAY_IS_ERR(out)) ray_release(out);
+            map_drop_vec(out);   /* a failed ray_vec_new is an owned error */
         }
     }
 
@@ -2782,8 +2808,11 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
             int la = 0, ra = 0;
             ray_t* a = left_coll  ? collection_elem(left, i, &la)  : left;
             ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
-            ray_t* elem = (RAY_IS_ERR(a) || RAY_IS_ERR(b))
-                         ? ray_error("type", NULL) : fn(a, b);
+            if (RAY_IS_ERR(a) || RAY_IS_ERR(b)) {
+                ray_release(vec);
+                return map_cell_error(left, left_coll, a, la, right, right_coll, b, ra);
+            }
+            ray_t* elem = fn(a, b);
             if (la) ray_release(a);
             if (ra) ray_release(b);
             if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
@@ -2837,7 +2866,8 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
         ray_t* b = right_coll ? collection_elem(right, i, &ra) : right;
         ray_t* elem;
         if (RAY_IS_ERR(a) || RAY_IS_ERR(b)) {
-            elem = ray_error("type", NULL);
+            elem = map_cell_error(left, left_coll, a, la, right, right_coll, b, ra);
+            la = ra = 0;   /* released with the error */
         } else if (is_collection(a) || is_collection(b)) {
             /* Recursive auto-map when list element is itself a collection */
             elem = atomic_map_binary(fn, a, b);
@@ -2872,7 +2902,9 @@ ray_t* ray_list_collapse_bool(ray_t* list) {
     for (int64_t i = 0; i < n; i++)
         if (!e[i] || e[i]->type != -RAY_BOOL) return list;
     ray_t* vec = ray_vec_new(RAY_BOOL, n);
-    if (!vec || RAY_IS_ERR(vec)) return list;
+    /* a B8 vector it could not allocate is the call's oom: the list of
+     * cells is not the answer (and the failure is an owned error) */
+    if (RAY_IS_ERR(vec)) { ray_release(list); return vec; }
     uint8_t* d = (uint8_t*)ray_data(vec);
     for (int64_t i = 0; i < n; i++) d[i] = e[i]->b8 ? 1 : 0;
     vec->len = n;

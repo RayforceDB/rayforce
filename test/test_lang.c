@@ -477,11 +477,7 @@ static test_result_t test_eval_typed_map_oom(void) {
         { "neg I64",   ray_neg_fn,   NULL, "[1 2 3 4 5 6 7 0N]", 1 },
         { "round I32", ray_round_fn, NULL, "(as 'I32 [1 2 3 4 5 6 7 8])", 1 },
         { "sqrt F64",  ray_sqrt_fn,  NULL, "[1.0 4.0 9.0 16.0 25.0 36.0 49.0 64.0]", 1 },
-        /* from the second allocation: the first is the binary map's
-         * first-cell probe, which answers a failed allocation there with a
-         * `type` error and keeps the oom's block, as on dev (outside this
-         * change, which adds nothing before it) */
-        { "div I64",   NULL, ray_idiv_fn,  "[7 -7 0N 5 9 -9 1 -1]", 2 },
+        { "div I64",   NULL, ray_idiv_fn,  "[7 -7 0N 5 9 -9 1 -1]", 1 },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         ray_t* v = ray_eval_str(cases[i].src);
@@ -516,6 +512,103 @@ static test_result_t test_eval_typed_map_oom(void) {
         ray_release(want);
         ray_release(three);
         ray_release(v);
+    }
+    PASS();
+}
+#endif
+
+#ifdef DEBUG
+/* A binary atomic builtin mapped over a collection, with each of its
+ * allocations failed in turn, once and twice running, from the first: the
+ * map's read of the first cells, the cells after it, the result.  The call
+ * answers what it answers unarmed or an oom error, never a `type` error,
+ * and once that is released nothing it allocated is left. */
+typedef struct { const char* name; ray_binary_fn fn; uint16_t op; const char* l; const char* r; } binary_map_oom_case_t;
+
+static bool binary_map_oom_same(ray_t* a, ray_t* b) {
+    if (!a || !b || RAY_IS_ERR(a) || RAY_IS_ERR(b)) return false;
+    ray_t* sa = ray_ser(a);
+    ray_t* sb = ray_ser(b);
+    bool same = sa && sb && !RAY_IS_ERR(sa) && !RAY_IS_ERR(sb) && sa->len == sb->len &&
+                memcmp(ray_data(sa), ray_data(sb), (size_t)sa->len) == 0;
+    if (sa && !RAY_IS_ERR(sa)) ray_release(sa);
+    if (sb && !RAY_IS_ERR(sb)) ray_release(sb);
+    return same;
+}
+
+static test_result_t test_eval_binary_map_oom(void) {
+    static const binary_map_oom_case_t cases[] = {
+        { "div I64 by atom",  ray_idiv_fn, 0,      "[7 -7 0N 5 9 -9 1 -1]", "3" },
+        { "div atom by I64",  ray_idiv_fn, 0,      "7", "[2 -2 0 0N 1 -1 7 -7]" },
+        { "div I32 by I16",   ray_idiv_fn, 0,      "(as 'I32 [7 -7 5])", "(as 'I16 [2 3 0])" },
+        { "div list",         ray_idiv_fn, 0,      "(list 7 2.5 0N)", "2" },
+        { "+ I64",            ray_add_fn,  OP_ADD, "[1 2 3]", "10" },
+        { "+ list",           ray_add_fn,  OP_ADD, "(list 1 2.5 3)", "1" },
+        { "- I16 atom left",  ray_sub_fn,  OP_SUB, "1h", "(as 'I16 [1 2 3])" },
+        { "* F64 by I64",     ray_mul_fn,  OP_MUL, "[1.5 2.5 3.5]", "[1 2 3]" },
+        { "/ I64",            ray_div_fn,  OP_DIV, "[1 2 3]", "2" },
+        { "% I64",            ray_mod_fn,  OP_MOD, "[7 -7 5]", "3" },
+        { "% list",           ray_mod_fn,  OP_MOD, "(list 7 -7.5 5)", "3" },
+        { "min list",         ray_min2_fn, 0,      "(list 1 2.5 3)", "2" },
+        { "max I32",          ray_max2_fn, 0,      "(as 'I32 [1 5 3])", "2i" },
+        { "< I64",            ray_lt_fn,   OP_LT,  "[1 2 3]", "2" },
+        { "== sym by atom",   ray_eq_fn,   OP_EQ,  "['a 'b 'a]", "'a" },
+        { "!= sym by sym",    ray_neq_fn,  OP_NE,  "['a 'b 'a]", "['b 'b 'c]" },
+        { "< sym by atom",    ray_lt_fn,   OP_LT,  "['a 'b 'c]", "'b" },
+        { ">= sym by sym",    ray_gte_fn,  OP_GE,  "['a 'b 'c]", "['c 'b 'a]" },
+        { "== str by atom",   ray_eq_fn,   OP_EQ,  "[\"ab\" \"cd\" \"ab\"]", "\"ab\"" },
+        { "< str by str",     ray_lt_fn,   OP_LT,  "[\"ab\" \"cd\" \"ef\"]", "[\"cd\" \"cd\" \"ab\"]" },
+        { "== guid",          ray_eq_fn,   OP_EQ,  "(guid 3)", "(guid 3)" },
+        { "== list",          ray_eq_fn,   OP_EQ,  "(list 1 2.5 1)", "1" },
+        { "!= str",           ray_neq_fn,  OP_NE,  "(list \"ab\" \"cd\")", "\"ab\"" },
+        { "pow I64",          ray_pow_fn,  OP_POW, "[1 2 3]", "2" },
+        { "fill F64",         ray_fill_fn, 0,      "0.0", "[1.0 0Nf 3.0]" },
+        { "+ date by I64",    ray_add_fn,  OP_ADD, "(as 'DATE [1 2 3])", "1" },
+        /* B8 cells: the DAG takes no BOOL, so every cell goes through the
+         * per-cell loops, the first and the later ones */
+        { "div B8 by B8",     ray_idiv_fn, 0,      "[true false true true]", "true" },
+        { "div I64 by B8",    ray_idiv_fn, 0,      "[7 8 9 10]", "[true true false true]" },
+        { "+ B8 by I64",      ray_add_fn,  OP_ADD, "[true false true true]", "1" },
+        { "* B8 by B8",       ray_mul_fn,  OP_MUL, "[true false true]", "[false true true]" },
+        { "- I64 by B8",      ray_sub_fn,  OP_SUB, "5", "[true false true]" },
+        { "% B8 by I64",      ray_mod_fn,  OP_MOD, "[true false true]", "2" },
+        { "== B8 by B8",      ray_eq_fn,   OP_EQ,  "[true false true]", "[true true false]" },
+        { "< B8 by atom",     ray_lt_fn,   OP_LT,  "[true false true]", "true" },
+        { "max B8 by B8",     ray_max2_fn, 0,      "[true false true]", "[false false true]" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ray_t* l = ray_eval_str(cases[i].l);
+        ray_t* r = ray_eval_str(cases[i].r);
+        TEST_ASSERT(l && r && !RAY_IS_ERR(l) && !RAY_IS_ERR(r), cases[i].name);
+        ray_t* want = atomic_map_binary_op(cases[i].fn, cases[i].op, l, r);
+        TEST_ASSERT(want && !RAY_IS_ERR(want), cases[i].name);
+        for (int64_t nth = 1; nth <= 16; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                ray_heap_gc();
+                TEST_ASSERT_TRUE(ray_mem_trace_begin());
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* got = atomic_map_binary_op(cases[i].fn, cases[i].op, l, r);
+                ray_alloc_fail_set_for_test(0, 0);
+                const char* code = got && RAY_IS_ERR(got) ? ray_err_code(got) : NULL;
+                bool ok = got && (code ? strcmp(code, "oom") == 0
+                                       : binary_map_oom_same(got, want));
+                if (got && RAY_IS_ERR(got)) ray_error_free(got); else if (got) ray_release(got);
+                ray_error_clear();
+                ray_heap_gc();
+                ray_mem_trace_t t;
+                ray_mem_trace_end(&t);
+                if (!ok || t.net_bytes != 0)
+                    fprintf(stderr, "  %s: allocation %lld failed x%lld: %s, %lld bytes left\n",
+                            cases[i].name, (long long)nth, (long long)count,
+                            ok ? "answer ok" : code ? code : "wrong answer",
+                            (long long)t.net_bytes);
+                TEST_ASSERT(ok, cases[i].name);
+                TEST_ASSERT(t.net_bytes == 0, cases[i].name);
+            }
+        }
+        ray_release(want);
+        ray_release(l);
+        ray_release(r);
     }
     PASS();
 }
@@ -15892,6 +15985,7 @@ const test_entry_t lang_entries[] = {
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
 #ifdef DEBUG
+    { "lang/eval/binary_map_oom", test_eval_binary_map_oom, lang_setup, lang_teardown },
     { "lang/eval/typed_map_oom", test_eval_typed_map_oom, lang_setup, lang_teardown },
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
     { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
