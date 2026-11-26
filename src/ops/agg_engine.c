@@ -8370,14 +8370,14 @@ static void agg_ord_fill_fn(void* raw, uint32_t wid, int64_t start, int64_t end)
  * One the direct cache will not keep (ray_raw_transient_bytes: over its
  * budget) is unmapped at once, and that munmap is single-threaded: it
  * walked 5.6M page-table entries for 3.5 s of a 13 s query on the 23 GB
- * payload of a 1B-row grouping.  The heap maps such a block 2 MB-aligned
- * and advised for huge pages, which makes that unmap short; on a kernel
- * with transparent huge pages off (ray_raw_transient_bytes says which) the
- * workers drop its pages first instead, a 2 MB slice a task, and the unmap
- * finds them gone.  The first slice holds the headers and is left to the
- * unmap, as is the tail.  Linux only: elsewhere the free alone.  Kept
- * noinline, out of the hot bodies of its callers (see
- * agg_radix_select_first_n). */
+ * payload of a 1B-row grouping.  The heap maps such a block advised for
+ * huge pages where the kernel has them free, which makes that unmap short;
+ * a block in small pages (ray_raw_transient_bytes says which: transparent
+ * huge pages off, or too few free) has its pages dropped by the workers
+ * first instead, a 2 MB slice a task, and the unmap finds them gone.
+ * The first slice holds the headers and is left to the unmap, as is the
+ * tail.  Linux only: elsewhere the free alone.  Kept noinline, out of the
+ * hot bodies of its callers (see agg_radix_select_first_n). */
 #if defined(RAY_OS_LINUX)
 #define AGG_FREE_SLICE ((uintptr_t)2 << 20)
 typedef struct { uintptr_t lo, hi; } agg_free_ctx_t;

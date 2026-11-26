@@ -2861,42 +2861,80 @@ static test_result_t test_parted_flatten_into_bounds(void) {
     PASS();
 }
 
+#if defined(RAY_OS_LINUX) && defined(DEBUG)
+/* A one-node /proc/buddyinfo with `pmds` free blocks of the PMD order and
+ * the low orders full, for ray_vm_test_buddyinfo_path_set. */
+static bool ae_buddy_write(const char* path, long long pmds) {
+    size_t pg = ray_vm_page_size(), pmd = ray_vm_pmd_size();
+    if (pmd <= pg) return false;
+    int po = 0;
+    while ((pg << po) < pmd) po++;
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+    fprintf(f, "Node 0, zone   Normal ");
+    for (int o = 0; o < (po + 1 > 11 ? po + 1 : 11); o++)
+        fprintf(f, "%6lld ", o < po ? 87078ll : o == po ? pmds : 0ll);
+    fprintf(f, "\n");
+    return fclose(f) == 0;
+}
+/* Whether this kernel takes MADV_HUGEPAGE (built with transparent huge
+ * pages). */
+static bool ae_kernel_advises(void) {
+    size_t pmd = ray_vm_pmd_size();
+    void* p = pmd ? ray_vm_alloc_aligned(pmd, pmd) : NULL;
+    if (!p) return false;
+    bool ok = ray_vm_hugepage(p, pmd);
+    ray_vm_free(p, pmd);
+    return ok;
+}
+#endif
+
 /* A radix grouping whose input-sized blocks (the payload, the order map)
  * are over the direct cache's budget has its workers drop their pages ahead
- * of the free (agg_free_input_sized) on a kernel with transparent huge
- * pages off, taken so by a test seam.  On a 2 GB budget (a 128 MB cache),
- * taken for a big one by the test seam (48 GB and up otherwise), 8M
- * distinct keys take that path, and the answer is still each row its own
- * group, in first-seen order.  With huge pages on the blocks go to the
- * free alone.
+ * of the free (agg_free_input_sized) when the blocks are in small pages:
+ * here with transparent huge pages on (a test seam) and no PMD pages free,
+ * the shape of a fragmented box (a buddyinfo fixture).  On a 2 GB budget (a
+ * 128 MB cache), taken for a big one by the test seam (48 GB and up
+ * otherwise), 8M distinct keys take that path, and the answer is still
+ * each row its own group, in first-seen order.  With PMD pages free the
+ * blocks are advised for huge pages and go to the free alone.
  * The blocks are still freed: a grouping whose result is dropped leaves
  * none of them committed. */
 static test_result_t test_group_radix_transient_release(void) {
 #if !defined(RAY_OS_LINUX) || !defined(DEBUG)
     SKIP("the early page release is Linux only; its counter is DEBUG");
 #else
+    if (!ae_kernel_advises()) SKIP("this kernel has no transparent huge pages");
+    char path[512];
+    snprintf(path, sizeof(path), "%s", ray_test_tmp(AE_TMP "/buddyinfo"));
+    bool w = ae_buddy_write(path, 0);   /* none free */
+    ray_vm_test_buddyinfo_path_set(path);
     ae_eval_ok("(set n 8000000)");
     ae_eval_ok("(set T (table [k v] (list (% (* (til n) 2654435761) 1000000007) (% (til n) 3))))");
     ray_heap_direct_cache_drain();
     int64_t previous = ray_heap_anon_watermark();
     bool    was_lock = ray_heap_set_lock(false);   /* MADV_DONTNEED refuses a locked block */
     ray_heap_set_anon_watermark(INT64_C(2) << 30);
-    ray_heap_test_direct_thp(0);
+    ray_heap_test_direct_thp(1);
     /* a 2 GB budget leaves its blocks to the free... */
     int64_t t1 = ray_heap_direct_transient_count();
     ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
     int64_t t1s = ray_heap_direct_transient_count();
     ae_eval_ok("(set rb 0)");
-    /* ...unless the seam counts it as a big one */
+    /* ...unless the seam counts it as a big one: no PMD pages free, so
+     * small pages, released early */
     ray_heap_test_direct_huge_min_budget(INT64_C(2) << 30);
+    int64_t h1 = ray_heap_direct_huge_count();
     ae_eval_ok("(set rb (select {from: T by: k e: (max v)}))");
     int64_t t2 = ray_heap_direct_transient_count();
-    /* ...and the huge pages are off */
-    ray_heap_test_direct_thp(1);
+    int64_t h2 = ray_heap_direct_huge_count();
+    /* ...and with PMD pages free, advised and left to the free */
+    w &= ae_buddy_write(path, 1000000);
     ae_eval_ok("(set rd (select {from: T by: k e: (max v)}))");
     int64_t t2h = ray_heap_direct_transient_count();
+    int64_t h3 = ray_heap_direct_huge_count();
     ae_eval_ok("(set rd 0)");
-    ray_heap_test_direct_thp(0);
+    w &= ae_buddy_write(path, 0);
     /* once more, its result dropped: it leaves nothing committed */
     ray_heap_direct_cache_drain();
     int64_t committed_rb = ray_heap_anon_committed();
@@ -2905,6 +2943,7 @@ static test_result_t test_group_radix_transient_release(void) {
     ae_eval_ok("(set rc 0)");
     ray_heap_direct_cache_drain();
     int64_t committed_end = ray_heap_anon_committed();
+    ray_vm_test_buddyinfo_path_set(NULL);
     ray_heap_test_direct_huge_min_budget(0);
     ray_heap_test_direct_thp(-1);
     ray_heap_set_lock(was_lock);
@@ -2916,9 +2955,12 @@ static test_result_t test_group_radix_transient_release(void) {
     int64_t ng = groups && !RAY_IS_ERR(groups) ? groups->i64 : -1;
     ae_drop(same); ae_drop(groups);
     ae_eval_ok("(set T 0) (set rb 0)");
+    TEST_ASSERT(w, "buddyinfo fixtures written");
     TEST_ASSERT_EQ_I(ng, 8000000);
     TEST_ASSERT_EQ_I(t1s - t1, 0);    /* a small budget does not release early */
-    TEST_ASSERT_EQ_I(t2h - t2, 0);    /* nor do huge pages */
+    TEST_ASSERT_EQ_I(h2 - h1, 0);     /* no PMD pages free: no advice */
+    TEST_ASSERT(h3 - h2 >= 1, "with PMD pages free an input-sized block is advised");
+    TEST_ASSERT_EQ_I(t2h - t2, 0);    /* an advised block is not released early */
     TEST_ASSERT(t2 - t1s >= 1 && t3 - t2h >= 1, "an input-sized block was released ahead of its free");
     TEST_ASSERT(ok, "each row is its own group, in order");
     /* The released blocks were unmapped.  Each is over the 128 MB cache

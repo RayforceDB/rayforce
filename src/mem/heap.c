@@ -1944,7 +1944,7 @@ static int64_t direct_cache_bytes(void) {
  * work: a fault per 4 KB page, each zeroing its page, and one
  * single-threaded munmap walking every page-table entry — 3.5 s of a 13 s
  * query for the 23 GB radix payload of a 1B-row grouping (6M faults, 5.6M
- * entries).  Mapped 2 MB-aligned and advised MADV_HUGEPAGE, the same block
+ * entries).  Mapped PMD-aligned and advised MADV_HUGEPAGE, the same block
  * takes 512 times fewer faults and entries; that query ran 13.1 → 8.5 s.
  * A block the cache keeps pays its faults once and is never unmapped, so
  * the advice is not given there — and not everywhere, as THP on every
@@ -1954,21 +1954,37 @@ static int64_t direct_cache_bytes(void) {
  * blocks as they were, huge pages and early page release
  * (ray_raw_transient_bytes) alike.  A 32 GB box ran the 100M-row random
  * query set (4 clients) the same with the advice and without (165 s), so
- * it gains nothing there for the risk it takes: with THP defrag at
- * "madvise" a huge-page fault compacts or reclaims synchronously, and a
- * small box is the one whose memory is full of page cache and fragmented.
- * The
- * alignment costs no memory — the surplus of the mapping is unmapped
+ * it gains nothing there for the risk it takes.
+ *
+ * And only where the kernel has the huge pages free now.  With THP defrag
+ * at "madvise" each fault of an advised range the kernel cannot give a
+ * huge page compacts synchronously first, in the faulting thread, and then
+ * falls back to small pages: on a 62 GB box whose free memory was
+ * fragmented the kernel refused ~10,400 of a grouping's huge pages and
+ * granted ~900, the process's system time rose 21 → 58 s and the query
+ * ran 15-40% slower than with no advice.  So the block is advised only if
+ * every NUMA node holds, in free blocks of a PMD page or larger
+ * (/proc/buddyinfo), half again its share of the block and of the advised
+ * blocks still live (g_direct_huge_outstanding) — the workers that fault
+ * the block in run on every node.  Read for each such block (a few per
+ * query, tens of microseconds each).  Whatever cannot be read, or an
+ * advice the kernel refuses, leaves the plain mapping.
+ *
+ * The alignment costs no memory — the surplus of the mapping is unmapped
  * (ray_vm_alloc_aligned) and map_size stays page-rounded, so the cache
  * fits such a block as any other should the budget rise before it is
  * freed.  Linux only. */
-#define RAY_DIRECT_HUGE             ((size_t)2 << 20)
 #define RAY_DIRECT_HUGE_MIN_BUDGET  (INT64_C(48) << 30)
+/* Bytes of the live direct blocks advised for huge pages. */
+static _Atomic(int64_t) g_direct_huge_outstanding;
 #ifdef DEBUG
 static _Atomic(int64_t) g_direct_huge_count, g_direct_transient_count;
 static _Atomic(int64_t) g_direct_huge_min_budget = RAY_DIRECT_HUGE_MIN_BUDGET;
 int64_t ray_heap_direct_huge_count(void) {
     return atomic_load_explicit(&g_direct_huge_count, memory_order_relaxed);
+}
+int64_t ray_heap_direct_huge_outstanding(void) {
+    return atomic_load_explicit(&g_direct_huge_outstanding, memory_order_relaxed);
 }
 int64_t ray_heap_direct_transient_count(void) {
     return atomic_load_explicit(&g_direct_transient_count, memory_order_relaxed);
@@ -1995,15 +2011,31 @@ static bool direct_thp_enabled(void) {
 static bool direct_big_budget(void) {
     return ray_heap_mem_budget() >= DIRECT_HUGE_MIN_BUDGET();
 }
+/* A block that would take huge pages, should the kernel have them free. */
 static bool direct_huge_wanted(size_t map_size) {
 #if defined(RAY_OS_LINUX)
-    if (!direct_big_budget()) return false;
-    return map_size > direct_cache_budget();
+    if (!direct_big_budget() || map_size <= direct_cache_budget()) return false;
+    return direct_thp_enabled() && ray_vm_pmd_size() != 0;
 #else
     (void)map_size;
     return false;
 #endif
 }
+#if defined(RAY_OS_LINUX)
+/* Whether every node's free blocks of a PMD page or larger hold half again
+ * its share of `want` bytes: 2·n·free >= 3·want.  False when buddyinfo
+ * cannot tell.  Out of line: its node array stays off the allocator's
+ * frame. */
+static __attribute__((noinline)) bool direct_huge_room(int64_t want) {
+    int64_t free_b[RAY_VM_MAX_NODES];
+    int n = ray_vm_free_huge_bytes(free_b, RAY_VM_MAX_NODES);
+    if (n <= 0 || want < 0) return false;
+    for (int i = 0; i < n; i++)
+        if ((unsigned __int128)free_b[i] * 2u * (unsigned)n < (unsigned __int128)want * 3u)
+            return false;
+    return true;
+}
+#endif
 
 /* Direct large allocation: mmap the exact page-rounded size instead of a
  * power-of-2 oversized buddy pool.  Returns a marked ray_t or NULL on failure. */
@@ -2021,6 +2053,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cach
     size_t cached_size = 0;
     bool locked = false;
     bool fresh = true;
+    bool hdr_huge = false;
     base = direct_cache_take(map_size, exact_cache ? map_size : SIZE_MAX, &cached_size, &locked);
     if (base) {
         map_size = cached_size;
@@ -2040,12 +2073,21 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cach
          * (heap_make_room). */
         bool force_file = heap_anon_would_exceed(map_size) && heap_make_room(map_size);
         bool huge = !force_file && direct_huge_wanted(map_size);
+#if defined(RAY_OS_LINUX)
         if (huge) {
-            base = ray_vm_alloc_aligned(map_size, RAY_DIRECT_HUGE);   /* anon RW, 2 MB-aligned, counted */
-            /* Refused the alignment's extra 2 MB of address space: the
-             * plain mapping below, as the block would take on a small budget. */
-            if (!base) huge = false;
+            /* Counted before the kernel is asked, so blocks mapped at once
+             * see each other; given back below unless the advice is taken. */
+            int64_t want = atomic_fetch_add_explicit(&g_direct_huge_outstanding, (int64_t)map_size,
+                                                     memory_order_relaxed) + (int64_t)map_size;
+            /* anon RW, PMD-aligned, counted.  Refused the alignment's extra
+             * address space: the plain mapping below. */
+            if (direct_huge_room(want)) base = ray_vm_alloc_aligned(map_size, ray_vm_pmd_size());
+            if (!base) {
+                huge = false;
+                atomic_fetch_sub_explicit(&g_direct_huge_outstanding, (int64_t)map_size, memory_order_relaxed);
+            }
         }
+#endif
         if (!base && !force_file)
             base = ray_vm_alloc(map_size);   /* anon RW, page-aligned, counted */
         if (!base) {
@@ -2055,12 +2097,16 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cach
             if (!base && force_file) base = ray_vm_alloc(map_size);
             if (!base) return NULL;
         }
-        if (huge && swap_fd < 0) {   /* the aligned anonymous mapping */
-            ray_vm_hugepage(base, map_size);
+        if (huge) {   /* the aligned anonymous mapping */
+            huge = ray_vm_hugepage(base, map_size);
+            if (!huge)
+                atomic_fetch_sub_explicit(&g_direct_huge_outstanding, (int64_t)map_size, memory_order_relaxed);
 #ifdef DEBUG
-            atomic_fetch_add_explicit(&g_direct_huge_count, 1, memory_order_relaxed);
+            else
+                atomic_fetch_add_explicit(&g_direct_huge_count, 1, memory_order_relaxed);
 #endif
         }
+        hdr_huge = huge;
         if (swap_fd < 0 && !force_file)   /* under the watermark */
             locked = heap_lock(base, map_size);
         if (swap_fd < 0)   /* anonymous: counts toward the RAM watermark */
@@ -2075,6 +2121,7 @@ static ray_t* heap_alloc_direct(ray_heap_t* h, size_t data_size, bool exact_cach
     hdr->locked    = locked;
     hdr->swap_path = swap_path;
     hdr->fresh     = fresh;
+    hdr->huge      = hdr_huge;
 
     ray_t* v = (ray_t*)((char*)base + RAY_DIRECT_HDR);
     memset(v, 0, 32);
@@ -2423,6 +2470,9 @@ RAY_INLINE void ray_free_block(ray_t* v) {
         int    swap_fd   = hdr->swap_fd;
         bool   locked    = hdr->locked != 0;
         char*  swap_path = hdr->swap_path;
+        if (hdr->huge)   /* read before the cache's links overlay the header */
+            atomic_fetch_sub_explicit(&g_direct_huge_outstanding, (int64_t)map_size,
+                                      memory_order_relaxed);
         mem_trace_note_free(map_size);
         if (h) RAY_STAT(h->stats.free_count++);
         atomic_fetch_sub_explicit(&g_direct_bytes, (int64_t)map_size, memory_order_relaxed);
@@ -2794,14 +2844,13 @@ size_t ray_raw_transient_bytes(const void* p) {
     /* A locked block's pages go with munmap's own unlock walk, which a
      * madvise cannot shorten (MADV_DONTNEED refuses a locked range).  A
      * small budget's blocks are left to the free (direct_huge_wanted).
-     * Where the kernel grants the huge pages the block was advised for,
-     * the munmap is short already (a 4 GB block: 18 ms) and the release
-     * only adds its dispatch (30-37 ms in all; a 1B-row grouping ran the
-     * same either way), so the release is for a kernel with transparent
-     * huge pages off: there it cut a 4 GB block's free from 440 to 295 ms
-     * and the 1B-row grouping from 13.2 to 11 s. */
-    if (hdr->locked || hdr->map_size <= direct_cache_budget() || !direct_big_budget()
-        || direct_thp_enabled())
+     * A block advised for huge pages has its munmap short already (a 4 GB
+     * block: 18 ms) and the release would only add its dispatch (30-37 ms
+     * in all; a 1B-row grouping ran the same either way), so the release
+     * is for a block in small pages — transparent huge pages off, or too
+     * few free when it was mapped: there it cut a 4 GB block's free from
+     * 440 to 295 ms and the 1B-row grouping from 13.2 to 11 s. */
+    if (hdr->locked || hdr->huge || hdr->map_size <= direct_cache_budget() || !direct_big_budget())
         return 0;
 #ifdef DEBUG
     atomic_fetch_add_explicit(&g_direct_transient_count, 1, memory_order_relaxed);
