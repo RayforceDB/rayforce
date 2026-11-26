@@ -188,7 +188,7 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     }
 
     insp_dict_t d;
-    insp_init(&d, 12);
+    insp_init(&d, 15);
     ray_retain(name);
     insp_put(&d, "name", name);
     insp_put(&d, "bound", ray_bool(v != NULL));
@@ -202,6 +202,21 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     insp_put(&d, "summary", summary ? ray_str(summary, strlen(summary)) : ray_str("", 0));
     insp_put(&d, "builtin", own >= 0 ? ray_sym(own) : insp_sym(""));
     insp_put(&d, "restricted", ray_bool(builtin && (v->attrs & RAY_FN_RESTRICTED)));
+    /* how it treats a collection, from what the engine records (#1744):
+     * atomic, the evaluator maps it over vectors and lists itself; per
+     * argument, whether that argument maps a vector element by element
+     * (the row-shape record, at the arity it describes); aggregate, it
+     * reduces.  Nothing for anything that is not a builtin. */
+    insp_put(&d, "atomic", ray_bool(builtin && (v->attrs & RAY_FN_ATOMIC)));
+    int64_t na = builtin ? ray_fn_row_arity(v) : 0;
+    ray_t* ew = ray_vec_new(RAY_BOOL, na);
+    if (ew && !RAY_IS_ERR(ew)) {
+        for (int64_t i = 0; i < na; i++)
+            ((uint8_t*)ray_data(ew))[i] = ray_fn_row_arg(v, na, i + 1) ? 1 : 0;
+        ew->len = na;
+    }
+    insp_put(&d, "elementwise", ew);
+    insp_put(&d, "aggregate", ray_bool(builtin && (v->attrs & RAY_FN_AGGR)));
     if (v) ray_release(v);
     return insp_done(&d);
 }

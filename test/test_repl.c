@@ -1608,7 +1608,7 @@ static test_result_t test_repl_run_piped_help_full(void) {
  * Bare `:h` and `:help` still list the commands, `:h` among them. */
 static test_result_t test_repl_help_name(void) {
     const char* defs[] = { "(set zhn_add (fn [a b] (+ a b)))", "(set zhn_m min)",
-                           "(set zhn_x 5)", "(set zhn_none0 (fn [] 1))" };
+                           "(set zhn_x 5)", "(set zhn_plus +)", "(set zhn_none0 (fn [] 1))" };
     for (size_t i = 0; i < sizeof defs / sizeof defs[0]; i++) {
         ray_t* r = ray_eval_str(defs[i]);
         TEST_ASSERT_FMT(r && !RAY_IS_ERR(r), "%s failed", defs[i]);
@@ -1620,7 +1620,7 @@ static test_result_t test_repl_help_name(void) {
     const char* cmds[] = { "h min", "help zhn_add", "h 'zhn_m", "h if", "h .sys.exec",
                            "h .ipc.open", "h zhn_x", "h zhn_nosuch", "h zhn_none0",
                            "h a b", "h", "help", "h .sys.querylog.enable", "h .sys.profile.reset",
-                           "h .ipc", "h true" };
+                           "h .ipc", "h true", "h zhn_plus", "h in" };
     char path[256];
     char buf[8192];
     int saved = cap_begin(path, sizeof path);
@@ -1635,10 +1635,10 @@ static test_result_t test_repl_help_name(void) {
     TEST_ASSERT_TRUE(all_null);
     const char* want[] = {
         /* the usage lines, then the summary right under them */
-        "min: builtin (unary)\n  (min <x: vector, atom or list>)\n  (min <a: num> <b: num>)\n  Reduce one vector, or choose the element-wise minimum of two values",
+        "min: builtin (unary), aggregate\n  (min <x: vector, atom or list>)\n  (min <a: num> <b: num>)\n  Reduce one vector, or choose the element-wise minimum of two values",
         "zhn_add: lambda\n  (zhn_add a b)\n",
-        "zhn_m: builtin min (unary)\n  (min <x: vector, atom or list>)\n",
-        "if: builtin (vary), special form\n  (if <cond: bool or bool vector>",
+        "zhn_m: builtin min (unary), aggregate\n  (min <x: vector, atom or list>)\n",
+        "if: builtin (vary), special form, element-wise\n  (if <cond: bool or bool vector>",
         ".sys.exec: builtin (vary), restricted under -U\n  (.sys.exec <command: str> [<mode: sym, 'out>])\n",
         ".ipc.open: builtin (vary), restricted under -U\n  (.ipc.open <address: str, \"host:port[:user:password]\">",
         "zhn_x: a value, not a function\n",
@@ -1651,6 +1651,8 @@ static test_result_t test_repl_help_name(void) {
         ".ipc: namespace of ",
         "; :h .ipc.<name> for one of them\n",
         "true: a literal (b8)\n",
+        "zhn_plus: builtin + (binary), atomic\n",
+        "in: builtin (binary), element-wise in argument 1\n",
     };
     for (size_t i = 0; i < sizeof want / sizeof want[0]; i++)
         TEST_ASSERT_FMT(strstr(buf, want[i]) != NULL, "no \"%s\" in:\n%.1500s", want[i], buf);
