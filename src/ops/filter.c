@@ -1008,12 +1008,78 @@ static void parted_runs_fn(void* raw, uint32_t wid, int64_t start, int64_t end) 
         if (c->idx[start] < c->seg_ends[mid]) hi = mid; else lo = mid + 1;
     }
     int64_t seg = lo;
+    /* The cell size once, and each segment's data and bounds once per
+     * segment: a scattered selection is mostly runs of one cell (#1748). */
+    size_t esz = ray_sym_elem_size(c->base, c->out_attrs);
+    bool all_plain = c->base != RAY_SYM;
+    if (!all_plain) {
+        all_plain = true;
+        for (int64_t k = 0; k < c->n_segs && all_plain; k++)
+            all_plain = ((c->segs[k]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
+    }
+    /* Every segment at the output's width, a cell of 1, 2, 4 or 8 bytes: a
+     * typed move a cell, a run of the rows that follow by one copy. */
+#define PARTED_RUNS_TYPED(T) do {                                                      \
+        T* out = (T*)(void*)c->dst;                                                    \
+        int64_t s0 = seg > 0 ? c->seg_ends[seg - 1] : 0, s1 = c->seg_ends[seg];        \
+        const T* in = (const T*)ray_data(c->segs[seg]);                                \
+        for (int64_t i = start; i < end; ) {                                           \
+            int64_t row = c->idx[i];                                                   \
+            if (row >= s1 && seg < c->n_segs - 1) {                                    \
+                while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;          \
+                s0 = seg > 0 ? c->seg_ends[seg - 1] : 0; s1 = c->seg_ends[seg];        \
+                in = (const T*)ray_data(c->segs[seg]);                                 \
+            }                                                                          \
+            if (i + 1 < end && c->idx[i + 1] == row + 1 && row + 1 < s1) {             \
+                int64_t j = i + 2;                                                     \
+                while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < s1) j++;   \
+                memcpy(out + i, in + (row - s0), (size_t)(j - i) * sizeof(T));         \
+                i = j;                                                                 \
+            } else {                                                                   \
+                out[i] = in[row - s0];                                                 \
+                i++;                                                                   \
+            }                                                                          \
+        }                                                                              \
+        return;                                                                        \
+    } while (0)
+    if (all_plain) {
+        switch (esz) {
+            case 1: PARTED_RUNS_TYPED(uint8_t);
+            case 2: PARTED_RUNS_TYPED(uint16_t);
+            case 4: PARTED_RUNS_TYPED(uint32_t);
+            case 8: PARTED_RUNS_TYPED(uint64_t);
+            default: break;
+        }
+    }
+#undef PARTED_RUNS_TYPED
+    int64_t seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0, seg_end = c->seg_ends[seg];
+    bool plain = c->base != RAY_SYM || ((c->segs[seg]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
+    const char* src = (const char*)ray_data(c->segs[seg]);
     for (int64_t i = start; i < end; ) {
         int64_t row = c->idx[i];
-        while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;
-        int64_t seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0, j = i + 1;
-        while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < c->seg_ends[seg]) j++;
-        parted_copy_cells(c->dst, c->base, c->out_attrs, i, c->segs[seg], row - seg_start, j - i);
+        if (row >= seg_end && seg < c->n_segs - 1) {
+            while (seg < c->n_segs - 1 && row >= c->seg_ends[seg]) seg++;
+            seg_start = seg > 0 ? c->seg_ends[seg - 1] : 0;
+            seg_end = c->seg_ends[seg];
+            plain = c->base != RAY_SYM || ((c->segs[seg]->attrs ^ c->out_attrs) & RAY_SYM_W_MASK) == 0;
+            src = (const char*)ray_data(c->segs[seg]);
+        }
+        int64_t j = i + 1;
+        while (j < end && c->idx[j] == row + (j - i) && c->idx[j] < seg_end) j++;
+        if (!plain) {
+            parted_copy_cells(c->dst, c->base, c->out_attrs, i, c->segs[seg], row - seg_start, j - i);
+        } else {
+            char* d = c->dst + (size_t)i * esz;
+            const char* s = src + (size_t)(row - seg_start) * esz;
+            switch (j - i == 1 ? esz : 0) {
+                case 1:  *d = *s; break;
+                case 2:  memcpy(d, s, 2); break;
+                case 4:  memcpy(d, s, 4); break;
+                case 8:  memcpy(d, s, 8); break;
+                case 16: memcpy(d, s, 16); break;
+                default: memcpy(d, s, (size_t)(j - i) * esz); break;
+            }
+        }
         i = j;
     }
 }

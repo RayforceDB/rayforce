@@ -124,9 +124,19 @@ static inline void parted_copy_cells(void* out_data, int8_t base,
     uint8_t out_esz = ray_sym_elem_size(base, out_attrs);
     if (base != RAY_SYM ||
         ((src->attrs ^ out_attrs) & RAY_SYM_W_MASK) == 0) {
-        memcpy((char*)out_data + (size_t)dst_off * out_esz,
-               (const char*)ray_data(src) + (size_t)src_off * out_esz,
-               (size_t)n * out_esz);
+        char* d = (char*)out_data + (size_t)dst_off * out_esz;
+        const char* s = (const char*)ray_data(src) + (size_t)src_off * out_esz;
+        /* One cell (a selection's scattered rows: a run of one) is a move of
+         * a known size, not a call. */
+        switch (n == 1 ? out_esz : 0) {
+            case 1:  *d = *s; return;
+            case 2:  memcpy(d, s, 2); return;
+            case 4:  memcpy(d, s, 4); return;
+            case 8:  memcpy(d, s, 8); return;
+            case 16: memcpy(d, s, 16); return;
+            default: break;
+        }
+        memcpy(d, s, (size_t)n * out_esz);
         return;
     }
     const void* src_data = ray_data(src);

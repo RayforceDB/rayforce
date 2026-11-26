@@ -1,0 +1,28 @@
+;; #1748: a grouped select over a parted table, under a where: that keeps 1
+;; row in 10, by a key with a group for every kept row, takes the concat
+;; fallback of exec_group_parted.  It copied the columns the group reads at
+;; every row, the dropped ones included, and evaluated the aggregates'
+;; inputs at that length.  It now gathers the kept rows first when every key
+;; and input is row by row, and costs about what gathering the kept rows in
+;; an inner select and grouping them costs.
+(.sys.exec "rm -rf /tmp/rf_issue_1748 && mkdir -p /tmp/rf_issue_1748") -- 0
+(set n 20000)
+(set mk (fn [p] (table [k f a b c] (list (+ (* p n) (til n)) (at ['x 'y 'z 'u 'v 'w 'r 's 'p 'o] (% (til n) 10)) (til n) (% (til n) 7) (* 2 (til n))))))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1748/%/t" (+ 2024.01.01 p)) (mk p) "/tmp/rf_issue_1748/.sym")) (til 8))
+(set P (.db.parted.get "/tmp/rf_issue_1748/" 't))
+;; the answers agree with gathering the kept rows first
+(select {from: P where: (== f 'x) by: k a: (first a) b: (max b) c: (sum c)}) -- (select {from: (select {from: P where: (== f 'x) k: k a: a b: b c: c}) by: k a: (first a) b: (max b) c: (sum c)})
+(select {from: P where: (== f 'x) by: k c: (sum (if (== b 3) c 0))}) -- (select {from: (select {from: P where: (== f 'x) k: k b: b c: c}) by: k c: (sum (if (== b 3) c 0))})
+(select {from: P where: (== f 'x) by: k c: (sum (* c (in b [3])))}) -- (select {from: (select {from: P where: (== f 'x) k: k b: b c: c}) by: k c: (sum (* c (in b [3])))})
+;; an input that reads other rows keeps the whole table's rows under the
+;; where: (docs: running functions under where:), as without the gather
+(select {from: P where: (== f 'x) by: k c: (last (sums c))}) -- (select {from: (select {from: P k: k f: f s: (sums c)}) where: (== f 'x) by: k c: (last s)})
+;; an empty where: still makes the keyless group's one row
+(count (select {from: P where: (== f 'nope) n: (count c)})) -- 1
+;; the baseline: gather the kept rows of the columns the group reads, then group them
+(set two (at (.mem.ts (select {from: (select {from: P where: (== f 'x) k: k a: a b: b c: c}) by: k a: (first a) b: (max b) c: (sum c)})) 'peak-live-bytes))
+(set one (at (.mem.ts (select {from: P where: (== f 'x) by: k a: (first a) b: (max b) c: (sum c)})) 'peak-live-bytes))
+(<= one (* 2 two)) -- true
+(set iff (at (.mem.ts (select {from: P where: (== f 'x) by: k a: (first a) b: (max b) c: (sum (if (== b 3) c 0))})) 'peak-live-bytes))
+(<= iff (* 2 two)) -- true
+(.sys.exec "rm -rf /tmp/rf_issue_1748") -- 0
