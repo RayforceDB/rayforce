@@ -1,0 +1,46 @@
+;; @requires: posix  (fixtures run through a POSIX shell via .sys.exec)
+;; A grouped select whose where: runs as its own filter gathers only the
+;; columns its keys and outputs name (#769).  A callee computed at run time,
+;; ((at (value (env 0)) K) 1), names none of the columns its body reads, so
+;; the filter keeps every column when an output holds such a call: every
+;; call must be to a builtin known by identity, as the outer select's
+;; narrowing has it (#1773).  Each answer is the one the named helper gives,
+;; in memory, splayed, compressed splayed and parted, with and without a
+;; global c.
+(.sys.exec "rm -rf /tmp/rfl_gk_callee && mkdir -p /tmp/rfl_gk_callee") -- 0
+(set t (table [a c s w] (list [1 2 3 4 5 6] [100 200 300 400 500 600] ['x 'y 'x 'y 'x 'y] [7 8 9 10 11 12])))
+(.db.splayed.set "/tmp/rfl_gk_callee/spl/t/" t)
+(.db.splayed.set "/tmp/rfl_gk_callee/cmp/t/" t {compress: true})
+(.db.splayed.set "/tmp/rfl_gk_callee/par/2024.01.01/t/" (at t [0 1 2]) "/tmp/rfl_gk_callee/par/.sym")
+(.db.splayed.set "/tmp/rfl_gk_callee/par/2024.01.02/t/" (at t [3 4 5]) "/tmp/rfl_gk_callee/par/.sym")
+(set S (.db.splayed.get "/tmp/rfl_gk_callee/spl/t/"))
+(set C (.db.splayed.get "/tmp/rfl_gk_callee/cmp/t/"))
+(set P (.db.parted.get "/tmp/rfl_gk_callee/par/" 't))
+(set f (fn [v] (+ v c)))
+(set K (find (key (env 0)) 'f))
+(set KN (find (key (env 0)) 'neg))
+(at (select {from: t where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: S where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: C where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: P where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: t where: (> a 2) by: s r: (sum ((at (value (env 0)) K) a))}) 'r) -- [808 1010]
+(at (select {from: P where: (> a 2) by: s r: (sum ((at (value (env 0)) K) a))}) 'r) -- [808 1010]
+(at (select {from: S where: (> a 2) by: {k: s} r: (first ((at (value (env 0)) K) w))}) 'r) -- [309 410]
+(at (select {from: t where: (> a 2) by: s r: (last ((at (value (env 0)) K) w)) m: (max w)}) 'r) -- [511 612]
+(at (select {from: P where: (> a 2) by: s r: (first ((at (value (env 0)) KN) a))}) 'r) -- [-3 -4]
+(at (select {from: t where: (> a 2) by: s r: (first (f 1))}) 'r) -- [301 401]
+(at (select {from: P where: (> a 2) by: s r: (sum (f a))}) 'r) -- [808 1010]
+;; with a global c the body still reads the column
+(set c 1000)
+(at (select {from: t where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: S where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: C where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: P where: (> a 2) by: s r: (first ((at (value (env 0)) K) 1))}) 'r) -- [301 401]
+(at (select {from: t where: (> a 2) by: s r: (sum ((at (value (env 0)) K) a))}) 'r) -- [808 1010]
+(at (select {from: P where: (> a 2) by: s r: (sum ((at (value (env 0)) K) a))}) 'r) -- [808 1010]
+(at (select {from: S where: (> a 2) by: {k: s} r: (first ((at (value (env 0)) K) w))}) 'r) -- [309 410]
+(at (select {from: t where: (> a 2) by: s r: (last ((at (value (env 0)) K) w)) m: (max w)}) 'r) -- [511 612]
+(at (select {from: P where: (> a 2) by: s r: (first ((at (value (env 0)) KN) a))}) 'r) -- [-3 -4]
+(at (select {from: t where: (> a 2) by: s r: (first (f 1))}) 'r) -- [301 401]
+(at (select {from: P where: (> a 2) by: s r: (sum (f a))}) 'r) -- [808 1010]
+(.sys.exec "rm -rf /tmp/rfl_gk_callee") -- 0
