@@ -3223,7 +3223,17 @@ static test_result_t test_eval_select_timeseries_primitives(void) {
     PASS();
 }
 
-/* ---- Test: time-series kernels surface pool cancellation ---- */
+/* ---- Test: time-series kernels surface pool cancellation ----
+ * Two ways a cancel reaches the kernel's dispatch (#1765):
+ *  - a user's interrupt (ray_request_interrupt: Ctrl-C, an embedder's
+ *    cancel thread) raised before the pool exists.  It is kept in the
+ *    interrupt word, which the kernel's poll reads, so the first pooled
+ *    operation answers `cancel` even though no pool flag could be set;
+ *  - the pool's own flag (ray_cancel), which the interrupt sets on a live
+ *    pool to stop workers mid-dispatch.  It exists only on a live pool and
+ *    each query resets it, so the pool is started first.  The test used to
+ *    call ray_cancel() with whatever pool state earlier tests had left, and
+ *    failed whenever it was the first test in its process to need the pool. */
 static test_result_t test_eval_timeseries_interrupt_cancel(void) {
     int64_t n = RAY_MORSEL_ELEMS * 2;
     ray_t* v = ray_vec_new(RAY_I64, n);
@@ -3233,15 +3243,29 @@ static test_result_t test_eval_timeseries_interrupt_cancel(void) {
     int64_t* data = (int64_t*)ray_data(v);
     for (int64_t i = 0; i < n; i++) data[i] = i;
 
+    ray_pool_destroy();                /* no pool, as in a fresh process */
+    bool no_pool = ray_pool_live() == NULL;
+    ray_request_interrupt();
+    ray_t* r1 = deltas_vec_eager(v);
+    ray_clear_interrupt();
+
+    ray_pool_get();
+    bool live = ray_pool_live() != NULL;
     ray_cancel();
-    ray_t* r = deltas_vec_eager(v);
+    ray_t* r2 = deltas_vec_eager(v);
     ray_cancel_reset();
     ray_release(v);
 
-    TEST_ASSERT_NOT_NULL(r);
-    TEST_ASSERT_TRUE(RAY_IS_ERR(r));
-    TEST_ASSERT_STR_EQ(ray_err_code(r), "cancel");
-    ray_error_free(r);
+    TEST_ASSERT_TRUE(no_pool);
+    TEST_ASSERT_TRUE(live);
+    TEST_ASSERT_NOT_NULL(r1);
+    TEST_ASSERT_NOT_NULL(r2);
+    bool c1 = RAY_IS_ERR(r1) && strcmp(ray_err_code(r1), "cancel") == 0;
+    bool c2 = RAY_IS_ERR(r2) && strcmp(ray_err_code(r2), "cancel") == 0;
+    if (RAY_IS_ERR(r1)) ray_error_free(r1); else ray_release(r1);
+    if (RAY_IS_ERR(r2)) ray_error_free(r2); else ray_release(r2);
+    TEST_ASSERT(c1, "an interrupt raised before the pool existed was not honoured");
+    TEST_ASSERT(c2, "the live pool's cancel flag was not honoured");
     PASS();
 }
 
