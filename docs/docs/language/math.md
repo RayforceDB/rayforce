@@ -904,6 +904,9 @@ empty result, with no error.
 ## Higher-order Functions
 
 Functions that take other functions as arguments for flexible iteration patterns.
+Inside a query, a helper they call sees the source columns its body reads, as a
+direct call of the helper does, however the helper was reached
+([Names in queries](name-resolution.md#names-in-queries)).
 
 ### `(map f x)`
 

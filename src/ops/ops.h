@@ -1128,6 +1128,10 @@ ray_t* ray_query_edge_value(void* fnp, ray_t* arg, uint8_t rows);
 /* The table a helper called from a query may read columns from: the
  * source schema while a projection binds aliases, else the active table. */
 ray_t* ray_query_helper_table(void);
+/* The two behind ray_active_query_table and ray_query_helper_table, for a
+ * test paid per call of a lambda a builtin calls (call_lambda, #1762). */
+extern _Thread_local ray_t* g_active_query_table;
+extern _Thread_local ray_t* g_query_source_table;
 /* The length a value over the rows of the query being evaluated has here:
  * the group's row count while a group is evaluated, else the active
  * table's.  -1 outside a query, and while it is evaluated one row at a

@@ -197,6 +197,14 @@ enum {
 #define LAMBDA_CLOSURE(lam)   (((ray_t**)ray_data(lam))[7])
 #define LAMBDA_CAPROWS(lam)   (((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPROWS])
 #define LAMBDA_CAPQ(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ]))
+/* The other half of the capq slot: call_lambda's cached answer to whether
+ * the body names only its parameters and first-order builtins (#1762), with
+ * the global epoch it holds for; 0 when not known.  Never serialized. */
+#define LAMBDA_QPLAIN(lam)    (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_CAPQ] + 1))
+/* The other half of the n_locals slot: the tag of the query table the body's
+ * names were last checked against for LAMBDA_QPLAIN, and the answer; 0 when
+ * not known.  Never serialized. */
+#define LAMBDA_QTBL(lam)      (*((uint32_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_NLOCALS] + 1))
 #define LAMBDA_TRUSTED(lam)   (*((uint64_t*)&((ray_t**)ray_data(lam))[LAMBDA_SLOT_TRUSTED]))
 
 #define LAMBDA_IS_COMPILED(lam) ((lam)->attrs & RAY_FN_COMPILED)
