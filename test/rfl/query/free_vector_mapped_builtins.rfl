@@ -1,0 +1,50 @@
+;; date, time, trunc, split and .emb.tokens map a free vector element by
+;; element (#1755): an aggregate over a global as long as the table reads
+;; each group's slice and the rows where: keeps, as over the column; one of
+;; any other length is the length error every row-shaped position gives
+;; (#1492), as under dd; a LIST global is one whole value.
+(set M (.emb.model.get "test/data/emb/tiny"))
+(set TS [2024.03.01D10:00:00.000 2024.01.05D09:30:00.000 2024.03.01D23:59:00.000 2024.02.07D11:00:00.000])
+(set SS ["a,b" "c" "d,e,f" "g,h"])
+(set t (table [k ts s v] (list [1 2 1 2] TS SS [10 20 30 40])))
+(set W TS)
+(set WS SS)
+;; as long as the table: the free vector's answer is the column's
+(at (select {from: t by: k r: (first (date W))}) 'r) -- (at (select {from: t by: k r: (first (date ts))}) 'r)
+(at (select {from: t by: k r: (last (time W))}) 'r) -- (at (select {from: t by: k r: (last (time ts))}) 'r)
+(at (select {from: t by: k r: (count (distinct (trunc 'day W)))}) 'r) -- (at (select {from: t by: k r: (count (distinct (trunc 'day ts)))}) 'r)
+(at (select {from: t by: k r: (first (split WS ","))}) 'r) -- (at (select {from: t by: k r: (first (split s ","))}) 'r)
+(at (select {from: t by: k r: (last (.emb.tokens M WS))}) 'r) -- (at (select {from: t by: k r: (last (.emb.tokens M s))}) 'r)
+(at (select {from: t by: k r: (count (date W))}) 'r) -- [2 2]
+(at (select {from: t where: (> v 15) r: (first (date W))}) 'r) -- [2024.01.05]
+(at (select {from: t where: (> v 15) r: (count (split WS ","))}) 'r) -- [3]
+(at (select {from: t where: (> v 15) r: (count (distinct (time W)))}) 'r) -- (at (select {from: t where: (> v 15) r: (count (distinct (time ts)))}) 'r)
+(at (select {from: t where: (> v 5) by: k r: (first (.emb.tokens M WS))}) 'r) -- (at (select {from: t where: (> v 5) by: k r: (first (.emb.tokens M s))}) 'r)
+(at (select {from: t where: (> v 15) by: k r: (count (trunc 'day W))}) 'r) -- (at (select {from: t where: (> v 15) by: k r: (count (trunc 'day ts))}) 'r)
+(at (update {from: t r: (first (time W)) by: k}) 'r) -- (at (update {from: t r: (first (time ts)) by: k}) 'r)
+(at (update {from: t r: (count (split WS ",")) by: k}) 'r) -- [2 2 2 2]
+(at (update {from: t r: (first (date W)) where: (> v 15)}) 'r) -- (at (update {from: t r: (first (date ts)) where: (> v 15)}) 'r)
+(at (update {from: t r: (count (.emb.tokens M WS)) where: (> v 15)}) 'r) -- [0Nl 3 3 3]
+;; one value is spread as an atom
+(at (select {from: t r: (count (date (take W 1)))}) 'r) -- [1]
+;; any other length: the length error, as under dd
+(set W2 (take W 2))
+(set W0 (take W 0))
+(set W5 (take W 5))
+(set WS2 (take WS 2))
+(select {from: t r: (count (dd W2))}) !- length
+(select {from: t r: (count (date W2))}) !- length
+(select {from: t r: (count (date W0))}) !- length
+(select {from: t r: (count (date W5))}) !- length
+(select {from: t by: k r: (first (time W2))}) !- length
+(select {from: t where: (> v 15) r: (count (trunc 'day W5))}) !- length
+(select {from: t where: (> v 99) r: (count (trunc 'day W2))}) !- length
+(select {from: t r: (count (split WS2 ","))}) !- length
+(select {from: t where: (> v 5) by: k r: (count (.emb.tokens M WS2))}) !- length
+(update {from: t r: (count (time W0)) by: k}) !- length
+;; a computed operand is no free vector: its own values are counted
+(at (select {from: t r: (count (date (take W 5)))}) 'r) -- [5]
+;; a LIST global is one whole value in every group
+(set WL (list "a,b" "c" "d,e,f" "g,h"))
+(at (select {from: t by: k r: (first (split WL ","))}) 'r) -- (list ["a" "b"] ["a" "b"])
+(at (select {from: t where: (> v 15) r: (count (split WL ","))}) 'r) -- [4]
