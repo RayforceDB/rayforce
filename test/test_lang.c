@@ -452,6 +452,75 @@ static bool group_probe_test_compound_values(ray_t* value) {
            group_probe_test_i64s(ray_table_get_col_idx(value, 2), s, 1);
 }
 
+#ifdef DEBUG
+/* #1756: a typed vector's unary builtin (the vector kernel, or for integer
+ * floor / ceil a copy) and div (its DAG opcode), with each of their
+ * allocations failed in turn, once and twice running.  The call answers
+ * the right vector or an oom error, and once both are released nothing it
+ * allocated is left: an error a failed allocation returned is never
+ * dropped. */
+typedef struct { const char* name; ray_unary_fn f1; ray_binary_fn f2; const char* src; int64_t first; } typed_map_oom_case_t;
+
+static bool typed_map_oom_same(ray_t* a, ray_t* b) {
+    return a && b && !RAY_IS_ERR(a) && !RAY_IS_ERR(b) && a->type == b->type &&
+           a->len == b->len &&
+           memcmp(ray_data(a), ray_data(b), (size_t)a->len * ray_elem_size(a->type)) == 0;
+}
+
+static test_result_t test_eval_typed_map_oom(void) {
+    static const typed_map_oom_case_t cases[] = {
+        { "floor I16", ray_floor_fn, NULL, "(as 'I16 [0 1 2 3 4 5 6 7])", 1 },
+        { "ceil I16",  ray_ceil_fn,  NULL, "(as 'I16 [0 1 2 3 4 5 6 7])", 1 },
+        { "floor I64", ray_floor_fn, NULL, "[0N 1 2 3 4 5 6 7 8]", 1 },
+        { "ceil B8",   ray_ceil_fn,  NULL, "[true false true false true true false false]", 1 },
+        { "neg F64",   ray_neg_fn,   NULL, "[0.5 1.5 2.5 3.5 4.5 5.5 6.5 7.5]", 1 },
+        { "neg I64",   ray_neg_fn,   NULL, "[1 2 3 4 5 6 7 0N]", 1 },
+        { "round I32", ray_round_fn, NULL, "(as 'I32 [1 2 3 4 5 6 7 8])", 1 },
+        { "sqrt F64",  ray_sqrt_fn,  NULL, "[1.0 4.0 9.0 16.0 25.0 36.0 49.0 64.0]", 1 },
+        /* from the second allocation: the first is the binary map's
+         * first-cell probe, which answers a failed allocation there with a
+         * `type` error and keeps the oom's block, as on dev (outside this
+         * change, which adds nothing before it) */
+        { "div I64",   NULL, ray_idiv_fn,  "[7 -7 0N 5 9 -9 1 -1]", 2 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ray_t* v = ray_eval_str(cases[i].src);
+        TEST_ASSERT(v && !RAY_IS_ERR(v) && ray_is_vec(v), cases[i].name);
+        ray_t* three = ray_i64(3);
+        ray_t* want = cases[i].f1 ? atomic_map_unary(cases[i].f1, v)
+                                  : atomic_map_binary_op(cases[i].f2, 0, v, three);
+        TEST_ASSERT(want && !RAY_IS_ERR(want), cases[i].name);
+        for (int64_t nth = cases[i].first; nth <= 16; nth++) {
+            for (int64_t count = 1; count <= 2; count++) {
+                ray_heap_gc();
+                TEST_ASSERT_TRUE(ray_mem_trace_begin());
+                ray_alloc_fail_set_for_test(nth, count);
+                ray_t* r = cases[i].f1 ? atomic_map_unary(cases[i].f1, v)
+                                       : atomic_map_binary_op(cases[i].f2, 0, v, three);
+                ray_alloc_fail_set_for_test(0, 0);
+                bool ok = r && (RAY_IS_ERR(r) ? strcmp(ray_err_code(r), "oom") == 0
+                                              : typed_map_oom_same(r, want));
+                if (r && RAY_IS_ERR(r)) ray_error_free(r); else if (r) ray_release(r);
+                ray_error_clear();
+                ray_heap_gc();
+                ray_mem_trace_t t;
+                ray_mem_trace_end(&t);
+                if (!ok || t.net_bytes != 0)
+                    fprintf(stderr, "  %s: allocation %lld failed x%lld: %s, %lld bytes left\n",
+                            cases[i].name, (long long)nth, (long long)count,
+                            ok ? "answer ok" : "wrong answer", (long long)t.net_bytes);
+                TEST_ASSERT(ok, cases[i].name);
+                TEST_ASSERT(t.net_bytes == 0, cases[i].name);
+            }
+        }
+        ray_release(want);
+        ray_release(three);
+        ray_release(v);
+    }
+    PASS();
+}
+#endif
+
 static test_result_t test_query_group_classifier_owned_oom(void) {
 #ifdef DEBUG
     ray_group_dag_probe_fail_set_for_test(0);
@@ -15777,6 +15846,7 @@ const test_entry_t lang_entries[] = {
     { "lang/callprof/repl_calls", test_callprof_repl_calls, lang_setup, lang_teardown },
     { "lang/query/group_classifier_owned_oom", test_query_group_classifier_owned_oom, lang_setup, lang_teardown },
 #ifdef DEBUG
+    { "lang/eval/typed_map_oom", test_eval_typed_map_oom, lang_setup, lang_teardown },
     { "lang/eval/narrow_left_route", test_eval_narrow_left_route, lang_setup, lang_teardown },
     { "lang/eval/narrow_bounded_route", test_eval_narrow_bounded_route, lang_setup, lang_teardown },
 #endif
