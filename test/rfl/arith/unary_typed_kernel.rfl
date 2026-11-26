@@ -1,0 +1,105 @@
+;; A unary atomic builtin, or div, over a typed vector runs the vector kernel
+;; the query path uses instead of boxing every element as an atom (#1756):
+;; a 100 000-element call allocates a handful of blocks, not two a cell.
+;; Its answers are those of the boxed map, (map f v), for every type, errors
+;; included (neg of a bool or u8 vector is a type error either way).
+(set X (+ 1 (til 100000)))
+(set F (* 0.5 (as 'F64 X)))
+(set allocs (fn [th] (get (.mem.ts (th)) (quote alloc-count))))
+(< (allocs (fn [] (neg X))) 100) -- true
+(< (allocs (fn [] (abs X))) 100) -- true
+(< (allocs (fn [] (neg F))) 100) -- true
+(< (allocs (fn [] (floor F))) 100) -- true
+(< (allocs (fn [] (ceil F))) 100) -- true
+(< (allocs (fn [] (floor (as 'I16 X)))) 100) -- true
+(< (allocs (fn [] (round F))) 100) -- true
+(< (allocs (fn [] (round X))) 100) -- true
+(< (allocs (fn [] (sqrt F))) 100) -- true
+(< (allocs (fn [] (log F))) 100) -- true
+(< (allocs (fn [] (exp F))) 100) -- true
+(< (allocs (fn [] (div X 3))) 100) -- true
+(< (allocs (fn [] (div F 2.5))) 100) -- true
+;; inside a compiled lambda too
+(< (allocs (fn [] ((fn [v] (let q 1) (neg v)) X))) 100) -- true
+
+;; ─────────────────── answers: the boxed map's, type by type ────────────────
+;; every vector is at least 8 long, the shortest the kernel takes
+(set vecs (list [true false true false true true false false] (as 'U8 [0 1 7 200 255 3 4 128]) (as 'I16 [0 1 -1 7 32767 -32767 0N 100]) (as 'I32 [0 1 -1 7 2147483647 -2147483647 0N 100]) [0 1 -1 7 -100 9223372036854775807 -9223372036854775807 0N] (as 'F32 [0.0 -0.0 1.5 -2.5 0.5 2.5 3.5 0Nf]) [0.0 -0.0 1.5 -2.5 0.5 -0.5 2.5 3.5 1e300 -1e300 0Nf 1e-300] (- (% (* (til 5000) 7919) 20001) 10000) (- (* 0.37 (til 5000)) 900.25)))
+(set code (fn [e] (at e 'code)))
+(set same (fn [f] (map (fn [v] (identical (try (f v) code) (try (map f v) code))) vecs)))
+(same neg) -- (take [true] 9)
+(same abs) -- (take [true] 9)
+(same floor) -- (take [true] 9)
+(same ceil) -- (take [true] 9)
+(same round) -- (take [true] 9)
+(same sqrt) -- (take [true] 9)
+(same log) -- (take [true] 9)
+(same exp) -- (take [true] 9)
+;; the result types are unchanged: round of an integer is a float, floor of
+;; one stays its type, neg of a narrow integer keeps its width
+(type (round X)) -- 'F64
+(type (floor (as 'I16 X))) -- 'I16
+(type (ceil (as 'U8 X))) -- 'U8
+(type (neg (as 'I32 X))) -- 'I32
+(type (sqrt X)) -- 'F64
+;; nulls and edge values
+(neg [1 0N -5 2 3 4 5 6]) -- [-1 0N 5 -2 -3 -4 -5 -6]
+(abs (as 'I16 [-3 0N 3 -4 4 -5 5 0])) -- (as 'I16 [3 0N 3 4 4 5 5 0])
+(sqrt [-1.0 4.0 0Nf 9.0 16.0 0.0 1.0 2.25]) -- [0Nf 2.0 0Nf 3.0 4.0 0.0 1.0 1.5]
+(log [1.0 -1.0 0Nf 1.0 1.0 1.0 1.0 1.0]) -- [0.0 0Nf 0Nf 0.0 0.0 0.0 0.0 0.0]
+(floor [-0.5 0.5 -1.5 0Nf 2.5 -2.5 3.0 -3.0]) -- [-1.0 0.0 -2.0 0Nf 2.0 -3.0 3.0 -3.0]
+(floor (as 'I16 [1 -1 0N 7 -7 32767 -32767 0])) -- (as 'I16 [1 -1 0N 7 -7 32767 -32767 0])
+
+;; floor and ceil of an integer vector are its copy: same cells, same type,
+;; its nulls still nulls, the input untouched
+(set J (as 'I32 [0N 1 -2 3 2147483647 -2147483647 6 7 8]))
+(ceil J) -- J
+(nil? (floor J)) -- (nil? J)
+(identical (ser (ceil J)) (ser (map ceil J))) -- true
+(set B (== 0 (% (til 9) 2)))
+(identical (ser (floor B)) (ser (map floor B))) -- true
+(set U (as 'U8 [0 1 2 200 255 3 4 5]))
+(identical (ser (ceil U)) (ser (map ceil U))) -- true
+(set W (concat (til 8) 0N))
+(identical (ser (floor W)) (ser (map floor W))) -- true
+(set W2 (floor W))
+W -- (concat (til 8) 0N)
+(set R [0.5 1.5 2.5 -0.5 -2.5 3.5 -3.5 4.5])
+(round R) -- (map round R)
+;; a temporal vector stays on the boxed map: neg of a null TIMESTAMP is a
+;; null, of any other a type error, whatever the first cell
+(neg (as 'TIMESTAMP [0N 1 2 3 4 5 6 7])) !- type
+;; div: vector by atom, atom by vector, vector by vector, zero and nulls
+(div [7 -7 0N 5 9 -9 1 -1] 2) -- [3 -4 0N 2 4 -5 0 -1]
+(div [7 -7 5 1 2 3 4 5] 0) -- [0N 0N 0N 0N 0N 0N 0N 0N]
+(div 7 [2 -2 0 0N 1 -1 7 -7]) -- [3 -4 0N 0N 7 -7 1 -1]
+(div [7.0 -7.0 1.5 0Nf 2.0 -2.0 0.0 9.0] 2.0) -- [3.0 -4.0 0.0 0Nf 1.0 -1.0 0.0 4.0]
+(div [7 8 9 1 2 3 4 5] [2 3 0 1 1 1 2 2]) -- [3 2 0N 1 2 3 2 2]
+(set I (as 'I32 [7 -7 0N 5 9 -9 1 -1]))
+(div I 2) -- (map (fn [x] (div x 2)) I)
+(set H (as 'I16 [7 -7 0N 5 9 -9 1 -1]))
+(div H 2i) -- (map (fn [x] (div x 2i)) H)
+;; errors are the boxed map's, message included
+(neg ['a 'b 'c 'd 'e 'f 'g 'h]) !- type
+(div (as 'DATE [1 2 3 4 5 6 7 8]) 2) !- type
+(at (try (div [1 2 3 4 5 6 7 8] [1 2 3 4 5 6 7 8 9]) (fn [e] e)) 'msg) -- "binary op: operand lengths must match, got 8 and 9"
+;; a short vector keeps the boxed map, with the same answers
+(neg [1 0N -5]) -- [-1 0N 5]
+(div [7 -7 0N] 2) -- [3 -4 0N]
+;; a raw infinity (a literal cannot write one, a deserialized vector can) is
+;; the null to neg abs floor ceil round, as it is to their atom forms, on
+;; both sides of the kernel's 8-element threshold
+(set rawf (fn [n p] (de (concat (take (ser (take 0.0 n)) 26) (take p (* 8 n))))))
+(set PINF [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0x7f])
+(set NINF [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0xff])
+(set V (rawf 8 PINF))
+(map (fn [f] (identical (ser (f V)) (ser (map f V)))) (list neg abs floor ceil round)) -- (take [true] 5)
+(neg V) -- (take 0Nf 8)
+(set vecs1 (fn [f n p] (ser (f (rawf n p)))))
+(set thr (fn [f p] (map (fn [n] (identical (vecs1 f n p) (ser (map f (rawf n p))))) [7 8 9])))
+(map (fn [f] (thr f PINF)) (list neg abs floor ceil round sqrt log exp)) -- (take (list [true true true]) 8)
+(map (fn [f] (thr f NINF)) (list neg abs floor ceil round sqrt log exp)) -- (take (list [true true true]) 8)
+;; one infinity among finite cells, at length 9
+(set M (de (concat (take (ser (take 0.0 9)) 26) (concat (take [0x00 0x00 0x00 0x00 0x00 0x00 0xf0 0x3f] 64) PINF))))
+(floor M) -- [1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 0Nf]
+(map (fn [f] (identical (ser (f M)) (ser (map f M)))) (list neg abs floor ceil round)) -- (take [true] 5)

@@ -2148,6 +2148,12 @@ static ray_t* map_unary_run(void* p) {
     map_ctx_t* c = p;
     return atomic_map_unary_c(c->fn1, c->l);
 }
+/* The shortest typed vector a builtin's vector kernel runs on from the
+ * per-element maps below (#1756).  The kernel's graph costs about 4 800
+ * instructions to build and run whatever the length, the boxed map about
+ * 720 per element, so they cross at six or seven elements. */
+#define MAP_KERNEL_MIN_LEN 8
+
 __attribute__((noinline))
 static ray_t* atomic_map_binary_op_memo(ray_binary_fn fn, uint16_t dag_opcode, ray_t* left, ray_t* right) {
     /* user-space pointers are below 2^48: the opcode fits above fn */
@@ -2276,6 +2282,17 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_binary_op_c(ray_b
     if (out_type == RAY_I32 && left_coll && ray_is_vec(left) &&
         !ray_num_type(left->type, left->type) && !RAY_ATOM_IS_NULL(e0))
         out_type = RAY_I64;
+
+    /* `div` is registered without its opcode (the query compiler maps the
+     * name itself); here, past the checks whose messages name the opcode,
+     * it is what lets a typed vector reach the floor-division kernel
+     * instead of the boxed per-element loop (#1756), from the length where
+     * the kernel is the cheaper (MAP_KERNEL_MIN_LEN).  A B8 operand has no
+     * kernel there (the DAG path takes no BOOL) and would only pay for
+     * the attempt, so it keeps the boxed loop as it was */
+    if (RAY_UNLIKELY(dag_opcode == 0) && fn == ray_idiv_fn && len >= MAP_KERNEL_MIN_LEN &&
+        left->type != RAY_BOOL && left->type != -RAY_BOOL &&
+        right->type != RAY_BOOL && right->type != -RAY_BOOL) dag_opcode = OP_IDIV;
 
     if (!force_boxed) {
         ray_t* r = tempint_arith(dag_opcode, left, right, out_type, len);
@@ -2934,6 +2951,114 @@ ray_t* atomic_map_unary(ray_unary_fn fn, ray_t* arg) {
     if (RAY_UNLIKELY(map_memo_wanted(arg))) return atomic_map_unary_memo(fn, arg);
     return atomic_map_unary_c(fn, arg);
 }
+/* A copy of an integer-family vector (B8, U8, I16, I32, I64) as the boxed
+ * map builds it: the same cells, and HAS_NULLS when a cell is the type's
+ * null sentinel (store_typed_elem flags each null it stores).  An oom is
+ * returned as the error it is. */
+static ray_t* int_vec_copy(ray_t* v, int64_t len) {
+    ray_t* r = ray_vec_new(v->type, len);
+    /* an allocation failure is the boxed map's answer too (its own
+     * ray_vec_new): the owned oom goes back to the caller */
+    if (RAY_IS_ERR(r)) return r;
+    r->len = len;
+    const void* src = ray_data(v);
+    memcpy(ray_data(r), src, (size_t)len * ray_elem_size(v->type));
+    bool nulls = false;
+    switch (v->type) {
+    case RAY_I16: { const int16_t* p = src; for (int64_t i = 0; i < len; i++) nulls |= p[i] == NULL_I16; break; }
+    case RAY_I32: { const int32_t* p = src; for (int64_t i = 0; i < len; i++) nulls |= p[i] == NULL_I32; break; }
+    case RAY_I64: { const int64_t* p = src; for (int64_t i = 0; i < len; i++) nulls |= p[i] == NULL_I64; break; }
+    default: break;   /* B8 and U8 hold no null */
+    }
+    if (nulls) r->attrs |= RAY_ATTR_HAS_NULLS;
+    return r;
+}
+
+/* Whether an F64 vector holds an infinity: one branch-free pass, which the
+ * compiler vectorises. */
+static bool f64_any_inf(const ray_t* v, int64_t len) {
+    const uint64_t* u = (const uint64_t*)ray_data((ray_t*)v);
+    uint64_t hit = 0;
+    for (int64_t i = 0; i < len; i++)
+        hit |= (u[i] & UINT64_C(0x7fffffffffffffff)) == UINT64_C(0x7ff0000000000000);
+    return hit != 0;
+}
+
+/* A unary atomic builtin over a typed vector through the vector kernel the
+ * query path runs (#1756): the boxed map below costs two allocations and
+ * two frees per element around a one-instruction operation.  Taken only for
+ * the builtins with a kernel, and its result kept only when it is what the
+ * boxed map gives: a vector of the first cell's result type (`out_type`)
+ * and the input's length.  Anything else (a type whose kernel answers
+ * another type, a kernel's error other than a cancel, a graph that could
+ * not be built) is dropped, freed, and the boxed map answers as before.
+ * The integer floor / ceil copy's oom is returned, as the boxed map's own
+ * allocation would return it.  NULL when not taken. */
+__attribute__((noinline)) static ray_t* unary_kernel_vec(ray_unary_fn fn, ray_t* v, int8_t out_type, int64_t len) {
+    ray_op_t* (*mk)(ray_graph_t*, ray_op_t*) =
+        fn == ray_neg_fn   ? ray_neg       :
+        fn == ray_abs_fn   ? ray_abs       :
+        fn == ray_floor_fn ? ray_floor_op  :
+        fn == ray_ceil_fn  ? ray_ceil_op   :
+        fn == ray_round_fn ? ray_round_op  :
+        fn == ray_sqrt_fn  ? ray_sqrt_op   :
+        fn == ray_log_fn   ? ray_log_op    :
+        fn == ray_exp_fn   ? ray_exp_op    : NULL;
+    if (!mk) return NULL;
+    /* Numbers only.  A temporal atom's answer depends on its value (`neg` of
+     * a null TIMESTAMP is a null, of any other a type error), so the first
+     * cell's type does not settle a temporal vector's: the boxed map keeps
+     * them, and every other type the kernels do not read */
+    if (v->type != RAY_BOOL && v->type != RAY_U8 && v->type != RAY_I16 &&
+        v->type != RAY_I32 && v->type != RAY_I64 && v->type != RAY_F32 &&
+        v->type != RAY_F64) return NULL;
+    /* An infinity is the null to the atom builtins `neg abs floor ceil
+     * round` (the boxed map's answer), where their kernels keep it: a
+     * vector holding one keeps the boxed map, at every length.  A literal
+     * cannot write one, but a deserialized vector can. */
+    if (v->type == RAY_F64 &&
+        (fn == ray_neg_fn || fn == ray_abs_fn || fn == ray_floor_fn ||
+         fn == ray_ceil_fn || fn == ray_round_fn) && f64_any_inf(v, len))
+        return NULL;
+    /* floor and ceil of an integer are the integer (ray_floor_fn hands the
+     * atom back, a null included): the vector's copy, its nulls flagged as
+     * the boxed map's stores flag them.  No kernel, no cast. */
+    if ((fn == ray_floor_fn || fn == ray_ceil_fn) &&
+        v->type != RAY_F64 && v->type != RAY_F32)
+        return out_type == v->type ? int_vec_copy(v, len) : NULL;
+    ray_graph_t* g = ray_graph_new(NULL);
+    if (!g) return NULL;
+    ray_op_t* in = ray_const_vec(g, v);
+    /* round answers a float for an integer cell (as it does for an atom):
+     * the kernel keeps the integer type, so an integer vector is cast to
+     * F64 first — rounding an exact integer changes nothing */
+    if (in && fn == ray_round_fn && out_type == RAY_F64 && v->type != RAY_F64)
+        in = ray_cast(g, in, RAY_F64);
+    ray_op_t* root = in ? mk(g, in) : NULL;
+    ray_t* r = root ? ray_execute(g, root) : NULL;
+    ray_graph_free(g);
+    if (!r) return NULL;
+    if (RAY_IS_ERR(r)) {
+        /* a cancelled query stays cancelled: the boxed map is not its answer */
+        if (strcmp(ray_err_code(r), "cancel") == 0) return r;
+        ray_error_free(r);
+        ray_error_clear();
+        return NULL;
+    }
+    if (!ray_is_vec(r) || r->type != out_type || r->len != len) { ray_release(r); return NULL; }
+    return r;
+}
+
+/* The builtin over a collection's first cell: its result's type is the
+ * map's (atomic_map_unary_c below) */
+static inline __attribute__((always_inline)) ray_t* atomic_unary_first(ray_unary_fn fn, ray_t* arg) {
+    int alloc0 = 0;
+    ray_t* e0_in = collection_elem(arg, 0, &alloc0);
+    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : atomic_unary_elem(fn, e0_in);
+    if (alloc0) ray_release(e0_in);
+    return e0;
+}
+
 static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary_fn fn, ray_t* arg) {
     if (!is_collection(arg)) return fn(arg);
     /* A list's cells are mapped through here again: one C frame per level
@@ -2943,35 +3068,46 @@ static inline __attribute__((always_inline)) ray_t* atomic_map_unary_c(ray_unary
         return ray_error("limit", "value nested too deep for this thread's stack");
 
     int64_t len = ray_len(arg);
+    ray_t* e0;
+    int8_t out_type;
 
-    if (len == 0) {
-        /* Empty — fabricate a zero atom of the element type and run
-         * `fn` to learn the output type; fall back to I64 if the
-         * probe can't resolve a typed atom.  The probe is ours: a
-         * failed one (or a failed fabricated operand) is freed and its
-         * message cleared, since only the type is wanted from it. */
-        ray_t* z = zero_atom_for_elem_type(arg);
-        ray_t* probe = (z && !RAY_IS_ERR(z)) ? fn(z) : NULL;
-        bool failed = (z && RAY_IS_ERR(z)) || (probe && RAY_IS_ERR(probe));
-        if (z) { if (RAY_IS_ERR(z)) ray_error_free(z); else ray_release(z); }
-        if (probe && !RAY_IS_ERR(probe) && probe->type < 0) {
-            int8_t t = (int8_t)(-probe->type);
-            ray_release(probe);
-            return ray_vec_new(t, 0);
+    /* One test sends both the empty collection and a vector long enough
+     * for its builtin's vector kernel (MAP_KERNEL_MIN_LEN) off the path of
+     * a short one, so a short call pays nothing for the kernel */
+    if (RAY_UNLIKELY((uint64_t)len - 1 >= (uint64_t)MAP_KERNEL_MIN_LEN - 1)) {
+        if (len == 0) {
+            /* Empty — fabricate a zero atom of the element type and run
+             * `fn` to learn the output type; fall back to I64 if the
+             * probe can't resolve a typed atom.  The probe is ours: a
+             * failed one (or a failed fabricated operand) is freed and its
+             * message cleared, since only the type is wanted from it. */
+            ray_t* z = zero_atom_for_elem_type(arg);
+            ray_t* probe = (z && !RAY_IS_ERR(z)) ? fn(z) : NULL;
+            bool failed = (z && RAY_IS_ERR(z)) || (probe && RAY_IS_ERR(probe));
+            if (z) { if (RAY_IS_ERR(z)) ray_error_free(z); else ray_release(z); }
+            if (probe && !RAY_IS_ERR(probe) && probe->type < 0) {
+                int8_t t = (int8_t)(-probe->type);
+                ray_release(probe);
+                return ray_vec_new(t, 0);
+            }
+            if (probe) { if (RAY_IS_ERR(probe)) ray_error_free(probe); else ray_release(probe); }
+            if (failed) ray_error_clear();
+            return ray_vec_new(RAY_I64, 0);
         }
-        if (probe) { if (RAY_IS_ERR(probe)) ray_error_free(probe); else ray_release(probe); }
-        if (failed) ray_error_clear();
-        return ray_vec_new(RAY_I64, 0);
+        e0 = atomic_unary_first(fn, arg);
+        if (RAY_IS_ERR(e0)) return e0;
+        out_type = -(e0->type);
+        /* A typed vector: its builtin's vector kernel, when it has one */
+        if (arg->type != RAY_LIST && ray_is_vec(arg)) {
+            ray_t* r = unary_kernel_vec(fn, arg, out_type, len);
+            if (r) { ray_release(e0); return r; }
+        }
+    } else {
+        /* Probe first element to determine output type */
+        e0 = atomic_unary_first(fn, arg);
+        if (RAY_IS_ERR(e0)) return e0;
+        out_type = -(e0->type);
     }
-
-    /* Probe first element to determine output type */
-    int alloc0 = 0;
-    ray_t* e0_in = collection_elem(arg, 0, &alloc0);
-    ray_t* e0 = RAY_IS_ERR(e0_in) ? e0_in : atomic_unary_elem(fn, e0_in);
-    if (alloc0) ray_release(e0_in);
-    if (RAY_IS_ERR(e0)) return e0;
-
-    int8_t out_type = -(e0->type);
 
     /* Try typed vector path for numeric/bool/temporal output */
     if (out_type == RAY_I64 || out_type == RAY_F64 || out_type == RAY_F32 || out_type == RAY_I32 ||
