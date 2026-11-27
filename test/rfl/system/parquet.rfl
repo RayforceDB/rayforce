@@ -262,3 +262,19 @@
 (count (.parquet.meta pq-n)) -- 6
 (.parquet.read [a l] pq-n) !- parquet
 (.parquet.read pq-n) !- parquet
+;; A date or time part accessor reads only its argument, so a select of one
+;; projects like an arithmetic call and never decodes the corrupt `name`
+;; column.  It is judged by the function the head holds (#1826): before, only
+;; the query-only spellings year, month, day, hour and second were.
+(set pq-p (.parquet.scan "test/data/parquet/projection.parquet"))
+(at (select {from: pq-p y: (yyyy day)}) 'y) -- [2000 2000 2000 2000 2000 2000 2000 2000 2000]
+(sum (at (select {from: pq-p m: (mm day) d: (dd day)}) 'd)) -- 45
+(at (select {from: pq-p w: (dow day)}) 'w) -- [6 7 1 2 3 4 5 6 7]
+(sum (at (select {from: pq-p d: (doy day)}) 'd)) -- 45
+(sum (at (select {from: pq-p h: (+ (hh ts) (ss ts))}) 'h)) -- 0
+(sum (at (select {from: pq-p h: (minute ts)}) 'h)) -- 0
+;; another name holding an accessor is the accessor
+(set pq-yr yyyy)
+(sum (at (select {from: pq-p y: (pq-yr day)}) 'y)) -- 18000
+;; a let that rebinds an accessor's name is no accessor: every column is read
+(select {from: pq-p y: (let yyyy (fn [x] x) (yyyy day))}) !- parquet

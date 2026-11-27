@@ -105,13 +105,6 @@ ALLOWED_SPELLINGS = {
     "self": "the evaluator's keyword for the lambda being called",
     "ilike": "owner decision 2026-11-27: query-only case-insensitive like",
     "cond": "pending removal, #1826",
-    "year": "pending removal, #1826 (the builtin is yyyy)",
-    "month": "pending removal, #1826 (the builtin is mm)",
-    "day": "pending removal, #1826 (the builtin is dd)",
-    "hour": "pending removal, #1826 (the builtin is hh)",
-    "second": "pending removal, #1826 (the builtin is ss)",
-    "dayofweek": "pending removal, #1826 (the builtin is dow)",
-    "dayofyear": "pending removal, #1826 (the builtin is doy)",
 }
 ALLOWED_SPELLINGS.update({t: "a type name `as` casts to, not a function" for t in TYPE_NAMES})
 

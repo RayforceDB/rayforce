@@ -35,37 +35,37 @@
 (set TS_nn (table [ts] (list [2024.03.15D14:27:31.000000000 2024.07.04D09:15:30.000000000 1999.12.31D23:59:59.500000000])))
 
 ;; YEAR
-(at (at (select {y: (year ts) from: TS_nn}) 'y) 0) -- 2024
-(at (at (select {y: (year ts) from: TS_nn}) 'y) 2) -- 1999
+(at (at (select {y: (yyyy ts) from: TS_nn}) 'y) 0) -- 2024
+(at (at (select {y: (yyyy ts) from: TS_nn}) 'y) 2) -- 1999
 
 ;; MONTH
-(at (at (select {m: (month ts) from: TS_nn}) 'm) 0) -- 3
-(at (at (select {m: (month ts) from: TS_nn}) 'm) 1) -- 7
+(at (at (select {m: (mm ts) from: TS_nn}) 'm) 0) -- 3
+(at (at (select {m: (mm ts) from: TS_nn}) 'm) 1) -- 7
 
 ;; DAY
-(at (at (select {d: (day ts) from: TS_nn}) 'd) 0) -- 15
-(at (at (select {d: (day ts) from: TS_nn}) 'd) 1) -- 4
+(at (at (select {d: (dd ts) from: TS_nn}) 'd) 0) -- 15
+(at (at (select {d: (dd ts) from: TS_nn}) 'd) 1) -- 4
 
 ;; HOUR — includes pre-epoch timestamp where day_us < 0 after modulo
-(at (at (select {h: (hour ts) from: TS_nn}) 'h) 0) -- 14
-(at (at (select {h: (hour ts) from: TS_nn}) 'h) 2) -- 23
+(at (at (select {h: (hh ts) from: TS_nn}) 'h) 0) -- 14
+(at (at (select {h: (hh ts) from: TS_nn}) 'h) 2) -- 23
 
 ;; MINUTE — includes pre-epoch
 (at (at (select {mi: (minute ts) from: TS_nn}) 'mi) 0) -- 27
 (at (at (select {mi: (minute ts) from: TS_nn}) 'mi) 2) -- 59
 
 ;; SECOND — includes pre-epoch
-(at (at (select {s: (second ts) from: TS_nn}) 's) 0) -- 31
-(at (at (select {s: (second ts) from: TS_nn}) 's) 2) -- 59
+(at (at (select {s: (ss ts) from: TS_nn}) 's) 0) -- 31
+(at (at (select {s: (ss ts) from: TS_nn}) 's) 2) -- 59
 
 ;; DOW
-(at (at (select {dw: (dayofweek ts) from: TS_nn}) 'dw) 0) -- 5
-(at (at (select {dw: (dayofweek ts) from: TS_nn}) 'dw) 2) -- 5
+(at (at (select {dw: (dow ts) from: TS_nn}) 'dw) 0) -- 5
+(at (at (select {dw: (dow ts) from: TS_nn}) 'dw) 2) -- 5
 
 ;; DOY — includes leap year (2024) and non-leap (1999)
-(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 0) -- 75
-(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 1) -- 186
-(at (at (select {dy: (dayofyear ts) from: TS_nn}) 'dy) 2) -- 365
+(at (at (select {dy: (doy ts) from: TS_nn}) 'dy) 0) -- 75
+(at (at (select {dy: (doy ts) from: TS_nn}) 'dy) 1) -- 186
+(at (at (select {dy: (doy ts) from: TS_nn}) 'dy) 2) -- 365
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 2: exec_extract EXTRACT_INNER(0,1) — non-null DATE
@@ -75,20 +75,20 @@
 
 (set DT_nn (table [d] (list [2024.03.15 2024.07.04 1999.12.31])))
 
-(at (at (select {y: (year d) from: DT_nn}) 'y) 0) -- 2024
-(at (at (select {y: (year d) from: DT_nn}) 'y) 2) -- 1999
-(at (at (select {m: (month d) from: DT_nn}) 'm) 0) -- 3
-(at (at (select {m: (month d) from: DT_nn}) 'm) 2) -- 12
-(at (at (select {dd: (day d) from: DT_nn}) 'dd) 0) -- 15
-(at (at (select {dd: (day d) from: DT_nn}) 'dd) 2) -- 31
-(at (at (select {h: (hour d) from: DT_nn}) 'h) 0) -- 0
+(at (at (select {y: (yyyy d) from: DT_nn}) 'y) 0) -- 2024
+(at (at (select {y: (yyyy d) from: DT_nn}) 'y) 2) -- 1999
+(at (at (select {m: (mm d) from: DT_nn}) 'm) 0) -- 3
+(at (at (select {m: (mm d) from: DT_nn}) 'm) 2) -- 12
+(at (at (select {dd: (dd d) from: DT_nn}) 'dd) 0) -- 15
+(at (at (select {dd: (dd d) from: DT_nn}) 'dd) 2) -- 31
+(at (at (select {h: (hh d) from: DT_nn}) 'h) 0) -- 0
 (at (at (select {mi: (minute d) from: DT_nn}) 'mi) 0) -- 0
-(at (at (select {s: (second d) from: DT_nn}) 's) 0) -- 0
-(at (at (select {dw: (dayofweek d) from: DT_nn}) 'dw) 0) -- 5
-(at (at (select {dw: (dayofweek d) from: DT_nn}) 'dw) 2) -- 5
-(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 0) -- 75
-(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 1) -- 186
-(at (at (select {dy: (dayofyear d) from: DT_nn}) 'dy) 2) -- 365
+(at (at (select {s: (ss d) from: DT_nn}) 's) 0) -- 0
+(at (at (select {dw: (dow d) from: DT_nn}) 'dw) 0) -- 5
+(at (at (select {dw: (dow d) from: DT_nn}) 'dw) 2) -- 5
+(at (at (select {dy: (doy d) from: DT_nn}) 'dy) 0) -- 75
+(at (at (select {dy: (doy d) from: DT_nn}) 'dy) 1) -- 186
+(at (at (select {dy: (doy d) from: DT_nn}) 'dy) 2) -- 365
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 3: exec_extract EXTRACT_INNER(0,1) — non-null TIME
@@ -98,19 +98,19 @@
 
 (set TM_nn (table [t] (list [01:02:03.000 12:30:45.000 23:59:59.000])))
 
-(at (at (select {h: (hour t) from: TM_nn}) 'h) 0) -- 1
-(at (at (select {h: (hour t) from: TM_nn}) 'h) 1) -- 12
-(at (at (select {h: (hour t) from: TM_nn}) 'h) 2) -- 23
+(at (at (select {h: (hh t) from: TM_nn}) 'h) 0) -- 1
+(at (at (select {h: (hh t) from: TM_nn}) 'h) 1) -- 12
+(at (at (select {h: (hh t) from: TM_nn}) 'h) 2) -- 23
 (at (at (select {mi: (minute t) from: TM_nn}) 'mi) 0) -- 2
 (at (at (select {mi: (minute t) from: TM_nn}) 'mi) 1) -- 30
-(at (at (select {s: (second t) from: TM_nn}) 's) 0) -- 3
-(at (at (select {s: (second t) from: TM_nn}) 's) 1) -- 45
+(at (at (select {s: (ss t) from: TM_nn}) 's) 0) -- 3
+(at (at (select {s: (ss t) from: TM_nn}) 's) 1) -- 45
 ;; TIME is within day 0 (2000-01-01), so calendar fields are epoch-relative
-(at (at (select {y: (year t) from: TM_nn}) 'y) 0) -- 2000
-(at (at (select {m: (month t) from: TM_nn}) 'm) 0) -- 1
-(at (at (select {dd: (day t) from: TM_nn}) 'dd) 0) -- 1
-(at (at (select {dw: (dayofweek t) from: TM_nn}) 'dw) 0) -- 6
-(at (at (select {dy: (dayofyear t) from: TM_nn}) 'dy) 0) -- 1
+(at (at (select {y: (yyyy t) from: TM_nn}) 'y) 0) -- 2000
+(at (at (select {m: (mm t) from: TM_nn}) 'm) 0) -- 1
+(at (at (select {dd: (dd t) from: TM_nn}) 'dd) 0) -- 1
+(at (at (select {dw: (dow t) from: TM_nn}) 'dw) 0) -- 6
+(at (at (select {dy: (doy t) from: TM_nn}) 'dy) 0) -- 1
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 4: exec_extract EXTRACT_INNER(1,0) — null-bearing TIMESTAMP
@@ -122,27 +122,27 @@
 ;; -1800000000000 ns = 1999-12-31T23:30:00
 (set TS_wn (table [ts] (list (as 'TIMESTAMP [763828051000000000 0N -1800000000000]))))
 
-(at (at (select {y: (year ts) from: TS_wn}) 'y) 0) -- 2024
-(at (at (select {y: (year ts) from: TS_wn}) 'y) 1) -- 0Nl
-(at (at (select {y: (year ts) from: TS_wn}) 'y) 2) -- 1999
-(at (at (select {m: (month ts) from: TS_wn}) 'm) 0) -- 3
-(at (at (select {m: (month ts) from: TS_wn}) 'm) 1) -- 0Nl
-(at (at (select {d: (day ts) from: TS_wn}) 'd) 0) -- 15
-(at (at (select {d: (day ts) from: TS_wn}) 'd) 1) -- 0Nl
-(at (at (select {h: (hour ts) from: TS_wn}) 'h) 0) -- 14
-(at (at (select {h: (hour ts) from: TS_wn}) 'h) 1) -- 0Nl
-(at (at (select {h: (hour ts) from: TS_wn}) 'h) 2) -- 23
+(at (at (select {y: (yyyy ts) from: TS_wn}) 'y) 0) -- 2024
+(at (at (select {y: (yyyy ts) from: TS_wn}) 'y) 1) -- 0Nl
+(at (at (select {y: (yyyy ts) from: TS_wn}) 'y) 2) -- 1999
+(at (at (select {m: (mm ts) from: TS_wn}) 'm) 0) -- 3
+(at (at (select {m: (mm ts) from: TS_wn}) 'm) 1) -- 0Nl
+(at (at (select {d: (dd ts) from: TS_wn}) 'd) 0) -- 15
+(at (at (select {d: (dd ts) from: TS_wn}) 'd) 1) -- 0Nl
+(at (at (select {h: (hh ts) from: TS_wn}) 'h) 0) -- 14
+(at (at (select {h: (hh ts) from: TS_wn}) 'h) 1) -- 0Nl
+(at (at (select {h: (hh ts) from: TS_wn}) 'h) 2) -- 23
 (at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 0) -- 27
 (at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 1) -- 0Nl
 (at (at (select {mi: (minute ts) from: TS_wn}) 'mi) 2) -- 30
-(at (at (select {s: (second ts) from: TS_wn}) 's) 0) -- 31
-(at (at (select {s: (second ts) from: TS_wn}) 's) 1) -- 0Nl
-(at (at (select {s: (second ts) from: TS_wn}) 's) 2) -- 0
-(at (at (select {dw: (dayofweek ts) from: TS_wn}) 'dw) 0) -- 5
-(at (at (select {dw: (dayofweek ts) from: TS_wn}) 'dw) 1) -- 0Nl
-(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 0) -- 75
-(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear ts) from: TS_wn}) 'dy) 2) -- 365
+(at (at (select {s: (ss ts) from: TS_wn}) 's) 0) -- 31
+(at (at (select {s: (ss ts) from: TS_wn}) 's) 1) -- 0Nl
+(at (at (select {s: (ss ts) from: TS_wn}) 's) 2) -- 0
+(at (at (select {dw: (dow ts) from: TS_wn}) 'dw) 0) -- 5
+(at (at (select {dw: (dow ts) from: TS_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (doy ts) from: TS_wn}) 'dy) 0) -- 75
+(at (at (select {dy: (doy ts) from: TS_wn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy ts) from: TS_wn}) 'dy) 2) -- 365
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 5: exec_extract EXTRACT_INNER(1,1) — null-bearing DATE
@@ -150,23 +150,23 @@
 ;; 8840 = 2024-03-15 (leap year), 8951 = 2024-07-04
 (set DT_wn (table [d] (list (as 'DATE [8840 0N 8951]))))
 
-(at (at (select {y: (year d) from: DT_wn}) 'y) 0) -- 2024
-(at (at (select {y: (year d) from: DT_wn}) 'y) 1) -- 0Nl
-(at (at (select {m: (month d) from: DT_wn}) 'm) 0) -- 3
-(at (at (select {m: (month d) from: DT_wn}) 'm) 1) -- 0Nl
-(at (at (select {dd: (day d) from: DT_wn}) 'dd) 0) -- 15
-(at (at (select {dd: (day d) from: DT_wn}) 'dd) 1) -- 0Nl
-(at (at (select {h: (hour d) from: DT_wn}) 'h) 0) -- 0
-(at (at (select {h: (hour d) from: DT_wn}) 'h) 1) -- 0Nl
+(at (at (select {y: (yyyy d) from: DT_wn}) 'y) 0) -- 2024
+(at (at (select {y: (yyyy d) from: DT_wn}) 'y) 1) -- 0Nl
+(at (at (select {m: (mm d) from: DT_wn}) 'm) 0) -- 3
+(at (at (select {m: (mm d) from: DT_wn}) 'm) 1) -- 0Nl
+(at (at (select {dd: (dd d) from: DT_wn}) 'dd) 0) -- 15
+(at (at (select {dd: (dd d) from: DT_wn}) 'dd) 1) -- 0Nl
+(at (at (select {h: (hh d) from: DT_wn}) 'h) 0) -- 0
+(at (at (select {h: (hh d) from: DT_wn}) 'h) 1) -- 0Nl
 (at (at (select {mi: (minute d) from: DT_wn}) 'mi) 0) -- 0
 (at (at (select {mi: (minute d) from: DT_wn}) 'mi) 1) -- 0Nl
-(at (at (select {s: (second d) from: DT_wn}) 's) 0) -- 0
-(at (at (select {s: (second d) from: DT_wn}) 's) 1) -- 0Nl
-(at (at (select {dw: (dayofweek d) from: DT_wn}) 'dw) 0) -- 5
-(at (at (select {dw: (dayofweek d) from: DT_wn}) 'dw) 1) -- 0Nl
-(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 0) -- 75
-(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear d) from: DT_wn}) 'dy) 2) -- 186
+(at (at (select {s: (ss d) from: DT_wn}) 's) 0) -- 0
+(at (at (select {s: (ss d) from: DT_wn}) 's) 1) -- 0Nl
+(at (at (select {dw: (dow d) from: DT_wn}) 'dw) 0) -- 5
+(at (at (select {dw: (dow d) from: DT_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (doy d) from: DT_wn}) 'dy) 0) -- 75
+(at (at (select {dy: (doy d) from: DT_wn}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy d) from: DT_wn}) 'dy) 2) -- 186
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 6: exec_extract EXTRACT_INNER(1,1) — null-bearing TIME
@@ -174,22 +174,22 @@
 ;; in_type=RAY_TIME inside (1,1): exercises the IN32 ternary `*1000` arm.
 (set TM_wn (table [t] (list (as 'TIME [3723000 0N 86399000]))))
 
-(at (at (select {h: (hour t) from: TM_wn}) 'h) 0) -- 1
-(at (at (select {h: (hour t) from: TM_wn}) 'h) 1) -- 0Nl
+(at (at (select {h: (hh t) from: TM_wn}) 'h) 0) -- 1
+(at (at (select {h: (hh t) from: TM_wn}) 'h) 1) -- 0Nl
 (at (at (select {mi: (minute t) from: TM_wn}) 'mi) 0) -- 2
 (at (at (select {mi: (minute t) from: TM_wn}) 'mi) 1) -- 0Nl
-(at (at (select {s: (second t) from: TM_wn}) 's) 0) -- 3
-(at (at (select {s: (second t) from: TM_wn}) 's) 1) -- 0Nl
-(at (at (select {y: (year t) from: TM_wn}) 'y) 0) -- 2000
-(at (at (select {y: (year t) from: TM_wn}) 'y) 1) -- 0Nl
-(at (at (select {m: (month t) from: TM_wn}) 'm) 0) -- 1
-(at (at (select {m: (month t) from: TM_wn}) 'm) 1) -- 0Nl
-(at (at (select {dd: (day t) from: TM_wn}) 'dd) 0) -- 1
-(at (at (select {dd: (day t) from: TM_wn}) 'dd) 1) -- 0Nl
-(at (at (select {dw: (dayofweek t) from: TM_wn}) 'dw) 0) -- 6
-(at (at (select {dw: (dayofweek t) from: TM_wn}) 'dw) 1) -- 0Nl
-(at (at (select {dy: (dayofyear t) from: TM_wn}) 'dy) 0) -- 1
-(at (at (select {dy: (dayofyear t) from: TM_wn}) 'dy) 1) -- 0Nl
+(at (at (select {s: (ss t) from: TM_wn}) 's) 0) -- 3
+(at (at (select {s: (ss t) from: TM_wn}) 's) 1) -- 0Nl
+(at (at (select {y: (yyyy t) from: TM_wn}) 'y) 0) -- 2000
+(at (at (select {y: (yyyy t) from: TM_wn}) 'y) 1) -- 0Nl
+(at (at (select {m: (mm t) from: TM_wn}) 'm) 0) -- 1
+(at (at (select {m: (mm t) from: TM_wn}) 'm) 1) -- 0Nl
+(at (at (select {dd: (dd t) from: TM_wn}) 'dd) 0) -- 1
+(at (at (select {dd: (dd t) from: TM_wn}) 'dd) 1) -- 0Nl
+(at (at (select {dw: (dow t) from: TM_wn}) 'dw) 0) -- 6
+(at (at (select {dw: (dow t) from: TM_wn}) 'dw) 1) -- 0Nl
+(at (at (select {dy: (doy t) from: TM_wn}) 'dy) 0) -- 1
+(at (at (select {dy: (doy t) from: TM_wn}) 'dy) 1) -- 0Nl
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 7: exec_date_trunc DATE_TRUNC_INNER(0,0) — non-null TIMESTAMP
@@ -470,22 +470,22 @@
 ;; (1,0) null-bearing TIMESTAMP — exercise the doy leap path
 (set TS_leap_n (table [ts] (list (as 'TIMESTAMP [762566400000000000 0N 788918400000000000]))))
 ;; 762566400000000000 ns = 2024-03-01, 788918400000000000 ns = 2024-12-31
-(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 0) -- 61
-(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear ts) from: TS_leap_n}) 'dy) 2) -- 366
+(at (at (select {dy: (doy ts) from: TS_leap_n}) 'dy) 0) -- 61
+(at (at (select {dy: (doy ts) from: TS_leap_n}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy ts) from: TS_leap_n}) 'dy) 2) -- 366
 
 ;; (1,1) null-bearing DATE — exercise doy leap for IN32 path
 (set DT_leap_n (table [d] (list (as 'DATE [8826 0N 9131]))))
 ;; 8826 = 2024-03-01, 9131 = 2024-12-31
-(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 0) -- 61
-(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 1) -- 0Nl
-(at (at (select {dy: (dayofyear d) from: DT_leap_n}) 'dy) 2) -- 366
+(at (at (select {dy: (doy d) from: DT_leap_n}) 'dy) 0) -- 61
+(at (at (select {dy: (doy d) from: DT_leap_n}) 'dy) 1) -- 0Nl
+(at (at (select {dy: (doy d) from: DT_leap_n}) 'dy) 2) -- 366
 
 ;; Non-leap: ensure the false branch of `mo > 2 && leap` is hit too
 ;; 2023 is not a leap year. 2023-07-04 = doy 185
 (set TS_noleap (table [ts] (list [2023.07.04D12:00:00.000000000 2023.12.31D00:00:00.000000000])))
-(at (at (select {dy: (dayofyear ts) from: TS_noleap}) 'dy) 0) -- 185
-(at (at (select {dy: (dayofyear ts) from: TS_noleap}) 'dy) 1) -- 365
+(at (at (select {dy: (doy ts) from: TS_noleap}) 'dy) 0) -- 185
+(at (at (select {dy: (doy ts) from: TS_noleap}) 'dy) 1) -- 365
 
 ;; ════════════════════════════════════════════════════════════════════
 ;; Section 24: Pre-epoch us < 0 && us % USEC_PER_DAY != 0 in calendar

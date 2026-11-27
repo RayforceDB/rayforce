@@ -25,6 +25,7 @@
 #include "ops/hash.h"
 #include "ops/glob.h"
 #include "ops/agg_registry.h"
+#include "ops/temporal.h"     /* the date and time part accessors */
 #include "store/splay.h"
 #include "store/stream.h"
 #include "store/col.h"
@@ -5601,6 +5602,17 @@ static int64_t pq_column_id(ray_parquet_t* r, ray_t* x) {
         for (int64_t c = 0; c < r->ncols; c++) if (r->schema[c].name == x->i64) return c;
     return -1;
 }
+/* A date or time part accessor (yyyy, mm, dd, hh, minute, ss, dow, doy), by
+ * the function the name `x` holds, not its spelling: it reads only its
+ * argument, row by row. */
+static bool pq_temporal_part(ray_t* x) {
+    ray_t* fn = x && x->type == -RAY_SYM ? ray_env_get(x->i64) : NULL;
+    if (!fn || RAY_IS_ERR(fn) || fn->type != RAY_UNARY) return false;
+    ray_unary_fn f = (ray_unary_fn)(uintptr_t)fn->i64;
+    return f == ray_extract_yyyy_fn || f == ray_extract_mm_fn || f == ray_extract_dd_fn ||
+           f == ray_extract_hh_fn || f == ray_extract_minute_fn || f == ray_extract_ss_fn ||
+           f == ray_extract_dow_fn || f == ray_extract_doy_fn;
+}
 /* Only statically transparent expressions permit projection. Unknown calls,
  * lambdas and dynamic evaluation may reference columns through local scope. */
 static bool pq_references(ray_parquet_t* r, ray_t* e, uint8_t* keep, unsigned depth) {
@@ -5633,20 +5645,20 @@ static bool pq_references(ray_parquet_t* r, ray_t* e, uint8_t* keep, unsigned de
             "+","-","*","/","mod","%","div","==","!=","<","<=",">",">=","and","or","not",
             "sum","count","avg","min","max","first","last","distinct","all","any",
             "abs","sqrt","floor","ceil","round","log","exp","like","within","in",
-            "strlen","lower","upper","year","month","day","hour","minute","second","xbar",
+            "strlen","lower","upper","xbar",
             "if","nil?","substr","str-find"
         };
         if (fn && !strcmp(fn,"let")) {
             if (e->len != 4) return false;
             const char* binding = pq_symbol_name(ray_list_get(e,1));
-            if (!binding || !strcmp(binding,"let")) return false;
+            if (!binding || !strcmp(binding,"let") || pq_temporal_part(ray_list_get(e,1))) return false;
             for (size_t i = 0; i < sizeof(transparent)/sizeof(*transparent); i++)
                 if (!strcmp(binding,transparent[i])) return false;
             return pq_references(r,ray_list_get(e,2),keep,depth+1) &&
                 pq_references(r,ray_list_get(e,3),keep,depth+1);
         }
-        bool known = false;
-        for (size_t i = 0; fn && i < sizeof(transparent)/sizeof(*transparent); i++)
+        bool known = fn && pq_temporal_part(ray_list_get(e,0));
+        for (size_t i = 0; fn && !known && i < sizeof(transparent)/sizeof(*transparent); i++)
             if (!strcmp(fn,transparent[i])) { known = true; break; }
         if (!known) return false;
         /* A source column shadows a function name in query scope. */
