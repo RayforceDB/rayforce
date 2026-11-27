@@ -2560,6 +2560,23 @@ ray_op_t* compile_expr_dag(ray_graph_t* g, ray_t* expr) {
     return dag_temporal_int_readers_ok(g, base) ? &g->nodes[r->id] : NULL;
 }
 
+/* A name the query compiles that holds a lazy value (a local a compiled
+ * frame's window bound): read here and compiled as its concrete constant,
+ * as the same name holding that value would be (#1868).  The handle itself
+ * is no atom, though ray_is_atom says so of every type from RAY_LAMBDA up:
+ * as a constant node it read as one value.  The name is read at plan time,
+ * even where the evaluation would skip the operand that names it.  When the
+ * read fails, no node: the evaluator answers the expression, and a read
+ * there raises the value's own error (RAY_LAZY_G_FAILED, #1860). */
+static ray_op_t* compile_lazy_name(ray_graph_t* g, int64_t sym, ray_t* lazy) {
+    ray_t* v = ray_env_read_bound(sym, lazy);   /* the binding the lookup found */
+    if (!v || RAY_IS_ERR(v)) { if (v) ray_error_free(v); return NULL; }
+    ray_op_t* c = ray_is_lazy(v) ? NULL : ray_is_atom(v) ? ray_const_atom(g, v)
+                : ray_is_vec(v) ? ray_const_vec(g, v) : NULL;
+    ray_release(v);
+    return c;
+}
+
 static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
     if (!expr) return NULL;
 
@@ -2593,6 +2610,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
         if (alias) return alias;
         ray_t* local = g->cexpr_helper_depth > 0 ? ray_env_get_lexical_local_callee(expr->i64)
                                                  : ray_env_get_lexical_local(expr->i64);
+        if (local && ray_is_lazy(local)) return compile_lazy_name(g, expr->i64, local);
         if (local) {
             if (ray_is_atom(local)) return ray_const_atom(g, local);
             if (ray_is_vec(local))  return ray_const_vec(g, local);
@@ -2668,6 +2686,7 @@ static ray_op_t* compile_expr_dag_node(ray_graph_t* g, ray_t* expr) {
          * window of whoever evaluated the query is not its scope. */
         ray_t* gv = g->cexpr_helper_depth > 0 ? ray_env_get_compiled(expr->i64)
                                               : ray_env_get(expr->i64);
+        if (gv && ray_is_lazy(gv)) return compile_lazy_name(g, expr->i64, gv);
         if (gv) {
             if (ray_is_atom(gv)) return ray_const_atom(g, gv);
             if (ray_is_vec(gv))  return ray_const_vec(g, gv);
