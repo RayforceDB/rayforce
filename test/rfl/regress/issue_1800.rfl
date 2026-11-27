@@ -1,0 +1,52 @@
+;; #1800: filter of a vector by a mask copied each kept cell at the in-memory
+;; width of its type: a SYM column of a file holds 1-, 2- or 4-byte ids, so
+;; the copy read 8 bytes a cell at 8 times its offset, past the column's end,
+;; and the result resolved over the process domain, not the file's.  A STR
+;; result lost the source's string pool, and with it every string longer
+;; than its 12 inline bytes.  The result now has the source's width, domain
+;; and pool, as take's does.
+(.sys.exec "rm -rf /tmp/rf_issue_1800 && mkdir -p /tmp/rf_issue_1800") -- 0
+(set T (table [g c s x] (list ['a 'a 'b 'b] [true false true false] ['p 'q 'r 's] (list "a string longer than twelve bytes" "q" "another string longer than twelve" "s"))))
+(.db.splayed.set "/tmp/rf_issue_1800/spl/t/" T "/tmp/rf_issue_1800/spl/.sym")
+(set S (.db.splayed.get "/tmp/rf_issue_1800/spl/t/" "/tmp/rf_issue_1800/spl/.sym"))
+(map (fn [p] (.db.splayed.set (format "/tmp/rf_issue_1800/par/%/t" (+ 2024.01.01 p)) T "/tmp/rf_issue_1800/par/.sym")) (til 2))
+(set P (.db.parted.get "/tmp/rf_issue_1800/par/" 't))
+(.db.splayed.set "/tmp/rf_issue_1800/cmp/t/" T "/tmp/rf_issue_1800/cmp/.sym" {compress: true})
+(set Z (.db.splayed.get "/tmp/rf_issue_1800/cmp/t/" "/tmp/rf_issue_1800/cmp/.sym"))
+(filter (at T 's) (at T 'c)) -- [p r]
+;; an in-memory STR vector lost its long strings the same way
+(filter (as 'STR (list "a string longer than twelve bytes" "q" "another string longer than twelve" "s")) [true false true false]) -- (as 'STR (list "a string longer than twelve bytes" "another string longer than twelve"))
+;; and as a table's column inside select by:
+(set M (table [g c x] (list ['a 'a 'b 'b] [true false true false] (as 'STR (list "a string longer than twelve bytes" "q" "another string longer than twelve" "s")))))
+(at (select {from: M by: g l: (last (filter x c))}) 'l) -- (as 'STR (list "a string longer than twelve bytes" "another string longer than twelve"))
+(filter (at S 's) (at S 'c)) -- [p r]
+(filter (at Z 's) (at Z 'c)) -- [p r]
+(filter (at S 'x) (at S 'c)) -- (list "a string longer than twelve bytes" "another string longer than twelve")
+(filter (at Z 'x) (at Z 'c)) -- (list "a string longer than twelve bytes" "another string longer than twelve")
+;; inside a query: each group's surviving rows, as over the table in memory
+(at (select {from: P by: g l: (last (filter s c))}) 'l) -- [p r]
+(at (select {from: P by: g l: (first (filter s c))}) 'l) -- [p r]
+(at (select {from: S by: g l: (last (filter s c))}) 'l) -- [p r]
+(at (select {from: P l: (last (filter s c))}) 'l) -- [r]
+(at (select {from: P by: g l: (filter s c)}) 'l) -- (list [p p] [r r])
+(at (select {from: P by: g l: (last (filter x c))}) 'l) -- (list "a string longer than twelve bytes" "another string longer than twelve")
+;; 2- and 4-byte ids: 300 and 70000 symbols
+(set n 70000)
+(set mk (fn [m] (table [s c] (list (map (fn [i] (as 'SYM (format "v%" (% i m)))) (til n)) (== 0 (% (til n) 100))))))
+(set T2 (mk 300))
+(.db.splayed.set "/tmp/rf_issue_1800/w16/t/" T2 "/tmp/rf_issue_1800/w16/.sym")
+(set S2 (.db.splayed.get "/tmp/rf_issue_1800/w16/t/" "/tmp/rf_issue_1800/w16/.sym"))
+(filter (at S2 's) (at S2 'c)) -- (filter (at T2 's) (at T2 'c))
+(take (filter (at S2 's) (at S2 'c)) 3) -- [v0 v100 v200]
+(set T4 (mk n))
+(.db.splayed.set "/tmp/rf_issue_1800/w32/t/" T4 "/tmp/rf_issue_1800/w32/.sym")
+(set S4 (.db.splayed.get "/tmp/rf_issue_1800/w32/t/" "/tmp/rf_issue_1800/w32/.sym"))
+(filter (at S4 's) (at S4 'c)) -- (filter (at T4 's) (at T4 'c))
+(last (filter (at S4 's) (at S4 'c))) -- 'v69900
+;; a larger 1-byte column read past its end and crashed
+(set n 100000)
+(.db.splayed.set "/tmp/rf_issue_1800/big/t/" (table [s c] (list (at ['p 'q 'r 's] (% (til n) 4)) (== 0 (% (til n) 2)))) "/tmp/rf_issue_1800/big/.sym")
+(set SB (.db.splayed.get "/tmp/rf_issue_1800/big/t/" "/tmp/rf_issue_1800/big/.sym"))
+(count (filter (at SB 's) (at SB 'c))) -- 50000
+(distinct (filter (at SB 's) (at SB 'c))) -- [p r]
+(.sys.exec "rm -rf /tmp/rf_issue_1800") -- 0

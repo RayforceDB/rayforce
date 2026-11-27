@@ -1822,11 +1822,17 @@ ray_t* ray_filter_fn(ray_t* vec, ray_t* mask) {
         int64_t count = 0;
         for (int64_t i = 0; i < len; i++) if (mb[i]) count++;
 
+        /* A cell at the vector's own width: a SYM column of a file holds
+         * 1-, 2- or 4-byte ids into its file's domain, which the result
+         * keeps; a STR cell longer than its inline bytes points into the
+         * source's string pool, which the result shares (#1800). */
         int8_t vtype = vec->type;
-        int esz = ray_elem_size(vtype);
-        ray_t* result = ray_vec_new(vtype, count);
+        int esz = ray_sym_elem_size(vtype, vec->attrs);
+        ray_t* result = col_vec_new(vec, count);
         if (RAY_IS_ERR(result)) return result;
         result->len = count;
+        if (vtype == RAY_SYM) ray_sym_vec_adopt_domain(result, vec);
+        if (vtype == RAY_STR) col_propagate_str_pool(result, vec);
         char* src = (char*)ray_data(vec);
         char* dst = (char*)ray_data(result);
         int64_t j = 0;
