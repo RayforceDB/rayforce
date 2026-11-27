@@ -16285,6 +16285,58 @@ static test_result_t test_group_indices_alloc_fail(void) {
 }
 #endif
 
+#ifdef DEBUG
+/* The per-row and row-store paths of the query engine under an allocation
+ * failure: a cell boxed by collection_elem that fails to allocate is the
+ * failure, never a false condition, a row number 0, a null cell or a NULL
+ * key.  And .emb.model.get frees the error a failed read answers, which
+ * ray_release leaves.  Each run answers the unfailed answer or `oom`,
+ * keeping nothing either way (group_indices_sweep_one). */
+static test_result_t test_query_cell_alloc_fail(void) {
+    static const char* const setup[] = {
+        "(set T9 (table [k v d t] (list (% (til 200) 5) (til 200) (+ 2024.01.01 (% (til 200) 40)) (as 'TIME (* 1000 (til 200))))))",
+        "(set TL9 (table [k v L] (list (% (til 20) 4) (til 20) (map (fn [i] (list i \"a\")) (til 20)))))",
+    };
+    for (size_t i = 0; i < sizeof setup / sizeof *setup; i++) {
+        ray_t* r = ray_eval_str(setup[i]);
+        TEST_ASSERT(r && !RAY_IS_ERR(r), "setup");
+        ray_release(r);
+    }
+    static const char* const qs[] = {
+        "(select {r: (if (% v 2) 1 0) from: T9})",
+        "(update {v: (+ v 1) from: T9 by: k})",
+        "(update {w: (first v) from: T9 by: k})",
+        "(update {L: (first L) from: TL9 by: k})",
+        "(update {L: (+ v 1) from: TL9 by: k})",   /* a typed result into a list column */
+        "(insert T9 (dict ['k 'v 'd 't] (list 1 2 2024.01.01 10:00:00.000)))",
+        "(insert T9 (list (as 'I32 [1 2]) (list 3 4) (list 2024.01.01 2024.01.02) (list 10:00:00.000 11:00:00.000)))",   /* cell by cell */
+        "(upsert T9 'k (table [k v d t] (list [1 9] [5 6] [2024.01.01 2024.01.02] [10:00:00.000 11:00:00.000])))",
+        "(upsert T9 'k (dict ['k 'v 'd 't] (list 1 2 2024.01.01 10:00:00.000)))",
+        "(select {c: (count v) from: T9 by: (yyyy d)})",
+        "(select {c: (count v) from: T9 by: (% v 3)})",
+        "(select {f: (first v) from: T9 by: (% v 3)})",
+    };
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++)
+        TEST_ASSERT_FMT(group_indices_sweep_one(qs[q]) > 0, "%s: an allocation failure answered other than the answer or oom keeping nothing", qs[q]);
+    /* a model directory without its files: the read's error is freed */
+    for (int i = 0; i < 2; i++) {
+        ray_heap_gc();
+        TEST_ASSERT_TRUE(ray_mem_trace_begin());
+        ray_t* r = ray_eval_str("(.emb.model.get \"test/data/emb/no-such-model\")");
+        TEST_ASSERT(r && RAY_IS_ERR(r), "a missing model is an error");
+        ray_error_free(r);
+        ray_clear_error_trace();
+        ray_heap_gc();
+        ray_mem_trace_t tr;
+        ray_mem_trace_end(&tr);
+        TEST_ASSERT_FMT(tr.net_bytes == 0, "a missing model keeps %lld bytes", (long long)tr.net_bytes);
+    }
+    ray_t* z = ray_eval_str("(do (set T9 0) (set TL9 0))");
+    if (z && !RAY_IS_ERR(z)) ray_release(z);
+    PASS();
+}
+#endif
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -16833,5 +16885,8 @@ const test_entry_t lang_entries[] = {
 #endif
 
     { "lang/eval/part_skip_date_part", test_eval_part_skip_date_part, lang_setup, lang_teardown },
+#ifdef DEBUG
+    { "lang/query/cell_alloc_fail", test_query_cell_alloc_fail, lang_setup, lang_teardown },
+#endif
     { NULL, NULL, NULL, NULL },
 };

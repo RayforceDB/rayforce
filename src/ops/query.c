@@ -14192,33 +14192,38 @@ done:
 }
 
 /* Each row's truth of the condition value `cv` into `t` (is_truthy's
- * rule, as OP_IF's fills read it; a null is false). */
-static void rw_truth(ray_t* cv, int64_t n, uint8_t* t) {
+ * rule, as OP_IF's fills read it; a null is false).  False when a cell
+ * fails to box (#1854): never a false condition in its place. */
+static bool rw_truth(ray_t* cv, int64_t n, uint8_t* t) {
     const void* d = ray_data(cv);
     switch (cv->type) {
     case RAY_BOOL: case RAY_U8:
         for (int64_t r = 0; r < n; r++) t[r] = ((const uint8_t*)d)[r] != 0;
-        return;
+        return true;
     case RAY_I16:
         for (int64_t r = 0; r < n; r++) t[r] = ((const int16_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
-        return;
+        return true;
     case RAY_I32: case RAY_DATE: case RAY_TIME:
         for (int64_t r = 0; r < n; r++) t[r] = ((const int32_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
-        return;
+        return true;
     case RAY_I64: case RAY_TIMESTAMP: case RAY_TIMESPAN:
         for (int64_t r = 0; r < n; r++) t[r] = ((const int64_t*)d)[r] != 0 && !ray_vec_is_null(cv, r);
-        return;
+        return true;
     case RAY_F64:
         for (int64_t r = 0; r < n; r++) { double v = ((const double*)d)[r]; t[r] = v != 0.0 && v == v; }
-        return;
+        return true;
     default:
         for (int64_t r = 0; r < n; r++) {
             int ca = 0;
             ray_t* cc = collection_elem(cv, r, &ca);
+            /* a list's cell is borrowed (a NULL one is false); a boxed one
+             * is owned here, and its failure is the failure */
+            if (ca && (!cc || RAY_IS_ERR(cc))) { ray_error_free(cc); return false; }
             t[r] = cc && !RAY_IS_ERR(cc) && is_truthy(cc);
             if (ca) ray_release(cc);
         }
     }
+    return true;
 }
 
 /* The `if` chain `e` from its pair `i` on, over the rows `reach` marks (the
@@ -14249,6 +14254,11 @@ static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, i
     if (one) {
         int ca = 0;
         ray_t* cc = ray_is_atom(cv) ? cv : collection_elem(cv, 0, &ca);
+        if (ca && (!cc || RAY_IS_ERR(cc))) {   /* never a false condition (#1854) */
+            ray_error_free(cc);                /* boxed here, owned here */
+            ray_release(cv);                   /* owned here */
+            return ray_error("oom", NULL);
+        }
         bool t = cc && !RAY_IS_ERR(cc) && is_truthy(cc);
         if (ca) ray_release(cc);
         ray_release(cv);
@@ -14259,7 +14269,7 @@ static ray_t* rw_chain(ray_t* e, int64_t i, const uint8_t* reach, rw_ctx_t* c, i
     ray_t* thdr = NULL;
     uint8_t* t = (uint8_t*)scratch_alloc(&thdr, (size_t)(nr > 0 ? nr : 1));
     if (!t) { ray_release(cv); return ray_error("oom", NULL); }
-    rw_truth(cv, nr, t);
+    if (!rw_truth(cv, nr, t)) { scratch_free(thdr); ray_release(cv); return ray_error("oom", NULL); }
     bool sel_t = nr == 0, sel_f = nr == 0;
     for (int64_t r = 0; r < nr; r++) {
         bool in = !reach || reach[r];
@@ -16356,8 +16366,13 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
                 for (int64_t k = 0; k < cnt; k++) {
                     int alloc = 0;
                     ray_t* e = collection_elem(idx_list, k, &alloc);
+                    if (alloc && (!e || RAY_IS_ERR(e))) {   /* never row 0 (#1854) */
+                        ray_error_free(e);                  /* boxed here, owned here */
+                        scratch_free(idx_hdr); scratch_free(off_hdr); scratch_free(cnt_hdr);
+                        return ray_error("oom", NULL);
+                    }
                     idx_buf[pos + k] = e ? as_i64(e) : 0;
-                    if (alloc && e) ray_release(e);
+                    if (alloc) ray_release(e);
                 }
             }
         }
@@ -16425,8 +16440,14 @@ static ray_t* count_distinct_per_group_groups(ray_t* inner_expr, ray_t* tbl,
             for (int64_t k = 0; k < cnt; k++) {
                 int alloc = 0;
                 ray_t* e = collection_elem(idx_list, k, &alloc);
+                if (alloc && (!e || RAY_IS_ERR(e))) {   /* never row 0 (#1854) */
+                    ray_error_free(e);                  /* boxed here, owned here */
+                    scratch_free(tmp_hdr);
+                    ray_release(src); ray_release(out);  /* both owned here */
+                    return ray_error("oom", NULL);
+                }
                 tmp[k] = e ? as_i64(e) : 0;
-                if (alloc && e) ray_release(e);
+                if (alloc) ray_release(e);
             }
             subset = gather_by_idx(src, tmp, cnt);
             scratch_free(tmp_hdr);
@@ -20007,6 +20028,7 @@ static ray_t* try_temporal_group_materialize(ray_t* dict, ray_t* tbl, unsigned p
             if (!rewritten) { rewritten = dict; ray_retain(rewritten); }
             int alloc = 0;
             ray_t* key = collection_elem(keys, i, &alloc);
+            if (alloc) MAT_CHECK(key);   /* boxed here: its error is the answer, never a NULL key (#1854) */
             rewritten = ray_dict_upsert(rewritten, key, replacement);
             if (alloc) ray_release(key);
             ray_release(replacement); replacement = NULL;
@@ -27769,6 +27791,11 @@ static ray_t* keys_first_gather(ray_t* src, const int64_t* rows, int64_t n) {
         }
         int alloc = 0;
         ray_t* val = collection_elem(src, rows[gi], &alloc);
+        if (alloc && (!val || RAY_IS_ERR(val))) {   /* never a cell stored from NULL (#1854) */
+            ray_error_free(val);                    /* boxed here, owned here */
+            ray_release(dst);                       /* owned here */
+            return ray_error("oom", NULL);
+        }
         store_typed_elem(dst, gi, val);
         if (alloc) ray_release(val);
     }
@@ -30826,13 +30853,18 @@ by_dict_done:
                                 dst->len = out_groups;
                                 for (int64_t gi = 0; gi < out_groups; gi++) {
                                     int a = 0; ray_t* v = collection_elem(sc, fi[gi], &a);
+                                    if (a && (!v || RAY_IS_ERR(v))) {   /* never a cell stored from NULL (#1854) */
+                                        ray_error_free(v);              /* boxed here, owned here */
+                                        ray_release(dst); dst = NULL;   /* owned here: the oom exit below */
+                                        break;
+                                    }
                                     store_typed_elem(dst, gi, v);
                                     if (a) ray_release(v);
                                 }
                             }
                         }
                         if (!dst || RAY_IS_ERR(dst)) {
-                            if (dst) ray_release(dst);
+                            ray_error_free(dst);   /* a failed vector's error, owned here; ray_release leaves it */
                             ray_free(fi_hdr); ray_release(result); ray_release(groups); if (eval_tbl != tbl) ray_release(eval_tbl); ray_release(tbl);
                             scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
                         }
@@ -32602,8 +32634,21 @@ by_dict_done:
                     fi2 = (int64_t*)ray_data(fi2_hdr);
                 }
                 for (int64_t g2 = 0; g2 < ng2; g2++) {
+                    ray_t* il2 = gi2[g2 * 2 + 1];
+                    if (il2 && il2->type == RAY_I64 && il2->len > 0) {   /* the group's first row, unboxed */
+                        fi2[g2] = ((const int64_t*)ray_data(il2))[0];
+                        continue;
+                    }
                     int alloc2 = 0;
-                    ray_t* i02 = collection_elem(gi2[g2 * 2 + 1], 0, &alloc2);
+                    ray_t* i02 = collection_elem(il2, 0, &alloc2);
+                    if (alloc2 && (!i02 || RAY_IS_ERR(i02))) {   /* never as_i64 of NULL (#1854) */
+                        ray_error_free(i02);                     /* boxed here, owned here */
+                        if (fi2_hdr) ray_free(fi2_hdr);
+                        ray_release(groups2); ray_release(computed_key);
+                        if (filtered_tbl != tbl) ray_release(filtered_tbl);
+                        ray_release(tbl);
+                        scratch_free(sel_slots_hdr); DICT_VIEW_CLOSE(dv); return ray_error("oom", NULL);
+                    }
                     fi2[g2] = as_i64(i02);
                     if (alloc2) ray_release(i02);
                 }
@@ -36969,6 +37014,12 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     for (int64_t r = 0; r < gsize; r++) {
                         int alloc = 0;
                         ray_t* cell = atom ? agg_result : collection_elem(agg_result, r, &alloc);
+                        if (alloc && (!cell || RAY_IS_ERR(cell))) {   /* never a NULL cell (#1854) */
+                            ray_error_free(cell);                     /* boxed here, owned here */
+                            ray_release(agg_result); ray_release(out_col);   /* both owned here */
+                            UPDATE_BY_CLEANUP_COLS(); ray_release(groups); ray_release(tbl); DICT_VIEW_CLOSE(updv);
+                            return ray_error("oom", NULL);
+                        }
                         if (!alloc) ray_retain(cell);
                         ray_release(d[lidxs[r]]);
                         d[lidxs[r]] = cell;
@@ -37030,6 +37081,11 @@ static ray_t* ray_update_on(ray_t* dict, ray_t* tbl, int64_t inplace_sym) {
                     for (int64_t r = 0; r < gsize && !store_err; r++) {
                         int alloc = 0;
                         ray_t* cell = collection_elem(agg_result, r, &alloc);
+                        /* a typed vector's cell is always boxed here (alloc) */
+                        if (RAY_UNLIKELY(!cell || RAY_IS_ERR(cell))) {   /* never a NULL cell stored (#1854) */
+                            store_err = cell ? cell : ray_error("oom", NULL);   /* boxed here: owned, answered below */
+                            break;
+                        }
                         ray_t* nc = update_by_store(out_col, idxs[r], cell);
                         if (RAY_IS_ERR(nc)) store_err = nc; else out_col = nc;
                         if (alloc) ray_release(cell);
@@ -38252,6 +38308,11 @@ static ray_t* normalize_parted_insert_rows(ray_t* tbl,
         } else {
             int owned = 0;
             ray_t* item = collection_elem(dvals, found, &owned);
+            if (owned && (!item || RAY_IS_ERR(item))) {   /* never a NULL item (#1854) */
+                ray_error_free(item);                     /* boxed here, owned here */
+                ray_release(vals);                        /* owned here */
+                return ray_error("oom", NULL);
+            }
             vals = parted_values_append(vals, item, owned != 0);
         }
         if (!vals || RAY_IS_ERR(vals)) return vals;
@@ -39442,7 +39503,10 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
         int64_t dict_len = dkeys->len;
 
         dict_vals = ray_alloc(ncols * sizeof(ray_t*));
-        if (!dict_vals) { ray_release(tbl); ray_release(row_orig); return ray_error("oom", NULL); }
+        if (!dict_vals || RAY_IS_ERR(dict_vals)) {
+            ray_error_free(dict_vals);   /* a refused size's error, owned here */
+            ray_release(tbl); ray_release(row_orig); return ray_error("oom", NULL);
+        }
         dict_vals->type = RAY_LIST;
         dict_vals->len = ncols;
         ray_t** dv = (ray_t**)ray_data(dict_vals);
@@ -39462,6 +39526,15 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 } else {
                     int alloc = 0;
                     dv[c] = collection_elem(dvals, d, &alloc);
+                    if (alloc && (!dv[c] || RAY_IS_ERR(dv[c]))) {   /* never a column left out (#1854) */
+                        ray_error_free(dv[c]);                      /* boxed here, owned here */
+                        dv[c] = NULL;
+                        for (int64_t j = 0; j < c; j++) if (dv[j]) ray_release(dv[j]);   /* the cells made, owned here */
+                        dict_vals->len = 0;
+                        ray_free(dict_vals);
+                        ray_release(tbl); ray_release(row_orig);
+                        return ray_error("oom", NULL);
+                    }
                     if (!alloc && dv[c]) ray_retain(dv[c]);
                 }
                 break;
@@ -39634,6 +39707,11 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
                 for (int64_t k = 0; k < m && !RAY_IS_ERR(res); k++) {
                     int alloc = 0;
                     ray_t* e = collection_elem(pay, k, &alloc);
+                    if (alloc && (!e || RAY_IS_ERR(e))) {   /* a cell that failed to box: never a null (#1854) */
+                        ray_error_free(e);                  /* boxed here, owned here */
+                        res = ray_error("oom", NULL);       /* the column stays in slots[c] for the roll-back */
+                        break;
+                    }
                     if (!e) {
                         ray_t* na = ray_typed_null(-ct);
                         res = append_atom_to_col(res, na);
@@ -39813,6 +39891,12 @@ ray_t* ray_insert(ray_t** args, int64_t n) {
             for (int64_t k = 0; k < m; k++) {
                 int alloc = 0;
                 ray_t* e = collection_elem(payload, k, &alloc);
+                if (alloc && (!e || RAY_IS_ERR(e))) {   /* a cell that failed to box: never a null (#1854) */
+                    ray_error_free(e);                  /* boxed here, owned here */
+                    ray_release(new_col);               /* the rebuilt column, owned here */
+                    new_col = ray_error("oom", NULL);
+                    break;
+                }
                 if (!e) {
                     ray_t* na = ray_typed_null(-ct);
                     new_col = append_atom_to_col(new_col, na);
@@ -41127,10 +41211,23 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             single->type = RAY_LIST;
             single->len = ncols;
             ray_t** sr = (ray_t**)ray_data(single);
+            bool cell_fail = false;
             for (int64_t c = 0; c < ncols; c++) {
                 int alloc = 0;
+                if (cell_fail) { sr[c] = NULL; continue; }
                 sr[c] = src_cols[c] ? collection_elem(src_cols[c], r, &alloc) : NULL;
+                if (alloc && (!sr[c] || RAY_IS_ERR(sr[c]))) {   /* never a column left out (#1854) */
+                    ray_error_free(sr[c]);                      /* boxed here, owned here */
+                    sr[c] = NULL; cell_fail = true; continue;
+                }
                 if (!alloc && sr[c]) ray_retain(sr[c]);
+            }
+            if (cell_fail) {
+                for (int64_t c = 0; c < ncols; c++) if (sr[c]) ray_release(sr[c]);   /* the cells made, owned here */
+                single->len = 0;
+                ray_free(single);
+                scratch_free(srcs_hdr); ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return ray_error("oom", NULL);
             }
             ray_t* upsert_args[3] = { cur_tbl, key_sym, single };
             ray_t* new_tbl = ray_upsert_fn(upsert_args, 3);
@@ -41200,6 +41297,15 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
                 } else {
                     int alloc = 0;
                     drl[c] = collection_elem(dvals, d, &alloc);
+                    if (alloc && (!drl[c] || RAY_IS_ERR(drl[c]))) {   /* never a column left out (#1854) */
+                        ray_error_free(drl[c]);                       /* boxed here, owned here */
+                        drl[c] = NULL;
+                        for (int64_t j = 0; j < c; j++) if (drl[j]) ray_release(drl[j]);   /* the cells made, owned here */
+                        dict_row_list->len = 0;
+                        ray_free(dict_row_list);
+                        ray_release(tbl); ray_release(key_sym); ray_release(row);
+                        return ray_error("oom", NULL);
+                    }
                     if (!alloc && drl[c]) ray_retain(drl[c]);
                 }
                 break;
@@ -41284,11 +41390,24 @@ ray_t* ray_upsert(ray_t** args, int64_t n) {
             single_row->type = RAY_LIST;
             single_row->len = ncols;
             ray_t** sr = (ray_t**)ray_data(single_row);
+            bool cell_fail = false;
             for (int64_t c = 0; c < ncols; c++) {
                 int alloc = 0;
+                if (cell_fail) { sr[c] = NULL; continue; }
                 /* A column a dict row left out stays a NULL slot. */
                 sr[c] = row_elems[c] ? collection_elem(row_elems[c], r, &alloc) : NULL;
+                if (alloc && (!sr[c] || RAY_IS_ERR(sr[c]))) {   /* never a column left out (#1854) */
+                    ray_error_free(sr[c]);                      /* boxed here, owned here */
+                    sr[c] = NULL; cell_fail = true; continue;
+                }
                 if (!alloc && sr[c]) ray_retain(sr[c]);
+            }
+            if (cell_fail) {
+                for (int64_t c = 0; c < ncols; c++) if (sr[c]) ray_release(sr[c]);   /* the cells made, owned here */
+                single_row->len = 0;
+                ray_free(single_row);
+                scratch_free(kci_hdr); ray_release(cur_tbl); ray_release(tbl); ray_release(key_sym); ray_release(row);
+                return ray_error("oom", NULL);
             }
             /* Upsert single row into current table */
             ray_t* upsert_args[3] = { cur_tbl, key_sym, single_row };
