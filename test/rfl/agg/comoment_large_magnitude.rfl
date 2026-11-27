@@ -1,0 +1,155 @@
+;; cov and scov are translation-invariant: shifting both columns by a
+;; constant must not change them.  They were computed from the raw sums,
+;; (sum(x*y) - sum(x)*sum(y)/n) / n, which cancels to noise of the size of
+;; n*x^2 once the values are large next to their spread: 200,000 copies of
+;; 3e38e gave a covariance of 2.8e+65 where it is 0, and under by: the noise
+;; changed with the worker count (#1847).  They now sum about a pair of the
+;; data, on every route.
+(set n 200000)
+(set X (take 3e38e n))
+(set T (table [k x] (list (take 'a n) X)))
+(cov X X) -- 0.0
+(scov X X) -- 0.0
+(at (select {r: (cov x x) from: T}) 'r) -- [0.0]
+(at (select {r: (cov x x) from: T by: k}) 'r) -- [0.0]
+(at (select {r: (scov x x) from: T by: k}) 'r) -- [0.0]
+(at (select {r: (cov x x) from: T by: k where: (> x 0.0)}) 'r) -- [0.0]
+(cov (as 'F64 X) (as 'F64 X)) -- 0.0
+
+;; values 1e8 apart from 0 with a spread of a few units: the population
+;; variance of 1e8 + [0 1 2 3] is 1.25, and so is cov x x; y = 7 - 2x gives
+;; cov -2.5
+(set Y (+ 1e8 (as 'F64 (% (til n) 4))))
+(set Z (- 7.0 (* 2.0 Y)))
+(cov Y Y) -- 1.25
+(cov Y Z) -- -2.5
+(set TY (table [k x y] (list (% (til n) 3) Y Z)))
+(at (select {r: (cov x y) from: TY by: k}) 'r) -- [-2.5 -2.5 -2.5]
+(at (select {r: (cov x y) from: TY by: k where: (> x 0.0)}) 'r) -- [-2.5 -2.5 -2.5]
+(at (select {r: (cov x y) from: TY}) 'r) -- [-2.5]
+;; a high-cardinality key: every group of 4 rows holds 1e8 + [0 1 2 3]
+(set TH (table [k x y] (list (div (til n) 4) Y Z)))
+(distinct (at (select {r: (cov x y) from: TH by: k}) 'r)) -- [-2.5]
+(distinct (at (select {r: (scov x y) from: TH by: k where: (> x 0.0)}) 'r)) -- [-3.3333333333333335]
+;; integers: the same spread about 1e15
+(set I (+ 1000000000000000 (% (til n) 4)))
+(cov I I) -- 1.25
+(at (select {r: (cov x x) from: (table [k x] (list (% (til n) 3) I)) by: k}) 'r) -- [1.25 1.25 1.25]
+
+;; the index-slice route: a grouped key filtered by membership
+(set S (take ['a 'b 'c] n))
+(set TS (table [s x y] (list (.attr.set 'grouped S) Y Z)))
+(at (select {r: (cov x y) from: TS by: s where: (in s ['a 'b])}) 'r) -- [-2.5 -2.5]
+(set TSS (xasc (table [s x y] (list S Y Z)) ['s]))
+(set TP (table [s x y] (list (.attr.set 'parted (at TSS 's)) (at TSS 'x) (at TSS 'y))))
+(at (select {r: (cov x y) from: TP by: s where: (in s ['a 'b])}) 'r) -- [-2.5 -2.5]
+
+;; a parted table: keyless and by a key
+(.sys.exec "rm -rf /tmp/rf_comoment_large /tmp/rf_comoment_small")
+(.db.splayed.set "/tmp/rf_comoment_large/2024.01.01/t/" (table [k x y] (list (% (til 1000) 3) (take Y 1000) (take Z 1000))))
+(.db.splayed.set "/tmp/rf_comoment_large/2024.01.02/t/" (table [k x y] (list (% (til 1000) 3) (take Y 1000) (take Z 1000))))
+(set PT (.db.parted.get "/tmp/rf_comoment_large/" 't))
+(at (select {r: (cov x y) from: PT}) 'r) -- [-2.5]
+;; by a key whose groups do not hold the four values evenly: the oracle is
+;; the same table shifted back to small values
+(.db.splayed.set "/tmp/rf_comoment_small/2024.01.01/t/" (table [k x y] (list (% (til 1000) 3) (- (take Y 1000) 1e8) (+ (take Z 1000) 2e8))))
+(.db.splayed.set "/tmp/rf_comoment_small/2024.01.02/t/" (table [k x y] (list (% (til 1000) 3) (- (take Y 1000) 1e8) (+ (take Z 1000) 2e8))))
+(set PS (.db.parted.get "/tmp/rf_comoment_small/" 't))
+(max (abs (- (at (select {r: (cov x y) from: PT by: k}) 'r) (at (select {r: (cov x y) from: PS by: k}) 'r)))) -- 0.0
+(< (abs (+ 2.5 (first (at (select {r: (cov x y) from: PT by: k}) 'r)))) 0.02) -- true
+(.sys.exec "rm -rf /tmp/rf_comoment_large /tmp/rf_comoment_small")
+
+;; too few pairs keep their answers: cov of one pair is 0, scov of one
+;; pair, and either of none, are the null
+(cov [1e100] [1e100]) -- 0.0
+(scov [1e300] [1e300]) -- 0Nf
+(at (select {r: (cov x x) s: (scov x x) from: (table [k x] (list [1 2 2] [5e100 1e100 0Nf])) by: k}) 'r) -- [0.0 0.0]
+(at (select {s: (scov x x) from: (table [k x] (list [1 2 2] [5e100 1e100 0Nf])) by: k}) 's) -- [0Nf 0Nf]
+
+;; integers: their differences in int64, so 1e16 + [0 1 2 3] keeps its low bits
+(set XI [10000000000000000 10000000000000001 10000000000000002 10000000000000003])
+(set YI [0 1 2 3])
+(cov XI YI) -- 1.25
+(== (scov XI YI) (/ 5.0 3.0)) -- true
+(set TI (table [g x y] (list (take 0 120000) (take XI 120000) (take YI 120000))))
+(at (select {r: (cov x y) from: TI by: g}) 'r) -- [1.25]
+(at (select {r: (cov x y) from: TI by: g where: (>= y 0)}) 'r) -- [1.25]
+;; an outlying first value: the pivot moves to the mean, so the answer is the
+;; two-pass one (exact: 49999751501.234999999775) to within 1.0 (1e-9 of the
+;; spread allows 50)
+(set XO (concat [0.0] (+ 1e8 (as 'F64 (% (til 199999) 4)))))
+(set TO (table [g x] (list (take 0 200000) XO)))
+(< (abs (- (cov XO XO) 49999751501.235)) 1.0) -- true
+(< (abs (- (first (at (select {c: (cov x x) from: TO by: g}) 'c)) 49999751501.235)) 1.0) -- true
+(< (abs (- (first (at (select {c: (cov x x) from: TO by: g where: (> x -1.0)}) 'c)) 49999751501.235)) 1.0) -- true
+(< (abs (- (first (at (select {c: (cov x x) from: TO}) 'c)) 49999751501.235)) 1.0) -- true
+
+;; review 4, finding 1: outliers at rows 0 and 63 among zeros leave no
+;; pivot far from the mean (it follows the running mean at every power of
+;; two).  Exact: 166663888888.888888..., allowance 1e-9 of the spread: 166.7
+(set I4 (til 120000))
+(set X4 (as 'F64 (map (fn [i] (if (in i [0 63]) 1e8 0.0)) I4)))
+(set T4 (table [g h x] (list (take 0 120000) (% I4 1000) X4)))
+(set ok4 (fn [v] (< (abs (- v 166663888888.88889)) 166.0)))
+(ok4 (cov X4 X4)) -- true
+(< (abs (- (scov X4 X4) 166665277766.20370)) 166.0) -- true
+(ok4 (first (at (select {c: (cov x x) from: T4}) 'c))) -- true
+(ok4 (first (at (select {c: (cov x x) from: T4 by: g}) 'c))) -- true
+(ok4 (first (at (select {c: (cov x x) from: T4 by: g where: (>= h 0)}) 'c))) -- true
+(.sys.exec "rm -rf /tmp/rf_comoment_f4")
+(.db.splayed.set "/tmp/rf_comoment_f4/2024.01.01/t/" (take T4 60000))
+(.db.splayed.set "/tmp/rf_comoment_f4/2024.01.02/t/" (drop T4 60000))
+(set P4 (.db.parted.get "/tmp/rf_comoment_f4/" 't))
+(ok4 (first (at (select {c: (cov x x) from: P4}) 'c))) -- true
+(ok4 (first (at (select {c: (cov x x) from: P4 by: g}) 'c))) -- true
+(.sys.exec "rm -rf /tmp/rf_comoment_f4")
+
+;; review 4, finding 3: a constant integer column has covariance exactly 0,
+;; INT64_MAX included (the pivot is the first value exactly)
+(set XC (take 9223372036854775807 99999))
+(set TC (table [g x] (list (take 0 99999) XC)))
+(cov XC XC) -- 0.0
+(scov XC XC) -- 0.0
+(at (select {c: (cov x x) s: (scov x x) from: TC}) 'c) -- [0.0]
+(at (select {c: (cov x x) from: TC by: g}) 'c) -- [0.0]
+(at (select {s: (scov x x) from: TC by: g where: (> g -1)}) 's) -- [0.0]
+(cov (take -9223372036854775807 1000) (take 5 1000)) -- 0.0
+
+;; review 5, finding 1: an integer pivot follows the mean across the whole
+;; int64 range (here from INT64_MAX at the first row toward -9.22e18)
+(set X6 (concat [9223372036854775807] (take -9220000000000000000 119999)))
+(set T6 (table [g x] (list (take 0 120000) X6)))
+(set ok6 (fn [v w] (< (abs (- (/ v w) 1.0)) 1e-9)))
+(ok6 (cov X6 X6) 2.8346261453339105535e33) -- true
+(ok6 (scov X6 X6) (/ (* 120000 2.8346261453339105535e33) 119999.0)) -- true
+(ok6 (first (at (select {c: (cov x x) from: T6 by: g}) 'c)) 2.8346261453339105535e33) -- true
+(ok6 (first (at (select {c: (cov x x) from: T6}) 'c)) 2.8346261453339105535e33) -- true
+;; review 5, finding 2: the final correction is ordered sx * (sy / n), so it
+;; does not overflow below 1e150 where the covariance is finite
+(set X7 (concat (take 0.0 65536) (take 3e149 54464)))
+(ok6 (cov X7 X7) 2.23084544000000005e298) -- true
+(ok6 (scov X7 X7) 2.23086403053358783e298) -- true
+(ok6 (first (at (select {c: (cov x x) from: (table [g x] (list (take 0 120000) X7)) by: g}) 'c)) 2.23084544000000005e298) -- true
+(set X8 (concat (take 5e149 60000) (take -5e149 60000)))
+(ok6 (cov X8 X8) 2.5e299) -- true
+;; review 5, finding 3: a mixed pair keeps each side's own arithmetic: the
+;; I64 side's differences in integers
+(set XM [9007199254740992 9007199254740993 9007199254740994 9007199254740995])
+(cov XM [0.0 1.0 2.0 3.0]) -- 1.25
+(== (scov XM [0.0 1.0 2.0 3.0]) (/ 5.0 3.0)) -- true
+(cov [9223372036854775804 9223372036854775805 9223372036854775806 9223372036854775807] [0.0 1.0 2.0 3.0]) -- 1.25
+(set TM (table [g x y] (list (take [0 1] 120000) (take XM 120000) (take [0.0 1.0 2.0 3.0] 120000))))
+(at (select {c: (cov x y) from: TM by: g}) 'c) -- [1.0 1.0]
+(at (select {c: (cov y x) from: TM}) 'c) -- [1.25]
+(at (select {c: (cov x y) from: TM by: g where: (>= g 0)}) 'c) -- [1.0 1.0]
+
+;; values from 1e150: a difference, a product or the final correction can
+;; overflow or cancel, and no answer is promised; they must not fail
+(cov [1e308 -1e308] [0.25 -0.25])
+(select {r: (cov x y) s: (scov x y) from: (table [g x y] (list [0 0] [1e308 -1e308] [0.25 -0.25])) by: g})
+(cov (take [1e153 -1e153] 32) (take [1e153 -1e153] 32))
+(cov [0.0 5e-324] [0.0 1e308])
+(set X5 (as 'F64 (map (fn [i] (if (in i [0 63]) 0.0 2e150)) I4)))
+(set Y5 (as 'F64 (map (fn [i] (if (in i [0 63]) 0.0 1e8)) I4)))
+(cov X5 Y5)
+(select {c: (cov x y) s: (scov x y) from: (table [g x y] (list (% I4 3) X5 Y5)) by: g})

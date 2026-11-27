@@ -5891,6 +5891,15 @@ bool ght_compute_layout(ght_layout_t* out, uint32_t n_keys, uint32_t n_aggs,
             af2 |= GHT_AF2_VAR;
             out->need_flags |= GHT_NEED_VARK;
         }
+        if (agg_ops && vslot >= 0 && agg_is_cov_agg(agg_ops[a])) {
+            af2 |= GHT_AF2_COMOM;
+            out->need_flags |= GHT_NEED_VARK;
+            /* a mixed pair keeps its integer side's int64 (#1847) */
+            if ((af & GHT_AF_F64) && agg_vecs[a] && agg_vecs2 && agg_vecs2[a]) {
+                if (ray_comom_int_type(agg_vecs[a]->type))  af2 |= GHT_AF2_X_I64;
+                if (ray_comom_int_type(agg_vecs2[a]->type)) af2 |= GHT_AF2_Y_I64;
+            }
+        }
         if (vslot >= 0 && agg_vecs[a]) {
             ray_t* src = (agg_vecs[a]->attrs & RAY_ATTR_SLICE)
                          ? agg_vecs[a]->slice_parent : agg_vecs[a];
@@ -6701,6 +6710,22 @@ static inline void init_accum_from_entry(char* row, const char* entry,
             memcpy(row + ly->off_sumsq_y + s * 8, &yy, 8);
             double xy = x * y;
             memcpy(row + ly->off_sumxy   + s * 8, &xy, 8);
+            if (aflags2[a] & GHT_AF2_COMOM) {
+                /* cov / scov about the opening pair (#1847): it is the
+                 * pivot (an integer pair's exactly, ray_comom_pivot_i), so
+                 * the sums start at 0 */
+                double pivx, pivy, dx = 0.0, dy = 0.0;
+                /* each side's slot as it is packed: a double, or an int64's
+                 * bits (ray_comom_pivot_i) */
+                memcpy(&pivx, agg_data +  s      * 8, 8);
+                memcpy(&pivy, agg_data + (s + 1) * 8, 8);
+                memcpy(row + ly->off_var_k + s * 8, &pivx, 8);
+                memcpy(row + ly->off_var_k + (s + 1) * 8, &pivy, 8);
+                double dxy = dx * dy;
+                memcpy(row + ly->off_sum + s * 8, &dx, 8);
+                memcpy(row + ly->off_sum_y + s * 8, &dy, 8);
+                memcpy(row + ly->off_sumxy + s * 8, &dxy, 8);
+            }
         }
         /* Seed per-slot row-index bounds with the row that opened this
          * group.  Only writes the populated slots; unpopulated slot
@@ -6740,10 +6765,41 @@ static inline void ght_var_add(char* row, const ght_layout_t* ly, int8_t s, uint
     }
 }
 
+/* A cov / scov pair (GHT_AF2_COMOM, #1847) at slots s, s+1 of an entry into
+ * slot s of an HT row, the n-th pair of the slot: about the row's pivot in
+ * off_var_k (slots s, s+1), which the first pair seeds and each due count
+ * moves to the running mean (ray_comom_repivot); an integer pair's (no
+ * GHT_AF_F64) differences in int64. */
+/* The per-side integer mode of a COMOM slot: a side is an integer when the
+ * slot packs int64s, or it packs F64 but keeps that side's int64. */
+static inline unsigned ght_comom_im(uint8_t af, uint8_t af2) {
+    if (!(af & GHT_AF_F64)) return RAY_COMOM_IMX | RAY_COMOM_IMY;
+    return ((af2 & GHT_AF2_X_I64) ? RAY_COMOM_IMX : 0u) | ((af2 & GHT_AF2_Y_I64) ? RAY_COMOM_IMY : 0u);
+}
+static inline __attribute__((always_inline)) void
+ght_comom_add(char* row, const ght_layout_t* ly, int8_t s, uint8_t af, uint8_t af2,
+              const char* agg_data, int64_t n) {
+    double* pivx = &ROW_WR_F64(row, ly->off_var_k, s);
+    double* pivy = &ROW_WR_F64(row, ly->off_var_k, s + 1);
+    double dx, dy, cx, cy;   /* the pair: a double, or an int64's bits per side */
+    unsigned im = ght_comom_im(af, af2);
+    memcpy(&cx, agg_data + s * 8, 8);
+    memcpy(&cy, agg_data + (s + 1) * 8, 8);
+    if (n == 1) { *pivx = cx; *pivy = cy; }
+    dx = (im & RAY_COMOM_IMX) ? ray_comom_d_i(ray_comom_pivot_iv(cx), *pivx) : cx - *pivx;
+    dy = (im & RAY_COMOM_IMY) ? ray_comom_d_i(ray_comom_pivot_iv(cy), *pivy) : cy - *pivy;
+    double* sx = &ROW_WR_F64(row, ly->off_sum, s);
+    double* sy = &ROW_WR_F64(row, ly->off_sum_y, s);
+    double* sxy = &ROW_WR_F64(row, ly->off_sumxy, s);
+    ray_comom_add(dx, dy, sx, sy, sxy);
+    if (RAY_UNLIKELY(ray_comom_due(n)))
+        ray_comom_repivot_cold(im, (double)n, pivx, pivy, sx, sy, sxy);
+}
+
 /* Accumulate into existing group from entry's inline agg values */
 static inline __attribute__((always_inline)) void
 accum_from_entry_body(char* row, const char* entry, const ght_layout_t* ly, const bool with_var) {
-    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR) : GHT_AF2_TRUTHY;
+    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR | GHT_AF2_COMOM) : GHT_AF2_TRUTHY;
     const char* agg_data = entry + 8 + (size_t)ly->key_region;
     uint16_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
@@ -6789,6 +6845,13 @@ accum_from_entry_body(char* row, const char* entry, const ght_layout_t* ly, cons
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
                     if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                    else if (aflags2[a] & GHT_AF2_COMOM) {
+                        /* cov / scov about the row's pivot
+                         * (#1847): its own sums only; the group's count is
+                         * its pairs' (no nulls on this layout) */
+                        ght_comom_add(row, ly, s, af, aflags2[a], agg_data, *(const int64_t*)row);
+                        continue;
+                    }
                     else {
                         /* VAR / STDDEV about the slot's k (#1666, its first
                          * value): its own sums only */
@@ -6818,6 +6881,11 @@ accum_from_entry_body(char* row, const char* entry, const ght_layout_t* ly, cons
                 else if (af & GHT_AF_LAST) { if (take_last) memcpy(row + ly->off_sum + s * 8, val, 8); }
                 else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
                     if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                    else if (aflags2[a] & GHT_AF2_COMOM) {
+                        /* an integer pair's co-moments (#1847) */
+                        ght_comom_add(row, ly, s, af, aflags2[a], agg_data, *(const int64_t*)row);
+                        continue;
+                    }
                     else {
                         /* VAR / STDDEV about the slot's k (#1666, its first
                          * value): its own sums only */
@@ -6882,13 +6950,13 @@ static void accum_from_entry(char* row, const char* entry, const ght_layout_t* l
 static inline bool agg_entry_is_null(uint8_t af, uint8_t af2, int64_t sentinel,
                                      const char* val) {
     if (!(af2 & GHT_AF2_NULLABLE)) return false;
-    if (af & GHT_AF_F64) { double v; memcpy(&v, val, 8); return v != v; }
+    if ((af & GHT_AF_F64) && !(af2 & GHT_AF2_X_I64)) { double v; memcpy(&v, val, 8); return v != v; }
     int64_t v; memcpy(&v, val, 8); return v == sentinel;
 }
 
 static inline __attribute__((always_inline)) void
 accum_from_entry_nullable_body(char* row, const char* entry, const ght_layout_t* ly, const bool with_var) {
-    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR) : GHT_AF2_TRUTHY;
+    const uint8_t alt2 = with_var ? (GHT_AF2_TRUTHY | GHT_AF2_VAR | GHT_AF2_COMOM) : GHT_AF2_TRUTHY;
     const char* agg_data = entry + 8 + (size_t)ly->key_region;
     uint16_t na = ly->n_aggs;
     uint8_t nf = ly->need_flags;
@@ -6915,7 +6983,7 @@ accum_from_entry_nullable_body(char* row, const char* entry, const ght_layout_t*
          * 10.0).  Entry packing canonicalizes y nulls: NaN in F64-packed
          * entries (incl. int y beside an FP x), NULL_I64 in int×int ones. */
         if ((af & GHT_AF_BINARY) && (aflags2[a] & GHT_AF2_Y_NULLABLE)) {
-            if (af & GHT_AF_F64) {
+            if ((af & GHT_AF_F64) && !(aflags2[a] & GHT_AF2_Y_I64)) {
                 double y; memcpy(&y, agg_data + (s + 1) * 8, 8);
                 if (y != y) continue;
             } else {
@@ -6939,6 +7007,12 @@ accum_from_entry_nullable_body(char* row, const char* entry, const ght_layout_t*
                     }
                 } else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
                     if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0.0); }
+                    else if (aflags2[a] & GHT_AF2_COMOM) {
+                        /* cov / scov about the slot's pivot
+                         * (#1847), its count the non-null pairs */
+                        ght_comom_add(row, ly, s, af, aflags2[a], agg_data, nn[s]);
+                        continue;
+                    }
                     else {
                         /* VAR / STDDEV about the slot's k (#1666, its first
                          * value): its own sums only */
@@ -6974,6 +7048,11 @@ accum_from_entry_nullable_body(char* row, const char* entry, const ght_layout_t*
                     }
                 } else if (RAY_UNLIKELY(aflags2[a] & alt2)) {
                     if (aflags2[a] & GHT_AF2_TRUTHY) { ROW_WR_I64(row, ly->off_sum, s) += (v != 0); }
+                    else if (aflags2[a] & GHT_AF2_COMOM) {
+                        /* an integer pair's co-moments (#1847) */
+                        ght_comom_add(row, ly, s, af, aflags2[a], agg_data, nn[s]);
+                        continue;
+                    }
                     else {
                         /* VAR / STDDEV about the slot's k (#1666, its first
                          * value): its own sums only */
@@ -7375,9 +7454,10 @@ RAY_INLINE void ght_pack_aggs(const ght_layout_t* ly, ray_t* const* agg_vecs,
             uint8_t vi = (uint8_t)vs;
             ray_t* ac = agg_vecs ? agg_vecs[a] : NULL;
             if (!ac) continue;
+            uint8_t af2 = ly->agg_flags2[a];
             if (agg_strlen && agg_strlen[a])
                 ev[vi] = group_strlen_at(ac, row);
-            else if (af & GHT_AF_F64) {
+            else if ((af & GHT_AF_F64) && !(af2 & GHT_AF2_X_I64)) {
                 double d = group_fp_type(ac->type)
                     ? group_fp_at(ray_data(ac), ac->type, row)
                     : group_pack_i64_as_f64(ac, row);
@@ -7391,7 +7471,7 @@ RAY_INLINE void ght_pack_aggs(const ght_layout_t* ly, ray_t* const* agg_vecs,
              * canonicalizes nulls). */
             if ((af & GHT_AF_BINARY) && agg_vecs2 && agg_vecs2[a]) {
                 ray_t* ay = agg_vecs2[a];
-                if (af & GHT_AF_F64) {
+                if ((af & GHT_AF_F64) && !(af2 & GHT_AF2_Y_I64)) {
                     double d = group_fp_type(ay->type)
                         ? group_fp_at(ray_data(ay), ay->type, row)
                         : group_pack_i64_as_f64(ay, row);
@@ -7421,10 +7501,11 @@ static void ght_pack_aggs_piece(const ght_layout_t* ly, ray_t* const* agg_vecs,
         ray_t* ac = agg_vecs ? agg_vecs[a] : NULL;
         if (!ac) continue;
         const void* xd = v->agg_ptrs[a];
+        uint8_t af2 = ly->agg_flags2[a];
         if (agg_strlen && agg_strlen[a])
             ev[vi] = ac->type == RAY_STR ? (int64_t)((const ray_str_t*)xd)[r].len
                    : sym_strlen_raw(xd, r, v->agg_attrs[a], ray_sym_vec_domain(ac));
-        else if (af & GHT_AF_F64) {
+        else if ((af & GHT_AF_F64) && !(af2 & GHT_AF2_X_I64)) {
             double d = group_fp_type(ac->type)
                 ? group_fp_at(xd, ac->type, r)
                 : group_pack_i64_as_f64_at(xd, r, ac->type, v->agg_attrs[a],
@@ -7437,7 +7518,7 @@ static void ght_pack_aggs_piece(const ght_layout_t* ly, ray_t* const* agg_vecs,
         if ((af & GHT_AF_BINARY) && agg_vecs2 && agg_vecs2[a]) {
             ray_t* ay = agg_vecs2[a];
             const void* yd = v->agg_ptrs2[a];
-            if (af & GHT_AF_F64) {
+            if ((af & GHT_AF_F64) && !(af2 & GHT_AF2_Y_I64)) {
                 double d = group_fp_type(ay->type) ? group_fp_at(yd, ay->type, r)
                          : group_pack_i64_as_f64_at(yd, r, ay->type, v->agg_attrs2[a],
                                                     ray_vec_may_have_nulls(ay));
@@ -8534,7 +8615,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                              * NaN (canonicalize folds to null upstream). */
                             if ((op == OP_PEARSON_CORR || op == OP_SCOV) && nn < 2) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
                             if ((op == OP_COV || op == OP_WAVG) && nn < 1) { v = NULL_F64; grp_set_null(ao->vec, di); break; }
-                            double sx  = sf ? ROW_RD_F64(row, ly->off_sum,    s)
+                            /* a cov / scov slot sums doubles whatever its types (#1847) */
+                            double sx  = sf || agg_is_cov_agg(op) ? ROW_RD_F64(row, ly->off_sum, s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                             double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                             double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
@@ -8551,8 +8633,8 @@ static void radix_phase3_fn(void* ctx, uint32_t worker_id, int64_t start, int64_
                             double dy  = dn * syy - sy * sy;
                             if (op == OP_WSUM) { v = sxy; break; }
                             if (op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
-                            if (op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
-                            if (op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
+                            if (op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
+                            if (op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
                             if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                             v = num / sqrt(dx * dy);
                             break;
@@ -9462,6 +9544,11 @@ typedef struct {
      * (DA_NEED_VARK). */
     int64_t*  var_k;
     int64_t*  var_n;
+    /* cov / scov (#1847): the co-moments are taken about the slot's first
+     * pair, x's in var_k (a double's bits), y's here, counted in var_n;
+     * sum, sum_y and sumxy then hold the sums about it.  NULL without such
+     * an aggregate. */
+    double*   cov_ky;
     /* Arena headers */
     ray_t* _h_sum;
     ray_t* _h_sum_hi;
@@ -9479,6 +9566,7 @@ typedef struct {
     ray_t* _h_touched;
     ray_t* _h_var_k;
     ray_t* _h_var_n;
+    ray_t* _h_cov_ky;
     /* A fused product overflowed while no nn_count is kept (#1349): an AVG
      * over it reruns on ht_path.  The partitioned DA path's drain tasks
      * share accums[0], so it is set with a relaxed atomic store (always
@@ -9516,6 +9604,7 @@ static inline void da_accum_free(da_accum_t* a) {
     scratch_free(a->_h_touched);
     scratch_free(a->_h_var_k);
     scratch_free(a->_h_var_n);
+    scratch_free(a->_h_cov_ky);
 }
 
 
@@ -9581,15 +9670,40 @@ static inline void da_var_merge(da_accum_t* dst, size_t di, da_accum_t* src, siz
     src->sumsq_f64[si] = 0;
 }
 
-/* Every variance-family slot of slots [lo, hi) (n_aggs per slot) of src
- * into dst, ahead of a merge that adds the rest. */
+/* A cov / scov slot (#1847) si of src into di
+ * of dst: src's sums re-expressed about dst's pair (ray_comom_merge), then
+ * left zero, as da_var_merge leaves them, for the merge that adds the rest. */
+static void da_comom_merge(da_accum_t* dst, size_t di, da_accum_t* src, size_t si) {
+    int64_t ns = src->var_n[si] & RAY_COMOM_N_MASK;
+    if (ns == 0) return;
+    int64_t nd = dst->var_n[di] & RAY_COMOM_N_MASK;
+    unsigned im = RAY_COMOM_N_IMOF(src->var_n[si] | dst->var_n[di]);
+    double kxd = 0.0, kxs;
+    if (nd) memcpy(&kxd, &dst->var_k[di], sizeof kxd);
+    memcpy(&kxs, &src->var_k[si], sizeof kxs);
+    ray_comom_merge(im, (double)nd, &kxd, &dst->cov_ky[di], &dst->sum[di].f, &dst->sum_y[di],
+                    &dst->sumxy[di], (double)ns, kxs, src->cov_ky[si], src->sum[si].f,
+                    src->sum_y[si], src->sumxy[si]);
+    memcpy(&dst->var_k[di], &kxd, sizeof kxd);
+    dst->var_n[di] = RAY_COMOM_N_IM(im) | (nd + ns);
+    src->sum[si].f = 0;
+    src->sum_y[si] = 0;
+    src->sumxy[si] = 0;
+}
+
+/* Every variance-family and co-moment slot of slots [lo, hi) (n_aggs per
+ * slot) of src into dst, ahead of a merge that adds the rest. */
 static void da_var_merge_slots(da_accum_t* dst, da_accum_t* src, size_t lo, size_t hi, uint32_t n_aggs,
                                const uint16_t* ops, const int8_t* types) {
     if (!dst->var_n || !src->var_n) return;
+    bool comom = dst->cov_ky && src->cov_ky;
     for (size_t sl = lo; sl < hi; sl++)
-        for (uint32_t a = 0; a < n_aggs; a++)
+        for (uint32_t a = 0; a < n_aggs; a++) {
             if (agg_op_is_var(ops[a]))
                 da_var_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a, group_fp_type(types[a]));
+            else if (comom && agg_is_cov_agg(ops[a]))
+                da_comom_merge(dst, sl * n_aggs + a, src, sl * n_aggs + a);
+        }
 }
 
 /* emit_agg_columns' per-group arms, one value each.  The switch that picks
@@ -9813,8 +9927,8 @@ static void emit_agg_columns(ray_t** result, ray_graph_t* g, const ray_op_ext_t*
                             v = sxy / sx; break;
                         }
                         double dn = (double)cnt;
-                        if (agg_op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
-                        if (agg_op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
+                        if (agg_op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
+                        if (agg_op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
                         double num = dn * sxy - sx * sy;
                         double dx = dn * sxx - sx * sx;
                         double dy = dn * syy - sy * sy;
@@ -12281,11 +12395,37 @@ RAY_INLINE void da_accum_row_body(da_ctx_t* c, da_accum_t* acc, int32_t gid, int
             double yval = y_is_f ? yv : (double)yi;
             bool y_null = y_is_f ? !(yval == yval) : false;
             if (RAY_LIKELY(!is_null && !y_null)) {
-                acc->sum[idx].f    += xv;
-                if (acc->sumsq_f64) acc->sumsq_f64[idx] += xv * xv;
-                acc->sum_y[idx]    += yval;
-                acc->sumsq_y[idx]  += yval * yval;
-                acc->sumxy[idx]    += xv * yval;
+                if (acc->cov_ky && agg_is_cov_agg(op)) {
+                    /* about the slot's pivot (#1847): an integer side's
+                     * differences in integers, the per-side mode in var_n
+                     * (RAY_COMOM_N_IM) */
+                    unsigned im = (is_f ? 0u : RAY_COMOM_IMX) | (y_is_f ? 0u : RAY_COMOM_IMY);
+                    double pivx;
+                    int64_t* vn = &acc->var_n[idx];
+                    if (*vn == 0) {
+                        pivx = is_f ? xv : ray_comom_pivot_i(iv);
+                        acc->cov_ky[idx] = y_is_f ? yval : ray_comom_pivot_i(yi);
+                        memcpy(&acc->var_k[idx], &pivx, sizeof pivx);
+                        *vn = RAY_COMOM_N_IM(im);
+                    }
+                    int64_t vc = (++*vn) & RAY_COMOM_N_MASK;
+                    memcpy(&pivx, &acc->var_k[idx], sizeof pivx);
+                    double pivy = acc->cov_ky[idx];
+                    double dx = is_f ? xv - pivx : ray_comom_d_i(iv, pivx);
+                    double dy = y_is_f ? yval - pivy : ray_comom_d_i(yi, pivy);
+                    ray_comom_add(dx, dy, &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx]);
+                    if (RAY_UNLIKELY(ray_comom_due(vc))) {
+                        ray_comom_repivot_cold(im, (double)vc, &pivx, &acc->cov_ky[idx],
+                                               &acc->sum[idx].f, &acc->sum_y[idx], &acc->sumxy[idx]);
+                        memcpy(&acc->var_k[idx], &pivx, sizeof pivx);
+                    }
+                } else {
+                    acc->sum[idx].f    += xv;
+                    if (acc->sumsq_f64) acc->sumsq_f64[idx] += xv * xv;
+                    acc->sum_y[idx]    += yval;
+                    acc->sumsq_y[idx]  += yval * yval;
+                    acc->sumxy[idx]    += xv * yval;
+                }
                 if (nn) nn[idx]++;
             }
         } else if (op == OP_PROD) {
@@ -15347,6 +15487,9 @@ typedef struct {
     double*           partial_sum_y;
     double*           partial_sumsq_y;
     double*           partial_sumxy;
+    /* cov / scov (#1847): each task's pivot pair,
+     * [n_tasks * n_aggs * 2] (NULL without a pair aggregate) */
+    double*           partial_k;
     /* Shared-stream fusion: pair_sum[a] = sibling SUM agg slot whose bare
      * scan is prod[a]'s int side (-1 = none); fused_by[b] = the prod slot
      * that computes SUM b (-1 = b runs its own loop). */
@@ -15467,6 +15610,56 @@ static inline void sg_pair_accum(ray_t* x, ray_t* y, uint16_t op,
     *sx = ax; *sy = ay; *sxx = axx; *syy = ayy; *sxy = axy;
 }
 
+
+/* A task's cov / scov sums (#1847) of differences about its pivot, its
+ * first row's pair, moved to the running mean at each due count as every
+ * accumulator moves it (ray_comom_repivot); an integer pair's differences
+ * exact in int64.  The rows run in segments between the due counts, the
+ * pivot held in locals.  The slice path admits no null. */
+static void sg_comom_accum(ray_t* x, ray_t* y, const int64_t* rows, int64_t n, bool contig,
+                           int64_t r0, double* kxo, double* kyo, double* sx, double* sy,
+                           double* sxy) {
+    unsigned im = ray_comom_im(x->type, y->type);
+    bool imx = (im & RAY_COMOM_IMX) != 0, imy = (im & RAY_COMOM_IMY) != 0;
+    bool f64 = x->type == RAY_F64 && y->type == RAY_F64;
+    const void* xd = ray_data(x);
+    const void* yd = ray_data(y);
+    double ax = 0.0, ay = 0.0, axy = 0.0, pivx = 0.0, pivy = 0.0;
+    if (n > 0) {
+        int64_t rk = contig ? r0 : rows[0];
+        pivx = imx ? ray_comom_pivot_i(read_col_i64(xd, rk, x->type, x->attrs)) : sg_num_at(x, rk);
+        pivy = imy ? ray_comom_pivot_i(read_col_i64(yd, rk, y->type, y->attrs)) : sg_num_at(y, rk);
+    }
+    #define SG_COMOM_SEG(ROW) do {                                                   \
+        for (int64_t j_ = j; j_ < e; j_++) {                                         \
+            int64_t r = contig ? r0 + j_ : rows[j_];                                 \
+            double dx, dy;                                                           \
+            ROW;                                                                     \
+            ax += dx; ay += dy; axy += dx * dy;                                      \
+        }                                                                            \
+    } while (0)
+    for (int64_t j = 0; j < n; ) {
+        int64_t due = j ? 2 * j : 2, e = due < n ? due : n;
+        if (f64) {
+            const double* xf = (const double*)xd;
+            const double* yf = (const double*)yd;
+            SG_COMOM_SEG((dx = xf[r] - pivx, dy = yf[r] - pivy));
+        } else if (im) {
+            SG_COMOM_SEG((dx = imx ? ray_comom_d_i(read_col_i64(xd, r, x->type, x->attrs), pivx)
+                               : sg_num_at(x, r) - pivx,
+                          dy = imy ? ray_comom_d_i(read_col_i64(yd, r, y->type, y->attrs), pivy)
+                               : sg_num_at(y, r) - pivy));
+        } else {
+            SG_COMOM_SEG((dx = sg_num_at(x, r) - pivx, dy = sg_num_at(y, r) - pivy));
+        }
+        j = e;
+        if (j == due) ray_comom_repivot_cold(im, (double)j, &pivx, &pivy, &ax, &ay, &axy);
+    }
+    #undef SG_COMOM_SEG
+    *kxo = pivx; *kyo = pivy;
+    *sx = ax; *sy = ay; *sxy = axy;
+}
+
 /* The value a slice's VAR/STDDEV sums are taken about (#1666): its first
  * row's value for an integer input (the slice path admits no integer null),
  * else its first non-NaN value; an int64, or a double's bits.  Every task of
@@ -15509,8 +15702,14 @@ static void sg_accum_fn(void* raw, uint32_t wid, int64_t tstart, int64_t tend) {
             uint16_t op = c->agg_ops[a];
             if (agg_is_binary_agg(op)) {
                 double sx = 0.0, sy = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
-                sg_pair_accum(c->agg_vecs[a], c->agg_vecs2[a], op, rows, n,
-                              contig, r0, &sx, &sy, &sxx, &syy, &sxy);
+                if (agg_is_cov_agg(op) && c->partial_k)
+                    /* about the task's own pivot; the fold re-centres (#1847) */
+                    sg_comom_accum(c->agg_vecs[a], c->agg_vecs2[a], rows, n, contig, r0,
+                                   &c->partial_k[2 * idx], &c->partial_k[2 * idx + 1],
+                                   &sx, &sy, &sxy);
+                else
+                    sg_pair_accum(c->agg_vecs[a], c->agg_vecs2[a], op, rows, n,
+                                  contig, r0, &sx, &sy, &sxx, &syy, &sxy);
                 c->partials[idx].f = sx;
                 if (c->partial_sumsq)   c->partial_sumsq[idx] = sxx;
                 if (c->partial_sum_y)   c->partial_sum_y[idx] = sy;
@@ -15890,6 +16089,21 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         da_val_t* partials = NULL;
         int64_t* part_hi = NULL;
         double *part_sumsq = NULL, *part_sum_y = NULL, *part_sumsq_y = NULL, *part_sumxy = NULL;
+        /* the pivots of the cov / scov aggregates (#1847): a task's and a group's */
+        ray_t *part_k_hdr = NULL, *grp_k_hdr = NULL;
+        double *part_k = NULL, *grp_k = NULL;
+        if (need_pair && sums && counts) {
+            part_k = (double*)scratch_calloc(&part_k_hdr, (size_t)n_tasks * n_aggs * 2 * sizeof(double));
+            grp_k = (double*)scratch_calloc(&grp_k_hdr, (size_t)K * n_aggs * 2 * sizeof(double));
+            if (!part_k || !grp_k) {
+                scratch_free(part_k_hdr); scratch_free(grp_k_hdr);
+                scratch_free(sum_hdr); scratch_free(cnt_hdr);
+                scratch_free(sumsq_hdr); scratch_free(sum_y_hdr);
+                scratch_free(sumsq_y_hdr); scratch_free(sumxy_hdr);
+                scratch_free(sum_hi_hdr);
+                return NULL;    /* OOM → generic path via fallback */
+            }
+        }
         if (sums && counts) {
             task_hdr = ray_alloc((size_t)n_tasks * (int64_t)sizeof(sg_task_t));
             tasks = task_hdr ? (sg_task_t*)ray_data(task_hdr) : NULL;
@@ -15923,6 +16137,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
             scratch_free(part_hdr);
             scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
             scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
+            scratch_free(part_k_hdr); scratch_free(grp_k_hdr);
             return NULL;    /* OOM → generic path via fallback */
         }
         int64_t total_rows = 0, tw = 0;
@@ -15936,7 +16151,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         }
         sg_ctx_t ctx = { slices, tasks, agg_vecs, agg_vecs2, prod, ext->agg_ops,
                          n_aggs, partials, part_hi, part_sumsq, part_sum_y,
-                         part_sumsq_y, part_sumxy, {0}, {0}, NULL };
+                         part_sumsq_y, part_sumxy, part_k, {0}, {0}, NULL };
         /* Shared-stream pairing: a bare-scan SUM/AVG over the same column
          * a product's int side already streams rides the product loop —
          * one pass over the column instead of two. */
@@ -15981,6 +16196,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 scratch_free(part_hdr);
                 scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
                 scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
+                scratch_free(part_k_hdr); scratch_free(grp_k_hdr);
                 return NULL;    /* OOM → generic path via fallback */
             }
             break;
@@ -16002,6 +16218,16 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
                 size_t di = (size_t)gi * n_aggs + a;
                 size_t si = (size_t)ti * n_aggs + a;
                 bool pair = agg_is_binary_agg(ext->agg_ops[a]);
+                if (pair && agg_is_cov_agg(ext->agg_ops[a])) {
+                    /* re-centred onto the larger part's pivot (#1847) */
+                    double ns = (double)(tasks[ti].hi - tasks[ti].lo);
+                    double nd = (double)counts[gi] - ns;
+                    unsigned im = ray_comom_im(agg_vecs[a]->type, agg_vecs2[a]->type);
+                    ray_comom_merge(im, nd, &grp_k[2 * di], &grp_k[2 * di + 1], &sums[di].f, &sum_y[di],
+                                    &sumxy[di], ns, part_k[2 * si], part_k[2 * si + 1],
+                                    partials[si].f, part_sum_y[si], part_sumxy[si]);
+                    continue;
+                }
                 if (pair || prod[a].enabled || ext->agg_ops[a] == OP_COUNT ||
                     (agg_vecs[a] && group_fp_type(agg_vecs[a]->type)) ||
                     (sumsq && agg_op_is_var(ext->agg_ops[a])))   /* a double (#1666) */
@@ -16024,6 +16250,7 @@ static ray_t* exec_group_slices(ray_graph_t* g, ray_op_t* op, ray_t* tbl,
         scratch_free(part_hdr); scratch_free(part_hi_hdr);
         scratch_free(part_sumsq_hdr); scratch_free(part_sum_y_hdr);
         scratch_free(part_sumsq_y_hdr); scratch_free(part_sumxy_hdr);
+        scratch_free(part_k_hdr); scratch_free(grp_k_hdr);
     }
 
     /* A fused product that overflowed is a null the slice loops count as
@@ -19368,6 +19595,7 @@ da_path:;
         if (da_fits) {
             /* Recompute need_flags (da_fits may have changed scope) */
             uint8_t need_flags = DA_NEED_COUNT;
+            bool da_need_comom = false;
             bool all_sum = true;
             bool da_has_first_last = false;
             for (uint32_t a = 0; a < n_aggs; a++) {
@@ -19375,8 +19603,11 @@ da_path:;
                 if (aop == OP_SUM || aop == OP_PROD || aop == OP_AVG || aop == OP_ALL || aop == OP_ANY || aop == OP_FIRST || aop == OP_LAST) need_flags |= DA_NEED_SUM;
                 else if (agg_op_is_var(aop))
                     { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_VARK; }
-                else if (agg_is_binary_agg(aop))
-                    { need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_PAIR; }
+                else if (agg_is_binary_agg(aop)) {
+                    need_flags |= DA_NEED_SUM; need_flags |= DA_NEED_SUMSQ; need_flags |= DA_NEED_PAIR;
+                    /* a cov / scov slot keeps its pair in var_k/cov_ky (#1847) */
+                    if (agg_is_cov_agg(aop)) { need_flags |= DA_NEED_VARK; da_need_comom = true; }
+                }
                 else if (aop == OP_MIN) need_flags |= DA_NEED_MIN;
                 else if (aop == OP_MAX) need_flags |= DA_NEED_MAX;
                 if (aop != OP_SUM && aop != OP_AVG && aop != OP_COUNT)
@@ -19510,6 +19741,7 @@ da_path:;
             if (need_flags & DA_NEED_SUMSQ) arrays_per_agg += 1;
             if (need_flags & DA_NEED_PAIR) arrays_per_agg += 3; /* sum_y+sumsq_y+sumxy */
             if (need_flags & DA_NEED_VARK) arrays_per_agg += 2; /* var_k+var_n */
+            if (da_need_comom) arrays_per_agg += 1;             /* cov_ky */
             /* Nullable aggs add a per-(group, agg) non-null count array.
              * ~8 bytes per (group, agg). */
             if (da_any_nullable) arrays_per_agg += 1;
@@ -19590,6 +19822,11 @@ da_path:;
                     accums[w].var_k = DA_ARR(int64_t, &accums[w]._h_var_k, total);
                     accums[w].var_n = DA_ARR(int64_t, &accums[w]._h_var_n, total);
                     if (!accums[w].var_k || !accums[w].var_n) { alloc_ok = false; break; }
+                }
+                if (da_need_comom) {
+                    /* read only where var_n says it was set */
+                    accums[w].cov_ky = DA_ARR(double, &accums[w]._h_cov_ky, total);
+                    if (!accums[w].cov_ky) { alloc_ok = false; break; }
                 }
                 if (need_flags & DA_NEED_PAIR) {
                     accums[w].sum_y = DA_ARR(double, &accums[w]._h_sum_y, total);
@@ -23033,7 +23270,8 @@ sequential_fallback:;
                     case OP_WAVG: {
                         if ((agg_op == OP_PEARSON_CORR || agg_op == OP_SCOV) && nn < 2) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
                         if ((agg_op == OP_COV || agg_op == OP_WAVG) && nn < 1) { v = NULL_F64; ray_vec_set_null(new_col, gi, true); break; }
-                        double sx  = is_f64 ? ROW_RD_F64(row, ly->off_sum,    s)
+                        /* a cov / scov slot sums doubles whatever its types (#1847) */
+                        double sx  = is_f64 || agg_is_cov_agg(agg_op) ? ROW_RD_F64(row, ly->off_sum, s)
                                             : (double)ROW_RD_I64(row, ly->off_sum, s);
                         double sxx = ly->off_sumsq ? ROW_RD_F64(row, ly->off_sumsq, s) : 0.0;
                         double sy  = ly->off_sum_y   ? ROW_RD_F64(row, ly->off_sum_y,   s) : 0.0;
@@ -23047,8 +23285,8 @@ sequential_fallback:;
                         double dy  = dn * syy - sy * sy;
                         if (agg_op == OP_WSUM) { v = sxy; break; }
                         if (agg_op == OP_WAVG) { if (sx == 0.0) { v = NULL_F64; break; } v = sxy / sx; break; }
-                        if (agg_op == OP_COV) { v = (sxy - sx * sy / dn) / dn; break; }
-                        if (agg_op == OP_SCOV) { v = (sxy - sx * sy / dn) / (dn - 1.0); break; }
+                        if (agg_op == OP_COV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / dn; break; }
+                        if (agg_op == OP_SCOV) { v = (sxy - ray_comom_corr(sx, sy, dn)) / (dn - 1.0); break; }
                         if (dx <= 0.0 || dy <= 0.0) { v = NULL_F64; break; }
                         v = num / sqrt(dx * dy);
                         break;

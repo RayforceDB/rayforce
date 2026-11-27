@@ -6729,6 +6729,616 @@ static test_result_t test_timespan_key_v2_route(void) {
     PASS();
 }
 
+/* cov and scov against an independent two-pass reference in double-double
+ * arithmetic (about 106 bits), on every route: the direct call, the default
+ * v2 route, the legacy direct-array and hash/radix routes (route 1, 2),
+ * keyless, by a low- and a high-cardinality key, with and without where:,
+ * an index slice and a two-partition parted table, at one and at four
+ * workers (#1847).  The shapes are the adversarial ones: large values close
+ * together, a constant column (3e38, and an I64 one at INT64_MAX), ordinary
+ * data, integers about 1e15, integers near 2^53 and near 2^63 (exact
+ * differences in int64), two halves of the rows with means 2e9 apart (the
+ * partitions and the workers' parts), outliers first (0 before
+ * 1e8 + [0 1 2 3]), at rows 0 and 63 among zeros, at the powers of two and
+ * last, four seeded random shapes with outliers at random rows (offsets up
+ * to 1e140), and, unchecked beyond not failing, magnitudes from 1e150
+ * (+-1e308 against +-1e-308, +-1e150, ten ulps on 1e150, a subnormal x
+ * against 0 and 1e300).  F64, F32 and I64 where they apply, each with and
+ * without nulls (a pair with a null side is skipped).
+ *
+ * The tolerance is 1e-9 of the pair's spread, sqrt(var x * var y), for any
+ * order of the rows: the sums are taken about a pivot that moves to the
+ * running mean at every power of two (a merge re-expresses the smaller
+ * part about the larger part's pivot), so they carry the rounding of a sum
+ * of n terms of the spread's size, at most about 3*n*u of the spread
+ * (u = 2^-53): 4e-11 at these 120,000 rows, within the tolerance.  The
+ * bound grows with n, so 1e-9 holds up to about 3 million rows a group,
+ * not beyond.  A constant side gives 0 exactly.  The reference scales each side by a power of two first, so
+ * its squares never overflow. */
+typedef struct { double hi, lo; } cdd_t;
+static cdd_t cdd_qsum(double a, double b) { double s = a + b; return (cdd_t){ s, b - (s - a) }; }
+static cdd_t cdd_add(cdd_t a, cdd_t b) {
+    double s = a.hi + b.hi, bb = s - a.hi, e = (a.hi - (s - bb)) + (b.hi - bb);
+    return cdd_qsum(s, e + a.lo + b.lo);
+}
+static cdd_t cdd_mul(cdd_t a, cdd_t b) {
+    double p = a.hi * b.hi, e = fma(a.hi, b.hi, -p) + a.hi * b.lo + a.lo * b.hi;
+    return cdd_qsum(p, e);
+}
+static cdd_t cdd_neg(cdd_t a) { return (cdd_t){ -a.hi, -a.lo }; }
+static cdd_t cdd_div(cdd_t a, double d) {
+    double q1 = a.hi / d;
+    cdd_t r = cdd_add(a, cdd_neg(cdd_mul((cdd_t){ q1, 0 }, (cdd_t){ d, 0 })));
+    return cdd_qsum(q1, r.hi / d);
+}
+/* an int64 exactly, scaled by 2^-e */
+static cdd_t cdd_i64(int64_t x, int e) {
+    double hi = (double)x;
+    if (hi >= 9223372036854775808.0) hi = 9223372036854774784.0;
+    double lo = (double)(x - (int64_t)hi);
+    return (cdd_t){ ldexp(hi, -e), ldexp(lo, -e) };
+}
+typedef struct { double n; cdd_t mx, my, cxx, cyy, cxy; } comom_ref_t;
+
+enum { CM_SHAPES = 20 };
+/* shapes 16-19: seeded random values, outliers at random rows */
+static double comom_u01(int shape, int64_t i, int salt) {
+    uint64_t z = (uint64_t)i * 0x9E3779B97F4A7C15ull + (uint64_t)(shape * 131 + salt) * 0xD1B54A32D192ED03ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return (double)(z >> 11) * 0x1p-53;
+}
+static double comom_rand(int shape, int64_t i, bool y) {
+    static const double base[4] = { 1e12, -3e8, 7.5e4, 1e140 };
+    static const double spread[4] = { 1000.0, 0.5, 3.0, 1e135 };
+    static const double outl[4] = { 1e14, 4e10, -2e7, 5e146 };
+    int k = shape - 16;
+    double v = base[k] * (y ? -0.5 : 1.0) + spread[k] * (comom_u01(shape, i, y ? 2 : 1) - 0.5);
+    if (comom_u01(shape, i, y ? 4 : 3) < 0.001) v += outl[k] * (y ? 0.25 : 1.0);
+    return v;
+}
+static double comom_case_x(int shape, int64_t i) {
+    double s = (i % 2) ? 1.0 : -1.0;
+    switch (shape) {
+        case 0:  return 1e8 + (double)(i % 4);
+        case 1:  return 3e38;
+        case 2:  return ((double)((i * 37) % 1000) - 400.25) * 0.5;
+        case 3:  return 1e15 + (double)(i % 1000);
+        case 4:  return s * 1e308;
+        case 5:  return 9007199254740992.0 + (double)(i % 7) * 3.0;
+        case 7:  return 1e150 + (double)(i % 4) * 1e135;
+        case 8:  return (i < 60000 ? 1e9 : -1e9) + (double)(i % 5);
+        case 10: return s * 1e150;                     /* review 2, finding 1 */
+        case 11: return (i % 2) ? 5e-324 : 0.0;         /* review 2, finding 3 */
+        case 12: return (i == 0 || i == 63) ? 1e8 : 0.0;  /* review 4, finding 1 */
+        case 14: return (i & (i - 1)) == 0 ? 1e9 : 1e3 + (double)(i % 7);   /* at powers of two */
+        case 15: return i >= 119998 ? -1e9 : 5e6 + (double)(i % 11);          /* outliers last */
+        case 16: case 17: case 18: case 19: return comom_rand(shape, i, false);
+        default: return i == 0 ? 0.0 : 1e8 + (double)(i % 4);
+    }
+}
+static double comom_case_y(int shape, int64_t i) {
+    double s = (i % 2) ? 1.0 : -1.0;
+    switch (shape) {
+        case 0:  return 7e7 - 3.0 * (double)(i % 5) + (double)(i % 4);
+        case 1:  return 3e38;
+        case 2:  return (double)((i * 91) % 777) * 0.125;
+        case 3:  return 2e15 - 2.0 * (double)(i % 1000) + (double)(i % 7);
+        case 4:  return s * 1e-308 * (1.0 + 0.25 * (double)(i % 3));
+        case 5:  return 9007199254740993.0 - (double)(i % 5);
+        case 7:  return -0.5e150 - (double)(i % 3) * 1e135;
+        case 8:  return (double)(i % 3);
+        case 10: return s * 1e150 * (1.0 + 0.25 * (double)(i % 3));
+        case 11: return (i % 2) ? 1e300 : 0.0;
+        case 12: return (i == 0 || i == 63) ? 1e8 : (double)(i % 3);
+        case 14: return (i & (i - 1)) == 0 ? -2e9 : 3e3 - (double)(i % 5);
+        case 15: return i >= 119998 ? 3e9 : -2e6 + (double)(i % 13);
+        case 16: case 17: case 18: case 19: return comom_rand(shape, i, true);
+        default: return i == 0 ? 0.0 : 1e8 + (double)(i % 4);
+    }
+}
+/* shape 6, I64 only: near 2^63 on both ends (never INT64_MIN, the null) */
+static int64_t comom_case_i(int shape, int64_t i, bool y) {
+    if (shape == 13) return INT64_MAX;                 /* review 4, finding 3: a constant at INT64_MAX */
+    if (shape == 6) return y ? INT64_MIN + 1 + (i % 7) : INT64_MAX - (i % 1000) * 3;
+    if (shape == 5) return y ? (INT64_C(1) << 53) + 1 - (i % 5) : (INT64_C(1) << 53) + (i % 7) * 3;
+    return (int64_t)(y ? comom_case_y(shape, i) : comom_case_x(shape, i));
+}
+
+static cdd_t comom_val(ray_t* v, int64_t i, int e) {
+    if (v->type == RAY_F64) return (cdd_t){ ldexp(((double*)ray_data(v))[i], -e), 0 };
+    if (v->type == RAY_F32) return (cdd_t){ ldexp((double)((float*)ray_data(v))[i], -e), 0 };
+    if (v->type == RAY_I32) return cdd_i64(((int32_t*)ray_data(v))[i], e);
+    return cdd_i64(((int64_t*)ray_data(v))[i], e);
+}
+static int comom_exp(ray_t* v, int64_t n) {
+    double m = 0;
+    for (int64_t i = 0; i < n; i++) {
+        cdd_t c = comom_val(v, i, 0);
+        if (fabs(c.hi) > m && !ray_vec_is_null(v, i)) m = fabs(c.hi);
+    }
+    int e = 0;
+    if (m > 0) frexp(m, &e);
+    return e;
+}
+
+/* The largest magnitude of a column's non-null values. */
+static double comom_maxabs(ray_t* v, int64_t n) {
+    double m = 0;
+    for (int64_t i = 0; i < n; i++) {
+        cdd_t c = comom_val(v, i, 0);
+        if (fabs(c.hi) > m && !ray_vec_is_null(v, i)) m = fabs(c.hi);
+    }
+    return m;
+}
+
+/* The two-pass double-double reference of each group g of gid[0..n) (ng
+ * groups), each side scaled by 2^-ex, 2^-ey; a pair with a null side is
+ * skipped. */
+static void comom_ref_build(ray_t* x, ray_t* y, const int64_t* gid, int64_t n, int64_t ng,
+                            int ex, int ey, comom_ref_t* ref) {
+    memset(ref, 0, (size_t)ng * sizeof(comom_ref_t));
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1)
+            for (int64_t g = 0; g < ng; g++)
+                if (ref[g].n > 0) {
+                    ref[g].mx = cdd_div(ref[g].mx, ref[g].n);
+                    ref[g].my = cdd_div(ref[g].my, ref[g].n);
+                }
+        for (int64_t i = 0; i < n; i++) {
+            if (ray_vec_is_null(x, i) || ray_vec_is_null(y, i)) continue;
+            comom_ref_t* r = &ref[gid[i]];
+            cdd_t xv = comom_val(x, i, ex), yv = comom_val(y, i, ey);
+            if (pass == 0) { r->n += 1; r->mx = cdd_add(r->mx, xv); r->my = cdd_add(r->my, yv); }
+            else {
+                cdd_t dx = cdd_add(xv, cdd_neg(r->mx)), dy = cdd_add(yv, cdd_neg(r->my));
+                r->cxx = cdd_add(r->cxx, cdd_mul(dx, dx));
+                r->cyy = cdd_add(r->cyy, cdd_mul(dy, dy));
+                r->cxy = cdd_add(r->cxy, cdd_mul(dx, dy));
+            }
+        }
+    }
+}
+
+/* Checks a query's two columns c s (after the keys, if any) against
+ * ref[group] for groups 0..ng (keyed by column 0 when keyed); unchecked: a
+ * side reaches 1e150, where no answer is promised. */
+static test_result_t comom_check(ray_t* out, const char* q, bool keyed, const comom_ref_t* ref,
+                                 int64_t ng, int ex, int ey, const char* tag, bool unchecked) {
+    TEST_ASSERT_FMT(out && !RAY_IS_ERR(out), "%s %s failed: %s", tag, q, out ? ray_err_code(out) : "NULL");
+    int64_t rows = out->type == RAY_TABLE ? ray_table_nrows(out) : 1;
+    TEST_ASSERT_FMT(rows == ng, "%s %s: %lld groups", tag, q, (long long)rows);
+    ray_t* kc = keyed ? ray_table_get_col_idx(out, 0) : NULL;
+    for (int64_t r = 0; r < ng; r++) {
+        int64_t g = 0;
+        if (kc) g = kc->type == RAY_SYM ? ray_read_sym(ray_data(kc), r, kc->type, kc->attrs)
+                                        : ((int64_t*)ray_data(kc))[r];
+        if (kc && kc->type == RAY_SYM) {
+            ray_t* sn = ray_sym_str(g);
+            g = sn ? ray_str_ptr(sn)[0] - 'a' : -1;
+        }
+        TEST_ASSERT_TRUE(g >= 0 && g < ng);
+        const comom_ref_t* e = &ref[g];
+        double cxx = e->cxx.hi, cyy = e->cyy.hi;
+        double scale = sqrt(cxx / e->n) * sqrt(cyy / e->n);   /* scaled units */
+        double want[2] = { cdd_div(e->cxy, e->n).hi, e->n > 1 ? cdd_div(e->cxy, e->n - 1).hi : 0 };
+        for (int a = 0; a < 2; a++) {
+            double got;
+            bool isnull;
+            if (out->type == RAY_TABLE) {
+                ray_t* col = ray_table_get_col_idx(out, (keyed ? 1 : 0) + a);
+                got = ((double*)ray_data(col))[r];
+                isnull = got != got;
+            } else {
+                got = out->f64; isnull = got != got;   /* the direct call answers one atom (column c only) */
+                if (a > 0) break;
+            }
+            if (e->n < (a == 0 ? 1 : 2)) {
+                TEST_ASSERT_FMT(isnull, "%s %s group %lld agg %d: %.17g, want the null", tag, q, (long long)g, a, got);
+                continue;
+            }
+            if (unchecked) continue;
+            TEST_ASSERT_FMT(!isnull, "%s %s group %lld agg %d: the null, want %.17g", tag, q, (long long)g, a,
+                            ldexp(want[a], ex + ey));
+            double gs = ldexp(got, -(ex + ey));
+            double tol = 1e-9 * scale + 1e-300;
+            TEST_ASSERT_FMT(fabs(gs - want[a]) <= tol, "%s %s group %lld agg %d: got %.17g want %.17g",
+                            tag, q, (long long)g, a, got, ldexp(want[a], ex + ey));
+        }
+    }
+    PASS();
+}
+
+static test_result_t test_comoment_large_magnitude(void) {
+    const int64_t n = 120000, nhi = 40000;
+    static const char* const keys[] = { NULL, "klo", "khi" };
+    static const int64_t ngroups[] = { 1, 3, 40000 };
+    comom_ref_t* ref = calloc((size_t)nhi, sizeof(comom_ref_t));
+    TEST_ASSERT_NOT_NULL(ref);
+    char root[64];
+    snprintf(root, sizeof root, "/tmp/rayforce_comoment_%ld", (long)getpid());
+    for (int workers = 1; workers <= 4; workers += 3) {
+        ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers), RAY_OK);
+        for (int shape = 0; shape < CM_SHAPES; shape++) {
+            for (int wn = 0; wn < 6; wn++) {   /* F64, F32, I64; then each with nulls */
+                int width = wn % 3; bool nulls = wn >= 3;
+                bool int_ok = shape == 0 || shape == 3 || shape == 5 || shape == 6 || shape == 8 || shape == 9 ||
+                              (shape >= 12 && shape <= 15);
+                bool f32_ok = shape == 0 || shape == 1 || shape == 2 || shape == 8 || shape == 9 ||
+                              shape == 12 || shape == 14 || shape == 15 || shape == 17 || shape == 18;
+                if ((width == 2 && !int_ok) || (width == 1 && !f32_ok) || (width == 0 && (shape == 6 || shape == 13)))
+                    continue;
+                ray_t* klo = ray_vec_new(RAY_I64, n);
+                ray_t* khi = ray_vec_new(RAY_I64, n);
+                int8_t vt = width == 0 ? RAY_F64 : width == 1 ? RAY_F32 : RAY_I64;
+                ray_t* x = ray_vec_new(vt, n);
+                ray_t* y = ray_vec_new(vt, n);
+                TEST_ASSERT_TRUE(klo && khi && x && y);
+                klo->len = khi->len = x->len = y->len = n;
+                for (int64_t i = 0; i < n; i++) {
+                    ((int64_t*)ray_data(klo))[i] = i % 3;
+                    ((int64_t*)ray_data(khi))[i] = (i * 7919) % nhi;
+                    double xv = comom_case_x(shape, i), yv = comom_case_y(shape, i);
+                    if (width == 0) { ((double*)ray_data(x))[i] = xv; ((double*)ray_data(y))[i] = yv; }
+                    else if (width == 1) { ((float*)ray_data(x))[i] = (float)xv; ((float*)ray_data(y))[i] = (float)yv; }
+                    else { ((int64_t*)ray_data(x))[i] = comom_case_i(shape, i, false);
+                           ((int64_t*)ray_data(y))[i] = comom_case_i(shape, i, true); }
+                    if (nulls && i > 0 && (i % 11 == 0 || i % 13 == 5))
+                        ray_vec_set_null(i % 11 == 0 ? x : y, i, true);
+                }
+                int ex = comom_exp(x, n), ey = comom_exp(y, n);
+                bool big = comom_maxabs(x, n) >= 1e150 || comom_maxabs(y, n) >= 1e150;
+                ray_t* t = ray_table_new(4);
+                t = ray_table_add_col(t, ray_sym_intern("klo", 3), klo);
+                t = ray_table_add_col(t, ray_sym_intern("khi", 3), khi);
+                t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+                t = ray_table_add_col(t, ray_sym_intern("y", 1), y);
+                ray_env_set(ray_sym_intern("comt", 4), t);
+                ray_release(t); ray_release(klo); ray_release(khi);
+                char tag[96];
+                snprintf(tag, sizeof tag, "workers %d shape %d width %d nulls %d:", workers, shape, width, nulls);
+                /* the index-slice table (a grouped symbol key, a b c for klo) and two partitions */
+                char setup[1536];
+                snprintf(setup, sizeof setup,
+                         "(do (set comts (table [sk x y] (list (.attr.set 'grouped (at ['a 'b 'c] (at comt 'klo))) "
+                         "(at comt 'x) (at comt 'y)))) (.sys.exec \"rm -rf %s\") "
+                         "(.db.splayed.set \"%s/2024.01.01/t/\" (take (select {klo: klo x: x y: y from: comt}) 60000)) "
+                         "(.db.splayed.set \"%s/2024.01.02/t/\" (drop (select {klo: klo x: x y: y from: comt}) 60000)) "
+                         "(set comp (.db.parted.get \"%s/\" 't)) 0)", root, root, root, root);
+                ray_t* su = ray_eval_str(setup);
+                TEST_ASSERT_FMT(su && !RAY_IS_ERR(su), "%s setup", tag);
+                ray_release(su);
+                for (int kf = 0; kf < 3; kf++) {
+                    int64_t ng = ngroups[kf];
+                    memset(ref, 0, (size_t)ng * sizeof(comom_ref_t));
+                    for (int pass = 0; pass < 2; pass++) {
+                        if (pass == 1)
+                            for (int64_t g = 0; g < ng; g++) {
+                                if (ref[g].n > 0) {
+                                    ref[g].mx = cdd_div(ref[g].mx, ref[g].n);
+                                    ref[g].my = cdd_div(ref[g].my, ref[g].n);
+                                }
+                            }
+                        for (int64_t i = 0; i < n; i++) {
+                            if (nulls && (ray_vec_is_null(x, i) || ray_vec_is_null(y, i))) continue;
+                            int64_t g = kf == 0 ? 0 : kf == 1 ? i % 3 : (i * 7919) % nhi;
+                            cdd_t xv = comom_val(x, i, ex), yv = comom_val(y, i, ey);
+                            comom_ref_t* r = &ref[g];
+                            if (pass == 0) { r->n += 1; r->mx = cdd_add(r->mx, xv); r->my = cdd_add(r->my, yv); }
+                            else {
+                                cdd_t dx = cdd_add(xv, cdd_neg(r->mx)), dy = cdd_add(yv, cdd_neg(r->my));
+                                r->cxx = cdd_add(r->cxx, cdd_mul(dx, dx));
+                                r->cyy = cdd_add(r->cyy, cdd_mul(dy, dy));
+                                r->cxy = cdd_add(r->cxy, cdd_mul(dx, dy));
+                            }
+                        }
+                    }
+                    for (int where = 0; where < 2; where++)
+                        for (int route = 0; route <= 2; route++) {
+                            char q[256];
+                            snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) "
+                                     "from:comt%s%s%s})", kf ? " by:" : "", kf ? keys[kf] : "",
+                                     where ? " where:(>= klo 0)" : "");
+                            ray_group_test_route(route);
+                            ray_t* out = ray_eval_str(q);
+                            ray_group_test_route(0);
+                            test_result_t tr = comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, big);
+                            ray_release(out);
+                            if (tr.status != TEST_PASS) { free(ref); return tr; }
+                        }
+                    static const char* const extra[2][3] = {
+                        { "(cov (at comt 'x) (at comt 'y))",
+                          "(select {c:(cov x y) s:(scov x y) from:comp})", NULL },
+                        { "(select {c:(cov x y) s:(scov x y) from:comts by:sk where:(in sk ['a 'b 'c])})",
+                          "(select {c:(cov x y) s:(scov x y) from:comp by:klo})", NULL },
+                    };
+                    for (int j = 0; kf < 2 && extra[kf][j]; j++) {
+                        ray_t* out = ray_eval_str(extra[kf][j]);
+                        test_result_t tr = comom_check(out, extra[kf][j], kf > 0, ref, ng, ex, ey, tag, big);
+                        ray_release(out);
+                        if (tr.status != TEST_PASS) { free(ref); return tr; }
+                    }
+                }
+                ray_release(x); ray_release(y);
+            }
+        }
+    }
+    free(ref);
+    char rm[256];
+    snprintf(rm, sizeof rm, "(do (set comt 0) (set comts 0) (set comp 0) (.sys.exec \"rm -rf %s\") 0)", root);
+    ray_release(ray_eval_str(rm));
+    PASS();
+}
+
+/* The legacy direct-array route keeps a co-moment slot's pair in its own
+ * array (cov_ky, #1847): an allocation that fails, any of them, answers oom
+ * or the unfailed groups and values, never a group summed about a pair it
+ * did not keep.  A fallback route sums about its own running means, so cov
+ * and scov match to the tolerance (1e-9 of a spread of about 1.6), the
+ * keys and wsum exactly. */
+static test_result_t test_comoment_alloc_fail(void) {
+    ray_t* init = ray_eval_str(
+        "(set comaf (table [j x y] (list (% (til 70000) 7) (+ 1e8 (as 'F64 (% (til 70000) 4))) "
+        "(- 3.0 (as 'F64 (% (til 70000) 5))))))");
+    TEST_ASSERT_NOT_NULL(init); TEST_ASSERT_FALSE(RAY_IS_ERR(init)); ray_release(init);
+    const char* q = "(select {c: (cov x y) s: (scov x y) w: (wsum x y) from: comaf by: j asc: j})";
+    ray_group_test_route(1);
+    ray_t* want = ray_eval_str(q);
+    TEST_ASSERT_TRUE(want && !RAY_IS_ERR(want));
+    TEST_ASSERT_EQ_I(ray_table_nrows(want), 7);
+    int64_t fails = 0;
+    for (int64_t n = 1; n <= 4000; n++) {
+        ray_group_alloc_fail_for_test(n);
+        ray_t* got = ray_eval_str(q);
+        bool fired = ray_group_alloc_fail_fired_for_test();
+        ray_group_alloc_fail_for_test(0);
+        if (got && RAY_IS_ERR(got)) {
+            TEST_ASSERT_FMT(strcmp(ray_err_code(got), "oom") == 0, "allocation %lld fails: %s, not oom",
+                            (long long)n, ray_err_code(got));
+            ray_error_free(got);
+            fails++;
+            continue;
+        }
+        TEST_ASSERT_NOT_NULL(got);
+        TEST_ASSERT_FMT(got->type == RAY_TABLE && ray_table_nrows(got) == 7,
+                        "allocation %lld fails: other groups", (long long)n);
+        for (int64_t c = 0; c < 4; c++) {
+            ray_t* gc = ray_table_get_col_idx(got, c);
+            ray_t* wc = ray_table_get_col_idx(want, c);
+            TEST_ASSERT_TRUE(gc && wc && gc->type == wc->type);
+            for (int64_t r = 0; r < 7; r++) {
+                bool same = c == 0 ? ((int64_t*)ray_data(gc))[r] == ((int64_t*)ray_data(wc))[r]
+                          : c == 3 ? ((double*)ray_data(gc))[r] == ((double*)ray_data(wc))[r]
+                          : fabs(((double*)ray_data(gc))[r] - ((double*)ray_data(wc))[r]) <= 1e-9;
+                TEST_ASSERT_FMT(same, "allocation %lld fails: column %lld row %lld differs",
+                                (long long)n, (long long)c, (long long)r);
+            }
+        }
+        ray_release(got);
+        if (!fired) break;
+    }
+    ray_group_test_route(0);
+    TEST_ASSERT_FMT(fails > 0, "no allocation failure answered oom");
+    ray_release(want);
+    ray_release(ray_eval_str("(set comaf 0)"));
+    PASS();
+}
+
+
+/* A seeded randomized search for cov and scov against the double-double
+ * reference (#1847): each case draws a type pair (F64, F32, I64, I32, and
+ * mixed I64 x F64, F64 x I64, I32 x F64), a magnitude up to 1e149 (1e37 for
+ * F32, int64's range for an integer side), a spread relative to it down to 1e-15, a
+ * handful of outliers, a row order (shuffled, sorted, reversed, outliers
+ * first, last or at the powers of two, two alternating clusters) and
+ * sometimes nulls.  Every case runs the direct call, keyless, by a 3-key
+ * and a high-cardinality column with and without where:, under routes 0, 1
+ * and 2, and an index slice, at 1 and 4 workers.  Every cell must be within
+ * 1e-9 of its group's spread: groups hold at most 70,000 rows, where the
+ * rounding bound of a sum of n terms, about 3*n*u of the spread, is 2.3e-11.  COMOM_SEARCH_CASES cases from COMOM_SEARCH_SEED. */
+#ifndef COMOM_SEARCH_CASES
+#define COMOM_SEARCH_CASES 24
+#endif
+#ifndef COMOM_SEARCH_SEED
+#define COMOM_SEARCH_SEED 0x1847u
+#endif
+static uint64_t comom_sm(uint64_t* st) {
+    uint64_t z = (*st += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+static double comom_su(uint64_t* st) { return (double)(comom_sm(st) >> 11) * 0x1p-53; }
+static int comom_cmp_d(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+/* One side's values: base + spread * u, outliers at the order's places,
+ * reordered (0 shuffled, 1 sorted, 2 reversed, 3 outliers first, 4 last,
+ * 5 at the powers of two, 6 two alternating clusters, 7 at random rows).
+ * A float side's magnitude is drawn up to maxmag, a third of the time from
+ * its top decade; an integer side is built in int64 arithmetic (vi), a
+ * third of the time near INT64_MAX or INT64_MIN with outliers at the other
+ * end. */
+static void comom_search_side(uint64_t* st, double* v, int64_t* vi, int64_t n, bool integer,
+                              double maxmag, int order, const int64_t* perm) {
+    int nout = 1 + (int)(comom_su(st) * 4.0);
+    int64_t* rank = malloc((size_t)n * sizeof(int64_t));
+    double* u = malloc((size_t)n * sizeof(double));
+    for (int64_t i = 0; i < n; i++) u[i] = comom_su(st);
+    if (order == 1 || order == 2) qsort(u, (size_t)n, sizeof(double), comom_cmp_d);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t j = order == 0 ? perm[i] : order == 2 ? n - 1 - i : i;
+        bool o;
+        if (order == 3) o = i < nout;
+        else if (order == 4) o = i >= n - nout;
+        else if (order == 5) o = i > 0 && (i & (i - 1)) == 0;
+        else if (order == 6) o = (i % 2) != 0;
+        else o = (int64_t)(comom_su(st) * (double)n) < nout;
+        rank[i] = o ? -1 - j : j;
+    }
+    if (integer) {
+        int64_t base, out;
+        uint64_t spread;
+        int kind = (int)(comom_sm(st) % 3);
+        if (kind == 0) {          /* near INT64_MAX, outliers near INT64_MIN */
+            spread = (uint64_t)1 << (comom_sm(st) % 40);
+            base = INT64_MAX - (int64_t)spread;
+            out = INT64_MIN + (int64_t)(comom_sm(st) % 1000);
+        } else if (kind == 1) {   /* past 2^53 with a small spread */
+            spread = (uint64_t)1 << (comom_sm(st) % 20);
+            base = (int64_t)(comom_sm(st) >> 2) * (comom_sm(st) & 1 ? 1 : -1);
+            out = base / 2;
+        } else {
+            spread = (uint64_t)1 << (comom_sm(st) % 50);
+            base = (int64_t)(comom_sm(st) >> (2 + comom_sm(st) % 60)) * (comom_sm(st) & 1 ? 1 : -1);
+            out = (int64_t)(comom_sm(st) >> 1) * (comom_sm(st) & 1 ? 1 : -1);
+        }
+        for (int64_t i = 0; i < n; i++) {
+            int64_t r = rank[i];
+            if (r < 0) { vi[i] = out; continue; }
+            int64_t d = (int64_t)(u[r] * (double)spread);
+            vi[i] = base >= 0 ? base - d : base + d;
+        }
+        for (int64_t i = 0; i < n; i++) v[i] = (double)vi[i];
+    } else {
+        double lg = log10(maxmag);
+        double e = comom_su(st) < 0.33 ? lg - comom_su(st) : comom_su(st) * lg;
+        double base = (comom_su(st) < 0.5 ? -1.0 : 1.0) * pow(10.0, e);
+        if (comom_su(st) < 0.1) base = 0.0;
+        double spread = fabs(base) * pow(10.0, -comom_su(st) * 15.0);
+        if (spread == 0.0) spread = pow(10.0, comom_su(st) * 100.0 - 50.0);
+        if (spread > 0.1 * maxmag) spread = 0.1 * maxmag;
+        double outl = comom_su(st) < 0.3 ? -base : spread * pow(10.0, comom_su(st) * 6.0);
+        if (comom_su(st) < 0.5) outl = -outl;
+        if (fabs(base) + fabs(outl) > 0.9 * maxmag) outl = (outl < 0 ? -1.0 : 1.0) * 0.05 * maxmag;
+        for (int64_t i = 0; i < n; i++) {
+            int64_t r = rank[i];
+            v[i] = r < 0 ? base + outl + spread * u[-1 - r] : base + spread * u[r];
+        }
+    }
+    free(rank); free(u);
+}
+static ray_t* comom_search_vec(const double* v, const int64_t* vi, int64_t n, int8_t t) {
+    ray_t* r = ray_vec_new(t, n);
+    if (!r) return NULL;
+    r->len = n;
+    for (int64_t i = 0; i < n; i++) {
+        if (t == RAY_F64) ((double*)ray_data(r))[i] = v[i];
+        else if (t == RAY_F32) ((float*)ray_data(r))[i] = (float)v[i];
+        else if (t == RAY_I32) ((int32_t*)ray_data(r))[i] = (int32_t)(vi[i] % 2000000000);
+        else ((int64_t*)ray_data(r))[i] = vi[i] == INT64_MIN ? INT64_MIN + 1 : vi[i];
+    }
+    return r;
+}
+
+static test_result_t test_comoment_random_search(void) {
+    static const int8_t tx[7] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_I64, RAY_F64, RAY_I32 };
+    static const int8_t ty[7] = { RAY_F64, RAY_F32, RAY_I64, RAY_I32, RAY_F64, RAY_I64, RAY_F64 };
+    uint64_t st = COMOM_SEARCH_SEED;
+    int64_t cells = 0;
+    for (int c = 0; c < COMOM_SEARCH_CASES; c++) {
+        int64_t n = (c % 4 == 0) ? 70000 : (c % 4 == 1) ? 20000 : (c % 4 == 2) ? 4000 : 777;
+        int pair = (int)(comom_sm(&st) % 7);
+        int order = (int)(comom_sm(&st) % 8);
+        bool nulls = comom_su(&st) < 0.25;
+        int64_t nhi = n / 4 + 1;
+        int64_t* perm = malloc((size_t)n * sizeof(int64_t));
+        double* xv = malloc((size_t)n * sizeof(double));
+        double* yv = malloc((size_t)n * sizeof(double));
+        int64_t* xi = malloc((size_t)n * sizeof(int64_t));
+        int64_t* yi = malloc((size_t)n * sizeof(int64_t));
+        int64_t* glo = malloc((size_t)n * sizeof(int64_t));
+        int64_t* ghi = malloc((size_t)n * sizeof(int64_t));
+        int64_t* g0 = calloc((size_t)n, sizeof(int64_t));
+        comom_ref_t* ref = calloc((size_t)nhi, sizeof(comom_ref_t));
+        TEST_ASSERT_TRUE(perm && xv && yv && xi && yi && glo && ghi && g0 && ref);
+        for (int64_t i = 0; i < n; i++) perm[i] = i;
+        for (int64_t i = n - 1; i > 0; i--) {
+            int64_t j = (int64_t)(comom_sm(&st) % (uint64_t)(i + 1)), t = perm[i];
+            perm[i] = perm[j]; perm[j] = t;
+        }
+        bool ix = tx[pair] == RAY_I64 || tx[pair] == RAY_I32, iy = ty[pair] == RAY_I64 || ty[pair] == RAY_I32;
+        comom_search_side(&st, xv, xi, n, ix, tx[pair] == RAY_F32 ? 1e37 : 1e149, order, perm);
+        comom_search_side(&st, yv, yi, n, iy, ty[pair] == RAY_F32 ? 1e37 : 1e149, order, perm);
+        for (int64_t i = 0; i < n; i++) {
+            glo[i] = i % 3;
+            ghi[i] = (int64_t)(comom_sm(&st) % (uint64_t)nhi);
+        }
+        for (int64_t g = 0; g < nhi; g++) ghi[g] = g;   /* every high-cardinality key appears */
+        ray_t* x = comom_search_vec(xv, xi, n, tx[pair]);
+        ray_t* y = comom_search_vec(yv, yi, n, ty[pair]);
+        ray_t* klo = ray_vec_new(RAY_I64, n);
+        ray_t* khi = ray_vec_new(RAY_I64, n);
+        TEST_ASSERT_TRUE(x && y && klo && khi);
+        klo->len = khi->len = n;
+        memcpy(ray_data(klo), glo, (size_t)n * sizeof(int64_t));
+        memcpy(ray_data(khi), ghi, (size_t)n * sizeof(int64_t));
+        if (nulls)
+            for (int64_t i = 1; i < n; i += 7 + (int64_t)(comom_sm(&st) % 9))
+                ray_vec_set_null(comom_sm(&st) & 1 ? x : y, i, true);
+        int ex = comom_exp(x, n), ey = comom_exp(y, n);
+        ray_t* t = ray_table_new(4);
+        t = ray_table_add_col(t, ray_sym_intern("klo", 3), klo);
+        t = ray_table_add_col(t, ray_sym_intern("khi", 3), khi);
+        t = ray_table_add_col(t, ray_sym_intern("x", 1), x);
+        t = ray_table_add_col(t, ray_sym_intern("y", 1), y);
+        ray_env_set(ray_sym_intern("comr", 4), t);
+        ray_release(t); ray_release(klo); ray_release(khi);
+        ray_t* su = ray_eval_str("(do (set comrs (table [sk x y] (list (.attr.set 'grouped (at ['a 'b 'c] (at comr 'klo))) "
+                                 "(at comr 'x) (at comr 'y)))) 0)");
+        TEST_ASSERT_FMT(su && !RAY_IS_ERR(su), "search case %d setup", c);
+        ray_release(su);
+        char tag[128];
+        snprintf(tag, sizeof tag, "search seed %#x case %d (pair %d order %d nulls %d n %lld):",
+                 (unsigned)COMOM_SEARCH_SEED, c, pair, order, nulls, (long long)n);
+        for (int workers = 1; workers <= 4; workers += 3) {
+            ray_pool_destroy(); TEST_ASSERT_EQ_I(ray_pool_init_total(workers), RAY_OK);
+            for (int kf = 0; kf < 3; kf++) {
+                int64_t ng = kf == 0 ? 1 : kf == 1 ? 3 : nhi;
+                comom_ref_build(x, y, kf == 0 ? g0 : kf == 1 ? glo : ghi, n, ng, ex, ey, ref);
+                for (int where = 0; where < 2; where++)
+                    for (int route = 0; route <= 2; route++) {
+                        char q[256];
+                        snprintf(q, sizeof q, "(select {c:(cov x y) s:(scov x y) from:comr%s%s})",
+                                 kf == 0 ? "" : kf == 1 ? " by:klo" : " by:khi",
+                                 where ? " where:(>= klo 0)" : "");
+                        ray_group_test_route(route);
+                        ray_t* out = ray_eval_str(q);
+                        ray_group_test_route(0);
+                        test_result_t tr = comom_check(out, q, kf > 0, ref, ng, ex, ey, tag, false);
+                        ray_release(out);
+                        if (tr.status != TEST_PASS) return tr;
+                        cells += 2 * ng;
+                    }
+                if (kf == 0) {
+                    ray_t* out = ray_eval_str("(cov (at comr 'x) (at comr 'y))");
+                    test_result_t tr = comom_check(out, "direct", false, ref, 1, ex, ey, tag, false);
+                    ray_release(out);
+                    if (tr.status != TEST_PASS) return tr;
+                    cells += 1;
+                }
+                if (kf == 1) {
+                    const char* q = "(select {c:(cov x y) s:(scov x y) from:comrs by:sk where:(in sk ['a 'b 'c])})";
+                    ray_t* out = ray_eval_str(q);
+                    test_result_t tr = comom_check(out, q, true, ref, 3, ex, ey, tag, false);
+                    ray_release(out);
+                    if (tr.status != TEST_PASS) return tr;
+                    cells += 6;
+                }
+            }
+        }
+        ray_release(x); ray_release(y);
+        free(perm); free(xv); free(yv); free(xi); free(yi); free(glo); free(ghi); free(g0); free(ref);
+    }
+    ray_release(ray_eval_str("(do (set comr 0) (set comrs 0) 0)"));
+    fprintf(stderr, "  comoment search: seed %#x, %d cases, %lld cells, 0 failed\n",
+            (unsigned)COMOM_SEARCH_SEED, COMOM_SEARCH_CASES, (long long)cells);
+    PASS();
+}
+
+
 const test_entry_t agg_contract_entries[] = {
     { "agg_contract/card_estimate", test_card_estimate, contract_setup, contract_teardown },
     { "agg_contract/cd_route", test_cd_route, contract_setup, contract_teardown },
@@ -6816,5 +7426,8 @@ const test_entry_t agg_contract_entries[] = {
     { "agg_contract/agg_topk_ask_ahead", test_agg_topk_ask_ahead, contract_setup, contract_teardown },
     { "agg_contract/cd_gate_read_ahead", test_cd_gate_read_ahead, contract_setup, contract_teardown },
 #endif
+    { "agg_contract/comoment_large_magnitude", test_comoment_large_magnitude, contract_setup, contract_teardown },
+    { "agg_contract/comoment_alloc_fail", test_comoment_alloc_fail, contract_setup, contract_teardown },
+    { "agg_contract/comoment_random_search", test_comoment_random_search, contract_setup, contract_teardown },
     { NULL, NULL, NULL, NULL },
 };

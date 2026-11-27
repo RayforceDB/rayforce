@@ -698,6 +698,72 @@ Population and sample covariance over paired non-null numeric inputs.
 (scov [1 3] [2 6])  ; 4.0
 ```
 
+#### Covariance accuracy
+
+`cov` and `scov` sum the differences of the pairs from a pivot pair, and
+their products:
+- the pivot starts at the first pair of each part a route sums (a group,
+  the part of it one worker or one partition sums);
+- at every power of two from 2 pairs, it moves to the running mean, and
+  the sums are re-expressed about it exactly;
+- parts combine exactly: the smaller part is re-expressed about the larger
+  part's pivot, which lies within about a standard deviation of the
+  combined mean.
+
+After the move at the largest power of two up to the count, the pivot is
+the mean of at least half the pairs, so it lies within about a standard
+deviation of the final mean whatever the order of the rows.
+
+For values whose magnitudes are all below 1e150, the error is that of
+rounding a sum of n pairs, whatever the order of the rows, on every route,
+at any worker count and any partition split: at most about 3·n·u times the
+pairs' spread, sqrt(var x · var y), where u = 2^-53 ≈ 1.1e-16 is the
+double's unit roundoff. The sum of products adds n terms that each round,
+and with the pivot within a standard deviation of the mean their sizes
+add up to at most about 2n times the spread. So the answer is within 1e-9
+of the spread for groups of up to 3 million pairs, and within 3.3e-8 at
+100 million. The bound is a worst case: rounding errors mostly cancel, and
+typical errors grow like the square root of n. Different worker counts and
+splits add the parts in a different order, so their answers can differ
+from each other, within the same bound.
+
+Large values close together are as accurate as small ones: values near
+1e8 or 1e15, or 3e38 in F32, give the covariance of their spread, and
+outliers among them, first, last or anywhere, do not leave cancellation
+behind.
+
+Two cases hold exactly:
+- a column whose values are all equal, of any type, has a covariance of
+  exactly 0;
+- the covariance of `1e8 + [0 1 2 3]` with itself is its population
+  variance, 1.25.
+
+Integers. Each side of a pair keeps its own arithmetic. An integer or
+temporal side's pivot is an integer: the first value exactly, then the
+mean rounded to an integer, anywhere in the int64 range. Its differences
+are taken in integer arithmetic, with one rounding to a double. A float
+side takes its differences in doubles. So the covariance of
+`10000000000000000 + [0 1 2 3]` with `[0 1 2 3]` is 1.25, with the second
+side integer or float, and a column of 9223372036854775807 has a
+covariance of 0.
+
+The final correction is formed so that no intermediate passes the largest
+double where the sums themselves do not: a covariance whose sums fit is
+never `0Nf` from the correction alone. The sums hold about n·cov, so they
+must fit the double range themselves.
+
+Limit: **values from 1e150.** A difference, a product or the final
+correction can overflow or cancel, so for such magnitudes the answer may be
+`0Nf` or inaccurate, as the raw formula's was.
+
+`pearson_corr` is unchanged: it is computed from the raw sums.
+
+```lisp
+(cov (take 3e38e 200000) (take 3e38e 200000))   ; 0.0
+(cov (+ 1e8 [0 1 2 3]) (- 7 (* 2 (+ 1e8 [0 1 2 3]))))   ; -2.5
+(cov [10000000000000000 10000000000000001 10000000000000002 10000000000000003] [0 1 2 3])   ; 1.25
+```
+
 ### `(wsum weights values)` / `(wavg weights values)` — aggregate
 
 Weighted sum and weighted average over paired non-null inputs. `wavg` returns null when there are no valid pairs or the total weight is zero.
