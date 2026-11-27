@@ -3250,6 +3250,130 @@ static test_result_t test_cast_unflagged_i32_temporal(void) {
     PASS();
 }
 
+#ifdef DEBUG
+#include "lang/eval.h"
+#include "lang/parse.h"
+#include "core/runtime.h"
+
+/* The concat of every operand shape (each vector type, a vector and a
+ * list, two lists, mixed vectors, an atom and a vector, two atoms, tables,
+ * dicts, strings) with the nth allocation of the parsed call failing, for
+ * every n it reaches.  Each run answers the unfailed answer or `oom`,
+ * keeping nothing either way: a failed copy answered C NULL, which the
+ * evaluator took for a value. */
+static void vec_rt_setup(void) { ray_runtime_create(0, NULL); }
+static void vec_rt_teardown(void) { ray_runtime_destroy(__RUNTIME); }
+
+static test_result_t test_vec_concat_alloc_fail(void) {
+    ray_t* u = ray_eval_str("(set U9 (guid 2))");
+    TEST_ASSERT(u && !RAY_IS_ERR(u), "setup");
+    ray_release(u);
+    u = ray_eval_str("(set M9 (table [d t v] (list [2024.01.01 2024.01.02] [10:00:00.000 11:00:00.000] [1 9])))");
+    TEST_ASSERT(u && !RAY_IS_ERR(u), "setup");
+    ray_release(u);
+    static const char* const qs[] = {
+        "(concat (til 100) (til 50))",
+        "(concat (as 'F64 (til 30)) [1.5 2.5])",
+        "(concat U9 U9)",
+        "(concat ['a 'b] ['c])",
+        "(concat [\"abcdefghijklmnopq\" \"x\"] [\"bcdefghijklmnopqr\"])",
+        "(concat [true false] [true])",
+        "(concat [2024.01.01] [2024.01.02 2024.01.03])",
+        "(concat (til 3) (list \"a\" 'b))",
+        "(concat (list 1 \"a\") (til 2))",
+        "(concat (list 1 \"a\") (list 'b))",
+        "(concat (til 3) [1.5 2.5])",
+        "(concat 7 (til 5))",
+        "(concat (til 5) 7)",
+        "(concat 1 2)",
+        "(concat (table [a b] (list (til 3) [1.5 2.5 3.5])) (table [a b] (list (til 2) [4.5 5.5])))",
+        "(concat {a: 1} {b: 2})",
+        "(concat (dict [1.5] [1]) (dict [2.5] [2]))",
+        "(concat 1 (list 2 \"a\"))",
+        "(concat (list 2 \"a\") 1)",
+        "(concat 1 \"a\")",
+        "(concat \"ab\" \"cd\")",
+        "(concat [\"ab\" \"cd\"] \"ef\")",
+        "(raze (list (til 3) (list 1 \"a\") [1.5 2.5]))",
+        "(raze (list (til 3) (til 4)))",
+        "(raze (list (list 1 \"a\") (til 3) [1.5 2.5] (til 2)))",   /* a list's tail of vectors */
+        "(dict [1 2] [3 4])",
+        "(as 'STR [1 2 3])",
+        "(as 'F64 [1 2 3])",
+        /* an if whose arms mix two temporal types is refused, as the
+         * planner refuses it: never boxed cells (rw_if_mix_err) */
+        "(select {s: (count (enlist (if (> v 5) d t))) from: M9})",
+        "(split (til 6) [0 2])",                  /* a vector cut by positions */
+        "(split (list 1 \"a\" 2 3) (as 'I32 [0 2]))",   /* a list cut by I32 positions */
+    };
+    for (size_t q = 0; q < sizeof qs / sizeof *qs; q++) {
+        /* the reference: an answer, or an error whose code a run gives too */
+        ray_t* ref = ray_eval_str(qs[q]);
+        TEST_ASSERT(ref != NULL, "reference");
+        char ref_err[32] = "";
+        if (RAY_IS_ERR(ref)) {
+            snprintf(ref_err, sizeof ref_err, "%s", ray_err_code(ref));
+            ray_error_free(ref);
+            ray_clear_error_trace();
+            ref = ray_str("", 0);
+        }
+        ray_t* rf = ray_fmt(ref, 1);
+        ray_release(ref);
+        TEST_ASSERT(rf && !RAY_IS_ERR(rf), "fmt");
+        ray_t* parsed = ray_parse(qs[q]);
+        TEST_ASSERT(parsed && !RAY_IS_ERR(parsed), "parse");
+        int ooms = 0;
+        for (int64_t n = 1; n <= 20000; n++) {
+            ray_heap_gc();
+            TEST_ASSERT_TRUE(ray_mem_trace_begin());
+            ray_clear_error_trace();
+            ray_raise_clear();
+            ray_alloc_fail_set_for_test(n, 1);
+            ray_t* got = ray_eval(parsed);
+            ray_eval_request_end();
+            if (got && !RAY_IS_ERR(got) && ray_is_lazy(got)) got = ray_lazy_materialize(got);
+            bool fired = ray_alloc_fail_armed_for_test() == 0;
+            ray_alloc_fail_set_for_test(0, 0);
+            ray_clear_error_trace();
+            bool ok;
+            if (got && RAY_IS_ERR(got)) {
+                bool oom = strcmp(ray_err_code(got), "oom") == 0;
+                ok = oom || (ref_err[0] && strcmp(ray_err_code(got), ref_err) == 0);
+                if (!ok) fprintf(stderr, "  %s, allocation %lld fails: %s, not oom\n", qs[q], (long long)n, ray_err_code(got));
+                ray_error_free(got);
+                if (oom) ooms++;
+            } else if (ref_err[0]) {
+                ok = false;
+                fprintf(stderr, "  %s, allocation %lld fails: an answer, not %s\n", qs[q], (long long)n, ref_err);
+                if (got) ray_release(got);
+            } else {
+                ray_t* gf = got ? ray_fmt(got, 1) : NULL;
+                ok = gf && !RAY_IS_ERR(gf) && ray_str_len(gf) == ray_str_len(rf) &&
+                     memcmp(ray_str_ptr(gf), ray_str_ptr(rf), ray_str_len(rf)) == 0;
+                if (!ok) fprintf(stderr, "  %s, allocation %lld fails: %s\n", qs[q], (long long)n, got ? "an answer, not the reference" : "C NULL");
+                if (gf && RAY_IS_ERR(gf)) ray_error_free(gf); else if (gf) ray_release(gf);
+                if (got) ray_release(got);
+            }
+            ray_heap_gc();
+            ray_mem_trace_t tr;
+            ray_mem_trace_end(&tr);
+            if (ok && tr.net_bytes != 0) {
+                fprintf(stderr, "  %s, allocation %lld fails: %lld bytes kept\n", qs[q], (long long)n, (long long)tr.net_bytes);
+                ok = false;
+            }
+            if (!ok) { ray_release(rf); ray_release(parsed); FAIL("a failed allocation in concat answered other than the answer or oom keeping nothing"); }
+            if (!fired) break;
+        }
+        ray_release(rf);
+        ray_release(parsed);
+        TEST_ASSERT_FMT(ooms > 0, "%s: no allocation failure answered oom", qs[q]);
+    }
+    ray_t* z = ray_eval_str("(do (set U9 0) (set M9 0))");
+    if (z && !RAY_IS_ERR(z)) ray_release(z);
+    PASS();
+}
+#endif
+
 const test_entry_t vec_entries[] = {
     { "vec/cast_unflagged_i32_temporal", test_cast_unflagged_i32_temporal, vec_setup, vec_teardown },
     { "vec/grow_ordinary_cow_modes", test_vec_grow_ordinary_cow_modes, vec_setup, vec_teardown },
@@ -3343,6 +3467,9 @@ const test_entry_t vec_entries[] = {
     { "vec/from_raw_sym", test_vec_from_raw_sym, vec_setup, vec_teardown },
     { "vec/from_raw_sentinel_nulls", test_vec_from_raw_sentinel_nulls, vec_setup, vec_teardown },
     { "vec/slice_guards", test_vec_slice_guards, vec_setup, vec_teardown },
+#ifdef DEBUG
+    { "vec/concat_alloc_fail", test_vec_concat_alloc_fail, vec_rt_setup, vec_rt_teardown },
+#endif
     { NULL, NULL, NULL, NULL },
 };
 

@@ -505,7 +505,7 @@ ray_t* ray_vec_slice(ray_t* vec, int64_t offset, int64_t len) {
 
     /* Allocate a header-only block for the slice view */
     ray_t* s = ray_alloc(0);
-    if (!s || RAY_IS_ERR(s)) return s;
+    if (!s || RAY_IS_ERR(s)) return s ? s : ray_error("oom", NULL);   /* never C NULL (#1851) */
 
     s->type = parent->type;
     /* A slice inherits the parent's HAS_NULLS hint: it is a window onto
@@ -653,7 +653,7 @@ ray_t* ray_vec_concat(ray_t* a, ray_t* b) {
         return ray_error("oom", NULL); /* multiplication overflow */
 
     ray_t* result = ray_alloc(data_size);
-    if (!result || RAY_IS_ERR(result)) return result;
+    if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);   /* never C NULL (#1851) */
 
     result->type = a->type;
     result->len = total_len;
@@ -1046,7 +1046,7 @@ ray_t* ray_vec_from_raw(int8_t type, const void* data, int64_t count) {
     size_t data_size = (size_t)count * esz;
 
     ray_t* v = ray_alloc(data_size);
-    if (!v || RAY_IS_ERR(v)) return v;
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);   /* never C NULL (#1851) */
 
     v->type = type;
     v->len = count;

@@ -1752,7 +1752,7 @@ static ray_t* cast_vec_numeric(ray_t* type_sym, ray_t* val, int8_t out_type) {
     for (int64_t i = 0; i < n2; i++) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
-        if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        if (!elem || RAY_IS_ERR(elem)) { ray_release(vec); return elem ? elem : ray_error("oom", NULL); }   /* vec owned here */
         int8_t cell_type = elem->type;
         ray_t* cast = ray_cast_fn(type_sym, elem);
         if (alloc) ray_release(elem);
@@ -1859,7 +1859,7 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
     for (int64_t i = 0; i < n2; i++) {
         int alloc = 0;
         ray_t* elem = collection_elem(val, i, &alloc);
-        if (RAY_IS_ERR(elem)) { ray_release(vec); return elem; }
+        if (!elem || RAY_IS_ERR(elem)) { ray_release(vec); return elem ? elem : ray_error("oom", NULL); }   /* vec owned here */
         int8_t cell_type = elem->type;
         ray_t* cast = may_nest ? ray_cast_fn(type_sym, elem)
                       : RAY_ATOM_IS_NULL(elem) ? ray_str("", 0)
@@ -3164,6 +3164,11 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
             v = (i < vals->len) ? ((ray_t**)ray_data(vals))[i] : NULL;
         } else if (ray_is_vec(vals)) {
             v = collection_elem(vals, i, &alloc);
+            if (!v || RAY_IS_ERR(v)) {   /* a cell that failed to box: never a null value (#1851) */
+                ray_error_free(v);       /* made by collection_elem, owned here */
+                ray_release(vlist); ray_release(keys);   /* both owned here */
+                return ray_error("oom", NULL);
+            }
         } else {
             v = vals;
         }
@@ -3172,6 +3177,11 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
             if (alloc) ray_release(v);
         } else {
             ray_t* null_val = ray_typed_null(-RAY_I64);
+            if (!null_val || RAY_IS_ERR(null_val)) {
+                ray_error_free(null_val);
+                ray_release(vlist); ray_release(keys);
+                return ray_error("oom", NULL);
+            }
             vlist = ray_list_append(vlist, null_val);
             ray_release(null_val);
         }
@@ -4391,6 +4401,32 @@ static bool concat_table_parted(ray_t* t) {
 }
 
 /* (concat a b) -> concatenate vectors/strings/dicts/tables */
+/* A list of n cells for ray_concat_fn, every cell NULL until filled, so a
+ * failure part-way releases only the cells made.  NULL when it fails to
+ * allocate (a refused size's error is freed here). */
+static ray_t* concat_list_new(int64_t n) {
+    ray_t* l = ray_alloc((size_t)n * sizeof(ray_t*));
+    if (!l || RAY_IS_ERR(l)) { ray_error_free(l); return NULL; }
+    l->type = RAY_LIST;
+    l->len = n;
+    memset(ray_data(l), 0, (size_t)n * sizeof(ray_t*));
+    return l;
+}
+
+/* The n cells of typed vector v boxed into out, one owned atom each.
+ * False when a cell fails to box: its error (made by collection_elem,
+ * owned here) is freed and out keeps the atoms made so far, for the
+ * caller's release of the list. */
+static bool concat_box_cells(ray_t** out, ray_t* v, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        int alloc = 0;
+        ray_t* c = collection_elem(v, i, &alloc);
+        if (!c || RAY_IS_ERR(c)) { ray_error_free(c); return false; }
+        out[i] = c;
+    }
+    return true;
+}
+
 ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Helper: get string content from atom (STR or CHAR), stripping trailing nulls */
     {
@@ -4441,38 +4477,23 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
         ray_t* va = ray_is_vec(a) ? a : NULL;
         ray_t* vb = ray_is_vec(b) ? b : NULL;
         int64_t na = a->len, nb = b->len;
-        ray_t* result = ray_alloc((na + nb) * sizeof(ray_t*));
+        ray_t* result = concat_list_new(na + nb);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = na + nb;
         ray_t** out = (ray_t**)ray_data(result);
-        for (int64_t i = 0; i < na; i++) {
-            if (va) {
-                int alloc = 0;
-                out[i] = collection_elem(va, i, &alloc);
-            } else {
-                out[i] = ((ray_t**)ray_data(la))[i];
-                ray_retain(out[i]);
-            }
-        }
-        for (int64_t i = 0; i < nb; i++) {
-            if (vb) {
-                int alloc = 0;
-                out[na + i] = collection_elem(vb, i, &alloc);
-            } else {
-                out[na + i] = ((ray_t**)ray_data(lb))[i];
-                ray_retain(out[na + i]);
-            }
+        /* a list's cells are borrowed and retained; a vector's are boxed */
+        if (la) for (int64_t i = 0; i < na; i++) { out[i] = ((ray_t**)ray_data(la))[i]; ray_retain(out[i]); }
+        if (lb) for (int64_t i = 0; i < nb; i++) { out[na + i] = ((ray_t**)ray_data(lb))[i]; ray_retain(out[na + i]); }
+        if ((va && !concat_box_cells(out, va, na)) || (vb && !concat_box_cells(out + na, vb, nb))) {
+            ray_release(result);   /* owned here, with every cell it holds */
+            return ray_error("oom", NULL);
         }
         return result;
     }
     /* Boxed list concat */
     if (a->type == RAY_LIST && b->type == RAY_LIST) {
         int64_t na = a->len, nb = b->len;
-        ray_t* result = ray_alloc((na + nb) * sizeof(ray_t*));
+        ray_t* result = concat_list_new(na + nb);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = na + nb;
         ray_t** out = (ray_t**)ray_data(result);
         ray_t** ae = (ray_t**)ray_data(a);
         ray_t** be = (ray_t**)ray_data(b);
@@ -4483,19 +4504,13 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Vector concat: mixed types -> boxed list (preserves original element types) */
     if (ray_is_vec(a) && ray_is_vec(b) && a->type != b->type) {
         int64_t na = a->len, nb = b->len;
-        ray_t* result = ray_alloc((na + nb) * sizeof(ray_t*));
+        ray_t* result = concat_list_new(na + nb);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = na + nb;
         ray_t** out = (ray_t**)ray_data(result);
-        for (int64_t i = 0; i < na; i++) {
-            int alloc = 0;
-            out[i] = collection_elem(a, i, &alloc);
-            /* collection_elem always allocates for typed vecs, so ownership transfers */
-        }
-        for (int64_t i = 0; i < nb; i++) {
-            int alloc = 0;
-            out[na + i] = collection_elem(b, i, &alloc);
+        /* collection_elem always allocates for typed vecs, so ownership transfers */
+        if (!concat_box_cells(out, a, na) || !concat_box_cells(out + na, b, nb)) {
+            ray_release(result);   /* owned here, with every cell it holds */
+            return ray_error("oom", NULL);
         }
         return result;
     }
@@ -4652,6 +4667,7 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
             /* Synthesize a key atom view from bk and the value pointer from bv. */
             ray_t k_storage; memset(&k_storage, 0, sizeof(k_storage));
             ray_t* k = NULL;
+            bool k_owned = false;   /* a boxed key; else borrowed from bk or on the stack */
             if (bk->type == RAY_LIST) {
                 k = ((ray_t**)ray_data(bk))[i];
             } else if (bk->type == RAY_SYM) {
@@ -4666,19 +4682,29 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
                 /* Heterogeneous element types fall back to boxing via collection_elem. */
                 int alloc = 0;
                 k = collection_elem(bk, i, &alloc);
-                ray_t* v;
-                if (bv->type == RAY_LIST) v = ((ray_t**)ray_data(bv))[i];
-                else { int va = 0; v = collection_elem(bv, i, &va); (void)va; }
-                out = ray_dict_upsert(out, k, v);
-                if (alloc) ray_release(k);
-                if (!out || RAY_IS_ERR(out)) return out;
-                continue;
+                k_owned = alloc;
+                if (!k || RAY_IS_ERR(k)) {   /* never a NULL key (#1851) */
+                    ray_error_free(k);       /* made by collection_elem, owned here */
+                    ray_release(out);        /* owned here: the dict so far */
+                    return ray_error("oom", NULL);
+                }
             }
+            /* v: borrowed from a list, or boxed here (owned; the upsert
+             * retains its own reference, so the box is released after) */
             ray_t* v;
+            int va = 0;
             if (bv->type == RAY_LIST) v = ((ray_t**)ray_data(bv))[i];
-            else { int va = 0; v = collection_elem(bv, i, &va); (void)va; }
+            else v = collection_elem(bv, i, &va);
+            if (!v || RAY_IS_ERR(v)) {
+                ray_error_free(v);
+                if (k_owned) ray_release(k);
+                ray_release(out);
+                return ray_error("oom", NULL);
+            }
             out = ray_dict_upsert(out, k, v);
-            if (!out || RAY_IS_ERR(out)) return out;
+            if (k_owned) ray_release(k);   /* the boxed key: the upsert keeps its own copy or reference */
+            if (va) ray_release(v);
+            if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         }
         return out;
     }
@@ -4731,10 +4757,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Atom + boxed list -> prepend atom to list */
     if (ray_is_atom(a) && b->type == RAY_LIST && b->type != RAY_DICT) {
         int64_t nb = b->len;
-        ray_t* result = ray_alloc((1 + nb) * sizeof(ray_t*));
+        ray_t* result = concat_list_new(1 + nb);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 1 + nb;
         ray_t** out = (ray_t**)ray_data(result);
         ray_retain(a);
         out[0] = a;
@@ -4745,10 +4769,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     /* Boxed list + atom -> append atom to list */
     if (a->type == RAY_LIST && a->type != RAY_DICT && ray_is_atom(b)) {
         int64_t na = a->len;
-        ray_t* result = ray_alloc((na + 1) * sizeof(ray_t*));
+        ray_t* result = concat_list_new(na + 1);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = na + 1;
         ray_t** out = (ray_t**)ray_data(result);
         ray_t** ae = (ray_t**)ray_data(a);
         for (int64_t i = 0; i < na; i++) { ray_retain(ae[i]); out[i] = ae[i]; }
@@ -4758,10 +4780,8 @@ ray_t* ray_concat_fn(ray_t* a, ray_t* b) {
     }
     /* Atom + atom of different types -> 2-element boxed list */
     if (ray_is_atom(a) && ray_is_atom(b) && a->type != b->type) {
-        ray_t* result = ray_alloc(2 * sizeof(ray_t*));
+        ray_t* result = concat_list_new(2);
         if (!result) return ray_error("oom", NULL);
-        result->type = RAY_LIST;
-        result->len = 2;
         ray_t** out = (ray_t**)ray_data(result);
         ray_retain(a); out[0] = a;
         ray_retain(b); out[1] = b;
@@ -5018,10 +5038,8 @@ __attribute__((noinline)) static ray_t* raze_list_tail(ray_t* r, ray_t** items, 
     if (RAY_UNLIKELY((uint64_t)total * 16 > RAY_DUP_BUDGET) &&
         raze_parts_repeat_over(r, items + k, j - k))
         return raze_limit();
-    ray_t* out = ray_alloc((size_t)total * sizeof(ray_t*));
+    ray_t* out = concat_list_new(total);
     if (!out) return ray_error("oom", NULL);
-    out->type = RAY_LIST;
-    out->len = total;
     ray_t** o = (ray_t**)ray_data(out);
     ray_t** rc = (ray_t**)ray_data(r);
     int64_t pos = 0;
@@ -5032,7 +5050,11 @@ __attribute__((noinline)) static ray_t* raze_list_tail(ray_t* r, ray_t** items, 
             ray_t** xc = (ray_t**)ray_data(x);
             for (int64_t c = 0; c < x->len; c++) { ray_retain(xc[c]); o[pos++] = xc[c]; }
         } else if (ray_is_vec(x)) {
-            for (int64_t c = 0; c < x->len; c++) { int alloc = 0; o[pos++] = collection_elem(x, c, &alloc); }
+            if (!concat_box_cells(o + pos, x, x->len)) {   /* never a NULL cell (#1851) */
+                ray_release(out);   /* owned here, with every cell it holds */
+                return ray_error("oom", NULL);
+            }
+            pos += x->len;
         } else {
             ray_retain(x);
             o[pos++] = x;

@@ -865,6 +865,17 @@ static ray_t* split_cells(ray_t* v, const char* dp, size_t dlen) {
     return out;
 }
 
+/* The cut positions of an I64, I32 or I16 vector, read in place: boxing
+ * each as an atom could fail and was read through unchecked (#1851).  A
+ * null cut reads as its sentinel, as the boxed atom's value did. */
+static void split_read_cuts(ray_t* delim, int64_t n, int64_t* out) {
+    const void* d = ray_data(delim);
+    for (int64_t i = 0; i < n; i++)
+        out[i] = delim->type == RAY_I64 ? ((const int64_t*)d)[i]
+               : delim->type == RAY_I32 ? (int64_t)((const int32_t*)d)[i]
+               :                          (int64_t)((const int16_t*)d)[i];
+}
+
 ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
     /* List split: (split list indices) → list of sub-lists */
     if (str->type == RAY_LIST &&
@@ -873,12 +884,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         if (nidx == 0) return RAY_NULL_OBJ; /* null for empty indices */
         int64_t idx_buf[256];
         if (nidx > 256) return ray_error("limit", NULL);
-        for (int64_t ii = 0; ii < nidx; ii++) {
-            int alloc = 0;
-            ray_t* ie = collection_elem(delim, ii, &alloc);
-            idx_buf[ii] = as_i64(ie);
-            if (alloc) ray_release(ie);
-        }
+        split_read_cuts(delim, nidx, idx_buf);
         ray_t* bad_pos = split_positions_check(idx_buf, nidx, str->len);
         if (bad_pos) return bad_pos;
         int64_t total = str->len;
@@ -900,7 +906,11 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
                 if (all_same && first_type < 0 && first_type != -RAY_STR) {
                     int8_t vtype = -first_type;
                     ray_t* vec = ray_vec_new(vtype, seglen);
-                    if (!RAY_IS_ERR(vec)) {
+                    if (!vec || RAY_IS_ERR(vec)) {   /* never a list segment in its place (#1851) */
+                        ray_release(result);          /* owned here, with the segments made */
+                        return vec ? vec : ray_error("oom", NULL);
+                    }
+                    {
                         vec->len = seglen;
                         for (int64_t j = 0; j < seglen && start + j < total; j++)
                             store_typed_elem(vec, j, items[start + j]);
@@ -934,12 +944,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
         /* Extract indices as i64 */
         int64_t idx_buf[256];
         if (nidx > 256) return ray_error("limit", NULL);
-        for (int64_t ii = 0; ii < nidx; ii++) {
-            int alloc = 0;
-            ray_t* ie = collection_elem(delim, ii, &alloc);
-            idx_buf[ii] = as_i64(ie);
-            if (alloc) ray_release(ie);
-        }
+        split_read_cuts(delim, nidx, idx_buf);
         ray_t* bad_pos = split_positions_check(idx_buf, nidx,
             ray_is_atom(str) ? (int64_t)ray_str_len(str) : str->len);
         if (bad_pos) return bad_pos;

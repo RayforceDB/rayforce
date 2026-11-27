@@ -5583,8 +5583,9 @@ ray_t* ray_parquet_scan_fn(ray_t** args, int64_t n) {
     ray_t* keys = ray_vec_from_raw(RAY_SYM,names,n);
     ray_t* vals = ray_list_new(n);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
-        if (keys) ray_release(keys);
-        if (vals) ray_release(vals);
+        /* each is owned here: a vector released, a failed one's error freed */
+        if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else ray_release(keys);
+        if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else ray_release(vals);
         return ray_error("oom",NULL);
     }
     ray_retain(path); ((ray_t**)ray_data(vals))[0] = path; vals->len = 1;
