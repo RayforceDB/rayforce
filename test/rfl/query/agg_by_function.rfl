@@ -101,3 +101,38 @@
 (set TC3 (table [k v count] (list [0 0 1 1] [3 1 2 4] [10 20 30 40])))
 (at (select {from: TC3 by: k r: (count (asc v))}) 'r) -- [2 2]
 (at (select {from: TC3 r: (count (asc v))}) 'r) -- [4]
+
+;; ── the planner's other aggregate shortcuts judge the head by function (#1844) ──
+(set T44 (table [k a b v] (list [0 0 1 1 1] [1 5 3 8 2] [4 2 6 1 9] [3 3 2 5 5])))
+;; a count rebound to sum is sum under by:, never a distinct count
+(at (select {r: (count (distinct v)) from: T44 by: k}) 'r) -- [1 2]
+((fn [count] (at (select {r: (count (distinct v)) from: T44 by: k}) 'r)) sum) -- [3 7]
+((fn [count] (at (select {r: (count (distinct v)) from: T44}) 'r)) sum) -- [10]
+(set cnt1844 count)
+(at (select {r: (cnt1844 (distinct v)) from: T44 by: k}) 'r) -- [1 2]
+;; a key derived from one symbol column: min rebound to max is max
+(set TQ44 (table [ref] (list (as 'SYMBOL (concat "http://h" (as 'STR (% (til 70000) 3)))))))
+(== (at (select {from: TQ44 by: (substr ref 1 8) c: (max ref)}) 'c) (as 'SYMBOL ["http://h2"])) -- [true]
+(== ((fn [min] (at (select {from: TQ44 by: (substr ref 1 8) c: (min ref)}) 'c)) max) (as 'SYMBOL ["http://h2"])) -- [true]
+((fn [count] (at (select {from: TQ44 by: (substr ref 1 8) c: (count ref)}) 'c)) cnt1844) -- [70000]
+;; a source read through first or last beside the group, under any name
+(set N44 (list [1 2] [3 4]))
+(at (select {r: (+ v (last (last N44))) from: T44 by: k}) 'r) -- (list [7 7] [6 9 9])
+((fn [first] (at (select {r: (+ v (first (first N44))) from: T44 by: k}) 'r)) last) -- (list [7 7] [6 9 9])
+(set fst1844 first)
+(at (select {r: (+ v (fst1844 (fst1844 N44))) from: T44 by: k}) 'r) -- (list [4 4] [3 6 6])
+;; med and the binary min/max answer as before under another name
+(set md1844 med) (set mn1844 min)
+(at (select {r: (md1844 v) from: T44 by: k}) 'r) -- [3.0 5.0]
+((fn [med] (at (select {r: (med v) from: T44 by: k}) 'r)) avg) -- [3.0 4.0]
+(at (select {r: (mn1844 a b) from: T44}) 'r) -- [1 2 3 1 2]
+((fn [min] (at (select {r: (min a b) from: T44}) 'r)) max) -- [4 5 6 8 9]
+;; distinct is no aggregate: a column named like it, or like an alias of it,
+;; is the column, so no distinct count, and the call raises as it does keyless
+(set dst1844 distinct)
+(set TD44 (table [k v dst1844] (list [0 0 1 1 1] [3 3 2 5 5] [1 2 3 4 5])))
+(set TD45 (table [k v distinct] (list [0 0 1 1 1] [3 3 2 5 5] [1 2 3 4 5])))
+(select {r: (count (dst1844 v)) from: TD44}) !- type
+(select {r: (count (dst1844 v)) from: TD44 by: k}) !- type
+(select {r: (count (distinct v)) from: TD45}) !- type
+(select {r: (count (distinct v)) from: TD45 by: k}) !- type

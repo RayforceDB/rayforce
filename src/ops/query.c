@@ -2160,7 +2160,6 @@ bool ray_query_rowwise_builtin(int64_t id) {
     /* reverse/asc/desc reorder a column but keep every row of it. */
     static const char* const names[] = {
         "as", "if", "and", "or", "pow", "substr", "replace", "xbar", "within",
-        "minute",
         "reverse", "asc", "desc", "at",
     };
     enum { N = sizeof names / sizeof *names };
@@ -5335,14 +5334,11 @@ static int select_fallback_bulk_minmax(ray_t* expr, ray_t* tbl, int64_t nrows) {
     ray_t** args = (ray_t**)ray_data(expr);
     ray_t* head = args[0];
     if (!head || head->type != -RAY_SYM || (head->attrs & ATTR_QUOTED)) return 0;
-    /* Reject unrelated verbs before any schema lookup.  Keep the existing
-     * name-based reducer/alias classification unchanged. */
-    ray_t* name = ray_sym_str(head->i64);
-    if (!name || ray_str_len(name) != 3 ||
-        (memcmp(ray_str_ptr(name), "min", 3) != 0 &&
-         memcmp(ray_str_ptr(name), "max", 3) != 0)) return 0;
-    if (ray_env_has_lexical_local(head->i64) || ray_table_slot(tbl, head->i64)) return 0;
-    ray_t* fn = ray_env_get(head->i64);
+    /* min or max by the function the head holds (#1814, #1844): an alias
+     * or a parameter holding min is min.  A column of the name is the
+     * column, which the evaluator reads, so it takes no bulk path. */
+    if (ray_table_slot(tbl, head->i64)) return 0;
+    ray_t* fn = agg_head_fn(head->i64);
     if (!fn || fn->type != RAY_UNARY) return 0;
     ray_unary_fn native = (ray_unary_fn)(uintptr_t)fn->i64;
     if (native != ray_min_fn && native != ray_max_fn) return 0;
@@ -7097,7 +7093,7 @@ static bool cd_src_bounded_ok(ray_t* tbl, ray_t* inner) {
 }
 
 static bool sym_names_col(ray_t* tbl, int64_t s);
-static ray_t* match_count_distinct(ray_t* expr);
+static ray_t* match_count_distinct(ray_t* expr, ray_t* tbl);
 
 /* Every non-agg a count(distinct) of a column the bounded kernel reads by
  * range (cd_enc_slot): the bounded kernel then counts them over the row
@@ -7105,7 +7101,7 @@ static ray_t* match_count_distinct(ray_t* expr);
 static bool cd_nonaggs_by_range(ray_t** nonagg_exprs, int64_t n_nonaggs, ray_t* tbl) {
     if (n_nonaggs <= 0) return false;
     for (int64_t ni = 0; ni < n_nonaggs; ni++) {
-        ray_t* in = match_count_distinct(nonagg_exprs[ni]);
+        ray_t* in = match_count_distinct(nonagg_exprs[ni], tbl);
         if (!in || in->type != -RAY_SYM || (in->attrs & ATTR_QUOTED) ||
             ray_env_get_lexical_local(in->i64) || !tbl_has_col(tbl, in->i64))
             return false;
@@ -7129,25 +7125,28 @@ static bool cd_operand_is_collection(ray_t* inner, ray_t* tbl) {
     return expr_is_constant_collection(inner, tbl, NULL);
 }
 
-static ray_t* match_count_distinct(ray_t* expr) {
+static ray_t* match_count_distinct(ray_t* expr, ray_t* tbl) {
     if (!expr || expr->type != RAY_LIST) return NULL;
     int64_t n = ray_len(expr);
     if (n != 2) return NULL;
     ray_t** elems = (ray_t**)ray_data(expr);
-    if (!elems[0] || elems[0]->type != -RAY_SYM) return NULL;
-    ray_t* nm = ray_sym_str(elems[0]->i64);
-    if (!nm || ray_str_len(nm) != 5 ||
-        memcmp(ray_str_ptr(nm), "count", 5) != 0) return NULL;
+    /* count and distinct by the functions the heads hold (#1814, #1844): a
+     * count rebound to sum is sum, never a distinct count */
+    if (!elems[0] || elems[0]->type != -RAY_SYM || (elems[0]->attrs & ATTR_QUOTED)) return NULL;
+    if (resolve_agg_opcode(elems[0]->i64) != OP_COUNT) return NULL;
 
     ray_t* inner = elems[1];
     if (!inner || inner->type != RAY_LIST) return NULL;
     int64_t in_n = ray_len(inner);
     if (in_n != 2) return NULL;
     ray_t** in_elems = (ray_t**)ray_data(inner);
-    if (!in_elems[0] || in_elems[0]->type != -RAY_SYM) return NULL;
-    ray_t* dnm = ray_sym_str(in_elems[0]->i64);
-    if (!dnm || ray_str_len(dnm) != 8 ||
-        memcmp(ray_str_ptr(dnm), "distinct", 8) != 0) return NULL;
+    if (!in_elems[0] || in_elems[0]->type != -RAY_SYM || (in_elems[0]->attrs & ATTR_QUOTED)) return NULL;
+    /* distinct is no aggregate: a column of its name is the column, as
+     * evaluation reads it in the select, so no distinct count */
+    if (tbl && tbl_has_col(tbl, in_elems[0]->i64)) return NULL;
+    ray_t* dfn = agg_head_fn(in_elems[0]->i64);
+    if (!dfn || dfn->type != RAY_UNARY || (ray_unary_fn)(uintptr_t)dfn->i64 != ray_distinct_fn)
+        return NULL;
     return in_elems[1];
 }
 
@@ -10563,30 +10562,28 @@ static bool dkv_is_col(ray_t* e, int64_t col) {
 }
 
 /* Which decomposable aggregate over C is `v`, or 0. */
-static int dkv_agg_kind(ray_t* v, int64_t col) {
+static int dkv_agg_kind(ray_t* v, int64_t col, ray_t* tbl) {
     if (!v || v->type != RAY_LIST || ray_len(v) != 2) return 0;
     ray_t** e = (ray_t**)ray_data(v);
-    if (!e[0] || e[0]->type != -RAY_SYM) return 0;
-    ray_t* hs = ray_sym_str(e[0]->i64);
-    if (!hs) return 0;
-    const char* h = ray_str_ptr(hs); size_t hl = ray_str_len(hs);
-    bool is = false;
-    #define DKV_IS(lit) (hl == sizeof(lit) - 1 && memcmp(h, lit, hl) == 0)
-    if (DKV_IS("count") || DKV_IS("min") || DKV_IS("max")) {
+    /* the aggregate by the function the head holds (#1814, #1844): min
+     * rebound to max is max, and an alias of count is count */
+    if (!e[0] || e[0]->type != -RAY_SYM || (e[0]->attrs & ATTR_QUOTED)) return 0;
+    uint16_t op = resolve_agg_opcode(e[0]->i64);
+    if (op == OP_COUNT || op == OP_MIN || op == OP_MAX) {
         if (!dkv_is_col(e[1], col)) return 0;
-        return DKV_IS("count") ? DKV_COUNT : DKV_IS("min") ? DKV_MIN : DKV_MAX;
+        return op == OP_COUNT ? DKV_COUNT : op == OP_MIN ? DKV_MIN : DKV_MAX;
     }
-    is = DKV_IS("sum") || DKV_IS("avg");
-    if (!is) return 0;
+    if (op != OP_SUM && op != OP_AVG) return 0;
     ray_t* a = e[1];
     if (!a || a->type != RAY_LIST || ray_len(a) != 2) return 0;
     ray_t** ae = (ray_t**)ray_data(a);
-    if (!ae[0] || ae[0]->type != -RAY_SYM) return 0;
-    ray_t* as = ray_sym_str(ae[0]->i64);
-    if (!as || ray_str_len(as) != 6 || memcmp(ray_str_ptr(as), "strlen", 6) != 0) return 0;
+    if (!ae[0] || ae[0]->type != -RAY_SYM || (ae[0]->attrs & ATTR_QUOTED)) return 0;
+    /* strlen is no aggregate: a column of its name is the column */
+    if (tbl_has_col(tbl, ae[0]->i64)) return 0;
+    ray_t* sfn = agg_head_fn(ae[0]->i64);
+    if (!sfn || sfn->type != RAY_UNARY || (ray_unary_fn)(uintptr_t)sfn->i64 != ray_strlen_fn) return 0;
     if (!dkv_is_col(ae[1], col)) return 0;
-    return DKV_IS("sum") ? DKV_SUM_LEN : DKV_AVG_LEN;
-    #undef DKV_IS
+    return op == OP_SUM ? DKV_SUM_LEN : DKV_AVG_LEN;
 }
 
 /* H (distinct values of C with their counts) in C's domain-position order.
@@ -11772,7 +11769,7 @@ static ray_t* derived_key_vocab_aggs(ray_t* tbl, ray_t* by_expr, ray_t* where_ex
             kid == asc_id || kid == desc_id) continue;
         if (kid == nearest_id) return NULL;
         if (n_aggs >= DKV_MAX_AGGS) return NULL;
-        int k = dkv_agg_kind(dict_elems[i + 1], col);
+        int k = dkv_agg_kind(dict_elems[i + 1], col, tbl);
         if (!k) return NULL;
         alias[n_aggs] = kid; kind[n_aggs] = k; n_aggs++;
     }
@@ -14815,10 +14812,9 @@ static int is_med_call(ray_t* expr) {
     if (!expr || expr->type != RAY_LIST) return 0;
     if (ray_len(expr) != 2) return 0;
     ray_t** elems = (ray_t**)ray_data(expr);
-    if (!elems[0] || elems[0]->type != -RAY_SYM) return 0;
-    ray_t* nm = ray_sym_str(elems[0]->i64);
-    if (!nm) return 0;
-    return ray_str_len(nm) == 3 && memcmp(ray_str_ptr(nm), "med", 3) == 0;
+    if (!elems[0] || elems[0]->type != -RAY_SYM || (elems[0]->attrs & ATTR_QUOTED)) return 0;
+    /* med by the function the head holds (#1814, #1844) */
+    return resolve_agg_opcode(elems[0]->i64) == OP_MEDIAN;
 }
 
 /* Fast median per group: read values straight out of the source column
@@ -15696,7 +15692,7 @@ static ray_t* try_count_distinct_v2_rewrite(
             else return NULL;
             continue;
         }
-        ray_t* cd_inner = match_count_distinct(val);
+        ray_t* cd_inner = match_count_distinct(val, tbl);
         if (cd_inner && cd_inner->type == -RAY_SYM &&
             !(cd_inner->attrs & ATTR_QUOTED))
         {
@@ -16053,12 +16049,12 @@ static bool cd_bounded_scatter_ok(ray_t** nonagg_exprs, int64_t n_nonaggs, ray_t
               : key->type;
     if (grp_key->type != kb || grp_key->len < n_groups) return false;
     for (int64_t ni = 0; ni < n_nonaggs; ni++) {
-        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
         if (!cd_inner || cd_inner->type != -RAY_SYM || (cd_inner->attrs & ATTR_QUOTED))
             return false;
         if (!cd_src_bounded_ok(tbl, cd_inner)) return false;
     }
-    ray_t* first = cd_bounded_src_col(tbl, match_count_distinct(nonagg_exprs[0]));
+    ray_t* first = cd_bounded_src_col(tbl, match_count_distinct(nonagg_exprs[0], tbl));
     if (first && RAY_IS_ERR(first)) { ray_error_free(first); return false; }
     return ray_cd_bounded_preferred(tbl, key, first, sel, nrows, n_groups);
 }
@@ -17350,7 +17346,7 @@ static ray_t* grouped_nonagg_empty(ray_t* result, ray_t* tbl, ray_t* const* expr
     for (int64_t ni = 0; ni < n; ni++) {
         ray_t* expr = exprs[ni];
         ray_t* typed = grouped_if_output_empty(expr, tbl);
-        ray_t* empty_list = typed ? typed : match_count_distinct(expr) ? ray_vec_new(RAY_I64, 0)
+        ray_t* empty_list = typed ? typed : match_count_distinct(expr, tbl) ? ray_vec_new(RAY_I64, 0)
             : is_streaming_aggr_unary_call(expr, tbl) ? aggr_unary_per_group_buf(expr, tbl, NULL, NULL, NULL, 0)
             : can_atom_broadcast(expr) ? atom_broadcast_vec(expr, 0) : ray_list_new(0);
         if (!empty_list || RAY_IS_ERR(empty_list)) {
@@ -20398,14 +20394,18 @@ static int src_rank(ray_t* e, ray_t* tbl, int depth) {
     if (e->type != RAY_LIST) return src_value_rank(e, 0);
     if ((e->attrs & ATTR_QUOTED) || e->len < 2) return -1;
     ray_t** el = (ray_t**)ray_data(e);
-    if (e->len == 2 && (src_head_is(el[0], "first", 5) || src_head_is(el[0], "last", 4))) {
+    /* first or last by the function the head holds (#1814, #1844): an alias
+     * or a parameter holding last is last */
+    uint16_t fl = el[0] && el[0]->type == -RAY_SYM && !(el[0]->attrs & ATTR_QUOTED)
+                ? resolve_agg_opcode(el[0]->i64) : 0;
+    if (e->len == 2 && (fl == OP_FIRST || fl == OP_LAST)) {
         /* a name's value: the element taken, read as data */
         ray_t* a = el[1];   /* not-a-table */
         if (a && a->type == -RAY_SYM && !(a->attrs & ATTR_QUOTED) &&
             (ray_env_has_lexical_local(a->i64) || !tbl_has_col(tbl, a->i64))) {
             ray_t* v = ray_env_get(a->i64);
             if (v && v->type == RAY_LIST && v->len > 0) {
-                bool first = src_head_is(el[0], "first", 5);
+                bool first = fl == OP_FIRST;
                 return src_value_rank(((ray_t**)ray_data(v))[first ? 0 : v->len - 1], 0);
             }
         }
@@ -25120,7 +25120,7 @@ static bool select_grouped_running_needed(ray_t* dict, ray_t* tbl, ray_t* by_exp
         }
         if (all_dag && !is_single_group_key_projection(by_expr, kid, v) &&
             !is_group_dag_agg_expr(v, tbl) && !is_decomposable_agg_compound(v, tbl) &&
-            !can_atom_broadcast(v) && !match_count_distinct(v))
+            !can_atom_broadcast(v) && !match_count_distinct(v, tbl))
             all_dag = false;
     }
     return any_run && !all_dag;
@@ -25152,7 +25152,7 @@ static bool select_outputs_group_local(ray_t* dict, ray_t* tbl) {
             if (select_clause_key(rid, sym_cell_runtime_id(keys, i))) continue;
             ray_t* v = ((ray_t**)ray_data(vals))[i];
             if (!v || v->type != RAY_LIST || (v->attrs & ATTR_QUOTED) || v->len == 0) continue;
-            ray_t* cd = match_count_distinct(v);
+            ray_t* cd = match_count_distinct(v, tbl);
             if (cd && cd->type == -RAY_SYM && !(cd->attrs & ATTR_QUOTED)) continue;
             if (pass == 0) {
                 if (const_output_expr(v, tbl, 0)) continue;
@@ -26579,7 +26579,7 @@ static bool prune_group_names(ray_t* e, prune_group_proof_t* p) {
  * first/last of elementwise arguments is a DAG aggregate on any source,
  * so it leaves the SUM(IF)s on the rowwise IF lowering. */
 static bool prune_group_companion(ray_t* e, ray_t* tbl, prune_group_proof_t* p) {
-    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || match_count_distinct(e) ||
+    if (!e || e->type != RAY_LIST || (e->attrs & ATTR_QUOTED) || match_count_distinct(e, tbl) ||
         prune_where_elementwise(e, tbl) || !prune_output_ok(e, tbl, true)) return false;
     return prune_group_names(e, p);
 }
@@ -29932,7 +29932,7 @@ by_dict_done:
                 if (is_decomposable_agg_compound(dict_elems[i + 1], tbl)) continue;
                 any_nonagg = 1;
                 if (can_atom_broadcast(dict_elems[i + 1])) continue;
-                if (!match_count_distinct(dict_elems[i + 1])) { any_true_nonagg = 1; break; }
+                if (!match_count_distinct(dict_elems[i + 1], tbl)) { any_true_nonagg = 1; break; }
                 /* count(distinct): DAG-capable, keep scanning for true non-aggs */
             }
         }
@@ -30573,7 +30573,7 @@ by_dict_done:
                      * group and dispatch directly to exec_count_distinct on
                      * each group's slice.  Same kernel the standalone
                      * `(count (distinct col))` fast path uses. */
-                        ray_t* cd_inner = match_count_distinct(val_expr_item);
+                        ray_t* cd_inner = match_count_distinct(val_expr_item, tbl);
                     if (cd_inner) {
                         ray_t* per_group = count_distinct_per_group_groups(
                             cd_inner, eval_tbl, groups, out_groups);
@@ -31239,7 +31239,7 @@ by_dict_done:
                 /* Per-group count(distinct) — bypass full ray_eval per
                  * group and dispatch directly to exec_count_distinct. */
                 {
-                    ray_t* cd_inner = match_count_distinct(val_expr_item);
+                    ray_t* cd_inner = match_count_distinct(val_expr_item, tbl);
                     if (cd_inner) {
                         ray_t* per_group = count_distinct_per_group_groups(
                             cd_inner, eval_tbl, groups, n_groups);
@@ -31789,7 +31789,7 @@ by_dict_done:
                     }
                     continue;
                 }
-                ray_t* cd_inner = match_count_distinct(expr);
+                ray_t* cd_inner = match_count_distinct(expr, tbl);
                 int is_simple_cd = cd_inner && cd_inner->type == -RAY_SYM &&
                                    !(cd_inner->attrs & ATTR_QUOTED);
                 if (is_simple_cd) { has_cd_output = 1; continue; }
@@ -34322,7 +34322,7 @@ by_dict_done:
                                           grp_key, saved_selection, nrows, n_groups)) {
                     ray_t* cd_err = NULL;
                     for (int64_t ni = 0; ni < n_nonaggs && !cd_err; ni++) {
-                        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                        ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
                         ray_t* src = cd_enc_slot(tbl, cd_inner->i64);   /* read by range */
                         if (!src) src = ray_table_col(tbl, cd_inner->i64);
                         ray_t* col = src && RAY_IS_ERR(src) ? src
@@ -34448,7 +34448,7 @@ by_dict_done:
                                   (ray_cd_bounded_preferred(tbl, NULL, NULL, NULL, nrows, n_groups) ||
                                    cd_nonaggs_by_range(nonagg_exprs, n_nonaggs, tbl));
                 for (int64_t ni = 0; ni < n_nonaggs && cd_compact; ni++) {
-                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
                     cd_compact = cd_inner && cd_inner->type == -RAY_SYM &&
                                  !(cd_inner->attrs & ATTR_QUOTED) &&
                                  cd_src_bounded_ok(tbl, cd_inner);
@@ -34833,7 +34833,7 @@ by_dict_done:
                 bool cd_gid_kernel = n_groups > 50000 || ray_cd_few_groups_kernel_ok(nrows, n_groups);
                 int needs_slice_idx = 0;
                 for (int64_t ni = 0; ni < n_nonaggs && !needs_slice_idx; ni++) {
-                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
                     int simple_cd = cd_inner && cd_inner->type == -RAY_SYM &&
                                     !(cd_inner->attrs & ATTR_QUOTED);
                     if (simple_cd && cd_bounded_rows &&
@@ -34877,7 +34877,7 @@ by_dict_done:
                      * High-cardinality grouping: try the single-pass
                      * global-hash kernel first.  Falls back to the
                      * per-group slice path on type miss / error. */
-                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni]);
+                    ray_t* cd_inner = match_count_distinct(nonagg_exprs[ni], tbl);
                     if (cd_inner) {
                         ray_t* col = NULL;
                         /* Resolve the inner column for the global-hash
