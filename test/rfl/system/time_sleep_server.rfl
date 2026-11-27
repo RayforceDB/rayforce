@@ -41,7 +41,7 @@
 (set bound_soon (fn [name] (do (set k 0) (while (and (< k 100) (== 0 (.ipc.send h (format "(try (do % 1) (fn [e] 0))" name) 3000))) (do (.time.sleep 50) (set k (+ k 1)))) (< k 100))))
 
 ;; another client is answered promptly once the sleeping one is gone
-(set answered_soon (fn [] (do (set t0 (.time.now)) (set r (.ipc.send h "(+ 1 2)" 3000)) (and (== r 3) (< (- (.time.now) t0) 2500)))))
+(set answered_soon (fn [] (do (set t0 (.time.mono)) (set r (.ipc.send h "(+ 1 2)" 3000)) (and (== r 3) (< (- (.time.mono) t0) 2500)))))
 
 ;; a sync sleep of 5 s whose client dies (it stays in the log)
 (client "(.time.sleep 5000)") -- 0
@@ -50,9 +50,9 @@
 (.sys.exec "test/serve.sh --stop /tmp/rfl_tss/s1") -- 0
 
 ;; replaying that log restores tss_a here without waiting the 5 s out
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (.log.replay "/tmp/rftest_tss1.log")
-(< (- (.time.now) t0) 2500) -- true
+(< (- (.time.mono) t0) 2500) -- true
 tss_a -- 41
 
 ;; an endless sync sleep on a second server and log: no cancel can reach it
@@ -67,17 +67,17 @@ tss_a -- 41
 ;; async: a client posts a stamp, a 1.5 s sleep and a second stamp, then
 ;; exits at once.  The sleep runs its full time after the client is gone,
 ;; so the second stamp is at least 1.5 s after the first.
-(run_client "(.ipc.post h \"(set tss_t0 (.time.now))\")\n(.ipc.post h \"(.time.sleep 1500)\")\n(.ipc.post h \"(set tss_t1 (.time.now))\")") -- 0
+(run_client "(.ipc.post h \"(set tss_t0 (.time.mono))\")\n(.ipc.post h \"(.time.sleep 1500)\")\n(.ipc.post h \"(set tss_t1 (.time.mono))\")") -- 0
 (bound_soon "tss_t1") -- true
 (>= (.ipc.send h "(- tss_t1 tss_t0)" 5000) 1500) -- true
 
 ;; an async sleep that would never finish is refused (nothing on the client
 ;; side could end it), and the work posted behind it runs at once
 (run_client "(.ipc.post h \"(set tss_e (try (.time.sleep 0Wn) (fn [e] 1)))\")\n(.ipc.post h \"(set tss_f (try (.time.sleep 9223372036854775807) (fn [e] 1)))\")") -- 0
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (bound_soon "tss_f") -- true
 (.ipc.send h "(+ tss_e tss_f)" 3000) -- 2
-(< (- (.time.now) t0) 2500) -- true
+(< (- (.time.mono) t0) 2500) -- true
 (.ipc.close h)
 (.sys.exec "test/serve.sh --stop /tmp/rfl_tss/s2") -- 0
 

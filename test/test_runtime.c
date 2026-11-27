@@ -760,15 +760,15 @@ static test_result_t test_syscov_rc(void) {
     PASS();
 }
 
-/* .time.now */
-static test_result_t test_syscov_time_now(void) {
-    ray_t* r = ray_eval_str("(.time.now)");
+/* .time.mono */
+static test_result_t test_syscov_time_mono(void) {
+    ray_t* r = ray_eval_str("(.time.mono)");
     TEST_ASSERT_NOT_NULL(r);
     TEST_ASSERT_FALSE(RAY_IS_ERR(r));
     TEST_ASSERT_EQ_I(r->type, -RAY_I64);
     TEST_ASSERT_TRUE(r->i64 > 0);
     ray_release(r);
-    TEST_ASSERT_TRUE(eval_err("(.time.now 1)", "domain"));
+    TEST_ASSERT_TRUE(eval_err("(.time.mono 1)", "domain"));
     PASS();
 }
 
@@ -1623,7 +1623,7 @@ const test_entry_t runtime_entries[] = {
     { "runtime/build_sys_args_rejects_malformed_numbers", test_build_sys_args_rejects_malformed_numbers, sys_setup, sys_teardown },
     { "runtime/sys_args_builtin",            test_sys_args_builtin,            sys_setup, sys_teardown },
     { "runtime/syscov_rc",                   test_syscov_rc,                   sys_setup, sys_teardown },
-    { "runtime/syscov_time_now",             test_syscov_time_now,             sys_setup, sys_teardown },
+    { "runtime/syscov_time_mono",            test_syscov_time_mono,             sys_setup, sys_teardown },
     { "runtime/syscov_time_timer_set_del",   test_syscov_time_timer_set_del,   sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/syscov_time_timer_fires",     test_syscov_time_timer_fires,     sys_setup_with_poll, sys_teardown_with_poll },
     { "runtime/poll_run_for_fires_timer",    test_poll_run_for_fires_timer,    sys_setup_with_poll, sys_teardown_with_poll },

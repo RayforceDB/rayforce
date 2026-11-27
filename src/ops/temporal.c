@@ -935,9 +935,10 @@ ray_t* ray_time_clock_fn(ray_t* arg) {
     return ray_time(ms);
 }
 
-/* (timestamp 'local) or (timestamp 'global) — returns current timestamp (ns since 2000.01.01) */
-ray_t* ray_timestamp_clock_fn(ray_t* arg) {
-    bool local = !is_global_arg(arg);
+/* The wall clock now as a TIMESTAMP (ns since 2000.01.01): UTC, or the
+ * local time of day read as a timestamp.  The one reader behind .time.utc
+ * and .time.local, which replace the removed `timestamp` builtin (#1859). */
+static ray_t* wall_clock_now(bool local) {
     int64_t now_ns = unix_now_ns();
     int64_t sub_ns = now_ns % 1000000000LL;
     if (!local)
@@ -945,7 +946,7 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
 
     time_t now = (time_t)(now_ns / 1000000000LL);
     struct tm* t = localtime(&now);
-    if (!t) return ray_error("domain", "timestamp: failed to get current time");
+    if (!t) return ray_error("domain", ".time.local: failed to get current time");
 
     /* Local wall clock as a timestamp: the broken-down local fields read
      * as UTC (timegm).  mktime converts them straight back to the same
@@ -954,4 +955,19 @@ ray_t* ray_timestamp_clock_fn(ray_t* arg) {
     lt.tm_isdst = 0;
     int64_t secs = (int64_t)timegm(&lt) - ray_epoch_offset();
     return ray_timestamp(secs * 1000000000LL + sub_ns);
+}
+
+/* (.time.utc) and (.time.local): the wall clock, in UTC and in local time.
+ * A TIMESTAMP carries no zone: .time.local compared with UTC data is off by
+ * the zone's offset. */
+ray_t* ray_time_utc_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".time.utc takes no arguments");
+    return wall_clock_now(false);
+}
+
+ray_t* ray_time_local_fn(ray_t** args, int64_t n) {
+    (void)args;
+    if (n != 0) return ray_error("domain", ".time.local takes no arguments");
+    return wall_clock_now(true);
 }

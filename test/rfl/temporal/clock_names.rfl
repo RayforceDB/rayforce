@@ -1,0 +1,27 @@
+;; The wall clock and its names (#1859).
+;; The `timestamp` builtin is removed: its argument chose the clock, and any
+;; argument but 'global (`'utc` included) answered local time.  The clocks
+;; are .time.utc and .time.local; the TIMESTAMP type is untouched.
+(timestamp 'global) !- name
+(timestamp 'local) !- name
+(timestamp 0) !- name
+(type (as 'TIMESTAMP 0)) -- 'timestamp
+(as 'timestamp 0) -- 2000.01.01D00:00:00.000000000
+
+;; .time.utc and .time.local: the wall clock, a timestamp each
+(type (.time.utc)) -- 'timestamp
+(type (.time.local)) -- 'timestamp
+(.time.utc 1) !- domain
+(.time.local 'x) !- domain
+
+;; UTC is the system clock: two readings a second apart or less, in order
+(set u0 (as 'I64 (.time.utc)))
+(set u1 (as 'I64 (.time.utc)))
+(and (>= u1 u0) (< (- u1 u0) 1000000000)) -- true
+
+;; .time.mono is the monotonic millisecond counter, .time.now no longer a name
+(type (.time.mono)) -- 'i64
+(set m0 (.time.mono))
+(>= (- (.time.mono) m0) 0) -- true
+(.time.mono 1) !- domain
+(.time.now) !- name

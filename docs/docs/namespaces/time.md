@@ -1,32 +1,62 @@
-# `.time.*` — clock, timers and sleep
+# `.time.*` — clocks, timers and sleep
 
-Monotonic clock access, a recurring-callback scheduler, and a blocking sleep for scripts. Timers integrate into the runtime's poll loop — they only fire when control is back in the loop, i.e. between REPL inputs (interactive or piped: both read stdin through the loop), between IPC requests, or while idling in server-only mode. A long-running synchronous evaluation will defer pending timers until it returns. A script, or a piped session that reached end of input, stays alive until its pending timers are spent, so a one-shot timer set by a script fires before the process exits; a periodic timer keeps it running until the script ends the process itself. An open client handle does not keep a script alive.
+The clocks, a recurring-callback scheduler, and a blocking sleep for scripts. Timers integrate into the runtime's poll loop — they only fire when control is back in the loop, i.e. between REPL inputs (interactive or piped: both read stdin through the loop), between IPC requests, or while idling in server-only mode. A long-running synchronous evaluation will defer pending timers until it returns. A script, or a piped session that reached end of input, stays alive until its pending timers are spent, so a one-shot timer set by a script fires before the process exits; a periodic timer keeps it running until the script ends the process itself. An open client handle does not keep a script alive.
 
-The clock is the same `CLOCK_MONOTONIC` source the scheduler uses for its deadlines, so `(.time.now)` is directly comparable to the `ms` argument passed to `.time.timer.set`. Wall-clock time is intentionally not exposed here: a host sleep / resume must not retroactively shift a scheduled deadline.
+There are two clocks, and each name says which it reads:
+
+| Name | Clock | Answers |
+|---|---|---|
+| `.time.mono` | monotonic (`CLOCK_MONOTONIC`) | `i64` milliseconds from a platform-defined epoch: for intervals and timer deadlines, never a date |
+| `.time.utc` | wall clock, UTC | `timestamp` |
+| `.time.local` | wall clock, local time | `timestamp` |
+
+The scheduler's deadlines use the monotonic clock, so `(.time.mono)` is directly comparable to the `ms` argument passed to `.time.timer.set`, and the timers never read the wall clock: a host sleep / resume or a clock change must not shift a scheduled deadline. A `timestamp` carries no zone, so `.time.local` compared with UTC data is off by the zone's offset; use `.time.utc` for that.
 
 !!! note "Restricted under `-U`"
-    `.time.timer.set` and `.time.timer.del` are `RAY_FN_RESTRICTED` — installing callbacks on the server's poll loop is privileged. `.time.sleep` is restricted too: it stops the whole server while it waits, as `.sys.exec "sleep 1"` would, and that is restricted. `.time.now` is unrestricted (it's a clock read).
+    `.time.timer.set` and `.time.timer.del` are `RAY_FN_RESTRICTED` — installing callbacks on the server's poll loop is privileged. `.time.sleep` is restricted too: it stops the whole server while it waits, as `.sys.exec "sleep 1"` would, and that is restricted. `.time.mono`, `.time.utc` and `.time.local` are unrestricted (they are clock reads).
 
 ## Reference
 
 | Function | Arity | Flags | Description |
 |---|---|---|---|
-| [`.time.now`](#time-now) | variadic | — | Monotonic time in milliseconds |
+| [`.time.mono`](#time-mono) | variadic | — | Monotonic clock in milliseconds from a platform-defined epoch, for intervals and timer deadlines |
+| [`.time.utc`](#time-utc) | variadic | — | Current wall-clock timestamp in UTC, at the system clock's full resolution (nanoseconds on Linux) |
+| [`.time.local`](#time-local) | variadic | — | Current wall-clock timestamp in local time (a timestamp carries no zone), at the system clock's full resolution |
 | [`.time.timer.set`](#time-timer-set) | variadic | restricted | Schedule callback every `ms`, `num` times (0 = forever); returns id |
 | [`.time.timer.del`](#time-timer-del) | unary | restricted | Cancel a scheduled timer by id; returns null |
 | [`.time.sleep`](#time-sleep) | unary | restricted | Block the calling thread for `ms` milliseconds (an integer) or a timespan; returns null |
 
-## `.time.now` { #time-now }
+## `.time.mono` { #time-mono }
 
-Signature: `(.time.now)`. Returns an `i64` count of milliseconds since some monotonic epoch (platform-defined; comparable only against itself and against timer deadlines on the same process).
+Signature: `(.time.mono)`. Returns an `i64` count of milliseconds since some monotonic epoch (platform-defined; comparable only against itself and against timer deadlines on the same process). It is not a date or a time of day: for those, use `.time.utc` or `.time.local`. It was named `.time.now` before #1859.
 
 Errors: `domain` if called with any arguments.
 
 ```lisp
-(set t0 (.time.now))
+(set t0 (.time.mono))
 (sum (til 1000))
-(- (.time.now) t0)
+(- (.time.mono) t0)
 ;; => elapsed ms
+```
+
+## `.time.utc` { #time-utc }
+
+Signature: `(.time.utc)`. Returns the current wall-clock time in UTC as a `timestamp`, at the system clock's full resolution (nanoseconds on Linux). It replaces `(timestamp 'global)`: the `timestamp` builtin is removed (#1859).
+
+Errors: `domain` if called with any arguments.
+
+```lisp
+(.time.utc)      ;; 2026.11.27D13:58:15.763045160
+```
+
+## `.time.local` { #time-local }
+
+Signature: `(.time.local)`. Returns the current wall-clock time in the host's local time zone as a `timestamp`: the local date and time of day, read as a timestamp, which carries no zone. It replaces `(timestamp 'local)`, and `(timestamp 0)` or any other argument, which all answered local time.
+
+Errors: `domain` if called with any arguments.
+
+```lisp
+(.time.local)    ;; 2026.11.27D14:58:15.763046312 on a host at UTC+1
 ```
 
 ## `.time.timer.set` { #time-timer-set }
@@ -35,7 +65,7 @@ Signature: `(.time.timer.set ms num fn)`.
 
 - `ms` — `i64` ≥ 0. The delay until the first fire **and** the interval between subsequent fires.
 - `num` — `i64` ≥ 0. **`0` means fire forever**; `N ≥ 1` means fire exactly N times.
-- `fn` — a `RAY_LAMBDA` whose declared parameter list has exactly one entry. The callback is invoked with the current monotonic time (the same value `.time.now` would return).
+- `fn` — a `RAY_LAMBDA` whose declared parameter list has exactly one entry. The callback is invoked with the current monotonic time (the same value `.time.mono` would return).
 
 Returns the new timer's `i64` id. IDs are monotonically increasing per runtime — never reused after deletion.
 

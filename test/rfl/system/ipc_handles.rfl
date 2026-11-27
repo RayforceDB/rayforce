@@ -17,7 +17,7 @@
 (.sys.exec "rm -rf /tmp/rftest_ipc_handles; mkdir -p /tmp/rftest_ipc_handles; true") -- 0
 (.sys.exec "test/serve.sh --listen /tmp/rftest_ipc_handles -U secret") -- 0
 (set addr (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_ipc_handles/port")) ":mon:secret")))
-(set t0 (timestamp 'global))
+(set t0 (.time.utc))
 (set h1 (.ipc.open addr 3000))
 (set h2 (.ipc.open addr 3000))
 

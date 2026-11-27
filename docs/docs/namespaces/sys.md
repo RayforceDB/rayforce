@@ -99,13 +99,13 @@ peer can check a stale cursor against:
 ```lisp
 (format "%-%-%" (get (.sys.info) 'hostname)
                 (get (.sys.info) 'pid)
-                (timestamp 'global))
+                (.time.utc))
 ;; => "tp-prod-01-48213-2026.09.18D10:05:59.482917304"
 ```
 
 That identity is worth preferring over a random token because it is
 diagnosable: reading it back tells you which host and which process produced
-it. `(timestamp 'global)` carries the system clock's sub-second part, so two
+it. `(.time.utc)` carries the system clock's sub-second part, so two
 starts rarely share a stamp; pid is what still separates them when they do.
 
 If `hostname` cannot be obtained, it reports `""` rather than failing the whole
@@ -598,4 +598,4 @@ Signature: `(.sys.timeit [flag])`. Toggles the per-expression profiler. Calling 
 
 - [`.os.*`](os.md) — filesystem and env-variable primitives that don't shell out.
 - [`.ipc.*`](ipc.md) — the client side; `.sys.listen` binds the server.
-- [`.time.*`](time.md) — `.time.now` / `.time.timer.set` for measurement and scheduling without the profiler.
+- [`.time.*`](time.md) — `.time.mono` / `.time.timer.set` for measurement and scheduling without the profiler.

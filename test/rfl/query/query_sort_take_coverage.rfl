@@ -1016,7 +1016,7 @@
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 2
 ;; the clock verbs read the clock, not a row: answered on the whole table
 (set Brw (at (.sys.mem) 'sort-perpart-runs))
-(at (select {x: x from: Pwr where: (< 0 (as 'I64 (timestamp 'local))) desc: x take: 2}) 'x) -- [6 5]
+(at (select {x: x from: Pwr where: (< 0 (as 'I64 (.time.local))) desc: x take: 2}) 'x) -- [6 5]
 (- (at (.sys.mem) 'sort-perpart-runs) Brw) -- 0
 ;; a concat of collections is not row-wise (it changes the length)
 (set Brw (at (.sys.mem) 'sort-perpart-runs))

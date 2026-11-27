@@ -7207,7 +7207,6 @@ static void ray_register_builtins(void) {
     /* Temporal clocks */
     register_unary("date",       RAY_FN_NONE, ray_date_clock_fn);
     register_unary("time",       RAY_FN_NONE, ray_time_clock_fn);
-    register_unary("timestamp",  RAY_FN_NONE, ray_timestamp_clock_fn);
 
     /* Temporal field accessors: unary builtins that map 1:1 onto
      * ray_temporal_extract.  Registered here so `(ss ts)` / `(dd d)`
@@ -7343,7 +7342,9 @@ static void ray_register_builtins(void) {
     register_binary("row",       RAY_FN_NONE, ray_row_fn);
 
     /* .time.* — monotonic clock, scheduled timers and sleep */
-    register_vary (".time.now",       RAY_FN_NONE,       ray_time_now_fn);
+    register_vary (".time.mono",      RAY_FN_NONE,       ray_time_mono_fn);
+    register_vary (".time.utc",       RAY_FN_NONE,       ray_time_utc_fn);
+    register_vary (".time.local",     RAY_FN_NONE,       ray_time_local_fn);
     register_vary (".time.timer.set", RAY_FN_RESTRICTED, ray_time_timer_set_fn);
     register_unary(".time.timer.del", RAY_FN_RESTRICTED, ray_time_timer_del_fn);
     /* Restricted: a sleep stops the whole single-threaded server, and a
