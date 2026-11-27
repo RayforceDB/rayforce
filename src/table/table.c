@@ -130,9 +130,11 @@ ray_t* ray_table_new(int64_t ncols) {
 /* --------------------------------------------------------------------------
  * ray_table_add_col — append `col_vec` under name `name_id`.
  *
- * Consumes one ref of the input table; on success returns an owned ref to
- * the (possibly COW'd) result.  Retains `col_vec` internally so the caller
- * keeps its own ref.
+ * Consumes one ref of the input table on every answer, as the `_take`
+ * writes do (#1864): on success it returns an owned ref to the (possibly
+ * COW'd) result, on failure an owned error with the table released.  So
+ * `tbl = ray_table_add_col(tbl, ...)` loses nothing.  Retains `col_vec`
+ * internally so the caller keeps its own ref.
  * -------------------------------------------------------------------------- */
 
 ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
@@ -154,8 +156,12 @@ ray_t* ray_table_add_col(ray_t* tbl, int64_t name_id, ray_t* col_vec) {
                          col_vec ? ray_type_name(col_vec->type) : "null");
     }
 
-    tbl = ray_cow(tbl);
-    if (!tbl || RAY_IS_ERR(tbl)) return tbl;
+    ray_t* copy = ray_cow(tbl);
+    if (!copy || RAY_IS_ERR(copy)) {   /* a failed copy leaves tbl: consumed here too (#1864) */
+        ray_release(tbl);
+        return copy ? copy : ray_error("oom", NULL);
+    }
+    tbl = copy;
     /* a column added under a name a note gives is not the column the note
      * was made for; the builders that know it is mark the table afterwards */
     tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;
@@ -404,20 +410,23 @@ ray_t* ray_table_get_col_idx(ray_t* tbl, int64_t idx) {
  * with the wrong representation (e.g. wide STR/GUID min/max post-fill).
  * -------------------------------------------------------------------------- */
 
-void ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
-    if (!tbl_is_table(tbl) || !col_vec) return;
+ray_err_t ray_table_set_col_idx(ray_t* tbl, int64_t idx, ray_t* col_vec) {
+    if (!tbl_is_table(tbl) || !col_vec) return RAY_OK;   /* the documented no-op */
     ray_t** slots = tbl_slots(tbl);
     ray_t* cols = slots[1];
-    if (!cols || RAY_IS_ERR(cols)) return;
-    if (idx < 0 || idx >= cols->len) return;
-    cols = ray_cow(cols);
-    if (!cols || RAY_IS_ERR(cols)) return;
+    if (!cols || RAY_IS_ERR(cols)) return RAY_OK;
+    if (idx < 0 || idx >= cols->len) return RAY_OK;
+    ray_t* copy = ray_cow(cols);
+    /* a failed copy leaves the table as it was, and says so (#1864) */
+    if (!copy || RAY_IS_ERR(copy)) { ray_error_free(copy); return RAY_ERR_OOM; }
+    cols = copy;
     slots[1] = cols;
     tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;   /* a new column object */
     ray_t** cv = (ray_t**)ray_data(cols);
     ray_retain(col_vec);
     ray_release(cv[idx]);
     cv[idx] = col_vec;
+    return RAY_OK;
 }
 
 /* --------------------------------------------------------------------------
@@ -437,17 +446,20 @@ int64_t ray_table_col_name(ray_t* tbl, int64_t idx) {
  * exclusive ownership (rc==1) before calling.
  * -------------------------------------------------------------------------- */
 
-void ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id) {
-    if (!tbl_is_table(tbl)) return;
+ray_err_t ray_table_set_col_name(ray_t* tbl, int64_t idx, int64_t name_id) {
+    if (!tbl_is_table(tbl)) return RAY_OK;   /* the documented no-op */
     ray_t** slots = tbl_slots(tbl);
     ray_t* schema = slots[0];
-    if (!schema || RAY_IS_ERR(schema)) return;
-    if (idx < 0 || idx >= schema->len) return;
-    schema = ray_cow(schema);
-    if (!schema || RAY_IS_ERR(schema)) return;
+    if (!schema || RAY_IS_ERR(schema)) return RAY_OK;
+    if (idx < 0 || idx >= schema->len) return RAY_OK;
+    ray_t* copy = ray_cow(schema);
+    /* a failed copy leaves the table as it was, and says so (#1864) */
+    if (!copy || RAY_IS_ERR(copy)) { ray_error_free(copy); return RAY_ERR_OOM; }
+    schema = copy;
     slots[0] = schema;
     ((int64_t*)ray_data(schema))[idx] = name_id;
     tbl->attrs &= (uint8_t)~RAY_ATTR_ORDER_NOTES;   /* a note names by symbol */
+    return RAY_OK;
 }
 
 /* --------------------------------------------------------------------------

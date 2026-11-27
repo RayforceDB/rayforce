@@ -2127,7 +2127,7 @@ ray_t* exec_string_unary(ray_graph_t* g, ray_op_t* op) {
 
         if (is_str) {
             ray_t* prev = result;
-            result = ray_str_vec_append(result, buf, out_len);
+            result = ray_str_vec_append(result, buf, out_len);   /* plain: keeps the input for its own failure path (#1864) */
             if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
         } else {
             buf[out_len] = '\0';
@@ -2593,7 +2593,7 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
             ((s_data || s_data_i32) && ray_vec_is_null((ray_t*)start_v, i)) ||
             ((l_data || l_data_i32) && ray_vec_is_null((ray_t*)len_v, i))) {
             if (is_str) {
-                result = ray_str_vec_append(result, "", 0);
+                result = ray_str_vec_append_take(result, "", 0);
                 if (RAY_IS_ERR(result)) break;
                 ray_vec_set_null(result, result->len - 1, true);
             } else {
@@ -2614,7 +2614,7 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
         if (st < 0) st = 0;
         if ((size_t)st >= sl) {
             if (is_str) {
-                result = ray_str_vec_append(result, "", 0);
+                result = ray_str_vec_append_take(result, "", 0);
                 if (RAY_IS_ERR(result)) break;
             }
             else { sym_dst[i] = ray_sym_intern("", 0); }
@@ -2622,7 +2622,7 @@ ray_t* exec_substr(ray_graph_t* g, ray_op_t* op) {
         }
         if (ln < 0 || ln > (int64_t)(sl - (size_t)st)) ln = (int64_t)sl - st;
         if (is_str) {
-            result = ray_str_vec_append(result, sp + st, (size_t)ln);
+            result = ray_str_vec_append_take(result, sp + st, (size_t)ln);
             if (RAY_IS_ERR(result)) break;
         } else {
             sym_dst[i] = ray_sym_intern(sp + st, (size_t)ln);
@@ -2745,7 +2745,7 @@ ray_t* exec_replace(ray_graph_t* g, ray_op_t* op) {
         }
         if (is_str) {
             ray_t* prev = result;
-            result = ray_str_vec_append(result, buf, bi);
+            result = ray_str_vec_append(result, buf, bi);   /* plain: keeps the input for its own failure path (#1864) */
             if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
         } else {
             buf[bi] = '\0';
@@ -2892,7 +2892,7 @@ static ray_t* concat_text_values(ray_t** args, int n_args, bool str_out) {
         }
         if (out_str) {
             ray_t* prev = result;
-            result = ray_str_vec_append(result, buf, bi);
+            result = ray_str_vec_append(result, buf, bi);   /* plain: keeps the input for its own failure path (#1864) */
             if (RAY_IS_ERR(result)) { ray_release(prev); scratch_free(dyn_hdr); break; }
         } else {
             buf[bi] = '\0';

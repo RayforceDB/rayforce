@@ -146,9 +146,9 @@ ray_t* ray_idx_uses_fn(ray_t* tbl) {
         }
         if (cnt == 0) continue;
         int64_t name = ray_table_col_name(tbl, c);
-        keys = ray_vec_append(keys, &name);
+        keys = ray_vec_append_take(keys, &name);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return ray_error("oom", NULL); }
-        vals = ray_vec_append(vals, &cnt);
+        vals = ray_vec_append_take(vals, &cnt);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return ray_error("oom", NULL); }
     }
     return ray_dict_new(keys, vals);
@@ -5273,13 +5273,13 @@ ray_t* ray_index_info(ray_t* v) {
     case RAY_IDX_ZONE:
         if (ix->parent_type == RAY_F32 || ix->parent_type == RAY_F64) {
             int64_t kmin = ray_sym_intern("min", 3);
-            keys = ray_vec_append(keys, &kmin);
+            keys = ray_vec_append_take(keys, &kmin);
             ray_t* mn = ray_f64(ix->u.zone.min_f);
-            vals = ray_list_append(vals, mn); ray_release(mn);
+            vals = ray_list_append_take(vals, mn); ray_release(mn);
             int64_t kmax = ray_sym_intern("max", 3);
-            keys = ray_vec_append(keys, &kmax);
+            keys = ray_vec_append_take(keys, &kmax);
             ray_t* mx = ray_f64(ix->u.zone.max_f);
-            vals = ray_list_append(vals, mx); ray_release(mx);
+            vals = ray_list_append_take(vals, mx); ray_release(mx);
         } else {
             r = dict_append_sym_i64(&keys, &vals, "min", ix->u.zone.min_i);
             if (RAY_IS_ERR(r)) goto fail;

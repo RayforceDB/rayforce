@@ -372,7 +372,7 @@ static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
 
     /* Offsets (n_nodes + 1), zeroed: off[k + 1] accumulates the degree of k. */
     out->offsets = ray_vec_new(RAY_I64, n_nodes + 1);
-    if (!out->offsets || RAY_IS_ERR(out->offsets)) return RAY_ERR_OOM;
+    if (!out->offsets || RAY_IS_ERR(out->offsets)) { ray_error_free(out->offsets); out->offsets = NULL; return RAY_ERR_OOM; }
     out->offsets->len = n_nodes + 1;
     int64_t* off = (int64_t*)ray_data(out->offsets);
     memset(off, 0, (size_t)(n_nodes + 1) * sizeof(int64_t));
@@ -388,6 +388,7 @@ static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
 
     out->targets = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->targets || RAY_IS_ERR(out->targets)) {
+        ray_error_free(out->targets); out->targets = NULL;
         ray_release(out->offsets); out->offsets = NULL;
         return RAY_ERR_OOM;
     }
@@ -396,6 +397,7 @@ static ray_err_t csr_build_direct(const int64_t* keys, const int64_t* vals,
 
     out->rowmap = ray_vec_new(RAY_I64, valid_edges > 0 ? valid_edges : 1);
     if (!out->rowmap || RAY_IS_ERR(out->rowmap)) {
+        ray_error_free(out->rowmap); out->rowmap = NULL;
         ray_release(out->offsets); out->offsets = NULL;
         ray_release(out->targets); out->targets = NULL;
         return RAY_ERR_OOM;

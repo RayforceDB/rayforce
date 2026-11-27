@@ -199,13 +199,14 @@ ray_t* ray_graph_build_fn(ray_t** args, int64_t n) {
     ray_t* edges = ray_table_new(2);
     if (!edges || RAY_IS_ERR(edges)) {
         ray_release(src_i64); ray_release(dst_i64);
-        return ray_error("oom", NULL);
+        return edges ? edges : ray_error("oom", NULL);
     }
-    edges = ray_table_add_col(edges, s_sym, src_i64);
+    edges = ray_table_add_col(edges, s_sym, src_i64);   /* consumes edges */
     ray_release(src_i64);
+    if (!edges || RAY_IS_ERR(edges)) { ray_release(dst_i64); return edges ? edges : ray_error("oom", NULL); }
     edges = ray_table_add_col(edges, d_sym, dst_i64);
     ray_release(dst_i64);
-    if (!edges || RAY_IS_ERR(edges)) return ray_error("oom", NULL);
+    if (!edges || RAY_IS_ERR(edges)) return edges ? edges : ray_error("oom", NULL);
 
     ray_rel_t* rel = ray_rel_from_edges(edges, "src", "dst",
                                          n_nodes, n_nodes, true);
@@ -312,30 +313,27 @@ ray_t* ray_graph_info_fn(ray_t* h) {
     ray_rel_t* rel = graph_unwrap(h);
     if (!rel) return ray_error("type", "graph.info: expects a graph handle, got %s", h ? ray_type_name(h->type) : "null");
 
+    int64_t ks[4] = { sym_intern_safe("n_nodes", 7), sym_intern_safe("n_edges", 7),
+                      sym_intern_safe("sorted", 6), sym_intern_safe("has_weights", 11) };
+    ray_t* vs[4] = { make_i64(rel->fwd.n_nodes), make_i64(rel->fwd.n_edges),
+                     make_bool(rel->fwd.sorted ? 1 : 0), make_bool(rel->fwd.props != NULL) };
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 4);
-    if (RAY_IS_ERR(keys)) return keys;
     ray_t* vals = ray_list_new(4);
-    if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-
-    int64_t k_nodes  = sym_intern_safe("n_nodes",  7);
-    int64_t k_edges  = sym_intern_safe("n_edges",  7);
-    int64_t k_sorted = sym_intern_safe("sorted",   6);
-    int64_t k_wts    = sym_intern_safe("has_weights", 11);
-
-    ray_t* v_nodes  = make_i64(rel->fwd.n_nodes);
-    ray_t* v_edges  = make_i64(rel->fwd.n_edges);
-    ray_t* v_sorted = make_bool(rel->fwd.sorted ? 1 : 0);
-    ray_t* v_wts    = make_bool(rel->fwd.props != NULL);
-
-    keys = ray_vec_append(keys, &k_nodes);
-    vals = ray_list_append(vals, v_nodes); ray_release(v_nodes);
-    keys = ray_vec_append(keys, &k_edges);
-    vals = ray_list_append(vals, v_edges); ray_release(v_edges);
-    keys = ray_vec_append(keys, &k_sorted);
-    vals = ray_list_append(vals, v_sorted); ray_release(v_sorted);
-    keys = ray_vec_append(keys, &k_wts);
-    vals = ray_list_append(vals, v_wts); ray_release(v_wts);
-
+    bool ok = keys && !RAY_IS_ERR(keys) && vals && !RAY_IS_ERR(vals);
+    for (int i = 0; i < 4; i++) if (!vs[i] || RAY_IS_ERR(vs[i])) ok = false;
+    for (int i = 0; i < 4 && ok; i++) {
+        keys = ray_vec_append_take(keys, &ks[i]);
+        if (RAY_IS_ERR(keys)) { ok = false; break; }
+        vals = ray_list_append_take(vals, vs[i]);
+        if (RAY_IS_ERR(vals)) { ok = false; break; }
+    }
+    if (!ok) {   /* every error is ours: free it as one */
+        for (int i = 0; i < 4; i++) { if (vs[i] && RAY_IS_ERR(vs[i])) ray_error_free(vs[i]); else if (vs[i]) ray_release(vs[i]); }
+        if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else if (keys) ray_release(keys);
+        if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else if (vals) ray_release(vals);
+        return ray_error("oom", NULL);
+    }
+    for (int i = 0; i < 4; i++) ray_release(vs[i]);
     return ray_dict_new(keys, vals);
 }
 

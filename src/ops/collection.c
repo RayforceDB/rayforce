@@ -3251,7 +3251,7 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
                     }
                     int64_t e = n - b > RAY_CANCEL_ROWS ? b + RAY_CANCEL_ROWS : n;
                     for (int64_t i = b; i < e; i++) {
-                        out = ray_str_vec_append(out, "", 0);
+                        out = ray_str_vec_append_take(out, "", 0);
                         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
                         ray_vec_set_null(out, pos++, true);
                     }
@@ -3285,7 +3285,7 @@ static ray_t* parted_to_flat_vec_c(ray_t* x, const int64_t* cnt, int64_t ncnt) {
                 for (int64_t i = b; i < e; i++, pos++) {
                     size_t slen = 0;
                     const char* sp = ray_str_vec_get(seg, i, &slen);
-                    out = ray_str_vec_append(out, sp ? sp : "", sp ? slen : 0);
+                    out = ray_str_vec_append_take(out, sp ? sp : "", sp ? slen : 0);
                     if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
                     if (ray_vec_is_null(seg, i)) ray_vec_set_null(out, pos, true);
                 }
@@ -3526,7 +3526,7 @@ static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
             ray_t* lst = ray_list_new(vlen);
             for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
                 ray_t* b = make_bool(out[k]);
-                lst = ray_list_append(lst, b);
+                lst = ray_list_append_take(lst, b);
                 ray_release(b);
             }
             ray_release(result);
@@ -3534,7 +3534,7 @@ static ray_t* in_list_rows(ray_t* val, ray_t* vec, const list_set_t* s) {
             boxed = true;
             if (!result || RAY_IS_ERR(result)) { ray_release(r); return result ? result : ray_error("oom", NULL); }
         }
-        result = ray_list_append(result, r);
+        result = ray_list_append_take(result, r);
         ray_release(r);
         if (!result || RAY_IS_ERR(result)) return result ? result : ray_error("oom", NULL);
     }
@@ -3731,7 +3731,7 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
             if (vec->type == -RAY_STR) {
                 sv = ray_vec_new(RAY_STR, 1);
                 if (sv && !RAY_IS_ERR(sv))
-                    sv = ray_str_vec_append(sv, ray_str_ptr(vec), ray_str_len(vec));
+                    sv = ray_str_vec_append_take(sv, ray_str_ptr(vec), ray_str_len(vec));
             } else {
                 ray_t** el = (ray_t**)ray_data(vec);
                 sv = ray_vec_new(RAY_STR, ray_len(vec));
@@ -3741,7 +3741,7 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
                 ray_dup_copy_begin(&seen);
                 for (int64_t j = 0; j < ray_len(vec) && sv && !RAY_IS_ERR(sv); j++)
                     if (el[j] && el[j]->type == -RAY_STR && !ray_dup_copy_seen(&seen, el[j], ray_str_len(el[j])))
-                        sv = ray_str_vec_append(sv, ray_str_ptr(el[j]), ray_str_len(el[j]));
+                        sv = ray_str_vec_append_take(sv, ray_str_ptr(el[j]), ray_str_len(el[j]));
                 ray_dup_copy_end(&seen);
             }
             if (!sv || RAY_IS_ERR(sv)) return sv ? sv : ray_error("oom", NULL);
@@ -3881,11 +3881,11 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
                 ray_t* lst = ray_list_new(vlen);
                 for (int64_t k = 0; k < i && lst && !RAY_IS_ERR(lst); k++) {
                     ray_t* b = make_bool(out[k]);
-                    lst = ray_list_append(lst, b);
+                    lst = ray_list_append_take(lst, b);
                     ray_release(b);
                 }
                 ray_release(result);
-                if (lst && !RAY_IS_ERR(lst)) lst = ray_list_append(lst, r);
+                if (lst && !RAY_IS_ERR(lst)) lst = ray_list_append_take(lst, r);
                 ray_release(r);
                 if (!lst || RAY_IS_ERR(lst)) return lst ? lst : ray_error("oom", NULL);
                 result = lst;
@@ -3903,7 +3903,7 @@ static ray_t* in_fn_c(ray_t* val, ray_t* vec) {
             ray_t* r = in_row(elem, vec);
             if (alloc) ray_release(elem);
             if (RAY_IS_ERR(r)) { ray_release(result); return r; }
-            result = ray_list_append(result, r);
+            result = ray_list_append_take(result, r);
             ray_release(r);
             if (RAY_IS_ERR(result)) return result;
         }
@@ -3984,7 +3984,7 @@ static ray_t* membership_not_c(ray_t* r) {
     for (int64_t i = 0; i < r->len; i++) {
         ray_t* item = membership_not(((ray_t**)ray_data(r))[i]);
         if (!item || RAY_IS_ERR(item)) { ray_release(out); return item; }
-        out = ray_list_append(out, item);
+        out = ray_list_append_take(out, item);
         ray_release(item);
         if (!out || RAY_IS_ERR(out)) return out;
     }
@@ -5183,7 +5183,7 @@ ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs) {
         if (idx > prev) {
             ray_t* seg = collection_slice(vec, prev, idx - prev);
             if (!seg || RAY_IS_ERR(seg)) { ray_release(out); return seg ? seg : ray_error("oom", NULL); }
-            out = ray_list_append(out, seg);
+            out = ray_list_append_take(out, seg);
             ray_release(seg);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         }
@@ -5192,7 +5192,7 @@ ray_t* ray_cut_fn(ray_t* vec, ray_t* idxs) {
 
     ray_t* tail = collection_slice(vec, prev, len - prev);
     if (!tail || RAY_IS_ERR(tail)) { ray_release(out); return tail ? tail : ray_error("oom", NULL); }
-    out = ray_list_append(out, tail);
+    out = ray_list_append_take(out, tail);
     ray_release(tail);
     return out;
 }
@@ -5250,21 +5250,21 @@ ray_t* ray_cross_fn(ray_t* a, ray_t* b) {
                 ray_release(out);
                 return pair ? pair : ray_error("oom", NULL);
             }
-            pair = ray_list_append(pair, ae);
+            pair = ray_list_append_take(pair, ae);
             if (!pair || RAY_IS_ERR(pair)) {
                 if (alloc_a) ray_release(ae);
                 if (alloc_b) ray_release(be);
                 ray_release(out);
                 return pair ? pair : ray_error("oom", NULL);
             }
-            pair = ray_list_append(pair, be);
+            pair = ray_list_append_take(pair, be);
             if (alloc_b) ray_release(be);
             if (!pair || RAY_IS_ERR(pair)) {
                 if (alloc_a) ray_release(ae);
                 ray_release(out);
                 return pair ? pair : ray_error("oom", NULL);
             }
-            out = ray_list_append(out, pair);
+            out = ray_list_append_take(out, pair);
             ray_release(pair);
             if (!out || RAY_IS_ERR(out)) {
                 if (alloc_a) ray_release(ae);
@@ -5411,14 +5411,14 @@ static ray_t* table_row_dict(ray_t* vec, int64_t row) {
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     for (int64_t c = 0; c < ncols; c++) {
         int64_t key_id = ray_table_col_name(vec, c);
-        keys = ray_vec_append(keys, &key_id);
+        keys = ray_vec_append_take(keys, &key_id);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
         ray_t* col = ray_table_col_idx(vec, c);
         if (col && RAY_IS_ERR(col)) { ray_release(keys); ray_release(vals); return col; }
         int alloc = 0;
         ray_t* val = collection_elem(col, row, &alloc);
         if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
-        vals = ray_list_append(vals, val);
+        vals = ray_list_append_take(vals, val);
         if (alloc) ray_release(val);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
@@ -5560,14 +5560,14 @@ static __attribute__((noinline)) ray_t* at_str_keys(ray_t* vec, const char* s, s
                 for (int64_t p = 0; p < j && nested && !RAY_IS_ERR(nested); p++) {
                     ray_t* ch = ray_str(&buf[p], 1);
                     if (!ch || RAY_IS_ERR(ch)) { ray_release(nested); nested = ch ? ch : ray_error("oom", NULL); break; }
-                    nested = ray_list_append(nested, ch);
+                    nested = ray_list_append_take(nested, ch);
                     ray_release(ch);
                 }
                 if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
             }
             ray_t* v = ray_at_fn(vec, c);
             if (!v || RAY_IS_ERR(v)) { r = v ? v : ray_error("oom", NULL); break; }
-            nested = ray_list_append(nested, v);
+            nested = ray_list_append_take(nested, v);
             ray_release(v);
             if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
             continue;
@@ -5582,7 +5582,7 @@ static __attribute__((noinline)) ray_t* at_str_keys(ray_t* vec, const char* s, s
         if (nested) {
             ray_t* ch = ray_str(&s[k], 1);
             if (!ch || RAY_IS_ERR(ch)) { r = ch ? ch : ray_error("oom", NULL); break; }
-            nested = ray_list_append(nested, ch);
+            nested = ray_list_append_take(nested, ch);
             ray_release(ch);
             if (!nested || RAY_IS_ERR(nested)) { r = nested ? nested : ray_error("oom", NULL); nested = NULL; break; }
         } else {
@@ -5719,7 +5719,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
                         ray_release(pos); ray_release(out);
                         return value ? value : ray_error("oom", NULL);
                     }
-                    out = ray_list_append(out, value);
+                    out = ray_list_append_take(out, value);
                     ray_release(value);
                     if (!out || RAY_IS_ERR(out)) { ray_release(pos); return out ? out : ray_error("oom", NULL); }
                 }
@@ -5739,7 +5739,7 @@ ray_t* ray_at_fn(ray_t* vec, ray_t* idx) {
                     ray_release(out);
                     return value ? value : ray_error("oom", NULL);
                 }
-                out = ray_list_append(out, value);
+                out = ray_list_append_take(out, value);
                 ray_release(value);
                 if (!out || RAY_IS_ERR(out))
                     return out ? out : ray_error("oom", NULL);
@@ -6230,13 +6230,13 @@ ray_t* reverse_vec_eager(ray_t* x) {
         if (has_nulls) {
             for (int64_t i = 0; i < len; i++) {
                 if (ray_vec_is_null(x, len - 1 - i)) {
-                    result = ray_str_vec_append(result, "", 0);
+                    result = ray_str_vec_append_take(result, "", 0);
                     if (!RAY_IS_ERR(result))
                         ray_vec_set_null(result, result->len - 1, true);
                 } else {
                     size_t slen;
                     const char* sp = ray_str_vec_get(x, len - 1 - i, &slen);
-                    result = ray_str_vec_append(result, sp ? sp : "", sp ? slen : 0);
+                    result = ray_str_vec_append_take(result, sp ? sp : "", sp ? slen : 0);
                 }
                 if (RAY_IS_ERR(result)) return result;
             }
@@ -6244,7 +6244,7 @@ ray_t* reverse_vec_eager(ray_t* x) {
             for (int64_t i = 0; i < len; i++) {
                 size_t slen;
                 const char* sp = ray_str_vec_get(x, len - 1 - i, &slen);
-                result = ray_str_vec_append(result, sp ? sp : "", sp ? slen : 0);
+                result = ray_str_vec_append_take(result, sp ? sp : "", sp ? slen : 0);
                 if (RAY_IS_ERR(result)) return result;
             }
         }

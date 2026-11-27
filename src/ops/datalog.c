@@ -1217,8 +1217,8 @@ static ray_t* dl_table_take_mask(ray_t* tbl, const uint8_t* keep, int64_t count)
         if (src->type == RAY_STR) col_propagate_str_pool(dst, src);
         ray_t* next = ray_table_add_col(out, ray_table_col_name(tbl, c), dst);
         ray_release(dst);
-        if (!next) { ray_release(out); return ray_error("memory", "dl_table_take_mask: add_col"); }
-        if (RAY_IS_ERR(next)) { ray_release(out); return next; }
+        if (!next) { return ray_error("memory", "dl_table_take_mask: add_col"); }
+        if (RAY_IS_ERR(next)) { return next; }
         out = next;
     }
     return out;
@@ -1458,11 +1458,9 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
                     ray_t* next = ray_table_add_col(out, head_rel->col_names[c], ecol);
                     ray_release(ecol);
                     if (!next) {
-                        ray_release(out);
                         return ray_error("memory", "dl_project: add_col");
                     }
                     if (RAY_IS_ERR(next)) {
-                        ray_release(out);
                         return next;
                     }
                     out = next;
@@ -1505,14 +1503,12 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
             if (src->type == RAY_SYM) ray_sym_vec_adopt_domain(dst, src);
             ray_t* next = ray_table_add_col(out, head_rel->col_names[c], dst);
             ray_release(dst);
-            /* Release the partial `out` on failure — ray_table_add_col
-             * does not free its input on error. */
+            /* ray_table_add_col consumes `out` on every answer, a failure
+             * included: nothing to release here (#1864). */
             if (!next) {
-                ray_release(out);
                 return ray_error("memory", "dl_project: add_col");
             }
             if (RAY_IS_ERR(next)) {
-                ray_release(out);
                 return next;
             }
             out = next;
@@ -1540,11 +1536,9 @@ static ray_t* dl_project(ray_t* tbl, const int* col_indices, int n_out,
             ray_t* next = ray_table_add_col(out, head_rel->col_names[c], bcast);
             ray_release(bcast);
             if (!next) {
-                ray_release(out);
                 return ray_error("memory", "dl_project: add_col");
             }
             if (RAY_IS_ERR(next)) {
-                ray_release(out);
                 return next;
             }
             out = next;
@@ -1727,16 +1721,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
         int64_t unit_sym = ray_sym_intern("_unit", 5);
         ray_t* accum_unit = ray_table_add_col(accum, unit_sym, one_val);
         ray_release(one_val);
-        /* ray_table_add_col doesn't free `accum` on error — release it
-         * ourselves so the partially-built table isn't leaked. */
+        /* ray_table_add_col consumes `accum` on every answer, a failure
+         * included: nothing to release here (#1864). */
         if (!accum_unit) {
-            ray_release(accum);
             prog->eval_err = true;
             return NULL;
         }
         if (RAY_IS_ERR(accum_unit)) {
             dl_keep_err(prog, accum_unit);
-            ray_release(accum);
             prog->eval_err = true;
             return NULL;
         }
@@ -2452,14 +2444,14 @@ ray_op_t* dl_compile_rule(dl_program_t* prog, dl_rule_t* rule,
                 ray_t* next = ray_table_add_col(out, ray_table_col_name(accum, c), dst);
                 ray_release(dst);
                 if (!next) {
-                    ray_release(out); ray_free(mask_block);
+                    ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
                 }
                 if (RAY_IS_ERR(next)) {
                     dl_keep_err(prog, next);
-                    ray_release(out); ray_free(mask_block);
+                    ray_free(mask_block);
                     ray_release(accum);
                     prog->eval_err = true;
                     return NULL;
@@ -2661,11 +2653,9 @@ static ray_t* table_union(ray_t* a, ray_t* b) {
         ray_t* next = ray_table_add_col(out, ray_table_col_name(a, c), merged);
         ray_release(merged);
         if (!next) {
-            ray_release(out);
             return ray_error("memory", "table_union: add_col");
         }
         if (RAY_IS_ERR(next)) {
-            ray_release(out);
             return next;
         }
         out = next;
@@ -3532,14 +3522,14 @@ ray_t* ray_assert_fact_fn(ray_t** args, int64_t n) {
         if (c == 0) {
             /* e column: append entity i64 */
             int64_t e_val = entity->i64;
-            new_col = ray_vec_append(new_col, &e_val);
+            new_col = ray_vec_append(new_col, &e_val);   /* plain: keeps the input for its own failure path (#1864) */
         } else if (c == 1) {
             /* a column: append attr sym ID */
             int64_t a_val = attr->i64;
-            new_col = ray_vec_append(new_col, &a_val);
+            new_col = ray_vec_append(new_col, &a_val);   /* plain: keeps the input for its own failure path (#1864) */
         } else {
             /* v column: append value as i64 */
-            new_col = ray_vec_append(new_col, &v_val);
+            new_col = ray_vec_append(new_col, &v_val);   /* plain: keeps the input for its own failure path (#1864) */
         }
 
         if (RAY_IS_ERR(new_col)) {
@@ -3606,11 +3596,11 @@ ray_t* ray_retract_fact_fn(ray_t** args, int64_t n) {
     for (int64_t r = 0; r < nrows; r++) {
         if (e_data[r] == match_e && a_data[r] == match_a && v_data[r] == match_v)
             continue; /* skip this row */
-        new_e = ray_vec_append(new_e, &e_data[r]);
+        new_e = ray_vec_append_take(new_e, &e_data[r]);
         if (RAY_IS_ERR(new_e)) { ray_release(new_a); ray_release(new_v); return new_e; }
-        new_a = ray_vec_append(new_a, &a_data[r]);
+        new_a = ray_vec_append_take(new_a, &a_data[r]);
         if (RAY_IS_ERR(new_a)) { ray_release(new_e); ray_release(new_v); return new_a; }
-        new_v = ray_vec_append(new_v, &v_data[r]);
+        new_v = ray_vec_append_take(new_v, &v_data[r]);
         if (RAY_IS_ERR(new_v)) { ray_release(new_e); ray_release(new_a); return new_v; }
     }
     /* SYM ids copied verbatim from the db's attribute column — resolve
@@ -3678,10 +3668,10 @@ ray_t* ray_scan_eav_fn(ray_t** args, int64_t n) {
         for (int64_t r = 0; r < nrows; r++) {
             int64_t a_val = ray_read_sym(ray_data(a_col), r, a_col->type, a_col->attrs);
             if (a_val == attr_id) {
-                re = ray_vec_append(re, &e_data[r]);
+                re = ray_vec_append_take(re, &e_data[r]);
                 if (RAY_IS_ERR(re)) { ray_release(rv); return re; }
                 int64_t v_val = dl_datom_untag(v_data[r]);
-                rv = ray_vec_append(rv, &v_val);
+                rv = ray_vec_append_take(rv, &v_val);
                 if (RAY_IS_ERR(rv)) { ray_release(re); return rv; }
             }
         }
@@ -3792,12 +3782,12 @@ ray_t* ray_pull_fn(ray_t** args, int64_t n) {
             if (!found) continue;
         }
 
-        keys = ray_vec_append(keys, &a_val);
+        keys = ray_vec_append_take(keys, &a_val);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
 
         ray_t* val = ray_i64(dl_datom_untag(v_data[r]));
         if (RAY_IS_ERR(val)) { ray_release(keys); ray_release(vals); return val; }
-        vals = ray_list_append(vals, val);
+        vals = ray_list_append_take(vals, val);
         ray_release(val);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
@@ -4770,14 +4760,12 @@ ray_t* ray_query_fn(ray_t** args, int64_t n) {
                     next_clean = ray_table_add_col(clean, ray_table_col_name(env_val, c), col);
                 }
                 if (!next_clean) {
-                    ray_release(clean);
                     dl_program_free(prog);
                     ray_release(db);
                     return ray_error("memory", "query: failed to build env-backed EDB table");
                 }
                 if (RAY_IS_ERR(next_clean)) {
                     ray_error_free(next_clean);
-                    ray_release(clean);
                     dl_program_free(prog);
                     ray_release(db);
                     return ray_error("memory", "query: failed to build env-backed EDB table");

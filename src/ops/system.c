@@ -676,23 +676,25 @@ ray_t* ray_meta_fn(ray_t* x) {
     ray_t* vals = ray_list_new(cap);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
-    keys = ray_vec_append(keys, &type_sym);
+    keys = ray_vec_append_take(keys, &type_sym);
     if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
     ray_t* tv = ray_sym(type_id);
-    vals = ray_list_append(vals, tv);
+    if (!tv || RAY_IS_ERR(tv)) { ray_release(keys); ray_release(vals); return tv ? tv : ray_error("oom", NULL); }   /* never an error as the type (#1864) */
+    vals = ray_list_append_take(vals, tv);
     ray_release(tv);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     if (!ray_is_atom(x)) {
         int64_t len_sym = ray_sym_intern("len", 3);
-        keys = ray_vec_append(keys, &len_sym);
+        keys = ray_vec_append_take(keys, &len_sym);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
         int64_t row_count;
         if (x->type == RAY_DICT)       row_count = ray_dict_len(x);
         else if (x->type == RAY_TABLE) row_count = ray_table_ncols(x);
         else                            row_count = x->len;
         ray_t* lv = make_i64(row_count);
-        vals = ray_list_append(vals, lv);
+        if (!lv || RAY_IS_ERR(lv)) { ray_release(keys); ray_release(vals); return lv ? lv : ray_error("oom", NULL); }   /* never an error as the length */
+        vals = ray_list_append_take(vals, lv);
         ray_release(lv);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
@@ -997,13 +999,13 @@ ray_t* ray_mem_ts_fn(ray_t** args, int64_t n) {
 
     for (int i = 0; i < MEM_TS_FIELDS; i++) {
         int64_t sid = ray_sym_intern(names[i], name_lens[i]);
-        keys = ray_vec_append(keys, &sid);
+        keys = ray_vec_append_take(keys, &sid);
         if (RAY_IS_ERR(keys)) {
             ray_release(vals);
             for (int j = i; j < MEM_TS_FIELDS; j++) ray_release(items[j]);
             return keys;
         }
-        vals = ray_list_append(vals, items[i]);
+        vals = ray_list_append_take(vals, items[i]);
         ray_release(items[i]);
         if (RAY_IS_ERR(vals)) {
             ray_release(keys);
@@ -1174,12 +1176,12 @@ ray_t* ray_system_fn(ray_t** args, int64_t n) {
                 return RAY_IS_ERR(keys) ? keys : vals;
             }
             int64_t k1 = ray_sym_intern("code", 4);
-            keys = ray_vec_append(keys, &k1);
+            keys = ray_vec_append_take(keys, &k1);
             ray_t* v1 = make_i64(code);
-            vals = ray_list_append(vals, v1); ray_release(v1);
+            vals = ray_list_append_take(vals, v1); ray_release(v1);
             int64_t k2 = ray_sym_intern("out", 3);
-            keys = ray_vec_append(keys, &k2);
-            vals = ray_list_append(vals, out); ray_release(out);
+            keys = ray_vec_append_take(keys, &k2);
+            vals = ray_list_append_take(vals, out); ray_release(out);
             result = ray_dict_new(keys, vals);
         }
     }
@@ -1434,9 +1436,9 @@ ray_t* ray_env_fn(ray_t* x) {
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     for (int32_t i = 0; i < count; i++) {
-        keys = ray_vec_append(keys, &sym_ids[i]);
+        keys = ray_vec_append_take(keys, &sym_ids[i]);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-        vals = ray_list_append(vals, vals_buf[i]);
+        vals = ray_list_append_take(vals, vals_buf[i]);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
     return ray_dict_new(keys, vals);
@@ -1452,22 +1454,22 @@ ray_t* ray_internals_fn(ray_t** args, int64_t n) {
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
 
     int64_t ver_sym = ray_sym_intern("version", 7);
-    keys = ray_vec_append(keys, &ver_sym);
+    keys = ray_vec_append_take(keys, &ver_sym);
 #ifdef RAYFORCE_VERSION
     ray_t* v1 = ray_str(RAYFORCE_VERSION, strlen(RAYFORCE_VERSION));
 #else
     ray_t* v1 = ray_str("unknown", 7);
 #endif
-    vals = ray_list_append(vals, v1); ray_release(v1);
+    vals = ray_list_append_take(vals, v1); ray_release(v1);
 
     int64_t date_sym = ray_sym_intern("build-date", 10);
-    keys = ray_vec_append(keys, &date_sym);
+    keys = ray_vec_append_take(keys, &date_sym);
 #ifdef RAYFORCE_BUILD_DATE
     ray_t* v2 = ray_str(RAYFORCE_BUILD_DATE, strlen(RAYFORCE_BUILD_DATE));
 #else
     ray_t* v2 = ray_str("unknown", 7);
 #endif
-    vals = ray_list_append(vals, v2); ray_release(v2);
+    vals = ray_list_append_take(vals, v2); ray_release(v2);
 
     return ray_dict_new(keys, vals);
 }
@@ -1521,9 +1523,9 @@ ray_t* ray_memstat_fn(ray_t** args, int64_t n) {
     };
     for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); i++) {
         int64_t s = ray_sym_intern(rows[i].name, rows[i].nlen);
-        keys = ray_vec_append(keys, &s);
+        keys = ray_vec_append_take(keys, &s);
         ray_t* v = make_i64(rows[i].v);
-        vals = ray_list_append(vals, v); ray_release(v);
+        vals = ray_list_append_take(vals, v); ray_release(v);
     }
 
     return ray_dict_new(keys, vals);
@@ -1847,61 +1849,61 @@ ray_t* ray_sysinfo_fn(ray_t** args, int64_t n) {
 #if !defined(RAY_OS_WINDOWS)
     /* cores: the CPUs this process may run on (its affinity mask) */
     int64_t s1 = ray_sym_intern("cores", 5);
-    keys = ray_vec_append(keys, &s1);
+    keys = ray_vec_append_take(keys, &s1);
     ray_t* v1 = make_i64((int64_t)ray_cpu_set_count());
-    vals = ray_list_append(vals, v1); ray_release(v1);
+    vals = ray_list_append_take(vals, v1); ray_release(v1);
 
     int64_t s2 = ray_sym_intern("page-size", 9);
-    keys = ray_vec_append(keys, &s2);
+    keys = ray_vec_append_take(keys, &s2);
     ray_t* v2 = make_i64(sysconf(_SC_PAGESIZE));
-    vals = ray_list_append(vals, v2); ray_release(v2);
+    vals = ray_list_append_take(vals, v2); ray_release(v2);
 
     int64_t s3 = ray_sym_intern("total-mem", 9);
-    keys = ray_vec_append(keys, &s3);
+    keys = ray_vec_append_take(keys, &s3);
     ray_t* v3 = make_i64(ray_sys_total_ram());
-    vals = ray_list_append(vals, v3); ray_release(v3);
+    vals = ray_list_append_take(vals, v3); ray_release(v3);
 #else
     SYSTEM_INFO si;
     GetSystemInfo(&si);
 
     int64_t s1 = ray_sym_intern("cores", 5);
-    keys = ray_vec_append(keys, &s1);
+    keys = ray_vec_append_take(keys, &s1);
     ray_t* v1 = make_i64((int64_t)si.dwNumberOfProcessors);
-    vals = ray_list_append(vals, v1); ray_release(v1);
+    vals = ray_list_append_take(vals, v1); ray_release(v1);
 
     int64_t s2 = ray_sym_intern("page-size", 9);
-    keys = ray_vec_append(keys, &s2);
+    keys = ray_vec_append_take(keys, &s2);
     ray_t* v2 = make_i64((int64_t)si.dwPageSize);
-    vals = ray_list_append(vals, v2); ray_release(v2);
+    vals = ray_list_append_take(vals, v2); ray_release(v2);
 
     int64_t s3 = ray_sym_intern("total-mem", 9);
-    keys = ray_vec_append(keys, &s3);
+    keys = ray_vec_append_take(keys, &s3);
     ray_t* v3 = make_i64(ray_sys_total_ram());
-    vals = ray_list_append(vals, v3); ray_release(v3);
+    vals = ray_list_append_take(vals, v3); ray_release(v3);
 #endif
 
     /* workers: the threads of the execution pool, main included (the size
      * a default pool would get while none exists; none is created here) */
     int64_t sw = ray_sym_intern("workers", 7);
-    keys = ray_vec_append(keys, &sw);
+    keys = ray_vec_append_take(keys, &sw);
     ray_t* vw = make_i64((int64_t)ray_pool_size());
-    vals = ray_list_append(vals, vw); ray_release(vw);
+    vals = ray_list_append_take(vals, vw); ray_release(vw);
 
     /* Process and host identity (#573).  An embedded process previously had
      * no way to name itself: pid plus hostname plus a start timestamp is a
      * diagnosable epoch, where a random token only tells you that two runs
      * differ, not which machine or process either one was. */
     int64_t sp = ray_sym_intern("pid", 3);
-    keys = ray_vec_append(keys, &sp);
+    keys = ray_vec_append_take(keys, &sp);
     ray_t* vp = make_i64(ray_os_pid());
-    vals = ray_list_append(vals, vp); ray_release(vp);
+    vals = ray_list_append_take(vals, vp); ray_release(vp);
 
     char host[256];
     int64_t sh = ray_sym_intern("hostname", 8);
-    keys = ray_vec_append(keys, &sh);
+    keys = ray_vec_append_take(keys, &sh);
     ray_t* vh = ray_os_hostname(host, sizeof(host)) ? ray_str(host, strlen(host))
                                                     : ray_str("", 0);
-    vals = ray_list_append(vals, vh); ray_release(vh);
+    vals = ray_list_append_take(vals, vh); ray_release(vh);
 
     return ray_dict_new(keys, vals);
 }
@@ -1999,22 +2001,22 @@ ray_t* ray_build_sys_args(int argc, char** argv) {
 
     int64_t k;
     ray_t* v;
-    k = ray_sym_intern("file", 4);        keys = ray_vec_append(keys, &k);
-    v = ray_str(file, strlen(file));      vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("port", 4);        keys = ray_vec_append(keys, &k);
-    v = ray_i64(port);                    vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("cores", 5);       keys = ray_vec_append(keys, &k);
-    v = ray_i64(cores);                   vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("timeit", 6);      keys = ray_vec_append(keys, &k);
-    v = ray_bool(timeit);                 vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("querylog", 8);    keys = ray_vec_append(keys, &k);
-    v = ray_bool(querylog);               vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("interactive", 11);keys = ray_vec_append(keys, &k);
-    v = ray_bool(interactive);            vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("log", 3);         keys = ray_vec_append(keys, &k);
-    v = ray_str(log, strlen(log));        vals = ray_list_append(vals, v); ray_release(v);
-    k = ray_sym_intern("user", 4);        keys = ray_vec_append(keys, &k);
-    vals = ray_list_append(vals, user);   ray_release(user);
+    k = ray_sym_intern("file", 4);        keys = ray_vec_append_take(keys, &k);
+    v = ray_str(file, strlen(file));      vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("port", 4);        keys = ray_vec_append_take(keys, &k);
+    v = ray_i64(port);                    vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("cores", 5);       keys = ray_vec_append_take(keys, &k);
+    v = ray_i64(cores);                   vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("timeit", 6);      keys = ray_vec_append_take(keys, &k);
+    v = ray_bool(timeit);                 vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("querylog", 8);    keys = ray_vec_append_take(keys, &k);
+    v = ray_bool(querylog);               vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("interactive", 11);keys = ray_vec_append_take(keys, &k);
+    v = ray_bool(interactive);            vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("log", 3);         keys = ray_vec_append_take(keys, &k);
+    v = ray_str(log, strlen(log));        vals = ray_list_append_take(vals, v); ray_release(v);
+    k = ray_sym_intern("user", 4);        keys = ray_vec_append_take(keys, &k);
+    vals = ray_list_append_take(vals, user);   ray_release(user);
 
     return ray_dict_new(keys, vals);
 }
@@ -2250,7 +2252,7 @@ static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
     }
     for (int i = 0; i < 8; i++) {
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
-        keys = ray_vec_append(keys, &k);
+        keys = ray_vec_append_take(keys, &k);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
         /* `inbound` is the direction: accepted here, or opened by .ipc.open;
          * `transport` where its bytes go: `tcp`, `shm` or `rdma`. */
@@ -2261,7 +2263,7 @@ static ray_t* ipc_tx_info_dict(int64_t h, const ray_ipc_tx_info_t* ti) {
             if (!tn) tn = "tcp";
             v = ray_sym(ray_sym_intern(tn, strlen(tn)));
         } else v = make_i64(vals_i[i]);
-        vals = ray_list_append(vals, v); ray_release(v);
+        vals = ray_list_append_take(vals, v); ray_release(v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
     return ray_dict_new(keys, vals);
@@ -2357,13 +2359,13 @@ static ray_t* ipc_txlimit_dict(int64_t bytes, int64_t frames) {
         if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
         return ray_error("oom", NULL);
     }
-    int64_t k = ray_sym_intern("bytes", 5);  keys = ray_vec_append(keys, &k);
+    int64_t k = ray_sym_intern("bytes", 5);  keys = ray_vec_append_take(keys, &k);
     if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-    k = ray_sym_intern("frames", 6);         keys = ray_vec_append(keys, &k);
+    k = ray_sym_intern("frames", 6);         keys = ray_vec_append_take(keys, &k);
     if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-    ray_t* v = make_i64(bytes);  vals = ray_list_append(vals, v); ray_release(v);
+    ray_t* v = make_i64(bytes);  vals = ray_list_append_take(vals, v); ray_release(v);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
-    v = make_i64(frames);        vals = ray_list_append(vals, v); ray_release(v);
+    v = make_i64(frames);        vals = ray_list_append_take(vals, v); ray_release(v);
     if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     return ray_dict_new(keys, vals);
 }

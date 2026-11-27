@@ -849,7 +849,7 @@ static ray_t* parse_vector(ray_parser_t *p) {
                 for (int32_t i = 0; i < count; i++) {
                     const char* s = ray_str_ptr(elems[i]);
                     size_t slen = ray_str_len(elems[i]);
-                    svec = ray_str_vec_append(svec, s, slen);
+                    svec = ray_str_vec_append_take(svec, s, slen);
                     if (RAY_IS_ERR(svec)) {
                         for (int32_t j = 0; j < count; j++) ray_release(elems[j]);
                         ray_free(vec);
@@ -973,11 +973,11 @@ static ray_t* parse_dict(ray_parser_t *p) {
         ray_t* val = parse_expr(p);
         if (RAY_IS_ERR(val)) { ray_release(key_atom); ray_release(key_list); ray_release(vals); return val; }
 
-        key_list = ray_list_append(key_list, key_atom);
+        key_list = ray_list_append_take(key_list, key_atom);
         ray_release(key_atom);
         if (RAY_IS_ERR(key_list)) { ray_release(vals); ray_release(val); return key_list; }
 
-        vals = ray_list_append(vals, val);
+        vals = ray_list_append_take(vals, val);
         ray_release(val);
         if (RAY_IS_ERR(vals)) { ray_release(key_list); return vals; }
 
@@ -995,7 +995,7 @@ static ray_t* parse_dict(ray_parser_t *p) {
         if (RAY_IS_ERR(keys)) { ray_release(key_list); ray_release(vals); return keys; }
         for (int64_t i = 0; i < n_pairs; i++) {
             int64_t id = key_atoms[i]->i64;
-            keys = ray_vec_append(keys, &id);
+            keys = ray_vec_append_take(keys, &id);
             if (RAY_IS_ERR(keys)) { ray_release(key_list); ray_release(vals); return keys; }
         }
         ray_release(key_list);
@@ -1003,7 +1003,7 @@ static ray_t* parse_dict(ray_parser_t *p) {
         keys = ray_vec_new(RAY_STR, n_pairs);
         if (RAY_IS_ERR(keys)) { ray_release(key_list); ray_release(vals); return keys; }
         for (int64_t i = 0; i < n_pairs; i++) {
-            keys = ray_str_vec_append(keys, ray_str_ptr(key_atoms[i]), ray_str_len(key_atoms[i]));
+            keys = ray_str_vec_append_take(keys, ray_str_ptr(key_atoms[i]), ray_str_len(key_atoms[i]));
             if (RAY_IS_ERR(keys)) { ray_release(key_list); ray_release(vals); return keys; }
         }
         ray_release(key_list);
@@ -1029,7 +1029,7 @@ static ray_t* parse_times_binding(ray_parser_t *p) {
     if (RAY_IS_ERR(list)) return list;
     ray_t* marker = ray_sym(ray_sym_intern(RAY_TIMES_BIND, sizeof(RAY_TIMES_BIND) - 1));
     if (RAY_IS_ERR(marker)) { ray_release(list); return marker; }
-    list = ray_list_append(list, marker);
+    list = ray_list_append_take(list, marker);
     ray_release(marker);
     if (RAY_IS_ERR(list)) return list;
 
@@ -1046,7 +1046,7 @@ static ray_t* parse_times_binding(ray_parser_t *p) {
             ray_release(list);
             return ray_error("parse", "times: binding must be [name count], with a name first");
         }
-        list = ray_list_append(list, elem);
+        list = ray_list_append_take(list, elem);
         ray_release(elem);
         if (RAY_IS_ERR(list)) return list;
     }

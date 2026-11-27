@@ -106,7 +106,7 @@ ray_t* ray_qlog_table(int64_t from) {
         wrks[i]  = r->workers;
         pars[i]  = r->parallelism;
         stats[i] = ray_sym_intern(r->status, r->status_len);
-        c_qry    = ray_str_vec_append(c_qry, r->query, r->query_len);
+        c_qry    = ray_str_vec_append_take(c_qry, r->query, r->query_len);
         if (!c_qry || RAY_IS_ERR(c_qry)) {
             for (size_t j = 0; j < sizeof(fixed)/sizeof(fixed[0]); j++) ray_release(fixed[j]);
             return c_qry ? c_qry : ray_error("oom", "sys.querylog: query column");
@@ -144,16 +144,18 @@ ray_t* ray_qlog_stats(void) {
     ray_t* keys = ray_sym_vec_new(RAY_SYM_W64, 3);
     ray_t* vals = ray_list_new(3);
     if (!keys || RAY_IS_ERR(keys) || !vals || RAY_IS_ERR(vals)) {
-        if (keys && !RAY_IS_ERR(keys)) ray_release(keys);
-        if (vals && !RAY_IS_ERR(vals)) ray_release(vals);
+        /* each is ours: a value released, an error freed (#1864) */
+        if (keys && RAY_IS_ERR(keys)) ray_error_free(keys); else ray_release(keys);
+        if (vals && RAY_IS_ERR(vals)) ray_error_free(vals); else ray_release(vals);
         return ray_error("oom", "sys.querylog.stats");
     }
     for (int i = 0; i < 3; i++) {
         int64_t k = ray_sym_intern(names[i], strlen(names[i]));
-        keys = ray_vec_append(keys, &k);
+        keys = ray_vec_append_take(keys, &k);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
         ray_t* v = ray_i64(vals_i[i]);
-        vals = ray_list_append(vals, v); ray_release(v);
+        if (!v || RAY_IS_ERR(v)) { ray_release(keys); ray_release(vals); return v ? v : ray_error("oom", NULL); }
+        vals = ray_list_append_take(vals, v); ray_release(v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
     return ray_dict_new(keys, vals);

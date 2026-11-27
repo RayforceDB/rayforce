@@ -389,14 +389,14 @@ static inline __attribute__((always_inline)) ray_t* eq_container(ray_t* a, ray_t
             err = value ? value : ray_error("oom", NULL);
             break;
         }
-        result = ray_list_append(result, value);
+        result = ray_list_append_take(result, value);
         ray_release(value);
         if (RAY_IS_ERR(result) || RAY_IS_ERR(outkeys)) break;
     }
     for (int64_t i = 0; !err && !RAY_IS_ERR(result) && !RAY_IS_ERR(outkeys) && more && i < more->len; i++) {
         if (((int64_t*)ray_data(reverse))[i] != NULL_I64) continue;
         ray_t* no = make_bool(0);
-        result = ray_list_append(result, no);
+        result = ray_list_append_take(result, no);
         ray_release(no);
     }
     if (!err && more) {
@@ -551,7 +551,7 @@ static ray_t* logic_map_c(ray_binary_fn fn, const char* name, ray_t* a, ray_t* b
         if (la) ray_release(ea);
         if (lb) ray_release(eb);
         if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
-        out = ray_list_append(out, r);
+        out = ray_list_append_take(out, r);
         ray_release(r);
         if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
     }
@@ -782,7 +782,7 @@ static ray_t* not_c(ray_t* x) {
         for (int64_t i = 0; i < n; i++) {
             ray_t* r = ray_not_fn(e[i]);
             if (!r || RAY_IS_ERR(r)) { ray_release(out); return r ? r : ray_error("oom", NULL); }
-            out = ray_list_append(out, r);
+            out = ray_list_append_take(out, r);
             ray_release(r);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         }

@@ -1918,7 +1918,7 @@ static ray_t* exec_if_eager(ray_graph_t* g, ray_op_t* op, ray_t* cond_in) {
                     sl = sa ? ray_str_len(sa) : 0;
                 }
             }
-            result = ray_str_vec_append(result, sp, sl);
+            result = ray_str_vec_append_take(result, sp, sl);
             if (RAY_IS_ERR(result)) break;
         }
     } else {

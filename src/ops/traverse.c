@@ -93,10 +93,10 @@ static ray_t* exec_expand_factorized(ray_rel_t* rel, uint8_t direction, ray_t* s
         return ray_error("oom", NULL);
     }
     ray_t* tmp = ray_table_add_col(result, src_sym, out_src);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(out_src); ray_release(out_cnt); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(out_src); ray_release(out_cnt); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, cnt_sym, out_cnt);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(out_src); ray_release(out_cnt); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(out_src); ray_release(out_cnt); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     ray_release(out_src); ray_release(out_cnt);
     return result;
@@ -206,10 +206,10 @@ ray_t* exec_expand(ray_graph_t* g, ray_op_t* op, ray_t* src_vec) {
             return ray_error("oom", NULL); \
         } \
         ray_t* _tmp = ray_table_add_col(result, src_sym, d_src); \
-        if (!_tmp || RAY_IS_ERR(_tmp)) { ray_release(d_src); ray_release(d_dst); ray_release(result); return ray_error("oom", NULL); } \
+        if (!_tmp || RAY_IS_ERR(_tmp)) { ray_release(d_src); ray_release(d_dst); return _tmp ? _tmp : ray_error("oom", NULL); } \
         result = _tmp; \
         _tmp = ray_table_add_col(result, dst_sym, d_dst); \
-        if (!_tmp || RAY_IS_ERR(_tmp)) { ray_release(d_src); ray_release(d_dst); ray_release(result); return ray_error("oom", NULL); } \
+        if (!_tmp || RAY_IS_ERR(_tmp)) { ray_release(d_src); ray_release(d_dst); return _tmp ? _tmp : ray_error("oom", NULL); } \
         result = _tmp; \
         ray_release(d_src); ray_release(d_dst); \
         return result; \
@@ -289,10 +289,10 @@ ray_t* exec_expand(ray_graph_t* g, ray_op_t* op, ray_t* src_vec) {
             return ray_error("oom", NULL);
         }
         ray_t* tmp = ray_table_add_col(result, src_sym, d_src);
-        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(d_src); ray_release(d_dst); ray_release(result); return ray_error("oom", NULL); }
+        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(d_src); ray_release(d_dst); return tmp ? tmp : ray_error("oom", NULL); }
         result = tmp;
         tmp = ray_table_add_col(result, dst_sym, d_dst);
-        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(d_src); ray_release(d_dst); ray_release(result); return ray_error("oom", NULL); }
+        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(d_src); ray_release(d_dst); return tmp ? tmp : ray_error("oom", NULL); }
         result = tmp;
         ray_release(d_src); ray_release(d_dst);
         return result;
@@ -474,13 +474,13 @@ cleanup:;
         return ray_error("oom", NULL);
     }
     ray_t* tmp = ray_table_add_col(result, start_sym, v_start);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, end_sym, v_end);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, depth_sym, v_depth);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_start); ray_release(v_end); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     ray_release(v_start); ray_release(v_end); ray_release(v_depth);
     return result;
@@ -537,10 +537,10 @@ ray_t* exec_shortest_path(ray_graph_t* g, ray_op_t* op,
         ray_t* result = ray_table_new(2);
         if (!result || RAY_IS_ERR(result)) { ray_release(v_node); ray_release(v_depth); return ray_error("oom", NULL); }
         ray_t* tmp = ray_table_add_col(result, sym_intern_safe("_node", 5), v_node);
-        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
         result = tmp;
         tmp = ray_table_add_col(result, sym_intern_safe("_depth", 6), v_depth);
-        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+        if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
         result = tmp;
         ray_release(v_node); ray_release(v_depth);
         return result;
@@ -651,10 +651,10 @@ bfs_done:
     ray_t* result = ray_table_new(2);
     if (!result || RAY_IS_ERR(result)) { ray_release(v_node); ray_release(v_depth); return ray_error("oom", NULL); }
     ray_t* tmp = ray_table_add_col(result, node_sym, v_node);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, depth_sym, v_depth);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(v_node); ray_release(v_depth); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     ray_release(v_node); ray_release(v_depth);
     return result;
@@ -1201,8 +1201,8 @@ ray_t* exec_wco_join(ray_graph_t* g, ray_op_t* op) {
         if (!new_result || RAY_IS_ERR(new_result)) {
             for (uint8_t j = v + 1; j < n_vars; j++) ray_free(ctx.buf_hdrs[j]);
             scratch_free(col_data_block);
-            ray_release(result);
-            return ray_error("oom", NULL);
+            /* result consumed by add_col */
+            return new_result ? new_result : ray_error("oom", NULL);
         }
         result = new_result;
     }
@@ -1815,11 +1815,11 @@ ray_t* exec_betweenness(ray_graph_t* g, ray_op_t* op) {
     }
     ray_t* tmp = ray_table_add_col(result, sym_intern_safe("_node", 5), node_vec);
     ray_release(node_vec);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(result); ray_release(cent_vec); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(cent_vec); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, sym_intern_safe("_centrality", 11), cent_vec);
     ray_release(cent_vec);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     return result;
 }
@@ -1942,11 +1942,11 @@ ray_t* exec_closeness(ray_graph_t* g, ray_op_t* op) {
     }
     ray_t* tmp = ray_table_add_col(result, sym_intern_safe("_node", 5), node_vec);
     ray_release(node_vec);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(result); ray_release(cent_vec); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(cent_vec); return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     tmp = ray_table_add_col(result, sym_intern_safe("_centrality", 11), cent_vec);
     ray_release(cent_vec);
-    if (!tmp || RAY_IS_ERR(tmp)) { ray_release(result); return ray_error("oom", NULL); }
+    if (!tmp || RAY_IS_ERR(tmp)) { return tmp ? tmp : ray_error("oom", NULL); }
     result = tmp;
     return result;
 }

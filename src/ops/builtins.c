@@ -635,9 +635,9 @@ ray_t* ray_read_limits_fn(ray_t** args, int64_t n) {
     for (size_t i = 0; i < READ_LIMIT_COUNT; i++) {
         int64_t id = ray_sym_intern(read_limit_names[i].name, strlen(read_limit_names[i].name));
         int64_t v = (int64_t)*(size_t*)((char*)&lim + read_limit_names[i].off);
-        keys = ray_vec_append(keys, &id);
+        keys = ray_vec_append_take(keys, &id);
         if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-        vals = ray_vec_append(vals, &v);
+        vals = ray_vec_append_take(vals, &v);
         if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
     }
     return ray_dict_new(keys, vals);
@@ -764,7 +764,7 @@ ray_t* ray_resolve_fn(ray_t** args, int64_t n) {
                 ray_t* sym_col = ray_vec_new(RAY_SYM, nrows);
                 if (RAY_IS_ERR(sym_col)) { ray_release(result); ray_release(tbl); return sym_col; }
                 for (int64_t r = 0; r < nrows; r++) {
-                    sym_col = ray_vec_append(sym_col, &data[r]);
+                    sym_col = ray_vec_append_take(sym_col, &data[r]);
                     if (RAY_IS_ERR(sym_col)) { ray_release(result); ray_release(tbl); return sym_col; }
                 }
                 result = ray_table_add_col(result, col_name, sym_col);
@@ -1887,7 +1887,7 @@ ray_t* cast_str_cells(ray_t* type_sym, ray_t* val, bool may_nest) {
                 return cast_str_limit(cast, vec);
             scan_at = UINT64_MAX;   /* the whole list is counted */
         }
-        vec = ray_str_vec_append(vec, sp ? sp : "", sp ? slen : 0);
+        vec = ray_str_vec_append_take(vec, sp ? sp : "", sp ? slen : 0);
         ray_release(cast);
         if (RAY_IS_ERR(vec)) return vec;
         if (cell_null) ray_vec_set_null(vec, i, true);
@@ -2664,9 +2664,9 @@ ray_t* ray_cast_fn(ray_t* type_sym, ray_t* val) {
                 int64_t col_name = ray_table_col_name(val, c);
                 ray_t* col_val = ray_table_col_idx(val, c);
                 if (col_val && RAY_IS_ERR(col_val)) { ray_release(keys); ray_release(vals); return col_val; }
-                keys = ray_vec_append(keys, &col_name);
+                keys = ray_vec_append_take(keys, &col_name);
                 if (RAY_IS_ERR(keys)) { ray_release(vals); return keys; }
-                vals = ray_list_append(vals, col_val);
+                vals = ray_list_append_take(vals, col_val);
                 if (RAY_IS_ERR(vals)) { ray_release(keys); return vals; }
             }
             return ray_dict_new(keys, vals);
@@ -3107,7 +3107,7 @@ ray_t* ray_enlist_fn(ray_t** args, int64_t n) {
             ray_t* svec = ray_vec_new(RAY_STR, n);
             if (RAY_IS_ERR(svec)) { ray_free(vec); return svec; }
             for (int64_t i = 0; i < n; i++) {
-                svec = ray_str_vec_append(svec, ray_str_ptr(args[i]), ray_str_len(args[i]));
+                svec = ray_str_vec_append_take(svec, ray_str_ptr(args[i]), ray_str_len(args[i]));
                 if (RAY_IS_ERR(svec)) return svec;
             }
             ray_free(vec);
@@ -3136,7 +3136,7 @@ as_list:;
     if (RAY_IS_ERR(lst)) return lst;
     for (int64_t i = 0; i < n; i++) {
         ray_retain(args[i]);
-        lst = ray_list_append(lst, args[i]);
+        lst = ray_list_append_take(lst, args[i]);
         ray_release(args[i]);
         if (RAY_IS_ERR(lst)) return lst;
     }
@@ -3173,7 +3173,7 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
             v = vals;
         }
         if (v && !RAY_IS_ERR(v)) {
-            vlist = ray_list_append(vlist, v);
+            vlist = ray_list_append_take(vlist, v);
             if (alloc) ray_release(v);
         } else {
             ray_t* null_val = ray_typed_null(-RAY_I64);
@@ -3182,7 +3182,7 @@ ray_t* ray_dict_fn(ray_t* keys, ray_t* vals) {
                 ray_release(vlist); ray_release(keys);
                 return ray_error("oom", NULL);
             }
-            vlist = ray_list_append(vlist, null_val);
+            vlist = ray_list_append_take(vlist, null_val);
             ray_release(null_val);
         }
         if (RAY_IS_ERR(vlist)) { ray_release(keys); return vlist; }
@@ -4332,17 +4332,17 @@ ray_t* ray_group_indices_fn(ray_t* x) {
             case RAY_TIMESTAMP:
             case RAY_TIMESPAN: {
                 int64_t v = gvals[g];
-                keys_vec = ray_vec_append(keys_vec, &v); break;
+                keys_vec = ray_vec_append_take(keys_vec, &v); break;
             }
             case RAY_I32:
             case RAY_DATE:
             case RAY_TIME: {
                 int32_t v = (int32_t)gvals[g];
-                keys_vec = ray_vec_append(keys_vec, &v); break;
+                keys_vec = ray_vec_append_take(keys_vec, &v); break;
             }
-            case RAY_I16: { int16_t v = (int16_t)gvals[g]; keys_vec = ray_vec_append(keys_vec, &v); break; }
+            case RAY_I16: { int16_t v = (int16_t)gvals[g]; keys_vec = ray_vec_append_take(keys_vec, &v); break; }
             case RAY_BOOL:
-            case RAY_U8:  { uint8_t v = (uint8_t)gvals[g]; keys_vec = ray_vec_append(keys_vec, &v); break; }
+            case RAY_U8:  { uint8_t v = (uint8_t)gvals[g]; keys_vec = ray_vec_append_take(keys_vec, &v); break; }
             case RAY_F64: {
                 /* gvals[g] holds the IEEE-754 bit pattern packed by the
                  * row-loop above; reinterpret rather than int->double
@@ -4350,17 +4350,17 @@ ray_t* ray_group_indices_fn(ray_t* x) {
                  * actual float values). */
                 double v;
                 memcpy(&v, &gvals[g], sizeof(v));
-                keys_vec = ray_vec_append(keys_vec, &v);
+                keys_vec = ray_vec_append_take(keys_vec, &v);
                 break;
             }
             case RAY_F32: {
                 double f;
                 memcpy(&f, &gvals[g], sizeof(f));
                 float  v = (float)f;
-                keys_vec = ray_vec_append(keys_vec, &v);
+                keys_vec = ray_vec_append_take(keys_vec, &v);
                 break;
             }
-            default:      keys_vec = ray_vec_append(keys_vec, &gvals[g]); break;
+            default:      keys_vec = ray_vec_append_take(keys_vec, &gvals[g]); break;
         }
         /* If the source column had a null at any row in this group, mark
          * the group's key as null so dict rendering / lookup can recover
@@ -4434,7 +4434,7 @@ static ray_t* str_vec_concat_atom(ray_t* vec, ray_t* atom, bool atom_first) {
             if (al) memcpy(buf + sl, ap, al);
         }
         ray_t* prev = out;
-        out = ray_str_vec_append(out, buf, total);
+        out = ray_str_vec_append(out, buf, total);   /* plain: keeps the input for its own failure path (#1864) */
         if (buf != sbuf) ray_free_raw(buf);
         if (RAY_IS_ERR(out)) {
             ray_release(prev);
@@ -5216,7 +5216,7 @@ static ray_t* raze_strings(ray_t** items, int64_t n) {
         for (int64_t j = 0; j < it->len; j++) {
             size_t l = 0;
             const char* p = ray_str_vec_get(it, j, &l);
-            out = ray_str_vec_append(out, p ? p : "", p ? l : 0);
+            out = ray_str_vec_append_take(out, p ? p : "", p ? l : 0);
             if (!out || RAY_IS_ERR(out)) return out ? out : ray_error("oom", NULL);
         }
     }

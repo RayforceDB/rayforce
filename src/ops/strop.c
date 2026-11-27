@@ -811,7 +811,7 @@ static ray_t* split_bytes(const char* sp, size_t slen, const char* dp, size_t dl
             if (memcmp(sp + i, dp, dlen) == 0) {
                 ray_t* part = ray_str(sp + start, i - start);
                 if (!part || RAY_IS_ERR(part)) { ray_release(result); return part ? part : ray_error("oom", NULL); }
-                result = ray_list_append(result, part);
+                result = ray_list_append_take(result, part);
                 ray_release(part);
                 if (RAY_IS_ERR(result)) return result;
                 i += dlen;
@@ -823,7 +823,7 @@ static ray_t* split_bytes(const char* sp, size_t slen, const char* dp, size_t dl
     }
     ray_t* part = ray_str(sp + start, slen - start);
     if (!part || RAY_IS_ERR(part)) { ray_release(result); return part ? part : ray_error("oom", NULL); }
-    result = ray_list_append(result, part);
+    result = ray_list_append_take(result, part);
     ray_release(part);
     return result;
 }
@@ -858,7 +858,7 @@ static ray_t* split_cells(ray_t* v, const char* dp, size_t dlen) {
         }
         ray_t* parts = split_bytes(sp, sl, dp, dlen);
         if (!parts || RAY_IS_ERR(parts)) { ray_release(out); return parts ? parts : ray_error("oom", NULL); }
-        out = ray_list_append(out, parts);
+        out = ray_list_append_take(out, parts);
         ray_release(parts);
         if (RAY_IS_ERR(out)) return out;
     }
@@ -914,7 +914,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
                         vec->len = seglen;
                         for (int64_t j = 0; j < seglen && start + j < total; j++)
                             store_typed_elem(vec, j, items[start + j]);
-                        result = ray_list_append(result, vec);
+                        result = ray_list_append_take(result, vec);
                         ray_release(vec);
                         if (RAY_IS_ERR(result)) return result;
                         continue;
@@ -926,11 +926,11 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
             for (int64_t j = 0; j < seglen && start + j < total; j++) {
                 ray_retain(items[start + j]);
-                seg = ray_list_append(seg, items[start + j]);
+                seg = ray_list_append_take(seg, items[start + j]);
                 ray_release(items[start + j]);
                 if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
             }
-            result = ray_list_append(result, seg);
+            result = ray_list_append_take(result, seg);
             ray_release(seg);
             if (RAY_IS_ERR(result)) return result;
         }
@@ -963,7 +963,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
                 if (start + seglen > (int64_t)total) seglen = (int64_t)total - start;
                 ray_t* seg = ray_str(sp2 + start, (size_t)seglen);
                 if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
-                result = ray_list_append(result, seg);
+                result = ray_list_append_take(result, seg);
                 ray_release(seg);
                 if (RAY_IS_ERR(result)) return result;
             }
@@ -997,7 +997,7 @@ ray_t* ray_split_fn(ray_t* str, ray_t* delim) {
                 seg = ray_vec_slice(str, start, seglen);
             }
             if (RAY_IS_ERR(seg)) { ray_release(result); return seg; }
-            result = ray_list_append(result, seg);
+            result = ray_list_append_take(result, seg);
             ray_release(seg);
             if (RAY_IS_ERR(result)) return result;
         }
@@ -1123,7 +1123,7 @@ ray_t* ray_sym_name_fn(ray_t* x) {
         ray_t* out = ray_vec_new(RAY_SYM, n);
         if (RAY_IS_ERR(out)) return out;
         for (int64_t i = 0; i < n; i++) {
-            out = ray_vec_append(out, &data[i]);
+            out = ray_vec_append_take(out, &data[i]);
             if (RAY_IS_ERR(out)) return out;
         }
         return out;

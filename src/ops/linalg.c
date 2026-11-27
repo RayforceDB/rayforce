@@ -166,7 +166,7 @@ static double* lin_flat(const lin_t* m) {
 
 static ray_t* lin_vec_out(const double* d, int64_t n, bool f32) {
     ray_t* v = ray_vec_new(f32 ? RAY_F32 : RAY_F64, n);
-    if (!v || RAY_IS_ERR(v)) return ray_error("oom", NULL);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->len = n;
     if (f32) {
         float* o = (float*)ray_data(v);
@@ -186,7 +186,7 @@ static ray_t* lin_vec_out(const double* d, int64_t n, bool f32) {
 /* An F32 vector from float results; a value that is not finite is a null. */
 static ray_t* lin_vec_out_f32(const float* d, int64_t n) {
     ray_t* v = ray_vec_new(RAY_F32, n);
-    if (!v || RAY_IS_ERR(v)) return ray_error("oom", NULL);
+    if (!v || RAY_IS_ERR(v)) return v ? v : ray_error("oom", NULL);
     v->len = n;
     float* o = (float*)ray_data(v);
     for (int64_t i = 0; i < n; i++) {
@@ -198,11 +198,11 @@ static ray_t* lin_vec_out_f32(const float* d, int64_t n) {
 
 static ray_t* lin_out_f32(const float* d, int64_t r, int64_t c) {
     ray_t* L = ray_list_new(r);
-    if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
+    if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     for (int64_t i = 0; i < r; i++) {
         ray_t* row = lin_vec_out_f32(d + i * c, c);
         if (RAY_IS_ERR(row)) { ray_release(L); return row; }
-        L = ray_list_append(L, row);
+        L = ray_list_append_take(L, row);
         ray_release(row);
         if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     }
@@ -211,11 +211,11 @@ static ray_t* lin_out_f32(const float* d, int64_t r, int64_t c) {
 
 static ray_t* lin_out(const double* d, int64_t r, int64_t c, bool f32) {
     ray_t* L = ray_list_new(r);
-    if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
+    if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     for (int64_t i = 0; i < r; i++) {
         ray_t* row = lin_vec_out(d + i * c, c, f32);
         if (RAY_IS_ERR(row)) { ray_release(L); return row; }
-        L = ray_list_append(L, row);
+        L = ray_list_append_take(L, row);
         ray_release(row);
         if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     }
@@ -907,10 +907,10 @@ static ray_t* lin_flip_same(ray_t* x, int64_t r, int64_t c) {
     uint8_t ty = ray_list_get(x, 0)->type;
     size_t w = ty == RAY_I64 ? 8 : 4;
     ray_t* L = ray_list_new(c);
-    if (!L || RAY_IS_ERR(L)) return ray_error("oom", NULL);
+    if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     for (int64_t j = 0; j < c; j++) {
         ray_t* v = ray_vec_new(ty, r);
-        if (!v || RAY_IS_ERR(v)) { ray_release(L); return ray_error("oom", NULL); }
+        if (!v || RAY_IS_ERR(v)) { ray_release(L); return v ? v : ray_error("oom", NULL); }
         v->len = r;
         char* o = (char*)ray_data(v);
         bool nulls = false;
@@ -920,7 +920,7 @@ static ray_t* lin_flip_same(ray_t* x, int64_t r, int64_t c) {
             if (ray_vec_is_null(row, j)) nulls = true;
         }
         if (nulls) v->attrs |= RAY_ATTR_HAS_NULLS;
-        L = ray_list_append(L, v);
+        L = ray_list_append_take(L, v);
         ray_release(v);
         if (!L || RAY_IS_ERR(L)) return L ? L : ray_error("oom", NULL);
     }

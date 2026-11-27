@@ -1210,7 +1210,7 @@ static ray_t* empty_table_like(ray_t* tmpl) {
         if (!ecol || RAY_IS_ERR(ecol)) { ray_release(out); return ecol ? ecol : ray_error("oom", NULL); }
         ray_t* nout = ray_table_add_col(out, ray_table_col_name(tmpl, c), ecol);
         ray_release(ecol);
-        if (!nout || RAY_IS_ERR(nout)) { ray_release(out); return nout ? nout : ray_error("oom", NULL); }
+        if (!nout || RAY_IS_ERR(nout)) return nout ? nout : ray_error("oom", NULL);   /* out consumed by add_col (#1864) */
         out = nout;
     }
     return out;

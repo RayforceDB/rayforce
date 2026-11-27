@@ -1389,7 +1389,7 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
         }
 
     ray_t *mentioned = ray_vec_new(RAY_I64, 16);
-    if (!mentioned || RAY_IS_ERR(mentioned)) { if (own_params) ray_release(params); return false; }
+    if (!mentioned || RAY_IS_ERR(mentioned)) { ray_error_free(mentioned); if (own_params) ray_release(params); return false; }
     bool dynamic = false, ok = true;
     int64_t tweight = 0, tnodes = AST_NAME_NODES;
     for (int64_t i = 2; i < n && ok; i++)
@@ -1401,8 +1401,8 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
     ray_t *slots = ray_vec_new(RAY_I64, c->n_locals > 0 ? c->n_locals : 1);
     if (!names || RAY_IS_ERR(names) || !slots || RAY_IS_ERR(slots)) {
         ray_release(mentioned);
-        if (names && !RAY_IS_ERR(names)) ray_release(names);
-        if (slots && !RAY_IS_ERR(slots)) ray_release(slots);
+        if (names && RAY_IS_ERR(names)) ray_error_free(names); else if (names) ray_release(names);
+        if (slots && RAY_IS_ERR(slots)) ray_error_free(slots); else if (slots) ray_release(slots);
         if (own_params) ray_release(params);
         return false;
     }
@@ -1426,7 +1426,9 @@ static bool compile_fn_template_at(compiler_t *c, ray_t *ast) {
         ray_release(names); ray_release(slots);
         if (own_params) ray_release(params);
         if (body && !RAY_IS_ERR(body)) { body->type = RAY_LIST; body->len = 0; ray_release(body); }
+        else ray_error_free(body);
         if (tmpl && !RAY_IS_ERR(tmpl)) { tmpl->type = RAY_LAMBDA; memset(ray_data(tmpl), 0, LAMBDA_SLOTS * sizeof(ray_t*)); ray_release(tmpl); }
+        else ray_error_free(tmpl);
         return false;
     }
     body->type = RAY_LIST;
@@ -1482,7 +1484,7 @@ ray_t *ray_closure_names_from(ray_t *closure, ray_t *mentioned, bool dynamic) {
     if (!keys || keys->len == 0) return NULL;
     init_sf_syms();
     ray_t *names = ray_sym_vec_new(RAY_SYM_W64, keys->len);
-    if (!names || RAY_IS_ERR(names)) return NULL;
+    if (!names || RAY_IS_ERR(names)) { ray_error_free(names); return NULL; }   /* NULL is the failure; its error is ours */
     int64_t *out = (int64_t*)ray_data(names);
     names->len = 0;
     for (int64_t i = 0; i < keys->len; i++) {
