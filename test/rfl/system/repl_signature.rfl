@@ -127,3 +127,14 @@ zsg_calls -- 0
 (at (.repl.signature 'top) 'aggregate) -- true
 (at (.repl.signature 'bot) 'aggregate) -- true
 (at (.repl.signature 'reverse) 'aggregate) -- false
+;; update, delete, insert and upsert are refused under -U only on a named
+;; target: restricted_named, not restricted; set is refused whatever its
+;; arguments (#1878)
+(at (.repl.signature 'update) 'restricted) -- false
+(at (.repl.signature 'update) 'restricted_named) -- true
+(at (.repl.signature 'delete) 'restricted_named) -- true
+(at (.repl.signature 'insert) 'restricted_named) -- true
+(at (.repl.signature 'upsert) 'restricted_named) -- true
+(at (.repl.signature 'set) 'restricted) -- true
+(at (.repl.signature 'set) 'restricted_named) -- false
+(at (.repl.signature 'count) 'restricted_named) -- false

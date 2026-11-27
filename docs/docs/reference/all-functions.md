@@ -4,7 +4,8 @@
     **atomic** — auto-maps element-wise over vectors.
     **aggr** — reduces vectors to scalars (used in group-by).
     **special** — receives unevaluated arguments (special form).
-    **restricted** — disabled in sandboxed mode.
+    **restricted** — refused on a restricted (`-U`) connection.
+    **restricted (named target)** — on a restricted connection, refused only when the target names a binding (`from: 't`, `(insert 't …)`); on a table value (`from: t`) it runs and answers a new table. See [restricted mode](../storage/ipc.md#-u-password-restricted-mode).
 
 ## Categories
 
@@ -833,7 +834,7 @@ Create and manipulate tables, dictionaries, and their metadata.
 | `union-all` | binary | — | Concatenate two tables (all rows, no dedup). A parted operand (`.db.parted.get`) is read into memory first: the result is a plain table, and the partition key becomes a column | `(union-all t1 t2)` |
 | `unify` | binary | — | A two-element list of both values, as given (no merge, no type coercion) | `(unify d1 d2)` |
 | `modify` | variadic | restricted | Functional table update (returns new table) | `(modify trades 'price (fn [p] (* p 1.1)))` |
-| `delete` | unary | special, restricted | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |
+| `delete` | unary | special, restricted (named target) | Remove the rows a predicate matches: `{from: 't where: p}` removes them in place, `{from: t where: p}` returns a new table. Both clauses are required | `(delete {from: 'trades where: (> price 100)})` |
 | `ungroup` | unary | — | Flatten a grouped table's nested list columns into one row per element | `(ungroup gt)` |
 | `pivot` | variadic | — | Pivot table — reshape long to wide format | `(pivot trades 'sym 'date 'price sum)` |
 
@@ -877,9 +878,9 @@ Special forms that bridge to the Rayforce DAG executor for high-performance colu
 |---|---|---|---|---|
 | `select` | variadic | special | Query table with optional filter, projection, grouping, and aggregation | `(select {from: t a: a})` |
 | `window` | variadic | special | Partitioned window query. `frame:` is `'whole`, `'running`, or a positive trailing row count. `first` and `last` give the frame's first or last row, a null included, in the value column's type; `min` and `max` skip nulls and keep the value column's type too, ordering SYM and STR by text and GUID by bytes, as `min` and `max` do outside a window | `(window {from: t part: [sym] order: [time] frame: 5 funcs: {avg5: (avg price)}})` |
-| `update` | variadic | special, restricted | Add or modify columns: `{from: 't …}` updates the named table in place, `{from: t …}` returns a new table | `(update {from: t b: (* a 2)})` |
-| `insert` | variadic | special, restricted | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
-| `upsert` | variadic | special, restricted | Insert or update flat-table rows by key match (target, key, row); a null key matches a null-keyed row for every key type, and a key value the key column cannot hold is a `domain` error | `(upsert t 'x {x: 10 y: 20})` |
+| `update` | variadic | special, restricted (named target) | Add or modify columns: `{from: 't …}` updates the named table in place, `{from: t …}` returns a new table | `(update {from: t b: (* a 2)})` |
+| `insert` | variadic | special, restricted (named target) | Append rows, or grow a parted table's in-memory live tail with an explicit partition key; a quoted target names the innermost visible local or parameter before a global, through a literal `insert` head or a global alias of it | `(insert 't 2024.01.16 rows)` |
+| `upsert` | variadic | special, restricted (named target) | Insert or update flat-table rows by key match (target, key, row); a null key matches a null-keyed row for every key type, and a key value the key column cannot hold is a `domain` error | `(upsert t 'x {x: 10 y: 20})` |
 
 ```lisp
 ; Select with filter and projection

@@ -202,7 +202,11 @@ ray_t* ray_repl_signature_fn(ray_t* name) {
     insp_put(&d, "usage", usage ? ray_str(usage, strlen(usage)) : ray_str("", 0));
     insp_put(&d, "summary", summary ? ray_str(summary, strlen(summary)) : ray_str("", 0));
     insp_put(&d, "builtin", own >= 0 ? ray_sym(own) : insp_sym(""));
-    insp_put(&d, "restricted", ray_bool(builtin && (v->attrs & RAY_FN_RESTRICTED)));
+    /* restricted: refused under -U whatever its arguments; restricted_named:
+     * refused under -U only when its target names a binding (#1878) */
+    bool named = builtin && ray_fn_restricted_named(v);
+    insp_put(&d, "restricted", ray_bool(builtin && (v->attrs & RAY_FN_RESTRICTED) && !named));
+    insp_put(&d, "restricted_named", ray_bool(named));
     /* how it treats a collection, from what the engine records (#1744):
      * atomic, the evaluator maps it over vectors and lists itself; per
      * argument, whether that argument maps a vector element by element

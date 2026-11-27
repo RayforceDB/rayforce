@@ -1,0 +1,31 @@
+;; @requires: posix  (the server is started and stopped through a POSIX shell)
+;; On a restricted (-U) connection the value spellings of update, delete,
+;; insert and upsert answer a new table and bind nothing; the named
+;; spellings, which rebind a global, are refused with access (#1878).  The
+;; server's table is as it was after each.
+(.sys.exec "rm -rf /tmp/rftest_rqv; mkdir -p /tmp/rftest_rqv; printf '(set t (table [a b] (list [1 2 3] [10 20 30])))\n' > /tmp/rftest_rqv/boot.rfl") -- 0
+(.sys.exec "test/serve.sh --listen /tmp/rftest_rqv/s -U pw /tmp/rftest_rqv/boot.rfl") -- 0
+(set h (.ipc.open (concat "127.0.0.1:" (concat (trim (read "/tmp/rftest_rqv/s/port")) ":u:pw"))))
+(set ask (fn [src] (try (.ipc.send h src) (fn [e] (get e 'code)))))
+
+;; the issue's four cases
+(ask "(update {c: (+ a b) from: t})") -- (table [a b c] (list [1 2 3] [10 20 30] [11 22 33]))
+(ask "(update {c: (+ a b) from: (select {from: t where: (> a 1)})})") -- (table [a b c] (list [2 3] [20 30] [22 33]))
+(ask "(update {c: 0 from: 't})") -- 'access
+(ask "(select {from: t c: (+ a b)})") -- (table [c] (list [11 22 33]))
+
+;; delete, insert and upsert, by value and by name
+(ask "(delete {from: t where: (> a 1)})") -- (table [a b] (list [1] [10]))
+(ask "(delete {from: 't where: (> a 1)})") -- 'access
+(ask "(insert t (list 4 40))") -- (table [a b] (list [1 2 3 4] [10 20 30 40]))
+(ask "(insert 't (list 4 40))") -- 'access
+(ask "(upsert t 1 (list 2 99))") -- (table [a b] (list [1 2 3] [10 99 30]))
+(ask "(upsert 't 1 (list 2 99))") -- 'access
+;; a symbol computed at run time is the named spelling
+(ask "(update {c: 0 from: (first ['t])})") -- 'access
+
+;; the server's table is as it was
+(ask "t") -- (table [a b] (list [1 2 3] [10 20 30]))
+(.ipc.close h)
+(.sys.exec "test/serve.sh --stop /tmp/rftest_rqv/s") -- 0
+(.sys.exec "rm -rf /tmp/rftest_rqv; true") -- 0

@@ -330,6 +330,7 @@ static ray_t* help_name(const char* p, size_t len, ray_syscmd_ctx_t* ctx) {
         fprintf(stdout, " (%s)", k);
         if (sig_flag(d, "special")) fprintf(stdout, ", special form");
         if (sig_flag(d, "restricted")) fprintf(stdout, ", restricted under -U");
+        if (sig_flag(d, "restricted_named")) fprintf(stdout, ", restricted under -U on a named target");
         /* how it treats a collection (#1744): atomic, else which arguments
          * map element by element, and aggregate */
         if (sig_flag(d, "atomic")) {

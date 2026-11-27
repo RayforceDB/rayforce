@@ -16337,6 +16337,224 @@ static test_result_t test_query_cell_alloc_fail(void) {
 }
 #endif
 
+/* ---- restricted update / delete / insert / upsert (#1878) ----------------
+ * On a restricted connection the value spellings run: the target evaluates
+ * to a table (or vector) value, the form answers a new one and binds
+ * nothing.  The named spellings, whose target evaluates to a symbol (quoted
+ * or computed), rebind a global or write it in place and stay refused with
+ * `access`, as does any write the expression itself tries.  The global a
+ * value spelling reads is the same object afterwards, its columns the same
+ * blocks with the same bytes: no write went through a shared column. */
+
+/* The answer of a restricted eval as rows x cols of a table, or -1 on an
+ * error or another type; the answer is released. */
+static int64_t rq_rows(const char* expr, int64_t* ncols) {
+    ray_t* r = eval_restricted_expr(expr);
+    int64_t n = -1;
+    if (ncols) *ncols = -1;
+    if (r && !RAY_IS_ERR(r) && r->type == RAY_TABLE) {
+        n = ray_table_nrows(r);
+        if (ncols) *ncols = ray_table_ncols(r);
+    } else if (r && RAY_IS_ERR(r)) {
+        fprintf(stderr, "  %s: %s\n", expr, ray_err_code(r));
+    }
+    if (r) { if (RAY_IS_ERR(r)) ray_error_free(r); else ray_release(r); }
+    return n;
+}
+
+typedef struct { ray_t* tbl; int64_t ncols; ray_t* cols[8]; ray_t* index[8]; void* bytes[8]; size_t len[8]; } rq_snap_t;
+
+static void rq_snap(rq_snap_t* s, const char* name) {
+    memset(s, 0, sizeof *s);
+    s->tbl = ray_env_get(ray_sym_intern(name, strlen(name)));
+    s->ncols = s->tbl ? ray_table_ncols(s->tbl) : 0;
+    for (int64_t c = 0; c < s->ncols && c < 8; c++) {
+        ray_t* col = ray_table_col_idx(s->tbl, c);
+        s->cols[c] = col;
+        s->index[c] = col->index;
+        size_t esz = col->type == RAY_LIST ? sizeof(ray_t*) : col->type == RAY_STR ? 16 : (size_t)ray_sym_elem_size(col->type, col->attrs);
+        s->len[c] = (size_t)col->len * esz;
+        s->bytes[c] = malloc(s->len[c] ? s->len[c] : 1);
+        memcpy(s->bytes[c], ray_data(col), s->len[c]);
+    }
+}
+
+/* The global is the snapshot's table, column for column, byte for byte. */
+static bool rq_same(rq_snap_t* s, const char* name) {
+    bool ok = ray_env_get(ray_sym_intern(name, strlen(name))) == s->tbl && ray_table_ncols(s->tbl) == s->ncols;
+    for (int64_t c = 0; ok && c < s->ncols && c < 8; c++) {
+        ray_t* col = ray_table_col_idx(s->tbl, c);
+        ok = col == s->cols[c] && col->index == s->index[c] && (size_t)col->len * (s->len[c] / (size_t)(s->cols[c]->len ? s->cols[c]->len : 1)) == s->len[c] &&
+             memcmp(ray_data(col), s->bytes[c], s->len[c]) == 0;
+    }
+    for (int64_t c = 0; c < 8; c++) free(s->bytes[c]);
+    return ok;
+}
+
+static test_result_t test_eval_restricted_query_forms(void) {
+    ray_t* r = ray_eval_str("(do (set __rf_rq_t (table [a b s] (list (.idx.zone [1 2 3]) [10 20 30] ['x 'y 'z]))) (set __rf_rq_v [1 2 3]) 0)");
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "setup");
+    ray_release(r);
+    rq_snap_t snap;
+    rq_snap(&snap, "__rf_rq_t");
+    TEST_ASSERT_EQ_I(snap.ncols, 3);
+    TEST_ASSERT(snap.index[0] != NULL, "column a carries an index");
+    ray_t* info0 = ray_eval_str("(format \"%\" (.idx.info (at __rf_rq_t 'a)))");
+    TEST_ASSERT(info0 && !RAY_IS_ERR(info0), "index info");
+    int64_t nc = 0;
+
+    /* the issue's value spellings */
+    TEST_ASSERT_EQ_I(rq_rows("(update {c: (+ a b) from: __rf_rq_t})", &nc), 3);
+    TEST_ASSERT_EQ_I(nc, 4);
+    TEST_ASSERT_EQ_I(rq_rows("(update {c: (+ a b) from: (select {from: __rf_rq_t where: (> a 1)})})", &nc), 2);
+    TEST_ASSERT_EQ_I(nc, 4);
+    /* a replaced column, by where: and by: */
+    TEST_ASSERT_EQ_I(rq_rows("(update {a: 0 from: __rf_rq_t where: (> a 1)})", &nc), 3);
+    TEST_ASSERT_EQ_I(rq_rows("(update {b: (sum b) from: __rf_rq_t by: s})", &nc), 3);
+    TEST_ASSERT_EQ_I(rq_rows("(update {a: (* a 2) b: 0 from: __rf_rq_t})", &nc), 3);
+    /* a table built in the request, and one a lambda holds */
+    TEST_ASSERT_EQ_I(rq_rows("(update {c: 1 from: (table [a] (list [1 2]))})", &nc), 2);
+    TEST_ASSERT_EQ_I(rq_rows("((fn [t] (update {a: (+ a 1) from: t})) __rf_rq_t)", &nc), 3);
+    /* delete, insert and upsert by value */
+    TEST_ASSERT_EQ_I(rq_rows("(delete {from: __rf_rq_t where: (> a 1)})", &nc), 1);
+    TEST_ASSERT_EQ_I(rq_rows("(insert __rf_rq_t (list 4 40 'w))", &nc), 4);
+    TEST_ASSERT_EQ_I(rq_rows("(upsert __rf_rq_t 1 (list 2 99 'q))", &nc), 3);
+    TEST_ASSERT_EQ_I(rq_rows("(upsert __rf_rq_t 1 (list 7 70 'q))", &nc), 4);
+    ray_t* v = eval_restricted_expr("(insert __rf_rq_v 4)");
+    TEST_ASSERT(v && !RAY_IS_ERR(v) && v->type == RAY_I64 && v->len == 4, "insert into a vector value");
+    ray_release(v);
+
+    /* the named spellings, quoted or computed, and with where:/by: */
+    static const char* const refused[] = {
+        "(update {c: 0 from: '__rf_rq_t})",
+        "(update {a: 0 from: '__rf_rq_t where: (> a 1)})",
+        "(update {b: (sum b) from: '__rf_rq_t by: s})",
+        "(update {c: 0 from: (first ['__rf_rq_t])})",
+        "((fn [n] (update {c: 0 from: n})) '__rf_rq_t)",
+        "(update {c: 0 from: (quote __rf_rq_t)})",
+        "(delete {from: '__rf_rq_t where: (> a 1)})",
+        "(delete {from: (first ['__rf_rq_t]) where: (> a 1)})",
+        "(insert '__rf_rq_t (list 4 40 'w))",
+        "(insert (first ['__rf_rq_t]) (list 4 40 'w))",
+        "(insert '__rf_rq_v 4)",
+        "(insert '__rf_rq_v 0 9)",
+        "(upsert '__rf_rq_t 1 (list 2 99 'q))",
+        "(upsert (first ['__rf_rq_t]) 1 (list 2 99 'q))",
+        /* a write inside a value spelling: a named form, a set, a lambda */
+        "(update {c: (do (update {a: 0 from: '__rf_rq_t}) 1) from: __rf_rq_t})",
+        "(update {c: (do (set __rf_rq_t 0) 1) from: __rf_rq_t})",
+        "(update {c: ((fn [x] (set __rf_rq_g x)) 1) from: __rf_rq_t})",
+        "(delete {from: __rf_rq_t where: (do (insert '__rf_rq_t (list 9 9 'n)) (> a 1))})",
+        "(insert __rf_rq_t (list 4 (do (upsert '__rf_rq_t 1 (list 1 0 'k)) 40) 'w))",
+    };
+    for (size_t i = 0; i < sizeof refused / sizeof *refused; i++)
+        TEST_ASSERT_FMT(restricted_expr_returns_access(refused[i]), "%s: not refused with access", refused[i]);
+
+    TEST_ASSERT_NULL(ray_env_get(ray_sym_intern("__rf_rq_g", 9)));
+    TEST_ASSERT(rq_same(&snap, "__rf_rq_t"), "the global table is the object it was, its columns unwritten");
+    ray_t* info1 = ray_eval_str("(format \"%\" (.idx.info (at __rf_rq_t 'a)))");
+    TEST_ASSERT(info1 && !RAY_IS_ERR(info1) && ray_str_len(info1) == ray_str_len(info0) &&
+                memcmp(ray_str_ptr(info1), ray_str_ptr(info0), ray_str_len(info0)) == 0, "the column's index is as it was");
+    ray_release(info0); ray_release(info1);
+    ray_t* vv = ray_env_get(ray_sym_intern("__rf_rq_v", 9));
+    TEST_ASSERT(vv && vv->len == 3, "the global vector is as it was");
+
+    /* unrestricted, the named spelling still rebinds */
+    r = ray_eval_str("(do (update {c: 7 from: '__rf_rq_t}) (sum (at __rf_rq_t 'c)))");
+    TEST_ASSERT(r && !RAY_IS_ERR(r) && r->i64 == 21, "unrestricted named update rebinds");
+    ray_release(r);
+    r = ray_eval_str("(do (set __rf_rq_t 0) (set __rf_rq_v 0) 0)");
+    if (r && !RAY_IS_ERR(r)) ray_release(r);
+    PASS();
+}
+
+/* An FNV digest of every file under `dir`, names and bytes. */
+static uint64_t rq_dir_digest(const char* dir, uint64_t h) {
+    DIR* d = opendir(dir);
+    if (!d) return h;
+    char names[64][256];
+    int n = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) && n < 64) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(names[n++], sizeof names[0], "%s", e->d_name);
+    }
+    closedir(d);
+    qsort(names, (size_t)n, sizeof names[0], (int (*)(const void*, const void*))strcmp);
+    for (int i = 0; i < n; i++) {
+        size_t pl = strlen(dir) + strlen(names[i]) + 2;
+        char* p = malloc(pl);
+        if (!p) continue;
+        memcpy(p, dir, strlen(dir));
+        p[strlen(dir)] = '/';
+        memcpy(p + strlen(dir) + 1, names[i], strlen(names[i]) + 1);
+        for (const char* c = names[i]; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ULL;
+        struct stat st;
+        if (stat(p, &st) != 0) { free(p); continue; }
+        if (S_ISDIR(st.st_mode)) { h = rq_dir_digest(p, h); free(p); continue; }
+        FILE* f = fopen(p, "rb");
+        free(p);
+        if (!f) continue;
+        int ch;
+        while ((ch = fgetc(f)) != EOF) h = (h ^ (uint8_t)ch) * 1099511628211ULL;
+        h = (h ^ (uint64_t)st.st_size) * 1099511628211ULL;
+        fclose(f);
+    }
+    return h;
+}
+
+/* A mapped table under a restricted request: a splayed one (its SYM column
+ * in the directory's symfile domain) and a parted one.  A value spelling
+ * answers a new in-memory table and the files are as they were, byte for
+ * byte; a new symbol goes to the runtime domain, never the symfile's.  The
+ * parted live-tail insert, which grows the table's file domain even into a
+ * value, is refused. */
+static test_result_t test_eval_restricted_query_mapped(void) {
+    const char* root = ray_test_tmp("/tmp/rf_rq_mapped");
+    (void)ray_test_rm_rf(root);
+    TEST_ASSERT_EQ_I(ray_test_mkdir_p(root), 0);
+    char src[2048];
+    snprintf(src, sizeof src,
+        "(do (.db.splayed.set \"%s/s/t/\" (table [a s] (list [1 2 3] ['x 'y 'z])))"
+        " (.db.splayed.set \"%s/p/2024.01.01/t/\" (table [v s] (list [1 2] ['x 'y])))"
+        " (set __rf_rq_s (.db.splayed.get \"%s/s/t/\"))"
+        " (set __rf_rq_p (.db.parted.get \"%s/p/\" 't)) 0)", root, root, root, root);
+    ray_t* r = ray_eval_str(src);
+    TEST_ASSERT(r && !RAY_IS_ERR(r), "setup");
+    ray_release(r);
+    ray_t* scol = ray_table_col_idx(ray_env_get(ray_sym_intern("__rf_rq_s", 9)), 1);
+    TEST_ASSERT(scol && scol->type == RAY_SYM, "a SYM column");
+    ray_sym_domain_t* sdom = ray_sym_vec_domain(scol);
+    TEST_ASSERT(sdom && sdom != ray_sym_runtime_domain(), "the SYM column is in the symfile's domain");
+    int64_t sdom_n = ray_sym_domain_count(sdom);
+    uint64_t before = rq_dir_digest(root, 1469598103934665603ULL);
+    rq_snap_t ss, ps;
+    rq_snap(&ss, "__rf_rq_s");
+    rq_snap(&ps, "__rf_rq_p");
+
+    int64_t nc = 0;
+    TEST_ASSERT_EQ_I(rq_rows("(update {a: (* a 10) from: __rf_rq_s})", &nc), 3);
+    TEST_ASSERT_EQ_I(rq_rows("(update {s: 'brandnew1878 from: __rf_rq_s where: (> a 1)})", &nc), 3);
+    TEST_ASSERT_EQ_I(rq_rows("(delete {from: __rf_rq_s where: (> a 1)})", &nc), 1);
+    TEST_ASSERT_EQ_I(rq_rows("(insert __rf_rq_s (list 4 'brandnew1878b))", &nc), 4);
+    TEST_ASSERT_EQ_I(rq_rows("(upsert __rf_rq_s 1 (list 9 'brandnew1878c))", &nc), 4);
+    TEST_ASSERT_EQ_I(rq_rows("(update {v: (* v 10) from: __rf_rq_p})", &nc), 2);
+    TEST_ASSERT_EQ_I(rq_rows("(delete {from: __rf_rq_p where: (> v 1)})", &nc), 1);
+    snprintf(src, sizeof src, "(insert __rf_rq_p 2024.01.01 (table [v s] (list [3] ['brandnew1878d])))");
+    TEST_ASSERT(restricted_expr_returns_access(src), "a parted live-tail insert into a value is refused");
+    TEST_ASSERT(restricted_expr_returns_access("(update {a: 0 from: '__rf_rq_s})"), "named splayed update refused");
+    TEST_ASSERT(restricted_expr_returns_access("(insert '__rf_rq_p 2024.01.02 (table [v s] (list [3] ['n])))"), "named parted insert refused");
+
+    TEST_ASSERT_EQ_I(ray_sym_domain_count(sdom), sdom_n);
+    TEST_ASSERT(rq_dir_digest(root, 1469598103934665603ULL) == before, "the files are as they were");
+    TEST_ASSERT(rq_same(&ss, "__rf_rq_s"), "the splayed global is unwritten");
+    TEST_ASSERT(rq_same(&ps, "__rf_rq_p"), "the parted global is unwritten");
+    r = ray_eval_str("(do (set __rf_rq_s 0) (set __rf_rq_p 0) 0)");
+    if (r && !RAY_IS_ERR(r)) ray_release(r);
+    (void)ray_test_rm_rf(root);
+    PASS();
+}
+
 const test_entry_t lang_entries[] = {
     { "lang/query/group_wide_null_masks", test_group_wide_null_masks, lang_setup, lang_teardown },
     { "lang/callprof/error_unwinds", test_callprof_error_unwinds, lang_setup, lang_teardown },
@@ -16888,5 +17106,7 @@ const test_entry_t lang_entries[] = {
 #ifdef DEBUG
     { "lang/query/cell_alloc_fail", test_query_cell_alloc_fail, lang_setup, lang_teardown },
 #endif
+    { "lang/eval/restricted_query_forms", test_eval_restricted_query_forms, lang_setup, lang_teardown },
+    { "lang/eval/restricted_query_mapped", test_eval_restricted_query_mapped, lang_setup, lang_teardown },
     { NULL, NULL, NULL, NULL },
 };

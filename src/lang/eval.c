@@ -539,8 +539,21 @@ static bool mutator_head_is_global(const ray_t* hd, const ray_t* head) {
     return !ray_env_get_local(hd->i64) && ray_env_get_global(hd->i64) == head;
 }
 
+/* update, delete, insert and upsert keep RAY_FN_RESTRICTED (each can
+ * rebind a global, and the planner reads the flag as "may write"), but a
+ * restricted request may call them: each refuses itself at the one point it
+ * would write, when its target evaluates to a symbol naming a binding.  The
+ * value spellings, which answer a new table and bind nothing, run (#1878).
+ * Judged by the function object, and only once restricted.  The same
+ * predicate tells .repl.signature and :h which of the two a builtin is. */
+bool ray_fn_restricted_named(const ray_t* fn_obj) {
+    if (!fn_obj || fn_obj->type != RAY_VARY || !(fn_obj->attrs & RAY_FN_RESTRICTED)) return false;
+    ray_vary_fn f = (ray_vary_fn)(uintptr_t)fn_obj->i64;
+    return f == ray_update || f == ray_delete || f == ray_insert || f == ray_upsert;
+}
+
 static inline bool fn_is_restricted(ray_t* fn_obj) {
-    return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED);
+    return __VM->restricted && (fn_obj->attrs & RAY_FN_RESTRICTED) && !ray_fn_restricted_named(fn_obj);
 }
 
 /* A lambda the server marked with .sys.trust, called by restricted code:
