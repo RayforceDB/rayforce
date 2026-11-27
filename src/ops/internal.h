@@ -60,6 +60,24 @@
  * it), compiled out of release so a poll costs the release build no more
  * than ray_interrupted() does. */
 #define RAY_CANCEL_ROWS ((int64_t)65536)
+
+/* Test seam (DEBUG): a holistic aggregate's per-group buffers fail their
+ * nth allocation on the calling thread.  HOLISTIC_FAIL_ARM/_DISARM bound
+ * the code that computes a median, quantile or mode column from its
+ * row-index buffers (group.c, query.c); each region entered counts in
+ * ray_holistic_fail_regions_for_test. */
+#ifdef DEBUG
+extern _Thread_local int64_t g_holistic_fail_nth;
+extern _Thread_local int64_t g_holistic_fail_regions;
+void ray_holistic_alloc_fail_for_test(int64_t nth);
+int64_t ray_holistic_fail_regions_for_test(void);
+#define HOLISTIC_FAIL_ARM() do { if (g_holistic_fail_nth) { g_holistic_fail_regions++; \
+        ray_alloc_fail_set_for_test(g_holistic_fail_nth, 1); } } while (0)
+#define HOLISTIC_FAIL_DISARM() do { if (g_holistic_fail_nth) ray_alloc_fail_set_for_test(0, 0); } while (0)
+#else
+#define HOLISTIC_FAIL_ARM() do { } while (0)
+#define HOLISTIC_FAIL_DISARM() do { } while (0)
+#endif
 #ifdef DEBUG
 bool ray_cancel_poll(void);
 void ray_test_cancel_at_poll(uint32_t nth);
