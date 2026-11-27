@@ -104,7 +104,6 @@ ALLOWED_SPELLINGS = {
     "nearest": "a query clause key, not a function",
     "self": "the evaluator's keyword for the lambda being called",
     "ilike": "owner decision 2026-11-27: query-only case-insensitive like",
-    "cond": "pending removal, #1826",
 }
 ALLOWED_SPELLINGS.update({t: "a type name `as` casts to, not a function" for t in TYPE_NAMES})
 

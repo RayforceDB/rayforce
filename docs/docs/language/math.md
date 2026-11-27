@@ -1051,7 +1051,7 @@ is:
   the query planner lowers.
 - A lambda whose body is built only from such calls, its parameters, its
   captures, `let` locals, literals and global data, with the forms `if`, `do`,
-  `let`, `and`, `or`, `cond` and `quote`.
+  `let`, `and`, `or` and `quote`.
 
 Anything else runs as `map` does, on the calling thread, in order. That includes
 a body that uses `set`, prints, does I/O, calls `rand`, `eval` or a dotted

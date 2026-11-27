@@ -43,10 +43,10 @@
 (set B (mkB 2000))
 
 ;; ── DATE: sibling forms, without and with where: ────────────────────────────
-;; a nested if, a cond, an if whose arms both compile, the arithmetic alone
+;; a nested if, a three-way nested if, an if whose arms both compile, the arithmetic alone
 (try (select {from: B by: g s: (sum (if (> c 7) d (if (> c 4) (+ d 1) d)))}) E) -- DATE_ERR
 (try (select {from: B by: g s: (sum (if (> c 4) d (if (> c 2) (+ d 1) (- d 1))))}) E) -- DATE_ERR
-(try (select {from: B by: g s: (sum (cond ((> c 7) d) ((> c 4) d) (else d)))}) E) -- DATE_ERR
+(try (select {from: B by: g s: (sum (if (> c 7) d (if (> c 4) d d)))}) E) -- DATE_ERR
 (try (select {from: B by: g s: (sum (if (> c 4) d d))}) E) -- DATE_ERR
 (try (select {from: B by: g s: (sum (+ d 1))}) E) -- DATE_ERR
 (try (select {from: B by: g where: (> c 2) s: (sum de)}) E) -- DATE_ERR

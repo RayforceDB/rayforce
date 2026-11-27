@@ -4,7 +4,7 @@
 ;; (#1488).  A where: predicate went to the evaluator's `if`, which tests the
 ;; condition vector whole, so every row took the `then` arm; a call such as
 ;; `nil?` around the `if` hid the mix; a chain with no fallback boxed DATE
-;; cells beside I64 ones; `cond` raised `name`.
+;; cells beside I64 ones.
 
 (set T (table [g c i d] (list [0 1 1 0] [true false true false] [1 2 3 4] (+ 2024.01.01 (til 4)))))
 (set DV [2024.05.05 2024.06.06])
@@ -45,22 +45,22 @@
 (Bg (select {from: T r: (sum (if c i 10)) by: g})) -- [11 13]
 (Bg (select {from: T r: (first (if c (at DV 0) (at DV 1))) by: g})) -- [2024.05.05 2024.06.06]
 
-;; ── 4. `cond` is its `if` chain ──
-(select {from: T r: (cond ((> g 0) (at DV 0)) (else 7))}) !- type
-(select {from: T r: (first (cond ((> g 0) (at DV 0)) (else 7))) by: g}) !- type
-(update {from: T r: (cond ((> g 0) (at DV 0)) (else 7))}) !- type
-(select {from: T r: (cond ((> g 0) (at DV 0)) ((> i 3) (at DV 1)))}) !- type
-(at (select {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
-(at (select {from: T r: (cond ((> g 0) (at DV 0)) ((> i 3) (at DV 1)) (else d))}) 'r) -- [2024.01.01 2024.05.05 2024.05.05 2024.06.06]
-(Bg (select {from: T r: (first (cond ((> g 0) (at DV 0)) (else (at DV 1)))) by: g})) -- [2024.06.06 2024.05.05]
-(at (select {from: T where: (cond ((> g 0) (> (at DV 0) d)) (else (> i 3)))}) 'i) -- [2 3 4]
-(at (update {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
-(at (update {from: T r: (cond ((> g 0) (at DV 0)) (else (at DV 1))) by: g}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
-(at (xasc (select {from: T r: (count i) by: {k: (cond ((> g 0) (at DV 0)) (else (at DV 1)))}}) 'k) 'r) -- [2 2]
-(at (select {from: T r: (cond ((> g 0) 1) (else 7))}) 'r) -- [7 1 1 7]
-;; a lone else is its arm
-(at (select {from: T r: (cond (else 7))}) 'r) -- [7 7 7 7]
-(at (select {from: T r: (cond (else (at DV 1)))}) 'r) -- [2024.06.06 2024.06.06 2024.06.06 2024.06.06]
+;; ── 4. a nested `if` ──
+(select {from: T r: (if (> g 0) (at DV 0) 7)}) !- type
+(select {from: T r: (first (if (> g 0) (at DV 0) 7)) by: g}) !- type
+(update {from: T r: (if (> g 0) (at DV 0) 7)}) !- type
+(select {from: T r: (if (> g 0) (at DV 0) (if (> i 3) (at DV 1)))}) !- type
+(at (select {from: T r: (if (> g 0) (at DV 0) (at DV 1))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (select {from: T r: (if (> g 0) (at DV 0) (if (> i 3) (at DV 1) d))}) 'r) -- [2024.01.01 2024.05.05 2024.05.05 2024.06.06]
+(Bg (select {from: T r: (first (if (> g 0) (at DV 0) (at DV 1))) by: g})) -- [2024.06.06 2024.05.05]
+(at (select {from: T where: (if (> g 0) (> (at DV 0) d) (> i 3))}) 'i) -- [2 3 4]
+(at (update {from: T r: (if (> g 0) (at DV 0) (at DV 1))}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (update {from: T r: (if (> g 0) (at DV 0) (at DV 1)) by: g}) 'r) -- [2024.06.06 2024.05.05 2024.05.05 2024.06.06]
+(at (xasc (select {from: T r: (count i) by: {k: (if (> g 0) (at DV 0) (at DV 1))}}) 'k) 'r) -- [2 2]
+(at (select {from: T r: (if (> g 0) 1 7)}) 'r) -- [7 1 1 7]
+;; an if whose condition is always true answers its arm (a lone else was it)
+(at (select {from: T r: (if true 7 0)}) 'r) -- [7 7 7 7]
+(at (select {from: T r: (if true (at DV 1) (at DV 0))}) 'r) -- [2024.06.06 2024.06.06 2024.06.06 2024.06.06]
 
 ;; ── update by: with an aggregate over a per-group `if` ──
 ;; each row takes its own arm, as select by: does; it took one arm per group
@@ -84,3 +84,12 @@
 (at (select {r: (if (> g 0) (at FV 0) 0N) from: V}) 'r) -- [0Nf 9.5 0Nf 9.5]
 (at (update {r: (if (> g 0) (at FV 0) i) from: V}) 'r) -- [1.0 9.5 3.0 9.5]
 (at (select {r: (if (> g 0) (at FV 0) (> i 2) (at IV 0) 1) from: V}) 'r) -- [1.0 9.5 9.0 9.5]
+
+;; ── `cond` is removed (#1826): a nested `if` is the way, and in a query
+;; `cond` is a name like any other unbound one, on every route ──
+(select {from: V r: (cond ((> g 0) 1) (else 7))}) !- name
+(select {from: V r: (first (cond ((> g 0) 1) (else 7))) by: g}) !- name
+(update {from: V r: (cond ((> g 0) 1) (else 7))}) !- name
+(select {from: V where: (cond ((> g 0) (> i 1)) (else false))}) !- name
+(select {from: V r: (count i) by: {k: (cond ((> g 0) 1) (else 7))}}) !- name
+(at (select {from: V r: (if (> g 0) 1 7)}) 'r) -- [7 1 7 1]

@@ -33,10 +33,10 @@
 (at (select {from: T r: (if (> n 2) "a" 'b)}) 'r) -- [b b a a]
 (at (select {from: T r: (if (> n 2) 'a 'b)}) 'r) -- [b b a a]
 
-;; ── cond is its if chain: string literals give STR there too ──
-(type (at (select {from: T r: (cond ((> n 3) "a") ((> n 1) "b") (else "c"))}) 'r)) -- 'STR
-(type (at (update {from: T r: (cond ((> n 3) "a") (else "c")) by: k}) 'r)) -- 'STR
-(type (at (select {from: T r: (cond ((> n 3) 'a) (else "c"))}) 'r)) -- 'SYM
+;; ── a nested if: string literals give STR there too ──
+(type (at (select {from: T r: (if (> n 3) "a" (if (> n 1) "b" "c"))}) 'r)) -- 'STR
+(type (at (update {from: T r: (if (> n 3) "a" "c") by: k}) 'r)) -- 'STR
+(type (at (select {from: T r: (if (> n 3) 'a "c")}) 'r)) -- 'SYM
 
 ;; ── the column is a string column, so it does not mix with symbols ──
 (set U (select {from: T y: y r: (if (> n 2) "a" "b") q: (if (> n 2) 'a 'b)}))

@@ -106,10 +106,10 @@
 (select {from: T by: g q: (avg (if (> c 4) (+ d 1) (+ d "x")))}) !- type
 (select {from: T by: g q: (avg (if (> c 4) (+ d 1) (+ d (til 2))))}) !- length
 
-;; ── `cond` is its `if` chain on every route (#1488; it raised `name`) ──────
-(at (select {from: T q: (cond ((> c 4) (+ d 1)) (else d))}) 'q) -- (at (select {from: T q: (if (> c 4) (+ d 1) d)}) 'q)
-(at (select {from: T by: g q: (cond ((> c 4) (+ d 1)) (else d))}) 'q) -- (at (select {from: T by: g q: (if (> c 4) (+ d 1) d)}) 'q)
-(at (select {from: T by: g q: (avg (cond ((> c 4) (+ d 1)) (else d)))}) 'q) -- (at (select {from: T by: g q: (avg (if (> c 4) (+ d 1) d))}) 'q)
+;; ── an `if` on every route: plain, by:, inside an aggregate (#1488) ────────
+(at (select {from: T q: (if (> c 4) (+ d 1) d)}) 'q) -- [2024.01.01 2024.01.03 2024.01.03 2024.01.05]
+(at (select {from: T by: g q: (if (> c 4) (+ d 1) d)}) 'q) -- (list [2024.01.01 2024.01.03] [2024.01.03 2024.01.05])
+(at (select {from: T by: g q: (avg (if (> c 4) (+ d 1) d))}) 'q) -- [8767.0 8769.0]
 
 ;; ── a running call in an arm sees the whole table, as written alone (#1280)
 (set U (table ['g 'c 'i 'd] (list ['a 'a 'a 'b 'b 'b] [9 0 9 0 9 9] [1 2 3 4 5 6] (+ 2024.01.01 (til 6)))))

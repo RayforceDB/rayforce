@@ -675,7 +675,7 @@ typedef struct ray_graph {
      * not clear it; classification probes must report it before routing. */
     ray_t*          compile_err;
 
-    /* > 0 while compile_expr_dag is inside a branch of `if`/`cond`.  The
+    /* > 0 while compile_expr_dag is inside a branch of `if`.  The
      * DAG evaluates both arms element-wise and the condition picks one, so
      * an arm's value is observable only where it is selected; the checks
      * that reject an expression outright (arithmetic on a symbol) stay

@@ -211,7 +211,7 @@
 
 ;; read by anything but another such pair or a same-typed `if`, the pair is
 ;; answered by the builtins, as before it lowered: an aggregate without by:,
-;; a mixed `if`, a `cond`, nil?, a sort by the output
+;; a mixed `if`, a nested `if`, nil?, a sort by the output
 (try (select {r: (sum (+ d 1)) from: Q}) (fn [e] (at e 'msg))) -- "sum expects a numeric or time-duration vector, got DATE"
 (at (select {r: (first (+ d i32)) from: Q where: (> c 4)}) 'r) -- [2000.01.03]
 (at (select {r: (dev (+ d i16)) from: Q}) 'r) -- [858977952.7502966]
@@ -219,7 +219,7 @@
 ;; a DATE arm beside a TIME arm has no common type (#1337; this boxed the
 ;; cells per row)
 (select {r: (if (> c 4) (+ d 1) t) from: Q}) !- type
-(at (select {r: (cond ((> c 4) (+ d 1)) (else d)) from: Q}) 'r) -- (at (select {r: (if (> c 4) (+ d 1) d) from: Q}) 'r)
+(as 'I64 (at (select {r: (if (> c 4) (+ d 1) d) from: Q}) 'r)) -- [0 2 0 2147483647 -2147483646 0Nl 8767]
 ;; a null literal beside a TIME arm is a TIME null, on this per-row route too
 ;; (#1485; it boxed the cells with a DATE null)
 (repr (at (select {r: (if (> c 4) (+ t 1000) 0Nd) from: Q}) 'r)) -- "[0Nt 00:00:01.001 00:00:00.999 0Nt -596:31:22.647 0Nt 24:00:00.999]"

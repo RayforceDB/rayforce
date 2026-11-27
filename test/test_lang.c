@@ -3978,7 +3978,7 @@ static test_result_t test_eval_select_temporal_int_dag_admission(void) {
         "(+ d (+ i 1i))", "(- (+ i 1i) t)", "(+ ts (+ l 1))", "(+ d (as 'I32 l))", "(+ (xbar d 7) 1)",
         "(nil? (+ d 1))", "(== (+ d 1) d)", "(as 'I64 (+ ts 1))", "(sum (+ t 1))",
         "(if (> i 2) d (+ t 1))", "(if (> i 2) (+ d 1) ts)", "(if (> i 2) (+ d 1) 0Nd)",
-        "(cond ((> i 2) (+ d 1)) (else d))", "(xbar (+ d 1) 7)", "(nil? (if (> i 2) d (+ d 1)))",
+        "(xbar (+ d 1) 7)", "(nil? (if (> i 2) d (+ d 1)))",
     };
     for (size_t k = 0; k < sizeof lowers / sizeof *lowers + sizeof declines / sizeof *declines; k++) {
         bool want = k < sizeof lowers / sizeof *lowers;

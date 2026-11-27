@@ -8,7 +8,7 @@
 (type (at (select {w: (if true g g) from: T691}) 'w)) -- 'GUID
 (type (at (select {w: (if (> i 2) g g) from: T691 where: (> i 1)}) 'w)) -- 'GUID
 (type (at (update {w: (if (> i 2) g g) from: T691}) 'w)) -- 'GUID
-(type (at (select {w: (cond ((> i 2) g) (else g)) from: T691}) 'w)) -- 'GUID
+(type (at (select {w: (if (> i 2) g g) from: T691}) 'w)) -- 'GUID
 ;; scalar GUID branch (an env-bound atom compiles as a const)
 (set W691 (at (select {w: (if (> i 2) g G1) from: T691}) 'w))
 (type W691) -- 'GUID
