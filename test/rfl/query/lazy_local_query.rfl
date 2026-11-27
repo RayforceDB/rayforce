@@ -55,3 +55,16 @@
 (same1868 (fn [v w] (at (select {from: (select {from: SP1868 where: (> b 0)}) n: (at w 0)}) 'n))) -- true
 (same1868 (fn [v w] (count (select {from: (select {from: SP1868 where: (> b 0)}) c: (count a) by: {g: (> a (count v))}})))) -- true
 (.sys.exec "rm -rf /tmp/rfl_lazy_local_query") -- 0
+
+;; a grouped select's output that reads no column is evaluated once and
+;; broadcast into every group: a lazy local there is its value, and one that
+;; fails to materialize raises its error, as the query without by: does
+;; (#1881; it answered a table whose cells raised when read)
+(set TB1881 (table [k a] (list [0 0 1 1] [1 2 3 4])))
+(set bad1881 (fn [] (sum (distinct ['a 'b]))))
+(try ((fn [v] (select {n: v from: TB1881 by: k})) (bad1881)) (fn [e] (at e 'code))) -- 'type
+(try ((fn [v] (select {n: v from: TB1881})) (bad1881)) (fn [e] (at e 'code))) -- 'type
+(try ((fn [v] (select {n: (+ a v) from: TB1881 by: k})) (bad1881)) (fn [e] (at e 'code))) -- 'type
+(try ((fn [v] (update {n: v from: TB1881 by: k})) (bad1881)) (fn [e] (at e 'code))) -- 'type
+(at ((fn [v] (select {n: v from: TB1881 by: k})) (distinct [7 8 7])) 'n) -- (at ((fn [v] (select {n: v from: TB1881 by: k})) [7 8]) 'n)
+(type (at (at ((fn [v] (select {n: v from: TB1881 by: k})) (distinct [7 8 7])) 'n) 0)) -- 'I64
