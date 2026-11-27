@@ -1901,8 +1901,16 @@ ray_t* ray_group_gather(ray_t* src_col, const int64_t* first_row, int64_t n) {
     if (agg_cancelled()) { ray_release(out); return ray_error("cancel", NULL); }
     bool gathered_null = atomic_load_explicit(&c.any_null, memory_order_relaxed) &&
                          src_col->type != RAY_BOOL && src_col->type != RAY_U8;
-    if (gathered_null || ray_vec_may_have_nulls(src_col)) out->attrs |= RAY_ATTR_HAS_NULLS;
-    if (!gathered_null) ray_group_key_settle_nulls(out);
+    /* A text column may hold nulls whatever its attrs say, so its keys are
+     * scanned (one cell per group): flagged only when one is null, as the
+     * other routes' key columns are. */
+    if (gathered_null) out->attrs |= RAY_ATTR_HAS_NULLS;
+    else if (src_col->type == RAY_SYM || src_col->type == RAY_STR) {
+        if (ray_vec_text_has_nulls(out)) out->attrs |= RAY_ATTR_HAS_NULLS;
+    } else if (ray_vec_may_have_nulls(src_col)) {
+        out->attrs |= RAY_ATTR_HAS_NULLS;
+        ray_group_key_settle_nulls(out);
+    }
     return out;
 }
 

@@ -3698,6 +3698,94 @@ static test_result_t test_radix_cancel_keeps_nothing(void) {
  * table init inside phase 2's tasks, on any thread.  "Keeps nothing" is
  * the process's allocation trace (every heap) over the run, the error's
  * release and a GC. */
+/* Q equals R0: byte for byte, or by the expression `cmp`. */
+static bool aw_q_same(const char* cmp) {
+    ray_t* v = ray_eval_str(cmp ? cmp : "(and (== (count (ser Q)) (count (ser R0))) (all (== (ser Q) (ser R0))))");
+    bool ok = v && !RAY_IS_ERR(v) && v->type == -RAY_BOOL && v->b8;
+    if (v && RAY_IS_ERR(v)) ray_error_free(v); else if (v) ray_release(v);
+    return ok;
+}
+
+/* A SYM key column is flagged has-nulls only when a key is null, on the v2
+ * serial routes as on the legacy ones: the two engines answer the same
+ * bytes, in key order (each emits its strategy's order), a null key
+ * included (#1819). */
+static test_result_t test_group_sym_key_nulls_flag(void) {
+    aw_eval_ok("(set KS (as 'SYM (at ['aa 'bb 'cc 'dd 'ee 'ff 'gg 'hh] (% (til 40000) 8))))");
+    aw_eval_ok("(set KN (as 'SYM (at ['aa ' 'cc 'dd] (% (til 40000) 4))))");
+    aw_eval_ok("(set TP (table [s n v] (list KS KN (til 40000))))");
+    static const char* const fq[] = {
+        "(select {c: (count v) from: TP by: s})",
+        "(select {c: (count v) from: TP by: s where: (in s ['aa 'cc])})",
+        "(select {c: (sum v) from: TP by: s where: (> v 5)})",
+        "(select {c: (count v) from: TP by: n})",
+    };
+    for (size_t q = 0; q < sizeof fq / sizeof *fq; q++) {
+        ray_t* r[2];
+        for (int e = 0; e < 2; e++) {
+            ray_agg_engine_v2 = e == 0;
+            r[e] = aw_eval(fq[q]);
+            TEST_ASSERT_TRUE(r[e] && !RAY_IS_ERR(r[e]) && r[e]->type == RAY_TABLE);
+        }
+        ray_agg_engine_v2 = true;
+        ray_t* k = ray_table_col_idx(r[0], 0);
+        bool has_null = q == 3;
+        TEST_ASSERT_FMT(((k->attrs & RAY_ATTR_HAS_NULLS) != 0) == has_null, "%s: key attrs %x", fq[q], k->attrs);
+        ray_env_set(ray_sym_intern("Q", 1), r[0]);
+        ray_env_set(ray_sym_intern("R0", 2), r[1]);
+        ray_release(r[0]); ray_release(r[1]);
+        char cmp[300];
+        snprintf(cmp, sizeof cmp, "(all (== (ser (select {from: Q asc: %s})) (ser (select {from: R0 asc: %s}))))", q == 3 ? "n" : "s", q == 3 ? "n" : "s");
+        TEST_ASSERT_FMT(aw_q_same(cmp), "%s: v2 and the legacy engine answer different bytes", fq[q]);
+    }
+    aw_eval_ok("(set KS 0)"); aw_eval_ok("(set KN 0)"); aw_eval_ok("(set TP 0)"); aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R0 0)");
+    PASS();
+}
+
+/* A direct (dense) route whose allocation fails falls back to the hash
+ * route, which answers its groups in first-seen order: the order of a
+ * result without asc: or desc: follows the strategy (pipeline.md).  The
+ * groups and their values are the unfailed ones (#1819). */
+static test_result_t test_group_fallback_order(void) {
+    aw_eval_ok("(set F (table [j v w] (list (% (til 70000) 7) (til 70000) (% (* (til 70000) 7919) 50000))))");
+    static const char* const oq[] = {
+        "(select {s: (sum v) c: (count v) from: F where: (> v 5) by: j})",
+        "(select {s: (sum v) from: F by: w})",
+    };
+    static const char* const ok[] = { "j", "w" };
+    int reordered = 0;
+    for (int e = 0; e < 2; e++) {
+        ray_agg_engine_v2 = e == 0;
+        for (size_t q = 0; q < sizeof oq / sizeof *oq; q++) {
+            char setq[200], cmp[300];
+            snprintf(setq, sizeof setq, "(set R0 %s)", oq[q]);
+            aw_eval_ok(setq);
+            snprintf(cmp, sizeof cmp, "(all (== (ser (select {from: Q asc: %s})) (ser (select {from: R0 asc: %s}))))", ok[q], ok[q]);
+            for (int64_t n = 1; n <= 4000; n++) {
+                ray_group_alloc_fail_for_test(n);
+                ray_t* got = aw_eval(oq[q]);
+                bool fired = ray_group_alloc_fail_fired_for_test();
+                ray_group_alloc_fail_for_test(0);
+                if (got && RAY_IS_ERR(got)) {
+                    TEST_ASSERT_FMT(strcmp(ray_err_code(got), "oom") == 0, "%s, allocation %lld fails: %s, not oom", oq[q], (long long)n, ray_err_code(got));
+                    ray_error_free(got);
+                    continue;
+                }
+                TEST_ASSERT_NOT_NULL(got);
+                ray_env_set(ray_sym_intern("Q", 1), got);
+                ray_release(got);
+                if (!aw_q_same(NULL)) reordered++;
+                TEST_ASSERT_FMT(aw_q_same(cmp), "%s (v2 %d), allocation %lld fails: other groups or values", oq[q], e == 0, (long long)n);
+                if (!fired) break;
+            }
+        }
+    }
+    ray_agg_engine_v2 = true;
+    TEST_ASSERT_FMT(reordered > 0, "no failure took the hash fallback");
+    aw_eval_ok("(set F 0)"); aw_eval_ok("(set Q 0)"); aw_eval_ok("(set R0 0)");
+    PASS();
+}
+
 static test_result_t test_group_alloc_fail(void) {
     ray_pool_destroy();
     TEST_ASSERT_EQ_I(ray_pool_init_total(4), RAY_OK);
@@ -6999,6 +7087,8 @@ const test_entry_t aware_entries[] = {
     { "aware/sort_head_late_chunked", test_sort_head_late_chunked, aw_setup, aw_teardown },
     { "aware/topk_cancel_at_dispatch", test_topk_cancel_at_dispatch, aw_setup, aw_teardown },
     { "aware/group_cancel_status", test_group_cancel_status, aw_setup, aw_teardown },
+    { "aware/group_sym_key_nulls_flag", test_group_sym_key_nulls_flag, aw_setup, aw_teardown },
+    { "aware/group_fallback_order", test_group_fallback_order, aw_setup, aw_teardown },
     { "aware/group_alloc_fail", test_group_alloc_fail, aw_setup, aw_teardown },
     { "aware/holistic_oom", test_holistic_oom, aw_setup, aw_teardown },
     { "aware/radix_cancel_keeps_nothing", test_radix_cancel_keeps_nothing, aw_setup, aw_teardown },
