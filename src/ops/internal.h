@@ -79,6 +79,13 @@ int64_t ray_holistic_fail_regions_for_test(void);
 #define HOLISTIC_FAIL_DISARM() do { } while (0)
 #endif
 #ifdef DEBUG
+/* Test seam (group.c): the nth partition-table init of the v2 radix
+ * route's phase 2 from now, on any thread, fails as a failed rows
+ * allocation does (its slots allocated); with cancel it also raises the
+ * cancel.  nth 0 disarms. */
+void ray_group_test_ht_rows_fail(int64_t nth, bool cancel);
+#endif
+#ifdef DEBUG
 bool ray_cancel_poll(void);
 void ray_test_cancel_at_poll(uint32_t nth);
 #else
